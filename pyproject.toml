@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "triwarp"
+version = "0.1.0"
+description = "Triangular mesh library based on NVIDIA Warp"
+readme = "README.md"
+requires-python = ">=3.11"
+
+dependencies = ["warp-lang>=1.12.1"]
+
+[project.optional-dependencies]
+test = ["pytest>=9", "numpy>=1.24", "trimesh>=4.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["triwarp*"]
+exclude = ["reference*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

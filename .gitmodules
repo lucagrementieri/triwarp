@@ -1,0 +1,3 @@
+[submodule "reference/trimesh"]
+	path = reference/trimesh
+	url = git@github.com:mikedh/trimesh.git
