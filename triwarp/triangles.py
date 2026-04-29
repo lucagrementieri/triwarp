@@ -62,3 +62,14 @@ def points_to_barycentric(
     )
     wp.launch(kernel, dim=f, inputs=[vertices, faces, points, out_barycentric], device=vertices.device)
     return out_barycentric
+
+
+def closest_point(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], points: wp.array[wp.vec3]
+) -> wp.array[wp.vec3]:
+    f = faces.shape[0] // 3
+    out_closest = wp.empty(f, dtype=wp.vec3, device=vertices.device)
+    wp.launch(
+        kernel_triangles.closest_point, dim=f, inputs=[vertices, faces, points, out_closest], device=vertices.device
+    )
+    return out_closest

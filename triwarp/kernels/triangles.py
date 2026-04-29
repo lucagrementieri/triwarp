@@ -1,6 +1,7 @@
 import warp as wp
 
 TOLERANCE_MERGE = 1e-8
+TOLERANCE_ZERO = 1e-12
 
 
 @wp.func
@@ -143,3 +144,73 @@ def points_to_barycentric_cross(
     out_barycentric[f][2] = wp.dot(wp.cross(e0, w), n) * inverse_denominator
     out_barycentric[f][1] = wp.dot(wp.cross(w, e1), n) * inverse_denominator
     out_barycentric[f][0] = 1.0 - out_barycentric[f][1] - out_barycentric[f][2]
+
+
+@wp.kernel
+def closest_point(
+    in_vertices: wp.array[wp.vec3],
+    in_faces: wp.array[wp.int32],
+    in_points: wp.array[wp.vec3],
+    out_closest: wp.array[wp.vec3],
+) -> None:
+    f = int(wp.tid())
+    triangle_face = in_faces[f * 3 : (f + 1) * 3]
+    ab, ac, bc = triangle_edges(in_vertices, triangle_face)
+
+    # check if P is in vertex region outside A
+    ap = in_points[f] - in_vertices[triangle_face[0]]
+    d1 = wp.dot(ab, ap)
+    d2 = wp.dot(ac, ap)
+    is_a = d1 < 0.0 and d2 < 0.0
+    if is_a:
+        out_closest[f] = in_vertices[triangle_face[0]]
+        return
+
+    # check if P in vertex region outside B
+    bp = in_points[f] - in_vertices[triangle_face[1]]
+    d3 = wp.dot(ab, bp)
+    d4 = wp.dot(ac, bp)
+    is_b = d3 > -TOLERANCE_ZERO and d4 <= d3
+    if is_b:
+        out_closest[f] = in_vertices[triangle_face[1]]
+        return
+
+    # check if P in edge region of AB, if so return projection of P onto A
+    vc = (d1 * d4) - (d3 * d2)
+    is_ab = vc < TOLERANCE_ZERO and d1 > -TOLERANCE_ZERO and d3 < TOLERANCE_ZERO
+    if is_ab:
+        v = d1 / (d1 - d3)
+        out_closest[f] = in_vertices[triangle_face[0]] + v * ab
+        return
+
+    # check if P in vertex region outside C
+    cp = in_points[f] - in_vertices[triangle_face[2]]
+    d5 = wp.dot(ab, cp)
+    d6 = wp.dot(ac, cp)
+    is_c = d6 > -TOLERANCE_ZERO and d5 <= d6
+    if is_c:
+        out_closest[f] = in_vertices[triangle_face[2]]
+        return
+
+    # check if P in edge region of AC, if so return projection of P onto AC
+    vb = (d5 * d2) - (d1 * d6)
+    is_ac = vb < TOLERANCE_ZERO and d2 > -TOLERANCE_ZERO and d6 < TOLERANCE_ZERO
+    if is_ac:
+        w = d2 / (d2 - d6)
+        out_closest[f] = in_vertices[triangle_face[0]] + w * ac
+        return
+
+    # check if P in edge region of BC, if so return projection of P onto BC
+    va = (d3 * d6) - (d5 * d4)
+    is_bc = va < TOLERANCE_ZERO and (d4 - d3) > -TOLERANCE_ZERO and (d5 - d6) > -TOLERANCE_ZERO
+    if is_bc:
+        d43 = d4 - d3
+        w = d43 / (d43 + (d5 - d6))
+        out_closest[f] = in_vertices[triangle_face[1]] + w * bc
+        return
+
+    # any remaining points must be inside face region
+    denom = 1.0 / (va + vb + vc)
+    v = vb * denom
+    w = vc * denom
+    out_closest[f] = in_vertices[triangle_face[0]] + ab * v + ac * w
