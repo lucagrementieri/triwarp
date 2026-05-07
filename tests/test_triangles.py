@@ -22,23 +22,15 @@ def _triangle_soup_to_vertices_faces_wp(tri_np: np.ndarray, device):
     return v_wp, f_wp
 
 
-def test_face_areas(device):
+def test_face_normals_and_areas(device):
     rng = np.random.default_rng(1)
     tri_np = rng.random((48, 3, 3))
     v_wp, f_wp = _triangle_soup_to_vertices_faces_wp(tri_np, device)
-    got = tw.face_areas(v_wp, f_wp).numpy()
-    exp = tm.area(triangles=tri_np)
-    assert np.allclose(got, exp, rtol=1e-5, atol=1e-5)
-
-
-def test_face_normals(device):
-    rng = np.random.default_rng(3)
-    tri_np = rng.random((40, 3, 3))
-    v_wp, f_wp = _triangle_soup_to_vertices_faces_wp(tri_np, device)
-    n_w = tw.face_normals(v_wp, f_wp).numpy()
-    n_t, v_t = tm.normals(triangles=tri_np)
-    mask = v_t.astype(bool)
-    assert np.allclose(n_w[mask], n_t[mask], rtol=1e-5, atol=1e-5)
+    normal_wp, area_wp = tw.face_normals_and_areas(v_wp, f_wp)
+    normal_t = tm.normals(triangles=tri_np)[0]
+    area_t = tm.area(triangles=tri_np)
+    assert np.allclose(normal_wp.numpy(), normal_t, rtol=1e-5, atol=1e-5)
+    assert np.allclose(area_wp.numpy(), area_t, rtol=1e-5, atol=1e-5)
 
 
 def test_angles(device):

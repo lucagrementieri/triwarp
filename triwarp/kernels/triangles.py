@@ -5,7 +5,9 @@ TOLERANCE_ZERO = 1e-12
 
 
 @wp.func
-def triangle_cross(in_vertices: wp.array[wp.vec3], in_face: wp.array[wp.int32]) -> wp.vec3:
+def triangle_cross(
+    in_vertices: wp.array[wp.vec3], in_face: wp.array[wp.int32]
+) -> wp.vec3:
     v0 = in_vertices[in_face[0]]
     v1 = in_vertices[in_face[1]]
     v2 = in_vertices[in_face[2]]
@@ -15,7 +17,9 @@ def triangle_cross(in_vertices: wp.array[wp.vec3], in_face: wp.array[wp.int32]) 
 
 
 @wp.func
-def triangle_edges(in_vertices: wp.array[wp.vec3], in_face: wp.array[wp.int32]) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
+def triangle_edges(
+    in_vertices: wp.array[wp.vec3], in_face: wp.array[wp.int32]
+) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
     e0 = wp.vec3(*(in_vertices[in_face[1]] - in_vertices[in_face[0]]))
     e1 = wp.vec3(*(in_vertices[in_face[2]] - in_vertices[in_face[0]]))
     e2 = wp.vec3(*(in_vertices[in_face[2]] - in_vertices[in_face[1]]))
@@ -23,22 +27,28 @@ def triangle_edges(in_vertices: wp.array[wp.vec3], in_face: wp.array[wp.int32]) 
 
 
 @wp.func
-def triangle_area(in_vertices: wp.array[wp.vec3], in_face: wp.array[wp.int32]) -> wp.float32:
+def face_normals_and_area(
+    in_vertices: wp.array[wp.vec3], in_face: wp.array[wp.int32]
+) -> tuple[wp.vec3, wp.float32]:
     cross = triangle_cross(in_vertices, in_face)
-    return 0.5 * wp.length(cross)
+    norm = wp.length(cross)
+    if norm > TOLERANCE_ZERO:
+        normal = cross / norm
+    area = 0.5 * norm
+    return normal, area
 
 
 @wp.kernel
-def face_areas(in_vertices: wp.array[wp.vec3], in_faces: wp.array[wp.int32], out_areas: wp.array[wp.float32]) -> None:
+def face_normals_and_areas(
+    in_vertices: wp.array[wp.vec3],
+    in_faces: wp.array[wp.int32],
+    out_normals: wp.array[wp.vec3],
+    out_areas: wp.array[wp.float32],
+) -> None:
     f = int(wp.tid())
-    out_areas[f] = triangle_area(in_vertices, in_faces[f * 3 : (f + 1) * 3])
-
-
-@wp.kernel
-def face_normals(in_vertices: wp.array[wp.vec3], in_faces: wp.array[wp.int32], out_normals: wp.array[wp.vec3]) -> None:
-    f = int(wp.tid())
-    cross = triangle_cross(in_vertices, in_faces[f * 3 : (f + 1) * 3])
-    out_normals[f] = wp.normalize(cross)
+    normal, area = face_normals_and_area(in_vertices, in_faces[f * 3 : (f + 1) * 3])
+    out_normals[f] = normal
+    out_areas[f] = area
 
 
 @wp.kernel
@@ -69,12 +79,14 @@ def angles(
 
 @wp.kernel
 def nondegenerate(
-    in_vertices: wp.array[wp.vec3], in_faces: wp.array[wp.int32], out_nondegenerate: wp.array[wp.bool]
+    in_vertices: wp.array[wp.vec3],
+    in_faces: wp.array[wp.int32],
+    out_nondegenerate: wp.array[wp.bool],
 ) -> None:
     f = int(wp.tid())
     triangle_face = in_faces[f * 3 : (f + 1) * 3]
     e0, e1, _ = triangle_edges(in_vertices, triangle_face)
-    area = triangle_area(in_vertices, triangle_face)
+    _, area = face_normals_and_area(in_vertices, triangle_face)
     length_e0 = wp.length(e0)
     length_e1 = wp.length(e1)
     height_e0 = 2.0 * area / length_e0
@@ -202,7 +214,11 @@ def closest_point(
 
     # check if P in edge region of BC, if so return projection of P onto BC
     va = (d3 * d6) - (d5 * d4)
-    is_bc = va < TOLERANCE_ZERO and (d4 - d3) > -TOLERANCE_ZERO and (d5 - d6) > -TOLERANCE_ZERO
+    is_bc = (
+        va < TOLERANCE_ZERO
+        and (d4 - d3) > -TOLERANCE_ZERO
+        and (d5 - d6) > -TOLERANCE_ZERO
+    )
     if is_bc:
         d43 = d4 - d3
         w = d43 / (d43 + (d5 - d6))

@@ -3,38 +3,51 @@ from triwarp.kernels import triangles as kernel_triangles
 from typing import Literal
 
 
-def face_areas(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array[wp.float32]:
-    f = faces.shape[0] // 3
-    out_area = wp.empty(f, dtype=wp.float32, device=vertices.device)
-    wp.launch(kernel_triangles.face_areas, dim=f, inputs=[vertices, faces, out_area], device=vertices.device)
-    return out_area
-
-
-def face_normals(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array[wp.vec3]:
+def face_normals_and_areas(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> tuple[wp.array[wp.vec3], wp.array[wp.float32]]:
     f = faces.shape[0] // 3
     out_normal = wp.empty(f, dtype=wp.vec3, device=vertices.device)
-    wp.launch(kernel_triangles.face_normals, dim=f, inputs=[vertices, faces, out_normal], device=vertices.device)
-    return out_normal
+    out_area = wp.empty(f, dtype=wp.float32, device=vertices.device)
+    wp.launch(
+        kernel_triangles.face_normals_and_areas,
+        dim=f,
+        inputs=[vertices, faces, out_normal, out_area],
+        device=vertices.device,
+    )
+    return out_normal, out_area
 
 
 def angles(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array[wp.vec3]:
     f = faces.shape[0] // 3
     out_angle = wp.empty(f, dtype=wp.vec3, device=vertices.device)
-    wp.launch(kernel_triangles.angles, dim=f, inputs=[vertices, faces, out_angle], device=vertices.device)
+    wp.launch(
+        kernel_triangles.angles,
+        dim=f,
+        inputs=[vertices, faces, out_angle],
+        device=vertices.device,
+    )
     return out_angle
 
 
-def nondegenerate(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
+def nondegenerate(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> wp.array[wp.bool]:
     f = faces.shape[0] // 3
     out_nondegenerate = wp.empty(f, dtype=wp.bool, device=vertices.device)
     wp.launch(
-        kernel_triangles.nondegenerate, dim=f, inputs=[vertices, faces, out_nondegenerate], device=vertices.device
+        kernel_triangles.nondegenerate,
+        dim=f,
+        inputs=[vertices, faces, out_nondegenerate],
+        device=vertices.device,
     )
     return out_nondegenerate
 
 
 def barycentric_to_points(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], barycentric: wp.array[wp.vec3]
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    barycentric: wp.array[wp.vec3],
 ) -> wp.array[wp.vec3]:
     f = faces.shape[0] // 3
     out_points = wp.empty(f, dtype=wp.vec3, device=vertices.device)
@@ -60,7 +73,12 @@ def points_to_barycentric(
         if method == "cramer"
         else kernel_triangles.points_to_barycentric_cross
     )
-    wp.launch(kernel, dim=f, inputs=[vertices, faces, points, out_barycentric], device=vertices.device)
+    wp.launch(
+        kernel,
+        dim=f,
+        inputs=[vertices, faces, points, out_barycentric],
+        device=vertices.device,
+    )
     return out_barycentric
 
 
@@ -70,6 +88,9 @@ def closest_point(
     f = faces.shape[0] // 3
     out_closest = wp.empty(f, dtype=wp.vec3, device=vertices.device)
     wp.launch(
-        kernel_triangles.closest_point, dim=f, inputs=[vertices, faces, points, out_closest], device=vertices.device
+        kernel_triangles.closest_point,
+        dim=f,
+        inputs=[vertices, faces, points, out_closest],
+        device=vertices.device,
     )
     return out_closest
