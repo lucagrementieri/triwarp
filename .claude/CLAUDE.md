@@ -34,8 +34,9 @@ You are an expert in NVIDIA Warp (wp). Follow all rules below when writing kerne
 - Always use `tid = wp.tid()` (or `i, j = wp.tid()` for 2-D grids) to retrieve the thread index inside a kernel.
 - Cast `wp.tid()` to `int` explicitly when used as an array index: `f = int(wp.tid())`.
 - Use `wp.launch(kernel=..., dim=..., inputs=[...], device=...)` for execution. Always forward the `device` from the input arrays.
-- Array slicing is supported inside kernels: `in_faces[f * 3 : (f + 1) * 3]` produces a sub-array view.
+- Array slicing is supported inside kernels: `faces[f * 3 : (f + 1) * 3]` produces a sub-array view.
 - Use `wp.cast(expr, TargetType)` for explicit type conversions between Warp types.
+- Prepend output argument names with out_ and put them at the end of the kernel signature after all the input arguments.
 
 ---
 
