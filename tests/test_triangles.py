@@ -5,91 +5,61 @@ Regression tests for ``triwarp.triangles`` against ``trimesh.triangles`` (CPU re
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import warp as wp
 
-import trimesh.triangles as tm
-import triwarp.triangles as tw
+import trimesh as tm
+import triwarp as tw
 
 
-def _triangle_soup_to_vertices_faces_wp(tri_np: np.ndarray, device):
-    """Triangle soup ``(n, 3, 3)`` → indexed mesh on ``device`` (disjoint vertices per face)."""
-    tri_np = np.ascontiguousarray(tri_np, dtype=np.float64)
-    n = tri_np.shape[0]
-    vertices = tri_np.reshape(-1, 3)
-    faces = np.arange(n * 3, dtype=np.int32).reshape(n, 3)
-    v_wp = wp.array(vertices, dtype=wp.vec3, device=device)
-    f_wp = wp.array(faces.reshape(-1), dtype=wp.int32, device=device)
-    return v_wp, f_wp
+def test_face_normals_and_areas(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = icosahedron
+    normal_wp, area_wp = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
+    assert np.allclose(normal_wp.numpy(), mesh_tm.face_normals, rtol=1e-5, atol=1e-5)
+    assert np.allclose(area_wp.numpy(), mesh_tm.area_faces, rtol=1e-5, atol=1e-5)
 
 
-def test_face_normals_and_areas(device):
-    rng = np.random.default_rng(1)
-    tri_np = rng.random((48, 3, 3))
-    v_wp, f_wp = _triangle_soup_to_vertices_faces_wp(tri_np, device)
-    normal_wp, area_wp = tw.face_normals_and_areas(v_wp, f_wp)
-    normal_t = tm.normals(triangles=tri_np)[0]
-    area_t = tm.area(triangles=tri_np)
-    assert np.allclose(normal_wp.numpy(), normal_t, rtol=1e-5, atol=1e-5)
-    assert np.allclose(area_wp.numpy(), area_t, rtol=1e-5, atol=1e-5)
+def test_angles(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = half_torus
+    angles_wp = tw.triangles.face_angles(mesh_wp.points, mesh_wp.indices)
+    assert np.allclose(angles_wp.numpy(), mesh_tm.face_angles, rtol=1e-5, atol=1e-5)
 
 
-def test_angles(device):
-    rng = np.random.default_rng(5)
-    tri_np = rng.random((36, 3, 3))
-    v_wp, f_wp = _triangle_soup_to_vertices_faces_wp(tri_np, device)
-    got = tw.angles(v_wp, f_wp).numpy()
-    exp = tm.angles(tri_np)
-    assert np.allclose(got, exp, rtol=1e-5, atol=1e-5)
+def test_nondegenerate(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = hemisphere
+    nondegenerate_tm = tm.triangles.nondegenerate(mesh_tm.triangles)
+    nondegenerate_wp = tw.triangles.nondegenerate(mesh_wp.points, mesh_wp.indices)
+    assert np.array_equal(nondegenerate_wp.numpy().astype(bool), nondegenerate_tm)
 
 
-def test_nondegenerate(device):
-    rng = np.random.default_rng(14)
-    tri_np = rng.random((26, 3, 3))
-    v_wp, f_wp = _triangle_soup_to_vertices_faces_wp(tri_np, device)
-    got = tw.nondegenerate(v_wp, f_wp).numpy().astype(bool)
-    exp = tm.nondegenerate(triangles=tri_np)
-    assert np.array_equal(got, exp)
+def test_barycentric_to_points(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = hemisphere
+    barycentric_np = np.random.rand(mesh_tm.triangles.shape[0], 3)
+    points_tm = tm.triangles.barycentric_to_points(mesh_tm.triangles, barycentric_np)
+
+    barycentric_wp = wp.array(barycentric_np, dtype=wp.vec3, device=mesh_wp.points.device)
+    points_wp = tw.triangles.barycentric_to_points(mesh_wp.points, mesh_wp.indices, barycentric_wp)
+    assert np.allclose(points_wp.numpy(), points_tm, rtol=1e-5, atol=1e-5)
 
 
-def test_barycentric_to_points(device):
-    rng = np.random.default_rng(15)
-    tri_np = rng.random((30, 3, 3))
-    b = rng.random((30, 3))
-    tri_wp = _triangle_soup_to_vertices_faces_wp(tri_np, device)
-    b_wp = wp.array(b, dtype=wp.vec3, device=device)
-    got = tw.barycentric_to_points(tri_wp[0], tri_wp[1], b_wp).numpy()
-    exp = tm.barycentric_to_points(tri_np, b)
-    assert np.allclose(got, exp, rtol=1e-5, atol=1e-5)
+@pytest.mark.parametrize("method", ["cramer", "cross"])
+def test_points_to_barycentric(hemisphere: tuple[tm.Trimesh, wp.Mesh], method: str):
+    mesh_tm, mesh_wp = hemisphere
+
+    barycentric_np = np.random.rand(mesh_tm.triangles.shape[0], 3)
+    points_np = tm.triangles.barycentric_to_points(mesh_tm.triangles, barycentric_np)
+    barycentric_tm = tm.triangles.points_to_barycentric(mesh_tm.triangles, points_np, method=method)
+
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=mesh_wp.points.device)
+    barycentric_wp = tw.triangles.points_to_barycentric(mesh_wp.points, mesh_wp.indices, points_wp, method=method)
+    assert np.allclose(barycentric_wp.numpy(), barycentric_tm, rtol=1e-5, atol=1e-5)
 
 
-def test_points_to_barycentric_cramer(device):
-    rng = np.random.default_rng(16)
-    tri_np = rng.random((25, 3, 3))
-    p = rng.random((25, 3))
-    tri_wp = _triangle_soup_to_vertices_faces_wp(tri_np, device)
-    p_wp = wp.array(p, dtype=wp.vec3, device=device)
-    got = tw.points_to_barycentric(tri_wp[0], tri_wp[1], p_wp, method="cramer").numpy()
-    exp = tm.points_to_barycentric(tri_np, p, method="cramer")
-    assert np.allclose(got, exp, rtol=1e-5, atol=1e-5)
+def test_closest_point(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = hemisphere
+    points_np = np.random.rand(mesh_tm.triangles.shape[0], 3)
+    closest_points_tm = tm.triangles.closest_point(mesh_tm.triangles, points_np)
 
-
-def test_points_to_barycentric_cross(device):
-    rng = np.random.default_rng(17)
-    tri_np = rng.random((25, 3, 3))
-    p = rng.random((25, 3))
-    tri_wp = _triangle_soup_to_vertices_faces_wp(tri_np, device)
-    p_wp = wp.array(p, dtype=wp.vec3, device=device)
-    got = tw.points_to_barycentric(tri_wp[0], tri_wp[1], p_wp, method="cross").numpy()
-    exp = tm.points_to_barycentric(tri_np, p, method="cross")
-    assert np.allclose(got, exp, rtol=1e-5, atol=1e-5)
-
-
-def test_closest_point(device):
-    rng = np.random.default_rng(17)
-    tri_np = rng.random((33, 3, 3))
-    p = rng.random((33, 3))
-    v_wp, f_wp = _triangle_soup_to_vertices_faces_wp(tri_np, device)
-    p_wp = wp.array(p, dtype=wp.vec3, device=device)
-    got = tw.closest_point(v_wp, f_wp, p_wp).numpy()
-    exp = tm.closest_point(tri_np, p)
-    assert np.allclose(got, exp, rtol=1e-5, atol=1e-5)
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=mesh_wp.points.device)
+    closest_points_wp = tw.triangles.closest_point(mesh_wp.points, mesh_wp.indices, points_wp)
+    assert np.allclose(closest_points_wp.numpy(), closest_points_tm, rtol=1e-5, atol=1e-5)

@@ -18,7 +18,7 @@ def face_normals_and_areas(
     return out_normal, out_area
 
 
-def angles(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array[wp.vec3]:
+def face_angles(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array[wp.vec3]:
     f = faces.shape[0] // 3
     out_angle = wp.empty(f, dtype=wp.vec3, device=vertices.device)
     wp.launch(
@@ -30,9 +30,7 @@ def angles(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array[w
     return out_angle
 
 
-def nondegenerate(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
-) -> wp.array[wp.bool]:
+def nondegenerate(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
     f = faces.shape[0] // 3
     out_nondegenerate = wp.empty(f, dtype=wp.bool, device=vertices.device)
     wp.launch(
