@@ -9,10 +9,16 @@ readme = "README.md"
 requires-python = ">=3.11"
 version = "0.1.0"
 
-dependencies = ["warp-lang>=1.13"]
+dependencies = ["newton>=1.1.0", "warp-lang>=1.13"]
 
 [project.optional-dependencies]
-test = ["numpy>=2.4", "pytest>=9.0", "shapely>=2.1.2", "trimesh>=4.11"]
+test = [
+    "numpy>=2.4",
+    "pytest>=9.0",
+    "scipy>=1.17",
+    "shapely>=2.1.2",
+    "trimesh>=4.11",
+]
 
 [tool.setuptools.packages.find]
 exclude = ["reference*"]
