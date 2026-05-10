@@ -8,6 +8,31 @@ from triwarp.kernels import points as kernel_points
 
 
 def bvh_from_points(points: wp.array[wp.vec3], leaf_size: int) -> wp.Bvh:
+    """
+    Build a bounding-volume hierarchy over ``points`` for radius queries.
+
+    Each leaf stores the same geometry as ``points`` (degenerate bounds via a clone),
+    matching the broad-phase pattern used by :func:`remove_close` and the
+    ``query_ball*`` helpers.
+
+    Parameters
+    ----------
+    points
+        ``(n, 3)`` positions as ``wp.vec3``.
+    leaf_size
+        Maximum primitives per leaf; forwarded to :class:`warp.Bvh`.
+
+    Returns
+    -------
+    warp.Bvh
+        BVH suited for ``query_ball_count``, ``query_ball``, and related kernels.
+
+    See Also
+    --------
+    query_ball_count
+    query_ball
+    remove_close
+    """
     return wp.Bvh(points, wp.clone(points), leaf_size=leaf_size)
 
 
@@ -20,28 +45,42 @@ def query_ball_count(
     leaf_size: int = 4,
 ) -> wp.array[wp.int32]:
     """
-    Indices of ``points`` within Euclidean distance ``r`` of each query center,
-    analogous to :meth:`scipy.spatial.KDTree.query_ball_point` (``p=2``, exact).
+    Count neighbors of each query within Euclidean distance ``r``.
 
-    Uses the same BVH broad-phase cube ``[center ± r]`` and ``float32`` narrow-phase
-    distance test as :func:`remove_close`.
+    For each query center ``q``, returns how many entries ``p`` in ``points`` satisfy
+    ``‖p - q‖₂ ≤ r``. This matches :meth:`scipy.spatial.KDTree.query_ball_point` with
+    ``p=2``, ``eps=0``, and ``return_length=True`` (exact search; only the spatial
+    index differs).
+
+    Broad-phase traversal uses an axis-aligned cube ``[q - r, q + r]`` against the BVH;
+    narrow-phase keeps points with Euclidean distance at most ``r`` (``float32``), the same
+    geometric radius as :func:`remove_close` (which tests ``‖·‖² ≤ r²`` in the kernel).
 
     Parameters
     ----------
     points
-        ``(n, 3)`` points stored as ``wp.vec3``.
+        ``(n, 3)`` data points stored as ``wp.vec3``.
     queries
-        ``(m, 3)`` query points stored as ``wp.vec3``.
+        ``(m, 3)`` query centers stored as ``wp.vec3``.
     r
-        Query radius (cast to ``float32`` in kernels).
+        Inclusion radius; cast to ``float32`` in kernels (non-negative).
     bvh
-        Optional BVH built from ``points``.
+        Optional pre-built BVH from ``points``. If ``None``, built via
+        :func:`bvh_from_points`.
     leaf_size
-        Passed to :class:`warp.Bvh`.
+        Leaf size when constructing ``bvh`` (ignored if ``bvh`` is provided).
 
     Returns
     -------
-    ``(m,)`` array of neighbor counts.
+    wp.array[wp.int32]
+        Length-``m`` device array whose ``k``-th element is the neighbor count for
+        ``queries[k]``. If ``n == 0``, returns zeros.
+
+    See Also
+    --------
+    query_ball
+    bvh_from_points
+    :meth:`scipy.spatial.KDTree.query_ball_point`
     """
     device = points.device
     n = int(points.shape[0])
@@ -97,31 +136,60 @@ def query_ball(
     | tuple[wp.array[wp.int32], wp.array[wp.float32]]
 ):
     """
-    Indices of ``points`` within Euclidean distance ``r`` of each query center,
-    analogous to :meth:`scipy.spatial.KDTree.query_ball_point` (``p=2``, exact).
+    Find all data points within distance ``r`` of each query center.
 
-    Uses the same BVH broad-phase cube ``[center ± r]`` and ``float32`` narrow-phase
-    distance test as :func:`remove_close`.
+    For each query ``q``, returns indices ``i`` such that ``‖points[i] − q‖₂ ≤ r`` and
+    the corresponding distances. Semantics match :meth:`scipy.spatial.KDTree.query_ball_point`
+    with ``p=2`` and ``eps=0`` (Minkowski-2, exact). Unlike SciPy, results are returned as
+    separate Warp arrays per query (or a single pair for one query), not Python lists inside
+    an object array.
+
+    Uses the same BVH broad-phase cube ``[center ± r]`` as :func:`remove_close` and a
+    ``float32`` Euclidean distance check ``‖points[i] - q‖₂ ≤ r``.
 
     Parameters
     ----------
     points
-        ``(n, 3)`` points stored as ``wp.vec3``.
+        ``(n, 3)`` data points stored as ``wp.vec3``.
     queries
-        ``(m, 3)`` query points stored as ``wp.vec3``.
+        Either ``(m, 3)`` query centers as ``wp.array[wp.vec3]``, or a single ``wp.vec3``
+        (treated as one query).
     r
-        Query radius (cast to ``float32`` in kernels).
+        Inclusion radius; cast to ``float32`` in kernels (non-negative).
     bvh
-        Optional BVH built from ``points``.
+        Optional pre-built BVH from ``points``. If ``None``, built via
+        :func:`bvh_from_points`.
     leaf_size
-        Passed to :class:`warp.Bvh`.
+        Leaf size when constructing ``bvh`` (ignored if ``bvh`` is provided).
     return_sorted
-        If True, each neighbor list is sorted by ascending distance. If False, traversal order.
-        Note that the returned indices are not sorted by ascending index as in the SciPy implementation.
+        If ``True``, neighbors within each query are ordered by increasing distance.
+        If ``False``, order follows tree traversal (undefined ordering).
 
     Returns
     -------
-    List of length ``m`` with ``(k,)`` array of neighbor indices for each query.
+    neighbor_indices, neighbor_distances
+        If ``queries`` is an array with ``m`` rows: two lists of length ``m``. Element ``k``
+        holds parallel rank-1 ``wp.array`` objects (dtype ``wp.int32`` and ``wp.float32``)
+        listing neighbor indices into ``points`` and their distances ``‖points[i] − q‖₂``
+        for ``queries[k]``.
+
+        If ``queries`` is a single ``wp.vec3``: returns one pair ``(indices, distances)``
+        as two rank-1 arrays (possibly length 0).
+
+        Empty inputs yield empty arrays; duplicate neighbors are not produced.
+
+    Notes
+    -----
+    SciPy may sort indices when ``return_sorted`` is left default on multi-point queries;
+    here sorting only occurs when ``return_sorted=True``, and sorts by distance, not by
+    index. Ball boundaries use ``float32`` arithmetic; extremely tight radii near representable
+    limits may disagree slightly with pure ``float64`` SciPy runs.
+
+    See Also
+    --------
+    query_ball_count
+    bvh_from_points
+    :meth:`scipy.spatial.KDTree.query_ball_point`
     """
     device = points.device
 
@@ -199,12 +267,6 @@ def query_ball(
             neighbor_indices_flat,
             total_neighbors,
             segment_bounds,
-        )
-        print(
-            "Indices flat",
-            neighbor_indices_flat.numpy(),
-            "Distances flat",
-            neighbor_distances_flat.numpy(),
         )
 
     neighbor_indices: list[wp.array[wp.int32]] = []
