@@ -15,7 +15,9 @@ def triangle_cross(vertices: wp.array[wp.vec3], face: wp.array[wp.int32]) -> wp.
 
 
 @wp.func
-def triangle_edges(vertices: wp.array[wp.vec3], face: wp.array[wp.int32]) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
+def triangle_edges(
+    vertices: wp.array[wp.vec3], face: wp.array[wp.int32]
+) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
     e0 = wp.vec3(*(vertices[face[1]] - vertices[face[0]]))
     e1 = wp.vec3(*(vertices[face[2]] - vertices[face[0]]))
     e2 = wp.vec3(*(vertices[face[2]] - vertices[face[1]]))
@@ -23,7 +25,9 @@ def triangle_edges(vertices: wp.array[wp.vec3], face: wp.array[wp.int32]) -> tup
 
 
 @wp.func
-def face_normals_and_area(vertices: wp.array[wp.vec3], face: wp.array[wp.int32]) -> tuple[wp.vec3, wp.float32]:
+def face_normals_and_area(
+    vertices: wp.array[wp.vec3], face: wp.array[wp.int32]
+) -> tuple[wp.vec3, wp.float32]:
     normal = triangle_cross(vertices, face)
     norm = wp.length(normal)
     if norm > TOLERANCE_ZERO:
@@ -39,7 +43,7 @@ def face_normals_and_areas(
     out_normals: wp.array[wp.vec3],
     out_areas: wp.array[wp.float32],
 ) -> None:
-    f = int(wp.tid())
+    f = wp.tid()
     normal, area = face_normals_and_area(vertices, faces[f * 3 : (f + 1) * 3])
     out_normals[f] = normal
     out_areas[f] = area
@@ -51,7 +55,7 @@ def angles(
     faces: wp.array[wp.int32],
     out_angles: wp.array[wp.vec3],
 ) -> None:
-    f = int(wp.tid())
+    f = wp.tid()
     edges = triangle_edges(vertices, faces[f * 3 : (f + 1) * 3])
 
     u = wp.normalize(edges[0])
@@ -77,7 +81,7 @@ def nondegenerate(
     faces: wp.array[wp.int32],
     out_nondegenerate: wp.array[wp.bool],
 ) -> None:
-    f = int(wp.tid())
+    f = wp.tid()
     triangle_face = faces[f * 3 : (f + 1) * 3]
     e0, e1, _ = triangle_edges(vertices, triangle_face)
     _, area = face_normals_and_area(vertices, triangle_face)
@@ -100,7 +104,7 @@ def barycentric_to_points(
     barycentric: wp.array[wp.vec3],
     out_points: wp.array[wp.vec3],
 ) -> None:
-    f = int(wp.tid())
+    f = wp.tid()
     triangle_face = faces[f * 3 : (f + 1) * 3]
     face_barycentric = barycentric[f]
     s = face_barycentric[0] + face_barycentric[1] + face_barycentric[2]
@@ -119,7 +123,7 @@ def points_to_barycentric_cramer(
     points: wp.array[wp.vec3],
     out_barycentric: wp.array[wp.vec3],
 ) -> None:
-    f = int(wp.tid())
+    f = wp.tid()
     triangle_face = faces[f * 3 : (f + 1) * 3]
     e0, e1, _ = triangle_edges(vertices, triangle_face)
     w = points[f] - vertices[triangle_face[0]]
@@ -141,7 +145,7 @@ def points_to_barycentric_cross(
     points: wp.array[wp.vec3],
     out_barycentric: wp.array[wp.vec3],
 ) -> None:
-    f = int(wp.tid())
+    f = wp.tid()
     triangle_face = faces[f * 3 : (f + 1) * 3]
     e0, e1, _ = triangle_edges(vertices, triangle_face)
     w = points[f] - vertices[triangle_face[0]]
@@ -159,7 +163,7 @@ def closest_point(
     points: wp.array[wp.vec3],
     out_closest: wp.array[wp.vec3],
 ) -> None:
-    f = int(wp.tid())
+    f = wp.tid()
     triangle_face = faces[f * 3 : (f + 1) * 3]
     ab, ac, bc = triangle_edges(vertices, triangle_face)
 
@@ -208,7 +212,11 @@ def closest_point(
 
     # check if P in edge region of BC, if so return projection of P onto BC
     va = (d3 * d6) - (d5 * d4)
-    is_bc = va < TOLERANCE_ZERO and (d4 - d3) > -TOLERANCE_ZERO and (d5 - d6) > -TOLERANCE_ZERO
+    is_bc = (
+        va < TOLERANCE_ZERO
+        and (d4 - d3) > -TOLERANCE_ZERO
+        and (d5 - d6) > -TOLERANCE_ZERO
+    )
     if is_bc:
         d43 = d4 - d3
         w = d43 / (d43 + (d5 - d6))

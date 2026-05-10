@@ -1,4 +1,24 @@
 import warp as wp
+import math
+
+
+@wp.kernel
+def aabb_bounds(
+    points: wp.array[wp.vec3],
+    out_min: wp.array[wp.float32],
+    out_max: wp.array[wp.float32],
+) -> None:
+    tid = wp.tid()
+    p = points[tid]
+
+    # Atomic operations for component-wise reduction
+    wp.atomic_min(out_min, 0, p[0])
+    wp.atomic_min(out_min, 1, p[1])
+    wp.atomic_min(out_min, 2, p[2])
+
+    wp.atomic_max(out_max, 0, p[0])
+    wp.atomic_max(out_max, 1, p[1])
+    wp.atomic_max(out_max, 2, p[2])
 
 
 @wp.kernel
@@ -9,7 +29,7 @@ def query_ball_count(
     radius: wp.float32,
     out_neighbor_counts: wp.array[wp.int32],
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.tid()
     q = queries[tid]
     r = radius
     lower = wp.vec3(q[0] - r, q[1] - r, q[2] - r)
@@ -23,6 +43,7 @@ def query_ball_count(
     out_neighbor_counts[tid] = c
 
 
+# TODO: Maybe use hashgrid
 @wp.kernel
 def query_ball_neighbors(
     points: wp.array[wp.vec3],
@@ -33,70 +54,57 @@ def query_ball_neighbors(
     out_indices: wp.array[wp.int32],
     out_distances: wp.array[wp.float32],
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.tid()
     q = queries[tid]
     r = radius
     lower = wp.vec3(q[0] - r, q[1] - r, q[2] - r)
     upper = wp.vec3(q[0] + r, q[1] + r, q[2] + r)
     query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    j = int(0)
+    point_idx = int(0)
     w = int(offsets[tid])
-    while wp.bvh_query_next(query, j):
-        d = wp.length(points[j] - q)
+    while wp.bvh_query_next(query, point_idx):
+        d = wp.length(points[point_idx] - q)
         if d <= r:
-            out_indices[w] = j
+            out_indices[w] = point_idx
             out_distances[w] = d
             w = w + 1
 
 
 @wp.kernel
-def count_close_pairs(
+def query_nearest_neighbors(
     points: wp.array[wp.vec3],
-    bvh_id: wp.uint64,
-    radius: wp.float32,
-    pair_count: wp.array[wp.int32],
+    queries: wp.array[wp.vec3],
+    grid_id: wp.uint64,
+    k: wp.int32,
+    max_radius: wp.float32,
+    out_indices: wp.array2d[wp.int32],
+    out_distances: wp.array2d[wp.float32],
 ) -> None:
-    i = int(wp.tid())
-    p = points[i]
-    r = radius
-    lower = wp.vec3(p[0] - r, p[1] - r, p[2] - r)
-    upper = wp.vec3(p[0] + r, p[1] + r, p[2] + r)
-    query = wp.bvh_query_aabb(bvh_id, lower, upper)
-    j = int(0)
-    c = int(0)
-    r2 = r * r
-    while wp.bvh_query_next(query, j):
-        if j > i:
-            q = points[j]
-            d = q - p
-            if wp.dot(d, d) <= r2:
-                c = c + 1
-    pair_count[i] = c
+    tid = wp.tid()
+    q = queries[tid]
 
+    query = wp.hash_grid_query(grid_id, q, max_radius)
+    point_index = int(-1)
 
-@wp.kernel
-def fill_close_pairs(
-    points: wp.array[wp.vec3],
-    bvh_id: wp.uint64,
-    radius: wp.float32,
-    offsets: wp.array[wp.int32],
-    pairs_a: wp.array[wp.int32],
-    pairs_b: wp.array[wp.int32],
-) -> None:
-    i = int(wp.tid())
-    p = points[i]
-    r = radius
-    lower = wp.vec3(p[0] - r, p[1] - r, p[2] - r)
-    upper = wp.vec3(p[0] + r, p[1] + r, p[2] + r)
-    query = wp.bvh_query_aabb(bvh_id, lower, upper)
-    j = int(0)
-    w = int(offsets[i])
-    r2 = r * r
-    while wp.bvh_query_next(query, j):
-        if j > i:
-            q = points[j]
-            d = q - p
-            if wp.dot(d, d) <= r2:
-                pairs_a[w] = i
-                pairs_b[w] = j
-                w = w + 1
+    while wp.hash_grid_query_next(query, point_index):
+        d = wp.length(points[point_index] - q)
+
+        if d > max_radius:
+            continue
+
+        if d >= out_distances[tid, k - 1]:
+            continue
+
+        if k == 1:
+            out_indices[tid, 0] = point_index
+            out_distances[tid, 0] = d
+        else:
+            pos = int(0)
+            while pos < k and d > out_distances[tid, pos]:
+                pos = pos + 1
+            if pos < k:
+                for s in range(k - 1, pos, -1):
+                    out_distances[tid, s] = out_distances[tid, s - 1]
+                    out_indices[tid, s] = out_indices[tid, s - 1]
+                out_distances[tid, pos] = d
+                out_indices[tid, pos] = point_index

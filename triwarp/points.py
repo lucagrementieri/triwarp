@@ -1,10 +1,27 @@
 from __future__ import annotations
 
-from typing import overload
+import math
+from typing import Literal, overload
 
 import warp as wp
 
 from triwarp.kernels import points as kernel_points
+
+
+def aabb_bounds(points: wp.array[wp.vec3]) -> float:
+    out_min = wp.full(3, math.inf, dtype=wp.float32, device=points.device)
+    out_max = wp.full(3, -math.inf, dtype=wp.float32, device=points.device)
+    wp.launch(
+        kernel_points.aabb_bounds,
+        dim=points.shape[0],
+        inputs=[points, out_min, out_max],
+        device=points.device,
+    )
+    out_min = out_min.list()
+    out_max = out_max.list()
+    min_bound = wp.vec3(out_min[0], out_min[1], out_min[2])
+    max_bound = wp.vec3(out_max[0], out_max[1], out_max[2])
+    return min_bound, max_bound
 
 
 def bvh_from_points(points: wp.array[wp.vec3], leaf_size: int) -> wp.Bvh:
@@ -31,9 +48,10 @@ def bvh_from_points(points: wp.array[wp.vec3], leaf_size: int) -> wp.Bvh:
     --------
     query_ball_count
     query_ball
+    query
     remove_close
     """
-    return wp.Bvh(points, wp.clone(points), leaf_size=leaf_size)
+    return wp.Bvh(points, points, leaf_size=leaf_size)
 
 
 def query_ball_count(
@@ -284,88 +302,128 @@ def query_ball(
     return neighbor_indices, neighbor_distances
 
 
-"""
-def _mask_from_close_pairs(pairs: np.ndarray, n: int) -> np.ndarray:
-    ""Trimesh-compatible greedy mask from unique pairs (i, j) with i < j.""
-    if pairs.size == 0:
-        return np.ones(n, dtype=bool)
-    count = np.bincount(pairs.ravel(), minlength=n)
-    column = count[pairs].argmax(axis=1)
-    highest = pairs.ravel()[column + 2 * np.arange(len(column), dtype=np.intp)]
-    mask = np.ones(n, dtype=bool)
-    mask[highest] = False
-    return mask
-
-
-def remove_close(
+def query(
     points: wp.array[wp.vec3],
-    radius: float,
+    queries: wp.array[wp.vec3] | wp.vec3,
+    k: int = 1,
     *,
-    leaf_size: int = 4,
-) -> tuple[np.ndarray, np.ndarray]:
-    ""
-    Return a subset of 3-D points where no two kept points have Euclidean distance
-    at most ``radius``, using the same greedy rule as :func:`trimesh.points.remove_close`.
+    max_radius: float = math.inf,
+    grid_bins: int = 128,
+) -> tuple[wp.array2d[wp.int32], wp.array2d[wp.float32]]:  # TODO fix types for k =1
+    """
+    For each query center, find the ``k`` nearest points in Euclidean distance.
 
-    Broad-phase search uses a Warp :class:`warp.Bvh` over degenerate point bounds; each
-    query is an axis-aligned cube of half-extent ``radius``. Narrow-phase filters with
-    squared distance in ``float32``.
+    Semantics follow :meth:`scipy.spatial.KDTree.query` with ``p=2`` and ``eps=0`` (exact
+    Minkowski-2). Distances use ``float32`` (``wp.length``), so results may differ slightly
+    from a ``float64`` SciPy tree on the same inputs. Missing neighbors (too few points,
+    or ``distance_upper_bound`` too tight) use ``inf`` distance and a sentinel index: ``n``
+    when ``n > 0``, otherwise ``0``, matching SciPy.
+
+    Neighbor search uses a :class:`warp.HashGrid` spatial hash: points are bucketed with
+    cell size matching the search radius, and each query scans candidates within that
+    radius (from ``distance_upper_bound`` when finite, otherwise within the bounding box
+    of ``points`` and ``queries``). ``k`` nearest candidates are maintained per query in
+    sorted order (same semantics as before).
 
     Parameters
     ----------
     points
-        ``(n, 3)`` positions as ``wp.vec3`` (typically ``float32`` components).
-    radius
-        Maximum distance defining close pairs (passed as ``float32`` to kernels).
-    leaf_size
-        BVH leaf size (see Warp ``Bvh`` documentation).
+        ``(n, 3)`` data points as ``wp.vec3``.
+    queries
+        ``(m, 3)`` query centers as ``wp.array[wp.vec3]``, or one ``wp.vec3``.
+    k
+        Number of neighbors (``1 <= k <= 32``).
+    max_radius
+        Only neighbors within this Euclidean distance are considered; forwarded as
+        ``float32``. Use ``math.inf`` for no bound.
 
     Returns
     -------
-    culled
-        ``(m, 3)`` float array of kept points (same dtype as ``points.numpy()``).
-    mask
-        ``(n,)`` boolean mask into the original ordering.
-    ""
+    distances, indices
+        ``wp.array[wp.float32]`` and ``wp.array[wp.int32]`` with the same length:
+
+        * ``queries`` array, ``k > 1``: length ``m * k`` (row-major: query ``q``,
+          neighbor ``t`` at ``distances[q * k + t]``), sorted by increasing distance per query.
+        * ``queries`` array, ``k == 1``: length ``m`` (nearest distance / index per query).
+        * Single ``wp.vec3``: length ``k``.
+
+        If ``m == 0``, returns empty arrays. If ``n == 0``, all distances are ``inf`` and
+        indices are ``0`` (SciPy behavior), with the same shapes as when ``n > 0``.
+
+    Raises
+    ------
+    ValueError
+        If ``k`` is out of range.
+
+    See Also
+    --------
+    query_ball
+    :meth:`scipy.spatial.KDTree.query`
+    """
+    if k < 1:
+        raise ValueError("k must be >= 1")
+    if max_radius < 0:
+        raise ValueError("max_radius must be >= 0")
+
     device = points.device
+    single_query = isinstance(queries, wp.vec3)
+    if single_query:
+        queries = wp.array([queries], dtype=wp.vec3, device=device)
+
+    m = int(queries.shape[0])
     n = int(points.shape[0])
+
+    if m == 0:
+        return (
+            wp.empty((0, k), dtype=wp.int32, device=device),
+            wp.empty((0, k), dtype=wp.float32, device=device),
+        )
+
+    neighbor_indices = wp.full((m, k), wp.int32(-1), dtype=wp.int32, device=device)
+    neighbor_distances = wp.full((m, k), math.inf, dtype=wp.float32, device=device)
     if n == 0:
-        empty = np.zeros((0, 3), dtype=np.float32)
-        return empty, np.ones(0, dtype=bool)
+        if single_query:
+            return neighbor_indices[0], neighbor_distances[0]
+        return neighbor_indices, neighbor_distances
 
-    bvh = bvh_from_points(points, leaf_size)
+    min_points_bound, max_points_bound = aabb_bounds(points)
+    min_queries_bound, max_queries_bound = aabb_bounds(queries)
+    min_bound = wp.vec3(
+        min(min_points_bound.x, min_queries_bound.x),
+        min(min_points_bound.y, min_queries_bound.y),
+        min(min_points_bound.z, min_queries_bound.z),
+    )
+    max_bound = wp.vec3(
+        max(max_points_bound.x, max_queries_bound.x),
+        max(max_points_bound.y, max_queries_bound.y),
+        max(max_points_bound.z, max_queries_bound.z),
+    )
+    diagonal = wp.length(max_bound - min_bound)
+    max_radius = min(max_radius, max(diagonal, 1e-12))
 
-    pair_count = wp.empty(n, dtype=wp.int32, device=device)
+    grid = wp.HashGrid(grid_bins, grid_bins, grid_bins, device=device)
+    grid.reserve(n)
+    grid.build(points, max_radius)
+
     wp.launch(
-        kernel_points.count_close_pairs,
-        dim=n,
-        inputs=[points, bvh.id, wp.float32(radius), pair_count],
+        kernel_points.query_nearest_neighbors,
+        dim=m,
+        inputs=[
+            points,
+            queries,
+            grid.id,
+            wp.int32(k),
+            wp.float32(max_radius),
+            neighbor_indices,
+            neighbor_distances,
+        ],
         device=device,
     )
 
-    counts = pair_count.numpy()
-    total_pairs = int(counts.sum())
-    if total_pairs == 0:
-        mask = np.ones(n, dtype=bool)
-        pts_np = points.numpy()
-        return pts_np, mask
+    if k == 1:
+        neighbor_indices = neighbor_indices.reshape(-1)
+        neighbor_distances = neighbor_distances.reshape(-1)
 
-    offsets_np = np.zeros(n, dtype=np.int32)
-    if n > 1:
-        offsets_np[1:] = np.cumsum(counts[:-1])
-    offsets = wp.array(offsets_np, dtype=wp.int32, device=device)
-
-    pairs_a = wp.empty(total_pairs, dtype=wp.int32, device=device)
-    pairs_b = wp.empty(total_pairs, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_points.fill_close_pairs,
-        dim=n,
-        inputs=[points, bvh.id, wp.float32(radius), offsets, pairs_a, pairs_b],
-        device=device,
-    )
-
-    pairs = np.column_stack((pairs_a.numpy(), pairs_b.numpy()))
-    mask = _mask_from_close_pairs(pairs, n)
-    pts_np = points.numpy()
-    return pts_np[mask], mask
-"""
+    if single_query and k > 1:
+        return neighbor_indices[0], neighbor_distances[0]
+    return neighbor_indices, neighbor_distances
