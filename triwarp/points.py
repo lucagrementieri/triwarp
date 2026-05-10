@@ -116,7 +116,8 @@ def query_ball(
     leaf_size
         Passed to :class:`warp.Bvh`.
     return_sorted
-        If True, each neighbor list is sorted ascending. If False, traversal order.
+        If True, each neighbor list is sorted by ascending distance. If False, traversal order.
+        Note that the returned indices are not sorted by ascending index as in the SciPy implementation.
 
     Returns
     -------
@@ -183,8 +184,6 @@ def query_ball(
         device=device,
     )
 
-    offsets_np = offsets.numpy()
-
     if return_sorted:
         segment_bounds = wp.empty(m + 1, dtype=wp.int32, device=device)
         wp.copy(segment_bounds, offsets, dest_offset=0, src_offset=0, count=m)
@@ -201,12 +200,20 @@ def query_ball(
             total_neighbors,
             segment_bounds,
         )
+        print(
+            "Indices flat",
+            neighbor_indices_flat.numpy(),
+            "Distances flat",
+            neighbor_distances_flat.numpy(),
+        )
 
     neighbor_indices: list[wp.array[wp.int32]] = []
     neighbor_distances: list[wp.array[wp.float32]] = []
+
+    offsets_list = offsets.list()
     for k in range(m):
-        start = int(offsets_np[k])
-        end = int(offsets_np[k + 1]) if k < m - 1 else total_neighbors
+        start = offsets_list[k]
+        end = offsets_list[k + 1] if k < m - 1 else total_neighbors
         neighbor_indices.append(wp.clone(neighbor_indices_flat[start:end]))
         neighbor_distances.append(wp.clone(neighbor_distances_flat[start:end]))
 
