@@ -22,15 +22,14 @@ def linear_search_index(values: wp.array[wp.Scalar], value: wp.Scalar) -> wp.int
 @wp.func
 def binary_search_index(values: wp.array[wp.Scalar], value: wp.Scalar) -> wp.int32:
     n = values.shape[0]
-    left = 0
+    left = int(0)
     right = n - 1
+    result = n
     while left <= right:
         mid = (left + right) // 2
-        if values[mid] == value:
-            return wp.int32(mid)
-        elif values[mid] < value:
-            left = mid + 1
-        else:
+        if values[mid] > value:
+            result = mid
             right = mid - 1
-    # left == n when value is greater than every element
-    return wp.int32(left)
+        else:
+            left = mid + 1
+    return wp.int32(result)

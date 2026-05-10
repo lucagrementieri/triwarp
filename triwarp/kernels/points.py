@@ -1,5 +1,5 @@
 import warp as wp
-import math
+from triwarp.kernels.array import array_shift_insert, binary_search_index
 
 
 @wp.kernel
@@ -76,20 +76,20 @@ def query_nearest_neighbors(
     queries: wp.array[wp.vec3],
     grid_id: wp.uint64,
     k: wp.int32,
-    max_radius: wp.float32,
+    radius: wp.float32,
     out_indices: wp.array2d[wp.int32],
     out_distances: wp.array2d[wp.float32],
 ) -> None:
     tid = wp.tid()
     q = queries[tid]
 
-    query = wp.hash_grid_query(grid_id, q, max_radius)
+    query = wp.hash_grid_query(grid_id, q, radius)
     point_index = int(-1)
 
     while wp.hash_grid_query_next(query, point_index):
         d = wp.length(points[point_index] - q)
 
-        if d > max_radius:
+        if d > radius:
             continue
 
         if d >= out_distances[tid, k - 1]:
@@ -98,13 +98,8 @@ def query_nearest_neighbors(
         if k == 1:
             out_indices[tid, 0] = point_index
             out_distances[tid, 0] = d
-        else:
-            pos = int(0)
-            while pos < k and d > out_distances[tid, pos]:
-                pos = pos + 1
-            if pos < k:
-                for s in range(k - 1, pos, -1):
-                    out_distances[tid, s] = out_distances[tid, s - 1]
-                    out_indices[tid, s] = out_indices[tid, s - 1]
-                out_distances[tid, pos] = d
-                out_indices[tid, pos] = point_index
+            continue
+
+        slot = binary_search_index(out_distances[tid], d)
+        array_shift_insert(out_distances[tid], d, slot)
+        array_shift_insert(out_indices[tid], point_index, slot)

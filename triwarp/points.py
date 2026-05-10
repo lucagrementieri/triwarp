@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Literal, overload
+from typing import overload
 
 import warp as wp
 
@@ -302,7 +302,7 @@ def query_ball(
     return neighbor_indices, neighbor_distances
 
 
-def query(
+def query_nearest(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3] | wp.vec3,
     k: int = 1,
@@ -311,49 +311,56 @@ def query(
     grid_bins: int = 128,
 ) -> tuple[wp.array2d[wp.int32], wp.array2d[wp.float32]]:  # TODO fix types for k =1
     """
-    For each query center, find the ``k`` nearest points in Euclidean distance.
+    For each query center, find the ``k`` nearest data points in Euclidean distance (``p=2``).
 
-    Semantics follow :meth:`scipy.spatial.KDTree.query` with ``p=2`` and ``eps=0`` (exact
-    Minkowski-2). Distances use ``float32`` (``wp.length``), so results may differ slightly
-    from a ``float64`` SciPy tree on the same inputs. Missing neighbors (too few points,
-    or ``distance_upper_bound`` too tight) use ``inf`` distance and a sentinel index: ``n``
-    when ``n > 0``, otherwise ``0``, matching SciPy.
+    Distances are ``float32`` via ``wp.length``, so they can differ from a ``float64`` reference
+    on the same coordinates. For each query, at most ``k`` neighbors with distance ``<=`` the
+    effective radius are kept; unused slots stay at distance ``inf`` and index ``-1`` (e.g. when
+    there are fewer than ``k`` points within that radius, or when ``n == 0``).
 
-    Neighbor search uses a :class:`warp.HashGrid` spatial hash: points are bucketed with
-    cell size matching the search radius, and each query scans candidates within that
-    radius (from ``distance_upper_bound`` when finite, otherwise within the bounding box
-    of ``points`` and ``queries``). ``k`` nearest candidates are maintained per query in
-    sorted order (same semantics as before).
+    Implementation: a 3D :class:`warp.HashGrid` with ``grid_bins`` cells per axis is built from
+    ``points`` using the (possibly clamped) radius below. Each query runs ``wp.hash_grid_query``
+    out to that radius and updates a per-query sorted list of the ``k`` smallest distances
+    (binary search + shift insert in the kernel when ``k > 1``; a single running minimum when
+    ``k == 1``).
+
+    The radius passed to the grid is ``min(max_radius, max(diagonal, 1e-12))``, where
+    ``diagonal`` is the length of the axis-aligned box that contains both ``points`` and
+    ``queries``. So a user ``max_radius`` larger than that span is capped; ``math.inf`` means
+    “use the scene diagonal”.
 
     Parameters
     ----------
     points
-        ``(n, 3)`` data points as ``wp.vec3``.
+        ``n`` data points as ``wp.array[wp.vec3]``.
     queries
-        ``(m, 3)`` query centers as ``wp.array[wp.vec3]``, or one ``wp.vec3``.
+        ``m`` query centers as ``wp.array[wp.vec3]``, or a single ``wp.vec3`` (treated as ``m=1``).
     k
-        Number of neighbors (``1 <= k <= 32``).
+        Number of neighbors per query; must be ``>= 1``.
     max_radius
-        Only neighbors within this Euclidean distance are considered; forwarded as
-        ``float32``. Use ``math.inf`` for no bound.
+        Ignore point--query pairs whose distance is strictly greater than this bound (stored as
+        ``float32``). Must be ``>= 0``.
+    grid_bins
+        Resolution of the hash grid along each axis (``grid_bins`` cubed cells).
 
     Returns
     -------
-    distances, indices
-        ``wp.array[wp.float32]`` and ``wp.array[wp.int32]`` with the same length:
+    indices, distances
+        Pair of ``wp.array2d`` with shape ``(m, k)``, row ``q`` listing neighbors for ``queries[q]``
+        in non-decreasing distance order (when ``k > 1`` and neighbors exist in that row).
 
-        * ``queries`` array, ``k > 1``: length ``m * k`` (row-major: query ``q``,
-          neighbor ``t`` at ``distances[q * k + t]``), sorted by increasing distance per query.
-        * ``queries`` array, ``k == 1``: length ``m`` (nearest distance / index per query).
-        * Single ``wp.vec3``: length ``k``.
-
-        If ``m == 0``, returns empty arrays. If ``n == 0``, all distances are ``inf`` and
-        indices are ``0`` (SciPy behavior), with the same shapes as when ``n > 0``.
+        * If ``k == 1``, both arrays are reshaped to length ``m`` (one index and one distance
+          per query).
+        * If ``queries`` was a single ``wp.vec3`` and ``k > 1``, returns two length-``k`` 1D
+          arrays (the sole query row). If ``k == 1``, returns two length-1 1D arrays.
+        * If ``m == 0``, returns empty ``(0, k)`` arrays.
+        * If ``n == 0`` but ``m > 0``, returns the pre-filled ``(m, k)`` arrays of ``inf`` and
+          ``-1`` (or the corresponding 1D slices for a single ``wp.vec3`` query).
 
     Raises
     ------
     ValueError
-        If ``k`` is out of range.
+        If ``k < 1`` or ``max_radius < 0``.
 
     See Also
     --------
