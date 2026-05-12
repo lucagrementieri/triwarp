@@ -21,17 +21,6 @@ wheels = [
 ]
 
 [[package]]
-name = "newton"
-version = "1.1.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "warp-lang" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/54/5c/2e16bae91f87b051038e7619bcf1287224a2bdf1fca4213a06ccf68cc1b8/newton-1.1.0-py3-none-any.whl", hash = "sha256:38a04d3636b28ed2114f94918c2f58ddd3231ac843c7159c4fb18eee89cdf4bc", size = 5182985, upload-time = "2026-04-13T13:23:49.916Z" },
-]
-
-[[package]]
 name = "numpy"
 version = "2.4.4"
 source = { registry = "https://pypi.org/simple" }
@@ -300,7 +289,6 @@ name = "triwarp"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "newton" },
     { name = "warp-lang" },
 ]
 
@@ -315,7 +303,6 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "newton", specifier = ">=1.1.0" },
     { name = "numpy", marker = "extra == 'test'", specifier = ">=2.4" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=9.0" },
     { name = "scipy", marker = "extra == 'test'", specifier = ">=1.17" },

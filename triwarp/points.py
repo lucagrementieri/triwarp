@@ -1,14 +1,30 @@
 from __future__ import annotations
 
 import math
-from typing import overload
+from typing import overload, Literal
 
 import warp as wp
-
 from triwarp.kernels import points as kernel_points
 
 
 def aabb_bounds(points: wp.array[wp.vec3]) -> float:
+    """
+    Axis-aligned bounding box of ``points`` (component-wise min / max).
+
+    The reduction runs on ``points.device`` in ``float32`` via atomic min/max per axis.
+
+    Parameters
+    ----------
+    points
+        ``(n, 3)`` positions as ``wp.vec3``.
+
+    Returns
+    -------
+    tuple[wp.vec3, wp.vec3]
+        ``(min_bound, max_bound)`` with ``min_bound[i] ≤ p[i] ≤ max_bound[i]`` for every
+        point ``p`` and axis ``i``. If ``n == 0``, ``min_bound`` is ``(+inf, …)`` and
+        ``max_bound`` is ``(-inf, …)`` (initial reduction buffers unchanged).
+    """
     out_min = wp.full(3, math.inf, dtype=wp.float32, device=points.device)
     out_max = wp.full(3, -math.inf, dtype=wp.float32, device=points.device)
     wp.launch(
@@ -302,6 +318,24 @@ def query_ball(
     return neighbor_indices, neighbor_distances
 
 
+@overload
+def query_nearest(
+    points: wp.array[wp.vec3],
+    queries: wp.vec3,
+    k: int = 1,
+    *,
+    max_radius: float = math.inf,
+    grid_bins: int = 128,
+) -> tuple[wp.array[wp.int32], wp.array[wp.float32]]: ...
+@overload
+def query_nearest(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3] | wp.vec3,
+    k: Literal[1] = 1,
+    *,
+    max_radius: float = math.inf,
+    grid_bins: int = 128,
+) -> tuple[wp.array[wp.int32], wp.array[wp.float32]]: ...
 def query_nearest(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3] | wp.vec3,
@@ -309,7 +343,10 @@ def query_nearest(
     *,
     max_radius: float = math.inf,
     grid_bins: int = 128,
-) -> tuple[wp.array2d[wp.int32], wp.array2d[wp.float32]]:  # TODO fix types for k =1
+) -> tuple[
+    wp.array2d[wp.int32] | wp.array[wp.int32],
+    wp.array2d[wp.float32] | wp.array[wp.float32],
+]:
     """
     For each query center, find the ``k`` nearest data points in Euclidean distance (``p=2``).
 
