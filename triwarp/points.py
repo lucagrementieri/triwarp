@@ -7,7 +7,7 @@ import warp as wp
 from triwarp.kernels import points as kernel_points
 
 
-def aabb_bounds(points: wp.array[wp.vec3]) -> float:
+def aabb_bounds(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     """
     Axis-aligned bounding box of ``points`` (component-wise min / max).
 
@@ -165,10 +165,7 @@ def query_ball(
     bvh: wp.Bvh | None = None,
     leaf_size: int = 4,
     return_sorted: bool = False,
-) -> (
-    tuple[list[wp.array[wp.int32]], list[wp.array[wp.float32]]]
-    | tuple[wp.array[wp.int32], wp.array[wp.float32]]
-):
+) -> tuple[list[wp.array[wp.int32]], list[wp.array[wp.float32]]] | tuple[wp.array[wp.int32], wp.array[wp.float32]]:
     """
     Find all data points within distance ``r`` of each query center.
 

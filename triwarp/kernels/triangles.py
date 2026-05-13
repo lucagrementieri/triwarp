@@ -15,9 +15,7 @@ def triangle_cross(vertices: wp.array[wp.vec3], face: wp.array[wp.int32]) -> wp.
 
 
 @wp.func
-def triangle_edges(
-    vertices: wp.array[wp.vec3], face: wp.array[wp.int32]
-) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
+def triangle_edges(vertices: wp.array[wp.vec3], face: wp.array[wp.int32]) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
     e0 = wp.vec3(*(vertices[face[1]] - vertices[face[0]]))
     e1 = wp.vec3(*(vertices[face[2]] - vertices[face[0]]))
     e2 = wp.vec3(*(vertices[face[2]] - vertices[face[1]]))
@@ -25,9 +23,7 @@ def triangle_edges(
 
 
 @wp.func
-def face_normals_and_area(
-    vertices: wp.array[wp.vec3], face: wp.array[wp.int32]
-) -> tuple[wp.vec3, wp.float32]:
+def face_normals_and_area(vertices: wp.array[wp.vec3], face: wp.array[wp.int32]) -> tuple[wp.vec3, wp.float32]:
     normal = triangle_cross(vertices, face)
     norm = wp.length(normal)
     if norm > TOLERANCE_ZERO:
@@ -73,6 +69,23 @@ def angles(
     )
     if degen:
         out_angles[f] = wp.vec3(0.0, 0.0, 0.0)
+
+
+@wp.kernel
+def centroid(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    out_centroid: wp.array[wp.float32],
+    out_total_area: wp.array[wp.float32],
+) -> None:
+    f = int(wp.tid())
+    triangle_face = faces[f * 3 : (f + 1) * 3]
+    _, area = face_normals_and_area(vertices, triangle_face)
+    centroid = (vertices[triangle_face[0]] + vertices[triangle_face[1]] + vertices[triangle_face[2]]) / 3.0
+    wp.atomic_add(out_centroid, 0, centroid[0] * area)
+    wp.atomic_add(out_centroid, 1, centroid[1] * area)
+    wp.atomic_add(out_centroid, 2, centroid[2] * area)
+    wp.atomic_add(out_total_area, 0, area)
 
 
 @wp.kernel
@@ -212,11 +225,7 @@ def closest_point(
 
     # check if P in edge region of BC, if so return projection of P onto BC
     va = (d3 * d6) - (d5 * d4)
-    is_bc = (
-        va < TOLERANCE_ZERO
-        and (d4 - d3) > -TOLERANCE_ZERO
-        and (d5 - d6) > -TOLERANCE_ZERO
-    )
+    is_bc = va < TOLERANCE_ZERO and (d4 - d3) > -TOLERANCE_ZERO and (d5 - d6) > -TOLERANCE_ZERO
     if is_bc:
         d43 = d4 - d3
         w = d43 / (d43 + (d5 - d6))

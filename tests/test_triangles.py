@@ -63,3 +63,21 @@ def test_closest_point(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     points_wp = wp.array(points_np, dtype=wp.vec3, device=mesh_wp.points.device)
     closest_points_wp = tw.triangles.closest_point(mesh_wp.points, mesh_wp.indices, points_wp)
     assert np.allclose(closest_points_wp.numpy(), closest_points_tm, rtol=1e-5, atol=1e-5)
+
+
+def test_centroid(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = hemisphere
+
+    centroid_tm = mesh_tm.centroid
+
+    centroid_wp = tw.triangles.centroid(mesh_wp.points, mesh_wp.indices)
+    centroid_wp = np.array([centroid_wp.x, centroid_wp.y, centroid_wp.z])
+    assert np.allclose(centroid_wp, centroid_tm, rtol=1e-5, atol=1e-5)
+
+
+def test_centroid_empty(device: str):
+    vertices = wp.zeros(1, dtype=wp.vec3, device=device)
+    faces = wp.array([], dtype=wp.int32, device=device)
+    centroid_wp = tw.triangles.centroid(vertices, faces)
+    centroid_wp = np.array([centroid_wp.x, centroid_wp.y, centroid_wp.z])
+    assert np.isnan(centroid_wp).all()
