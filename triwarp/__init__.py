@@ -3,5 +3,6 @@
 from . import points
 from . import sample
 from . import triangles
+from . import geometry
 
-__all__ = ["points", "sample", "triangles"]
+__all__ = ["points", "sample", "triangles", "geometry"]
