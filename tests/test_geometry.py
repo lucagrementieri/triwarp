@@ -23,6 +23,7 @@ def test_index_sparse(data: npt.NDArray[np.int32] | None, device: str):
     data_wp = wp.array(data, dtype=wp.int32, device=device) if data is not None else None
 
     result_wp = tw.geometry.index_sparse(n_rows, indices_wp, data_wp)
+    assert result_wp.values.dtype == (data_wp.dtype if data_wp is not None else wp.float32)
     assert np.array_equal(result_wp.offsets.numpy(), result_np.indptr)
     assert np.array_equal(result_wp.values.numpy(), result_np.data)
 
@@ -34,9 +35,10 @@ def test_index_sparse_repeated_indices(device: str):
     result_np = tm.geometry.index_sparse(n_rows, indices, data).tocsr()
 
     indices_wp = wp.array(indices, dtype=wp.int32, device=device)
-    data_wp = wp.array(data, dtype=wp.int32, device=device) if data is not None else None
+    data_wp = wp.array(data, dtype=wp.int32, device=device)
 
-    result_wp = tw.geometry.index_sparse(n_rows, indices_wp, data_wp)
+    result_wp = tw.geometry.index_sparse(n_rows, indices_wp, data_wp, dtype=wp.float64)
+    assert result_wp.values.dtype == wp.float64
     result_csr = scipy.sparse.csr_matrix(
         (result_wp.values.numpy(), result_wp.columns.numpy(), result_wp.offsets.numpy()), shape=result_wp.shape
     )
