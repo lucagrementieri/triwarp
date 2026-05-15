@@ -1,5 +1,5 @@
 import warp as wp
-from triwarp.kernels.array import array_shift_insert, binary_search_index
+from triwarp.kernels import array as kernel_array
 
 
 @wp.kernel
@@ -100,6 +100,6 @@ def query_nearest_neighbors(
             out_distances[tid, 0] = d
             continue
 
-        slot = binary_search_index(out_distances[tid], d)
-        array_shift_insert(out_distances[tid], d, slot)
-        array_shift_insert(out_indices[tid], point_index, slot)
+        slot = kernel_array.binary_search_index(out_distances[tid], d)
+        kernel_array.array_shift_insert(out_distances[tid], d, slot)
+        kernel_array.array_shift_insert(out_indices[tid], point_index, slot)

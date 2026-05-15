@@ -1,9 +1,67 @@
 """Mesh connectivity helpers on NVIDIA Warp."""
 
+from __future__ import annotations
+
+from collections.abc import Sequence
+
 import warp as wp
 import warp.sparse as wps
 
-from typing import Union  # pyright: ignore[reportDeprecated]
+from typing import Union, Any  # pyright: ignore[reportDeprecated]
+
+
+def pack_1d_arrays(arrays: Sequence[wp.array[Any]]) -> tuple[wp.array[Any], wp.array[wp.int32]]:  # pyright: ignore[reportExplicitAny]
+    """
+    Concatenate several 1-D :class:`warp.array` instances into one buffer plus CSR-style offsets.
+
+    Each input segment ``i`` occupies ``flat[offsets[i] : offsets[i + 1]]``. This is the usual
+    packed representation for variable-length per-item lists on the device (no nested arrays).
+
+    Parameters
+    ----------
+    arrays
+        Non-empty sequence of 1-D arrays sharing the same ``dtype`` and ``device``.
+
+    Returns
+    -------
+    flat
+        1-D array of length ``sum(a.size for a in arrays)``, same ``dtype`` and ``device`` as the inputs.
+    offsets
+        Length ``len(arrays) + 1``, ``dtype`` ``wp.int32``, same ``device`` as the inputs.
+        ``offsets[0] == 0`` and ``offsets[-1] == flat.size``.
+
+    Raises
+    ------
+    ValueError
+        If ``arrays`` is empty, ranks differ from one, or ``dtype`` / ``device`` are inconsistent.
+    """
+    if len(arrays) == 0:
+        raise ValueError("arrays must be non-empty")
+
+    dtype = arrays[0].dtype
+    device = arrays[0].device
+    sizes = []
+    offsets = [0]
+    for i, arr in enumerate(arrays):
+        if arr.dtype != dtype:
+            raise ValueError(
+                "all arrays must have the same dtype, got {} and {} at index {}".format(dtype, arr.dtype, i)
+            )
+        if arr.device != device:
+            raise ValueError(
+                "all arrays must live on the same device, got {!r} and {!r} at index {}".format(device, arr.device, i)
+            )
+        sizes.append(int(arr.size))
+        offsets.append(offsets[-1] + sizes[-1])
+
+    total = offsets.pop()
+    flat = wp.empty(total, dtype=dtype, device=device)
+    for array, offset in zip(arrays, offsets, strict=True):
+        array_length = int(array.size)
+        if array_length > 0:
+            wp.copy(flat, array, dest_offset=offset, src_offset=0, count=array_length)
+
+    return flat, wp.array(offsets, dtype=wp.int32, device=device)
 
 
 def index_sparse(

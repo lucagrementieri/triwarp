@@ -18,9 +18,9 @@ def face_normals_and_areas(
     return out_normal, out_area
 
 
-def face_angles(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array[wp.vec3]:
+def face_angles(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array2d[wp.float32]:
     f = faces.shape[0] // 3
-    out_angle = wp.empty(f, dtype=wp.vec3, device=vertices.device)
+    out_angle = wp.empty((f, 3), dtype=wp.float32, device=vertices.device)
     wp.launch(
         kernel_triangles.angles,
         dim=f,

@@ -12,6 +12,40 @@ import trimesh as tm
 import triwarp as tw
 
 
+def test_pack_1d_wp_arrays(device: str):
+    parts = [
+        wp.array([1, 2, 3], dtype=wp.int32, device=device),
+        wp.array([], dtype=wp.int32, device=device),
+        wp.array([4], dtype=wp.int32, device=device),
+    ]
+    flat, offsets = tw.geometry.pack_1d_arrays(parts)
+    assert flat.device == device
+    assert offsets.device == device
+    assert np.array_equal(flat.numpy(), np.array([1, 2, 3, 4], dtype=np.int32))
+    assert np.array_equal(offsets.numpy(), np.array([0, 3, 3], dtype=np.int32))
+
+
+def test_pack_1d_wp_arrays_vec3(device: str):
+    parts = [
+        wp.array([wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0)], dtype=wp.vec3, device=device),
+        wp.array([wp.vec3(2.0, 2.0, 2.0)], dtype=wp.vec3, device=device),
+    ]
+    flat, offsets = tw.geometry.pack_1d_arrays(parts)
+    exp = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [2.0, 2.0, 2.0]], dtype=np.float32)
+    got = flat.numpy().reshape(-1, 3)
+    assert np.allclose(got, exp, rtol=1e-5, atol=1e-5)
+    assert np.array_equal(offsets.numpy(), np.array([0, 2], dtype=np.int32))
+
+
+def test_pack_1d_wp_arrays_dtype_mismatch(device: str):
+    parts = [
+        wp.array([1], dtype=wp.int32, device=device),
+        wp.array([2.0], dtype=wp.float32, device=device),
+    ]
+    with pytest.raises(ValueError, match="same dtype"):
+        tw.geometry.pack_1d_arrays(parts)
+
+
 @pytest.mark.parametrize("data", (None, np.arange(1, 13, dtype=np.int32)))
 def test_index_sparse(data: npt.NDArray[np.int32] | None, device: str):
     n_rows = 4

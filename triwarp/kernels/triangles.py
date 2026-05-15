@@ -49,7 +49,7 @@ def face_normals_and_areas(
 def angles(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
-    out_angles: wp.array[wp.vec3],
+    out_angles: wp.array2d[wp.float32],
 ) -> None:
     f = wp.tid()
     edges = triangle_edges(vertices, faces[f * 3 : (f + 1) * 3])
@@ -58,9 +58,9 @@ def angles(
     v = wp.normalize(edges[1])
     w = wp.normalize(edges[2])
 
-    out_angles[f][0] = wp.acos(wp.clamp(wp.dot(u, v), -1.0, 1.0))
-    out_angles[f][1] = wp.acos(wp.clamp(wp.dot(-u, w), -1.0, 1.0))
-    out_angles[f][2] = wp.pi - out_angles[f][0] - out_angles[f][1]
+    out_angles[f, 0] = wp.acos(wp.clamp(wp.dot(u, v), -1.0, 1.0))
+    out_angles[f, 1] = wp.acos(wp.clamp(wp.dot(-u, w), -1.0, 1.0))
+    out_angles[f, 2] = wp.pi - out_angles[f, 0] - out_angles[f, 1]
 
     degen = (
         (out_angles[f][0] < TOLERANCE_MERGE)
@@ -68,7 +68,9 @@ def angles(
         or (out_angles[f][2] < TOLERANCE_MERGE)
     )
     if degen:
-        out_angles[f] = wp.vec3(0.0, 0.0, 0.0)
+        out_angles[f, 0] = 0.0
+        out_angles[f, 1] = 0.0
+        out_angles[f, 2] = 0.0
 
 
 @wp.kernel
