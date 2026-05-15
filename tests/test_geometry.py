@@ -12,10 +12,10 @@ import trimesh as tm
 import triwarp as tw
 
 
-@pytest.mark.parametrize("data", (None, np.arange(1, 10, dtype=np.int32)))
+@pytest.mark.parametrize("data", (None, np.arange(1, 13, dtype=np.int32)))
 def test_index_sparse(data: npt.NDArray[np.int32] | None, device: str):
     n_rows = 4
-    indices = np.array([[0, 1, 2], [0, 3, 1], [1, 2, 3]])
+    indices = np.array([[0, 1, 2], [0, 3, 1], [1, 2, 3], [0, 2, 3]])
 
     result_np = tm.geometry.index_sparse(n_rows, indices, data).tocsr()
 

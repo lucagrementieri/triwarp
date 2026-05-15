@@ -1,7 +1,6 @@
 """Mesh connectivity helpers on NVIDIA Warp."""
 
 import warp as wp
-import numpy as np
 import warp.sparse as wps
 
 from typing import Union  # pyright: ignore[reportDeprecated]
@@ -52,7 +51,7 @@ def index_sparse(
             data = casted_data
 
     n_cols, n_repeats = indices.shape
-    cols = wp.array(np.repeat(np.arange(n_cols), n_repeats), dtype=wp.int32)
+    cols = wp.array([c for c in range(n_cols) for _ in range(n_repeats)], dtype=wp.int32)
     return wps.bsr_from_triplets(
         n_rows, indices.shape[0], indices.flatten(), cols, data, prune_numerical_zeros=prune_numerical_zeros
     )

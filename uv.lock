@@ -289,13 +289,11 @@ name = "triwarp"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "numpy" },
     { name = "warp-lang" },
 ]
 
 [package.optional-dependencies]
 test = [
-    { name = "numpy" },
     { name = "pytest" },
     { name = "scipy" },
     { name = "shapely" },
@@ -304,8 +302,6 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "numpy", specifier = ">=2.4.4" },
-    { name = "numpy", marker = "extra == 'test'", specifier = ">=2.4" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=9.0" },
     { name = "scipy", marker = "extra == 'test'", specifier = ">=1.17" },
     { name = "shapely", marker = "extra == 'test'", specifier = ">=2.1.2" },

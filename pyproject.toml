@@ -9,7 +9,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 version = "0.1.0"
 
-dependencies = ["numpy>=2.0", "warp-lang>=1.13"]
+dependencies = ["warp-lang>=1.13"]
 
 [project.optional-dependencies]
 test = ["pytest>=9.0", "scipy>=1.17", "shapely>=2.1.2", "trimesh>=4.11"]
