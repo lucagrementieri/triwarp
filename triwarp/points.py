@@ -333,6 +333,15 @@ def query_nearest(
     max_radius: float = math.inf,
     grid_bins: int = 128,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.float32]]: ...
+@overload
+def query_nearest(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    k: int,
+    *,
+    max_radius: float = math.inf,
+    grid_bins: int = 128,
+) -> tuple[wp.array2d[wp.int32], wp.array2d[wp.float32]]: ...
 def query_nearest(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3] | wp.vec3,
