@@ -137,27 +137,7 @@ def query_ball_count(
     return neighbor_counts
 
 
-@overload
-def query_ball(
-    points: wp.array[wp.vec3],
-    queries: wp.array[wp.vec3],
-    r: float,
-    *,
-    bvh: wp.Bvh | None = None,
-    leaf_size: int = 4,
-    return_sorted: bool = False,
-) -> tuple[list[wp.array[wp.int32]], list[wp.array[wp.float32]]]: ...
-@overload
-def query_ball(
-    points: wp.array[wp.vec3],
-    queries: wp.vec3,
-    r: float,
-    *,
-    bvh: wp.Bvh | None = None,
-    leaf_size: int = 4,
-    return_sorted: bool = False,
-) -> tuple[wp.array[wp.int32], wp.array[wp.float32]]: ...
-def query_ball(
+def query_ball_with_offsets(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3] | wp.vec3,
     r: float,
@@ -165,18 +145,17 @@ def query_ball(
     bvh: wp.Bvh | None = None,
     leaf_size: int = 4,
     return_sorted: bool = False,
-) -> tuple[list[wp.array[wp.int32]], list[wp.array[wp.float32]]] | tuple[wp.array[wp.int32], wp.array[wp.float32]]:
+) -> tuple[wp.array[wp.int32], wp.array[wp.float32], wp.array[wp.int32]]:
     """
-    Find all data points within distance ``r`` of each query center.
+    Low-level ball query: neighbors in one concatenated pair plus per-query offsets.
 
-    For each query ``q``, returns indices ``i`` such that ``‖points[i] − q‖₂ ≤ r`` and
-    the corresponding distances. Semantics match :meth:`scipy.spatial.KDTree.query_ball_point`
-    with ``p=2`` and ``eps=0`` (Minkowski-2, exact). Unlike SciPy, results are returned as
-    separate Warp arrays per query (or a single pair for one query), not Python lists inside
-    an object array.
+    Same geometry as :func:`query_ball` (BVH broad-phase cube ``[center ± r]`` as in
+    :func:`remove_close`, ``float32`` test ``‖points[i] − q‖₂ ≤ r``). Semantics match
+    :meth:`scipy.spatial.KDTree.query_ball_point` with ``p=2`` and ``eps=0``.
 
-    Uses the same BVH broad-phase cube ``[center ± r]`` as :func:`remove_close` and a
-    ``float32`` Euclidean distance check ``‖points[i] - q‖₂ ≤ r``.
+    Prefer :func:`query_ball` for a Python list of one array per query; use this when you
+    want a single flat buffer on device (e.g. fused downstream kernels) and CSR-style
+    boundaries without cloning each segment.
 
     Parameters
     ----------
@@ -198,16 +177,18 @@ def query_ball(
 
     Returns
     -------
-    neighbor_indices, neighbor_distances
-        If ``queries`` is an array with ``m`` rows: two lists of length ``m``. Element ``k``
-        holds parallel rank-1 ``wp.array`` objects (dtype ``wp.int32`` and ``wp.float32``)
-        listing neighbor indices into ``points`` and their distances ``‖points[i] − q‖₂``
-        for ``queries[k]``.
+    neighbor_indices_flat, neighbor_distances_flat, offsets
+        Three rank-1 arrays. Let ``m = queries.shape[0]`` after any ``wp.vec3`` wrap.
 
-        If ``queries`` is a single ``wp.vec3``: returns one pair ``(indices, distances)``
-        as two rank-1 arrays (possibly length 0).
+        ``offsets`` has length ``m`` and is the exclusive prefix sum of per-query neighbor
+        counts (same layout as ``wp.utils.array_scan(..., inclusive=False)``): query ``k``
+        owns ``neighbor_indices_flat[offsets[k] : offsets[k+1]]`` where ``offsets[m]`` is
+        understood as ``neighbor_indices_flat.shape[0]`` (the total neighbor count).
 
-        Empty inputs yield empty arrays; duplicate neighbors are not produced.
+        ``neighbor_indices_flat`` and ``neighbor_distances_flat`` have that total length
+        and list point indices and distances ``‖points[i] − q‖₂`` in parallel. Empty
+        ``points`` still returns length-``m`` zero ``offsets``; empty neighbor sets yield
+        length-0 flat arrays and zero ``offsets``.
 
     Notes
     -----
@@ -218,29 +199,23 @@ def query_ball(
 
     See Also
     --------
+    query_ball
     query_ball_count
     bvh_from_points
     :meth:`scipy.spatial.KDTree.query_ball_point`
     """
     device = points.device
 
-    single_query = isinstance(queries, wp.vec3)
-    if single_query:
+    if isinstance(queries, wp.vec3):
         queries = wp.array([queries], dtype=wp.vec3, device=device)
     m = int(queries.shape[0])
 
     n: int = int(points.shape[0])
     if n == 0:
         return (
-            (
-                wp.empty(0, dtype=wp.int32, device=device),
-                wp.empty(0, dtype=wp.float32, device=device),
-            )
-            if single_query
-            else (
-                [wp.empty(0, dtype=wp.int32, device=device) for _ in range(m)],
-                [wp.empty(0, dtype=wp.float32, device=device) for _ in range(m)],
-            )
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.float32, device=device),
+            wp.zeros(m, dtype=wp.int32, device=device),
         )
 
     if bvh is None:
@@ -251,15 +226,9 @@ def query_ball(
 
     if total_neighbors == 0:
         return (
-            (
-                wp.empty(0, dtype=wp.int32, device=device),
-                wp.empty(0, dtype=wp.float32, device=device),
-            )
-            if single_query
-            else (
-                [wp.empty(0, dtype=wp.int32, device=device) for _ in range(m)],
-                [wp.empty(0, dtype=wp.float32, device=device) for _ in range(m)],
-            )
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.float32, device=device),
+            wp.zeros(m, dtype=wp.int32, device=device),
         )
 
     offsets = wp.empty(m, dtype=wp.int32, device=device)
@@ -299,16 +268,123 @@ def query_ball(
             total_neighbors,
             segment_bounds,
         )
+    return (
+        wp.clone(neighbor_indices_flat[:total_neighbors]),
+        wp.clone(neighbor_distances_flat[:total_neighbors]),
+        offsets,
+    )
 
+
+@overload
+def query_ball(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    r: float,
+    *,
+    bvh: wp.Bvh | None = None,
+    leaf_size: int = 4,
+    return_sorted: bool = False,
+) -> tuple[list[wp.array[wp.int32]], list[wp.array[wp.float32]]]: ...
+@overload
+def query_ball(
+    points: wp.array[wp.vec3],
+    queries: wp.vec3,
+    r: float,
+    *,
+    bvh: wp.Bvh | None = None,
+    leaf_size: int = 4,
+    return_sorted: bool = False,
+) -> tuple[wp.array[wp.int32], wp.array[wp.float32]]: ...
+def query_ball(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3] | wp.vec3,
+    r: float,
+    *,
+    bvh: wp.Bvh | None = None,
+    leaf_size: int = 4,
+    return_sorted: bool = False,
+) -> tuple[list[wp.array[wp.int32]], list[wp.array[wp.float32]]] | tuple[wp.array[wp.int32], wp.array[wp.float32]]:
+    """
+    Find all data points within distance ``r`` of each query center (per-query arrays).
+
+    High-level wrapper around :func:`query_ball_with_offsets`: same BVH broad-phase and
+    ``float32`` distance test as :func:`remove_close`, same SciPy semantics as
+    :meth:`scipy.spatial.KDTree.query_ball_point` with ``p=2`` and ``eps=0``.
+
+    Unlike SciPy's object array of lists, multi-query results are two Python lists of
+    length ``m``, each element a rank-1 ``wp.array`` for that query. A single ``wp.vec3``
+    query returns one ``(indices, distances)`` pair directly (not wrapped in lists). This
+    clones each query's segment out of the internal flat buffer; for one flat buffer plus
+    offsets on device, call :func:`query_ball_with_offsets` instead.
+
+    Parameters
+    ----------
+    points
+        ``(n, 3)`` data points stored as ``wp.vec3``.
+    queries
+        Either ``(m, 3)`` query centers as ``wp.array[wp.vec3]``, or a single ``wp.vec3``
+        (treated as one query).
+    r
+        Inclusion radius; cast to ``float32`` in kernels (non-negative).
+    bvh
+        Optional pre-built BVH from ``points``. If ``None``, built via
+        :func:`bvh_from_points`.
+    leaf_size
+        Leaf size when constructing ``bvh`` (ignored if ``bvh`` is provided).
+    return_sorted
+        If ``True``, neighbors within each query are ordered by increasing distance.
+        If ``False``, order follows tree traversal (undefined ordering).
+
+    Returns
+    -------
+    neighbor_indices, neighbor_distances
+        If ``queries`` has ``m`` rows: ``list[wp.array[wp.int32]]`` and
+        ``list[wp.array[wp.float32]]``, each of length ``m``. Element ``k`` lists neighbors
+        of ``queries[k]`` (indices into ``points`` and distances ``‖points[i] − q‖₂``).
+
+        If ``queries`` is a single ``wp.vec3``: two rank-1 arrays (possibly length 0), not
+        lists.
+
+        Empty ``points`` yields empty neighbor arrays and per-query empty slices; duplicate
+        neighbors are not produced.
+
+    Notes
+    -----
+    SciPy may sort indices when ``return_sorted`` is left default on multi-point queries;
+    here sorting only occurs when ``return_sorted=True``, and sorts by distance, not by
+    index. Ball boundaries use ``float32`` arithmetic; extremely tight radii near representable
+    limits may disagree slightly with pure ``float64`` SciPy runs.
+
+    See Also
+    --------
+    query_ball_with_offsets
+    query_ball_count
+    bvh_from_points
+    :meth:`scipy.spatial.KDTree.query_ball_point`
+    """
+    device = points.device
+
+    single_query = isinstance(queries, wp.vec3)
+    if single_query:
+        queries = wp.array([queries], dtype=wp.vec3, device=device)
+    m = int(queries.shape[0])
+
+    neighbor_indices_flat, neighbor_distances_flat, offsets = query_ball_with_offsets(
+        points, queries, r, bvh=bvh, leaf_size=leaf_size, return_sorted=return_sorted
+    )
     neighbor_indices: list[wp.array[wp.int32]] = []
     neighbor_distances: list[wp.array[wp.float32]] = []
 
     offsets_list = offsets.list()
     for k in range(m):
         start = offsets_list[k]
-        end = offsets_list[k + 1] if k < m - 1 else total_neighbors
-        neighbor_indices.append(wp.clone(neighbor_indices_flat[start:end]))
-        neighbor_distances.append(wp.clone(neighbor_distances_flat[start:end]))
+        end = offsets_list[k + 1] if k < m - 1 else neighbor_indices_flat.shape[0]
+        if end - start > 0:
+            neighbor_indices.append(wp.clone(neighbor_indices_flat[start:end]))
+            neighbor_distances.append(wp.clone(neighbor_distances_flat[start:end]))
+        else:
+            neighbor_indices.append(wp.empty(0, dtype=wp.int32, device=device))
+            neighbor_distances.append(wp.empty(0, dtype=wp.float32, device=device))
 
     if single_query:
         return neighbor_indices[0], neighbor_distances[0]

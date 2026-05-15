@@ -147,13 +147,12 @@ def discrete_gaussian_curvature(
     gaussian_curvature:  (n,) float
       Discrete gaussian curvature measure.
     """
-    nearest_indices, _ = tw.points.query_ball(vertices, points, radius)
-    flat_nearest_indices, nearest_offsets = tw.geometry.pack_1d_arrays(nearest_indices)
+    nearest_indices, _, nearest_offsets = tw.points.query_ball_with_offsets(vertices, points, radius)
     defects = vertex_defects(vertices.shape[0], faces, face_angles)
     gauss_curvature = wp.zeros(points.shape[0], dtype=wp.float32, device=points.device)
     wp.launch(
         kernel_array.scatter_offset_sum,
-        dim=flat_nearest_indices.shape[0],
-        inputs=[defects, flat_nearest_indices, nearest_offsets, gauss_curvature],
+        dim=nearest_indices.shape[0],
+        inputs=[defects, nearest_indices, nearest_offsets, gauss_curvature],
     )
     return gauss_curvature
