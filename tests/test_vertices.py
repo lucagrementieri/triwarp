@@ -1,5 +1,5 @@
 """
-Regression tests for ``triwarp.vertices`` against ``trimesh.vertices`` (CPU reference).
+Regression tests for ``triwarp.vertices`` against Trimesh (CPU reference).
 """
 
 import numpy as np
