@@ -1,7 +1,6 @@
 import warp as wp
 
-TOLERANCE_MERGE = 1e-8
-TOLERANCE_ZERO = 1e-12
+from triwarp.constants import TOLERANCE_MERGE, TOLERANCE_ZERO
 
 
 @wp.func
