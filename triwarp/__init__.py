@@ -3,6 +3,7 @@
 from . import curvature
 from . import graph
 from . import geometry
+from . import grouping
 from . import points
 from . import reduce
 from . import sample
@@ -13,6 +14,7 @@ __all__ = [
     "curvature",
     "graph",
     "geometry",
+    "grouping",
     "points",
     "reduce",
     "sample",
