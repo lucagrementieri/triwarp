@@ -9,6 +9,7 @@ from . import reduce
 from . import sample
 from . import triangles
 from . import vertices
+from . import unique
 
 __all__ = [
     "curvature",
@@ -20,4 +21,5 @@ __all__ = [
     "sample",
     "triangles",
     "vertices",
+    "unique",
 ]

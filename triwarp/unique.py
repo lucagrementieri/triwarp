@@ -1,5 +1,7 @@
 """1D unique values (``numpy.unique``-style) for Warp rank-1 scalar arrays."""
 
+from __future__ import annotations
+
 import warp as wp
 from typing import Literal, overload
 
@@ -130,7 +132,7 @@ def unique_1d(
         return empty_unique, empty_i32
 
     # Sort data and indices
-    indices_buffer = wp.array(list(range(n)) + [-1] * n, dtype=wp.int32, device=data.device)
+    indices_buffer = wp.array(list(range(n)) + [n] * n, dtype=wp.int32, device=data.device)
     data_buffer = wp.empty(indices_buffer.shape, dtype=data.dtype, device=data.device)
     wp.copy(data_buffer, data)
     wp.utils.radix_sort_pairs(data_buffer, indices_buffer, n)
@@ -138,17 +140,31 @@ def unique_1d(
     wp.copy(data_buffer_int32, data_buffer, count=n)
 
     unique_values_int32 = wp.empty(n, dtype=wp.int32, device=data.device)
-    unique_counts = wp.empty(n, dtype=wp.int32, device=data.device)
+    unique_counts_buffer = wp.empty(n, dtype=wp.int32, device=data.device)
 
-    n_unique = wp.utils.runlength_encode(data_buffer_int32, unique_values_int32, run_lengths=unique_counts)
+    n_unique = wp.utils.runlength_encode(data_buffer_int32, unique_values_int32, run_lengths=unique_counts_buffer)
     unique_values = wp.empty(n_unique, dtype=data.dtype, device=data.device)
     wp.copy(unique_values, unique_values_int32, count=n_unique)
+
+    if return_counts:
+        unique_counts = wp.empty(n_unique, dtype=wp.int32, device=data.device)
+        wp.copy(unique_counts, unique_counts_buffer, count=n_unique)
+    else:
+        unique_counts = unique_counts_buffer
 
     if not return_inverse:
         if return_counts:
             return unique_values, unique_counts
         return unique_values
 
-    if return_inverse and return_counts:
-        return unique_values, unique_counts, unique_counts
-    return unique_values, unique_counts
+    counts_list = unique_counts.list()
+    inverse_buffer = wp.array(
+        [i for i in range(n_unique) for _ in range(counts_list[i])] + [n_unique] * n, dtype=wp.int32, device=data.device
+    )
+    wp.utils.radix_sort_pairs(indices_buffer, inverse_buffer, n)
+    inverse = wp.empty(n, dtype=wp.int32, device=data.device)
+    wp.copy(inverse, inverse_buffer, count=n)
+
+    if return_counts:
+        return unique_values, inverse, unique_counts
+    return unique_values, inverse
