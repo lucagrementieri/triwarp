@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import math
 from typing import overload, Literal
 
@@ -281,9 +279,9 @@ def query_ball(
     queries: wp.array[wp.vec3],
     r: float,
     *,
-    bvh: wp.Bvh | None = None,
-    leaf_size: int = 4,
-    return_sorted: bool = False,
+    bvh: wp.Bvh | None = ...,
+    leaf_size: int = ...,
+    return_sorted: bool = ...,
 ) -> tuple[list[wp.array[wp.int32]], list[wp.array[wp.float32]]]: ...
 @overload
 def query_ball(
@@ -291,9 +289,9 @@ def query_ball(
     queries: wp.vec3,
     r: float,
     *,
-    bvh: wp.Bvh | None = None,
-    leaf_size: int = 4,
-    return_sorted: bool = False,
+    bvh: wp.Bvh | None = ...,
+    leaf_size: int = ...,
+    return_sorted: bool = ...,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.float32]]: ...
 def query_ball(
     points: wp.array[wp.vec3],
@@ -395,10 +393,10 @@ def query_ball(
 def query_nearest(
     points: wp.array[wp.vec3],
     queries: wp.vec3,
-    k: int = 1,
+    k: int,
     *,
-    max_radius: float = math.inf,
-    grid_bins: int = 128,
+    max_radius: float = ...,
+    grid_bins: int = ...,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.float32]]: ...
 @overload
 def query_nearest(
@@ -406,8 +404,8 @@ def query_nearest(
     queries: wp.array[wp.vec3] | wp.vec3,
     k: Literal[1] = 1,
     *,
-    max_radius: float = math.inf,
-    grid_bins: int = 128,
+    max_radius: float = ...,
+    grid_bins: int = ...,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.float32]]: ...
 @overload
 def query_nearest(
@@ -415,8 +413,8 @@ def query_nearest(
     queries: wp.array[wp.vec3],
     k: int,
     *,
-    max_radius: float = math.inf,
-    grid_bins: int = 128,
+    max_radius: float = ...,
+    grid_bins: int = ...,
 ) -> tuple[wp.array2d[wp.int32], wp.array2d[wp.float32]]: ...
 def query_nearest(
     points: wp.array[wp.vec3],
