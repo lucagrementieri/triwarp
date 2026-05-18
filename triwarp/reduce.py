@@ -4,8 +4,13 @@ import warp as wp
 
 from triwarp.kernels import reduce as kernel_reduce
 from triwarp.constants import TILE_1D, TILE_2D
+from typing import overload, Union  # pyright: ignore[reportDeprecated]
 
 
+@overload
+def max_for_dtype(dtype: type[wp.Int]) -> int: ...
+@overload
+def max_for_dtype(dtype: type[wp.Float]) -> float: ...
 def max_for_dtype(dtype: type[wp.Scalar]) -> int | float:
     if not wp.types.type_is_int(dtype):
         return float("inf")
@@ -15,6 +20,10 @@ def max_for_dtype(dtype: type[wp.Scalar]) -> int | float:
     return (1 << bits) - 1
 
 
+@overload
+def min_for_dtype(dtype: type[wp.Int]) -> int: ...
+@overload
+def min_for_dtype(dtype: type[wp.Float]) -> float: ...
 def min_for_dtype(dtype: type[wp.Scalar]) -> int | float:
     if not wp.types.type_is_int(dtype):
         return float("-inf")
@@ -24,7 +33,11 @@ def min_for_dtype(dtype: type[wp.Scalar]) -> int | float:
     return -(1 << (bits - 1))
 
 
-def min(array: wp.array[wp.Scalar]) -> float | int:
+@overload
+def min(array: Union[wp.array[wp.Int], wp.array2d[wp.Int]]) -> int: ...
+@overload
+def min(array: Union[wp.array[wp.Float], wp.array2d[wp.Float]]) -> float: ...
+def min(array: Union[wp.array[wp.Scalar], wp.array2d[wp.Scalar]]) -> float | int:
     """
     Global minimum of ``array`` (reduce every element to one scalar).
 
@@ -77,7 +90,11 @@ def min(array: wp.array[wp.Scalar]) -> float | int:
     return out.numpy().item()
 
 
-def max(array: wp.array[wp.Scalar]) -> float | int:
+@overload
+def max(array: Union[wp.array[wp.Int], wp.array2d[wp.Int]]) -> int: ...
+@overload
+def max(array: Union[wp.array[wp.Float], wp.array2d[wp.Float]]) -> float: ...
+def max(array: Union[wp.array[wp.Scalar], wp.array2d[wp.Scalar]]) -> float | int:
     """
     Global maximum of ``array`` (reduce every element to one scalar).
 
@@ -130,7 +147,11 @@ def max(array: wp.array[wp.Scalar]) -> float | int:
     return out.numpy().item()
 
 
-def minmax(array: wp.array[wp.Scalar]) -> tuple[float, float] | tuple[int, int]:
+@overload
+def minmax(array: Union[wp.array[wp.Int], wp.array2d[wp.Int]]) -> tuple[int, int]: ...
+@overload
+def minmax(array: Union[wp.array[wp.Float], wp.array2d[wp.Float]]) -> tuple[float, float]: ...
+def minmax(array: Union[wp.array[wp.Scalar], wp.array2d[wp.Scalar]]) -> tuple[float, float] | tuple[int, int]:
     """
     Global minimum and maximum of ``array`` (reduce every element to two scalars).
 
@@ -178,7 +199,7 @@ def minmax(array: wp.array[wp.Scalar]) -> tuple[float, float] | tuple[int, int]:
             device=array.device,
         )
     else:
-        raise ValueError("max requires a 1D or 2D array.")
+        raise ValueError("minmax requires a 1D or 2D array.")
 
     out_min, out_max = out.list()
     return out_min, out_max

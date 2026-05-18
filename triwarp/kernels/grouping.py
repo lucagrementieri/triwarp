@@ -17,8 +17,22 @@ def pack_vec3(vectors: wp.array[wp.vec3], out_packed: wp.array[wp.uint64]) -> No
 
     # 3. Explicitly promote components to uint64 before shifting.
     # This avoids 32-bit integer overflow during the large left-shifts (<< 21 and << 42)
-    packed_val = wp.uint64(ix) | (
+    packed_value = wp.uint64(ix) | (
         (wp.uint64(iy) << VEC3_PACK_PRECISION) | (wp.uint64(iz) << (VEC3_PACK_PRECISION + VEC3_PACK_PRECISION))
     )
 
-    out_packed[tid] = packed_val
+    out_packed[tid] = packed_value
+
+
+@wp.kernel
+def pack_indices(indices: wp.array2d[wp.int32], max_index: wp.uint64, out_packed: wp.array[wp.uint64]) -> None:
+    tid = int(wp.tid())
+    indices_row = indices[tid]
+    packed_value = wp.uint64(0)
+    power = wp.uint64(1)
+    for i in range(indices_row.shape[0]):
+        digit = wp.uint64(wp.uint32(indices_row[i]))
+        packed_value = packed_value + digit * power
+        power = power * max_index
+
+    out_packed[tid] = packed_value
