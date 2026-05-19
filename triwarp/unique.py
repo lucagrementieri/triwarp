@@ -7,6 +7,7 @@ from typing import Literal, TypeVar, overload
 import warp as wp
 import triwarp as tw
 from triwarp.kernels import unique as kernel_unique
+from triwarp.kernels import array as kernel_array
 
 Scalar = TypeVar("Scalar", bound=wp.Scalar)
 
@@ -126,27 +127,25 @@ def unique_1d(
     else:
         unique_start_mask = wp.empty(n, dtype=wp.int32, device=device)
         wp.launch(kernel_unique.mark_run_starts, dim=n, inputs=[sorted_data, unique_start_mask], device=device)
-        shifted_indices = wp.empty(n, dtype=wp.int32, device=device)
-        wp.utils.array_scan(unique_start_mask, shifted_indices, inclusive=True)
-        n_unique = tw.reduce.max(shifted_indices)
+        indices = wp.empty(n, dtype=wp.int32, device=device)
+        wp.utils.array_scan(unique_start_mask, indices, inclusive=True)
+        wp.launch(kernel_array.sub, dim=n, inputs=[indices, wp.int32(1)], device=device)
+        n_unique = tw.reduce.max(indices) + 1
         unique_values_int = wp.empty(n, dtype=sorted_data.dtype, device=device)
         wp.launch(
-            kernel_unique.scatter_unique_from_run_starts,
+            kernel_unique.scatter_from_masked_indices,
             dim=n,
-            inputs=[sorted_data, unique_start_mask, shifted_indices, unique_values_int],
+            inputs=[sorted_data, unique_start_mask, indices, unique_values_int],
             device=device,
         )
         if return_counts:
             unique_counts_buffer = wp.empty(n, dtype=wp.int32, device=device)
-            _ = wp.utils.runlength_encode(
-                shifted_indices, run_values=unique_start_mask, run_lengths=unique_counts_buffer
-            )
+            _ = wp.utils.runlength_encode(indices, run_values=unique_start_mask, run_lengths=unique_counts_buffer)
             unique_counts = wp.empty(n_unique, dtype=wp.int32, device=device)
             wp.copy(unique_counts, unique_counts_buffer, count=n_unique)
         if return_inverse:
-            wp.map(lambda v: v - 1, shifted_indices, out=shifted_indices)
             inverse_buffer = wp.empty(2 * n, dtype=wp.int32, device=device)
-            wp.copy(inverse_buffer, shifted_indices, count=n)
+            wp.copy(inverse_buffer, indices, count=n)
     unique_values = reinterpret_cast_from_int(unique_values_int, data.dtype, count=n_unique)
 
     if return_inverse:

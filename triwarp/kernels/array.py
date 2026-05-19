@@ -2,6 +2,12 @@ import warp as wp
 
 
 @wp.kernel
+def sub(array: wp.array[wp.Scalar], n: wp.Scalar) -> None:
+    i = int(wp.tid())
+    array[i] = array[i] - n
+
+
+@wp.kernel
 def normalize(array: wp.array[wp.vec3]) -> None:
     tid = wp.tid()
     array[tid] = wp.normalize(array[tid])

@@ -12,13 +12,13 @@ def mark_run_starts(values: wp.array[wp.Scalar], out_starts: wp.array[wp.int32])
 
 
 @wp.kernel
-def scatter_unique_from_run_starts(
+def scatter_from_masked_indices(
     values: wp.array[wp.Scalar],
-    starts: wp.array[wp.int32],
-    shifted_indices: wp.array[wp.int32],
-    out_unique: wp.array[wp.Scalar],
+    mask: wp.array[wp.int32],
+    indices: wp.array[wp.int32],
+    out_values: wp.array[wp.Scalar],
 ) -> None:
     i = int(wp.tid())
-    if starts[i] == 1:
-        unique_index = shifted_indices[i] - wp.int32(1)
-        out_unique[unique_index] = values[i]
+    if mask[i] == 1:
+        index = indices[i]
+        out_values[index] = values[i]
