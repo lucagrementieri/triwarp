@@ -5,8 +5,88 @@ from __future__ import annotations
 from typing import Literal, TypeVar, overload
 
 import warp as wp
+import triwarp as tw
+from triwarp.kernels import unique as kernel_unique
 
 Scalar = TypeVar("Scalar", bound=wp.Scalar)
+
+
+def _radix_sort_inverse(
+    device: str,
+    n: int,
+    indices_buffer: wp.array[wp.int32],
+    inverse_keys: wp.array[wp.int32],
+) -> wp.array[wp.int32]:
+    inverse_buffer = wp.empty(2 * n, dtype=wp.int32, device=device)
+    wp.copy(inverse_buffer, inverse_keys, count=n)
+    wp.utils.radix_sort_pairs(indices_buffer, inverse_buffer, n)
+    inverse = wp.empty(n, dtype=wp.int32, device=device)
+    wp.copy(inverse, inverse_buffer, count=n)
+    return inverse
+
+
+def _unique_from_runlength(
+    sorted_data: wp.array[wp.int32], device: str
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32], int]:
+    n = int(sorted_data.shape[0])
+    unique_values = wp.empty(n, dtype=wp.int32, device=device)
+    counts_buffer = wp.empty(n, dtype=wp.int32, device=device)
+    n_unique = wp.utils.runlength_encode(sorted_data, unique_values, run_lengths=counts_buffer)
+    return unique_values, counts_buffer, n_unique
+
+
+def _unique_from_sorted_runs(
+    sorted_data: wp.array[wp.int32] | wp.array[wp.int64], device: str
+) -> tuple[wp.array[wp.int32] | wp.array[wp.int64], wp.array[wp.int32], wp.array[wp.int32], int]:
+    n = int(sorted_data.shape[0])
+    run_starts = wp.empty(n, dtype=wp.int32, device=device)
+    wp.launch(kernel_unique.mark_run_starts, dim=n, inputs=[sorted_data, run_starts], device=device)
+    shifted_indices = wp.empty(n, dtype=wp.int32, device=device)
+    wp.utils.array_scan(run_starts, shifted_indices, inclusive=True)
+    n_unique = tw.reduce.max(shifted_indices)
+    unique_keys = wp.empty(n, dtype=sorted_data.dtype, device=device)
+    wp.launch(
+        kernel_unique.scatter_unique_from_run_starts,
+        dim=n,
+        inputs=[sorted_data, run_starts, shifted_indices, unique_keys],
+        device=device,
+    )
+    return unique_keys, run_starts, shifted_indices, n_unique
+
+
+def _counts_from_run_markers(
+    shifted_indices: wp.array[wp.int32],
+    run_starts: wp.array[wp.int32],
+    n_unique: int,
+    device: str,
+) -> wp.array[wp.int32]:
+    n = int(shifted_indices.shape[0])
+    counts_buffer = wp.empty(n, dtype=wp.int32, device=device)
+    _ = wp.utils.runlength_encode(shifted_indices, run_values=run_starts, run_lengths=counts_buffer)
+    counts = wp.empty(n_unique, dtype=wp.int32, device=device)
+    wp.copy(counts, counts_buffer, count=n_unique)
+    return counts
+
+
+def _inverse_from_runlength_counts(
+    device: str,
+    n: int,
+    n_unique: int,
+    indices_buffer: wp.array[wp.int32],
+    counts_buffer: wp.array[wp.int32],
+) -> wp.array[wp.int32]:
+    counts_list = counts_buffer.list()
+    inverse_keys = wp.array(
+        [i for i in range(n_unique) for _ in range(counts_list[i])] + [n_unique] * n,
+        dtype=wp.int32,
+        device=device,
+    )
+    inverse_buffer = wp.empty(2 * n, dtype=wp.int32, device=device)
+    wp.copy(inverse_buffer, inverse_keys, count=n)
+    wp.utils.radix_sort_pairs(indices_buffer, inverse_buffer, n)
+    inverse = wp.empty(n, dtype=wp.int32, device=device)
+    wp.copy(inverse, inverse_buffer, count=n)
+    return inverse
 
 
 @overload
@@ -30,8 +110,6 @@ def unique_1d(
     return_inverse: Literal[False] = False,
     return_counts: Literal[True],
 ) -> tuple[wp.array[Scalar], wp.array[wp.int32]]: ...
-
-
 @overload
 def unique_1d(
     data: wp.array[Scalar],
@@ -52,16 +130,17 @@ def unique_1d(
     """
     Find sorted unique elements of a 1D Warp array (``numpy.unique`` subset).
 
-    Uses stable ``warp.utils.radix_sort_pairs`` on sortable integer keys (signed
-    integers are remapped so radix order matches two's-complement order; floats
-    use total-order bit keys). ``return_inverse`` maps each input position to the
-    index of its value in the sorted unique output. ``return_index`` is not
-    supported.
+    Works for any Warp scalar dtype (signed and unsigned integers, floating-point
+    types, etc.). Uses stable ``warp.utils.radix_sort_pairs`` on sortable integer
+    keys (signed integers are remapped so radix order matches two's-complement
+    order; floats use total-order bit keys). ``return_inverse`` maps each input
+    position to the index of its value in the sorted unique output.
+    ``return_index`` is not supported.
 
     Parameters
     ----------
     data
-        Rank-1 ``wp.array`` of ``wp.int32`` or ``wp.float32``.
+        Rank-1 ``wp.array`` with any scalar ``dtype``.
     return_inverse
         If ``True``, include the inverse mapping in the return tuple.
     return_counts
@@ -81,12 +160,10 @@ def unique_1d(
     Raises
     ------
     ValueError
-        If ``data`` is not rank-1, dtype is unsupported, or length is ``>= 2**31``.
+        If ``data`` is not rank-1 or length is ``>= 2**31``.
     """
     if int(data.ndim) != 1:
         raise ValueError(f"unique_1d expects a rank-1 array, got ndim={data.ndim}")
-    if data.dtype in (wp.int64, wp.uint64, wp.float64):
-        raise ValueError(f"unique_1d dtype must be one of (wp.int32, wp.float32), got {data.dtype}")
 
     device = data.device
     n = int(data.shape[0])
@@ -98,13 +175,9 @@ def unique_1d(
     if n == 0:
         empty_unique = wp.empty(0, dtype=data.dtype, device=device)
         empty_i32 = wp.empty(0, dtype=wp.int32, device=device)
-        if not return_inverse and not return_counts:
-            return empty_unique
-        if return_inverse and return_counts:
-            return empty_unique, empty_i32, empty_i32
-        if return_inverse:
-            return empty_unique, empty_i32
-        return empty_unique, empty_i32
+        return _pack_unique_result(
+            empty_unique, inverse=empty_i32 if return_inverse else None, counts=empty_i32 if return_counts else None
+        )
 
     indices_buffer = wp.array(list(range(n)) + [n] * n, dtype=wp.int32, device=device)
     data_buffer = reinterpret_cast_to_int(data, 2 * n)
@@ -112,34 +185,74 @@ def unique_1d(
     sorted_data = wp.empty(n, dtype=data_buffer.dtype, device=device)
     wp.copy(sorted_data, data_buffer, count=n)
 
-    unique_values_int32 = wp.empty(n, dtype=wp.int32, device=data.device)
-    unique_counts_buffer = wp.empty(n, dtype=wp.int32, device=data.device)
-    n_unique = wp.utils.runlength_encode(sorted_data, unique_values_int32, run_lengths=unique_counts_buffer)
+    unique_counts = None
+    unique_inverse = None
+    inverse_buffer = None
 
-    unique_values = reinterpret_cast_from_int(unique_values_int32, data.dtype, count=n_unique)
-
-    if return_counts:
-        unique_counts = wp.empty(n_unique, dtype=wp.int32, device=data.device)
-        wp.copy(unique_counts, unique_counts_buffer, count=n_unique)
-    else:
-        unique_counts = unique_counts_buffer
-
-    if not return_inverse:
+    if wp.types.types_equal(data_buffer.dtype, wp.int32):
+        unique_values_int = wp.empty(n, dtype=wp.int32, device=device)
+        unique_counts_buffer = wp.empty(n, dtype=wp.int32, device=device)
+        n_unique = wp.utils.runlength_encode(sorted_data, unique_values_int, run_lengths=unique_counts_buffer)
         if return_counts:
-            return unique_values, unique_counts
-        return unique_values
+            unique_counts = wp.empty(n_unique, dtype=wp.int32, device=device)
+            wp.copy(unique_counts, unique_counts_buffer, count=n_unique)
+        if return_inverse:
+            counts_list = unique_counts_buffer.list()
+            inverse_buffer = wp.array(
+                [i for i in range(n_unique) for _ in range(counts_list[i])] + [-1] * n, dtype=wp.int32, device=device
+            )
+    else:
+        unique_start_mask = wp.empty(n, dtype=wp.int32, device=device)
+        wp.launch(kernel_unique.mark_run_starts, dim=n, inputs=[sorted_data, unique_start_mask], device=device)
+        shifted_indices = wp.empty(n, dtype=wp.int32, device=device)
+        wp.utils.array_scan(unique_start_mask, shifted_indices, inclusive=True)
+        n_unique = tw.reduce.max(shifted_indices)
+        unique_values_int = wp.empty(n, dtype=sorted_data.dtype, device=device)
+        wp.launch(
+            kernel_unique.scatter_unique_from_run_starts,
+            dim=n,
+            inputs=[sorted_data, unique_start_mask, shifted_indices, unique_values_int],
+            device=device,
+        )
+        if return_counts:
+            unique_counts_buffer = wp.empty(n, dtype=wp.int32, device=device)
+            _ = wp.utils.runlength_encode(
+                shifted_indices, run_values=unique_start_mask, run_lengths=unique_counts_buffer
+            )
+            unique_counts = wp.empty(n_unique, dtype=wp.int32, device=device)
+            wp.copy(unique_counts, unique_counts_buffer, count=n_unique)
+        if return_inverse:
+            wp.map(lambda v: v - 1, shifted_indices, out=shifted_indices)
+            inverse_buffer = wp.empty(2 * n, dtype=wp.int32, device=device)
+            wp.copy(inverse_buffer, shifted_indices, count=n)
+    unique_values = reinterpret_cast_from_int(unique_values_int, data.dtype, count=n_unique)
 
-    counts_list = unique_counts.list()
-    inverse_buffer = wp.array(
-        [i for i in range(n_unique) for _ in range(counts_list[i])] + [n_unique] * n, dtype=wp.int32, device=data.device
-    )
-    wp.utils.radix_sort_pairs(indices_buffer, inverse_buffer, n)
-    inverse = wp.empty(n, dtype=wp.int32, device=data.device)
-    wp.copy(inverse, inverse_buffer, count=n)
+    if return_inverse:
+        assert inverse_buffer is not None
+        wp.utils.radix_sort_pairs(indices_buffer, inverse_buffer, n)
+        unique_inverse = wp.empty(n, dtype=wp.int32, device=device)
+        wp.copy(unique_inverse, inverse_buffer, count=n)
 
-    if return_counts:
-        return unique_values, inverse, unique_counts
-    return unique_values, inverse
+    return _pack_unique_result(unique_values, inverse=unique_inverse, counts=unique_counts)
+
+
+def _pack_unique_result(
+    unique: wp.array[Scalar],
+    *,
+    inverse: wp.array[wp.int32] | None = None,
+    counts: wp.array[wp.int32] | None = None,
+) -> (
+    wp.array[Scalar]
+    | tuple[wp.array[Scalar], wp.array[wp.int32]]
+    | tuple[wp.array[Scalar], wp.array[wp.int32], wp.array[wp.int32]]
+):
+    if inverse is not None and counts is not None:
+        return unique, inverse, counts
+    if inverse is not None:
+        return unique, inverse
+    if counts is not None:
+        return unique, counts
+    return unique
 
 
 def reinterpret_cast_to_int(
