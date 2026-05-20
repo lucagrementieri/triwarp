@@ -12,6 +12,7 @@ from triwarp.kernels import array as kernel_array
 Scalar = TypeVar("Scalar", bound=wp.Scalar)
 
 
+# TODO: do a faster unique for 64-bit types
 @overload
 def unique_1d(
     data: wp.array[Scalar],

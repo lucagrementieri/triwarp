@@ -5,6 +5,36 @@ VEC3_PACK_SHIFT = wp.constant(wp.uint32(11))
 
 
 @wp.kernel
+def group_sorted_fixed_length(
+    sorted_values: wp.array[wp.Int],
+    indices: wp.array[wp.int32],
+    length: int,
+    out_counter: wp.array[wp.int32],
+    out_groups: wp.array2d[wp.int32],
+) -> None:
+    tid = wp.tid()
+    n = sorted_values.shape[0]
+
+    # Prevent out-of-bounds indexing
+    if tid + length > n:
+        return
+
+    # Check if the index is a start of a run
+    if (tid != 0) and (sorted_values[tid] == sorted_values[tid - 1]):
+        return
+    # Check if the run spans at least 'length'
+    if sorted_values[tid] != sorted_values[tid + length - 1]:
+        return
+    # Check if the run exceeds 'length'
+    if (tid + length < n) and (sorted_values[tid] == sorted_values[tid + length]):
+        return
+
+    idx = wp.atomic_add(out_counter, 0, 1)
+    for j in range(length):
+        out_groups[idx, j] = indices[tid + j]
+
+
+@wp.kernel
 def pack_vec3(vectors: wp.array[wp.vec3], out_packed: wp.array[wp.uint64]) -> None:
     tid = int(wp.tid())
     vector = vectors[tid]

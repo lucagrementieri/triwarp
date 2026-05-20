@@ -4,6 +4,28 @@ from triwarp.kernels import grouping as kernel_grouping
 import triwarp as tw
 
 
+def group(values: wp.array[wp.Int], length: int) -> wp.array2d[wp.int32]:
+    n = int(values.shape[0])
+    values_buffer = tw.unique.reinterpret_cast_to_int(values, 2 * n)
+    indices_buffer = wp.array(list(range(n)) + [-1] * n, dtype=wp.int32, device=values.device)
+    wp.utils.radix_sort_pairs(values_buffer, indices_buffer, count=n)
+
+    counter = wp.zeros(1, dtype=wp.int32, device=values.device)
+    groups_buffer = wp.empty((n, length), dtype=wp.int32, device=values.device)
+    wp.launch(
+        kernel_grouping.group_sorted_fixed_length,
+        dim=n - length + 1,
+        inputs=[values_buffer, indices_buffer, length, counter, groups_buffer],
+        device=values.device,
+    )
+    n_groups = counter.numpy().item()
+    if n_groups == 0:
+        return wp.empty((0, length), dtype=wp.int32, device=values.device)
+    groups = wp.empty((n_groups, length), dtype=wp.int32, device=values.device)
+    wp.copy(groups, groups_buffer, count=n_groups * length)
+    return groups
+
+
 def hash_vector_rows(data: wp.array[wp.vec3]) -> wp.array[wp.uint64]:
     """
     Pack each ``wp.vec3`` row into a single ``uint64`` key.
