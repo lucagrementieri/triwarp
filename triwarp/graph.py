@@ -39,10 +39,15 @@ def faces_to_edges(faces: wp.array[wp.int32]) -> wp.array2d[wp.int32]:
         raise ValueError(f"faces length must be divisible by 3, got {n}")
     n_faces = n // 3
     edges = wp.empty((n_faces * 3, 2), dtype=wp.int32, device=faces.device)
-    wp.launch(
-        kernel_graph.faces_to_edges,
-        dim=n_faces,
-        inputs=[faces, edges],
-        device=faces.device,
-    )
+    wp.launch(kernel_graph.faces_to_edges, dim=n_faces, inputs=[faces, edges], device=faces.device)
     return edges
+
+
+"""
+def face_adjacency(faces: wp.array[wp.int32], edges: wp.array2d[wp.int32] | None = None) -> wp.array2d[wp.int32]:
+    n_faces = int(faces.shape[0]) // 3
+    if edges is None:
+        edges = faces_to_edges(faces)
+    sorted_edges = wp.sort(edges, axis=1)
+    edges_face = wp.array([f for f in range(n_faces) for _ in range(3)], dtype=wp.int32, device=faces.device)
+"""

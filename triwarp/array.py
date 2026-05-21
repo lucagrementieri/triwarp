@@ -7,10 +7,10 @@ from collections.abc import Sequence
 import warp as wp
 import warp.sparse as wps
 
-from typing import Union, Any  # pyright: ignore[reportDeprecated]
+from typing import Union  # pyright: ignore[reportDeprecated]
 
 
-def pack_1d_arrays(arrays: Sequence[wp.array[Any]]) -> tuple[wp.array[Any], wp.array[wp.int32]]:  # pyright: ignore[reportExplicitAny]
+def pack_1d_arrays(arrays: Sequence[wp.array[wp.Scalar]]) -> tuple[wp.array[wp.Scalar], wp.array[wp.int32]]:
     """
     Concatenate several 1-D :class:`warp.array` instances into one buffer plus CSR-style offsets.
 
@@ -62,6 +62,16 @@ def pack_1d_arrays(arrays: Sequence[wp.array[Any]]) -> tuple[wp.array[Any], wp.a
             wp.copy(flat, array, dest_offset=offset, src_offset=0, count=array_length)
 
     return flat, wp.array(offsets, dtype=wp.int32, device=device)
+
+
+def sort_rows(data: wp.array2d[wp.int32] | wp.array2d[wp.float32]) -> None:
+    n = data.size
+    data_buffer = wp.empty(n * 2, dtype=data.dtype, device=data.device)
+    wp.copy(data_buffer, data, count=n)
+    indices_buffer = wp.array(list(range(n)) + [-1] * n, dtype=wp.int32, device=data.device)
+    segment_start_indices = wp.array(list(range(0, n + 1, data.shape[1])), dtype=wp.int32, device=data.device)
+    wp.utils.segmented_sort_pairs(data_buffer, indices_buffer, n, segment_start_indices=segment_start_indices)
+    wp.copy(data, data_buffer, count=n)
 
 
 def index_sparse(

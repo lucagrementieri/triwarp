@@ -1,8 +1,8 @@
 """Triangular mesh utilities on NVIDIA Warp."""
 
+from . import array
 from . import curvature
 from . import graph
-from . import geometry
 from . import grouping
 from . import points
 from . import reduce
@@ -12,9 +12,9 @@ from . import vertices
 from . import unique
 
 __all__ = [
+    "array",
     "curvature",
     "graph",
-    "geometry",
     "grouping",
     "points",
     "reduce",
