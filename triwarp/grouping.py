@@ -5,6 +5,33 @@ import triwarp as tw
 
 
 def group(values: wp.array[wp.Int], length: int) -> wp.array2d[wp.int32]:
+    """
+    Return index groups of exactly ``length`` entries that share the same value.
+
+    ``values`` are radix-sorted with their original indices; each output row lists
+    ``length`` indices whose corresponding entries are equal and form a run of
+    precisely that size (runs shorter or longer than ``length`` are omitted). This
+    matches :func:`trimesh.grouping.group` with ``min_len == max_len == length`` and
+    :func:`trimesh.grouping.group_rows` with ``require_count=length``.
+
+    Parameters
+    ----------
+    values
+        ``(n,)`` device array of integer keys (any ``wp.Int`` dtype).
+    length
+        Required run length; each returned group contains exactly this many indices.
+
+    Returns
+    -------
+    wp.array2d[wp.int32]
+        ``(g, length)`` array on ``values.device`` where ``g`` is the number of
+        groups found. Empty when no run has exactly ``length`` equal neighbors.
+
+    See Also
+    --------
+    group_int_rows
+    hash_indices_rows
+    """
     n = int(values.shape[0])
     values_buffer = tw.unique.reinterpret_cast_to_int(values, 2 * n)
     indices_buffer = wp.array(list(range(n)) + [-1] * n, dtype=wp.int32, device=values.device)
@@ -19,11 +46,44 @@ def group(values: wp.array[wp.Int], length: int) -> wp.array2d[wp.int32]:
         device=values.device,
     )
     n_groups = counter.numpy().item()
-    if n_groups == 0:
-        return wp.empty((0, length), dtype=wp.int32, device=values.device)
     groups = wp.empty((n_groups, length), dtype=wp.int32, device=values.device)
-    wp.copy(groups, groups_buffer, count=n_groups * length)
+    if n_groups > 0:
+        wp.copy(groups, groups_buffer, count=n_groups * length)
     return groups
+
+
+def group_int_rows(data: wp.array2d[wp.Int], length: int, max_value: int | None = None) -> wp.array2d[wp.int32]:
+    """
+    Return index groups of exactly ``length`` rows that are identical.
+
+    Each row is hashed with :func:`hash_indices_rows`, then :func:`group` finds runs
+    of ``length`` equal keys in sorted order. For example, ``[[1, 2], [3, 4], [1, 2]]``
+    with ``length=2`` yields one group ``[[0, 2]]`` (same as
+    :func:`trimesh.grouping.group_rows` with ``require_count=2``).
+
+    Parameters
+    ----------
+    data
+        ``(n, w)`` device array of non-negative ``int32`` row values.
+    length
+        Required number of duplicate rows per group.
+    max_value
+        Optional exclusive upper bound on entries and radix for row hashing; passed
+        through to :func:`hash_indices_rows` as ``max_index``. If ``None``, inferred
+        from ``max(data) + 1``.
+
+    Returns
+    -------
+    wp.array2d[wp.int32]
+        ``(g, length)`` array on ``data.device`` with original row indices per group.
+
+    See Also
+    --------
+    group
+    hash_indices_rows
+    """
+    hashed_rows = hash_indices_rows(data, max_value)
+    return group(hashed_rows, length)
 
 
 def hash_vector_rows(data: wp.array[wp.vec3]) -> wp.array[wp.uint64]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import trimesh as tm
 import warp as wp
 import pytest
 
@@ -23,6 +24,16 @@ def test_group(device: str, values: wp.array[wp.Int], length: int, expected: wp.
     values_wp = wp.array(values, dtype=values.dtype, device=device)
     groups_wp = tw.grouping.group(values_wp, length)
     assert np.array_equal(groups_wp.numpy(), expected.numpy())
+
+
+def test_group_int_rows(device: str) -> None:
+    data_np = np.array([[1, 2], [3, 4], [1, 2], [2, 1], [3, 4], [0, 1], [3, 4]], dtype=np.int32)
+    length = 2
+    groups_np = np.sort(tm.grouping.group_rows(data_np, require_count=length), axis=1)
+
+    data_wp = wp.array(data_np, dtype=wp.int32, device=device)
+    groups_wp = tw.grouping.group_int_rows(data_wp, length)
+    assert np.array_equal(np.sort(groups_wp.numpy(), axis=1), groups_np)
 
 
 def test_hash_vector_rows(device: str) -> None:
