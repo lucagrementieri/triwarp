@@ -3,7 +3,7 @@ import warp as wp
 from triwarp.kernels import graph as kernel_graph
 
 
-def faces_to_edges(faces: wp.array[wp.int32]) -> wp.array2d[wp.int32]:
+def faces_to_edges(faces: wp.array[wp.int32], sorted: bool = False) -> wp.array2d[wp.int32]:
     """
     Directed triangle edges from a flat ``(i0, i1, i2)`` index buffer.
 
@@ -17,6 +17,8 @@ def faces_to_edges(faces: wp.array[wp.int32]) -> wp.array2d[wp.int32]:
         Length-``3 * n_faces`` ``wp.int32`` buffer: consecutive triples
         ``(i0, i1, i2), (i0, i1, i2), ...`` of vertex indices, the same convention as
         :mod:`triwarp.triangles`.
+    sorted
+        If ``True``, sort the edges by the minimum vertex index first.
 
     Returns
     -------
@@ -39,15 +41,22 @@ def faces_to_edges(faces: wp.array[wp.int32]) -> wp.array2d[wp.int32]:
         raise ValueError(f"faces length must be divisible by 3, got {n}")
     n_faces = n // 3
     edges = wp.empty((n_faces * 3, 2), dtype=wp.int32, device=faces.device)
-    wp.launch(kernel_graph.faces_to_edges, dim=n_faces, inputs=[faces, edges], device=faces.device)
+    wp.launch(
+        kernel_graph.faces_to_edges_sorted if sorted else kernel_graph.faces_to_edges,
+        dim=n_faces,
+        inputs=[faces, edges],
+        device=faces.device,
+    )
     return edges
 
 
 """
-def face_adjacency(faces: wp.array[wp.int32], edges: wp.array2d[wp.int32] | None = None) -> wp.array2d[wp.int32]:
+def face_adjacency(faces: wp.array[wp.int32], edges_sorted: wp.array2d[wp.int32] | None = None) -> wp.array2d[wp.int32]:
     n_faces = int(faces.shape[0]) // 3
-    if edges is None:
-        edges = faces_to_edges(faces)
-    sorted_edges = wp.sort(edges, axis=1)
+    if edges_sorted is None:
+        edges_sorted = faces_to_edges(faces, sorted=True)
     edges_face = wp.array([f for f in range(n_faces) for _ in range(3)], dtype=wp.int32, device=faces.device)
+    edge_groups = tw.grouping.group_int_rows(edges_sorted, length=2, max_value=n_faces)
+    # TODO: implement sorted gather kernel
+    # return edges_face[edge_groups]
 """

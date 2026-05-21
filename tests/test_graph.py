@@ -20,6 +20,17 @@ def test_faces_to_edges(device: str) -> None:
     assert np.array_equal(edges_wp.numpy(), edges_np)
 
 
+def test_faces_to_edges_sorted(device: str) -> None:
+    rng = np.random.default_rng(42)
+    n_faces = 16
+    faces_np = rng.integers(0, 100, size=(n_faces, 3), dtype=np.int32)
+    edges_np = np.sort(tm.geometry.faces_to_edges(faces_np), axis=1)
+
+    faces_wp = wp.array(faces_np.flatten(), dtype=wp.int32, device=device)
+    edges_wp = tw.graph.faces_to_edges(faces_wp, sorted=True)
+    assert np.array_equal(edges_wp.numpy(), edges_np)
+
+
 def test_faces_to_edges_empty(device: str) -> None:
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
     edges_wp = tw.graph.faces_to_edges(faces_wp)

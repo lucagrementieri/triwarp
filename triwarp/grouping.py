@@ -4,6 +4,7 @@ from triwarp.kernels import grouping as kernel_grouping
 import triwarp as tw
 
 
+# TODO: probably implement with stream compaction instead, probably general function usable also for unique
 def group(values: wp.array[wp.Int], length: int) -> wp.array2d[wp.int32]:
     """
     Return index groups of exactly ``length`` entries that share the same value.
