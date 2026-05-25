@@ -14,6 +14,22 @@ def normalize(array: wp.array[wp.vec3]) -> None:
 
 
 @wp.kernel
+def gather_2d_from_1d(
+    array: wp.array[wp.Scalar], indices: wp.array2d[wp.int32], out_gathered: wp.array2d[wp.Scalar]
+) -> None:
+    i, j = wp.tid()
+    index = indices[i, j]
+    out_gathered[i, j] = array[index]
+
+
+@wp.kernel
+def gather_rows(array: wp.array2d[wp.Scalar], indices: wp.array[wp.int32], out_gathered: wp.array2d[wp.Scalar]) -> None:
+    tid = wp.tid()
+    index = indices[tid]
+    out_gathered[tid] = array[index]
+
+
+@wp.kernel
 def scatter_sum_scalar(
     values: wp.array2d[wp.Scalar], indices: wp.array2d[wp.int32], out_sum: wp.array[wp.Scalar]
 ) -> None:

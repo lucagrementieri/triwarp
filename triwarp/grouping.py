@@ -43,7 +43,7 @@ def group(values: wp.array[wp.Int], length: int) -> wp.array2d[wp.int32]:
     wp.launch(
         kernel_grouping.group_sorted_fixed_length,
         dim=n - length + 1,
-        inputs=[values_buffer, indices_buffer, length, counter, groups_buffer],
+        inputs=[values_buffer, indices_buffer, counter, groups_buffer],
         device=values.device,
     )
     n_groups = counter.numpy().item()

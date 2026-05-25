@@ -8,12 +8,12 @@ VEC3_PACK_SHIFT = wp.constant(wp.uint32(11))
 def group_sorted_fixed_length(
     sorted_values: wp.array[wp.Int],
     indices: wp.array[wp.int32],
-    length: int,
     out_counter: wp.array[wp.int32],
     out_groups: wp.array2d[wp.int32],
 ) -> None:
     tid = wp.tid()
-    n = sorted_values.shape[0]
+    length = out_groups.shape[1]
+    n = out_groups.shape[0]
 
     # Prevent out-of-bounds indexing
     if tid + length > n:

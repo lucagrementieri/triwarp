@@ -21,7 +21,7 @@ def test_discrete_gaussian_curvature(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
     faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
     face_angles_wp = wp.array(face_angles_tm, dtype=wp.float32, device=mesh_wp.device)
-    gauss_curvature_wp = tw.vertices.discrete_gaussian_curvature(
+    gauss_curvature_wp = tw.curvature.discrete_gaussian_curvature(
         points_wp, vertices_wp, faces_wp, face_angles_wp, radius
     )
     assert np.allclose(gauss_curvature_wp.numpy(), gauss_curvature_tm, rtol=1e-5, atol=1e-5)
