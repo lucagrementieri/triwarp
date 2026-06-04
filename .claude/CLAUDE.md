@@ -18,7 +18,8 @@ You are an expert in NVIDIA Warp (wp). Follow all rules below when writing kerne
 ## 2. Type Standards (Warp 1.12+)
 
 - Use subscript-style array type hints: `wp.array[wp.vec3]`, `wp.array[wp.int32]`, `wp.array[wp.float32]`.
-- Use `wp.array2d[T]`, `wp.array3d[T]`, `wp.array4d[T]` for multi-dimensional arrays with matching multi-index `wp.tid()` unpacking.
+- In **`triwarp/kernels/`** only: use `wp.array2d[T]`, `wp.array3d[T]`, `wp.array4d[T]` for multi-dimensional kernel arguments with matching multi-index `wp.tid()` unpacking.
+- In **Python wrappers** (`triwarp/*.py`, not `kernels/`): do **not** annotate with `wp.array2d[T]` — Pyright treats it as a Warp annotation object (no `.shape`). Use `triwarp.typing` aliases instead (see §7).
 - Use built-in vector/matrix types: `wp.vec2`, `wp.vec3`, `wp.vec4`, `wp.mat22`, `wp.mat33`, `wp.mat44`, `wp.quat`.
 - Use `wp.indexedarray[wp.vec3]` for sparse/indexed data access patterns.
 - Declare module-level numeric constants with `wp.constant()` so they are visible inside kernel scope:
@@ -43,9 +44,11 @@ You are an expert in NVIDIA Warp (wp). Follow all rules below when writing kerne
 ## 4. Python-Scope Wrappers
 
 - Every kernel lives in a `kernels/` sub-module. Import it with an alias: `from triwarp.kernels import triangles as kernel_triangles`.
-- Python-scope wrapper functions accept `wp.array[T]` arguments (typed with subscript style) and return `wp.array[T]`.
-- Allocate output arrays with `wp.empty(n, dtype=..., device=input.device)` when all elements will be written by the kernel (avoid unnecessary zero-initialization).
-- Always forward `device=vertices.device` (or the relevant input's device) to `wp.launch` and `wp.empty`.
+- Python-scope wrapper functions accept `wp.array[T]` for 1D buffers; use `twt.Array2dInt32`, `twt.Array2dFloat32`, etc. for rank-2 results (see §7).
+- For **2D** outputs, allocate with `twt.empty_int32_2d((rows, cols), device=...)` or `twt.empty_float32_2d(...)` instead of bare `wp.empty((rows, cols), ...)`.
+- For **1D** outputs, keep `wp.empty(n, dtype=..., device=input.device)` when all elements will be written by the kernel (avoid unnecessary zero-initialization).
+- Return rank-2 buffers with `return twt.as_array2d_int32(arr)` (or `as_array2d_float32`) so callers get a checked, correctly typed value.
+- Always forward `device=vertices.device` (or the relevant input's device) to `wp.launch` and allocation helpers.
 - Derive the face count as `f = faces.shape[0] // 3` from the flat face index array.
 
 ---
@@ -87,6 +90,69 @@ All new geometry functions MUST have regression tests that compare against the `
       return v_wp, f_wp
   ```
 - Call `.numpy()` on Warp output arrays before passing to NumPy comparison functions.
-- Use `np.allclose(got, exp, rtol=1e-5, atol=1e-5)` for floating-point results.
+- Use `np.allclose(got, exp, rtol=1e-5, atol=1e-5)` for floating-point results (or `got_wp` / `exp_tm` with library suffixes).
 - Use `np.array_equal(got, exp)` for boolean or integer results.
-- When trimesh masks invalid/degenerate faces (e.g. via a validity array), apply the same mask to both `got` and `exp` before comparing.
+- Name variables with a suffix for the library: `_np` for NumPy/SciPy, `_tm` for Trimesh, `_wp` for Warp. In assertions prefer `got` / `exp` (e.g. `got_wp = ...`, `exp_tm = mesh_tm.face_adjacency_unshared`).
+
+---
+
+## 7. Python wrapper typing (`triwarp.typing`)
+
+Import once per Python wrapper module:
+
+```python
+import triwarp.typing as twt
+```
+
+Do **not** re-export typing symbols from `triwarp/__init__.py`; import `twt` where needed.
+
+### Why not `wp.array2d` in wrappers?
+
+At runtime every buffer is `warp.array`. `wp.array2d[dtype]` in Python signatures is a static annotation helper; type checkers do not treat it like a real array (missing `.shape`, bad assignability from `wp.empty`). `isinstance(x, wp.array2d)` is always `False`.
+
+Use **`wp.array[dtype, Literal[ndim]]`** via the aliases in `triwarp/typing.py`:
+
+| Alias | Meaning |
+|-------|---------|
+| `twt.Array2dInt32` | `(rows, cols)` `int32` |
+| `twt.Array2dFloat32` | `(rows, cols)` `float32` |
+| `twt.Array1dInt32` | 1D `int32` |
+| `twt.IntArray`, `twt.FloatArray`, `twt.ScalarArray` | 1D or 2D unions (e.g. `reduce.py`) |
+
+Kernels in `triwarp/kernels/` keep `wp.array2d[dtype]` unchanged.
+
+### Empty 2D allocation
+
+```python
+edges_wp = twt.empty_int32_2d((n_faces * 3, 2), device=faces_wp.device)
+angles_wp = twt.empty_float32_2d((f, 3), device=vertices_wp.device)
+```
+
+Empty mesh / no adjacency early return:
+
+```python
+if n_faces == 0:
+    return twt.empty_int32_2d((0, 2), device=faces_wp.device)
+```
+
+### Returns and parameters
+
+```python
+def faces_to_edges(faces_wp: wp.array[wp.int32], sorted: bool = False) -> twt.Array2dInt32:
+    out_wp = twt.empty_int32_2d((n_faces * 3, 2), device=faces_wp.device)
+    wp.launch(kernel_graph.faces_to_edges, dim=n_faces, inputs=[faces_wp, out_wp], device=faces_wp.device)
+    return twt.as_array2d_int32(out_wp)
+```
+
+Optional 2D arguments: `edges_sorted_wp: twt.Array2dInt32 | None = None`.
+
+### Runtime checks (not `isinstance`)
+
+- `twt.ensure_ndim(arr_wp, 2, dtype=wp.int32)` — validate rank and dtype on inputs.
+- `twt.as_array2d_int32(arr_wp)` / `twt.as_array2d_float32(arr_wp)` — check then narrow the return type for Pyright.
+
+Do not use `isinstance(..., wp.array2d)`; use the helpers above.
+
+### Tests
+
+Tests may use `import triwarp.typing as twt` for annotations (e.g. `expected: twt.Array2dInt32`). Compare via `.numpy()` and `np.array_equal(got, exp)` as in `tests/test_graph.py`.

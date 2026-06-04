@@ -1,11 +1,12 @@
 import warp as wp
 
 from triwarp.kernels import grouping as kernel_grouping
+import triwarp.typing as twt
 import triwarp as tw
 
 
 # TODO: probably implement with stream compaction instead, probably general function usable also for unique
-def group(values: wp.array[wp.Int], length: int) -> wp.array2d[wp.int32]:
+def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
     """
     Return index groups of exactly ``length`` entries that share the same value.
 
@@ -24,7 +25,7 @@ def group(values: wp.array[wp.Int], length: int) -> wp.array2d[wp.int32]:
 
     Returns
     -------
-    wp.array2d[wp.int32]
+    twt.Array2dInt32
         ``(g, length)`` array on ``values.device`` where ``g`` is the number of
         groups found. Empty when no run has exactly ``length`` equal neighbors.
 
@@ -50,10 +51,10 @@ def group(values: wp.array[wp.Int], length: int) -> wp.array2d[wp.int32]:
     groups = wp.empty((n_groups, length), dtype=wp.int32, device=values.device)
     if n_groups > 0:
         wp.copy(groups, groups_buffer, count=n_groups * length)
-    return groups
+    return twt.as_array2d_int32(groups)
 
 
-def group_int_rows(data: wp.array2d[wp.Int], length: int, max_value: int | None = None) -> wp.array2d[wp.int32]:
+def group_int_rows(data: twt.Array2dInt, length: int, max_value: int | None = None) -> twt.Array2dInt32:
     """
     Return index groups of exactly ``length`` rows that are identical.
 
@@ -75,7 +76,7 @@ def group_int_rows(data: wp.array2d[wp.Int], length: int, max_value: int | None 
 
     Returns
     -------
-    wp.array2d[wp.int32]
+    twt.Array2dInt32
         ``(g, length)`` array on ``data.device`` with original row indices per group.
 
     See Also
@@ -83,6 +84,7 @@ def group_int_rows(data: wp.array2d[wp.Int], length: int, max_value: int | None 
     group
     hash_indices_rows
     """
+    twt.ensure_ndim(data, 2)
     hashed_rows = hash_indices_rows(data, max_value)
     return group(hashed_rows, length)
 
@@ -116,7 +118,7 @@ def hash_vector_rows(data: wp.array[wp.vec3]) -> wp.array[wp.uint64]:
     return hashes
 
 
-def hash_indices_rows(data: wp.array2d[wp.int32], max_index: int | None = None) -> wp.array[wp.uint64]:
+def hash_indices_rows(data: twt.Array2dInt32, max_index: int | None = None) -> wp.array[wp.uint64]:
     """
     Pack each row of non-negative ``int32`` values into a single ``uint64`` key.
 
@@ -143,8 +145,7 @@ def hash_indices_rows(data: wp.array2d[wp.int32], max_index: int | None = None) 
     --------
     hash_vector_rows
     """
-    if data.dtype != wp.int32:
-        raise ValueError(f"data must be a wp.array2d[wp.int32], got wp.array2d[{data.dtype}]")
+    twt.ensure_ndim(data, 2, dtype=wp.int32)
     if max_index is not None and max_index <= 0:
         raise ValueError(f"max_index must be positive, got {max_index}")
     min_data, max_data = tw.reduce.minmax(data)

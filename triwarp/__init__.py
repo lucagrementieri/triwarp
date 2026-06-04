@@ -10,6 +10,7 @@ from . import sample
 from . import triangles
 from . import vertices
 from . import unique
+from . import typing
 
 __all__ = [
     "array",
@@ -22,4 +23,5 @@ __all__ = [
     "triangles",
     "vertices",
     "unique",
+    "typing",
 ]

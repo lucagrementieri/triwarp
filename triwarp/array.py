@@ -9,6 +9,8 @@ import warp.sparse as wps
 
 from typing import Union  # pyright: ignore[reportDeprecated]
 
+import triwarp.typing as twt
+
 
 def pack_1d_arrays(arrays: Sequence[wp.array[wp.Scalar]]) -> tuple[wp.array[wp.Scalar], wp.array[wp.int32]]:
     """
@@ -64,7 +66,7 @@ def pack_1d_arrays(arrays: Sequence[wp.array[wp.Scalar]]) -> tuple[wp.array[wp.S
     return flat, wp.array(offsets, dtype=wp.int32, device=device)
 
 
-def sort_rows(data: wp.array2d[wp.int32] | wp.array2d[wp.float32]) -> None:
+def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
     n = data.size
     data_buffer = wp.empty(n * 2, dtype=data.dtype, device=data.device)
     wp.copy(data_buffer, data, count=n)
@@ -76,7 +78,7 @@ def sort_rows(data: wp.array2d[wp.int32] | wp.array2d[wp.float32]) -> None:
 
 def index_sparse(
     n_rows: int,
-    indices: wp.array2d[wp.int32],
+    indices: twt.Array2dInt32,
     data: Union[wp.array[wp.Scalar], None] = None,  # pyright: ignore[reportDeprecated]
     dtype: type[wp.Scalar] | None = None,
     *,

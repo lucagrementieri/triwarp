@@ -1,5 +1,6 @@
 import warp as wp
 from triwarp.kernels import triangles as kernel_triangles
+import triwarp.typing as twt
 from typing import Literal
 
 
@@ -18,16 +19,16 @@ def face_normals_and_areas(
     return out_normal, out_area
 
 
-def face_angles(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array2d[wp.float32]:
+def face_angles(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> twt.Array2dFloat32:
     f = faces.shape[0] // 3
-    out_angle = wp.empty((f, 3), dtype=wp.float32, device=vertices.device)
+    out_angle = twt.empty_float32_2d((f, 3), device=vertices.device)
     wp.launch(
         kernel_triangles.angles,
         dim=f,
         inputs=[vertices, faces, out_angle],
         device=vertices.device,
     )
-    return out_angle
+    return twt.as_array2d_float32(out_angle)
 
 
 def centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.vec3:

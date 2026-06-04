@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.kernels import array as kernel_array
+import triwarp.typing as twt
 import triwarp as tw
 from triwarp.vertices import vertex_defects
 
@@ -9,7 +10,7 @@ def discrete_gaussian_curvature(
     points: wp.array[wp.vec3],
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
-    face_angles: wp.array2d[wp.float32],
+    face_angles: twt.Array2dFloat32,
     radius: float,
 ) -> wp.array[wp.float32]:
     """

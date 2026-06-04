@@ -5,6 +5,9 @@ from typing import overload, Literal
 
 import warp as wp
 from triwarp.kernels import points as kernel_points
+from typing import cast
+
+import triwarp.typing as twt
 
 
 def aabb_bounds(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
@@ -417,7 +420,7 @@ def query_nearest(
     *,
     max_radius: float = ...,
     grid_bins: int = ...,
-) -> tuple[wp.array2d[wp.int32], wp.array2d[wp.float32]]: ...
+) -> tuple[twt.Array2dInt32, twt.Array2dFloat32]: ...
 def query_nearest(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3] | wp.vec3,
@@ -426,8 +429,8 @@ def query_nearest(
     max_radius: float = math.inf,
     grid_bins: int = 128,
 ) -> tuple[
-    wp.array2d[wp.int32] | wp.array[wp.int32],
-    wp.array2d[wp.float32] | wp.array[wp.float32],
+    twt.Array2dInt32 | twt.Array1dInt32,
+    twt.Array2dFloat32 | twt.Array1dFloat32,
 ]:
     """
     For each query center, find the ``k`` nearest data points in Euclidean distance (``p=2``).
@@ -465,7 +468,7 @@ def query_nearest(
     Returns
     -------
     indices, distances
-        Pair of ``wp.array2d`` with shape ``(m, k)``, row ``q`` listing neighbors for ``queries[q]``
+        Pair of 2-D arrays with shape ``(m, k)``, row ``q`` listing neighbors for ``queries[q]``
         in non-decreasing distance order (when ``k > 1`` and neighbors exist in that row).
 
         * If ``k == 1``, both arrays are reshaped to length ``m`` (one index and one distance
@@ -501,8 +504,8 @@ def query_nearest(
 
     if m == 0:
         return (
-            wp.empty((0, k), dtype=wp.int32, device=device),
-            wp.empty((0, k), dtype=wp.float32, device=device),
+            twt.empty_int32_2d((0, k), device=device),
+            twt.empty_float32_2d((0, k), device=device),
         )
 
     neighbor_indices = wp.full((m, k), wp.int32(-1), dtype=wp.int32, device=device)
@@ -510,7 +513,7 @@ def query_nearest(
     if n == 0:
         if single_query:
             return neighbor_indices[0], neighbor_distances[0]
-        return neighbor_indices, neighbor_distances
+        return twt.as_array2d_int32(neighbor_indices), twt.as_array2d_float32(neighbor_distances)
 
     min_points_bound, max_points_bound = aabb_bounds(points)
     min_queries_bound, max_queries_bound = aabb_bounds(queries)
@@ -552,4 +555,6 @@ def query_nearest(
 
     if single_query and k > 1:
         return neighbor_indices[0], neighbor_distances[0]
-    return neighbor_indices, neighbor_distances
+    if k == 1:
+        return cast(twt.Array1dInt32, neighbor_indices), cast(twt.Array1dFloat32, neighbor_distances)
+    return twt.as_array2d_int32(neighbor_indices), twt.as_array2d_float32(neighbor_distances)

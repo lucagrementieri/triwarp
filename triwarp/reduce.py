@@ -1,10 +1,13 @@
 """Global reductions on Warp arrays."""
 
+from __future__ import annotations
+
 import warp as wp
 
 from triwarp.kernels import reduce as kernel_reduce
 from triwarp.constants import TILE_1D, TILE_2D
-from typing import overload, Union  # pyright: ignore[reportDeprecated]
+import triwarp.typing as twt
+from typing import overload
 
 
 @overload
@@ -34,10 +37,10 @@ def min_for_dtype(dtype: type[wp.Scalar]) -> int | float:
 
 
 @overload
-def min(array: Union[wp.array[wp.Int], wp.array2d[wp.Int]]) -> int: ...
+def min(array: twt.IntArray) -> int: ...
 @overload
-def min(array: Union[wp.array[wp.Float], wp.array2d[wp.Float]]) -> float: ...
-def min(array: Union[wp.array[wp.Scalar], wp.array2d[wp.Scalar]]) -> float | int:
+def min(array: twt.FloatArray) -> float: ...
+def min(array: twt.ScalarArray) -> float | int:
     """
     Global minimum of ``array`` (reduce every element to one scalar).
 
@@ -91,10 +94,10 @@ def min(array: Union[wp.array[wp.Scalar], wp.array2d[wp.Scalar]]) -> float | int
 
 
 @overload
-def max(array: Union[wp.array[wp.Int], wp.array2d[wp.Int]]) -> int: ...
+def max(array: twt.IntArray) -> int: ...
 @overload
-def max(array: Union[wp.array[wp.Float], wp.array2d[wp.Float]]) -> float: ...
-def max(array: Union[wp.array[wp.Scalar], wp.array2d[wp.Scalar]]) -> float | int:
+def max(array: twt.FloatArray) -> float: ...
+def max(array: twt.ScalarArray) -> float | int:
     """
     Global maximum of ``array`` (reduce every element to one scalar).
 
@@ -148,10 +151,10 @@ def max(array: Union[wp.array[wp.Scalar], wp.array2d[wp.Scalar]]) -> float | int
 
 
 @overload
-def minmax(array: Union[wp.array[wp.Int], wp.array2d[wp.Int]]) -> tuple[int, int]: ...
+def minmax(array: twt.IntArray) -> tuple[int, int]: ...
 @overload
-def minmax(array: Union[wp.array[wp.Float], wp.array2d[wp.Float]]) -> tuple[float, float]: ...
-def minmax(array: Union[wp.array[wp.Scalar], wp.array2d[wp.Scalar]]) -> tuple[float, float] | tuple[int, int]:
+def minmax(array: twt.FloatArray) -> tuple[float, float]: ...
+def minmax(array: twt.ScalarArray) -> tuple[float, float] | tuple[int, int]:
     """
     Global minimum and maximum of ``array`` (reduce every element to two scalars).
 

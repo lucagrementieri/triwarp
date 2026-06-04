@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.kernels import array as kernel_array
+import triwarp.typing as twt
 
 
 def mean_vertex_normals(
@@ -41,7 +42,7 @@ def mean_vertex_normals(
 
 # TODO: check management of degenerate faces
 def weighted_vertex_normals(
-    n_vertices: int, faces: wp.array[wp.int32], face_normals: wp.array[wp.vec3], face_angles: wp.array2d[wp.float32]
+    n_vertices: int, faces: wp.array[wp.int32], face_normals: wp.array[wp.vec3], face_angles: twt.Array2dFloat32
 ) -> wp.array[wp.vec3]:
     """
     Angle-weighted vertex normals (Thuerrner & Wuethrich, 1998).
@@ -62,7 +63,7 @@ def weighted_vertex_normals(
         One normal per triangle, length ``f`` as ``wp.vec3``, aligned with ``faces``.
     face_angles
         Interior angles at the three corners of each triangle, shape ``(f, 3)`` as
-        ``wp.array2d[wp.float32]`` with rows matching ``faces`` / ``face_normals``.
+        ``twt.Array2dFloat32`` with rows matching ``faces`` / ``face_normals``.
 
     Returns
     -------
@@ -84,7 +85,7 @@ def weighted_vertex_normals(
 
 
 def vertex_defects(
-    n_vertices: int, faces: wp.array[wp.int32], face_angles: wp.array2d[wp.float32]
+    n_vertices: int, faces: wp.array[wp.int32], face_angles: twt.Array2dFloat32
 ) -> wp.array[wp.float32]:
     """
     Discrete angle defect per vertex: ``2π`` minus the sum of incident corner angles.
@@ -103,7 +104,7 @@ def vertex_defects(
         (row-major flat layout is fine).
     face_angles
         Interior angles at the three corners of each triangle, shape ``(f, 3)`` as
-        ``wp.array2d[wp.float32]``, with rows aligned with ``faces``.
+        ``twt.Array2dFloat32``, with rows aligned with ``faces``.
 
     Returns
     -------

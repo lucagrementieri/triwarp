@@ -7,6 +7,7 @@ import pytest
 
 import triwarp as tw
 from triwarp.kernels.grouping import VEC3_PACK_SHIFT, VEC3_PACK_PRECISION
+import triwarp.typing as twt
 
 group_test_data = (
     (wp.array([1, 3, 2, 3, 4, 4, 7, 5, -1, 5, 5], dtype=wp.int32), 2, wp.array([[1, 3], [4, 5]])),
@@ -20,7 +21,7 @@ group_test_data = (
 
 
 @pytest.mark.parametrize("values, length, expected", group_test_data)
-def test_group(device: str, values: wp.array[wp.Int], length: int, expected: wp.array2d[wp.int32]) -> None:
+def test_group(device: str, values: wp.array[wp.Int], length: int, expected: twt.Array2dInt32) -> None:
     values_wp = wp.array(values, dtype=values.dtype, device=device)
     groups_wp = tw.grouping.group(values_wp, length)
     assert np.array_equal(groups_wp.numpy(), expected.numpy())

@@ -26,7 +26,8 @@ def gather_2d_from_1d(
 def gather_rows(array: wp.array2d[wp.Scalar], indices: wp.array[wp.int32], out_gathered: wp.array2d[wp.Scalar]) -> None:
     tid = wp.tid()
     index = indices[tid]
-    out_gathered[tid] = array[index]
+    for j in range(out_gathered.shape[1]):
+        out_gathered[tid, j] = array[index, j]
 
 
 @wp.kernel
