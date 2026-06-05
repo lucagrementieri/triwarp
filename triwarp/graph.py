@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import warp as wp
+import warp.sparse as wps
 from typing import overload, Literal
 from triwarp.kernels import graph as kernel_graph
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels.algorithms import connected_components as kernel_connected_components
 import triwarp.typing as twt
 import triwarp as tw
 
@@ -113,22 +115,11 @@ def face_adjacency(
     ``length=2``, equivalent to :func:`trimesh.grouping.group_rows` with
     ``require_count=2``. An empty mesh yields shape ``(0, 2)``.
 
-    Examples
-    --------
-    Face-connected components (with NetworkX on CPU after ``.numpy()``):
-
-    .. code-block:: python
-
-        import networkx as nx
-
-        adj = tw.graph.face_adjacency(faces_wp).numpy()
-        graph = nx.Graph()
-        graph.add_edges_from(adj)
-        groups = nx.connected_components(graph)
-
     See Also
     --------
     :func:`faces_to_edges`
+    :func:`connected_component_labels_from_edges`
+    :func:`face_connected_component_labels`
     :func:`trimesh.graph.face_adjacency`
     """
     n_faces = int(faces.shape[0]) // 3
@@ -231,3 +222,236 @@ def face_adjacency_unshared(
         device=faces.device,
     )
     return twt.as_array2d_int32(unshared)
+
+
+def edges_to_csr(
+    node_count: int,
+    edges: twt.Array2dInt32,
+) -> wps.BsrMatrix[wp.float32]:
+    """
+    Undirected adjacency as a 1x1-block :class:`warp.sparse.BsrMatrix` (CSR form).
+
+    Each undirected edge ``(a, b)`` contributes directed entries ``(a, b)`` and ``(b, a)``.
+
+    Parameters
+    ----------
+    node_count
+        Number of vertices ``0 .. node_count - 1``.
+    edges
+        ``(m, 2)`` ``wp.int32`` edge rows on the target device.
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        Square ``(node_count, node_count)`` adjacency with unit block values. Duplicate
+        directed pairs from repeated input edges are merged (values summed).
+    """
+    device = edges.device
+    m = int(edges.shape[0])
+
+    n_entries = 2 * m
+    rows = wp.empty(n_entries, dtype=wp.int32, device=device)
+    cols = wp.empty(n_entries, dtype=wp.int32, device=device)
+    if m > 0:
+        wp.launch(
+            kernel_graph.edges_to_adjacency,
+            dim=m,
+            inputs=[edges, rows, cols],
+            device=device,
+        )
+    data = wp.ones(n_entries, dtype=wp.float32, device=device)
+    return wps.bsr_from_triplets(node_count, node_count, rows, cols, data, prune_numerical_zeros=False)
+
+
+def connected_component_labels(
+    adjacency: wps.BsrMatrix[wp.Scalar],
+) -> wp.array[wp.int32]:
+    """
+    Per-node connected-component labels from a sparse adjacency matrix.
+
+    Uses ECL-lite (ECL-CC style init, CAS hooking, intermediate pointer jumping)
+    on the CSR structure of ``adjacency`` (1x1 BSR blocks). Hook passes run until
+    a pass reports no merge attempts (``changed == 0``), no exhausted per-edge CAS
+    retries (``incomplete == 0``), and a post-hook CSR edge check finds all
+    endpoints sharing the same representative. At most ``node_count`` hook passes
+    are attempted before raising. Labels identify nodes in the same component;
+    values are not necessarily contiguous in ``0 .. k-1`` (compare partitions,
+    not raw ids).
+
+    Parameters
+    ----------
+    adjacency
+        Square undirected adjacency in 1x1-block :class:`warp.sparse.BsrMatrix` form.
+        Each nonzero ``(i, j)`` denotes an edge between nodes ``i`` and ``j``; for
+        undirected graphs both ``(i, j)`` and ``(j, i)`` should be present.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        Length ``adjacency.nrow`` on ``adjacency.device``. Isolated nodes (empty rows)
+        receive distinct labels. When ``nnz == 0``, ``labels[i] == i``.
+
+    Raises
+    ------
+    ValueError
+        If ``adjacency`` is not square or does not use 1x1 blocks.
+    RuntimeError
+        If hook passes reach ``node_count`` without converging, or edge
+        verification still fails at that limit.
+
+    See Also
+    --------
+    :func:`connected_component_labels_from_edges`
+    :func:`edges_to_csr`
+    :func:`face_connected_component_labels`
+    """
+    node_count = adjacency.nrow  # pyright: ignore[reportAttributeAccessIssue]
+    ncol = adjacency.ncol  # pyright: ignore[reportAttributeAccessIssue]
+    if ncol != node_count:
+        raise ValueError(f"adjacency must be square, got shape ({node_count}, {ncol})")
+    if adjacency.block_shape != (1, 1):
+        raise ValueError(f"adjacency must use 1x1 blocks, got block_shape {adjacency.block_shape}")
+
+    device = adjacency.device
+    if node_count <= 1:
+        return wp.zeros(node_count, dtype=wp.int32, device=device)
+    if adjacency.nnz == 0:
+        return wp.array(range(node_count), dtype=wp.int32, device=device)
+
+    offsets = adjacency.offsets  # pyright: ignore[reportAttributeAccessIssue]
+    indices = adjacency.columns  # pyright: ignore[reportAttributeAccessIssue]
+
+    labels = wp.empty(node_count, dtype=wp.int32, device=device)
+    parents = wp.empty(node_count, dtype=wp.int32, device=device)
+
+    wp.launch(
+        kernel_connected_components.ecl_init_parent,
+        dim=node_count,
+        inputs=[offsets, indices, parents],
+        device=device,
+    )
+
+    changed = wp.zeros(1, dtype=wp.int32, device=device)
+    incomplete = wp.zeros(1, dtype=wp.int32, device=device)
+    violations = wp.zeros(1, dtype=wp.int32, device=device)
+
+    for _ in range(node_count):
+        changed.zero_()
+        incomplete.zero_()
+        wp.launch(
+            kernel_connected_components.ecl_hook,
+            dim=node_count,
+            inputs=[offsets, indices, parents, changed, incomplete],
+            device=device,
+        )
+        if changed.numpy().item() != 0 or incomplete.numpy().item() != 0:
+            continue
+
+        violations.zero_()
+        wp.launch(
+            kernel_connected_components.ecl_finalize_and_verify,
+            dim=node_count,
+            inputs=[offsets, indices, parents, labels, violations],
+            device=device,
+        )
+        if violations.numpy().item() == 0:
+            return labels
+    else:
+        n_changed = changed.numpy().item()
+        n_incomplete = incomplete.numpy().item()
+        if n_changed != 0 or n_incomplete != 0:
+            raise RuntimeError(
+                f"connected_component_labels: hook passes did not converge after {node_count} iterations"
+            )
+        else:
+            raise RuntimeError(f"connected_component_labels: edge verification failed after {node_count} iterations")
+
+
+def connected_component_labels_from_edges(
+    edges: twt.Array2dInt32,
+    node_count: int | None = None,
+) -> wp.array[wp.int32]:
+    """
+    Per-node connected-component labels from an undirected edge list.
+
+    Builds a CSR adjacency via :func:`edges_to_csr` and delegates to
+    :func:`connected_component_labels`.
+
+    Parameters
+    ----------
+    edges
+        ``(m, 2)`` ``wp.int32`` edge list. Each row ``(a, b)`` connects nodes ``a``
+        and ``b`` (undirected; order does not matter).
+    node_count
+        Number of nodes ``0 .. node_count - 1``. When ``None``, inferred as
+        ``max(edges) + 1`` if ``m > 0``, else ``0``.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        Length ``node_count`` on ``edges.device``.
+
+    Raises
+    ------
+    ValueError
+        If ``edges`` is not ``(m, 2)``, an endpoint is outside ``[0, node_count)``,
+        or ``node_count`` is negative.
+
+    See Also
+    --------
+    :func:`connected_component_labels`
+    :func:`face_connected_component_labels`
+    :func:`trimesh.graph.connected_component_labels`
+    """
+    twt.ensure_ndim(edges, 2, dtype=wp.int32)
+    if int(edges.shape[1]) != 2:
+        raise ValueError(f"edges must have shape (m, 2), got {edges.shape}")
+
+    device = edges.device
+    m = int(edges.shape[0])
+
+    if node_count is None:
+        node_count = int(edges.numpy().max()) + 1 if m > 0 else 0
+    elif node_count < 0:
+        raise ValueError(f"node_count must be non-negative, got {node_count}")
+    elif m == 0:
+        return wp.array(range(node_count), dtype=wp.int32, device=device)
+    else:
+        edges_np = edges.numpy()
+        if edges_np.min() < 0 or int(edges_np.max()) >= node_count:
+            raise ValueError(
+                f"edge indices must lie in [0, {node_count}), got min={edges_np.min()} max={edges_np.max()}"
+            )
+
+    adjacency = edges_to_csr(node_count, edges)
+    return connected_component_labels(adjacency)
+
+
+def face_connected_component_labels(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
+    """
+    Connected-component label per face (face-adjacency graph).
+
+    Equivalent to :func:`connected_component_labels_from_edges` on :func:`face_adjacency`
+    with ``node_count = n_faces``.
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` flat triangle index buffer (same as :func:`face_adjacency`).
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        Length ``n_faces`` on ``faces.device``.
+
+    See Also
+    --------
+    :func:`connected_component_labels`
+    :func:`connected_component_labels_from_edges`
+    :func:`face_adjacency`
+    """
+    n_faces = int(faces.shape[0]) // 3
+    if int(faces.shape[0]) % 3 != 0:
+        raise ValueError(f"faces length must be divisible by 3, got {faces.shape[0]}")
+    adjacency = face_adjacency(faces)
+    return connected_component_labels_from_edges(adjacency, node_count=n_faces)

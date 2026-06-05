@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import scipy.sparse as sp
+import scipy.sparse.csgraph as csgraph
 import warp as wp
+import warp.sparse as wps
 
 import trimesh as tm
 import triwarp as tw
+import triwarp.typing as twt
 
 
 def test_faces_to_edges(device: str) -> None:
@@ -81,3 +85,95 @@ def test_face_adjacency_unshared_empty(device: str) -> None:
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
     unshared_wp = tw.graph.face_adjacency_unshared(faces_wp)
     assert unshared_wp.shape == (0, 2)
+
+
+def test_edges_to_csr_roundtrip(device: str) -> None:
+    edges_np = np.array([[0, 1], [1, 2], [0, 2]], dtype=np.int32)
+    node_count = 3
+    edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
+    adjacency = tw.graph.edges_to_csr(node_count, edges_wp)
+    offsets = adjacency.offsets.numpy()  # pyright: ignore[reportAttributeAccessIssue]
+    indices = adjacency.columns.numpy()  # pyright: ignore[reportAttributeAccessIssue]
+
+    assert adjacency.nrow == node_count  # pyright: ignore[reportAttributeAccessIssue]
+    assert adjacency.ncol == node_count  # pyright: ignore[reportAttributeAccessIssue]
+    assert adjacency.block_shape == (1, 1)
+    assert offsets[0] == 0
+    assert offsets[-1] == len(indices)
+    assert offsets.shape[0] == node_count + 1
+
+    neighbors: dict[int, set[int]] = {i: set() for i in range(node_count)}
+    for a, b in edges_np:
+        neighbors[int(a)].add(int(b))
+        neighbors[int(b)].add(int(a))
+
+    for v in range(node_count):
+        row = indices[offsets[v] : offsets[v + 1]]
+        assert set(row.tolist()) == neighbors[v]
+
+
+def test_connected_component_labels_random(device: str) -> None:
+    rng = np.random.default_rng(7)
+    node_count = 64
+    n_edges = 200
+    edges_np = rng.integers(0, node_count, size=(n_edges, 2), dtype=np.int32)
+
+    edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
+    labels_wp = tw.graph.connected_component_labels_from_edges(edges_wp, node_count=node_count)
+    labels_np = _scipy_component_labels(edges_np, node_count)
+
+    assert _same_partition(labels_wp.numpy(), labels_np)
+
+
+def test_connected_component_labels_empty_edges(device: str) -> None:
+    node_count = 10
+    edges_wp = twt.empty_int32_2d((0, 2), device=device)
+    labels_wp = tw.graph.connected_component_labels_from_edges(edges_wp, node_count=node_count)
+    labels_exp = _scipy_component_labels(np.empty((0, 2), dtype=np.int32), node_count)
+    assert np.array_equal(labels_wp.numpy(), labels_exp)
+
+
+def test_connected_component_labels_zero_nodes(device: str) -> None:
+    edges_wp = twt.empty_int32_2d((0, 2), device=device)
+    labels_wp = tw.graph.connected_component_labels_from_edges(edges_wp, node_count=0)
+    assert labels_wp.shape == (0,)
+
+
+def test_connected_component_labels_path_graph(device: str) -> None:
+    n = 2048
+    edges_np = np.stack([np.arange(n - 1, dtype=np.int32), np.arange(1, n, dtype=np.int32)], axis=1)
+    edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
+    labels_wp = tw.graph.connected_component_labels_from_edges(edges_wp, node_count=n)
+    labels_exp = _scipy_component_labels(edges_np, n)
+    assert _same_partition(labels_wp.numpy(), labels_exp)
+
+
+def test_connected_component_labels_star_graph(device: str) -> None:
+    n = 512
+    hub = 0
+    leaves = np.arange(1, n, dtype=np.int32)
+    edges_np = np.stack([np.full(n - 1, hub, dtype=np.int32), leaves], axis=1)
+    edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
+    labels_wp = tw.graph.connected_component_labels_from_edges(edges_wp, node_count=n)
+    labels_exp = _scipy_component_labels(edges_np, n)
+    assert _same_partition(labels_wp.numpy(), labels_exp)
+
+
+def _scipy_component_labels(edges: np.ndarray, node_count: int) -> np.ndarray:
+    if node_count == 0:
+        return np.array([], dtype=np.int32)
+    if len(edges) == 0:
+        return np.arange(node_count, dtype=np.int32)
+    row = edges[:, 0]
+    col = edges[:, 1]
+    data = np.ones(len(edges), dtype=np.int8)
+    matrix = sp.coo_matrix((data, (row, col)), shape=(node_count, node_count))
+    matrix = matrix + matrix.T
+    _n_comp, labels = csgraph.connected_components(matrix, directed=False)
+    return labels.astype(np.int32)
+
+
+def _same_partition(a: np.ndarray, b: np.ndarray) -> bool:
+    same_a = a[:, None] == a[None, :]
+    same_b = b[:, None] == b[None, :]
+    return bool(np.array_equal(same_a, same_b))

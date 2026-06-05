@@ -37,6 +37,22 @@ def faces_to_edges_sorted(
     out_edges[f + 2, 1] = wp.max(i2, i0)
 
 
+@wp.kernel
+def edges_to_adjacency(
+    edges: wp.array2d[wp.int32],
+    out_rows: wp.array[wp.int32],
+    out_cols: wp.array[wp.int32],
+) -> None:
+    tid = int(wp.tid())
+    a = edges[tid, 0]
+    b = edges[tid, 1]
+    base = tid * 2
+    out_rows[base] = a
+    out_cols[base] = b
+    out_rows[base + 1] = b
+    out_cols[base + 1] = a
+
+
 @wp.func
 def unshared_vertex(v0: wp.int32, v1: wp.int32, v2: wp.int32, e0: wp.int32, e1: wp.int32) -> wp.int32:
     result = wp.int32(-1)
