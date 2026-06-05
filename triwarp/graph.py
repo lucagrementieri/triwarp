@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import overload, Literal
 
 import warp as wp
@@ -36,19 +35,11 @@ def faces_to_edges(faces: wp.array[wp.int32], sorted: bool = False) -> twt.Array
         ``edges[3*f + 1] = (i1, i2)``, ``edges[3*f + 2] = (i2, i0)`` for face ``f``.
         If ``n_faces == 0``, returns an empty ``(0, 2)`` array.
 
-    Raises
-    ------
-    ValueError
-        If ``faces.shape[0]`` is not divisible by ``3``.
-
     See Also
     --------
     :func:`trimesh.geometry.faces_to_edges`
     """
-    n = int(faces.shape[0])
-    if n % 3 != 0:
-        raise ValueError(f"faces length must be divisible by 3, got {n}")
-    n_faces = n // 3
+    n_faces = int(faces.shape[0]) // 3
     edges = twt.empty_int32_2d((n_faces * 3, 2), device=faces.device)
     wp.launch(
         kernel_graph.faces_to_edges_sorted if sorted else kernel_graph.faces_to_edges,
@@ -192,9 +183,8 @@ def face_adjacency_unshared(
     Raises
     ------
     ValueError
-        If ``faces.shape[0]`` is not divisible by ``3``, or if only one of
-        ``face_adjacency`` and ``face_adjacency_edges`` is provided, or if their
-        row counts differ.
+        If only one of ``face_adjacency`` and ``face_adjacency_edges`` is provided,
+        or if their row counts differ.
 
     See Also
     --------
@@ -453,77 +443,5 @@ def face_connected_component_labels(faces: wp.array[wp.int32]) -> wp.array[wp.in
     :func:`face_adjacency`
     """
     n_faces = int(faces.shape[0]) // 3
-    if int(faces.shape[0]) % 3 != 0:
-        raise ValueError(f"faces length must be divisible by 3, got {faces.shape[0]}")
     adjacency = face_adjacency(faces)
     return connected_component_labels_from_edges(adjacency, node_count=n_faces)
-
-
-def concatenate(
-    meshes_data: Sequence[tuple[wp.array[wp.vec3], wp.array[wp.int32]]],
-) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-    """
-    Concatenate meshes, each given as ``(vertices, faces)`` on the same device.
-
-    Face indices are renumbered with cumulative vertex offsets, matching
-    :func:`trimesh.util.concatenate` (with triwarp's flat ``(3 * n_faces,)`` face
-    layout instead of ``(n_faces, 3)``).
-
-    Parameters
-    ----------
-    meshes
-        Sequence of ``(vertices, faces)`` pairs using triwarp's flat face layout.
-        An empty sequence yields empty arrays on ``cpu``.
-
-    Returns
-    -------
-    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
-        Combined vertices and reindexed faces on the shared device.
-
-    Raises
-    ------
-    ValueError
-        If any pair uses a different device, or any face buffer length is not
-        divisible by ``3``.
-
-    See Also
-    --------
-    :func:`trimesh.util.concatenate`
-    """
-    if len(meshes_data) == 0:
-        return wp.empty(0, dtype=wp.vec3), wp.empty(0, dtype=wp.int32)
-
-    device = meshes_data[0][0].device
-    vertex_counts: list[int] = []
-    total_indices = 0
-    for i, (vertices, faces) in enumerate(meshes_data):
-        if vertices.device != device or faces.device != device:
-            raise ValueError(f"all arrays must live on the same device, got mismatch at index {i}")
-        f = int(faces.shape[0])
-        if f % 3 != 0:
-            raise ValueError(f"faces length must be divisible by 3, got {f} at index {i}")
-        vertex_counts.append(int(vertices.shape[0]))
-        total_indices += f
-
-    if sum(vertex_counts) == 0:
-        concatenated_vertices = wp.empty(0, dtype=wp.vec3, device=device)
-    else:
-        concatenated_vertices, _ = tw.array.pack_1d_arrays([vertices for vertices, _ in meshes_data])
-
-    concatenated_faces = wp.empty(total_indices, dtype=wp.int32, device=device)
-
-    vertex_offset = wp.int32(0)
-    dest_offset = wp.int32(0)
-    for count, (_, faces) in zip(vertex_counts, meshes_data, strict=True):
-        f = int(faces.shape[0])
-        if f > 0:
-            wp.launch(
-                kernel_graph.offset_copy_int32,
-                dim=f,
-                inputs=[faces, vertex_offset, dest_offset, concatenated_faces],
-                device=device,
-            )
-            dest_offset += wp.int32(f)
-        vertex_offset += wp.int32(count)
-
-    return concatenated_vertices, concatenated_faces

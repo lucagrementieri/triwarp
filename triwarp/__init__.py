@@ -7,6 +7,7 @@ from . import grouping
 from . import points
 from . import reduce
 from . import sample
+from . import selection
 from . import triangles
 from . import vertices
 from . import unique
@@ -20,6 +21,7 @@ __all__ = [
     "points",
     "reduce",
     "sample",
+    "selection",
     "triangles",
     "vertices",
     "unique",

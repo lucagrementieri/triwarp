@@ -74,17 +74,6 @@ def unshared_vertex(v0: wp.int32, v1: wp.int32, v2: wp.int32, e0: wp.int32, e1: 
 
 
 @wp.kernel
-def offset_copy_int32(
-    src: wp.array[wp.int32],
-    offset: wp.int32,
-    dest_offset: wp.int32,
-    out: wp.array[wp.int32],
-) -> None:
-    tid = int(wp.tid())
-    out[dest_offset + tid] = src[tid] + offset
-
-
-@wp.kernel
 def face_adjacency_unshared(
     faces: wp.array[wp.int32],
     face_adjacency: wp.array2d[wp.int32],
