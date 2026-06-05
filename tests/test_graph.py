@@ -158,6 +158,25 @@ def test_connected_component_labels_star_graph(device: str) -> None:
     assert _same_partition(labels_wp.numpy(), labels_exp)
 
 
+def test_face_connected_component_labels(request: pytest.FixtureRequest) -> None:
+    mesh_a_tm, mesh_a_wp = request.getfixturevalue("icosahedron")
+    mesh_b_tm, mesh_b_wp = request.getfixturevalue("hemisphere")
+    mesh_c_tm, mesh_c_wp = request.getfixturevalue("half_torus")
+
+    concat_tm = tm.util.concatenate([mesh_a_tm, mesh_b_tm, mesh_c_tm])
+    _, concat_faces_wp = tw.graph.concatenate(
+        [
+            (mesh_a_wp.points, mesh_a_wp.indices),
+            (mesh_b_wp.points, mesh_b_wp.indices),
+            (mesh_c_wp.points, mesh_c_wp.indices),
+        ]
+    )
+    face_labels_wp = tw.graph.face_connected_component_labels(concat_faces_wp)
+    n_faces = concat_tm.faces.shape[0]
+    face_labels_tm = _scipy_component_labels(concat_tm.face_adjacency.astype(np.int32), n_faces)
+    assert _same_partition(face_labels_wp.numpy(), face_labels_tm)
+
+
 def _scipy_component_labels(edges: np.ndarray, node_count: int) -> np.ndarray:
     if node_count == 0:
         return np.array([], dtype=np.int32)
