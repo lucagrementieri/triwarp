@@ -2,6 +2,7 @@
 
 import warp as wp
 
+# TODO: validate experimentally a good value for this and also for the max hook passes
 ECL_HOOK_MAX_RETRY = wp.constant(wp.int32(32))
 
 

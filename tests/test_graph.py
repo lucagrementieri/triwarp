@@ -7,7 +7,6 @@ import pytest
 import scipy.sparse as sp
 import scipy.sparse.csgraph as csgraph
 import warp as wp
-import warp.sparse as wps
 
 import trimesh as tm
 import triwarp as tw
@@ -177,3 +176,33 @@ def _same_partition(a: np.ndarray, b: np.ndarray) -> bool:
     same_a = a[:, None] == a[None, :]
     same_b = b[:, None] == b[None, :]
     return bool(np.array_equal(same_a, same_b))
+
+
+def test_concatenate_meshes(request: pytest.FixtureRequest) -> None:
+    mesh_a_tm, mesh_a_wp = request.getfixturevalue("icosahedron")
+    mesh_b_tm, mesh_b_wp = request.getfixturevalue("hemisphere")
+    mesh_c_tm, mesh_c_wp = request.getfixturevalue("half_torus")
+
+    concat_tm = tm.util.concatenate([mesh_a_tm, mesh_b_tm, mesh_c_tm])
+    concat_vertices_wp, concat_faces_wp = tw.graph.concatenate(
+        [
+            (mesh_a_wp.points, mesh_a_wp.indices),
+            (mesh_b_wp.points, mesh_b_wp.indices),
+            (mesh_c_wp.points, mesh_c_wp.indices),
+        ]
+    )
+    assert np.allclose(concat_vertices_wp.numpy(), concat_tm.vertices)
+    assert np.array_equal(concat_faces_wp.numpy(), concat_tm.faces.reshape(-1))
+
+
+def test_concatenate_single_mesh(request: pytest.FixtureRequest) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue("icosahedron")
+    concat_vertices_wp, concat_faces_wp = tw.graph.concatenate([(mesh_wp.points, mesh_wp.indices)])
+    assert np.allclose(concat_vertices_wp.numpy(), mesh_tm.vertices)
+    assert np.array_equal(concat_faces_wp.numpy(), mesh_tm.faces.reshape(-1))
+
+
+def test_concatenate_empty() -> None:
+    vertices_wp, faces_wp = tw.graph.concatenate([])
+    assert vertices_wp.shape == (0,)
+    assert faces_wp.shape == (0,)
