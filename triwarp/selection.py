@@ -90,6 +90,8 @@ def submesh(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     face_indices: wp.array[wp.int32],
+    *,
+    unique_indices: bool = False,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
     Extract a face subset and reindex vertices from zero.
@@ -109,6 +111,9 @@ def submesh(
     face_indices
         1D ``wp.int32`` array of face indices into the source mesh
         (``0 .. n_faces - 1``), on the same device as ``vertices``.
+    unique_indices
+        If ``True``, ``face_indices`` is assumed to contain no duplicates and
+        the deduplication pass is skipped.
 
     Returns
     -------
@@ -146,7 +151,11 @@ def submesh(
             f"face indices must lie in [0, {n_faces}), got min={face_indices_np.min()} max={face_indices_np.max()}"
         )
 
-    unique_face_indices, face_slots = tw.unique.unique_1d(face_indices, return_inverse=True)
+    if unique_indices:
+        unique_face_indices = face_indices
+        face_slots = wp.array(range(k), dtype=wp.int32, device=device)
+    else:
+        unique_face_indices, face_slots = tw.unique.unique_1d(face_indices, return_inverse=True)
 
     unique_faces = _gather_faces(faces, unique_face_indices)
 

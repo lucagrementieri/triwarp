@@ -53,7 +53,9 @@ def test_submesh_single_face(request: pytest.FixtureRequest) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue("icosahedron")
     face_indices = wp.array([0], dtype=wp.int32, device=mesh_wp.points.device)
     submesh_tm = tm.util.submesh(mesh_tm, [[0]], repair=False, append=False)[0]
-    submesh_vertices_wp, submesh_faces_wp = tw.selection.submesh(mesh_wp.points, mesh_wp.indices, face_indices)
+    submesh_vertices_wp, submesh_faces_wp = tw.selection.submesh(
+        mesh_wp.points, mesh_wp.indices, face_indices, unique_indices=True
+    )
     assert submesh_vertices_wp.shape == (3,)
     assert submesh_faces_wp.shape == (3,)
     assert np.allclose(submesh_vertices_wp.numpy(), submesh_tm.vertices)
@@ -93,7 +95,9 @@ def test_submesh_all_faces(request: pytest.FixtureRequest, mesh_name: str) -> No
     face_indices_np = np.arange(n_faces, dtype=np.int32)
     face_indices = wp.array(face_indices_np, dtype=wp.int32, device=mesh_wp.points.device)
     submesh_tm = tm.util.submesh(mesh_tm, [face_indices_np], repair=False, append=False)[0]
-    submesh_vertices_wp, submesh_faces_wp = tw.selection.submesh(mesh_wp.points, mesh_wp.indices, face_indices)
+    submesh_vertices_wp, submesh_faces_wp = tw.selection.submesh(
+        mesh_wp.points, mesh_wp.indices, face_indices, unique_indices=True
+    )
     assert submesh_vertices_wp.shape[0] <= mesh_tm.vertices.shape[0]
     assert submesh_faces_wp.shape[0] == n_faces * 3
     assert np.allclose(submesh_vertices_wp.numpy(), submesh_tm.vertices)
