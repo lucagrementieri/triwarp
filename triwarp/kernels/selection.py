@@ -10,4 +10,3 @@ def offset_copy_int32(
 ) -> None:
     tid = int(wp.tid())
     out[dest_offset + tid] = src[tid] + offset
-

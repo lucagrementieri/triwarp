@@ -51,6 +51,24 @@ You are an expert in NVIDIA Warp (wp). Follow all rules below when writing kerne
 - Always forward `device=vertices.device` (or the relevant input's device) to `wp.launch` and allocation helpers.
 - Derive the face count as `f = faces.shape[0] // 3` from the flat face index array.
 
+### Python-scope gather indexing (prefer over trivial gather kernels)
+
+At **Python scope**, Warp supports **gather** with integer indexing: `view = src[indices]` yields a `wp.indexedarray`. Materialize a dense `wp.array` with `wp.copy(dst, view)` when callers need `.reshape()` or a guaranteed `wp.array` return type (see `triwarp/selection.py` face gather and `triwarp/array.py` `isin`).
+
+- **1D gather:** `vertices[indices]`, `lookup[elements]`, etc.
+- **2D index arrays:** Warp requires **1D** index arrays for `[]` gather — flatten first (`elements.flatten()`), gather, `wp.copy`, then `.reshape(original_shape)`.
+- **Indexed assignment** (`arr[indices] = value`) is **not** supported on `wp.array` at Python scope — keep a small kernel for scatter / mask marking (e.g. `mark_membership_mask` in `triwarp/kernels/array.py`).
+
+Do **not** add custom per-element gather kernels when `[]` plus `wp.copy` suffices. Probe tests live in `tests/test_*_indexing_probe.py`.
+
+### Dtype conversion at Python scope (`wp.utils.array_cast`)
+
+`wp.cast(expr, TargetType)` is for **kernel / `@wp.func` scope** only — there is no `wp.cast` on whole arrays at Python scope.
+
+For element-wise dtype conversion of `wp.array` buffers at Python scope, allocate the destination and call **`wp.utils.array_cast(src, dst)`** (same device, matching shape). Example: `wp.bool` → `wp.int32` `0`/`1` flags for `wp.utils.array_scan` in `flatnonzero` — do **not** add a `bool_to_int32` gather-style kernel.
+
+Inside kernels, keep using `wp.cast(expr, TargetType)` for scalar and vector conversions.
+
 ---
 
 ## 5. Kernel-Scope Restrictions
@@ -89,10 +107,10 @@ All new geometry functions MUST have regression tests that compare against the `
       f_wp = wp.array(faces, dtype=wp.int32, device=device)
       return v_wp, f_wp
   ```
-- Call `.numpy()` on Warp output arrays before passing to NumPy comparison functions.
-- Use `np.allclose(got, exp, rtol=1e-5, atol=1e-5)` for floating-point results (or `got_wp` / `exp_tm` with library suffixes).
+- Call `.numpy()` on Warp output arrays before passing to NumPy comparison functions. Use it inline, and not defining a new variable.
+- Use `np.allclose(got, exp, rtol=1e-5, atol=1e-5)` for floating-point results.
 - Use `np.array_equal(got, exp)` for boolean or integer results.
-- Name variables with a suffix for the library: `_np` for NumPy/SciPy, `_tm` for Trimesh, `_wp` for Warp. In assertions prefer `got` / `exp` (e.g. `got_wp = ...`, `exp_tm = mesh_tm.face_adjacency_unshared`).
+- Name variables with a suffix for the library: `_np` for NumPy/SciPy, `_tm` for Trimesh, `_wp` for Warp. Avoid `got` / `exp` but use instead clear names.
 
 ---
 

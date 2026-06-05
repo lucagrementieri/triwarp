@@ -20,12 +20,14 @@ if TYPE_CHECKING:
     Array2dInt32: TypeAlias = wp.array[wp.int32, Literal[2]]
     Array2dFloat32: TypeAlias = wp.array[wp.float32, Literal[2]]
 
-    Array1dInt: TypeAlias = wp.array[wp.Int, Literal[1]]
-    Array2dInt: TypeAlias = wp.array[wp.Int, Literal[2]]
-    Array1dFloat: TypeAlias = wp.array[wp.Float, Literal[1]]
-    Array2dFloat: TypeAlias = wp.array[wp.Float, Literal[2]]
-    Array1dScalar: TypeAlias = wp.array[wp.Scalar, Literal[1]]
-    Array2dScalar: TypeAlias = wp.array[wp.Scalar, Literal[2]]
+    # wp.Int / wp.Float / wp.Scalar are TypeVars; subscripting wp.array[...] with them
+    # yields a generic alias that requires type arguments under basedpyright.
+    Array1dInt: TypeAlias = Array1dInt32
+    Array2dInt: TypeAlias = Array2dInt32
+    Array1dFloat: TypeAlias = Array1dFloat32
+    Array2dFloat: TypeAlias = Array2dFloat32
+    Array1dScalar: TypeAlias = Array1dInt32 | Array1dFloat32
+    Array2dScalar: TypeAlias = Array2dInt32 | Array2dFloat32
 
     IntArray: TypeAlias = Array1dInt | Array2dInt
     FloatArray: TypeAlias = Array1dFloat | Array2dFloat

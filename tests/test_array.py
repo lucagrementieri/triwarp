@@ -87,3 +87,62 @@ def test_index_sparse_repeated_indices(device: str):
         (result_wp.values.numpy(), result_wp.columns.numpy(), result_wp.offsets.numpy()), shape=result_wp.shape
     )
     assert np.array_equal(result_csr.todense(), result_np.todense())
+
+
+def test_isin_1d(device: str) -> None:
+    rng = np.random.default_rng(42)
+    elements_np = rng.integers(0, 20, size=50, dtype=np.int32)
+    test_np = rng.choice(20, size=8, replace=False).astype(np.int32)
+
+    elements_wp = wp.array(elements_np, dtype=wp.int32, device=device)
+    test_wp = wp.array(test_np, dtype=wp.int32, device=device)
+    mask_wp = tw.array.isin(elements_wp, test_wp)
+    mask_np = np.isin(elements_np, test_np)
+    assert np.array_equal(mask_wp.numpy(), mask_np)
+
+
+def test_isin_2d(device: str) -> None:
+    rng = np.random.default_rng(7)
+    elements_np = rng.integers(0, 15, size=(12, 3), dtype=np.int32)
+    test_np = rng.choice(15, size=5, replace=False).astype(np.int32)
+
+    elements_wp = wp.array(elements_np, dtype=wp.int32, device=device)
+    test_wp = wp.array(test_np, dtype=wp.int32, device=device)
+    mask_wp = tw.array.isin(elements_wp, test_wp)
+    mask_np = np.isin(elements_np, test_np)
+    assert np.array_equal(mask_wp.numpy(), mask_np)
+
+
+def test_isin_empty_test(device: str) -> None:
+    elements_np = np.array([0, 1, 2, 3], dtype=np.int32)
+    elements_wp = wp.array(elements_np, dtype=wp.int32, device=device)
+    test_wp = wp.empty(0, dtype=wp.int32, device=device)
+    mask_wp = tw.array.isin(elements_wp, test_wp)
+    mask_ref_np = np.zeros_like(elements_np, dtype=bool)
+    assert np.array_equal(mask_wp.numpy(), mask_ref_np)
+
+
+def test_isin_sparse_large_indices(device: str) -> None:
+    """Forces sort + binary-search path (max index >> len(test_elements))."""
+    elements_np = np.array([1, 1_000_000, 2, 999_999, 3], dtype=np.int32)
+    test_np = np.array([1, 2, 3], dtype=np.int32)
+    elements_wp = wp.array(elements_np, dtype=wp.int32, device=device)
+    test_wp = wp.array(test_np, dtype=wp.int32, device=device)
+    mask_wp = tw.array.isin(elements_wp, test_wp)
+    mask_np = np.isin(elements_np, test_np)
+    assert np.array_equal(mask_wp.numpy(), mask_np)
+
+
+def test_flatnonzero(device: str) -> None:
+    rng = np.random.default_rng(11)
+    mask_np = rng.choice([False, True], size=64, replace=True)
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+    indices_wp = tw.array.flatnonzero(mask_wp)
+    indices_ref_np = np.flatnonzero(mask_np).astype(np.int32)
+    assert np.array_equal(indices_wp.numpy(), indices_ref_np)
+
+
+def test_flatnonzero_empty(device: str) -> None:
+    mask_wp = wp.array(np.zeros(8, dtype=bool), dtype=wp.bool, device=device)
+    indices_wp = tw.array.flatnonzero(mask_wp)
+    assert indices_wp.shape == (0,)

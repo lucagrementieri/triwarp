@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import warp as wp
 
 import triwarp.reduce as tw_reduce
@@ -57,6 +58,16 @@ def test_min_2d(device: str) -> None:
     assert np.allclose(min_wp, min_np)
 
 
+@pytest.mark.parametrize("axis", [0, 1])
+def test_min_2d_axis(device: str, axis: int) -> None:
+    rng = np.random.default_rng(42)
+    values_np = rng.integers(-1000, 1000, (32, 10), dtype=np.int32)
+    values_wp = wp.array(values_np, dtype=wp.int32, device=device)
+    got_wp = tw_reduce.min(values_wp, axis=axis)
+    exp_np = values_np.min(axis=axis)
+    assert np.array_equal(got_wp.numpy(), exp_np)
+
+
 def test_max_1d(device: str) -> None:
     rng = np.random.default_rng(42)
     n = 100
@@ -77,6 +88,16 @@ def test_max_2d(device: str) -> None:
     values_wp = wp.array(values_np, dtype=wp.float32, device=device)
     max_wp = tw_reduce.max(values_wp)
     assert np.allclose(max_wp, max_np)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_max_2d_axis(device: str, axis: int) -> None:
+    rng = np.random.default_rng(42)
+    values_np = rng.integers(-1000, 1000, (32, 10), dtype=np.int32)
+    values_wp = wp.array(values_np, dtype=wp.int32, device=device)
+    got_wp = tw_reduce.max(values_wp, axis=axis)
+    exp_np = values_np.max(axis=axis)
+    assert np.array_equal(got_wp.numpy(), exp_np)
 
 
 def test_minmax_1d(device: str) -> None:
@@ -103,3 +124,151 @@ def test_minmax_2d(device: str) -> None:
     min_wp, max_wp = tw_reduce.minmax(values_wp)
     assert np.allclose(min_wp, min_np)
     assert np.allclose(max_wp, max_np)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_minmax_2d_axis(device: str, axis: int) -> None:
+    rng = np.random.default_rng(42)
+    values_np = rng.standard_normal((32, 10), dtype=np.float32)
+    values_wp = wp.array(values_np, dtype=wp.float32, device=device)
+    got_min_wp, got_max_wp = tw_reduce.minmax(values_wp, axis=axis)
+    exp_min_np = values_np.min(axis=axis)
+    exp_max_np = values_np.max(axis=axis)
+    assert np.allclose(got_min_wp.numpy(), exp_min_np, rtol=1e-5, atol=1e-5)
+    assert np.allclose(got_max_wp.numpy(), exp_max_np, rtol=1e-5, atol=1e-5)
+
+
+def test_any_1d(device: str) -> None:
+    rng = np.random.default_rng(42)
+    mask_np = rng.choice([False, True], size=(100,), replace=True)
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+    any_wp = tw_reduce.any(mask_wp)
+    any_ref_np = np.any(mask_np)
+    assert any_wp == any_ref_np
+
+
+def test_all_1d(device: str) -> None:
+    rng = np.random.default_rng(42)
+    mask_np = rng.choice([False, True], size=(100,), replace=True)
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+    all_wp = tw_reduce.all(mask_wp)
+    all_ref_np = np.all(mask_np)
+    assert all_wp == all_ref_np
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_any_2d_axis(device: str, axis: int) -> None:
+    rng = np.random.default_rng(42)
+    mask_np = rng.choice([False, True], size=(32, 4), replace=True)
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+    any_wp = tw_reduce.any(mask_wp, axis=axis)
+    any_ref_np = np.any(mask_np, axis=axis)
+    assert np.array_equal(any_wp.numpy(), any_ref_np)
+
+
+def test_any_2d_global(device: str) -> None:
+    rng = np.random.default_rng(42)
+    for mask_np in [
+        rng.choice([False, True], size=(32, 4), replace=True),
+        np.zeros((32, 4), dtype=bool),
+        np.ones((32, 4), dtype=bool),
+    ]:
+        mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+        got = tw_reduce.any(mask_wp, axis=None)
+        exp = bool(np.any(mask_np))
+        assert got == exp, f"any global mismatch: got {got}, exp {exp}"
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_all_2d_axis(device: str, axis: int) -> None:
+    rng = np.random.default_rng(42)
+    mask_np = rng.choice([False, True], size=(32, 4), replace=True)
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+    all_wp = tw_reduce.all(mask_wp, axis=axis)
+    all_ref_np = np.all(mask_np, axis=axis)
+    assert np.array_equal(all_wp.numpy(), all_ref_np)
+
+
+def test_all_2d_global(device: str) -> None:
+    rng = np.random.default_rng(42)
+    for mask_np in [
+        rng.choice([False, True], size=(32, 4), replace=True),
+        np.zeros((32, 4), dtype=bool),
+        np.ones((32, 4), dtype=bool),
+    ]:
+        mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+        got = tw_reduce.all(mask_wp, axis=None)
+        exp = bool(np.all(mask_np))
+        assert got == exp, f"all global mismatch: got {got}, exp {exp}"
+
+
+def test_scalar_reduce_1d_axis_raises(device: str) -> None:
+    values_wp = wp.array([1, 2, 3], dtype=wp.int32, device=device)
+    for fn in (tw_reduce.min, tw_reduce.max, tw_reduce.minmax):
+        with pytest.raises(ValueError, match="requires axis=None for a 1D array"):
+            fn(values_wp, axis=0)
+
+
+@pytest.mark.parametrize("shape", [(65,), (9, 9), (65, 10)])
+def test_min_partial_tiles(device: str, shape: tuple[int, ...]) -> None:
+    rng = np.random.default_rng(99)
+    values_np = rng.integers(-1000, 1000, shape, dtype=np.int32)
+    values_wp = wp.array(values_np, dtype=wp.int32, device=device)
+    got = tw_reduce.min(values_wp)
+    assert np.allclose(got, values_np.min())
+
+
+@pytest.mark.parametrize("shape", [(65,), (9, 9), (65, 10)])
+def test_max_partial_tiles(device: str, shape: tuple[int, ...]) -> None:
+    rng = np.random.default_rng(99)
+    values_np = rng.standard_normal(shape).astype(np.float32)
+    values_wp = wp.array(values_np, dtype=wp.float32, device=device)
+    got = tw_reduce.max(values_wp)
+    assert np.allclose(got, values_np.max(), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("shape", [(65,), (9, 9), (65, 10)])
+def test_minmax_partial_tiles(device: str, shape: tuple[int, ...]) -> None:
+    rng = np.random.default_rng(99)
+    values_np = rng.standard_normal(shape).astype(np.float32)
+    values_wp = wp.array(values_np, dtype=wp.float32, device=device)
+    got_min, got_max = tw_reduce.minmax(values_wp)
+    assert np.allclose(got_min, values_np.min(), rtol=1e-5, atol=1e-5)
+    assert np.allclose(got_max, values_np.max(), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("shape", [(65,), (9, 9), (65, 10)])
+def test_any_partial_tiles(device: str, shape: tuple[int, ...]) -> None:
+    rng = np.random.default_rng(99)
+    mask_np = rng.choice([False, True], size=shape, replace=True)
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+    assert tw_reduce.any(mask_wp) == bool(np.any(mask_np))
+
+
+@pytest.mark.parametrize("shape", [(65,), (9, 9), (65, 10)])
+def test_all_partial_tiles(device: str, shape: tuple[int, ...]) -> None:
+    rng = np.random.default_rng(99)
+    mask_np = rng.choice([False, True], size=shape, replace=True)
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+    assert tw_reduce.all(mask_wp) == bool(np.all(mask_np))
+
+
+@pytest.mark.parametrize("shape,axis", [((9, 9), 0), ((9, 9), 1), ((65, 10), 0), ((65, 10), 1)])
+def test_scalar_reduce_partial_tiles_axis(device: str, shape: tuple[int, int], axis: int) -> None:
+    rng = np.random.default_rng(99)
+    values_np = rng.integers(-1000, 1000, shape, dtype=np.int32)
+    values_wp = wp.array(values_np, dtype=wp.int32, device=device)
+    assert np.array_equal(tw_reduce.min(values_wp, axis=axis).numpy(), values_np.min(axis=axis))
+    assert np.array_equal(tw_reduce.max(values_wp, axis=axis).numpy(), values_np.max(axis=axis))
+    got_min, got_max = tw_reduce.minmax(values_wp, axis=axis)
+    assert np.array_equal(got_min.numpy(), values_np.min(axis=axis))
+    assert np.array_equal(got_max.numpy(), values_np.max(axis=axis))
+
+
+@pytest.mark.parametrize("shape,axis", [((9, 9), 0), ((9, 9), 1), ((65, 10), 0), ((65, 10), 1)])
+def test_bool_reduce_partial_tiles_axis(device: str, shape: tuple[int, int], axis: int) -> None:
+    rng = np.random.default_rng(99)
+    mask_np = rng.choice([False, True], size=shape, replace=True)
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+    assert np.array_equal(tw_reduce.any(mask_wp, axis=axis).numpy(), np.any(mask_np, axis=axis))
+    assert np.array_equal(tw_reduce.all(mask_wp, axis=axis).numpy(), np.all(mask_np, axis=axis))
