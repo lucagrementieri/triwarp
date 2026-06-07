@@ -86,6 +86,68 @@ def test_face_adjacency_unshared_empty(device: str) -> None:
     assert unshared_wp.shape == (0, 2)
 
 
+def test_concatenate_meshes(request: pytest.FixtureRequest) -> None:
+    mesh_a_tm, mesh_a_wp = request.getfixturevalue("icosahedron")
+    mesh_b_tm, mesh_b_wp = request.getfixturevalue("hemisphere")
+    mesh_c_tm, mesh_c_wp = request.getfixturevalue("half_torus")
+
+    concat_tm = tm.util.concatenate([mesh_a_tm, mesh_b_tm, mesh_c_tm])
+    concat_vertices_wp, concat_faces_wp = tw.graph.concatenate(
+        [
+            (mesh_a_wp.points, mesh_a_wp.indices),
+            (mesh_b_wp.points, mesh_b_wp.indices),
+            (mesh_c_wp.points, mesh_c_wp.indices),
+        ]
+    )
+    assert np.allclose(concat_vertices_wp.numpy(), concat_tm.vertices)
+    assert np.array_equal(concat_faces_wp.numpy(), concat_tm.faces.reshape(-1))
+
+
+def test_concatenate_single_mesh(request: pytest.FixtureRequest) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue("icosahedron")
+    concat_vertices_wp, concat_faces_wp = tw.graph.concatenate([(mesh_wp.points, mesh_wp.indices)])
+    assert np.allclose(concat_vertices_wp.numpy(), mesh_tm.vertices)
+    assert np.array_equal(concat_faces_wp.numpy(), mesh_tm.faces.reshape(-1))
+
+
+def test_concatenate_empty() -> None:
+    vertices_wp, faces_wp = tw.graph.concatenate([])
+    assert vertices_wp.shape == (0,)
+    assert faces_wp.shape == (0,)
+
+
+def test_split_meshes(request: pytest.FixtureRequest) -> None:
+    mesh_a_tm, mesh_a_wp = request.getfixturevalue("icosahedron")
+    mesh_b_tm, mesh_b_wp = request.getfixturevalue("hemisphere")
+    mesh_c_tm, mesh_c_wp = request.getfixturevalue("half_torus")
+
+    meshes_wp = [
+        (mesh_a_wp.points, mesh_a_wp.indices),
+        (mesh_b_wp.points, mesh_b_wp.indices),
+        (mesh_c_wp.points, mesh_c_wp.indices),
+    ]
+    concat_vertices_wp, concat_faces_wp = tw.graph.concatenate(meshes_wp)
+
+    split_wp = tw.graph.split(concat_vertices_wp, concat_faces_wp)
+    assert len(split_wp) == 3
+
+    roundtrip_vertices_wp, roundtrip_faces_wp = tw.graph.concatenate(split_wp)
+    assert np.allclose(roundtrip_vertices_wp.numpy(), concat_vertices_wp.numpy())
+    assert np.array_equal(roundtrip_faces_wp.numpy(), concat_faces_wp.numpy())
+
+    split_wp_sorted = sorted(split_wp, key=lambda mesh: mesh[1].shape[0])
+    meshes_tm_sorted = sorted([mesh_a_tm, mesh_b_tm, mesh_c_tm], key=lambda mesh: len(mesh.faces))
+    for (vertices_wp, faces_wp), mesh_tm in zip(split_wp_sorted, meshes_tm_sorted, strict=True):
+        assert np.allclose(vertices_wp.numpy(), mesh_tm.vertices, rtol=1e-5, atol=1e-5)
+        assert np.array_equal(faces_wp.numpy(), mesh_tm.faces.reshape(-1))
+
+
+def test_split_empty(device: str) -> None:
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    assert tw.graph.split(vertices_wp, faces_wp) == []
+
+
 def test_edges_to_csr_roundtrip(device: str) -> None:
     edges_np = np.array([[0, 1], [1, 2], [0, 2]], dtype=np.int32)
     node_count = 3
@@ -164,7 +226,7 @@ def test_face_connected_component_labels(request: pytest.FixtureRequest) -> None
     mesh_c_tm, mesh_c_wp = request.getfixturevalue("half_torus")
 
     concat_tm = tm.util.concatenate([mesh_a_tm, mesh_b_tm, mesh_c_tm])
-    _, concat_faces_wp = tw.selection.concatenate(
+    _, concat_faces_wp = tw.graph.concatenate(
         [
             (mesh_a_wp.points, mesh_a_wp.indices),
             (mesh_b_wp.points, mesh_b_wp.indices),
@@ -195,4 +257,3 @@ def _same_partition(a: np.ndarray, b: np.ndarray) -> bool:
     same_a = a[:, None] == a[None, :]
     same_b = b[:, None] == b[None, :]
     return bool(np.array_equal(same_a, same_b))
-

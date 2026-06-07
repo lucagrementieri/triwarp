@@ -1,13 +1,11 @@
-"""Mesh concatenation and face-subset extraction (Warp)."""
+"""Face-subset extraction (Warp)."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import Literal
 
 import warp as wp
 import triwarp as tw
-from triwarp.kernels import selection as kernel_selection
 
 
 def _gather_faces(faces: wp.array[wp.int32], face_indices: wp.array[wp.int32]) -> wp.array[wp.int32]:
@@ -18,73 +16,6 @@ def _gather_faces(faces: wp.array[wp.int32], face_indices: wp.array[wp.int32]) -
     out = wp.empty((k, 3), dtype=wp.int32, device=faces.device)
     wp.copy(out, gathered)
     return out.reshape((-1,))
-
-
-def concatenate(
-    meshes_data: Sequence[tuple[wp.array[wp.vec3], wp.array[wp.int32]]],
-) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-    """
-    Concatenate meshes, each given as ``(vertices, faces)`` on the same device.
-
-    Face indices are renumbered with cumulative vertex offsets, matching
-    :func:`trimesh.util.concatenate` (with triwarp's flat ``(3 * n_faces,)`` face
-    layout instead of ``(n_faces, 3)``).
-
-    Parameters
-    ----------
-    meshes
-        Sequence of ``(vertices, faces)`` pairs using triwarp's flat face layout.
-        An empty sequence yields empty arrays on ``cpu``.
-
-    Returns
-    -------
-    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
-        Combined vertices and reindexed faces on the shared device.
-
-    Raises
-    ------
-    ValueError
-        If any pair uses a different device.
-
-    See Also
-    --------
-    :func:`trimesh.util.concatenate`
-    """
-    if len(meshes_data) == 0:
-        return wp.empty(0, dtype=wp.vec3), wp.empty(0, dtype=wp.int32)
-
-    device = meshes_data[0][0].device
-    vertex_counts: list[int] = []
-    total_indices = 0
-    for i, (vertices, faces) in enumerate(meshes_data):
-        if vertices.device != device or faces.device != device:
-            raise ValueError(f"all arrays must live on the same device, got mismatch at index {i}")
-        f = int(faces.shape[0])
-        vertex_counts.append(int(vertices.shape[0]))
-        total_indices += f
-
-    if sum(vertex_counts) == 0:
-        concatenated_vertices = wp.empty(0, dtype=wp.vec3, device=device)
-    else:
-        concatenated_vertices, _ = tw.array.pack_1d_arrays([vertices for vertices, _ in meshes_data])
-
-    concatenated_faces = wp.empty(total_indices, dtype=wp.int32, device=device)
-
-    vertex_offset = wp.int32(0)
-    dest_offset = wp.int32(0)
-    for count, (_, faces) in zip(vertex_counts, meshes_data, strict=True):
-        f = int(faces.shape[0])
-        if f > 0:
-            wp.launch(
-                kernel_selection.offset_copy_int32,
-                dim=f,
-                inputs=[faces, vertex_offset, dest_offset, concatenated_faces],
-                device=device,
-            )
-            dest_offset += wp.int32(f)
-        vertex_offset += wp.int32(count)
-
-    return concatenated_vertices, concatenated_faces
 
 
 def submesh_from_face_indices(
@@ -131,7 +62,7 @@ def submesh_from_face_indices(
     --------
     :func:`submesh_from_face_mask`
     :func:`submesh_from_vertex_indices`
-    :func:`concatenate`
+    :func:`triwarp.graph.concatenate`
     :func:`trimesh.util.submesh`
     """
     device = vertices.device

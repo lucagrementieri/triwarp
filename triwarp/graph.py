@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import overload, Literal
 
 import warp as wp
 import warp.sparse as wps
 from triwarp.kernels import graph as kernel_graph
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels import selection as kernel_selection
 from triwarp.kernels.algorithms import connected_components as kernel_connected_components
 import triwarp.typing as twt
 import triwarp as tw
@@ -214,6 +216,131 @@ def face_adjacency_unshared(
         device=faces.device,
     )
     return twt.as_array2d_int32(unshared)
+
+
+def concatenate(
+    meshes_data: Sequence[tuple[wp.array[wp.vec3], wp.array[wp.int32]]],
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Concatenate meshes, each given as ``(vertices, faces)`` on the same device.
+
+    Face indices are renumbered with cumulative vertex offsets, matching
+    :func:`trimesh.util.concatenate` (with triwarp's flat ``(3 * n_faces,)`` face
+    layout instead of ``(n_faces, 3)``).
+
+    Parameters
+    ----------
+    meshes
+        Sequence of ``(vertices, faces)`` pairs using triwarp's flat face layout.
+        An empty sequence yields empty arrays on ``cpu``.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        Combined vertices and reindexed faces on the shared device.
+
+    Raises
+    ------
+    ValueError
+        If any pair uses a different device.
+
+    See Also
+    --------
+    :func:`split`
+    :func:`trimesh.util.concatenate`
+    """
+    if len(meshes_data) == 0:
+        return wp.empty(0, dtype=wp.vec3), wp.empty(0, dtype=wp.int32)
+
+    device = meshes_data[0][0].device
+    vertex_counts: list[int] = []
+    total_indices = 0
+    for i, (vertices, faces) in enumerate(meshes_data):
+        if vertices.device != device or faces.device != device:
+            raise ValueError(f"all arrays must live on the same device, got mismatch at index {i}")
+        f = int(faces.shape[0])
+        vertex_counts.append(int(vertices.shape[0]))
+        total_indices += f
+
+    if sum(vertex_counts) == 0:
+        concatenated_vertices = wp.empty(0, dtype=wp.vec3, device=device)
+    else:
+        concatenated_vertices, _ = tw.array.pack_1d_arrays([vertices for vertices, _ in meshes_data])
+
+    concatenated_faces = wp.empty(total_indices, dtype=wp.int32, device=device)
+
+    vertex_offset = wp.int32(0)
+    dest_offset = wp.int32(0)
+    for count, (_, faces) in zip(vertex_counts, meshes_data, strict=True):
+        f = int(faces.shape[0])
+        if f > 0:
+            wp.launch(
+                kernel_selection.offset_copy_int32,
+                dim=f,
+                inputs=[faces, vertex_offset, dest_offset, concatenated_faces],
+                device=device,
+            )
+            dest_offset += wp.int32(f)
+        vertex_offset += wp.int32(count)
+
+    return concatenated_vertices, concatenated_faces
+
+
+def split(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+) -> list[tuple[wp.array[wp.vec3], wp.array[wp.int32]]]:
+    """
+    Split a mesh into connected components by face adjacency.
+
+    Each returned pair is a compact ``(vertices, faces)`` submesh with vertices
+    reindexed from zero, matching :func:`trimesh.graph.split` with
+    ``only_watertight=False``. :func:`concatenate` on the result recovers the
+    input mesh (up to vertex/face ordering within each body).
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions on the target device.
+    faces
+        Length-``3 * n_faces`` flat triangle index buffer (same layout as
+        :func:`face_adjacency`).
+
+    Returns
+    -------
+    list[tuple[wp.array[wp.vec3], wp.array[wp.int32]]]
+        One ``(vertices, faces)`` pair per face-connected component on
+        ``vertices.device``. Empty when ``n_faces == 0``.
+
+    Raises
+    ------
+    ValueError
+        If ``vertices`` and ``faces`` live on different devices.
+
+    See Also
+    --------
+    :func:`concatenate`
+    :func:`face_connected_component_labels`
+    :func:`triwarp.selection.submesh_from_face_indices`
+    :func:`trimesh.graph.split`
+    """
+    device = vertices.device
+    if faces.device != device:
+        raise ValueError(f"vertices and faces must live on the same device, got {device} and {faces.device}")
+
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return []
+
+    face_labels = face_connected_component_labels(faces)
+    unique_labels = tw.unique.unique_1d(face_labels)
+
+    meshes: list[tuple[wp.array[wp.vec3], wp.array[wp.int32]]] = []
+    for label in unique_labels.numpy():
+        label_wp = wp.array([int(label)], dtype=wp.int32, device=device)
+        face_indices = tw.array.flatnonzero(tw.array.isin(face_labels, label_wp))
+        meshes.append(tw.selection.submesh_from_face_indices(vertices, faces, face_indices, unique_indices=True))
+    return meshes
 
 
 def edges_to_csr(

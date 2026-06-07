@@ -40,6 +40,7 @@ def half_torus(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
 def hemisphere(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
     sphere = tm.creation.icosphere(subdivisions=2, radius=1.0)
     hemisphere = sphere.slice_plane(plane_origin=np.zeros(3), plane_normal=np.array([0.0, 0.0, 1.0]), cap=False)
+    hemisphere.merge_vertices()
     rotation = tm.transformations.rotation_matrix(np.deg2rad(45.0), direction=np.array([1.0, 1.0, 0.0]))
     rotation[:3, 3] = np.array([-1.0, 0.0, 2.0])
     hemisphere.apply_transform(rotation)
