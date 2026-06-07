@@ -234,7 +234,7 @@ def submesh_from_vertex_indices(
 
     See Also
     --------
-    :func:`face_indices_for_vertices`
+    :func:`face_indices_from_vertex_indices`
     :func:`submesh_from_vertex_mask`
     :func:`submesh_from_face_indices`
     """
@@ -246,7 +246,7 @@ def submesh_from_vertex_indices(
             f"vertex_indices must live on the same device as vertices, got {vertex_indices.device} and {device}"
         )
 
-    face_indices = face_indices_for_vertices(faces, vertex_indices, face_mode=face_mode)
+    face_indices = face_indices_from_vertex_indices(faces, vertex_indices, face_mode=face_mode)
     return submesh_from_face_indices(vertices, faces, face_indices, unique_indices=True)
 
 
@@ -298,7 +298,7 @@ def submesh_from_vertex_mask(
     return submesh_from_vertex_indices(vertices, faces, vertex_indices, face_mode=face_mode)
 
 
-def face_indices_for_vertices(
+def face_indices_from_vertex_indices(
     faces: wp.array[wp.int32],
     vertex_indices: wp.array[wp.int32],
     *,
