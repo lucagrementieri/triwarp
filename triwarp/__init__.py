@@ -5,6 +5,7 @@ from . import curvature
 from . import graph
 from . import grouping
 from . import points
+from . import ray
 from . import reduce
 from . import sample
 from . import selection
@@ -19,6 +20,7 @@ __all__ = [
     "graph",
     "grouping",
     "points",
+    "ray",
     "reduce",
     "sample",
     "selection",
