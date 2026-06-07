@@ -147,6 +147,72 @@ def face_adjacency(
     return twt.as_array2d_int32(adjacency)
 
 
+def is_watertight(
+    edges: twt.Array2dInt32,
+    edges_sorted: twt.Array2dInt32 | None = None,
+) -> tuple[bool, bool]:
+    """
+    Whether a directed edge list forms a closed, consistently wound surface.
+
+    Parameters
+    ----------
+    edges
+        ``(n, 2)`` directed vertex-index pairs (e.g. from :func:`faces_to_edges`).
+    edges_sorted
+        Optional precomputed copy of ``edges`` with each row sorted so the smaller
+        vertex index is first. When ``None``, sorted rows are built on ``edges.device``.
+
+    Returns
+    -------
+    watertight
+        ``True`` when every undirected edge appears exactly twice in ``edges``
+        (no boundary or non-manifold edges).
+    winding
+        ``True`` when the two directed copies of each shared edge are reversed
+        (consistent face winding). Vacuously ``True`` when there are no edge pairs.
+
+    See Also
+    --------
+    :func:`faces_to_edges`
+    :func:`trimesh.graph.is_watertight`
+    """
+    twt.ensure_ndim(edges, 2, dtype=wp.int32)
+    if int(edges.shape[1]) != 2:
+        raise ValueError(f"edges must have shape (n, 2), got {edges.shape}")
+
+    n_edges = int(edges.shape[0])
+    device = edges.device
+    if n_edges == 0:
+        return True, True
+
+    if edges_sorted is None:
+        edges_sorted = twt.empty_int32_2d((n_edges, 2), device=device)
+        wp.copy(edges_sorted, edges)
+        tw.array.sort_rows(edges_sorted)
+    else:
+        twt.ensure_ndim(edges_sorted, 2, dtype=wp.int32)
+        if int(edges_sorted.shape[0]) != n_edges or int(edges_sorted.shape[1]) != 2:
+            raise ValueError(f"edges_sorted must have shape ({n_edges}, 2), got {edges_sorted.shape}")
+
+    edge_groups = tw.grouping.group_int_rows(edges_sorted, length=2)
+    n_groups = int(edge_groups.shape[0])
+    watertight = (n_groups * 2) == n_edges
+
+    if n_groups == 0:
+        winding = True
+    else:
+        consistent = wp.empty(n_groups, dtype=wp.bool, device=device)
+        wp.launch(
+            kernel_graph.edge_pair_winding_mask,
+            dim=n_groups,
+            inputs=[edges, edge_groups, consistent],
+            device=device,
+        )
+        winding = tw.reduce.all(consistent)
+
+    return watertight, winding
+
+
 _compute_face_adjacency = face_adjacency
 
 

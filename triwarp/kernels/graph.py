@@ -38,6 +38,18 @@ def faces_to_edges_sorted(
 
 
 @wp.kernel
+def edge_pair_winding_mask(
+    edges: wp.array2d[wp.int32],
+    edge_groups: wp.array2d[wp.int32],
+    out_consistent: wp.array[wp.bool],
+) -> None:
+    tid = int(wp.tid())
+    i0 = edge_groups[tid, 0]
+    i1 = edge_groups[tid, 1]
+    out_consistent[tid] = edges[i0, 1] == edges[i1, 0]
+
+
+@wp.kernel
 def edges_to_adjacency(
     edges: wp.array2d[wp.int32],
     out_rows: wp.array[wp.int32],
