@@ -1,6 +1,7 @@
 """Triangular mesh utilities on NVIDIA Warp."""
 
 from . import array
+from . import convex
 from . import curvature
 from . import graph
 from . import grouping
@@ -16,6 +17,7 @@ from . import typing
 
 __all__ = [
     "array",
+    "convex",
     "curvature",
     "graph",
     "grouping",

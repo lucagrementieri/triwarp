@@ -71,6 +71,47 @@ def query_ball_neighbors(
 
 
 @wp.kernel
+def query_bvh_aabb_count(
+    queries: wp.array[wp.vec3],
+    bvh_id: wp.uint64,
+    half_extent: wp.float32,
+    out_counts: wp.array[wp.int32],
+) -> None:
+    tid = wp.tid()
+    q = queries[tid]
+    h = half_extent
+    lower = wp.vec3(q[0] - h, q[1] - h, q[2] - h)
+    upper = wp.vec3(q[0] + h, q[1] + h, q[2] + h)
+    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
+    j = int(0)
+    c = int(0)
+    while wp.bvh_query_next(query, j):
+        c = c + 1
+    out_counts[tid] = c
+
+
+@wp.kernel
+def query_bvh_aabb_neighbors(
+    queries: wp.array[wp.vec3],
+    bvh_id: wp.uint64,
+    half_extent: wp.float32,
+    offsets: wp.array[wp.int32],
+    out_indices: wp.array[wp.int32],
+) -> None:
+    tid = wp.tid()
+    q = queries[tid]
+    h = half_extent
+    lower = wp.vec3(q[0] - h, q[1] - h, q[2] - h)
+    upper = wp.vec3(q[0] + h, q[1] + h, q[2] + h)
+    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
+    primitive_idx = int(0)
+    w = int(offsets[tid])
+    while wp.bvh_query_next(query, primitive_idx):
+        out_indices[w] = primitive_idx
+        w = w + 1
+
+
+@wp.kernel
 def query_nearest_neighbors(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3],

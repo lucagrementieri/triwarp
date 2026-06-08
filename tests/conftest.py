@@ -20,6 +20,13 @@ def device():
 
 
 @pytest.fixture
+def icosphere(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
+    sphere = tm.creation.icosphere()
+    sphere.apply_translation(translation=np.array([-1.0, 0.0, 2.0]))
+    return sphere, _trimesh_to_warp(sphere, device)
+
+
+@pytest.fixture
 def icosahedron(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
     icosahedron = tm.creation.icosahedron()
     icosahedron.apply_translation(translation=np.array([-1.0, 0.0, 2.0]))

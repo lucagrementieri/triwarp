@@ -73,6 +73,103 @@ def bvh_from_points(points: wp.array[wp.vec3], leaf_size: int) -> wp.Bvh:
     return wp.Bvh(points, points, leaf_size=leaf_size)
 
 
+def bvh_from_bounds(
+    lower: wp.array[wp.vec3],
+    upper: wp.array[wp.vec3],
+    leaf_size: int = 4,
+) -> wp.Bvh:
+    """
+    Build a bounding-volume hierarchy over axis-aligned bounds.
+
+    Each primitive ``i`` is represented by ``lower[i]`` and ``upper[i]`` corner
+    positions, suitable for :func:`query_bvh_aabb_with_offsets` broad-phase
+    intersection tests.
+
+    Parameters
+    ----------
+    lower
+        ``(n,)`` minimum corner of each bound as ``wp.vec3``.
+    upper
+        ``(n,)`` maximum corner of each bound as ``wp.vec3``.
+    leaf_size
+        Maximum primitives per leaf; forwarded to :class:`warp.Bvh`.
+
+    Returns
+    -------
+    warp.Bvh
+        BVH suited for AABB intersection queries.
+    """
+    return wp.Bvh(lower, upper, leaf_size=leaf_size)
+
+
+def query_bvh_aabb_with_offsets(
+    bvh: wp.Bvh,
+    queries: wp.array[wp.vec3],
+    half_extent: float,
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Low-level BVH AABB query: primitive indices in one flat buffer plus offsets.
+
+    For each query center ``q``, tests intersection of the query cube
+    ``[q - h, q + h]`` against every primitive bound in ``bvh``. Unlike
+    :func:`query_ball_with_offsets`, there is no narrow-phase distance filter;
+    every broad-phase hit is returned.
+
+    Parameters
+    ----------
+    bvh
+        Pre-built BVH from :func:`bvh_from_bounds` or :func:`bvh_from_points`.
+    queries
+        ``(m, 3)`` query centers stored as ``wp.vec3``.
+    half_extent
+        Half side length of the axis-aligned query cube along each axis.
+
+    Returns
+    -------
+    candidate_indices_flat, offsets
+        ``offsets`` has length ``m`` and is the exclusive prefix sum of per-query
+        hit counts. Query ``k`` owns
+        ``candidate_indices_flat[offsets[k] : offsets[k+1]]`` where ``offsets[m]``
+        is understood as ``candidate_indices_flat.shape[0]``.
+    """
+    device = queries.device
+    m = int(queries.shape[0])
+
+    if m == 0:
+        return (
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+        )
+
+    hit_counts = wp.empty(m, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_points.query_bvh_aabb_count,
+        dim=m,
+        inputs=[queries, bvh.id, wp.float32(half_extent), hit_counts],
+        device=device,
+    )
+
+    total_hits = int(hit_counts.numpy().sum())
+    if total_hits == 0:
+        return (
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.zeros(m, dtype=wp.int32, device=device),
+        )
+
+    offsets = wp.empty(m, dtype=wp.int32, device=device)
+    wp.utils.array_scan(hit_counts, out_array=offsets, inclusive=False)
+
+    candidate_indices_flat = wp.empty(total_hits, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_points.query_bvh_aabb_neighbors,
+        dim=m,
+        inputs=[queries, bvh.id, wp.float32(half_extent), offsets, candidate_indices_flat],
+        device=device,
+    )
+
+    return candidate_indices_flat, offsets
+
+
 def query_ball_count(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3],
