@@ -135,6 +135,63 @@ def test_face_adjacency_unshared_empty(device: str) -> None:
     assert unshared_wp.shape == (0, 2)
 
 
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+def test_face_adjacency_angles(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    adjacency_tm = mesh_tm.face_adjacency
+    angles_tm = mesh_tm.face_adjacency_angles
+
+    adjacency_wp = tw.graph.face_adjacency(mesh_wp.indices)
+    angles_wp = tw.graph.face_adjacency_angles(
+        mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp
+    )
+
+    adjacency_wp_np = adjacency_wp.numpy()
+    angles_wp_np = angles_wp.numpy()
+    angles_wp_lookup = {(int(row[0]), int(row[1])): float(angles_wp_np[i]) for i, row in enumerate(adjacency_wp_np)}
+    angles_tm_lookup = {(int(row[0]), int(row[1])): float(angles_tm[i]) for i, row in enumerate(adjacency_tm)}
+    assert angles_wp_lookup.keys() == angles_tm_lookup.keys()
+    for key, angle_tm in angles_tm_lookup.items():
+        angle_wp = angles_wp_lookup[key]
+        assert np.isclose(angle_wp, angle_tm, rtol=1e-4, atol=5e-4)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
+def test_face_adjacency_angles_precomputed(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    adjacency_wp = tw.graph.face_adjacency(mesh_wp.indices)
+    face_normals_wp, _ = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
+
+    angles_all_wp = tw.graph.face_adjacency_angles(
+        mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp
+    )
+    angles_precomputed_wp = tw.graph.face_adjacency_angles(
+        mesh_wp.points,
+        mesh_wp.indices,
+        face_adjacency=adjacency_wp,
+        face_normals=face_normals_wp,
+    )
+    assert np.allclose(angles_all_wp.numpy(), angles_precomputed_wp.numpy(), rtol=1e-5, atol=1e-5)
+
+    adjacency_tm = mesh_tm.face_adjacency
+    angles_tm = mesh_tm.face_adjacency_angles
+    adjacency_wp_np = adjacency_wp.numpy()
+    angles_precomputed_np = angles_precomputed_wp.numpy()
+    angles_tm_lookup = {(int(row[0]), int(row[1])): float(angles_tm[i]) for i, row in enumerate(adjacency_tm)}
+    angles_precomputed_lookup = {
+        (int(row[0]), int(row[1])): float(angles_precomputed_np[i]) for i, row in enumerate(adjacency_wp_np)
+    }
+    for key, angle_tm in angles_tm_lookup.items():
+        assert np.isclose(angles_precomputed_lookup[key], angle_tm, rtol=1e-4, atol=5e-4)
+
+
+def test_face_adjacency_angles_empty(device: str) -> None:
+    faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    angles_wp = tw.graph.face_adjacency_angles(vertices_wp, faces_wp)
+    assert angles_wp.shape == (0,)
+
+
 def test_concatenate_meshes(request: pytest.FixtureRequest) -> None:
     mesh_a_tm, mesh_a_wp = request.getfixturevalue("icosahedron")
     mesh_b_tm, mesh_b_wp = request.getfixturevalue("hemisphere")

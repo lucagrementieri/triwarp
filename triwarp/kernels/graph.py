@@ -1,5 +1,7 @@
 import warp as wp
 
+from triwarp.kernels import array as kernel_array
+
 
 @wp.kernel
 def faces_to_edges(
@@ -99,3 +101,15 @@ def face_adjacency_unshared(
     e1 = face_adjacency_edges[tid, 1]
     out_unshared[tid, 0] = unshared_vertex(faces[f0 + 0], faces[f0 + 1], faces[f0 + 2], e0, e1)
     out_unshared[tid, 1] = unshared_vertex(faces[f1 + 0], faces[f1 + 1], faces[f1 + 2], e0, e1)
+
+
+@wp.kernel
+def face_adjacency_angles(
+    face_normals: wp.array[wp.vec3],
+    face_adjacency: wp.array2d[wp.int32],
+    out_angles: wp.array[wp.float32],
+) -> None:
+    tid = int(wp.tid())
+    normal_a = face_normals[face_adjacency[tid, 0]]
+    normal_b = face_normals[face_adjacency[tid, 1]]
+    out_angles[tid] = kernel_array.vector_angle_vec(normal_a, normal_b)

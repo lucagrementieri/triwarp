@@ -284,6 +284,78 @@ def face_adjacency_unshared(
     return twt.as_array2d_int32(unshared)
 
 
+def face_adjacency_angles(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_adjacency: twt.Array2dInt32 | None = None,
+    face_normals: wp.array[wp.vec3] | None = None,
+) -> wp.array[wp.float32]:
+    """
+    Unsigned angle in radians between each pair of adjacent faces.
+
+    For each row of ``face_adjacency``, the angle is computed from the two
+    corresponding face normals (unit vectors). For a signed angle, combine with
+    ``face_adjacency_convex`` once that attribute is available.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions on the target device.
+    faces
+        Length-``3 * n_faces`` flat triangle index buffer (same layout as
+        :func:`face_adjacency`).
+    face_adjacency
+        Optional ``(m, 2)`` face index pairs from :func:`face_adjacency`. When
+        ``None``, adjacency is computed from ``faces``.
+    face_normals
+        Optional length-``n_faces`` unit face normals. When ``None``, normals
+        are computed from ``vertices`` and ``faces`` via
+        :func:`triwarp.triangles.face_normals_and_areas`.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        Length ``m`` unsigned angles in radians on ``faces.device``, one per
+        ``face_adjacency`` row. Empty when there are no faces or no adjacency pairs.
+
+    Raises
+    ------
+    ValueError
+        If ``vertices`` and ``faces`` live on different devices.
+
+    See Also
+    --------
+    :func:`face_adjacency`
+    :func:`triwarp.array.vector_angle`
+    :attr:`trimesh.Trimesh.face_adjacency_angles`
+    """
+    device = faces.device
+    if vertices.device != device:
+        raise ValueError(f"vertices and faces must live on the same device, got {vertices.device} and {device}")
+
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return wp.empty(0, dtype=wp.float32, device=device)
+
+    if face_adjacency is None:
+        face_adjacency = _compute_face_adjacency(faces)
+    if face_normals is None:
+        face_normals, _ = tw.triangles.face_normals_and_areas(vertices, faces)
+
+    m = int(face_adjacency.shape[0])
+    if m == 0:
+        return wp.empty(0, dtype=wp.float32, device=device)
+
+    out_angles = wp.empty(m, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_graph.face_adjacency_angles,
+        dim=m,
+        inputs=[face_normals, face_adjacency, out_angles],
+        device=device,
+    )
+    return out_angles
+
+
 def concatenate(
     meshes_data: Sequence[tuple[wp.array[wp.vec3], wp.array[wp.int32]]],
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:

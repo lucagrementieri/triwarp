@@ -291,3 +291,47 @@ def flatnonzero(mask: wp.array[wp.bool]) -> wp.array[wp.int32]:
         device=device,
     )
     return out_indices
+
+
+def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3]) -> wp.array[wp.float32]:
+    """
+    Unsigned angle in radians between pairs of unit vectors.
+
+    For each index ``i``, computes ``abs(arccos(clip(dot(a[i], b[i]), -1, 1)))``.
+    Matches :func:`trimesh.geometry.vector_angle` on stacked pairs.
+
+    Parameters
+    ----------
+    a
+        Length-``n`` unit vectors on the target device.
+    b
+        Length-``n`` unit vectors on the same device as ``a``.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        Length-``n`` unsigned angles in radians on ``a.device``. Empty when ``n == 0``.
+
+    Raises
+    ------
+    ValueError
+        If ``a`` and ``b`` live on different devices or have different lengths.
+
+    See Also
+    --------
+    :func:`trimesh.geometry.vector_angle`
+    """
+    device = a.device
+    if b.device != device:
+        raise ValueError(f"a and b must live on the same device, got {device} and {b.device}")
+
+    n = int(a.shape[0])
+    if n != int(b.shape[0]):
+        raise ValueError(f"a and b must have the same length, got {n} and {b.shape[0]}")
+
+    if n == 0:
+        return wp.empty(0, dtype=wp.float32, device=device)
+
+    out_angles = wp.empty(n, dtype=wp.float32, device=device)
+    wp.launch(kernel_array.vector_angle, dim=n, inputs=[a, b, out_angles], device=device)
+    return out_angles

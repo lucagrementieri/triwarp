@@ -1,3 +1,4 @@
 {
-    "ruff.lineLength": 120
+    "ruff.lineLength": 120,
+    "ruff.format.preview": true
 }

@@ -146,3 +146,27 @@ def test_flatnonzero_empty(device: str) -> None:
     mask_wp = wp.array(np.zeros(8, dtype=bool), dtype=wp.bool, device=device)
     indices_wp = tw.array.flatnonzero(mask_wp)
     assert indices_wp.shape == (0,)
+
+
+def test_vector_angle(device: str) -> None:
+    rng = np.random.default_rng(42)
+    n = 64
+    vecs_a_np = rng.standard_normal((n, 3))
+    vecs_a_np /= np.linalg.norm(vecs_a_np, axis=1, keepdims=True)
+    vecs_b_np = rng.standard_normal((n, 3))
+    vecs_b_np /= np.linalg.norm(vecs_b_np, axis=1, keepdims=True)
+
+    pairs_np = np.stack([vecs_a_np, vecs_b_np], axis=1)
+    angles_tm = tm.geometry.vector_angle(pairs_np)
+
+    vecs_a_wp = wp.array(vecs_a_np.astype(np.float32), dtype=wp.vec3, device=device)
+    vecs_b_wp = wp.array(vecs_b_np.astype(np.float32), dtype=wp.vec3, device=device)
+    angles_wp = tw.array.vector_angle(vecs_a_wp, vecs_b_wp)
+    assert np.allclose(angles_wp.numpy(), angles_tm, rtol=1e-5, atol=1e-5)
+
+
+def test_vector_angle_empty(device: str) -> None:
+    vecs_a_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    vecs_b_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    angles_wp = tw.array.vector_angle(vecs_a_wp, vecs_b_wp)
+    assert angles_wp.shape == (0,)

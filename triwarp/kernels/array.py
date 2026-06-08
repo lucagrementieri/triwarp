@@ -121,6 +121,22 @@ def scatter_compact_indices(
 
 
 @wp.func
+def vector_angle_vec(a: wp.vec3, b: wp.vec3) -> wp.float32:
+    dot = wp.clamp(wp.dot(a, b), -1.0, 1.0)
+    return wp.abs(wp.acos(dot))
+
+
+@wp.kernel
+def vector_angle(
+    a: wp.array[wp.vec3],
+    b: wp.array[wp.vec3],
+    out_angles: wp.array[wp.float32],
+) -> None:
+    tid = int(wp.tid())
+    out_angles[tid] = vector_angle_vec(a[tid], b[tid])
+
+
+@wp.func
 def array_shift_insert(array: wp.array[wp.Scalar], value: wp.Scalar, index: wp.int32) -> None:
     for i in range(array.shape[0] - 1, index, -1):
         array[i] = array[i - 1]
