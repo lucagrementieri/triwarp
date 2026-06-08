@@ -43,13 +43,13 @@ def aabb_bounds(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     return min_bound, max_bound
 
 
-def bvh_from_points(points: wp.array[wp.vec3], leaf_size: int) -> wp.Bvh:
+def bvh_from_points(points: wp.array[wp.vec3], leaf_size: int = 4) -> wp.Bvh:
     """
     Build a bounding-volume hierarchy over ``points`` for radius queries.
 
     Each leaf stores the same geometry as ``points`` (degenerate bounds via a clone),
-    matching the broad-phase pattern used by :func:`remove_close` and the
-    ``query_ball*`` helpers.
+    matching the broad-phase pattern used by :func:`query_bvh_ball` and
+    :func:`query_bvh_nearest`.
 
     Parameters
     ----------
@@ -61,16 +61,51 @@ def bvh_from_points(points: wp.array[wp.vec3], leaf_size: int) -> wp.Bvh:
     Returns
     -------
     warp.Bvh
-        BVH suited for ``query_ball_count``, ``query_ball``, and related kernels.
+        BVH suited for ``query_bvh_ball*`` and ``query_bvh_nearest``.
 
     See Also
     --------
-    query_ball_count
-    query_ball
-    query
-    remove_close
+    query_bvh_ball
+    query_bvh_nearest
     """
     return wp.Bvh(points, points, leaf_size=leaf_size)
+
+
+def hashgrid_from_points(
+    points: wp.array[wp.vec3],
+    radius: float,
+    grid_bins: int = 128,
+) -> wp.HashGrid:
+    """
+    Build a 3D hash grid over ``points`` for radius queries.
+
+    Parameters
+    ----------
+    points
+        ``(n, 3)`` positions as ``wp.vec3``.
+    radius
+        Cell size passed to :meth:`warp.HashGrid.build` and used by
+        ``query_hashgrid_ball*`` and ``query_hashgrid_nearest`` kernels.
+    grid_bins
+        Resolution of the hash grid along each axis.
+
+    Returns
+    -------
+    warp.HashGrid
+        Hash grid suited for ``query_hashgrid_ball*``, ``query_hashgrid_nearest``,
+        and related kernels.
+
+    See Also
+    --------
+    query_hashgrid_ball_count
+    query_hashgrid_ball
+    query_hashgrid_nearest
+    """
+    n = int(points.shape[0])
+    grid = wp.HashGrid(grid_bins, grid_bins, grid_bins, device=points.device)
+    grid.reserve(n)
+    grid.build(points, radius)
+    return grid
 
 
 def bvh_from_bounds(
@@ -102,6 +137,74 @@ def bvh_from_bounds(
     return wp.Bvh(lower, upper, leaf_size=leaf_size)
 
 
+def hashgrid_from_bounds(
+    lower: wp.array[wp.vec3],
+    upper: wp.array[wp.vec3],
+    cell_size: float,
+    grid_bins: int = 128,
+) -> wp.HashGrid:
+    """
+    Build a 3D hash grid over axis-aligned bound centers for AABB queries.
+
+    Each primitive ``i`` is inserted at the midpoint of ``lower[i]`` and ``upper[i]``.
+
+    Parameters
+    ----------
+    lower
+        ``(n,)`` minimum corner of each bound as ``wp.vec3``.
+    upper
+        ``(n,)`` maximum corner of each bound as ``wp.vec3``.
+    cell_size
+        Cell size passed to :meth:`warp.HashGrid.build`.
+    grid_bins
+        Resolution of the hash grid along each axis.
+
+    Returns
+    -------
+    warp.HashGrid
+        Hash grid suited for :func:`query_hashgrid_aabb_with_offsets`.
+
+    See Also
+    --------
+    query_hashgrid_aabb_with_offsets
+    bvh_from_bounds
+    """
+    device = lower.device
+    n = int(lower.shape[0])
+    grid = wp.HashGrid(grid_bins, grid_bins, grid_bins, device=device)
+    if n == 0:
+        return grid
+    centers = wp.empty(n, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_points.bounds_centers,
+        dim=n,
+        inputs=[lower, upper, centers],
+        device=device,
+    )
+    grid.reserve(n)
+    grid.build(centers, cell_size)
+    return grid
+
+
+def _max_primitive_half_extent(
+    lower: wp.array[wp.vec3],
+    upper: wp.array[wp.vec3],
+) -> float:
+    """Maximum half-diagonal of ``lower``/``upper`` bounds (Python scope)."""
+    n = int(lower.shape[0])
+    if n == 0:
+        return 0.0
+    lower_np = lower.numpy()
+    upper_np = upper.numpy()
+    extents = upper_np - lower_np
+    half_diagonals = 0.5 * (
+        extents[:, 0] * extents[:, 0]
+        + extents[:, 1] * extents[:, 1]
+        + extents[:, 2] * extents[:, 2]
+    ) ** 0.5
+    return float(half_diagonals.max())
+
+
 def query_bvh_aabb_with_offsets(
     bvh: wp.Bvh,
     queries: wp.array[wp.vec3],
@@ -112,7 +215,7 @@ def query_bvh_aabb_with_offsets(
 
     For each query center ``q``, tests intersection of the query cube
     ``[q - h, q + h]`` against every primitive bound in ``bvh``. Unlike
-    :func:`query_ball_with_offsets`, there is no narrow-phase distance filter;
+    :func:`query_hashgrid_ball_with_offsets`, there is no narrow-phase distance filter;
     every broad-phase hit is returned.
 
     Parameters
@@ -170,13 +273,124 @@ def query_bvh_aabb_with_offsets(
     return candidate_indices_flat, offsets
 
 
-def query_ball_count(
+def query_hashgrid_aabb_with_offsets(
+    lower: wp.array[wp.vec3],
+    upper: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    half_extent: float,
+    *,
+    grid: wp.HashGrid | None = None,
+    grid_bins: int = 128,
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Low-level hash-grid AABB query: primitive indices in one flat buffer plus offsets.
+
+    For each query center ``q``, tests intersection of the query cube
+    ``[q - h, q + h]`` against every primitive bound. Broad-phase uses
+    :class:`warp.HashGrid` over bound centers; narrow-phase applies exact
+    axis-aligned box intersection.
+
+    Parameters
+    ----------
+    lower
+        ``(n,)`` minimum corner of each primitive bound as ``wp.vec3``.
+    upper
+        ``(n,)`` maximum corner of each primitive bound as ``wp.vec3``.
+    queries
+        ``(m, 3)`` query centers stored as ``wp.vec3``.
+    half_extent
+        Half side length of the axis-aligned query cube along each axis.
+    grid
+        Optional pre-built hash grid from :func:`hashgrid_from_bounds`. If ``None``,
+        built with ``cell_size = half_extent``.
+    grid_bins
+        Grid resolution when constructing ``grid`` (ignored if ``grid`` is provided).
+
+    Returns
+    -------
+    candidate_indices_flat, offsets
+        Same CSR layout as :func:`query_bvh_aabb_with_offsets`.
+
+    See Also
+    --------
+    query_bvh_aabb_with_offsets
+    hashgrid_from_bounds
+    """
+    device = queries.device
+    m = int(queries.shape[0])
+    n = int(lower.shape[0])
+
+    if m == 0:
+        return (
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+        )
+
+    if n == 0:
+        return (
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.zeros(m, dtype=wp.int32, device=device),
+        )
+
+    max_half_extent = _max_primitive_half_extent(lower, upper)
+    broad_radius = half_extent + max_half_extent
+
+    if grid is None:
+        grid = hashgrid_from_bounds(lower, upper, half_extent, grid_bins)
+
+    hit_counts = wp.empty(m, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_points.query_hashgrid_aabb_count,
+        dim=m,
+        inputs=[
+            lower,
+            upper,
+            queries,
+            grid.id,
+            wp.float32(half_extent),
+            wp.float32(broad_radius),
+            hit_counts,
+        ],
+        device=device,
+    )
+
+    total_hits = int(hit_counts.numpy().sum())
+    if total_hits == 0:
+        return (
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.zeros(m, dtype=wp.int32, device=device),
+        )
+
+    offsets = wp.empty(m, dtype=wp.int32, device=device)
+    wp.utils.array_scan(hit_counts, out_array=offsets, inclusive=False)
+
+    candidate_indices_flat = wp.empty(total_hits, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_points.query_hashgrid_aabb_neighbors,
+        dim=m,
+        inputs=[
+            lower,
+            upper,
+            queries,
+            grid.id,
+            wp.float32(half_extent),
+            wp.float32(broad_radius),
+            offsets,
+            candidate_indices_flat,
+        ],
+        device=device,
+    )
+
+    return candidate_indices_flat, offsets
+
+
+def query_hashgrid_ball_count(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3],
     r: float,
     *,
-    bvh: wp.Bvh | None = None,
-    leaf_size: int = 4,
+    grid: wp.HashGrid | None = None,
+    grid_bins: int = 128,
 ) -> wp.array[wp.int32]:
     """
     Count neighbors of each query within Euclidean distance ``r``.
@@ -186,9 +400,8 @@ def query_ball_count(
     ``p=2``, ``eps=0``, and ``return_length=True`` (exact search; only the spatial
     index differs).
 
-    Broad-phase traversal uses an axis-aligned cube ``[q - r, q + r]`` against the BVH;
-    narrow-phase keeps points with Euclidean distance at most ``r`` (``float32``), the same
-    geometric radius as :func:`remove_close` (which tests ``‖·‖² ≤ r²`` in the kernel).
+    Broad-phase traversal uses :class:`warp.HashGrid` with ``wp.hash_grid_query`` out
+    to ``r``; narrow-phase keeps points with Euclidean distance at most ``r`` (``float32``).
 
     Parameters
     ----------
@@ -198,11 +411,11 @@ def query_ball_count(
         ``(m, 3)`` query centers stored as ``wp.vec3``.
     r
         Inclusion radius; cast to ``float32`` in kernels (non-negative).
-    bvh
-        Optional pre-built BVH from ``points``. If ``None``, built via
-        :func:`bvh_from_points`.
-    leaf_size
-        Leaf size when constructing ``bvh`` (ignored if ``bvh`` is provided).
+    grid
+        Optional pre-built hash grid from ``points``. If ``None``, built via
+        :func:`hashgrid_from_points`.
+    grid_bins
+        Grid resolution when constructing ``grid`` (ignored if ``grid`` is provided).
 
     Returns
     -------
@@ -212,8 +425,9 @@ def query_ball_count(
 
     See Also
     --------
-    query_ball
-    bvh_from_points
+    query_bvh_ball_count
+    query_hashgrid_ball
+    hashgrid_from_points
     :meth:`scipy.spatial.KDTree.query_ball_point`
     """
     device = points.device
@@ -224,38 +438,38 @@ def query_ball_count(
 
     neighbor_counts = wp.empty(m, dtype=wp.int32, device=device)
 
-    if bvh is None:
-        bvh = bvh_from_points(points, leaf_size)
+    if grid is None:
+        grid = hashgrid_from_points(points, r, grid_bins)
 
     wp.launch(
-        kernel_points.query_ball_count,
+        kernel_points.query_hashgrid_ball_count,
         dim=m,
-        inputs=[points, queries, bvh.id, wp.float32(r), neighbor_counts],
+        inputs=[points, queries, grid.id, wp.float32(r), neighbor_counts],
         device=device,
     )
 
     return neighbor_counts
 
 
-def query_ball_with_offsets(
+def query_hashgrid_ball_with_offsets(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3] | wp.vec3,
     r: float,
     *,
-    bvh: wp.Bvh | None = None,
-    leaf_size: int = 4,
+    grid: wp.HashGrid | None = None,
+    grid_bins: int = 128,
     return_sorted: bool = False,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.float32], wp.array[wp.int32]]:
     """
     Low-level ball query: neighbors in one concatenated pair plus per-query offsets.
 
-    Same geometry as :func:`query_ball` (BVH broad-phase cube ``[center ± r]`` as in
-    :func:`remove_close`, ``float32`` test ``‖points[i] − q‖₂ ≤ r``). Semantics match
+    Same geometry as :func:`query_hashgrid_ball` (hash-grid broad-phase out to ``r``,
+    ``float32`` test ``‖points[i] − q‖₂ ≤ r``). Semantics match
     :meth:`scipy.spatial.KDTree.query_ball_point` with ``p=2`` and ``eps=0``.
 
-    Prefer :func:`query_ball` for a Python list of one array per query; use this when you
-    want a single flat buffer on device (e.g. fused downstream kernels) and CSR-style
-    boundaries without cloning each segment.
+    Prefer :func:`query_hashgrid_ball` for a Python list of one array per query; use this
+    when you want a single flat buffer on device (e.g. fused downstream kernels) and
+    CSR-style boundaries without cloning each segment.
 
     Parameters
     ----------
@@ -266,14 +480,14 @@ def query_ball_with_offsets(
         (treated as one query).
     r
         Inclusion radius; cast to ``float32`` in kernels (non-negative).
-    bvh
-        Optional pre-built BVH from ``points``. If ``None``, built via
-        :func:`bvh_from_points`.
-    leaf_size
-        Leaf size when constructing ``bvh`` (ignored if ``bvh`` is provided).
+    grid
+        Optional pre-built hash grid from ``points``. If ``None``, built via
+        :func:`hashgrid_from_points`.
+    grid_bins
+        Grid resolution when constructing ``grid`` (ignored if ``grid`` is provided).
     return_sorted
         If ``True``, neighbors within each query are ordered by increasing distance.
-        If ``False``, order follows tree traversal (undefined ordering).
+        If ``False``, order follows grid traversal (undefined ordering).
 
     Returns
     -------
@@ -299,8 +513,300 @@ def query_ball_with_offsets(
 
     See Also
     --------
-    query_ball
-    query_ball_count
+    query_hashgrid_ball
+    query_hashgrid_ball_count
+    hashgrid_from_points
+    :meth:`scipy.spatial.KDTree.query_ball_point`
+    """
+    device = points.device
+
+    if isinstance(queries, wp.vec3):
+        queries = wp.array([queries], dtype=wp.vec3, device=device)
+    m = int(queries.shape[0])
+
+    n: int = int(points.shape[0])
+    if n == 0:
+        return (
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.float32, device=device),
+            wp.zeros(m, dtype=wp.int32, device=device),
+        )
+
+    if grid is None:
+        grid = hashgrid_from_points(points, r, grid_bins)
+
+    neighbor_counts = query_hashgrid_ball_count(points, queries, r, grid=grid)
+    total_neighbors = int(neighbor_counts.numpy().sum())
+
+    if total_neighbors == 0:
+        return (
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.float32, device=device),
+            wp.zeros(m, dtype=wp.int32, device=device),
+        )
+
+    offsets = wp.empty(m, dtype=wp.int32, device=device)
+    wp.utils.array_scan(neighbor_counts, out_array=offsets, inclusive=False)
+
+    flat_len = total_neighbors * (2 if return_sorted else 1)
+    neighbor_indices_flat = wp.empty(flat_len, dtype=wp.int32, device=device)
+    neighbor_distances_flat = wp.empty(flat_len, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_points.query_hashgrid_ball_neighbors,
+        dim=m,
+        inputs=[
+            points,
+            queries,
+            grid.id,
+            wp.float32(r),
+            offsets,
+            neighbor_indices_flat,
+            neighbor_distances_flat,
+        ],
+        device=device,
+    )
+
+    if return_sorted:
+        segment_bounds = wp.empty(m + 1, dtype=wp.int32, device=device)
+        wp.copy(segment_bounds, offsets, dest_offset=0, src_offset=0, count=m)
+        wp.copy(
+            segment_bounds,
+            wp.array([total_neighbors], dtype=wp.int32, device=device),
+            dest_offset=m,
+            src_offset=0,
+            count=1,
+        )
+        wp.utils.segmented_sort_pairs(
+            neighbor_distances_flat,
+            neighbor_indices_flat,
+            total_neighbors,
+            segment_bounds,
+        )
+    return (
+        wp.clone(neighbor_indices_flat[:total_neighbors]),
+        wp.clone(neighbor_distances_flat[:total_neighbors]),
+        offsets,
+    )
+
+
+@overload
+def query_hashgrid_ball(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    r: float,
+    *,
+    grid: wp.HashGrid | None = ...,
+    grid_bins: int = ...,
+    return_sorted: bool = ...,
+) -> tuple[list[wp.array[wp.int32]], list[wp.array[wp.float32]]]: ...
+@overload
+def query_hashgrid_ball(
+    points: wp.array[wp.vec3],
+    queries: wp.vec3,
+    r: float,
+    *,
+    grid: wp.HashGrid | None = ...,
+    grid_bins: int = ...,
+    return_sorted: bool = ...,
+) -> tuple[wp.array[wp.int32], wp.array[wp.float32]]: ...
+def query_hashgrid_ball(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3] | wp.vec3,
+    r: float,
+    *,
+    grid: wp.HashGrid | None = None,
+    grid_bins: int = 128,
+    return_sorted: bool = False,
+) -> tuple[list[wp.array[wp.int32]], list[wp.array[wp.float32]]] | tuple[wp.array[wp.int32], wp.array[wp.float32]]:
+    """
+    Find all data points within distance ``r`` of each query center (per-query arrays).
+
+    High-level wrapper around :func:`query_hashgrid_ball_with_offsets`: hash-grid
+    broad-phase and ``float32`` distance test, same SciPy semantics as
+    :meth:`scipy.spatial.KDTree.query_ball_point` with ``p=2`` and ``eps=0``.
+
+    Unlike SciPy's object array of lists, multi-query results are two Python lists of
+    length ``m``, each element a rank-1 ``wp.array`` for that query. A single ``wp.vec3``
+    query returns one ``(indices, distances)`` pair directly (not wrapped in lists). This
+    clones each query's segment out of the internal flat buffer; for one flat buffer plus
+    offsets on device, call :func:`query_hashgrid_ball_with_offsets` instead.
+
+    Parameters
+    ----------
+    points
+        ``(n, 3)`` data points stored as ``wp.vec3``.
+    queries
+        Either ``(m, 3)`` query centers as ``wp.array[wp.vec3]``, or a single ``wp.vec3``
+        (treated as one query).
+    r
+        Inclusion radius; cast to ``float32`` in kernels (non-negative).
+    grid
+        Optional pre-built hash grid from ``points``. If ``None``, built via
+        :func:`hashgrid_from_points`.
+    grid_bins
+        Grid resolution when constructing ``grid`` (ignored if ``grid`` is provided).
+    return_sorted
+        If ``True``, neighbors within each query are ordered by increasing distance.
+        If ``False``, order follows grid traversal (undefined ordering).
+
+    Returns
+    -------
+    neighbor_indices, neighbor_distances
+        If ``queries`` has ``m`` rows: ``list[wp.array[wp.int32]]`` and
+        ``list[wp.array[wp.float32]]``, each of length ``m``. Element ``k`` lists neighbors
+        of ``queries[k]`` (indices into ``points`` and distances ``‖points[i] − q‖₂``).
+
+        If ``queries`` is a single ``wp.vec3``: two rank-1 arrays (possibly length 0), not
+        lists.
+
+        Empty ``points`` yields empty neighbor arrays and per-query empty slices; duplicate
+        neighbors are not produced.
+
+    Notes
+    -----
+    SciPy may sort indices when ``return_sorted`` is left default on multi-point queries;
+    here sorting only occurs when ``return_sorted=True``, and sorts by distance, not by
+    index. Ball boundaries use ``float32`` arithmetic; extremely tight radii near representable
+    limits may disagree slightly with pure ``float64`` SciPy runs.
+
+    See Also
+    --------
+    query_hashgrid_ball_with_offsets
+    query_hashgrid_ball_count
+    hashgrid_from_points
+    :meth:`scipy.spatial.KDTree.query_ball_point`
+    """
+    device = points.device
+
+    single_query = isinstance(queries, wp.vec3)
+    if single_query:
+        queries = wp.array([queries], dtype=wp.vec3, device=device)
+    m = int(queries.shape[0])
+
+    neighbor_indices_flat, neighbor_distances_flat, offsets = query_hashgrid_ball_with_offsets(
+        points, queries, r, grid=grid, grid_bins=grid_bins, return_sorted=return_sorted
+    )
+    neighbor_indices: list[wp.array[wp.int32]] = []
+    neighbor_distances: list[wp.array[wp.float32]] = []
+
+    offsets_list = offsets.list()
+    for k in range(m):
+        start = offsets_list[k]
+        end = offsets_list[k + 1] if k < m - 1 else neighbor_indices_flat.shape[0]
+        if end - start > 0:
+            neighbor_indices.append(wp.clone(neighbor_indices_flat[start:end]))
+            neighbor_distances.append(wp.clone(neighbor_distances_flat[start:end]))
+        else:
+            neighbor_indices.append(wp.empty(0, dtype=wp.int32, device=device))
+            neighbor_distances.append(wp.empty(0, dtype=wp.float32, device=device))
+
+    if single_query:
+        return neighbor_indices[0], neighbor_distances[0]
+    return neighbor_indices, neighbor_distances
+
+
+def query_bvh_ball_count(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    r: float,
+    *,
+    bvh: wp.Bvh | None = None,
+    leaf_size: int = 4,
+) -> wp.array[wp.int32]:
+    """
+    Count neighbors of each query within Euclidean distance ``r`` (BVH backend).
+
+    Same semantics as :func:`query_hashgrid_ball_count`; broad-phase uses
+    ``wp.bvh_query_aabb`` over the cube ``[q ± r]``.
+
+    Parameters
+    ----------
+    points
+        ``(n, 3)`` data points stored as ``wp.vec3``.
+    queries
+        ``(m, 3)`` query centers stored as ``wp.vec3``.
+    r
+        Inclusion radius; cast to ``float32`` in kernels (non-negative).
+    bvh
+        Optional pre-built BVH from ``points``. If ``None``, built via
+        :func:`bvh_from_points`.
+    leaf_size
+        Leaf size when constructing ``bvh`` (ignored if ``bvh`` is provided).
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        Length-``m`` device array of per-query neighbor counts.
+
+    See Also
+    --------
+    query_hashgrid_ball_count
+    query_bvh_ball
+    bvh_from_points
+    :meth:`scipy.spatial.KDTree.query_ball_point`
+    """
+    device = points.device
+    n = int(points.shape[0])
+    m = int(queries.shape[0])
+    if n == 0:
+        return wp.zeros(m, dtype=wp.int32, device=device)
+
+    neighbor_counts = wp.empty(m, dtype=wp.int32, device=device)
+
+    if bvh is None:
+        bvh = bvh_from_points(points, leaf_size)
+
+    wp.launch(
+        kernel_points.query_bvh_ball_count,
+        dim=m,
+        inputs=[points, queries, bvh.id, wp.float32(r), neighbor_counts],
+        device=device,
+    )
+
+    return neighbor_counts
+
+
+def query_bvh_ball_with_offsets(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3] | wp.vec3,
+    r: float,
+    *,
+    bvh: wp.Bvh | None = None,
+    leaf_size: int = 4,
+    return_sorted: bool = False,
+) -> tuple[wp.array[wp.int32], wp.array[wp.float32], wp.array[wp.int32]]:
+    """
+    Low-level BVH ball query: neighbors in one concatenated pair plus per-query offsets.
+
+    Same geometry as :func:`query_bvh_ball`. Semantics match
+    :meth:`scipy.spatial.KDTree.query_ball_point` with ``p=2`` and ``eps=0``.
+
+    Parameters
+    ----------
+    points
+        ``(n, 3)`` data points stored as ``wp.vec3``.
+    queries
+        Either ``(m, 3)`` query centers as ``wp.array[wp.vec3]``, or a single ``wp.vec3``.
+    r
+        Inclusion radius; cast to ``float32`` in kernels (non-negative).
+    bvh
+        Optional pre-built BVH from ``points``. If ``None``, built via
+        :func:`bvh_from_points`.
+    leaf_size
+        Leaf size when constructing ``bvh`` (ignored if ``bvh`` is provided).
+    return_sorted
+        If ``True``, neighbors within each query are ordered by increasing distance.
+
+    Returns
+    -------
+    neighbor_indices_flat, neighbor_distances_flat, offsets
+        CSR-style flat buffers; see :func:`query_hashgrid_ball_with_offsets`.
+
+    See Also
+    --------
+    query_hashgrid_ball_with_offsets
+    query_bvh_ball
+    query_bvh_ball_count
     bvh_from_points
     :meth:`scipy.spatial.KDTree.query_ball_point`
     """
@@ -321,7 +827,7 @@ def query_ball_with_offsets(
     if bvh is None:
         bvh = bvh_from_points(points, leaf_size)
 
-    neighbor_counts = query_ball_count(points, queries, r, bvh=bvh)
+    neighbor_counts = query_bvh_ball_count(points, queries, r, bvh=bvh)
     total_neighbors = int(neighbor_counts.numpy().sum())
 
     if total_neighbors == 0:
@@ -338,7 +844,7 @@ def query_ball_with_offsets(
     neighbor_indices_flat = wp.empty(flat_len, dtype=wp.int32, device=device)
     neighbor_distances_flat = wp.empty(flat_len, dtype=wp.float32, device=device)
     wp.launch(
-        kernel_points.query_ball_neighbors,
+        kernel_points.query_bvh_ball_neighbors,
         dim=m,
         inputs=[
             points,
@@ -376,7 +882,7 @@ def query_ball_with_offsets(
 
 
 @overload
-def query_ball(
+def query_bvh_ball(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3],
     r: float,
@@ -386,7 +892,7 @@ def query_ball(
     return_sorted: bool = ...,
 ) -> tuple[list[wp.array[wp.int32]], list[wp.array[wp.float32]]]: ...
 @overload
-def query_ball(
+def query_bvh_ball(
     points: wp.array[wp.vec3],
     queries: wp.vec3,
     r: float,
@@ -395,7 +901,7 @@ def query_ball(
     leaf_size: int = ...,
     return_sorted: bool = ...,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.float32]]: ...
-def query_ball(
+def query_bvh_ball(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3] | wp.vec3,
     r: float,
@@ -405,25 +911,17 @@ def query_ball(
     return_sorted: bool = False,
 ) -> tuple[list[wp.array[wp.int32]], list[wp.array[wp.float32]]] | tuple[wp.array[wp.int32], wp.array[wp.float32]]:
     """
-    Find all data points within distance ``r`` of each query center (per-query arrays).
+    Find all data points within distance ``r`` of each query center (BVH backend).
 
-    High-level wrapper around :func:`query_ball_with_offsets`: same BVH broad-phase and
-    ``float32`` distance test as :func:`remove_close`, same SciPy semantics as
-    :meth:`scipy.spatial.KDTree.query_ball_point` with ``p=2`` and ``eps=0``.
-
-    Unlike SciPy's object array of lists, multi-query results are two Python lists of
-    length ``m``, each element a rank-1 ``wp.array`` for that query. A single ``wp.vec3``
-    query returns one ``(indices, distances)`` pair directly (not wrapped in lists). This
-    clones each query's segment out of the internal flat buffer; for one flat buffer plus
-    offsets on device, call :func:`query_ball_with_offsets` instead.
+    High-level wrapper around :func:`query_bvh_ball_with_offsets`. Same SciPy semantics
+    as :meth:`scipy.spatial.KDTree.query_ball_point` with ``p=2`` and ``eps=0``.
 
     Parameters
     ----------
     points
         ``(n, 3)`` data points stored as ``wp.vec3``.
     queries
-        Either ``(m, 3)`` query centers as ``wp.array[wp.vec3]``, or a single ``wp.vec3``
-        (treated as one query).
+        Either ``(m, 3)`` query centers as ``wp.array[wp.vec3]``, or a single ``wp.vec3``.
     r
         Inclusion radius; cast to ``float32`` in kernels (non-negative).
     bvh
@@ -433,32 +931,17 @@ def query_ball(
         Leaf size when constructing ``bvh`` (ignored if ``bvh`` is provided).
     return_sorted
         If ``True``, neighbors within each query are ordered by increasing distance.
-        If ``False``, order follows tree traversal (undefined ordering).
 
     Returns
     -------
     neighbor_indices, neighbor_distances
-        If ``queries`` has ``m`` rows: ``list[wp.array[wp.int32]]`` and
-        ``list[wp.array[wp.float32]]``, each of length ``m``. Element ``k`` lists neighbors
-        of ``queries[k]`` (indices into ``points`` and distances ``‖points[i] − q‖₂``).
-
-        If ``queries`` is a single ``wp.vec3``: two rank-1 arrays (possibly length 0), not
-        lists.
-
-        Empty ``points`` yields empty neighbor arrays and per-query empty slices; duplicate
-        neighbors are not produced.
-
-    Notes
-    -----
-    SciPy may sort indices when ``return_sorted`` is left default on multi-point queries;
-    here sorting only occurs when ``return_sorted=True``, and sorts by distance, not by
-    index. Ball boundaries use ``float32`` arithmetic; extremely tight radii near representable
-    limits may disagree slightly with pure ``float64`` SciPy runs.
+        Per-query neighbor lists; see :func:`query_hashgrid_ball`.
 
     See Also
     --------
-    query_ball_with_offsets
-    query_ball_count
+    query_hashgrid_ball
+    query_bvh_ball_with_offsets
+    query_bvh_ball_count
     bvh_from_points
     :meth:`scipy.spatial.KDTree.query_ball_point`
     """
@@ -469,7 +952,7 @@ def query_ball(
         queries = wp.array([queries], dtype=wp.vec3, device=device)
     m = int(queries.shape[0])
 
-    neighbor_indices_flat, neighbor_distances_flat, offsets = query_ball_with_offsets(
+    neighbor_indices_flat, neighbor_distances_flat, offsets = query_bvh_ball_with_offsets(
         points, queries, r, bvh=bvh, leaf_size=leaf_size, return_sorted=return_sorted
     )
     neighbor_indices: list[wp.array[wp.int32]] = []
@@ -492,39 +975,39 @@ def query_ball(
 
 
 @overload
-def query_nearest(
+def query_bvh_nearest(
     points: wp.array[wp.vec3],
     queries: wp.vec3,
     k: int,
     *,
     max_radius: float = ...,
-    grid_bins: int = ...,
+    leaf_size: int = ...,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.float32]]: ...
 @overload
-def query_nearest(
+def query_bvh_nearest(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3] | wp.vec3,
     k: Literal[1] = 1,
     *,
     max_radius: float = ...,
-    grid_bins: int = ...,
+    leaf_size: int = ...,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.float32]]: ...
 @overload
-def query_nearest(
+def query_bvh_nearest(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3],
     k: int,
     *,
     max_radius: float = ...,
-    grid_bins: int = ...,
+    leaf_size: int = ...,
 ) -> tuple[twt.Array2dInt32, twt.Array2dFloat32]: ...
-def query_nearest(
+def query_bvh_nearest(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3] | wp.vec3,
     k: int = 1,
     *,
     max_radius: float = math.inf,
-    grid_bins: int = 128,
+    leaf_size: int = 4,
 ) -> tuple[
     twt.Array2dInt32 | twt.Array1dInt32,
     twt.Array2dFloat32 | twt.Array1dFloat32,
@@ -537,16 +1020,16 @@ def query_nearest(
     effective radius are kept; unused slots stay at distance ``inf`` and index ``-1`` (e.g. when
     there are fewer than ``k`` points within that radius, or when ``n == 0``).
 
-    Implementation: a 3D :class:`warp.HashGrid` with ``grid_bins`` cells per axis is built from
-    ``points`` using the (possibly clamped) radius below. Each query runs ``wp.hash_grid_query``
-    out to that radius and updates a per-query sorted list of the ``k`` smallest distances
+    Implementation: a BVH over ``points`` is built via :func:`bvh_from_points`. Each query
+    runs ``wp.bvh_query_aabb`` over the cube ``[q - r, q + r]`` with the (possibly clamped)
+    radius below and updates a per-query sorted list of the ``k`` smallest distances
     (binary search + shift insert in the kernel when ``k > 1``; a single running minimum when
     ``k == 1``).
 
-    The radius passed to the grid is ``min(max_radius, max(diagonal, 1e-12))``, where
+    The radius passed to the query is ``min(max_radius, max(diagonal, 1e-12))``, where
     ``diagonal`` is the length of the axis-aligned box that contains both ``points`` and
     ``queries``. So a user ``max_radius`` larger than that span is capped; ``math.inf`` means
-    “use the scene diagonal”.
+    "use the scene diagonal".
 
     Parameters
     ----------
@@ -559,8 +1042,8 @@ def query_nearest(
     max_radius
         Ignore point--query pairs whose distance is strictly greater than this bound (stored as
         ``float32``). Must be ``>= 0``.
-    grid_bins
-        Resolution of the hash grid along each axis (``grid_bins`` cubed cells).
+    leaf_size
+        Maximum primitives per BVH leaf when constructing the tree.
 
     Returns
     -------
@@ -583,7 +1066,7 @@ def query_nearest(
 
     See Also
     --------
-    query_ball
+    query_hashgrid_nearest
     :meth:`scipy.spatial.KDTree.query`
     """
     if k < 1:
@@ -627,12 +1110,153 @@ def query_nearest(
     diagonal = wp.length(max_bound - min_bound)
     max_radius = min(max_radius, max(diagonal, 1e-12))
 
-    grid = wp.HashGrid(grid_bins, grid_bins, grid_bins, device=device)
-    grid.reserve(n)
-    grid.build(points, max_radius)
+    bvh = bvh_from_points(points, leaf_size)
 
     wp.launch(
-        kernel_points.query_nearest_neighbors,
+        kernel_points.query_bvh_nearest_neighbors,
+        dim=m,
+        inputs=[
+            points,
+            queries,
+            bvh.id,
+            wp.int32(k),
+            wp.float32(max_radius),
+            neighbor_indices,
+            neighbor_distances,
+        ],
+        device=device,
+    )
+
+    if k == 1:
+        neighbor_indices = neighbor_indices.reshape(-1)
+        neighbor_distances = neighbor_distances.reshape(-1)
+
+    if single_query and k > 1:
+        return neighbor_indices[0], neighbor_distances[0]
+    if k == 1:
+        return cast(twt.Array1dInt32, neighbor_indices), cast(twt.Array1dFloat32, neighbor_distances)
+    return twt.as_array2d_int32(neighbor_indices), twt.as_array2d_float32(neighbor_distances)
+
+
+@overload
+def query_hashgrid_nearest(
+    points: wp.array[wp.vec3],
+    queries: wp.vec3,
+    k: int,
+    *,
+    max_radius: float = ...,
+    grid_bins: int = ...,
+) -> tuple[wp.array[wp.int32], wp.array[wp.float32]]: ...
+@overload
+def query_hashgrid_nearest(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3] | wp.vec3,
+    k: Literal[1] = 1,
+    *,
+    max_radius: float = ...,
+    grid_bins: int = ...,
+) -> tuple[wp.array[wp.int32], wp.array[wp.float32]]: ...
+@overload
+def query_hashgrid_nearest(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    k: int,
+    *,
+    max_radius: float = ...,
+    grid_bins: int = ...,
+) -> tuple[twt.Array2dInt32, twt.Array2dFloat32]: ...
+def query_hashgrid_nearest(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3] | wp.vec3,
+    k: int = 1,
+    *,
+    max_radius: float = math.inf,
+    grid_bins: int = 128,
+) -> tuple[
+    twt.Array2dInt32 | twt.Array1dInt32,
+    twt.Array2dFloat32 | twt.Array1dFloat32,
+]:
+    """
+    For each query center, find the ``k`` nearest data points (HashGrid backend).
+
+    Same semantics as :func:`query_bvh_nearest`. Broad-phase uses
+    :class:`warp.HashGrid` with ``wp.hash_grid_query`` out to the effective radius.
+
+    Parameters
+    ----------
+    points
+        ``n`` data points as ``wp.array[wp.vec3]``.
+    queries
+        ``m`` query centers as ``wp.array[wp.vec3]``, or a single ``wp.vec3``.
+    k
+        Number of neighbors per query; must be ``>= 1``.
+    max_radius
+        Ignore point--query pairs whose distance is strictly greater than this bound.
+        Must be ``>= 0``.
+    grid_bins
+        Resolution of the hash grid along each axis when constructing the grid.
+
+    Returns
+    -------
+    indices, distances
+        Same layout rules as :func:`query_bvh_nearest`.
+
+    Raises
+    ------
+    ValueError
+        If ``k < 1`` or ``max_radius < 0``.
+
+    See Also
+    --------
+    query_bvh_nearest
+    hashgrid_from_points
+    :meth:`scipy.spatial.KDTree.query`
+    """
+    if k < 1:
+        raise ValueError("k must be >= 1")
+    if max_radius < 0:
+        raise ValueError("max_radius must be >= 0")
+
+    device = points.device
+    single_query = isinstance(queries, wp.vec3)
+    if single_query:
+        queries = wp.array([queries], dtype=wp.vec3, device=device)
+
+    m = int(queries.shape[0])
+    n = int(points.shape[0])
+
+    if m == 0:
+        return (
+            twt.empty_int32_2d((0, k), device=device),
+            twt.empty_float32_2d((0, k), device=device),
+        )
+
+    neighbor_indices = wp.full((m, k), wp.int32(-1), dtype=wp.int32, device=device)
+    neighbor_distances = wp.full((m, k), math.inf, dtype=wp.float32, device=device)
+    if n == 0:
+        if single_query:
+            return neighbor_indices[0], neighbor_distances[0]
+        return twt.as_array2d_int32(neighbor_indices), twt.as_array2d_float32(neighbor_distances)
+
+    min_points_bound, max_points_bound = aabb_bounds(points)
+    min_queries_bound, max_queries_bound = aabb_bounds(queries)
+    min_bound = wp.vec3(
+        min(min_points_bound.x, min_queries_bound.x),
+        min(min_points_bound.y, min_queries_bound.y),
+        min(min_points_bound.z, min_queries_bound.z),
+    )
+    max_bound = wp.vec3(
+        max(max_points_bound.x, max_queries_bound.x),
+        max(max_points_bound.y, max_queries_bound.y),
+        max(max_points_bound.z, max_queries_bound.z),
+    )
+    diagonal = wp.length(max_bound - min_bound)
+    max_radius = min(max_radius, max(diagonal, 1e-12))
+
+    grid = hashgrid_from_points(points, max_radius, grid_bins)
+
+    wp.launch(
+        kernel_points.query_hashgrid_nearest_neighbors,
         dim=m,
         inputs=[
             points,

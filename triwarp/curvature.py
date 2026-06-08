@@ -35,7 +35,7 @@ def discrete_gaussian_curvature(
     gaussian_curvature:  (n,) float
       Discrete gaussian curvature measure.
     """
-    nearest_indices, _, nearest_offsets = tw.points.query_ball_with_offsets(vertices, points, radius)
+    nearest_indices, _, nearest_offsets = tw.points.query_hashgrid_ball_with_offsets(vertices, points, radius)
     defects = vertex_defects(vertices.shape[0], faces, face_angles)
     gauss_curvature = wp.zeros(points.shape[0], dtype=wp.float32, device=points.device)
     wp.launch(
