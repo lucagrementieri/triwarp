@@ -256,6 +256,29 @@ def query_bvh_nearest_neighbors(
 
 
 @wp.kernel
+def closest_point_on_mesh(
+    mesh_id: wp.uint64,
+    points: wp.array[wp.vec3],
+    max_dist: wp.float32,
+    out_closest: wp.array[wp.vec3],
+    out_distance: wp.array[wp.float32],
+    out_face: wp.array[wp.int32],
+) -> None:
+    tid = wp.tid()
+    p = points[tid]
+    query = wp.mesh_query_point(mesh_id, p, max_dist)
+    if query.result:
+        closest = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
+        out_closest[tid] = closest
+        out_distance[tid] = wp.length(p - closest)
+        out_face[tid] = query.face
+    else:
+        out_closest[tid] = p
+        out_distance[tid] = max_dist
+        out_face[tid] = wp.int32(-1)
+
+
+@wp.kernel
 def query_hashgrid_nearest_neighbors(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3],

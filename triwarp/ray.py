@@ -6,7 +6,7 @@ import warp as wp
 
 import triwarp as tw
 from triwarp.kernels import ray as kernel_ray
-from triwarp.points import aabb_bounds
+from triwarp.proximity import aabb_bounds
 
 
 def _default_max_t(mesh: wp.Mesh, ray_origins: wp.array[wp.vec3]) -> float:
@@ -209,7 +209,7 @@ def contains_points(
 
     Uses ``wp.mesh_query_point_sign_parity`` on the mesh BVH. Points outside the
     mesh axis-aligned bounding box are rejected without a ray test. The closest-point
-    search radius is the mesh AABB diagonal from :func:`triwarp.points.aabb_bounds`.
+    search radius is the mesh AABB diagonal from :func:`triwarp.proximity.aabb_bounds`.
     Behavior for points on the surface is undefined, matching
     :func:`trimesh.ray.ray_util.contains_points`.
 

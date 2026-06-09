@@ -1,7 +1,8 @@
 """
-Regression tests for ``triwarp.points`` ball / k-nearest / AABB query APIs.
+Regression tests for ``triwarp.proximity`` ball / k-nearest / AABB query APIs.
 
 Against SciPy ``KDTree`` or brute-force reference (BVH and HashGrid backends).
+Closest-on-mesh tests compare against ``trimesh.proximity.closest_point``.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from typing import Literal
 
 import numpy as np
 import pytest
+import trimesh as tm
 import warp as wp
 from scipy.spatial import KDTree
 
@@ -33,7 +35,9 @@ def test_query_ball_single(device: str, backend: Literal["bvh", "hashgrid"]):
 
     points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
     query_wp = wp.vec3(query[0], query[1], query[2])
-    query_ball = tw.points.query_bvh_ball if backend == "bvh" else tw.points.query_hashgrid_ball
+    query_ball = (
+        tw.proximity.query_bvh_ball if backend == "bvh" else tw.proximity.query_hashgrid_ball
+    )
 
     query_indices_wp, query_distances_wp = query_ball(
         points_wp, query_wp, radius, return_sorted=True
@@ -65,7 +69,9 @@ def test_query_ball_empty_ball(device: str, backend: Literal["bvh", "hashgrid"])
 
     points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
     query_wp = wp.vec3(query[0], query[1], query[2])
-    query_ball = tw.points.query_bvh_ball if backend == "bvh" else tw.points.query_hashgrid_ball
+    query_ball = (
+        tw.proximity.query_bvh_ball if backend == "bvh" else tw.proximity.query_hashgrid_ball
+    )
 
     query_indices_wp, query_distances_wp = query_ball(
         points_wp, query_wp, radius, return_sorted=True
@@ -100,7 +106,9 @@ def test_query_ball_batch(device: str, backend: Literal["bvh", "hashgrid"]):
 
     points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
     query_wp = wp.array(np.ascontiguousarray(queries), dtype=wp.vec3, device=device)
-    query_ball = tw.points.query_bvh_ball if backend == "bvh" else tw.points.query_hashgrid_ball
+    query_ball = (
+        tw.proximity.query_bvh_ball if backend == "bvh" else tw.proximity.query_hashgrid_ball
+    )
 
     query_indices_wp, query_distances_wp = query_ball(
         points_wp, query_wp, radius, return_sorted=True
@@ -149,7 +157,9 @@ def test_query_ball_empty(device: str, backend: Literal["bvh", "hashgrid"]):
     query_wp = wp.vec3(points[0][0], points[0][1], points[0][2])
     queries_wp = wp.array(np.ascontiguousarray(points[-3:]), dtype=wp.vec3, device=device)
     radius = 0.5
-    query_ball = tw.points.query_bvh_ball if backend == "bvh" else tw.points.query_hashgrid_ball
+    query_ball = (
+        tw.proximity.query_bvh_ball if backend == "bvh" else tw.proximity.query_hashgrid_ball
+    )
 
     indices, distances = query_ball(empty_points_wp, query_wp, radius)
     assert indices.shape == (0,)
@@ -186,7 +196,7 @@ def test_query_nearest_single(
     query_distances_np = np.atleast_1d(np.asarray(query_distances_np))
 
     query_nearest = (
-        tw.points.query_bvh_nearest if backend == "bvh" else tw.points.query_hashgrid_nearest
+        tw.proximity.query_bvh_nearest if backend == "bvh" else tw.proximity.query_hashgrid_nearest
     )
     query_indices_wp, query_distances_wp = query_nearest(
         points_wp, query_wp, k=k, max_radius=max_radius
@@ -218,7 +228,7 @@ def test_query_nearest_batch(
     query_distances_np = np.asarray(query_distances_np)
 
     query_nearest = (
-        tw.points.query_bvh_nearest if backend == "bvh" else tw.points.query_hashgrid_nearest
+        tw.proximity.query_bvh_nearest if backend == "bvh" else tw.proximity.query_hashgrid_nearest
     )
     query_indices_wp, query_distances_wp = query_nearest(
         points_wp, query_wp, k=k, max_radius=max_radius
@@ -240,7 +250,7 @@ def test_query_nearest_empty(device: str, backend: Literal["bvh", "hashgrid"]):
     queries_wp = wp.array(np.ascontiguousarray(points[-3:]), dtype=wp.vec3, device=device)
     k = 2
     query_nearest = (
-        tw.points.query_bvh_nearest if backend == "bvh" else tw.points.query_hashgrid_nearest
+        tw.proximity.query_bvh_nearest if backend == "bvh" else tw.proximity.query_hashgrid_nearest
     )
 
     indices, distances = query_nearest(empty_points_wp, query_wp, k=k)
@@ -268,8 +278,8 @@ def test_query_bvh_aabb_bounds_with_offsets(device: str) -> None:
     query_lower_wp = wp.array(np.ascontiguousarray(query_lower_np), dtype=wp.vec3, device=device)
     query_upper_wp = wp.array(np.ascontiguousarray(query_upper_np), dtype=wp.vec3, device=device)
 
-    bvh = tw.points.bvh_from_bounds(lower_wp, upper_wp)
-    indices_wp, offsets_wp, hit_counts_wp = tw.points.query_bvh_aabb_bounds_with_offsets(
+    bvh = tw.proximity.bvh_from_bounds(lower_wp, upper_wp)
+    indices_wp, offsets_wp, hit_counts_wp = tw.proximity.query_bvh_aabb_bounds_with_offsets(
         bvh, query_lower_wp, query_upper_wp, max_hits=16
     )
 
@@ -286,3 +296,102 @@ def test_query_bvh_aabb_bounds_with_offsets(device: str) -> None:
         got_np = np.sort(indices_np[bounds_np[query_idx] : bounds_np[query_idx + 1]])
         assert hit_counts_np[query_idx] == got_np.shape[0]
         assert np.array_equal(got_np, expected_np)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+def test_closest_point_on_mesh_random(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    rng = np.random.default_rng(42)
+    points_np = rng.random((200, 3), dtype=np.float64) * 4.0 - 2.0
+
+    closest_tm, distance_tm, _triangle_id_tm = tm.proximity.closest_point(mesh_tm, points_np)
+
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    closest_wp, distance_wp, _triangle_id_wp = tw.proximity.closest_point_on_mesh(
+        mesh_wp.points, mesh_wp.indices, points_wp
+    )
+
+    assert np.allclose(closest_wp.numpy(), closest_tm, rtol=1e-5, atol=1e-5)
+    assert np.allclose(distance_wp.numpy(), distance_tm, rtol=1e-5, atol=1e-5)
+
+
+def test_closest_point_on_mesh_ambiguous_edge(device: str) -> None:
+    mesh_tm = tm.Trimesh(
+        vertices=[[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, -1.0]],
+        faces=[[0, 1, 2], [0, 1, 3]],
+        process=False,
+    )
+    query_np = np.array([[-0.25 - 1e-9, 0.0, -0.25]], dtype=np.float64)
+    closest_tm, distance_tm, _triangle_id_tm = tm.proximity.closest_point(mesh_tm, query_np)
+
+    vertices_wp = wp.array(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    faces_wp = wp.array(
+        np.ascontiguousarray(mesh_tm.faces.reshape(-1), dtype=np.int32), device=device
+    )
+    query_wp = wp.array(
+        np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    closest_wp, distance_wp, _triangle_id_wp = tw.proximity.closest_point_on_mesh(
+        vertices_wp, faces_wp, query_wp
+    )
+
+    assert np.allclose(closest_wp.numpy(), closest_tm, rtol=1e-5, atol=1e-5)
+    assert np.allclose(distance_wp.numpy(), distance_tm, rtol=1e-5, atol=1e-5)
+
+
+def test_closest_point_on_mesh_unreferenced_vertex(device: str) -> None:
+    query_np = np.array([[-1.0, -1.0, -1.0]], dtype=np.float64)
+    mesh_tm = tm.Trimesh(
+        vertices=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [-0.5, -0.5, -0.5]],
+        faces=[[0, 1, 2]],
+        process=False,
+    )
+    closest_tm, distance_tm, triangle_id_tm = tm.proximity.closest_point(mesh_tm, query_np)
+
+    vertices_wp = wp.array(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    faces_wp = wp.array(
+        np.ascontiguousarray(mesh_tm.faces.reshape(-1), dtype=np.int32), device=device
+    )
+    query_wp = wp.array(
+        np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    closest_wp, distance_wp, triangle_id_wp = tw.proximity.closest_point_on_mesh(
+        vertices_wp, faces_wp, query_wp
+    )
+
+    assert np.allclose(closest_wp.numpy(), closest_tm, rtol=1e-5, atol=1e-5)
+    assert np.allclose(distance_wp.numpy(), distance_tm, rtol=1e-5, atol=1e-5)
+    assert np.array_equal(triangle_id_wp.numpy(), triangle_id_tm)
+
+
+def test_closest_point_on_mesh_empty_points(device: str) -> None:
+    vertices = wp.array(np.zeros((3, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    faces = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+    points = wp.empty(0, dtype=wp.vec3, device=device)
+    closest_wp, distance_wp, triangle_id_wp = tw.proximity.closest_point_on_mesh(
+        vertices, faces, points
+    )
+    assert closest_wp.shape == (0,)
+    assert distance_wp.shape == (0,)
+    assert triangle_id_wp.shape == (0,)
+
+
+def test_closest_point_on_mesh_empty_faces(device: str) -> None:
+    vertices = wp.zeros(1, dtype=wp.vec3, device=device)
+    faces = wp.empty(0, dtype=wp.int32, device=device)
+    points = wp.array(np.zeros((2, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    closest_wp, distance_wp, triangle_id_wp = tw.proximity.closest_point_on_mesh(
+        vertices, faces, points
+    )
+    assert closest_wp.shape == (2,)
+    assert distance_wp.shape == (2,)
+    assert triangle_id_wp.shape == (2,)
+    assert np.all(np.isnan(closest_wp.numpy()))
+    assert np.all(np.isinf(distance_wp.numpy()))
+    assert np.all(triangle_id_wp.numpy() == -1)

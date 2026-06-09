@@ -3,10 +3,11 @@ from __future__ import annotations
 import math
 from typing import Literal, cast, overload
 
+import numpy as np
 import warp as wp
 
 import triwarp.typing as twt
-from triwarp.kernels import points as kernel_points
+from triwarp.kernels import proximity as kernel_proximity
 
 
 def aabb_bounds(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
@@ -30,7 +31,7 @@ def aabb_bounds(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     out_min = wp.full(3, math.inf, dtype=wp.float32, device=points.device)
     out_max = wp.full(3, -math.inf, dtype=wp.float32, device=points.device)
     wp.launch(
-        kernel_points.aabb_bounds,
+        kernel_proximity.aabb_bounds,
         dim=points.shape[0],
         inputs=[points, out_min, out_max],
         device=points.device,
@@ -171,7 +172,7 @@ def query_bvh_aabb_with_offsets(
 
     hit_counts = wp.empty(m, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_points.query_bvh_aabb_count,
+        kernel_proximity.query_bvh_aabb_count,
         dim=m,
         inputs=[queries, bvh.id, wp.float32(half_extent), hit_counts],
         device=device,
@@ -189,7 +190,7 @@ def query_bvh_aabb_with_offsets(
 
     candidate_indices_flat = wp.empty(total_hits, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_points.query_bvh_aabb_neighbors,
+        kernel_proximity.query_bvh_aabb_neighbors,
         dim=m,
         inputs=[queries, bvh.id, wp.float32(half_extent), offsets, candidate_indices_flat],
         device=device,
@@ -236,7 +237,7 @@ def query_bvh_aabb_bounds_with_offsets(
 
     hit_counts = wp.empty(m, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_points.query_bvh_aabb_bounds_count,
+        kernel_proximity.query_bvh_aabb_bounds_count,
         dim=m,
         inputs=[query_lower, query_upper, bvh.id, wp.int32(max_hits), hit_counts],
         device=device,
@@ -255,7 +256,7 @@ def query_bvh_aabb_bounds_with_offsets(
 
     candidate_indices_flat = wp.empty(total_hits, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_points.query_bvh_aabb_bounds_neighbors,
+        kernel_proximity.query_bvh_aabb_bounds_neighbors,
         dim=m,
         inputs=[
             query_lower,
@@ -329,7 +330,7 @@ def query_hashgrid_ball_count(
         grid = hashgrid_from_points(points, r, grid_bins)
 
     wp.launch(
-        kernel_points.query_hashgrid_ball_count,
+        kernel_proximity.query_hashgrid_ball_count,
         dim=m,
         inputs=[points, queries, grid.id, wp.float32(r), neighbor_counts],
         device=device,
@@ -439,7 +440,7 @@ def query_hashgrid_ball_with_offsets(
     neighbor_indices_flat = wp.empty(flat_len, dtype=wp.int32, device=device)
     neighbor_distances_flat = wp.empty(flat_len, dtype=wp.float32, device=device)
     wp.launch(
-        kernel_points.query_hashgrid_ball_neighbors,
+        kernel_proximity.query_hashgrid_ball_neighbors,
         dim=m,
         inputs=[
             points,
@@ -644,7 +645,7 @@ def query_bvh_ball_count(
         bvh = bvh_from_points(points, leaf_size)
 
     wp.launch(
-        kernel_points.query_bvh_ball_count,
+        kernel_proximity.query_bvh_ball_count,
         dim=m,
         inputs=[points, queries, bvh.id, wp.float32(r), neighbor_counts],
         device=device,
@@ -731,7 +732,7 @@ def query_bvh_ball_with_offsets(
     neighbor_indices_flat = wp.empty(flat_len, dtype=wp.int32, device=device)
     neighbor_distances_flat = wp.empty(flat_len, dtype=wp.float32, device=device)
     wp.launch(
-        kernel_points.query_bvh_ball_neighbors,
+        kernel_proximity.query_bvh_ball_neighbors,
         dim=m,
         inputs=[
             points,
@@ -997,7 +998,7 @@ def query_bvh_nearest(
     bvh = bvh_from_points(points, leaf_size)
 
     wp.launch(
-        kernel_points.query_bvh_nearest_neighbors,
+        kernel_proximity.query_bvh_nearest_neighbors,
         dim=m,
         inputs=[
             points,
@@ -1139,7 +1140,7 @@ def query_hashgrid_nearest(
     grid = hashgrid_from_points(points, max_radius, grid_bins)
 
     wp.launch(
-        kernel_points.query_hashgrid_nearest_neighbors,
+        kernel_proximity.query_hashgrid_nearest_neighbors,
         dim=m,
         inputs=[
             points,
@@ -1164,3 +1165,100 @@ def query_hashgrid_nearest(
             twt.Array1dFloat32, neighbor_distances
         )
     return twt.as_array2d_int32(neighbor_indices), twt.as_array2d_float32(neighbor_distances)
+
+
+def _default_max_dist(vertices: wp.array[wp.vec3], points: wp.array[wp.vec3]) -> float:
+    mesh_min, mesh_max = aabb_bounds(vertices)
+    if int(points.shape[0]) == 0:
+        return float(wp.length(mesh_max - mesh_min))
+    pts_min, pts_max = aabb_bounds(points)
+    combined_min = wp.vec3(
+        min(mesh_min[0], pts_min[0]),
+        min(mesh_min[1], pts_min[1]),
+        min(mesh_min[2], pts_min[2]),
+    )
+    combined_max = wp.vec3(
+        max(mesh_max[0], pts_max[0]),
+        max(mesh_max[1], pts_max[1]),
+        max(mesh_max[2], pts_max[2]),
+    )
+    return float(wp.length(combined_max - combined_min))
+
+
+def closest_point_on_mesh(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    points: wp.array[wp.vec3],
+    *,
+    max_dist: float | None = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.float32], wp.array[wp.int32]]:
+    """
+    For each query point, find the closest point on any triangle of the mesh.
+
+    Uses ``wp.mesh_query_point`` on a ``wp.Mesh`` BVH built from ``vertices`` and
+    ``faces``. Distances are unsigned Euclidean lengths in ``float32``.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions as ``wp.vec3``.
+    faces
+        Length-``3 * n_faces`` flat triangle index buffer.
+    points
+        ``(m,)`` query positions in space as ``wp.vec3``.
+    max_dist
+        Maximum search radius per query. Faces farther than this are ignored.
+        When ``None``, derived from the axis-aligned box enclosing mesh
+        vertices and query points.
+
+    Returns
+    -------
+    closest
+        ``(m, 3)`` closest point on the mesh surface for each query.
+    distance
+        ``(m,)`` unsigned distance from each query to its closest surface point.
+    triangle_id
+        ``(m,)`` index of the triangle containing each closest point, or ``-1``
+        when no face lies within ``max_dist``.
+    """
+    device = vertices.device
+    if faces.device != device or points.device != device:
+        devices = f"{device}, {faces.device}, {points.device}"
+        raise ValueError(f"vertices, faces, and points must live on the same device, got {devices}")
+
+    m = int(points.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    if m == 0:
+        return (
+            wp.empty(0, dtype=wp.vec3, device=device),
+            wp.empty(0, dtype=wp.float32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+        )
+    if n_faces == 0:
+        nan_closest_np = np.full((m, 3), np.nan, dtype=np.float32)
+        out_closest = wp.array(nan_closest_np, dtype=wp.vec3, device=device)
+        out_distance = wp.full(m, float("inf"), dtype=wp.float32, device=device)
+        out_face = wp.full(m, -1, dtype=wp.int32, device=device)
+        return out_closest, out_distance, out_face
+
+    if max_dist is None:
+        max_dist = _default_max_dist(vertices, points)
+
+    mesh = wp.Mesh(points=vertices, indices=faces)
+    out_closest = wp.empty(m, dtype=wp.vec3, device=device)
+    out_distance = wp.empty(m, dtype=wp.float32, device=device)
+    out_face = wp.empty(m, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_proximity.closest_point_on_mesh,
+        dim=m,
+        inputs=[
+            mesh.id,
+            points,
+            wp.float32(max_dist),
+            out_closest,
+            out_distance,
+            out_face,
+        ],
+        device=device,
+    )
+    return out_closest, out_distance, out_face

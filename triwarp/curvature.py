@@ -40,7 +40,7 @@ def discrete_gaussian_curvature(
     wp.array[wp.float32]
         Length ``n`` discrete Gaussian curvature measure on ``points.device``.
     """
-    nearest_indices, _, nearest_offsets = tw.points.query_hashgrid_ball_with_offsets(
+    nearest_indices, _, nearest_offsets = tw.proximity.query_hashgrid_ball_with_offsets(
         vertices, points, radius
     )
     defects = vertex_defects(vertices.shape[0], faces, face_angles)
@@ -138,8 +138,8 @@ def discrete_mean_curvature(
         device=device,
     )
 
-    bvh = tw.points.bvh_from_bounds(edge_lower, edge_upper)
-    candidate_edges, offsets = tw.points.query_bvh_aabb_with_offsets(bvh, points, radius)
+    bvh = tw.proximity.bvh_from_bounds(edge_lower, edge_upper)
+    candidate_edges, offsets = tw.proximity.query_bvh_aabb_with_offsets(bvh, points, radius)
 
     mean_curvature = wp.zeros(n_points, dtype=wp.float32, device=device)
     n_candidates = int(candidate_edges.shape[0])
