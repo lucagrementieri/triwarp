@@ -93,14 +93,7 @@ def face_adjacency_projections(
     wp.launch(
         kernel_convex.face_adjacency_projections,
         dim=m,
-        inputs=[
-            vertices,
-            face_normals,
-            face_adjacency,
-            face_adjacency_edges,
-            face_adjacency_unshared,
-            out_projections,
-        ],
+        inputs=[vertices, face_normals, face_adjacency, face_adjacency_edges, face_adjacency_unshared, out_projections],
         device=device,
     )
     return out_projections
@@ -179,10 +172,5 @@ def face_adjacency_convex(
         face_normals=face_normals,
     )
     out_convex = wp.empty(m, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_convex.face_adjacency_convex,
-        dim=m,
-        inputs=[projections, out_convex],
-        device=device,
-    )
+    wp.launch(kernel_convex.face_adjacency_convex, dim=m, inputs=[projections, out_convex], device=device)
     return out_convex

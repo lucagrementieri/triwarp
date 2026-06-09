@@ -32,10 +32,7 @@ def contains_points_sign_parity(
 
 @wp.func
 def ray_query_first(
-    mesh_id: wp.uint64,
-    origin: wp.vec3,
-    direction: wp.vec3,
-    max_t: wp.float32,
+    mesh_id: wp.uint64, origin: wp.vec3, direction: wp.vec3, max_t: wp.float32
 ) -> tuple[wp.bool, wp.int32, wp.vec3]:
     query = wp.mesh_query_ray(mesh_id, origin, direction, max_t)
     if query.result:
@@ -74,10 +71,7 @@ def intersects_first_detail(
 
 
 @wp.kernel
-def face_hit_mask(
-    triangle_index: wp.array[wp.int32],
-    out_hit: wp.array[wp.bool],
-) -> None:
+def face_hit_mask(triangle_index: wp.array[wp.int32], out_hit: wp.array[wp.bool]) -> None:
     tid = wp.tid()
     out_hit[tid] = triangle_index[tid] >= 0
 

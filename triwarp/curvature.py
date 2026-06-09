@@ -115,14 +115,9 @@ def discrete_mean_curvature(
     if m == 0:
         return wp.zeros(n_points, dtype=wp.float32, device=device)
 
-    angles = tw.graph.face_adjacency_angles(
-        vertices, faces, face_adjacency=face_adjacency
-    )
+    angles = tw.graph.face_adjacency_angles(vertices, faces, face_adjacency=face_adjacency)
     convex = tw.convex.face_adjacency_convex(
-        vertices,
-        faces,
-        face_adjacency=face_adjacency,
-        face_adjacency_edges=face_adjacency_edges,
+        vertices, faces, face_adjacency=face_adjacency, face_adjacency_edges=face_adjacency_edges
     )
 
     edge_lower = wp.empty(m, dtype=wp.vec3, device=device)

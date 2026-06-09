@@ -54,23 +54,14 @@ def faces_to_edges(faces: wp.array[wp.int32], sorted: bool = False) -> twt.Array
 
 @overload
 def face_adjacency(
-    faces: wp.array[wp.int32],
-    edges_sorted: twt.Array2dInt32 | None = None,
-    *,
-    return_edges: Literal[False] = False,
+    faces: wp.array[wp.int32], edges_sorted: twt.Array2dInt32 | None = None, *, return_edges: Literal[False] = False
 ) -> twt.Array2dInt32: ...
 @overload
 def face_adjacency(
-    faces: wp.array[wp.int32],
-    edges_sorted: twt.Array2dInt32 | None = None,
-    *,
-    return_edges: Literal[True],
+    faces: wp.array[wp.int32], edges_sorted: twt.Array2dInt32 | None = None, *, return_edges: Literal[True]
 ) -> tuple[twt.Array2dInt32, twt.Array2dInt32]: ...
 def face_adjacency(
-    faces: wp.array[wp.int32],
-    edges_sorted: twt.Array2dInt32 | None = None,
-    *,
-    return_edges: bool = False,
+    faces: wp.array[wp.int32], edges_sorted: twt.Array2dInt32 | None = None, *, return_edges: bool = False
 ) -> twt.Array2dInt32 | tuple[twt.Array2dInt32, twt.Array2dInt32]:
     """
     Face index pairs that share an undirected mesh edge.
@@ -147,10 +138,7 @@ def face_adjacency(
     return twt.as_array2d_int32(adjacency)
 
 
-def is_watertight(
-    edges: twt.Array2dInt32,
-    edges_sorted: twt.Array2dInt32 | None = None,
-) -> tuple[bool, bool]:
+def is_watertight(edges: twt.Array2dInt32, edges_sorted: twt.Array2dInt32 | None = None) -> tuple[bool, bool]:
     """
     Whether a directed edge list forms a closed, consistently wound surface.
 
@@ -203,10 +191,7 @@ def is_watertight(
     else:
         consistent = wp.empty(n_groups, dtype=wp.bool, device=device)
         wp.launch(
-            kernel_graph.edge_pair_winding_mask,
-            dim=n_groups,
-            inputs=[edges, edge_groups, consistent],
-            device=device,
+            kernel_graph.edge_pair_winding_mask, dim=n_groups, inputs=[edges, edge_groups, consistent], device=device
         )
         winding = tw.reduce.all(consistent)
 
@@ -348,10 +333,7 @@ def face_adjacency_angles(
 
     out_angles = wp.empty(m, dtype=wp.float32, device=device)
     wp.launch(
-        kernel_graph.face_adjacency_angles,
-        dim=m,
-        inputs=[face_normals, face_adjacency, out_angles],
-        device=device,
+        kernel_graph.face_adjacency_angles, dim=m, inputs=[face_normals, face_adjacency, out_angles], device=device
     )
     return out_angles
 
@@ -424,10 +406,7 @@ def concatenate(
     return concatenated_vertices, concatenated_faces
 
 
-def split(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-) -> list[tuple[wp.array[wp.vec3], wp.array[wp.int32]]]:
+def split(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> list[tuple[wp.array[wp.vec3], wp.array[wp.int32]]]:
     """
     Split a mesh into connected components by face adjacency.
 
@@ -481,10 +460,7 @@ def split(
     return meshes
 
 
-def edges_to_csr(
-    node_count: int,
-    edges: twt.Array2dInt32,
-) -> wps.BsrMatrix[wp.float32]:
+def edges_to_csr(node_count: int, edges: twt.Array2dInt32) -> wps.BsrMatrix[wp.float32]:
     """
     Undirected adjacency as a 1x1-block :class:`warp.sparse.BsrMatrix` (CSR form).
 
@@ -510,19 +486,12 @@ def edges_to_csr(
     rows = wp.empty(n_entries, dtype=wp.int32, device=device)
     cols = wp.empty(n_entries, dtype=wp.int32, device=device)
     if m > 0:
-        wp.launch(
-            kernel_graph.edges_to_adjacency,
-            dim=m,
-            inputs=[edges, rows, cols],
-            device=device,
-        )
+        wp.launch(kernel_graph.edges_to_adjacency, dim=m, inputs=[edges, rows, cols], device=device)
     data = wp.ones(n_entries, dtype=wp.float32, device=device)
     return wps.bsr_from_triplets(node_count, node_count, rows, cols, data, prune_numerical_zeros=False)
 
 
-def connected_component_labels(
-    adjacency: wps.BsrMatrix[wp.Scalar],
-) -> wp.array[wp.int32]:
+def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[wp.int32]:
     """
     Per-node connected-component labels from a sparse adjacency matrix.
 
@@ -582,10 +551,7 @@ def connected_component_labels(
     parents = wp.empty(node_count, dtype=wp.int32, device=device)
 
     wp.launch(
-        kernel_connected_components.ecl_init_parent,
-        dim=node_count,
-        inputs=[offsets, indices, parents],
-        device=device,
+        kernel_connected_components.ecl_init_parent, dim=node_count, inputs=[offsets, indices, parents], device=device
     )
 
     changed = wp.zeros(1, dtype=wp.int32, device=device)
@@ -624,10 +590,7 @@ def connected_component_labels(
             raise RuntimeError(f"connected_component_labels: edge verification failed after {node_count} iterations")
 
 
-def connected_component_labels_from_edges(
-    edges: twt.Array2dInt32,
-    node_count: int | None = None,
-) -> wp.array[wp.int32]:
+def connected_component_labels_from_edges(edges: twt.Array2dInt32, node_count: int | None = None) -> wp.array[wp.int32]:
     """
     Per-node connected-component labels from an undirected edge list.
 

@@ -12,16 +12,8 @@ from triwarp.points import aabb_bounds
 def _default_max_t(mesh: wp.Mesh, ray_origins: wp.array[wp.vec3]) -> float:
     mesh_min, mesh_max = aabb_bounds(mesh.points)
     ray_min, ray_max = aabb_bounds(ray_origins)
-    combined_min = wp.vec3(
-        min(mesh_min[0], ray_min[0]),
-        min(mesh_min[1], ray_min[1]),
-        min(mesh_min[2], ray_min[2]),
-    )
-    combined_max = wp.vec3(
-        max(mesh_max[0], ray_max[0]),
-        max(mesh_max[1], ray_max[1]),
-        max(mesh_max[2], ray_max[2]),
-    )
+    combined_min = wp.vec3(min(mesh_min[0], ray_min[0]), min(mesh_min[1], ray_min[1]), min(mesh_min[2], ray_min[2]))
+    combined_max = wp.vec3(max(mesh_max[0], ray_max[0]), max(mesh_max[1], ray_max[1]), max(mesh_max[2], ray_max[2]))
     return float(wp.length(combined_max - combined_min))
 
 
@@ -34,11 +26,7 @@ def _validate_ray_inputs(mesh: wp.Mesh, ray_origins: wp.array[wp.vec3], ray_dire
 
 
 def intersects_location(
-    mesh: wp.Mesh,
-    ray_origins: wp.array[wp.vec3],
-    ray_directions: wp.array[wp.vec3],
-    *,
-    max_t: float | None = None,
+    mesh: wp.Mesh, ray_origins: wp.array[wp.vec3], ray_directions: wp.array[wp.vec3], *, max_t: float | None = None
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32]]:
     """Return world-space locations where rays hit the mesh surface (first hit per ray).
 
@@ -87,12 +75,7 @@ def intersects_location(
     )
 
     hit_mask = wp.empty(n, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_ray.face_hit_mask,
-        dim=n,
-        inputs=[faces_dense, hit_mask],
-        device=device,
-    )
+    wp.launch(kernel_ray.face_hit_mask, dim=n, inputs=[faces_dense, hit_mask], device=device)
     index_ray = tw.array.flatnonzero(hit_mask)
     k = int(index_ray.shape[0])
     index_tri = wp.empty(k, dtype=wp.int32, device=device)
@@ -103,11 +86,7 @@ def intersects_location(
 
 
 def intersects_first(
-    mesh: wp.Mesh,
-    ray_origins: wp.array[wp.vec3],
-    ray_directions: wp.array[wp.vec3],
-    *,
-    max_t: float | None = None,
+    mesh: wp.Mesh, ray_origins: wp.array[wp.vec3], ray_directions: wp.array[wp.vec3], *, max_t: float | None = None
 ) -> wp.array[wp.int32]:
     """Find the index of the first triangle each ray hits.
 
@@ -150,11 +129,7 @@ def intersects_first(
 
 
 def intersects_any(
-    mesh: wp.Mesh,
-    ray_origins: wp.array[wp.vec3],
-    ray_directions: wp.array[wp.vec3],
-    *,
-    max_t: float | None = None,
+    mesh: wp.Mesh, ray_origins: wp.array[wp.vec3], ray_directions: wp.array[wp.vec3], *, max_t: float | None = None
 ) -> wp.array[wp.bool]:
     """Check whether each ray hits the mesh surface.
 
@@ -197,11 +172,7 @@ def intersects_any(
 
 
 def contains_points(
-    mesh: wp.Mesh,
-    points: wp.array[wp.vec3],
-    *,
-    n_sample: int = 5,
-    perturbation_scale: float = 0.1,
+    mesh: wp.Mesh, points: wp.array[wp.vec3], *, n_sample: int = 5, perturbation_scale: float = 0.1
 ) -> wp.array[wp.bool]:
     """Test whether query points lie inside a closed mesh (ray parity sign).
 

@@ -18,11 +18,7 @@ def min(array: twt.Array1dInt32 | twt.Array2dInt32, *, axis: None = ...) -> int:
 def min(array: twt.Array1dFloat32 | twt.Array2dFloat32, *, axis: None = ...) -> float: ...
 @overload
 def min(array: twt.Array2dScalar, *, axis: Literal[0, 1]) -> twt.Array1dScalar: ...
-def min(
-    array: twt.ScalarArray,
-    *,
-    axis: Literal[0, 1] | None = None,
-) -> float | int | twt.Array1dScalar:
+def min(array: twt.ScalarArray, *, axis: Literal[0, 1] | None = None) -> float | int | twt.Array1dScalar:
     """
     Minimum of ``array``.
 
@@ -61,11 +57,7 @@ def max(array: twt.Array1dInt32 | twt.Array2dInt32, *, axis: None = ...) -> int:
 def max(array: twt.Array1dFloat32 | twt.Array2dFloat32, *, axis: None = ...) -> float: ...
 @overload
 def max(array: twt.Array2dScalar, *, axis: Literal[0, 1]) -> twt.Array1dScalar: ...
-def max(
-    array: twt.ScalarArray,
-    *,
-    axis: Literal[0, 1] | None = None,
-) -> float | int | twt.Array1dScalar:
+def max(array: twt.ScalarArray, *, axis: Literal[0, 1] | None = None) -> float | int | twt.Array1dScalar:
     """
     Maximum of ``array``.
 
@@ -105,9 +97,7 @@ def minmax(array: twt.Array1dFloat32 | twt.Array2dFloat32, *, axis: None = ...) 
 @overload
 def minmax(array: twt.Array2dScalar, *, axis: Literal[0, 1]) -> tuple[twt.Array1dScalar, twt.Array1dScalar]: ...
 def minmax(
-    array: twt.ScalarArray,
-    *,
-    axis: Literal[0, 1] | None = None,
+    array: twt.ScalarArray, *, axis: Literal[0, 1] | None = None
 ) -> tuple[float, float] | tuple[int, int] | tuple[twt.Array1dScalar, twt.Array1dScalar]:
     """
     Minimum and maximum of ``array``.
@@ -314,9 +304,7 @@ def _validate_scalar_array(array: twt.ScalarArray, spec: _ScalarReduceSpec, axis
 
 
 def _launch_axis_scalar(
-    array: twt.Array2dScalar,
-    axis: Literal[0, 1],
-    spec: _ScalarReduceSpec,
+    array: twt.Array2dScalar, axis: Literal[0, 1], spec: _ScalarReduceSpec
 ) -> twt.Array1dScalar | tuple[twt.Array1dScalar, twt.Array1dScalar]:
     n_rows, n_cols = int(array.shape[0]), int(array.shape[1])
     if spec.dual_axis:
@@ -340,38 +328,23 @@ def _launch_axis_scalar(
 
 
 def _launch_global_scalar_tiled(
-    array: twt.ScalarArray,
-    spec: _ScalarReduceSpec,
+    array: twt.ScalarArray, spec: _ScalarReduceSpec
 ) -> float | int | tuple[float, float] | tuple[int, int]:
     if spec.global_output_slots == 2:
-        out = wp.array(
-            [max_for_dtype(array.dtype), min_for_dtype(array.dtype)],
-            dtype=array.dtype,
-            device=array.device,
-        )
+        out = wp.array([max_for_dtype(array.dtype), min_for_dtype(array.dtype)], dtype=array.dtype, device=array.device)
     else:
         out = wp.full(1, spec.init_global(array.dtype), dtype=array.dtype, device=array.device)
 
     if array.ndim == 1:
         n = int(array.shape[0])
         n_tiles = (n + TILE_1D - 1) // TILE_1D
-        wp.launch_tiled(
-            spec.tiled_1d,
-            dim=[n_tiles],
-            inputs=[array, out],
-            block_dim=TILE_1D,
-            device=array.device,
-        )
+        wp.launch_tiled(spec.tiled_1d, dim=[n_tiles], inputs=[array, out], block_dim=TILE_1D, device=array.device)
     else:
         n, m = array.shape
         n_tiles = (n + TILE_2D - 1) // TILE_2D
         m_tiles = (m + TILE_2D - 1) // TILE_2D
         wp.launch_tiled(
-            spec.tiled_2d,
-            dim=[n_tiles, m_tiles],
-            inputs=[array, out],
-            block_dim=TILE_2D * TILE_2D,
-            device=array.device,
+            spec.tiled_2d, dim=[n_tiles, m_tiles], inputs=[array, out], block_dim=TILE_2D * TILE_2D, device=array.device
         )
 
     out_np = out.numpy()
@@ -381,9 +354,7 @@ def _launch_global_scalar_tiled(
 
 
 def _reduce_scalar(
-    array: twt.ScalarArray,
-    axis: Literal[0, 1] | None,
-    spec: _ScalarReduceSpec,
+    array: twt.ScalarArray, axis: Literal[0, 1] | None, spec: _ScalarReduceSpec
 ) -> (
     float
     | int
@@ -410,20 +381,12 @@ def _launch_global_bool_tiled(mask_i32: wp.array[wp.int32], spec: _BoolReduceSpe
     out = wp.full(1, spec.init_global, dtype=wp.int32, device=mask_i32.device)
     n = int(mask_i32.shape[0])
     n_tiles = (n + TILE_1D - 1) // TILE_1D
-    wp.launch_tiled(
-        spec.tiled_1d,
-        dim=[n_tiles],
-        inputs=[mask_i32, out],
-        block_dim=TILE_1D,
-        device=mask_i32.device,
-    )
+    wp.launch_tiled(spec.tiled_1d, dim=[n_tiles], inputs=[mask_i32, out], block_dim=TILE_1D, device=mask_i32.device)
     return bool(out.numpy().item() != 0)
 
 
 def _reduce_bool(
-    array: wp.array[wp.bool],
-    axis: Literal[0, 1] | None,
-    spec: _BoolReduceSpec,
+    array: wp.array[wp.bool], axis: Literal[0, 1] | None, spec: _BoolReduceSpec
 ) -> wp.array[wp.bool] | bool:
     if int(array.size) == 0:
         raise ValueError(f"{spec.name} requires a non-empty array.")

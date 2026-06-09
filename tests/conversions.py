@@ -15,8 +15,5 @@ def trimesh_to_warp(mesh: tm.Trimesh, device: str) -> wp.Mesh:
 
 
 def trimesh_to_pyvista(mesh: tm.Trimesh) -> pv.PolyData:
-    faces_np = np.column_stack([
-        np.full(mesh.faces.shape[0], 3, dtype=np.int32),
-        mesh.faces.astype(np.int32),
-    ]).ravel()
+    faces_np = np.column_stack([np.full(mesh.faces.shape[0], 3, dtype=np.int32), mesh.faces.astype(np.int32)]).ravel()
     return pv.PolyData(np.ascontiguousarray(mesh.vertices.astype(np.float64)), faces_np)

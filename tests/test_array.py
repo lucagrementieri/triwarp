@@ -38,10 +38,7 @@ def test_pack_1d_wp_arrays_vec3(device: str):
 
 
 def test_pack_1d_wp_arrays_dtype_mismatch(device: str):
-    parts = [
-        wp.array([1], dtype=wp.int32, device=device),
-        wp.array([2.0], dtype=wp.float32, device=device),
-    ]
+    parts = [wp.array([1], dtype=wp.int32, device=device), wp.array([2.0], dtype=wp.float32, device=device)]
     with pytest.raises(ValueError, match="same dtype"):
         tw.array.pack_1d_arrays(parts)
 

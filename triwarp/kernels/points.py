@@ -3,11 +3,7 @@ from triwarp.kernels import array as kernel_array
 
 
 @wp.kernel
-def aabb_bounds(
-    points: wp.array[wp.vec3],
-    out_min: wp.array[wp.float32],
-    out_max: wp.array[wp.float32],
-) -> None:
+def aabb_bounds(points: wp.array[wp.vec3], out_min: wp.array[wp.float32], out_max: wp.array[wp.float32]) -> None:
     tid = wp.tid()
     p = points[tid]
 
@@ -22,22 +18,13 @@ def aabb_bounds(
 
 
 @wp.kernel
-def bounds_centers(
-    lower: wp.array[wp.vec3],
-    upper: wp.array[wp.vec3],
-    out_centers: wp.array[wp.vec3],
-) -> None:
+def bounds_centers(lower: wp.array[wp.vec3], upper: wp.array[wp.vec3], out_centers: wp.array[wp.vec3]) -> None:
     tid = wp.tid()
     out_centers[tid] = wp.float32(0.5) * (lower[tid] + upper[tid])
 
 
 @wp.func
-def aabb_intersects_cube(
-    p_lower: wp.vec3,
-    p_upper: wp.vec3,
-    q: wp.vec3,
-    h: wp.float32,
-) -> bool:
+def aabb_intersects_cube(p_lower: wp.vec3, p_upper: wp.vec3, q: wp.vec3, h: wp.float32) -> bool:
     q_lower = wp.vec3(q[0] - h, q[1] - h, q[2] - h)
     q_upper = wp.vec3(q[0] + h, q[1] + h, q[2] + h)
     return (
@@ -144,10 +131,7 @@ def query_hashgrid_ball_neighbors(
 
 @wp.kernel
 def query_bvh_aabb_count(
-    queries: wp.array[wp.vec3],
-    bvh_id: wp.uint64,
-    half_extent: wp.float32,
-    out_counts: wp.array[wp.int32],
+    queries: wp.array[wp.vec3], bvh_id: wp.uint64, half_extent: wp.float32, out_counts: wp.array[wp.int32]
 ) -> None:
     tid = wp.tid()
     q = queries[tid]

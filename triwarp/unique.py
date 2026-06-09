@@ -15,37 +15,22 @@ Scalar = TypeVar("Scalar", bound=wp.Scalar)
 # TODO: do a faster unique for 64-bit types
 @overload
 def unique_1d(
-    data: wp.array[Scalar],
-    *,
-    return_inverse: Literal[False] = False,
-    return_counts: Literal[False] = False,
+    data: wp.array[Scalar], *, return_inverse: Literal[False] = False, return_counts: Literal[False] = False
 ) -> wp.array[Scalar]: ...
 @overload
 def unique_1d(
-    data: wp.array[Scalar],
-    *,
-    return_inverse: Literal[True],
-    return_counts: Literal[False] = False,
+    data: wp.array[Scalar], *, return_inverse: Literal[True], return_counts: Literal[False] = False
 ) -> tuple[wp.array[Scalar], wp.array[wp.int32]]: ...
 @overload
 def unique_1d(
-    data: wp.array[Scalar],
-    *,
-    return_inverse: Literal[False] = False,
-    return_counts: Literal[True],
+    data: wp.array[Scalar], *, return_inverse: Literal[False] = False, return_counts: Literal[True]
 ) -> tuple[wp.array[Scalar], wp.array[wp.int32]]: ...
 @overload
 def unique_1d(
-    data: wp.array[Scalar],
-    *,
-    return_inverse: Literal[True],
-    return_counts: Literal[True],
+    data: wp.array[Scalar], *, return_inverse: Literal[True], return_counts: Literal[True]
 ) -> tuple[wp.array[Scalar], wp.array[wp.int32], wp.array[wp.int32]]: ...
 def unique_1d(
-    data: wp.array[Scalar],
-    *,
-    return_inverse: bool = False,
-    return_counts: bool = False,
+    data: wp.array[Scalar], *, return_inverse: bool = False, return_counts: bool = False
 ) -> (
     wp.array[Scalar]
     | tuple[wp.array[Scalar], wp.array[wp.int32]]
@@ -159,10 +144,7 @@ def unique_1d(
 
 
 def _pack_unique_result(
-    unique: wp.array[Scalar],
-    *,
-    inverse: wp.array[wp.int32] | None = None,
-    counts: wp.array[wp.int32] | None = None,
+    unique: wp.array[Scalar], *, inverse: wp.array[wp.int32] | None = None, counts: wp.array[wp.int32] | None = None
 ) -> (
     wp.array[Scalar]
     | tuple[wp.array[Scalar], wp.array[wp.int32]]
@@ -203,9 +185,7 @@ def reinterpret_cast_to_int(
 
 
 def reinterpret_cast_from_int(
-    data: wp.array[wp.int32] | wp.array[wp.int64],
-    dtype: type[Scalar],
-    count: int | None = None,
+    data: wp.array[wp.int32] | wp.array[wp.int64], dtype: type[Scalar], count: int | None = None
 ) -> wp.array[Scalar]:
     n_bits = wp.types.type_size_in_bytes(data.dtype) * 8
     n_target_bits = wp.types.type_size_in_bytes(dtype) * 8

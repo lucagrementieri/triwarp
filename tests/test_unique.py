@@ -124,11 +124,7 @@ reinterpret_cast_test_data = (
 )
 
 
-@pytest.mark.parametrize(
-    "data",
-    reinterpret_cast_test_data,
-    ids=[a.dtype.__name__ for a in reinterpret_cast_test_data],
-)
+@pytest.mark.parametrize("data", reinterpret_cast_test_data, ids=[a.dtype.__name__ for a in reinterpret_cast_test_data])
 def test_reinterpret_cast_int_reciprocity(device: str, data: wp.array[wp.Scalar]):
     as_int = tw.unique.reinterpret_cast_to_int(data.to(device))
     recovered = tw.unique.reinterpret_cast_from_int(as_int, data.dtype)

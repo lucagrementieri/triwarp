@@ -17,10 +17,7 @@ def test_face_adjacency_projections(request: pytest.FixtureRequest, mesh_name: s
 
     adjacency_wp, adjacency_edges_wp = tw.graph.face_adjacency(mesh_wp.indices, return_edges=True)
     projections_wp = tw.convex.face_adjacency_projections(
-        mesh_wp.points,
-        mesh_wp.indices,
-        face_adjacency=adjacency_wp,
-        face_adjacency_edges=adjacency_edges_wp,
+        mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp, face_adjacency_edges=adjacency_edges_wp
     )
 
     adjacency_wp_np = adjacency_wp.numpy()
@@ -45,10 +42,7 @@ def test_face_adjacency_projections_precomputed(request: pytest.FixtureRequest, 
     face_normals_wp, _ = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
 
     projections_all_wp = tw.convex.face_adjacency_projections(
-        mesh_wp.points,
-        mesh_wp.indices,
-        face_adjacency=adjacency_wp,
-        face_adjacency_edges=adjacency_edges_wp,
+        mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp, face_adjacency_edges=adjacency_edges_wp
     )
     projections_precomputed_wp = tw.convex.face_adjacency_projections(
         mesh_wp.points,
@@ -87,10 +81,7 @@ def test_face_adjacency_convex(request: pytest.FixtureRequest, mesh_name: str) -
 
     adjacency_wp, adjacency_edges_wp = tw.graph.face_adjacency(mesh_wp.indices, return_edges=True)
     convex_wp = tw.convex.face_adjacency_convex(
-        mesh_wp.points,
-        mesh_wp.indices,
-        face_adjacency=adjacency_wp,
-        face_adjacency_edges=adjacency_edges_wp,
+        mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp, face_adjacency_edges=adjacency_edges_wp
     )
 
     adjacency_wp_np = adjacency_wp.numpy()
@@ -112,10 +103,7 @@ def test_face_adjacency_convex_precomputed(request: pytest.FixtureRequest, mesh_
     face_normals_wp, _ = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
 
     convex_all_wp = tw.convex.face_adjacency_convex(
-        mesh_wp.points,
-        mesh_wp.indices,
-        face_adjacency=adjacency_wp,
-        face_adjacency_edges=adjacency_edges_wp,
+        mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp, face_adjacency_edges=adjacency_edges_wp
     )
     convex_precomputed_wp = tw.convex.face_adjacency_convex(
         mesh_wp.points,

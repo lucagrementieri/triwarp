@@ -35,13 +35,22 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-exclude = [".git", ".pytest_cache", ".ruff_cache", ".venv", "build", "dist", "reference"]
+exclude = [
+    ".git",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "build",
+    "dist",
+    "reference",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["triwarp"]
+split-on-trailing-comma = false
 
 [tool.ruff.format]
 skip-magic-trailing-comma = true

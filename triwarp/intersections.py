@@ -177,11 +177,7 @@ def mesh_with_mesh(
         ``(m, 2)`` ``wp.vec3`` segment endpoints (logical shape ``(m, 2, 3)``).
     """
     device = vertices_a.device
-    for name, arr in (
-        ("faces_a", faces_a),
-        ("vertices_b", vertices_b),
-        ("faces_b", faces_b),
-    ):
+    for name, arr in (("faces_a", faces_a), ("vertices_b", vertices_b), ("faces_b", faces_b)):
         if arr.device != device:
             raise ValueError(f"vertices_a and {name} must live on the same device, got {device} and {arr.device}")
 
@@ -223,10 +219,7 @@ def mesh_with_mesh(
     )
 
     target_indices, offsets, hit_counts = tw.points.query_bvh_aabb_bounds_with_offsets(
-        bvh,
-        query_lower,
-        query_upper,
-        max_hits=max_triangle_collisions,
+        bvh, query_lower, query_upper, max_hits=max_triangle_collisions
     )
     n_pairs = int(target_indices.shape[0])
     if n_pairs == 0:
@@ -265,12 +258,7 @@ def mesh_with_mesh(
     )
 
     seg_valid = wp.empty(n_hit, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_intersections.segment_nondegenerate,
-        dim=n_hit,
-        inputs=[segments, seg_valid],
-        device=device,
-    )
+    wp.launch(kernel_intersections.segment_nondegenerate, dim=n_hit, inputs=[segments, seg_valid], device=device)
 
     keep = tw.array.flatnonzero(seg_valid)
     n_keep = int(keep.shape[0])

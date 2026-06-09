@@ -142,9 +142,7 @@ def test_face_adjacency_angles(request: pytest.FixtureRequest, mesh_name: str) -
     angles_tm = mesh_tm.face_adjacency_angles
 
     adjacency_wp = tw.graph.face_adjacency(mesh_wp.indices)
-    angles_wp = tw.graph.face_adjacency_angles(
-        mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp
-    )
+    angles_wp = tw.graph.face_adjacency_angles(mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp)
 
     adjacency_wp_np = adjacency_wp.numpy()
     angles_wp_np = angles_wp.numpy()
@@ -162,14 +160,9 @@ def test_face_adjacency_angles_precomputed(request: pytest.FixtureRequest, mesh_
     adjacency_wp = tw.graph.face_adjacency(mesh_wp.indices)
     face_normals_wp, _ = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
 
-    angles_all_wp = tw.graph.face_adjacency_angles(
-        mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp
-    )
+    angles_all_wp = tw.graph.face_adjacency_angles(mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp)
     angles_precomputed_wp = tw.graph.face_adjacency_angles(
-        mesh_wp.points,
-        mesh_wp.indices,
-        face_adjacency=adjacency_wp,
-        face_normals=face_normals_wp,
+        mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp, face_normals=face_normals_wp
     )
     assert np.allclose(angles_all_wp.numpy(), angles_precomputed_wp.numpy(), rtol=1e-5, atol=1e-5)
 

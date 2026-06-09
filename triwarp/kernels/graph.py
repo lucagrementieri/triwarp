@@ -4,10 +4,7 @@ from triwarp.kernels import array as kernel_array
 
 
 @wp.kernel
-def faces_to_edges(
-    faces: wp.array[wp.int32],
-    out_edges: wp.array2d[wp.int32],
-) -> None:
+def faces_to_edges(faces: wp.array[wp.int32], out_edges: wp.array2d[wp.int32]) -> None:
     tid = int(wp.tid())
     f = tid * 3
     i0 = faces[f + 0]
@@ -22,10 +19,7 @@ def faces_to_edges(
 
 
 @wp.kernel
-def faces_to_edges_sorted(
-    faces: wp.array[wp.int32],
-    out_edges: wp.array2d[wp.int32],
-) -> None:
+def faces_to_edges_sorted(faces: wp.array[wp.int32], out_edges: wp.array2d[wp.int32]) -> None:
     tid = int(wp.tid())
     f = tid * 3
     i0 = faces[f + 0]
@@ -41,9 +35,7 @@ def faces_to_edges_sorted(
 
 @wp.kernel
 def edge_pair_winding_mask(
-    edges: wp.array2d[wp.int32],
-    edge_groups: wp.array2d[wp.int32],
-    out_consistent: wp.array[wp.bool],
+    edges: wp.array2d[wp.int32], edge_groups: wp.array2d[wp.int32], out_consistent: wp.array[wp.bool]
 ) -> None:
     tid = int(wp.tid())
     i0 = edge_groups[tid, 0]
@@ -52,11 +44,7 @@ def edge_pair_winding_mask(
 
 
 @wp.kernel
-def edges_to_adjacency(
-    edges: wp.array2d[wp.int32],
-    out_rows: wp.array[wp.int32],
-    out_cols: wp.array[wp.int32],
-) -> None:
+def edges_to_adjacency(edges: wp.array2d[wp.int32], out_rows: wp.array[wp.int32], out_cols: wp.array[wp.int32]) -> None:
     tid = int(wp.tid())
     a = edges[tid, 0]
     b = edges[tid, 1]
@@ -105,9 +93,7 @@ def face_adjacency_unshared(
 
 @wp.kernel
 def face_adjacency_angles(
-    face_normals: wp.array[wp.vec3],
-    face_adjacency: wp.array2d[wp.int32],
-    out_angles: wp.array[wp.float32],
+    face_normals: wp.array[wp.vec3], face_adjacency: wp.array2d[wp.int32], out_angles: wp.array[wp.float32]
 ) -> None:
     tid = int(wp.tid())
     normal_a = face_normals[face_adjacency[tid, 0]]

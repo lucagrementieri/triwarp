@@ -24,11 +24,7 @@ def triangle_case_code(s0: wp.int32, s1: wp.int32, s2: wp.int32) -> wp.int32:
 
 @wp.func
 def plane_with_line(
-    plane_origin: wp.vec3,
-    plane_normal: wp.vec3,
-    p0: wp.vec3,
-    p1: wp.vec3,
-    line_segments: wp.bool,
+    plane_origin: wp.vec3, plane_normal: wp.vec3, p0: wp.vec3, p1: wp.vec3, line_segments: wp.bool
 ) -> tuple[wp.vec3, wp.bool]:
     line_dir = wp.normalize(p1 - p0)
     n = wp.normalize(plane_normal)
@@ -127,10 +123,7 @@ def mesh_with_plane_segment_for_face(
 
 @wp.kernel
 def vertex_plane_dots(
-    vertices: wp.array[wp.vec3],
-    plane_origin: wp.vec3,
-    plane_normal: wp.vec3,
-    out_dots: wp.array[wp.float32],
+    vertices: wp.array[wp.vec3], plane_origin: wp.vec3, plane_normal: wp.vec3, out_dots: wp.array[wp.float32]
 ) -> None:
     tid = wp.tid()
     out_dots[tid] = wp.dot(vertices[tid] - plane_origin, plane_normal)
@@ -217,10 +210,7 @@ def interval_intersect(a: wp.vec2, b: wp.vec2) -> wp.vec2:
 
 @wp.func
 def intersection_line_coordinate(
-    start1: wp.vec3,
-    direction1: wp.vec3,
-    start2: wp.vec3,
-    direction2: wp.vec3,
+    start1: wp.vec3, direction1: wp.vec3, start2: wp.vec3, direction2: wp.vec3
 ) -> wp.float32:
     minors = wp.cross(direction1, direction2)
     order_x, order_y, order_z = vec3_argsort(minors)
@@ -239,27 +229,16 @@ def intersection_line_coordinate(
 @wp.func
 def triangle_aabb(v0: wp.vec3, v1: wp.vec3, v2: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
     lower = wp.vec3(
-        wp.min(v0[0], wp.min(v1[0], v2[0])),
-        wp.min(v0[1], wp.min(v1[1], v2[1])),
-        wp.min(v0[2], wp.min(v1[2], v2[2])),
+        wp.min(v0[0], wp.min(v1[0], v2[0])), wp.min(v0[1], wp.min(v1[1], v2[1])), wp.min(v0[2], wp.min(v1[2], v2[2]))
     )
     upper = wp.vec3(
-        wp.max(v0[0], wp.max(v1[0], v2[0])),
-        wp.max(v0[1], wp.max(v1[1], v2[1])),
-        wp.max(v0[2], wp.max(v1[2], v2[2])),
+        wp.max(v0[0], wp.max(v1[0], v2[0])), wp.max(v0[1], wp.max(v1[1], v2[1])), wp.max(v0[2], wp.max(v1[2], v2[2]))
     )
     return lower, upper
 
 
 @wp.func
-def triangles_share_vertex(
-    a0: wp.vec3,
-    a1: wp.vec3,
-    a2: wp.vec3,
-    b0: wp.vec3,
-    b1: wp.vec3,
-    b2: wp.vec3,
-) -> wp.bool:
+def triangles_share_vertex(a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3) -> wp.bool:
     return (
         vec3_equal(a0, b0)
         or vec3_equal(a0, b1)
@@ -283,13 +262,7 @@ def axis_interval_projection(axis: wp.vec3, v0: wp.vec3, v1: wp.vec3, v2: wp.vec
 
 @wp.func
 def overlaps_along_axis(
-    axis: wp.vec3,
-    a0: wp.vec3,
-    a1: wp.vec3,
-    a2: wp.vec3,
-    b0: wp.vec3,
-    b1: wp.vec3,
-    b2: wp.vec3,
+    axis: wp.vec3, a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3
 ) -> wp.bool:
     interval_a = axis_interval_projection(axis, a0, a1, a2)
     interval_b = axis_interval_projection(axis, b0, b1, b2)
@@ -297,14 +270,7 @@ def overlaps_along_axis(
 
 
 @wp.func
-def triangles_intersect_sat(
-    a0: wp.vec3,
-    a1: wp.vec3,
-    a2: wp.vec3,
-    b0: wp.vec3,
-    b1: wp.vec3,
-    b2: wp.vec3,
-) -> wp.bool:
+def triangles_intersect_sat(a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3) -> wp.bool:
     edge0 = a1 - a0
     edge1 = a2 - a0
     edge2 = a2 - a1
@@ -357,12 +323,7 @@ def triangles_intersect_sat(
 
 @wp.func
 def triangle_intersection_segment(
-    a0: wp.vec3,
-    a1: wp.vec3,
-    a2: wp.vec3,
-    b0: wp.vec3,
-    b1: wp.vec3,
-    b2: wp.vec3,
+    a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3
 ) -> tuple[wp.bool, wp.vec3, wp.vec3]:
     edge0 = a1 - a0
     edge1 = a2 - a0
@@ -385,12 +346,9 @@ def triangle_intersection_segment(
     line_origin = (va_min * proj1c - va_max * proj1a) / (proj1c - proj1a)
     line_direction = wp.cross(normal, other_normal)
 
-    edge_direction = vertex_at(
-        order1_x if proj1b >= wp.float32(0.0) else order1_z,
-        a0,
-        a1,
-        a2,
-    ) - vertex_at(order1_y, a0, a1, a2)
+    edge_direction = vertex_at(order1_x if proj1b >= wp.float32(0.0) else order1_z, a0, a1, a2) - vertex_at(
+        order1_y, a0, a1, a2
+    )
     t2 = intersection_line_coordinate(line_origin, line_direction, vertex_at(order1_y, a0, a1, a2), edge_direction)
 
     if t2 > wp.float32(0.0):
@@ -402,10 +360,7 @@ def triangle_intersection_segment(
     edge_direction = vertex_at(order2_z, b0, b1, b2) - vertex_at(order2_x, b0, b1, b2)
     s1 = intersection_line_coordinate(line_origin, line_direction, vertex_at(order2_x, b0, b1, b2), edge_direction)
     edge_direction = vertex_at(
-        order2_x if vec3_get(proj2, order2_y) >= wp.float32(0.0) else order2_z,
-        b0,
-        b1,
-        b2,
+        order2_x if vec3_get(proj2, order2_y) >= wp.float32(0.0) else order2_z, b0, b1, b2
     ) - vertex_at(order2_y, b0, b1, b2)
     s2 = intersection_line_coordinate(line_origin, line_direction, vertex_at(order2_y, b0, b1, b2), edge_direction)
 
@@ -423,9 +378,7 @@ def triangle_intersection_segment(
 
 @wp.func
 def face_vertices(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    face_index: wp.int32,
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], face_index: wp.int32
 ) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
     base = face_index * wp.int32(3)
     i0 = faces[base]
@@ -436,10 +389,7 @@ def face_vertices(
 
 @wp.kernel
 def face_aabb_bounds(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    out_lower: wp.array[wp.vec3],
-    out_upper: wp.array[wp.vec3],
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_lower: wp.array[wp.vec3], out_upper: wp.array[wp.vec3]
 ) -> None:
     f = wp.tid()
     v0, v1, v2 = face_vertices(vertices, faces, wp.int32(f))
@@ -504,10 +454,7 @@ def triangle_pair_segments(
 
 
 @wp.kernel
-def segment_nondegenerate(
-    segments: wp.array2d[wp.vec3],
-    out_valid: wp.array[wp.bool],
-) -> None:
+def segment_nondegenerate(segments: wp.array2d[wp.vec3], out_valid: wp.array[wp.bool]) -> None:
     tid = wp.tid()
     p0 = segments[tid, 0]
     p1 = segments[tid, 1]

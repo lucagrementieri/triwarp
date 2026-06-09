@@ -45,11 +45,7 @@ def face_normals_and_areas(
 
 
 @wp.kernel
-def angles(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    out_angles: wp.array2d[wp.float32],
-) -> None:
+def angles(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_angles: wp.array2d[wp.float32]) -> None:
     f = wp.tid()
     edges = triangle_edges(vertices, faces[f * 3 : (f + 1) * 3])
 
@@ -90,11 +86,7 @@ def centroid(
 
 
 @wp.kernel
-def nondegenerate(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    out_nondegenerate: wp.array[wp.bool],
-) -> None:
+def nondegenerate(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_nondegenerate: wp.array[wp.bool]) -> None:
     f = wp.tid()
     triangle_face = faces[f * 3 : (f + 1) * 3]
     e0, e1, _ = triangle_edges(vertices, triangle_face)
@@ -172,10 +164,7 @@ def points_to_barycentric_cross(
 
 @wp.kernel
 def closest_point(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    points: wp.array[wp.vec3],
-    out_closest: wp.array[wp.vec3],
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], points: wp.array[wp.vec3], out_closest: wp.array[wp.vec3]
 ) -> None:
     f = wp.tid()
     triangle_face = faces[f * 3 : (f + 1) * 3]
@@ -226,7 +215,9 @@ def closest_point(
 
     # check if P in edge region of BC, if so return projection of P onto BC
     va = (d3 * d6) - (d5 * d4)
-    is_bc = va < TOLERANCE_ZERO_CONSTANT and (d4 - d3) > -TOLERANCE_ZERO_CONSTANT and (d5 - d6) > -TOLERANCE_ZERO_CONSTANT
+    is_bc = (
+        va < TOLERANCE_ZERO_CONSTANT and (d4 - d3) > -TOLERANCE_ZERO_CONSTANT and (d5 - d6) > -TOLERANCE_ZERO_CONSTANT
+    )
     if is_bc:
         d43 = d4 - d3
         w = d43 / (d43 + (d5 - d6))

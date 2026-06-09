@@ -110,20 +110,14 @@ def mark_membership_mask(indices: wp.array[wp.int32], mask: wp.array[wp.bool]) -
 
 
 @wp.kernel
-def isin_lookup_mask(
-    elements: wp.array[wp.int32],
-    membership: wp.array[wp.bool],
-    out_mask: wp.array[wp.bool],
-) -> None:
+def isin_lookup_mask(elements: wp.array[wp.int32], membership: wp.array[wp.bool], out_mask: wp.array[wp.bool]) -> None:
     tid = int(wp.tid())
     out_mask[tid] = membership[elements[tid]]
 
 
 @wp.kernel
 def isin_lookup_sorted(
-    elements: wp.array[wp.int32],
-    sorted_test: wp.array[wp.int32],
-    out_mask: wp.array[wp.bool],
+    elements: wp.array[wp.int32], sorted_test: wp.array[wp.int32], out_mask: wp.array[wp.bool]
 ) -> None:
     tid = int(wp.tid())
     value = elements[tid]
@@ -133,9 +127,7 @@ def isin_lookup_sorted(
 
 @wp.kernel
 def scatter_compact_indices(
-    mask: wp.array[wp.bool],
-    exclusive_offsets: wp.array[wp.int32],
-    out_indices: wp.array[wp.int32],
+    mask: wp.array[wp.bool], exclusive_offsets: wp.array[wp.int32], out_indices: wp.array[wp.int32]
 ) -> None:
     i = int(wp.tid())
     if mask[i]:
@@ -149,11 +141,7 @@ def vector_angle_vec(a: wp.vec3, b: wp.vec3) -> wp.float32:
 
 
 @wp.kernel
-def vector_angle(
-    a: wp.array[wp.vec3],
-    b: wp.array[wp.vec3],
-    out_angles: wp.array[wp.float32],
-) -> None:
+def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3], out_angles: wp.array[wp.float32]) -> None:
     tid = int(wp.tid())
     out_angles[tid] = vector_angle_vec(a[tid], b[tid])
 

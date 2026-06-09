@@ -249,11 +249,7 @@ def max_2d_cols(values: wp.array2d[wp.Scalar], out_max: wp.array[wp.Scalar]) -> 
 
 
 @wp.kernel
-def minmax_2d_rows(
-    values: wp.array2d[wp.Scalar],
-    out_min: wp.array[wp.Scalar],
-    out_max: wp.array[wp.Scalar],
-) -> None:
+def minmax_2d_rows(values: wp.array2d[wp.Scalar], out_min: wp.array[wp.Scalar], out_max: wp.array[wp.Scalar]) -> None:
     """axis=1: one thread per row, min and max across columns."""
     i = int(wp.tid())
     vmin = values[i, 0]
@@ -267,11 +263,7 @@ def minmax_2d_rows(
 
 
 @wp.kernel
-def minmax_2d_cols(
-    values: wp.array2d[wp.Scalar],
-    out_min: wp.array[wp.Scalar],
-    out_max: wp.array[wp.Scalar],
-) -> None:
+def minmax_2d_cols(values: wp.array2d[wp.Scalar], out_min: wp.array[wp.Scalar], out_max: wp.array[wp.Scalar]) -> None:
     """axis=0: one thread per column, min and max across rows."""
     i = int(wp.tid())
     vmin = values[0, i]

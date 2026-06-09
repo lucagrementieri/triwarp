@@ -84,9 +84,7 @@ def weighted_vertex_normals(
     return vec_normals
 
 
-def vertex_defects(
-    n_vertices: int, faces: wp.array[wp.int32], face_angles: twt.Array2dFloat32
-) -> wp.array[wp.float32]:
+def vertex_defects(n_vertices: int, faces: wp.array[wp.int32], face_angles: twt.Array2dFloat32) -> wp.array[wp.float32]:
     """
     Discrete angle defect per vertex: ``2π`` minus the sum of incident corner angles.
 

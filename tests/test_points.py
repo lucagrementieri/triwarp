@@ -44,10 +44,7 @@ def test_query_ball_single(device: str, backend: Literal["bvh", "hashgrid"]):
     )
     assert np.array_equal(np.sort(query_indices_unsorted_wp.numpy()), np.sort(query_indices_wp.numpy()))
     assert np.allclose(
-        np.sort(query_distances_unsorted_wp.numpy()),
-        np.sort(query_distances_wp.numpy()),
-        rtol=1e-5,
-        atol=1e-5,
+        np.sort(query_distances_unsorted_wp.numpy()), np.sort(query_distances_wp.numpy()), rtol=1e-5, atol=1e-5
     )
 
 
@@ -93,20 +90,14 @@ def test_query_ball_batch(device: str, backend: Literal["bvh", "hashgrid"]):
     for single_query_indices_wp, single_query_indices_np in zip(query_indices_wp, query_indices_np):
         assert np.array_equal(single_query_indices_wp.numpy(), single_query_indices_np)
     for single_query_distances_wp, single_query_distances_np in zip(query_distances_wp, query_distances_np):
-        assert np.allclose(
-            single_query_distances_wp.numpy(),
-            single_query_distances_np,
-            rtol=1e-5,
-            atol=1e-5,
-        )
+        assert np.allclose(single_query_distances_wp.numpy(), single_query_distances_np, rtol=1e-5, atol=1e-5)
 
     query_indices_unsorted_wp, query_distances_unsorted_wp = query_ball(
         points_wp, query_wp, radius, return_sorted=False
     )
     for single_query_indices_unsorted_wp, single_query_indices_wp in zip(query_indices_unsorted_wp, query_indices_wp):
         assert np.array_equal(
-            np.sort(single_query_indices_unsorted_wp.numpy()),
-            np.sort(single_query_indices_wp.numpy()),
+            np.sort(single_query_indices_unsorted_wp.numpy()), np.sort(single_query_indices_wp.numpy())
         )
     for single_query_distances_unsorted_wp, single_query_distances_wp in zip(
         query_distances_unsorted_wp, query_distances_wp
@@ -230,10 +221,7 @@ def test_query_bvh_aabb_bounds_with_offsets(device: str) -> None:
 
     bvh = tw.points.bvh_from_bounds(lower_wp, upper_wp)
     indices_wp, offsets_wp, hit_counts_wp = tw.points.query_bvh_aabb_bounds_with_offsets(
-        bvh,
-        query_lower_wp,
-        query_upper_wp,
-        max_hits=16,
+        bvh, query_lower_wp, query_upper_wp, max_hits=16
     )
 
     indices_np = indices_wp.numpy()

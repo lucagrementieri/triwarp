@@ -41,12 +41,7 @@ def half_torus(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
 
 @pytest.fixture
 def cave_cube(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
-    mesh = tm.boolean.difference(
-        [
-            tm.creation.box(extents=[1.0, 1.0, 1.0]),
-            tm.creation.box(extents=[0.1, 0.1, 0.1]),
-        ]
-    )
+    mesh = tm.boolean.difference([tm.creation.box(extents=[1.0, 1.0, 1.0]), tm.creation.box(extents=[0.1, 0.1, 0.1])])
     return mesh, trimesh_to_warp(mesh, device)
 
 

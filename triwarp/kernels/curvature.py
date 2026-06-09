@@ -5,10 +5,7 @@ from triwarp.kernels import array as kernel_array
 
 @wp.func
 def line_ball_intersection_segment(
-    start_point: wp.vec3,
-    end_point: wp.vec3,
-    center: wp.vec3,
-    radius: wp.float32,
+    start_point: wp.vec3, end_point: wp.vec3, center: wp.vec3, radius: wp.float32
 ) -> wp.float32:
     L = end_point - start_point
     oc = start_point - center
@@ -41,16 +38,8 @@ def edge_aabb_from_endpoints(
     tid = int(wp.tid())
     v0 = vertices[face_adjacency_edges[tid, 0]]
     v1 = vertices[face_adjacency_edges[tid, 1]]
-    out_lower[tid] = wp.vec3(
-        wp.min(v0[0], v1[0]),
-        wp.min(v0[1], v1[1]),
-        wp.min(v0[2], v1[2]),
-    )
-    out_upper[tid] = wp.vec3(
-        wp.max(v0[0], v1[0]),
-        wp.max(v0[1], v1[1]),
-        wp.max(v0[2], v1[2]),
-    )
+    out_lower[tid] = wp.vec3(wp.min(v0[0], v1[0]), wp.min(v0[1], v1[1]), wp.min(v0[2], v1[2]))
+    out_upper[tid] = wp.vec3(wp.max(v0[0], v1[0]), wp.max(v0[1], v1[1]), wp.max(v0[2], v1[2]))
 
 
 @wp.kernel

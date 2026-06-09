@@ -52,10 +52,7 @@ def sample_surface(
     """
     n_faces = faces.shape[0] // 3
     if count == 0:
-        return (
-            wp.empty(0, dtype=wp.vec3, device=vertices.device),
-            wp.empty(0, dtype=wp.int32, device=vertices.device),
-        )
+        return (wp.empty(0, dtype=wp.vec3, device=vertices.device), wp.empty(0, dtype=wp.int32, device=vertices.device))
     if face_weight is not None and face_weight.shape[0] != n_faces:
         raise ValueError(
             f"face_weight length must match number of triangles (expected {n_faces}, got {face_weight.shape[0]})"
@@ -78,14 +75,7 @@ def sample_surface(
     wp.launch(
         kernel_sample.sample_surface,
         dim=count,
-        inputs=[
-            vertices,
-            faces,
-            cdf,
-            get_seed(seed),
-            out_points,
-            out_face_indices,
-        ],
+        inputs=[vertices, faces, cdf, get_seed(seed), out_points, out_face_indices],
         device=vertices.device,
     )
     return out_points, out_face_indices

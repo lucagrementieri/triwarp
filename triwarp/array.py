@@ -132,10 +132,7 @@ def index_sparse(
     )
 
 
-def isin(
-    elements: twt.Array1dInt32 | twt.Array2dInt32,
-    test_elements: twt.Array1dInt32,
-) -> wp.array[wp.bool]:
+def isin(elements: twt.Array1dInt32 | twt.Array2dInt32, test_elements: twt.Array1dInt32) -> wp.array[wp.bool]:
     """
     Test whether each element appears in ``test_elements`` (``numpy.isin`` for ``int32``).
 
@@ -205,19 +202,12 @@ def _sorted_int32_copy(values: wp.array[wp.int32]) -> wp.array[wp.int32]:
 
 
 def _isin_lookup_mask(
-    elements_flat: wp.array[wp.int32],
-    test_elements: wp.array[wp.int32],
-    max_index: int,
+    elements_flat: wp.array[wp.int32], test_elements: wp.array[wp.int32], max_index: int
 ) -> wp.array[wp.bool]:
     k = int(test_elements.shape[0])
     device = elements_flat.device
     membership_wp = wp.zeros(max_index, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_array.mark_membership_mask,
-        dim=k,
-        inputs=[test_elements, membership_wp],
-        device=device,
-    )
+    wp.launch(kernel_array.mark_membership_mask, dim=k, inputs=[test_elements, membership_wp], device=device)
     out_wp = wp.empty(elements_flat.shape, dtype=wp.bool, device=device)
     wp.launch(
         kernel_array.isin_lookup_mask,
@@ -228,10 +218,7 @@ def _isin_lookup_mask(
     return out_wp
 
 
-def _isin_lookup_sorted(
-    elements_flat: wp.array[wp.int32],
-    test_elements: wp.array[wp.int32],
-) -> wp.array[wp.bool]:
+def _isin_lookup_sorted(elements_flat: wp.array[wp.int32], test_elements: wp.array[wp.int32]) -> wp.array[wp.bool]:
     device = elements_flat.device
     sorted_test_wp = _sorted_int32_copy(test_elements)
     out_wp = wp.empty(elements_flat.shape, dtype=wp.bool, device=device)
@@ -284,12 +271,7 @@ def flatnonzero(mask: wp.array[wp.bool]) -> wp.array[wp.int32]:
         return wp.empty(0, dtype=wp.int32, device=device)
 
     out_indices = wp.empty(n_out, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_array.scatter_compact_indices,
-        dim=n,
-        inputs=[mask, exclusive, out_indices],
-        device=device,
-    )
+    wp.launch(kernel_array.scatter_compact_indices, dim=n, inputs=[mask, exclusive, out_indices], device=device)
     return out_indices
 
 

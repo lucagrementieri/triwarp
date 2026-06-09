@@ -96,9 +96,7 @@ def submesh_from_face_indices(
 
 
 def submesh_from_face_mask(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    face_mask: wp.array[wp.bool],
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], face_mask: wp.array[wp.bool]
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
     Extract a face subset selected by a per-face boolean mask.
@@ -230,10 +228,7 @@ def submesh_from_vertex_mask(
 
 
 def face_indices_from_vertex_indices(
-    faces: wp.array[wp.int32],
-    vertex_indices: wp.array[wp.int32],
-    *,
-    face_mode: Literal["all", "any"] = "all",
+    faces: wp.array[wp.int32], vertex_indices: wp.array[wp.int32], *, face_mode: Literal["all", "any"] = "all"
 ) -> wp.array[wp.int32]:
     """
     Face indices whose vertex indices match a set under an all/any rule.
