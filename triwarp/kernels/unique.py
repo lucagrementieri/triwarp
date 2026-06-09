@@ -13,7 +13,10 @@ def mark_run_starts(values: wp.array[wp.Scalar], out_starts: wp.array[wp.int32])
 
 @wp.kernel
 def scatter_from_masked_indices(
-    values: wp.array[wp.Scalar], mask: wp.array[wp.int32], indices: wp.array[wp.int32], out_values: wp.array[wp.Scalar]
+    values: wp.array[wp.Scalar],
+    mask: wp.array[wp.int32],
+    indices: wp.array[wp.int32],
+    out_values: wp.array[wp.Scalar],
 ) -> None:
     i = int(wp.tid())
     if mask[i] == 1:

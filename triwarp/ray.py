@@ -12,21 +12,33 @@ from triwarp.points import aabb_bounds
 def _default_max_t(mesh: wp.Mesh, ray_origins: wp.array[wp.vec3]) -> float:
     mesh_min, mesh_max = aabb_bounds(mesh.points)
     ray_min, ray_max = aabb_bounds(ray_origins)
-    combined_min = wp.vec3(min(mesh_min[0], ray_min[0]), min(mesh_min[1], ray_min[1]), min(mesh_min[2], ray_min[2]))
-    combined_max = wp.vec3(max(mesh_max[0], ray_max[0]), max(mesh_max[1], ray_max[1]), max(mesh_max[2], ray_max[2]))
+    combined_min = wp.vec3(
+        min(mesh_min[0], ray_min[0]), min(mesh_min[1], ray_min[1]), min(mesh_min[2], ray_min[2])
+    )
+    combined_max = wp.vec3(
+        max(mesh_max[0], ray_max[0]), max(mesh_max[1], ray_max[1]), max(mesh_max[2], ray_max[2])
+    )
     return float(wp.length(combined_max - combined_min))
 
 
-def _validate_ray_inputs(mesh: wp.Mesh, ray_origins: wp.array[wp.vec3], ray_directions: wp.array[wp.vec3]) -> None:
+def _validate_ray_inputs(
+    mesh: wp.Mesh, ray_origins: wp.array[wp.vec3], ray_directions: wp.array[wp.vec3]
+) -> None:
     if ray_origins.shape != ray_directions.shape:
         raise ValueError("Ray origin and direction don't match!")
     if mesh.device != ray_origins.device or mesh.device != ray_directions.device:
         devices = f"{mesh.device}, {ray_origins.device}, {ray_directions.device}"
-        raise ValueError(f"mesh, ray_origins, and ray_directions must live on the same device, got {devices}")
+        raise ValueError(
+            f"mesh, ray_origins, and ray_directions must live on the same device, got {devices}"
+        )
 
 
 def intersects_location(
-    mesh: wp.Mesh, ray_origins: wp.array[wp.vec3], ray_directions: wp.array[wp.vec3], *, max_t: float | None = None
+    mesh: wp.Mesh,
+    ray_origins: wp.array[wp.vec3],
+    ray_directions: wp.array[wp.vec3],
+    *,
+    max_t: float | None = None,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32]]:
     """Return world-space locations where rays hit the mesh surface (first hit per ray).
 
@@ -70,7 +82,14 @@ def intersects_location(
     wp.launch(
         kernel_ray.intersects_first_detail,
         dim=n,
-        inputs=[mesh.id, ray_origins, ray_directions, wp.float32(max_t), faces_dense, locations_dense],
+        inputs=[
+            mesh.id,
+            ray_origins,
+            ray_directions,
+            wp.float32(max_t),
+            faces_dense,
+            locations_dense,
+        ],
         device=device,
     )
 
@@ -86,7 +105,11 @@ def intersects_location(
 
 
 def intersects_first(
-    mesh: wp.Mesh, ray_origins: wp.array[wp.vec3], ray_directions: wp.array[wp.vec3], *, max_t: float | None = None
+    mesh: wp.Mesh,
+    ray_origins: wp.array[wp.vec3],
+    ray_directions: wp.array[wp.vec3],
+    *,
+    max_t: float | None = None,
 ) -> wp.array[wp.int32]:
     """Find the index of the first triangle each ray hits.
 
@@ -129,7 +152,11 @@ def intersects_first(
 
 
 def intersects_any(
-    mesh: wp.Mesh, ray_origins: wp.array[wp.vec3], ray_directions: wp.array[wp.vec3], *, max_t: float | None = None
+    mesh: wp.Mesh,
+    ray_origins: wp.array[wp.vec3],
+    ray_directions: wp.array[wp.vec3],
+    *,
+    max_t: float | None = None,
 ) -> wp.array[wp.bool]:
     """Check whether each ray hits the mesh surface.
 
@@ -202,7 +229,9 @@ def contains_points(
     if n == 0:
         return wp.empty(0, dtype=wp.bool, device=points.device)
     if mesh.device != points.device:
-        raise ValueError(f"mesh and points must live on the same device, got {mesh.device} vs {points.device}")
+        raise ValueError(
+            f"mesh and points must live on the same device, got {mesh.device} vs {points.device}"
+        )
 
     mesh_min, mesh_max = aabb_bounds(mesh.points)
     max_dist = wp.length(mesh_max - mesh_min)

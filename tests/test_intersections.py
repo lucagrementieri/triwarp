@@ -26,11 +26,22 @@ def _canonical_segments(lines_np: np.ndarray) -> np.ndarray:
         pairs.append(np.concatenate([a, b]))
     ordered = np.array(pairs)
     return ordered[
-        np.lexsort((ordered[:, 3], ordered[:, 4], ordered[:, 5], ordered[:, 0], ordered[:, 1], ordered[:, 2]))
+        np.lexsort(
+            (
+                ordered[:, 3],
+                ordered[:, 4],
+                ordered[:, 5],
+                ordered[:, 0],
+                ordered[:, 1],
+                ordered[:, 2],
+            )
+        )
     ].reshape(-1, 2, 3)
 
 
-def _segments_equal(got_np: np.ndarray, exp_np: np.ndarray, *, rtol: float = 1e-5, atol: float = 1e-5) -> bool:
+def _segments_equal(
+    got_np: np.ndarray, exp_np: np.ndarray, *, rtol: float = 1e-5, atol: float = 1e-5
+) -> bool:
     got = _canonical_segments(got_np.reshape(-1, 2, 3))
     exp = _canonical_segments(exp_np.reshape(-1, 2, 3))
     if got.shape != exp.shape:
@@ -44,7 +55,11 @@ def test_segments_with_plane_axis_aligned(device: str) -> None:
     plane_origin = np.array([0.0, 0.0, 0.0], dtype=np.float32)
     plane_normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
     endpoints_np = np.array(
-        [[[0.0, 0.0, -1.0], [0.0, 0.0, 1.0]], [[1.0, 0.0, 1.0], [1.0, 0.0, 2.0]], [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]],
+        [
+            [[0.0, 0.0, -1.0], [0.0, 0.0, 1.0]],
+            [[1.0, 0.0, 1.0], [1.0, 0.0, 2.0]],
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        ],
         dtype=np.float32,
     )
     endpoints_np = np.transpose(endpoints_np, (1, 0, 2))
@@ -63,7 +78,9 @@ def test_segments_with_plane_axis_aligned(device: str) -> None:
     )
 
     assert np.array_equal(valid_wp.numpy(), valid_tm)
-    assert np.allclose(intersections_wp.numpy()[valid_wp.numpy()], intersections_tm, rtol=1e-5, atol=1e-5)
+    assert np.allclose(
+        intersections_wp.numpy()[valid_wp.numpy()], intersections_tm, rtol=1e-5, atol=1e-5
+    )
 
 
 def test_segments_with_plane_parallel(device: str) -> None:
@@ -71,7 +88,9 @@ def test_segments_with_plane_parallel(device: str) -> None:
     plane_normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
     endpoints_np = np.array([[[0.0, 0.0, 1.0], [1.0, 0.0, 1.0]]], dtype=np.float32)
     endpoints_np = np.transpose(endpoints_np, (1, 0, 2))
-    _, valid_tm = tm_intersections.plane_lines(plane_origin, plane_normal, endpoints_np, line_segments=True)
+    _, valid_tm = tm_intersections.plane_lines(
+        plane_origin, plane_normal, endpoints_np, line_segments=True
+    )
 
     start_points_wp = wp.array(endpoints_np[0], dtype=wp.vec3, device=device)
     end_points_wp = wp.array(endpoints_np[1], dtype=wp.vec3, device=device)
@@ -88,7 +107,9 @@ def test_segments_with_plane_parallel(device: str) -> None:
 def test_mesh_with_plane_empty(device: str) -> None:
     vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    lines_wp = tw.intersections.mesh_with_plane(vertices_wp, faces_wp, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0))
+    lines_wp = tw.intersections.mesh_with_plane(
+        vertices_wp, faces_wp, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0)
+    )
     assert lines_wp.shape == (0, 2)
 
 
@@ -98,10 +119,16 @@ def test_mesh_with_plane_axis_planes(request: pytest.FixtureRequest, mesh_name: 
 
     bounds = mesh_tm.bounds
     mid = 0.5 * (bounds[0] + bounds[1])
-    planes = [(np.array([0.0, 0.0, 1.0]), mid), (np.array([1.0, 0.0, 0.0]), mid), (np.array([0.0, 1.0, 0.0]), mid)]
+    planes = [
+        (np.array([0.0, 0.0, 1.0]), mid),
+        (np.array([1.0, 0.0, 0.0]), mid),
+        (np.array([0.0, 1.0, 0.0]), mid),
+    ]
 
     for plane_normal, plane_origin in planes:
-        lines_tm = tm_intersections.mesh_plane(mesh=mesh_tm, plane_normal=plane_normal, plane_origin=plane_origin)
+        lines_tm = tm_intersections.mesh_plane(
+            mesh=mesh_tm, plane_normal=plane_normal, plane_origin=plane_origin
+        )
         lines_wp = tw.intersections.mesh_with_plane(
             mesh_wp.points,
             mesh_wp.indices,
@@ -121,9 +148,14 @@ def test_mesh_with_plane_tilted_plane(request: pytest.FixtureRequest, mesh_name:
     plane_normal = tm.transform_points([[0.0, 0.0, 1.0]], base, translate=False)[0]
     plane_origin = tm.transform_points([mesh_tm.centroid], base)[0]
 
-    lines_tm = tm_intersections.mesh_plane(mesh=mesh_tm, plane_normal=plane_normal, plane_origin=plane_origin)
+    lines_tm = tm_intersections.mesh_plane(
+        mesh=mesh_tm, plane_normal=plane_normal, plane_origin=plane_origin
+    )
     lines_wp = tw.intersections.mesh_with_plane(
-        mesh_wp.points, mesh_wp.indices, wp.vec3(*plane_normal.tolist()), wp.vec3(*plane_origin.tolist())
+        mesh_wp.points,
+        mesh_wp.indices,
+        wp.vec3(*plane_normal.tolist()),
+        wp.vec3(*plane_origin.tolist()),
     )
     assert _segments_equal(lines_wp.numpy(), lines_tm)
 
@@ -154,13 +186,18 @@ def test_mesh_with_plane_miss_plane(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> 
     plane_origin = mesh_tm.bounds[1] + np.array([0.0, 0.0, 10.0])
 
     lines_wp = tw.intersections.mesh_with_plane(
-        mesh_wp.points, mesh_wp.indices, wp.vec3(*plane_normal.tolist()), wp.vec3(*plane_origin.tolist())
+        mesh_wp.points,
+        mesh_wp.indices,
+        wp.vec3(*plane_normal.tolist()),
+        wp.vec3(*plane_origin.tolist()),
     )
     assert lines_wp.shape == (0, 2)
 
 
 def _pyvista_intersection_segments(mesh1_pv: pv.PolyData, mesh2_pv: pv.PolyData) -> np.ndarray:
-    intersection_pv = cast(pv.PolyData, mesh1_pv.intersection(mesh2_pv, split_first=False, split_second=False)[0])
+    intersection_pv = cast(
+        pv.PolyData, mesh1_pv.intersection(mesh2_pv, split_first=False, split_second=False)[0]
+    )
     if intersection_pv.n_cells == 0:
         return np.empty((0, 2, 3), dtype=np.float64)
     pairs_np = np.reshape(intersection_pv.lines, (-1, 3))[:, 1:]
@@ -168,7 +205,11 @@ def _pyvista_intersection_segments(mesh1_pv: pv.PolyData, mesh2_pv: pv.PolyData)
 
 
 def _intersection_curves_match(
-    got_segments_np: np.ndarray, ref_segments_np: np.ndarray, *, ref_atol: float = 1e-5, got_atol: float = 1e-5
+    got_segments_np: np.ndarray,
+    ref_segments_np: np.ndarray,
+    *,
+    ref_atol: float = 1e-5,
+    got_atol: float = 1e-5,
 ) -> bool:
     """Check both segment sets describe the same intersection curves."""
     got_segments_np = got_segments_np.reshape(-1, 2, 3)
@@ -184,11 +225,15 @@ def _intersection_curves_match(
     return bool(np.all(np.isfinite(ref_distances_np)) and np.all(np.isfinite(got_distances_np)))
 
 
-def test_mesh_with_mesh_empty(icosahedron: tuple[tm.Trimesh, wp.Mesh], cave_cube: tuple[tm.Trimesh, wp.Mesh]) -> None:
+def test_mesh_with_mesh_empty(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh], cave_cube: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
     _, ico_wp = icosahedron
     _, cave_wp = cave_cube
 
-    lines_wp = tw.intersections.mesh_with_mesh(ico_wp.points, ico_wp.indices, cave_wp.points, cave_wp.indices)
+    lines_wp = tw.intersections.mesh_with_mesh(
+        ico_wp.points, ico_wp.indices, cave_wp.points, cave_wp.indices
+    )
     assert lines_wp.shape == (0, 2)
 
 
@@ -201,8 +246,12 @@ def test_mesh_with_mesh_icosahedron_cave_cube(
     cave_at_ico_tm.apply_translation(ico_tm.centroid)
     cave_wp = trimesh_to_warp(cave_at_ico_tm, ico_wp.device)
 
-    ref_segments_np = _pyvista_intersection_segments(trimesh_to_pyvista(ico_tm), trimesh_to_pyvista(cave_at_ico_tm))
-    lines_wp = tw.intersections.mesh_with_mesh(ico_wp.points, ico_wp.indices, cave_wp.points, cave_wp.indices)
+    ref_segments_np = _pyvista_intersection_segments(
+        trimesh_to_pyvista(ico_tm), trimesh_to_pyvista(cave_at_ico_tm)
+    )
+    lines_wp = tw.intersections.mesh_with_mesh(
+        ico_wp.points, ico_wp.indices, cave_wp.points, cave_wp.indices
+    )
 
     assert lines_wp.shape[0] > 0
     assert _intersection_curves_match(lines_wp.numpy(), ref_segments_np)

@@ -41,16 +41,22 @@ def half_torus(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
 
 @pytest.fixture
 def cave_cube(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
-    mesh = tm.boolean.difference([tm.creation.box(extents=[1.0, 1.0, 1.0]), tm.creation.box(extents=[0.1, 0.1, 0.1])])
+    mesh = tm.boolean.difference(
+        [tm.creation.box(extents=[1.0, 1.0, 1.0]), tm.creation.box(extents=[0.1, 0.1, 0.1])]
+    )
     return mesh, trimesh_to_warp(mesh, device)
 
 
 @pytest.fixture
 def hemisphere(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
     sphere = tm.creation.icosphere(subdivisions=2, radius=1.0)
-    hemisphere = sphere.slice_plane(plane_origin=np.zeros(3), plane_normal=np.array([0.0, 0.0, 1.0]), cap=False)
+    hemisphere = sphere.slice_plane(
+        plane_origin=np.zeros(3), plane_normal=np.array([0.0, 0.0, 1.0]), cap=False
+    )
     hemisphere.merge_vertices()
-    rotation = tm.transformations.rotation_matrix(np.deg2rad(45.0), direction=np.array([1.0, 1.0, 0.0]))
+    rotation = tm.transformations.rotation_matrix(
+        np.deg2rad(45.0), direction=np.array([1.0, 1.0, 0.0])
+    )
     rotation[:3, 3] = np.array([-1.0, 0.0, 2.0])
     hemisphere.apply_transform(rotation)
     return hemisphere, trimesh_to_warp(hemisphere, device)

@@ -41,7 +41,9 @@ def max2d_tiled(values: wp.array2d[wp.Scalar], out_max: wp.array[wp.Scalar]) -> 
     tile_rows = TILE_2D if remaining_rows >= TILE_2D else remaining_rows
     tile_cols = TILE_2D if remaining_cols >= TILE_2D else remaining_cols
     if remaining_rows >= TILE_2D and remaining_cols >= TILE_2D:
-        tile = wp.tile_load(values, shape=(TILE_2D, TILE_2D), offset=(row_offset, col_offset), storage="register")
+        tile = wp.tile_load(
+            values, shape=(TILE_2D, TILE_2D), offset=(row_offset, col_offset), storage="register"
+        )
         tile_max = wp.tile_max(tile)[0]
     else:
         tile_max = values[row_offset, col_offset]
@@ -91,7 +93,9 @@ def min2d_tiled(values: wp.array2d[wp.Scalar], out_min: wp.array[wp.Scalar]) -> 
     tile_rows = TILE_2D if remaining_rows >= TILE_2D else remaining_rows
     tile_cols = TILE_2D if remaining_cols >= TILE_2D else remaining_cols
     if remaining_rows >= TILE_2D and remaining_cols >= TILE_2D:
-        tile = wp.tile_load(values, shape=(TILE_2D, TILE_2D), offset=(row_offset, col_offset), storage="register")
+        tile = wp.tile_load(
+            values, shape=(TILE_2D, TILE_2D), offset=(row_offset, col_offset), storage="register"
+        )
         tile_min = wp.tile_min(tile)[0]
     else:
         tile_min = values[row_offset, col_offset]
@@ -146,7 +150,9 @@ def minmax2d_tiled(values: wp.array2d[wp.Scalar], out_minmax: wp.array[wp.Scalar
     tile_rows = TILE_2D if remaining_rows >= TILE_2D else remaining_rows
     tile_cols = TILE_2D if remaining_cols >= TILE_2D else remaining_cols
     if remaining_rows >= TILE_2D and remaining_cols >= TILE_2D:
-        tile = wp.tile_load(values, shape=(TILE_2D, TILE_2D), offset=(row_offset, col_offset), storage="register")
+        tile = wp.tile_load(
+            values, shape=(TILE_2D, TILE_2D), offset=(row_offset, col_offset), storage="register"
+        )
         tile_min = wp.tile_min(tile)[0]
         tile_max = wp.tile_max(tile)[0]
     else:
@@ -249,7 +255,9 @@ def max_2d_cols(values: wp.array2d[wp.Scalar], out_max: wp.array[wp.Scalar]) -> 
 
 
 @wp.kernel
-def minmax_2d_rows(values: wp.array2d[wp.Scalar], out_min: wp.array[wp.Scalar], out_max: wp.array[wp.Scalar]) -> None:
+def minmax_2d_rows(
+    values: wp.array2d[wp.Scalar], out_min: wp.array[wp.Scalar], out_max: wp.array[wp.Scalar]
+) -> None:
     """axis=1: one thread per row, min and max across columns."""
     i = int(wp.tid())
     vmin = values[i, 0]
@@ -263,7 +271,9 @@ def minmax_2d_rows(values: wp.array2d[wp.Scalar], out_min: wp.array[wp.Scalar], 
 
 
 @wp.kernel
-def minmax_2d_cols(values: wp.array2d[wp.Scalar], out_min: wp.array[wp.Scalar], out_max: wp.array[wp.Scalar]) -> None:
+def minmax_2d_cols(
+    values: wp.array2d[wp.Scalar], out_min: wp.array[wp.Scalar], out_max: wp.array[wp.Scalar]
+) -> None:
     """axis=0: one thread per column, min and max across rows."""
     i = int(wp.tid())
     vmin = values[0, i]

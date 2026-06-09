@@ -18,7 +18,9 @@ def min(array: twt.Array1dInt32 | twt.Array2dInt32, *, axis: None = ...) -> int:
 def min(array: twt.Array1dFloat32 | twt.Array2dFloat32, *, axis: None = ...) -> float: ...
 @overload
 def min(array: twt.Array2dScalar, *, axis: Literal[0, 1]) -> twt.Array1dScalar: ...
-def min(array: twt.ScalarArray, *, axis: Literal[0, 1] | None = None) -> float | int | twt.Array1dScalar:
+def min(
+    array: twt.ScalarArray, *, axis: Literal[0, 1] | None = None
+) -> float | int | twt.Array1dScalar:
     """
     Minimum of ``array``.
 
@@ -57,7 +59,9 @@ def max(array: twt.Array1dInt32 | twt.Array2dInt32, *, axis: None = ...) -> int:
 def max(array: twt.Array1dFloat32 | twt.Array2dFloat32, *, axis: None = ...) -> float: ...
 @overload
 def max(array: twt.Array2dScalar, *, axis: Literal[0, 1]) -> twt.Array1dScalar: ...
-def max(array: twt.ScalarArray, *, axis: Literal[0, 1] | None = None) -> float | int | twt.Array1dScalar:
+def max(
+    array: twt.ScalarArray, *, axis: Literal[0, 1] | None = None
+) -> float | int | twt.Array1dScalar:
     """
     Maximum of ``array``.
 
@@ -93,9 +97,13 @@ def max(array: twt.ScalarArray, *, axis: Literal[0, 1] | None = None) -> float |
 @overload
 def minmax(array: twt.Array1dInt32 | twt.Array2dInt32, *, axis: None = ...) -> tuple[int, int]: ...
 @overload
-def minmax(array: twt.Array1dFloat32 | twt.Array2dFloat32, *, axis: None = ...) -> tuple[float, float]: ...
+def minmax(
+    array: twt.Array1dFloat32 | twt.Array2dFloat32, *, axis: None = ...
+) -> tuple[float, float]: ...
 @overload
-def minmax(array: twt.Array2dScalar, *, axis: Literal[0, 1]) -> tuple[twt.Array1dScalar, twt.Array1dScalar]: ...
+def minmax(
+    array: twt.Array2dScalar, *, axis: Literal[0, 1]
+) -> tuple[twt.Array1dScalar, twt.Array1dScalar]: ...
 def minmax(
     array: twt.ScalarArray, *, axis: Literal[0, 1] | None = None
 ) -> tuple[float, float] | tuple[int, int] | tuple[twt.Array1dScalar, twt.Array1dScalar]:
@@ -294,7 +302,9 @@ _BOOL_REDUCE: dict[str, _BoolReduceSpec] = {
 }
 
 
-def _validate_scalar_array(array: twt.ScalarArray, spec: _ScalarReduceSpec, axis: Literal[0, 1] | None) -> None:
+def _validate_scalar_array(
+    array: twt.ScalarArray, spec: _ScalarReduceSpec, axis: Literal[0, 1] | None
+) -> None:
     if int(array.size) == 0:
         raise ValueError(f"{spec.name} requires a non-empty array.")
     if array.ndim == 1 and axis is not None:
@@ -311,11 +321,15 @@ def _launch_axis_scalar(
         if axis == 1:
             out_min = wp.empty(n_rows, dtype=array.dtype, device=array.device)
             out_max = wp.empty(n_rows, dtype=array.dtype, device=array.device)
-            wp.launch(spec.axis_rows, dim=n_rows, inputs=[array, out_min, out_max], device=array.device)
+            wp.launch(
+                spec.axis_rows, dim=n_rows, inputs=[array, out_min, out_max], device=array.device
+            )
         else:
             out_min = wp.empty(n_cols, dtype=array.dtype, device=array.device)
             out_max = wp.empty(n_cols, dtype=array.dtype, device=array.device)
-            wp.launch(spec.axis_cols, dim=n_cols, inputs=[array, out_min, out_max], device=array.device)
+            wp.launch(
+                spec.axis_cols, dim=n_cols, inputs=[array, out_min, out_max], device=array.device
+            )
         return cast(twt.Array1dScalar, out_min), cast(twt.Array1dScalar, out_max)
 
     if axis == 1:
@@ -331,20 +345,34 @@ def _launch_global_scalar_tiled(
     array: twt.ScalarArray, spec: _ScalarReduceSpec
 ) -> float | int | tuple[float, float] | tuple[int, int]:
     if spec.global_output_slots == 2:
-        out = wp.array([max_for_dtype(array.dtype), min_for_dtype(array.dtype)], dtype=array.dtype, device=array.device)
+        out = wp.array(
+            [max_for_dtype(array.dtype), min_for_dtype(array.dtype)],
+            dtype=array.dtype,
+            device=array.device,
+        )
     else:
         out = wp.full(1, spec.init_global(array.dtype), dtype=array.dtype, device=array.device)
 
     if array.ndim == 1:
         n = int(array.shape[0])
         n_tiles = (n + TILE_1D - 1) // TILE_1D
-        wp.launch_tiled(spec.tiled_1d, dim=[n_tiles], inputs=[array, out], block_dim=TILE_1D, device=array.device)
+        wp.launch_tiled(
+            spec.tiled_1d,
+            dim=[n_tiles],
+            inputs=[array, out],
+            block_dim=TILE_1D,
+            device=array.device,
+        )
     else:
         n, m = array.shape
         n_tiles = (n + TILE_2D - 1) // TILE_2D
         m_tiles = (m + TILE_2D - 1) // TILE_2D
         wp.launch_tiled(
-            spec.tiled_2d, dim=[n_tiles, m_tiles], inputs=[array, out], block_dim=TILE_2D * TILE_2D, device=array.device
+            spec.tiled_2d,
+            dim=[n_tiles, m_tiles],
+            inputs=[array, out],
+            block_dim=TILE_2D * TILE_2D,
+            device=array.device,
         )
 
     out_np = out.numpy()
@@ -381,7 +409,13 @@ def _launch_global_bool_tiled(mask_i32: wp.array[wp.int32], spec: _BoolReduceSpe
     out = wp.full(1, spec.init_global, dtype=wp.int32, device=mask_i32.device)
     n = int(mask_i32.shape[0])
     n_tiles = (n + TILE_1D - 1) // TILE_1D
-    wp.launch_tiled(spec.tiled_1d, dim=[n_tiles], inputs=[mask_i32, out], block_dim=TILE_1D, device=mask_i32.device)
+    wp.launch_tiled(
+        spec.tiled_1d,
+        dim=[n_tiles],
+        inputs=[mask_i32, out],
+        block_dim=TILE_1D,
+        device=mask_i32.device,
+    )
     return bool(out.numpy().item() != 0)
 
 

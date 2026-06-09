@@ -17,7 +17,9 @@ from triwarp.kernels import array as kernel_array
 _ISIN_MASK_SIZE_FACTOR = 8
 
 
-def pack_1d_arrays(arrays: Sequence[wp.array[wp.Scalar]]) -> tuple[wp.array[wp.Scalar], wp.array[wp.int32]]:
+def pack_1d_arrays(
+    arrays: Sequence[wp.array[wp.Scalar]],
+) -> tuple[wp.array[wp.Scalar], wp.array[wp.int32]]:
     """
     Concatenate several 1-D :class:`warp.array` instances into one buffer plus CSR-style offsets.
 
@@ -52,11 +54,15 @@ def pack_1d_arrays(arrays: Sequence[wp.array[wp.Scalar]]) -> tuple[wp.array[wp.S
     for i, arr in enumerate(arrays):
         if arr.dtype != dtype:
             raise ValueError(
-                "all arrays must have the same dtype, got {} and {} at index {}".format(dtype, arr.dtype, i)
+                "all arrays must have the same dtype, got {} and {} at index {}".format(
+                    dtype, arr.dtype, i
+                )
             )
         if arr.device != device:
             raise ValueError(
-                "all arrays must live on the same device, got {!r} and {!r} at index {}".format(device, arr.device, i)
+                "all arrays must live on the same device, got {!r} and {!r} at index {}".format(
+                    device, arr.device, i
+                )
             )
         sizes.append(int(arr.size))
         offsets.append(offsets[-1] + sizes[-1])
@@ -76,8 +82,12 @@ def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
     data_buffer = wp.empty(n * 2, dtype=data.dtype, device=data.device)
     wp.copy(data_buffer, data, count=n)
     indices_buffer = wp.array(list(range(n)) + [-1] * n, dtype=wp.int32, device=data.device)
-    segment_start_indices = wp.array(list(range(0, n + 1, data.shape[1])), dtype=wp.int32, device=data.device)
-    wp.utils.segmented_sort_pairs(data_buffer, indices_buffer, n, segment_start_indices=segment_start_indices)
+    segment_start_indices = wp.array(
+        list(range(0, n + 1, data.shape[1])), dtype=wp.int32, device=data.device
+    )
+    wp.utils.segmented_sort_pairs(
+        data_buffer, indices_buffer, n, segment_start_indices=segment_start_indices
+    )
     wp.copy(data, data_buffer, count=n)
 
 
@@ -119,7 +129,11 @@ def index_sparse(
         data = wp.ones(indices.size, dtype=dtype if dtype is not None else wp.float32)
     else:
         if data.size != indices.size:
-            raise ValueError("data must have the same size as indices, got {} and {}".format(data.size, indices.size))
+            raise ValueError(
+                "data must have the same size as indices, got {} and {}".format(
+                    data.size, indices.size
+                )
+            )
         if dtype is not None and data.dtype != dtype:
             casted_data = wp.empty(data.shape, dtype=dtype)
             wp.utils.array_cast(data, casted_data)
@@ -128,11 +142,18 @@ def index_sparse(
     n_cols, n_repeats = indices.shape
     cols = wp.array([c for c in range(n_cols) for _ in range(n_repeats)], dtype=wp.int32)
     return wps.bsr_from_triplets(
-        n_rows, indices.shape[0], indices.flatten(), cols, data, prune_numerical_zeros=prune_numerical_zeros
+        n_rows,
+        indices.shape[0],
+        indices.flatten(),
+        cols,
+        data,
+        prune_numerical_zeros=prune_numerical_zeros,
     )
 
 
-def isin(elements: twt.Array1dInt32 | twt.Array2dInt32, test_elements: twt.Array1dInt32) -> wp.array[wp.bool]:
+def isin(
+    elements: twt.Array1dInt32 | twt.Array2dInt32, test_elements: twt.Array1dInt32
+) -> wp.array[wp.bool]:
     """
     Test whether each element appears in ``test_elements`` (``numpy.isin`` for ``int32``).
 
@@ -207,7 +228,12 @@ def _isin_lookup_mask(
     k = int(test_elements.shape[0])
     device = elements_flat.device
     membership_wp = wp.zeros(max_index, dtype=wp.bool, device=device)
-    wp.launch(kernel_array.mark_membership_mask, dim=k, inputs=[test_elements, membership_wp], device=device)
+    wp.launch(
+        kernel_array.mark_membership_mask,
+        dim=k,
+        inputs=[test_elements, membership_wp],
+        device=device,
+    )
     out_wp = wp.empty(elements_flat.shape, dtype=wp.bool, device=device)
     wp.launch(
         kernel_array.isin_lookup_mask,
@@ -218,7 +244,9 @@ def _isin_lookup_mask(
     return out_wp
 
 
-def _isin_lookup_sorted(elements_flat: wp.array[wp.int32], test_elements: wp.array[wp.int32]) -> wp.array[wp.bool]:
+def _isin_lookup_sorted(
+    elements_flat: wp.array[wp.int32], test_elements: wp.array[wp.int32]
+) -> wp.array[wp.bool]:
     device = elements_flat.device
     sorted_test_wp = _sorted_int32_copy(test_elements)
     out_wp = wp.empty(elements_flat.shape, dtype=wp.bool, device=device)
@@ -271,7 +299,12 @@ def flatnonzero(mask: wp.array[wp.bool]) -> wp.array[wp.int32]:
         return wp.empty(0, dtype=wp.int32, device=device)
 
     out_indices = wp.empty(n_out, dtype=wp.int32, device=device)
-    wp.launch(kernel_array.scatter_compact_indices, dim=n, inputs=[mask, exclusive, out_indices], device=device)
+    wp.launch(
+        kernel_array.scatter_compact_indices,
+        dim=n,
+        inputs=[mask, exclusive, out_indices],
+        device=device,
+    )
     return out_indices
 
 

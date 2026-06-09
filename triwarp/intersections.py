@@ -59,7 +59,15 @@ def segments_with_plane(
     wp.launch(
         kernel_intersections.segments_with_plane,
         dim=n,
-        inputs=[start_points, end_points, plane_origin, plane_normal, line_segments, intersections, valid],
+        inputs=[
+            start_points,
+            end_points,
+            plane_origin,
+            plane_normal,
+            line_segments,
+            intersections,
+            valid,
+        ],
         device=device,
     )
     return intersections, valid
@@ -102,7 +110,9 @@ def mesh_with_plane(
     """
     device = vertices.device
     if faces.device != device:
-        raise ValueError(f"vertices and faces must live on the same device, got {device} and {faces.device}")
+        raise ValueError(
+            f"vertices and faces must live on the same device, got {device} and {faces.device}"
+        )
 
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -179,7 +189,9 @@ def mesh_with_mesh(
     device = vertices_a.device
     for name, arr in (("faces_a", faces_a), ("vertices_b", vertices_b), ("faces_b", faces_b)):
         if arr.device != device:
-            raise ValueError(f"vertices_a and {name} must live on the same device, got {device} and {arr.device}")
+            raise ValueError(
+                f"vertices_a and {name} must live on the same device, got {device} and {arr.device}"
+            )
 
     n_faces_a = int(faces_a.shape[0]) // 3
     n_faces_b = int(faces_b.shape[0]) // 3
@@ -258,7 +270,12 @@ def mesh_with_mesh(
     )
 
     seg_valid = wp.empty(n_hit, dtype=wp.bool, device=device)
-    wp.launch(kernel_intersections.segment_nondegenerate, dim=n_hit, inputs=[segments, seg_valid], device=device)
+    wp.launch(
+        kernel_intersections.segment_nondegenerate,
+        dim=n_hit,
+        inputs=[segments, seg_valid],
+        device=device,
+    )
 
     keep = tw.array.flatnonzero(seg_valid)
     n_keep = int(keep.shape[0])

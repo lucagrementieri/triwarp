@@ -54,7 +54,9 @@ def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
     return twt.as_array2d_int32(groups)
 
 
-def group_int_rows(data: twt.Array2dInt, length: int, max_value: int | None = None) -> twt.Array2dInt32:
+def group_int_rows(
+    data: twt.Array2dInt, length: int, max_value: int | None = None
+) -> twt.Array2dInt32:
     """
     Return index groups of exactly ``length`` rows that are identical.
 
@@ -114,7 +116,9 @@ def hash_vector_rows(data: wp.array[wp.vec3]) -> wp.array[wp.uint64]:
     if data.dtype != wp.vec3:
         raise ValueError(f"data must be a wp.array[wp.vec3], got wp.array[{data.dtype}]")
     hashes = wp.empty(data.shape[0], dtype=wp.uint64, device=data.device)
-    wp.launch(kernel_grouping.pack_vec3, dim=data.shape[0], inputs=[data, hashes], device=data.device)
+    wp.launch(
+        kernel_grouping.pack_vec3, dim=data.shape[0], inputs=[data, hashes], device=data.device
+    )
     return hashes
 
 
@@ -152,11 +156,16 @@ def hash_indices_rows(data: twt.Array2dInt32, max_index: int | None = None) -> w
     if min_data < 0:
         raise ValueError(f"data must be non-negative, got a minimum of {min_data}")
     if max_index is not None and max_data >= max_index:
-        raise ValueError(f"data must be less than max_index {max_index}, got a maximum of {max_data}")
+        raise ValueError(
+            f"data must be less than max_index {max_index}, got a maximum of {max_data}"
+        )
     if max_index is None:
         max_index = max_data + 1
     hashes = wp.empty(data.shape[0], dtype=wp.uint64, device=data.device)
     wp.launch(
-        kernel_grouping.pack_indices, dim=data.shape[0], inputs=[data, wp.uint64(max_index), hashes], device=data.device
+        kernel_grouping.pack_indices,
+        dim=data.shape[0],
+        inputs=[data, wp.uint64(max_index), hashes],
+        device=data.device,
     )
     return hashes

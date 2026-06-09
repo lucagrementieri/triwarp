@@ -14,7 +14,9 @@ def triangle_cross(vertices: wp.array[wp.vec3], face: wp.array[wp.int32]) -> wp.
 
 
 @wp.func
-def triangle_edges(vertices: wp.array[wp.vec3], face: wp.array[wp.int32]) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
+def triangle_edges(
+    vertices: wp.array[wp.vec3], face: wp.array[wp.int32]
+) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
     e0 = wp.vec3(*(vertices[face[1]] - vertices[face[0]]))
     e1 = wp.vec3(*(vertices[face[2]] - vertices[face[0]]))
     e2 = wp.vec3(*(vertices[face[2]] - vertices[face[1]]))
@@ -22,7 +24,9 @@ def triangle_edges(vertices: wp.array[wp.vec3], face: wp.array[wp.int32]) -> tup
 
 
 @wp.func
-def face_normals_and_area(vertices: wp.array[wp.vec3], face: wp.array[wp.int32]) -> tuple[wp.vec3, wp.float32]:
+def face_normals_and_area(
+    vertices: wp.array[wp.vec3], face: wp.array[wp.int32]
+) -> tuple[wp.vec3, wp.float32]:
     normal = triangle_cross(vertices, face)
     norm = wp.length(normal)
     if norm > TOLERANCE_ZERO_CONSTANT:
@@ -45,7 +49,9 @@ def face_normals_and_areas(
 
 
 @wp.kernel
-def angles(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_angles: wp.array2d[wp.float32]) -> None:
+def angles(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_angles: wp.array2d[wp.float32]
+) -> None:
     f = wp.tid()
     edges = triangle_edges(vertices, faces[f * 3 : (f + 1) * 3])
 
@@ -78,7 +84,9 @@ def centroid(
     f = int(wp.tid())
     triangle_face = faces[f * 3 : (f + 1) * 3]
     _, area = face_normals_and_area(vertices, triangle_face)
-    centroid = (vertices[triangle_face[0]] + vertices[triangle_face[1]] + vertices[triangle_face[2]]) / 3.0
+    centroid = (
+        vertices[triangle_face[0]] + vertices[triangle_face[1]] + vertices[triangle_face[2]]
+    ) / 3.0
     wp.atomic_add(out_centroid, 0, centroid[0] * area)
     wp.atomic_add(out_centroid, 1, centroid[1] * area)
     wp.atomic_add(out_centroid, 2, centroid[2] * area)
@@ -86,7 +94,9 @@ def centroid(
 
 
 @wp.kernel
-def nondegenerate(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_nondegenerate: wp.array[wp.bool]) -> None:
+def nondegenerate(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_nondegenerate: wp.array[wp.bool]
+) -> None:
     f = wp.tid()
     triangle_face = faces[f * 3 : (f + 1) * 3]
     e0, e1, _ = triangle_edges(vertices, triangle_face)
@@ -164,7 +174,10 @@ def points_to_barycentric_cross(
 
 @wp.kernel
 def closest_point(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], points: wp.array[wp.vec3], out_closest: wp.array[wp.vec3]
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    points: wp.array[wp.vec3],
+    out_closest: wp.array[wp.vec3],
 ) -> None:
     f = wp.tid()
     triangle_face = faces[f * 3 : (f + 1) * 3]
@@ -190,7 +203,11 @@ def closest_point(
 
     # check if P in edge region of AB, if so return projection of P onto A
     vc = (d1 * d4) - (d3 * d2)
-    is_ab = vc < TOLERANCE_ZERO_CONSTANT and d1 > -TOLERANCE_ZERO_CONSTANT and d3 < TOLERANCE_ZERO_CONSTANT
+    is_ab = (
+        vc < TOLERANCE_ZERO_CONSTANT
+        and d1 > -TOLERANCE_ZERO_CONSTANT
+        and d3 < TOLERANCE_ZERO_CONSTANT
+    )
     if is_ab:
         v = d1 / (d1 - d3)
         out_closest[f] = vertices[triangle_face[0]] + v * ab
@@ -207,7 +224,11 @@ def closest_point(
 
     # check if P in edge region of AC, if so return projection of P onto AC
     vb = (d5 * d2) - (d1 * d6)
-    is_ac = vb < TOLERANCE_ZERO_CONSTANT and d2 > -TOLERANCE_ZERO_CONSTANT and d6 < TOLERANCE_ZERO_CONSTANT
+    is_ac = (
+        vb < TOLERANCE_ZERO_CONSTANT
+        and d2 > -TOLERANCE_ZERO_CONSTANT
+        and d6 < TOLERANCE_ZERO_CONSTANT
+    )
     if is_ac:
         w = d2 / (d2 - d6)
         out_closest[f] = vertices[triangle_face[0]] + w * ac
@@ -216,7 +237,9 @@ def closest_point(
     # check if P in edge region of BC, if so return projection of P onto BC
     va = (d3 * d6) - (d5 * d4)
     is_bc = (
-        va < TOLERANCE_ZERO_CONSTANT and (d4 - d3) > -TOLERANCE_ZERO_CONSTANT and (d5 - d6) > -TOLERANCE_ZERO_CONSTANT
+        va < TOLERANCE_ZERO_CONSTANT
+        and (d4 - d3) > -TOLERANCE_ZERO_CONSTANT
+        and (d5 - d6) > -TOLERANCE_ZERO_CONSTANT
     )
     if is_bc:
         d43 = d4 - d3

@@ -54,14 +54,23 @@ def faces_to_edges(faces: wp.array[wp.int32], sorted: bool = False) -> twt.Array
 
 @overload
 def face_adjacency(
-    faces: wp.array[wp.int32], edges_sorted: twt.Array2dInt32 | None = None, *, return_edges: Literal[False] = False
+    faces: wp.array[wp.int32],
+    edges_sorted: twt.Array2dInt32 | None = None,
+    *,
+    return_edges: Literal[False] = False,
 ) -> twt.Array2dInt32: ...
 @overload
 def face_adjacency(
-    faces: wp.array[wp.int32], edges_sorted: twt.Array2dInt32 | None = None, *, return_edges: Literal[True]
+    faces: wp.array[wp.int32],
+    edges_sorted: twt.Array2dInt32 | None = None,
+    *,
+    return_edges: Literal[True],
 ) -> tuple[twt.Array2dInt32, twt.Array2dInt32]: ...
 def face_adjacency(
-    faces: wp.array[wp.int32], edges_sorted: twt.Array2dInt32 | None = None, *, return_edges: bool = False
+    faces: wp.array[wp.int32],
+    edges_sorted: twt.Array2dInt32 | None = None,
+    *,
+    return_edges: bool = False,
 ) -> twt.Array2dInt32 | tuple[twt.Array2dInt32, twt.Array2dInt32]:
     """
     Face index pairs that share an undirected mesh edge.
@@ -116,7 +125,9 @@ def face_adjacency(
         return empty_array
     if edges_sorted is None:
         edges_sorted = faces_to_edges(faces, sorted=True)
-    edges_face = wp.array([f for f in range(n_faces) for _ in range(3)], dtype=wp.int32, device=faces.device)
+    edges_face = wp.array(
+        [f for f in range(n_faces) for _ in range(3)], dtype=wp.int32, device=faces.device
+    )
     edge_groups = tw.grouping.group_int_rows(edges_sorted, length=2, max_value=n_faces)
     adjacency = twt.empty_int32_2d((edge_groups.shape[0], 2), device=faces.device)
     wp.launch(
@@ -138,7 +149,9 @@ def face_adjacency(
     return twt.as_array2d_int32(adjacency)
 
 
-def is_watertight(edges: twt.Array2dInt32, edges_sorted: twt.Array2dInt32 | None = None) -> tuple[bool, bool]:
+def is_watertight(
+    edges: twt.Array2dInt32, edges_sorted: twt.Array2dInt32 | None = None
+) -> tuple[bool, bool]:
     """
     Whether a directed edge list forms a closed, consistently wound surface.
 
@@ -180,7 +193,9 @@ def is_watertight(edges: twt.Array2dInt32, edges_sorted: twt.Array2dInt32 | None
     else:
         twt.ensure_ndim(edges_sorted, 2, dtype=wp.int32)
         if int(edges_sorted.shape[0]) != n_edges or int(edges_sorted.shape[1]) != 2:
-            raise ValueError(f"edges_sorted must have shape ({n_edges}, 2), got {edges_sorted.shape}")
+            raise ValueError(
+                f"edges_sorted must have shape ({n_edges}, 2), got {edges_sorted.shape}"
+            )
 
     edge_groups = tw.grouping.group_int_rows(edges_sorted, length=2)
     n_groups = int(edge_groups.shape[0])
@@ -191,7 +206,10 @@ def is_watertight(edges: twt.Array2dInt32, edges_sorted: twt.Array2dInt32 | None
     else:
         consistent = wp.empty(n_groups, dtype=wp.bool, device=device)
         wp.launch(
-            kernel_graph.edge_pair_winding_mask, dim=n_groups, inputs=[edges, edge_groups, consistent], device=device
+            kernel_graph.edge_pair_winding_mask,
+            dim=n_groups,
+            inputs=[edges, edge_groups, consistent],
+            device=device,
         )
         winding = tw.reduce.all(consistent)
 
@@ -245,7 +263,9 @@ def face_adjacency_unshared(
     :func:`trimesh.graph.face_adjacency_unshared`
     """
     if (face_adjacency is None) != (face_adjacency_edges is None):
-        raise ValueError("face_adjacency and face_adjacency_edges must both be provided or both omitted")
+        raise ValueError(
+            "face_adjacency and face_adjacency_edges must both be provided or both omitted"
+        )
     if face_adjacency is None:
         face_adjacency, face_adjacency_edges = _compute_face_adjacency(faces, return_edges=True)
     assert face_adjacency is not None and face_adjacency_edges is not None
@@ -316,7 +336,9 @@ def face_adjacency_angles(
     """
     device = faces.device
     if vertices.device != device:
-        raise ValueError(f"vertices and faces must live on the same device, got {vertices.device} and {device}")
+        raise ValueError(
+            f"vertices and faces must live on the same device, got {vertices.device} and {device}"
+        )
 
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -333,7 +355,10 @@ def face_adjacency_angles(
 
     out_angles = wp.empty(m, dtype=wp.float32, device=device)
     wp.launch(
-        kernel_graph.face_adjacency_angles, dim=m, inputs=[face_normals, face_adjacency, out_angles], device=device
+        kernel_graph.face_adjacency_angles,
+        dim=m,
+        inputs=[face_normals, face_adjacency, out_angles],
+        device=device,
     )
     return out_angles
 
@@ -385,7 +410,9 @@ def concatenate(
     if sum(vertex_counts) == 0:
         concatenated_vertices = wp.empty(0, dtype=wp.vec3, device=device)
     else:
-        concatenated_vertices, _ = tw.array.pack_1d_arrays([vertices for vertices, _ in meshes_data])
+        concatenated_vertices, _ = tw.array.pack_1d_arrays(
+            [vertices for vertices, _ in meshes_data]
+        )
 
     concatenated_faces = wp.empty(total_indices, dtype=wp.int32, device=device)
 
@@ -406,7 +433,9 @@ def concatenate(
     return concatenated_vertices, concatenated_faces
 
 
-def split(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> list[tuple[wp.array[wp.vec3], wp.array[wp.int32]]]:
+def split(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> list[tuple[wp.array[wp.vec3], wp.array[wp.int32]]]:
     """
     Split a mesh into connected components by face adjacency.
 
@@ -443,7 +472,9 @@ def split(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> list[tuple[
     """
     device = vertices.device
     if faces.device != device:
-        raise ValueError(f"vertices and faces must live on the same device, got {device} and {faces.device}")
+        raise ValueError(
+            f"vertices and faces must live on the same device, got {device} and {faces.device}"
+        )
 
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -456,7 +487,11 @@ def split(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> list[tuple[
     for label in unique_labels.numpy():
         label_wp = wp.array([int(label)], dtype=wp.int32, device=device)
         face_indices = tw.array.flatnonzero(tw.array.isin(face_labels, label_wp))
-        meshes.append(tw.selection.submesh_from_face_indices(vertices, faces, face_indices, unique_indices=True))
+        meshes.append(
+            tw.selection.submesh_from_face_indices(
+                vertices, faces, face_indices, unique_indices=True
+            )
+        )
     return meshes
 
 
@@ -488,7 +523,9 @@ def edges_to_csr(node_count: int, edges: twt.Array2dInt32) -> wps.BsrMatrix[wp.f
     if m > 0:
         wp.launch(kernel_graph.edges_to_adjacency, dim=m, inputs=[edges, rows, cols], device=device)
     data = wp.ones(n_entries, dtype=wp.float32, device=device)
-    return wps.bsr_from_triplets(node_count, node_count, rows, cols, data, prune_numerical_zeros=False)
+    return wps.bsr_from_triplets(
+        node_count, node_count, rows, cols, data, prune_numerical_zeros=False
+    )
 
 
 def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[wp.int32]:
@@ -551,7 +588,10 @@ def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[
     parents = wp.empty(node_count, dtype=wp.int32, device=device)
 
     wp.launch(
-        kernel_connected_components.ecl_init_parent, dim=node_count, inputs=[offsets, indices, parents], device=device
+        kernel_connected_components.ecl_init_parent,
+        dim=node_count,
+        inputs=[offsets, indices, parents],
+        device=device,
     )
 
     changed = wp.zeros(1, dtype=wp.int32, device=device)
@@ -587,10 +627,14 @@ def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[
                 f"connected_component_labels: hook passes did not converge after {node_count} iterations"
             )
         else:
-            raise RuntimeError(f"connected_component_labels: edge verification failed after {node_count} iterations")
+            raise RuntimeError(
+                f"connected_component_labels: edge verification failed after {node_count} iterations"
+            )
 
 
-def connected_component_labels_from_edges(edges: twt.Array2dInt32, node_count: int | None = None) -> wp.array[wp.int32]:
+def connected_component_labels_from_edges(
+    edges: twt.Array2dInt32, node_count: int | None = None
+) -> wp.array[wp.int32]:
     """
     Per-node connected-component labels from an undirected edge list.
 

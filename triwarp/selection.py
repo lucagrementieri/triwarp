@@ -8,7 +8,9 @@ import warp as wp
 import triwarp as tw
 
 
-def _gather_faces(faces: wp.array[wp.int32], face_indices: wp.array[wp.int32]) -> wp.array[wp.int32]:
+def _gather_faces(
+    faces: wp.array[wp.int32], face_indices: wp.array[wp.int32]
+) -> wp.array[wp.int32]:
     k = int(face_indices.shape[0])
     if k == 0:
         return wp.empty(0, dtype=wp.int32, device=faces.device)
@@ -67,7 +69,9 @@ def submesh_from_face_indices(
     """
     device = vertices.device
     if faces.device != device:
-        raise ValueError(f"vertices and faces must live on the same device, got {device} and {faces.device}")
+        raise ValueError(
+            f"vertices and faces must live on the same device, got {device} and {faces.device}"
+        )
     if face_indices.device != device:
         raise ValueError(
             f"face_indices must live on the same device as vertices, got {face_indices.device} and {device}"
@@ -126,9 +130,13 @@ def submesh_from_face_mask(
     """
     device = vertices.device
     if faces.device != device:
-        raise ValueError(f"vertices and faces must live on the same device, got {device} and {faces.device}")
+        raise ValueError(
+            f"vertices and faces must live on the same device, got {device} and {faces.device}"
+        )
     if face_mask.device != device:
-        raise ValueError(f"face_mask must live on the same device as vertices, got {face_mask.device} and {device}")
+        raise ValueError(
+            f"face_mask must live on the same device as vertices, got {face_mask.device} and {device}"
+        )
 
     face_indices = tw.array.flatnonzero(face_mask)
     return submesh_from_face_indices(vertices, faces, face_indices, unique_indices=True)
@@ -169,7 +177,9 @@ def submesh_from_vertex_indices(
     """
     device = vertices.device
     if faces.device != device:
-        raise ValueError(f"vertices and faces must live on the same device, got {device} and {faces.device}")
+        raise ValueError(
+            f"vertices and faces must live on the same device, got {device} and {faces.device}"
+        )
     if vertex_indices.device != device:
         raise ValueError(
             f"vertex_indices must live on the same device as vertices, got {vertex_indices.device} and {device}"
@@ -217,18 +227,27 @@ def submesh_from_vertex_mask(
     n_vertices = int(vertices.shape[0])
     device = vertices.device
     if faces.device != device:
-        raise ValueError(f"vertices and faces must live on the same device, got {device} and {faces.device}")
+        raise ValueError(
+            f"vertices and faces must live on the same device, got {device} and {faces.device}"
+        )
     if vertex_mask.device != device:
-        raise ValueError(f"vertex_mask must live on the same device as vertices, got {vertex_mask.device} and {device}")
+        raise ValueError(
+            f"vertex_mask must live on the same device as vertices, got {vertex_mask.device} and {device}"
+        )
     if int(vertex_mask.shape[0]) != n_vertices:
-        raise ValueError(f"vertex_mask length must equal n_vertices={n_vertices}, got {vertex_mask.shape[0]}")
+        raise ValueError(
+            f"vertex_mask length must equal n_vertices={n_vertices}, got {vertex_mask.shape[0]}"
+        )
 
     vertex_indices = tw.array.flatnonzero(vertex_mask)
     return submesh_from_vertex_indices(vertices, faces, vertex_indices, face_mode=face_mode)
 
 
 def face_indices_from_vertex_indices(
-    faces: wp.array[wp.int32], vertex_indices: wp.array[wp.int32], *, face_mode: Literal["all", "any"] = "all"
+    faces: wp.array[wp.int32],
+    vertex_indices: wp.array[wp.int32],
+    *,
+    face_mode: Literal["all", "any"] = "all",
 ) -> wp.array[wp.int32]:
     """
     Face indices whose vertex indices match a set under an all/any rule.

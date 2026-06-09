@@ -35,7 +35,9 @@ def faces_to_edges_sorted(faces: wp.array[wp.int32], out_edges: wp.array2d[wp.in
 
 @wp.kernel
 def edge_pair_winding_mask(
-    edges: wp.array2d[wp.int32], edge_groups: wp.array2d[wp.int32], out_consistent: wp.array[wp.bool]
+    edges: wp.array2d[wp.int32],
+    edge_groups: wp.array2d[wp.int32],
+    out_consistent: wp.array[wp.bool],
 ) -> None:
     tid = int(wp.tid())
     i0 = edge_groups[tid, 0]
@@ -44,7 +46,9 @@ def edge_pair_winding_mask(
 
 
 @wp.kernel
-def edges_to_adjacency(edges: wp.array2d[wp.int32], out_rows: wp.array[wp.int32], out_cols: wp.array[wp.int32]) -> None:
+def edges_to_adjacency(
+    edges: wp.array2d[wp.int32], out_rows: wp.array[wp.int32], out_cols: wp.array[wp.int32]
+) -> None:
     tid = int(wp.tid())
     a = edges[tid, 0]
     b = edges[tid, 1]
@@ -56,7 +60,9 @@ def edges_to_adjacency(edges: wp.array2d[wp.int32], out_rows: wp.array[wp.int32]
 
 
 @wp.func
-def unshared_vertex(v0: wp.int32, v1: wp.int32, v2: wp.int32, e0: wp.int32, e1: wp.int32) -> wp.int32:
+def unshared_vertex(
+    v0: wp.int32, v1: wp.int32, v2: wp.int32, e0: wp.int32, e1: wp.int32
+) -> wp.int32:
     result = wp.int32(-1)
     count = wp.int32(0)
     if v0 != e0 and v0 != e1:
@@ -93,7 +99,9 @@ def face_adjacency_unshared(
 
 @wp.kernel
 def face_adjacency_angles(
-    face_normals: wp.array[wp.vec3], face_adjacency: wp.array2d[wp.int32], out_angles: wp.array[wp.float32]
+    face_normals: wp.array[wp.vec3],
+    face_adjacency: wp.array2d[wp.int32],
+    out_angles: wp.array[wp.float32],
 ) -> None:
     tid = int(wp.tid())
     normal_a = face_normals[face_adjacency[tid, 0]]

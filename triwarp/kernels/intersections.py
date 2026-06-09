@@ -123,7 +123,10 @@ def mesh_with_plane_segment_for_face(
 
 @wp.kernel
 def vertex_plane_dots(
-    vertices: wp.array[wp.vec3], plane_origin: wp.vec3, plane_normal: wp.vec3, out_dots: wp.array[wp.float32]
+    vertices: wp.array[wp.vec3],
+    plane_origin: wp.vec3,
+    plane_normal: wp.vec3,
+    out_dots: wp.array[wp.float32],
 ) -> None:
     tid = wp.tid()
     out_dots[tid] = wp.dot(vertices[tid] - plane_origin, plane_normal)
@@ -149,7 +152,9 @@ def mesh_with_plane_segments(
     s0 = kernel_array.tolerance_sign(vertex_dots[i0])
     s1 = kernel_array.tolerance_sign(vertex_dots[i1])
     s2 = kernel_array.tolerance_sign(vertex_dots[i2])
-    valid, p0, p1 = mesh_with_plane_segment_for_face(plane_origin, plane_normal, v0, v1, v2, s0, s1, s2)
+    valid, p0, p1 = mesh_with_plane_segment_for_face(
+        plane_origin, plane_normal, v0, v1, v2, s0, s1, s2
+    )
     out_valid[f] = valid
     out_segments[f, 0] = p0
     out_segments[f, 1] = p1
@@ -166,7 +171,9 @@ def segments_with_plane(
     out_valid: wp.array[wp.bool],
 ) -> None:
     tid = wp.tid()
-    hit, valid = plane_with_line(plane_origin, plane_normal, start_points[tid], end_points[tid], line_segments)
+    hit, valid = plane_with_line(
+        plane_origin, plane_normal, start_points[tid], end_points[tid], line_segments
+    )
     out_intersections[tid] = hit
     out_valid[tid] = valid
 
@@ -229,16 +236,22 @@ def intersection_line_coordinate(
 @wp.func
 def triangle_aabb(v0: wp.vec3, v1: wp.vec3, v2: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
     lower = wp.vec3(
-        wp.min(v0[0], wp.min(v1[0], v2[0])), wp.min(v0[1], wp.min(v1[1], v2[1])), wp.min(v0[2], wp.min(v1[2], v2[2]))
+        wp.min(v0[0], wp.min(v1[0], v2[0])),
+        wp.min(v0[1], wp.min(v1[1], v2[1])),
+        wp.min(v0[2], wp.min(v1[2], v2[2])),
     )
     upper = wp.vec3(
-        wp.max(v0[0], wp.max(v1[0], v2[0])), wp.max(v0[1], wp.max(v1[1], v2[1])), wp.max(v0[2], wp.max(v1[2], v2[2]))
+        wp.max(v0[0], wp.max(v1[0], v2[0])),
+        wp.max(v0[1], wp.max(v1[1], v2[1])),
+        wp.max(v0[2], wp.max(v1[2], v2[2])),
     )
     return lower, upper
 
 
 @wp.func
-def triangles_share_vertex(a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3) -> wp.bool:
+def triangles_share_vertex(
+    a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3
+) -> wp.bool:
     return (
         vec3_equal(a0, b0)
         or vec3_equal(a0, b1)
@@ -270,7 +283,9 @@ def overlaps_along_axis(
 
 
 @wp.func
-def triangles_intersect_sat(a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3) -> wp.bool:
+def triangles_intersect_sat(
+    a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3
+) -> wp.bool:
     edge0 = a1 - a0
     edge1 = a2 - a0
     edge2 = a2 - a1
@@ -333,7 +348,9 @@ def triangle_intersection_segment(
     other_edge1 = b2 - b0
     other_normal = wp.normalize(wp.cross(other_edge0, other_edge1))
 
-    proj1 = wp.vec3(wp.dot(other_normal, a0 - b0), wp.dot(other_normal, a1 - b0), wp.dot(other_normal, a2 - b0))
+    proj1 = wp.vec3(
+        wp.dot(other_normal, a0 - b0), wp.dot(other_normal, a1 - b0), wp.dot(other_normal, a2 - b0)
+    )
     proj2 = wp.vec3(wp.dot(normal, b0 - a0), wp.dot(normal, b1 - a0), wp.dot(normal, b2 - a0))
 
     order1_x, order1_y, order1_z = vec3_argsort(proj1)
@@ -346,10 +363,12 @@ def triangle_intersection_segment(
     line_origin = (va_min * proj1c - va_max * proj1a) / (proj1c - proj1a)
     line_direction = wp.cross(normal, other_normal)
 
-    edge_direction = vertex_at(order1_x if proj1b >= wp.float32(0.0) else order1_z, a0, a1, a2) - vertex_at(
-        order1_y, a0, a1, a2
+    edge_direction = vertex_at(
+        order1_x if proj1b >= wp.float32(0.0) else order1_z, a0, a1, a2
+    ) - vertex_at(order1_y, a0, a1, a2)
+    t2 = intersection_line_coordinate(
+        line_origin, line_direction, vertex_at(order1_y, a0, a1, a2), edge_direction
     )
-    t2 = intersection_line_coordinate(line_origin, line_direction, vertex_at(order1_y, a0, a1, a2), edge_direction)
 
     if t2 > wp.float32(0.0):
         interval = wp.vec2(wp.float32(0.0), t2)
@@ -358,11 +377,15 @@ def triangle_intersection_segment(
 
     order2_x, order2_y, order2_z = vec3_argsort(proj2)
     edge_direction = vertex_at(order2_z, b0, b1, b2) - vertex_at(order2_x, b0, b1, b2)
-    s1 = intersection_line_coordinate(line_origin, line_direction, vertex_at(order2_x, b0, b1, b2), edge_direction)
+    s1 = intersection_line_coordinate(
+        line_origin, line_direction, vertex_at(order2_x, b0, b1, b2), edge_direction
+    )
     edge_direction = vertex_at(
         order2_x if vec3_get(proj2, order2_y) >= wp.float32(0.0) else order2_z, b0, b1, b2
     ) - vertex_at(order2_y, b0, b1, b2)
-    s2 = intersection_line_coordinate(line_origin, line_direction, vertex_at(order2_y, b0, b1, b2), edge_direction)
+    s2 = intersection_line_coordinate(
+        line_origin, line_direction, vertex_at(order2_y, b0, b1, b2), edge_direction
+    )
 
     if s1 <= s2:
         other_interval = wp.vec2(s1, s2)
@@ -389,7 +412,10 @@ def face_vertices(
 
 @wp.kernel
 def face_aabb_bounds(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_lower: wp.array[wp.vec3], out_upper: wp.array[wp.vec3]
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    out_lower: wp.array[wp.vec3],
+    out_upper: wp.array[wp.vec3],
 ) -> None:
     f = wp.tid()
     v0, v1, v2 = face_vertices(vertices, faces, wp.int32(f))

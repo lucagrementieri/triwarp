@@ -95,9 +95,13 @@ def _shape_2d(shape: tuple[int, int] | list[int]) -> tuple[int, int]:
     return (dims[0], dims[1])
 
 
-def empty_int32_2d(shape: tuple[int, int] | list[int], *, device: wp.DeviceLike = None) -> Array2dInt32:
+def empty_int32_2d(
+    shape: tuple[int, int] | list[int], *, device: wp.DeviceLike = None
+) -> Array2dInt32:
     return cast(Array2dInt32, wp.empty(_shape_2d(shape), dtype=wp.int32, device=device))
 
 
-def empty_float32_2d(shape: tuple[int, int] | list[int], *, device: wp.DeviceLike = None) -> Array2dFloat32:
+def empty_float32_2d(
+    shape: tuple[int, int] | list[int], *, device: wp.DeviceLike = None
+) -> Array2dFloat32:
     return cast(Array2dFloat32, wp.empty(_shape_2d(shape), dtype=wp.float32, device=device))

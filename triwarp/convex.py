@@ -66,14 +66,18 @@ def face_adjacency_projections(
     """
     device = faces.device
     if vertices.device != device:
-        raise ValueError(f"vertices and faces must live on the same device, got {vertices.device} and {device}")
+        raise ValueError(
+            f"vertices and faces must live on the same device, got {vertices.device} and {device}"
+        )
 
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return wp.empty(0, dtype=wp.float32, device=device)
 
     if (face_adjacency is None) != (face_adjacency_edges is None):
-        raise ValueError("face_adjacency and face_adjacency_edges must both be provided or both omitted")
+        raise ValueError(
+            "face_adjacency and face_adjacency_edges must both be provided or both omitted"
+        )
     if face_adjacency is None:
         face_adjacency, face_adjacency_edges = tw.graph.face_adjacency(faces, return_edges=True)
     assert face_adjacency is not None and face_adjacency_edges is not None
@@ -93,7 +97,14 @@ def face_adjacency_projections(
     wp.launch(
         kernel_convex.face_adjacency_projections,
         dim=m,
-        inputs=[vertices, face_normals, face_adjacency, face_adjacency_edges, face_adjacency_unshared, out_projections],
+        inputs=[
+            vertices,
+            face_normals,
+            face_adjacency,
+            face_adjacency_edges,
+            face_adjacency_unshared,
+            out_projections,
+        ],
         device=device,
     )
     return out_projections
@@ -147,14 +158,18 @@ def face_adjacency_convex(
     """
     device = faces.device
     if vertices.device != device:
-        raise ValueError(f"vertices and faces must live on the same device, got {vertices.device} and {device}")
+        raise ValueError(
+            f"vertices and faces must live on the same device, got {vertices.device} and {device}"
+        )
 
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return wp.empty(0, dtype=wp.bool, device=device)
 
     if (face_adjacency is None) != (face_adjacency_edges is None):
-        raise ValueError("face_adjacency and face_adjacency_edges must both be provided or both omitted")
+        raise ValueError(
+            "face_adjacency and face_adjacency_edges must both be provided or both omitted"
+        )
     if face_adjacency is None:
         face_adjacency, face_adjacency_edges = tw.graph.face_adjacency(faces, return_edges=True)
     assert face_adjacency is not None
@@ -172,5 +187,7 @@ def face_adjacency_convex(
         face_normals=face_normals,
     )
     out_convex = wp.empty(m, dtype=wp.bool, device=device)
-    wp.launch(kernel_convex.face_adjacency_convex, dim=m, inputs=[projections, out_convex], device=device)
+    wp.launch(
+        kernel_convex.face_adjacency_convex, dim=m, inputs=[projections, out_convex], device=device
+    )
     return out_convex

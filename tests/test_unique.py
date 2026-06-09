@@ -41,7 +41,9 @@ def test_unique_1d_inverse_counts(device: str):
     unique_np, inverse_np, counts_np = np.unique(data_np, return_inverse=True, return_counts=True)
 
     data_wp = wp.array(data_np, dtype=wp.uint64, device=device)
-    unique_wp, inverse_wp, counts_wp = tw.unique.unique_1d(data_wp, return_inverse=True, return_counts=True)
+    unique_wp, inverse_wp, counts_wp = tw.unique.unique_1d(
+        data_wp, return_inverse=True, return_counts=True
+    )
     assert np.array_equal(unique_wp.numpy(), unique_np)
     assert np.array_equal(inverse_wp.numpy(), inverse_np)
     assert np.array_equal(counts_wp.numpy(), counts_np)
@@ -55,7 +57,15 @@ reinterpret_cast_test_data = (
     wp.array([-2147483648, -2147483647, 10, 0, -1, 2147483647, 2147483645], dtype=wp.int32),
     wp.array([4294967295, 32, 4294967294, 0, 1], dtype=wp.uint32),
     wp.array(
-        [-9223372036854775808, -9223372036854775807, 10, 0, -1, 9223372036854775806, 9223372036854775807],
+        [
+            -9223372036854775808,
+            -9223372036854775807,
+            10,
+            0,
+            -1,
+            9223372036854775806,
+            9223372036854775807,
+        ],
         dtype=wp.int64,
     ),
     wp.array([18446744073709551615, 65535, 18446744073709551614, 131070, 1], dtype=wp.uint64),
@@ -124,7 +134,9 @@ reinterpret_cast_test_data = (
 )
 
 
-@pytest.mark.parametrize("data", reinterpret_cast_test_data, ids=[a.dtype.__name__ for a in reinterpret_cast_test_data])
+@pytest.mark.parametrize(
+    "data", reinterpret_cast_test_data, ids=[a.dtype.__name__ for a in reinterpret_cast_test_data]
+)
 def test_reinterpret_cast_int_reciprocity(device: str, data: wp.array[wp.Scalar]):
     as_int = tw.unique.reinterpret_cast_to_int(data.to(device))
     recovered = tw.unique.reinterpret_cast_from_int(as_int, data.dtype)

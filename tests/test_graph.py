@@ -76,7 +76,8 @@ def test_face_adjacency_unshared(request: pytest.FixtureRequest, mesh_name: str)
         (unshared_precomputed_wp.numpy()[:, 1], unshared_precomputed_wp.numpy()[:, 0])
     )
     assert np.array_equal(
-        unshared_wp.numpy()[order_unshared], unshared_precomputed_wp.numpy()[order_unshared_precomputed]
+        unshared_wp.numpy()[order_unshared],
+        unshared_precomputed_wp.numpy()[order_unshared_precomputed],
     )
 
 
@@ -142,12 +143,18 @@ def test_face_adjacency_angles(request: pytest.FixtureRequest, mesh_name: str) -
     angles_tm = mesh_tm.face_adjacency_angles
 
     adjacency_wp = tw.graph.face_adjacency(mesh_wp.indices)
-    angles_wp = tw.graph.face_adjacency_angles(mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp)
+    angles_wp = tw.graph.face_adjacency_angles(
+        mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp
+    )
 
     adjacency_wp_np = adjacency_wp.numpy()
     angles_wp_np = angles_wp.numpy()
-    angles_wp_lookup = {(int(row[0]), int(row[1])): float(angles_wp_np[i]) for i, row in enumerate(adjacency_wp_np)}
-    angles_tm_lookup = {(int(row[0]), int(row[1])): float(angles_tm[i]) for i, row in enumerate(adjacency_tm)}
+    angles_wp_lookup = {
+        (int(row[0]), int(row[1])): float(angles_wp_np[i]) for i, row in enumerate(adjacency_wp_np)
+    }
+    angles_tm_lookup = {
+        (int(row[0]), int(row[1])): float(angles_tm[i]) for i, row in enumerate(adjacency_tm)
+    }
     assert angles_wp_lookup.keys() == angles_tm_lookup.keys()
     for key, angle_tm in angles_tm_lookup.items():
         angle_wp = angles_wp_lookup[key]
@@ -160,7 +167,9 @@ def test_face_adjacency_angles_precomputed(request: pytest.FixtureRequest, mesh_
     adjacency_wp = tw.graph.face_adjacency(mesh_wp.indices)
     face_normals_wp, _ = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
 
-    angles_all_wp = tw.graph.face_adjacency_angles(mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp)
+    angles_all_wp = tw.graph.face_adjacency_angles(
+        mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp
+    )
     angles_precomputed_wp = tw.graph.face_adjacency_angles(
         mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp, face_normals=face_normals_wp
     )
@@ -170,9 +179,12 @@ def test_face_adjacency_angles_precomputed(request: pytest.FixtureRequest, mesh_
     angles_tm = mesh_tm.face_adjacency_angles
     adjacency_wp_np = adjacency_wp.numpy()
     angles_precomputed_np = angles_precomputed_wp.numpy()
-    angles_tm_lookup = {(int(row[0]), int(row[1])): float(angles_tm[i]) for i, row in enumerate(adjacency_tm)}
+    angles_tm_lookup = {
+        (int(row[0]), int(row[1])): float(angles_tm[i]) for i, row in enumerate(adjacency_tm)
+    }
     angles_precomputed_lookup = {
-        (int(row[0]), int(row[1])): float(angles_precomputed_np[i]) for i, row in enumerate(adjacency_wp_np)
+        (int(row[0]), int(row[1])): float(angles_precomputed_np[i])
+        for i, row in enumerate(adjacency_wp_np)
     }
     for key, angle_tm in angles_tm_lookup.items():
         assert np.isclose(angles_precomputed_lookup[key], angle_tm, rtol=1e-4, atol=5e-4)

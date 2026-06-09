@@ -45,7 +45,9 @@ def gather_2d_from_1d(
 
 
 @wp.kernel
-def gather_rows(array: wp.array2d[wp.Scalar], indices: wp.array[wp.int32], out_gathered: wp.array2d[wp.Scalar]) -> None:
+def gather_rows(
+    array: wp.array2d[wp.Scalar], indices: wp.array[wp.int32], out_gathered: wp.array2d[wp.Scalar]
+) -> None:
     tid = wp.tid()
     index = indices[tid]
     for j in range(out_gathered.shape[1]):
@@ -63,7 +65,9 @@ def scatter_sum_scalar(
 
 
 @wp.kernel
-def scatter_sum_vec(values: wp.array[wp.vec3], indices: wp.array2d[wp.int32], out_sum: wp.array2d[wp.float32]) -> None:
+def scatter_sum_vec(
+    values: wp.array[wp.vec3], indices: wp.array2d[wp.int32], out_sum: wp.array2d[wp.float32]
+) -> None:
     tid = wp.tid()
     index = indices[tid]
     value = values[tid]
@@ -110,7 +114,9 @@ def mark_membership_mask(indices: wp.array[wp.int32], mask: wp.array[wp.bool]) -
 
 
 @wp.kernel
-def isin_lookup_mask(elements: wp.array[wp.int32], membership: wp.array[wp.bool], out_mask: wp.array[wp.bool]) -> None:
+def isin_lookup_mask(
+    elements: wp.array[wp.int32], membership: wp.array[wp.bool], out_mask: wp.array[wp.bool]
+) -> None:
     tid = int(wp.tid())
     out_mask[tid] = membership[elements[tid]]
 
@@ -141,7 +147,9 @@ def vector_angle_vec(a: wp.vec3, b: wp.vec3) -> wp.float32:
 
 
 @wp.kernel
-def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3], out_angles: wp.array[wp.float32]) -> None:
+def vector_angle(
+    a: wp.array[wp.vec3], b: wp.array[wp.vec3], out_angles: wp.array[wp.float32]
+) -> None:
     tid = int(wp.tid())
     out_angles[tid] = vector_angle_vec(a[tid], b[tid])
 

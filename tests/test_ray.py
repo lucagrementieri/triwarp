@@ -19,22 +19,30 @@ def test_contains_points(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     far_np = rng.random((30, 3)) * 100.0 + 1.0 + mesh_tm.bounds[1]
     center_np = np.asarray([mesh_tm.center_mass], dtype=np.float32)
 
-    points_wp = wp.array(np.ascontiguousarray(inside_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    points_wp = wp.array(
+        np.ascontiguousarray(inside_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
     contains_wp = tw.ray.contains_points(mesh_wp, points_wp).numpy()
     assert contains_wp.all()
     assert np.array_equal(contains_wp, mesh_tm.contains(inside_np))
 
-    points_wp = wp.array(np.ascontiguousarray(outside_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    points_wp = wp.array(
+        np.ascontiguousarray(outside_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
     contains_wp = tw.ray.contains_points(mesh_wp, points_wp).numpy()
     assert not contains_wp.any()
     assert np.array_equal(contains_wp, mesh_tm.contains(outside_np))
 
-    points_wp = wp.array(np.ascontiguousarray(far_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    points_wp = wp.array(
+        np.ascontiguousarray(far_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
     contains_wp = tw.ray.contains_points(mesh_wp, points_wp).numpy()
     assert not contains_wp.any()
     assert np.array_equal(contains_wp, mesh_tm.contains(far_np))
 
-    points_wp = wp.array(np.ascontiguousarray(center_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    points_wp = wp.array(
+        np.ascontiguousarray(center_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
     contains_wp = tw.ray.contains_points(mesh_wp, points_wp).numpy()
     assert contains_wp.all()
     assert np.array_equal(contains_wp, mesh_tm.contains(center_np))
@@ -44,7 +52,9 @@ def test_contains_cavity(cave_cube: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = cave_cube
     origin_np = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
 
-    points_wp = wp.array(np.ascontiguousarray(origin_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    points_wp = wp.array(
+        np.ascontiguousarray(origin_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
     contains_wp = tw.ray.contains_points(mesh_wp, points_wp).numpy()
     assert not contains_wp.any()
     assert np.array_equal(contains_wp, mesh_tm.contains(origin_np))
@@ -65,7 +75,9 @@ def test_intersects_first(request: pytest.FixtureRequest, mesh_name: str):
     directions_np = np.tile([0.0, 0.0, 1.0], (n, 1)).astype(np.float32)
     origins_np[:, 2] = mesh_tm.bounds[0, 2] - 5.0
 
-    origins_wp = wp.array(np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    origins_wp = wp.array(
+        np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
     directions_wp = wp.array(
         np.ascontiguousarray(directions_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
     )
@@ -81,7 +93,9 @@ def test_intersects_first_miss(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     directions_np = np.tile([0.0, 1.0, 0.0], (n, 1)).astype(np.float32)
     origins_np[:, 2] = mesh_tm.bounds[0, 2] - 5.0
 
-    origins_wp = wp.array(np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    origins_wp = wp.array(
+        np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
     directions_wp = wp.array(
         np.ascontiguousarray(directions_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
     )
@@ -100,7 +114,9 @@ def test_intersects_any(request: pytest.FixtureRequest, mesh_name: str):
     directions_np = np.tile([0.0, 0.0, 1.0], (n, 1)).astype(np.float32)
     origins_np[:, 2] = mesh_tm.bounds[0, 2] - 5.0
 
-    origins_wp = wp.array(np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    origins_wp = wp.array(
+        np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
     directions_wp = wp.array(
         np.ascontiguousarray(directions_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
     )
@@ -116,7 +132,9 @@ def test_intersects_any_miss(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     directions_np = np.tile([0.0, 1.0, 0.0], (n, 1)).astype(np.float32)
     origins_np[:, 2] = mesh_tm.bounds[0, 2] - 5.0
 
-    origins_wp = wp.array(np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    origins_wp = wp.array(
+        np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
     directions_wp = wp.array(
         np.ascontiguousarray(directions_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
     )
@@ -135,7 +153,9 @@ def test_intersects_location(request: pytest.FixtureRequest, mesh_name: str):
     directions_np = np.tile([0.0, 0.0, 1.0], (n, 1)).astype(np.float32)
     origins_np[:, 2] = mesh_tm.bounds[0, 2] - 5.0
 
-    origins_wp = wp.array(np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    origins_wp = wp.array(
+        np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
     directions_wp = wp.array(
         np.ascontiguousarray(directions_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
     )
@@ -156,7 +176,9 @@ def test_intersects_location_miss(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     directions_np = np.tile([0.0, 1.0, 0.0], (n, 1)).astype(np.float32)
     origins_np[:, 2] = mesh_tm.bounds[0, 2] - 5.0
 
-    origins_wp = wp.array(np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    origins_wp = wp.array(
+        np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
     directions_wp = wp.array(
         np.ascontiguousarray(directions_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
     )
@@ -168,16 +190,22 @@ def test_intersects_location_miss(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
 
 def test_intersects_location_cave_cube(cave_cube: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = cave_cube
-    origins_np = tm.util.grid_linspace(mesh_tm.bounds[:, :2] + np.reshape([-0.02, 0.02], (-1, 1)), 100)
+    origins_np = tm.util.grid_linspace(
+        mesh_tm.bounds[:, :2] + np.reshape([-0.02, 0.02], (-1, 1)), 100
+    )
     origins_np = np.column_stack((origins_np, np.ones(len(origins_np)) * -100.0)).astype(np.float32)
     directions_np = np.ones((len(origins_np), 3), dtype=np.float32) * [0.0, 0.0, 1.0]
 
-    origins_wp = wp.array(np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    origins_wp = wp.array(
+        np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
     directions_wp = wp.array(
         np.ascontiguousarray(directions_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
     )
     loc_wp, ray_wp, _tri_wp = tw.ray.intersects_location(mesh_wp, origins_wp, directions_wp)
-    loc_tm, ray_tm, _tri_tm = mesh_tm.ray.intersects_location(origins_np, directions_np, multiple_hits=False)
+    loc_tm, ray_tm, _tri_tm = mesh_tm.ray.intersects_location(
+        origins_np, directions_np, multiple_hits=False
+    )
 
     ray_wp_np = ray_wp.numpy()
     loc_wp_np = loc_wp.numpy()

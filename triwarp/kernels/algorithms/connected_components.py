@@ -51,7 +51,9 @@ def ecl_hook_edge(
 
 
 @wp.kernel
-def ecl_init_parent(offsets: wp.array[wp.int32], indices: wp.array[wp.int32], parents: wp.array[wp.int32]) -> None:
+def ecl_init_parent(
+    offsets: wp.array[wp.int32], indices: wp.array[wp.int32], parents: wp.array[wp.int32]
+) -> None:
     v = int(wp.tid())
     parents[v] = v
     start = offsets[v]

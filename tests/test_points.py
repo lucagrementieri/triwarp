@@ -34,7 +34,9 @@ def test_query_ball_single(device: str, backend: Literal["bvh", "hashgrid"]):
     query_wp = wp.vec3(query[0], query[1], query[2])
     query_ball = tw.points.query_bvh_ball if backend == "bvh" else tw.points.query_hashgrid_ball
 
-    query_indices_wp, query_distances_wp = query_ball(points_wp, query_wp, radius, return_sorted=True)
+    query_indices_wp, query_distances_wp = query_ball(
+        points_wp, query_wp, radius, return_sorted=True
+    )
 
     assert np.array_equal(query_indices_wp.numpy(), query_indices_np)
     assert np.allclose(query_distances_wp.numpy(), query_distances_np, rtol=1e-5, atol=1e-5)
@@ -42,9 +44,14 @@ def test_query_ball_single(device: str, backend: Literal["bvh", "hashgrid"]):
     query_indices_unsorted_wp, query_distances_unsorted_wp = query_ball(
         points_wp, query_wp, radius, return_sorted=False
     )
-    assert np.array_equal(np.sort(query_indices_unsorted_wp.numpy()), np.sort(query_indices_wp.numpy()))
+    assert np.array_equal(
+        np.sort(query_indices_unsorted_wp.numpy()), np.sort(query_indices_wp.numpy())
+    )
     assert np.allclose(
-        np.sort(query_distances_unsorted_wp.numpy()), np.sort(query_distances_wp.numpy()), rtol=1e-5, atol=1e-5
+        np.sort(query_distances_unsorted_wp.numpy()),
+        np.sort(query_distances_wp.numpy()),
+        rtol=1e-5,
+        atol=1e-5,
     )
 
 
@@ -59,7 +66,9 @@ def test_query_ball_empty_ball(device: str, backend: Literal["bvh", "hashgrid"])
     query_wp = wp.vec3(query[0], query[1], query[2])
     query_ball = tw.points.query_bvh_ball if backend == "bvh" else tw.points.query_hashgrid_ball
 
-    query_indices_wp, query_distances_wp = query_ball(points_wp, query_wp, radius, return_sorted=True)
+    query_indices_wp, query_distances_wp = query_ball(
+        points_wp, query_wp, radius, return_sorted=True
+    )
     assert query_indices_wp.shape == (0,) and query_distances_wp.shape == (0,)
 
 
@@ -72,10 +81,12 @@ def test_query_ball_batch(device: str, backend: Literal["bvh", "hashgrid"]):
     radius = 0.5
 
     query_indices_np = [
-        np.asarray(indices) for indices in kdtree.query_ball_point(queries, radius, return_sorted=False)
+        np.asarray(indices)
+        for indices in kdtree.query_ball_point(queries, radius, return_sorted=False)
     ]
     query_distances_np = [
-        np.linalg.norm(points[indices] - query, axis=1) for indices, query in zip(query_indices_np, queries)
+        np.linalg.norm(points[indices] - query, axis=1)
+        for indices, query in zip(query_indices_np, queries)
     ]
     orders = [np.argsort(distances) for distances in query_distances_np]
     query_indices_np = [indices[order] for indices, order in zip(query_indices_np, orders)]
@@ -85,19 +96,28 @@ def test_query_ball_batch(device: str, backend: Literal["bvh", "hashgrid"]):
     query_wp = wp.array(np.ascontiguousarray(queries), dtype=wp.vec3, device=device)
     query_ball = tw.points.query_bvh_ball if backend == "bvh" else tw.points.query_hashgrid_ball
 
-    query_indices_wp, query_distances_wp = query_ball(points_wp, query_wp, radius, return_sorted=True)
+    query_indices_wp, query_distances_wp = query_ball(
+        points_wp, query_wp, radius, return_sorted=True
+    )
 
     for single_query_indices_wp, single_query_indices_np in zip(query_indices_wp, query_indices_np):
         assert np.array_equal(single_query_indices_wp.numpy(), single_query_indices_np)
-    for single_query_distances_wp, single_query_distances_np in zip(query_distances_wp, query_distances_np):
-        assert np.allclose(single_query_distances_wp.numpy(), single_query_distances_np, rtol=1e-5, atol=1e-5)
+    for single_query_distances_wp, single_query_distances_np in zip(
+        query_distances_wp, query_distances_np
+    ):
+        assert np.allclose(
+            single_query_distances_wp.numpy(), single_query_distances_np, rtol=1e-5, atol=1e-5
+        )
 
     query_indices_unsorted_wp, query_distances_unsorted_wp = query_ball(
         points_wp, query_wp, radius, return_sorted=False
     )
-    for single_query_indices_unsorted_wp, single_query_indices_wp in zip(query_indices_unsorted_wp, query_indices_wp):
+    for single_query_indices_unsorted_wp, single_query_indices_wp in zip(
+        query_indices_unsorted_wp, query_indices_wp
+    ):
         assert np.array_equal(
-            np.sort(single_query_indices_unsorted_wp.numpy()), np.sort(single_query_indices_wp.numpy())
+            np.sort(single_query_indices_unsorted_wp.numpy()),
+            np.sort(single_query_indices_wp.numpy()),
         )
     for single_query_distances_unsorted_wp, single_query_distances_wp in zip(
         query_distances_unsorted_wp, query_distances_wp
@@ -138,7 +158,9 @@ def test_query_ball_empty(device: str, backend: Literal["bvh", "hashgrid"]):
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 @pytest.mark.parametrize("k", [1, 3, 40])
 @pytest.mark.parametrize("max_radius", [math.inf, 0.5, 1.0])
-def test_query_nearest_single(device: str, backend: Literal["bvh", "hashgrid"], k: int, max_radius: float):
+def test_query_nearest_single(
+    device: str, backend: Literal["bvh", "hashgrid"], k: int, max_radius: float
+):
     rng = np.random.default_rng(0)
     points = rng.random((50, 3), dtype=np.float32) * 4.0
     kdtree = KDTree(points)
@@ -151,8 +173,12 @@ def test_query_nearest_single(device: str, backend: Literal["bvh", "hashgrid"], 
     query_indices_np[query_indices_np == len(points)] = -1
     query_distances_np = np.atleast_1d(np.asarray(query_distances_np))
 
-    query_nearest = tw.points.query_bvh_nearest if backend == "bvh" else tw.points.query_hashgrid_nearest
-    query_indices_wp, query_distances_wp = query_nearest(points_wp, query_wp, k=k, max_radius=max_radius)
+    query_nearest = (
+        tw.points.query_bvh_nearest if backend == "bvh" else tw.points.query_hashgrid_nearest
+    )
+    query_indices_wp, query_distances_wp = query_nearest(
+        points_wp, query_wp, k=k, max_radius=max_radius
+    )
 
     assert np.array_equal(query_indices_wp.numpy(), query_indices_np)
     assert np.allclose(query_distances_wp.numpy(), query_distances_np, rtol=1e-5, atol=1e-5)
@@ -161,7 +187,9 @@ def test_query_nearest_single(device: str, backend: Literal["bvh", "hashgrid"], 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 @pytest.mark.parametrize("k", [1, 3, 10])
 @pytest.mark.parametrize("max_radius", [math.inf, 0.5, 1.0])
-def test_query_nearest_batch(device: str, backend: Literal["bvh", "hashgrid"], k: int, max_radius: float):
+def test_query_nearest_batch(
+    device: str, backend: Literal["bvh", "hashgrid"], k: int, max_radius: float
+):
     rng = np.random.default_rng(0)
     points = rng.random((50, 3), dtype=np.float32) * 2.0
     kdtree = KDTree(points)
@@ -170,13 +198,19 @@ def test_query_nearest_batch(device: str, backend: Literal["bvh", "hashgrid"], k
     points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
     query_wp = wp.array(np.ascontiguousarray(queries), dtype=wp.vec3, device=device)
 
-    query_distances_np, query_indices_np = kdtree.query(queries, k=k, distance_upper_bound=max_radius)
+    query_distances_np, query_indices_np = kdtree.query(
+        queries, k=k, distance_upper_bound=max_radius
+    )
     query_indices_np = np.asarray(query_indices_np)
     query_indices_np[query_indices_np == len(points)] = -1
     query_distances_np = np.asarray(query_distances_np)
 
-    query_nearest = tw.points.query_bvh_nearest if backend == "bvh" else tw.points.query_hashgrid_nearest
-    query_indices_wp, query_distances_wp = query_nearest(points_wp, query_wp, k=k, max_radius=max_radius)
+    query_nearest = (
+        tw.points.query_bvh_nearest if backend == "bvh" else tw.points.query_hashgrid_nearest
+    )
+    query_indices_wp, query_distances_wp = query_nearest(
+        points_wp, query_wp, k=k, max_radius=max_radius
+    )
 
     assert np.array_equal(query_indices_wp.numpy(), query_indices_np)
     assert np.allclose(query_distances_wp.numpy(), query_distances_np, rtol=1e-5, atol=1e-5)
@@ -193,7 +227,9 @@ def test_query_nearest_empty(device: str, backend: Literal["bvh", "hashgrid"]):
     query_wp = wp.vec3(points[0][0], points[0][1], points[0][2])
     queries_wp = wp.array(np.ascontiguousarray(points[-3:]), dtype=wp.vec3, device=device)
     k = 2
-    query_nearest = tw.points.query_bvh_nearest if backend == "bvh" else tw.points.query_hashgrid_nearest
+    query_nearest = (
+        tw.points.query_bvh_nearest if backend == "bvh" else tw.points.query_hashgrid_nearest
+    )
 
     indices, distances = query_nearest(empty_points_wp, query_wp, k=k)
     assert np.array_equal(indices.numpy(), -np.ones(k))

@@ -51,7 +51,9 @@ def test_points_to_barycentric(hemisphere: tuple[tm.Trimesh, wp.Mesh], method: s
     barycentric_tm = tm.triangles.points_to_barycentric(mesh_tm.triangles, points_np, method=method)
 
     points_wp = wp.array(points_np, dtype=wp.vec3, device=mesh_wp.points.device)
-    barycentric_wp = tw.triangles.points_to_barycentric(mesh_wp.points, mesh_wp.indices, points_wp, method=method)
+    barycentric_wp = tw.triangles.points_to_barycentric(
+        mesh_wp.points, mesh_wp.indices, points_wp, method=method
+    )
     assert np.allclose(barycentric_wp.numpy(), barycentric_tm, rtol=1e-5, atol=1e-5)
 
 

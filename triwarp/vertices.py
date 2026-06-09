@@ -33,7 +33,11 @@ def mean_vertex_normals(
     """
     normals = wp.zeros((n_vertices, 3), dtype=wp.float32, device=faces.device)
     faces2d = faces.reshape((-1, 3))
-    wp.launch(kernel_array.scatter_sum_vec, dim=face_normals.shape[0], inputs=[face_normals, faces2d, normals])
+    wp.launch(
+        kernel_array.scatter_sum_vec,
+        dim=face_normals.shape[0],
+        inputs=[face_normals, faces2d, normals],
+    )
     vec_normals = wp.empty(n_vertices, dtype=wp.vec3, device=faces.device)
     wp.utils.array_cast(normals, vec_normals)
     wp.launch(kernel_array.normalize, dim=n_vertices, inputs=[vec_normals])
@@ -42,7 +46,10 @@ def mean_vertex_normals(
 
 # TODO: check management of degenerate faces
 def weighted_vertex_normals(
-    n_vertices: int, faces: wp.array[wp.int32], face_normals: wp.array[wp.vec3], face_angles: twt.Array2dFloat32
+    n_vertices: int,
+    faces: wp.array[wp.int32],
+    face_normals: wp.array[wp.vec3],
+    face_angles: twt.Array2dFloat32,
 ) -> wp.array[wp.vec3]:
     """
     Angle-weighted vertex normals (Thuerrner & Wuethrich, 1998).
@@ -84,7 +91,9 @@ def weighted_vertex_normals(
     return vec_normals
 
 
-def vertex_defects(n_vertices: int, faces: wp.array[wp.int32], face_angles: twt.Array2dFloat32) -> wp.array[wp.float32]:
+def vertex_defects(
+    n_vertices: int, faces: wp.array[wp.int32], face_angles: twt.Array2dFloat32
+) -> wp.array[wp.float32]:
     """
     Discrete angle defect per vertex: ``2π`` minus the sum of incident corner angles.
 
@@ -112,6 +121,10 @@ def vertex_defects(n_vertices: int, faces: wp.array[wp.int32], face_angles: twt.
     """
     angle_sum = wp.zeros(n_vertices, dtype=wp.float32, device=faces.device)
     faces2d = faces.reshape((-1, 3))
-    wp.launch(kernel_array.scatter_sum_scalar, dim=face_angles.shape[0], inputs=[face_angles, faces2d, angle_sum])
+    wp.launch(
+        kernel_array.scatter_sum_scalar,
+        dim=face_angles.shape[0],
+        inputs=[face_angles, faces2d, angle_sum],
+    )
     defect = (2 * wp.pi) - angle_sum
     return defect

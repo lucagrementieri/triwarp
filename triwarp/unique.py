@@ -15,7 +15,10 @@ Scalar = TypeVar("Scalar", bound=wp.Scalar)
 # TODO: do a faster unique for 64-bit types
 @overload
 def unique_1d(
-    data: wp.array[Scalar], *, return_inverse: Literal[False] = False, return_counts: Literal[False] = False
+    data: wp.array[Scalar],
+    *,
+    return_inverse: Literal[False] = False,
+    return_counts: Literal[False] = False,
 ) -> wp.array[Scalar]: ...
 @overload
 def unique_1d(
@@ -85,7 +88,9 @@ def unique_1d(
         empty_unique = wp.empty(0, dtype=data.dtype, device=device)
         empty_i32 = wp.empty(0, dtype=wp.int32, device=device)
         return _pack_unique_result(
-            empty_unique, inverse=empty_i32 if return_inverse else None, counts=empty_i32 if return_counts else None
+            empty_unique,
+            inverse=empty_i32 if return_inverse else None,
+            counts=empty_i32 if return_counts else None,
         )
 
     indices_buffer = wp.array(list(range(n)) + [n] * n, dtype=wp.int32, device=device)
@@ -101,18 +106,27 @@ def unique_1d(
     if wp.types.types_equal(data_buffer.dtype, wp.int32):
         unique_values_int = wp.empty(n, dtype=wp.int32, device=device)
         unique_counts_buffer = wp.empty(n, dtype=wp.int32, device=device)
-        n_unique = wp.utils.runlength_encode(sorted_data, unique_values_int, run_lengths=unique_counts_buffer)
+        n_unique = wp.utils.runlength_encode(
+            sorted_data, unique_values_int, run_lengths=unique_counts_buffer
+        )
         if return_counts:
             unique_counts = wp.empty(n_unique, dtype=wp.int32, device=device)
             wp.copy(unique_counts, unique_counts_buffer, count=n_unique)
         if return_inverse:
             counts_list = unique_counts_buffer.list()
             inverse_buffer = wp.array(
-                [i for i in range(n_unique) for _ in range(counts_list[i])] + [-1] * n, dtype=wp.int32, device=device
+                [i for i in range(n_unique) for _ in range(counts_list[i])] + [-1] * n,
+                dtype=wp.int32,
+                device=device,
             )
     else:
         unique_start_mask = wp.empty(n, dtype=wp.int32, device=device)
-        wp.launch(kernel_unique.mark_run_starts, dim=n, inputs=[sorted_data, unique_start_mask], device=device)
+        wp.launch(
+            kernel_unique.mark_run_starts,
+            dim=n,
+            inputs=[sorted_data, unique_start_mask],
+            device=device,
+        )
         indices = wp.empty(n, dtype=wp.int32, device=device)
         wp.utils.array_scan(unique_start_mask, indices, inclusive=True)
         wp.launch(kernel_array.sub, dim=n, inputs=[indices, wp.int32(1)], device=device)
@@ -126,7 +140,9 @@ def unique_1d(
         )
         if return_counts:
             unique_counts_buffer = wp.empty(n, dtype=wp.int32, device=device)
-            _ = wp.utils.runlength_encode(indices, run_values=unique_start_mask, run_lengths=unique_counts_buffer)
+            _ = wp.utils.runlength_encode(
+                indices, run_values=unique_start_mask, run_lengths=unique_counts_buffer
+            )
             unique_counts = wp.empty(n_unique, dtype=wp.int32, device=device)
             wp.copy(unique_counts, unique_counts_buffer, count=n_unique)
         if return_inverse:
@@ -144,7 +160,10 @@ def unique_1d(
 
 
 def _pack_unique_result(
-    unique: wp.array[Scalar], *, inverse: wp.array[wp.int32] | None = None, counts: wp.array[wp.int32] | None = None
+    unique: wp.array[Scalar],
+    *,
+    inverse: wp.array[wp.int32] | None = None,
+    counts: wp.array[wp.int32] | None = None,
 ) -> (
     wp.array[Scalar]
     | tuple[wp.array[Scalar], wp.array[wp.int32]]

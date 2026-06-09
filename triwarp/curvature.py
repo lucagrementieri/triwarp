@@ -35,7 +35,9 @@ def discrete_gaussian_curvature(
     gaussian_curvature:  (n,) float
       Discrete gaussian curvature measure.
     """
-    nearest_indices, _, nearest_offsets = tw.points.query_hashgrid_ball_with_offsets(vertices, points, radius)
+    nearest_indices, _, nearest_offsets = tw.points.query_hashgrid_ball_with_offsets(
+        vertices, points, radius
+    )
     defects = vertex_defects(vertices.shape[0], faces, face_angles)
     gauss_curvature = wp.zeros(points.shape[0], dtype=wp.float32, device=points.device)
     wp.launch(
@@ -106,7 +108,9 @@ def discrete_mean_curvature(
         return wp.zeros(n_points, dtype=wp.float32, device=device)
 
     if (face_adjacency is None) != (face_adjacency_edges is None):
-        raise ValueError("face_adjacency and face_adjacency_edges must both be provided or both omitted")
+        raise ValueError(
+            "face_adjacency and face_adjacency_edges must both be provided or both omitted"
+        )
     if face_adjacency is None:
         face_adjacency, face_adjacency_edges = tw.graph.face_adjacency(faces, return_edges=True)
     assert face_adjacency is not None and face_adjacency_edges is not None
