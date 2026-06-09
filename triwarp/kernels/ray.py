@@ -58,3 +58,46 @@ def intersects_any(
     tid = wp.tid()
     direction = wp.normalize(ray_directions[tid])
     out_hit[tid] = wp.mesh_query_ray_anyhit(mesh_id, ray_origins[tid], direction, max_t)
+
+
+@wp.func
+def longest_ray_distance(
+    mesh_id: wp.uint64,
+    origin: wp.vec3,
+    direction: wp.vec3,
+    max_t: wp.float32,
+    planar_tol: wp.float32,
+) -> wp.float32:
+    t_offset = wp.float32(0.0)
+    cur_origin = origin
+    for _i in range(64):
+        remaining = max_t - t_offset
+        if remaining <= wp.float32(0.0):
+            break
+        query = wp.mesh_query_ray(mesh_id, cur_origin, direction, remaining)
+        if not query.result:
+            break
+        dist = t_offset + query.t
+        if dist > planar_tol:
+            return dist
+        t_offset = t_offset + query.t + planar_tol
+        cur_origin = origin + direction * t_offset
+        if t_offset >= max_t:
+            break
+    return wp.float32(float("inf"))
+
+
+@wp.kernel
+def longest_ray(
+    mesh_id: wp.uint64,
+    ray_origins: wp.array[wp.vec3],
+    ray_directions: wp.array[wp.vec3],
+    max_t: wp.float32,
+    planar_tol: wp.float32,
+    out_distances: wp.array[wp.float32],
+) -> None:
+    tid = wp.tid()
+    direction = wp.normalize(ray_directions[tid])
+    out_distances[tid] = longest_ray_distance(
+        mesh_id, ray_origins[tid], direction, max_t, planar_tol
+    )

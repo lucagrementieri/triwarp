@@ -10,6 +10,15 @@ import warp as wp
 import triwarp as tw
 
 
+def _assert_longest_ray_allclose(distances_wp_np: np.ndarray, distances_tm_np: np.ndarray) -> None:
+    assert np.array_equal(np.isinf(distances_wp_np), np.isinf(distances_tm_np))
+    finite_tm = ~np.isinf(distances_tm_np)
+    if finite_tm.any():
+        assert np.allclose(
+            distances_wp_np[finite_tm], distances_tm_np[finite_tm], rtol=1e-5, atol=1e-5
+        )
+
+
 def test_contains_points(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = icosahedron
     rng = np.random.default_rng(7)
@@ -218,6 +227,67 @@ def test_intersects_location_cave_cube(cave_cube: tuple[tm.Trimesh, wp.Mesh]):
         assert np.isclose(p[2], mesh_tm.bounds[0, 2], atol=1e-4)
 
 
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+def test_longest_ray(request: pytest.FixtureRequest, mesh_name: str):
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    rng = np.random.default_rng(3)
+    n = 128
+    origins_np = (rng.random((n, 3)).astype(np.float32) * 2.0 + mesh_tm.bounds[0]).astype(
+        np.float32
+    )
+    directions_np = rng.normal(size=(n, 3)).astype(np.float32)
+
+    origins_wp = wp.array(
+        np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    directions_wp = wp.array(
+        np.ascontiguousarray(directions_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    distances_wp_np = tw.ray.longest_ray(mesh_wp, origins_wp, directions_wp).numpy()
+    distances_tm_np = tm.proximity.longest_ray(mesh_tm, origins_np, directions_np)
+    _assert_longest_ray_allclose(distances_wp_np, distances_tm_np)
+
+
+def test_longest_ray_surface_normals(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = icosahedron
+    rng = np.random.default_rng(11)
+    n = 64
+    query_np = rng.random((n, 3)).astype(np.float64)
+    closest_np, _distance_np, triangle_id_np = tm.proximity.closest_point(mesh_tm, query_np)
+    normals_np = mesh_tm.face_normals[triangle_id_np].astype(np.float32)
+
+    origins_wp = wp.array(
+        np.ascontiguousarray(closest_np.astype(np.float32), dtype=np.float32),
+        dtype=wp.vec3,
+        device=mesh_wp.device,
+    )
+    directions_wp = wp.array(
+        np.ascontiguousarray(normals_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    distances_wp_np = tw.ray.longest_ray(mesh_wp, origins_wp, directions_wp).numpy()
+    distances_tm_np = tm.proximity.longest_ray(mesh_tm, closest_np, normals_np)
+    _assert_longest_ray_allclose(distances_wp_np, distances_tm_np)
+
+
+def test_longest_ray_miss(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = icosahedron
+    n = 100
+    origins_np = np.random.default_rng(1).random((n, 3)).astype(np.float32)
+    directions_np = np.tile([0.0, 1.0, 0.0], (n, 1)).astype(np.float32)
+    origins_np[:, 2] = mesh_tm.bounds[0, 2] - 5.0
+
+    origins_wp = wp.array(
+        np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    directions_wp = wp.array(
+        np.ascontiguousarray(directions_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    distances_wp_np = tw.ray.longest_ray(mesh_wp, origins_wp, directions_wp).numpy()
+    distances_tm_np = tm.proximity.longest_ray(mesh_tm, origins_np, directions_np)
+    _assert_longest_ray_allclose(distances_wp_np, distances_tm_np)
+    assert np.isinf(distances_wp_np).all()
+
+
 def test_intersects_empty_rays(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     _, mesh_wp = icosahedron
     origins_wp = wp.empty(0, dtype=wp.vec3, device=mesh_wp.device)
@@ -228,3 +298,4 @@ def test_intersects_empty_rays(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     assert loc_wp.shape[0] == 0
     assert tri_wp.shape[0] == 0
     assert ray_wp.shape[0] == 0
+    assert tw.ray.longest_ray(mesh_wp, origins_wp, directions_wp).numpy().shape == (0,)

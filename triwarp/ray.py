@@ -5,6 +5,7 @@ from __future__ import annotations
 import warp as wp
 
 import triwarp as tw
+from triwarp.constants import TOLERANCE_PLANAR
 from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import ray as kernel_ray
 from triwarp.proximity import aabb_bounds, default_mesh_query_max_dist, mesh_query_max_dist
@@ -188,6 +189,67 @@ def intersects_any(
         device=ray_origins.device,
     )
     return out_hit
+
+
+def longest_ray(
+    mesh: wp.Mesh,
+    ray_origins: wp.array[wp.vec3],
+    ray_directions: wp.array[wp.vec3],
+    *,
+    max_t: float | None = None,
+    planar_tol: float = TOLERANCE_PLANAR,
+) -> wp.array[wp.float32]:
+    """
+    Find the length of the longest unobstructed ray segment along each direction.
+
+    Uses iterative ``wp.mesh_query_ray`` on the mesh BVH. Ray directions are
+    unitized before querying. For each ray, returns the distance to the first mesh
+    intersection strictly beyond ``planar_tol`` (to ignore degenerate on-surface
+    hits), or ``inf`` when no such intersection exists within ``max_t``.
+
+    Equivalent to :func:`trimesh.proximity.longest_ray`.
+
+    Parameters
+    ----------
+    mesh
+        Triangle mesh with a built BVH (``wp.Mesh``).
+    ray_origins
+        ``(n,)`` ray origin positions as ``wp.vec3``.
+    ray_directions
+        ``(n,)`` ray direction vectors as ``wp.vec3`` (need not be unit length).
+    max_t
+        Optional maximum parametric distance along each normalized ray. When
+        ``None``, derived from the combined mesh-and-origin AABB diagonal.
+    planar_tol
+        Ignore intersections closer than this distance from the ray origin.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        ``(n,)`` unobstructed ray lengths; ``inf`` when a ray misses within ``max_t``.
+    """
+    n = ray_origins.shape[0]
+    if n == 0:
+        return wp.empty(0, dtype=wp.float32, device=ray_origins.device)
+    _validate_ray_inputs(mesh, ray_origins, ray_directions)
+    if max_t is None:
+        max_t = default_mesh_query_max_dist(mesh.points, ray_origins)
+
+    out_distances = wp.empty(n, dtype=wp.float32, device=ray_origins.device)
+    wp.launch(
+        kernel_ray.longest_ray,
+        dim=n,
+        inputs=[
+            mesh.id,
+            ray_origins,
+            ray_directions,
+            wp.float32(max_t),
+            wp.float32(planar_tol),
+            out_distances,
+        ],
+        device=ray_origins.device,
+    )
+    return out_distances
 
 
 def contains_points(
