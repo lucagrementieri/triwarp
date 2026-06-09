@@ -121,7 +121,7 @@ Reuse shared mesh fixtures from `tests/conftest.py` instead of building meshes i
 |---------|----------|
 | `icosahedron` | Default watertight solid; inside/outside, surface sampling, sign tests |
 | `cave_cube` | Hollow / non-convex shell (boolean difference) |
-| `icosphere`, `hemisphere`, `half_torus` | Curved or open surfaces |
+| `hemisphere`, `half_torus` | Curved or open surfaces |
 
 - **Do not** call `tm.creation.box()` or hand-roll `wp.Mesh(...)` in tests unless the case requires a bespoke degenerate mesh (e.g. empty faces, unreferenced vertices).
 - When a simple cube would suffice, prefer **`icosahedron`** or **`cave_cube`** for richer geometry.

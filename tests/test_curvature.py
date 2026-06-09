@@ -27,8 +27,8 @@ def test_discrete_gaussian_curvature(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     assert np.allclose(gauss_curvature_wp.numpy(), gauss_curvature_tm, rtol=1e-5, atol=1e-5)
 
 
-def test_discrete_mean_curvature(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    mesh_tm, mesh_wp = icosphere
+def test_discrete_mean_curvature(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
     radius = 2.0
     points_tm = mesh_tm.vertices
     mean_curvature_tm = tm.curvature.discrete_mean_curvature_measure(mesh_tm, points_tm, radius)

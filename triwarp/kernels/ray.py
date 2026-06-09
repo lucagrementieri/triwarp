@@ -84,7 +84,7 @@ def longest_ray_distance(
         cur_origin = origin + direction * t_offset
         if t_offset >= max_t:
             break
-    return wp.float32(float("inf"))
+    return wp.inf
 
 
 @wp.kernel

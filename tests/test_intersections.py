@@ -327,8 +327,8 @@ def test_slice_mesh_with_plane_tilted_plane(icosahedron: tuple[tm.Trimesh, wp.Me
     )
 
 
-def test_slice_mesh_with_plane_on_plane(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    mesh_tm, mesh_wp = icosphere
+def test_slice_mesh_with_plane_on_plane(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
     plane_origin_np = mesh_tm.bounds[1]
     plane_normal_np = np.array([0.0, 0.0, 1.0])
 
