@@ -7,10 +7,8 @@ from collections.abc import Sequence
 import warp as wp
 import warp.sparse as wps
 
-from typing import Union  # pyright: ignore[reportDeprecated]
-
-import triwarp.typing as twt
 import triwarp as tw
+import triwarp.typing as twt
 from triwarp.kernels import array as kernel_array
 
 # Use a direct-index membership table when max(value)+1 is at most this multiple of |test_elements|.
@@ -34,7 +32,8 @@ def pack_1d_arrays(
     Returns
     -------
     flat
-        1-D array of length ``sum(a.size for a in arrays)``, same ``dtype`` and ``device`` as the inputs.
+        1-D array of length ``sum(a.size for a in arrays)``, same ``dtype`` and ``device`` as
+        the inputs.
     offsets
         Length ``len(arrays) + 1``, ``dtype`` ``wp.int32``, same ``device`` as the inputs.
         ``offsets[0] == 0`` and ``offsets[-1] == flat.size``.
@@ -54,15 +53,12 @@ def pack_1d_arrays(
     for i, arr in enumerate(arrays):
         if arr.dtype != dtype:
             raise ValueError(
-                "all arrays must have the same dtype, got {} and {} at index {}".format(
-                    dtype, arr.dtype, i
-                )
+                f"all arrays must have the same dtype, got {dtype} and {arr.dtype} at index {i}"
             )
         if arr.device != device:
             raise ValueError(
-                "all arrays must live on the same device, got {!r} and {!r} at index {}".format(
-                    device, arr.device, i
-                )
+                f"all arrays must live on the same device, "
+                f"got {device!r} and {arr.device!r} at index {i}"
             )
         sizes.append(int(arr.size))
         offsets.append(offsets[-1] + sizes[-1])
@@ -94,28 +90,31 @@ def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
 def index_sparse(
     n_rows: int,
     indices: twt.Array2dInt32,
-    data: Union[wp.array[wp.Scalar], None] = None,  # pyright: ignore[reportDeprecated]
+    data: wp.array[wp.Scalar] | None = None,  # pyright: ignore[reportDeprecated]
     dtype: type[wp.Scalar] | None = None,
     *,
     prune_numerical_zeros: bool = True,
 ) -> wps.BsrMatrix[wp.Scalar]:
     """
-    Build a sparse matrix indicating which row indices (e.g. vertices) appear in which columns (e.g. faces).
+    Build a sparse matrix indicating which row indices (e.g. vertices) appear in which
+    columns (e.g. faces).
 
-    This mirrors ``trimesh.geometry.index_sparse``, but returns a :class:`warp.sparse.BsrMatrix` in 1x1 BSR
-    (CSR) form instead of ``scipy.sparse.coo_matrix``.
+    This mirrors ``trimesh.geometry.index_sparse``, but returns a :class:`warp.sparse.BsrMatrix`
+    in 1x1 BSR (CSR) form instead of ``scipy.sparse.coo_matrix``.
 
     Parameters
     ----------
     n_rows
         Number of matrix rows (e.g. vertex count). Matrix shape is ``(n_rows, len(indices))``.
     indices
-        Integer array of shape ``(m, d)`` — typically ``mesh.faces`` with three vertex indices per face.
+        Integer array of shape ``(m, d)`` — typically ``mesh.faces`` with three vertex indices
+        per face.
     data
         Optional 1-D array of length ``m * d``. If omitted, ``wp.ones`` is used; see ``dtype``.
     dtype
-        Scalar type for ``wp.ones`` when ``data`` is ``None`` (defaults to ``wp.float32`` if ``dtype`` is
-        ``None``). When ``data`` and ``dtype`` are provided, the values of the matrix are cast to ``dtype``.
+        Scalar type for ``wp.ones`` when ``data`` is ``None`` (defaults to ``wp.float32`` if
+        ``dtype`` is ``None``). When ``data`` and ``dtype`` are provided, the values of the
+        matrix are cast to ``dtype``.
     prune_numerical_zeros
         Forwarded to :func:`warp.sparse.bsr_from_triplets`.
 
@@ -130,9 +129,7 @@ def index_sparse(
     else:
         if data.size != indices.size:
             raise ValueError(
-                "data must have the same size as indices, got {} and {}".format(
-                    data.size, indices.size
-                )
+                f"data must have the same size as indices, got {data.size} and {indices.size}"
             )
         if dtype is not None and data.dtype != dtype:
             casted_data = wp.empty(data.shape, dtype=dtype)
@@ -183,7 +180,8 @@ def isin(
     device = elements.device
     if test_elements.device != device:
         raise ValueError(
-            f"test_elements must live on the same device as elements, got {test_elements.device} and {device}"
+            f"test_elements must live on the same device as elements, "
+            f"got {test_elements.device} and {device}"
         )
 
     k = int(test_elements.shape[0])

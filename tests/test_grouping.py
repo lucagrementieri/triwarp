@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import trimesh as tm
 import warp as wp
-import pytest
 
 import triwarp as tw
-from triwarp.kernels.grouping import VEC3_PACK_SHIFT, VEC3_PACK_PRECISION
 import triwarp.typing as twt
+from triwarp.kernels.grouping import VEC3_PACK_PRECISION, VEC3_PACK_SHIFT
 
 group_test_data = (
     (wp.array([1, 3, 2, 3, 4, 4, 7, 5, -1, 5, 5], dtype=wp.int32), 2, wp.array([[1, 3], [4, 5]])),

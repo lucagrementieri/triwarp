@@ -7,9 +7,9 @@ from typing import Literal, NamedTuple, cast, overload
 
 import warp as wp
 
+import triwarp.typing as twt
 from triwarp.constants import TILE_1D, TILE_2D
 from triwarp.kernels import reduce as kernel_reduce
-import triwarp.typing as twt
 
 
 @overload
@@ -111,7 +111,8 @@ def minmax(
     Minimum and maximum of ``array``.
 
     With ``axis=None`` (default), reduces every element to two Python scalars using
-    tiled kernels (``wp.tile_load`` + ``wp.tile_min``/``tile_max`` + ``wp.atomic_min``/``atomic_max``).
+    tiled kernels (``wp.tile_load`` + ``wp.tile_min``/``tile_max`` +
+    ``wp.atomic_min``/``atomic_max``).
 
     With ``axis=0`` or ``axis=1`` on a rank-2 input, reduces along that axis to a
     pair of 1D ``wp.array`` buffers (min, max) of the same dtype.

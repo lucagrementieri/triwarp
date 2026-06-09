@@ -5,9 +5,10 @@ from __future__ import annotations
 from typing import Literal, TypeVar, overload
 
 import warp as wp
+
 import triwarp as tw
-from triwarp.kernels import unique as kernel_unique
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels import unique as kernel_unique
 
 Scalar = TypeVar("Scalar", bound=wp.Scalar)
 
@@ -81,7 +82,8 @@ def unique_1d(
     n = int(data.shape[0])
     if n >= (1 << 31):
         raise ValueError(
-            f"unique_1d requires length < 2**31 because radix sort value indices are int32, got length {n}"
+            f"unique_1d requires length < 2**31 because radix sort value indices are int32, "
+            f"got length {n}"
         )
 
     if n == 0:

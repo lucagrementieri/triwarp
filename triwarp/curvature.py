@@ -1,9 +1,9 @@
 import warp as wp
 
+import triwarp as tw
+import triwarp.typing as twt
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import curvature as kernel_curvature
-import triwarp.typing as twt
-import triwarp as tw
 from triwarp.vertices import vertex_defects
 
 
@@ -100,7 +100,8 @@ def discrete_mean_curvature(
 
     if vertices.device != device or faces.device != device:
         raise ValueError(
-            f"points, vertices, and faces must live on the same device, got {device}, {vertices.device}, {faces.device}"
+            f"points, vertices, and faces must live on the same device, "
+            f"got {device}, {vertices.device}, {faces.device}"
         )
 
     n_faces = int(faces.shape[0]) // 3

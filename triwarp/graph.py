@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import overload, Literal
+from typing import Literal, overload
 
 import warp as wp
 import warp.sparse as wps
-from triwarp.kernels import graph as kernel_graph
+
+import triwarp as tw
+import triwarp.typing as twt
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels import graph as kernel_graph
 from triwarp.kernels import selection as kernel_selection
 from triwarp.kernels.algorithms import connected_components as kernel_connected_components
-import triwarp.typing as twt
-import triwarp as tw
 
 
 def faces_to_edges(faces: wp.array[wp.int32], sorted: bool = False) -> twt.Array2dInt32:
@@ -271,10 +272,8 @@ def face_adjacency_unshared(
     assert face_adjacency is not None and face_adjacency_edges is not None
     if face_adjacency.shape[0] != face_adjacency_edges.shape[0]:
         raise ValueError(
-            (
-                "face_adjacency and face_adjacency_edges row counts must match, "
-                f"got {face_adjacency.shape[0]} and {face_adjacency_edges.shape[0]}"
-            )
+            "face_adjacency and face_adjacency_edges row counts must match, "
+            f"got {face_adjacency.shape[0]} and {face_adjacency_edges.shape[0]}"
         )
     m = int(face_adjacency.shape[0])
     unshared = twt.empty_int32_2d((m, 2), device=faces.device)
@@ -624,11 +623,13 @@ def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[
         n_incomplete = incomplete.numpy().item()
         if n_changed != 0 or n_incomplete != 0:
             raise RuntimeError(
-                f"connected_component_labels: hook passes did not converge after {node_count} iterations"
+                f"connected_component_labels: hook passes did not converge "
+                f"after {node_count} iterations"
             )
         else:
             raise RuntimeError(
-                f"connected_component_labels: edge verification failed after {node_count} iterations"
+                f"connected_component_labels: edge verification failed "
+                f"after {node_count} iterations"
             )
 
 
@@ -684,7 +685,8 @@ def connected_component_labels_from_edges(
         edges_np = edges.numpy()
         if edges_np.min() < 0 or int(edges_np.max()) >= node_count:
             raise ValueError(
-                f"edge indices must lie in [0, {node_count}), got min={edges_np.min()} max={edges_np.max()}"
+                f"edge indices must lie in [0, {node_count}), "
+                f"got min={edges_np.min()} max={edges_np.max()}"
             )
 
     adjacency = edges_to_csr(node_count, edges)

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import warp as wp
 
-from triwarp.kernels import intersections as kernel_intersections
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import intersections as kernel_intersections
 
 
 def segments_with_plane(

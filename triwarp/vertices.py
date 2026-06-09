@@ -1,7 +1,7 @@
 import warp as wp
 
-from triwarp.kernels import array as kernel_array
 import triwarp.typing as twt
+from triwarp.kernels import array as kernel_array
 
 
 def mean_vertex_normals(

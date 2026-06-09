@@ -6,9 +6,9 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 import scipy.sparse.csgraph as csgraph
+import trimesh as tm
 import warp as wp
 
-import trimesh as tm
 import triwarp as tw
 import triwarp.typing as twt
 

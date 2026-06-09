@@ -1,7 +1,9 @@
-import warp as wp
-from triwarp.kernels import triangles as kernel_triangles
-import triwarp.typing as twt
 from typing import Literal
+
+import warp as wp
+
+import triwarp.typing as twt
+from triwarp.kernels import triangles as kernel_triangles
 
 
 def face_normals_and_areas(

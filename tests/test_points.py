@@ -9,8 +9,8 @@ import math
 from typing import Literal
 
 import numpy as np
-import warp as wp
 import pytest
+import warp as wp
 from scipy.spatial import KDTree
 
 import triwarp as tw

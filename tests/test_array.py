@@ -2,13 +2,13 @@
 Regression tests for ``triwarp.geometry`` against ``trimesh.geometry`` (CPU reference).
 """
 
-import pytest
 import numpy as np
 import numpy.typing as npt
+import pytest
 import scipy.sparse
+import trimesh as tm
 import warp as wp
 
-import trimesh as tm
 import triwarp as tw
 
 

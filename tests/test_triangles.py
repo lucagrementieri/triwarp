@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import trimesh as tm
 import warp as wp
 
-import trimesh as tm
 import triwarp as tw
 
 

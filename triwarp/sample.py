@@ -58,7 +58,8 @@ def sample_surface(
         )
     if face_weight is not None and face_weight.shape[0] != n_faces:
         raise ValueError(
-            f"face_weight length must match number of triangles (expected {n_faces}, got {face_weight.shape[0]})"
+            f"face_weight length must match number of triangles (expected {n_faces}, "
+            f"got {face_weight.shape[0]})"
         )
 
     if face_weight is None:

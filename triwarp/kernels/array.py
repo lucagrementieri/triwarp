@@ -173,7 +173,7 @@ def linear_search_index(values: wp.array[wp.Scalar], value: wp.Scalar) -> wp.int
 @wp.func
 def binary_search_index(values: wp.array[wp.Scalar], value: wp.Scalar) -> wp.int32:
     n = values.shape[0]
-    left = int(0)
+    left = wp.int32(0)
     right = n - 1
     result = n
     while left <= right:

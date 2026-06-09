@@ -1,4 +1,5 @@
 import warp as wp
+
 from triwarp.kernels import array as kernel_array
 
 
@@ -55,8 +56,8 @@ def query_bvh_ball_count(
     lower = wp.vec3(q[0] - r, q[1] - r, q[2] - r)
     upper = wp.vec3(q[0] + r, q[1] + r, q[2] + r)
     query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    j = int(0)
-    c = int(0)
+    j = wp.int32(0)
+    c = wp.int32(0)
     while wp.bvh_query_next(query, j):
         if wp.length(points[j] - q) <= r:
             c = c + 1
@@ -79,7 +80,7 @@ def query_bvh_ball_neighbors(
     lower = wp.vec3(q[0] - r, q[1] - r, q[2] - r)
     upper = wp.vec3(q[0] + r, q[1] + r, q[2] + r)
     query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    point_idx = int(0)
+    point_idx = wp.int32(0)
     w = int(offsets[tid])
     while wp.bvh_query_next(query, point_idx):
         d = wp.length(points[point_idx] - q)
@@ -101,8 +102,8 @@ def query_hashgrid_ball_count(
     q = queries[tid]
     r = radius
     query = wp.hash_grid_query(grid_id, q, r)
-    j = int(0)
-    c = int(0)
+    j = wp.int32(0)
+    c = wp.int32(0)
     while wp.hash_grid_query_next(query, j):
         if wp.length(points[j] - q) <= r:
             c = c + 1
@@ -123,7 +124,7 @@ def query_hashgrid_ball_neighbors(
     q = queries[tid]
     r = radius
     query = wp.hash_grid_query(grid_id, q, r)
-    point_idx = int(0)
+    point_idx = wp.int32(0)
     w = int(offsets[tid])
     while wp.hash_grid_query_next(query, point_idx):
         d = wp.length(points[point_idx] - q)
@@ -146,8 +147,8 @@ def query_bvh_aabb_count(
     lower = wp.vec3(q[0] - h, q[1] - h, q[2] - h)
     upper = wp.vec3(q[0] + h, q[1] + h, q[2] + h)
     query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    j = int(0)
-    c = int(0)
+    j = wp.int32(0)
+    c = wp.int32(0)
     while wp.bvh_query_next(query, j):
         c = c + 1
     out_counts[tid] = c
@@ -167,7 +168,7 @@ def query_bvh_aabb_neighbors(
     lower = wp.vec3(q[0] - h, q[1] - h, q[2] - h)
     upper = wp.vec3(q[0] + h, q[1] + h, q[2] + h)
     query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    primitive_idx = int(0)
+    primitive_idx = wp.int32(0)
     w = int(offsets[tid])
     while wp.bvh_query_next(query, primitive_idx):
         out_indices[w] = primitive_idx
@@ -186,8 +187,8 @@ def query_bvh_aabb_bounds_count(
     lower = query_lower[tid]
     upper = query_upper[tid]
     query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    j = int(0)
-    c = int(0)
+    j = wp.int32(0)
+    c = wp.int32(0)
     max_hits_i = int(max_hits)
     while wp.bvh_query_next(query, j) and c < max_hits_i:
         c = c + 1
@@ -207,10 +208,10 @@ def query_bvh_aabb_bounds_neighbors(
     lower = query_lower[tid]
     upper = query_upper[tid]
     query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    primitive_idx = int(0)
+    primitive_idx = wp.int32(0)
     w = int(offsets[tid])
     max_hits_i = int(max_hits)
-    hits = int(0)
+    hits = wp.int32(0)
     while wp.bvh_query_next(query, primitive_idx) and hits < max_hits_i:
         out_indices[w] = primitive_idx
         w = w + 1
@@ -233,7 +234,7 @@ def query_bvh_nearest_neighbors(
     lower = wp.vec3(q[0] - r, q[1] - r, q[2] - r)
     upper = wp.vec3(q[0] + r, q[1] + r, q[2] + r)
     query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    point_index = int(0)
+    point_index = wp.int32(0)
 
     while wp.bvh_query_next(query, point_index):
         d = wp.length(points[point_index] - q)
@@ -268,7 +269,7 @@ def query_hashgrid_nearest_neighbors(
     q = queries[tid]
 
     query = wp.hash_grid_query(grid_id, q, radius)
-    point_index = int(-1)
+    point_index = wp.int32(-1)
 
     while wp.hash_grid_query_next(query, point_index):
         d = wp.length(points[point_index] - q)

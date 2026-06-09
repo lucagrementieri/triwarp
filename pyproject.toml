@@ -46,11 +46,38 @@ exclude = [
 ]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP"]
+# Core rules to enable
+select = [
+    "F",   # Pyflakes (Severe syntax/runtime errors)
+    "E",
+    "W",   # Pycodestyle (Standard PEP 8 formatting)
+    "I",   # Isort (Clean, sorted imports)
+    "N",   # Pep8-naming (Mathematical & PEP8 naming conventions)
+    "D",   # Pydocstyle (Enforces docstrings for complex geometry algorithms)
+    "UP",  # Pyupgrade (Keeps syntax modern and performant)
+    "YTT", # Sys.version checks (Prevents compatibility bugs)
+    "BLE", # Blind-except (No generic 'except:')
+    "B",   # Bugbear (Finds subtle, design-level bugs)
+    "A",   # Builtins shadowing (Don't name a mesh variable 'id' or 'max')
+    "ICN", # Import conventions (Forces 'import numpy as np')
+    "PT",  # Pytest-style (Clean testing framework)
+    "RUF", # Ruff-specific internal rules
+]
+
+ignore = [
+    "D105", # Missing docstring in magic method (e.g., __str__ usually doesn't need one)
+    "D203", # Conflict fix: Prefer D211 (no blank line before class)
+    "D213", # Conflict fix: Prefer D212 (summary on first line)
+]
 
 [tool.ruff.lint.isort]
 known-first-party = ["triwarp"]
 split-on-trailing-comma = false
+
+[tool.ruff.lint.flake8-import-conventions.aliases]
+numpy = "np"
+trimesh = "tm"
+warp = "wp"
 
 [tool.ruff.format]
 skip-magic-trailing-comma = true

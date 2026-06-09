@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import warp as wp
 
-from triwarp.kernels import convex as kernel_convex
-import triwarp.typing as twt
 import triwarp as tw
+import triwarp.typing as twt
+from triwarp.kernels import convex as kernel_convex
 
 
 def face_adjacency_projections(

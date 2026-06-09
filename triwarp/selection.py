@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Literal
 
 import warp as wp
+
 import triwarp as tw
 
 
@@ -74,7 +75,8 @@ def submesh_from_face_indices(
         )
     if face_indices.device != device:
         raise ValueError(
-            f"face_indices must live on the same device as vertices, got {face_indices.device} and {device}"
+            f"face_indices must live on the same device as vertices, "
+            f"got {face_indices.device} and {device}"
         )
 
     k = int(face_indices.shape[0])
@@ -135,7 +137,8 @@ def submesh_from_face_mask(
         )
     if face_mask.device != device:
         raise ValueError(
-            f"face_mask must live on the same device as vertices, got {face_mask.device} and {device}"
+            f"face_mask must live on the same device as vertices, "
+            f"got {face_mask.device} and {device}"
         )
 
     face_indices = tw.array.flatnonzero(face_mask)
@@ -182,7 +185,8 @@ def submesh_from_vertex_indices(
         )
     if vertex_indices.device != device:
         raise ValueError(
-            f"vertex_indices must live on the same device as vertices, got {vertex_indices.device} and {device}"
+            f"vertex_indices must live on the same device as vertices, "
+            f"got {vertex_indices.device} and {device}"
         )
 
     face_indices = face_indices_from_vertex_indices(faces, vertex_indices, face_mode=face_mode)
@@ -232,7 +236,8 @@ def submesh_from_vertex_mask(
         )
     if vertex_mask.device != device:
         raise ValueError(
-            f"vertex_mask must live on the same device as vertices, got {vertex_mask.device} and {device}"
+            f"vertex_mask must live on the same device as vertices, "
+            f"got {vertex_mask.device} and {device}"
         )
     if int(vertex_mask.shape[0]) != n_vertices:
         raise ValueError(
@@ -279,7 +284,8 @@ def face_indices_from_vertex_indices(
     device = faces.device
     if vertex_indices.device != device:
         raise ValueError(
-            f"vertex_indices must live on the same device as faces, got {vertex_indices.device} and {device}"
+            f"vertex_indices must live on the same device as faces, "
+            f"got {vertex_indices.device} and {device}"
         )
 
     n_faces = int(faces.shape[0]) // 3

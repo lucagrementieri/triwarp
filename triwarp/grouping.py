@@ -1,11 +1,12 @@
 import warp as wp
 
-from triwarp.kernels import grouping as kernel_grouping
-import triwarp.typing as twt
 import triwarp as tw
+import triwarp.typing as twt
+from triwarp.kernels import grouping as kernel_grouping
 
 
-# TODO: probably implement with stream compaction instead, probably general function usable also for unique
+# TODO: probably implement with stream compaction instead, probably general function
+# usable also for unique
 def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
     """
     Return index groups of exactly ``length`` entries that share the same value.

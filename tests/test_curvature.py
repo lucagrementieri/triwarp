@@ -3,9 +3,9 @@ Regression tests for ``triwarp.curvature`` against ``trimesh.curvature`` (CPU re
 """
 
 import numpy as np
+import trimesh as tm
 import warp as wp
 
-import trimesh as tm
 import triwarp as tw
 
 

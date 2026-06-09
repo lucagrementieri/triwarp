@@ -434,7 +434,7 @@ def expand_query_target_pairs(
     q = wp.tid()
     start = int(offsets[q])
     count = int(hit_counts[q])
-    i = int(0)
+    i = wp.int32(0)
     w = start
     while i < count:
         out_pairs[w, 0] = wp.int32(q)

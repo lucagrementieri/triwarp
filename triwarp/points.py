@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import math
-from typing import overload, Literal
+from typing import Literal, cast, overload
 
 import warp as wp
-from triwarp.kernels import points as kernel_points
-from typing import cast
 
 import triwarp.typing as twt
+from triwarp.kernels import points as kernel_points
 
 
 def aabb_bounds(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
