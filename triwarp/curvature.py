@@ -15,25 +15,30 @@ def discrete_gaussian_curvature(
     radius: float,
 ) -> wp.array[wp.float32]:
     """
-    Return the discrete gaussian curvature measure of a sphere
-    centered at a point as detailed in 'Restricted Delaunay
-    triangulations and normal cycle'- Cohen-Steiner and Morvan.
+    Return the discrete Gaussian curvature measure of a sphere centered at each query point.
 
-    This is the sum of the vertex defects at all vertices
-    within the radius for each point.
+    As detailed in Cohen-Steiner and Morvan, "Restricted Delaunay triangulations and
+    normal cycle". This is the sum of vertex defects at all vertices within the radius
+    for each point.
 
     Parameters
     ----------
-    points : (n, 3) float
-      Points in space
-    radius : float ,
-      The sphere radius, which can be zero if vertices
-      passed are points.
+    points
+        ``(n,)`` query positions in space as ``wp.vec3``.
+    vertices
+        ``(n_vertices,)`` mesh vertex positions on the target device.
+    faces
+        Length-``3 * n_faces`` flat triangle index buffer.
+    face_angles
+        ``(n_faces, 3)`` interior angles per face (from
+        :func:`triwarp.triangles.face_angles`).
+    radius
+        Sphere radius; may be zero when ``vertices`` are the query points.
 
     Returns
-    --------
-    gaussian_curvature:  (n,) float
-      Discrete gaussian curvature measure.
+    -------
+    wp.array[wp.float32]
+        Length ``n`` discrete Gaussian curvature measure on ``points.device``.
     """
     nearest_indices, _, nearest_offsets = tw.points.query_hashgrid_ball_with_offsets(
         vertices, points, radius
@@ -58,12 +63,10 @@ def discrete_mean_curvature(
     face_adjacency_edges: twt.Array2dInt32 | None = None,
 ) -> wp.array[wp.float32]:
     """
-    Return the discrete mean curvature measure of a sphere
-    centered at a point as detailed in 'Restricted Delaunay
-    triangulations and normal cycle'- Cohen-Steiner and Morvan.
+    Return the discrete mean curvature measure of a sphere centered at each query point.
 
-    This is the sum of the angle at all edges contained in the
-    sphere for each point.
+    As detailed in Cohen-Steiner and Morvan, "Restricted Delaunay triangulations and
+    normal cycle". This is the sum of edge angles contained in the sphere for each point.
 
     Parameters
     ----------
@@ -114,7 +117,8 @@ def discrete_mean_curvature(
         )
     if face_adjacency is None:
         face_adjacency, face_adjacency_edges = tw.graph.face_adjacency(faces, return_edges=True)
-    assert face_adjacency is not None and face_adjacency_edges is not None
+    assert face_adjacency is not None
+    assert face_adjacency_edges is not None
 
     m = int(face_adjacency.shape[0])
     if m == 0:

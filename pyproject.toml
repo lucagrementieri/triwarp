@@ -65,10 +65,17 @@ select = [
 ]
 
 ignore = [
+    "D100", # Missing docstring in __init__
+    "D103", # Missing docstring in public package
+    "D104", # Missing docstring in public package
     "D105", # Missing docstring in magic method (e.g., __str__ usually doesn't need one)
     "D203", # Conflict fix: Prefer D211 (no blank line before class)
-    "D213", # Conflict fix: Prefer D212 (summary on first line)
+    "D212", # Conflict fix: Prefer D213 (summary on second line)
+    "D413", # Missing blank line after last section
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"triwarp/reduce.py" = ["A001"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["triwarp"]

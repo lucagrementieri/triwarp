@@ -253,7 +253,9 @@ def test_all_partial_tiles(device: str, shape: tuple[int, ...]) -> None:
     assert tw_reduce.all(mask_wp) == bool(np.all(mask_np))
 
 
-@pytest.mark.parametrize("shape,axis", [((9, 9), 0), ((9, 9), 1), ((65, 10), 0), ((65, 10), 1)])
+@pytest.mark.parametrize(
+    ("shape", "axis"), [((9, 9), 0), ((9, 9), 1), ((65, 10), 0), ((65, 10), 1)]
+)
 def test_scalar_reduce_partial_tiles_axis(device: str, shape: tuple[int, int], axis: int) -> None:
     rng = np.random.default_rng(99)
     values_np = rng.integers(-1000, 1000, shape, dtype=np.int32)
@@ -265,7 +267,9 @@ def test_scalar_reduce_partial_tiles_axis(device: str, shape: tuple[int, int], a
     assert np.array_equal(got_max.numpy(), values_np.max(axis=axis))
 
 
-@pytest.mark.parametrize("shape,axis", [((9, 9), 0), ((9, 9), 1), ((65, 10), 0), ((65, 10), 1)])
+@pytest.mark.parametrize(
+    ("shape", "axis"), [((9, 9), 0), ((9, 9), 1), ((65, 10), 0), ((65, 10), 1)]
+)
 def test_bool_reduce_partial_tiles_axis(device: str, shape: tuple[int, int], axis: int) -> None:
     rng = np.random.default_rng(99)
     mask_np = rng.choice([False, True], size=shape, replace=True)

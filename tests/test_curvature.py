@@ -1,6 +1,4 @@
-"""
-Regression tests for ``triwarp.curvature`` against ``trimesh.curvature`` (CPU reference).
-"""
+"""Regression tests for ``triwarp.curvature`` against ``trimesh.curvature`` (CPU reference)."""
 
 import numpy as np
 import trimesh as tm

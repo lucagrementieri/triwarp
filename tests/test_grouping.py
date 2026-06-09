@@ -24,7 +24,7 @@ group_test_data = (
 )
 
 
-@pytest.mark.parametrize("values, length, expected", group_test_data)
+@pytest.mark.parametrize(("values", "length", "expected"), group_test_data)
 def test_group(
     device: str, values: wp.array[wp.Int], length: int, expected: twt.Array2dInt32
 ) -> None:
@@ -56,7 +56,7 @@ def test_hash_vector_rows(device: str) -> None:
     assert np.array_equal(packed, packed_np)
 
     vectors_double_wp = wp.array(vectors_np, dtype=wp.vec3d, device=device)
-    with pytest.raises(ValueError, match="data must be a wp.array\\[wp.vec3\\]"):
+    with pytest.raises(ValueError, match=r"data must be a wp\.array\[wp\.vec3\]"):
         _ = tw.grouping.hash_vector_rows(vectors_double_wp)
 
 

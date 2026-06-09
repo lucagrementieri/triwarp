@@ -1,6 +1,7 @@
 """
-Regression tests for ``triwarp.points`` ball / k-nearest / AABB query APIs
-(BVH and HashGrid backends) against SciPy ``KDTree`` or brute-force reference.
+Regression tests for ``triwarp.points`` ball / k-nearest / AABB query APIs.
+
+Against SciPy ``KDTree`` or brute-force reference (BVH and HashGrid backends).
 """
 
 from __future__ import annotations
@@ -69,7 +70,8 @@ def test_query_ball_empty_ball(device: str, backend: Literal["bvh", "hashgrid"])
     query_indices_wp, query_distances_wp = query_ball(
         points_wp, query_wp, radius, return_sorted=True
     )
-    assert query_indices_wp.shape == (0,) and query_distances_wp.shape == (0,)
+    assert query_indices_wp.shape == (0,)
+    assert query_distances_wp.shape == (0,)
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
@@ -86,11 +88,15 @@ def test_query_ball_batch(device: str, backend: Literal["bvh", "hashgrid"]):
     ]
     query_distances_np = [
         np.linalg.norm(points[indices] - query, axis=1)
-        for indices, query in zip(query_indices_np, queries)
+        for indices, query in zip(query_indices_np, queries, strict=False)
     ]
     orders = [np.argsort(distances) for distances in query_distances_np]
-    query_indices_np = [indices[order] for indices, order in zip(query_indices_np, orders)]
-    query_distances_np = [distances[order] for distances, order in zip(query_distances_np, orders)]
+    query_indices_np = [
+        indices[order] for indices, order in zip(query_indices_np, orders, strict=False)
+    ]
+    query_distances_np = [
+        distances[order] for distances, order in zip(query_distances_np, orders, strict=False)
+    ]
 
     points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
     query_wp = wp.array(np.ascontiguousarray(queries), dtype=wp.vec3, device=device)
@@ -100,10 +106,12 @@ def test_query_ball_batch(device: str, backend: Literal["bvh", "hashgrid"]):
         points_wp, query_wp, radius, return_sorted=True
     )
 
-    for single_query_indices_wp, single_query_indices_np in zip(query_indices_wp, query_indices_np):
+    for single_query_indices_wp, single_query_indices_np in zip(
+        query_indices_wp, query_indices_np, strict=False
+    ):
         assert np.array_equal(single_query_indices_wp.numpy(), single_query_indices_np)
     for single_query_distances_wp, single_query_distances_np in zip(
-        query_distances_wp, query_distances_np
+        query_distances_wp, query_distances_np, strict=False
     ):
         assert np.allclose(
             single_query_distances_wp.numpy(), single_query_distances_np, rtol=1e-5, atol=1e-5
@@ -113,14 +121,14 @@ def test_query_ball_batch(device: str, backend: Literal["bvh", "hashgrid"]):
         points_wp, query_wp, radius, return_sorted=False
     )
     for single_query_indices_unsorted_wp, single_query_indices_wp in zip(
-        query_indices_unsorted_wp, query_indices_wp
+        query_indices_unsorted_wp, query_indices_wp, strict=False
     ):
         assert np.array_equal(
             np.sort(single_query_indices_unsorted_wp.numpy()),
             np.sort(single_query_indices_wp.numpy()),
         )
     for single_query_distances_unsorted_wp, single_query_distances_wp in zip(
-        query_distances_unsorted_wp, query_distances_wp
+        query_distances_unsorted_wp, query_distances_wp, strict=False
     ):
         assert np.allclose(
             np.sort(single_query_distances_unsorted_wp.numpy()),
@@ -144,15 +152,19 @@ def test_query_ball_empty(device: str, backend: Literal["bvh", "hashgrid"]):
     query_ball = tw.points.query_bvh_ball if backend == "bvh" else tw.points.query_hashgrid_ball
 
     indices, distances = query_ball(empty_points_wp, query_wp, radius)
-    assert indices.shape == (0,) and distances.shape == (0,)
+    assert indices.shape == (0,)
+    assert distances.shape == (0,)
 
     indices, distances = query_ball(empty_points_wp, queries_wp, radius)
-    assert len(indices) == queries_wp.shape[0] and len(distances) == queries_wp.shape[0]
-    for single_indices, single_distances in zip(indices, distances):
-        assert single_indices.shape == (0,) and single_distances.shape == (0,)
+    assert len(indices) == queries_wp.shape[0]
+    assert len(distances) == queries_wp.shape[0]
+    for single_indices, single_distances in zip(indices, distances, strict=False):
+        assert single_indices.shape == (0,)
+        assert single_distances.shape == (0,)
 
     indices, distances = query_ball(points_wp, empty_queries_wp, radius)
-    assert len(indices) == 0 and len(distances) == 0
+    assert len(indices) == 0
+    assert len(distances) == 0
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
@@ -240,7 +252,8 @@ def test_query_nearest_empty(device: str, backend: Literal["bvh", "hashgrid"]):
     assert distances.shape == (queries_wp.shape[0], k)
 
     indices, distances = query_nearest(points_wp, empty_queries_wp, k=k)
-    assert indices.shape == (0, k) and distances.shape == (0, k)
+    assert indices.shape == (0, k)
+    assert distances.shape == (0, k)
 
 
 def test_query_bvh_aabb_bounds_with_offsets(device: str) -> None:

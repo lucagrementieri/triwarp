@@ -40,7 +40,8 @@ def intersects_location(
     *,
     max_t: float | None = None,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32]]:
-    """Return world-space locations where rays hit the mesh surface (first hit per ray).
+    """
+    Return world-space locations where rays hit the mesh surface (first hit per ray).
 
     Uses ``wp.mesh_query_ray`` on the mesh BVH. Ray directions are unitized before
     querying. Returns only rays that hit within ``max_t`` as sparse ``(m,)`` arrays.
@@ -111,7 +112,8 @@ def intersects_first(
     *,
     max_t: float | None = None,
 ) -> wp.array[wp.int32]:
-    """Find the index of the first triangle each ray hits.
+    """
+    Find the index of the first triangle each ray hits.
 
     Uses ``wp.mesh_query_ray`` on the mesh BVH. Ray directions are unitized before
     querying. The search distance along each ray defaults to the diagonal of the
@@ -158,7 +160,8 @@ def intersects_any(
     *,
     max_t: float | None = None,
 ) -> wp.array[wp.bool]:
-    """Check whether each ray hits the mesh surface.
+    """
+    Check whether each ray hits the mesh surface.
 
     Uses ``wp.mesh_query_ray_anyhit`` on the mesh BVH. Ray directions are unitized
     before querying. The search distance along each ray defaults to the diagonal of
@@ -201,7 +204,8 @@ def intersects_any(
 def contains_points(
     mesh: wp.Mesh, points: wp.array[wp.vec3], *, n_sample: int = 5, perturbation_scale: float = 0.1
 ) -> wp.array[wp.bool]:
-    """Test whether query points lie inside a closed mesh (ray parity sign).
+    """
+    Test whether query points lie inside a closed mesh (ray parity sign).
 
     Uses ``wp.mesh_query_point_sign_parity`` on the mesh BVH. Points outside the
     mesh axis-aligned bounding box are rejected without a ray test. The closest-point

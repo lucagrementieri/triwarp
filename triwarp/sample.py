@@ -23,7 +23,8 @@ def sample_surface(
     face_weight: wp.array[wp.float32] | None = None,
     seed: int | None = None,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-    """Sample points uniformly on a triangle mesh surface (area-weighted faces).
+    """
+    Sample points uniformly on a triangle mesh surface (area-weighted faces).
 
     Uses ``face_normals_and_areas`` for default triangle weights. Builds a CDF and
     draws triangle indices with ``wp.sample_cdf``, then uniform points with

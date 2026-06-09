@@ -1,6 +1,4 @@
-"""
-Regression tests for ``triwarp.triangles`` against ``trimesh.triangles`` (CPU reference).
-"""
+"""Regression tests for ``triwarp.triangles`` against ``trimesh.triangles`` (CPU reference)."""
 
 from __future__ import annotations
 

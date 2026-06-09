@@ -31,7 +31,7 @@ __all__ = [
     "sample",
     "selection",
     "triangles",
-    "vertices",
-    "unique",
     "typing",
+    "unique",
+    "vertices",
 ]

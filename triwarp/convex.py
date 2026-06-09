@@ -16,8 +16,7 @@ def face_adjacency_projections(
     face_normals: wp.array[wp.vec3] | None = None,
 ) -> wp.array[wp.float32]:
     """
-    Projection of the non-shared vertex of each adjacent face pair onto the
-    plane of the first face in the pair.
+    Project each adjacent face pair's non-shared vertex onto the first face plane.
 
     For each row of ``face_adjacency``, the dot product is taken between the
     normal of face ``face_adjacency[k, 0]`` and the vector from one endpoint of
@@ -80,7 +79,8 @@ def face_adjacency_projections(
         )
     if face_adjacency is None:
         face_adjacency, face_adjacency_edges = tw.graph.face_adjacency(faces, return_edges=True)
-    assert face_adjacency is not None and face_adjacency_edges is not None
+    assert face_adjacency is not None
+    assert face_adjacency_edges is not None
 
     if face_adjacency_unshared is None:
         face_adjacency_unshared = tw.graph.face_adjacency_unshared(

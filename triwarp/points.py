@@ -351,7 +351,7 @@ def query_hashgrid_ball_with_offsets(
     Low-level ball query: neighbors in one concatenated pair plus per-query offsets.
 
     Same geometry as :func:`query_hashgrid_ball` (hash-grid broad-phase out to ``r``,
-    ``float32`` test ``‖points[i] − q‖₂ ≤ r``). Semantics match
+    ``float32`` test ``‖points[i] - q‖₂ ≤ r``). Semantics match
     :meth:`scipy.spatial.KDTree.query_ball_point` with ``p=2`` and ``eps=0``.
 
     Prefer :func:`query_hashgrid_ball` for a Python list of one array per query; use this
@@ -387,7 +387,7 @@ def query_hashgrid_ball_with_offsets(
         understood as ``neighbor_indices_flat.shape[0]`` (the total neighbor count).
 
         ``neighbor_indices_flat`` and ``neighbor_distances_flat`` have that total length
-        and list point indices and distances ``‖points[i] − q‖₂`` in parallel. Empty
+        and list point indices and distances ``‖points[i] - q‖₂`` in parallel. Empty
         ``points`` still returns length-``m`` zero ``offsets``; empty neighbor sets yield
         length-0 flat arrays and zero ``offsets``.
 
@@ -541,7 +541,7 @@ def query_hashgrid_ball(
     neighbor_indices, neighbor_distances
         If ``queries`` has ``m`` rows: ``list[wp.array[wp.int32]]`` and
         ``list[wp.array[wp.float32]]``, each of length ``m``. Element ``k`` lists neighbors
-        of ``queries[k]`` (indices into ``points`` and distances ``‖points[i] − q‖₂``).
+        of ``queries[k]`` (indices into ``points`` and distances ``‖points[i] - q‖₂``).
 
         If ``queries`` is a single ``wp.vec3``: two rank-1 arrays (possibly length 0), not
         lists.

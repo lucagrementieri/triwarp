@@ -17,7 +17,8 @@ def segments_with_plane(
     *,
     line_segments: bool = True,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.bool]]:
-    """Calculate plane-line intersections for batched segment endpoints.
+    """
+    Calculate plane-line intersections for batched segment endpoints.
 
     Each row pair ``(start_points[i], end_points[i])`` defines one line to test.
     Matches :func:`trimesh.intersections.plane_lines` with Trimesh's ``(2, n, 3)``
@@ -81,7 +82,8 @@ def mesh_with_plane(
     *,
     return_faces: bool = False,
 ) -> wp.array[wp.vec3] | tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-    """Intersect a mesh with a plane, returning line segments on the plane.
+    """
+    Intersect a mesh with a plane, returning line segments on the plane.
 
     Matches :func:`trimesh.intersections.mesh_plane` for indexed triangle meshes.
     To section a face subset, extract a submesh first (e.g.
@@ -165,7 +167,8 @@ def mesh_with_mesh(
     *,
     max_triangle_collisions: int = 16,
 ) -> wp.array[wp.vec3]:
-    """Intersect two meshes, returning line segments along the intersection curve(s).
+    """
+    Intersect two meshes, returning line segments along the intersection curve(s).
 
     Broad phase uses a BVH over the mesh with fewer faces; each triangle of the
     other mesh queries that BVH with its axis-aligned bounding box. Narrow phase

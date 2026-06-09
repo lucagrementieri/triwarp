@@ -90,14 +90,13 @@ def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
 def index_sparse(
     n_rows: int,
     indices: twt.Array2dInt32,
-    data: wp.array[wp.Scalar] | None = None,  # pyright: ignore[reportDeprecated]
+    data: wp.array[wp.Scalar] | None = None,
     dtype: type[wp.Scalar] | None = None,
     *,
     prune_numerical_zeros: bool = True,
 ) -> wps.BsrMatrix[wp.Scalar]:
     """
-    Build a sparse matrix indicating which row indices (e.g. vertices) appear in which
-    columns (e.g. faces).
+    Build a sparse row/column incidence matrix from flat index columns.
 
     This mirrors ``trimesh.geometry.index_sparse``, but returns a :class:`warp.sparse.BsrMatrix`
     in 1x1 BSR (CSR) form instead of ``scipy.sparse.coo_matrix``.
@@ -259,7 +258,7 @@ def _isin_lookup_sorted(
 
 def flatnonzero(mask: wp.array[wp.bool]) -> wp.array[wp.int32]:
     """
-    Indices of ``True`` entries in a 1D boolean mask (``numpy.flatnonzero``).
+    Return indices of ``True`` entries in a 1D boolean mask (``numpy.flatnonzero``).
 
     Parameters
     ----------

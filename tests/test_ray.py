@@ -213,7 +213,7 @@ def test_intersects_location_cave_cube(cave_cube: tuple[tm.Trimesh, wp.Mesh]):
     order_tm = np.argsort(ray_tm)
     assert np.array_equal(ray_wp_np[order_wp], ray_tm[order_tm])
     assert np.allclose(loc_wp_np[order_wp], loc_tm[order_tm], rtol=1e-5, atol=1e-4)
-    for p, r in zip(loc_wp_np[order_wp], ray_wp_np[order_wp]):
+    for p, r in zip(loc_wp_np[order_wp], ray_wp_np[order_wp], strict=False):
         assert np.allclose(p[:2], origins_np[r][:2], rtol=1e-5, atol=1e-5)
         assert np.isclose(p[2], mesh_tm.bounds[0, 2], atol=1e-4)
 

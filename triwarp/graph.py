@@ -14,7 +14,7 @@ from triwarp.kernels import selection as kernel_selection
 from triwarp.kernels.algorithms import connected_components as kernel_connected_components
 
 
-def faces_to_edges(faces: wp.array[wp.int32], sorted: bool = False) -> twt.Array2dInt32:
+def faces_to_edges(faces: wp.array[wp.int32], sorted: bool = False) -> twt.Array2dInt32:  # noqa: A002
     """
     Directed triangle edges from a flat ``(i0, i1, i2)`` index buffer.
 
@@ -29,7 +29,7 @@ def faces_to_edges(faces: wp.array[wp.int32], sorted: bool = False) -> twt.Array
         ``(i0, i1, i2), (i0, i1, i2), ...`` of vertex indices, the same convention as
         :mod:`triwarp.triangles`.
     sorted
-        If ``True``, sort the edges by the minimum vertex index first.
+        If ``True``, sort each edge row by the minimum vertex index first.
 
     Returns
     -------
@@ -125,7 +125,7 @@ def face_adjacency(
             return empty_array, twt.empty_int32_2d((0, 2), device=faces.device)
         return empty_array
     if edges_sorted is None:
-        edges_sorted = faces_to_edges(faces, sorted=True)
+        edges_sorted = faces_to_edges(faces, sort_edges=True)
     edges_face = wp.array(
         [f for f in range(n_faces) for _ in range(3)], dtype=wp.int32, device=faces.device
     )
@@ -269,7 +269,8 @@ def face_adjacency_unshared(
         )
     if face_adjacency is None:
         face_adjacency, face_adjacency_edges = _compute_face_adjacency(faces, return_edges=True)
-    assert face_adjacency is not None and face_adjacency_edges is not None
+    assert face_adjacency is not None
+    assert face_adjacency_edges is not None
     if face_adjacency.shape[0] != face_adjacency_edges.shape[0]:
         raise ValueError(
             "face_adjacency and face_adjacency_edges row counts must match, "
@@ -374,7 +375,7 @@ def concatenate(
 
     Parameters
     ----------
-    meshes
+    meshes_data
         Sequence of ``(vertices, faces)`` pairs using triwarp's flat face layout.
         An empty sequence yields empty arrays on ``cpu``.
 
@@ -409,9 +410,9 @@ def concatenate(
     if sum(vertex_counts) == 0:
         concatenated_vertices = wp.empty(0, dtype=wp.vec3, device=device)
     else:
-        concatenated_vertices, _ = tw.array.pack_1d_arrays(
-            [vertices for vertices, _ in meshes_data]
-        )
+        concatenated_vertices, _ = tw.array.pack_1d_arrays([
+            vertices for vertices, _ in meshes_data
+        ])
 
     concatenated_faces = wp.empty(total_indices, dtype=wp.int32, device=device)
 

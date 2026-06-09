@@ -1,6 +1,4 @@
-"""
-Regression tests for ``triwarp.geometry`` against ``trimesh.geometry`` (CPU reference).
-"""
+"""Regression tests for ``triwarp.geometry`` against ``trimesh.geometry`` (CPU reference)."""
 
 import numpy as np
 import numpy.typing as npt
@@ -56,7 +54,7 @@ def test_sort_rows(device: str):
     assert np.array_equal(data_wp.numpy(), sorted_data_np)
 
 
-@pytest.mark.parametrize("data", (None, np.arange(1, 13, dtype=np.int32)))
+@pytest.mark.parametrize("data", [None, np.arange(1, 13, dtype=np.int32)])
 def test_index_sparse(data: npt.NDArray[np.int32] | None, device: str):
     n_rows = 4
     indices = np.array([[0, 1, 2], [0, 3, 1], [1, 2, 3], [0, 2, 3]])

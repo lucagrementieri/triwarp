@@ -7,11 +7,11 @@ from triwarp.kernels import array as kernel_array
 def line_ball_intersection_segment(
     start_point: wp.vec3, end_point: wp.vec3, center: wp.vec3, radius: wp.float32
 ) -> wp.float32:
-    L = end_point - start_point
+    segment = end_point - start_point
     oc = start_point - center
     r = radius
-    ldotl = wp.dot(L, L)
-    ldotoc = wp.dot(L, oc)
+    ldotl = wp.dot(segment, segment)
+    ldotoc = wp.dot(segment, oc)
     ocdotoc = wp.dot(oc, oc)
     discrim = ldotoc * ldotoc - ldotl * (ocdotoc - r * r)
 

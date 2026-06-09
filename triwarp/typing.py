@@ -1,4 +1,5 @@
-"""Warp array type aliases and runtime rank checks for Python wrappers.
+"""
+Warp array type aliases and runtime rank checks for Python wrappers.
 
 Use these aliases in :mod:`triwarp` Python APIs instead of ``wp.array2d[dtype]``, which
 static checkers treat as Warp annotation objects (no ``.shape`` / indexing).
@@ -49,9 +50,9 @@ else:
 
 __all__ = [
     "Array1dFloat",
+    "Array1dFloat32",
     "Array1dInt",
     "Array1dInt32",
-    "Array1dFloat32",
     "Array1dScalar",
     "Array2dFloat",
     "Array2dFloat32",

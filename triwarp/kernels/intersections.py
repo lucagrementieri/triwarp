@@ -220,7 +220,7 @@ def intersection_line_coordinate(
     start1: wp.vec3, direction1: wp.vec3, start2: wp.vec3, direction2: wp.vec3
 ) -> wp.float32:
     minors = wp.cross(direction1, direction2)
-    order_x, order_y, order_z = vec3_argsort(minors)
+    order_x, _order_y, order_z = vec3_argsort(minors)
     minor_x = vec3_get(minors, order_x)
     minor_z = vec3_get(minors, order_z)
     i = order_z
