@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.constants import TOLERANCE_MERGE, TOLERANCE_ZERO
+from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
 
 
 @wp.func
@@ -25,7 +25,7 @@ def triangle_edges(vertices: wp.array[wp.vec3], face: wp.array[wp.int32]) -> tup
 def face_normals_and_area(vertices: wp.array[wp.vec3], face: wp.array[wp.int32]) -> tuple[wp.vec3, wp.float32]:
     normal = triangle_cross(vertices, face)
     norm = wp.length(normal)
-    if norm > TOLERANCE_ZERO:
+    if norm > TOLERANCE_ZERO_CONSTANT:
         normal = normal / norm
     area = 0.5 * norm
     return normal, area
@@ -62,9 +62,9 @@ def angles(
     out_angles[f, 2] = wp.pi - out_angles[f, 0] - out_angles[f, 1]
 
     degen = (
-        (out_angles[f][0] < TOLERANCE_MERGE)
-        or (out_angles[f][1] < TOLERANCE_MERGE)
-        or (out_angles[f][2] < TOLERANCE_MERGE)
+        (out_angles[f][0] < TOLERANCE_MERGE_CONSTANT)
+        or (out_angles[f][1] < TOLERANCE_MERGE_CONSTANT)
+        or (out_angles[f][2] < TOLERANCE_MERGE_CONSTANT)
     )
     if degen:
         out_angles[f, 0] = 0.0
@@ -104,10 +104,10 @@ def nondegenerate(
     height_e0 = 2.0 * area / length_e0
     height_e1 = 2.0 * area / length_e1
     out_nondegenerate[f] = (
-        (height_e0 > TOLERANCE_MERGE)
-        and (height_e1 > TOLERANCE_MERGE)
-        and (length_e0 > TOLERANCE_MERGE)
-        and (length_e1 > TOLERANCE_MERGE)
+        (height_e0 > TOLERANCE_MERGE_CONSTANT)
+        and (height_e1 > TOLERANCE_MERGE_CONSTANT)
+        and (length_e0 > TOLERANCE_MERGE_CONSTANT)
+        and (length_e1 > TOLERANCE_MERGE_CONSTANT)
     )
 
 
@@ -194,14 +194,14 @@ def closest_point(
     bp = points[f] - vertices[triangle_face[1]]
     d3 = wp.dot(ab, bp)
     d4 = wp.dot(ac, bp)
-    is_b = d3 > -TOLERANCE_ZERO and d4 <= d3
+    is_b = d3 > -TOLERANCE_ZERO_CONSTANT and d4 <= d3
     if is_b:
         out_closest[f] = vertices[triangle_face[1]]
         return
 
     # check if P in edge region of AB, if so return projection of P onto A
     vc = (d1 * d4) - (d3 * d2)
-    is_ab = vc < TOLERANCE_ZERO and d1 > -TOLERANCE_ZERO and d3 < TOLERANCE_ZERO
+    is_ab = vc < TOLERANCE_ZERO_CONSTANT and d1 > -TOLERANCE_ZERO_CONSTANT and d3 < TOLERANCE_ZERO_CONSTANT
     if is_ab:
         v = d1 / (d1 - d3)
         out_closest[f] = vertices[triangle_face[0]] + v * ab
@@ -211,14 +211,14 @@ def closest_point(
     cp = points[f] - vertices[triangle_face[2]]
     d5 = wp.dot(ab, cp)
     d6 = wp.dot(ac, cp)
-    is_c = d6 > -TOLERANCE_ZERO and d5 <= d6
+    is_c = d6 > -TOLERANCE_ZERO_CONSTANT and d5 <= d6
     if is_c:
         out_closest[f] = vertices[triangle_face[2]]
         return
 
     # check if P in edge region of AC, if so return projection of P onto AC
     vb = (d5 * d2) - (d1 * d6)
-    is_ac = vb < TOLERANCE_ZERO and d2 > -TOLERANCE_ZERO and d6 < TOLERANCE_ZERO
+    is_ac = vb < TOLERANCE_ZERO_CONSTANT and d2 > -TOLERANCE_ZERO_CONSTANT and d6 < TOLERANCE_ZERO_CONSTANT
     if is_ac:
         w = d2 / (d2 - d6)
         out_closest[f] = vertices[triangle_face[0]] + w * ac
@@ -226,7 +226,7 @@ def closest_point(
 
     # check if P in edge region of BC, if so return projection of P onto BC
     va = (d3 * d6) - (d5 * d4)
-    is_bc = va < TOLERANCE_ZERO and (d4 - d3) > -TOLERANCE_ZERO and (d5 - d6) > -TOLERANCE_ZERO
+    is_bc = va < TOLERANCE_ZERO_CONSTANT and (d4 - d3) > -TOLERANCE_ZERO_CONSTANT and (d5 - d6) > -TOLERANCE_ZERO_CONSTANT
     if is_bc:
         d43 = d4 - d3
         w = d43 / (d43 + (d5 - d6))

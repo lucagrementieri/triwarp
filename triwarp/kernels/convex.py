@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.constants import TOLERANCE_MERGE
+from triwarp.constants import TOLERANCE_MERGE_CONSTANT
 
 
 @wp.kernel
@@ -26,4 +26,4 @@ def face_adjacency_convex(
     out_convex: wp.array[wp.bool],
 ) -> None:
     tid = int(wp.tid())
-    out_convex[tid] = projections[tid] < TOLERANCE_MERGE
+    out_convex[tid] = projections[tid] < TOLERANCE_MERGE_CONSTANT

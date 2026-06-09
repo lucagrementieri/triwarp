@@ -1,6 +1,7 @@
 import warp as wp
 
-from triwarp.constants import TOLERANCE_MERGE, TOLERANCE_ZERO
+from triwarp.constants import TOLERANCE_ZERO_CONSTANT
+from triwarp.kernels import array as kernel_array
 
 CASE_NONE = wp.constant(wp.int32(0))
 CASE_BASIC = wp.constant(wp.int32(1))
@@ -9,28 +10,8 @@ CASE_ONE_EDGE = wp.constant(wp.int32(3))
 
 
 @wp.func
-def vertex_sign(dot: wp.float32) -> wp.int32:
-    if dot < -TOLERANCE_MERGE:
-        return wp.int32(-1)
-    if dot > TOLERANCE_MERGE:
-        return wp.int32(1)
-    return wp.int32(0)
-
-
-@wp.func
-def sort3_int(a: wp.int32, b: wp.int32, c: wp.int32) -> tuple[wp.int32, wp.int32, wp.int32]:
-    if a > b:
-        a, b = b, a
-    if b > c:
-        b, c = c, b
-    if a > b:
-        a, b = b, a
-    return a, b, c
-
-
-@wp.func
 def triangle_case_code(s0: wp.int32, s1: wp.int32, s2: wp.int32) -> wp.int32:
-    sa, sb, sc = sort3_int(s0, s1, s2)
+    sa, sb, sc = kernel_array.sort3(s0, s1, s2)
     coded = wp.int32(14) + (sa << 3) + (sb << 2) + (sc << 1)
     if coded == wp.int32(4) or coded == wp.int32(12):
         return CASE_BASIC
@@ -42,7 +23,7 @@ def triangle_case_code(s0: wp.int32, s1: wp.int32, s2: wp.int32) -> wp.int32:
 
 
 @wp.func
-def plane_line_intersect(
+def plane_with_line(
     plane_origin: wp.vec3,
     plane_normal: wp.vec3,
     p0: wp.vec3,
@@ -53,16 +34,16 @@ def plane_line_intersect(
     n = wp.normalize(plane_normal)
     t = wp.dot(n, plane_origin - p0)
     b = wp.dot(n, line_dir)
-    valid = wp.abs(b) > TOLERANCE_ZERO
+    valid = wp.abs(b) > TOLERANCE_ZERO_CONSTANT
     if line_segments:
         test = wp.dot(n, plane_origin - p1)
         different_sides = wp.sign(t) != wp.sign(test)
-        nonzero = (wp.abs(t) > TOLERANCE_ZERO) or (wp.abs(test) > TOLERANCE_ZERO)
+        nonzero = (wp.abs(t) > TOLERANCE_ZERO_CONSTANT) or (wp.abs(test) > TOLERANCE_ZERO_CONSTANT)
         valid = valid and different_sides and nonzero
     if valid:
         d = t / b
-        return p0 + line_dir * d, True
-    return wp.vec3(0.0, 0.0, 0.0), False
+        return p0 + line_dir * d, wp.bool(True)
+    return wp.vec3(0.0, 0.0, 0.0), wp.bool(False)
 
 
 @wp.func
@@ -84,7 +65,7 @@ def vertex_at(local_index: wp.int32, v0: wp.vec3, v1: wp.vec3, v2: wp.vec3) -> w
 
 
 @wp.func
-def mesh_plane_segment_for_face(
+def mesh_with_plane_segment_for_face(
     plane_origin: wp.vec3,
     plane_normal: wp.vec3,
     v0: wp.vec3,
@@ -103,8 +84,8 @@ def mesh_plane_segment_for_face(
         unique_v = vertex_at(unique_i, v0, v1, v2)
         va = vertex_at(other_a, v0, v1, v2)
         vb = vertex_at(other_b, v0, v1, v2)
-        p_a, valid_a = plane_line_intersect(plane_origin, plane_normal, unique_v, va, False)
-        p_b, valid_b = plane_line_intersect(plane_origin, plane_normal, unique_v, vb, False)
+        p_a, valid_a = plane_with_line(plane_origin, plane_normal, unique_v, va, False)
+        p_b, valid_b = plane_with_line(plane_origin, plane_normal, unique_v, vb, False)
         if valid_a and valid_b:
             return True, p_a, p_b
         return False, wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0)
@@ -122,7 +103,7 @@ def mesh_plane_segment_for_face(
         on_plane_v = vertex_at(on_plane_i, v0, v1, v2)
         va = vertex_at(other_a, v0, v1, v2)
         vb = vertex_at(other_b, v0, v1, v2)
-        hit, valid = plane_line_intersect(plane_origin, plane_normal, va, vb, False)
+        hit, valid = plane_with_line(plane_origin, plane_normal, va, vb, False)
         if valid:
             return True, on_plane_v, hit
         return False, wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0)
@@ -156,7 +137,7 @@ def vertex_plane_dots(
 
 
 @wp.kernel
-def mesh_plane_segments(
+def mesh_with_plane_segments(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     vertex_dots: wp.array[wp.float32],
@@ -172,10 +153,10 @@ def mesh_plane_segments(
     v0 = vertices[i0]
     v1 = vertices[i1]
     v2 = vertices[i2]
-    s0 = vertex_sign(vertex_dots[i0])
-    s1 = vertex_sign(vertex_dots[i1])
-    s2 = vertex_sign(vertex_dots[i2])
-    valid, p0, p1 = mesh_plane_segment_for_face(plane_origin, plane_normal, v0, v1, v2, s0, s1, s2)
+    s0 = kernel_array.tolerance_sign(vertex_dots[i0])
+    s1 = kernel_array.tolerance_sign(vertex_dots[i1])
+    s2 = kernel_array.tolerance_sign(vertex_dots[i2])
+    valid, p0, p1 = mesh_with_plane_segment_for_face(plane_origin, plane_normal, v0, v1, v2, s0, s1, s2)
     out_valid[f] = valid
     out_segments[f, 0] = p0
     out_segments[f, 1] = p1
@@ -192,12 +173,6 @@ def segments_with_plane(
     out_valid: wp.array[wp.bool],
 ) -> None:
     tid = wp.tid()
-    hit, valid = plane_line_intersect(
-        plane_origin,
-        plane_normal,
-        start_points[tid],
-        end_points[tid],
-        line_segments,
-    )
+    hit, valid = plane_with_line(plane_origin, plane_normal, start_points[tid], end_points[tid], line_segments)
     out_intersections[tid] = hit
     out_valid[tid] = valid

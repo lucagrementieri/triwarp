@@ -1,5 +1,27 @@
 import warp as wp
 
+from triwarp.constants import TOLERANCE_MERGE_CONSTANT
+
+
+@wp.func
+def sort3(a: wp.Scalar, b: wp.Scalar, c: wp.Scalar) -> tuple[wp.Scalar, wp.Scalar, wp.Scalar]:
+    if a > b:
+        a, b = b, a
+    if b > c:
+        b, c = c, b
+    if a > b:
+        a, b = b, a
+    return a, b, c
+
+
+@wp.func
+def tolerance_sign(value: wp.float32) -> wp.int32:
+    if value < -TOLERANCE_MERGE_CONSTANT:
+        return wp.int32(-1)
+    if value > TOLERANCE_MERGE_CONSTANT:
+        return wp.int32(1)
+    return wp.int32(0)
+
 
 @wp.kernel
 def sub(array: wp.array[wp.Scalar], n: wp.Scalar) -> None:

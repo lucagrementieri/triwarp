@@ -121,7 +121,7 @@ def mesh_with_plane(
     valid = wp.empty(n_faces, dtype=wp.bool, device=device)
     segments = wp.empty((n_faces, 2), dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_intersections.mesh_plane_segments,
+        kernel_intersections.mesh_with_plane_segments,
         dim=n_faces,
         inputs=[vertices, faces, vertex_dots, plane_origin, plane_normal, valid, segments],
         device=device,
