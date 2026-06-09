@@ -125,7 +125,7 @@ def face_adjacency(
             return empty_array, twt.empty_int32_2d((0, 2), device=faces.device)
         return empty_array
     if edges_sorted is None:
-        edges_sorted = faces_to_edges(faces, sort_edges=True)
+        edges_sorted = faces_to_edges(faces, sorted=True)
     edges_face = wp.array(
         [f for f in range(n_faces) for _ in range(3)], dtype=wp.int32, device=faces.device
     )

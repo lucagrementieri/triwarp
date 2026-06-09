@@ -2,6 +2,12 @@ import warp as wp
 
 from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels import triangles as kernel_triangles
+
+SLICE_SIGN_INSIDE = wp.constant(wp.int32(-1))
+SLICE_SIGN_OUTSIDE = wp.constant(wp.int32(1))
+SLICE_SIGN_ON_PLANE = wp.constant(wp.int32(0))
+EDGE_DENOM_EPSILON = wp.constant(wp.float32(1e-12))
 
 CASE_NONE = wp.constant(wp.int32(0))
 CASE_BASIC = wp.constant(wp.int32(1))
@@ -485,3 +491,178 @@ def segment_nondegenerate(segments: wp.array2d[wp.vec3], out_valid: wp.array[wp.
     p0 = segments[tid, 0]
     p1 = segments[tid, 1]
     out_valid[tid] = wp.length(p1 - p0) > TOLERANCE_MERGE_CONSTANT
+
+
+@wp.func
+def find_outside_corner(s0: wp.int32, s1: wp.int32, s2: wp.int32) -> wp.int32:
+    if s0 == SLICE_SIGN_OUTSIDE:
+        return wp.int32(0)
+    if s1 == SLICE_SIGN_OUTSIDE:
+        return wp.int32(1)
+    return wp.int32(2)
+
+
+@wp.func
+def find_inside_corner(s0: wp.int32, s1: wp.int32, s2: wp.int32) -> wp.int32:
+    if s0 == SLICE_SIGN_INSIDE:
+        return wp.int32(0)
+    if s1 == SLICE_SIGN_INSIDE:
+        return wp.int32(1)
+    return wp.int32(2)
+
+
+@wp.func
+def edge_plane_intersection(
+    origin: wp.vec3, dest: wp.vec3, plane_origin: wp.vec3, plane_normal: wp.vec3
+) -> wp.vec3:
+    direction = dest - origin
+    numerator = wp.dot(plane_origin - origin, plane_normal)
+    denominator = wp.dot(direction, plane_normal)
+    if denominator == wp.float32(0.0):
+        denominator = EDGE_DENOM_EPSILON
+    dist = numerator / denominator
+    return origin + direction * dist
+
+
+@wp.kernel
+def classify_faces_for_slice(
+    faces: wp.array[wp.int32],
+    vertex_dots: wp.array[wp.float32],
+    out_inside: wp.array[wp.bool],
+    out_cut_quad: wp.array[wp.bool],
+    out_cut_tri: wp.array[wp.bool],
+    out_on_plane: wp.array[wp.bool],
+    out_signs: wp.array2d[wp.int32],
+) -> None:
+    f = wp.tid()
+    i0 = faces[f * 3]
+    i1 = faces[f * 3 + 1]
+    i2 = faces[f * 3 + 2]
+    s0 = -kernel_array.tolerance_sign(vertex_dots[i0])
+    s1 = -kernel_array.tolerance_sign(vertex_dots[i1])
+    s2 = -kernel_array.tolerance_sign(vertex_dots[i2])
+    out_signs[f, 0] = s0
+    out_signs[f, 1] = s1
+    out_signs[f, 2] = s2
+
+    signs_sum = s0 + s1 + s2
+    signs_asum = wp.abs(s0) + wp.abs(s1) + wp.abs(s2)
+
+    inside = signs_sum == -signs_asum
+    onedge = (signs_asum >= wp.int32(2)) and (wp.abs(signs_sum) <= wp.int32(1))
+    on_plane = signs_asum == wp.int32(0)
+    cut_quad = onedge and (signs_sum < wp.int32(0))
+    cut_tri = onedge and (signs_sum >= wp.int32(0))
+
+    out_inside[f] = inside
+    out_cut_quad[f] = cut_quad
+    out_cut_tri[f] = cut_tri
+    out_on_plane[f] = on_plane
+
+
+@wp.kernel
+def resolve_on_plane_faces(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    plane_normal: wp.vec3,
+    out_on_plane: wp.array[wp.bool],
+    out_inside: wp.array[wp.bool],
+) -> None:
+    f = wp.tid()
+    if not out_on_plane[f]:
+        return
+    normal, area = kernel_triangles.face_normals_and_area(vertices, faces[f * 3 : (f + 1) * 3])
+    valid = area > TOLERANCE_ZERO_CONSTANT
+    if not valid:
+        out_on_plane[f] = False
+        out_inside[f] = False
+        return
+    out_inside[f] = wp.dot(normal, plane_normal) < wp.float32(0.0)
+
+
+@wp.kernel
+def edge_plane_intersections(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_indices: wp.array[wp.int32],
+    plane_origin: wp.vec3,
+    plane_normal: wp.vec3,
+    out_points: wp.array2d[wp.vec3],
+) -> None:
+    tid = wp.tid()
+    face_index = face_indices[tid]
+    base = face_index * wp.int32(3)
+    v0 = vertices[faces[base]]
+    v1 = vertices[faces[base + wp.int32(1)]]
+    v2 = vertices[faces[base + wp.int32(2)]]
+    out_points[tid, 0] = edge_plane_intersection(v0, v1, plane_origin, plane_normal)
+    out_points[tid, 1] = edge_plane_intersection(v1, v2, plane_origin, plane_normal)
+    out_points[tid, 2] = edge_plane_intersection(v2, v0, plane_origin, plane_normal)
+
+
+@wp.kernel
+def emit_quad_cut(
+    faces: wp.array[wp.int32],
+    face_indices: wp.array[wp.int32],
+    face_signs: wp.array2d[wp.int32],
+    edge_points: wp.array2d[wp.vec3],
+    vertex_base: wp.int32,
+    out_new_verts: wp.array[wp.vec3],
+    out_new_faces: wp.array2d[wp.int32],
+) -> None:
+    tid = wp.tid()
+    face_index = face_indices[tid]
+    base = face_index * wp.int32(3)
+    s0 = face_signs[face_index, 0]
+    s1 = face_signs[face_index, 1]
+    s2 = face_signs[face_index, 2]
+    outside = find_outside_corner(s0, s1, s2)
+    inside_a = (outside + wp.int32(1)) % wp.int32(3)
+    inside_b = (outside + wp.int32(2)) % wp.int32(3)
+    v_a = faces[base + inside_a]
+    v_b = faces[base + inside_b]
+    edge_a = (outside + wp.int32(2)) % wp.int32(3)
+    edge_b = outside
+    new_v0 = edge_points[tid, edge_a]
+    new_v1 = edge_points[tid, edge_b]
+    new_i0 = vertex_base + wp.int32(2) * wp.int32(tid)
+    new_i1 = new_i0 + wp.int32(1)
+    out_new_verts[wp.int32(2) * wp.int32(tid)] = new_v0
+    out_new_verts[wp.int32(2) * wp.int32(tid) + wp.int32(1)] = new_v1
+    out_new_faces[wp.int32(2) * wp.int32(tid), 0] = v_a
+    out_new_faces[wp.int32(2) * wp.int32(tid), 1] = v_b
+    out_new_faces[wp.int32(2) * wp.int32(tid), 2] = new_i0
+    out_new_faces[wp.int32(2) * wp.int32(tid) + wp.int32(1), 0] = new_i0
+    out_new_faces[wp.int32(2) * wp.int32(tid) + wp.int32(1), 1] = new_i1
+    out_new_faces[wp.int32(2) * wp.int32(tid) + wp.int32(1), 2] = v_a
+
+
+@wp.kernel
+def emit_tri_cut(
+    faces: wp.array[wp.int32],
+    face_indices: wp.array[wp.int32],
+    face_signs: wp.array2d[wp.int32],
+    edge_points: wp.array2d[wp.vec3],
+    vertex_base: wp.int32,
+    out_new_verts: wp.array[wp.vec3],
+    out_new_faces: wp.array2d[wp.int32],
+) -> None:
+    tid = wp.tid()
+    face_index = face_indices[tid]
+    base = face_index * wp.int32(3)
+    s0 = face_signs[face_index, 0]
+    s1 = face_signs[face_index, 1]
+    s2 = face_signs[face_index, 2]
+    inside = find_inside_corner(s0, s1, s2)
+    v_inside = faces[base + inside]
+    edge_0 = inside
+    edge_1 = (inside + wp.int32(2)) % wp.int32(3)
+    new_v0 = edge_points[tid, edge_0]
+    new_v1 = edge_points[tid, edge_1]
+    new_i0 = vertex_base + wp.int32(2) * wp.int32(tid)
+    new_i1 = new_i0 + wp.int32(1)
+    out_new_verts[wp.int32(2) * wp.int32(tid)] = new_v0
+    out_new_verts[wp.int32(2) * wp.int32(tid) + wp.int32(1)] = new_v1
+    out_new_faces[tid, 0] = v_inside
+    out_new_faces[tid, 1] = new_i0
+    out_new_faces[tid, 2] = new_i1

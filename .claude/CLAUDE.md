@@ -111,6 +111,7 @@ All new geometry functions MUST have regression tests that compare against the `
 - Use `np.allclose(got, exp, rtol=1e-5, atol=1e-5)` for floating-point results.
 - Use `np.array_equal(got, exp)` for boolean or integer results.
 - Name variables with a suffix for the library: `_np` for NumPy/SciPy, `_tm` for Trimesh, `_wp` for Warp. Avoid `got` / `exp` but use instead clear names.
+- When passing a NumPy 1D vector to a `wp.vec3` scalar argument at Python scope, use `wp.vec3(*array_np.tolist())` — not `wp.vec3(*map(float, np.asanyarray(...).reshape(3)))`.
 
 ---
 

@@ -14,6 +14,7 @@ from scipy.spatial import KDTree
 
 import triwarp as tw
 from tests.conversions import trimesh_to_pyvista, trimesh_to_warp
+from triwarp.constants import TOLERANCE_MERGE
 
 
 def _canonical_segments(lines_np: np.ndarray) -> np.ndarray:
@@ -26,16 +27,14 @@ def _canonical_segments(lines_np: np.ndarray) -> np.ndarray:
         pairs.append(np.concatenate([a, b]))
     ordered = np.array(pairs)
     return ordered[
-        np.lexsort(
-            (
-                ordered[:, 3],
-                ordered[:, 4],
-                ordered[:, 5],
-                ordered[:, 0],
-                ordered[:, 1],
-                ordered[:, 2],
-            )
-        )
+        np.lexsort((
+            ordered[:, 3],
+            ordered[:, 4],
+            ordered[:, 5],
+            ordered[:, 0],
+            ordered[:, 1],
+            ordered[:, 2],
+        ))
     ].reshape(-1, 2, 3)
 
 
@@ -132,8 +131,8 @@ def test_mesh_with_plane_axis_planes(request: pytest.FixtureRequest, mesh_name: 
         lines_wp = tw.intersections.mesh_with_plane(
             mesh_wp.points,
             mesh_wp.indices,
-            wp.vec3(*map(float, np.asanyarray(plane_normal, dtype=np.float32).reshape(3))),
-            wp.vec3(*map(float, np.asanyarray(plane_origin, dtype=np.float32).reshape(3))),
+            wp.vec3(*plane_normal.tolist()),
+            wp.vec3(*plane_origin.tolist()),
         )
         assert _segments_equal(lines_wp.numpy(), lines_tm)
 
@@ -192,6 +191,160 @@ def test_mesh_with_plane_miss_plane(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> 
         wp.vec3(*plane_origin.tolist()),
     )
     assert lines_wp.shape == (0, 2)
+
+
+def _sliced_meshes_equivalent(
+    vertices_a_np: np.ndarray,
+    faces_a_np: np.ndarray,
+    vertices_b_np: np.ndarray,
+    faces_b_np: np.ndarray,
+    plane_normal: np.ndarray,
+    plane_origin: np.ndarray,
+    *,
+    rtol: float = 1e-5,
+    atol: float = 1e-5,
+) -> bool:
+    mesh_a_tm = tm.Trimesh(vertices_a_np, faces_a_np, process=False)
+    mesh_b_tm = tm.Trimesh(vertices_b_np, faces_b_np, process=False)
+    if len(mesh_a_tm.faces) != len(mesh_b_tm.faces):
+        return False
+    if not np.allclose(mesh_a_tm.bounds, mesh_b_tm.bounds, rtol=rtol, atol=atol):
+        return False
+    if not np.isclose(mesh_a_tm.area, mesh_b_tm.area, rtol=1e-4, atol=1e-4):
+        return False
+    dots_b_np = np.dot(plane_normal, (mesh_b_tm.vertices - plane_origin).T)
+    return bool(np.min(dots_b_np) >= -max(TOLERANCE_MERGE, 1e-5))
+
+
+def test_slice_mesh_with_plane_empty(device: str) -> None:
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    out_vertices_wp, out_faces_wp = tw.intersections.slice_mesh_with_plane(
+        vertices_wp, faces_wp, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0)
+    )
+    assert out_vertices_wp.shape == (0,)
+    assert out_faces_wp.shape == (0,)
+
+
+def test_slice_mesh_with_plane_box_corner() -> None:
+    mesh_tm = tm.creation.box()
+    plane_origin_np = mesh_tm.bounds[1] - 0.05
+    plane_normal_np = mesh_tm.bounds[1]
+
+    vertices_tm, faces_tm, _ = tm_intersections.slice_faces_plane(
+        mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
+    )
+    mesh_wp = trimesh_to_warp(mesh_tm, "cpu")
+    vertices_wp, faces_wp = tw.intersections.slice_mesh_with_plane(
+        mesh_wp.points,
+        mesh_wp.indices,
+        wp.vec3(*plane_normal_np.tolist()),
+        wp.vec3(*plane_origin_np.tolist()),
+    )
+    vertices_wp_np = vertices_wp.numpy()
+    faces_wp_np = faces_wp.numpy().reshape(-1, 3)
+
+    assert _sliced_meshes_equivalent(
+        vertices_tm, faces_tm, vertices_wp_np, faces_wp_np, plane_normal_np, plane_origin_np
+    )
+    assert len(faces_tm) == 5
+
+
+def test_slice_mesh_with_plane_box_top() -> None:
+    mesh_tm = tm.creation.box()
+    plane_origin_np = mesh_tm.bounds[1] - 0.05
+    plane_normal_np = np.array([0.0, 0.0, 1.0])
+
+    vertices_tm, faces_tm, _ = tm_intersections.slice_faces_plane(
+        mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
+    )
+    mesh_wp = trimesh_to_warp(mesh_tm, "cpu")
+    vertices_wp, faces_wp = tw.intersections.slice_mesh_with_plane(
+        mesh_wp.points,
+        mesh_wp.indices,
+        wp.vec3(*plane_normal_np.tolist()),
+        wp.vec3(*plane_origin_np.tolist()),
+    )
+    vertices_wp_np = vertices_wp.numpy()
+    faces_wp_np = faces_wp.numpy().reshape(-1, 3)
+
+    assert _sliced_meshes_equivalent(
+        vertices_tm, faces_tm, vertices_wp_np, faces_wp_np, plane_normal_np, plane_origin_np
+    )
+    assert len(faces_tm) == 14
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+def test_slice_mesh_with_plane_axis_planes(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mid_np = 0.5 * (mesh_tm.bounds[0] + mesh_tm.bounds[1])
+    planes = [
+        (np.array([0.0, 0.0, 1.0]), mid_np),
+        (np.array([1.0, 0.0, 0.0]), mid_np),
+        (np.array([0.0, 1.0, 0.0]), mid_np),
+    ]
+
+    for plane_normal_np, plane_origin_np in planes:
+        vertices_tm, faces_tm, _ = tm_intersections.slice_faces_plane(
+            mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
+        )
+        vertices_wp, faces_wp = tw.intersections.slice_mesh_with_plane(
+            mesh_wp.points,
+            mesh_wp.indices,
+            wp.vec3(*plane_normal_np.tolist()),
+            wp.vec3(*plane_origin_np.tolist()),
+        )
+        vertices_wp_np = vertices_wp.numpy()
+        faces_wp_np = faces_wp.numpy().reshape(-1, 3)
+        assert _sliced_meshes_equivalent(
+            vertices_tm, faces_tm, vertices_wp_np, faces_wp_np, plane_normal_np, plane_origin_np
+        )
+
+
+def test_slice_mesh_with_plane_tilted_plane(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    axis_np = tm.unitize(np.array([1.0, 2.0, 0.3], dtype=np.float32))
+    angle = np.radians(11)
+    base = tm.transformations.rotation_matrix(angle=angle, direction=axis_np)
+    plane_normal_np = tm.transform_points([[0.0, 0.0, 1.0]], base, translate=False)[0]
+    plane_origin_np = tm.transform_points([mesh_tm.centroid], base)[0]
+
+    vertices_tm, faces_tm, _ = tm_intersections.slice_faces_plane(
+        mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
+    )
+    vertices_wp, faces_wp = tw.intersections.slice_mesh_with_plane(
+        mesh_wp.points,
+        mesh_wp.indices,
+        wp.vec3(*plane_normal_np.tolist()),
+        wp.vec3(*plane_origin_np.tolist()),
+    )
+    vertices_wp_np = vertices_wp.numpy()
+    faces_wp_np = faces_wp.numpy().reshape(-1, 3)
+    assert _sliced_meshes_equivalent(
+        vertices_tm, faces_tm, vertices_wp_np, faces_wp_np, plane_normal_np, plane_origin_np
+    )
+
+
+def test_slice_mesh_with_plane_on_plane(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosphere
+    plane_origin_np = mesh_tm.bounds[1]
+    plane_normal_np = np.array([0.0, 0.0, 1.0])
+
+    vertices_tm, faces_tm, _ = tm_intersections.slice_faces_plane(
+        mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
+    )
+    vertices_wp, faces_wp = tw.intersections.slice_mesh_with_plane(
+        mesh_wp.points,
+        mesh_wp.indices,
+        wp.vec3(*plane_normal_np.tolist()),
+        wp.vec3(*plane_origin_np.tolist()),
+    )
+    vertices_wp_np = vertices_wp.numpy()
+    faces_wp_np = faces_wp.numpy().reshape(-1, 3)
+    assert len(vertices_tm) == 0
+    assert len(faces_tm) == 0
+    assert vertices_wp_np.shape[0] == 0
+    assert faces_wp_np.shape[0] == 0
 
 
 def _pyvista_intersection_segments(mesh1_pv: pv.PolyData, mesh2_pv: pv.PolyData) -> np.ndarray:

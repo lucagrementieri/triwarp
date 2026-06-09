@@ -288,3 +288,171 @@ def mesh_with_mesh(
     lines = wp.empty((n_keep, 2), dtype=wp.vec3, device=device)
     wp.copy(lines, segments[keep])
     return lines
+
+
+def _compact_referenced_vertices(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """Keep only vertices referenced by ``faces`` and reindex face indices from zero."""
+    unique_idx, inverse = tw.unique.unique_1d(faces, return_inverse=True)
+    n_unique = int(unique_idx.shape[0])
+    compact_vertices = wp.empty(n_unique, dtype=wp.vec3, device=vertices.device)
+    wp.copy(compact_vertices, vertices[unique_idx])
+    compact_faces = inverse.reshape((-1,))
+    return compact_vertices, compact_faces
+
+
+def slice_mesh_with_plane(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    plane_normal: wp.vec3,
+    plane_origin: wp.vec3,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Slice a mesh with a plane, returning the portion on the positive normal side.
+
+    Matches :func:`trimesh.intersections.slice_faces_plane` for indexed triangle meshes
+    (without UV handling). To slice a face subset, extract a submesh first (e.g.
+    :func:`triwarp.selection.submesh_from_face_indices`).
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` flat triangle index buffer.
+    plane_normal
+        Normal vector of the plane.
+    plane_origin
+        Point on the plane.
+
+    Returns
+    -------
+    new_vertices
+        Vertices of the sliced mesh.
+    new_faces
+        Length-``3 * m`` flat triangle index buffer for the sliced mesh.
+    """
+    device = vertices.device
+    if faces.device != device:
+        raise ValueError(
+            f"vertices and faces must live on the same device, got {device} and {faces.device}"
+        )
+
+    n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    if n_vertices == 0:
+        return vertices, faces
+
+    vertex_dots = wp.empty(n_vertices, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_intersections.vertex_plane_dots,
+        dim=n_vertices,
+        inputs=[vertices, plane_origin, plane_normal, vertex_dots],
+        device=device,
+    )
+
+    inside = wp.empty(n_faces, dtype=wp.bool, device=device)
+    cut_quad = wp.empty(n_faces, dtype=wp.bool, device=device)
+    cut_tri = wp.empty(n_faces, dtype=wp.bool, device=device)
+    on_plane = wp.empty(n_faces, dtype=wp.bool, device=device)
+    face_signs = twt.empty_int32_2d((n_faces, 3), device=device)
+    wp.launch(
+        kernel_intersections.classify_faces_for_slice,
+        dim=n_faces,
+        inputs=[faces, vertex_dots, inside, cut_quad, cut_tri, on_plane, face_signs],
+        device=device,
+    )
+    wp.launch(
+        kernel_intersections.resolve_on_plane_faces,
+        dim=n_faces,
+        inputs=[vertices, faces, plane_normal, on_plane, inside],
+        device=device,
+    )
+
+    inside_idx = tw.array.flatnonzero(inside)
+    quad_idx = tw.array.flatnonzero(cut_quad)
+    tri_idx = tw.array.flatnonzero(cut_tri)
+    n_in = int(inside_idx.shape[0])
+    n_quad = int(quad_idx.shape[0])
+    n_tri = int(tri_idx.shape[0])
+
+    if n_quad + n_tri == 0:
+        if n_in == 0:
+            return wp.empty(0, dtype=wp.vec3, device=device), wp.empty(
+                0, dtype=wp.int32, device=device
+            )
+        return tw.selection.submesh_from_face_indices(
+            vertices, faces, inside_idx, unique_indices=True
+        )
+
+    if n_in > 0:
+        inside_faces_2d = twt.empty_int32_2d((n_in, 3), device=device)
+        wp.copy(inside_faces_2d, faces.reshape((-1, 3))[inside_idx])
+        inside_faces = inside_faces_2d.reshape((-1,))
+    else:
+        inside_faces = wp.empty(0, dtype=wp.int32, device=device)
+
+    cut_vert_segments: list[wp.array[wp.vec3]] = []
+    cut_face_segments: list[wp.array[wp.int32]] = []
+
+    if n_quad > 0:
+        quad_edge_points = wp.empty((n_quad, 3), dtype=wp.vec3, device=device)
+        wp.launch(
+            kernel_intersections.edge_plane_intersections,
+            dim=n_quad,
+            inputs=[vertices, faces, quad_idx, plane_origin, plane_normal, quad_edge_points],
+            device=device,
+        )
+        quad_new_verts = wp.empty(2 * n_quad, dtype=wp.vec3, device=device)
+        quad_new_faces = twt.empty_int32_2d((2 * n_quad, 3), device=device)
+        wp.launch(
+            kernel_intersections.emit_quad_cut,
+            dim=n_quad,
+            inputs=[
+                faces,
+                quad_idx,
+                face_signs,
+                quad_edge_points,
+                wp.int32(n_vertices),
+                quad_new_verts,
+                quad_new_faces,
+            ],
+            device=device,
+        )
+        cut_vert_segments.append(quad_new_verts)
+        cut_face_segments.append(quad_new_faces.reshape((-1,)))
+
+    if n_tri > 0:
+        tri_edge_points = wp.empty((n_tri, 3), dtype=wp.vec3, device=device)
+        wp.launch(
+            kernel_intersections.edge_plane_intersections,
+            dim=n_tri,
+            inputs=[vertices, faces, tri_idx, plane_origin, plane_normal, tri_edge_points],
+            device=device,
+        )
+        tri_new_verts = wp.empty(2 * n_tri, dtype=wp.vec3, device=device)
+        tri_new_faces = twt.empty_int32_2d((n_tri, 3), device=device)
+        tri_vertex_base = wp.int32(n_vertices + 2 * n_quad)
+        wp.launch(
+            kernel_intersections.emit_tri_cut,
+            dim=n_tri,
+            inputs=[
+                faces,
+                tri_idx,
+                face_signs,
+                tri_edge_points,
+                tri_vertex_base,
+                tri_new_verts,
+                tri_new_faces,
+            ],
+            device=device,
+        )
+        cut_vert_segments.append(tri_new_verts)
+        cut_face_segments.append(tri_new_faces.reshape((-1,)))
+
+    vert_segments = [vertices, *cut_vert_segments]
+    face_segments = [inside_faces, *cut_face_segments]
+    all_vertices, _ = tw.array.pack_1d_arrays(vert_segments)
+    all_faces, _ = tw.array.pack_1d_arrays(face_segments)
+    return _compact_referenced_vertices(all_vertices, all_faces)
