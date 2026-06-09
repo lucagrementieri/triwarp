@@ -5,20 +5,9 @@ from __future__ import annotations
 import warp as wp
 
 import triwarp as tw
+from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import ray as kernel_ray
-from triwarp.proximity import aabb_bounds
-
-
-def _default_max_t(mesh: wp.Mesh, ray_origins: wp.array[wp.vec3]) -> float:
-    mesh_min, mesh_max = aabb_bounds(mesh.points)
-    ray_min, ray_max = aabb_bounds(ray_origins)
-    combined_min = wp.vec3(
-        min(mesh_min[0], ray_min[0]), min(mesh_min[1], ray_min[1]), min(mesh_min[2], ray_min[2])
-    )
-    combined_max = wp.vec3(
-        max(mesh_max[0], ray_max[0]), max(mesh_max[1], ray_max[1]), max(mesh_max[2], ray_max[2])
-    )
-    return float(wp.length(combined_max - combined_min))
+from triwarp.proximity import aabb_bounds, default_mesh_query_max_dist, mesh_query_max_dist
 
 
 def _validate_ray_inputs(
@@ -76,7 +65,7 @@ def intersects_location(
 
     _validate_ray_inputs(mesh, ray_origins, ray_directions)
     if max_t is None:
-        max_t = _default_max_t(mesh, ray_origins)
+        max_t = default_mesh_query_max_dist(mesh.points, ray_origins)
 
     faces_dense = wp.empty(n, dtype=wp.int32, device=device)
     locations_dense = wp.empty(n, dtype=wp.vec3, device=device)
@@ -141,7 +130,7 @@ def intersects_first(
         return wp.empty(0, dtype=wp.int32, device=ray_origins.device)
     _validate_ray_inputs(mesh, ray_origins, ray_directions)
     if max_t is None:
-        max_t = _default_max_t(mesh, ray_origins)
+        max_t = default_mesh_query_max_dist(mesh.points, ray_origins)
 
     out_triangle_index = wp.empty(n, dtype=wp.int32, device=ray_origins.device)
     wp.launch(
@@ -189,7 +178,7 @@ def intersects_any(
         return wp.empty(0, dtype=wp.bool, device=ray_origins.device)
     _validate_ray_inputs(mesh, ray_origins, ray_directions)
     if max_t is None:
-        max_t = _default_max_t(mesh, ray_origins)
+        max_t = default_mesh_query_max_dist(mesh.points, ray_origins)
 
     out_hit = wp.empty(n, dtype=wp.bool, device=ray_origins.device)
     wp.launch(
@@ -207,11 +196,14 @@ def contains_points(
     """
     Test whether query points lie inside a closed mesh (ray parity sign).
 
-    Uses ``wp.mesh_query_point_sign_parity`` on the mesh BVH. Points outside the
-    mesh axis-aligned bounding box are rejected without a ray test. The closest-point
-    search radius is the mesh AABB diagonal from :func:`triwarp.proximity.aabb_bounds`.
-    Behavior for points on the surface is undefined, matching
-    :func:`trimesh.ray.ray_util.contains_points`.
+    Uses ``wp.mesh_query_point_sign_parity`` on the mesh BVH, sharing the same
+    parity path as :func:`triwarp.proximity.signed_distance_on_mesh`. Points
+    outside the mesh axis-aligned bounding box are rejected without a parity test.
+
+    Triwarp mesh queries use **Warp's SDF sign convention** (outside positive,
+    inside negative). A point is classified as inside when its signed distance
+    would be negative; behavior on the on-surface tolerance band is undefined.
+    Boolean results still match :func:`trimesh.Trimesh.contains`.
 
     Parameters
     ----------
@@ -228,6 +220,10 @@ def contains_points(
     -------
     wp.array[wp.bool]
         ``(n,)`` flags; ``True`` when the point is classified as inside the mesh.
+
+    See Also
+    --------
+    triwarp.proximity.signed_distance_on_mesh
     """
     n = points.shape[0]
     if n == 0:
@@ -238,10 +234,10 @@ def contains_points(
         )
 
     mesh_min, mesh_max = aabb_bounds(mesh.points)
-    max_dist = wp.length(mesh_max - mesh_min)
+    max_dist = mesh_query_max_dist(mesh.points)
     out_contains = wp.empty(n, dtype=wp.bool, device=points.device)
     wp.launch(
-        kernel_ray.contains_points_sign_parity,
+        kernel_proximity.contains_points_sign_parity,
         dim=n,
         inputs=[
             mesh.id,

@@ -13,10 +13,12 @@ from typing import Literal
 import numpy as np
 import pytest
 import trimesh as tm
+import trimesh.proximity as tm_proximity
 import warp as wp
 from scipy.spatial import KDTree
 
 import triwarp as tw
+from triwarp.constants import TOLERANCE_MERGE
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
@@ -404,3 +406,89 @@ def test_closest_point_on_mesh_empty_faces(device: str) -> None:
     assert np.all(np.isnan(closest_wp.numpy()))
     assert np.all(np.isinf(distance_wp.numpy()))
     assert np.all(triangle_id_wp.numpy() == -1)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+def test_signed_distance_on_mesh_random(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    rng = np.random.default_rng(42)
+    points_np = rng.random((200, 3), dtype=np.float64) * 4.0 - 2.0
+
+    expected_np = -tm_proximity.signed_distance(mesh_tm, points_np)
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    signed_wp = tw.proximity.signed_distance_on_mesh(mesh_wp.points, mesh_wp.indices, points_wp)
+    assert np.allclose(signed_wp.numpy(), expected_np, rtol=1e-5, atol=1e-5)
+
+
+def test_signed_distance_on_mesh_sign_direction(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    outside_np = np.asarray([mesh_tm.bounds[0] + [100.0, 100.0, 100.0]], dtype=np.float32)
+    inside_np = np.asarray([mesh_tm.center_mass], dtype=np.float32)
+    outside_wp = wp.array(outside_np, dtype=wp.vec3, device=mesh_wp.device)
+    inside_wp = wp.array(inside_np, dtype=wp.vec3, device=mesh_wp.device)
+    outside_signed_wp = tw.proximity.signed_distance_on_mesh(
+        mesh_wp.points, mesh_wp.indices, outside_wp
+    )
+    inside_signed_wp = tw.proximity.signed_distance_on_mesh(
+        mesh_wp.points, mesh_wp.indices, inside_wp
+    )
+    assert (outside_signed_wp.numpy() > 0.0).all()
+    assert (inside_signed_wp.numpy() < 0.0).all()
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+def test_signed_distance_on_mesh_coplanar(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    outside_np = np.asarray([mesh_tm.bounds[0] + [100.0, 0.0, 0.0]], dtype=np.float32)
+    outside_wp = wp.array(outside_np, dtype=wp.vec3, device=mesh_wp.device)
+    outside_signed_wp = tw.proximity.signed_distance_on_mesh(
+        mesh_wp.points, mesh_wp.indices, outside_wp
+    )
+    assert (outside_signed_wp.numpy() > 0.0).all()
+
+
+def test_signed_distance_on_mesh_on_surface(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    surface_np, _face_idx = tm.sample.sample_surface(mesh_tm, 50)
+    surface_wp = wp.array(
+        np.ascontiguousarray(surface_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    signed_wp = tw.proximity.signed_distance_on_mesh(mesh_wp.points, mesh_wp.indices, surface_wp)
+    signed_np = signed_wp.numpy()
+    assert (np.abs(signed_np) <= max(TOLERANCE_MERGE, 1e-4)).all()
+
+
+def test_signed_distance_contains_points_consistency(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    rng = np.random.default_rng(9)
+    inside_np = mesh_tm.center_mass + rng.normal(scale=0.05, size=(50, 3))
+    points_wp = wp.array(
+        np.ascontiguousarray(inside_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    signed_np = tw.proximity.signed_distance_on_mesh(
+        mesh_wp.points, mesh_wp.indices, points_wp
+    ).numpy()
+    contains_np = tw.ray.contains_points(mesh_wp, points_wp).numpy()
+    off_surface = np.abs(signed_np) > TOLERANCE_MERGE
+    assert np.array_equal(contains_np[off_surface], signed_np[off_surface] < 0.0)
+
+
+def test_signed_distance_on_mesh_empty_points(device: str) -> None:
+    vertices = wp.array(np.zeros((3, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    faces = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+    points = wp.empty(0, dtype=wp.vec3, device=device)
+    signed_wp = tw.proximity.signed_distance_on_mesh(vertices, faces, points)
+    assert signed_wp.shape == (0,)
+
+
+def test_signed_distance_on_mesh_empty_faces(device: str) -> None:
+    vertices = wp.zeros(1, dtype=wp.vec3, device=device)
+    faces = wp.empty(0, dtype=wp.int32, device=device)
+    points = wp.array(np.zeros((2, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    signed_wp = tw.proximity.signed_distance_on_mesh(vertices, faces, points)
+    assert signed_wp.shape == (2,)
+    assert np.all(np.isinf(signed_wp.numpy()))

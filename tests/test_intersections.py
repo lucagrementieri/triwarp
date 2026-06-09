@@ -27,14 +27,16 @@ def _canonical_segments(lines_np: np.ndarray) -> np.ndarray:
         pairs.append(np.concatenate([a, b]))
     ordered = np.array(pairs)
     return ordered[
-        np.lexsort((
-            ordered[:, 3],
-            ordered[:, 4],
-            ordered[:, 5],
-            ordered[:, 0],
-            ordered[:, 1],
-            ordered[:, 2],
-        ))
+        np.lexsort(
+            (
+                ordered[:, 3],
+                ordered[:, 4],
+                ordered[:, 5],
+                ordered[:, 0],
+                ordered[:, 1],
+                ordered[:, 2],
+            )
+        )
     ].reshape(-1, 2, 3)
 
 

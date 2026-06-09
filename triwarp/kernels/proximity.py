@@ -1,5 +1,6 @@
 import warp as wp
 
+from triwarp.constants import TOLERANCE_MERGE_CONSTANT
 from triwarp.kernels import array as kernel_array
 
 
@@ -231,6 +232,63 @@ def query_bvh_nearest_neighbors(
         slot = kernel_array.binary_search_index(out_distances[tid], d)
         kernel_array.array_shift_insert(out_distances[tid], d, slot)
         kernel_array.array_shift_insert(out_indices[tid], point_index, slot)
+
+
+@wp.func
+def point_strictly_inside_aabb(p: wp.vec3, mesh_min: wp.vec3, mesh_max: wp.vec3) -> bool:
+    return (
+        p[0] > mesh_min[0]
+        and p[1] > mesh_min[1]
+        and p[2] > mesh_min[2]
+        and p[0] < mesh_max[0]
+        and p[1] < mesh_max[1]
+        and p[2] < mesh_max[2]
+    )
+
+
+@wp.kernel
+def contains_points_sign_parity(
+    mesh_id: wp.uint64,
+    points: wp.array[wp.vec3],
+    max_dist: wp.float32,
+    n_sample: wp.int32,
+    perturbation_scale: wp.float32,
+    mesh_min: wp.vec3,
+    mesh_max: wp.vec3,
+    out_contains: wp.array[wp.bool],
+) -> None:
+    tid = wp.tid()
+    p = points[tid]
+
+    if not point_strictly_inside_aabb(p, mesh_min, mesh_max):
+        out_contains[tid] = False
+        return
+
+    query = wp.mesh_query_point_sign_parity(mesh_id, p, max_dist, n_sample, perturbation_scale)
+    out_contains[tid] = query.result and query.sign < wp.float32(0.0)
+
+
+@wp.kernel
+def signed_distance_on_mesh(
+    mesh_id: wp.uint64,
+    points: wp.array[wp.vec3],
+    max_dist: wp.float32,
+    n_sample: wp.int32,
+    perturbation_scale: wp.float32,
+    out_distance: wp.array[wp.float32],
+) -> None:
+    tid = wp.tid()
+    p = points[tid]
+    query = wp.mesh_query_point_sign_parity(mesh_id, p, max_dist, n_sample, perturbation_scale)
+    if not query.result:
+        out_distance[tid] = max_dist
+        return
+    closest = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
+    dist = wp.length(p - closest)
+    if dist <= TOLERANCE_MERGE_CONSTANT:
+        out_distance[tid] = dist
+    else:
+        out_distance[tid] = query.sign * dist
 
 
 @wp.kernel

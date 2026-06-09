@@ -113,6 +113,22 @@ All new geometry functions MUST have regression tests that compare against the `
 - Name variables with a suffix for the library: `_np` for NumPy/SciPy, `_tm` for Trimesh, `_wp` for Warp. Avoid `got` / `exp` but use instead clear names.
 - When passing a NumPy 1D vector to a `wp.vec3` scalar argument at Python scope, use `wp.vec3(*array_np.tolist())` — not `wp.vec3(*map(float, np.asanyarray(...).reshape(3)))`.
 
+### Mesh fixtures (prefer over inline construction)
+
+Reuse shared mesh fixtures from `tests/conftest.py` instead of building meshes in each test. Fixtures return `(mesh_tm: tm.Trimesh, mesh_wp: wp.Mesh)` via `tests.conversions.trimesh_to_warp`.
+
+| Fixture | Use when |
+|---------|----------|
+| `icosahedron` | Default watertight solid; inside/outside, surface sampling, sign tests |
+| `cave_cube` | Hollow / non-convex shell (boolean difference) |
+| `icosphere`, `hemisphere`, `half_torus` | Curved or open surfaces |
+
+- **Do not** call `tm.creation.box()` or hand-roll `wp.Mesh(...)` in tests unless the case requires a bespoke degenerate mesh (e.g. empty faces, unreferenced vertices).
+- When a simple cube would suffice, prefer **`icosahedron`** or **`cave_cube`** for richer geometry.
+- Parametrize over multiple fixtures with `request.getfixturevalue(mesh_name)` when coverage should span mesh types (see `test_signed_distance_on_mesh_random`).
+- Use `mesh_wp.device` (not the `device` fixture) for query-point allocation when a mesh fixture is already in scope.
+- Edge-case tests (empty points/faces, single-triangle pathology) may still use minimal inline buffers.
+
 ---
 
 ## 7. Python wrapper typing (`triwarp.typing`)

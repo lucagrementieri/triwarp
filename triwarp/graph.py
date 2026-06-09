@@ -410,9 +410,9 @@ def concatenate(
     if sum(vertex_counts) == 0:
         concatenated_vertices = wp.empty(0, dtype=wp.vec3, device=device)
     else:
-        concatenated_vertices, _ = tw.array.pack_1d_arrays([
-            vertices for vertices, _ in meshes_data
-        ])
+        concatenated_vertices, _ = tw.array.pack_1d_arrays(
+            [vertices for vertices, _ in meshes_data]
+        )
 
     concatenated_faces = wp.empty(total_indices, dtype=wp.int32, device=device)
 
