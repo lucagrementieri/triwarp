@@ -21,28 +21,6 @@ def aabb_bounds(
 
 
 @wp.kernel
-def bounds_centers(
-    lower: wp.array[wp.vec3], upper: wp.array[wp.vec3], out_centers: wp.array[wp.vec3]
-) -> None:
-    tid = wp.tid()
-    out_centers[tid] = wp.float32(0.5) * (lower[tid] + upper[tid])
-
-
-@wp.func
-def aabb_intersects_cube(p_lower: wp.vec3, p_upper: wp.vec3, q: wp.vec3, h: wp.float32) -> bool:
-    q_lower = wp.vec3(q[0] - h, q[1] - h, q[2] - h)
-    q_upper = wp.vec3(q[0] + h, q[1] + h, q[2] + h)
-    return (
-        p_lower[0] <= q_upper[0]
-        and p_upper[0] >= q_lower[0]
-        and p_lower[1] <= q_upper[1]
-        and p_upper[1] >= q_lower[1]
-        and p_lower[2] <= q_upper[2]
-        and p_upper[2] >= q_lower[2]
-    )
-
-
-@wp.kernel
 def query_bvh_ball_count(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3],
@@ -176,30 +154,30 @@ def query_bvh_aabb_neighbors(
 
 
 @wp.kernel
-def query_bvh_aabb_bounds_count(
+def query_mesh_aabb_bounds_count(
     query_lower: wp.array[wp.vec3],
     query_upper: wp.array[wp.vec3],
-    bvh_id: wp.uint64,
+    mesh_id: wp.uint64,
     max_hits: wp.int32,
     out_counts: wp.array[wp.int32],
 ) -> None:
     tid = wp.tid()
     lower = query_lower[tid]
     upper = query_upper[tid]
-    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    j = wp.int32(0)
+    query = wp.mesh_query_aabb(mesh_id, lower, upper)
+    face_idx = wp.int32(0)
     c = wp.int32(0)
     max_hits_i = int(max_hits)
-    while wp.bvh_query_next(query, j) and c < max_hits_i:
+    while wp.mesh_query_aabb_next(query, face_idx) and c < max_hits_i:
         c = c + 1
     out_counts[tid] = c
 
 
 @wp.kernel
-def query_bvh_aabb_bounds_neighbors(
+def query_mesh_aabb_bounds_neighbors(
     query_lower: wp.array[wp.vec3],
     query_upper: wp.array[wp.vec3],
-    bvh_id: wp.uint64,
+    mesh_id: wp.uint64,
     max_hits: wp.int32,
     offsets: wp.array[wp.int32],
     out_indices: wp.array[wp.int32],
@@ -207,13 +185,13 @@ def query_bvh_aabb_bounds_neighbors(
     tid = wp.tid()
     lower = query_lower[tid]
     upper = query_upper[tid]
-    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    primitive_idx = wp.int32(0)
+    query = wp.mesh_query_aabb(mesh_id, lower, upper)
+    face_idx = wp.int32(0)
     w = int(offsets[tid])
     max_hits_i = int(max_hits)
     hits = wp.int32(0)
-    while wp.bvh_query_next(query, primitive_idx) and hits < max_hits_i:
-        out_indices[w] = primitive_idx
+    while wp.mesh_query_aabb_next(query, face_idx) and hits < max_hits_i:
+        out_indices[w] = face_idx
         w = w + 1
         hits = hits + 1
 
@@ -266,7 +244,7 @@ def closest_point_on_mesh(
 ) -> None:
     tid = wp.tid()
     p = points[tid]
-    query = wp.mesh_query_point(mesh_id, p, max_dist)
+    query = wp.mesh_query_point_no_sign(mesh_id, p, max_dist)
     if query.result:
         closest = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
         out_closest[tid] = closest

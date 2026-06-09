@@ -266,21 +266,30 @@ def test_query_nearest_empty(device: str, backend: Literal["bvh", "hashgrid"]):
     assert distances.shape == (0, k)
 
 
-def test_query_bvh_aabb_bounds_with_offsets(device: str) -> None:
-    rng = np.random.default_rng(7)
-    lower_np = rng.random((8, 3), dtype=np.float32)
-    upper_np = lower_np + rng.random((8, 3), dtype=np.float32) * 0.4 + 0.05
+def test_query_mesh_aabb_bounds_with_offsets(device: str) -> None:
+    rng = np.random.default_rng(11)
+    n_faces = 8
+    vertices_np = rng.random((n_faces * 3, 3), dtype=np.float32)
+    faces_np = np.arange(n_faces * 3, dtype=np.int32).reshape(n_faces, 3)
+
+    lower_np = np.empty((n_faces, 3), dtype=np.float32)
+    upper_np = np.empty((n_faces, 3), dtype=np.float32)
+    for face_idx in range(n_faces):
+        tri = vertices_np[faces_np[face_idx]]
+        lower_np[face_idx] = tri.min(axis=0)
+        upper_np[face_idx] = tri.max(axis=0)
+
     query_lower_np = lower_np[:4].copy()
     query_upper_np = upper_np[:4].copy()
 
-    lower_wp = wp.array(np.ascontiguousarray(lower_np), dtype=wp.vec3, device=device)
-    upper_wp = wp.array(np.ascontiguousarray(upper_np), dtype=wp.vec3, device=device)
+    vertices_wp = wp.array(np.ascontiguousarray(vertices_np), dtype=wp.vec3, device=device)
+    faces_wp = wp.array(np.ascontiguousarray(faces_np.reshape(-1)), dtype=wp.int32, device=device)
+    mesh = wp.Mesh(points=vertices_wp, indices=faces_wp)
     query_lower_wp = wp.array(np.ascontiguousarray(query_lower_np), dtype=wp.vec3, device=device)
     query_upper_wp = wp.array(np.ascontiguousarray(query_upper_np), dtype=wp.vec3, device=device)
 
-    bvh = tw.proximity.bvh_from_bounds(lower_wp, upper_wp)
-    indices_wp, offsets_wp, hit_counts_wp = tw.proximity.query_bvh_aabb_bounds_with_offsets(
-        bvh, query_lower_wp, query_upper_wp, max_hits=16
+    indices_wp, offsets_wp, hit_counts_wp = tw.proximity.query_mesh_aabb_bounds_with_offsets(
+        mesh, query_lower_wp, query_upper_wp, max_hits=16
     )
 
     indices_np = indices_wp.numpy()

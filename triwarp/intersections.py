@@ -170,8 +170,9 @@ def mesh_with_mesh(
     """
     Intersect two meshes, returning line segments along the intersection curve(s).
 
-    Broad phase uses a BVH over the mesh with fewer faces; each triangle of the
-    other mesh queries that BVH with its axis-aligned bounding box. Narrow phase
+    Broad phase builds a ``wp.Mesh`` over the mesh with fewer faces and queries
+    triangle AABBs via ``wp.mesh_query_aabb``; each triangle of the other mesh
+    supplies the query box. Narrow phase
     applies separating-axis triangle tests and clips the intersection line to both
     triangles. Coplanar overlapping faces produce no segments.
 
@@ -210,19 +211,9 @@ def mesh_with_mesh(
         target_vertices, target_faces = vertices_b, faces_b
         query_vertices, query_faces = vertices_a, faces_a
 
-    n_target = int(target_faces.shape[0]) // 3
     n_query = int(query_faces.shape[0]) // 3
 
-    target_lower = wp.empty(n_target, dtype=wp.vec3, device=device)
-    target_upper = wp.empty(n_target, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_intersections.face_aabb_bounds,
-        dim=n_target,
-        inputs=[target_vertices, target_faces, target_lower, target_upper],
-        device=device,
-    )
-
-    bvh = tw.proximity.bvh_from_bounds(target_lower, target_upper)
+    target_mesh = wp.Mesh(points=target_vertices, indices=target_faces)
 
     query_lower = wp.empty(n_query, dtype=wp.vec3, device=device)
     query_upper = wp.empty(n_query, dtype=wp.vec3, device=device)
@@ -233,8 +224,8 @@ def mesh_with_mesh(
         device=device,
     )
 
-    target_indices, offsets, hit_counts = tw.proximity.query_bvh_aabb_bounds_with_offsets(
-        bvh, query_lower, query_upper, max_hits=max_triangle_collisions
+    target_indices, offsets, hit_counts = tw.proximity.query_mesh_aabb_bounds_with_offsets(
+        target_mesh, query_lower, query_upper, max_hits=max_triangle_collisions
     )
     n_pairs = int(target_indices.shape[0])
     if n_pairs == 0:

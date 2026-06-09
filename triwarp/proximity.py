@@ -199,19 +199,22 @@ def query_bvh_aabb_with_offsets(
     return candidate_indices_flat, offsets
 
 
-def query_bvh_aabb_bounds_with_offsets(
-    bvh: wp.Bvh,
+def query_mesh_aabb_bounds_with_offsets(
+    mesh: wp.Mesh,
     query_lower: wp.array[wp.vec3],
     query_upper: wp.array[wp.vec3],
     *,
     max_hits: int = 16,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
     """
-    Low-level BVH AABB query with per-query axis-aligned bounds.
+    Low-level mesh AABB query with per-query axis-aligned bounds.
 
     For each query primitive ``k``, tests intersection of ``[query_lower[k],
-    query_upper[k]]`` against every primitive bound in ``bvh``. At most
-    ``max_hits`` candidates are recorded per query.
+    query_upper[k]]`` against every triangle in ``mesh`` via ``wp.mesh_query_aabb``.
+    At most ``max_hits`` candidate face indices are recorded per query.
+
+    Requires the default Warp mesh BVH backend; ``bvh_constructor="cubql"`` meshes
+    do not support AABB queries.
 
     Returns
     -------
@@ -222,6 +225,10 @@ def query_bvh_aabb_bounds_with_offsets(
     device = query_lower.device
     if query_upper.device != device:
         raise ValueError("query_lower and query_upper must live on the same device")
+    if mesh.device != device:
+        raise ValueError(
+            f"mesh and query bounds must live on the same device, got {mesh.device} vs {device}"
+        )
     m = int(query_lower.shape[0])
     if int(query_upper.shape[0]) != m:
         raise ValueError("query_lower and query_upper must have the same length")
@@ -237,9 +244,9 @@ def query_bvh_aabb_bounds_with_offsets(
 
     hit_counts = wp.empty(m, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_proximity.query_bvh_aabb_bounds_count,
+        kernel_proximity.query_mesh_aabb_bounds_count,
         dim=m,
-        inputs=[query_lower, query_upper, bvh.id, wp.int32(max_hits), hit_counts],
+        inputs=[query_lower, query_upper, mesh.id, wp.int32(max_hits), hit_counts],
         device=device,
     )
 
@@ -256,12 +263,12 @@ def query_bvh_aabb_bounds_with_offsets(
 
     candidate_indices_flat = wp.empty(total_hits, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_proximity.query_bvh_aabb_bounds_neighbors,
+        kernel_proximity.query_mesh_aabb_bounds_neighbors,
         dim=m,
         inputs=[
             query_lower,
             query_upper,
-            bvh.id,
+            mesh.id,
             wp.int32(max_hits),
             offsets,
             candidate_indices_flat,
@@ -1195,8 +1202,9 @@ def closest_point_on_mesh(
     """
     For each query point, find the closest point on any triangle of the mesh.
 
-    Uses ``wp.mesh_query_point`` on a ``wp.Mesh`` BVH built from ``vertices`` and
-    ``faces``. Distances are unsigned Euclidean lengths in ``float32``.
+    Uses ``wp.mesh_query_point_no_sign`` on a ``wp.Mesh`` BVH built from
+    ``vertices`` and ``faces``. Distances are unsigned Euclidean lengths in
+    ``float32``.
 
     Parameters
     ----------
