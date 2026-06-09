@@ -184,6 +184,49 @@ def query_bvh_aabb_neighbors(
 
 
 @wp.kernel
+def query_bvh_aabb_bounds_count(
+    query_lower: wp.array[wp.vec3],
+    query_upper: wp.array[wp.vec3],
+    bvh_id: wp.uint64,
+    max_hits: wp.int32,
+    out_counts: wp.array[wp.int32],
+) -> None:
+    tid = wp.tid()
+    lower = query_lower[tid]
+    upper = query_upper[tid]
+    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
+    j = int(0)
+    c = int(0)
+    max_hits_i = int(max_hits)
+    while wp.bvh_query_next(query, j) and c < max_hits_i:
+        c = c + 1
+    out_counts[tid] = c
+
+
+@wp.kernel
+def query_bvh_aabb_bounds_neighbors(
+    query_lower: wp.array[wp.vec3],
+    query_upper: wp.array[wp.vec3],
+    bvh_id: wp.uint64,
+    max_hits: wp.int32,
+    offsets: wp.array[wp.int32],
+    out_indices: wp.array[wp.int32],
+) -> None:
+    tid = wp.tid()
+    lower = query_lower[tid]
+    upper = query_upper[tid]
+    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
+    primitive_idx = int(0)
+    w = int(offsets[tid])
+    max_hits_i = int(max_hits)
+    hits = int(0)
+    while wp.bvh_query_next(query, primitive_idx) and hits < max_hits_i:
+        out_indices[w] = primitive_idx
+        w = w + 1
+        hits = hits + 1
+
+
+@wp.kernel
 def query_bvh_nearest_neighbors(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3],
@@ -253,48 +296,3 @@ def query_hashgrid_nearest_neighbors(
         slot = kernel_array.binary_search_index(out_distances[tid], d)
         kernel_array.array_shift_insert(out_distances[tid], d, slot)
         kernel_array.array_shift_insert(out_indices[tid], point_index, slot)
-
-
-@wp.kernel
-def query_hashgrid_aabb_count(
-    lower: wp.array[wp.vec3],
-    upper: wp.array[wp.vec3],
-    queries: wp.array[wp.vec3],
-    grid_id: wp.uint64,
-    half_extent: wp.float32,
-    broad_radius: wp.float32,
-    out_counts: wp.array[wp.int32],
-) -> None:
-    tid = wp.tid()
-    q = queries[tid]
-    h = half_extent
-    query = wp.hash_grid_query(grid_id, q, broad_radius)
-    j = int(0)
-    c = int(0)
-    while wp.hash_grid_query_next(query, j):
-        if aabb_intersects_cube(lower[j], upper[j], q, h):
-            c = c + 1
-    out_counts[tid] = c
-
-
-@wp.kernel
-def query_hashgrid_aabb_neighbors(
-    lower: wp.array[wp.vec3],
-    upper: wp.array[wp.vec3],
-    queries: wp.array[wp.vec3],
-    grid_id: wp.uint64,
-    half_extent: wp.float32,
-    broad_radius: wp.float32,
-    offsets: wp.array[wp.int32],
-    out_indices: wp.array[wp.int32],
-) -> None:
-    tid = wp.tid()
-    q = queries[tid]
-    h = half_extent
-    query = wp.hash_grid_query(grid_id, q, broad_radius)
-    primitive_idx = int(0)
-    w = int(offsets[tid])
-    while wp.hash_grid_query_next(query, primitive_idx):
-        if aabb_intersects_cube(lower[primitive_idx], upper[primitive_idx], q, h):
-            out_indices[w] = primitive_idx
-            w = w + 1

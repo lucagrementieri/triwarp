@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import numpy as np
 import pytest
+import pyvista as pv
 import trimesh as tm
 import trimesh.intersections as tm_intersections
 import warp as wp
+from scipy.spatial import KDTree
 
 import triwarp as tw
+from tests.conversions import trimesh_to_pyvista, trimesh_to_warp
 
 
 def _canonical_segments(lines_np: np.ndarray) -> np.ndarray:
@@ -39,11 +44,7 @@ def test_segments_with_plane_axis_aligned(device: str) -> None:
     plane_origin = np.array([0.0, 0.0, 0.0], dtype=np.float32)
     plane_normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
     endpoints_np = np.array(
-        [
-            [[0.0, 0.0, -1.0], [0.0, 0.0, 1.0]],
-            [[1.0, 0.0, 1.0], [1.0, 0.0, 2.0]],
-            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-        ],
+        [[[0.0, 0.0, -1.0], [0.0, 0.0, 1.0]], [[1.0, 0.0, 1.0], [1.0, 0.0, 2.0]], [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]],
         dtype=np.float32,
     )
     endpoints_np = np.transpose(endpoints_np, (1, 0, 2))
@@ -97,18 +98,10 @@ def test_mesh_with_plane_axis_planes(request: pytest.FixtureRequest, mesh_name: 
 
     bounds = mesh_tm.bounds
     mid = 0.5 * (bounds[0] + bounds[1])
-    planes = [
-        (np.array([0.0, 0.0, 1.0]), mid),
-        (np.array([1.0, 0.0, 0.0]), mid),
-        (np.array([0.0, 1.0, 0.0]), mid),
-    ]
+    planes = [(np.array([0.0, 0.0, 1.0]), mid), (np.array([1.0, 0.0, 0.0]), mid), (np.array([0.0, 1.0, 0.0]), mid)]
 
     for plane_normal, plane_origin in planes:
-        lines_tm = tm_intersections.mesh_plane(
-            mesh=mesh_tm,
-            plane_normal=plane_normal,
-            plane_origin=plane_origin,
-        )
+        lines_tm = tm_intersections.mesh_plane(mesh=mesh_tm, plane_normal=plane_normal, plane_origin=plane_origin)
         lines_wp = tw.intersections.mesh_with_plane(
             mesh_wp.points,
             mesh_wp.indices,
@@ -128,16 +121,9 @@ def test_mesh_with_plane_tilted_plane(request: pytest.FixtureRequest, mesh_name:
     plane_normal = tm.transform_points([[0.0, 0.0, 1.0]], base, translate=False)[0]
     plane_origin = tm.transform_points([mesh_tm.centroid], base)[0]
 
-    lines_tm = tm_intersections.mesh_plane(
-        mesh=mesh_tm,
-        plane_normal=plane_normal,
-        plane_origin=plane_origin,
-    )
+    lines_tm = tm_intersections.mesh_plane(mesh=mesh_tm, plane_normal=plane_normal, plane_origin=plane_origin)
     lines_wp = tw.intersections.mesh_with_plane(
-        mesh_wp.points,
-        mesh_wp.indices,
-        wp.vec3(*plane_normal.tolist()),
-        wp.vec3(*plane_origin.tolist()),
+        mesh_wp.points, mesh_wp.indices, wp.vec3(*plane_normal.tolist()), wp.vec3(*plane_origin.tolist())
     )
     assert _segments_equal(lines_wp.numpy(), lines_tm)
 
@@ -148,10 +134,7 @@ def test_mesh_with_plane_return_faces(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -
     plane_origin = mesh_tm.centroid
 
     lines_tm, faces_tm = tm_intersections.mesh_plane(
-        mesh=mesh_tm,
-        plane_normal=plane_normal,
-        plane_origin=plane_origin,
-        return_faces=True,
+        mesh=mesh_tm, plane_normal=plane_normal, plane_origin=plane_origin, return_faces=True
     )
     lines_wp, faces_wp = tw.intersections.mesh_with_plane(
         mesh_wp.points,
@@ -171,9 +154,55 @@ def test_mesh_with_plane_miss_plane(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> 
     plane_origin = mesh_tm.bounds[1] + np.array([0.0, 0.0, 10.0])
 
     lines_wp = tw.intersections.mesh_with_plane(
-        mesh_wp.points,
-        mesh_wp.indices,
-        wp.vec3(*plane_normal.tolist()),
-        wp.vec3(*plane_origin.tolist()),
+        mesh_wp.points, mesh_wp.indices, wp.vec3(*plane_normal.tolist()), wp.vec3(*plane_origin.tolist())
     )
     assert lines_wp.shape == (0, 2)
+
+
+def _pyvista_intersection_segments(mesh1_pv: pv.PolyData, mesh2_pv: pv.PolyData) -> np.ndarray:
+    intersection_pv = cast(pv.PolyData, mesh1_pv.intersection(mesh2_pv, split_first=False, split_second=False)[0])
+    if intersection_pv.n_cells == 0:
+        return np.empty((0, 2, 3), dtype=np.float64)
+    pairs_np = np.reshape(intersection_pv.lines, (-1, 3))[:, 1:]
+    return intersection_pv.points[pairs_np]
+
+
+def _intersection_curves_match(
+    got_segments_np: np.ndarray, ref_segments_np: np.ndarray, *, ref_atol: float = 1e-5, got_atol: float = 1e-5
+) -> bool:
+    """Check both segment sets describe the same intersection curves."""
+    got_segments_np = got_segments_np.reshape(-1, 2, 3)
+    ref_segments_np = ref_segments_np.reshape(-1, 2, 3)
+    if ref_segments_np.shape[0] == 0:
+        return got_segments_np.shape[0] == 0
+    if got_segments_np.shape[0] == 0:
+        return False
+    got_pts_np = got_segments_np.reshape(-1, 3)
+    ref_pts_np = ref_segments_np.reshape(-1, 3)
+    ref_distances_np = KDTree(got_pts_np).query(ref_pts_np, distance_upper_bound=ref_atol)[0]
+    got_distances_np = KDTree(ref_pts_np).query(got_pts_np, distance_upper_bound=got_atol)[0]
+    return bool(np.all(np.isfinite(ref_distances_np)) and np.all(np.isfinite(got_distances_np)))
+
+
+def test_mesh_with_mesh_empty(icosahedron: tuple[tm.Trimesh, wp.Mesh], cave_cube: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _, ico_wp = icosahedron
+    _, cave_wp = cave_cube
+
+    lines_wp = tw.intersections.mesh_with_mesh(ico_wp.points, ico_wp.indices, cave_wp.points, cave_wp.indices)
+    assert lines_wp.shape == (0, 2)
+
+
+def test_mesh_with_mesh_icosahedron_cave_cube(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh], cave_cube: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    ico_tm, ico_wp = icosahedron
+    cave_tm, _ = cave_cube
+    cave_at_ico_tm = cave_tm.copy()
+    cave_at_ico_tm.apply_translation(ico_tm.centroid)
+    cave_wp = trimesh_to_warp(cave_at_ico_tm, ico_wp.device)
+
+    ref_segments_np = _pyvista_intersection_segments(trimesh_to_pyvista(ico_tm), trimesh_to_pyvista(cave_at_ico_tm))
+    lines_wp = tw.intersections.mesh_with_mesh(ico_wp.points, ico_wp.indices, cave_wp.points, cave_wp.indices)
+
+    assert lines_wp.shape[0] > 0
+    assert _intersection_curves_match(lines_wp.numpy(), ref_segments_np)

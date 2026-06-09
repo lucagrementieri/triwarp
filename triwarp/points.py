@@ -137,74 +137,6 @@ def bvh_from_bounds(
     return wp.Bvh(lower, upper, leaf_size=leaf_size)
 
 
-def hashgrid_from_bounds(
-    lower: wp.array[wp.vec3],
-    upper: wp.array[wp.vec3],
-    cell_size: float,
-    grid_bins: int = 128,
-) -> wp.HashGrid:
-    """
-    Build a 3D hash grid over axis-aligned bound centers for AABB queries.
-
-    Each primitive ``i`` is inserted at the midpoint of ``lower[i]`` and ``upper[i]``.
-
-    Parameters
-    ----------
-    lower
-        ``(n,)`` minimum corner of each bound as ``wp.vec3``.
-    upper
-        ``(n,)`` maximum corner of each bound as ``wp.vec3``.
-    cell_size
-        Cell size passed to :meth:`warp.HashGrid.build`.
-    grid_bins
-        Resolution of the hash grid along each axis.
-
-    Returns
-    -------
-    warp.HashGrid
-        Hash grid suited for :func:`query_hashgrid_aabb_with_offsets`.
-
-    See Also
-    --------
-    query_hashgrid_aabb_with_offsets
-    bvh_from_bounds
-    """
-    device = lower.device
-    n = int(lower.shape[0])
-    grid = wp.HashGrid(grid_bins, grid_bins, grid_bins, device=device)
-    if n == 0:
-        return grid
-    centers = wp.empty(n, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_points.bounds_centers,
-        dim=n,
-        inputs=[lower, upper, centers],
-        device=device,
-    )
-    grid.reserve(n)
-    grid.build(centers, cell_size)
-    return grid
-
-
-def _max_primitive_half_extent(
-    lower: wp.array[wp.vec3],
-    upper: wp.array[wp.vec3],
-) -> float:
-    """Maximum half-diagonal of ``lower``/``upper`` bounds (Python scope)."""
-    n = int(lower.shape[0])
-    if n == 0:
-        return 0.0
-    lower_np = lower.numpy()
-    upper_np = upper.numpy()
-    extents = upper_np - lower_np
-    half_diagonals = 0.5 * (
-        extents[:, 0] * extents[:, 0]
-        + extents[:, 1] * extents[:, 1]
-        + extents[:, 2] * extents[:, 2]
-    ) ** 0.5
-    return float(half_diagonals.max())
-
-
 def query_bvh_aabb_with_offsets(
     bvh: wp.Bvh,
     queries: wp.array[wp.vec3],
@@ -273,84 +205,47 @@ def query_bvh_aabb_with_offsets(
     return candidate_indices_flat, offsets
 
 
-def query_hashgrid_aabb_with_offsets(
-    lower: wp.array[wp.vec3],
-    upper: wp.array[wp.vec3],
-    queries: wp.array[wp.vec3],
-    half_extent: float,
+def query_bvh_aabb_bounds_with_offsets(
+    bvh: wp.Bvh,
+    query_lower: wp.array[wp.vec3],
+    query_upper: wp.array[wp.vec3],
     *,
-    grid: wp.HashGrid | None = None,
-    grid_bins: int = 128,
-) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+    max_hits: int = 16,
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
     """
-    Low-level hash-grid AABB query: primitive indices in one flat buffer plus offsets.
+    Low-level BVH AABB query with per-query axis-aligned bounds.
 
-    For each query center ``q``, tests intersection of the query cube
-    ``[q - h, q + h]`` against every primitive bound. Broad-phase uses
-    :class:`warp.HashGrid` over bound centers; narrow-phase applies exact
-    axis-aligned box intersection.
-
-    Parameters
-    ----------
-    lower
-        ``(n,)`` minimum corner of each primitive bound as ``wp.vec3``.
-    upper
-        ``(n,)`` maximum corner of each primitive bound as ``wp.vec3``.
-    queries
-        ``(m, 3)`` query centers stored as ``wp.vec3``.
-    half_extent
-        Half side length of the axis-aligned query cube along each axis.
-    grid
-        Optional pre-built hash grid from :func:`hashgrid_from_bounds`. If ``None``,
-        built with ``cell_size = half_extent``.
-    grid_bins
-        Grid resolution when constructing ``grid`` (ignored if ``grid`` is provided).
+    For each query primitive ``k``, tests intersection of ``[query_lower[k],
+    query_upper[k]]`` against every primitive bound in ``bvh``. At most
+    ``max_hits`` candidates are recorded per query.
 
     Returns
     -------
-    candidate_indices_flat, offsets
-        Same CSR layout as :func:`query_bvh_aabb_with_offsets`.
-
-    See Also
-    --------
-    query_bvh_aabb_with_offsets
-    hashgrid_from_bounds
+    candidate_indices_flat, offsets, hit_counts
+        ``offsets`` is the exclusive prefix sum of per-query hit counts.
+        Query ``k`` owns ``candidate_indices_flat[offsets[k] : offsets[k] + hit_counts[k]]``.
     """
-    device = queries.device
-    m = int(queries.shape[0])
-    n = int(lower.shape[0])
+    device = query_lower.device
+    if query_upper.device != device:
+        raise ValueError("query_lower and query_upper must live on the same device")
+    m = int(query_lower.shape[0])
+    if int(query_upper.shape[0]) != m:
+        raise ValueError("query_lower and query_upper must have the same length")
+    if max_hits < 1:
+        raise ValueError("max_hits must be >= 1")
 
     if m == 0:
         return (
             wp.empty(0, dtype=wp.int32, device=device),
             wp.empty(0, dtype=wp.int32, device=device),
-        )
-
-    if n == 0:
-        return (
             wp.empty(0, dtype=wp.int32, device=device),
-            wp.zeros(m, dtype=wp.int32, device=device),
         )
-
-    max_half_extent = _max_primitive_half_extent(lower, upper)
-    broad_radius = half_extent + max_half_extent
-
-    if grid is None:
-        grid = hashgrid_from_bounds(lower, upper, half_extent, grid_bins)
 
     hit_counts = wp.empty(m, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_points.query_hashgrid_aabb_count,
+        kernel_points.query_bvh_aabb_bounds_count,
         dim=m,
-        inputs=[
-            lower,
-            upper,
-            queries,
-            grid.id,
-            wp.float32(half_extent),
-            wp.float32(broad_radius),
-            hit_counts,
-        ],
+        inputs=[query_lower, query_upper, bvh.id, wp.int32(max_hits), hit_counts],
         device=device,
     )
 
@@ -359,6 +254,7 @@ def query_hashgrid_aabb_with_offsets(
         return (
             wp.empty(0, dtype=wp.int32, device=device),
             wp.zeros(m, dtype=wp.int32, device=device),
+            hit_counts,
         )
 
     offsets = wp.empty(m, dtype=wp.int32, device=device)
@@ -366,22 +262,13 @@ def query_hashgrid_aabb_with_offsets(
 
     candidate_indices_flat = wp.empty(total_hits, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_points.query_hashgrid_aabb_neighbors,
+        kernel_points.query_bvh_aabb_bounds_neighbors,
         dim=m,
-        inputs=[
-            lower,
-            upper,
-            queries,
-            grid.id,
-            wp.float32(half_extent),
-            wp.float32(broad_radius),
-            offsets,
-            candidate_indices_flat,
-        ],
+        inputs=[query_lower, query_upper, bvh.id, wp.int32(max_hits), offsets, candidate_indices_flat],
         device=device,
     )
 
-    return candidate_indices_flat, offsets
+    return candidate_indices_flat, offsets, hit_counts
 
 
 def query_hashgrid_ball_count(

@@ -12,7 +12,17 @@ version = "0.1.0"
 dependencies = ["warp-lang>=1.13"]
 
 [project.optional-dependencies]
-test = ["pytest>=9.0", "embreex>=4.4", "manifold3d>=2.3.0", "rtree", "scipy>=1.17", "shapely>=2.1.2", "trimesh>=4.11"]
+dev = ["ruff>=0.9"]
+test = [
+    "pytest>=9.0",
+    "embreex>=4.4",
+    "manifold3d>=2.3.0",
+    "pyvista>=0.48",
+    "rtree>=0.12",
+    "scipy>=1.17",
+    "shapely>=2.1.2",
+    "trimesh>=4.11",
+]
 
 [tool.setuptools.packages.find]
 exclude = ["reference*"]
@@ -21,3 +31,17 @@ where = ["."]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = [".git", ".pytest_cache", ".ruff_cache", ".venv", "build", "dist", "reference"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["triwarp"]
+
+[tool.ruff.format]
+skip-magic-trailing-comma = true

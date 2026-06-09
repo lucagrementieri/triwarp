@@ -216,35 +216,36 @@ def test_query_nearest_empty(device: str, backend: Literal["bvh", "hashgrid"]):
     assert indices.shape == (0, k) and distances.shape == (0, k)
 
 
-def test_query_aabb_bvh_vs_hashgrid(device: str):
-    rng = np.random.default_rng(3)
-    lower_np = rng.random((12, 3), dtype=np.float32)
-    upper_np = lower_np + rng.random((12, 3), dtype=np.float32) * 0.4 + 0.05
-    queries_np = rng.random((4, 3), dtype=np.float32)
-    half_extent = 0.35
+def test_query_bvh_aabb_bounds_with_offsets(device: str) -> None:
+    rng = np.random.default_rng(7)
+    lower_np = rng.random((8, 3), dtype=np.float32)
+    upper_np = lower_np + rng.random((8, 3), dtype=np.float32) * 0.4 + 0.05
+    query_lower_np = lower_np[:4].copy()
+    query_upper_np = upper_np[:4].copy()
 
     lower_wp = wp.array(np.ascontiguousarray(lower_np), dtype=wp.vec3, device=device)
     upper_wp = wp.array(np.ascontiguousarray(upper_np), dtype=wp.vec3, device=device)
-    queries_wp = wp.array(np.ascontiguousarray(queries_np), dtype=wp.vec3, device=device)
+    query_lower_wp = wp.array(np.ascontiguousarray(query_lower_np), dtype=wp.vec3, device=device)
+    query_upper_wp = wp.array(np.ascontiguousarray(query_upper_np), dtype=wp.vec3, device=device)
 
     bvh = tw.points.bvh_from_bounds(lower_wp, upper_wp)
-    bvh_indices, bvh_offsets = tw.points.query_bvh_aabb_with_offsets(bvh, queries_wp, half_extent)
-
-    hg_indices, hg_offsets = tw.points.query_hashgrid_aabb_with_offsets(
-        lower_wp, upper_wp, queries_wp, half_extent
+    indices_wp, offsets_wp, hit_counts_wp = tw.points.query_bvh_aabb_bounds_with_offsets(
+        bvh,
+        query_lower_wp,
+        query_upper_wp,
+        max_hits=16,
     )
 
-    bvh_indices_np = bvh_indices.numpy()
-    hg_indices_np = hg_indices.numpy()
-    bvh_bounds = np.append(bvh_offsets.numpy(), bvh_indices_np.shape[0])
-    hg_bounds = np.append(hg_offsets.numpy(), hg_indices_np.shape[0])
+    indices_np = indices_wp.numpy()
+    offsets_np = offsets_wp.numpy()
+    hit_counts_np = hit_counts_wp.numpy()
+    bounds_np = np.append(offsets_np, indices_np.shape[0])
 
-    for query_idx, q in enumerate(queries_np):
-        q_lower = q - half_extent
-        q_upper = q + half_extent
-        mask = np.all(lower_np <= q_upper, axis=1) & np.all(upper_np >= q_lower, axis=1)
-        expected_sorted = np.sort(np.flatnonzero(mask).astype(np.int32))
-        bvh_got = np.sort(bvh_indices_np[bvh_bounds[query_idx] : bvh_bounds[query_idx + 1]])
-        hg_got = np.sort(hg_indices_np[hg_bounds[query_idx] : hg_bounds[query_idx + 1]])
-        assert np.array_equal(bvh_got, expected_sorted)
-        assert np.array_equal(hg_got, expected_sorted)
+    for query_idx in range(query_lower_np.shape[0]):
+        q_lower = query_lower_np[query_idx]
+        q_upper = query_upper_np[query_idx]
+        mask_np = np.all(lower_np <= q_upper, axis=1) & np.all(upper_np >= q_lower, axis=1)
+        expected_np = np.sort(np.flatnonzero(mask_np).astype(np.int32))
+        got_np = np.sort(indices_np[bounds_np[query_idx] : bounds_np[query_idx + 1]])
+        assert hit_counts_np[query_idx] == got_np.shape[0]
+        assert np.array_equal(got_np, expected_np)
