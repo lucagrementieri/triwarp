@@ -5,6 +5,7 @@ from . import convex
 from . import curvature
 from . import graph
 from . import grouping
+from . import intersections
 from . import points
 from . import ray
 from . import reduce
@@ -21,6 +22,7 @@ __all__ = [
     "curvature",
     "graph",
     "grouping",
+    "intersections",
     "points",
     "ray",
     "reduce",
