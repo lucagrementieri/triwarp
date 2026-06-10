@@ -8,6 +8,7 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.array import init_range, init_repeat_index
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import graph as kernel_graph
 from triwarp.kernels import selection as kernel_selection
@@ -126,9 +127,7 @@ def face_adjacency(
         return empty_array
     if edges_sorted is None:
         edges_sorted = faces_to_edges(faces, sorted=True)
-    edges_face = wp.array(
-        [f for f in range(n_faces) for _ in range(3)], dtype=wp.int32, device=faces.device
-    )
+    edges_face = init_repeat_index(n_faces * 3, 3, faces.device)
     edge_groups = tw.grouping.group_int_rows(edges_sorted, length=2, max_value=n_faces)
     adjacency = twt.empty_int32_2d((edge_groups.shape[0], 2), device=faces.device)
     wp.launch(
@@ -579,7 +578,7 @@ def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[
     if node_count <= 1:
         return wp.zeros(node_count, dtype=wp.int32, device=device)
     if adjacency.nnz == 0:
-        return wp.array(range(node_count), dtype=wp.int32, device=device)
+        return init_range(node_count, device)
 
     offsets = adjacency.offsets  # pyright: ignore[reportAttributeAccessIssue]
     indices = adjacency.columns  # pyright: ignore[reportAttributeAccessIssue]
@@ -681,7 +680,7 @@ def connected_component_labels_from_edges(
     elif node_count < 0:
         raise ValueError(f"node_count must be non-negative, got {node_count}")
     elif m == 0:
-        return wp.array(range(node_count), dtype=wp.int32, device=device)
+        return init_range(node_count, device)
     else:
         edges_np = edges.numpy()
         if edges_np.min() < 0 or int(edges_np.max()) >= node_count:

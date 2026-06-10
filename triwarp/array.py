@@ -15,6 +15,120 @@ from triwarp.kernels import array as kernel_array
 _ISIN_MASK_SIZE_FACTOR = 8
 
 
+def _ensure_int_dtype(dtype: type) -> type[wp.Int]:
+    if not wp.types.type_is_int(dtype):
+        raise TypeError(f"dtype must be a Warp integer type, got {dtype!r}")
+    return dtype
+
+
+def _check_int_fits(dtype: type[wp.Int], value: int, name: str) -> None:
+    vmin = tw.reduce.min_for_dtype(dtype)
+    vmax = tw.reduce.max_for_dtype(dtype)
+    if value < vmin or value > vmax:
+        raise ValueError(f"{name}={value} is out of range for {dtype} [{vmin}, {vmax}]")
+
+
+def _int_scalar(dtype: type[wp.Int], value: int) -> wp.Int:
+    _check_int_fits(dtype, value, "value")
+    return dtype(value)
+
+
+def init_range(
+    n: int,
+    device: str,
+    *,
+    dtype: type[wp.Int] = wp.int32,
+) -> wp.array:
+    """Fill ``out[i] = i`` for ``i`` in ``[0, n)``."""
+    dtype = _ensure_int_dtype(dtype)
+    if n < 0:
+        raise ValueError(f"n must be non-negative, got {n}")
+    if n > 0:
+        _check_int_fits(dtype, n - 1, "n")
+    out = wp.empty(n, dtype=dtype, device=device)
+    if n > 0:
+        wp.launch(kernel_array.init_range, dim=n, inputs=[out], device=device)
+    return out
+
+
+def init_range_step(
+    count: int,
+    step: int,
+    device: str,
+    *,
+    dtype: type[wp.Int] = wp.int32,
+) -> wp.array:
+    """Fill ``out[i] = i * step`` (``numpy.arange(0, count * step, step)``)."""
+    dtype = _ensure_int_dtype(dtype)
+    if count < 0:
+        raise ValueError(f"count must be non-negative, got {count}")
+    if step < 0:
+        raise ValueError(f"step must be non-negative, got {step}")
+    if count > 0:
+        _check_int_fits(dtype, (count - 1) * step, "count * step")
+        _check_int_fits(dtype, step, "step")
+    out = wp.empty(count, dtype=dtype, device=device)
+    if count > 0:
+        wp.launch(
+            kernel_array.init_range_step,
+            dim=count,
+            inputs=[out, _int_scalar(dtype, step)],
+            device=device,
+        )
+    return out
+
+
+def init_sort_pair_indices(
+    n: int,
+    fill_value: int,
+    device: str,
+    *,
+    dtype: type[wp.Int] = wp.int32,
+) -> wp.array:
+    """Fill ``[0, 1, ..., n-1, fill_value, ..., fill_value]`` (length ``2 * n``)."""
+    dtype = _ensure_int_dtype(dtype)
+    if n < 0:
+        raise ValueError(f"n must be non-negative, got {n}")
+    if n > 0:
+        _check_int_fits(dtype, n - 1, "n")
+    _check_int_fits(dtype, fill_value, "fill_value")
+    out = wp.empty(2 * n, dtype=dtype, device=device)
+    if n > 0:
+        wp.launch(
+            kernel_array.init_sort_pair_indices,
+            dim=2 * n,
+            inputs=[out, _int_scalar(dtype, n), _int_scalar(dtype, fill_value)],
+            device=device,
+        )
+    return out
+
+
+def init_repeat_index(
+    count: int,
+    repeats: int,
+    device: str,
+    *,
+    dtype: type[wp.Int] = wp.int32,
+) -> wp.array:
+    """Fill ``out[i] = i // repeats`` (repeat each index ``repeats`` times)."""
+    dtype = _ensure_int_dtype(dtype)
+    if count < 0:
+        raise ValueError(f"count must be non-negative, got {count}")
+    if repeats <= 0:
+        raise ValueError(f"repeats must be positive, got {repeats}")
+    if count > 0:
+        _check_int_fits(dtype, (count - 1) // repeats, "count // repeats")
+    out = wp.empty(count, dtype=dtype, device=device)
+    if count > 0:
+        wp.launch(
+            kernel_array.init_repeat_index,
+            dim=count,
+            inputs=[out, _int_scalar(dtype, repeats)],
+            device=device,
+        )
+    return out
+
+
 def pack_1d_arrays(
     arrays: Sequence[wp.array[wp.Scalar]],
 ) -> tuple[wp.array[wp.Scalar], wp.array[wp.int32]]:
@@ -77,10 +191,9 @@ def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
     n = data.size
     data_buffer = wp.empty(n * 2, dtype=data.dtype, device=data.device)
     wp.copy(data_buffer, data, count=n)
-    indices_buffer = wp.array(list(range(n)) + [-1] * n, dtype=wp.int32, device=data.device)
-    segment_start_indices = wp.array(
-        list(range(0, n + 1, data.shape[1])), dtype=wp.int32, device=data.device
-    )
+    indices_buffer = init_sort_pair_indices(n, -1, data.device)
+    n_cols = int(data.shape[1])
+    segment_start_indices = init_range_step(n // n_cols + 1, n_cols, data.device)
     wp.utils.segmented_sort_pairs(
         data_buffer, indices_buffer, n, segment_start_indices=segment_start_indices
     )
@@ -136,7 +249,7 @@ def index_sparse(
             data = casted_data
 
     n_cols, n_repeats = indices.shape
-    cols = wp.array([c for c in range(n_cols) for _ in range(n_repeats)], dtype=wp.int32)
+    cols = init_repeat_index(n_cols * n_repeats, n_repeats, indices.device)
     return wps.bsr_from_triplets(
         n_rows,
         indices.shape[0],
@@ -212,7 +325,7 @@ def _sorted_int32_copy(values: wp.array[wp.int32]) -> wp.array[wp.int32]:
         return sorted_wp
     keys_wp = wp.empty(2 * n, dtype=wp.int32, device=device)
     wp.copy(keys_wp, values, count=n)
-    indices_wp = wp.array(list(range(n)) + [n] * n, dtype=wp.int32, device=device)
+    indices_wp = init_sort_pair_indices(n, n, device)
     wp.utils.radix_sort_pairs(keys_wp, indices_wp, count=n)
     sorted_wp = wp.empty(n, dtype=wp.int32, device=device)
     wp.copy(sorted_wp, keys_wp, count=n)

@@ -7,6 +7,7 @@ from typing import Literal
 import warp as wp
 
 import triwarp as tw
+from triwarp.array import init_range
 
 
 def _gather_faces(
@@ -85,7 +86,7 @@ def submesh_from_face_indices(
 
     if unique_indices:
         unique_face_indices = face_indices
-        face_slots = wp.array(range(k), dtype=wp.int32, device=device)
+        face_slots = init_range(k, device)
     else:
         unique_face_indices, face_slots = tw.unique.unique_1d(face_indices, return_inverse=True)
 

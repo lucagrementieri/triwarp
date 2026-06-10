@@ -30,9 +30,32 @@ def sub(array: wp.array[wp.Scalar], n: wp.Scalar) -> None:
 
 
 @wp.kernel
-def range(empty_array: wp.array[wp.int32]) -> None:
+def init_range(out: wp.array[wp.Int]) -> None:
     i = int(wp.tid())
-    empty_array[i] = i
+    out[i] = i
+
+
+@wp.kernel
+def init_range_step(out: wp.array[wp.Int], step: wp.Int) -> None:
+    i = int(wp.tid())
+    out[i] = i * step
+
+
+@wp.kernel
+def init_sort_pair_indices(
+    out: wp.array[wp.Int], n: wp.Int, fill_value: wp.Int
+) -> None:
+    i = int(wp.tid())
+    if i < n:
+        out[i] = i
+    else:
+        out[i] = fill_value
+
+
+@wp.kernel
+def init_repeat_index(out: wp.array[wp.Int], repeats: wp.Int) -> None:
+    i = int(wp.tid())
+    out[i] = i // repeats
 
 
 @wp.kernel

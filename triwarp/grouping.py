@@ -2,6 +2,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.array import init_sort_pair_indices
 from triwarp.kernels import grouping as kernel_grouping
 
 
@@ -37,7 +38,7 @@ def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
     """
     n = int(values.shape[0])
     values_buffer = tw.unique.reinterpret_cast_to_int(values, 2 * n)
-    indices_buffer = wp.array(list(range(n)) + [-1] * n, dtype=wp.int32, device=values.device)
+    indices_buffer = init_sort_pair_indices(n, -1, values.device)
     wp.utils.radix_sort_pairs(values_buffer, indices_buffer, count=n)
 
     counter = wp.zeros(1, dtype=wp.int32, device=values.device)

@@ -8,6 +8,7 @@ from typing import Literal, TypeVar, overload
 import warp as wp
 
 import triwarp as tw
+from triwarp.array import init_range
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import unique as kernel_unique
 
@@ -146,7 +147,7 @@ def _unique_hash(
     # Phase 4: sort only the n_unique keys (typically n_unique << n).
     keys_buf = wp.empty(2 * n_unique, dtype=key_dtype, device=device)
     wp.copy(keys_buf, keys_compact, count=n_unique)
-    perm_buf = wp.array(range(2 * n_unique), dtype=wp.int32, device=device)
+    perm_buf = init_range(2 * n_unique, device)
     wp.utils.radix_sort_pairs(keys_buf, perm_buf, count=n_unique)
 
     unique_values = reinterpret_cast_from_int(keys_buf, original_dtype, count=n_unique)
