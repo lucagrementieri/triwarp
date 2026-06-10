@@ -30,6 +30,12 @@ def sub(array: wp.array[wp.Scalar], n: wp.Scalar) -> None:
 
 
 @wp.kernel
+def range(empty_array: wp.array[wp.int32]) -> None:
+    i = int(wp.tid())
+    empty_array[i] = i
+
+
+@wp.kernel
 def normalize(array: wp.array[wp.vec3]) -> None:
     tid = wp.tid()
     array[tid] = wp.normalize(array[tid])
@@ -126,9 +132,7 @@ def isin_lookup_sorted(
     elements: wp.array[wp.int32], sorted_test: wp.array[wp.int32], out_mask: wp.array[wp.bool]
 ) -> None:
     tid = int(wp.tid())
-    value = elements[tid]
-    idx = binary_search_index(sorted_test, value)
-    out_mask[tid] = idx > 0 and sorted_test[idx - 1] == value
+    out_mask[tid] = binary_search_sorted_contains(sorted_test, elements[tid])
 
 
 @wp.kernel
@@ -162,16 +166,8 @@ def array_shift_insert(array: wp.array[wp.Scalar], value: wp.Scalar, index: wp.i
 
 
 @wp.func
-def linear_search_index(values: wp.array[wp.Scalar], value: wp.Scalar) -> wp.int32:
-    n = values.shape[0]
-    for slot_index in range(n):
-        if value < values[slot_index]:
-            return wp.int32(slot_index)
-    return wp.int32(n)
-
-
-@wp.func
 def binary_search_index(values: wp.array[wp.Scalar], value: wp.Scalar) -> wp.int32:
+    """First index i with values[i] > value, or len(values) (numpy searchsorted side='right')."""
     n = values.shape[0]
     left = wp.int32(0)
     right = n - 1
@@ -184,3 +180,17 @@ def binary_search_index(values: wp.array[wp.Scalar], value: wp.Scalar) -> wp.int
         else:
             left = mid + 1
     return wp.int32(result)
+
+
+@wp.func
+def binary_search_sorted_contains(values: wp.array[wp.Scalar], value: wp.Scalar) -> bool:
+    idx = binary_search_index(values, value)
+    return idx > wp.int32(0) and values[idx - wp.int32(1)] == value
+
+
+@wp.kernel
+def map_sorted_inverse(
+    data: wp.array[wp.Scalar], sorted_unique: wp.array[wp.Scalar], out_inverse: wp.array[wp.int32]
+) -> None:
+    i = int(wp.tid())
+    out_inverse[i] = binary_search_index(sorted_unique, data[i]) - wp.int32(1)
