@@ -9,7 +9,7 @@
       "Bash(cat *)",
       "Bash(ls *)",
       "Bash(rm -rf ~/.cache/warp/*)",
-      "WebFetch(domain:nvidia.github.io)",
+      "WebFetch(domain:nvidia.github.io)"
     ],
     "additionalDirectories": [
       "~/.cache/warp/"
