@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.constants import TOLERANCE_MERGE_CONSTANT
+from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_PLANAR_CONSTANT
 from triwarp.kernels import array as kernel_array
 
 
@@ -347,3 +347,113 @@ def query_hashgrid_nearest_neighbors(
         slot = kernel_array.binary_search_index(out_distances[tid], d)
         kernel_array.array_shift_insert(out_distances[tid], d, slot)
         kernel_array.array_shift_insert(out_indices[tid], point_index, slot)
+
+
+@wp.kernel
+def init_sphere_radii(
+    mesh_vertices: wp.array[wp.vec3],
+    n_vertices: wp.int32,
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    distances: wp.array[wp.float32],
+    out_radii: wp.array[wp.float32],
+    out_not_converged: wp.array[wp.bool],
+) -> None:
+    tid = wp.tid()
+    p = points[tid]
+    n = normals[tid]
+    d = distances[tid]
+
+    if not wp.isinf(d):
+        out_radii[tid] = d * wp.float32(0.5)
+        out_not_converged[tid] = True
+        return
+
+    max_proj = wp.float32(-1e38)
+    best_v = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
+    found = wp.bool(False)
+
+    for v_idx in range(n_vertices):
+        v = mesh_vertices[v_idx]
+        proj = wp.dot(v - p, n)
+        if proj > max_proj:
+            max_proj = proj
+            best_v = v
+            found = True
+
+    if not found or max_proj < TOLERANCE_PLANAR_CONSTANT:
+        out_radii[tid] = wp.inf
+        out_not_converged[tid] = False
+        return
+
+    diff = best_v - p
+    denom = wp.float32(2.0) * wp.dot(diff, n)
+    if wp.abs(denom) < TOLERANCE_PLANAR_CONSTANT:
+        out_radii[tid] = wp.inf
+        out_not_converged[tid] = False
+        return
+
+    out_radii[tid] = wp.dot(diff, diff) / denom
+    out_not_converged[tid] = True
+
+
+@wp.kernel
+def compute_sphere_centers(
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    radii: wp.array[wp.float32],
+    out_centers: wp.array[wp.vec3],
+) -> None:
+    tid = wp.tid()
+    r = radii[tid]
+    if wp.isinf(r) or wp.isnan(r):
+        out_centers[tid] = wp.vec3(wp.nan, wp.nan, wp.nan)
+    else:
+        out_centers[tid] = points[tid] + normals[tid] * r
+
+
+@wp.kernel
+def step_sphere_shrink(
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    n_points: wp.array[wp.vec3],
+    n_dists: wp.array[wp.float32],
+    centers: wp.array[wp.vec3],
+    old_radii: wp.array[wp.float32],
+    convergence_threshold: wp.float32,
+    not_converged: wp.array[wp.bool],
+    out_radii: wp.array[wp.float32],
+    out_centers: wp.array[wp.vec3],
+    out_not_converged: wp.array[wp.bool],
+) -> None:
+    tid = wp.tid()
+    if not not_converged[tid]:
+        return
+
+    p = points[tid]
+    center = centers[tid]
+    dist_to_start = wp.length(center - p)
+
+    if wp.abs(n_dists[tid] - dist_to_start) < TOLERANCE_PLANAR_CONSTANT:
+        out_not_converged[tid] = False
+        return
+
+    diff = n_points[tid] - p
+    denom = wp.float32(2.0) * wp.dot(diff, normals[tid])
+    if wp.abs(denom) < TOLERANCE_PLANAR_CONSTANT:
+        out_not_converged[tid] = False
+        return
+
+    new_r = wp.dot(diff, diff) / denom
+    out_radii[tid] = new_r
+    out_centers[tid] = p + normals[tid] * new_r
+
+    if old_radii[tid] - new_r < convergence_threshold:
+        out_not_converged[tid] = False
+
+
+@wp.kernel
+def count_true(flags: wp.array[wp.bool], out_count: wp.array[wp.int32]) -> None:
+    tid = wp.tid()
+    if flags[tid]:
+        wp.atomic_add(out_count, 0, 1)

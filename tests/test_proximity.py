@@ -408,6 +408,43 @@ def test_closest_point_on_mesh_empty_faces(device: str) -> None:
     assert np.all(triangle_id_wp.numpy() == -1)
 
 
+def test_normals_at_closest_faces(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _, mesh_wp = icosahedron
+    rng = np.random.default_rng(19)
+    query_np = rng.random((32, 3)).astype(np.float64)
+
+    query_wp = wp.array(
+        np.ascontiguousarray(query_np.astype(np.float32)), dtype=wp.vec3, device=mesh_wp.device
+    )
+    normals_wp = tw.proximity.normals_at_closest_faces(mesh_wp, query_wp).numpy()
+
+    _, _, triangle_id_wp = tw.proximity.closest_point_on_mesh(
+        mesh_wp.points, mesh_wp.indices, query_wp
+    )
+    all_normals_wp, _ = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
+    expected_normals_np = all_normals_wp.numpy()[triangle_id_wp.numpy()]
+    assert np.allclose(normals_wp, expected_normals_np, rtol=1e-5, atol=1e-5)
+
+
+def test_normals_at_closest_faces_surface(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    points_np, face_ids_np = tm.sample.sample_surface(mesh_tm, 24, seed=3)
+    expected_normals_np = mesh_tm.face_normals[face_ids_np].astype(np.float32)
+
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np.astype(np.float32)), dtype=wp.vec3, device=mesh_wp.device
+    )
+    normals_wp = tw.proximity.normals_at_closest_faces(mesh_wp, points_wp).numpy()
+    assert np.allclose(normals_wp, expected_normals_np, rtol=1e-5, atol=1e-5)
+
+
+def test_normals_at_closest_faces_empty(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _, mesh_wp = icosahedron
+    points_wp = wp.empty(0, dtype=wp.vec3, device=mesh_wp.device)
+    normals_wp = tw.proximity.normals_at_closest_faces(mesh_wp, points_wp)
+    assert normals_wp.shape == (0,)
+
+
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
 def test_signed_distance_on_mesh_random(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
@@ -492,3 +529,79 @@ def test_signed_distance_on_mesh_empty_faces(device: str) -> None:
     signed_wp = tw.proximity.signed_distance_on_mesh(vertices, faces, points)
     assert signed_wp.shape == (2,)
     assert np.all(np.isinf(signed_wp.numpy()))
+
+
+def test_max_tangent_sphere(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    points_np, face_ids = tm.sample.sample_surface(mesh_tm, 20, seed=42)
+    normals_np = mesh_tm.face_normals[face_ids]
+
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    normals_wp = wp.array(
+        np.ascontiguousarray(normals_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+
+    centers_wp, radii_wp = tw.proximity.max_tangent_sphere(mesh_wp, points_wp, normals=normals_wp)
+    centers_tm, radii_tm = tm_proximity.max_tangent_sphere(mesh_tm, points_np, normals=normals_np)
+
+    finite_tm = np.isfinite(radii_tm)
+    assert np.array_equal(np.isfinite(radii_wp.numpy()), finite_tm)
+    if finite_tm.any():
+        assert np.allclose(radii_wp.numpy()[finite_tm], radii_tm[finite_tm], rtol=1e-2, atol=1e-2)
+        assert np.allclose(
+            centers_wp.numpy()[finite_tm], centers_tm[finite_tm], rtol=1e-2, atol=1e-2
+        )
+
+
+def test_thickness_max_sphere(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    points_np, face_ids = tm.sample.sample_surface(mesh_tm, 20, seed=7)
+    normals_np = mesh_tm.face_normals[face_ids]
+
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    normals_wp = wp.array(
+        np.ascontiguousarray(normals_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+
+    thickness_wp = tw.proximity.thickness(mesh_wp, points_wp, normals=normals_wp).numpy()
+    thickness_tm = tm_proximity.thickness(mesh_tm, points_np, normals=normals_np)
+
+    finite_tm = np.isfinite(thickness_tm)
+    assert np.array_equal(np.isfinite(thickness_wp), finite_tm)
+    if finite_tm.any():
+        assert np.allclose(thickness_wp[finite_tm], thickness_tm[finite_tm], rtol=1e-5, atol=1e-5)
+
+
+def test_thickness_ray(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    points_np, face_ids = tm.sample.sample_surface(mesh_tm, 20, seed=13)
+    normals_np = mesh_tm.face_normals[face_ids]
+
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    normals_wp = wp.array(
+        np.ascontiguousarray(normals_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+
+    thickness_wp = tw.proximity.thickness(
+        mesh_wp, points_wp, normals=normals_wp, method="ray"
+    ).numpy()
+    thickness_tm = tm_proximity.thickness(mesh_tm, points_np, normals=normals_np, method="ray")
+
+    finite_tm = np.isfinite(thickness_tm)
+    assert np.array_equal(np.isfinite(thickness_wp), finite_tm)
+    if finite_tm.any():
+        assert np.allclose(thickness_wp[finite_tm], thickness_tm[finite_tm])
+
+
+def test_max_tangent_sphere_empty(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _, mesh_wp = icosahedron
+    points_wp = wp.empty(0, dtype=wp.vec3, device=mesh_wp.device)
+    centers_wp, radii_wp = tw.proximity.max_tangent_sphere(mesh_wp, points_wp)
+    assert centers_wp.shape == (0,)
+    assert radii_wp.shape == (0,)

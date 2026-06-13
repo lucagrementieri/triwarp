@@ -14,8 +14,10 @@ from typing import Literal, cast, overload
 import numpy as np
 import warp as wp
 
+import triwarp as tw
 import triwarp.typing as twt
 from triwarp.kernels import proximity as kernel_proximity
+from triwarp.triangles import face_normals_and_areas
 
 
 def aabb_bounds(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
@@ -1278,6 +1280,55 @@ def closest_point_on_mesh(
     return out_closest, out_distance, out_face
 
 
+def normals_at_closest_faces(
+    mesh: wp.Mesh, points: wp.array[wp.vec3], *, max_dist: float | None = None
+) -> wp.array[wp.vec3]:
+    """
+    Return unit face normals at the closest mesh triangle for each query point.
+
+    For each position in ``points``, runs an unsigned closest-point query on
+    ``mesh`` and returns the normal of the hit triangle. When no face lies
+    within ``max_dist``, the corresponding output is undefined (same as the
+    underlying ``wp.mesh_query_point_no_sign`` miss case).
+
+    Parameters
+    ----------
+    mesh
+        Warp mesh (BVH built by caller).
+    points
+        ``(m,)`` query positions as ``wp.vec3``.
+    max_dist
+        Maximum search radius per query. When ``None``, derived from the
+        axis-aligned box enclosing mesh vertices and query points.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        ``(m,)`` face normals at the closest triangle for each query.
+    """
+    device = points.device
+    m = int(points.shape[0])
+    if m == 0:
+        return wp.empty(0, dtype=wp.vec3, device=device)
+
+    if max_dist is None:
+        max_dist = default_mesh_query_max_dist(mesh.points, points)
+
+    out_closest = wp.empty(m, dtype=wp.vec3, device=device)
+    out_dist = wp.empty(m, dtype=wp.float32, device=device)
+    out_face = wp.empty(m, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_proximity.closest_point_on_mesh,
+        dim=m,
+        inputs=[mesh.id, points, wp.float32(max_dist), out_closest, out_dist, out_face],
+        device=device,
+    )
+    all_face_normals, _ = face_normals_and_areas(mesh.points, mesh.indices)
+    normals = wp.empty(m, dtype=wp.vec3, device=device)
+    wp.copy(normals, all_face_normals[out_face])
+    return normals
+
+
 def signed_distance_on_mesh(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -1349,3 +1400,175 @@ def signed_distance_on_mesh(
         device=device,
     )
     return out_distance
+
+
+def max_tangent_sphere(
+    mesh: wp.Mesh,
+    points: wp.array[wp.vec3],
+    *,
+    inwards: bool = True,
+    normals: wp.array[wp.vec3] | None = None,
+    threshold: float = 1e-6,
+    max_iter: int = 100,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.float32]]:
+    """
+    Find the center and radius of the sphere tangent to the mesh at each point.
+
+    Implements the shrinking-sphere algorithm (Inui et al. 2016): iteratively
+    finds the largest sphere tangent to the mesh at ``points`` with no
+    non-tangential intersections.
+
+    Parameters
+    ----------
+    mesh
+        Warp mesh (BVH built by caller).
+    points
+        ``(m,)`` surface points as ``wp.vec3``.
+    inwards
+        If ``True``, sphere grows inward (into the mesh interior). If ``False``,
+        grows outward.
+    normals
+        ``(m,)`` unit surface normals at ``points``. If ``None``, computed from
+        the closest triangle.
+    threshold
+        Convergence threshold as a fraction of the scene diagonal.
+    max_iter
+        Maximum number of shrink iterations.
+
+    Returns
+    -------
+    centers
+        ``(m,)`` sphere center positions as ``wp.vec3``.
+    radii
+        ``(m,)`` sphere radii as ``float32``. ``inf`` when the sphere is
+        unbounded.
+    """
+    device = points.device
+    m = int(points.shape[0])
+    if m == 0:
+        return (
+            wp.empty(0, dtype=wp.vec3, device=device),
+            wp.empty(0, dtype=wp.float32, device=device),
+        )
+
+    if normals is None:
+        normals = normals_at_closest_faces(mesh, points)
+
+    ray_dirs: wp.array[wp.vec3] = -normals if inwards else normals
+
+    max_t = default_mesh_query_max_dist(mesh.points, points)
+    distances = tw.ray.longest_ray(mesh, points, ray_dirs, max_t=max_t)
+
+    n_verts = int(mesh.points.shape[0])
+    radii = wp.empty(m, dtype=wp.float32, device=device)
+    not_converged = wp.empty(m, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_proximity.init_sphere_radii,
+        dim=m,
+        inputs=[mesh.points, wp.int32(n_verts), points, ray_dirs, distances, radii, not_converged],
+        device=device,
+    )
+
+    centers = wp.empty(m, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_proximity.compute_sphere_centers,
+        dim=m,
+        inputs=[points, ray_dirs, radii, centers],
+        device=device,
+    )
+
+    mesh_min, mesh_max = aabb_bounds(mesh.points)
+    D = float(wp.length(mesh_max - mesh_min))
+    convergence_threshold = wp.float32(threshold * D)
+
+    n_iter = 0
+    while n_iter < max_iter:
+        count_wp = wp.zeros(1, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_proximity.count_true, dim=m, inputs=[not_converged, count_wp], device=device
+        )
+        if int(count_wp.numpy()[0]) == 0:
+            break
+
+        n_pts_wp = wp.empty(m, dtype=wp.vec3, device=device)
+        n_dists_wp = wp.empty(m, dtype=wp.float32, device=device)
+        n_face_wp = wp.empty(m, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_proximity.closest_point_on_mesh,
+            dim=m,
+            inputs=[mesh.id, centers, wp.float32(max_t), n_pts_wp, n_dists_wp, n_face_wp],
+            device=device,
+        )
+
+        new_radii = wp.clone(radii)
+        new_centers = wp.clone(centers)
+        new_nc = wp.clone(not_converged)
+        wp.launch(
+            kernel_proximity.step_sphere_shrink,
+            dim=m,
+            inputs=[
+                points,
+                ray_dirs,
+                n_pts_wp,
+                n_dists_wp,
+                centers,
+                radii,
+                convergence_threshold,
+                not_converged,
+                new_radii,
+                new_centers,
+                new_nc,
+            ],
+            device=device,
+        )
+        radii = new_radii
+        centers = new_centers
+        not_converged = new_nc
+        n_iter += 1
+
+    return centers, radii
+
+
+def thickness(
+    mesh: wp.Mesh,
+    points: wp.array[wp.vec3],
+    *,
+    exterior: bool = False,
+    normals: wp.array[wp.vec3] | None = None,
+    method: Literal["max_sphere", "ray"] = "max_sphere",
+) -> wp.array[wp.float32]:
+    """
+    Thickness of the mesh at each point.
+
+    Parameters
+    ----------
+    mesh
+        Warp mesh (BVH built by caller).
+    points
+        ``(m,)`` surface points as ``wp.vec3``.
+    exterior
+        If ``True``, compute exterior thickness (reach). If ``False``, interior.
+    normals
+        ``(m,)`` unit surface normals. If ``None``, computed automatically.
+    method
+        ``"max_sphere"`` (default) or ``"ray"``.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        ``(m,)`` thickness values. ``inf`` for unbounded.
+    """
+    if method == "max_sphere":
+        _centers, radii = max_tangent_sphere(mesh, points, inwards=not exterior, normals=normals)
+        return radii * wp.float32(2.0)
+
+    elif method == "ray":
+        if normals is None:
+            normals = normals_at_closest_faces(mesh, points)
+
+        ray_dirs = normals if exterior else -normals
+        max_t = default_mesh_query_max_dist(mesh.points, points)
+        return tw.ray.longest_ray(mesh, points, ray_dirs, max_t=max_t)
+
+    else:
+        raise ValueError('Invalid method, use "max_sphere" or "ray"')
