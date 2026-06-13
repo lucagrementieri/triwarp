@@ -175,6 +175,110 @@ def any(array: wp.array[wp.bool], *, axis: Literal[0, 1] | None = None) -> wp.ar
     return _reduce_bool(array, axis, _BOOL_REDUCE["any"])
 
 
+@overload
+def sum(array: twt.Array1dInt32 | twt.Array2dInt32, *, axis: None = ...) -> int: ...
+@overload
+def sum(array: twt.Array1dFloat32 | twt.Array2dFloat32, *, axis: None = ...) -> float: ...
+@overload
+def sum(array: twt.Array2dScalar, *, axis: Literal[0, 1]) -> twt.Array1dScalar: ...
+@overload
+def sum(array: wp.array[wp.bool], *, axis: None = ...) -> int: ...
+@overload
+def sum(array: wp.array[wp.bool], *, axis: Literal[0, 1]) -> twt.Array1dInt32: ...
+def sum(
+    array: twt.ScalarArray | wp.array[wp.bool],
+    *,
+    axis: Literal[0, 1] | None = None,
+) -> float | int | twt.Array1dScalar | twt.Array1dInt32:
+    """
+    Sum of ``array``.
+
+    With ``axis=None`` (default), reduces every element to one Python scalar using
+    tiled kernels (``wp.tile_load`` + ``wp.tile_sum`` + ``wp.atomic_add``).
+
+    With ``axis=0`` or ``axis=1`` on a rank-2 input, reduces along that axis to a
+    1D ``wp.array`` of the same dtype using one thread per output element.
+
+    For ``wp.bool`` input, counts ``True`` values and returns ``int`` (global) or
+    ``wp.int32`` (per-axis).
+
+    Parameters
+    ----------
+    array
+        Rank-1 ``(n,)`` or rank-2 ``(n, m)`` scalar or ``wp.bool`` Warp array.
+        Must be non-empty.
+    axis
+        ``None`` for a global scalar result. ``0`` or ``1`` for a per-axis 1D
+        result (rank-2 input only).
+
+    Returns
+    -------
+    float | int | wp.array
+        Global scalar when ``axis=None``; 1D array of length ``n`` (``axis=1``) or
+        ``m`` (``axis=0``) otherwise.
+
+    Raises
+    ------
+    ValueError
+        If ``array`` is empty, its rank is not 1 or 2, or ``axis`` is not
+        ``None`` for a rank-1 input.
+    """
+    if array.dtype == wp.bool:
+        mask = cast(wp.array[wp.bool], array)
+        mask_i32 = _bool_mask_as_int32(mask)
+        if mask.ndim == 2 and axis is None:
+            mask_i32 = mask_i32.flatten()
+        result = _reduce_scalar(cast(twt.ScalarArray, mask_i32), axis, _SCALAR_REDUCE["sum"])
+        if axis is None:
+            return int(cast(int, result))
+        return cast(twt.Array1dInt32, result)
+    return cast(
+        float | int | twt.Array1dScalar,
+        _reduce_scalar(cast(twt.ScalarArray, array), axis, _SCALAR_REDUCE["sum"]),
+    )
+
+
+def weighted_sum(
+    values: twt.Array1dFloat32,
+    weights: twt.Array1dFloat32,
+) -> float:
+    """
+    Weighted sum ``sum_i values[i] * weights[i]``.
+
+    Parameters
+    ----------
+    values, weights
+        Rank-1 ``(n,)`` ``wp.float32`` arrays of equal length. Must be non-empty.
+
+    Returns
+    -------
+    float
+        Scalar weighted sum on the host.
+
+    Raises
+    ------
+    ValueError
+        If either array is empty or their lengths differ.
+    """
+    n_values = int(values.shape[0])
+    n_weights = int(weights.shape[0])
+    if n_values == 0 or n_weights == 0:
+        raise ValueError("weighted_sum requires non-empty arrays.")
+    if n_values != n_weights:
+        raise ValueError("weighted_sum requires values and weights of equal length.")
+
+    out = wp.zeros(1, dtype=wp.float32, device=values.device)
+    n_tiles = (n_values + TILE_1D - 1) // TILE_1D
+    wp.launch_tiled(
+        kernel_reduce.weighted_sum1d_tiled,
+        dim=[n_tiles],
+        inputs=[values, weights, out],
+        block_dim=TILE_1D,
+        device=values.device,
+    )
+    return float(out.numpy().item())
+
+
 def all(array: wp.array[wp.bool], *, axis: Literal[0, 1] | None = None) -> wp.array[wp.bool] | bool:
     """
     Reduce a boolean array with logical AND.
@@ -233,10 +337,18 @@ def min_for_dtype(dtype: type[wp.Scalar]) -> int | float:
     return -(1 << (bits - 1))
 
 
+def zero_for_dtype(dtype: type[wp.Scalar]) -> int | float:
+    if wp.types.type_is_int(dtype):
+        return 0
+    return 0.0
+
+
 class _ScalarReduceSpec(NamedTuple):
     name: str
     axis_rows: Callable[..., None]
     axis_cols: Callable[..., None]
+    axis_rows_tiled: Callable[..., None]
+    axis_cols_tiled: Callable[..., None]
     tiled_1d: Callable[..., None]
     tiled_2d: Callable[..., None]
     init_global: Callable[[type], int | float]
@@ -248,6 +360,8 @@ class _BoolReduceSpec(NamedTuple):
     name: str
     axis_rows: Callable[..., None]
     axis_cols: Callable[..., None]
+    axis_rows_tiled: Callable[..., None]
+    axis_cols_tiled: Callable[..., None]
     tiled_1d: Callable[..., None]
     init_global: int
 
@@ -257,6 +371,8 @@ _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
         name="min",
         axis_rows=kernel_reduce.min_2d_rows,
         axis_cols=kernel_reduce.min_2d_cols,
+        axis_rows_tiled=kernel_reduce.min_2d_rows_tiled,
+        axis_cols_tiled=kernel_reduce.min_2d_cols_tiled,
         tiled_1d=kernel_reduce.min1d_tiled,
         tiled_2d=kernel_reduce.min2d_tiled,
         init_global=max_for_dtype,
@@ -267,6 +383,8 @@ _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
         name="max",
         axis_rows=kernel_reduce.max_2d_rows,
         axis_cols=kernel_reduce.max_2d_cols,
+        axis_rows_tiled=kernel_reduce.max_2d_rows_tiled,
+        axis_cols_tiled=kernel_reduce.max_2d_cols_tiled,
         tiled_1d=kernel_reduce.max1d_tiled,
         tiled_2d=kernel_reduce.max2d_tiled,
         init_global=min_for_dtype,
@@ -277,11 +395,25 @@ _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
         name="minmax",
         axis_rows=kernel_reduce.minmax_2d_rows,
         axis_cols=kernel_reduce.minmax_2d_cols,
+        axis_rows_tiled=kernel_reduce.minmax_2d_rows_tiled,
+        axis_cols_tiled=kernel_reduce.minmax_2d_cols_tiled,
         tiled_1d=kernel_reduce.minmax1d_tiled,
         tiled_2d=kernel_reduce.minmax2d_tiled,
         init_global=max_for_dtype,
         global_output_slots=2,
         dual_axis=True,
+    ),
+    "sum": _ScalarReduceSpec(
+        name="sum",
+        axis_rows=kernel_reduce.sum_2d_rows,
+        axis_cols=kernel_reduce.sum_2d_cols,
+        axis_rows_tiled=kernel_reduce.sum_2d_rows_tiled,
+        axis_cols_tiled=kernel_reduce.sum_2d_cols_tiled,
+        tiled_1d=kernel_reduce.sum1d_tiled,
+        tiled_2d=kernel_reduce.sum2d_tiled,
+        init_global=zero_for_dtype,
+        global_output_slots=1,
+        dual_axis=False,
     ),
 }
 
@@ -290,6 +422,8 @@ _BOOL_REDUCE: dict[str, _BoolReduceSpec] = {
         name="any",
         axis_rows=kernel_reduce.any_2d_rows,
         axis_cols=kernel_reduce.any_2d_cols,
+        axis_rows_tiled=kernel_reduce.any_2d_rows_tiled,
+        axis_cols_tiled=kernel_reduce.any_2d_cols_tiled,
         tiled_1d=kernel_reduce.any_1d_tiled,
         init_global=0,
     ),
@@ -297,6 +431,8 @@ _BOOL_REDUCE: dict[str, _BoolReduceSpec] = {
         name="all",
         axis_rows=kernel_reduce.all_2d_rows,
         axis_cols=kernel_reduce.all_2d_cols,
+        axis_rows_tiled=kernel_reduce.all_2d_rows_tiled,
+        axis_cols_tiled=kernel_reduce.all_2d_cols_tiled,
         tiled_1d=kernel_reduce.all_1d_tiled,
         init_global=1,
     ),
@@ -318,27 +454,49 @@ def _launch_axis_scalar(
     array: twt.Array2dScalar, axis: Literal[0, 1], spec: _ScalarReduceSpec
 ) -> twt.Array1dScalar | tuple[twt.Array1dScalar, twt.Array1dScalar]:
     n_rows, n_cols = int(array.shape[0]), int(array.shape[1])
+    n_col_tiles = (n_cols + TILE_1D - 1) // TILE_1D
+    n_row_tiles = (n_rows + TILE_1D - 1) // TILE_1D
     if spec.dual_axis:
         if axis == 1:
-            out_min = wp.empty(n_rows, dtype=array.dtype, device=array.device)
-            out_max = wp.empty(n_rows, dtype=array.dtype, device=array.device)
-            wp.launch(
-                spec.axis_rows, dim=n_rows, inputs=[array, out_min, out_max], device=array.device
+            out_min = wp.full(n_rows, max_for_dtype(array.dtype), dtype=array.dtype, device=array.device)
+            out_max = wp.full(n_rows, min_for_dtype(array.dtype), dtype=array.dtype, device=array.device)
+            wp.launch_tiled(
+                spec.axis_rows_tiled,
+                dim=[n_rows, n_col_tiles],
+                inputs=[array, out_min, out_max],
+                block_dim=TILE_1D,
+                device=array.device,
             )
         else:
-            out_min = wp.empty(n_cols, dtype=array.dtype, device=array.device)
-            out_max = wp.empty(n_cols, dtype=array.dtype, device=array.device)
-            wp.launch(
-                spec.axis_cols, dim=n_cols, inputs=[array, out_min, out_max], device=array.device
+            out_min = wp.full(n_cols, max_for_dtype(array.dtype), dtype=array.dtype, device=array.device)
+            out_max = wp.full(n_cols, min_for_dtype(array.dtype), dtype=array.dtype, device=array.device)
+            wp.launch_tiled(
+                spec.axis_cols_tiled,
+                dim=[n_cols, n_row_tiles],
+                inputs=[array, out_min, out_max],
+                block_dim=TILE_1D,
+                device=array.device,
             )
         return cast(twt.Array1dScalar, out_min), cast(twt.Array1dScalar, out_max)
 
     if axis == 1:
-        out = wp.empty(n_rows, dtype=array.dtype, device=array.device)
-        wp.launch(spec.axis_rows, dim=n_rows, inputs=[array, out], device=array.device)
+        out = wp.full(n_rows, spec.init_global(array.dtype), dtype=array.dtype, device=array.device)
+        wp.launch_tiled(
+            spec.axis_rows_tiled,
+            dim=[n_rows, n_col_tiles],
+            inputs=[array, out],
+            block_dim=TILE_1D,
+            device=array.device,
+        )
     else:
-        out = wp.empty(n_cols, dtype=array.dtype, device=array.device)
-        wp.launch(spec.axis_cols, dim=n_cols, inputs=[array, out], device=array.device)
+        out = wp.full(n_cols, spec.init_global(array.dtype), dtype=array.dtype, device=array.device)
+        wp.launch_tiled(
+            spec.axis_cols_tiled,
+            dim=[n_cols, n_row_tiles],
+            inputs=[array, out],
+            block_dim=TILE_1D,
+            device=array.device,
+        )
     return cast(twt.Array1dScalar, out)
 
 
@@ -435,12 +593,28 @@ def _reduce_bool(
         n_rows, n_cols = int(array.shape[0]), int(array.shape[1])
         if axis is None:
             return _launch_global_bool_tiled(mask_i32.flatten(), spec)
+        n_col_tiles = (n_cols + TILE_1D - 1) // TILE_1D
+        n_row_tiles = (n_rows + TILE_1D - 1) // TILE_1D
         if axis == 1:
-            out = wp.empty(n_rows, dtype=wp.bool, device=array.device)
-            wp.launch(spec.axis_rows, dim=n_rows, inputs=[mask_i32, out], device=array.device)
+            out_i32 = wp.full(n_rows, spec.init_global, dtype=wp.int32, device=array.device)
+            wp.launch_tiled(
+                spec.axis_rows_tiled,
+                dim=[n_rows, n_col_tiles],
+                inputs=[mask_i32, out_i32],
+                block_dim=TILE_1D,
+                device=array.device,
+            )
         else:
-            out = wp.empty(n_cols, dtype=wp.bool, device=array.device)
-            wp.launch(spec.axis_cols, dim=n_cols, inputs=[mask_i32, out], device=array.device)
+            out_i32 = wp.full(n_cols, spec.init_global, dtype=wp.int32, device=array.device)
+            wp.launch_tiled(
+                spec.axis_cols_tiled,
+                dim=[n_cols, n_row_tiles],
+                inputs=[mask_i32, out_i32],
+                block_dim=TILE_1D,
+                device=array.device,
+            )
+        out = wp.empty(out_i32.shape[0], dtype=wp.bool, device=array.device)
+        wp.utils.array_cast(out_i32, out)
         return out
 
     raise ValueError(f"{spec.name} requires a 1D or 2D array.")

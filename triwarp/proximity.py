@@ -1483,11 +1483,7 @@ def max_tangent_sphere(
 
     n_iter = 0
     while n_iter < max_iter:
-        count_wp = wp.zeros(1, dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_proximity.count_true, dim=m, inputs=[not_converged, count_wp], device=device
-        )
-        if int(count_wp.numpy()[0]) == 0:
+        if tw.reduce.sum(not_converged) == 0:
             break
 
         n_pts_wp = wp.empty(m, dtype=wp.vec3, device=device)

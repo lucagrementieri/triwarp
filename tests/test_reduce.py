@@ -204,9 +204,15 @@ def test_all_2d_global(device: str) -> None:
 
 def test_scalar_reduce_1d_axis_raises(device: str) -> None:
     values_wp = wp.array([1, 2, 3], dtype=wp.int32, device=device)
-    for fn in (tw_reduce.min, tw_reduce.max, tw_reduce.minmax):
+    for fn in (tw_reduce.min, tw_reduce.max, tw_reduce.minmax, tw_reduce.sum):
         with pytest.raises(ValueError, match="requires axis=None for a 1D array"):
             fn(values_wp, axis=0)
+
+
+def test_sum_bool_1d_axis_raises(device: str) -> None:
+    mask_wp = wp.array([True, False, True], dtype=wp.bool, device=device)
+    with pytest.raises(ValueError, match="requires axis=None for a 1D array"):
+        tw_reduce.sum(mask_wp, axis=0)
 
 
 @pytest.mark.parametrize("shape", [(65,), (9, 9), (65, 10)])
@@ -265,6 +271,7 @@ def test_scalar_reduce_partial_tiles_axis(device: str, shape: tuple[int, int], a
     got_min, got_max = tw_reduce.minmax(values_wp, axis=axis)
     assert np.array_equal(got_min.numpy(), values_np.min(axis=axis))
     assert np.array_equal(got_max.numpy(), values_np.max(axis=axis))
+    assert np.array_equal(tw_reduce.sum(values_wp, axis=axis).numpy(), values_np.sum(axis=axis))
 
 
 @pytest.mark.parametrize(
@@ -276,3 +283,114 @@ def test_bool_reduce_partial_tiles_axis(device: str, shape: tuple[int, int], axi
     mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
     assert np.array_equal(tw_reduce.any(mask_wp, axis=axis).numpy(), np.any(mask_np, axis=axis))
     assert np.array_equal(tw_reduce.all(mask_wp, axis=axis).numpy(), np.all(mask_np, axis=axis))
+
+
+def test_sum_1d(device: str) -> None:
+    rng = np.random.default_rng(42)
+    n = 100
+    values_np = rng.integers(-1000, 1000, (n,), dtype=np.int32)
+    sum_np = values_np.sum()
+
+    values_wp = wp.array(values_np, dtype=wp.int32, device=device)
+    sum_wp = tw_reduce.sum(values_wp)
+    assert np.allclose(sum_wp, sum_np)
+
+
+def test_sum_2d(device: str) -> None:
+    rng = np.random.default_rng(42)
+    n = 200
+    m = 100
+    values_np = rng.standard_normal((n, m), dtype=np.float32)
+    sum_np = values_np.sum()
+    values_wp = wp.array(values_np, dtype=wp.float32, device=device)
+    sum_wp = tw_reduce.sum(values_wp)
+    assert np.allclose(sum_wp, sum_np, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_sum_2d_axis(device: str, axis: int) -> None:
+    rng = np.random.default_rng(42)
+    values_np = rng.integers(-1000, 1000, (32, 10), dtype=np.int32)
+    values_wp = wp.array(values_np, dtype=wp.int32, device=device)
+    got_wp = tw_reduce.sum(values_wp, axis=axis)
+    exp_np = values_np.sum(axis=axis)
+    assert np.array_equal(got_wp.numpy(), exp_np)
+
+
+def test_sum_bool_1d(device: str) -> None:
+    rng = np.random.default_rng(42)
+    mask_np = rng.choice([False, True], size=(100,), replace=True)
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+    sum_wp = tw_reduce.sum(mask_wp)
+    sum_np = int(mask_np.sum())
+    assert sum_wp == sum_np
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_sum_bool_2d_axis(device: str, axis: int) -> None:
+    rng = np.random.default_rng(42)
+    mask_np = rng.choice([False, True], size=(32, 4), replace=True)
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+    got_wp = tw_reduce.sum(mask_wp, axis=axis)
+    exp_np = mask_np.sum(axis=axis).astype(np.int32)
+    assert np.array_equal(got_wp.numpy(), exp_np)
+
+
+def test_sum_bool_2d_global(device: str) -> None:
+    rng = np.random.default_rng(42)
+    for mask_np in [
+        rng.choice([False, True], size=(32, 4), replace=True),
+        np.zeros((32, 4), dtype=bool),
+        np.ones((32, 4), dtype=bool),
+    ]:
+        mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+        got = tw_reduce.sum(mask_wp, axis=None)
+        exp = int(mask_np.sum())
+        assert got == exp, f"sum global mismatch: got {got}, exp {exp}"
+
+
+def test_weighted_sum_1d(device: str) -> None:
+    rng = np.random.default_rng(42)
+    n = 100
+    values_np = rng.standard_normal(n, dtype=np.float32)
+    weights_np = rng.random(n, dtype=np.float32)
+    exp_np = float(np.sum(values_np * weights_np))
+
+    values_wp = wp.array(values_np, dtype=wp.float32, device=device)
+    weights_wp = wp.array(weights_np, dtype=wp.float32, device=device)
+    got_wp = tw_reduce.weighted_sum(values_wp, weights_wp)
+    assert np.allclose(got_wp, exp_np, rtol=1e-5, atol=1e-5)
+
+
+def test_weighted_sum_length_mismatch_raises(device: str) -> None:
+    values_wp = wp.array([1.0, 2.0], dtype=wp.float32, device=device)
+    weights_wp = wp.array([1.0], dtype=wp.float32, device=device)
+    with pytest.raises(ValueError, match="equal length"):
+        tw_reduce.weighted_sum(values_wp, weights_wp)
+
+
+@pytest.mark.parametrize("shape", [(65,), (9, 9), (65, 10)])
+def test_sum_partial_tiles(device: str, shape: tuple[int, ...]) -> None:
+    rng = np.random.default_rng(99)
+    values_np = rng.integers(-1000, 1000, shape, dtype=np.int32)
+    values_wp = wp.array(values_np, dtype=wp.int32, device=device)
+    got = tw_reduce.sum(values_wp)
+    assert np.allclose(got, values_np.sum())
+
+
+@pytest.mark.parametrize("shape", [(65,), (9, 9), (65, 10)])
+def test_sum_bool_partial_tiles(device: str, shape: tuple[int, ...]) -> None:
+    rng = np.random.default_rng(99)
+    mask_np = rng.choice([False, True], size=shape, replace=True)
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+    assert tw_reduce.sum(mask_wp) == int(mask_np.sum())
+
+
+@pytest.mark.parametrize(
+    ("shape", "axis"), [((9, 9), 0), ((9, 9), 1), ((65, 10), 0), ((65, 10), 1)]
+)
+def test_sum_partial_tiles_axis(device: str, shape: tuple[int, int], axis: int) -> None:
+    rng = np.random.default_rng(99)
+    values_np = rng.integers(-1000, 1000, shape, dtype=np.int32)
+    values_wp = wp.array(values_np, dtype=wp.int32, device=device)
+    assert np.array_equal(tw_reduce.sum(values_wp, axis=axis).numpy(), values_np.sum(axis=axis))

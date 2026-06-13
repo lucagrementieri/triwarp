@@ -450,10 +450,3 @@ def step_sphere_shrink(
 
     if old_radii[tid] - new_r < convergence_threshold:
         out_not_converged[tid] = False
-
-
-@wp.kernel
-def count_true(flags: wp.array[wp.bool], out_count: wp.array[wp.int32]) -> None:
-    tid = wp.tid()
-    if flags[tid]:
-        wp.atomic_add(out_count, 0, 1)
