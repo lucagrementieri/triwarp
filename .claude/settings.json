@@ -1,18 +1,19 @@
 {
-  "permissions": {
-    "allow": [
-      "Bash(python *)",
-      "Bash(python3 *)",
-      "Bash(pytest *)",
-      "Bash(uv *)",
-      "Bash(grep *)",
-      "Bash(cat *)",
-      "Bash(ls *)",
-      "Bash(rm -rf ~/.cache/warp/*)",
-      "WebFetch(domain:nvidia.github.io)"
-    ],
-    "additionalDirectories": [
-      "~/.cache/warp/"
-    ]
-  }
+    "permissions": {
+        "allow": [
+            "Bash(python *)",
+            "Bash(python3 *)",
+            "Bash(pytest *)",
+            "Bash(uv *)",
+            "Bash(pip list *)",
+            "Bash(grep *)",
+            "Bash(cat *)",
+            "Bash(ls *)",
+            "Bash(rm -rf ~/.cache/warp/*)",
+            "WebFetch(domain:nvidia.github.io)"
+        ],
+        "additionalDirectories": [
+            "~/.cache/warp/"
+        ]
+    }
 }
