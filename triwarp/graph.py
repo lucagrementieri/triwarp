@@ -8,50 +8,11 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.array import init_range, init_repeat_index
+from triwarp.array import init_range
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import graph as kernel_graph
 from triwarp.kernels import selection as kernel_selection
 from triwarp.kernels.algorithms import connected_components as kernel_connected_components
-
-
-def faces_to_edges(faces: wp.array[wp.int32], sorted: bool = False) -> twt.Array2dInt32:  # noqa: A002
-    """
-    Directed triangle edges from a flat ``(i0, i1, i2)`` index buffer.
-
-    For each face, emits the three directed edges ``(i0, i1)``, ``(i1, i2)``, and ``(i2, i0)``
-    in row-major order, matching :func:`trimesh.geometry.faces_to_edges` on the same ``faces``
-    layout. Runs on ``faces.device`` with one launched thread per face (``int32`` indices).
-
-    Parameters
-    ----------
-    faces
-        Length-``3 * n_faces`` ``wp.int32`` buffer: consecutive triples
-        ``(i0, i1, i2), (i0, i1, i2), ...`` of vertex indices, the same convention as
-        :mod:`triwarp.triangles`.
-    sorted
-        If ``True``, sort each edge row by the minimum vertex index first.
-
-    Returns
-    -------
-    twt.Array2dInt32
-        Shape ``(n_faces * 3, 2)`` with rows ``edges[3*f + 0] = (i0, i1)``,
-        ``edges[3*f + 1] = (i1, i2)``, ``edges[3*f + 2] = (i2, i0)`` for face ``f``.
-        If ``n_faces == 0``, returns an empty ``(0, 2)`` array.
-
-    See Also
-    --------
-    :func:`trimesh.geometry.faces_to_edges`
-    """
-    n_faces = int(faces.shape[0]) // 3
-    edges = twt.empty_int32_2d((n_faces * 3, 2), device=faces.device)
-    wp.launch(
-        kernel_graph.faces_to_edges_sorted if sorted else kernel_graph.faces_to_edges,
-        dim=n_faces,
-        inputs=[faces, edges],
-        device=faces.device,
-    )
-    return twt.as_array2d_int32(edges)
 
 
 @overload
@@ -126,8 +87,8 @@ def face_adjacency(
             return empty_array, twt.empty_int32_2d((0, 2), device=faces.device)
         return empty_array
     if edges_sorted is None:
-        edges_sorted = faces_to_edges(faces, sorted=True)
-    edges_face = init_repeat_index(n_faces * 3, 3, faces.device)
+        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+    edges_face = tw.edges.edges_face(faces)
     edge_groups = tw.grouping.group_int_rows(edges_sorted, length=2, max_value=n_faces)
     adjacency = twt.empty_int32_2d((edge_groups.shape[0], 2), device=faces.device)
     wp.launch(

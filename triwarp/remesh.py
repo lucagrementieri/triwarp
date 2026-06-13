@@ -42,29 +42,15 @@ def subdivide(
     if n_faces == 0:
         return vertices, faces
 
-    # Sorted directed edges, shape (n_faces*3, 2)
-    edges_sorted = tw.graph.faces_to_edges(faces, sorted=True)
-
-    # Hash each edge row and find unique edges + inverse mapping
-    hashes = tw.grouping.hash_indices_rows(edges_sorted, n_vertices)
-    unique_hashes, inverse = tw.unique.unique_1d(hashes, return_inverse=True)
-    n_unique = int(unique_hashes.shape[0])
-
-    # For each unique edge, find one representative row in edges_sorted
-    first_occurrence = wp.empty(n_unique, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_remesh.scatter_first_occurrence,
-        dim=n_faces * 3,
-        inputs=[inverse, first_occurrence],
-        device=device,
-    )
+    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    n_unique = int(unique_edges.shape[0])
 
     # Compute midpoint vertex for each unique edge
     out_midpoints = wp.empty(n_unique, dtype=wp.vec3, device=device)
     wp.launch(
         kernel_remesh.compute_midpoints,
         dim=n_unique,
-        inputs=[vertices, edges_sorted, first_occurrence, out_midpoints],
+        inputs=[vertices, unique_edges, out_midpoints],
         device=device,
     )
 

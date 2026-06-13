@@ -165,7 +165,6 @@ def angle_weighted_vertex_normals(
     return weighted_vertex_normals(n_vertices, faces, face_normals, face_angles)
 
 
-# TODO: write edges.py file for lengths
 def sine_and_edge_length_weighted_vertex_normals(
     n_vertices: int,
     vertices: wp.array[wp.vec3],

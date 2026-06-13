@@ -10,7 +10,8 @@ import warp as wp
 
 import triwarp.reduce as tw_reduce
 from triwarp.array import append, flatnonzero
-from triwarp.graph import faces_to_edges, is_watertight
+from triwarp.edges import faces_to_edges
+from triwarp.graph import is_watertight
 from triwarp.kernels import sample as kernel_sample
 from triwarp.proximity import query_hashgrid_ball_with_offsets
 from triwarp.triangles import centroid, face_normals_and_areas

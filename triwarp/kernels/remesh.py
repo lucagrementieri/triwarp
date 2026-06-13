@@ -2,25 +2,14 @@ import warp as wp
 
 
 @wp.kernel
-def scatter_first_occurrence(
-    inverse: wp.array[wp.int32], out_first_occurrence: wp.array[wp.int32]
-) -> None:
-    i = int(wp.tid())
-    k = inverse[i]
-    out_first_occurrence[k] = i
-
-
-@wp.kernel
 def compute_midpoints(
     vertices: wp.array[wp.vec3],
-    edges: wp.array2d[wp.int32],
-    first_occurrence: wp.array[wp.int32],
+    unique_edges: wp.array2d[wp.int32],
     out_midpoints: wp.array[wp.vec3],
 ) -> None:
     k = int(wp.tid())
-    i = first_occurrence[k]
-    v0 = vertices[edges[i, 0]]
-    v1 = vertices[edges[i, 1]]
+    v0 = vertices[unique_edges[k, 0]]
+    v1 = vertices[unique_edges[k, 1]]
     out_midpoints[k] = (v0 + v1) * wp.float32(0.5)
 
 
