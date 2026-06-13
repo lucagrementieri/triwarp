@@ -10,6 +10,52 @@ import warp as wp
 import triwarp as tw
 
 
+def test_init_range(device: str) -> None:
+    n = 8
+    out_wp = tw.array.init_range(n, device)
+    assert np.array_equal(out_wp.numpy(), np.arange(n, dtype=np.int32))
+
+
+def test_init_range_zero(device: str) -> None:
+    out_wp = tw.array.init_range(0, device)
+    assert out_wp.shape == (0,)
+
+
+def test_init_range_step(device: str) -> None:
+    count, step = 6, 3
+    out_wp = tw.array.init_range_step(count, step, device)
+    assert np.array_equal(out_wp.numpy(), np.arange(0, count * step, step, dtype=np.int32))
+
+
+def test_init_range_step_zero_count(device: str) -> None:
+    out_wp = tw.array.init_range_step(0, 5, device)
+    assert out_wp.shape == (0,)
+
+
+def test_init_sort_pair_indices(device: str) -> None:
+    n, fill = 5, -1
+    out_wp = tw.array.init_sort_pair_indices(n, fill, device)
+    expected_np = np.array([0, 1, 2, 3, 4, -1, -1, -1, -1, -1], dtype=np.int32)
+    assert np.array_equal(out_wp.numpy(), expected_np)
+
+
+def test_init_sort_pair_indices_zero(device: str) -> None:
+    out_wp = tw.array.init_sort_pair_indices(0, -1, device)
+    assert out_wp.shape == (0,)
+
+
+def test_init_repeat_index(device: str) -> None:
+    count, repeats = 9, 3
+    out_wp = tw.array.init_repeat_index(count, repeats, device)
+    expected_np = np.repeat(np.arange(count // repeats, dtype=np.int32), repeats)
+    assert np.array_equal(out_wp.numpy(), expected_np)
+
+
+def test_init_repeat_index_zero_count(device: str) -> None:
+    out_wp = tw.array.init_repeat_index(0, 4, device)
+    assert out_wp.shape == (0,)
+
+
 def test_pack_1d_wp_arrays(device: str):
     parts = [
         wp.array([1, 2, 3], dtype=wp.int32, device=device),
