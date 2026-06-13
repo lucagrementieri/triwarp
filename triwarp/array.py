@@ -129,6 +129,20 @@ def init_repeat_index(
     return out
 
 
+def append(arr: wp.array[wp.Scalar], value: wp.Scalar) -> wp.array[wp.Scalar]:
+    """
+    Return a new 1-D array with ``value`` appended after ``arr``.
+
+    Allocates ``len(arr) + 1`` elements initialized to ``value``, then copies
+    ``arr`` into the prefix with a single ``wp.copy``.
+    """
+    n = int(arr.shape[0])
+    out = wp.full(n + 1, value, dtype=arr.dtype, device=arr.device)
+    if n > 0:
+        wp.copy(out, arr, dest_offset=0, src_offset=0, count=n)
+    return out
+
+
 def pack_1d_arrays(
     arrays: Sequence[wp.array[wp.Scalar]],
 ) -> tuple[wp.array[wp.Scalar], wp.array[wp.int32]]:

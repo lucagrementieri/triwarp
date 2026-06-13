@@ -69,3 +69,96 @@ def sample_volume_tet(
     s2 = a + b + c - s1 - s3
 
     out_points[tid] = center * (1.0 - s3) + v0 * s1 + v1 * (s2 - s1) + v2 * (s3 - s2)
+
+
+@wp.func
+def _poisson_edge_weight(d: wp.float32, r_max: wp.float32, r_min: wp.float32, alpha: wp.float32) -> wp.float32:
+    d_eff = wp.max(d, r_min)
+    return wp.pow(wp.float32(1.0) - d_eff / r_max, alpha)
+
+
+@wp.kernel
+def compute_poisson_weights(
+    nbr_indices: wp.array[wp.int32],
+    nbr_dists: wp.array[wp.float32],
+    offsets: wp.array[wp.int32],
+    alive: wp.array[wp.int32],
+    r_max: wp.float32,
+    r_min: wp.float32,
+    alpha: wp.float32,
+    out_weights: wp.array[wp.float32],
+) -> None:
+    i = int(wp.tid())
+    if alive[i] == 0:
+        out_weights[i] = wp.float32(0.0)
+        return
+    start = int(offsets[i])
+    end = int(offsets[i + 1])
+    w = wp.float32(0.0)
+    for k in range(start, end):
+        j = int(nbr_indices[k])
+        if j == i or alive[j] == 0:
+            continue
+        w += _poisson_edge_weight(nbr_dists[k], r_max, r_min, alpha)
+    out_weights[i] = w
+
+
+@wp.kernel
+def find_local_maxima(
+    weights: wp.array[wp.float32],
+    alive: wp.array[wp.int32],
+    nbr_indices: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    out_is_max: wp.array[wp.int32],
+) -> None:
+    i = int(wp.tid())
+    if alive[i] == 0:
+        out_is_max[i] = 0
+        return
+    wi = wp.max(weights[i], wp.float32(0.0))
+    start = int(offsets[i])
+    end = int(offsets[i + 1])
+    is_max = int(1)
+    for k in range(start, end):
+        j = int(nbr_indices[k])
+        if j == i or alive[j] == 0:
+            continue
+        if wp.max(weights[j], wp.float32(0.0)) > wi:
+            is_max = int(0)
+            break
+    out_is_max[i] = is_max
+
+
+@wp.kernel
+def apply_deletions(
+    deleted_mask: wp.array[wp.int32],
+    alive: wp.array[wp.int32],
+) -> None:
+    i = int(wp.tid())
+    if deleted_mask[i] == 1:
+        alive[i] = 0
+
+
+@wp.kernel
+def subtract_deleted_contributions(
+    deleted_mask: wp.array[wp.int32],
+    nbr_indices: wp.array[wp.int32],
+    nbr_dists: wp.array[wp.float32],
+    offsets: wp.array[wp.int32],
+    alive: wp.array[wp.int32],
+    r_max: wp.float32,
+    r_min: wp.float32,
+    alpha: wp.float32,
+    weights: wp.array[wp.float32],
+) -> None:
+    i = int(wp.tid())
+    if deleted_mask[i] == 0:
+        return
+    start = int(offsets[i])
+    end = int(offsets[i + 1])
+    for k in range(start, end):
+        j = int(nbr_indices[k])
+        if j == i or alive[j] == 0:
+            continue
+        contribution = _poisson_edge_weight(nbr_dists[k], r_max, r_min, alpha)
+        wp.atomic_add(weights, j, -contribution)

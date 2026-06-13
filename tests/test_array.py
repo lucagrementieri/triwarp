@@ -56,6 +56,18 @@ def test_init_repeat_index_zero_count(device: str) -> None:
     assert out_wp.shape == (0,)
 
 
+def test_append(device: str) -> None:
+    arr_wp = wp.array([0, 3, 7], dtype=wp.int32, device=device)
+    out_wp = tw.array.append(arr_wp, 12)
+    assert np.array_equal(out_wp.numpy(), np.array([0, 3, 7, 12], dtype=np.int32))
+
+
+def test_append_empty(device: str) -> None:
+    arr_wp = wp.empty(0, dtype=wp.int32, device=device)
+    out_wp = tw.array.append(arr_wp, 5)
+    assert np.array_equal(out_wp.numpy(), np.array([5], dtype=np.int32))
+
+
 def test_pack_1d_wp_arrays(device: str):
     parts = [
         wp.array([1, 2, 3], dtype=wp.int32, device=device),

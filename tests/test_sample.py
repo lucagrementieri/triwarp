@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
+from scipy.spatial.distance import pdist
 
 import triwarp as tw
 
@@ -46,35 +49,88 @@ def test_sample_surface_with_face_weights(icosahedron: tuple[tm.Trimesh, wp.Mesh
     assert np.allclose(freq_tm, freq_expected, rtol=0.07, atol=0.01)
 
 
-def test_volume_mesh_containment(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+def test_sample_surface_poisson_disk_count(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    _, mesh_wp = icosahedron
+    count = 100
+    pts, fids = tw.sample.sample_surface_poisson_disk(
+        mesh_wp.points, mesh_wp.indices, count, seed=0
+    )
+    assert pts.shape == (count,)
+    assert fids.shape == (count,)
+
+
+def test_sample_surface_poisson_disk_on_surface(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = icosahedron
+    count = 100
+    pts, _ = tw.sample.sample_surface_poisson_disk(mesh_wp.points, mesh_wp.indices, count, seed=1)
+    _, dists, _ = tm.proximity.closest_point(mesh_tm, pts.numpy())
+    assert np.all(dists < 1e-4)
+
+
+def test_sample_surface_poisson_disk_min_distance(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = icosahedron
+    count = 100
+    init_factor = 5.0
+    surface_area = float(mesh_tm.area)
+    ratio = 1.0 / init_factor
+    r_max = 2.0 * math.sqrt((surface_area / count) / (2.0 * math.sqrt(3.0)))
+    r_min = r_max * 0.65 * (1.0 - ratio**1.5)
+
+    points, _ = tw.sample.sample_surface_poisson_disk(
+        mesh_wp.points, mesh_wp.indices, count, init_factor=init_factor, seed=2
+    )
+    min_dist = float(pdist(points.numpy()).min())
+    assert min_dist >= r_min * 0.9
+
+
+def test_sample_surface_poisson_disk_deterministic(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    _, mesh_wp = icosahedron
+    points_a, face_indices_a = tw.sample.sample_surface_poisson_disk(
+        mesh_wp.points, mesh_wp.indices, 80, seed=7
+    )
+    points_b, face_indices_b = tw.sample.sample_surface_poisson_disk(
+        mesh_wp.points, mesh_wp.indices, 80, seed=7
+    )
+    assert np.array_equal(points_a.numpy(), points_b.numpy())
+    assert np.array_equal(face_indices_a.numpy(), face_indices_b.numpy())
+
+
+def test_sample_surface_poisson_disk_count_zero(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    _, mesh_wp = icosahedron
+    points, face_indices = tw.sample.sample_surface_poisson_disk(mesh_wp.points, mesh_wp.indices, 0)
+    assert points.shape == (0,)
+    assert face_indices.shape == (0,)
+
+
+def test_sample_volume_containment(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = icosahedron
     count = 5_000
-    points_np = tw.sample.volume_mesh(mesh_wp, count, seed=42).numpy()
+    points_np = tw.sample.sample_volume(mesh_wp.points, mesh_wp.indices, count, seed=42).numpy()
     assert points_np.shape == (count, 3)
     assert mesh_tm.contains(points_np).all()
 
 
-def test_volume_mesh_uniform(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+def test_sample_volume_uniform(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     # With 20 000 samples the per-axis std-of-mean is ~0.003, so atol=0.05 is safe.
     mesh_tm, mesh_wp = icosahedron
-    points_np = tw.sample.volume_mesh(mesh_wp, 20_000, seed=0).numpy()
+    points_np = tw.sample.sample_volume(mesh_wp.points, mesh_wp.indices, 20_000, seed=0).numpy()
     assert np.allclose(points_np.mean(axis=0), mesh_tm.center_mass, atol=0.05)
 
 
-def test_volume_mesh_deterministic(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+def test_sample_volume_deterministic(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     _, mesh_wp = icosahedron
-    pts_a = tw.sample.volume_mesh(mesh_wp, 200, seed=7).numpy()
-    pts_b = tw.sample.volume_mesh(mesh_wp, 200, seed=7).numpy()
+    pts_a = tw.sample.sample_volume(mesh_wp.points, mesh_wp.indices, 200, seed=7).numpy()
+    pts_b = tw.sample.sample_volume(mesh_wp.points, mesh_wp.indices, 200, seed=7).numpy()
     assert np.array_equal(pts_a, pts_b)
 
 
-def test_volume_mesh_count_zero(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+def test_sample_volume_count_zero(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     _, mesh_wp = icosahedron
-    pts = tw.sample.volume_mesh(mesh_wp, 0)
+    pts = tw.sample.sample_volume(mesh_wp.points, mesh_wp.indices, 0)
     assert pts.shape == (0,)
 
 
-def test_volume_mesh_not_watertight(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+def test_sample_volume_not_watertight(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     _, mesh_wp = half_torus
     with pytest.raises(ValueError, match="watertight"):
-        tw.sample.volume_mesh(mesh_wp, 100)
+        tw.sample.sample_volume(mesh_wp.points, mesh_wp.indices, 100)

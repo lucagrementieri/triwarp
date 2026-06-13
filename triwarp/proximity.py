@@ -466,15 +466,7 @@ def query_hashgrid_ball_with_offsets(
     )
 
     if return_sorted:
-        segment_bounds = wp.empty(m + 1, dtype=wp.int32, device=device)
-        wp.copy(segment_bounds, offsets, dest_offset=0, src_offset=0, count=m)
-        wp.copy(
-            segment_bounds,
-            wp.array([total_neighbors], dtype=wp.int32, device=device),
-            dest_offset=m,
-            src_offset=0,
-            count=1,
-        )
+        segment_bounds = tw.array.append(offsets, total_neighbors)
         wp.utils.segmented_sort_pairs(
             neighbor_distances_flat, neighbor_indices_flat, total_neighbors, segment_bounds
         )
@@ -758,15 +750,7 @@ def query_bvh_ball_with_offsets(
     )
 
     if return_sorted:
-        segment_bounds = wp.empty(m + 1, dtype=wp.int32, device=device)
-        wp.copy(segment_bounds, offsets, dest_offset=0, src_offset=0, count=m)
-        wp.copy(
-            segment_bounds,
-            wp.array([total_neighbors], dtype=wp.int32, device=device),
-            dest_offset=m,
-            src_offset=0,
-            count=1,
-        )
+        segment_bounds = tw.array.append(offsets, total_neighbors)
         wp.utils.segmented_sort_pairs(
             neighbor_distances_flat, neighbor_indices_flat, total_neighbors, segment_bounds
         )

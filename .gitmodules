@@ -1,3 +1,9 @@
 [submodule "reference/trimesh"]
 	path = reference/trimesh
 	url = git@github.com:mikedh/trimesh.git
+[submodule "reference/libigl"]
+	path = reference/libigl
+	url = git@github.com:libigl/libigl.git
+[submodule "reference/Open3D"]
+	path = reference/Open3D
+	url = git@github.com:isl-org/Open3D.git
