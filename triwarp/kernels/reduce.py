@@ -648,51 +648,6 @@ def weighted_sum_vec3_tile(
     return tile_sum
 
 
-@wp.func
-def weighted_centered_dot_tile(
-    values: wp.array[wp.vec3],
-    weights: wp.array[wp.float32],
-    center: wp.vec3,
-    w_sum: wp.float32,
-    offset: int,
-    remaining: int,
-) -> wp.float32:
-    count = remaining
-    if count > TILE_1D:
-        count = TILE_1D
-    result = wp.float32(0.0)
-    for k in range(count):
-        v = values[offset + k] - center
-        result += (weights[offset + k] / w_sum) * wp.dot(v, v)
-    return result
-
-
-@wp.func
-def masked_outer_product_sum_tile(
-    a: wp.array[wp.vec3],
-    b: wp.array[wp.vec3],
-    weights: wp.array[wp.float32],
-    a_center: wp.vec3,
-    b_center: wp.vec3,
-    offset: int,
-    remaining: int,
-) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
-    count = remaining
-    if count > TILE_1D:
-        count = TILE_1D
-    row0 = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    row1 = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    row2 = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    for k in range(count):
-        if weights[offset + k] > wp.float32(0.0):
-            ac = a[offset + k] - a_center
-            bc = b[offset + k] - b_center
-            row0 = row0 + bc[0] * ac
-            row1 = row1 + bc[1] * ac
-            row2 = row2 + bc[2] * ac
-    return row0, row1, row2
-
-
 @wp.kernel
 def weighted_sum1d_tiled(
     values: wp.array[wp.float32], weights: wp.array[wp.float32], out_sum: wp.array[wp.float32]

@@ -1,12 +1,52 @@
 import warp as wp
 
 from triwarp.constants import TILE_1D
-from triwarp.kernels.reduce import (
-    masked_outer_product_sum_tile,
-    sum1d_tile,
-    weighted_centered_dot_tile,
-    weighted_sum_vec3_tile,
-)
+from triwarp.kernels.reduce import sum1d_tile, weighted_sum_vec3_tile
+
+
+@wp.func
+def weighted_centered_dot_tile(
+    values: wp.array[wp.vec3],
+    weights: wp.array[wp.float32],
+    center: wp.vec3,
+    w_sum: wp.float32,
+    offset: int,
+    remaining: int,
+) -> wp.float32:
+    count = remaining
+    if count > TILE_1D:
+        count = TILE_1D
+    result = wp.float32(0.0)
+    for k in range(count):
+        v = values[offset + k] - center
+        result += (weights[offset + k] / w_sum) * wp.dot(v, v)
+    return result
+
+
+@wp.func
+def masked_outer_product_sum_tile(
+    a: wp.array[wp.vec3],
+    b: wp.array[wp.vec3],
+    weights: wp.array[wp.float32],
+    a_center: wp.vec3,
+    b_center: wp.vec3,
+    offset: int,
+    remaining: int,
+) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
+    count = remaining
+    if count > TILE_1D:
+        count = TILE_1D
+    row0 = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
+    row1 = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
+    row2 = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
+    for k in range(count):
+        if weights[offset + k] > wp.float32(0.0):
+            ac = a[offset + k] - a_center
+            bc = b[offset + k] - b_center
+            row0 = row0 + bc[0] * ac
+            row1 = row1 + bc[1] * ac
+            row2 = row2 + bc[2] * ac
+    return row0, row1, row2
 
 
 @wp.kernel
@@ -155,18 +195,28 @@ def build_procrustes_matrix(
         t = bcenter - sR * acenter
 
     out_matrix[0] = wp.mat44(
-        sR[0, 0], sR[0, 1], sR[0, 2], t[0],
-        sR[1, 0], sR[1, 1], sR[1, 2], t[1],
-        sR[2, 0], sR[2, 1], sR[2, 2], t[2],
-        wp.float32(0.0), wp.float32(0.0), wp.float32(0.0), wp.float32(1.0),
+        sR[0, 0],
+        sR[0, 1],
+        sR[0, 2],
+        t[0],
+        sR[1, 0],
+        sR[1, 1],
+        sR[1, 2],
+        t[1],
+        sR[2, 0],
+        sR[2, 1],
+        sR[2, 2],
+        t[2],
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(1.0),
     )
 
 
 @wp.kernel
 def apply_transform_mat44(
-    points: wp.array[wp.vec3],
-    matrix: wp.array[wp.mat44],
-    out_points: wp.array[wp.vec3],
+    points: wp.array[wp.vec3], matrix: wp.array[wp.mat44], out_points: wp.array[wp.vec3]
 ) -> None:
     i = int(wp.tid())
     M = matrix[0]
