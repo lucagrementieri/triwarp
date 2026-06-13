@@ -231,12 +231,6 @@ def query_mesh_aabb_bounds_with_offsets(
         Query ``k`` owns ``candidate_indices_flat[offsets[k] : offsets[k] + hit_counts[k]]``.
     """
     device = query_lower.device
-    if query_upper.device != device:
-        raise ValueError("query_lower and query_upper must live on the same device")
-    if mesh.device != device:
-        raise ValueError(
-            f"mesh and query bounds must live on the same device, got {mesh.device} vs {device}"
-        )
     m = int(query_lower.shape[0])
     if int(query_upper.shape[0]) != m:
         raise ValueError("query_lower and query_upper must have the same length")
@@ -1216,19 +1210,6 @@ def default_mesh_query_max_dist(
     return _aabb_diagonal(combined_min, combined_max)
 
 
-def _validate_mesh_point_inputs(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], points: wp.array[wp.vec3]
-) -> None:
-    device = vertices.device
-    if faces.device != device or points.device != device:
-        devices = f"{device}, {faces.device}, {points.device}"
-        raise ValueError(f"vertices, faces, and points must live on the same device, got {devices}")
-
-
-def _build_mesh(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.Mesh:
-    return wp.Mesh(points=vertices, indices=faces)
-
-
 def closest_point_on_mesh(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -1239,16 +1220,15 @@ def closest_point_on_mesh(
     """
     For each query point, find the closest point on any triangle of the mesh.
 
-    Uses ``wp.mesh_query_point_no_sign`` on a ``wp.Mesh`` BVH built from
-    ``vertices`` and ``faces``. Distances are unsigned Euclidean lengths in
-    ``float32``.
+    Uses ``wp.mesh_query_point_no_sign`` via ``wp.Mesh``. Distances are unsigned
+    Euclidean lengths in ``float32``.
 
     Parameters
     ----------
     vertices
-        ``(n_vertices,)`` mesh vertex positions as ``wp.vec3``.
+        ``(n,)`` mesh vertex positions as ``wp.vec3``.
     faces
-        Length-``3 * n_faces`` flat triangle index buffer.
+        ``(f * 3,)`` flat triangle index array as ``wp.int32``.
     points
         ``(m,)`` query positions in space as ``wp.vec3``.
     max_dist
@@ -1267,8 +1247,6 @@ def closest_point_on_mesh(
         when no face lies within ``max_dist``.
     """
     device = vertices.device
-    _validate_mesh_point_inputs(vertices, faces, points)
-
     m = int(points.shape[0])
     n_faces = int(faces.shape[0]) // 3
     if m == 0:
@@ -1284,10 +1262,10 @@ def closest_point_on_mesh(
         out_face = wp.full(m, -1, dtype=wp.int32, device=device)
         return out_closest, out_distance, out_face
 
+    mesh = wp.Mesh(points=wp.clone(vertices), indices=wp.clone(faces))
     if max_dist is None:
-        max_dist = default_mesh_query_max_dist(vertices, points)
+        max_dist = default_mesh_query_max_dist(mesh.points, points)
 
-    mesh = _build_mesh(vertices, faces)
     out_closest = wp.empty(m, dtype=wp.vec3, device=device)
     out_distance = wp.empty(m, dtype=wp.float32, device=device)
     out_face = wp.empty(m, dtype=wp.int32, device=device)
@@ -1312,7 +1290,7 @@ def signed_distance_on_mesh(
     """
     Signed distance from each query point to a triangle mesh (Warp SDF convention).
 
-    Uses ``wp.mesh_query_point_sign_parity`` on a ``wp.Mesh`` BVH. Distances follow
+    Uses ``wp.mesh_query_point_sign_parity`` via ``wp.Mesh``. Distances follow
     Warp's signed-distance field convention:
 
     * Points **outside** the mesh have **positive** distance.
@@ -1327,9 +1305,9 @@ def signed_distance_on_mesh(
     Parameters
     ----------
     vertices
-        ``(n_vertices,)`` mesh vertex positions as ``wp.vec3``.
+        ``(n,)`` mesh vertex positions as ``wp.vec3``.
     faces
-        Length-``3 * n_faces`` flat triangle index buffer.
+        ``(f * 3,)`` flat triangle index array as ``wp.int32``.
     points
         ``(m,)`` query positions in space as ``wp.vec3``.
     max_dist
@@ -1346,8 +1324,6 @@ def signed_distance_on_mesh(
         ``(m,)`` signed distances in ``float32``.
     """
     device = vertices.device
-    _validate_mesh_point_inputs(vertices, faces, points)
-
     m = int(points.shape[0])
     n_faces = int(faces.shape[0]) // 3
     if m == 0:
@@ -1355,10 +1331,9 @@ def signed_distance_on_mesh(
     if n_faces == 0:
         return wp.full(m, float("inf"), dtype=wp.float32, device=device)
 
+    mesh = wp.Mesh(points=wp.clone(vertices), indices=wp.clone(faces))
     if max_dist is None:
-        max_dist = default_mesh_query_max_dist(vertices, points)
-
-    mesh = _build_mesh(vertices, faces)
+        max_dist = default_mesh_query_max_dist(mesh.points, points)
     out_distance = wp.empty(m, dtype=wp.float32, device=device)
     wp.launch(
         kernel_proximity.signed_distance_on_mesh,

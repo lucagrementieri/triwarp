@@ -64,11 +64,6 @@ def face_adjacency_projections(
     :attr:`trimesh.Trimesh.face_adjacency_projections`
     """
     device = faces.device
-    if vertices.device != device:
-        raise ValueError(
-            f"vertices and faces must live on the same device, got {vertices.device} and {device}"
-        )
-
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return wp.empty(0, dtype=wp.float32, device=device)
@@ -157,11 +152,6 @@ def face_adjacency_convex(
     :attr:`trimesh.Trimesh.face_adjacency_convex`
     """
     device = faces.device
-    if vertices.device != device:
-        raise ValueError(
-            f"vertices and faces must live on the same device, got {vertices.device} and {device}"
-        )
-
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return wp.empty(0, dtype=wp.bool, device=device)

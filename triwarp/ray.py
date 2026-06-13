@@ -16,11 +16,6 @@ def _validate_ray_inputs(
 ) -> None:
     if ray_origins.shape != ray_directions.shape:
         raise ValueError("Ray origin and direction don't match!")
-    if mesh.device != ray_origins.device or mesh.device != ray_directions.device:
-        devices = f"{mesh.device}, {ray_origins.device}, {ray_directions.device}"
-        raise ValueError(
-            f"mesh, ray_origins, and ray_directions must live on the same device, got {devices}"
-        )
 
 
 def intersects_location(
@@ -290,11 +285,6 @@ def contains_points(
     n = points.shape[0]
     if n == 0:
         return wp.empty(0, dtype=wp.bool, device=points.device)
-    if mesh.device != points.device:
-        raise ValueError(
-            f"mesh and points must live on the same device, got {mesh.device} vs {points.device}"
-        )
-
     mesh_min, mesh_max = aabb_bounds(mesh.points)
     max_dist = mesh_query_max_dist(mesh.points)
     out_contains = wp.empty(n, dtype=wp.bool, device=points.device)

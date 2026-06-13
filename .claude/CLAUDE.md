@@ -191,3 +191,9 @@ Do not use `isinstance(..., wp.array2d)`; use the helpers above.
 ### Tests
 
 Tests may use `import triwarp.typing as twt` for annotations (e.g. `expected: twt.Array2dInt32`). Compare via `.numpy()` and `np.array_equal(got, exp)` as in `tests/test_graph.py`.
+
+---
+
+## 8. Device Checks
+
+**Do not check that input arrays share the same device.** Warp raises a clear error automatically when mismatched devices are used in `wp.launch` or array operations, so manual `if arr.device != device: raise ValueError(...)` guards are redundant. Omit them entirely.

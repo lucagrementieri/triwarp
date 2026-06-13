@@ -169,11 +169,6 @@ def pack_1d_arrays(
             raise ValueError(
                 f"all arrays must have the same dtype, got {dtype} and {arr.dtype} at index {i}"
             )
-        if arr.device != device:
-            raise ValueError(
-                f"all arrays must live on the same device, "
-                f"got {device!r} and {arr.device!r} at index {i}"
-            )
         sizes.append(int(arr.size))
         offsets.append(offsets[-1] + sizes[-1])
 
@@ -290,11 +285,6 @@ def isin(
         If ``elements`` and ``test_elements`` live on different devices.
     """
     device = elements.device
-    if test_elements.device != device:
-        raise ValueError(
-            f"test_elements must live on the same device as elements, "
-            f"got {test_elements.device} and {device}"
-        )
 
     k = int(test_elements.shape[0])
     if k == 0 or int(elements.size) == 0:
@@ -447,9 +437,6 @@ def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3]) -> wp.array[wp.floa
     :func:`trimesh.geometry.vector_angle`
     """
     device = a.device
-    if b.device != device:
-        raise ValueError(f"a and b must live on the same device, got {device} and {b.device}")
-
     n = int(a.shape[0])
     if n != int(b.shape[0]):
         raise ValueError(f"a and b must have the same length, got {n} and {b.shape[0]}")

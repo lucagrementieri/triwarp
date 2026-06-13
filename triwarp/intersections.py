@@ -49,9 +49,6 @@ def segments_with_plane(
         raise ValueError("start_points and end_points must have the same shape")
     n = int(start_points.shape[0])
     device = start_points.device
-    if end_points.device != device:
-        raise ValueError("start_points and end_points must live on the same device")
-
     intersections = wp.empty(n, dtype=wp.vec3, device=device)
     valid = wp.empty(n, dtype=wp.bool, device=device)
     if n == 0:
@@ -111,11 +108,6 @@ def mesh_with_plane(
         face indices into the mesh.
     """
     device = vertices.device
-    if faces.device != device:
-        raise ValueError(
-            f"vertices and faces must live on the same device, got {device} and {faces.device}"
-        )
-
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         empty_segments = wp.empty((0, 2), dtype=wp.vec3, device=device)
@@ -191,12 +183,6 @@ def mesh_with_mesh(
         ``(m, 2)`` ``wp.vec3`` segment endpoints (logical shape ``(m, 2, 3)``).
     """
     device = vertices_a.device
-    for name, arr in (("faces_a", faces_a), ("vertices_b", vertices_b), ("faces_b", faces_b)):
-        if arr.device != device:
-            raise ValueError(
-                f"vertices_a and {name} must live on the same device, got {device} and {arr.device}"
-            )
-
     n_faces_a = int(faces_a.shape[0]) // 3
     n_faces_b = int(faces_b.shape[0]) // 3
     if n_faces_a == 0 or n_faces_b == 0:
@@ -325,11 +311,6 @@ def slice_mesh_with_plane(
         Length-``3 * m`` flat triangle index buffer for the sliced mesh.
     """
     device = vertices.device
-    if faces.device != device:
-        raise ValueError(
-            f"vertices and faces must live on the same device, got {device} and {faces.device}"
-        )
-
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
     if n_vertices == 0:

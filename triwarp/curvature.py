@@ -101,12 +101,6 @@ def discrete_mean_curvature(
     if n_points == 0:
         return wp.empty(0, dtype=wp.float32, device=device)
 
-    if vertices.device != device or faces.device != device:
-        raise ValueError(
-            f"points, vertices, and faces must live on the same device, "
-            f"got {device}, {vertices.device}, {faces.device}"
-        )
-
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return wp.zeros(n_points, dtype=wp.float32, device=device)

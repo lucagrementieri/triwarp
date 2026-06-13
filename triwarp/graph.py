@@ -334,11 +334,6 @@ def face_adjacency_angles(
     :attr:`trimesh.Trimesh.face_adjacency_angles`
     """
     device = faces.device
-    if vertices.device != device:
-        raise ValueError(
-            f"vertices and faces must live on the same device, got {vertices.device} and {device}"
-        )
-
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return wp.empty(0, dtype=wp.float32, device=device)
@@ -400,8 +395,6 @@ def concatenate(
     vertex_counts: list[int] = []
     total_indices = 0
     for i, (vertices, faces) in enumerate(meshes_data):
-        if vertices.device != device or faces.device != device:
-            raise ValueError(f"all arrays must live on the same device, got mismatch at index {i}")
         f = int(faces.shape[0])
         vertex_counts.append(int(vertices.shape[0]))
         total_indices += f
@@ -470,11 +463,6 @@ def split(
     :func:`trimesh.graph.split`
     """
     device = vertices.device
-    if faces.device != device:
-        raise ValueError(
-            f"vertices and faces must live on the same device, got {device} and {faces.device}"
-        )
-
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return []

@@ -70,16 +70,6 @@ def submesh_from_face_indices(
     :func:`trimesh.util.submesh`
     """
     device = vertices.device
-    if faces.device != device:
-        raise ValueError(
-            f"vertices and faces must live on the same device, got {device} and {faces.device}"
-        )
-    if face_indices.device != device:
-        raise ValueError(
-            f"face_indices must live on the same device as vertices, "
-            f"got {face_indices.device} and {device}"
-        )
-
     k = int(face_indices.shape[0])
     if k == 0:
         return wp.empty(0, dtype=wp.vec3, device=device), wp.empty(0, dtype=wp.int32, device=device)
@@ -132,16 +122,6 @@ def submesh_from_face_mask(
     :func:`submesh_from_face_indices`
     """
     device = vertices.device
-    if faces.device != device:
-        raise ValueError(
-            f"vertices and faces must live on the same device, got {device} and {faces.device}"
-        )
-    if face_mask.device != device:
-        raise ValueError(
-            f"face_mask must live on the same device as vertices, "
-            f"got {face_mask.device} and {device}"
-        )
-
     face_indices = tw.array.flatnonzero(face_mask)
     return submesh_from_face_indices(vertices, faces, face_indices, unique_indices=True)
 
@@ -180,16 +160,6 @@ def submesh_from_vertex_indices(
     :func:`submesh_from_face_indices`
     """
     device = vertices.device
-    if faces.device != device:
-        raise ValueError(
-            f"vertices and faces must live on the same device, got {device} and {faces.device}"
-        )
-    if vertex_indices.device != device:
-        raise ValueError(
-            f"vertex_indices must live on the same device as vertices, "
-            f"got {vertex_indices.device} and {device}"
-        )
-
     face_indices = face_indices_from_vertex_indices(faces, vertex_indices, face_mode=face_mode)
     return submesh_from_face_indices(vertices, faces, face_indices, unique_indices=True)
 
@@ -231,15 +201,6 @@ def submesh_from_vertex_mask(
     """
     n_vertices = int(vertices.shape[0])
     device = vertices.device
-    if faces.device != device:
-        raise ValueError(
-            f"vertices and faces must live on the same device, got {device} and {faces.device}"
-        )
-    if vertex_mask.device != device:
-        raise ValueError(
-            f"vertex_mask must live on the same device as vertices, "
-            f"got {vertex_mask.device} and {device}"
-        )
     if int(vertex_mask.shape[0]) != n_vertices:
         raise ValueError(
             f"vertex_mask length must equal n_vertices={n_vertices}, got {vertex_mask.shape[0]}"
@@ -283,12 +244,6 @@ def face_indices_from_vertex_indices(
         raise ValueError(f'face_mode must be "all" or "any", got {face_mode!r}')
 
     device = faces.device
-    if vertex_indices.device != device:
-        raise ValueError(
-            f"vertex_indices must live on the same device as faces, "
-            f"got {vertex_indices.device} and {device}"
-        )
-
     n_faces = int(faces.shape[0]) // 3
     if int(vertex_indices.shape[0]) == 0 or n_faces == 0:
         return wp.empty(0, dtype=wp.int32, device=device)
