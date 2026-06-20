@@ -394,3 +394,67 @@ def test_sum_partial_tiles_axis(device: str, shape: tuple[int, int], axis: int) 
     values_np = rng.integers(-1000, 1000, shape, dtype=np.int32)
     values_wp = wp.array(values_np, dtype=wp.int32, device=device)
     assert np.array_equal(tw_reduce.sum(values_wp, axis=axis).numpy(), values_np.sum(axis=axis))
+
+
+def test_mean_1d_float(device: str) -> None:
+    rng = np.random.default_rng(42)
+    values_np = rng.standard_normal(100, dtype=np.float32)
+    values_wp = wp.array(values_np, dtype=wp.float32, device=device)
+    mean_wp = tw_reduce.mean(values_wp)
+    assert np.allclose(mean_wp, values_np.mean(), rtol=1e-5, atol=1e-5)
+
+
+def test_mean_1d_int(device: str) -> None:
+    rng = np.random.default_rng(42)
+    values_np = rng.integers(-1000, 1000, (100,), dtype=np.int32)
+    values_wp = wp.array(values_np, dtype=wp.int32, device=device)
+    mean_wp = tw_reduce.mean(values_wp)
+    assert np.allclose(mean_wp, values_np.mean(), rtol=1e-5, atol=1e-5)
+
+
+def test_mean_2d(device: str) -> None:
+    rng = np.random.default_rng(42)
+    values_np = rng.standard_normal((200, 100), dtype=np.float32)
+    values_wp = wp.array(values_np, dtype=wp.float32, device=device)
+    mean_wp = tw_reduce.mean(values_wp)
+    assert np.allclose(mean_wp, values_np.mean(), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_mean_2d_axis(device: str, axis: int) -> None:
+    rng = np.random.default_rng(42)
+    values_np = rng.standard_normal((32, 10), dtype=np.float32)
+    values_wp = wp.array(values_np, dtype=wp.float32, device=device)
+    mean_wp = tw_reduce.mean(values_wp, axis=axis)
+    assert np.allclose(mean_wp.numpy(), values_np.mean(axis=axis), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_mean_2d_axis_int(device: str, axis: int) -> None:
+    rng = np.random.default_rng(42)
+    values_np = rng.integers(-1000, 1000, (32, 10), dtype=np.int32)
+    values_wp = wp.array(values_np, dtype=wp.int32, device=device)
+    mean_wp = tw_reduce.mean(values_wp, axis=axis)
+    assert np.allclose(mean_wp.numpy(), values_np.mean(axis=axis), rtol=1e-5, atol=1e-5)
+
+
+def test_mean_bool_global(device: str) -> None:
+    rng = np.random.default_rng(42)
+    mask_np = rng.choice([False, True], size=(32, 4), replace=True)
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+    assert np.allclose(tw_reduce.mean(mask_wp), mask_np.mean(), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_mean_bool_2d_axis(device: str, axis: int) -> None:
+    rng = np.random.default_rng(42)
+    mask_np = rng.choice([False, True], size=(32, 4), replace=True)
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+    mean_wp = tw_reduce.mean(mask_wp, axis=axis)
+    assert np.allclose(mean_wp.numpy(), mask_np.mean(axis=axis), rtol=1e-5, atol=1e-5)
+
+
+def test_mean_1d_axis_raises(device: str) -> None:
+    values_wp = wp.array([1, 2, 3], dtype=wp.int32, device=device)
+    with pytest.raises(ValueError, match="requires axis=None for a 1D array"):
+        tw_reduce.mean(values_wp, axis=0)

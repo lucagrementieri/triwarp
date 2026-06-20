@@ -9,6 +9,7 @@ import warp as wp
 
 import triwarp.typing as twt
 from triwarp.constants import TILE_1D, TILE_2D
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import reduce as kernel_reduce
 
 
@@ -186,9 +187,7 @@ def sum(array: wp.array[wp.bool], *, axis: None = ...) -> int: ...
 @overload
 def sum(array: wp.array[wp.bool], *, axis: Literal[0, 1]) -> twt.Array1dInt32: ...
 def sum(
-    array: twt.ScalarArray | wp.array[wp.bool],
-    *,
-    axis: Literal[0, 1] | None = None,
+    array: twt.ScalarArray | wp.array[wp.bool], *, axis: Literal[0, 1] | None = None
 ) -> float | int | twt.Array1dScalar | twt.Array1dInt32:
     """
     Sum of ``array``.
@@ -238,10 +237,62 @@ def sum(
     )
 
 
-def weighted_sum(
-    values: twt.Array1dFloat32,
-    weights: twt.Array1dFloat32,
-) -> float:
+@overload
+def mean(array: twt.ScalarArray | wp.array[wp.bool], *, axis: None = ...) -> float: ...
+@overload
+def mean(
+    array: twt.Array2dScalar | wp.array[wp.bool], *, axis: Literal[0, 1]
+) -> twt.Array1dFloat32: ...
+def mean(
+    array: twt.ScalarArray | wp.array[wp.bool], *, axis: Literal[0, 1] | None = None
+) -> float | twt.Array1dFloat32:
+    """
+    Arithmetic mean of ``array``.
+
+    Delegates the reduction to the tiled :func:`sum`, then divides by the element
+    count. With ``axis=None`` (default), returns one Python ``float``. With
+    ``axis=0`` or ``axis=1`` on a rank-2 input, returns a 1D ``wp.float32`` array.
+
+    The result is always floating point regardless of input dtype. For ``wp.bool``
+    input, the mean is the fraction of ``True`` values.
+
+    Parameters
+    ----------
+    array
+        Rank-1 ``(n,)`` or rank-2 ``(n, m)`` scalar or ``wp.bool`` Warp array.
+        Must be non-empty.
+    axis
+        ``None`` for a global scalar result. ``0`` or ``1`` for a per-axis 1D
+        result (rank-2 input only).
+
+    Returns
+    -------
+    float | wp.array
+        Global ``float`` when ``axis=None``; 1D ``wp.float32`` array of length
+        ``n`` (``axis=1``) or ``m`` (``axis=0``) otherwise.
+
+    Raises
+    ------
+    ValueError
+        If ``array`` is empty, its rank is not 1 or 2, or ``axis`` is not
+        ``None`` for a rank-1 input.
+    """
+    total = sum(array, axis=axis)
+    if axis is None:
+        return float(total) / float(int(array.size))
+    sums = cast(twt.Array1dScalar, total)
+    out = wp.empty(int(sums.shape[0]), dtype=wp.float32, device=array.device)
+    wp.utils.array_cast(sums, out)
+    wp.launch(
+        kernel_array.divide,
+        dim=int(out.shape[0]),
+        inputs=[out, wp.float32(array.shape[axis])],
+        device=array.device,
+    )
+    return cast(twt.Array1dFloat32, out)
+
+
+def weighted_sum(values: twt.Array1dFloat32, weights: twt.Array1dFloat32) -> float:
     """
     Weighted sum ``sum_i values[i] * weights[i]``.
 
@@ -458,8 +509,12 @@ def _launch_axis_scalar(
     n_row_tiles = (n_rows + TILE_1D - 1) // TILE_1D
     if spec.dual_axis:
         if axis == 1:
-            out_min = wp.full(n_rows, max_for_dtype(array.dtype), dtype=array.dtype, device=array.device)
-            out_max = wp.full(n_rows, min_for_dtype(array.dtype), dtype=array.dtype, device=array.device)
+            out_min = wp.full(
+                n_rows, max_for_dtype(array.dtype), dtype=array.dtype, device=array.device
+            )
+            out_max = wp.full(
+                n_rows, min_for_dtype(array.dtype), dtype=array.dtype, device=array.device
+            )
             wp.launch_tiled(
                 spec.axis_rows_tiled,
                 dim=[n_rows, n_col_tiles],
@@ -468,8 +523,12 @@ def _launch_axis_scalar(
                 device=array.device,
             )
         else:
-            out_min = wp.full(n_cols, max_for_dtype(array.dtype), dtype=array.dtype, device=array.device)
-            out_max = wp.full(n_cols, min_for_dtype(array.dtype), dtype=array.dtype, device=array.device)
+            out_min = wp.full(
+                n_cols, max_for_dtype(array.dtype), dtype=array.dtype, device=array.device
+            )
+            out_max = wp.full(
+                n_cols, min_for_dtype(array.dtype), dtype=array.dtype, device=array.device
+            )
             wp.launch_tiled(
                 spec.axis_cols_tiled,
                 dim=[n_cols, n_row_tiles],

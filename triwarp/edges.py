@@ -277,4 +277,4 @@ def mean_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
     if n_faces == 0:
         return 0.0
     lengths = edges_length(vertices, faces)
-    return tw.reduce.sum(lengths) / float(lengths.shape[0])
+    return tw.reduce.mean(lengths)

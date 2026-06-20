@@ -188,7 +188,7 @@ def query_bvh_aabb_with_offsets(
         device=device,
     )
 
-    total_hits = int(hit_counts.numpy().sum())
+    total_hits = int(tw.reduce.sum(hit_counts))
     if total_hits == 0:
         return (
             wp.empty(0, dtype=wp.int32, device=device),
@@ -254,7 +254,7 @@ def query_mesh_aabb_bounds_with_offsets(
         device=device,
     )
 
-    total_hits = int(hit_counts.numpy().sum())
+    total_hits = int(tw.reduce.sum(hit_counts))
     if total_hits == 0:
         return (
             wp.empty(0, dtype=wp.int32, device=device),
@@ -435,7 +435,7 @@ def query_hashgrid_ball_with_offsets(
         grid = hashgrid_from_points(points, r, grid_bins)
 
     neighbor_counts = query_hashgrid_ball_count(points, queries, r, grid=grid)
-    total_neighbors = int(neighbor_counts.numpy().sum())
+    total_neighbors = int(tw.reduce.sum(neighbor_counts))
 
     if total_neighbors == 0:
         return (
@@ -719,7 +719,7 @@ def query_bvh_ball_with_offsets(
         bvh = bvh_from_points(points, leaf_size)
 
     neighbor_counts = query_bvh_ball_count(points, queries, r, bvh=bvh)
-    total_neighbors = int(neighbor_counts.numpy().sum())
+    total_neighbors = int(tw.reduce.sum(neighbor_counts))
 
     if total_neighbors == 0:
         return (

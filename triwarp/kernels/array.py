@@ -30,6 +30,12 @@ def sub(array: wp.array[wp.Scalar], n: wp.Scalar) -> None:
 
 
 @wp.kernel
+def divide(array: wp.array[wp.Scalar], n: wp.Scalar) -> None:
+    i = int(wp.tid())
+    array[i] = array[i] / n
+
+
+@wp.kernel
 def init_range(out: wp.array[wp.Int]) -> None:
     i = int(wp.tid())
     out[i] = i
