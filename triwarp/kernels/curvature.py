@@ -2,7 +2,8 @@ import warp as wp
 
 from triwarp.kernels import array as kernel_array
 
-# Custom fixed-size float64 types for the 5x5 quadric-fit normal equations.
+# Custom fixed-size float64 types for the 5x5 quadric-fit normal equations: the rest of the
+# kernel runs in float32, but the least-squares solve is done in float64 for conditioning.
 vec5d = wp.types.vector(length=5, dtype=wp.float64)
 mat55d = wp.types.matrix(shape=(5, 5), dtype=wp.float64)
 
@@ -239,19 +240,20 @@ def fit_principal_curvature(
         out_valid[i] = False
         return
 
-    a = solution[0]
-    b = solution[1]
-    c = solution[2]
-    d = solution[3]
-    e = solution[4]
+    # Cast the float64 solution back to float32 for the rest of the kernel.
+    a = wp.float32(solution[0])
+    b = wp.float32(solution[1])
+    c = wp.float32(solution[2])
+    d = wp.float32(solution[3])
+    e = wp.float32(solution[4])
 
     # First fundamental form coefficients
-    E_ff = wp.float64(1.0) + d * d
+    E_ff = wp.float32(1.0) + d * d
     F_ff = d * e
-    G_ff = wp.float64(1.0) + e * e
+    G_ff = wp.float32(1.0) + e * e
     denom = E_ff * G_ff - F_ff * F_ff
 
-    if wp.abs(denom) < wp.float64(1e-14):
+    if wp.abs(denom) < wp.float32(1e-14):
         out_pd1[i] = zero3
         out_pd2[i] = zero3
         out_pv1[i] = wp.float32(0.0)
@@ -260,15 +262,15 @@ def fit_principal_curvature(
         return
 
     # Normal z-component in local frame
-    nz = wp.float64(1.0) / wp.sqrt(d * d + e * e + wp.float64(1.0))
+    nz = wp.float32(1.0) / wp.sqrt(d * d + e * e + wp.float32(1.0))
 
     # Second fundamental form
-    L_ff = wp.float64(2.0) * a * nz
+    L_ff = wp.float32(2.0) * a * nz
     M_ff = b * nz
-    N_ff = wp.float64(2.0) * c * nz
+    N_ff = wp.float32(2.0) * c * nz
 
-    first_form = wp.vec3(wp.float32(E_ff), wp.float32(F_ff), wp.float32(G_ff))
-    second_form = wp.vec3(wp.float32(L_ff), wp.float32(M_ff), wp.float32(N_ff))
+    first_form = wp.vec3(E_ff, F_ff, G_ff)
+    second_form = wp.vec3(L_ff, M_ff, N_ff)
     lam0, lam1, ev0, ev1 = _principal_curvatures_from_monge(first_form, second_form)
 
     # Negate: the Monge patch height function curves downward for convex surfaces,
