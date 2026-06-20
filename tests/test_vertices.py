@@ -57,6 +57,25 @@ def test_area_weighted_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     assert np.allclose(vertex_normals_wp.numpy(), vertex_normals_igl, rtol=1e-5, atol=1e-5)
 
 
+def test_area_weighted_vertex_normals_precomputed(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = half_torus
+
+    n_vertices = mesh_tm.vertices.shape[0]
+    vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
+
+    face_normals_wp, face_areas_wp = tw.triangles.face_normals_and_areas(vertices_wp, mesh_wp.indices)
+    vertex_normals_precomputed_wp = tw.vertices.area_weighted_vertex_normals(
+        n_vertices, vertices_wp, mesh_wp.indices,
+        face_normals=face_normals_wp, face_areas=face_areas_wp,
+    )
+    vertex_normals_wp = tw.vertices.area_weighted_vertex_normals(
+        n_vertices, vertices_wp, mesh_wp.indices
+    )
+    assert np.allclose(
+        vertex_normals_precomputed_wp.numpy(), vertex_normals_wp.numpy(), rtol=1e-5, atol=1e-5
+    )
+
+
 def test_angle_weighted_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = half_torus
 
@@ -70,6 +89,26 @@ def test_angle_weighted_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
         n_vertices, vertices_wp, mesh_wp.indices
     )
     assert np.allclose(vertex_normals_wp.numpy(), vertex_normals_tm, rtol=1e-5, atol=1e-5)
+
+
+def test_angle_weighted_vertex_normals_precomputed(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = half_torus
+
+    n_vertices = mesh_tm.vertices.shape[0]
+    vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
+
+    face_normals_wp, _ = tw.triangles.face_normals_and_areas(vertices_wp, mesh_wp.indices)
+    face_angles_wp = tw.triangles.face_angles(vertices_wp, mesh_wp.indices)
+    vertex_normals_precomputed_wp = tw.vertices.angle_weighted_vertex_normals(
+        n_vertices, vertices_wp, mesh_wp.indices,
+        face_normals=face_normals_wp, face_angles=face_angles_wp,
+    )
+    vertex_normals_wp = tw.vertices.angle_weighted_vertex_normals(
+        n_vertices, vertices_wp, mesh_wp.indices
+    )
+    assert np.allclose(
+        vertex_normals_precomputed_wp.numpy(), vertex_normals_wp.numpy(), rtol=1e-5, atol=1e-5
+    )
 
 
 def _compute_max_vertex_normals_np(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
