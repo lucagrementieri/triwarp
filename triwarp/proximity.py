@@ -9,6 +9,7 @@ positive, inside negative. Trimesh ``signed_distance`` uses the opposite sign.
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Literal, cast, overload
 
 import numpy as np
@@ -424,7 +425,7 @@ def query_hashgrid_ball_with_offsets(
     m = int(queries.shape[0])
 
     n: int = int(points.shape[0])
-    if n == 0:
+    if n == 0 or m == 0:
         return (
             wp.empty(0, dtype=wp.int32, device=device),
             wp.empty(0, dtype=wp.float32, device=device),
@@ -708,7 +709,7 @@ def query_bvh_ball_with_offsets(
     m = int(queries.shape[0])
 
     n: int = int(points.shape[0])
-    if n == 0:
+    if n == 0 or m == 0:
         return (
             wp.empty(0, dtype=wp.int32, device=device),
             wp.empty(0, dtype=wp.float32, device=device),
@@ -855,6 +856,126 @@ def query_bvh_ball(
     if single_query:
         return neighbor_indices[0], neighbor_distances[0]
     return neighbor_indices, neighbor_distances
+
+
+def query_geodesic_ball(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], radius: float, min_count: int = 6
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Per-vertex geodesic-ball neighborhoods matching ``igl::principal_curvature``'s ``getSphere``.
+
+    For each vertex this is a breadth-first traversal of the mesh edge graph, enqueueing a neighbor
+    only when it lies within Euclidean ``radius`` of the center — i.e. the connected component of
+    the center within the radius ball. This is a *geodesic* ball rather than a pure Euclidean one,
+    so it excludes vertices that are spatially close but lie across a fold of the surface (e.g. the
+    opposite wall of a torus tube), which a Euclidean hash-grid query would wrongly include and
+    which corrupts the quadric fit. When fewer than ``min_count`` vertices are reachable, the
+    nearest out-of-ball vertices are appended (libigl's ``extra_candidates`` path).
+
+    Also returns the per-vertex reference neighbor used to build the tangent frame: the
+    lowest-indexed edge neighbor, matching libigl's ``adjacency_list[i][0]``. libigl's symmetrized
+    shape operator is frame-dependent, so reproducing its principal values requires this exact
+    frame. Isolated vertices reference themselves.
+
+    The traversal runs entirely on device. Vertex adjacency is built as a CSR graph via
+    :func:`triwarp.edges.edges_unique` + :func:`triwarp.graph.edges_to_csr`, then a two-pass BFS
+    (count → exclusive scan → fill) emits the CSR neighbor buffer. Each thread uses fixed-capacity
+    local scratch of 512 neighbors; if a vertex collects more than that the surplus is dropped and a
+    warning is emitted.
+
+    .. note::
+        Distances and tie-breaking are computed in ``float32`` (set-equivalent to the libigl
+        reference; borderline ties between equidistant neighbors may resolve differently but leave
+        the order-independent quadric fit unchanged).
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions as ``wp.vec3``.
+    faces
+        Length-``3 * n_faces`` flat triangle index buffer as ``wp.int32``.
+    radius
+        Geodesic-ball radius in world units.
+    min_count
+        Minimum neighbors per vertex; the nearest out-of-ball vertices backfill any shortfall.
+
+    Returns
+    -------
+    tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]
+        ``(neighbor_indices, offsets, reference_neighbors)``. ``offsets`` is the
+        length-``n_vertices`` exclusive prefix sum of per-vertex neighbor counts (CSR starts);
+        vertex ``i`` owns ``neighbor_indices[offsets[i] : offsets[i + 1]]`` with ``offsets[n]``
+        implied as the total. ``reference_neighbors`` has length ``n_vertices``.
+    """
+    device = vertices.device
+    n = int(vertices.shape[0])
+    if n == 0:
+        empty = wp.empty(0, dtype=wp.int32, device=device)
+        return (
+            empty,
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+        )
+
+    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n)
+    adjacency = tw.graph.edges_to_csr(n, unique_edges)
+    adj_offsets = adjacency.offsets
+    adj_columns = adjacency.columns
+
+    reference_neighbors = wp.empty(n, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_proximity.geodesic_ball_reference_neighbors,
+        dim=n,
+        inputs=[adj_offsets, adj_columns, reference_neighbors],
+        device=device,
+    )
+
+    overflow = wp.zeros(1, dtype=wp.int32, device=device)
+    counts = wp.empty(n, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_proximity.query_geodesic_ball_count,
+        dim=n,
+        inputs=[
+            vertices,
+            adj_offsets,
+            adj_columns,
+            wp.float32(radius),
+            wp.int32(min_count),
+            counts,
+            overflow,
+        ],
+        device=device,
+    )
+    n_overflow = int(overflow.numpy()[0])
+    if n_overflow > 0:
+        warnings.warn(
+            f"query_geodesic_ball: {n_overflow} neighborhood capacity breaches "
+            f"(fixed cap 512); surplus neighbors dropped.",
+            stacklevel=2,
+        )
+
+    offsets = wp.empty(n, dtype=wp.int32, device=device)
+    wp.utils.array_scan(counts, out_array=offsets, inclusive=False)
+    total = int(offsets.numpy()[-1]) + int(counts.numpy()[-1])
+
+    neighbor_indices = wp.empty(total, dtype=wp.int32, device=device)
+    overflow.zero_()
+    wp.launch(
+        kernel_proximity.query_geodesic_ball_neighbors,
+        dim=n,
+        inputs=[
+            vertices,
+            adj_offsets,
+            adj_columns,
+            wp.float32(radius),
+            wp.int32(min_count),
+            offsets,
+            neighbor_indices,
+            overflow,
+        ],
+        device=device,
+    )
+    return neighbor_indices, offsets, reference_neighbors
 
 
 @overload
@@ -1178,18 +1299,17 @@ def _combined_aabb(
     return combined_min, combined_max
 
 
-def mesh_query_max_dist(mesh_points: wp.array[wp.vec3]) -> float:
-    """Diagonal of the axis-aligned bounding box of ``mesh_points``."""
-    mesh_min, mesh_max = aabb_bounds(mesh_points)
-    return _aabb_diagonal(mesh_min, mesh_max)
-
-
 def default_mesh_query_max_dist(
-    mesh_points: wp.array[wp.vec3], query_points: wp.array[wp.vec3]
+    mesh_points: wp.array[wp.vec3], query_points: wp.array[wp.vec3] | None = None
 ) -> float:
-    """Diagonal of the AABB enclosing ``mesh_points`` and ``query_points``."""
+    """
+    Diagonal of the AABB enclosing ``mesh_points`` and ``query_points``.
+
+    When ``query_points`` is ``None`` (or empty), returns the diagonal of the
+    axis-aligned bounding box of ``mesh_points`` alone.
+    """
     mesh_min, mesh_max = aabb_bounds(mesh_points)
-    if int(query_points.shape[0]) == 0:
+    if query_points is None or int(query_points.shape[0]) == 0:
         return _aabb_diagonal(mesh_min, mesh_max)
     query_min, query_max = aabb_bounds(query_points)
     combined_min, combined_max = _combined_aabb(mesh_min, mesh_max, query_min, query_max)

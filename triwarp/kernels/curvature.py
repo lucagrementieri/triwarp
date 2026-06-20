@@ -2,6 +2,297 @@ import warp as wp
 
 from triwarp.kernels import array as kernel_array
 
+# Custom fixed-size float64 types for the 5x5 quadric-fit normal equations.
+vec5d = wp.types.vector(length=5, dtype=wp.float64)
+mat55d = wp.types.matrix(shape=(5, 5), dtype=wp.float64)
+
+# ---------------------------------------------------------------------------
+# principal_curvature helpers
+# ---------------------------------------------------------------------------
+
+
+@wp.func
+def _build_reference_frame(
+    vertex: wp.vec3, normal: wp.vec3, first_neighbor: wp.vec3
+) -> tuple[wp.vec3, wp.vec3]:
+    """Return (t1, t2) orthonormal tangent frame with t1 pointing toward first_neighbor."""
+    diff = first_neighbor - vertex
+    t1 = diff - normal * wp.dot(diff, normal)
+    if wp.length(t1) < wp.float32(1e-6):
+        # fallback: arbitrary perpendicular to normal
+        if wp.abs(normal[0]) < wp.float32(0.9):
+            t1 = wp.vec3(1.0, 0.0, 0.0) - normal * normal[0]
+        else:
+            t1 = wp.vec3(0.0, 1.0, 0.0) - normal * normal[1]
+    t1 = wp.normalize(t1)
+    t2 = wp.cross(normal, t1)
+    t2 = wp.normalize(t2)
+    return t1, t2
+
+
+@wp.func
+def _solve_normal_equations(ata: mat55d, atb: vec5d) -> tuple[vec5d, wp.bool]:
+    """
+    Solve the 5x5 system ``AtA x = Atb`` by Gaussian elimination with partial pivoting.
+    Returns (solution, ok); ok is False if singular to tolerance 1e-14.
+    """
+    m = ata
+    b = atb
+
+    # forward elimination
+    for col in range(5):
+        # find pivot row
+        pivot_row = col
+        pivot_val = wp.abs(m[col, col])
+        for row in range(col + 1, 5):
+            v = wp.abs(m[row, col])
+            if v > pivot_val:
+                pivot_val = v
+                pivot_row = row
+        if pivot_val < wp.float64(1e-14):
+            return b, False
+        # swap rows col and pivot_row
+        if pivot_row != col:
+            for k in range(5):
+                tmp = m[col, k]
+                m[col, k] = m[pivot_row, k]
+                m[pivot_row, k] = tmp
+            tmp_b = b[col]
+            b[col] = b[pivot_row]
+            b[pivot_row] = tmp_b
+        # eliminate rows below
+        inv = wp.float64(1.0) / m[col, col]
+        for row in range(col + 1, 5):
+            factor = m[row, col] * inv
+            for k in range(col, 5):
+                m[row, k] = m[row, k] - factor * m[col, k]
+            b[row] = b[row] - factor * b[col]
+
+    # back-substitution: iterate col = 4, 3, 2, 1, 0
+    x = vec5d()
+    for back_idx in range(5):
+        col = 4 - back_idx
+        val = b[col]
+        for k in range(col + 1, 5):
+            val = val - m[col, k] * x[k]
+        x[col] = val / m[col, col]
+    return x, True
+
+
+@wp.func
+def _eigvec_sym2(m00: wp.float32, m01: wp.float32, lam: wp.float32, fallback: wp.vec2) -> wp.vec2:
+    """Return the unit eigenvector of [[m00, m01], [m01, *]] for eigenvalue lam, in (t1, t2)."""
+    v = wp.vec2(m01, lam - m00)
+    if wp.length(v) < wp.float32(1e-14):
+        return fallback
+    return wp.normalize(v)
+
+
+@wp.func
+def _principal_curvatures_from_monge(
+    first_form: wp.vec3, second_form: wp.vec3
+) -> tuple[wp.float32, wp.float32, wp.vec2, wp.vec2]:
+    """
+    Reproduce ``igl::principal_curvature``'s ``finalEigenStuff`` from the fundamental forms.
+
+    Takes the first fundamental form ``first_form = (E, F, G)`` and second fundamental form
+    ``second_form = (L, M, N)``: the shape operator is built as a *symmetric* 2x2 matrix and its
+    (real) eigenvalues are the principal curvatures.
+
+    libigl does not solve the true generalized eigenvalue problem ``II*v = lam*I*v`` (whose
+    Weingarten map has unequal off-diagonals ``G*M - N*F`` and ``E*M - L*F``). Instead it forms
+
+        m = [[L*G - M*F, M*E - L*F],
+             [M*E - L*F, N*E - M*F]] / (E*G - F*F)
+
+    forcing symmetry by reusing ``M*E - L*F`` for both off-diagonals. This keeps the trace (mean
+    curvature) exact but alters the determinant (and therefore the eigenvalue spread), so matching
+    libigl requires replicating this formulation verbatim rather than the textbook one.
+
+    Returns (lam0, lam1, ev0, ev1) where lam0 <= lam1 are eigenvalues of ``m``. The caller negates
+    them (libigl's ``c_val = -c_val``). The eigenvectors ev0, ev1 are unit ``wp.vec2`` in the
+    (t1, t2) tangent-frame 2D basis.
+    """
+    e_ff = first_form[0]
+    f_ff = first_form[1]
+    g_ff = first_form[2]
+    l_ff = second_form[0]
+    m_ff = second_form[1]
+    n_ff = second_form[2]
+
+    inv_denom = wp.float32(1.0) / (e_ff * g_ff - f_ff * f_ff)
+    m00 = (l_ff * g_ff - m_ff * f_ff) * inv_denom
+    m01 = (m_ff * e_ff - l_ff * f_ff) * inv_denom
+    m11 = (n_ff * e_ff - m_ff * f_ff) * inv_denom
+
+    # Eigenvalues of the symmetric 2x2 matrix [[m00, m01], [m01, m11]] (ascending).
+    half_trace = (m00 + m11) * wp.float32(0.5)
+    half_diff = (m00 - m11) * wp.float32(0.5)
+    disc = wp.sqrt(half_diff * half_diff + m01 * m01)
+    lam0 = half_trace - disc
+    lam1 = half_trace + disc
+
+    # Eigenvectors of (m - lam*I)v = 0 → v ~ [m01, lam - m00], with axis fallbacks when degenerate.
+    ev0 = _eigvec_sym2(m00, m01, lam0, wp.vec2(1.0, 0.0))
+    ev1 = _eigvec_sym2(m00, m01, lam1, wp.vec2(0.0, 1.0))
+
+    return lam0, lam1, ev0, ev1
+
+
+# ---------------------------------------------------------------------------
+# principal curvature kernel
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def fit_principal_curvature(
+    vertices: wp.array[wp.vec3],
+    vertex_normals: wp.array[wp.vec3],
+    neighbor_indices: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    reference_neighbors: wp.array[wp.int32],
+    out_pd1: wp.array[wp.vec3],
+    out_pd2: wp.array[wp.vec3],
+    out_pv1: wp.array[wp.float32],
+    out_pv2: wp.array[wp.float32],
+    out_valid: wp.array[wp.bool],
+) -> None:
+    """
+    Fit a quadric surface in a local tangent frame per vertex and extract principal
+    curvature directions and magnitudes. Matches igl::principal_curvature.
+
+    """
+    i = int(wp.tid())
+    zero3 = wp.vec3(0.0, 0.0, 0.0)
+
+    start = int(offsets[i])
+    # offsets has length n_vertices (no sentinel); last vertex ends at neighbor_indices end
+    if i + 1 < offsets.shape[0]:
+        end = int(offsets[i + 1])
+    else:
+        end = int(neighbor_indices.shape[0])
+    n_nbr = end - start
+
+    if (
+        n_nbr < 5
+    ):  # need at least 5 non-self neighbors for quadric fit; degenerate cases caught by gauss_elim
+        out_pd1[i] = zero3
+        out_pd2[i] = zero3
+        out_pv1[i] = wp.float32(0.0)
+        out_pv2[i] = wp.float32(0.0)
+        out_valid[i] = False
+        return
+
+    vertex = vertices[i]
+    normal = wp.normalize(vertex_normals[i])
+
+    # Build the tangent frame from the lowest-indexed mesh-adjacency neighbor, matching libigl's
+    # computeReferenceFrame (adjacency_list[i][0]). libigl extracts curvature from a *symmetrized*
+    # shape operator whose eigenvalues depend on the chosen frame, so the principal values only
+    # agree with igl::principal_curvature when this exact reference direction is used.
+    ref = int(reference_neighbors[i])
+    t1, t2 = _build_reference_frame(vertex, normal, vertices[ref])
+
+    # Count neighbors passing projection-plane filter, including self (self always passes with dot=1).
+    # Matches libigl's applyProjOnPlane which includes vv[self] because dot(n_i, n_i) = 1 > 0.
+    n_valid = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
+    for k in range(n_nbr):
+        j = int(neighbor_indices[start + k])
+        if j == i:
+            n_valid = n_valid + 1  # self always passes
+            continue
+        nj = wp.normalize(vertex_normals[j])
+        if wp.dot(nj, normal) > wp.float32(0.0):
+            n_valid = n_valid + 1
+
+    # Mirror libigl: only apply filter if it leaves >= 6 AND fewer than the full set
+    use_filter = n_valid >= 6
+
+    # Least-squares quadric fit: accumulate the normal equations AᵀA x = Aᵀb.
+    ata = mat55d()
+    atb = vec5d()
+
+    for k in range(n_nbr):
+        j = int(neighbor_indices[start + k])
+        if j == i:
+            continue  # self contributes (0,0,0) — skip to avoid frame degeneration
+        nj = wp.normalize(vertex_normals[j])
+        if use_filter and wp.dot(nj, normal) <= wp.float32(0.0):
+            continue
+
+        diff = vertices[j] - vertex
+        u = wp.float64(wp.dot(diff, t1))
+        v_c = wp.float64(wp.dot(diff, t2))
+        w = wp.float64(wp.dot(diff, normal))
+
+        # row of A: [u², uv, v², u, v]
+        r = vec5d(u * u, u * v_c, v_c * v_c, u, v_c)
+        ata += wp.outer(r, r)
+        atb += r * w
+
+    solution, ok = _solve_normal_equations(ata, atb)
+    if not ok:
+        out_pd1[i] = zero3
+        out_pd2[i] = zero3
+        out_pv1[i] = wp.float32(0.0)
+        out_pv2[i] = wp.float32(0.0)
+        out_valid[i] = False
+        return
+
+    a = solution[0]
+    b = solution[1]
+    c = solution[2]
+    d = solution[3]
+    e = solution[4]
+
+    # First fundamental form coefficients
+    E_ff = wp.float64(1.0) + d * d
+    F_ff = d * e
+    G_ff = wp.float64(1.0) + e * e
+    denom = E_ff * G_ff - F_ff * F_ff
+
+    if wp.abs(denom) < wp.float64(1e-14):
+        out_pd1[i] = zero3
+        out_pd2[i] = zero3
+        out_pv1[i] = wp.float32(0.0)
+        out_pv2[i] = wp.float32(0.0)
+        out_valid[i] = False
+        return
+
+    # Normal z-component in local frame
+    nz = wp.float64(1.0) / wp.sqrt(d * d + e * e + wp.float64(1.0))
+
+    # Second fundamental form
+    L_ff = wp.float64(2.0) * a * nz
+    M_ff = b * nz
+    N_ff = wp.float64(2.0) * c * nz
+
+    first_form = wp.vec3(wp.float32(E_ff), wp.float32(F_ff), wp.float32(G_ff))
+    second_form = wp.vec3(wp.float32(L_ff), wp.float32(M_ff), wp.float32(N_ff))
+    lam0, lam1, ev0, ev1 = _principal_curvatures_from_monge(first_form, second_form)
+
+    # Negate: the Monge patch height function curves downward for convex surfaces,
+    # giving negative eigenvalues; convention is positive curvature for convex.
+    k0 = -lam0
+    k1 = -lam1
+
+    # Reconstruct global directions from local eigenvectors
+    dir0 = wp.normalize(t1 * ev0[0] + t2 * ev0[1])
+    dir1 = wp.normalize(t1 * ev1[0] + t2 * ev1[1])
+
+    # Assign so that PV1 >= PV2
+    if k0 >= k1:
+        out_pd1[i] = dir0
+        out_pd2[i] = dir1
+        out_pv1[i] = k0
+        out_pv2[i] = k1
+    else:
+        out_pd1[i] = dir1
+        out_pd2[i] = dir0
+        out_pv1[i] = k1
+        out_pv2[i] = k0
+    out_valid[i] = True
+
 
 @wp.func
 def line_ball_intersection_segment(

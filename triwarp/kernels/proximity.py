@@ -1,6 +1,11 @@
 import warp as wp
 
-from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_PLANAR_CONSTANT
+from triwarp.constants import (
+    FLOAT32_INF_CONSTANT,
+    INT32_MAX_CONSTANT,
+    TOLERANCE_MERGE_CONSTANT,
+    TOLERANCE_PLANAR_CONSTANT,
+)
 from triwarp.kernels import array as kernel_array
 
 
@@ -19,98 +24,6 @@ def aabb_bounds(
     wp.atomic_max(out_max, 0, p[0])
     wp.atomic_max(out_max, 1, p[1])
     wp.atomic_max(out_max, 2, p[2])
-
-
-@wp.kernel
-def query_bvh_ball_count(
-    points: wp.array[wp.vec3],
-    queries: wp.array[wp.vec3],
-    bvh_id: wp.uint64,
-    radius: wp.float32,
-    out_neighbor_counts: wp.array[wp.int32],
-) -> None:
-    tid = wp.tid()
-    q = queries[tid]
-    r = radius
-    lower = wp.vec3(q[0] - r, q[1] - r, q[2] - r)
-    upper = wp.vec3(q[0] + r, q[1] + r, q[2] + r)
-    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    j = wp.int32(0)
-    c = wp.int32(0)
-    while wp.bvh_query_next(query, j):
-        if wp.length(points[j] - q) <= r:
-            c = c + 1
-    out_neighbor_counts[tid] = c
-
-
-@wp.kernel
-def query_bvh_ball_neighbors(
-    points: wp.array[wp.vec3],
-    queries: wp.array[wp.vec3],
-    bvh_id: wp.uint64,
-    radius: wp.float32,
-    offsets: wp.array[wp.int32],
-    out_indices: wp.array[wp.int32],
-    out_distances: wp.array[wp.float32],
-) -> None:
-    tid = wp.tid()
-    q = queries[tid]
-    r = radius
-    lower = wp.vec3(q[0] - r, q[1] - r, q[2] - r)
-    upper = wp.vec3(q[0] + r, q[1] + r, q[2] + r)
-    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    point_idx = wp.int32(0)
-    w = int(offsets[tid])
-    while wp.bvh_query_next(query, point_idx):
-        d = wp.length(points[point_idx] - q)
-        if d <= r:
-            out_indices[w] = point_idx
-            out_distances[w] = d
-            w = w + 1
-
-
-@wp.kernel
-def query_hashgrid_ball_count(
-    points: wp.array[wp.vec3],
-    queries: wp.array[wp.vec3],
-    grid_id: wp.uint64,
-    radius: wp.float32,
-    out_neighbor_counts: wp.array[wp.int32],
-) -> None:
-    tid = wp.tid()
-    q = queries[tid]
-    r = radius
-    query = wp.hash_grid_query(grid_id, q, r)
-    j = wp.int32(0)
-    c = wp.int32(0)
-    while wp.hash_grid_query_next(query, j):
-        if wp.length(points[j] - q) <= r:
-            c = c + 1
-    out_neighbor_counts[tid] = c
-
-
-@wp.kernel
-def query_hashgrid_ball_neighbors(
-    points: wp.array[wp.vec3],
-    queries: wp.array[wp.vec3],
-    grid_id: wp.uint64,
-    radius: wp.float32,
-    offsets: wp.array[wp.int32],
-    out_indices: wp.array[wp.int32],
-    out_distances: wp.array[wp.float32],
-) -> None:
-    tid = wp.tid()
-    q = queries[tid]
-    r = radius
-    query = wp.hash_grid_query(grid_id, q, r)
-    point_idx = wp.int32(0)
-    w = int(offsets[tid])
-    while wp.hash_grid_query_next(query, point_idx):
-        d = wp.length(points[point_idx] - q)
-        if d <= r:
-            out_indices[w] = point_idx
-            out_distances[w] = d
-            w = w + 1
 
 
 @wp.kernel
@@ -198,6 +111,324 @@ def query_mesh_aabb_bounds_neighbors(
 
 
 @wp.kernel
+def query_hashgrid_ball_count(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    grid_id: wp.uint64,
+    radius: wp.float32,
+    out_neighbor_counts: wp.array[wp.int32],
+) -> None:
+    tid = wp.tid()
+    q = queries[tid]
+    r = radius
+    query = wp.hash_grid_query(grid_id, q, r)
+    j = wp.int32(0)
+    c = wp.int32(0)
+    while wp.hash_grid_query_next(query, j):
+        if wp.length(points[j] - q) <= r:
+            c = c + 1
+    out_neighbor_counts[tid] = c
+
+
+@wp.kernel
+def query_hashgrid_ball_neighbors(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    grid_id: wp.uint64,
+    radius: wp.float32,
+    offsets: wp.array[wp.int32],
+    out_indices: wp.array[wp.int32],
+    out_distances: wp.array[wp.float32],
+) -> None:
+    tid = wp.tid()
+    q = queries[tid]
+    r = radius
+    query = wp.hash_grid_query(grid_id, q, r)
+    point_idx = wp.int32(0)
+    w = int(offsets[tid])
+    while wp.hash_grid_query_next(query, point_idx):
+        d = wp.length(points[point_idx] - q)
+        if d <= r:
+            out_indices[w] = point_idx
+            out_distances[w] = d
+            w = w + 1
+
+
+@wp.kernel
+def query_bvh_ball_count(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    bvh_id: wp.uint64,
+    radius: wp.float32,
+    out_neighbor_counts: wp.array[wp.int32],
+) -> None:
+    tid = wp.tid()
+    q = queries[tid]
+    r = radius
+    lower = wp.vec3(q[0] - r, q[1] - r, q[2] - r)
+    upper = wp.vec3(q[0] + r, q[1] + r, q[2] + r)
+    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
+    j = wp.int32(0)
+    c = wp.int32(0)
+    while wp.bvh_query_next(query, j):
+        if wp.length(points[j] - q) <= r:
+            c = c + 1
+    out_neighbor_counts[tid] = c
+
+
+@wp.kernel
+def query_bvh_ball_neighbors(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    bvh_id: wp.uint64,
+    radius: wp.float32,
+    offsets: wp.array[wp.int32],
+    out_indices: wp.array[wp.int32],
+    out_distances: wp.array[wp.float32],
+) -> None:
+    tid = wp.tid()
+    q = queries[tid]
+    r = radius
+    lower = wp.vec3(q[0] - r, q[1] - r, q[2] - r)
+    upper = wp.vec3(q[0] + r, q[1] + r, q[2] + r)
+    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
+    point_idx = wp.int32(0)
+    w = int(offsets[tid])
+    while wp.bvh_query_next(query, point_idx):
+        d = wp.length(points[point_idx] - q)
+        if d <= r:
+            out_indices[w] = point_idx
+            out_distances[w] = d
+            w = w + 1
+
+
+@wp.kernel
+def geodesic_ball_reference_neighbors(
+    adj_offsets: wp.array[wp.int32],
+    adj_columns: wp.array[wp.int32],
+    out_reference: wp.array[wp.int32],
+) -> None:
+    """Lowest-indexed edge neighbor per vertex (libigl ``adjacency_list[i][0]``); self if alone."""
+    i = int(wp.tid())
+    start = int(adj_offsets[i])
+    end = int(adj_offsets[i + 1])
+    if start == end:
+        out_reference[i] = i
+        return
+    minimum = adj_columns[start]
+    for k in range(start + 1, end):
+        if adj_columns[k] < minimum:
+            minimum = adj_columns[k]
+    out_reference[i] = minimum
+
+
+@wp.func
+def _geodesic_sorted_insert_unique(
+    arr: wp.array[wp.int32], value: wp.int32, count: wp.int32, out_overflow: wp.array[wp.int32]
+) -> wp.int32:
+    """Insert ``value`` into the sorted prefix of ``arr`` (tail filled with max-int sentinels)."""
+    if count >= arr.shape[0]:
+        wp.atomic_add(out_overflow, 0, 1)
+        return count
+    slot = kernel_array.binary_search_index(arr, value)
+    kernel_array.array_shift_insert(arr, value, slot)
+    return count + 1
+
+
+@wp.func
+def _geodesic_extras_push(
+    ext_dist: wp.array[wp.float32],
+    ext_idx: wp.array[wp.int32],
+    distance: wp.float32,
+    neighbor: wp.int32,
+    count: wp.int32,
+) -> wp.int32:
+    """Insert ``(distance, neighbor)`` keeping ``ext_dist`` ascending (distance-only ordering)."""
+    cap = ext_dist.shape[0]
+    slot = kernel_array.binary_search_index(ext_dist, distance)
+    if slot >= cap:
+        return count  # farther than every kept extra and the buffer is full — drop it
+    kernel_array.array_shift_insert(ext_dist, distance, slot)
+    kernel_array.array_shift_insert(ext_idx, neighbor, slot)
+    if count < cap:
+        return count + 1
+    return count
+
+
+@wp.func
+def _geodesic_ball_collect(
+    i: wp.int32,
+    vertices: wp.array[wp.vec3],
+    adj_offsets: wp.array[wp.int32],
+    adj_columns: wp.array[wp.int32],
+    radius: wp.float32,
+    min_count: wp.int32,
+    queue: wp.array[wp.int32],
+    visited: wp.array[wp.int32],
+    ext_dist: wp.array[wp.float32],
+    ext_idx: wp.array[wp.int32],
+    write: wp.bool,
+    base: wp.int32,
+    out_flat: wp.array[wp.int32],
+    out_overflow: wp.array[wp.int32],
+) -> wp.int32:
+    """
+    Geodesic-ball BFS for vertex ``i`` (libigl ``getSphere``); returns the collected count.
+
+    Traverses the mesh edge graph (CSR ``adj_offsets``/``adj_columns``), enqueueing a neighbor only
+    when it lies within Euclidean ``radius`` of vertex ``i``. Out-of-ball neighbors feed a nearest
+    fallback (``ext_dist``/``ext_idx``) drained until ``min_count`` is reached. When ``write`` is
+    true, collected vertices are emitted to ``out_flat[base + pos]`` in BFS order. ``queue``,
+    ``visited`` and the extras buffers are caller-allocated fixed-capacity scratch sized to the
+    neighbor limit; exceeding it increments ``out_overflow`` so the caller can warn.
+    """
+    visited_cap = visited.shape[0]
+    queue_cap = queue.shape[0]
+    extras_cap = ext_dist.shape[0]
+
+    # Fill the unused tail with the largest representable values so real entries always sort before
+    # them and ``binary_search_index`` holds across the whole buffer (sentinels shift off the end).
+    for k in range(visited_cap):
+        visited[k] = INT32_MAX_CONSTANT
+    for k in range(extras_cap):
+        ext_dist[k] = FLOAT32_INF_CONSTANT
+        ext_idx[k] = wp.int32(-1)
+
+    center = vertices[i]
+
+    visited[0] = i
+    visited_n = wp.int32(1)
+    queue[0] = i
+    q_head = wp.int32(0)
+    q_tail = wp.int32(1)
+    ext_n = wp.int32(0)
+    collected = wp.int32(0)
+
+    while q_head < q_tail:
+        current = queue[q_head]
+        q_head += wp.int32(1)
+        if write:
+            out_flat[base + collected] = current
+        collected += wp.int32(1)
+
+        start = adj_offsets[current]
+        end = adj_offsets[current + 1]
+        for k in range(start, end):
+            neighbor = adj_columns[k]
+            if kernel_array.binary_search_sorted_contains(visited, neighbor):
+                continue
+            distance = wp.length(vertices[neighbor] - center)
+            if distance < radius:
+                if q_tail < queue_cap:
+                    queue[q_tail] = neighbor
+                    q_tail += wp.int32(1)
+                else:
+                    wp.atomic_add(out_overflow, 0, 1)
+            elif collected < min_count:
+                ext_n = _geodesic_extras_push(ext_dist, ext_idx, distance, neighbor, ext_n)
+            visited_n = _geodesic_sorted_insert_unique(visited, neighbor, visited_n, out_overflow)
+
+    while ext_n > wp.int32(0) and collected < min_count:
+        cand = ext_idx[0]
+        for k in range(extras_cap - 1):
+            ext_dist[k] = ext_dist[k + 1]
+            ext_idx[k] = ext_idx[k + 1]
+        ext_dist[extras_cap - 1] = FLOAT32_INF_CONSTANT
+        ext_idx[extras_cap - 1] = wp.int32(-1)
+        ext_n -= wp.int32(1)
+
+        if write:
+            out_flat[base + collected] = cand
+        collected += wp.int32(1)
+
+        start = adj_offsets[cand]
+        end = adj_offsets[cand + 1]
+        for k in range(start, end):
+            neighbor = adj_columns[k]
+            if kernel_array.binary_search_sorted_contains(visited, neighbor):
+                continue
+            distance = wp.length(vertices[neighbor] - center)
+            ext_n = _geodesic_extras_push(ext_dist, ext_idx, distance, neighbor, ext_n)
+            visited_n = _geodesic_sorted_insert_unique(visited, neighbor, visited_n, out_overflow)
+
+    return collected
+
+
+# Fixed per-thread scratch capacity for the BFS (queue, visited, and extras buffers). Local kernel
+# arrays need a compile-time-constant shape; a vertex whose neighborhood exceeds this is clamped and
+# the wrapper warns. 512 comfortably covers observed neighborhoods (~272 on a folded half-torus).
+_GEODESIC_MAX_NEIGHBORS = 512
+
+
+@wp.kernel
+def query_geodesic_ball_count(
+    vertices: wp.array[wp.vec3],
+    adj_offsets: wp.array[wp.int32],
+    adj_columns: wp.array[wp.int32],
+    radius: wp.float32,
+    min_count: wp.int32,
+    out_counts: wp.array[wp.int32],
+    out_overflow: wp.array[wp.int32],
+) -> None:
+    i = int(wp.tid())
+    queue = wp.zeros(shape=_GEODESIC_MAX_NEIGHBORS, dtype=wp.int32)
+    visited = wp.zeros(shape=_GEODESIC_MAX_NEIGHBORS, dtype=wp.int32)
+    ext_dist = wp.zeros(shape=_GEODESIC_MAX_NEIGHBORS, dtype=wp.float32)
+    ext_idx = wp.zeros(shape=_GEODESIC_MAX_NEIGHBORS, dtype=wp.int32)
+    dummy = wp.zeros(shape=1, dtype=wp.int32)
+    out_counts[i] = _geodesic_ball_collect(
+        i,
+        vertices,
+        adj_offsets,
+        adj_columns,
+        radius,
+        min_count,
+        queue,
+        visited,
+        ext_dist,
+        ext_idx,
+        False,
+        wp.int32(0),
+        dummy,
+        out_overflow,
+    )
+
+
+@wp.kernel
+def query_geodesic_ball_neighbors(
+    vertices: wp.array[wp.vec3],
+    adj_offsets: wp.array[wp.int32],
+    adj_columns: wp.array[wp.int32],
+    radius: wp.float32,
+    min_count: wp.int32,
+    offsets: wp.array[wp.int32],
+    out_neighbors: wp.array[wp.int32],
+    out_overflow: wp.array[wp.int32],
+) -> None:
+    i = int(wp.tid())
+    queue = wp.zeros(shape=_GEODESIC_MAX_NEIGHBORS, dtype=wp.int32)
+    visited = wp.zeros(shape=_GEODESIC_MAX_NEIGHBORS, dtype=wp.int32)
+    ext_dist = wp.zeros(shape=_GEODESIC_MAX_NEIGHBORS, dtype=wp.float32)
+    ext_idx = wp.zeros(shape=_GEODESIC_MAX_NEIGHBORS, dtype=wp.int32)
+    _geodesic_ball_collect(
+        i,
+        vertices,
+        adj_offsets,
+        adj_columns,
+        radius,
+        min_count,
+        queue,
+        visited,
+        ext_dist,
+        ext_idx,
+        True,
+        offsets[i],
+        out_neighbors,
+        out_overflow,
+    )
+
+
+@wp.kernel
 def query_bvh_nearest_neighbors(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3],
@@ -232,6 +463,64 @@ def query_bvh_nearest_neighbors(
         slot = kernel_array.binary_search_index(out_distances[tid], d)
         kernel_array.array_shift_insert(out_distances[tid], d, slot)
         kernel_array.array_shift_insert(out_indices[tid], point_index, slot)
+
+
+@wp.kernel
+def query_hashgrid_nearest_neighbors(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3],
+    grid_id: wp.uint64,
+    k: wp.int32,
+    radius: wp.float32,
+    out_indices: wp.array2d[wp.int32],
+    out_distances: wp.array2d[wp.float32],
+) -> None:
+    tid = wp.tid()
+    q = queries[tid]
+
+    query = wp.hash_grid_query(grid_id, q, radius)
+    point_index = wp.int32(-1)
+
+    while wp.hash_grid_query_next(query, point_index):
+        d = wp.length(points[point_index] - q)
+
+        if d > radius:
+            continue
+
+        if d >= out_distances[tid, k - 1]:
+            continue
+
+        if k == 1:
+            out_indices[tid, 0] = point_index
+            out_distances[tid, 0] = d
+            continue
+
+        slot = kernel_array.binary_search_index(out_distances[tid], d)
+        kernel_array.array_shift_insert(out_distances[tid], d, slot)
+        kernel_array.array_shift_insert(out_indices[tid], point_index, slot)
+
+
+@wp.kernel
+def closest_point_on_mesh(
+    mesh_id: wp.uint64,
+    points: wp.array[wp.vec3],
+    max_dist: wp.float32,
+    out_closest: wp.array[wp.vec3],
+    out_distance: wp.array[wp.float32],
+    out_face: wp.array[wp.int32],
+) -> None:
+    tid = wp.tid()
+    p = points[tid]
+    query = wp.mesh_query_point_no_sign(mesh_id, p, max_dist)
+    if query.result:
+        closest = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
+        out_closest[tid] = closest
+        out_distance[tid] = wp.length(p - closest)
+        out_face[tid] = query.face
+    else:
+        out_closest[tid] = p
+        out_distance[tid] = max_dist
+        out_face[tid] = wp.int32(-1)
 
 
 @wp.func
@@ -289,64 +578,6 @@ def signed_distance_on_mesh(
         out_distance[tid] = dist
     else:
         out_distance[tid] = query.sign * dist
-
-
-@wp.kernel
-def closest_point_on_mesh(
-    mesh_id: wp.uint64,
-    points: wp.array[wp.vec3],
-    max_dist: wp.float32,
-    out_closest: wp.array[wp.vec3],
-    out_distance: wp.array[wp.float32],
-    out_face: wp.array[wp.int32],
-) -> None:
-    tid = wp.tid()
-    p = points[tid]
-    query = wp.mesh_query_point_no_sign(mesh_id, p, max_dist)
-    if query.result:
-        closest = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
-        out_closest[tid] = closest
-        out_distance[tid] = wp.length(p - closest)
-        out_face[tid] = query.face
-    else:
-        out_closest[tid] = p
-        out_distance[tid] = max_dist
-        out_face[tid] = wp.int32(-1)
-
-
-@wp.kernel
-def query_hashgrid_nearest_neighbors(
-    points: wp.array[wp.vec3],
-    queries: wp.array[wp.vec3],
-    grid_id: wp.uint64,
-    k: wp.int32,
-    radius: wp.float32,
-    out_indices: wp.array2d[wp.int32],
-    out_distances: wp.array2d[wp.float32],
-) -> None:
-    tid = wp.tid()
-    q = queries[tid]
-
-    query = wp.hash_grid_query(grid_id, q, radius)
-    point_index = wp.int32(-1)
-
-    while wp.hash_grid_query_next(query, point_index):
-        d = wp.length(points[point_index] - q)
-
-        if d > radius:
-            continue
-
-        if d >= out_distances[tid, k - 1]:
-            continue
-
-        if k == 1:
-            out_indices[tid, 0] = point_index
-            out_distances[tid, 0] = d
-            continue
-
-        slot = kernel_array.binary_search_index(out_distances[tid], d)
-        kernel_array.array_shift_insert(out_distances[tid], d, slot)
-        kernel_array.array_shift_insert(out_indices[tid], point_index, slot)
 
 
 @wp.kernel

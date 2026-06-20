@@ -4,7 +4,83 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import curvature as kernel_curvature
-from triwarp.vertices import vertex_defects
+from triwarp.vertices import area_weighted_vertex_normals, vertex_defects
+
+
+def principal_curvature(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], radius: int = 5
+) -> tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.float32], wp.array[wp.float32]]:
+    """
+    Principal curvature directions and magnitudes per vertex via quadric fitting.
+
+    For each vertex a quadric surface is fitted to a sphere-neighborhood of vertices in the
+    local tangent frame. The principal curvatures and directions are extracted from the
+    eigendecomposition of the resulting shape operator. This matches ``igl.principal_curvature``
+    with sphere-search neighborhood of radius ``radius * avg_edge_length``.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions as ``wp.vec3``.
+    faces
+        Length-``3 * n_faces`` flat triangle index buffer as ``wp.int32``.
+    radius
+        Neighborhood size multiplier applied to the average edge length. Larger values
+        collect more neighbors and produce smoother curvature estimates.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.float32], wp.array[wp.float32]]
+        ``(PD1, PD2, PV1, PV2)`` where ``PV1 >= PV2`` at every vertex. Vertices for which
+        the quadric fit failed (fewer than 6 neighbors or degenerate system) have zero
+        directions and zero curvature values.
+    """
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+
+    # Compute vertex normals via face normals
+    face_normals, face_areas = tw.triangles.face_normals_and_areas(vertices, faces)
+    vertex_normals = area_weighted_vertex_normals(
+        n_vertices, vertices, faces, face_normals, face_areas
+    )
+
+    # Average edge length (per-face, matching libigl's getAverageEdge) for sphere-radius scaling.
+    avg_edge = tw.edges.mean_edge_length(vertices, faces)
+    scaled_radius = float(radius) * avg_edge
+
+    # Collect vertex neighborhoods as geodesic balls (libigl getSphere) on device. A Euclidean ball
+    # would pull in vertices across surface folds and corrupt the quadric fit; see
+    # tw.proximity.query_geodesic_ball.
+    neighbor_indices, offsets, reference_neighbors = tw.proximity.query_geodesic_ball(
+        vertices, faces, scaled_radius
+    )
+
+    # Fit quadric and extract principal curvature per vertex
+    pd1 = wp.zeros(n_vertices, dtype=wp.vec3, device=device)
+    pd2 = wp.zeros(n_vertices, dtype=wp.vec3, device=device)
+    pv1 = wp.zeros(n_vertices, dtype=wp.float32, device=device)
+    pv2 = wp.zeros(n_vertices, dtype=wp.float32, device=device)
+    valid = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+
+    wp.launch(
+        kernel_curvature.fit_principal_curvature,
+        dim=n_vertices,
+        inputs=[
+            vertices,
+            vertex_normals,
+            neighbor_indices,
+            offsets,
+            reference_neighbors,
+            pd1,
+            pd2,
+            pv1,
+            pv2,
+            valid,
+        ],
+        device=device,
+    )
+
+    return pd1, pd2, pv1, pv2
 
 
 def discrete_gaussian_curvature(

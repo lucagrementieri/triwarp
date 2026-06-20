@@ -8,7 +8,7 @@ import triwarp as tw
 from triwarp.constants import TOLERANCE_PLANAR
 from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import ray as kernel_ray
-from triwarp.proximity import aabb_bounds, default_mesh_query_max_dist, mesh_query_max_dist
+from triwarp.proximity import aabb_bounds, default_mesh_query_max_dist
 
 
 def _validate_ray_inputs(
@@ -286,7 +286,7 @@ def contains_points(
     if n == 0:
         return wp.empty(0, dtype=wp.bool, device=points.device)
     mesh_min, mesh_max = aabb_bounds(mesh.points)
-    max_dist = mesh_query_max_dist(mesh.points)
+    max_dist = default_mesh_query_max_dist(mesh.points)
     out_contains = wp.empty(n, dtype=wp.bool, device=points.device)
     wp.launch(
         kernel_proximity.contains_points_sign_parity,
