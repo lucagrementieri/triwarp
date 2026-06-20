@@ -206,3 +206,23 @@ def test_edges_length_empty(device: str) -> None:
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
     verts_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
     assert tw.edges.edges_length(verts_wp, faces_wp).shape == (0,)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+def test_mean_edge_length(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+
+    verts_np = mesh_tm.vertices.astype(np.float64)
+    tri = verts_np[mesh_tm.faces]
+    avg_edge_np = float(np.linalg.norm(tri - tri[:, [1, 2, 0]], axis=2).mean())
+
+    vertices_wp = _vertices_np_to_wp(mesh_tm.vertices, mesh_wp.device)
+    avg_edge_wp = tw.edges.mean_edge_length(vertices_wp, mesh_wp.indices)
+
+    assert np.allclose(avg_edge_wp, avg_edge_np, rtol=1e-4, atol=1e-4)
+
+
+def test_mean_edge_length_empty(device: str) -> None:
+    faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
+    verts_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    assert tw.edges.mean_edge_length(verts_wp, faces_wp) == 0.0

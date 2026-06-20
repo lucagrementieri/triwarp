@@ -250,3 +250,31 @@ def edges_length(
     out = wp.empty(n, dtype=wp.float32, device=device)
     wp.launch(kernel_edges.edge_lengths, dim=n, inputs=[vertices, edges_in, out], device=device)
     return out
+
+
+def mean_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> float:
+    """
+    Mean length of all per-face triangle edges (libigl ``getAverageEdge``).
+
+    Averages the three edges of every face (``3 * n_faces`` directed edges from
+    :func:`faces_to_edges`), matching the per-face edge mean used to scale the
+    sphere-search radius in :func:`triwarp.curvature.principal_curvature`.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` face index buffer.
+
+    Returns
+    -------
+    float
+        Mean edge length over all ``3 * n_faces`` per-face edges. ``0.0`` when
+        ``n_faces == 0``.
+    """
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return 0.0
+    lengths = edges_length(vertices, faces)
+    return tw.reduce.sum(lengths) / float(lengths.shape[0])
