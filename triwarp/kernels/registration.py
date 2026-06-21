@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.constants import TILE_1D
-from triwarp.kernels.reduce import sum1d_tile, weighted_sum_vec3_tile
+from triwarp.kernels.reduce import cross_outer_sum_tile, sum1d_tile, weighted_sum_vec3_tile
 
 
 @wp.func
@@ -21,32 +21,6 @@ def weighted_centered_dot_tile(
         v = values[offset + k] - center
         result += (weights[offset + k] / w_sum) * wp.dot(v, v)
     return result
-
-
-@wp.func
-def masked_outer_product_sum_tile(
-    a: wp.array[wp.vec3],
-    b: wp.array[wp.vec3],
-    weights: wp.array[wp.float32],
-    a_center: wp.vec3,
-    b_center: wp.vec3,
-    offset: int,
-    remaining: int,
-) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
-    count = remaining
-    if count > TILE_1D:
-        count = TILE_1D
-    row0 = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    row1 = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    row2 = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    for k in range(count):
-        if weights[offset + k] > wp.float32(0.0):
-            ac = a[offset + k] - a_center
-            bc = b[offset + k] - b_center
-            row0 = row0 + bc[0] * ac
-            row1 = row1 + bc[1] * ac
-            row2 = row2 + bc[2] * ac
-    return row0, row1, row2
 
 
 @wp.kernel
@@ -86,9 +60,7 @@ def accumulate_scale_and_cov(
     use_translation: bool,
     out_a_scale_sq: wp.array[wp.float32],
     out_b_scale_sq: wp.array[wp.float32],
-    out_cov_row0: wp.array[wp.vec3],
-    out_cov_row1: wp.array[wp.vec3],
-    out_cov_row2: wp.array[wp.vec3],
+    out_cov: wp.array[wp.mat33],
 ) -> None:
     i, t = wp.tid()
     n = weights.shape[0]
@@ -106,17 +78,13 @@ def accumulate_scale_and_cov(
 
     tile_a_sq = weighted_centered_dot_tile(a, weights, acenter, ws, offset, remaining)
     tile_b_sq = weighted_centered_dot_tile(b, weights, bcenter, ws, offset, remaining)
-    # Cross-covariance: target[row, col] = sum_k mask_k * bc[k,row] * ac[k,col]
-    tile_row0, tile_row1, tile_row2 = masked_outer_product_sum_tile(
-        a, b, weights, acenter, bcenter, offset, remaining
-    )
+    # Cross-covariance: H[row, col] = sum_k mask_k * bc[k, row] * ac[k, col]
+    tile_cov = cross_outer_sum_tile(a, b, weights, acenter, bcenter, offset, remaining)
 
     if t == 0:
         wp.atomic_add(out_a_scale_sq, 0, tile_a_sq)
         wp.atomic_add(out_b_scale_sq, 0, tile_b_sq)
-        wp.atomic_add(out_cov_row0, 0, tile_row0)
-        wp.atomic_add(out_cov_row1, 0, tile_row1)
-        wp.atomic_add(out_cov_row2, 0, tile_row2)
+        wp.atomic_add(out_cov, 0, tile_cov)
 
 
 @wp.kernel
@@ -126,9 +94,7 @@ def build_procrustes_matrix(
     b_center_raw: wp.array[wp.vec3],
     a_scale_sq: wp.array[wp.float32],
     b_scale_sq: wp.array[wp.float32],
-    cov_row0: wp.array[wp.vec3],
-    cov_row1: wp.array[wp.vec3],
-    cov_row2: wp.array[wp.vec3],
+    cov: wp.array[wp.mat33],
     use_reflection: bool,
     use_translation: bool,
     use_scale: bool,
@@ -148,12 +114,9 @@ def build_procrustes_matrix(
         ascale = wp.sqrt(a_scale_sq[0])
         bscale = wp.sqrt(b_scale_sq[0])
 
-    # Normalise cross-covariance rows by scale product
+    # Normalise cross-covariance by scale product
     inv_scales = wp.float32(1.0) / (bscale * ascale)
-    row0 = cov_row0[0] * inv_scales
-    row1 = cov_row1[0] * inv_scales
-    row2 = cov_row2[0] * inv_scales
-    target = wp.matrix_from_rows(row0, row1, row2)
+    target = cov[0] * inv_scales
 
     U = wp.mat33(wp.float32(0.0))
     sigma = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))

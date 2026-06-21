@@ -634,6 +634,18 @@ def weighted_sum1d_tile(
 
 
 @wp.func
+def sum_vec3_tile(values: wp.array[wp.vec3], offset: int, remaining: int) -> wp.vec3:
+    if remaining >= TILE_1D:
+        tile = wp.tile_load(values, shape=TILE_1D, offset=offset, storage="register")
+        return wp.tile_sum(tile)[0]
+
+    tile_sum = values[offset]
+    for k in range(1, remaining):
+        tile_sum += values[offset + k]
+    return tile_sum
+
+
+@wp.func
 def weighted_sum_vec3_tile(
     values: wp.array[wp.vec3], weights: wp.array[wp.float32], offset: int, remaining: int
 ) -> wp.vec3:
@@ -660,6 +672,76 @@ def weighted_sum1d_tiled(
         return
 
     tile_sum = weighted_sum1d_tile(values, weights, offset, remaining)
+
+    if t == 0:
+        wp.atomic_add(out_sum, 0, tile_sum)
+
+
+@wp.func
+def outer_sum_tile(
+    points: wp.array[wp.vec3], center: wp.vec3, offset: int, remaining: int
+) -> wp.mat33:
+    count = remaining
+    if count > TILE_1D:
+        count = TILE_1D
+    # M = sum_k outer(x_k, x_k) where x_k = points[k] - center
+    m = wp.mat33(0.0)
+    for k in range(count):
+        x = points[offset + k] - center
+        m += wp.outer(x, x)
+    return m
+
+
+@wp.func
+def cross_outer_sum_tile(
+    a: wp.array[wp.vec3],
+    b: wp.array[wp.vec3],
+    weights: wp.array[wp.float32],
+    a_center: wp.vec3,
+    b_center: wp.vec3,
+    offset: int,
+    remaining: int,
+) -> wp.mat33:
+    count = remaining
+    if count > TILE_1D:
+        count = TILE_1D
+    # masked cross-covariance H = sum_{k: w_k > 0} outer(b_k - b_center, a_k - a_center)
+    m = wp.mat33(0.0)
+    for k in range(count):
+        if weights[offset + k] > wp.float32(0.0):
+            ac = a[offset + k] - a_center
+            bc = b[offset + k] - b_center
+            m += wp.outer(bc, ac)
+    return m
+
+
+@wp.kernel
+def sum_vec3_1d_tiled(values: wp.array[wp.vec3], out_sum: wp.array[wp.vec3]) -> None:
+    i, t = wp.tid()
+    n = values.shape[0]
+    offset = i * TILE_1D
+    remaining = n - offset
+    if remaining <= 0:
+        return
+
+    tile_sum = sum_vec3_tile(values, offset, remaining)
+
+    if t == 0:
+        wp.atomic_add(out_sum, 0, tile_sum)
+
+
+@wp.kernel
+def weighted_sum_vec3_1d_tiled(
+    values: wp.array[wp.vec3], weights: wp.array[wp.float32], out_sum: wp.array[wp.vec3]
+) -> None:
+    i, t = wp.tid()
+    n = values.shape[0]
+    offset = i * TILE_1D
+    remaining = n - offset
+    if remaining <= 0:
+        return
+
+    tile_sum = weighted_sum_vec3_tile(values, weights, offset, remaining)
 
     if t == 0:
         wp.atomic_add(out_sum, 0, tile_sum)

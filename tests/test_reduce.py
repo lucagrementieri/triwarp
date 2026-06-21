@@ -458,3 +458,72 @@ def test_mean_1d_axis_raises(device: str) -> None:
     values_wp = wp.array([1, 2, 3], dtype=wp.int32, device=device)
     with pytest.raises(ValueError, match="requires axis=None for a 1D array"):
         tw_reduce.mean(values_wp, axis=0)
+
+
+def test_mean_vec3_1d(device: str) -> None:
+    rng = np.random.default_rng(20)
+    values_np = rng.standard_normal((300, 3)).astype(np.float32)
+    values_wp = wp.array(values_np, dtype=wp.vec3, device=device)
+    mean_wp = tw_reduce.mean(values_wp)
+    assert np.allclose(np.array(mean_wp), values_np.mean(axis=0), rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("n", [63, 64, 65, 197])
+def test_mean_vec3_partial_tiles(device: str, n: int) -> None:
+    rng = np.random.default_rng(n)
+    values_np = rng.standard_normal((n, 3)).astype(np.float32)
+    values_wp = wp.array(values_np, dtype=wp.vec3, device=device)
+    mean_wp = tw_reduce.mean(values_wp)
+    assert np.allclose(np.array(mean_wp), values_np.mean(axis=0), rtol=1e-4, atol=1e-4)
+
+
+def test_mean_vec3_axis_raises(device: str) -> None:
+    values_wp = wp.zeros(4, dtype=wp.vec3, device=device)
+    with pytest.raises(ValueError, match="axis"):
+        tw_reduce.mean(values_wp, axis=0)
+
+
+def test_mean_vec3_empty_raises(device: str) -> None:
+    values_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    with pytest.raises(ValueError, match="non-empty"):
+        tw_reduce.mean(values_wp)
+
+
+def test_sum_vec3_1d(device: str) -> None:
+    rng = np.random.default_rng(20)
+    values_np = rng.standard_normal((300, 3)).astype(np.float32)
+    values_wp = wp.array(values_np, dtype=wp.vec3, device=device)
+    sum_wp = tw_reduce.sum(values_wp)
+    assert np.allclose(np.array(sum_wp), values_np.sum(axis=0), rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("n", [63, 64, 65, 197])
+def test_sum_vec3_partial_tiles(device: str, n: int) -> None:
+    rng = np.random.default_rng(n)
+    values_np = rng.standard_normal((n, 3)).astype(np.float32)
+    values_wp = wp.array(values_np, dtype=wp.vec3, device=device)
+    sum_wp = tw_reduce.sum(values_wp)
+    assert np.allclose(np.array(sum_wp), values_np.sum(axis=0), rtol=1e-4, atol=1e-4)
+
+
+def test_sum_vec3_axis_raises(device: str) -> None:
+    values_wp = wp.zeros(4, dtype=wp.vec3, device=device)
+    with pytest.raises(ValueError, match="axis"):
+        tw_reduce.sum(values_wp, axis=0)
+
+
+def test_sum_vec3_empty_raises(device: str) -> None:
+    values_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    with pytest.raises(ValueError, match="non-empty"):
+        tw_reduce.sum(values_wp)
+
+
+def test_weighted_sum_vec3_1d(device: str) -> None:
+    rng = np.random.default_rng(21)
+    values_np = rng.standard_normal((300, 3)).astype(np.float32)
+    weights_np = rng.random(300, dtype=np.float32)
+    values_wp = wp.array(values_np, dtype=wp.vec3, device=device)
+    weights_wp = wp.array(weights_np, dtype=wp.float32, device=device)
+    sum_wp = tw_reduce.weighted_sum(values_wp, weights_wp)
+    exp_np = (weights_np[:, None] * values_np).sum(axis=0)
+    assert np.allclose(np.array(sum_wp), exp_np, rtol=1e-4, atol=1e-4)

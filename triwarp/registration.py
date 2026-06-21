@@ -94,9 +94,7 @@ def procrustes(
     # --- Phase 1b: weighted scale^2 and cross-covariance ---
     a_scale_sq = wp.zeros(1, dtype=wp.float32, device=device)
     b_scale_sq = wp.zeros(1, dtype=wp.float32, device=device)
-    cov_row0 = wp.zeros(1, dtype=wp.vec3, device=device)
-    cov_row1 = wp.zeros(1, dtype=wp.vec3, device=device)
-    cov_row2 = wp.zeros(1, dtype=wp.vec3, device=device)
+    cov = wp.zeros(1, dtype=wp.mat33, device=device)
     wp.launch_tiled(
         kernel_registration.accumulate_scale_and_cov,
         dim=[n_tiles],
@@ -110,9 +108,7 @@ def procrustes(
             translation,
             a_scale_sq,
             b_scale_sq,
-            cov_row0,
-            cov_row1,
-            cov_row2,
+            cov,
         ],
         block_dim=TILE_1D,
         device=device,
@@ -129,9 +125,7 @@ def procrustes(
             b_sum,
             a_scale_sq,
             b_scale_sq,
-            cov_row0,
-            cov_row1,
-            cov_row2,
+            cov,
             reflection,
             translation,
             scale,

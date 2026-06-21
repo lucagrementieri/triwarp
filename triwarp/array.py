@@ -9,7 +9,9 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels import reduce as kernel_reduce
 
 # Use a direct-index membership table when max(value)+1 is at most this multiple of |test_elements|.
 _ISIN_MASK_SIZE_FACTOR = 8
@@ -461,3 +463,117 @@ def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3]) -> wp.array[wp.floa
     out_angles = wp.empty(n, dtype=wp.float32, device=device)
     wp.launch(kernel_array.vector_angle, dim=n, inputs=[a, b, out_angles], device=device)
     return out_angles
+
+
+def gram_matrix(points: wp.array[wp.vec3]) -> wp.array[wp.mat33]:
+    """
+    Uncentered Gram (scatter) matrix ``G = sum_k outer(x_k, x_k)``.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` positions in space as ``wp.vec3``.
+
+    Returns
+    -------
+    wp.array[wp.mat33]
+        Shape ``(1,)`` device array holding the ``3x3`` Gram matrix on
+        ``points.device``. All-zeros when ``points`` is empty.
+    """
+    device = points.device
+    n = int(points.shape[0])
+    out = wp.zeros(1, dtype=wp.mat33, device=device)
+    if n == 0:
+        return out
+    n_tiles = (n + TILE_1D - 1) // TILE_1D
+    wp.launch_tiled(
+        kernel_array.gram_matrix,
+        dim=[n_tiles],
+        inputs=[points, out],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    return out
+
+
+def centered_covariance(
+    points: wp.array[wp.vec3], center: wp.array[wp.vec3] | None = None
+) -> wp.array[wp.mat33]:
+    """
+    Centered scatter matrix ``C = sum_k outer(x_k - mu, x_k - mu)`` (no ``1/n``).
+
+    Centering happens inside the outer-product loop (rather than via the
+    ``sum(x x^T) - n mu mu^T`` identity) to avoid float32 catastrophic
+    cancellation.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` positions in space as ``wp.vec3``.
+    center
+        Optional precomputed centroid as a ``(1,)`` ``wp.vec3`` device array.
+        When ``None`` it is computed on-device as ``sum(points) / n``.
+
+    Returns
+    -------
+    wp.array[wp.mat33]
+        Shape ``(1,)`` device array holding the centered ``3x3`` scatter matrix
+        on ``points.device``. All-zeros when ``points`` is empty.
+    """
+    device = points.device
+    n = int(points.shape[0])
+    out = wp.zeros(1, dtype=wp.mat33, device=device)
+    if n == 0:
+        return out
+    n_tiles = (n + TILE_1D - 1) // TILE_1D
+    if center is None:
+        center = wp.zeros(1, dtype=wp.vec3, device=device)
+        wp.launch_tiled(
+            kernel_reduce.sum_vec3_1d_tiled,
+            dim=[n_tiles],
+            inputs=[points, center],
+            block_dim=TILE_1D,
+            device=device,
+        )
+        wp.launch(kernel_array.divide, dim=1, inputs=[center, wp.float32(n)], device=device)
+    wp.launch_tiled(
+        kernel_array.centered_covariance,
+        dim=[n_tiles],
+        inputs=[points, center, out],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    return out
+
+
+def covariance(points: wp.array[wp.vec3], ddof: int = 1) -> wp.array[wp.mat33]:
+    """
+    Sample covariance matrix ``(1 / (n - ddof)) sum_k outer(x_k - mu, x_k - mu)``.
+
+    Matches ``numpy.cov(points.T, ddof=ddof)`` for the default ``ddof=1``.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` positions in space as ``wp.vec3``.
+    ddof
+        Delta degrees of freedom; the divisor is ``n - ddof``. Defaults to ``1``.
+
+    Returns
+    -------
+    wp.array[wp.mat33]
+        Shape ``(1,)`` device array holding the ``3x3`` covariance matrix on
+        ``points.device``.
+
+    Raises
+    ------
+    ValueError
+        If ``n - ddof <= 0``.
+    """
+    device = points.device
+    n = int(points.shape[0])
+    if n - ddof <= 0:
+        raise ValueError(f"covariance requires n > ddof, got n={n}, ddof={ddof}")
+    out = centered_covariance(points)
+    wp.launch(kernel_array.divide, dim=1, inputs=[out, wp.float32(n - ddof)], device=device)
+    return out

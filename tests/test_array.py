@@ -227,3 +227,53 @@ def test_vector_angle_empty(device: str) -> None:
     vecs_b_wp = wp.empty(0, dtype=wp.vec3, device=device)
     angles_wp = tw.array.vector_angle(vecs_a_wp, vecs_b_wp)
     assert angles_wp.shape == (0,)
+
+
+def test_gram_matrix(device: str) -> None:
+    # 200 = 3 * 64 + 8 exercises the multi-tile reduction and remainder path.
+    rng = np.random.default_rng(10)
+    points_np = rng.standard_normal((200, 3)).astype(np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    gram_np = points_np.T @ points_np
+    assert np.allclose(tw.array.gram_matrix(points_wp).numpy()[0], gram_np, rtol=1e-4, atol=1e-4)
+
+
+def test_gram_matrix_empty(device: str) -> None:
+    points_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    assert np.allclose(tw.array.gram_matrix(points_wp).numpy()[0], np.zeros((3, 3)))
+
+
+def test_centered_covariance(device: str) -> None:
+    rng = np.random.default_rng(11)
+    points_np = rng.standard_normal((200, 3)).astype(np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    centered_np = points_np - points_np.mean(axis=0)
+    scatter_np = centered_np.T @ centered_np
+    cov_wp = tw.array.centered_covariance(points_wp)
+    assert np.allclose(cov_wp.numpy()[0], scatter_np, rtol=1e-4, atol=1e-4)
+
+
+def test_centered_covariance_precomputed_center(device: str) -> None:
+    rng = np.random.default_rng(12)
+    points_np = rng.standard_normal((150, 3)).astype(np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    mean_np = points_np.mean(axis=0)
+    center_wp = wp.array(mean_np.reshape(1, 3).astype(np.float32), dtype=wp.vec3, device=device)
+    centered_np = points_np - mean_np
+    scatter_np = centered_np.T @ centered_np
+    cov_wp = tw.array.centered_covariance(points_wp, center=center_wp)
+    assert np.allclose(cov_wp.numpy()[0], scatter_np, rtol=1e-4, atol=1e-4)
+
+
+def test_covariance(device: str) -> None:
+    rng = np.random.default_rng(13)
+    points_np = rng.standard_normal((200, 3)).astype(np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    cov_np = np.cov(points_np.T, ddof=1)
+    assert np.allclose(tw.array.covariance(points_wp).numpy()[0], cov_np, rtol=1e-4, atol=1e-4)
+
+
+def test_covariance_too_few_points_raises(device: str) -> None:
+    points_wp = wp.zeros(1, dtype=wp.vec3, device=device)
+    with pytest.raises(ValueError, match="ddof"):
+        tw.array.covariance(points_wp)

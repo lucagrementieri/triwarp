@@ -177,6 +177,8 @@ def any(array: wp.array[wp.bool], *, axis: Literal[0, 1] | None = None) -> wp.ar
 
 
 @overload
+def sum(array: wp.array[wp.vec3], *, axis: None = ...) -> wp.vec3: ...
+@overload
 def sum(array: twt.Array1dInt32 | twt.Array2dInt32, *, axis: None = ...) -> int: ...
 @overload
 def sum(array: twt.Array1dFloat32 | twt.Array2dFloat32, *, axis: None = ...) -> float: ...
@@ -187,8 +189,10 @@ def sum(array: wp.array[wp.bool], *, axis: None = ...) -> int: ...
 @overload
 def sum(array: wp.array[wp.bool], *, axis: Literal[0, 1]) -> twt.Array1dInt32: ...
 def sum(
-    array: twt.ScalarArray | wp.array[wp.bool], *, axis: Literal[0, 1] | None = None
-) -> float | int | twt.Array1dScalar | twt.Array1dInt32:
+    array: twt.ScalarArray | wp.array[wp.bool] | wp.array[wp.vec3],
+    *,
+    axis: Literal[0, 1] | None = None,
+) -> float | int | twt.Array1dScalar | twt.Array1dInt32 | wp.vec3:
     """
     Sum of ``array``.
 
@@ -222,6 +226,24 @@ def sum(
         If ``array`` is empty, its rank is not 1 or 2, or ``axis`` is not
         ``None`` for a rank-1 input.
     """
+    if array.dtype == wp.vec3:
+        if axis is not None:
+            raise ValueError("sum over a vec3 array supports only axis=None.")
+        if array.ndim != 1:
+            raise ValueError("sum over a vec3 array requires a 1D array.")
+        n = int(array.shape[0])
+        if n == 0:
+            raise ValueError("sum requires a non-empty array.")
+        out_vec = wp.zeros(1, dtype=wp.vec3, device=array.device)
+        n_tiles = (n + TILE_1D - 1) // TILE_1D
+        wp.launch_tiled(
+            kernel_reduce.sum_vec3_1d_tiled,
+            dim=[n_tiles],
+            inputs=[array, out_vec],
+            block_dim=TILE_1D,
+            device=array.device,
+        )
+        return wp.vec3(*out_vec.numpy()[0].tolist())
     if array.dtype == wp.bool:
         mask = cast(wp.array[wp.bool], array)
         mask_i32 = _bool_mask_as_int32(mask)
@@ -238,14 +260,18 @@ def sum(
 
 
 @overload
+def mean(array: wp.array[wp.vec3], *, axis: None = ...) -> wp.vec3: ...
+@overload
 def mean(array: twt.ScalarArray | wp.array[wp.bool], *, axis: None = ...) -> float: ...
 @overload
 def mean(
     array: twt.Array2dScalar | wp.array[wp.bool], *, axis: Literal[0, 1]
 ) -> twt.Array1dFloat32: ...
 def mean(
-    array: twt.ScalarArray | wp.array[wp.bool], *, axis: Literal[0, 1] | None = None
-) -> float | twt.Array1dFloat32:
+    array: twt.ScalarArray | wp.array[wp.bool] | wp.array[wp.vec3],
+    *,
+    axis: Literal[0, 1] | None = None,
+) -> float | twt.Array1dFloat32 | wp.vec3:
     """
     Arithmetic mean of ``array``.
 
@@ -254,29 +280,33 @@ def mean(
     ``axis=0`` or ``axis=1`` on a rank-2 input, returns a 1D ``wp.float32`` array.
 
     The result is always floating point regardless of input dtype. For ``wp.bool``
-    input, the mean is the fraction of ``True`` values.
+    input, the mean is the fraction of ``True`` values. For a 1D ``wp.vec3`` input
+    the mean is the component-wise average ``wp.vec3`` (``axis=None`` only).
 
     Parameters
     ----------
     array
-        Rank-1 ``(n,)`` or rank-2 ``(n, m)`` scalar or ``wp.bool`` Warp array.
-        Must be non-empty.
+        Rank-1 ``(n,)`` or rank-2 ``(n, m)`` scalar or ``wp.bool`` Warp array, or
+        a rank-1 ``(n,)`` ``wp.vec3`` array. Must be non-empty.
     axis
         ``None`` for a global scalar result. ``0`` or ``1`` for a per-axis 1D
         result (rank-2 input only).
 
     Returns
     -------
-    float | wp.array
-        Global ``float`` when ``axis=None``; 1D ``wp.float32`` array of length
-        ``n`` (``axis=1``) or ``m`` (``axis=0``) otherwise.
+    float | wp.vec3 | wp.array
+        Global ``float`` (scalar/``wp.bool`` input) or ``wp.vec3`` (``wp.vec3``
+        input) when ``axis=None``; 1D ``wp.float32`` array of length ``n``
+        (``axis=1``) or ``m`` (``axis=0``) otherwise.
 
     Raises
     ------
     ValueError
         If ``array`` is empty, its rank is not 1 or 2, or ``axis`` is not
-        ``None`` for a rank-1 input.
+        ``None`` for a rank-1 (or ``wp.vec3``) input.
     """
+    if array.dtype == wp.vec3:
+        return cast(wp.vec3, sum(array, axis=axis)) / float(int(array.size))
     total = sum(array, axis=axis)
     if axis is None:
         return float(total) / float(int(array.size))
@@ -292,19 +322,28 @@ def mean(
     return cast(twt.Array1dFloat32, out)
 
 
-def weighted_sum(values: twt.Array1dFloat32, weights: twt.Array1dFloat32) -> float:
+@overload
+def weighted_sum(values: twt.Array1dFloat32, weights: twt.Array1dFloat32) -> float: ...
+@overload
+def weighted_sum(values: wp.array[wp.vec3], weights: twt.Array1dFloat32) -> wp.vec3: ...
+def weighted_sum(
+    values: twt.Array1dFloat32 | wp.array[wp.vec3], weights: twt.Array1dFloat32
+) -> float | wp.vec3:
     """
-    Weighted sum ``sum_i values[i] * weights[i]``.
+    Weighted sum ``sum_i weights[i] * values[i]``.
 
     Parameters
     ----------
-    values, weights
-        Rank-1 ``(n,)`` ``wp.float32`` arrays of equal length. Must be non-empty.
+    values
+        Rank-1 ``(n,)`` ``wp.float32`` or ``wp.vec3`` array. Must be non-empty.
+    weights
+        Rank-1 ``(n,)`` ``wp.float32`` array of the same length as ``values``.
 
     Returns
     -------
-    float
-        Scalar weighted sum on the host.
+    float | wp.vec3
+        Scalar weighted sum on the host (``float`` for scalar ``values``,
+        ``wp.vec3`` for ``wp.vec3`` ``values``).
 
     Raises
     ------
@@ -318,8 +357,19 @@ def weighted_sum(values: twt.Array1dFloat32, weights: twt.Array1dFloat32) -> flo
     if n_values != n_weights:
         raise ValueError("weighted_sum requires values and weights of equal length.")
 
-    out = wp.zeros(1, dtype=wp.float32, device=values.device)
     n_tiles = (n_values + TILE_1D - 1) // TILE_1D
+    if values.dtype == wp.vec3:
+        out_vec = wp.zeros(1, dtype=wp.vec3, device=values.device)
+        wp.launch_tiled(
+            kernel_reduce.weighted_sum_vec3_1d_tiled,
+            dim=[n_tiles],
+            inputs=[values, weights, out_vec],
+            block_dim=TILE_1D,
+            device=values.device,
+        )
+        return wp.vec3(*out_vec.numpy()[0].tolist())
+
+    out = wp.zeros(1, dtype=wp.float32, device=values.device)
     wp.launch_tiled(
         kernel_reduce.weighted_sum1d_tiled,
         dim=[n_tiles],
