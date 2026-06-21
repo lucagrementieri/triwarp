@@ -197,3 +197,19 @@ Tests may use `import triwarp.typing as twt` for annotations (e.g. `expected: tw
 ## 8. Device Checks
 
 **Do not check that input arrays share the same device.** Warp raises a clear error automatically when mismatched devices are used in `wp.launch` or array operations, so manual `if arr.device != device: raise ValueError(...)` guards are redundant. Omit them entirely.
+
+---
+
+## 9. Warp API Reference
+
+Authoritative Warp function lists are mirrored locally under `reference/warp_api/`:
+
+| File | Scope |
+|------|-------|
+| `reference/warp_api/builtins.md` | Built-in functions usable inside `@wp.kernel` / `@wp.func` (`wp.<name>`) |
+| `reference/warp_api/warp.md` | `warp` module API at Python scope (`wp.<name>`) |
+| `reference/warp_api/sparse.md` | `warp.sparse` BSR/CSR matrix API |
+| `reference/warp_api/utils.md` | `warp.utils` Python-scope utilities |
+| `reference/warp_api/fem_linalg.md` | `warp.fem.linalg` linear-algebra utilities |
+
+BEFORE using an unfamiliar Warp builtin, sparse, or utils function, `grep` these files to confirm the exact name, signature, and scope rather than guessing. Each file lists its source URL (Warp 1.14.0) at the top — fetch it for full argument details or examples when the one-line description is insufficient.
