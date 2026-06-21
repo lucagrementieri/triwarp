@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TypeVar
 
 import warp as wp
 import warp.sparse as wps
@@ -12,6 +13,8 @@ import triwarp.typing as twt
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import reduce as kernel_reduce
+
+DType = TypeVar("DType")
 
 # Use a direct-index membership table when max(value)+1 is at most this multiple of |test_elements|.
 _ISIN_MASK_SIZE_FACTOR = 8
@@ -422,6 +425,38 @@ def flatnonzero(mask: wp.array[wp.bool]) -> wp.array[wp.int32]:
         device=device,
     )
     return out_indices
+
+
+def gather(src: wp.array[DType], indices: wp.array[wp.int32]) -> wp.array[DType]:
+    """
+    Dense copy of ``src`` gathered along its first axis by ``indices`` (``numpy.take``).
+
+    Warp's ``src[indices]`` fancy indexing yields a :class:`warp.indexedarray` view; this
+    materializes a contiguous :class:`warp.array` (performing the copy) so callers get a real
+    array supporting ``.reshape`` and a stable return type. Works for rank-1 sources
+    (``src[indices]``) and rank-2 row gather (``src[indices, :]``), with any scalar or vector
+    ``dtype``.
+
+    Parameters
+    ----------
+    src
+        Rank-1 or rank-2 ``wp.array`` on the target device.
+    indices
+        1D ``wp.int32`` array of indices into the first axis of ``src``, on the same device.
+
+    Returns
+    -------
+    wp.array
+        Contiguous gathered copy on ``src.device`` with shape
+        ``(len(indices), *src.shape[1:])`` and the same ``dtype`` as ``src``. Empty along the
+        first axis when ``indices`` is empty.
+    """
+    k = int(indices.shape[0])
+    out_shape = (k, *(int(dim) for dim in src.shape[1:]))
+    out = wp.empty(out_shape, dtype=src.dtype, device=src.device)
+    if k > 0:
+        wp.copy(out, src[indices])
+    return out
 
 
 def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3]) -> wp.array[wp.float32]:

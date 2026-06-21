@@ -2,6 +2,7 @@
 
 from . import (
     array,
+    boundary,
     convex,
     curvature,
     edges,
@@ -23,6 +24,7 @@ from . import (
 
 __all__ = [
     "array",
+    "boundary",
     "convex",
     "curvature",
     "edges",

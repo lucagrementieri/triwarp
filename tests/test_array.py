@@ -205,6 +205,50 @@ def test_flatnonzero_empty(device: str) -> None:
     assert indices_wp.shape == (0,)
 
 
+def test_gather_1d(device: str) -> None:
+    rng = np.random.default_rng(5)
+    values_np = rng.integers(0, 1000, size=32, dtype=np.int32)
+    indices_np = rng.integers(0, 32, size=10, dtype=np.int32)
+
+    values_wp = wp.array(values_np, dtype=wp.int32, device=device)
+    indices_wp = wp.array(indices_np, dtype=wp.int32, device=device)
+    gathered_wp = tw.array.gather(values_wp, indices_wp)
+
+    assert np.array_equal(gathered_wp.numpy(), values_np[indices_np])
+
+
+def test_gather_2d_rows(device: str) -> None:
+    rng = np.random.default_rng(6)
+    rows_np = rng.integers(0, 1000, size=(20, 2), dtype=np.int32)
+    indices_np = rng.integers(0, 20, size=7, dtype=np.int32)
+
+    rows_wp = wp.array(rows_np, dtype=wp.int32, device=device)
+    indices_wp = wp.array(indices_np, dtype=wp.int32, device=device)
+    gathered_wp = tw.array.gather(rows_wp, indices_wp)
+
+    assert gathered_wp.shape == (7, 2)
+    assert np.array_equal(gathered_wp.numpy(), rows_np[indices_np])
+
+
+def test_gather_vec3(device: str) -> None:
+    rng = np.random.default_rng(7)
+    points_np = rng.standard_normal((16, 3)).astype(np.float32)
+    indices_np = rng.integers(0, 16, size=5, dtype=np.int32)
+
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    indices_wp = wp.array(indices_np, dtype=wp.int32, device=device)
+    gathered_wp = tw.array.gather(points_wp, indices_wp)
+
+    assert np.array_equal(gathered_wp.numpy(), points_np[indices_np])
+
+
+def test_gather_empty_indices(device: str) -> None:
+    rows_wp = wp.array(np.zeros((4, 2), dtype=np.int32), dtype=wp.int32, device=device)
+    indices_wp = wp.empty(0, dtype=wp.int32, device=device)
+    gathered_wp = tw.array.gather(rows_wp, indices_wp)
+    assert gathered_wp.shape == (0, 2)
+
+
 def test_vector_angle(device: str) -> None:
     rng = np.random.default_rng(42)
     n = 64

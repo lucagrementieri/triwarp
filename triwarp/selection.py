@@ -10,18 +10,6 @@ import triwarp as tw
 from triwarp.array import init_range
 
 
-def _gather_faces(
-    faces: wp.array[wp.int32], face_indices: wp.array[wp.int32]
-) -> wp.array[wp.int32]:
-    k = int(face_indices.shape[0])
-    if k == 0:
-        return wp.empty(0, dtype=wp.int32, device=faces.device)
-    gathered = faces.reshape((-1, 3))[face_indices]
-    out = wp.empty((k, 3), dtype=wp.int32, device=faces.device)
-    wp.copy(out, gathered)
-    return out.reshape((-1,))
-
-
 def submesh_from_face_indices(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -80,14 +68,14 @@ def submesh_from_face_indices(
     else:
         unique_face_indices, face_slots = tw.unique.unique_1d(face_indices, return_inverse=True)
 
-    unique_faces = _gather_faces(faces, unique_face_indices)
+    unique_faces = tw.array.gather(faces.reshape((-1, 3)), unique_face_indices).reshape((-1,))
 
     unique_vertex_indices, remapped_faces = tw.unique.unique_1d(unique_faces, return_inverse=True)
     n_unique = int(unique_vertex_indices.shape[0])
     sub_vertices = wp.empty(n_unique, dtype=wp.vec3, device=device)
     wp.copy(sub_vertices, vertices[unique_vertex_indices])
 
-    sub_faces = _gather_faces(remapped_faces, face_slots)
+    sub_faces = tw.array.gather(remapped_faces.reshape((-1, 3)), face_slots).reshape((-1,))
 
     return sub_vertices, sub_faces
 
@@ -121,7 +109,6 @@ def submesh_from_face_mask(
     --------
     :func:`submesh_from_face_indices`
     """
-    device = vertices.device
     face_indices = tw.array.flatnonzero(face_mask)
     return submesh_from_face_indices(vertices, faces, face_indices, unique_indices=True)
 
@@ -159,7 +146,6 @@ def submesh_from_vertex_indices(
     :func:`submesh_from_vertex_mask`
     :func:`submesh_from_face_indices`
     """
-    device = vertices.device
     face_indices = face_indices_from_vertex_indices(faces, vertex_indices, face_mode=face_mode)
     return submesh_from_face_indices(vertices, faces, face_indices, unique_indices=True)
 
@@ -200,7 +186,6 @@ def submesh_from_vertex_mask(
     :func:`submesh_from_vertex_indices`
     """
     n_vertices = int(vertices.shape[0])
-    device = vertices.device
     if int(vertex_mask.shape[0]) != n_vertices:
         raise ValueError(
             f"vertex_mask length must equal n_vertices={n_vertices}, got {vertex_mask.shape[0]}"
