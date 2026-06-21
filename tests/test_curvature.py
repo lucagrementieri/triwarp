@@ -121,7 +121,7 @@ def test_geodesic_ball_neighborhoods_overflow_warns() -> None:
 
 
 def test_principal_curvature(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    """Curvature values against libigl reference on an icosahedron."""
+    """Curvature values against libigl reference on an icosahedron (frame-dependent path)."""
     mesh_tm, mesh_wp = icosahedron
 
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
@@ -130,7 +130,10 @@ def test_principal_curvature(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
 
     vertices_wp = wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=mesh_wp.device)
     faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
-    _, _, pv1_wp, pv2_wp = tw.curvature.principal_curvature(vertices_wp, faces_wp)
+    # frame_independent=False reproduces igl::principal_curvature's symmetrized shape operator.
+    _, _, pv1_wp, pv2_wp = tw.curvature.principal_curvature(
+        vertices_wp, faces_wp, frame_independent=False
+    )
 
     assert np.allclose(pv1_wp.numpy(), pv1_igl, atol=1e-3, rtol=1e-3)
     assert np.allclose(pv2_wp.numpy(), pv2_igl, atol=1e-3, rtol=1e-3)
@@ -148,7 +151,10 @@ def test_principal_curvature_half_torus(half_torus: tuple[tm.Trimesh, wp.Mesh]) 
 
     vertices_wp = wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=mesh_wp.device)
     faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
-    pd1_wp, pd2_wp, pv1_wp, pv2_wp = tw.curvature.principal_curvature(vertices_wp, faces_wp)
+    # frame_independent=False reproduces igl::principal_curvature's symmetrized shape operator.
+    pd1_wp, pd2_wp, pv1_wp, pv2_wp = tw.curvature.principal_curvature(
+        vertices_wp, faces_wp, frame_independent=False
+    )
 
     # Exclude vertices igl marked bad (degenerate) and umbilics where PV1 ~ PV2 (dirs undefined)
     bad = np.array(bad_igl, dtype=np.int32)
@@ -167,6 +173,51 @@ def test_principal_curvature_half_torus(half_torus: tuple[tm.Trimesh, wp.Mesh]) 
     pd2_dot = np.abs(np.einsum("ij,ij->i", pd2_wp.numpy()[mask], pd2_igl[mask]))
     assert np.allclose(pd1_dot, 1.0, atol=1e-1)
     assert np.allclose(pd2_dot, 1.0, atol=1e-1)
+
+
+def test_principal_curvature_frame_independent(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """The default frame-independent Weingarten map stays similar to the libigl reference.
+
+    ``frame_independent=True`` solves the true generalized eigenproblem (a surface invariant)
+    rather than libigl's frame-dependent symmetrized operator. The two formulations share the
+    trace of the shape operator, so the mean curvature ``(PV1 + PV2) / 2`` is preserved exactly;
+    only the eigenvalue *spread* differs, and only appreciably at high-anisotropy vertices where
+    ``PV1 - PV2`` is large. The bulk of vertices therefore stay close to libigl.
+    """
+    mesh_tm, mesh_wp = half_torus
+
+    vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
+    faces_np = np.array(mesh_tm.faces, dtype=np.int32)
+    _, _, pv1_igl, pv2_igl, bad_igl = igl.principal_curvature(
+        vertices_np, faces_np, useKring=False
+    )
+
+    vertices_wp = wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=mesh_wp.device)
+    faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
+    # Default (frame_independent=True): true Weingarten map, independent of the tangent frame.
+    _, _, pv1_wp, pv2_wp = tw.curvature.principal_curvature(vertices_wp, faces_wp)
+    pv1_indep = pv1_wp.numpy()
+    pv2_indep = pv2_wp.numpy()
+
+    # Same masking as the frame-dependent test: drop degenerate and umbilic vertices.
+    bad = np.array(bad_igl, dtype=np.int32)
+    gap = np.abs(pv1_igl - pv2_igl)
+    mask = np.ones(len(pv1_igl), dtype=bool)
+    if len(bad) > 0:
+        mask[bad] = False
+    mask[gap < 1e-2] = False
+
+    # Mean curvature (the shared trace invariant) must match libigl tightly.
+    mean_indep = 0.5 * (pv1_indep + pv2_indep)
+    mean_igl = 0.5 * (pv1_igl + pv2_igl)
+    assert np.allclose(mean_indep[mask], mean_igl[mask], atol=5e-2, rtol=5e-2)
+
+    # The principal values themselves stay close for the vast majority of vertices; genuine
+    # divergence is confined to the few highest-anisotropy vertices.
+    within_pv1 = np.abs(pv1_indep[mask] - pv1_igl[mask]) <= 5e-2 + 5e-2 * np.abs(pv1_igl[mask])
+    within_pv2 = np.abs(pv2_indep[mask] - pv2_igl[mask]) <= 5e-2 + 5e-2 * np.abs(pv2_igl[mask])
+    assert within_pv1.mean() > 0.95
+    assert within_pv2.mean() > 0.95
 
 
 def test_discrete_gaussian_curvature(hemisphere: tuple[tm.Trimesh, wp.Mesh]):

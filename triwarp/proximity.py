@@ -874,8 +874,10 @@ def query_geodesic_ball(
 
     Also returns the per-vertex reference neighbor used to build the tangent frame: the
     lowest-indexed edge neighbor, matching libigl's ``adjacency_list[i][0]``. libigl's symmetrized
-    shape operator is frame-dependent, so reproducing its principal values requires this exact
-    frame. Isolated vertices reference themselves.
+    shape operator is frame-dependent, so reproducing its principal values
+    (:func:`triwarp.curvature.principal_curvature` with ``frame_independent=False``) requires this
+    exact frame; the default frame-independent computation does not depend on it. Isolated vertices
+    reference themselves.
 
     The traversal runs entirely on device. Vertex adjacency is built as a CSR graph via
     :func:`triwarp.edges.edges_unique` + :func:`triwarp.graph.edges_to_csr`, then a two-pass BFS

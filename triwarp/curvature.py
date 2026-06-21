@@ -8,15 +8,19 @@ from triwarp.vertices import area_weighted_vertex_normals, vertex_defects
 
 
 def principal_curvature(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], radius: int = 5
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    radius: int = 5,
+    *,
+    frame_independent: bool = True,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.float32], wp.array[wp.float32]]:
     """
     Principal curvature directions and magnitudes per vertex via quadric fitting.
 
     For each vertex a quadric surface is fitted to a sphere-neighborhood of vertices in the
     local tangent frame. The principal curvatures and directions are extracted from the
-    eigendecomposition of the resulting shape operator. This matches ``igl.principal_curvature``
-    with sphere-search neighborhood of radius ``radius * avg_edge_length``.
+    eigendecomposition of the resulting shape operator (Weingarten map), built over a
+    sphere-search neighborhood of radius ``radius * avg_edge_length``.
 
     Parameters
     ----------
@@ -27,6 +31,13 @@ def principal_curvature(
     radius
         Neighborhood size multiplier applied to the average edge length. Larger values
         collect more neighbors and produce smoother curvature estimates.
+    frame_independent
+        When ``True`` (default), the principal curvatures are the eigenvalues of the true
+        (textbook) Weingarten map ``II*v = lam*I*v``; these are surface invariants and do not
+        depend on the chosen tangent frame. When ``False``, the symmetrized shape operator of
+        ``igl::principal_curvature`` is reproduced verbatim (frame-dependent), matching
+        ``igl.principal_curvature`` exactly. The two agree closely on well-sampled smooth
+        surfaces; they differ only in the off-diagonal of the shape operator.
 
     Returns
     -------
@@ -71,6 +82,7 @@ def principal_curvature(
             neighbor_indices,
             offsets,
             reference_neighbors,
+            frame_independent,
             pd1,
             pd2,
             pv1,

@@ -82,7 +82,14 @@ def _solve_normal_equations(ata: mat55d, atb: vec5d) -> tuple[vec5d, wp.bool]:
 
 @wp.func
 def _eigvec_sym2(m00: wp.float32, m01: wp.float32, lam: wp.float32, fallback: wp.vec2) -> wp.vec2:
-    """Return the unit eigenvector of [[m00, m01], [m01, *]] for eigenvalue lam, in (t1, t2)."""
+    """
+    Return the unit eigenvector of a 2x2 matrix ``[[m00, m01], [m10, m11]]`` for eigenvalue ``lam``,
+    expressed in the (t1, t2) tangent-frame basis.
+
+    Uses the first-row form ``v ~ [m01, lam - m00]``, which is valid for any 2x2 (symmetric or the
+    non-symmetric Weingarten map) since it depends only on the top row. ``fallback`` is returned when
+    that row is degenerate (near-diagonal matrix).
+    """
     v = wp.vec2(m01, lam - m00)
     if wp.length(v) < wp.float32(1e-14):
         return fallback
@@ -91,24 +98,26 @@ def _eigvec_sym2(m00: wp.float32, m01: wp.float32, lam: wp.float32, fallback: wp
 
 @wp.func
 def _principal_curvatures_from_monge(
-    first_form: wp.vec3, second_form: wp.vec3
+    first_form: wp.vec3, second_form: wp.vec3, frame_independent: wp.bool
 ) -> tuple[wp.float32, wp.float32, wp.vec2, wp.vec2]:
     """
-    Reproduce ``igl::principal_curvature``'s ``finalEigenStuff`` from the fundamental forms.
+    Extract principal curvatures and directions from the fundamental forms (Monge patch).
 
     Takes the first fundamental form ``first_form = (E, F, G)`` and second fundamental form
-    ``second_form = (L, M, N)``: the shape operator is built as a *symmetric* 2x2 matrix and its
-    (real) eigenvalues are the principal curvatures.
+    ``second_form = (L, M, N)`` and builds the shape operator (Weingarten map) as a 2x2 matrix whose
+    (real) eigenvalues are the principal curvatures. The two formulations share ``m00``, ``m10`` and
+    ``m11`` and differ only in the upper-right entry:
 
-    libigl does not solve the true generalized eigenvalue problem ``II*v = lam*I*v`` (whose
-    Weingarten map has unequal off-diagonals ``G*M - N*F`` and ``E*M - L*F``). Instead it forms
+        m = [[L*G - M*F,  m01      ],
+             [M*E - L*F,  N*E - M*F]] / (E*G - F*F)
 
-        m = [[L*G - M*F, M*E - L*F],
-             [M*E - L*F, N*E - M*F]] / (E*G - F*F)
-
-    forcing symmetry by reusing ``M*E - L*F`` for both off-diagonals. This keeps the trace (mean
-    curvature) exact but alters the determinant (and therefore the eigenvalue spread), so matching
-    libigl requires replicating this formulation verbatim rather than the textbook one.
+    * ``frame_independent=True`` (textbook): ``m01 = (M*G - N*F) / (E*G - F*F)`` — the true
+      generalized eigenvalue problem ``II*v = lam*I*v``. The eigenvalues are surface invariants and
+      do not depend on the chosen tangent frame.
+    * ``frame_independent=False``: ``m01 = M*E - L*F`` (reuses the lower-left term), reproducing
+      ``igl::principal_curvature``'s ``finalEigenStuff`` verbatim. libigl forces this symmetry, which
+      keeps the trace (mean curvature) exact but alters the determinant (eigenvalue spread) and makes
+      the result depend on the reference frame.
 
     Returns (lam0, lam1, ev0, ev1) where lam0 <= lam1 are eigenvalues of ``m``. The caller negates
     them (libigl's ``c_val = -c_val``). The eigenvectors ev0, ev1 are unit ``wp.vec2`` in the
@@ -123,13 +132,20 @@ def _principal_curvatures_from_monge(
 
     inv_denom = wp.float32(1.0) / (e_ff * g_ff - f_ff * f_ff)
     m00 = (l_ff * g_ff - m_ff * f_ff) * inv_denom
-    m01 = (m_ff * e_ff - l_ff * f_ff) * inv_denom
+    m10 = (m_ff * e_ff - l_ff * f_ff) * inv_denom
     m11 = (n_ff * e_ff - m_ff * f_ff) * inv_denom
+    # Upper-right entry: the textbook Weingarten map uses (M*G - N*F); libigl forces symmetry by
+    # reusing the lower-left (M*E - L*F), which is what makes its eigenvalues frame-dependent.
+    if frame_independent:
+        m01 = (m_ff * g_ff - n_ff * f_ff) * inv_denom
+    else:
+        m01 = m10
 
-    # Eigenvalues of the symmetric 2x2 matrix [[m00, m01], [m01, m11]] (ascending).
+    # Eigenvalues of [[m00, m01], [m10, m11]] (ascending). The discriminant argument is
+    # mathematically >= 0 for the Weingarten map; wp.max guards numerical dips near umbilics.
     half_trace = (m00 + m11) * wp.float32(0.5)
     half_diff = (m00 - m11) * wp.float32(0.5)
-    disc = wp.sqrt(half_diff * half_diff + m01 * m01)
+    disc = wp.sqrt(wp.max(half_diff * half_diff + m01 * m10, wp.float32(0.0)))
     lam0 = half_trace - disc
     lam1 = half_trace + disc
 
@@ -152,6 +168,7 @@ def fit_principal_curvature(
     neighbor_indices: wp.array[wp.int32],
     offsets: wp.array[wp.int32],
     reference_neighbors: wp.array[wp.int32],
+    frame_independent: wp.bool,
     out_pd1: wp.array[wp.vec3],
     out_pd2: wp.array[wp.vec3],
     out_pv1: wp.array[wp.float32],
@@ -188,9 +205,11 @@ def fit_principal_curvature(
     normal = wp.normalize(vertex_normals[i])
 
     # Build the tangent frame from the lowest-indexed mesh-adjacency neighbor, matching libigl's
-    # computeReferenceFrame (adjacency_list[i][0]). libigl extracts curvature from a *symmetrized*
-    # shape operator whose eigenvalues depend on the chosen frame, so the principal values only
-    # agree with igl::principal_curvature when this exact reference direction is used.
+    # computeReferenceFrame (adjacency_list[i][0]). When frame_independent is False, libigl extracts
+    # curvature from a *symmetrized* shape operator whose eigenvalues depend on the chosen frame, so
+    # the principal values only agree with igl::principal_curvature when this exact reference
+    # direction is used. When frame_independent is True the eigenvalues are surface invariants, so
+    # the exact frame is irrelevant (any orthonormal tangent basis yields the same result).
     ref = int(reference_neighbors[i])
     t1, t2 = _build_reference_frame(vertex, normal, vertices[ref])
 
@@ -271,7 +290,9 @@ def fit_principal_curvature(
 
     first_form = wp.vec3(E_ff, F_ff, G_ff)
     second_form = wp.vec3(L_ff, M_ff, N_ff)
-    lam0, lam1, ev0, ev1 = _principal_curvatures_from_monge(first_form, second_form)
+    lam0, lam1, ev0, ev1 = _principal_curvatures_from_monge(
+        first_form, second_form, frame_independent
+    )
 
     # Negate: the Monge patch height function curves downward for convex surfaces,
     # giving negative eigenvalues; convention is positive curvature for convex.
