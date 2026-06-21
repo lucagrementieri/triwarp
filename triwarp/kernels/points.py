@@ -14,6 +14,21 @@ def point_plane_distance(
 
 
 @wp.kernel
+def radial_sort_key(
+    points: wp.array[wp.vec3],
+    origin: wp.vec3,
+    axis0: wp.vec3,
+    axis1: wp.vec3,
+    out_keys: wp.array[wp.float32],
+) -> None:
+    tid = wp.tid()
+    v = points[tid] - origin
+    # Negated angle: an ascending radix sort of these keys reproduces trimesh's
+    # descending-angle order (`angles.argsort()[::-1]`).
+    out_keys[tid] = -wp.atan2(wp.dot(v, axis0), wp.dot(v, axis1))
+
+
+@wp.kernel
 def finalize_fit_line(
     m: wp.array[wp.mat33],
     out_axis: wp.array[wp.vec3],

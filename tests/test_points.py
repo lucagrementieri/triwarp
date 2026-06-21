@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import trimesh.points as tm
 import warp as wp
 
@@ -106,3 +107,73 @@ def test_point_plane_distance_no_origin(device: str) -> None:
     distances_wp = tw.point_plane_distance(points_wp, wp.vec3(*plane_normal_np.tolist()))
 
     assert np.allclose(distances_wp.numpy(), distances_tm, rtol=1e-5, atol=1e-5)
+
+
+def test_radial_sort(device: str) -> None:
+    rng = np.random.default_rng(7)
+    n = 256
+    # evenly spaced angles so the radial order is unambiguous and float32 cannot
+    # flip the order of neighboring points relative to the float64 reference.
+    theta_np = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    radius_np = rng.uniform(0.1, 2.0, n)
+    points_np = np.column_stack(
+        (np.cos(theta_np) * radius_np, np.sin(theta_np) * radius_np, np.zeros(n))
+    )
+    points_np = points_np[rng.permutation(n)]
+    origin_np = np.array([0.0, 0.0, 0.0])
+    normal_np = np.array([0.0, 0.0, 1.0])
+
+    ordered_tm = tm.radial_sort(points_np, origin=origin_np, normal=normal_np)
+
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    ordered_wp = tw.radial_sort(
+        points_wp, wp.vec3(*origin_np.tolist()), wp.vec3(*normal_np.tolist())
+    )
+
+    assert np.allclose(ordered_wp.numpy(), ordered_tm, rtol=1e-5, atol=1e-5)
+
+
+def test_radial_sort_with_start(device: str) -> None:
+    rng = np.random.default_rng(8)
+    n = 256
+    theta_np = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    radius_np = rng.uniform(0.1, 2.0, n)
+    points_np = np.column_stack(
+        (np.cos(theta_np) * radius_np, np.sin(theta_np) * radius_np, np.zeros(n))
+    )
+    points_np = points_np[rng.permutation(n)]
+    origin_np = np.array([0.0, 0.0, 0.0])
+    normal_np = np.array([0.0, 0.0, 1.0])
+    start_np = np.array([1.0, 0.0, 0.0])
+
+    ordered_tm = tm.radial_sort(points_np, origin=origin_np, normal=normal_np, start=start_np)
+
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    ordered_wp = tw.radial_sort(
+        points_wp,
+        wp.vec3(*origin_np.tolist()),
+        wp.vec3(*normal_np.tolist()),
+        start=wp.vec3(*start_np.tolist()),
+    )
+
+    assert np.allclose(ordered_wp.numpy(), ordered_tm, rtol=1e-5, atol=1e-5)
+
+
+def test_radial_sort_parallel_start_raises(device: str) -> None:
+    points_np = np.zeros((4, 3))
+    origin_np = np.array([0.0, 0.0, 0.0])
+    normal_np = np.array([0.0, 0.0, 1.0])
+    # start parallel to normal is invalid.
+    start_np = np.array([0.0, 0.0, 2.0])
+
+    with pytest.raises(ValueError, match=r"must not.*parallel"):
+        tm.radial_sort(points_np, origin=origin_np, normal=normal_np, start=start_np)
+
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    with pytest.raises(ValueError, match=r"must not.*parallel"):
+        tw.radial_sort(
+            points_wp,
+            wp.vec3(*origin_np.tolist()),
+            wp.vec3(*normal_np.tolist()),
+            start=wp.vec3(*start_np.tolist()),
+        )

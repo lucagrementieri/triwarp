@@ -1,7 +1,7 @@
 import warp as wp
 
 import triwarp as tw
-from triwarp.constants import TILE_1D
+from triwarp.constants import TILE_1D, TOLERANCE_ZERO
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import points as kernel_points
 from triwarp.kernels import reduce as kernel_reduce
@@ -160,3 +160,80 @@ def fit_plane(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
         wp.vec3(*out_centroid.numpy()[0].tolist()),
         wp.vec3(*out_normal.numpy()[0].tolist()),
     )
+
+
+def radial_sort(
+    points: wp.array[wp.vec3],
+    origin: wp.vec3,
+    normal: wp.vec3,
+    start: wp.vec3 | None = None,
+) -> wp.array[wp.vec3]:
+    """
+    Sort points radially (by angle) around an axis and return them reordered.
+
+    Points are projected onto two axes perpendicular to ``normal`` and ordered by
+    the angle ``atan2`` of the projection, in **descending** order (matching
+    :func:`trimesh.points.radial_sort`).
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` positions in space as ``wp.vec3``.
+    origin
+        Point to sort around as ``wp.vec3``.
+    normal
+        Axis to sort around as ``wp.vec3``.
+    start
+        Optional ``wp.vec3`` specifying the start position in counter-clockwise
+        order when viewed along ``normal``. Must not be parallel with ``normal``.
+        When ``None``, an arbitrary perpendicular axis is used.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        Length ``n`` array of the input points reordered by descending angle, on
+        ``points.device``. Empty when ``points`` is empty.
+
+    Raises
+    ------
+    ValueError
+        If ``start`` is provided and is (near-)parallel with ``normal``.
+    """
+    device = points.device
+    n = int(points.shape[0])
+    if n == 0:
+        return wp.empty(0, dtype=wp.vec3, device=device)
+
+    # Build two axes perpendicular to each other and the normal, onto which the
+    # points are projected to recover an angle. Done on the host since the axes
+    # are a single O(1) setup shared by every point.
+    if start is None:
+        axis0 = wp.vec3(normal[0], normal[2], -normal[1])
+        axis1 = wp.cross(normal, axis0)
+    else:
+        unit_normal = wp.normalize(normal)
+        unit_start = wp.normalize(start)
+        if abs(1.0 - abs(wp.dot(unit_normal, unit_start))) < TOLERANCE_ZERO:
+            raise ValueError("start must not be parallel with normal")
+        axis0 = wp.cross(unit_start, unit_normal)
+        axis1 = wp.cross(axis0, unit_normal)
+
+    out_keys = wp.empty(n, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_points.radial_sort_key,
+        dim=n,
+        inputs=[points, origin, axis0, axis1, out_keys],
+        device=device,
+    )
+
+    # Ascending radix sort of the negated angles yields the descending-angle order.
+    keys_buf = wp.empty(2 * n, dtype=wp.float32, device=device)
+    wp.copy(keys_buf, out_keys, count=n)
+    order_buf = tw.array.init_sort_pair_indices(n, n, device)
+    wp.utils.radix_sort_pairs(keys_buf, order_buf, count=n)
+
+    order = wp.empty(n, dtype=wp.int32, device=device)
+    wp.copy(order, order_buf, count=n)
+    out = wp.empty(n, dtype=wp.vec3, device=device)
+    wp.copy(out, points[order])
+    return out
