@@ -102,6 +102,83 @@ def test_sample_surface_poisson_disk_count_zero(icosahedron: tuple[tm.Trimesh, w
     assert face_indices.shape == (0,)
 
 
+def test_sample_surface_poisson_disk_high_init_factor(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    """Exercise the GPU top-k branch when local maxima exceed excess."""
+    _, mesh_wp = icosahedron
+    count = 20
+    pts, fids = tw.sample.sample_surface_poisson_disk(
+        mesh_wp.points, mesh_wp.indices, count, init_factor=20.0, seed=3
+    )
+    assert pts.shape == (count,)
+    assert fids.shape == (count,)
+
+
+def _blue_noise_radius_for_count(surface_area: float, n: int) -> float:
+    return math.sqrt((surface_area * 0.5 / (n * 0.6162910373)) / math.pi)
+
+
+def test_sample_surface_blue_noise_min_distance(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = icosahedron
+    radius = _blue_noise_radius_for_count(float(mesh_tm.area), 80)
+    points, _ = tw.sample.sample_surface_blue_noise(
+        mesh_wp.points, mesh_wp.indices, radius, seed=2
+    )
+    points_np = points.numpy().reshape(-1, 3)
+    if points_np.shape[0] >= 2:
+        min_dist = float(pdist(points_np).min())
+        assert min_dist >= radius * 0.99
+
+
+def test_sample_surface_blue_noise_on_surface(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = icosahedron
+    radius = _blue_noise_radius_for_count(float(mesh_tm.area), 50)
+    pts, _ = tw.sample.sample_surface_blue_noise(mesh_wp.points, mesh_wp.indices, radius, seed=1)
+    _, dists, _ = tm.proximity.closest_point(mesh_tm, pts.numpy())
+    assert np.all(dists < 1e-4)
+
+
+def test_sample_surface_blue_noise_deterministic(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    _, mesh_wp = icosahedron
+    radius = _blue_noise_radius_for_count(1.0, 30)
+    points_a, face_indices_a = tw.sample.sample_surface_blue_noise(
+        mesh_wp.points, mesh_wp.indices, radius, seed=7
+    )
+    points_b, face_indices_b = tw.sample.sample_surface_blue_noise(
+        mesh_wp.points, mesh_wp.indices, radius, seed=7
+    )
+    assert np.array_equal(points_a.numpy(), points_b.numpy())
+    assert np.array_equal(face_indices_a.numpy(), face_indices_b.numpy())
+
+
+def test_sample_surface_blue_noise_count_order_of_magnitude(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = icosahedron
+    surface_area = float(mesh_tm.area)
+    expected = 50
+    radius = _blue_noise_radius_for_count(surface_area, expected)
+    points, _ = tw.sample.sample_surface_blue_noise(
+        mesh_wp.points, mesh_wp.indices, radius, seed=0
+    )
+    n = int(points.shape[0])
+    igl_expected = surface_area * (math.pi * math.sqrt(3.0) / 6.0) / (math.pi * radius * radius / 4.0)
+    assert 0.5 * igl_expected <= n <= 1.5 * igl_expected
+
+
+def test_sample_surface_blue_noise_radius_invalid(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    _, mesh_wp = icosahedron
+    with pytest.raises(ValueError, match="radius"):
+        tw.sample.sample_surface_blue_noise(mesh_wp.points, mesh_wp.indices, 0.0)
+
+
+def test_sample_surface_blue_noise_empty_faces(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_wp = icosahedron[1]
+    empty_faces = wp.empty(0, dtype=wp.int32, device=mesh_wp.points.device)
+    points, face_indices = tw.sample.sample_surface_blue_noise(
+        mesh_wp.points, empty_faces, 0.1, seed=0
+    )
+    assert points.shape == (0,)
+    assert face_indices.shape == (0,)
+
+
 def test_sample_volume_containment(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = icosahedron
     count = 5_000

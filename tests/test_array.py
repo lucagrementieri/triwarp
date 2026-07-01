@@ -68,6 +68,27 @@ def test_append_empty(device: str) -> None:
     assert np.array_equal(out_wp.numpy(), np.array([5], dtype=np.int32))
 
 
+def test_concatenate(device: str) -> None:
+    parts = [
+        wp.array([0, 3], dtype=wp.int32, device=device),
+        wp.array([], dtype=wp.int32, device=device),
+        wp.array([7, 12], dtype=wp.int32, device=device),
+    ]
+    out_wp = tw.array.concatenate(parts)
+    assert np.array_equal(out_wp.numpy(), np.array([0, 3, 7, 12], dtype=np.int32))
+
+
+def test_concatenate_single_returns_input(device: str) -> None:
+    arr_wp = wp.array([1, 2], dtype=wp.int32, device=device)
+    out_wp = tw.array.concatenate([arr_wp])
+    assert out_wp is arr_wp
+
+
+def test_concatenate_empty_segments(device: str) -> None:
+    out_wp = tw.array.concatenate([wp.empty(0, dtype=wp.int32, device=device)])
+    assert out_wp.shape == (0,)
+
+
 def test_pack_1d_wp_arrays(device: str):
     parts = [
         wp.array([1, 2, 3], dtype=wp.int32, device=device),

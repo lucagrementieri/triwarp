@@ -201,6 +201,61 @@ def pack_1d_arrays(
     return flat, wp.array(offsets, dtype=wp.int32, device=device)
 
 
+def concatenate(arrays: Sequence[wp.array[DType]]) -> wp.array[DType]:
+    """
+    Concatenate 1-D :class:`warp.array` instances in order (``numpy.concatenate``).
+
+    Parameters
+    ----------
+    arrays
+        Non-empty sequence of rank-1 arrays sharing the same ``dtype`` and ``device``.
+        Empty segments are allowed.
+
+    Returns
+    -------
+    wp.array
+        Contiguous 1-D array of length ``sum(a.size for a in arrays)`` on the input
+        device. When ``arrays`` has a single element, that array is returned without
+        copying.
+
+    Raises
+    ------
+    ValueError
+        If ``arrays`` is empty, any input is not rank-1, or ``dtype`` / ``device`` differ.
+    """
+    if len(arrays) == 0:
+        raise ValueError("arrays must be non-empty")
+    if len(arrays) == 1:
+        arr = arrays[0]
+        if int(arr.ndim) != 1:
+            raise ValueError(f"concatenate requires rank-1 arrays, got ndim={arr.ndim}")
+        return arr
+
+    dtype = arrays[0].dtype
+    device = arrays[0].device
+    total = 0
+    for i, arr in enumerate(arrays):
+        if int(arr.ndim) != 1:
+            raise ValueError(f"concatenate requires rank-1 arrays, got ndim={arr.ndim} at index {i}")
+        if arr.dtype != dtype:
+            raise ValueError(
+                f"all arrays must have the same dtype, got {dtype} and {arr.dtype} at index {i}"
+            )
+        total += int(arr.shape[0])
+
+    if total == 0:
+        return wp.empty(0, dtype=dtype, device=device)
+
+    out = wp.empty(total, dtype=dtype, device=device)
+    dest = 0
+    for arr in arrays:
+        n = int(arr.shape[0])
+        if n > 0:
+            wp.copy(out, arr, dest_offset=dest, count=n)
+            dest += n
+    return out
+
+
 def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
     n = data.size
     data_buffer = wp.empty(n * 2, dtype=data.dtype, device=data.device)
