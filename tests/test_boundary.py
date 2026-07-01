@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import pytest
 import trimesh as tm
@@ -14,21 +15,6 @@ import triwarp as tw
 OPEN_MESHES = ["hemisphere", "half_torus"]
 
 
-def _lexsort_rows(rows: np.ndarray) -> np.ndarray:
-    """Sort ``(n, 2)`` rows lexicographically (rows kept intact) for set comparison."""
-    order = np.lexsort((rows[:, 1], rows[:, 0]))
-    return rows[order]
-
-
-def _boundary_indices_tm(mesh_tm: tm.Trimesh) -> np.ndarray:
-    return tm_grouping.group_rows(mesh_tm.edges_sorted, require_count=1)
-
-
-# ---------------------------------------------------------------------------
-# boundary_edges
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
 def test_boundary_edges(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
@@ -39,11 +25,6 @@ def test_boundary_edges(request: pytest.FixtureRequest, mesh_name: str) -> None:
     assert np.array_equal(
         _lexsort_rows(boundary_edges_wp.numpy()), _lexsort_rows(boundary_edges_tm)
     )
-
-
-# ---------------------------------------------------------------------------
-# oriented_boundary_edges
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
@@ -59,11 +40,6 @@ def test_oriented_boundary_edges(request: pytest.FixtureRequest, mesh_name: str)
     )
 
 
-# ---------------------------------------------------------------------------
-# boundary_vertex_indices
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
 def test_boundary_vertex_indices(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
@@ -75,11 +51,6 @@ def test_boundary_vertex_indices(request: pytest.FixtureRequest, mesh_name: str)
     assert np.array_equal(vertex_indices_wp.numpy(), vertex_indices_tm)
 
 
-# ---------------------------------------------------------------------------
-# boundary_vertices
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
 def test_boundary_vertices(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
@@ -89,11 +60,6 @@ def test_boundary_vertices(request: pytest.FixtureRequest, mesh_name: str) -> No
     vertices_wp = tw.boundary.boundary_vertices(mesh_wp.points, mesh_wp.indices)
 
     assert np.allclose(vertices_wp.numpy(), vertices_tm, rtol=1e-4, atol=1e-4)
-
-
-# ---------------------------------------------------------------------------
-# precomputed edges fast path
-# ---------------------------------------------------------------------------
 
 
 def test_boundary_precomputed_edges(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
@@ -126,11 +92,6 @@ def test_boundary_precomputed_edges(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> N
     assert np.array_equal(indices_default.numpy(), indices_precomputed.numpy())
 
 
-# ---------------------------------------------------------------------------
-# edge cases
-# ---------------------------------------------------------------------------
-
-
 def test_boundary_watertight(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _, mesh_wp = icosahedron
     assert tw.boundary.boundary_edges(mesh_wp.points, mesh_wp.indices).shape == (0, 2)
@@ -147,3 +108,49 @@ def test_boundary_empty(device: str) -> None:
     assert tw.boundary.oriented_boundary_edges(vertices_wp, faces_wp).shape == (0, 2)
     assert tw.boundary.boundary_vertex_indices(vertices_wp, faces_wp).shape == (0,)
     assert tw.boundary.boundary_vertices(vertices_wp, faces_wp).shape == (0,)
+
+
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+def test_boundary_loops(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+
+    loops_igl = igl.boundary_loop_all(mesh_tm.faces.astype(np.int64))
+    loops_wp = tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices)
+
+    assert len(loops_wp) == len(loops_igl)
+    for loop_wp, loop_igl in zip(loops_wp, loops_igl, strict=True):
+        assert np.array_equal(loop_wp.numpy(), np.asarray(loop_igl))
+
+
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+def test_boundary_loop(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+
+    loop_igl = igl.boundary_loop(mesh_tm.faces.astype(np.int64))
+    loop_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
+
+    assert np.array_equal(loop_wp.numpy(), loop_igl)
+
+
+def test_boundary_loops_watertight(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _, mesh_wp = icosahedron
+    assert tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices) == []
+    assert tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices).shape == (0,)
+
+
+def test_boundary_loops_empty(device: str) -> None:
+    vertices_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
+
+    assert tw.boundary.boundary_loops(vertices_wp, faces_wp) == []
+    assert tw.boundary.boundary_loop(vertices_wp, faces_wp).shape == (0,)
+
+
+def _lexsort_rows(rows: np.ndarray) -> np.ndarray:
+    """Sort ``(n, 2)`` rows lexicographically (rows kept intact) for set comparison."""
+    order = np.lexsort((rows[:, 1], rows[:, 0]))
+    return rows[order]
+
+
+def _boundary_indices_tm(mesh_tm: tm.Trimesh) -> np.ndarray:
+    return tm_grouping.group_rows(mesh_tm.edges_sorted, require_count=1)

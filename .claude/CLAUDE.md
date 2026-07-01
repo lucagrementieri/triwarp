@@ -113,6 +113,14 @@ All new geometry functions MUST have regression tests that compare against the `
 - Name variables with a suffix for the library: `_np` for NumPy/SciPy, `_tm` for Trimesh, `_wp` for Warp. Avoid `got` / `exp` but use instead clear names.
 - When passing a NumPy 1D vector to a `wp.vec3` scalar argument at Python scope, use `wp.vec3(*array_np.tolist())` — not `wp.vec3(*map(float, np.asanyarray(...).reshape(3)))`.
 
+### Fallback reference: libigl Python bindings
+
+When `trimesh` has no equivalent function, use the `igl` Python package (bindings for the C++
+reference mirrored under `reference/libigl/`) as the CPU reference instead — import as
+`import igl`, name reference variables with an `_igl` suffix. Pass triwarp's flat face buffer
+as `mesh_tm.faces` (`(n_faces, 3)` int array) to the igl function. Otherwise follow the same
+comparison conventions (`np.array_equal`/`np.allclose`, inline `.numpy()`).
+
 ### Mesh fixtures (prefer over inline construction)
 
 Reuse shared mesh fixtures from `tests/conftest.py` instead of building meshes in each test. Fixtures return `(mesh_tm: tm.Trimesh, mesh_wp: wp.Mesh)` via `tests.conversions.trimesh_to_warp`.
