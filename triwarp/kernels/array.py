@@ -42,6 +42,21 @@ def divide(array: wp.array[Any], n: wp.float32) -> None:
 
 
 @wp.kernel
+def divide_arrays(array: wp.array[Any], divisor: wp.array[wp.Scalar]) -> None:
+    # Generic element-wise division by a per-element scalar divisor.
+    i = int(wp.tid())
+    array[i] = array[i] / divisor[i]
+
+
+@wp.kernel
+def divide_arrays_if_positive(array: wp.array[Any], divisor: wp.array[wp.Scalar]) -> None:
+    # Like divide_arrays, but skips division when divisor[i] <= 0.
+    i = int(wp.tid())
+    if divisor[i] > 0.0:
+        array[i] = array[i] / divisor[i]
+
+
+@wp.kernel
 def init_range(out: wp.array[wp.Int]) -> None:
     i = int(wp.tid())
     out[i] = i
@@ -54,9 +69,7 @@ def init_range_step(out: wp.array[wp.Int], step: wp.Int) -> None:
 
 
 @wp.kernel
-def init_sort_pair_indices(
-    out: wp.array[wp.Int], n: wp.Int, fill_value: wp.Int
-) -> None:
+def init_sort_pair_indices(out: wp.array[wp.Int], n: wp.Int, fill_value: wp.Int) -> None:
     i = int(wp.tid())
     if i < n:
         out[i] = i
