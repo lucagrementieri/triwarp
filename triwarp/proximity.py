@@ -17,6 +17,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.constants import TILE_1D
 from triwarp.kernels import proximity as kernel_proximity
 from triwarp.triangles import face_normals_and_areas
 
@@ -1506,6 +1507,70 @@ def signed_distance_on_mesh(
         device=device,
     )
     return out_distance
+
+
+def winding_number(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    query_points: wp.array[wp.vec3],
+    *,
+    tiled: bool = False,
+) -> wp.array[wp.float32]:
+    """
+    Generalized winding number at each query point (``igl::winding_number``).
+
+    Sums the signed solid angle subtended by each oriented triangle. For a
+    closed, consistently oriented watertight mesh, interior points have
+    winding number near ``1`` and exterior points near ``0``.
+
+    Parameters
+    ----------
+    vertices
+        ``(n,)`` mesh vertex positions as ``wp.vec3``.
+    faces
+        ``(f * 3,)`` flat triangle index array as ``wp.int32``.
+    query_points
+        ``(m,)`` query positions in space as ``wp.vec3``.
+    tiled
+        When ``True``, sum solid angles with a per-query tiled reduction over
+        faces: each ``(query, face_tile)`` block assigns one face per lane via
+        ``wp.tile``, cooperatively reduces with ``wp.tile_sum``, and
+        accumulates via ``wp.tile_atomic_add``. When ``False``, each query thread
+        loops over all faces serially.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        ``(m,)`` winding numbers in ``float32``.
+    """
+    device = query_points.device
+    n_queries = int(query_points.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    if n_queries == 0:
+        return wp.empty(0, dtype=wp.float32, device=device)
+    if n_faces == 0:
+        return wp.zeros(n_queries, dtype=wp.float32, device=device)
+
+    out_winding = wp.zeros(n_queries, dtype=wp.float32, device=device) if tiled else wp.empty(
+        n_queries, dtype=wp.float32, device=device
+    )
+    if tiled:
+        n_face_tiles = (n_faces + TILE_1D - 1) // TILE_1D
+        wp.launch_tiled(
+            kernel_proximity.winding_number_tiled,
+            dim=[n_queries, n_face_tiles],
+            inputs=[vertices, faces, wp.int32(n_faces), query_points, out_winding],
+            block_dim=TILE_1D,
+            device=device,
+        )
+    else:
+        wp.launch(
+            kernel_proximity.winding_number,
+            dim=n_queries,
+            inputs=[vertices, faces, wp.int32(n_faces), query_points, out_winding],
+            device=device,
+        )
+    return out_winding
 
 
 def max_tangent_sphere(

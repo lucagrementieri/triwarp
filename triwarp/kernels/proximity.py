@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_PLANAR_CONSTANT
+from triwarp.constants import TILE_1D, TOLERANCE_MERGE_CONSTANT, TOLERANCE_PLANAR_CONSTANT
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels.algorithms import bfs as kernel_bfs
 
@@ -382,6 +382,44 @@ def closest_point_on_mesh(
 
 
 @wp.func
+def solid_angle(a: wp.vec3, b: wp.vec3, c: wp.vec3, p: wp.vec3) -> wp.float32:
+    """Signed solid angle subtended by triangle (a, b, c) at point p (``igl::solid_angle``)."""
+    v0 = a - p
+    v1 = b - p
+    v2 = c - p
+    vl0 = wp.length(v0)
+    vl1 = wp.length(v1)
+    vl2 = wp.length(v2)
+    detf = (
+        v0[0] * v1[1] * v2[2]
+        + v1[0] * v2[1] * v0[2]
+        + v2[0] * v0[1] * v1[2]
+        - v2[0] * v1[1] * v0[2]
+        - v1[0] * v0[1] * v2[2]
+        - v0[0] * v2[1] * v1[2]
+    )
+    dp0 = wp.dot(v1, v2)
+    dp1 = wp.dot(v2, v0)
+    dp2 = wp.dot(v0, v1)
+    denom = vl0 * vl1 * vl2 + dp0 * vl0 + dp1 * vl1 + dp2 * vl2
+    return wp.atan2(detf, denom) / (wp.float32(2.0) * wp.PI)
+
+
+@wp.func
+def solid_angle_at_face(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    f: int,
+    p: wp.vec3,
+) -> wp.float32:
+    face_indices = faces[f * 3 : (f + 1) * 3]
+    i0 = int(face_indices[0])
+    i1 = int(face_indices[1])
+    i2 = int(face_indices[2])
+    return solid_angle(vertices[i0], vertices[i1], vertices[i2], p)
+
+
+@wp.func
 def point_strictly_inside_aabb(p: wp.vec3, mesh_min: wp.vec3, mesh_max: wp.vec3) -> bool:
     return (
         p[0] > mesh_min[0]
@@ -436,6 +474,58 @@ def signed_distance_on_mesh(
         out_distance[tid] = dist
     else:
         out_distance[tid] = query.sign * dist
+
+
+@wp.kernel
+def winding_number(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    n_faces: wp.int32,
+    query_points: wp.array[wp.vec3],
+    out_winding: wp.array[wp.float32],
+) -> None:
+    q = int(wp.tid())
+    p = query_points[q]
+    w = wp.float32(0.0)
+    n_f = int(n_faces)
+    for f in range(n_f):
+        face_indices = faces[f * 3 : (f + 1) * 3]
+        i0 = int(face_indices[0])
+        i1 = int(face_indices[1])
+        i2 = int(face_indices[2])
+        w = w + solid_angle(vertices[i0], vertices[i1], vertices[i2], p)
+    out_winding[q] = w
+
+
+@wp.kernel
+def winding_number_tiled(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    n_faces: wp.int32,
+    query_points: wp.array[wp.vec3],
+    out_winding: wp.array[wp.float32],
+) -> None:
+    q, tile_i, t = wp.tid()
+    n_f = int(n_faces)
+    face_offset = int(tile_i) * TILE_1D
+    if face_offset >= n_f:
+        return
+
+    remaining = n_f - face_offset
+    count = remaining
+    if count > TILE_1D:
+        count = TILE_1D
+
+    p = query_points[int(q)]
+    face_idx = face_offset + int(t)
+    contrib = wp.float32(0.0)
+    if int(t) < count:
+        contrib = solid_angle_at_face(vertices, faces, face_idx, p)
+
+    tile = wp.tile(contrib)
+    tile_sum = wp.tile_sum(tile)
+    if t == 0:
+        wp.tile_atomic_add(out_winding, tile_sum, (int(q),))
 
 
 @wp.kernel

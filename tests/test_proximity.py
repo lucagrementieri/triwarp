@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 from typing import Literal
 
+import igl
 import numpy as np
 import pytest
 import trimesh as tm
@@ -529,6 +530,82 @@ def test_signed_distance_on_mesh_empty_faces(device: str) -> None:
     signed_wp = tw.proximity.signed_distance_on_mesh(vertices, faces, points)
     assert signed_wp.shape == (2,)
     assert np.all(np.isinf(signed_wp.numpy()))
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "hemisphere"])
+@pytest.mark.parametrize("tiled", [False, True])
+def test_winding_number_random(
+    request: pytest.FixtureRequest, mesh_name: str, tiled: bool
+) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    rng = np.random.default_rng(42)
+    query_np = rng.random((200, 3), dtype=np.float64) * 4.0 - 2.0
+    vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
+    faces_np = np.array(mesh_tm.faces, dtype=np.int64)
+
+    winding_igl = igl.winding_number(vertices_np, faces_np, query_np)
+    query_wp = wp.array(
+        np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    winding_wp = tw.proximity.winding_number(
+        mesh_wp.points, mesh_wp.indices, query_wp, tiled=tiled
+    )
+    assert np.allclose(winding_wp.numpy(), winding_igl.ravel(), rtol=1e-5, atol=1e-5)
+
+
+def test_winding_number_tiled_matches_exact(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    rng = np.random.default_rng(17)
+    query_np = rng.random((100, 3), dtype=np.float32) * 2.0 - 1.0
+    query_wp = wp.array(
+        np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    exact_wp = tw.proximity.winding_number(
+        mesh_wp.points, mesh_wp.indices, query_wp, tiled=False
+    )
+    tiled_wp = tw.proximity.winding_number(
+        mesh_wp.points, mesh_wp.indices, query_wp, tiled=True
+    )
+    assert np.allclose(tiled_wp.numpy(), exact_wp.numpy(), rtol=1e-6, atol=1e-6)
+
+
+def test_winding_number_inside_outside(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    outside_np = np.asarray([mesh_tm.bounds[0] + [100.0, 100.0, 100.0]], dtype=np.float32)
+    inside_np = np.asarray([mesh_tm.center_mass], dtype=np.float32)
+    outside_wp = wp.array(outside_np, dtype=wp.vec3, device=mesh_wp.device)
+    inside_wp = wp.array(inside_np, dtype=wp.vec3, device=mesh_wp.device)
+    outside_winding_wp = tw.proximity.winding_number(
+        mesh_wp.points, mesh_wp.indices, outside_wp
+    )
+    inside_winding_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, inside_wp)
+    assert np.allclose(outside_winding_wp.numpy(), 0.0, atol=1e-3)
+    assert np.allclose(inside_winding_wp.numpy(), 1.0, atol=1e-3)
+
+
+def test_winding_number_cave_cube_origin(cave_cube: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _, mesh_wp = cave_cube
+    origin_np = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+    origin_wp = wp.array(origin_np, dtype=wp.vec3, device=mesh_wp.device)
+    winding_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, origin_wp)
+    assert np.allclose(winding_wp.numpy(), 0.0, atol=1e-3)
+
+
+def test_winding_number_empty_points(device: str) -> None:
+    vertices = wp.array(np.zeros((3, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    faces = wp.array([0, 1, 2], dtype=wp.int32, device=device)
+    points = wp.empty(0, dtype=wp.vec3, device=device)
+    winding_wp = tw.proximity.winding_number(vertices, faces, points)
+    assert winding_wp.shape == (0,)
+
+
+def test_winding_number_empty_faces(device: str) -> None:
+    vertices = wp.zeros(1, dtype=wp.vec3, device=device)
+    faces = wp.empty(0, dtype=wp.int32, device=device)
+    points = wp.array(np.zeros((2, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    winding_wp = tw.proximity.winding_number(vertices, faces, points)
+    assert winding_wp.shape == (2,)
+    assert np.allclose(winding_wp.numpy(), 0.0)
 
 
 def test_max_tangent_sphere(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
