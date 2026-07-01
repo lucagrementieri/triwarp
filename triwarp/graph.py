@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from collections.abc import Sequence
 from typing import Literal, overload
 
@@ -12,6 +13,7 @@ from triwarp.array import init_range
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import graph as kernel_graph
 from triwarp.kernels import selection as kernel_selection
+from triwarp.kernels.algorithms import bfs as kernel_bfs
 from triwarp.kernels.algorithms import connected_components as kernel_connected_components
 
 
@@ -363,9 +365,9 @@ def concatenate(
     if sum(vertex_counts) == 0:
         concatenated_vertices = wp.empty(0, dtype=wp.vec3, device=device)
     else:
-        concatenated_vertices, _ = tw.array.pack_1d_arrays(
-            [vertices for vertices, _ in meshes_data]
-        )
+        concatenated_vertices, _ = tw.array.pack_1d_arrays([
+            vertices for vertices, _ in meshes_data
+        ])
 
     concatenated_faces = wp.empty(total_indices, dtype=wp.int32, device=device)
 
@@ -668,3 +670,226 @@ def face_connected_component_labels(faces: wp.array[wp.int32]) -> wp.array[wp.in
     n_faces = int(faces.shape[0]) // 3
     adjacency = face_adjacency(faces)
     return connected_component_labels_from_edges(adjacency, node_count=n_faces)
+
+
+def bfs(
+    adjacency: wps.BsrMatrix[wp.Scalar], source: int
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Single-source breadth-first search over a sparse CSR adjacency matrix.
+
+    Runs a serial traversal from ``source`` (one device thread) so the discovery order, parent
+    tree, and distances match :func:`scipy.sparse.csgraph.breadth_first_order` exactly when the
+    adjacency columns are sorted ascending per row (as produced by :func:`edges_to_csr`). This
+    mirrors ``igl::bfs`` (`reference/libigl/include/igl/bfs.cpp`), additionally returning the BFS
+    level of each node.
+
+    Parameters
+    ----------
+    adjacency
+        Square undirected adjacency in 1x1-block :class:`warp.sparse.BsrMatrix` form. Each nonzero
+        ``(i, j)`` denotes an edge between nodes ``i`` and ``j``; for undirected graphs both
+        ``(i, j)`` and ``(j, i)`` should be present (as from :func:`edges_to_csr`).
+    source
+        Start node, in ``[0, node_count)``.
+
+    Returns
+    -------
+    order
+        ``wp.array[wp.int32]`` of the reachable nodes in BFS discovery order; length equals the
+        number of nodes reachable from ``source`` (matches scipy's ``node_array``).
+    parents
+        Length ``node_count`` on ``adjacency.device``. ``parents[i]`` is the predecessor of ``i``
+        in the BFS tree; ``-1`` for ``source`` and for unreachable nodes (scipy uses ``-9999``).
+    distances
+        Length ``node_count``. ``distances[i]`` is the BFS level (hop count) of ``i`` from
+        ``source``; ``-1`` for unreachable nodes.
+
+    Raises
+    ------
+    ValueError
+        If ``adjacency`` is not square, does not use 1x1 blocks, or ``source`` is out of range.
+
+    See Also
+    --------
+    :func:`bfs_from_edges`
+    :func:`bfs_multi_source`
+    :func:`connected_component_labels`
+    :func:`scipy.sparse.csgraph.breadth_first_order`
+    """
+    node_count = adjacency.nrow  # pyright: ignore[reportAttributeAccessIssue]
+    ncol = adjacency.ncol  # pyright: ignore[reportAttributeAccessIssue]
+    if ncol != node_count:
+        raise ValueError(f"adjacency must be square, got shape ({node_count}, {ncol})")
+    if adjacency.block_shape != (1, 1):
+        raise ValueError(f"adjacency must use 1x1 blocks, got block_shape {adjacency.block_shape}")
+    if source < 0 or source >= node_count:
+        raise ValueError(f"source must be in [0, {node_count}), got {source}")
+
+    device = adjacency.device
+    offsets = adjacency.offsets  # pyright: ignore[reportAttributeAccessIssue]
+    columns = adjacency.columns  # pyright: ignore[reportAttributeAccessIssue]
+
+    parents = wp.full(node_count, -1, dtype=wp.int32, device=device)
+    distances = wp.full(node_count, -1, dtype=wp.int32, device=device)
+    order_buffer = wp.empty(node_count, dtype=wp.int32, device=device)
+    reached = wp.zeros(1, dtype=wp.int32, device=device)
+
+    wp.launch(
+        kernel_bfs.single_source_bfs_kernel,
+        dim=1,
+        inputs=[wp.int32(source), offsets, columns, order_buffer, parents, distances, reached],
+        device=device,
+    )
+    n_reached = int(reached.numpy()[0])
+    order = wp.clone(order_buffer[:n_reached])
+    return order, parents, distances
+
+
+def bfs_from_edges(
+    edges: twt.Array2dInt32, source: int, node_count: int | None = None
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Single-source BFS from an undirected edge list.
+
+    Builds a CSR adjacency via :func:`edges_to_csr` and delegates to :func:`bfs`.
+
+    Parameters
+    ----------
+    edges
+        ``(m, 2)`` ``wp.int32`` edge list. Each row ``(a, b)`` connects nodes ``a`` and ``b``
+        (undirected; order does not matter).
+    source
+        Start node, in ``[0, node_count)``.
+    node_count
+        Number of nodes ``0 .. node_count - 1``. When ``None``, inferred as ``max(edges) + 1`` if
+        ``m > 0``, else ``0``.
+
+    Returns
+    -------
+    tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]
+        ``(order, parents, distances)`` as in :func:`bfs`, on ``edges.device``.
+
+    Raises
+    ------
+    ValueError
+        If ``edges`` is not ``(m, 2)``, an endpoint is outside ``[0, node_count)``, ``node_count``
+        is negative, or ``source`` is out of range.
+
+    See Also
+    --------
+    :func:`bfs`
+    :func:`connected_component_labels_from_edges`
+    """
+    twt.ensure_ndim(edges, 2, dtype=wp.int32)
+    if int(edges.shape[1]) != 2:
+        raise ValueError(f"edges must have shape (m, 2), got {edges.shape}")
+
+    m = int(edges.shape[0])
+    if node_count is None:
+        node_count = int(edges.numpy().max()) + 1 if m > 0 else 0
+    else:
+        if node_count < 0:
+            raise ValueError(f"node_count must be non-negative, got {node_count}")
+        if m > 0:
+            edges_np = edges.numpy()
+            if edges_np.min() < 0 or int(edges_np.max()) >= node_count:
+                raise ValueError(
+                    f"edge indices must lie in [0, {node_count}), "
+                    f"got min={edges_np.min()} max={edges_np.max()}"
+                )
+
+    adjacency = edges_to_csr(node_count, edges)
+    return bfs(adjacency, source)
+
+
+def bfs_multi_source(
+    adjacency: wps.BsrMatrix[wp.Scalar], sources: wp.array[wp.int32]
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Independent BFS reachable sets for many sources, packed as a CSR buffer.
+
+    One device thread per source runs a topological BFS over ``adjacency`` (the geodesic-ball
+    traversal with its geometric predicate disabled). Source ``sources[k]`` owns
+    ``neighbors[offsets[k] : offsets[k + 1]]``, listed in BFS discovery order (the source itself
+    first). Each thread uses fixed-capacity scratch of ``kernel_bfs._PER_SOURCE_MAX_NEIGHBORS``
+    nodes; a source whose reachable set exceeds that has the surplus dropped and a warning emitted.
+    For a single source with no capacity limit, use :func:`bfs`.
+
+    Parameters
+    ----------
+    adjacency
+        Square undirected adjacency in 1x1-block :class:`warp.sparse.BsrMatrix` form.
+    sources
+        Length-``k`` ``wp.int32`` start nodes, each in ``[0, node_count)``.
+
+    Returns
+    -------
+    neighbors
+        Flat ``wp.array[wp.int32]`` of reachable nodes for all sources, concatenated in source
+        order (CSR column buffer).
+    offsets
+        Length-``k`` exclusive prefix sum of per-source counts (CSR starts); source ``k`` owns
+        ``neighbors[offsets[k] : offsets[k + 1]]`` with ``offsets[k_total]`` implied as the total.
+
+    Raises
+    ------
+    ValueError
+        If ``adjacency`` is not square, does not use 1x1 blocks, or a source is out of range.
+
+    See Also
+    --------
+    :func:`bfs`
+    :func:`triwarp.proximity.query_geodesic_ball`
+    """
+    node_count = adjacency.nrow  # pyright: ignore[reportAttributeAccessIssue]
+    ncol = adjacency.ncol  # pyright: ignore[reportAttributeAccessIssue]
+    if ncol != node_count:
+        raise ValueError(f"adjacency must be square, got shape ({node_count}, {ncol})")
+    if adjacency.block_shape != (1, 1):
+        raise ValueError(f"adjacency must use 1x1 blocks, got block_shape {adjacency.block_shape}")
+
+    device = adjacency.device
+    k = int(sources.shape[0])
+    if k == 0:
+        empty = wp.empty(0, dtype=wp.int32, device=device)
+        return empty, wp.empty(0, dtype=wp.int32, device=device)
+
+    sources_np = sources.numpy()
+    if sources_np.min() < 0 or int(sources_np.max()) >= node_count:
+        raise ValueError(
+            f"source indices must lie in [0, {node_count}), "
+            f"got min={sources_np.min()} max={sources_np.max()}"
+        )
+
+    offsets_csr = adjacency.offsets  # pyright: ignore[reportAttributeAccessIssue]
+    columns = adjacency.columns  # pyright: ignore[reportAttributeAccessIssue]
+
+    overflow = wp.zeros(1, dtype=wp.int32, device=device)
+    counts = wp.empty(k, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_bfs.multi_source_bfs_count,
+        dim=k,
+        inputs=[offsets_csr, columns, sources, counts, overflow],
+        device=device,
+    )
+    n_overflow = int(overflow.numpy()[0])
+    if n_overflow > 0:
+        warnings.warn(
+            f"bfs_multi_source: {n_overflow} reachable-set capacity breaches "
+            f"(fixed cap {kernel_bfs._PER_SOURCE_MAX_NEIGHBORS}); surplus nodes dropped."
+        )
+
+    offsets = wp.empty(k, dtype=wp.int32, device=device)
+    wp.utils.array_scan(counts, out_array=offsets, inclusive=False)
+    total = int(offsets.numpy()[-1]) + int(counts.numpy()[-1])
+
+    neighbors = wp.empty(total, dtype=wp.int32, device=device)
+    overflow.zero_()
+    wp.launch(
+        kernel_bfs.multi_source_bfs_neighbors,
+        dim=k,
+        inputs=[offsets_csr, columns, sources, offsets, neighbors, overflow],
+        device=device,
+    )
+    return neighbors, offsets
