@@ -13,6 +13,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import boundary as kernel_boundary
 
 
@@ -300,3 +301,81 @@ def boundary_vertices(
     """
     indices = boundary_vertex_indices(vertices, faces, edges_sorted)
     return tw.array.gather(vertices, indices)
+
+
+def ears(
+    faces: wp.array[wp.int32],
+    edges_sorted: twt.Array2dInt32 | None = None,
+    n_vertices: int | None = None,
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Find ear faces (triangles with exactly two boundary edges).
+
+    Mirrors ``igl::ears`` (`reference/libigl/include/igl/ears.cpp`): for each ear face,
+    ``ear_opp`` is the local edge index (0, 1, or 2) of the non-boundary edge.
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` face index buffer.
+    edges_sorted
+        Optional precomputed ``(n_faces * 3, 2)`` sorted edges (each row min-first), as from
+        :func:`triwarp.edges.faces_to_edges` with ``sorted=True``. Built from ``faces`` when
+        ``None``.
+    n_vertices
+        Total number of vertices (used as the row-hash base). When ``None``, inferred from
+        ``edges_sorted`` with a device-host sync.
+
+    Returns
+    -------
+    ear : wp.array[wp.int32]
+        Face indices of ear triangles on ``faces.device``. Empty when no ears exist.
+    ear_opp : wp.array[wp.int32]
+        Local edge index of the interior edge for each ear face, same length as ``ear``.
+
+    See Also
+    --------
+    :func:`igl.ears`
+    """
+    n_faces = int(faces.shape[0]) // 3
+    device = faces.device
+    empty = wp.empty(0, dtype=wp.int32, device=device)
+    if n_faces == 0:
+        return empty, empty
+
+    if edges_sorted is None:
+        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+
+    if n_vertices is None:
+        n_vertices = int(edges_sorted.numpy().max()) + 1
+
+    boundary_rows = tw.grouping.group_int_rows(edges_sorted, 1, n_vertices).flatten()
+    edge_boundary = wp.zeros(n_faces * 3, dtype=wp.bool, device=device)
+    n_boundary_rows = int(boundary_rows.shape[0])
+    if n_boundary_rows > 0:
+        wp.launch(
+            kernel_array.mark_membership_mask,
+            dim=n_boundary_rows,
+            inputs=[boundary_rows, edge_boundary],
+            device=device,
+        )
+
+    out_ear = wp.empty(n_faces, dtype=wp.int32, device=device)
+    out_ear_opp = wp.empty(n_faces, dtype=wp.int32, device=device)
+    counter = wp.zeros(1, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_boundary.find_ears,
+        dim=n_faces,
+        inputs=[edge_boundary, out_ear, out_ear_opp, counter],
+        device=device,
+    )
+
+    n_ears = int(counter.numpy().item())
+    if n_ears == 0:
+        return empty, empty
+
+    ear = wp.empty(n_ears, dtype=wp.int32, device=device)
+    ear_opp = wp.empty(n_ears, dtype=wp.int32, device=device)
+    wp.copy(ear, out_ear, count=n_ears)
+    wp.copy(ear_opp, out_ear_opp, count=n_ears)
+    return ear, ear_opp

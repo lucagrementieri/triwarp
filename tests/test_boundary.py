@@ -146,6 +146,42 @@ def test_boundary_loops_empty(device: str) -> None:
     assert tw.boundary.boundary_loop(vertices_wp, faces_wp).shape == (0,)
 
 
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+def test_ears(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_np = mesh_tm.faces.astype(np.int64)
+
+    ear_igl, ear_opp_igl = igl.ears(faces_np)
+    ear_wp, ear_opp_wp = tw.boundary.ears(mesh_wp.indices)
+
+    pairs_igl = np.stack([ear_igl, ear_opp_igl], axis=1)
+    pairs_wp = np.stack([ear_wp.numpy(), ear_opp_wp.numpy()], axis=1)
+    assert np.array_equal(_lexsort_rows(pairs_wp), _lexsort_rows(pairs_igl))
+
+    oriented_boundary = tw.boundary.oriented_boundary_edges(mesh_wp.points, mesh_wp.indices)
+    boundary_set = {tuple(row) for row in oriented_boundary.numpy()}
+    directed_edges = tw.edges.faces_to_edges(mesh_wp.indices).numpy()
+    for face_idx, opp in zip(ear_wp.numpy(), ear_opp_wp.numpy(), strict=True):
+        f = int(face_idx)
+        for local_edge in ((int(opp) + 1) % 3, (int(opp) + 2) % 3):
+            edge = tuple(directed_edges[3 * f + local_edge])
+            assert edge in boundary_set
+
+
+def test_ears_watertight(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _, mesh_wp = icosahedron
+    ear_wp, ear_opp_wp = tw.boundary.ears(mesh_wp.indices)
+    assert ear_wp.shape == (0,)
+    assert ear_opp_wp.shape == (0,)
+
+
+def test_ears_empty(device: str) -> None:
+    faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
+    ear_wp, ear_opp_wp = tw.boundary.ears(faces_wp)
+    assert ear_wp.shape == (0,)
+    assert ear_opp_wp.shape == (0,)
+
+
 def _lexsort_rows(rows: np.ndarray) -> np.ndarray:
     """Sort ``(n, 2)`` rows lexicographically (rows kept intact) for set comparison."""
     order = np.lexsort((rows[:, 1], rows[:, 0]))
