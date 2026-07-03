@@ -1,5 +1,6 @@
 site_name: triwarp
 site_description: Triangular mesh library based on NVIDIA Warp
+site_url: https://lucagrementieri.github.io/triwarp/
 repo_url: https://github.com/lucagrementieri/triwarp
 docs_dir: docs
 
