@@ -152,7 +152,7 @@ def pack_1d_arrays(
     arrays: Sequence[wp.array[wp.Scalar]],
 ) -> tuple[wp.array[wp.Scalar], wp.array[wp.int32]]:
     """
-    Concatenate several 1-D :class:`warp.array` instances into one buffer plus CSR-style offsets.
+    Concatenate several 1-D ``warp.array`` instances into one buffer plus CSR-style offsets.
 
     Each input segment ``i`` occupies ``flat[offsets[i] : offsets[i + 1]]``. This is the usual
     packed representation for variable-length per-item lists on the device (no nested arrays).
@@ -203,7 +203,7 @@ def pack_1d_arrays(
 
 def concatenate(arrays: Sequence[wp.array[DType]]) -> wp.array[DType]:
     """
-    Concatenate 1-D :class:`warp.array` instances in order (``numpy.concatenate``).
+    Concatenate 1-D ``warp.array`` instances in order (``numpy.concatenate``).
 
     Parameters
     ----------
@@ -257,6 +257,17 @@ def concatenate(arrays: Sequence[wp.array[DType]]) -> wp.array[DType]:
 
 
 def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
+    """
+    Sort each row of a 2D array independently, in place, ascending.
+
+    Each row is treated as its own radix-sort segment, so rows are reordered internally
+    but their relative row order is unaffected.
+
+    Parameters
+    ----------
+    data
+        ``(n, w)`` device array sorted in place, row by row.
+    """
     n = data.size
     data_buffer = wp.empty(n * 2, dtype=data.dtype, device=data.device)
     wp.copy(data_buffer, data, count=n)
@@ -280,7 +291,7 @@ def index_sparse(
     """
     Build a sparse row/column incidence matrix from flat index columns.
 
-    This mirrors ``trimesh.geometry.index_sparse``, but returns a :class:`warp.sparse.BsrMatrix`
+    This mirrors ``trimesh.geometry.index_sparse``, but returns a ``warp.sparse.BsrMatrix``
     in 1x1 BSR (CSR) form instead of ``scipy.sparse.coo_matrix``.
 
     Parameters
@@ -297,7 +308,7 @@ def index_sparse(
         ``dtype`` is ``None``). When ``data`` and ``dtype`` are provided, the values of the
         matrix are cast to ``dtype``.
     prune_numerical_zeros
-        Forwarded to :func:`warp.sparse.bsr_from_triplets`.
+        Forwarded to ``warp.sparse.bsr_from_triplets``.
 
     Returns
     -------
@@ -486,8 +497,8 @@ def gather(src: wp.array[DType], indices: wp.array[wp.int32]) -> wp.array[DType]
     """
     Dense copy of ``src`` gathered along its first axis by ``indices`` (``numpy.take``).
 
-    Warp's ``src[indices]`` fancy indexing yields a :class:`warp.indexedarray` view; this
-    materializes a contiguous :class:`warp.array` (performing the copy) so callers get a real
+    Warp's ``src[indices]`` fancy indexing yields a ``warp.indexedarray`` view; this
+    materializes a contiguous ``warp.array`` (performing the copy) so callers get a real
     array supporting ``.reshape`` and a stable return type. Works for rank-1 sources
     (``src[indices]``) and rank-2 row gather (``src[indices, :]``), with any scalar or vector
     ``dtype``.
@@ -519,7 +530,7 @@ def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3]) -> wp.array[wp.floa
     Unsigned angle in radians between pairs of unit vectors.
 
     For each index ``i``, computes ``abs(arccos(clip(dot(a[i], b[i]), -1, 1)))``.
-    Matches :func:`trimesh.geometry.vector_angle` on stacked pairs.
+    Matches [`trimesh.geometry.vector_angle`][] on stacked pairs.
 
     Parameters
     ----------
@@ -540,7 +551,7 @@ def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3]) -> wp.array[wp.floa
 
     See Also
     --------
-    :func:`trimesh.geometry.vector_angle`
+    [`trimesh.geometry.vector_angle`][]
     """
     device = a.device
     n = int(a.shape[0])

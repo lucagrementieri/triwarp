@@ -49,10 +49,12 @@ def face_adjacency(
     ----------
     faces
         Length-``3 * n_faces`` ``wp.int32`` buffer of triangle vertex indices, the
-        same flat layout as :mod:`triwarp.triangles` and :func:`faces_to_edges`.
+        same flat layout as [`triwarp.triangles`][triwarp.triangles] and
+        [`faces_to_edges`][triwarp.edges.faces_to_edges].
     edges_sorted
         Optional precomputed ``(n_faces * 3, 2)`` edge rows with each row sorted
-        so the smaller vertex index is first (as from :func:`faces_to_edges` with
+        so the smaller vertex index is first (as from
+        [`faces_to_edges`][triwarp.edges.faces_to_edges] with
         ``sorted=True``). When ``None``, edges are built from ``faces`` on
         ``faces.device``.
     return_edges
@@ -71,16 +73,17 @@ def face_adjacency(
 
     Notes
     -----
-    Duplicate-edge grouping uses :func:`triwarp.grouping.group_int_rows` with
-    ``length=2``, equivalent to :func:`trimesh.grouping.group_rows` with
+    Duplicate-edge grouping uses
+    [`group_int_rows`][triwarp.grouping.group_int_rows] with
+    ``length=2``, equivalent to [`trimesh.grouping.group_rows`][] with
     ``require_count=2``. An empty mesh yields shape ``(0, 2)``.
 
     See Also
     --------
-    :func:`faces_to_edges`
-    :func:`connected_component_labels_from_edges`
-    :func:`face_connected_component_labels`
-    :func:`trimesh.graph.face_adjacency`
+    [`faces_to_edges`][triwarp.edges.faces_to_edges]
+    [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
+    [`face_connected_component_labels`][triwarp.graph.face_connected_component_labels]
+    [`trimesh.graph.face_adjacency`][]
     """
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -121,7 +124,8 @@ def is_watertight(
     Parameters
     ----------
     edges
-        ``(n, 2)`` directed vertex-index pairs (e.g. from :func:`faces_to_edges`).
+        ``(n, 2)`` directed vertex-index pairs (e.g. from
+        [`faces_to_edges`][triwarp.edges.faces_to_edges]).
     edges_sorted
         Optional precomputed copy of ``edges`` with each row sorted so the smaller
         vertex index is first. When ``None``, sorted rows are built on ``edges.device``.
@@ -137,8 +141,8 @@ def is_watertight(
 
     See Also
     --------
-    :func:`faces_to_edges`
-    :func:`trimesh.graph.is_watertight`
+    [`faces_to_edges`][triwarp.edges.faces_to_edges]
+    [`trimesh.graph.is_watertight`][]
     """
     twt.ensure_ndim(edges, 2, dtype=wp.int32)
     if int(edges.shape[1]) != 2:
@@ -198,13 +202,14 @@ def face_adjacency_unshared(
     ----------
     faces
         Length-``3 * n_faces`` ``wp.int32`` buffer of triangle vertex indices, the
-        same flat layout as :func:`face_adjacency`.
+        same flat layout as [`face_adjacency`][triwarp.graph.face_adjacency].
     face_adjacency
-        Optional ``(m, 2)`` face index pairs from :func:`face_adjacency`. When
+        Optional ``(m, 2)`` face index pairs from
+        [`face_adjacency`][triwarp.graph.face_adjacency]. When
         ``None``, adjacency and shared edges are computed from ``faces``.
     face_adjacency_edges
         Optional ``(m, 2)`` sorted shared vertex pairs (as from
-        :func:`face_adjacency` with ``return_edges=True``). Must be supplied
+        [`face_adjacency`][triwarp.graph.face_adjacency] with ``return_edges=True``). Must be supplied
         together with ``face_adjacency`` or omitted with it.
 
     Returns
@@ -222,8 +227,8 @@ def face_adjacency_unshared(
 
     See Also
     --------
-    :func:`face_adjacency`
-    :func:`trimesh.graph.face_adjacency_unshared`
+    [`face_adjacency`][triwarp.graph.face_adjacency]
+    [`trimesh.graph.face_adjacency_unshared`][]
     """
     if (face_adjacency is None) != (face_adjacency_edges is None):
         raise ValueError(
@@ -270,14 +275,15 @@ def face_adjacency_angles(
         ``(n_vertices,)`` mesh vertex positions on the target device.
     faces
         Length-``3 * n_faces`` flat triangle index buffer (same layout as
-        :func:`face_adjacency`).
+        [`face_adjacency`][triwarp.graph.face_adjacency]).
     face_adjacency
-        Optional ``(m, 2)`` face index pairs from :func:`face_adjacency`. When
+        Optional ``(m, 2)`` face index pairs from
+        [`face_adjacency`][triwarp.graph.face_adjacency]. When
         ``None``, adjacency is computed from ``faces``.
     face_normals
         Optional length-``n_faces`` unit face normals. When ``None``, normals
         are computed from ``vertices`` and ``faces`` via
-        :func:`triwarp.triangles.face_normals_and_areas`.
+        [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas].
 
     Returns
     -------
@@ -292,9 +298,9 @@ def face_adjacency_angles(
 
     See Also
     --------
-    :func:`face_adjacency`
-    :func:`triwarp.array.vector_angle`
-    :attr:`trimesh.Trimesh.face_adjacency_angles`
+    [`face_adjacency`][triwarp.graph.face_adjacency]
+    [`vector_angle`][triwarp.array.vector_angle]
+    [`trimesh.Trimesh.face_adjacency_angles`][]
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
@@ -327,7 +333,7 @@ def concatenate(
     Concatenate meshes, each given as ``(vertices, faces)`` on the same device.
 
     Face indices are renumbered with cumulative vertex offsets, matching
-    :func:`trimesh.util.concatenate` (with triwarp's flat ``(3 * n_faces,)`` face
+    [`trimesh.util.concatenate`][] (with triwarp's flat ``(3 * n_faces,)`` face
     layout instead of ``(n_faces, 3)``).
 
     Parameters
@@ -348,8 +354,8 @@ def concatenate(
 
     See Also
     --------
-    :func:`split`
-    :func:`trimesh.util.concatenate`
+    [`split`][triwarp.graph.split]
+    [`trimesh.util.concatenate`][]
     """
     if len(meshes_data) == 0:
         return wp.empty(0, dtype=wp.vec3), wp.empty(0, dtype=wp.int32)
@@ -395,8 +401,8 @@ def split(
     Split a mesh into connected components by face adjacency.
 
     Each returned pair is a compact ``(vertices, faces)`` submesh with vertices
-    reindexed from zero, matching :func:`trimesh.graph.split` with
-    ``only_watertight=False``. :func:`concatenate` on the result recovers the
+    reindexed from zero, matching [`trimesh.graph.split`][] with
+    ``only_watertight=False``. [`concatenate`][triwarp.graph.concatenate] on the result recovers the
     input mesh (up to vertex/face ordering within each body).
 
     Parameters
@@ -405,7 +411,7 @@ def split(
         ``(n_vertices,)`` mesh vertex positions on the target device.
     faces
         Length-``3 * n_faces`` flat triangle index buffer (same layout as
-        :func:`face_adjacency`).
+        [`face_adjacency`][triwarp.graph.face_adjacency]).
 
     Returns
     -------
@@ -420,10 +426,10 @@ def split(
 
     See Also
     --------
-    :func:`concatenate`
-    :func:`face_connected_component_labels`
-    :func:`triwarp.selection.submesh_from_face_indices`
-    :func:`trimesh.graph.split`
+    [`concatenate`][triwarp.graph.concatenate]
+    [`face_connected_component_labels`][triwarp.graph.face_connected_component_labels]
+    [`submesh_from_face_indices`][triwarp.selection.submesh_from_face_indices]
+    [`trimesh.graph.split`][]
     """
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
@@ -447,7 +453,7 @@ def split(
 
 def edges_to_csr(node_count: int, edges: twt.Array2dInt32) -> wps.BsrMatrix[wp.float32]:
     """
-    Undirected adjacency as a 1x1-block :class:`warp.sparse.BsrMatrix` (CSR form).
+    Undirected adjacency as a 1x1-block ``warp.sparse.BsrMatrix`` (CSR form).
 
     Each undirected edge ``(a, b)`` contributes directed entries ``(a, b)`` and ``(b, a)``.
 
@@ -494,7 +500,7 @@ def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[
     Parameters
     ----------
     adjacency
-        Square undirected adjacency in 1x1-block :class:`warp.sparse.BsrMatrix` form.
+        Square undirected adjacency in 1x1-block ``warp.sparse.BsrMatrix`` form.
         Each nonzero ``(i, j)`` denotes an edge between nodes ``i`` and ``j``; for
         undirected graphs both ``(i, j)`` and ``(j, i)`` should be present.
 
@@ -514,9 +520,9 @@ def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[
 
     See Also
     --------
-    :func:`connected_component_labels_from_edges`
-    :func:`edges_to_csr`
-    :func:`face_connected_component_labels`
+    [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
+    [`edges_to_csr`][triwarp.graph.edges_to_csr]
+    [`face_connected_component_labels`][triwarp.graph.face_connected_component_labels]
     """
     node_count = adjacency.nrow  # pyright: ignore[reportAttributeAccessIssue]
     ncol = adjacency.ncol  # pyright: ignore[reportAttributeAccessIssue]
@@ -590,8 +596,8 @@ def connected_component_labels_from_edges(
     """
     Per-node connected-component labels from an undirected edge list.
 
-    Builds a CSR adjacency via :func:`edges_to_csr` and delegates to
-    :func:`connected_component_labels`.
+    Builds a CSR adjacency via [`edges_to_csr`][triwarp.graph.edges_to_csr] and delegates to
+    [`connected_component_labels`][triwarp.graph.connected_component_labels].
 
     Parameters
     ----------
@@ -615,9 +621,9 @@ def connected_component_labels_from_edges(
 
     See Also
     --------
-    :func:`connected_component_labels`
-    :func:`face_connected_component_labels`
-    :func:`trimesh.graph.connected_component_labels`
+    [`connected_component_labels`][triwarp.graph.connected_component_labels]
+    [`face_connected_component_labels`][triwarp.graph.face_connected_component_labels]
+    [`trimesh.graph.connected_component_labels`][]
     """
     twt.ensure_ndim(edges, 2, dtype=wp.int32)
     if int(edges.shape[1]) != 2:
@@ -648,13 +654,13 @@ def face_connected_component_labels(faces: wp.array[wp.int32]) -> wp.array[wp.in
     """
     Connected-component label per face (face-adjacency graph).
 
-    Equivalent to :func:`connected_component_labels_from_edges` on :func:`face_adjacency`
+    Equivalent to [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges] on [`face_adjacency`][triwarp.graph.face_adjacency]
     with ``node_count = n_faces``.
 
     Parameters
     ----------
     faces
-        Length-``3 * n_faces`` flat triangle index buffer (same as :func:`face_adjacency`).
+        Length-``3 * n_faces`` flat triangle index buffer (same as [`face_adjacency`][triwarp.graph.face_adjacency]).
 
     Returns
     -------
@@ -663,9 +669,9 @@ def face_connected_component_labels(faces: wp.array[wp.int32]) -> wp.array[wp.in
 
     See Also
     --------
-    :func:`connected_component_labels`
-    :func:`connected_component_labels_from_edges`
-    :func:`face_adjacency`
+    [`connected_component_labels`][triwarp.graph.connected_component_labels]
+    [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
+    [`face_adjacency`][triwarp.graph.face_adjacency]
     """
     n_faces = int(faces.shape[0]) // 3
     adjacency = face_adjacency(faces)
@@ -679,17 +685,17 @@ def bfs(
     Single-source breadth-first search over a sparse CSR adjacency matrix.
 
     Runs a serial traversal from ``source`` (one device thread) so the discovery order, parent
-    tree, and distances match :func:`scipy.sparse.csgraph.breadth_first_order` exactly when the
-    adjacency columns are sorted ascending per row (as produced by :func:`edges_to_csr`). This
+    tree, and distances match [`scipy.sparse.csgraph.breadth_first_order`][] exactly when the
+    adjacency columns are sorted ascending per row (as produced by [`edges_to_csr`][triwarp.graph.edges_to_csr]). This
     mirrors ``igl::bfs`` (`reference/libigl/include/igl/bfs.cpp`), additionally returning the BFS
     level of each node.
 
     Parameters
     ----------
     adjacency
-        Square undirected adjacency in 1x1-block :class:`warp.sparse.BsrMatrix` form. Each nonzero
+        Square undirected adjacency in 1x1-block ``warp.sparse.BsrMatrix`` form. Each nonzero
         ``(i, j)`` denotes an edge between nodes ``i`` and ``j``; for undirected graphs both
-        ``(i, j)`` and ``(j, i)`` should be present (as from :func:`edges_to_csr`).
+        ``(i, j)`` and ``(j, i)`` should be present (as from [`edges_to_csr`][triwarp.graph.edges_to_csr]).
     source
         Start node, in ``[0, node_count)``.
 
@@ -712,10 +718,10 @@ def bfs(
 
     See Also
     --------
-    :func:`bfs_from_edges`
-    :func:`bfs_multi_source`
-    :func:`connected_component_labels`
-    :func:`scipy.sparse.csgraph.breadth_first_order`
+    [`bfs_from_edges`][triwarp.graph.bfs_from_edges]
+    [`bfs_multi_source`][triwarp.graph.bfs_multi_source]
+    [`connected_component_labels`][triwarp.graph.connected_component_labels]
+    [`scipy.sparse.csgraph.breadth_first_order`][]
     """
     node_count = adjacency.nrow  # pyright: ignore[reportAttributeAccessIssue]
     ncol = adjacency.ncol  # pyright: ignore[reportAttributeAccessIssue]
@@ -752,7 +758,7 @@ def bfs_from_edges(
     """
     Single-source BFS from an undirected edge list.
 
-    Builds a CSR adjacency via :func:`edges_to_csr` and delegates to :func:`bfs`.
+    Builds a CSR adjacency via [`edges_to_csr`][triwarp.graph.edges_to_csr] and delegates to [`bfs`][triwarp.graph.bfs].
 
     Parameters
     ----------
@@ -768,7 +774,7 @@ def bfs_from_edges(
     Returns
     -------
     tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]
-        ``(order, parents, distances)`` as in :func:`bfs`, on ``edges.device``.
+        ``(order, parents, distances)`` as in [`bfs`][triwarp.graph.bfs], on ``edges.device``.
 
     Raises
     ------
@@ -778,8 +784,8 @@ def bfs_from_edges(
 
     See Also
     --------
-    :func:`bfs`
-    :func:`connected_component_labels_from_edges`
+    [`bfs`][triwarp.graph.bfs]
+    [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
     """
     twt.ensure_ndim(edges, 2, dtype=wp.int32)
     if int(edges.shape[1]) != 2:
@@ -814,12 +820,12 @@ def bfs_multi_source(
     ``neighbors[offsets[k] : offsets[k + 1]]``, listed in BFS discovery order (the source itself
     first). Each thread uses fixed-capacity scratch of ``kernel_bfs._PER_SOURCE_MAX_NEIGHBORS``
     nodes; a source whose reachable set exceeds that has the surplus dropped and a warning emitted.
-    For a single source with no capacity limit, use :func:`bfs`.
+    For a single source with no capacity limit, use [`bfs`][triwarp.graph.bfs].
 
     Parameters
     ----------
     adjacency
-        Square undirected adjacency in 1x1-block :class:`warp.sparse.BsrMatrix` form.
+        Square undirected adjacency in 1x1-block ``warp.sparse.BsrMatrix`` form.
     sources
         Length-``k`` ``wp.int32`` start nodes, each in ``[0, node_count)``.
 
@@ -839,8 +845,8 @@ def bfs_multi_source(
 
     See Also
     --------
-    :func:`bfs`
-    :func:`triwarp.proximity.query_geodesic_ball`
+    [`bfs`][triwarp.graph.bfs]
+    [`query_geodesic_ball`][triwarp.proximity.query_geodesic_ball]
     """
     node_count = adjacency.nrow  # pyright: ignore[reportAttributeAccessIssue]
     ncol = adjacency.ncol  # pyright: ignore[reportAttributeAccessIssue]

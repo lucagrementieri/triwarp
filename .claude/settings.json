@@ -1,20 +1,23 @@
 {
+    "$schema": "https://json-schema.org/claude-code-settings.json",
     "permissions": {
         "allow": [
-            "Bash(python *)",
-            "Bash(python3 *)",
-            "Bash(pytest *)",
-            "Bash(uv *)",
-            "Bash(pip list *)",
-            "Bash(grep *)",
-            "Bash(cat *)",
-            "Bash(ls *)",
-            "Bash(rm -rf ~/.cache/warp/*)",
-            "Bash(git stash *)",
+            "Bash(python:*)",
+            "Bash(python3:*)",
+            "Bash(pytest:*)",
+            "Bash(uv:*)",
+            "Bash(git:*)",
+            "Bash(pip list:*)",
+            "Bash(grep:*)",
+            "Bash(cat:*)",
+            "Bash(ls:*)",
+            "Bash(rm -rf //**/.cache/warp/*)",
             "WebFetch(domain:nvidia.github.io)"
         ],
         "additionalDirectories": [
-            "~/.cache/warp/"
+            "//**/.cache/warp/",
+            "//**/.cache/uv/",
+            "//**/.local/share/uv/"
         ]
     }
 }

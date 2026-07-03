@@ -19,6 +19,19 @@ from triwarp.triangles import centroid, face_normals_and_areas
 
 
 def get_seed(seed: int | None) -> int:
+    """
+    Resolve an optional RNG seed to a concrete non-negative ``int32``-range seed.
+
+    Parameters
+    ----------
+    seed
+        User-provided seed, or ``None`` to draw a cryptographically random seed.
+
+    Returns
+    -------
+    int
+        ``seed`` unchanged when provided, otherwise a random value in ``[0, 2**31)``.
+    """
     if seed is None:
         return secrets.randbelow(2**31)
     return int(seed)
@@ -36,7 +49,7 @@ def sample_surface(
 
     Uses ``face_normals_and_areas`` for default triangle weights. Builds a CDF and
     draws triangle indices with ``wp.sample_cdf``, then uniform points with
-    ``wp.sample_triangle`` (same scheme as :func:`trimesh.sample.sample_surface`).
+    ``wp.sample_triangle`` (same scheme as [`trimesh.sample.sample_surface`][]).
 
     Parameters
     ----------

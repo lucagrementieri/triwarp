@@ -119,7 +119,7 @@ def discrete_gaussian_curvature(
         Length-``3 * n_faces`` flat triangle index buffer.
     face_angles
         ``(n_faces, 3)`` interior angles per face (from
-        :func:`triwarp.triangles.face_angles`).
+        [`face_angles`][triwarp.triangles.face_angles]).
     radius
         Sphere radius; may be zero when ``vertices`` are the query points.
 
@@ -168,7 +168,7 @@ def discrete_mean_curvature(
         Sphere radius which should typically be greater than zero.
     face_adjacency
         Optional ``(m, 2)`` face index pairs from
-        :func:`triwarp.graph.face_adjacency`. When ``None``, adjacency and
+        [`face_adjacency`][triwarp.graph.face_adjacency]. When ``None``, adjacency and
         shared edges are computed from ``faces``.
     face_adjacency_edges
         Optional ``(m, 2)`` sorted shared vertex pairs. Must be supplied
@@ -181,8 +181,8 @@ def discrete_mean_curvature(
 
     See Also
     --------
-    :func:`discrete_gaussian_curvature`
-    :func:`trimesh.curvature.discrete_mean_curvature_measure`
+    [`discrete_gaussian_curvature`][triwarp.curvature.discrete_gaussian_curvature]
+    [`trimesh.curvature.discrete_mean_curvature_measure`][]
     """
     device = points.device
     n_points = int(points.shape[0])

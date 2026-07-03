@@ -42,7 +42,7 @@ def procrustes(
     """
     Find the optimal transform mapping point cloud *a* onto *b*.
 
-    Warp port of ``trimesh.registration.procrustes``. Accepts and returns
+    Warp port of [`trimesh.registration.procrustes`][]. Accepts and returns
     GPU-resident arrays; no NumPy in the hot path.
 
     Parameters

@@ -313,8 +313,8 @@ def hash_vector_rows(data: wp.array[wp.vec3], epsilon: float = 0.0) -> wp.array[
     right-shifted by 11 to drop low mantissa bits, then concatenated into one key
     per row for bucketing or near-duplicate grouping. With ``epsilon > 0.0``, each
     coordinate is instead rounded to the nearest multiple of ``epsilon`` and the
-    resulting integer row is packed via :func:`hash_indices_rows`, giving exact
-    (non-bucketed) equality up to the tolerance.
+    resulting integer row is packed via [`hash_indices_rows`][triwarp.unique.hash_indices_rows],
+    giving exact (non-bucketed) equality up to the tolerance.
 
     Parameters
     ----------
@@ -331,8 +331,8 @@ def hash_vector_rows(data: wp.array[wp.vec3], epsilon: float = 0.0) -> wp.array[
 
     See Also
     --------
-    hash_indices_rows
-    hash_rows
+    [`hash_indices_rows`][triwarp.unique.hash_indices_rows]
+    [`hash_rows`][triwarp.unique.hash_rows]
     """
     if data.dtype != wp.vec3:
         raise ValueError(f"data must be a wp.array[wp.vec3], got wp.array[{data.dtype}]")
@@ -375,8 +375,8 @@ def hash_indices_rows(data: twt.Array2dInt32, max_index: int | None = None) -> w
 
     See Also
     --------
-    hash_vector_rows
-    hash_rows
+    [`hash_vector_rows`][triwarp.unique.hash_vector_rows]
+    [`hash_rows`][triwarp.unique.hash_rows]
     """
     twt.ensure_ndim(data, 2, dtype=wp.int32)
     if max_index is not None and max_index <= 0:
@@ -412,8 +412,9 @@ def hash_rows(
     """
     Pack each row of a 2D or ``wp.vec3`` array into a single ``uint64`` key.
 
-    Dispatches to :func:`hash_vector_rows` for ``wp.vec3`` (including ``float32``
-    arrays with width 3) or :func:`hash_indices_rows` for ``int32`` rows.
+    Dispatches to [`hash_vector_rows`][triwarp.unique.hash_vector_rows] for ``wp.vec3``
+    (including ``float32`` arrays with width 3) or
+    [`hash_indices_rows`][triwarp.unique.hash_indices_rows] for ``int32`` rows.
 
     Parameters
     ----------
@@ -518,8 +519,9 @@ def unique_rows(
     """
     Find unique rows of a 2D Warp array (``numpy.unique`` along axis 0).
 
-    Each row is hashed with :func:`hash_rows`, then deduplicated via the same
-    open-addressing hash table as :func:`unique_1d`. Unique rows are returned in
+    Each row is hashed with [`hash_rows`][triwarp.unique.hash_rows], then deduplicated via the
+    same open-addressing hash table as [`unique_1d`][triwarp.unique.unique_1d]. Unique rows are
+    returned in
     sorted hash-key order; the representative row for each key is the first input
     row in that equivalence class.
 

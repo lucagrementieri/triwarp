@@ -2,7 +2,7 @@
 Mesh boundary edges and vertices (Warp).
 
 A mesh edge lies on the boundary when it appears exactly once among all triangle edges.
-Boundary detection reuses :func:`triwarp.grouping.group_int_rows` (the analog of
+Boundary detection reuses [`group_int_rows`][triwarp.grouping.group_int_rows] (the analog of
 ``trimesh.grouping.group_rows(require_count=1)``), which hashes each sorted edge row and
 returns the original row indices of edges occurring exactly once.
 """
@@ -36,8 +36,8 @@ def boundary_edges(
         Length-``3 * n_faces`` ``wp.int32`` face index buffer.
     edges_sorted
         Optional precomputed ``(n_faces * 3, 2)`` sorted edges (each row min-first), as from
-        :func:`triwarp.edges.faces_to_edges` with ``sorted=True``. Built from ``faces`` when
-        ``None``.
+        [`faces_to_edges`][triwarp.edges.faces_to_edges] with ``sorted=True``. Built from
+        ``faces`` when ``None``.
 
     Returns
     -------
@@ -79,7 +79,7 @@ def oriented_boundary_edges(
         from ``faces`` when ``None``.
     edges
         Optional precomputed ``(n_faces * 3, 2)`` directed edges, as from
-        :func:`triwarp.edges.faces_to_edges`. Built from ``faces`` when ``None``.
+        [`faces_to_edges`][triwarp.edges.faces_to_edges]. Built from ``faces`` when ``None``.
 
     Returns
     -------
@@ -125,10 +125,11 @@ def boundary_loops(
         Length-``3 * n_faces`` ``wp.int32`` face index buffer.
     edges_sorted
         Optional precomputed ``(n_faces * 3, 2)`` sorted edges, forwarded to
-        :func:`boundary_edges` and :func:`oriented_boundary_edges`.
+        [`boundary_edges`][triwarp.boundary.boundary_edges] and
+        [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges].
     edges
         Optional precomputed ``(n_faces * 3, 2)`` directed edges, forwarded to
-        :func:`oriented_boundary_edges`.
+        [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges].
 
     Returns
     -------
@@ -145,9 +146,9 @@ def boundary_loops(
 
     See Also
     --------
-    :func:`boundary_loop`
-    :func:`oriented_boundary_edges`
-    :func:`igl.boundary_loop_all`
+    [`boundary_loop`][triwarp.boundary.boundary_loop]
+    [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]
+    ``igl.boundary_loop_all``
     """
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
@@ -228,7 +229,7 @@ def boundary_loop(
     Parameters
     ----------
     vertices, faces, edges_sorted, edges
-        Forwarded to :func:`boundary_loops`.
+        Forwarded to [`boundary_loops`][triwarp.boundary.boundary_loops].
 
     Returns
     -------
@@ -238,8 +239,8 @@ def boundary_loop(
 
     See Also
     --------
-    :func:`boundary_loops`
-    :func:`igl.boundary_loop`
+    [`boundary_loops`][triwarp.boundary.boundary_loops]
+    ``igl.boundary_loop``
     """
     loops = boundary_loops(vertices, faces, edges_sorted, edges)
     if not loops:
@@ -264,7 +265,8 @@ def boundary_vertex_indices(
     faces
         Length-``3 * n_faces`` ``wp.int32`` face index buffer.
     edges_sorted
-        Optional precomputed sorted edges, forwarded to :func:`boundary_edges`.
+        Optional precomputed sorted edges, forwarded to
+        [`boundary_edges`][triwarp.boundary.boundary_edges].
 
     Returns
     -------
@@ -291,7 +293,8 @@ def boundary_vertices(
     faces
         Length-``3 * n_faces`` ``wp.int32`` face index buffer.
     edges_sorted
-        Optional precomputed sorted edges, forwarded to :func:`boundary_vertex_indices`.
+        Optional precomputed sorted edges, forwarded to
+        [`boundary_vertex_indices`][triwarp.boundary.boundary_vertex_indices].
 
     Returns
     -------
@@ -320,8 +323,8 @@ def ears(
         Length-``3 * n_faces`` ``wp.int32`` face index buffer.
     edges_sorted
         Optional precomputed ``(n_faces * 3, 2)`` sorted edges (each row min-first), as from
-        :func:`triwarp.edges.faces_to_edges` with ``sorted=True``. Built from ``faces`` when
-        ``None``.
+        [`faces_to_edges`][triwarp.edges.faces_to_edges] with ``sorted=True``. Built from
+        ``faces`` when ``None``.
     n_vertices
         Total number of vertices (used as the row-hash base). When ``None``, inferred from
         ``edges_sorted`` with a device-host sync.
@@ -335,7 +338,7 @@ def ears(
 
     See Also
     --------
-    :func:`igl.ears`
+    ``igl.ears``
     """
     n_faces = int(faces.shape[0]) // 3
     device = faces.device

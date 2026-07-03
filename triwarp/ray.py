@@ -30,7 +30,8 @@ def intersects_location(
 
     Uses ``wp.mesh_query_ray`` on the mesh BVH. Ray directions are unitized before
     querying. Returns only rays that hit within ``max_t`` as sparse ``(m,)`` arrays.
-    Equivalent to compressing the dense output of :func:`intersects_first`.
+    Equivalent to compressing the dense output of
+    [`intersects_first`][triwarp.ray.intersects_first].
 
     Parameters
     ----------
@@ -202,7 +203,7 @@ def longest_ray(
     intersection strictly beyond ``planar_tol`` (to ignore degenerate on-surface
     hits), or ``inf`` when no such intersection exists within ``max_t``.
 
-    Equivalent to :func:`trimesh.proximity.longest_ray`.
+    Equivalent to [`trimesh.proximity.longest_ray`][].
 
     Parameters
     ----------
@@ -254,13 +255,14 @@ def contains_points(
     Test whether query points lie inside a closed mesh (ray parity sign).
 
     Uses ``wp.mesh_query_point_sign_parity`` on the mesh BVH, sharing the same
-    parity path as :func:`triwarp.proximity.signed_distance_on_mesh`. Points
+    parity path as
+    [`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]. Points
     outside the mesh axis-aligned bounding box are rejected without a parity test.
 
     Triwarp mesh queries use **Warp's SDF sign convention** (outside positive,
     inside negative). A point is classified as inside when its signed distance
     would be negative; behavior on the on-surface tolerance band is undefined.
-    Boolean results still match :func:`trimesh.Trimesh.contains`.
+    Boolean results still match [`trimesh.Trimesh.contains`][].
 
     Parameters
     ----------
@@ -280,7 +282,7 @@ def contains_points(
 
     See Also
     --------
-    triwarp.proximity.signed_distance_on_mesh
+    [`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]
     """
     n = points.shape[0]
     if n == 0:

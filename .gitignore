@@ -13,3 +13,8 @@ wheels/
 # Virtual environments
 .venv
 
+# MkDocs
+site/
+docs/api/
+docs/SUMMARY.md
+

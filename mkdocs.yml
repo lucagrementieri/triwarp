@@ -1,0 +1,55 @@
+site_name: triwarp
+site_description: Triangular mesh library based on NVIDIA Warp
+repo_url: https://github.com/lucagrementieri/triwarp
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - content.code.copy
+    - search.suggest
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - tables
+  - pymdownx.details
+  - pymdownx.superfences
+
+plugins:
+  - search
+  - gen-files:
+      scripts:
+        - docs/gen_ref_pages.py
+  - literate-nav:
+      nav_file: SUMMARY.md
+  - section-index
+  - mkdocstrings:
+      handlers:
+        python:
+          inventories:
+            - https://docs.python.org/3/objects.inv
+            - https://numpy.org/doc/stable/objects.inv
+            - https://docs.scipy.org/doc/scipy/objects.inv
+            - https://trimesh.org/objects.inv
+          options:
+            docstring_style: numpy
+            docstring_section_style: table
+            show_source: true
+            show_root_heading: true
+            merge_init_into_class: true
+            separate_signature: true
+            show_signature_annotations: true
+            show_if_no_docstring: true

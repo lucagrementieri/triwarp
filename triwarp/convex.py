@@ -28,23 +28,23 @@ def face_adjacency_projections(
         ``(n_vertices,)`` mesh vertex positions on the target device.
     faces
         Length-``3 * n_faces`` flat triangle index buffer (same layout as
-        :func:`triwarp.graph.face_adjacency`).
+        [`face_adjacency`][triwarp.graph.face_adjacency]).
     face_adjacency
         Optional ``(m, 2)`` face index pairs from
-        :func:`triwarp.graph.face_adjacency`. When ``None``, adjacency and
+        [`face_adjacency`][triwarp.graph.face_adjacency]. When ``None``, adjacency and
         shared edges are computed from ``faces``.
     face_adjacency_edges
         Optional ``(m, 2)`` sorted shared vertex pairs (as from
-        :func:`triwarp.graph.face_adjacency` with ``return_edges=True``).
+        [`face_adjacency`][triwarp.graph.face_adjacency] with ``return_edges=True``).
         Must be supplied together with ``face_adjacency`` or omitted with it.
     face_adjacency_unshared
         Optional ``(m, 2)`` unshared vertex indices per face pair from
-        :func:`triwarp.graph.face_adjacency_unshared`. When ``None``, computed
-        from ``faces`` and the adjacency data.
+        [`face_adjacency_unshared`][triwarp.graph.face_adjacency_unshared]. When ``None``,
+        computed from ``faces`` and the adjacency data.
     face_normals
         Optional length-``n_faces`` unit face normals. When ``None``, normals
         are computed from ``vertices`` and ``faces`` via
-        :func:`triwarp.triangles.face_normals_and_areas`.
+        [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas].
 
     Returns
     -------
@@ -60,8 +60,8 @@ def face_adjacency_projections(
 
     See Also
     --------
-    :func:`face_adjacency_convex`
-    :attr:`trimesh.Trimesh.face_adjacency_projections`
+    [`face_adjacency_convex`][triwarp.convex.face_adjacency_convex]
+    [`trimesh.Trimesh.face_adjacency_projections`][]
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
@@ -118,7 +118,7 @@ def face_adjacency_convex(
 
     A pair is locally convex when the unshared vertex of the second face,
     projected onto the plane of the first face, has a projection less than
-    :data:`triwarp.constants.TOLERANCE_MERGE`.
+    [`TOLERANCE_MERGE`][triwarp.constants.TOLERANCE_MERGE].
 
     Parameters
     ----------
@@ -126,10 +126,10 @@ def face_adjacency_convex(
         ``(n_vertices,)`` mesh vertex positions on the target device.
     faces
         Length-``3 * n_faces`` flat triangle index buffer (same layout as
-        :func:`triwarp.graph.face_adjacency`).
+        [`face_adjacency`][triwarp.graph.face_adjacency]).
     face_adjacency
         Optional ``(m, 2)`` face index pairs from
-        :func:`triwarp.graph.face_adjacency`. When ``None``, adjacency and
+        [`face_adjacency`][triwarp.graph.face_adjacency]. When ``None``, adjacency and
         shared edges are computed from ``faces``.
     face_adjacency_edges
         Optional ``(m, 2)`` sorted shared vertex pairs. Must be supplied
@@ -148,8 +148,8 @@ def face_adjacency_convex(
 
     See Also
     --------
-    :func:`face_adjacency_projections`
-    :attr:`trimesh.Trimesh.face_adjacency_convex`
+    [`face_adjacency_projections`][triwarp.convex.face_adjacency_projections]
+    [`trimesh.Trimesh.face_adjacency_convex`][]
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3

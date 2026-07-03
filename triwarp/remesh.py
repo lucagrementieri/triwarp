@@ -17,7 +17,7 @@ def subdivide(
 
     Each triangle is split by placing a new vertex at the midpoint of each
     edge. The four child triangles share these midpoints and preserve the
-    original winding order, matching :func:`trimesh.remesh.subdivide` exactly.
+    original winding order, matching [`trimesh.remesh.subdivide`][] exactly.
 
     Parameters
     ----------
@@ -33,7 +33,7 @@ def subdivide(
 
     See Also
     --------
-    :func:`trimesh.remesh.subdivide`
+    [`trimesh.remesh.subdivide`][]
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])

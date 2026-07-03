@@ -249,7 +249,7 @@ def vertex_defects(
     For each vertex, interior angles from every triangle corner that references that vertex
     are accumulated in ``float32`` on ``faces.device``, then subtracted from a full turn.
     This is the standard piecewise-linear angle defect (related to discrete Gaussian
-    curvature via the Gauss--Bonnet viewpoint on triangle meshes).
+    curvature via the Gauss—Bonnet viewpoint on triangle meshes).
 
     Parameters
     ----------

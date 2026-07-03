@@ -21,7 +21,7 @@ def segments_with_plane(
     Calculate plane-line intersections for batched segment endpoints.
 
     Each row pair ``(start_points[i], end_points[i])`` defines one line to test.
-    Matches :func:`trimesh.intersections.plane_lines` with Trimesh's ``(2, n, 3)``
+    Matches [`trimesh.intersections.plane_lines`][] with Trimesh's ``(2, n, 3)``
     layout expressed as two length-``n`` ``wp.vec3`` arrays.
 
     Parameters
@@ -82,9 +82,9 @@ def mesh_with_plane(
     """
     Intersect a mesh with a plane, returning line segments on the plane.
 
-    Matches :func:`trimesh.intersections.mesh_plane` for indexed triangle meshes.
+    Matches [`trimesh.intersections.mesh_plane`][] for indexed triangle meshes.
     To section a face subset, extract a submesh first (e.g.
-    :func:`triwarp.selection.submesh_from_face_indices`).
+    [`submesh_from_face_indices`][triwarp.selection.submesh_from_face_indices]).
 
     Parameters
     ----------
@@ -288,9 +288,9 @@ def slice_mesh_with_plane(
     """
     Slice a mesh with a plane, returning the portion on the positive normal side.
 
-    Matches :func:`trimesh.intersections.slice_faces_plane` for indexed triangle meshes
+    Matches [`trimesh.intersections.slice_faces_plane`][] for indexed triangle meshes
     (without UV handling). To slice a face subset, extract a submesh first (e.g.
-    :func:`triwarp.selection.submesh_from_face_indices`).
+    [`submesh_from_face_indices`][triwarp.selection.submesh_from_face_indices]).
 
     Parameters
     ----------

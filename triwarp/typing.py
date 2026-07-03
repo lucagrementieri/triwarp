@@ -1,7 +1,7 @@
 """
 Warp array type aliases and runtime rank checks for Python wrappers.
 
-Use these aliases in :mod:`triwarp` Python APIs instead of ``wp.array2d[dtype]``, which
+Use these aliases in ``triwarp`` Python APIs instead of ``wp.array2d[dtype]``, which
 static checkers treat as Warp annotation objects (no ``.shape`` / indexing).
 
 Kernels should continue to use ``wp.array2d[dtype]`` in ``@wp.kernel`` signatures.
@@ -80,11 +80,47 @@ def ensure_ndim(arr: wp.array[T], ndim: int, *, dtype: type | None = None) -> wp
 
 
 def as_array2d_int32(arr: wp.array[T]) -> Array2dInt32:
+    """
+    Validate and narrow a Warp array to [`Array2dInt32`][triwarp.typing.Array2dInt32].
+
+    Parameters
+    ----------
+    arr
+        Warp array expected to be rank-2 ``int32``.
+
+    Returns
+    -------
+    Array2dInt32
+        ``arr`` unchanged, narrowed to the checked alias.
+
+    Raises
+    ------
+    TypeError
+        If ``arr`` is not rank-2 ``int32``.
+    """
     ensure_ndim(arr, 2, dtype=wp.int32)
     return cast(Array2dInt32, arr)
 
 
 def as_array2d_float32(arr: wp.array[T]) -> Array2dFloat32:
+    """
+    Validate and narrow a Warp array to [`Array2dFloat32`][triwarp.typing.Array2dFloat32].
+
+    Parameters
+    ----------
+    arr
+        Warp array expected to be rank-2 ``float32``.
+
+    Returns
+    -------
+    Array2dFloat32
+        ``arr`` unchanged, narrowed to the checked alias.
+
+    Raises
+    ------
+    TypeError
+        If ``arr`` is not rank-2 ``float32``.
+    """
     ensure_ndim(arr, 2, dtype=wp.float32)
     return cast(Array2dFloat32, arr)
 
@@ -99,10 +135,40 @@ def _shape_2d(shape: tuple[int, int] | list[int]) -> tuple[int, int]:
 def empty_int32_2d(
     shape: tuple[int, int] | list[int], *, device: wp.DeviceLike = None
 ) -> Array2dInt32:
+    """
+    Allocate an uninitialized rank-2 ``int32`` Warp array.
+
+    Parameters
+    ----------
+    shape
+        ``(rows, cols)`` shape of the allocated array.
+    device
+        Target Warp device.
+
+    Returns
+    -------
+    Array2dInt32
+        Uninitialized ``(rows, cols)`` ``int32`` array on ``device``.
+    """
     return cast(Array2dInt32, wp.empty(_shape_2d(shape), dtype=wp.int32, device=device))
 
 
 def empty_float32_2d(
     shape: tuple[int, int] | list[int], *, device: wp.DeviceLike = None
 ) -> Array2dFloat32:
+    """
+    Allocate an uninitialized rank-2 ``float32`` Warp array.
+
+    Parameters
+    ----------
+    shape
+        ``(rows, cols)`` shape of the allocated array.
+    device
+        Target Warp device.
+
+    Returns
+    -------
+    Array2dFloat32
+        Uninitialized ``(rows, cols)`` ``float32`` array on ``device``.
+    """
     return cast(Array2dFloat32, wp.empty(_shape_2d(shape), dtype=wp.float32, device=device))

@@ -275,8 +275,8 @@ def mean(
     """
     Arithmetic mean of ``array``.
 
-    Delegates the reduction to the tiled :func:`sum`, then divides by the element
-    count. With ``axis=None`` (default), returns one Python ``float``. With
+    Delegates the reduction to the tiled [`sum`][triwarp.reduce.sum], then divides by the
+    element count. With ``axis=None`` (default), returns one Python ``float``. With
     ``axis=0`` or ``axis=1`` on a rank-2 input, returns a 1D ``wp.float32`` array.
 
     The result is always floating point regardless of input dtype. For ``wp.bool``
@@ -417,6 +417,20 @@ def max_for_dtype(dtype: type[wp.Int]) -> int: ...
 @overload
 def max_for_dtype(dtype: type[wp.Float]) -> float: ...
 def max_for_dtype(dtype: type[wp.Scalar]) -> int | float:
+    """
+    Largest representable value for a Warp scalar type.
+
+    Parameters
+    ----------
+    dtype
+        A Warp integer or floating-point scalar type.
+
+    Returns
+    -------
+    int | float
+        ``float("inf")`` for floating-point types; the maximum representable
+        integer for integer types.
+    """
     if not wp.types.type_is_int(dtype):
         return float("inf")
     bits = wp.types.type_size_in_bytes(dtype) * 8
@@ -430,6 +444,20 @@ def min_for_dtype(dtype: type[wp.Int]) -> int: ...
 @overload
 def min_for_dtype(dtype: type[wp.Float]) -> float: ...
 def min_for_dtype(dtype: type[wp.Scalar]) -> int | float:
+    """
+    Smallest representable value for a Warp scalar type.
+
+    Parameters
+    ----------
+    dtype
+        A Warp integer or floating-point scalar type.
+
+    Returns
+    -------
+    int | float
+        ``float("-inf")`` for floating-point types; the minimum representable
+        integer for integer types.
+    """
     if not wp.types.type_is_int(dtype):
         return float("-inf")
     bits = wp.types.type_size_in_bytes(dtype) * 8
@@ -439,6 +467,19 @@ def min_for_dtype(dtype: type[wp.Scalar]) -> int | float:
 
 
 def zero_for_dtype(dtype: type[wp.Scalar]) -> int | float:
+    """
+    Zero value for a Warp scalar type, typed to match Python's ``int``/``float`` split.
+
+    Parameters
+    ----------
+    dtype
+        A Warp integer or floating-point scalar type.
+
+    Returns
+    -------
+    int | float
+        ``0`` for integer types, ``0.0`` for floating-point types.
+    """
     if wp.types.type_is_int(dtype):
         return 0
     return 0.0

@@ -1,8 +1,9 @@
 """
 Proximity queries: point clouds, BVH/HashGrid neighbors, and mesh point queries.
 
-Mesh point queries (:func:`closest_point_on_mesh`, :func:`signed_distance_on_mesh`)
-and :func:`triwarp.ray.contains_points` follow Warp's SDF sign convention: outside
+Mesh point queries ([`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh],
+[`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh])
+and [`contains_points`][triwarp.ray.contains_points] follow Warp's SDF sign convention: outside
 positive, inside negative. Trimesh ``signed_distance`` uses the opposite sign.
 """
 
@@ -60,15 +61,15 @@ def bvh_from_points(points: wp.array[wp.vec3], leaf_size: int = 4) -> wp.Bvh:
     Build a bounding-volume hierarchy over ``points`` for radius queries.
 
     Each leaf stores the same geometry as ``points`` (degenerate bounds via a clone),
-    matching the broad-phase pattern used by :func:`query_bvh_ball` and
-    :func:`query_bvh_nearest`.
+    matching the broad-phase pattern used by [`query_bvh_ball`][triwarp.proximity.query_bvh_ball] and
+    [`query_bvh_nearest`][triwarp.proximity.query_bvh_nearest].
 
     Parameters
     ----------
     points
         ``(n, 3)`` positions as ``wp.vec3``.
     leaf_size
-        Maximum primitives per leaf; forwarded to :class:`warp.Bvh`.
+        Maximum primitives per leaf; forwarded to ``warp.Bvh``.
 
     Returns
     -------
@@ -77,8 +78,8 @@ def bvh_from_points(points: wp.array[wp.vec3], leaf_size: int = 4) -> wp.Bvh:
 
     See Also
     --------
-    query_bvh_ball
-    query_bvh_nearest
+    [`query_bvh_ball`][triwarp.proximity.query_bvh_ball]
+    [`query_bvh_nearest`][triwarp.proximity.query_bvh_nearest]
     """
     return wp.Bvh(points, points, leaf_size=leaf_size)
 
@@ -94,7 +95,7 @@ def hashgrid_from_points(
     points
         ``(n, 3)`` positions as ``wp.vec3``.
     radius
-        Cell size passed to :meth:`warp.HashGrid.build` and used by
+        Cell size passed to ``warp.HashGrid.build`` and used by
         ``query_hashgrid_ball*`` and ``query_hashgrid_nearest`` kernels.
     grid_bins
         Resolution of the hash grid along each axis.
@@ -107,9 +108,9 @@ def hashgrid_from_points(
 
     See Also
     --------
-    query_hashgrid_ball_count
-    query_hashgrid_ball
-    query_hashgrid_nearest
+    [`query_hashgrid_ball_count`][triwarp.proximity.query_hashgrid_ball_count]
+    [`query_hashgrid_ball`][triwarp.proximity.query_hashgrid_ball]
+    [`query_hashgrid_nearest`][triwarp.proximity.query_hashgrid_nearest]
     """
     n = int(points.shape[0])
     grid = wp.HashGrid(grid_bins, grid_bins, grid_bins, device=points.device)
@@ -125,7 +126,7 @@ def bvh_from_bounds(
     Build a bounding-volume hierarchy over axis-aligned bounds.
 
     Each primitive ``i`` is represented by ``lower[i]`` and ``upper[i]`` corner
-    positions, suitable for :func:`query_bvh_aabb_with_offsets` broad-phase
+    positions, suitable for [`query_bvh_aabb_with_offsets`][triwarp.proximity.query_bvh_aabb_with_offsets] broad-phase
     intersection tests.
 
     Parameters
@@ -135,7 +136,7 @@ def bvh_from_bounds(
     upper
         ``(n,)`` maximum corner of each bound as ``wp.vec3``.
     leaf_size
-        Maximum primitives per leaf; forwarded to :class:`warp.Bvh`.
+        Maximum primitives per leaf; forwarded to ``warp.Bvh``.
 
     Returns
     -------
@@ -153,13 +154,13 @@ def query_bvh_aabb_with_offsets(
 
     For each query center ``q``, tests intersection of the query cube
     ``[q - h, q + h]`` against every primitive bound in ``bvh``. Unlike
-    :func:`query_hashgrid_ball_with_offsets`, there is no narrow-phase distance filter;
+    [`query_hashgrid_ball_with_offsets`][triwarp.proximity.query_hashgrid_ball_with_offsets], there is no narrow-phase distance filter;
     every broad-phase hit is returned.
 
     Parameters
     ----------
     bvh
-        Pre-built BVH from :func:`bvh_from_bounds` or :func:`bvh_from_points`.
+        Pre-built BVH from [`bvh_from_bounds`][triwarp.proximity.bvh_from_bounds] or [`bvh_from_points`][triwarp.proximity.bvh_from_points].
     queries
         ``(m, 3)`` query centers stored as ``wp.vec3``.
     half_extent
@@ -297,11 +298,11 @@ def query_hashgrid_ball_count(
     Count neighbors of each query within Euclidean distance ``r``.
 
     For each query center ``q``, returns how many entries ``p`` in ``points`` satisfy
-    ``‖p - q‖₂ ≤ r``. This matches :meth:`scipy.spatial.KDTree.query_ball_point` with
+    ``‖p - q‖₂ ≤ r``. This matches [`scipy.spatial.KDTree.query_ball_point`][] with
     ``p=2``, ``eps=0``, and ``return_length=True`` (exact search; only the spatial
     index differs).
 
-    Broad-phase traversal uses :class:`warp.HashGrid` with ``wp.hash_grid_query`` out
+    Broad-phase traversal uses ``warp.HashGrid`` with ``wp.hash_grid_query`` out
     to ``r``; narrow-phase keeps points with Euclidean distance at most ``r`` (``float32``).
 
     Parameters
@@ -314,7 +315,7 @@ def query_hashgrid_ball_count(
         Inclusion radius; cast to ``float32`` in kernels (non-negative).
     grid
         Optional pre-built hash grid from ``points``. If ``None``, built via
-        :func:`hashgrid_from_points`.
+        [`hashgrid_from_points`][triwarp.proximity.hashgrid_from_points].
     grid_bins
         Grid resolution when constructing ``grid`` (ignored if ``grid`` is provided).
 
@@ -326,10 +327,10 @@ def query_hashgrid_ball_count(
 
     See Also
     --------
-    query_bvh_ball_count
-    query_hashgrid_ball
-    hashgrid_from_points
-    :meth:`scipy.spatial.KDTree.query_ball_point`
+    [`query_bvh_ball_count`][triwarp.proximity.query_bvh_ball_count]
+    [`query_hashgrid_ball`][triwarp.proximity.query_hashgrid_ball]
+    [`hashgrid_from_points`][triwarp.proximity.hashgrid_from_points]
+    [`scipy.spatial.KDTree.query_ball_point`][]
     """
     device = points.device
     n = int(points.shape[0])
@@ -364,11 +365,11 @@ def query_hashgrid_ball_with_offsets(
     """
     Low-level ball query: neighbors in one concatenated pair plus per-query offsets.
 
-    Same geometry as :func:`query_hashgrid_ball` (hash-grid broad-phase out to ``r``,
+    Same geometry as [`query_hashgrid_ball`][triwarp.proximity.query_hashgrid_ball] (hash-grid broad-phase out to ``r``,
     ``float32`` test ``‖points[i] - q‖₂ ≤ r``). Semantics match
-    :meth:`scipy.spatial.KDTree.query_ball_point` with ``p=2`` and ``eps=0``.
+    [`scipy.spatial.KDTree.query_ball_point`][] with ``p=2`` and ``eps=0``.
 
-    Prefer :func:`query_hashgrid_ball` for a Python list of one array per query; use this
+    Prefer [`query_hashgrid_ball`][triwarp.proximity.query_hashgrid_ball] for a Python list of one array per query; use this
     when you want a single flat buffer on device (e.g. fused downstream kernels) and
     CSR-style boundaries without cloning each segment.
 
@@ -383,7 +384,7 @@ def query_hashgrid_ball_with_offsets(
         Inclusion radius; cast to ``float32`` in kernels (non-negative).
     grid
         Optional pre-built hash grid from ``points``. If ``None``, built via
-        :func:`hashgrid_from_points`.
+        [`hashgrid_from_points`][triwarp.proximity.hashgrid_from_points].
     grid_bins
         Grid resolution when constructing ``grid`` (ignored if ``grid`` is provided).
     return_sorted
@@ -414,10 +415,10 @@ def query_hashgrid_ball_with_offsets(
 
     See Also
     --------
-    query_hashgrid_ball
-    query_hashgrid_ball_count
-    hashgrid_from_points
-    :meth:`scipy.spatial.KDTree.query_ball_point`
+    [`query_hashgrid_ball`][triwarp.proximity.query_hashgrid_ball]
+    [`query_hashgrid_ball_count`][triwarp.proximity.query_hashgrid_ball_count]
+    [`hashgrid_from_points`][triwarp.proximity.hashgrid_from_points]
+    [`scipy.spatial.KDTree.query_ball_point`][]
     """
     device = points.device
 
@@ -514,15 +515,15 @@ def query_hashgrid_ball(
     """
     Find all data points within distance ``r`` of each query center (per-query arrays).
 
-    High-level wrapper around :func:`query_hashgrid_ball_with_offsets`: hash-grid
+    High-level wrapper around [`query_hashgrid_ball_with_offsets`][triwarp.proximity.query_hashgrid_ball_with_offsets]: hash-grid
     broad-phase and ``float32`` distance test, same SciPy semantics as
-    :meth:`scipy.spatial.KDTree.query_ball_point` with ``p=2`` and ``eps=0``.
+    [`scipy.spatial.KDTree.query_ball_point`][] with ``p=2`` and ``eps=0``.
 
     Unlike SciPy's object array of lists, multi-query results are two Python lists of
     length ``m``, each element a rank-1 ``wp.array`` for that query. A single ``wp.vec3``
     query returns one ``(indices, distances)`` pair directly (not wrapped in lists). This
     clones each query's segment out of the internal flat buffer; for one flat buffer plus
-    offsets on device, call :func:`query_hashgrid_ball_with_offsets` instead.
+    offsets on device, call [`query_hashgrid_ball_with_offsets`][triwarp.proximity.query_hashgrid_ball_with_offsets] instead.
 
     Parameters
     ----------
@@ -535,7 +536,7 @@ def query_hashgrid_ball(
         Inclusion radius; cast to ``float32`` in kernels (non-negative).
     grid
         Optional pre-built hash grid from ``points``. If ``None``, built via
-        :func:`hashgrid_from_points`.
+        [`hashgrid_from_points`][triwarp.proximity.hashgrid_from_points].
     grid_bins
         Grid resolution when constructing ``grid`` (ignored if ``grid`` is provided).
     return_sorted
@@ -564,10 +565,10 @@ def query_hashgrid_ball(
 
     See Also
     --------
-    query_hashgrid_ball_with_offsets
-    query_hashgrid_ball_count
-    hashgrid_from_points
-    :meth:`scipy.spatial.KDTree.query_ball_point`
+    [`query_hashgrid_ball_with_offsets`][triwarp.proximity.query_hashgrid_ball_with_offsets]
+    [`query_hashgrid_ball_count`][triwarp.proximity.query_hashgrid_ball_count]
+    [`hashgrid_from_points`][triwarp.proximity.hashgrid_from_points]
+    [`scipy.spatial.KDTree.query_ball_point`][]
     """
     device = points.device
 
@@ -609,7 +610,7 @@ def query_bvh_ball_count(
     """
     Count neighbors of each query within Euclidean distance ``r`` (BVH backend).
 
-    Same semantics as :func:`query_hashgrid_ball_count`; broad-phase uses
+    Same semantics as [`query_hashgrid_ball_count`][triwarp.proximity.query_hashgrid_ball_count]; broad-phase uses
     ``wp.bvh_query_aabb`` over the cube ``[q ± r]``.
 
     Parameters
@@ -622,7 +623,7 @@ def query_bvh_ball_count(
         Inclusion radius; cast to ``float32`` in kernels (non-negative).
     bvh
         Optional pre-built BVH from ``points``. If ``None``, built via
-        :func:`bvh_from_points`.
+        [`bvh_from_points`][triwarp.proximity.bvh_from_points].
     leaf_size
         Leaf size when constructing ``bvh`` (ignored if ``bvh`` is provided).
 
@@ -633,10 +634,10 @@ def query_bvh_ball_count(
 
     See Also
     --------
-    query_hashgrid_ball_count
-    query_bvh_ball
-    bvh_from_points
-    :meth:`scipy.spatial.KDTree.query_ball_point`
+    [`query_hashgrid_ball_count`][triwarp.proximity.query_hashgrid_ball_count]
+    [`query_bvh_ball`][triwarp.proximity.query_bvh_ball]
+    [`bvh_from_points`][triwarp.proximity.bvh_from_points]
+    [`scipy.spatial.KDTree.query_ball_point`][]
     """
     device = points.device
     n = int(points.shape[0])
@@ -671,8 +672,8 @@ def query_bvh_ball_with_offsets(
     """
     Low-level BVH ball query: neighbors in one concatenated pair plus per-query offsets.
 
-    Same geometry as :func:`query_bvh_ball`. Semantics match
-    :meth:`scipy.spatial.KDTree.query_ball_point` with ``p=2`` and ``eps=0``.
+    Same geometry as [`query_bvh_ball`][triwarp.proximity.query_bvh_ball]. Semantics match
+    [`scipy.spatial.KDTree.query_ball_point`][] with ``p=2`` and ``eps=0``.
 
     Parameters
     ----------
@@ -684,7 +685,7 @@ def query_bvh_ball_with_offsets(
         Inclusion radius; cast to ``float32`` in kernels (non-negative).
     bvh
         Optional pre-built BVH from ``points``. If ``None``, built via
-        :func:`bvh_from_points`.
+        [`bvh_from_points`][triwarp.proximity.bvh_from_points].
     leaf_size
         Leaf size when constructing ``bvh`` (ignored if ``bvh`` is provided).
     return_sorted
@@ -693,15 +694,16 @@ def query_bvh_ball_with_offsets(
     Returns
     -------
     neighbor_indices_flat, neighbor_distances_flat, offsets
-        CSR-style flat buffers; see :func:`query_hashgrid_ball_with_offsets`.
+        CSR-style flat buffers; see
+        [`query_hashgrid_ball_with_offsets`][triwarp.proximity.query_hashgrid_ball_with_offsets].
 
     See Also
     --------
-    query_hashgrid_ball_with_offsets
-    query_bvh_ball
-    query_bvh_ball_count
-    bvh_from_points
-    :meth:`scipy.spatial.KDTree.query_ball_point`
+    [`query_hashgrid_ball_with_offsets`][triwarp.proximity.query_hashgrid_ball_with_offsets]
+    [`query_bvh_ball`][triwarp.proximity.query_bvh_ball]
+    [`query_bvh_ball_count`][triwarp.proximity.query_bvh_ball_count]
+    [`bvh_from_points`][triwarp.proximity.bvh_from_points]
+    [`scipy.spatial.KDTree.query_ball_point`][]
     """
     device = points.device
 
@@ -798,8 +800,9 @@ def query_bvh_ball(
     """
     Find all data points within distance ``r`` of each query center (BVH backend).
 
-    High-level wrapper around :func:`query_bvh_ball_with_offsets`. Same SciPy semantics
-    as :meth:`scipy.spatial.KDTree.query_ball_point` with ``p=2`` and ``eps=0``.
+    High-level wrapper around
+    [`query_bvh_ball_with_offsets`][triwarp.proximity.query_bvh_ball_with_offsets]. Same SciPy
+    semantics as [`scipy.spatial.KDTree.query_ball_point`][] with ``p=2`` and ``eps=0``.
 
     Parameters
     ----------
@@ -811,7 +814,7 @@ def query_bvh_ball(
         Inclusion radius; cast to ``float32`` in kernels (non-negative).
     bvh
         Optional pre-built BVH from ``points``. If ``None``, built via
-        :func:`bvh_from_points`.
+        [`bvh_from_points`][triwarp.proximity.bvh_from_points].
     leaf_size
         Leaf size when constructing ``bvh`` (ignored if ``bvh`` is provided).
     return_sorted
@@ -820,15 +823,16 @@ def query_bvh_ball(
     Returns
     -------
     neighbor_indices, neighbor_distances
-        Per-query neighbor lists; see :func:`query_hashgrid_ball`.
+        Per-query neighbor lists; see
+        [`query_hashgrid_ball`][triwarp.proximity.query_hashgrid_ball].
 
     See Also
     --------
-    query_hashgrid_ball
-    query_bvh_ball_with_offsets
-    query_bvh_ball_count
-    bvh_from_points
-    :meth:`scipy.spatial.KDTree.query_ball_point`
+    [`query_hashgrid_ball`][triwarp.proximity.query_hashgrid_ball]
+    [`query_bvh_ball_with_offsets`][triwarp.proximity.query_bvh_ball_with_offsets]
+    [`query_bvh_ball_count`][triwarp.proximity.query_bvh_ball_count]
+    [`bvh_from_points`][triwarp.proximity.bvh_from_points]
+    [`scipy.spatial.KDTree.query_ball_point`][]
     """
     device = points.device
 
@@ -875,18 +879,20 @@ def query_geodesic_ball(
 
     Also returns the per-vertex reference neighbor used to build the tangent frame: the
     lowest-indexed edge neighbor, matching libigl's ``adjacency_list[i][0]``. libigl's symmetrized
-    shape operator is frame-dependent, so reproducing its principal values
-    (:func:`triwarp.curvature.principal_curvature` with ``frame_independent=False``) requires this
-    exact frame; the default frame-independent computation does not depend on it. Isolated vertices
-    reference themselves.
+    shape operator is frame-dependent, so reproducing its principal values (
+    [`principal_curvature`][triwarp.curvature.principal_curvature] with ``frame_independent=False``)
+    requires this exact frame; the default frame-independent computation does not depend on it.
+    Isolated vertices reference themselves.
 
     The traversal runs entirely on device. Vertex adjacency is built as a CSR graph via
-    :func:`triwarp.edges.edges_unique` + :func:`triwarp.graph.edges_to_csr`, then a two-pass BFS
+    [`edges_unique`][triwarp.edges.edges_unique] +
+    [`edges_to_csr`][triwarp.graph.edges_to_csr], then a two-pass BFS
     (count → exclusive scan → fill) emits the CSR neighbor buffer. Each thread uses fixed-capacity
     local scratch of 512 neighbors; if a vertex collects more than that the surplus is dropped and a
     warning is emitted.
 
-    .. note::
+    !!! note
+
         Distances and tie-breaking are computed in ``float32`` (set-equivalent to the libigl
         reference; borderline ties between equidistant neighbors may resolve differently but leave
         the order-independent quadric fit unchanged).
@@ -1024,7 +1030,8 @@ def query_bvh_nearest(
     effective radius are kept; unused slots stay at distance ``inf`` and index ``-1`` (e.g. when
     there are fewer than ``k`` points within that radius, or when ``n == 0``).
 
-    Implementation: a BVH over ``points`` is built via :func:`bvh_from_points`. Each query
+    Implementation: a BVH over ``points`` is built via
+    [`bvh_from_points`][triwarp.proximity.bvh_from_points]. Each query
     runs ``wp.bvh_query_aabb`` over the cube ``[q - r, q + r]`` with the (possibly clamped)
     radius below and updates a per-query sorted list of the ``k`` smallest distances
     (binary search + shift insert in the kernel when ``k > 1``; a single running minimum when
@@ -1070,8 +1077,8 @@ def query_bvh_nearest(
 
     See Also
     --------
-    query_hashgrid_nearest
-    :meth:`scipy.spatial.KDTree.query`
+    [`query_hashgrid_nearest`][triwarp.proximity.query_hashgrid_nearest]
+    [`scipy.spatial.KDTree.query`][]
     """
     if k < 1:
         raise ValueError("k must be >= 1")
@@ -1182,8 +1189,8 @@ def query_hashgrid_nearest(
     """
     For each query center, find the ``k`` nearest data points (HashGrid backend).
 
-    Same semantics as :func:`query_bvh_nearest`. Broad-phase uses
-    :class:`warp.HashGrid` with ``wp.hash_grid_query`` out to the effective radius.
+    Same semantics as [`query_bvh_nearest`][triwarp.proximity.query_bvh_nearest]. Broad-phase uses
+    ``warp.HashGrid`` with ``wp.hash_grid_query`` out to the effective radius.
 
     Parameters
     ----------
@@ -1202,7 +1209,7 @@ def query_hashgrid_nearest(
     Returns
     -------
     indices, distances
-        Same layout rules as :func:`query_bvh_nearest`.
+        Same layout rules as [`query_bvh_nearest`][triwarp.proximity.query_bvh_nearest].
 
     Raises
     ------
@@ -1211,9 +1218,9 @@ def query_hashgrid_nearest(
 
     See Also
     --------
-    query_bvh_nearest
-    hashgrid_from_points
-    :meth:`scipy.spatial.KDTree.query`
+    [`query_bvh_nearest`][triwarp.proximity.query_bvh_nearest]
+    [`hashgrid_from_points`][triwarp.proximity.hashgrid_from_points]
+    [`scipy.spatial.KDTree.query`][]
     """
     if k < 1:
         raise ValueError("k must be >= 1")
@@ -1453,11 +1460,11 @@ def signed_distance_on_mesh(
 
     * Points **outside** the mesh have **positive** distance.
     * Points **inside** have **negative** distance.
-    * Points within :data:`triwarp.constants.TOLERANCE_MERGE` of the surface
+    * Points within [`TOLERANCE_MERGE`][triwarp.constants.TOLERANCE_MERGE] of the surface
       return positive unsigned distance.
 
     Trimesh ``signed_distance`` uses the opposite sign; negate its output to compare.
-    See also :func:`triwarp.ray.contains_points` (inside iff signed distance is
+    See also [`contains_points`][triwarp.ray.contains_points] (inside iff signed distance is
     negative, except on the on-surface tolerance band).
 
     Parameters

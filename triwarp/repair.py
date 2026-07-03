@@ -1,6 +1,9 @@
 """
-Mesh repair utilities (libigl ``remove_unreferenced_vertices``, ``remove_duplicated_vertices``,
-``resolve_duplicated_faces``).
+Mesh repair utilities (libigl unreferenced/duplicated vertex and duplicated face cleanup).
+
+See [`remove_unreferenced_vertices`][triwarp.repair.remove_unreferenced_vertices],
+[`remove_duplicated_vertices`][triwarp.repair.remove_duplicated_vertices], and
+[`resolve_duplicated_faces`][triwarp.repair.resolve_duplicated_faces].
 """
 
 from __future__ import annotations

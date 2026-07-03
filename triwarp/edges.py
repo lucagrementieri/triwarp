@@ -16,7 +16,7 @@ def faces_to_edges(
     Directed triangle edges from a flat ``(i0, i1, i2)`` index buffer.
 
     For each face emits three directed edges ``(i0, i1)``, ``(i1, i2)``, ``(i2, i0)`` in
-    row-major order, matching :func:`trimesh.geometry.faces_to_edges`.
+    row-major order, matching [`trimesh.geometry.faces_to_edges`][].
 
     Parameters
     ----------
@@ -33,7 +33,7 @@ def faces_to_edges(
 
     See Also
     --------
-    :func:`trimesh.geometry.faces_to_edges`
+    [`trimesh.geometry.faces_to_edges`][]
     """
     n_faces = int(faces.shape[0]) // 3
     edges = twt.empty_int32_2d((n_faces * 3, 2), device=faces.device)
@@ -48,10 +48,10 @@ def faces_to_edges(
 
 def edges_face(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
     """
-    Face index for each directed edge produced by :func:`edges`.
+    Face index for each directed edge produced by [`faces_to_edges`][triwarp.edges.faces_to_edges].
 
     Returns an array of length ``n_faces * 3`` where entry ``3*f + k`` equals ``f``,
-    matching :attr:`trimesh.Trimesh.edges_face`.
+    matching [`trimesh.Trimesh.edges_face`][].
 
     Parameters
     ----------
@@ -65,7 +65,7 @@ def edges_face(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
 
     See Also
     --------
-    :attr:`trimesh.Trimesh.edges_face`
+    [`trimesh.Trimesh.edges_face`][]
     """
     n_faces = int(faces.shape[0]) // 3
     return init_repeat_index(n_faces * 3, 3, faces.device)
@@ -79,8 +79,8 @@ def edges_unique(
     """
     Return unique undirected edges and their inverse mapping into the sorted edge list.
 
-    Equivalent to :attr:`trimesh.Trimesh.edges_unique` and
-    :attr:`trimesh.Trimesh.edges_unique_inverse` computed together.
+    Equivalent to [`trimesh.Trimesh.edges_unique`][] and
+    [`trimesh.Trimesh.edges_unique_inverse`][] computed together.
 
     Parameters
     ----------
@@ -102,8 +102,8 @@ def edges_unique(
 
     See Also
     --------
-    :attr:`trimesh.Trimesh.edges_unique`
-    :attr:`trimesh.Trimesh.edges_unique_inverse`
+    [`trimesh.Trimesh.edges_unique`][]
+    [`trimesh.Trimesh.edges_unique_inverse`][]
     """
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
@@ -150,8 +150,9 @@ def edges_unique_inverse(
     n_vertices: int | None = None,
 ) -> wp.array[wp.int32]:
     """
-    Inverse mapping from :func:`edges` (sorted) into :func:`edges_unique`.
+    Inverse mapping from sorted edges into [`edges_unique`][triwarp.edges.edges_unique].
 
+    Maps [`faces_to_edges`][triwarp.edges.faces_to_edges] (sorted) into `edges_unique`:
     ``edges_unique(faces)[edges_unique_inverse(faces)] == faces_to_edges(faces, sorted=True)``
 
     Parameters
@@ -170,7 +171,7 @@ def edges_unique_inverse(
 
     See Also
     --------
-    :attr:`trimesh.Trimesh.edges_unique_inverse`
+    [`trimesh.Trimesh.edges_unique_inverse`][]
     """
     return edges_unique(faces, edges_sorted=edges_sorted, n_vertices=n_vertices)[1]
 
@@ -193,8 +194,8 @@ def edges_unique_length(
     unique_edges
         Optional precomputed unique edges ``(m, 2)``. When ``None``, computed from ``faces``.
     n_vertices
-        Total vertex count passed to :func:`edges_unique`. Ignored when ``unique_edges`` is
-        already provided.
+        Total vertex count passed to [`edges_unique`][triwarp.edges.edges_unique]. Ignored when
+        ``unique_edges`` is already provided.
 
     Returns
     -------
@@ -203,7 +204,7 @@ def edges_unique_length(
 
     See Also
     --------
-    :attr:`trimesh.Trimesh.edges_unique_length`
+    [`trimesh.Trimesh.edges_unique_length`][]
     """
     if unique_edges is None:
         unique_edges, _ = edges_unique(faces, n_vertices=n_vertices)
@@ -257,8 +258,9 @@ def mean_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
     Mean length of all per-face triangle edges (libigl ``getAverageEdge``).
 
     Averages the three edges of every face (``3 * n_faces`` directed edges from
-    :func:`faces_to_edges`), matching the per-face edge mean used to scale the
-    sphere-search radius in :func:`triwarp.curvature.principal_curvature`.
+    [`faces_to_edges`][triwarp.edges.faces_to_edges]), matching the per-face edge mean used to
+    scale the sphere-search radius in
+    [`principal_curvature`][triwarp.curvature.principal_curvature].
 
     Parameters
     ----------

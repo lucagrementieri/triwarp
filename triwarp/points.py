@@ -173,7 +173,7 @@ def radial_sort(
 
     Points are projected onto two axes perpendicular to ``normal`` and ordered by
     the angle ``atan2`` of the projection, in **descending** order (matching
-    :func:`trimesh.points.radial_sort`).
+    [`trimesh.points.radial_sort`][]).
 
     Parameters
     ----------

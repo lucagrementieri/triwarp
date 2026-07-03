@@ -15,8 +15,8 @@ def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
     ``values`` are radix-sorted with their original indices; each output row lists
     ``length`` indices whose corresponding entries are equal and form a run of
     precisely that size (runs shorter or longer than ``length`` are omitted). This
-    matches :func:`trimesh.grouping.group` with ``min_len == max_len == length`` and
-    :func:`trimesh.grouping.group_rows` with ``require_count=length``.
+    matches [`trimesh.grouping.group`][] with ``min_len == max_len == length`` and
+    [`trimesh.grouping.group_rows`][] with ``require_count=length``.
 
     Parameters
     ----------
@@ -33,7 +33,7 @@ def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
 
     See Also
     --------
-    group_int_rows
+    [`group_int_rows`][triwarp.grouping.group_int_rows]
     """
     n = int(values.shape[0])
     values_buffer = tw.unique.reinterpret_cast_to_int(values, 2 * n)
@@ -61,10 +61,10 @@ def group_int_rows(
     """
     Return index groups of exactly ``length`` rows that are identical.
 
-    Each row is hashed with :func:`triwarp.unique.hash_indices_rows`, then :func:`group` finds runs
-    of ``length`` equal keys in sorted order. For example, ``[[1, 2], [3, 4], [1, 2]]``
-    with ``length=2`` yields one group ``[[0, 2]]`` (same as
-    :func:`trimesh.grouping.group_rows` with ``require_count=2``).
+    Each row is hashed with [`hash_indices_rows`][triwarp.unique.hash_indices_rows], then
+    [`group`][triwarp.grouping.group] finds runs of ``length`` equal keys in sorted order. For
+    example, ``[[1, 2], [3, 4], [1, 2]]`` with ``length=2`` yields one group ``[[0, 2]]`` (same as
+    [`trimesh.grouping.group_rows`][] with ``require_count=2``).
 
     Parameters
     ----------
@@ -74,7 +74,8 @@ def group_int_rows(
         Required number of duplicate rows per group.
     max_value
         Optional exclusive upper bound on entries and radix for row hashing; passed
-        through to :func:`triwarp.unique.hash_indices_rows` as ``max_index``. If ``None``, inferred
+        through to [`hash_indices_rows`][triwarp.unique.hash_indices_rows] as ``max_index``. If
+        ``None``, inferred
         from ``max(data) + 1``.
 
     Returns
@@ -84,7 +85,7 @@ def group_int_rows(
 
     See Also
     --------
-    group
+    [`group`][triwarp.grouping.group]
     """
     twt.ensure_ndim(data, 2)
     hashed_rows = tw.unique.hash_indices_rows(data, max_value)

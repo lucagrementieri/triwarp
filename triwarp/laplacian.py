@@ -30,8 +30,8 @@ def cotmatrix_entries(
 
     See Also
     --------
-    :func:`cotmatrix_entries_intrinsic`
-    :func:`cotmatrix`
+    [`cotmatrix_entries_intrinsic`][triwarp.laplacian.cotmatrix_entries_intrinsic]
+    [`cotmatrix`][triwarp.laplacian.cotmatrix]
     """
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
@@ -67,8 +67,8 @@ def cotmatrix_entries_intrinsic(edge_lengths: twt.Array2dFloat32) -> twt.Array2d
 
     See Also
     --------
-    :func:`cotmatrix_entries`
-    :func:`cotmatrix`
+    [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries]
+    [`cotmatrix`][triwarp.laplacian.cotmatrix]
     """
     twt.ensure_ndim(edge_lengths, 2, dtype=wp.float32)
     n_faces = int(edge_lengths.shape[0])
@@ -105,8 +105,9 @@ def cotmatrix(
     faces
         Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
     cot_entries
-        Optional precomputed ``(n_faces, 3)`` weights from :func:`cotmatrix_entries`. When
-        ``None``, entries are computed from ``vertices`` and ``faces``.
+        Optional precomputed ``(n_faces, 3)`` weights from
+        [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries]. When ``None``, entries are
+        computed from ``vertices`` and ``faces``.
 
     Returns
     -------
@@ -116,8 +117,8 @@ def cotmatrix(
 
     See Also
     --------
-    :func:`cotmatrix_entries`
-    :func:`triwarp.graph.edges_to_csr`
+    [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries]
+    [`edges_to_csr`][triwarp.graph.edges_to_csr]
     """
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3

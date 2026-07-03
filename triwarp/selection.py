@@ -22,7 +22,7 @@ def submesh_from_face_indices(
 
     Gathers the selected face triplets, compacts referenced vertices, and remaps
     face indices into the compact vertex buffer. Matches the core geometry step of
-    :func:`trimesh.util.submesh` (without visuals, repair, watertight filtering, or
+    [`trimesh.util.submesh`][] (without visuals, repair, watertight filtering, or
     append).
 
     Parameters
@@ -31,7 +31,7 @@ def submesh_from_face_indices(
         ``(n_vertices,)`` mesh vertex positions on the target device.
     faces
         Length-``3 * n_faces`` flat triangle index buffer (same layout as
-        :func:`triwarp.graph.face_adjacency`).
+        [`face_adjacency`][triwarp.graph.face_adjacency]).
     face_indices
         1D ``wp.int32`` array of face indices into the source mesh
         (``0 .. n_faces - 1``), on the same device as ``vertices``.
@@ -52,10 +52,10 @@ def submesh_from_face_indices(
 
     See Also
     --------
-    :func:`submesh_from_face_mask`
-    :func:`submesh_from_vertex_indices`
-    :func:`triwarp.graph.concatenate`
-    :func:`trimesh.util.submesh`
+    [`submesh_from_face_mask`][triwarp.selection.submesh_from_face_mask]
+    [`submesh_from_vertex_indices`][triwarp.selection.submesh_from_vertex_indices]
+    [`concatenate`][triwarp.graph.concatenate]
+    [`trimesh.util.submesh`][]
     """
     device = vertices.device
     k = int(face_indices.shape[0])
@@ -107,7 +107,7 @@ def submesh_from_face_mask(
 
     See Also
     --------
-    :func:`submesh_from_face_indices`
+    [`submesh_from_face_indices`][triwarp.selection.submesh_from_face_indices]
     """
     face_indices = tw.array.flatnonzero(face_mask)
     return submesh_from_face_indices(vertices, faces, face_indices, unique_indices=True)
@@ -142,9 +142,9 @@ def submesh_from_vertex_indices(
 
     See Also
     --------
-    :func:`face_indices_from_vertex_indices`
-    :func:`submesh_from_vertex_mask`
-    :func:`submesh_from_face_indices`
+    [`face_indices_from_vertex_indices`][triwarp.selection.face_indices_from_vertex_indices]
+    [`submesh_from_vertex_mask`][triwarp.selection.submesh_from_vertex_mask]
+    [`submesh_from_face_indices`][triwarp.selection.submesh_from_face_indices]
     """
     face_indices = face_indices_from_vertex_indices(faces, vertex_indices, face_mode=face_mode)
     return submesh_from_face_indices(vertices, faces, face_indices, unique_indices=True)
@@ -169,7 +169,7 @@ def submesh_from_vertex_mask(
     vertex_mask
         Length-``n_vertices`` ``wp.bool`` array on the same device as ``vertices``.
     face_mode
-        Passed to :func:`submesh_from_vertex_indices`.
+        Passed to [`submesh_from_vertex_indices`][triwarp.selection.submesh_from_vertex_indices].
 
     Returns
     -------
@@ -183,7 +183,7 @@ def submesh_from_vertex_mask(
 
     See Also
     --------
-    :func:`submesh_from_vertex_indices`
+    [`submesh_from_vertex_indices`][triwarp.selection.submesh_from_vertex_indices]
     """
     n_vertices = int(vertices.shape[0])
     if int(vertex_mask.shape[0]) != n_vertices:
