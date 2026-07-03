@@ -15,6 +15,7 @@ dependencies = ["warp-lang>=1.14"]
 io = ["meshio>=5.0", "numpy>=1.20"]
 
 [dependency-groups]
+bench = ["pytest-benchmark>=5.1", { include-group = "test" }]
 dev = ["ruff>=0.9", "scipy-stubs>=1.17.1.5"]
 docs = [
     "mkdocs>=1.6",
