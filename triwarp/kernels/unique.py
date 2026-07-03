@@ -1,6 +1,11 @@
 import warp as wp
 
+from triwarp.kernels import array as kernel_array
+
 HASH_MULT_U64 = wp.constant(wp.uint64(11400714819323198485))  # 0x9e3779b97f4a7c15
+
+VEC3_PACK_PRECISION = wp.constant(wp.uint64(64 // 3))
+VEC3_PACK_SHIFT = wp.constant(wp.uint32(11))
 
 
 # ---------------------------------------------------------------------------
@@ -93,3 +98,68 @@ def compact_from_table(
         pos = scan_pos[h]
         out_keys[pos] = decode_key(slot_key[h])
         out_counts[pos] = slot_counts[h]
+
+
+@wp.kernel
+def pack_vec3(vectors: wp.array[wp.vec3], out_packed: wp.array[wp.uint64]) -> None:
+    tid = int(wp.tid())
+    vector = vectors[tid]
+
+    # 1. Bit-cast float32 to uint32 to look at raw bits
+    # 2. Shift right by 11 bits to discard the lower mantissa bits
+    ix = wp.cast(vector[0], wp.uint32) >> VEC3_PACK_SHIFT
+    iy = wp.cast(vector[1], wp.uint32) >> VEC3_PACK_SHIFT
+    iz = wp.cast(vector[2], wp.uint32) >> VEC3_PACK_SHIFT
+
+    # 3. Explicitly promote components to uint64 before shifting.
+    # This avoids 32-bit integer overflow during the large left-shifts (<< 21 and << 42)
+    packed_value = wp.uint64(ix) | (
+        (wp.uint64(iy) << VEC3_PACK_PRECISION)
+        | (wp.uint64(iz) << (VEC3_PACK_PRECISION + VEC3_PACK_PRECISION))
+    )
+
+    out_packed[tid] = packed_value
+
+
+@wp.kernel
+def pack_indices(
+    indices: wp.array2d[wp.int32], max_index: wp.uint64, out_packed: wp.array[wp.uint64]
+) -> None:
+    tid = int(wp.tid())
+    indices_row = indices[tid]
+    packed_value = wp.uint64(0)
+    power = wp.uint64(1)
+    for i in range(indices_row.shape[0]):
+        digit = wp.uint64(wp.uint32(indices_row[i]))
+        packed_value = packed_value + digit * power
+        power = power * max_index
+
+    out_packed[tid] = packed_value
+
+
+@wp.kernel
+def round_vec3_scaled(
+    vertices: wp.array[wp.vec3],
+    inv_epsilon: wp.float32,
+    out_rounded: wp.array2d[wp.int32],
+) -> None:
+    tid = int(wp.tid())
+    v = vertices[tid] * inv_epsilon
+    out_rounded[tid, 0] = wp.int32(wp.round(v[0]))
+    out_rounded[tid, 1] = wp.int32(wp.round(v[1]))
+    out_rounded[tid, 2] = wp.int32(wp.round(v[2]))
+
+
+@wp.kernel
+def sort_face_indices(
+    faces: wp.array2d[wp.int32],
+    out_sorted: wp.array2d[wp.int32],
+) -> None:
+    tid = int(wp.tid())
+    i0 = faces[tid, 0]
+    i1 = faces[tid, 1]
+    i2 = faces[tid, 2]
+    s0, s1, s2 = kernel_array.sort3(i0, i1, i2)
+    out_sorted[tid, 0] = wp.int32(s0)
+    out_sorted[tid, 1] = wp.int32(s1)
+    out_sorted[tid, 2] = wp.int32(s2)

@@ -474,7 +474,7 @@ def flatnonzero(mask: wp.array[wp.bool]) -> wp.array[wp.int32]:
 
     out_indices = wp.empty(n_out, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_array.scatter_compact_indices,
+        kernel_array.scatter_index_where,
         dim=n,
         inputs=[mask, exclusive, out_indices],
         device=device,

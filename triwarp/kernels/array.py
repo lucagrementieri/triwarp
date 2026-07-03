@@ -90,6 +90,18 @@ def normalize(array: wp.array[wp.vec3]) -> None:
 
 
 @wp.kernel
+def gather_1d_skip_negative(
+    indices: wp.array[wp.int32], table: wp.array[wp.int32], out_gathered: wp.array[wp.int32]
+) -> None:
+    tid = int(wp.tid())
+    index = indices[tid]
+    if index < wp.int32(0):
+        out_gathered[tid] = index
+    else:
+        out_gathered[tid] = table[index]
+
+
+@wp.kernel
 def gather_2d_from_1d(
     array: wp.array[wp.Scalar], indices: wp.array2d[wp.int32], out_gathered: wp.array2d[wp.Scalar]
 ) -> None:
@@ -168,6 +180,18 @@ def mark_membership_mask(indices: wp.array[wp.int32], mask: wp.array[wp.bool]) -
 
 
 @wp.kernel
+def mark_membership_mask_bounded(
+    indices: wp.array[wp.int32],
+    n: wp.int32,
+    out_mask: wp.array[wp.bool],
+) -> None:
+    tid = int(wp.tid())
+    index = indices[tid]
+    if index >= wp.int32(0) and index < n:
+        out_mask[index] = wp.bool(True)
+
+
+@wp.kernel
 def isin_lookup_mask(
     elements: wp.array[wp.int32], membership: wp.array[wp.bool], out_mask: wp.array[wp.bool]
 ) -> None:
@@ -184,12 +208,18 @@ def isin_lookup_sorted(
 
 
 @wp.kernel
-def scatter_compact_indices(
-    mask: wp.array[wp.bool], exclusive_offsets: wp.array[wp.int32], out_indices: wp.array[wp.int32]
+def scatter_index(index: wp.array[wp.int32], out_scattered: wp.array[wp.int32]) -> None:
+    tid = int(wp.tid())
+    out_scattered[index[tid]] = wp.int32(tid)
+
+
+@wp.kernel
+def scatter_index_where(
+    mask: wp.array[wp.bool], offset: wp.array[wp.int32], out_scattered: wp.array[wp.int32]
 ) -> None:
     i = int(wp.tid())
     if mask[i]:
-        out_indices[exclusive_offsets[i]] = wp.int32(i)
+        out_scattered[offset[i]] = wp.int32(i)
 
 
 @wp.func
