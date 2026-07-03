@@ -742,6 +742,19 @@ wheels = [
 ]
 
 [[package]]
+name = "meshio"
+version = "5.3.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "rich" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/20/1e/caa4f15c020de3e3486b4133ca689236bd3863a3d6dd0f58e97ce86a296a/meshio-5.3.5.tar.gz", hash = "sha256:f21f01abd9f29ba06ea119304b3d39e610421cfe93b9dd23362834919f87586d", size = 490922, upload-time = "2024-01-31T15:09:41.731Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/89/5f/39cbadc320cd78f4834b0a9f7a2fa3c980dca942bf193f315837eacb8870/meshio-5.3.5-py3-none-any.whl", hash = "sha256:0736c6e34ecc768f62f2cde5d8233a3529512a9399b25c68ea2ca0d5900cdc10", size = 166162, upload-time = "2024-01-31T15:09:36.691Z" },
+]
+
+[[package]]
 name = "mkdocs"
 version = "1.6.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1645,8 +1658,15 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+io = [
+    { name = "meshio" },
+]
+
+[package.dev-dependencies]
 dev = [
     { name = "ruff" },
+    { name = "scipy-stubs", version = "1.17.1.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "scipy-stubs", version = "1.18.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 docs = [
     { name = "mkdocs" },
@@ -1660,6 +1680,8 @@ test = [
     { name = "embreex" },
     { name = "libigl" },
     { name = "manifold3d" },
+    { name = "meshio" },
+    { name = "numpy" },
     { name = "pytest" },
     { name = "pyvista" },
     { name = "rtree" },
@@ -1668,36 +1690,39 @@ test = [
     { name = "trimesh" },
 ]
 
-[package.dev-dependencies]
-dev = [
-    { name = "scipy-stubs", version = "1.17.1.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "scipy-stubs", version = "1.18.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-]
-
 [package.metadata]
 requires-dist = [
-    { name = "embreex", marker = "extra == 'test'", specifier = ">=4.4" },
-    { name = "libigl", marker = "extra == 'test'", specifier = ">=2.6" },
-    { name = "manifold3d", marker = "extra == 'test'", specifier = ">=2.3.0" },
-    { name = "mkdocs", marker = "extra == 'docs'", specifier = ">=1.6" },
-    { name = "mkdocs-gen-files", marker = "extra == 'docs'", specifier = ">=0.5" },
-    { name = "mkdocs-literate-nav", marker = "extra == 'docs'", specifier = ">=0.6" },
-    { name = "mkdocs-material", marker = "extra == 'docs'", specifier = ">=9.5" },
-    { name = "mkdocs-section-index", marker = "extra == 'docs'", specifier = ">=0.3" },
-    { name = "mkdocstrings", extras = ["python"], marker = "extra == 'docs'", specifier = ">=0.27" },
-    { name = "pytest", marker = "extra == 'test'", specifier = ">=9.0" },
-    { name = "pyvista", marker = "extra == 'test'", specifier = ">=0.48" },
-    { name = "rtree", marker = "extra == 'test'", specifier = ">=0.12" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9" },
-    { name = "scipy", marker = "extra == 'test'", specifier = ">=1.17" },
-    { name = "shapely", marker = "extra == 'test'", specifier = ">=2.1.2" },
-    { name = "trimesh", marker = "extra == 'test'", specifier = ">=4.11" },
+    { name = "meshio", marker = "extra == 'io'", specifier = ">=5.3" },
     { name = "warp-lang", specifier = ">=1.14" },
 ]
-provides-extras = ["dev", "docs", "test"]
+provides-extras = ["io"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "scipy-stubs", specifier = ">=1.17.1.5" }]
+dev = [
+    { name = "ruff", specifier = ">=0.9" },
+    { name = "scipy-stubs", specifier = ">=1.17.1.5" },
+]
+docs = [
+    { name = "mkdocs", specifier = ">=1.6" },
+    { name = "mkdocs-gen-files", specifier = ">=0.5" },
+    { name = "mkdocs-literate-nav", specifier = ">=0.6" },
+    { name = "mkdocs-material", specifier = ">=9.5" },
+    { name = "mkdocs-section-index", specifier = ">=0.3" },
+    { name = "mkdocstrings", extras = ["python"], specifier = ">=0.27" },
+]
+test = [
+    { name = "embreex", specifier = ">=4.4" },
+    { name = "libigl", specifier = ">=2.6" },
+    { name = "manifold3d", specifier = ">=2.3.0" },
+    { name = "meshio", specifier = ">=5.3" },
+    { name = "numpy", specifier = ">=2.4.4" },
+    { name = "pytest", specifier = ">=9.0" },
+    { name = "pyvista", specifier = ">=0.48" },
+    { name = "rtree", specifier = ">=0.12" },
+    { name = "scipy", specifier = ">=1.17" },
+    { name = "shapely", specifier = ">=2.1.2" },
+    { name = "trimesh", specifier = ">=4.11" },
+]
 
 [[package]]
 name = "typing-extensions"

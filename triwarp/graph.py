@@ -94,7 +94,10 @@ def face_adjacency(
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
     edges_face = tw.edges.edges_face(faces)
-    edge_groups = tw.grouping.group_int_rows(edges_sorted, length=2, max_value=n_faces)
+    # Hash edge rows over the vertex-index range (inferred max + 1); using ``n_faces`` as the base
+    # is wrong whenever the largest vertex index is >= n_faces (e.g. small meshes with more
+    # vertices than faces). The grouping partition is invariant to the (sufficiently large) base.
+    edge_groups = tw.grouping.group_int_rows(edges_sorted, length=2)
     adjacency = twt.empty_int32_2d((edge_groups.shape[0], 2), device=faces.device)
     wp.launch(
         kernel_array.gather_2d_from_1d,
@@ -105,12 +108,13 @@ def face_adjacency(
     tw.array.sort_rows(adjacency)
     if return_edges:
         adjacency_edges = twt.empty_int32_2d((edge_groups.shape[0], 2), device=faces.device)
-        wp.launch(
-            kernel_array.gather_rows,
-            dim=edge_groups.shape[0],
-            inputs=[edges_sorted, edge_groups[:, 0], adjacency_edges],
-            device=faces.device,
-        )
+        if edge_groups.shape[0] > 0:
+            wp.launch(
+                kernel_array.gather_rows,
+                dim=edge_groups.shape[0],
+                inputs=[edges_sorted, edge_groups[:, 0], adjacency_edges],
+                device=faces.device,
+            )
         return twt.as_array2d_int32(adjacency), twt.as_array2d_int32(adjacency_edges)
     return twt.as_array2d_int32(adjacency)
 

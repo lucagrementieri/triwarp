@@ -18,3 +18,10 @@ site/
 docs/api/
 docs/SUMMARY.md
 
+# Mesh files
+*.obj
+*.off
+*.ply
+*.stl
+tests/data/
+benchmarks/data/

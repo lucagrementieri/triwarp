@@ -3,6 +3,7 @@
 from . import (
     array,
     boundary,
+    characteristics,
     convex,
     curvature,
     edges,
@@ -10,6 +11,7 @@ from . import (
     grouping,
     interpolation,
     intersections,
+    io,
     laplacian,
     points,
     proximity,
@@ -29,6 +31,7 @@ from . import (
 __all__ = [
     "array",
     "boundary",
+    "characteristics",
     "convex",
     "curvature",
     "edges",
@@ -36,6 +39,7 @@ __all__ = [
     "grouping",
     "interpolation",
     "intersections",
+    "io",
     "laplacian",
     "points",
     "proximity",

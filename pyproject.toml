@@ -9,12 +9,13 @@ readme = "README.md"
 requires-python = ">=3.11"
 version = "0.1.0"
 
-dependencies = [
-    "warp-lang>=1.14",
-]
+dependencies = ["warp-lang>=1.14"]
 
 [project.optional-dependencies]
-dev = ["ruff>=0.9"]
+io = ["meshio>=5.0", "numpy>=1.20"]
+
+[dependency-groups]
+dev = ["ruff>=0.9", "scipy-stubs>=1.17.1.5"]
 docs = [
     "mkdocs>=1.6",
     "mkdocs-material>=9.5",
@@ -28,12 +29,15 @@ test = [
     "embreex>=4.4",
     "libigl>=2.6",
     "manifold3d>=2.3.0",
+    "meshio>=5.3",
+    "numpy>=2.4.4",
     "pyvista>=0.48",
     "rtree>=0.12",
     "scipy>=1.17",
     "shapely>=2.1.2",
-    "trimesh>=4.11"
+    "trimesh>=4.11",
 ]
+
 
 [tool.setuptools.packages.find]
 exclude = ["reference*"]
@@ -99,8 +103,3 @@ warp = "wp"
 
 [tool.ruff.format]
 skip-magic-trailing-comma = true
-
-[dependency-groups]
-dev = [
-    "scipy-stubs>=1.17.1.5",
-]
