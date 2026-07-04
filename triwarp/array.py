@@ -152,10 +152,11 @@ def pack_1d_arrays(
     arrays: Sequence[wp.array[wp.Scalar]],
 ) -> tuple[wp.array[wp.Scalar], wp.array[wp.int32]]:
     """
-    Concatenate several 1-D ``warp.array`` instances into one buffer plus CSR-style offsets.
+    Concatenate several 1-D ``warp.array`` instances into one buffer plus per-segment offsets.
 
-    Each input segment ``i`` occupies ``flat[offsets[i] : offsets[i + 1]]``. This is the usual
-    packed representation for variable-length per-item lists on the device (no nested arrays).
+    Segment ``i`` starts at ``offsets[i]`` in ``flat``; its length is ``arrays[i].size``, so it
+    occupies ``flat[offsets[i] : offsets[i] + arrays[i].size]``. This is the usual packed
+    representation for variable-length per-item lists on the device (no nested arrays).
 
     Parameters
     ----------
@@ -168,8 +169,11 @@ def pack_1d_arrays(
         1-D array of length ``sum(a.size for a in arrays)``, same ``dtype`` and ``device`` as
         the inputs.
     offsets
-        Length ``len(arrays) + 1``, ``dtype`` ``wp.int32``, same ``device`` as the inputs.
-        ``offsets[0] == 0`` and ``offsets[-1] == flat.size``.
+        Length ``len(arrays)`` (the start offset of each segment, an exclusive scan of the
+        segment sizes), ``dtype`` ``wp.int32``, same ``device`` as the inputs. ``offsets[0] == 0``.
+        This is *not* a trailing-sentinel CSR array — there is no ``offsets[-1] == flat.size``
+        terminator, so the last segment's length must be taken from ``arrays[-1].size`` (or
+        ``flat.size - offsets[-1]``).
 
     Raises
     ------
@@ -254,6 +258,64 @@ def concatenate(arrays: Sequence[wp.array[DType]]) -> wp.array[DType]:
             wp.copy(out, arr, dest_offset=dest, count=n)
             dest += n
     return out
+
+
+def allclose(
+    a: wp.array[wp.float32] | wp.array[wp.vec3],
+    b: wp.array[wp.float32] | wp.array[wp.vec3],
+    *,
+    rtol: float = 1e-05,
+    atol: float = 1e-08,
+) -> bool:
+    """
+    Test whether two arrays are element-wise equal within a tolerance (``numpy.allclose``).
+
+    Reduces ``|a - b| <= atol + rtol * |b|`` (element-wise, and component-wise for ``wp.vec3``)
+    to a single Python ``bool`` on-device, without copying either array to the host. Matches the
+    asymmetric ``numpy.allclose`` / ``torch.allclose`` tolerance convention.
+
+    Parameters
+    ----------
+    a
+        Length-``n`` ``wp.float32`` or ``wp.vec3`` array on the target device.
+    b
+        Array of the same length and dtype as ``a``, on the same device.
+    rtol
+        Relative tolerance. Defaults to ``1e-05``.
+    atol
+        Absolute tolerance. Defaults to ``1e-08``.
+
+    Returns
+    -------
+    bool
+        ``True`` when every element (every component, for ``wp.vec3``) is within tolerance.
+        ``True`` for empty inputs, following the ``numpy.allclose`` convention.
+
+    Raises
+    ------
+    ValueError
+        If ``a`` and ``b`` have different lengths or dtypes.
+    """
+    if a.dtype != b.dtype:
+        raise ValueError(f"allclose requires matching dtypes, got {a.dtype} and {b.dtype}")
+    n = int(a.shape[0])
+    if n != int(b.shape[0]):
+        raise ValueError(f"allclose requires equal lengths, got {n} and {b.shape[0]}")
+    if n == 0:
+        return True
+
+    device = a.device
+    mask = wp.empty(n, dtype=wp.bool, device=device)
+    kernel = (
+        kernel_array.allclose_mask_vec3 if a.dtype == wp.vec3 else kernel_array.allclose_mask_scalar
+    )
+    wp.launch(
+        kernel,
+        dim=n,
+        inputs=[a, b, wp.float32(rtol), wp.float32(atol), mask],
+        device=device,
+    )
+    return bool(tw.reduce.all(mask))
 
 
 def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
@@ -522,6 +584,32 @@ def gather(src: wp.array[DType], indices: wp.array[wp.int32]) -> wp.array[DType]
     out = wp.empty(out_shape, dtype=src.dtype, device=src.device)
     if k > 0:
         wp.copy(out, src[indices])
+    return out
+
+
+def square(values: wp.array[wp.Scalar]) -> wp.array[wp.Scalar]:
+    """
+    Element-wise square of a scalar array.
+
+    Computes ``out[i] = values[i] ** 2`` on the device, returning a freshly
+    allocated array of the same dtype and length.
+
+    Parameters
+    ----------
+    values
+        Length-``n`` scalar Warp array (e.g. ``wp.float32`` or ``wp.int32``).
+
+    Returns
+    -------
+    wp.array[wp.Scalar]
+        Length-``n`` squared values on ``values.device``. Empty when ``n == 0``.
+    """
+    device = values.device
+    n = int(values.shape[0])
+    out = wp.empty(n, dtype=values.dtype, device=device)
+    if n == 0:
+        return out
+    wp.launch(kernel_array.square, dim=n, inputs=[values, out], device=device)
     return out
 
 

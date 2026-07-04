@@ -57,6 +57,14 @@ def divide_arrays_if_positive(array: wp.array[Any], divisor: wp.array[wp.Scalar]
 
 
 @wp.kernel
+def square(values: wp.array[wp.Scalar], out_squared: wp.array[wp.Scalar]) -> None:
+    # Generic element-wise square of a scalar array.
+    i = int(wp.tid())
+    v = values[i]
+    out_squared[i] = v * v
+
+
+@wp.kernel
 def init_range(out: wp.array[wp.Int]) -> None:
     i = int(wp.tid())
     out[i] = i
@@ -234,6 +242,36 @@ def vector_angle(
 ) -> None:
     tid = int(wp.tid())
     out_angles[tid] = vector_angle_vec(a[tid], b[tid])
+
+
+@wp.kernel
+def allclose_mask_scalar(
+    a: wp.array[wp.float32],
+    b: wp.array[wp.float32],
+    rtol: wp.float32,
+    atol: wp.float32,
+    out_mask: wp.array[wp.bool],
+) -> None:
+    i = int(wp.tid())
+    out_mask[i] = wp.abs(a[i] - b[i]) <= atol + rtol * wp.abs(b[i])
+
+
+@wp.kernel
+def allclose_mask_vec3(
+    a: wp.array[wp.vec3],
+    b: wp.array[wp.vec3],
+    rtol: wp.float32,
+    atol: wp.float32,
+    out_mask: wp.array[wp.bool],
+) -> None:
+    i = int(wp.tid())
+    av = a[i]
+    bv = b[i]
+    close = True
+    for k in range(3):
+        if wp.abs(av[k] - bv[k]) > atol + rtol * wp.abs(bv[k]):
+            close = False
+    out_mask[i] = close
 
 
 @wp.func

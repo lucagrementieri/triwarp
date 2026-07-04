@@ -2,8 +2,10 @@
 Mesh repair utilities (libigl unreferenced/duplicated vertex and duplicated face cleanup).
 
 See [`remove_unreferenced_vertices`][triwarp.repair.remove_unreferenced_vertices],
-[`remove_duplicated_vertices`][triwarp.repair.remove_duplicated_vertices], and
-[`resolve_duplicated_faces`][triwarp.repair.resolve_duplicated_faces].
+[`remove_duplicated_vertices`][triwarp.repair.remove_duplicated_vertices],
+[`resolve_duplicated_faces`][triwarp.repair.resolve_duplicated_faces],
+[`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces], and
+[`collapse_small_triangles`][triwarp.repair.collapse_small_triangles].
 """
 
 from __future__ import annotations
@@ -210,6 +212,155 @@ def resolve_duplicated_faces(
     return resolved, kept_wp
 
 
+def remove_degenerate_faces(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Drop degenerate (zero-area) triangles and reindex, keeping vertex positions unchanged.
+
+    Mirrors ``trimesh.Trimesh.nondegenerate_faces`` + ``update_faces``: a face is degenerate when
+    two of its vertices coincide or its three vertices are collinear, detected by
+    [`nondegenerate`][triwarp.triangles.nondegenerate] (both triangle altitudes exceed the merge
+    tolerance). Surviving faces are unchanged; vertices left unreferenced after the drop are
+    removed by the reindexing in
+    [`submesh_from_face_mask`][triwarp.selection.submesh_from_face_mask].
+
+    Unlike [`collapse_small_triangles`][triwarp.repair.collapse_small_triangles], no vertices are
+    merged and no edges are collapsed: this only removes faces already degenerate in the input.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+
+    Returns
+    -------
+    new_vertices : wp.array[wp.vec3]
+        Vertices still referenced by a non-degenerate face, compacted from index zero.
+    new_faces : wp.array[wp.int32]
+        Flat buffer of the non-degenerate faces, remapped into ``new_vertices``.
+
+    See Also
+    --------
+    [`collapse_small_triangles`][triwarp.repair.collapse_small_triangles]
+    [`nondegenerate`][triwarp.triangles.nondegenerate]
+    [`trimesh.triangles.nondegenerate`][]
+    """
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return wp.clone(vertices), wp.clone(faces)
+
+    keep_mask = tw.triangles.nondegenerate(vertices, faces)
+    return tw.selection.submesh_from_face_mask(vertices, faces, keep_mask)
+
+
+def collapse_small_triangles(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], epsilon: float = 1e-6
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Collapse triangles smaller than a bounding-box-relative area threshold (libigl).
+
+    Mirrors ``igl::collapse_small_triangles``. A triangle is *small* when its doubled area is below
+    ``2 * epsilon * bbd ** 2``, where ``bbd`` is the diagonal of the axis-aligned bounding box of
+    ``vertices``. Each small triangle has its **shortest edge** collapsed by merging that edge's two
+    endpoints; the merged face (now carrying a repeated vertex) is discarded. The process repeats to
+    a fixpoint, so triangles that only become small after a neighbouring collapse are also removed.
+
+    This subsumes degenerate-triangle removal: an exactly degenerate face (zero area) is always
+    below the threshold, so passing a small ``epsilon`` removes it. To drop only degenerate faces
+    without any bounding-box-relative collapsing, use
+    [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces].
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    epsilon
+        Relative area tolerance. The doubled-area threshold is ``2 * epsilon * bbd ** 2``; larger
+        values collapse more (and larger) triangles.
+
+    Returns
+    -------
+    new_vertices : wp.array[wp.vec3]
+        Vertices surviving the collapse, compacted from index zero.
+    new_faces : wp.array[wp.int32]
+        Flat buffer of the surviving faces, remapped into ``new_vertices``.
+
+    See Also
+    --------
+    [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
+    [`nondegenerate`][triwarp.triangles.nondegenerate]
+
+    Notes
+    -----
+    Where ``igl::collapse_small_triangles`` merges vertices by a sequentially updated index map and
+    recurses until no edge collapses, this resolves all shortest-edge merges of one pass at once via
+    the connected-components closure of
+    [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges],
+    then loops over the shrinking mesh. Both converge to a mesh with no sub-threshold triangle. The
+    surviving vertex of a collapsed edge keeps the position of the component representative (the
+    lowest original index in its class) rather than libigl's longest-edge-preserving endpoint; for
+    sub-threshold triangles the two endpoints are close enough that the difference is negligible.
+    The bounding-box diagonal is measured once on the input ``vertices`` so the threshold is fixed
+    across iterations.
+    """
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0 or int(vertices.shape[0]) == 0:
+        return wp.clone(vertices), wp.clone(faces)
+
+    bbd = tw.proximity.default_mesh_query_max_dist(vertices)
+    min_dbl_area = wp.float32(2.0 * epsilon * bbd * bbd)
+
+    current_vertices = vertices
+    current_faces = faces
+    max_iterations = int(faces.shape[0])  # bounded: each collapsing pass drops at least one face
+    for _ in range(max_iterations):
+        n_current = int(current_faces.shape[0]) // 3
+        if n_current == 0:
+            break
+
+        pairs = twt.empty_int32_2d((n_current, 2), device=device)
+        flag = wp.empty(n_current, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_repair.small_triangle_collapse_edges,
+            dim=n_current,
+            inputs=[current_vertices, current_faces, min_dbl_area, pairs, flag],
+            device=device,
+        )
+
+        if int(tw.reduce.sum(flag)) == 0:
+            break
+
+        # Non-flagged faces emit a self-pair (i0, i0); these are self-loops that leave the
+        # connected-components closure unchanged, so all rows can be passed without filtering.
+        n_vertices = int(current_vertices.shape[0])
+        labels = tw.graph.connected_component_labels_from_edges(pairs, node_count=n_vertices)
+
+        unique_labels, inverse = unique_1d(labels, return_inverse=True)
+        n_unique = int(unique_labels.shape[0])
+        unique_indices = wp.full(n_unique, wp.int32(n_vertices), dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_edges.scatter_first_occurrence,
+            dim=n_vertices,
+            inputs=[inverse, unique_indices],
+            device=device,
+        )
+        class_vertices = tw.array.gather(current_vertices, unique_indices)
+        remapped_faces = _remap_flat_indices(current_faces, inverse)
+
+        keep_mask = tw.triangles.nondegenerate(class_vertices, remapped_faces)
+        current_vertices, current_faces = tw.selection.submesh_from_face_mask(
+            class_vertices, remapped_faces, keep_mask
+        )
+
+    return current_vertices, current_faces
+
+
 def make_winding_consistent(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
     """
     Flip faces so every shared edge is traversed in opposite directions by its two faces.
@@ -235,7 +386,7 @@ def make_winding_consistent(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
     --------
     [`is_winding_consistent`][triwarp.characteristics.is_winding_consistent]
     [`face_orientation_mask`][triwarp.characteristics.face_orientation_mask]
-    [`make_normals_consistent`][triwarp.repair.make_normals_consistent]
+    [`make_normals_outward`][triwarp.repair.make_normals_outward]
 
     Notes
     -----
@@ -290,7 +441,7 @@ def make_volume(
     --------
     [`is_volume`][triwarp.characteristics.is_volume]
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
-    [`make_normals_consistent`][triwarp.repair.make_normals_consistent]
+    [`make_normals_outward`][triwarp.repair.make_normals_outward]
 
     Notes
     -----
@@ -299,7 +450,7 @@ def make_volume(
     multibody path, this does not skip components that are not watertight/consistently wound: an
     open component's signed volume is ill-defined and may be flipped spuriously. Run
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent] first (see
-    [`make_normals_consistent`][triwarp.repair.make_normals_consistent]) and reserve ``multibody``
+    [`make_normals_outward`][triwarp.repair.make_normals_outward]) and reserve ``multibody``
     for meshes whose bodies are individually closed.
     """
     n_faces = int(faces.shape[0]) // 3
@@ -355,7 +506,7 @@ def make_volume(
     return out_faces
 
 
-def make_normals_consistent(
+def make_normals_outward(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], multibody: bool = False
 ) -> wp.array[wp.int32]:
     """

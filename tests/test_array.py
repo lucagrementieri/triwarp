@@ -68,6 +68,20 @@ def test_append_empty(device: str) -> None:
     assert np.array_equal(out_wp.numpy(), np.array([5], dtype=np.int32))
 
 
+def test_square(device: str) -> None:
+    rng = np.random.default_rng(0)
+    values_np = (rng.random(64, dtype=np.float32) * 4.0 - 2.0).astype(np.float32)
+    values_wp = wp.array(values_np, dtype=wp.float32, device=device)
+    squared_wp = tw.array.square(values_wp)
+    assert np.allclose(squared_wp.numpy(), values_np**2, rtol=1e-5, atol=1e-5)
+
+
+def test_square_empty(device: str) -> None:
+    values_wp = wp.empty(0, dtype=wp.float32, device=device)
+    squared_wp = tw.array.square(values_wp)
+    assert squared_wp.shape == (0,)
+
+
 def test_concatenate(device: str) -> None:
     parts = [
         wp.array([0, 3], dtype=wp.int32, device=device),

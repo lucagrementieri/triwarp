@@ -1737,14 +1737,14 @@ wheels = [
 
 [[package]]
 name = "trimesh"
-version = "4.11.5"
+version = "5.0.0rc1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/0d/bf/53b69f3b6708c20ceb4d1d1250c7dc205733eb646659e5e55771f76ffabd/trimesh-4.11.5.tar.gz", hash = "sha256:b90e6cdd6ada51c52d4a7d32947f4ce44b6751c5b7cab2b04e271ecea1e397d3", size = 836449, upload-time = "2026-03-25T01:08:24.216Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4f/73/1c56a0e3a91dcb36d0957b2d87087cd3300e4b341ee0eb1711f71760d589/trimesh-5.0.0rc1.tar.gz", hash = "sha256:2f48db2cb769ad379dadbee16fcf8c36b4814c72bf237f3c5941076abc829e61", size = 849395, upload-time = "2026-06-24T04:58:35.013Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/24/83/72e812f772daee66651f468c7b2535fa05eac27db26df7e614cae823c832/trimesh-4.11.5-py3-none-any.whl", hash = "sha256:b225a94c8af79569f7167ca7eaaab4fd05c260da58a075599453d655835258ef", size = 740833, upload-time = "2026-03-25T01:08:21.397Z" },
+    { url = "https://files.pythonhosted.org/packages/62/a7/5d3fc0b3da684a9984438e8ba00d8d5528013ba32836894bb18875590d5b/trimesh-5.0.0rc1-py3-none-any.whl", hash = "sha256:2ebd562ede63ab2089ab751f5fd151758c5009aa903dfd18add5cdcfd7cfcc36", size = 742125, upload-time = "2026-06-24T04:58:33.386Z" },
 ]
 
 [[package]]
@@ -1830,7 +1830,7 @@ bench = [
     { name = "rtree", specifier = ">=0.12" },
     { name = "scipy", specifier = ">=1.17" },
     { name = "shapely", specifier = ">=2.1.2" },
-    { name = "trimesh", specifier = ">=4.11" },
+    { name = "trimesh", specifier = ">=5.0.0rc1" },
 ]
 dev = [
     { name = "ruff", specifier = ">=0.9" },
@@ -1857,7 +1857,7 @@ test = [
     { name = "rtree", specifier = ">=0.12" },
     { name = "scipy", specifier = ">=1.17" },
     { name = "shapely", specifier = ">=2.1.2" },
-    { name = "trimesh", specifier = ">=4.11" },
+    { name = "trimesh", specifier = ">=5.0.0rc1" },
 ]
 
 [[package]]

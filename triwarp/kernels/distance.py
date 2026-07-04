@@ -1,0 +1,112 @@
+"""
+Differentiable kernels for Chamfer distance losses.
+
+The nearest-neighbor / closest-face assignment is a non-differentiable ``argmin``
+and is computed by the proximity primitives *outside* the autodiff tape (see
+[`triwarp.distance`][]). These kernels consume that fixed assignment and compute
+per-element squared distances as pure arithmetic of the input coordinates, so
+Warp's reverse-mode autodiff (``wp.Tape``) flows gradients back to the point
+positions (and, for the surface terms, the mesh vertices).
+
+Each term accumulates a *scaled* contribution into a length-1 loss accumulator via
+``wp.atomic_add`` (which has a well-defined adjoint), so ``"sum"`` and ``"mean"``
+reductions differ only by the ``scale`` passed from Python scope. Following the
+``pytorch3d`` convention the distances are **squared** Euclidean distances.
+"""
+
+import warp as wp
+
+# Relative coplanarity tolerance for the triangle-interior test, matching
+# warp.fem's ``project_on_tri_at_origin``.
+_TRI_DET_TOLERANCE = wp.constant(wp.float32(1.0e-6))
+
+
+@wp.func
+def project_segment_sq_dist(q: wp.vec3, segment: wp.vec3, length_sq: wp.float32) -> wp.float32:
+    """Squared distance from ``q`` to the segment ``[0, segment]`` (clamped projection)."""
+    s = wp.clamp(wp.dot(q, segment) / length_sq, wp.float32(0.0), wp.float32(1.0))
+    return wp.length_sq(q - s * segment)
+
+
+@wp.func
+def point_triangle_sq_dist(p: wp.vec3, a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.float32:
+    """
+    Squared Euclidean distance from point ``p`` to triangle ``(a, b, c)``.
+
+    Adapts warp.fem's ``project_on_tri_at_origin``: the closest point lies either in
+    the triangle interior (barycentric ``s, t`` both non-negative with ``s + t <= 1``)
+    or on one of the three edges. Every branch is a smooth function of ``p, a, b, c``,
+    so Warp differentiates whichever branch is taken. Degenerate (near-zero-area)
+    triangles fall through to the edge projections.
+    """
+    q = p - a
+    e1 = b - a
+    e2 = c - a
+    e1e1 = wp.dot(e1, e1)
+    e1e2 = wp.dot(e1, e2)
+    e2e2 = wp.dot(e2, e2)
+    det = e1e1 * e2e2 - e1e2 * e1e2
+
+    # Initialize before branching (Warp leaves branch-local variables uninitialized
+    # when the branch is not taken).
+    dist_sq = wp.float32(0.0)
+    inside = wp.int32(0)
+    if det > e1e1 * e2e2 * _TRI_DET_TOLERANCE:
+        e1p = wp.dot(e1, q)
+        e2p = wp.dot(e2, q)
+        s = (e2e2 * e1p - e1e2 * e2p) / det
+        t = (e1e1 * e2p - e1e2 * e1p) / det
+        if s >= wp.float32(0.0) and t >= wp.float32(0.0) and s + t <= wp.float32(1.0):
+            dist_sq = wp.length_sq(q - s * e1 - t * e2)
+            inside = wp.int32(1)
+
+    if inside == wp.int32(0):
+        d_e1 = project_segment_sq_dist(q, e1, e1e1)
+        d_e2 = project_segment_sq_dist(q, e2, e2e2)
+        d_e12 = project_segment_sq_dist(q - e1, e2 - e1, wp.length_sq(e2 - e1))
+        dist_sq = wp.min(wp.min(d_e1, d_e2), d_e12)
+
+    return dist_sq
+
+
+@wp.kernel
+def chamfer_nn_term(
+    x: wp.array[wp.vec3],
+    y: wp.array[wp.vec3],
+    nearest: wp.array[wp.int32],
+    scale: wp.float32,
+    out_loss: wp.array[wp.float32],
+) -> None:
+    """
+    Accumulate ``scale * ||x[i] - y[nearest[i]]||^2`` into ``out_loss[0]``.
+
+    ``nearest[i]`` is the (fixed, non-differentiable) index in ``y`` closest to ``x[i]``.
+    """
+    i = wp.tid()
+    diff = x[i] - y[nearest[i]]
+    wp.atomic_add(out_loss, 0, scale * wp.dot(diff, diff))
+
+
+@wp.kernel
+def chamfer_surface_term(
+    points: wp.array[wp.vec3],
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_id: wp.array[wp.int32],
+    scale: wp.float32,
+    out_loss: wp.array[wp.float32],
+) -> None:
+    """
+    Accumulate ``scale * d(points[i], triangle face_id[i])^2`` into ``out_loss[0]``.
+
+    ``face_id[i]`` is the (fixed, non-differentiable) index of the triangle of the mesh
+    closest to ``points[i]``. Gradients flow to both ``points`` and ``vertices``. Points
+    with ``face_id[i] < 0`` (no face within the search radius) contribute nothing.
+    """
+    i = wp.tid()
+    f = face_id[i]
+    if f >= 0:
+        a = vertices[faces[3 * f + 0]]
+        b = vertices[faces[3 * f + 1]]
+        c = vertices[faces[3 * f + 2]]
+        wp.atomic_add(out_loss, 0, scale * point_triangle_sq_dist(points[i], a, b, c))

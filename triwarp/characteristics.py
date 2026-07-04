@@ -7,7 +7,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.kernels import characteristics as kernel_characteristics
-from triwarp.kernels import intersections as kernel_intersections
+from triwarp.kernels import intersection as kernel_intersections
 from triwarp.kernels import sample as kernel_sample
 
 
@@ -335,7 +335,7 @@ def is_self_intersecting(
     See Also
     --------
     [`self_intersecting_face_mask`][triwarp.characteristics.self_intersecting_face_mask]
-    [`mesh_with_mesh`][triwarp.intersections.mesh_with_mesh]
+    [`mesh_with_mesh`][triwarp.intersection.mesh_with_mesh]
     [`is_watertight`][triwarp.characteristics.is_watertight]
 
     Notes

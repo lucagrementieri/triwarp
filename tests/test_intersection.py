@@ -1,4 +1,4 @@
-"""Regression tests for ``triwarp.intersections`` against Trimesh (CPU reference)."""
+"""Regression tests for ``triwarp.intersection`` against Trimesh (CPU reference)."""
 
 from __future__ import annotations
 
@@ -70,7 +70,7 @@ def test_segments_with_plane_axis_aligned(device: str) -> None:
 
     start_points_wp = wp.array(endpoints_np[0], dtype=wp.vec3, device=device)
     end_points_wp = wp.array(endpoints_np[1], dtype=wp.vec3, device=device)
-    intersections_wp, valid_wp = tw.intersections.segments_with_plane(
+    intersections_wp, valid_wp = tw.intersection.segments_with_plane(
         start_points_wp,
         end_points_wp,
         wp.vec3(*plane_origin.tolist()),
@@ -95,7 +95,7 @@ def test_segments_with_plane_parallel(device: str) -> None:
 
     start_points_wp = wp.array(endpoints_np[0], dtype=wp.vec3, device=device)
     end_points_wp = wp.array(endpoints_np[1], dtype=wp.vec3, device=device)
-    _, valid_wp = tw.intersections.segments_with_plane(
+    _, valid_wp = tw.intersection.segments_with_plane(
         start_points_wp,
         end_points_wp,
         wp.vec3(*plane_origin.tolist()),
@@ -108,7 +108,7 @@ def test_segments_with_plane_parallel(device: str) -> None:
 def test_mesh_with_plane_empty(device: str) -> None:
     vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    lines_wp = tw.intersections.mesh_with_plane(
+    lines_wp = tw.intersection.mesh_with_plane(
         vertices_wp, faces_wp, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0)
     )
     assert lines_wp.shape == (0, 2)
@@ -130,7 +130,7 @@ def test_mesh_with_plane_axis_planes(request: pytest.FixtureRequest, mesh_name: 
         lines_tm = tm_intersections.mesh_plane(
             mesh=mesh_tm, plane_normal=plane_normal, plane_origin=plane_origin
         )
-        lines_wp = tw.intersections.mesh_with_plane(
+        lines_wp = tw.intersection.mesh_with_plane(
             mesh_wp.points,
             mesh_wp.indices,
             wp.vec3(*plane_normal.tolist()),
@@ -152,7 +152,7 @@ def test_mesh_with_plane_tilted_plane(request: pytest.FixtureRequest, mesh_name:
     lines_tm = tm_intersections.mesh_plane(
         mesh=mesh_tm, plane_normal=plane_normal, plane_origin=plane_origin
     )
-    lines_wp = tw.intersections.mesh_with_plane(
+    lines_wp = tw.intersection.mesh_with_plane(
         mesh_wp.points,
         mesh_wp.indices,
         wp.vec3(*plane_normal.tolist()),
@@ -169,7 +169,7 @@ def test_mesh_with_plane_return_faces(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -
     lines_tm, faces_tm = tm_intersections.mesh_plane(
         mesh=mesh_tm, plane_normal=plane_normal, plane_origin=plane_origin, return_faces=True
     )
-    lines_wp, faces_wp = tw.intersections.mesh_with_plane(
+    lines_wp, faces_wp = tw.intersection.mesh_with_plane(
         mesh_wp.points,
         mesh_wp.indices,
         wp.vec3(*plane_normal.tolist()),
@@ -186,7 +186,7 @@ def test_mesh_with_plane_miss_plane(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> 
     plane_normal = np.array([0.0, 0.0, 1.0])
     plane_origin = mesh_tm.bounds[1] + np.array([0.0, 0.0, 10.0])
 
-    lines_wp = tw.intersections.mesh_with_plane(
+    lines_wp = tw.intersection.mesh_with_plane(
         mesh_wp.points,
         mesh_wp.indices,
         wp.vec3(*plane_normal.tolist()),
@@ -221,7 +221,7 @@ def _sliced_meshes_equivalent(
 def test_slice_mesh_with_plane_empty(device: str) -> None:
     vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    out_vertices_wp, out_faces_wp = tw.intersections.slice_mesh_with_plane(
+    out_vertices_wp, out_faces_wp = tw.intersection.slice_mesh_with_plane(
         vertices_wp, faces_wp, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0)
     )
     assert out_vertices_wp.shape == (0,)
@@ -237,7 +237,7 @@ def test_slice_mesh_with_plane_box_corner() -> None:
         mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
     )
     mesh_wp = trimesh_to_warp(mesh_tm, "cpu")
-    vertices_wp, faces_wp = tw.intersections.slice_mesh_with_plane(
+    vertices_wp, faces_wp = tw.intersection.slice_mesh_with_plane(
         mesh_wp.points,
         mesh_wp.indices,
         wp.vec3(*plane_normal_np.tolist()),
@@ -261,7 +261,7 @@ def test_slice_mesh_with_plane_box_top() -> None:
         mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
     )
     mesh_wp = trimesh_to_warp(mesh_tm, "cpu")
-    vertices_wp, faces_wp = tw.intersections.slice_mesh_with_plane(
+    vertices_wp, faces_wp = tw.intersection.slice_mesh_with_plane(
         mesh_wp.points,
         mesh_wp.indices,
         wp.vec3(*plane_normal_np.tolist()),
@@ -290,7 +290,7 @@ def test_slice_mesh_with_plane_axis_planes(request: pytest.FixtureRequest, mesh_
         vertices_tm, faces_tm, _ = tm_intersections.slice_faces_plane(
             mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
         )
-        vertices_wp, faces_wp = tw.intersections.slice_mesh_with_plane(
+        vertices_wp, faces_wp = tw.intersection.slice_mesh_with_plane(
             mesh_wp.points,
             mesh_wp.indices,
             wp.vec3(*plane_normal_np.tolist()),
@@ -314,7 +314,7 @@ def test_slice_mesh_with_plane_tilted_plane(icosahedron: tuple[tm.Trimesh, wp.Me
     vertices_tm, faces_tm, _ = tm_intersections.slice_faces_plane(
         mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
     )
-    vertices_wp, faces_wp = tw.intersections.slice_mesh_with_plane(
+    vertices_wp, faces_wp = tw.intersection.slice_mesh_with_plane(
         mesh_wp.points,
         mesh_wp.indices,
         wp.vec3(*plane_normal_np.tolist()),
@@ -335,7 +335,7 @@ def test_slice_mesh_with_plane_on_plane(icosahedron: tuple[tm.Trimesh, wp.Mesh])
     vertices_tm, faces_tm, _ = tm_intersections.slice_faces_plane(
         mesh_tm.vertices, mesh_tm.faces, plane_normal_np, plane_origin_np
     )
-    vertices_wp, faces_wp = tw.intersections.slice_mesh_with_plane(
+    vertices_wp, faces_wp = tw.intersection.slice_mesh_with_plane(
         mesh_wp.points,
         mesh_wp.indices,
         wp.vec3(*plane_normal_np.tolist()),
@@ -386,7 +386,7 @@ def test_mesh_with_mesh_empty(
     _, ico_wp = icosahedron
     _, cave_wp = cave_cube
 
-    lines_wp = tw.intersections.mesh_with_mesh(
+    lines_wp = tw.intersection.mesh_with_mesh(
         ico_wp.points, ico_wp.indices, cave_wp.points, cave_wp.indices
     )
     assert lines_wp.shape == (0, 2)
@@ -404,7 +404,7 @@ def test_mesh_with_mesh_icosahedron_cave_cube(
     ref_segments_np = _pyvista_intersection_segments(
         trimesh_to_pyvista(ico_tm), trimesh_to_pyvista(cave_at_ico_tm)
     )
-    lines_wp = tw.intersections.mesh_with_mesh(
+    lines_wp = tw.intersection.mesh_with_mesh(
         ico_wp.points, ico_wp.indices, cave_wp.points, cave_wp.indices
     )
 

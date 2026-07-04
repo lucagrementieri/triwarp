@@ -412,6 +412,62 @@ def all(array: wp.array[wp.bool], *, axis: Literal[0, 1] | None = None) -> wp.ar
     return _reduce_bool(array, axis, _BOOL_REDUCE["all"])
 
 
+def median(array: twt.Array1dScalar) -> float:
+    """
+    Median of a 1D scalar array (``numpy.median``).
+
+    Sorts a copy of the values on-device with ``warp.utils.radix_sort_pairs`` and reads the
+    middle element (odd length) or averages the two middle elements (even length). The result
+    is always a Python ``float``, regardless of input dtype.
+
+    Parameters
+    ----------
+    array
+        Rank-1 ``(n,)`` ``wp.float32`` or ``wp.int32`` Warp array. Must be non-empty.
+
+    Returns
+    -------
+    float
+        The median value on the host.
+
+    Raises
+    ------
+    ValueError
+        If ``array`` is empty or not rank-1.
+    """
+    if array.ndim != 1:
+        raise ValueError("median requires a 1D array.")
+    n = int(array.shape[0])
+    if n == 0:
+        raise ValueError("median requires a non-empty array.")
+
+    sorted_values = _sorted_scalar_copy(cast(twt.Array1dScalar, array))
+    if n % 2 == 1:
+        return float(sorted_values[n // 2 : n // 2 + 1].numpy()[0])
+    middle = sorted_values[n // 2 - 1 : n // 2 + 1].numpy()
+    return (float(middle[0]) + float(middle[1])) / 2.0
+
+
+def _sorted_scalar_copy(values: twt.Array1dScalar) -> twt.Array1dScalar:
+    n = int(values.shape[0])
+    device = values.device
+    if n <= 1:
+        return values
+    keys = wp.empty(2 * n, dtype=values.dtype, device=device)
+    wp.copy(keys, values, count=n)
+    indices = wp.empty(2 * n, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_array.init_sort_pair_indices,
+        dim=2 * n,
+        inputs=[indices, wp.int32(n), wp.int32(n)],
+        device=device,
+    )
+    wp.utils.radix_sort_pairs(keys, indices, count=n)
+    sorted_values = wp.empty(n, dtype=values.dtype, device=device)
+    wp.copy(sorted_values, keys, count=n)
+    return cast(twt.Array1dScalar, sorted_values)
+
+
 @overload
 def max_for_dtype(dtype: type[wp.Int]) -> int: ...
 @overload

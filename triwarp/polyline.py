@@ -1,0 +1,742 @@
+"""Open and closed 3D polyline operations on NVIDIA Warp."""
+
+from __future__ import annotations
+
+from typing import Literal
+
+import warp as wp
+
+import triwarp as tw
+from triwarp.kernels import array as kernel_array
+from triwarp.kernels import polyline as kernel_polyline
+
+
+def is_closed(polyline: wp.array[wp.vec3]) -> bool:
+    """
+    Whether a polyline is closed (its first and last points coincide).
+
+    The endpoint comparison runs on-device via [`allclose`][triwarp.array.allclose], so no array
+    is copied to the host.
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``.
+
+    Returns
+    -------
+    bool
+        ``True`` when the polyline has at least two points and its first and last points are
+        equal within the default ``allclose`` tolerance; ``False`` otherwise.
+
+    See Also
+    --------
+    [`open_polyline`][triwarp.polyline.open_polyline]
+    [`close_polyline`][triwarp.polyline.close_polyline]
+    """
+    n = int(polyline.shape[0])
+    return n >= 2 and tw.array.allclose(polyline[0:1], polyline[n - 1 : n])
+
+
+def open_polyline(polyline: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
+    """
+    Open a polyline by dropping the last point when it duplicates the first.
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        The input unchanged when it has fewer than two points or is already open;
+        otherwise a length ``n - 1`` view without the duplicated closing point.
+
+    See Also
+    --------
+    [`close_polyline`][triwarp.polyline.close_polyline]
+    """
+    n = int(polyline.shape[0])
+    if not is_closed(polyline):
+        return polyline
+    return polyline[0 : n - 1]
+
+
+def close_polyline(polyline: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
+    """
+    Close a polyline by appending the first point when it is not already the last.
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        The input unchanged when it has fewer than two points or is already closed;
+        otherwise a length ``n + 1`` array with the first point appended.
+
+    See Also
+    --------
+    [`open_polyline`][triwarp.polyline.open_polyline]
+    """
+    n = int(polyline.shape[0])
+    if n < 2 or is_closed(polyline):
+        return polyline
+    return tw.array.concatenate([polyline, polyline[0:1]])
+
+
+def polyline_length(polyline: wp.array[wp.vec3]) -> float:
+    """
+    Total arc length of a polyline (sum of segment lengths).
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``.
+
+    Returns
+    -------
+    float
+        The summed segment length, ``0.0`` for fewer than two points.
+
+    See Also
+    --------
+    [`closed_polyline_length`][triwarp.polyline.closed_polyline_length]
+    """
+    device = polyline.device
+    n_segments = int(polyline.shape[0]) - 1
+    if n_segments < 1:
+        return 0.0
+    lengths = wp.empty(n_segments, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_polyline.segment_lengths, dim=n_segments, inputs=[polyline, lengths], device=device
+    )
+    return float(tw.reduce.sum(lengths))
+
+
+def closed_polyline_length(polyline: wp.array[wp.vec3]) -> float:
+    """
+    Total arc length of a closed polyline (closing edge included).
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``. The closing edge is added if absent.
+
+    Returns
+    -------
+    float
+        The summed segment length of the closed polyline.
+
+    See Also
+    --------
+    [`polyline_length`][triwarp.polyline.polyline_length]
+    """
+    return polyline_length(close_polyline(polyline))
+
+
+def polyline_centroid(polyline: wp.array[wp.vec3]) -> wp.vec3:
+    """
+    Segment-length-weighted centroid of a polyline.
+
+    Each segment contributes its midpoint weighted by its length, so the result is invariant to
+    how densely the polyline is sampled (unlike the plain mean of the vertices).
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``.
+
+    Returns
+    -------
+    wp.vec3
+        The weighted centroid on the host.
+
+    Raises
+    ------
+    ValueError
+        If the polyline has fewer than two points.
+
+    See Also
+    --------
+    [`closed_polyline_centroid`][triwarp.polyline.closed_polyline_centroid]
+    """
+    device = polyline.device
+    n_segments = int(polyline.shape[0]) - 1
+    if n_segments < 1:
+        raise ValueError("polyline_centroid requires at least two points")
+    midpoints = wp.empty(n_segments, dtype=wp.vec3, device=device)
+    lengths = wp.empty(n_segments, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_polyline.segment_midpoints_and_lengths,
+        dim=n_segments,
+        inputs=[polyline, midpoints, lengths],
+        device=device,
+    )
+    weighted = tw.reduce.weighted_sum(midpoints, lengths)
+    return weighted / float(tw.reduce.sum(lengths))
+
+
+def closed_polyline_centroid(polyline: wp.array[wp.vec3]) -> wp.vec3:
+    """
+    Segment-length-weighted centroid of a closed polyline (closing edge included).
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``. The closing edge is added if absent.
+
+    Returns
+    -------
+    wp.vec3
+        The weighted centroid on the host.
+
+    See Also
+    --------
+    [`polyline_centroid`][triwarp.polyline.polyline_centroid]
+    """
+    return polyline_centroid(close_polyline(polyline))
+
+
+def polyline_normal(polyline: wp.array[wp.vec3]) -> wp.vec3:
+    """
+    Average unit normal of a 3D polyline via Newell's method.
+
+    Sums the cross products of consecutive segment pairs and normalizes the result.
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``.
+
+    Returns
+    -------
+    wp.vec3
+        The unit normal on the host.
+
+    Raises
+    ------
+    ValueError
+        If the polyline has fewer than three points.
+
+    See Also
+    --------
+    [`closed_polyline_normal`][triwarp.polyline.closed_polyline_normal]
+    """
+    device = polyline.device
+    n = int(polyline.shape[0])
+    if n < 3:
+        raise ValueError("polyline_normal requires at least three points")
+    out_normal = wp.zeros(1, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_polyline.accumulate_newell_normal,
+        dim=n - 2,
+        inputs=[polyline, out_normal],
+        device=device,
+    )
+    wp.launch(kernel_array.normalize, dim=1, inputs=[out_normal], device=device)
+    return wp.vec3(*out_normal.numpy()[0].tolist())
+
+
+def closed_polyline_normal(polyline: wp.array[wp.vec3]) -> wp.vec3:
+    """
+    Average unit normal of a closed 3D polyline via Newell's method.
+
+    Includes the wrap-around segment pair (closing edge), unlike
+    [`polyline_normal`][triwarp.polyline.polyline_normal].
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``. The closing edge is added if absent.
+
+    Returns
+    -------
+    wp.vec3
+        The unit normal on the host.
+
+    Raises
+    ------
+    ValueError
+        If the closed polyline has fewer than three points.
+
+    See Also
+    --------
+    [`polyline_normal`][triwarp.polyline.polyline_normal]
+    """
+    polyline = close_polyline(polyline)
+    device = polyline.device
+    n = int(polyline.shape[0])
+    if n < 3:
+        raise ValueError("closed_polyline_normal requires at least three points")
+    out_normal = wp.zeros(1, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_polyline.accumulate_newell_normal_closed,
+        dim=n - 1,
+        inputs=[polyline, out_normal],
+        device=device,
+    )
+    wp.launch(kernel_array.normalize, dim=1, inputs=[out_normal], device=device)
+    return wp.vec3(*out_normal.numpy()[0].tolist())
+
+
+def distance_to_polyline(
+    points: wp.array[wp.vec3], polyline: wp.array[wp.vec3]
+) -> wp.array[wp.float32]:
+    """
+    Minimum distance from each query point to the nearest segment of a polyline.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` query points as ``wp.vec3``.
+    polyline
+        ``(m,)`` polyline vertices as ``wp.vec3``.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        Length ``n`` minimum distances on ``points.device``.
+
+    See Also
+    --------
+    [`distance_to_closed_polyline`][triwarp.polyline.distance_to_closed_polyline]
+    """
+    device = points.device
+    n_points = int(points.shape[0])
+    m = int(polyline.shape[0])
+    out_distances = wp.empty(n_points, dtype=wp.float32, device=device)
+    if m == 0 or n_points == 0:
+        return out_distances
+    if m == 1:
+        wp.launch(
+            kernel_polyline.distance_to_first_point,
+            dim=n_points,
+            inputs=[points, polyline, out_distances],
+            device=device,
+        )
+        return out_distances
+    wp.launch(
+        kernel_polyline.distance_to_segments,
+        dim=n_points,
+        inputs=[points, polyline, out_distances],
+        device=device,
+    )
+    return out_distances
+
+
+def distance_to_closed_polyline(
+    points: wp.array[wp.vec3], polyline: wp.array[wp.vec3]
+) -> wp.array[wp.float32]:
+    """
+    Minimum distance from each query point to a closed 3D polyline.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` query points as ``wp.vec3``.
+    polyline
+        ``(m,)`` polyline vertices as ``wp.vec3``. The closing edge is added if absent.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        Length ``n`` minimum distances on ``points.device``.
+
+    See Also
+    --------
+    [`distance_to_polyline`][triwarp.polyline.distance_to_polyline]
+    """
+    return distance_to_polyline(points, close_polyline(polyline))
+
+
+def upsample_polyline(polyline: wp.array[wp.vec3], step_size: float) -> wp.array[wp.vec3]:
+    """
+    Upsample a polyline to an approximately uniform step size.
+
+    Each segment is split into ``max(floor(length / step_size), 1)`` equal pieces. The final
+    endpoint of the polyline is not emitted (matching the source implementation).
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``.
+    step_size
+        Target spacing between consecutive output points.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        The upsampled polyline. The input is returned unchanged for fewer than two points.
+
+    See Also
+    --------
+    [`upsample_closed_polyline`][triwarp.polyline.upsample_closed_polyline]
+    [`downsample_polyline`][triwarp.polyline.downsample_polyline]
+    [`resample_polyline`][triwarp.polyline.resample_polyline]
+    """
+    device = polyline.device
+    n_segments = int(polyline.shape[0]) - 1
+    if n_segments < 1:
+        return polyline
+
+    steps = wp.empty(n_segments, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_polyline.segment_step_counts,
+        dim=n_segments,
+        inputs=[polyline, wp.float32(step_size), steps],
+        device=device,
+    )
+    offsets = wp.empty(n_segments, dtype=wp.int32, device=device)
+    inclusive = wp.empty(n_segments, dtype=wp.int32, device=device)
+    wp.utils.array_scan(steps, out_array=offsets, inclusive=False)
+    wp.utils.array_scan(steps, out_array=inclusive, inclusive=True)
+    total = int(inclusive.numpy()[-1])
+
+    out_points = wp.empty(total, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_polyline.upsample_gather,
+        dim=total,
+        inputs=[polyline, offsets, steps, out_points],
+        device=device,
+    )
+    return out_points
+
+
+def upsample_closed_polyline(polyline: wp.array[wp.vec3], step_size: float) -> wp.array[wp.vec3]:
+    """
+    Upsample a closed polyline to an approximately uniform step size.
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``. The closing edge is added if absent.
+    step_size
+        Target spacing between consecutive output points.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        The upsampled closed polyline.
+
+    See Also
+    --------
+    [`upsample_polyline`][triwarp.polyline.upsample_polyline]
+    """
+    return upsample_polyline(close_polyline(polyline), step_size)
+
+
+def _cumulative_arc_length(polyline: wp.array[wp.vec3]) -> wp.array[wp.float32]:
+    device = polyline.device
+    n_segments = int(polyline.shape[0]) - 1
+    lengths = wp.empty(n_segments, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_polyline.segment_lengths, dim=n_segments, inputs=[polyline, lengths], device=device
+    )
+    inclusive = wp.empty(n_segments, dtype=wp.float32, device=device)
+    wp.utils.array_scan(lengths, out_array=inclusive, inclusive=True)
+    return tw.array.concatenate([wp.zeros(1, dtype=wp.float32, device=device), inclusive])
+
+
+def downsample_polyline(polyline: wp.array[wp.vec3], step_size: float) -> wp.array[wp.vec3]:
+    """
+    Downsample a polyline to a minimum arc-length spacing between kept points.
+
+    Greedily keeps the first point, then each subsequent point at least ``step_size`` of arc
+    length beyond the previously kept point.
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``.
+    step_size
+        Minimum arc-length distance between kept points.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        The downsampled polyline. The input is returned unchanged for fewer than two points.
+
+    See Also
+    --------
+    [`downsample_closed_polyline`][triwarp.polyline.downsample_closed_polyline]
+    [`upsample_polyline`][triwarp.polyline.upsample_polyline]
+    """
+    device = polyline.device
+    n = int(polyline.shape[0])
+    if n < 2:
+        return polyline
+
+    cumulative = _cumulative_arc_length(polyline)
+    keep_mask = wp.zeros(n, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_polyline.greedy_downsample_mask,
+        dim=1,
+        inputs=[cumulative, wp.float32(step_size), keep_mask],
+        device=device,
+    )
+    return tw.array.gather(polyline, tw.array.flatnonzero(keep_mask))
+
+
+def downsample_closed_polyline(polyline: wp.array[wp.vec3], step_size: float) -> wp.array[wp.vec3]:
+    """
+    Downsample a closed polyline to a minimum arc-length spacing between kept points.
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``. The closing edge is added if absent.
+    step_size
+        Minimum arc-length distance between kept points.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        The downsampled closed polyline.
+
+    See Also
+    --------
+    [`downsample_polyline`][triwarp.polyline.downsample_polyline]
+    """
+    return downsample_polyline(close_polyline(polyline), step_size)
+
+
+def resample_polyline(polyline: wp.array[wp.vec3], num_points: int) -> wp.array[wp.vec3]:
+    """
+    Resample a polyline to a fixed number of points evenly spaced by arc length.
+
+    Points are sampled at ``num_points`` arc lengths evenly spanning ``[0, total_length]`` and
+    linearly interpolated between the bracketing vertices (matching ``numpy.interp`` semantics).
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``.
+    num_points
+        Number of output points.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        Length ``num_points`` resampled polyline. An empty input is returned unchanged; a single
+        point is repeated ``num_points`` times.
+
+    See Also
+    --------
+    [`resample_closed_polyline`][triwarp.polyline.resample_closed_polyline]
+    [`upsample_polyline`][triwarp.polyline.upsample_polyline]
+    """
+    device = polyline.device
+    n = int(polyline.shape[0])
+    if n == 0:
+        return polyline
+    out_points = wp.empty(num_points, dtype=wp.vec3, device=device)
+    if n == 1:
+        wp.launch(
+            kernel_polyline.broadcast_first_point,
+            dim=num_points,
+            inputs=[polyline, out_points],
+            device=device,
+        )
+        return out_points
+
+    cumulative = _cumulative_arc_length(polyline)
+    wp.launch(
+        kernel_polyline.resample_interp,
+        dim=num_points,
+        inputs=[polyline, cumulative, wp.int32(num_points), out_points],
+        device=device,
+    )
+    return out_points
+
+
+def resample_closed_polyline(polyline: wp.array[wp.vec3], num_points: int) -> wp.array[wp.vec3]:
+    """
+    Resample a closed polyline to a fixed number of points evenly spaced by arc length.
+
+    Resamples the closed polyline to ``num_points + 1`` points and drops the duplicated closing
+    point, so the returned polyline has ``num_points`` distinct points.
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``. The closing edge is added if absent.
+    num_points
+        Number of output points.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        Length ``num_points`` resampled closed polyline.
+
+    See Also
+    --------
+    [`resample_polyline`][triwarp.polyline.resample_polyline]
+    """
+    resampled = resample_polyline(close_polyline(polyline), num_points + 1)
+    return resampled[0:num_points]
+
+
+def polyline_radius(
+    polyline: wp.array[wp.vec3],
+    reduction: Literal["min", "max", "mean", "median"] = "min",
+    center: wp.vec3 | None = None,
+    normal: wp.vec3 | None = None,
+) -> float:
+    """
+    Radius of a polyline projected onto the plane through ``center`` with the given ``normal``.
+
+    Each segment is projected onto the plane and its closest point to ``center`` is found; the
+    per-segment distances to ``center`` are then reduced. With ``reduction="min"`` this is the
+    inner radius (nearest point, not vertex, on the polyline).
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``.
+    reduction
+        Reduction over the per-segment radial distances: ``"min"``, ``"max"``, ``"mean"``, or
+        ``"median"``. Defaults to ``"min"``.
+    center
+        Plane origin. Defaults to [`polyline_centroid`][triwarp.polyline.polyline_centroid].
+    normal
+        Plane normal (need not be unit). Defaults to
+        [`polyline_normal`][triwarp.polyline.polyline_normal].
+
+    Returns
+    -------
+    float
+        The reduced radius.
+
+    Raises
+    ------
+    ValueError
+        If ``reduction`` is not one of the supported values, or the polyline has fewer than
+        two points.
+
+    See Also
+    --------
+    [`closed_polyline_radius`][triwarp.polyline.closed_polyline_radius]
+    [`median`][triwarp.reduce.median]
+    """
+    if reduction not in ("min", "max", "mean", "median"):
+        raise ValueError(f"unsupported reduction {reduction!r}")
+    device = polyline.device
+    n_segments = int(polyline.shape[0]) - 1
+    if n_segments < 1:
+        raise ValueError("polyline_radius requires at least two points")
+
+    if center is None:
+        center = polyline_centroid(polyline)
+    if normal is None:
+        normal = polyline_normal(polyline)
+
+    distances = wp.empty(n_segments, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_polyline.radius_segment_distances,
+        dim=n_segments,
+        inputs=[polyline, center, normal, distances],
+        device=device,
+    )
+    if reduction == "min":
+        return float(tw.reduce.min(distances))
+    if reduction == "max":
+        return float(tw.reduce.max(distances))
+    if reduction == "mean":
+        return float(tw.reduce.mean(distances))
+    return tw.reduce.median(distances)
+
+
+def closed_polyline_radius(
+    polyline: wp.array[wp.vec3],
+    reduction: Literal["min", "max", "mean", "median"] = "min",
+    center: wp.vec3 | None = None,
+    normal: wp.vec3 | None = None,
+) -> float:
+    """
+    Radius of a closed polyline projected onto the plane through ``center`` with ``normal``.
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``. The closing edge is added if absent.
+    reduction
+        Reduction over the per-segment radial distances. Defaults to ``"min"``.
+    center
+        Plane origin. Defaults to the closed-polyline centroid.
+    normal
+        Plane normal. Defaults to the closed-polyline normal.
+
+    Returns
+    -------
+    float
+        The reduced radius.
+
+    See Also
+    --------
+    [`polyline_radius`][triwarp.polyline.polyline_radius]
+    """
+    return polyline_radius(close_polyline(polyline), reduction, center, normal)
+
+
+def polyline_angles(polyline: wp.array[wp.vec3]) -> wp.array[wp.float32]:
+    """
+    Angles between consecutive segments at each vertex of a polyline.
+
+    Returns one angle per point. For an open polyline the two endpoints get an angle of ``0``;
+    for a closed polyline (first point equal to last) the turning angles wrap around.
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        Length ``n`` angles in radians on ``polyline.device``. All zeros for fewer than two points.
+
+    See Also
+    --------
+    [`closed_polyline_angles`][triwarp.polyline.closed_polyline_angles]
+    """
+    device = polyline.device
+    n = int(polyline.shape[0])
+    if n < 2:
+        return wp.zeros(n, dtype=wp.float32, device=device)
+
+    n_segments = n - 1
+    raw = wp.empty(n_segments, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_polyline.cyclic_segment_angles, dim=n_segments, inputs=[polyline, raw], device=device
+    )
+    if is_closed(polyline):
+        return tw.array.concatenate([raw, raw[0:1]])
+    zero = wp.zeros(1, dtype=wp.float32, device=device)
+    return tw.array.concatenate([zero, raw[0 : n_segments - 1], zero])
+
+
+def closed_polyline_angles(polyline: wp.array[wp.vec3]) -> wp.array[wp.float32]:
+    """
+    Angles between consecutive segments at each vertex of a closed polyline.
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``. The closing edge is added if absent.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        Length ``n`` angles in radians on ``polyline.device`` (one per original point).
+
+    See Also
+    --------
+    [`polyline_angles`][triwarp.polyline.polyline_angles]
+    """
+    n_original = int(polyline.shape[0])
+    angles = polyline_angles(close_polyline(polyline))
+    return angles[0:n_original]

@@ -38,7 +38,7 @@ test = [
     "rtree>=0.12",
     "scipy>=1.17",
     "shapely>=2.1.2",
-    "trimesh>=4.11",
+    "trimesh>=5.0.0rc1",
 ]
 
 

@@ -6,7 +6,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.kernels import intersections as kernel_intersections
+from triwarp.kernels import intersection as kernel_intersections
 
 
 def segments_with_plane(
