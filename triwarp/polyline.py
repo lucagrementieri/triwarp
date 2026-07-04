@@ -430,6 +430,105 @@ def upsample_closed_polyline(polyline: wp.array[wp.vec3], step_size: float) -> w
     return upsample_polyline(close_polyline(polyline), step_size)
 
 
+def _smooth_upsample(
+    polyline: wp.array[wp.vec3], step_size: float, closed: bool
+) -> wp.array[wp.vec3]:
+    device = polyline.device
+    n_segments = int(polyline.shape[0]) - 1
+    if n_segments < 1:
+        return polyline
+
+    steps = wp.empty(n_segments, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_polyline.segment_step_counts,
+        dim=n_segments,
+        inputs=[polyline, wp.float32(step_size), steps],
+        device=device,
+    )
+    offsets = wp.empty(n_segments, dtype=wp.int32, device=device)
+    inclusive = wp.empty(n_segments, dtype=wp.int32, device=device)
+    wp.utils.array_scan(steps, out_array=offsets, inclusive=False)
+    wp.utils.array_scan(steps, out_array=inclusive, inclusive=True)
+    total = int(inclusive.numpy()[-1])
+
+    out_points = wp.empty(total, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_polyline.smooth_upsample_gather,
+        dim=total,
+        inputs=[polyline, offsets, steps, wp.int32(closed), out_points],
+        device=device,
+    )
+    return out_points
+
+
+def smooth_upsample_polyline(polyline: wp.array[wp.vec3], step_size: float) -> wp.array[wp.vec3]:
+    """
+    Upsample a polyline to an approximately uniform step size, following local curvature.
+
+    Like [`upsample_polyline`][triwarp.polyline.upsample_polyline], each segment is split into
+    ``max(floor(length / step_size), 1)`` pieces and the final endpoint is not emitted. Unlike it,
+    the inserted points are placed on a circular arc fitted to the segment's endpoint tangents
+    (estimated from the two bracketing neighbour vertices) rather than on the straight chord, so a
+    coarsely sampled curve is refined smoothly. This is a port of the ``useCurvature`` vertex
+    placement in MeshLib ``MRPolylineSubdivide.cpp``, generalised from the edge midpoint to every
+    interpolation parameter.
+
+    The first and last segments have no bracketing neighbour and are subdivided linearly (matching
+    MeshLib, which applies curvature only to interior edges); collinear neighbours likewise reduce
+    to the straight chord. Original vertices are preserved exactly, since each segment's first
+    sample coincides with its start vertex.
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``.
+    step_size
+        Target spacing between consecutive output points.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        The curvature-aware upsampled polyline. The input is returned unchanged for fewer than
+        two points.
+
+    See Also
+    --------
+    [`smooth_upsample_closed_polyline`][triwarp.polyline.smooth_upsample_closed_polyline]
+    [`upsample_polyline`][triwarp.polyline.upsample_polyline]
+    """
+    return _smooth_upsample(polyline, step_size, closed=False)
+
+
+def smooth_upsample_closed_polyline(
+    polyline: wp.array[wp.vec3], step_size: float
+) -> wp.array[wp.vec3]:
+    """
+    Upsample a closed polyline to an approximately uniform step size, following local curvature.
+
+    The closing edge is added if absent, and every segment — including the seam — is treated as
+    interior, so neighbour tangents wrap cyclically and the whole loop is smoothed. The duplicated
+    closing point is not emitted, yielding a clean cyclic ring.
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``. The closing edge is added if absent.
+    step_size
+        Target spacing between consecutive output points.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        The curvature-aware upsampled closed polyline.
+
+    See Also
+    --------
+    [`smooth_upsample_polyline`][triwarp.polyline.smooth_upsample_polyline]
+    [`upsample_closed_polyline`][triwarp.polyline.upsample_closed_polyline]
+    """
+    return _smooth_upsample(close_polyline(polyline), step_size, closed=True)
+
+
 def _cumulative_arc_length(polyline: wp.array[wp.vec3]) -> wp.array[wp.float32]:
     device = polyline.device
     n_segments = int(polyline.shape[0]) - 1

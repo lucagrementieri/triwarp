@@ -69,6 +69,71 @@ def _upsample_np(pts: np.ndarray, step: float) -> np.ndarray:
     return pts[indices] + weights[:, None] * segments[indices]
 
 
+def _endpoint_normals_np(
+    a: np.ndarray, b: np.ndarray, c: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    n1 = np.cross(b, a + c)
+    n2 = np.cross(b, a - c)
+    plane = n1 if n1 @ n1 >= n2 @ n2 else n2
+    if plane @ plane < 1e-6:
+        return np.zeros(3), np.zeros(3)
+    unit = lambda v: v / np.linalg.norm(v)  # noqa: E731
+    nod = unit(np.cross(plane, b))
+    return unit(nod + unit(np.cross(plane, a))), unit(nod + unit(np.cross(plane, c)))
+
+
+def _arc_point_np(
+    po: np.ndarray, pd: np.ndarray, no: np.ndarray, nd: np.ndarray, t: float
+) -> np.ndarray:
+    b = pd - po
+    chord = np.linalg.norm(b)
+    linear = po + t * b
+    if chord < 1e-6:
+        return po
+    if no @ no < 0.5 or nd @ nd < 0.5:
+        return linear
+    theta = abs(np.arccos(np.clip(no @ nd, -1.0, 1.0)))
+    if theta < 1e-6:
+        return linear
+    tangent = b / chord
+    sign = 1.0 if b @ (nd - no) >= 0.0 else -1.0
+    bulge = sign * (no + nd)
+    m = bulge - (bulge @ tangent) * tangent
+    if m @ m < 1e-6:
+        return linear
+    m = m / np.linalg.norm(m)
+    alpha = 0.5 * theta
+    radius = chord / (2.0 * np.sin(alpha))
+    center = 0.5 * (po + pd) - radius * np.cos(alpha) * m
+    phi = (2.0 * t - 1.0) * alpha
+    return center + radius * (np.cos(phi) * m + np.sin(phi) * tangent)
+
+
+def _smooth_upsample_np(pts: np.ndarray, step: float, closed: bool) -> np.ndarray:
+    n = len(pts)
+    m = n - 1  # distinct vertices when closed (pts[-1] == pts[0])
+    segments = np.diff(pts, axis=0)
+    steps = np.clip(np.linalg.norm(segments, axis=-1) // step, 1, None).astype(np.int64)
+    out = []
+    for s in range(n - 1):
+        po, pd = pts[s], pts[s + 1]
+        no = nd = np.zeros(3)
+        if closed:
+            a, c = po - pts[(s - 1 + m) % m], pts[(s + 2) % m] - pd
+            no, nd = _endpoint_normals_np(a, segments[s], c)
+            interior = True
+        elif s >= 1 and s + 2 <= n - 1:
+            a, c = po - pts[s - 1], pts[s + 2] - pd
+            no, nd = _endpoint_normals_np(a, segments[s], c)
+            interior = True
+        else:
+            interior = False
+        for k in range(int(steps[s])):
+            t = k / steps[s]
+            out.append(_arc_point_np(po, pd, no, nd, t) if interior else po + t * (pd - po))
+    return np.array(out)
+
+
 def _downsample_np(pts: np.ndarray, step: float) -> np.ndarray:
     seg_len = np.linalg.norm(np.diff(pts, axis=0), axis=-1)
     cumulative = np.concatenate([[0.0], np.cumsum(seg_len)])
@@ -259,6 +324,72 @@ def test_upsample_point_count(device: str) -> None:
     expected_count = int(np.clip(seg_len // step, 1, None).astype(np.int64).sum())
     upsampled = tw.polyline.upsample_polyline(_polyline_wp(pts_np, device), step).numpy()
     assert upsampled.shape[0] == expected_count
+
+
+# --- smooth upsample (curvature-aware, NumPy reference + circle oracle) ---
+
+
+@pytest.mark.parametrize("step", [0.3, 0.75])
+def test_smooth_upsample_matches_reference(device: str, step: float) -> None:
+    pts_np = _random_open_polyline(50)
+    smoothed_wp = tw.polyline.smooth_upsample_polyline(_polyline_wp(pts_np, device), step)
+    assert np.allclose(
+        smoothed_wp.numpy(), _smooth_upsample_np(pts_np, step, closed=False), rtol=1e-4, atol=1e-4
+    )
+
+
+@pytest.mark.parametrize("step", [0.3, 0.75])
+def test_smooth_upsample_closed_matches_reference(device: str, step: float) -> None:
+    pts_np = _closed_from(_random_open_polyline(52))
+    smoothed_wp = tw.polyline.smooth_upsample_closed_polyline(_polyline_wp(pts_np, device), step)
+    assert np.allclose(
+        smoothed_wp.numpy(), _smooth_upsample_np(pts_np, step, closed=True), rtol=1e-4, atol=1e-4
+    )
+
+
+def test_smooth_upsample_same_point_count_as_linear(device: str) -> None:
+    pts_np = _random_open_polyline(53)
+    step = 0.4
+    linear = tw.polyline.upsample_polyline(_polyline_wp(pts_np, device), step).numpy()
+    smoothed = tw.polyline.smooth_upsample_polyline(_polyline_wp(pts_np, device), step).numpy()
+    assert smoothed.shape == linear.shape
+
+
+def test_smooth_upsample_straight_line_reduces_to_linear(device: str) -> None:
+    # Collinear vertices have zero curvature everywhere, so the arc collapses onto the chord and
+    # the result must coincide with plain linear upsampling.
+    pts_np = np.stack([np.linspace(0.0, 3.0, 7), np.zeros(7), np.zeros(7)], axis=1)
+    step = 0.25
+    linear = tw.polyline.upsample_polyline(_polyline_wp(pts_np, device), step).numpy()
+    smoothed = tw.polyline.smooth_upsample_polyline(_polyline_wp(pts_np, device), step).numpy()
+    assert np.allclose(smoothed, linear, rtol=1e-5, atol=1e-5)
+
+
+def test_smooth_upsample_preserves_original_vertices(device: str) -> None:
+    # Each segment's first sample (t == 0) is its start vertex, so all but the final vertex survive.
+    pts_np = _random_open_polyline(54, n=6)
+    smoothed = tw.polyline.smooth_upsample_polyline(_polyline_wp(pts_np, device), 0.5).numpy()
+    for vertex in pts_np[:-1]:
+        assert np.any(np.all(np.isclose(smoothed, vertex, rtol=1e-4, atol=1e-4), axis=1))
+
+
+def test_smooth_upsample_closed_recovers_circle(device: str) -> None:
+    # A regular polygon inscribed in a circle: curvature fitting reconstructs the circumscribed
+    # arcs, so every inserted point lies on the circle (a linear upsample would cut inside it).
+    radius = 2.0
+    polygon_np = _planar_circle(8, radius)
+    smoothed = tw.polyline.smooth_upsample_closed_polyline(
+        _polyline_wp(polygon_np, device), 0.35
+    ).numpy()
+    assert np.allclose(np.linalg.norm(smoothed, axis=-1), radius, rtol=1e-3, atol=1e-3)
+    # The added points genuinely bulge outward relative to the straight-chord upsample.
+    linear = tw.polyline.upsample_closed_polyline(_polyline_wp(polygon_np, device), 0.35).numpy()
+    assert np.linalg.norm(linear, axis=-1).min() < radius - 1e-2
+
+
+def test_smooth_upsample_short_polyline_unchanged(device: str) -> None:
+    single = _polyline_wp(np.array([[1.0, 2.0, 3.0]]), device)
+    assert tw.polyline.smooth_upsample_polyline(single, 0.5).shape[0] == 1
 
 
 # --- downsample (NumPy reference) ---

@@ -28,6 +28,20 @@ def laplacian_step(
 
 
 @wp.kernel
+def neighborhood_average_step(
+    v_prev: wp.array[wp.vec3d],
+    lv: wp.array[wp.vec3d],
+    offsets: wp.array[wp.int32],
+    out_v: wp.array[wp.vec3d],
+) -> None:
+    # Closed 1-ring average: new_v = (v + deg * L·v) / (deg + 1), where L is the neighbors-only
+    # averaging operator and deg = CSR row length (vertex degree). deg=0 -> new_v = v.
+    i = int(wp.tid())
+    deg = wp.float64(offsets[i + 1] - offsets[i])
+    out_v[i] = (v_prev[i] + deg * lv[i]) / (deg + wp.float64(1.0))
+
+
+@wp.kernel
 def humphrey_residual(
     lv: wp.array[wp.vec3d],
     original: wp.array[wp.vec3d],
@@ -57,6 +71,50 @@ def humphrey_update(
 def scale_vertices(factor: wp.float64, out_v: wp.array[wp.vec3d]) -> None:
     i = int(wp.tid())
     out_v[i] = factor * out_v[i]
+
+
+@wp.kernel
+def mut_dif_adil(
+    normals: wp.array[wp.vec3],
+    v: wp.array[wp.vec3d],
+    lv: wp.array[wp.vec3d],
+    out_adil: wp.array[wp.float64],
+) -> None:
+    # adil = 1 / max(1e-12, |N . (V - L.V)|), the reciprocal normal-residual magnitude per vertex.
+    i = int(wp.tid())
+    p = normals[i]
+    nrm = wp.vec3d(wp.float64(p[0]), wp.float64(p[1]), wp.float64(p[2]))
+    d = wp.abs(wp.dot(nrm, v[i] - lv[i]))
+    out_adil[i] = wp.float64(1.0) / wp.max(wp.float64(1e-12), d)
+
+
+@wp.kernel
+def mut_dif_step(
+    v_prev: wp.array[wp.vec3d],
+    lv: wp.array[wp.vec3d],
+    adil: wp.array[wp.float64],
+    mean_adil: wp.float64,
+    lamb: wp.float64,
+    out_v: wp.array[wp.vec3d],
+) -> None:
+    # v' = v + lamber * (L.v - v), lamber = clamp(lamb * adil / mean_adil, 0.2 * lamb, 1.0).
+    i = int(wp.tid())
+    lamber = wp.max(wp.float64(0.2) * lamb, wp.min(wp.float64(1.0), lamb * adil[i] / mean_adil))
+    out_v[i] = v_prev[i] + lamber * (lv[i] - v_prev[i])
+
+
+@wp.kernel
+def add_scaled_normal(
+    v_prev: wp.array[wp.vec3d],
+    normals: wp.array[wp.vec3],
+    scale: wp.float64,
+    out_v: wp.array[wp.vec3d],
+) -> None:
+    # v' = v + scale * N; reused for the eps finite-difference probe and the volume correction.
+    i = int(wp.tid())
+    p = normals[i]
+    nrm = wp.vec3d(wp.float64(p[0]), wp.float64(p[1]), wp.float64(p[2]))
+    out_v[i] = v_prev[i] + scale * nrm
 
 
 @wp.kernel

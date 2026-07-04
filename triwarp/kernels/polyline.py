@@ -147,6 +147,115 @@ def upsample_gather(
     out_points[j] = polyline[segment] + weight * segment_displacement(polyline, segment)
 
 
+CURVATURE_EPS = wp.constant(wp.float32(1.0e-6))
+
+
+@wp.func
+def plane_normal(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.vec3:
+    """Normal of the plane approximately containing segment vectors ``a``, ``b``, ``c``.
+
+    Port of ``getPlaneNormal`` from MeshLib ``MRPolylineSubdivide.cpp``: returns whichever of
+    ``b x (a + c)`` and ``b x (a - c)`` has the larger magnitude, staying well-defined when ``a``
+    and ``c`` are nearly parallel or anti-parallel.
+    """
+    n1 = wp.cross(b, a + c)
+    n2 = wp.cross(b, a - c)
+    if wp.dot(n1, n1) >= wp.dot(n2, n2):
+        return n1
+    return n2
+
+
+@wp.func
+def endpoint_normals(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
+    """In-plane unit normals at the two ends of segment ``b`` bracketed by neighbours ``a``, ``c``.
+
+    Mirrors MeshLib's ``no``/``nd``: rotate each segment 90 degrees within the fitted plane
+    (``plane_normal``) and average the edge normal with each neighbour's normal. Returns two
+    zero vectors when the segments are (nearly) collinear, signalling the caller to fall back to a
+    straight chord.
+    """
+    normal = plane_normal(a, b, c)
+    if wp.dot(normal, normal) < CURVATURE_EPS:
+        return wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0)
+    nod = wp.normalize(wp.cross(normal, b))
+    no = wp.normalize(nod + wp.normalize(wp.cross(normal, a)))
+    nd = wp.normalize(nod + wp.normalize(wp.cross(normal, c)))
+    return no, nd
+
+
+@wp.func
+def arc_point(po: wp.vec3, pd: wp.vec3, no: wp.vec3, nd: wp.vec3, t: wp.float32) -> wp.vec3:
+    """Point at parameter ``t`` in ``[0, 1]`` along the circular arc from ``po`` to ``pd``.
+
+    The arc is the one whose unit end-normals are ``no`` and ``nd``; its midpoint offset from the
+    chord equals MeshLib's ``(|chord| / 2) * tan(theta / 4)`` sagitta, generalised here to every
+    ``t`` for multi-point subdivision. Degenerate inputs (zero-length chord, collinear neighbours
+    signalled by zero normals, straight/near-straight arc, or a cusp) collapse to the straight
+    chord ``po + t * (pd - po)``, so ``t == 0`` always returns ``po`` exactly.
+    """
+    b = pd - po
+    chord = wp.length(b)
+    linear = po + t * b
+    if chord < CURVATURE_EPS:
+        return po
+    # Zero end-normals are the collinear sentinel from endpoint_normals; unit normals have norm 1.
+    if wp.dot(no, no) < 0.5 or wp.dot(nd, nd) < 0.5:
+        return linear
+    theta = vector_angle_vec(no, nd)
+    if theta < CURVATURE_EPS:
+        return linear
+    tangent = b / chord
+    sign = 1.0
+    if wp.dot(b, nd - no) < 0.0:
+        sign = -1.0
+    bulge = sign * (no + nd)
+    m = bulge - wp.dot(bulge, tangent) * tangent  # bulge direction, orthogonalised against chord
+    if wp.dot(m, m) < CURVATURE_EPS:
+        return linear
+    m = wp.normalize(m)
+    alpha = 0.5 * theta
+    radius = chord / (2.0 * wp.sin(alpha))
+    center = 0.5 * (po + pd) - radius * wp.cos(alpha) * m
+    phi = (2.0 * t - 1.0) * alpha
+    return center + radius * (wp.cos(phi) * m + wp.sin(phi) * tangent)
+
+
+@wp.kernel
+def smooth_upsample_gather(
+    polyline: wp.array[wp.vec3],
+    offsets: wp.array[wp.int32],
+    steps: wp.array[wp.int32],
+    closed: wp.int32,
+    out_points: wp.array[wp.vec3],
+) -> None:
+    j = int(wp.tid())
+    segment = binary_search_index(offsets, j) - 1
+    k = j - offsets[segment]
+    t = wp.float32(k) / wp.float32(steps[segment])
+    n = polyline.shape[0]
+    po = polyline[segment]
+    pd = polyline[segment + 1]
+    # Locate the vertices bracketing this segment; interior segments fit a curvature arc, boundary
+    # segments of an open polyline (missing a neighbour) stay linear, matching MeshLib.
+    has_neighbours = int(0)
+    prev_index = int(0)
+    next_index = int(0)
+    if closed == 1:
+        m = n - 1  # distinct vertices: polyline[n - 1] duplicates polyline[0]
+        prev_index = (segment - 1 + m) % m
+        next_index = (segment + 2) % m
+        has_neighbours = 1
+    elif segment >= 1 and segment + 2 <= n - 1:
+        prev_index = segment - 1
+        next_index = segment + 2
+        has_neighbours = 1
+    if has_neighbours == 0:
+        out_points[j] = po + t * (pd - po)
+        return
+    no, nd = endpoint_normals(po - polyline[prev_index], pd - po, polyline[next_index] - pd)
+    out_points[j] = arc_point(po, pd, no, nd, t)
+
+
 @wp.kernel
 def greedy_downsample_mask(
     cumulative_lengths: wp.array[wp.float32], step_size: wp.float32, out_keep: wp.array[wp.bool]

@@ -200,3 +200,245 @@ def accumulate_cost(
     w_norm = weights[i] / w_sum[0]
     diff = b[i] - transformed[i]
     wp.atomic_add(out_cost, 0, w_norm * wp.dot(diff, diff))
+
+
+# --- Iterative closest point (ICP) -----------------------------------------
+
+
+@wp.kernel
+def distance_threshold_weights(
+    distance: wp.array[wp.float32],
+    triangle_id: wp.array[wp.int32],
+    max_distance: wp.float32,
+    out_weights: wp.array[wp.float32],
+) -> None:
+    """Binary correspondence mask: 1 for a valid, in-range hit, 0 otherwise."""
+    i = int(wp.tid())
+    if triangle_id[i] >= 0 and distance[i] <= max_distance:
+        out_weights[i] = wp.float32(1.0)
+    else:
+        out_weights[i] = wp.float32(0.0)
+
+
+@wp.kernel
+def compose_mat44(a: wp.array[wp.mat44], b: wp.array[wp.mat44], out_ab: wp.array[wp.mat44]) -> None:
+    """Compose two homogeneous transforms: ``out = a @ b`` (apply ``b`` then ``a``)."""
+    out_ab[0] = a[0] * b[0]
+
+
+@wp.kernel
+def gather_face_normals(
+    face_normals: wp.array[wp.vec3], index: wp.array[wp.int32], out_normals: wp.array[wp.vec3]
+) -> None:
+    """Gather per-correspondence normals by index, zeroing misses (``index < 0``)."""
+    i = int(wp.tid())
+    f = index[i]
+    if f >= 0:
+        out_normals[i] = face_normals[f]
+    else:
+        out_normals[i] = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
+
+
+@wp.func
+def robust_weight(residual: wp.float32, scale: wp.float32, kind: wp.int32) -> wp.float32:
+    """
+    IRLS weight for a residual under an M-estimator loss.
+
+    ``kind``: 0 = none (unit weight), 1 = Huber (``k = scale``),
+    2 = Tukey biweight (``c = scale``). A non-positive ``scale`` yields unit weight.
+    """
+    if kind == wp.int32(0) or scale <= wp.float32(0.0):
+        return wp.float32(1.0)
+    r = wp.abs(residual)
+    if kind == wp.int32(1):
+        # Huber
+        if r <= scale:
+            return wp.float32(1.0)
+        return scale / r
+    # Tukey biweight
+    if r >= scale:
+        return wp.float32(0.0)
+    u = r / scale
+    t = wp.float32(1.0) - u * u
+    return t * t
+
+
+@wp.func
+def point_to_plane_tile(
+    source: wp.array[wp.vec3],
+    target: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    distance: wp.array[wp.float32],
+    triangle_id: wp.array[wp.int32],
+    max_distance: wp.float32,
+    robust_kind: wp.int32,
+    robust_scale: wp.float32,
+    offset: int,
+    remaining: int,
+) -> tuple[wp.spatial_matrix, wp.spatial_vector, wp.float32]:
+    count = remaining
+    if count > TILE_1D:
+        count = TILE_1D
+    jtj = wp.spatial_matrix(wp.float32(0.0))
+    jtr = wp.spatial_vector(
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+    )
+    cost = wp.float32(0.0)
+    for k in range(count):
+        idx = offset + k
+        if triangle_id[idx] < 0 or distance[idx] > max_distance:
+            continue
+        nrm = wp.normalize(normals[idx])
+        x = source[idx]
+        d = x - target[idx]
+        r = wp.dot(d, nrm)
+        w = robust_weight(r, robust_scale, robust_kind)
+        # Jacobian of the point-to-plane residual: [x x n ; n]
+        j = wp.spatial_vector(wp.cross(x, nrm), nrm)
+        jtj += w * wp.outer(j, j)
+        jtr += (w * r) * j
+        cost += w * r * r
+    return jtj, jtr, cost
+
+
+@wp.kernel
+def accumulate_point_to_plane(
+    source: wp.array[wp.vec3],
+    target: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    distance: wp.array[wp.float32],
+    triangle_id: wp.array[wp.int32],
+    max_distance: wp.float32,
+    robust_kind: wp.int32,
+    robust_scale: wp.float32,
+    out_jtj: wp.array[wp.spatial_matrix],
+    out_jtr: wp.array[wp.spatial_vector],
+    out_cost: wp.array[wp.float32],
+) -> None:
+    i, t = wp.tid()
+    n = source.shape[0]
+    offset = i * TILE_1D
+    remaining = n - offset
+    if remaining <= 0:
+        return
+
+    tile_jtj, tile_jtr, tile_cost = point_to_plane_tile(
+        source,
+        target,
+        normals,
+        distance,
+        triangle_id,
+        max_distance,
+        robust_kind,
+        robust_scale,
+        offset,
+        remaining,
+    )
+
+    if t == 0:
+        wp.atomic_add(out_jtj, 0, tile_jtj)
+        wp.atomic_add(out_jtr, 0, tile_jtr)
+        wp.atomic_add(out_cost, 0, tile_cost)
+
+
+@wp.func
+def solve_spd6(a: wp.spatial_matrix, b: wp.spatial_vector) -> wp.spatial_vector:
+    """Solve the SPD 6x6 system ``a x = b`` via Cholesky (``a = L L^T``)."""
+    lower = wp.spatial_matrix(wp.float32(0.0))
+    for j in range(6):
+        s = a[j, j]
+        for k in range(j):
+            s -= lower[j, k] * lower[j, k]
+        if s < wp.float32(1e-20):
+            s = wp.float32(1e-20)
+        ljj = wp.sqrt(s)
+        lower[j, j] = ljj
+        for i in range(j + 1, 6):
+            v = a[i, j]
+            for k in range(j):
+                v -= lower[i, k] * lower[j, k]
+            lower[i, j] = v / ljj
+    # Forward substitution: L y = b
+    y = wp.spatial_vector(
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+    )
+    for i in range(6):
+        v = b[i]
+        for k in range(i):
+            v -= lower[i, k] * y[k]
+        y[i] = v / lower[i, i]
+    # Back substitution: L^T x = y
+    x = wp.spatial_vector(
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+    )
+    for ii in range(6):
+        i = 5 - ii
+        v = y[i]
+        for k in range(i + 1, 6):
+            v -= lower[k, i] * x[k]
+        x[i] = v / lower[i, i]
+    return x
+
+
+@wp.kernel
+def solve_point_to_plane(
+    jtj: wp.array[wp.spatial_matrix],
+    jtr: wp.array[wp.spatial_vector],
+    damping: wp.float32,
+    out_matrix: wp.array[wp.mat44],
+) -> None:
+    """Solve the linearized point-to-plane system and build the incremental transform."""
+    a = jtj[0]
+    b = jtr[0]
+
+    # Levenberg-style diagonal damping, scaled by the mean diagonal magnitude,
+    # keeps the system positive-definite for planar / rank-deficient targets.
+    trace = wp.float32(0.0)
+    for i in range(6):
+        trace += a[i, i]
+    reg = damping * trace / wp.float32(6.0) + wp.float32(1e-12)
+    for i in range(6):
+        a[i, i] += reg
+
+    delta = -solve_spd6(a, b)
+    omega = wp.spatial_top(delta)
+    tvec = wp.spatial_bottom(delta)
+
+    angle = wp.length(omega)
+    rot = wp.identity(n=3, dtype=wp.float32)
+    if angle > wp.float32(1e-12):
+        rot = wp.quat_to_matrix(wp.quat_from_axis_angle(omega / angle, angle))
+
+    out_matrix[0] = wp.mat44(
+        rot[0, 0],
+        rot[0, 1],
+        rot[0, 2],
+        tvec[0],
+        rot[1, 0],
+        rot[1, 1],
+        rot[1, 2],
+        tvec[1],
+        rot[2, 0],
+        rot[2, 1],
+        rot[2, 2],
+        tvec[2],
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(1.0),
+    )

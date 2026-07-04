@@ -69,6 +69,42 @@ def test_filter_taubin(request: pytest.FixtureRequest, mesh_name: str) -> None:
     assert np.allclose(smoothed_wp.numpy(), mesh_ref.vertices, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+def test_filter_mut_dif_laplacian_volume_constraint(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    # Watertight meshes only: the volume constraint inflates along vertex normals, so mesh.volume
+    # must be meaningful.
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+
+    smoothed_wp = tw.smoothing.filter_mut_dif_laplacian(
+        mesh_wp.points, mesh_wp.indices, lamb=0.5, iterations=8, volume_constraint=True
+    )
+    mesh_ref = mesh_tm.copy()
+    tms.filter_mut_dif_laplacian(mesh_ref, lamb=0.5, iterations=8, volume_constraint=True)
+
+    assert np.allclose(smoothed_wp.numpy(), mesh_ref.vertices, rtol=1e-5, atol=1e-5)
+
+
+def test_filter_mut_dif_laplacian_no_volume_constraint(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    # Open mesh, unconstrained path. Note: the per-vertex adil = 1/|N.(V - L.V)| reciprocal is
+    # coupled globally through its mean, so on strongly-saddled meshes (e.g. half_torus) the filter
+    # is chaotically sensitive to input precision (the float64 trimesh reference itself diverges by
+    # ~1e-2 under a float32 input round-trip). The hemisphere has no such near-zero normal residual,
+    # so float32 warp matches the float64 reference tightly.
+    mesh_tm, mesh_wp = hemisphere
+
+    smoothed_wp = tw.smoothing.filter_mut_dif_laplacian(
+        mesh_wp.points, mesh_wp.indices, lamb=0.5, iterations=8, volume_constraint=False
+    )
+    mesh_ref = mesh_tm.copy()
+    tms.filter_mut_dif_laplacian(mesh_ref, lamb=0.5, iterations=8, volume_constraint=False)
+
+    assert np.allclose(smoothed_wp.numpy(), mesh_ref.vertices, rtol=1e-5, atol=1e-5)
+
+
 def test_filter_laplacian_implicit(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     mesh_tm, mesh_wp = icosahedron
     _skip_without_cuda(mesh_wp)
@@ -129,6 +165,37 @@ def test_filter_laplacian_pluggable_operator(half_torus: tuple[tm.Trimesh, wp.Me
     tms.filter_laplacian(mesh_ref, iterations=6, volume_constraint=False, laplacian_operator=operator_tm)
 
     assert np.allclose(smoothed_wp.numpy(), mesh_ref.vertices, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+def test_filter_neighborhood_average(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    o3d = pytest.importorskip("open3d")
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    iterations = 5
+
+    smoothed_wp = tw.smoothing.filter_neighborhood_average(
+        mesh_wp.points, mesh_wp.indices, iterations=iterations
+    )
+
+    mesh_o3d = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(np.asarray(mesh_tm.vertices, dtype=np.float64)),
+        o3d.utility.Vector3iVector(np.asarray(mesh_tm.faces, dtype=np.int32)),
+    )
+    mesh_o3d = mesh_o3d.filter_smooth_simple(number_of_iterations=iterations)
+
+    assert np.allclose(
+        smoothed_wp.numpy(), np.asarray(mesh_o3d.vertices), rtol=1e-5, atol=1e-5
+    )
+
+
+def test_filter_neighborhood_average_zero_iterations(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    _, mesh_wp = icosahedron
+    smoothed_wp = tw.smoothing.filter_neighborhood_average(
+        mesh_wp.points, mesh_wp.indices, iterations=0
+    )
+    assert np.array_equal(smoothed_wp.numpy(), mesh_wp.points.numpy())
 
 
 def test_cpu_implicit_raises() -> None:
