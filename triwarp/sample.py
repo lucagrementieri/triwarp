@@ -10,8 +10,6 @@ import warp as wp
 
 import triwarp as tw
 from triwarp.array import append, concatenate, flatnonzero, gather, init_sort_pair_indices
-from triwarp.edges import faces_to_edges
-from triwarp.graph import is_watertight
 from triwarp.kernels import sample as kernel_sample
 from triwarp.kernels.algorithms import blue_noise as kernel_blue_noise
 from triwarp.proximity import query_hashgrid_ball_with_offsets
@@ -35,6 +33,78 @@ def get_seed(seed: int | None) -> int:
     if seed is None:
         return secrets.randbelow(2**31)
     return int(seed)
+
+
+def sample_fibonacci_sphere(count: int, device: wp.DeviceLike = None) -> wp.array[wp.vec3]:
+    """
+    Generate near-uniform unit vectors on the sphere via the Fibonacci spiral.
+
+    Successive points are placed at multiples of the golden angle while their
+    height ``z`` descends uniformly through ``(-1, 1)``, producing the Fibonacci
+    lattice — a deterministic, low-discrepancy covering of the sphere that is far
+    more even than independent random sampling for the same ``count``.
+
+    Parameters
+    ----------
+    count
+        Number of directions to generate.
+    device
+        Warp device for the result. Defaults to the current device.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        ``(count,)`` unit vectors on the sphere. Empty when ``count`` is 0.
+
+    See Also
+    --------
+    [`sample_fibonacci_hemisphere`][triwarp.sample.sample_fibonacci_hemisphere]
+    """
+    if count <= 0:
+        return wp.empty(0, dtype=wp.vec3, device=device)
+    out_directions = wp.empty(count, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_sample.fibonacci_sphere, dim=count, inputs=[count, out_directions], device=device
+    )
+    return out_directions
+
+
+def sample_fibonacci_hemisphere(count: int, device: wp.DeviceLike = None) -> wp.array[wp.vec3]:
+    """
+    Generate near-uniform unit vectors on the positive-``z`` hemisphere.
+
+    Same Fibonacci-spiral construction as
+    [`sample_fibonacci_sphere`][triwarp.sample.sample_fibonacci_sphere] but with
+    ``z`` descending uniformly through ``(0, 1)``, so every direction has a
+    positive ``z`` component. Because the hemisphere and its reflection tile the
+    full sphere, pairing each direction ``n`` with its antipode ``-n`` (for
+    example via a min/max reduction) covers all orientations with half the
+    directions.
+
+    Parameters
+    ----------
+    count
+        Number of directions to generate.
+    device
+        Warp device for the result. Defaults to the current device.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        ``(count,)`` unit vectors on the positive-``z`` hemisphere. Empty when
+        ``count`` is 0.
+
+    See Also
+    --------
+    [`sample_fibonacci_sphere`][triwarp.sample.sample_fibonacci_sphere]
+    """
+    if count <= 0:
+        return wp.empty(0, dtype=wp.vec3, device=device)
+    out_directions = wp.empty(count, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_sample.fibonacci_hemisphere, dim=count, inputs=[count, out_directions], device=device
+    )
+    return out_directions
 
 
 def sample_surface(
@@ -536,17 +606,16 @@ def sample_volume(
     ValueError
         If the mesh is not watertight (open boundary edges detected).
     ValueError
-        If some signed tet volumes are negative after fanning from the centroid
-        (the mesh is not star-shaped with respect to its own centroid, e.g. a torus).
+        If the mesh has zero total volume, or some signed tet volumes are negative after fanning
+        from the centroid (the mesh is not star-shaped with respect to its own centroid, e.g. a
+        torus).
     """
     n_faces = faces.shape[0] // 3
 
     if count == 0:
         return wp.empty(0, dtype=wp.vec3, device=vertices.device)
 
-    edges = faces_to_edges(faces)
-    watertight, _ = is_watertight(edges)
-    if not watertight:
+    if not tw.characteristics.is_edge_manifold(faces, allow_boundary_edges=False):
         raise ValueError(
             "mesh is not watertight; tetrahedral decomposition requires a closed surface"
         )
@@ -565,10 +634,6 @@ def sample_volume(
     total_vol = float(vols_np.sum())
     if total_vol == 0.0:
         raise ValueError("mesh has zero volume")
-
-    if total_vol < 0.0:
-        vols_np = -vols_np
-        total_vol = -total_vol
 
     if float(vols_np.min()) < 0.0:
         raise ValueError(

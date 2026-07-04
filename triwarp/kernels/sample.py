@@ -1,4 +1,32 @@
+import math
+
 import warp as wp
+
+# Golden angle in radians: pi * (3 - sqrt(5)) ~ 2.399963. Successive multiples of this
+# angle place points on the Fibonacci lattice, the most uniform simple spiral on a sphere.
+GOLDEN_ANGLE = wp.constant(wp.float32(math.pi * (3.0 - math.sqrt(5.0))))
+
+
+@wp.kernel
+def fibonacci_sphere(count: wp.int32, out_directions: wp.array[wp.vec3]) -> None:
+    i = int(wp.tid())
+    count_f = wp.float32(count)
+    # z descends uniformly through (-1, 1); the offset 0.5 centers the samples.
+    z = 1.0 - 2.0 * (wp.float32(i) + 0.5) / count_f
+    radius = wp.sqrt(wp.max(0.0, 1.0 - z * z))
+    theta = GOLDEN_ANGLE * wp.float32(i)
+    out_directions[i] = wp.vec3(radius * wp.cos(theta), radius * wp.sin(theta), z)
+
+
+@wp.kernel
+def fibonacci_hemisphere(count: wp.int32, out_directions: wp.array[wp.vec3]) -> None:
+    i = int(wp.tid())
+    count_f = wp.float32(count)
+    # z descends uniformly through (0, 1): positive-z hemisphere only.
+    z = 1.0 - (wp.float32(i) + 0.5) / count_f
+    radius = wp.sqrt(wp.max(0.0, 1.0 - z * z))
+    theta = GOLDEN_ANGLE * wp.float32(i)
+    out_directions[i] = wp.vec3(radius * wp.cos(theta), radius * wp.sin(theta), z)
 
 
 @wp.kernel

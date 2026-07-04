@@ -8,13 +8,7 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp.kernels import characteristics as kernel_characteristics
 from triwarp.kernels import intersections as kernel_intersections
-
-
-def _n_vertices(faces: wp.array[wp.int32]) -> int:
-    """Vertex count inferred as ``max(faces) + 1`` (matches libigl ``F.maxCoeff() + 1``)."""
-    if int(faces.shape[0]) == 0:
-        return 0
-    return int(faces.numpy().max()) + 1
+from triwarp.kernels import sample as kernel_sample
 
 
 def is_edge_manifold(faces: wp.array[wp.int32], allow_boundary_edges: bool = True) -> bool:
@@ -54,7 +48,7 @@ def is_edge_manifold(faces: wp.array[wp.int32], allow_boundary_edges: bool = Tru
         return True
 
     edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    keys = tw.unique.hash_indices_rows(edges_sorted, max_index=_n_vertices(faces))
+    keys = tw.unique.hash_indices_rows(edges_sorted, max_index=tw.vertices.n_vertices(faces))
     _, counts = tw.unique.unique_1d(keys, return_counts=True)
 
     min_count, max_count = tw.reduce.minmax(cast(twt.Array1dInt32, counts))
@@ -107,7 +101,7 @@ def edge_manifold_mask(
 
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    keys = tw.unique.hash_indices_rows(edges_sorted, max_index=_n_vertices(faces))
+    keys = tw.unique.hash_indices_rows(edges_sorted, max_index=tw.vertices.n_vertices(faces))
     _, inverse, counts = tw.unique.unique_1d(keys, return_inverse=True, return_counts=True)
 
     n_unique = int(counts.shape[0])
@@ -242,7 +236,7 @@ def is_vertex_manifold(faces: wp.array[wp.int32]) -> bool:
     if n_faces == 0:
         return True
 
-    manifold = _vertex_manifold_mask(faces, _n_vertices(faces))
+    manifold = _vertex_manifold_mask(faces, tw.vertices.n_vertices(faces))
     return bool(tw.reduce.all(manifold))
 
 
@@ -350,19 +344,159 @@ def is_watertight(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> boo
     [`is_edge_manifold`][triwarp.characteristics.is_edge_manifold]
     [`is_vertex_manifold`][triwarp.characteristics.is_vertex_manifold]
     [`is_self_intersecting`][triwarp.characteristics.is_self_intersecting]
-    [`is_watertight`][triwarp.graph.is_watertight]
+    [`is_volume`][triwarp.characteristics.is_volume]
 
     Notes
     -----
     Equivalent to ``open3d.geometry.TriangleMesh.is_watertight``. For the cheaper "every edge shared
     by exactly two faces" test (trimesh semantics) use
-    [`is_watertight`][triwarp.graph.is_watertight].
+    [`is_edge_manifold`][triwarp.characteristics.is_edge_manifold] with
+    ``allow_boundary_edges=False``.
     """
     return (
         is_edge_manifold(faces, allow_boundary_edges=False)
         and is_vertex_manifold(faces)
         and not is_self_intersecting(vertices, faces)
     )
+
+
+def _watertight_winding(
+    edges: twt.Array2dInt32, edges_sorted: twt.Array2dInt32 | None = None
+) -> tuple[bool, bool]:
+    """
+    Watertight and winding-consistency flags for a directed edge list.
+
+    ``watertight`` is ``True`` when every undirected edge appears exactly twice in ``edges`` (no
+    boundary or non-manifold edges); ``winding`` is ``True`` when the two directed copies of each
+    shared edge are reversed. Mirrors ``trimesh.graph.is_watertight``.
+    """
+    twt.ensure_ndim(edges, 2, dtype=wp.int32)
+    if int(edges.shape[1]) != 2:
+        raise ValueError(f"edges must have shape (n, 2), got {edges.shape}")
+
+    n_edges = int(edges.shape[0])
+    device = edges.device
+    if n_edges == 0:
+        return True, True
+
+    if edges_sorted is None:
+        edges_sorted = twt.empty_int32_2d((n_edges, 2), device=device)
+        wp.copy(edges_sorted, edges)
+        tw.array.sort_rows(edges_sorted)
+    else:
+        twt.ensure_ndim(edges_sorted, 2, dtype=wp.int32)
+        if int(edges_sorted.shape[0]) != n_edges or int(edges_sorted.shape[1]) != 2:
+            raise ValueError(
+                f"edges_sorted must have shape ({n_edges}, 2), got {edges_sorted.shape}"
+            )
+
+    edge_groups = tw.grouping.group_int_rows(edges_sorted, length=2)
+    n_groups = int(edge_groups.shape[0])
+    watertight = (n_groups * 2) == n_edges
+
+    if n_groups == 0:
+        return watertight, True
+
+    consistent = wp.empty(n_groups, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_characteristics.edge_pair_winding_mask,
+        dim=n_groups,
+        inputs=[edges, edge_groups, consistent],
+        device=device,
+    )
+    return watertight, bool(tw.reduce.all(consistent))
+
+
+def is_winding_consistent(faces: wp.array[wp.int32]) -> bool:
+    """
+    Whether every shared edge is traversed in opposite directions by its two faces.
+
+    A mesh has consistent winding when, for each edge shared by two faces, the two faces list the
+    edge's endpoints in opposite order (so their normals agree locally). This is a property of the
+    current winding, unlike [`is_orientable`][triwarp.characteristics.is_orientable], which allows
+    faces to be flipped. Matches [`trimesh.Trimesh.is_winding_consistent`][].
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+
+    Returns
+    -------
+    bool
+        ``True`` when winding is consistent across all shared edges. Vacuously ``True`` for an empty
+        mesh or a mesh with no shared edges.
+
+    See Also
+    --------
+    [`is_orientable`][triwarp.characteristics.is_orientable]
+    [`is_volume`][triwarp.characteristics.is_volume]
+    [`trimesh.Trimesh.is_winding_consistent`][]
+    """
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return True
+
+    edges = tw.edges.faces_to_edges(faces)
+    edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+    _, winding = _watertight_winding(edges, edges_sorted)
+    return winding
+
+
+def is_volume(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> bool:
+    """
+    Whether the mesh is a valid closed volume with outward-facing normals.
+
+    Follows [`trimesh.Trimesh.is_volume`][]: the mesh must be watertight (every undirected edge
+    shared by exactly two faces), winding-consistent, and enclose a positive signed volume (normals
+    point outward). A mesh with inward-facing normals encloses a negative signed volume and is
+    reported ``False``.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+
+    Returns
+    -------
+    bool
+        ``True`` when the mesh is watertight, winding-consistent, and has outward normals (positive
+        signed volume). ``False`` for an empty mesh.
+
+    See Also
+    --------
+    [`is_winding_consistent`][triwarp.characteristics.is_winding_consistent]
+    [`is_watertight`][triwarp.characteristics.is_watertight]
+    [`is_orientable`][triwarp.characteristics.is_orientable]
+    [`trimesh.Trimesh.is_volume`][]
+
+    Notes
+    -----
+    The signed volume is the sum of per-face signed tetrahedron volumes ``dot(v0, cross(v1, v2)) /
+    6`` measured from the origin; for a closed surface this is independent of the reference point and
+    its sign encodes the normal orientation.
+    """
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return False
+
+    device = vertices.device
+    edges = tw.edges.faces_to_edges(faces)
+    edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+    watertight, winding = _watertight_winding(edges, edges_sorted)
+    if not (watertight and winding):
+        return False
+
+    signed_volumes = wp.empty(n_faces, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_sample.signed_tet_volumes,
+        dim=n_faces,
+        inputs=[vertices, faces, wp.vec3(0.0, 0.0, 0.0), signed_volumes],
+        device=device,
+    )
+    return tw.reduce.sum(signed_volumes) > 0.0
 
 
 def is_orientable(faces: wp.array[wp.int32]) -> bool:
@@ -390,14 +524,14 @@ def is_orientable(faces: wp.array[wp.int32]) -> bool:
     See Also
     --------
     [`is_watertight`][triwarp.characteristics.is_watertight]
-    [`is_watertight`][triwarp.graph.is_watertight]
+    [`is_winding_consistent`][triwarp.characteristics.is_winding_consistent]
 
     Notes
     -----
     Equivalent to ``open3d.geometry.TriangleMesh.is_orientable``. Unlike
-    [`is_watertight`][triwarp.graph.is_watertight]'s winding flag, orientability allows individual
-    faces to be flipped, so a consistently-orientable mesh with mixed winding still returns
-    ``True``.
+    [`is_winding_consistent`][triwarp.characteristics.is_winding_consistent], orientability allows
+    individual faces to be flipped, so a consistently-orientable mesh with inconsistent winding still
+    returns ``True``.
     """
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -475,6 +609,6 @@ def euler_characteristic(faces: wp.array[wp.int32]) -> int:
         return 0
 
     n_referenced = int(tw.unique.unique_1d(faces).shape[0])
-    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=_n_vertices(faces))
+    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=tw.vertices.n_vertices(faces))
     n_edges = int(unique_edges.shape[0])
     return n_referenced - n_edges + n_faces

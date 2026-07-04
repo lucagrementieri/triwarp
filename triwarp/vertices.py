@@ -9,6 +9,30 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels import vertices as kernel_vertices
 
 
+def n_vertices(indices: twt.IntArray) -> int:
+    """
+    Vertex count inferred from an index buffer as ``max(indices) + 1``.
+
+    Follows libigl's ``F.maxCoeff() + 1`` convention: the vertex count is one past the largest
+    referenced index. Accepts any ``wp.int32`` index buffer — a length-``3 * n_faces`` flat
+    triangle buffer, an ``(n, 2)`` edge array, etc. — reading its maximum on the host.
+
+    Parameters
+    ----------
+    indices
+        A ``wp.int32`` index buffer of any shape (e.g. a flat ``faces`` array or a ``(n, 2)``
+        edge array).
+
+    Returns
+    -------
+    int
+        ``max(indices) + 1``, or ``0`` when ``indices`` is empty.
+    """
+    if int(indices.shape[0]) == 0:
+        return 0
+    return int(indices.numpy().max()) + 1
+
+
 def mean_vertex_normals(
     n_vertices: int, faces: wp.array[wp.int32], face_normals: wp.array[wp.vec3]
 ) -> wp.array[wp.vec3]:

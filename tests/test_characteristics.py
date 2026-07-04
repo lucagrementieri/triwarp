@@ -268,6 +268,44 @@ def test_is_watertight(request: pytest.FixtureRequest, mesh_name: str) -> None:
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
+def test_is_winding_consistent(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    winding_wp = tw.characteristics.is_winding_consistent(mesh_wp.indices)
+    assert winding_wp == bool(mesh_tm.is_winding_consistent)
+    assert winding_wp is True
+
+
+def test_is_winding_consistent_flipped(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    faces_flipped = mesh_tm.faces.copy()
+    faces_flipped[::2] = faces_flipped[::2][:, ::-1]  # reverse winding of half the faces
+    _, faces_wp = _mesh_to_wp(mesh_tm.vertices, faces_flipped, mesh_wp.device)
+    mesh_flipped_tm = tm.Trimesh(vertices=mesh_tm.vertices, faces=faces_flipped, process=False)
+    winding_wp = tw.characteristics.is_winding_consistent(faces_wp)
+    assert winding_wp == bool(mesh_flipped_tm.is_winding_consistent)
+    assert winding_wp is False
+
+
+@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+def test_is_volume(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    volume_wp = tw.characteristics.is_volume(mesh_wp.points, mesh_wp.indices)
+    assert volume_wp == bool(mesh_tm.is_volume)
+    assert volume_wp == (mesh_name in CLOSED_MESHES)
+
+
+def test_is_volume_inward_normals(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    faces_inward = mesh_tm.faces[:, ::-1].copy()  # reverse every face -> inward-facing normals
+    vertices_wp, faces_wp = _mesh_to_wp(mesh_tm.vertices, faces_inward, mesh_wp.device)
+    mesh_inward_tm = tm.Trimesh(vertices=mesh_tm.vertices, faces=faces_inward, process=False)
+    # Still watertight and winding-consistent, but the enclosed signed volume is negative.
+    volume_wp = tw.characteristics.is_volume(vertices_wp, faces_wp)
+    assert volume_wp == bool(mesh_inward_tm.is_volume)
+    assert volume_wp is False
+
+
+@pytest.mark.parametrize("mesh_name", ALL_MESHES)
 def test_is_orientable_fixtures(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     orientable_wp = tw.characteristics.is_orientable(mesh_wp.indices)
@@ -316,6 +354,8 @@ def test_empty_mesh(device: str) -> None:
     assert tw.characteristics.is_vertex_manifold(faces_wp) is True
     assert tw.characteristics.is_self_intersecting(vertices_wp, faces_wp) is False
     assert tw.characteristics.is_orientable(faces_wp) is True
+    assert tw.characteristics.is_winding_consistent(faces_wp) is True
+    assert tw.characteristics.is_volume(vertices_wp, faces_wp) is False
     assert tw.characteristics.euler_characteristic(faces_wp) == 0
     assert tw.characteristics.edge_manifold_mask(faces_wp).shape[0] == 0
     assert tw.characteristics.vertex_manifold_mask(vertices_wp, faces_wp).shape[0] == 0

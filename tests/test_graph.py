@@ -54,55 +54,6 @@ def test_face_adjacency_unshared(request: pytest.FixtureRequest, mesh_name: str)
     )
 
 
-def test_is_watertight_icosahedron(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    mesh_tm, mesh_wp = icosahedron
-    edges_wp = tw.edges.faces_to_edges(mesh_wp.indices)
-    edges_sorted_wp = tw.edges.faces_to_edges(mesh_wp.indices, sorted=True)
-
-    watertight_wp, winding_wp = tw.graph.is_watertight(edges_wp, edges_sorted_wp)
-    watertight_tm, winding_tm = tm.graph.is_watertight(mesh_tm.edges, mesh_tm.edges_sorted)
-
-    assert watertight_wp == watertight_tm
-    assert winding_wp == winding_tm
-    assert watertight_wp
-    assert winding_wp
-
-
-def test_is_watertight_hemisphere(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    mesh_tm, mesh_wp = hemisphere
-    edges_wp = tw.edges.faces_to_edges(mesh_wp.indices)
-    edges_sorted_wp = tw.edges.faces_to_edges(mesh_wp.indices, sorted=True)
-
-    watertight_wp, winding_wp = tw.graph.is_watertight(edges_wp, edges_sorted_wp)
-    watertight_tm, winding_tm = tm.graph.is_watertight(mesh_tm.edges, mesh_tm.edges_sorted)
-
-    assert watertight_wp == watertight_tm
-    assert winding_wp == winding_tm
-    assert not watertight_wp
-
-
-def test_is_watertight_icosahedron_reversed_faces(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    mesh_tm, mesh_wp = icosahedron
-    rng = np.random.default_rng(17)
-    faces_np = mesh_tm.faces.copy()
-    flip_mask = rng.random(len(faces_np)) < 0.5
-    faces_np[flip_mask] = faces_np[flip_mask, ::-1]
-
-    faces_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=mesh_wp.points.device)
-    edges_wp = tw.edges.faces_to_edges(faces_wp)
-    edges_sorted_wp = tw.edges.faces_to_edges(faces_wp, sorted=True)
-
-    watertight_wp, winding_wp = tw.graph.is_watertight(edges_wp, edges_sorted_wp)
-    edges_tm = tm.geometry.faces_to_edges(faces_np)
-    edges_sorted_tm = np.sort(edges_tm, axis=1)
-    watertight_tm, winding_tm = tm.graph.is_watertight(edges_tm, edges_sorted_tm)
-
-    assert watertight_wp == watertight_tm
-    assert winding_wp == winding_tm
-    assert watertight_wp
-    assert not winding_wp
-
-
 def test_face_adjacency_unshared_empty(device: str) -> None:
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
     unshared_wp = tw.graph.face_adjacency_unshared(faces_wp)

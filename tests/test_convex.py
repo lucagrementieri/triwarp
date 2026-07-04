@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import scipy.spatial
 import warp as wp
 
 import triwarp as tw
@@ -161,3 +162,46 @@ def test_face_adjacency_convex_empty(device: str) -> None:
     vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
     convex_wp = tw.convex.face_adjacency_convex(vertices_wp, faces_wp)
     assert convex_wp.shape == (0,)
+
+
+def test_fast_convex_set_mask_sound(device: str) -> None:
+    rng = np.random.default_rng(0)
+    points_np = rng.standard_normal((500, 3)).astype(np.float64)
+    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+
+    mask_wp = tw.convex.fast_convex_set_mask(points_wp, n_directions=256)
+    selected = np.flatnonzero(mask_wp.numpy())
+
+    hull_scipy = scipy.spatial.ConvexHull(points_np)
+    assert set(selected.tolist()) <= set(hull_scipy.vertices.tolist())
+
+
+def test_fast_convex_set_recall(device: str) -> None:
+    rng = np.random.default_rng(2)
+    points_np = rng.standard_normal((200, 3)).astype(np.float64)
+    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+
+    mask_wp = tw.convex.fast_convex_set_mask(points_wp, n_directions=4096)
+    selected = set(np.flatnonzero(mask_wp.numpy()).tolist())
+
+    hull_scipy = scipy.spatial.ConvexHull(points_np)
+    assert selected == set(hull_scipy.vertices.tolist())
+
+
+def test_fast_convex_set_points(device: str) -> None:
+    rng = np.random.default_rng(4)
+    points_np = rng.standard_normal((300, 3)).astype(np.float64)
+    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+
+    mask_wp = tw.convex.fast_convex_set_mask(points_wp, n_directions=256)
+    subset_wp = tw.convex.fast_convex_set(points_wp, n_directions=256)
+
+    selected = np.flatnonzero(mask_wp.numpy())
+    expected_points = points_np[np.sort(selected)]
+    assert np.allclose(subset_wp.numpy(), expected_points, rtol=1e-5, atol=1e-5)
+
+
+def test_fast_convex_set_mask_empty(device: str) -> None:
+    points_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    mask_wp = tw.convex.fast_convex_set_mask(points_wp)
+    assert mask_wp.shape == (0,)

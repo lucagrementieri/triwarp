@@ -1,6 +1,18 @@
 import warp as wp
 
 
+@wp.kernel
+def edge_pair_winding_mask(
+    edges: wp.array2d[wp.int32],
+    edge_groups: wp.array2d[wp.int32],
+    out_consistent: wp.array[wp.bool],
+) -> None:
+    tid = int(wp.tid())
+    i0 = edge_groups[tid, 0]
+    i1 = edge_groups[tid, 1]
+    out_consistent[tid] = edges[i0, 1] == edges[i1, 0]
+
+
 @wp.func
 def local_index(faces: wp.array[wp.int32], f: wp.int32, v: wp.int32) -> wp.int32:
     """Position (0, 1, 2) of vertex ``v`` within face ``f``."""

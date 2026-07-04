@@ -12,6 +12,7 @@
             "Bash(cat:*)",
             "Bash(ls:*)",
             "Bash(rm -rf //**/.cache/warp/*)",
+            "Bash(DISABLE_MKDOCS_2_WARNING=true uv run mkdocs:*)",
             "WebFetch(domain:nvidia.github.io)"
         ],
         "additionalDirectories": [

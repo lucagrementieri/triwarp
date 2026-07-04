@@ -211,3 +211,41 @@ def test_sample_volume_not_watertight(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     _, mesh_wp = half_torus
     with pytest.raises(ValueError, match="watertight"):
         tw.sample.sample_volume(mesh_wp.points, mesh_wp.indices, 100)
+
+
+def test_sample_fibonacci_sphere_unit(device: str):
+    directions_wp = tw.sample.sample_fibonacci_sphere(1000, device=device)
+    directions_np = directions_wp.numpy()
+    assert directions_np.shape == (1000, 3)
+    norms = np.linalg.norm(directions_np, axis=1)
+    assert np.allclose(norms, 1.0, rtol=1e-5, atol=1e-5)
+
+
+def test_sample_fibonacci_sphere_uniform(device: str):
+    # A near-uniform covering of the sphere has its centroid essentially at the origin.
+    directions_np = tw.sample.sample_fibonacci_sphere(4096, device=device).numpy()
+    assert np.allclose(directions_np.mean(axis=0), 0.0, atol=1e-2)
+
+
+def test_sample_fibonacci_sphere_deterministic(device: str):
+    directions_a = tw.sample.sample_fibonacci_sphere(500, device=device).numpy()
+    directions_b = tw.sample.sample_fibonacci_sphere(500, device=device).numpy()
+    assert np.array_equal(directions_a, directions_b)
+
+
+def test_sample_fibonacci_sphere_empty(device: str):
+    directions_wp = tw.sample.sample_fibonacci_sphere(0, device=device)
+    assert directions_wp.shape == (0,)
+
+
+def test_sample_fibonacci_hemisphere_positive_z(device: str):
+    directions_np = tw.sample.sample_fibonacci_hemisphere(1000, device=device).numpy()
+    assert directions_np.shape == (1000, 3)
+    assert np.all(directions_np[:, 2] > 0.0)
+    norms = np.linalg.norm(directions_np, axis=1)
+    assert np.allclose(norms, 1.0, rtol=1e-5, atol=1e-5)
+
+
+def test_sample_fibonacci_hemisphere_empty(device: str):
+    directions_wp = tw.sample.sample_fibonacci_hemisphere(0, device=device)
+    assert directions_wp.shape == (0,)
