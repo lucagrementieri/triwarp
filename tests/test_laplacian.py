@@ -42,7 +42,9 @@ def test_cotmatrix_entries_intrinsic(request: pytest.FixtureRequest, mesh_name: 
 
     edge_lengths_igl = igl.edge_lengths(vertices_np, faces_np)
     cot_entries_igl = igl.cotmatrix_entries(edge_lengths_igl)
-    edge_lengths_wp = wp.array(edge_lengths_igl.astype(np.float32), dtype=wp.float32, device=mesh_wp.device)
+    edge_lengths_wp = wp.array(
+        edge_lengths_igl.astype(np.float32), dtype=wp.float32, device=mesh_wp.device
+    )
     cot_entries_wp = tw.laplacian.cotmatrix_entries_intrinsic(edge_lengths_wp)
 
     assert np.allclose(cot_entries_wp.numpy(), cot_entries_igl, rtol=1e-5, atol=1e-5)

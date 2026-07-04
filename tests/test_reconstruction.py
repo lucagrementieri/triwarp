@@ -23,7 +23,7 @@ from meshlib import mrmeshpy as mm  # noqa: E402
 def _meshlib_triangulate(
     points_np: np.ndarray, normals_np: np.ndarray, num_neighbours: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Reference reconstruction via MeshLib; returns ``(vertices, faces)`` numpy arrays."""
+    """Reconstruct a reference mesh via MeshLib, returning ``(vertices, faces)`` numpy arrays."""
     cloud_mm = mn.pointCloudFromPoints(
         np.ascontiguousarray(points_np), np.ascontiguousarray(normals_np)
     )
@@ -189,9 +189,9 @@ def test_too_few_points(device: str):
 
 def test_invalid_parameters(device: str):
     points_wp = wp.zeros(4, dtype=wp.vec3, device=device)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="pass at most one of num_neighbours and radius"):
         tw.reconstruction.triangulate_point_cloud(points_wp, num_neighbours=8, radius=1.0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="max_neighbours must be <="):
         tw.reconstruction.triangulate_point_cloud(
             points_wp, max_neighbours=tw.kernels.reconstruction.MAX_NEIGHBOURS + 1
         )

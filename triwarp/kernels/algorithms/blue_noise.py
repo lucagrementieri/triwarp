@@ -7,7 +7,7 @@ from triwarp.kernels import array as kernel_array
 G_FAR = wp.constant(wp.int32(2))
 G_STEP = wp.constant(wp.int32(4))
 INVALID = wp.constant(wp.int32(-1))
-# Compile-time stack array size for neighbor shell (g=4 → 9³−1 cells).
+# Compile-time stack array size for neighbor shell (g=4 -> 9^3-1 cells).
 _MAX_STEP_NEIGHBORS = 728
 
 
@@ -41,9 +41,6 @@ def far_enough(
     zi = grid_coords[mi].z
     g = G_FAR
     w64 = wp.int64(grid_w)
-    xi64 = wp.int64(xi)
-    yi64 = wp.int64(yi)
-    zi64 = wp.int64(zi)
 
     for dx in range(-g, g + 1):
         cx = xi + dx

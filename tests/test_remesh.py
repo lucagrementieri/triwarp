@@ -175,7 +175,7 @@ def test_subdivide_to_size_max_edge(
     mesh_name: str, frac: float, request: pytest.FixtureRequest
 ) -> None:
     """Every edge is at most ``max_edge`` after subdivision (the defining property)."""
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     max_edge = frac * tw.edges.mean_edge_length(mesh_wp.points, mesh_wp.indices)
 
     new_v_wp, new_f_wp = tw.remesh.subdivide_to_size(mesh_wp.points, mesh_wp.indices, max_edge)
@@ -259,7 +259,8 @@ def test_subdivide_to_size_return_index(mesh_name: str, request: pytest.FixtureR
     index_np = index_wp.numpy()
 
     assert index_np.shape[0] == new_f_np.shape[0]
-    assert index_np.min() >= 0 and index_np.max() < n_in_faces
+    assert index_np.min() >= 0
+    assert index_np.max() < n_in_faces
 
     # Every output-face centroid lies inside its claimed source triangle.
     centroids = new_v_np[new_f_np].mean(axis=1)
@@ -276,10 +277,12 @@ def test_subdivide_to_size_return_index(mesh_name: str, request: pytest.FixtureR
     bary_w = (d00 * d21 - d01 * d20) / denom
     bary_u = 1.0 - bary_v - bary_w
     tol = 1e-3
-    assert np.all(bary_u >= -tol) and np.all(bary_v >= -tol) and np.all(bary_w >= -tol)
-    assert (
-        np.all(bary_u <= 1.0 + tol) and np.all(bary_v <= 1.0 + tol) and np.all(bary_w <= 1.0 + tol)
-    )
+    assert np.all(bary_u >= -tol)
+    assert np.all(bary_v >= -tol)
+    assert np.all(bary_w >= -tol)
+    assert np.all(bary_u <= 1.0 + tol)
+    assert np.all(bary_v <= 1.0 + tol)
+    assert np.all(bary_w <= 1.0 + tol)
 
 
 def test_subdivide_to_size_empty(device: str) -> None:

@@ -60,11 +60,11 @@ def flipped_faces(
     vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]
 ) -> wp.array[wp.int32]:
     """
-    Indices of triangles that are inverted (negative 2D signed area) in the parametrization.
+    Return the indices of triangles inverted (negative 2D signed area) in the parametrization.
 
     Convenience wrapper returning ``flatnonzero`` of
-    [`flipped_faces_mask`][triwarp.parametrization.flipped_faces_mask]: the indices into ``faces`` of
-    triangles whose 2D signed area is strictly negative (folded over in the UV domain). Matches
+    [`flipped_faces_mask`][triwarp.parametrization.flipped_faces_mask]: the indices into ``faces``
+    of triangles whose 2D signed area is strictly negative (folded over in the UV domain). Matches
     libigl's ``flipped_triangles``, which returns the same list of flipped-triangle indices.
 
     Parameters

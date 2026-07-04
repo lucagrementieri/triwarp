@@ -1,7 +1,5 @@
 import warp as wp
 
-from triwarp.kernels import array as kernel_array
-
 
 @wp.kernel
 def faces_to_edges(faces: wp.array[wp.int32], out_edges: wp.array2d[wp.int32]) -> None:

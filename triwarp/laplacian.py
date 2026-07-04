@@ -52,7 +52,9 @@ def cotmatrix_entries(
 
 def cotmatrix_entries_intrinsic(edge_lengths: twt.Array2dFloat32) -> twt.Array2dFloat32:
     """
-    Per-triangle half-cotangent weights from edge lengths (``igl::cotmatrix_entries`` intrinsic overload).
+    Per-triangle half-cotangent weights from edge lengths.
+
+    (``igl::cotmatrix_entries`` intrinsic overload).
 
     Each row gives the three edge lengths opposite vertices 0, 1, and 2 of the corresponding
     triangle.
@@ -298,8 +300,9 @@ def mass_matrix_entries(
     Per-vertex barycentric lumped mass (diagonal of ``igl::massmatrix``).
 
     Each triangle donates a third of its area to each of its three vertices, so entry ``i`` is
-    the summed one-third incident-face area at vertex ``i``. This is the ``MASSMATRIX_TYPE_BARYCENTRIC``
-    lumping; it is the diagonal of [`mass_matrix`][triwarp.laplacian.mass_matrix].
+    the summed one-third incident-face area at vertex ``i``. This is the
+    ``MASSMATRIX_TYPE_BARYCENTRIC`` lumping; it is the diagonal of
+    [`mass_matrix`][triwarp.laplacian.mass_matrix].
 
     Parameters
     ----------

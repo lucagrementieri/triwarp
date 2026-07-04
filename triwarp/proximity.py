@@ -61,7 +61,8 @@ def bvh_from_points(points: wp.array[wp.vec3], leaf_size: int = 4) -> wp.Bvh:
     Build a bounding-volume hierarchy over ``points`` for radius queries.
 
     Each leaf stores the same geometry as ``points`` (degenerate bounds via a clone),
-    matching the broad-phase pattern used by [`query_bvh_ball`][triwarp.proximity.query_bvh_ball] and
+    matching the broad-phase pattern used by
+    [`query_bvh_ball`][triwarp.proximity.query_bvh_ball] and
     [`query_bvh_nearest`][triwarp.proximity.query_bvh_nearest].
 
     Parameters
@@ -126,8 +127,9 @@ def bvh_from_bounds(
     Build a bounding-volume hierarchy over axis-aligned bounds.
 
     Each primitive ``i`` is represented by ``lower[i]`` and ``upper[i]`` corner
-    positions, suitable for [`query_bvh_aabb_with_offsets`][triwarp.proximity.query_bvh_aabb_with_offsets] broad-phase
-    intersection tests.
+    positions, suitable for
+    [`query_bvh_aabb_with_offsets`][triwarp.proximity.query_bvh_aabb_with_offsets]
+    broad-phase intersection tests.
 
     Parameters
     ----------
@@ -154,13 +156,15 @@ def query_bvh_aabb_with_offsets(
 
     For each query center ``q``, tests intersection of the query cube
     ``[q - h, q + h]`` against every primitive bound in ``bvh``. Unlike
-    [`query_hashgrid_ball_with_offsets`][triwarp.proximity.query_hashgrid_ball_with_offsets], there is no narrow-phase distance filter;
+    [`query_hashgrid_ball_with_offsets`][triwarp.proximity.query_hashgrid_ball_with_offsets],
+    there is no narrow-phase distance filter;
     every broad-phase hit is returned.
 
     Parameters
     ----------
     bvh
-        Pre-built BVH from [`bvh_from_bounds`][triwarp.proximity.bvh_from_bounds] or [`bvh_from_points`][triwarp.proximity.bvh_from_points].
+        Pre-built BVH from [`bvh_from_bounds`][triwarp.proximity.bvh_from_bounds]
+        or [`bvh_from_points`][triwarp.proximity.bvh_from_points].
     queries
         ``(m, 3)`` query centers stored as ``wp.vec3``.
     half_extent
@@ -365,11 +369,13 @@ def query_hashgrid_ball_with_offsets(
     """
     Low-level ball query: neighbors in one concatenated pair plus per-query offsets.
 
-    Same geometry as [`query_hashgrid_ball`][triwarp.proximity.query_hashgrid_ball] (hash-grid broad-phase out to ``r``,
+    Same geometry as [`query_hashgrid_ball`][triwarp.proximity.query_hashgrid_ball]
+    (hash-grid broad-phase out to ``r``,
     ``float32`` test ``‖points[i] - q‖₂ ≤ r``). Semantics match
     [`scipy.spatial.KDTree.query_ball_point`][] with ``p=2`` and ``eps=0``.
 
-    Prefer [`query_hashgrid_ball`][triwarp.proximity.query_hashgrid_ball] for a Python list of one array per query; use this
+    Prefer [`query_hashgrid_ball`][triwarp.proximity.query_hashgrid_ball] for a Python
+    list of one array per query; use this
     when you want a single flat buffer on device (e.g. fused downstream kernels) and
     CSR-style boundaries without cloning each segment.
 
@@ -515,7 +521,9 @@ def query_hashgrid_ball(
     """
     Find all data points within distance ``r`` of each query center (per-query arrays).
 
-    High-level wrapper around [`query_hashgrid_ball_with_offsets`][triwarp.proximity.query_hashgrid_ball_with_offsets]: hash-grid
+    High-level wrapper around
+    [`query_hashgrid_ball_with_offsets`][triwarp.proximity.query_hashgrid_ball_with_offsets]:
+    hash-grid
     broad-phase and ``float32`` distance test, same SciPy semantics as
     [`scipy.spatial.KDTree.query_ball_point`][] with ``p=2`` and ``eps=0``.
 
@@ -523,7 +531,9 @@ def query_hashgrid_ball(
     length ``m``, each element a rank-1 ``wp.array`` for that query. A single ``wp.vec3``
     query returns one ``(indices, distances)`` pair directly (not wrapped in lists). This
     clones each query's segment out of the internal flat buffer; for one flat buffer plus
-    offsets on device, call [`query_hashgrid_ball_with_offsets`][triwarp.proximity.query_hashgrid_ball_with_offsets] instead.
+    offsets on device, call
+    [`query_hashgrid_ball_with_offsets`][triwarp.proximity.query_hashgrid_ball_with_offsets]
+    instead.
 
     Parameters
     ----------
@@ -610,7 +620,9 @@ def query_bvh_ball_count(
     """
     Count neighbors of each query within Euclidean distance ``r`` (BVH backend).
 
-    Same semantics as [`query_hashgrid_ball_count`][triwarp.proximity.query_hashgrid_ball_count]; broad-phase uses
+    Same semantics as
+    [`query_hashgrid_ball_count`][triwarp.proximity.query_hashgrid_ball_count];
+    broad-phase uses
     ``wp.bvh_query_aabb`` over the cube ``[q ± r]``.
 
     Parameters
@@ -1656,7 +1668,7 @@ def max_tangent_sphere(
     )
 
     mesh_min, mesh_max = aabb_bounds(mesh.points)
-    D = float(wp.length(mesh_max - mesh_min))
+    D = float(wp.length(mesh_max - mesh_min))  # noqa: N806
     convergence_threshold = wp.float32(threshold * D)
 
     n_iter = 0

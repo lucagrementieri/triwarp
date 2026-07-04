@@ -41,7 +41,8 @@ def project_point_to_plane(p: wp.vec3, origin: wp.vec3, unit_normal: wp.vec3) ->
 def line_squared_distance(
     p: wp.vec3, s: wp.vec3, d: wp.vec3, seg_sq_len: wp.float32
 ) -> wp.float32:
-    """Squared perpendicular distance from ``p`` to the infinite line ``s -> d``.
+    """
+    Squared perpendicular distance from ``p`` to the infinite line ``s -> d``.
 
     Mirrors ``igl::project_to_line`` with an **unclamped** parameter ``t`` (distance to the
     line, not the segment). ``seg_sq_len`` is the precomputed ``dot(d - s, d - s)``.
@@ -152,7 +153,8 @@ CURVATURE_EPS = wp.constant(wp.float32(1.0e-6))
 
 @wp.func
 def plane_normal(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.vec3:
-    """Normal of the plane approximately containing segment vectors ``a``, ``b``, ``c``.
+    """
+    Return the normal of the plane approximately containing segment vectors ``a``, ``b``, ``c``.
 
     Port of ``getPlaneNormal`` from MeshLib ``MRPolylineSubdivide.cpp``: returns whichever of
     ``b x (a + c)`` and ``b x (a - c)`` has the larger magnitude, staying well-defined when ``a``
@@ -167,7 +169,8 @@ def plane_normal(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.vec3:
 
 @wp.func
 def endpoint_normals(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
-    """In-plane unit normals at the two ends of segment ``b`` bracketed by neighbours ``a``, ``c``.
+    """
+    In-plane unit normals at the two ends of segment ``b`` bracketed by neighbours ``a``, ``c``.
 
     Mirrors MeshLib's ``no``/``nd``: rotate each segment 90 degrees within the fitted plane
     (``plane_normal``) and average the edge normal with each neighbour's normal. Returns two
@@ -185,7 +188,8 @@ def endpoint_normals(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> tuple[wp.vec3, wp.ve
 
 @wp.func
 def arc_point(po: wp.vec3, pd: wp.vec3, no: wp.vec3, nd: wp.vec3, t: wp.float32) -> wp.vec3:
-    """Point at parameter ``t`` in ``[0, 1]`` along the circular arc from ``po`` to ``pd``.
+    """
+    Point at parameter ``t`` in ``[0, 1]`` along the circular arc from ``po`` to ``pd``.
 
     The arc is the one whose unit end-normals are ``no`` and ``nd``; its midpoint offset from the
     chord equals MeshLib's ``(|chord| / 2) * tan(theta / 4)`` sagitta, generalised here to every
@@ -237,9 +241,9 @@ def smooth_upsample_gather(
     pd = polyline[segment + 1]
     # Locate the vertices bracketing this segment; interior segments fit a curvature arc, boundary
     # segments of an open polyline (missing a neighbour) stay linear, matching MeshLib.
-    has_neighbours = int(0)
-    prev_index = int(0)
-    next_index = int(0)
+    has_neighbours = 0
+    prev_index = 0
+    next_index = 0
     if closed == 1:
         m = n - 1  # distinct vertices: polyline[n - 1] duplicates polyline[0]
         prev_index = (segment - 1 + m) % m
@@ -289,18 +293,18 @@ def rdp_keep_mask(
         out_keep[i] = True
     stack[0] = 0
     stack[1] = n - 1
-    top = int(1)  # number of (ixs, ixe) pairs currently on the stack
+    top = 1  # number of (ixs, ixe) pairs currently on the stack
     while top > 0:
         top -= 1
         ixs = stack[2 * top + 0]
         ixe = stack[2 * top + 1]
-        sdmax = float(0.0)
-        ixc = int(-1)
+        sdmax = 0.0
+        ixc = -1
         if ixe - ixs > 1:
             seg = polyline[ixe] - polyline[ixs]
             sdes = wp.dot(seg, seg)
             for k in range(ixs + 1, ixe):
-                sd = float(0.0)  # initialize before branching (variable scope rule)
+                sd = 0.0  # initialize before branching (variable scope rule)
                 if sdes <= RDP_LINE_EPS:
                     dvec = polyline[k] - polyline[ixs]
                     sd = wp.dot(dvec, dvec)
@@ -376,7 +380,11 @@ def radius_segment_distances(
 
 @wp.func
 def orient2d(a: wp.vec2, b: wp.vec2, c: wp.vec2) -> wp.int32:
-    """Sign of the 2D cross product ``(b - a) x (c - a)``: ``+1`` CCW, ``-1`` CW, ``0`` collinear."""
+    """
+    Sign of the 2D cross product ``(b - a) x (c - a)``.
+
+    ``+1`` CCW, ``-1`` CW, ``0`` collinear.
+    """
     det = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
     if det > TOLERANCE_ZERO_CONSTANT:
         return wp.int32(1)
@@ -387,7 +395,8 @@ def orient2d(a: wp.vec2, b: wp.vec2, c: wp.vec2) -> wp.int32:
 
 @wp.func
 def point_in_triangle(a: wp.vec2, b: wp.vec2, c: wp.vec2, p: wp.vec2) -> wp.bool:
-    """Whether ``p`` lies inside or on the boundary of the CCW triangle ``(a, b, c)``.
+    """
+    Whether ``p`` lies inside or on the boundary of the CCW triangle ``(a, b, c)``.
 
     Boundary inclusion matters for the ear test: a (reflex) vertex lying exactly on a candidate
     ear's cutting diagonal must block that ear, otherwise a degenerate/overlapping triangle is
@@ -532,12 +541,12 @@ def select_independent(
     if is_ear[i] == 0:
         return
     ll = left[left[i]]
-    l = left[i]
+    left_i = left[i]
     r = right[i]
     rr = right[right[i]]
     if is_ear[ll] == 1 and ll < i:
         return
-    if is_ear[l] == 1 and l < i:
+    if is_ear[left_i] == 1 and left_i < i:
         return
     if is_ear[r] == 1 and r < i:
         return

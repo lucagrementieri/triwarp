@@ -88,7 +88,7 @@ def _assert_duplicate_vertices_match(
     faces_np: np.ndarray | None = None,
     epsilon: float = 0.0,
 ) -> None:
-    sv_igl, _, svj_igl, sf_igl = (
+    sv_igl, _, _svj_igl, sf_igl = (
         igl.remove_duplicate_vertices(vertices_np, faces_np, epsilon)
         if faces_np is not None
         else (*igl.remove_duplicate_vertices(vertices_np, epsilon), None)

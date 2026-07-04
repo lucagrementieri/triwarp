@@ -15,7 +15,8 @@ from triwarp.kernels import reconstruction as kernel_reconstruction
 def _repeated_oriented_triangles(
     candidates: twt.Array2dInt32, n_points: int, repetitions: int
 ) -> twt.Array2dInt32:
-    """Keep one oriented representative per candidate triangle repeated exactly ``repetitions`` times.
+    """
+    Keep one oriented representative per candidate triangle repeated exactly ``repetitions`` times.
 
     Candidate triangles are grouped by their sorted (unoriented) vertex key; groups of the
     requested size contribute their first oriented triangle. Mirrors MeshLib's
@@ -126,7 +127,8 @@ def triangulate_point_cloud(
         raise ValueError("pass at most one of num_neighbours and radius")
     if max_neighbours > kernel_reconstruction.MAX_NEIGHBOURS:
         raise ValueError(
-            f"max_neighbours must be <= {kernel_reconstruction.MAX_NEIGHBOURS}, got {max_neighbours}"
+            "max_neighbours must be <= "
+            f"{kernel_reconstruction.MAX_NEIGHBOURS}, got {max_neighbours}"
         )
 
     device = points.device
@@ -182,7 +184,8 @@ def _assemble_faces(
     t2: twt.Array2dInt32,
     crit_hole_length: float,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-    """Combine t3/t2 triangles into a clean mesh: dedup, drop degenerate/non-manifold, fill holes.
+    """
+    Combine t3/t2 triangles into a clean mesh: dedup, drop degenerate/non-manifold, fill holes.
 
     Triangle soup is assembled from the repeated oriented triangles (Stage 4), then degenerate,
     duplicate, and non-manifold faces are removed and small boundary holes are filled (Stage 5).
@@ -219,7 +222,8 @@ def _assemble_faces(
 def _drop_non_manifold_faces(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], max_iter: int = 3
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-    """Remove faces touching a non-manifold (>2-incident) edge, iterating until edge-manifold.
+    """
+    Remove faces touching a non-manifold (>2-incident) edge, iterating until edge-manifold.
 
     Each pass keeps only faces whose three edges are each used by at most two faces
     ([`edge_manifold_mask`][triwarp.characteristics.edge_manifold_mask]); dropping a face can make a
@@ -241,7 +245,8 @@ def _drop_non_manifold_faces(
 def _fill_small_holes(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], max_perimeter: float
 ) -> wp.array[wp.int32]:
-    """Fill only boundary loops whose perimeter is at most ``max_perimeter`` (Stage 5).
+    """
+    Fill only boundary loops whose perimeter is at most ``max_perimeter`` (Stage 5).
 
     Intended open boundaries (large loops) are left untouched; spurious small holes are sealed by
     the shared min-weight interval DP ([`_fill_loops`][triwarp.stitching._fill_loops]).

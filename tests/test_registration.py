@@ -1,4 +1,4 @@
-"""Regression tests for ``triwarp.registration`` against ``trimesh.registration`` (CPU reference)."""
+"""Regression tests for ``triwarp.registration`` against ``trimesh.registration``."""
 
 from __future__ import annotations
 

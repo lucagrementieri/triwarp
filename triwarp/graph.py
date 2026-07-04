@@ -145,7 +145,8 @@ def face_adjacency_unshared(
         ``None``, adjacency and shared edges are computed from ``faces``.
     face_adjacency_edges
         Optional ``(m, 2)`` sorted shared vertex pairs (as from
-        [`face_adjacency`][triwarp.graph.face_adjacency] with ``return_edges=True``). Must be supplied
+        [`face_adjacency`][triwarp.graph.face_adjacency] with ``return_edges=True``).
+        Must be supplied
         together with ``face_adjacency`` or omitted with it.
 
     Returns
@@ -299,7 +300,7 @@ def concatenate(
     device = meshes_data[0][0].device
     vertex_counts: list[int] = []
     total_indices = 0
-    for i, (vertices, faces) in enumerate(meshes_data):
+    for _i, (vertices, faces) in enumerate(meshes_data):
         f = int(faces.shape[0])
         vertex_counts.append(int(vertices.shape[0]))
         total_indices += f
@@ -590,13 +591,16 @@ def face_connected_component_labels(faces: wp.array[wp.int32]) -> wp.array[wp.in
     """
     Connected-component label per face (face-adjacency graph).
 
-    Equivalent to [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges] on [`face_adjacency`][triwarp.graph.face_adjacency]
+    Equivalent to
+    [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
+    on [`face_adjacency`][triwarp.graph.face_adjacency]
     with ``node_count = n_faces``.
 
     Parameters
     ----------
     faces
-        Length-``3 * n_faces`` flat triangle index buffer (same as [`face_adjacency`][triwarp.graph.face_adjacency]).
+        Length-``3 * n_faces`` flat triangle index buffer (same as
+        [`face_adjacency`][triwarp.graph.face_adjacency]).
 
     Returns
     -------
@@ -622,7 +626,8 @@ def bfs(
 
     Runs a serial traversal from ``source`` (one device thread) so the discovery order, parent
     tree, and distances match [`scipy.sparse.csgraph.breadth_first_order`][] exactly when the
-    adjacency columns are sorted ascending per row (as produced by [`edges_to_csr`][triwarp.graph.edges_to_csr]). This
+    adjacency columns are sorted ascending per row (as produced by
+    [`edges_to_csr`][triwarp.graph.edges_to_csr]). This
     mirrors ``igl::bfs`` (`reference/libigl/include/igl/bfs.cpp`), additionally returning the BFS
     level of each node.
 
@@ -631,7 +636,8 @@ def bfs(
     adjacency
         Square undirected adjacency in 1x1-block ``warp.sparse.BsrMatrix`` form. Each nonzero
         ``(i, j)`` denotes an edge between nodes ``i`` and ``j``; for undirected graphs both
-        ``(i, j)`` and ``(j, i)`` should be present (as from [`edges_to_csr`][triwarp.graph.edges_to_csr]).
+        ``(i, j)`` and ``(j, i)`` should be present (as from
+        [`edges_to_csr`][triwarp.graph.edges_to_csr]).
     source
         Start node, in ``[0, node_count)``.
 
@@ -694,7 +700,8 @@ def bfs_from_edges(
     """
     Single-source BFS from an undirected edge list.
 
-    Builds a CSR adjacency via [`edges_to_csr`][triwarp.graph.edges_to_csr] and delegates to [`bfs`][triwarp.graph.bfs].
+    Builds a CSR adjacency via [`edges_to_csr`][triwarp.graph.edges_to_csr] and delegates
+    to [`bfs`][triwarp.graph.bfs].
 
     Parameters
     ----------
@@ -819,7 +826,8 @@ def bfs_multi_source(
     if n_overflow > 0:
         warnings.warn(
             f"bfs_multi_source: {n_overflow} reachable-set capacity breaches "
-            f"(fixed cap {kernel_bfs._PER_SOURCE_MAX_NEIGHBORS}); surplus nodes dropped."
+            f"(fixed cap {kernel_bfs._PER_SOURCE_MAX_NEIGHBORS}); surplus nodes dropped.",
+            stacklevel=2,
         )
 
     offsets = wp.empty(k, dtype=wp.int32, device=device)

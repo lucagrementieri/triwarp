@@ -156,7 +156,7 @@ def filter_laplacian(
                 inputs=[positions, *components],
                 device=device,
             )
-            for rhs, solution in zip(components, solutions):
+            for rhs, solution in zip(components, solutions, strict=True):
                 wp.copy(solution, rhs)
                 wpl.cg(system, rhs, solution, tol=_CG_TOLERANCE, maxiter=10 * n, M=precond)
             wp.launch(
@@ -605,7 +605,7 @@ def filter_implicit_fairing(
             inputs=[positions, *components],
             device=device,
         )
-        for component, b in zip(components, rhs):
+        for component, b in zip(components, rhs, strict=True):
             wp.launch(
                 kernel_smoothing.scale_by_diagonal,
                 dim=n,
@@ -616,7 +616,7 @@ def filter_implicit_fairing(
         # A = M - lamb L (SPD: L has a negative diagonal, so subtracting it adds to the diagonal).
         system = wps.bsr_axpy(x=stiffness, y=wps.bsr_diag(diag=mass), alpha=-float(lamb), beta=1.0)
         precond = wpl.preconditioner(system, "diag")
-        for b, solution, component in zip(rhs, solutions, components):
+        for b, solution, component in zip(rhs, solutions, components, strict=True):
             wp.copy(solution, component)
             wpl.cg(system, b, solution, tol=_CG_TOLERANCE, maxiter=10 * n, M=precond)
         wp.launch(

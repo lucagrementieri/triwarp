@@ -23,7 +23,9 @@ def _skip_on_cpu(device: str) -> None:
     # device (NaN) in Warp 1.14.0. The solver raises NotImplementedError there, so skip the
     # comparison tests when no CUDA device is available.
     if wp.get_device(device).is_cpu:
-        pytest.skip("heat_geodesic requires a CUDA device (warp CG is broken on CPU in Warp 1.14.0)")
+        pytest.skip(
+            "heat_geodesic requires a CUDA device (warp CG is broken on CPU in Warp 1.14.0)"
+        )
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])

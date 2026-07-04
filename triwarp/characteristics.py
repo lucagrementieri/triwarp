@@ -649,8 +649,8 @@ def is_orientable(faces: wp.array[wp.int32]) -> bool:
     -----
     Equivalent to ``open3d.geometry.TriangleMesh.is_orientable``. Unlike
     [`is_winding_consistent`][triwarp.characteristics.is_winding_consistent], orientability allows
-    individual faces to be flipped, so a consistently-orientable mesh with inconsistent winding still
-    returns ``True``.
+    individual faces to be flipped, so a consistently-orientable mesh with inconsistent winding
+    still returns ``True``.
     """
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:

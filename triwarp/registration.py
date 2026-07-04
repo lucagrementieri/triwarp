@@ -107,7 +107,7 @@ def procrustes(
         device=device,
     )
 
-    # --- Phase 2: SVD and 4×4 matrix construction (single thread) ---
+    # --- Phase 2: SVD and 4x4 matrix construction (single thread) ---
     out_matrix = wp.zeros(1, dtype=wp.mat44, device=device)
     wp.launch(
         kernel_registration.build_procrustes_matrix,

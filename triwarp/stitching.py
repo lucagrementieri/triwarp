@@ -954,8 +954,8 @@ def triangulate_boundaries_min_weight(
     offset = int(vertices_a.shape[0])
 
     # Reverse loop A so the two rims wind oppositely (facing), then align both at the closest pair.
-    # ``la`` / ``lb`` stay on the host for the sequential band traceback, but the closest-pair search
-    # gathers rim positions on device and reduces there.
+    # ``la`` / ``lb`` stay on the host for the sequential band traceback, but the closest-pair
+    # search gathers rim positions on device and reduces there.
     la = loop_a.numpy()[::-1].copy()
     lb = loop_b.numpy().copy()
     a_rim = tw.array.gather(vertices_a, wp.array(la, dtype=wp.int32, device=device))

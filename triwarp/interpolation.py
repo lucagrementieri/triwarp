@@ -93,7 +93,8 @@ def average_from_edges_onto_vertices(
     edge_values: wp.array[wp.float32],
 ) -> wp.array[wp.float32]:
     """
-    Move a scalar field defined on edges to vertices by averaging
+    Move a scalar field defined on edges to vertices by averaging.
+
     (``igl::average_from_edges_onto_vertices``).
 
     For each face half-edge with non-negative orientation, ``edge_values`` at the

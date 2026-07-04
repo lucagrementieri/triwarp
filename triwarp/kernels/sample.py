@@ -100,7 +100,9 @@ def sample_volume_tet(
 
 
 @wp.func
-def _poisson_edge_weight(d: wp.float32, r_max: wp.float32, r_min: wp.float32, alpha: wp.float32) -> wp.float32:
+def _poisson_edge_weight(
+    d: wp.float32, r_max: wp.float32, r_min: wp.float32, alpha: wp.float32
+) -> wp.float32:
     d_eff = wp.max(d, r_min)
     return wp.pow(wp.float32(1.0) - d_eff / r_max, alpha)
 
@@ -146,13 +148,13 @@ def find_local_maxima(
     wi = wp.max(weights[i], wp.float32(0.0))
     start = int(offsets[i])
     end = int(offsets[i + 1])
-    is_max = int(1)
+    is_max = 1
     for k in range(start, end):
         j = int(nbr_indices[k])
         if j == i or alive[j] == 0:
             continue
         if wp.max(weights[j], wp.float32(0.0)) > wi:
-            is_max = int(0)
+            is_max = 0
             break
     out_is_max[i] = is_max
 

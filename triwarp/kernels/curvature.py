@@ -35,6 +35,7 @@ def _build_reference_frame(
 def _solve_normal_equations(ata: mat55d, atb: vec5d) -> tuple[vec5d, wp.bool]:
     """
     Solve the 5x5 system ``AtA x = Atb`` by Gaussian elimination with partial pivoting.
+
     Returns (solution, ok); ok is False if singular to tolerance 1e-14.
     """
     m = ata
@@ -83,12 +84,12 @@ def _solve_normal_equations(ata: mat55d, atb: vec5d) -> tuple[vec5d, wp.bool]:
 @wp.func
 def _eigvec_sym2(m00: wp.float32, m01: wp.float32, lam: wp.float32, fallback: wp.vec2) -> wp.vec2:
     """
-    Return the unit eigenvector of a 2x2 matrix ``[[m00, m01], [m10, m11]]`` for eigenvalue ``lam``,
-    expressed in the (t1, t2) tangent-frame basis.
+    Return the unit eigenvector of a 2x2 matrix for the eigenvalue ``lam``.
 
-    Uses the first-row form ``v ~ [m01, lam - m00]``, which is valid for any 2x2 (symmetric or the
-    non-symmetric Weingarten map) since it depends only on the top row. ``fallback`` is returned when
-    that row is degenerate (near-diagonal matrix).
+    The matrix is ``[[m00, m01], [m10, m11]]`` and the result is expressed in the (t1, t2)
+    tangent-frame basis. Uses the first-row form ``v ~ [m01, lam - m00]``, which is valid for
+    any 2x2 (symmetric or the non-symmetric Weingarten map) since it depends only on the top
+    row. ``fallback`` is returned when that row is degenerate (near-diagonal matrix).
     """
     v = wp.vec2(m01, lam - m00)
     if wp.length(v) < wp.float32(1e-14):
@@ -115,9 +116,9 @@ def _principal_curvatures_from_monge(
       generalized eigenvalue problem ``II*v = lam*I*v``. The eigenvalues are surface invariants and
       do not depend on the chosen tangent frame.
     * ``frame_independent=False``: ``m01 = M*E - L*F`` (reuses the lower-left term), reproducing
-      ``igl::principal_curvature``'s ``finalEigenStuff`` verbatim. libigl forces this symmetry, which
-      keeps the trace (mean curvature) exact but alters the determinant (eigenvalue spread) and makes
-      the result depend on the reference frame.
+      ``igl::principal_curvature``'s ``finalEigenStuff`` verbatim. libigl forces this symmetry,
+      which keeps the trace (mean curvature) exact but alters the determinant (eigenvalue spread)
+      and makes the result depend on the reference frame.
 
     Returns (lam0, lam1, ev0, ev1) where lam0 <= lam1 are eigenvalues of ``m``. The caller negates
     them (libigl's ``c_val = -c_val``). The eigenvectors ev0, ev1 are unit ``wp.vec2`` in the
@@ -176,9 +177,9 @@ def fit_principal_curvature(
     out_valid: wp.array[wp.bool],
 ) -> None:
     """
-    Fit a quadric surface in a local tangent frame per vertex and extract principal
-    curvature directions and magnitudes. Matches igl::principal_curvature.
+    Fit a quadric surface in a local tangent frame per vertex.
 
+    Extract principal curvature directions and magnitudes. Matches igl::principal_curvature.
     """
     i = int(wp.tid())
     zero3 = wp.vec3(0.0, 0.0, 0.0)
@@ -213,7 +214,8 @@ def fit_principal_curvature(
     ref = int(reference_neighbors[i])
     t1, t2 = _build_reference_frame(vertex, normal, vertices[ref])
 
-    # Count neighbors passing projection-plane filter, including self (self always passes with dot=1).
+    # Count neighbors passing projection-plane filter, including self (self always passes,
+    # dot=1).
     # Matches libigl's applyProjOnPlane which includes vv[self] because dot(n_i, n_i) = 1 > 0.
     n_valid = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
     for k in range(n_nbr):
@@ -267,9 +269,9 @@ def fit_principal_curvature(
     e = wp.float32(solution[4])
 
     # First fundamental form coefficients
-    E_ff = wp.float32(1.0) + d * d
-    F_ff = d * e
-    G_ff = wp.float32(1.0) + e * e
+    E_ff = wp.float32(1.0) + d * d  # noqa: N806
+    F_ff = d * e  # noqa: N806
+    G_ff = wp.float32(1.0) + e * e  # noqa: N806
     denom = E_ff * G_ff - F_ff * F_ff
 
     if wp.abs(denom) < wp.float32(1e-14):
@@ -284,9 +286,9 @@ def fit_principal_curvature(
     nz = wp.float32(1.0) / wp.sqrt(d * d + e * e + wp.float32(1.0))
 
     # Second fundamental form
-    L_ff = wp.float32(2.0) * a * nz
-    M_ff = b * nz
-    N_ff = wp.float32(2.0) * c * nz
+    L_ff = wp.float32(2.0) * a * nz  # noqa: N806
+    M_ff = b * nz  # noqa: N806
+    N_ff = wp.float32(2.0) * c * nz  # noqa: N806
 
     first_form = wp.vec3(E_ff, F_ff, G_ff)
     second_form = wp.vec3(L_ff, M_ff, N_ff)

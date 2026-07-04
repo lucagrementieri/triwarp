@@ -240,7 +240,9 @@ def concatenate(arrays: Sequence[wp.array[DType]]) -> wp.array[DType]:
     total = 0
     for i, arr in enumerate(arrays):
         if int(arr.ndim) != 1:
-            raise ValueError(f"concatenate requires rank-1 arrays, got ndim={arr.ndim} at index {i}")
+            raise ValueError(
+                f"concatenate requires rank-1 arrays, got ndim={arr.ndim} at index {i}"
+            )
         if arr.dtype != dtype:
             raise ValueError(
                 f"all arrays must have the same dtype, got {dtype} and {arr.dtype} at index {i}"

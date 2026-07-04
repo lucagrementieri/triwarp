@@ -167,7 +167,7 @@ def test_unique_rows_inverse_counts(device: str):
     unique_wp, inverse_wp, counts_wp = tw.unique.unique_rows(
         data_wp, return_inverse=True, return_counts=True
     )
-    _, inverse_np, counts_np = np.unique(data_np, axis=0, return_inverse=True, return_counts=True)
+    _, _inverse_np, counts_np = np.unique(data_np, axis=0, return_inverse=True, return_counts=True)
     assert np.array_equal(np.sort(counts_wp.numpy()), np.sort(counts_np))
     for i in range(data_np.shape[0]):
         assert np.array_equal(unique_wp.numpy()[inverse_wp.numpy()[i]], data_np[i])
@@ -179,7 +179,9 @@ def test_unique_rows_vec3(device: str):
     unique_wp, inverse_wp = tw.unique.unique_rows(data_wp, return_inverse=True)
     assert unique_wp.shape[0] == 2
     for i in range(data_np.shape[0]):
-        assert np.allclose(unique_wp.numpy()[inverse_wp.numpy()[i]], data_np[i], rtol=1e-5, atol=1e-5)
+        assert np.allclose(
+            unique_wp.numpy()[inverse_wp.numpy()[i]], data_np[i], rtol=1e-5, atol=1e-5
+        )
 
 
 def test_unique_faces(device: str):

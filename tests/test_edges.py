@@ -10,7 +10,6 @@ import warp as wp
 
 import triwarp as tw
 
-
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -21,7 +20,9 @@ def _faces_np_to_wp(faces_np: np.ndarray, device: str) -> wp.array:
 
 
 def _vertices_np_to_wp(vertices_np: np.ndarray, device: str) -> wp.array:
-    return wp.array(np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device)
+    return wp.array(
+        np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +103,7 @@ def test_edges_unique(request: pytest.FixtureRequest, mesh_name: str) -> None:
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 def test_edges_unique_inverse(request: pytest.FixtureRequest, mesh_name: str) -> None:
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     unique_edges_wp, inverse_wp = tw.edges.edges_unique(mesh_wp.indices)
     edges_sorted_wp = tw.edges.faces_to_edges(mesh_wp.indices, sorted=True)
@@ -128,7 +129,7 @@ def test_edges_unique_empty(device: str) -> None:
 def test_edges_unique_inverse_standalone(request: pytest.FixtureRequest, mesh_name: str) -> None:
     _, mesh_wp = request.getfixturevalue(mesh_name)
 
-    unique_edges_wp, inverse_from_unique = tw.edges.edges_unique(mesh_wp.indices)
+    _unique_edges_wp, inverse_from_unique = tw.edges.edges_unique(mesh_wp.indices)
     inverse_standalone = tw.edges.edges_unique_inverse(mesh_wp.indices)
     assert np.array_equal(inverse_from_unique.numpy(), inverse_standalone.numpy())
 
@@ -145,7 +146,9 @@ def test_edges_unique_length(request: pytest.FixtureRequest, mesh_name: str) -> 
     unique_idx_tm, _ = tm_grouping.unique_rows(np.sort(mesh_tm.edges, axis=1))
     unique_edges_tm = np.sort(mesh_tm.edges, axis=1)[unique_idx_tm]
     verts_np = mesh_tm.vertices.astype(np.float32)
-    lengths_tm = np.linalg.norm(verts_np[unique_edges_tm[:, 1]] - verts_np[unique_edges_tm[:, 0]], axis=1)
+    lengths_tm = np.linalg.norm(
+        verts_np[unique_edges_tm[:, 1]] - verts_np[unique_edges_tm[:, 0]], axis=1
+    )
 
     vertices_wp = _vertices_np_to_wp(mesh_tm.vertices, mesh_wp.device)
     lengths_wp = tw.edges.edges_unique_length(vertices_wp, mesh_wp.indices)

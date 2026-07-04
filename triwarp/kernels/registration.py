@@ -118,12 +118,12 @@ def build_procrustes_matrix(
     inv_scales = wp.float32(1.0) / (bscale * ascale)
     target = cov[0] * inv_scales
 
-    U = wp.mat33(wp.float32(0.0))
+    U = wp.mat33(wp.float32(0.0))  # noqa: N806
     sigma = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    V = wp.mat33(wp.float32(0.0))
+    V = wp.mat33(wp.float32(0.0))  # noqa: N806
     wp.svd3(target, U, sigma, V)
 
-    Vt = wp.transpose(V)
+    Vt = wp.transpose(V)  # noqa: N806
 
     # wp.svd3 may return negative singular values; absorb their signs into a
     # diagonal correction matrix so R = U @ D @ V^T matches the numpy convention
@@ -140,18 +140,18 @@ def build_procrustes_matrix(
 
     if not use_reflection:
         # Ensure det(R) = 1 by flipping the last correction factor when needed
-        R_test = U * wp.diag(wp.vec3(d0, d1, d2)) * Vt
+        R_test = U * wp.diag(wp.vec3(d0, d1, d2)) * Vt  # noqa: N806
         if wp.determinant(R_test) < wp.float32(0.0):
             d2 = -d2
 
-    D = wp.diag(wp.vec3(d0, d1, d2))
-    R = U * D * Vt
+    D = wp.diag(wp.vec3(d0, d1, d2))  # noqa: N806
+    R = U * D * Vt  # noqa: N806
 
     s = wp.float32(1.0)
     if use_scale:
         s = bscale / ascale
 
-    sR = s * R
+    sR = s * R  # noqa: N806
 
     t = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
     if use_translation:
@@ -182,7 +182,7 @@ def apply_transform_mat44(
     points: wp.array[wp.vec3], matrix: wp.array[wp.mat44], out_points: wp.array[wp.vec3]
 ) -> None:
     i = int(wp.tid())
-    M = matrix[0]
+    M = matrix[0]  # noqa: N806
     p = points[i]
     r = M * wp.vec4(p[0], p[1], p[2], wp.float32(1.0))
     out_points[i] = wp.vec3(r[0], r[1], r[2])

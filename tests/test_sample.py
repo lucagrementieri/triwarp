@@ -150,7 +150,9 @@ def test_sample_surface_blue_noise_deterministic(icosahedron: tuple[tm.Trimesh, 
     assert np.array_equal(face_indices_a.numpy(), face_indices_b.numpy())
 
 
-def test_sample_surface_blue_noise_count_order_of_magnitude(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+def test_sample_surface_blue_noise_count_order_of_magnitude(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+):
     mesh_tm, mesh_wp = icosahedron
     surface_area = float(mesh_tm.area)
     expected = 50
@@ -159,7 +161,9 @@ def test_sample_surface_blue_noise_count_order_of_magnitude(icosahedron: tuple[t
         mesh_wp.points, mesh_wp.indices, radius, seed=0
     )
     n = int(points.shape[0])
-    igl_expected = surface_area * (math.pi * math.sqrt(3.0) / 6.0) / (math.pi * radius * radius / 4.0)
+    igl_expected = (
+        surface_area * (math.pi * math.sqrt(3.0) / 6.0) / (math.pi * radius * radius / 4.0)
+    )
     assert 0.5 * igl_expected <= n <= 1.5 * igl_expected
 
 

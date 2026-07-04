@@ -979,7 +979,9 @@ def triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     )
 
     total = wp.zeros(1, dtype=wp.float32, device=device)
-    wp.launch(kernel_polyline.accumulate_turning_angle, dim=n, inputs=[points2d, total], device=device)
+    wp.launch(
+        kernel_polyline.accumulate_turning_angle, dim=n, inputs=[points2d, total], device=device
+    )
     if float(total.numpy()[0]) < 0.0:
         wp.launch(kernel_polyline.orient_ccw, dim=n, inputs=[points2d], device=device)
 

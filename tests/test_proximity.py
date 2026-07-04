@@ -554,7 +554,7 @@ def test_winding_number_random(
 
 
 def test_winding_number_tiled_matches_exact(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    mesh_tm, mesh_wp = icosahedron
+    _mesh_tm, mesh_wp = icosahedron
     rng = np.random.default_rng(17)
     query_np = rng.random((100, 3), dtype=np.float32) * 2.0 - 1.0
     query_wp = wp.array(

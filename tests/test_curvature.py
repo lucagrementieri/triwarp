@@ -176,7 +176,8 @@ def test_principal_curvature_half_torus(half_torus: tuple[tm.Trimesh, wp.Mesh]) 
 
 
 def test_principal_curvature_frame_independent(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    """The default frame-independent Weingarten map stays similar to the libigl reference.
+    """
+    The default frame-independent Weingarten map stays similar to the libigl reference.
 
     ``frame_independent=True`` solves the true generalized eigenproblem (a surface invariant)
     rather than libigl's frame-dependent symmetrized operator. The two formulations share the

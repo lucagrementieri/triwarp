@@ -529,7 +529,7 @@ def _convex_ngon(n: int, radius: float = 1.5) -> np.ndarray:
 
 
 def _l_shape() -> np.ndarray:
-    """A non-convex (one reflex corner) simple polygon in the xy-plane, CCW."""
+    """Return a non-convex (one reflex corner) simple polygon in the xy-plane, CCW."""
     xy = np.array(
         [[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0], [1.0, 2.0], [0.0, 2.0]]
     )
@@ -537,7 +537,7 @@ def _l_shape() -> np.ndarray:
 
 
 def _star(points: int = 5, outer: float = 2.0, inner: float = 0.8) -> np.ndarray:
-    """A star polygon (alternating reflex corners), CCW, in the xy-plane."""
+    """Return a star polygon (alternating reflex corners), CCW, in the xy-plane."""
     angle = np.linspace(0.0, 2 * np.pi, 2 * points, endpoint=False)
     radius = np.where(np.arange(2 * points) % 2 == 0, outer, inner)
     return np.stack([radius * np.cos(angle), radius * np.sin(angle), np.zeros(2 * points)], axis=1)
@@ -567,7 +567,8 @@ def _triangle_areas(pts: np.ndarray, faces: np.ndarray) -> np.ndarray:
 def _assert_valid_triangulation(pts: np.ndarray, faces: np.ndarray) -> None:
     n = pts.shape[0]
     assert faces.shape == (n - 2, 3)
-    assert faces.min() >= 0 and faces.max() < n
+    assert faces.min() >= 0
+    assert faces.max() < n
     assert set(faces.ravel().tolist()) == set(range(n))  # no orphan vertices
     tri_areas = _triangle_areas(pts, faces)
     assert np.all(tri_areas > 1e-6)  # no degenerate triangles

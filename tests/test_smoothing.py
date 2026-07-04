@@ -162,7 +162,9 @@ def test_filter_laplacian_pluggable_operator(half_torus: tuple[tm.Trimesh, wp.Me
     )
     mesh_ref = mesh_tm.copy()
     operator_tm = tms.laplacian_calculation(mesh_ref, equal_weight=False)
-    tms.filter_laplacian(mesh_ref, iterations=6, volume_constraint=False, laplacian_operator=operator_tm)
+    tms.filter_laplacian(
+        mesh_ref, iterations=6, volume_constraint=False, laplacian_operator=operator_tm
+    )
 
     assert np.allclose(smoothed_wp.numpy(), mesh_ref.vertices, rtol=1e-5, atol=1e-5)
 

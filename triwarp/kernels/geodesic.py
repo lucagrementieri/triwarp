@@ -1,4 +1,5 @@
-"""Kernels for the heat-method geodesic distance solver (Crane et al. 2013).
+"""
+Kernels for the heat-method geodesic distance solver (Crane et al. 2013).
 
 Everything runs in ``float64``: far from the source the diffused heat decays exponentially and
 would underflow ``float32``, destroying the gradient direction and collapsing the far field. The

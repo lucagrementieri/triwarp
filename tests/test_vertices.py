@@ -63,7 +63,9 @@ def test_area_weighted_vertex_normals_precomputed(half_torus: tuple[tm.Trimesh, 
     n_vertices = mesh_tm.vertices.shape[0]
     vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
 
-    face_normals_wp, face_areas_wp = tw.triangles.face_normals_and_areas(vertices_wp, mesh_wp.indices)
+    face_normals_wp, face_areas_wp = tw.triangles.face_normals_and_areas(
+        vertices_wp, mesh_wp.indices
+    )
     vertex_normals_precomputed_wp = tw.vertices.area_weighted_vertex_normals(
         n_vertices, vertices_wp, mesh_wp.indices,
         face_normals=face_normals_wp, face_areas=face_areas_wp,

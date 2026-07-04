@@ -1,7 +1,10 @@
-"""Kernels for point-cloud surface reconstruction (ported from MeshLib).
+"""
+Kernels for point-cloud surface reconstruction (ported from MeshLib).
 
-The heart is [`build_local_triangulations`][triwarp.kernels.reconstruction.build_local_triangulations],
-a per-point fan triangulation that mirrors MeshLib's ``TriangulationHelpers::buildLocalTriangulation``
+The heart is
+[`build_local_triangulations`][triwarp.kernels.reconstruction.build_local_triangulations], a
+per-point fan triangulation that mirrors MeshLib's
+``TriangulationHelpers::buildLocalTriangulation``
 (``reference/MeshLib/source/MRMesh/MRPointCloudTriangulationHelpers.cpp``). Every geometry helper
 below is a direct port of the corresponding ``MRTriMath.h`` / ``MRReducePath`` primitive.
 """
@@ -227,9 +230,11 @@ def edge_removal_weight(
 
     ac_length_sq = wp.dot(a - c, a - c)
     if (
-        ac_length_sq > wp.dot(b - a, b - a) and triangle_aspect_ratio(a, b, c) > CRITICAL_ASPECT_RATIO
+        ac_length_sq > wp.dot(b - a, b - a)
+        and triangle_aspect_ratio(a, b, c) > CRITICAL_ASPECT_RATIO
     ) or (
-        ac_length_sq > wp.dot(d - a, d - a) and triangle_aspect_ratio(a, c, d) > CRITICAL_ASPECT_RATIO
+        ac_length_sq > wp.dot(d - a, d - a)
+        and triangle_aspect_ratio(a, c, d) > CRITICAL_ASPECT_RATIO
     ):
         # degenerate triangle, longest edge -> remove as fast as possible
         return wp.vec2(FLOAT32_INF_CONSTANT, 0.0)
@@ -250,7 +255,7 @@ def edge_removal_weight(
     if delone_prof < 0.0 and angle_prof <= 0.0:
         return stable
 
-    weight = float(0.0)
+    weight = 0.0
     if delone_prof > 0.0:
         weight += delone_prof / normalizer_sq
     if angle_prof > 0.0:
@@ -300,7 +305,7 @@ def build_local_triangulations(
     ang = wp.zeros(shape=MAX_NEIGHBOURS, dtype=wp.float32)
 
     # --- gather + filter neighbours ---
-    m = int(0)
+    m = 0
     for i in range(k):
         if m >= MAX_NEIGHBOURS:
             break
@@ -322,7 +327,7 @@ def build_local_triangulations(
 
     # --- tangent-plane basis (project neighbours onto plane through center) ---
     base = wp.vec3(0.0, 0.0, 0.0)
-    normalizer_sq = float(0.0)
+    normalizer_sq = 0.0
     for i in range(m):
         d = points[nbr[i]] - a
         pv = d - wp.dot(n_center, d) * n_center
@@ -343,7 +348,7 @@ def build_local_triangulations(
         else:
             vec = base
         cp = wp.cross(vec, base)
-        s = float(1.0)
+        s = 1.0
         if wp.dot(cp, n_center) < 0.0:
             s = -1.0
         ang[i] = wp.atan2(s * wp.length(cp), wp.dot(vec, base))
@@ -363,7 +368,7 @@ def build_local_triangulations(
             nbr[mn] = tn
 
     # --- boundary detection: first angular gap wider than boundary_angle ---
-    border = int(-1)
+    border = -1
     for i in range(m):
         if i + 1 < m:
             diff = ang[i + 1] - ang[i]
@@ -377,7 +382,7 @@ def build_local_triangulations(
     current = m
     for _step in range(m):
         best_w = -FLOAT32_INF_CONSTANT
-        best_pos = int(-1)
+        best_pos = -1
         for i in range(m):
             if nbr[i] < 0:
                 continue
@@ -403,7 +408,7 @@ def build_local_triangulations(
             break
 
     # --- emit fan triangles between consecutive surviving neighbours ---
-    slot = int(0)
+    slot = 0
     for i in range(m):
         if nbr[i] < 0:
             continue
