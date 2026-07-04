@@ -185,9 +185,7 @@ def face_adjacency_convex(
 
 
 def fast_convex_set_mask(
-    points: wp.array[wp.vec3],
-    n_directions: int = 128,
-    tolerance: float = 1e-6,
+    points: wp.array[wp.vec3], n_directions: int = 128, tolerance: float = 1e-6
 ) -> wp.array[wp.bool]:
     """
     Approximate the convex-hull vertices of a point cloud as a boolean mask.
@@ -267,9 +265,7 @@ def fast_convex_set_mask(
 
 
 def fast_convex_set(
-    points: wp.array[wp.vec3],
-    n_directions: int = 128,
-    tolerance: float = 1e-6,
+    points: wp.array[wp.vec3], n_directions: int = 128, tolerance: float = 1e-6
 ) -> wp.array[wp.vec3]:
     """
     Approximate the convex-hull vertices of a point cloud as a point subset.

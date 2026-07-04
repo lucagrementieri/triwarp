@@ -139,9 +139,7 @@ def pack_indices(
 
 @wp.kernel
 def round_vec3_scaled(
-    vertices: wp.array[wp.vec3],
-    inv_epsilon: wp.float32,
-    out_rounded: wp.array2d[wp.int32],
+    vertices: wp.array[wp.vec3], inv_epsilon: wp.float32, out_rounded: wp.array2d[wp.int32]
 ) -> None:
     tid = int(wp.tid())
     v = vertices[tid] * inv_epsilon
@@ -151,10 +149,7 @@ def round_vec3_scaled(
 
 
 @wp.kernel
-def sort_face_indices(
-    faces: wp.array2d[wp.int32],
-    out_sorted: wp.array2d[wp.int32],
-) -> None:
+def sort_face_indices(faces: wp.array2d[wp.int32], out_sorted: wp.array2d[wp.int32]) -> None:
     tid = int(wp.tid())
     i0 = faces[tid, 0]
     i1 = faces[tid, 1]

@@ -266,9 +266,7 @@ def test_chamfer_points_to_points_empty(device: str) -> None:
 def test_chamfer_points_to_points_empty_unreduced(device: str) -> None:
     x_wp = wp.empty(0, dtype=wp.vec3, device=device)
     y_wp = _points_wp(np.zeros((5, 3), dtype=np.float32), device)
-    forward_wp, backward_wp = tw.distance.chamfer_points_to_points(
-        x_wp, y_wp, point_reduction=None
-    )
+    forward_wp, backward_wp = tw.distance.chamfer_points_to_points(x_wp, y_wp, point_reduction=None)
     assert forward_wp.shape == (0,)
     assert backward_wp.shape == (0,)
 

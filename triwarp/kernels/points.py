@@ -29,10 +29,7 @@ def radial_sort_key(
 
 
 @wp.kernel
-def finalize_fit_line(
-    m: wp.array[wp.mat33],
-    out_axis: wp.array[wp.vec3],
-) -> None:
+def finalize_fit_line(m: wp.array[wp.mat33], out_axis: wp.array[wp.vec3]) -> None:
     # gram matrix of the (uncentred) points: M = sum_j outer(x_j, x_j)
     # the singular values / right singular vectors of M match the squared
     # singular values / right singular vectors of the (n, 3) point matrix.

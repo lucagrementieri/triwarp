@@ -38,12 +38,7 @@ def _int_scalar(dtype: type[wp.Int], value: int) -> wp.Int:
     return dtype(value)
 
 
-def init_range(
-    n: int,
-    device: str,
-    *,
-    dtype: type[wp.Int] = wp.int32,
-) -> wp.array:
+def init_range(n: int, device: str, *, dtype: type[wp.Int] = wp.int32) -> wp.array:
     """Fill ``out[i] = i`` for ``i`` in ``[0, n)``."""
     dtype = _ensure_int_dtype(dtype)
     if n < 0:
@@ -57,11 +52,7 @@ def init_range(
 
 
 def init_range_step(
-    count: int,
-    step: int,
-    device: str,
-    *,
-    dtype: type[wp.Int] = wp.int32,
+    count: int, step: int, device: str, *, dtype: type[wp.Int] = wp.int32
 ) -> wp.array:
     """Fill ``out[i] = i * step`` (``numpy.arange(0, count * step, step)``)."""
     dtype = _ensure_int_dtype(dtype)
@@ -84,11 +75,7 @@ def init_range_step(
 
 
 def init_sort_pair_indices(
-    n: int,
-    fill_value: int,
-    device: str,
-    *,
-    dtype: type[wp.Int] = wp.int32,
+    n: int, fill_value: int, device: str, *, dtype: type[wp.Int] = wp.int32
 ) -> wp.array:
     """Fill ``[0, 1, ..., n-1, fill_value, ..., fill_value]`` (length ``2 * n``)."""
     dtype = _ensure_int_dtype(dtype)
@@ -109,11 +96,7 @@ def init_sort_pair_indices(
 
 
 def init_repeat_index(
-    count: int,
-    repeats: int,
-    device: str,
-    *,
-    dtype: type[wp.Int] = wp.int32,
+    count: int, repeats: int, device: str, *, dtype: type[wp.Int] = wp.int32
 ) -> wp.array:
     """Fill ``out[i] = i // repeats`` (repeat each index ``repeats`` times)."""
     dtype = _ensure_int_dtype(dtype)
@@ -311,12 +294,7 @@ def allclose(
     kernel = (
         kernel_array.allclose_mask_vec3 if a.dtype == wp.vec3 else kernel_array.allclose_mask_scalar
     )
-    wp.launch(
-        kernel,
-        dim=n,
-        inputs=[a, b, wp.float32(rtol), wp.float32(atol), mask],
-        device=device,
-    )
+    wp.launch(kernel, dim=n, inputs=[a, b, wp.float32(rtol), wp.float32(atol), mask], device=device)
     return bool(tw.reduce.all(mask))
 
 

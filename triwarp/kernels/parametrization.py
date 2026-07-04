@@ -3,9 +3,7 @@ import warp as wp
 
 @wp.kernel
 def flipped_faces_mask(
-    vertices: wp.array[wp.vec2],
-    faces: wp.array[wp.int32],
-    out_mask: wp.array[wp.bool],
+    vertices: wp.array[wp.vec2], faces: wp.array[wp.int32], out_mask: wp.array[wp.bool]
 ) -> None:
     fi = int(wp.tid())
     v0 = vertices[faces[fi * 3]]

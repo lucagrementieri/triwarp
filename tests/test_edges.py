@@ -50,8 +50,6 @@ def test_edges_sorted(device: str) -> None:
     assert np.array_equal(edges_wp.numpy(), edges_np)
 
 
-
-
 def test_edges_empty(device: str) -> None:
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
     assert tw.edges.faces_to_edges(faces_wp).shape == (0, 2)

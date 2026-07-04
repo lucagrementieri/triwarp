@@ -189,9 +189,7 @@ def test_principal_curvature_frame_independent(half_torus: tuple[tm.Trimesh, wp.
 
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
     faces_np = np.array(mesh_tm.faces, dtype=np.int32)
-    _, _, pv1_igl, pv2_igl, bad_igl = igl.principal_curvature(
-        vertices_np, faces_np, useKring=False
-    )
+    _, _, pv1_igl, pv2_igl, bad_igl = igl.principal_curvature(vertices_np, faces_np, useKring=False)
 
     vertices_wp = wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=mesh_wp.device)
     faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)

@@ -189,9 +189,7 @@ def mark_membership_mask(indices: wp.array[wp.int32], mask: wp.array[wp.bool]) -
 
 @wp.kernel
 def mark_membership_mask_bounded(
-    indices: wp.array[wp.int32],
-    n: wp.int32,
-    out_mask: wp.array[wp.bool],
+    indices: wp.array[wp.int32], n: wp.int32, out_mask: wp.array[wp.bool]
 ) -> None:
     tid = int(wp.tid())
     index = indices[tid]

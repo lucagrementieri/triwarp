@@ -530,9 +530,7 @@ def _convex_ngon(n: int, radius: float = 1.5) -> np.ndarray:
 
 def _l_shape() -> np.ndarray:
     """Return a non-convex (one reflex corner) simple polygon in the xy-plane, CCW."""
-    xy = np.array(
-        [[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0], [1.0, 2.0], [0.0, 2.0]]
-    )
+    xy = np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0], [1.0, 2.0], [0.0, 2.0]])
     return np.concatenate([xy, np.zeros((xy.shape[0], 1))], axis=1)
 
 
@@ -687,9 +685,7 @@ def test_simplify_collinear_collapses_to_endpoints(device: str) -> None:
 
 def test_simplify_preserves_a_sharp_corner(device: str) -> None:
     # A tent: the apex deviates far from the base chord and must be kept.
-    pts_np = np.array(
-        [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float64
-    )
+    pts_np = np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float64)
     _, indices_wp = tw.polyline.simplify(_polyline_wp(pts_np, device), 0.1)
     assert np.array_equal(indices_wp.numpy(), np.array([0, 1, 2], dtype=np.int32))
 

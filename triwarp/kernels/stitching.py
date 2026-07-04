@@ -581,9 +581,7 @@ def stitch_prev_apex(
 
 @wp.kernel
 def pair_sq_distances(
-    a_pos: wp.array[wp.vec3],
-    b_pos: wp.array[wp.vec3],
-    out_dist: wp.array2d[wp.float32],
+    a_pos: wp.array[wp.vec3], b_pos: wp.array[wp.vec3], out_dist: wp.array2d[wp.float32]
 ) -> None:
     # Squared distance between every rim-A vertex ``i`` and rim-B vertex ``j``; the global argmin
     # (reused ``row_argmin`` + ``global_argmin``) is MeshLib's aligned start pair for stitchHoles.

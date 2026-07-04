@@ -38,9 +38,7 @@ def project_point_to_plane(p: wp.vec3, origin: wp.vec3, unit_normal: wp.vec3) ->
 
 
 @wp.func
-def line_squared_distance(
-    p: wp.vec3, s: wp.vec3, d: wp.vec3, seg_sq_len: wp.float32
-) -> wp.float32:
+def line_squared_distance(p: wp.vec3, s: wp.vec3, d: wp.vec3, seg_sq_len: wp.float32) -> wp.float32:
     """
     Squared perpendicular distance from ``p`` to the infinite line ``s -> d``.
 
@@ -63,9 +61,7 @@ def segment_lengths(polyline: wp.array[wp.vec3], out_lengths: wp.array[wp.float3
 
 @wp.kernel
 def segment_midpoints_and_lengths(
-    polyline: wp.array[wp.vec3],
-    out_midpoints: wp.array[wp.vec3],
-    out_lengths: wp.array[wp.float32],
+    polyline: wp.array[wp.vec3], out_midpoints: wp.array[wp.vec3], out_lengths: wp.array[wp.float32]
 ) -> None:
     i = int(wp.tid())
     displacement = segment_displacement(polyline, i)
@@ -326,9 +322,7 @@ def rdp_keep_mask(
 
 
 @wp.kernel
-def broadcast_first_point(
-    polyline: wp.array[wp.vec3], out_points: wp.array[wp.vec3]
-) -> None:
+def broadcast_first_point(polyline: wp.array[wp.vec3], out_points: wp.array[wp.vec3]) -> None:
     j = int(wp.tid())
     out_points[j] = polyline[0]
 
@@ -402,9 +396,7 @@ def point_in_triangle(a: wp.vec2, b: wp.vec2, c: wp.vec2, p: wp.vec2) -> wp.bool
     ear's cutting diagonal must block that ear, otherwise a degenerate/overlapping triangle is
     emitted.
     """
-    return (
-        orient2d(a, b, p) >= 0 and orient2d(b, c, p) >= 0 and orient2d(c, a, p) >= 0
-    )
+    return orient2d(a, b, p) >= 0 and orient2d(b, c, p) >= 0 and orient2d(c, a, p) >= 0
 
 
 @wp.func
@@ -451,9 +443,7 @@ def project_to_plane_2d(
 
 
 @wp.kernel
-def accumulate_turning_angle(
-    points2d: wp.array[wp.vec2], out_total: wp.array[wp.float32]
-) -> None:
+def accumulate_turning_angle(points2d: wp.array[wp.vec2], out_total: wp.array[wp.float32]) -> None:
     # Cyclic signed exterior angle at each vertex; the sum's sign gives the loop orientation.
     i = int(wp.tid())
     n = points2d.shape[0]

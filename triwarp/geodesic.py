@@ -105,10 +105,7 @@ def heat_geodesic(
     normals, areas = face_normals_and_areas(vertices, faces)
     mass = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     wp.launch(
-        kernel_geodesic.vertex_lumped_mass,
-        dim=n_faces,
-        inputs=[faces, areas, mass],
-        device=device,
+        kernel_geodesic.vertex_lumped_mass, dim=n_faces, inputs=[faces, areas, mass], device=device
     )
 
     # Heat solve: (M - t L) u = u0, with u0 the source indicator. ``bsr_axpy`` overwrites the mass

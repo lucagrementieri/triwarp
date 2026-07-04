@@ -41,10 +41,7 @@ def _repeated_oriented_triangles(
 
     reps = wp.empty(n_groups, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_reconstruction.copy_first_column,
-        dim=n_groups,
-        inputs=[groups, reps],
-        device=device,
+        kernel_reconstruction.copy_first_column, dim=n_groups, inputs=[groups, reps], device=device
     )
     return twt.as_array2d_int32(tw.array.gather(candidates, reps))
 
@@ -179,10 +176,7 @@ def triangulate_point_cloud(
 
 
 def _assemble_faces(
-    points: wp.array[wp.vec3],
-    t3: twt.Array2dInt32,
-    t2: twt.Array2dInt32,
-    crit_hole_length: float,
+    points: wp.array[wp.vec3], t3: twt.Array2dInt32, t2: twt.Array2dInt32, crit_hole_length: float
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
     Combine t3/t2 triangles into a clean mesh: dedup, drop degenerate/non-manifold, fill holes.
@@ -192,9 +186,7 @@ def _assemble_faces(
     Vertices are the referenced input points, compacted from index zero.
     """
     device = points.device
-    parts = [
-        f for f in (t3.reshape(-1), t2.reshape(-1)) if int(f.shape[0]) > 0
-    ]
+    parts = [f for f in (t3.reshape(-1), t2.reshape(-1)) if int(f.shape[0]) > 0]
     if not parts:
         return wp.clone(points), wp.empty(0, dtype=wp.int32, device=device)
     faces = parts[0] if len(parts) == 1 else tw.array.concatenate(parts)
@@ -262,14 +254,10 @@ def _fill_small_holes(
         if int(loop_np.shape[0]) < 3:
             continue
         ring = vertices_np[loop_np]
-        perimeter = float(
-            np.linalg.norm(np.diff(ring, axis=0, append=ring[:1]), axis=1).sum()
-        )
+        perimeter = float(np.linalg.norm(np.diff(ring, axis=0, append=ring[:1]), axis=1).sum())
         if perimeter <= max_perimeter:
             small_loops.append(loop)
 
     if not small_loops:
         return faces
-    return tw.stitching._fill_loops(
-        vertices, faces, small_loops, "plane_normalized", True
-    )
+    return tw.stitching._fill_loops(vertices, faces, small_loops, "plane_normalized", True)

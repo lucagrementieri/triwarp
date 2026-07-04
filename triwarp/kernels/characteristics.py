@@ -38,9 +38,7 @@ def edge_forward_in_face(
 
 @wp.kernel
 def mark_intersecting_faces(
-    pairs: wp.array2d[wp.int32],
-    valid: wp.array[wp.bool],
-    out_mask: wp.array[wp.bool],
+    pairs: wp.array2d[wp.int32], valid: wp.array[wp.bool], out_mask: wp.array[wp.bool]
 ) -> None:
     """Flag both faces of each intersecting candidate pair (idempotent ``True`` writes)."""
     p = int(wp.tid())

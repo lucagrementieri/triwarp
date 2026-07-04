@@ -19,9 +19,7 @@ def _write_synthetic_mesh(path: Path) -> dict[str, np.ndarray]:
     normals_np = np.array(
         [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.5, 0.5, 0.5]], dtype=np.float32
     )
-    colors_np = np.array(
-        [[10, 20, 30], [200, 100, 50], [0, 0, 0], [255, 255, 255]], dtype=np.uint8
-    )
+    colors_np = np.array([[10, 20, 30], [200, 100, 50], [0, 0, 0], [255, 255, 255]], dtype=np.uint8)
     uv_np = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.5, 0.5]], dtype=np.float32)
     point_data_mio = {
         "nx": normals_np[:, 0],

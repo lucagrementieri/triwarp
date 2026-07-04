@@ -216,8 +216,15 @@ def _triangle_aspect_ratio(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float
 
 
 FILL_METRICS = [
-    "plane_normalized", "min_area", "circumscribed", "plane", "min_tri_angle",
-    "edge_length", "universal", "max_dihedral", "complex_fill",
+    "plane_normalized",
+    "min_area",
+    "circumscribed",
+    "plane",
+    "min_tri_angle",
+    "edge_length",
+    "universal",
+    "max_dihedral",
+    "complex_fill",
 ]
 _COMBINE_MAX = {"max_dihedral"}  # metrics that accumulate with max instead of sum
 
@@ -448,15 +455,17 @@ def test_fill_metric_scorer_matches_meshlib(hemisphere: tuple[tm.Trimesh, wp.Mes
         "complex_fill": lambda m, e: mr.getComplexFillMetric(m, e),
     }
     for metric, factory in make_metric.items():
-        fill = tw.stitching.fill_holes_min_weight(
-            mesh_wp.points, mesh_wp.indices, metric=metric
-        ).numpy()[faces_np.size :].reshape(-1, 3)
+        fill = (
+            tw.stitching.fill_holes_min_weight(mesh_wp.points, mesh_wp.indices, metric=metric)
+            .numpy()[faces_np.size :]
+            .reshape(-1, 3)
+        )
         mesh_orig = mn.meshFromFacesVerts(faces_np, verts_np)
         metric_obj = factory(mesh_orig, mesh_orig.topology.findHoleRepresentiveEdges()[0])
         full = np.vstack([faces_np, fill]).astype(np.int32)
         mesh_full = mn.meshFromFacesVerts(np.ascontiguousarray(full, np.int32), verts_np)
         region_bools = np.zeros(len(full), dtype=bool)
-        region_bools[len(faces_np):] = True
+        region_bools[len(faces_np) :] = True
         region = mn.faceBitSetFromBools(region_bools)
         mr_cost = mr.calcCombinedFillMetric(mesh_full, region, metric_obj)
         my_cost = _total_fill_metric(mesh_wp.points, mesh_wp.indices, fill.reshape(-1), metric)
@@ -679,18 +688,11 @@ def _triangulate_boundaries_np(
     window_b = np.lib.stride_tricks.sliding_window_view(
         np.append(loop_b_shifted, loop_b_shifted[0]), window_shape=2
     )
-    apex = flipped_a[
-        np.searchsorted(edge, np.arange(loop_b.size), side="right") % flipped_a.size
-    ]
+    apex = flipped_a[np.searchsorted(edge, np.arange(loop_b.size), side="right") % flipped_a.size]
     bridge_b = np.column_stack([np.fliplr(window_b), apex])
 
     faces = np.vstack(
-        [
-            faces_a.reshape(-1, 3),
-            faces_b.reshape(-1, 3) + len(vertices_a),
-            bridge_a,
-            bridge_b,
-        ]
+        [faces_a.reshape(-1, 3), faces_b.reshape(-1, 3) + len(vertices_a), bridge_a, bridge_b]
     )
     return faces.reshape(-1).astype(np.int32)
 
@@ -750,9 +752,7 @@ def test_triangulate_boundaries_matches_numpy(
         va_np, fa_np, loop_a.numpy(), vb_np, fb_np, loop_b.numpy()
     )
 
-    assert np.array_equal(
-        _sorted_triangle_rows(faces_wp.numpy()), _sorted_triangle_rows(faces_np)
-    )
+    assert np.array_equal(_sorted_triangle_rows(faces_wp.numpy()), _sorted_triangle_rows(faces_np))
 
 
 def test_stitch_argument_order_invariant(device: str) -> None:
@@ -858,7 +858,7 @@ def _meshlib_stitch_cost(
     full = np.ascontiguousarray(np.vstack([orig, band]), dtype=np.int32)
     mesh_full = mn.meshFromFacesVerts(full, verts)
     region_bools = np.zeros(len(full), dtype=bool)
-    region_bools[len(orig):] = True
+    region_bools[len(orig) :] = True
     region = mn.faceBitSetFromBools(region_bools)
     return mr.calcCombinedFillMetric(mesh_full, region, metric_obj)
 

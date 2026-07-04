@@ -250,8 +250,7 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
-        "markers",
-        "benchlibs(*kinds): library kinds (triwarp/trimesh/igl) a benchmark supports.",
+        "markers", "benchlibs(*kinds): library kinds (triwarp/trimesh/igl) a benchmark supports."
     )
     # Default to one comparison table per (function, mesh): the ``group`` marker is the function
     # name and ``param:mesh_name`` splits by mesh, so each table lists the libraries side by side.

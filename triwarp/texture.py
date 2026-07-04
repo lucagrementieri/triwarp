@@ -43,10 +43,7 @@ def _check_uv_in_range(uv: wp.array[wp.vec2]) -> None:
 
 
 def rasterize_attribute(
-    uv: wp.array[wp.vec2],
-    faces: wp.array[wp.int32],
-    attribute: twt.Array2dFloat32,
-    resolution: int,
+    uv: wp.array[wp.vec2], faces: wp.array[wp.int32], attribute: twt.Array2dFloat32, resolution: int
 ) -> twt.Array3dFloat32:
     """
     Rasterize a per-vertex attribute into a square UV-space texture.
@@ -86,9 +83,7 @@ def rasterize_attribute(
     n_vertices = int(attribute.shape[0])
     n_channels = int(attribute.shape[1])
     if int(uv.shape[0]) != n_vertices:
-        raise ValueError(
-            f"uv and attribute row count mismatch: {int(uv.shape[0])} vs {n_vertices}"
-        )
+        raise ValueError(f"uv and attribute row count mismatch: {int(uv.shape[0])} vs {n_vertices}")
     _check_uv_in_range(uv)
 
     device = uv.device
@@ -97,9 +92,7 @@ def rasterize_attribute(
     if n_faces == 0:
         return twt.as_array3d_float32(image)
 
-    owner = wp.full(
-        (resolution, resolution), _OWNER_SENTINEL, dtype=wp.int32, device=device
-    )
+    owner = wp.full((resolution, resolution), _OWNER_SENTINEL, dtype=wp.int32, device=device)
     wp.launch(
         kernel_texture.rasterize_owner,
         dim=n_faces,
@@ -116,10 +109,7 @@ def rasterize_attribute(
 
 
 def rasterize_discrete_attribute(
-    uv: wp.array[wp.vec2],
-    faces: wp.array[wp.int32],
-    attribute: wp.array[wp.int32],
-    resolution: int,
+    uv: wp.array[wp.vec2], faces: wp.array[wp.int32], attribute: wp.array[wp.int32], resolution: int
 ) -> twt.Array2dInt32:
     """
     Rasterize a per-vertex discrete label into a square UV-space class image.
@@ -157,9 +147,7 @@ def rasterize_discrete_attribute(
     twt.ensure_ndim(attribute, 1, dtype=wp.int32)
     n_vertices = int(attribute.shape[0])
     if int(uv.shape[0]) != n_vertices:
-        raise ValueError(
-            f"uv and attribute row count mismatch: {int(uv.shape[0])} vs {n_vertices}"
-        )
+        raise ValueError(f"uv and attribute row count mismatch: {int(uv.shape[0])} vs {n_vertices}")
     if n_vertices > 0 and tw.reduce.min(cast(twt.Array1dInt32, attribute)) < 0:
         raise ValueError("Attribute values must be greater than or equal to 0")
     _check_uv_in_range(uv)
@@ -170,9 +158,7 @@ def rasterize_discrete_attribute(
     if n_faces == 0:
         return twt.as_array2d_int32(labels_image)
 
-    owner = wp.full(
-        (resolution, resolution), _OWNER_SENTINEL, dtype=wp.int32, device=device
-    )
+    owner = wp.full((resolution, resolution), _OWNER_SENTINEL, dtype=wp.int32, device=device)
     wp.launch(
         kernel_texture.rasterize_owner,
         dim=n_faces,
@@ -240,21 +226,15 @@ def remap_attribute_from_uv(
     n_vertices = int(uv.shape[0])
     out_values = twt.empty_float32_2d((n_vertices, n_channels), device=device)
     if n_vertices > 0:
-        kernel = (
-            kernel_texture.sample_bilinear if order == 1 else kernel_texture.sample_nearest
-        )
+        kernel = kernel_texture.sample_bilinear if order == 1 else kernel_texture.sample_nearest
         wp.launch(
-            kernel,
-            dim=n_vertices,
-            inputs=[uv, image3d, n_channels, out_values],
-            device=device,
+            kernel, dim=n_vertices, inputs=[uv, image3d, n_channels, out_values], device=device
         )
     return twt.as_array2d_float32(out_values)
 
 
 def remap_discrete_attribute_from_uv(
-    uv: wp.array[wp.vec2],
-    class_image: twt.Array2dInt32,
+    uv: wp.array[wp.vec2], class_image: twt.Array2dInt32
 ) -> twt.Array1dInt32:
     """
     Sample a UV-space class image back to per-vertex labels.
@@ -295,9 +275,6 @@ def remap_discrete_attribute_from_uv(
     out_labels = wp.empty(n_vertices, dtype=wp.int32, device=device)
     if n_vertices > 0:
         wp.launch(
-            kernel_texture.round_labels,
-            dim=n_vertices,
-            inputs=[sampled, out_labels],
-            device=device,
+            kernel_texture.round_labels, dim=n_vertices, inputs=[sampled, out_labels], device=device
         )
     return cast(twt.Array1dInt32, out_labels)

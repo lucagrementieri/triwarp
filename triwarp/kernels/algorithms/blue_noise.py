@@ -131,9 +131,7 @@ def compute_grid_coords(
 
 @wp.kernel
 def compute_cell_keys(
-    grid_coords: wp.array[wp.vec3i],
-    grid_w: wp.int32,
-    out_cell_keys: wp.array[wp.int64],
+    grid_coords: wp.array[wp.vec3i], grid_w: wp.int32, out_cell_keys: wp.array[wp.int64]
 ) -> None:
     i = int(wp.tid())
     c = grid_coords[i]
@@ -155,11 +153,7 @@ def extract_grid_component(
 
 
 @wp.func
-def shuffle_neighbors(
-    neighbors: wp.array[wp.int32],
-    count: wp.int32,
-    state: wp.uint32,
-) -> None:
+def shuffle_neighbors(neighbors: wp.array[wp.int32], count: wp.int32, state: wp.uint32) -> None:
     i = count - wp.int32(1)
     while i > wp.int32(0):
         j = wp.int32(wp.randu(state) % wp.uint32(i + wp.int32(1)))
@@ -310,9 +304,7 @@ def mark_empty_candidate_cells(
     out_has_candidates: wp.array[wp.bool],
 ) -> None:
     c = int(wp.tid())
-    out_has_candidates[c] = (
-        selected[c] < wp.int32(0) and cell_offsets[c + 1] > cell_offsets[c]
-    )
+    out_has_candidates[c] = selected[c] < wp.int32(0) and cell_offsets[c + 1] > cell_offsets[c]
 
 
 @wp.kernel

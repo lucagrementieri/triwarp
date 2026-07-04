@@ -6,9 +6,7 @@ import triwarp as tw
 from triwarp.kernels import parametrization as kernel_parametrization
 
 
-def flipped_faces_mask(
-    vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]
-) -> wp.array[wp.bool]:
+def flipped_faces_mask(vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
     """
     Per-face flag: whether a triangle is inverted (negative 2D signed area) in the parametrization.
 
@@ -56,9 +54,7 @@ def flipped_faces_mask(
     return out_mask
 
 
-def flipped_faces(
-    vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]
-) -> wp.array[wp.int32]:
+def flipped_faces(vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
     """
     Return the indices of triangles inverted (negative 2D signed area) in the parametrization.
 

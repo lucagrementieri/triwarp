@@ -50,9 +50,7 @@ def cotmatrix_triplets_f64(
 
 @wp.kernel
 def vertex_lumped_mass(
-    faces: wp.array[wp.int32],
-    areas: wp.array[wp.float32],
-    out_mass: wp.array[wp.float64],
+    faces: wp.array[wp.int32], areas: wp.array[wp.float32], out_mass: wp.array[wp.float64]
 ) -> None:
     # Barycentric (lumped) mass: each face donates a third of its area to each incident vertex.
     f = int(wp.tid())
@@ -63,10 +61,7 @@ def vertex_lumped_mass(
 
 
 @wp.kernel
-def seed_source_indicator(
-    sources: wp.array[wp.int32],
-    out_u0: wp.array[wp.float64],
-) -> None:
+def seed_source_indicator(sources: wp.array[wp.int32], out_u0: wp.array[wp.float64]) -> None:
     # Set the initial heat to 1 at each source vertex (out_u0 pre-zeroed by the caller).
     t = int(wp.tid())
     out_u0[sources[t]] = wp.float64(1.0)
@@ -99,9 +94,9 @@ def face_gradient_normalized(
         e0 = v2 - v1  # opposite vertex i0
         e1 = v0 - v2  # opposite vertex i1
         e2 = v1 - v0  # opposite vertex i2
-        grad = (
-            u[i0] * wp.cross(n, e0) + u[i1] * wp.cross(n, e1) + u[i2] * wp.cross(n, e2)
-        ) / (wp.float64(2.0) * area)
+        grad = (u[i0] * wp.cross(n, e0) + u[i1] * wp.cross(n, e1) + u[i2] * wp.cross(n, e2)) / (
+            wp.float64(2.0) * area
+        )
 
     length = wp.length(grad)
     unit = wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
@@ -143,20 +138,14 @@ def integrated_divergence(
 
 
 @wp.kernel
-def negate_field(
-    field: wp.array[wp.float64],
-    out_field: wp.array[wp.float64],
-) -> None:
+def negate_field(field: wp.array[wp.float64], out_field: wp.array[wp.float64]) -> None:
     # Flip sign so the Poisson right-hand side matches the positive semi-definite operator ``-L``.
     t = int(wp.tid())
     out_field[t] = -field[t]
 
 
 @wp.kernel
-def shift_field(
-    offset: wp.float64,
-    out_field: wp.array[wp.float64],
-) -> None:
+def shift_field(offset: wp.float64, out_field: wp.array[wp.float64]) -> None:
     # Subtract a constant so the distance is zero at the source set (in place).
     t = int(wp.tid())
     out_field[t] = out_field[t] - offset

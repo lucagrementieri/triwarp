@@ -120,9 +120,7 @@ def _blue_noise_radius_for_count(surface_area: float, n: int) -> float:
 def test_sample_surface_blue_noise_min_distance(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = icosahedron
     radius = _blue_noise_radius_for_count(float(mesh_tm.area), 80)
-    points, _ = tw.sample.sample_surface_blue_noise(
-        mesh_wp.points, mesh_wp.indices, radius, seed=2
-    )
+    points, _ = tw.sample.sample_surface_blue_noise(mesh_wp.points, mesh_wp.indices, radius, seed=2)
     points_np = points.numpy().reshape(-1, 3)
     if points_np.shape[0] >= 2:
         min_dist = float(pdist(points_np).min())
@@ -157,9 +155,7 @@ def test_sample_surface_blue_noise_count_order_of_magnitude(
     surface_area = float(mesh_tm.area)
     expected = 50
     radius = _blue_noise_radius_for_count(surface_area, expected)
-    points, _ = tw.sample.sample_surface_blue_noise(
-        mesh_wp.points, mesh_wp.indices, radius, seed=0
-    )
+    points, _ = tw.sample.sample_surface_blue_noise(mesh_wp.points, mesh_wp.indices, radius, seed=0)
     n = int(points.shape[0])
     igl_expected = (
         surface_area * (math.pi * math.sqrt(3.0) / 6.0) / (math.pi * radius * radius / 4.0)

@@ -90,4 +90,3 @@ def group_int_rows(
     twt.ensure_ndim(data, 2)
     hashed_rows = tw.unique.hash_indices_rows(data, max_value)
     return group(hashed_rows, length)
-

@@ -61,9 +61,7 @@ def test_heat_geodesic_multi_source_matches_igl(
     assert np.allclose(distance_wp.numpy(), distance_igl, rtol=5e-2, atol=5e-2)
 
 
-def test_heat_geodesic_approximates_exact(
-    device: str, icosahedron: tuple[object, wp.Mesh]
-) -> None:
+def test_heat_geodesic_approximates_exact(device: str, icosahedron: tuple[object, wp.Mesh]) -> None:
     _skip_on_cpu(device)
     mesh_tm, mesh_wp = icosahedron
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)  # type: ignore[attr-defined]
@@ -97,9 +95,7 @@ def test_heat_geodesic_source_is_zero_and_nonnegative(
 
 
 def test_heat_geodesic_empty_faces(device: str) -> None:
-    vertices = wp.array(
-        np.zeros((4, 3), dtype=np.float32), dtype=wp.vec3, device=device
-    )
+    vertices = wp.array(np.zeros((4, 3), dtype=np.float32), dtype=wp.vec3, device=device)
     faces = wp.empty(0, dtype=wp.int32, device=device)
     sources = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
 

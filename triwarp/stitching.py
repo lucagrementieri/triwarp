@@ -46,9 +46,7 @@ from triwarp.kernels import stitching as kernel_stitching
 
 
 def _fillable_loops(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    preserve_largest_hole: bool = False,
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], preserve_largest_hole: bool = False
 ) -> list[wp.array[wp.int32]]:
     """
     Boundary loops (>= 3 vertices) eligible for hole filling, as per-loop vertex-index arrays.
@@ -71,9 +69,7 @@ def _fillable_loops(
 
 
 def _hole_loops(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    preserve_largest_hole: bool = False,
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], preserve_largest_hole: bool = False
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32], int, int] | None:
     """
     Pack fillable boundary loops (>= 3 vertices) for on-device triangulation.
@@ -94,9 +90,7 @@ def _hole_loops(
 
 
 def fill_holes_fan(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    preserve_largest_hole: bool = False,
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], preserve_largest_hole: bool = False
 ) -> wp.array[wp.int32]:
     """
     Fill every boundary hole with a triangle fan from each loop's first vertex.
@@ -154,9 +148,7 @@ def fill_holes_fan(
 
 
 def fill_holes_cone(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    preserve_largest_hole: bool = False,
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], preserve_largest_hole: bool = False
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
     Fill every boundary hole by coning it onto a new centroid vertex.
@@ -229,10 +221,7 @@ def fill_holes_cone(
         ],
         device=device,
     )
-    return (
-        tw.array.concatenate([vertices, centroids]),
-        tw.array.concatenate([faces, fill_faces]),
-    )
+    return (tw.array.concatenate([vertices, centroids]), tw.array.concatenate([faces, fill_faces]))
 
 
 # Fill-metric name -> kernel selector (must match the METRIC_* constants in kernels/stitching.py).
@@ -467,9 +456,7 @@ def fill_holes_min_weight(
     wound (see [`make_winding_consistent`][triwarp.repair.make_winding_consistent]).
     """
     if metric not in _METRIC_IDS:
-        raise ValueError(
-            f"metric must be one of {sorted(_METRIC_IDS)}, got {metric!r}"
-        )
+        raise ValueError(f"metric must be one of {sorted(_METRIC_IDS)}, got {metric!r}")
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return wp.clone(faces)
@@ -526,13 +513,29 @@ def _fill_loops(
         char_area = 1.0 / max_edge_sq if max_edge_sq > 0.0 else 1.0
 
         dp_np, prev_np = _run_hole_dp(
-            loop_pos, plane_normal, forbidden, rim_opp_pos, rim_opp_valid,
-            char_area, primary_id, combine_id, smooth_boundary, device,
+            loop_pos,
+            plane_normal,
+            forbidden,
+            rim_opp_pos,
+            rim_opp_valid,
+            char_area,
+            primary_id,
+            combine_id,
+            smooth_boundary,
+            device,
         )
         if primary_id != min_area_id and dp_np[0, b - 1] >= _BAD_TRIANGULATION_METRIC:
             _, prev_np = _run_hole_dp(
-                loop_pos, plane_normal, forbidden, rim_opp_pos, rim_opp_valid,
-                char_area, min_area_id, 0, smooth_boundary, device,
+                loop_pos,
+                plane_normal,
+                forbidden,
+                rim_opp_pos,
+                rim_opp_valid,
+                char_area,
+                min_area_id,
+                0,
+                smooth_boundary,
+                device,
             )
         triangles.extend(_traceback_triangles(prev_np, loop_np))
 
@@ -844,9 +847,7 @@ def stitch(
 _STITCH_METRIC_IDS = {"complex_stitch": 0, "edge_length_stitch": 1, "vertical": 2}
 
 
-def _closest_loop_pair(
-    a_pos: wp.array[wp.vec3], b_pos: wp.array[wp.vec3]
-) -> tuple[int, int]:
+def _closest_loop_pair(a_pos: wp.array[wp.vec3], b_pos: wp.array[wp.vec3]) -> tuple[int, int]:
     """
     Return the closest vertex pair ``(i, j)`` between the two rims (MeshLib's start pair).
 
@@ -982,8 +983,19 @@ def triangulate_boundaries_min_weight(
             kernel_stitching.stitch_dp_diag,
             dim=min(diag, n_a) - max(0, diag - n_b) + 1,
             inputs=[
-                a_pos, b_pos, a_opp, a_opp_valid, b_opp, b_opp_valid, up,
-                wp.int32(metric_id), wp.int32(n_a), wp.int32(n_b), wp.int32(diag), dp, came,
+                a_pos,
+                b_pos,
+                a_opp,
+                a_opp_valid,
+                b_opp,
+                b_opp_valid,
+                up,
+                wp.int32(metric_id),
+                wp.int32(n_a),
+                wp.int32(n_b),
+                wp.int32(diag),
+                dp,
+                came,
             ],
             device=device,
         )

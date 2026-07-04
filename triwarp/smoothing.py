@@ -31,9 +31,7 @@ def _to_vec3(positions: wp.array[wp.vec3d]) -> wp.array[wp.vec3]:
 
 
 def _apply_operator(
-    operator: wps.BsrMatrix[wp.float32],
-    v_in: wp.array[wp.vec3d],
-    out_lv: wp.array[wp.vec3d],
+    operator: wps.BsrMatrix[wp.float32], v_in: wp.array[wp.vec3d], out_lv: wp.array[wp.vec3d]
 ) -> None:
     wp.launch(
         kernel_laplacian.apply_operator,
@@ -523,10 +521,7 @@ def filter_mut_dif_laplacian(
 
 
 def filter_implicit_fairing(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    lamb: float = 0.1,
-    iterations: int = 10,
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], lamb: float = 0.1, iterations: int = 10
 ) -> wp.array[wp.vec3]:
     """
     Implicit fairing with the cotangent Laplace-Beltrami operator (Desbrun et al.).
@@ -620,10 +615,7 @@ def filter_implicit_fairing(
             wp.copy(solution, component)
             wpl.cg(system, b, solution, tol=_CG_TOLERANCE, maxiter=10 * n, M=precond)
         wp.launch(
-            kernel_smoothing.insert_components,
-            dim=n,
-            inputs=[*solutions, positions],
-            device=device,
+            kernel_smoothing.insert_components, dim=n, inputs=[*solutions, positions], device=device
         )
 
     return _to_vec3(positions)

@@ -242,9 +242,7 @@ def test_estimate_normals_orientation(device: str) -> None:
 
 
 def test_estimate_normals_mutually_exclusive_orientation(device: str) -> None:
-    points_wp = wp.array(
-        _fibonacci_sphere(16).astype(np.float32), dtype=wp.vec3, device=device
-    )
+    points_wp = wp.array(_fibonacci_sphere(16).astype(np.float32), dtype=wp.vec3, device=device)
     neighbor_idx_wp, _ = tw_proximity.query_bvh_nearest(points_wp, points_wp, k=8)
     with pytest.raises(ValueError, match=r"at most one"):
         tw.estimate_normals(

@@ -407,10 +407,7 @@ def solid_angle(a: wp.vec3, b: wp.vec3, c: wp.vec3, p: wp.vec3) -> wp.float32:
 
 @wp.func
 def solid_angle_at_face(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    f: int,
-    p: wp.vec3,
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: int, p: wp.vec3
 ) -> wp.float32:
     face_indices = faces[f * 3 : (f + 1) * 3]
     i0 = int(face_indices[0])

@@ -185,9 +185,7 @@ def test_filter_neighborhood_average(request: pytest.FixtureRequest, mesh_name: 
     )
     mesh_o3d = mesh_o3d.filter_smooth_simple(number_of_iterations=iterations)
 
-    assert np.allclose(
-        smoothed_wp.numpy(), np.asarray(mesh_o3d.vertices), rtol=1e-5, atol=1e-5
-    )
+    assert np.allclose(smoothed_wp.numpy(), np.asarray(mesh_o3d.vertices), rtol=1e-5, atol=1e-5)
 
 
 def test_filter_neighborhood_average_zero_iterations(

@@ -89,9 +89,7 @@ def _chamfer(
 
 
 def _hausdorff(
-    d_forward: twt.Array1dFloat32,
-    d_backward: twt.Array1dFloat32 | None,
-    single_directional: bool,
+    d_forward: twt.Array1dFloat32, d_backward: twt.Array1dFloat32 | None, single_directional: bool
 ) -> float:
     """
     Directed (or symmetric) Hausdorff distance from Euclidean distances.
@@ -107,9 +105,7 @@ def _hausdorff(
 
 
 def _empty_chamfer(
-    point_reduction: _PointReduction | None,
-    single_directional: bool,
-    device: wp.DeviceLike,
+    point_reduction: _PointReduction | None, single_directional: bool, device: wp.DeviceLike
 ) -> float | _UnreducedChamfer:
     if point_reduction is not None:
         return 0.0
@@ -269,9 +265,7 @@ def chamfer_points_to_mesh(
     d_forward = _as_distances(tw.proximity.closest_point_on_mesh(vertices, faces, points)[1])
     d_backward = None
     if not single_directional:
-        d_backward = _as_distances(
-            tw.proximity.query_hashgrid_nearest(points, vertices, k=1)[1]
-        )
+        d_backward = _as_distances(tw.proximity.query_hashgrid_nearest(points, vertices, k=1)[1])
     return _chamfer(d_forward, d_backward, point_reduction, single_directional)
 
 
@@ -386,7 +380,7 @@ def _validate_diff_reduction(point_reduction: _DiffReduction) -> None:
     if point_reduction not in ("mean", "sum"):
         raise ValueError(
             'Differentiable Chamfer losses support point_reduction "mean" or "sum" only. '
-            "Use the non-differentiable chamfer_* functions for \"max\"/None."
+            'Use the non-differentiable chamfer_* functions for "max"/None.'
         )
 
 
@@ -681,10 +675,7 @@ def chamfer_mesh_to_mesh_loss(
 
 
 def hausdorff_points_to_points(
-    x: wp.array[wp.vec3],
-    y: wp.array[wp.vec3],
-    *,
-    single_directional: bool = False,
+    x: wp.array[wp.vec3], y: wp.array[wp.vec3], *, single_directional: bool = False
 ) -> float:
     """
     Hausdorff distance between two point clouds.
@@ -769,9 +760,7 @@ def hausdorff_points_to_mesh(
     d_forward = _as_distances(tw.proximity.closest_point_on_mesh(vertices, faces, points)[1])
     d_backward = None
     if not single_directional:
-        d_backward = _as_distances(
-            tw.proximity.query_hashgrid_nearest(points, vertices, k=1)[1]
-        )
+        d_backward = _as_distances(tw.proximity.query_hashgrid_nearest(points, vertices, k=1)[1])
     return _hausdorff(d_forward, d_backward, single_directional)
 
 

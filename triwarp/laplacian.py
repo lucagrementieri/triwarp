@@ -9,9 +9,7 @@ from triwarp.kernels import laplacian as kernel_laplacian
 from triwarp.triangles import face_normals_and_areas
 
 
-def cotmatrix_entries(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
-) -> twt.Array2dFloat32:
+def cotmatrix_entries(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> twt.Array2dFloat32:
     """
     Per-triangle half-cotangent weights (``igl::cotmatrix_entries``).
 
@@ -327,10 +325,7 @@ def mass_matrix_entries(
     if n_faces > 0:
         _, areas = face_normals_and_areas(vertices, faces)
         wp.launch(
-            kernel_laplacian.lumped_mass,
-            dim=n_faces,
-            inputs=[faces, areas, mass],
-            device=device,
+            kernel_laplacian.lumped_mass, dim=n_faces, inputs=[faces, areas, mass], device=device
         )
     return mass
 

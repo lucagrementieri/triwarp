@@ -17,10 +17,7 @@ def to_vec3(v_in: wp.array[wp.vec3d], out_v: wp.array[wp.vec3]) -> None:
 
 @wp.kernel
 def laplacian_step(
-    v_prev: wp.array[wp.vec3d],
-    lv: wp.array[wp.vec3d],
-    coeff: wp.float64,
-    out_v: wp.array[wp.vec3d],
+    v_prev: wp.array[wp.vec3d], lv: wp.array[wp.vec3d], coeff: wp.float64, out_v: wp.array[wp.vec3d]
 ) -> None:
     # Explicit diffusion step v' = v + coeff * (L·v - v); coeff = +lambda (shrink) or -nu (inflate).
     i = int(wp.tid())
@@ -119,9 +116,7 @@ def add_scaled_normal(
 
 @wp.kernel
 def signed_tet_volumes(
-    vertices: wp.array[wp.vec3d],
-    faces: wp.array[wp.int32],
-    out_volumes: wp.array[wp.float64],
+    vertices: wp.array[wp.vec3d], faces: wp.array[wp.int32], out_volumes: wp.array[wp.float64]
 ) -> None:
     # Signed volume of the tetrahedron (origin, v0, v1, v2); the sum over faces is the mesh volume.
     f = int(wp.tid())
@@ -158,9 +153,7 @@ def insert_components(
 
 @wp.kernel
 def scale_by_diagonal(
-    diag: wp.array[wp.float64],
-    comp: wp.array[wp.float64],
-    out_rhs: wp.array[wp.float64],
+    diag: wp.array[wp.float64], comp: wp.array[wp.float64], out_rhs: wp.array[wp.float64]
 ) -> None:
     # Right-hand side b = M·U for a diagonal (lumped) mass matrix M.
     i = int(wp.tid())

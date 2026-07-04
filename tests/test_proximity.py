@@ -534,9 +534,7 @@ def test_signed_distance_on_mesh_empty_faces(device: str) -> None:
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "hemisphere"])
 @pytest.mark.parametrize("tiled", [False, True])
-def test_winding_number_random(
-    request: pytest.FixtureRequest, mesh_name: str, tiled: bool
-) -> None:
+def test_winding_number_random(request: pytest.FixtureRequest, mesh_name: str, tiled: bool) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     rng = np.random.default_rng(42)
     query_np = rng.random((200, 3), dtype=np.float64) * 4.0 - 2.0
@@ -547,9 +545,7 @@ def test_winding_number_random(
     query_wp = wp.array(
         np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
     )
-    winding_wp = tw.proximity.winding_number(
-        mesh_wp.points, mesh_wp.indices, query_wp, tiled=tiled
-    )
+    winding_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, query_wp, tiled=tiled)
     assert np.allclose(winding_wp.numpy(), winding_igl.ravel(), rtol=1e-5, atol=1e-5)
 
 
@@ -560,12 +556,8 @@ def test_winding_number_tiled_matches_exact(icosahedron: tuple[tm.Trimesh, wp.Me
     query_wp = wp.array(
         np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
     )
-    exact_wp = tw.proximity.winding_number(
-        mesh_wp.points, mesh_wp.indices, query_wp, tiled=False
-    )
-    tiled_wp = tw.proximity.winding_number(
-        mesh_wp.points, mesh_wp.indices, query_wp, tiled=True
-    )
+    exact_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, query_wp, tiled=False)
+    tiled_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, query_wp, tiled=True)
     assert np.allclose(tiled_wp.numpy(), exact_wp.numpy(), rtol=1e-6, atol=1e-6)
 
 
@@ -575,9 +567,7 @@ def test_winding_number_inside_outside(icosahedron: tuple[tm.Trimesh, wp.Mesh]) 
     inside_np = np.asarray([mesh_tm.center_mass], dtype=np.float32)
     outside_wp = wp.array(outside_np, dtype=wp.vec3, device=mesh_wp.device)
     inside_wp = wp.array(inside_np, dtype=wp.vec3, device=mesh_wp.device)
-    outside_winding_wp = tw.proximity.winding_number(
-        mesh_wp.points, mesh_wp.indices, outside_wp
-    )
+    outside_winding_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, outside_wp)
     inside_winding_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, inside_wp)
     assert np.allclose(outside_winding_wp.numpy(), 0.0, atol=1e-3)
     assert np.allclose(inside_winding_wp.numpy(), 1.0, atol=1e-3)

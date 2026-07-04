@@ -106,12 +106,7 @@ def fit_line(points: wp.array[wp.vec3]) -> wp.vec3:
 
     # Pass 2: SVD of the 3x3 matrix and axis extraction (single thread).
     out_axis = wp.empty(1, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_points.finalize_fit_line,
-        dim=1,
-        inputs=[gram, out_axis],
-        device=device,
-    )
+    wp.launch(kernel_points.finalize_fit_line, dim=1, inputs=[gram, out_axis], device=device)
     return wp.vec3(*out_axis.numpy()[0].tolist())
 
 
@@ -157,10 +152,7 @@ def fit_plane(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
         inputs=[center, cov, out_centroid, out_normal],
         device=device,
     )
-    return (
-        wp.vec3(*out_centroid.numpy()[0].tolist()),
-        wp.vec3(*out_normal.numpy()[0].tolist()),
-    )
+    return (wp.vec3(*out_centroid.numpy()[0].tolist()), wp.vec3(*out_normal.numpy()[0].tolist()))
 
 
 def estimate_normals(
@@ -255,10 +247,7 @@ def estimate_normals(
 
 
 def radial_sort(
-    points: wp.array[wp.vec3],
-    origin: wp.vec3,
-    normal: wp.vec3,
-    start: wp.vec3 | None = None,
+    points: wp.array[wp.vec3], origin: wp.vec3, normal: wp.vec3, start: wp.vec3 | None = None
 ) -> wp.array[wp.vec3]:
     """
     Sort points radially (by angle) around an axis and return them reordered.

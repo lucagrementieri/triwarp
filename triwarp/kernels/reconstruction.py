@@ -61,9 +61,7 @@ def triangle_aspect_ratio(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.float32:
 
 
 @wp.func
-def delone_flip_profit_sq(
-    a: wp.vec3, b: wp.vec3, c: wp.vec3, d: wp.vec3
-) -> wp.float32:
+def delone_flip_profit_sq(a: wp.vec3, b: wp.vec3, c: wp.vec3, d: wp.vec3) -> wp.float32:
     # MRPointCloudTriangulationHelpers.cpp: profit of flipping diagonal AC to BD.
     metric_ac = wp.max(circumcircle_diameter_sq(a, c, d), circumcircle_diameter_sq(c, a, b))
     metric_bd = wp.max(circumcircle_diameter_sq(b, d, a), circumcircle_diameter_sq(d, b, c))
@@ -126,9 +124,7 @@ def line_isect(b: wp.vec2, c: wp.vec2, d: wp.vec2) -> wp.float32:
 
 
 @wp.func
-def is_unfold_quadrangle_convex(
-    a: wp.vec3, b: wp.vec3, c: wp.vec3, d: wp.vec3
-) -> bool:
+def is_unfold_quadrangle_convex(a: wp.vec3, b: wp.vec3, c: wp.vec3, d: wp.vec3) -> bool:
     # MRReducePath: unfold triangles ABC and ACD into a plane; convex iff the B-D path
     # crosses edge AC strictly between A and C.
     vec_b = b - a
@@ -439,8 +435,7 @@ def build_local_triangulations(
 # --------------------------------------------------------------------------------------
 @wp.kernel
 def canonicalize_triangles(
-    tris: wp.array2d(dtype=wp.int32),
-    out_sorted: wp.array2d(dtype=wp.int32),
+    tris: wp.array2d(dtype=wp.int32), out_sorted: wp.array2d(dtype=wp.int32)
 ) -> None:
     t = int(wp.tid())
     i = tris[t, 0]
@@ -465,9 +460,6 @@ def canonicalize_triangles(
 
 
 @wp.kernel
-def copy_first_column(
-    groups: wp.array2d(dtype=wp.int32),
-    out: wp.array(dtype=wp.int32),
-) -> None:
+def copy_first_column(groups: wp.array2d(dtype=wp.int32), out: wp.array(dtype=wp.int32)) -> None:
     t = int(wp.tid())
     out[t] = groups[t, 0]

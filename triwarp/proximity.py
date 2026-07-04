@@ -1570,8 +1570,10 @@ def winding_number(
     if n_faces == 0:
         return wp.zeros(n_queries, dtype=wp.float32, device=device)
 
-    out_winding = wp.zeros(n_queries, dtype=wp.float32, device=device) if tiled else wp.empty(
-        n_queries, dtype=wp.float32, device=device
+    out_winding = (
+        wp.zeros(n_queries, dtype=wp.float32, device=device)
+        if tiled
+        else wp.empty(n_queries, dtype=wp.float32, device=device)
     )
     if tiled:
         n_face_tiles = (n_faces + TILE_1D - 1) // TILE_1D

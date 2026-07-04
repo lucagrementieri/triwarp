@@ -160,10 +160,7 @@ def find_local_maxima(
 
 
 @wp.kernel
-def apply_deletions(
-    deleted_mask: wp.array[wp.int32],
-    alive: wp.array[wp.int32],
-) -> None:
+def apply_deletions(deleted_mask: wp.array[wp.int32], alive: wp.array[wp.int32]) -> None:
     i = int(wp.tid())
     if deleted_mask[i] == 1:
         alive[i] = 0

@@ -201,9 +201,7 @@ def test_unique_faces(device: str):
 
     # Each input face maps to a unique representative sharing its vertex set.
     for i in range(faces_np.shape[0]):
-        assert np.array_equal(
-            np.sort(unique_faces_np[inverse[i]]), np.sort(faces_np[i])
-        )
+        assert np.array_equal(np.sort(unique_faces_np[inverse[i]]), np.sort(faces_np[i]))
     # Representatives are the first occurrence with original vertex order preserved.
     assert np.array_equal(unique_faces_np[inverse[0]], faces_np[0])
     assert np.array_equal(unique_faces_np[inverse[2]], faces_np[2])
@@ -285,4 +283,3 @@ def _pack_indices_rows_np(indices_np: np.ndarray, max_index: int | None = None) 
     if max_index is None:
         max_index = np.max(indices_np) + 1
     return np.sum(indices_np * np.power(max_index, np.arange(indices_np.shape[1])), axis=1)
-

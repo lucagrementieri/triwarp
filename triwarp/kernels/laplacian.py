@@ -66,9 +66,7 @@ def cot_entries_from_edge_lengths(
 
 @wp.kernel
 def cotmatrix_entries(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    out_cot: wp.array2d[wp.float32],
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_cot: wp.array2d[wp.float32]
 ) -> None:
     f = int(wp.tid())
     i0 = faces[f * 3 + 0]
@@ -90,8 +88,7 @@ def cotmatrix_entries(
 
 @wp.kernel
 def cotmatrix_entries_intrinsic(
-    edge_lengths: wp.array2d[wp.float32],
-    out_cot: wp.array2d[wp.float32],
+    edge_lengths: wp.array2d[wp.float32], out_cot: wp.array2d[wp.float32]
 ) -> None:
     f = int(wp.tid())
     l0 = edge_lengths[f, 0]
@@ -156,10 +153,7 @@ def laplacian_triplets_symmetric(
 
 
 @wp.kernel
-def row_normalize(
-    offsets: wp.array[wp.int32],
-    out_values: wp.array[wp.float32],
-) -> None:
+def row_normalize(offsets: wp.array[wp.int32], out_values: wp.array[wp.float32]) -> None:
     i = int(wp.tid())
     start = offsets[i]
     end = offsets[i + 1]
@@ -196,9 +190,7 @@ def apply_operator(
 
 @wp.kernel
 def lumped_mass(
-    faces: wp.array[wp.int32],
-    areas: wp.array[wp.float32],
-    out_mass: wp.array[wp.float32],
+    faces: wp.array[wp.int32], areas: wp.array[wp.float32], out_mass: wp.array[wp.float32]
 ) -> None:
     # Barycentric (lumped) mass: each face donates a third of its area to each incident vertex.
     f = int(wp.tid())

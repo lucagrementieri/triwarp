@@ -100,9 +100,7 @@ def _rasterize_attribute_gl(
 
 
 def _remap_attribute_scipy(
-    uv: npt.NDArray[np.float32],
-    image: npt.NDArray[np.float32],
-    order: int,
+    uv: npt.NDArray[np.float32], image: npt.NDArray[np.float32], order: int
 ) -> npt.NDArray[np.float32]:
     """Scipy reference for the pixel-center inverse sampling."""
     image_hwc = image[:, :, None] if image.ndim == 2 else image
