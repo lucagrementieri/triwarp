@@ -495,3 +495,100 @@ def test_triangulate_too_few_points(device: str) -> None:
     pts_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
     faces_wp = tw.polyline.triangulate(_polyline_wp(pts_np, device))
     assert faces_wp.shape == (0, 3)
+
+
+# --- simplify (Ramer-Douglas-Peucker, NumPy reference) ---
+
+
+def _simplify_np(pts_np: np.ndarray, tol: float) -> tuple[np.ndarray, np.ndarray]:
+    # Mirrors reference/libigl/include/igl/ramer_douglas_peucker.cpp; returns (S, J).
+    n = len(pts_np)
+    keep = np.ones(n, dtype=bool)
+    stol = tol * tol
+
+    def rec(ixs: int, ixe: int) -> None:
+        sdmax, ixc = 0.0, -1
+        if ixe - ixs > 1:
+            s, d = pts_np[ixs], pts_np[ixe]
+            dms = d - s
+            sdes = float(dms @ dms)
+            for k in range(ixs + 1, ixe):
+                p = pts_np[k]
+                if sdes <= 1e-7:
+                    sd = float((p - s) @ (p - s))
+                else:
+                    t = -(dms @ (s - p)) / sdes
+                    proj = (1.0 - t) * s + t * d
+                    sd = float((p - proj) @ (p - proj))
+                if sd > sdmax:
+                    sdmax, ixc = sd, k
+        if sdmax <= stol:
+            keep[ixs + 1 : ixe] = False
+        else:
+            rec(ixs, ixc)
+            rec(ixc, ixe)
+
+    if n >= 2:
+        rec(0, n - 1)
+    indices = np.flatnonzero(keep)
+    return pts_np[indices], indices
+
+
+@pytest.mark.parametrize("tol", [0.1, 0.5])
+@pytest.mark.parametrize("seed", [0, 7, 42])
+def test_simplify_matches_reference(device: str, tol: float, seed: int) -> None:
+    pts_np = _random_open_polyline(seed, n=40)
+    simplified_wp, indices_wp = tw.polyline.simplify(_polyline_wp(pts_np, device), tol)
+    simplified_np, indices_np = _simplify_np(pts_np, tol)
+    assert np.array_equal(indices_wp.numpy(), indices_np.astype(np.int32))
+    assert np.allclose(
+        simplified_wp.numpy(), simplified_np.astype(np.float32), rtol=1e-4, atol=1e-4
+    )
+
+
+def test_simplify_collinear_collapses_to_endpoints(device: str) -> None:
+    pts_np = np.stack([np.linspace(0.0, 1.0, 11), np.zeros(11), np.zeros(11)], axis=1)
+    simplified_wp, indices_wp = tw.polyline.simplify(_polyline_wp(pts_np, device), 1e-3)
+    assert np.array_equal(indices_wp.numpy(), np.array([0, 10], dtype=np.int32))
+    assert np.allclose(simplified_wp.numpy(), pts_np[[0, 10]].astype(np.float32))
+
+
+def test_simplify_preserves_a_sharp_corner(device: str) -> None:
+    # A tent: the apex deviates far from the base chord and must be kept.
+    pts_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float64
+    )
+    _, indices_wp = tw.polyline.simplify(_polyline_wp(pts_np, device), 0.1)
+    assert np.array_equal(indices_wp.numpy(), np.array([0, 1, 2], dtype=np.int32))
+
+
+def test_simplify_empty(device: str) -> None:
+    empty_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    simplified_wp, indices_wp = tw.polyline.simplify(empty_wp, 0.5)
+    assert simplified_wp.shape == (0,)
+    assert indices_wp.shape == (0,)
+
+
+def test_simplify_single_point(device: str) -> None:
+    pts_np = np.array([[0.3, -0.4, 1.2]])
+    simplified_wp, indices_wp = tw.polyline.simplify(_polyline_wp(pts_np, device), 0.5)
+    assert np.array_equal(indices_wp.numpy(), np.array([0], dtype=np.int32))
+    assert np.allclose(simplified_wp.numpy(), pts_np.astype(np.float32))
+
+
+def test_simplify_two_points_kept(device: str) -> None:
+    pts_np = np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]])
+    _, indices_wp = tw.polyline.simplify(_polyline_wp(pts_np, device), 0.5)
+    assert np.array_equal(indices_wp.numpy(), np.array([0, 1], dtype=np.int32))
+
+
+@pytest.mark.parametrize("tol", [0.1, 0.5])
+def test_simplify_closed_matches_reference(device: str, tol: float) -> None:
+    pts_np = _random_open_polyline(3, n=30)
+    closed_np = _closed_from(pts_np)
+    simplified_wp, indices_wp = tw.polyline.simplify_closed(_polyline_wp(pts_np, device), tol)
+    simplified_np, indices_np = _simplify_np(closed_np, tol)
+    assert np.array_equal(indices_wp.numpy(), indices_np.astype(np.int32))
+    assert np.allclose(
+        simplified_wp.numpy(), simplified_np.astype(np.float32), rtol=1e-4, atol=1e-4
+    )

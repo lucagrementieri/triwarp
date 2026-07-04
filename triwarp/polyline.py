@@ -505,6 +505,80 @@ def downsample_closed_polyline(polyline: wp.array[wp.vec3], step_size: float) ->
     return downsample_polyline(close_polyline(polyline), step_size)
 
 
+def simplify(
+    polyline: wp.array[wp.vec3], tol: float
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Simplify a polyline with the Ramer-Douglas-Peucker algorithm.
+
+    Recursively drops interior vertices whose perpendicular distance to the chord spanning a
+    kept sub-range is at most ``tol``; the first and last vertices are always retained. This is
+    a Warp port of ``ramer_douglas_peucker`` from libigl, evaluated on-device by a single-thread
+    stack-based kernel (Warp forbids recursion).
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``.
+    tol
+        Maximum Euclidean distance allowed between a dropped vertex and the retained chord.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        ``(simplified, indices)`` on ``polyline.device``: the ``(m,)`` retained vertices and the
+        ``(m,)`` sorted indices into the input such that ``polyline[indices] == simplified``. An
+        empty input yields two empty arrays; a single point is returned unchanged with
+        ``indices == [0]``.
+
+    See Also
+    --------
+    [`simplify_closed`][triwarp.polyline.simplify_closed]
+    [`downsample_polyline`][triwarp.polyline.downsample_polyline]
+    """
+    device = polyline.device
+    n = int(polyline.shape[0])
+    keep_mask = wp.empty(n, dtype=wp.bool, device=device)
+    # Scratch stack of interleaved (ixs, ixe) ranges; max(2 * n, 2) keeps n == 0 in bounds.
+    stack = wp.empty(max(2 * n, 2), dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_polyline.rdp_keep_mask,
+        dim=1,
+        inputs=[polyline, wp.float32(tol * tol), stack, keep_mask],
+        device=device,
+    )
+    indices = tw.array.flatnonzero(keep_mask)
+    return tw.array.gather(polyline, indices), indices
+
+
+def simplify_closed(
+    polyline: wp.array[wp.vec3], tol: float
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Simplify a closed polyline with the Ramer-Douglas-Peucker algorithm.
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``. The closing edge is added if absent.
+    tol
+        Maximum Euclidean distance allowed between a dropped vertex and the retained chord.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        ``(simplified, indices)`` on ``polyline.device``. ``indices`` refer to the *closed*
+        polyline (the input with its closing point appended), so the shared start/end vertex is
+        preserved at both ends.
+
+    See Also
+    --------
+    [`simplify`][triwarp.polyline.simplify]
+    [`close_polyline`][triwarp.polyline.close_polyline]
+    """
+    return simplify(close_polyline(polyline), tol)
+
+
 def resample_polyline(polyline: wp.array[wp.vec3], num_points: int) -> wp.array[wp.vec3]:
     """
     Resample a polyline to a fixed number of points evenly spaced by arc length.

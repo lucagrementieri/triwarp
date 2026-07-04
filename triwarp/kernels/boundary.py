@@ -37,7 +37,11 @@ def rank_loop_positions(
     loop_length = label_count[label]
     current = v
     steps = wp.int32(0)
-    while current != start:
+    # Follow the successor chain back to the loop's start vertex. The guards make the walk
+    # terminating on any input: a well-formed loop reaches `start` in fewer than `loop_length`
+    # hops, while a broken successor chain (non-manifold boundary: a `-1` sentinel or a sub-cycle
+    # not containing `start`) stops at the bound instead of spinning forever on the device.
+    while current != start and current >= 0 and steps < loop_length:
         current = next_vertex[current]
         steps += 1
     out_position[tid] = (loop_length - steps) % loop_length

@@ -1,6 +1,7 @@
 import warp as wp
 
 import triwarp as tw
+import triwarp.typing as twt
 from triwarp.constants import TILE_1D, TOLERANCE_ZERO
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import points as kernel_points
@@ -160,6 +161,97 @@ def fit_plane(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
         wp.vec3(*out_centroid.numpy()[0].tolist()),
         wp.vec3(*out_normal.numpy()[0].tolist()),
     )
+
+
+def estimate_normals(
+    points: wp.array[wp.vec3],
+    neighbor_idx: twt.Array2dInt32,
+    *,
+    orient_reference: wp.vec3 | None = None,
+    camera_location: wp.vec3 | None = None,
+) -> wp.array[wp.vec3]:
+    """
+    Estimate per-point normals by PCA over each point's neighbourhood.
+
+    Each normal is the eigenvector of the smallest eigenvalue of the local
+    covariance matrix accumulated over the point's neighbours — the same choice
+    made by MeshLib (``PointAccumulator``) and Open3D (``FastEigen3x3``), so the
+    result matches both references up to sign. The neighbourhood is supplied by
+    the caller as ``neighbor_idx``: build it with
+    [`query_bvh_nearest`][triwarp.proximity.query_bvh_nearest] using a plain
+    ``k`` for a k-nearest (KNN) neighbourhood, or with ``max_radius`` set for a
+    radius-bounded (hybrid) neighbourhood — mirroring the two neighbour modes of
+    Open3D's ``estimate_normals(max_nn, radius)``.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` point positions on the target device.
+    neighbor_idx
+        ``(n, k)`` int32 table of neighbour indices per point, as returned by
+        [`query_bvh_nearest`][triwarp.proximity.query_bvh_nearest] (unused slots
+        marked ``-1``). A self-query table includes each point itself once, which
+        is counted normally.
+    orient_reference
+        When given, normals are flipped to align with this fixed direction
+        (``dot(normal, orient_reference) >= 0``), matching Open3D's
+        ``orient_normals_to_align_with_direction``. Mutually exclusive with
+        ``camera_location``.
+    camera_location
+        When given, normals are flipped to point toward this location
+        (``dot(normal, camera_location - point) >= 0``), matching Open3D's
+        ``orient_normals_towards_camera_location``. Mutually exclusive with
+        ``orient_reference``.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        Length ``n`` unit normals on ``points.device``. When neither orientation
+        argument is given, normals are oriented outward from the whole-cloud
+        centroid — a best-effort global orientation valid for star-shaped clouds
+        (Open3D leaves the sign arbitrary instead). Points with fewer than two
+        valid neighbours (or a degenerate neighbourhood) receive a fallback
+        ``(0, 0, 1)`` normal.
+
+    Raises
+    ------
+    ValueError
+        If both ``orient_reference`` and ``camera_location`` are given.
+
+    See Also
+    --------
+    [`triwarp.points.fit_plane`][triwarp.points.fit_plane]
+    [`triwarp.reconstruction.triangulate_point_cloud`][triwarp.reconstruction.triangulate_point_cloud]
+    """
+    if orient_reference is not None and camera_location is not None:
+        raise ValueError("pass at most one of orient_reference and camera_location")
+
+    twt.ensure_ndim(neighbor_idx, 2, dtype=wp.int32)
+
+    device = points.device
+    n = int(points.shape[0])
+    if n == 0:
+        return wp.empty(0, dtype=wp.vec3, device=device)
+
+    if camera_location is not None:
+        orient_mode = kernel_points.ORIENT_CAMERA
+        reference = camera_location
+    elif orient_reference is not None:
+        orient_mode = kernel_points.ORIENT_DIRECTION
+        reference = orient_reference
+    else:
+        orient_mode = kernel_points.ORIENT_CENTROID
+        reference = wp.vec3(0.0, 0.0, 0.0)
+
+    center = centroid(points)
+    out_normals = wp.empty(n, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_points.estimate_point_normals,
+        dim=n,
+        inputs=[points, neighbor_idx, center, orient_mode, reference, out_normals],
+        device=device,
+    )
+    return out_normals
 
 
 def radial_sort(

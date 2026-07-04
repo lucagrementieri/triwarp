@@ -201,7 +201,10 @@ def boundary_loops(
     offsets = wp.empty(n_loops, dtype=wp.int32, device=device)
     wp.utils.array_scan(loop_sizes, out_array=offsets, inclusive=False)
 
-    flat_loops = wp.empty(n_boundary_vertices, dtype=wp.int32, device=device)
+    # Zero-initialised (not wp.empty): on a non-manifold boundary the position ranks can collide,
+    # leaving some slots unwritten by scatter_loop_slot. Zero is a valid vertex index, so a
+    # malformed loop stays in-range rather than returning uninitialised garbage to callers.
+    flat_loops = wp.zeros(n_boundary_vertices, dtype=wp.int32, device=device)
     wp.launch(
         kernel_boundary.scatter_loop_slot,
         dim=n_boundary_vertices,

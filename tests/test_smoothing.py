@@ -1,0 +1,158 @@
+"""Regression tests for ``triwarp.smoothing`` against trimesh / igl (CPU reference)."""
+
+from __future__ import annotations
+
+import igl
+import numpy as np
+import pytest
+import scipy.sparse.linalg as spla
+import trimesh as tm
+import trimesh.smoothing as tms
+import warp as wp
+
+import triwarp as tw
+
+
+def _skip_without_cuda(mesh_wp: wp.Mesh) -> None:
+    if wp.get_device(mesh_wp.device).is_cpu:
+        pytest.skip("implicit smoothing requires a CUDA device (warp.optim.linear.cg)")
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+def test_filter_laplacian_explicit(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+
+    smoothed_wp = tw.smoothing.filter_laplacian(
+        mesh_wp.points, mesh_wp.indices, iterations=8, volume_constraint=False
+    )
+    mesh_ref = mesh_tm.copy()
+    tms.filter_laplacian(mesh_ref, iterations=8, volume_constraint=False)
+
+    assert np.allclose(smoothed_wp.numpy(), mesh_ref.vertices, rtol=1e-5, atol=1e-5)
+
+
+def test_filter_laplacian_volume_constraint(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+
+    smoothed_wp = tw.smoothing.filter_laplacian(
+        mesh_wp.points, mesh_wp.indices, iterations=8, volume_constraint=True
+    )
+    mesh_ref = mesh_tm.copy()
+    tms.filter_laplacian(mesh_ref, iterations=8, volume_constraint=True)
+
+    assert np.allclose(smoothed_wp.numpy(), mesh_ref.vertices, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+def test_filter_humphrey(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+
+    smoothed_wp = tw.smoothing.filter_humphrey(
+        mesh_wp.points, mesh_wp.indices, alpha=0.1, beta=0.5, iterations=8
+    )
+    mesh_ref = mesh_tm.copy()
+    tms.filter_humphrey(mesh_ref, alpha=0.1, beta=0.5, iterations=8)
+
+    assert np.allclose(smoothed_wp.numpy(), mesh_ref.vertices, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+def test_filter_taubin(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+
+    smoothed_wp = tw.smoothing.filter_taubin(
+        mesh_wp.points, mesh_wp.indices, lamb=0.5, nu=0.53, iterations=9
+    )
+    mesh_ref = mesh_tm.copy()
+    tms.filter_taubin(mesh_ref, lamb=0.5, nu=0.53, iterations=9)
+
+    assert np.allclose(smoothed_wp.numpy(), mesh_ref.vertices, rtol=1e-5, atol=1e-5)
+
+
+def test_filter_laplacian_implicit(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    _skip_without_cuda(mesh_wp)
+
+    smoothed_wp = tw.smoothing.filter_laplacian(
+        mesh_wp.points,
+        mesh_wp.indices,
+        lamb=0.5,
+        iterations=6,
+        implicit_time_integration=True,
+        volume_constraint=False,
+    )
+    mesh_ref = mesh_tm.copy()
+    tms.filter_laplacian(
+        mesh_ref, lamb=0.5, iterations=6, implicit_time_integration=True, volume_constraint=False
+    )
+
+    assert np.allclose(smoothed_wp.numpy(), mesh_ref.vertices, rtol=1e-4, atol=1e-4)
+
+
+def test_filter_implicit_fairing(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    # Implicit curvature flow is defined for closed meshes; on open boundaries the unconstrained
+    # flow degrades boundary triangles and the conjugate-gradient solve diverges (igl's direct
+    # solver tolerates it, Warp only offers CG), so the regression uses the watertight icosahedron.
+    mesh_tm, mesh_wp = icosahedron
+    _skip_without_cuda(mesh_wp)
+
+    lamb = 0.1
+    iterations = 6
+    vertices_igl = np.array(mesh_tm.vertices, dtype=np.float64)
+    faces_igl = np.array(mesh_tm.faces, dtype=np.int64)
+    for _ in range(iterations):
+        stiffness_igl = igl.cotmatrix(vertices_igl, faces_igl)
+        mass_igl = igl.massmatrix(vertices_igl, faces_igl, igl.MASSMATRIX_TYPE_BARYCENTRIC)
+        system_igl = (mass_igl - lamb * stiffness_igl).tocsc()
+        vertices_igl = spla.spsolve(system_igl, mass_igl.dot(vertices_igl))
+
+    smoothed_wp = tw.smoothing.filter_implicit_fairing(
+        mesh_wp.points, mesh_wp.indices, lamb=lamb, iterations=iterations
+    )
+
+    assert np.allclose(smoothed_wp.numpy(), vertices_igl, rtol=1e-4, atol=1e-4)
+
+
+def test_filter_laplacian_pluggable_operator(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = half_torus
+    operator = tw.laplacian.laplacian(mesh_wp.points, mesh_wp.indices, equal_weight=False)
+
+    smoothed_wp = tw.smoothing.filter_laplacian(
+        mesh_wp.points,
+        mesh_wp.indices,
+        iterations=6,
+        volume_constraint=False,
+        laplacian_operator=operator,
+    )
+    mesh_ref = mesh_tm.copy()
+    operator_tm = tms.laplacian_calculation(mesh_ref, equal_weight=False)
+    tms.filter_laplacian(mesh_ref, iterations=6, volume_constraint=False, laplacian_operator=operator_tm)
+
+    assert np.allclose(smoothed_wp.numpy(), mesh_ref.vertices, rtol=1e-5, atol=1e-5)
+
+
+def test_cpu_implicit_raises() -> None:
+    vertices = wp.array(
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        dtype=wp.vec3,
+        device="cpu",
+    )
+    faces = wp.array([0, 1, 2], dtype=wp.int32, device="cpu")
+
+    with pytest.raises(NotImplementedError):
+        tw.smoothing.filter_laplacian(vertices, faces, iterations=2, implicit_time_integration=True)
+    with pytest.raises(NotImplementedError):
+        tw.smoothing.filter_implicit_fairing(vertices, faces, iterations=2)
+
+
+def test_zero_iterations_returns_copy(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _, mesh_wp = icosahedron
+    smoothed_wp = tw.smoothing.filter_taubin(mesh_wp.points, mesh_wp.indices, iterations=0)
+    assert np.array_equal(smoothed_wp.numpy(), mesh_wp.points.numpy())
+
+
+def test_empty_mesh(device: str) -> None:
+    vertices = wp.empty(0, dtype=wp.vec3, device=device)
+    faces = wp.empty(0, dtype=wp.int32, device=device)
+    smoothed_wp = tw.smoothing.filter_taubin(vertices, faces, iterations=4)
+    assert int(smoothed_wp.shape[0]) == 0

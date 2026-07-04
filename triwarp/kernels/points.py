@@ -60,3 +60,65 @@ def finalize_fit_plane(
     # (svd3 returns singular values in descending order: last column of u).
     out_centroid[0] = center[0]
     out_normal[0] = wp.normalize(wp.vec3(u[0, 2], u[1, 2], u[2, 2]))
+
+
+# Orientation modes for estimate_point_normals (mirror Open3D's orient methods).
+ORIENT_CENTROID = wp.constant(wp.int32(0))  # outward from the cloud centroid (MeshLib default)
+ORIENT_DIRECTION = wp.constant(wp.int32(1))  # align with a fixed direction
+ORIENT_CAMERA = wp.constant(wp.int32(2))  # point toward a camera location
+
+
+@wp.kernel
+def estimate_point_normals(
+    points: wp.array[wp.vec3],
+    neighbor_idx: wp.array2d[wp.int32],
+    centroid: wp.array[wp.vec3],
+    orient_mode: wp.int32,
+    orient_reference: wp.vec3,
+    out_normals: wp.array[wp.vec3],
+) -> None:
+    # Per-point normal = eigenvector of the smallest eigenvalue of the neighbourhood
+    # covariance (same choice as MeshLib PointAccumulator and Open3D FastEigen3x3).
+    v = int(wp.tid())
+    k = neighbor_idx.shape[1]
+
+    # Local neighbourhood mean over the valid entries of the table. A self-query table
+    # contains the point itself once, so it is naturally included (matching Open3D KNN).
+    mean = wp.vec3(0.0, 0.0, 0.0)
+    count = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    for i in range(k):
+        nb = neighbor_idx[v, i]
+        if nb >= 0:
+            mean += points[nb]
+            count += 1.0
+
+    if count < 2.0:
+        out_normals[v] = wp.vec3(0.0, 0.0, 1.0)  # too few neighbours (Open3D fallback)
+        return
+    mean = mean / count
+
+    cov = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    for i in range(k):
+        nb = neighbor_idx[v, i]
+        if nb >= 0:
+            e = points[nb] - mean
+            cov += wp.outer(e, e)
+
+    if wp.ddot(cov, cov) <= 0.0:
+        out_normals[v] = wp.vec3(0.0, 0.0, 1.0)  # coincident neighbours (zero covariance)
+        return
+
+    u, _sigma, _vt = wp.svd3(cov)
+    normal = wp.normalize(wp.vec3(u[0, 2], u[1, 2], u[2, 2]))
+
+    # Orientation: flip so the normal points along a per-point reference vector.
+    ref = wp.vec3(0.0, 0.0, 0.0)
+    if orient_mode == ORIENT_CENTROID:
+        ref = points[v] - centroid[0]  # outward from the cloud centroid (star-shaped assumption)
+    elif orient_mode == ORIENT_DIRECTION:
+        ref = orient_reference
+    else:
+        ref = orient_reference - points[v]  # toward the camera location
+    if wp.dot(normal, ref) < 0.0:
+        normal = -normal
+    out_normals[v] = normal

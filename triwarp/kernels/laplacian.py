@@ -103,6 +103,111 @@ def cotmatrix_entries_intrinsic(
     out_cot[f, 2] = c2
 
 
+@wp.func
+def edge_weight(
+    a: wp.int32, b: wp.int32, vertices: wp.array[wp.vec3], equal_weight: wp.int32
+) -> wp.float32:
+    if equal_weight != 0:
+        return wp.float32(1.0)
+    return wp.float32(1.0) / (wp.length(vertices[a] - vertices[b]) + wp.float32(1.0e-12))
+
+
+@wp.kernel
+def laplacian_triplets_directed(
+    edges: wp.array2d[wp.int32],
+    vertices: wp.array[wp.vec3],
+    equal_weight: wp.int32,
+    out_rows: wp.array[wp.int32],
+    out_cols: wp.array[wp.int32],
+    out_vals: wp.array[wp.float32],
+) -> None:
+    # One triplet per directed triangle edge, matching trimesh's ``mesh.edges`` adjacency.
+    e = int(wp.tid())
+    a = edges[e, 0]
+    b = edges[e, 1]
+    out_rows[e] = a
+    out_cols[e] = b
+    out_vals[e] = edge_weight(a, b, vertices, equal_weight)
+
+
+@wp.kernel
+def laplacian_triplets_symmetric(
+    edges: wp.array2d[wp.int32],
+    vertices: wp.array[wp.vec3],
+    equal_weight: wp.int32,
+    out_rows: wp.array[wp.int32],
+    out_cols: wp.array[wp.int32],
+    out_vals: wp.array[wp.float32],
+) -> None:
+    # Emits both directed pairs (a, b) and (b, a) from each unique undirected edge so the
+    # adjacency is symmetric, matching trimesh's ``vertex_neighbors``. Duplicate multiplicity
+    # cancels under row-normalization.
+    e = int(wp.tid())
+    a = edges[e, 0]
+    b = edges[e, 1]
+    w = edge_weight(a, b, vertices, equal_weight)
+    base = e * 2
+    out_rows[base + 0] = a
+    out_cols[base + 0] = b
+    out_vals[base + 0] = w
+    out_rows[base + 1] = b
+    out_cols[base + 1] = a
+    out_vals[base + 1] = w
+
+
+@wp.kernel
+def row_normalize(
+    offsets: wp.array[wp.int32],
+    out_values: wp.array[wp.float32],
+) -> None:
+    i = int(wp.tid())
+    start = offsets[i]
+    end = offsets[i + 1]
+    total = wp.float32(0.0)
+    for k in range(start, end):
+        total += out_values[k]
+    if total > wp.float32(0.0):
+        for k in range(start, end):
+            out_values[k] = out_values[k] / total
+
+
+@wp.kernel
+def apply_operator(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float32],
+    v_in: wp.array[wp.vec3d],
+    out_lv: wp.array[wp.vec3d],
+) -> None:
+    i = int(wp.tid())
+    start = offsets[i]
+    end = offsets[i + 1]
+    if end == start:
+        # Isolated vertex (empty row): the averaging operator acts as the identity so the
+        # vertex does not drift toward the origin.
+        out_lv[i] = v_in[i]
+        return
+    acc = wp.vec3d(0.0, 0.0, 0.0)
+    for k in range(start, end):
+        w = wp.float64(values[k])
+        acc += w * v_in[columns[k]]
+    out_lv[i] = acc
+
+
+@wp.kernel
+def lumped_mass(
+    faces: wp.array[wp.int32],
+    areas: wp.array[wp.float32],
+    out_mass: wp.array[wp.float32],
+) -> None:
+    # Barycentric (lumped) mass: each face donates a third of its area to each incident vertex.
+    f = int(wp.tid())
+    third = areas[f] / wp.float32(3.0)
+    wp.atomic_add(out_mass, faces[f * 3 + 0], third)
+    wp.atomic_add(out_mass, faces[f * 3 + 1], third)
+    wp.atomic_add(out_mass, faces[f * 3 + 2], third)
+
+
 @wp.kernel
 def cotmatrix_triplets(
     faces: wp.array[wp.int32],

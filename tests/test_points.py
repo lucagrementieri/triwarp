@@ -4,6 +4,17 @@ import trimesh.points as tm
 import warp as wp
 
 import triwarp.points as tw
+import triwarp.proximity as tw_proximity
+
+
+def _fibonacci_sphere(n: int) -> np.ndarray:
+    """Deterministic near-uniform points on the unit sphere (unique pairwise distances)."""
+    i = np.arange(n, dtype=np.float64)
+    phi = np.pi * (3.0 - np.sqrt(5.0))  # golden angle
+    z = 1.0 - 2.0 * (i + 0.5) / n
+    r = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+    theta = phi * i
+    return np.stack([r * np.cos(theta), r * np.sin(theta), z], axis=1)
 
 
 def test_point_plane_distance(device: str) -> None:
@@ -176,4 +187,69 @@ def test_radial_sort_parallel_start_raises(device: str) -> None:
             wp.vec3(*origin_np.tolist()),
             wp.vec3(*normal_np.tolist()),
             start=wp.vec3(*start_np.tolist()),
+        )
+
+
+def test_estimate_normals_matches_open3d(device: str) -> None:
+    o3d = pytest.importorskip("open3d")
+    knn = 30
+    points_np = _fibonacci_sphere(2000)
+
+    # Open3D reference: PCA normal from the k-nearest neighbourhood (KNN includes self).
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points_np)
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=knn))
+    normals_o3d = np.asarray(pcd.normals)
+
+    # triwarp: build the same k-neighbourhood (self + knn-1 = knn points total), then PCA.
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    neighbor_idx_wp, _ = tw_proximity.query_bvh_nearest(points_wp, points_wp, k=knn)
+    normals_wp = tw.estimate_normals(points_wp, neighbor_idx_wp)
+
+    # Both estimators fix the smallest-eigenvalue covariance eigenvector but leave the sign
+    # free, so compare up to sign. A few points may disagree on KNN ties; require the vast
+    # majority to align.
+    abs_dots = np.abs(np.einsum("ij,ij->i", normals_wp.numpy(), normals_o3d))
+    assert np.mean(abs_dots > 0.99) > 0.98
+
+
+def test_estimate_normals_orientation(device: str) -> None:
+    # Small negative slack: the kernel enforces the sign in float32, so a float64
+    # recomputation can dip just below zero at a zero-crossing.
+    tol = 1e-5
+    points_np = _fibonacci_sphere(1000)
+    centroid_np = points_np.mean(axis=0)
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    neighbor_idx_wp, _ = tw_proximity.query_bvh_nearest(points_wp, points_wp, k=20)
+
+    # Default: outward from the cloud centroid (the reference vector the kernel uses).
+    normals_default = tw.estimate_normals(points_wp, neighbor_idx_wp).numpy()
+    assert np.all(np.einsum("ij,ij->i", normals_default, points_np - centroid_np) >= -tol)
+
+    # Align with a fixed direction (Open3D orient_normals_to_align_with_direction).
+    reference_np = np.array([0.0, 0.0, 1.0])
+    normals_dir = tw.estimate_normals(
+        points_wp, neighbor_idx_wp, orient_reference=wp.vec3(*reference_np.tolist())
+    ).numpy()
+    assert np.all(normals_dir @ reference_np >= -tol)
+
+    # Toward a camera at the sphere centre (Open3D orient_normals_towards_camera_location):
+    # every normal points inward, i.e. opposite the outward position vector.
+    normals_cam = tw.estimate_normals(
+        points_wp, neighbor_idx_wp, camera_location=wp.vec3(0.0, 0.0, 0.0)
+    ).numpy()
+    assert np.all(np.einsum("ij,ij->i", normals_cam, points_np) <= tol)
+
+
+def test_estimate_normals_mutually_exclusive_orientation(device: str) -> None:
+    points_wp = wp.array(
+        _fibonacci_sphere(16).astype(np.float32), dtype=wp.vec3, device=device
+    )
+    neighbor_idx_wp, _ = tw_proximity.query_bvh_nearest(points_wp, points_wp, k=8)
+    with pytest.raises(ValueError, match=r"at most one"):
+        tw.estimate_normals(
+            points_wp,
+            neighbor_idx_wp,
+            orient_reference=wp.vec3(0.0, 0.0, 1.0),
+            camera_location=wp.vec3(0.0, 0.0, 0.0),
         )

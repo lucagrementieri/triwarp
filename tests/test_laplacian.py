@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 import trimesh as tm
+import trimesh.smoothing as tms
 import warp as wp
 
 import triwarp as tw
@@ -72,6 +73,57 @@ def test_cotmatrix_null_space(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     laplacian_wp = _bsr_to_csr(tw.laplacian.cotmatrix(mesh_wp.points, mesh_wp.indices))
     ones_wp = np.ones(int(mesh_wp.points.shape[0]), dtype=np.float32)
     assert np.linalg.norm(laplacian_wp @ ones_wp) < 1e-4
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parametrize("equal_weight", [True, False])
+def test_laplacian_operator(
+    request: pytest.FixtureRequest, mesh_name: str, equal_weight: bool
+) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+
+    operator_tm = tms.laplacian_calculation(mesh_tm, equal_weight=equal_weight).tocsr()
+    operator_wp = _bsr_to_csr(
+        tw.laplacian.laplacian(mesh_wp.points, mesh_wp.indices, equal_weight=equal_weight)
+    )
+
+    assert operator_wp.shape == operator_tm.shape
+    assert np.allclose(operator_wp.toarray(), operator_tm.toarray(), rtol=1e-5, atol=1e-5)
+
+
+def test_laplacian_symmetric_flag(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    # On an open mesh the directed and symmetric adjacencies differ; forcing ``symmetric``
+    # overrides the ``not equal_weight`` default, so uniform+symmetric is row-stochastic and
+    # symmetric while uniform+directed matches trimesh's (asymmetric) ``edges_to_coo``.
+    _, mesh_wp = half_torus
+    directed = _bsr_to_csr(
+        tw.laplacian.laplacian(mesh_wp.points, mesh_wp.indices, equal_weight=True, symmetric=False)
+    )
+    symmetric = _bsr_to_csr(
+        tw.laplacian.laplacian(mesh_wp.points, mesh_wp.indices, equal_weight=True, symmetric=True)
+    )
+
+    directed_dense = directed.toarray()
+    symmetric_dense = symmetric.toarray()
+    assert not np.allclose(directed_dense, symmetric_dense)
+    # Symmetric adjacency has a symmetric sparsity pattern; directed does not (open boundary).
+    assert np.array_equal(symmetric_dense != 0.0, (symmetric_dense != 0.0).T)
+    assert not np.array_equal(directed_dense != 0.0, (directed_dense != 0.0).T)
+    # Both operators are row-stochastic.
+    assert np.allclose(symmetric_dense.sum(axis=1), 1.0)
+    assert np.allclose(directed_dense.sum(axis=1), 1.0)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+def test_mass_matrix(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
+    faces_np = np.array(mesh_tm.faces, dtype=np.int64)
+
+    mass_igl = igl.massmatrix(vertices_np, faces_np, igl.MASSMATRIX_TYPE_BARYCENTRIC).diagonal()
+    mass_wp = tw.laplacian.mass_matrix_entries(mesh_wp.points, mesh_wp.indices)
+
+    assert np.allclose(mass_wp.numpy(), mass_igl, rtol=1e-5, atol=1e-5)
 
 
 def test_cotmatrix_empty_mesh(device: str) -> None:

@@ -182,6 +182,388 @@ def test_fill_holes_empty_mesh(device: str) -> None:
     assert int(new_faces.shape[0]) == 0
 
 
+# --- Minimum-weight hole triangulation (``fill_holes_min_weight``) ---------------------------
+
+_BAD = 1e10  # kernel ``BAD_METRIC``
+
+
+def _circumcircle_diameter(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    ab = float(np.dot(b - a, b - a))
+    ca = float(np.dot(a - c, a - c))
+    bc = float(np.dot(c - b, c - b))
+    if ab <= 0.0:
+        return float(np.sqrt(ca))
+    if ca <= 0.0:
+        return float(np.sqrt(bc))
+    if bc <= 0.0:
+        return float(np.sqrt(ab))
+    n = np.cross(b - a, c - a)
+    f = float(np.dot(n, n))
+    if f <= 0.0:
+        return np.inf
+    return float(np.sqrt(ab * ca * bc / f))
+
+
+def _triangle_aspect_ratio(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    bc = float(np.linalg.norm(c - b))
+    ca = float(np.linalg.norm(a - c))
+    ab = float(np.linalg.norm(b - a))
+    half_perimeter = (bc + ca + ab) * 0.5
+    den = 8.0 * (half_perimeter - bc) * (half_perimeter - ca) * (half_perimeter - ab)
+    if den <= 0.0:
+        return np.inf
+    return bc * ca * ab / den
+
+
+FILL_METRICS = [
+    "plane_normalized", "min_area", "circumscribed", "plane", "min_tri_angle",
+    "edge_length", "universal", "max_dihedral", "complex_fill",
+]
+_COMBINE_MAX = {"max_dihedral"}  # metrics that accumulate with max instead of sum
+
+
+def _min_triangle_angle_sin(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    ab = float(np.linalg.norm(b - a))
+    ca = float(np.linalg.norm(a - c))
+    bc = float(np.linalg.norm(c - b))
+    if ab <= 0.0 or ca <= 0.0 or bc <= 0.0:
+        return 0.0
+    return float(np.linalg.norm(np.cross(b - a, c - a)) * min(ab, ca, bc) / (ab * ca * bc))
+
+
+def _dihedral(left: np.ndarray, right: np.ndarray, edge: np.ndarray) -> float:
+    edge_dir = edge / np.linalg.norm(edge)
+    return float(np.arctan2(np.dot(edge_dir, np.cross(left, right)), np.dot(left, right)))
+
+
+def _tri_term(
+    a: np.ndarray, b: np.ndarray, c: np.ndarray, normal: np.ndarray, char_area: float, metric: str
+) -> float:
+    """Per-triangle term, pure-NumPy mirror of ``kernels.stitching.triangle_fill_metric``."""
+    a, b, c = (x.astype(np.float32) for x in (a, b, c))
+    if metric == "min_area":
+        return float(np.linalg.norm(np.cross(b - a, c - a)))
+    if metric == "circumscribed" or metric == "universal":
+        return _circumcircle_diameter(a, b, c)
+    if metric == "min_tri_angle":
+        return float(np.exp(25.0 * (0.86602540378443864676 - _min_triangle_angle_sin(a, b, c))))
+    if metric == "edge_length" or metric == "max_dihedral":
+        return 0.0
+    if metric == "complex_fill":
+        aspect_ratio = _triangle_aspect_ratio(a, b, c)
+        if aspect_ratio > _BAD:
+            return _BAD
+        return aspect_ratio + 100.0 * float(np.linalg.norm(np.cross(b - a, c - a))) * char_area
+    if metric == "plane":
+        if float(np.dot(normal.astype(np.float32), np.cross(b - a, c - a))) < 0.0:
+            return _BAD
+        return _circumcircle_diameter(a, b, c)
+    # plane_normalized
+    face_norm = np.cross(b - a, c - a)
+    face_dbl_area_sq = float(np.dot(face_norm, face_norm))
+    if face_dbl_area_sq == 0.0:
+        return _BAD
+    dot_res = float(np.dot(normal.astype(np.float32), face_norm))
+    if dot_res < 0.0 or dot_res * dot_res * 4.0 < face_dbl_area_sq:
+        return _BAD
+    aspect_ratio = _triangle_aspect_ratio(a, b, c)
+    if aspect_ratio > _BAD:
+        return _BAD
+    return _circumcircle_diameter(a, b, c) * aspect_ratio
+
+
+def _edge_term(
+    a: np.ndarray, b: np.ndarray, lft: np.ndarray, rgt: np.ndarray, metric: str
+) -> float:
+    """Per-edge term, pure-NumPy mirror of ``kernels.stitching.fill_edge_term``."""
+    a, b, lft, rgt = (x.astype(np.float32) for x in (a, b, lft, rgt))
+    if metric == "edge_length":
+        return float(np.linalg.norm(b - a))
+    ab = b - a
+    if metric == "universal":
+        norm_l = np.cross(lft - a, ab)
+        norm_r = np.cross(ab, rgt - a)
+        dbl_area = float(np.linalg.norm(norm_l) + np.linalg.norm(norm_r))
+        return float(np.sqrt(dbl_area) * np.exp(5.0 * abs(_dihedral(norm_l, norm_r, ab))))
+    if metric == "max_dihedral":
+        return abs(_dihedral(np.cross(lft - a, ab), np.cross(ab, rgt - a), ab))
+    if metric == "complex_fill":
+        norm_a = np.cross(rgt - b, -ab)
+        norm_c = np.cross(lft - a, ab)
+        denom = float(np.linalg.norm(norm_a) * np.linalg.norm(norm_c))
+        if denom == 0.0:
+            return _BAD
+        cos_ac = float(np.dot(norm_a, norm_c) / denom)
+        if cos_ac <= -1.0:
+            return _BAD
+        return ((1.0 - cos_ac) / (1.0 + cos_ac)) ** 4
+    return 0.0
+
+
+def _total_fill_metric(
+    vertices: wp.array, faces: wp.array, fill_flat: np.ndarray, metric: str
+) -> float:
+    """
+    Score a fill triangulation exactly as ``fill_dp_span`` accumulates it.
+
+    Validated against MeshLib's own ``calcCombinedFillMetric``: per-triangle terms plus per-edge
+    (dihedral) terms — interior edges use both adjacent fill apexes, rim edges the existing face's
+    opposite vertex (``smoothBd``).
+    """
+    from collections import defaultdict
+
+    vertices_np = vertices.numpy()
+    fill = fill_flat.reshape(-1, 3)
+    is_max = metric in _COMBINE_MAX
+
+    loops = _fillable_loops(vertices, faces)
+    loop_of: dict[int, int] = {}
+    normals: list[np.ndarray] = []
+    char_areas: list[float] = []
+    for li, loop_wp in enumerate(loops):
+        loop = loop_wp.numpy()
+        for vtx in loop:
+            loop_of[int(vtx)] = li
+        loop_pos = tw.array.gather(vertices, loop_wp)
+        normals.append(np.asarray(tw.polyline.closed_polyline_normal(loop_pos)))
+        pos = vertices_np[loop]
+        rim = np.roll(pos, -1, axis=0) - pos
+        max_sq = float(np.max(np.einsum("ij,ij->i", rim, rim)))
+        char_areas.append(1.0 / max_sq if max_sq > 0.0 else 1.0)
+
+    def edge_map(triangles: np.ndarray) -> dict[tuple[int, int], list[int]]:
+        out: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for tri in triangles:
+            a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+            for u, v, w in ((a, b, c), (b, c, a), (a, c, b)):
+                out[(u, v) if u < v else (v, u)].append(w)
+        return out
+
+    fill_apex = edge_map(fill)
+    orig_third = edge_map(faces.numpy().reshape(-1, 3))
+
+    total = 0.0
+    for tri in fill:
+        li = loop_of[int(tri[0])]
+        a, b, c = (vertices_np[int(x)] for x in tri)
+        # Emitted triangles are reverse-wound vs. the DP scoring; take the accepted orientation.
+        term = min(
+            _tri_term(a, b, c, normals[li], char_areas[li], metric),
+            _tri_term(a, c, b, normals[li], char_areas[li], metric),
+        )
+        total = max(total, term) if is_max else total + term
+    for edge, apexes in fill_apex.items():
+        pa, pb = vertices_np[edge[0]], vertices_np[edge[1]]
+        if len(apexes) == 2:
+            left, right = vertices_np[apexes[0]], vertices_np[apexes[1]]
+        elif len(apexes) == 1:
+            others = orig_third.get(edge, [])
+            if len(others) != 1:
+                continue
+            left, right = vertices_np[others[0]], vertices_np[apexes[0]]
+        else:
+            continue
+        term = _edge_term(pa, pb, left, right, metric)
+        total = max(total, term) if is_max else total + term
+    return total
+
+
+def _meshlib_fill_triangles(vertices: wp.array, faces: wp.array, metric: str) -> np.ndarray:
+    """
+    Fill triangles produced by MeshLib's ``fillHole`` for the same metric, as a flat vertex buffer.
+
+    ``maxPolygonSubdivisions`` is raised so MeshLib runs the exhaustive DP (no large-hole
+    sub-sampling), matching [`fill_holes_min_weight`]'s full search. fillHole reuses existing
+    vertices, so the new faces are those not present in the original triangle set.
+    """
+    mr = pytest.importorskip("meshlib.mrmeshpy")
+    mn = pytest.importorskip("meshlib.mrmeshnumpy")
+    make_metric = {
+        "plane_normalized": lambda m, e: mr.getPlaneNormalizedFillMetric(m, e),
+        "min_area": lambda m, e: mr.getMinAreaMetric(m),
+        "circumscribed": lambda m, e: mr.getCircumscribedMetric(m),
+        "plane": lambda m, e: mr.getPlaneFillMetric(m, e),
+        "min_tri_angle": lambda m, e: mr.getMinTriAngleMetric(m),
+        "edge_length": lambda m, e: mr.getEdgeLengthFillMetric(m),
+        "universal": lambda m, e: mr.getUniversalMetric(m),
+        "max_dihedral": lambda m, e: mr.getMaxDihedralAngleMetric(m),
+        "complex_fill": lambda m, e: mr.getComplexFillMetric(m, e),
+    }[metric]
+    vertices_np = np.ascontiguousarray(vertices.numpy(), dtype=np.float32)
+    faces_np = np.ascontiguousarray(faces.numpy().reshape(-1, 3), dtype=np.int32)
+    mesh = mn.meshFromFacesVerts(faces_np, vertices_np)
+    params = mr.FillHoleParams()
+    params.maxPolygonSubdivisions = 1000
+    for edge in mesh.topology.findHoleRepresentiveEdges():
+        params.metric = make_metric(mesh, edge)
+        mr.fillHole(mesh, edge, params)
+    faces_out = mn.getNumpyFaces(mesh.topology)
+    original = {tuple(sorted(int(x) for x in tri)) for tri in faces_np}
+    fill = [tri for tri in faces_out if tuple(sorted(int(x) for x in tri)) not in original]
+    return np.asarray(fill, dtype=np.int32).reshape(-1)
+
+
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+@pytest.mark.parametrize("metric", FILL_METRICS)
+def test_fill_holes_min_weight_matches_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str, metric: str
+) -> None:
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    n_orig = int(mesh_wp.indices.shape[0])
+
+    tw_fill = tw.stitching.fill_holes_min_weight(
+        mesh_wp.points, mesh_wp.indices, metric=metric
+    ).numpy()[n_orig:]
+    ml_fill = _meshlib_fill_triangles(mesh_wp.points, mesh_wp.indices, metric)
+
+    # Same triangle count and same achieved optimum as MeshLib's exhaustive fillHole (the exact
+    # triangulation can differ under ties / MeshLib's tie-breaking, so compare the cost).
+    assert len(tw_fill) // 3 == len(ml_fill) // 3
+    tw_total = _total_fill_metric(mesh_wp.points, mesh_wp.indices, tw_fill, metric)
+    ml_total = _total_fill_metric(mesh_wp.points, mesh_wp.indices, ml_fill, metric)
+    assert np.isclose(tw_total, ml_total, rtol=2e-3, atol=1e-3)
+
+
+def test_fill_metric_scorer_matches_meshlib(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Anchor ``_total_fill_metric`` to MeshLib's own ``calcCombinedFillMetric`` (single-hole mesh).
+
+    Validates that the test-side scorer used by ``test_fill_holes_min_weight_matches_meshlib`` truly
+    computes each MeshLib metric, for the metrics that expose a triangle term
+    (``calcCombinedFillMetric`` cannot score the edge-only metrics — it always calls
+    ``triangleMetric``, which is empty for them).
+    """
+    mr = pytest.importorskip("meshlib.mrmeshpy")
+    mn = pytest.importorskip("meshlib.mrmeshnumpy")
+    _, mesh_wp = hemisphere
+    faces_np = np.ascontiguousarray(mesh_wp.indices.numpy().reshape(-1, 3), dtype=np.int32)
+    verts_np = np.ascontiguousarray(mesh_wp.points.numpy(), dtype=np.float32)
+    make_metric = {
+        "plane_normalized": lambda m, e: mr.getPlaneNormalizedFillMetric(m, e),
+        "min_area": lambda m, e: mr.getMinAreaMetric(m),
+        "circumscribed": lambda m, e: mr.getCircumscribedMetric(m),
+        "plane": lambda m, e: mr.getPlaneFillMetric(m, e),
+        "min_tri_angle": lambda m, e: mr.getMinTriAngleMetric(m),
+        "universal": lambda m, e: mr.getUniversalMetric(m),
+        "complex_fill": lambda m, e: mr.getComplexFillMetric(m, e),
+    }
+    for metric, factory in make_metric.items():
+        fill = tw.stitching.fill_holes_min_weight(
+            mesh_wp.points, mesh_wp.indices, metric=metric
+        ).numpy()[faces_np.size :].reshape(-1, 3)
+        mesh_orig = mn.meshFromFacesVerts(faces_np, verts_np)
+        metric_obj = factory(mesh_orig, mesh_orig.topology.findHoleRepresentiveEdges()[0])
+        full = np.vstack([faces_np, fill]).astype(np.int32)
+        mesh_full = mn.meshFromFacesVerts(np.ascontiguousarray(full, np.int32), verts_np)
+        region_bools = np.zeros(len(full), dtype=bool)
+        region_bools[len(faces_np):] = True
+        region = mn.faceBitSetFromBools(region_bools)
+        mr_cost = mr.calcCombinedFillMetric(mesh_full, region, metric_obj)
+        my_cost = _total_fill_metric(mesh_wp.points, mesh_wp.indices, fill.reshape(-1), metric)
+        assert np.isclose(my_cost, mr_cost, rtol=2e-3, atol=1e-3), metric
+
+
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+@pytest.mark.parametrize("metric", FILL_METRICS)
+def test_fill_holes_min_weight_watertight(
+    request: pytest.FixtureRequest, mesh_name: str, metric: str
+) -> None:
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    loop_sizes = _loop_sizes(mesh_wp)
+
+    filled_faces = tw.stitching.fill_holes_min_weight(
+        mesh_wp.points, mesh_wp.indices, metric=metric
+    )
+
+    # No vertices added; every hole sealed with exactly B - 2 triangles.
+    n_new_faces = (int(filled_faces.shape[0]) - int(mesh_wp.indices.shape[0])) // 3
+    assert n_new_faces == sum(size - 2 for size in loop_sizes)
+
+    # Topologically closed and consistently wound (triwarp's own is_watertight false-positives on
+    # coplanar/curved caps via its self-intersection test, so trimesh is the watertight oracle).
+    assert tw.characteristics.is_edge_manifold(filled_faces, allow_boundary_edges=False)
+    assert tw.characteristics.is_winding_consistent(filled_faces)
+    assert len(_loop_sizes_of(mesh_wp.points, filled_faces)) == 0
+    filled_tm = tm.Trimesh(
+        vertices=mesh_wp.points.numpy(), faces=filled_faces.numpy().reshape(-1, 3), process=False
+    )
+    assert filled_tm.is_watertight
+    assert filled_tm.is_winding_consistent
+
+
+def test_fill_holes_min_weight_optimal_vs_fan(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _, mesh_wp = hemisphere
+    # Single-loop fixture: the DP minimizes the plane-normalized objective over all triangulations,
+    # and the fan is one such triangulation, so the min-weight total must not exceed the fan's.
+    n_orig = int(mesh_wp.indices.shape[0])
+    fan_fill = tw.stitching.fill_holes_fan(mesh_wp.points, mesh_wp.indices).numpy()[n_orig:]
+    mw_fill = tw.stitching.fill_holes_min_weight(mesh_wp.points, mesh_wp.indices).numpy()[n_orig:]
+
+    fan_total = _total_fill_metric(mesh_wp.points, mesh_wp.indices, fan_fill, "plane_normalized")
+    mw_total = _total_fill_metric(mesh_wp.points, mesh_wp.indices, mw_fill, "plane_normalized")
+    assert mw_total <= fan_total + 1e-4
+
+
+def test_fill_holes_min_weight_avoids_multiple_edges(device: str) -> None:
+    # Two triangles sharing edge (0, 2); the boundary loop 0-1-2-3 has 0-2 as a pre-existing chord.
+    vertices = wp.array(
+        [[0.0, 0.0, 0.0], [0.5, 2.0, 0.0], [1.0, 0.0, 0.0], [0.5, -2.0, 0.0]],
+        dtype=wp.vec3,
+        device=device,
+    )
+    faces = wp.array([0, 1, 2, 0, 2, 3], dtype=wp.int32, device=device)
+
+    def edge_face_count(faces_flat: np.ndarray, u: int, v: int) -> int:
+        return int(sum({u, v} <= set(tri) for tri in faces_flat.reshape(-1, 3).tolist()))
+
+    resolved = tw.stitching.fill_holes_min_weight(vertices, faces, resolve_multiple_edges=True)
+    # The forbidden diagonal (0, 2) keeps its two original faces; the other diagonal is used.
+    assert edge_face_count(resolved.numpy(), 0, 2) == 2
+    assert tw.characteristics.is_edge_manifold(resolved, allow_boundary_edges=True)
+
+    unresolved = tw.stitching.fill_holes_min_weight(vertices, faces, resolve_multiple_edges=False)
+    # Free to reuse the geometrically preferred diagonal (0, 2), creating a non-manifold edge.
+    assert edge_face_count(unresolved.numpy(), 0, 2) == 4
+    assert not tw.characteristics.is_edge_manifold(unresolved, allow_boundary_edges=True)
+
+
+def test_fill_holes_min_weight_watertight_mesh_unchanged(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    _, mesh_wp = icosahedron
+    filled_faces = tw.stitching.fill_holes_min_weight(mesh_wp.points, mesh_wp.indices)
+    assert np.array_equal(filled_faces.numpy(), mesh_wp.indices.numpy())
+
+
+def test_fill_holes_min_weight_preserve_largest(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _, mesh_wp = half_torus
+    loop_sizes = _loop_sizes(mesh_wp)
+    perimeters = _loop_perimeters_of(mesh_wp.points, mesh_wp.indices)
+    assert len(loop_sizes) >= 2
+    preserved_size = loop_sizes[int(np.argmax(perimeters))]
+
+    filled_faces = tw.stitching.fill_holes_min_weight(
+        mesh_wp.points, mesh_wp.indices, preserve_largest_hole=True
+    )
+    n_new_faces = (int(filled_faces.shape[0]) - int(mesh_wp.indices.shape[0])) // 3
+    assert n_new_faces == sum(size - 2 for size in loop_sizes) - (preserved_size - 2)
+    assert len(_loop_sizes_of(mesh_wp.points, filled_faces)) == 1
+
+
+def test_fill_holes_min_weight_empty_mesh(device: str) -> None:
+    vertices = wp.empty(0, dtype=wp.vec3, device=device)
+    faces = wp.empty(0, dtype=wp.int32, device=device)
+    assert int(tw.stitching.fill_holes_min_weight(vertices, faces).shape[0]) == 0
+
+
+def test_fill_holes_min_weight_rejects_unknown_metric(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    _, mesh_wp = hemisphere
+    with pytest.raises(ValueError, match="metric must be one of"):
+        tw.stitching.fill_holes_min_weight(mesh_wp.points, mesh_wp.indices, metric="bogus")
+
+
 # --- Boundary stitching (``triangulate_boundaries`` / ``stitch``) ----------------------------
 
 
@@ -424,3 +806,110 @@ def test_non_increasing_indices() -> None:
 
     # A strictly sorted sequence needs no correction.
     assert _non_increasing_indices(np.arange(6, dtype=np.int64)).size == 0
+
+
+# --- Minimum-weight stitching (``stitch_min_weight`` / ``triangulate_boundaries_min_weight``) ---
+
+STITCH_METRICS = ["complex_stitch", "edge_length_stitch", "vertical"]
+# complex_stitch (aspect + dihedral) and vertical (area/normal) are winding-invariant, so MeshLib's
+# calcCombinedFillMetric re-scores them exactly; edge_length_stitch's |c-a| term is winding-order
+# sensitive, so it is checked structurally only.
+STITCH_COST_METRICS = ["complex_stitch", "vertical"]
+
+
+def _meshlib_stitch_band(
+    va_np: np.ndarray, fa_np: np.ndarray, vb_np: np.ndarray, fb_np: np.ndarray, metric: str
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """MeshLib ``stitchHoles`` band for the same metric; returns ``(verts, orig_faces, band)``."""
+    mr = pytest.importorskip("meshlib.mrmeshpy")
+    mn = pytest.importorskip("meshlib.mrmeshnumpy")
+    make_metric = {
+        "complex_stitch": lambda m: mr.getComplexStitchMetric(m),
+        "edge_length_stitch": lambda m: mr.getEdgeLengthStitchMetric(m),
+        "vertical": lambda m: mr.getVerticalStitchMetric(m, mr.Vector3f(0.0, 0.0, 1.0)),
+    }[metric]
+    verts = np.ascontiguousarray(np.vstack([va_np, vb_np]), dtype=np.float32)
+    orig = np.ascontiguousarray(np.vstack([fa_np, fb_np + len(va_np)]), dtype=np.int32)
+    mesh = mn.meshFromFacesVerts(orig, verts)
+    edges = mesh.topology.findHoleRepresentiveEdges()
+    params = mr.StitchHolesParams()
+    params.metric = make_metric(mesh)
+    mr.stitchHoles(mesh, edges[0], edges[1], params)
+    faces_out = mn.getNumpyFaces(mesh.topology)
+    original = {tuple(sorted(int(x) for x in t)) for t in orig}
+    band = np.array(
+        [t for t in faces_out if tuple(sorted(int(x) for x in t)) not in original], np.int32
+    )
+    return verts, orig, band
+
+
+def _meshlib_stitch_cost(
+    verts: np.ndarray, orig: np.ndarray, band: np.ndarray, metric: str
+) -> float:
+    mr = pytest.importorskip("meshlib.mrmeshpy")
+    mn = pytest.importorskip("meshlib.mrmeshnumpy")
+    make_metric = {
+        "complex_stitch": lambda m: mr.getComplexStitchMetric(m),
+        "vertical": lambda m: mr.getVerticalStitchMetric(m, mr.Vector3f(0.0, 0.0, 1.0)),
+    }[metric]
+    verts = np.ascontiguousarray(verts, dtype=np.float32)
+    mesh_orig = mn.meshFromFacesVerts(np.ascontiguousarray(orig, np.int32), verts)
+    metric_obj = make_metric(mesh_orig)
+    full = np.ascontiguousarray(np.vstack([orig, band]), dtype=np.int32)
+    mesh_full = mn.meshFromFacesVerts(full, verts)
+    region_bools = np.zeros(len(full), dtype=bool)
+    region_bools[len(orig):] = True
+    region = mn.faceBitSetFromBools(region_bools)
+    return mr.calcCombinedFillMetric(mesh_full, region, metric_obj)
+
+
+@pytest.mark.parametrize(("n_a", "n_b"), [(9, 13), (16, 11), (8, 8)])
+@pytest.mark.parametrize("metric", STITCH_METRICS)
+def test_stitch_min_weight_watertight(device: str, n_a: int, n_b: int, metric: str) -> None:
+    (_, _, va, fa), (_, _, vb, fb) = _capsule_halves(device, n_a, n_b)
+
+    new_vertices, new_faces = tw.stitching.stitch_min_weight(va, fa, vb, fb, metric=metric)
+
+    # A band of exactly n_a + n_b triangles over the existing vertices, closing the two rims.
+    n_band = (int(new_faces.shape[0]) - int(fa.shape[0]) - int(fb.shape[0])) // 3
+    assert n_band == n_a + n_b
+    assert int(new_vertices.shape[0]) == int(va.shape[0]) + int(vb.shape[0])
+    assert tw.characteristics.is_winding_consistent(new_faces)
+    filled_tm = tm.Trimesh(
+        vertices=new_vertices.numpy(), faces=new_faces.numpy().reshape(-1, 3), process=False
+    )
+    assert filled_tm.is_watertight
+
+
+@pytest.mark.parametrize(("n_a", "n_b"), [(9, 13), (16, 11)])
+@pytest.mark.parametrize("metric", STITCH_COST_METRICS)
+def test_stitch_min_weight_matches_meshlib(device: str, n_a: int, n_b: int, metric: str) -> None:
+    (va_np, fa_np, va, fa), (vb_np, fb_np, vb, fb) = _capsule_halves(device, n_a, n_b)
+
+    new_vertices, new_faces = tw.stitching.stitch_min_weight(va, fa, vb, fb, metric=metric)
+    n_orig = int(fa.shape[0]) + int(fb.shape[0])  # flat length of the two original face buffers
+    band_tw = new_faces.numpy()[n_orig:].reshape(-1, 3)
+    fa_rows, fb_rows = fa_np.reshape(-1, 3), fb_np.reshape(-1, 3)
+    orig_tw = np.vstack([fa_rows, fb_rows + len(va_np)]).astype(np.int32)
+
+    verts_ml, orig_ml, band_ml = _meshlib_stitch_band(va_np, fa_rows, vb_np, fb_rows, metric)
+
+    # triwarp reaches MeshLib's exhaustive stitchHoles optimum (compare cost, not exact triangles).
+    cost_tw = _meshlib_stitch_cost(new_vertices.numpy(), orig_tw, band_tw, metric)
+    cost_ml = _meshlib_stitch_cost(verts_ml, orig_ml, band_ml, metric)
+    assert np.isclose(cost_tw, cost_ml, rtol=3e-3, atol=1e-3)
+
+
+def test_stitch_min_weight_requires_single_boundary(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    _, mesh_wp = icosahedron
+    _, _, vb, fb = _cone_wp(device=mesh_wp.device, n=8, apex_z=1.0, rim_z=0.5)
+    with pytest.raises(ValueError, match="exactly one boundary loop"):
+        tw.stitching.stitch_min_weight(mesh_wp.points, mesh_wp.indices, vb, fb)
+
+
+def test_stitch_min_weight_rejects_unknown_metric(device: str) -> None:
+    (_, _, va, fa), (_, _, vb, fb) = _capsule_halves(device, 8, 8)
+    with pytest.raises(ValueError, match="metric must be one of"):
+        tw.stitching.stitch_min_weight(va, fa, vb, fb, metric="bogus")

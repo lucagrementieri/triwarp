@@ -43,5 +43,5 @@ Full API reference: <https://lucagrementieri.github.io/triwarp/>
 ```bash
 uv sync --extra dev --extra test --extra docs
 uv run pytest
-uv run mkdocs serve
+DISABLE_MKDOCS_2_WARNING=true uv run mkdocs serve
 ```

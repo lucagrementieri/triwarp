@@ -122,6 +122,27 @@ def test_boundary_loops(request: pytest.FixtureRequest, mesh_name: str) -> None:
         assert np.array_equal(loop_wp.numpy(), np.asarray(loop_igl))
 
 
+def test_boundary_loops_non_manifold_terminates(device: str) -> None:
+    # A "bowtie" (two triangles sharing a single pinch vertex) has a vertex-non-manifold boundary:
+    # the boundary successor chain is not one simple cycle, so vertex 2 gets two outgoing edges and
+    # only one survives (last write wins). boundary_loops must still terminate -- the successor walk
+    # in ``rank_loop_positions`` is bounded -- rather than spin forever on the device (regression).
+    vertices_wp = wp.array(
+        np.array(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 1.0, 0.0], [2.0, 2.0, 0.0]],
+            dtype=np.float32,
+        ),
+        dtype=wp.vec3,
+        device=device,
+    )
+    faces_wp = wp.array(np.array([0, 1, 2, 2, 3, 4], dtype=np.int32), dtype=wp.int32, device=device)
+
+    loops_wp = tw.boundary.boundary_loops(vertices_wp, faces_wp)
+
+    # Completes without hanging; the boundary vertices are distributed across the returned loops.
+    assert sum(int(loop.shape[0]) for loop in loops_wp) >= 1
+
+
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
 def test_boundary_loop(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)

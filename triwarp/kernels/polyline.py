@@ -37,6 +37,23 @@ def project_point_to_plane(p: wp.vec3, origin: wp.vec3, unit_normal: wp.vec3) ->
     return p - unit_normal * wp.dot(p - origin, unit_normal)
 
 
+@wp.func
+def line_squared_distance(
+    p: wp.vec3, s: wp.vec3, d: wp.vec3, seg_sq_len: wp.float32
+) -> wp.float32:
+    """Squared perpendicular distance from ``p`` to the infinite line ``s -> d``.
+
+    Mirrors ``igl::project_to_line`` with an **unclamped** parameter ``t`` (distance to the
+    line, not the segment). ``seg_sq_len`` is the precomputed ``dot(d - s, d - s)``.
+    """
+    dms = d - s
+    smp = s - p
+    t = -wp.dot(dms, smp) / seg_sq_len
+    proj = (1.0 - t) * s + t * d
+    diff = p - proj
+    return wp.dot(diff, diff)
+
+
 @wp.kernel
 def segment_lengths(polyline: wp.array[wp.vec3], out_lengths: wp.array[wp.float32]) -> None:
     i = int(wp.tid())
@@ -142,6 +159,57 @@ def greedy_downsample_mask(
         if cumulative_lengths[i] - last >= step_size:
             out_keep[i] = True
             last = cumulative_lengths[i]
+
+
+RDP_LINE_EPS = wp.constant(wp.float32(1.0e-7))  # libigl FLOAT_EPS: degenerate-segment threshold
+
+
+@wp.kernel
+def rdp_keep_mask(
+    polyline: wp.array[wp.vec3],
+    stol: wp.float32,
+    stack: wp.array[wp.int32],
+    out_keep: wp.array[wp.bool],
+) -> None:
+    # Single thread (dim == 1): iterative Ramer-Douglas-Peucker over an explicit stack of
+    # (ixs, ixe) index ranges, since Warp forbids recursion. ``stack`` is scratch holding the
+    # ranges interleaved; its size must be >= max(2 * n, 2). The first and last vertices are
+    # always kept; interior vertices closer than sqrt(stol) to their bracketing chord are dropped.
+    n = polyline.shape[0]
+    for i in range(n):
+        out_keep[i] = True
+    stack[0] = 0
+    stack[1] = n - 1
+    top = int(1)  # number of (ixs, ixe) pairs currently on the stack
+    while top > 0:
+        top -= 1
+        ixs = stack[2 * top + 0]
+        ixe = stack[2 * top + 1]
+        sdmax = float(0.0)
+        ixc = int(-1)
+        if ixe - ixs > 1:
+            seg = polyline[ixe] - polyline[ixs]
+            sdes = wp.dot(seg, seg)
+            for k in range(ixs + 1, ixe):
+                sd = float(0.0)  # initialize before branching (variable scope rule)
+                if sdes <= RDP_LINE_EPS:
+                    dvec = polyline[k] - polyline[ixs]
+                    sd = wp.dot(dvec, dvec)
+                else:
+                    sd = line_squared_distance(polyline[k], polyline[ixs], polyline[ixe], sdes)
+                if sd > sdmax:  # strict '>' keeps the first argmax, matching Eigen maxCoeff
+                    sdmax = sd
+                    ixc = k
+        if sdmax <= stol:
+            for k in range(ixs + 1, ixe):  # empty range when there are no interior points
+                out_keep[k] = False
+        else:
+            stack[2 * top + 0] = ixs
+            stack[2 * top + 1] = ixc
+            top += 1
+            stack[2 * top + 0] = ixc
+            stack[2 * top + 1] = ixe
+            top += 1
 
 
 @wp.kernel
