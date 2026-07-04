@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.constants import TOLERANCE_MERGE_CONSTANT
+from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.array import binary_search_index, vector_angle_vec
 
 
@@ -192,3 +192,201 @@ def radius_segment_distances(
     a = project_point_to_plane(polyline[i], center, unit_normal)
     b = project_point_to_plane(polyline[i + 1], center, unit_normal)
     out_distances[i] = wp.length(closest_point_on_segment(a, b, center) - center)
+
+
+# --- polygon triangulation (parallel ear clipping); port of libigl ear_clipping.cpp ---
+
+
+@wp.func
+def orient2d(a: wp.vec2, b: wp.vec2, c: wp.vec2) -> wp.int32:
+    """Sign of the 2D cross product ``(b - a) x (c - a)``: ``+1`` CCW, ``-1`` CW, ``0`` collinear."""
+    det = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    if det > TOLERANCE_ZERO_CONSTANT:
+        return wp.int32(1)
+    if det < -TOLERANCE_ZERO_CONSTANT:
+        return wp.int32(-1)
+    return wp.int32(0)
+
+
+@wp.func
+def point_in_triangle(a: wp.vec2, b: wp.vec2, c: wp.vec2, p: wp.vec2) -> wp.bool:
+    """Whether ``p`` lies inside or on the boundary of the CCW triangle ``(a, b, c)``.
+
+    Boundary inclusion matters for the ear test: a (reflex) vertex lying exactly on a candidate
+    ear's cutting diagonal must block that ear, otherwise a degenerate/overlapping triangle is
+    emitted.
+    """
+    return (
+        orient2d(a, b, p) >= 0 and orient2d(b, c, p) >= 0 and orient2d(c, a, p) >= 0
+    )
+
+
+@wp.func
+def is_ear_at(
+    points2d: wp.array[wp.vec2],
+    left: wp.array[wp.int32],
+    right: wp.array[wp.int32],
+    active: wp.array[wp.int32],
+    i: wp.int32,
+    n: wp.int32,
+) -> wp.bool:
+    # Corner (a, i, b) is an ear iff it is strictly convex and no other active vertex lies
+    # strictly inside triangle (a, i, b). Equivalent to libigl's edge-intersection walk for a
+    # simple polygon, but simpler to evaluate in parallel per corner.
+    a = left[i]
+    b = right[i]
+    if a == b or a == i or b == i:
+        return False
+    pa = points2d[a]
+    pi = points2d[i]
+    pb = points2d[b]
+    if orient2d(pa, pi, pb) <= 0:
+        return False
+    # Walk the remaining ring from R[b] up to a, skipping the ear's own vertices.
+    j = right[b]
+    while j != a:
+        if active[j] == 1 and j != i and point_in_triangle(pa, pi, pb, points2d[j]):
+            return False
+        j = right[j]
+    return True
+
+
+@wp.kernel
+def project_to_plane_2d(
+    polyline: wp.array[wp.vec3],
+    center: wp.vec3,
+    u: wp.vec3,
+    v: wp.vec3,
+    out_points2d: wp.array[wp.vec2],
+) -> None:
+    i = int(wp.tid())
+    d = polyline[i] - center
+    out_points2d[i] = wp.vec2(wp.dot(d, u), wp.dot(d, v))
+
+
+@wp.kernel
+def accumulate_turning_angle(
+    points2d: wp.array[wp.vec2], out_total: wp.array[wp.float32]
+) -> None:
+    # Cyclic signed exterior angle at each vertex; the sum's sign gives the loop orientation.
+    i = int(wp.tid())
+    n = points2d.shape[0]
+    current = points2d[i]
+    nxt = points2d[(i + 1) % n]
+    after = points2d[(i + 2) % n]
+    d1 = nxt - current
+    d2 = after - nxt
+    angle = wp.atan2(d1[0] * d2[1] - d1[1] * d2[0], d1[0] * d2[0] + d1[1] * d2[1])
+    wp.atomic_add(out_total, 0, angle)
+
+
+@wp.kernel
+def orient_ccw(points2d: wp.array[wp.vec2]) -> None:
+    # Mirror the y-axis to flip a clockwise loop to counter-clockwise (replaces libigl's row
+    # reversal); the convex/ear tests assume CCW orientation.
+    i = int(wp.tid())
+    p = points2d[i]
+    points2d[i] = wp.vec2(p[0], -p[1])
+
+
+@wp.kernel
+def count_reflex(points2d: wp.array[wp.vec2], out_count: wp.array[wp.int32]) -> None:
+    # Pre-clip the ring is trivial, so use direct cyclic neighbours. Convex polygon <=> 0 reflex.
+    i = int(wp.tid())
+    n = points2d.shape[0]
+    prev = points2d[(i - 1 + n) % n]
+    cur = points2d[i]
+    nxt = points2d[(i + 1) % n]
+    if orient2d(prev, cur, nxt) < 0:
+        wp.atomic_add(out_count, 0, 1)
+
+
+@wp.kernel
+def fan_triangulate(out_faces: wp.array2d[wp.int32]) -> None:
+    # Convex fast-path: fan from vertex 0. dim == n - 2.
+    k = int(wp.tid())
+    out_faces[k, 0] = wp.int32(0)
+    out_faces[k, 1] = k + 1
+    out_faces[k, 2] = k + 2
+
+
+@wp.kernel
+def init_ring(
+    left: wp.array[wp.int32], right: wp.array[wp.int32], active: wp.array[wp.int32]
+) -> None:
+    i = int(wp.tid())
+    n = left.shape[0]
+    left[i] = (i - 1 + n) % n
+    right[i] = (i + 1) % n
+    active[i] = wp.int32(1)
+
+
+@wp.kernel
+def compute_ears(
+    points2d: wp.array[wp.vec2],
+    left: wp.array[wp.int32],
+    right: wp.array[wp.int32],
+    active: wp.array[wp.int32],
+    out_is_ear: wp.array[wp.int32],
+) -> None:
+    i = int(wp.tid())
+    n = points2d.shape[0]
+    if active[i] == 0:
+        out_is_ear[i] = wp.int32(0)
+        return
+    if is_ear_at(points2d, left, right, active, i, n):
+        out_is_ear[i] = wp.int32(1)
+    else:
+        out_is_ear[i] = wp.int32(0)
+
+
+@wp.kernel
+def select_independent(
+    is_ear: wp.array[wp.int32],
+    left: wp.array[wp.int32],
+    right: wp.array[wp.int32],
+    out_selected: wp.array[wp.int32],
+) -> None:
+    # Select ear i iff it has the smallest index among ears within ring-distance 2. This keeps
+    # chosen ears >= 3 apart, so their clip footprints {L[i], i, R[i]} are disjoint and can be
+    # clipped concurrently. The global-min-index ear is always selected, guaranteeing progress.
+    i = int(wp.tid())
+    out_selected[i] = wp.int32(0)
+    if is_ear[i] == 0:
+        return
+    ll = left[left[i]]
+    l = left[i]
+    r = right[i]
+    rr = right[right[i]]
+    if is_ear[ll] == 1 and ll < i:
+        return
+    if is_ear[l] == 1 and l < i:
+        return
+    if is_ear[r] == 1 and r < i:
+        return
+    if is_ear[rr] == 1 and rr < i:
+        return
+    out_selected[i] = wp.int32(1)
+
+
+@wp.kernel
+def clip_selected(
+    selected: wp.array[wp.int32],
+    left: wp.array[wp.int32],
+    right: wp.array[wp.int32],
+    active: wp.array[wp.int32],
+    out_faces: wp.array2d[wp.int32],
+    out_count: wp.array[wp.int32],
+) -> None:
+    i = int(wp.tid())
+    if selected[i] == 0:
+        return
+    a = left[i]
+    b = right[i]
+    slot = wp.atomic_add(out_count, 0, 1)
+    out_faces[slot, 0] = a
+    out_faces[slot, 1] = i
+    out_faces[slot, 2] = b
+    active[i] = wp.int32(0)
+    right[a] = b
+    left[b] = a

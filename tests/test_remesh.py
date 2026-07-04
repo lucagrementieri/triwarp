@@ -161,8 +161,7 @@ def test_subdivide_to_size_reference_mixed(device: str) -> None:
     faces_mapped = np.sort(wp_to_ref[new_f_np], axis=1)
     faces_ref = np.sort(ref_f, axis=1)
     assert np.array_equal(
-        faces_mapped[np.lexsort(faces_mapped.T[::-1])],
-        faces_ref[np.lexsort(faces_ref.T[::-1])],
+        faces_mapped[np.lexsort(faces_mapped.T[::-1])], faces_ref[np.lexsort(faces_ref.T[::-1])]
     )
 
     hist_wp = np.bincount(index_wp.numpy(), minlength=mesh_tm.faces.shape[0])
@@ -172,7 +171,9 @@ def test_subdivide_to_size_reference_mixed(device: str) -> None:
 
 @pytest.mark.parametrize("mesh_name", _MESH_FIXTURES)
 @pytest.mark.parametrize("frac", [0.75, 0.5, 0.3])
-def test_subdivide_to_size_max_edge(mesh_name: str, frac: float, request: pytest.FixtureRequest) -> None:
+def test_subdivide_to_size_max_edge(
+    mesh_name: str, frac: float, request: pytest.FixtureRequest
+) -> None:
     """Every edge is at most ``max_edge`` after subdivision (the defining property)."""
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     max_edge = frac * tw.edges.mean_edge_length(mesh_wp.points, mesh_wp.indices)
@@ -242,9 +243,7 @@ def test_subdivide_to_size_preserves_surface(
 
 
 @pytest.mark.parametrize("mesh_name", _MESH_FIXTURES)
-def test_subdivide_to_size_return_index(
-    mesh_name: str, request: pytest.FixtureRequest
-) -> None:
+def test_subdivide_to_size_return_index(mesh_name: str, request: pytest.FixtureRequest) -> None:
     """Each output face carries a valid source id and lies inside that source triangle."""
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = mesh_wp.points.numpy()
@@ -278,7 +277,9 @@ def test_subdivide_to_size_return_index(
     bary_u = 1.0 - bary_v - bary_w
     tol = 1e-3
     assert np.all(bary_u >= -tol) and np.all(bary_v >= -tol) and np.all(bary_w >= -tol)
-    assert np.all(bary_u <= 1.0 + tol) and np.all(bary_v <= 1.0 + tol) and np.all(bary_w <= 1.0 + tol)
+    assert (
+        np.all(bary_u <= 1.0 + tol) and np.all(bary_v <= 1.0 + tol) and np.all(bary_w <= 1.0 + tol)
+    )
 
 
 def test_subdivide_to_size_empty(device: str) -> None:
@@ -294,7 +295,7 @@ def test_subdivide_to_size_empty(device: str) -> None:
 
 
 def test_subdivide_to_size_single_triangle(device: str) -> None:
-    """A single triangle with one over-long edge splits into two faces (pymesh case)."""
+    """A single triangle with one over-long edge splits into two faces."""
     # Edges: base (0,1) = 2.0, the other two ~1.044. With max_edge = 1.5 only the
     # base edge is over-long, so it splits once into two faces.
     vertices_np = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [1.0, 0.3, 0.0]], dtype=np.float32)

@@ -7,6 +7,7 @@ from typing import Literal
 import warp as wp
 
 import triwarp as tw
+import triwarp.typing as twt
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import polyline as kernel_polyline
 
@@ -740,3 +741,112 @@ def closed_polyline_angles(polyline: wp.array[wp.vec3]) -> wp.array[wp.float32]:
     n_original = int(polyline.shape[0])
     angles = polyline_angles(close_polyline(polyline))
     return angles[0:n_original]
+
+
+def _in_plane_basis(normal: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
+    """Right-handed orthonormal basis ``(u, v)`` spanning the plane with the given ``normal``."""
+    unit_normal = wp.normalize(normal)
+    axis = wp.vec3(1.0, 0.0, 0.0)
+    if abs(unit_normal[0]) > 0.9:
+        axis = wp.vec3(0.0, 1.0, 0.0)
+    u = wp.normalize(wp.cross(axis, unit_normal))
+    v = wp.cross(unit_normal, u)
+    return u, v
+
+
+def triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
+    """
+    Triangulate the simple planar polygon bounded by a closed 3D polyline (ear clipping).
+
+    The polyline is treated as the boundary of a simple polygon, which is filled with triangles
+    whose vertices are the polyline vertices themselves — no new (Steiner) points are introduced.
+    A simple ``n``-gon yields ``n - 2`` non-overlapping triangles that cover the polygon. The loop
+    is first projected onto its best-fit plane (via
+    [`polyline_normal`][triwarp.polyline.polyline_normal]) so any planar loop works, not only
+    ones lying in the ``xy`` plane.
+
+    The implementation is a GPU-parallel port of ``ear_clipping.cpp`` from libigl: convex polygons
+    use a single fan, while non-convex polygons clip a maximal independent set of ears per round
+    until the polygon is exhausted. Returned faces are consistently wound counter-clockwise with
+    respect to the loop's turning direction; the exact set of triangles may differ from a
+    sequential ear clip, but every triangulation of a simple polygon has ``n - 2`` faces.
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``. A duplicated closing point is dropped via
+        [`open_polyline`][triwarp.polyline.open_polyline].
+
+    Returns
+    -------
+    twt.Array2dInt32
+        ``(m, 3)`` triangle vertex indices into ``polyline`` on ``polyline.device``. ``m`` is
+        ``n - 2`` for a simple polygon; a degenerate or self-intersecting loop may yield fewer
+        (a partial triangulation). Empty ``(0, 3)`` for fewer than three points.
+
+    See Also
+    --------
+    [`polyline_normal`][triwarp.polyline.polyline_normal]
+    [`close_polyline`][triwarp.polyline.close_polyline]
+    """
+    polyline = open_polyline(polyline)
+    device = polyline.device
+    n = int(polyline.shape[0])
+    if n < 3:
+        return twt.empty_int32_2d((0, 3), device=device)
+
+    u, v = _in_plane_basis(polyline_normal(polyline))
+    center = polyline_centroid(polyline)
+    points2d = wp.empty(n, dtype=wp.vec2, device=device)
+    wp.launch(
+        kernel_polyline.project_to_plane_2d,
+        dim=n,
+        inputs=[polyline, center, u, v, points2d],
+        device=device,
+    )
+
+    total = wp.zeros(1, dtype=wp.float32, device=device)
+    wp.launch(kernel_polyline.accumulate_turning_angle, dim=n, inputs=[points2d, total], device=device)
+    if float(total.numpy()[0]) < 0.0:
+        wp.launch(kernel_polyline.orient_ccw, dim=n, inputs=[points2d], device=device)
+
+    out_faces = twt.empty_int32_2d((n - 2, 3), device=device)
+    out_count = wp.zeros(1, dtype=wp.int32, device=device)
+
+    reflex = wp.zeros(1, dtype=wp.int32, device=device)
+    wp.launch(kernel_polyline.count_reflex, dim=n, inputs=[points2d, reflex], device=device)
+    if int(reflex.numpy()[0]) == 0:
+        wp.launch(kernel_polyline.fan_triangulate, dim=n - 2, inputs=[out_faces], device=device)
+        return twt.as_array2d_int32(out_faces)
+
+    left = wp.empty(n, dtype=wp.int32, device=device)
+    right = wp.empty(n, dtype=wp.int32, device=device)
+    active = wp.empty(n, dtype=wp.int32, device=device)
+    is_ear = wp.empty(n, dtype=wp.int32, device=device)
+    selected = wp.empty(n, dtype=wp.int32, device=device)
+    wp.launch(kernel_polyline.init_ring, dim=n, inputs=[left, right, active], device=device)
+
+    for _ in range(n):
+        wp.launch(
+            kernel_polyline.compute_ears,
+            dim=n,
+            inputs=[points2d, left, right, active, is_ear],
+            device=device,
+        )
+        wp.launch(
+            kernel_polyline.select_independent,
+            dim=n,
+            inputs=[is_ear, left, right, selected],
+            device=device,
+        )
+        wp.launch(
+            kernel_polyline.clip_selected,
+            dim=n,
+            inputs=[selected, left, right, active, out_faces, out_count],
+            device=device,
+        )
+        if int(out_count.numpy()[0]) >= n - 2:
+            break
+
+    count = int(out_count.numpy()[0])
+    return twt.as_array2d_int32(out_faces[0:count])

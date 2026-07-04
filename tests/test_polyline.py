@@ -386,3 +386,112 @@ def test_distance_empty_polyline(device: str) -> None:
     points = _polyline_wp(np.random.default_rng(99).standard_normal((4, 3)), device)
     empty = wp.empty(0, dtype=wp.vec3, device=device)
     assert tw.polyline.distance_to_polyline(points, empty).shape[0] == 4
+
+
+# --- triangulate (ear clipping) ---
+
+
+def _convex_ngon(n: int, radius: float = 1.5) -> np.ndarray:
+    """CCW regular polygon in the xy-plane."""
+    angle = np.linspace(0.0, 2 * np.pi, n, endpoint=False)
+    return np.stack([radius * np.cos(angle), radius * np.sin(angle), np.zeros(n)], axis=1)
+
+
+def _l_shape() -> np.ndarray:
+    """A non-convex (one reflex corner) simple polygon in the xy-plane, CCW."""
+    xy = np.array(
+        [[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0], [1.0, 2.0], [0.0, 2.0]]
+    )
+    return np.concatenate([xy, np.zeros((xy.shape[0], 1))], axis=1)
+
+
+def _star(points: int = 5, outer: float = 2.0, inner: float = 0.8) -> np.ndarray:
+    """A star polygon (alternating reflex corners), CCW, in the xy-plane."""
+    angle = np.linspace(0.0, 2 * np.pi, 2 * points, endpoint=False)
+    radius = np.where(np.arange(2 * points) % 2 == 0, outer, inner)
+    return np.stack([radius * np.cos(angle), radius * np.sin(angle), np.zeros(2 * points)], axis=1)
+
+
+def _rotate_into_3d(pts_xy: np.ndarray, seed: int) -> np.ndarray:
+    """Apply a random rotation + translation so the polygon lies in a tilted 3D plane."""
+    rng = np.random.default_rng(seed)
+    a = rng.standard_normal((3, 3))
+    q, _ = np.linalg.qr(a)
+    if np.linalg.det(q) < 0:
+        q[:, 0] = -q[:, 0]
+    return pts_xy @ q.T + rng.standard_normal(3)
+
+
+def _polygon_area(pts: np.ndarray) -> float:
+    """Area of a planar polygon in 3D via the summed cross products (Newell)."""
+    rolled = np.roll(pts, -1, axis=0)
+    return float(np.linalg.norm(np.cross(pts, rolled).sum(axis=0)) / 2.0)
+
+
+def _triangle_areas(pts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    a, b, c = pts[faces[:, 0]], pts[faces[:, 1]], pts[faces[:, 2]]
+    return np.linalg.norm(np.cross(b - a, c - a), axis=-1) / 2.0
+
+
+def _assert_valid_triangulation(pts: np.ndarray, faces: np.ndarray) -> None:
+    n = pts.shape[0]
+    assert faces.shape == (n - 2, 3)
+    assert faces.min() >= 0 and faces.max() < n
+    assert set(faces.ravel().tolist()) == set(range(n))  # no orphan vertices
+    tri_areas = _triangle_areas(pts, faces)
+    assert np.all(tri_areas > 1e-6)  # no degenerate triangles
+    assert np.allclose(tri_areas.sum(), _polygon_area(pts), rtol=1e-5, atol=1e-5)
+
+
+def test_triangulate_convex_is_fan(device: str) -> None:
+    pts_np = _convex_ngon(8)
+    faces_wp = tw.polyline.triangulate(_polyline_wp(pts_np, device))
+    n = pts_np.shape[0]
+    expected = np.stack([np.zeros(n - 2), np.arange(1, n - 1), np.arange(2, n)], axis=1)
+    assert np.array_equal(faces_wp.numpy(), expected.astype(np.int32))
+    _assert_valid_triangulation(pts_np, faces_wp.numpy())
+
+
+def test_triangulate_l_shape(device: str) -> None:
+    pts_np = _l_shape()
+    faces_wp = tw.polyline.triangulate(_polyline_wp(pts_np, device))
+    _assert_valid_triangulation(pts_np, faces_wp.numpy())
+
+
+def test_triangulate_star(device: str) -> None:
+    pts_np = _star(6)
+    faces_wp = tw.polyline.triangulate(_polyline_wp(pts_np, device))
+    _assert_valid_triangulation(pts_np, faces_wp.numpy())
+
+
+def test_triangulate_tilted_plane(device: str) -> None:
+    pts_np = _rotate_into_3d(_star(6), seed=7)
+    faces_wp = tw.polyline.triangulate(_polyline_wp(pts_np, device))
+    _assert_valid_triangulation(pts_np, faces_wp.numpy())
+
+
+def test_triangulate_clockwise_orientation(device: str) -> None:
+    pts_np = _l_shape()[::-1].copy()  # reverse to clockwise
+    faces_wp = tw.polyline.triangulate(_polyline_wp(pts_np, device))
+    _assert_valid_triangulation(pts_np, faces_wp.numpy())
+
+
+def test_triangulate_closed_input_matches_open(device: str) -> None:
+    pts_np = _star(5)
+    closed_np = _closed_from(pts_np)
+    faces_open = tw.polyline.triangulate(_polyline_wp(pts_np, device)).numpy()
+    faces_closed = tw.polyline.triangulate(_polyline_wp(closed_np, device)).numpy()
+    assert np.array_equal(faces_open, faces_closed)
+
+
+def test_triangulate_single_triangle(device: str) -> None:
+    pts_np = _convex_ngon(3)
+    faces_wp = tw.polyline.triangulate(_polyline_wp(pts_np, device))
+    assert faces_wp.shape == (1, 3)
+    assert set(faces_wp.numpy().ravel().tolist()) == {0, 1, 2}
+
+
+def test_triangulate_too_few_points(device: str) -> None:
+    pts_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    faces_wp = tw.polyline.triangulate(_polyline_wp(pts_np, device))
+    assert faces_wp.shape == (0, 3)

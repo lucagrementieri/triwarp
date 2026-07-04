@@ -7,9 +7,6 @@
 [submodule "reference/Open3D"]
 	path = reference/Open3D
 	url = git@github.com:isl-org/Open3D.git
-[submodule "reference/PyMesh"]
-	path = reference/PyMesh
-	url = git@github.com:PyMesh/PyMesh.git
 [submodule "reference/pytorch3d"]
 	path = reference/pytorch3d
 	url = org-16943930@github.com:facebookresearch/pytorch3d.git
