@@ -37,6 +37,26 @@ def edge_forward_in_face(
 
 
 @wp.kernel
+def mark_intersecting_faces(
+    pairs: wp.array2d[wp.int32],
+    valid: wp.array[wp.bool],
+    out_mask: wp.array[wp.bool],
+) -> None:
+    """Flag both faces of each intersecting candidate pair (idempotent ``True`` writes)."""
+    p = int(wp.tid())
+    if valid[p]:
+        out_mask[pairs[p, 0]] = True
+        out_mask[pairs[p, 1]] = True
+
+
+@wp.kernel
+def orientation_bit_mask(orient: wp.array[wp.int32], out_mask: wp.array[wp.bool]) -> None:
+    """Per-face flip flag: ``True`` where the orientation bit marks the face for flipping."""
+    f = int(wp.tid())
+    out_mask[f] = orient[f] > wp.int32(0)
+
+
+@wp.kernel
 def edge_manifold_mask(
     counts: wp.array[wp.int32], allow_boundary: wp.bool, out_mask: wp.array[wp.bool]
 ) -> None:

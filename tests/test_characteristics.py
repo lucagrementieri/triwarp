@@ -4,6 +4,7 @@ import igl
 import numpy as np
 import pytest
 import trimesh as tm
+import trimesh.repair as tm_repair
 import warp as wp
 
 import triwarp as tw
@@ -113,6 +114,18 @@ def _mobius_strip(n: int) -> tuple[np.ndarray, np.ndarray]:
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
+def test_euler_characteristic(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    euler_wp = tw.characteristics.euler_characteristic(mesh_wp.indices)
+    assert euler_wp == int(mesh_tm.euler_number)
+
+
+def test_euler_characteristic_icosahedron(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _, mesh_wp = icosahedron
+    assert tw.characteristics.euler_characteristic(mesh_wp.indices) == 2
+
+
+@pytest.mark.parametrize("mesh_name", ALL_MESHES)
 def test_is_edge_manifold_allow_boundary(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     manifold_wp = tw.characteristics.is_edge_manifold(mesh_wp.indices, allow_boundary_edges=True)
@@ -130,30 +143,6 @@ def test_is_edge_manifold_no_boundary(request: pytest.FixtureRequest, mesh_name:
     assert manifold_wp == manifold_np
     # Closed meshes have no boundary edges; open surfaces do.
     assert manifold_wp == (mesh_name in CLOSED_MESHES)
-
-
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
-def test_is_vertex_manifold(request: pytest.FixtureRequest, mesh_name: str) -> None:
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    manifold_wp = tw.characteristics.is_vertex_manifold(mesh_wp.indices)
-    manifold_igl = bool(igl.is_vertex_manifold(_faces_igl(mesh_tm)).all())
-    assert manifold_wp == manifold_igl
-    assert manifold_wp is True
-
-
-def test_is_vertex_manifold_bowtie(device: str) -> None:
-    # Two triangles sharing only the apex vertex 0 -> non-manifold vertex.
-    vertices_np = np.array(
-        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]]
-    )
-    faces_np = np.array([[0, 1, 2], [0, 3, 4]])
-    _, faces_wp = _mesh_to_wp(vertices_np, faces_np, device)
-    manifold_wp = tw.characteristics.is_vertex_manifold(faces_wp)
-    manifold_igl = bool(igl.is_vertex_manifold(faces_np.astype(np.int64)).all())
-    assert manifold_wp == manifold_igl
-    assert manifold_wp is False
-    # The bow-tie is still edge-manifold (each edge used once).
-    assert tw.characteristics.is_edge_manifold(faces_wp, allow_boundary_edges=True) is True
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
@@ -189,6 +178,30 @@ def test_edge_manifold_mask_edges_sorted_shortcut(icosahedron: tuple[tm.Trimesh,
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
+def test_is_vertex_manifold(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    manifold_wp = tw.characteristics.is_vertex_manifold(mesh_wp.indices)
+    manifold_igl = bool(igl.is_vertex_manifold(_faces_igl(mesh_tm)).all())
+    assert manifold_wp == manifold_igl
+    assert manifold_wp is True
+
+
+def test_is_vertex_manifold_bowtie(device: str) -> None:
+    # Two triangles sharing only the apex vertex 0 -> non-manifold vertex.
+    vertices_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]]
+    )
+    faces_np = np.array([[0, 1, 2], [0, 3, 4]])
+    _, faces_wp = _mesh_to_wp(vertices_np, faces_np, device)
+    manifold_wp = tw.characteristics.is_vertex_manifold(faces_wp)
+    manifold_igl = bool(igl.is_vertex_manifold(faces_np.astype(np.int64)).all())
+    assert manifold_wp == manifold_igl
+    assert manifold_wp is False
+    # The bow-tie is still edge-manifold (each edge used once).
+    assert tw.characteristics.is_edge_manifold(faces_wp, allow_boundary_edges=True) is True
+
+
+@pytest.mark.parametrize("mesh_name", ALL_MESHES)
 def test_vertex_manifold_mask(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mask_wp = tw.characteristics.vertex_manifold_mask(mesh_wp.points, mesh_wp.indices)
@@ -217,6 +230,14 @@ def test_vertex_manifold_mask_unreferenced(device: str) -> None:
     expected = np.array([False, True, True, True, True, False])
     assert mask_wp.shape[0] == vertices_np.shape[0]
     assert np.array_equal(mask_wp.numpy(), expected)
+
+
+def test_vertex_manifold_mask_faces_without_vertices(device: str) -> None:
+    # Vertices present but no faces: every vertex is unreferenced -> all False.
+    vertices_wp = wp.array(np.zeros((4, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    mask_wp = tw.characteristics.vertex_manifold_mask(vertices_wp, faces_wp)
+    assert np.array_equal(mask_wp.numpy(), np.zeros(4, dtype=bool))
 
 
 @pytest.mark.parametrize("mesh_name", CLOSED_MESHES)
@@ -258,13 +279,14 @@ def test_is_self_intersecting_separated(device: str) -> None:
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
-def test_is_watertight(request: pytest.FixtureRequest, mesh_name: str) -> None:
+def test_self_intersecting_face_mask_matches_predicate(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    watertight_wp = tw.characteristics.is_watertight(mesh_wp.points, mesh_wp.indices)
-    assert watertight_wp == (mesh_name in CLOSED_MESHES)
-    # These fixtures are not self-intersecting, so Open3D's composite definition agrees with
-    # trimesh's "every edge shared by exactly two faces" check.
-    assert watertight_wp == bool(mesh_tm.is_watertight)
+    mask_wp = tw.characteristics.self_intersecting_face_mask(mesh_wp.points, mesh_wp.indices)
+    assert int(mask_wp.shape[0]) == mesh_tm.faces.shape[0]
+    predicate = tw.characteristics.is_self_intersecting(mesh_wp.points, mesh_wp.indices)
+    assert bool(tw.reduce.any(mask_wp)) == predicate
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
@@ -287,22 +309,24 @@ def test_is_winding_consistent_flipped(icosahedron: tuple[tm.Trimesh, wp.Mesh]) 
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
-def test_is_volume(request: pytest.FixtureRequest, mesh_name: str) -> None:
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    volume_wp = tw.characteristics.is_volume(mesh_wp.points, mesh_wp.indices)
-    assert volume_wp == bool(mesh_tm.is_volume)
-    assert volume_wp == (mesh_name in CLOSED_MESHES)
+def test_winding_consistent_mask_matches_predicate(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    mask_wp = tw.characteristics.winding_consistent_mask(mesh_wp.indices)
+    aggregated = bool(tw.reduce.all(mask_wp)) if int(mask_wp.shape[0]) > 0 else True
+    assert aggregated == tw.characteristics.is_winding_consistent(mesh_wp.indices)
+    assert aggregated is True
 
 
-def test_is_volume_inward_normals(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+def test_winding_consistent_mask_flags_flipped(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     mesh_tm, mesh_wp = icosahedron
-    faces_inward = mesh_tm.faces[:, ::-1].copy()  # reverse every face -> inward-facing normals
-    vertices_wp, faces_wp = _mesh_to_wp(mesh_tm.vertices, faces_inward, mesh_wp.device)
-    mesh_inward_tm = tm.Trimesh(vertices=mesh_tm.vertices, faces=faces_inward, process=False)
-    # Still watertight and winding-consistent, but the enclosed signed volume is negative.
-    volume_wp = tw.characteristics.is_volume(vertices_wp, faces_wp)
-    assert volume_wp == bool(mesh_inward_tm.is_volume)
-    assert volume_wp is False
+    faces_flipped = mesh_tm.faces.copy()
+    faces_flipped[::2] = faces_flipped[::2][:, ::-1]  # reverse winding of half the faces
+    _, faces_wp = _mesh_to_wp(mesh_tm.vertices, faces_flipped, mesh_wp.device)
+    mask_wp = tw.characteristics.winding_consistent_mask(faces_wp)
+    assert int(mask_wp.shape[0]) > 0
+    assert bool(tw.reduce.all(mask_wp)) is False
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
@@ -335,15 +359,70 @@ def test_is_orientable_mobius(device: str) -> None:
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
-def test_euler_characteristic(request: pytest.FixtureRequest, mesh_name: str) -> None:
+def test_face_orientation_mask_all_false_on_consistent(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    euler_wp = tw.characteristics.euler_characteristic(mesh_wp.indices)
-    assert euler_wp == int(mesh_tm.euler_number)
+    mask_wp = tw.characteristics.face_orientation_mask(mesh_wp.indices)
+    assert int(mask_wp.shape[0]) == mesh_tm.faces.shape[0]
+    # Fixtures are consistently wound, so no face needs flipping.
+    assert bool(tw.reduce.any(mask_wp)) is False
 
 
-def test_euler_characteristic_icosahedron(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    _, mesh_wp = icosahedron
-    assert tw.characteristics.euler_characteristic(mesh_wp.indices) == 2
+@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+def test_is_watertight(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    watertight_wp = tw.characteristics.is_watertight(mesh_wp.points, mesh_wp.indices)
+    assert watertight_wp == (mesh_name in CLOSED_MESHES)
+    # These fixtures are not self-intersecting, so Open3D's composite definition agrees with
+    # trimesh's "every edge shared by exactly two faces" check.
+    assert watertight_wp == bool(mesh_tm.is_watertight)
+
+
+@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+def test_watertight_face_mask_matches_reference(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mask_wp = tw.characteristics.watertight_face_mask(mesh_wp.indices)
+    mask_np = _edge_manifold_mask_np(mesh_tm.faces, allow_boundary_edges=False)
+    assert np.array_equal(mask_wp.numpy(), mask_np)
+    # Equivalent to edge_manifold_mask with boundary edges disallowed.
+    edge_mask_wp = tw.characteristics.edge_manifold_mask(
+        mesh_wp.indices, allow_boundary_edges=False
+    )
+    assert np.array_equal(mask_wp.numpy(), edge_mask_wp.numpy())
+
+
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+def test_watertight_face_mask_broken_faces_reference(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mask_wp = tw.characteristics.watertight_face_mask(mesh_wp.indices)
+    # Faces breaking watertightness are the complement of the mask (trimesh's broken_faces).
+    broken_ours = np.flatnonzero(~mask_wp.numpy())
+    broken_tm = np.asarray(tm_repair.broken_faces(mesh_tm), dtype=np.int64)
+    assert np.array_equal(np.sort(broken_ours), np.sort(broken_tm))
+
+
+@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+def test_is_volume(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    volume_wp = tw.characteristics.is_volume(mesh_wp.points, mesh_wp.indices)
+    assert volume_wp == bool(mesh_tm.is_volume)
+    assert volume_wp == (mesh_name in CLOSED_MESHES)
+
+
+def test_is_volume_inward_normals(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    faces_inward = mesh_tm.faces[:, ::-1].copy()  # reverse every face -> inward-facing normals
+    vertices_wp, faces_wp = _mesh_to_wp(mesh_tm.vertices, faces_inward, mesh_wp.device)
+    mesh_inward_tm = tm.Trimesh(vertices=mesh_tm.vertices, faces=faces_inward, process=False)
+    # Still watertight and winding-consistent, but the enclosed signed volume is negative.
+    volume_wp = tw.characteristics.is_volume(vertices_wp, faces_wp)
+    assert volume_wp == bool(mesh_inward_tm.is_volume)
+    assert volume_wp is False
 
 
 def test_empty_mesh(device: str) -> None:
@@ -361,9 +440,10 @@ def test_empty_mesh(device: str) -> None:
     assert tw.characteristics.vertex_manifold_mask(vertices_wp, faces_wp).shape[0] == 0
 
 
-def test_vertex_manifold_mask_faces_without_vertices(device: str) -> None:
-    # Vertices present but no faces: every vertex is unreferenced -> all False.
-    vertices_wp = wp.array(np.zeros((4, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+def test_new_masks_empty_mesh(device: str) -> None:
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    mask_wp = tw.characteristics.vertex_manifold_mask(vertices_wp, faces_wp)
-    assert np.array_equal(mask_wp.numpy(), np.zeros(4, dtype=bool))
+    assert tw.characteristics.winding_consistent_mask(faces_wp).shape[0] == 0
+    assert tw.characteristics.self_intersecting_face_mask(vertices_wp, faces_wp).shape[0] == 0
+    assert tw.characteristics.watertight_face_mask(faces_wp).shape[0] == 0
+    assert tw.characteristics.face_orientation_mask(faces_wp).shape[0] == 0

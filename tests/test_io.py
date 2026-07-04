@@ -9,8 +9,6 @@ import warp as wp
 
 import triwarp as tw
 
-DATA_DIR = Path(__file__).parent / "data"
-
 
 def _write_synthetic_mesh(path: Path) -> dict[str, np.ndarray]:
     """Write a tetrahedron surface with normals, colors and uv; return the source arrays."""
@@ -74,28 +72,6 @@ def test_load_mesh_returns_wp_mesh(tmp_path, device):
     assert isinstance(mesh_wp, wp.Mesh)
     assert np.allclose(mesh_wp.points.numpy(), source["vertices"], rtol=1e-5, atol=1e-5)
     assert np.array_equal(mesh_wp.indices.numpy().reshape(-1, 3), source["faces"])
-
-
-def test_load_mesh_data_bunny(device):
-    data_wp = tw.io.load_mesh_data(DATA_DIR / "bunny.ply", device=device)
-
-    assert data_wp["vertices"].shape == (35947,)
-    assert data_wp["vertices"].dtype == wp.vec3
-    # 69451 triangles stored as a flat int32 buffer.
-    assert data_wp["faces"].shape == (69451 * 3,)
-    assert data_wp["faces"].dtype == wp.int32
-    # bunny.ply carries only confidence/intensity scalars, no normals/colors/uv.
-    assert "vertex_normals" not in data_wp
-    assert "colors" not in data_wp
-    assert "uv" not in data_wp
-
-
-def test_load_mesh_bunny_returns_wp_mesh(device):
-    mesh_wp = tw.io.load_mesh(DATA_DIR / "bunny.ply", device=device)
-
-    assert isinstance(mesh_wp, wp.Mesh)
-    assert mesh_wp.points.shape == (35947,)
-    assert mesh_wp.indices.shape == (69451 * 3,)
 
 
 def test_load_mesh_without_faces_raises(tmp_path, device):

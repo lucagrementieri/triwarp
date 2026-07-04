@@ -15,6 +15,8 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import edges as kernel_edges
+from triwarp.kernels import repair as kernel_repair
+from triwarp.kernels import sample as kernel_sample
 from triwarp.unique import hash_vector_rows, unique_1d, unique_faces, unique_rows
 
 
@@ -66,10 +68,7 @@ def remove_unreferenced_vertices(
     n_referenced = int(tw.reduce.sum(referenced))
     if n_referenced > 0:
         wp.launch(
-            kernel_array.scatter_index,
-            dim=n_referenced,
-            inputs=[inverse, remap],
-            device=device,
+            kernel_array.scatter_index, dim=n_referenced, inputs=[inverse, remap], device=device
         )
 
     new_vertices = (
@@ -211,6 +210,189 @@ def resolve_duplicated_faces(
     return resolved, kept_wp
 
 
+def make_winding_consistent(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
+    """
+    Flip faces so every shared edge is traversed in opposite directions by its two faces.
+
+    Reuses the orientation flood-fill of
+    [`face_orientation_mask`][triwarp.characteristics.face_orientation_mask] (one arbitrary seed
+    face per connected component) and reverses the winding of every face whose orientation bit is
+    set. The result satisfies
+    [`is_winding_consistent`][triwarp.characteristics.is_winding_consistent]; an already-consistent
+    mesh is returned unchanged. Mirrors ``trimesh.repair.fix_winding``.
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        New flat face buffer with corrected winding, on ``faces.device``. Vertices are unchanged.
+
+    See Also
+    --------
+    [`is_winding_consistent`][triwarp.characteristics.is_winding_consistent]
+    [`face_orientation_mask`][triwarp.characteristics.face_orientation_mask]
+    [`make_normals_consistent`][triwarp.repair.make_normals_consistent]
+
+    Notes
+    -----
+    The reference winding within each connected component is arbitrary (the seed face keeps its
+    orientation), matching ``trimesh.repair.fix_winding``'s BFS. Use
+    [`make_volume`][triwarp.repair.make_volume] afterwards to also orient normals outward.
+    """
+    n_faces = int(faces.shape[0]) // 3
+    device = faces.device
+    if n_faces == 0:
+        return wp.empty(0, dtype=wp.int32, device=device)
+
+    orient, _, _, _ = tw.characteristics._orientation_bits(faces)
+    out_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_repair.flip_faces_masked,
+        dim=n_faces,
+        inputs=[faces, orient, out_faces],
+        device=device,
+    )
+    return out_faces
+
+
+def make_volume(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], multibody: bool = False
+) -> wp.array[wp.int32]:
+    """
+    Orient faces so the mesh encloses a positive signed volume (normals point outward).
+
+    Mirrors ``trimesh.repair.fix_inversion``. With ``multibody=False`` (default) the mesh is only
+    corrected when it is watertight (every undirected edge shared by exactly two faces) and its
+    total signed volume is negative, in which case every face is reversed. With ``multibody=True``
+    each connected component is corrected independently by the sign of its own signed volume.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    multibody
+        When ``True`` correct each connected component independently rather than the mesh as a
+        whole.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        New flat face buffer with outward-oriented normals, on ``faces.device``. Vertices are
+        unchanged.
+
+    See Also
+    --------
+    [`is_volume`][triwarp.characteristics.is_volume]
+    [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
+    [`make_normals_consistent`][triwarp.repair.make_normals_consistent]
+
+    Notes
+    -----
+    The signed volume is ``sum(dot(v0, cross(v1, v2)) / 6)`` measured from the origin, as in
+    [`is_volume`][triwarp.characteristics.is_volume]. Unlike ``trimesh.repair.fix_inversion``'s
+    multibody path, this does not skip components that are not watertight/consistently wound: an
+    open component's signed volume is ill-defined and may be flipped spuriously. Run
+    [`make_winding_consistent`][triwarp.repair.make_winding_consistent] first (see
+    [`make_normals_consistent`][triwarp.repair.make_normals_consistent]) and reserve ``multibody``
+    for meshes whose bodies are individually closed.
+    """
+    n_faces = int(faces.shape[0]) // 3
+    device = faces.device
+    if n_faces == 0:
+        return wp.empty(0, dtype=wp.int32, device=device)
+
+    out_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
+    signed_volumes = wp.empty(n_faces, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_sample.signed_tet_volumes,
+        dim=n_faces,
+        inputs=[vertices, faces, wp.vec3(0.0, 0.0, 0.0), signed_volumes],
+        device=device,
+    )
+
+    if multibody:
+        labels = tw.graph.face_connected_component_labels(faces)
+        accum = wp.zeros(n_faces, dtype=wp.float32, device=device)
+        wp.launch(
+            kernel_repair.accumulate_component_volume,
+            dim=n_faces,
+            inputs=[labels, signed_volumes, accum],
+            device=device,
+        )
+        flip = wp.empty(n_faces, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_repair.mark_negative_component,
+            dim=n_faces,
+            inputs=[labels, accum, flip],
+            device=device,
+        )
+        wp.launch(
+            kernel_repair.flip_faces_masked,
+            dim=n_faces,
+            inputs=[faces, flip, out_faces],
+            device=device,
+        )
+        return out_faces
+
+    watertight = bool(tw.reduce.all(tw.characteristics.watertight_face_mask(faces)))
+    if watertight and tw.reduce.sum(signed_volumes) < 0.0:
+        flip = wp.full(n_faces, wp.int32(1), dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_repair.flip_faces_masked,
+            dim=n_faces,
+            inputs=[faces, flip, out_faces],
+            device=device,
+        )
+        return out_faces
+
+    wp.copy(out_faces, faces)
+    return out_faces
+
+
+def make_normals_consistent(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], multibody: bool = False
+) -> wp.array[wp.int32]:
+    """
+    Make winding consistent and orient normals outward (winding fix followed by inversion fix).
+
+    Equivalent to ``trimesh.repair.fix_normals``: first
+    [`make_winding_consistent`][triwarp.repair.make_winding_consistent] gives every connected
+    component a coherent winding, then [`make_volume`][triwarp.repair.make_volume] flips it (or each
+    body, with ``multibody=True``) so normals point outward. On a watertight, orientable mesh the
+    result satisfies [`is_volume`][triwarp.characteristics.is_volume].
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    multibody
+        Forwarded to [`make_volume`][triwarp.repair.make_volume]: correct each connected component
+        independently.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        New flat face buffer with consistent winding and outward normals, on ``faces.device``.
+        Vertices are unchanged.
+
+    See Also
+    --------
+    [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
+    [`make_volume`][triwarp.repair.make_volume]
+    [`is_volume`][triwarp.characteristics.is_volume]
+    """
+    wound = make_winding_consistent(faces)
+    return make_volume(vertices, wound, multibody=multibody)
+
+
 def _duplicate_vertex_inverse(vertices: wp.array[wp.vec3], epsilon: float) -> wp.array[wp.int32]:
     device = vertices.device
     n = int(vertices.shape[0])
@@ -235,5 +417,7 @@ def _remap_flat_indices(
     if n == 0:
         return wp.empty(0, dtype=wp.int32, device=device)
     out = wp.empty(n, dtype=wp.int32, device=device)
-    wp.launch(kernel_array.gather_1d_skip_negative, dim=n, inputs=[indices, remap, out], device=device)
+    wp.launch(
+        kernel_array.gather_1d_skip_negative, dim=n, inputs=[indices, remap, out], device=device
+    )
     return out

@@ -1,0 +1,268 @@
+import warp as wp
+
+# NaN payload for vertices whose UV is non-finite (never sampled) and out-of-bounds reads.
+NAN_F32 = wp.constant(wp.float32(float("nan")))
+# Inclusive coverage tolerance so shared triangle edges are not dropped (avoids seam gaps).
+COVERAGE_EPS = wp.constant(wp.float32(1e-6))
+
+
+@wp.func
+def _sanitize_uv(uv: wp.vec2) -> wp.vec2:
+    """Replace a non-finite UV with the origin so the rasterizer never sees NaN/Inf."""
+    if not wp.isfinite(uv[0]) or not wp.isfinite(uv[1]):
+        return wp.vec2(0.0, 0.0)
+    return uv
+
+
+@wp.func
+def _uv_to_pixel(uv: wp.vec2, resolution: wp.int32) -> wp.vec2:
+    """
+    Map a UV in ``[0, 1]`` to its pixel-center coordinate ``(x=col, y=row)``.
+
+    Inverse of the sampling convention in the ``sample_*`` kernels: ``col = u * W - 0.5``
+    and ``row = (1 - v) * H - 0.5`` (row 0 corresponds to ``v = 1``).
+    """
+    size = wp.float32(resolution)
+    return wp.vec2(uv[0] * size - 0.5, (1.0 - uv[1]) * size - 0.5)
+
+
+@wp.func
+def _barycentric(q0: wp.vec2, q1: wp.vec2, q2: wp.vec2, p: wp.vec2) -> wp.vec3:
+    """
+    Barycentric coordinates ``(b0, b1, b2)`` of ``p`` in triangle ``(q0, q1, q2)``.
+
+    Returns a vector with a negative component for degenerate triangles so the coverage
+    test rejects them.
+    """
+    v0 = q1 - q0
+    v1 = q2 - q0
+    v2 = p - q0
+    d00 = wp.dot(v0, v0)
+    d01 = wp.dot(v0, v1)
+    d11 = wp.dot(v1, v1)
+    d20 = wp.dot(v2, v0)
+    d21 = wp.dot(v2, v1)
+    denom = d00 * d11 - d01 * d01
+    if wp.abs(denom) < wp.float32(1e-20):
+        return wp.vec3(-1.0, -1.0, -1.0)
+    inverse_denominator = 1.0 / denom
+    b1 = (d11 * d20 - d01 * d21) * inverse_denominator
+    b2 = (d00 * d21 - d01 * d20) * inverse_denominator
+    b0 = 1.0 - b1 - b2
+    return wp.vec3(b0, b1, b2)
+
+
+@wp.func
+def _covered(bary: wp.vec3) -> bool:
+    """Return whether a pixel center lies inside the triangle (edge-inclusive)."""
+    return bary[0] >= -COVERAGE_EPS and bary[1] >= -COVERAGE_EPS and bary[2] >= -COVERAGE_EPS
+
+
+@wp.kernel
+def rasterize_owner(
+    uv: wp.array[wp.vec2],
+    faces: wp.array[wp.int32],
+    resolution: wp.int32,
+    out_owner: wp.array2d[wp.int32],
+) -> None:
+    """Resolve per-pixel triangle ownership: the lowest face index covering each pixel wins."""
+    f = int(wp.tid())
+    q0 = _uv_to_pixel(_sanitize_uv(uv[faces[f * 3 + 0]]), resolution)
+    q1 = _uv_to_pixel(_sanitize_uv(uv[faces[f * 3 + 1]]), resolution)
+    q2 = _uv_to_pixel(_sanitize_uv(uv[faces[f * 3 + 2]]), resolution)
+
+    x_min = wp.min(q0[0], wp.min(q1[0], q2[0]))
+    x_max = wp.max(q0[0], wp.max(q1[0], q2[0]))
+    y_min = wp.min(q0[1], wp.min(q1[1], q2[1]))
+    y_max = wp.max(q0[1], wp.max(q1[1], q2[1]))
+
+    col_lo = wp.clamp(int(wp.floor(x_min)), wp.int32(0), resolution - 1)
+    col_hi = wp.clamp(int(wp.ceil(x_max)), wp.int32(0), resolution - 1)
+    row_lo = wp.clamp(int(wp.floor(y_min)), wp.int32(0), resolution - 1)
+    row_hi = wp.clamp(int(wp.ceil(y_max)), wp.int32(0), resolution - 1)
+
+    for row in range(row_lo, row_hi + 1):
+        for col in range(col_lo, col_hi + 1):
+            bary = _barycentric(q0, q1, q2, wp.vec2(wp.float32(col), wp.float32(row)))
+            if _covered(bary):
+                wp.atomic_min(out_owner, row, col, f)
+
+
+@wp.kernel
+def rasterize_scatter(
+    uv: wp.array[wp.vec2],
+    faces: wp.array[wp.int32],
+    attribute: wp.array2d[wp.float32],
+    n_channels: wp.int32,
+    owner: wp.array2d[wp.int32],
+    out_image: wp.array3d[wp.float32],
+) -> None:
+    """Write the barycentric-interpolated attribute at every pixel this face owns."""
+    f = int(wp.tid())
+    i0 = faces[f * 3 + 0]
+    i1 = faces[f * 3 + 1]
+    i2 = faces[f * 3 + 2]
+    resolution = int(out_image.shape[0])
+    q0 = _uv_to_pixel(_sanitize_uv(uv[i0]), resolution)
+    q1 = _uv_to_pixel(_sanitize_uv(uv[i1]), resolution)
+    q2 = _uv_to_pixel(_sanitize_uv(uv[i2]), resolution)
+
+    x_min = wp.min(q0[0], wp.min(q1[0], q2[0]))
+    x_max = wp.max(q0[0], wp.max(q1[0], q2[0]))
+    y_min = wp.min(q0[1], wp.min(q1[1], q2[1]))
+    y_max = wp.max(q0[1], wp.max(q1[1], q2[1]))
+
+    col_lo = wp.clamp(int(wp.floor(x_min)), wp.int32(0), resolution - 1)
+    col_hi = wp.clamp(int(wp.ceil(x_max)), wp.int32(0), resolution - 1)
+    row_lo = wp.clamp(int(wp.floor(y_min)), wp.int32(0), resolution - 1)
+    row_hi = wp.clamp(int(wp.ceil(y_max)), wp.int32(0), resolution - 1)
+
+    for row in range(row_lo, row_hi + 1):
+        for col in range(col_lo, col_hi + 1):
+            if owner[row, col] != f:
+                continue
+            bary = _barycentric(q0, q1, q2, wp.vec2(wp.float32(col), wp.float32(row)))
+            for k in range(n_channels):
+                out_image[row, col, k] = (
+                    bary[0] * attribute[i0, k]
+                    + bary[1] * attribute[i1, k]
+                    + bary[2] * attribute[i2, k]
+                )
+
+
+@wp.kernel
+def rasterize_labels(
+    uv: wp.array[wp.vec2],
+    faces: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+    owner: wp.array2d[wp.int32],
+    out_labels: wp.array2d[wp.int32],
+) -> None:
+    """
+    Write the argmax-of-barycentric-weight label at every pixel this face owns.
+
+    Equivalent to one-hot encoding the vertex labels, barycentrically interpolating, and taking
+    the per-pixel argmax: label weights of shared vertices sum, and ties resolve to the lowest
+    label value (matching ``numpy.argmax`` over one-hot columns).
+    """
+    f = int(wp.tid())
+    i0 = faces[f * 3 + 0]
+    i1 = faces[f * 3 + 1]
+    i2 = faces[f * 3 + 2]
+    resolution = int(out_labels.shape[0])
+    q0 = _uv_to_pixel(_sanitize_uv(uv[i0]), resolution)
+    q1 = _uv_to_pixel(_sanitize_uv(uv[i1]), resolution)
+    q2 = _uv_to_pixel(_sanitize_uv(uv[i2]), resolution)
+
+    l0 = labels[i0]
+    l1 = labels[i1]
+    l2 = labels[i2]
+
+    x_min = wp.min(q0[0], wp.min(q1[0], q2[0]))
+    x_max = wp.max(q0[0], wp.max(q1[0], q2[0]))
+    y_min = wp.min(q0[1], wp.min(q1[1], q2[1]))
+    y_max = wp.max(q0[1], wp.max(q1[1], q2[1]))
+
+    col_lo = wp.clamp(int(wp.floor(x_min)), wp.int32(0), resolution - 1)
+    col_hi = wp.clamp(int(wp.ceil(x_max)), wp.int32(0), resolution - 1)
+    row_lo = wp.clamp(int(wp.floor(y_min)), wp.int32(0), resolution - 1)
+    row_hi = wp.clamp(int(wp.ceil(y_max)), wp.int32(0), resolution - 1)
+
+    for row in range(row_lo, row_hi + 1):
+        for col in range(col_lo, col_hi + 1):
+            if owner[row, col] != f:
+                continue
+            bary = _barycentric(q0, q1, q2, wp.vec2(wp.float32(col), wp.float32(row)))
+            # Per-class weight = sum of barycentric weights of vertices sharing that class.
+            s0 = bary[0] + wp.where(l1 == l0, bary[1], 0.0) + wp.where(l2 == l0, bary[2], 0.0)
+            s1 = bary[1] + wp.where(l0 == l1, bary[0], 0.0) + wp.where(l2 == l1, bary[2], 0.0)
+            s2 = bary[2] + wp.where(l0 == l2, bary[0], 0.0) + wp.where(l1 == l2, bary[1], 0.0)
+            best_label = l0
+            best_weight = s0
+            if s1 > best_weight or (s1 == best_weight and l1 < best_label):
+                best_label = l1
+                best_weight = s1
+            if s2 > best_weight or (s2 == best_weight and l2 < best_label):
+                best_label = l2
+                best_weight = s2
+            out_labels[row, col] = best_label
+
+
+@wp.kernel
+def check_uv_range(uv: wp.array[wp.vec2], out_flag: wp.array[wp.int32]) -> None:
+    """Set ``out_flag[0] = 1`` if any finite UV lies outside ``[0, 1]``."""
+    v = int(wp.tid())
+    u = uv[v][0]
+    w = uv[v][1]
+    if wp.isfinite(u) and wp.isfinite(w):
+        if u < 0.0 or u > 1.0 or w < 0.0 or w > 1.0:
+            wp.atomic_max(out_flag, 0, wp.int32(1))
+
+
+@wp.kernel
+def sample_nearest(
+    uv: wp.array[wp.vec2],
+    image: wp.array3d[wp.float32],
+    n_channels: wp.int32,
+    out_values: wp.array2d[wp.float32],
+) -> None:
+    """Nearest-neighbor sample the texture at each vertex UV (edge-clamped)."""
+    v = int(wp.tid())
+    u = uv[v][0]
+    w = uv[v][1]
+    height = int(image.shape[0])
+    width = int(image.shape[1])
+    if not wp.isfinite(u) or not wp.isfinite(w):
+        for k in range(n_channels):
+            out_values[v, k] = NAN_F32
+        return
+    row = (1.0 - w) * wp.float32(height) - 0.5
+    col = u * wp.float32(width) - 0.5
+    r = wp.clamp(int(wp.floor(row + 0.5)), wp.int32(0), height - 1)
+    c = wp.clamp(int(wp.floor(col + 0.5)), wp.int32(0), width - 1)
+    for k in range(n_channels):
+        out_values[v, k] = image[r, c, k]
+
+
+@wp.kernel
+def sample_bilinear(
+    uv: wp.array[wp.vec2],
+    image: wp.array3d[wp.float32],
+    n_channels: wp.int32,
+    out_values: wp.array2d[wp.float32],
+) -> None:
+    """Bilinearly sample the texture at each vertex UV (edge-clamped)."""
+    v = int(wp.tid())
+    u = uv[v][0]
+    w = uv[v][1]
+    height = int(image.shape[0])
+    width = int(image.shape[1])
+    if not wp.isfinite(u) or not wp.isfinite(w):
+        for k in range(n_channels):
+            out_values[v, k] = NAN_F32
+        return
+    row = (1.0 - w) * wp.float32(height) - 0.5
+    col = u * wp.float32(width) - 0.5
+    r0 = int(wp.floor(row))
+    c0 = int(wp.floor(col))
+    fr = row - wp.float32(r0)
+    fc = col - wp.float32(c0)
+    r0c = wp.clamp(r0, wp.int32(0), height - 1)
+    r1c = wp.clamp(r0 + 1, wp.int32(0), height - 1)
+    c0c = wp.clamp(c0, wp.int32(0), width - 1)
+    c1c = wp.clamp(c0 + 1, wp.int32(0), width - 1)
+    for k in range(n_channels):
+        top = image[r0c, c0c, k] * (1.0 - fc) + image[r0c, c1c, k] * fc
+        bottom = image[r1c, c0c, k] * (1.0 - fc) + image[r1c, c1c, k] * fc
+        out_values[v, k] = top * (1.0 - fr) + bottom * fr
+
+
+@wp.kernel
+def round_labels(sampled: wp.array2d[wp.float32], out_labels: wp.array[wp.int32]) -> None:
+    """Round nearest-sampled float labels back to int32; non-finite (NaN-UV) rows map to -1."""
+    v = int(wp.tid())
+    x = sampled[v, 0]
+    if wp.isfinite(x):
+        out_labels[v] = wp.int32(wp.round(x))
+    else:
+        out_labels[v] = wp.int32(-1)

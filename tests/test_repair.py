@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import pytest
+import trimesh as tm
+import trimesh.repair as tm_repair
 import warp as wp
 
-import igl
 import triwarp as tw
 
 
@@ -110,8 +112,7 @@ def test_remove_unreferenced_identity(icosahedron, device: str):
     )
 
     nv_igl, nf_igl, remap_igl, inverse_igl = igl.remove_unreferenced(
-        np.asarray(vertices_np, dtype=np.float64),
-        np.asarray(faces_np, dtype=np.int32),
+        np.asarray(vertices_np, dtype=np.float64), np.asarray(faces_np, dtype=np.int32)
     )
 
     assert np.allclose(nv_wp.numpy(), nv_igl, rtol=1e-5, atol=1e-5)
@@ -132,9 +133,7 @@ def test_remove_unreferenced_extra_vertices(device: str):
         vertices_wp, faces_wp, return_inverse=True
     )
 
-    nv_igl, nf_igl, remap_igl, inverse_igl = igl.remove_unreferenced(
-        vertices_full_np, faces_np
-    )
+    nv_igl, nf_igl, remap_igl, inverse_igl = igl.remove_unreferenced(vertices_full_np, faces_np)
 
     assert np.allclose(nv_wp.numpy(), nv_igl, rtol=1e-5, atol=1e-5)
     assert np.array_equal(nf_wp.numpy().reshape(-1, 3), nf_igl)
@@ -157,13 +156,7 @@ def test_remove_unreferenced_sentinel(device: str):
 
 def test_remove_duplicate_vertices_exact(device: str):
     vertices_np = np.array(
-        [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ],
-        dtype=np.float64,
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64
     )
     vertices_wp = wp.array(
         np.ascontiguousarray(vertices_np.astype(np.float32)), dtype=wp.vec3, device=device
@@ -176,13 +169,7 @@ def test_remove_duplicate_vertices_exact(device: str):
 
 def test_remove_duplicate_vertices_epsilon(device: str):
     vertices_np = np.array(
-        [
-            [0.0, 0.0, 0.0],
-            [1e-9, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [1.0, 1e-9, 0.0],
-        ],
-        dtype=np.float64,
+        [[0.0, 0.0, 0.0], [1e-9, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1e-9, 0.0]], dtype=np.float64
     )
     epsilon = 1e-8
     vertices_wp = wp.array(
@@ -190,38 +177,27 @@ def test_remove_duplicate_vertices_epsilon(device: str):
     )
 
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    sv_wp, _, svj_wp, _ = tw.repair.remove_duplicated_vertices(vertices_wp, faces_wp, epsilon=epsilon)
+    sv_wp, _, svj_wp, _ = tw.repair.remove_duplicated_vertices(
+        vertices_wp, faces_wp, epsilon=epsilon
+    )
     _assert_duplicate_vertices_match(vertices_np, sv_wp.numpy(), svj_wp.numpy(), epsilon=epsilon)
 
 
 def test_remove_duplicate_vertices_faces(device: str):
     vertices_np = np.array(
-        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-        dtype=np.float64,
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64
     )
     faces_np = np.array([[0, 1, 3], [2, 1, 3]], dtype=np.int32)
     vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
 
     sv_wp, _, svj_wp, sf_wp = tw.repair.remove_duplicated_vertices(vertices_wp, faces_wp, 0.0)
     _assert_duplicate_vertices_match(
-        vertices_np,
-        sv_wp.numpy(),
-        svj_wp.numpy(),
-        sf_wp.numpy(),
-        faces_np,
+        vertices_np, sv_wp.numpy(), svj_wp.numpy(), sf_wp.numpy(), faces_np
     )
 
 
 def test_resolve_duplicated_faces_cancelling(device: str):
-    faces_np = np.array(
-        [
-            [0, 1, 2],
-            [0, 1, 2],
-            [0, 2, 1],
-            [0, 2, 1],
-        ],
-        dtype=np.int32,
-    )
+    faces_np = np.array([[0, 1, 2], [0, 1, 2], [0, 2, 1], [0, 2, 1]], dtype=np.int32)
     faces_wp = wp.array(
         np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
     )
@@ -234,16 +210,7 @@ def test_resolve_duplicated_faces_cancelling(device: str):
 
 
 def test_resolve_duplicated_faces_keep_positive(device: str):
-    faces_np = np.array(
-        [
-            [0, 1, 2],
-            [0, 1, 2],
-            [0, 1, 2],
-            [0, 2, 1],
-            [0, 2, 1],
-        ],
-        dtype=np.int32,
-    )
+    faces_np = np.array([[0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 2, 1], [0, 2, 1]], dtype=np.int32)
     faces_wp = wp.array(
         np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
     )
@@ -253,3 +220,130 @@ def test_resolve_duplicated_faces_keep_positive(device: str):
 
     assert np.array_equal(f2_wp.numpy().reshape(-1, 3), f2_ref)
     assert np.array_equal(j_wp.numpy(), j_ref)
+
+
+def _faces_2d(faces_wp: wp.array) -> np.ndarray:
+    return faces_wp.numpy().reshape(-1, 3)
+
+
+def test_make_winding_consistent_repairs_flipped(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    faces_flipped = mesh_tm.faces.copy()
+    faces_flipped[::2] = faces_flipped[::2][:, ::-1]  # reverse winding of half the faces
+    _, faces_wp = _to_wp_mesh(mesh_tm.vertices, faces_flipped, mesh_wp.device)
+
+    assert tw.characteristics.is_winding_consistent(faces_wp) is False
+    repaired_wp = tw.repair.make_winding_consistent(faces_wp)
+    assert tw.characteristics.is_winding_consistent(repaired_wp) is True
+
+    before = faces_flipped
+    after = _faces_2d(repaired_wp)
+    # Pure per-face winding operation: corner 0 preserved, same vertex set per face.
+    assert np.array_equal(after[:, 0], before[:, 0])
+    assert np.array_equal(np.sort(after, axis=1), np.sort(before, axis=1))
+
+    # Reference: trimesh.repair.fix_winding reaches the same consistent state.
+    reference_tm = tm.Trimesh(vertices=mesh_tm.vertices, faces=before, process=False)
+    tm_repair.fix_winding(reference_tm)
+    assert bool(reference_tm.is_winding_consistent) is True
+    ours_tm = tm.Trimesh(vertices=mesh_tm.vertices, faces=after, process=False)
+    assert bool(ours_tm.is_winding_consistent) is True
+    # Single connected component: our winding equals trimesh's up to a global flip.
+    same = np.allclose(ours_tm.face_normals, reference_tm.face_normals, atol=1e-5)
+    opposite = np.allclose(ours_tm.face_normals, -reference_tm.face_normals, atol=1e-5)
+    assert same or opposite
+
+
+def test_make_winding_consistent_idempotent(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _, mesh_wp = icosahedron
+    repaired_wp = tw.repair.make_winding_consistent(mesh_wp.indices)
+    # Already consistently wound: output identical to input.
+    assert np.array_equal(_faces_2d(repaired_wp), _faces_2d(mesh_wp.indices))
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+def test_make_volume_repairs_inversion(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_inward = mesh_tm.faces[:, ::-1].copy()  # reverse every face -> inward normals
+    vertices_wp, faces_wp = _to_wp_mesh(mesh_tm.vertices, faces_inward, mesh_wp.device)
+
+    assert tw.characteristics.is_volume(vertices_wp, faces_wp) is False
+    repaired_wp = tw.repair.make_volume(vertices_wp, faces_wp)
+    assert tw.characteristics.is_volume(vertices_wp, repaired_wp) is True
+
+    # Reference: trimesh.repair.fix_inversion also produces an outward-oriented volume.
+    reference_tm = tm.Trimesh(vertices=mesh_tm.vertices, faces=faces_inward, process=False)
+    tm_repair.fix_inversion(reference_tm)
+    ours_tm = tm.Trimesh(vertices=mesh_tm.vertices, faces=_faces_2d(repaired_wp), process=False)
+    assert ours_tm.volume > 0.0
+    assert np.allclose(ours_tm.face_normals, reference_tm.face_normals, atol=1e-5)
+
+
+def test_make_volume_leaves_valid_mesh(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _, mesh_wp = icosahedron
+    repaired_wp = tw.repair.make_volume(mesh_wp.points, mesh_wp.indices)
+    # Already outward-oriented: unchanged.
+    assert np.array_equal(_faces_2d(repaired_wp), _faces_2d(mesh_wp.indices))
+
+
+def test_make_normals_consistent(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    faces_bad = mesh_tm.faces.copy()
+    faces_bad[::2] = faces_bad[::2][:, ::-1]  # inconsistent winding
+    faces_bad = faces_bad[:, ::-1]  # then invert everything
+    vertices_wp, faces_wp = _to_wp_mesh(mesh_tm.vertices, faces_bad, mesh_wp.device)
+
+    assert tw.characteristics.is_volume(vertices_wp, faces_wp) is False
+    repaired_wp = tw.repair.make_normals_consistent(vertices_wp, faces_wp)
+    assert tw.characteristics.is_winding_consistent(repaired_wp) is True
+    assert tw.characteristics.is_volume(vertices_wp, repaired_wp) is True
+
+    # Reference: trimesh.repair.fix_normals. On a closed mesh outward orientation is unique,
+    # so per-face normals must agree exactly (index representation may differ).
+    reference_tm = tm.Trimesh(vertices=mesh_tm.vertices, faces=faces_bad, process=False)
+    tm_repair.fix_normals(reference_tm)
+    ours_tm = tm.Trimesh(vertices=mesh_tm.vertices, faces=_faces_2d(repaired_wp), process=False)
+    assert np.allclose(ours_tm.face_normals, reference_tm.face_normals, atol=1e-5)
+
+
+def test_make_volume_multibody(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float64)
+    faces_np = np.asarray(mesh_tm.faces, dtype=np.int64)
+    n_vertices = vertices_np.shape[0]
+    n_faces = faces_np.shape[0]
+
+    # Body A: as-is (outward). Body B: translated and inverted (inward normals).
+    vertices_two = np.vstack([vertices_np, vertices_np + np.array([10.0, 0.0, 0.0])])
+    faces_two = np.vstack([faces_np, faces_np[:, ::-1] + n_vertices])
+    vertices_wp, faces_wp = _to_wp_mesh(vertices_two, faces_two, mesh_wp.device)
+
+    body_a = slice(0, 3 * n_faces)
+    body_b = slice(3 * n_faces, 6 * n_faces)
+
+    def _body_is_volume(flat_faces_wp: wp.array, body: slice) -> bool:
+        sub = wp.array(flat_faces_wp.numpy()[body], dtype=wp.int32, device=mesh_wp.device)
+        return tw.characteristics.is_volume(vertices_wp, sub)
+
+    # Initially only body B has inward-facing normals.
+    assert _body_is_volume(faces_wp, body_a) is True
+    assert _body_is_volume(faces_wp, body_b) is False
+
+    # multibody corrects each connected component independently -> both outward.
+    repaired_multi = tw.repair.make_volume(vertices_wp, faces_wp, multibody=True)
+    assert _body_is_volume(repaired_multi, body_a) is True
+    assert _body_is_volume(repaired_multi, body_b) is True
+
+    # The single-body path flips all-or-nothing and cannot orient two opposing bodies outward.
+    repaired_single = tw.repair.make_volume(vertices_wp, faces_wp, multibody=False)
+    ok_a = _body_is_volume(repaired_single, body_a)
+    ok_b = _body_is_volume(repaired_single, body_b)
+    assert not (ok_a and ok_b)
+
+
+def test_make_repairs_empty_mesh(device: str) -> None:
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    assert tw.repair.make_winding_consistent(faces_wp).shape[0] == 0
+    assert tw.repair.make_volume(vertices_wp, faces_wp).shape[0] == 0
+    assert tw.repair.make_normals_consistent(vertices_wp, faces_wp).shape[0] == 0

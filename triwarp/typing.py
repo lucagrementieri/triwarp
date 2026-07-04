@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     Array1dFloat32: TypeAlias = wp.array[wp.float32, Literal[1]]
     Array2dInt32: TypeAlias = wp.array[wp.int32, Literal[2]]
     Array2dFloat32: TypeAlias = wp.array[wp.float32, Literal[2]]
+    Array3dFloat32: TypeAlias = wp.array[wp.float32, Literal[3]]
 
     # wp.Int / wp.Float / wp.Scalar are TypeVars; subscripting wp.array[...] with them
     # yields a generic alias that requires type arguments under basedpyright.
@@ -38,6 +39,7 @@ else:
     Array1dFloat32 = wp.array
     Array2dInt32 = wp.array
     Array2dFloat32 = wp.array
+    Array3dFloat32 = wp.array
     Array1dInt = wp.array
     Array2dInt = wp.array
     Array1dFloat = wp.array
@@ -59,11 +61,13 @@ __all__ = [
     "Array2dInt",
     "Array2dInt32",
     "Array2dScalar",
+    "Array3dFloat32",
     "FloatArray",
     "IntArray",
     "ScalarArray",
     "as_array2d_float32",
     "as_array2d_int32",
+    "as_array3d_float32",
     "empty_float32_2d",
     "empty_int32_2d",
     "ensure_ndim",
@@ -123,6 +127,29 @@ def as_array2d_float32(arr: wp.array[T]) -> Array2dFloat32:
     """
     ensure_ndim(arr, 2, dtype=wp.float32)
     return cast(Array2dFloat32, arr)
+
+
+def as_array3d_float32(arr: wp.array[T]) -> Array3dFloat32:
+    """
+    Validate and narrow a Warp array to [`Array3dFloat32`][triwarp.typing.Array3dFloat32].
+
+    Parameters
+    ----------
+    arr
+        Warp array expected to be rank-3 ``float32``.
+
+    Returns
+    -------
+    Array3dFloat32
+        ``arr`` unchanged, narrowed to the checked alias.
+
+    Raises
+    ------
+    TypeError
+        If ``arr`` is not rank-3 ``float32``.
+    """
+    ensure_ndim(arr, 3, dtype=wp.float32)
+    return cast(Array3dFloat32, arr)
 
 
 def _shape_2d(shape: tuple[int, int] | list[int]) -> tuple[int, int]:
