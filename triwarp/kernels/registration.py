@@ -226,19 +226,6 @@ def compose_mat44(a: wp.array[wp.mat44], b: wp.array[wp.mat44], out_ab: wp.array
     out_ab[0] = a[0] * b[0]
 
 
-@wp.kernel
-def gather_face_normals(
-    face_normals: wp.array[wp.vec3], index: wp.array[wp.int32], out_normals: wp.array[wp.vec3]
-) -> None:
-    """Gather per-correspondence normals by index, zeroing misses (``index < 0``)."""
-    i = int(wp.tid())
-    f = index[i]
-    if f >= 0:
-        out_normals[i] = face_normals[f]
-    else:
-        out_normals[i] = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-
-
 @wp.func
 def robust_weight(residual: wp.float32, scale: wp.float32, kind: wp.int32) -> wp.float32:
     """

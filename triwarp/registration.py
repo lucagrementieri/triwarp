@@ -10,6 +10,7 @@ import warp as wp
 
 import triwarp as tw
 from triwarp.constants import TILE_1D
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import registration as kernel_registration
 
@@ -479,7 +480,7 @@ def icp_point_to_plane(
             )
             normals = wp.empty(n, dtype=wp.vec3, device=device)
             wp.launch(
-                kernel_registration.gather_face_normals,
+                kernel_array.gather_vec_skip_negative,
                 dim=n,
                 inputs=[face_normals, triangle_id, normals],
                 device=device,
@@ -491,7 +492,7 @@ def icp_point_to_plane(
             wp.copy(closest, target_vertices[index])
             normals = wp.empty(n, dtype=wp.vec3, device=device)
             wp.launch(
-                kernel_registration.gather_face_normals,
+                kernel_array.gather_vec_skip_negative,
                 dim=n,
                 inputs=[target_normals, index, normals],
                 device=device,

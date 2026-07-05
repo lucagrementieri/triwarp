@@ -43,13 +43,3 @@ def edge_lengths(
 def scatter_first_occurrence(inverse: wp.array[wp.int32], out_first: wp.array[wp.int32]) -> None:
     i = int(wp.tid())
     wp.atomic_min(out_first, inverse[i], i)
-
-
-@wp.kernel
-def gather_rows_at_indices(
-    src: wp.array2d[wp.int32], indices: wp.array[wp.int32], out: wp.array2d[wp.int32]
-) -> None:
-    i = int(wp.tid())
-    j = indices[i]
-    out[i, 0] = src[j, 0]
-    out[i, 1] = src[j, 1]

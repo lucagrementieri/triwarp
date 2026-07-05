@@ -7,6 +7,7 @@ import warp as wp
 import triwarp.typing as twt
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import interpolation as kernel_interpolation
+from triwarp.kernels import scatter as kernel_scatter
 
 
 def average_onto_faces(
@@ -74,7 +75,7 @@ def average_onto_vertices(
     out_sum = wp.zeros(n_vertices, dtype=wp.float32, device=device)
     out_valence = wp.zeros(n_vertices, dtype=wp.float32, device=device)
     wp.launch(
-        kernel_interpolation.scatter_face_values_sum_and_valence,
+        kernel_scatter.scatter_face_values_sum_and_valence,
         dim=n_faces,
         inputs=[faces, face_values, out_sum, out_valence],
         device=device,
@@ -129,7 +130,7 @@ def average_from_edges_onto_vertices(
     out_sum = wp.zeros(n_vertices, dtype=wp.float32, device=device)
     out_valence = wp.zeros(n_vertices, dtype=wp.float32, device=device)
     wp.launch(
-        kernel_interpolation.scatter_edges_sum_and_valence,
+        kernel_scatter.scatter_edges_sum_and_valence,
         dim=n_faces,
         inputs=[faces, edges, edges_orientation, edge_values, out_sum, out_valence],
         device=device,

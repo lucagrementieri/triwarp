@@ -64,15 +64,6 @@ def flip_faces_masked(
 
 
 @wp.kernel
-def accumulate_component_volume(
-    labels: wp.array[wp.int32], volumes: wp.array[wp.float32], out_accum: wp.array[wp.float32]
-) -> None:
-    """Atomically add each face's signed volume into its connected component's accumulator."""
-    f = int(wp.tid())
-    wp.atomic_add(out_accum, labels[f], volumes[f])
-
-
-@wp.kernel
 def mark_negative_component(
     labels: wp.array[wp.int32], component_volume: wp.array[wp.float32], out_flip: wp.array[wp.int32]
 ) -> None:

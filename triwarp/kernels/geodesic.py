@@ -49,18 +49,6 @@ def cotmatrix_triplets_f64(
 
 
 @wp.kernel
-def vertex_lumped_mass(
-    faces: wp.array[wp.int32], areas: wp.array[wp.float32], out_mass: wp.array[wp.float64]
-) -> None:
-    # Barycentric (lumped) mass: each face donates a third of its area to each incident vertex.
-    f = int(wp.tid())
-    third = wp.float64(areas[f]) / wp.float64(3.0)
-    wp.atomic_add(out_mass, faces[f * 3 + 0], third)
-    wp.atomic_add(out_mass, faces[f * 3 + 1], third)
-    wp.atomic_add(out_mass, faces[f * 3 + 2], third)
-
-
-@wp.kernel
 def seed_source_indicator(sources: wp.array[wp.int32], out_u0: wp.array[wp.float64]) -> None:
     # Set the initial heat to 1 at each source vertex (out_u0 pre-zeroed by the caller).
     t = int(wp.tid())

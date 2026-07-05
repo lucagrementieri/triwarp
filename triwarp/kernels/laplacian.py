@@ -189,18 +189,6 @@ def apply_operator(
 
 
 @wp.kernel
-def lumped_mass(
-    faces: wp.array[wp.int32], areas: wp.array[wp.float32], out_mass: wp.array[wp.float32]
-) -> None:
-    # Barycentric (lumped) mass: each face donates a third of its area to each incident vertex.
-    f = int(wp.tid())
-    third = areas[f] / wp.float32(3.0)
-    wp.atomic_add(out_mass, faces[f * 3 + 0], third)
-    wp.atomic_add(out_mass, faces[f * 3 + 1], third)
-    wp.atomic_add(out_mass, faces[f * 3 + 2], third)
-
-
-@wp.kernel
 def cotmatrix_triplets(
     faces: wp.array[wp.int32],
     cot_entries: wp.array2d[wp.float32],

@@ -289,18 +289,20 @@ def rdp_keep_mask(
         out_keep[i] = True
     stack[0] = 0
     stack[1] = n - 1
-    top = 1  # number of (ixs, ixe) pairs currently on the stack
+    # int()/float() declare mutable Warp dynamic variables; bare literals are compile-time
+    # constants that get folded (freezing the loop). See noqa: UP018/RUF046 below.
+    top = int(1)  # noqa: UP018, RUF046 — number of (ixs, ixe) pairs currently on the stack
     while top > 0:
         top -= 1
         ixs = stack[2 * top + 0]
         ixe = stack[2 * top + 1]
-        sdmax = 0.0
-        ixc = -1
+        sdmax = float(0.0)  # noqa: UP018 — mutable Warp dynamic variable
+        ixc = int(-1)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
         if ixe - ixs > 1:
             seg = polyline[ixe] - polyline[ixs]
             sdes = wp.dot(seg, seg)
             for k in range(ixs + 1, ixe):
-                sd = 0.0  # initialize before branching (variable scope rule)
+                sd = float(0.0)  # noqa: UP018 — mutable; initialize before branching
                 if sdes <= RDP_LINE_EPS:
                     dvec = polyline[k] - polyline[ixs]
                     sd = wp.dot(dvec, dvec)

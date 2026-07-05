@@ -2,8 +2,8 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.kernels import array as kernel_array
 from triwarp.kernels import curvature as kernel_curvature
+from triwarp.kernels import scatter as kernel_scatter
 from triwarp.vertices import area_weighted_vertex_normals, vertex_defects
 
 
@@ -134,7 +134,7 @@ def discrete_gaussian_curvature(
     defects = vertex_defects(vertices.shape[0], faces, face_angles)
     gauss_curvature = wp.zeros(points.shape[0], dtype=wp.float32, device=points.device)
     wp.launch(
-        kernel_array.scatter_offset_sum,
+        kernel_scatter.scatter_offset_sum,
         dim=nearest_indices.shape[0],
         inputs=[defects, nearest_indices, nearest_offsets, gauss_curvature],
     )

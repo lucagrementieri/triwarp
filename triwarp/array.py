@@ -13,6 +13,7 @@ import triwarp.typing as twt
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import reduce as kernel_reduce
+from triwarp.kernels import scatter as kernel_scatter
 
 DType = TypeVar("DType")
 
@@ -456,19 +457,13 @@ def _isin_lookup_mask(
     device = elements_flat.device
     membership_wp = wp.zeros(max_index, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_array.mark_membership_mask,
+        kernel_scatter.mark_membership_mask,
         dim=k,
-        inputs=[test_elements, membership_wp],
+        inputs=[test_elements, wp.int32(max_index), membership_wp],
         device=device,
     )
-    out_wp = wp.empty(elements_flat.shape, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_array.isin_lookup_mask,
-        dim=int(elements_flat.shape[0]),
-        inputs=[elements_flat, membership_wp, out_wp],
-        device=device,
-    )
-    return out_wp
+    # ``membership_wp[elements_flat]`` gathers the boolean membership flag per element.
+    return gather(membership_wp, elements_flat)
 
 
 def _isin_lookup_sorted(
@@ -527,7 +522,7 @@ def flatnonzero(mask: wp.array[wp.bool]) -> wp.array[wp.int32]:
 
     out_indices = wp.empty(n_out, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_array.scatter_index_where,
+        kernel_scatter.scatter_index_where,
         dim=n,
         inputs=[mask, exclusive, out_indices],
         device=device,

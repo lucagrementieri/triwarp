@@ -583,21 +583,10 @@ def unique_rows(
         kernel_edges.scatter_first_occurrence, dim=n, inputs=[inverse, first_idx], device=device
     )
 
-    if is_vec3:
-        unique_rows_out = gather(data, first_idx)
-    else:
+    if not is_vec3:
         twt.ensure_ndim(data, 2)
-        n_cols = int(data.shape[1])
-        if data.dtype == wp.int32:
-            unique_rows_out = twt.empty_int32_2d((n_unique, n_cols), device=device)
-        else:
-            unique_rows_out = twt.empty_float32_2d((n_unique, n_cols), device=device)
-        wp.launch(
-            kernel_array.gather_rows,
-            dim=n_unique,
-            inputs=[data, first_idx, unique_rows_out],
-            device=device,
-        )
+    # ``gather`` performs both rank-1 (vec3) and rank-2 (int32/float32 row) gather.
+    unique_rows_out = gather(data, first_idx)
 
     if not return_inverse:
         inverse = None

@@ -6,6 +6,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import vertices as kernel_vertices
 
 
@@ -63,7 +64,7 @@ def mean_vertex_normals(
     normals = wp.zeros((n_vertices, 3), dtype=wp.float32, device=faces.device)
     faces2d = faces.reshape((-1, 3))
     wp.launch(
-        kernel_array.scatter_sum_vec,
+        kernel_scatter.scatter_sum_vec,
         dim=face_normals.shape[0],
         inputs=[face_normals, faces2d, normals],
     )
@@ -107,7 +108,7 @@ def weighted_vertex_normals(
     normals = wp.zeros((n_vertices, 3), dtype=wp.float32, device=faces.device)
     faces2d = faces.reshape((-1, 3))
     wp.launch(
-        kernel_array.scatter_weighted_sum_vec,
+        kernel_scatter.scatter_weighted_sum_vec,
         dim=face_normals.shape[0],
         inputs=[face_normals, faces2d, face_weights, normals],
     )
@@ -295,7 +296,7 @@ def vertex_defects(
     angle_sum = wp.zeros(n_vertices, dtype=wp.float32, device=faces.device)
     faces2d = faces.reshape((-1, 3))
     wp.launch(
-        kernel_array.scatter_sum_scalar,
+        kernel_scatter.scatter_sum_scalar,
         dim=face_angles.shape[0],
         inputs=[face_angles, faces2d, angle_sum],
     )

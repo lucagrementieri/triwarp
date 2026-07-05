@@ -301,7 +301,9 @@ def build_local_triangulations(
     ang = wp.zeros(shape=MAX_NEIGHBOURS, dtype=wp.float32)
 
     # --- gather + filter neighbours ---
-    m = 0
+    # int()/float() declare mutable Warp dynamic variables; bare literals are compile-time
+    # constants that freeze the enclosing loop (out_valid stays all-False -> no faces).
+    m = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
     for i in range(k):
         if m >= MAX_NEIGHBOURS:
             break
@@ -323,7 +325,7 @@ def build_local_triangulations(
 
     # --- tangent-plane basis (project neighbours onto plane through center) ---
     base = wp.vec3(0.0, 0.0, 0.0)
-    normalizer_sq = 0.0
+    normalizer_sq = float(0.0)  # noqa: UP018 — mutable Warp dynamic variable
     for i in range(m):
         d = points[nbr[i]] - a
         pv = d - wp.dot(n_center, d) * n_center
@@ -344,7 +346,7 @@ def build_local_triangulations(
         else:
             vec = base
         cp = wp.cross(vec, base)
-        s = 1.0
+        s = float(1.0)  # noqa: UP018 — mutable Warp dynamic variable
         if wp.dot(cp, n_center) < 0.0:
             s = -1.0
         ang[i] = wp.atan2(s * wp.length(cp), wp.dot(vec, base))
@@ -364,7 +366,7 @@ def build_local_triangulations(
             nbr[mn] = tn
 
     # --- boundary detection: first angular gap wider than boundary_angle ---
-    border = -1
+    border = int(-1)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
     for i in range(m):
         if i + 1 < m:
             diff = ang[i + 1] - ang[i]
@@ -375,10 +377,10 @@ def build_local_triangulations(
             break
 
     # --- greedy fan optimisation (linear-scan replacement of the priority queue) ---
-    current = m
+    current = m  # inherits m's dynamic-variable type (m is already mutable)
     for _step in range(m):
-        best_w = -FLOAT32_INF_CONSTANT
-        best_pos = -1
+        best_w = float(-FLOAT32_INF_CONSTANT)  # float() keeps this a mutable Warp variable
+        best_pos = int(-1)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
         for i in range(m):
             if nbr[i] < 0:
                 continue
@@ -404,7 +406,7 @@ def build_local_triangulations(
             break
 
     # --- emit fan triangles between consecutive surviving neighbours ---
-    slot = 0
+    slot = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
     for i in range(m):
         if nbr[i] < 0:
             continue

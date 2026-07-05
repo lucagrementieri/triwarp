@@ -6,6 +6,7 @@ import warp.sparse as wps
 import triwarp.typing as twt
 from triwarp.edges import edges_unique, faces_to_edges
 from triwarp.kernels import laplacian as kernel_laplacian
+from triwarp.kernels import scatter as kernel_scatter
 from triwarp.triangles import face_normals_and_areas
 
 
@@ -291,6 +292,69 @@ def laplacian(
     return operator
 
 
+def uniform_laplacian(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> wps.BsrMatrix[wp.float32]:
+    """
+    Combinatorial (graph) Laplacian ``L = A - diag(deg)`` from mesh connectivity.
+
+    Builds the sparse ``(n_vertices, n_vertices)`` matrix with unit off-diagonal weights on every
+    undirected edge and the negated vertex degree on the diagonal, ignoring geometry. Mirrors
+    libigl's uniform-weight ``igl::harmonic`` variant (``L = A - diag(rowsum(A))`` from
+    ``igl::adjacency_matrix``). Diagonal entries are **negative** (each row sums to zero), so ``-L``
+    is positive semi-definite — the same sign convention as
+    [`cotmatrix`][triwarp.laplacian.cotmatrix]. This is the operator behind the Tutte embedding
+    [`tutte`][triwarp.parametrization.tutte], whose interior block ``-L_uu = diag(deg) - A`` is a
+    diagonally dominant M-matrix (hence positive definite for a well-posed Dirichlet problem).
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions. Only the count and device are used; positions do
+        not affect the uniform weights.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        Square ``(n_vertices, n_vertices)`` combinatorial Laplacian in 1x1-block BSR form on
+        ``vertices.device``.
+
+    See Also
+    --------
+    [`cotmatrix`][triwarp.laplacian.cotmatrix]
+    [`laplacian`][triwarp.laplacian.laplacian]
+    [`tutte`][triwarp.parametrization.tutte]
+    """
+    n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    device = vertices.device
+
+    if n_faces == 0:
+        return wps.bsr_from_triplets(
+            n_vertices,
+            n_vertices,
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.float32, device=device),
+            prune_numerical_zeros=False,
+        )
+
+    # Symmetric unit-weight adjacency: each undirected edge emits both directed (a, b) and (b, a)
+    # triplets with weight 1, matching ``igl::adjacency_matrix`` (all non-zeros forced to one).
+    rows, cols, vals = laplacian_entries(vertices, faces, equal_weight=True, symmetric=True)
+    adjacency = wps.bsr_from_triplets(
+        n_vertices, n_vertices, rows, cols, vals, prune_numerical_zeros=False
+    )
+
+    # Vertex degrees as the row sums ``A @ 1``, then ``L = A - diag(deg)``.
+    degree = wp.empty(n_vertices, dtype=wp.float32, device=device)
+    ones = wp.ones(n_vertices, dtype=wp.float32, device=device)
+    wps.bsr_mv(adjacency, ones, degree, alpha=1.0, beta=0.0)
+    return wps.bsr_axpy(x=adjacency, y=wps.bsr_diag(diag=degree), alpha=1.0, beta=-1.0)
+
+
 def mass_matrix_entries(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
 ) -> wp.array[wp.float32]:
@@ -325,7 +389,10 @@ def mass_matrix_entries(
     if n_faces > 0:
         _, areas = face_normals_and_areas(vertices, faces)
         wp.launch(
-            kernel_laplacian.lumped_mass, dim=n_faces, inputs=[faces, areas, mass], device=device
+            kernel_scatter.scatter_face_thirds,
+            dim=n_faces,
+            inputs=[faces, areas, wp.float32(3.0), mass],
+            device=device,
         )
     return mass
 

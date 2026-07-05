@@ -13,8 +13,8 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.kernels import array as kernel_array
 from triwarp.kernels import boundary as kernel_boundary
+from triwarp.kernels import scatter as kernel_scatter
 
 
 def boundary_edges(
@@ -360,9 +360,9 @@ def ears(
     n_boundary_rows = int(boundary_rows.shape[0])
     if n_boundary_rows > 0:
         wp.launch(
-            kernel_array.mark_membership_mask,
+            kernel_scatter.mark_membership_mask,
             dim=n_boundary_rows,
-            inputs=[boundary_rows, edge_boundary],
+            inputs=[boundary_rows, wp.int32(n_faces * 3), edge_boundary],
             device=device,
         )
 

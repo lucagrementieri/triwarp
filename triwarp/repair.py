@@ -19,6 +19,7 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels import edges as kernel_edges
 from triwarp.kernels import repair as kernel_repair
 from triwarp.kernels import sample as kernel_sample
+from triwarp.kernels import scatter as kernel_scatter
 from triwarp.unique import hash_vector_rows, unique_1d, unique_faces, unique_rows
 
 
@@ -59,7 +60,7 @@ def remove_unreferenced_vertices(
     referenced = wp.zeros(n_vertices, dtype=wp.bool, device=device)
     if n_indices > 0:
         wp.launch(
-            kernel_array.mark_membership_mask_bounded,
+            kernel_scatter.mark_membership_mask,
             dim=n_indices,
             inputs=[faces, wp.int32(n_vertices), referenced],
             device=device,
@@ -70,7 +71,7 @@ def remove_unreferenced_vertices(
     n_referenced = int(tw.reduce.sum(referenced))
     if n_referenced > 0:
         wp.launch(
-            kernel_array.scatter_index, dim=n_referenced, inputs=[inverse, remap], device=device
+            kernel_scatter.scatter_index, dim=n_referenced, inputs=[inverse, remap], device=device
         )
 
     new_vertices = (
@@ -471,9 +472,9 @@ def make_volume(
         labels = tw.graph.face_connected_component_labels(faces)
         accum = wp.zeros(n_faces, dtype=wp.float32, device=device)
         wp.launch(
-            kernel_repair.accumulate_component_volume,
+            kernel_scatter.scatter_add_scalar,
             dim=n_faces,
-            inputs=[labels, signed_volumes, accum],
+            inputs=[signed_volumes, labels, accum],
             device=device,
         )
         flip = wp.empty(n_faces, dtype=wp.int32, device=device)

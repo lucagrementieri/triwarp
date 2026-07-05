@@ -119,90 +119,17 @@ def gather_2d_from_1d(
 
 
 @wp.kernel
-def gather_rows(
-    array: wp.array2d[wp.Scalar], indices: wp.array[wp.int32], out_gathered: wp.array2d[wp.Scalar]
+def gather_vec_skip_negative(
+    source: wp.array[wp.vec3], index: wp.array[wp.int32], out_gathered: wp.array[wp.vec3]
 ) -> None:
-    tid = wp.tid()
-    index = indices[tid]
-    for j in range(out_gathered.shape[1]):
-        out_gathered[tid, j] = array[index, j]
-
-
-@wp.kernel
-def scatter_sum_scalar(
-    values: wp.array2d[wp.Scalar], indices: wp.array2d[wp.int32], out_sum: wp.array[wp.Scalar]
-) -> None:
-    tid = wp.tid()
-    index = indices[tid]
-    for j in range(indices.shape[1]):
-        wp.atomic_add(out_sum, index[j], values[tid, j])
-
-
-@wp.kernel
-def scatter_sum_vec(
-    values: wp.array[wp.vec3], indices: wp.array2d[wp.int32], out_sum: wp.array2d[wp.float32]
-) -> None:
-    tid = wp.tid()
-    index = indices[tid]
-    value = values[tid]
-    for j in range(indices.shape[1]):
-        wp.atomic_add(out_sum, index[j], 0, value[0])
-        wp.atomic_add(out_sum, index[j], 1, value[1])
-        wp.atomic_add(out_sum, index[j], 2, value[2])
-
-
-@wp.kernel
-def scatter_weighted_sum_vec(
-    values: wp.array[wp.vec3],
-    indices: wp.array2d[wp.int32],
-    weights: wp.array2d[wp.float32],
-    out_sum: wp.array2d[wp.float32],
-) -> None:
-    tid = wp.tid()
-    index = indices[tid]
-    value = values[tid]
-    for j in range(indices.shape[1]):
-        wp.atomic_add(out_sum, index[j], 0, value[0] * weights[tid, j])
-        wp.atomic_add(out_sum, index[j], 1, value[1] * weights[tid, j])
-        wp.atomic_add(out_sum, index[j], 2, value[2] * weights[tid, j])
-
-
-@wp.kernel
-def scatter_offset_sum(
-    values: wp.array[wp.Scalar],
-    flat_indices: wp.array[wp.int32],
-    offsets: wp.array[wp.int32],
-    out_sum: wp.array[wp.Scalar],
-) -> None:
-    tid = wp.tid()
-    in_index = flat_indices[tid]
-    value = values[in_index]
-    out_index = binary_search_index(offsets, tid) - 1
-    wp.atomic_add(out_sum, out_index, value)
-
-
-@wp.kernel
-def mark_membership_mask(indices: wp.array[wp.int32], mask: wp.array[wp.bool]) -> None:
-    tid = int(wp.tid())
-    mask[indices[tid]] = wp.bool(True)
-
-
-@wp.kernel
-def mark_membership_mask_bounded(
-    indices: wp.array[wp.int32], n: wp.int32, out_mask: wp.array[wp.bool]
-) -> None:
-    tid = int(wp.tid())
-    index = indices[tid]
-    if index >= wp.int32(0) and index < n:
-        out_mask[index] = wp.bool(True)
-
-
-@wp.kernel
-def isin_lookup_mask(
-    elements: wp.array[wp.int32], membership: wp.array[wp.bool], out_mask: wp.array[wp.bool]
-) -> None:
-    tid = int(wp.tid())
-    out_mask[tid] = membership[elements[tid]]
+    # Gather vectors by index, writing a zero vector wherever the index is negative
+    # (missing-correspondence sentinel).
+    i = int(wp.tid())
+    f = index[i]
+    if f >= 0:
+        out_gathered[i] = source[f]
+    else:
+        out_gathered[i] = wp.vec3(0.0, 0.0, 0.0)
 
 
 @wp.kernel
@@ -211,21 +138,6 @@ def isin_lookup_sorted(
 ) -> None:
     tid = int(wp.tid())
     out_mask[tid] = binary_search_sorted_contains(sorted_test, elements[tid])
-
-
-@wp.kernel
-def scatter_index(index: wp.array[wp.int32], out_scattered: wp.array[wp.int32]) -> None:
-    tid = int(wp.tid())
-    out_scattered[index[tid]] = wp.int32(tid)
-
-
-@wp.kernel
-def scatter_index_where(
-    mask: wp.array[wp.bool], offset: wp.array[wp.int32], out_scattered: wp.array[wp.int32]
-) -> None:
-    i = int(wp.tid())
-    if mask[i]:
-        out_scattered[offset[i]] = wp.int32(i)
 
 
 @wp.func

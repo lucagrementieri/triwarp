@@ -107,14 +107,14 @@ def face_adjacency(
     )
     tw.array.sort_rows(adjacency)
     if return_edges:
-        adjacency_edges = twt.empty_int32_2d((edge_groups.shape[0], 2), device=faces.device)
         if edge_groups.shape[0] > 0:
-            wp.launch(
-                kernel_array.gather_rows,
-                dim=edge_groups.shape[0],
-                inputs=[edges_sorted, edge_groups[:, 0], adjacency_edges],
-                device=faces.device,
-            )
+            # ``edge_groups[:, 0]`` is a strided column view; Warp's fancy indexing reads the
+            # underlying flat buffer and ignores the stride, so materialize a contiguous index
+            # first. (Slicing an empty first axis also raises, hence the guard.)
+            first_edge_index = wp.clone(edge_groups[:, 0])
+            adjacency_edges = tw.array.gather(edges_sorted, first_edge_index)
+        else:
+            adjacency_edges = twt.empty_int32_2d((0, 2), device=faces.device)
         return twt.as_array2d_int32(adjacency), twt.as_array2d_int32(adjacency_edges)
     return twt.as_array2d_int32(adjacency)
 

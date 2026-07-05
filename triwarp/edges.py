@@ -133,13 +133,7 @@ def edges_unique(
         device=device,
     )
 
-    unique_edges_out = twt.empty_int32_2d((n_unique, 2), device=device)
-    wp.launch(
-        kernel_edges.gather_rows_at_indices,
-        dim=n_unique,
-        inputs=[edges_sorted, first_occ, unique_edges_out],
-        device=device,
-    )
+    unique_edges_out = tw.array.gather(edges_sorted, first_occ)
 
     return twt.as_array2d_int32(unique_edges_out), inverse
 
