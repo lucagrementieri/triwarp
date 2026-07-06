@@ -216,3 +216,36 @@ def cotmatrix_triplets(
         out_rows[base + 3] = dest
         out_cols[base + 3] = dest
         out_vals[base + 3] = -w
+
+
+@wp.kernel
+def cotmatrix_triplets_f64(
+    faces: wp.array[wp.int32],
+    cot_entries: wp.array2d[wp.float32],
+    out_rows: wp.array[wp.int32],
+    out_cols: wp.array[wp.int32],
+    out_vals: wp.array[wp.float64],
+) -> None:
+    # float64 build of ``cotmatrix_triplets`` from the shared float32 half-cotangent weights.
+    # Emitting float64 values in a single ``bsr_from_triplets`` (rather than recasting a float32
+    # matrix) dodges a Warp 1.14 ``bsr_mm`` bug triggered by a second rebuild — see issue_report.md.
+    f = int(wp.tid())
+    for e in range(3):
+        c0 = (e + 1) % 3
+        c1 = (e + 2) % 3
+        source = faces[f * 3 + c0]
+        dest = faces[f * 3 + c1]
+        w = wp.float64(cot_entries[f, e])
+        base = f * 12 + e * 4
+        out_rows[base + 0] = source
+        out_cols[base + 0] = dest
+        out_vals[base + 0] = w
+        out_rows[base + 1] = dest
+        out_cols[base + 1] = source
+        out_vals[base + 1] = w
+        out_rows[base + 2] = source
+        out_cols[base + 2] = source
+        out_vals[base + 2] = -w
+        out_rows[base + 3] = dest
+        out_cols[base + 3] = dest
+        out_vals[base + 3] = -w

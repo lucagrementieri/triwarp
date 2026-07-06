@@ -153,74 +153,45 @@ def map_vertices_to_circle(
     return out_uv
 
 
-def _to_float64_bsr(
-    matrix: wps.BsrMatrix[wp.float32], n: int, device: wp.DeviceLike
-) -> wps.BsrMatrix[wp.float64]:
-    """Recast a square 1x1-block float32 ``BsrMatrix`` to float64, preserving its sparsity."""
-    nnz = int(matrix.nnz)
-    rows = wp.empty(nnz, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_parametrization.expand_offsets_to_rows,
-        dim=n,
-        inputs=[matrix.offsets, rows],
-        device=device,
-    )
-    values64 = wp.empty(nnz, dtype=wp.float64, device=device)
-    wp.utils.array_cast(matrix.values, values64)
-    return wps.bsr_from_triplets(
-        n, n, rows, matrix.columns, values64, prune_numerical_zeros=False
-    )
-
-
 def _solve_fixed_boundary(
-    laplacian: wps.BsrMatrix[wp.float32],
+    laplacian: wps.BsrMatrix[wp.float64],
     mass_diag: wp.array[wp.float32] | None,
+    k: int,
     n_vertices: int,
     boundary_indices: wp.array[wp.int32],
     boundary_uv: wp.array[wp.vec2],
-    k: int,
     device: wp.DeviceLike,
 ) -> wp.array[wp.vec2]:
     """
     Solve the fixed-boundary quadratic minimization shared by ``harmonic`` and ``tutte``.
 
-    Forms the operator ``Q = -L`` for ``k == 1`` and ``Q = (-L) (M^-1 (-L))^(k-1)`` for ``k > 1``
-    (``M`` the diagonal mass, identity when ``mass_diag is None``), then solves the interior
-    Dirichlet system ``Q_uu x_u = -Q_ub bc`` per UV column with conjugate gradient, keeping the
-    fixed vertices at ``boundary_uv``.
+    Forms the positive-semi-definite operator ``Q = -L`` for ``k == 1`` and
+    ``Q = (-L) (M^-1 (-L))^(k-1)`` for ``k > 1`` (``M`` the diagonal mass, identity when
+    ``mass_diag is None``), then solves the interior Dirichlet system ``Q_uu x_u = -Q_ub bc`` per
+    UV column with conjugate gradient, keeping the fixed vertices at ``boundary_uv``. ``laplacian``
+    must be float64: ``k > 1`` squares its condition number, and building the operator natively in a
+    single ``bsr_from_triplets`` (never recast/rebuilt) is what keeps ``bsr_mm`` deterministic — see
+    issue_report.md.
     """
-    # Operator Q (positive semi-definite), assembled in float64: for k > 1 the operator squares the
-    # Laplacian condition number, which float32 conjugate gradient cannot resolve. q and neg_l alias
-    # -L initially; bsr_mm returns fresh matrices, so neg_l stays valid across the accumulation.
-    # ``wp.synchronize()`` guards each sparse matrix-matrix product: warp's bsr_mm reuses internal
-    # work buffers that race when one product's result is consumed by the next before it completes,
-    # producing nondeterministic (occasionally garbage) entries.
-    laplacian64 = _to_float64_bsr(laplacian, n_vertices, device)
-    neg_l = wps.bsr_axpy(x=laplacian64, alpha=-1.0)
+    # Operator Q. neg_l aliases -L; bsr_mm returns fresh matrices so neg_l stays valid across the
+    # accumulation. Chained products stay deterministic because neg_l is a single-build operator.
+    neg_l = wps.bsr_axpy(x=laplacian, alpha=-1.0)
     q = neg_l
     if k > 1:
         if mass_diag is None:
             for _ in range(k - 1):
-                wp.synchronize()
                 q = wps.bsr_mm(q, neg_l)
-            wp.synchronize()
         else:
-            mass64 = wp.empty(n_vertices, dtype=wp.float64, device=device)
-            wp.utils.array_cast(mass_diag, mass64)
             inv_mass = wp.empty(n_vertices, dtype=wp.float64, device=device)
             wp.launch(
                 kernel_parametrization.reciprocal,
                 dim=n_vertices,
-                inputs=[mass64, inv_mass],
+                inputs=[mass_diag, inv_mass],
                 device=device,
             )
             mass_inv = wps.bsr_diag(diag=inv_mass)
             for _ in range(k - 1):
-                wp.synchronize()
-                half = wps.bsr_mm(q, mass_inv)
-                wp.synchronize()
-                q = wps.bsr_mm(half, neg_l)
-            wp.synchronize()
+                q = wps.bsr_mm(wps.bsr_mm(q, mass_inv), neg_l)
 
     # Boundary mask + prescribed positions scattered to full length.
     n_boundary = int(boundary_indices.shape[0])
@@ -299,24 +270,8 @@ def _solve_fixed_boundary(
     preconditioner = wpl.preconditioner(q_uu, "diag")
     sol_x = wp.zeros(n_interior, dtype=wp.float64, device=device)
     sol_y = wp.zeros(n_interior, dtype=wp.float64, device=device)
-    wpl.cg(
-        q_uu,
-        rhs_x,
-        sol_x,
-        tol=_CG_TOLERANCE,
-        maxiter=10 * n_interior,
-        M=preconditioner,
-        use_cuda_graph=False,
-    )
-    wpl.cg(
-        q_uu,
-        rhs_y,
-        sol_y,
-        tol=_CG_TOLERANCE,
-        maxiter=10 * n_interior,
-        M=preconditioner,
-        use_cuda_graph=False,
-    )
+    wpl.cg(q_uu, rhs_x, sol_x, tol=_CG_TOLERANCE, maxiter=10 * n_interior, M=preconditioner)
+    wpl.cg(q_uu, rhs_y, sol_y, tol=_CG_TOLERANCE, maxiter=10 * n_interior, M=preconditioner)
 
     out_uv = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     wp.launch(
@@ -342,9 +297,9 @@ def harmonic(
     [`cotmatrix`][triwarp.laplacian.cotmatrix] subject to the boundary vertices being pinned to
     ``boundary_uv``. For ``k == 1`` this is the harmonic map (each interior UV is the
     cotangent-weighted average of its neighbors); ``k == 2`` is the biharmonic map, and so on. The
-    interior system is
-    solved with conjugate gradient, so a **CUDA device is required** whenever there are interior
-    vertices to solve for (``warp.optim.linear.cg`` returns NaN on the CPU in Warp 1.14.0).
+    interior system is solved with conjugate gradient, so a **CUDA device is required** whenever
+    there are interior vertices to solve for (``warp.optim.linear.cg`` returns NaN on the CPU in
+    Warp 1.14.0).
 
     Parameters
     ----------
@@ -359,7 +314,8 @@ def harmonic(
         [`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle]).
     k
         Harmonic power (``>= 1``). ``k > 1`` additionally uses the barycentric lumped mass matrix
-        [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries].
+        [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries]. The operator is assembled in
+        float64 (built native, never recast) so the ill-conditioned ``k > 1`` solve is accurate.
 
     Returns
     -------
@@ -386,10 +342,10 @@ def harmonic(
     n_vertices = int(vertices.shape[0])
     if n_vertices == 0:
         return wp.empty(0, dtype=wp.vec2, device=device)
-    laplacian = cotmatrix(vertices, faces)
+    laplacian = cotmatrix(vertices, faces, dtype=wp.float64)
     mass_diag = mass_matrix_entries(vertices, faces) if k > 1 else None
     return _solve_fixed_boundary(
-        laplacian, mass_diag, n_vertices, boundary_indices, boundary_uv, k, device
+        laplacian, mass_diag, k, n_vertices, boundary_indices, boundary_uv, device
     )
 
 
@@ -405,11 +361,12 @@ def tutte(
 
     Identical to [`harmonic`][triwarp.parametrization.harmonic] except the operator is the
     combinatorial [`uniform_laplacian`][triwarp.laplacian.uniform_laplacian] instead of the
-    cotangent one — for ``k == 1`` this is the *only* difference. Because the uniform Laplacian's
-    free-free block is a diagonally dominant M-matrix, the Tutte embedding of a mesh with a convex
-    boundary is guaranteed bijective (fold-free), unlike the harmonic/conformal maps. For ``k > 1``
-    the mass matrix is the identity (matching libigl's ``speye`` graph-Laplacian variant). Requires
-    a **CUDA device** whenever there are interior vertices to solve for.
+    cotangent one — for ``k == 1`` that Laplacian is the *only* difference. Because the uniform
+    Laplacian's free-free block is a diagonally dominant M-matrix, the Tutte embedding of a mesh
+    with a convex boundary is guaranteed bijective (fold-free), unlike the harmonic/conformal maps.
+    For
+    ``k > 1`` the mass matrix is the identity (matching libigl's ``speye`` graph-Laplacian variant).
+    Requires a **CUDA device** whenever there are interior vertices to solve for.
 
     Parameters
     ----------
@@ -451,7 +408,7 @@ def tutte(
     n_vertices = int(vertices.shape[0])
     if n_vertices == 0:
         return wp.empty(0, dtype=wp.vec2, device=device)
-    laplacian = uniform_laplacian(vertices, faces)
+    laplacian = uniform_laplacian(vertices, faces, dtype=wp.float64)
     return _solve_fixed_boundary(
-        laplacian, None, n_vertices, boundary_indices, boundary_uv, k, device
+        laplacian, None, k, n_vertices, boundary_indices, boundary_uv, device
     )
