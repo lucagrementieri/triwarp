@@ -332,7 +332,7 @@ def _total_fill_metric(
         for vtx in loop:
             loop_of[int(vtx)] = li
         loop_pos = tw.array.gather(vertices, loop_wp)
-        normals.append(np.asarray(tw.polyline.closed_polyline_normal(loop_pos)))
+        normals.append(np.asarray(tw.polyline.polyline_normal(loop_pos)))
         pos = vertices_np[loop]
         rim = np.roll(pos, -1, axis=0) - pos
         max_sq = float(np.max(np.einsum("ij,ij->i", rim, rim)))

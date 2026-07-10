@@ -32,16 +32,9 @@ def _centroid_np(pts: np.ndarray) -> np.ndarray:
     return (midpoints * seg_len).sum(axis=0) / seg_len.sum()
 
 
-def _normal_np(pts: np.ndarray) -> np.ndarray:
-    segments = np.diff(pts, axis=0)
-    normal = np.cross(segments[:-1], segments[1:]).sum(axis=0)
-    return normal / np.linalg.norm(normal)
-
-
 def _closed_normal_np(pts: np.ndarray) -> np.ndarray:
-    pts = _closed_from(pts)
-    segments = np.diff(pts, axis=0)
-    normal = np.cross(segments, np.roll(segments, -1, axis=0)).sum(axis=0)
+    # Closed Newell's method: consecutive-vertex cross products including the wrap-around edge.
+    normal = np.cross(pts, np.roll(pts, -1, axis=0)).sum(axis=0)
     return normal / np.linalg.norm(normal)
 
 
@@ -172,7 +165,7 @@ def _radius_np(
     if center is None:
         center = _centroid_np(pts)
     if normal is None:
-        normal = _normal_np(pts)
+        normal = _closed_normal_np(pts)
     else:
         normal = normal / np.linalg.norm(normal)
     projected = pts - normal * np.sum((pts - center) * normal, axis=-1, keepdims=True)
@@ -245,16 +238,10 @@ def test_polyline_centroid_matches_reference(device: str) -> None:
 
 
 def test_polyline_normal_matches_reference(device: str) -> None:
-    pts_np = _random_open_polyline(21)
-    normal_wp = tw.polyline.polyline_normal(_polyline_wp(pts_np, device))
-    normal_np = _normal_np(pts_np)
-    # normal sign is well-defined by the summed cross products; compare directly.
-    assert np.allclose(list(normal_wp), normal_np, rtol=1e-4, atol=1e-4)
-
-
-def test_closed_polyline_normal_matches_reference(device: str) -> None:
     pts_np = _random_open_polyline(22)
-    normal_wp = tw.polyline.closed_polyline_normal(_polyline_wp(pts_np, device))
+    normal_wp = tw.polyline.polyline_normal(_polyline_wp(pts_np, device))
+    # polyline_normal treats the polyline as a closed loop (Newell's method); the normal sign is
+    # well-defined by the summed cross products, so compare directly.
     assert np.allclose(list(normal_wp), _closed_normal_np(pts_np), rtol=1e-4, atol=1e-4)
 
 

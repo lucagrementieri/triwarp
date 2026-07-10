@@ -71,23 +71,11 @@ def segment_midpoints_and_lengths(
 
 @wp.kernel
 def accumulate_newell_normal(polyline: wp.array[wp.vec3], out_normal: wp.array[wp.vec3]) -> None:
-    # dim == n_points - 2: consecutive segment pairs (i, i + 1), no wrap-around.
+    # dim == n_points - 1: Newell's method sums cross products of consecutive vertices
+    # (position vectors), cross(V_i, V_{i + 1}). Appending the closing vertex before launch
+    # (as polyline_normal does) folds the wrap-around edge into this same sum.
     i = int(wp.tid())
-    s0 = segment_displacement(polyline, i)
-    s1 = segment_displacement(polyline, i + 1)
-    wp.atomic_add(out_normal, 0, wp.cross(s0, s1))
-
-
-@wp.kernel
-def accumulate_newell_normal_closed(
-    polyline: wp.array[wp.vec3], out_normal: wp.array[wp.vec3]
-) -> None:
-    # dim == n_points - 1: cyclic segment pairs (closing edge included), for a closed polyline.
-    i = int(wp.tid())
-    n_segments = polyline.shape[0] - 1
-    s0 = segment_displacement(polyline, i)
-    s1 = segment_displacement(polyline, (i + 1) % n_segments)
-    wp.atomic_add(out_normal, 0, wp.cross(s0, s1))
+    wp.atomic_add(out_normal, 0, wp.cross(polyline[i], polyline[i + 1]))
 
 
 @wp.kernel

@@ -495,7 +495,7 @@ def _fill_loops(
         loop_np = loop.numpy()
         b = int(loop.shape[0])
         loop_pos = tw.array.gather(vertices, loop)
-        plane_normal = tw.polyline.closed_polyline_normal(loop_pos)
+        plane_normal = tw.polyline.polyline_normal(loop_pos)
         forbidden = (
             _forbidden_chords(loop_np, edges_np, device)
             if resolve_multiple_edges

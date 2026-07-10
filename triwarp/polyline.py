@@ -206,48 +206,11 @@ def polyline_normal(polyline: wp.array[wp.vec3]) -> wp.vec3:
     """
     Average unit normal of a 3D polyline via Newell's method.
 
-    Sums the cross products of consecutive segment pairs and normalizes the result.
-
-    Parameters
-    ----------
-    polyline
-        ``(n,)`` polyline vertices as ``wp.vec3``.
-
-    Returns
-    -------
-    wp.vec3
-        The unit normal on the host.
-
-    Raises
-    ------
-    ValueError
-        If the polyline has fewer than three points.
-
-    See Also
-    --------
-    [`closed_polyline_normal`][triwarp.polyline.closed_polyline_normal]
-    """
-    device = polyline.device
-    n = int(polyline.shape[0])
-    if n < 3:
-        raise ValueError("polyline_normal requires at least three points")
-    out_normal = wp.zeros(1, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_polyline.accumulate_newell_normal,
-        dim=n - 2,
-        inputs=[polyline, out_normal],
-        device=device,
-    )
-    wp.launch(kernel_array.normalize, dim=1, inputs=[out_normal], device=device)
-    return wp.vec3(*out_normal.numpy()[0].tolist())
-
-
-def closed_polyline_normal(polyline: wp.array[wp.vec3]) -> wp.vec3:
-    """
-    Average unit normal of a closed 3D polyline via Newell's method.
-
-    Includes the wrap-around segment pair (closing edge), unlike
-    [`polyline_normal`][triwarp.polyline.polyline_normal].
+    The polyline is treated as a closed loop (its closing edge is added if absent), then the
+    cross products of consecutive vertices, ``cross(V_i, V_{i + 1})``, are summed and normalized.
+    This is Newell's method: the summed cross products of consecutive position vectors around a
+    closed loop equal the area-weighted, translation-invariant plane normal. The open-chain
+    variant (omitting the closing edge) is origin-dependent and not computed.
 
     Parameters
     ----------
@@ -262,20 +225,20 @@ def closed_polyline_normal(polyline: wp.array[wp.vec3]) -> wp.vec3:
     Raises
     ------
     ValueError
-        If the closed polyline has fewer than three points.
-
-    See Also
-    --------
-    [`polyline_normal`][triwarp.polyline.polyline_normal]
+        If the polyline has fewer than three points.
     """
     polyline = close_polyline(polyline)
     device = polyline.device
     n = int(polyline.shape[0])
-    if n < 3:
-        raise ValueError("closed_polyline_normal requires at least three points")
+    # The closed polyline's last vertex duplicates its first, so it has n - 1 distinct vertices;
+    # a non-degenerate loop normal needs at least three of them.
+    if n < 4:
+        raise ValueError("polyline_normal requires at least three points")
     out_normal = wp.zeros(1, dtype=wp.vec3, device=device)
+    # The polyline is closed (last vertex duplicates the first), so summing cross(V_i, V_{i + 1})
+    # over the n - 1 consecutive pairs includes the wrap-around edge — full Newell's method.
     wp.launch(
-        kernel_polyline.accumulate_newell_normal_closed,
+        kernel_polyline.accumulate_newell_normal,
         dim=n - 1,
         inputs=[polyline, out_normal],
         device=device,
