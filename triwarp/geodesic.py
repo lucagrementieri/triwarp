@@ -8,8 +8,8 @@ import warp.sparse as wps
 
 from triwarp.edges import mean_edge_length
 from triwarp.kernels import geodesic as kernel_geodesic
-from triwarp.kernels import scatter as kernel_scatter
-from triwarp.laplacian import cotmatrix_entries
+from triwarp.kernels import laplacian as kernel_laplacian
+from triwarp.laplacian import cotmatrix_entries, mass_matrix_entries
 from triwarp.triangles import face_normals_and_areas
 
 _CG_TOLERANCE = 1e-8
@@ -92,8 +92,10 @@ def heat_geodesic(
     rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
     cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
     vals = wp.empty(n_triplets, dtype=wp.float64, device=device)
+    # The generic ``cotmatrix_triplets`` casts the shared float32 half-cotangent weights to
+    # float64, assembling the operator natively in a single build (see issue_report.md).
     wp.launch(
-        kernel_geodesic.cotmatrix_triplets_f64,
+        kernel_laplacian.cotmatrix_triplets,
         dim=n_faces,
         inputs=[faces, cot_entries, rows, cols, vals],
         device=device,
@@ -102,19 +104,10 @@ def heat_geodesic(
         n_vertices, n_vertices, rows, cols, vals, prune_numerical_zeros=False
     )
 
-    # Lumped (barycentric) mass matrix.
+    # Face normals / areas (float32) for the gradient below; the lumped mass is built natively in
+    # float64 by ``mass_matrix_entries``.
     normals, areas = face_normals_and_areas(vertices, faces)
-    mass = wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    # scatter_face_thirds shares one float dtype across areas/count/mass; the heat solve runs in
-    # float64, so promote the float32 face areas before scattering.
-    areas64 = wp.empty(n_faces, dtype=wp.float64, device=device)
-    wp.utils.array_cast(areas, areas64)
-    wp.launch(
-        kernel_scatter.scatter_face_thirds,
-        dim=n_faces,
-        inputs=[faces, areas64, wp.float64(3.0), mass],
-        device=device,
-    )
+    mass = mass_matrix_entries(vertices, faces, dtype=wp.float64)
 
     # Heat solve: (M - t L) u = u0, with u0 the source indicator. ``bsr_axpy`` overwrites the mass
     # matrix in place (no longer needed) to form the system.

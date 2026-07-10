@@ -18,18 +18,20 @@ T = TypeVar("T")
 if TYPE_CHECKING:
     Array1dInt32: TypeAlias = wp.array[wp.int32, Literal[1]]
     Array1dFloat32: TypeAlias = wp.array[wp.float32, Literal[1]]
+    Array1dFloat64: TypeAlias = wp.array[wp.float64, Literal[1]]
     Array2dInt32: TypeAlias = wp.array[wp.int32, Literal[2]]
     Array2dFloat32: TypeAlias = wp.array[wp.float32, Literal[2]]
+    Array2dFloat64: TypeAlias = wp.array[wp.float64, Literal[2]]
     Array3dFloat32: TypeAlias = wp.array[wp.float32, Literal[3]]
 
     # wp.Int / wp.Float / wp.Scalar are TypeVars; subscripting wp.array[...] with them
     # yields a generic alias that requires type arguments under basedpyright.
     Array1dInt: TypeAlias = Array1dInt32
     Array2dInt: TypeAlias = Array2dInt32
-    Array1dFloat: TypeAlias = Array1dFloat32
-    Array2dFloat: TypeAlias = Array2dFloat32
-    Array1dScalar: TypeAlias = Array1dInt32 | Array1dFloat32
-    Array2dScalar: TypeAlias = Array2dInt32 | Array2dFloat32
+    Array1dFloat: TypeAlias = Array1dFloat32 | Array1dFloat64
+    Array2dFloat: TypeAlias = Array2dFloat32 | Array2dFloat64
+    Array1dScalar: TypeAlias = Array1dInt32 | Array1dFloat
+    Array2dScalar: TypeAlias = Array2dInt32 | Array2dFloat
 
     IntArray: TypeAlias = Array1dInt | Array2dInt
     FloatArray: TypeAlias = Array1dFloat | Array2dFloat
@@ -37,8 +39,10 @@ if TYPE_CHECKING:
 else:
     Array1dInt32 = wp.array
     Array1dFloat32 = wp.array
+    Array1dFloat64 = wp.array
     Array2dInt32 = wp.array
     Array2dFloat32 = wp.array
+    Array2dFloat64 = wp.array
     Array3dFloat32 = wp.array
     Array1dInt = wp.array
     Array2dInt = wp.array
@@ -53,11 +57,13 @@ else:
 __all__ = [
     "Array1dFloat",
     "Array1dFloat32",
+    "Array1dFloat64",
     "Array1dInt",
     "Array1dInt32",
     "Array1dScalar",
     "Array2dFloat",
     "Array2dFloat32",
+    "Array2dFloat64",
     "Array2dInt",
     "Array2dInt32",
     "Array2dScalar",
@@ -65,10 +71,12 @@ __all__ = [
     "FloatArray",
     "IntArray",
     "ScalarArray",
+    "as_array2d_float",
     "as_array2d_float32",
     "as_array2d_int32",
     "as_array3d_float32",
     "empty_float32_2d",
+    "empty_float_2d",
     "empty_int32_2d",
     "ensure_ndim",
 ]
@@ -127,6 +135,35 @@ def as_array2d_float32(arr: wp.array[T]) -> Array2dFloat32:
     """
     ensure_ndim(arr, 2, dtype=wp.float32)
     return cast(Array2dFloat32, arr)
+
+
+def as_array2d_float(arr: wp.array[T], *, dtype: type = wp.float32) -> Array2dFloat:
+    """
+    Validate and narrow a Warp array to [`Array2dFloat`][triwarp.typing.Array2dFloat].
+
+    The dtype-parameterized analogue of
+    [`as_array2d_float32`][triwarp.typing.as_array2d_float32]: use it for functions whose
+    result precision is chosen at call time (``wp.float32`` or ``wp.float64``).
+
+    Parameters
+    ----------
+    arr
+        Warp array expected to be rank-2 with scalar type ``dtype``.
+    dtype
+        Expected floating-point scalar type: ``wp.float32`` (default) or ``wp.float64``.
+
+    Returns
+    -------
+    Array2dFloat
+        ``arr`` unchanged, narrowed to the checked alias.
+
+    Raises
+    ------
+    TypeError
+        If ``arr`` is not rank-2 with scalar type ``dtype``.
+    """
+    ensure_ndim(arr, 2, dtype=dtype)
+    return cast(Array2dFloat, arr)
 
 
 def as_array3d_float32(arr: wp.array[T]) -> Array3dFloat32:
@@ -199,3 +236,29 @@ def empty_float32_2d(
         Uninitialized ``(rows, cols)`` ``float32`` array on ``device``.
     """
     return cast(Array2dFloat32, wp.empty(_shape_2d(shape), dtype=wp.float32, device=device))
+
+
+def empty_float_2d(
+    shape: tuple[int, int] | list[int], *, dtype: type = wp.float32, device: wp.DeviceLike = None
+) -> Array2dFloat:
+    """
+    Allocate an uninitialized rank-2 floating-point Warp array of the given precision.
+
+    The dtype-parameterized analogue of
+    [`empty_float32_2d`][triwarp.typing.empty_float32_2d].
+
+    Parameters
+    ----------
+    shape
+        ``(rows, cols)`` shape of the allocated array.
+    dtype
+        Floating-point scalar type: ``wp.float32`` (default) or ``wp.float64``.
+    device
+        Target Warp device.
+
+    Returns
+    -------
+    Array2dFloat
+        Uninitialized ``(rows, cols)`` array of scalar type ``dtype`` on ``device``.
+    """
+    return cast(Array2dFloat, wp.empty(_shape_2d(shape), dtype=dtype, device=device))

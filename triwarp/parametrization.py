@@ -155,7 +155,7 @@ def map_vertices_to_circle(
 
 def _solve_fixed_boundary(
     laplacian: wps.BsrMatrix[wp.float64],
-    mass_diag: wp.array[wp.float32] | None,
+    mass_diag: wp.array[wp.float64] | None,
     k: int,
     n_vertices: int,
     boundary_indices: wp.array[wp.int32],
@@ -343,7 +343,7 @@ def harmonic(
     if n_vertices == 0:
         return wp.empty(0, dtype=wp.vec2, device=device)
     laplacian = cotmatrix(vertices, faces, dtype=wp.float64)
-    mass_diag = mass_matrix_entries(vertices, faces) if k > 1 else None
+    mass_diag = mass_matrix_entries(vertices, faces, dtype=wp.float64) if k > 1 else None
     return _solve_fixed_boundary(
         laplacian, mass_diag, k, n_vertices, boundary_indices, boundary_uv, device
     )

@@ -7,7 +7,6 @@ import warp.optim.linear as wpl
 import warp.sparse as wps
 
 from triwarp import laplacian
-from triwarp.kernels import geodesic as kernel_geodesic
 from triwarp.kernels import laplacian as kernel_laplacian
 from triwarp.kernels import smoothing as kernel_smoothing
 from triwarp.triangles import face_normals_and_areas
@@ -582,16 +581,17 @@ def filter_implicit_fairing(
         rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
         cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
         vals = wp.empty(n_triplets, dtype=wp.float64, device=device)
+        # Generic ``cotmatrix_triplets`` casts the float32 half-cotangent weights to float64,
+        # assembling the stiffness matrix natively in a single build (see issue_report.md).
         wp.launch(
-            kernel_geodesic.cotmatrix_triplets_f64,
+            kernel_laplacian.cotmatrix_triplets,
             dim=n_faces,
             inputs=[faces, cot_entries, rows, cols, vals],
             device=device,
         )
         stiffness = wps.bsr_from_triplets(n, n, rows, cols, vals, prune_numerical_zeros=False)
 
-        mass = wp.empty(n, dtype=wp.float64, device=device)
-        wp.utils.array_cast(laplacian.mass_matrix_entries(current, faces), mass)
+        mass = laplacian.mass_matrix_entries(current, faces, dtype=wp.float64)
 
         # Right-hand side b = M V, formed before ``bsr_axpy`` mutates the mass matrix.
         wp.launch(

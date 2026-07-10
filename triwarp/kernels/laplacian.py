@@ -66,8 +66,10 @@ def cot_entries_from_edge_lengths(
 
 @wp.kernel
 def cotmatrix_entries(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_cot: wp.array2d[wp.float32]
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_cot: wp.array2d[wp.Float]
 ) -> None:
+    # ``out_cot`` is generic: the half-cotangent weights are computed in float32 (the vertex
+    # precision) and cast to the requested output dtype (float32 or float64) at store time.
     f = int(wp.tid())
     i0 = faces[f * 3 + 0]
     i1 = faces[f * 3 + 1]
@@ -81,23 +83,23 @@ def cotmatrix_entries(
     l2 = wp.sqrt(l2_2)
     dbl_area = doublearea_from_lengths(l0, l1, l2)
     c0, c1, c2 = cot_entries_from_l2(l2_0, l2_1, l2_2, dbl_area)
-    out_cot[f, 0] = c0
-    out_cot[f, 1] = c1
-    out_cot[f, 2] = c2
+    out_cot[f, 0] = type(out_cot[f, 0])(c0)
+    out_cot[f, 1] = type(out_cot[f, 1])(c1)
+    out_cot[f, 2] = type(out_cot[f, 2])(c2)
 
 
 @wp.kernel
 def cotmatrix_entries_intrinsic(
-    edge_lengths: wp.array2d[wp.float32], out_cot: wp.array2d[wp.float32]
+    edge_lengths: wp.array2d[wp.float32], out_cot: wp.array2d[wp.Float]
 ) -> None:
     f = int(wp.tid())
     l0 = edge_lengths[f, 0]
     l1 = edge_lengths[f, 1]
     l2 = edge_lengths[f, 2]
     c0, c1, c2 = cot_entries_from_edge_lengths(l0, l1, l2)
-    out_cot[f, 0] = c0
-    out_cot[f, 1] = c1
-    out_cot[f, 2] = c2
+    out_cot[f, 0] = type(out_cot[f, 0])(c0)
+    out_cot[f, 1] = type(out_cot[f, 1])(c1)
+    out_cot[f, 2] = type(out_cot[f, 2])(c2)
 
 
 @wp.func
@@ -116,15 +118,16 @@ def laplacian_triplets_directed(
     equal_weight: wp.int32,
     out_rows: wp.array[wp.int32],
     out_cols: wp.array[wp.int32],
-    out_vals: wp.array[wp.float32],
+    out_vals: wp.array[wp.Float],
 ) -> None:
     # One triplet per directed triangle edge, matching trimesh's ``mesh.edges`` adjacency.
+    # ``out_vals`` is generic: the float32 edge weight is cast to the requested output dtype.
     e = int(wp.tid())
     a = edges[e, 0]
     b = edges[e, 1]
     out_rows[e] = a
     out_cols[e] = b
-    out_vals[e] = edge_weight(a, b, vertices, equal_weight)
+    out_vals[e] = type(out_vals[e])(edge_weight(a, b, vertices, equal_weight))
 
 
 @wp.kernel
@@ -134,15 +137,15 @@ def laplacian_triplets_symmetric(
     equal_weight: wp.int32,
     out_rows: wp.array[wp.int32],
     out_cols: wp.array[wp.int32],
-    out_vals: wp.array[wp.float32],
+    out_vals: wp.array[wp.Float],
 ) -> None:
     # Emits both directed pairs (a, b) and (b, a) from each unique undirected edge so the
     # adjacency is symmetric, matching trimesh's ``vertex_neighbors``. Duplicate multiplicity
-    # cancels under row-normalization.
+    # cancels under row-normalization. ``out_vals`` is generic (float32 or float64).
     e = int(wp.tid())
     a = edges[e, 0]
     b = edges[e, 1]
-    w = edge_weight(a, b, vertices, equal_weight)
+    w = type(out_vals[e * 2])(edge_weight(a, b, vertices, equal_weight))
     base = e * 2
     out_rows[base + 0] = a
     out_cols[base + 0] = b
@@ -153,14 +156,16 @@ def laplacian_triplets_symmetric(
 
 
 @wp.kernel
-def row_normalize(offsets: wp.array[wp.int32], out_values: wp.array[wp.float32]) -> None:
+def row_normalize(offsets: wp.array[wp.int32], out_values: wp.array[wp.Float]) -> None:
     i = int(wp.tid())
     start = offsets[i]
     end = offsets[i + 1]
-    total = wp.float32(0.0)
+    # ``out_values[0]`` is always valid: the launcher only runs this kernel when nnz > 0. It is
+    # read solely to source the generic scalar type for the accumulator / zero literals.
+    total = type(out_values[0])(0.0)
     for k in range(start, end):
         total += out_values[k]
-    if total > wp.float32(0.0):
+    if total > type(out_values[0])(0.0):
         for k in range(start, end):
             out_values[k] = out_values[k] / total
 
@@ -191,52 +196,25 @@ def apply_operator(
 @wp.kernel
 def cotmatrix_triplets(
     faces: wp.array[wp.int32],
-    cot_entries: wp.array2d[wp.float32],
+    cot_entries: wp.array2d[wp.Float],
     out_rows: wp.array[wp.int32],
     out_cols: wp.array[wp.int32],
-    out_vals: wp.array[wp.float32],
+    out_vals: wp.array[wp.Float],
 ) -> None:
+    # Emits the 12 cotangent-Laplacian COO triplets per triangle. ``cot_entries`` and ``out_vals``
+    # are independent generic float types: the half-cotangent weights (typically float32, the
+    # vertex precision) are cast to the requested matrix dtype, so a single ``bsr_from_triplets``
+    # builds a float32 or float64 matrix natively. Building float64 values here (rather than
+    # recasting a float32 matrix) dodges a Warp 1.14 ``bsr_mm`` bug triggered by a second
+    # ``bsr_from_triplets`` rebuild — see issue_report.md.
     f = int(wp.tid())
     for e in range(3):
         c0 = (e + 1) % 3
         c1 = (e + 2) % 3
         source = faces[f * 3 + c0]
         dest = faces[f * 3 + c1]
-        w = cot_entries[f, e]
         base = f * 12 + e * 4
-        out_rows[base + 0] = source
-        out_cols[base + 0] = dest
-        out_vals[base + 0] = w
-        out_rows[base + 1] = dest
-        out_cols[base + 1] = source
-        out_vals[base + 1] = w
-        out_rows[base + 2] = source
-        out_cols[base + 2] = source
-        out_vals[base + 2] = -w
-        out_rows[base + 3] = dest
-        out_cols[base + 3] = dest
-        out_vals[base + 3] = -w
-
-
-@wp.kernel
-def cotmatrix_triplets_f64(
-    faces: wp.array[wp.int32],
-    cot_entries: wp.array2d[wp.float32],
-    out_rows: wp.array[wp.int32],
-    out_cols: wp.array[wp.int32],
-    out_vals: wp.array[wp.float64],
-) -> None:
-    # float64 build of ``cotmatrix_triplets`` from the shared float32 half-cotangent weights.
-    # Emitting float64 values in a single ``bsr_from_triplets`` (rather than recasting a float32
-    # matrix) dodges a Warp 1.14 ``bsr_mm`` bug triggered by a second rebuild — see issue_report.md.
-    f = int(wp.tid())
-    for e in range(3):
-        c0 = (e + 1) % 3
-        c1 = (e + 2) % 3
-        source = faces[f * 3 + c0]
-        dest = faces[f * 3 + c1]
-        w = wp.float64(cot_entries[f, e])
-        base = f * 12 + e * 4
+        w = type(out_vals[base])(cot_entries[f, e])
         out_rows[base + 0] = source
         out_cols[base + 0] = dest
         out_vals[base + 0] = w

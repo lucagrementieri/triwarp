@@ -90,12 +90,13 @@ def interior_system_triplets(
 
 
 @wp.kernel
-def reciprocal(values: wp.array[wp.float32], out_inv: wp.array[wp.float64]) -> None:
-    # Diagonal inverse (``igl::invert_diag``) of the float32 lumped mass into float64, for the
-    # ``k > 1`` operator ``Q = (-L) (M^-1 (-L))^(k-1)``. A zero entry maps to zero, not infinity.
+def reciprocal(values: wp.array[wp.Float], out_inv: wp.array[wp.float64]) -> None:
+    # Diagonal inverse (``igl::invert_diag``) of the lumped mass into float64, for the ``k > 1``
+    # operator ``Q = (-L) (M^-1 (-L))^(k-1)``. ``values`` is generic (float32 or float64). A zero
+    # entry maps to zero, not infinity.
     i = int(wp.tid())
     v = values[i]
-    if v != wp.float32(0.0):
+    if v != type(values[0])(0.0):
         out_inv[i] = wp.float64(1.0) / wp.float64(v)
     else:
         out_inv[i] = wp.float64(0.0)

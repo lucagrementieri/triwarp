@@ -10,7 +10,9 @@ from triwarp.kernels import scatter as kernel_scatter
 from triwarp.triangles import face_normals_and_areas
 
 
-def cotmatrix_entries(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> twt.Array2dFloat32:
+def cotmatrix_entries(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], dtype: type = wp.float32
+) -> twt.Array2dFloat:
     """
     Per-triangle half-cotangent weights (``igl::cotmatrix_entries``).
 
@@ -23,10 +25,14 @@ def cotmatrix_entries(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) ->
         ``(n_vertices,)`` mesh vertex positions.
     faces
         Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    dtype
+        Scalar type of the returned weights: ``wp.float32`` (default) or ``wp.float64``. The weights
+        are computed in float32 (the vertex precision) and cast to ``dtype`` on write; request
+        ``wp.float64`` to feed a native float64 [`cotmatrix`][triwarp.laplacian.cotmatrix] build.
 
     Returns
     -------
-    twt.Array2dFloat32
+    twt.Array2dFloat
         Shape ``(n_faces, 3)`` on ``faces.device``. Empty ``(0, 3)`` when ``n_faces == 0``.
 
     See Also
@@ -37,19 +43,21 @@ def cotmatrix_entries(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) ->
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
     if n_faces == 0:
-        return twt.empty_float32_2d((0, 3), device=device)
+        return twt.empty_float_2d((0, 3), dtype=dtype, device=device)
 
-    out_cot = twt.empty_float32_2d((n_faces, 3), device=device)
+    out_cot = twt.empty_float_2d((n_faces, 3), dtype=dtype, device=device)
     wp.launch(
         kernel_laplacian.cotmatrix_entries,
         dim=n_faces,
         inputs=[vertices, faces, out_cot],
         device=device,
     )
-    return twt.as_array2d_float32(out_cot)
+    return twt.as_array2d_float(out_cot, dtype=dtype)
 
 
-def cotmatrix_entries_intrinsic(edge_lengths: twt.Array2dFloat32) -> twt.Array2dFloat32:
+def cotmatrix_entries_intrinsic(
+    edge_lengths: twt.Array2dFloat32, dtype: type = wp.float32
+) -> twt.Array2dFloat:
     """
     Per-triangle half-cotangent weights from edge lengths.
 
@@ -61,11 +69,13 @@ def cotmatrix_entries_intrinsic(edge_lengths: twt.Array2dFloat32) -> twt.Array2d
     Parameters
     ----------
     edge_lengths
-        ``(n_faces, 3)`` edge lengths on the target device.
+        ``(n_faces, 3)`` ``float32`` edge lengths on the target device.
+    dtype
+        Scalar type of the returned weights: ``wp.float32`` (default) or ``wp.float64``.
 
     Returns
     -------
-    twt.Array2dFloat32
+    twt.Array2dFloat
         Shape ``(n_faces, 3)`` on ``edge_lengths.device``. Empty ``(0, 3)`` when ``n_faces == 0``.
 
     See Also
@@ -77,22 +87,22 @@ def cotmatrix_entries_intrinsic(edge_lengths: twt.Array2dFloat32) -> twt.Array2d
     n_faces = int(edge_lengths.shape[0])
     device = edge_lengths.device
     if n_faces == 0:
-        return twt.empty_float32_2d((0, 3), device=device)
+        return twt.empty_float_2d((0, 3), dtype=dtype, device=device)
 
-    out_cot = twt.empty_float32_2d((n_faces, 3), device=device)
+    out_cot = twt.empty_float_2d((n_faces, 3), dtype=dtype, device=device)
     wp.launch(
         kernel_laplacian.cotmatrix_entries_intrinsic,
         dim=n_faces,
         inputs=[edge_lengths, out_cot],
         device=device,
     )
-    return twt.as_array2d_float32(out_cot)
+    return twt.as_array2d_float(out_cot, dtype=dtype)
 
 
 def cotmatrix(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
-    cot_entries: twt.Array2dFloat32 | None = None,
+    cot_entries: twt.Array2dFloat | None = None,
     dtype: type = wp.float32,
 ) -> wps.BsrMatrix[wp.float32]:
     """
@@ -111,7 +121,8 @@ def cotmatrix(
     cot_entries
         Optional precomputed ``(n_faces, 3)`` weights from
         [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries]. When ``None``, entries are
-        computed from ``vertices`` and ``faces``.
+        computed from ``vertices`` and ``faces`` in ``dtype``. May be ``float32`` or ``float64``
+        regardless of ``dtype``: the assembly kernel casts them to the matrix precision.
     dtype
         Scalar block type of the assembled matrix: ``wp.float32`` (default) or ``wp.float64``. Use
         ``wp.float64`` when the matrix feeds an ill-conditioned solve (e.g. the biharmonic operator
@@ -144,19 +155,19 @@ def cotmatrix(
         )
 
     if cot_entries is None:
-        cot_entries = cotmatrix_entries(vertices, faces)
+        cot_entries = cotmatrix_entries(vertices, faces, dtype=dtype)
 
     n_triplets = 12 * n_faces
     rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
     cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
     vals = wp.empty(n_triplets, dtype=dtype, device=device)
-    triplet_kernel = (
-        kernel_laplacian.cotmatrix_triplets
-        if dtype == wp.float32
-        else kernel_laplacian.cotmatrix_triplets_f64
-    )
+    # One generic kernel handles both precisions: it casts the (float32 or float64) half-cotangent
+    # weights to the matrix dtype, assembling a native float32/float64 matrix in a single build.
     wp.launch(
-        triplet_kernel, dim=n_faces, inputs=[faces, cot_entries, rows, cols, vals], device=device
+        kernel_laplacian.cotmatrix_triplets,
+        dim=n_faces,
+        inputs=[faces, cot_entries, rows, cols, vals],
+        device=device,
     )
     return wps.bsr_from_triplets(
         n_vertices, n_vertices, rows, cols, vals, prune_numerical_zeros=False
@@ -168,7 +179,8 @@ def laplacian_entries(
     faces: wp.array[wp.int32],
     equal_weight: bool = True,
     symmetric: bool | None = None,
-) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.float32]]:
+    dtype: type = wp.float32,
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32], twt.Array1dFloat]:
     """
     Per-edge weight triplets for the 1-ring Laplacian, before assembly.
 
@@ -190,6 +202,10 @@ def laplacian_entries(
         undirected edge emits both directed pairs (trimesh's ``vertex_neighbors``), giving a
         symmetric adjacency. When ``None`` (default) the trimesh convention is used:
         ``symmetric = not equal_weight``.
+    dtype
+        Scalar type of the returned ``vals``: ``wp.float32`` (default) or ``wp.float64``. The
+        assembly kernel casts the float32 edge weights to ``dtype`` so the matrix built from these
+        triplets is native float32/float64.
 
     Returns
     -------
@@ -212,7 +228,7 @@ def laplacian_entries(
         m = int(edges.shape[0])
         rows = wp.empty(m, dtype=wp.int32, device=device)
         cols = wp.empty(m, dtype=wp.int32, device=device)
-        vals = wp.empty(m, dtype=wp.float32, device=device)
+        vals = wp.empty(m, dtype=dtype, device=device)
         if m > 0:
             wp.launch(
                 kernel_laplacian.laplacian_triplets_directed,
@@ -227,7 +243,7 @@ def laplacian_entries(
     m_unique = int(unique_edges.shape[0])
     rows = wp.empty(2 * m_unique, dtype=wp.int32, device=device)
     cols = wp.empty(2 * m_unique, dtype=wp.int32, device=device)
-    vals = wp.empty(2 * m_unique, dtype=wp.float32, device=device)
+    vals = wp.empty(2 * m_unique, dtype=dtype, device=device)
     if m_unique > 0:
         wp.launch(
             kernel_laplacian.laplacian_triplets_symmetric,
@@ -243,6 +259,7 @@ def laplacian(
     faces: wp.array[wp.int32],
     equal_weight: bool = True,
     symmetric: bool | None = None,
+    dtype: type = wp.float32,
 ) -> wps.BsrMatrix[wp.float32]:
     """
     Row-normalized 1-ring averaging operator (uniform / umbrella Laplacian).
@@ -268,6 +285,10 @@ def laplacian(
         the trimesh convention ``symmetric = not equal_weight`` is used, so the default matches
         [`trimesh.smoothing.laplacian_calculation`][] for both weightings. The two choices differ
         only on meshes with an open boundary.
+    dtype
+        Scalar block type of the assembled matrix: ``wp.float32`` (default) or ``wp.float64``. Use
+        ``wp.float64`` when the operator feeds a linear-system solve; the matrix is built and
+        row-normalized natively in the requested precision (single ``bsr_from_triplets``).
 
     Returns
     -------
@@ -285,7 +306,7 @@ def laplacian(
     n_vertices = int(vertices.shape[0])
     device = vertices.device
     rows, cols, vals = laplacian_entries(
-        vertices, faces, equal_weight=equal_weight, symmetric=symmetric
+        vertices, faces, equal_weight=equal_weight, symmetric=symmetric, dtype=dtype
     )
     operator = wps.bsr_from_triplets(
         n_vertices, n_vertices, rows, cols, vals, prune_numerical_zeros=False
@@ -355,13 +376,10 @@ def uniform_laplacian(
 
     # Symmetric unit-weight adjacency: each undirected edge emits both directed (a, b) and (b, a)
     # triplets with weight 1, matching ``igl::adjacency_matrix`` (all non-zeros forced to one).
-    rows, cols, vals = laplacian_entries(vertices, faces, equal_weight=True, symmetric=True)
-    if dtype != wp.float32:
-        # Cast the plain triplet values (not a second bsr_from_triplets) so the matrix is still
-        # assembled in a single build in the requested precision.
-        vals_typed = wp.empty(int(vals.shape[0]), dtype=dtype, device=device)
-        wp.utils.array_cast(vals, vals_typed)
-        vals = vals_typed
+    # The triplet values are emitted natively in ``dtype`` (single build, no recast).
+    rows, cols, vals = laplacian_entries(
+        vertices, faces, equal_weight=True, symmetric=True, dtype=dtype
+    )
     adjacency = wps.bsr_from_triplets(
         n_vertices, n_vertices, rows, cols, vals, prune_numerical_zeros=False
     )
@@ -374,8 +392,8 @@ def uniform_laplacian(
 
 
 def mass_matrix_entries(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
-) -> wp.array[wp.float32]:
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], dtype: type = wp.float32
+) -> twt.Array1dFloat:
     """
     Per-vertex barycentric lumped mass (diagonal of ``igl::massmatrix``).
 
@@ -390,10 +408,14 @@ def mass_matrix_entries(
         ``(n_vertices,)`` mesh vertex positions.
     faces
         Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    dtype
+        Scalar type of the returned diagonal: ``wp.float32`` (default) or ``wp.float64``. Request
+        ``wp.float64`` to feed a float64 solve (e.g. geodesic heat method, implicit fairing)
+        without a downstream recast.
 
     Returns
     -------
-    wp.array[wp.float32]
+    twt.Array1dFloat
         Length-``n_vertices`` diagonal on ``vertices.device``.
 
     See Also
@@ -402,21 +424,27 @@ def mass_matrix_entries(
     """
     n_vertices = int(vertices.shape[0])
     device = vertices.device
-    mass = wp.zeros(n_vertices, dtype=wp.float32, device=device)
+    mass = wp.zeros(n_vertices, dtype=dtype, device=device)
     n_faces = int(faces.shape[0]) // 3
     if n_faces > 0:
         _, areas = face_normals_and_areas(vertices, faces)
+        if dtype != wp.float32:
+            # scatter_face_thirds shares one float dtype across areas/count/mass; promote the
+            # float32 face areas so the scatter specializes to the requested precision.
+            areas_typed = wp.empty(n_faces, dtype=dtype, device=device)
+            wp.utils.array_cast(areas, areas_typed)
+            areas = areas_typed
         wp.launch(
             kernel_scatter.scatter_face_thirds,
             dim=n_faces,
-            inputs=[faces, areas, wp.float32(3.0), mass],
+            inputs=[faces, areas, dtype(3.0), mass],
             device=device,
         )
     return mass
 
 
 def mass_matrix(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], dtype: type = wp.float32
 ) -> wps.BsrMatrix[wp.float32]:
     """
     Diagonal barycentric lumped mass matrix (``igl::massmatrix``, barycentric).
@@ -427,6 +455,9 @@ def mass_matrix(
         ``(n_vertices,)`` mesh vertex positions.
     faces
         Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    dtype
+        Scalar block type of the assembled matrix: ``wp.float32`` (default) or ``wp.float64``. Use
+        ``wp.float64`` when the mass matrix feeds a float64 linear-system solve.
 
     Returns
     -------
@@ -439,4 +470,4 @@ def mass_matrix(
     [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
     """
-    return wps.bsr_diag(diag=mass_matrix_entries(vertices, faces))
+    return wps.bsr_diag(diag=mass_matrix_entries(vertices, faces, dtype=dtype))

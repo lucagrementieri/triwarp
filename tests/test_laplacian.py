@@ -128,6 +128,56 @@ def test_mass_matrix(request: pytest.FixtureRequest, mesh_name: str) -> None:
     assert np.allclose(mass_wp.numpy(), mass_igl, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+def test_operators_float64_match_float32(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    # Every operator exposes a ``dtype`` parameter for native float64 assembly (used by the
+    # linear-system solvers). The float64 build must carry float64 values and agree with the
+    # float32 build within float32 precision.
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    points, indices = mesh_wp.points, mesh_wp.indices
+
+    cot_entries_f32 = tw.laplacian.cotmatrix_entries(points, indices)
+    cot_entries_f64 = tw.laplacian.cotmatrix_entries(points, indices, dtype=wp.float64)
+    assert cot_entries_f64.dtype == wp.float64
+    assert np.allclose(cot_entries_f64.numpy(), cot_entries_f32.numpy(), rtol=1e-5, atol=1e-5)
+
+    mass_f32 = tw.laplacian.mass_matrix_entries(points, indices)
+    mass_f64 = tw.laplacian.mass_matrix_entries(points, indices, dtype=wp.float64)
+    assert mass_f64.dtype == wp.float64
+    assert np.allclose(mass_f64.numpy(), mass_f32.numpy(), rtol=1e-5, atol=1e-5)
+
+    builders = [
+        tw.laplacian.cotmatrix,
+        tw.laplacian.laplacian,
+        tw.laplacian.uniform_laplacian,
+        tw.laplacian.mass_matrix,
+    ]
+    for builder in builders:
+        matrix_f32 = builder(points, indices)
+        matrix_f64 = builder(points, indices, dtype=wp.float64)
+        assert matrix_f64.values.dtype == wp.float64  # pyright: ignore[reportAttributeAccessIssue]
+        dense_f32 = _bsr_to_csr(matrix_f32).toarray()
+        dense_f64 = _bsr_to_csr(matrix_f64).toarray()
+        assert dense_f64.shape == dense_f32.shape
+        assert np.allclose(dense_f64, dense_f32, rtol=1e-5, atol=1e-5)
+
+
+def test_cotmatrix_entries_intrinsic_float64(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
+    faces_np = np.array(mesh_tm.faces, dtype=np.int64)
+
+    edge_lengths_igl = igl.edge_lengths(vertices_np, faces_np)
+    edge_lengths_wp = wp.array(
+        edge_lengths_igl.astype(np.float32), dtype=wp.float32, device=mesh_wp.device
+    )
+    cot_entries_wp = tw.laplacian.cotmatrix_entries_intrinsic(edge_lengths_wp, dtype=wp.float64)
+
+    assert cot_entries_wp.dtype == wp.float64
+    cot_entries_igl = igl.cotmatrix_entries(edge_lengths_igl)
+    assert np.allclose(cot_entries_wp.numpy(), cot_entries_igl, rtol=1e-5, atol=1e-5)
+
+
 def test_cotmatrix_empty_mesh(device: str) -> None:
     vertices_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
     faces_np = np.empty((0, 3), dtype=np.int64)
