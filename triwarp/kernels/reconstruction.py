@@ -439,9 +439,3 @@ def canonicalize_triangles(
     out_sorted[t, 0] = i
     out_sorted[t, 1] = j
     out_sorted[t, 2] = k
-
-
-@wp.kernel
-def copy_first_column(groups: wp.array2d(dtype=wp.int32), out: wp.array(dtype=wp.int32)) -> None:
-    t = int(wp.tid())
-    out[t] = groups[t, 0]

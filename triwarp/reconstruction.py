@@ -39,11 +39,7 @@ def _repeated_oriented_triangles(
     if n_groups == 0:
         return twt.empty_int32_2d((0, 3), device=device)
 
-    reps = wp.empty(n_groups, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_reconstruction.copy_first_column, dim=n_groups, inputs=[groups, reps], device=device
-    )
-    return twt.as_array2d_int32(tw.array.gather(candidates, reps))
+    return twt.as_array2d_int32(tw.array.gather(candidates, wp.clone(groups[:, 0])))
 
 
 def triangulate_point_cloud(
