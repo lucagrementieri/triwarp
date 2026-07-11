@@ -426,7 +426,7 @@ def init_dp_base(dp: wp.array2d[wp.float32], prev: wp.array2d[wp.int32], b: wp.i
         dp[i, j] = BAD_METRIC
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def fill_dp_span(
     loop_pos: wp.array[wp.vec3],
     plane_normal: wp.vec3,
@@ -489,9 +489,7 @@ def fill_dp_span(
             e = fill_edge_term(a_pos, c_pos, rim_opp_pos[b - 1], k_pos, metric_id)
             val = combine_metric(val, e, combine_id)
 
-        if val < best_val:
-            best_val = val
-            best_k = k
+        update_argmin(best_val, best_k, val, k)
     dp[i, j] = best_val
     prev[i, j] = best_k
 
@@ -572,7 +570,7 @@ def set_dp_origin(dp: wp.array2d[wp.float32]) -> None:
     dp[0, 0] = 0.0
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def stitch_dp_diag(
     a_pos: wp.array[wp.vec3],
     b_pos: wp.array[wp.vec3],
@@ -618,9 +616,7 @@ def stitch_dp_diag(
                 w = w + stitch_edge_metric(a_prev, b_cur, c_op, a_cur)
             if a_opp_valid[(i - 1) % n_a] != 0:
                 w = w + stitch_edge_metric(a_cur, a_prev, a_opp[(i - 1) % n_a], b_cur)
-        if w < best:
-            best = w
-            best_came = CAME_A
+        update_argmin(best, best_came, w, CAME_A)
 
     # Advance loop B: new triangle (a[i], b[j-1], b[j]).
     if j >= 1 and dp[i, j - 1] < BAD_METRIC:
@@ -634,9 +630,7 @@ def stitch_dp_diag(
                 w = w + stitch_edge_metric(a_cur, b_prev, c_op, b_cur)
             if b_opp_valid[j % n_b] != 0:
                 w = w + stitch_edge_metric(b_prev, b_cur, b_opp[j % n_b], a_cur)
-        if w < best:
-            best = w
-            best_came = CAME_B
+        update_argmin(best, best_came, w, CAME_B)
 
     dp[i, j] = best
     came[i, j] = best_came

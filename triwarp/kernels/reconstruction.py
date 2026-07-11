@@ -12,7 +12,7 @@ below is a direct port of the corresponding ``MRTriMath.h`` / ``MRReducePath`` p
 import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT, PI, TWO_PI
-from triwarp.kernels.array import cross2, sort3
+from triwarp.kernels.array import cross2, sort3, update_argmax
 
 # Compile-time upper bound on the per-point fan size (neighbours kept for one center).
 # Per-thread scratch arrays are sized to this; the runtime ``max_neighbours`` must not exceed it.
@@ -272,7 +272,7 @@ def edge_removal_weight(
 # --------------------------------------------------------------------------------------
 # Local fan triangulation (port of buildLocalTriangulation + FanOptimizer)
 # --------------------------------------------------------------------------------------
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def build_local_triangulations(
     points: wp.array(dtype=wp.vec3),
     normals: wp.array(dtype=wp.vec3),
@@ -383,9 +383,7 @@ def build_local_triangulations(
             )
             if res[1] > 0.5:
                 continue  # stable, cannot remove
-            if res[0] > best_w:
-                best_w = res[0]
-                best_pos = i
+            update_argmax(best_w, best_pos, res[0], i)
         if best_pos < 0:
             break
         old = nbr[best_pos]
@@ -415,9 +413,7 @@ def build_local_triangulations(
         pc = points[cidx]
         # orient so the face normal agrees with the (trusted) center normal
         if wp.dot(wp.cross(pb - a, pc - a), n_center) < 0.0:
-            tmp = bidx
-            bidx = cidx
-            cidx = tmp
+            bidx, cidx = cidx, bidx
         if slot < cap:
             out_tris[v, slot, 0] = v
             out_tris[v, slot, 1] = bidx

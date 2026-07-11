@@ -596,7 +596,7 @@ def winding_number_tiled(
         wp.tile_atomic_add(out_winding, tile_sum, (int(q),))
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def init_sphere_radii(
     mesh_vertices: wp.array[wp.vec3],
     n_vertices: wp.int32,
@@ -618,15 +618,13 @@ def init_sphere_radii(
 
     max_proj = wp.float32(-1e38)
     best_v = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    found = wp.bool(False)
+    # ``found`` == "at least one candidate seen": the ``-1e38`` seed is beaten by the first finite
+    # projection, so this equals ``n_vertices > 0`` (the argmax helper only tracks max_proj/best_v).
+    found = wp.bool(n_vertices > 0)
 
     for v_idx in range(n_vertices):
         v = mesh_vertices[v_idx]
-        proj = wp.dot(v - p, n)
-        if proj > max_proj:
-            max_proj = proj
-            best_v = v
-            found = True
+        kernel_array.update_argmax_vec3(max_proj, best_v, wp.dot(v - p, n), v)
 
     if not found or max_proj < TOLERANCE_PLANAR_CONSTANT:
         out_radii[tid] = wp.inf

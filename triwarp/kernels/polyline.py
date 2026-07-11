@@ -1,7 +1,13 @@
 import warp as wp
 
 from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
-from triwarp.kernels.array import binary_search_index, cross2, vector_angle_vec, wrap_index
+from triwarp.kernels.array import (
+    binary_search_index,
+    cross2,
+    update_argmax,
+    vector_angle_vec,
+    wrap_index,
+)
 
 
 @wp.func
@@ -256,7 +262,7 @@ def greedy_downsample_mask(
 RDP_LINE_EPS = wp.constant(wp.float32(1.0e-7))  # libigl FLOAT_EPS: degenerate-segment threshold
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def rdp_keep_mask(
     polyline: wp.array[wp.vec3],
     stol: wp.float32,
@@ -291,9 +297,8 @@ def rdp_keep_mask(
                     sd = wp.dot(dvec, dvec)
                 else:
                     sd = line_squared_distance(polyline[k], polyline[ixs], polyline[ixe], sdes)
-                if sd > sdmax:  # strict '>' keeps the first argmax, matching Eigen maxCoeff
-                    sdmax = sd
-                    ixc = k
+                # strict '>' inside update_argmax keeps the first argmax (Eigen maxCoeff)
+                update_argmax(sdmax, ixc, sd, k)
         if sdmax <= stol:
             for k in range(ixs + 1, ixe):  # empty range when there are no interior points
                 out_keep[k] = False

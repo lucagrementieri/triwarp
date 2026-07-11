@@ -1,9 +1,10 @@
 import warp as wp
 
+from triwarp.kernels.array import update_argmin_pair
 from triwarp.kernels.triangles import triangle_cross
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def small_triangle_collapse_edges(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -26,15 +27,8 @@ def small_triangle_collapse_edges(
         best = wp.length_sq(v1 - v0)
         a = i0
         b = i1
-        length_12 = wp.length_sq(v2 - v1)
-        if length_12 < best:
-            best = length_12
-            a = i1
-            b = i2
-        length_20 = wp.length_sq(v0 - v2)
-        if length_20 < best:
-            a = i2
-            b = i0
+        update_argmin_pair(best, a, b, wp.length_sq(v2 - v1), i1, i2)
+        update_argmin_pair(best, a, b, wp.length_sq(v0 - v2), i2, i0)
         out_pairs[f, 0] = a
         out_pairs[f, 1] = b
         out_flag[f] = wp.int32(1)

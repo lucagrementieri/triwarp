@@ -32,16 +32,64 @@ def wrap_index(i: wp.int32, n: wp.int32) -> wp.int32:
 
 @wp.func
 def update_argmin(
-    best_value: wp.ref[wp.float32],
-    best_index: wp.ref[wp.int32],
-    value: wp.float32,
-    index: wp.int32,
+    best_value: wp.ref[wp.float32], best_index: wp.ref[wp.int32], value: wp.float32, index: wp.int32
 ):
     # Running min-with-index update in place. Callers must be compiled with
-    # ``enable_backward=False`` (``wp.ref`` helpers have no adjoint).
+    # ``enable_backward=False`` (``wp.ref`` helpers have no adjoint). Concrete ``float32``:
+    # ``wp.ref[wp.Scalar]`` generics do not instantiate in Warp 1.15 (float64 sites keep a
+    # hand-written loop; the index/tag stays ``int32``).
     if value < best_value:
         best_value = value
         best_index = index  # noqa: F841 — writes through the wp.ref parameter
+
+
+@wp.func
+def update_argmax(
+    best_value: wp.ref[wp.float32], best_index: wp.ref[wp.int32], value: wp.float32, index: wp.int32
+):
+    # Running max-with-index mirror of ``update_argmin`` (same ``enable_backward=False`` rule).
+    if value > best_value:
+        best_value = value
+        best_index = index  # noqa: F841 — writes through the wp.ref parameter
+
+
+@wp.func
+def update_argmax_lowest_index(
+    best_value: wp.ref[wp.float32], best_index: wp.ref[wp.int32], value: wp.float32, index: wp.int32
+):
+    # argmax with a lowest-index tie-break (matches the label-vote rule in ``rasterize_labels``).
+    if value > best_value or (value == best_value and index < best_index):
+        best_value = value
+        best_index = index
+
+
+@wp.func
+def update_argmax_vec3(
+    best_value: wp.ref[wp.float32],
+    best_payload: wp.ref[wp.vec3],
+    value: wp.float32,
+    payload: wp.vec3,
+):
+    # Running argmax carrying a ``vec3`` payload instead of an index.
+    if value > best_value:
+        best_value = value
+        best_payload = payload  # noqa: F841 — writes through the wp.ref parameter
+
+
+@wp.func
+def update_argmin_pair(
+    best_value: wp.ref[wp.float32],
+    first: wp.ref[wp.int32],
+    second: wp.ref[wp.int32],
+    value: wp.float32,
+    a: wp.int32,
+    b: wp.int32,
+):
+    # Running argmin carrying a pair of associated indices (shortest-edge endpoints).
+    if value < best_value:
+        best_value = value
+        first = a  # noqa: F841 — writes through the wp.ref parameter
+        second = b  # noqa: F841 — writes through the wp.ref parameter
 
 
 @wp.func

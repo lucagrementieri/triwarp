@@ -1,5 +1,6 @@
 import warp as wp
 
+from triwarp.kernels.array import update_argmax_lowest_index
 from triwarp.kernels.triangles import face_vertices
 
 # NaN payload for vertices whose UV is non-finite (never sampled) and out-of-bounds reads.
@@ -139,7 +140,7 @@ def rasterize_scatter(
                 )
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def rasterize_labels(
     uv: wp.array[wp.vec2],
     faces: wp.array[wp.int32],
@@ -177,12 +178,8 @@ def rasterize_labels(
             s2 = bary[2] + wp.where(l0 == l2, bary[0], 0.0) + wp.where(l1 == l2, bary[1], 0.0)
             best_label = l0
             best_weight = s0
-            if s1 > best_weight or (s1 == best_weight and l1 < best_label):
-                best_label = l1
-                best_weight = s1
-            if s2 > best_weight or (s2 == best_weight and l2 < best_label):
-                best_label = l2
-                best_weight = s2
+            update_argmax_lowest_index(best_weight, best_label, s1, l1)
+            update_argmax_lowest_index(best_weight, best_label, s2, l2)
             out_labels[row, col] = best_label
 
 
