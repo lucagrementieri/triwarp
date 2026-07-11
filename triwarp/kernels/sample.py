@@ -148,7 +148,7 @@ def find_local_maxima(
     wi = wp.max(weights[i], wp.float32(0.0))
     start = int(offsets[i])
     end = int(offsets[i + 1])
-    is_max = int(1)
+    is_max = int(1)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
     for k in range(start, end):
         j = int(nbr_indices[k])
         if j == i or alive[j] == 0:

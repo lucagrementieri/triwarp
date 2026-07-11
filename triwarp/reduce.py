@@ -423,7 +423,9 @@ def median(array: twt.Array1dScalar) -> float:
     Parameters
     ----------
     array
-        Rank-1 ``(n,)`` ``wp.float32`` or ``wp.int32`` Warp array. Must be non-empty.
+        Rank-1 ``(n,)`` Warp array of any 32- or 64-bit scalar dtype accepted by
+        ``warp.utils.radix_sort_pairs`` (``wp.int32``, ``wp.uint32``, ``wp.float32``,
+        ``wp.int64``, ``wp.uint64``, ``wp.float64``). Must be non-empty.
 
     Returns
     -------

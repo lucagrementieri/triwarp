@@ -15,7 +15,7 @@ def _require_cuda(device: wp.DeviceLike) -> None:
     if wp.get_device(device).is_cpu:
         raise NotImplementedError(
             "harmonic / tutte require a CUDA device: warp.optim.linear.cg produces NaN on the CPU "
-            "device in Warp 1.14.0."
+            "device in Warp 1.14-1.15."
         )
 
 
@@ -299,7 +299,7 @@ def harmonic(
     cotangent-weighted average of its neighbors); ``k == 2`` is the biharmonic map, and so on. The
     interior system is solved with conjugate gradient, so a **CUDA device is required** whenever
     there are interior vertices to solve for (``warp.optim.linear.cg`` returns NaN on the CPU in
-    Warp 1.14.0).
+    Warp 1.14-1.15).
 
     Parameters
     ----------

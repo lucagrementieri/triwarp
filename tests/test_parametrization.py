@@ -11,10 +11,10 @@ import triwarp as tw
 
 def _skip_on_cpu(device: str) -> None:
     # harmonic / tutte solve the interior system with ``warp.optim.linear.cg``, which returns NaN on
-    # the CPU device (NaN) in Warp 1.14.0. The solver raises NotImplementedError there, so skip.
+    # the CPU device in Warp 1.14-1.15. The solver raises NotImplementedError there, so skip.
     if wp.get_device(device).is_cpu:
         pytest.skip(
-            "harmonic / tutte require CUDA: warp.optim.linear.cg is NaN on CPU in Warp 1.14.0."
+            "harmonic / tutte require CUDA: warp.optim.linear.cg is NaN on CPU in Warp 1.14-1.15."
         )
 
 

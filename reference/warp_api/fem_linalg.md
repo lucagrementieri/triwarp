@@ -1,6 +1,6 @@
 # warp.fem.linalg API
 
-Source: https://nvidia.github.io/warp/stable/api_reference/warp_fem_linalg.html (Warp 1.14.0)
+Source: https://nvidia.github.io/warp/stable/api_reference/warp_fem_linalg.html (Warp 1.15.0)
 > Regenerate after a Warp upgrade — see `reference/warp_api/REGENERATE.md`.
 
 Linear-algebra utilities from the FEM module. Called as `wp.fem.linalg.<name>(...)`. Most are usable inside kernels / `@wp.func`.

@@ -1,6 +1,6 @@
 # Warp Built-In Functions (kernel scope)
 
-Source: https://nvidia.github.io/warp/stable/language_reference/builtins.html (Warp 1.14.0)
+Source: https://nvidia.github.io/warp/stable/language_reference/builtins.html (Warp 1.15.0)
 > Regenerate after a Warp upgrade — see `reference/warp_api/REGENERATE.md`.
 
 These are callable inside `@wp.kernel` / `@wp.func` as `wp.<name>(...)`.

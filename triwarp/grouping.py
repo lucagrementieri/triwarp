@@ -36,7 +36,12 @@ def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
     [`group_int_rows`][triwarp.grouping.group_int_rows]
     """
     n = int(values.shape[0])
-    values_buffer = tw.unique.reinterpret_cast_to_int(values, 2 * n)
+    sort_dtype = values.dtype if wp.types.type_size_in_bytes(values.dtype) >= 4 else wp.int32
+    values_buffer = wp.empty(2 * n, dtype=sort_dtype, device=values.device)
+    if sort_dtype == values.dtype:
+        wp.copy(values_buffer, values, count=n)
+    else:
+        wp.utils.array_cast(values, values_buffer, count=n)
     indices_buffer = init_sort_pair_indices(n, -1, values.device)
     wp.utils.radix_sort_pairs(values_buffer, indices_buffer, count=n)
 

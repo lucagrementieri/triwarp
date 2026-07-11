@@ -1,6 +1,6 @@
 # warp.sparse API
 
-Source: https://nvidia.github.io/warp/stable/api_reference/warp_sparse.html (Warp 1.14.0)
+Source: https://nvidia.github.io/warp/stable/api_reference/warp_sparse.html (Warp 1.15.0)
 > Regenerate after a Warp upgrade — see `reference/warp_api/REGENERATE.md`.
 
 Block-sparse (BSR/CSR) matrix support. Import via `from warp.sparse import ...` or `wp.sparse.<name>`.
@@ -11,12 +11,17 @@ Block-sparse (BSR/CSR) matrix support. Import via `from warp.sparse import ...` 
 - `bsr_mm_work_arrays` — persists temporary work buffers across matrix-matrix multiply calls.
 - `bsr_axpy_work_arrays` — persists temporary work buffers across addition calls.
 
+## Status Codes (new in 1.15)
+- `BSR_STATUS_SUCCESS` — operation completed successfully.
+- `BSR_STATUS_ROW_CAPACITY_EXCEEDED` — a topology-changing operation exceeded the padded row capacity.
+
 ## Matrix Construction
-- `bsr_zeros(shape) -> BsrMatrix` — empty BSR/CSR matrix of given shape.
+- `bsr_zeros(shape, row_capacity=...) -> BsrMatrix` — empty BSR/CSR matrix of given shape; `row_capacity` (1.15) reserves padded per-row block storage.
 - `bsr_identity(n) -> BsrMatrix` — square identity matrix.
 - `bsr_diag(block_value) -> BsrMatrix` — block-diagonal matrix from a block value or array.
 - `bsr_from_triplets(rows, cols, values, shape) -> BsrMatrix` — build from COO triplets.
 - `bsr_copy(A) -> BsrMatrix` — copy, optionally changing scalar type.
+- `bsr_compress(src, prune_numerical_zeros=True, inplace=False, topology=None) -> BsrMatrix` — (1.15) sort/coalesce active blocks and compact storage; `topology="padded"` keeps reserved row capacity. **Caution:** calling it on a matrix rebuilt from its own CSR via a second `bsr_from_triplets` makes the next `bsr_mm` crash with an illegal memory access — see `issue_report.md`.
 
 ## Matrix Operations
 - `bsr_mv(A, x, y, alpha, beta)` — sparse matrix-vector product with scaling.

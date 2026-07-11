@@ -205,8 +205,8 @@ def cotmatrix_triplets(
     # are independent generic float types: the half-cotangent weights (typically float32, the
     # vertex precision) are cast to the requested matrix dtype, so a single ``bsr_from_triplets``
     # builds a float32 or float64 matrix natively. Building float64 values here (rather than
-    # recasting a float32 matrix) dodges a Warp 1.14 ``bsr_mm`` bug triggered by a second
-    # ``bsr_from_triplets`` rebuild — see issue_report.md.
+    # recasting a float32 matrix) dodges a Warp ``bsr_mm`` bug (still present in 1.15.0) triggered
+    # by a second ``bsr_from_triplets`` rebuild — see issue_report.md.
     f = int(wp.tid())
     for e in range(3):
         c0 = (e + 1) % 3

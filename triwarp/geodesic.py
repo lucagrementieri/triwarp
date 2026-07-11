@@ -56,9 +56,9 @@ def heat_geodesic(
     ------
     NotImplementedError
         If a non-trivial solve is required on the CPU device. The two conjugate-gradient solves use
-        ``warp.optim.linear.cg``, which returns NaN on the CPU device in Warp 1.14.0; a CUDA device
-        is required. (Empty meshes or empty source sets return a zero field without solving and are
-        allowed on any device.)
+        ``warp.optim.linear.cg``, which returns NaN on the CPU device in Warp 1.14-1.15; a CUDA
+        device is required. (Empty meshes or empty source sets return a zero field without solving
+        and are allowed on any device.)
 
     See Also
     --------
@@ -73,11 +73,11 @@ def heat_geodesic(
         return wp.zeros(n_vertices, dtype=wp.float64, device=device)
 
     # The two linear solves rely on ``warp.optim.linear.cg``, which returns NaN on the CPU device
-    # in Warp 1.14.0 (even for a trivial well-conditioned system). Require a CUDA device.
+    # in Warp 1.14-1.15 (even for a trivial well-conditioned system). Require a CUDA device.
     if wp.get_device(device).is_cpu:
         raise NotImplementedError(
             "heat_geodesic requires a CUDA device: warp.optim.linear.cg produces NaN on the CPU "
-            "device in Warp 1.14.0."
+            "device in Warp 1.14-1.15."
         )
 
     if t is None:

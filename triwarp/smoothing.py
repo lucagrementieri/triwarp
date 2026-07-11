@@ -70,7 +70,7 @@ def _require_cuda(device: wp.DeviceLike, name: str) -> None:
     if wp.get_device(device).is_cpu:
         raise NotImplementedError(
             f"{name} requires a CUDA device: warp.optim.linear.cg produces NaN on the CPU "
-            "device in Warp 1.14.0."
+            "device in Warp 1.14-1.15."
         )
 
 

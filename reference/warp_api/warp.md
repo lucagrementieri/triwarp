@@ -1,6 +1,6 @@
 # warp module API (Python scope)
 
-Source: https://nvidia.github.io/warp/stable/api_reference/warp.html (Warp 1.14.0)
+Source: https://nvidia.github.io/warp/stable/api_reference/warp.html (Warp 1.15.0)
 > Regenerate after a Warp upgrade — see `reference/warp_api/REGENERATE.md`.
 
 Called as `wp.<name>(...)` at Python scope.
@@ -8,6 +8,7 @@ Called as `wp.<name>(...)` at Python scope.
 ## Type Annotations
 - `DeviceLike` — union type for device representation.
 - `Float` / `Int` / `Scalar` — type variables for float/int/scalar types.
+- `ref` — pass-by-reference parameter annotation.
 
 ## Data Types — Scalars
 - `bool`, `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`.
@@ -68,6 +69,7 @@ Called as `wp.<name>(...)` at Python scope.
 - `func()` — decorator defining a Warp function callable from kernels.
 - `func_grad()` / `func_replay()` / `func_native()` — register custom gradient/replay/native snippet.
 - `grad()` — callable computing a function gradient.
+- `address_of()` — return the address of an addressable expression.
 - `map()` — map function over array elements.
 - `overload()` — overload a generic kernel with argument types.
 - `static()` — evaluate static expression and inline its result.
@@ -112,12 +114,15 @@ Called as `wp.<name>(...)` at Python scope.
 
 ## CUDA Memory Management
 - `Allocator()` / `ScopedAllocator()` — allocator protocol + context manager.
+- `CudaManagedAllocator()` — CUDA managed-memory allocator.
+- `MemoryKind()` — memory kind backing an array.
 - `get_device_allocator()` / `set_device_allocator()` / `set_cuda_allocator()` — allocator get/set.
 - `ScopedMempool()` / `ScopedMempoolAccess()` / `ScopedPeerAccess()` — mempool/peer context managers.
 - `is_mempool_supported/enabled()` / `set_mempool_enabled()` — mempool support/toggle.
 - `is_mempool_access_supported/enabled()` / `set_mempool_access_enabled()` — mempool access.
 - `get_mempool_release_threshold()` / `set_mempool_release_threshold()` — release threshold.
 - `get_mempool_used_mem_current()` / `get_mempool_used_mem_high()` — mempool usage / high-water mark.
+- `get_cuda_max_cluster_dim()` — maximum thread-block cluster dimension.
 - `is_peer_access_supported/enabled()` / `set_peer_access_enabled()` — peer device access.
 
 ## Graph Management
@@ -155,6 +160,9 @@ Called as `wp.<name>(...)` at Python scope.
 ## Constants
 - `constant()` — declare a compile-time constant for kernels.
 - Math constants (upper and lower case): `PI`, `TAU`, `E`, `PHI`, `HALF_PI`, `INF`, `NAN`, `LN2`, `LN10`, `LOG2E`, `LOG10E`.
+
+## Configuration Modes
+- `DeterministicMode()` — deterministic atomic-operation mode enum.
 
 ## Miscellaneous
 - `MarchingCubes()` — reusable marching-cubes extraction context.

@@ -464,10 +464,24 @@ def test_polyline_radius_rejects_unknown_reduction(device: str) -> None:
 
 
 @pytest.mark.parametrize("n", [7, 8])
-def test_reduce_median_matches_numpy(device: str, n: int) -> None:
+@pytest.mark.parametrize(
+    ("dtype_wp", "dtype_np"),
+    [
+        (wp.float32, np.float32),
+        (wp.float64, np.float64),
+        (wp.int32, np.int32),
+        (wp.int64, np.int64),
+        (wp.uint32, np.uint32),
+        (wp.uint64, np.uint64),
+    ],
+)
+def test_reduce_median_matches_numpy(device: str, n: int, dtype_wp: type, dtype_np: type) -> None:
     rng = np.random.default_rng(90 + n)
-    values_np = rng.standard_normal(n).astype(np.float32)
-    values_wp = wp.array(values_np, dtype=wp.float32, device=device)
+    if np.issubdtype(dtype_np, np.floating):
+        values_np = rng.standard_normal(n).astype(dtype_np)
+    else:
+        values_np = rng.integers(0, 1000, size=n).astype(dtype_np)
+    values_wp = wp.array(values_np, dtype=dtype_wp, device=device)
     assert np.allclose(tw.reduce.median(values_wp), np.median(values_np), rtol=1e-5, atol=1e-5)
 
 
