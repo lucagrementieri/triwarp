@@ -1,248 +1,195 @@
-"""Global reductions: tiled ``wp.tile_load`` + SIMT axis paths."""
+"""Global reductions: tiled ``wp.tile_load`` reductions generated from a shared template."""
 
 import warp as wp
 
+# Tile-reduction builtins are resolved only inside kernel source text and are not
+# exposed as Python-scope attributes (``wp.tile_max`` etc. raise ``AttributeError``),
+# unlike the atomic and scalar builtins (``wp.atomic_max``, ``wp.max`` …). To let the
+# kernel factories below *capture* them, pull the concrete ``Function`` objects out of
+# Warp's builtin registry. A captured builtin is emitted inline at codegen (same as a
+# literal ``wp.tile_sum`` call), so it templates on the tile dtype correctly — wrapping
+# it in a ``@wp.func`` instead would erase the dtype and produce ambiguous C++ overloads.
+from warp._src.context import builtin_functions as _warp_builtins
+
 from triwarp.constants import TILE_1D, TILE_2D
 
+_tile_min = _warp_builtins["tile_min"]
+_tile_max = _warp_builtins["tile_max"]
+_tile_sum = _warp_builtins["tile_sum"]
 
-def _simt_reduce_rows(reduce_fn):
-    """Generate axis=1 SIMT kernel: one thread per row, reduce across columns."""
+
+# ---------------------------------------------------------------------------
+# Kernel factories.
+#
+# Each builds one ``@wp.kernel`` capturing a ``(tile_reduce, atomic, scalar)``
+# triple. The full-tile branch loads a tile and reduces it with ``tile_reduce``;
+# the partial-tile remainder folds elements with ``scalar``; the result is
+# committed with ``atomic``. A unique ``name`` per instantiation is REQUIRED:
+# Warp keys generated kernels by name, so reusing one name would alias distinct
+# reductions to the same compiled kernel.
+# ---------------------------------------------------------------------------
+
+
+def _reduce_1d_tiled(tile_reduce, atomic, scalar, name):
+    """axis=None on a 1-D array: one tile per block, atomically fold into slot 0."""
+
+    def _k(values: wp.array[wp.Scalar], out: wp.array[wp.Scalar]) -> None:
+        i, t = wp.tid()
+        n = values.shape[0]
+        offset = i * TILE_1D
+        remaining = n - offset
+        if remaining <= 0:
+            return
+
+        if remaining >= TILE_1D:
+            tile = wp.tile_load(values, shape=TILE_1D, offset=offset, storage="register")
+            result = tile_reduce(tile)[0]
+        else:
+            result = values[offset]
+            for k in range(1, remaining):
+                result = scalar(result, values[offset + k])
+
+        if t == 0:
+            atomic(out, 0, result)
+
+    _k.__name__ = name
+    _k.__qualname__ = name
+    return wp.kernel(_k)
+
+
+def _reduce_2d_tiled(tile_reduce, atomic, scalar, name):
+    """axis=None on a 2-D array: one 2-D tile per block, atomically fold into slot 0."""
 
     def _k(values: wp.array2d[wp.Scalar], out: wp.array[wp.Scalar]) -> None:
-        i = int(wp.tid())
-        result = values[i, 0]
-        for j in range(1, values.shape[1]):
-            result = reduce_fn(result, values[i, j])
-        out[i] = result
+        i, j, t = wp.tid()
+        n_rows = values.shape[0]
+        n_cols = values.shape[1]
+        row_offset = i * TILE_2D
+        col_offset = j * TILE_2D
+        if row_offset >= n_rows or col_offset >= n_cols:
+            return
 
+        remaining_rows = n_rows - row_offset
+        remaining_cols = n_cols - col_offset
+        tile_rows = TILE_2D if remaining_rows >= TILE_2D else remaining_rows
+        tile_cols = TILE_2D if remaining_cols >= TILE_2D else remaining_cols
+        if remaining_rows >= TILE_2D and remaining_cols >= TILE_2D:
+            tile = wp.tile_load(
+                values,
+                shape=(TILE_2D, TILE_2D),
+                offset=(row_offset, col_offset),
+                storage="register",
+            )
+            result = tile_reduce(tile)[0]
+        else:
+            result = values[row_offset, col_offset]
+            for r in range(tile_rows):
+                for c in range(tile_cols):
+                    if r == 0 and c == 0:
+                        continue
+                    result = scalar(result, values[row_offset + r, col_offset + c])
+
+        if t == 0:
+            atomic(out, 0, result)
+
+    _k.__name__ = name
+    _k.__qualname__ = name
     return wp.kernel(_k)
 
 
-def _simt_reduce_cols(reduce_fn):
-    """Generate axis=0 SIMT kernel: one thread per column, reduce across rows."""
+def _reduce_2d_rows_tiled(tile_reduce, atomic, scalar, name):
+    """axis=1: one row per grid index, tile across columns, fold into slot ``i``."""
 
     def _k(values: wp.array2d[wp.Scalar], out: wp.array[wp.Scalar]) -> None:
-        i = int(wp.tid())
-        result = values[0, i]
-        for row in range(1, values.shape[0]):
-            result = reduce_fn(result, values[row, i])
-        out[i] = result
+        i, j, t = wp.tid()
+        n_cols = values.shape[1]
+        col_offset = j * TILE_1D
+        if col_offset >= n_cols:
+            return
+        remaining = n_cols - col_offset
+        if remaining >= TILE_1D:
+            tile = wp.tile_load(
+                values, shape=(1, TILE_1D), offset=(i, col_offset), storage="register"
+            )
+            result = tile_reduce(tile)[0]
+        else:
+            result = values[i, col_offset]
+            for k in range(1, remaining):
+                result = scalar(result, values[i, col_offset + k])
+        if t == 0:
+            atomic(out, i, result)
 
+    _k.__name__ = name
+    _k.__qualname__ = name
     return wp.kernel(_k)
 
 
-def _simt_bool_rows(reduce_fn, init_val):
-    """Generate axis=1 SIMT bool kernel: one thread per row, reduce int32 mask to bool."""
+def _reduce_2d_cols_tiled(tile_reduce, atomic, scalar, name):
+    """axis=0: one column per grid index, tile across rows, fold into slot ``i``."""
 
-    def _k(mask: wp.array2d[wp.int32], out: wp.array[wp.bool]) -> None:
-        i = int(wp.tid())
-        result = wp.int32(init_val)
-        for j in range(mask.shape[1]):
-            result = reduce_fn(result, mask[i, j])
-        out[i] = result != 0
+    def _k(values: wp.array2d[wp.Scalar], out: wp.array[wp.Scalar]) -> None:
+        i, j, t = wp.tid()
+        n_rows = values.shape[0]
+        row_offset = j * TILE_1D
+        if row_offset >= n_rows:
+            return
+        remaining = n_rows - row_offset
+        if remaining >= TILE_1D:
+            tile = wp.tile_load(
+                values, shape=(TILE_1D, 1), offset=(row_offset, i), storage="register"
+            )
+            result = tile_reduce(tile)[0]
+        else:
+            result = values[row_offset, i]
+            for k in range(1, remaining):
+                result = scalar(result, values[row_offset + k, i])
+        if t == 0:
+            atomic(out, i, result)
 
+    _k.__name__ = name
+    _k.__qualname__ = name
     return wp.kernel(_k)
 
 
-def _simt_bool_cols(reduce_fn, init_val):
-    """Generate axis=0 SIMT bool kernel: one thread per column, reduce int32 mask to bool."""
+# ---------------------------------------------------------------------------
+# Scalar reductions (min / max / sum) over ``wp.Scalar`` arrays.
+# ---------------------------------------------------------------------------
 
-    def _k(mask: wp.array2d[wp.int32], out: wp.array[wp.bool]) -> None:
-        i = int(wp.tid())
-        result = wp.int32(init_val)
-        for row in range(mask.shape[0]):
-            result = reduce_fn(result, mask[row, i])
-        out[i] = result != 0
+min1d_tiled = _reduce_1d_tiled(_tile_min, wp.atomic_min, wp.min, "min1d_tiled")
+min2d_tiled = _reduce_2d_tiled(_tile_min, wp.atomic_min, wp.min, "min2d_tiled")
+min_2d_rows_tiled = _reduce_2d_rows_tiled(_tile_min, wp.atomic_min, wp.min, "min_2d_rows_tiled")
+min_2d_cols_tiled = _reduce_2d_cols_tiled(_tile_min, wp.atomic_min, wp.min, "min_2d_cols_tiled")
 
-    return wp.kernel(_k)
+max1d_tiled = _reduce_1d_tiled(_tile_max, wp.atomic_max, wp.max, "max1d_tiled")
+max2d_tiled = _reduce_2d_tiled(_tile_max, wp.atomic_max, wp.max, "max2d_tiled")
+max_2d_rows_tiled = _reduce_2d_rows_tiled(_tile_max, wp.atomic_max, wp.max, "max_2d_rows_tiled")
+max_2d_cols_tiled = _reduce_2d_cols_tiled(_tile_max, wp.atomic_max, wp.max, "max_2d_cols_tiled")
 
+sum1d_tiled = _reduce_1d_tiled(_tile_sum, wp.atomic_add, wp.add, "sum1d_tiled")
+sum2d_tiled = _reduce_2d_tiled(_tile_sum, wp.atomic_add, wp.add, "sum2d_tiled")
+sum_2d_rows_tiled = _reduce_2d_rows_tiled(_tile_sum, wp.atomic_add, wp.add, "sum_2d_rows_tiled")
+sum_2d_cols_tiled = _reduce_2d_cols_tiled(_tile_sum, wp.atomic_add, wp.add, "sum_2d_cols_tiled")
 
-@wp.kernel
-def max1d_tiled(values: wp.array[wp.Scalar], out_max: wp.array[wp.Scalar]) -> None:
-    i, t = wp.tid()
-    n = values.shape[0]
-    offset = i * TILE_1D
-    remaining = n - offset
-    if remaining <= 0:
-        return
+# ---------------------------------------------------------------------------
+# Boolean reductions over int32 0/1 masks. ``any`` == OR == max; ``all`` == AND
+# == min (a 0/1 mask minimises to 1 iff every element is 1). The 2-D global case
+# is handled by the wrapper flattening the mask and reusing the 1-D kernel, so no
+# ``*2d_tiled`` bool kernel is needed.
+# ---------------------------------------------------------------------------
 
-    if remaining >= TILE_1D:
-        tile = wp.tile_load(values, shape=TILE_1D, offset=offset, storage="register")
-        tile_max = wp.tile_max(tile)[0]
-    else:
-        tile_max = values[offset]
-        for k in range(1, remaining):
-            tile_max = wp.max(tile_max, values[offset + k])
+any_1d_tiled = _reduce_1d_tiled(_tile_max, wp.atomic_max, wp.max, "any_1d_tiled")
+any_2d_rows_tiled = _reduce_2d_rows_tiled(_tile_max, wp.atomic_max, wp.max, "any_2d_rows_tiled")
+any_2d_cols_tiled = _reduce_2d_cols_tiled(_tile_max, wp.atomic_max, wp.max, "any_2d_cols_tiled")
 
-    if t == 0:
-        wp.atomic_max(out_max, 0, tile_max)
-
-
-@wp.kernel
-def max2d_tiled(values: wp.array2d[wp.Scalar], out_max: wp.array[wp.Scalar]) -> None:
-    i, j, t = wp.tid()
-    n_rows = values.shape[0]
-    n_cols = values.shape[1]
-    row_offset = i * TILE_2D
-    col_offset = j * TILE_2D
-    if row_offset >= n_rows or col_offset >= n_cols:
-        return
-
-    remaining_rows = n_rows - row_offset
-    remaining_cols = n_cols - col_offset
-    tile_rows = TILE_2D if remaining_rows >= TILE_2D else remaining_rows
-    tile_cols = TILE_2D if remaining_cols >= TILE_2D else remaining_cols
-    if remaining_rows >= TILE_2D and remaining_cols >= TILE_2D:
-        tile = wp.tile_load(
-            values, shape=(TILE_2D, TILE_2D), offset=(row_offset, col_offset), storage="register"
-        )
-        tile_max = wp.tile_max(tile)[0]
-    else:
-        tile_max = values[row_offset, col_offset]
-        for r in range(tile_rows):
-            for c in range(tile_cols):
-                if r == 0 and c == 0:
-                    continue
-                tile_max = wp.max(tile_max, values[row_offset + r, col_offset + c])
-
-    if t == 0:
-        wp.atomic_max(out_max, 0, tile_max)
+all_1d_tiled = _reduce_1d_tiled(_tile_min, wp.atomic_min, wp.min, "all_1d_tiled")
+all_2d_rows_tiled = _reduce_2d_rows_tiled(_tile_min, wp.atomic_min, wp.min, "all_2d_rows_tiled")
+all_2d_cols_tiled = _reduce_2d_cols_tiled(_tile_min, wp.atomic_min, wp.min, "all_2d_cols_tiled")
 
 
-@wp.kernel
-def max_2d_rows_tiled(values: wp.array2d[wp.Scalar], out_max: wp.array[wp.Scalar]) -> None:
-    i, j, t = wp.tid()
-    n_cols = values.shape[1]
-    col_offset = j * TILE_1D
-    if col_offset >= n_cols:
-        return
-    remaining = n_cols - col_offset
-    if remaining >= TILE_1D:
-        tile = wp.tile_load(values, shape=(1, TILE_1D), offset=(i, col_offset), storage="register")
-        tile_max = wp.tile_max(tile)[0]
-    else:
-        tile_max = values[i, col_offset]
-        for k in range(1, remaining):
-            tile_max = wp.max(tile_max, values[i, col_offset + k])
-    if t == 0:
-        wp.atomic_max(out_max, i, tile_max)
-
-
-@wp.kernel
-def max_2d_cols_tiled(values: wp.array2d[wp.Scalar], out_max: wp.array[wp.Scalar]) -> None:
-    i, j, t = wp.tid()
-    n_rows = values.shape[0]
-    row_offset = j * TILE_1D
-    if row_offset >= n_rows:
-        return
-    remaining = n_rows - row_offset
-    if remaining >= TILE_1D:
-        tile = wp.tile_load(values, shape=(TILE_1D, 1), offset=(row_offset, i), storage="register")
-        tile_max = wp.tile_max(tile)[0]
-    else:
-        tile_max = values[row_offset, i]
-        for k in range(1, remaining):
-            tile_max = wp.max(tile_max, values[row_offset + k, i])
-    if t == 0:
-        wp.atomic_max(out_max, i, tile_max)
-
-
-max_2d_rows = _simt_reduce_rows(wp.max)
-max_2d_cols = _simt_reduce_cols(wp.max)
-
-
-@wp.kernel
-def min1d_tiled(values: wp.array[wp.Scalar], out_min: wp.array[wp.Scalar]) -> None:
-    i, t = wp.tid()
-    n = values.shape[0]
-    offset = i * TILE_1D
-    remaining = n - offset
-    if remaining <= 0:
-        return
-
-    if remaining >= TILE_1D:
-        tile = wp.tile_load(values, shape=TILE_1D, offset=offset, storage="register")
-        tile_min = wp.tile_min(tile)[0]
-    else:
-        tile_min = values[offset]
-        for k in range(1, remaining):
-            tile_min = wp.min(tile_min, values[offset + k])
-
-    if t == 0:
-        wp.atomic_min(out_min, 0, tile_min)
-
-
-@wp.kernel
-def min2d_tiled(values: wp.array2d[wp.Scalar], out_min: wp.array[wp.Scalar]) -> None:
-    i, j, t = wp.tid()
-    n_rows = values.shape[0]
-    n_cols = values.shape[1]
-    row_offset = i * TILE_2D
-    col_offset = j * TILE_2D
-    if row_offset >= n_rows or col_offset >= n_cols:
-        return
-
-    remaining_rows = n_rows - row_offset
-    remaining_cols = n_cols - col_offset
-    tile_rows = TILE_2D if remaining_rows >= TILE_2D else remaining_rows
-    tile_cols = TILE_2D if remaining_cols >= TILE_2D else remaining_cols
-    if remaining_rows >= TILE_2D and remaining_cols >= TILE_2D:
-        tile = wp.tile_load(
-            values, shape=(TILE_2D, TILE_2D), offset=(row_offset, col_offset), storage="register"
-        )
-        tile_min = wp.tile_min(tile)[0]
-    else:
-        tile_min = values[row_offset, col_offset]
-        for r in range(tile_rows):
-            for c in range(tile_cols):
-                if r == 0 and c == 0:
-                    continue
-                tile_min = wp.min(tile_min, values[row_offset + r, col_offset + c])
-
-    if t == 0:
-        wp.atomic_min(out_min, 0, tile_min)
-
-
-@wp.kernel
-def min_2d_rows_tiled(values: wp.array2d[wp.Scalar], out_min: wp.array[wp.Scalar]) -> None:
-    i, j, t = wp.tid()
-    n_cols = values.shape[1]
-    col_offset = j * TILE_1D
-    if col_offset >= n_cols:
-        return
-    remaining = n_cols - col_offset
-    if remaining >= TILE_1D:
-        tile = wp.tile_load(values, shape=(1, TILE_1D), offset=(i, col_offset), storage="register")
-        tile_min = wp.tile_min(tile)[0]
-    else:
-        tile_min = values[i, col_offset]
-        for k in range(1, remaining):
-            tile_min = wp.min(tile_min, values[i, col_offset + k])
-    if t == 0:
-        wp.atomic_min(out_min, i, tile_min)
-
-
-@wp.kernel
-def min_2d_cols_tiled(values: wp.array2d[wp.Scalar], out_min: wp.array[wp.Scalar]) -> None:
-    i, j, t = wp.tid()
-    n_rows = values.shape[0]
-    row_offset = j * TILE_1D
-    if row_offset >= n_rows:
-        return
-    remaining = n_rows - row_offset
-    if remaining >= TILE_1D:
-        tile = wp.tile_load(values, shape=(TILE_1D, 1), offset=(row_offset, i), storage="register")
-        tile_min = wp.tile_min(tile)[0]
-    else:
-        tile_min = values[row_offset, i]
-        for k in range(1, remaining):
-            tile_min = wp.min(tile_min, values[row_offset + k, i])
-    if t == 0:
-        wp.atomic_min(out_min, i, tile_min)
-
-
-min_2d_rows = _simt_reduce_rows(wp.min)
-min_2d_cols = _simt_reduce_cols(wp.min)
+# ---------------------------------------------------------------------------
+# Min/max together. The dual tile-reduction, dual atomic and two output slots do
+# not fit the single-primitive factory template, so these stay hand-written.
+# ---------------------------------------------------------------------------
 
 
 @wp.kernel
@@ -359,163 +306,11 @@ def minmax_2d_cols_tiled(
         wp.atomic_max(out_max, i, tile_max)
 
 
-@wp.kernel
-def minmax_2d_rows(
-    values: wp.array2d[wp.Scalar], out_min: wp.array[wp.Scalar], out_max: wp.array[wp.Scalar]
-) -> None:
-    """axis=1: one thread per row, min and max across columns."""
-    i = int(wp.tid())
-    vmin = values[i, 0]
-    vmax = values[i, 0]
-    for j in range(1, values.shape[1]):
-        v = values[i, j]
-        vmin = wp.min(vmin, v)
-        vmax = wp.max(vmax, v)
-    out_min[i] = vmin
-    out_max[i] = vmax
-
-
-@wp.kernel
-def minmax_2d_cols(
-    values: wp.array2d[wp.Scalar], out_min: wp.array[wp.Scalar], out_max: wp.array[wp.Scalar]
-) -> None:
-    """axis=0: one thread per column, min and max across rows."""
-    i = int(wp.tid())
-    vmin = values[0, i]
-    vmax = values[0, i]
-    for row in range(1, values.shape[0]):
-        v = values[row, i]
-        vmin = wp.min(vmin, v)
-        vmax = wp.max(vmax, v)
-    out_min[i] = vmin
-    out_max[i] = vmax
-
-
-@wp.kernel
-def any_1d_tiled(mask: wp.array[wp.int32], out: wp.array[wp.int32]) -> None:
-    i, t = wp.tid()
-    n = mask.shape[0]
-    offset = i * TILE_1D
-    remaining = n - offset
-    if remaining <= 0:
-        return
-
-    if remaining >= TILE_1D:
-        tile = wp.tile_load(mask, shape=TILE_1D, offset=offset, storage="register")
-        tile_any = wp.tile_max(tile)[0]
-    else:
-        tile_any = wp.int32(0)
-        for k in range(remaining):
-            tile_any = wp.max(tile_any, mask[offset + k])
-
-    if t == 0:
-        wp.atomic_max(out, 0, tile_any)
-
-
-@wp.kernel
-def any_2d_rows_tiled(mask: wp.array2d[wp.int32], out: wp.array[wp.int32]) -> None:
-    i, j, t = wp.tid()
-    n_cols = mask.shape[1]
-    col_offset = j * TILE_1D
-    if col_offset >= n_cols:
-        return
-    remaining = n_cols - col_offset
-    if remaining >= TILE_1D:
-        tile = wp.tile_load(mask, shape=(1, TILE_1D), offset=(i, col_offset), storage="register")
-        tile_any = wp.tile_max(tile)[0]
-    else:
-        tile_any = wp.int32(0)
-        for k in range(remaining):
-            tile_any = wp.max(tile_any, mask[i, col_offset + k])
-    if t == 0:
-        wp.atomic_max(out, i, tile_any)
-
-
-@wp.kernel
-def any_2d_cols_tiled(mask: wp.array2d[wp.int32], out: wp.array[wp.int32]) -> None:
-    i, j, t = wp.tid()
-    n_rows = mask.shape[0]
-    row_offset = j * TILE_1D
-    if row_offset >= n_rows:
-        return
-    remaining = n_rows - row_offset
-    if remaining >= TILE_1D:
-        tile = wp.tile_load(mask, shape=(TILE_1D, 1), offset=(row_offset, i), storage="register")
-        tile_any = wp.tile_max(tile)[0]
-    else:
-        tile_any = wp.int32(0)
-        for k in range(remaining):
-            tile_any = wp.max(tile_any, mask[row_offset + k, i])
-    if t == 0:
-        wp.atomic_max(out, i, tile_any)
-
-
-any_2d_rows = _simt_bool_rows(wp.max, 0)
-any_2d_cols = _simt_bool_cols(wp.max, 0)
-
-
-@wp.kernel
-def all_1d_tiled(mask: wp.array[wp.int32], out: wp.array[wp.int32]) -> None:
-    i, t = wp.tid()
-    n = mask.shape[0]
-    offset = i * TILE_1D
-    remaining = n - offset
-    if remaining <= 0:
-        return
-
-    if remaining >= TILE_1D:
-        tile = wp.tile_load(mask, shape=TILE_1D, offset=offset, storage="register")
-        tile_all = wp.int32(wp.tile_sum(tile)[0] == TILE_1D)
-    else:
-        chunk_sum = wp.int32(0)
-        for k in range(remaining):
-            chunk_sum += mask[offset + k]
-        tile_all = wp.int32(chunk_sum == remaining)
-
-    if t == 0:
-        wp.atomic_min(out, 0, tile_all)
-
-
-@wp.kernel
-def all_2d_rows_tiled(mask: wp.array2d[wp.int32], out: wp.array[wp.int32]) -> None:
-    i, j, t = wp.tid()
-    n_cols = mask.shape[1]
-    col_offset = j * TILE_1D
-    if col_offset >= n_cols:
-        return
-    remaining = n_cols - col_offset
-    if remaining >= TILE_1D:
-        tile = wp.tile_load(mask, shape=(1, TILE_1D), offset=(i, col_offset), storage="register")
-        tile_all = wp.tile_min(tile)[0]
-    else:
-        tile_all = wp.int32(1)
-        for k in range(remaining):
-            tile_all = wp.min(tile_all, mask[i, col_offset + k])
-    if t == 0:
-        wp.atomic_min(out, i, tile_all)
-
-
-@wp.kernel
-def all_2d_cols_tiled(mask: wp.array2d[wp.int32], out: wp.array[wp.int32]) -> None:
-    i, j, t = wp.tid()
-    n_rows = mask.shape[0]
-    row_offset = j * TILE_1D
-    if row_offset >= n_rows:
-        return
-    remaining = n_rows - row_offset
-    if remaining >= TILE_1D:
-        tile = wp.tile_load(mask, shape=(TILE_1D, 1), offset=(row_offset, i), storage="register")
-        tile_all = wp.tile_min(tile)[0]
-    else:
-        tile_all = wp.int32(1)
-        for k in range(remaining):
-            tile_all = wp.min(tile_all, mask[row_offset + k, i])
-    if t == 0:
-        wp.atomic_min(out, i, tile_all)
-
-
-all_2d_rows = _simt_bool_rows(wp.min, 1)
-all_2d_cols = _simt_bool_cols(wp.min, 1)
+# ---------------------------------------------------------------------------
+# Specialised sum helpers used by other kernel modules and the vec3 / weighted
+# reductions. These carry bespoke dtypes (vec3, weight products) that the shared
+# scalar template does not cover, so they remain standalone.
+# ---------------------------------------------------------------------------
 
 
 @wp.func
@@ -528,94 +323,6 @@ def sum1d_tile(values: wp.array[wp.Scalar], offset: int, remaining: int) -> wp.S
     for k in range(1, remaining):
         tile_sum += values[offset + k]
     return tile_sum
-
-
-@wp.kernel
-def sum1d_tiled(values: wp.array[wp.Scalar], out_sum: wp.array[wp.Scalar]) -> None:
-    i, t = wp.tid()
-    n = values.shape[0]
-    offset = i * TILE_1D
-    remaining = n - offset
-    if remaining <= 0:
-        return
-
-    tile_sum = sum1d_tile(values, offset, remaining)
-
-    if t == 0:
-        wp.atomic_add(out_sum, 0, tile_sum)
-
-
-@wp.kernel
-def sum2d_tiled(values: wp.array2d[wp.Scalar], out_sum: wp.array[wp.Scalar]) -> None:
-    i, j, t = wp.tid()
-    n_rows = values.shape[0]
-    n_cols = values.shape[1]
-    row_offset = i * TILE_2D
-    col_offset = j * TILE_2D
-    if row_offset >= n_rows or col_offset >= n_cols:
-        return
-
-    remaining_rows = n_rows - row_offset
-    remaining_cols = n_cols - col_offset
-    tile_rows = TILE_2D if remaining_rows >= TILE_2D else remaining_rows
-    tile_cols = TILE_2D if remaining_cols >= TILE_2D else remaining_cols
-    if remaining_rows >= TILE_2D and remaining_cols >= TILE_2D:
-        tile = wp.tile_load(
-            values, shape=(TILE_2D, TILE_2D), offset=(row_offset, col_offset), storage="register"
-        )
-        tile_sum = wp.tile_sum(tile)[0]
-    else:
-        tile_sum = values[row_offset, col_offset]
-        for r in range(tile_rows):
-            for c in range(tile_cols):
-                if r == 0 and c == 0:
-                    continue
-                tile_sum += values[row_offset + r, col_offset + c]
-
-    if t == 0:
-        wp.atomic_add(out_sum, 0, tile_sum)
-
-
-@wp.kernel
-def sum_2d_rows_tiled(values: wp.array2d[wp.Scalar], out_sum: wp.array[wp.Scalar]) -> None:
-    i, j, t = wp.tid()
-    n_cols = values.shape[1]
-    col_offset = j * TILE_1D
-    if col_offset >= n_cols:
-        return
-    remaining = n_cols - col_offset
-    if remaining >= TILE_1D:
-        tile = wp.tile_load(values, shape=(1, TILE_1D), offset=(i, col_offset), storage="register")
-        tile_sum = wp.tile_sum(tile)[0]
-    else:
-        tile_sum = values[i, col_offset]
-        for k in range(1, remaining):
-            tile_sum += values[i, col_offset + k]
-    if t == 0:
-        wp.atomic_add(out_sum, i, tile_sum)
-
-
-@wp.kernel
-def sum_2d_cols_tiled(values: wp.array2d[wp.Scalar], out_sum: wp.array[wp.Scalar]) -> None:
-    i, j, t = wp.tid()
-    n_rows = values.shape[0]
-    row_offset = j * TILE_1D
-    if row_offset >= n_rows:
-        return
-    remaining = n_rows - row_offset
-    if remaining >= TILE_1D:
-        tile = wp.tile_load(values, shape=(TILE_1D, 1), offset=(row_offset, i), storage="register")
-        tile_sum = wp.tile_sum(tile)[0]
-    else:
-        tile_sum = values[row_offset, i]
-        for k in range(1, remaining):
-            tile_sum += values[row_offset + k, i]
-    if t == 0:
-        wp.atomic_add(out_sum, i, tile_sum)
-
-
-sum_2d_rows = _simt_reduce_rows(wp.add)
-sum_2d_cols = _simt_reduce_cols(wp.add)
 
 
 @wp.func

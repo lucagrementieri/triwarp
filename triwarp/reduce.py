@@ -545,8 +545,6 @@ def zero_for_dtype(dtype: type[wp.Scalar]) -> int | float:
 
 class _ScalarReduceSpec(NamedTuple):
     name: str
-    axis_rows: Callable[..., None]
-    axis_cols: Callable[..., None]
     axis_rows_tiled: Callable[..., None]
     axis_cols_tiled: Callable[..., None]
     tiled_1d: Callable[..., None]
@@ -558,8 +556,6 @@ class _ScalarReduceSpec(NamedTuple):
 
 class _BoolReduceSpec(NamedTuple):
     name: str
-    axis_rows: Callable[..., None]
-    axis_cols: Callable[..., None]
     axis_rows_tiled: Callable[..., None]
     axis_cols_tiled: Callable[..., None]
     tiled_1d: Callable[..., None]
@@ -569,8 +565,6 @@ class _BoolReduceSpec(NamedTuple):
 _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
     "min": _ScalarReduceSpec(
         name="min",
-        axis_rows=kernel_reduce.min_2d_rows,
-        axis_cols=kernel_reduce.min_2d_cols,
         axis_rows_tiled=kernel_reduce.min_2d_rows_tiled,
         axis_cols_tiled=kernel_reduce.min_2d_cols_tiled,
         tiled_1d=kernel_reduce.min1d_tiled,
@@ -581,8 +575,6 @@ _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
     ),
     "max": _ScalarReduceSpec(
         name="max",
-        axis_rows=kernel_reduce.max_2d_rows,
-        axis_cols=kernel_reduce.max_2d_cols,
         axis_rows_tiled=kernel_reduce.max_2d_rows_tiled,
         axis_cols_tiled=kernel_reduce.max_2d_cols_tiled,
         tiled_1d=kernel_reduce.max1d_tiled,
@@ -593,8 +585,6 @@ _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
     ),
     "minmax": _ScalarReduceSpec(
         name="minmax",
-        axis_rows=kernel_reduce.minmax_2d_rows,
-        axis_cols=kernel_reduce.minmax_2d_cols,
         axis_rows_tiled=kernel_reduce.minmax_2d_rows_tiled,
         axis_cols_tiled=kernel_reduce.minmax_2d_cols_tiled,
         tiled_1d=kernel_reduce.minmax1d_tiled,
@@ -605,8 +595,6 @@ _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
     ),
     "sum": _ScalarReduceSpec(
         name="sum",
-        axis_rows=kernel_reduce.sum_2d_rows,
-        axis_cols=kernel_reduce.sum_2d_cols,
         axis_rows_tiled=kernel_reduce.sum_2d_rows_tiled,
         axis_cols_tiled=kernel_reduce.sum_2d_cols_tiled,
         tiled_1d=kernel_reduce.sum1d_tiled,
@@ -620,8 +608,6 @@ _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
 _BOOL_REDUCE: dict[str, _BoolReduceSpec] = {
     "any": _BoolReduceSpec(
         name="any",
-        axis_rows=kernel_reduce.any_2d_rows,
-        axis_cols=kernel_reduce.any_2d_cols,
         axis_rows_tiled=kernel_reduce.any_2d_rows_tiled,
         axis_cols_tiled=kernel_reduce.any_2d_cols_tiled,
         tiled_1d=kernel_reduce.any_1d_tiled,
@@ -629,8 +615,6 @@ _BOOL_REDUCE: dict[str, _BoolReduceSpec] = {
     ),
     "all": _BoolReduceSpec(
         name="all",
-        axis_rows=kernel_reduce.all_2d_rows,
-        axis_cols=kernel_reduce.all_2d_cols,
         axis_rows_tiled=kernel_reduce.all_2d_rows_tiled,
         axis_cols_tiled=kernel_reduce.all_2d_cols_tiled,
         tiled_1d=kernel_reduce.all_1d_tiled,

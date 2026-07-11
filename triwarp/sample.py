@@ -372,7 +372,8 @@ def _bridson_blue_noise(
         device=device,
     )
 
-    keys_buf = tw.unique.reinterpret_cast_to_int(cell_keys, 2 * nx)
+    keys_buf = wp.empty(2 * nx, dtype=wp.int64, device=device)
+    wp.copy(keys_buf, cell_keys, count=nx)
     perm = init_sort_pair_indices(nx, nx, device)
     wp.utils.radix_sort_pairs(keys_buf, perm, count=nx)
 
