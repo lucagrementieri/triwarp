@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.constants import FLOAT32_INF_CONSTANT, TILE_1D, TOLERANCE_MERGE_CONSTANT
+from triwarp.constants import FLOAT32_INF_CONSTANT, TILE_1D
 
 
 @wp.kernel
@@ -18,11 +18,6 @@ def face_adjacency_projections(
     vid_other = face_adjacency_unshared[tid, 1]
     vector_other = vertices[vid_other] - origin
     out_projections[tid] = wp.dot(vector_other, normal)
-
-
-@wp.func
-def is_convex_projection(projection: wp.float32) -> wp.bool:
-    return projection < TOLERANCE_MERGE_CONSTANT
 
 
 @wp.kernel

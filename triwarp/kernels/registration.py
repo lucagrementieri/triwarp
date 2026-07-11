@@ -216,15 +216,11 @@ def distance_threshold_weight(
     distance: wp.float32, triangle_id: wp.int32, max_distance: wp.float32
 ) -> wp.float32:
     """Binary correspondence mask: 1 for a valid, in-range hit, 0 otherwise."""
-    if triangle_id >= 0 and distance <= max_distance:
-        return wp.float32(1.0)
-    return wp.float32(0.0)
-
-
-@wp.kernel
-def compose_mat44(a: wp.array[wp.mat44], b: wp.array[wp.mat44], out_ab: wp.array[wp.mat44]) -> None:
-    """Compose two homogeneous transforms: ``out = a @ b`` (apply ``b`` then ``a``)."""
-    out_ab[0] = a[0] * b[0]
+    return wp.where(
+        triangle_id >= wp.int32(0) and distance <= max_distance,
+        wp.float32(1.0),
+        wp.float32(0.0),
+    )
 
 
 @wp.func

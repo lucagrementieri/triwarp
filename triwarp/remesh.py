@@ -8,6 +8,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import remesh as kernel_remesh
 
 
@@ -177,7 +178,7 @@ def subdivide_to_size(
 
         # Flag the edges that are longer than the target length.
         long_mask = wp.empty(m, dtype=wp.bool, device=device)
-        wp.map(kernel_remesh.is_long_edge, lengths, max_edge_f, out=long_mask)
+        wp.map(kernel_array.greater, lengths, max_edge_f, out=long_mask)
 
         # Exclusive scan of the flags gives each long edge its new-vertex slot;
         # the inclusive total is the number of midpoints to add this pass.

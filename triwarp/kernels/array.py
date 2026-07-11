@@ -149,6 +149,26 @@ def vector_angle_vec(a: wp.vec3, b: wp.vec3) -> wp.float32:
 
 
 @wp.func
+def greater(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
+    return a > b
+
+
+@wp.func
+def greater_equal(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
+    return a >= b
+
+
+@wp.func
+def less(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
+    return a < b
+
+
+@wp.func
+def equal(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
+    return a == b
+
+
+@wp.func
 def is_close_scalar(a: wp.float32, b: wp.float32, rtol: wp.float32, atol: wp.float32) -> wp.bool:
     return wp.abs(a - b) <= atol + rtol * wp.abs(b)
 

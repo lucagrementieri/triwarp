@@ -548,9 +548,7 @@ def icp_point_to_plane(
         current = updated
         transformed = current
         new_total = wp.empty(1, dtype=wp.mat44, device=device)
-        wp.launch(
-            kernel_registration.compose_mat44, dim=1, inputs=[step, total, new_total], device=device
-        )
+        wp.map(wp.mul, step, total, out=new_total)
         total = new_total
 
         cost = float(cost_acc.numpy()[0])

@@ -510,10 +510,8 @@ def flatnonzero(mask: wp.array[wp.bool]) -> wp.array[wp.int32]:
     wp.utils.array_cast(mask, flags)
 
     exclusive = wp.empty(n, dtype=wp.int32, device=device)
-    inclusive = wp.empty(n, dtype=wp.int32, device=device)
     wp.utils.array_scan(flags, out_array=exclusive, inclusive=False)
-    wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
-    n_out = int(inclusive.numpy()[-1])
+    n_out = int(exclusive.numpy()[-1]) + int(flags.numpy()[-1])
 
     if n_out == 0:
         return wp.empty(0, dtype=wp.int32, device=device)
@@ -558,6 +556,50 @@ def gather(src: wp.array[DType], indices: wp.array[wp.int32]) -> wp.array[DType]
     if k > 0:
         wp.copy(out, src[indices])
     return out
+
+
+def trim_to_count(
+    counter: wp.array[wp.int32], *buffers: wp.array[DType]
+) -> tuple[int, list[wp.array[DType]]]:
+    """
+    Trim atomic-append output buffers to the number of elements actually written.
+
+    A kernel that emits an unpredictable number of results cannot size its output ahead of
+    time. The usual pattern is to over-allocate the output buffers to a safe upper bound and
+    have each thread claim its slots with ``wp.atomic_add`` on a shared length-1 ``counter``,
+    writing into ``buffer[slot]``. After the launch, only the first ``n_out`` slots hold valid
+    data and the tail is uninitialized, but ``n_out`` is known only on the device.
+
+    This finalizes that pattern: it reads the counter back to the host once, then copies the
+    valid prefix ``buffer[:n_out]`` of each over-allocated buffer into a freshly allocated,
+    exact-size array. Pass every buffer filled by the same counter in one call so they are all
+    trimmed to a consistent length.
+
+    Parameters
+    ----------
+    counter
+        Length-1 ``wp.int32`` array holding the final atomic-append count on the target device.
+    *buffers
+        Over-allocated output buffers to trim, all indexed along their first axis by the same
+        counter. Any rank and ``dtype``; trailing dimensions are preserved.
+
+    Returns
+    -------
+    n_out : int
+        The counter value: the number of valid leading elements in each buffer.
+    trimmed : list[wp.array]
+        One contiguous ``(n_out, *buffer.shape[1:])`` copy per input buffer, in order, each on
+        its buffer's device.
+    """
+    n_out = int(counter.numpy().item())
+    trimmed = []
+    for buffer in buffers:
+        out_shape = (n_out, *(int(dim) for dim in buffer.shape[1:]))
+        out = wp.empty(out_shape, dtype=buffer.dtype, device=buffer.device)
+        if n_out > 0:
+            wp.copy(out, buffer[:n_out])
+        trimmed.append(out)
+    return n_out, trimmed
 
 
 def square(values: wp.array[wp.Scalar]) -> wp.array[wp.Scalar]:

@@ -66,6 +66,4 @@ def flip_faces_masked(
 @wp.func
 def negative_volume_flag(volume: wp.float32) -> wp.int32:
     """Flag a face for flipping when its component's signed volume is negative (inward)."""
-    if volume < 0.0:
-        return wp.int32(1)
-    return wp.int32(0)
+    return wp.where(volume < wp.float32(0.0), wp.int32(1), wp.int32(0))

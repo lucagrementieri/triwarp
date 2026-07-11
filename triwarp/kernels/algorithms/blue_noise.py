@@ -293,11 +293,3 @@ def mark_empty_candidate_cells(
     out_has_candidates[c] = selected[c] < wp.int32(0) and cell_offsets[c + 1] > cell_offsets[c]
 
 
-@wp.func
-def int_is_zero(flag: wp.int32) -> wp.bool:
-    return flag == wp.int32(0)
-
-
-@wp.func
-def spawned_is_valid(spawned: wp.int32) -> wp.bool:
-    return spawned >= wp.int32(0)

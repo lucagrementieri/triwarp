@@ -64,25 +64,28 @@ def intersects_location(
     if max_t is None:
         max_t = default_mesh_query_max_dist(mesh.points, ray_origins)
 
-    faces_dense = wp.empty(n, dtype=wp.int32, device=device)
-    locations_dense = wp.empty(n, dtype=wp.vec3, device=device)
-    wp.map(
-        kernel_ray.first_hit,
-        wp.uint64(mesh.id),
-        ray_origins,
-        ray_directions,
-        wp.float32(max_t),
-        out=[faces_dense, locations_dense],
+    index_ray = wp.empty(n, dtype=wp.int32, device=device)
+    index_tri = wp.empty(n, dtype=wp.int32, device=device)
+    locations = wp.empty(n, dtype=wp.vec3, device=device)
+    counter = wp.zeros(1, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_ray.first_hit_append,
+        dim=n,
+        inputs=[
+            wp.uint64(mesh.id),
+            ray_origins,
+            ray_directions,
+            wp.float32(max_t),
+            index_ray,
+            index_tri,
+            locations,
+            counter,
+        ],
+        device=device,
     )
-
-    hit_mask = wp.empty(n, dtype=wp.bool, device=device)
-    wp.map(kernel_ray.is_hit, faces_dense, out=hit_mask)
-    index_ray = tw.array.flatnonzero(hit_mask)
-    k = int(index_ray.shape[0])
-    index_tri = wp.empty(k, dtype=wp.int32, device=device)
-    wp.copy(index_tri, faces_dense[index_ray])
-    locations = wp.empty(k, dtype=wp.vec3, device=device)
-    wp.copy(locations, locations_dense[index_ray])
+    _, (locations, index_ray, index_tri) = tw.array.trim_to_count(
+        counter, locations, index_ray, index_tri
+    )
     return locations, index_ray, index_tri
 
 

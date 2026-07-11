@@ -10,6 +10,7 @@ import warp as wp
 
 import triwarp as tw
 from triwarp.array import append, concatenate, flatnonzero, gather, init_sort_pair_indices
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import sample as kernel_sample
 from triwarp.kernels.algorithms import blue_noise as kernel_blue_noise
 from triwarp.proximity import query_hashgrid_ball_with_offsets
@@ -472,9 +473,9 @@ def _bridson_blue_noise(
         )
 
         staying_mask = wp.empty(active_count, dtype=wp.bool, device=device)
-        wp.map(kernel_blue_noise.int_is_zero, retire, out=staying_mask)
+        wp.map(kernel_array.equal, retire, wp.int32(0), out=staying_mask)
         spawned_mask = wp.empty(active_count, dtype=wp.bool, device=device)
-        wp.map(kernel_blue_noise.spawned_is_valid, spawned, out=spawned_mask)
+        wp.map(kernel_array.greater_equal, spawned, wp.int32(0), out=spawned_mask)
 
         retire_bool = wp.empty(active_count, dtype=wp.bool, device=device)
         wp.utils.array_cast(retire, retire_bool)

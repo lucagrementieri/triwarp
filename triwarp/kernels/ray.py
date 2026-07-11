@@ -20,16 +20,32 @@ def first_hit(
     return face, location
 
 
+@wp.kernel
+def first_hit_append(
+    mesh_id: wp.uint64,
+    ray_origins: wp.array[wp.vec3],
+    ray_directions: wp.array[wp.vec3],
+    max_t: wp.float32,
+    out_index_ray: wp.array[wp.int32],
+    out_index_tri: wp.array[wp.int32],
+    out_locations: wp.array[wp.vec3],
+    out_count: wp.array[wp.int32],
+) -> None:
+    # Single-pass compaction: each ray that hits atomically claims one output slot.
+    i = int(wp.tid())
+    face, location = first_hit(mesh_id, ray_origins[i], ray_directions[i], max_t)
+    if face >= 0:
+        slot = wp.atomic_add(out_count, 0, 1)
+        out_index_ray[slot] = wp.int32(i)
+        out_index_tri[slot] = face
+        out_locations[slot] = location
+
+
 @wp.func
 def any_hit(
     mesh_id: wp.uint64, origin: wp.vec3, direction: wp.vec3, max_t: wp.float32
 ) -> wp.bool:
     return wp.mesh_query_ray_anyhit(mesh_id, origin, wp.normalize(direction), max_t)
-
-
-@wp.func
-def is_hit(triangle_index: wp.int32) -> wp.bool:
-    return triangle_index >= 0
 
 
 @wp.func

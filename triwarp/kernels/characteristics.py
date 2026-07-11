@@ -48,12 +48,6 @@ def mark_intersecting_faces(
 
 
 @wp.func
-def orientation_bit(orient: wp.int32) -> wp.bool:
-    """Per-face flip flag: ``True`` where the orientation bit marks the face for flipping."""
-    return orient > wp.int32(0)
-
-
-@wp.func
 def edge_manifold(count: wp.int32, allow_boundary: wp.bool) -> wp.bool:
     """Per-unique-edge manifold flag from its face-share count."""
     if allow_boundary:

@@ -376,12 +376,7 @@ def ears(
         device=device,
     )
 
-    n_ears = int(counter.numpy().item())
+    n_ears, (ear, ear_opp) = tw.array.trim_to_count(counter, out_ear, out_ear_opp)
     if n_ears == 0:
         return empty, empty
-
-    ear = wp.empty(n_ears, dtype=wp.int32, device=device)
-    ear_opp = wp.empty(n_ears, dtype=wp.int32, device=device)
-    wp.copy(ear, out_ear, count=n_ears)
-    wp.copy(ear_opp, out_ear_opp, count=n_ears)
     return ear, ear_opp

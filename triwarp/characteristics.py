@@ -6,6 +6,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import characteristics as kernel_characteristics
 from triwarp.kernels import intersection as kernel_intersections
 from triwarp.kernels import sample as kernel_sample
@@ -705,7 +706,7 @@ def face_orientation_mask(faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
 
     orient, _, _, _ = _orientation_bits(faces)
     mask = wp.empty(n_faces, dtype=wp.bool, device=device)
-    wp.map(kernel_characteristics.orientation_bit, orient, out=mask)
+    wp.map(kernel_array.greater, orient, wp.int32(0), out=mask)
     return mask
 
 

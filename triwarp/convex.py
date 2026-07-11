@@ -4,7 +4,8 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.constants import TILE_1D
+from triwarp.constants import TILE_1D, TOLERANCE_MERGE_CONSTANT
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import convex as kernel_convex
 
 
@@ -178,7 +179,7 @@ def face_adjacency_convex(
         face_normals=face_normals,
     )
     out_convex = wp.empty(m, dtype=wp.bool, device=device)
-    wp.map(kernel_convex.is_convex_projection, projections, out=out_convex)
+    wp.map(kernel_array.less, projections, TOLERANCE_MERGE_CONSTANT, out=out_convex)
     return out_convex
 
 

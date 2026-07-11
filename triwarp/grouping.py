@@ -53,10 +53,7 @@ def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
         inputs=[values_buffer, indices_buffer, counter, groups_buffer],
         device=values.device,
     )
-    n_groups = counter.numpy().item()
-    groups = wp.empty((n_groups, length), dtype=wp.int32, device=values.device)
-    if n_groups > 0:
-        wp.copy(groups, groups_buffer, count=n_groups * length)
+    _, (groups,) = tw.array.trim_to_count(counter, groups_buffer)
     return twt.as_array2d_int32(groups)
 
 

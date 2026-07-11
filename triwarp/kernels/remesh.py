@@ -60,11 +60,6 @@ def subdivide_faces(
     out_faces[base + 11] = m2
 
 
-@wp.func
-def is_long_edge(length: wp.float32, max_edge: wp.float32) -> wp.bool:
-    return length > max_edge
-
-
 @wp.kernel
 def build_midpoint_index(
     long_mask: wp.array[wp.bool],

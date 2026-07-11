@@ -29,9 +29,7 @@ def scatter_boundary_mask(
 @wp.func
 def interior_flag(boundary: wp.bool) -> wp.int32:
     # ``1`` for interior (free) vertices, ``0`` for fixed ones; scanned into the interior remap.
-    if boundary:
-        return wp.int32(0)
-    return wp.int32(1)
+    return wp.where(boundary, wp.int32(0), wp.int32(1))
 
 
 @wp.kernel
