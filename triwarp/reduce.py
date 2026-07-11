@@ -313,12 +313,7 @@ def mean(
     sums = cast(twt.Array1dScalar, total)
     out = wp.empty(int(sums.shape[0]), dtype=wp.float32, device=array.device)
     wp.utils.array_cast(sums, out)
-    wp.launch(
-        kernel_array.divide,
-        dim=int(out.shape[0]),
-        inputs=[out, wp.float32(array.shape[axis])],
-        device=array.device,
-    )
+    wp.map(wp.div, out, wp.float32(array.shape[axis]), out=out)
     return cast(twt.Array1dFloat32, out)
 
 

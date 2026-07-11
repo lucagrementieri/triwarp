@@ -133,7 +133,7 @@ def _unique_hash(
     wp.launch(kernel_unique.mark_occupied, dim=cap, inputs=[slot_key, occ_mask], device=device)
     scan_pos = wp.empty(cap, dtype=wp.int32, device=device)
     wp.utils.array_scan(occ_mask, scan_pos, inclusive=True)
-    wp.launch(kernel_array.sub, dim=cap, inputs=[scan_pos, wp.int32(1)], device=device)
+    wp.map(wp.sub, scan_pos, wp.int32(1), out=scan_pos)
     n_unique = int(tw.reduce.max(scan_pos)) + 1
 
     # Phase 3: compact unique keys and their occurrence counts.
@@ -346,7 +346,7 @@ def hash_vector_rows(data: wp.array[wp.vec3], epsilon: float = 0.0) -> wp.array[
         )
         return hash_indices_rows(rounded)
     hashes = wp.empty(data.shape[0], dtype=wp.uint64, device=data.device)
-    wp.launch(kernel_unique.pack_vec3, dim=data.shape[0], inputs=[data, hashes], device=data.device)
+    wp.map(kernel_unique.pack_vec3, data, out=hashes)
     return hashes
 
 

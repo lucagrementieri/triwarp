@@ -7,6 +7,7 @@ import warp.optim.linear as wpl
 import warp.sparse as wps
 
 from triwarp import laplacian
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import laplacian as kernel_laplacian
 from triwarp.kernels import smoothing as kernel_smoothing
 from triwarp.triangles import face_normals_and_areas
@@ -16,16 +17,14 @@ _CG_TOLERANCE = 1e-10
 
 
 def _to_vec3d(vertices: wp.array[wp.vec3]) -> wp.array[wp.vec3d]:
-    n = int(vertices.shape[0])
-    out = wp.empty(n, dtype=wp.vec3d, device=vertices.device)
-    wp.launch(kernel_smoothing.to_vec3d, dim=n, inputs=[vertices, out], device=vertices.device)
+    out = wp.empty(int(vertices.shape[0]), dtype=wp.vec3d, device=vertices.device)
+    wp.map(kernel_array.to_vec3d, vertices, out=out)
     return out
 
 
 def _to_vec3(positions: wp.array[wp.vec3d]) -> wp.array[wp.vec3]:
-    n = int(positions.shape[0])
-    out = wp.empty(n, dtype=wp.vec3, device=positions.device)
-    wp.launch(kernel_smoothing.to_vec3, dim=n, inputs=[positions, out], device=positions.device)
+    out = wp.empty(int(positions.shape[0]), dtype=wp.vec3, device=positions.device)
+    wp.map(kernel_array.to_vec3, positions, out=out)
     return out
 
 
@@ -58,12 +57,7 @@ def _apply_volume_constraint(
     vol_new = _mesh_volume(positions, faces)
     if vol_new != 0.0:
         factor = (vol_ini / vol_new) ** (1.0 / 3.0)
-        wp.launch(
-            kernel_smoothing.scale_vertices,
-            dim=int(positions.shape[0]),
-            inputs=[wp.float64(factor), positions],
-            device=positions.device,
-        )
+        wp.map(wp.mul, positions, wp.float64(factor), out=positions)
 
 
 def _require_cuda(device: wp.DeviceLike, name: str) -> None:
@@ -147,34 +141,23 @@ def filter_laplacian(
         components = _empty_components(n, device)
         solutions = _empty_components(n, device)
         for _ in range(iterations):
-            wp.launch(
-                kernel_smoothing.extract_components,
-                dim=n,
-                inputs=[positions, *components],
-                device=device,
-            )
+            wp.map(kernel_smoothing.extract_components, positions, out=list(components))
             for rhs, solution in zip(components, solutions, strict=True):
                 wp.copy(solution, rhs)
                 wpl.cg(system, rhs, solution, tol=_CG_TOLERANCE, maxiter=10 * n, M=precond)
-            wp.launch(
-                kernel_smoothing.insert_components,
-                dim=n,
-                inputs=[*solutions, positions],
-                device=device,
-            )
+            wp.map(kernel_smoothing.combine_components, *solutions, out=positions)
             if volume_constraint:
                 _apply_volume_constraint(positions, faces, vol_ini)
     else:
         lv = wp.empty(n, dtype=wp.vec3d, device=device)
         nxt = wp.empty(n, dtype=wp.vec3d, device=device)
+        coeff = wp.float64(lamb)
+        step = wp.map(
+            kernel_smoothing.laplacian_step, positions, lv, coeff, out=nxt, return_kernel=True
+        )
         for _ in range(iterations):
             _apply_operator(operator, positions, lv)
-            wp.launch(
-                kernel_smoothing.laplacian_step,
-                dim=n,
-                inputs=[positions, lv, wp.float64(lamb), nxt],
-                device=device,
-            )
+            wp.launch(step, dim=n, inputs=[positions, lv, coeff], outputs=[nxt], device=device)
             positions, nxt = nxt, positions
             if volume_constraint:
                 _apply_volume_constraint(positions, faces, vol_ini)
@@ -244,22 +227,28 @@ def filter_humphrey(
     b = wp.empty(n, dtype=wp.vec3d, device=device)
     lb = wp.empty(n, dtype=wp.vec3d, device=device)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
+    alpha64 = wp.float64(alpha)
+    beta64 = wp.float64(beta)
+    residual = wp.map(
+        kernel_smoothing.humphrey_residual,
+        lv,
+        original,
+        positions,
+        alpha64,
+        out=b,
+        return_kernel=True,
+    )
+    update = wp.map(
+        kernel_smoothing.humphrey_update, lv, b, lb, beta64, out=nxt, return_kernel=True
+    )
     for _ in range(iterations):
         # ``positions`` doubles as the previous-iterate ``q`` (it is only read this pass).
         _apply_operator(operator, positions, lv)
         wp.launch(
-            kernel_smoothing.humphrey_residual,
-            dim=n,
-            inputs=[lv, original, positions, wp.float64(alpha), b],
-            device=device,
+            residual, dim=n, inputs=[lv, original, positions, alpha64], outputs=[b], device=device
         )
         _apply_operator(operator, b, lb)
-        wp.launch(
-            kernel_smoothing.humphrey_update,
-            dim=n,
-            inputs=[lv, b, lb, wp.float64(beta), nxt],
-            device=device,
-        )
+        wp.launch(update, dim=n, inputs=[lv, b, lb, beta64], outputs=[nxt], device=device)
         positions, nxt = nxt, positions
 
     return _to_vec3(positions)
@@ -321,14 +310,19 @@ def filter_taubin(
     positions = _to_vec3d(vertices)
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
+    step = wp.map(
+        kernel_smoothing.laplacian_step,
+        positions,
+        lv,
+        wp.float64(lamb),
+        out=nxt,
+        return_kernel=True,
+    )
     for index in range(iterations):
         _apply_operator(operator, positions, lv)
         coeff = lamb if index % 2 == 0 else -nu
         wp.launch(
-            kernel_smoothing.laplacian_step,
-            dim=n,
-            inputs=[positions, lv, wp.float64(coeff), nxt],
-            device=device,
+            step, dim=n, inputs=[positions, lv, wp.float64(coeff)], outputs=[nxt], device=device
         )
         positions, nxt = nxt, positions
 
@@ -392,14 +386,21 @@ def filter_neighborhood_average(
     positions = _to_vec3d(vertices)
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
+    # CSR row bounds as aligned per-vertex inputs: degree(i) = offsets[i + 1] - offsets[i].
+    starts = operator.offsets[:-1]
+    ends = operator.offsets[1:]
+    step = wp.map(
+        kernel_smoothing.neighborhood_average,
+        positions,
+        lv,
+        starts,
+        ends,
+        out=nxt,
+        return_kernel=True,
+    )
     for _ in range(iterations):
         _apply_operator(operator, positions, lv)
-        wp.launch(
-            kernel_smoothing.neighborhood_average_step,
-            dim=n,
-            inputs=[positions, lv, operator.offsets, nxt],
-            device=device,
-        )
+        wp.launch(step, dim=n, inputs=[positions, lv, starts, ends], outputs=[nxt], device=device)
         positions, nxt = nxt, positions
 
     return _to_vec3(positions)
@@ -484,36 +485,33 @@ def filter_mut_dif_laplacian(
     slope = 0.0
     for index in range(iterations):
         _apply_operator(operator, positions, lv)
-        wp.launch(
-            kernel_smoothing.mut_dif_adil,
-            dim=n,
-            inputs=[normals, positions, lv, adil],
-            device=device,
-        )
+        wp.map(kernel_smoothing.mut_dif_adil, normals, positions, lv, out=adil)
         mean_adil = float(adil.numpy().sum()) / n
-        wp.launch(
+        wp.map(
             kernel_smoothing.mut_dif_step,
-            dim=n,
-            inputs=[positions, lv, adil, wp.float64(mean_adil), wp.float64(lamb), nxt],
-            device=device,
+            positions,
+            lv,
+            adil,
+            wp.float64(mean_adil),
+            wp.float64(lamb),
+            out=nxt,
         )
         positions, nxt = nxt, positions
         if volume_constraint:
             vol = _mesh_volume(positions, faces)
             if index == 0:
-                wp.launch(
-                    kernel_smoothing.add_scaled_normal,
-                    dim=n,
-                    inputs=[positions, normals, wp.float64(eps), probe],
-                    device=device,
+                wp.map(
+                    kernel_smoothing.add_scaled_normal, positions, normals, wp.float64(eps),
+                    out=probe,
                 )
                 vol2 = _mesh_volume(probe, faces)
                 slope = eps / (vol2 - vol) if vol2 != vol else 0.0
-            wp.launch(
+            wp.map(
                 kernel_smoothing.add_scaled_normal,
-                dim=n,
-                inputs=[positions, normals, wp.float64(slope * (vol_ini - vol)), positions],
-                device=device,
+                positions,
+                normals,
+                wp.float64(slope * (vol_ini - vol)),
+                out=positions,
             )
 
     return _to_vec3(positions)
@@ -594,19 +592,9 @@ def filter_implicit_fairing(
         mass = laplacian.mass_matrix_entries(current, faces, dtype=wp.float64)
 
         # Right-hand side b = M V, formed before ``bsr_axpy`` mutates the mass matrix.
-        wp.launch(
-            kernel_smoothing.extract_components,
-            dim=n,
-            inputs=[positions, *components],
-            device=device,
-        )
+        wp.map(kernel_smoothing.extract_components, positions, out=list(components))
         for component, b in zip(components, rhs, strict=True):
-            wp.launch(
-                kernel_smoothing.scale_by_diagonal,
-                dim=n,
-                inputs=[mass, component, b],
-                device=device,
-            )
+            wp.map(wp.mul, mass, component, out=b)
 
         # A = M - lamb L (SPD: L has a negative diagonal, so subtracting it adds to the diagonal).
         system = wps.bsr_axpy(x=stiffness, y=wps.bsr_diag(diag=mass), alpha=-float(lamb), beta=1.0)
@@ -614,9 +602,7 @@ def filter_implicit_fairing(
         for b, solution, component in zip(rhs, solutions, components, strict=True):
             wp.copy(solution, component)
             wpl.cg(system, b, solution, tol=_CG_TOLERANCE, maxiter=10 * n, M=precond)
-        wp.launch(
-            kernel_smoothing.insert_components, dim=n, inputs=[*solutions, positions], device=device
-        )
+        wp.map(kernel_smoothing.combine_components, *solutions, out=positions)
 
     return _to_vec3(positions)
 

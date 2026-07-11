@@ -8,7 +8,6 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.kernels import array as kernel_array
 from triwarp.kernels import polyline as kernel_polyline
 
 
@@ -112,9 +111,7 @@ def polyline_length(polyline: wp.array[wp.vec3]) -> float:
     if n_segments < 1:
         return 0.0
     lengths = wp.empty(n_segments, dtype=wp.float32, device=device)
-    wp.launch(
-        kernel_polyline.segment_lengths, dim=n_segments, inputs=[polyline, lengths], device=device
-    )
+    wp.map(kernel_polyline.segment_length, polyline[:-1], polyline[1:], out=lengths)
     return float(tw.reduce.sum(lengths))
 
 
@@ -171,11 +168,11 @@ def polyline_centroid(polyline: wp.array[wp.vec3]) -> wp.vec3:
         raise ValueError("polyline_centroid requires at least two points")
     midpoints = wp.empty(n_segments, dtype=wp.vec3, device=device)
     lengths = wp.empty(n_segments, dtype=wp.float32, device=device)
-    wp.launch(
-        kernel_polyline.segment_midpoints_and_lengths,
-        dim=n_segments,
-        inputs=[polyline, midpoints, lengths],
-        device=device,
+    wp.map(
+        kernel_polyline.segment_midpoint_and_length,
+        polyline[:-1],
+        polyline[1:],
+        out=[midpoints, lengths],
     )
     weighted = tw.reduce.weighted_sum(midpoints, lengths)
     return weighted / float(tw.reduce.sum(lengths))
@@ -243,7 +240,7 @@ def polyline_normal(polyline: wp.array[wp.vec3]) -> wp.vec3:
         inputs=[polyline, out_normal],
         device=device,
     )
-    wp.launch(kernel_array.normalize, dim=1, inputs=[out_normal], device=device)
+    wp.map(wp.normalize, out_normal, out=out_normal)
     return wp.vec3(*out_normal.numpy()[0].tolist())
 
 
@@ -496,9 +493,7 @@ def _cumulative_arc_length(polyline: wp.array[wp.vec3]) -> wp.array[wp.float32]:
     device = polyline.device
     n_segments = int(polyline.shape[0]) - 1
     lengths = wp.empty(n_segments, dtype=wp.float32, device=device)
-    wp.launch(
-        kernel_polyline.segment_lengths, dim=n_segments, inputs=[polyline, lengths], device=device
-    )
+    wp.map(kernel_polyline.segment_length, polyline[:-1], polyline[1:], out=lengths)
     inclusive = wp.empty(n_segments, dtype=wp.float32, device=device)
     wp.utils.array_scan(lengths, out_array=inclusive, inclusive=True)
     return tw.array.concatenate([wp.zeros(1, dtype=wp.float32, device=device), inclusive])
@@ -934,12 +929,7 @@ def triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     u, v = _in_plane_basis(polyline_normal(polyline))
     center = polyline_centroid(polyline)
     points2d = wp.empty(n, dtype=wp.vec2, device=device)
-    wp.launch(
-        kernel_polyline.project_to_plane_2d,
-        dim=n,
-        inputs=[polyline, center, u, v, points2d],
-        device=device,
-    )
+    wp.map(kernel_polyline.project_to_plane_2d, polyline, center, u, v, out=points2d)
 
     total = wp.zeros(1, dtype=wp.float32, device=device)
     wp.launch(

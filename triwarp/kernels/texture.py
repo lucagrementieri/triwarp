@@ -1,5 +1,7 @@
 import warp as wp
 
+from triwarp.kernels.triangles import face_vertices
+
 # NaN payload for vertices whose UV is non-finite (never sampled) and out-of-bounds reads.
 NAN_F32 = wp.constant(wp.float32(float("nan")))
 # Inclusive coverage tolerance so shared triangle edges are not dropped (avoids seam gaps).
@@ -58,19 +60,23 @@ def _covered(bary: wp.vec3) -> bool:
     return bary[0] >= -COVERAGE_EPS and bary[1] >= -COVERAGE_EPS and bary[2] >= -COVERAGE_EPS
 
 
-@wp.kernel
-def rasterize_owner(
-    uv: wp.array[wp.vec2],
-    faces: wp.array[wp.int32],
-    resolution: wp.int32,
-    out_owner: wp.array2d[wp.int32],
-) -> None:
-    """Resolve per-pixel triangle ownership: the lowest face index covering each pixel wins."""
-    f = int(wp.tid())
-    q0 = _uv_to_pixel(_sanitize_uv(uv[faces[f * 3 + 0]]), resolution)
-    q1 = _uv_to_pixel(_sanitize_uv(uv[faces[f * 3 + 1]]), resolution)
-    q2 = _uv_to_pixel(_sanitize_uv(uv[faces[f * 3 + 2]]), resolution)
+@wp.func
+def _face_pixels(
+    uv: wp.array[wp.vec2], faces: wp.array[wp.int32], f: wp.int32, resolution: wp.int32
+) -> tuple[wp.vec2, wp.vec2, wp.vec2]:
+    """Pixel-center coordinates of the three (sanitized) corner UVs of face ``f``."""
+    uv0, uv1, uv2 = face_vertices(uv, faces, f)
+    q0 = _uv_to_pixel(_sanitize_uv(uv0), resolution)
+    q1 = _uv_to_pixel(_sanitize_uv(uv1), resolution)
+    q2 = _uv_to_pixel(_sanitize_uv(uv2), resolution)
+    return q0, q1, q2
 
+
+@wp.func
+def _pixel_bounds(
+    q0: wp.vec2, q1: wp.vec2, q2: wp.vec2, resolution: wp.int32
+) -> tuple[wp.int32, wp.int32, wp.int32, wp.int32]:
+    """Clamped raster bounds ``(row_lo, row_hi, col_lo, col_hi)`` of the triangle's bbox."""
     x_min = wp.min(q0[0], wp.min(q1[0], q2[0]))
     x_max = wp.max(q0[0], wp.max(q1[0], q2[0]))
     y_min = wp.min(q0[1], wp.min(q1[1], q2[1]))
@@ -80,6 +86,20 @@ def rasterize_owner(
     col_hi = wp.clamp(int(wp.ceil(x_max)), wp.int32(0), resolution - 1)
     row_lo = wp.clamp(int(wp.floor(y_min)), wp.int32(0), resolution - 1)
     row_hi = wp.clamp(int(wp.ceil(y_max)), wp.int32(0), resolution - 1)
+    return row_lo, row_hi, col_lo, col_hi
+
+
+@wp.kernel
+def rasterize_owner(
+    uv: wp.array[wp.vec2],
+    faces: wp.array[wp.int32],
+    resolution: wp.int32,
+    out_owner: wp.array2d[wp.int32],
+) -> None:
+    """Resolve per-pixel triangle ownership: the lowest face index covering each pixel wins."""
+    f = int(wp.tid())
+    q0, q1, q2 = _face_pixels(uv, faces, wp.int32(f), resolution)
+    row_lo, row_hi, col_lo, col_hi = _pixel_bounds(q0, q1, q2, resolution)
 
     for row in range(row_lo, row_hi + 1):
         for col in range(col_lo, col_hi + 1):
@@ -103,19 +123,8 @@ def rasterize_scatter(
     i1 = faces[f * 3 + 1]
     i2 = faces[f * 3 + 2]
     resolution = int(out_image.shape[0])
-    q0 = _uv_to_pixel(_sanitize_uv(uv[i0]), resolution)
-    q1 = _uv_to_pixel(_sanitize_uv(uv[i1]), resolution)
-    q2 = _uv_to_pixel(_sanitize_uv(uv[i2]), resolution)
-
-    x_min = wp.min(q0[0], wp.min(q1[0], q2[0]))
-    x_max = wp.max(q0[0], wp.max(q1[0], q2[0]))
-    y_min = wp.min(q0[1], wp.min(q1[1], q2[1]))
-    y_max = wp.max(q0[1], wp.max(q1[1], q2[1]))
-
-    col_lo = wp.clamp(int(wp.floor(x_min)), wp.int32(0), resolution - 1)
-    col_hi = wp.clamp(int(wp.ceil(x_max)), wp.int32(0), resolution - 1)
-    row_lo = wp.clamp(int(wp.floor(y_min)), wp.int32(0), resolution - 1)
-    row_hi = wp.clamp(int(wp.ceil(y_max)), wp.int32(0), resolution - 1)
+    q0, q1, q2 = _face_pixels(uv, faces, wp.int32(f), resolution)
+    row_lo, row_hi, col_lo, col_hi = _pixel_bounds(q0, q1, q2, resolution)
 
     for row in range(row_lo, row_hi + 1):
         for col in range(col_lo, col_hi + 1):
@@ -150,23 +159,12 @@ def rasterize_labels(
     i1 = faces[f * 3 + 1]
     i2 = faces[f * 3 + 2]
     resolution = int(out_labels.shape[0])
-    q0 = _uv_to_pixel(_sanitize_uv(uv[i0]), resolution)
-    q1 = _uv_to_pixel(_sanitize_uv(uv[i1]), resolution)
-    q2 = _uv_to_pixel(_sanitize_uv(uv[i2]), resolution)
+    q0, q1, q2 = _face_pixels(uv, faces, wp.int32(f), resolution)
+    row_lo, row_hi, col_lo, col_hi = _pixel_bounds(q0, q1, q2, resolution)
 
     l0 = labels[i0]
     l1 = labels[i1]
     l2 = labels[i2]
-
-    x_min = wp.min(q0[0], wp.min(q1[0], q2[0]))
-    x_max = wp.max(q0[0], wp.max(q1[0], q2[0]))
-    y_min = wp.min(q0[1], wp.min(q1[1], q2[1]))
-    y_max = wp.max(q0[1], wp.max(q1[1], q2[1]))
-
-    col_lo = wp.clamp(int(wp.floor(x_min)), wp.int32(0), resolution - 1)
-    col_hi = wp.clamp(int(wp.ceil(x_max)), wp.int32(0), resolution - 1)
-    row_lo = wp.clamp(int(wp.floor(y_min)), wp.int32(0), resolution - 1)
-    row_hi = wp.clamp(int(wp.ceil(y_max)), wp.int32(0), resolution - 1)
 
     for row in range(row_lo, row_hi + 1):
         for col in range(col_lo, col_hi + 1):
@@ -199,14 +197,19 @@ def check_uv_range(uv: wp.array[wp.vec2], out_flag: wp.array[wp.int32]) -> None:
             wp.atomic_max(out_flag, 0, wp.int32(1))
 
 
+SAMPLE_NEAREST = wp.constant(wp.int32(0))
+SAMPLE_BILINEAR = wp.constant(wp.int32(1))
+
+
 @wp.kernel
-def sample_nearest(
+def sample_texture(
     uv: wp.array[wp.vec2],
     image: wp.array3d[wp.float32],
     n_channels: wp.int32,
+    mode: wp.int32,
     out_values: wp.array2d[wp.float32],
 ) -> None:
-    """Nearest-neighbor sample the texture at each vertex UV (edge-clamped)."""
+    """Sample the texture at each vertex UV (edge-clamped), nearest or bilinear per ``mode``."""
     v = int(wp.tid())
     u = uv[v][0]
     w = uv[v][1]
@@ -218,43 +221,24 @@ def sample_nearest(
         return
     row = (1.0 - w) * wp.float32(height) - 0.5
     col = u * wp.float32(width) - 0.5
-    r = wp.clamp(int(wp.floor(row + 0.5)), wp.int32(0), height - 1)
-    c = wp.clamp(int(wp.floor(col + 0.5)), wp.int32(0), width - 1)
-    for k in range(n_channels):
-        out_values[v, k] = image[r, c, k]
-
-
-@wp.kernel
-def sample_bilinear(
-    uv: wp.array[wp.vec2],
-    image: wp.array3d[wp.float32],
-    n_channels: wp.int32,
-    out_values: wp.array2d[wp.float32],
-) -> None:
-    """Bilinearly sample the texture at each vertex UV (edge-clamped)."""
-    v = int(wp.tid())
-    u = uv[v][0]
-    w = uv[v][1]
-    height = int(image.shape[0])
-    width = int(image.shape[1])
-    if not wp.isfinite(u) or not wp.isfinite(w):
+    if mode == SAMPLE_NEAREST:
+        r = wp.clamp(int(wp.floor(row + 0.5)), wp.int32(0), height - 1)
+        c = wp.clamp(int(wp.floor(col + 0.5)), wp.int32(0), width - 1)
         for k in range(n_channels):
-            out_values[v, k] = NAN_F32
-        return
-    row = (1.0 - w) * wp.float32(height) - 0.5
-    col = u * wp.float32(width) - 0.5
-    r0 = int(wp.floor(row))
-    c0 = int(wp.floor(col))
-    fr = row - wp.float32(r0)
-    fc = col - wp.float32(c0)
-    r0c = wp.clamp(r0, wp.int32(0), height - 1)
-    r1c = wp.clamp(r0 + 1, wp.int32(0), height - 1)
-    c0c = wp.clamp(c0, wp.int32(0), width - 1)
-    c1c = wp.clamp(c0 + 1, wp.int32(0), width - 1)
-    for k in range(n_channels):
-        top = image[r0c, c0c, k] * (1.0 - fc) + image[r0c, c1c, k] * fc
-        bottom = image[r1c, c0c, k] * (1.0 - fc) + image[r1c, c1c, k] * fc
-        out_values[v, k] = top * (1.0 - fr) + bottom * fr
+            out_values[v, k] = image[r, c, k]
+    else:
+        r0 = int(wp.floor(row))
+        c0 = int(wp.floor(col))
+        fr = row - wp.float32(r0)
+        fc = col - wp.float32(c0)
+        r0c = wp.clamp(r0, wp.int32(0), height - 1)
+        r1c = wp.clamp(r0 + 1, wp.int32(0), height - 1)
+        c0c = wp.clamp(c0, wp.int32(0), width - 1)
+        c1c = wp.clamp(c0 + 1, wp.int32(0), width - 1)
+        for k in range(n_channels):
+            top = image[r0c, c0c, k] * (1.0 - fc) + image[r0c, c1c, k] * fc
+            bottom = image[r1c, c0c, k] * (1.0 - fc) + image[r1c, c1c, k] * fc
+            out_values[v, k] = top * (1.0 - fr) + bottom * fr
 
 
 @wp.kernel

@@ -150,13 +150,9 @@ def heat_geodesic(
         device=device,
     )
     poisson_system = wps.bsr_axpy(x=laplacian, alpha=-1.0)
+    # Flip sign so the Poisson right-hand side matches the positive semi-definite operator ``-L``.
     neg_divergence = wp.empty(n_vertices, dtype=wp.float64, device=device)
-    wp.launch(
-        kernel_geodesic.negate_field,
-        dim=n_vertices,
-        inputs=[divergence, neg_divergence],
-        device=device,
-    )
+    wp.map(wp.neg, divergence, out=neg_divergence)
 
     phi = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     wpl.cg(
@@ -171,5 +167,5 @@ def heat_geodesic(
     # Shift so the distance field is zero at the (nearest) source. For a correctly signed field
     # the global minimum sits at the source set, so subtracting it yields a nonnegative field.
     offset = float(phi.numpy().min())
-    wp.launch(kernel_geodesic.shift_field, dim=n_vertices, inputs=[offset, phi], device=device)
+    wp.map(wp.sub, phi, wp.float64(offset), out=phi)
     return phi

@@ -1,5 +1,7 @@
 import warp as wp
 
+from triwarp.kernels.triangles import face_vertices
+
 
 @wp.kernel
 def average_onto_faces(
@@ -8,11 +10,7 @@ def average_onto_faces(
     out_face_values: wp.array[wp.float32],
 ) -> None:
     f = int(wp.tid())
-    v0 = faces[f * 3 + 0]
-    v1 = faces[f * 3 + 1]
-    v2 = faces[f * 3 + 2]
-    out_face_values[f] = (vertex_values[v0] + vertex_values[v1] + vertex_values[v2]) / wp.float32(
-        3.0
-    )
+    x0, x1, x2 = face_vertices(vertex_values, faces, wp.int32(f))
+    out_face_values[f] = (x0 + x1 + x2) / wp.float32(3.0)
 
 

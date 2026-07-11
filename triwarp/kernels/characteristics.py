@@ -47,24 +47,18 @@ def mark_intersecting_faces(
         out_mask[pairs[p, 1]] = True
 
 
-@wp.kernel
-def orientation_bit_mask(orient: wp.array[wp.int32], out_mask: wp.array[wp.bool]) -> None:
+@wp.func
+def orientation_bit(orient: wp.int32) -> wp.bool:
     """Per-face flip flag: ``True`` where the orientation bit marks the face for flipping."""
-    f = int(wp.tid())
-    out_mask[f] = orient[f] > wp.int32(0)
+    return orient > wp.int32(0)
 
 
-@wp.kernel
-def edge_manifold_mask(
-    counts: wp.array[wp.int32], allow_boundary: wp.bool, out_mask: wp.array[wp.bool]
-) -> None:
-    """Per-unique-edge manifold flag from face-share counts."""
-    tid = int(wp.tid())
-    c = counts[tid]
+@wp.func
+def edge_manifold(count: wp.int32, allow_boundary: wp.bool) -> wp.bool:
+    """Per-unique-edge manifold flag from its face-share count."""
     if allow_boundary:
-        out_mask[tid] = c <= wp.int32(2)
-    else:
-        out_mask[tid] = c == wp.int32(2)
+        return count <= wp.int32(2)
+    return count == wp.int32(2)
 
 
 @wp.kernel

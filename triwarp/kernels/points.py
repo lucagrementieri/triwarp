@@ -1,31 +1,20 @@
 import warp as wp
 
 
-@wp.kernel
+@wp.func
 def point_plane_distance(
-    points: wp.array[wp.vec3],
-    plane_normal: wp.vec3,
-    plane_origin: wp.vec3,
-    out_distances: wp.array[wp.float32],
-) -> None:
-    tid = wp.tid()
-    w = points[tid] - plane_origin
-    out_distances[tid] = wp.dot(plane_normal, w) / wp.length(plane_normal)
+    point: wp.vec3, plane_normal: wp.vec3, plane_origin: wp.vec3
+) -> wp.float32:
+    w = point - plane_origin
+    return wp.dot(plane_normal, w) / wp.length(plane_normal)
 
 
-@wp.kernel
-def radial_sort_key(
-    points: wp.array[wp.vec3],
-    origin: wp.vec3,
-    axis0: wp.vec3,
-    axis1: wp.vec3,
-    out_keys: wp.array[wp.float32],
-) -> None:
-    tid = wp.tid()
-    v = points[tid] - origin
+@wp.func
+def radial_sort_key(point: wp.vec3, origin: wp.vec3, axis0: wp.vec3, axis1: wp.vec3) -> wp.float32:
+    v = point - origin
     # Negated angle: an ascending radix sort of these keys reproduces trimesh's
     # descending-angle order (`angles.argsort()[::-1]`).
-    out_keys[tid] = -wp.atan2(wp.dot(v, axis0), wp.dot(v, axis1))
+    return -wp.atan2(wp.dot(v, axis0), wp.dot(v, axis1))
 
 
 @wp.kernel

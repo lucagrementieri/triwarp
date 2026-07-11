@@ -292,10 +292,8 @@ def allclose(
 
     device = a.device
     mask = wp.empty(n, dtype=wp.bool, device=device)
-    kernel = (
-        kernel_array.allclose_mask_vec3 if a.dtype == wp.vec3 else kernel_array.allclose_mask_scalar
-    )
-    wp.launch(kernel, dim=n, inputs=[a, b, wp.float32(rtol), wp.float32(atol), mask], device=device)
+    is_close = kernel_array.is_close_vec3 if a.dtype == wp.vec3 else kernel_array.is_close_scalar
+    wp.map(is_close, a, b, wp.float32(rtol), wp.float32(atol), out=mask)
     return bool(tw.reduce.all(mask))
 
 
@@ -584,7 +582,7 @@ def square(values: wp.array[wp.Scalar]) -> wp.array[wp.Scalar]:
     out = wp.empty(n, dtype=values.dtype, device=device)
     if n == 0:
         return out
-    wp.launch(kernel_array.square, dim=n, inputs=[values, out], device=device)
+    wp.map(kernel_array.square_scalar, values, out=out)
     return out
 
 
@@ -625,7 +623,7 @@ def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3]) -> wp.array[wp.floa
         return wp.empty(0, dtype=wp.float32, device=device)
 
     out_angles = wp.empty(n, dtype=wp.float32, device=device)
-    wp.launch(kernel_array.vector_angle, dim=n, inputs=[a, b, out_angles], device=device)
+    wp.map(kernel_array.vector_angle_vec, a, b, out=out_angles)
     return out_angles
 
 
@@ -650,10 +648,12 @@ def gram_matrix(points: wp.array[wp.vec3]) -> wp.array[wp.mat33]:
     if n == 0:
         return out
     n_tiles = (n + TILE_1D - 1) // TILE_1D
+    # The uncentred Gram matrix is the scatter matrix around a zero center.
+    zero_center = wp.zeros(1, dtype=wp.vec3, device=device)
     wp.launch_tiled(
-        kernel_array.gram_matrix,
+        kernel_array.centered_covariance,
         dim=[n_tiles],
-        inputs=[points, out],
+        inputs=[points, zero_center, out],
         block_dim=TILE_1D,
         device=device,
     )
@@ -699,7 +699,7 @@ def centered_covariance(
             block_dim=TILE_1D,
             device=device,
         )
-        wp.launch(kernel_array.divide, dim=1, inputs=[center, wp.float32(n)], device=device)
+        wp.map(wp.div, center, wp.float32(n), out=center)
     wp.launch_tiled(
         kernel_array.centered_covariance,
         dim=[n_tiles],
@@ -734,10 +734,9 @@ def covariance(points: wp.array[wp.vec3], ddof: int = 1) -> wp.array[wp.mat33]:
     ValueError
         If ``n - ddof <= 0``.
     """
-    device = points.device
     n = int(points.shape[0])
     if n - ddof <= 0:
         raise ValueError(f"covariance requires n > ddof, got n={n}, ddof={ddof}")
     out = centered_covariance(points)
-    wp.launch(kernel_array.divide, dim=1, inputs=[out, wp.float32(n - ddof)], device=device)
+    wp.map(wp.div, out, wp.float32(n - ddof), out=out)
     return out

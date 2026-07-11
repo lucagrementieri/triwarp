@@ -10,10 +10,8 @@ linear solves need double precision.
 
 import warp as wp
 
-
-@wp.func
-def to_vec3d(v: wp.vec3) -> wp.vec3d:
-    return wp.vec3d(wp.float64(v[0]), wp.float64(v[1]), wp.float64(v[2]))
+from triwarp.kernels.array import to_vec3d
+from triwarp.kernels.triangles import face_vertices_vec3d
 
 
 @wp.kernel
@@ -39,9 +37,7 @@ def face_gradient_normalized(
     i0 = faces[f * 3 + 0]
     i1 = faces[f * 3 + 1]
     i2 = faces[f * 3 + 2]
-    v0 = to_vec3d(vertices[i0])
-    v1 = to_vec3d(vertices[i1])
-    v2 = to_vec3d(vertices[i2])
+    v0, v1, v2 = face_vertices_vec3d(vertices, faces, wp.int32(f))
     n = to_vec3d(normals[f])
     area = wp.float64(areas[f])
 
@@ -76,9 +72,7 @@ def integrated_divergence(
     i0 = faces[f * 3 + 0]
     i1 = faces[f * 3 + 1]
     i2 = faces[f * 3 + 2]
-    v0 = to_vec3d(vertices[i0])
-    v1 = to_vec3d(vertices[i1])
-    v2 = to_vec3d(vertices[i2])
+    v0, v1, v2 = face_vertices_vec3d(vertices, faces, wp.int32(f))
     x = field[f]
     c0 = wp.float64(cot_entries[f, 0])
     c1 = wp.float64(cot_entries[f, 1])
@@ -91,17 +85,3 @@ def integrated_divergence(
     wp.atomic_add(out_div, i0, d0)
     wp.atomic_add(out_div, i1, d1)
     wp.atomic_add(out_div, i2, d2)
-
-
-@wp.kernel
-def negate_field(field: wp.array[wp.float64], out_field: wp.array[wp.float64]) -> None:
-    # Flip sign so the Poisson right-hand side matches the positive semi-definite operator ``-L``.
-    t = int(wp.tid())
-    out_field[t] = -field[t]
-
-
-@wp.kernel
-def shift_field(offset: wp.float64, out_field: wp.array[wp.float64]) -> None:
-    # Subtract a constant so the distance is zero at the source set (in place).
-    t = int(wp.tid())
-    out_field[t] = out_field[t] - offset

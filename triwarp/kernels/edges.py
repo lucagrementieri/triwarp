@@ -1,34 +1,31 @@
 import warp as wp
 
 
+@wp.func
+def _write_edge(
+    out_edges: wp.array2d[wp.int32], row: wp.int32, a: wp.int32, b: wp.int32, sort: wp.bool
+):
+    if sort:
+        out_edges[row, 0] = wp.min(a, b)
+        out_edges[row, 1] = wp.max(a, b)
+    else:
+        out_edges[row, 0] = a
+        out_edges[row, 1] = b
+
+
 @wp.kernel
-def faces_to_edges(faces: wp.array[wp.int32], out_edges: wp.array2d[wp.int32]) -> None:
+def faces_to_edges(
+    faces: wp.array[wp.int32], sort: wp.bool, out_edges: wp.array2d[wp.int32]
+) -> None:
+    # Three directed edges per face; ``sort`` puts the smaller vertex index first per row.
     tid = int(wp.tid())
     f = tid * 3
     i0 = faces[f + 0]
     i1 = faces[f + 1]
     i2 = faces[f + 2]
-    out_edges[f, 0] = i0
-    out_edges[f, 1] = i1
-    out_edges[f + 1, 0] = i1
-    out_edges[f + 1, 1] = i2
-    out_edges[f + 2, 0] = i2
-    out_edges[f + 2, 1] = i0
-
-
-@wp.kernel
-def faces_to_edges_sorted(faces: wp.array[wp.int32], out_edges: wp.array2d[wp.int32]) -> None:
-    tid = int(wp.tid())
-    f = tid * 3
-    i0 = faces[f + 0]
-    i1 = faces[f + 1]
-    i2 = faces[f + 2]
-    out_edges[f, 0] = wp.min(i0, i1)
-    out_edges[f, 1] = wp.max(i0, i1)
-    out_edges[f + 1, 0] = wp.min(i1, i2)
-    out_edges[f + 1, 1] = wp.max(i1, i2)
-    out_edges[f + 2, 0] = wp.min(i2, i0)
-    out_edges[f + 2, 1] = wp.max(i2, i0)
+    _write_edge(out_edges, wp.int32(f), i0, i1, sort)
+    _write_edge(out_edges, wp.int32(f + 1), i1, i2, sort)
+    _write_edge(out_edges, wp.int32(f + 2), i2, i0, sort)
 
 
 @wp.kernel

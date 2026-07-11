@@ -12,7 +12,6 @@ import triwarp.typing as twt
 from triwarp.array import init_range
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import graph as kernel_graph
-from triwarp.kernels import selection as kernel_selection
 from triwarp.kernels.algorithms import bfs as kernel_bfs
 from triwarp.kernels.algorithms import connected_components as kernel_connected_components
 
@@ -314,19 +313,19 @@ def concatenate(
 
     concatenated_faces = wp.empty(total_indices, dtype=wp.int32, device=device)
 
-    vertex_offset = wp.int32(0)
-    dest_offset = wp.int32(0)
+    vertex_offset = 0
+    dest_offset = 0
     for count, (_, faces) in zip(vertex_counts, meshes_data, strict=True):
         f = int(faces.shape[0])
         if f > 0:
-            wp.launch(
-                kernel_selection.offset_copy_int32,
-                dim=f,
-                inputs=[faces, vertex_offset, dest_offset, concatenated_faces],
-                device=device,
+            wp.map(
+                wp.add,
+                faces,
+                wp.int32(vertex_offset),
+                out=concatenated_faces[dest_offset : dest_offset + f],
             )
-            dest_offset += wp.int32(f)
-        vertex_offset += wp.int32(count)
+            dest_offset += f
+        vertex_offset += count
 
     return concatenated_vertices, concatenated_faces
 

@@ -11,7 +11,8 @@ below is a direct port of the corresponding ``MRTriMath.h`` / ``MRReducePath`` p
 
 import warp as wp
 
-from triwarp.constants import FLOAT32_INF_CONSTANT
+from triwarp.constants import FLOAT32_INF_CONSTANT, PI, TWO_PI
+from triwarp.kernels.array import cross2, sort3
 
 # Compile-time upper bound on the per-point fan size (neighbours kept for one center).
 # Per-thread scratch arrays are sized to this; the runtime ``max_neighbours`` must not exceed it.
@@ -21,8 +22,6 @@ MAX_NEIGHBOURS = 64
 CRITICAL_ASPECT_RATIO = wp.constant(wp.float32(1e3))
 # MeshLib filterNeighbors: drop a neighbour whose oriented normal opposes the center normal.
 NORMAL_FILTER_DOT = wp.constant(wp.float32(-0.3))
-TWO_PI = wp.constant(wp.float32(6.283185307179586))
-PI = wp.constant(wp.float32(3.141592653589793))
 
 
 # --------------------------------------------------------------------------------------
@@ -85,11 +84,6 @@ def tris_angle_profit(
     dir_abc = wp.cross(ab, ac)
     dir_acd = wp.cross(ac, ad)
     return vec_angle(dir_abc, dir_acd) - crit_ang
-
-
-@wp.func
-def cross2(a: wp.vec2, b: wp.vec2) -> wp.float32:
-    return a[0] * b[1] - a[1] * b[0]
 
 
 @wp.func
@@ -440,22 +434,8 @@ def canonicalize_triangles(
     tris: wp.array2d(dtype=wp.int32), out_sorted: wp.array2d(dtype=wp.int32)
 ) -> None:
     t = int(wp.tid())
-    i = tris[t, 0]
-    j = tris[t, 1]
-    k = tris[t, 2]
     # sort the three indices ascending (unoriented key)
-    if i > j:
-        tmp = i
-        i = j
-        j = tmp
-    if j > k:
-        tmp = j
-        j = k
-        k = tmp
-    if i > j:
-        tmp = i
-        i = j
-        j = tmp
+    i, j, k = sort3(tris[t, 0], tris[t, 1], tris[t, 2])
     out_sorted[t, 0] = i
     out_sorted[t, 1] = j
     out_sorted[t, 2] = k

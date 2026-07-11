@@ -16,6 +16,8 @@ reductions differ only by the ``scale`` passed from Python scope. Following the
 
 import warp as wp
 
+from triwarp.kernels.triangles import face_vertices
+
 # Relative coplanarity tolerance for the triangle-interior test, matching
 # warp.fem's ``project_on_tri_at_origin``.
 _TRI_DET_TOLERANCE = wp.constant(wp.float32(1.0e-6))
@@ -106,7 +108,5 @@ def chamfer_surface_term(
     i = wp.tid()
     f = face_id[i]
     if f >= 0:
-        a = vertices[faces[3 * f + 0]]
-        b = vertices[faces[3 * f + 1]]
-        c = vertices[faces[3 * f + 2]]
+        a, b, c = face_vertices(vertices, faces, f)
         wp.atomic_add(out_loss, 0, scale * point_triangle_sq_dist(points[i], a, b, c))

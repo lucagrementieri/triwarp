@@ -66,22 +66,17 @@ def intersects_location(
 
     faces_dense = wp.empty(n, dtype=wp.int32, device=device)
     locations_dense = wp.empty(n, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_ray.intersects_first_detail,
-        dim=n,
-        inputs=[
-            mesh.id,
-            ray_origins,
-            ray_directions,
-            wp.float32(max_t),
-            faces_dense,
-            locations_dense,
-        ],
-        device=device,
+    wp.map(
+        kernel_ray.first_hit,
+        wp.uint64(mesh.id),
+        ray_origins,
+        ray_directions,
+        wp.float32(max_t),
+        out=[faces_dense, locations_dense],
     )
 
     hit_mask = wp.empty(n, dtype=wp.bool, device=device)
-    wp.launch(kernel_ray.face_hit_mask, dim=n, inputs=[faces_dense, hit_mask], device=device)
+    wp.map(kernel_ray.is_hit, faces_dense, out=hit_mask)
     index_ray = tw.array.flatnonzero(hit_mask)
     k = int(index_ray.shape[0])
     index_tri = wp.empty(k, dtype=wp.int32, device=device)
@@ -130,11 +125,14 @@ def intersects_first(
         max_t = default_mesh_query_max_dist(mesh.points, ray_origins)
 
     out_triangle_index = wp.empty(n, dtype=wp.int32, device=ray_origins.device)
-    wp.launch(
-        kernel_ray.intersects_first,
-        dim=n,
-        inputs=[mesh.id, ray_origins, ray_directions, wp.float32(max_t), out_triangle_index],
-        device=ray_origins.device,
+    locations_scratch = wp.empty(n, dtype=wp.vec3, device=ray_origins.device)
+    wp.map(
+        kernel_ray.first_hit,
+        wp.uint64(mesh.id),
+        ray_origins,
+        ray_directions,
+        wp.float32(max_t),
+        out=[out_triangle_index, locations_scratch],
     )
     return out_triangle_index
 
@@ -178,11 +176,13 @@ def intersects_any(
         max_t = default_mesh_query_max_dist(mesh.points, ray_origins)
 
     out_hit = wp.empty(n, dtype=wp.bool, device=ray_origins.device)
-    wp.launch(
-        kernel_ray.intersects_any,
-        dim=n,
-        inputs=[mesh.id, ray_origins, ray_directions, wp.float32(max_t), out_hit],
-        device=ray_origins.device,
+    wp.map(
+        kernel_ray.any_hit,
+        wp.uint64(mesh.id),
+        ray_origins,
+        ray_directions,
+        wp.float32(max_t),
+        out=out_hit,
     )
     return out_hit
 
@@ -232,18 +232,14 @@ def longest_ray(
         max_t = default_mesh_query_max_dist(mesh.points, ray_origins)
 
     out_distances = wp.empty(n, dtype=wp.float32, device=ray_origins.device)
-    wp.launch(
-        kernel_ray.longest_ray,
-        dim=n,
-        inputs=[
-            mesh.id,
-            ray_origins,
-            ray_directions,
-            wp.float32(max_t),
-            wp.float32(planar_tol),
-            out_distances,
-        ],
-        device=ray_origins.device,
+    wp.map(
+        kernel_ray.longest_ray_distance,
+        wp.uint64(mesh.id),
+        ray_origins,
+        ray_directions,
+        wp.float32(max_t),
+        wp.float32(planar_tol),
+        out=out_distances,
     )
     return out_distances
 

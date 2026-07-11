@@ -478,12 +478,8 @@ def make_volume(
             device=device,
         )
         flip = wp.empty(n_faces, dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_repair.mark_negative_component,
-            dim=n_faces,
-            inputs=[labels, accum, flip],
-            device=device,
-        )
+        # ``accum[labels]`` gathers each face's component volume (Python-scope gather).
+        wp.map(kernel_repair.negative_volume_flag, accum[labels], out=flip)
         wp.launch(
             kernel_repair.flip_faces_masked,
             dim=n_faces,

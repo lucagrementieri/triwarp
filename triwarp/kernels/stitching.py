@@ -1,6 +1,8 @@
 import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT
+from triwarp.kernels.array import update_argmin
+from triwarp.kernels.array import wrap_index as _wrap
 
 # Big-but-finite penalty (MeshLib ``BadTriangulationMetric``): lets the DP keep a bad triangulation
 # rather than break entirely, while staying below ``float`` precision limits when summed.
@@ -100,12 +102,6 @@ def loop_centroids(
 
 
 @wp.func
-def _wrap(i: wp.int32, n: wp.int32) -> wp.int32:
-    # Positive modulo: ``%`` follows C++11 semantics (sign of the dividend).
-    return ((i % n) + n) % n
-
-
-@wp.func
 def searchsorted_right(edge: wp.array[wp.int32], n: wp.int32, value: wp.int32) -> wp.int32:
     # Number of entries in the non-decreasing ``edge[0:n]`` that are ``<= value``
     # (``numpy.searchsorted(..., side="right")``), via binary search.
@@ -121,9 +117,21 @@ def searchsorted_right(edge: wp.array[wp.int32], n: wp.int32, value: wp.int32) -
 
 
 @wp.kernel
-def flip_loop(loop_a: wp.array[wp.int32], n_a: wp.int32, out_flipped: wp.array[wp.int32]) -> None:
+def cyclic_gather(
+    src: wp.array[wp.int32],
+    n: wp.int32,
+    shift: wp.int32,
+    flip: wp.bool,
+    value_offset: wp.int32,
+    out_gathered: wp.array[wp.int32],
+) -> None:
+    # out[i] = src[wrap(index)] + value_offset with index = n-1-i (flip) or i+shift (roll);
+    # covers loop reversal, cyclic rolls, and the roll-plus-vertex-offset variant in one kernel.
     i = int(wp.tid())
-    out_flipped[i] = loop_a[n_a - 1 - i]
+    j = i + shift
+    if flip:
+        j = n - 1 - i
+    out_gathered[i] = src[_wrap(j, n)] + value_offset
 
 
 @wp.kernel
@@ -140,7 +148,7 @@ def boundary_perimeters(
     out_perimeters[i, j] = wp.length(edge_start - b) + wp.length(edge_end - b)
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def row_argmin(
     perimeters: wp.array2d[wp.float32],
     m_b: wp.int32,
@@ -151,15 +159,12 @@ def row_argmin(
     best_col = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
     best_val = perimeters[i, 0]
     for j in range(1, m_b):
-        v = perimeters[i, j]
-        if v < best_val:
-            best_val = v
-            best_col = j
+        update_argmin(best_val, best_col, perimeters[i, j], j)
     out_col[i] = best_col
     out_val[i] = best_val
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def global_argmin(
     col_min: wp.array[wp.int32],
     val_min: wp.array[wp.float32],
@@ -170,10 +175,7 @@ def global_argmin(
     best_row = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
     best_val = val_min[0]
     for i in range(1, n_a):
-        v = val_min[i]
-        if v < best_val:
-            best_val = v
-            best_row = i
+        update_argmin(best_val, best_row, val_min[i], i)
     out_shift[0] = best_row
     out_shift[1] = col_min[best_row]
 
@@ -193,7 +195,7 @@ def rolled_edge_map(
     out_edge[i] = _wrap(col_min[_wrap(i + shift_a, n_a)] - shift_b, m_b)
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def resolve_corrections(
     perimeters: wp.array2d[wp.float32],
     unsorted_indices: wp.array[wp.int32],
@@ -219,34 +221,8 @@ def resolve_corrections(
         best_col = lo
         best_val = perimeters[row, _wrap(lo + col_roll, m_b)]
         for c in range(lo + 1, hi + 1):
-            v = perimeters[row, _wrap(c + col_roll, m_b)]
-            if v < best_val:
-                best_val = v
-                best_col = c
+            update_argmin(best_val, best_col, perimeters[row, _wrap(c + col_roll, m_b)], c)
         out_edge[idx] = best_col
-
-
-@wp.kernel
-def rolled_loop_a(
-    flipped_loop_a: wp.array[wp.int32],
-    row_roll: wp.int32,
-    n_a: wp.int32,
-    out_loop: wp.array[wp.int32],
-) -> None:
-    i = int(wp.tid())
-    out_loop[i] = flipped_loop_a[_wrap(i + row_roll, n_a)]
-
-
-@wp.kernel
-def rolled_loop_b(
-    loop_b: wp.array[wp.int32],
-    col_roll: wp.int32,
-    vertex_offset: wp.int32,
-    m_b: wp.int32,
-    out_loop: wp.array[wp.int32],
-) -> None:
-    j = int(wp.tid())
-    out_loop[j] = loop_b[_wrap(j + col_roll, m_b)] + vertex_offset
 
 
 @wp.kernel

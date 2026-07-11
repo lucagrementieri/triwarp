@@ -127,15 +127,9 @@ def mesh_with_plane_segment_for_face(
     return False, wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0)
 
 
-@wp.kernel
-def vertex_plane_dots(
-    vertices: wp.array[wp.vec3],
-    plane_origin: wp.vec3,
-    plane_normal: wp.vec3,
-    out_dots: wp.array[wp.float32],
-) -> None:
-    tid = wp.tid()
-    out_dots[tid] = wp.dot(vertices[tid] - plane_origin, plane_normal)
+@wp.func
+def point_plane_dot(point: wp.vec3, plane_origin: wp.vec3, plane_normal: wp.vec3) -> wp.float32:
+    return wp.dot(point - plane_origin, plane_normal)
 
 
 @wp.kernel
@@ -164,24 +158,6 @@ def mesh_with_plane_segments(
     out_valid[f] = valid
     out_segments[f, 0] = p0
     out_segments[f, 1] = p1
-
-
-@wp.kernel
-def segments_with_plane(
-    start_points: wp.array[wp.vec3],
-    end_points: wp.array[wp.vec3],
-    plane_origin: wp.vec3,
-    plane_normal: wp.vec3,
-    line_segments: wp.bool,
-    out_intersections: wp.array[wp.vec3],
-    out_valid: wp.array[wp.bool],
-) -> None:
-    tid = wp.tid()
-    hit, valid = plane_with_line(
-        plane_origin, plane_normal, start_points[tid], end_points[tid], line_segments
-    )
-    out_intersections[tid] = hit
-    out_valid[tid] = valid
 
 
 @wp.func
@@ -405,17 +381,6 @@ def triangle_intersection_segment(
     return True, p0, p1
 
 
-@wp.func
-def face_vertices(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], face_index: wp.int32
-) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
-    base = face_index * wp.int32(3)
-    i0 = faces[base]
-    i1 = faces[base + wp.int32(1)]
-    i2 = faces[base + wp.int32(2)]
-    return vertices[i0], vertices[i1], vertices[i2]
-
-
 @wp.kernel
 def face_aabb_bounds(
     vertices: wp.array[wp.vec3],
@@ -424,7 +389,7 @@ def face_aabb_bounds(
     out_upper: wp.array[wp.vec3],
 ) -> None:
     f = wp.tid()
-    v0, v1, v2 = face_vertices(vertices, faces, wp.int32(f))
+    v0, v1, v2 = kernel_triangles.face_vertices(vertices, faces, wp.int32(f))
     lower, upper = triangle_aabb(v0, v1, v2)
     out_lower[f] = lower
     out_upper[f] = upper
@@ -459,8 +424,8 @@ def filter_intersecting_pairs(
     out_valid: wp.array[wp.bool],
 ) -> None:
     tid = wp.tid()
-    qa, qb, qc = face_vertices(query_vertices, query_faces, pairs[tid, 0])
-    ta, tb, tc = face_vertices(target_vertices, target_faces, pairs[tid, 1])
+    qa, qb, qc = kernel_triangles.face_vertices(query_vertices, query_faces, pairs[tid, 0])
+    ta, tb, tc = kernel_triangles.face_vertices(target_vertices, target_faces, pairs[tid, 1])
     if triangles_share_vertex(qa, qb, qc, ta, tb, tc):
         out_valid[tid] = False
         return
@@ -477,8 +442,8 @@ def triangle_pair_segments(
     out_segments: wp.array2d[wp.vec3],
 ) -> None:
     tid = wp.tid()
-    qa, qb, qc = face_vertices(query_vertices, query_faces, pairs[tid, 0])
-    ta, tb, tc = face_vertices(target_vertices, target_faces, pairs[tid, 1])
+    qa, qb, qc = kernel_triangles.face_vertices(query_vertices, query_faces, pairs[tid, 0])
+    ta, tb, tc = kernel_triangles.face_vertices(target_vertices, target_faces, pairs[tid, 1])
     valid, p0, p1 = triangle_intersection_segment(qa, qb, qc, ta, tb, tc)
     if valid:
         out_segments[tid, 0] = p0
@@ -591,10 +556,7 @@ def edge_plane_intersections(
 ) -> None:
     tid = wp.tid()
     face_index = face_indices[tid]
-    base = face_index * wp.int32(3)
-    v0 = vertices[faces[base]]
-    v1 = vertices[faces[base + wp.int32(1)]]
-    v2 = vertices[faces[base + wp.int32(2)]]
+    v0, v1, v2 = kernel_triangles.face_vertices(vertices, faces, face_index)
     out_points[tid, 0] = edge_plane_intersection(v0, v1, plane_origin, plane_normal)
     out_points[tid, 1] = edge_plane_intersection(v1, v2, plane_origin, plane_normal)
     out_points[tid, 2] = edge_plane_intersection(v2, v0, plane_origin, plane_normal)

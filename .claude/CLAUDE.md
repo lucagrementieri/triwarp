@@ -69,6 +69,58 @@ For element-wise dtype conversion of `wp.array` buffers at Python scope, allocat
 
 Inside kernels, keep using `wp.cast(expr, TargetType)` for scalar and vector conversions.
 
+### Elementwise ops at Python scope (`wp.map`, Warp 1.15+ — prefer over trivial map kernels)
+
+Do **not** write a `@wp.kernel` whose body is only `out[i] = f(in[i], ...)`. Keep the op as a
+named `@wp.func` in the `kernels/` module (or use a builtin like `wp.neg`, `wp.add`, `wp.div`,
+`wp.normalize`) and call **`wp.map(op, *inputs, out=...)`** from the wrapper. The generated
+kernel is cached (in-memory per process + Warp's on-disk kernel cache) and its GPU time is
+identical to a hand-written kernel; cached calls cost ~11 µs extra host-side Python.
+
+- **Named `@wp.func` only, never lambdas**: the map cache is keyed by the *unqualified*
+  function name plus input dtypes — two different ops with the same name would collide, and
+  lambdas re-derive the function each call.
+- **Always pass `out=`** so allocation stays with `wp.empty` / `twt.empty_*` in the wrapper.
+  In-place is `out=<an input>`; multi-output funcs (`tuple[...]` return) take `out=[a, b]`.
+- Scalars mix freely with arrays (`wp.map(is_long_edge, lengths, max_edge_f, out=mask)`);
+  device is inferred from the array inputs.
+- **Slice views** work as inputs and outputs: adjacent-element ops map over shifted views
+  (`wp.map(segment_length, polyline[:-1], polyline[1:], out=lengths)`), and offset writes map
+  into `out=dst[o : o + n]`. CSR row degrees: pass `offsets[:-1]` and `offsets[1:]`.
+- **Python-scope gather composes**: `wp.map(pred, table[indices], out=mask)` maps over the
+  `wp.indexedarray` view (see `repair.orient_faces`).
+- Inside **per-iteration wrapper loops**, hoist the kernel once with
+  `wp.map(..., return_kernel=True)` and `wp.launch(kernel, dim, inputs=[...], outputs=[...])`
+  in the loop (see `triwarp/smoothing.py`) — this removes the per-call Python overhead.
+- Still a real kernel: ops needing the thread index as *data* (`init_range`,
+  `seed_orientation`), whole arrays as uniform arguments (binary-search tables), scatters,
+  and multi-element/row-indexed outputs.
+
+### Function-valued parameters and kernel factories (Warp 1.15+)
+
+- A `@wp.func` may take `fn: wp.Function` parameters; the target is bound at **compile time**
+  per call site (user `@wp.func`s and simple builtins like `wp.min` are valid targets; tile
+  intrinsics, variadic and LTO builtins are not). `wp.launch` can NOT pass a `wp.Function` as
+  a kernel argument — for runtime selection, pass an **int/enum kernel argument** and branch
+  over `wp.Function` targets inside a dispatch `@wp.func` (warp-uniform branch, one compiled
+  module; see `registration.robust_weight` for the pattern).
+- Builtins with no Python-scope handle (e.g. tile intrinsics) can still parameterize kernel
+  factories by pulling the concrete `Function` object from
+  `warp._src.context.builtin_functions["tile_max"]` and closure-capturing it — captured
+  builtins emit inline at codegen and template on the tile dtype (see
+  `triwarp/kernels/reduce.py`). Give each factory instantiation a unique kernel `name`.
+
+### In-place `@wp.func` parameters (`wp.ref[T]`, Warp 1.15+)
+
+`@wp.func` helpers may declare `wp.ref[T]` parameters to mutate caller-owned storage (locals,
+array elements, struct fields) — use for multi-value updates like argmin/minmax/swap helpers
+(see `update_argmin` in `kernels/array.py`).
+**Constraint:** any kernel calling a `wp.ref` helper must be decorated
+`@wp.kernel(enable_backward=False)` — the per-kernel flag specifically; a module-level
+`wp.set_module_options({"enable_backward": False})` is NOT consulted at kernel-parse time in
+Warp 1.15 and the module still fails to compile. Never use `wp.ref` in
+`triwarp/kernels/distance.py` — the chamfer kernels are differentiated via `wp.Tape`.
+
 ---
 
 ## 5. Kernel-Scope Restrictions

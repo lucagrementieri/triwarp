@@ -178,9 +178,7 @@ def face_adjacency_convex(
         face_normals=face_normals,
     )
     out_convex = wp.empty(m, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_convex.face_adjacency_convex, dim=m, inputs=[projections, out_convex], device=device
-    )
+    wp.map(kernel_convex.is_convex_projection, projections, out=out_convex)
     return out_convex
 
 

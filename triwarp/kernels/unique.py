@@ -100,11 +100,8 @@ def compact_from_table(
         out_counts[pos] = slot_counts[h]
 
 
-@wp.kernel
-def pack_vec3(vectors: wp.array[wp.vec3], out_packed: wp.array[wp.uint64]) -> None:
-    tid = int(wp.tid())
-    vector = vectors[tid]
-
+@wp.func
+def pack_vec3(vector: wp.vec3) -> wp.uint64:
     # 1. Bit-cast float32 to uint32 to look at raw bits
     # 2. Shift right by 11 bits to discard the lower mantissa bits
     ix = wp.cast(vector[0], wp.uint32) >> VEC3_PACK_SHIFT
@@ -113,12 +110,10 @@ def pack_vec3(vectors: wp.array[wp.vec3], out_packed: wp.array[wp.uint64]) -> No
 
     # 3. Explicitly promote components to uint64 before shifting.
     # This avoids 32-bit integer overflow during the large left-shifts (<< 21 and << 42)
-    packed_value = wp.uint64(ix) | (
+    return wp.uint64(ix) | (
         (wp.uint64(iy) << VEC3_PACK_PRECISION)
         | (wp.uint64(iz) << (VEC3_PACK_PRECISION + VEC3_PACK_PRECISION))
     )
-
-    out_packed[tid] = packed_value
 
 
 @wp.kernel

@@ -3,7 +3,6 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.constants import TILE_1D, TOLERANCE_ZERO
-from triwarp.kernels import array as kernel_array
 from triwarp.kernels import points as kernel_points
 from triwarp.kernels import reduce as kernel_reduce
 
@@ -35,11 +34,8 @@ def point_plane_distance(
         plane_origin = wp.vec3(0.0, 0.0, 0.0)
     n = int(points.shape[0])
     out_distances = wp.empty(n, dtype=wp.float32, device=points.device)
-    wp.launch(
-        kernel_points.point_plane_distance,
-        dim=n,
-        inputs=[points, plane_normal, plane_origin, out_distances],
-        device=points.device,
+    wp.map(
+        kernel_points.point_plane_distance, points, plane_normal, plane_origin, out=out_distances
     )
     return out_distances
 
@@ -72,7 +68,7 @@ def centroid(points: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
         block_dim=TILE_1D,
         device=device,
     )
-    wp.launch(kernel_array.divide, dim=1, inputs=[out, wp.float32(n)], device=device)
+    wp.map(wp.div, out, wp.float32(n), out=out)
     return out
 
 
@@ -300,12 +296,7 @@ def radial_sort(
         axis1 = wp.cross(axis0, unit_normal)
 
     out_keys = wp.empty(n, dtype=wp.float32, device=device)
-    wp.launch(
-        kernel_points.radial_sort_key,
-        dim=n,
-        inputs=[points, origin, axis0, axis1, out_keys],
-        device=device,
-    )
+    wp.map(kernel_points.radial_sort_key, points, origin, axis0, axis1, out=out_keys)
 
     # Ascending radix sort of the negated angles yields the descending-angle order.
     keys_buf = wp.empty(2 * n, dtype=wp.float32, device=device)

@@ -5,6 +5,29 @@ from triwarp.kernels.reduce import cross_outer_sum_tile, sum1d_tile, weighted_su
 
 
 @wp.func
+def make_affine44(rotation: wp.mat33, translation: wp.vec3) -> wp.mat44:
+    """Pack a 3x3 linear part and a translation into a homogeneous transform."""
+    return wp.mat44(
+        rotation[0, 0],
+        rotation[0, 1],
+        rotation[0, 2],
+        translation[0],
+        rotation[1, 0],
+        rotation[1, 1],
+        rotation[1, 2],
+        translation[1],
+        rotation[2, 0],
+        rotation[2, 1],
+        rotation[2, 2],
+        translation[2],
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(0.0),
+        wp.float32(1.0),
+    )
+
+
+@wp.func
 def weighted_centered_dot_tile(
     values: wp.array[wp.vec3],
     weights: wp.array[wp.float32],
@@ -157,24 +180,7 @@ def build_procrustes_matrix(
     if use_translation:
         t = bcenter - sR * acenter
 
-    out_matrix[0] = wp.mat44(
-        sR[0, 0],
-        sR[0, 1],
-        sR[0, 2],
-        t[0],
-        sR[1, 0],
-        sR[1, 1],
-        sR[1, 2],
-        t[1],
-        sR[2, 0],
-        sR[2, 1],
-        sR[2, 2],
-        t[2],
-        wp.float32(0.0),
-        wp.float32(0.0),
-        wp.float32(0.0),
-        wp.float32(1.0),
-    )
+    out_matrix[0] = make_affine44(sR, t)
 
 
 @wp.kernel
@@ -205,19 +211,14 @@ def accumulate_cost(
 # --- Iterative closest point (ICP) -----------------------------------------
 
 
-@wp.kernel
-def distance_threshold_weights(
-    distance: wp.array[wp.float32],
-    triangle_id: wp.array[wp.int32],
-    max_distance: wp.float32,
-    out_weights: wp.array[wp.float32],
-) -> None:
+@wp.func
+def distance_threshold_weight(
+    distance: wp.float32, triangle_id: wp.int32, max_distance: wp.float32
+) -> wp.float32:
     """Binary correspondence mask: 1 for a valid, in-range hit, 0 otherwise."""
-    i = int(wp.tid())
-    if triangle_id[i] >= 0 and distance[i] <= max_distance:
-        out_weights[i] = wp.float32(1.0)
-    else:
-        out_weights[i] = wp.float32(0.0)
+    if triangle_id >= 0 and distance <= max_distance:
+        return wp.float32(1.0)
+    return wp.float32(0.0)
 
 
 @wp.kernel
@@ -411,21 +412,4 @@ def solve_point_to_plane(
     if angle > wp.float32(1e-12):
         rot = wp.quat_to_matrix(wp.quat_from_axis_angle(omega / angle, angle))
 
-    out_matrix[0] = wp.mat44(
-        rot[0, 0],
-        rot[0, 1],
-        rot[0, 2],
-        tvec[0],
-        rot[1, 0],
-        rot[1, 1],
-        rot[1, 2],
-        tvec[1],
-        rot[2, 0],
-        rot[2, 1],
-        rot[2, 2],
-        tvec[2],
-        wp.float32(0.0),
-        wp.float32(0.0),
-        wp.float32(0.0),
-        wp.float32(1.0),
-    )
+    out_matrix[0] = make_affine44(rot, tvec)

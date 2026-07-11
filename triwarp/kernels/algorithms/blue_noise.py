@@ -114,42 +114,28 @@ def try_activate_cell(
     return INVALID
 
 
-@wp.kernel
-def compute_grid_coords(
-    pool_points: wp.array[wp.vec3],
-    bbox_min: wp.vec3,
-    inv_cell_size: wp.float32,
-    out_grid_coords: wp.array[wp.vec3i],
-) -> None:
-    i = int(wp.tid())
-    p = pool_points[i] - bbox_min
+@wp.func
+def grid_coord(point: wp.vec3, bbox_min: wp.vec3, inv_cell_size: wp.float32) -> wp.vec3i:
+    p = point - bbox_min
     gx = wp.int32(wp.float32(p.x) * inv_cell_size)
     gy = wp.int32(wp.float32(p.y) * inv_cell_size)
     gz = wp.int32(wp.float32(p.z) * inv_cell_size)
-    out_grid_coords[i] = wp.vec3i(gx, gy, gz)
+    return wp.vec3i(gx, gy, gz)
 
 
-@wp.kernel
-def compute_cell_keys(
-    grid_coords: wp.array[wp.vec3i], grid_w: wp.int32, out_cell_keys: wp.array[wp.int64]
-) -> None:
-    i = int(wp.tid())
-    c = grid_coords[i]
+@wp.func
+def grid_cell_key(coord: wp.vec3i, grid_w: wp.int32) -> wp.int64:
     w64 = wp.int64(grid_w)
-    out_cell_keys[i] = cell_key(w64, wp.int64(c.x), wp.int64(c.y), wp.int64(c.z))
+    return cell_key(w64, wp.int64(coord.x), wp.int64(coord.y), wp.int64(coord.z))
 
 
-@wp.kernel
-def extract_grid_component(
-    grid_coords: wp.array[wp.vec3i], axis: wp.int32, out_component: wp.array[wp.int32]
-) -> None:
-    i = int(wp.tid())
+@wp.func
+def grid_component(coord: wp.vec3i, axis: wp.int32) -> wp.int32:
     if axis == wp.int32(0):
-        out_component[i] = grid_coords[i].x
-    elif axis == wp.int32(1):
-        out_component[i] = grid_coords[i].y
-    else:
-        out_component[i] = grid_coords[i].z
+        return coord.x
+    if axis == wp.int32(1):
+        return coord.y
+    return coord.z
 
 
 @wp.func
@@ -307,13 +293,11 @@ def mark_empty_candidate_cells(
     out_has_candidates[c] = selected[c] < wp.int32(0) and cell_offsets[c + 1] > cell_offsets[c]
 
 
-@wp.kernel
-def int_is_zero(flags: wp.array[wp.int32], out_mask: wp.array[wp.bool]) -> None:
-    i = int(wp.tid())
-    out_mask[i] = flags[i] == wp.int32(0)
+@wp.func
+def int_is_zero(flag: wp.int32) -> wp.bool:
+    return flag == wp.int32(0)
 
 
-@wp.kernel
-def spawned_is_valid(spawned: wp.array[wp.int32], out_mask: wp.array[wp.bool]) -> None:
-    i = int(wp.tid())
-    out_mask[i] = spawned[i] >= wp.int32(0)
+@wp.func
+def spawned_is_valid(spawned: wp.int32) -> wp.bool:
+    return spawned >= wp.int32(0)

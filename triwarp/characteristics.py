@@ -139,12 +139,7 @@ def edge_manifold_mask(
 
     n_unique = int(counts.shape[0])
     edge_ok = wp.empty(n_unique, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_characteristics.edge_manifold_mask,
-        dim=n_unique,
-        inputs=[counts, allow_boundary_edges, edge_ok],
-        device=device,
-    )
+    wp.map(kernel_characteristics.edge_manifold, counts, wp.bool(allow_boundary_edges), out=edge_ok)
 
     out_mask = wp.empty(n_faces, dtype=wp.bool, device=device)
     wp.launch(
@@ -710,12 +705,7 @@ def face_orientation_mask(faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
 
     orient, _, _, _ = _orientation_bits(faces)
     mask = wp.empty(n_faces, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_characteristics.orientation_bit_mask,
-        dim=n_faces,
-        inputs=[orient, mask],
-        device=device,
-    )
+    wp.map(kernel_characteristics.orientation_bit, orient, out=mask)
     return mask
 
 

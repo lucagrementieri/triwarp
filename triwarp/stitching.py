@@ -668,9 +668,9 @@ def triangulate_boundaries(
     # Reverse loop A so both rims wind the same way, then take rim positions.
     flipped_loop_a = wp.empty(n, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_stitching.flip_loop,
+        kernel_stitching.cyclic_gather,
         dim=n,
-        inputs=[loop_a, wp.int32(n), flipped_loop_a],
+        inputs=[loop_a, wp.int32(n), wp.int32(0), wp.bool(True), wp.int32(0), flipped_loop_a],
         device=device,
     )
     a_pos = tw.array.gather(vertices_a, flipped_loop_a)
@@ -754,16 +754,30 @@ def triangulate_boundaries(
     # Rolled loops referencing the concatenated vertex buffer (A first, then B offset).
     roll_a = wp.empty(n, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_stitching.rolled_loop_a,
+        kernel_stitching.cyclic_gather,
         dim=n,
-        inputs=[flipped_loop_a, wp.int32(row_roll), wp.int32(n), roll_a],
+        inputs=[
+            flipped_loop_a,
+            wp.int32(n),
+            wp.int32(row_roll),
+            wp.bool(False),
+            wp.int32(0),
+            roll_a,
+        ],
         device=device,
     )
     roll_b = wp.empty(m, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_stitching.rolled_loop_b,
+        kernel_stitching.cyclic_gather,
         dim=m,
-        inputs=[loop_b, wp.int32(col_roll), wp.int32(n_vertices_a), wp.int32(m), roll_b],
+        inputs=[
+            loop_b,
+            wp.int32(m),
+            wp.int32(col_roll),
+            wp.bool(False),
+            wp.int32(n_vertices_a),
+            roll_b,
+        ],
         device=device,
     )
 

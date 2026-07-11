@@ -1,7 +1,8 @@
 import warp as wp
 
-from triwarp.constants import TILE_1D, TOLERANCE_MERGE_CONSTANT, TOLERANCE_PLANAR_CONSTANT
+from triwarp.constants import TILE_1D, TOLERANCE_MERGE_CONSTANT, TOLERANCE_PLANAR_CONSTANT, TWO_PI
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels import triangles as kernel_triangles
 from triwarp.kernels.algorithms import bfs as kernel_bfs
 
 
@@ -22,6 +23,29 @@ def aabb_bounds(
     wp.atomic_max(out_max, 2, p[2])
 
 
+@wp.func
+def bvh_aabb_collect(
+    bvh_id: wp.uint64,
+    q: wp.vec3,
+    half_extent: wp.float32,
+    write: wp.bool,
+    base: wp.int32,
+    out_indices: wp.array[wp.int32],
+) -> wp.int32:
+    # Count (``write=False``) or emit at ``base`` (``write=True``) the BVH hits around ``q``.
+    h = half_extent
+    lower = wp.vec3(q[0] - h, q[1] - h, q[2] - h)
+    upper = wp.vec3(q[0] + h, q[1] + h, q[2] + h)
+    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
+    j = wp.int32(0)
+    c = wp.int32(0)
+    while wp.bvh_query_next(query, j):
+        if write:
+            out_indices[base + c] = j
+        c = c + 1
+    return c
+
+
 @wp.kernel
 def query_bvh_aabb_count(
     queries: wp.array[wp.vec3],
@@ -30,16 +54,10 @@ def query_bvh_aabb_count(
     out_counts: wp.array[wp.int32],
 ) -> None:
     tid = wp.tid()
-    q = queries[tid]
-    h = half_extent
-    lower = wp.vec3(q[0] - h, q[1] - h, q[2] - h)
-    upper = wp.vec3(q[0] + h, q[1] + h, q[2] + h)
-    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    j = wp.int32(0)
-    c = wp.int32(0)
-    while wp.bvh_query_next(query, j):
-        c = c + 1
-    out_counts[tid] = c
+    # ``out_counts`` doubles as the (never written) emit target of the counting pass.
+    out_counts[tid] = bvh_aabb_collect(
+        bvh_id, queries[tid], half_extent, wp.bool(False), wp.int32(0), out_counts
+    )
 
 
 @wp.kernel
@@ -51,16 +69,29 @@ def query_bvh_aabb_neighbors(
     out_indices: wp.array[wp.int32],
 ) -> None:
     tid = wp.tid()
-    q = queries[tid]
-    h = half_extent
-    lower = wp.vec3(q[0] - h, q[1] - h, q[2] - h)
-    upper = wp.vec3(q[0] + h, q[1] + h, q[2] + h)
-    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    primitive_idx = wp.int32(0)
-    w = int(offsets[tid])
-    while wp.bvh_query_next(query, primitive_idx):
-        out_indices[w] = primitive_idx
-        w = w + 1
+    bvh_aabb_collect(bvh_id, queries[tid], half_extent, wp.bool(True), offsets[tid], out_indices)
+
+
+@wp.func
+def mesh_aabb_collect(
+    mesh_id: wp.uint64,
+    lower: wp.vec3,
+    upper: wp.vec3,
+    max_hits: wp.int32,
+    write: wp.bool,
+    base: wp.int32,
+    out_indices: wp.array[wp.int32],
+) -> wp.int32:
+    # Count (``write=False``) or emit at ``base`` (``write=True``) up to ``max_hits`` face hits.
+    query = wp.mesh_query_aabb(mesh_id, lower, upper)
+    face_idx = wp.int32(0)
+    c = wp.int32(0)
+    max_hits_i = int(max_hits)
+    while wp.mesh_query_aabb_next(query, face_idx) and c < max_hits_i:
+        if write:
+            out_indices[base + c] = face_idx
+        c = c + 1
+    return c
 
 
 @wp.kernel
@@ -72,15 +103,15 @@ def query_mesh_aabb_bounds_count(
     out_counts: wp.array[wp.int32],
 ) -> None:
     tid = wp.tid()
-    lower = query_lower[tid]
-    upper = query_upper[tid]
-    query = wp.mesh_query_aabb(mesh_id, lower, upper)
-    face_idx = wp.int32(0)
-    c = wp.int32(0)
-    max_hits_i = int(max_hits)
-    while wp.mesh_query_aabb_next(query, face_idx) and c < max_hits_i:
-        c = c + 1
-    out_counts[tid] = c
+    out_counts[tid] = mesh_aabb_collect(
+        mesh_id,
+        query_lower[tid],
+        query_upper[tid],
+        max_hits,
+        wp.bool(False),
+        wp.int32(0),
+        out_counts,
+    )
 
 
 @wp.kernel
@@ -93,17 +124,40 @@ def query_mesh_aabb_bounds_neighbors(
     out_indices: wp.array[wp.int32],
 ) -> None:
     tid = wp.tid()
-    lower = query_lower[tid]
-    upper = query_upper[tid]
-    query = wp.mesh_query_aabb(mesh_id, lower, upper)
-    face_idx = wp.int32(0)
-    w = int(offsets[tid])
-    max_hits_i = int(max_hits)
-    hits = wp.int32(0)
-    while wp.mesh_query_aabb_next(query, face_idx) and hits < max_hits_i:
-        out_indices[w] = face_idx
-        w = w + 1
-        hits = hits + 1
+    mesh_aabb_collect(
+        mesh_id,
+        query_lower[tid],
+        query_upper[tid],
+        max_hits,
+        wp.bool(True),
+        offsets[tid],
+        out_indices,
+    )
+
+
+@wp.func
+def hashgrid_ball_collect(
+    points: wp.array[wp.vec3],
+    grid_id: wp.uint64,
+    q: wp.vec3,
+    radius: wp.float32,
+    write: wp.bool,
+    base: wp.int32,
+    out_indices: wp.array[wp.int32],
+    out_distances: wp.array[wp.float32],
+) -> wp.int32:
+    # Count (``write=False``) or emit at ``base`` (``write=True``) points within ``radius``.
+    query = wp.hash_grid_query(grid_id, q, radius)
+    j = wp.int32(0)
+    c = wp.int32(0)
+    while wp.hash_grid_query_next(query, j):
+        d = wp.length(points[j] - q)
+        if d <= radius:
+            if write:
+                out_indices[base + c] = j
+                out_distances[base + c] = d
+            c = c + 1
+    return c
 
 
 @wp.kernel
@@ -115,15 +169,17 @@ def query_hashgrid_ball_count(
     out_neighbor_counts: wp.array[wp.int32],
 ) -> None:
     tid = wp.tid()
-    q = queries[tid]
-    r = radius
-    query = wp.hash_grid_query(grid_id, q, r)
-    j = wp.int32(0)
-    c = wp.int32(0)
-    while wp.hash_grid_query_next(query, j):
-        if wp.length(points[j] - q) <= r:
-            c = c + 1
-    out_neighbor_counts[tid] = c
+    dummy_dist = wp.zeros(shape=1, dtype=wp.float32)
+    out_neighbor_counts[tid] = hashgrid_ball_collect(
+        points,
+        grid_id,
+        queries[tid],
+        radius,
+        wp.bool(False),
+        wp.int32(0),
+        out_neighbor_counts,
+        dummy_dist,
+    )
 
 
 @wp.kernel
@@ -137,17 +193,43 @@ def query_hashgrid_ball_neighbors(
     out_distances: wp.array[wp.float32],
 ) -> None:
     tid = wp.tid()
-    q = queries[tid]
-    r = radius
-    query = wp.hash_grid_query(grid_id, q, r)
-    point_idx = wp.int32(0)
-    w = int(offsets[tid])
-    while wp.hash_grid_query_next(query, point_idx):
-        d = wp.length(points[point_idx] - q)
-        if d <= r:
-            out_indices[w] = point_idx
-            out_distances[w] = d
-            w = w + 1
+    hashgrid_ball_collect(
+        points,
+        grid_id,
+        queries[tid],
+        radius,
+        wp.bool(True),
+        offsets[tid],
+        out_indices,
+        out_distances,
+    )
+
+
+@wp.func
+def bvh_ball_collect(
+    points: wp.array[wp.vec3],
+    bvh_id: wp.uint64,
+    q: wp.vec3,
+    radius: wp.float32,
+    write: wp.bool,
+    base: wp.int32,
+    out_indices: wp.array[wp.int32],
+    out_distances: wp.array[wp.float32],
+) -> wp.int32:
+    # Count (``write=False``) or emit at ``base`` (``write=True``) points within ``radius``.
+    lower = wp.vec3(q[0] - radius, q[1] - radius, q[2] - radius)
+    upper = wp.vec3(q[0] + radius, q[1] + radius, q[2] + radius)
+    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
+    j = wp.int32(0)
+    c = wp.int32(0)
+    while wp.bvh_query_next(query, j):
+        d = wp.length(points[j] - q)
+        if d <= radius:
+            if write:
+                out_indices[base + c] = j
+                out_distances[base + c] = d
+            c = c + 1
+    return c
 
 
 @wp.kernel
@@ -159,17 +241,17 @@ def query_bvh_ball_count(
     out_neighbor_counts: wp.array[wp.int32],
 ) -> None:
     tid = wp.tid()
-    q = queries[tid]
-    r = radius
-    lower = wp.vec3(q[0] - r, q[1] - r, q[2] - r)
-    upper = wp.vec3(q[0] + r, q[1] + r, q[2] + r)
-    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    j = wp.int32(0)
-    c = wp.int32(0)
-    while wp.bvh_query_next(query, j):
-        if wp.length(points[j] - q) <= r:
-            c = c + 1
-    out_neighbor_counts[tid] = c
+    dummy_dist = wp.zeros(shape=1, dtype=wp.float32)
+    out_neighbor_counts[tid] = bvh_ball_collect(
+        points,
+        bvh_id,
+        queries[tid],
+        radius,
+        wp.bool(False),
+        wp.int32(0),
+        out_neighbor_counts,
+        dummy_dist,
+    )
 
 
 @wp.kernel
@@ -183,19 +265,16 @@ def query_bvh_ball_neighbors(
     out_distances: wp.array[wp.float32],
 ) -> None:
     tid = wp.tid()
-    q = queries[tid]
-    r = radius
-    lower = wp.vec3(q[0] - r, q[1] - r, q[2] - r)
-    upper = wp.vec3(q[0] + r, q[1] + r, q[2] + r)
-    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    point_idx = wp.int32(0)
-    w = int(offsets[tid])
-    while wp.bvh_query_next(query, point_idx):
-        d = wp.length(points[point_idx] - q)
-        if d <= r:
-            out_indices[w] = point_idx
-            out_distances[w] = d
-            w = w + 1
+    bvh_ball_collect(
+        points,
+        bvh_id,
+        queries[tid],
+        radius,
+        wp.bool(True),
+        offsets[tid],
+        out_indices,
+        out_distances,
+    )
 
 
 @wp.kernel
@@ -286,6 +365,29 @@ def query_geodesic_ball_neighbors(
     )
 
 
+@wp.func
+def knn_sorted_insert(
+    point_index: wp.int32,
+    d: wp.float32,
+    k: wp.int32,
+    radius: wp.float32,
+    out_indices_row: wp.array[wp.int32],
+    out_distances_row: wp.array[wp.float32],
+) -> None:
+    # Insert ``(point_index, d)`` into the ascending k-nearest rows, dropping the current worst.
+    if d > radius:
+        return
+    if d >= out_distances_row[k - 1]:
+        return
+    if k == 1:
+        out_indices_row[0] = point_index
+        out_distances_row[0] = d
+        return
+    slot = kernel_array.binary_search_index(out_distances_row, d)
+    kernel_array.array_shift_insert(out_distances_row, d, slot)
+    kernel_array.array_shift_insert(out_indices_row, point_index, slot)
+
+
 @wp.kernel
 def query_bvh_nearest_neighbors(
     points: wp.array[wp.vec3],
@@ -306,21 +408,7 @@ def query_bvh_nearest_neighbors(
 
     while wp.bvh_query_next(query, point_index):
         d = wp.length(points[point_index] - q)
-
-        if d > radius:
-            continue
-
-        if d >= out_distances[tid, k - 1]:
-            continue
-
-        if k == 1:
-            out_indices[tid, 0] = point_index
-            out_distances[tid, 0] = d
-            continue
-
-        slot = kernel_array.binary_search_index(out_distances[tid], d)
-        kernel_array.array_shift_insert(out_distances[tid], d, slot)
-        kernel_array.array_shift_insert(out_indices[tid], point_index, slot)
+        knn_sorted_insert(point_index, d, k, radius, out_indices[tid], out_distances[tid])
 
 
 @wp.kernel
@@ -341,21 +429,7 @@ def query_hashgrid_nearest_neighbors(
 
     while wp.hash_grid_query_next(query, point_index):
         d = wp.length(points[point_index] - q)
-
-        if d > radius:
-            continue
-
-        if d >= out_distances[tid, k - 1]:
-            continue
-
-        if k == 1:
-            out_indices[tid, 0] = point_index
-            out_distances[tid, 0] = d
-            continue
-
-        slot = kernel_array.binary_search_index(out_distances[tid], d)
-        kernel_array.array_shift_insert(out_distances[tid], d, slot)
-        kernel_array.array_shift_insert(out_indices[tid], point_index, slot)
+        knn_sorted_insert(point_index, d, k, radius, out_indices[tid], out_distances[tid])
 
 
 @wp.kernel
@@ -402,18 +476,15 @@ def solid_angle(a: wp.vec3, b: wp.vec3, c: wp.vec3, p: wp.vec3) -> wp.float32:
     dp1 = wp.dot(v2, v0)
     dp2 = wp.dot(v0, v1)
     denom = vl0 * vl1 * vl2 + dp0 * vl0 + dp1 * vl1 + dp2 * vl2
-    return wp.atan2(detf, denom) / (wp.float32(2.0) * wp.PI)
+    return wp.atan2(detf, denom) / TWO_PI
 
 
 @wp.func
 def solid_angle_at_face(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: int, p: wp.vec3
 ) -> wp.float32:
-    face_indices = faces[f * 3 : (f + 1) * 3]
-    i0 = int(face_indices[0])
-    i1 = int(face_indices[1])
-    i2 = int(face_indices[2])
-    return solid_angle(vertices[i0], vertices[i1], vertices[i2], p)
+    v0, v1, v2 = kernel_triangles.face_vertices(vertices, faces, wp.int32(f))
+    return solid_angle(v0, v1, v2, p)
 
 
 @wp.func
@@ -573,19 +644,11 @@ def init_sphere_radii(
     out_not_converged[tid] = True
 
 
-@wp.kernel
-def compute_sphere_centers(
-    points: wp.array[wp.vec3],
-    normals: wp.array[wp.vec3],
-    radii: wp.array[wp.float32],
-    out_centers: wp.array[wp.vec3],
-) -> None:
-    tid = wp.tid()
-    r = radii[tid]
-    if wp.isinf(r) or wp.isnan(r):
-        out_centers[tid] = wp.vec3(wp.nan, wp.nan, wp.nan)
-    else:
-        out_centers[tid] = points[tid] + normals[tid] * r
+@wp.func
+def sphere_center(point: wp.vec3, normal: wp.vec3, radius: wp.float32) -> wp.vec3:
+    if wp.isinf(radius) or wp.isnan(radius):
+        return wp.vec3(wp.nan, wp.nan, wp.nan)
+    return point + normal * radius
 
 
 @wp.kernel

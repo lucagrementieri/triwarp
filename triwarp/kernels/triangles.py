@@ -1,6 +1,33 @@
+from typing import Any
+
 import warp as wp
 
-from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
+from triwarp.constants import PI, TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
+from triwarp.kernels.array import to_vec3d
+
+
+@wp.func
+def face_vertices(vertices: wp.array[Any], faces: wp.array[wp.int32], face_index: wp.int32):
+    """
+    Load the three per-corner values of face ``face_index`` from a flat index buffer.
+
+    Generic over the value dtype: works for positions (``wp.vec3``/``wp.vec3d``/``wp.vec2``)
+    as well as per-vertex scalar fields.
+    """
+    base = face_index * wp.int32(3)
+    i0 = faces[base]
+    i1 = faces[base + wp.int32(1)]
+    i2 = faces[base + wp.int32(2)]
+    return vertices[i0], vertices[i1], vertices[i2]
+
+
+@wp.func
+def face_vertices_vec3d(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], face_index: wp.int32
+) -> tuple[wp.vec3d, wp.vec3d, wp.vec3d]:
+    """Load the three corners of face ``face_index`` promoted to ``wp.vec3d``."""
+    v0, v1, v2 = face_vertices(vertices, faces, face_index)
+    return to_vec3d(v0), to_vec3d(v1), to_vec3d(v2)
 
 
 @wp.func
@@ -61,7 +88,7 @@ def angles(
 
     out_angles[f, 0] = wp.acos(wp.clamp(wp.dot(u, v), -1.0, 1.0))
     out_angles[f, 1] = wp.acos(wp.clamp(wp.dot(-u, w), -1.0, 1.0))
-    out_angles[f, 2] = wp.pi - out_angles[f, 0] - out_angles[f, 1]
+    out_angles[f, 2] = PI - out_angles[f, 0] - out_angles[f, 1]
 
     degen = (
         (out_angles[f][0] < TOLERANCE_MERGE_CONSTANT)

@@ -1,6 +1,15 @@
 import warp as wp
 
 
+@wp.func
+def edge_midpoint(
+    vertices: wp.array[wp.vec3], unique_edges: wp.array2d[wp.int32], e: wp.int32
+) -> wp.vec3:
+    v0 = vertices[unique_edges[e, 0]]
+    v1 = vertices[unique_edges[e, 1]]
+    return (v0 + v1) * wp.float32(0.5)
+
+
 @wp.kernel
 def compute_midpoints(
     vertices: wp.array[wp.vec3],
@@ -8,9 +17,7 @@ def compute_midpoints(
     out_midpoints: wp.array[wp.vec3],
 ) -> None:
     k = int(wp.tid())
-    v0 = vertices[unique_edges[k, 0]]
-    v1 = vertices[unique_edges[k, 1]]
-    out_midpoints[k] = (v0 + v1) * wp.float32(0.5)
+    out_midpoints[k] = edge_midpoint(vertices, unique_edges, wp.int32(k))
 
 
 @wp.kernel
@@ -53,12 +60,9 @@ def subdivide_faces(
     out_faces[base + 11] = m2
 
 
-@wp.kernel
-def mark_long_edges(
-    lengths: wp.array[wp.float32], max_edge: wp.float32, out_mask: wp.array[wp.bool]
-) -> None:
-    e = int(wp.tid())
-    out_mask[e] = lengths[e] > max_edge
+@wp.func
+def is_long_edge(length: wp.float32, max_edge: wp.float32) -> wp.bool:
+    return length > max_edge
 
 
 @wp.kernel
@@ -85,9 +89,7 @@ def fill_edge_midpoints(
 ) -> None:
     e = int(wp.tid())
     if long_mask[e]:
-        v0 = vertices[unique_edges[e, 0]]
-        v1 = vertices[unique_edges[e, 1]]
-        out_mid[offsets[e]] = (v0 + v1) * wp.float32(0.5)
+        out_mid[offsets[e]] = edge_midpoint(vertices, unique_edges, wp.int32(e))
 
 
 @wp.kernel

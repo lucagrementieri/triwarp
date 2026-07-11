@@ -20,10 +20,9 @@ def face_adjacency_projections(
     out_projections[tid] = wp.dot(vector_other, normal)
 
 
-@wp.kernel
-def face_adjacency_convex(projections: wp.array[wp.float32], out_convex: wp.array[wp.bool]) -> None:
-    tid = int(wp.tid())
-    out_convex[tid] = projections[tid] < TOLERANCE_MERGE_CONSTANT
+@wp.func
+def is_convex_projection(projection: wp.float32) -> wp.bool:
+    return projection < TOLERANCE_MERGE_CONSTANT
 
 
 @wp.kernel

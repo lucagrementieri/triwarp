@@ -80,9 +80,7 @@ def average_onto_vertices(
         inputs=[faces, face_values, out_sum, out_valence],
         device=device,
     )
-    wp.launch(
-        kernel_array.divide_arrays, dim=n_vertices, inputs=[out_sum, out_valence], device=device
-    )
+    wp.map(wp.div, out_sum, out_valence, out=out_sum)
     return out_sum
 
 
@@ -135,10 +133,5 @@ def average_from_edges_onto_vertices(
         inputs=[faces, edges, edges_orientation, edge_values, out_sum, out_valence],
         device=device,
     )
-    wp.launch(
-        kernel_array.divide_arrays_if_positive,
-        dim=n_vertices,
-        inputs=[out_sum, out_valence],
-        device=device,
-    )
+    wp.map(kernel_array.divide_if_positive, out_sum, out_valence, out=out_sum)
     return out_sum

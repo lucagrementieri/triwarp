@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
-from triwarp.kernels.array import binary_search_index, vector_angle_vec
+from triwarp.kernels.array import binary_search_index, cross2, vector_angle_vec, wrap_index
 
 
 @wp.func
@@ -53,20 +53,15 @@ def line_squared_distance(p: wp.vec3, s: wp.vec3, d: wp.vec3, seg_sq_len: wp.flo
     return wp.dot(diff, diff)
 
 
-@wp.kernel
-def segment_lengths(polyline: wp.array[wp.vec3], out_lengths: wp.array[wp.float32]) -> None:
-    i = int(wp.tid())
-    out_lengths[i] = wp.length(segment_displacement(polyline, i))
+@wp.func
+def segment_length(start: wp.vec3, end: wp.vec3) -> wp.float32:
+    return wp.length(end - start)
 
 
-@wp.kernel
-def segment_midpoints_and_lengths(
-    polyline: wp.array[wp.vec3], out_midpoints: wp.array[wp.vec3], out_lengths: wp.array[wp.float32]
-) -> None:
-    i = int(wp.tid())
-    displacement = segment_displacement(polyline, i)
-    out_midpoints[i] = polyline[i] + 0.5 * displacement
-    out_lengths[i] = wp.length(displacement)
+@wp.func
+def segment_midpoint_and_length(start: wp.vec3, end: wp.vec3) -> tuple[wp.vec3, wp.float32]:
+    displacement = end - start
+    return start + 0.5 * displacement, wp.length(displacement)
 
 
 @wp.kernel
@@ -419,17 +414,10 @@ def is_ear_at(
     return True
 
 
-@wp.kernel
-def project_to_plane_2d(
-    polyline: wp.array[wp.vec3],
-    center: wp.vec3,
-    u: wp.vec3,
-    v: wp.vec3,
-    out_points2d: wp.array[wp.vec2],
-) -> None:
-    i = int(wp.tid())
-    d = polyline[i] - center
-    out_points2d[i] = wp.vec2(wp.dot(d, u), wp.dot(d, v))
+@wp.func
+def project_to_plane_2d(point: wp.vec3, center: wp.vec3, u: wp.vec3, v: wp.vec3) -> wp.vec2:
+    d = point - center
+    return wp.vec2(wp.dot(d, u), wp.dot(d, v))
 
 
 @wp.kernel
@@ -442,7 +430,7 @@ def accumulate_turning_angle(points2d: wp.array[wp.vec2], out_total: wp.array[wp
     after = points2d[(i + 2) % n]
     d1 = nxt - current
     d2 = after - nxt
-    angle = wp.atan2(d1[0] * d2[1] - d1[1] * d2[0], d1[0] * d2[0] + d1[1] * d2[1])
+    angle = wp.atan2(cross2(d1, d2), wp.dot(d1, d2))
     wp.atomic_add(out_total, 0, angle)
 
 
@@ -460,7 +448,7 @@ def count_reflex(points2d: wp.array[wp.vec2], out_count: wp.array[wp.int32]) -> 
     # Pre-clip the ring is trivial, so use direct cyclic neighbours. Convex polygon <=> 0 reflex.
     i = int(wp.tid())
     n = points2d.shape[0]
-    prev = points2d[(i - 1 + n) % n]
+    prev = points2d[wrap_index(i - 1, n)]
     cur = points2d[i]
     nxt = points2d[(i + 1) % n]
     if orient2d(prev, cur, nxt) < 0:
@@ -482,7 +470,7 @@ def init_ring(
 ) -> None:
     i = int(wp.tid())
     n = left.shape[0]
-    left[i] = (i - 1 + n) % n
+    left[i] = wrap_index(i - 1, n)
     right[i] = (i + 1) % n
     active[i] = wp.int32(1)
 

@@ -38,9 +38,9 @@ def faces_to_edges(
     n_faces = int(faces.shape[0]) // 3
     edges = twt.empty_int32_2d((n_faces * 3, 2), device=faces.device)
     wp.launch(
-        kernel_edges.faces_to_edges_sorted if sorted else kernel_edges.faces_to_edges,
+        kernel_edges.faces_to_edges,
         dim=n_faces,
-        inputs=[faces, edges],
+        inputs=[faces, wp.bool(sorted), edges],
         device=faces.device,
     )
     return twt.as_array2d_int32(edges)

@@ -54,19 +54,14 @@ def segments_with_plane(
     if n == 0:
         return intersections, valid
 
-    wp.launch(
-        kernel_intersections.segments_with_plane,
-        dim=n,
-        inputs=[
-            start_points,
-            end_points,
-            plane_origin,
-            plane_normal,
-            line_segments,
-            intersections,
-            valid,
-        ],
-        device=device,
+    wp.map(
+        kernel_intersections.plane_with_line,
+        plane_origin,
+        plane_normal,
+        start_points,
+        end_points,
+        wp.bool(line_segments),
+        out=[intersections, valid],
     )
     return intersections, valid
 
@@ -116,11 +111,8 @@ def mesh_with_plane(
         return empty_segments
 
     vertex_dots = wp.empty(int(vertices.shape[0]), dtype=wp.float32, device=device)
-    wp.launch(
-        kernel_intersections.vertex_plane_dots,
-        dim=int(vertices.shape[0]),
-        inputs=[vertices, plane_origin, plane_normal, vertex_dots],
-        device=device,
+    wp.map(
+        kernel_intersections.point_plane_dot, vertices, plane_origin, plane_normal, out=vertex_dots
     )
 
     valid = wp.empty(n_faces, dtype=wp.bool, device=device)
@@ -317,11 +309,8 @@ def slice_mesh_with_plane(
         return vertices, faces
 
     vertex_dots = wp.empty(n_vertices, dtype=wp.float32, device=device)
-    wp.launch(
-        kernel_intersections.vertex_plane_dots,
-        dim=n_vertices,
-        inputs=[vertices, plane_origin, plane_normal, vertex_dots],
-        device=device,
+    wp.map(
+        kernel_intersections.point_plane_dot, vertices, plane_origin, plane_normal, out=vertex_dots
     )
 
     inside = wp.empty(n_faces, dtype=wp.bool, device=device)

@@ -1,6 +1,8 @@
 import warp as wp
 
-TWO_PI = wp.constant(wp.float32(6.283185307179586))
+from triwarp import constants as twc
+from triwarp.kernels.array import cross2
+from triwarp.kernels.triangles import face_vertices
 
 
 @wp.kernel
@@ -8,12 +10,11 @@ def flipped_faces_mask(
     vertices: wp.array[wp.vec2], faces: wp.array[wp.int32], out_mask: wp.array[wp.bool]
 ) -> None:
     fi = int(wp.tid())
-    v0 = vertices[faces[fi * 3]]
-    e0 = vertices[faces[fi * 3 + 1]] - v0
-    e1 = vertices[faces[fi * 3 + 2]] - v0
+    v0, v1, v2 = face_vertices(vertices, faces, wp.int32(fi))
+    e0 = v1 - v0
+    e1 = v2 - v0
     # 2D signed area * 2 == det of libigl's homogeneous 3x3 matrix
-    signed_area2 = e0[0] * e1[1] - e0[1] * e1[0]
-    out_mask[fi] = signed_area2 < 0.0
+    out_mask[fi] = cross2(e0, e1) < 0.0
 
 
 @wp.kernel
@@ -25,14 +26,12 @@ def scatter_boundary_mask(
     out_mask[boundary_indices[b]] = True
 
 
-@wp.kernel
-def interior_flags(boundary_mask: wp.array[wp.bool], out_flags: wp.array[wp.int32]) -> None:
+@wp.func
+def interior_flag(boundary: wp.bool) -> wp.int32:
     # ``1`` for interior (free) vertices, ``0`` for fixed ones; scanned into the interior remap.
-    i = int(wp.tid())
-    if boundary_mask[i]:
-        out_flags[i] = 0
-    else:
-        out_flags[i] = 1
+    if boundary:
+        return wp.int32(0)
+    return wp.int32(1)
 
 
 @wp.kernel
@@ -89,17 +88,15 @@ def interior_system_triplets(
     out_rhs_y[ri] = rhs_y
 
 
-@wp.kernel
-def reciprocal(values: wp.array[wp.Float], out_inv: wp.array[wp.float64]) -> None:
+@wp.func
+def reciprocal64(value: wp.Float) -> wp.float64:
     # Diagonal inverse (``igl::invert_diag``) of the lumped mass into float64, for the ``k > 1``
-    # operator ``Q = (-L) (M^-1 (-L))^(k-1)``. ``values`` is generic (float32 or float64). A zero
+    # operator ``Q = (-L) (M^-1 (-L))^(k-1)``. ``value`` is generic (float32 or float64). A zero
     # entry maps to zero, not infinity.
-    i = int(wp.tid())
-    v = values[i]
-    if v != type(values[0])(0.0):
-        out_inv[i] = wp.float64(1.0) / wp.float64(v)
-    else:
-        out_inv[i] = wp.float64(0.0)
+    v = wp.float64(value)
+    if v != wp.float64(0.0):
+        return wp.float64(1.0) / v
+    return wp.float64(0.0)
 
 
 @wp.kernel
@@ -147,5 +144,5 @@ def circle_positions(
     n = cumulative_length.shape[0]
     wrap = wp.length(vertices[boundary[0]] - vertices[boundary[n - 1]])
     total = cumulative_length[n - 1] + wrap
-    frac = cumulative_length[i] * TWO_PI / total
+    frac = cumulative_length[i] * twc.TWO_PI / total
     out_uv[i] = wp.vec2(wp.cos(frac), wp.sin(frac))

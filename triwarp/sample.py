@@ -64,7 +64,10 @@ def sample_fibonacci_sphere(count: int, device: wp.DeviceLike = None) -> wp.arra
         return wp.empty(0, dtype=wp.vec3, device=device)
     out_directions = wp.empty(count, dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_sample.fibonacci_sphere, dim=count, inputs=[count, out_directions], device=device
+        kernel_sample.fibonacci_lattice,
+        dim=count,
+        inputs=[count, wp.float32(2.0), out_directions],
+        device=device,
     )
     return out_directions
 
@@ -102,7 +105,10 @@ def sample_fibonacci_hemisphere(count: int, device: wp.DeviceLike = None) -> wp.
         return wp.empty(0, dtype=wp.vec3, device=device)
     out_directions = wp.empty(count, dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_sample.fibonacci_hemisphere, dim=count, inputs=[count, out_directions], device=device
+        kernel_sample.fibonacci_lattice,
+        dim=count,
+        inputs=[count, wp.float32(1.0), out_directions],
+        device=device,
     )
     return out_directions
 
@@ -345,32 +351,17 @@ def _bridson_blue_noise(
     bbox_min = wp.vec3(*pts_np.min(axis=0).astype(np.float32))
 
     grid_coords = wp.empty(nx, dtype=wp.vec3i, device=device)
-    wp.launch(
-        kernel_blue_noise.compute_grid_coords,
-        dim=nx,
-        inputs=[pool_points, bbox_min, inv_cell_size, grid_coords],
-        device=device,
-    )
+    wp.map(kernel_blue_noise.grid_coord, pool_points, bbox_min, inv_cell_size, out=grid_coords)
 
     comp = wp.empty(nx, dtype=wp.int32, device=device)
     max_coord = 0
     for axis in (0, 1, 2):
-        wp.launch(
-            kernel_blue_noise.extract_grid_component,
-            dim=nx,
-            inputs=[grid_coords, wp.int32(axis), comp],
-            device=device,
-        )
+        wp.map(kernel_blue_noise.grid_component, grid_coords, wp.int32(axis), out=comp)
         max_coord = max(max_coord, tw.reduce.max(comp))
     grid_w = int(max_coord) + 1
 
     cell_keys = wp.empty(nx, dtype=wp.int64, device=device)
-    wp.launch(
-        kernel_blue_noise.compute_cell_keys,
-        dim=nx,
-        inputs=[grid_coords, wp.int32(grid_w), cell_keys],
-        device=device,
-    )
+    wp.map(kernel_blue_noise.grid_cell_key, grid_coords, wp.int32(grid_w), out=cell_keys)
 
     keys_buf = wp.empty(2 * nx, dtype=wp.int64, device=device)
     wp.copy(keys_buf, cell_keys, count=nx)
@@ -481,19 +472,9 @@ def _bridson_blue_noise(
         )
 
         staying_mask = wp.empty(active_count, dtype=wp.bool, device=device)
-        wp.launch(
-            kernel_blue_noise.int_is_zero,
-            dim=active_count,
-            inputs=[retire, staying_mask],
-            device=device,
-        )
+        wp.map(kernel_blue_noise.int_is_zero, retire, out=staying_mask)
         spawned_mask = wp.empty(active_count, dtype=wp.bool, device=device)
-        wp.launch(
-            kernel_blue_noise.spawned_is_valid,
-            dim=active_count,
-            inputs=[spawned, spawned_mask],
-            device=device,
-        )
+        wp.map(kernel_blue_noise.spawned_is_valid, spawned, out=spawned_mask)
 
         retire_bool = wp.empty(active_count, dtype=wp.bool, device=device)
         wp.utils.array_cast(retire, retire_bool)

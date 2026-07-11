@@ -226,9 +226,12 @@ def remap_attribute_from_uv(
     n_vertices = int(uv.shape[0])
     out_values = twt.empty_float32_2d((n_vertices, n_channels), device=device)
     if n_vertices > 0:
-        kernel = kernel_texture.sample_bilinear if order == 1 else kernel_texture.sample_nearest
+        mode = kernel_texture.SAMPLE_BILINEAR if order == 1 else kernel_texture.SAMPLE_NEAREST
         wp.launch(
-            kernel, dim=n_vertices, inputs=[uv, image3d, n_channels, out_values], device=device
+            kernel_texture.sample_texture,
+            dim=n_vertices,
+            inputs=[uv, image3d, n_channels, mode, out_values],
+            device=device,
         )
     return twt.as_array2d_float32(out_values)
 

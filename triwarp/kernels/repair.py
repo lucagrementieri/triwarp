@@ -63,13 +63,9 @@ def flip_faces_masked(
         out_faces[base + wp.int32(2)] = i2
 
 
-@wp.kernel
-def mark_negative_component(
-    labels: wp.array[wp.int32], component_volume: wp.array[wp.float32], out_flip: wp.array[wp.int32]
-) -> None:
+@wp.func
+def negative_volume_flag(volume: wp.float32) -> wp.int32:
     """Flag a face for flipping when its component's signed volume is negative (inward)."""
-    f = int(wp.tid())
-    if component_volume[labels[f]] < 0.0:
-        out_flip[f] = wp.int32(1)
-    else:
-        out_flip[f] = wp.int32(0)
+    if volume < 0.0:
+        return wp.int32(1)
+    return wp.int32(0)

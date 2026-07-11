@@ -1,5 +1,3 @@
-from typing import Any
-
 import warp as wp
 
 from triwarp.constants import TILE_1D, TOLERANCE_MERGE_CONSTANT
@@ -26,42 +24,52 @@ def tolerance_sign(value: wp.float32) -> wp.int32:
     return wp.int32(0)
 
 
-@wp.kernel
-def sub(array: wp.array[wp.Scalar], n: wp.Scalar) -> None:
-    i = int(wp.tid())
-    array[i] = array[i] - n
+@wp.func
+def wrap_index(i: wp.int32, n: wp.int32) -> wp.int32:
+    # Positive modulo: ``%`` follows C++11 semantics (sign of the dividend).
+    return ((i % n) + n) % n
 
 
-@wp.kernel
-def divide(array: wp.array[Any], n: wp.float32) -> None:
-    # Generic element-wise division by a scalar. ``array`` may hold scalars,
-    # vectors (e.g. wp.vec3), or matrices (e.g. wp.mat33); Warp specialises the
-    # kernel per launch dtype.
-    i = int(wp.tid())
-    array[i] = array[i] / n
+@wp.func
+def update_argmin(
+    best_value: wp.ref[wp.float32],
+    best_index: wp.ref[wp.int32],
+    value: wp.float32,
+    index: wp.int32,
+):
+    # Running min-with-index update in place. Callers must be compiled with
+    # ``enable_backward=False`` (``wp.ref`` helpers have no adjoint).
+    if value < best_value:
+        best_value = value
+        best_index = index  # noqa: F841 — writes through the wp.ref parameter
 
 
-@wp.kernel
-def divide_arrays(array: wp.array[Any], divisor: wp.array[wp.Scalar]) -> None:
-    # Generic element-wise division by a per-element scalar divisor.
-    i = int(wp.tid())
-    array[i] = array[i] / divisor[i]
+@wp.func
+def cross2(a: wp.vec2, b: wp.vec2) -> wp.float32:
+    return a[0] * b[1] - a[1] * b[0]
 
 
-@wp.kernel
-def divide_arrays_if_positive(array: wp.array[Any], divisor: wp.array[wp.Scalar]) -> None:
-    # Like divide_arrays, but skips division when divisor[i] <= 0.
-    i = int(wp.tid())
-    if divisor[i] > 0.0:
-        array[i] = array[i] / divisor[i]
+@wp.func
+def to_vec3d(v: wp.vec3) -> wp.vec3d:
+    return wp.vec3d(wp.float64(v[0]), wp.float64(v[1]), wp.float64(v[2]))
 
 
-@wp.kernel
-def square(values: wp.array[wp.Scalar], out_squared: wp.array[wp.Scalar]) -> None:
-    # Generic element-wise square of a scalar array.
-    i = int(wp.tid())
-    v = values[i]
-    out_squared[i] = v * v
+@wp.func
+def to_vec3(v: wp.vec3d) -> wp.vec3:
+    return wp.vec3(wp.float32(v[0]), wp.float32(v[1]), wp.float32(v[2]))
+
+
+@wp.func
+def square_scalar(value: wp.Scalar) -> wp.Scalar:
+    return value * value
+
+
+@wp.func
+def divide_if_positive(value: wp.float32, divisor: wp.float32) -> wp.float32:
+    # Guarded division: leave ``value`` unchanged when ``divisor <= 0``.
+    if divisor > 0.0:
+        return value / divisor
+    return value
 
 
 @wp.kernel
@@ -89,12 +97,6 @@ def init_sort_pair_indices(out: wp.array[wp.Int], n: wp.Int, fill_value: wp.Int)
 def init_repeat_index(out: wp.array[wp.Int], repeats: wp.Int) -> None:
     i = int(wp.tid())
     out[i] = i // repeats
-
-
-@wp.kernel
-def normalize(array: wp.array[wp.vec3]) -> None:
-    tid = wp.tid()
-    array[tid] = wp.normalize(array[tid])
 
 
 @wp.kernel
@@ -146,42 +148,18 @@ def vector_angle_vec(a: wp.vec3, b: wp.vec3) -> wp.float32:
     return wp.abs(wp.acos(dot))
 
 
-@wp.kernel
-def vector_angle(
-    a: wp.array[wp.vec3], b: wp.array[wp.vec3], out_angles: wp.array[wp.float32]
-) -> None:
-    tid = int(wp.tid())
-    out_angles[tid] = vector_angle_vec(a[tid], b[tid])
+@wp.func
+def is_close_scalar(a: wp.float32, b: wp.float32, rtol: wp.float32, atol: wp.float32) -> wp.bool:
+    return wp.abs(a - b) <= atol + rtol * wp.abs(b)
 
 
-@wp.kernel
-def allclose_mask_scalar(
-    a: wp.array[wp.float32],
-    b: wp.array[wp.float32],
-    rtol: wp.float32,
-    atol: wp.float32,
-    out_mask: wp.array[wp.bool],
-) -> None:
-    i = int(wp.tid())
-    out_mask[i] = wp.abs(a[i] - b[i]) <= atol + rtol * wp.abs(b[i])
-
-
-@wp.kernel
-def allclose_mask_vec3(
-    a: wp.array[wp.vec3],
-    b: wp.array[wp.vec3],
-    rtol: wp.float32,
-    atol: wp.float32,
-    out_mask: wp.array[wp.bool],
-) -> None:
-    i = int(wp.tid())
-    av = a[i]
-    bv = b[i]
+@wp.func
+def is_close_vec3(a: wp.vec3, b: wp.vec3, rtol: wp.float32, atol: wp.float32) -> wp.bool:
     close = True
     for k in range(3):
-        if wp.abs(av[k] - bv[k]) > atol + rtol * wp.abs(bv[k]):
+        if wp.abs(a[k] - b[k]) > atol + rtol * wp.abs(b[k]):
             close = False
-    out_mask[i] = close
+    return close
 
 
 @wp.func
@@ -223,25 +201,11 @@ def map_sorted_inverse(
 
 
 @wp.kernel
-def gram_matrix(points: wp.array[wp.vec3], out_gram: wp.array[wp.mat33]) -> None:
-    i, t = wp.tid()
-    n = points.shape[0]
-    offset = i * TILE_1D
-    remaining = n - offset
-    if remaining <= 0:
-        return
-
-    # uncentred Gram matrix: G = sum_k outer(x_k, x_k)
-    m = outer_sum_tile(points, wp.vec3(0.0, 0.0, 0.0), offset, remaining)
-
-    if t == 0:
-        wp.atomic_add(out_gram, 0, m)
-
-
-@wp.kernel
 def centered_covariance(
     points: wp.array[wp.vec3], center: wp.array[wp.vec3], out_cov: wp.array[wp.mat33]
 ) -> None:
+    # Scatter matrix C = sum_k outer(x_k - center, x_k - center). With a zero center this is
+    # the uncentred Gram matrix G = sum_k outer(x_k, x_k).
     i, t = wp.tid()
     n = points.shape[0]
     offset = i * TILE_1D
@@ -249,7 +213,6 @@ def centered_covariance(
     if remaining <= 0:
         return
 
-    # centred scatter matrix: C = sum_k outer(x_k - center, x_k - center)
     m = outer_sum_tile(points, center[0], offset, remaining)
 
     if t == 0:

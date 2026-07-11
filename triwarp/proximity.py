@@ -1662,12 +1662,7 @@ def max_tangent_sphere(
     )
 
     centers = wp.empty(m, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_proximity.compute_sphere_centers,
-        dim=m,
-        inputs=[points, ray_dirs, radii, centers],
-        device=device,
-    )
+    wp.map(kernel_proximity.sphere_center, points, ray_dirs, radii, out=centers)
 
     mesh_min, mesh_max = aabb_bounds(mesh.points)
     D = float(wp.length(mesh_max - mesh_min))  # noqa: N806

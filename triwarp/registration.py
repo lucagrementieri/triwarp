@@ -295,11 +295,12 @@ def icp(
         weights: wp.array[wp.float32] | None = None
         if max_distance is not None:
             weights = wp.empty(n, dtype=wp.float32, device=device)
-            wp.launch(
-                kernel_registration.distance_threshold_weights,
-                dim=n,
-                inputs=[distance, triangle_id, wp.float32(max_distance), weights],
-                device=device,
+            wp.map(
+                kernel_registration.distance_threshold_weight,
+                distance,
+                triangle_id,
+                wp.float32(max_distance),
+                out=weights,
             )
             if float(tw.reduce.sum(weights)) == 0.0:
                 break

@@ -183,12 +183,7 @@ def _solve_fixed_boundary(
                 q = wps.bsr_mm(q, neg_l)
         else:
             inv_mass = wp.empty(n_vertices, dtype=wp.float64, device=device)
-            wp.launch(
-                kernel_parametrization.reciprocal,
-                dim=n_vertices,
-                inputs=[mass_diag, inv_mass],
-                device=device,
-            )
+            wp.map(kernel_parametrization.reciprocal64, mass_diag, out=inv_mass)
             mass_inv = wps.bsr_diag(diag=inv_mass)
             for _ in range(k - 1):
                 q = wps.bsr_mm(wps.bsr_mm(q, mass_inv), neg_l)
@@ -214,12 +209,7 @@ def _solve_fixed_boundary(
     # Compact interior remap: exclusive scan of the interior indicator gives each free vertex its
     # index in the reduced system; the inclusive scan's last entry is the interior count.
     flags = wp.empty(n_vertices, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_parametrization.interior_flags,
-        dim=n_vertices,
-        inputs=[boundary_mask, flags],
-        device=device,
-    )
+    wp.map(kernel_parametrization.interior_flag, boundary_mask, out=flags)
     interior_map = wp.empty(n_vertices, dtype=wp.int32, device=device)
     inclusive = wp.empty(n_vertices, dtype=wp.int32, device=device)
     wp.utils.array_scan(flags, out_array=interior_map, inclusive=False)
