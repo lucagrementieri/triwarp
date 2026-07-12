@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels.array import update_argmin
 from triwarp.kernels.array import wrap_index as _wrap
 
@@ -634,3 +635,78 @@ def stitch_dp_diag(
 
     dp[i, j] = best
     came[i, j] = best_came
+
+
+@wp.kernel
+def edge_third_vertex(faces: wp.array[wp.int32], out_third: wp.array[wp.int32]) -> None:
+    # Third vertex per faces_to_edges row: edge k of face f is (v_k, v_{k+1}), third is v_{k+2}.
+    r = int(wp.tid())
+    f = r // 3
+    k = r % 3
+    out_third[r] = faces[f * 3 + (k + 2) % 3]
+
+
+@wp.kernel
+def rim_opposite_from_table(
+    loop: wp.array[wp.int32],
+    vertices: wp.array[wp.vec3],
+    sorted_keys: wp.array[wp.uint64],
+    sorted_rows: wp.array[wp.int32],
+    thirds: wp.array[wp.int32],
+    max_index: wp.uint64,
+    out_positions: wp.array[wp.vec3],
+    out_valid: wp.array[wp.int32],
+) -> None:
+    # Per rim edge (loop[i], loop[i+1]): probe the sorted packed-edge table; a single hit means
+    # exactly one adjacent existing face, whose third vertex blends the fill dihedral metrics
+    # into the surface (host dict semantics of the former _rim_opposite).
+    i = int(wp.tid())
+    b = loop.shape[0]
+    u = loop[i]
+    v = loop[(i + 1) % b]
+    lo_v = wp.min(u, v)
+    hi_v = wp.max(u, v)
+    key = wp.uint64(wp.uint32(lo_v)) + wp.uint64(wp.uint32(hi_v)) * max_index
+    lo_idx = kernel_array.binary_search_index_left(sorted_keys, key)
+    hi_idx = kernel_array.binary_search_index(sorted_keys, key)
+    out_positions[i] = wp.vec3(0.0, 0.0, 0.0)
+    out_valid[i] = wp.int32(0)
+    if hi_idx - lo_idx == 1:
+        out_positions[i] = vertices[thirds[sorted_rows[lo_idx]]]
+        out_valid[i] = wp.int32(1)
+
+
+@wp.kernel
+def scatter_loop_positions(loop: wp.array[wp.int32], out_position: wp.array[wp.int32]) -> None:
+    # Highest position wins on duplicate loop vertices, matching the last-write-wins dict the
+    # host implementation built (dict insertion followed ascending positions).
+    i = int(wp.tid())
+    wp.atomic_max(out_position, loop[i], wp.int32(i))
+
+
+@wp.kernel
+def mark_forbidden_chords(
+    edges_sorted: wp.array2d[wp.int32],
+    position: wp.array[wp.int32],
+    b: wp.int32,
+    out_mask: wp.array2d[wp.int32],
+) -> None:
+    # Chords (non-adjacent loop positions) that already exist as mesh edges are forbidden
+    # (MeshLib MultipleEdgesResolveMode::Simple). Idempotent writes: no atomics needed.
+    e = int(wp.tid())
+    pu = position[edges_sorted[e, 0]]
+    pv = position[edges_sorted[e, 1]]
+    if pu < 0 or pv < 0:
+        return
+    lo = wp.min(pu, pv)
+    hi = wp.max(pu, pv)
+    if hi - lo >= 2 and hi - lo <= int(b) - 2:
+        out_mask[lo, hi] = wp.int32(1)
+        out_mask[hi, lo] = wp.int32(1)
+
+
+@wp.kernel
+def clear_loop_positions(loop: wp.array[wp.int32], out_position: wp.array[wp.int32]) -> None:
+    # Reset the touched slots so the (n_vertices,) scratch is reusable across loops.
+    i = int(wp.tid())
+    out_position[loop[i]] = wp.int32(-1)

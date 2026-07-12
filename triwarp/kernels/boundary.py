@@ -1,5 +1,7 @@
 import warp as wp
 
+from triwarp.kernels.array import wrap_index
+
 
 @wp.kernel
 def scatter_successor(directed_edges: wp.array2d[wp.int32], out_next: wp.array[wp.int32]) -> None:
@@ -22,29 +24,62 @@ def scatter_loop_min_and_count(
 
 
 @wp.kernel
-def rank_loop_positions(
+def init_rank_arrays(
     boundary_vertices: wp.array[wp.int32],
     next_vertex: wp.array[wp.int32],
     labels: wp.array[wp.int32],
     label_min: wp.array[wp.int32],
-    label_count: wp.array[wp.int32],
-    out_position: wp.array[wp.int32],
+    out_successor: wp.array[wp.int32],
+    out_steps: wp.array[wp.int32],
 ) -> None:
+    # Pointer-jumping list ranking, step 1: cut each loop at its canonical start (the smallest
+    # vertex index, label_min) so cycles become chains ending in a fixed point (successor ==
+    # self, steps == 0). Broken chains (-1 sentinel on non-manifold boundaries) also terminate
+    # at a fixed point, so the whole ranking finishes in a fixed round count on any input.
     tid = int(wp.tid())
     v = boundary_vertices[tid]
-    label = labels[v]
-    start = label_min[label]
-    loop_length = label_count[label]
-    current = v
-    steps = wp.int32(0)
-    # Follow the successor chain back to the loop's start vertex. The guards make the walk
-    # terminating on any input: a well-formed loop reaches `start` in fewer than `loop_length`
-    # hops, while a broken successor chain (non-manifold boundary: a `-1` sentinel or a sub-cycle
-    # not containing `start`) stops at the bound instead of spinning forever on the device.
-    while current != start and current >= 0 and steps < loop_length:
-        current = next_vertex[current]
-        steps += 1
-    out_position[tid] = (loop_length - steps) % loop_length
+    start = label_min[labels[v]]
+    nxt = next_vertex[v]
+    if v == start or nxt < 0:
+        out_successor[v] = v
+        out_steps[v] = wp.int32(0)
+    else:
+        out_successor[v] = nxt
+        out_steps[v] = wp.int32(1)
+
+
+@wp.kernel
+def jump_rank(
+    boundary_vertices: wp.array[wp.int32],
+    successor_in: wp.array[wp.int32],
+    steps_in: wp.array[wp.int32],
+    out_successor: wp.array[wp.int32],
+    out_steps: wp.array[wp.int32],
+) -> None:
+    # Pointer doubling (Wyllie): after k rounds each vertex knows its 2^k-th successor and the
+    # exact hop count to it; the fixed point at the loop start contributes zero, so steps
+    # converges to the hop distance to the start in ceil(log2(chain length)) rounds.
+    tid = int(wp.tid())
+    v = boundary_vertices[tid]
+    s = successor_in[v]
+    out_steps[v] = steps_in[v] + steps_in[s]
+    out_successor[v] = successor_in[s]
+
+
+@wp.kernel
+def finalize_rank_positions(
+    boundary_vertices: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+    label_count: wp.array[wp.int32],
+    steps: wp.array[wp.int32],
+    out_position: wp.array[wp.int32],
+) -> None:
+    # position = (loop_length - hops to start) mod loop_length; the positive modulo keeps
+    # malformed chains (steps beyond loop_length on non-manifold boundaries) in range.
+    tid = int(wp.tid())
+    v = boundary_vertices[tid]
+    loop_length = label_count[labels[v]]
+    out_position[tid] = wrap_index(loop_length - steps[v], loop_length)
 
 
 @wp.kernel

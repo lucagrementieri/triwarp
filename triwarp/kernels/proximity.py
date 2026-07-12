@@ -6,23 +6,6 @@ from triwarp.kernels import triangles as kernel_triangles
 from triwarp.kernels.algorithms import bfs as kernel_bfs
 
 
-@wp.kernel
-def aabb_bounds(
-    points: wp.array[wp.vec3], out_min: wp.array[wp.float32], out_max: wp.array[wp.float32]
-) -> None:
-    tid = wp.tid()
-    p = points[tid]
-
-    # Atomic operations for component-wise reduction
-    wp.atomic_min(out_min, 0, p[0])
-    wp.atomic_min(out_min, 1, p[1])
-    wp.atomic_min(out_min, 2, p[2])
-
-    wp.atomic_max(out_max, 0, p[0])
-    wp.atomic_max(out_max, 1, p[1])
-    wp.atomic_max(out_max, 2, p[2])
-
-
 @wp.func
 def bvh_aabb_collect(
     bvh_id: wp.uint64,
@@ -304,26 +287,31 @@ def query_geodesic_ball_count(
     adj_columns: wp.array[wp.int32],
     radius: wp.float32,
     min_count: wp.int32,
+    chunk_start: wp.int32,
+    queue_pool: wp.array2d[wp.int32],
+    visited_pool: wp.array2d[wp.int32],
+    ext_dist_pool: wp.array2d[wp.float32],
+    ext_idx_pool: wp.array2d[wp.int32],
     out_counts: wp.array[wp.int32],
     out_overflow: wp.array[wp.int32],
 ) -> None:
-    i = int(wp.tid())
-    queue = wp.zeros(shape=kernel_bfs._PER_SOURCE_MAX_NEIGHBORS, dtype=wp.int32)
-    visited = wp.zeros(shape=kernel_bfs._PER_SOURCE_MAX_NEIGHBORS, dtype=wp.int32)
-    ext_dist = wp.zeros(shape=kernel_bfs._PER_SOURCE_MAX_NEIGHBORS, dtype=wp.float32)
-    ext_idx = wp.zeros(shape=kernel_bfs._PER_SOURCE_MAX_NEIGHBORS, dtype=wp.int32)
+    # Scratch lives in wrapper-allocated global-memory pools (one row per thread of the current
+    # chunk) instead of ~8 KB of per-thread local arrays; the wrapper pre-fills the visited pool
+    # with -1 before each launch.
+    t = int(wp.tid())
+    i = int(chunk_start) + t
     dummy = wp.zeros(shape=1, dtype=wp.int32)
     out_counts[i] = kernel_bfs.per_source_bfs_collect(
-        i,
+        wp.int32(i),
         vertices,
         adj_offsets,
         adj_columns,
         radius,
         min_count,
-        queue,
-        visited,
-        ext_dist,
-        ext_idx,
+        queue_pool[t],
+        visited_pool[t],
+        ext_dist_pool[t],
+        ext_idx_pool[t],
         False,
         wp.int32(0),
         dummy,
@@ -338,26 +326,28 @@ def query_geodesic_ball_neighbors(
     adj_columns: wp.array[wp.int32],
     radius: wp.float32,
     min_count: wp.int32,
+    chunk_start: wp.int32,
+    queue_pool: wp.array2d[wp.int32],
+    visited_pool: wp.array2d[wp.int32],
+    ext_dist_pool: wp.array2d[wp.float32],
+    ext_idx_pool: wp.array2d[wp.int32],
     offsets: wp.array[wp.int32],
     out_neighbors: wp.array[wp.int32],
     out_overflow: wp.array[wp.int32],
 ) -> None:
-    i = int(wp.tid())
-    queue = wp.zeros(shape=kernel_bfs._PER_SOURCE_MAX_NEIGHBORS, dtype=wp.int32)
-    visited = wp.zeros(shape=kernel_bfs._PER_SOURCE_MAX_NEIGHBORS, dtype=wp.int32)
-    ext_dist = wp.zeros(shape=kernel_bfs._PER_SOURCE_MAX_NEIGHBORS, dtype=wp.float32)
-    ext_idx = wp.zeros(shape=kernel_bfs._PER_SOURCE_MAX_NEIGHBORS, dtype=wp.int32)
+    t = int(wp.tid())
+    i = int(chunk_start) + t
     kernel_bfs.per_source_bfs_collect(
-        i,
+        wp.int32(i),
         vertices,
         adj_offsets,
         adj_columns,
         radius,
         min_count,
-        queue,
-        visited,
-        ext_dist,
-        ext_idx,
+        queue_pool[t],
+        visited_pool[t],
+        ext_dist_pool[t],
+        ext_idx_pool[t],
         True,
         offsets[i],
         out_neighbors,
@@ -596,42 +586,105 @@ def winding_number_tiled(
         wp.tile_atomic_add(out_winding, tile_sum, (int(q),))
 
 
-@wp.kernel(enable_backward=False)
-def init_sphere_radii(
-    mesh_vertices: wp.array[wp.vec3],
-    n_vertices: wp.int32,
-    points: wp.array[wp.vec3],
-    normals: wp.array[wp.vec3],
+@wp.kernel
+def init_sphere_radii_finite(
     distances: wp.array[wp.float32],
     out_radii: wp.array[wp.float32],
     out_not_converged: wp.array[wp.bool],
+    out_needs_support: wp.array[wp.bool],
 ) -> None:
+    # Finite longest-ray hits initialise directly; escaped rays (inf distance) are deferred to
+    # the tiled support-point passes below. Their slots default to the "no valid support"
+    # outcome so an empty support subset needs no fix-up.
     tid = wp.tid()
-    p = points[tid]
-    n = normals[tid]
     d = distances[tid]
-
     if not wp.isinf(d):
         out_radii[tid] = d * wp.float32(0.5)
         out_not_converged[tid] = True
-        return
+        out_needs_support[tid] = False
+    else:
+        out_radii[tid] = wp.inf
+        out_not_converged[tid] = False
+        out_needs_support[tid] = True
 
-    max_proj = wp.float32(-1e38)
-    best_v = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    # ``found`` == "at least one candidate seen": the ``-1e38`` seed is beaten by the first finite
-    # projection, so this equals ``n_vertices > 0`` (the argmax helper only tracks max_proj/best_v).
-    found = wp.bool(n_vertices > 0)
 
-    for v_idx in range(n_vertices):
-        v = mesh_vertices[v_idx]
-        kernel_array.update_argmax_vec3(max_proj, best_v, wp.dot(v - p, n), v)
+@wp.func
+def pack_support_candidate(projection: wp.float32, index: wp.int32) -> wp.uint64:
+    # Order-preserving float32 -> uint32 mapping (sign bit set for non-negatives, all bits
+    # inverted for negatives) packed above the bit-inverted index, so a single atomic_max
+    # selects the greatest projection with the LOWEST index as the tie-break. Zero never
+    # occurs as a real packed value, so it doubles as the "no candidate" sentinel.
+    bits = wp.cast(projection, wp.uint32)
+    if bits & wp.uint32(0x80000000) != wp.uint32(0):
+        key = ~bits
+    else:
+        key = bits | wp.uint32(0x80000000)
+    return (wp.uint64(key) << wp.uint64(32)) | wp.uint64(~wp.uint32(index))
 
-    if not found or max_proj < TOLERANCE_PLANAR_CONSTANT:
+
+@wp.kernel
+def support_argmax_tiled(
+    mesh_vertices: wp.array[wp.vec3],
+    n_vertices: wp.int32,
+    stride_blocks: wp.int32,
+    normals: wp.array[wp.vec3],
+    support_indices: wp.array[wp.int32],
+    out_packed: wp.array[wp.uint64],
+) -> None:
+    # Support point of the vertex cloud per deferred query: argmax of dot(v, n). Each lane
+    # strides over the vertices (grid-stride keeps the block count bounded), reduces its own
+    # running best into a packed (projection, index) key, and the block commits one atomic.
+    q, block_j, t = wp.tid()
+    normal = normals[support_indices[int(q)]]
+    stride = int(stride_blocks) * TILE_1D
+    idx = int(block_j) * TILE_1D + int(t)
+    best = wp.float32(-wp.inf)
+    best_index = wp.int32(0)
+    while idx < int(n_vertices):
+        projection = wp.dot(mesh_vertices[idx], normal)
+        if projection > best or (projection == best and idx < best_index):
+            best = projection
+            best_index = idx
+        idx += stride
+    packed = wp.uint64(0)
+    if not wp.isinf(best):
+        packed = pack_support_candidate(best, best_index)
+    tile_best = wp.tile_max(wp.tile(packed))
+    if t == 0:
+        wp.atomic_max(out_packed, int(q), tile_best[0])
+
+
+@wp.kernel
+def init_sphere_radii_support(
+    mesh_vertices: wp.array[wp.vec3],
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    support_indices: wp.array[wp.int32],
+    packed_support: wp.array[wp.uint64],
+    out_radii: wp.array[wp.float32],
+    out_not_converged: wp.array[wp.bool],
+) -> None:
+    # Tail pass over the deferred subset: decode the support point and derive the
+    # tangent-sphere radius, scattering it back into the full arrays.
+    q = int(wp.tid())
+    tid = support_indices[q]
+    packed = packed_support[q]
+    if packed == wp.uint64(0):
         out_radii[tid] = wp.inf
         out_not_converged[tid] = False
         return
 
-    diff = best_v - p
+    p = points[tid]
+    n = normals[tid]
+    best = wp.int32(~wp.uint32(packed & wp.uint64(0xFFFFFFFF)))
+    max_proj = wp.dot(mesh_vertices[best], n) - wp.dot(p, n)
+
+    if max_proj < TOLERANCE_PLANAR_CONSTANT:
+        out_radii[tid] = wp.inf
+        out_not_converged[tid] = False
+        return
+
+    diff = mesh_vertices[best] - p
     denom = wp.float32(2.0) * wp.dot(diff, n)
     if wp.abs(denom) < TOLERANCE_PLANAR_CONSTANT:
         out_radii[tid] = wp.inf
@@ -663,27 +716,35 @@ def step_sphere_shrink(
     out_centers: wp.array[wp.vec3],
     out_not_converged: wp.array[wp.bool],
 ) -> None:
+    # Every lane writes all three outputs (converged lanes pass their state through), so the
+    # wrapper can ping-pong two preallocated buffer sets instead of cloning per iteration, and
+    # extra launches on a fully converged state are harmless no-ops.
     tid = wp.tid()
-    if not not_converged[tid]:
-        return
-
     p = points[tid]
     center = centers[tid]
+    if not not_converged[tid]:
+        out_radii[tid] = old_radii[tid]
+        out_centers[tid] = center
+        out_not_converged[tid] = False
+        return
+
     dist_to_start = wp.length(center - p)
 
     if wp.abs(n_dists[tid] - dist_to_start) < TOLERANCE_PLANAR_CONSTANT:
+        out_radii[tid] = old_radii[tid]
+        out_centers[tid] = center
         out_not_converged[tid] = False
         return
 
     diff = n_points[tid] - p
     denom = wp.float32(2.0) * wp.dot(diff, normals[tid])
     if wp.abs(denom) < TOLERANCE_PLANAR_CONSTANT:
+        out_radii[tid] = old_radii[tid]
+        out_centers[tid] = center
         out_not_converged[tid] = False
         return
 
     new_r = wp.dot(diff, diff) / denom
     out_radii[tid] = new_r
     out_centers[tid] = p + normals[tid] * new_r
-
-    if old_radii[tid] - new_r < convergence_threshold:
-        out_not_converged[tid] = False
+    out_not_converged[tid] = old_radii[tid] - new_r >= convergence_threshold

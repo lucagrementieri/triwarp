@@ -177,6 +177,39 @@ def test_edge_manifold_mask_edges_sorted_shortcut(icosahedron: tuple[tm.Trimesh,
     assert np.array_equal(mask_default.numpy(), mask_shortcut.numpy())
 
 
+def test_is_edge_manifold_precomputed_shortcut(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _, mesh_wp = icosahedron
+    edges_sorted = tw.edges.faces_to_edges(mesh_wp.indices, sorted=True)
+    n_vertices = tw.vertices.n_vertices(edges_sorted)
+    assert tw.characteristics.is_edge_manifold(
+        mesh_wp.indices, edges_sorted=edges_sorted, n_vertices=n_vertices
+    ) == tw.characteristics.is_edge_manifold(mesh_wp.indices)
+
+
+def test_is_vertex_manifold_precomputed_shortcut(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _, mesh_wp = icosahedron
+    adjacency, adjacency_edges = tw.graph.face_adjacency(mesh_wp.indices, return_edges=True)
+    assert tw.characteristics.is_vertex_manifold(
+        mesh_wp.indices, face_adjacency=adjacency, face_adjacency_edges=adjacency_edges
+    ) == tw.characteristics.is_vertex_manifold(mesh_wp.indices)
+    with pytest.raises(ValueError, match="together"):
+        tw.characteristics.is_vertex_manifold(mesh_wp.indices, face_adjacency=adjacency)
+
+
+def test_is_watertight_is_volume_precomputed_shortcut(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    _, mesh_wp = icosahedron
+    edges = tw.edges.faces_to_edges(mesh_wp.indices)
+    edges_sorted = tw.edges.faces_to_edges(mesh_wp.indices, sorted=True)
+    assert tw.characteristics.is_watertight(
+        mesh_wp.points, mesh_wp.indices, edges_sorted=edges_sorted
+    ) == tw.characteristics.is_watertight(mesh_wp.points, mesh_wp.indices)
+    assert tw.characteristics.is_volume(
+        mesh_wp.points, mesh_wp.indices, edges=edges, edges_sorted=edges_sorted
+    ) == tw.characteristics.is_volume(mesh_wp.points, mesh_wp.indices)
+
+
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 def test_is_vertex_manifold(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)

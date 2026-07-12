@@ -10,7 +10,6 @@ See [`remove_unreferenced_vertices`][triwarp.repair.remove_unreferenced_vertices
 
 from __future__ import annotations
 
-import numpy as np
 import warp as wp
 
 import triwarp as tw
@@ -153,62 +152,71 @@ def resolve_duplicated_faces(
         Original face indices into the input ``faces`` buffer.
     """
     n_faces = int(faces.shape[0]) // 3
+    device = faces.device
     if n_faces == 0:
-        empty = wp.empty(0, dtype=wp.int32, device=faces.device)
+        empty = wp.empty(0, dtype=wp.int32, device=device)
         return empty, empty
 
     faces2d = faces.reshape((-1, 3))
     unique_faces_wp, inverse = unique_faces(faces, return_inverse=True)
+    num_unique = int(unique_faces_wp.shape[0]) // 3
 
-    faces_np = faces2d.numpy()
-    unique_np = unique_faces_wp.numpy().reshape(-1, 3)
-    inverse_np = inverse.numpy()
+    # Per-group orientation stats scattered on device: member/signed counts plus the smallest
+    # member index of each sign class (seeded with the ``n_faces`` sentinel).
+    member_count = wp.zeros(num_unique, dtype=wp.int32, device=device)
+    signed_count = wp.zeros(num_unique, dtype=wp.int32, device=device)
+    first_member = wp.full(num_unique, n_faces, dtype=wp.int32, device=device)
+    first_positive = wp.full(num_unique, n_faces, dtype=wp.int32, device=device)
+    first_negative = wp.full(num_unique, n_faces, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_repair.scatter_duplicate_face_stats,
+        dim=n_faces,
+        inputs=[
+            faces,
+            unique_faces_wp,
+            inverse,
+            member_count,
+            signed_count,
+            first_member,
+            first_positive,
+            first_negative,
+        ],
+        device=device,
+    )
 
-    num_unique = int(unique_np.shape[0])
-    kept: list[int] = []
-    for ui in range(num_unique):
-        member = np.flatnonzero(inverse_np == ui)
-        urow = unique_np[ui]
-        signed_ids: list[int] = []
-        count = 0
-        for fi in member:
-            row = faces_np[fi]
-            consistent = (
-                (row[0] == urow[0] and row[1] == urow[1] and row[2] == urow[2])
-                or (row[0] == urow[1] and row[1] == urow[2] and row[2] == urow[0])
-                or (row[0] == urow[2] and row[1] == urow[0] and row[2] == urow[1])
-            )
-            signed = int(fi + 1) if consistent else -int(fi + 1)
-            signed_ids.append(signed)
-            count += 1 if consistent else -1
+    keep = wp.empty(num_unique, dtype=wp.int32, device=device)
+    error_group = wp.full(1, num_unique, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_repair.resolve_duplicate_groups,
+        dim=num_unique,
+        inputs=[
+            member_count,
+            signed_count,
+            first_member,
+            first_positive,
+            first_negative,
+            keep,
+            error_group,
+        ],
+        device=device,
+    )
+    first_error = int(error_group.numpy()[0])
+    if first_error < num_unique:
+        count = int(signed_count[first_error : first_error + 1].numpy()[0])
+        raise ValueError(
+            f"resolve_duplicated_faces: non-orientable duplicate face group {first_error} "
+            f"with signed count {count}"
+        )
 
-        if member.size == 1:
-            kept.append(int(member[0]))
-            continue
-        if count == 1:
-            for fid in signed_ids:
-                if fid > 0:
-                    kept.append(fid - 1)
-                    break
-        elif count == -1:
-            for fid in signed_ids:
-                if fid < 0:
-                    kept.append(-fid - 1)
-                    break
-        elif count == 0:
-            continue
-        else:
-            raise ValueError(
-                f"resolve_duplicated_faces: non-orientable duplicate face group {ui} "
-                f"with signed count {count}"
-            )
-
-    device = faces.device
-    if len(kept) == 0:
+    # Compact kept decisions in ascending group order (matches the reference emission order).
+    keep_mask = wp.empty(num_unique, dtype=wp.bool, device=device)
+    wp.map(kernel_array.greater_equal, keep, wp.int32(0), out=keep_mask)
+    kept_slots = tw.array.flatnonzero(keep_mask)
+    if int(kept_slots.shape[0]) == 0:
         empty = wp.empty(0, dtype=wp.int32, device=device)
         return empty, empty
 
-    kept_wp = wp.array(np.asarray(kept, dtype=np.int32), dtype=wp.int32, device=device)
+    kept_wp = tw.array.gather(keep, kept_slots)
     resolved = tw.array.gather(faces2d, kept_wp).reshape((-1,))
     return resolved, kept_wp
 

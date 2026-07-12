@@ -42,9 +42,7 @@ def first_hit_append(
 
 
 @wp.func
-def any_hit(
-    mesh_id: wp.uint64, origin: wp.vec3, direction: wp.vec3, max_t: wp.float32
-) -> wp.bool:
+def any_hit(mesh_id: wp.uint64, origin: wp.vec3, direction: wp.vec3, max_t: wp.float32) -> wp.bool:
     return wp.mesh_query_ray_anyhit(mesh_id, origin, wp.normalize(direction), max_t)
 
 

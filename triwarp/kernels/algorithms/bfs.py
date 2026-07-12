@@ -1,64 +1,106 @@
 """
 Breadth-first search over a CSR adjacency graph.
 
-Two traversal cores share the leaf helpers in :mod:`triwarp.kernels.array`:
+Two traversal cores:
 
 - :func:`single_source_bfs` — one Warp thread walks the whole graph from a single source using a
   dense ``dist`` array as the visited marker (``dist[node] == -1`` ⇒ unvisited). Run at ``dim=1`` it
   reproduces ``scipy.sparse.csgraph.breadth_first_order`` order/parents/distances exactly when the
   CSR columns are sorted ascending (as produced by :func:`triwarp.graph.edges_to_csr`).
-- :func:`per_source_bfs_collect` — one thread per source, fixed-capacity per-thread sorted
-  ``visited`` scratch. Relocated from the geodesic-ball query, it keeps an optional geometric
-  predicate: with a
-  finite ``radius`` it enqueues only neighbors within ``radius`` of the center (and backfills the
-  nearest out-of-ball vertices up to ``min_count``); with ``radius = +inf`` (and ``min_count = 0``)
-  the predicate is disabled and it becomes a pure topological reachable-set BFS, which the
-  multi-source kernels here use.
+- :func:`per_source_bfs_collect` — one thread per source over caller-provided global-memory
+  scratch rows (a FIFO queue whose emitted prefix is the discovery order, an open-addressing
+  visited hash set, and a small nearest-fallback pool). With a finite ``radius`` it enqueues only
+  neighbors within ``radius`` of the center (and backfills the nearest out-of-ball vertices up to
+  ``min_count``) — the geodesic-ball query.
 """
 
 import warp as wp
 
-from triwarp.constants import FLOAT32_INF_CONSTANT, INT32_MAX_CONSTANT
-from triwarp.kernels import array as kernel_array
+from triwarp.constants import INT64_MAX_CONSTANT
+from triwarp.kernels import unique as kernel_unique
 
-# Fixed per-thread scratch capacity for the per-source BFS (queue, visited, and extras buffers).
-# Local kernel arrays need a compile-time-constant shape; a source whose reachable set exceeds this
-# is clamped and the wrapper warns. 512 comfortably covers observed neighborhoods (~272 on a folded
-# half-torus).
+# Per-source scratch capacities (rows of the wrapper-allocated global-memory pools).
+# ``_PER_SOURCE_MAX_NEIGHBORS`` caps the queue — and therefore the collected set — as before;
+# the visited hash row is power-of-two sized with a 3/4 load-factor fill bound; the extras pool
+# only needs to hold the nearest out-of-ball frontier for the ``min_count`` backfill.
 _PER_SOURCE_MAX_NEIGHBORS = 512
+_VISITED_HASH_CAPACITY = 1024
+_VISITED_MAX_FILL = 768
+_EXTRAS_CAPACITY = 64
 
 
 @wp.func
-def bfs_sorted_insert_unique(
-    arr: wp.array[wp.int32], value: wp.int32, count: wp.int32, out_overflow: wp.array[wp.int32]
-) -> wp.int32:
-    """Insert ``value`` into the sorted prefix of ``arr`` (tail filled with max-int sentinels)."""
-    if count >= arr.shape[0]:
-        wp.atomic_add(out_overflow, 0, 1)
-        return count
-    slot = kernel_array.binary_search_index(arr, value)
-    kernel_array.array_shift_insert(arr, value, slot)
-    return count + 1
+def bfs_visited_insert(
+    visited: wp.array[wp.int32],
+    mask: wp.int32,
+    value: wp.int32,
+    count: wp.int32,
+    out_overflow: wp.array[wp.int32],
+) -> tuple[wp.bool, wp.int32]:
+    """
+    Insert ``value`` into the open-addressing ``visited`` row (empty slots hold ``-1``).
+
+    Returns ``(is_new, new_count)``: ``is_new`` is ``False`` when the value was already present.
+    Beyond the load-factor fill bound the insert is dropped (counted in ``out_overflow``) and the
+    value reads as new, mirroring the old full-buffer behavior where dropped nodes could be
+    revisited.
+    """
+    slot = kernel_unique.hash_slot(value, mask)
+    while True:
+        stored = visited[slot]
+        if stored == value:
+            return False, count
+        if stored == wp.int32(-1):
+            if count >= _VISITED_MAX_FILL:
+                wp.atomic_add(out_overflow, 0, 1)
+                return True, count
+            visited[slot] = value
+            return True, count + 1
+        slot = kernel_unique.next_slot(slot, mask)
 
 
 @wp.func
-def _bfs_extras_push(
+def bfs_extras_push_nearest(
     ext_dist: wp.array[wp.float32],
     ext_idx: wp.array[wp.int32],
     distance: wp.float32,
     neighbor: wp.int32,
     count: wp.int32,
 ) -> wp.int32:
-    """Insert ``(distance, neighbor)`` keeping ``ext_dist`` ascending (distance-only ordering)."""
+    """Keep the ``cap`` nearest candidates: append, or replace the farthest kept one."""
     cap = ext_dist.shape[0]
-    slot = kernel_array.binary_search_index(ext_dist, distance)
-    if slot >= cap:
-        return count  # farther than every kept extra and the buffer is full — drop it
-    kernel_array.array_shift_insert(ext_dist, distance, slot)
-    kernel_array.array_shift_insert(ext_idx, neighbor, slot)
     if count < cap:
+        ext_dist[count] = distance
+        ext_idx[count] = neighbor
         return count + 1
+    farthest = wp.int32(0)
+    farthest_distance = ext_dist[0]
+    for k in range(1, cap):
+        if ext_dist[k] > farthest_distance:
+            farthest_distance = ext_dist[k]
+            farthest = k
+    if distance < farthest_distance:
+        ext_dist[farthest] = distance
+        ext_idx[farthest] = neighbor
     return count
+
+
+@wp.func
+def bfs_extras_pop_nearest(
+    ext_dist: wp.array[wp.float32], ext_idx: wp.array[wp.int32], count: wp.int32
+) -> tuple[wp.int32, wp.int32]:
+    """Remove and return the nearest candidate (swap-remove); caller ensures ``count > 0``."""
+    best = wp.int32(0)
+    best_distance = ext_dist[0]
+    for k in range(1, count):
+        if ext_dist[k] < best_distance:
+            best_distance = ext_dist[k]
+            best = k
+    nearest = ext_idx[best]
+    last = count - 1
+    ext_dist[best] = ext_dist[last]
+    ext_idx[best] = ext_idx[last]
+    return nearest, last
 
 
 @wp.func
@@ -81,36 +123,29 @@ def per_source_bfs_collect(
     """
     BFS over the CSR edge graph from source ``i``; returns the collected count.
 
-    Traverses ``adj_offsets``/``adj_columns`` (FIFO ``queue`` + sorted ``visited`` with binary
-    search). When ``radius`` is finite the traversal is *geodesic* (libigl ``getSphere``): a
-    neighbor is enqueued only when within Euclidean ``radius`` of ``vertices[i]``, and out-of-ball
-    neighbors feed a nearest fallback (``ext_dist``/``ext_idx``) drained to ``min_count``. When
-    ``radius`` is ``+inf`` the geometric predicate is disabled (``vertices`` is never read, so a
-    length-1 placeholder is fine) and this is a pure topological reachable-set BFS; pass
-    ``min_count = 0`` so the fallback never engages. When ``write`` is true, collected vertices are
-    emitted to ``out_flat[base + pos]`` in BFS order. ``queue``, ``visited`` and the extras buffers
-    are caller-allocated fixed-capacity scratch; exceeding capacity increments ``out_overflow``.
+    Traverses ``adj_offsets``/``adj_columns`` with a FIFO ``queue`` (whose emitted prefix is the
+    discovery order) and an O(1) open-addressing ``visited`` hash row — power-of-two length,
+    pre-filled with ``-1`` by the caller before the launch. When ``radius`` is finite the
+    traversal is *geodesic* (libigl ``getSphere``): a neighbor is enqueued only when within
+    Euclidean ``radius`` of the center, and out-of-ball neighbors feed a nearest fallback
+    (``ext_dist``/``ext_idx``) drained to ``min_count``. When ``radius`` is ``+inf`` the
+    geometric predicate is disabled (``vertices`` is never read, so a length-1 placeholder is
+    fine); pass ``min_count = 0`` so the fallback never engages. When ``write`` is true,
+    collected vertices are emitted to ``out_flat[base + pos]`` in BFS order. Exceeding the queue
+    or visited capacity increments ``out_overflow``.
     """
     use_geometry = not wp.isinf(radius)
 
-    visited_cap = visited.shape[0]
     queue_cap = queue.shape[0]
-    extras_cap = ext_dist.shape[0]
-
-    # Fill the unused tail with the largest representable values so real entries always sort before
-    # them and ``binary_search_index`` holds across the whole buffer (sentinels shift off the end).
-    for k in range(visited_cap):
-        visited[k] = INT32_MAX_CONSTANT
-    for k in range(extras_cap):
-        ext_dist[k] = FLOAT32_INF_CONSTANT
-        ext_idx[k] = wp.int32(-1)
+    mask = visited.shape[0] - 1
 
     center = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
     if use_geometry:
         center = vertices[i]
 
-    visited[0] = i
-    visited_n = wp.int32(1)
+    visited_n = wp.int32(0)
+    is_new = wp.bool(True)
+    is_new, visited_n = bfs_visited_insert(visited, mask, i, visited_n, out_overflow)
     queue[0] = i
     q_head = wp.int32(0)
     q_tail = wp.int32(1)
@@ -128,7 +163,8 @@ def per_source_bfs_collect(
         end = adj_offsets[current + 1]
         for k in range(start, end):
             neighbor = adj_columns[k]
-            if kernel_array.binary_search_sorted_contains(visited, neighbor):
+            is_new, visited_n = bfs_visited_insert(visited, mask, neighbor, visited_n, out_overflow)
+            if not is_new:
                 continue
             distance = wp.float32(0.0)
             if use_geometry:
@@ -140,17 +176,11 @@ def per_source_bfs_collect(
                 else:
                     wp.atomic_add(out_overflow, 0, 1)
             elif collected < min_count:
-                ext_n = _bfs_extras_push(ext_dist, ext_idx, distance, neighbor, ext_n)
-            visited_n = bfs_sorted_insert_unique(visited, neighbor, visited_n, out_overflow)
+                ext_n = bfs_extras_push_nearest(ext_dist, ext_idx, distance, neighbor, ext_n)
 
     while ext_n > wp.int32(0) and collected < min_count:
-        cand = ext_idx[0]
-        for k in range(extras_cap - 1):
-            ext_dist[k] = ext_dist[k + 1]
-            ext_idx[k] = ext_idx[k + 1]
-        ext_dist[extras_cap - 1] = FLOAT32_INF_CONSTANT
-        ext_idx[extras_cap - 1] = wp.int32(-1)
-        ext_n -= wp.int32(1)
+        cand = wp.int32(0)
+        cand, ext_n = bfs_extras_pop_nearest(ext_dist, ext_idx, ext_n)
 
         if write:
             out_flat[base + collected] = cand
@@ -160,13 +190,13 @@ def per_source_bfs_collect(
         end = adj_offsets[cand + 1]
         for k in range(start, end):
             neighbor = adj_columns[k]
-            if kernel_array.binary_search_sorted_contains(visited, neighbor):
+            is_new, visited_n = bfs_visited_insert(visited, mask, neighbor, visited_n, out_overflow)
+            if not is_new:
                 continue
             distance = wp.float32(0.0)
             if use_geometry:
                 distance = wp.length(vertices[neighbor] - center)
-            ext_n = _bfs_extras_push(ext_dist, ext_idx, distance, neighbor, ext_n)
-            visited_n = bfs_sorted_insert_unique(visited, neighbor, visited_n, out_overflow)
+            ext_n = bfs_extras_push_nearest(ext_dist, ext_idx, distance, neighbor, ext_n)
 
     return collected
 
@@ -230,66 +260,66 @@ def single_source_bfs_kernel(
 
 
 @wp.kernel
-def multi_source_bfs_count(
-    adj_offsets: wp.array[wp.int32],
-    adj_columns: wp.array[wp.int32],
-    sources: wp.array[wp.int32],
-    out_counts: wp.array[wp.int32],
-    out_overflow: wp.array[wp.int32],
-) -> None:
-    t = int(wp.tid())
-    queue = wp.zeros(shape=_PER_SOURCE_MAX_NEIGHBORS, dtype=wp.int32)
-    visited = wp.zeros(shape=_PER_SOURCE_MAX_NEIGHBORS, dtype=wp.int32)
-    ext_dist = wp.zeros(shape=_PER_SOURCE_MAX_NEIGHBORS, dtype=wp.float32)
-    ext_idx = wp.zeros(shape=_PER_SOURCE_MAX_NEIGHBORS, dtype=wp.int32)
-    vertices = wp.zeros(shape=1, dtype=wp.vec3)
-    dummy = wp.zeros(shape=1, dtype=wp.int32)
-    out_counts[t] = per_source_bfs_collect(
-        sources[t],
-        vertices,
-        adj_offsets,
-        adj_columns,
-        FLOAT32_INF_CONSTANT,
-        wp.int32(0),
-        queue,
-        visited,
-        ext_dist,
-        ext_idx,
-        False,
-        wp.int32(0),
-        dummy,
-        out_overflow,
-    )
+def bfs_seed(source: wp.int32, out_order: wp.array[wp.int32], out_dist: wp.array[wp.int32]) -> None:
+    # dim=1: place the source at order slot 0 with distance 0.
+    _ = int(wp.tid())
+    out_order[0] = source
+    out_dist[source] = wp.int32(0)
 
 
 @wp.kernel
-def multi_source_bfs_neighbors(
+def bfs_expand(
     adj_offsets: wp.array[wp.int32],
     adj_columns: wp.array[wp.int32],
-    sources: wp.array[wp.int32],
-    offsets: wp.array[wp.int32],
-    out_neighbors: wp.array[wp.int32],
-    out_overflow: wp.array[wp.int32],
+    frontier: wp.array[wp.int32],
+    node_count: wp.int64,
+    dist: wp.array[wp.int32],
+    claim_key: wp.array[wp.int64],
+    out_candidates: wp.array[wp.int32],
+    out_candidate_count: wp.array[wp.int32],
 ) -> None:
-    t = int(wp.tid())
-    queue = wp.zeros(shape=_PER_SOURCE_MAX_NEIGHBORS, dtype=wp.int32)
-    visited = wp.zeros(shape=_PER_SOURCE_MAX_NEIGHBORS, dtype=wp.int32)
-    ext_dist = wp.zeros(shape=_PER_SOURCE_MAX_NEIGHBORS, dtype=wp.float32)
-    ext_idx = wp.zeros(shape=_PER_SOURCE_MAX_NEIGHBORS, dtype=wp.int32)
-    vertices = wp.zeros(shape=1, dtype=wp.vec3)
-    per_source_bfs_collect(
-        sources[t],
-        vertices,
-        adj_offsets,
-        adj_columns,
-        FLOAT32_INF_CONSTANT,
-        wp.int32(0),
-        queue,
-        visited,
-        ext_dist,
-        ext_idx,
-        True,
-        offsets[t],
-        out_neighbors,
-        out_overflow,
-    )
+    # Level-synchronous expansion reproducing scipy's FIFO discovery order: thread r (the
+    # dequeue rank of its frontier node) claims each unvisited neighbor v with the composite
+    # key r * n + v. atomic_min keeps the earliest-dequeued parent; only the first claimer
+    # (sentinel seen) appends v to the candidate list, so each node appears exactly once.
+    r = int(wp.tid())
+    u = frontier[r]
+    for k in range(adj_offsets[u], adj_offsets[u + 1]):
+        v = adj_columns[k]
+        if dist[v] == wp.int32(-1):
+            key = wp.int64(r) * node_count + wp.int64(v)
+            previous = wp.atomic_min(claim_key, v, key)
+            if previous == INT64_MAX_CONSTANT:
+                slot = wp.atomic_add(out_candidate_count, 0, 1)
+                out_candidates[slot] = v
+
+
+@wp.kernel
+def bfs_gather_claim_keys(
+    candidates: wp.array[wp.int32], claim_key: wp.array[wp.int64], out_keys: wp.array[wp.int64]
+) -> None:
+    i = int(wp.tid())
+    out_keys[i] = claim_key[candidates[i]]
+
+
+@wp.kernel
+def bfs_finalize_level(
+    frontier_sorted: wp.array[wp.int32],
+    claim_key: wp.array[wp.int64],
+    prev_frontier: wp.array[wp.int32],
+    node_count: wp.int64,
+    level: wp.int32,
+    order_base: wp.int32,
+    out_order: wp.array[wp.int32],
+    out_parent: wp.array[wp.int32],
+    out_dist: wp.array[wp.int32],
+) -> None:
+    # Candidates sorted by claim key = (parent dequeue rank, ascending node id) = exact scipy
+    # FIFO discovery order given ascending CSR columns; the min-rank claimer is scipy's
+    # first-discoverer predecessor.
+    i = int(wp.tid())
+    v = frontier_sorted[i]
+    rank = wp.int32((claim_key[v] - wp.int64(v)) / node_count)
+    out_dist[v] = level
+    out_parent[v] = prev_frontier[rank]
+    out_order[order_base + i] = v

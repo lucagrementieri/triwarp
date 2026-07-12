@@ -82,6 +82,20 @@ def test_edges_unique(bench_case) -> None:
         assert result.shape[1] == 2
 
 
+@pytest.mark.benchmark(group="edges_unique_auto_nv")
+@pytest.mark.benchlibs("triwarp")
+def test_edges_unique_auto_n_vertices(bench_case) -> None:
+    """
+    Time ``edges_unique`` without the ``n_vertices=`` shortcut.
+
+    Exercises the internal vertex-count inference (a full-array host max before the
+    ``n_vertices`` device-reduce fix).
+    """
+    faces = bench_case.faces_wp
+    unique_edges, _ = bench_case.run(lambda: tw.edges.edges_unique(faces))
+    assert unique_edges.shape[1] == 2
+
+
 @pytest.mark.benchmark(group="edges_unique_inverse")
 @pytest.mark.benchlibs("triwarp", "trimesh", "igl")
 def test_edges_unique_inverse(bench_case) -> None:

@@ -20,6 +20,7 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp.constants import TILE_1D
 from triwarp.kernels import proximity as kernel_proximity
+from triwarp.kernels.algorithms import bfs as kernel_bfs
 from triwarp.triangles import face_normals_and_areas
 
 
@@ -27,33 +28,33 @@ def aabb_bounds(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     """
     Axis-aligned bounding box of ``points`` (component-wise min / max).
 
-    The reduction runs on ``points.device`` in ``float32`` via atomic min/max per axis.
+    The reduction runs on ``points.device`` in ``float32`` as a tiled per-column min/max
+    over a zero-copy ``(n, 3)`` scalar view of the ``wp.vec3`` buffer (see
+    [`minmax`][triwarp.reduce.minmax]).
 
     Parameters
     ----------
     points
-        ``(n, 3)`` positions as ``wp.vec3``.
+        ``(n, 3)`` positions as ``wp.vec3``. Must be contiguous (any freshly allocated or
+        ``wp.Mesh``-owned buffer is).
 
     Returns
     -------
     tuple[wp.vec3, wp.vec3]
         ``(min_bound, max_bound)`` with ``min_bound[i] ≤ p[i] ≤ max_bound[i]`` for every
         point ``p`` and axis ``i``. If ``n == 0``, ``min_bound`` is ``(+inf, …)`` and
-        ``max_bound`` is ``(-inf, …)`` (initial reduction buffers unchanged).
+        ``max_bound`` is ``(-inf, …)``.
     """
-    out_min = wp.full(3, math.inf, dtype=wp.float32, device=points.device)
-    out_max = wp.full(3, -math.inf, dtype=wp.float32, device=points.device)
-    wp.launch(
-        kernel_proximity.aabb_bounds,
-        dim=points.shape[0],
-        inputs=[points, out_min, out_max],
-        device=points.device,
+    if int(points.shape[0]) == 0:
+        return (wp.vec3(math.inf, math.inf, math.inf), wp.vec3(-math.inf, -math.inf, -math.inf))
+    components = twt.as_array2d_float32(points.view(wp.float32))
+    min_wp, max_wp = tw.reduce.minmax(components, axis=0)
+    min_np = min_wp.numpy()
+    max_np = max_wp.numpy()
+    return (
+        wp.vec3(float(min_np[0]), float(min_np[1]), float(min_np[2])),
+        wp.vec3(float(max_np[0]), float(max_np[1]), float(max_np[2])),
     )
-    out_min = out_min.list()
-    out_max = out_max.list()
-    min_bound = wp.vec3(out_min[0], out_min[1], out_min[2])
-    max_bound = wp.vec3(out_max[0], out_max[1], out_max[2])
-    return min_bound, max_bound
 
 
 def bvh_from_points(points: wp.array[wp.vec3], leaf_size: int = 4) -> wp.Bvh:
@@ -951,22 +952,42 @@ def query_geodesic_ball(
         device=device,
     )
 
+    # Per-source scratch lives in shared global-memory pools sized for one chunk of sources
+    # (queue rows, an open-addressing visited row pre-filled with -1 per launch, and a small
+    # nearest-fallback pool) instead of ~8 KB of per-thread local arrays.
+    chunk = min(n, 1 << 15)
+    queue_pool = wp.empty(
+        (chunk, kernel_bfs._PER_SOURCE_MAX_NEIGHBORS), dtype=wp.int32, device=device
+    )
+    visited_pool = wp.empty(
+        (chunk, kernel_bfs._VISITED_HASH_CAPACITY), dtype=wp.int32, device=device
+    )
+    ext_dist_pool = wp.empty((chunk, kernel_bfs._EXTRAS_CAPACITY), dtype=wp.float32, device=device)
+    ext_idx_pool = wp.empty((chunk, kernel_bfs._EXTRAS_CAPACITY), dtype=wp.int32, device=device)
+
     overflow = wp.zeros(1, dtype=wp.int32, device=device)
     counts = wp.empty(n, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_proximity.query_geodesic_ball_count,
-        dim=n,
-        inputs=[
-            vertices,
-            adj_offsets,
-            adj_columns,
-            wp.float32(radius),
-            wp.int32(min_count),
-            counts,
-            overflow,
-        ],
-        device=device,
-    )
+    for start in range(0, n, chunk):
+        visited_pool.fill_(-1)
+        wp.launch(
+            kernel_proximity.query_geodesic_ball_count,
+            dim=min(chunk, n - start),
+            inputs=[
+                vertices,
+                adj_offsets,
+                adj_columns,
+                wp.float32(radius),
+                wp.int32(min_count),
+                wp.int32(start),
+                queue_pool,
+                visited_pool,
+                ext_dist_pool,
+                ext_idx_pool,
+                counts,
+                overflow,
+            ],
+            device=device,
+        )
     n_overflow = int(overflow.numpy()[0])
     if n_overflow > 0:
         warnings.warn(
@@ -977,25 +998,33 @@ def query_geodesic_ball(
 
     offsets = wp.empty(n, dtype=wp.int32, device=device)
     wp.utils.array_scan(counts, out_array=offsets, inclusive=False)
-    total = int(offsets.numpy()[-1]) + int(counts.numpy()[-1])
+    # Slice before .numpy(): copy only the two tail scalars, not both full arrays.
+    total = int(offsets[n - 1 :].numpy()[0]) + int(counts[n - 1 :].numpy()[0])
 
     neighbor_indices = wp.empty(total, dtype=wp.int32, device=device)
     overflow.zero_()
-    wp.launch(
-        kernel_proximity.query_geodesic_ball_neighbors,
-        dim=n,
-        inputs=[
-            vertices,
-            adj_offsets,
-            adj_columns,
-            wp.float32(radius),
-            wp.int32(min_count),
-            offsets,
-            neighbor_indices,
-            overflow,
-        ],
-        device=device,
-    )
+    for start in range(0, n, chunk):
+        visited_pool.fill_(-1)
+        wp.launch(
+            kernel_proximity.query_geodesic_ball_neighbors,
+            dim=min(chunk, n - start),
+            inputs=[
+                vertices,
+                adj_offsets,
+                adj_columns,
+                wp.float32(radius),
+                wp.int32(min_count),
+                wp.int32(start),
+                queue_pool,
+                visited_pool,
+                ext_dist_pool,
+                ext_idx_pool,
+                offsets,
+                neighbor_indices,
+                overflow,
+            ],
+            device=device,
+        )
     return neighbor_indices, offsets, reference_neighbors
 
 
@@ -1533,7 +1562,7 @@ def winding_number(
     faces: wp.array[wp.int32],
     query_points: wp.array[wp.vec3],
     *,
-    tiled: bool = False,
+    tiled: bool = True,
 ) -> wp.array[wp.float32]:
     """
     Generalized winding number at each query point (``igl::winding_number``).
@@ -1551,11 +1580,12 @@ def winding_number(
     query_points
         ``(m,)`` query positions in space as ``wp.vec3``.
     tiled
-        When ``True``, sum solid angles with a per-query tiled reduction over
+        When ``True`` (default), sum solid angles with a per-query tiled reduction over
         faces: each ``(query, face_tile)`` block assigns one face per lane via
         ``wp.tile``, cooperatively reduces with ``wp.tile_sum``, and
         accumulates via ``wp.tile_atomic_add``. When ``False``, each query thread
-        loops over all faces serially.
+        loops over all faces serially — orders of magnitude slower on large meshes,
+        but the fixed left-to-right summation makes it the exact-sum reference.
 
     Returns
     -------
@@ -1654,12 +1684,51 @@ def max_tangent_sphere(
     n_verts = int(mesh.points.shape[0])
     radii = wp.empty(m, dtype=wp.float32, device=device)
     not_converged = wp.empty(m, dtype=wp.bool, device=device)
+    needs_support = wp.empty(m, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_proximity.init_sphere_radii,
+        kernel_proximity.init_sphere_radii_finite,
         dim=m,
-        inputs=[mesh.points, wp.int32(n_verts), points, ray_dirs, distances, radii, not_converged],
+        inputs=[distances, radii, not_converged, needs_support],
         device=device,
     )
+    # Escaped rays (typically exterior/reach queries) need the support point of the vertex
+    # cloud in the ray direction. Compact them first — interior queries usually leave the
+    # subset empty — then run one grid-stride packed-argmax pass over the vertices for just
+    # that subset instead of a serial all-vertices loop per query thread.
+    support_indices = tw.array.flatnonzero(needs_support)
+    k = int(support_indices.shape[0])
+    if k > 0:
+        n_vert_tiles = (n_verts + TILE_1D - 1) // TILE_1D
+        stride_blocks = min(n_vert_tiles, 64)
+        packed_support = wp.zeros(k, dtype=wp.uint64, device=device)
+        wp.launch_tiled(
+            kernel_proximity.support_argmax_tiled,
+            dim=[k, stride_blocks],
+            inputs=[
+                mesh.points,
+                wp.int32(n_verts),
+                wp.int32(stride_blocks),
+                ray_dirs,
+                support_indices,
+                packed_support,
+            ],
+            block_dim=TILE_1D,
+            device=device,
+        )
+        wp.launch(
+            kernel_proximity.init_sphere_radii_support,
+            dim=k,
+            inputs=[
+                mesh.points,
+                points,
+                ray_dirs,
+                support_indices,
+                packed_support,
+                radii,
+                not_converged,
+            ],
+            device=device,
+        )
 
     centers = wp.empty(m, dtype=wp.vec3, device=device)
     wp.map(kernel_proximity.sphere_center, points, ray_dirs, radii, out=centers)
@@ -1668,24 +1737,27 @@ def max_tangent_sphere(
     D = float(wp.length(mesh_max - mesh_min))  # noqa: N806
     convergence_threshold = wp.float32(threshold * D)
 
-    n_iter = 0
-    while n_iter < max_iter:
+    # All per-iteration buffers are preallocated once and ping-ponged (the step kernel writes
+    # every lane, passing converged state through). The convergence count is checked every
+    # iteration on purpose: an extra iteration runs a full BVH closest-point pass, far more
+    # expensive than the 8-byte readback the check costs.
+    n_pts_wp = wp.empty(m, dtype=wp.vec3, device=device)
+    n_dists_wp = wp.empty(m, dtype=wp.float32, device=device)
+    n_face_wp = wp.empty(m, dtype=wp.int32, device=device)
+    new_radii = wp.empty(m, dtype=wp.float32, device=device)
+    new_centers = wp.empty(m, dtype=wp.vec3, device=device)
+    new_nc = wp.empty(m, dtype=wp.bool, device=device)
+
+    for _ in range(max_iter):
         if tw.reduce.sum(not_converged) == 0:
             break
 
-        n_pts_wp = wp.empty(m, dtype=wp.vec3, device=device)
-        n_dists_wp = wp.empty(m, dtype=wp.float32, device=device)
-        n_face_wp = wp.empty(m, dtype=wp.int32, device=device)
         wp.launch(
             kernel_proximity.closest_point_on_mesh,
             dim=m,
             inputs=[mesh.id, centers, wp.float32(max_t), n_pts_wp, n_dists_wp, n_face_wp],
             device=device,
         )
-
-        new_radii = wp.clone(radii)
-        new_centers = wp.clone(centers)
-        new_nc = wp.clone(not_converged)
         wp.launch(
             kernel_proximity.step_sphere_shrink,
             dim=m,
@@ -1704,10 +1776,9 @@ def max_tangent_sphere(
             ],
             device=device,
         )
-        radii = new_radii
-        centers = new_centers
-        not_converged = new_nc
-        n_iter += 1
+        radii, new_radii = new_radii, radii
+        centers, new_centers = new_centers, centers
+        not_converged, new_nc = new_nc, not_converged
 
     return centers, radii
 

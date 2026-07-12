@@ -5,6 +5,7 @@ from typing import Literal
 import warp as wp
 
 import triwarp.typing as twt
+from triwarp.constants import TILE_1D
 from triwarp.kernels import triangles as kernel_triangles
 
 
@@ -101,18 +102,20 @@ def centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.vec3:
     device = vertices.device
     out_centroid = wp.zeros(3, dtype=wp.float32, device=device)
     out_total_area = wp.zeros(1, dtype=wp.float32, device=device)
-    wp.launch(
+    n_tiles = (f + TILE_1D - 1) // TILE_1D
+    wp.launch_tiled(
         kernel_triangles.centroid,
-        dim=f,
-        inputs=[vertices, faces, out_centroid, out_total_area],
+        dim=[n_tiles],
+        inputs=[vertices, faces, wp.int32(f), out_centroid, out_total_area],
+        block_dim=TILE_1D,
         device=device,
     )
     centroid = out_centroid.numpy()
-    total_area = out_total_area.numpy().item()
+    total_area = float(out_total_area.numpy()[0])
     return wp.vec3(
-        float(centroid[0] / total_area),
-        float(centroid[1] / total_area),
-        float(centroid[2] / total_area),
+        float(centroid[0]) / total_area,
+        float(centroid[1]) / total_area,
+        float(centroid[2]) / total_area,
     )
 
 

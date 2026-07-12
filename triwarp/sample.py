@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import math
 import secrets
+from typing import cast
 
 import numpy as np
 import warp as wp
 
 import triwarp as tw
-from triwarp.array import append, concatenate, flatnonzero, gather, init_sort_pair_indices
+import triwarp.typing as twt
+from triwarp.array import append, flatnonzero, gather, init_sort_pair_indices
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import sample as kernel_sample
 from triwarp.kernels.algorithms import blue_noise as kernel_blue_noise
@@ -348,18 +350,14 @@ def _bridson_blue_noise(
     rr = wp.float32(radius * radius)
     four_rr = wp.float32(4.0 * radius * radius)
 
-    pts_np = pool_points.numpy()
-    bbox_min = wp.vec3(*pts_np.min(axis=0).astype(np.float32))
+    # Bounding-box min and grid extent via device reductions (no full-pool host copies).
+    bbox_min, _ = tw.proximity.aabb_bounds(pool_points)
 
     grid_coords = wp.empty(nx, dtype=wp.vec3i, device=device)
     wp.map(kernel_blue_noise.grid_coord, pool_points, bbox_min, inv_cell_size, out=grid_coords)
 
-    comp = wp.empty(nx, dtype=wp.int32, device=device)
-    max_coord = 0
-    for axis in (0, 1, 2):
-        wp.map(kernel_blue_noise.grid_component, grid_coords, wp.int32(axis), out=comp)
-        max_coord = max(max_coord, tw.reduce.max(comp))
-    grid_w = int(max_coord) + 1
+    coord_components = cast(twt.Array2dInt32, grid_coords.view(wp.int32))
+    grid_w = int(tw.reduce.max(coord_components)) + 1
 
     cell_keys = wp.empty(nx, dtype=wp.int64, device=device)
     wp.map(kernel_blue_noise.grid_cell_key, grid_coords, wp.int32(grid_w), out=cell_keys)
@@ -384,28 +382,37 @@ def _bridson_blue_noise(
     selected = wp.full(n_cells, -1, dtype=wp.int32, device=device)
     cand_alive = wp.ones(nx, dtype=wp.bool, device=device)
 
-    has_candidates = wp.empty(n_cells, dtype=wp.bool, device=device)
     seed_cursor = 0
-    active = wp.empty(0, dtype=wp.int32, device=device)
-    collected_chunks: list[wp.array[wp.int32]] = []
+    winner = wp.empty(1, dtype=wp.int32, device=device)
+    seed_state = wp.empty(2, dtype=wp.int32, device=device)
 
-    def _try_seed() -> bool:
-        nonlocal seed_cursor, active
-        wp.launch(
-            kernel_blue_noise.mark_empty_candidate_cells,
-            dim=n_cells,
-            inputs=[cell_offsets, selected, has_candidates],
-            device=device,
-        )
-        has_np = has_candidates.numpy()
+    def _try_seed() -> wp.array[wp.int32] | None:
+        # Parallel scan for the lowest seedable cell at/after the cursor (a read-only dry run
+        # of the activation predicate), then a single-thread commit of the winner: one packed
+        # 8-byte host read per drain event instead of a dim=1 launch + sync per scanned cell.
+        nonlocal seed_cursor
         while seed_cursor < n_cells:
-            if not bool(has_np[seed_cursor]):
-                seed_cursor += 1
-                continue
-            out_spawned = wp.empty(1, dtype=wp.int32, device=device)
-            out_success = wp.zeros(1, dtype=wp.int32, device=device)
+            winner.fill_(n_cells)
             wp.launch(
-                kernel_blue_noise.bridson_seed_cell,
+                kernel_blue_noise.bridson_seed_scan,
+                dim=n_cells - seed_cursor,
+                inputs=[
+                    pool_points,
+                    grid_coords,
+                    sorted_pool_idx,
+                    cell_offsets,
+                    selected,
+                    unique_keys,
+                    cand_alive,
+                    wp.int32(grid_w),
+                    rr,
+                    wp.int32(seed_cursor),
+                    winner,
+                ],
+                device=device,
+            )
+            wp.launch(
+                kernel_blue_noise.bridson_seed_commit,
                 dim=1,
                 inputs=[
                     pool_points,
@@ -418,20 +425,23 @@ def _bridson_blue_noise(
                     wp.int32(grid_w),
                     rr,
                     four_rr,
-                    wp.int32(seed_cursor),
-                    out_spawned,
-                    out_success,
+                    wp.int32(n_cells),
+                    winner,
+                    seed_state,
                 ],
                 device=device,
             )
-            if int(out_success.numpy()[0]) != 0:
-                active = wp.array([int(out_spawned.numpy()[0])], dtype=wp.int32, device=device)
-                seed_cursor += 1
-                return True
-            seed_cursor += 1
-        return False
+            state_np = seed_state.numpy()
+            if int(state_np[0]) >= n_cells:
+                seed_cursor = n_cells
+                return None
+            seed_cursor = int(state_np[0]) + 1
+            if int(state_np[1]) >= 0:
+                return wp.clone(seed_state[1:2])
+        return None
 
-    if not _try_seed():
+    active = _try_seed()
+    if active is None:
         return (
             wp.empty(0, dtype=wp.vec3, device=device),
             wp.empty(0, dtype=wp.int32, device=device),
@@ -442,7 +452,8 @@ def _bridson_blue_noise(
     while round_idx < max_rounds:
         active_count = int(active.shape[0])
         if active_count == 0:
-            if not _try_seed():
+            active = _try_seed()
+            if active is None:
                 break
             round_idx += 1
             continue
@@ -472,30 +483,43 @@ def _bridson_blue_noise(
             device=device,
         )
 
-        staying_mask = wp.empty(active_count, dtype=wp.bool, device=device)
-        wp.map(kernel_array.equal, retire, wp.int32(0), out=staying_mask)
-        spawned_mask = wp.empty(active_count, dtype=wp.bool, device=device)
-        wp.map(kernel_array.greater_equal, spawned, wp.int32(0), out=spawned_mask)
-
-        retire_bool = wp.empty(active_count, dtype=wp.bool, device=device)
-        wp.utils.array_cast(retire, retire_bool)
-
-        staying_active = gather(active, flatnonzero(staying_mask))
-        new_spawned = gather(spawned, flatnonzero(spawned_mask))
-        retired = gather(active, flatnonzero(retire_bool))
-        if int(retired.shape[0]) > 0:
-            collected_chunks.append(retired)
-        active = concatenate([staying_active, new_spawned])
+        # Survivors (retire == 0) and fresh spawns compact into the next active list with one
+        # scan + one scatter: a single small host read per round instead of three
+        # flatnonzero/gather passes plus a concatenate.
+        flags = wp.empty(2 * active_count, dtype=wp.int32, device=device)
+        wp.map(kernel_blue_noise.is_zero_int32, retire, out=flags[:active_count])
+        wp.map(kernel_blue_noise.is_nonnegative_int32, spawned, out=flags[active_count:])
+        positions = wp.empty(2 * active_count, dtype=wp.int32, device=device)
+        wp.utils.array_scan(flags, out_array=positions, inclusive=False)
+        tail = 2 * active_count - 1
+        total = int(positions[tail:].numpy()[0]) + int(flags[tail:].numpy()[0])
+        if total == 0:
+            active = wp.empty(0, dtype=wp.int32, device=device)
+            round_idx += 1
+            continue
+        next_active = wp.empty(total, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_blue_noise.compact_active_and_spawned,
+            dim=2 * active_count,
+            inputs=[active, spawned, flags, positions, next_active],
+            device=device,
+        )
+        active = next_active
         round_idx += 1
 
-    if len(collected_chunks) == 0:
+    # Every activated point was committed into ``selected`` at claim time (atomic CAS), so the
+    # result is exactly the non-empty cells — including points still active at the round cap,
+    # which the retirement-order bookkeeping used to drop.
+    selected_mask = wp.empty(n_cells, dtype=wp.bool, device=device)
+    wp.map(kernel_array.greater_equal, selected, wp.int32(0), out=selected_mask)
+    kept_cells = flatnonzero(selected_mask)
+    if int(kept_cells.shape[0]) == 0:
         return (
             wp.empty(0, dtype=wp.vec3, device=device),
             wp.empty(0, dtype=wp.int32, device=device),
         )
-
-    collected_indices = concatenate(collected_chunks)
-    return gather(pool_points, collected_indices), gather(pool_faces, collected_indices)
+    kept = gather(selected, kept_cells)
+    return gather(pool_points, kept), gather(pool_faces, kept)
 
 
 def sample_surface_blue_noise(

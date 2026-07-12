@@ -243,8 +243,69 @@ def bridson_step(
         out_retire[tid] = wp.int32(1)
 
 
+@wp.func
+def cell_has_far_candidate(
+    pool_points: wp.array[wp.vec3],
+    grid_coords: wp.array[wp.vec3i],
+    sorted_pool_idx: wp.array[wp.int32],
+    cell_offsets: wp.array[wp.int32],
+    selected: wp.array[wp.int32],
+    unique_keys: wp.array[wp.int64],
+    cand_alive: wp.array[wp.bool],
+    grid_w: wp.int32,
+    rr: wp.float32,
+    cell_idx: wp.int32,
+) -> wp.bool:
+    # Read-only dry run of ``try_activate_cell``'s success condition: an empty cell with at
+    # least one alive candidate that is far enough from every committed point. No pruning and
+    # no CAS, so it is safe to evaluate for every cell in parallel against frozen state.
+    if selected[cell_idx] >= wp.int32(0):
+        return False
+    start = int(cell_offsets[cell_idx])
+    end = int(cell_offsets[cell_idx + 1])
+    for k in range(start, end):
+        mi = int(sorted_pool_idx[k])
+        if not cand_alive[mi]:
+            continue
+        if far_enough(pool_points, grid_coords, selected, unique_keys, grid_w, rr, mi):
+            return True
+    return False
+
+
 @wp.kernel
-def bridson_seed_cell(
+def bridson_seed_scan(
+    pool_points: wp.array[wp.vec3],
+    grid_coords: wp.array[wp.vec3i],
+    sorted_pool_idx: wp.array[wp.int32],
+    cell_offsets: wp.array[wp.int32],
+    selected: wp.array[wp.int32],
+    unique_keys: wp.array[wp.int64],
+    cand_alive: wp.array[wp.bool],
+    grid_w: wp.int32,
+    rr: wp.float32,
+    cursor: wp.int32,
+    out_winner: wp.array[wp.int32],
+) -> None:
+    # One thread per remaining cell: the lowest-indexed seedable cell wins, matching the
+    # sequential cursor scan exactly (failed cells' candidate pruning was a side effect only).
+    c = cursor + wp.int32(wp.tid())
+    if cell_has_far_candidate(
+        pool_points,
+        grid_coords,
+        sorted_pool_idx,
+        cell_offsets,
+        selected,
+        unique_keys,
+        cand_alive,
+        grid_w,
+        rr,
+        c,
+    ):
+        wp.atomic_min(out_winner, 0, c)
+
+
+@wp.kernel
+def bridson_seed_commit(
     pool_points: wp.array[wp.vec3],
     grid_coords: wp.array[wp.vec3i],
     sorted_pool_idx: wp.array[wp.int32],
@@ -255,41 +316,60 @@ def bridson_seed_cell(
     grid_w: wp.int32,
     rr: wp.float32,
     four_rr: wp.float32,
-    cell_idx: wp.int32,
-    out_spawned: wp.array[wp.int32],
-    out_success: wp.array[wp.int32],
+    n_cells: wp.int32,
+    winner: wp.array[wp.int32],
+    out_seed: wp.array[wp.int32],
 ) -> None:
+    # Single-thread commit of the scan winner (``out_seed`` = [winning cell, spawned pool
+    # index or -1]); state is frozen between scan and commit, so the activation succeeds.
     if int(wp.tid()) != 0:
         return
-    mi = try_activate_cell(
-        pool_points,
-        grid_coords,
-        sorted_pool_idx,
-        cell_offsets,
-        selected,
-        unique_keys,
-        cand_alive,
-        grid_w,
-        rr,
-        four_rr,
-        INVALID,
-        cell_idx,
-    )
-    if mi >= wp.int32(0):
-        out_spawned[0] = mi
-        out_success[0] = wp.int32(1)
-    else:
-        out_spawned[0] = INVALID
-        out_success[0] = wp.int32(0)
+    c = winner[0]
+    out_seed[0] = c
+    out_seed[1] = INVALID
+    if c < n_cells:
+        out_seed[1] = try_activate_cell(
+            pool_points,
+            grid_coords,
+            sorted_pool_idx,
+            cell_offsets,
+            selected,
+            unique_keys,
+            cand_alive,
+            grid_w,
+            rr,
+            four_rr,
+            INVALID,
+            c,
+        )
+
+
+@wp.func
+def is_zero_int32(value: wp.int32) -> wp.int32:
+    return wp.where(value == wp.int32(0), wp.int32(1), wp.int32(0))
+
+
+@wp.func
+def is_nonnegative_int32(value: wp.int32) -> wp.int32:
+    return wp.where(value >= wp.int32(0), wp.int32(1), wp.int32(0))
 
 
 @wp.kernel
-def mark_empty_candidate_cells(
-    cell_offsets: wp.array[wp.int32],
-    selected: wp.array[wp.int32],
-    out_has_candidates: wp.array[wp.bool],
+def compact_active_and_spawned(
+    active: wp.array[wp.int32],
+    spawned: wp.array[wp.int32],
+    flags: wp.array[wp.int32],
+    positions: wp.array[wp.int32],
+    out_next_active: wp.array[wp.int32],
 ) -> None:
-    c = int(wp.tid())
-    out_has_candidates[c] = selected[c] < wp.int32(0) and cell_offsets[c + 1] > cell_offsets[c]
-
-
+    # Scatter the surviving actives (first half of ``flags``) and fresh spawns (second half)
+    # into their scanned positions: one kernel replaces the per-round flatnonzero/gather/
+    # concatenate cascade (order matches the old staying-then-spawned concatenation).
+    t = int(wp.tid())
+    if flags[t] == 0:
+        return
+    k = active.shape[0]
+    if t < k:
+        out_next_active[positions[t]] = active[t]
+    else:
+        out_next_active[positions[t]] = spawned[t - k]

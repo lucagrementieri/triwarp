@@ -13,6 +13,8 @@ TOLERANCE_ZERO_CONSTANT = wp.constant(wp.float32(TOLERANCE_ZERO))
 # Largest representable values, usable as "sorts last" sentinels inside kernels (computing them
 # here in Python scope avoids the literals Warp cannot evaluate at kernel scope).
 INT32_MAX_CONSTANT = wp.constant(wp.int32(2**31 - 1))
+INT64_MAX = 2**63 - 1
+INT64_MAX_CONSTANT = wp.constant(wp.int64(INT64_MAX))
 FLOAT32_INF_CONSTANT = wp.constant(wp.INF)
 
 PI = wp.constant(wp.PI)

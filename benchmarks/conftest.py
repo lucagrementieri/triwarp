@@ -86,6 +86,14 @@ MESHES: list[MeshSpec] = [
     _mesh("lucy", "lucy.ply", 28_055_742),
 ]
 MESHES_BY_NAME = {mesh["name"]: mesh for mesh in MESHES}
+MESH_ORDER = [mesh["name"] for mesh in MESHES]
+
+
+def skip_larger_than(bench_case: BenchCase, largest: str, reason: str = "") -> None:
+    """Skip the current case when its mesh is larger than ``largest`` (registry order)."""
+    if MESH_ORDER.index(bench_case.mesh_name) > MESH_ORDER.index(largest):
+        pytest.skip(reason or f"{bench_case.mesh_name} is larger than the {largest} cap")
+
 
 # ``cpu_bound`` marks references that only ever run on the CPU (the baselines), so the harness
 # can skip them on the largest meshes by default.

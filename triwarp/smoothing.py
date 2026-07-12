@@ -6,9 +6,12 @@ import warp as wp
 import warp.optim.linear as wpl
 import warp.sparse as wps
 
+import triwarp as tw
 from triwarp import laplacian
+from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import laplacian as kernel_laplacian
+from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import smoothing as kernel_smoothing
 from triwarp.triangles import face_normals_and_areas
 from triwarp.vertices import mean_vertex_normals
@@ -41,14 +44,25 @@ def _apply_operator(
 
 def _mesh_volume(positions: wp.array[wp.vec3d], faces: wp.array[wp.int32]) -> float:
     n_faces = int(faces.shape[0]) // 3
-    volumes = wp.empty(n_faces, dtype=wp.float64, device=positions.device)
+    device = positions.device
+    volumes = wp.empty(n_faces, dtype=wp.float64, device=device)
     wp.launch(
         kernel_smoothing.signed_tet_volumes,
         dim=n_faces,
         inputs=[positions, faces, volumes],
-        device=positions.device,
+        device=device,
     )
-    return float(volumes.numpy().sum())
+    # Device-side tiled sum: only the 8-byte total crosses to the host, not the whole array.
+    total = wp.zeros(1, dtype=wp.float64, device=device)
+    n_tiles = (n_faces + TILE_1D - 1) // TILE_1D
+    wp.launch_tiled(
+        kernel_reduce.sum1d_tiled,
+        dim=[n_tiles],
+        inputs=[volumes, total],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    return float(total.numpy()[0])
 
 
 def _apply_volume_constraint(
@@ -476,32 +490,50 @@ def filter_mut_dif_laplacian(
     face_normals, areas = face_normals_and_areas(vertices, faces)
     normals = mean_vertex_normals(n, faces, face_normals)
     vol_ini = _mesh_volume(positions, faces) if volume_constraint else 0.0
-    eps = 0.01 * float(areas.numpy().max()) ** 0.5 if volume_constraint else 0.0
+    eps = 0.01 * float(tw.reduce.max(areas)) ** 0.5 if volume_constraint else 0.0
 
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
     adil = wp.empty(n, dtype=wp.float64, device=device)
+    adil_sum = wp.zeros(1, dtype=wp.float64, device=device)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
     probe = wp.empty(n, dtype=wp.vec3d, device=device) if volume_constraint else None
     slope = 0.0
+    inv_n = wp.float64(1.0 / n)
+    n_tiles = (n + TILE_1D - 1) // TILE_1D
+    adil_kernel = wp.map(
+        kernel_smoothing.mut_dif_adil, normals, positions, lv, out=adil, return_kernel=True
+    )
     for index in range(iterations):
+        # The mean diffusion coefficient is reduced on device and consumed by the step kernel
+        # directly, so the loop body issues no host synchronisation.
         _apply_operator(operator, positions, lv)
-        wp.map(kernel_smoothing.mut_dif_adil, normals, positions, lv, out=adil)
-        mean_adil = float(adil.numpy().sum()) / n
-        wp.map(
-            kernel_smoothing.mut_dif_step,
-            positions,
-            lv,
-            adil,
-            wp.float64(mean_adil),
-            wp.float64(lamb),
-            out=nxt,
+        wp.launch(
+            adil_kernel, dim=n, inputs=[normals, positions, lv], outputs=[adil], device=device
+        )
+        adil_sum.zero_()
+        wp.launch_tiled(
+            kernel_reduce.sum1d_tiled,
+            dim=[n_tiles],
+            inputs=[adil, adil_sum],
+            block_dim=TILE_1D,
+            device=device,
+        )
+        wp.launch(
+            kernel_smoothing.mut_dif_step_scaled,
+            dim=n,
+            inputs=[positions, lv, adil, adil_sum, inv_n, wp.float64(lamb)],
+            outputs=[nxt],
+            device=device,
         )
         positions, nxt = nxt, positions
         if volume_constraint:
             vol = _mesh_volume(positions, faces)
             if index == 0:
                 wp.map(
-                    kernel_smoothing.add_scaled_normal, positions, normals, wp.float64(eps),
+                    kernel_smoothing.add_scaled_normal,
+                    positions,
+                    normals,
+                    wp.float64(eps),
                     out=probe,
                 )
                 vol2 = _mesh_volume(probe, faces)

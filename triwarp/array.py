@@ -509,9 +509,11 @@ def flatnonzero(mask: wp.array[wp.bool]) -> wp.array[wp.int32]:
     flags = wp.empty(n, dtype=wp.int32, device=device)
     wp.utils.array_cast(mask, flags)
 
-    exclusive = wp.empty(n, dtype=wp.int32, device=device)
-    wp.utils.array_scan(flags, out_array=exclusive, inclusive=False)
-    n_out = int(exclusive.numpy()[-1]) + int(flags.numpy()[-1])
+    # Inclusive scan: the total is its last element, so one 4-byte tail read sizes the output
+    # (the scatter kernel derives each exclusive position as inclusive[i] - 1).
+    inclusive = wp.empty(n, dtype=wp.int32, device=device)
+    wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
+    n_out = int(inclusive[n - 1 :].numpy()[0])
 
     if n_out == 0:
         return wp.empty(0, dtype=wp.int32, device=device)
@@ -520,7 +522,7 @@ def flatnonzero(mask: wp.array[wp.bool]) -> wp.array[wp.int32]:
     wp.launch(
         kernel_scatter.scatter_index_where,
         dim=n,
-        inputs=[mask, exclusive, out_indices],
+        inputs=[mask, inclusive, out_indices],
         device=device,
     )
     return out_indices
@@ -591,7 +593,7 @@ def trim_to_count(
         One contiguous ``(n_out, *buffer.shape[1:])`` copy per input buffer, in order, each on
         its buffer's device.
     """
-    n_out = int(counter.numpy().item())
+    n_out = int(counter[:1].numpy()[0])
     trimmed = []
     for buffer in buffers:
         out_shape = (n_out, *(int(dim) for dim in buffer.shape[1:]))

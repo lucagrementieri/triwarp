@@ -222,6 +222,33 @@ def test_resolve_duplicated_faces_keep_positive(device: str):
     assert np.array_equal(j_wp.numpy(), j_ref)
 
 
+def test_resolve_duplicated_faces_random(device: str):
+    """Randomized orientable duplicate groups vs the CPU reference (order-insensitive)."""
+    rng = np.random.default_rng(17)
+    pool = np.stack(np.meshgrid(np.arange(12), np.arange(12, 24), np.arange(24, 36)), -1).reshape(
+        -1, 3
+    )
+    base_np = rng.permutation(pool, axis=0)[:300].astype(np.int32)
+    singles = base_np[:100]
+    cancelling = np.vstack([base_np[100:180], base_np[100:180][:, ::-1]])
+    majority_pos = np.vstack([np.repeat(base_np[180:240], 2, axis=0), base_np[180:240][:, ::-1]])
+    faces_np = np.vstack([singles, cancelling, majority_pos])
+    faces_np = rng.permutation(faces_np, axis=0)
+    faces_wp = wp.array(
+        np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
+    )
+
+    f2_wp, j_wp = tw.repair.resolve_duplicated_faces(faces_wp)
+    f2_ref, j_ref = _resolve_duplicated_faces_ref(faces_np)
+
+    # The reference emits groups in lexicographic (np.unique) order while the production path
+    # follows its hash-sorted unique order; the kept sets must agree exactly.
+    assert np.array_equal(np.sort(j_wp.numpy()), np.sort(j_ref))
+    resolved_rows = {tuple(row) for row in f2_wp.numpy().reshape(-1, 3).tolist()}
+    reference_rows = {tuple(row) for row in f2_ref.tolist()}
+    assert resolved_rows == reference_rows
+
+
 def _faces_2d(faces_wp: wp.array) -> np.ndarray:
     return faces_wp.numpy().reshape(-1, 3)
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import warnings
+import itertools
 from collections.abc import Sequence
 from typing import Literal, overload
 
@@ -10,10 +10,15 @@ import warp.sparse as wps
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.array import init_range
+from triwarp.constants import INT64_MAX
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import graph as kernel_graph
 from triwarp.kernels.algorithms import bfs as kernel_bfs
 from triwarp.kernels.algorithms import connected_components as kernel_connected_components
+
+# Below this node count the single-thread BFS kernel wins: the frontier-parallel path pays one
+# launch + sync per BFS level, which dominates on small or path-like graphs.
+_BFS_SERIAL_THRESHOLD = 16_384
 
 
 @overload
@@ -373,12 +378,27 @@ def split(
         return []
 
     face_labels = face_connected_component_labels(faces)
-    unique_labels = tw.unique.unique_1d(face_labels)
+
+    # One stable label sort replaces the per-component isin/flatnonzero full-array passes: the
+    # sort is stable, so faces stay ascending within each component and components ascend by
+    # label — the exact emission order of the previous per-label loop.
+    labels_buffer = wp.empty(2 * n_faces, dtype=wp.int32, device=device)
+    wp.copy(labels_buffer, face_labels, count=n_faces)
+    face_ids = tw.array.init_sort_pair_indices(n_faces, -1, device)
+    wp.utils.radix_sort_pairs(labels_buffer, face_ids, count=n_faces)
+    sorted_labels = wp.clone(labels_buffer[:n_faces])
+    sorted_face_ids = wp.clone(face_ids[:n_faces])
+
+    is_start = wp.empty(n_faces, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_graph.mark_label_starts, dim=n_faces, inputs=[sorted_labels, is_start], device=device
+    )
+    starts_np = tw.array.flatnonzero(is_start).numpy()
+    bounds = [int(start) for start in starts_np] + [n_faces]
 
     meshes: list[tuple[wp.array[wp.vec3], wp.array[wp.int32]]] = []
-    for label in unique_labels.numpy():
-        label_wp = wp.array([int(label)], dtype=wp.int32, device=device)
-        face_indices = tw.array.flatnonzero(tw.array.isin(face_labels, label_wp))
+    for begin, end in itertools.pairwise(bounds):
+        face_indices = wp.clone(sorted_face_ids[begin:end])
         meshes.append(
             tw.selection.submesh_from_face_indices(
                 vertices, faces, face_indices, unique_indices=True
@@ -486,20 +506,26 @@ def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[
         device=device,
     )
 
-    changed = wp.zeros(1, dtype=wp.int32, device=device)
-    incomplete = wp.zeros(1, dtype=wp.int32, device=device)
+    # Both convergence flags live in one length-2 buffer, so each pass costs one 8-byte host
+    # read instead of two or three separate ones. (Batching several hook passes between reads
+    # was measured slower: ECL-CC converges in a handful of passes on meshes, so the extra
+    # whole-graph launches outweigh the saved readbacks.)
+    flags = wp.zeros(2, dtype=wp.int32, device=device)
+    changed = flags[0:1]
+    incomplete = flags[1:2]
     violations = wp.zeros(1, dtype=wp.int32, device=device)
 
+    flags_np = flags.numpy()
     for _ in range(node_count):
-        changed.zero_()
-        incomplete.zero_()
+        flags.zero_()
         wp.launch(
             kernel_connected_components.ecl_hook,
             dim=node_count,
             inputs=[offsets, indices, parents, changed, incomplete],
             device=device,
         )
-        if changed.numpy().item() != 0 or incomplete.numpy().item() != 0:
+        flags_np = flags.numpy()
+        if flags_np[0] != 0 or flags_np[1] != 0:
             continue
 
         violations.zero_()
@@ -511,19 +537,15 @@ def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[
         )
         if violations.numpy().item() == 0:
             return labels
-    else:
-        n_changed = changed.numpy().item()
-        n_incomplete = incomplete.numpy().item()
-        if n_changed != 0 or n_incomplete != 0:
-            raise RuntimeError(
-                f"connected_component_labels: hook passes did not converge "
-                f"after {node_count} iterations"
-            )
-        else:
-            raise RuntimeError(
-                f"connected_component_labels: edge verification failed "
-                f"after {node_count} iterations"
-            )
+
+    if flags_np[0] != 0 or flags_np[1] != 0:
+        raise RuntimeError(
+            f"connected_component_labels: hook passes did not converge "
+            f"after {node_count} iterations"
+        )
+    raise RuntimeError(
+        f"connected_component_labels: edge verification failed after {node_count} iterations"
+    )
 
 
 def connected_component_labels_from_edges(
@@ -680,16 +702,90 @@ def bfs(
     parents = wp.full(node_count, -1, dtype=wp.int32, device=device)
     distances = wp.full(node_count, -1, dtype=wp.int32, device=device)
     order_buffer = wp.empty(node_count, dtype=wp.int32, device=device)
-    reached = wp.zeros(1, dtype=wp.int32, device=device)
 
+    if node_count < _BFS_SERIAL_THRESHOLD:
+        # Small graphs: per-level launch overhead dominates (a path graph runs one level per
+        # node), so the single-thread traversal is faster and trivially order-exact.
+        reached = wp.zeros(1, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_bfs.single_source_bfs_kernel,
+            dim=1,
+            inputs=[wp.int32(source), offsets, columns, order_buffer, parents, distances, reached],
+            device=device,
+        )
+        n_reached = int(reached.numpy()[0])
+        order = wp.clone(order_buffer[:n_reached])
+        return order, parents, distances
+
+    # Level-synchronous frontier BFS that reproduces scipy's FIFO discovery order exactly:
+    # unvisited neighbors are claimed with the key (parent dequeue rank) * n + node via
+    # atomic_min (first-dequeued parent wins, matching scipy's predecessor), and each level's
+    # candidates are radix-sorted by that key — rank-major then ascending node id, which equals
+    # encounter order because the CSR columns are ascending. The sorted level is appended to
+    # ``order_buffer``, whose slices double as the frontiers. One 4-byte sync per level.
+    claim_key = wp.full(node_count, INT64_MAX, dtype=wp.int64, device=device)
+    candidate_buffer = wp.empty(2 * node_count, dtype=wp.int32, device=device)
+    keys_buffer = wp.empty(2 * node_count, dtype=wp.int64, device=device)
+    candidate_count = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_bfs.single_source_bfs_kernel,
+        kernel_bfs.bfs_seed,
         dim=1,
-        inputs=[wp.int32(source), offsets, columns, order_buffer, parents, distances, reached],
+        inputs=[wp.int32(source), order_buffer, distances],
         device=device,
     )
-    n_reached = int(reached.numpy()[0])
-    order = wp.clone(order_buffer[:n_reached])
+
+    node_count_64 = wp.int64(node_count)
+    tail = 1
+    level = 0
+    frontier = order_buffer[0:1]
+    while True:
+        candidate_count.zero_()
+        wp.launch(
+            kernel_bfs.bfs_expand,
+            dim=int(frontier.shape[0]),
+            inputs=[
+                offsets,
+                columns,
+                frontier,
+                node_count_64,
+                distances,
+                claim_key,
+                candidate_buffer,
+                candidate_count,
+            ],
+            device=device,
+        )
+        count = int(candidate_count.numpy()[0])
+        if count == 0:
+            break
+        wp.launch(
+            kernel_bfs.bfs_gather_claim_keys,
+            dim=count,
+            inputs=[candidate_buffer, claim_key, keys_buffer],
+            device=device,
+        )
+        wp.utils.radix_sort_pairs(keys_buffer, candidate_buffer, count=count)
+        level += 1
+        wp.launch(
+            kernel_bfs.bfs_finalize_level,
+            dim=count,
+            inputs=[
+                candidate_buffer,
+                claim_key,
+                frontier,
+                node_count_64,
+                wp.int32(level),
+                wp.int32(tail),
+                order_buffer,
+                parents,
+                distances,
+            ],
+            device=device,
+        )
+        frontier = order_buffer[tail : tail + count]
+        tail += count
+
+    order = wp.clone(order_buffer[:tail])
     return order, parents, distances
 
 
@@ -755,14 +851,16 @@ def bfs_multi_source(
     adjacency: wps.BsrMatrix[wp.Scalar], sources: wp.array[wp.int32]
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
     """
-    Independent BFS reachable sets for many sources, packed as a CSR buffer.
+    Reachable sets for many sources, packed as a CSR buffer.
 
-    One device thread per source runs a topological BFS over ``adjacency`` (the geodesic-ball
-    traversal with its geometric predicate disabled). Source ``sources[k]`` owns
-    ``neighbors[offsets[k] : offsets[k + 1]]``, listed in BFS discovery order (the source itself
-    first). Each thread uses fixed-capacity scratch of ``kernel_bfs._PER_SOURCE_MAX_NEIGHBORS``
-    nodes; a source whose reachable set exceeds that has the surplus dropped and a warning emitted.
-    For a single source with no capacity limit, use [`bfs`][triwarp.graph.bfs].
+    The reachable set of an unbounded traversal is the source's connected component, so this
+    labels components once
+    ([`connected_component_labels`][triwarp.graph.connected_component_labels])
+    and emits each source's component from one label-sorted node array. Source ``sources[k]``
+    owns ``neighbors[offsets[k] : offsets[k + 1]]``, listed with the source itself first and
+    the remaining nodes in ascending index order. There is no reachable-set capacity limit.
+    For BFS discovery order, parents, and distances of a single source, use
+    [`bfs`][triwarp.graph.bfs].
 
     Parameters
     ----------
@@ -810,35 +908,47 @@ def bfs_multi_source(
             f"got min={sources_np.min()} max={sources_np.max()}"
         )
 
-    offsets_csr = adjacency.offsets  # pyright: ignore[reportAttributeAccessIssue]
-    columns = adjacency.columns  # pyright: ignore[reportAttributeAccessIssue]
-
-    overflow = wp.zeros(1, dtype=wp.int32, device=device)
-    counts = wp.empty(k, dtype=wp.int32, device=device)
+    # The reachable set of an unbounded BFS is exactly the source's connected component, so a
+    # single component labeling plus one stable key sort replaces the per-source traversals —
+    # with no per-thread scratch and no reachable-set capacity cap.
+    labels = connected_component_labels(adjacency)
+    n = int(node_count)
+    keys_buffer = wp.empty(2 * n, dtype=wp.int64, device=device)
+    node_ids = tw.array.init_sort_pair_indices(n, -1, device)
     wp.launch(
-        kernel_bfs.multi_source_bfs_count,
-        dim=k,
-        inputs=[offsets_csr, columns, sources, counts, overflow],
+        kernel_graph.pack_label_node_keys,
+        dim=n,
+        inputs=[labels, wp.int64(n), keys_buffer],
         device=device,
     )
-    n_overflow = int(overflow.numpy()[0])
-    if n_overflow > 0:
-        warnings.warn(
-            f"bfs_multi_source: {n_overflow} reachable-set capacity breaches "
-            f"(fixed cap {kernel_bfs._PER_SOURCE_MAX_NEIGHBORS}); surplus nodes dropped.",
-            stacklevel=2,
-        )
+    wp.utils.radix_sort_pairs(keys_buffer, node_ids, count=n)
+    sorted_keys = wp.clone(keys_buffer[:n])
+    sorted_nodes = wp.clone(node_ids[:n])
+    node_rank = wp.empty(n, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_graph.scatter_sorted_positions,
+        dim=n,
+        inputs=[sorted_nodes, node_rank],
+        device=device,
+    )
 
+    segment_start = wp.empty(k, dtype=wp.int32, device=device)
+    counts = wp.empty(k, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_graph.component_segment_bounds,
+        dim=k,
+        inputs=[sources, labels, sorted_keys, wp.int64(n), segment_start, counts],
+        device=device,
+    )
     offsets = wp.empty(k, dtype=wp.int32, device=device)
     wp.utils.array_scan(counts, out_array=offsets, inclusive=False)
-    total = int(offsets.numpy()[-1]) + int(counts.numpy()[-1])
+    total = int(offsets[k - 1 :].numpy()[0]) + int(counts[k - 1 :].numpy()[0])
 
     neighbors = wp.empty(total, dtype=wp.int32, device=device)
-    overflow.zero_()
     wp.launch(
-        kernel_bfs.multi_source_bfs_neighbors,
-        dim=k,
-        inputs=[offsets_csr, columns, sources, offsets, neighbors, overflow],
+        kernel_graph.emit_component_neighbors,
+        dim=total,
+        inputs=[sources, sorted_nodes, node_rank, segment_start, offsets, neighbors],
         device=device,
     )
     return neighbors, offsets

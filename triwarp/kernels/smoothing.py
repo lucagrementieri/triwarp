@@ -48,6 +48,24 @@ def mut_dif_step(
     return v_prev + lamber * (lv - v_prev)
 
 
+@wp.kernel
+def mut_dif_step_scaled(
+    positions: wp.array[wp.vec3d],
+    lv: wp.array[wp.vec3d],
+    adil: wp.array[wp.float64],
+    adil_sum: wp.array[wp.float64],
+    inv_n: wp.float64,
+    lamb: wp.float64,
+    out_next: wp.array[wp.vec3d],
+) -> None:
+    # ``mut_dif_step`` with the mean coefficient read from a device scalar (adil_sum[0] * inv_n),
+    # so the smoothing loop never synchronises with the host. A real kernel rather than wp.map:
+    # the length-1 ``adil_sum`` is a uniform argument, which wp.map cannot broadcast.
+    i = int(wp.tid())
+    mean_adil = adil_sum[0] * inv_n
+    out_next[i] = mut_dif_step(positions[i], lv[i], adil[i], mean_adil, lamb)
+
+
 @wp.func
 def add_scaled_normal(v_prev: wp.vec3d, normal: wp.vec3, scale: wp.float64) -> wp.vec3d:
     # v' = v + scale * N; reused for the eps finite-difference probe and the volume correction.

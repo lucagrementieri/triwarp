@@ -255,6 +255,23 @@ def binary_search_index(values: wp.array[wp.Scalar], value: wp.Scalar) -> wp.int
 
 
 @wp.func
+def binary_search_index_left(values: wp.array[wp.Scalar], value: wp.Scalar) -> wp.int32:
+    """First index i with values[i] >= value, or len(values) (numpy searchsorted side='left')."""
+    n = values.shape[0]
+    left = wp.int32(0)
+    right = n - 1
+    result = n
+    while left <= right:
+        mid = (left + right) // 2
+        if values[mid] >= value:
+            result = mid
+            right = mid - 1
+        else:
+            left = mid + 1
+    return wp.int32(result)
+
+
+@wp.func
 def binary_search_sorted_contains(values: wp.array[wp.Scalar], value: wp.Scalar) -> bool:
     idx = binary_search_index(values, value)
     return idx > wp.int32(0) and values[idx - wp.int32(1)] == value

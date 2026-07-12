@@ -16,6 +16,7 @@ reductions differ only by the ``scale`` passed from Python scope. Following the
 
 import warp as wp
 
+from triwarp.constants import TILE_1D
 from triwarp.kernels.triangles import face_vertices
 
 # Relative coplanarity tolerance for the triangle-interior test, matching
@@ -83,10 +84,19 @@ def chamfer_nn_term(
     Accumulate ``scale * ||x[i] - y[nearest[i]]||^2`` into ``out_loss[0]``.
 
     ``nearest[i]`` is the (fixed, non-differentiable) index in ``y`` closest to ``x[i]``.
+    Launched via ``wp.launch_tiled`` (block ``TILE_1D``): each block reduces its lanes
+    cooperatively and commits one atomic; out-of-range lanes contribute zero. Tile ops carry
+    adjoints, so the kernel stays differentiable under ``wp.Tape``.
     """
-    i = wp.tid()
-    diff = x[i] - y[nearest[i]]
-    wp.atomic_add(out_loss, 0, scale * wp.dot(diff, diff))
+    i, t = wp.tid()
+    idx = i * TILE_1D + int(t)
+    contrib = wp.float32(0.0)
+    if idx < x.shape[0]:
+        diff = x[idx] - y[nearest[idx]]
+        contrib = scale * wp.dot(diff, diff)
+    total = wp.tile_sum(wp.tile(contrib))
+    if t == 0:
+        wp.tile_atomic_add(out_loss, total, (0,))
 
 
 @wp.kernel
@@ -104,9 +114,17 @@ def chamfer_surface_term(
     ``face_id[i]`` is the (fixed, non-differentiable) index of the triangle of the mesh
     closest to ``points[i]``. Gradients flow to both ``points`` and ``vertices``. Points
     with ``face_id[i] < 0`` (no face within the search radius) contribute nothing.
+    Launched via ``wp.launch_tiled`` (block ``TILE_1D``), same reduction shape as
+    [`chamfer_nn_term`][triwarp.kernels.distance.chamfer_nn_term].
     """
-    i = wp.tid()
-    f = face_id[i]
-    if f >= 0:
-        a, b, c = face_vertices(vertices, faces, f)
-        wp.atomic_add(out_loss, 0, scale * point_triangle_sq_dist(points[i], a, b, c))
+    i, t = wp.tid()
+    idx = i * TILE_1D + int(t)
+    contrib = wp.float32(0.0)
+    if idx < points.shape[0]:
+        f = face_id[idx]
+        if f >= 0:
+            a, b, c = face_vertices(vertices, faces, f)
+            contrib = scale * point_triangle_sq_dist(points[idx], a, b, c)
+    total = wp.tile_sum(wp.tile(contrib))
+    if t == 0:
+        wp.tile_atomic_add(out_loss, total, (0,))

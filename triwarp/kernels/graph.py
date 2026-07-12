@@ -65,3 +65,73 @@ def face_adjacency_angles(
     normal_a = face_normals[face_adjacency[tid, 0]]
     normal_b = face_normals[face_adjacency[tid, 1]]
     out_angles[tid] = kernel_array.vector_angle_vec(normal_a, normal_b)
+
+
+@wp.kernel
+def mark_label_starts(sorted_labels: wp.array[wp.int32], out_is_start: wp.array[wp.bool]) -> None:
+    # Segment boundaries of a label-sorted array: position 0 and every label change.
+    i = int(wp.tid())
+    out_is_start[i] = i == 0 or sorted_labels[i] != sorted_labels[i - 1]
+
+
+@wp.kernel
+def pack_label_node_keys(
+    labels: wp.array[wp.int32], node_count: wp.int64, out_keys: wp.array[wp.int64]
+) -> None:
+    # Composite sort key label * n + node: sorting groups nodes by component with node ids
+    # ascending inside each component (keys are strictly increasing within a label).
+    i = int(wp.tid())
+    out_keys[i] = wp.int64(labels[i]) * node_count + wp.int64(i)
+
+
+@wp.kernel
+def component_segment_bounds(
+    sources: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+    sorted_keys: wp.array[wp.int64],
+    node_count: wp.int64,
+    out_segment_start: wp.array[wp.int32],
+    out_counts: wp.array[wp.int32],
+) -> None:
+    # The label-L segment of the sorted key array is exactly
+    # [lower_bound(L*n), lower_bound((L+1)*n)).
+    q = int(wp.tid())
+    label = wp.int64(labels[sources[q]])
+    lo = kernel_array.binary_search_index_left(sorted_keys, label * node_count)
+    hi = kernel_array.binary_search_index_left(sorted_keys, (label + wp.int64(1)) * node_count)
+    out_segment_start[q] = lo
+    out_counts[q] = hi - lo
+
+
+@wp.kernel
+def emit_component_neighbors(
+    sources: wp.array[wp.int32],
+    sorted_nodes: wp.array[wp.int32],
+    node_rank: wp.array[wp.int32],
+    segment_start: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    out_neighbors: wp.array[wp.int32],
+) -> None:
+    # One thread per output slot: slot 0 of each source's range holds the source itself, the
+    # rest list its component's nodes in ascending order (the source's own position skipped).
+    t = int(wp.tid())
+    q = kernel_array.binary_search_index(offsets, wp.int32(t)) - 1
+    rel = t - offsets[q]
+    source = sources[q]
+    if rel == 0:
+        out_neighbors[t] = source
+        return
+    base = segment_start[q]
+    source_position = node_rank[source] - base
+    idx = rel - 1
+    if idx >= source_position:
+        idx = rel
+    out_neighbors[t] = sorted_nodes[base + idx]
+
+
+@wp.kernel
+def scatter_sorted_positions(
+    sorted_nodes: wp.array[wp.int32], out_rank: wp.array[wp.int32]
+) -> None:
+    i = int(wp.tid())
+    out_rank[sorted_nodes[i]] = i

@@ -2,7 +2,7 @@ from typing import Any
 
 import warp as wp
 
-from triwarp.constants import PI, TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
+from triwarp.constants import PI, TILE_1D, TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.array import to_vec3d
 
 
@@ -105,19 +105,33 @@ def angles(
 def centroid(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
-    out_centroid: wp.array[wp.float32],
+    n_faces: wp.int32,
+    out_weighted_centroid: wp.array[wp.float32],
     out_total_area: wp.array[wp.float32],
 ) -> None:
-    f = int(wp.tid())
-    triangle_face = faces[f * 3 : (f + 1) * 3]
-    _, area = face_normals_and_area(vertices, triangle_face)
-    centroid = (
-        vertices[triangle_face[0]] + vertices[triangle_face[1]] + vertices[triangle_face[2]]
-    ) / 3.0
-    wp.atomic_add(out_centroid, 0, centroid[0] * area)
-    wp.atomic_add(out_centroid, 1, centroid[1] * area)
-    wp.atomic_add(out_centroid, 2, centroid[2] * area)
-    wp.atomic_add(out_total_area, 0, area)
+    # Launched via wp.launch_tiled with block_dim=TILE_1D: each lane computes one face's
+    # area-weighted centroid contribution, the block reduces each component cooperatively
+    # with wp.tile_sum, and lane 0 commits four atomics per block (out-of-range lanes
+    # contribute zero).
+    i, t = wp.tid()
+    f = i * TILE_1D + int(t)
+    contrib = wp.vec3(0.0, 0.0, 0.0)
+    area = wp.float32(0.0)
+    if f < int(n_faces):
+        triangle_face = faces[f * 3 : (f + 1) * 3]
+        _, area = face_normals_and_area(vertices, triangle_face)
+        contrib = (
+            vertices[triangle_face[0]] + vertices[triangle_face[1]] + vertices[triangle_face[2]]
+        ) * (area / 3.0)
+    sum_x = wp.tile_sum(wp.tile(contrib[0]))
+    sum_y = wp.tile_sum(wp.tile(contrib[1]))
+    sum_z = wp.tile_sum(wp.tile(contrib[2]))
+    area_sum = wp.tile_sum(wp.tile(area))
+    if t == 0:
+        wp.tile_atomic_add(out_weighted_centroid, sum_x, (0,))
+        wp.tile_atomic_add(out_weighted_centroid, sum_y, (1,))
+        wp.tile_atomic_add(out_weighted_centroid, sum_z, (2,))
+        wp.tile_atomic_add(out_total_area, area_sum, (0,))
 
 
 @wp.kernel

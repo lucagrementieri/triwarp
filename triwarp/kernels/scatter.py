@@ -132,11 +132,13 @@ def scatter_index(index: wp.array[wp.int32], out_scattered: wp.array[wp.int32]) 
 
 @wp.kernel
 def scatter_index_where(
-    mask: wp.array[wp.bool], offset: wp.array[wp.int32], out_scattered: wp.array[wp.int32]
+    mask: wp.array[wp.bool], inclusive: wp.array[wp.int32], out_scattered: wp.array[wp.int32]
 ) -> None:
+    # ``inclusive`` is the inclusive prefix sum of the mask, so a set position lands at
+    # ``inclusive[i] - 1`` (its exclusive-scan value).
     i = int(wp.tid())
     if mask[i]:
-        out_scattered[offset[i]] = wp.int32(i)
+        out_scattered[inclusive[i] - 1] = wp.int32(i)
 
 
 @wp.kernel

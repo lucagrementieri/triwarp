@@ -28,6 +28,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.constants import TILE_1D
 from triwarp.kernels import distance as kernel_distance
 
 _PointReduction = Literal["mean", "sum", "max"]
@@ -382,6 +383,10 @@ def _reduction_scale(point_reduction: _DiffReduction, count: int) -> float:
     return (1.0 / count) if point_reduction == "mean" else 1.0
 
 
+def _loss_tiles(count: int) -> int:
+    return (count + TILE_1D - 1) // TILE_1D
+
+
 def _zero_loss(device: wp.DeviceLike) -> twt.Array1dFloat32:
     zeros = wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True)
     return cast(twt.Array1dFloat32, zeros)
@@ -451,17 +456,19 @@ def chamfer_points_to_points_loss(
         nearest_yx = tw.proximity.query_hashgrid_nearest(x, y, k=1)[0]
 
     def _record() -> None:
-        wp.launch(
+        wp.launch_tiled(
             kernel_distance.chamfer_nn_term,
-            dim=n,
+            dim=[_loss_tiles(n)],
             inputs=[x, y, nearest_xy, wp.float32(_reduction_scale(point_reduction, n)), loss],
+            block_dim=TILE_1D,
             device=device,
         )
         if not single_directional:
-            wp.launch(
+            wp.launch_tiled(
                 kernel_distance.chamfer_nn_term,
-                dim=m,
+                dim=[_loss_tiles(m)],
                 inputs=[y, x, nearest_yx, wp.float32(_reduction_scale(point_reduction, m)), loss],
+                block_dim=TILE_1D,
                 device=device,
             )
 
@@ -533,9 +540,9 @@ def chamfer_points_to_mesh_loss(
         nearest_vp = tw.proximity.query_hashgrid_nearest(points, vertices, k=1)[0]
 
     def _record() -> None:
-        wp.launch(
+        wp.launch_tiled(
             kernel_distance.chamfer_surface_term,
-            dim=n,
+            dim=[_loss_tiles(n)],
             inputs=[
                 points,
                 vertices,
@@ -544,12 +551,13 @@ def chamfer_points_to_mesh_loss(
                 wp.float32(_reduction_scale(point_reduction, n)),
                 loss,
             ],
+            block_dim=TILE_1D,
             device=device,
         )
         if not single_directional:
-            wp.launch(
+            wp.launch_tiled(
                 kernel_distance.chamfer_nn_term,
-                dim=v,
+                dim=[_loss_tiles(v)],
                 inputs=[
                     vertices,
                     points,
@@ -557,6 +565,7 @@ def chamfer_points_to_mesh_loss(
                     wp.float32(_reduction_scale(point_reduction, v)),
                     loss,
                 ],
+                block_dim=TILE_1D,
                 device=device,
             )
 
@@ -628,9 +637,9 @@ def chamfer_mesh_to_mesh_loss(
         face_id_ba = tw.proximity.closest_point_on_mesh(vertices_a, faces_a, vertices_b)[2]
 
     def _record() -> None:
-        wp.launch(
+        wp.launch_tiled(
             kernel_distance.chamfer_surface_term,
-            dim=va,
+            dim=[_loss_tiles(va)],
             inputs=[
                 vertices_a,
                 vertices_b,
@@ -639,12 +648,13 @@ def chamfer_mesh_to_mesh_loss(
                 wp.float32(_reduction_scale(point_reduction, va)),
                 loss,
             ],
+            block_dim=TILE_1D,
             device=device,
         )
         if not single_directional:
-            wp.launch(
+            wp.launch_tiled(
                 kernel_distance.chamfer_surface_term,
-                dim=vb,
+                dim=[_loss_tiles(vb)],
                 inputs=[
                     vertices_b,
                     vertices_a,
@@ -653,6 +663,7 @@ def chamfer_mesh_to_mesh_loss(
                     wp.float32(_reduction_scale(point_reduction, vb)),
                     loss,
                 ],
+                block_dim=TILE_1D,
                 device=device,
             )
 

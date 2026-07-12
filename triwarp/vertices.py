@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import numpy as np
 import warp as wp
 
 import triwarp as tw
@@ -28,9 +27,10 @@ def n_vertices(indices: twt.IntArray) -> int:
     int
         ``max(indices) + 1``, or ``0`` when ``indices`` is empty.
     """
-    if int(indices.shape[0]) == 0:
+    if int(indices.size) == 0:
         return 0
-    return int(indices.numpy().max()) + 1
+    # Device-side tiled max: only the 4-byte result crosses to the host, not the whole buffer.
+    return int(tw.reduce.max(indices)) + 1
 
 
 def mean_vertex_normals(
@@ -160,10 +160,9 @@ def area_weighted_vertex_normals(
         if face_areas is None:
             face_areas = computed_areas
     n_faces = int(face_areas.shape[0])
-    areas_np = np.ascontiguousarray(face_areas.numpy(), dtype=np.float32).reshape(-1, 1)
-    face_weights_np = np.broadcast_to(areas_np, (n_faces, 3))
-    face_weights = wp.array(face_weights_np, dtype=wp.float32, device=faces.device)
-    return weighted_vertex_normals(n_vertices, faces, face_normals, face_weights)
+    scaled_normals = wp.empty(n_faces, dtype=wp.vec3, device=faces.device)
+    wp.map(wp.mul, face_normals, face_areas, out=scaled_normals)
+    return mean_vertex_normals(n_vertices, faces, scaled_normals)
 
 
 def angle_weighted_vertex_normals(

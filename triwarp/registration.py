@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import math
-from typing import Literal, overload
+from typing import Literal, cast, overload
 
 import numpy as np
 import warp as wp
 
 import triwarp as tw
+import triwarp.typing as twt
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import proximity as kernel_proximity
@@ -274,12 +275,19 @@ def icp(
         if max_distance is not None:
             query_max = max(query_max, max_distance)
 
+    # Correspondence and weight buffers are allocated once and refilled every iteration.
+    closest = wp.empty(n, dtype=wp.vec3, device=device)
+    distance_mesh = wp.empty(n, dtype=wp.float32, device=device)
+    triangle_id_mesh = wp.empty(n, dtype=wp.int32, device=device)
+    weights: wp.array[wp.float32] | None = (
+        wp.empty(n, dtype=wp.float32, device=device) if max_distance is not None else None
+    )
+
     old_cost = math.inf
     for _ in range(max_iterations):
         if is_mesh:
-            closest = wp.empty(n, dtype=wp.vec3, device=device)
-            distance = wp.empty(n, dtype=wp.float32, device=device)
-            triangle_id = wp.empty(n, dtype=wp.int32, device=device)
+            distance = distance_mesh
+            triangle_id = triangle_id_mesh
             wp.launch(
                 kernel_proximity.closest_point_on_mesh,
                 dim=n,
@@ -288,13 +296,10 @@ def icp(
             )
         else:
             index, distance = tw.proximity.query_bvh_nearest(target_vertices, current, 1)
-            closest = wp.empty(n, dtype=wp.vec3, device=device)
             wp.copy(closest, target_vertices[index])
             triangle_id = index
 
-        weights: wp.array[wp.float32] | None = None
-        if max_distance is not None:
-            weights = wp.empty(n, dtype=wp.float32, device=device)
+        if max_distance is not None and weights is not None:
             wp.map(
                 kernel_registration.distance_threshold_weight,
                 distance,
@@ -326,18 +331,35 @@ def _robust_scale_from_residuals(
     kind: int,
 ) -> float:
     """Robust scale (Huber/Tukey) from the MAD of the current point-to-plane residuals."""
-    cur = current.numpy()
-    cls = closest.numpy()
-    nrm = normals.numpy()
-    residual = np.einsum("ij,ij->i", cur - cls, nrm)
-    valid = (triangle_id.numpy() >= 0) & (distance.numpy() <= max_distance)
-    residual = residual[valid]
-    if residual.size == 0:
+    device = current.device
+    n = int(current.shape[0])
+    residual = wp.empty(n, dtype=wp.float32, device=device)
+    wp.map(kernel_registration.point_to_plane_residual, current, closest, normals, out=residual)
+    valid = wp.empty(n, dtype=wp.bool, device=device)
+    wp.map(
+        kernel_registration.residual_valid,
+        triangle_id,
+        distance,
+        wp.float32(max_distance),
+        out=valid,
+    )
+    valid_indices = tw.array.flatnonzero(valid)
+    k = int(valid_indices.shape[0])
+    if k == 0:
         return 0.0
-    mad = np.median(np.abs(residual - np.median(residual)))
+    kept = tw.array.gather(residual, valid_indices)
+    # Median and MAD on device (sort-based); only the scalar results cross to the host.
+    median = tw.reduce.median(cast(twt.Array1dFloat32, kept))
+    deviation = wp.empty(k, dtype=wp.float32, device=device)
+    wp.map(kernel_registration.abs_deviation, kept, wp.float32(median), out=deviation)
+    mad = tw.reduce.median(cast(twt.Array1dFloat32, deviation))
     sigma = float(1.4826 * mad)
     if sigma <= 0.0:
-        sigma = float(np.std(residual))
+        # Standard-deviation fallback: sqrt(mean((r - mean)^2)).
+        mean = float(tw.reduce.mean(cast(twt.Array1dFloat32, kept)))
+        wp.map(kernel_registration.abs_deviation, kept, wp.float32(mean), out=deviation)
+        wp.map(kernel_array.square_scalar, deviation, out=deviation)
+        sigma = float(tw.reduce.mean(cast(twt.Array1dFloat32, deviation))) ** 0.5
     if sigma <= 0.0:
         return 0.0
     # 95% asymptotic efficiency tuning constants.
@@ -466,20 +488,32 @@ def icp_point_to_plane(
     old_cost = math.inf
     n_tiles = (n + TILE_1D - 1) // TILE_1D
 
+    # All per-iteration buffers are allocated once; the accumulators are zeroed in place and
+    # ``current``/``updated`` ping-pong. ``total`` is cloned so composing in place never mutates
+    # a caller-provided initial transform. The per-iteration cost read stays: it is the
+    # stopping criterion (a 4-byte transfer).
+    closest = wp.empty(n, dtype=wp.vec3, device=device)
+    distance = wp.empty(n, dtype=wp.float32, device=device)
+    triangle_id_mesh = wp.empty(n, dtype=wp.int32, device=device)
+    normals = wp.empty(n, dtype=wp.vec3, device=device)
+    jtj = wp.zeros(1, dtype=wp.spatial_matrix, device=device)
+    jtr = wp.zeros(1, dtype=wp.spatial_vector, device=device)
+    cost_acc = wp.zeros(1, dtype=wp.float32, device=device)
+    step = wp.empty(1, dtype=wp.mat44, device=device)
+    updated = wp.empty(n, dtype=wp.vec3, device=device)
+    total = wp.clone(initial_matrix)
+
     for iteration in range(max_iterations):
         # --- correspondence + target normals ---
         if is_mesh:
             assert face_normals is not None
-            closest = wp.empty(n, dtype=wp.vec3, device=device)
-            distance = wp.empty(n, dtype=wp.float32, device=device)
-            triangle_id = wp.empty(n, dtype=wp.int32, device=device)
+            triangle_id = triangle_id_mesh
             wp.launch(
                 kernel_proximity.closest_point_on_mesh,
                 dim=n,
                 inputs=[mesh.id, current, wp.float32(query_max), closest, distance, triangle_id],
                 device=device,
             )
-            normals = wp.empty(n, dtype=wp.vec3, device=device)
             wp.launch(
                 kernel_array.gather_vec_skip_negative,
                 dim=n,
@@ -489,9 +523,7 @@ def icp_point_to_plane(
         else:
             assert target_normals is not None
             index, distance = tw.proximity.query_bvh_nearest(target_vertices, current, 1)
-            closest = wp.empty(n, dtype=wp.vec3, device=device)
             wp.copy(closest, target_vertices[index])
-            normals = wp.empty(n, dtype=wp.vec3, device=device)
             wp.launch(
                 kernel_array.gather_vec_skip_negative,
                 dim=n,
@@ -507,9 +539,9 @@ def icp_point_to_plane(
             )
 
         # --- assemble and solve the linearized point-to-plane system ---
-        jtj = wp.zeros(1, dtype=wp.spatial_matrix, device=device)
-        jtr = wp.zeros(1, dtype=wp.spatial_vector, device=device)
-        cost_acc = wp.zeros(1, dtype=wp.float32, device=device)
+        jtj.zero_()
+        jtr.zero_()
+        cost_acc.zero_()
         wp.launch_tiled(
             kernel_registration.accumulate_point_to_plane,
             dim=[n_tiles],
@@ -529,7 +561,6 @@ def icp_point_to_plane(
             block_dim=TILE_1D,
             device=device,
         )
-        step = wp.empty(1, dtype=wp.mat44, device=device)
         wp.launch(
             kernel_registration.solve_point_to_plane,
             dim=1,
@@ -538,18 +569,15 @@ def icp_point_to_plane(
         )
 
         # --- apply the incremental step and compose into the running transform ---
-        updated = wp.empty(n, dtype=wp.vec3, device=device)
         wp.launch(
             kernel_registration.apply_transform_mat44,
             dim=n,
             inputs=[current, step, updated],
             device=device,
         )
-        current = updated
+        current, updated = updated, current
         transformed = current
-        new_total = wp.empty(1, dtype=wp.mat44, device=device)
-        wp.map(wp.mul, step, total, out=new_total)
-        total = new_total
+        wp.map(wp.mul, step, total, out=total)
 
         cost = float(cost_acc.numpy()[0])
         if iteration > 0 and old_cost - cost < threshold:

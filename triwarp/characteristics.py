@@ -45,7 +45,13 @@ def euler_characteristic(faces: wp.array[wp.int32]) -> int:
     return n_referenced - n_edges + n_faces
 
 
-def is_edge_manifold(faces: wp.array[wp.int32], allow_boundary_edges: bool = True) -> bool:
+def is_edge_manifold(
+    faces: wp.array[wp.int32],
+    allow_boundary_edges: bool = True,
+    *,
+    edges_sorted: twt.Array2dInt32 | None = None,
+    n_vertices: int | None = None,
+) -> bool:
     """
     Whether every undirected mesh edge is shared by a manifold number of faces.
 
@@ -60,6 +66,12 @@ def is_edge_manifold(faces: wp.array[wp.int32], allow_boundary_edges: bool = Tru
     allow_boundary_edges
         When ``True`` (default) boundary edges (used by a single face) are allowed. When ``False``
         every edge must be shared by exactly two faces.
+    edges_sorted
+        Optional precomputed ``(n_faces * 3, 2)`` sorted edges in
+        [`faces_to_edges`][triwarp.edges.faces_to_edges] row order. When ``None``, built from
+        ``faces``.
+    n_vertices
+        Optional vertex count (the edge-hash base). When ``None``, inferred from ``faces``.
 
     Returns
     -------
@@ -81,8 +93,11 @@ def is_edge_manifold(faces: wp.array[wp.int32], allow_boundary_edges: bool = Tru
     if n_faces == 0:
         return True
 
-    edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    keys = tw.unique.hash_indices_rows(edges_sorted, max_index=tw.vertices.n_vertices(faces))
+    if edges_sorted is None:
+        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+    if n_vertices is None:
+        n_vertices = tw.vertices.n_vertices(faces)
+    keys = tw.unique.hash_indices_rows(edges_sorted, max_index=n_vertices)
     _, counts = tw.unique.unique_1d(keys, return_counts=True)
 
     min_count, max_count = tw.reduce.minmax(cast(twt.Array1dInt32, counts))
@@ -152,7 +167,12 @@ def edge_manifold_mask(
     return out_mask
 
 
-def is_vertex_manifold(faces: wp.array[wp.int32]) -> bool:
+def is_vertex_manifold(
+    faces: wp.array[wp.int32],
+    *,
+    face_adjacency: twt.Array2dInt32 | None = None,
+    face_adjacency_edges: twt.Array2dInt32 | None = None,
+) -> bool:
     """
     Whether every referenced vertex has a single edge-connected fan of faces.
 
@@ -169,11 +189,23 @@ def is_vertex_manifold(faces: wp.array[wp.int32]) -> bool:
     ----------
     faces
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    face_adjacency
+        Optional precomputed ``(m, 2)`` face-adjacency pairs from
+        [`face_adjacency`][triwarp.graph.face_adjacency]. Must be given together with
+        ``face_adjacency_edges``.
+    face_adjacency_edges
+        Optional ``(m, 2)`` shared-edge vertex pairs aligned with ``face_adjacency``
+        (``return_edges=True``). Must be given together with ``face_adjacency``.
 
     Returns
     -------
     bool
         ``True`` when every referenced vertex is manifold. Vacuously ``True`` for an empty mesh.
+
+    Raises
+    ------
+    ValueError
+        If exactly one of ``face_adjacency`` / ``face_adjacency_edges`` is provided.
 
     See Also
     --------
@@ -192,6 +224,10 @@ def is_vertex_manifold(faces: wp.array[wp.int32]) -> bool:
     [`vertex_manifold_mask`][triwarp.characteristics.vertex_manifold_mask] for a per-vertex flag
     sized to a caller-provided vertex buffer.
     """
+    if (face_adjacency is None) != (face_adjacency_edges is None):
+        raise ValueError(
+            "is_vertex_manifold: pass face_adjacency and face_adjacency_edges together"
+        )
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -199,7 +235,10 @@ def is_vertex_manifold(faces: wp.array[wp.int32]) -> bool:
 
     n_vertices = tw.vertices.n_vertices(faces)
     n_corners = n_faces * 3
-    adjacency, adjacency_edges = tw.graph.face_adjacency(faces, return_edges=True)
+    if face_adjacency is None or face_adjacency_edges is None:
+        adjacency, adjacency_edges = tw.graph.face_adjacency(faces, return_edges=True)
+    else:
+        adjacency, adjacency_edges = face_adjacency, face_adjacency_edges
     m = int(adjacency.shape[0])
 
     corner_edges = twt.empty_int32_2d((2 * m, 2), device=device)
@@ -599,14 +638,21 @@ def _orientation_bits(
     )
 
     changed = wp.zeros(1, dtype=wp.int32, device=device)
-    for _ in range(n_faces):
+    # Propagation is idempotent (a converged state stays converged), so the device flag is
+    # polled once per batch of launches instead of after every pass: 16x fewer host syncs on
+    # long propagation chains at the cost of at most 15 no-op launches at the end.
+    batch = 16
+    remaining = n_faces
+    while remaining > 0:
         changed.zero_()
-        wp.launch(
-            kernel_characteristics.propagate_orientation,
-            dim=m,
-            inputs=[signed_edges, signs, orient, changed],
-            device=device,
-        )
+        for _ in range(min(batch, remaining)):
+            wp.launch(
+                kernel_characteristics.propagate_orientation,
+                dim=m,
+                inputs=[signed_edges, signs, orient, changed],
+                device=device,
+            )
+            remaining -= 1
         if changed.numpy().item() == 0:
             break
 
@@ -710,7 +756,12 @@ def face_orientation_mask(faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
     return mask
 
 
-def is_watertight(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> bool:
+def is_watertight(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    edges_sorted: twt.Array2dInt32 | None = None,
+) -> bool:
     """
     Whether the mesh bounds a closed volume with no self-intersections.
 
@@ -723,6 +774,10 @@ def is_watertight(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> boo
         ``(n_vertices,)`` vertex positions.
     faces
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    edges_sorted
+        Optional precomputed ``(n_faces * 3, 2)`` sorted edges in
+        [`faces_to_edges`][triwarp.edges.faces_to_edges] row order. When ``None``, built once
+        and shared by the edge- and vertex-manifold checks.
 
     Returns
     -------
@@ -745,11 +800,25 @@ def is_watertight(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> boo
     [`is_edge_manifold`][triwarp.characteristics.is_edge_manifold] with
     ``allow_boundary_edges=False``.
     """
-    return (
-        is_edge_manifold(faces, allow_boundary_edges=False)
-        and is_vertex_manifold(faces)
-        and not is_self_intersecting(vertices, faces)
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return True
+
+    # The three checks share their most expensive intermediates: sorted edges feed both
+    # manifold tests, and the face adjacency (built lazily only after the cheap edge test
+    # passes, preserving the short-circuit) feeds the vertex-manifold test.
+    if edges_sorted is None:
+        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+    if not is_edge_manifold(faces, allow_boundary_edges=False, edges_sorted=edges_sorted):
+        return False
+    adjacency, adjacency_edges = tw.graph.face_adjacency(
+        faces, edges_sorted=edges_sorted, return_edges=True
     )
+    if not is_vertex_manifold(
+        faces, face_adjacency=adjacency, face_adjacency_edges=adjacency_edges
+    ):
+        return False
+    return not is_self_intersecting(vertices, faces)
 
 
 def watertight_face_mask(
@@ -784,7 +853,13 @@ def watertight_face_mask(
     return edge_manifold_mask(faces, edges_sorted=edges_sorted, allow_boundary_edges=False)
 
 
-def is_volume(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> bool:
+def is_volume(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    edges: twt.Array2dInt32 | None = None,
+    edges_sorted: twt.Array2dInt32 | None = None,
+) -> bool:
     """
     Whether the mesh is a valid closed volume with outward-facing normals.
 
@@ -799,6 +874,13 @@ def is_volume(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> bool:
         ``(n_vertices,)`` vertex positions.
     faces
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    edges
+        Optional precomputed ``(n_faces * 3, 2)`` directed edges in
+        [`faces_to_edges`][triwarp.edges.faces_to_edges] row order. When ``None``, built from
+        ``faces``.
+    edges_sorted
+        Optional precomputed ``(n_faces * 3, 2)`` sorted edges (same row order). When ``None``,
+        built from ``faces``.
 
     Returns
     -------
@@ -826,8 +908,10 @@ def is_volume(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> bool:
         return False
 
     device = vertices.device
-    edges = tw.edges.faces_to_edges(faces)
-    edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+    if edges is None:
+        edges = tw.edges.faces_to_edges(faces)
+    if edges_sorted is None:
+        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
 
     edge_groups = tw.grouping.group_int_rows(edges_sorted, length=2)
     n_groups = int(edge_groups.shape[0])

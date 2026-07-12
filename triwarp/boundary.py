@@ -9,6 +9,8 @@ returns the original row indices of edges occurring exactly once.
 
 from __future__ import annotations
 
+import math
+
 import warp as wp
 
 import triwarp as tw
@@ -185,11 +187,34 @@ def boundary_loops(
         device=device,
     )
 
+    # Pointer-jumping list ranking (Wyllie): O(log L) rounds of pointer doubling replace the
+    # per-vertex successor walk, whose total work was quadratic in the boundary-loop length.
+    successor = wp.empty(n_vertices, dtype=wp.int32, device=device)
+    steps = wp.empty(n_vertices, dtype=wp.int32, device=device)
+    successor_next = wp.empty(n_vertices, dtype=wp.int32, device=device)
+    steps_next = wp.empty(n_vertices, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_boundary.init_rank_arrays,
+        dim=n_boundary_vertices,
+        inputs=[boundary_vertices, next_vertex, labels, label_min, successor, steps],
+        device=device,
+    )
+    rounds = max(1, math.ceil(math.log2(max(n_boundary_vertices, 2))))
+    for _ in range(rounds):
+        wp.launch(
+            kernel_boundary.jump_rank,
+            dim=n_boundary_vertices,
+            inputs=[boundary_vertices, successor, steps, successor_next, steps_next],
+            device=device,
+        )
+        successor, successor_next = successor_next, successor
+        steps, steps_next = steps_next, steps
+
     position = wp.empty(n_boundary_vertices, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_boundary.rank_loop_positions,
+        kernel_boundary.finalize_rank_positions,
         dim=n_boundary_vertices,
-        inputs=[boundary_vertices, next_vertex, labels, label_min, label_count, position],
+        inputs=[boundary_vertices, labels, label_count, steps, position],
         device=device,
     )
 

@@ -241,68 +241,92 @@ _METRIC_COMBINE = {"max_dihedral": 1}
 _BAD_TRIANGULATION_METRIC = 1e10  # kernel ``BAD_METRIC``; a forced-bad triangulation reaches it.
 
 
-def _edge_third_vertices(faces_np: np.ndarray) -> dict[tuple[int, int], list[int]]:
-    """Map each undirected mesh edge to the third vertex of every face using it."""
-    edge_third: dict[tuple[int, int], list[int]] = {}
-    for tri in faces_np:
-        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
-        for u, v, w in ((a, b, c), (b, c, a), (a, c, b)):
-            edge_third.setdefault((u, v) if u < v else (v, u), []).append(w)
-    return edge_third
-
-
-def _rim_opposite(
-    loop_np: np.ndarray,
-    vertices_np: np.ndarray,
-    edge_third: dict[tuple[int, int], list[int]],
-    device: wp.DeviceLike,
-) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+class _EdgeTable:
     """
-    Per rim edge ``(loop[i], loop[(i+1) % B])``, the opposite vertex of its single adjacent face.
+    Device edge->third-vertex table for the pre-DP hole-fill stage.
 
-    Used for the ``smoothBd`` boundary term of the dihedral fill metrics: each hole rim edge borders
-    exactly one existing triangle, whose third vertex blends the fill's dihedral into the surface.
-    Marked invalid (``0``) when the edge has no unique adjacent face.
+    Built once per fill call from the (unsorted) packed sorted-edge keys: probing a rim edge
+    with a binary search over ``sorted_keys`` yields its occurrence count (adjacent-face count)
+    and, via ``sorted_rows`` -> ``thirds``, the opposite vertex of the single adjacent face. A
+    ``(n_vertices,)`` position scratch supports the forbidden-chord mask per loop.
     """
-    b = int(loop_np.shape[0])
-    positions = np.zeros((b, 3), dtype=np.float32)
-    valid = np.zeros(b, dtype=np.int32)
-    for i in range(b):
-        u = int(loop_np[i])
-        v = int(loop_np[(i + 1) % b])
-        thirds = edge_third.get((u, v) if u < v else (v, u), [])
-        if len(thirds) == 1:
-            positions[i] = vertices_np[thirds[0]]
-            valid[i] = 1
-    return (
-        wp.array(positions, dtype=wp.vec3, device=device),
-        wp.array(valid, dtype=wp.int32, device=device),
-    )
 
+    def __init__(
+        self, vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], edges_sorted: twt.Array2dInt32
+    ) -> None:
+        device = faces.device
+        n_rows = int(edges_sorted.shape[0])
+        n_vertices = tw.vertices.n_vertices(edges_sorted)
+        self.vertices = vertices
+        self.edges_sorted = edges_sorted
+        self.max_index = wp.uint64(n_vertices)
+        self.device = device
 
-def _forbidden_chords(
-    loop_np: np.ndarray, edges_np: np.ndarray, device: wp.DeviceLike
-) -> twt.Array2dInt32:
-    """
-    ``(B, B)`` mask of interior chords ``(i, j)`` that already exist as a mesh edge.
+        self.thirds = wp.empty(n_rows, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_stitching.edge_third_vertex,
+            dim=n_rows,
+            inputs=[faces, self.thirds],
+            device=device,
+        )
 
-    Marks only **non-adjacent** loop positions (distance ``2 .. B - 2``); the rim edges ``(i, i+1)``
-    and the closing edge ``(0, B-1)`` are the hole boundary itself and stay allowed. This is
-    MeshLib's ``MultipleEdgesResolveMode::Simple`` guard against non-manifold fills.
-    """
-    b = int(loop_np.shape[0])
-    position = {int(v): p for p, v in enumerate(loop_np)}
-    mask = np.zeros((b, b), dtype=np.int32)
-    for u, v in edges_np:
-        pu = position.get(int(u))
-        pv = position.get(int(v))
-        if pu is None or pv is None:
-            continue
-        lo, hi = (pu, pv) if pu < pv else (pv, pu)
-        if 2 <= hi - lo <= b - 2:
-            mask[lo, hi] = 1
-            mask[hi, lo] = 1
-    return twt.as_array2d_int32(wp.array(mask, dtype=wp.int32, device=device))
+        keys = tw.unique.hash_indices_rows(edges_sorted, max_index=n_vertices)
+        keys_buffer = wp.empty(2 * n_rows, dtype=wp.uint64, device=device)
+        wp.copy(keys_buffer, keys, count=n_rows)
+        rows_buffer = tw.array.init_sort_pair_indices(n_rows, -1, device)
+        wp.utils.radix_sort_pairs(keys_buffer, rows_buffer, count=n_rows)
+        self.sorted_keys = wp.clone(keys_buffer[:n_rows])
+        self.sorted_rows = wp.clone(rows_buffer[:n_rows])
+
+        self.position = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
+
+    def rim_opposite(
+        self, loop: wp.array[wp.int32]
+    ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+        """Opposite-vertex position + validity per rim edge of ``loop`` (device kernels)."""
+        b = int(loop.shape[0])
+        positions = wp.empty(b, dtype=wp.vec3, device=self.device)
+        valid = wp.empty(b, dtype=wp.int32, device=self.device)
+        wp.launch(
+            kernel_stitching.rim_opposite_from_table,
+            dim=b,
+            inputs=[
+                loop,
+                self.vertices,
+                self.sorted_keys,
+                self.sorted_rows,
+                self.thirds,
+                self.max_index,
+                positions,
+                valid,
+            ],
+            device=self.device,
+        )
+        return positions, valid
+
+    def forbidden_chords(self, loop: wp.array[wp.int32]) -> twt.Array2dInt32:
+        """``(B, B)`` mask of chords that already exist as mesh edges (device kernels)."""
+        b = int(loop.shape[0])
+        mask = twt.as_array2d_int32(wp.zeros((b, b), dtype=wp.int32, device=self.device))
+        wp.launch(
+            kernel_stitching.scatter_loop_positions,
+            dim=b,
+            inputs=[loop, self.position],
+            device=self.device,
+        )
+        wp.launch(
+            kernel_stitching.mark_forbidden_chords,
+            dim=int(self.edges_sorted.shape[0]),
+            inputs=[self.edges_sorted, self.position, wp.int32(b), mask],
+            device=self.device,
+        )
+        wp.launch(
+            kernel_stitching.clear_loop_positions,
+            dim=b,
+            inputs=[loop, self.position],
+            device=self.device,
+        )
+        return mask
 
 
 def _run_hole_dp(
@@ -483,9 +507,10 @@ def _fill_loops(
     if len(loops) == 0:
         return wp.clone(faces)
 
-    vertices_np = vertices.numpy()
-    edges_np = tw.edges.faces_to_edges(faces, sorted=True).numpy()
-    edge_third = _edge_third_vertices(faces.numpy().reshape(-1, 3))
+    # All pre-DP inputs (edge->third-vertex table, forbidden chords, rim opposites) are built
+    # on device; the host only reads back each loop for the O(B) DP traceback.
+    edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+    edge_table = _EdgeTable(vertices, faces, edges_sorted)
     primary_id = _METRIC_IDS[metric]
     combine_id = _METRIC_COMBINE.get(metric, 0)
     min_area_id = _METRIC_IDS["min_area"]
@@ -497,11 +522,11 @@ def _fill_loops(
         loop_pos = tw.array.gather(vertices, loop)
         plane_normal = tw.polyline.polyline_normal(loop_pos)
         forbidden = (
-            _forbidden_chords(loop_np, edges_np, device)
+            edge_table.forbidden_chords(loop)
             if resolve_multiple_edges
             else twt.as_array2d_int32(wp.zeros((b, b), dtype=wp.int32, device=device))
         )
-        rim_opp_pos, rim_opp_valid = _rim_opposite(loop_np, vertices_np, edge_third, device)
+        rim_opp_pos, rim_opp_valid = edge_table.rim_opposite(loop)
         edge_sq = wp.empty(b, dtype=wp.float32, device=device)
         wp.launch(
             kernel_stitching.closed_edge_sq_lengths,
@@ -964,13 +989,11 @@ def triangulate_boundaries_min_weight(
 
     device = faces_a.device
     metric_id = _STITCH_METRIC_IDS[metric]
-    va_np = vertices_a.numpy()
-    vb_np = vertices_b.numpy()
     offset = int(vertices_a.shape[0])
 
     # Reverse loop A so the two rims wind oppositely (facing), then align both at the closest pair.
     # ``la`` / ``lb`` stay on the host for the sequential band traceback, but the closest-pair
-    # search gathers rim positions on device and reduces there.
+    # search, rim gathers and rim-opposite lookups all run on device.
     la = loop_a.numpy()[::-1].copy()
     lb = loop_b.numpy().copy()
     a_rim = tw.array.gather(vertices_a, wp.array(la, dtype=wp.int32, device=device))
@@ -979,12 +1002,14 @@ def triangulate_boundaries_min_weight(
     la = np.roll(la, -start_a)
     lb = np.roll(lb, -start_b)
 
-    a_pos = wp.array(va_np[la], dtype=wp.vec3, device=device)
-    b_pos = wp.array(vb_np[lb], dtype=wp.vec3, device=device)
-    a_third = _edge_third_vertices(faces_a.numpy().reshape(-1, 3))
-    b_third = _edge_third_vertices(faces_b.numpy().reshape(-1, 3))
-    a_opp, a_opp_valid = _rim_opposite(la, va_np, a_third, device)
-    b_opp, b_opp_valid = _rim_opposite(lb, vb_np, b_third, device)
+    la_wp = wp.array(la, dtype=wp.int32, device=device)
+    lb_wp = wp.array(lb, dtype=wp.int32, device=device)
+    a_pos = tw.array.gather(vertices_a, la_wp)
+    b_pos = tw.array.gather(vertices_b, lb_wp)
+    table_a = _EdgeTable(vertices_a, faces_a, tw.edges.faces_to_edges(faces_a, sorted=True))
+    table_b = _EdgeTable(vertices_b, faces_b, tw.edges.faces_to_edges(faces_b, sorted=True))
+    a_opp, a_opp_valid = table_a.rim_opposite(la_wp)
+    b_opp, b_opp_valid = table_b.rim_opposite(lb_wp)
     up = wp.vec3(*(up_dir if up_dir is not None else (0.0, 0.0, 1.0)))
 
     dp = twt.as_array2d_float32(

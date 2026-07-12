@@ -311,6 +311,26 @@ def test_bfs_random(device: str) -> None:
         assert np.array_equal(distances_wp.numpy(), distances_np)
 
 
+def test_bfs_random_large_frontier(device: str) -> None:
+    # Above the serial threshold the frontier-parallel path runs; it must still match scipy's
+    # exact discovery order, parents, and distances.
+    rng = np.random.default_rng(11)
+    node_count = 20_000
+    pairs = rng.integers(0, node_count, size=(60_000, 2), dtype=np.int32)
+    pairs = pairs[pairs[:, 0] != pairs[:, 1]]
+    edges_np = np.unique(np.sort(pairs, axis=1), axis=0).astype(np.int32)
+    edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
+
+    for source in (0, node_count // 2):
+        order_wp, parents_wp, distances_wp = tw.graph.bfs_from_edges(
+            edges_wp, source, node_count=node_count
+        )
+        order_np, parents_np, distances_np = _scipy_bfs(edges_np, node_count, source)
+        assert np.array_equal(order_wp.numpy(), order_np)
+        assert np.array_equal(parents_wp.numpy(), parents_np)
+        assert np.array_equal(distances_wp.numpy(), distances_np)
+
+
 def test_bfs_path_graph(device: str) -> None:
     n = 1024
     edges_np = np.stack([np.arange(n - 1, dtype=np.int32), np.arange(1, n, dtype=np.int32)], axis=1)
@@ -477,15 +497,20 @@ def test_bfs_multi_source_source_out_of_range(device: str) -> None:
         tw.graph.bfs_multi_source(adjacency, sources_wp)
 
 
-def test_bfs_multi_source_overflow_warns(device: str) -> None:
-    # A path longer than the fixed per-source scratch capacity overflows from an endpoint source.
-    n = 700  # > kernel_bfs._PER_SOURCE_MAX_NEIGHBORS (512)
+def test_bfs_multi_source_large_component(device: str) -> None:
+    # A long path exercises what used to be a fixed 512-node scratch cap: the component-based
+    # implementation returns the complete reachable set with no truncation warning.
+    n = 700
     edges_np = np.stack([np.arange(n - 1, dtype=np.int32), np.arange(1, n, dtype=np.int32)], axis=1)
     edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
     adjacency = tw.graph.edges_to_csr(n, edges_wp)
-    sources_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
-    with pytest.warns(UserWarning, match="capacity breaches"):
-        tw.graph.bfs_multi_source(adjacency, sources_wp)
+    sources_wp = wp.array(np.array([5], dtype=np.int32), dtype=wp.int32, device=device)
+    neighbors_wp, offsets_wp = tw.graph.bfs_multi_source(adjacency, sources_wp)
+    assert offsets_wp.numpy().tolist() == [0]
+    neighbors_np = neighbors_wp.numpy()
+    assert neighbors_np.shape == (n,)
+    assert neighbors_np[0] == 5  # the source leads its own range
+    assert np.array_equal(np.sort(neighbors_np), np.arange(n))
 
 
 def _scipy_bfs(

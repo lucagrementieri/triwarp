@@ -217,10 +217,28 @@ def distance_threshold_weight(
 ) -> wp.float32:
     """Binary correspondence mask: 1 for a valid, in-range hit, 0 otherwise."""
     return wp.where(
-        triangle_id >= wp.int32(0) and distance <= max_distance,
-        wp.float32(1.0),
-        wp.float32(0.0),
+        triangle_id >= wp.int32(0) and distance <= max_distance, wp.float32(1.0), wp.float32(0.0)
     )
+
+
+@wp.func
+def point_to_plane_residual(current: wp.vec3, closest: wp.vec3, normal: wp.vec3) -> wp.float32:
+    """Signed point-to-plane residual ``dot(current - closest, normal)``."""
+    return wp.dot(current - closest, normal)
+
+
+@wp.func
+def residual_valid(
+    triangle_id: wp.int32, distance: wp.float32, max_distance: wp.float32
+) -> wp.bool:
+    """Whether a correspondence is a valid, in-range hit."""
+    return triangle_id >= wp.int32(0) and distance <= max_distance
+
+
+@wp.func
+def abs_deviation(value: wp.float32, center: wp.float32) -> wp.float32:
+    """Absolute deviation ``|value - center|`` (median-absolute-deviation building block)."""
+    return wp.abs(value - center)
 
 
 @wp.func
