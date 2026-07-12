@@ -6,8 +6,10 @@ Run with ``uv run pytest benchmarks/`` (the default ``pytest`` run only collects
 Flags
 -----
 ``--device={auto,cpu,cuda,both}``
-    Which ``triwarp`` targets to time. ``auto`` (default) uses both when CUDA is available,
-    else cpu only. The ``trimesh`` / ``igl`` CPU baselines are always included.
+    Which ``triwarp`` targets to time. ``auto`` (default) uses cuda when CUDA is available,
+    else falls back to cpu — ``triwarp-cpu`` is not timed alongside cuda by default. Pass
+    ``cpu`` for cpu only or ``both`` to time both triwarp targets. The ``trimesh`` / ``igl``
+    CPU baselines are always included.
 ``--size=<comma list | all>``
     Restrict meshes to these size categories (``small,medium,large,extralarge,huge``).
 ``--cpu-max-size=<category>``
@@ -193,7 +195,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store",
         default="auto",
         choices=["auto", "cpu", "cuda", "both"],
-        help="triwarp target device(s) to benchmark (default: auto).",
+        help="triwarp target device(s) to benchmark (default: auto = cuda if available, else cpu).",
     )
     group.addoption(
         "--size",
@@ -226,7 +228,9 @@ def _selected_libraries(config: pytest.Config) -> list[LibrarySpec]:
     device = str(config.getoption("--device"))
     cuda_available = wp.is_cuda_available()
     if device == "auto":
-        include_cpu, include_cuda = True, cuda_available
+        # triwarp-cpu is disabled by default: run it only as a fallback when there is no CUDA
+        # device. Pass --device=cpu or --device=both to time it explicitly.
+        include_cpu, include_cuda = not cuda_available, cuda_available
     elif device == "cpu":
         include_cpu, include_cuda = True, False
     elif device == "cuda":

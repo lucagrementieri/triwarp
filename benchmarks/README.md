@@ -30,7 +30,8 @@ Place mesh files in `benchmarks/data/` (gitignored, local-only). The registry in
 ## Run
 
 ```bash
-# Default: triwarp-cuda on all meshes; triwarp-cpu/trimesh/igl on meshes up to 'large'.
+# Default: triwarp-cuda on all meshes; trimesh/igl on meshes up to 'large'.
+# triwarp-cpu is off by default when CUDA is available (pass --device=both to add it).
 uv run pytest benchmarks/
 
 # Quick CPU-only smoke on the medium meshes:
@@ -49,7 +50,7 @@ into a single table).
 
 | flag | default | meaning |
 |---|---|---|
-| `--device` | `auto` | `triwarp` target(s): `auto`/`cpu`/`cuda`/`both`. `auto` = both if CUDA is available. The trimesh/igl baselines always run. |
+| `--device` | `auto` | `triwarp` target(s): `auto`/`cpu`/`cuda`/`both`. `auto` = cuda if CUDA is available, else cpu (triwarp-cpu is not timed alongside cuda; use `both` for that). The trimesh/igl baselines always run. |
 | `--size` | `all` | comma-separated size categories to include (`small,medium,large,extralarge,huge`). Naming a size explicitly also lifts the CPU cap for it. |
 | `--cpu-max-size` | `large` | CPU-bound libraries (`triwarp-cpu`, `trimesh`, `igl`) skip meshes larger than this unless the size is named in `--size`. |
 
