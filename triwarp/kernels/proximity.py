@@ -281,7 +281,7 @@ def geodesic_ball_reference_neighbors(
 
 
 @wp.kernel
-def query_geodesic_ball_count(
+def query_geodesic_ball_collect(
     vertices: wp.array[wp.vec3],
     adj_offsets: wp.array[wp.int32],
     adj_columns: wp.array[wp.int32],
@@ -297,10 +297,10 @@ def query_geodesic_ball_count(
 ) -> None:
     # Scratch lives in wrapper-allocated global-memory pools (one row per thread of the current
     # chunk) instead of ~8 KB of per-thread local arrays; the wrapper pre-fills the visited pool
-    # with -1 before each launch.
+    # with -1 before each launch. Single pass: after this kernel the thread's queue row holds
+    # the collected set (``queue_pool[t][:out_counts[chunk_start + t]]``) ready to gather.
     t = int(wp.tid())
     i = int(chunk_start) + t
-    dummy = wp.zeros(shape=1, dtype=wp.int32)
     out_counts[i] = kernel_bfs.per_source_bfs_collect(
         wp.int32(i),
         vertices,
@@ -312,47 +312,26 @@ def query_geodesic_ball_count(
         visited_pool[t],
         ext_dist_pool[t],
         ext_idx_pool[t],
-        False,
-        wp.int32(0),
-        dummy,
         out_overflow,
     )
 
 
 @wp.kernel
-def query_geodesic_ball_neighbors(
-    vertices: wp.array[wp.vec3],
-    adj_offsets: wp.array[wp.int32],
-    adj_columns: wp.array[wp.int32],
-    radius: wp.float32,
-    min_count: wp.int32,
-    chunk_start: wp.int32,
+def gather_queue_rows(
     queue_pool: wp.array2d[wp.int32],
-    visited_pool: wp.array2d[wp.int32],
-    ext_dist_pool: wp.array2d[wp.float32],
-    ext_idx_pool: wp.array2d[wp.int32],
-    offsets: wp.array[wp.int32],
-    out_neighbors: wp.array[wp.int32],
-    out_overflow: wp.array[wp.int32],
+    counts: wp.array[wp.int32],
+    local_offsets: wp.array[wp.int32],
+    chunk_start: wp.int32,
+    out_flat: wp.array[wp.int32],
 ) -> None:
-    t = int(wp.tid())
-    i = int(chunk_start) + t
-    kernel_bfs.per_source_bfs_collect(
-        wp.int32(i),
-        vertices,
-        adj_offsets,
-        adj_columns,
-        radius,
-        min_count,
-        queue_pool[t],
-        visited_pool[t],
-        ext_dist_pool[t],
-        ext_idx_pool[t],
-        True,
-        offsets[i],
-        out_neighbors,
-        out_overflow,
-    )
+    # Compact the chunk's queue rows into its flat CSR buffer. Adjacent j threads read one
+    # queue row and write one out_flat segment contiguously (coalesced on both sides).
+    # ``counts`` is the global per-source array (indexed at chunk_start + t); ``local_offsets``
+    # is the chunk-local exclusive scan of this chunk's counts.
+    t, j = wp.tid()
+    if j >= counts[int(chunk_start) + t]:
+        return
+    out_flat[local_offsets[t] + j] = queue_pool[t, j]
 
 
 @wp.func

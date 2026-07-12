@@ -331,6 +331,27 @@ def test_bfs_random_large_frontier(device: str) -> None:
         assert np.array_equal(distances_wp.numpy(), distances_np)
 
 
+def test_bfs_grid_graph_many_levels(device: str) -> None:
+    # High-diameter graph above the serial threshold: a 150x150 grid runs ~300 frontier levels,
+    # stressing the per-level rank/scan/scatter ordering against scipy across many iterations.
+    side = 150
+    node_count = side * side
+    ids = np.arange(node_count, dtype=np.int32).reshape(side, side)
+    horizontal = np.stack([ids[:, :-1].ravel(), ids[:, 1:].ravel()], axis=1)
+    vertical = np.stack([ids[:-1, :].ravel(), ids[1:, :].ravel()], axis=1)
+    edges_np = np.concatenate([horizontal, vertical]).astype(np.int32)
+    edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
+
+    for source in (0, node_count // 2):
+        order_wp, parents_wp, distances_wp = tw.graph.bfs_from_edges(
+            edges_wp, source, node_count=node_count
+        )
+        order_np, parents_np, distances_np = _scipy_bfs(edges_np, node_count, source)
+        assert np.array_equal(order_wp.numpy(), order_np)
+        assert np.array_equal(parents_wp.numpy(), parents_np)
+        assert np.array_equal(distances_wp.numpy(), distances_np)
+
+
 def test_bfs_path_graph(device: str) -> None:
     n = 1024
     edges_np = np.stack([np.arange(n - 1, dtype=np.int32), np.arange(1, n, dtype=np.int32)], axis=1)

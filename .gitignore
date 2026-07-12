@@ -1,5 +1,6 @@
-promesh/
 .benchmarks/
+promesh/
+downloads/
 
 # Python-generated files
 __pycache__/

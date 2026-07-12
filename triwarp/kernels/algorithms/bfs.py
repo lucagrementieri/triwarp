@@ -16,7 +16,6 @@ Two traversal cores:
 
 import warp as wp
 
-from triwarp.constants import INT64_MAX_CONSTANT
 from triwarp.kernels import unique as kernel_unique
 
 # Per-source scratch capacities (rows of the wrapper-allocated global-memory pools).
@@ -115,24 +114,23 @@ def per_source_bfs_collect(
     visited: wp.array[wp.int32],
     ext_dist: wp.array[wp.float32],
     ext_idx: wp.array[wp.int32],
-    write: wp.bool,
-    base: wp.int32,
-    out_flat: wp.array[wp.int32],
     out_overflow: wp.array[wp.int32],
 ) -> wp.int32:
     """
     BFS over the CSR edge graph from source ``i``; returns the collected count.
 
-    Traverses ``adj_offsets``/``adj_columns`` with a FIFO ``queue`` (whose emitted prefix is the
-    discovery order) and an O(1) open-addressing ``visited`` hash row — power-of-two length,
-    pre-filled with ``-1`` by the caller before the launch. When ``radius`` is finite the
-    traversal is *geodesic* (libigl ``getSphere``): a neighbor is enqueued only when within
-    Euclidean ``radius`` of the center, and out-of-ball neighbors feed a nearest fallback
-    (``ext_dist``/``ext_idx``) drained to ``min_count``. When ``radius`` is ``+inf`` the
-    geometric predicate is disabled (``vertices`` is never read, so a length-1 placeholder is
-    fine); pass ``min_count = 0`` so the fallback never engages. When ``write`` is true,
-    collected vertices are emitted to ``out_flat[base + pos]`` in BFS order. Exceeding the queue
-    or visited capacity increments ``out_overflow``.
+    Traverses ``adj_offsets``/``adj_columns`` with a FIFO ``queue`` and an O(1) open-addressing
+    ``visited`` hash row — power-of-two length, pre-filled with ``-1`` by the caller before the
+    launch. When ``radius`` is finite the traversal is *geodesic* (libigl ``getSphere``): a
+    neighbor is enqueued only when within Euclidean ``radius`` of the center, and out-of-ball
+    neighbors feed a nearest fallback (``ext_dist``/``ext_idx``) drained to ``min_count``. When
+    ``radius`` is ``+inf`` the geometric predicate is disabled (``vertices`` is never read, so a
+    length-1 placeholder is fine); pass ``min_count = 0`` so the fallback never engages.
+
+    On return the collected set *is* ``queue[:count]`` in BFS-then-backfill order (drained
+    fallback candidates are appended to the queue), so ``count == q_tail <= queue capacity``
+    always and the caller gathers results straight from its queue row — no second traversal.
+    Exceeding the queue or visited capacity increments ``out_overflow`` and drops the surplus.
     """
     use_geometry = not wp.isinf(radius)
 
@@ -155,8 +153,6 @@ def per_source_bfs_collect(
     while q_head < q_tail:
         current = queue[q_head]
         q_head += wp.int32(1)
-        if write:
-            out_flat[base + collected] = current
         collected += wp.int32(1)
 
         start = adj_offsets[current]
@@ -178,13 +174,21 @@ def per_source_bfs_collect(
             elif collected < min_count:
                 ext_n = bfs_extras_push_nearest(ext_dist, ext_idx, distance, neighbor, ext_n)
 
+    # Drained candidates are appended to the queue (not re-expanded from it) so the queue prefix
+    # stays the complete collected set. The main loop exits with collected == q_tail, so with the
+    # default min_count << queue capacity the drain never sees a full queue; only a pathological
+    # min_count > capacity can overflow here, dropping the surplus like the main phase does.
     while ext_n > wp.int32(0) and collected < min_count:
         cand = wp.int32(0)
         cand, ext_n = bfs_extras_pop_nearest(ext_dist, ext_idx, ext_n)
 
-        if write:
-            out_flat[base + collected] = cand
-        collected += wp.int32(1)
+        if q_tail < queue_cap:
+            queue[q_tail] = cand
+            q_tail += wp.int32(1)
+            collected += wp.int32(1)
+        else:
+            wp.atomic_add(out_overflow, 0, 1)
+            continue
 
         start = adj_offsets[cand]
         end = adj_offsets[cand + 1]
@@ -267,59 +271,157 @@ def bfs_seed(source: wp.int32, out_order: wp.array[wp.int32], out_dist: wp.array
     out_dist[source] = wp.int32(0)
 
 
+# The level-synchronous frontier loop runs entirely on device (``wp.capture_while``): the
+# frontier bounds live in a 4-int32 ``state`` array [frontier start, frontier end, level, loop
+# condition], every kernel is launched at a fixed ``dim=node_count`` with an early-exit guard on
+# the device-side frontier size, and the per-level prefix sum is a capture-safe fixed-buffer
+# scan (``wp.utils.array_scan`` allocates CUB temp storage internally, which conditional graph
+# bodies reject). ``BFS_SCAN_BLOCK`` also sizes the wrapper's padded scan buffers.
+_STATE_START = wp.constant(wp.int32(0))
+_STATE_TAIL = wp.constant(wp.int32(1))
+_STATE_LEVEL = wp.constant(wp.int32(2))
+_STATE_COND = wp.constant(wp.int32(3))
+BFS_SCAN_BLOCK = 256
+
+
 @wp.kernel
-def bfs_expand(
+def bfs_expand_claim(
     adj_offsets: wp.array[wp.int32],
     adj_columns: wp.array[wp.int32],
-    frontier: wp.array[wp.int32],
-    node_count: wp.int64,
+    order: wp.array[wp.int32],
+    state: wp.array[wp.int32],
     dist: wp.array[wp.int32],
-    claim_key: wp.array[wp.int64],
-    out_candidates: wp.array[wp.int32],
-    out_candidate_count: wp.array[wp.int32],
+    out_claim_rank: wp.array[wp.int32],
 ) -> None:
-    # Level-synchronous expansion reproducing scipy's FIFO discovery order: thread r (the
-    # dequeue rank of its frontier node) claims each unvisited neighbor v with the composite
-    # key r * n + v. atomic_min keeps the earliest-dequeued parent; only the first claimer
-    # (sentinel seen) appends v to the candidate list, so each node appears exactly once.
+    # Level-synchronous expansion: thread r (the dequeue rank of its frontier node) claims each
+    # unvisited neighbor v via atomic_min on the rank — the earliest-dequeued parent wins,
+    # matching scipy's first-discoverer predecessor. ``out_claim_rank`` is initialized to
+    # INT32_MAX once and never reset: a node claimed at level L is always finalized at level L
+    # (its dist is set by the scatter), so the ``dist[v] == -1`` guard in the count/scatter
+    # kernels rejects any stale rank from an earlier level.
     r = int(wp.tid())
-    u = frontier[r]
+    if r >= state[_STATE_TAIL] - state[_STATE_START]:
+        return
+    u = order[state[_STATE_START] + r]
     for k in range(adj_offsets[u], adj_offsets[u + 1]):
         v = adj_columns[k]
         if dist[v] == wp.int32(-1):
-            key = wp.int64(r) * node_count + wp.int64(v)
-            previous = wp.atomic_min(claim_key, v, key)
-            if previous == INT64_MAX_CONSTANT:
-                slot = wp.atomic_add(out_candidate_count, 0, 1)
-                out_candidates[slot] = v
+            wp.atomic_min(out_claim_rank, v, wp.int32(r))
 
 
 @wp.kernel
-def bfs_gather_claim_keys(
-    candidates: wp.array[wp.int32], claim_key: wp.array[wp.int64], out_keys: wp.array[wp.int64]
+def bfs_count_claims(
+    adj_offsets: wp.array[wp.int32],
+    adj_columns: wp.array[wp.int32],
+    order: wp.array[wp.int32],
+    state: wp.array[wp.int32],
+    dist: wp.array[wp.int32],
+    claim_rank: wp.array[wp.int32],
+    out_counts: wp.array[wp.int32],
 ) -> None:
-    i = int(wp.tid())
-    out_keys[i] = claim_key[candidates[i]]
+    # Thread r counts the neighbors it owns this level: still unvisited (stale-rank guard, see
+    # bfs_expand_claim) and won by rank r — the atomic_min winner is unique per node. Stale
+    # ``out_counts`` entries beyond the frontier size are harmless: an inclusive scan's prefix
+    # only depends on the prefix, and offsets past the frontier are never read.
+    r = int(wp.tid())
+    if r >= state[_STATE_TAIL] - state[_STATE_START]:
+        return
+    u = order[state[_STATE_START] + r]
+    count = wp.int32(0)
+    for k in range(adj_offsets[u], adj_offsets[u + 1]):
+        v = adj_columns[k]
+        if dist[v] == wp.int32(-1) and claim_rank[v] == wp.int32(r):
+            count += wp.int32(1)
+    out_counts[r] = count
 
 
 @wp.kernel
-def bfs_finalize_level(
-    frontier_sorted: wp.array[wp.int32],
-    claim_key: wp.array[wp.int64],
-    prev_frontier: wp.array[wp.int32],
-    node_count: wp.int64,
-    level: wp.int32,
-    order_base: wp.int32,
-    out_order: wp.array[wp.int32],
+def bfs_scan_blocks(
+    values: wp.array[wp.int32],
+    out_scanned: wp.array[wp.int32],
+    out_block_sums: wp.array[wp.int32],
+) -> None:
+    # Capture-safe scan, pass 1: per-block inclusive scan (arrays are padded to a multiple of
+    # BFS_SCAN_BLOCK; padding garbage never reaches a read prefix). Thread 0 exports the block
+    # total for pass 2.
+    i, t = wp.tid()
+    offset = i * BFS_SCAN_BLOCK
+    tile = wp.tile_load(values, shape=BFS_SCAN_BLOCK, offset=offset, storage="register")
+    scanned = wp.tile_scan_inclusive(tile)
+    wp.tile_store(out_scanned, scanned, offset=offset)
+    if t == 0:
+        out_block_sums[i] = scanned[BFS_SCAN_BLOCK - 1]
+
+
+@wp.kernel
+def bfs_scan_block_sums(out_block_sums: wp.array[wp.int32]) -> None:
+    # Capture-safe scan, pass 2 (dim=1): serial inclusive scan of the few thousand block sums.
+    _ = int(wp.tid())
+    n = out_block_sums.shape[0]
+    total = wp.int32(0)
+    for k in range(n):
+        total += out_block_sums[k]
+        out_block_sums[k] = total
+
+
+@wp.kernel
+def bfs_add_block_offsets(
+    block_sums: wp.array[wp.int32], out_scanned: wp.array[wp.int32]
+) -> None:
+    # Capture-safe scan, pass 3: add the preceding blocks' total to each element.
+    idx = int(wp.tid())
+    b = wp.int32(idx) / wp.int32(BFS_SCAN_BLOCK)
+    if b > wp.int32(0):
+        out_scanned[idx] += block_sums[b - 1]
+
+
+@wp.kernel
+def bfs_scatter_claims(
+    adj_offsets: wp.array[wp.int32],
+    adj_columns: wp.array[wp.int32],
+    state: wp.array[wp.int32],
+    claim_rank: wp.array[wp.int32],
+    offsets_inclusive: wp.array[wp.int32],
+    order: wp.array[wp.int32],
     out_parent: wp.array[wp.int32],
     out_dist: wp.array[wp.int32],
 ) -> None:
-    # Candidates sorted by claim key = (parent dequeue rank, ascending node id) = exact scipy
-    # FIFO discovery order given ascending CSR columns; the min-rank claimer is scipy's
-    # first-discoverer predecessor.
-    i = int(wp.tid())
-    v = frontier_sorted[i]
-    rank = wp.int32((claim_key[v] - wp.int64(v)) / node_count)
-    out_dist[v] = level
-    out_parent[v] = prev_frontier[rank]
-    out_order[order_base + i] = v
+    # Emits the level in exact scipy FIFO order without a sort: segments are rank-major (thread
+    # r's segment starts at the exclusive-scan value offsets_inclusive[r - 1]) and each segment
+    # fills in ascending CSR column order — (parent dequeue rank, ascending node id), exactly
+    # the order the former int64 claim-key radix sort produced. ``order`` is read as the current
+    # frontier and written with the next level's nodes. ``out_dist`` doubles as the visited
+    # marker read by the ownership guard: only the unique rank winner writes dist[v], so its
+    # racy read by non-owners cannot flip their guard (they fail claim_rank[v] == r).
+    r = int(wp.tid())
+    start = state[_STATE_START]
+    tail = state[_STATE_TAIL]
+    if r >= tail - start:
+        return
+    u = order[start + r]
+    level = state[_STATE_LEVEL]
+    slot = tail
+    if r > 0:
+        slot += offsets_inclusive[r - 1]
+    for k in range(adj_offsets[u], adj_offsets[u + 1]):
+        v = adj_columns[k]
+        if out_dist[v] == wp.int32(-1) and claim_rank[v] == wp.int32(r):
+            order[slot] = v
+            out_parent[v] = u
+            out_dist[v] = level
+            slot += wp.int32(1)
+
+
+@wp.kernel
+def bfs_update_state(offsets_inclusive: wp.array[wp.int32], out_state: wp.array[wp.int32]) -> None:
+    # dim=1, last op of each level: advance the frontier window to the freshly scattered
+    # segment, bump the level, and keep looping while the level emitted anything.
+    _ = int(wp.tid())
+    frontier_size = out_state[_STATE_TAIL] - out_state[_STATE_START]
+    count = wp.int32(0)
+    if frontier_size > 0:
+        count = offsets_inclusive[frontier_size - 1]
+    out_state[_STATE_START] = out_state[_STATE_TAIL]
+    out_state[_STATE_TAIL] = out_state[_STATE_TAIL] + count
+    out_state[_STATE_LEVEL] = out_state[_STATE_LEVEL] + wp.int32(1)
+    out_state[_STATE_COND] = wp.where(count > wp.int32(0), wp.int32(1), wp.int32(0))

@@ -12,6 +12,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.array import append, flatnonzero, gather, init_sort_pair_indices
+from triwarp.constants import INT32_MAX
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import sample as kernel_sample
 from triwarp.kernels.algorithms import blue_noise as kernel_blue_noise
@@ -379,14 +380,49 @@ def _bridson_blue_noise(
     wp.utils.array_scan(counts, out_array=cell_offsets_inner, inclusive=False)
     cell_offsets = append(cell_offsets_inner, nx)
 
+    # One-time lookup tables (the grid never changes): each pool point's compacted cell index,
+    # and every cell's 9x9x9 shell of compacted neighbor indices. The round kernels then replace
+    # every binary search over ``unique_keys`` with a single table load. The table costs
+    # ``n_cells * 729`` int32 (~2.9 KB per occupied cell).
+    point_cell = wp.empty(nx, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_blue_noise.init_point_cells,
+        dim=nx,
+        inputs=[grid_coords, wp.int32(grid_w), unique_keys, point_cell],
+        device=device,
+    )
+    cell_neighbors = twt.empty_int32_2d((n_cells, kernel_blue_noise.SHELL_CELLS), device=device)
+    wp.launch(
+        kernel_blue_noise.build_cell_neighbors,
+        dim=(n_cells, kernel_blue_noise.SHELL_CELLS),
+        inputs=[unique_keys, wp.int32(grid_w), cell_neighbors],
+        device=device,
+    )
+
     selected = wp.full(n_cells, -1, dtype=wp.int32, device=device)
     cand_alive = wp.ones(nx, dtype=wp.bool, device=device)
+
+    # Round-loop scratch, allocated once and reused via slice views: every active entry is a
+    # distinct CAS-committed selected point (spawns are fresh cells, survivors earlier spawns),
+    # so the active count is bounded by the number of occupied cells.
+    cap = n_cells
+    active_buf = wp.empty(cap, dtype=wp.int32, device=device)
+    next_buf = wp.empty(cap, dtype=wp.int32, device=device)
+    spawned_buf = wp.empty(cap, dtype=wp.int32, device=device)
+    retire_buf = wp.empty(cap, dtype=wp.int32, device=device)
+    conflict_buf = wp.empty(cap, dtype=wp.int32, device=device)
+    proposal_cell_buf = wp.empty(cap, dtype=wp.int32, device=device)
+    proposal_mi_buf = wp.empty(cap, dtype=wp.int32, device=device)
+    cell_owner = wp.empty(n_cells, dtype=wp.int32, device=device)
+    flags_buf = wp.empty(2 * cap, dtype=wp.int32, device=device)
+    positions_buf = wp.empty(2 * cap, dtype=wp.int32, device=device)
+    total_buf = wp.empty(1, dtype=wp.int32, device=device)
 
     seed_cursor = 0
     winner = wp.empty(1, dtype=wp.int32, device=device)
     seed_state = wp.empty(2, dtype=wp.int32, device=device)
 
-    def _try_seed() -> wp.array[wp.int32] | None:
+    def _try_seed() -> int:
         # Parallel scan for the lowest seedable cell at/after the cursor (a read-only dry run
         # of the activation predicate), then a single-thread commit of the winner: one packed
         # 8-byte host read per drain event instead of a dim=1 launch + sync per scanned cell.
@@ -398,13 +434,12 @@ def _bridson_blue_noise(
                 dim=n_cells - seed_cursor,
                 inputs=[
                     pool_points,
-                    grid_coords,
+                    point_cell,
+                    cell_neighbors,
                     sorted_pool_idx,
                     cell_offsets,
                     selected,
-                    unique_keys,
                     cand_alive,
-                    wp.int32(grid_w),
                     rr,
                     wp.int32(seed_cursor),
                     winner,
@@ -416,13 +451,12 @@ def _bridson_blue_noise(
                 dim=1,
                 inputs=[
                     pool_points,
-                    grid_coords,
+                    point_cell,
+                    cell_neighbors,
                     sorted_pool_idx,
                     cell_offsets,
                     selected,
-                    unique_keys,
                     cand_alive,
-                    wp.int32(grid_w),
                     rr,
                     four_rr,
                     wp.int32(n_cells),
@@ -434,14 +468,30 @@ def _bridson_blue_noise(
             state_np = seed_state.numpy()
             if int(state_np[0]) >= n_cells:
                 seed_cursor = n_cells
-                return None
+                return 0
             seed_cursor = int(state_np[0]) + 1
             if int(state_np[1]) >= 0:
-                return wp.clone(seed_state[1:2])
-        return None
+                wp.copy(active_buf[0:1], seed_state[1:2])
+                return 1
+        return 0
 
-    active = _try_seed()
-    if active is None:
+    # Per-round elementwise kernels, hoisted once (see ``triwarp/smoothing.py``): flag survivors
+    # (retire == 0) and fresh spawns, and pack the two scan tail scalars into one readback.
+    zero_flag = wp.map(
+        kernel_blue_noise.is_zero_int32, retire_buf, out=flags_buf[:cap], return_kernel=True
+    )
+    nonneg_flag = wp.map(
+        kernel_blue_noise.is_nonnegative_int32,
+        spawned_buf,
+        out=flags_buf[cap:],
+        return_kernel=True,
+    )
+    tail_total = wp.map(
+        wp.add, positions_buf[:1], flags_buf[:1], out=total_buf, return_kernel=True
+    )
+
+    active_count = _try_seed()
+    if active_count == 0:
         return (
             wp.empty(0, dtype=wp.vec3, device=device),
             wp.empty(0, dtype=wp.int32, device=device),
@@ -450,61 +500,137 @@ def _bridson_blue_noise(
     round_idx = 0
     max_rounds = nx * 4
     while round_idx < max_rounds:
-        active_count = int(active.shape[0])
         if active_count == 0:
-            active = _try_seed()
-            if active is None:
+            active_count = _try_seed()
+            if active_count == 0:
                 break
             round_idx += 1
             continue
 
-        spawned = wp.empty(active_count, dtype=wp.int32, device=device)
-        retire = wp.zeros(active_count, dtype=wp.int32, device=device)
+        # Propose -> resolve -> commit: the parallel propose phase is read-only against the
+        # frozen committed state, and the two resolve passes pick winners deterministically
+        # (same-cell by active-list rank, cross-cell min-distance conflicts by cell index), so
+        # each round — and therefore the whole sampling — is deterministic by construction.
+        cell_owner.fill_(INT32_MAX)
         wp.launch(
-            kernel_blue_noise.bridson_step,
+            kernel_blue_noise.bridson_propose,
             dim=active_count,
             inputs=[
                 pool_points,
-                grid_coords,
+                point_cell,
+                cell_neighbors,
                 sorted_pool_idx,
                 cell_offsets,
                 selected,
-                unique_keys,
                 cand_alive,
-                active,
-                wp.int32(grid_w),
+                active_buf[:active_count],
                 rr,
                 four_rr,
                 wp.int32(seed),
                 wp.int32(round_idx),
-                spawned,
-                retire,
+                proposal_cell_buf[:active_count],
+                proposal_mi_buf[:active_count],
+                retire_buf[:active_count],
+            ],
+            device=device,
+        )
+        wp.launch(
+            kernel_blue_noise.resolve_same_cell,
+            dim=active_count,
+            inputs=[proposal_cell_buf[:active_count], cell_owner],
+            device=device,
+        )
+        wp.launch(
+            kernel_blue_noise.resolve_cross_cell,
+            dim=active_count,
+            inputs=[
+                pool_points,
+                cell_neighbors,
+                proposal_cell_buf[:active_count],
+                proposal_mi_buf[:active_count],
+                cell_owner,
+                rr,
+                conflict_buf[:active_count],
+            ],
+            device=device,
+        )
+        wp.launch(
+            kernel_blue_noise.commit_proposals,
+            dim=active_count,
+            inputs=[
+                proposal_cell_buf[:active_count],
+                proposal_mi_buf[:active_count],
+                cell_owner,
+                conflict_buf[:active_count],
+                selected,
+                spawned_buf[:active_count],
+            ],
+            device=device,
+        )
+        wp.launch(
+            kernel_blue_noise.prune_spawn_neighborhoods,
+            dim=active_count,
+            inputs=[
+                pool_points,
+                point_cell,
+                cell_neighbors,
+                sorted_pool_idx,
+                cell_offsets,
+                spawned_buf[:active_count],
+                rr,
+                cand_alive,
             ],
             device=device,
         )
 
-        # Survivors (retire == 0) and fresh spawns compact into the next active list with one
-        # scan + one scatter: a single small host read per round instead of three
-        # flatnonzero/gather passes plus a concatenate.
-        flags = wp.empty(2 * active_count, dtype=wp.int32, device=device)
-        wp.map(kernel_blue_noise.is_zero_int32, retire, out=flags[:active_count])
-        wp.map(kernel_blue_noise.is_nonnegative_int32, spawned, out=flags[active_count:])
-        positions = wp.empty(2 * active_count, dtype=wp.int32, device=device)
-        wp.utils.array_scan(flags, out_array=positions, inclusive=False)
+        # Survivors and fresh spawns compact into the next active list with one scan + one
+        # scatter and a single small host read per round; all buffers are reused slice views.
+        wp.launch(
+            zero_flag,
+            dim=active_count,
+            inputs=[retire_buf[:active_count]],
+            outputs=[flags_buf[:active_count]],
+            device=device,
+        )
+        wp.launch(
+            nonneg_flag,
+            dim=active_count,
+            inputs=[spawned_buf[:active_count]],
+            outputs=[flags_buf[active_count : 2 * active_count]],
+            device=device,
+        )
+        wp.utils.array_scan(
+            flags_buf[: 2 * active_count],
+            out_array=positions_buf[: 2 * active_count],
+            inclusive=False,
+        )
         tail = 2 * active_count - 1
-        total = int(positions[tail:].numpy()[0]) + int(flags[tail:].numpy()[0])
+        wp.launch(
+            tail_total,
+            dim=1,
+            inputs=[positions_buf[tail : tail + 1], flags_buf[tail : tail + 1]],
+            outputs=[total_buf],
+            device=device,
+        )
+        total = int(total_buf.numpy()[0])
         if total == 0:
-            active = wp.empty(0, dtype=wp.int32, device=device)
+            active_count = 0
             round_idx += 1
             continue
-        next_active = wp.empty(total, dtype=wp.int32, device=device)
         wp.launch(
             kernel_blue_noise.compact_active_and_spawned,
             dim=2 * active_count,
-            inputs=[active, spawned, flags, positions, next_active],
+            inputs=[
+                active_buf[:active_count],
+                spawned_buf[:active_count],
+                flags_buf[: 2 * active_count],
+                positions_buf[: 2 * active_count],
+                next_buf[:total],
+            ],
             device=device,
         )
-        active = next_active
+        active_buf, next_buf = next_buf, active_buf
+        active_count = total
         round_idx += 1
 
     # Every activated point was committed into ``selected`` at claim time (atomic CAS), so the

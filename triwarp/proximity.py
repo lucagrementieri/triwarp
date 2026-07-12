@@ -899,10 +899,10 @@ def query_geodesic_ball(
 
     The traversal runs entirely on device. Vertex adjacency is built as a CSR graph via
     [`edges_unique`][triwarp.edges.edges_unique] +
-    [`edges_to_csr`][triwarp.graph.edges_to_csr], then a two-pass BFS
-    (count → exclusive scan → fill) emits the CSR neighbor buffer. Each thread uses fixed-capacity
-    local scratch of 512 neighbors; if a vertex collects more than that the surplus is dropped and a
-    warning is emitted.
+    [`edges_to_csr`][triwarp.graph.edges_to_csr], then a single-pass BFS collects each ball into
+    its per-source queue row (the queue prefix *is* the result) and a scan + gather compacts the
+    rows into the CSR neighbor buffer. Each source uses fixed-capacity scratch of 512 neighbors;
+    if a vertex collects more than that the surplus is dropped and a warning is emitted.
 
     !!! note
 
@@ -967,11 +967,15 @@ def query_geodesic_ball(
 
     overflow = wp.zeros(1, dtype=wp.int32, device=device)
     counts = wp.empty(n, dtype=wp.int32, device=device)
+    local_offsets = wp.empty(chunk, dtype=wp.int32, device=device)
+    chunk_total_buf = wp.empty(1, dtype=wp.int32, device=device)
+    chunk_flats: list[wp.array[wp.int32]] = []
     for start in range(0, n, chunk):
+        m = min(chunk, n - start)
         visited_pool.fill_(-1)
         wp.launch(
-            kernel_proximity.query_geodesic_ball_count,
-            dim=min(chunk, n - start),
+            kernel_proximity.query_geodesic_ball_collect,
+            dim=m,
             inputs=[
                 vertices,
                 adj_offsets,
@@ -988,6 +992,29 @@ def query_geodesic_ball(
             ],
             device=device,
         )
+        # Gather this chunk's queue rows before the next chunk reuses the pools: chunk-local
+        # exclusive scan of counts, one 4-byte readback for the chunk total, then a coalesced
+        # 2D copy into the chunk's flat buffer.
+        wp.utils.array_scan(
+            counts[start : start + m], out_array=local_offsets[:m], inclusive=False
+        )
+        wp.map(
+            wp.add,
+            local_offsets[m - 1 : m],
+            counts[start + m - 1 : start + m],
+            out=chunk_total_buf,
+        )
+        chunk_total = int(chunk_total_buf.numpy()[0])
+        flat_chunk = wp.empty(chunk_total, dtype=wp.int32, device=device)
+        if chunk_total > 0:
+            wp.launch(
+                kernel_proximity.gather_queue_rows,
+                dim=(m, kernel_bfs._PER_SOURCE_MAX_NEIGHBORS),
+                inputs=[queue_pool, counts, local_offsets, wp.int32(start), flat_chunk],
+                device=device,
+            )
+        chunk_flats.append(flat_chunk)
+
     n_overflow = int(overflow.numpy()[0])
     if n_overflow > 0:
         warnings.warn(
@@ -998,33 +1025,20 @@ def query_geodesic_ball(
 
     offsets = wp.empty(n, dtype=wp.int32, device=device)
     wp.utils.array_scan(counts, out_array=offsets, inclusive=False)
-    # Slice before .numpy(): copy only the two tail scalars, not both full arrays.
-    total = int(offsets[n - 1 :].numpy()[0]) + int(counts[n - 1 :].numpy()[0])
 
+    if len(chunk_flats) == 1:
+        # Single chunk (n <= chunk): the chunk buffer already is the global CSR neighbor buffer.
+        return chunk_flats[0], offsets, reference_neighbors
+
+    # Chunk order equals ascending source order, so concatenation lines up with the global scan.
+    total = sum(int(flat_chunk.shape[0]) for flat_chunk in chunk_flats)
     neighbor_indices = wp.empty(total, dtype=wp.int32, device=device)
-    overflow.zero_()
-    for start in range(0, n, chunk):
-        visited_pool.fill_(-1)
-        wp.launch(
-            kernel_proximity.query_geodesic_ball_neighbors,
-            dim=min(chunk, n - start),
-            inputs=[
-                vertices,
-                adj_offsets,
-                adj_columns,
-                wp.float32(radius),
-                wp.int32(min_count),
-                wp.int32(start),
-                queue_pool,
-                visited_pool,
-                ext_dist_pool,
-                ext_idx_pool,
-                offsets,
-                neighbor_indices,
-                overflow,
-            ],
-            device=device,
-        )
+    position = 0
+    for flat_chunk in chunk_flats:
+        length = int(flat_chunk.shape[0])
+        if length > 0:
+            wp.copy(neighbor_indices[position : position + length], flat_chunk)
+            position += length
     return neighbor_indices, offsets, reference_neighbors
 
 

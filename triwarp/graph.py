@@ -10,7 +10,7 @@ import warp.sparse as wps
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.array import init_range
-from triwarp.constants import INT64_MAX
+from triwarp.constants import INT32_MAX
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import graph as kernel_graph
 from triwarp.kernels.algorithms import bfs as kernel_bfs
@@ -444,14 +444,12 @@ def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[
     """
     Per-node connected-component labels from a sparse adjacency matrix.
 
-    Uses ECL-lite (ECL-CC style init, CAS hooking, intermediate pointer jumping)
-    on the CSR structure of ``adjacency`` (1x1 BSR blocks). Hook passes run until
-    a pass reports no merge attempts (``changed == 0``), no exhausted per-edge CAS
-    retries (``incomplete == 0``), and a post-hook CSR edge check finds all
-    endpoints sharing the same representative. At most ``node_count`` hook passes
-    are attempted before raising. Labels identify nodes in the same component;
-    values are not necessarily contiguous in ``0 .. k-1`` (compare partitions,
-    not raw ids).
+    Uses ECL-CC (init, single-pass CAS hooking with in-kernel retry, intermediate
+    pointer jumping) on the CSR structure of ``adjacency`` (1x1 BSR blocks): one
+    init launch, one hook launch, one flatten launch — no host-side convergence
+    loop. Each label is the smallest node id in its component (hooks always point
+    the larger root at the smaller one); values are not necessarily contiguous in
+    ``0 .. k-1`` (compare partitions, not raw ids).
 
     Parameters
     ----------
@@ -470,9 +468,6 @@ def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[
     ------
     ValueError
         If ``adjacency`` is not square or does not use 1x1 blocks.
-    RuntimeError
-        If hook passes reach ``node_count`` without converging, or edge
-        verification still fails at that limit.
 
     See Also
     --------
@@ -505,47 +500,19 @@ def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[
         inputs=[offsets, indices, parents],
         device=device,
     )
-
-    # Both convergence flags live in one length-2 buffer, so each pass costs one 8-byte host
-    # read instead of two or three separate ones. (Batching several hook passes between reads
-    # was measured slower: ECL-CC converges in a handful of passes on meshes, so the extra
-    # whole-graph launches outweigh the saved readbacks.)
-    flags = wp.zeros(2, dtype=wp.int32, device=device)
-    changed = flags[0:1]
-    incomplete = flags[1:2]
-    violations = wp.zeros(1, dtype=wp.int32, device=device)
-
-    flags_np = flags.numpy()
-    for _ in range(node_count):
-        flags.zero_()
-        wp.launch(
-            kernel_connected_components.ecl_hook,
-            dim=node_count,
-            inputs=[offsets, indices, parents, changed, incomplete],
-            device=device,
-        )
-        flags_np = flags.numpy()
-        if flags_np[0] != 0 or flags_np[1] != 0:
-            continue
-
-        violations.zero_()
-        wp.launch(
-            kernel_connected_components.ecl_finalize_and_verify,
-            dim=node_count,
-            inputs=[offsets, indices, parents, labels, violations],
-            device=device,
-        )
-        if violations.numpy().item() == 0:
-            return labels
-
-    if flags_np[0] != 0 or flags_np[1] != 0:
-        raise RuntimeError(
-            f"connected_component_labels: hook passes did not converge "
-            f"after {node_count} iterations"
-        )
-    raise RuntimeError(
-        f"connected_component_labels: edge verification failed after {node_count} iterations"
+    wp.launch(
+        kernel_connected_components.ecl_hook,
+        dim=node_count,
+        inputs=[offsets, indices, parents],
+        device=device,
     )
+    wp.launch(
+        kernel_connected_components.ecl_flatten,
+        dim=node_count,
+        inputs=[parents, labels],
+        device=device,
+    )
+    return labels
 
 
 def connected_component_labels_from_edges(
@@ -703,9 +670,11 @@ def bfs(
     distances = wp.full(node_count, -1, dtype=wp.int32, device=device)
     order_buffer = wp.empty(node_count, dtype=wp.int32, device=device)
 
-    if node_count < _BFS_SERIAL_THRESHOLD:
+    if node_count < _BFS_SERIAL_THRESHOLD or device.is_cpu:
         # Small graphs: per-level launch overhead dominates (a path graph runs one level per
-        # node), so the single-thread traversal is faster and trivially order-exact.
+        # node), so the single-thread traversal is faster and trivially order-exact. The Warp
+        # CPU backend executes kernels serially anyway, so on CPU the single-thread traversal
+        # also beats the frontier loop at every size.
         reached = wp.zeros(1, dtype=wp.int32, device=device)
         wp.launch(
             kernel_bfs.single_source_bfs_kernel,
@@ -717,16 +686,25 @@ def bfs(
         order = wp.clone(order_buffer[:n_reached])
         return order, parents, distances
 
-    # Level-synchronous frontier BFS that reproduces scipy's FIFO discovery order exactly:
-    # unvisited neighbors are claimed with the key (parent dequeue rank) * n + node via
-    # atomic_min (first-dequeued parent wins, matching scipy's predecessor), and each level's
-    # candidates are radix-sorted by that key — rank-major then ascending node id, which equals
-    # encounter order because the CSR columns are ascending. The sorted level is appended to
-    # ``order_buffer``, whose slices double as the frontiers. One 4-byte sync per level.
-    claim_key = wp.full(node_count, INT64_MAX, dtype=wp.int64, device=device)
-    candidate_buffer = wp.empty(2 * node_count, dtype=wp.int32, device=device)
-    keys_buffer = wp.empty(2 * node_count, dtype=wp.int64, device=device)
-    candidate_count = wp.zeros(1, dtype=wp.int32, device=device)
+    # Level-synchronous frontier BFS that reproduces scipy's FIFO discovery order exactly,
+    # sort-free: unvisited neighbors are claimed with the parent dequeue rank via atomic_min
+    # (first-dequeued parent wins, matching scipy's predecessor), per-rank owned counts are
+    # scanned into rank-major segment offsets, and each rank scatters its owned nodes in
+    # ascending CSR column order — (rank, ascending node id), the same order the former int64
+    # claim-key radix sort produced. The whole loop runs on device via ``wp.capture_while``
+    # (kernels launch at fixed dim=node_count and early-exit on the device-side frontier size),
+    # so the only host sync is the final tail readback; when conditional CUDA graphs are
+    # unavailable, ``capture_while`` itself falls back to direct execution with one pinned
+    # 4-byte condition readback per level.
+    scan_block = kernel_bfs.BFS_SCAN_BLOCK
+    n_blocks = (node_count + scan_block - 1) // scan_block
+    padded = n_blocks * scan_block
+    claim_rank = wp.full(node_count, INT32_MAX, dtype=wp.int32, device=device)
+    counts = wp.empty(padded, dtype=wp.int32, device=device)
+    offsets_scan = wp.empty(padded, dtype=wp.int32, device=device)
+    block_sums = wp.empty(n_blocks, dtype=wp.int32, device=device)
+    # state = [frontier start, frontier end, level to emit, loop condition].
+    state = wp.array([0, 1, 1, 1], dtype=wp.int32, device=device)
     wp.launch(
         kernel_bfs.bfs_seed,
         dim=1,
@@ -734,57 +712,61 @@ def bfs(
         device=device,
     )
 
-    node_count_64 = wp.int64(node_count)
-    tail = 1
-    level = 0
-    frontier = order_buffer[0:1]
-    while True:
-        candidate_count.zero_()
+    def bfs_level_body() -> None:
         wp.launch(
-            kernel_bfs.bfs_expand,
-            dim=int(frontier.shape[0]),
+            kernel_bfs.bfs_expand_claim,
+            dim=node_count,
+            inputs=[offsets, columns, order_buffer, state, distances, claim_rank],
+            device=device,
+        )
+        wp.launch(
+            kernel_bfs.bfs_count_claims,
+            dim=node_count,
+            inputs=[offsets, columns, order_buffer, state, distances, claim_rank, counts],
+            device=device,
+        )
+        # Capture-safe fixed-buffer inclusive scan (wp.utils.array_scan allocates temp storage
+        # internally, which conditional graph bodies reject).
+        wp.launch_tiled(
+            kernel_bfs.bfs_scan_blocks,
+            dim=[n_blocks],
+            inputs=[counts, offsets_scan, block_sums],
+            block_dim=scan_block,
+            device=device,
+        )
+        wp.launch(kernel_bfs.bfs_scan_block_sums, dim=1, inputs=[block_sums], device=device)
+        wp.launch(
+            kernel_bfs.bfs_add_block_offsets,
+            dim=node_count,
+            inputs=[block_sums, offsets_scan],
+            device=device,
+        )
+        wp.launch(
+            kernel_bfs.bfs_scatter_claims,
+            dim=node_count,
             inputs=[
                 offsets,
                 columns,
-                frontier,
-                node_count_64,
-                distances,
-                claim_key,
-                candidate_buffer,
-                candidate_count,
-            ],
-            device=device,
-        )
-        count = int(candidate_count.numpy()[0])
-        if count == 0:
-            break
-        wp.launch(
-            kernel_bfs.bfs_gather_claim_keys,
-            dim=count,
-            inputs=[candidate_buffer, claim_key, keys_buffer],
-            device=device,
-        )
-        wp.utils.radix_sort_pairs(keys_buffer, candidate_buffer, count=count)
-        level += 1
-        wp.launch(
-            kernel_bfs.bfs_finalize_level,
-            dim=count,
-            inputs=[
-                candidate_buffer,
-                claim_key,
-                frontier,
-                node_count_64,
-                wp.int32(level),
-                wp.int32(tail),
+                state,
+                claim_rank,
+                offsets_scan,
                 order_buffer,
                 parents,
                 distances,
             ],
             device=device,
         )
-        frontier = order_buffer[tail : tail + count]
-        tail += count
+        wp.launch(kernel_bfs.bfs_update_state, dim=1, inputs=[offsets_scan, state], device=device)
 
+    condition = state[3:4]
+    if wp.is_conditional_graph_supported():
+        with wp.ScopedCapture(device) as capture:
+            wp.capture_while(condition, bfs_level_body)
+        wp.capture_launch(capture.graph)
+    else:
+        wp.capture_while(condition, bfs_level_body)
+
+    tail = int(state[1:2].numpy()[0])
     order = wp.clone(order_buffer[:tail])
     return order, parents, distances
 
