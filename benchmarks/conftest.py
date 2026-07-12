@@ -88,6 +88,11 @@ MESHES: list[MeshSpec] = [
 MESHES_BY_NAME = {mesh["name"]: mesh for mesh in MESHES}
 MESH_ORDER = [mesh["name"] for mesh in MESHES]
 
+RIM_LONG = 1 << 16
+SYNTHETIC_MESHES: list[MeshSpec] = [_mesh("synthetic_cylinder", "", 2 * RIM_LONG)]
+SYNTHETIC_MESHES_BY_NAME = {mesh["name"]: mesh for mesh in SYNTHETIC_MESHES}
+ALL_MESHES_BY_NAME = {**MESHES_BY_NAME, **SYNTHETIC_MESHES_BY_NAME}
+
 
 def skip_larger_than(bench_case: BenchCase, largest: str, reason: str = "") -> None:
     """Skip the current case when its mesh is larger than ``largest`` (registry order)."""
@@ -114,6 +119,18 @@ _numpy_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 _wp_cache: dict[tuple[str, str, str], wp.array] = {}
 
 
+def _open_cylinder(rim: int) -> tuple[np.ndarray, np.ndarray]:
+    """Open tube with two boundary rims of ``rim`` vertices each (``2 * rim`` triangles)."""
+    angle = 2.0 * np.pi * np.arange(rim) / rim
+    ring = np.column_stack((np.cos(angle), np.sin(angle), np.zeros(rim)))
+    vertices = np.vstack((ring, ring + np.array([0.0, 0.0, 1.0]))).astype(np.float32)
+    j = np.arange(rim)
+    k = (j + 1) % rim
+    lower = np.column_stack((j, k, j + rim))
+    upper = np.column_stack((j + rim, k, k + rim))
+    return vertices, np.vstack((lower, upper)).astype(np.int32)
+
+
 def _load_numpy(name: str) -> tuple[np.ndarray, np.ndarray]:
     """
     Read ``(vertices_f64, faces_i64)`` once with meshio, cached across the session.
@@ -123,6 +140,14 @@ def _load_numpy(name: str) -> tuple[np.ndarray, np.ndarray]:
     buffers are built from the same source.
     """
     if name not in _numpy_cache:
+        if name == "synthetic_cylinder":
+            vertices, faces = _open_cylinder(RIM_LONG)
+            _numpy_cache[name] = (
+                np.ascontiguousarray(vertices, dtype=np.float64),
+                np.ascontiguousarray(faces, dtype=np.int64),
+            )
+            return _numpy_cache[name]
+
         import meshio
 
         mesh = meshio.read(DATA_DIR / MESHES_BY_NAME[name]["filename"])
@@ -241,6 +266,20 @@ def _supported_kinds(metafunc: pytest.Metafunc) -> set[str]:
     return set(marker.args)
 
 
+def _test_meshes(metafunc: pytest.Metafunc, lib: LibrarySpec) -> list[MeshSpec]:
+    """Meshes for one test: explicit ``benchmeshes`` names, else registry filtered by CLI flags."""
+    marker = metafunc.definition.get_closest_marker("benchmeshes")
+    if marker is not None:
+        meshes = []
+        for name in marker.args:
+            spec = ALL_MESHES_BY_NAME.get(name)
+            if spec is None:
+                raise pytest.UsageError(f"unknown benchmeshes name: {name!r}")
+            meshes.append(spec)
+        return meshes
+    return _selected_meshes(metafunc.config, lib)
+
+
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     if "mesh_name" not in metafunc.fixturenames or "library" not in metafunc.fixturenames:
         return
@@ -250,7 +289,7 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     for lib in _selected_libraries(metafunc.config):
         if lib["kind"] not in supported:
             continue
-        for mesh in _selected_meshes(metafunc.config, lib):
+        for mesh in _test_meshes(metafunc, lib):
             cases.append((mesh["name"], lib["id"]))
             ids.append(f"{mesh['name']}-{lib['id']}")
     metafunc.parametrize(("mesh_name", "library"), cases, ids=ids)
@@ -259,6 +298,10 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers", "benchlibs(*kinds): library kinds (triwarp/trimesh/igl) a benchmark supports."
+    )
+    config.addinivalue_line(
+        "markers",
+        "benchmeshes(*names): mesh names for a benchmark (registry or synthetic); bypasses --size.",
     )
     # Default to one comparison table per (function, mesh): the ``group`` marker is the function
     # name and ``param:mesh_name`` splits by mesh, so each table lists the libraries side by side.

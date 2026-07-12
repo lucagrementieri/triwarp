@@ -19,7 +19,7 @@ from scipy.sparse.csgraph import breadth_first_order
 
 import triwarp as tw
 
-_N_SOURCES = 1_024
+_N_SOURCES = 128
 _SOURCE_SEED = 3
 _SPLIT_COPIES = 64
 
