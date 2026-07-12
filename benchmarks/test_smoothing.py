@@ -9,6 +9,7 @@ loop takes tens of seconds on ``dragon``.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
@@ -57,9 +58,13 @@ def test_filter_mut_dif_laplacian(bench_case: BenchCase, volume_constraint: bool
 
         def run() -> tm.Trimesh:
             mesh = tm.Trimesh(vertices, faces, process=False)
-            tm.smoothing.filter_mut_dif_laplacian(
-                mesh, iterations=_ITERATIONS, volume_constraint=volume_constraint
-            )
+            # trimesh's reference normalizes vertex normals via a scipy-sparse divide that
+            # hits 1/0 on degenerate (zero-length) normals; the result is finite and
+            # unused, so silence the third-party warning rather than let it leak.
+            with np.errstate(divide="ignore", invalid="ignore"):
+                tm.smoothing.filter_mut_dif_laplacian(
+                    mesh, iterations=_ITERATIONS, volume_constraint=volume_constraint
+                )
             return mesh
 
         result = bench_case.run(run)
