@@ -32,16 +32,31 @@ band of bridge triangles via a greedy correspondence, producing a single waterti
 [`stitch_min_weight`][triwarp.stitching.stitch_min_weight] (and
 [`triangulate_boundaries_min_weight`][triwarp.stitching.triangulate_boundaries_min_weight]) instead
 choose the band that minimizes a stitch metric (the MeshLib ``stitchHoles`` grid DP). No smoothing
-or refinement is applied.
+or refinement is applied by these lower-level fillers.
+
+For a smooth, well-graded patch, [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely] and
+[`stitch_nicely`][triwarp.stitching.stitch_nicely] run the full MeshLib ``fillHoleNicely`` /
+``stitchHolesNicely`` pipeline on top of the min-weight fill/stitch: the patch is refined to a
+target edge length with Delaunay edge flips
+([`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size]) and its new interior
+vertices are smoothed into the surrounding surface — a sharp-boundary umbrella solve
+([`position_verts_smoothly_sharp_boundary`][triwarp.smoothing.position_verts_smoothly_sharp_boundary])
+followed by a cross-boundary least-squares solve
+([`position_verts_smoothly`][triwarp.smoothing.position_verts_smoothly]), with an optional
+``natural_smooth`` collar that blends the patch into the neighbouring surface.
 """
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import scatter as kernel_scatter
+from triwarp.kernels import selection as kernel_selection
 from triwarp.kernels import stitching as kernel_stitching
 
 
@@ -1127,3 +1142,387 @@ def stitch_min_weight(
     return triangulate_boundaries_min_weight(
         vertices_a, faces_a, loops_a[0], vertices_b, faces_b, loops_b[0], metric, up_dir
     )
+
+
+# ---------------------------------------------------------------------------
+# "Nicely" pipeline: min-weight fill / stitch -> region subdivision -> region smoothing
+# (MeshLib fillHoleNicely / stitchHolesNicely, MRFillHoleNicely.cpp).
+# ---------------------------------------------------------------------------
+
+
+def _mean_rim_edge_length(vertices: wp.array[wp.vec3], loops: list[wp.array[wp.int32]]) -> float:
+    """Mean edge length over the rims of the given loops (the derived subdivision target)."""
+    total = 0.0
+    count = 0
+    vertices_np = vertices.numpy()
+    for loop in loops:
+        loop_np = loop.numpy()
+        pos = vertices_np[loop_np]
+        seg = np.linalg.norm(pos - np.roll(pos, -1, axis=0), axis=1)
+        total += float(seg.sum())
+        count += int(seg.shape[0])
+    return total / count if count > 0 else 0.0
+
+
+def _boundary_verts_mask(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> wp.array[wp.bool]:
+    """Length-``n_vertices`` mask of mesh-boundary vertices (MeshLib ``findBdVerts``)."""
+    device = faces.device
+    n = int(vertices.shape[0])
+    mask = wp.zeros(n, dtype=wp.bool, device=device)
+    boundary = tw.boundary.boundary_vertex_indices(vertices, faces)
+    if int(boundary.shape[0]) > 0:
+        wp.launch(
+            kernel_scatter.mark_membership_mask,
+            dim=int(boundary.shape[0]),
+            inputs=[boundary, wp.int32(n), mask],
+            device=device,
+        )
+    return mask
+
+
+def _finish_nicely(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    n_vertices_before: int,
+    patch_face_mask: wp.array[wp.bool],
+    max_edge: float,
+    max_edge_splits: int,
+    max_angle_change_after_flip: float,
+    smooth_curvature: bool,
+    smooth_boundary: bool,
+    natural_smooth: bool,
+    edge_weights: str,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.bool]]:
+    """
+    Subdivide the patch and smooth its new vertices.
+
+    Ports MeshLib ``subdivideFillingNicely`` + ``smoothFillingNicely``.
+
+    Shared finisher of [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely] and
+    [`stitch_nicely`][triwarp.stitching.stitch_nicely].
+    """
+    device = faces.device
+    vertices, faces, patch_face_mask = tw.remesh.subdivide_region_to_size(
+        vertices,
+        faces,
+        patch_face_mask,
+        max_edge=max_edge,
+        max_splits=max_edge_splits,
+        max_angle_change=max_angle_change_after_flip,
+    )
+    if not smooth_curvature:
+        return vertices, faces, patch_face_mask
+
+    n = int(vertices.shape[0])
+    # New (interior patch) vertices are the tail appended by subdivision, minus mesh-boundary verts.
+    new_verts_np = np.zeros(n, dtype=bool)
+    new_verts_np[n_vertices_before:] = True
+    new_verts = wp.array(new_verts_np, dtype=wp.bool, device=device)
+    bd_mask = _boundary_verts_mask(vertices, faces)
+    free = wp.empty(n, dtype=wp.bool, device=device)
+    wp.map(kernel_selection.mask_and_not, new_verts, bd_mask, out=free)
+
+    vertices = tw.smoothing.position_verts_smoothly_sharp_boundary(vertices, faces, free)
+    if smooth_boundary:
+        vertices = tw.smoothing.position_verts_smoothly(vertices, faces, free, edge_weights)
+
+    if natural_smooth:
+        edges_bd = tw.selection.region_boundary_edges(faces, patch_face_mask, n_vertices=n)
+        incident = wp.zeros(n, dtype=wp.bool, device=device)
+        k = int(edges_bd.shape[0])
+        if k > 0:
+            endpoints = wp.clone(twt.as_array2d_int32(edges_bd).reshape(-1))
+            wp.launch(
+                kernel_scatter.mark_membership_mask,
+                dim=2 * k,
+                inputs=[endpoints, wp.int32(n), incident],
+                device=device,
+            )
+        incident = tw.selection.expand_vertex_mask(faces, incident, 5)
+        incident = tw.selection.shrink_vertex_mask(faces, incident, 2)
+        incident = tw.selection.exclude_fully_selected_components(faces, incident, n)
+        if bool(incident.numpy().any()):
+            bd_mask = _boundary_verts_mask(vertices, faces)
+            free2 = wp.empty(n, dtype=wp.bool, device=device)
+            wp.map(kernel_selection.mask_and_not, incident, bd_mask, out=free2)
+            vertices = tw.smoothing.position_verts_smoothly_sharp_boundary(vertices, faces, free2)
+            vertices = tw.smoothing.position_verts_smoothly(vertices, faces, free2, edge_weights)
+
+    return vertices, faces, patch_face_mask
+
+
+def _patch_mask(
+    n_faces_before: int, n_faces_after: int, device: wp.DeviceLike
+) -> wp.array[wp.bool]:
+    """Boolean face mask marking the trailing ``[n_faces_before, n_faces_after)`` fill faces."""
+    mask = np.zeros(n_faces_after, dtype=bool)
+    mask[n_faces_before:] = True
+    return wp.array(mask, dtype=wp.bool, device=device)
+
+
+def fill_holes_nicely(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    metric: str = "plane_normalized",
+    *,
+    triangulate_only: bool = False,
+    max_edge: float | None = None,
+    max_edge_splits: int = 1000,
+    max_angle_change_after_flip: float = math.radians(30.0),
+    smooth_curvature: bool = True,
+    natural_smooth: bool = False,
+    edge_weights: str = "cotan",
+    preserve_largest_hole: bool = False,
+    resolve_multiple_edges: bool = True,
+    smooth_boundary: bool = True,
+    return_patch: bool = False,
+) -> (
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+    | tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.bool]]
+):
+    """
+    Fill every boundary hole with a smooth, refined patch (MeshLib ``fillHoleNicely``).
+
+    Runs the full three-stage pipeline: a minimum-weight triangulation seals each hole over its
+    existing rim vertices ([`fill_holes_min_weight`][triwarp.stitching.fill_holes_min_weight]),
+    the patch is then subdivided to ``max_edge`` with Delaunay edge flips
+    ([`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size]), and finally the new
+    interior patch vertices are smoothed into the surrounding surface
+    ([`position_verts_smoothly_sharp_boundary`][triwarp.smoothing.position_verts_smoothly_sharp_boundary]
+    then [`position_verts_smoothly`][triwarp.smoothing.position_verts_smoothly]). Unlike the purely
+    topological fillers, this produces a well-graded, curvature-continuous patch.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    metric
+        Minimum-weight fill metric; see
+        [`fill_holes_min_weight`][triwarp.stitching.fill_holes_min_weight].
+    triangulate_only
+        When ``True``, only fill (no subdivision or smoothing) — equivalent to
+        [`fill_holes_min_weight`][triwarp.stitching.fill_holes_min_weight].
+    max_edge
+        Target maximum patch edge length. ``None`` (default) derives it from the mean rim edge
+        length of the holes being filled (MeshLib's ``maxEdgeLen = 0`` budget target has no
+        parallel analogue).
+    max_edge_splits
+        Soft cap on the number of edge splits during subdivision (``maxEdgeSplits``).
+    max_angle_change_after_flip
+        Dihedral-angle-change gate for the Delaunay flip pass (default 30°).
+    smooth_curvature
+        When ``True`` (default), smooth the new patch vertices after subdivision.
+    natural_smooth
+        When ``True``, additionally grow a collar around the patch and smooth it so the patch
+        blends into the surrounding surface (MeshLib ``naturalSmooth``).
+    edge_weights
+        Laplacian edge weights for the cross-boundary smooth solve: ``"cotan"`` (default) or
+        ``"unit"``.
+    preserve_largest_hole
+        When ``True``, leave the single largest boundary loop open.
+    resolve_multiple_edges
+        When ``True`` (default), forbid fill chords that duplicate existing mesh edges.
+    smooth_boundary
+        When ``True`` (default), also run the cross-boundary smooth solve so the patch is C¹ across
+        its rim (MeshLib ``smoothBd``). Also tunes the fill metric's rim edge terms.
+    return_patch
+        When ``True``, also return a length-``n_out_faces`` ``wp.bool`` mask of the patch faces.
+
+    Returns
+    -------
+    new_vertices : wp.array[wp.vec3]
+        Original vertices followed by the inserted patch vertices, on ``vertices.device``.
+    new_faces : wp.array[wp.int32]
+        Original faces followed by the patch faces.
+    patch_mask : wp.array[wp.bool]
+        Only when ``return_patch`` is ``True``: mask of the patch faces in ``new_faces``.
+
+    Raises
+    ------
+    ValueError
+        If ``metric`` or ``edge_weights`` is unknown.
+
+    See Also
+    --------
+    [`fill_holes_min_weight`][triwarp.stitching.fill_holes_min_weight]
+    [`stitch_nicely`][triwarp.stitching.stitch_nicely]
+    [`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size]
+
+    Notes
+    -----
+    The subdivision and smoothing stages require a CUDA device (``warp.optim.linear.cg`` produces
+    NaN on CPU in Warp 1.14-1.15); ``triangulate_only=True`` stays CPU-capable. Winding is
+    consistent with the surrounding faces only for a consistently wound input.
+    """
+    if metric not in _METRIC_IDS:
+        raise ValueError(f"metric must be one of {sorted(_METRIC_IDS)}, got {metric!r}")
+    if edge_weights not in ("cotan", "unit"):
+        raise ValueError(f"edge_weights must be 'cotan' or 'unit', got {edge_weights!r}")
+
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    loops = _fillable_loops(vertices, faces, preserve_largest_hole) if n_faces > 0 else []
+    if len(loops) == 0:
+        empty = _patch_mask(int(faces.shape[0]) // 3, int(faces.shape[0]) // 3, device)
+        result = (wp.clone(vertices), wp.clone(faces))
+        return (*result, empty) if return_patch else result
+
+    n_faces_before = int(faces.shape[0]) // 3
+    n_vertices_before = int(vertices.shape[0])
+    faces_filled = _fill_loops(
+        vertices, faces, loops, metric, resolve_multiple_edges, smooth_boundary
+    )
+    n_faces_after = int(faces_filled.shape[0]) // 3
+    patch_mask = _patch_mask(n_faces_before, n_faces_after, device)
+
+    if triangulate_only:
+        result = (wp.clone(vertices), faces_filled)
+        return (*result, patch_mask) if return_patch else result
+
+    target_edge = max_edge if max_edge is not None else _mean_rim_edge_length(vertices, loops)
+    new_vertices, new_faces, out_patch = _finish_nicely(
+        vertices,
+        faces_filled,
+        n_vertices_before,
+        patch_mask,
+        target_edge,
+        max_edge_splits,
+        max_angle_change_after_flip,
+        smooth_curvature,
+        smooth_boundary,
+        natural_smooth,
+        edge_weights,
+    )
+    return (new_vertices, new_faces, out_patch) if return_patch else (new_vertices, new_faces)
+
+
+def stitch_nicely(
+    vertices_a: wp.array[wp.vec3],
+    faces_a: wp.array[wp.int32],
+    vertices_b: wp.array[wp.vec3],
+    faces_b: wp.array[wp.int32],
+    metric: str = "complex_stitch",
+    up_dir: tuple[float, float, float] | None = None,
+    *,
+    triangulate_only: bool = False,
+    max_edge: float | None = None,
+    max_edge_splits: int = 1000,
+    max_angle_change_after_flip: float = math.radians(30.0),
+    smooth_curvature: bool = True,
+    natural_smooth: bool = False,
+    edge_weights: str = "cotan",
+    return_patch: bool = False,
+) -> (
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+    | tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.bool]]
+):
+    """
+    Stitch two open meshes with a smooth, refined band (MeshLib ``stitchHolesNicely``).
+
+    Like [`stitch_min_weight`][triwarp.stitching.stitch_min_weight] but the connecting band is then
+    subdivided and smoothed by the same finisher as
+    [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely]. Each mesh must have exactly one
+    boundary loop. The cross-boundary smooth solve is always applied (MeshLib forces ``smoothBd``).
+
+    Parameters
+    ----------
+    vertices_a, vertices_b
+        ``(n_vertices,)`` vertex positions of each mesh.
+    faces_a, faces_b
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffers of each mesh.
+    metric
+        Stitch metric; see
+        [`triangulate_boundaries_min_weight`][triwarp.stitching.triangulate_boundaries_min_weight].
+    up_dir
+        Up direction for the ``"vertical"`` stitch metric.
+    triangulate_only
+        See [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely].
+    max_edge
+        See [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely].
+    max_edge_splits
+        See [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely].
+    max_angle_change_after_flip
+        See [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely].
+    smooth_curvature
+        See [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely].
+    natural_smooth
+        See [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely].
+    edge_weights
+        See [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely].
+    return_patch
+        See [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely].
+
+    Returns
+    -------
+    new_vertices : wp.array[wp.vec3]
+        Concatenated vertices followed by any inserted band vertices, on ``faces_a.device``.
+    new_faces : wp.array[wp.int32]
+        Concatenated, reindexed faces followed by the band faces.
+    patch_mask : wp.array[wp.bool]
+        Only when ``return_patch`` is ``True``: mask of the band faces.
+
+    Raises
+    ------
+    ValueError
+        If either mesh lacks exactly one boundary loop, or ``metric`` / ``edge_weights`` is unknown.
+
+    See Also
+    --------
+    [`stitch_min_weight`][triwarp.stitching.stitch_min_weight]
+    [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely]
+    """
+    if metric not in _STITCH_METRIC_IDS:
+        raise ValueError(f"metric must be one of {sorted(_STITCH_METRIC_IDS)}, got {metric!r}")
+    if edge_weights not in ("cotan", "unit"):
+        raise ValueError(f"edge_weights must be 'cotan' or 'unit', got {edge_weights!r}")
+
+    loops_a = [
+        loop for loop in tw.boundary.boundary_loops(vertices_a, faces_a) if int(loop.shape[0]) >= 3
+    ]
+    loops_b = [
+        loop for loop in tw.boundary.boundary_loops(vertices_b, faces_b) if int(loop.shape[0]) >= 3
+    ]
+    if len(loops_a) != 1 or len(loops_b) != 1:
+        raise ValueError(
+            "stitch_nicely requires each mesh to have exactly one boundary loop (>=3 verts); "
+            f"got {len(loops_a)} and {len(loops_b)}"
+        )
+
+    device = faces_a.device
+    n_faces_before = (int(faces_a.shape[0]) + int(faces_b.shape[0])) // 3
+    n_vertices_before = int(vertices_a.shape[0]) + int(vertices_b.shape[0])
+    combined_vertices, combined_faces = triangulate_boundaries_min_weight(
+        vertices_a, faces_a, loops_a[0], vertices_b, faces_b, loops_b[0], metric, up_dir
+    )
+    n_faces_after = int(combined_faces.shape[0]) // 3
+    patch_mask = _patch_mask(n_faces_before, n_faces_after, device)
+
+    if triangulate_only:
+        result = (combined_vertices, combined_faces)
+        return (*result, patch_mask) if return_patch else result
+
+    rim_loops = [
+        wp.array(loops_a[0].numpy(), dtype=wp.int32, device=device),
+        wp.array(loops_b[0].numpy() + int(vertices_a.shape[0]), dtype=wp.int32, device=device),
+    ]
+    target_edge = (
+        max_edge if max_edge is not None else _mean_rim_edge_length(combined_vertices, rim_loops)
+    )
+    new_vertices, new_faces, out_patch = _finish_nicely(
+        combined_vertices,
+        combined_faces,
+        n_vertices_before,
+        patch_mask,
+        target_edge,
+        max_edge_splits,
+        max_angle_change_after_flip,
+        smooth_curvature,
+        True,  # stitchHolesNicely forces smoothBd
+        natural_smooth,
+        edge_weights,
+    )
+    return (new_vertices, new_faces, out_patch) if return_patch else (new_vertices, new_faces)

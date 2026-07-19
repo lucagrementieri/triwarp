@@ -223,3 +223,93 @@ def test_empty_mesh(device: str) -> None:
     faces = wp.empty(0, dtype=wp.int32, device=device)
     smoothed_wp = tw.smoothing.filter_taubin(vertices, faces, iterations=4)
     assert int(smoothed_wp.shape[0]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Region smoothing solves vs MeshLib (positionVertsSmoothly / SharpBd)
+# ---------------------------------------------------------------------------
+
+_meshlib = pytest.importorskip("meshlib")
+from meshlib import mrmeshnumpy as _mn  # noqa: E402
+from meshlib import mrmeshpy as _mm  # noqa: E402
+
+
+def _sphere_region(subdivisions: int = 2, z_cut: float = 0.5):
+    sph = tm.creation.icosphere(subdivisions=subdivisions, radius=1.0)
+    vertices = sph.vertices.astype(np.float64)
+    faces = sph.faces.astype(np.int32)
+    free = vertices[:, 2] > z_cut
+    return vertices, faces, free
+
+
+def test_position_verts_smoothly_sharp_boundary_matches_meshlib(device: str):
+    if wp.get_device(device).is_cpu:
+        pytest.skip("region smoothing requires a CUDA device (warp.optim.linear.cg)")
+    vertices_np, faces_np, free_np = _sphere_region()
+    v_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    f_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
+    free_wp = wp.array(free_np, dtype=wp.bool, device=device)
+
+    result_wp = tw.smoothing.position_verts_smoothly_sharp_boundary(v_wp, f_wp, free_wp)
+
+    mesh_ml = _mn.meshFromFacesVerts(faces_np, vertices_np.astype(np.float32))
+    params_ml = _mm.PositionVertsSmoothlyParams()
+    params_ml.region = _mn.vertBitSetFromBools(free_np)
+    _mm.positionVertsSmoothlySharpBd(mesh_ml, params_ml)
+    verts_ml = _mn.getNumpyVerts(mesh_ml)
+
+    assert np.allclose(result_wp.numpy(), verts_ml, rtol=1e-5, atol=1e-5)
+    assert np.array_equal(result_wp.numpy()[~free_np], v_wp.numpy()[~free_np])
+
+
+@pytest.mark.parametrize("edge_weights", ["cotan", "unit"])
+def test_position_verts_smoothly_matches_meshlib(device: str, edge_weights: str):
+    if wp.get_device(device).is_cpu:
+        pytest.skip("region smoothing requires a CUDA device (warp.optim.linear.cg)")
+    vertices_np, faces_np, free_np = _sphere_region()
+    v_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    f_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
+    free_wp = wp.array(free_np, dtype=wp.bool, device=device)
+
+    result_wp = tw.smoothing.position_verts_smoothly(v_wp, f_wp, free_wp, edge_weights=edge_weights)
+
+    mesh_ml = _mn.meshFromFacesVerts(faces_np, vertices_np.astype(np.float32))
+    ew_ml = _mm.EdgeWeights.Cotan if edge_weights == "cotan" else _mm.EdgeWeights.Unit
+    _mm.positionVertsSmoothly(mesh_ml, _mn.vertBitSetFromBools(free_np), ew_ml, _mm.VertexMass.Unit)
+    verts_ml = _mn.getNumpyVerts(mesh_ml)
+
+    assert np.allclose(result_wp.numpy(), verts_ml, rtol=1e-4, atol=1e-4)
+    assert np.array_equal(result_wp.numpy()[~free_np], v_wp.numpy()[~free_np])
+
+
+def test_position_verts_sharp_boundary_dirichlet_residual(device: str):
+    if wp.get_device(device).is_cpu:
+        pytest.skip("region smoothing requires a CUDA device (warp.optim.linear.cg)")
+    vertices_np, faces_np, free_np = _sphere_region()
+    v_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    f_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
+    free_wp = wp.array(free_np, dtype=wp.bool, device=device)
+
+    result = tw.smoothing.position_verts_smoothly_sharp_boundary(v_wp, f_wp, free_wp).numpy()
+
+    # Umbrella (unit-weight) residual: deg(v) * p_v - sum_neighbors p_d == 0 for every free vertex.
+    adjacency: dict[int, list[int]] = {}
+    for tri in faces_np:
+        for a, b in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])):
+            adjacency.setdefault(int(a), set()).add(int(b))
+            adjacency.setdefault(int(b), set()).add(int(a))
+    max_residual = 0.0
+    for v in np.flatnonzero(free_np):
+        neighbors = list(adjacency[int(v)])
+        residual = len(neighbors) * result[v] - result[neighbors].sum(axis=0)
+        max_residual = max(max_residual, float(np.linalg.norm(residual)))
+    assert max_residual < 1e-4
+
+
+def test_position_verts_smoothly_empty_region(device: str):
+    vertices_np, faces_np, _ = _sphere_region()
+    v_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    f_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
+    empty = wp.zeros(len(vertices_np), dtype=wp.bool, device=device)
+    result = tw.smoothing.position_verts_smoothly_sharp_boundary(v_wp, f_wp, empty)
+    assert np.array_equal(result.numpy(), v_wp.numpy())

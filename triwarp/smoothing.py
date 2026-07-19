@@ -673,3 +673,281 @@ def _build_implicit_system(
         device=device,
     )
     return wps.bsr_from_triplets(n, n, rows, cols, vals, prune_numerical_zeros=False)
+
+
+# ---------------------------------------------------------------------------
+# Region smoothing solves (positionVertsSmoothly / positionVertsSmoothlySharpBd)
+# ---------------------------------------------------------------------------
+
+_CG_TOLERANCE_POSITION = 1e-10
+
+
+def _mask_to_map(mask: wp.array[wp.bool]) -> tuple[wp.array[wp.int32], int]:
+    """Compact index map over the ``True`` entries plus their count (exclusive scan)."""
+    device = mask.device
+    n = int(mask.shape[0])
+    if n == 0:
+        return wp.zeros(0, dtype=wp.int32, device=device), 0
+    flags = wp.empty(n, dtype=wp.int32, device=device)
+    wp.utils.array_cast(mask, flags)
+    cmap = wp.empty(n, dtype=wp.int32, device=device)
+    inclusive = wp.empty(n, dtype=wp.int32, device=device)
+    wp.utils.array_scan(flags, out_array=cmap, inclusive=False)
+    wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
+    return cmap, int(inclusive.numpy()[-1])
+
+
+def _edge_weight_matrix(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], edge_weights: str
+) -> wps.BsrMatrix[wp.float64]:
+    """Symmetric ``(n, n)`` float64 edge-weight matrix (zero diagonal); unit or clamped cotan."""
+    device = vertices.device
+    n = int(vertices.shape[0])
+    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n)
+    m = int(unique_edges.shape[0])
+    weights = wp.zeros(m, dtype=wp.float32, device=device)
+    if edge_weights == "unit":
+        weights.fill_(1.0)
+    elif edge_weights == "cotan":
+        wp.launch(
+            kernel_smoothing.edge_cotan_add,
+            dim=int(faces.shape[0]) // 3,
+            inputs=[vertices, faces, inverse, weights],
+            device=device,
+        )
+        wp.map(kernel_smoothing.clamp_cotan, weights, out=weights)
+    else:
+        raise ValueError(f"edge_weights must be 'unit' or 'cotan', got {edge_weights!r}")
+    rows = wp.empty(2 * m, dtype=wp.int32, device=device)
+    cols = wp.empty(2 * m, dtype=wp.int32, device=device)
+    vals = wp.empty(2 * m, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_smoothing.symmetric_weight_triplets,
+        dim=m,
+        inputs=[unique_edges, weights, rows, cols, vals],
+        device=device,
+    )
+    return wps.bsr_from_triplets(n, n, rows, cols, vals, prune_numerical_zeros=False)
+
+
+def _solve_spd_xyz(
+    system: wps.BsrMatrix[wp.float64],
+    rhs_x: wp.array[wp.float64],
+    rhs_y: wp.array[wp.float64],
+    rhs_z: wp.array[wp.float64],
+    n: int,
+) -> tuple[wp.array[wp.float64], wp.array[wp.float64], wp.array[wp.float64]]:
+    """Solve the same SPD system for three right-hand sides (x/y/z), sharing a preconditioner."""
+    device = rhs_x.device
+    preconditioner = wpl.preconditioner(system, "diag")
+    sol_x = wp.zeros(n, dtype=wp.float64, device=device)
+    sol_y = wp.zeros(n, dtype=wp.float64, device=device)
+    sol_z = wp.zeros(n, dtype=wp.float64, device=device)
+    wpl.cg(system, rhs_x, sol_x, tol=_CG_TOLERANCE_POSITION, maxiter=10 * n, M=preconditioner)
+    wpl.cg(system, rhs_y, sol_y, tol=_CG_TOLERANCE_POSITION, maxiter=10 * n, M=preconditioner)
+    wpl.cg(system, rhs_z, sol_z, tol=_CG_TOLERANCE_POSITION, maxiter=10 * n, M=preconditioner)
+    return sol_x, sol_y, sol_z
+
+
+def position_verts_smoothly_sharp_boundary(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    free_mask: wp.array[wp.bool],
+    stabilizer: float = 0.0,
+) -> wp.array[wp.vec3]:
+    """
+    Reposition a free vertex region as the umbrella-Laplacian solution with a sharp fixed boundary.
+
+    Ports MeshLib ``positionVertsSmoothlySharpBd``: the free vertices (``free_mask``) are moved to
+    the solution of the graph-Laplacian Dirichlet system ``(D - W) x = b`` (unit edge weights),
+    where the fixed one-ring neighbours are folded into ``b``, so the region rim stays sharp
+    (a hard C⁰ constraint). Fixed vertices keep their positions.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    free_mask
+        Length-``n_vertices`` ``wp.bool`` mask of the vertices to reposition.
+    stabilizer
+        Optional attraction to the original position (adds to the diagonal), which also makes the
+        system solvable for a fully-free component. Defaults to ``0``.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        New vertex positions on ``vertices.device`` (a copy; fixed vertices unchanged).
+
+    Raises
+    ------
+    NotImplementedError
+        On a CPU device (``warp.optim.linear.cg`` produces NaN on CPU in Warp 1.14-1.15).
+
+    See Also
+    --------
+    [`position_verts_smoothly`][triwarp.smoothing.position_verts_smoothly]
+    [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely]
+
+    Notes
+    -----
+    The system is SPD only when no free connected component is entirely free (or ``stabilizer >
+    0``); the hole-filling pipeline guarantees this because the patch rim is always fixed.
+    """
+    device = vertices.device
+    n = int(vertices.shape[0])
+    out = wp.clone(vertices)
+    if int(faces.shape[0]) == 0 or n == 0:
+        return out
+    free_map, n_free = _mask_to_map(free_mask)
+    if n_free == 0:
+        return out
+    _require_cuda(device, "position_verts_smoothly_sharp_boundary")
+
+    weight_matrix = _edge_weight_matrix(vertices, faces, "unit")
+    nnz = int(weight_matrix.nnz)
+    size = nnz + n
+    out_rows = wp.zeros(size, dtype=wp.int32, device=device)
+    out_cols = wp.zeros(size, dtype=wp.int32, device=device)
+    out_vals = wp.zeros(size, dtype=wp.float64, device=device)
+    rhs_x = wp.zeros(n_free, dtype=wp.float64, device=device)
+    rhs_y = wp.zeros(n_free, dtype=wp.float64, device=device)
+    rhs_z = wp.zeros(n_free, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_smoothing.dirichlet_system_triplets,
+        dim=n,
+        inputs=[
+            weight_matrix.offsets,
+            weight_matrix.columns,
+            weight_matrix.values,
+            free_mask,
+            free_map,
+            vertices,
+            wp.float64(stabilizer),
+            out_rows,
+            out_cols,
+            out_vals,
+            rhs_x,
+            rhs_y,
+            rhs_z,
+        ],
+        device=device,
+    )
+    system = wps.bsr_from_triplets(
+        n_free, n_free, out_rows, out_cols, out_vals, prune_numerical_zeros=False
+    )
+    sol_x, sol_y, sol_z = _solve_spd_xyz(system, rhs_x, rhs_y, rhs_z, n_free)
+    wp.launch(
+        kernel_smoothing.scatter_free_solution,
+        dim=n,
+        inputs=[free_mask, free_map, sol_x, sol_y, sol_z, out],
+        device=device,
+    )
+    return out
+
+
+def position_verts_smoothly(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    free_mask: wp.array[wp.bool],
+    edge_weights: str = "cotan",
+) -> wp.array[wp.vec3]:
+    """
+    Reposition a free vertex region so the surface is smooth across the region boundary too.
+
+    Ports MeshLib ``positionVertsSmoothly`` (the ``Laplacian`` least-squares solve with
+    ``RememberShape::No``): every vertex in the region and its first fixed ring contributes the
+    umbrella equation ``p_v = Σ_d (w_vd / ΣW) p_d``; free vertices are unknowns and fixed
+    neighbours move to the right-hand side. The normal equations ``(MᵀM) x = Mᵀ b`` are solved per
+    coordinate, giving a patch that is smooth (C¹) *across* the region rim, unlike the sharp-rim
+    [`position_verts_smoothly_sharp_boundary`][triwarp.smoothing.position_verts_smoothly_sharp_boundary].
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    free_mask
+        Length-``n_vertices`` ``wp.bool`` mask of the vertices to reposition.
+    edge_weights
+        ``"cotan"`` (default, clamped cotangent weights) or ``"unit"`` (uniform).
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        New vertex positions on ``vertices.device`` (a copy; fixed vertices unchanged).
+
+    Raises
+    ------
+    NotImplementedError
+        On a CPU device.
+    ValueError
+        If ``edge_weights`` is not ``"cotan"`` or ``"unit"``.
+
+    See Also
+    --------
+    [`position_verts_smoothly_sharp_boundary`][triwarp.smoothing.position_verts_smoothly_sharp_boundary]
+    [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely]
+    """
+    device = vertices.device
+    n = int(vertices.shape[0])
+    out = wp.clone(vertices)
+    if int(faces.shape[0]) == 0 or n == 0:
+        return out
+    free_map, n_free = _mask_to_map(free_mask)
+    if n_free == 0:
+        return out
+    _require_cuda(device, "position_verts_smoothly")
+
+    row_mask = tw.selection.expand_vertex_mask(faces, free_mask, 1)
+    row_map, n_rows = _mask_to_map(row_mask)
+    weight_matrix = _edge_weight_matrix(vertices, faces, edge_weights)
+    nnz = int(weight_matrix.nnz)
+    size = nnz + n
+    rows = wp.zeros(size, dtype=wp.int32, device=device)
+    cols = wp.zeros(size, dtype=wp.int32, device=device)
+    vals = wp.zeros(size, dtype=wp.float64, device=device)
+    rhs_x = wp.zeros(n_rows, dtype=wp.float64, device=device)
+    rhs_y = wp.zeros(n_rows, dtype=wp.float64, device=device)
+    rhs_z = wp.zeros(n_rows, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_smoothing.laplacian_ls_triplets,
+        dim=n,
+        inputs=[
+            weight_matrix.offsets,
+            weight_matrix.columns,
+            weight_matrix.values,
+            free_mask,
+            row_mask,
+            free_map,
+            row_map,
+            vertices,
+            rows,
+            cols,
+            vals,
+            rhs_x,
+            rhs_y,
+            rhs_z,
+        ],
+        device=device,
+    )
+    # M is (n_rows x n_free); build M and M^T from the same (swapped) triplets in a single build
+    # each (never rebuilt/recast — bsr_mm determinism), then A = M^T M is SPD.
+    m_matrix = wps.bsr_from_triplets(n_rows, n_free, rows, cols, vals, prune_numerical_zeros=False)
+    mt_matrix = wps.bsr_from_triplets(
+        n_free, n_rows, wp.clone(cols), wp.clone(rows), wp.clone(vals), prune_numerical_zeros=False
+    )
+    system = wps.bsr_mm(mt_matrix, m_matrix)
+    atb_x = wps.bsr_mv(mt_matrix, rhs_x)
+    atb_y = wps.bsr_mv(mt_matrix, rhs_y)
+    atb_z = wps.bsr_mv(mt_matrix, rhs_z)
+    sol_x, sol_y, sol_z = _solve_spd_xyz(system, atb_x, atb_y, atb_z, n_free)
+    wp.launch(
+        kernel_smoothing.scatter_free_solution,
+        dim=n,
+        inputs=[free_mask, free_map, sol_x, sol_y, sol_z, out],
+        device=device,
+    )
+    return out

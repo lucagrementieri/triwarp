@@ -3,6 +3,186 @@ import warp as wp
 from triwarp.kernels.array import to_vec3d
 from triwarp.kernels.triangles import face_vertices
 
+# ---------------------------------------------------------------------------
+# Region Dirichlet / least-squares smoothing (positionVertsSmoothly, MRLaplacian.cpp)
+# ---------------------------------------------------------------------------
+
+
+@wp.func
+def _corner_cotan(p: wp.vec3, q: wp.vec3, o: wp.vec3) -> wp.float32:
+    # Cotangent of the angle at corner ``o`` in triangle ``(o, p, q)`` (MeshLib leftCotan).
+    a = p - o
+    b = q - o
+    cr = wp.length(wp.cross(a, b))
+    if cr <= wp.float32(0.0):
+        return wp.float32(0.0)
+    return wp.dot(a, b) / cr
+
+
+@wp.kernel
+def edge_cotan_add(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    inverse: wp.array[wp.int32],
+    out_w: wp.array[wp.float32],
+) -> None:
+    # Accumulate each face corner's cotangent into its opposite unique edge; the two incident faces
+    # sum to the cotangent edge weight cot(alpha) + cot(beta).
+    f = int(wp.tid())
+    v0 = faces[f * 3 + 0]
+    v1 = faces[f * 3 + 1]
+    v2 = faces[f * 3 + 2]
+    p0 = vertices[v0]
+    p1 = vertices[v1]
+    p2 = vertices[v2]
+    wp.atomic_add(out_w, inverse[f * 3 + 0], _corner_cotan(p0, p1, p2))
+    wp.atomic_add(out_w, inverse[f * 3 + 1], _corner_cotan(p1, p2, p0))
+    wp.atomic_add(out_w, inverse[f * 3 + 2], _corner_cotan(p2, p0, p1))
+
+
+@wp.func
+def clamp_cotan(w: wp.float32) -> wp.float32:
+    # MeshLib clamps the summed cotangent edge weight (degenerate edges give arbitrarily high cot).
+    return wp.clamp(w, wp.float32(-1.0), wp.float32(10.0))
+
+
+@wp.kernel
+def symmetric_weight_triplets(
+    unique_edges: wp.array2d[wp.int32],
+    weights: wp.array[wp.float32],
+    out_rows: wp.array[wp.int32],
+    out_cols: wp.array[wp.int32],
+    out_vals: wp.array[wp.float64],
+) -> None:
+    i = int(wp.tid())
+    a = unique_edges[i, 0]
+    b = unique_edges[i, 1]
+    w = wp.float64(weights[i])
+    out_rows[2 * i] = a
+    out_cols[2 * i] = b
+    out_vals[2 * i] = w
+    out_rows[2 * i + 1] = b
+    out_cols[2 * i + 1] = a
+    out_vals[2 * i + 1] = w
+
+
+@wp.kernel
+def dirichlet_system_triplets(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    free_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    points: wp.array[wp.vec3],
+    stabilizer: wp.float64,
+    out_rows: wp.array[wp.int32],
+    out_cols: wp.array[wp.int32],
+    out_vals: wp.array[wp.float64],
+    out_rhs_x: wp.array[wp.float64],
+    out_rhs_y: wp.array[wp.float64],
+    out_rhs_z: wp.array[wp.float64],
+) -> None:
+    # positionVertsSmoothlySharpBd: SPD umbrella system A = D - W over free verts (weights in the
+    # CSR ``W``), fixed 1-ring neighbors folded into the right-hand side, plus optional stabilizer.
+    v = int(wp.tid())
+    if not free_mask[v]:
+        return
+    ri = free_map[v]
+    start = offsets[v]
+    end = offsets[v + 1]
+    sum_w = stabilizer
+    rhs = stabilizer * to_vec3d(points[v])
+    base = start + v  # one reserved diagonal slot per vertex; off-diagonals follow
+    for k in range(start, end):
+        j = columns[k]
+        w = values[k]
+        sum_w += w
+        if free_mask[j]:
+            slot = base + 1 + (k - start)
+            out_rows[slot] = ri
+            out_cols[slot] = free_map[j]
+            out_vals[slot] = -w
+        else:
+            rhs += w * to_vec3d(points[j])
+    out_rows[base] = ri
+    out_cols[base] = ri
+    out_vals[base] = sum_w
+    out_rhs_x[ri] = rhs[0]
+    out_rhs_y[ri] = rhs[1]
+    out_rhs_z[ri] = rhs[2]
+
+
+@wp.kernel
+def laplacian_ls_triplets(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    free_mask: wp.array[wp.bool],
+    row_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    row_map: wp.array[wp.int32],
+    points: wp.array[wp.vec3],
+    out_rows: wp.array[wp.int32],
+    out_cols: wp.array[wp.int32],
+    out_vals: wp.array[wp.float64],
+    out_rhs_x: wp.array[wp.float64],
+    out_rhs_y: wp.array[wp.float64],
+    out_rhs_z: wp.array[wp.float64],
+) -> None:
+    # positionVertsSmoothly: least-squares umbrella rows over R = free plus first-fixed-ring.
+    # Row is
+    # ``p_v = sum_d (w_vd/sumW) p_d``; free neighbors stay in M, fixed ones move to the RHS.
+    # The
+    # normal equations (M^T M) x = M^T b are assembled by the caller.
+    v = int(wp.tid())
+    if not row_mask[v]:
+        return
+    start = offsets[v]
+    end = offsets[v + 1]
+    sum_w = wp.float64(0.0)
+    for k in range(start, end):
+        sum_w += values[k]
+    if sum_w == wp.float64(0.0):
+        return
+    r = row_map[v]
+    base = start + v
+    is_free = free_mask[v]
+    rhs = wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
+    if not is_free:
+        rhs = -to_vec3d(points[v])
+    for k in range(start, end):
+        j = columns[k]
+        coeff = -values[k] / sum_w
+        if free_mask[j]:
+            slot = base + 1 + (k - start)
+            out_rows[slot] = r
+            out_cols[slot] = free_map[j]
+            out_vals[slot] = coeff
+        else:
+            rhs -= coeff * to_vec3d(points[j])
+    if is_free:
+        out_rows[base] = r
+        out_cols[base] = free_map[v]
+        out_vals[base] = wp.float64(1.0)
+    out_rhs_x[r] = rhs[0]
+    out_rhs_y[r] = rhs[1]
+    out_rhs_z[r] = rhs[2]
+
+
+@wp.kernel
+def scatter_free_solution(
+    free_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    sol_x: wp.array[wp.float64],
+    sol_y: wp.array[wp.float64],
+    sol_z: wp.array[wp.float64],
+    out_points: wp.array[wp.vec3],
+) -> None:
+    v = int(wp.tid())
+    if free_mask[v]:
+        i = free_map[v]
+        out_points[v] = wp.vec3(wp.float32(sol_x[i]), wp.float32(sol_y[i]), wp.float32(sol_z[i]))
+
 
 @wp.func
 def laplacian_step(v_prev: wp.vec3d, lv: wp.vec3d, coeff: wp.float64) -> wp.vec3d:

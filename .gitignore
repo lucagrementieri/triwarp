@@ -1,6 +1,7 @@
 .benchmarks/
 promesh/
 downloads/
+plans/
 
 # Python-generated files
 __pycache__/

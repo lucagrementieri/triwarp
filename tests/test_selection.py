@@ -189,3 +189,107 @@ def _face_indices_from_vertex_indices_np(
     else:
         face_hit = np.any(vertex_hit, axis=1)
     return np.flatnonzero(face_hit).astype(np.int32)
+
+
+# ---------------------------------------------------------------------------
+# Vertex-selection morphology + region utilities
+# ---------------------------------------------------------------------------
+
+
+def _grid_mesh(n: int = 5):
+    xs, ys = np.meshgrid(np.arange(float(n)), np.arange(float(n)))
+    vertices = np.stack([xs.ravel(), ys.ravel(), np.zeros(n * n)], axis=1).astype(np.float64)
+    faces = []
+    for r in range(n - 1):
+        for c in range(n - 1):
+            a = r * n + c
+            faces += [a, a + 1, a + n + 1, a, a + n + 1, a + n]
+    return vertices, np.array(faces, dtype=np.int32)
+
+
+def _graph_distance(faces_np: np.ndarray, n: int, seed: np.ndarray) -> np.ndarray:
+    """BFS graph distance from the seed set over the undirected mesh edges (NumPy oracle)."""
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import dijkstra
+
+    edges = faces_np.reshape(-1, 3)[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2)
+    rows = np.concatenate([edges[:, 0], edges[:, 1]])
+    cols = np.concatenate([edges[:, 1], edges[:, 0]])
+    graph = csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))
+    return dijkstra(graph, indices=np.flatnonzero(seed), unweighted=True).min(axis=0)
+
+
+def test_expand_vertex_mask(device: str):
+    vertices_np, faces_np = _grid_mesh(6)
+    n = len(vertices_np)
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+    seed = np.zeros(n, dtype=bool)
+    seed[len(vertices_np) // 2] = True
+    seed_wp = wp.array(seed, dtype=wp.bool, device=device)
+    for hops in (1, 2, 3):
+        got = tw.selection.expand_vertex_mask(faces_wp, seed_wp, hops).numpy()
+        expected = _graph_distance(faces_np, n, seed) <= hops
+        assert np.array_equal(got, expected)
+
+
+def test_shrink_vertex_mask(device: str):
+    vertices_np, faces_np = _grid_mesh(6)
+    n = len(vertices_np)
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+    seed = np.zeros(n, dtype=bool)
+    seed[len(vertices_np) // 2] = True
+    seed_wp = wp.array(seed, dtype=wp.bool, device=device)
+    dilated = tw.selection.expand_vertex_mask(faces_wp, seed_wp, 2)
+    shrunk = tw.selection.shrink_vertex_mask(faces_wp, dilated, 1).numpy()
+    # shrink = complement of expand of complement: vertex kept iff all 1-ring neighbours dilated.
+    dilated_np = dilated.numpy()
+    dist = _graph_distance(faces_np, n, ~dilated_np)
+    expected = dist > 1
+    assert np.array_equal(shrunk, expected)
+
+
+def test_region_boundary_edges(device: str):
+    _, faces_np = _grid_mesh(5)
+    n_faces = len(faces_np) // 3
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+    region = np.zeros(n_faces, dtype=bool)
+    region[:6] = True  # a contiguous block of faces
+    region_wp = wp.array(region, dtype=wp.bool, device=device)
+
+    got = tw.selection.region_boundary_edges(faces_wp, region_wp).numpy()
+    got_set = {tuple(sorted(int(x) for x in e)) for e in got}
+
+    # Oracle: undirected edges with exactly two incident faces, exactly one in the region.
+    faces = faces_np.reshape(-1, 3)
+    edge_faces: dict[tuple[int, int], list[int]] = {}
+    for fi, t in enumerate(faces):
+        for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
+            edge_faces.setdefault((int(min(a, b)), int(max(a, b))), []).append(fi)
+    expected = {
+        e for e, fs in edge_faces.items() if len(fs) == 2 and (region[fs[0]] ^ region[fs[1]])
+    }
+    assert got_set == expected
+
+
+def test_exclude_fully_selected_components(device: str):
+    ico = tm.creation.icosahedron()
+    hemi = tm.creation.icosphere(subdivisions=1)
+    v_ico = ico.vertices.astype(np.float64)
+    v_hemi = hemi.vertices.astype(np.float64) + np.array([5.0, 0.0, 0.0])
+    v_wp_ico = wp.array(v_ico, dtype=wp.vec3, device=device)
+    f_wp_ico = wp.array(ico.faces.astype(np.int32).reshape(-1), dtype=wp.int32, device=device)
+    v_wp_hemi = wp.array(v_hemi, dtype=wp.vec3, device=device)
+    f_wp_hemi = wp.array(hemi.faces.astype(np.int32).reshape(-1), dtype=wp.int32, device=device)
+    verts, faces = tw.graph.concatenate([(v_wp_ico, f_wp_ico), (v_wp_hemi, f_wp_hemi)])
+
+    n = int(verts.shape[0])
+    n_ico = len(v_ico)
+    mask = np.zeros(n, dtype=bool)
+    mask[:n_ico] = True  # whole icosahedron component
+    mask[n_ico : n_ico + 3] = True  # partial hemisphere component
+    mask_wp = wp.array(mask, dtype=wp.bool, device=device)
+
+    result = tw.selection.exclude_fully_selected_components(faces, mask_wp, n).numpy()
+    # The fully-selected icosahedron component is dropped; the partial hemisphere subset stays.
+    assert not result[:n_ico].any()
+    assert np.array_equal(result[n_ico : n_ico + 3], np.ones(3, dtype=bool))

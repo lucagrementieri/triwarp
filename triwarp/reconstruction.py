@@ -10,6 +10,152 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.kernels import reconstruction as kernel_reconstruction
+from triwarp.kernels import remesh as kernel_remesh
+
+
+def _orient2d(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+
+
+def _lexicographic_triangulation(points: np.ndarray) -> np.ndarray:
+    """
+    Sequential lexicographic incremental triangulation.
+
+    NumPy port of ``igl::lexicographic_triangulation``.
+
+    ``points`` is ``(n, 2)`` ``float64``. Returns an ``(n_faces, 3)`` ``int32`` array of CCW
+    triangles over the input point indices, or an empty ``(0, 3)`` array when the points are
+    collinear. The output is not yet Delaunay — the caller flips it to Delaunay on device.
+    """
+    n = points.shape[0]
+    order = np.lexsort((points[:, 1], points[:, 0]))
+    p0 = points[order[0]]
+    p1 = points[order[1]]
+    faces: list[tuple[int, int, int]] = []
+    boundary: list[int] = []
+    for i in range(2, n):
+        curr = points[order[i]]
+        ci = int(order[i])
+        if len(faces) == 0:
+            # Every point so far is collinear; the first off-line point fans the prefix.
+            orientation = _orient2d(p0, p1, curr)
+            if orientation != 0.0:
+                if orientation > 0.0:
+                    for j in range(i - 1):
+                        faces.append((int(order[j]), int(order[j + 1]), ci))
+                else:
+                    for j in range(i - 1):
+                        faces.append((int(order[j + 1]), int(order[j]), ci))
+                boundary = [int(order[j]) for j in range(i + 1)]
+                if orientation < 0.0:
+                    boundary.reverse()
+            continue
+
+        nb = len(boundary)
+        orientations = [
+            _orient2d(points[boundary[j]], points[boundary[(j + 1) % nb]], curr) for j in range(nb)
+        ]
+        for j in range(nb):
+            if orientations[j] < 0.0:
+                faces.append((boundary[(j + 1) % nb], boundary[j], ci))
+
+        # The visible edges form one contiguous arc; L starts it, R ends it (first kept vertex).
+        left = right = -1
+        for j in range(nb):
+            prev = (j - 1) % nb
+            if orientations[j] >= 0.0 and orientations[prev] < 0.0:
+                right = j
+            elif orientations[j] < 0.0 and orientations[prev] >= 0.0:
+                left = j
+        # Keep the non-visible arc R..L (forward), then insert curr between L and R.
+        kept: list[int] = []
+        k = right
+        while True:
+            kept.append(boundary[k])
+            if k == left:
+                break
+            k = (k + 1) % nb
+        kept.append(ci)
+        boundary = kept
+
+    if len(faces) == 0:
+        return np.empty((0, 3), dtype=np.int32)
+    return np.asarray(faces, dtype=np.int32)
+
+
+def delaunay_triangulation(points: wp.array[wp.vec2], max_iter: int = 1000) -> wp.array[wp.int32]:
+    """
+    Delaunay triangulation of a 2D point set.
+
+    Ports ``igl::delaunay_triangulation``: a sequential lexicographic incremental triangulation
+    seeds the mesh, then interior edges are flipped until every one satisfies the empty-circumcircle
+    (Delaunay) criterion. The flip loop reuses the parallel edge-flip machinery of
+    [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay] with a float64 in-circle predicate; ties
+    (cocircular points) are left unflipped, which guarantees termination.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` 2D point positions on the target device.
+    max_iter
+        Maximum number of parallel flip passes.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        Flat length-``3 * n_faces`` buffer of CCW triangles over the input point indices, on
+        ``points.device``. Empty when the points are collinear.
+
+    Raises
+    ------
+    ValueError
+        If fewer than 3 points are given.
+
+    See Also
+    --------
+    [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay]
+    [`triangulate_point_cloud`][triwarp.reconstruction.triangulate_point_cloud]
+
+    Notes
+    -----
+    The initial triangulation runs on the host (an inherently sequential hull sweep); only the
+    flips run on device. A float64 in-circle determinant is used rather than exact predicates, so
+    near-cocircular inputs may resolve either ambiguous diagonal.
+    """
+    device = points.device
+    n = int(points.shape[0])
+    if n < 3:
+        raise ValueError(f"delaunay_triangulation requires at least 3 points, got {n}")
+
+    faces_np = _lexicographic_triangulation(points.numpy().astype(np.float64))
+    if faces_np.shape[0] == 0:
+        return wp.empty(0, dtype=wp.int32, device=device)
+
+    faces = wp.array(np.ascontiguousarray(faces_np.reshape(-1)), dtype=wp.int32, device=device)
+
+    def launch(
+        adjacency, adjacency_edges, unshared, sorted_keys, n_keys, key_base, out_flip, out_quad
+    ):
+        wp.launch(
+            kernel_remesh.incircle_flip_candidates,
+            dim=int(adjacency.shape[0]),
+            inputs=[
+                points,
+                faces,
+                adjacency,
+                adjacency_edges,
+                unshared,
+                sorted_keys,
+                wp.int32(n_keys),
+                key_base,
+                out_flip,
+                out_quad,
+            ],
+            device=device,
+        )
+
+    tw.remesh._flip_interior_edges(faces, n, launch, max_iter)
+    return faces
 
 
 def _repeated_oriented_triangles(

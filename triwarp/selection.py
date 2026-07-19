@@ -1,4 +1,4 @@
-"""Face-subset extraction (Warp)."""
+"""Face-subset extraction and vertex-selection morphology (Warp)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,212 @@ from typing import Literal
 import warp as wp
 
 import triwarp as tw
+import triwarp.typing as twt
 from triwarp.array import init_range
+from triwarp.kernels import selection as kernel_selection
+
+
+def expand_vertex_mask(
+    faces: wp.array[wp.int32],
+    mask: wp.array[wp.bool],
+    hops: int,
+    unique_edges: twt.Array2dInt32 | None = None,
+) -> wp.array[wp.bool]:
+    """
+    Grow a vertex selection by ``hops`` one-ring layers (MeshLib ``expand``).
+
+    Each round adds every vertex sharing a mesh edge with a currently-selected vertex, so after
+    ``hops`` rounds the mask covers all vertices within graph distance ``hops`` of the input
+    selection.
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    mask
+        Length-``n_vertices`` ``wp.bool`` selection to dilate.
+    hops
+        Number of one-ring dilation rounds (``0`` returns a copy).
+    unique_edges
+        Optional precomputed ``(m, 2)`` unique edges (from
+        [`edges_unique`][triwarp.edges.edges_unique]); rebuilt when ``None``.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Dilated mask on ``mask.device``.
+
+    See Also
+    --------
+    [`shrink_vertex_mask`][triwarp.selection.shrink_vertex_mask]
+    """
+    device = mask.device
+    n = int(mask.shape[0])
+    current = wp.clone(mask)
+    if hops <= 0 or n == 0:
+        return current
+    if unique_edges is None:
+        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n)
+    m = int(unique_edges.shape[0])
+    for _ in range(hops):
+        nxt = wp.clone(current)
+        if m > 0:
+            wp.launch(
+                kernel_selection.dilate_vertex_mask,
+                dim=m,
+                inputs=[unique_edges, current, nxt],
+                device=device,
+            )
+        current = nxt
+    return current
+
+
+def shrink_vertex_mask(
+    faces: wp.array[wp.int32],
+    mask: wp.array[wp.bool],
+    hops: int,
+    unique_edges: twt.Array2dInt32 | None = None,
+) -> wp.array[wp.bool]:
+    """
+    Erode a vertex selection by ``hops`` one-ring layers (MeshLib ``shrink``).
+
+    Implemented as the complement of an [`expand_vertex_mask`][triwarp.selection.expand_vertex_mask]
+    of the complement: a vertex is removed if any vertex within ``hops`` hops is unselected.
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    mask
+        Length-``n_vertices`` ``wp.bool`` selection to erode.
+    hops
+        Number of one-ring erosion rounds.
+    unique_edges
+        Optional precomputed ``(m, 2)`` unique edges; rebuilt when ``None``.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Eroded mask on ``mask.device``.
+
+    See Also
+    --------
+    [`expand_vertex_mask`][triwarp.selection.expand_vertex_mask]
+    """
+    device = mask.device
+    n = int(mask.shape[0])
+    if hops <= 0 or n == 0:
+        return wp.clone(mask)
+    if unique_edges is None:
+        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n)
+    complement = wp.empty(n, dtype=wp.bool, device=device)
+    wp.map(kernel_selection.mask_not, mask, out=complement)
+    dilated = expand_vertex_mask(faces, complement, hops, unique_edges)
+    out = wp.empty(n, dtype=wp.bool, device=device)
+    wp.map(kernel_selection.mask_not, dilated, out=out)
+    return out
+
+
+def region_boundary_edges(
+    faces: wp.array[wp.int32], face_mask: wp.array[wp.bool], n_vertices: int | None = None
+) -> twt.Array2dInt32:
+    """
+    Interior edges on the boundary of a face region.
+
+    Ports MeshLib ``findRegionBoundaryUndirectedEdgesInsideMesh``.
+
+    Returns the undirected edges that have exactly two incident faces, exactly one of which is in
+    ``face_mask`` — i.e. the interior seam separating the region from the rest of the mesh (mesh
+    boundary edges, with a single incident face, are excluded).
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    face_mask
+        Length-``n_faces`` ``wp.bool`` region mask.
+    n_vertices
+        Optional vertex count; inferred from ``faces`` when ``None``.
+
+    Returns
+    -------
+    twt.Array2dInt32
+        ``(k, 2)`` sorted vertex pairs on ``faces.device``.
+
+    See Also
+    --------
+    [`expand_vertex_mask`][triwarp.selection.expand_vertex_mask]
+    """
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return twt.empty_int32_2d((0, 2), device=device)
+    if n_vertices is None:
+        n_vertices = tw.vertices.n_vertices(faces)
+    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    m = int(unique_edges.shape[0])
+    count = wp.zeros(m, dtype=wp.int32, device=device)
+    region_count = wp.zeros(m, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_selection.edge_region_counts,
+        dim=3 * n_faces,
+        inputs=[inverse, face_mask, count, region_count],
+        device=device,
+    )
+    flag = wp.empty(m, dtype=wp.bool, device=device)
+    wp.map(kernel_selection.region_boundary_flag, count, region_count, out=flag)
+    ids = tw.array.flatnonzero(flag)
+    return twt.as_array2d_int32(tw.array.gather(unique_edges, ids))
+
+
+def exclude_fully_selected_components(
+    faces: wp.array[wp.int32],
+    mask: wp.array[wp.bool],
+    n_vertices: int,
+    unique_edges: twt.Array2dInt32 | None = None,
+) -> wp.array[wp.bool]:
+    """
+    Drop selected vertices whose entire connected component is selected.
+
+    Ports MeshLib ``excludeFullySelectedComponents``.
+
+    A vertex-connected component that is wholly inside ``mask`` would make a region-smoothing
+    Dirichlet system singular (no fixed anchor), so those components are removed from the
+    selection; components with at least one unselected vertex are kept intact.
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    mask
+        Length-``n_vertices`` ``wp.bool`` selection.
+    n_vertices
+        Vertex count (component labels span ``0 .. n_vertices - 1``).
+    unique_edges
+        Optional precomputed ``(m, 2)`` unique edges; rebuilt when ``None``.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Selection with fully-selected components removed, on ``mask.device``.
+    """
+    device = mask.device
+    if n_vertices == 0:
+        return wp.clone(mask)
+    if unique_edges is None:
+        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    labels = tw.graph.connected_component_labels_from_edges(unique_edges, node_count=n_vertices)
+    keep = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_selection.keep_component_scatter,
+        dim=n_vertices,
+        inputs=[mask, labels, keep],
+        device=device,
+    )
+    kept_per_vertex = keep[labels]  # Python-scope gather: component-keep flag per vertex
+    out = wp.empty(n_vertices, dtype=wp.bool, device=device)
+    wp.map(kernel_selection.keep_selected, mask, kept_per_vertex, out=out)
+    return out
 
 
 def submesh_from_face_indices(

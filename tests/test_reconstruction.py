@@ -195,3 +195,144 @@ def test_invalid_parameters(device: str):
         tw.reconstruction.triangulate_point_cloud(
             points_wp, max_neighbours=tw.kernels.reconstruction.MAX_NEIGHBOURS + 1
         )
+
+
+# ---------------------------------------------------------------------------
+# 2D Delaunay triangulation (reference: scipy.spatial.Delaunay)
+# ---------------------------------------------------------------------------
+
+
+def _cross2(u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    return u[..., 0] * v[..., 1] - u[..., 1] * v[..., 0]
+
+
+def _edge_set(faces_flat: np.ndarray) -> set[tuple[int, int]]:
+    faces_flat = faces_flat.reshape(-1)
+    edges: set[tuple[int, int]] = set()
+    for i in range(0, len(faces_flat), 3):
+        t = faces_flat[i : i + 3]
+        for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
+            edges.add((int(min(a, b)), int(max(a, b))))
+    return edges
+
+
+def _incircle_violations(points_np: np.ndarray, faces_flat: np.ndarray) -> int:
+    """Count interior edges whose opposite apex lies inside the adjacent triangle circumcircle."""
+    from scipy.spatial import Delaunay  # noqa: F401 — parity handled by caller
+
+    faces = faces_flat.reshape(-1, 3)
+    edge_faces: dict[tuple[int, int], list[int]] = {}
+    for fi, t in enumerate(faces):
+        for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
+            edge_faces.setdefault((int(min(a, b)), int(max(a, b))), []).append(fi)
+
+    def in_circle(a, b, c, d):
+        m = np.array(
+            [
+                [a[0] - d[0], a[1] - d[1], (a[0] - d[0]) ** 2 + (a[1] - d[1]) ** 2],
+                [b[0] - d[0], b[1] - d[1], (b[0] - d[0]) ** 2 + (b[1] - d[1]) ** 2],
+                [c[0] - d[0], c[1] - d[1], (c[0] - d[0]) ** 2 + (c[1] - d[1]) ** 2],
+            ]
+        )
+        return np.linalg.det(m)
+
+    violations = 0
+    for (u, v), fs in edge_faces.items():
+        if len(fs) != 2:
+            continue
+        apex = []
+        for fi in fs:
+            apex.extend([int(x) for x in faces[fi] if int(x) not in (u, v)])
+        if len(apex) != 2:
+            continue
+        d0, d1 = apex
+        a, b, c = points_np[u], points_np[v], points_np[d0]
+        if _cross2(b - a, c - a) < 0:
+            a, b = b, a
+        if in_circle(a, b, c, points_np[d1]) > 1e-9:
+            violations += 1
+    return violations
+
+
+def test_delaunay_matches_scipy_random(device: str):
+    from scipy.spatial import Delaunay
+
+    rng = np.random.default_rng(42)
+    points_np = rng.random((200, 2)).astype(np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec2, device=device)
+
+    faces_wp = tw.reconstruction.delaunay_triangulation(points_wp).numpy()
+    faces_sp = Delaunay(points_np.astype(np.float64)).simplices
+
+    assert _edge_set(faces_wp) == _edge_set(faces_sp.reshape(-1))
+
+
+def test_delaunay_no_violations(device: str):
+    rng = np.random.default_rng(7)
+    points_np = rng.random((150, 2)).astype(np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec2, device=device)
+
+    faces_wp = tw.reconstruction.delaunay_triangulation(points_wp).numpy().reshape(-1, 3)
+
+    # All triangles counter-clockwise.
+    tris = points_np.astype(np.float64)[faces_wp]
+    cross = _cross2(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+    assert np.all(cross > 0.0)
+    assert _incircle_violations(points_np.astype(np.float64), faces_wp) == 0
+
+
+def test_delaunay_covers_hull(device: str):
+    from scipy.spatial import ConvexHull
+
+    rng = np.random.default_rng(3)
+    points_np = rng.random((120, 2)).astype(np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec2, device=device)
+
+    faces_wp = tw.reconstruction.delaunay_triangulation(points_wp).numpy().reshape(-1, 3)
+    tris = points_np.astype(np.float64)[faces_wp]
+    area = float(np.abs(_cross2(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])).sum() * 0.5)
+    hull_area = float(ConvexHull(points_np.astype(np.float64)).volume)
+    assert np.isclose(area, hull_area, rtol=1e-5, atol=1e-6)
+
+
+def test_delaunay_cocircular(device: str):
+    # Regular 12-gon plus centre: many cocircular quadruples; compare on invariants, not triangles.
+    angles = np.linspace(0.0, 2.0 * np.pi, 12, endpoint=False)
+    ring = np.stack([np.cos(angles), np.sin(angles)], axis=1)
+    points_np = np.vstack([ring, [[0.0, 0.0]]]).astype(np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec2, device=device)
+
+    faces_wp = tw.reconstruction.delaunay_triangulation(points_wp).numpy().reshape(-1, 3)
+    assert _incircle_violations(points_np.astype(np.float64), faces_wp) == 0
+
+    from scipy.spatial import ConvexHull
+
+    tris = points_np.astype(np.float64)[faces_wp]
+    area = float(np.abs(_cross2(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])).sum() * 0.5)
+    assert np.isclose(area, float(ConvexHull(points_np.astype(np.float64)).volume), rtol=1e-5)
+
+
+def test_delaunay_grid_perturbed(device: str):
+    from scipy.spatial import Delaunay
+
+    rng = np.random.default_rng(11)
+    grid = np.stack(np.meshgrid(np.arange(8.0), np.arange(8.0)), axis=-1).reshape(-1, 2)
+    points_np = (grid + rng.normal(0.0, 0.05, grid.shape)).astype(np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec2, device=device)
+
+    faces_wp = tw.reconstruction.delaunay_triangulation(points_wp).numpy()
+    faces_sp = Delaunay(points_np.astype(np.float64)).simplices
+    assert _edge_set(faces_wp) == _edge_set(faces_sp.reshape(-1))
+
+
+def test_delaunay_collinear(device: str):
+    points_np = np.array([[float(i), 0.0] for i in range(5)], dtype=np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec2, device=device)
+    faces_wp = tw.reconstruction.delaunay_triangulation(points_wp)
+    assert int(faces_wp.shape[0]) == 0
+
+
+def test_delaunay_too_few(device: str):
+    points_wp = wp.array(np.zeros((2, 2), dtype=np.float32), dtype=wp.vec2, device=device)
+    with pytest.raises(ValueError, match="at least 3 points"):
+        tw.reconstruction.delaunay_triangulation(points_wp)

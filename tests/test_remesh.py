@@ -322,3 +322,169 @@ def test_subdivide_to_size_max_iter_exceeded(icosahedron: tuple[tm.Trimesh, wp.M
     small_edge = 0.1 * tw.edges.mean_edge_length(mesh_wp.points, mesh_wp.indices)
     with pytest.raises(ValueError, match="max_iter exceeded"):
         tw.remesh.subdivide_to_size(mesh_wp.points, mesh_wp.indices, small_edge, max_iter=0)
+
+
+# ---------------------------------------------------------------------------
+# Region-restricted subdivision + parallel Delaunay flips
+# ---------------------------------------------------------------------------
+
+
+def _filled_hemisphere(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    """Fill the hemisphere's boundary and return (vertices_wp, faces_wp, region_mask_wp)."""
+    _, mesh_wp = hemisphere
+    faces_filled = tw.stitching.fill_holes_min_weight(mesh_wp.points, mesh_wp.indices)
+    n0 = int(mesh_wp.indices.shape[0]) // 3
+    n1 = int(faces_filled.shape[0]) // 3
+    region = np.zeros(n1, dtype=bool)
+    region[n0:] = True
+    region_wp = wp.array(region, dtype=wp.bool, device=mesh_wp.device)
+    return mesh_wp.points, faces_filled, region_wp
+
+
+def _region_max_edge(vertices_np, faces_np, region_np):
+    edges = _undirected_edges(faces_np)
+    face_of_edge = np.repeat(np.arange(faces_np.shape[0]), 3)
+    lengths = np.linalg.norm(vertices_np[edges[:, 0]] - vertices_np[edges[:, 1]], axis=1)
+    in_region = region_np[face_of_edge]
+    return float(lengths[in_region].max()) if in_region.any() else 0.0
+
+
+def test_subdivide_region_max_edge(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    v, f, region = _filled_hemisphere(hemisphere)
+    max_edge = 0.2 * _region_max_edge(v.numpy(), f.numpy().reshape(-1, 3), region.numpy())
+    nv, nf, nr = tw.remesh.subdivide_region_to_size(v, f, region, max_edge=max_edge, delaunay=False)
+    got = _region_max_edge(nv.numpy(), nf.numpy().reshape(-1, 3), nr.numpy())
+    assert got <= max_edge + 1e-4
+
+
+def test_subdivide_region_crack_free(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    v, f, region = _filled_hemisphere(hemisphere)
+    max_edge = 0.3 * _region_max_edge(v.numpy(), f.numpy().reshape(-1, 3), region.numpy())
+    _, nf, _ = tw.remesh.subdivide_region_to_size(v, f, region, max_edge=max_edge)
+    faces_np = nf.numpy().reshape(-1, 3)
+    edges = _undirected_edges(faces_np)
+    _, counts = np.unique(edges, axis=0, return_counts=True)
+    # Filled hemisphere is closed: every undirected edge is shared by exactly two faces.
+    assert np.array_equal(np.unique(counts), np.array([2]))
+
+
+def test_subdivide_region_outside_untouched(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    v, f, region = _filled_hemisphere(hemisphere)
+    n_vertices_before = int(v.shape[0])
+    max_edge = 0.3 * _region_max_edge(v.numpy(), f.numpy().reshape(-1, 3), region.numpy())
+    _, nf, nr = tw.remesh.subdivide_region_to_size(v, f, region, max_edge=max_edge, delaunay=False)
+    faces_np = nf.numpy().reshape(-1, 3)
+    region_np = nr.numpy()
+    original = {tuple(sorted(t)) for t in f.numpy().reshape(-1, 3).tolist()}
+    for t in faces_np[~region_np]:
+        touches_new = any(idx >= n_vertices_before for idx in t)
+        # A non-region face is unchanged, or only retriangulated because it shared a split rim edge.
+        assert tuple(sorted(int(x) for x in t)) in original or touches_new
+
+
+def test_subdivide_region_new_vertex_range(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    v, f, region = _filled_hemisphere(hemisphere)
+    n_vertices_before = int(v.shape[0])
+    max_edge = 0.3 * _region_max_edge(v.numpy(), f.numpy().reshape(-1, 3), region.numpy())
+    nv, _, _ = tw.remesh.subdivide_region_to_size(v, f, region, max_edge=max_edge, delaunay=False)
+    nv_np = nv.numpy()
+    assert nv_np.shape[0] > n_vertices_before
+    assert np.array_equal(nv_np[:n_vertices_before], v.numpy())
+
+
+def test_subdivide_region_max_splits(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    v, f, region = _filled_hemisphere(hemisphere)
+    n_vertices_before = int(v.shape[0])
+    max_edge = 0.2 * _region_max_edge(v.numpy(), f.numpy().reshape(-1, 3), region.numpy())
+    nv, _, _ = tw.remesh.subdivide_region_to_size(
+        v, f, region, max_edge=max_edge, max_splits=5, delaunay=False
+    )
+    assert nv.numpy().shape[0] - n_vertices_before <= 5
+
+
+def test_subdivide_region_empty_region(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    v, f, region = _filled_hemisphere(hemisphere)
+    empty = wp.zeros(int(region.shape[0]), dtype=wp.bool, device=region.device)
+    nv, nf, _ = tw.remesh.subdivide_region_to_size(v, f, empty, max_edge=0.01, delaunay=False)
+    assert np.array_equal(nv.numpy(), v.numpy())
+    assert np.array_equal(nf.numpy(), f.numpy())
+
+
+def test_subdivide_region_empty_mesh(device: str):
+    v = wp.zeros(0, dtype=wp.vec3, device=device)
+    f = wp.zeros(0, dtype=wp.int32, device=device)
+    region = wp.zeros(0, dtype=wp.bool, device=device)
+    _, nf, _ = tw.remesh.subdivide_region_to_size(v, f, region, max_edge=0.1)
+    assert int(nf.shape[0]) == 0
+
+
+def _delone_violations(vertices_np, faces_np, region_np):
+    """Count interior region edges that fail the (angle-gate-free) circumcircle Delone test."""
+    faces = faces_np
+    edge_faces: dict[tuple[int, int], list[int]] = {}
+    for fi, t in enumerate(faces):
+        for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
+            edge_faces.setdefault((int(min(a, b)), int(max(a, b))), []).append(fi)
+
+    def circ_diam_sq(a, b, c):
+        ab = np.dot(b - a, b - a)
+        ca = np.dot(a - c, a - c)
+        bc = np.dot(c - b, c - b)
+        if ab <= 0 or ca <= 0 or bc <= 0:
+            return np.inf
+        f = np.dot(np.cross(b - a, c - a), np.cross(b - a, c - a))
+        return np.inf if f <= 0 else ab * ca * bc / f
+
+    violations = 0
+    for (u, v), fs in edge_faces.items():
+        if len(fs) != 2 or not (region_np[fs[0]] and region_np[fs[1]]):
+            continue
+        apex = []
+        for fi in fs:
+            apex.extend([int(x) for x in faces[fi] if int(x) not in (u, v)])
+        if len(apex) != 2:
+            continue
+        a, c = vertices_np[u], vertices_np[v]
+        b, d = vertices_np[apex[1]], vertices_np[apex[0]]
+        m_ac = max(circ_diam_sq(a, c, d), circ_diam_sq(c, a, b))
+        m_bd = max(circ_diam_sq(b, d, a), circ_diam_sq(d, b, c))
+        if m_bd < m_ac * (1.0 - 1e-6):
+            violations += 1
+    return violations
+
+
+def test_flip_to_delaunay_reduces_violations(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    v, f, region = _filled_hemisphere(hemisphere)
+    max_edge = 0.3 * _region_max_edge(v.numpy(), f.numpy().reshape(-1, 3), region.numpy())
+    nv, nf, nr = tw.remesh.subdivide_region_to_size(v, f, region, max_edge=max_edge, delaunay=False)
+
+    before = _delone_violations(nv.numpy(), nf.numpy().reshape(-1, 3), nr.numpy())
+    flipped = tw.remesh.flip_to_delaunay(nv, nf, region=nr)
+    after = _delone_violations(nv.numpy(), flipped.numpy().reshape(-1, 3), nr.numpy())
+
+    assert after <= before
+    # Face count unchanged; mesh stays closed.
+    assert int(flipped.shape[0]) == int(nf.shape[0])
+    edges = _undirected_edges(flipped.numpy().reshape(-1, 3))
+    _, counts = np.unique(edges, axis=0, return_counts=True)
+    assert np.array_equal(np.unique(counts), np.array([2]))
+
+
+def test_flip_to_delaunay_region_gated(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    v, f, region = _filled_hemisphere(hemisphere)
+    nv, nf, nr = tw.remesh.subdivide_region_to_size(
+        v, f, region, max_edge=1e9, delaunay=False
+    )  # no splits; just exercise gating on the raw fill patch
+    flipped = tw.remesh.flip_to_delaunay(nv, nf, region=nr)
+    faces_before = nf.numpy().reshape(-1, 3)
+    faces_after = flipped.numpy().reshape(-1, 3)
+    region_np = nr.numpy()
+    # Faces outside the region are never rewritten.
+    assert np.array_equal(faces_before[~region_np], faces_after[~region_np])
+
+
+def test_flip_to_delaunay_empty(device: str):
+    v = wp.zeros(0, dtype=wp.vec3, device=device)
+    f = wp.zeros(0, dtype=wp.int32, device=device)
+    out = tw.remesh.flip_to_delaunay(v, f)
+    assert int(out.shape[0]) == 0

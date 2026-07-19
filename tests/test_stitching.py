@@ -913,3 +913,171 @@ def test_stitch_min_weight_rejects_unknown_metric(device: str) -> None:
     (_, _, va, fa), (_, _, vb, fb) = _capsule_halves(device, 8, 8)
     with pytest.raises(ValueError, match="metric must be one of"):
         tw.stitching.stitch_min_weight(va, fa, vb, fb, metric="bogus")
+
+
+# ---------------------------------------------------------------------------
+# fill_holes_nicely / stitch_nicely (MeshLib fillHoleNicely / stitchHolesNicely)
+# ---------------------------------------------------------------------------
+
+
+def _skip_cpu(device: str) -> None:
+    if wp.get_device(device).is_cpu:
+        pytest.skip("fill_holes_nicely subdivision/smoothing requires CUDA (warp.optim.linear.cg)")
+
+
+def _mesh_volume_area(vertices_np: np.ndarray, faces_np: np.ndarray) -> tuple[float, float]:
+    mesh = tm.Trimesh(vertices_np, faces_np, process=False)
+    return float(mesh.volume), float(mesh.area)
+
+
+def _meshlib_fill_nicely_volume(
+    vertices_np: np.ndarray, faces_np: np.ndarray, max_edge: float
+) -> float:
+    mm = pytest.importorskip("meshlib.mrmeshpy")
+    mn = pytest.importorskip("meshlib.mrmeshnumpy")
+    mesh = mn.meshFromFacesVerts(
+        np.ascontiguousarray(faces_np.astype(np.int32)),
+        np.ascontiguousarray(vertices_np.astype(np.float32)),
+    )
+    settings = mm.FillHoleNicelySettings()
+    settings.subdivideSettings.maxEdgeLen = max_edge
+    for edge in mesh.topology.findHoleRepresentiveEdges():
+        mm.fillHoleNicely(mesh, edge, settings)
+    verts = mn.getNumpyVerts(mesh)
+    faces = mn.getNumpyFaces(mesh.topology)
+    return float(tm.Trimesh(verts, faces, process=False).volume)
+
+
+def test_fill_holes_nicely_invariants(device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    _skip_cpu(device)
+    _, mesh_wp = hemisphere
+    n_v0 = int(mesh_wp.points.shape[0])
+
+    new_vertices, new_faces, patch = tw.stitching.fill_holes_nicely(
+        mesh_wp.points, mesh_wp.indices, return_patch=True
+    )
+    verts_np = new_vertices.numpy()
+    faces_np = new_faces.numpy().reshape(-1, 3)
+
+    assert len(_loop_sizes_of(new_vertices, new_faces)) == 0
+    mesh_tm = tm.Trimesh(verts_np, faces_np, process=False)
+    assert mesh_tm.is_watertight
+    assert mesh_tm.is_winding_consistent
+    assert tw.characteristics.is_edge_manifold(new_faces)
+    assert int(patch.numpy().sum()) > 0
+    assert np.allclose(verts_np[:n_v0], mesh_wp.points.numpy(), atol=1e-6)
+
+
+def test_fill_holes_nicely_triangulate_only(device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    _, mesh_wp = hemisphere
+    new_vertices, new_faces = tw.stitching.fill_holes_nicely(
+        mesh_wp.points, mesh_wp.indices, triangulate_only=True
+    )
+    expected_faces = tw.stitching.fill_holes_min_weight(mesh_wp.points, mesh_wp.indices)
+    assert np.array_equal(new_faces.numpy(), expected_faces.numpy())
+    assert np.array_equal(new_vertices.numpy(), mesh_wp.points.numpy())
+
+
+def test_fill_holes_nicely_statistics_vs_meshlib(
+    device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]
+):
+    _skip_cpu(device)
+    pytest.importorskip("meshlib.mrmeshpy")
+    _, mesh_wp = hemisphere
+    vertices_np = mesh_wp.points.numpy().astype(np.float64)
+    faces_np = mesh_wp.indices.numpy().reshape(-1, 3)
+    max_edge = 0.3
+
+    new_vertices, new_faces = tw.stitching.fill_holes_nicely(
+        mesh_wp.points, mesh_wp.indices, max_edge=max_edge
+    )
+    volume_tw, _ = _mesh_volume_area(new_vertices.numpy(), new_faces.numpy().reshape(-1, 3))
+    volume_ml = _meshlib_fill_nicely_volume(vertices_np, faces_np, max_edge)
+    assert np.isclose(volume_tw, volume_ml, rtol=0.05)
+
+
+def test_fill_holes_nicely_natural_smooth(device: str):
+    _skip_cpu(device)
+    sphere = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    hemi = sphere.slice_plane(
+        plane_origin=np.zeros(3), plane_normal=np.array([0.0, 0.0, 1.0]), cap=False
+    )
+    hemi.merge_vertices()
+    vertices_np = np.ascontiguousarray(hemi.vertices.astype(np.float64))
+    faces_np = np.ascontiguousarray(hemi.faces.astype(np.int32).reshape(-1))
+    v_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    f_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+    n_v0 = len(vertices_np)
+
+    verts_off = tw.stitching.fill_holes_nicely(v_wp, f_wp, natural_smooth=False)[0].numpy()
+    verts_on = tw.stitching.fill_holes_nicely(v_wp, f_wp, natural_smooth=True)[0].numpy()
+
+    # naturalSmooth grows a collar past the rim, so some original vertices move.
+    disp = np.linalg.norm(verts_off[:n_v0] - verts_on[:n_v0], axis=1)
+    assert int((disp > 1e-5).sum()) > 0
+
+    _, new_faces = tw.stitching.fill_holes_nicely(v_wp, f_wp, natural_smooth=True)
+    mesh_tm = tm.Trimesh(verts_on, new_faces.numpy().reshape(-1, 3), process=False)
+    assert mesh_tm.is_watertight
+    assert mesh_tm.is_winding_consistent
+
+
+def test_fill_holes_nicely_watertight_unchanged(
+    device: str, icosahedron: tuple[tm.Trimesh, wp.Mesh]
+):
+    _, mesh_wp = icosahedron
+    new_vertices, new_faces = tw.stitching.fill_holes_nicely(mesh_wp.points, mesh_wp.indices)
+    assert np.array_equal(new_vertices.numpy(), mesh_wp.points.numpy())
+    assert np.array_equal(new_faces.numpy(), mesh_wp.indices.numpy())
+
+
+def test_fill_holes_nicely_rejects_unknown(device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    _, mesh_wp = hemisphere
+    with pytest.raises(ValueError, match="metric must be one of"):
+        tw.stitching.fill_holes_nicely(mesh_wp.points, mesh_wp.indices, metric="nope")
+    with pytest.raises(ValueError, match="edge_weights must be"):
+        tw.stitching.fill_holes_nicely(mesh_wp.points, mesh_wp.indices, edge_weights="nope")
+
+
+def _hemisphere_pair(device: str):
+    """Two facing hemispheres (single boundary loop each) for stitch tests."""
+    meshes = []
+    for z_sign, z_off in ((1.0, 0.6), (-1.0, -0.6)):
+        sphere = tm.creation.icosphere(subdivisions=2, radius=1.0)
+        cap = sphere.slice_plane(
+            plane_origin=np.zeros(3), plane_normal=np.array([0.0, 0.0, z_sign]), cap=False
+        )
+        cap.merge_vertices()
+        cap.apply_translation([0.0, 0.0, z_off])
+        v = wp.array(
+            np.ascontiguousarray(cap.vertices.astype(np.float64)), dtype=wp.vec3, device=device
+        )
+        f = wp.array(
+            np.ascontiguousarray(cap.faces.astype(np.int32).reshape(-1)),
+            dtype=wp.int32,
+            device=device,
+        )
+        meshes.append((v, f))
+    return meshes[0], meshes[1]
+
+
+def test_stitch_nicely_watertight(device: str):
+    _skip_cpu(device)
+    (va, fa), (vb, fb) = _hemisphere_pair(device)
+    n_v0 = int(va.shape[0]) + int(vb.shape[0])
+
+    new_vertices, new_faces = tw.stitching.stitch_nicely(va, fa, vb, fb)
+    verts_np = new_vertices.numpy()
+    mesh_tm = tm.Trimesh(verts_np, new_faces.numpy().reshape(-1, 3), process=False)
+
+    assert len(_loop_sizes_of(new_vertices, new_faces)) == 0
+    assert mesh_tm.is_watertight
+    assert mesh_tm.is_winding_consistent
+    # Original vertices are the concatenated prefix, unchanged.
+    assert np.allclose(verts_np[:n_v0], np.concatenate([va.numpy(), vb.numpy()]), atol=1e-6)
+
+
+def test_stitch_nicely_requires_single_loop(device: str, icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    _, mesh_wp = icosahedron
+    with pytest.raises(ValueError, match="exactly one boundary loop"):
+        tw.stitching.stitch_nicely(mesh_wp.points, mesh_wp.indices, mesh_wp.points, mesh_wp.indices)
