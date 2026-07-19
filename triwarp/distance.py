@@ -13,7 +13,7 @@ a maximum, so no squaring or final square root is needed.
 Two families of geometry are supported and can be mixed:
 
 - ``points_to_points`` -- both sides are point clouds
-  (nearest neighbor via [`query_hashgrid_nearest`][triwarp.proximity.query_hashgrid_nearest]).
+  (nearest neighbor via [`query_hashgrid_nearest`][triwarp.neighbors.query_hashgrid_nearest]).
 - ``points_to_mesh`` -- a point cloud versus a triangle mesh
   (point-to-surface via [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]
   one way, mesh-vertex nearest neighbor the other way).
@@ -177,7 +177,7 @@ def chamfer_points_to_points(
     --------
     [`chamfer_points_to_mesh`][triwarp.distance.chamfer_points_to_mesh]
     [`chamfer_mesh_to_mesh`][triwarp.distance.chamfer_mesh_to_mesh]
-    [`query_hashgrid_nearest`][triwarp.proximity.query_hashgrid_nearest]
+    [`query_hashgrid_nearest`][triwarp.neighbors.query_hashgrid_nearest]
     """
     _validate_point_reduction(point_reduction)
     device = x.device
@@ -186,10 +186,10 @@ def chamfer_points_to_points(
     if n == 0 or m == 0:
         return _empty_chamfer(point_reduction, single_directional, device)
 
-    d_forward = tw.proximity.query_hashgrid_nearest(y, x, k=1)[1]
+    d_forward = tw.neighbors.query_hashgrid_nearest(y, x, k=1)[1]
     d_backward = None
     if not single_directional:
-        d_backward = tw.proximity.query_hashgrid_nearest(x, y, k=1)[1]
+        d_backward = tw.neighbors.query_hashgrid_nearest(x, y, k=1)[1]
     return _chamfer(d_forward, d_backward, point_reduction, single_directional)
 
 
@@ -264,7 +264,7 @@ def chamfer_points_to_mesh(
     d_forward = tw.proximity.closest_point_on_mesh(vertices, faces, points)[1]
     d_backward = None
     if not single_directional:
-        d_backward = tw.proximity.query_hashgrid_nearest(points, vertices, k=1)[1]
+        d_backward = tw.neighbors.query_hashgrid_nearest(points, vertices, k=1)[1]
     return _chamfer(d_forward, d_backward, point_reduction, single_directional)
 
 
@@ -409,7 +409,7 @@ def chamfer_points_to_points_loss(
     back-propagated to ``x`` and ``y`` through a caller-owned ``wp.Tape``.
 
     The nearest-neighbor assignment (via
-    [`query_hashgrid_nearest`][triwarp.proximity.query_hashgrid_nearest]) is computed
+    [`query_hashgrid_nearest`][triwarp.neighbors.query_hashgrid_nearest]) is computed
     outside ``tape`` and held constant during the backward pass, matching pytorch3d's
     ``chamfer_distance`` gradient.
 
@@ -450,10 +450,10 @@ def chamfer_points_to_points_loss(
         return loss
 
     # Non-differentiable nearest-neighbor indices (computed outside the tape).
-    nearest_xy = tw.proximity.query_hashgrid_nearest(y, x, k=1)[0]
+    nearest_xy = tw.neighbors.query_hashgrid_nearest(y, x, k=1)[0]
     nearest_yx = None
     if not single_directional:
-        nearest_yx = tw.proximity.query_hashgrid_nearest(x, y, k=1)[0]
+        nearest_yx = tw.neighbors.query_hashgrid_nearest(x, y, k=1)[0]
 
     def _record() -> None:
         wp.launch_tiled(
@@ -537,7 +537,7 @@ def chamfer_points_to_mesh_loss(
     face_id = tw.proximity.closest_point_on_mesh(vertices, faces, points)[2]
     nearest_vp = None
     if not single_directional:
-        nearest_vp = tw.proximity.query_hashgrid_nearest(points, vertices, k=1)[0]
+        nearest_vp = tw.neighbors.query_hashgrid_nearest(points, vertices, k=1)[0]
 
     def _record() -> None:
         wp.launch_tiled(
@@ -715,10 +715,10 @@ def hausdorff_points_to_points(
     if n == 0 or m == 0:
         return 0.0
 
-    d_forward = tw.proximity.query_hashgrid_nearest(y, x, k=1)[1]
+    d_forward = tw.neighbors.query_hashgrid_nearest(y, x, k=1)[1]
     d_backward = None
     if not single_directional:
-        d_backward = tw.proximity.query_hashgrid_nearest(x, y, k=1)[1]
+        d_backward = tw.neighbors.query_hashgrid_nearest(x, y, k=1)[1]
     return _hausdorff(d_forward, d_backward, single_directional)
 
 
@@ -766,7 +766,7 @@ def hausdorff_points_to_mesh(
     d_forward = tw.proximity.closest_point_on_mesh(vertices, faces, points)[1]
     d_backward = None
     if not single_directional:
-        d_backward = tw.proximity.query_hashgrid_nearest(points, vertices, k=1)[1]
+        d_backward = tw.neighbors.query_hashgrid_nearest(points, vertices, k=1)[1]
     return _hausdorff(d_forward, d_backward, single_directional)
 
 

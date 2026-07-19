@@ -14,12 +14,12 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.grouping import hash_vector_rows, unique_1d, unique_faces, unique_rows
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import edges as kernel_edges
 from triwarp.kernels import repair as kernel_repair
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import triangles as kernel_triangles
-from triwarp.unique import hash_vector_rows, unique_1d, unique_faces, unique_rows
 
 
 def remove_unreferenced_vertices(
@@ -54,16 +54,8 @@ def remove_unreferenced_vertices(
     """
     device = faces.device
     n_vertices = int(vertices.shape[0])
-    n_indices = int(faces.shape[0])
 
-    referenced = wp.zeros(n_vertices, dtype=wp.bool, device=device)
-    if n_indices > 0:
-        wp.launch(
-            kernel_scatter.mark_membership_mask,
-            dim=n_indices,
-            inputs=[faces, wp.int32(n_vertices), referenced],
-            device=device,
-        )
+    referenced = tw.array.indices_to_mask(faces, n_vertices, device=device)
 
     inverse = tw.array.flatnonzero(referenced)
     remap = wp.full(n_vertices, wp.int32(-1), dtype=wp.int32, device=device)
@@ -78,7 +70,7 @@ def remove_unreferenced_vertices(
         if int(inverse.shape[0]) > 0
         else wp.empty(0, dtype=wp.vec3, device=vertices.device)
     )
-    new_faces = _remap_flat_indices(faces, remap)
+    new_faces = tw.array.remap_indices(faces, remap)
 
     if return_inverse:
         return new_vertices, new_faces, remap, inverse
@@ -112,7 +104,7 @@ def remove_duplicated_vertices(
     unique_faces : wp.array[wp.int32]
         Face buffer with indices remapped into ``unique_vertices``.
     """
-    inverse = _duplicate_vertex_inverse(vertices, epsilon)
+    inverse = duplicate_vertex_inverse(vertices, epsilon)
     n = int(inverse.shape[0])
     n_unique = int(tw.reduce.max(inverse)) + 1
     unique_indices = wp.full(n_unique, wp.int32(n), dtype=wp.int32, device=inverse.device)
@@ -123,8 +115,49 @@ def remove_duplicated_vertices(
         device=inverse.device,
     )
     unique_vertices = tw.array.gather(vertices, unique_indices)
-    unique_faces = _remap_flat_indices(faces, inverse)
+    unique_faces = tw.array.remap_indices(faces, inverse)
     return unique_vertices, unique_indices, inverse, unique_faces
+
+
+def duplicate_vertex_inverse(vertices: wp.array[wp.vec3], epsilon: float) -> wp.array[wp.int32]:
+    """
+    Map each vertex to the slot of its coincident-vertex equivalence class.
+
+    The inverse map produced by welding vertices at ``epsilon`` tolerance, without also
+    computing the deduplicated vertex/face buffers — useful for remapping per-vertex
+    attributes (colors, UVs, ...) to match a [`remove_duplicated_vertices`]
+    [triwarp.repair.remove_duplicated_vertices] call made with the same ``epsilon``.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    epsilon
+        Uniqueness tolerance. ``0`` requires exact match (via row hashing). Positive values
+        round coordinates to ``round(v / epsilon)`` before deduplication.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        Length ``n_vertices``. Maps each input vertex to its slot in the deduplicated set.
+
+    See Also
+    --------
+    [`remove_duplicated_vertices`][triwarp.repair.remove_duplicated_vertices]
+    """
+    device = vertices.device
+    n = int(vertices.shape[0])
+    if n == 0:
+        return wp.empty(0, dtype=wp.int32, device=device)
+
+    if epsilon > 0.0:
+        row_keys = hash_vector_rows(vertices, epsilon=epsilon)
+        _, inverse = unique_1d(row_keys, return_inverse=True)
+    else:
+        rows = twt.empty_float32_2d((n, 3), device=device)
+        wp.utils.array_cast(vertices, rows)
+        _, inverse = unique_rows(rows, return_inverse=True)
+    return inverse
 
 
 def resolve_duplicated_faces(
@@ -265,6 +298,50 @@ def remove_degenerate_faces(
     return tw.selection.submesh_from_face_mask(vertices, faces, keep_mask)
 
 
+def remove_non_manifold_faces(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], max_iter: int = 3
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Remove faces touching a non-manifold (>2-incident) edge, iterating until edge-manifold.
+
+    Each pass keeps only faces whose three edges are each used by at most two faces
+    ([`edge_manifold_mask`][triwarp.validation.edge_manifold_mask]); dropping a face can make a
+    neighbour manifold, so it repeats up to ``max_iter`` times (matching MeshLib's bounded
+    hole-complicating-face removal loop).
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    max_iter
+        Maximum number of removal passes.
+
+    Returns
+    -------
+    new_vertices : wp.array[wp.vec3]
+        Vertices still referenced after non-manifold faces are dropped, compacted from index zero.
+    new_faces : wp.array[wp.int32]
+        Flat buffer of the surviving (edge-manifold, up to ``max_iter`` passes) faces.
+
+    See Also
+    --------
+    [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
+    [`edge_manifold_mask`][triwarp.validation.edge_manifold_mask]
+    """
+    for _ in range(max_iter):
+        n_faces = int(faces.shape[0]) // 3
+        if n_faces == 0:
+            break
+        keep = tw.validation.edge_manifold_mask(faces, allow_boundary_edges=True)
+        kept = tw.array.flatnonzero(keep)
+        if int(kept.shape[0]) == n_faces:
+            break  # already edge-manifold
+        vertices, faces = tw.selection.submesh_from_face_mask(vertices, faces, keep)
+    return vertices, faces
+
+
 def collapse_small_triangles(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], epsilon: float = 1e-6
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
@@ -322,7 +399,7 @@ def collapse_small_triangles(
     if n_faces == 0 or int(vertices.shape[0]) == 0:
         return wp.clone(vertices), wp.clone(faces)
 
-    bbd = tw.proximity.default_mesh_query_max_dist(vertices)
+    bbd = tw.proximity._default_mesh_query_max_dist(vertices)
     min_dbl_area = wp.float32(2.0 * epsilon * bbd * bbd)
 
     current_vertices = vertices
@@ -360,7 +437,7 @@ def collapse_small_triangles(
             device=device,
         )
         class_vertices = tw.array.gather(current_vertices, unique_indices)
-        remapped_faces = _remap_flat_indices(current_faces, inverse)
+        remapped_faces = tw.array.remap_indices(current_faces, inverse)
 
         keep_mask = tw.triangles.nondegenerate(class_vertices, remapped_faces)
         current_vertices, current_faces = tw.selection.submesh_from_face_mask(
@@ -375,10 +452,10 @@ def make_winding_consistent(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
     Flip faces so every shared edge is traversed in opposite directions by its two faces.
 
     Reuses the orientation flood-fill of
-    [`face_orientation_mask`][triwarp.characteristics.face_orientation_mask] (one arbitrary seed
+    [`face_orientation_mask`][triwarp.validation.face_orientation_mask] (one arbitrary seed
     face per connected component) and reverses the winding of every face whose orientation bit is
     set. The result satisfies
-    [`is_winding_consistent`][triwarp.characteristics.is_winding_consistent]; an already-consistent
+    [`is_winding_consistent`][triwarp.validation.is_winding_consistent]; an already-consistent
     mesh is returned unchanged. Mirrors ``trimesh.repair.fix_winding``.
 
     Parameters
@@ -393,8 +470,8 @@ def make_winding_consistent(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
 
     See Also
     --------
-    [`is_winding_consistent`][triwarp.characteristics.is_winding_consistent]
-    [`face_orientation_mask`][triwarp.characteristics.face_orientation_mask]
+    [`is_winding_consistent`][triwarp.validation.is_winding_consistent]
+    [`face_orientation_mask`][triwarp.validation.face_orientation_mask]
     [`make_normals_outward`][triwarp.repair.make_normals_outward]
 
     Notes
@@ -408,7 +485,7 @@ def make_winding_consistent(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
     if n_faces == 0:
         return wp.empty(0, dtype=wp.int32, device=device)
 
-    orient, _, _, _ = tw.characteristics._orientation_bits(faces)
+    orient, _, _, _ = tw.validation.face_orientation_bits(faces)
     out_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
     wp.launch(
         kernel_repair.flip_faces_masked,
@@ -448,14 +525,14 @@ def make_volume(
 
     See Also
     --------
-    [`is_volume`][triwarp.characteristics.is_volume]
+    [`is_volume`][triwarp.validation.is_volume]
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
     [`make_normals_outward`][triwarp.repair.make_normals_outward]
 
     Notes
     -----
     The signed volume is ``sum(dot(v0, cross(v1, v2)) / 6)`` measured from the origin, as in
-    [`is_volume`][triwarp.characteristics.is_volume]. Unlike ``trimesh.repair.fix_inversion``'s
+    [`is_volume`][triwarp.validation.is_volume]. Unlike ``trimesh.repair.fix_inversion``'s
     multibody path, this does not skip components that are not watertight/consistently wound: an
     open component's signed volume is ill-defined and may be flipped spuriously. Run
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent] first (see
@@ -477,7 +554,7 @@ def make_volume(
     )
 
     if multibody:
-        labels = tw.graph.face_connected_component_labels(faces)
+        labels = tw.adjacency.face_connected_component_labels(faces)
         accum = wp.zeros(n_faces, dtype=wp.float32, device=device)
         wp.launch(
             kernel_scatter.scatter_add_scalar,
@@ -496,7 +573,7 @@ def make_volume(
         )
         return out_faces
 
-    watertight = bool(tw.reduce.all(tw.characteristics.watertight_face_mask(faces)))
+    watertight = bool(tw.reduce.all(tw.validation.face_watertight_mask(faces)))
     if watertight and tw.reduce.sum(signed_volumes) < 0.0:
         flip = wp.full(n_faces, wp.int32(1), dtype=wp.int32, device=device)
         wp.launch(
@@ -521,7 +598,7 @@ def make_normals_outward(
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent] gives every connected
     component a coherent winding, then [`make_volume`][triwarp.repair.make_volume] flips it (or each
     body, with ``multibody=True``) so normals point outward. On a watertight, orientable mesh the
-    result satisfies [`is_volume`][triwarp.characteristics.is_volume].
+    result satisfies [`is_volume`][triwarp.validation.is_volume].
 
     Parameters
     ----------
@@ -543,37 +620,7 @@ def make_normals_outward(
     --------
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
     [`make_volume`][triwarp.repair.make_volume]
-    [`is_volume`][triwarp.characteristics.is_volume]
+    [`is_volume`][triwarp.validation.is_volume]
     """
     wound = make_winding_consistent(faces)
     return make_volume(vertices, wound, multibody=multibody)
-
-
-def _duplicate_vertex_inverse(vertices: wp.array[wp.vec3], epsilon: float) -> wp.array[wp.int32]:
-    device = vertices.device
-    n = int(vertices.shape[0])
-    if n == 0:
-        return wp.empty(0, dtype=wp.int32, device=device)
-
-    if epsilon > 0.0:
-        row_keys = hash_vector_rows(vertices, epsilon=epsilon)
-        _, inverse = unique_1d(row_keys, return_inverse=True)
-    else:
-        rows = twt.empty_float32_2d((n, 3), device=device)
-        wp.utils.array_cast(vertices, rows)
-        _, inverse = unique_rows(rows, return_inverse=True)
-    return inverse
-
-
-def _remap_flat_indices(
-    indices: wp.array[wp.int32], remap: wp.array[wp.int32]
-) -> wp.array[wp.int32]:
-    n = int(indices.shape[0])
-    device = indices.device
-    if n == 0:
-        return wp.empty(0, dtype=wp.int32, device=device)
-    out = wp.empty(n, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_array.gather_1d_skip_negative, dim=n, inputs=[indices, remap, out], device=device
-    )
-    return out

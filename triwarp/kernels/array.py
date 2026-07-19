@@ -1,7 +1,6 @@
 import warp as wp
 
-from triwarp.constants import TILE_1D, TOLERANCE_MERGE_CONSTANT
-from triwarp.kernels.reduce import outer_sum_tile
+from triwarp.constants import TOLERANCE_MERGE_CONSTANT
 
 
 @wp.func
@@ -298,22 +297,3 @@ def map_sorted_inverse(
 ) -> None:
     i = int(wp.tid())
     out_inverse[i] = binary_search_index(sorted_unique, data[i]) - wp.int32(1)
-
-
-@wp.kernel
-def centered_covariance(
-    points: wp.array[wp.vec3], center: wp.array[wp.vec3], out_cov: wp.array[wp.mat33]
-) -> None:
-    # Scatter matrix C = sum_k outer(x_k - center, x_k - center). With a zero center this is
-    # the uncentred Gram matrix G = sum_k outer(x_k, x_k).
-    i, t = wp.tid()
-    n = points.shape[0]
-    offset = i * TILE_1D
-    remaining = n - offset
-    if remaining <= 0:
-        return
-
-    m = outer_sum_tile(points, center[0], offset, remaining)
-
-    if t == 0:
-        wp.atomic_add(out_cov, 0, m)

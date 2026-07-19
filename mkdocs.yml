@@ -54,3 +54,4 @@ plugins:
             separate_signature: true
             show_signature_annotations: true
             show_if_no_docstring: true
+            members_order: source

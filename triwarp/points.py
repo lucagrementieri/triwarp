@@ -3,6 +3,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.constants import TILE_1D, TOLERANCE_ZERO
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import points as kernel_points
 from triwarp.kernels import reduce as kernel_reduce
 
@@ -72,6 +73,39 @@ def centroid(points: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
     return out
 
 
+def gram_matrix(points: wp.array[wp.vec3]) -> wp.array[wp.mat33]:
+    """
+    Uncentered Gram (scatter) matrix ``G = sum_k outer(x_k, x_k)``.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` positions in space as ``wp.vec3``.
+
+    Returns
+    -------
+    wp.array[wp.mat33]
+        Shape ``(1,)`` device array holding the ``3x3`` Gram matrix on
+        ``points.device``. All-zeros when ``points`` is empty.
+    """
+    device = points.device
+    n = int(points.shape[0])
+    out = wp.zeros(1, dtype=wp.mat33, device=device)
+    if n == 0:
+        return out
+    n_tiles = (n + TILE_1D - 1) // TILE_1D
+    # The uncentred Gram matrix is the scatter matrix around a zero center.
+    zero_center = wp.zeros(1, dtype=wp.vec3, device=device)
+    wp.launch_tiled(
+        kernel_points.centered_covariance,
+        dim=[n_tiles],
+        inputs=[points, zero_center, out],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    return out
+
+
 def fit_line(points: wp.array[wp.vec3]) -> wp.vec3:
     """
     Approximate major axis of a point set via SVD.
@@ -98,12 +132,62 @@ def fit_line(points: wp.array[wp.vec3]) -> wp.vec3:
         return wp.vec3(0.0, 0.0, 0.0)
 
     # Pass 1: accumulate the (uncentred) Gram matrix G = sum_j outer(x_j, x_j).
-    gram = tw.array.gram_matrix(points)
+    gram = gram_matrix(points)
 
     # Pass 2: SVD of the 3x3 matrix and axis extraction (single thread).
     out_axis = wp.empty(1, dtype=wp.vec3, device=device)
     wp.launch(kernel_points.finalize_fit_line, dim=1, inputs=[gram, out_axis], device=device)
     return wp.vec3(*out_axis.numpy()[0].tolist())
+
+
+def centered_covariance(
+    points: wp.array[wp.vec3], center: wp.array[wp.vec3] | None = None
+) -> wp.array[wp.mat33]:
+    """
+    Centered scatter matrix ``C = sum_k outer(x_k - mu, x_k - mu)`` (no ``1/n``).
+
+    Centering happens inside the outer-product loop (rather than via the
+    ``sum(x x^T) - n mu mu^T`` identity) to avoid float32 catastrophic
+    cancellation.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` positions in space as ``wp.vec3``.
+    center
+        Optional precomputed centroid as a ``(1,)`` ``wp.vec3`` device array.
+        When ``None`` it is computed on-device as ``sum(points) / n``.
+
+    Returns
+    -------
+    wp.array[wp.mat33]
+        Shape ``(1,)`` device array holding the centered ``3x3`` scatter matrix
+        on ``points.device``. All-zeros when ``points`` is empty.
+    """
+    device = points.device
+    n = int(points.shape[0])
+    out = wp.zeros(1, dtype=wp.mat33, device=device)
+    if n == 0:
+        return out
+    n_tiles = (n + TILE_1D - 1) // TILE_1D
+    if center is None:
+        center = wp.zeros(1, dtype=wp.vec3, device=device)
+        wp.launch_tiled(
+            kernel_reduce.sum_vec3_1d_tiled,
+            dim=[n_tiles],
+            inputs=[points, center],
+            block_dim=TILE_1D,
+            device=device,
+        )
+        wp.map(wp.div, center, wp.float32(n), out=center)
+    wp.launch_tiled(
+        kernel_points.centered_covariance,
+        dim=[n_tiles],
+        inputs=[points, center, out],
+        block_dim=TILE_1D,
+        device=device,
+    )
+    return out
 
 
 def fit_plane(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
@@ -137,7 +221,7 @@ def fit_plane(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     # Pass 2: covariance matrix of the centred points. Centring before the
     # outer products (rather than via the sum(x x^T) - n c c^T identity) avoids
     # float32 catastrophic cancellation.
-    cov = tw.array.centered_covariance(points, center=center)
+    cov = centered_covariance(points, center=center)
 
     # Pass 3: SVD of the 3x3 covariance and centroid/normal extraction (single thread).
     out_centroid = wp.empty(1, dtype=wp.vec3, device=device)
@@ -149,6 +233,62 @@ def fit_plane(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
         device=device,
     )
     return (wp.vec3(*out_centroid.numpy()[0].tolist()), wp.vec3(*out_normal.numpy()[0].tolist()))
+
+
+def plane_basis(normal: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
+    """
+    Right-handed orthonormal basis ``(u, v)`` spanning the plane with the given ``normal``.
+
+    Parameters
+    ----------
+    normal
+        Plane normal as ``wp.vec3``; need not be unit length.
+
+    Returns
+    -------
+    tuple[wp.vec3, wp.vec3]
+        ``(u, v)`` unit vectors perpendicular to each other and to ``normal``, such that
+        ``(u, v, normalize(normal))`` is right-handed.
+    """
+    unit_normal = wp.normalize(normal)
+    axis = wp.vec3(1.0, 0.0, 0.0)
+    if abs(unit_normal[0]) > 0.9:
+        axis = wp.vec3(0.0, 1.0, 0.0)
+    u = wp.normalize(wp.cross(axis, unit_normal))
+    v = wp.cross(unit_normal, u)
+    return u, v
+
+
+def covariance(points: wp.array[wp.vec3], ddof: int = 1) -> wp.array[wp.mat33]:
+    """
+    Sample covariance matrix ``(1 / (n - ddof)) sum_k outer(x_k - mu, x_k - mu)``.
+
+    Matches ``numpy.cov(points.T, ddof=ddof)`` for the default ``ddof=1``.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` positions in space as ``wp.vec3``.
+    ddof
+        Delta degrees of freedom; the divisor is ``n - ddof``. Defaults to ``1``.
+
+    Returns
+    -------
+    wp.array[wp.mat33]
+        Shape ``(1,)`` device array holding the ``3x3`` covariance matrix on
+        ``points.device``.
+
+    Raises
+    ------
+    ValueError
+        If ``n - ddof <= 0``.
+    """
+    n = int(points.shape[0])
+    if n - ddof <= 0:
+        raise ValueError(f"covariance requires n > ddof, got n={n}, ddof={ddof}")
+    out = centered_covariance(points)
+    wp.map(wp.div, out, wp.float32(n - ddof), out=out)
+    return out
 
 
 def estimate_normals(
@@ -166,7 +306,7 @@ def estimate_normals(
     made by MeshLib (``PointAccumulator``) and Open3D (``FastEigen3x3``), so the
     result matches both references up to sign. The neighbourhood is supplied by
     the caller as ``neighbor_idx``: build it with
-    [`query_bvh_nearest`][triwarp.proximity.query_bvh_nearest] using a plain
+    [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] using a plain
     ``k`` for a k-nearest (KNN) neighbourhood, or with ``max_radius`` set for a
     radius-bounded (hybrid) neighbourhood — mirroring the two neighbour modes of
     Open3D's ``estimate_normals(max_nn, radius)``.
@@ -177,7 +317,7 @@ def estimate_normals(
         ``(n,)`` point positions on the target device.
     neighbor_idx
         ``(n, k)`` int32 table of neighbour indices per point, as returned by
-        [`query_bvh_nearest`][triwarp.proximity.query_bvh_nearest] (unused slots
+        [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] (unused slots
         marked ``-1``). A self-query table includes each point itself once, which
         is counted normally.
     orient_reference
@@ -240,6 +380,47 @@ def estimate_normals(
         device=device,
     )
     return out_normals
+
+
+def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3]) -> wp.array[wp.float32]:
+    """
+    Unsigned angle in radians between pairs of unit vectors.
+
+    For each index ``i``, computes ``abs(arccos(clip(dot(a[i], b[i]), -1, 1)))``.
+    Matches [`trimesh.geometry.vector_angle`][] on stacked pairs.
+
+    Parameters
+    ----------
+    a
+        Length-``n`` unit vectors on the target device.
+    b
+        Length-``n`` unit vectors on the same device as ``a``.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        Length-``n`` unsigned angles in radians on ``a.device``. Empty when ``n == 0``.
+
+    Raises
+    ------
+    ValueError
+        If ``a`` and ``b`` live on different devices or have different lengths.
+
+    See Also
+    --------
+    [`trimesh.geometry.vector_angle`][]
+    """
+    device = a.device
+    n = int(a.shape[0])
+    if n != int(b.shape[0]):
+        raise ValueError(f"a and b must have the same length, got {n} and {b.shape[0]}")
+
+    if n == 0:
+        return wp.empty(0, dtype=wp.float32, device=device)
+
+    out_angles = wp.empty(n, dtype=wp.float32, device=device)
+    wp.map(kernel_array.vector_angle_vec, a, b, out=out_angles)
+    return out_angles
 
 
 def radial_sort(

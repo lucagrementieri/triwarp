@@ -81,3 +81,25 @@ def test_centroid_empty(device: str):
     centroid_wp = tw.triangles.centroid(vertices, faces)
     centroid_wp = np.array([centroid_wp.x, centroid_wp.y, centroid_wp.z])
     assert np.isnan(centroid_wp).all()
+
+
+def test_volume(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = icosahedron
+    volume_wp = tw.triangles.volume(mesh_wp.points, mesh_wp.indices)
+    assert np.isclose(volume_wp, mesh_tm.volume, rtol=1e-5, atol=1e-5)
+
+
+def test_volume_inward_normals_negative(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    mesh_tm, mesh_wp = icosahedron
+    faces_np = mesh_tm.faces[:, ::-1].reshape(-1).astype(np.int32)
+    faces_flipped_wp = wp.array(
+        np.ascontiguousarray(faces_np), dtype=wp.int32, device=mesh_wp.device
+    )
+    volume_wp = tw.triangles.volume(mesh_wp.points, faces_flipped_wp)
+    assert np.isclose(volume_wp, -mesh_tm.volume, rtol=1e-5, atol=1e-5)
+
+
+def test_volume_empty(device: str):
+    vertices = wp.zeros(1, dtype=wp.vec3, device=device)
+    faces = wp.array([], dtype=wp.int32, device=device)
+    assert tw.triangles.volume(vertices, faces) == 0.0

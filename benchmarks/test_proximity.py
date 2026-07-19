@@ -101,7 +101,7 @@ def test_winding_number_serial(bench_case: BenchCase) -> None:
 def test_aabb_bounds(bench_case: BenchCase) -> None:
     if bench_case.kind == "triwarp":
         vertices = bench_case.vertices_wp
-        lower, upper = bench_case.run(lambda: tw.proximity.aabb_bounds(vertices))
+        lower, upper = bench_case.run(lambda: tw.bounds.aabb_bounds(vertices))
         assert lower[0] <= upper[0]
     else:  # what an uncached ``trimesh.Trimesh.bounds`` computes: numpy min/max per axis
         vertices = bench_case.vertices_np
@@ -138,6 +138,6 @@ def test_query_geodesic_ball(bench_case: BenchCase) -> None:
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     radius = 5.0 * float(tw.edges.mean_edge_length(vertices, faces))
     _, offsets, _ = bench_case.run(
-        lambda: tw.proximity.query_geodesic_ball(vertices, faces, radius)
+        lambda: tw.geodesic.geodesic_ball(vertices, faces, radius)
     )
     assert offsets.shape == (vertices.shape[0],)

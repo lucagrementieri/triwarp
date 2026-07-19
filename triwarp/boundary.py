@@ -219,7 +219,7 @@ def boundary_loops(
     )
 
     vertex_labels = tw.array.gather(labels, boundary_vertices)
-    unique_labels, loop_index = tw.unique.unique_1d(vertex_labels, return_inverse=True)
+    unique_labels, loop_index = tw.grouping.unique_1d(vertex_labels, return_inverse=True)
     n_loops = int(unique_labels.shape[0])
 
     loop_sizes = tw.array.gather(label_count, unique_labels)
@@ -303,7 +303,7 @@ def boundary_vertex_indices(
         no boundary.
     """
     edges = boundary_edges(vertices, faces, edges_sorted)
-    return tw.unique.unique_1d(edges.flatten())
+    return tw.grouping.unique_1d(edges.flatten())
 
 
 def boundary_vertices(

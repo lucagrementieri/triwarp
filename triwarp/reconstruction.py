@@ -256,7 +256,7 @@ def triangulate_point_cloud(
 
     See Also
     --------
-    [`triwarp.stitching.fill_holes_min_weight`][]
+    [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight]
     [`triwarp.repair.remove_degenerate_faces`][]
     """
     if num_neighbours > 0 and radius > 0.0:
@@ -276,7 +276,7 @@ def triangulate_point_cloud(
     k = min(k, max_neighbours)
 
     # Dense (n, k+1) nearest-neighbour table; slot 0 is the point itself and is skipped in-kernel.
-    neighbor_idx, neighbor_dist = tw.proximity.query_bvh_nearest(points, points, k=k + 1)
+    neighbor_idx, neighbor_dist = tw.neighbors.query_bvh_nearest(points, points, k=k + 1)
 
     if normals is None:
         normals = tw.points.estimate_normals(points, neighbor_idx)
@@ -337,66 +337,14 @@ def _assemble_faces(
     # Remove faces on non-manifold edges so the result is edge-manifold (MeshLib
     # findHoleComplicatingFaces loop). This is required before boundary extraction: hole filling and
     # boundary_loops assume a manifold boundary.
-    vertices, faces = _drop_non_manifold_faces(vertices, faces)
+    vertices, faces = tw.repair.remove_non_manifold_faces(vertices, faces)
 
     # Fill small boundary holes (MeshLib makeMesh_ tail).
     if int(faces.shape[0]) > 0:
         hole_length = crit_hole_length
         if hole_length < 0.0:
-            lo, hi = tw.proximity.aabb_bounds(points)
+            lo, hi = tw.bounds.aabb_bounds(points)
             hole_length = 0.1 * float(wp.length(hi - lo))
-        faces = _fill_small_holes(vertices, faces, hole_length)
+        faces = tw.hole_filling.fill_small_holes(vertices, faces, hole_length)
 
     return vertices, faces
-
-
-def _drop_non_manifold_faces(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], max_iter: int = 3
-) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-    """
-    Remove faces touching a non-manifold (>2-incident) edge, iterating until edge-manifold.
-
-    Each pass keeps only faces whose three edges are each used by at most two faces
-    ([`edge_manifold_mask`][triwarp.characteristics.edge_manifold_mask]); dropping a face can make a
-    neighbour manifold, so it repeats up to ``max_iter`` times (matching MeshLib's bounded
-    hole-complicating-face removal loop).
-    """
-    for _ in range(max_iter):
-        n_faces = int(faces.shape[0]) // 3
-        if n_faces == 0:
-            break
-        keep = tw.characteristics.edge_manifold_mask(faces, allow_boundary_edges=True)
-        kept = tw.array.flatnonzero(keep)
-        if int(kept.shape[0]) == n_faces:
-            break  # already edge-manifold
-        vertices, faces = tw.selection.submesh_from_face_mask(vertices, faces, keep)
-    return vertices, faces
-
-
-def _fill_small_holes(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], max_perimeter: float
-) -> wp.array[wp.int32]:
-    """
-    Fill only boundary loops whose perimeter is at most ``max_perimeter`` (Stage 5).
-
-    Intended open boundaries (large loops) are left untouched; spurious small holes are sealed by
-    the shared min-weight interval DP ([`_fill_loops`][triwarp.stitching._fill_loops]).
-    """
-    loops = tw.boundary.boundary_loops(vertices, faces)
-    if not loops:
-        return faces
-
-    vertices_np = vertices.numpy()
-    small_loops = []
-    for loop in loops:
-        loop_np = loop.numpy()
-        if int(loop_np.shape[0]) < 3:
-            continue
-        ring = vertices_np[loop_np]
-        perimeter = float(np.linalg.norm(np.diff(ring, axis=0, append=ring[:1]), axis=1).sum())
-        if perimeter <= max_perimeter:
-            small_loops.append(loop)
-
-    if not small_loops:
-        return faces
-    return tw.stitching._fill_loops(vertices, faces, small_loops, "plane_normalized", True)

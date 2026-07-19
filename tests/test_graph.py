@@ -18,7 +18,9 @@ def test_face_adjacency(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     adjacency_tm = mesh_tm.face_adjacency
     adjacency_edges_tm = mesh_tm.face_adjacency_edges
-    adjacency_wp, adjacency_edges_wp = tw.graph.face_adjacency(mesh_wp.indices, return_edges=True)
+    adjacency_wp, adjacency_edges_wp = tw.adjacency.face_adjacency(
+        mesh_wp.indices, return_edges=True
+    )
 
     order_tm = np.lexsort((adjacency_tm[:, 1], adjacency_tm[:, 0]))
     order_wp = np.lexsort((adjacency_wp.numpy()[:, 1], adjacency_wp.numpy()[:, 0]))
@@ -32,8 +34,10 @@ def test_face_adjacency_unshared(request: pytest.FixtureRequest, mesh_name: str)
     adjacency_tm = mesh_tm.face_adjacency
     unshared_tm = mesh_tm.face_adjacency_unshared.astype(np.int32)
 
-    adjacency_wp, adjacency_edges_wp = tw.graph.face_adjacency(mesh_wp.indices, return_edges=True)
-    unshared_precomputed_wp = tw.graph.face_adjacency_unshared(
+    adjacency_wp, adjacency_edges_wp = tw.adjacency.face_adjacency(
+        mesh_wp.indices, return_edges=True
+    )
+    unshared_precomputed_wp = tw.adjacency.face_adjacency_unshared(
         mesh_wp.indices, face_adjacency=adjacency_wp, face_adjacency_edges=adjacency_edges_wp
     )
     adjacency_wp_np = adjacency_wp.numpy()
@@ -42,7 +46,7 @@ def test_face_adjacency_unshared(request: pytest.FixtureRequest, mesh_name: str)
 
     assert np.array_equal(unshared_precomputed_wp.numpy()[order_wp], unshared_tm[order_tm])
 
-    unshared_wp = tw.graph.face_adjacency_unshared(mesh_wp.indices)
+    unshared_wp = tw.adjacency.face_adjacency_unshared(mesh_wp.indices)
     order_unshared = np.lexsort((unshared_wp.numpy()[:, 1], unshared_wp.numpy()[:, 0]))
     order_unshared_precomputed = np.lexsort(
         (unshared_precomputed_wp.numpy()[:, 1], unshared_precomputed_wp.numpy()[:, 0])
@@ -55,7 +59,7 @@ def test_face_adjacency_unshared(request: pytest.FixtureRequest, mesh_name: str)
 
 def test_face_adjacency_unshared_empty(device: str) -> None:
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
-    unshared_wp = tw.graph.face_adjacency_unshared(faces_wp)
+    unshared_wp = tw.adjacency.face_adjacency_unshared(faces_wp)
     assert unshared_wp.shape == (0, 2)
 
 
@@ -65,8 +69,8 @@ def test_face_adjacency_angles(request: pytest.FixtureRequest, mesh_name: str) -
     adjacency_tm = mesh_tm.face_adjacency
     angles_tm = mesh_tm.face_adjacency_angles
 
-    adjacency_wp = tw.graph.face_adjacency(mesh_wp.indices)
-    angles_wp = tw.graph.face_adjacency_angles(
+    adjacency_wp = tw.adjacency.face_adjacency(mesh_wp.indices)
+    angles_wp = tw.adjacency.face_adjacency_angles(
         mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp
     )
 
@@ -87,13 +91,13 @@ def test_face_adjacency_angles(request: pytest.FixtureRequest, mesh_name: str) -
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
 def test_face_adjacency_angles_precomputed(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    adjacency_wp = tw.graph.face_adjacency(mesh_wp.indices)
+    adjacency_wp = tw.adjacency.face_adjacency(mesh_wp.indices)
     face_normals_wp, _ = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
 
-    angles_all_wp = tw.graph.face_adjacency_angles(
+    angles_all_wp = tw.adjacency.face_adjacency_angles(
         mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp
     )
-    angles_precomputed_wp = tw.graph.face_adjacency_angles(
+    angles_precomputed_wp = tw.adjacency.face_adjacency_angles(
         mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp, face_normals=face_normals_wp
     )
     assert np.allclose(angles_all_wp.numpy(), angles_precomputed_wp.numpy(), rtol=1e-5, atol=1e-5)
@@ -116,7 +120,7 @@ def test_face_adjacency_angles_precomputed(request: pytest.FixtureRequest, mesh_
 def test_face_adjacency_angles_empty(device: str) -> None:
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
     vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    angles_wp = tw.graph.face_adjacency_angles(vertices_wp, faces_wp)
+    angles_wp = tw.adjacency.face_adjacency_angles(vertices_wp, faces_wp)
     assert angles_wp.shape == (0,)
 
 
@@ -126,7 +130,7 @@ def test_concatenate_meshes(request: pytest.FixtureRequest) -> None:
     mesh_c_tm, mesh_c_wp = request.getfixturevalue("half_torus")
 
     concat_tm = tm.util.concatenate([mesh_a_tm, mesh_b_tm, mesh_c_tm])
-    concat_vertices_wp, concat_faces_wp = tw.graph.concatenate(
+    concat_vertices_wp, concat_faces_wp = tw.combine.concatenate(
         [
             (mesh_a_wp.points, mesh_a_wp.indices),
             (mesh_b_wp.points, mesh_b_wp.indices),
@@ -139,13 +143,15 @@ def test_concatenate_meshes(request: pytest.FixtureRequest) -> None:
 
 def test_concatenate_single_mesh(request: pytest.FixtureRequest) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue("icosahedron")
-    concat_vertices_wp, concat_faces_wp = tw.graph.concatenate([(mesh_wp.points, mesh_wp.indices)])
+    concat_vertices_wp, concat_faces_wp = tw.combine.concatenate(
+        [(mesh_wp.points, mesh_wp.indices)]
+    )
     assert np.allclose(concat_vertices_wp.numpy(), mesh_tm.vertices)
     assert np.array_equal(concat_faces_wp.numpy(), mesh_tm.faces.reshape(-1))
 
 
 def test_concatenate_empty() -> None:
-    vertices_wp, faces_wp = tw.graph.concatenate([])
+    vertices_wp, faces_wp = tw.combine.concatenate([])
     assert vertices_wp.shape == (0,)
     assert faces_wp.shape == (0,)
 
@@ -160,12 +166,12 @@ def test_split_meshes(request: pytest.FixtureRequest) -> None:
         (mesh_b_wp.points, mesh_b_wp.indices),
         (mesh_c_wp.points, mesh_c_wp.indices),
     ]
-    concat_vertices_wp, concat_faces_wp = tw.graph.concatenate(meshes_wp)
+    concat_vertices_wp, concat_faces_wp = tw.combine.concatenate(meshes_wp)
 
-    split_wp = tw.graph.split(concat_vertices_wp, concat_faces_wp)
+    split_wp = tw.combine.split(concat_vertices_wp, concat_faces_wp)
     assert len(split_wp) == 3
 
-    roundtrip_vertices_wp, roundtrip_faces_wp = tw.graph.concatenate(split_wp)
+    roundtrip_vertices_wp, roundtrip_faces_wp = tw.combine.concatenate(split_wp)
     assert np.allclose(roundtrip_vertices_wp.numpy(), concat_vertices_wp.numpy())
     assert np.array_equal(roundtrip_faces_wp.numpy(), concat_faces_wp.numpy())
 
@@ -179,7 +185,7 @@ def test_split_meshes(request: pytest.FixtureRequest) -> None:
 def test_split_empty(device: str) -> None:
     vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    assert tw.graph.split(vertices_wp, faces_wp) == []
+    assert tw.combine.split(vertices_wp, faces_wp) == []
 
 
 def test_edges_to_csr_roundtrip(device: str) -> None:
@@ -260,14 +266,14 @@ def test_face_connected_component_labels(request: pytest.FixtureRequest) -> None
     mesh_c_tm, mesh_c_wp = request.getfixturevalue("half_torus")
 
     concat_tm = tm.util.concatenate([mesh_a_tm, mesh_b_tm, mesh_c_tm])
-    _, concat_faces_wp = tw.graph.concatenate(
+    _, concat_faces_wp = tw.combine.concatenate(
         [
             (mesh_a_wp.points, mesh_a_wp.indices),
             (mesh_b_wp.points, mesh_b_wp.indices),
             (mesh_c_wp.points, mesh_c_wp.indices),
         ]
     )
-    face_labels_wp = tw.graph.face_connected_component_labels(concat_faces_wp)
+    face_labels_wp = tw.adjacency.face_connected_component_labels(concat_faces_wp)
     n_faces = concat_tm.faces.shape[0]
     face_labels_tm = _scipy_component_labels(concat_tm.face_adjacency.astype(np.int32), n_faces)
     assert _same_partition(face_labels_wp.numpy(), face_labels_tm)

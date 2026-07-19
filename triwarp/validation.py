@@ -1,3 +1,5 @@
+"""Mesh diagnostics: topological/geometric validity predicates and their per-element masks."""
+
 from __future__ import annotations
 
 from typing import cast
@@ -7,9 +9,9 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.kernels import array as kernel_array
-from triwarp.kernels import characteristics as kernel_characteristics
 from triwarp.kernels import intersection as kernel_intersections
 from triwarp.kernels import triangles as kernel_triangles
+from triwarp.kernels import validation as kernel_validation
 
 
 def euler_characteristic(faces: wp.array[wp.int32]) -> int:
@@ -39,7 +41,7 @@ def euler_characteristic(faces: wp.array[wp.int32]) -> int:
     if n_faces == 0:
         return 0
 
-    n_referenced = int(tw.unique.unique_1d(faces).shape[0])
+    n_referenced = int(tw.grouping.unique_1d(faces).shape[0])
     unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=tw.vertices.n_vertices(faces))
     n_edges = int(unique_edges.shape[0])
     return n_referenced - n_edges + n_faces
@@ -81,8 +83,8 @@ def is_edge_manifold(
 
     See Also
     --------
-    [`is_vertex_manifold`][triwarp.characteristics.is_vertex_manifold]
-    [`is_watertight`][triwarp.characteristics.is_watertight]
+    [`is_vertex_manifold`][triwarp.validation.is_vertex_manifold]
+    [`is_watertight`][triwarp.validation.is_watertight]
 
     Notes
     -----
@@ -97,8 +99,8 @@ def is_edge_manifold(
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
     if n_vertices is None:
         n_vertices = tw.vertices.n_vertices(faces)
-    keys = tw.unique.hash_indices_rows(edges_sorted, max_index=n_vertices)
-    _, counts = tw.unique.unique_1d(keys, return_counts=True)
+    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices)
+    _, counts = tw.grouping.unique_1d(keys, return_counts=True)
 
     min_count, max_count = tw.reduce.minmax(cast(twt.Array1dInt32, counts))
     if allow_boundary_edges:
@@ -118,7 +120,7 @@ def edge_manifold_mask(
     exactly two faces (``allow_boundary_edges=False``); a face is flagged ``True`` only when all
     three of its edges qualify. This is a per-face collapse of libigl's ``BF`` (its per-corner
     ``is_edge_manifold`` matrix), and
-    [`is_edge_manifold`][triwarp.characteristics.is_edge_manifold] is ``True`` iff every entry of
+    [`is_edge_manifold`][triwarp.validation.is_edge_manifold] is ``True`` iff every entry of
     this mask is ``True``.
 
     Parameters
@@ -140,8 +142,8 @@ def edge_manifold_mask(
 
     See Also
     --------
-    [`is_edge_manifold`][triwarp.characteristics.is_edge_manifold]
-    [`vertex_manifold_mask`][triwarp.characteristics.vertex_manifold_mask]
+    [`is_edge_manifold`][triwarp.validation.is_edge_manifold]
+    [`vertex_manifold_mask`][triwarp.validation.vertex_manifold_mask]
     """
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
@@ -150,16 +152,16 @@ def edge_manifold_mask(
 
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    keys = tw.unique.hash_indices_rows(edges_sorted, max_index=tw.vertices.n_vertices(faces))
-    _, inverse, counts = tw.unique.unique_1d(keys, return_inverse=True, return_counts=True)
+    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=tw.vertices.n_vertices(faces))
+    _, inverse, counts = tw.grouping.unique_1d(keys, return_inverse=True, return_counts=True)
 
     n_unique = int(counts.shape[0])
     edge_ok = wp.empty(n_unique, dtype=wp.bool, device=device)
-    wp.map(kernel_characteristics.edge_manifold, counts, wp.bool(allow_boundary_edges), out=edge_ok)
+    wp.map(kernel_validation.edge_manifold, counts, wp.bool(allow_boundary_edges), out=edge_ok)
 
     out_mask = wp.empty(n_faces, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_characteristics.face_edge_manifold_mask,
+        kernel_validation.face_edge_manifold_mask,
         dim=n_faces,
         inputs=[inverse, edge_ok, out_mask],
         device=device,
@@ -191,7 +193,7 @@ def is_vertex_manifold(
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
     face_adjacency
         Optional precomputed ``(m, 2)`` face-adjacency pairs from
-        [`face_adjacency`][triwarp.graph.face_adjacency]. Must be given together with
+        [`face_adjacency`][triwarp.adjacency.face_adjacency]. Must be given together with
         ``face_adjacency_edges``.
     face_adjacency_edges
         Optional ``(m, 2)`` shared-edge vertex pairs aligned with ``face_adjacency``
@@ -209,19 +211,19 @@ def is_vertex_manifold(
 
     See Also
     --------
-    [`vertex_manifold_mask`][triwarp.characteristics.vertex_manifold_mask]
-    [`is_edge_manifold`][triwarp.characteristics.is_edge_manifold]
-    [`is_watertight`][triwarp.characteristics.is_watertight]
+    [`vertex_manifold_mask`][triwarp.validation.vertex_manifold_mask]
+    [`is_edge_manifold`][triwarp.validation.is_edge_manifold]
+    [`is_watertight`][triwarp.validation.is_watertight]
 
     Notes
     -----
     Corner adjacency is derived from
-    [`face_adjacency`][triwarp.graph.face_adjacency], which pairs faces across edges shared by
+    [`face_adjacency`][triwarp.adjacency.face_adjacency], which pairs faces across edges shared by
     exactly two faces; on edge-non-manifold meshes (an edge shared by three or more faces) read the
-    result together with [`is_edge_manifold`][triwarp.characteristics.is_edge_manifold]. Equivalent
+    result together with [`is_edge_manifold`][triwarp.validation.is_edge_manifold]. Equivalent
     to libigl ``is_vertex_manifold``. The output is sized to ``max(faces) + 1`` so unreferenced
     vertices in that range count as non-manifold; use
-    [`vertex_manifold_mask`][triwarp.characteristics.vertex_manifold_mask] for a per-vertex flag
+    [`vertex_manifold_mask`][triwarp.validation.vertex_manifold_mask] for a per-vertex flag
     sized to a caller-provided vertex buffer.
     """
     if (face_adjacency is None) != (face_adjacency_edges is None):
@@ -236,7 +238,7 @@ def is_vertex_manifold(
     n_vertices = tw.vertices.n_vertices(faces)
     n_corners = n_faces * 3
     if face_adjacency is None or face_adjacency_edges is None:
-        adjacency, adjacency_edges = tw.graph.face_adjacency(faces, return_edges=True)
+        adjacency, adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
     else:
         adjacency, adjacency_edges = face_adjacency, face_adjacency_edges
     m = int(adjacency.shape[0])
@@ -244,7 +246,7 @@ def is_vertex_manifold(
     corner_edges = twt.empty_int32_2d((2 * m, 2), device=device)
     if m > 0:
         wp.launch(
-            kernel_characteristics.build_corner_adjacency_edges,
+            kernel_validation.build_corner_adjacency_edges,
             dim=m,
             inputs=[faces, adjacency, adjacency_edges, corner_edges],
             device=device,
@@ -253,17 +255,17 @@ def is_vertex_manifold(
     labels = tw.graph.connected_component_labels_from_edges(corner_edges, node_count=n_corners)
 
     min_label = wp.full(
-        n_vertices, tw.reduce.max_for_dtype(wp.int32), dtype=wp.int32, device=device
+        n_vertices, twt.dtype_max(wp.int32), dtype=wp.int32, device=device
     )
     manifold = wp.zeros(n_vertices, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_characteristics.corner_vertex_reduce,
+        kernel_validation.corner_vertex_reduce,
         dim=n_corners,
         inputs=[faces, labels, min_label, manifold],
         device=device,
     )
     wp.launch(
-        kernel_characteristics.corner_vertex_check,
+        kernel_validation.corner_vertex_check,
         dim=n_corners,
         inputs=[faces, labels, min_label, manifold],
         device=device,
@@ -297,8 +299,8 @@ def vertex_manifold_mask(
 
     See Also
     --------
-    [`is_vertex_manifold`][triwarp.characteristics.is_vertex_manifold]
-    [`edge_manifold_mask`][triwarp.characteristics.edge_manifold_mask]
+    [`is_vertex_manifold`][triwarp.validation.is_vertex_manifold]
+    [`edge_manifold_mask`][triwarp.validation.edge_manifold_mask]
     """
     device = faces.device
     n_vertices = int(vertices.shape[0])
@@ -307,13 +309,13 @@ def vertex_manifold_mask(
         return wp.zeros(n_vertices, dtype=wp.bool, device=device)
 
     n_corners = n_faces * 3
-    adjacency, adjacency_edges = tw.graph.face_adjacency(faces, return_edges=True)
+    adjacency, adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
     m = int(adjacency.shape[0])
 
     corner_edges = twt.empty_int32_2d((2 * m, 2), device=device)
     if m > 0:
         wp.launch(
-            kernel_characteristics.build_corner_adjacency_edges,
+            kernel_validation.build_corner_adjacency_edges,
             dim=m,
             inputs=[faces, adjacency, adjacency_edges, corner_edges],
             device=device,
@@ -322,17 +324,17 @@ def vertex_manifold_mask(
     labels = tw.graph.connected_component_labels_from_edges(corner_edges, node_count=n_corners)
 
     min_label = wp.full(
-        n_vertices, tw.reduce.max_for_dtype(wp.int32), dtype=wp.int32, device=device
+        n_vertices, twt.dtype_max(wp.int32), dtype=wp.int32, device=device
     )
     manifold = wp.zeros(n_vertices, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_characteristics.corner_vertex_reduce,
+        kernel_validation.corner_vertex_reduce,
         dim=n_corners,
         inputs=[faces, labels, min_label, manifold],
         device=device,
     )
     wp.launch(
-        kernel_characteristics.corner_vertex_check,
+        kernel_validation.corner_vertex_check,
         dim=n_corners,
         inputs=[faces, labels, min_label, manifold],
         device=device,
@@ -369,9 +371,9 @@ def is_self_intersecting(
 
     See Also
     --------
-    [`self_intersecting_face_mask`][triwarp.characteristics.self_intersecting_face_mask]
+    [`face_self_intersecting_mask`][triwarp.validation.face_self_intersecting_mask]
     [`mesh_with_mesh`][triwarp.intersection.mesh_with_mesh]
-    [`is_watertight`][triwarp.characteristics.is_watertight]
+    [`is_watertight`][triwarp.validation.is_watertight]
 
     Notes
     -----
@@ -420,7 +422,7 @@ def is_self_intersecting(
     return bool(tw.reduce.any(valid))
 
 
-def self_intersecting_face_mask(
+def face_self_intersecting_mask(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], *, max_triangle_collisions: int = 32
 ) -> wp.array[wp.bool]:
     """
@@ -429,7 +431,7 @@ def self_intersecting_face_mask(
     Broad phase builds a ``warp.Mesh`` and queries each triangle's AABB for candidate overlaps;
     narrow phase runs a separating-axis triangle test on each candidate pair (skipping pairs that
     share a vertex), and both faces of every intersecting pair are flagged.
-    [`is_self_intersecting`][triwarp.characteristics.is_self_intersecting] is ``True`` iff any entry
+    [`is_self_intersecting`][triwarp.validation.is_self_intersecting] is ``True`` iff any entry
     of this mask is ``True``.
 
     Parameters
@@ -449,7 +451,7 @@ def self_intersecting_face_mask(
 
     See Also
     --------
-    [`is_self_intersecting`][triwarp.characteristics.is_self_intersecting]
+    [`is_self_intersecting`][triwarp.validation.is_self_intersecting]
     """
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
@@ -493,7 +495,7 @@ def self_intersecting_face_mask(
         device=device,
     )
     wp.launch(
-        kernel_characteristics.mark_intersecting_faces,
+        kernel_validation.mark_intersecting_faces,
         dim=n_pairs,
         inputs=[pairs, valid, mask],
         device=device,
@@ -507,7 +509,7 @@ def is_winding_consistent(faces: wp.array[wp.int32]) -> bool:
 
     A mesh has consistent winding when, for each edge shared by two faces, the two faces list the
     edge's endpoints in opposite order (so their normals agree locally). This is a property of the
-    current winding, unlike [`is_orientable`][triwarp.characteristics.is_orientable], which allows
+    current winding, unlike [`is_orientable`][triwarp.validation.is_orientable], which allows
     faces to be flipped. Matches [`trimesh.Trimesh.is_winding_consistent`][].
 
     Parameters
@@ -523,22 +525,22 @@ def is_winding_consistent(faces: wp.array[wp.int32]) -> bool:
 
     See Also
     --------
-    [`winding_consistent_mask`][triwarp.characteristics.winding_consistent_mask]
-    [`is_orientable`][triwarp.characteristics.is_orientable]
-    [`is_volume`][triwarp.characteristics.is_volume]
+    [`edge_winding_consistent_mask`][triwarp.validation.edge_winding_consistent_mask]
+    [`is_orientable`][triwarp.validation.is_orientable]
+    [`is_volume`][triwarp.validation.is_volume]
     [`trimesh.Trimesh.is_winding_consistent`][]
     """
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return True
 
-    mask = winding_consistent_mask(faces)
+    mask = edge_winding_consistent_mask(faces)
     if int(mask.shape[0]) == 0:
         return True
     return bool(tw.reduce.all(mask))
 
 
-def winding_consistent_mask(
+def edge_winding_consistent_mask(
     faces: wp.array[wp.int32],
     edges: twt.Array2dInt32 | None = None,
     edges_sorted: twt.Array2dInt32 | None = None,
@@ -549,7 +551,7 @@ def winding_consistent_mask(
     Built over the undirected edges shared by exactly two faces (edge groups of length two). An
     entry is ``True`` when the two directed half-edges are reversed (locally consistent normals);
     boundary and non-manifold edges have no entry.
-    [`is_winding_consistent`][triwarp.characteristics.is_winding_consistent] is ``True`` iff every
+    [`is_winding_consistent`][triwarp.validation.is_winding_consistent] is ``True`` iff every
     entry is ``True``.
 
     Parameters
@@ -571,8 +573,8 @@ def winding_consistent_mask(
 
     See Also
     --------
-    [`is_winding_consistent`][triwarp.characteristics.is_winding_consistent]
-    [`face_orientation_mask`][triwarp.characteristics.face_orientation_mask]
+    [`is_winding_consistent`][triwarp.validation.is_winding_consistent]
+    [`face_orientation_mask`][triwarp.validation.face_orientation_mask]
     """
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
@@ -591,7 +593,7 @@ def winding_consistent_mask(
 
     consistent = wp.empty(n_groups, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_characteristics.edge_pair_winding_mask,
+        kernel_validation.edge_pair_winding_mask,
         dim=n_groups,
         inputs=[edges, edge_groups, consistent],
         device=device,
@@ -599,7 +601,7 @@ def winding_consistent_mask(
     return consistent
 
 
-def _orientation_bits(
+def face_orientation_bits(
     faces: wp.array[wp.int32],
 ) -> tuple[wp.array[wp.int32], twt.Array2dInt32, wp.array[wp.int32], int]:
     """
@@ -607,20 +609,48 @@ def _orientation_bits(
 
     ``orient[f]`` is ``0`` for a face that agrees with its connected component's seed and ``1`` for
     a face that must be flipped to agree — the flip mask consumed by
-    [`face_orientation_mask`][triwarp.characteristics.face_orientation_mask] and
+    [`face_orientation_mask`][triwarp.validation.face_orientation_mask] and
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]. ``m`` is the number of
     face-adjacency rows; when ``m == 0`` the returned ``signed_edges`` / ``signs`` are empty.
     Assumes ``n_faces > 0`` (callers guard).
+
+    This is a lower-level primitive (the underlying orientation-propagation engine behind
+    [`is_orientable`][triwarp.validation.is_orientable] and
+    [`face_orientation_mask`][triwarp.validation.face_orientation_mask]) exposed for callers that
+    need the raw flip bits together with the propagation edges, such as
+    [`triwarp.repair.make_winding_consistent`][triwarp.repair.make_winding_consistent].
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer. ``n_faces`` must be
+        positive.
+
+    Returns
+    -------
+    orient : wp.array[wp.int32]
+        Length ``n_faces`` flip bits (``0`` or ``1``) on ``faces.device``.
+    signed_edges : twt.Array2dInt32
+        ``(m, 2)`` face-adjacency pairs, one row per face-adjacency edge.
+    signs : wp.array[wp.int32]
+        Length ``m`` Z2 sign per adjacency edge.
+    m : int
+        Number of face-adjacency rows.
+
+    See Also
+    --------
+    [`is_orientable`][triwarp.validation.is_orientable]
+    [`face_orientation_mask`][triwarp.validation.face_orientation_mask]
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
-    adjacency, adjacency_edges = tw.graph.face_adjacency(faces, return_edges=True)
+    adjacency, adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
     m = int(adjacency.shape[0])
 
     labels = tw.graph.connected_component_labels_from_edges(adjacency, node_count=n_faces)
     orient = wp.empty(n_faces, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_characteristics.seed_orientation, dim=n_faces, inputs=[labels, orient], device=device
+        kernel_validation.seed_orientation, dim=n_faces, inputs=[labels, orient], device=device
     )
 
     if m == 0:
@@ -631,7 +661,7 @@ def _orientation_bits(
     signed_edges = twt.empty_int32_2d((m, 2), device=device)
     signs = wp.empty(m, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_characteristics.build_signed_face_edges,
+        kernel_validation.build_signed_face_edges,
         dim=m,
         inputs=[faces, adjacency, adjacency_edges, signed_edges, signs],
         device=device,
@@ -647,7 +677,7 @@ def _orientation_bits(
         changed.zero_()
         for _ in range(min(batch, remaining)):
             wp.launch(
-                kernel_characteristics.propagate_orientation,
+                kernel_validation.propagate_orientation,
                 dim=m,
                 inputs=[signed_edges, signs, orient, changed],
                 device=device,
@@ -683,14 +713,14 @@ def is_orientable(faces: wp.array[wp.int32]) -> bool:
 
     See Also
     --------
-    [`face_orientation_mask`][triwarp.characteristics.face_orientation_mask]
-    [`is_watertight`][triwarp.characteristics.is_watertight]
-    [`is_winding_consistent`][triwarp.characteristics.is_winding_consistent]
+    [`face_orientation_mask`][triwarp.validation.face_orientation_mask]
+    [`is_watertight`][triwarp.validation.is_watertight]
+    [`is_winding_consistent`][triwarp.validation.is_winding_consistent]
 
     Notes
     -----
     Equivalent to ``open3d.geometry.TriangleMesh.is_orientable``. Unlike
-    [`is_winding_consistent`][triwarp.characteristics.is_winding_consistent], orientability allows
+    [`is_winding_consistent`][triwarp.validation.is_winding_consistent], orientability allows
     individual faces to be flipped, so a consistently-orientable mesh with inconsistent winding
     still returns ``True``.
     """
@@ -698,14 +728,14 @@ def is_orientable(faces: wp.array[wp.int32]) -> bool:
     if n_faces == 0:
         return True
 
-    orient, signed_edges, signs, m = _orientation_bits(faces)
+    orient, signed_edges, signs, m = face_orientation_bits(faces)
     if m == 0:
         return True
 
     device = faces.device
     conflict = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_characteristics.verify_orientation,
+        kernel_validation.verify_orientation,
         dim=m,
         inputs=[signed_edges, signs, orient, conflict],
         device=device,
@@ -736,8 +766,8 @@ def face_orientation_mask(faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
 
     See Also
     --------
-    [`is_orientable`][triwarp.characteristics.is_orientable]
-    [`is_winding_consistent`][triwarp.characteristics.is_winding_consistent]
+    [`is_orientable`][triwarp.validation.is_orientable]
+    [`is_winding_consistent`][triwarp.validation.is_winding_consistent]
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
 
     Notes
@@ -750,7 +780,7 @@ def face_orientation_mask(faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
     if n_faces == 0:
         return wp.empty(0, dtype=wp.bool, device=device)
 
-    orient, _, _, _ = _orientation_bits(faces)
+    orient, _, _, _ = face_orientation_bits(faces)
     mask = wp.empty(n_faces, dtype=wp.bool, device=device)
     wp.map(kernel_array.greater, orient, wp.int32(0), out=mask)
     return mask
@@ -787,17 +817,17 @@ def is_watertight(
 
     See Also
     --------
-    [`watertight_face_mask`][triwarp.characteristics.watertight_face_mask]
-    [`is_edge_manifold`][triwarp.characteristics.is_edge_manifold]
-    [`is_vertex_manifold`][triwarp.characteristics.is_vertex_manifold]
-    [`is_self_intersecting`][triwarp.characteristics.is_self_intersecting]
-    [`is_volume`][triwarp.characteristics.is_volume]
+    [`face_watertight_mask`][triwarp.validation.face_watertight_mask]
+    [`is_edge_manifold`][triwarp.validation.is_edge_manifold]
+    [`is_vertex_manifold`][triwarp.validation.is_vertex_manifold]
+    [`is_self_intersecting`][triwarp.validation.is_self_intersecting]
+    [`is_volume`][triwarp.validation.is_volume]
 
     Notes
     -----
     Equivalent to ``open3d.geometry.TriangleMesh.is_watertight``. For the cheaper "every edge shared
     by exactly two faces" test (trimesh semantics) use
-    [`is_edge_manifold`][triwarp.characteristics.is_edge_manifold] with
+    [`is_edge_manifold`][triwarp.validation.is_edge_manifold] with
     ``allow_boundary_edges=False``.
     """
     n_faces = int(faces.shape[0]) // 3
@@ -811,7 +841,7 @@ def is_watertight(
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
     if not is_edge_manifold(faces, allow_boundary_edges=False, edges_sorted=edges_sorted):
         return False
-    adjacency, adjacency_edges = tw.graph.face_adjacency(
+    adjacency, adjacency_edges = tw.adjacency.face_adjacency(
         faces, edges_sorted=edges_sorted, return_edges=True
     )
     if not is_vertex_manifold(
@@ -821,16 +851,16 @@ def is_watertight(
     return not is_self_intersecting(vertices, faces)
 
 
-def watertight_face_mask(
+def face_watertight_mask(
     faces: wp.array[wp.int32], edges_sorted: twt.Array2dInt32 | None = None
 ) -> wp.array[wp.bool]:
     """
     Per-face flag: whether all three of a face's undirected edges are shared by exactly two faces.
 
-    This is [`edge_manifold_mask`][triwarp.characteristics.edge_manifold_mask] with
+    This is [`edge_manifold_mask`][triwarp.validation.edge_manifold_mask] with
     ``allow_boundary_edges=False``: a face is ``True`` only when none of its edges is a boundary
     edge (used once) or a non-manifold edge (used three or more times). The faces that break
-    watertightness (trimesh's ``broken_faces``) are ``flatnonzero(~watertight_face_mask(faces))``.
+    watertightness (trimesh's ``broken_faces``) are ``flatnonzero(~face_watertight_mask(faces))``.
 
     Parameters
     ----------
@@ -838,7 +868,7 @@ def watertight_face_mask(
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
     edges_sorted
         Optional precomputed ``(n_faces * 3, 2)`` sorted edges forwarded to
-        [`edge_manifold_mask`][triwarp.characteristics.edge_manifold_mask].
+        [`edge_manifold_mask`][triwarp.validation.edge_manifold_mask].
 
     Returns
     -------
@@ -847,8 +877,8 @@ def watertight_face_mask(
 
     See Also
     --------
-    [`is_watertight`][triwarp.characteristics.is_watertight]
-    [`edge_manifold_mask`][triwarp.characteristics.edge_manifold_mask]
+    [`is_watertight`][triwarp.validation.is_watertight]
+    [`edge_manifold_mask`][triwarp.validation.edge_manifold_mask]
     """
     return edge_manifold_mask(faces, edges_sorted=edges_sorted, allow_boundary_edges=False)
 
@@ -890,9 +920,9 @@ def is_volume(
 
     See Also
     --------
-    [`is_winding_consistent`][triwarp.characteristics.is_winding_consistent]
-    [`is_watertight`][triwarp.characteristics.is_watertight]
-    [`is_orientable`][triwarp.characteristics.is_orientable]
+    [`is_winding_consistent`][triwarp.validation.is_winding_consistent]
+    [`is_watertight`][triwarp.validation.is_watertight]
+    [`is_orientable`][triwarp.validation.is_orientable]
     [`trimesh.Trimesh.is_volume`][]
 
     Notes
@@ -920,7 +950,7 @@ def is_volume(
 
     consistent = wp.empty(n_groups, dtype=wp.bool, device=device)
     wp.launch(
-        kernel_characteristics.edge_pair_winding_mask,
+        kernel_validation.edge_pair_winding_mask,
         dim=n_groups,
         inputs=[edges, edge_groups, consistent],
         device=device,

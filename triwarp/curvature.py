@@ -61,8 +61,8 @@ def principal_curvature(
 
     # Collect vertex neighborhoods as geodesic balls (libigl getSphere) on device. A Euclidean ball
     # would pull in vertices across surface folds and corrupt the quadric fit; see
-    # tw.proximity.query_geodesic_ball.
-    neighbor_indices, offsets, reference_neighbors = tw.proximity.query_geodesic_ball(
+    # tw.geodesic.geodesic_ball.
+    neighbor_indices, offsets, reference_neighbors = tw.geodesic.geodesic_ball(
         vertices, faces, scaled_radius
     )
 
@@ -128,7 +128,7 @@ def discrete_gaussian_curvature(
     wp.array[wp.float32]
         Length ``n`` discrete Gaussian curvature measure on ``points.device``.
     """
-    nearest_indices, _, nearest_offsets = tw.proximity.query_hashgrid_ball_with_offsets(
+    nearest_indices, _, nearest_offsets = tw.neighbors.query_hashgrid_ball_with_offsets(
         vertices, points, radius
     )
     defects = vertex_defects(vertices.shape[0], faces, face_angles)
@@ -168,7 +168,7 @@ def discrete_mean_curvature(
         Sphere radius which should typically be greater than zero.
     face_adjacency
         Optional ``(m, 2)`` face index pairs from
-        [`face_adjacency`][triwarp.graph.face_adjacency]. When ``None``, adjacency and
+        [`face_adjacency`][triwarp.adjacency.face_adjacency]. When ``None``, adjacency and
         shared edges are computed from ``faces``.
     face_adjacency_edges
         Optional ``(m, 2)`` sorted shared vertex pairs. Must be supplied
@@ -198,7 +198,7 @@ def discrete_mean_curvature(
             "face_adjacency and face_adjacency_edges must both be provided or both omitted"
         )
     if face_adjacency is None:
-        face_adjacency, face_adjacency_edges = tw.graph.face_adjacency(faces, return_edges=True)
+        face_adjacency, face_adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
     assert face_adjacency is not None
     assert face_adjacency_edges is not None
 
@@ -206,7 +206,7 @@ def discrete_mean_curvature(
     if m == 0:
         return wp.zeros(n_points, dtype=wp.float32, device=device)
 
-    angles = tw.graph.face_adjacency_angles(vertices, faces, face_adjacency=face_adjacency)
+    angles = tw.adjacency.face_adjacency_angles(vertices, faces, face_adjacency=face_adjacency)
     convex = tw.convex.face_adjacency_convex(
         vertices, faces, face_adjacency=face_adjacency, face_adjacency_edges=face_adjacency_edges
     )
@@ -220,8 +220,8 @@ def discrete_mean_curvature(
         device=device,
     )
 
-    bvh = tw.proximity.bvh_from_bounds(edge_lower, edge_upper)
-    candidate_edges, offsets = tw.proximity.query_bvh_aabb_with_offsets(bvh, points, radius)
+    bvh = tw.neighbors.bvh_from_bounds(edge_lower, edge_upper)
+    candidate_edges, offsets = tw.neighbors.query_bvh_aabb_with_offsets(bvh, points, radius)
 
     mean_curvature = wp.zeros(n_points, dtype=wp.float32, device=device)
     n_candidates = int(candidate_edges.shape[0])

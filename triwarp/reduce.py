@@ -8,8 +8,8 @@ from typing import Literal, NamedTuple, cast, overload
 import warp as wp
 
 import triwarp.typing as twt
+from triwarp.array import _sorted_copy
 from triwarp.constants import TILE_1D, TILE_2D
-from triwarp.kernels import array as kernel_array
 from triwarp.kernels import reduce as kernel_reduce
 
 
@@ -438,104 +438,11 @@ def median(array: twt.Array1dScalar) -> float:
     if n == 0:
         raise ValueError("median requires a non-empty array.")
 
-    sorted_values = _sorted_scalar_copy(cast(twt.Array1dScalar, array))
+    sorted_values = cast(twt.Array1dScalar, _sorted_copy(cast(twt.Array1dScalar, array)))
     if n % 2 == 1:
         return float(sorted_values[n // 2 : n // 2 + 1].numpy()[0])
     middle = sorted_values[n // 2 - 1 : n // 2 + 1].numpy()
     return (float(middle[0]) + float(middle[1])) / 2.0
-
-
-def _sorted_scalar_copy(values: twt.Array1dScalar) -> twt.Array1dScalar:
-    n = int(values.shape[0])
-    device = values.device
-    if n <= 1:
-        return values
-    keys = wp.empty(2 * n, dtype=values.dtype, device=device)
-    wp.copy(keys, values, count=n)
-    indices = wp.empty(2 * n, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_array.init_sort_pair_indices,
-        dim=2 * n,
-        inputs=[indices, wp.int32(n), wp.int32(n)],
-        device=device,
-    )
-    wp.utils.radix_sort_pairs(keys, indices, count=n)
-    sorted_values = wp.empty(n, dtype=values.dtype, device=device)
-    wp.copy(sorted_values, keys, count=n)
-    return cast(twt.Array1dScalar, sorted_values)
-
-
-@overload
-def max_for_dtype(dtype: type[wp.Int]) -> int: ...
-@overload
-def max_for_dtype(dtype: type[wp.Float]) -> float: ...
-def max_for_dtype(dtype: type[wp.Scalar]) -> int | float:
-    """
-    Largest representable value for a Warp scalar type.
-
-    Parameters
-    ----------
-    dtype
-        A Warp integer or floating-point scalar type.
-
-    Returns
-    -------
-    int | float
-        ``float("inf")`` for floating-point types; the maximum representable
-        integer for integer types.
-    """
-    if not wp.types.type_is_int(dtype):
-        return float("inf")
-    bits = wp.types.type_size_in_bytes(dtype) * 8
-    if not dtype.__name__.lower().startswith("u"):
-        bits -= 1
-    return (1 << bits) - 1
-
-
-@overload
-def min_for_dtype(dtype: type[wp.Int]) -> int: ...
-@overload
-def min_for_dtype(dtype: type[wp.Float]) -> float: ...
-def min_for_dtype(dtype: type[wp.Scalar]) -> int | float:
-    """
-    Smallest representable value for a Warp scalar type.
-
-    Parameters
-    ----------
-    dtype
-        A Warp integer or floating-point scalar type.
-
-    Returns
-    -------
-    int | float
-        ``float("-inf")`` for floating-point types; the minimum representable
-        integer for integer types.
-    """
-    if not wp.types.type_is_int(dtype):
-        return float("-inf")
-    bits = wp.types.type_size_in_bytes(dtype) * 8
-    if dtype.__name__.lower().startswith("u"):
-        return 0
-    return -(1 << (bits - 1))
-
-
-def zero_for_dtype(dtype: type[wp.Scalar]) -> int | float:
-    """
-    Zero value for a Warp scalar type, typed to match Python's ``int``/``float`` split.
-
-    Parameters
-    ----------
-    dtype
-        A Warp integer or floating-point scalar type.
-
-    Returns
-    -------
-    int | float
-        ``0`` for integer types, ``0.0`` for floating-point types.
-    """
-    if wp.types.type_is_int(dtype):
-        return 0
-    return 0.0
 
 
 class _ScalarReduceSpec(NamedTuple):
@@ -564,7 +471,7 @@ _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
         axis_cols_tiled=kernel_reduce.min_2d_cols_tiled,
         tiled_1d=kernel_reduce.min1d_tiled,
         tiled_2d=kernel_reduce.min2d_tiled,
-        init_global=max_for_dtype,
+        init_global=twt.dtype_max,
         global_output_slots=1,
         dual_axis=False,
     ),
@@ -574,7 +481,7 @@ _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
         axis_cols_tiled=kernel_reduce.max_2d_cols_tiled,
         tiled_1d=kernel_reduce.max1d_tiled,
         tiled_2d=kernel_reduce.max2d_tiled,
-        init_global=min_for_dtype,
+        init_global=twt.dtype_min,
         global_output_slots=1,
         dual_axis=False,
     ),
@@ -584,7 +491,7 @@ _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
         axis_cols_tiled=kernel_reduce.minmax_2d_cols_tiled,
         tiled_1d=kernel_reduce.minmax1d_tiled,
         tiled_2d=kernel_reduce.minmax2d_tiled,
-        init_global=max_for_dtype,
+        init_global=twt.dtype_max,
         global_output_slots=2,
         dual_axis=True,
     ),
@@ -594,7 +501,7 @@ _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
         axis_cols_tiled=kernel_reduce.sum_2d_cols_tiled,
         tiled_1d=kernel_reduce.sum1d_tiled,
         tiled_2d=kernel_reduce.sum2d_tiled,
-        init_global=zero_for_dtype,
+        init_global=twt.dtype_zero,
         global_output_slots=1,
         dual_axis=False,
     ),
@@ -638,10 +545,10 @@ def _launch_axis_scalar(
     if spec.dual_axis:
         if axis == 1:
             out_min = wp.full(
-                n_rows, max_for_dtype(array.dtype), dtype=array.dtype, device=array.device
+                n_rows, twt.dtype_max(array.dtype), dtype=array.dtype, device=array.device
             )
             out_max = wp.full(
-                n_rows, min_for_dtype(array.dtype), dtype=array.dtype, device=array.device
+                n_rows, twt.dtype_min(array.dtype), dtype=array.dtype, device=array.device
             )
             wp.launch_tiled(
                 spec.axis_rows_tiled,
@@ -652,10 +559,10 @@ def _launch_axis_scalar(
             )
         else:
             out_min = wp.full(
-                n_cols, max_for_dtype(array.dtype), dtype=array.dtype, device=array.device
+                n_cols, twt.dtype_max(array.dtype), dtype=array.dtype, device=array.device
             )
             out_max = wp.full(
-                n_cols, min_for_dtype(array.dtype), dtype=array.dtype, device=array.device
+                n_cols, twt.dtype_min(array.dtype), dtype=array.dtype, device=array.device
             )
             wp.launch_tiled(
                 spec.axis_cols_tiled,
@@ -692,7 +599,7 @@ def _launch_global_scalar_tiled(
 ) -> float | int | tuple[float, float] | tuple[int, int]:
     if spec.global_output_slots == 2:
         out = wp.array(
-            [max_for_dtype(array.dtype), min_for_dtype(array.dtype)],
+            [twt.dtype_max(array.dtype), twt.dtype_min(array.dtype)],
             dtype=array.dtype,
             device=array.device,
         )

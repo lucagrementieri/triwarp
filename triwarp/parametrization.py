@@ -5,18 +5,11 @@ import warp.optim.linear as wpl
 import warp.sparse as wps
 
 import triwarp as tw
+from triwarp._device import require_cuda
 from triwarp.kernels import parametrization as kernel_parametrization
 from triwarp.laplacian import cotmatrix, mass_matrix_entries, uniform_laplacian
 
 _CG_TOLERANCE = 1e-8
-
-
-def _require_cuda(device: wp.DeviceLike) -> None:
-    if wp.get_device(device).is_cpu:
-        raise NotImplementedError(
-            "harmonic / tutte require a CUDA device: warp.optim.linear.cg produces NaN on the CPU "
-            "device in Warp 1.14-1.15."
-        )
 
 
 def flipped_faces_mask(vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
@@ -225,7 +218,7 @@ def _solve_fixed_boundary(
             "otherwise singular."
         )
 
-    _require_cuda(device)
+    require_cuda(device, "harmonic / tutte")
 
     # Assemble the interior-interior block Q_uu and the right-hand sides -Q_ub bc from Q's CSR.
     nnz = int(q.nnz)

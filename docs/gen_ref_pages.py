@@ -1,4 +1,4 @@
-"""Generate API reference pages for every triwarp submodule."""
+"""Generate API reference pages for every triwarp submodule, grouped by theme."""
 
 from pathlib import Path
 
@@ -9,18 +9,92 @@ nav = mkdocs_gen_files.Nav()
 root = Path(__file__).parent.parent
 src = root / "triwarp"
 
-for path in sorted(src.glob("*.py")):
-    if path.name == "__init__.py":
-        continue
+# Curated theme groups. Order within a group matters: it is the docs nav order for that
+# section. Every triwarp/*.py module (except __init__.py and private "_*.py" modules) must
+# appear in exactly one group below — the guard at the bottom fails the build otherwise, so
+# adding a new module without classifying it here is caught immediately rather than silently
+# falling back to a flat alphabetical list.
+SECTIONS: dict[str, list[str]] = {
+    "Mesh structure & topology": [
+        "vertices",
+        "edges",
+        "triangles",
+        "boundary",
+        "adjacency",
+        "validation",
+        "selection",
+    ],
+    "Mesh editing & repair": [
+        "repair",
+        "hole_filling",
+        "combine",
+        "remesh",
+        "smoothing",
+    ],
+    "Queries & measures": [
+        "proximity",
+        "neighbors",
+        "bounds",
+        "ray",
+        "distance",
+        "geodesic",
+        "intersection",
+        "curvature",
+        "convex",
+    ],
+    "Operators & fields": [
+        "laplacian",
+        "interpolation",
+        "parametrization",
+    ],
+    "Point clouds & registration": [
+        "points",
+        "sample",
+        "reconstruction",
+        "registration",
+    ],
+    "Curves": [
+        "polyline",
+    ],
+    "Attributes & I/O": [
+        "texture",
+        "io",
+    ],
+    "Arrays & infrastructure": [
+        "array",
+        "reduce",
+        "grouping",
+        "graph",
+        "typing",
+        "constants",
+    ],
+}
 
-    module_name = path.stem
-    doc_path = Path("api", f"{module_name}.md")
-    nav[("API Reference", module_name)] = doc_path.as_posix()
+listed = {module_name for modules in SECTIONS.values() for module_name in modules}
+actual = {
+    path.stem
+    for path in src.glob("*.py")
+    if path.name != "__init__.py" and not path.name.startswith("_")
+}
+if listed != actual:
+    unmapped = actual - listed
+    stale = listed - actual
+    raise SystemExit(
+        "gen_ref_pages: SECTIONS is out of sync with triwarp/*.py — "
+        f"unmapped modules (add to a section): {sorted(unmapped)}; "
+        f"stale entries (module no longer exists): {sorted(stale)}"
+    )
 
-    with mkdocs_gen_files.open(doc_path, "w") as fd:
-        print(f"::: triwarp.{module_name}", file=fd)
+for section, modules in SECTIONS.items():
+    for module_name in modules:
+        module_path = src / f"{module_name}.py"
+        doc_path = Path("api", f"{module_name}.md")
+        nav[("API Reference", section, module_name)] = doc_path.as_posix()
 
-    mkdocs_gen_files.set_edit_path(doc_path, path.relative_to(root))
+        with mkdocs_gen_files.open(doc_path, "w") as fd:
+            print(f"::: triwarp.{module_name}", file=fd)
+
+        mkdocs_gen_files.set_edit_path(doc_path, module_path.relative_to(root))
 
 with mkdocs_gen_files.open("SUMMARY.md", "w") as nav_file:
     nav_file.write("* [Home](index.md)\n")

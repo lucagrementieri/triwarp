@@ -49,16 +49,18 @@ def _flip_interior_edges(
     total = 0
     for _ in range(max_iter):
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-        adjacency, adjacency_edges = tw.graph.face_adjacency(faces, edges_sorted, return_edges=True)
+        adjacency, adjacency_edges = tw.adjacency.face_adjacency(
+            faces, edges_sorted, return_edges=True
+        )
         m = int(adjacency.shape[0])
         if m == 0:
             break
-        unshared = tw.graph.face_adjacency_unshared(faces, adjacency, adjacency_edges)
+        unshared = tw.adjacency.face_adjacency_unshared(faces, adjacency, adjacency_edges)
 
         # Sorted table of existing undirected-edge keys, for the "flip would duplicate an edge"
-        # guard. Keys match kernels.unique.pack_indices (min + max * n_vertices).
+        # guard. Keys match kernels.grouping.pack_indices (min + max * n_vertices).
         n_rows = int(edges_sorted.shape[0])
-        keys = tw.unique.hash_indices_rows(edges_sorted, max_index=n_vertices)
+        keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices)
         keys_buffer = wp.empty(2 * n_rows, dtype=wp.uint64, device=device)
         wp.copy(keys_buffer, keys, count=n_rows)
         vals_buffer = tw.array.init_sort_pair_indices(n_rows, -1, device)
@@ -172,7 +174,7 @@ def flip_to_delaunay(
     --------
     [`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size]
     [`delaunay_triangulation`][triwarp.reconstruction.delaunay_triangulation]
-    [`face_adjacency`][triwarp.graph.face_adjacency]
+    [`face_adjacency`][triwarp.adjacency.face_adjacency]
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
@@ -558,7 +560,7 @@ def subdivide_region_to_size(
     --------
     [`subdivide_to_size`][triwarp.remesh.subdivide_to_size]
     [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay]
-    [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely]
+    [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely]
     """
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3

@@ -5,10 +5,11 @@ from __future__ import annotations
 import warp as wp
 
 import triwarp as tw
+from triwarp.bounds import aabb_bounds
 from triwarp.constants import TOLERANCE_PLANAR
 from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import ray as kernel_ray
-from triwarp.proximity import aabb_bounds, default_mesh_query_max_dist
+from triwarp.proximity import _default_mesh_query_max_dist as default_mesh_query_max_dist
 
 
 def _validate_ray_inputs(

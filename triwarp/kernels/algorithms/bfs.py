@@ -16,7 +16,7 @@ Two traversal cores:
 
 import warp as wp
 
-from triwarp.kernels import unique as kernel_unique
+from triwarp.kernels import grouping as kernel_grouping
 
 # Per-source scratch capacities (rows of the wrapper-allocated global-memory pools).
 # ``_PER_SOURCE_MAX_NEIGHBORS`` caps the queue — and therefore the collected set — as before;
@@ -44,7 +44,7 @@ def bfs_visited_insert(
     value reads as new, mirroring the old full-buffer behavior where dropped nodes could be
     revisited.
     """
-    slot = kernel_unique.hash_slot(value, mask)
+    slot = kernel_grouping.hash_slot(value, mask)
     while True:
         stored = visited[slot]
         if stored == value:
@@ -55,7 +55,7 @@ def bfs_visited_insert(
                 return True, count
             visited[slot] = value
             return True, count + 1
-        slot = kernel_unique.next_slot(slot, mask)
+        slot = kernel_grouping.next_slot(slot, mask)
 
 
 @wp.func

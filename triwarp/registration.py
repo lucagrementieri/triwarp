@@ -204,7 +204,7 @@ def icp(
     Warp port combining [`trimesh.registration.icp`][] and
     ``pytorch3d.ops.iterative_closest_point``. Correspondence search runs on the
     GPU via [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]
-    (mesh target) or [`query_bvh_nearest`][triwarp.proximity.query_bvh_nearest]
+    (mesh target) or [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest]
     (point-cloud target); the alignment is the GPU tiled SVD of
     [`procrustes`][triwarp.registration.procrustes].
 
@@ -271,7 +271,7 @@ def icp(
     if is_mesh:
         assert target_faces is not None
         mesh = wp.Mesh(points=wp.clone(target_vertices), indices=wp.clone(target_faces))
-        query_max = tw.proximity.default_mesh_query_max_dist(mesh.points, current)
+        query_max = tw.proximity._default_mesh_query_max_dist(mesh.points, current)
         if max_distance is not None:
             query_max = max(query_max, max_distance)
 
@@ -295,7 +295,7 @@ def icp(
                 device=device,
             )
         else:
-            index, distance = tw.proximity.query_bvh_nearest(target_vertices, current, 1)
+            index, distance = tw.neighbors.query_bvh_nearest(target_vertices, current, 1)
             wp.copy(closest, target_vertices[index])
             triangle_id = index
 
@@ -479,7 +479,7 @@ def icp_point_to_plane(
         assert target_faces is not None
         mesh = wp.Mesh(points=wp.clone(target_vertices), indices=wp.clone(target_faces))
         face_normals, _ = tw.triangles.face_normals_and_areas(target_vertices, target_faces)
-        query_max = tw.proximity.default_mesh_query_max_dist(mesh.points, current)
+        query_max = tw.proximity._default_mesh_query_max_dist(mesh.points, current)
         if max_distance is not None:
             query_max = max(query_max, max_distance)
 
@@ -522,7 +522,7 @@ def icp_point_to_plane(
             )
         else:
             assert target_normals is not None
-            index, distance = tw.proximity.query_bvh_nearest(target_vertices, current, 1)
+            index, distance = tw.neighbors.query_bvh_nearest(target_vertices, current, 1)
             wp.copy(closest, target_vertices[index])
             wp.launch(
                 kernel_array.gather_vec_skip_negative,

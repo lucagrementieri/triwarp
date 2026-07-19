@@ -259,9 +259,9 @@ def test_make_winding_consistent_repairs_flipped(icosahedron: tuple[tm.Trimesh, 
     faces_flipped[::2] = faces_flipped[::2][:, ::-1]  # reverse winding of half the faces
     _, faces_wp = _to_wp_mesh(mesh_tm.vertices, faces_flipped, mesh_wp.device)
 
-    assert tw.characteristics.is_winding_consistent(faces_wp) is False
+    assert tw.validation.is_winding_consistent(faces_wp) is False
     repaired_wp = tw.repair.make_winding_consistent(faces_wp)
-    assert tw.characteristics.is_winding_consistent(repaired_wp) is True
+    assert tw.validation.is_winding_consistent(repaired_wp) is True
 
     before = faces_flipped
     after = _faces_2d(repaired_wp)
@@ -294,9 +294,9 @@ def test_make_volume_repairs_inversion(request: pytest.FixtureRequest, mesh_name
     faces_inward = mesh_tm.faces[:, ::-1].copy()  # reverse every face -> inward normals
     vertices_wp, faces_wp = _to_wp_mesh(mesh_tm.vertices, faces_inward, mesh_wp.device)
 
-    assert tw.characteristics.is_volume(vertices_wp, faces_wp) is False
+    assert tw.validation.is_volume(vertices_wp, faces_wp) is False
     repaired_wp = tw.repair.make_volume(vertices_wp, faces_wp)
-    assert tw.characteristics.is_volume(vertices_wp, repaired_wp) is True
+    assert tw.validation.is_volume(vertices_wp, repaired_wp) is True
 
     # Reference: trimesh.repair.fix_inversion also produces an outward-oriented volume.
     reference_tm = tm.Trimesh(vertices=mesh_tm.vertices, faces=faces_inward, process=False)
@@ -320,10 +320,10 @@ def test_make_normals_outward(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     faces_bad = faces_bad[:, ::-1]  # then invert everything
     vertices_wp, faces_wp = _to_wp_mesh(mesh_tm.vertices, faces_bad, mesh_wp.device)
 
-    assert tw.characteristics.is_volume(vertices_wp, faces_wp) is False
+    assert tw.validation.is_volume(vertices_wp, faces_wp) is False
     repaired_wp = tw.repair.make_normals_outward(vertices_wp, faces_wp)
-    assert tw.characteristics.is_winding_consistent(repaired_wp) is True
-    assert tw.characteristics.is_volume(vertices_wp, repaired_wp) is True
+    assert tw.validation.is_winding_consistent(repaired_wp) is True
+    assert tw.validation.is_volume(vertices_wp, repaired_wp) is True
 
     # Reference: trimesh.repair.fix_normals. On a closed mesh outward orientation is unique,
     # so per-face normals must agree exactly (index representation may differ).
@@ -350,7 +350,7 @@ def test_make_volume_multibody(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
 
     def _body_is_volume(flat_faces_wp: wp.array, body: slice) -> bool:
         sub = wp.array(flat_faces_wp.numpy()[body], dtype=wp.int32, device=mesh_wp.device)
-        return tw.characteristics.is_volume(vertices_wp, sub)
+        return tw.validation.is_volume(vertices_wp, sub)
 
     # Initially only body B has inward-facing normals.
     assert _body_is_volume(faces_wp, body_a) is True
@@ -546,7 +546,7 @@ def test_collapse_small_triangles_removes_sliver(icosahedron: tuple[tm.Trimesh, 
     # Sliver is gone.
     assert out_faces_wp.shape[0] // 3 < faces_np.shape[0]
     # Invariant (libigl fixpoint guarantee): no surviving triangle is below threshold.
-    bbd = tw.proximity.default_mesh_query_max_dist(out_vertices_wp)
+    bbd = tw.proximity._default_mesh_query_max_dist(out_vertices_wp)
     _, areas_wp = tw.triangles.face_normals_and_areas(out_vertices_wp, out_faces_wp)
     assert (2.0 * areas_wp.numpy()).min() >= epsilon * bbd * bbd * (1.0 - 1e-3)
     # Surviving triangle geometry matches the CPU reference.
@@ -582,7 +582,7 @@ def test_collapse_small_triangles_fan_chain(device: str) -> None:
         vertices_wp, faces_wp, epsilon=epsilon
     )
 
-    bbd = tw.proximity.default_mesh_query_max_dist(out_vertices_wp)
+    bbd = tw.proximity._default_mesh_query_max_dist(out_vertices_wp)
     _, areas_wp = tw.triangles.face_normals_and_areas(out_vertices_wp, out_faces_wp)
     assert (2.0 * areas_wp.numpy()).min() >= epsilon * bbd * bbd * (1.0 - 1e-3)
     ref = _collapse_small_triangles_ref(vertices_np.astype(np.float64), faces_np, epsilon)

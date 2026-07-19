@@ -57,9 +57,9 @@ def test_sphere_is_closed_manifold(device: str, subdivisions: int):
 
     # A closed genus-0 triangulation of n points has exactly 2n - 4 faces (Euler).
     assert faces_np.shape[0] // 3 == 2 * n_points - 4
-    assert tw.characteristics.is_watertight(vertices_wp, faces_wp)
-    assert tw.characteristics.is_edge_manifold(faces_wp)
-    assert tw.characteristics.euler_characteristic(faces_wp) == 2
+    assert tw.validation.is_watertight(vertices_wp, faces_wp)
+    assert tw.validation.is_edge_manifold(faces_wp)
+    assert tw.validation.euler_characteristic(faces_wp) == 2
     # every input point is referenced
     assert np.unique(faces_np).size == n_points
 
@@ -79,10 +79,10 @@ def test_torus_is_genus_one(device: str):
     vertices_wp, faces_wp = tw.reconstruction.triangulate_point_cloud(
         points_wp, normals_wp, num_neighbours=16
     )
-    assert tw.characteristics.is_watertight(vertices_wp, faces_wp)
-    assert tw.characteristics.is_edge_manifold(faces_wp)
+    assert tw.validation.is_watertight(vertices_wp, faces_wp)
+    assert tw.validation.is_edge_manifold(faces_wp)
     # genus-1 closed surface: V - E + F = 0
-    assert tw.characteristics.euler_characteristic(faces_wp) == 0
+    assert tw.validation.euler_characteristic(faces_wp) == 0
 
 
 @pytest.mark.parametrize("subdivisions", [3])
@@ -129,7 +129,7 @@ def test_open_hemisphere_keeps_single_boundary(device: str):
     vertices_wp, faces_wp = tw.reconstruction.triangulate_point_cloud(
         points_wp, normals_wp, num_neighbours=18
     )
-    assert tw.characteristics.is_edge_manifold(faces_wp)
+    assert tw.validation.is_edge_manifold(faces_wp)
     # The intended equator rim is a single large boundary loop, not filled and not fragmented.
     loops = tw.boundary.boundary_loops(vertices_wp, faces_wp)
     assert len(loops) == 1
@@ -144,7 +144,7 @@ def test_estimated_normals_path_runs(device: str):
 
     vertices_wp, faces_wp = tw.reconstruction.triangulate_point_cloud(points_wp, num_neighbours=18)
     assert faces_wp.numpy().shape[0] > 0
-    assert tw.characteristics.is_edge_manifold(faces_wp)
+    assert tw.validation.is_edge_manifold(faces_wp)
     radii = np.linalg.norm(vertices_wp.numpy(), axis=1)
     assert np.allclose(radii, 1.0, rtol=1e-5, atol=1e-5)
 
@@ -162,14 +162,14 @@ def test_hole_filling_seals_small_hole(device: str):
     vertices_open, faces_open = tw.reconstruction.triangulate_point_cloud(
         points_wp, normals_wp, num_neighbours=18, crit_hole_length=0.0
     )
-    assert not tw.characteristics.is_watertight(vertices_open, faces_open)
+    assert not tw.validation.is_watertight(vertices_open, faces_open)
 
     # Large threshold: the hole is sealed into a watertight, manifold mesh.
     vertices_filled, faces_filled = tw.reconstruction.triangulate_point_cloud(
         points_wp, normals_wp, num_neighbours=18, crit_hole_length=10.0
     )
-    assert tw.characteristics.is_edge_manifold(faces_filled)
-    assert tw.characteristics.is_watertight(vertices_filled, faces_filled)
+    assert tw.validation.is_edge_manifold(faces_filled)
+    assert tw.validation.is_watertight(vertices_filled, faces_filled)
 
 
 def test_empty_cloud(device: str):

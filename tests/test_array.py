@@ -284,75 +284,95 @@ def test_gather_empty_indices(device: str) -> None:
     assert gathered_wp.shape == (0, 2)
 
 
-def test_vector_angle(device: str) -> None:
-    rng = np.random.default_rng(42)
-    n = 64
-    vecs_a_np = rng.standard_normal((n, 3))
-    vecs_a_np /= np.linalg.norm(vecs_a_np, axis=1, keepdims=True)
-    vecs_b_np = rng.standard_normal((n, 3))
-    vecs_b_np /= np.linalg.norm(vecs_b_np, axis=1, keepdims=True)
+bitcast_test_data = (
+    wp.array([-128, -127, -1, 0, 1, 127], dtype=wp.int8),
+    wp.array([255, 0, 254, 1], dtype=wp.uint8),
+    wp.array([-32768, -32767, 10, 0, -1, 32767, 32765], dtype=wp.int16),
+    wp.array([65535, 32, 65534, 0, 1], dtype=wp.uint16),
+    wp.array([-2147483648, -2147483647, 10, 0, -1, 2147483647, 2147483645], dtype=wp.int32),
+    wp.array([4294967295, 32, 4294967294, 0, 1], dtype=wp.uint32),
+    wp.array(
+        [
+            -9223372036854775808,
+            -9223372036854775807,
+            10,
+            0,
+            -1,
+            9223372036854775806,
+            9223372036854775807,
+        ],
+        dtype=wp.int64,
+    ),
+    wp.array([18446744073709551615, 65535, 18446744073709551614, 131070, 1], dtype=wp.uint64),
+    wp.array(
+        np.asarray(
+            [
+                0x0000,  # +0
+                0x8000,  # -0
+                0x7F80,  # +inf
+                0xFF80,  # -inf
+                0x7FFF,  # quiet NaN (preserved through float32 widen/narrow on CUDA)
+                0x7F7F,  # largest finite
+                0xFF7F,  # smallest (most negative) finite
+                0x0080,  # smallest subnormal
+                0x8100,  # negative subnormal
+            ],
+            dtype=np.uint16,
+        ),
+        dtype=wp.bfloat16,
+    ),
+    wp.array(
+        [
+            np.finfo(np.float16).min,
+            np.finfo(np.float16).max,
+            -np.finfo(np.float16).max,
+            np.finfo(np.float16).smallest_subnormal,
+            -np.finfo(np.float16).smallest_subnormal,
+            0.0,
+            -0.0,
+            np.inf,
+            -np.inf,
+            np.nan,
+        ],
+        dtype=wp.float16,
+    ),
+    wp.array(
+        [
+            np.finfo(np.float32).min,
+            np.finfo(np.float32).max,
+            -np.finfo(np.float32).max,
+            np.finfo(np.float32).smallest_subnormal,
+            -np.finfo(np.float32).smallest_subnormal,
+            0.0,
+            -0.0,
+            np.inf,
+            -np.inf,
+            np.nan,
+        ],
+        dtype=wp.float32,
+    ),
+    wp.array(
+        [
+            np.finfo(np.float64).min,
+            np.finfo(np.float64).max,
+            -np.finfo(np.float64).max,
+            np.finfo(np.float64).smallest_subnormal,
+            -np.finfo(np.float64).smallest_subnormal,
+            0.0,
+            -0.0,
+            np.inf,
+            -np.inf,
+            np.nan,
+        ],
+        dtype=wp.float64,
+    ),
+)
 
-    pairs_np = np.stack([vecs_a_np, vecs_b_np], axis=1)
-    angles_tm = tm.geometry.vector_angle(pairs_np)
 
-    vecs_a_wp = wp.array(vecs_a_np.astype(np.float32), dtype=wp.vec3, device=device)
-    vecs_b_wp = wp.array(vecs_b_np.astype(np.float32), dtype=wp.vec3, device=device)
-    angles_wp = tw.array.vector_angle(vecs_a_wp, vecs_b_wp)
-    assert np.allclose(angles_wp.numpy(), angles_tm, rtol=1e-5, atol=1e-5)
-
-
-def test_vector_angle_empty(device: str) -> None:
-    vecs_a_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    vecs_b_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    angles_wp = tw.array.vector_angle(vecs_a_wp, vecs_b_wp)
-    assert angles_wp.shape == (0,)
-
-
-def test_gram_matrix(device: str) -> None:
-    # 200 = 3 * 64 + 8 exercises the multi-tile reduction and remainder path.
-    rng = np.random.default_rng(10)
-    points_np = rng.standard_normal((200, 3)).astype(np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
-    gram_np = points_np.T @ points_np
-    assert np.allclose(tw.array.gram_matrix(points_wp).numpy()[0], gram_np, rtol=1e-4, atol=1e-4)
-
-
-def test_gram_matrix_empty(device: str) -> None:
-    points_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    assert np.allclose(tw.array.gram_matrix(points_wp).numpy()[0], np.zeros((3, 3)))
-
-
-def test_centered_covariance(device: str) -> None:
-    rng = np.random.default_rng(11)
-    points_np = rng.standard_normal((200, 3)).astype(np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
-    centered_np = points_np - points_np.mean(axis=0)
-    scatter_np = centered_np.T @ centered_np
-    cov_wp = tw.array.centered_covariance(points_wp)
-    assert np.allclose(cov_wp.numpy()[0], scatter_np, rtol=1e-4, atol=1e-4)
-
-
-def test_centered_covariance_precomputed_center(device: str) -> None:
-    rng = np.random.default_rng(12)
-    points_np = rng.standard_normal((150, 3)).astype(np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
-    mean_np = points_np.mean(axis=0)
-    center_wp = wp.array(mean_np.reshape(1, 3).astype(np.float32), dtype=wp.vec3, device=device)
-    centered_np = points_np - mean_np
-    scatter_np = centered_np.T @ centered_np
-    cov_wp = tw.array.centered_covariance(points_wp, center=center_wp)
-    assert np.allclose(cov_wp.numpy()[0], scatter_np, rtol=1e-4, atol=1e-4)
-
-
-def test_covariance(device: str) -> None:
-    rng = np.random.default_rng(13)
-    points_np = rng.standard_normal((200, 3)).astype(np.float32)
-    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
-    cov_np = np.cov(points_np.T, ddof=1)
-    assert np.allclose(tw.array.covariance(points_wp).numpy()[0], cov_np, rtol=1e-4, atol=1e-4)
-
-
-def test_covariance_too_few_points_raises(device: str) -> None:
-    points_wp = wp.zeros(1, dtype=wp.vec3, device=device)
-    with pytest.raises(ValueError, match="ddof"):
-        tw.array.covariance(points_wp)
+@pytest.mark.parametrize(
+    "data", bitcast_test_data, ids=[a.dtype.__name__ for a in bitcast_test_data]
+)
+def test_bitcast_int_reciprocity(device: str, data: wp.array[wp.Scalar]):
+    as_int = tw.array.bitcast_to_int(data.to(device))
+    recovered = tw.array.bitcast_from_int(as_int, data.dtype)
+    assert np.array_equal(data.numpy(), recovered.numpy(), equal_nan=True)

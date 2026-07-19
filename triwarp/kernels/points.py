@@ -1,5 +1,8 @@
 import warp as wp
 
+from triwarp.constants import TILE_1D
+from triwarp.kernels.reduce import outer_sum_tile
+
 
 @wp.func
 def point_plane_distance(
@@ -15,6 +18,25 @@ def radial_sort_key(point: wp.vec3, origin: wp.vec3, axis0: wp.vec3, axis1: wp.v
     # Negated angle: an ascending radix sort of these keys reproduces trimesh's
     # descending-angle order (`angles.argsort()[::-1]`).
     return -wp.atan2(wp.dot(v, axis0), wp.dot(v, axis1))
+
+
+@wp.kernel
+def centered_covariance(
+    points: wp.array[wp.vec3], center: wp.array[wp.vec3], out_cov: wp.array[wp.mat33]
+) -> None:
+    # Scatter matrix C = sum_k outer(x_k - center, x_k - center). With a zero center this is
+    # the uncentred Gram matrix G = sum_k outer(x_k, x_k).
+    i, t = wp.tid()
+    n = points.shape[0]
+    offset = i * TILE_1D
+    remaining = n - offset
+    if remaining <= 0:
+        return
+
+    m = outer_sum_tile(points, center[0], offset, remaining)
+
+    if t == 0:
+        wp.atomic_add(out_cov, 0, m)
 
 
 @wp.kernel

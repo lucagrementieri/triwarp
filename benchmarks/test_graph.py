@@ -129,7 +129,7 @@ def test_split(bench_case: BenchCase) -> None:
     skip_larger_than(bench_case, "bunny")
     if bench_case.kind == "triwarp":
         vertices, faces = _split_inputs(bench_case)
-        parts = bench_case.run(lambda: tw.graph.split(vertices, faces))
+        parts = bench_case.run(lambda: tw.combine.split(vertices, faces))
     else:  # trimesh
         import trimesh as tm
 

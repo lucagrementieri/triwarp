@@ -1,4 +1,4 @@
-"""Mesh connectivity helpers on NVIDIA Warp."""
+"""NumPy-style structural and elementwise operations on Warp arrays (init, gather, sort, masks)."""
 
 from __future__ import annotations
 
@@ -10,9 +10,7 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
-from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import scatter as kernel_scatter
 
 DType = TypeVar("DType")
@@ -28,8 +26,8 @@ def _ensure_int_dtype(dtype: type) -> type[wp.Int]:
 
 
 def _check_int_fits(dtype: type[wp.Int], value: int, name: str) -> None:
-    vmin = tw.reduce.min_for_dtype(dtype)
-    vmax = tw.reduce.max_for_dtype(dtype)
+    vmin = twt.dtype_min(dtype)
+    vmax = twt.dtype_max(dtype)
     if value < vmin or value > vmax:
         raise ValueError(f"{name}={value} is out of range for {dtype} [{vmin}, {vmax}]")
 
@@ -431,19 +429,17 @@ def isin(
     return out_flat
 
 
-def _sorted_int32_copy(values: wp.array[wp.int32]) -> wp.array[wp.int32]:
+def _sorted_copy(values: wp.array[DType]) -> wp.array[DType]:
+    """Ascending-sorted copy of a 1D scalar array via ``radix_sort_pairs``."""
     n = int(values.shape[0])
     device = values.device
     if n <= 1:
-        sorted_wp = wp.empty(n, dtype=wp.int32, device=device)
-        if n == 1:
-            wp.copy(sorted_wp, values)
-        return sorted_wp
-    keys_wp = wp.empty(2 * n, dtype=wp.int32, device=device)
+        return values
+    keys_wp = wp.empty(2 * n, dtype=values.dtype, device=device)
     wp.copy(keys_wp, values, count=n)
     indices_wp = init_sort_pair_indices(n, n, device)
     wp.utils.radix_sort_pairs(keys_wp, indices_wp, count=n)
-    sorted_wp = wp.empty(n, dtype=wp.int32, device=device)
+    sorted_wp = wp.empty(n, dtype=values.dtype, device=device)
     wp.copy(sorted_wp, keys_wp, count=n)
     return sorted_wp
 
@@ -468,7 +464,7 @@ def _isin_lookup_sorted(
     elements_flat: wp.array[wp.int32], test_elements: wp.array[wp.int32]
 ) -> wp.array[wp.bool]:
     device = elements_flat.device
-    sorted_test_wp = _sorted_int32_copy(test_elements)
+    sorted_test_wp = _sorted_copy(test_elements)
     out_wp = wp.empty(elements_flat.shape, dtype=wp.bool, device=device)
     wp.launch(
         kernel_array.isin_lookup_sorted,
@@ -560,6 +556,104 @@ def gather(src: wp.array[DType], indices: wp.array[wp.int32]) -> wp.array[DType]
     return out
 
 
+def indices_to_mask(
+    indices: wp.array[wp.int32], n: int, *, device: wp.DeviceLike = None
+) -> wp.array[wp.bool]:
+    """
+    Boolean membership mask of length ``n`` marking each value in ``indices`` as ``True``.
+
+    Wraps the ``mark_membership_mask`` scatter kernel: every ``indices[i]`` sets
+    ``out_mask[indices[i]] = True``. The inverse of [`flatnonzero`][triwarp.array.flatnonzero].
+
+    Parameters
+    ----------
+    indices
+        1D ``wp.int32`` array of values in ``[0, n)`` to mark. May be empty.
+    n
+        Length of the returned mask.
+    device
+        Target Warp device. Defaults to ``indices.device``.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Length-``n`` mask, all ``False`` except at positions named by ``indices``.
+    """
+    device = device if device is not None else indices.device
+    mask = wp.zeros(n, dtype=wp.bool, device=device)
+    k = int(indices.shape[0])
+    if k > 0:
+        wp.launch(
+            kernel_scatter.mark_membership_mask,
+            dim=k,
+            inputs=[indices, wp.int32(n), mask],
+            device=device,
+        )
+    return mask
+
+
+def mask_to_index_map(mask: wp.array[wp.bool]) -> tuple[wp.array[wp.int32], int]:
+    """
+    Compact index map over the ``True`` entries of a boolean mask, plus their count.
+
+    Parameters
+    ----------
+    mask
+        Length-``n`` ``wp.bool`` array.
+
+    Returns
+    -------
+    index_map : wp.array[wp.int32]
+        Length-``n`` array on ``mask.device``: an exclusive scan of ``mask``, so
+        ``index_map[i]`` is the compact 0-based rank of element ``i`` among the ``True``
+        entries at or before it (meaningful only where ``mask[i]`` is ``True``).
+    count : int
+        Total number of ``True`` entries in ``mask``.
+    """
+    device = mask.device
+    n = int(mask.shape[0])
+    if n == 0:
+        return wp.zeros(0, dtype=wp.int32, device=device), 0
+    flags = wp.empty(n, dtype=wp.int32, device=device)
+    wp.utils.array_cast(mask, flags)
+    index_map = wp.empty(n, dtype=wp.int32, device=device)
+    inclusive = wp.empty(n, dtype=wp.int32, device=device)
+    wp.utils.array_scan(flags, out_array=index_map, inclusive=False)
+    wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
+    return index_map, int(inclusive.numpy()[-1])
+
+
+def remap_indices(
+    indices: wp.array[wp.int32], remap: wp.array[wp.int32]
+) -> wp.array[wp.int32]:
+    """
+    Remap an index buffer through a lookup table, skipping negative (sentinel) entries.
+
+    Parameters
+    ----------
+    indices
+        1D ``wp.int32`` array of indices into ``remap`` (e.g. a flat face buffer). Negative
+        entries are passed through unchanged.
+    remap
+        1D ``wp.int32`` lookup table (e.g. old-to-new vertex index map).
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        Length ``len(indices)`` array on ``indices.device`` with ``out[i] = remap[indices[i]]``
+        for non-negative ``indices[i]``, and ``out[i] = indices[i]`` otherwise.
+    """
+    n = int(indices.shape[0])
+    device = indices.device
+    if n == 0:
+        return wp.empty(0, dtype=wp.int32, device=device)
+    out = wp.empty(n, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_array.gather_1d_skip_negative, dim=n, inputs=[indices, remap, out], device=device
+    )
+    return out
+
+
 def trim_to_count(
     counter: wp.array[wp.int32], *buffers: wp.array[DType]
 ) -> tuple[int, list[wp.array[DType]]]:
@@ -630,157 +724,127 @@ def square(values: wp.array[wp.Scalar]) -> wp.array[wp.Scalar]:
     return out
 
 
-def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3]) -> wp.array[wp.float32]:
+def bitcast_to_int(
+    data: wp.array[wp.Scalar], count: int | None = None
+) -> wp.array[wp.int32] | wp.array[wp.int64]:
     """
-    Unsigned angle in radians between pairs of unit vectors.
+    Reinterpret an array's underlying bits as a same-width signed integer dtype.
 
-    For each index ``i``, computes ``abs(arccos(clip(dot(a[i], b[i]), -1, 1)))``.
-    Matches [`trimesh.geometry.vector_angle`][] on stacked pairs.
+    32-bit-or-narrower dtypes (``wp.int32``, ``wp.uint32``, ``wp.float32``, and narrower) are
+    reinterpreted as ``wp.int32``; wider dtypes (``wp.int64``, ``wp.uint64``, ``wp.float64``) as
+    ``wp.int64``. Narrower-than-32-bit floating point values are first upcast to ``wp.float32``
+    (a numeric cast, not a bit reinterpretation) so every dtype narrower than 32 bits shares one
+    ``wp.int32`` key space. Used by the hashing/uniqueness machinery
+    ([`unique_1d`][triwarp.grouping.unique_1d]) to give arbitrary scalar dtypes a common sortable,
+    hashable integer key.
 
     Parameters
     ----------
-    a
-        Length-``n`` unit vectors on the target device.
-    b
-        Length-``n`` unit vectors on the same device as ``a``.
+    data
+        Rank-1 ``wp.array`` of any scalar dtype.
+    count
+        Output length. Defaults to ``data.shape[0]``. When greater than the input length, the
+        tail is left uninitialized (over-allocation for in-place radix-sort scratch).
 
     Returns
     -------
-    wp.array[wp.float32]
-        Length-``n`` unsigned angles in radians on ``a.device``. Empty when ``n == 0``.
-
-    Raises
-    ------
-    ValueError
-        If ``a`` and ``b`` live on different devices or have different lengths.
+    wp.array[wp.int32] | wp.array[wp.int64]
+        Bit-reinterpreted (or, for sub-32-bit floats, upcast-then-reinterpreted) copy of length
+        ``count`` on ``data.device``.
 
     See Also
     --------
-    [`trimesh.geometry.vector_angle`][]
+    [`bitcast_from_int`][triwarp.array.bitcast_from_int]
     """
-    device = a.device
-    n = int(a.shape[0])
-    if n != int(b.shape[0]):
-        raise ValueError(f"a and b must have the same length, got {n} and {b.shape[0]}")
+    n_bits = wp.types.type_size_in_bytes(data.dtype) * 8
+    n = data.shape[0]
+    count = count or n
+    copy_count = min(n, count)
 
-    if n == 0:
-        return wp.empty(0, dtype=wp.float32, device=device)
+    if n_bits > 32:
+        reinterpreted = wp.empty(count, dtype=wp.int64, device=data.device)
+        wp.copy(reinterpreted, data, count=copy_count)
+        return reinterpreted
 
-    out_angles = wp.empty(n, dtype=wp.float32, device=device)
-    wp.map(kernel_array.vector_angle_vec, a, b, out=out_angles)
-    return out_angles
+    reinterpreted = wp.empty(count, dtype=wp.int32, device=data.device)
+    if wp.types.type_is_float(data.dtype):
+        src = data
+        if n_bits < 32:
+            src = wp.empty(copy_count, dtype=wp.float32, device=data.device)
+            wp.utils.array_cast(data, src, count=copy_count)
+        wp.copy(reinterpreted, src, count=copy_count)
+    else:
+        wp.utils.array_cast(data, reinterpreted, count=copy_count)
+    return reinterpreted
 
 
-def gram_matrix(points: wp.array[wp.vec3]) -> wp.array[wp.mat33]:
+def bitcast_from_int(
+    data: wp.array[wp.int32] | wp.array[wp.int64], dtype: type[wp.Scalar], count: int | None = None
+) -> wp.array[wp.Scalar]:
     """
-    Uncentered Gram (scatter) matrix ``G = sum_k outer(x_k, x_k)``.
+    Inverse of [`bitcast_to_int`][triwarp.array.bitcast_to_int]: recover the original dtype.
+
+    Reinterprets (same-width) or upcasts-then-reinterprets (narrower target) the bits produced
+    by ``bitcast_to_int`` back into ``dtype``.
 
     Parameters
     ----------
-    points
-        ``(n,)`` positions in space as ``wp.vec3``.
+    data
+        Rank-1 ``wp.array[wp.int32]`` or ``wp.array[wp.int64]``, typically the output of
+        [`bitcast_to_int`][triwarp.array.bitcast_to_int].
+    dtype
+        Target scalar dtype to reinterpret ``data`` as.
+    count
+        Output length. Defaults to ``data.shape[0]``. When greater than the input length, the
+        tail is left uninitialized.
 
     Returns
     -------
-    wp.array[wp.mat33]
-        Shape ``(1,)`` device array holding the ``3x3`` Gram matrix on
-        ``points.device``. All-zeros when ``points`` is empty.
+    wp.array[wp.Scalar]
+        Array of dtype ``dtype`` and length ``count`` on ``data.device``.
+
+    See Also
+    --------
+    [`bitcast_to_int`][triwarp.array.bitcast_to_int]
     """
-    device = points.device
-    n = int(points.shape[0])
-    out = wp.zeros(1, dtype=wp.mat33, device=device)
-    if n == 0:
-        return out
-    n_tiles = (n + TILE_1D - 1) // TILE_1D
-    # The uncentred Gram matrix is the scatter matrix around a zero center.
-    zero_center = wp.zeros(1, dtype=wp.vec3, device=device)
-    wp.launch_tiled(
-        kernel_array.centered_covariance,
-        dim=[n_tiles],
-        inputs=[points, zero_center, out],
-        block_dim=TILE_1D,
-        device=device,
-    )
+    n_bits = wp.types.type_size_in_bytes(data.dtype) * 8
+    n_target_bits = wp.types.type_size_in_bytes(dtype) * 8
+    n = data.shape[0]
+    count = count or n
+    copy_count = min(n, count)
+
+    if n_bits == n_target_bits:
+        reinterpreted = wp.empty(count, dtype=dtype, device=data.device)
+        wp.copy(reinterpreted, data, count=copy_count)
+        return reinterpreted
+
+    if wp.types.type_is_float(dtype) and n_bits > n_target_bits:
+        wide_dtype = getattr(wp, f"float{n_bits}")
+        wide = wp.empty(count, dtype=wide_dtype, device=data.device)
+        wp.copy(wide, data, count=copy_count)
+        reinterpreted_casted = wp.empty(count, dtype=dtype, device=data.device)
+        wp.utils.array_cast(wide, reinterpreted_casted, count=copy_count)
+    else:
+        reinterpreted_casted = wp.empty(count, dtype=dtype, device=data.device)
+        wp.utils.array_cast(data, reinterpreted_casted, count=copy_count)
+    return reinterpreted_casted
+
+
+# ---------------------------------------------------------------------------
+# Private cross-cutting helpers (used by a single external caller today; promote to public
+# only with demonstrated cross-module demand).
+# ---------------------------------------------------------------------------
+
+
+def _as_vec3d(vertices: wp.array[wp.vec3]) -> wp.array[wp.vec3d]:
+    """Widen a ``wp.vec3`` array to ``wp.vec3d`` (used by ``smoothing``'s float64 solves)."""
+    out = wp.empty(int(vertices.shape[0]), dtype=wp.vec3d, device=vertices.device)
+    wp.map(kernel_array.to_vec3d, vertices, out=out)
     return out
 
 
-def centered_covariance(
-    points: wp.array[wp.vec3], center: wp.array[wp.vec3] | None = None
-) -> wp.array[wp.mat33]:
-    """
-    Centered scatter matrix ``C = sum_k outer(x_k - mu, x_k - mu)`` (no ``1/n``).
-
-    Centering happens inside the outer-product loop (rather than via the
-    ``sum(x x^T) - n mu mu^T`` identity) to avoid float32 catastrophic
-    cancellation.
-
-    Parameters
-    ----------
-    points
-        ``(n,)`` positions in space as ``wp.vec3``.
-    center
-        Optional precomputed centroid as a ``(1,)`` ``wp.vec3`` device array.
-        When ``None`` it is computed on-device as ``sum(points) / n``.
-
-    Returns
-    -------
-    wp.array[wp.mat33]
-        Shape ``(1,)`` device array holding the centered ``3x3`` scatter matrix
-        on ``points.device``. All-zeros when ``points`` is empty.
-    """
-    device = points.device
-    n = int(points.shape[0])
-    out = wp.zeros(1, dtype=wp.mat33, device=device)
-    if n == 0:
-        return out
-    n_tiles = (n + TILE_1D - 1) // TILE_1D
-    if center is None:
-        center = wp.zeros(1, dtype=wp.vec3, device=device)
-        wp.launch_tiled(
-            kernel_reduce.sum_vec3_1d_tiled,
-            dim=[n_tiles],
-            inputs=[points, center],
-            block_dim=TILE_1D,
-            device=device,
-        )
-        wp.map(wp.div, center, wp.float32(n), out=center)
-    wp.launch_tiled(
-        kernel_array.centered_covariance,
-        dim=[n_tiles],
-        inputs=[points, center, out],
-        block_dim=TILE_1D,
-        device=device,
-    )
-    return out
-
-
-def covariance(points: wp.array[wp.vec3], ddof: int = 1) -> wp.array[wp.mat33]:
-    """
-    Sample covariance matrix ``(1 / (n - ddof)) sum_k outer(x_k - mu, x_k - mu)``.
-
-    Matches ``numpy.cov(points.T, ddof=ddof)`` for the default ``ddof=1``.
-
-    Parameters
-    ----------
-    points
-        ``(n,)`` positions in space as ``wp.vec3``.
-    ddof
-        Delta degrees of freedom; the divisor is ``n - ddof``. Defaults to ``1``.
-
-    Returns
-    -------
-    wp.array[wp.mat33]
-        Shape ``(1,)`` device array holding the ``3x3`` covariance matrix on
-        ``points.device``.
-
-    Raises
-    ------
-    ValueError
-        If ``n - ddof <= 0``.
-    """
-    n = int(points.shape[0])
-    if n - ddof <= 0:
-        raise ValueError(f"covariance requires n > ddof, got n={n}, ddof={ddof}")
-    out = centered_covariance(points)
-    wp.map(wp.div, out, wp.float32(n - ddof), out=out)
+def _as_vec3(positions: wp.array[wp.vec3d]) -> wp.array[wp.vec3]:
+    """Narrow a ``wp.vec3d`` array back to ``wp.vec3`` (used by ``smoothing``'s float64 solves)."""
+    out = wp.empty(int(positions.shape[0]), dtype=wp.vec3, device=positions.device)
+    wp.map(kernel_array.to_vec3, positions, out=out)
     return out

@@ -30,18 +30,18 @@ def face_adjacency_projections(
         ``(n_vertices,)`` mesh vertex positions on the target device.
     faces
         Length-``3 * n_faces`` flat triangle index buffer (same layout as
-        [`face_adjacency`][triwarp.graph.face_adjacency]).
+        [`face_adjacency`][triwarp.adjacency.face_adjacency]).
     face_adjacency
         Optional ``(m, 2)`` face index pairs from
-        [`face_adjacency`][triwarp.graph.face_adjacency]. When ``None``, adjacency and
+        [`face_adjacency`][triwarp.adjacency.face_adjacency]. When ``None``, adjacency and
         shared edges are computed from ``faces``.
     face_adjacency_edges
         Optional ``(m, 2)`` sorted shared vertex pairs (as from
-        [`face_adjacency`][triwarp.graph.face_adjacency] with ``return_edges=True``).
+        [`face_adjacency`][triwarp.adjacency.face_adjacency] with ``return_edges=True``).
         Must be supplied together with ``face_adjacency`` or omitted with it.
     face_adjacency_unshared
         Optional ``(m, 2)`` unshared vertex indices per face pair from
-        [`face_adjacency_unshared`][triwarp.graph.face_adjacency_unshared]. When ``None``,
+        [`face_adjacency_unshared`][triwarp.adjacency.face_adjacency_unshared]. When ``None``,
         computed from ``faces`` and the adjacency data.
     face_normals
         Optional length-``n_faces`` unit face normals. When ``None``, normals
@@ -75,12 +75,12 @@ def face_adjacency_projections(
             "face_adjacency and face_adjacency_edges must both be provided or both omitted"
         )
     if face_adjacency is None:
-        face_adjacency, face_adjacency_edges = tw.graph.face_adjacency(faces, return_edges=True)
+        face_adjacency, face_adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
     assert face_adjacency is not None
     assert face_adjacency_edges is not None
 
     if face_adjacency_unshared is None:
-        face_adjacency_unshared = tw.graph.face_adjacency_unshared(
+        face_adjacency_unshared = tw.adjacency.face_adjacency_unshared(
             faces, face_adjacency=face_adjacency, face_adjacency_edges=face_adjacency_edges
         )
     if face_normals is None:
@@ -128,10 +128,10 @@ def face_adjacency_convex(
         ``(n_vertices,)`` mesh vertex positions on the target device.
     faces
         Length-``3 * n_faces`` flat triangle index buffer (same layout as
-        [`face_adjacency`][triwarp.graph.face_adjacency]).
+        [`face_adjacency`][triwarp.adjacency.face_adjacency]).
     face_adjacency
         Optional ``(m, 2)`` face index pairs from
-        [`face_adjacency`][triwarp.graph.face_adjacency]. When ``None``, adjacency and
+        [`face_adjacency`][triwarp.adjacency.face_adjacency]. When ``None``, adjacency and
         shared edges are computed from ``faces``.
     face_adjacency_edges
         Optional ``(m, 2)`` sorted shared vertex pairs. Must be supplied
@@ -163,7 +163,7 @@ def face_adjacency_convex(
             "face_adjacency and face_adjacency_edges must both be provided or both omitted"
         )
     if face_adjacency is None:
-        face_adjacency, face_adjacency_edges = tw.graph.face_adjacency(faces, return_edges=True)
+        face_adjacency, face_adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
     assert face_adjacency is not None
 
     m = int(face_adjacency.shape[0])

@@ -9,7 +9,7 @@ Kernels should continue to use ``wp.array2d[dtype]`` in ``@wp.kernel`` signature
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, TypeAlias, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, TypeAlias, TypeVar, cast, overload
 
 import warp as wp
 
@@ -75,6 +75,9 @@ __all__ = [
     "as_array2d_float32",
     "as_array2d_int32",
     "as_array3d_float32",
+    "dtype_max",
+    "dtype_min",
+    "dtype_zero",
     "empty_float32_2d",
     "empty_float_2d",
     "empty_int32_2d",
@@ -187,6 +190,79 @@ def as_array3d_float32(arr: wp.array[T]) -> Array3dFloat32:
     """
     ensure_ndim(arr, 3, dtype=wp.float32)
     return cast(Array3dFloat32, arr)
+
+
+@overload
+def dtype_max(dtype: type[wp.Int]) -> int: ...
+@overload
+def dtype_max(dtype: type[wp.Float]) -> float: ...
+def dtype_max(dtype: type[wp.Scalar]) -> int | float:
+    """
+    Largest representable value for a Warp scalar type.
+
+    Parameters
+    ----------
+    dtype
+        A Warp integer or floating-point scalar type.
+
+    Returns
+    -------
+    int | float
+        ``float("inf")`` for floating-point types; the maximum representable
+        integer for integer types.
+    """
+    if not wp.types.type_is_int(dtype):
+        return float("inf")
+    bits = wp.types.type_size_in_bytes(dtype) * 8
+    if not dtype.__name__.lower().startswith("u"):
+        bits -= 1
+    return (1 << bits) - 1
+
+
+@overload
+def dtype_min(dtype: type[wp.Int]) -> int: ...
+@overload
+def dtype_min(dtype: type[wp.Float]) -> float: ...
+def dtype_min(dtype: type[wp.Scalar]) -> int | float:
+    """
+    Smallest representable value for a Warp scalar type.
+
+    Parameters
+    ----------
+    dtype
+        A Warp integer or floating-point scalar type.
+
+    Returns
+    -------
+    int | float
+        ``float("-inf")`` for floating-point types; the minimum representable
+        integer for integer types.
+    """
+    if not wp.types.type_is_int(dtype):
+        return float("-inf")
+    bits = wp.types.type_size_in_bytes(dtype) * 8
+    if dtype.__name__.lower().startswith("u"):
+        return 0
+    return -(1 << (bits - 1))
+
+
+def dtype_zero(dtype: type[wp.Scalar]) -> int | float:
+    """
+    Zero value for a Warp scalar type, typed to match Python's ``int``/``float`` split.
+
+    Parameters
+    ----------
+    dtype
+        A Warp integer or floating-point scalar type.
+
+    Returns
+    -------
+    int | float
+        ``0`` for integer types, ``0.0`` for floating-point types.
+    """
+    if wp.types.type_is_int(dtype):
+        return 0
+    return 0.0
 
 
 def _shape_2d(shape: tuple[int, int] | list[int]) -> tuple[int, int]:

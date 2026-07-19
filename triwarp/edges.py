@@ -121,8 +121,8 @@ def edges_unique(
     if n_vertices is None:
         n_vertices = tw.vertices.n_vertices(edges_sorted)
 
-    keys = tw.unique.hash_indices_rows(edges_sorted, max_index=n_vertices)
-    unique_keys, inverse = tw.unique.unique_1d(keys, return_inverse=True)
+    keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices)
+    unique_keys, inverse = tw.grouping.unique_1d(keys, return_inverse=True)
     n_unique = int(unique_keys.shape[0])
 
     first_occ = wp.full(n_unique, n_edges, dtype=wp.int32, device=device)

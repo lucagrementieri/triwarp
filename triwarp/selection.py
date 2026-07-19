@@ -237,7 +237,7 @@ def submesh_from_face_indices(
         ``(n_vertices,)`` mesh vertex positions on the target device.
     faces
         Length-``3 * n_faces`` flat triangle index buffer (same layout as
-        [`face_adjacency`][triwarp.graph.face_adjacency]).
+        [`face_adjacency`][triwarp.adjacency.face_adjacency]).
     face_indices
         1D ``wp.int32`` array of face indices into the source mesh
         (``0 .. n_faces - 1``), on the same device as ``vertices``.
@@ -260,7 +260,7 @@ def submesh_from_face_indices(
     --------
     [`submesh_from_face_mask`][triwarp.selection.submesh_from_face_mask]
     [`submesh_from_vertex_indices`][triwarp.selection.submesh_from_vertex_indices]
-    [`concatenate`][triwarp.graph.concatenate]
+    [`concatenate`][triwarp.combine.concatenate]
     [`trimesh.util.submesh`][]
     """
     device = vertices.device
@@ -272,11 +272,11 @@ def submesh_from_face_indices(
         unique_face_indices = face_indices
         face_slots = init_range(k, device)
     else:
-        unique_face_indices, face_slots = tw.unique.unique_1d(face_indices, return_inverse=True)
+        unique_face_indices, face_slots = tw.grouping.unique_1d(face_indices, return_inverse=True)
 
     unique_faces = tw.array.gather(faces.reshape((-1, 3)), unique_face_indices).reshape((-1,))
 
-    unique_vertex_indices, remapped_faces = tw.unique.unique_1d(unique_faces, return_inverse=True)
+    unique_vertex_indices, remapped_faces = tw.grouping.unique_1d(unique_faces, return_inverse=True)
     n_unique = int(unique_vertex_indices.shape[0])
     sub_vertices = wp.empty(n_unique, dtype=wp.vec3, device=device)
     wp.copy(sub_vertices, vertices[unique_vertex_indices])

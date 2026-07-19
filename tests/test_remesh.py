@@ -332,7 +332,7 @@ def test_subdivide_to_size_max_iter_exceeded(icosahedron: tuple[tm.Trimesh, wp.M
 def _filled_hemisphere(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     """Fill the hemisphere's boundary and return (vertices_wp, faces_wp, region_mask_wp)."""
     _, mesh_wp = hemisphere
-    faces_filled = tw.stitching.fill_holes_min_weight(mesh_wp.points, mesh_wp.indices)
+    faces_filled = tw.hole_filling.fill_holes_min_weight(mesh_wp.points, mesh_wp.indices)
     n0 = int(mesh_wp.indices.shape[0]) // 3
     n1 = int(faces_filled.shape[0]) // 3
     region = np.zeros(n1, dtype=bool)

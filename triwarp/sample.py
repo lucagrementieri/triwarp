@@ -17,27 +17,8 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels import sample as kernel_sample
 from triwarp.kernels import triangles as kernel_triangles
 from triwarp.kernels.algorithms import blue_noise as kernel_blue_noise
-from triwarp.proximity import query_hashgrid_ball_with_offsets
+from triwarp.neighbors import query_hashgrid_ball_with_offsets
 from triwarp.triangles import centroid, face_normals_and_areas
-
-
-def get_seed(seed: int | None) -> int:
-    """
-    Resolve an optional RNG seed to a concrete non-negative ``int32``-range seed.
-
-    Parameters
-    ----------
-    seed
-        User-provided seed, or ``None`` to draw a cryptographically random seed.
-
-    Returns
-    -------
-    int
-        ``seed`` unchanged when provided, otherwise a random value in ``[0, 2**31)``.
-    """
-    if seed is None:
-        return secrets.randbelow(2**31)
-    return int(seed)
 
 
 def sample_fibonacci_sphere(count: int, device: wp.DeviceLike = None) -> wp.array[wp.vec3]:
@@ -182,7 +163,7 @@ def sample_surface(
     wp.launch(
         kernel_sample.sample_surface,
         dim=count,
-        inputs=[vertices, faces, cdf, get_seed(seed), out_points, out_face_indices],
+        inputs=[vertices, faces, cdf, _get_seed(seed), out_points, out_face_indices],
         device=vertices.device,
     )
     return out_points, out_face_indices
@@ -353,7 +334,7 @@ def _bridson_blue_noise(
     four_rr = wp.float32(4.0 * radius * radius)
 
     # Bounding-box min and grid extent via device reductions (no full-pool host copies).
-    bbox_min, _ = tw.proximity.aabb_bounds(pool_points)
+    bbox_min, _ = tw.bounds.aabb_bounds(pool_points)
 
     grid_coords = wp.empty(nx, dtype=wp.vec3i, device=device)
     wp.map(kernel_blue_noise.grid_coord, pool_points, bbox_min, inv_cell_size, out=grid_coords)
@@ -375,7 +356,7 @@ def _bridson_blue_noise(
     sorted_keys = wp.empty(nx, dtype=wp.int64, device=device)
     wp.copy(sorted_keys, keys_buf, count=nx)
 
-    unique_keys, counts = tw.unique.unique_1d(sorted_keys, return_counts=True)
+    unique_keys, counts = tw.grouping.unique_1d(sorted_keys, return_counts=True)
     n_cells = int(unique_keys.shape[0])
     cell_offsets_inner = wp.empty(n_cells, dtype=wp.int32, device=device)
     wp.utils.array_scan(counts, out_array=cell_offsets_inner, inclusive=False)
@@ -703,7 +684,7 @@ def sample_surface_blue_noise(
     expected = surface_area * (math.pi * math.sqrt(3.0) / 6.0) / (math.pi * radius * radius / 4.0)
     nx = max(1, int(30.0 * expected))
 
-    bridson_seed = get_seed(seed)
+    bridson_seed = _get_seed(seed)
     init_points, init_face_indices = sample_surface(vertices, faces, nx, seed=seed)
     return _bridson_blue_noise(init_points, init_face_indices, radius, bridson_seed)
 
@@ -749,7 +730,7 @@ def sample_volume(
     if count == 0:
         return wp.empty(0, dtype=wp.vec3, device=vertices.device)
 
-    if not tw.characteristics.is_edge_manifold(faces, allow_boundary_edges=False):
+    if not tw.validation.is_edge_manifold(faces, allow_boundary_edges=False):
         raise ValueError(
             "mesh is not watertight; tetrahedral decomposition requires a closed surface"
         )
@@ -784,7 +765,26 @@ def sample_volume(
     wp.launch(
         kernel_sample.sample_volume_tet,
         dim=count,
-        inputs=[vertices, faces, center, cdf, get_seed(seed), out_points],
+        inputs=[vertices, faces, center, cdf, _get_seed(seed), out_points],
         device=vertices.device,
     )
     return out_points
+
+
+def _get_seed(seed: int | None) -> int:
+    """
+    Resolve an optional RNG seed to a concrete non-negative ``int32``-range seed.
+
+    Parameters
+    ----------
+    seed
+        User-provided seed, or ``None`` to draw a cryptographically random seed.
+
+    Returns
+    -------
+    int
+        ``seed`` unchanged when provided, otherwise a random value in ``[0, 2**31)``.
+    """
+    if seed is None:
+        return secrets.randbelow(2**31)
+    return int(seed)

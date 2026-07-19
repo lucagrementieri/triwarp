@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.kernels.array import binary_search_sorted_contains, to_vec2d, to_vec3d
-from triwarp.kernels.unique import hash_slot, pack_edge_key
+from triwarp.kernels.grouping import hash_slot, pack_edge_key
 
 # Delaunay / Delone edge-flip constants (ported from MRMeshDelone.cpp). The flip predicate
 # runs in float64: MeshLib deliberately widens to double because circumcircle diameters of

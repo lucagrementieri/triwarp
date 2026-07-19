@@ -425,7 +425,7 @@ def test_chamfer_points_to_mesh_loss_grad(
 
     # Fixed assignments exactly as the loss function computes them.
     face_id = tw.proximity.closest_point_on_mesh(verts_wp, faces_wp, points_wp)[2].numpy()
-    nn_vp = tw.proximity.query_hashgrid_nearest(points_wp, verts_wp, k=1)[0].numpy()
+    nn_vp = tw.neighbors.query_hashgrid_nearest(points_wp, verts_wp, k=1)[0].numpy()
 
     def loss_np() -> float:
         total = _reduce_np(_surface_sq_np(points_np, verts_np, faces_np, face_id), reduction)

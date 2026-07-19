@@ -4,6 +4,7 @@ from typing import Literal
 
 import warp as wp
 
+import triwarp as tw
 import triwarp.typing as twt
 from triwarp.constants import TILE_1D
 from triwarp.kernels import triangles as kernel_triangles
@@ -117,6 +118,48 @@ def centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.vec3:
         float(centroid[1]) / total_area,
         float(centroid[2]) / total_area,
     )
+
+
+def volume(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> float:
+    """
+    Signed volume enclosed by the mesh.
+
+    Sum of per-face signed tetrahedron volumes measured from the origin
+    (``dot(v0, cross(v1, v2)) / 6``); for a closed, consistently wound surface this is
+    independent of the reference point, and its sign follows the orientation of the face
+    normals (positive for outward-facing normals). For an open or inconsistently wound mesh
+    the result is not a meaningful volume.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+
+    Returns
+    -------
+    float
+        Signed volume in ``float32``. ``0.0`` for an empty mesh.
+
+    See Also
+    --------
+    [`centroid`][triwarp.triangles.centroid]
+    [`is_volume`][triwarp.validation.is_volume]
+    [`trimesh.Trimesh.volume`][]
+    """
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return 0.0
+    device = vertices.device
+    volumes = wp.empty(n_faces, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_triangles.signed_tet_volumes,
+        dim=n_faces,
+        inputs=[vertices, faces, wp.vec3(0.0, 0.0, 0.0), volumes],
+        device=device,
+    )
+    return tw.reduce.sum(volumes)
 
 
 def nondegenerate(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array[wp.bool]:

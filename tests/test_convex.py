@@ -16,7 +16,9 @@ def test_face_adjacency_projections(request: pytest.FixtureRequest, mesh_name: s
     adjacency_tm = mesh_tm.face_adjacency
     projections_tm = mesh_tm.face_adjacency_projections
 
-    adjacency_wp, adjacency_edges_wp = tw.graph.face_adjacency(mesh_wp.indices, return_edges=True)
+    adjacency_wp, adjacency_edges_wp = tw.adjacency.face_adjacency(
+        mesh_wp.indices, return_edges=True
+    )
     projections_wp = tw.convex.face_adjacency_projections(
         mesh_wp.points,
         mesh_wp.indices,
@@ -44,8 +46,10 @@ def test_face_adjacency_projections_precomputed(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    adjacency_wp, adjacency_edges_wp = tw.graph.face_adjacency(mesh_wp.indices, return_edges=True)
-    unshared_wp = tw.graph.face_adjacency_unshared(
+    adjacency_wp, adjacency_edges_wp = tw.adjacency.face_adjacency(
+        mesh_wp.indices, return_edges=True
+    )
+    unshared_wp = tw.adjacency.face_adjacency_unshared(
         mesh_wp.indices, face_adjacency=adjacency_wp, face_adjacency_edges=adjacency_edges_wp
     )
     face_normals_wp, _ = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
@@ -96,7 +100,9 @@ def test_face_adjacency_convex(request: pytest.FixtureRequest, mesh_name: str) -
     adjacency_tm = mesh_tm.face_adjacency
     convex_tm = mesh_tm.face_adjacency_convex
 
-    adjacency_wp, adjacency_edges_wp = tw.graph.face_adjacency(mesh_wp.indices, return_edges=True)
+    adjacency_wp, adjacency_edges_wp = tw.adjacency.face_adjacency(
+        mesh_wp.indices, return_edges=True
+    )
     convex_wp = tw.convex.face_adjacency_convex(
         mesh_wp.points,
         mesh_wp.indices,
@@ -120,8 +126,10 @@ def test_face_adjacency_convex(request: pytest.FixtureRequest, mesh_name: str) -
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
 def test_face_adjacency_convex_precomputed(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    adjacency_wp, adjacency_edges_wp = tw.graph.face_adjacency(mesh_wp.indices, return_edges=True)
-    unshared_wp = tw.graph.face_adjacency_unshared(
+    adjacency_wp, adjacency_edges_wp = tw.adjacency.face_adjacency(
+        mesh_wp.indices, return_edges=True
+    )
+    unshared_wp = tw.adjacency.face_adjacency_unshared(
         mesh_wp.indices, face_adjacency=adjacency_wp, face_adjacency_edges=adjacency_edges_wp
     )
     face_normals_wp, _ = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)

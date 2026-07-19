@@ -259,18 +259,6 @@ def mesh_with_mesh(
     return lines
 
 
-def _compact_referenced_vertices(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
-) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-    """Keep only vertices referenced by ``faces`` and reindex face indices from zero."""
-    unique_idx, inverse = tw.unique.unique_1d(faces, return_inverse=True)
-    n_unique = int(unique_idx.shape[0])
-    compact_vertices = wp.empty(n_unique, dtype=wp.vec3, device=vertices.device)
-    wp.copy(compact_vertices, vertices[unique_idx])
-    compact_faces = inverse.reshape((-1,))
-    return compact_vertices, compact_faces
-
-
 def slice_mesh_with_plane(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -416,4 +404,5 @@ def slice_mesh_with_plane(
     face_segments = [inside_faces, *cut_face_segments]
     all_vertices, _ = tw.array.pack_1d_arrays(vert_segments)
     all_faces, _ = tw.array.pack_1d_arrays(face_segments)
-    return _compact_referenced_vertices(all_vertices, all_faces)
+    new_vertices, new_faces, _ = tw.repair.remove_unreferenced_vertices(all_vertices, all_faces)
+    return new_vertices, new_faces

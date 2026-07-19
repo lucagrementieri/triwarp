@@ -1,10 +1,11 @@
 import numpy as np
 import pytest
+import trimesh.geometry as tm_geometry
 import trimesh.points as tm
 import warp as wp
 
+import triwarp.neighbors as tw_neighbors
 import triwarp.points as tw
-import triwarp.proximity as tw_proximity
 
 
 def _fibonacci_sphere(n: int) -> np.ndarray:
@@ -41,6 +42,20 @@ def test_centroid(device: str) -> None:
     assert np.allclose(centroid_wp.numpy()[0], points_np.mean(axis=0), rtol=1e-5, atol=1e-5)
 
 
+def test_gram_matrix(device: str) -> None:
+    # 200 = 3 * 64 + 8 exercises the multi-tile reduction and remainder path.
+    rng = np.random.default_rng(10)
+    points_np = rng.standard_normal((200, 3)).astype(np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    gram_np = points_np.T @ points_np
+    assert np.allclose(tw.gram_matrix(points_wp).numpy()[0], gram_np, rtol=1e-4, atol=1e-4)
+
+
+def test_gram_matrix_empty(device: str) -> None:
+    points_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    assert np.allclose(tw.gram_matrix(points_wp).numpy()[0], np.zeros((3, 3)))
+
+
 def test_fit_line(device: str) -> None:
     rng = np.random.default_rng(2)
     # points strongly elongated along a known direction so the major axis
@@ -61,6 +76,28 @@ def test_fit_line(device: str) -> None:
     assert np.isclose(np.abs(np.dot(np.array(axis_wp), direction_np)), 1.0, atol=1e-3)
 
 
+def test_centered_covariance(device: str) -> None:
+    rng = np.random.default_rng(11)
+    points_np = rng.standard_normal((200, 3)).astype(np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    centered_np = points_np - points_np.mean(axis=0)
+    scatter_np = centered_np.T @ centered_np
+    cov_wp = tw.centered_covariance(points_wp)
+    assert np.allclose(cov_wp.numpy()[0], scatter_np, rtol=1e-4, atol=1e-4)
+
+
+def test_centered_covariance_precomputed_center(device: str) -> None:
+    rng = np.random.default_rng(12)
+    points_np = rng.standard_normal((150, 3)).astype(np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    mean_np = points_np.mean(axis=0)
+    center_wp = wp.array(mean_np.reshape(1, 3).astype(np.float32), dtype=wp.vec3, device=device)
+    centered_np = points_np - mean_np
+    scatter_np = centered_np.T @ centered_np
+    cov_wp = tw.centered_covariance(points_wp, center=center_wp)
+    assert np.allclose(cov_wp.numpy()[0], scatter_np, rtol=1e-4, atol=1e-4)
+
+
 def test_fit_plane(device: str) -> None:
     rng = np.random.default_rng(3)
     points_np = rng.standard_normal((80, 3))
@@ -73,6 +110,20 @@ def test_fit_plane(device: str) -> None:
     assert np.allclose(np.array(centroid_wp), centroid_tm, rtol=1e-4, atol=1e-4)
     # normal is sign-ambiguous: compare up to sign.
     assert np.isclose(np.abs(np.dot(np.array(normal_wp), normal_tm)), 1.0, atol=1e-4)
+
+
+def test_covariance(device: str) -> None:
+    rng = np.random.default_rng(13)
+    points_np = rng.standard_normal((200, 3)).astype(np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    cov_np = np.cov(points_np.T, ddof=1)
+    assert np.allclose(tw.covariance(points_wp).numpy()[0], cov_np, rtol=1e-4, atol=1e-4)
+
+
+def test_covariance_too_few_points_raises(device: str) -> None:
+    points_wp = wp.zeros(1, dtype=wp.vec3, device=device)
+    with pytest.raises(ValueError, match="ddof"):
+        tw.covariance(points_wp)
 
 
 def test_fit_line_large(device: str) -> None:
@@ -203,7 +254,7 @@ def test_estimate_normals_matches_open3d(device: str) -> None:
 
     # triwarp: build the same k-neighbourhood (self + knn-1 = knn points total), then PCA.
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
-    neighbor_idx_wp, _ = tw_proximity.query_bvh_nearest(points_wp, points_wp, k=knn)
+    neighbor_idx_wp, _ = tw_neighbors.query_bvh_nearest(points_wp, points_wp, k=knn)
     normals_wp = tw.estimate_normals(points_wp, neighbor_idx_wp)
 
     # Both estimators fix the smallest-eigenvalue covariance eigenvector but leave the sign
@@ -220,7 +271,7 @@ def test_estimate_normals_orientation(device: str) -> None:
     points_np = _fibonacci_sphere(1000)
     centroid_np = points_np.mean(axis=0)
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
-    neighbor_idx_wp, _ = tw_proximity.query_bvh_nearest(points_wp, points_wp, k=20)
+    neighbor_idx_wp, _ = tw_neighbors.query_bvh_nearest(points_wp, points_wp, k=20)
 
     # Default: outward from the cloud centroid (the reference vector the kernel uses).
     normals_default = tw.estimate_normals(points_wp, neighbor_idx_wp).numpy()
@@ -243,7 +294,7 @@ def test_estimate_normals_orientation(device: str) -> None:
 
 def test_estimate_normals_mutually_exclusive_orientation(device: str) -> None:
     points_wp = wp.array(_fibonacci_sphere(16).astype(np.float32), dtype=wp.vec3, device=device)
-    neighbor_idx_wp, _ = tw_proximity.query_bvh_nearest(points_wp, points_wp, k=8)
+    neighbor_idx_wp, _ = tw_neighbors.query_bvh_nearest(points_wp, points_wp, k=8)
     with pytest.raises(ValueError, match=r"at most one"):
         tw.estimate_normals(
             points_wp,
@@ -251,3 +302,27 @@ def test_estimate_normals_mutually_exclusive_orientation(device: str) -> None:
             orient_reference=wp.vec3(0.0, 0.0, 1.0),
             camera_location=wp.vec3(0.0, 0.0, 0.0),
         )
+
+
+def test_vector_angle(device: str) -> None:
+    rng = np.random.default_rng(42)
+    n = 64
+    vecs_a_np = rng.standard_normal((n, 3))
+    vecs_a_np /= np.linalg.norm(vecs_a_np, axis=1, keepdims=True)
+    vecs_b_np = rng.standard_normal((n, 3))
+    vecs_b_np /= np.linalg.norm(vecs_b_np, axis=1, keepdims=True)
+
+    pairs_np = np.stack([vecs_a_np, vecs_b_np], axis=1)
+    angles_tm = tm_geometry.vector_angle(pairs_np)
+
+    vecs_a_wp = wp.array(vecs_a_np.astype(np.float32), dtype=wp.vec3, device=device)
+    vecs_b_wp = wp.array(vecs_b_np.astype(np.float32), dtype=wp.vec3, device=device)
+    angles_wp = tw.vector_angle(vecs_a_wp, vecs_b_wp)
+    assert np.allclose(angles_wp.numpy(), angles_tm, rtol=1e-5, atol=1e-5)
+
+
+def test_vector_angle_empty(device: str) -> None:
+    vecs_a_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    vecs_b_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    angles_wp = tw.vector_angle(vecs_a_wp, vecs_b_wp)
+    assert angles_wp.shape == (0,)

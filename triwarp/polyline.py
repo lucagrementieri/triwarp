@@ -489,7 +489,32 @@ def smooth_upsample_closed_polyline(
     return _smooth_upsample(close_polyline(polyline), step_size, closed=True)
 
 
-def _cumulative_arc_length(polyline: wp.array[wp.vec3]) -> wp.array[wp.float32]:
+def cumulative_arc_length(polyline: wp.array[wp.vec3]) -> wp.array[wp.float32]:
+    """
+    Cumulative arc length from the first vertex to each vertex of an open polyline.
+
+    The underlying arc-length parametrization behind
+    [`downsample_polyline`][triwarp.polyline.downsample_polyline] and
+    [`resample_polyline`][triwarp.polyline.resample_polyline]; exposed directly for callers
+    doing custom resampling along the polyline.
+
+    Parameters
+    ----------
+    polyline
+        ``(n,)`` polyline vertices as ``wp.vec3``.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        Length-``n`` array on ``polyline.device``. Entry ``0`` is ``0.0``; entry ``i`` is the
+        summed length of segments ``0..i-1``.
+
+    See Also
+    --------
+    [`polyline_length`][triwarp.polyline.polyline_length]
+    [`downsample_polyline`][triwarp.polyline.downsample_polyline]
+    [`resample_polyline`][triwarp.polyline.resample_polyline]
+    """
     device = polyline.device
     n_segments = int(polyline.shape[0]) - 1
     lengths = wp.empty(n_segments, dtype=wp.float32, device=device)
@@ -528,7 +553,7 @@ def downsample_polyline(polyline: wp.array[wp.vec3], step_size: float) -> wp.arr
     if n < 2:
         return polyline
 
-    cumulative = _cumulative_arc_length(polyline)
+    cumulative = cumulative_arc_length(polyline)
     keep_mask = wp.zeros(n, dtype=wp.bool, device=device)
     wp.launch(
         kernel_polyline.greedy_downsample_mask,
@@ -562,7 +587,7 @@ def downsample_closed_polyline(polyline: wp.array[wp.vec3], step_size: float) ->
     return downsample_polyline(close_polyline(polyline), step_size)
 
 
-def simplify(
+def simplify_polyline(
     polyline: wp.array[wp.vec3], tol: float
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
@@ -590,7 +615,7 @@ def simplify(
 
     See Also
     --------
-    [`simplify_closed`][triwarp.polyline.simplify_closed]
+    [`simplify_closed_polyline`][triwarp.polyline.simplify_closed_polyline]
     [`downsample_polyline`][triwarp.polyline.downsample_polyline]
     """
     device = polyline.device
@@ -608,7 +633,7 @@ def simplify(
     return tw.array.gather(polyline, indices), indices
 
 
-def simplify_closed(
+def simplify_closed_polyline(
     polyline: wp.array[wp.vec3], tol: float
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
@@ -630,10 +655,10 @@ def simplify_closed(
 
     See Also
     --------
-    [`simplify`][triwarp.polyline.simplify]
+    [`simplify_polyline`][triwarp.polyline.simplify_polyline]
     [`close_polyline`][triwarp.polyline.close_polyline]
     """
-    return simplify(close_polyline(polyline), tol)
+    return simplify_polyline(close_polyline(polyline), tol)
 
 
 def resample_polyline(polyline: wp.array[wp.vec3], num_points: int) -> wp.array[wp.vec3]:
@@ -675,7 +700,7 @@ def resample_polyline(polyline: wp.array[wp.vec3], num_points: int) -> wp.array[
         )
         return out_points
 
-    cumulative = _cumulative_arc_length(polyline)
+    cumulative = cumulative_arc_length(polyline)
     wp.launch(
         kernel_polyline.resample_interp,
         dim=num_points,
@@ -874,18 +899,7 @@ def closed_polyline_angles(polyline: wp.array[wp.vec3]) -> wp.array[wp.float32]:
     return angles[0:n_original]
 
 
-def _in_plane_basis(normal: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
-    """Right-handed orthonormal basis ``(u, v)`` spanning the plane with the given ``normal``."""
-    unit_normal = wp.normalize(normal)
-    axis = wp.vec3(1.0, 0.0, 0.0)
-    if abs(unit_normal[0]) > 0.9:
-        axis = wp.vec3(0.0, 1.0, 0.0)
-    u = wp.normalize(wp.cross(axis, unit_normal))
-    v = wp.cross(unit_normal, u)
-    return u, v
-
-
-def triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
+def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     """
     Triangulate the simple planar polygon bounded by a closed 3D polyline (ear clipping).
 
@@ -926,7 +940,7 @@ def triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     if n < 3:
         return twt.empty_int32_2d((0, 3), device=device)
 
-    u, v = _in_plane_basis(polyline_normal(polyline))
+    u, v = tw.points.plane_basis(polyline_normal(polyline))
     center = polyline_centroid(polyline)
     points2d = wp.empty(n, dtype=wp.vec2, device=device)
     wp.map(kernel_polyline.project_to_plane_2d, polyline, center, u, v, out=points2d)

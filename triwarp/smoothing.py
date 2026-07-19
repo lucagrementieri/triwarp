@@ -8,8 +8,8 @@ import warp.sparse as wps
 
 import triwarp as tw
 from triwarp import laplacian
+from triwarp._device import require_cuda
 from triwarp.constants import TILE_1D
-from triwarp.kernels import array as kernel_array
 from triwarp.kernels import laplacian as kernel_laplacian
 from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import smoothing as kernel_smoothing
@@ -18,18 +18,6 @@ from triwarp.triangles import face_normals_and_areas
 from triwarp.vertices import mean_vertex_normals
 
 _CG_TOLERANCE = 1e-10
-
-
-def _to_vec3d(vertices: wp.array[wp.vec3]) -> wp.array[wp.vec3d]:
-    out = wp.empty(int(vertices.shape[0]), dtype=wp.vec3d, device=vertices.device)
-    wp.map(kernel_array.to_vec3d, vertices, out=out)
-    return out
-
-
-def _to_vec3(positions: wp.array[wp.vec3d]) -> wp.array[wp.vec3]:
-    out = wp.empty(int(positions.shape[0]), dtype=wp.vec3, device=positions.device)
-    wp.map(kernel_array.to_vec3, positions, out=out)
-    return out
 
 
 def _apply_operator(
@@ -74,14 +62,6 @@ def _apply_volume_constraint(
     if vol_new != 0.0:
         factor = (vol_ini / vol_new) ** (1.0 / 3.0)
         wp.map(wp.mul, positions, wp.float64(factor), out=positions)
-
-
-def _require_cuda(device: wp.DeviceLike, name: str) -> None:
-    if wp.get_device(device).is_cpu:
-        raise NotImplementedError(
-            f"{name} requires a CUDA device: warp.optim.linear.cg produces NaN on the CPU "
-            "device in Warp 1.14-1.15."
-        )
 
 
 def filter_laplacian(
@@ -147,11 +127,11 @@ def filter_laplacian(
         if laplacian_operator is not None
         else laplacian.laplacian(vertices, faces)
     )
-    positions = _to_vec3d(vertices)
+    positions = tw.array._as_vec3d(vertices)
     vol_ini = _mesh_volume(positions, faces) if volume_constraint else 0.0
 
     if implicit_time_integration:
-        _require_cuda(device, "filter_laplacian(implicit_time_integration=True)")
+        require_cuda(device, "filter_laplacian(implicit_time_integration=True)")
         system = _build_implicit_system(operator, lamb, n, device)
         precond = wpl.preconditioner(system, "diag")
         components = _empty_components(n, device)
@@ -178,7 +158,7 @@ def filter_laplacian(
             if volume_constraint:
                 _apply_volume_constraint(positions, faces, vol_ini)
 
-    return _to_vec3(positions)
+    return tw.array._as_vec3(positions)
 
 
 def filter_humphrey(
@@ -235,7 +215,7 @@ def filter_humphrey(
         if laplacian_operator is not None
         else laplacian.laplacian(vertices, faces)
     )
-    positions = _to_vec3d(vertices)
+    positions = tw.array._as_vec3d(vertices)
     original = wp.empty(n, dtype=wp.vec3d, device=device)
     wp.copy(original, positions)
 
@@ -267,7 +247,7 @@ def filter_humphrey(
         wp.launch(update, dim=n, inputs=[lv, b, lb, beta64], outputs=[nxt], device=device)
         positions, nxt = nxt, positions
 
-    return _to_vec3(positions)
+    return tw.array._as_vec3(positions)
 
 
 def filter_taubin(
@@ -323,7 +303,7 @@ def filter_taubin(
         if laplacian_operator is not None
         else laplacian.laplacian(vertices, faces)
     )
-    positions = _to_vec3d(vertices)
+    positions = tw.array._as_vec3d(vertices)
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
     step = wp.map(
@@ -342,7 +322,7 @@ def filter_taubin(
         )
         positions, nxt = nxt, positions
 
-    return _to_vec3(positions)
+    return tw.array._as_vec3(positions)
 
 
 def filter_neighborhood_average(
@@ -399,7 +379,7 @@ def filter_neighborhood_average(
         if laplacian_operator is not None
         else laplacian.laplacian(vertices, faces, symmetric=True)
     )
-    positions = _to_vec3d(vertices)
+    positions = tw.array._as_vec3d(vertices)
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
     # CSR row bounds as aligned per-vertex inputs: degree(i) = offsets[i + 1] - offsets[i].
@@ -419,7 +399,7 @@ def filter_neighborhood_average(
         wp.launch(step, dim=n, inputs=[positions, lv, starts, ends], outputs=[nxt], device=device)
         positions, nxt = nxt, positions
 
-    return _to_vec3(positions)
+    return tw.array._as_vec3(positions)
 
 
 def filter_mut_dif_laplacian(
@@ -485,7 +465,7 @@ def filter_mut_dif_laplacian(
         if laplacian_operator is not None
         else laplacian.laplacian(vertices, faces)
     )
-    positions = _to_vec3d(vertices)
+    positions = tw.array._as_vec3d(vertices)
 
     # Vertex normals and eps are computed once from the input mesh and reused every pass, matching
     # the trimesh reference (which reads normals off the un-mutated mesh inside its loop).
@@ -548,7 +528,7 @@ def filter_mut_dif_laplacian(
                 out=positions,
             )
 
-    return _to_vec3(positions)
+    return tw.array._as_vec3(positions)
 
 
 def filter_implicit_fairing(
@@ -600,15 +580,15 @@ def filter_implicit_fairing(
         wp.copy(out, vertices)
         return out
 
-    _require_cuda(device, "filter_implicit_fairing")
-    positions = _to_vec3d(vertices)
+    require_cuda(device, "filter_implicit_fairing")
+    positions = tw.array._as_vec3d(vertices)
     components = _empty_components(n, device)
     rhs = _empty_components(n, device)
     solutions = _empty_components(n, device)
 
     n_triplets = 12 * n_faces
     for _ in range(iterations):
-        current = _to_vec3(positions)
+        current = tw.array._as_vec3(positions)
         cot_entries = laplacian.cotmatrix_entries(current, faces)
         rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
         cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
@@ -638,7 +618,7 @@ def filter_implicit_fairing(
             wpl.cg(system, b, solution, tol=_CG_TOLERANCE, maxiter=10 * n, M=precond)
         wp.map(kernel_smoothing.combine_components, *solutions, out=positions)
 
-    return _to_vec3(positions)
+    return tw.array._as_vec3(positions)
 
 
 def _empty_components(
@@ -682,21 +662,6 @@ def _build_implicit_system(
 # ---------------------------------------------------------------------------
 
 _CG_TOLERANCE_POSITION = 1e-10
-
-
-def _mask_to_map(mask: wp.array[wp.bool]) -> tuple[wp.array[wp.int32], int]:
-    """Compact index map over the ``True`` entries plus their count (exclusive scan)."""
-    device = mask.device
-    n = int(mask.shape[0])
-    if n == 0:
-        return wp.zeros(0, dtype=wp.int32, device=device), 0
-    flags = wp.empty(n, dtype=wp.int32, device=device)
-    wp.utils.array_cast(mask, flags)
-    cmap = wp.empty(n, dtype=wp.int32, device=device)
-    inclusive = wp.empty(n, dtype=wp.int32, device=device)
-    wp.utils.array_scan(flags, out_array=cmap, inclusive=False)
-    wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
-    return cmap, int(inclusive.numpy()[-1])
 
 
 def _edge_weight_matrix(
@@ -790,7 +755,7 @@ def position_verts_smoothly_sharp_boundary(
     See Also
     --------
     [`position_verts_smoothly`][triwarp.smoothing.position_verts_smoothly]
-    [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely]
+    [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely]
 
     Notes
     -----
@@ -802,10 +767,10 @@ def position_verts_smoothly_sharp_boundary(
     out = wp.clone(vertices)
     if int(faces.shape[0]) == 0 or n == 0:
         return out
-    free_map, n_free = _mask_to_map(free_mask)
+    free_map, n_free = tw.array.mask_to_index_map(free_mask)
     if n_free == 0:
         return out
-    _require_cuda(device, "position_verts_smoothly_sharp_boundary")
+    require_cuda(device, "position_verts_smoothly_sharp_boundary")
 
     weight_matrix = _edge_weight_matrix(vertices, faces, "unit")
     nnz = int(weight_matrix.nnz)
@@ -891,20 +856,20 @@ def position_verts_smoothly(
     See Also
     --------
     [`position_verts_smoothly_sharp_boundary`][triwarp.smoothing.position_verts_smoothly_sharp_boundary]
-    [`fill_holes_nicely`][triwarp.stitching.fill_holes_nicely]
+    [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely]
     """
     device = vertices.device
     n = int(vertices.shape[0])
     out = wp.clone(vertices)
     if int(faces.shape[0]) == 0 or n == 0:
         return out
-    free_map, n_free = _mask_to_map(free_mask)
+    free_map, n_free = tw.array.mask_to_index_map(free_mask)
     if n_free == 0:
         return out
-    _require_cuda(device, "position_verts_smoothly")
+    require_cuda(device, "position_verts_smoothly")
 
     row_mask = tw.selection.expand_vertex_mask(faces, free_mask, 1)
-    row_map, n_rows = _mask_to_map(row_mask)
+    row_map, n_rows = tw.array.mask_to_index_map(row_mask)
     weight_matrix = _edge_weight_matrix(vertices, faces, edge_weights)
     nnz = int(weight_matrix.nnz)
     size = nnz + n

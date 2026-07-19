@@ -280,7 +280,7 @@ def test_exclude_fully_selected_components(device: str):
     f_wp_ico = wp.array(ico.faces.astype(np.int32).reshape(-1), dtype=wp.int32, device=device)
     v_wp_hemi = wp.array(v_hemi, dtype=wp.vec3, device=device)
     f_wp_hemi = wp.array(hemi.faces.astype(np.int32).reshape(-1), dtype=wp.int32, device=device)
-    verts, faces = tw.graph.concatenate([(v_wp_ico, f_wp_ico), (v_wp_hemi, f_wp_hemi)])
+    verts, faces = tw.combine.concatenate([(v_wp_ico, f_wp_ico), (v_wp_hemi, f_wp_hemi)])
 
     n = int(verts.shape[0])
     n_ico = len(v_ico)
