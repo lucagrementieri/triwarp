@@ -1,5 +1,7 @@
 """Triangular mesh utilities on NVIDIA Warp."""
 
+from triwarp.mesh import Trimesh
+
 from . import (
     adjacency,
     array,
@@ -19,6 +21,7 @@ from . import (
     intersection,
     io,
     laplacian,
+    mesh,
     neighbors,
     parametrization,
     points,
@@ -41,6 +44,7 @@ from . import (
 )
 
 __all__ = [
+    "Trimesh",
     "adjacency",
     "array",
     "boundary",
@@ -59,6 +63,7 @@ __all__ = [
     "intersection",
     "io",
     "laplacian",
+    "mesh",
     "neighbors",
     "parametrization",
     "points",

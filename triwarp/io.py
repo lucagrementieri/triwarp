@@ -8,6 +8,9 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import warp as wp
 
+from triwarp._device import require_nonempty_mesh
+from triwarp.mesh import Trimesh
+
 if TYPE_CHECKING:
     import meshio
 
@@ -150,7 +153,43 @@ def load_mesh(path: str | Path, *, device: wp.DeviceLike = None) -> wp.Mesh:
     data = load_mesh_data(path, device=device)
     if "faces" not in data:
         raise ValueError(f"Mesh file {path!r} has no triangle faces; cannot build a wp.Mesh.")
+    require_nonempty_mesh(data["faces"], "load_mesh")
     return wp.Mesh(points=wp.clone(data["vertices"]), indices=wp.clone(data["faces"]))
+
+
+def mesh_from_numpy(
+    vertices: np.ndarray, faces: np.ndarray, *, device: wp.DeviceLike = None
+) -> Trimesh:
+    """
+    Build a [`Trimesh`][triwarp.mesh.Trimesh] from NumPy vertex and face arrays.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices, 3)`` vertex positions, any NumPy float dtype.
+    faces
+        ``(n_faces, 3)`` (or already-flat length-``3 * n_faces``) triangle vertex indices,
+        any NumPy integer dtype.
+    device
+        Warp device for the returned mesh. Defaults to the current Warp device.
+
+    Returns
+    -------
+    Trimesh
+        New mesh with ``vec3`` vertices and a flat ``int32`` face buffer, owning freshly
+        allocated Warp arrays (no aliasing with ``vertices`` / ``faces``).
+
+    See Also
+    --------
+    [`load_mesh`][triwarp.io.load_mesh]
+    """
+    vertices_wp = wp.array(
+        np.ascontiguousarray(vertices, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    faces_wp = wp.array(
+        np.ascontiguousarray(faces.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
+    )
+    return Trimesh(vertices_wp, faces_wp)
 
 
 def _stack_columns(data: dict[str, np.ndarray], names: tuple[str, ...]) -> np.ndarray | None:

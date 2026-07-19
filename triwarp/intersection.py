@@ -6,6 +6,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_nonempty_mesh
 from triwarp.kernels import intersection as kernel_intersections
 
 
@@ -191,6 +192,7 @@ def mesh_with_mesh(
 
     n_query = int(query_faces.shape[0]) // 3
 
+    require_nonempty_mesh(target_faces, "mesh_with_mesh")
     target_mesh = wp.Mesh(points=target_vertices, indices=target_faces)
 
     query_lower = wp.empty(n_query, dtype=wp.vec3, device=device)

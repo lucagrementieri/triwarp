@@ -19,6 +19,7 @@ import numpy as np
 import warp as wp
 
 import triwarp as tw
+from triwarp._device import require_nonempty_mesh
 from triwarp.constants import TILE_1D
 from triwarp.kernels import proximity as kernel_proximity
 from triwarp.triangles import face_normals_and_areas
@@ -167,6 +168,7 @@ def closest_point_on_mesh(
         out_face = wp.full(m, -1, dtype=wp.int32, device=device)
         return out_closest, out_distance, out_face
 
+    require_nonempty_mesh(faces, "closest_point_on_mesh")
     mesh = wp.Mesh(points=wp.clone(vertices), indices=wp.clone(faces))
     if max_dist is None:
         max_dist = _default_mesh_query_max_dist(mesh.points, points)
@@ -285,6 +287,7 @@ def signed_distance_on_mesh(
     if n_faces == 0:
         return wp.full(m, float("inf"), dtype=wp.float32, device=device)
 
+    require_nonempty_mesh(faces, "signed_distance_on_mesh")
     mesh = wp.Mesh(points=wp.clone(vertices), indices=wp.clone(faces))
     if max_dist is None:
         max_dist = _default_mesh_query_max_dist(mesh.points, points)

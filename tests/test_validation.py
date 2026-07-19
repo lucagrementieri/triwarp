@@ -276,7 +276,7 @@ def test_vertex_manifold_mask_faces_without_vertices(device: str) -> None:
 @pytest.mark.parametrize("mesh_name", CLOSED_MESHES)
 def test_is_self_intersecting_clean(request: pytest.FixtureRequest, mesh_name: str) -> None:
     _, mesh_wp = request.getfixturevalue(mesh_name)
-    assert tw.validation.is_self_intersecting(mesh_wp.points, mesh_wp.indices) is False
+    assert tw.validation.is_self_intersecting(mesh_wp) is False
 
 
 def test_is_self_intersecting_crossing(device: str) -> None:
@@ -292,7 +292,8 @@ def test_is_self_intersecting_crossing(device: str) -> None:
     )
     faces_np = np.array([[0, 1, 2], [3, 4, 5]])
     vertices_wp, faces_wp = _mesh_to_wp(vertices_np, faces_np, device)
-    assert tw.validation.is_self_intersecting(vertices_wp, faces_wp) is True
+    mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
+    assert tw.validation.is_self_intersecting(mesh_wp) is True
 
 
 def test_is_self_intersecting_separated(device: str) -> None:
@@ -308,7 +309,8 @@ def test_is_self_intersecting_separated(device: str) -> None:
     )
     faces_np = np.array([[0, 1, 2], [3, 4, 5]])
     vertices_wp, faces_wp = _mesh_to_wp(vertices_np, faces_np, device)
-    assert tw.validation.is_self_intersecting(vertices_wp, faces_wp) is False
+    mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
+    assert tw.validation.is_self_intersecting(mesh_wp) is False
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
@@ -318,7 +320,7 @@ def test_face_self_intersecting_mask_matches_predicate(
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mask_wp = tw.validation.face_self_intersecting_mask(mesh_wp.points, mesh_wp.indices)
     assert int(mask_wp.shape[0]) == mesh_tm.faces.shape[0]
-    predicate = tw.validation.is_self_intersecting(mesh_wp.points, mesh_wp.indices)
+    predicate = tw.validation.is_self_intersecting(mesh_wp)
     assert bool(tw.reduce.any(mask_wp)) == predicate
 
 
@@ -466,13 +468,23 @@ def test_empty_mesh(device: str) -> None:
     assert tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=True) is True
     assert tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=False) is True
     assert tw.validation.is_vertex_manifold(faces_wp) is True
-    assert tw.validation.is_self_intersecting(vertices_wp, faces_wp) is False
     assert tw.validation.is_orientable(faces_wp) is True
     assert tw.validation.is_winding_consistent(faces_wp) is True
     assert tw.validation.is_volume(vertices_wp, faces_wp) is False
     assert tw.validation.euler_characteristic(faces_wp) == 0
     assert tw.validation.edge_manifold_mask(faces_wp).shape[0] == 0
     assert tw.validation.vertex_manifold_mask(vertices_wp, faces_wp).shape[0] == 0
+
+
+def test_is_self_intersecting_fewer_than_two_faces(device: str) -> None:
+    # A `warp.Mesh` with zero triangles corrupts CUDA state when its BVH is built (a Warp 1.15
+    # bug independent of triwarp), so this exercises the n_faces < 2 short-circuit with a
+    # single-triangle mesh instead of a fully empty one.
+    vertices_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    faces_np = np.array([[0, 1, 2]])
+    vertices_wp, faces_wp = _mesh_to_wp(vertices_np, faces_np, device)
+    mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
+    assert tw.validation.is_self_intersecting(mesh_wp) is False
 
 
 def test_new_masks_empty_mesh(device: str) -> None:

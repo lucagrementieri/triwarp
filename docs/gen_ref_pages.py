@@ -16,6 +16,7 @@ src = root / "triwarp"
 # falling back to a flat alphabetical list.
 SECTIONS: dict[str, list[str]] = {
     "Mesh structure & topology": [
+        "mesh",
         "vertices",
         "edges",
         "triangles",

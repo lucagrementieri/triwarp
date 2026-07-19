@@ -8,6 +8,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_nonempty_mesh
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import intersection as kernel_intersections
 from triwarp.kernels import triangles as kernel_triangles
@@ -342,23 +343,21 @@ def vertex_manifold_mask(
     return manifold
 
 
-def is_self_intersecting(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], *, max_triangle_collisions: int = 32
-) -> bool:
+def is_self_intersecting(mesh: wp.Mesh, *, max_triangle_collisions: int = 32) -> bool:
     """
     Whether any two non-adjacent triangles of the mesh intersect.
 
-    Broad phase builds a ``warp.Mesh`` and queries each triangle's AABB for candidate
-    overlaps; narrow phase runs a separating-axis triangle test on each candidate pair, skipping
-    pairs that share a vertex. Mirrors Open3D's ``IsSelfIntersecting`` (AABB pre-test followed by a
+    Broad phase queries each triangle's AABB against ``mesh``'s BVH for candidate overlaps;
+    narrow phase runs a separating-axis triangle test on each candidate pair, skipping pairs
+    that share a vertex. Mirrors Open3D's ``IsSelfIntersecting`` (AABB pre-test followed by a
     triangle-triangle test on non-neighbouring faces).
 
     Parameters
     ----------
-    vertices
-        ``(n_vertices,)`` vertex positions.
-    faces
-        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    mesh
+        Mesh to test; ``mesh.points`` and ``mesh.indices`` are used directly, so its BVH is
+        always in sync with the triangles being tested (a separately-passed vertex/face pair
+        could otherwise be misaligned with a caller's ``mesh``).
     max_triangle_collisions
         Broad-phase candidate cap per query triangle. Raise this for meshes with many triangles
         packed into overlapping bounding boxes.
@@ -379,14 +378,14 @@ def is_self_intersecting(
     -----
     Equivalent to ``open3d.geometry.TriangleMesh.is_self_intersecting``.
     """
+    vertices = mesh.points
+    faces = mesh.indices
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces < 2:
         return False
     if max_triangle_collisions < 1:
         raise ValueError("max_triangle_collisions must be >= 1")
-
-    mesh = wp.Mesh(points=vertices, indices=faces)
 
     lower = wp.empty(n_faces, dtype=wp.vec3, device=device)
     upper = wp.empty(n_faces, dtype=wp.vec3, device=device)
@@ -461,6 +460,7 @@ def face_self_intersecting_mask(
     if max_triangle_collisions < 1:
         raise ValueError("max_triangle_collisions must be >= 1")
 
+    require_nonempty_mesh(faces, "face_self_intersecting_mask")
     mesh = wp.Mesh(points=vertices, indices=faces)
 
     lower = wp.empty(n_faces, dtype=wp.vec3, device=device)
@@ -848,7 +848,8 @@ def is_watertight(
         faces, face_adjacency=adjacency, face_adjacency_edges=adjacency_edges
     ):
         return False
-    return not is_self_intersecting(vertices, faces)
+    require_nonempty_mesh(faces, "is_watertight")
+    return not is_self_intersecting(wp.Mesh(points=vertices, indices=faces))
 
 
 def face_watertight_mask(
