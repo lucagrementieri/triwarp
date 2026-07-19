@@ -46,21 +46,6 @@ def sample_surface(
 
 
 @wp.kernel
-def signed_tet_volumes(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    center: wp.vec3,
-    out_volumes: wp.array[wp.float32],
-) -> None:
-    fi = int(wp.tid())
-    p0, p1, p2 = face_vertices(vertices, faces, wp.int32(fi))
-    v0 = p0 - center
-    v1 = p1 - center
-    v2 = p2 - center
-    out_volumes[fi] = wp.dot(v0, wp.cross(v1, v2)) / 6.0
-
-
-@wp.kernel
 def sample_volume_tet(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],

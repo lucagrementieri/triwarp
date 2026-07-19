@@ -30,6 +30,20 @@ def face_vertices_vec3d(
     return to_vec3d(v0), to_vec3d(v1), to_vec3d(v2)
 
 
+@wp.kernel
+def signed_tet_volumes(
+    vertices: wp.array[Any],
+    faces: wp.array[wp.int32],
+    center: Any,
+    out_volumes: wp.array[wp.Float],
+) -> None:
+    # Signed volume of the tetrahedron (center, v0, v1, v2); the sum over faces is the mesh volume.
+    fi = int(wp.tid())
+    p0, p1, p2 = face_vertices(vertices, faces, wp.int32(fi))
+    d = wp.dot(p0 - center, wp.cross(p1 - center, p2 - center))
+    out_volumes[fi] = d / type(d)(6.0)
+
+
 @wp.func
 def triangle_cross(vertices: wp.array[wp.vec3], face: wp.array[wp.int32]) -> wp.vec3:
     v0 = vertices[face[0]]

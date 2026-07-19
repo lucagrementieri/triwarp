@@ -9,6 +9,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.array import init_range
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import selection as kernel_selection
 
 
@@ -106,10 +107,10 @@ def shrink_vertex_mask(
     if unique_edges is None:
         unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n)
     complement = wp.empty(n, dtype=wp.bool, device=device)
-    wp.map(kernel_selection.mask_not, mask, out=complement)
+    wp.map(kernel_array.mask_not, mask, out=complement)
     dilated = expand_vertex_mask(faces, complement, hops, unique_edges)
     out = wp.empty(n, dtype=wp.bool, device=device)
-    wp.map(kernel_selection.mask_not, dilated, out=out)
+    wp.map(kernel_array.mask_not, dilated, out=out)
     return out
 
 

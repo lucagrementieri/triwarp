@@ -17,8 +17,8 @@ import triwarp.typing as twt
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import edges as kernel_edges
 from triwarp.kernels import repair as kernel_repair
-from triwarp.kernels import sample as kernel_sample
 from triwarp.kernels import scatter as kernel_scatter
+from triwarp.kernels import triangles as kernel_triangles
 from triwarp.unique import hash_vector_rows, unique_1d, unique_faces, unique_rows
 
 
@@ -470,7 +470,7 @@ def make_volume(
     out_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
     signed_volumes = wp.empty(n_faces, dtype=wp.float32, device=device)
     wp.launch(
-        kernel_sample.signed_tet_volumes,
+        kernel_triangles.signed_tet_volumes,
         dim=n_faces,
         inputs=[vertices, faces, wp.vec3(0.0, 0.0, 0.0), signed_volumes],
         device=device,

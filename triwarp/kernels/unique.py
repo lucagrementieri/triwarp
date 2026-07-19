@@ -116,6 +116,14 @@ def pack_vec3(vector: wp.vec3) -> wp.uint64:
     )
 
 
+@wp.func
+def pack_edge_key(u: wp.int32, v: wp.int32, base: wp.uint64) -> wp.uint64:
+    """Key of undirected edge (u, v); matches ``pack_indices`` for a sorted 2-index row."""
+    lo = wp.uint64(wp.uint32(wp.min(u, v)))
+    hi = wp.uint64(wp.uint32(wp.max(u, v)))
+    return lo + hi * base
+
+
 @wp.kernel
 def pack_indices(
     indices: wp.array2d[wp.int32], max_index: wp.uint64, out_packed: wp.array[wp.uint64]

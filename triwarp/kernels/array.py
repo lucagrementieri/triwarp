@@ -108,6 +108,11 @@ def to_vec3(v: wp.vec3d) -> wp.vec3:
 
 
 @wp.func
+def to_vec2d(v: wp.vec2) -> wp.vec2d:
+    return wp.vec2d(wp.float64(v[0]), wp.float64(v[1]))
+
+
+@wp.func
 def square_scalar(value: wp.Scalar) -> wp.Scalar:
     return value * value
 
@@ -194,6 +199,16 @@ def isin_lookup_sorted(
 def vector_angle_vec(a: wp.vec3, b: wp.vec3) -> wp.float32:
     dot = wp.clamp(wp.dot(a, b), -1.0, 1.0)
     return wp.abs(wp.acos(dot))
+
+
+@wp.func
+def mask_not(a: wp.bool) -> wp.bool:
+    return not a
+
+
+@wp.func
+def mask_and_not(a: wp.bool, b: wp.bool) -> wp.bool:
+    return a and not b
 
 
 @wp.func

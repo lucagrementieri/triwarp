@@ -55,8 +55,8 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import scatter as kernel_scatter
-from triwarp.kernels import selection as kernel_selection
 from triwarp.kernels import stitching as kernel_stitching
 
 
@@ -1222,7 +1222,7 @@ def _finish_nicely(
     new_verts = wp.array(new_verts_np, dtype=wp.bool, device=device)
     bd_mask = _boundary_verts_mask(vertices, faces)
     free = wp.empty(n, dtype=wp.bool, device=device)
-    wp.map(kernel_selection.mask_and_not, new_verts, bd_mask, out=free)
+    wp.map(kernel_array.mask_and_not, new_verts, bd_mask, out=free)
 
     vertices = tw.smoothing.position_verts_smoothly_sharp_boundary(vertices, faces, free)
     if smooth_boundary:
@@ -1246,7 +1246,7 @@ def _finish_nicely(
         if bool(incident.numpy().any()):
             bd_mask = _boundary_verts_mask(vertices, faces)
             free2 = wp.empty(n, dtype=wp.bool, device=device)
-            wp.map(kernel_selection.mask_and_not, incident, bd_mask, out=free2)
+            wp.map(kernel_array.mask_and_not, incident, bd_mask, out=free2)
             vertices = tw.smoothing.position_verts_smoothly_sharp_boundary(vertices, faces, free2)
             vertices = tw.smoothing.position_verts_smoothly(vertices, faces, free2, edge_weights)
 

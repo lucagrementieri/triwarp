@@ -13,6 +13,7 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels import laplacian as kernel_laplacian
 from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import smoothing as kernel_smoothing
+from triwarp.kernels import triangles as kernel_triangles
 from triwarp.triangles import face_normals_and_areas
 from triwarp.vertices import mean_vertex_normals
 
@@ -46,10 +47,11 @@ def _mesh_volume(positions: wp.array[wp.vec3d], faces: wp.array[wp.int32]) -> fl
     n_faces = int(faces.shape[0]) // 3
     device = positions.device
     volumes = wp.empty(n_faces, dtype=wp.float64, device=device)
+    origin = wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
     wp.launch(
-        kernel_smoothing.signed_tet_volumes,
+        kernel_triangles.signed_tet_volumes,
         dim=n_faces,
-        inputs=[positions, faces, volumes],
+        inputs=[positions, faces, origin, volumes],
         device=device,
     )
     # Device-side tiled sum: only the 8-byte total crosses to the host, not the whole array.

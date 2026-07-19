@@ -16,16 +16,6 @@ def dilate_vertex_mask(
         out_mask[a] = wp.bool(True)
 
 
-@wp.func
-def mask_not(a: wp.bool) -> wp.bool:
-    return not a
-
-
-@wp.func
-def mask_and_not(a: wp.bool, b: wp.bool) -> wp.bool:
-    return a and not b
-
-
 @wp.kernel
 def edge_region_counts(
     inverse: wp.array[wp.int32],

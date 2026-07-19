@@ -15,6 +15,7 @@ from triwarp.array import append, flatnonzero, gather, init_sort_pair_indices
 from triwarp.constants import INT32_MAX
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import sample as kernel_sample
+from triwarp.kernels import triangles as kernel_triangles
 from triwarp.kernels.algorithms import blue_noise as kernel_blue_noise
 from triwarp.proximity import query_hashgrid_ball_with_offsets
 from triwarp.triangles import centroid, face_normals_and_areas
@@ -757,7 +758,7 @@ def sample_volume(
 
     signed_vols = wp.empty(n_faces, dtype=wp.float32, device=vertices.device)
     wp.launch(
-        kernel_sample.signed_tet_volumes,
+        kernel_triangles.signed_tet_volumes,
         dim=n_faces,
         inputs=[vertices, faces, center, signed_vols],
         device=vertices.device,

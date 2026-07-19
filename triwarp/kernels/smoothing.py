@@ -1,7 +1,6 @@
 import warp as wp
 
 from triwarp.kernels.array import to_vec3d
-from triwarp.kernels.triangles import face_vertices
 
 # ---------------------------------------------------------------------------
 # Region Dirichlet / least-squares smoothing (positionVertsSmoothly, MRLaplacian.cpp)
@@ -260,16 +259,6 @@ def extract_components(v: wp.vec3d) -> tuple[wp.float64, wp.float64, wp.float64]
 @wp.func
 def combine_components(x: wp.float64, y: wp.float64, z: wp.float64) -> wp.vec3d:
     return wp.vec3d(x, y, z)
-
-
-@wp.kernel
-def signed_tet_volumes(
-    vertices: wp.array[wp.vec3d], faces: wp.array[wp.int32], out_volumes: wp.array[wp.float64]
-) -> None:
-    # Signed volume of the tetrahedron (origin, v0, v1, v2); the sum over faces is the mesh volume.
-    f = int(wp.tid())
-    v0, v1, v2 = face_vertices(vertices, faces, wp.int32(f))
-    out_volumes[f] = wp.dot(v0, wp.cross(v1, v2)) / wp.float64(6.0)
 
 
 @wp.kernel

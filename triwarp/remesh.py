@@ -24,7 +24,6 @@ _LaunchCandidates = Callable[
         twt.Array2dInt32,  # adjacency_edges (m, 2)
         twt.Array2dInt32,  # unshared (m, 2)
         "wp.array[wp.uint64]",  # sorted edge keys
-        int,  # number of keys
         "wp.uint64",  # key base (n_vertices)
         "wp.array[wp.bool]",  # out_flip (m,)
         twt.Array2dInt32,  # out_quad (m, 4)
@@ -73,7 +72,6 @@ def _flip_interior_edges(
             adjacency_edges,
             unshared,
             sorted_keys,
-            n_rows,
             wp.uint64(n_vertices),
             out_flip,
             out_quad,
@@ -195,9 +193,7 @@ def flip_to_delaunay(
     mdsq = wp.float32(max_deviation * max_deviation if max_deviation is not None else 3.0e38)
     car = wp.float32(critical_aspect_ratio)
 
-    def launch(
-        adjacency, adjacency_edges, unshared, sorted_keys, n_keys, key_base, out_flip, out_quad
-    ):
+    def launch(adjacency, adjacency_edges, unshared, sorted_keys, key_base, out_flip, out_quad):
         wp.launch(
             kernel_remesh.delone_flip_candidates,
             dim=int(adjacency.shape[0]),
@@ -209,7 +205,6 @@ def flip_to_delaunay(
                 unshared,
                 region_flags,
                 sorted_keys,
-                wp.int32(n_keys),
                 key_base,
                 mac,
                 mdsq,
@@ -269,14 +264,10 @@ def subdivide(
         device=device,
     )
 
-    # Build (n_faces, 3) array of midpoint vertex indices
-    mid_idx = twt.empty_int32_2d((n_faces, 3), device=device)
-    wp.launch(
-        kernel_remesh.build_mid_idx,
-        dim=n_faces,
-        inputs=[inverse, wp.int32(n_vertices), mid_idx],
-        device=device,
-    )
+    # Build (n_faces, 3) array of midpoint vertex indices: unique-edge index + vertex offset.
+    mid_idx_flat = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
+    wp.map(wp.add, inverse, wp.int32(n_vertices), out=mid_idx_flat)
+    mid_idx = mid_idx_flat.reshape((n_faces, 3))
 
     # Emit 4 new triangles per face, shape (n_faces*12,)
     out_new_faces = wp.empty(n_faces * 12, dtype=wp.int32, device=device)
@@ -427,13 +418,7 @@ def subdivide_to_size(
         # Append midpoints so the new indices resolve during face emission.
         current_vertices, _ = tw.array.pack_1d_arrays([current_vertices, new_mid])
 
-        face_mid = twt.empty_int32_2d((n_faces, 3), device=device)
-        wp.launch(
-            kernel_remesh.build_face_mid,
-            dim=n_faces,
-            inputs=[inverse, midpoint_idx, face_mid],
-            device=device,
-        )
+        face_mid = tw.array.gather(midpoint_idx, inverse).reshape((n_faces, 3))
 
         # Emit up to four triangles per face into fixed slots, then compact.
         out_faces = twt.empty_int32_2d((n_faces * 4, 3), device=device)
@@ -478,9 +463,7 @@ def _flip_region_faces(
     mdsq = wp.float32(max_deviation * max_deviation if max_deviation is not None else 3.0e38)
     car = wp.float32(1000.0)
 
-    def launch(
-        adjacency, adjacency_edges, unshared, sorted_keys, n_keys, key_base, out_flip, out_quad
-    ):
+    def launch(adjacency, adjacency_edges, unshared, sorted_keys, key_base, out_flip, out_quad):
         wp.launch(
             kernel_remesh.delone_flip_candidates,
             dim=int(adjacency.shape[0]),
@@ -492,7 +475,6 @@ def _flip_region_faces(
                 unshared,
                 region_flags,
                 sorted_keys,
-                wp.int32(n_keys),
                 key_base,
                 mac,
                 mdsq,
@@ -654,13 +636,7 @@ def subdivide_region_to_size(
         )
         current_vertices, _ = tw.array.pack_1d_arrays([current_vertices, new_mid])
 
-        face_mid = twt.empty_int32_2d((n_faces, 3), device=device)
-        wp.launch(
-            kernel_remesh.build_face_mid,
-            dim=n_faces,
-            inputs=[inverse, midpoint_idx, face_mid],
-            device=device,
-        )
+        face_mid = tw.array.gather(midpoint_idx, inverse).reshape((n_faces, 3))
         out_faces = twt.empty_int32_2d((n_faces * 4, 3), device=device)
         out_valid = wp.empty(n_faces * 4, dtype=wp.bool, device=device)
         out_slot_index = wp.empty(n_faces * 4, dtype=wp.int32, device=device)

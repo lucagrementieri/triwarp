@@ -1,6 +1,7 @@
 import warp as wp
 
-from triwarp.kernels.unique import hash_slot
+from triwarp.kernels.array import binary_search_sorted_contains, to_vec2d, to_vec3d
+from triwarp.kernels.unique import hash_slot, pack_edge_key
 
 # Delaunay / Delone edge-flip constants (ported from MRMeshDelone.cpp). The flip predicate
 # runs in float64: MeshLib deliberately widens to double because circumcircle diameters of
@@ -31,14 +32,16 @@ def compute_midpoints(
     out_midpoints[k] = edge_midpoint(vertices, unique_edges, wp.int32(k))
 
 
-@wp.kernel
-def build_mid_idx(
-    inverse: wp.array[wp.int32], vertex_offset: wp.int32, out_mid_idx: wp.array2d[wp.int32]
-) -> None:
-    f = int(wp.tid())
-    out_mid_idx[f, 0] = inverse[f * 3 + 0] + vertex_offset
-    out_mid_idx[f, 1] = inverse[f * 3 + 1] + vertex_offset
-    out_mid_idx[f, 2] = inverse[f * 3 + 2] + vertex_offset
+@wp.func
+def split_face_four(
+    fv: wp.vec3i, mv: wp.vec3i
+) -> tuple[wp.vec3i, wp.vec3i, wp.vec3i, wp.vec3i]:
+    # 1 -> 4 loop-subdivision template: three corner triangles, then the central triangle.
+    t0 = wp.vec3i(fv[0], mv[0], mv[2])
+    t1 = wp.vec3i(mv[0], fv[1], mv[1])
+    t2 = wp.vec3i(mv[2], mv[1], fv[2])
+    t3 = wp.vec3i(mv[0], mv[1], mv[2])
+    return t0, t1, t2, t3
 
 
 @wp.kernel
@@ -46,29 +49,22 @@ def subdivide_faces(
     faces: wp.array[wp.int32], mid_idx: wp.array2d[wp.int32], out_faces: wp.array[wp.int32]
 ) -> None:
     f = int(wp.tid())
-    v0 = faces[f * 3 + 0]
-    v1 = faces[f * 3 + 1]
-    v2 = faces[f * 3 + 2]
-    m0 = mid_idx[f, 0]
-    m1 = mid_idx[f, 1]
-    m2 = mid_idx[f, 2]
+    fv = wp.vec3i(faces[f * 3 + 0], faces[f * 3 + 1], faces[f * 3 + 2])
+    mv = wp.vec3i(mid_idx[f, 0], mid_idx[f, 1], mid_idx[f, 2])
+    t0, t1, t2, t3 = split_face_four(fv, mv)
     base = f * 12
-    # (v0, m0, m2)
-    out_faces[base + 0] = v0
-    out_faces[base + 1] = m0
-    out_faces[base + 2] = m2
-    # (m0, v1, m1)
-    out_faces[base + 3] = m0
-    out_faces[base + 4] = v1
-    out_faces[base + 5] = m1
-    # (m2, m1, v2)
-    out_faces[base + 6] = m2
-    out_faces[base + 7] = m1
-    out_faces[base + 8] = v2
-    # (m0, m1, m2)
-    out_faces[base + 9] = m0
-    out_faces[base + 10] = m1
-    out_faces[base + 11] = m2
+    out_faces[base + 0] = t0[0]
+    out_faces[base + 1] = t0[1]
+    out_faces[base + 2] = t0[2]
+    out_faces[base + 3] = t1[0]
+    out_faces[base + 4] = t1[1]
+    out_faces[base + 5] = t1[2]
+    out_faces[base + 6] = t2[0]
+    out_faces[base + 7] = t2[1]
+    out_faces[base + 8] = t2[2]
+    out_faces[base + 9] = t3[0]
+    out_faces[base + 10] = t3[1]
+    out_faces[base + 11] = t3[2]
 
 
 @wp.kernel
@@ -96,18 +92,6 @@ def fill_edge_midpoints(
     e = int(wp.tid())
     if long_mask[e]:
         out_mid[offsets[e]] = edge_midpoint(vertices, unique_edges, wp.int32(e))
-
-
-@wp.kernel
-def build_face_mid(
-    inverse: wp.array[wp.int32],
-    midpoint_idx: wp.array[wp.int32],
-    out_face_mid: wp.array2d[wp.int32],
-) -> None:
-    f = int(wp.tid())
-    out_face_mid[f, 0] = midpoint_idx[inverse[f * 3 + 0]]
-    out_face_mid[f, 1] = midpoint_idx[inverse[f * 3 + 1]]
-    out_face_mid[f, 2] = midpoint_idx[inverse[f * 3 + 2]]
 
 
 @wp.func
@@ -212,13 +196,7 @@ def emit_size_faces(
         n2 = True
     else:
         # Three split edges: the regular 1 -> 4 split (matches subdivide).
-        m0 = mv[0]
-        m1 = mv[1]
-        m2 = mv[2]
-        t0 = wp.vec3i(fv[0], m0, m2)
-        t1 = wp.vec3i(m0, fv[1], m1)
-        t2 = wp.vec3i(m2, m1, fv[2])
-        t3 = wp.vec3i(m0, m1, m2)
+        t0, t1, t2, t3 = split_face_four(fv, mv)
         n0 = True
         n1 = True
         n2 = True
@@ -259,16 +237,6 @@ def long_region_edge(length: wp.float32, max_edge: wp.float32, in_region: wp.boo
 # Float64 Delone edge-flip predicate (ported from MRMeshDelone.cpp / MRTriMath.h /
 # MRReducePath.cpp). Computed in double precision, matching MeshLib.
 # ---------------------------------------------------------------------------
-
-
-@wp.func
-def _to_vec3d(v: wp.vec3) -> wp.vec3d:
-    return wp.vec3d(wp.float64(v[0]), wp.float64(v[1]), wp.float64(v[2]))
-
-
-@wp.func
-def _to_vec2d(v: wp.vec2) -> wp.vec2d:
-    return wp.vec2d(wp.float64(v[0]), wp.float64(v[1]))
 
 
 @wp.func
@@ -487,29 +455,6 @@ def _incircle_d(a: wp.vec2d, b: wp.vec2d, c: wp.vec2d, d: wp.vec2d) -> wp.float6
 
 
 @wp.func
-def _edge_key(u: wp.int32, v: wp.int32, base: wp.uint64) -> wp.uint64:
-    # Matches kernels.unique.pack_indices for a sorted 2-index row: min + max * base.
-    lo = wp.uint64(wp.uint32(wp.min(u, v)))
-    hi = wp.uint64(wp.uint32(wp.max(u, v)))
-    return lo + hi * base
-
-
-@wp.func
-def _edge_exists(sorted_keys: wp.array[wp.uint64], n: wp.int32, key: wp.uint64) -> wp.bool:
-    lo = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
-    hi = int(n)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if sorted_keys[mid] < key:
-            lo = mid + 1
-        else:
-            hi = mid
-    if lo < n:
-        return sorted_keys[lo] == key
-    return False
-
-
-@wp.func
 def _resolve_flip_quad(
     faces: wp.array[wp.int32], f0: wp.int32, u: wp.int32, v: wp.int32, d0: wp.int32, d1: wp.int32
 ) -> wp.vec4i:
@@ -529,6 +474,38 @@ def _resolve_flip_quad(
     return wp.vec4i(a, d1, c, d0)
 
 
+@wp.func
+def _resolve_flip_quad_guarded(
+    faces: wp.array[wp.int32],
+    adjacency_edges: wp.array2d[wp.int32],
+    unshared: wp.array2d[wp.int32],
+    sorted_edge_keys: wp.array[wp.uint64],
+    key_base: wp.uint64,
+    k: wp.int32,
+    f0: wp.int32,
+    out_quad: wp.array2d[wp.int32],
+) -> wp.vec4i:
+    # Shared flip-candidate preamble: reject missing apexes, inconsistent winding, b == d, and
+    # flips that would duplicate an existing edge. Returns (a, b, c, d) with a < 0 when not
+    # flippable; out_quad[k] is written only for valid quads (claim/commit read quad[k] only
+    # when the caller has set out_flip[k], which stays False for rejected/non-flipped edges).
+    invalid = wp.vec4i(-1, -1, -1, -1)
+    d0 = unshared[k, 0]
+    d1 = unshared[k, 1]
+    if d0 < 0 or d1 < 0:
+        return invalid
+    quad = _resolve_flip_quad(faces, f0, adjacency_edges[k, 0], adjacency_edges[k, 1], d0, d1)
+    if quad[0] < 0 or quad[1] == quad[3]:
+        return invalid
+    if binary_search_sorted_contains(sorted_edge_keys, pack_edge_key(quad[1], quad[3], key_base)):
+        return invalid
+    out_quad[k, 0] = quad[0]
+    out_quad[k, 1] = quad[1]
+    out_quad[k, 2] = quad[2]
+    out_quad[k, 3] = quad[3]
+    return quad
+
+
 @wp.kernel
 def delone_flip_candidates(
     vertices: wp.array[wp.vec3],
@@ -538,7 +515,6 @@ def delone_flip_candidates(
     unshared: wp.array2d[wp.int32],
     region_flags: wp.array[wp.int32],
     sorted_edge_keys: wp.array[wp.uint64],
-    n_keys: wp.int32,
     key_base: wp.uint64,
     max_angle_change: wp.float32,
     max_deviation_sq: wp.float32,
@@ -552,31 +528,19 @@ def delone_flip_candidates(
     f1 = adjacency[k, 1]
     if region_flags[f0] == 0 or region_flags[f1] == 0:
         return
-    u = adjacency_edges[k, 0]
-    v = adjacency_edges[k, 1]
-    d0 = unshared[k, 0]
-    d1 = unshared[k, 1]
-    if d0 < 0 or d1 < 0:
-        return
-    quad = _resolve_flip_quad(faces, f0, u, v, d0, d1)
+    quad = _resolve_flip_quad_guarded(
+        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, wp.int32(k), f0, out_quad
+    )
     a = quad[0]
     b = quad[1]
     c = quad[2]
     d = quad[3]
     if a < 0:
         return
-    if b == d:
-        return
-    if _edge_exists(sorted_edge_keys, n_keys, _edge_key(b, d, key_base)):
-        return
-    out_quad[k, 0] = a
-    out_quad[k, 1] = b
-    out_quad[k, 2] = c
-    out_quad[k, 3] = d
-    ap = _to_vec3d(vertices[a])
-    bp = _to_vec3d(vertices[b])
-    cp = _to_vec3d(vertices[c])
-    dp = _to_vec3d(vertices[d])
+    ap = to_vec3d(vertices[a])
+    bp = to_vec3d(vertices[b])
+    cp = to_vec3d(vertices[c])
+    dp = to_vec3d(vertices[d])
     if max_deviation_sq < F32_LARGE:
         if _segments_dist_sq_d(ap, cp, bp, dp) > wp.float64(max_deviation_sq):
             return
@@ -600,7 +564,6 @@ def incircle_flip_candidates(
     adjacency_edges: wp.array2d[wp.int32],
     unshared: wp.array2d[wp.int32],
     sorted_edge_keys: wp.array[wp.uint64],
-    n_keys: wp.int32,
     key_base: wp.uint64,
     out_flip: wp.array[wp.bool],
     out_quad: wp.array2d[wp.int32],
@@ -608,32 +571,22 @@ def incircle_flip_candidates(
     k = int(wp.tid())
     out_flip[k] = wp.bool(False)
     f0 = adjacency[k, 0]
-    u = adjacency_edges[k, 0]
-    v = adjacency_edges[k, 1]
-    d0 = unshared[k, 0]
-    d1 = unshared[k, 1]
-    if d0 < 0 or d1 < 0:
-        return
-    quad = _resolve_flip_quad(faces, f0, u, v, d0, d1)
+    quad = _resolve_flip_quad_guarded(
+        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, wp.int32(k), f0, out_quad
+    )
     a = quad[0]
     b = quad[1]
     c = quad[2]
     d = quad[3]
-    if a < 0 or b == d:
+    if a < 0:
         return
-    if _edge_exists(sorted_edge_keys, n_keys, _edge_key(b, d, key_base)):
-        return
-    ap = _to_vec2d(points[a])
-    bp = _to_vec2d(points[b])
-    cp = _to_vec2d(points[c])
-    dp = _to_vec2d(points[d])
+    ap = to_vec2d(points[a])
+    bp = to_vec2d(points[b])
+    cp = to_vec2d(points[c])
+    dp = to_vec2d(points[d])
     # Post-flip triangles (a, b, d) and (d, b, c) must both be positively oriented (convex quad).
     if _orient2d_d(ap, bp, dp) <= wp.float64(0.0) or _orient2d_d(dp, bp, cp) <= wp.float64(0.0):
         return
-    out_quad[k, 0] = a
-    out_quad[k, 1] = b
-    out_quad[k, 2] = c
-    out_quad[k, 3] = d
     # f0 = (a, c, d) is CCW; flip iff the opposite apex b lies inside its circumcircle.
     out_flip[k] = _incircle_d(ap, cp, dp, bp) > wp.float64(0.0)
 
@@ -653,7 +606,7 @@ def claim_flips(
         return
     wp.atomic_min(out_face_claim, adjacency[k, 0], k)
     wp.atomic_min(out_face_claim, adjacency[k, 1], k)
-    slot = hash_slot(_edge_key(quad[k, 1], quad[k, 3], key_base), edge_claim_mask)
+    slot = hash_slot(pack_edge_key(quad[k, 1], quad[k, 3], key_base), edge_claim_mask)
     wp.atomic_min(out_edge_claim, slot, k)
 
 
@@ -676,7 +629,7 @@ def commit_flips(
     f1 = adjacency[k, 1]
     if face_claim[f0] != k or face_claim[f1] != k:
         return
-    slot = hash_slot(_edge_key(quad[k, 1], quad[k, 3], key_base), edge_claim_mask)
+    slot = hash_slot(pack_edge_key(quad[k, 1], quad[k, 3], key_base), edge_claim_mask)
     if edge_claim[slot] != k:
         return
     a = quad[k, 0]
