@@ -199,12 +199,15 @@ def fast_convex_set_mask(
     the max and min per direction covers all ``2 * n_directions`` antipodal
     orientations at half the dot-product cost of sampling the full sphere.
 
-    Marking every support extremum yields an approximation of the hull-vertex set
-    with no false positives: every marked point is a true hull vertex, and coverage
-    of the full vertex set improves as ``n_directions`` grows. The extrema are
-    computed with a tiled block reduction (``wp.tile`` /
-    [`TILE_1D`][triwarp.constants.TILE_1D]-wide ``wp.tile_max`` and ``wp.tile_min``),
-    then a second pass marks the maximizers and minimizers.
+    Marking every support extremum yields an inner approximation of the hull-vertex
+    set: every marked point lies on the convex-hull boundary (within the tolerance
+    slack), though a support tie on a hull edge or facet can mark a boundary point
+    that is not itself a hull vertex. At most roughly ``2 * n_directions`` points
+    (plus ties) can be marked, and a hull vertex is recovered only when a sampled
+    direction falls inside its normal cone, so vertices in nearly-flat regions need
+    more directions. The extrema are computed with a tiled block reduction
+    (``wp.tile`` / [`TILE_1D`][triwarp.constants.TILE_1D]-wide ``wp.tile_max`` and
+    ``wp.tile_min``), then a second pass marks the maximizers and minimizers.
 
     Parameters
     ----------
@@ -215,10 +218,11 @@ def fast_convex_set_mask(
         orientations, so the effective coverage is ``2 * n_directions``. Larger
         values recover more of the hull vertices.
     tolerance
-        Absolute slack on the support test; a point is marked when its dot product
-        with a direction is within ``tolerance`` of that direction's maximum or
-        minimum. This captures coplanar ties and floating-point jitter. For
-        widely-scaled data, scale this with the coordinate magnitude.
+        Relative slack on the support test; a point is marked when its dot product
+        with a direction is within ``tolerance * (max - min)`` of that direction's
+        maximum or minimum, where ``max - min`` is the cloud's support extent along
+        the direction. Scaling the slack with the extent captures coplanar ties and
+        float32 roundoff at any coordinate scale.
 
     Returns
     -------
@@ -281,7 +285,7 @@ def fast_convex_set(
         Number of Fibonacci hemisphere directions (see
         [`fast_convex_set_mask`][triwarp.convex.fast_convex_set_mask]).
     tolerance
-        Absolute slack on the support test (see
+        Relative slack on the support test (see
         [`fast_convex_set_mask`][triwarp.convex.fast_convex_set_mask]).
 
     Returns

@@ -78,5 +78,8 @@ def mark_hull_support(
         # A hemisphere direction n covers both +n (max, supports the vertex farthest
         # along n) and -n (min, supports the vertex farthest along -n).
         distance = wp.dot(directions[int(k)], points[idx])
-        if distance >= best_max[int(k)] - tolerance or distance <= best_min[int(k)] + tolerance:
+        # Slack scales with the per-direction support extent so the test is
+        # scale-invariant and stays above the float32 dot-product noise floor.
+        slack = tolerance * (best_max[int(k)] - best_min[int(k)])
+        if distance >= best_max[int(k)] - slack or distance <= best_min[int(k)] + slack:
             out_mask[idx] = True

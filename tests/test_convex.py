@@ -184,6 +184,23 @@ def test_fast_convex_set_mask_sound(device: str) -> None:
     assert set(selected.tolist()) <= set(hull_scipy.vertices.tolist())
 
 
+def test_fast_convex_set_mask_scale_invariant(device: str) -> None:
+    rng = np.random.default_rng(7)
+    points_np = rng.standard_normal((500, 3)).astype(np.float64)
+    scaled_np = points_np * 1e4
+
+    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    scaled_wp = wp.array(np.ascontiguousarray(scaled_np), dtype=wp.vec3, device=device)
+
+    mask_wp = tw.convex.fast_convex_set_mask(points_wp, n_directions=256)
+    mask_scaled_wp = tw.convex.fast_convex_set_mask(scaled_wp, n_directions=256)
+    assert np.array_equal(mask_wp.numpy(), mask_scaled_wp.numpy())
+
+    hull_scipy = scipy.spatial.ConvexHull(scaled_np)
+    selected = np.flatnonzero(mask_scaled_wp.numpy())
+    assert set(selected.tolist()) <= set(hull_scipy.vertices.tolist())
+
+
 def test_fast_convex_set_recall(device: str) -> None:
     rng = np.random.default_rng(2)
     points_np = rng.standard_normal((200, 3)).astype(np.float64)
