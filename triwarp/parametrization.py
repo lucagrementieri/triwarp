@@ -8,7 +8,7 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_cuda
 from triwarp.kernels import parametrization as kernel_parametrization
-from triwarp.laplacian import cotmatrix, mass_matrix_entries, uniform_laplacian
+from triwarp.laplacian import cotmatrix, cotmatrix_entries, mass_matrix_entries, uniform_laplacian
 
 _CG_TOLERANCE = 1e-8
 
@@ -239,18 +239,8 @@ def _min_quad_with_fixed_columns(
     empty solution without a solve (and without requiring CUDA), leaving reconstruction to the
     caller's scatter kernel.
     """
-    n_dofs = int(fixed_mask.shape[0])
     n_rhs = int(fixed_values.shape[0])
-
-    # Compact free remap: exclusive scan of the free indicator gives each free DOF its index in the
-    # reduced system; the inclusive scan's last entry is the free count.
-    flags = wp.empty(n_dofs, dtype=wp.int32, device=device)
-    wp.map(kernel_parametrization.interior_flag, fixed_mask, out=flags)
-    free_map = wp.empty(n_dofs, dtype=wp.int32, device=device)
-    inclusive = wp.empty(n_dofs, dtype=wp.int32, device=device)
-    wp.utils.array_scan(flags, out_array=free_map, inclusive=False)
-    wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
-    n_free = int(inclusive.numpy()[-1])
+    free_map, n_free = _free_partition(fixed_mask, device)
 
     sol = wp.zeros((n_rhs, n_free), dtype=wp.float64, device=device)
     if n_free == 0:
@@ -259,7 +249,56 @@ def _min_quad_with_fixed_columns(
 
     require_cuda(device, "harmonic / tutte / lscm")
 
-    # Assemble the free-free block Q_uu and the right-hand sides -Q_ub bc from Q's CSR.
+    q_uu, rhs = _assemble_interior_system(q, fixed_mask, free_map, fixed_values, n_free, device)
+
+    # One diagonal preconditioner shared by every symmetric-PD column solve. Row views of the
+    # row-major (n_rhs, n_free) buffers are contiguous, so they serve directly as CG vectors.
+    preconditioner = wpl.preconditioner(q_uu, "diag")
+    for c in range(n_rhs):
+        wpl.cg(q_uu, rhs[c], sol[c], tol=_CG_TOLERANCE, maxiter=10 * n_free, M=preconditioner)
+    return twt.as_array2d_float(sol, dtype=wp.float64), free_map, n_free
+
+
+def _free_partition(
+    fixed_mask: wp.array[wp.bool], device: wp.DeviceLike
+) -> tuple[wp.array[wp.int32], int]:
+    """
+    Compact free-DOF remap shared by the fixed-value solver and ``arap``.
+
+    Exclusive-scans the free indicator (``1`` for free / interior DOFs, ``0`` for fixed ones) so
+    each free DOF gets its index in the reduced system; the inclusive scan's last entry is the free
+    count. Returns ``(free_map, n_free)`` where ``free_map[i]`` is meaningful only for free ``i``.
+    """
+    n_dofs = int(fixed_mask.shape[0])
+    flags = wp.empty(n_dofs, dtype=wp.int32, device=device)
+    wp.map(kernel_parametrization.interior_flag, fixed_mask, out=flags)
+    free_map = wp.empty(n_dofs, dtype=wp.int32, device=device)
+    inclusive = wp.empty(n_dofs, dtype=wp.int32, device=device)
+    wp.utils.array_scan(flags, out_array=free_map, inclusive=False)
+    wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
+    n_free = int(inclusive.numpy()[-1])
+    return free_map, n_free
+
+
+def _assemble_interior_system(
+    q: wps.BsrMatrix[wp.float64],
+    fixed_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    fixed_values: twt.Array2dFloat,
+    n_free: int,
+    device: wp.DeviceLike,
+) -> tuple[wps.BsrMatrix[wp.float64], twt.Array2dFloat]:
+    """
+    Assemble the interior operator ``Q_uu`` and the constant right-hand side ``-Q_ub bc``.
+
+    Launches [`interior_system_triplets`][triwarp.kernels.parametrization.interior_system_triplets]
+    over the ``n_dofs`` rows of ``Q`` (positive semi-definite), emitting the free-free COO block and
+    the ``n_rhs`` fixed-column contributions, then builds ``Q_uu`` in a single
+    ``bsr_from_triplets``. Shared by the fixed-value solver and ``arap`` (whose per-iteration
+    rotation term is added to the returned constant RHS). ``rhs`` is ``(n_rhs, n_free)``.
+    """
+    n_dofs = int(fixed_mask.shape[0])
+    n_rhs = int(fixed_values.shape[0])
     nnz = int(q.nnz)
     out_rows = wp.zeros(nnz, dtype=wp.int32, device=device)
     out_cols = wp.zeros(nnz, dtype=wp.int32, device=device)
@@ -285,13 +324,7 @@ def _min_quad_with_fixed_columns(
     q_uu = wps.bsr_from_triplets(
         n_free, n_free, out_rows, out_cols, out_vals, prune_numerical_zeros=False
     )
-
-    # One diagonal preconditioner shared by every symmetric-PD column solve. Row views of the
-    # row-major (n_rhs, n_free) buffers are contiguous, so they serve directly as CG vectors.
-    preconditioner = wpl.preconditioner(q_uu, "diag")
-    for c in range(n_rhs):
-        wpl.cg(q_uu, rhs[c], sol[c], tol=_CG_TOLERANCE, maxiter=10 * n_free, M=preconditioner)
-    return twt.as_array2d_float(sol, dtype=wp.float64), free_map, n_free
+    return q_uu, twt.as_array2d_float(rhs, dtype=wp.float64)
 
 
 def harmonic(
@@ -423,6 +456,215 @@ def tutte(
     return _solve_fixed_boundary(
         laplacian, None, k, n_vertices, boundary_indices, boundary_uv, device
     )
+
+
+def arap(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    fixed_indices: wp.array[wp.int32],
+    fixed_uv: wp.array[wp.vec2],
+    uv_init: wp.array[wp.vec2],
+    max_iterations: int = 10,
+) -> wp.array[wp.vec2]:
+    """
+    As-rigid-as-possible (ARAP) parametrization with fixed vertices (``igl::arap``, ``dim = 2``).
+
+    Minimizes the ARAP energy of the 2D parametrization by local/global alternation, starting from
+    ``uv_init`` and keeping ``fixed_indices`` pinned to ``fixed_uv`` at every iteration. The local
+    step fits, per triangle, the closest rotation between the isometrically flattened rest triangle
+    and its current UV image (closed-form 2D polar decomposition, reflections forbidden); the global
+    step solves the cotangent-Laplacian Poisson system ``(-L)_uu U_u = (K R)_u - (-L)_ub bc`` for
+    each UV column with conjugate gradient. A **CUDA device is required** whenever there are
+    interior vertices to solve for (``warp.optim.linear.cg`` returns NaN on the CPU in Warp
+    1.14-1.15).
+
+    A good ``uv_init`` matters: ARAP is non-convex, so feed a fold-free initial map such as
+    [`harmonic`][triwarp.parametrization.harmonic] or [`tutte`][triwarp.parametrization.tutte], with
+    the boundary placed by
+    [`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle]. Inspect the result
+    for inverted triangles with [`flipped_faces`][triwarp.parametrization.flipped_faces].
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    fixed_indices
+        ``wp.int32`` indices of the pinned (constrained) vertices — libigl's ``b``. At least one is
+        required whenever the mesh has interior vertices (the ARAP global system is otherwise a
+        singular, translation-invariant Poisson problem). Pinning the whole boundary loop reproduces
+        the classic fixed-boundary ARAP disk parametrization.
+    fixed_uv
+        ``(n_fixed,)`` target UV positions for ``fixed_indices``, in the same order — libigl's
+        ``bc``.
+    uv_init
+        ``(n_vertices,)`` initial UV coordinates (the warm start). Never mutated; the interior
+        values seed the first local step and the conjugate-gradient warm start, and the pinned rows
+        are
+        overwritten with ``fixed_uv`` before the first iteration.
+    max_iterations
+        Number of local/global iterations (``>= 1``). libigl defaults to ``10``.
+
+    Returns
+    -------
+    wp.array[wp.vec2]
+        ``(n_vertices,)`` UV coordinates on ``vertices.device``. Empty for an empty mesh. Rows at
+        ``fixed_indices`` equal ``fixed_uv`` exactly.
+
+    Raises
+    ------
+    ValueError
+        If ``max_iterations < 1``, or if there are interior vertices but ``fixed_indices`` is empty.
+    NotImplementedError
+        On a CPU device when an interior solve is required.
+
+    See Also
+    --------
+    [`harmonic`][triwarp.parametrization.harmonic]
+    [`tutte`][triwarp.parametrization.tutte]
+    [`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle]
+    [`flipped_faces`][triwarp.parametrization.flipped_faces]
+    [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries]
+
+    Notes
+    -----
+    Uses the *elements* ARAP energy (one rotation per triangle), libigl's default for the flat
+    ``dim = 2`` parametrization case; the covariance scatter is built per corner of the flattened
+    mesh, which is why the ``SPOKES`` / ``SPOKES_AND_RIMS`` (per-vertex) energies do not apply here.
+    The half-cotangent weights ``c_e`` come from
+    [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries] with no clamping (matching libigl),
+    and the closest 2D rotation is the closed form ``theta = atan2(S10 - S01, S00 + S11)`` of
+    ``igl::fit_rotations_planar`` (libigl's scale-invariant ``S /= max|S|`` normalization is
+    unnecessary for ``atan2`` and is skipped). The cotangent operator and the two conjugate-gradient
+    solves run in float64 for determinism while the UV field is stored ``float32`` between
+    iterations (module convention); the ~1e-7/iteration drift is well under the pinned-boundary
+    tolerance for the default iteration count.
+    """
+    if max_iterations < 1:
+        raise ValueError(f"arap max_iterations must be >= 1, got {max_iterations}.")
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    if n_vertices == 0:
+        return wp.empty(0, dtype=wp.vec2, device=device)
+    n_faces = int(faces.shape[0]) // 3
+
+    # Cotangents computed once and reused by both the Laplacian build and the rest-edge flattening;
+    # single native-float64 operator build for determinism (see issue_report.md / cotmatrix docs).
+    cot_entries = cotmatrix_entries(vertices, faces, dtype=wp.float64)
+    laplacian = cotmatrix(vertices, faces, cot_entries=cot_entries, dtype=wp.float64)
+
+    # Partition vertices into pinned (fixed) and interior (free). ``fixed_values`` is the
+    # (2, n_vertices) prescribed-UV buffer (row 0 = u, row 1 = v) shared with the assembly / scatter
+    # kernels; ``interior_map`` compacts free vertices into the reduced system.
+    n_fixed = int(fixed_indices.shape[0])
+    fixed_mask = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+    fixed_values = wp.zeros((2, n_vertices), dtype=wp.float64, device=device)
+    if n_fixed > 0:
+        wp.launch(
+            kernel_parametrization.scatter_boundary_mask,
+            dim=n_fixed,
+            inputs=[fixed_indices, fixed_mask],
+            device=device,
+        )
+        wp.launch(
+            kernel_parametrization.scatter_fixed_uv,
+            dim=n_fixed,
+            inputs=[fixed_indices, fixed_uv, fixed_values],
+            device=device,
+        )
+    fixed_values_2d = twt.as_array2d_float(fixed_values, dtype=wp.float64)
+    interior_map, n_interior = _free_partition(fixed_mask, device)
+
+    out_uv = wp.empty(n_vertices, dtype=wp.vec2, device=device)
+    if n_interior == 0:
+        # Every vertex pinned: the prescribed positions are the whole answer, no solve (CPU-safe).
+        empty_sol = wp.zeros((2, 0), dtype=wp.float64, device=device)
+        wp.launch(
+            kernel_parametrization.scatter_solution,
+            dim=n_vertices,
+            inputs=[fixed_mask, interior_map, empty_sol, fixed_values_2d, out_uv],
+            device=device,
+        )
+        return out_uv
+
+    # Interior vertices with nothing pinned leave the ARAP global system translation-invariant
+    # (singular). Raised up front, mirroring harmonic / tutte.
+    if n_fixed == 0:
+        raise ValueError(
+            "arap requires at least one fixed vertex when the mesh has interior vertices; the ARAP "
+            "global system is otherwise singular (translation invariant)."
+        )
+    require_cuda(device, "arap")
+
+    # Global-step operator: interior block of Q = -L and the constant boundary term -(-L)_ub bc.
+    # ``future work``: libigl also supports rotation groups ``G`` (shared rotations across grouped
+    # faces, replacing the per-face fit with a group-summed covariance) and ``with_dynamics`` (a
+    # mass-matrix + timestep term added to Q and the right-hand side); both are out of scope here.
+    neg_l = wps.bsr_axpy(x=laplacian, alpha=-1.0)
+    q_uu, rhs_const = _assemble_interior_system(
+        neg_l, fixed_mask, interior_map, fixed_values_2d, n_interior, device
+    )
+    preconditioner = wpl.preconditioner(q_uu, "diag")
+
+    # Weight-folded rest edges of the isometrically flattened triangles (internal buffer, plain
+    # wp.empty; kernels index it as wp.array2d per CLAUDE.md).
+    rest_edges = wp.empty((n_faces, 3), dtype=wp.vec2d, device=device)
+    wp.launch(
+        kernel_parametrization.arap_rest_edges,
+        dim=n_faces,
+        inputs=[vertices, faces, cot_entries, rest_edges],
+        device=device,
+    )
+
+    # Pre-loop buffers (no allocation inside the loop). ``sol`` (2, n_interior) holds the
+    # warm-started CG solution per column; seed it from ``uv_init`` interior values, then
+    # reconstruct the working ``out_uv`` with the constraints enforced for iteration 1.
+    sol = wp.zeros((2, n_interior), dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_parametrization.gather_interior_uv,
+        dim=n_vertices,
+        inputs=[fixed_mask, interior_map, uv_init, sol],
+        device=device,
+    )
+    wp.launch(
+        kernel_parametrization.scatter_solution,
+        dim=n_vertices,
+        inputs=[fixed_mask, interior_map, sol, fixed_values_2d, out_uv],
+        device=device,
+    )
+    rhs_rot_x = wp.zeros(n_vertices, dtype=wp.float64, device=device)
+    rhs_rot_y = wp.zeros(n_vertices, dtype=wp.float64, device=device)
+    b = wp.empty((2, n_interior), dtype=wp.float64, device=device)
+
+    for _ in range(max_iterations):
+        rhs_rot_x.zero_()
+        rhs_rot_y.zero_()
+        # Local step: fit per-face rotations from ``out_uv`` and scatter the rotation RHS.
+        wp.launch(
+            kernel_parametrization.arap_local_step,
+            dim=n_faces,
+            inputs=[faces, out_uv, rest_edges, rhs_rot_x, rhs_rot_y],
+            device=device,
+        )
+        # Global step RHS: constant boundary term + rotation term, restricted to interior rows.
+        wp.launch(
+            kernel_parametrization.arap_interior_rhs,
+            dim=n_vertices,
+            inputs=[fixed_mask, interior_map, rhs_const, rhs_rot_x, rhs_rot_y, b],
+            device=device,
+        )
+        # Two symmetric-PD column solves (warm-started from the previous ``sol``).
+        wpl.cg(q_uu, b[0], sol[0], tol=_CG_TOLERANCE, maxiter=10 * n_interior, M=preconditioner)
+        wpl.cg(q_uu, b[1], sol[1], tol=_CG_TOLERANCE, maxiter=10 * n_interior, M=preconditioner)
+        # Reconstruct the full UV field, re-enforcing the pinned constraints for the next iteration.
+        wp.launch(
+            kernel_parametrization.scatter_solution,
+            dim=n_vertices,
+            inputs=[fixed_mask, interior_map, sol, fixed_values_2d, out_uv],
+            device=device,
+        )
+    return out_uv
 
 
 def lscm(

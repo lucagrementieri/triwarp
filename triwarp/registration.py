@@ -269,6 +269,8 @@ def icp(
     transformed = wp.clone(current)
     cost = math.inf
 
+    mesh: wp.Mesh | None = None
+    query_max = wp.float32(0.0)
     if is_mesh:
         assert target_faces is not None
         require_nonempty_mesh(target_faces, "icp")
@@ -288,6 +290,7 @@ def icp(
     old_cost = math.inf
     for _ in range(max_iterations):
         if is_mesh:
+            assert mesh is not None
             distance = distance_mesh
             triangle_id = triangle_id_mesh
             wp.launch(
@@ -477,6 +480,8 @@ def icp_point_to_plane(
     cost = math.inf
 
     face_normals: wp.array[wp.vec3] | None = None
+    mesh: wp.Mesh | None = None
+    query_max = wp.float32(0.0)
     if is_mesh:
         assert target_faces is not None
         require_nonempty_mesh(target_faces, "icp_point_to_plane")
@@ -509,6 +514,7 @@ def icp_point_to_plane(
     for iteration in range(max_iterations):
         # --- correspondence + target normals ---
         if is_mesh:
+            assert mesh is not None
             assert face_normals is not None
             triangle_id = triangle_id_mesh
             wp.launch(

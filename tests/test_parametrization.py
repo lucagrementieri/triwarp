@@ -412,3 +412,162 @@ def test_harmonic_cpu_solve_raises():
     )
     with pytest.raises(NotImplementedError):
         tw.parametrization.harmonic(vertices, faces, boundary, boundary_uv)
+
+
+def _arap_igl(vertices_np, faces_np, fixed_np, fixed_uv_np, uv_init_np, max_iterations):
+    """Libigl ARAP reference (dim=2, elements energy); returns the (n, 2) UV."""
+    data = igl.ARAPData()
+    data.max_iter = max_iterations
+    igl.arap_precomputation(vertices_np, faces_np, 2, fixed_np.astype(np.int32), data)
+    return igl.arap_solve(
+        fixed_uv_np.astype(np.float64), data, np.ascontiguousarray(uv_init_np.astype(np.float64))
+    )
+
+
+@pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
+def test_arap_matches_igl(request, device, mesh_name):
+    _skip_on_cpu(device)
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np, faces_np = _mesh_numpy(mesh_tm)
+
+    # Full boundary loop pinned to the unit circle; identical harmonic warm start fed to both sides.
+    boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
+    boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)
+    boundary_np = boundary_wp.numpy().astype(np.int64)
+    boundary_uv_np = boundary_uv_wp.numpy().astype(np.float64)
+    uv_init_wp = tw.parametrization.harmonic(
+        mesh_wp.points, mesh_wp.indices, boundary_wp, boundary_uv_wp
+    )
+    uv_init_np = uv_init_wp.numpy().astype(np.float64)
+
+    uv_wp = tw.parametrization.arap(
+        mesh_wp.points, mesh_wp.indices, boundary_wp, boundary_uv_wp, uv_init_wp, max_iterations=10
+    )
+    uv_igl = _arap_igl(vertices_np, faces_np, boundary_np, boundary_uv_np, uv_init_np, 10)
+
+    assert np.allclose(uv_wp.numpy(), uv_igl, rtol=1e-4, atol=1e-4)
+
+
+def test_arap_free_boundary_matches_igl(device, hemisphere):
+    # Pin only two boundary vertices to their harmonic UV; the rest of the boundary is free.
+    _skip_on_cpu(device)
+    mesh_tm, mesh_wp = hemisphere
+    vertices_np, faces_np = _mesh_numpy(mesh_tm)
+
+    boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
+    boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)
+    uv_init_wp = tw.parametrization.harmonic(
+        mesh_wp.points, mesh_wp.indices, boundary_wp, boundary_uv_wp
+    )
+    uv_init_np = uv_init_wp.numpy().astype(np.float64)
+
+    loop_np = boundary_wp.numpy()
+    fixed_np = np.array([loop_np[0], loop_np[len(loop_np) // 2]], dtype=np.int32)
+    fixed_uv_np = uv_init_np[fixed_np]
+    fixed_wp = wp.array(fixed_np, dtype=wp.int32, device=mesh_wp.device)
+    fixed_uv_wp = wp.array(fixed_uv_np.astype(np.float32), dtype=wp.vec2, device=mesh_wp.device)
+
+    uv_wp = tw.parametrization.arap(
+        mesh_wp.points, mesh_wp.indices, fixed_wp, fixed_uv_wp, uv_init_wp, max_iterations=4
+    )
+    uv_igl = _arap_igl(vertices_np, faces_np, fixed_np, fixed_uv_np, uv_init_np, 4)
+
+    # float32-UV drift vs igl's float64 grows slowly; four iterations stays well under 1e-3.
+    assert np.allclose(uv_wp.numpy(), uv_igl, rtol=1e-3, atol=1e-3)
+
+
+def test_arap_fixed_vertices_pinned(device, hemisphere):
+    # The pinned rows must equal the prescribed UV exactly (they are re-enforced every iteration).
+    _skip_on_cpu(device)
+    _, mesh_wp = hemisphere
+    boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
+    boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)
+    uv_init_wp = tw.parametrization.harmonic(
+        mesh_wp.points, mesh_wp.indices, boundary_wp, boundary_uv_wp
+    )
+
+    uv_wp = tw.parametrization.arap(
+        mesh_wp.points, mesh_wp.indices, boundary_wp, boundary_uv_wp, uv_init_wp, max_iterations=10
+    )
+    assert np.array_equal(uv_wp.numpy()[boundary_wp.numpy()], boundary_uv_wp.numpy())
+
+
+def test_arap_disk_is_finite(device, hemisphere):
+    _skip_on_cpu(device)
+    _, mesh_wp = hemisphere
+    boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
+    boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)
+    uv_init_wp = tw.parametrization.harmonic(
+        mesh_wp.points, mesh_wp.indices, boundary_wp, boundary_uv_wp
+    )
+    uv_wp = tw.parametrization.arap(
+        mesh_wp.points, mesh_wp.indices, boundary_wp, boundary_uv_wp, uv_init_wp, max_iterations=10
+    )
+    assert np.isfinite(uv_wp.numpy()).all()
+
+
+def test_arap_all_vertices_fixed(device, hemisphere):
+    # Every vertex pinned: the prescribed UV is returned with no solve, so this runs on CPU too.
+    _, mesh_wp = hemisphere
+    n_vertices = int(mesh_wp.points.shape[0])
+    rng = np.random.default_rng(7)
+    fixed_uv_np = rng.standard_normal((n_vertices, 2)).astype(np.float32)
+    all_indices_np = np.arange(n_vertices, dtype=np.int32)
+    fixed_wp = wp.array(all_indices_np, dtype=wp.int32, device=mesh_wp.device)
+    fixed_uv_wp = wp.array(fixed_uv_np, dtype=wp.vec2, device=mesh_wp.device)
+    uv_init_wp = wp.zeros(n_vertices, dtype=wp.vec2, device=mesh_wp.device)
+
+    uv_wp = tw.parametrization.arap(
+        mesh_wp.points, mesh_wp.indices, fixed_wp, fixed_uv_wp, uv_init_wp, max_iterations=10
+    )
+    assert np.array_equal(uv_wp.numpy(), fixed_uv_np)
+
+
+def test_arap_empty_fixed_raises(device, hemisphere):
+    # Interior vertices but no pins: the ARAP global system is singular; raised pre-solve (CPU-ok).
+    _, mesh_wp = hemisphere
+    empty_fixed = wp.empty(0, dtype=wp.int32, device=mesh_wp.device)
+    empty_uv = wp.empty(0, dtype=wp.vec2, device=mesh_wp.device)
+    uv_init = wp.zeros(int(mesh_wp.points.shape[0]), dtype=wp.vec2, device=mesh_wp.device)
+    with pytest.raises(ValueError, match="at least one fixed vertex"):
+        tw.parametrization.arap(mesh_wp.points, mesh_wp.indices, empty_fixed, empty_uv, uv_init)
+
+
+def test_arap_bad_iterations_raises(device, hemisphere):
+    _, mesh_wp = hemisphere
+    boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
+    boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)
+    uv_init = wp.zeros(int(mesh_wp.points.shape[0]), dtype=wp.vec2, device=mesh_wp.device)
+    with pytest.raises(ValueError, match="max_iterations"):
+        tw.parametrization.arap(
+            mesh_wp.points, mesh_wp.indices, boundary_wp, boundary_uv_wp, uv_init, max_iterations=0
+        )
+
+
+def test_arap_cpu_solve_raises():
+    # Two-triangle quad with three pinned corners forcing an interior solve: CPU cg is unsupported.
+    vertices = wp.array(
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]),
+        dtype=wp.vec3,
+        device="cpu",
+    )
+    faces = wp.array(np.array([0, 1, 2, 1, 3, 2], dtype=np.int32), dtype=wp.int32, device="cpu")
+    fixed = wp.array(np.array([0, 1, 3], dtype=np.int32), dtype=wp.int32, device="cpu")
+    fixed_uv = wp.array(
+        np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float32),
+        dtype=wp.vec2,
+        device="cpu",
+    )
+    uv_init = wp.zeros(4, dtype=wp.vec2, device="cpu")
+    with pytest.raises(NotImplementedError):
+        tw.parametrization.arap(vertices, faces, fixed, fixed_uv, uv_init)
+
+
+def test_arap_empty_mesh(device):
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    fixed_wp = wp.empty(0, dtype=wp.int32, device=device)
+    fixed_uv_wp = wp.empty(0, dtype=wp.vec2, device=device)
+    uv_init_wp = wp.empty(0, dtype=wp.vec2, device=device)
+    uv_wp = tw.parametrization.arap(vertices_wp, faces_wp, fixed_wp, fixed_uv_wp, uv_init_wp)
+    assert uv_wp.numpy().size == 0

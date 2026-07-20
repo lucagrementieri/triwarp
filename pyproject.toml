@@ -16,7 +16,7 @@ io = ["meshio>=5.0", "numpy>=1.20"]
 
 [dependency-groups]
 bench = ["pytest-benchmark>=5.1", { include-group = "test" }]
-dev = ["ruff>=0.9", "scipy-stubs>=1.17.1.5"]
+dev = ["ruff>=0.9", "basedpyright>=1.39", "scipy-stubs>=1.17.1.5"]
 docs = [
     "mkdocs>=1.6",
     "mkdocs-material>=9.5",
@@ -108,3 +108,50 @@ warp = "wp"
 
 [tool.ruff.format]
 skip-magic-trailing-comma = true
+
+[tool.basedpyright]
+pythonVersion = "3.11"
+venvPath = "."
+venv = ".venv"
+include = ["triwarp"]
+exclude = [
+    "**/__pycache__",
+    ".venv",
+    "build",
+    "dist",
+    "reference",
+    "site",
+    # Warp's kernel DSL (wp.array[wp.vec3] subscripting, wp.tid(), typed vector
+    # constructors, kernel-scope slicing) is not modeled by any type stubs, so
+    # triwarp/kernels/ is inherently un-typecheckable. Excluded wholesale.
+    "triwarp/kernels",
+]
+typeCheckingMode = "standard"
+
+# Warp's Python-scope stubs are weak: wp.empty(dtype=wp.float32) is typed as
+# returning array[float]; the twt.Array2d* aliases (wp.array[dtype, Literal[2]])
+# are not assignable to Warp's array[Unknown, int]; BsrMatrix.offsets/.columns/
+# .values exist at runtime but not in the stub; wp.max/wp.mean/wp.__getitem__
+# overloads don't match. Every type-flow rule that touches a Warp array therefore
+# fires on false positives. These are disabled so the residual diagnostics are
+# actionable rather than drowned out. Trade-off: genuine wrapper type errors of
+# these kinds are also silenced.
+reportArgumentType = "none"
+reportCallIssue = "none"
+reportReturnType = "none"
+reportAttributeAccessIssue = "none"
+reportOperatorIssue = "none"
+reportIndexIssue = "none"
+reportAssignmentType = "none"
+reportInconsistentOverload = "none"
+reportOverlappingOverload = "none"
+reportMissingTypeArgument = "none"
+reportGeneralTypeIssues = "none"
+reportInvalidTypeForm = "none"
+
+# warp-lang and igl ship no py.typed marker / stubs.
+reportMissingTypeStubs = "none"
+
+# Keep as an error: catches the Warp §5 gotcha (a variable defined only inside an
+# `if` branch reads as uninitialized when the branch isn't taken).
+reportPossiblyUnboundVariable = "error"
