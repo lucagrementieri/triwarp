@@ -259,6 +259,143 @@ def test_tutte_disk_is_fold_free(device, hemisphere):
     assert tw.parametrization.flipped_faces(uv_wp, mesh_wp.indices).numpy().size == 0
 
 
+@pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
+def test_lscm_matches_igl(request, device, mesh_name):
+    _skip_on_cpu(device)
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np, faces_np = _mesh_numpy(mesh_tm)
+
+    # Pin two boundary vertices to (0, 0) and (1, 0), the libigl tutorial-502 convention.
+    loop_np = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices).numpy()
+    pins_np = np.array([loop_np[0], loop_np[len(loop_np) // 2]], dtype=np.int32)
+    pins_uv_np = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32)
+    pins_wp = wp.array(pins_np, dtype=wp.int32, device=mesh_wp.device)
+    pins_uv_wp = wp.array(pins_uv_np, dtype=wp.vec2, device=mesh_wp.device)
+
+    uv_wp = tw.parametrization.lscm(mesh_wp.points, mesh_wp.indices, pins_wp, pins_uv_wp)
+    uv_igl, _ = igl.lscm(
+        vertices_np, faces_np, pins_np.astype(np.int64), pins_uv_np.astype(np.float64)
+    )
+
+    assert np.allclose(uv_wp.numpy(), uv_igl, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
+def test_lscm_hessian_matches_igl(request, device, mesh_name):
+    # No CPU skip: this builds the Hessian only, no conjugate-gradient solve.
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np, faces_np = _mesh_numpy(mesh_tm)
+    n_vertices = int(mesh_wp.points.shape[0])
+
+    # igl.lscm returns (V_uv, Q); its Q equals -repdiag(L, 2) - 2A exactly.
+    pins_np = np.array([0, 1], dtype=np.int64)
+    pins_uv_np = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float64)
+    _, hessian_igl = igl.lscm(vertices_np, faces_np, pins_np, pins_uv_np)
+
+    hessian_wp = tw.parametrization.lscm_hessian(mesh_wp.points, mesh_wp.indices)
+    hessian_dense = scipy.sparse.csr_matrix(
+        (hessian_wp.values.numpy(), hessian_wp.columns.numpy(), hessian_wp.offsets.numpy()),
+        shape=(2 * n_vertices, 2 * n_vertices),
+    ).toarray()
+
+    assert np.allclose(hessian_dense, hessian_igl.toarray(), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
+def test_vector_area_matrix_matches_igl_derived(request, device, mesh_name):
+    # The bindings do not expose vector_area_matrix; derive it from A = (-repdiag(L,2) - Q) / 2.
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np, faces_np = _mesh_numpy(mesh_tm)
+    n_vertices = int(mesh_wp.points.shape[0])
+
+    pins_np = np.array([0, 1], dtype=np.int64)
+    pins_uv_np = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float64)
+    _, hessian_igl = igl.lscm(vertices_np, faces_np, pins_np, pins_uv_np)
+    laplacian_igl = igl.cotmatrix(vertices_np, faces_np)
+    area_igl = (-scipy.sparse.block_diag([laplacian_igl, laplacian_igl]) - hessian_igl) / 2.0
+
+    area_wp = tw.parametrization.vector_area_matrix(mesh_wp.points, mesh_wp.indices)
+    area_dense = scipy.sparse.csr_matrix(
+        (area_wp.values.numpy(), area_wp.columns.numpy(), area_wp.offsets.numpy()),
+        shape=(2 * n_vertices, 2 * n_vertices),
+    ).toarray()
+
+    assert np.allclose(area_dense, area_igl.toarray(), rtol=1e-5, atol=1e-5)
+
+
+def test_lscm_closed_mesh_matches_igl(device, icosahedron):
+    # Closed mesh: A = 0, Q = -repdiag(L, 2). igl.lscm accepts closed input.
+    _skip_on_cpu(device)
+    mesh_tm, mesh_wp = icosahedron
+    vertices_np, faces_np = _mesh_numpy(mesh_tm)
+
+    pins_np = np.array([0, 7], dtype=np.int32)
+    pins_uv_np = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32)
+    pins_wp = wp.array(pins_np, dtype=wp.int32, device=mesh_wp.device)
+    pins_uv_wp = wp.array(pins_uv_np, dtype=wp.vec2, device=mesh_wp.device)
+
+    uv_wp = tw.parametrization.lscm(mesh_wp.points, mesh_wp.indices, pins_wp, pins_uv_wp)
+    uv_igl, _ = igl.lscm(
+        vertices_np, faces_np, pins_np.astype(np.int64), pins_uv_np.astype(np.float64)
+    )
+
+    assert np.allclose(uv_wp.numpy(), uv_igl, rtol=1e-4, atol=1e-4)
+
+
+def test_lscm_is_fold_free(device, hemisphere):
+    # LSCM of a disk-topology open surface with two pins is conformal and fold-free.
+    _skip_on_cpu(device)
+    _, mesh_wp = hemisphere
+    loop_np = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices).numpy()
+    pins_wp = wp.array(
+        np.array([loop_np[0], loop_np[len(loop_np) // 2]], dtype=np.int32),
+        dtype=wp.int32,
+        device=mesh_wp.device,
+    )
+    pins_uv_wp = wp.array(
+        np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32), dtype=wp.vec2, device=mesh_wp.device
+    )
+    uv_wp = tw.parametrization.lscm(mesh_wp.points, mesh_wp.indices, pins_wp, pins_uv_wp)
+    assert tw.parametrization.flipped_faces(uv_wp, mesh_wp.indices).numpy().size == 0
+
+
+@pytest.mark.parametrize("n_pins", [0, 1])
+def test_lscm_too_few_pins_raises(device, hemisphere, n_pins):
+    # Fewer than two pins leaves the similarity-transform null space; raised pre-solve (CPU-safe).
+    _, mesh_wp = hemisphere
+    pins_wp = wp.array(np.arange(n_pins, dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
+    pins_uv_wp = wp.array(
+        np.zeros((n_pins, 2), dtype=np.float32), dtype=wp.vec2, device=mesh_wp.device
+    )
+    with pytest.raises(ValueError, match="at least two pinned vertices"):
+        tw.parametrization.lscm(mesh_wp.points, mesh_wp.indices, pins_wp, pins_uv_wp)
+
+
+def test_lscm_cpu_solve_raises():
+    # Two-triangle quad with two pins forces a free-vertex solve: CPU cg is unsupported.
+    vertices = wp.array(
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]),
+        dtype=wp.vec3,
+        device="cpu",
+    )
+    faces = wp.array(np.array([0, 1, 2, 1, 3, 2], dtype=np.int32), dtype=wp.int32, device="cpu")
+    pins = wp.array(np.array([0, 3], dtype=np.int32), dtype=wp.int32, device="cpu")
+    pins_uv = wp.array(
+        np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32), dtype=wp.vec2, device="cpu"
+    )
+    with pytest.raises(NotImplementedError):
+        tw.parametrization.lscm(vertices, faces, pins, pins_uv)
+
+
+def test_lscm_empty_mesh(device):
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    pins_wp = wp.empty(0, dtype=wp.int32, device=device)
+    pins_uv_wp = wp.empty(0, dtype=wp.vec2, device=device)
+    uv_wp = tw.parametrization.lscm(vertices_wp, faces_wp, pins_wp, pins_uv_wp)
+    assert uv_wp.numpy().size == 0
+
+
 def test_harmonic_cpu_solve_raises():
     # Single triangle with one interior-free setup forcing a solve: CPU cg is unsupported.
     vertices = wp.array(

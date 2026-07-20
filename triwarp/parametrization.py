@@ -5,6 +5,7 @@ import warp.optim.linear as wpl
 import warp.sparse as wps
 
 import triwarp as tw
+import triwarp.typing as twt
 from triwarp._device import require_cuda
 from triwarp.kernels import parametrization as kernel_parametrization
 from triwarp.laplacian import cotmatrix, mass_matrix_entries, uniform_laplacian
@@ -181,89 +182,116 @@ def _solve_fixed_boundary(
             for _ in range(k - 1):
                 q = wps.bsr_mm(wps.bsr_mm(q, mass_inv), neg_l)
 
-    # Boundary mask + prescribed positions scattered to full length.
+    # A mesh with interior vertices and no fixed boundary is a singular Dirichlet system. Raised up
+    # front (CPU-safe): once every vertex is fixed (n_vertices > 0, n_boundary == 0 is impossible
+    # here because n_vertices > 0 implies interior vertices exist) this cannot be satisfied.
     n_boundary = int(boundary_indices.shape[0])
-    boundary_mask = wp.zeros(n_vertices, dtype=wp.bool, device=device)
-    fixed_uv = wp.zeros(n_vertices, dtype=wp.vec2, device=device)
-    if n_boundary > 0:
-        wp.launch(
-            kernel_parametrization.scatter_boundary_mask,
-            dim=n_boundary,
-            inputs=[boundary_indices, boundary_mask],
-            device=device,
-        )
-        wp.launch(
-            kernel_parametrization.scatter_fixed_uv,
-            dim=n_boundary,
-            inputs=[boundary_indices, boundary_uv, fixed_uv],
-            device=device,
-        )
-
-    # Compact interior remap: exclusive scan of the interior indicator gives each free vertex its
-    # index in the reduced system; the inclusive scan's last entry is the interior count.
-    flags = wp.empty(n_vertices, dtype=wp.int32, device=device)
-    wp.map(kernel_parametrization.interior_flag, boundary_mask, out=flags)
-    interior_map = wp.empty(n_vertices, dtype=wp.int32, device=device)
-    inclusive = wp.empty(n_vertices, dtype=wp.int32, device=device)
-    wp.utils.array_scan(flags, out_array=interior_map, inclusive=False)
-    wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
-    n_interior = int(inclusive.numpy()[-1])
-
-    if n_interior == 0:
-        # Every vertex is fixed: the prescribed positions are the whole answer, no solve needed.
-        return fixed_uv
     if n_boundary == 0:
         raise ValueError(
             "harmonic / tutte require at least one fixed boundary vertex; the Dirichlet system is "
             "otherwise singular."
         )
 
-    require_cuda(device, "harmonic / tutte")
-
-    # Assemble the interior-interior block Q_uu and the right-hand sides -Q_ub bc from Q's CSR.
-    nnz = int(q.nnz)
-    out_rows = wp.zeros(nnz, dtype=wp.int32, device=device)
-    out_cols = wp.zeros(nnz, dtype=wp.int32, device=device)
-    out_vals = wp.zeros(nnz, dtype=wp.float64, device=device)
-    rhs_x = wp.zeros(n_interior, dtype=wp.float64, device=device)
-    rhs_y = wp.zeros(n_interior, dtype=wp.float64, device=device)
+    # Fixed mask + prescribed positions scattered to a (2, n_vertices) buffer (row 0 = u, 1 = v).
+    fixed_mask = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+    fixed_values = wp.zeros((2, n_vertices), dtype=wp.float64, device=device)
     wp.launch(
-        kernel_parametrization.interior_system_triplets,
-        dim=n_vertices,
-        inputs=[
-            q.offsets,
-            q.columns,
-            q.values,
-            boundary_mask,
-            interior_map,
-            fixed_uv,
-            out_rows,
-            out_cols,
-            out_vals,
-            rhs_x,
-            rhs_y,
-        ],
+        kernel_parametrization.scatter_boundary_mask,
+        dim=n_boundary,
+        inputs=[boundary_indices, fixed_mask],
         device=device,
     )
-    q_uu = wps.bsr_from_triplets(
-        n_interior, n_interior, out_rows, out_cols, out_vals, prune_numerical_zeros=False
+    wp.launch(
+        kernel_parametrization.scatter_fixed_uv,
+        dim=n_boundary,
+        inputs=[boundary_indices, boundary_uv, fixed_values],
+        device=device,
     )
 
-    # One diagonal preconditioner shared by both symmetric-PD column solves.
-    preconditioner = wpl.preconditioner(q_uu, "diag")
-    sol_x = wp.zeros(n_interior, dtype=wp.float64, device=device)
-    sol_y = wp.zeros(n_interior, dtype=wp.float64, device=device)
-    wpl.cg(q_uu, rhs_x, sol_x, tol=_CG_TOLERANCE, maxiter=10 * n_interior, M=preconditioner)
-    wpl.cg(q_uu, rhs_y, sol_y, tol=_CG_TOLERANCE, maxiter=10 * n_interior, M=preconditioner)
+    sol, free_map, _ = _min_quad_with_fixed_columns(
+        q, fixed_mask, twt.as_array2d_float(fixed_values, dtype=wp.float64), device
+    )
 
     out_uv = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     wp.launch(
         kernel_parametrization.scatter_solution,
         dim=n_vertices,
-        inputs=[boundary_mask, interior_map, sol_x, sol_y, fixed_uv, out_uv],
+        inputs=[fixed_mask, free_map, sol, fixed_values, out_uv],
         device=device,
     )
     return out_uv
+
+
+def _min_quad_with_fixed_columns(
+    q: wps.BsrMatrix[wp.float64],
+    fixed_mask: wp.array[wp.bool],
+    fixed_values: twt.Array2dFloat,
+    device: wp.DeviceLike,
+) -> tuple[twt.Array2dFloat, wp.array[wp.int32], int]:
+    """
+    Solve ``min_quad_with_fixed`` for a stacked operator with ``n_rhs`` right-hand-side columns.
+
+    Generalizes the fixed-value quadratic minimization shared by ``harmonic`` / ``tutte`` (2
+    independent UV columns over ``n_vertices`` unknowns) and ``lscm`` (1 coupled column over ``2n``
+    unknowns): ``fixed_mask`` marks the fixed DOFs among ``n_dofs = fixed_mask.shape[0]``, and
+    ``fixed_values`` is ``(n_rhs, n_dofs)``. Returns the solved free values ``(n_rhs, n_free)``, the
+    compact free-index remap, and the free count. The all-fixed case (``n_free == 0``) returns an
+    empty solution without a solve (and without requiring CUDA), leaving reconstruction to the
+    caller's scatter kernel.
+    """
+    n_dofs = int(fixed_mask.shape[0])
+    n_rhs = int(fixed_values.shape[0])
+
+    # Compact free remap: exclusive scan of the free indicator gives each free DOF its index in the
+    # reduced system; the inclusive scan's last entry is the free count.
+    flags = wp.empty(n_dofs, dtype=wp.int32, device=device)
+    wp.map(kernel_parametrization.interior_flag, fixed_mask, out=flags)
+    free_map = wp.empty(n_dofs, dtype=wp.int32, device=device)
+    inclusive = wp.empty(n_dofs, dtype=wp.int32, device=device)
+    wp.utils.array_scan(flags, out_array=free_map, inclusive=False)
+    wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
+    n_free = int(inclusive.numpy()[-1])
+
+    sol = wp.zeros((n_rhs, n_free), dtype=wp.float64, device=device)
+    if n_free == 0:
+        # Every DOF is fixed: the prescribed values are the whole answer, no solve needed.
+        return twt.as_array2d_float(sol, dtype=wp.float64), free_map, n_free
+
+    require_cuda(device, "harmonic / tutte / lscm")
+
+    # Assemble the free-free block Q_uu and the right-hand sides -Q_ub bc from Q's CSR.
+    nnz = int(q.nnz)
+    out_rows = wp.zeros(nnz, dtype=wp.int32, device=device)
+    out_cols = wp.zeros(nnz, dtype=wp.int32, device=device)
+    out_vals = wp.zeros(nnz, dtype=wp.float64, device=device)
+    rhs = wp.zeros((n_rhs, n_free), dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_parametrization.interior_system_triplets,
+        dim=n_dofs,
+        inputs=[
+            q.offsets,
+            q.columns,
+            q.values,
+            fixed_mask,
+            free_map,
+            fixed_values,
+            out_rows,
+            out_cols,
+            out_vals,
+            rhs,
+        ],
+        device=device,
+    )
+    q_uu = wps.bsr_from_triplets(
+        n_free, n_free, out_rows, out_cols, out_vals, prune_numerical_zeros=False
+    )
+
+    # One diagonal preconditioner shared by every symmetric-PD column solve. Row views of the
+    # row-major (n_rhs, n_free) buffers are contiguous, so they serve directly as CG vectors.
+    preconditioner = wpl.preconditioner(q_uu, "diag")
+    for c in range(n_rhs):
+        wpl.cg(q_uu, rhs[c], sol[c], tol=_CG_TOLERANCE, maxiter=10 * n_free, M=preconditioner)
+    return twt.as_array2d_float(sol, dtype=wp.float64), free_map, n_free
 
 
 def harmonic(
@@ -395,3 +423,239 @@ def tutte(
     return _solve_fixed_boundary(
         laplacian, None, k, n_vertices, boundary_indices, boundary_uv, device
     )
+
+
+def lscm(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    pinned_indices: wp.array[wp.int32],
+    pinned_uv: wp.array[wp.vec2],
+) -> wp.array[wp.vec2]:
+    """
+    Constrained least-squares conformal map (``igl::lscm``).
+
+    Computes the conformal (angle-preserving) parametrization that minimizes the LSCM (Levy)
+    conformal energy subject to a set of pinned vertices, by solving a single quadratic program
+    over the stacked ``[u; v]`` vector of ``2 * n_vertices`` unknowns with the LSCM Hessian
+    [`lscm_hessian`][triwarp.parametrization.lscm_hessian] as the operator. Unlike
+    [`harmonic`][triwarp.parametrization.harmonic] / [`tutte`][triwarp.parametrization.tutte] (which
+    pin the whole boundary and solve two independent columns), LSCM couples ``u`` and ``v`` through
+    the boundary vector-area term, so it needs only a few pins — typically **two** — to fix the
+    remaining similarity-transform (rotation + scale + translation) degree of freedom.
+
+    The interior system is solved with conjugate gradient, so a **CUDA device is required** whenever
+    there are free vertices to solve for (``warp.optim.linear.cg`` returns NaN on the CPU in Warp
+    1.14-1.15). Closed meshes are valid input: the boundary vector-area matrix is then zero and the
+    Hessian reduces to ``-repdiag(L, 2)``.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    pinned_indices
+        ``wp.int32`` indices of the pinned (constrained) vertices — igl's ``b``. At least two are
+        required (unless the mesh has fewer than two vertices) to remove the conformal map's
+        similarity-transform null space.
+    pinned_uv
+        ``(n_pinned,)`` target UV positions for ``pinned_indices``, in the same order (igl's
+        ``bc``).
+
+    Returns
+    -------
+    wp.array[wp.vec2]
+        ``(n_vertices,)`` UV coordinates on ``vertices.device``. Empty for an empty mesh.
+
+    Raises
+    ------
+    ValueError
+        If fewer than two vertices are pinned (and the mesh has at least two vertices).
+    NotImplementedError
+        On a CPU device when a free-vertex solve is required.
+
+    See Also
+    --------
+    [`lscm_hessian`][triwarp.parametrization.lscm_hessian]
+    [`vector_area_matrix`][triwarp.parametrization.vector_area_matrix]
+    [`harmonic`][triwarp.parametrization.harmonic]
+    [`flipped_faces`][triwarp.parametrization.flipped_faces]
+
+    Notes
+    -----
+    The unknowns are stacked ``[u; v]`` (all ``u`` DOFs then all ``v`` DOFs), matching igl's
+    ``lscm``: pin ``i`` fixes DOF ``i`` (``u``) and DOF ``i + n_vertices`` (``v``). The returned
+    ``Q`` of ``igl.lscm`` equals ``-repdiag(L, 2) - 2 A`` exactly (see
+    [`lscm_hessian`][triwarp.parametrization.lscm_hessian]).
+    """
+    device = vertices.device
+    n = int(vertices.shape[0])
+    if n == 0:
+        return wp.empty(0, dtype=wp.vec2, device=device)
+
+    n_pinned = int(pinned_indices.shape[0])
+    if n_pinned < 2 and n_pinned < n:
+        raise ValueError(
+            "lscm requires at least two pinned vertices to remove the conformal map's "
+            f"similarity-transform null space; got {n_pinned}."
+        )
+
+    q = lscm_hessian(vertices, faces)
+    fixed_mask = wp.zeros(2 * n, dtype=wp.bool, device=device)
+    fixed_values = wp.zeros((1, 2 * n), dtype=wp.float64, device=device)
+    if n_pinned > 0:
+        wp.launch(
+            kernel_parametrization.scatter_pinned_stacked,
+            dim=n_pinned,
+            inputs=[pinned_indices, pinned_uv, wp.int32(n), fixed_mask, fixed_values],
+            device=device,
+        )
+
+    sol, free_map, _ = _min_quad_with_fixed_columns(
+        q, fixed_mask, twt.as_array2d_float(fixed_values, dtype=wp.float64), device
+    )
+
+    out_uv = wp.empty(n, dtype=wp.vec2, device=device)
+    wp.launch(
+        kernel_parametrization.scatter_solution_stacked,
+        dim=n,
+        inputs=[fixed_mask, free_map, sol[0], fixed_values[0], out_uv],
+        device=device,
+    )
+    return out_uv
+
+
+def lscm_hessian(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> wps.BsrMatrix[wp.float64]:
+    """
+    LSCM Hessian ``Q = -repdiag(L, 2) - 2 A`` (``igl::lscm_hessian``).
+
+    Assembles the ``(2n, 2n)`` symmetric operator behind the least-squares conformal map, where
+    ``L`` is the cotangent Laplacian [`cotmatrix`][triwarp.laplacian.cotmatrix] (negative-diagonal
+    convention), ``repdiag(L, 2)`` is the block-diagonal ``[[L, 0], [0, L]]``, and ``A`` is the
+    boundary [`vector_area_matrix`][triwarp.parametrization.vector_area_matrix]. Built natively in
+    float64 in a single ``bsr_from_triplets`` (the within-quadrant repdiag triplets and the
+    cross-quadrant ``-2 A`` triplets never collide), so it feeds the float64 conjugate-gradient
+    solve directly. Matches the ``Q`` returned by ``igl.lscm`` exactly.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        Square ``(2n, 2n)`` float64 matrix in 1x1-block BSR form on ``vertices.device``.
+
+    See Also
+    --------
+    [`lscm`][triwarp.parametrization.lscm]
+    [`vector_area_matrix`][triwarp.parametrization.vector_area_matrix]
+    [`cotmatrix`][triwarp.laplacian.cotmatrix]
+    """
+    n = int(vertices.shape[0])
+    device = vertices.device
+    laplacian = cotmatrix(vertices, faces, dtype=wp.float64)
+    # The real compressed-CSR entry count is offsets[-1], not laplacian.nnz: bsr_from_triplets
+    # reports nnz as the (over-allocated) triplet capacity, so sizing by nnz would leave an
+    # uninitialized gap in the wp.empty buffers that bsr_from_triplets reads back as garbage.
+    n_entries = int(laplacian.offsets.numpy()[-1])
+    boundary = tw.boundary.oriented_boundary_edges(vertices, faces)
+    n_be = int(boundary.shape[0])
+
+    # Combined triplet buffers: 2 per Laplacian entry (the two diagonal blocks) plus 4 per oriented
+    # boundary edge (the vector-area cross-quadrant terms). Every slot is written, so wp.empty.
+    total = 2 * n_entries + 4 * n_be
+    rows = wp.empty(total, dtype=wp.int32, device=device)
+    cols = wp.empty(total, dtype=wp.int32, device=device)
+    vals = wp.empty(total, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_parametrization.neg_repdiag2_triplets,
+        dim=n,
+        inputs=[
+            laplacian.offsets,
+            laplacian.columns,
+            laplacian.values,
+            wp.int32(n),
+            rows,
+            cols,
+            vals,
+        ],
+        device=device,
+    )
+    if n_be > 0:
+        wp.launch(
+            kernel_parametrization.vector_area_triplets,
+            dim=n_be,
+            inputs=[
+                boundary,
+                wp.int32(n),
+                wp.float64(-2.0),
+                rows[2 * n_entries :],
+                cols[2 * n_entries :],
+                vals[2 * n_entries :],
+            ],
+            device=device,
+        )
+    return wps.bsr_from_triplets(2 * n, 2 * n, rows, cols, vals, prune_numerical_zeros=False)
+
+
+def vector_area_matrix(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> wps.BsrMatrix[wp.float64]:
+    """
+    Boundary vector-area matrix ``A`` (``igl::vector_area_matrix``).
+
+    Assembles the ``(2n, 2n)`` matrix that turns the ``[u; v]`` quadratic form into the signed area
+    enclosed by the boundary UV curve: for each **oriented** boundary edge ``(i, j)`` (from the face
+    winding, via [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]) it adds the
+    cross-quadrant entries ``(i+n, j, -1/4)``, ``(j, i+n, -1/4)``, ``(i, j+n, +1/4)``,
+    ``(j+n, i, +1/4)``. On a closed mesh (no boundary) ``A`` is the zero matrix. Built natively in
+    float64 in a single ``bsr_from_triplets``.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions; only the count and device are used.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        Square ``(2n, 2n)`` float64 matrix in 1x1-block BSR form on ``vertices.device``.
+
+    See Also
+    --------
+    [`lscm_hessian`][triwarp.parametrization.lscm_hessian]
+    [`lscm`][triwarp.parametrization.lscm]
+    [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]
+    """
+    n = int(vertices.shape[0])
+    device = vertices.device
+    boundary = tw.boundary.oriented_boundary_edges(vertices, faces)
+    n_be = int(boundary.shape[0])
+    if n_be == 0:
+        return wps.bsr_from_triplets(
+            2 * n,
+            2 * n,
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.float64, device=device),
+            prune_numerical_zeros=False,
+        )
+
+    rows = wp.empty(4 * n_be, dtype=wp.int32, device=device)
+    cols = wp.empty(4 * n_be, dtype=wp.int32, device=device)
+    vals = wp.empty(4 * n_be, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_parametrization.vector_area_triplets,
+        dim=n_be,
+        inputs=[boundary, wp.int32(n), wp.float64(1.0), rows, cols, vals],
+        device=device,
+    )
+    return wps.bsr_from_triplets(2 * n, 2 * n, rows, cols, vals, prune_numerical_zeros=False)
