@@ -6,11 +6,16 @@ import math
 
 import numpy as np
 import warp as wp
+import warp.optim.linear as wpl
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_cuda
+from triwarp.constants import INT32_MAX
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import reconstruction as kernel_reconstruction
 from triwarp.kernels import remesh as kernel_remesh
+from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
 
 
 def _orient2d(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
@@ -347,4 +352,655 @@ def _assemble_faces(
             hole_length = 0.1 * float(wp.length(hi - lo))
         faces = tw.hole_filling.fill_small_holes(vertices, faces, hole_length)
 
+    return vertices, faces
+
+
+def screened_poisson(
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    *,
+    depth: int = 8,
+    full_depth: int = 5,
+    scale: float = 1.1,
+    point_weight: float = 4.0,
+    solver_iterations: int = 100,
+    solver_tolerance: float = 1e-6,
+    confidence: bool = False,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Screened-Poisson surface reconstruction from an oriented point cloud (Kazhdan PoissonRecon).
+
+    GPU-native reimplementation of the screened-Poisson filter (PyMeshLab's
+    ``generate_surface_reconstruction_screened_poisson``, ``open3d``'s
+    ``create_from_point_cloud_poisson``).
+    A dense node-centered grid over a padded bounding cube is used instead of PoissonRecon's octree:
+    the oriented normals are trilinearly splatted into a smoothed vector field ``V`` (with a density
+    weight ``W``), the indicator function ``x`` is recovered by solving the screened-Poisson system
+    ``(L_N + point_weight * W) x = -div V`` matrix-free with a Jacobi-preconditioned conjugate
+    gradient, and the iso-surface is extracted with ``warp.MarchingCubes`` at the iso-value given by
+    the average of ``x`` over the input points. A **cascadic** coarse-to-fine schedule solves the
+    system from ``full_depth`` up to ``depth``, prolonging each level's solution as the next level's
+    initial guess (mirroring PoissonRecon's multigrid hierarchy).
+
+    ``normals`` are **required** and must be globally consistently oriented (all pointing outward or
+    all inward): the reconstruction encodes the surface orientation in the sign of the vector field,
+    and [`estimate_normals`][triwarp.points.estimate_normals] performs no global orientation. A
+    **CUDA device is required** (``warp.optim.linear.cg`` returns NaN on the CPU device in Warp
+    1.14-1.15).
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` point positions on the target device (``n >= 3``).
+    normals
+        ``(n,)`` oriented unit normals (their magnitude is used as a confidence weight when
+        ``confidence`` is set).
+    depth
+        Finest grid depth: the finest grid has ``2**depth + 1`` nodes per axis. Memory grows as the
+        cube of this; ``depth=8`` (a ``257**3`` grid, ~0.7 GB peak) is a safe default and ``depth``
+        is capped at ``10``.
+    full_depth
+        Coarsest depth of the cascade (``3 <= full_depth <= depth``). The system is solved at every
+        depth from ``full_depth`` to ``depth``.
+    scale
+        Ratio between the reconstruction cube's side and the point cloud's largest bounding-box
+        extent (``> 0``); ``1.1`` pads the cloud by 10 %.
+    point_weight
+        Screening weight ``alpha`` tying the iso-surface to the input samples. ``0`` recovers the
+        unscreened Poisson reconstruction (a tiny epsilon is still added to keep the operator SPD).
+    solver_iterations
+        Maximum conjugate-gradient iterations per cascade level.
+    solver_tolerance
+        Relative residual tolerance for the conjugate-gradient solve.
+    confidence
+        When ``True``, weight each sample's splat by ``|normals[i]|`` (treating the normal magnitude
+        as a per-sample confidence), matching PoissonRecon's ``confidence`` flag.
+
+    Returns
+    -------
+    vertices : wp.array[wp.vec3]
+        Iso-surface vertices on ``points.device``.
+    faces : wp.array[wp.int32]
+        Flat ``3 * n_faces`` triangle index buffer, oriented outward
+        ([`make_normals_outward`][triwarp.repair.make_normals_outward]).
+
+    Raises
+    ------
+    ValueError
+        If ``points`` has fewer than 3 points, or the depth/scale parameters are out of range.
+    NotImplementedError
+        On a CPU device (the conjugate-gradient solve requires CUDA).
+
+    See Also
+    --------
+    [`triangulate_point_cloud`][triwarp.reconstruction.triangulate_point_cloud]
+    [`ball_pivoting`][triwarp.reconstruction.ball_pivoting]
+    [`estimate_normals`][triwarp.points.estimate_normals]
+
+    Notes
+    -----
+    The whole system is solved in index space (grid spacing ``1``); the world scale is reapplied by
+    marching cubes via the cube bounds, so the extracted level set is invariant to that scale. The
+    per-node density normalization ``V /= max(W, eps)`` is cruder than PoissonRecon's kernel-density
+    estimate and can bulge on strongly anisotropic clouds. The screening weight ``point_weight`` is
+    not area-normalized as in PoissonRecon, so its numeric scale differs; ``4`` is a reasonable
+    default for unit-scale clouds.
+    """
+    if not (3 <= full_depth <= depth <= 10):
+        raise ValueError(
+            "screened_poisson requires 3 <= full_depth <= depth <= 10, got "
+            f"full_depth={full_depth}, depth={depth}."
+        )
+    if scale <= 0.0:
+        raise ValueError(f"screened_poisson requires scale > 0, got {scale}.")
+
+    device = points.device
+    require_cuda(device, "screened_poisson")
+    n = int(points.shape[0])
+    if n < 3:
+        raise ValueError(f"screened_poisson requires at least 3 points, got {n}.")
+
+    # Padded cubic reconstruction domain centered on the cloud AABB.
+    lo, hi = tw.bounds.aabb_bounds(points)
+    center = 0.5 * (lo + hi)
+    max_extent = max(float(hi[0] - lo[0]), float(hi[1] - lo[1]), float(hi[2] - lo[2]))
+    if max_extent <= 0.0:
+        raise ValueError("screened_poisson requires points with a non-degenerate bounding box.")
+    cube_size = scale * max_extent
+    half = wp.vec3(0.5 * cube_size, 0.5 * cube_size, 0.5 * cube_size)
+    cube_lower = center - half
+    cube_upper = center + half
+
+    # Effective screening weight: a floor keeps the operator SPD even at point_weight == 0.
+    screen = max(float(point_weight), 1e-4)
+
+    # Cascadic coarse-to-fine solve: prolong each level's solution as the next initial guess.
+    prev_solution: wp.array[wp.float32] | None = None
+    prev_res = 0
+    for level in range(full_depth, depth + 1):
+        res = (1 << level) + 1
+        inv_cell = float(res - 1) / cube_size
+        n_nodes = res * res * res
+        if prev_solution is None:
+            initial = wp.zeros(n_nodes, dtype=wp.float32, device=device)
+        else:
+            initial = wp.empty(n_nodes, dtype=wp.float32, device=device)
+            wp.launch(
+                kernel_reconstruction.prolong_grid,
+                dim=(res, res, res),
+                inputs=[prev_solution, prev_res, res, initial],
+                device=device,
+            )
+        prev_solution = _poisson_solve_level(
+            points,
+            normals,
+            cube_lower,
+            inv_cell,
+            res,
+            screen,
+            confidence,
+            initial,
+            solver_iterations,
+            solver_tolerance,
+            device,
+        )
+        prev_res = res
+
+    assert prev_solution is not None
+    solution = prev_solution
+    res = prev_res
+    inv_cell = float(res - 1) / cube_size
+
+    # Iso-value: average of the solution sampled at the input points (PoissonRecon GetIsoValue).
+    sampled = wp.empty(n, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_reconstruction.sample_field_trilinear,
+        dim=n,
+        inputs=[solution, res, cube_lower, inv_cell, points, sampled],
+        device=device,
+    )
+    sampled_np = sampled.numpy()
+    if confidence:
+        weights_np = np.linalg.norm(normals.numpy(), axis=1)
+        total = float(weights_np.sum())
+        iso = float(np.average(sampled_np, weights=weights_np)) if total > 0.0 else 0.0
+    else:
+        iso = float(sampled_np.mean())
+
+    field = solution.reshape((res, res, res))
+    vertices, faces = wp.MarchingCubes.extract_surface_marching_cubes(
+        field, wp.float32(iso), cube_lower, cube_upper
+    )
+    if int(faces.shape[0]) > 0:
+        faces = tw.repair.make_normals_outward(vertices, faces)
+    return vertices, faces
+
+
+def _poisson_solve_level(
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    cube_lower: wp.vec3,
+    inv_cell: float,
+    res: int,
+    screen: float,
+    confidence: bool,
+    initial: wp.array[wp.float32],
+    solver_iterations: int,
+    solver_tolerance: float,
+    device: wp.DeviceLike,
+) -> wp.array[wp.float32]:
+    """
+    Solve one cascade level ``(L_N + screen * W) x = -div V`` matrix-free from ``initial``.
+
+    Splats the oriented normals into the vector field ``V`` and density weight ``W`` on a
+    ``res**3`` node grid, normalizes ``V``, builds the negative-divergence right-hand side, and runs
+    a Jacobi-preconditioned conjugate gradient with the screened Laplacian applied as a
+    ``warp.optim.linear.LinearOperator``. Returns the ``res**3`` solution buffer (``initial`` is the
+    warm start and is returned in place).
+    """
+    n_nodes = res * res * res
+    vx = wp.zeros(n_nodes, dtype=wp.float32, device=device)
+    vy = wp.zeros(n_nodes, dtype=wp.float32, device=device)
+    vz = wp.zeros(n_nodes, dtype=wp.float32, device=device)
+    weights = wp.zeros(n_nodes, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_reconstruction.splat_normals,
+        dim=int(points.shape[0]),
+        inputs=[
+            points,
+            normals,
+            cube_lower,
+            wp.float32(inv_cell),
+            res,
+            wp.int32(1 if confidence else 0),
+            vx,
+            vy,
+            vz,
+            weights,
+        ],
+        device=device,
+    )
+    wp.launch(
+        kernel_reconstruction.normalize_vector_field,
+        dim=n_nodes,
+        inputs=[weights, vx, vy, vz],
+        device=device,
+    )
+    rhs = wp.empty(n_nodes, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_reconstruction.negative_divergence,
+        dim=(res, res, res),
+        inputs=[vx, vy, vz, res, rhs],
+        device=device,
+    )
+    inv_diag = wp.empty(n_nodes, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_reconstruction.screened_inverse_diagonal,
+        dim=(res, res, res),
+        inputs=[weights, wp.float32(screen), res, inv_diag],
+        device=device,
+    )
+
+    operator = _screened_operator(weights, screen, res, n_nodes, device)
+    preconditioner = _diagonal_operator(inv_diag, n_nodes, device)
+    wpl.cg(
+        operator, rhs, initial, tol=solver_tolerance, maxiter=solver_iterations, M=preconditioner
+    )
+    return initial
+
+
+def _screened_operator(
+    weights: wp.array[wp.float32], screen: float, res: int, n_nodes: int, device: wp.DeviceLike
+) -> wpl.LinearOperator:
+    """Matrix-free screened Laplacian ``A = L_N + screen * diag(W)`` as a ``LinearOperator``."""
+
+    def matvec(x, y, z, alpha, beta):
+        wp.launch(
+            kernel_reconstruction.screened_laplacian_matvec,
+            dim=(res, res, res),
+            inputs=[x, y, weights, wp.float32(screen), wp.float32(alpha), wp.float32(beta), res, z],
+            device=device,
+        )
+
+    return wpl.LinearOperator((n_nodes, n_nodes), wp.float32, wp.get_device(device), matvec)
+
+
+def _diagonal_operator(
+    inv_diag: wp.array[wp.float32], n_nodes: int, device: wp.DeviceLike
+) -> wpl.LinearOperator:
+    """Jacobi (inverse-diagonal) preconditioner as a ``LinearOperator``."""
+
+    def matvec(x, y, z, alpha, beta):
+        wp.launch(
+            kernel_reconstruction.diagonal_precond_matvec,
+            dim=n_nodes,
+            inputs=[x, y, inv_diag, wp.float32(alpha), wp.float32(beta), z],
+            device=device,
+        )
+
+    return wpl.LinearOperator((n_nodes, n_nodes), wp.float32, wp.get_device(device), matvec)
+
+
+def ball_pivoting(
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3] | None = None,
+    *,
+    radius: float = 0.0,
+    clustering: float = 0.2,
+    crease_angle: float = math.pi / 2.0,
+    max_waves: int = 0,
+    crit_hole_length: float = 0.0,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Ball-pivoting surface reconstruction from an oriented point cloud (interpolating).
+
+    GPU-native, wave-parallel port of the ball-pivoting algorithm (PyMeshLab's
+    ``generate_surface_reconstruction_ball_pivoting``, ``open3d``'s
+    ``create_from_point_cloud_ball_pivoting``, vcglib BPA). A ball of the given ``radius`` is rolled
+    over the oriented points; wherever it rests on three points without containing another point it
+    forms a triangle, and it then pivots around each boundary edge of the growing front to add the
+    next triangle. The output mesh **interpolates** the input points (its vertices are a subset of
+    ``points``), unlike the implicit
+    [`screened_poisson`][triwarp.reconstruction.screened_poisson].
+
+    Each wave recomputes the advancing front from the current triangle soup (front = boundary
+    edges), pivots every front edge independently through a hash-grid ball query, and commits a
+    conflict-free
+    independent set of triangles via a two-phase vertex claim. Manifoldness is protected by an
+    interior-edge guard (an edge already shared by two triangles never gains a third). The result is
+    passed through the standard cleanup tail (deduplicate, drop degenerate / non-manifold faces,
+    orient outward, optionally fill small holes).
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` point positions on the target device (``n >= 3``).
+    normals
+        Optional ``(n,)`` oriented unit normals. When ``None``, they are estimated by PCA oriented
+        outward from the centroid ([`estimate_normals`][triwarp.points.estimate_normals]; valid for
+        star-shaped clouds only).
+    radius
+        Ball radius. When ``<= 0``, it is auto-guessed as ``1.5 x`` the mean nearest-neighbour
+        spacing.
+    clustering
+        Candidate points closer than ``clustering * radius`` to an edge endpoint are rejected
+        (vcglib clustering, as a fraction of ``radius``).
+    crease_angle
+        Maximum dihedral angle (radians) between a new triangle and the one it pivots from; larger
+        folds are rejected. Use ``>= pi`` to disable the crease guard.
+    max_waves
+        Maximum number of parallel waves. ``0`` picks a generous safety cap from the point count.
+    crit_hole_length
+        Boundary loops with perimeter at most this value are filled at the end. ``0`` disables hole
+        filling; a negative value defaults to ``0.1 x`` the bounding-box diagonal.
+
+    Returns
+    -------
+    vertices : wp.array[wp.vec3]
+        The referenced input points, compacted from index zero, on ``points.device``.
+    faces : wp.array[wp.int32]
+        Flat ``3 * n_faces`` triangle index buffer, oriented outward.
+
+    Raises
+    ------
+    ValueError
+        If fewer than 3 points are given, or the triangle budget (``4 n`` faces) overflows.
+
+    See Also
+    --------
+    [`screened_poisson`][triwarp.reconstruction.screened_poisson]
+    [`triangulate_point_cloud`][triwarp.reconstruction.triangulate_point_cloud]
+    [`estimate_normals`][triwarp.points.estimate_normals]
+
+    Notes
+    -----
+    A single radius is used (the classic multi-radius schedule is a documented follow-up). Wave
+    order is non-deterministic, so the exact triangulation varies run to run.
+
+    **v1 limitation (watertightness).** Unlike the serial reference algorithm, this wave-parallel
+    front is rebuilt from the triangle soup each wave and lacks the persistent per-vertex fan
+    structure that keeps colliding fronts aligned. On densely, uniformly sampled closed surfaces the
+    independent fronts can therefore triangulate a neighbourhood in slightly overlapping layers, so
+    the result is **interpolating and edge-manifold (after cleanup) but not guaranteed watertight**.
+    It is most useful for its interpolating, empty-ball guarantee and explicit radius control; for a
+    guaranteed watertight surface use [`screened_poisson`][triwarp.reconstruction.screened_poisson]
+    or [`triangulate_point_cloud`][triwarp.reconstruction.triangulate_point_cloud]. Regions sampled
+    too sparsely for the ball to rest are left as holes (widen ``radius`` or set
+    ``crit_hole_length``).
+    """
+    device = points.device
+    n = int(points.shape[0])
+    if n < 3:
+        return wp.clone(points), wp.empty(0, dtype=wp.int32, device=device)
+
+    # Nearest-neighbour table drives both the radius auto-guess and (if needed) normal estimation.
+    neighbor_idx, neighbor_dist = tw.neighbors.query_bvh_nearest(points, points, k=7)
+    if radius <= 0.0:
+        distances = neighbor_dist.numpy()[:, 1:]
+        finite = distances[np.isfinite(distances) & (distances > 0.0)]
+        spacing = float(finite.mean()) if finite.size > 0 else 1.0
+        radius = 1.5 * spacing
+    if normals is None:
+        normals = tw.points.estimate_normals(points, neighbor_idx)
+
+    grid = tw.neighbors.hashgrid_from_points(points, 2.0 * radius)
+    crease_cos = math.cos(crease_angle) if crease_angle < math.pi else -1.0
+
+    max_faces = 4 * n + 16
+    all_faces = wp.empty(max_faces * 3, dtype=wp.int32, device=device)
+    face_count = wp.zeros(1, dtype=wp.int32, device=device)
+    key_base = wp.uint64(n)
+    waves = max_waves if max_waves > 0 else 16 * n
+
+    for _ in range(waves):
+        count = int(face_count.numpy()[0])
+        faces_view = all_faces[: count * 3]
+        committed = 0
+        if count > 0:
+            committed = _bpa_pivot_wave(
+                points,
+                normals,
+                faces_view,
+                grid,
+                radius,
+                clustering,
+                crease_cos,
+                key_base,
+                n,
+                all_faces,
+                face_count,
+                max_faces,
+                device,
+            )
+        if committed == 0:
+            committed = _bpa_seed_wave(
+                points,
+                normals,
+                faces_view,
+                grid,
+                radius,
+                clustering,
+                n,
+                all_faces,
+                face_count,
+                max_faces,
+                device,
+            )
+        if committed == 0:
+            break
+        if int(face_count.numpy()[0]) >= max_faces:
+            raise ValueError(
+                "ball_pivoting exceeded its triangle budget; the radius is likely far too small."
+            )
+
+    faces = wp.clone(all_faces[: int(face_count.numpy()[0]) * 3])
+    return _clean_reconstruction(points, faces, crit_hole_length)
+
+
+def _bpa_seed_wave(
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    faces_view: wp.array[wp.int32],
+    grid: wp.HashGrid,
+    radius: float,
+    clustering: float,
+    n: int,
+    all_faces: wp.array[wp.int32],
+    face_count: wp.array[wp.int32],
+    max_faces: int,
+    device: wp.DeviceLike,
+) -> int:
+    """Seed one wave of orphan triangles and commit a conflict-free set of them."""
+    if int(faces_view.shape[0]) > 0:
+        point_used = tw.array.indices_to_mask(faces_view, n, device=device)
+    else:
+        point_used = wp.zeros(n, dtype=wp.bool, device=device)
+    tri_a = wp.empty(n, dtype=wp.int32, device=device)
+    tri_b = wp.empty(n, dtype=wp.int32, device=device)
+    tri_c = wp.empty(n, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_bpa.seed_triangles,
+        dim=n,
+        inputs=[
+            points,
+            normals,
+            point_used,
+            grid.id,
+            wp.float32(radius),
+            wp.float32(clustering),
+            tri_a,
+            tri_b,
+            tri_c,
+        ],
+        device=device,
+    )
+    active = wp.empty(n, dtype=wp.bool, device=device)
+    wp.map(kernel_array.greater_equal, tri_a, wp.int32(0), out=active)
+    return _bpa_commit(tri_a, tri_b, tri_c, active, n, all_faces, face_count, max_faces, device)
+
+
+def _bpa_pivot_wave(
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    faces_view: wp.array[wp.int32],
+    grid: wp.HashGrid,
+    radius: float,
+    clustering: float,
+    crease_cos: float,
+    key_base: wp.uint64,
+    n: int,
+    all_faces: wp.array[wp.int32],
+    face_count: wp.array[wp.int32],
+    max_faces: int,
+    device: wp.DeviceLike,
+) -> int:
+    """Pivot every front edge of the soup, commit a conflict-free set of new triangles."""
+    n_faces = int(faces_view.shape[0]) // 3
+    unique_edges, inverse = tw.edges.edges_unique(faces_view, n_vertices=n)
+    m = int(unique_edges.shape[0])
+    if m == 0:
+        return 0
+    edge_face_count = wp.zeros(m, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_bpa.count_edge_faces,
+        dim=3 * n_faces,
+        inputs=[inverse, edge_face_count],
+        device=device,
+    )
+
+    # Sorted keys of interior (2-face) edges: the manifold guard for the pivot.
+    flags = wp.empty(m, dtype=wp.int32, device=device)
+    keys = wp.empty(m, dtype=wp.uint64, device=device)
+    wp.launch(
+        kernel_bpa.mark_interior_edge_keys,
+        dim=m,
+        inputs=[unique_edges, edge_face_count, key_base, flags, keys],
+        device=device,
+    )
+    flags_bool = wp.empty(m, dtype=wp.bool, device=device)
+    wp.map(kernel_array.greater, flags, wp.int32(0), out=flags_bool)
+    interior_keys = _sorted_keys(tw.array.gather(keys, tw.array.flatnonzero(flags_bool)), device)
+
+    # Front (single-use) edges with their opposite vertex.
+    front_src = wp.empty(m, dtype=wp.int32, device=device)
+    front_tgt = wp.empty(m, dtype=wp.int32, device=device)
+    front_opp = wp.empty(m, dtype=wp.int32, device=device)
+    front_count = wp.zeros(1, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_bpa.emit_front_edges,
+        dim=3 * n_faces,
+        inputs=[faces_view, inverse, edge_face_count, front_src, front_tgt, front_opp, front_count],
+        device=device,
+    )
+    n_front = int(front_count.numpy()[0])
+    if n_front == 0:
+        return 0
+
+    src = front_src[:n_front]
+    tgt = front_tgt[:n_front]
+
+    # Availability guard: a candidate must be orphan or itself on the front (never fully interior).
+    used = tw.array.indices_to_mask(faces_view, n, device=device)
+    point_available = wp.empty(n, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_bpa.init_available_from_used, dim=n, inputs=[used, point_available], device=device
+    )
+    wp.launch(
+        kernel_bpa.mark_front_endpoints,
+        dim=n_front,
+        inputs=[src, tgt, point_available],
+        device=device,
+    )
+
+    candidate = wp.empty(n_front, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_bpa.pivot_front_edges,
+        dim=n_front,
+        inputs=[
+            points,
+            normals,
+            src,
+            tgt,
+            front_opp[:n_front],
+            point_available,
+            grid.id,
+            wp.float32(radius),
+            wp.float32(clustering),
+            wp.float32(crease_cos),
+            interior_keys,
+            key_base,
+            candidate,
+        ],
+        device=device,
+    )
+    active = wp.empty(n_front, dtype=wp.bool, device=device)
+    wp.map(kernel_array.greater_equal, candidate, wp.int32(0), out=active)
+    return _bpa_commit(
+        wp.clone(src), wp.clone(tgt), candidate, active, n, all_faces, face_count, max_faces, device
+    )
+
+
+def _bpa_commit(
+    tri_a: wp.array[wp.int32],
+    tri_b: wp.array[wp.int32],
+    tri_c: wp.array[wp.int32],
+    active: wp.array[wp.bool],
+    n: int,
+    all_faces: wp.array[wp.int32],
+    face_count: wp.array[wp.int32],
+    max_faces: int,
+    device: wp.DeviceLike,
+) -> int:
+    """Two-phase vertex-claim / commit of the proposed triangles; returns the number committed."""
+    length = int(tri_a.shape[0])
+    if length == 0:
+        return 0
+    owner = wp.full(n, INT32_MAX, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_bpa.claim_triangle_vertices,
+        dim=length,
+        inputs=[tri_a, tri_b, tri_c, active, owner],
+        device=device,
+    )
+    before = int(face_count.numpy()[0])
+    wp.launch(
+        kernel_bpa.commit_triangles,
+        dim=length,
+        inputs=[tri_a, tri_b, tri_c, active, owner, wp.int32(max_faces), all_faces, face_count],
+        device=device,
+    )
+    return int(face_count.numpy()[0]) - before
+
+
+def _sorted_keys(keys: wp.array[wp.uint64], device: wp.DeviceLike) -> wp.array[wp.uint64]:
+    """Ascending sort of ``uint64`` edge keys for the in-kernel binary-search guard."""
+    n_keys = int(keys.shape[0])
+    if n_keys == 0:
+        return keys
+    keys_buffer = wp.empty(2 * n_keys, dtype=wp.uint64, device=device)
+    wp.copy(keys_buffer, keys, count=n_keys)
+    vals_buffer = tw.array.init_sort_pair_indices(n_keys, -1, device)
+    wp.utils.radix_sort_pairs(keys_buffer, vals_buffer, count=n_keys)
+    return keys_buffer[:n_keys]
+
+
+def _clean_reconstruction(
+    points: wp.array[wp.vec3], faces: wp.array[wp.int32], crit_hole_length: float
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """Shared reconstruction cleanup: dedup, drop degenerate/non-manifold, orient, fill holes."""
+    if int(faces.shape[0]) == 0:
+        return wp.clone(points), faces
+
+    faces, _ = tw.repair.resolve_duplicated_faces(faces)
+    vertices, faces = tw.repair.remove_degenerate_faces(points, faces)
+    vertices, faces = tw.repair.remove_non_manifold_faces(vertices, faces)
+
+    if int(faces.shape[0]) > 0:
+        faces = tw.repair.make_normals_outward(vertices, faces)
+        if crit_hole_length != 0.0:
+            hole_length = crit_hole_length
+            if hole_length < 0.0:
+                lo, hi = tw.bounds.aabb_bounds(points)
+                hole_length = 0.1 * float(wp.length(hi - lo))
+            faces = tw.hole_filling.fill_small_holes(vertices, faces, hole_length)
     return vertices, faces

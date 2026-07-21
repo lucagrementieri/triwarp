@@ -171,9 +171,7 @@ def test_edge_manifold_mask_edges_sorted_shortcut(icosahedron: tuple[tm.Trimesh,
     _, mesh_wp = icosahedron
     edges_sorted = tw.edges.faces_to_edges(mesh_wp.indices, sorted=True)
     mask_default = tw.validation.edge_manifold_mask(mesh_wp.indices)
-    mask_shortcut = tw.validation.edge_manifold_mask(
-        mesh_wp.indices, edges_sorted=edges_sorted
-    )
+    mask_shortcut = tw.validation.edge_manifold_mask(mesh_wp.indices, edges_sorted=edges_sorted)
     assert np.array_equal(mask_default.numpy(), mask_shortcut.numpy())
 
 
@@ -425,9 +423,7 @@ def test_face_watertight_mask_matches_reference(
     mask_np = _edge_manifold_mask_np(mesh_tm.faces, allow_boundary_edges=False)
     assert np.array_equal(mask_wp.numpy(), mask_np)
     # Equivalent to edge_manifold_mask with boundary edges disallowed.
-    edge_mask_wp = tw.validation.edge_manifold_mask(
-        mesh_wp.indices, allow_boundary_edges=False
-    )
+    edge_mask_wp = tw.validation.edge_manifold_mask(mesh_wp.indices, allow_boundary_edges=False)
     assert np.array_equal(mask_wp.numpy(), edge_mask_wp.numpy())
 
 

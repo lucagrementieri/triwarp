@@ -33,9 +33,7 @@ def compute_midpoints(
 
 
 @wp.func
-def split_face_four(
-    fv: wp.vec3i, mv: wp.vec3i
-) -> tuple[wp.vec3i, wp.vec3i, wp.vec3i, wp.vec3i]:
+def split_face_four(fv: wp.vec3i, mv: wp.vec3i) -> tuple[wp.vec3i, wp.vec3i, wp.vec3i, wp.vec3i]:
     # 1 -> 4 loop-subdivision template: three corner triangles, then the central triangle.
     t0 = wp.vec3i(fv[0], mv[0], mv[2])
     t1 = wp.vec3i(mv[0], fv[1], mv[1])
@@ -644,3 +642,359 @@ def commit_flips(
     out_faces[f1 * 3 + 1] = d
     out_faces[f1 * 3 + 2] = b
     wp.atomic_add(out_count, 0, 1)
+
+
+# ===========================================================================
+# Isotropic explicit remeshing (Botsch-Kobbelt split/collapse/flip/smooth/reproject)
+#
+# Split reuses subdivide_to_size. The kernels below add: feature/boundary classification
+# (per-vertex FREE/CREASE/CORNER codes), a parallel edge-collapse primitive with full 1-ring
+# locking + link-condition guard, valence-driven edge flips, tangential Laplacian smoothing, and
+# reprojection of free vertices onto the original surface.
+# ===========================================================================
+FREE_VERTEX = wp.constant(wp.int32(0))
+CREASE_VERTEX = wp.constant(wp.int32(1))
+CORNER_VERTEX = wp.constant(wp.int32(2))
+
+
+@wp.kernel
+def count_edge_faces(
+    inverse: wp.array(dtype=wp.int32), out_count: wp.array(dtype=wp.int32)
+) -> None:
+    # Per unique edge: number of incident face-corners (2 interior, 1 boundary).
+    c = int(wp.tid())
+    wp.atomic_add(out_count, inverse[c], 1)
+
+
+@wp.kernel
+def scatter_edge_endpoint_counts(
+    edges: wp.array2d(dtype=wp.int32), out_count: wp.array(dtype=wp.int32)
+) -> None:
+    # Add 1 to the per-vertex counter for both endpoints of every listed edge.
+    e = int(wp.tid())
+    wp.atomic_add(out_count, edges[e, 0], 1)
+    wp.atomic_add(out_count, edges[e, 1], 1)
+
+
+@wp.kernel
+def scatter_feature_endpoint_counts(
+    adjacency_edges: wp.array2d(dtype=wp.int32),
+    angles: wp.array(dtype=wp.float32),
+    feature_angle: wp.float32,
+    out_count: wp.array(dtype=wp.int32),
+) -> None:
+    # Add 1 to both endpoints of every interior edge sharper than feature_angle.
+    k = int(wp.tid())
+    if angles[k] > feature_angle:
+        wp.atomic_add(out_count, adjacency_edges[k, 0], 1)
+        wp.atomic_add(out_count, adjacency_edges[k, 1], 1)
+
+
+@wp.kernel
+def finalize_vertex_codes(
+    feature_count: wp.array(dtype=wp.int32), out_code: wp.array(dtype=wp.int32)
+) -> None:
+    # 0 feature edges -> FREE; exactly 2 -> CREASE (on a smooth feature/boundary line);
+    # anything else (1 = feature endpoint, >=3 = junction) -> CORNER (frozen).
+    v = int(wp.tid())
+    count = feature_count[v]
+    code = CORNER_VERTEX
+    if count == 0:
+        code = FREE_VERTEX
+    elif count == 2:
+        code = CREASE_VERTEX
+    out_code[v] = code
+
+
+@wp.func
+def csr_common_neighbor_count(
+    offsets: wp.array(dtype=wp.int32), columns: wp.array(dtype=wp.int32), a: wp.int32, b: wp.int32
+) -> wp.int32:
+    # Number of vertices adjacent to both a and b (two nested scans; degrees are tiny).
+    count = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
+    for i in range(offsets[a], offsets[a + 1]):
+        w = columns[i]
+        for j in range(offsets[b], offsets[b + 1]):
+            if columns[j] == w:
+                count += 1
+    return count
+
+
+@wp.kernel(enable_backward=False)
+def collapse_candidates(
+    unique_edges: wp.array2d(dtype=wp.int32),
+    lengths: wp.array(dtype=wp.float32),
+    vertices: wp.array(dtype=wp.vec3),
+    codes: wp.array(dtype=wp.int32),
+    edge_face_count: wp.array(dtype=wp.int32),
+    offsets: wp.array(dtype=wp.int32),
+    columns: wp.array(dtype=wp.int32),
+    low: wp.float32,
+    high: wp.float32,
+    out_survivor: wp.array(dtype=wp.int32),
+    out_removed: wp.array(dtype=wp.int32),
+    out_pos: wp.array(dtype=wp.vec3),
+) -> None:
+    k = int(wp.tid())
+    out_survivor[k] = -1
+    if lengths[k] >= low:
+        return
+    u = unique_edges[k, 0]
+    v = unique_edges[k, 1]
+    cu = codes[u]
+    cv = codes[v]
+    is_boundary = edge_face_count[k] == 1
+
+    # Choose the surviving vertex and its target position (features/corners stay put).
+    s = u
+    r = v
+    p = 0.5 * (vertices[u] + vertices[v])
+    reject = False
+    if cu == CORNER_VERTEX and cv == CORNER_VERTEX:
+        reject = True
+    elif cu >= CREASE_VERTEX and cv >= CREASE_VERTEX:
+        # Two feature vertices: only collapse along a boundary edge (both plain creases).
+        if is_boundary and cu == CREASE_VERTEX and cv == CREASE_VERTEX:
+            s = u
+            r = v
+            p = 0.5 * (vertices[u] + vertices[v])
+        else:
+            reject = True
+    elif cu >= CREASE_VERTEX:
+        s = u
+        r = v
+        p = vertices[u]
+    elif cv >= CREASE_VERTEX:
+        s = v
+        r = u
+        p = vertices[v]
+    if reject:
+        return
+
+    # Link condition: exactly 2 shared neighbours for an interior edge, 1 for a boundary edge.
+    required = 2
+    if is_boundary:
+        required = 1
+    if csr_common_neighbor_count(offsets, columns, u, v) != required:
+        return
+
+    # Anti-oscillation: reject if the collapse would create an edge longer than the high band.
+    for i in range(offsets[r], offsets[r + 1]):
+        w = columns[i]
+        if w != s and wp.length(p - vertices[w]) > high:
+            return
+
+    out_survivor[k] = s
+    out_removed[k] = r
+    out_pos[k] = p
+
+
+@wp.kernel(enable_backward=False)
+def claim_collapses(
+    out_survivor: wp.array(dtype=wp.int32),
+    out_removed: wp.array(dtype=wp.int32),
+    offsets: wp.array(dtype=wp.int32),
+    columns: wp.array(dtype=wp.int32),
+    out_claim: wp.array(dtype=wp.int32),
+) -> None:
+    # Lock the full closed 1-ring of both endpoints (min edge id wins), so committed
+    # collapses have disjoint neighbourhoods and stay independent.
+    k = int(wp.tid())
+    s = out_survivor[k]
+    if s < 0:
+        return
+    r = out_removed[k]
+    wp.atomic_min(out_claim, s, k)
+    wp.atomic_min(out_claim, r, k)
+    for i in range(offsets[s], offsets[s + 1]):
+        wp.atomic_min(out_claim, columns[i], k)
+    for i in range(offsets[r], offsets[r + 1]):
+        wp.atomic_min(out_claim, columns[i], k)
+
+
+@wp.kernel(enable_backward=False)
+def commit_collapses(
+    out_survivor: wp.array(dtype=wp.int32),
+    out_removed: wp.array(dtype=wp.int32),
+    out_pos: wp.array(dtype=wp.vec3),
+    offsets: wp.array(dtype=wp.int32),
+    columns: wp.array(dtype=wp.int32),
+    claim: wp.array(dtype=wp.int32),
+    out_remap: wp.array(dtype=wp.int32),
+    out_positions: wp.array(dtype=wp.vec3),
+    out_count: wp.array(dtype=wp.int32),
+) -> None:
+    k = int(wp.tid())
+    s = out_survivor[k]
+    if s < 0:
+        return
+    r = out_removed[k]
+    won = True
+    if claim[s] != k or claim[r] != k:
+        won = False
+    for i in range(offsets[s], offsets[s + 1]):
+        if claim[columns[i]] != k:
+            won = False
+    for i in range(offsets[r], offsets[r + 1]):
+        if claim[columns[i]] != k:
+            won = False
+    if not won:
+        return
+    out_remap[r] = s
+    out_positions[s] = out_pos[k]
+    wp.atomic_add(out_count, 0, 1)
+
+
+@wp.kernel
+def mark_distinct_faces(
+    faces: wp.array(dtype=wp.int32), out_valid: wp.array(dtype=wp.bool)
+) -> None:
+    # A face survives a collapse remap only if its three vertex indices are still distinct.
+    f = int(wp.tid())
+    a = faces[f * 3 + 0]
+    b = faces[f * 3 + 1]
+    c = faces[f * 3 + 2]
+    out_valid[f] = a != b and b != c and a != c
+
+
+@wp.kernel
+def accumulate_vertex_valence(
+    unique_edges: wp.array2d(dtype=wp.int32), out_valence: wp.array(dtype=wp.int32)
+) -> None:
+    e = int(wp.tid())
+    wp.atomic_add(out_valence, unique_edges[e, 0], 1)
+    wp.atomic_add(out_valence, unique_edges[e, 1], 1)
+
+
+@wp.func
+def _face_normal(
+    faces: wp.array(dtype=wp.int32), vertices: wp.array(dtype=wp.vec3), f: wp.int32
+) -> wp.vec3:
+    a = vertices[faces[f * 3 + 0]]
+    b = vertices[faces[f * 3 + 1]]
+    c = vertices[faces[f * 3 + 2]]
+    return wp.normalize(wp.cross(b - a, c - a))
+
+
+@wp.kernel
+def valence_flip_candidates(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    adjacency: wp.array2d[wp.int32],
+    adjacency_edges: wp.array2d[wp.int32],
+    unshared: wp.array2d[wp.int32],
+    sorted_edge_keys: wp.array[wp.uint64],
+    key_base: wp.uint64,
+    valence: wp.array[wp.int32],
+    boundary_vertex: wp.array[wp.bool],
+    feature_angle: wp.float32,
+    out_flip: wp.array[wp.bool],
+    out_quad: wp.array2d[wp.int32],
+) -> None:
+    k = int(wp.tid())
+    out_flip[k] = wp.bool(False)
+    f0 = adjacency[k, 0]
+    f1 = adjacency[k, 1]
+    # Never flip a feature edge (sharp dihedral between the two incident faces).
+    n0 = _face_normal(faces, vertices, f0)
+    n1 = _face_normal(faces, vertices, f1)
+    if wp.acos(wp.clamp(wp.dot(n0, n1), -1.0, 1.0)) > feature_angle:
+        return
+    quad = _resolve_flip_quad_guarded(
+        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, wp.int32(k), f0, out_quad
+    )
+    a = quad[0]
+    b = quad[1]
+    c = quad[2]
+    d = quad[3]
+    if a < 0:
+        return
+    if not _is_unfold_quad_convex_d(
+        to_vec3d(vertices[a]), to_vec3d(vertices[b]), to_vec3d(vertices[c]), to_vec3d(vertices[d])
+    ):
+        return
+    ta = 6
+    if boundary_vertex[a]:
+        ta = 4
+    tb = 6
+    if boundary_vertex[b]:
+        tb = 4
+    tc = 6
+    if boundary_vertex[c]:
+        tc = 4
+    td = 6
+    if boundary_vertex[d]:
+        td = 4
+    va = valence[a]
+    vb = valence[b]
+    vc = valence[c]
+    vd = valence[d]
+    before = (
+        (va - ta) * (va - ta)
+        + (vb - tb) * (vb - tb)
+        + (vc - tc) * (vc - tc)
+        + (vd - td) * (vd - td)
+    )
+    after = (
+        (va - 1 - ta) * (va - 1 - ta)
+        + (vb + 1 - tb) * (vb + 1 - tb)
+        + (vc - 1 - tc) * (vc - 1 - tc)
+        + (vd + 1 - td) * (vd + 1 - td)
+    )
+    out_flip[k] = after < before
+
+
+@wp.kernel
+def accumulate_one_ring(
+    unique_edges: wp.array2d(dtype=wp.int32),
+    vertices: wp.array(dtype=wp.vec3),
+    out_sum: wp.array(dtype=wp.vec3),
+    out_degree: wp.array(dtype=wp.int32),
+) -> None:
+    e = int(wp.tid())
+    u = unique_edges[e, 0]
+    v = unique_edges[e, 1]
+    wp.atomic_add(out_sum, u, vertices[v])
+    wp.atomic_add(out_degree, u, 1)
+    wp.atomic_add(out_sum, v, vertices[u])
+    wp.atomic_add(out_degree, v, 1)
+
+
+@wp.kernel
+def tangential_smooth_step(
+    vertices: wp.array(dtype=wp.vec3),
+    codes: wp.array(dtype=wp.int32),
+    normals: wp.array(dtype=wp.vec3),
+    ring_sum: wp.array(dtype=wp.vec3),
+    degree: wp.array(dtype=wp.int32),
+    lam: wp.float32,
+    out_positions: wp.array(dtype=wp.vec3),
+) -> None:
+    i = int(wp.tid())
+    p = vertices[i]
+    out_positions[i] = p
+    if codes[i] != FREE_VERTEX or degree[i] == 0:
+        return
+    centroid = ring_sum[i] / float(degree[i])
+    delta = centroid - p
+    n = normals[i]
+    tangential = delta - n * wp.dot(n, delta)  # project out the normal component
+    out_positions[i] = p + lam * tangential
+
+
+@wp.kernel(enable_backward=False)
+def reproject_vertices(
+    mesh_id: wp.uint64,
+    codes: wp.array(dtype=wp.int32),
+    vertices: wp.array(dtype=wp.vec3),
+    max_dist: wp.float32,
+    out_positions: wp.array(dtype=wp.vec3),
+) -> None:
+    i = int(wp.tid())
+    p = vertices[i]
+    out_positions[i] = p
+    if codes[i] != FREE_VERTEX:
+        return
+    query = wp.mesh_query_point_no_sign(mesh_id, p, max_dist)
+    if query.result:
+        out_positions[i] = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)

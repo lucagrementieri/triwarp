@@ -17,26 +17,28 @@ _R = TypeVar("_R")
 # functional update that keeps the same faces and the same vertex count (`with_vertices`)
 # can carry these forward instead of recomputing them. Every new cached property below must
 # be added to this set (if faces-only) or left out of it (if it also depends on `vertices`).
-_TOPOLOGY_KEYS: frozenset[str] = frozenset({
-    "edges",
-    "edges_sorted",
-    "edges_face",
-    "edges_unique",
-    "edges_unique_inverse",
-    "face_adjacency",
-    "face_adjacency_edges",
-    "face_adjacency_unshared",
-    "face_connected_component_labels",
-    "boundary_edges",
-    "oriented_boundary_edges",
-    "boundary_loops",
-    "boundary_vertex_indices",
-    "euler_characteristic",
-    "is_edge_manifold",
-    "is_vertex_manifold",
-    "is_winding_consistent",
-    "is_orientable",
-})
+_TOPOLOGY_KEYS: frozenset[str] = frozenset(
+    {
+        "edges",
+        "edges_sorted",
+        "edges_face",
+        "edges_unique",
+        "edges_unique_inverse",
+        "face_adjacency",
+        "face_adjacency_edges",
+        "face_adjacency_unshared",
+        "face_connected_component_labels",
+        "boundary_edges",
+        "oriented_boundary_edges",
+        "boundary_loops",
+        "boundary_vertex_indices",
+        "euler_characteristic",
+        "is_edge_manifold",
+        "is_vertex_manifold",
+        "is_winding_consistent",
+        "is_orientable",
+    }
+)
 
 
 class _CachedProperty(Generic[_R]):
@@ -59,9 +61,7 @@ class _CachedProperty(Generic[_R]):
     def __get__(self, obj: None, objtype: type | None = None) -> _CachedProperty[_R]: ...
     @overload
     def __get__(self, obj: Trimesh, objtype: type | None = None) -> _R: ...
-    def __get__(
-        self, obj: Trimesh | None, objtype: type | None = None
-    ) -> _CachedProperty[_R] | _R:
+    def __get__(self, obj: Trimesh | None, objtype: type | None = None) -> _CachedProperty[_R] | _R:
         if obj is None:
             return self
         if self._key not in obj._cache:

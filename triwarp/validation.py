@@ -255,9 +255,7 @@ def is_vertex_manifold(
 
     labels = tw.graph.connected_component_labels_from_edges(corner_edges, node_count=n_corners)
 
-    min_label = wp.full(
-        n_vertices, twt.dtype_max(wp.int32), dtype=wp.int32, device=device
-    )
+    min_label = wp.full(n_vertices, twt.dtype_max(wp.int32), dtype=wp.int32, device=device)
     manifold = wp.zeros(n_vertices, dtype=wp.bool, device=device)
     wp.launch(
         kernel_validation.corner_vertex_reduce,
@@ -324,9 +322,7 @@ def vertex_manifold_mask(
 
     labels = tw.graph.connected_component_labels_from_edges(corner_edges, node_count=n_corners)
 
-    min_label = wp.full(
-        n_vertices, twt.dtype_max(wp.int32), dtype=wp.int32, device=device
-    )
+    min_label = wp.full(n_vertices, twt.dtype_max(wp.int32), dtype=wp.int32, device=device)
     manifold = wp.zeros(n_vertices, dtype=wp.bool, device=device)
     wp.launch(
         kernel_validation.corner_vertex_reduce,

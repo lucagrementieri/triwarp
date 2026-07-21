@@ -435,3 +435,277 @@ def canonicalize_triangles(
     out_sorted[t, 0] = i
     out_sorted[t, 1] = j
     out_sorted[t, 2] = k
+
+
+# ======================================================================================
+# Screened-Poisson dense-grid kernels (Kazhdan PoissonRecon-style, index-space h = 1)
+#
+# A node-centered dense grid of ``res**3`` scalar nodes is stored flat (row-major
+# ``(i * res + j) * res + k``). The pipeline: (1) trilinear-splat the oriented normals into
+# a vector field ``V`` with a density weight ``W``; (2) normalize ``V /= max(W, eps)``;
+# (3) build the RHS ``b = -div V`` by central differences; (4) solve
+# ``(L_N + point_weight * W) x = b`` matrix-free (7-point homogeneous-Neumann Laplacian plus a
+# lumped screening diagonal); (5) sample ``x`` at the input points for the iso-value. The screening
+# diagonal is strictly positive at occupied nodes, so the operator is SPD (no constant null space).
+# Everything is index-space (grid spacing 1); the world scale is reapplied by marching cubes.
+# ======================================================================================
+POISSON_WEIGHT_EPS = wp.constant(wp.float32(1e-8))
+
+
+@wp.func
+def poisson_grid_index(i: wp.int32, j: wp.int32, k: wp.int32, res: wp.int32) -> wp.int32:
+    # Row-major flat index into a res**3 node grid (cube: ny = nz = res).
+    return (i * res + j) * res + k
+
+
+@wp.func
+def poisson_sample_grid(
+    field: wp.array(dtype=wp.float32), res: wp.int32, gx: wp.float32, gy: wp.float32, gz: wp.float32
+) -> wp.float32:
+    # Trilinear interpolation of ``field`` at grid coordinate (gx, gy, gz) in [0, res - 1].
+    i0 = int(wp.floor(gx))
+    j0 = int(wp.floor(gy))
+    k0 = int(wp.floor(gz))
+    if i0 < 0:
+        i0 = 0
+    if j0 < 0:
+        j0 = 0
+    if k0 < 0:
+        k0 = 0
+    if i0 > res - 2:
+        i0 = res - 2
+    if j0 > res - 2:
+        j0 = res - 2
+    if k0 > res - 2:
+        k0 = res - 2
+    fx = wp.clamp(gx - float(i0), 0.0, 1.0)
+    fy = wp.clamp(gy - float(j0), 0.0, 1.0)
+    fz = wp.clamp(gz - float(k0), 0.0, 1.0)
+    c000 = field[poisson_grid_index(i0, j0, k0, res)]
+    c100 = field[poisson_grid_index(i0 + 1, j0, k0, res)]
+    c010 = field[poisson_grid_index(i0, j0 + 1, k0, res)]
+    c110 = field[poisson_grid_index(i0 + 1, j0 + 1, k0, res)]
+    c001 = field[poisson_grid_index(i0, j0, k0 + 1, res)]
+    c101 = field[poisson_grid_index(i0 + 1, j0, k0 + 1, res)]
+    c011 = field[poisson_grid_index(i0, j0 + 1, k0 + 1, res)]
+    c111 = field[poisson_grid_index(i0 + 1, j0 + 1, k0 + 1, res)]
+    c00 = c000 * (1.0 - fx) + c100 * fx
+    c10 = c010 * (1.0 - fx) + c110 * fx
+    c01 = c001 * (1.0 - fx) + c101 * fx
+    c11 = c011 * (1.0 - fx) + c111 * fx
+    c0 = c00 * (1.0 - fy) + c10 * fy
+    c1 = c01 * (1.0 - fy) + c11 * fy
+    return c0 * (1.0 - fz) + c1 * fz
+
+
+@wp.kernel(enable_backward=False)
+def splat_normals(
+    points: wp.array(dtype=wp.vec3),
+    normals: wp.array(dtype=wp.vec3),
+    cube_lower: wp.vec3,
+    inv_cell: wp.float32,
+    res: wp.int32,
+    confidence: wp.int32,
+    out_vx: wp.array(dtype=wp.float32),
+    out_vy: wp.array(dtype=wp.float32),
+    out_vz: wp.array(dtype=wp.float32),
+    out_w: wp.array(dtype=wp.float32),
+) -> None:
+    s = int(wp.tid())
+    n = normals[s]
+    length = wp.length(n)
+    # Confidence weighting scales the splat by the normal magnitude; otherwise unit weight.
+    weight = float(1.0)  # noqa: UP018 — mutable Warp dynamic variable
+    if confidence != 0:
+        weight = length
+    if length > 0.0:
+        n = n / length  # unit direction; magnitude carried by ``weight``
+
+    g = (points[s] - cube_lower) * inv_cell
+    i0 = int(wp.floor(g[0]))
+    j0 = int(wp.floor(g[1]))
+    k0 = int(wp.floor(g[2]))
+    if i0 < 0:
+        i0 = 0
+    if j0 < 0:
+        j0 = 0
+    if k0 < 0:
+        k0 = 0
+    if i0 > res - 2:
+        i0 = res - 2
+    if j0 > res - 2:
+        j0 = res - 2
+    if k0 > res - 2:
+        k0 = res - 2
+    fx = wp.clamp(g[0] - float(i0), 0.0, 1.0)
+    fy = wp.clamp(g[1] - float(j0), 0.0, 1.0)
+    fz = wp.clamp(g[2] - float(k0), 0.0, 1.0)
+
+    for di in range(2):
+        wx = fx
+        if di == 0:
+            wx = 1.0 - fx
+        for dj in range(2):
+            wy = fy
+            if dj == 0:
+                wy = 1.0 - fy
+            for dk in range(2):
+                wz = fz
+                if dk == 0:
+                    wz = 1.0 - fz
+                w = wx * wy * wz * weight
+                idx = poisson_grid_index(i0 + di, j0 + dj, k0 + dk, res)
+                wp.atomic_add(out_vx, idx, w * n[0])
+                wp.atomic_add(out_vy, idx, w * n[1])
+                wp.atomic_add(out_vz, idx, w * n[2])
+                wp.atomic_add(out_w, idx, w)
+
+
+@wp.kernel(enable_backward=False)
+def normalize_vector_field(
+    weights: wp.array(dtype=wp.float32),
+    out_vx: wp.array(dtype=wp.float32),
+    out_vy: wp.array(dtype=wp.float32),
+    out_vz: wp.array(dtype=wp.float32),
+) -> None:
+    idx = int(wp.tid())
+    inv = 1.0 / wp.max(weights[idx], POISSON_WEIGHT_EPS)
+    out_vx[idx] = out_vx[idx] * inv
+    out_vy[idx] = out_vy[idx] * inv
+    out_vz[idx] = out_vz[idx] * inv
+
+
+@wp.kernel(enable_backward=False)
+def negative_divergence(
+    vx: wp.array(dtype=wp.float32),
+    vy: wp.array(dtype=wp.float32),
+    vz: wp.array(dtype=wp.float32),
+    res: wp.int32,
+    out_b: wp.array(dtype=wp.float32),
+) -> None:
+    i, j, k = wp.tid()
+    # Central differences in index space; one-sided at the grid boundary (denominator 1 there).
+    ip = wp.min(i + 1, res - 1)
+    im = wp.max(i - 1, 0)
+    jp = wp.min(j + 1, res - 1)
+    jm = wp.max(j - 1, 0)
+    kp = wp.min(k + 1, res - 1)
+    km = wp.max(k - 1, 0)
+    dx = (vx[poisson_grid_index(ip, j, k, res)] - vx[poisson_grid_index(im, j, k, res)]) / float(
+        ip - im
+    )
+    dy = (vy[poisson_grid_index(i, jp, k, res)] - vy[poisson_grid_index(i, jm, k, res)]) / float(
+        jp - jm
+    )
+    dz = (vz[poisson_grid_index(i, j, kp, res)] - vz[poisson_grid_index(i, j, km, res)]) / float(
+        kp - km
+    )
+    out_b[poisson_grid_index(i, j, k, res)] = -(dx + dy + dz)
+
+
+@wp.kernel(enable_backward=False)
+def screened_laplacian_matvec(
+    x: wp.array(dtype=wp.float32),
+    y: wp.array(dtype=wp.float32),
+    weights: wp.array(dtype=wp.float32),
+    screen: wp.float32,
+    alpha: wp.float32,
+    beta: wp.float32,
+    res: wp.int32,
+    out_z: wp.array(dtype=wp.float32),
+) -> None:
+    # z = alpha * (A @ x) + beta * y, with A = L_N + screen * diag(W).
+    i, j, k = wp.tid()
+    idx = poisson_grid_index(i, j, k, res)
+    xc = x[idx]
+    deg = float(0.0)  # noqa: UP018 — mutable Warp dynamic variable
+    acc = float(0.0)  # noqa: UP018 — mutable Warp dynamic variable
+    if i + 1 < res:
+        deg += 1.0
+        acc += x[poisson_grid_index(i + 1, j, k, res)]
+    if i - 1 >= 0:
+        deg += 1.0
+        acc += x[poisson_grid_index(i - 1, j, k, res)]
+    if j + 1 < res:
+        deg += 1.0
+        acc += x[poisson_grid_index(i, j + 1, k, res)]
+    if j - 1 >= 0:
+        deg += 1.0
+        acc += x[poisson_grid_index(i, j - 1, k, res)]
+    if k + 1 < res:
+        deg += 1.0
+        acc += x[poisson_grid_index(i, j, k + 1, res)]
+    if k - 1 >= 0:
+        deg += 1.0
+        acc += x[poisson_grid_index(i, j, k - 1, res)]
+    ax = (deg * xc - acc) + screen * weights[idx] * xc
+    out_z[idx] = alpha * ax + beta * y[idx]
+
+
+@wp.kernel(enable_backward=False)
+def screened_inverse_diagonal(
+    weights: wp.array(dtype=wp.float32),
+    screen: wp.float32,
+    res: wp.int32,
+    out_inv_diag: wp.array(dtype=wp.float32),
+) -> None:
+    i, j, k = wp.tid()
+    idx = poisson_grid_index(i, j, k, res)
+    deg = float(0.0)  # noqa: UP018 — mutable Warp dynamic variable
+    if i + 1 < res:
+        deg += 1.0
+    if i - 1 >= 0:
+        deg += 1.0
+    if j + 1 < res:
+        deg += 1.0
+    if j - 1 >= 0:
+        deg += 1.0
+    if k + 1 < res:
+        deg += 1.0
+    if k - 1 >= 0:
+        deg += 1.0
+    d = deg + screen * weights[idx]
+    if d <= 0.0:
+        d = 1.0
+    out_inv_diag[idx] = 1.0 / d
+
+
+@wp.kernel(enable_backward=False)
+def diagonal_precond_matvec(
+    x: wp.array(dtype=wp.float32),
+    y: wp.array(dtype=wp.float32),
+    inv_diag: wp.array(dtype=wp.float32),
+    alpha: wp.float32,
+    beta: wp.float32,
+    out_z: wp.array(dtype=wp.float32),
+) -> None:
+    idx = int(wp.tid())
+    out_z[idx] = alpha * inv_diag[idx] * x[idx] + beta * y[idx]
+
+
+@wp.kernel(enable_backward=False)
+def prolong_grid(
+    coarse: wp.array(dtype=wp.float32),
+    res_c: wp.int32,
+    res_f: wp.int32,
+    out_fine: wp.array(dtype=wp.float32),
+) -> None:
+    # Trilinear factor-2 prolongation: res_f - 1 == 2 * (res_c - 1), so fine node i sits at
+    # coarse coordinate i / 2.
+    i, j, k = wp.tid()
+    val = poisson_sample_grid(coarse, res_c, float(i) * 0.5, float(j) * 0.5, float(k) * 0.5)
+    out_fine[poisson_grid_index(i, j, k, res_f)] = val
+
+
+@wp.kernel(enable_backward=False)
+def sample_field_trilinear(
+    field: wp.array(dtype=wp.float32),
+    res: wp.int32,
+    cube_lower: wp.vec3,
+    inv_cell: wp.float32,
+    points: wp.array(dtype=wp.vec3),
+    out_values: wp.array(dtype=wp.float32),
+) -> None:
+    s = int(wp.tid())
+    g = (points[s] - cube_lower) * inv_cell
+    out_values[s] = poisson_sample_grid(field, res, g[0], g[1], g[2])

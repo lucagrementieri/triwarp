@@ -294,14 +294,9 @@ def geodesic_ball(
         # Gather this chunk's queue rows before the next chunk reuses the pools: chunk-local
         # exclusive scan of counts, one 4-byte readback for the chunk total, then a coalesced
         # 2D copy into the chunk's flat buffer.
-        wp.utils.array_scan(
-            counts[start : start + m], out_array=local_offsets[:m], inclusive=False
-        )
+        wp.utils.array_scan(counts[start : start + m], out_array=local_offsets[:m], inclusive=False)
         wp.map(
-            wp.add,
-            local_offsets[m - 1 : m],
-            counts[start + m - 1 : start + m],
-            out=chunk_total_buf,
+            wp.add, local_offsets[m - 1 : m], counts[start + m - 1 : start + m], out=chunk_total_buf
         )
         chunk_total = int(chunk_total_buf.numpy()[0])
         flat_chunk = wp.empty(chunk_total, dtype=wp.int32, device=device)

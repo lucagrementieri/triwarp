@@ -337,9 +337,7 @@ def bfs_count_claims(
 
 @wp.kernel
 def bfs_scan_blocks(
-    values: wp.array[wp.int32],
-    out_scanned: wp.array[wp.int32],
-    out_block_sums: wp.array[wp.int32],
+    values: wp.array[wp.int32], out_scanned: wp.array[wp.int32], out_block_sums: wp.array[wp.int32]
 ) -> None:
     # Capture-safe scan, pass 1: per-block inclusive scan (arrays are padded to a multiple of
     # BFS_SCAN_BLOCK; padding garbage never reaches a read prefix). Thread 0 exports the block
@@ -365,9 +363,7 @@ def bfs_scan_block_sums(out_block_sums: wp.array[wp.int32]) -> None:
 
 
 @wp.kernel
-def bfs_add_block_offsets(
-    block_sums: wp.array[wp.int32], out_scanned: wp.array[wp.int32]
-) -> None:
+def bfs_add_block_offsets(block_sums: wp.array[wp.int32], out_scanned: wp.array[wp.int32]) -> None:
     # Capture-safe scan, pass 3: add the preceding blocks' total to each element.
     idx = int(wp.tid())
     b = wp.int32(idx) / wp.int32(BFS_SCAN_BLOCK)

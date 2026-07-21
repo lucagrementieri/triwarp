@@ -463,14 +463,9 @@ def _bridson_blue_noise(
         kernel_blue_noise.is_zero_int32, retire_buf, out=flags_buf[:cap], return_kernel=True
     )
     nonneg_flag = wp.map(
-        kernel_blue_noise.is_nonnegative_int32,
-        spawned_buf,
-        out=flags_buf[cap:],
-        return_kernel=True,
+        kernel_blue_noise.is_nonnegative_int32, spawned_buf, out=flags_buf[cap:], return_kernel=True
     )
-    tail_total = wp.map(
-        wp.add, positions_buf[:1], flags_buf[:1], out=total_buf, return_kernel=True
-    )
+    tail_total = wp.map(wp.add, positions_buf[:1], flags_buf[:1], out=total_buf, return_kernel=True)
 
     active_count = _try_seed()
     if active_count == 0:

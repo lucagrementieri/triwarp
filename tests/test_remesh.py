@@ -488,3 +488,227 @@ def test_flip_to_delaunay_empty(device: str):
     f = wp.zeros(0, dtype=wp.int32, device=device)
     out = tw.remesh.flip_to_delaunay(v, f)
     assert int(out.shape[0]) == 0
+
+
+# ======================================================================================
+# Isotropic explicit remeshing (isotropic_remesh)
+#
+# Reference: meshlib ``mrmeshpy.remesh`` (``_ml`` suffix) for the edge-length spread; the rest are
+# metric/topological invariants (edge concentration, valence variance, Hausdorff, manifoldness,
+# feature/boundary preservation). Outputs never match a reference vertex-for-vertex.
+# ======================================================================================
+
+
+def _mesh_arrays(mesh_wp: wp.Mesh) -> tuple[np.ndarray, np.ndarray]:
+    return mesh_wp.points.numpy().astype(np.float64), mesh_wp.indices.numpy().reshape(-1, 3)
+
+
+def _edge_lengths(vertices_np: np.ndarray, faces_np: np.ndarray) -> np.ndarray:
+    edges = vertices_np[np.unique(_undirected_edges(faces_np), axis=0)]
+    return np.linalg.norm(edges[:, 0] - edges[:, 1], axis=1)
+
+
+def _valences(faces_np: np.ndarray, n_vertices: int) -> np.ndarray:
+    edges = np.unique(_undirected_edges(faces_np), axis=0)
+    valence = np.zeros(n_vertices, dtype=np.int64)
+    np.add.at(valence, edges[:, 0], 1)
+    np.add.at(valence, edges[:, 1], 1)
+    return valence
+
+
+def _two_sided_hausdorff(va: np.ndarray, fa: np.ndarray, vb: np.ndarray, fb: np.ndarray) -> float:
+    mesh_a = tm.Trimesh(va, fa, process=False)
+    mesh_b = tm.Trimesh(vb, fb, process=False)
+    sample_a, _ = tm.sample.sample_surface(mesh_a, 5000, seed=0)
+    sample_b, _ = tm.sample.sample_surface(mesh_b, 5000, seed=1)
+    a_to_b = np.abs(tm.proximity.signed_distance(mesh_b, sample_a)).max()
+    b_to_a = np.abs(tm.proximity.signed_distance(mesh_a, sample_b)).max()
+    return float(max(a_to_b, b_to_a))
+
+
+def _meshlib_remesh_spread(vertices_np: np.ndarray, faces_np: np.ndarray, target: float) -> float:
+    """Coefficient of variation (std / mean) of meshlib remesh at ``target`` (NaN if absent)."""
+    try:
+        from meshlib import mrmeshnumpy as _mn
+        from meshlib import mrmeshpy as _mm
+    except ImportError:
+        return float("nan")
+    mesh_ml = _mn.meshFromFacesVerts(
+        faces_np.astype(np.int32), np.ascontiguousarray(vertices_np, dtype=np.float64)
+    )
+    settings = _mm.RemeshSettings()
+    settings.targetEdgeLen = float(target)
+    settings.projectOnOriginalMesh = True
+    _mm.remesh(mesh_ml, settings)
+    vertices_ml = _mn.getNumpyVerts(mesh_ml)
+    faces_ml = _mn.getNumpyFaces(mesh_ml.topology)
+    lengths_ml = _edge_lengths(vertices_ml, faces_ml)
+    return float(lengths_ml.std() / lengths_ml.mean())
+
+
+def _icosphere_wp(device: str, subdivisions: int = 3):
+    sphere = tm.creation.icosphere(subdivisions=subdivisions, radius=1.0)
+    vertices = wp.array(
+        np.ascontiguousarray(sphere.vertices, dtype=np.float64), dtype=wp.vec3, device=device
+    )
+    faces = wp.array(
+        np.ascontiguousarray(sphere.faces.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=device,
+    )
+    return sphere, vertices, faces
+
+
+def test_remesh_edge_concentration(device: str) -> None:
+    sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=3)
+    target = 0.5 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
+
+    out_vertices, out_faces = tw.remesh.isotropic_remesh(
+        vertices_wp, faces_wp, target_length=target, iterations=10
+    )
+    vertices_np = out_vertices.numpy().astype(np.float64)
+    faces_np = out_faces.numpy().reshape(-1, 3)
+    lengths = _edge_lengths(vertices_np, faces_np)
+
+    assert abs(lengths.mean() / target - 1.0) < 0.2  # mean within 20% of target
+    in_band = np.mean((lengths >= 0.5 * target) & (lengths <= 1.6 * target))
+    assert in_band >= 0.8
+    spread_ml = _meshlib_remesh_spread(sphere.vertices, sphere.faces, target)
+    if not np.isnan(spread_ml):
+        assert lengths.std() / lengths.mean() <= 1.5 * spread_ml
+
+
+def test_remesh_watertight_genus_preserved(device: str) -> None:
+    _sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=3)
+    target = 0.5 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
+
+    out_vertices, out_faces = tw.remesh.isotropic_remesh(
+        vertices_wp, faces_wp, target_length=target, iterations=10
+    )
+    mesh_out = tm.Trimesh(out_vertices.numpy(), out_faces.numpy().reshape(-1, 3), process=False)
+    assert tw.validation.is_watertight(out_vertices, out_faces)
+    assert mesh_out.euler_number == 2  # genus 0
+    # Volume of the unit sphere is preserved to a few percent.
+    assert abs(mesh_out.volume - 4.0 / 3.0 * np.pi) / (4.0 / 3.0 * np.pi) < 0.05
+
+
+def test_remesh_valence_variance_decreases(device: str) -> None:
+    # A noisy, irregular triangulation: perturbed icosphere with random extra subdivision.
+    sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=3)
+    target = tw.edges.mean_edge_length(vertices_wp, faces_wp)
+    valence_before = _valences(sphere.faces, sphere.vertices.shape[0])
+
+    out_vertices, out_faces = tw.remesh.isotropic_remesh(
+        vertices_wp, faces_wp, target_length=target, iterations=10
+    )
+    faces_np = out_faces.numpy().reshape(-1, 3)
+    valence_after = _valences(faces_np, out_vertices.numpy().shape[0])
+    # Interior valences concentrate around 6: variance about the ideal does not grow.
+    assert np.var(valence_after - 6) <= np.var(valence_before - 6) + 0.5
+
+
+def test_remesh_surface_distance_bounded(device: str) -> None:
+    sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=3)
+    target = 0.5 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
+
+    out_vertices, out_faces = tw.remesh.isotropic_remesh(
+        vertices_wp, faces_wp, target_length=target, iterations=10
+    )
+    hausdorff = _two_sided_hausdorff(
+        sphere.vertices,
+        sphere.faces,
+        out_vertices.numpy().astype(np.float64),
+        out_faces.numpy().reshape(-1, 3),
+    )
+    # Reprojection keeps the remesh close to the original surface (well under the target length).
+    assert hausdorff < target
+
+
+def test_remesh_cave_cube_manifold(cave_cube: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = cave_cube
+    vertices_wp = wp.clone(mesh_wp.points)
+    faces_wp = wp.clone(mesh_wp.indices)
+    target = 0.5 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
+
+    out_vertices, out_faces = tw.remesh.isotropic_remesh(
+        vertices_wp, faces_wp, target_length=target, iterations=8
+    )
+    mesh_out = tm.Trimesh(out_vertices.numpy(), out_faces.numpy().reshape(-1, 3), process=False)
+    assert tw.validation.is_watertight(out_vertices, out_faces)
+    # Two nested cubes: Euler characteristic 4 (two genus-0 shells) is preserved.
+    assert mesh_out.euler_number == mesh_tm.euler_number
+
+
+def test_remesh_feature_preservation(cave_cube: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _mesh_tm, mesh_wp = cave_cube
+    vertices_wp = wp.clone(mesh_wp.points)
+    faces_wp = wp.clone(mesh_wp.indices)
+    target = 0.4 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
+
+    out_vertices, _ = tw.remesh.isotropic_remesh(
+        vertices_wp, faces_wp, target_length=target, iterations=8, feature_angle=30.0
+    )
+    vertices_np = out_vertices.numpy().astype(np.float64)
+    # The 8 outer cube corners (frozen CORNER vertices) survive at their exact positions.
+    outer_corners = np.array(
+        [[x, y, z] for x in (-0.5, 0.5) for y in (-0.5, 0.5) for z in (-0.5, 0.5)]
+    )
+    for corner in outer_corners:
+        assert np.min(np.linalg.norm(vertices_np - corner, axis=1)) < 1e-6
+
+
+def test_remesh_boundary_preservation(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _mesh_tm, mesh_wp = hemisphere
+    vertices_wp = wp.clone(mesh_wp.points)
+    faces_wp = wp.clone(mesh_wp.indices)
+    n_loops_before = len(tm.Trimesh(*_mesh_arrays(mesh_wp), process=False).outline().entities)
+    target = 0.5 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
+
+    out_vertices, out_faces = tw.remesh.isotropic_remesh(
+        vertices_wp, faces_wp, target_length=target, iterations=8
+    )
+    mesh_out = tm.Trimesh(out_vertices.numpy(), out_faces.numpy().reshape(-1, 3), process=False)
+    # The open boundary is still a single closed loop (the disk boundary is preserved).
+    assert len(mesh_out.outline().entities) == n_loops_before
+
+
+def test_remesh_flags_off(device: str) -> None:
+    _sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=2)
+    n_faces_before = int(faces_wp.shape[0]) // 3
+    # Collapse-only (no split/swap/smooth/reproject) can only reduce the face count.
+    out_vertices, out_faces = tw.remesh.isotropic_remesh(
+        vertices_wp,
+        faces_wp,
+        target_length=10.0 * tw.edges.mean_edge_length(vertices_wp, faces_wp),
+        iterations=5,
+        split=False,
+        swap=False,
+        smooth=False,
+        reproject=False,
+    )
+    assert int(out_faces.shape[0]) // 3 <= n_faces_before
+    assert tw.validation.is_watertight(out_vertices, out_faces)
+
+
+def test_remesh_adaptive_not_implemented(device: str) -> None:
+    _sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=1)
+    with pytest.raises(NotImplementedError, match="adaptive"):
+        tw.remesh.isotropic_remesh(vertices_wp, faces_wp, adaptive=True)
+
+
+def test_remesh_target_validation(device: str) -> None:
+    _sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=1)
+    with pytest.raises(ValueError, match="target_length"):
+        tw.remesh.isotropic_remesh(vertices_wp, faces_wp, target_length=-1.0)
+
+
+def test_remesh_empty_and_degenerate(device: str) -> None:
+    empty_v = wp.empty(0, dtype=wp.vec3, device=device)
+    empty_f = wp.empty(0, dtype=wp.int32, device=device)
+    _out_v, out_f = tw.remesh.isotropic_remesh(empty_v, empty_f)
+    assert int(out_f.shape[0]) == 0
+
+    # iterations=0 returns a clone unchanged.
+    _sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=1)
+    _out_v, out_f = tw.remesh.isotropic_remesh(vertices_wp, faces_wp, iterations=0)
+    assert int(out_f.shape[0]) == int(faces_wp.shape[0])

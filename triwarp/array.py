@@ -623,9 +623,7 @@ def mask_to_index_map(mask: wp.array[wp.bool]) -> tuple[wp.array[wp.int32], int]
     return index_map, int(inclusive.numpy()[-1])
 
 
-def remap_indices(
-    indices: wp.array[wp.int32], remap: wp.array[wp.int32]
-) -> wp.array[wp.int32]:
+def remap_indices(indices: wp.array[wp.int32], remap: wp.array[wp.int32]) -> wp.array[wp.int32]:
     """
     Remap an index buffer through a lookup table, skipping negative (sentinel) entries.
 

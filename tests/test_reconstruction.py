@@ -336,3 +336,317 @@ def test_delaunay_too_few(device: str):
     points_wp = wp.array(np.zeros((2, 2), dtype=np.float32), dtype=wp.vec2, device=device)
     with pytest.raises(ValueError, match="at least 3 points"):
         tw.reconstruction.delaunay_triangulation(points_wp)
+
+
+# ======================================================================================
+# Screened-Poisson reconstruction (screened_poisson)
+#
+# References: open3d ``create_from_point_cloud_poisson`` (``_o3d``) and PyMeshLab
+# ``generate_surface_reconstruction_screened_poisson`` (``_pml``). Both reconstruct a different
+# vertex set than triwarp, so every comparison is metric/topological, never vertex-for-vertex. The
+# solve goes through ``warp.optim.linear.cg`` (CUDA-only), so the CPU device is skipped.
+# ======================================================================================
+
+
+def _skip_poisson_on_cpu(device: str) -> None:
+    if wp.get_device(device).is_cpu:
+        pytest.skip("screened_poisson requires CUDA: warp.optim.linear.cg is NaN on CPU.")
+
+
+def _torus_cloud(n_major: int = 40, n_minor: int = 20, r_major: float = 1.0, r_minor: float = 0.35):
+    u = np.linspace(0.0, 2.0 * np.pi, n_major, endpoint=False)
+    v = np.linspace(0.0, 2.0 * np.pi, n_minor, endpoint=False)
+    uu, vv = np.meshgrid(u, v)
+    uu = uu.ravel()
+    vv = vv.ravel()
+    cx = np.cos(uu)
+    cy = np.sin(uu)
+    px = (r_major + r_minor * np.cos(vv)) * cx
+    py = (r_major + r_minor * np.cos(vv)) * cy
+    pz = r_minor * np.sin(vv)
+    points = np.stack([px, py, pz], axis=1)
+    nx = np.cos(vv) * cx
+    ny = np.cos(vv) * cy
+    nz = np.sin(vv)
+    normals = np.stack([nx, ny, nz], axis=1)
+    return points.astype(np.float64), normals.astype(np.float64)
+
+
+def _mesh_trimesh(vertices_wp, faces_wp) -> tm.Trimesh:
+    return tm.Trimesh(
+        vertices=vertices_wp.numpy().astype(np.float64),
+        faces=faces_wp.numpy().reshape(-1, 3),
+        process=False,
+    )
+
+
+def _symmetric_chamfer(mesh_a: tm.Trimesh, mesh_b: tm.Trimesh, n_samples: int = 4000) -> float:
+    """Mean symmetric chamfer distance between two triangle meshes via surface sampling."""
+    from scipy.spatial import cKDTree
+
+    rng = np.random.default_rng(0)
+    sample_a, _ = tm.sample.sample_surface(mesh_a, n_samples, seed=int(rng.integers(1 << 30)))
+    sample_b, _ = tm.sample.sample_surface(mesh_b, n_samples, seed=int(rng.integers(1 << 30)))
+    tree_a = cKDTree(sample_a)
+    tree_b = cKDTree(sample_b)
+    a_to_b = tree_b.query(sample_a)[0].mean()
+    b_to_a = tree_a.query(sample_b)[0].mean()
+    return float(0.5 * (a_to_b + b_to_a))
+
+
+def _points_to_surface(points_np: np.ndarray, mesh: tm.Trimesh) -> float:
+    """Mean distance from a point set to the nearest point on a mesh surface."""
+    return float(np.abs(tm.proximity.signed_distance(mesh, points_np)).mean())
+
+
+def _open3d_poisson(points_np: np.ndarray, normals_np: np.ndarray, depth: int) -> tm.Trimesh:
+    o3d = pytest.importorskip("open3d")
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(np.ascontiguousarray(points_np, dtype=np.float64))
+    pcd.normals = o3d.utility.Vector3dVector(np.ascontiguousarray(normals_np, dtype=np.float64))
+    mesh_o3d, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth)
+    return tm.Trimesh(
+        vertices=np.asarray(mesh_o3d.vertices), faces=np.asarray(mesh_o3d.triangles), process=False
+    )
+
+
+def test_poisson_sphere_watertight_manifold(device: str):
+    _skip_poisson_on_cpu(device)
+    points_np, normals_np = _sphere_cloud(3)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
+        points_wp, normals_wp, depth=6, full_depth=4
+    )
+    mesh_tw = _mesh_trimesh(vertices_wp, faces_wp)
+
+    assert tw.validation.is_watertight(vertices_wp, faces_wp)
+    assert mesh_tw.euler_number == 2  # closed genus-0 surface
+
+    radius_tw = np.linalg.norm(mesh_tw.vertices, axis=1)
+    # A depth-6 cube spans ~2.2 across 64 cells => cell ~0.034; recon must hug the unit sphere.
+    assert abs(radius_tw.mean() - 1.0) < 0.02
+    assert np.abs(radius_tw - 1.0).max() < 0.06
+
+
+def test_poisson_outward_orientation(device: str):
+    _skip_poisson_on_cpu(device)
+    points_np, normals_np = _sphere_cloud(3)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
+        points_wp, normals_wp, depth=6, full_depth=4
+    )
+    # Outward normals => positive enclosed volume.
+    assert _mesh_trimesh(vertices_wp, faces_wp).volume > 0.0
+
+
+def test_poisson_torus_genus(device: str):
+    _skip_poisson_on_cpu(device)
+    points_np, normals_np = _torus_cloud()
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
+        points_wp, normals_wp, depth=6, full_depth=4
+    )
+    mesh_tw = _mesh_trimesh(vertices_wp, faces_wp)
+    assert tw.validation.is_watertight(vertices_wp, faces_wp)
+    assert mesh_tw.euler_number == 0  # genus-1 torus: V - E + F = 0
+
+
+def test_poisson_matches_open3d_metric(device: str):
+    _skip_poisson_on_cpu(device)
+    points_np, normals_np = _sphere_cloud(3)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
+        points_wp, normals_wp, depth=6, full_depth=4
+    )
+    mesh_tw = _mesh_trimesh(vertices_wp, faces_wp)
+    mesh_o3d = _open3d_poisson(points_np, normals_np, depth=6)
+    # Same iso-surface up to discretization: symmetric chamfer well under a grid cell.
+    assert _symmetric_chamfer(mesh_tw, mesh_o3d) < 0.03
+
+
+def test_poisson_screening_improves_fit(device: str):
+    _skip_poisson_on_cpu(device)
+    points_np, normals_np = _sphere_cloud(3)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    vertices_screened, faces_screened = tw.reconstruction.screened_poisson(
+        points_wp, normals_wp, depth=6, full_depth=4, point_weight=4.0
+    )
+    vertices_unscreened, faces_unscreened = tw.reconstruction.screened_poisson(
+        points_wp, normals_wp, depth=6, full_depth=4, point_weight=0.0
+    )
+    fit_screened = _points_to_surface(points_np, _mesh_trimesh(vertices_screened, faces_screened))
+    fit_unscreened = _points_to_surface(
+        points_np, _mesh_trimesh(vertices_unscreened, faces_unscreened)
+    )
+    # Screening ties the surface to the samples: the fit is at least as good.
+    assert fit_screened <= fit_unscreened + 1e-4
+
+
+def test_poisson_finer_depth_reduces_error(device: str):
+    _skip_poisson_on_cpu(device)
+    points_np, normals_np = _sphere_cloud(4)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    vertices_coarse, _ = tw.reconstruction.screened_poisson(
+        points_wp, normals_wp, depth=5, full_depth=4
+    )
+    vertices_fine, _ = tw.reconstruction.screened_poisson(
+        points_wp, normals_wp, depth=7, full_depth=4
+    )
+    error_coarse = np.abs(np.linalg.norm(vertices_coarse.numpy(), axis=1) - 1.0).mean()
+    error_fine = np.abs(np.linalg.norm(vertices_fine.numpy(), axis=1) - 1.0).mean()
+    assert error_fine <= error_coarse
+
+
+def test_poisson_matches_pymeshlab_metric(device: str):
+    _skip_poisson_on_cpu(device)
+    pymeshlab = pytest.importorskip("pymeshlab")
+    points_np, normals_np = _sphere_cloud(3)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
+        points_wp, normals_wp, depth=6, full_depth=4
+    )
+    mesh_tw = _mesh_trimesh(vertices_wp, faces_wp)
+
+    ms = pymeshlab.MeshSet()
+    ms.add_mesh(
+        pymeshlab.Mesh(
+            vertex_matrix=np.ascontiguousarray(points_np),
+            v_normals_matrix=np.ascontiguousarray(normals_np),
+        )
+    )
+    ms.generate_surface_reconstruction_screened_poisson(depth=6)
+    mesh_current = ms.current_mesh()
+    mesh_pml = tm.Trimesh(
+        vertices=mesh_current.vertex_matrix(), faces=mesh_current.face_matrix(), process=False
+    )
+    assert _symmetric_chamfer(mesh_tw, mesh_pml) < 0.03
+
+
+def test_poisson_requires_normals_and_valid_params(device: str):
+    points_np, normals_np = _sphere_cloud(2)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+    with pytest.raises(ValueError, match="full_depth"):
+        tw.reconstruction.screened_poisson(points_wp, normals_wp, depth=6, full_depth=8)
+    with pytest.raises(ValueError, match="full_depth"):
+        tw.reconstruction.screened_poisson(points_wp, normals_wp, depth=11)
+    with pytest.raises(ValueError, match="scale"):
+        tw.reconstruction.screened_poisson(points_wp, normals_wp, scale=0.0)
+
+
+def test_poisson_too_few_points(device: str):
+    _skip_poisson_on_cpu(device)
+    points_wp = wp.array(np.zeros((2, 3), dtype=np.float64), dtype=wp.vec3, device=device)
+    normals_wp = wp.array(np.ones((2, 3), dtype=np.float64), dtype=wp.vec3, device=device)
+    with pytest.raises(ValueError, match="at least 3 points"):
+        tw.reconstruction.screened_poisson(points_wp, normals_wp, depth=4, full_depth=3)
+
+
+def test_poisson_cpu_raises(device: str):
+    if not wp.get_device(device).is_cpu:
+        pytest.skip("CPU-only guard test.")
+    points_np, normals_np = _sphere_cloud(2)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+    with pytest.raises(NotImplementedError, match="CUDA"):
+        tw.reconstruction.screened_poisson(points_wp, normals_wp, depth=4, full_depth=3)
+
+
+# ======================================================================================
+# Ball pivoting (ball_pivoting)
+#
+# The wave-parallel front is interpolating (output vertices are input points) and edge-manifold
+# after cleanup, but is not guaranteed watertight on densely sampled closed surfaces (v1
+# limitation), so the tests assert those robust invariants rather than watertightness / Euler.
+# open3d BPA (``_o3d``) is used only as a loose face-count sanity reference.
+# ======================================================================================
+
+
+def _edge_multiplicity(faces_np: np.ndarray) -> np.ndarray:
+    edges = np.sort(faces_np[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+    return np.unique(edges, axis=0, return_counts=True)[1]
+
+
+def test_ball_pivoting_interpolates_input(device: str):
+    points_np, normals_np = _sphere_cloud(3)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    vertices_wp, faces_wp = tw.reconstruction.ball_pivoting(points_wp, normals_wp)
+    vertices_np = vertices_wp.numpy().astype(np.float64)
+    assert int(faces_wp.shape[0]) > 0
+
+    # Interpolating: every output vertex coincides with an input point.
+    from scipy.spatial import cKDTree
+
+    distances = cKDTree(points_np).query(vertices_np)[0]
+    assert distances.max() < 1e-6
+    # Most input points are incorporated on a well-sampled sphere.
+    assert vertices_np.shape[0] >= 0.8 * points_np.shape[0]
+
+
+def test_ball_pivoting_edge_manifold(device: str):
+    points_np, normals_np = _sphere_cloud(3)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    _vertices, faces_wp = tw.reconstruction.ball_pivoting(points_wp, normals_wp)
+    # The cleanup tail removes non-manifold faces, so no edge is shared by more than two faces.
+    assert _edge_multiplicity(faces_wp.numpy().reshape(-1, 3)).max() <= 2
+
+
+def test_ball_pivoting_face_count_near_open3d(device: str):
+    points_np, normals_np = _sphere_cloud(3)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    # Auto-guessed radius roughly matches the mean spacing; use it for open3d too.
+    _idx, dist = tw.neighbors.query_bvh_nearest(points_wp, points_wp, k=7)
+    spacing = float(np.mean(dist.numpy()[:, 1:][np.isfinite(dist.numpy()[:, 1:])]))
+    radius = 1.5 * spacing
+
+    _vertices, faces_wp = tw.reconstruction.ball_pivoting(points_wp, normals_wp, radius=radius)
+    n_faces_tw = int(faces_wp.shape[0]) // 3
+
+    o3d = pytest.importorskip("open3d")
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(np.ascontiguousarray(points_np))
+    pcd.normals = o3d.utility.Vector3dVector(np.ascontiguousarray(normals_np))
+    mesh_o3d = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+        pcd, o3d.utility.DoubleVector([radius, 2.0 * radius])
+    )
+    n_faces_o3d = np.asarray(mesh_o3d.triangles).shape[0]
+    # Same order of magnitude as open3d (both reconstruct ~2n triangles on a closed sphere).
+    assert 0.5 * n_faces_o3d <= n_faces_tw <= 2.0 * n_faces_o3d
+
+
+def test_ball_pivoting_small_radius_leaves_holes(device: str):
+    points_np, normals_np = _sphere_cloud(3)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    _idx, dist = tw.neighbors.query_bvh_nearest(points_wp, points_wp, k=2)
+    spacing = float(np.mean(dist.numpy()[:, 1][np.isfinite(dist.numpy()[:, 1])]))
+
+    _v_small, faces_small = tw.reconstruction.ball_pivoting(
+        points_wp, normals_wp, radius=0.2 * spacing
+    )
+    _v_ok, faces_ok = tw.reconstruction.ball_pivoting(points_wp, normals_wp, radius=1.5 * spacing)
+    # A ball far smaller than the sampling never rests on three points: far fewer (or no) faces.
+    assert int(faces_small.shape[0]) < int(faces_ok.shape[0])
+
+
+def test_ball_pivoting_estimated_normals(device: str):
+    points_np, _normals = _sphere_cloud(3)
+    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    # normals=None triggers PCA normal estimation (valid for this star-shaped cloud).
+    _vertices, faces_wp = tw.reconstruction.ball_pivoting(points_wp, None)
+    assert int(faces_wp.shape[0]) > 0
+
+
+def test_ball_pivoting_too_few_points(device: str):
+    points_wp = wp.array(np.zeros((2, 3), dtype=np.float64), dtype=wp.vec3, device=device)
+    normals_wp = wp.array(np.ones((2, 3), dtype=np.float64), dtype=wp.vec3, device=device)
+    _vertices, faces_wp = tw.reconstruction.ball_pivoting(points_wp, normals_wp)
+    assert int(faces_wp.shape[0]) == 0

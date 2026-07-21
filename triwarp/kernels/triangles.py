@@ -32,10 +32,7 @@ def face_vertices_vec3d(
 
 @wp.kernel
 def signed_tet_volumes(
-    vertices: wp.array[Any],
-    faces: wp.array[wp.int32],
-    center: Any,
-    out_volumes: wp.array[wp.Float],
+    vertices: wp.array[Any], faces: wp.array[wp.int32], center: Any, out_volumes: wp.array[wp.Float]
 ) -> None:
     # Signed volume of the tetrahedron (center, v0, v1, v2); the sum over faces is the mesh volume.
     fi = int(wp.tid())

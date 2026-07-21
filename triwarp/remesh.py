@@ -11,6 +11,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_nonempty_mesh
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import remesh as kernel_remesh
 
@@ -30,6 +31,382 @@ _LaunchCandidates = Callable[
     ],
     None,
 ]
+
+
+def isotropic_remesh(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    target_length: float | None = None,
+    iterations: int = 10,
+    adaptive: bool = False,
+    feature_angle: float = 30.0,
+    check_surface_distance: bool = True,
+    max_surface_distance: float | None = None,
+    split: bool = True,
+    collapse: bool = True,
+    swap: bool = True,
+    smooth: bool = True,
+    reproject: bool = True,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Isotropic explicit remeshing (Botsch-Kobbelt split / collapse / flip / smooth / reproject).
+
+    GPU port of the classic incremental isotropic remesher (PyMeshLab's
+    ``meshing_isotropic_explicit_remeshing``, vcglib ``IsotropicRemeshing``): each iteration drives
+    all edge lengths toward ``target_length`` by (1) **splitting** every edge longer than
+    ``4/3 * target_length`` at its midpoint (crack-free, reusing
+    [`subdivide_to_size`][triwarp.remesh.subdivide_to_size]); (2) **collapsing** every edge shorter
+    than ``4/5 * target_length`` (a parallel primitive with full 1-ring locking and a manifold
+    link-condition guard); (3) **flipping** interior edges toward the ideal vertex valence (6
+    interior, 4 boundary); (4) **tangentially smoothing** free vertices (area-equalizing Laplacian
+    projected onto the tangent plane); and (5) **reprojecting** free vertices back onto the original
+    surface. Feature and boundary structure is preserved: each vertex is classified FREE / CREASE
+    (on a boundary loop or a dihedral crease sharper than ``feature_angle``) / CORNER (feature
+    junction or endpoint), corners are frozen, crease vertices only move along their feature, and
+    feature edges are never flipped.
+
+    Inputs are cloned and never mutated.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` vertex positions on the target device.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    target_length
+        Desired uniform edge length. Defaults to ``1 %`` of the bounding-box diagonal.
+    iterations
+        Number of full remeshing passes.
+    adaptive
+        Curvature-adaptive target length. Not implemented in this version (raises
+        ``NotImplementedError`` when ``True``).
+    feature_angle
+        Dihedral angle in **degrees** above which an interior edge is treated as a sharp feature
+        (protected from flipping and collapsing across).
+    check_surface_distance
+        Reserved for an explicit surface-deviation rejection gate; in this version surface fidelity
+        is maintained by the ``reproject`` step (see Notes).
+    max_surface_distance
+        Companion tolerance for ``check_surface_distance`` (defaults to ``1 %`` of the bounding-box
+        diagonal). Reserved (see Notes).
+    split, collapse, swap, smooth, reproject
+        Enable/disable each stage of the per-iteration pipeline.
+
+    Returns
+    -------
+    vertices : wp.array[wp.vec3]
+        Remeshed vertex positions on ``vertices.device``.
+    faces : wp.array[wp.int32]
+        Flat ``3 * n_faces`` triangle index buffer.
+
+    Raises
+    ------
+    ValueError
+        If ``target_length`` is non-positive.
+    NotImplementedError
+        If ``adaptive`` is ``True``.
+
+    See Also
+    --------
+    [`subdivide_to_size`][triwarp.remesh.subdivide_to_size]
+    [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay]
+
+    Notes
+    -----
+    Hysteresis (split above ``4/3 t``, collapse below ``4/5 t``) keeps split and collapse from
+    fighting. The collapse primitive guarantees manifoldness through the link condition but has no
+    normal-flip guard in this version, relying on the reprojection step to keep free vertices on the
+    original surface; ``check_surface_distance`` / ``max_surface_distance`` are accepted for API
+    parity and reserved for a future explicit rejection gate. Adaptive (curvature-driven) sizing is
+    a documented follow-up.
+    """
+    if adaptive:
+        raise NotImplementedError(
+            "adaptive isotropic remeshing is not implemented yet; call with adaptive=False."
+        )
+    n_faces = int(faces.shape[0]) // 3
+    current_vertices = wp.clone(vertices)
+    current_faces = wp.clone(faces)
+    if n_faces == 0 or iterations <= 0:
+        return current_vertices, current_faces
+
+    lo, hi = tw.bounds.aabb_bounds(vertices)
+    diag = float(wp.length(hi - lo))
+    target = target_length if target_length is not None else 0.01 * diag
+    if target <= 0.0:
+        raise ValueError(f"isotropic_remesh requires target_length > 0, got {target}.")
+    low = wp.float32(4.0 / 5.0 * target)
+    high = wp.float32(4.0 / 3.0 * target)
+    feature = wp.float32(math.radians(feature_angle))
+    _ = max_surface_distance if max_surface_distance is not None else 0.01 * diag
+
+    # Original surface, built once, for reprojecting free vertices (never a 0-triangle mesh).
+    original_mesh = None
+    if reproject:
+        require_nonempty_mesh(faces, "isotropic_remesh")
+        original_mesh = wp.Mesh(points=wp.clone(vertices), indices=wp.clone(faces))
+
+    for _ in range(iterations):
+        if split:
+            current_vertices, current_faces = subdivide_to_size(
+                current_vertices, current_faces, float(high), max_iter=20
+            )
+        if collapse:
+            current_vertices, current_faces = _collapse_pass(
+                current_vertices, current_faces, low, high, feature
+            )
+        if int(current_faces.shape[0]) == 0:
+            break
+        if swap:
+            _valence_flip_pass(current_vertices, current_faces, feature)
+        if smooth or reproject:
+            codes, _boundary = _classify(current_vertices, current_faces, feature)
+            if smooth:
+                current_vertices = _smooth_pass(current_vertices, current_faces, codes)
+            if reproject and original_mesh is not None:
+                current_vertices = _reproject_pass(
+                    current_vertices, codes, original_mesh, max(diag, 1.0)
+                )
+
+    return current_vertices, current_faces
+
+
+def _classify(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], feature: wp.float32
+) -> tuple[wp.array[wp.int32], wp.array[wp.bool]]:
+    """
+    Per-vertex FREE / CREASE / CORNER codes plus a boundary-vertex mask.
+
+    A boundary edge or an interior edge sharper than ``feature`` counts as one incident feature
+    edge; a vertex with zero is FREE, exactly two is CREASE (a smooth feature/boundary line), and
+    anything else (a feature endpoint or a junction) is a frozen CORNER.
+    """
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    codes = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+    boundary_vertex = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+    if n_faces == 0:
+        return codes, boundary_vertex
+
+    feature_count = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+    boundary_count = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+
+    edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+    boundary = tw.boundary.boundary_edges(vertices, faces, edges_sorted=edges_sorted)
+    if int(boundary.shape[0]) > 0:
+        wp.launch(
+            kernel_remesh.scatter_edge_endpoint_counts,
+            dim=int(boundary.shape[0]),
+            inputs=[boundary, feature_count],
+            device=device,
+        )
+        wp.launch(
+            kernel_remesh.scatter_edge_endpoint_counts,
+            dim=int(boundary.shape[0]),
+            inputs=[boundary, boundary_count],
+            device=device,
+        )
+
+    adjacency, adjacency_edges = tw.adjacency.face_adjacency(faces, edges_sorted, return_edges=True)
+    if int(adjacency.shape[0]) > 0:
+        angles = tw.adjacency.face_adjacency_angles(vertices, faces, face_adjacency=adjacency)
+        wp.launch(
+            kernel_remesh.scatter_feature_endpoint_counts,
+            dim=int(adjacency.shape[0]),
+            inputs=[adjacency_edges, angles, feature, feature_count],
+            device=device,
+        )
+
+    wp.launch(
+        kernel_remesh.finalize_vertex_codes,
+        dim=n_vertices,
+        inputs=[feature_count, codes],
+        device=device,
+    )
+    wp.map(kernel_array.greater, boundary_count, wp.int32(0), out=boundary_vertex)
+    return codes, boundary_vertex
+
+
+def _collapse_pass(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    low: wp.float32,
+    high: wp.float32,
+    feature: wp.float32,
+    max_passes: int = 5,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """Collapse short edges in parallel with 1-ring locking; returns compacted (vertices, faces)."""
+    device = vertices.device
+    for _ in range(max_passes):
+        n_vertices = int(vertices.shape[0])
+        n_faces = int(faces.shape[0]) // 3
+        if n_faces == 0:
+            break
+
+        unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+        m = int(unique_edges.shape[0])
+        if m == 0:
+            break
+        lengths = tw.edges.edges_unique_length(vertices, faces, unique_edges=unique_edges)
+
+        edge_face_count = wp.zeros(m, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_remesh.count_edge_faces,
+            dim=int(inverse.shape[0]),
+            inputs=[inverse, edge_face_count],
+            device=device,
+        )
+        codes, _boundary = _classify(vertices, faces, feature)
+        csr = tw.graph.edges_to_csr(n_vertices, unique_edges)
+
+        survivor = wp.full(m, -1, dtype=wp.int32, device=device)
+        removed = wp.empty(m, dtype=wp.int32, device=device)
+        target_pos = wp.empty(m, dtype=wp.vec3, device=device)
+        wp.launch(
+            kernel_remesh.collapse_candidates,
+            dim=m,
+            inputs=[
+                unique_edges,
+                lengths,
+                vertices,
+                codes,
+                edge_face_count,
+                csr.offsets,
+                csr.columns,
+                low,
+                high,
+                survivor,
+                removed,
+                target_pos,
+            ],
+            device=device,
+        )
+
+        claim = wp.full(n_vertices, _INT32_MAX, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_remesh.claim_collapses,
+            dim=m,
+            inputs=[survivor, removed, csr.offsets, csr.columns, claim],
+            device=device,
+        )
+        remap = tw.array.init_range(n_vertices, device)
+        positions = wp.clone(vertices)
+        count = wp.zeros(1, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_remesh.commit_collapses,
+            dim=m,
+            inputs=[
+                survivor,
+                removed,
+                target_pos,
+                csr.offsets,
+                csr.columns,
+                claim,
+                remap,
+                positions,
+                count,
+            ],
+            device=device,
+        )
+        if int(count.numpy()[0]) == 0:
+            break
+
+        remapped = tw.array.gather(remap, faces)
+        valid = wp.empty(n_faces, dtype=wp.bool, device=device)
+        wp.launch(
+            kernel_remesh.mark_distinct_faces, dim=n_faces, inputs=[remapped, valid], device=device
+        )
+        kept = tw.array.flatnonzero(valid)
+        faces = tw.array.gather(remapped.reshape((n_faces, 3)), kept).reshape(-1)
+        vertices, faces, _ = tw.repair.remove_unreferenced_vertices(positions, faces)
+
+    return vertices, faces
+
+
+def _valence_flip_pass(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], feature: wp.float32, max_iter: int = 10
+) -> None:
+    """Flip interior edges toward ideal valence (6 interior, 4 boundary); mutates ``faces``."""
+    device = faces.device
+    n_vertices = int(vertices.shape[0])
+    _codes, boundary_vertex = _classify(vertices, faces, feature)
+
+    def launch(adjacency, adjacency_edges, unshared, sorted_keys, key_base, out_flip, out_quad):
+        # Valence is recomputed from the (in-place mutated) faces each pass to avoid staleness.
+        valence = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+        wp.launch(
+            kernel_remesh.accumulate_vertex_valence,
+            dim=int(unique_edges.shape[0]),
+            inputs=[unique_edges, valence],
+            device=device,
+        )
+        wp.launch(
+            kernel_remesh.valence_flip_candidates,
+            dim=int(adjacency.shape[0]),
+            inputs=[
+                vertices,
+                faces,
+                adjacency,
+                adjacency_edges,
+                unshared,
+                sorted_keys,
+                key_base,
+                valence,
+                boundary_vertex,
+                feature,
+                out_flip,
+                out_quad,
+            ],
+            device=device,
+        )
+
+    _flip_interior_edges(faces, n_vertices, launch, max_iter)
+
+
+def _smooth_pass(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], codes: wp.array[wp.int32]
+) -> wp.array[wp.vec3]:
+    """One tangential Laplacian smoothing step over free vertices."""
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    normals = tw.vertices.area_weighted_vertex_normals(n_vertices, vertices, faces)
+    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+
+    ring_sum = wp.zeros(n_vertices, dtype=wp.vec3, device=device)
+    degree = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_remesh.accumulate_one_ring,
+        dim=int(unique_edges.shape[0]),
+        inputs=[unique_edges, vertices, ring_sum, degree],
+        device=device,
+    )
+    out_positions = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_remesh.tangential_smooth_step,
+        dim=n_vertices,
+        inputs=[vertices, codes, normals, ring_sum, degree, wp.float32(1.0), out_positions],
+        device=device,
+    )
+    return out_positions
+
+
+def _reproject_pass(
+    vertices: wp.array[wp.vec3], codes: wp.array[wp.int32], original_mesh: wp.Mesh, max_dist: float
+) -> wp.array[wp.vec3]:
+    """Snap free vertices onto the closest point of the original surface."""
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    out_positions = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_remesh.reproject_vertices,
+        dim=n_vertices,
+        inputs=[original_mesh.id, codes, vertices, wp.float32(max_dist), out_positions],
+        device=device,
+    )
+    return out_positions
 
 
 def _flip_interior_edges(

@@ -62,9 +62,7 @@ def init_point_cells(
 
 @wp.kernel
 def build_cell_neighbors(
-    unique_keys: wp.array[wp.int64],
-    grid_w: wp.int32,
-    out_cell_neighbors: wp.array2d[wp.int32],
+    unique_keys: wp.array[wp.int64], grid_w: wp.int32, out_cell_neighbors: wp.array2d[wp.int32]
 ) -> None:
     # One-time table build: out_cell_neighbors[c, shell_slot(dx, dy, dz)] is the compacted index
     # of cell c's neighbor at that offset, or INVALID for out-of-bounds, unoccupied, and the
