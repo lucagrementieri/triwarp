@@ -558,6 +558,101 @@ def test_poisson_cpu_raises(device: str):
 
 
 # ======================================================================================
+# Screened-Poisson, warp.fem adaptive backend (method="adaptive")
+#
+# The adaptive Nanogrid + variational assembly reconstructs a different vertex set than the dense
+# backend, so comparisons stay metric/topological (dense-vs-fem cross-check is discretization
+# agreement, never equality). CUDA-only, like the dense backend.
+# ======================================================================================
+
+
+def test_poisson_adaptive_sphere_watertight_manifold(device: str):
+    _skip_poisson_on_cpu(device)
+    points_np, normals_np = _sphere_cloud(4)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
+        points_wp, normals_wp, depth=6, full_depth=4, method="adaptive"
+    )
+    mesh_tw = _mesh_trimesh(vertices_wp, faces_wp)
+
+    assert tw.validation.is_watertight(vertices_wp, faces_wp)
+    assert mesh_tw.euler_number == 2  # closed genus-0 surface
+    assert mesh_tw.volume > 0.0  # outward orientation
+
+    radius_tw = np.linalg.norm(mesh_tw.vertices, axis=1)
+    assert abs(radius_tw.mean() - 1.0) < 0.03
+    assert np.abs(radius_tw - 1.0).max() < 0.08
+
+
+def test_poisson_adaptive_torus_genus(device: str):
+    _skip_poisson_on_cpu(device)
+    points_np, normals_np = _torus_cloud()
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
+        points_wp, normals_wp, depth=6, full_depth=4, method="adaptive"
+    )
+    assert tw.validation.is_watertight(vertices_wp, faces_wp)
+    assert _mesh_trimesh(vertices_wp, faces_wp).euler_number == 0  # genus-1 torus
+
+
+def test_poisson_adaptive_matches_dense(device: str):
+    _skip_poisson_on_cpu(device)
+    points_np, normals_np = _sphere_cloud(4)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    vertices_dense, faces_dense = tw.reconstruction.screened_poisson(
+        points_wp, normals_wp, depth=6, full_depth=4, method="dense"
+    )
+    vertices_adaptive, faces_adaptive = tw.reconstruction.screened_poisson(
+        points_wp, normals_wp, depth=6, full_depth=4, method="adaptive"
+    )
+    # Same iso-surface on two different grids: symmetric chamfer well within a couple of voxels.
+    chamfer = _symmetric_chamfer(
+        _mesh_trimesh(vertices_dense, faces_dense), _mesh_trimesh(vertices_adaptive, faces_adaptive)
+    )
+    assert chamfer < 0.05
+
+
+def test_poisson_adaptive_screening_improves_fit(device: str):
+    _skip_poisson_on_cpu(device)
+    points_np, normals_np = _sphere_cloud(4)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    vertices_screened, faces_screened = tw.reconstruction.screened_poisson(
+        points_wp, normals_wp, depth=6, full_depth=4, point_weight=4.0, method="adaptive"
+    )
+    vertices_unscreened, faces_unscreened = tw.reconstruction.screened_poisson(
+        points_wp, normals_wp, depth=6, full_depth=4, point_weight=0.0, method="adaptive"
+    )
+    fit_screened = _points_to_surface(points_np, _mesh_trimesh(vertices_screened, faces_screened))
+    fit_unscreened = _points_to_surface(
+        points_np, _mesh_trimesh(vertices_unscreened, faces_unscreened)
+    )
+    assert fit_screened <= fit_unscreened + 1e-4
+
+
+def test_poisson_adaptive_confidence_runs(device: str):
+    _skip_poisson_on_cpu(device)
+    points_np, normals_np = _sphere_cloud(4)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
+        points_wp, normals_wp, depth=6, full_depth=4, confidence=True, method="adaptive"
+    )
+    assert tw.validation.is_watertight(vertices_wp, faces_wp)
+    assert _mesh_trimesh(vertices_wp, faces_wp).euler_number == 2
+
+
+def test_poisson_invalid_method(device: str):
+    points_np, normals_np = _sphere_cloud(2)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+    with pytest.raises(ValueError, match="method"):
+        tw.reconstruction.screened_poisson(points_wp, normals_wp, method="bogus")
+
+
+# ======================================================================================
 # Ball pivoting (ball_pivoting)
 #
 # The wave-parallel front is interpolating (output vertices are input points) and edge-manifold

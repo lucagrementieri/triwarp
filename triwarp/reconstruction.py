@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import warp as wp
@@ -16,6 +17,11 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels import reconstruction as kernel_reconstruction
 from triwarp.kernels import remesh as kernel_remesh
 from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
+
+if TYPE_CHECKING:
+    # Type-checking only: the adaptive-backend helpers import ``warp.fem`` lazily (inside the
+    # functions) so ``import triwarp`` never pays its tens-of-seconds first-call codegen unused.
+    import warp.fem as fem
 
 
 def _orient2d(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
@@ -366,6 +372,7 @@ def screened_poisson(
     solver_iterations: int = 100,
     solver_tolerance: float = 1e-6,
     confidence: bool = False,
+    method: Literal["dense", "adaptive"] = "dense",
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
     Screened-Poisson surface reconstruction from an oriented point cloud (Kazhdan PoissonRecon).
@@ -415,6 +422,16 @@ def screened_poisson(
     confidence
         When ``True``, weight each sample's splat by ``|normals[i]|`` (treating the normal magnitude
         as a per-sample confidence), matching PoissonRecon's ``confidence`` flag.
+    method
+        Solver backend. ``"dense"`` (default) uses the dense node-centered grid described above.
+        ``"adaptive"`` uses a ``warp.fem`` adaptive Nanogrid refined only near the samples with a
+        variational (finite-element) assembly: fewer degrees of freedom for the same finest
+        resolution, so it reaches higher ``depth`` on the same memory budget. The two backends agree
+        up to discretization. A point-source weak form rings when the cells are much finer than the
+        sampling, so the adaptive backend caps the finest near-surface cell at roughly the mean
+        sample spacing (PoissonRecon-style); a ``depth`` above what the sampling supports then only
+        refines the extraction lattice. It lazily imports ``warp.fem`` (a one-time codegen cost of
+        tens of seconds on first use).
 
     Returns
     -------
@@ -453,6 +470,8 @@ def screened_poisson(
         )
     if scale <= 0.0:
         raise ValueError(f"screened_poisson requires scale > 0, got {scale}.")
+    if method not in ("dense", "adaptive"):
+        raise ValueError(f"screened_poisson method must be 'dense' or 'adaptive', got {method!r}.")
 
     device = points.device
     require_cuda(device, "screened_poisson")
@@ -460,7 +479,63 @@ def screened_poisson(
     if n < 3:
         raise ValueError(f"screened_poisson requires at least 3 points, got {n}.")
 
-    # Padded cubic reconstruction domain centered on the cloud AABB.
+    cube_lower, cube_upper, cube_size = _poisson_cube(points, scale)
+    # Effective screening weight: a floor keeps the operator SPD even at point_weight == 0.
+    screen = max(float(point_weight), 1e-4)
+
+    if method == "adaptive":
+        vertices, faces = _screened_poisson_adaptive(
+            points,
+            normals,
+            cube_lower,
+            cube_size,
+            depth=depth,
+            full_depth=full_depth,
+            screen=screen,
+            solver_iterations=solver_iterations,
+            solver_tolerance=solver_tolerance,
+            confidence=confidence,
+        )
+        if int(faces.shape[0]) > 0:
+            faces = tw.repair.make_normals_outward(vertices, faces)
+        return vertices, faces
+
+    solution, res = _poisson_dense_solve(
+        points,
+        normals,
+        cube_lower,
+        cube_size,
+        depth,
+        full_depth,
+        screen,
+        confidence,
+        solver_iterations,
+        solver_tolerance,
+        device,
+    )
+
+    # Iso-value: average of the solution sampled at the input points (PoissonRecon GetIsoValue).
+    inv_cell = float(res - 1) / cube_size
+    sampled = wp.empty(n, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_reconstruction.sample_field_trilinear,
+        dim=n,
+        inputs=[solution, res, cube_lower, inv_cell, points, sampled],
+        device=device,
+    )
+    sampled_np = sampled.numpy()
+    if confidence:
+        weights_np = np.linalg.norm(normals.numpy(), axis=1)
+        total = float(weights_np.sum())
+        iso = float(np.average(sampled_np, weights=weights_np)) if total > 0.0 else 0.0
+    else:
+        iso = float(sampled_np.mean())
+
+    return _extract_poisson_surface(solution, res, iso, cube_lower, cube_upper)
+
+
+def _poisson_cube(points: wp.array[wp.vec3], scale: float) -> tuple[wp.vec3, wp.vec3, float]:
+    """Return the padded cubic reconstruction domain (lower, upper, side) around the cloud AABB."""
     lo, hi = tw.bounds.aabb_bounds(points)
     center = 0.5 * (lo + hi)
     max_extent = max(float(hi[0] - lo[0]), float(hi[1] - lo[1]), float(hi[2] - lo[2]))
@@ -468,13 +543,35 @@ def screened_poisson(
         raise ValueError("screened_poisson requires points with a non-degenerate bounding box.")
     cube_size = scale * max_extent
     half = wp.vec3(0.5 * cube_size, 0.5 * cube_size, 0.5 * cube_size)
-    cube_lower = center - half
-    cube_upper = center + half
+    return center - half, center + half, cube_size
 
-    # Effective screening weight: a floor keeps the operator SPD even at point_weight == 0.
-    screen = max(float(point_weight), 1e-4)
 
-    # Cascadic coarse-to-fine solve: prolong each level's solution as the next initial guess.
+def _extract_poisson_surface(
+    field: wp.array[wp.float32], res: int, iso: float, cube_lower: wp.vec3, cube_upper: wp.vec3
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """Marching-cubes the ``res**3`` field at ``iso`` over the cube, oriented outward."""
+    vertices, faces = wp.MarchingCubes.extract_surface_marching_cubes(
+        field.reshape((res, res, res)), wp.float32(iso), cube_lower, cube_upper
+    )
+    if int(faces.shape[0]) > 0:
+        faces = tw.repair.make_normals_outward(vertices, faces)
+    return vertices, faces
+
+
+def _poisson_dense_solve(
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    cube_lower: wp.vec3,
+    cube_size: float,
+    depth: int,
+    full_depth: int,
+    screen: float,
+    confidence: bool,
+    solver_iterations: int,
+    solver_tolerance: float,
+    device: wp.DeviceLike,
+) -> tuple[wp.array[wp.float32], int]:
+    """Run the cascadic dense solve, returning the finest solution buffer and its resolution."""
     prev_solution: wp.array[wp.float32] | None = None
     prev_res = 0
     for level in range(full_depth, depth + 1):
@@ -507,33 +604,7 @@ def screened_poisson(
         prev_res = res
 
     assert prev_solution is not None
-    solution = prev_solution
-    res = prev_res
-    inv_cell = float(res - 1) / cube_size
-
-    # Iso-value: average of the solution sampled at the input points (PoissonRecon GetIsoValue).
-    sampled = wp.empty(n, dtype=wp.float32, device=device)
-    wp.launch(
-        kernel_reconstruction.sample_field_trilinear,
-        dim=n,
-        inputs=[solution, res, cube_lower, inv_cell, points, sampled],
-        device=device,
-    )
-    sampled_np = sampled.numpy()
-    if confidence:
-        weights_np = np.linalg.norm(normals.numpy(), axis=1)
-        total = float(weights_np.sum())
-        iso = float(np.average(sampled_np, weights=weights_np)) if total > 0.0 else 0.0
-    else:
-        iso = float(sampled_np.mean())
-
-    field = solution.reshape((res, res, res))
-    vertices, faces = wp.MarchingCubes.extract_surface_marching_cubes(
-        field, wp.float32(iso), cube_lower, cube_upper
-    )
-    if int(faces.shape[0]) > 0:
-        faces = tw.repair.make_normals_outward(vertices, faces)
-    return vertices, faces
+    return prev_solution, prev_res
 
 
 def _poisson_solve_level(
@@ -639,6 +710,217 @@ def _diagonal_operator(
         )
 
     return wpl.LinearOperator((n_nodes, n_nodes), wp.float32, wp.get_device(device), matvec)
+
+
+def _screened_poisson_adaptive(
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    cube_lower: wp.vec3,
+    cube_size: float,
+    *,
+    depth: int,
+    full_depth: int,
+    screen: float,
+    solver_iterations: int,
+    solver_tolerance: float,
+    confidence: bool,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Solve the screened-Poisson system on a ``warp.fem`` adaptive Nanogrid and extract its surface.
+
+    Backs the ``method="adaptive"`` path of
+    [`screened_poisson`][triwarp.reconstruction.screened_poisson]. ``warp.fem`` and its integrand
+    module are imported lazily here (not at module scope) so ``import triwarp`` never pays the
+    tens-of-seconds warp.fem first-call codegen unless the adaptive backend is used.
+
+    The solve is variational instead of the dense backend's finite-difference stencil: a dense
+    coarse grid at ``2**full_depth`` is refined toward the samples with an ``fem.ImplicitField``
+    oracle that never carves voxels (full-cube coverage), then the weak Laplacian
+    ``integral(grad u . grad v)``,
+    an exact point-measure screening term, and a point-source right-hand side are assembled over the
+    cells and a ``PicQuadrature`` at the samples and solved with a diagonal-preconditioned conjugate
+    gradient. Everything runs in index space (finest spacing ``1``) so the screening-vs-gradient
+    balance matches the dense backend's index-space calibration. The (un-oriented) iso-surface
+    ``(vertices, faces)`` is returned; the caller orients it outward.
+    """
+    import warp.fem as fem
+
+    from triwarp.kernels.algorithms import poisson_fem as kernel_poisson_fem
+
+    device = points.device
+    n = int(points.shape[0])
+
+    res_fine = 1 << depth
+    scale_to_index = float(res_fine) / cube_size
+
+    # Index-space sample positions, unit normals, and per-sample quadrature measures.
+    positions = wp.empty(n, dtype=wp.vec3, device=device)
+    wp.map(
+        kernel_poisson_fem.world_to_index,
+        points,
+        cube_lower,
+        wp.float32(scale_to_index),
+        out=positions,
+    )
+    unit_normals = wp.empty(n, dtype=wp.vec3, device=device)
+    wp.map(wp.normalize, normals, out=unit_normals)
+    if confidence:
+        measures = wp.empty(n, dtype=wp.float32, device=device)
+        wp.map(wp.length, normals, out=measures)
+    else:
+        measures = wp.full(n, wp.float32(1.0), device=device)
+
+    # Match the finest near-surface cell size to the sample spacing (PoissonRecon-style): a
+    # point-source weak form rings if cells are much finer than the sampling, so cap the effective
+    # octree depth at ~two cells per mean nearest-neighbour distance (never below full_depth, never
+    # above the requested depth). ``depth`` beyond this only refines the extraction lattice, which
+    # merely samples the already-smooth field more densely.
+    _idx, dist = tw.neighbors.query_bvh_nearest(points, points, k=2)
+    nn = dist.numpy()[:, 1]
+    finite = nn[np.isfinite(nn) & (nn > 0.0)]
+    spacing = float(finite.mean()) if finite.size > 0 else cube_size / float(res_fine)
+    grid_depth = int(np.floor(np.log2(max(2.0 * cube_size / spacing, 1.0))))
+    grid_depth = max(full_depth, min(depth, grid_depth))
+
+    res_coarse = 1 << full_depth
+    level_count = grid_depth - full_depth + 1
+    coarse_voxel = float(1 << (depth - full_depth))
+    fine_voxel = float(1 << (depth - grid_depth))
+    spacing_idx = spacing * scale_to_index
+    band_r = max(2.0 * fine_voxel, 1.5 * spacing_idx)
+    falloff = max(coarse_voxel, 2.0 * spacing_idx)
+
+    # Coarse dense base grid covering the whole cube in index space, then refine toward the samples.
+    ijk = np.stack(np.meshgrid(*(np.arange(res_coarse),) * 3, indexing="ij"), axis=-1).reshape(
+        -1, 3
+    )
+    # Translate by half a voxel so the voxel-centered grid spans exactly ``[0, 2**depth]`` per axis.
+    # Without it the domain is ``[-coarse_voxel/2, ...]`` and the outer lattice shell falls outside;
+    # failed lookups there would leave zeros that marching cubes reads as a spurious surface.
+    coarse_grid = wp.Volume.allocate_by_voxels(
+        wp.array(ijk.astype(np.int32), dtype=wp.vec3i, device=device),
+        voxel_size=coarse_voxel,
+        translation=(0.5 * coarse_voxel, 0.5 * coarse_voxel, 0.5 * coarse_voxel),
+        device=device,
+    )
+    hashgrid = tw.neighbors.hashgrid_from_points(positions, band_r + falloff)
+    refinement = fem.ImplicitField(
+        domain=fem.Cells(fem.Nanogrid(coarse_grid)),
+        func=kernel_poisson_fem.refinement_oracle,
+        values={
+            "grid": hashgrid.id,
+            "pts": positions,
+            "r": wp.float32(band_r),
+            "falloff": wp.float32(falloff),
+        },
+    )
+    geometry = fem.adaptive_nanogrid_from_field(
+        coarse_grid, level_count, refinement_field=refinement, grading="face"
+    )
+
+    # Weak-form assembly: stiffness + screening = source.
+    space = fem.make_polynomial_space(geometry, degree=1, dtype=float)
+    domain = fem.Cells(geometry)
+    test = fem.make_test(space, domain=domain)
+    trial = fem.make_trial(space, domain=domain)
+    quadrature = fem.PicQuadrature(domain, positions, measures)
+
+    matrix = fem.integrate(kernel_poisson_fem.diffusion_form, fields={"u": trial, "v": test})
+    matrix += fem.integrate(
+        kernel_poisson_fem.screening_form,
+        quadrature=quadrature,
+        fields={"u": trial, "v": test},
+        values={"screen": wp.float32(screen)},
+    )
+    rhs = fem.integrate(
+        kernel_poisson_fem.source_form,
+        quadrature=quadrature,
+        fields={"v": test},
+        values={"normals": unit_normals},
+        output_dtype=float,
+    )
+
+    solution = wp.zeros_like(rhs)
+    wpl.cg(
+        matrix,
+        rhs,
+        solution,
+        tol=solver_tolerance,
+        maxiter=solver_iterations,
+        M=wpl.preconditioner(matrix, "diag"),
+    )
+    field = space.make_field()
+    field.dof_values = solution
+
+    # Iso-value: (confidence-weighted) mean of the solution at the input samples.
+    sampled = wp.zeros(n, dtype=wp.float32, device=device)
+    fem.interpolate(
+        kernel_poisson_fem.sample_field,
+        at=domain,
+        dim=n,
+        fields={"u": field},
+        values={"positions": positions, "out_values": sampled},
+    )
+    sampled_np = sampled.numpy()
+    if confidence:
+        weights_np = np.linalg.norm(normals.numpy(), axis=1)
+        total = float(weights_np.sum())
+        iso = float(np.average(sampled_np, weights=weights_np)) if total > 0.0 else 0.0
+    else:
+        iso = float(sampled_np.mean())
+
+    return _extract_poisson_surface_fem(
+        field, domain, iso, cube_lower, cube_size, depth, res_fine, device
+    )
+
+
+def _extract_poisson_surface_fem(
+    field: fem.DiscreteField,
+    domain: fem.GeometryDomain,
+    iso: float,
+    cube_lower: wp.vec3,
+    cube_size: float,
+    depth: int,
+    res_fine: int,
+    device: wp.DeviceLike,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Sample the adaptive ``field`` onto a dense lattice and marching-cube the ``iso`` surface.
+
+    The lattice resolution is capped at ``2**min(depth, 9) + 1``: ``warp.MarchingCubes`` needs about
+    nine times the field bytes in scratch, so a full-cube call overflows above depth 9. A
+    slab-chunked pass would lift that cap, but ``warp.MarchingCubes`` is crack-free only within a
+    single grid -- its per-cell face triangulation is not consistent across independent invocations,
+    so welding independent slabs leaves non-manifold seams -- and depth 9-10 already oversamples the
+    spacing-capped solve, so the simple capped extraction is used.
+    """
+    import warp.fem as fem
+
+    from triwarp.kernels.algorithms import poisson_fem as kernel_poisson_fem
+
+    res = (1 << min(depth, 9)) + 1
+    step_index = float(res_fine) / float(res - 1)
+    positions = wp.empty(res * res * res, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_poisson_fem.lattice_positions,
+        dim=(res, res, res),
+        inputs=[wp.float32(step_index), res, wp.float32(float(res_fine) - 1e-3), positions],
+        device=device,
+    )
+    values = wp.zeros(res * res * res, dtype=wp.float32, device=device)
+    fem.interpolate(
+        kernel_poisson_fem.sample_field,
+        at=domain,
+        dim=res * res * res,
+        fields={"u": field},
+        values={"positions": positions, "out_values": values},
+    )
+    cube_upper = wp.vec3(
+        cube_lower[0] + cube_size, cube_lower[1] + cube_size, cube_lower[2] + cube_size
+    )
+    return wp.MarchingCubes.extract_surface_marching_cubes(
+        values.reshape((res, res, res)), wp.float32(iso), cube_lower, cube_upper
+    )
 
 
 def ball_pivoting(
