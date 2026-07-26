@@ -15,6 +15,7 @@ import warp as wp
 
 from triwarp.kernels.array import binary_search_sorted_contains
 from triwarp.kernels.grouping import pack_edge_key
+from triwarp.kernels.predicates import triangle_normal as face_normal
 
 # Per-thread neighbour scratch for the seed search (Open3D re-scans the KNN result twice).
 MAX_SEED_NEIGHBORS = 64
@@ -22,15 +23,6 @@ MAX_SEED_NEIGHBORS = 64
 # (exactly on the ball in exact arithmetic) do not spuriously read as "inside".
 BALL_EPS = wp.constant(wp.float32(1e-4))
 TWO_PI = wp.constant(2.0 * wp.PI)
-
-
-@wp.func
-def face_normal(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.vec3:
-    n = wp.cross(b - a, c - a)
-    length = wp.length(n)
-    if length > 0.0:
-        n = n / length
-    return n
 
 
 @wp.func
@@ -301,14 +293,6 @@ def mark_front_endpoints(
     e = int(wp.tid())
     out_available[front_src[e]] = True
     out_available[front_tgt[e]] = True
-
-
-@wp.kernel
-def count_edge_faces(
-    inverse: wp.array(dtype=wp.int32), out_count: wp.array(dtype=wp.int32)
-) -> None:
-    c = int(wp.tid())
-    wp.atomic_add(out_count, inverse[c], 1)
 
 
 @wp.kernel

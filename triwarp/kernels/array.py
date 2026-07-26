@@ -1,3 +1,5 @@
+from typing import Any
+
 import warp as wp
 
 from triwarp.constants import TOLERANCE_MERGE_CONSTANT
@@ -92,7 +94,9 @@ def update_argmin_pair(
 
 
 @wp.func
-def cross2(a: wp.vec2, b: wp.vec2) -> wp.float32:
+def cross2(a: Any, b: Any) -> wp.Float:
+    # 2D cross product (signed parallelogram area). Generic so float32 and float64 call sites share
+    # one definition.
     return a[0] * b[1] - a[1] * b[0]
 
 
@@ -173,6 +177,22 @@ def gather_2d_from_1d(
 
 
 @wp.kernel
+def sort_rows_insertion(data: wp.array2d[wp.Scalar]) -> None:
+    # One thread per row, in-place insertion sort across the row. For the narrow rows this library
+    # actually sorts (vertex pairs, triangle corners) that is 1-3 register comparisons, versus a
+    # segmented radix sort whose fixed per-segment cost dominates completely at these widths.
+    row = int(wp.tid())
+    width = data.shape[1]
+    for i in range(1, width):
+        value = data[row, i]
+        j = i - 1
+        while j >= 0 and data[row, j] > value:
+            data[row, j + 1] = data[row, j]
+            j = j - 1
+        data[row, j + 1] = value
+
+
+@wp.kernel
 def gather_vec_skip_negative(
     source: wp.array[wp.vec3], index: wp.array[wp.int32], out_gathered: wp.array[wp.vec3]
 ) -> None:
@@ -208,6 +228,13 @@ def mask_not(a: wp.bool) -> wp.bool:
 @wp.func
 def mask_and_not(a: wp.bool, b: wp.bool) -> wp.bool:
     return a and not b
+
+
+@wp.func
+def complement_flag(a: wp.bool) -> wp.int32:
+    # ``1`` where the mask is False, ``0`` where it is True: the scan input for an inverted
+    # ``mask_to_index_map`` (free/interior DOFs of a fixed-vertex mask, for instance).
+    return wp.where(a, wp.int32(0), wp.int32(1))
 
 
 @wp.func

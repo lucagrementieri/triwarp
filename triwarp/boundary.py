@@ -54,7 +54,9 @@ def boundary_edges(
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
 
-    indices = tw.grouping.group_int_rows(edges_sorted, 1, int(vertices.shape[0])).flatten()
+    indices = tw.grouping.group_int_rows(
+        edges_sorted, 1, int(vertices.shape[0]), validate=False
+    ).flatten()
     return twt.as_array2d_int32(tw.array.gather(edges_sorted, indices))
 
 
@@ -98,7 +100,9 @@ def oriented_boundary_edges(
     if edges is None:
         edges = tw.edges.faces_to_edges(faces)
 
-    indices = tw.grouping.group_int_rows(edges_sorted, 1, int(vertices.shape[0])).flatten()
+    indices = tw.grouping.group_int_rows(
+        edges_sorted, 1, int(vertices.shape[0]), validate=False
+    ).flatten()
     return twt.as_array2d_int32(tw.array.gather(edges, indices))
 
 
@@ -380,7 +384,9 @@ def ears(
     if n_vertices is None:
         n_vertices = tw.vertices.n_vertices(edges_sorted)
 
-    boundary_rows = tw.grouping.group_int_rows(edges_sorted, 1, n_vertices).flatten()
+    boundary_rows = tw.grouping.group_int_rows(
+        edges_sorted, 1, n_vertices, validate=False
+    ).flatten()
     edge_boundary = wp.zeros(n_faces * 3, dtype=wp.bool, device=device)
     n_boundary_rows = int(boundary_rows.shape[0])
     if n_boundary_rows > 0:

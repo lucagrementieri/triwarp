@@ -12,7 +12,12 @@ below is a direct port of the corresponding ``MRTriMath.h`` / ``MRReducePath`` p
 import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT, PI, TWO_PI
-from triwarp.kernels.array import cross2, sort3, update_argmax
+from triwarp.kernels.array import sort3, update_argmax
+from triwarp.kernels.predicates import (
+    circumcircle_diameter_sq,
+    is_unfold_quadrangle_convex,
+    triangle_aspect_ratio,
+)
 
 # Compile-time upper bound on the per-point fan size (neighbours kept for one center).
 # Per-thread scratch arrays are sized to this; the runtime ``max_neighbours`` must not exceed it.
@@ -27,36 +32,6 @@ NORMAL_FILTER_DOT = wp.constant(wp.float32(-0.3))
 # --------------------------------------------------------------------------------------
 # Geometry primitives (ports of MRTriMath.h / MRReducePath)
 # --------------------------------------------------------------------------------------
-@wp.func
-def circumcircle_diameter_sq(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.float32:
-    # MRTriMath.h: squared diameter of triangle ABC circumcircle.
-    ab = wp.dot(b - a, b - a)
-    ca = wp.dot(a - c, a - c)
-    bc = wp.dot(c - b, c - b)
-    if ab <= 0.0:
-        return ca
-    if ca <= 0.0:
-        return bc
-    if bc <= 0.0:
-        return ab
-    cr = wp.cross(b - a, c - a)
-    f = wp.dot(cr, cr)
-    if f <= 0.0:
-        return FLOAT32_INF_CONSTANT
-    return ab * ca * bc / f
-
-
-@wp.func
-def triangle_aspect_ratio(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.float32:
-    # MRTriMath.h: circum-radius over twice in-radius; large for slivers.
-    bc = wp.length(c - b)
-    ca = wp.length(a - c)
-    ab = wp.length(b - a)
-    half_perimeter = (bc + ca + ab) / 2.0
-    den = 8.0 * (half_perimeter - bc) * (half_perimeter - ca) * (half_perimeter - ab)
-    if den <= 0.0:
-        return FLOAT32_INF_CONSTANT
-    return bc * ca * ab / den
 
 
 @wp.func
@@ -86,54 +61,6 @@ def tris_angle_profit(
     return vec_angle(dir_abc, dir_acd) - crit_ang
 
 
-@wp.func
-def unfold_on_plane(b: wp.vec3, c: wp.vec3, d: wp.vec2, to_left: bool) -> wp.vec2:
-    # MRReducePath.cpp unfoldOnPlane: place c in the plane relative to already-placed d.
-    dot_bc = wp.dot(b, c)
-    crs_bc = wp.length(wp.cross(b, c))
-    dd = wp.dot(d, d)
-    if dd <= 0.0:
-        return wp.vec2(0.0, 0.0)
-    if to_left:
-        o = wp.vec2(-d[1], d[0])
-    else:
-        o = wp.vec2(d[1], -d[0])
-    return (dot_bc * d + crs_bc * o) / dd
-
-
-@wp.func
-def line_isect(b: wp.vec2, c: wp.vec2, d: wp.vec2) -> wp.float32:
-    # MRReducePath.cpp lineIsect: parameter where segment 0-B meets line C-D.
-    c1 = cross2(d, c)
-    c2 = cross2(c - b, d - b)
-    if c1 == 0.0 and c2 == 0.0:
-        bb = wp.dot(b, b)
-        if bb == 0.0:
-            return 0.0
-        return (wp.dot(c, b) + wp.dot(d, b)) / (2.0 * bb)
-    cc = c1 + c2
-    if cc == 0.0:
-        return 0.0
-    return c1 / cc
-
-
-@wp.func
-def is_unfold_quadrangle_convex(a: wp.vec3, b: wp.vec3, c: wp.vec3, d: wp.vec3) -> bool:
-    # MRReducePath: unfold triangles ABC and ACD into a plane; convex iff the B-D path
-    # crosses edge AC strictly between A and C.
-    vec_b = b - a
-    vec_c = c - a
-    vec_d = d - a
-    unfold_b = wp.vec2(wp.length(vec_b), 0.0)
-    unfold_c = unfold_on_plane(vec_b, vec_c, unfold_b, True)
-    unfold_d = unfold_on_plane(vec_c, vec_d, unfold_c, True)
-    x = line_isect(unfold_c, unfold_b, unfold_d)
-    return x > 0.0 and x < 1.0
-
-
-# --------------------------------------------------------------------------------------
-# Fan cyclic navigation over the compacted local neighbour array
-# --------------------------------------------------------------------------------------
 @wp.func
 def cycle_next(nbr: wp.array(dtype=wp.int32), m: wp.int32, i: wp.int32) -> wp.int32:
     j = i

@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
+from triwarp.constants import TOLERANCE_MERGE_CONSTANT
 from triwarp.kernels.array import (
     binary_search_index,
     cross2,
@@ -8,6 +8,7 @@ from triwarp.kernels.array import (
     vector_angle_vec,
     wrap_index,
 )
+from triwarp.kernels.predicates import orient2d
 
 
 @wp.func
@@ -360,21 +361,6 @@ def radius_segment_distances(
 
 
 # --- polygon triangulation (parallel ear clipping); port of libigl ear_clipping.cpp ---
-
-
-@wp.func
-def orient2d(a: wp.vec2, b: wp.vec2, c: wp.vec2) -> wp.int32:
-    """
-    Sign of the 2D cross product ``(b - a) x (c - a)``.
-
-    ``+1`` CCW, ``-1`` CW, ``0`` collinear.
-    """
-    det = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-    if det > TOLERANCE_ZERO_CONSTANT:
-        return wp.int32(1)
-    if det < -TOLERANCE_ZERO_CONSTANT:
-        return wp.int32(-1)
-    return wp.int32(0)
 
 
 @wp.func

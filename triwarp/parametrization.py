@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import warp as wp
-import warp.optim.linear as wpl
 import warp.sparse as wps
 
 import triwarp as tw
+import triwarp.linalg as twl
 import triwarp.typing as twt
 from triwarp._device import require_cuda
 from triwarp.kernels import parametrization as kernel_parametrization
@@ -208,8 +208,8 @@ def _solve_fixed_boundary(
         device=device,
     )
 
-    sol, free_map, _ = _min_quad_with_fixed_columns(
-        q, fixed_mask, twt.as_array2d_float(fixed_values, dtype=wp.float64), device
+    sol, free_map, _ = twl.min_quad_with_fixed(
+        q, fixed_mask, twt.as_array2d_float(fixed_values, dtype=wp.float64), tol=_CG_TOLERANCE
     )
 
     out_uv = wp.empty(n_vertices, dtype=wp.vec2, device=device)
@@ -220,111 +220,6 @@ def _solve_fixed_boundary(
         device=device,
     )
     return out_uv
-
-
-def _min_quad_with_fixed_columns(
-    q: wps.BsrMatrix[wp.float64],
-    fixed_mask: wp.array[wp.bool],
-    fixed_values: twt.Array2dFloat,
-    device: wp.DeviceLike,
-) -> tuple[twt.Array2dFloat, wp.array[wp.int32], int]:
-    """
-    Solve ``min_quad_with_fixed`` for a stacked operator with ``n_rhs`` right-hand-side columns.
-
-    Generalizes the fixed-value quadratic minimization shared by ``harmonic`` / ``tutte`` (2
-    independent UV columns over ``n_vertices`` unknowns) and ``lscm`` (1 coupled column over ``2n``
-    unknowns): ``fixed_mask`` marks the fixed DOFs among ``n_dofs = fixed_mask.shape[0]``, and
-    ``fixed_values`` is ``(n_rhs, n_dofs)``. Returns the solved free values ``(n_rhs, n_free)``, the
-    compact free-index remap, and the free count. The all-fixed case (``n_free == 0``) returns an
-    empty solution without a solve (and without requiring CUDA), leaving reconstruction to the
-    caller's scatter kernel.
-    """
-    n_rhs = int(fixed_values.shape[0])
-    free_map, n_free = _free_partition(fixed_mask, device)
-
-    sol = wp.zeros((n_rhs, n_free), dtype=wp.float64, device=device)
-    if n_free == 0:
-        # Every DOF is fixed: the prescribed values are the whole answer, no solve needed.
-        return twt.as_array2d_float(sol, dtype=wp.float64), free_map, n_free
-
-    require_cuda(device, "harmonic / tutte / lscm")
-
-    q_uu, rhs = _assemble_interior_system(q, fixed_mask, free_map, fixed_values, n_free, device)
-
-    # One diagonal preconditioner shared by every symmetric-PD column solve. Row views of the
-    # row-major (n_rhs, n_free) buffers are contiguous, so they serve directly as CG vectors.
-    preconditioner = wpl.preconditioner(q_uu, "diag")
-    for c in range(n_rhs):
-        wpl.cg(q_uu, rhs[c], sol[c], tol=_CG_TOLERANCE, maxiter=10 * n_free, M=preconditioner)
-    return twt.as_array2d_float(sol, dtype=wp.float64), free_map, n_free
-
-
-def _free_partition(
-    fixed_mask: wp.array[wp.bool], device: wp.DeviceLike
-) -> tuple[wp.array[wp.int32], int]:
-    """
-    Compact free-DOF remap shared by the fixed-value solver and ``arap``.
-
-    Exclusive-scans the free indicator (``1`` for free / interior DOFs, ``0`` for fixed ones) so
-    each free DOF gets its index in the reduced system; the inclusive scan's last entry is the free
-    count. Returns ``(free_map, n_free)`` where ``free_map[i]`` is meaningful only for free ``i``.
-    """
-    n_dofs = int(fixed_mask.shape[0])
-    flags = wp.empty(n_dofs, dtype=wp.int32, device=device)
-    wp.map(kernel_parametrization.interior_flag, fixed_mask, out=flags)
-    free_map = wp.empty(n_dofs, dtype=wp.int32, device=device)
-    inclusive = wp.empty(n_dofs, dtype=wp.int32, device=device)
-    wp.utils.array_scan(flags, out_array=free_map, inclusive=False)
-    wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
-    n_free = int(inclusive.numpy()[-1])
-    return free_map, n_free
-
-
-def _assemble_interior_system(
-    q: wps.BsrMatrix[wp.float64],
-    fixed_mask: wp.array[wp.bool],
-    free_map: wp.array[wp.int32],
-    fixed_values: twt.Array2dFloat,
-    n_free: int,
-    device: wp.DeviceLike,
-) -> tuple[wps.BsrMatrix[wp.float64], twt.Array2dFloat]:
-    """
-    Assemble the interior operator ``Q_uu`` and the constant right-hand side ``-Q_ub bc``.
-
-    Launches [`interior_system_triplets`][triwarp.kernels.parametrization.interior_system_triplets]
-    over the ``n_dofs`` rows of ``Q`` (positive semi-definite), emitting the free-free COO block and
-    the ``n_rhs`` fixed-column contributions, then builds ``Q_uu`` in a single
-    ``bsr_from_triplets``. Shared by the fixed-value solver and ``arap`` (whose per-iteration
-    rotation term is added to the returned constant RHS). ``rhs`` is ``(n_rhs, n_free)``.
-    """
-    n_dofs = int(fixed_mask.shape[0])
-    n_rhs = int(fixed_values.shape[0])
-    nnz = int(q.nnz)
-    out_rows = wp.zeros(nnz, dtype=wp.int32, device=device)
-    out_cols = wp.zeros(nnz, dtype=wp.int32, device=device)
-    out_vals = wp.zeros(nnz, dtype=wp.float64, device=device)
-    rhs = wp.zeros((n_rhs, n_free), dtype=wp.float64, device=device)
-    wp.launch(
-        kernel_parametrization.interior_system_triplets,
-        dim=n_dofs,
-        inputs=[
-            q.offsets,
-            q.columns,
-            q.values,
-            fixed_mask,
-            free_map,
-            fixed_values,
-            out_rows,
-            out_cols,
-            out_vals,
-            rhs,
-        ],
-        device=device,
-    )
-    q_uu = wps.bsr_from_triplets(
-        n_free, n_free, out_rows, out_cols, out_vals, prune_numerical_zeros=False
-    )
-    return q_uu, twt.as_array2d_float(rhs, dtype=wp.float64)
 
 
 def harmonic(
@@ -574,7 +469,7 @@ def arap(
             device=device,
         )
     fixed_values_2d = twt.as_array2d_float(fixed_values, dtype=wp.float64)
-    interior_map, n_interior = _free_partition(fixed_mask, device)
+    interior_map, n_interior = twl.free_partition(fixed_mask)
 
     out_uv = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     if n_interior == 0:
@@ -602,10 +497,9 @@ def arap(
     # faces, replacing the per-face fit with a group-summed covariance) and ``with_dynamics`` (a
     # mass-matrix + timestep term added to Q and the right-hand side); both are out of scope here.
     neg_l = wps.bsr_axpy(x=laplacian, alpha=-1.0)
-    q_uu, rhs_const = _assemble_interior_system(
-        neg_l, fixed_mask, interior_map, fixed_values_2d, n_interior, device
+    q_uu, rhs_const = twl.assemble_interior_system(
+        neg_l, fixed_mask, interior_map, fixed_values_2d, n_interior
     )
-    preconditioner = wpl.preconditioner(q_uu, "diag")
 
     # Weight-folded rest edges of the isometrically flattened triangles (internal buffer, plain
     # wp.empty; kernels index it as wp.array2d per CLAUDE.md).
@@ -637,6 +531,17 @@ def arap(
     rhs_rot_y = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     b = wp.empty((2, n_interior), dtype=wp.float64, device=device)
 
+    # One batched CG state for both UV columns, built once outside the loop: its temporaries and
+    # batch layout are reused across iterations, and it reads ``b`` / writes ``sol`` in place, so
+    # the warm start is simply whatever ``sol`` already holds.
+    solver = twl.spd_column_solver(
+        q_uu,
+        twt.as_array2d_float(b, dtype=wp.float64),
+        twt.as_array2d_float(sol, dtype=wp.float64),
+        tol=_CG_TOLERANCE,
+        maxiter=10 * n_interior,
+    )
+
     for _ in range(max_iterations):
         rhs_rot_x.zero_()
         rhs_rot_y.zero_()
@@ -654,9 +559,8 @@ def arap(
             inputs=[fixed_mask, interior_map, rhs_const, rhs_rot_x, rhs_rot_y, b],
             device=device,
         )
-        # Two symmetric-PD column solves (warm-started from the previous ``sol``).
-        wpl.cg(q_uu, b[0], sol[0], tol=_CG_TOLERANCE, maxiter=10 * n_interior, M=preconditioner)
-        wpl.cg(q_uu, b[1], sol[1], tol=_CG_TOLERANCE, maxiter=10 * n_interior, M=preconditioner)
+        # Both UV columns in one batched symmetric-PD solve, warm-started from the previous ``sol``.
+        solver()
         # Reconstruct the full UV field, re-enforcing the pinned constraints for the next iteration.
         wp.launch(
             kernel_parametrization.scatter_solution,
@@ -753,8 +657,8 @@ def lscm(
             device=device,
         )
 
-    sol, free_map, _ = _min_quad_with_fixed_columns(
-        q, fixed_mask, twt.as_array2d_float(fixed_values, dtype=wp.float64), device
+    sol, free_map, _ = twl.min_quad_with_fixed(
+        q, fixed_mask, twt.as_array2d_float(fixed_values, dtype=wp.float64), tol=_CG_TOLERANCE
     )
 
     out_uv = wp.empty(n, dtype=wp.vec2, device=device)
@@ -830,18 +734,13 @@ def lscm_hessian(
         device=device,
     )
     if n_be > 0:
-        wp.launch(
-            kernel_parametrization.vector_area_triplets,
-            dim=n_be,
-            inputs=[
-                boundary,
-                wp.int32(n),
-                wp.float64(-2.0),
-                rows[2 * n_entries :],
-                cols[2 * n_entries :],
-                vals[2 * n_entries :],
-            ],
-            device=device,
+        # The ``-2 A`` term shares its triplet kernel with
+        # [`vector_area_matrix`][triwarp.parametrization.vector_area_matrix] but writes into a slice
+        # of the combined buffer: assembling ``A`` as its own matrix and adding it would need a
+        # second build plus a ``bsr_axpy``, which breaks the single-``bsr_from_triplets`` rule this
+        # operator relies on for deterministic ``bsr_mm``.
+        _vector_area_triplets(
+            boundary, n, -2.0, rows[2 * n_entries :], cols[2 * n_entries :], vals[2 * n_entries :]
         )
     return wps.bsr_from_triplets(2 * n, 2 * n, rows, cols, vals, prune_numerical_zeros=False)
 
@@ -894,10 +793,36 @@ def vector_area_matrix(
     rows = wp.empty(4 * n_be, dtype=wp.int32, device=device)
     cols = wp.empty(4 * n_be, dtype=wp.int32, device=device)
     vals = wp.empty(4 * n_be, dtype=wp.float64, device=device)
+    _vector_area_triplets(boundary, n, 1.0, rows, cols, vals)
+    return wps.bsr_from_triplets(2 * n, 2 * n, rows, cols, vals, prune_numerical_zeros=False)
+
+
+def _vector_area_triplets(
+    boundary_edges: twt.Array2dInt32,
+    n_vertices: int,
+    scale: float,
+    out_rows: wp.array[wp.int32],
+    out_cols: wp.array[wp.int32],
+    out_vals: wp.array[wp.float64],
+) -> None:
+    """
+    Emit the four cross-quadrant vector-area triplets per oriented boundary edge.
+
+    Writes ``4 * n_boundary_edges`` triplets from slot zero of the given buffers, which may be
+    slices of a larger triplet array. ``scale = 1`` builds ``A`` itself
+    ([`vector_area_matrix`][triwarp.parametrization.vector_area_matrix]); ``scale = -2`` builds the
+    ``-2 A`` term of the LSCM Hessian ([`lscm_hessian`][triwarp.parametrization.lscm_hessian]).
+    """
     wp.launch(
         kernel_parametrization.vector_area_triplets,
-        dim=n_be,
-        inputs=[boundary, wp.int32(n), wp.float64(1.0), rows, cols, vals],
-        device=device,
+        dim=int(boundary_edges.shape[0]),
+        inputs=[
+            boundary_edges,
+            wp.int32(n_vertices),
+            wp.float64(scale),
+            out_rows,
+            out_cols,
+            out_vals,
+        ],
+        device=out_rows.device,
     )
-    return wps.bsr_from_triplets(2 * n, 2 * n, rows, cols, vals, prune_numerical_zeros=False)

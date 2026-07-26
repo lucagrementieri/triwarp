@@ -11,9 +11,8 @@ import warp.sparse as wps
 import triwarp as tw
 from triwarp.edges import mean_edge_length
 from triwarp.kernels import geodesic as kernel_geodesic
-from triwarp.kernels import laplacian as kernel_laplacian
 from triwarp.kernels.algorithms import bfs as kernel_bfs
-from triwarp.laplacian import cotmatrix_entries, mass_matrix_entries
+from triwarp.laplacian import cotmatrix, cotmatrix_entries, mass_matrix_entries
 from triwarp.triangles import face_normals_and_areas
 
 _CG_TOLERANCE = 1e-8
@@ -92,21 +91,9 @@ def heat_geodesic(
     # the divergence. The cotangent stiffness follows the igl convention (negative diagonal, so
     # ``-L`` is positive semi-definite) but is assembled here in float64.
     cot_entries = cotmatrix_entries(vertices, faces)
-    n_triplets = 12 * n_faces
-    rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
-    cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
-    vals = wp.empty(n_triplets, dtype=wp.float64, device=device)
-    # The generic ``cotmatrix_triplets`` casts the shared float32 half-cotangent weights to
-    # float64, assembling the operator natively in a single build (see issue_report.md).
-    wp.launch(
-        kernel_laplacian.cotmatrix_triplets,
-        dim=n_faces,
-        inputs=[faces, cot_entries, rows, cols, vals],
-        device=device,
-    )
-    laplacian = wps.bsr_from_triplets(
-        n_vertices, n_vertices, rows, cols, vals, prune_numerical_zeros=False
-    )
+    # ``cotmatrix`` casts the shared float32 half-cotangent weights to float64 and assembles the
+    # operator natively in a single build (see issue_report.md).
+    laplacian = cotmatrix(vertices, faces, cot_entries=cot_entries, dtype=wp.float64)
 
     # Face normals / areas (float32) for the gradient below; the lumped mass is built natively in
     # float64 by ``mass_matrix_entries``.

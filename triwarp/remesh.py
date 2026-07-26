@@ -12,10 +12,10 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_nonempty_mesh
+from triwarp.constants import INT32_MAX
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels import edges as kernel_edges
 from triwarp.kernels import remesh as kernel_remesh
-
-_INT32_MAX = 2147483647
 
 # Callback that launches a predicate kernel filling ``out_flip``/``out_quad`` for one flip
 # iteration. Supplied by each consumer of ``_flip_interior_edges`` (3D Delone / 2D incircle).
@@ -173,7 +173,10 @@ def isotropic_remesh(
 
 
 def _classify(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], feature: wp.float32
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    feature: wp.float32,
+    edges_sorted: twt.Array2dInt32 | None = None,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.bool]]:
     """
     Per-vertex FREE / CREASE / CORNER codes plus a boundary-vertex mask.
@@ -181,6 +184,10 @@ def _classify(
     A boundary edge or an interior edge sharper than ``feature`` counts as one incident feature
     edge; a vertex with zero is FREE, exactly two is CREASE (a smooth feature/boundary line), and
     anything else (a feature endpoint or a junction) is a frozen CORNER.
+
+    ``edges_sorted`` may be passed when the caller already built it for the same ``faces``: this is
+    called up to seven times per ``isotropic_remesh`` iteration, and rebuilding the sorted edge rows
+    each time was a measurable share of the total.
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
@@ -193,7 +200,8 @@ def _classify(
     feature_count = wp.zeros(n_vertices, dtype=wp.int32, device=device)
     boundary_count = wp.zeros(n_vertices, dtype=wp.int32, device=device)
 
-    edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+    if edges_sorted is None:
+        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
     boundary = tw.boundary.boundary_edges(vertices, faces, edges_sorted=edges_sorted)
     if int(boundary.shape[0]) > 0:
         wp.launch(
@@ -209,7 +217,9 @@ def _classify(
             device=device,
         )
 
-    adjacency, adjacency_edges = tw.adjacency.face_adjacency(faces, edges_sorted, return_edges=True)
+    adjacency, adjacency_edges = tw.adjacency.face_adjacency(
+        faces, edges_sorted, return_edges=True, n_vertices=n_vertices
+    )
     if int(adjacency.shape[0]) > 0:
         angles = tw.adjacency.face_adjacency_angles(vertices, faces, face_adjacency=adjacency)
         wp.launch(
@@ -245,7 +255,11 @@ def _collapse_pass(
         if n_faces == 0:
             break
 
-        unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+        # One sorted edge-row build per pass, shared by the unique-edge pass and ``_classify``.
+        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+        unique_edges, inverse = tw.edges.edges_unique(
+            faces, edges_sorted=edges_sorted, n_vertices=n_vertices
+        )
         m = int(unique_edges.shape[0])
         if m == 0:
             break
@@ -253,12 +267,12 @@ def _collapse_pass(
 
         edge_face_count = wp.zeros(m, dtype=wp.int32, device=device)
         wp.launch(
-            kernel_remesh.count_edge_faces,
+            kernel_edges.count_edge_faces,
             dim=int(inverse.shape[0]),
             inputs=[inverse, edge_face_count],
             device=device,
         )
-        codes, _boundary = _classify(vertices, faces, feature)
+        codes, _boundary = _classify(vertices, faces, feature, edges_sorted=edges_sorted)
         csr = tw.graph.edges_to_csr(n_vertices, unique_edges)
 
         survivor = wp.full(m, -1, dtype=wp.int32, device=device)
@@ -284,7 +298,7 @@ def _collapse_pass(
             device=device,
         )
 
-        claim = wp.full(n_vertices, _INT32_MAX, dtype=wp.int32, device=device)
+        claim = wp.full(n_vertices, INT32_MAX, dtype=wp.int32, device=device)
         wp.launch(
             kernel_remesh.claim_collapses,
             dim=m,
@@ -427,7 +441,7 @@ def _flip_interior_edges(
     for _ in range(max_iter):
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
         adjacency, adjacency_edges = tw.adjacency.face_adjacency(
-            faces, edges_sorted, return_edges=True
+            faces, edges_sorted, return_edges=True, n_vertices=n_vertices
         )
         m = int(adjacency.shape[0])
         if m == 0:
@@ -436,13 +450,8 @@ def _flip_interior_edges(
 
         # Sorted table of existing undirected-edge keys, for the "flip would duplicate an edge"
         # guard. Keys match kernels.grouping.pack_indices (min + max * n_vertices).
-        n_rows = int(edges_sorted.shape[0])
-        keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices)
-        keys_buffer = wp.empty(2 * n_rows, dtype=wp.uint64, device=device)
-        wp.copy(keys_buffer, keys, count=n_rows)
-        vals_buffer = tw.array.init_sort_pair_indices(n_rows, -1, device)
-        wp.utils.radix_sort_pairs(keys_buffer, vals_buffer, count=n_rows)
-        sorted_keys = keys_buffer[:n_rows]
+        keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=False)
+        sorted_keys, _order = tw.array.sort_pairs(keys)
 
         out_flip = wp.zeros(m, dtype=wp.bool, device=device)
         out_quad = twt.empty_int32_2d((m, 4), device=device)
@@ -461,8 +470,8 @@ def _flip_interior_edges(
         table = 1
         while table < 4 * m + 1:
             table <<= 1
-        face_claim = wp.full(n_faces, _INT32_MAX, dtype=wp.int32, device=device)
-        edge_claim = wp.full(table, _INT32_MAX, dtype=wp.int32, device=device)
+        face_claim = wp.full(n_faces, INT32_MAX, dtype=wp.int32, device=device)
+        edge_claim = wp.full(table, INT32_MAX, dtype=wp.int32, device=device)
         wp.launch(
             kernel_remesh.claim_flips,
             dim=m,

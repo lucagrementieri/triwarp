@@ -45,6 +45,7 @@ SECTIONS: dict[str, list[str]] = {
     ],
     "Operators & fields": [
         "laplacian",
+        "linalg",
         "interpolation",
         "parametrization",
     ],

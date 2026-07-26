@@ -4,6 +4,7 @@ from triwarp.constants import FLOAT32_INF_CONSTANT
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels.array import update_argmin
 from triwarp.kernels.array import wrap_index as _wrap
+from triwarp.kernels.predicates import circumcircle_diameter_sq, triangle_aspect_ratio
 
 # Big-but-finite penalty (MeshLib ``BadTriangulationMetric``): lets the DP keep a bad triangulation
 # rather than break entirely, while staying below ``float`` precision limits when summed.
@@ -262,34 +263,9 @@ def bridge_b_faces(
 
 @wp.func
 def circumcircle_diameter(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.float32:
-    # Diameter of the circumscribed circle of triangle ``abc`` (MeshLib ``circumcircleDiameterSq``).
-    ab = wp.length_sq(b - a)
-    ca = wp.length_sq(a - c)
-    bc = wp.length_sq(c - b)
-    if ab <= 0.0:
-        return wp.sqrt(ca)
-    if ca <= 0.0:
-        return wp.sqrt(bc)
-    if bc <= 0.0:
-        return wp.sqrt(ab)
-    f = wp.length_sq(wp.cross(b - a, c - a))
-    if f <= 0.0:
-        return FLOAT32_INF_CONSTANT
-    return wp.sqrt(ab * ca * bc / f)
-
-
-@wp.func
-def triangle_aspect_ratio(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.float32:
-    # Circum-radius over twice the in-radius (MeshLib ``triangleAspectRatio``); grows unboundedly
-    # for slivers, so a degenerate triangle returns +inf (sorts strictly above ``BAD_METRIC``).
-    bc = wp.length(c - b)
-    ca = wp.length(a - c)
-    ab = wp.length(b - a)
-    half_perimeter = (bc + ca + ab) * 0.5
-    den = 8.0 * (half_perimeter - bc) * (half_perimeter - ca) * (half_perimeter - ab)
-    if den <= 0.0:
-        return FLOAT32_INF_CONSTANT
-    return bc * ca * ab / den
+    # Diameter (not squared) of triangle ABC's circumcircle; +inf when degenerate, which the
+    # square root preserves.
+    return wp.sqrt(circumcircle_diameter_sq(a, b, c))
 
 
 @wp.func

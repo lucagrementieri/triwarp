@@ -18,6 +18,7 @@ def face_adjacency(
     edges_sorted: twt.Array2dInt32 | None = None,
     *,
     return_edges: Literal[False] = False,
+    n_vertices: int | None = None,
 ) -> twt.Array2dInt32: ...
 @overload
 def face_adjacency(
@@ -25,12 +26,14 @@ def face_adjacency(
     edges_sorted: twt.Array2dInt32 | None = None,
     *,
     return_edges: Literal[True],
+    n_vertices: int | None = None,
 ) -> tuple[twt.Array2dInt32, twt.Array2dInt32]: ...
 def face_adjacency(
     faces: wp.array[wp.int32],
     edges_sorted: twt.Array2dInt32 | None = None,
     *,
     return_edges: bool = False,
+    n_vertices: int | None = None,
 ) -> twt.Array2dInt32 | tuple[twt.Array2dInt32, twt.Array2dInt32]:
     """
     Face index pairs that share an undirected mesh edge.
@@ -54,6 +57,12 @@ def face_adjacency(
         ``faces.device``.
     return_edges
         If ``True``, also return the shared vertex indices for each adjacency row.
+    n_vertices
+        Optional vertex count, used as the row-hashing radix. Supplying it skips the
+        ``triwarp.reduce.minmax`` that would otherwise infer and validate the radix, and with it a
+        host readback that serialises the device pipeline — worth passing from loops that call this
+        once per pass. Must be greater than every index in ``faces``; see the warning on
+        [`hash_indices_rows`][triwarp.grouping.hash_indices_rows].
 
     Returns
     -------
@@ -92,7 +101,9 @@ def face_adjacency(
     # Hash edge rows over the vertex-index range (inferred max + 1); using ``n_faces`` as the base
     # is wrong whenever the largest vertex index is >= n_faces (e.g. small meshes with more
     # vertices than faces). The grouping partition is invariant to the (sufficiently large) base.
-    edge_groups = tw.grouping.group_int_rows(edges_sorted, length=2)
+    edge_groups = tw.grouping.group_int_rows(
+        edges_sorted, length=2, max_value=n_vertices, validate=n_vertices is None
+    )
     adjacency = twt.empty_int32_2d((edge_groups.shape[0], 2), device=faces.device)
     wp.launch(
         kernel_array.gather_2d_from_1d,

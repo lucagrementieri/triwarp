@@ -91,7 +91,15 @@ MESHES_BY_NAME = {mesh["name"]: mesh for mesh in MESHES}
 MESH_ORDER = [mesh["name"] for mesh in MESHES]
 
 RIM_LONG = 1 << 16
-SYNTHETIC_MESHES: list[MeshSpec] = [_mesh("synthetic_cylinder", "", 2 * RIM_LONG)]
+
+# Grid resolutions for the saddle patches: ``k x k`` vertices give ``2 * (k - 1) ** 2`` faces.
+SADDLE_SMALL, SADDLE_MEDIUM = 68, 133
+
+SYNTHETIC_MESHES: list[MeshSpec] = [
+    _mesh("synthetic_cylinder", "", 2 * RIM_LONG),
+    _mesh("synthetic_saddle_small", "", 2 * (SADDLE_SMALL - 1) ** 2),
+    _mesh("synthetic_saddle", "", 2 * (SADDLE_MEDIUM - 1) ** 2),
+]
 SYNTHETIC_MESHES_BY_NAME = {mesh["name"]: mesh for mesh in SYNTHETIC_MESHES}
 ALL_MESHES_BY_NAME = {**MESHES_BY_NAME, **SYNTHETIC_MESHES_BY_NAME}
 
@@ -119,6 +127,7 @@ LIBRARIES_BY_ID = {lib["id"]: lib for lib in LIBRARIES}
 
 _numpy_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 _wp_cache: dict[tuple[str, str, str], wp.array] = {}
+_mean_edge_cache: dict[str, float] = {}
 
 
 def _open_cylinder(rim: int) -> tuple[np.ndarray, np.ndarray]:
@@ -133,17 +142,49 @@ def _open_cylinder(rim: int) -> tuple[np.ndarray, np.ndarray]:
     return vertices, np.vstack((lower, upper)).astype(np.int32)
 
 
+def _saddle_patch(k: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    ``k x k`` regular grid lifted onto a saddle: ``2 * (k - 1) ** 2`` faces, one boundary loop.
+
+    A disk-topology patch, which is what the parametrization solvers are actually for: every vertex
+    has valence at most 6, the curvature is non-trivial (so the cotangent weights are not
+    degenerate), and the geometry is generated from NumPy alone, so the face count is exact and
+    independent of any mesh library's version.
+    """
+    axis = np.linspace(-1.0, 1.0, k)
+    x, y = np.meshgrid(axis, axis, indexing="ij")
+    z = 0.35 * (x * x - 0.6 * y * y)
+    vertices = np.column_stack((x.ravel(), y.ravel(), z.ravel()))
+    i, j = np.meshgrid(np.arange(k - 1), np.arange(k - 1), indexing="ij")
+    lower_left = (i * k + j).ravel()
+    faces = np.vstack(
+        (
+            np.column_stack((lower_left, lower_left + k, lower_left + k + 1)),
+            np.column_stack((lower_left, lower_left + k + 1, lower_left + 1)),
+        )
+    )
+    return vertices, faces
+
+
+_SYNTHETIC_BUILDERS = {
+    "synthetic_cylinder": lambda: _open_cylinder(RIM_LONG),
+    "synthetic_saddle_small": lambda: _saddle_patch(SADDLE_SMALL),
+    "synthetic_saddle": lambda: _saddle_patch(SADDLE_MEDIUM),
+}
+
+
 def _load_numpy(name: str) -> tuple[np.ndarray, np.ndarray]:
     """
     Read ``(vertices_f64, faces_i64)`` once with meshio, cached across the session.
 
     Uses the same ``meshio.read`` path as ``triwarp.io.load_mesh_data``; kept at NumPy level
     (float64 vertices / int64 faces) so igl and trimesh get their arrays directly and the warp
-    buffers are built from the same source.
+    buffers are built from the same source. Synthetic meshes are generated instead of read.
     """
     if name not in _numpy_cache:
-        if name == "synthetic_cylinder":
-            vertices, faces = _open_cylinder(RIM_LONG)
+        builder = _SYNTHETIC_BUILDERS.get(name)
+        if builder is not None:
+            vertices, faces = builder()
             _numpy_cache[name] = (
                 np.ascontiguousarray(vertices, dtype=np.float64),
                 np.ascontiguousarray(faces, dtype=np.int64),
@@ -170,6 +211,28 @@ def _faces_wp(name: str, device: str) -> wp.array[wp.int32]:
             np.ascontiguousarray(faces.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
         )
     return _wp_cache[key]
+
+
+def _mean_edge(name: str) -> float:
+    """
+    Mean undirected edge length of a mesh, from the shared NumPy source.
+
+    Computed on the host so every library variant of a case gets the *same* value: benchmarks that
+    size their work by edge length (remeshing targets, ball-pivoting radii) must not hand triwarp
+    and its reference slightly different parameters.
+    """
+    if name not in _mean_edge_cache:
+        vertices, faces = _load_numpy(name)
+        triangles = vertices[faces]
+        edges = np.concatenate(
+            (
+                triangles[:, 1] - triangles[:, 0],
+                triangles[:, 2] - triangles[:, 1],
+                triangles[:, 0] - triangles[:, 2],
+            )
+        )
+        _mean_edge_cache[name] = float(np.linalg.norm(edges, axis=1).mean())
+    return _mean_edge_cache[name]
 
 
 def _vertices_wp(name: str, device: str) -> wp.array[wp.vec3]:
@@ -364,6 +427,11 @@ class BenchCase:
     def n_vertices(self) -> int:
         """Vertex count (the ``edges_unique`` hash base)."""
         return int(_load_numpy(self.mesh_name)[0].shape[0])
+
+    @property
+    def mean_edge(self) -> float:
+        """Mean undirected edge length; the natural scale for remeshing / reconstruction sizing."""
+        return _mean_edge(self.mesh_name)
 
     def run(self, fn: Callable[[], Any]) -> Any:
         """

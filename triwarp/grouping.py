@@ -89,7 +89,7 @@ def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
 
 
 def group_int_rows(
-    data: twt.Array2dInt, length: int, max_value: int | None = None
+    data: twt.Array2dInt, length: int, max_value: int | None = None, *, validate: bool = True
 ) -> twt.Array2dInt32:
     """
     Return index groups of exactly ``length`` rows that are identical.
@@ -110,6 +110,10 @@ def group_int_rows(
         through to [`hash_indices_rows`][triwarp.grouping.hash_indices_rows] as ``max_index``. If
         ``None``, inferred
         from ``max(data) + 1``.
+    validate
+        Forwarded to [`hash_indices_rows`][triwarp.grouping.hash_indices_rows]. ``False`` skips the
+        range-check reduction (and its host readback) and requires ``max_value``; see the warning
+        there before using it.
 
     Returns
     -------
@@ -121,7 +125,7 @@ def group_int_rows(
     [`group`][triwarp.grouping.group]
     """
     twt.ensure_ndim(data, 2)
-    hashed_rows = hash_indices_rows(data, max_value)
+    hashed_rows = hash_indices_rows(data, max_value, validate=validate)
     return group(hashed_rows, length)
 
 
@@ -511,7 +515,9 @@ def hash_vector_rows(data: wp.array[wp.vec3], epsilon: float = 0.0) -> wp.array[
     return hashes
 
 
-def hash_indices_rows(data: twt.Array2dInt32, max_index: int | None = None) -> wp.array[wp.uint64]:
+def hash_indices_rows(
+    data: twt.Array2dInt32, max_index: int | None = None, *, validate: bool = True
+) -> wp.array[wp.uint64]:
     """
     Pack each row of non-negative ``int32`` values into a single ``uint64`` key.
 
@@ -528,11 +534,30 @@ def hash_indices_rows(data: twt.Array2dInt32, max_index: int | None = None) -> w
     max_index
         Optional exclusive upper bound on entries and radix for packing; must be
         positive when provided. If ``None``, set to ``max(data) + 1`` after validation.
+    validate
+        When ``True`` (default), a ``triwarp.reduce.minmax`` over ``data`` checks that entries are
+        non-negative and below ``max_index``. That reduction ends in a host readback, which
+        serialises the device pipeline — measurably so when this is called once per pass inside a
+        remeshing loop. Pass ``False``, together with an explicit ``max_index``, to skip it when the
+        bound is already guaranteed by construction (mesh edge rows are built from face indices, so
+        they are non-negative and below the vertex count by definition).
 
     Returns
     -------
     wp.array[wp.uint64]
         Length-``n`` array on ``data.device`` with one packed key per row.
+
+    Raises
+    ------
+    ValueError
+        If ``max_index`` is not positive, if ``validate=False`` is passed without a ``max_index``,
+        or -- when validating -- if ``data`` is negative or reaches ``max_index``.
+
+    Warnings
+    --------
+    ``validate=False`` with a ``max_index`` smaller than the true maximum silently produces
+    colliding keys, and therefore wrong groupings, rather than raising. Only use it where the bound
+    is structurally guaranteed.
 
     See Also
     --------
@@ -542,15 +567,22 @@ def hash_indices_rows(data: twt.Array2dInt32, max_index: int | None = None) -> w
     twt.ensure_ndim(data, 2, dtype=wp.int32)
     if max_index is not None and max_index <= 0:
         raise ValueError(f"max_index must be positive, got {max_index}")
-    min_data, max_data = tw.reduce.minmax(data)
-    if min_data < 0:
-        raise ValueError(f"data must be non-negative, got a minimum of {min_data}")
-    if max_index is not None and max_data >= max_index:
-        raise ValueError(
-            f"data must be less than max_index {max_index}, got a maximum of {max_data}"
-        )
-    if max_index is None:
-        max_index = max_data + 1
+    if not validate:
+        if max_index is None:
+            raise ValueError("validate=False requires an explicit max_index (the radix to use).")
+    else:
+        # The min/max is a device reduction with a host readback, so it serialises the pipeline.
+        # It is unavoidable when the radix has to be inferred, and skippable via validate=False
+        # when the caller already knows the bound.
+        min_data, max_data = tw.reduce.minmax(data)
+        if min_data < 0:
+            raise ValueError(f"data must be non-negative, got a minimum of {min_data}")
+        if max_index is not None and max_data >= max_index:
+            raise ValueError(
+                f"data must be less than max_index {max_index}, got a maximum of {max_data}"
+            )
+        if max_index is None:
+            max_index = max_data + 1
     hashes = wp.empty(data.shape[0], dtype=wp.uint64, device=data.device)
     wp.launch(
         kernel_grouping.pack_indices,

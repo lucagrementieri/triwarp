@@ -7,6 +7,8 @@ import warp.optim.linear as wpl
 import warp.sparse as wps
 
 import triwarp as tw
+import triwarp.linalg as twl
+import triwarp.typing as twt
 from triwarp import laplacian
 from triwarp._device import require_cuda
 from triwarp.constants import TILE_1D
@@ -586,22 +588,12 @@ def filter_implicit_fairing(
     rhs = _empty_components(n, device)
     solutions = _empty_components(n, device)
 
-    n_triplets = 12 * n_faces
     for _ in range(iterations):
         current = tw.array._as_vec3(positions)
+        # Rebuilt every iteration on purpose: the cotangent weights depend on ``current``, which
+        # the fairing step moves, so implicit fairing must re-linearise on the moving surface.
         cot_entries = laplacian.cotmatrix_entries(current, faces)
-        rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
-        cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
-        vals = wp.empty(n_triplets, dtype=wp.float64, device=device)
-        # Generic ``cotmatrix_triplets`` casts the float32 half-cotangent weights to float64,
-        # assembling the stiffness matrix natively in a single build (see issue_report.md).
-        wp.launch(
-            kernel_laplacian.cotmatrix_triplets,
-            dim=n_faces,
-            inputs=[faces, cot_entries, rows, cols, vals],
-            device=device,
-        )
-        stiffness = wps.bsr_from_triplets(n, n, rows, cols, vals, prune_numerical_zeros=False)
+        stiffness = laplacian.cotmatrix(current, faces, cot_entries=cot_entries, dtype=wp.float64)
 
         mass = laplacian.mass_matrix_entries(current, faces, dtype=wp.float64)
 
@@ -697,25 +689,6 @@ def _edge_weight_matrix(
     return wps.bsr_from_triplets(n, n, rows, cols, vals, prune_numerical_zeros=False)
 
 
-def _solve_spd_xyz(
-    system: wps.BsrMatrix[wp.float64],
-    rhs_x: wp.array[wp.float64],
-    rhs_y: wp.array[wp.float64],
-    rhs_z: wp.array[wp.float64],
-    n: int,
-) -> tuple[wp.array[wp.float64], wp.array[wp.float64], wp.array[wp.float64]]:
-    """Solve the same SPD system for three right-hand sides (x/y/z), sharing a preconditioner."""
-    device = rhs_x.device
-    preconditioner = wpl.preconditioner(system, "diag")
-    sol_x = wp.zeros(n, dtype=wp.float64, device=device)
-    sol_y = wp.zeros(n, dtype=wp.float64, device=device)
-    sol_z = wp.zeros(n, dtype=wp.float64, device=device)
-    wpl.cg(system, rhs_x, sol_x, tol=_CG_TOLERANCE_POSITION, maxiter=10 * n, M=preconditioner)
-    wpl.cg(system, rhs_y, sol_y, tol=_CG_TOLERANCE_POSITION, maxiter=10 * n, M=preconditioner)
-    wpl.cg(system, rhs_z, sol_z, tol=_CG_TOLERANCE_POSITION, maxiter=10 * n, M=preconditioner)
-    return sol_x, sol_y, sol_z
-
-
 def position_verts_smoothly_sharp_boundary(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -778,9 +751,9 @@ def position_verts_smoothly_sharp_boundary(
     out_rows = wp.zeros(size, dtype=wp.int32, device=device)
     out_cols = wp.zeros(size, dtype=wp.int32, device=device)
     out_vals = wp.zeros(size, dtype=wp.float64, device=device)
-    rhs_x = wp.zeros(n_free, dtype=wp.float64, device=device)
-    rhs_y = wp.zeros(n_free, dtype=wp.float64, device=device)
-    rhs_z = wp.zeros(n_free, dtype=wp.float64, device=device)
+    # One contiguous (3, n_free) right-hand side: its rows are contiguous 1-D views, so the
+    # assembly kernel writes them directly and the three columns solve in one batched CG.
+    rhs = wp.zeros((3, n_free), dtype=wp.float64, device=device)
     wp.launch(
         kernel_smoothing.dirichlet_system_triplets,
         dim=n,
@@ -795,20 +768,27 @@ def position_verts_smoothly_sharp_boundary(
             out_rows,
             out_cols,
             out_vals,
-            rhs_x,
-            rhs_y,
-            rhs_z,
+            rhs[0],
+            rhs[1],
+            rhs[2],
         ],
         device=device,
     )
     system = wps.bsr_from_triplets(
         n_free, n_free, out_rows, out_cols, out_vals, prune_numerical_zeros=False
     )
-    sol_x, sol_y, sol_z = _solve_spd_xyz(system, rhs_x, rhs_y, rhs_z, n_free)
+    sol = wp.zeros((3, n_free), dtype=wp.float64, device=device)
+    twl.solve_spd_columns(
+        system,
+        twt.as_array2d_float(rhs, dtype=wp.float64),
+        twt.as_array2d_float(sol, dtype=wp.float64),
+        tol=_CG_TOLERANCE_POSITION,
+        maxiter=10 * n_free,
+    )
     wp.launch(
         kernel_smoothing.scatter_free_solution,
         dim=n,
-        inputs=[free_mask, free_map, sol_x, sol_y, sol_z, out],
+        inputs=[free_mask, free_map, sol[0], sol[1], sol[2], out],
         device=device,
     )
     return out
@@ -907,14 +887,22 @@ def position_verts_smoothly(
         n_free, n_rows, wp.clone(cols), wp.clone(rows), wp.clone(vals), prune_numerical_zeros=False
     )
     system = wps.bsr_mm(mt_matrix, m_matrix)
-    atb_x = wps.bsr_mv(mt_matrix, rhs_x)
-    atb_y = wps.bsr_mv(mt_matrix, rhs_y)
-    atb_z = wps.bsr_mv(mt_matrix, rhs_z)
-    sol_x, sol_y, sol_z = _solve_spd_xyz(system, atb_x, atb_y, atb_z, n_free)
+    # A^T b straight into the rows of one contiguous buffer, so the three columns batch.
+    atb = wp.zeros((3, n_free), dtype=wp.float64, device=device)
+    for column, component in enumerate((rhs_x, rhs_y, rhs_z)):
+        wps.bsr_mv(mt_matrix, component, atb[column], alpha=1.0, beta=0.0)
+    sol = wp.zeros((3, n_free), dtype=wp.float64, device=device)
+    twl.solve_spd_columns(
+        system,
+        twt.as_array2d_float(atb, dtype=wp.float64),
+        twt.as_array2d_float(sol, dtype=wp.float64),
+        tol=_CG_TOLERANCE_POSITION,
+        maxiter=10 * n_free,
+    )
     wp.launch(
         kernel_smoothing.scatter_free_solution,
         dim=n,
-        inputs=[free_mask, free_map, sol_x, sol_y, sol_z, out],
+        inputs=[free_mask, free_map, sol[0], sol[1], sol[2], out],
         device=device,
     )
     return out

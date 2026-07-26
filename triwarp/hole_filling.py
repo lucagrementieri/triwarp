@@ -286,12 +286,10 @@ class _EdgeTable:
         )
 
         keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices)
-        keys_buffer = wp.empty(2 * n_rows, dtype=wp.uint64, device=device)
-        wp.copy(keys_buffer, keys, count=n_rows)
-        rows_buffer = tw.array.init_sort_pair_indices(n_rows, -1, device)
-        wp.utils.radix_sort_pairs(keys_buffer, rows_buffer, count=n_rows)
-        self.sorted_keys = wp.clone(keys_buffer[:n_rows])
-        self.sorted_rows = wp.clone(rows_buffer[:n_rows])
+        sorted_keys, sorted_rows = tw.array.sort_pairs(keys)
+        # Cloned: the views alias scratch that must not be shared with a later sort.
+        self.sorted_keys = wp.clone(sorted_keys)
+        self.sorted_rows = wp.clone(sorted_rows)
 
         self.position = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
 

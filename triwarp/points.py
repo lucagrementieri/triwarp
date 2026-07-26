@@ -480,13 +480,7 @@ def radial_sort(
     wp.map(kernel_points.radial_sort_key, points, origin, axis0, axis1, out=out_keys)
 
     # Ascending radix sort of the negated angles yields the descending-angle order.
-    keys_buf = wp.empty(2 * n, dtype=wp.float32, device=device)
-    wp.copy(keys_buf, out_keys, count=n)
-    order_buf = tw.array.init_sort_pair_indices(n, n, device)
-    wp.utils.radix_sort_pairs(keys_buf, order_buf, count=n)
-
-    order = wp.empty(n, dtype=wp.int32, device=device)
-    wp.copy(order, order_buf, count=n)
+    _sorted_keys, order = tw.array.sort_pairs(out_keys, fill_value=n)
     out = wp.empty(n, dtype=wp.vec3, device=device)
     wp.copy(out, points[order])
     return out

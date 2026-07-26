@@ -18,6 +18,10 @@ DType = TypeVar("DType")
 # Use a direct-index membership table when max(value)+1 is at most this multiple of |test_elements|.
 _ISIN_MASK_SIZE_FACTOR = 8
 
+# Row width up to which [`sort_rows`][triwarp.array.sort_rows] uses a per-row insertion sort instead
+# of a segmented radix sort. Comfortably above every in-library row width (edges 2, corners 3).
+SORT_ROWS_INSERTION_MAX_COLS = 8
+
 
 def _ensure_int_dtype(dtype: type) -> type[wp.Int]:
     if not wp.types.type_is_int(dtype):
@@ -295,6 +299,47 @@ def allclose(
     return bool(tw.reduce.all(mask))
 
 
+def sort_pairs(
+    keys: wp.array[wp.Scalar], *, fill_value: int = -1
+) -> tuple[wp.array[wp.Scalar], wp.array[wp.int32]]:
+    """
+    Ascending radix sort of ``keys``, returning the sorted keys and their original positions.
+
+    Wraps ``warp.utils.radix_sort_pairs``, which needs double-width scratch for both the keys and
+    the payload; this allocates that scratch, seeds the payload with ``0..n-1`` and hands back
+    length-``n`` views of the sorted prefixes.
+
+    Parameters
+    ----------
+    keys
+        Length-``n`` sort keys (any radix-sortable scalar dtype).
+    fill_value
+        Padding written into the upper half of the payload buffer, where the sort's scratch lives.
+        Only matters to callers that read past ``n``.
+
+    Returns
+    -------
+    sorted_keys : wp.array
+        Length-``n`` view of the ascending keys.
+    order : wp.array[wp.int32]
+        Length-``n`` view of the original index of each sorted key.
+
+    Notes
+    -----
+    Both results are **views** into the scratch buffers, kept alive by the returned arrays. Clone
+    them if they must outlive the caller's frame alongside another sort.
+    """
+    device = keys.device
+    n = int(keys.shape[0])
+    if n == 0:
+        return keys, wp.empty(0, dtype=wp.int32, device=device)
+    keys_buffer = wp.empty(2 * n, dtype=keys.dtype, device=device)
+    wp.copy(keys_buffer, keys, count=n)
+    order_buffer = init_sort_pair_indices(n, fill_value, device)
+    wp.utils.radix_sort_pairs(keys_buffer, order_buffer, count=n)
+    return keys_buffer[:n], order_buffer[:n]
+
+
 def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
     """
     Sort each row of a 2D array independently, in place, ascending.
@@ -306,12 +351,26 @@ def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
     ----------
     data
         ``(n, w)`` device array sorted in place, row by row.
+
+    Notes
+    -----
+    Rows no wider than ``SORT_ROWS_INSERTION_MAX_COLS`` are sorted by a per-row insertion sort (one
+    thread per row); wider rows fall back to a segmented radix sort. The narrow path is not a
+    micro-optimization: ``segmented_sort_pairs`` pays a fixed cost per *segment*, so sorting a
+    million two-element rows with it cost ~183 ms against ~0.1 ms for the compare-and-swap the width
+    actually needs. Every in-library caller sorts vertex pairs or triangle corners.
     """
     n = data.size
+    n_rows, n_cols = int(data.shape[0]), int(data.shape[1])
+    if n_rows == 0 or n_cols < 2:
+        return
+    if n_cols <= SORT_ROWS_INSERTION_MAX_COLS:
+        wp.launch(kernel_array.sort_rows_insertion, dim=n_rows, inputs=[data], device=data.device)
+        return
+
     data_buffer = wp.empty(n * 2, dtype=data.dtype, device=data.device)
     wp.copy(data_buffer, data, count=n)
     indices_buffer = init_sort_pair_indices(n, -1, data.device)
-    n_cols = int(data.shape[1])
     segment_start_indices = init_range_step(n // n_cols + 1, n_cols, data.device)
     wp.utils.segmented_sort_pairs(
         data_buffer, indices_buffer, n, segment_start_indices=segment_start_indices
@@ -592,7 +651,9 @@ def indices_to_mask(
     return mask
 
 
-def mask_to_index_map(mask: wp.array[wp.bool]) -> tuple[wp.array[wp.int32], int]:
+def mask_to_index_map(
+    mask: wp.array[wp.bool], *, invert: bool = False
+) -> tuple[wp.array[wp.int32], int]:
     """
     Compact index map over the ``True`` entries of a boolean mask, plus their count.
 
@@ -600,22 +661,29 @@ def mask_to_index_map(mask: wp.array[wp.bool]) -> tuple[wp.array[wp.int32], int]
     ----------
     mask
         Length-``n`` ``wp.bool`` array.
+    invert
+        When ``True``, map the ``False`` entries instead. Useful for a free/fixed degree-of-freedom
+        partition, where the mask marks the *constrained* entries and the compact map is wanted over
+        the unconstrained complement (see [`free_partition`][triwarp.linalg.free_partition]).
 
     Returns
     -------
     index_map : wp.array[wp.int32]
-        Length-``n`` array on ``mask.device``: an exclusive scan of ``mask``, so
-        ``index_map[i]`` is the compact 0-based rank of element ``i`` among the ``True``
-        entries at or before it (meaningful only where ``mask[i]`` is ``True``).
+        Length-``n`` array on ``mask.device``: an exclusive scan of the (optionally inverted) mask,
+        so ``index_map[i]`` is the compact 0-based rank of element ``i`` among the selected
+        entries at or before it (meaningful only where element ``i`` is itself selected).
     count : int
-        Total number of ``True`` entries in ``mask``.
+        Total number of selected entries in ``mask``.
     """
     device = mask.device
     n = int(mask.shape[0])
     if n == 0:
         return wp.zeros(0, dtype=wp.int32, device=device), 0
     flags = wp.empty(n, dtype=wp.int32, device=device)
-    wp.utils.array_cast(mask, flags)
+    if invert:
+        wp.map(kernel_array.complement_flag, mask, out=flags)
+    else:
+        wp.utils.array_cast(mask, flags)
     index_map = wp.empty(n, dtype=wp.int32, device=device)
     inclusive = wp.empty(n, dtype=wp.int32, device=device)
     wp.utils.array_scan(flags, out_array=index_map, inclusive=False)

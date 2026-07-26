@@ -137,7 +137,5 @@ def test_query_geodesic_ball(bench_case: BenchCase) -> None:
     skip_larger_than(bench_case, "happy_buddha")
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     radius = 5.0 * float(tw.edges.mean_edge_length(vertices, faces))
-    _, offsets, _ = bench_case.run(
-        lambda: tw.geodesic.geodesic_ball(vertices, faces, radius)
-    )
+    _, offsets, _ = bench_case.run(lambda: tw.geodesic.geodesic_ball(vertices, faces, radius))
     assert offsets.shape == (vertices.shape[0],)

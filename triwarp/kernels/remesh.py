@@ -2,6 +2,15 @@ import warp as wp
 
 from triwarp.kernels.array import binary_search_sorted_contains, to_vec2d, to_vec3d
 from triwarp.kernels.grouping import hash_slot, pack_edge_key
+from triwarp.kernels.predicates import (
+    circumcircle_diameter_sq,
+    dihedral_angle,
+    is_unfold_quadrangle_convex,
+    mincircle_diameter_sq,
+    orient2d,
+    triangle_aspect_ratio,
+    triangle_normal,
+)
 
 # Delaunay / Delone edge-flip constants (ported from MRMeshDelone.cpp). The flip predicate
 # runs in float64: MeshLib deliberately widens to double because circumcircle diameters of
@@ -9,7 +18,6 @@ from triwarp.kernels.grouping import hash_slot, pack_edge_key
 DELONE_CRITICAL_DOT = wp.constant(wp.float64(-0.9))
 DELONE_EPS = wp.constant(wp.float64(1e-7))
 NO_ANGLE_CHANGE_LIMIT = wp.constant(wp.float64(6.283185307179586))  # 2*pi (NoAngleChangeLimit)
-F64_INF = wp.constant(wp.float64(1.0e308))
 F32_LARGE = wp.constant(wp.float32(3.0e38))  # "disabled gate" sentinel (~FLT_MAX)
 
 
@@ -238,116 +246,6 @@ def long_region_edge(length: wp.float32, max_edge: wp.float32, in_region: wp.boo
 
 
 @wp.func
-def _normal_d(a: wp.vec3d, b: wp.vec3d, c: wp.vec3d) -> wp.vec3d:
-    n = wp.cross(b - a, c - a)
-    length = wp.length(n)
-    if length <= wp.float64(0.0):
-        return wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
-    return n / length
-
-
-@wp.func
-def _circumcircle_diameter_sq_d(a: wp.vec3d, b: wp.vec3d, c: wp.vec3d) -> wp.float64:
-    ab = wp.length_sq(b - a)
-    ca = wp.length_sq(a - c)
-    bc = wp.length_sq(c - b)
-    if ab <= wp.float64(0.0):
-        return ca
-    if ca <= wp.float64(0.0):
-        return bc
-    if bc <= wp.float64(0.0):
-        return ab
-    f = wp.length_sq(wp.cross(b - a, c - a))
-    if f <= wp.float64(0.0):
-        return F64_INF
-    return ab * ca * bc / f
-
-
-@wp.func
-def _mincircle_diameter_sq_d(a: wp.vec3d, b: wp.vec3d, c: wp.vec3d) -> wp.float64:
-    ab = wp.length_sq(b - a)
-    ca = wp.length_sq(a - c)
-    bc = wp.length_sq(c - b)
-    if ca >= bc + ab:
-        return ca
-    if bc >= ab + ca:
-        return bc
-    if ab >= ca + bc:
-        return ab
-    f = wp.length_sq(wp.cross(b - a, c - a))
-    if f <= wp.float64(0.0):
-        return F64_INF
-    return ab * ca * bc / f
-
-
-@wp.func
-def _dihedral_angle_d(left_n: wp.vec3d, right_n: wp.vec3d, edge_vec: wp.vec3d) -> wp.float64:
-    edge_dir = wp.normalize(edge_vec)
-    s = wp.dot(edge_dir, wp.cross(left_n, right_n))
-    co = wp.dot(left_n, right_n)
-    return wp.atan2(s, co)
-
-
-@wp.func
-def _triangle_aspect_ratio_d(a: wp.vec3d, b: wp.vec3d, c: wp.vec3d) -> wp.float64:
-    bc = wp.length(c - b)
-    ca = wp.length(a - c)
-    ab = wp.length(b - a)
-    half = (bc + ca + ab) / wp.float64(2.0)
-    den = wp.float64(8.0) * (half - bc) * (half - ca) * (half - ab)
-    if den <= wp.float64(0.0):
-        return F64_INF
-    return bc * ca * ab / den
-
-
-@wp.func
-def _cross2_d(u: wp.vec2d, v: wp.vec2d) -> wp.float64:
-    return u[0] * v[1] - u[1] * v[0]
-
-
-@wp.func
-def _unfold_on_plane_d(b: wp.vec3d, c: wp.vec3d, d: wp.vec2d, to_left: wp.bool) -> wp.vec2d:
-    dot_bc = wp.dot(b, c)
-    crs_bc = wp.length(wp.cross(b, c))
-    dd = wp.dot(d, d)
-    if dd <= wp.float64(0.0):
-        return wp.vec2d(wp.float64(0.0), wp.float64(0.0))
-    o = wp.vec2d(-d[1], d[0])
-    if not to_left:
-        o = wp.vec2d(d[1], -d[0])
-    return (dot_bc * d + crs_bc * o) / dd
-
-
-@wp.func
-def _line_isect_d(b: wp.vec2d, c: wp.vec2d, d: wp.vec2d) -> wp.float64:
-    c1 = _cross2_d(d, c)
-    c2 = _cross2_d(c - b, d - b)
-    if c1 == wp.float64(0.0) and c2 == wp.float64(0.0):
-        bb = wp.dot(b, b)
-        if bb == wp.float64(0.0):
-            return wp.float64(0.0)
-        return (wp.dot(c, b) + wp.dot(d, b)) / (wp.float64(2.0) * bb)
-    cc = c1 + c2
-    if cc == wp.float64(0.0):
-        return wp.float64(0.0)
-    return c1 / cc
-
-
-@wp.func
-def _is_unfold_quad_convex_d(a: wp.vec3d, b: wp.vec3d, c: wp.vec3d, d: wp.vec3d) -> wp.bool:
-    # Ports isUnfoldQuadrangleConvex(a,b,c,d): unfold triangles ABC/ACD into a plane and
-    # test where the shortest B->D path crosses diagonal AC. Convex iff strictly interior.
-    vec_b = b - a
-    vec_c = c - a
-    vec_d = d - a
-    unfold_b = wp.vec2d(wp.length(vec_b), wp.float64(0.0))
-    unfold_c = _unfold_on_plane_d(vec_b, vec_c, unfold_b, wp.bool(True))
-    unfold_d = _unfold_on_plane_d(vec_c, vec_d, unfold_c, wp.bool(True))
-    x = wp.clamp(_line_isect_d(unfold_c, unfold_b, unfold_d), wp.float64(0.0), wp.float64(1.0))
-    return x > wp.float64(0.0) and x < wp.float64(1.0)
-
-
-@wp.func
 def _segments_dist_sq_d(p1: wp.vec3d, q1: wp.vec3d, p2: wp.vec3d, q2: wp.vec3d) -> wp.float64:
     # Squared distance between segments [p1,q1] and [p2,q2] (Ericson, clamped closest points).
     eps = wp.float64(1e-30)
@@ -390,33 +288,33 @@ def _check_delone_quadrangle_d(
 ) -> wp.bool:
     # Returns True to KEEP the current diagonal (a-c), False to flip to (b-d). Exact port of
     # checkDeloneQuadrangle(Vector3d, ...).
-    n_abc = _normal_d(a, b, c)
-    n_acd = _normal_d(a, c, d)
+    n_abc = triangle_normal(a, b, c)
+    n_acd = triangle_normal(a, c, d)
     old_pocket = wp.dot(n_abc, n_acd) < DELONE_CRITICAL_DOT
 
-    n_abd = _normal_d(a, b, d)
-    n_dbc = _normal_d(d, b, c)
+    n_abd = triangle_normal(a, b, d)
+    n_dbc = triangle_normal(d, b, c)
     new_pocket = wp.dot(n_abd, n_dbc) < DELONE_CRITICAL_DOT
 
     if old_pocket != new_pocket:
         return new_pocket
 
     if old_pocket:
-        metric_ac = wp.max(_mincircle_diameter_sq_d(a, c, d), _mincircle_diameter_sq_d(c, a, b))
-        metric_bd = wp.max(_mincircle_diameter_sq_d(b, d, a), _mincircle_diameter_sq_d(d, b, c))
+        metric_ac = wp.max(mincircle_diameter_sq(a, c, d), mincircle_diameter_sq(c, a, b))
+        metric_bd = wp.max(mincircle_diameter_sq(b, d, a), mincircle_diameter_sq(d, b, c))
         return metric_ac <= metric_bd + DELONE_EPS * (metric_ac + metric_bd)
 
     if max_angle_change < NO_ANGLE_CHANGE_LIMIT:
-        old_angle = _dihedral_angle_d(n_abd, n_dbc, d - b)
-        new_angle = _dihedral_angle_d(n_abc, n_acd, a - c)
+        old_angle = dihedral_angle(n_abd, n_dbc, d - b)
+        new_angle = dihedral_angle(n_abc, n_acd, a - c)
         if wp.abs(old_angle - new_angle) > max_angle_change:
             return True
 
-    metric_ac = wp.max(_circumcircle_diameter_sq_d(a, c, d), _circumcircle_diameter_sq_d(c, a, b))
-    metric_bd = wp.max(_circumcircle_diameter_sq_d(b, d, a), _circumcircle_diameter_sq_d(d, b, c))
+    metric_ac = wp.max(circumcircle_diameter_sq(a, c, d), circumcircle_diameter_sq(c, a, b))
+    metric_bd = wp.max(circumcircle_diameter_sq(b, d, a), circumcircle_diameter_sq(d, b, c))
 
-    if metric_ac >= F64_INF:
-        if metric_bd >= F64_INF:
+    if wp.isinf(metric_ac):
+        if wp.isinf(metric_bd):
             return wp.length_sq(a - c) <= wp.length_sq(b - d)
         return False
     return metric_ac <= metric_bd + DELONE_EPS * (metric_ac + metric_bd)
@@ -425,11 +323,6 @@ def _check_delone_quadrangle_d(
 # ---------------------------------------------------------------------------
 # 2D orientation / incircle predicate (for delaunay_triangulation)
 # ---------------------------------------------------------------------------
-
-
-@wp.func
-def _orient2d_d(a: wp.vec2d, b: wp.vec2d, c: wp.vec2d) -> wp.float64:
-    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 
 
 @wp.func
@@ -542,13 +435,11 @@ def delone_flip_candidates(
     if max_deviation_sq < F32_LARGE:
         if _segments_dist_sq_d(ap, cp, bp, dp) > wp.float64(max_deviation_sq):
             return
-    if not _is_unfold_quad_convex_d(ap, bp, cp, dp):
+    if not is_unfold_quadrangle_convex(ap, bp, cp, dp):
         return
     angle = wp.float64(max_angle_change)
     if critical_aspect < F32_LARGE and angle < NO_ANGLE_CHANGE_LIMIT:
-        max_aspect = wp.max(
-            _triangle_aspect_ratio_d(ap, cp, dp), _triangle_aspect_ratio_d(cp, ap, bp)
-        )
+        max_aspect = wp.max(triangle_aspect_ratio(ap, cp, dp), triangle_aspect_ratio(cp, ap, bp))
         if max_aspect > wp.float64(critical_aspect):
             angle = NO_ANGLE_CHANGE_LIMIT
     out_flip[k] = not _check_delone_quadrangle_d(ap, bp, cp, dp, angle)
@@ -583,7 +474,7 @@ def incircle_flip_candidates(
     cp = to_vec2d(points[c])
     dp = to_vec2d(points[d])
     # Post-flip triangles (a, b, d) and (d, b, c) must both be positively oriented (convex quad).
-    if _orient2d_d(ap, bp, dp) <= wp.float64(0.0) or _orient2d_d(dp, bp, cp) <= wp.float64(0.0):
+    if orient2d(ap, bp, dp) <= wp.float64(0.0) or orient2d(dp, bp, cp) <= wp.float64(0.0):
         return
     # f0 = (a, c, d) is CCW; flip iff the opposite apex b lies inside its circumcircle.
     out_flip[k] = _incircle_d(ap, cp, dp, bp) > wp.float64(0.0)
@@ -655,15 +546,6 @@ def commit_flips(
 FREE_VERTEX = wp.constant(wp.int32(0))
 CREASE_VERTEX = wp.constant(wp.int32(1))
 CORNER_VERTEX = wp.constant(wp.int32(2))
-
-
-@wp.kernel
-def count_edge_faces(
-    inverse: wp.array(dtype=wp.int32), out_count: wp.array(dtype=wp.int32)
-) -> None:
-    # Per unique edge: number of incident face-corners (2 interior, 1 boundary).
-    c = int(wp.tid())
-    wp.atomic_add(out_count, inverse[c], 1)
 
 
 @wp.kernel
@@ -866,16 +748,6 @@ def accumulate_vertex_valence(
     wp.atomic_add(out_valence, unique_edges[e, 1], 1)
 
 
-@wp.func
-def _face_normal(
-    faces: wp.array(dtype=wp.int32), vertices: wp.array(dtype=wp.vec3), f: wp.int32
-) -> wp.vec3:
-    a = vertices[faces[f * 3 + 0]]
-    b = vertices[faces[f * 3 + 1]]
-    c = vertices[faces[f * 3 + 2]]
-    return wp.normalize(wp.cross(b - a, c - a))
-
-
 @wp.kernel
 def valence_flip_candidates(
     vertices: wp.array[wp.vec3],
@@ -896,8 +768,12 @@ def valence_flip_candidates(
     f0 = adjacency[k, 0]
     f1 = adjacency[k, 1]
     # Never flip a feature edge (sharp dihedral between the two incident faces).
-    n0 = _face_normal(faces, vertices, f0)
-    n1 = _face_normal(faces, vertices, f1)
+    n0 = triangle_normal(
+        vertices[faces[f0 * 3 + 0]], vertices[faces[f0 * 3 + 1]], vertices[faces[f0 * 3 + 2]]
+    )
+    n1 = triangle_normal(
+        vertices[faces[f1 * 3 + 0]], vertices[faces[f1 * 3 + 1]], vertices[faces[f1 * 3 + 2]]
+    )
     if wp.acos(wp.clamp(wp.dot(n0, n1), -1.0, 1.0)) > feature_angle:
         return
     quad = _resolve_flip_quad_guarded(
@@ -909,7 +785,7 @@ def valence_flip_candidates(
     d = quad[3]
     if a < 0:
         return
-    if not _is_unfold_quad_convex_d(
+    if not is_unfold_quadrangle_convex(
         to_vec3d(vertices[a]), to_vec3d(vertices[b]), to_vec3d(vertices[c]), to_vec3d(vertices[d])
     ):
         return

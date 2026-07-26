@@ -211,6 +211,31 @@ def test_hash_indices_rows_invalid(device: str) -> None:
     assert np.array_equal(packed_wp.numpy(), packed_np)
 
 
+def test_hash_indices_rows_unvalidated(device: str) -> None:
+    rng = np.random.default_rng(11)
+    max_index = 23
+    indices_np = rng.integers(0, max_index, size=(64, 2), dtype=np.int32)
+    indices_wp = wp.array(indices_np, dtype=wp.int32, device=device)
+
+    # Skipping validation must not change the keys, only the range check that produces them.
+    validated_wp = tw.grouping.hash_indices_rows(indices_wp, max_index=max_index)
+    unvalidated_wp = tw.grouping.hash_indices_rows(indices_wp, max_index=max_index, validate=False)
+    assert np.array_equal(unvalidated_wp.numpy(), validated_wp.numpy())
+    assert np.array_equal(unvalidated_wp.numpy(), _pack_indices_rows_np(indices_np, max_index))
+
+    # Without a radix there is nothing to skip to, so the combination is rejected up front.
+    with pytest.raises(ValueError, match="validate=False requires an explicit max_index"):
+        _ = tw.grouping.hash_indices_rows(indices_wp, validate=False)
+
+
+def test_group_int_rows_unvalidated(device: str) -> None:
+    data_np = np.array([[1, 2], [3, 4], [1, 2], [3, 4], [5, 6]], dtype=np.int32)
+    data_wp = wp.array(data_np, dtype=wp.int32, device=device)
+    groups_wp = tw.grouping.group_int_rows(data_wp, 2, max_value=7)
+    groups_unvalidated_wp = tw.grouping.group_int_rows(data_wp, 2, max_value=7, validate=False)
+    assert np.array_equal(groups_unvalidated_wp.numpy(), groups_wp.numpy())
+
+
 def _pack_vec3_np(vectors_np: np.ndarray) -> np.ndarray:
     if vectors_np.dtype != np.float32:
         vectors_np = vectors_np.astype(np.float32)
