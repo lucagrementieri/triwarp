@@ -5,9 +5,27 @@ The point cloud is a registry mesh's own vertices with area-weighted vertex norm
 (no sampling RNG), consistently oriented, and it scales with the mesh. Both are precomputed and
 cached: they are the *input*, not part of the operation being timed.
 
-There is no CPU reference in the harness ``LIBRARIES`` registry for these algorithms (the test
-suite compares against ``open3d`` / ``pymeshlab`` / ``meshlib``, none of which the benchmark harness
-registers), so every case here is ``triwarp``-only.
+**open3d** implements the same two published algorithms and is the reference for both:
+``create_from_point_cloud_ball_pivoting`` (Bernardini's BPA, given the identical radius) and
+``create_from_point_cloud_poisson`` (Kazhdan's screened Poisson, given the identical octree depth).
+Both take an oriented ``PointCloud``; open3d gets the same points and computes its own area-weighted
+vertex normals, which is the same quantity triwarp's
+[`area_weighted_vertex_normals`][triwarp.vertices.area_weighted_vertex_normals] produces.
+
+``triangulate_point_cloud`` has no open3d counterpart: it is a port of MeshLib's local-fan
+triangulation, and open3d's nearest analogue (``create_from_point_cloud_alpha_shape``) is a
+different algorithm solving the problem a different way, so timing them against each other would
+compare algorithm choices rather than implementations.
+
+What the open3d comparison showed when it was added (medians, RTX 5090, ``depth=8``,
+``radius = 1.5 * mean_edge``):
+
+- ``screened_poisson`` is a clear win — 134 ms (dense) against open3d's 2.0-2.3 s, so **15-25x
+  faster** on both meshes.
+- ``ball_pivoting`` is the opposite and is worth investigating: 580 ms / 1085 ms against open3d's
+  97 ms / 435 ms, i.e. triwarp is **2.5-6x slower than a serial CPU BPA**, and its run-to-run
+  spread is ~40x open3d's (222 ms StdDev on ``bunny``), which points at the pivot-front iteration
+  count rather than at per-launch overhead.
 
 Sizing notes measured on an RTX 5090 before the baseline was captured:
 
@@ -26,7 +44,7 @@ fixes, which show up at these sizes.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import pytest
 import warp as wp
@@ -34,13 +52,20 @@ from conftest import BenchCase, skip_larger_than
 
 import triwarp as tw
 
+if TYPE_CHECKING:
+    import open3d as o3d
+
 # MeshLib's default neighbour count for local fan triangulation.
 _NUM_NEIGHBOURS = 18
 
 # Ball radius as a multiple of the mean edge length (a proxy for point spacing).
 _BPA_RADIUS_FRACTION = 1.5
 
+# Octree depth of ``triwarp.reconstruction.screened_poisson``, mirrored on the open3d side.
+_POISSON_DEPTH = 8
+
 _normals_cache: dict[tuple[str, str], wp.array[wp.vec3]] = {}
+_cloud_o3d_cache: dict[str, o3d.geometry.PointCloud] = {}
 
 
 def _skip_cg_on_cpu(bench_case: BenchCase) -> None:
@@ -61,6 +86,24 @@ def _normals(bench_case: BenchCase) -> wp.array[wp.vec3]:
     return _normals_cache[key]
 
 
+def _cloud_o3d(bench_case: BenchCase) -> o3d.geometry.PointCloud:
+    """
+    Oriented open3d point cloud: the mesh vertices with area-weighted vertex normals.
+
+    The same input triwarp gets, with the normals computed by open3d's own
+    ``compute_vertex_normals`` (also area-weighted). Cached — it is the input, not the operation.
+    """
+    if bench_case.mesh_name not in _cloud_o3d_cache:
+        import open3d as o3d
+
+        mesh_o3d = bench_case.mesh_o3d
+        mesh_o3d.compute_vertex_normals()
+        cloud = o3d.geometry.PointCloud(mesh_o3d.vertices)
+        cloud.normals = mesh_o3d.vertex_normals
+        _cloud_o3d_cache[bench_case.mesh_name] = cloud
+    return _cloud_o3d_cache[bench_case.mesh_name]
+
+
 @pytest.mark.benchmark(group="triangulate_point_cloud")
 @pytest.mark.benchlibs("triwarp")
 def test_triangulate_point_cloud(bench_case: BenchCase) -> None:
@@ -75,22 +118,45 @@ def test_triangulate_point_cloud(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="ball_pivoting")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "open3d")
 def test_ball_pivoting(bench_case: BenchCase) -> None:
     skip_larger_than(bench_case, "bunny", "ball pivoting above bunny dominates the suite")
-    points, normals = bench_case.vertices_wp, _normals(bench_case)
     radius = _BPA_RADIUS_FRACTION * bench_case.mean_edge
-    _vertices, faces = bench_case.run(
-        lambda: tw.reconstruction.ball_pivoting(points, normals, radius=radius)
-    )
-    assert int(faces.shape[0]) > 0
+    if bench_case.kind == "triwarp":
+        points, normals = bench_case.vertices_wp, _normals(bench_case)
+        _vertices, faces = bench_case.run(
+            lambda: tw.reconstruction.ball_pivoting(points, normals, radius=radius)
+        )
+        assert int(faces.shape[0]) > 0
+    else:  # open3d's BPA takes a radius list; give it the single identical radius
+        import open3d as o3d
+
+        cloud = _cloud_o3d(bench_case)
+        radii = o3d.utility.DoubleVector([radius])
+        mesh_bpa = bench_case.run(
+            lambda: o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(cloud, radii)
+        )
+        assert len(mesh_bpa.triangles) > 0
 
 
 @pytest.mark.benchmark(group="screened_poisson")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "open3d")
 @pytest.mark.parametrize("method", ["dense", "adaptive"])
 def test_screened_poisson(bench_case: BenchCase, method: Literal["dense", "adaptive"]) -> None:
     skip_larger_than(bench_case, "bunny", "screened Poisson above bunny dominates the suite")
+    if bench_case.kind == "open3d":
+        if method != "dense":
+            pytest.skip("open3d has a single screened-Poisson path; timed once under 'dense'")
+        import open3d as o3d
+
+        cloud = _cloud_o3d(bench_case)
+        mesh_poisson, _density = bench_case.run(
+            lambda: o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                cloud, depth=_POISSON_DEPTH
+            )
+        )
+        assert len(mesh_poisson.triangles) > 0
+        return
     _skip_cg_on_cpu(bench_case)
     points, normals = bench_case.vertices_wp, _normals(bench_case)
     _vertices, faces = bench_case.run(

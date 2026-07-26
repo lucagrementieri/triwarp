@@ -1,7 +1,8 @@
 # triwarp benchmarks
 
-Performance benchmarks comparing `triwarp` against the CPU references **trimesh** and **libigl
-(`igl`)** on real scan meshes, built on [pytest-benchmark](https://pytest-benchmark.readthedocs.io).
+Performance benchmarks comparing `triwarp` against the CPU references **trimesh**, **libigl
+(`igl`)** and **open3d** on real scan meshes, built on
+[pytest-benchmark](https://pytest-benchmark.readthedocs.io).
 
 These are **not** collected by the normal test run (`pytest`'s `testpaths` is `tests/`); run them
 by pointing pytest at this directory.
@@ -30,7 +31,7 @@ Place mesh files in `benchmarks/data/` (gitignored, local-only). The registry in
 ## Run
 
 ```bash
-# Default: triwarp-cuda on all meshes; trimesh/igl on meshes up to 'large'.
+# Default: triwarp-cuda on all meshes; trimesh/igl/open3d on meshes up to 'large'.
 # triwarp-cpu is off by default when CUDA is available (pass --device=both to add it).
 uv run pytest benchmarks/
 
@@ -50,9 +51,9 @@ into a single table).
 
 | flag | default | meaning |
 |---|---|---|
-| `--device` | `auto` | `triwarp` target(s): `auto`/`cpu`/`cuda`/`both`. `auto` = cuda if CUDA is available, else cpu (triwarp-cpu is not timed alongside cuda; use `both` for that). The trimesh/igl baselines always run. |
+| `--device` | `auto` | `triwarp` target(s): `auto`/`cpu`/`cuda`/`both`. `auto` = cuda if CUDA is available, else cpu (triwarp-cpu is not timed alongside cuda; use `both` for that). The trimesh/igl/open3d baselines always run. |
 | `--size` | `all` | comma-separated size categories to include (`small,medium,large,extralarge,huge`). Naming a size explicitly also lifts the CPU cap for it. |
-| `--cpu-max-size` | `large` | CPU-bound libraries (`triwarp-cpu`, `trimesh`, `igl`) skip meshes larger than this unless the size is named in `--size`. |
+| `--cpu-max-size` | `large` | CPU-bound libraries (`triwarp-cpu`, `trimesh`, `igl`, `open3d`) skip meshes larger than this unless the size is named in `--size`. |
 
 ## Notes
 
@@ -61,6 +62,46 @@ into a single table).
 - **trimesh references** use the pure `trimesh.geometry` / `trimesh.grouping` functions (not cached
   `Trimesh` properties) so every round measures real work.
 - `edges_unique*` triwarp calls pass `n_vertices=` to avoid a host sync skewing GPU numbers.
-- **open3d** is not benchmarked here — it has no edge-extraction equivalents. The harness
-  (the `LIBRARIES` registry in `conftest.py`) is structured so it can be added for modules where
-  it fits.
+- Every benchmark carries an explicit `benchlibs` marker, so adding a library kind to `LIBRARIES`
+  never silently generates cases for modules that have no branch for it.
+- **libigl is not safe on every registry mesh.** `igl.principal_curvature` *segfaults* on all of
+  them (they have non-manifold vertices, which its vertex-ring walk assumes away) — a hard crash
+  that takes the pytest process with it, so `test_curvature` draws that comparison on the synthetic
+  saddle patches instead. `test_parametrization` documents a milder version of the same problem
+  (igl's direct LDLT cannot factor the scan meshes' cotangent systems).
+
+## open3d coverage
+
+`open3d` is registered in `LIBRARIES` and used for **every** benchmarked function that has a
+genuine equivalent, not only where trimesh/libigl are missing — the point is to have a third
+independent implementation to spot outliers against. It is marked `cpu_bound` even though the
+installed wheel is a CUDA build: the legacy `open3d.pipelines` / `open3d.geometry` APIs used here
+are CPU-only (only `open3d.t` has GPU kernels). `BenchCase.mesh_o3d` gives a shared legacy mesh
+built from the same NumPy source every other library gets.
+
+| module | open3d reference |
+|---|---|
+| `test_registration` | `TransformationEstimationPointToPoint.compute_transformation`, `registration_icp` (point-to-point, point-to-plane, `TukeyLoss`) |
+| `test_reconstruction` | `create_from_point_cloud_ball_pivoting`, `create_from_point_cloud_poisson` |
+| `test_remesh` | `subdivide_midpoint` (`subdivide` only) |
+| `test_smoothing` | `filter_smooth_laplacian` (`novol` only) |
+| `test_sample` | `sample_points_poisson_disk` |
+| `test_graph` | `cluster_connected_triangles` + `select_by_index` (`split` only) |
+| `test_hole_filling` | `open3d.t.geometry.TriangleMesh.fill_holes` |
+| `test_repair` | `remove_duplicated_triangles` |
+| `test_validation` | `is_watertight` |
+| `test_vertices` | `compute_vertex_normals` |
+| `test_proximity` | `get_axis_aligned_bounding_box` (`aabb_bounds` only) |
+| `test_points` | `PointCloud.estimate_normals` (`KDTreeSearchParamKNN`) |
+
+Modules with **no** open3d equivalent, and why, are documented in each module's docstring:
+`test_edges` (no general edge list), `test_boundary` (no loop ordering), `test_grouping` (array
+primitive), `test_parametrization` (no harmonic/LSCM/ARAP), `test_distance` (no autodiff),
+`test_laplacian` (no cotangent or mass matrix — the smoothing filters build their weights inline),
+`test_curvature` (no curvature estimation at all), plus the individual functions noted inline
+(`winding_number`, `thickness`, `geodesic_ball`, `triangulate_point_cloud`, `subdivide_to_size`,
+`flip_to_delaunay`, `isotropic_remesh`, `centroid`, `n_vertices`, `is_volume`, `bfs`).
+
+Where the reference is not algorithmically identical, the module docstring says so — `test_repair`
+(open3d's dedup is orientation-sensitive), `test_sample` (count- vs radius-parametrized),
+`test_hole_filling` and `test_smoothing` (different algorithms for the same task).

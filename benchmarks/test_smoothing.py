@@ -5,6 +5,12 @@ This is the iterative filter whose loop synced a full-array host sum per iterati
 device-mean fix. The Laplacian operator is precomputed outside the timed callable so the
 timing isolates the iteration loop. The trimesh reference is capped at ``bunny``: its CPU
 loop takes tens of seconds on ``dragon``.
+
+**open3d**'s ``filter_smooth_laplacian`` runs the same number of uniform-weight Laplacian
+iterations, so it is the reference for the ``novol`` case. It has no volume-constraint variant
+(``filter_smooth_taubin`` alternates two Laplacian passes to limit shrinkage, which is a different
+scheme), so the ``vol`` case stays triwarp/trimesh only. Open3D returns a new mesh, so the shared
+mesh is reusable across rounds.
 """
 
 from __future__ import annotations
@@ -31,10 +37,19 @@ def _laplacian_operator(bench_case: BenchCase) -> wps.BsrMatrix[wp.float32]:
 
 
 @pytest.mark.benchmark(group="filter_mut_dif_laplacian")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
 @pytest.mark.parametrize("volume_constraint", [False, True], ids=["novol", "vol"])
 def test_filter_mut_dif_laplacian(bench_case: BenchCase, volume_constraint: bool) -> None:
     skip_larger_than(bench_case, "dragon")
+    if bench_case.kind == "open3d":
+        if volume_constraint:
+            pytest.skip("open3d has no volume-constrained Laplacian smoother")
+        mesh_o3d = bench_case.mesh_o3d
+        smoothed = bench_case.run(
+            lambda: mesh_o3d.filter_smooth_laplacian(number_of_iterations=_ITERATIONS)
+        )
+        assert len(smoothed.vertices) == bench_case.n_vertices
+        return
     if bench_case.kind == "triwarp" and bench_case.device == "cpu" and volume_constraint:
         # Native abort inside the volume-constraint path on the CPU device (Warp 1.15);
         # under investigation alongside the device-mean fix.

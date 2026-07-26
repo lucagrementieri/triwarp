@@ -5,6 +5,18 @@ The vertex-adjacency CSR matrix is prebuilt (untimed, cached per mesh/device) so
 isolate the graph algorithms. The scipy BFS reference sits in the ``trimesh`` library slot:
 ``scipy.sparse.csgraph.breadth_first_order`` is the exact-order oracle the triwarp ``bfs``
 docstring promises to match (and the backend trimesh itself uses for graph traversals).
+
+Only ``split`` has an open3d equivalent. ``connected_component_labels`` and both ``bfs`` variants
+take an abstract CSR adjacency matrix, and open3d exposes no graph-traversal API over one — its
+connectivity work is mesh-bound (``cluster_connected_triangles``), which is what ``split`` uses.
+
+``split`` cost is dominated by the **component count**, not the mesh size, and the two registry
+meshes differ enormously there: ``bunny`` is a single component while ``bunny_decimated`` has 94
+(scan floaters). At ``_SPLIT_COPIES = 64`` that is 64 versus 6 016 returned submeshes, and triwarp
+takes 78 ms for the former but 3.8 s for the latter — ~0.64 ms of host work per submesh, against
+0.29 ms for open3d and 0.23 ms for trimesh. So triwarp wins by 34-120x when there are few
+components and loses by 2-3x per component when there are many: the per-component allocation and
+launch sequence in ``tw.combine.split``, not the labelling, is the thing to batch.
 """
 
 from __future__ import annotations
@@ -124,13 +136,13 @@ def _split_inputs(bench_case: BenchCase) -> tuple:
 
 
 @pytest.mark.benchmark(group="split")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
 def test_split(bench_case: BenchCase) -> None:
     skip_larger_than(bench_case, "bunny")
     if bench_case.kind == "triwarp":
         vertices, faces = _split_inputs(bench_case)
         parts = bench_case.run(lambda: tw.combine.split(vertices, faces))
-    else:  # trimesh
+    elif bench_case.kind == "trimesh":
         import trimesh as tm
 
         vertices_np, faces_np = _split_inputs(bench_case)
@@ -140,6 +152,29 @@ def test_split(bench_case: BenchCase) -> None:
             return mesh.split(only_watertight=False)
 
         parts = bench_case.run(run)
+    else:
+        # ``tw.combine.split`` returns compact per-component ``(vertices, faces)`` submeshes, so the
+        # open3d equivalent is ``cluster_connected_triangles`` (the labelling) followed by
+        # ``select_by_index`` per cluster (the compaction). ``select_by_index`` takes *vertex*
+        # indices, hence the ``np.unique`` over each cluster's faces — numpy is part of what an
+        # open3d user pays here, exactly as scipy is for the trimesh path.
+        import open3d as o3d
+
+        vertices_np, faces_np = _split_inputs(bench_case)
+        mesh_o3d = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(vertices_np),
+            o3d.utility.Vector3iVector(np.ascontiguousarray(faces_np, dtype=np.int32)),
+        )
+        faces_i32 = np.ascontiguousarray(faces_np, dtype=np.int32)
+
+        def run_o3d() -> list:
+            labels_np = np.asarray(mesh_o3d.cluster_connected_triangles()[0])
+            return [
+                mesh_o3d.select_by_index(np.unique(faces_i32[labels_np == label]))
+                for label in range(int(labels_np.max()) + 1)
+            ]
+
+        parts = bench_case.run(run_o3d)
     # Scan meshes contain floater components, so each copy contributes its own component count.
     assert len(parts) >= _SPLIT_COPIES
     assert len(parts) % _SPLIT_COPIES == 0

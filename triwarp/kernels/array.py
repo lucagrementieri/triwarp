@@ -259,6 +259,11 @@ def equal(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
 
 
 @wp.func
+def not_equal(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
+    return a != b
+
+
+@wp.func
 def is_close_scalar(a: wp.float32, b: wp.float32, rtol: wp.float32, atol: wp.float32) -> wp.bool:
     return wp.abs(a - b) <= atol + rtol * wp.abs(b)
 
@@ -299,24 +304,26 @@ def binary_search_index(values: wp.array[wp.Scalar], value: wp.Scalar) -> wp.int
 @wp.func
 def binary_search_index_left(values: wp.array[wp.Scalar], value: wp.Scalar) -> wp.int32:
     """First index i with values[i] >= value, or len(values) (numpy searchsorted side='left')."""
+    # ``wp.lower_bound`` is the same search, but it clamps its result to ``n - 1``
+    # (``warp/native/array.h``), so a value past the last element reads back as the last index
+    # instead of ``n``. Both callers (``graph.component_segment_bounds`` probes one past the
+    # highest component key, ``hole_filling.rim_opposite_from_table`` probes edges absent from the
+    # table) do query past the end, so the fix-up is mandatory, not defensive.
     n = values.shape[0]
-    left = wp.int32(0)
-    right = n - 1
-    result = n
-    while left <= right:
-        mid = (left + right) // 2
-        if values[mid] >= value:
-            result = mid
-            right = mid - 1
-        else:
-            left = mid + 1
-    return wp.int32(result)
+    index = wp.lower_bound(values, value)
+    if index == n - 1 and values[n - 1] < value:
+        index = n
+    return wp.int32(index)
 
 
 @wp.func
 def binary_search_sorted_contains(values: wp.array[wp.Scalar], value: wp.Scalar) -> bool:
-    idx = binary_search_index(values, value)
-    return idx > wp.int32(0) and values[idx - wp.int32(1)] == value
+    # ``wp.lower_bound``'s clamp to ``n - 1`` is harmless here: a value past the end lands on the
+    # last element, which then compares unequal. ``and`` short-circuits in kernel scope, so the
+    # element read is skipped on an empty array.
+    n = values.shape[0]
+    index = wp.lower_bound(values, value)
+    return index < n and values[index] == value
 
 
 @wp.kernel

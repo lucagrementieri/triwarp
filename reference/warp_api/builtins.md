@@ -184,7 +184,10 @@ These are callable inside `@wp.kernel` / `@wp.func` as `wp.<name>(...)`.
 - `bvh_query_aabb(bvh, lower, upper)` / `_tiled` — AABB query against BVH.
 - `bvh_query_next(query)` / `_tiled` — next bound returned by query.
 - `bvh_query_ray(bvh, start, dir, max_t)` / `_tiled` — ray query against BVH.
-- `closest_point_edge_edge(p1, d1, p2, d2)` — closest points between two edges.
+- `closest_point_edge_edge(p1, q1, p2, q2, epsilon)` — closest points between two edges. Takes the
+  four **endpoints** (not directions) plus a degeneracy tolerance, and returns
+  `vec3(s, t, d)`: the barycentric weight along each edge and the distance between the closest
+  points. `vec3`/`float32` only — there is no float64 overload.
 - `hash_grid_point_id(grid, index)` — index of a point in the HashGrid.
 - `hash_grid_query(grid, point)` / `hash_grid_query_next(query)` — HashGrid point query.
 - `intersect_tri_tri(v0,v1,v2,u0,u1,u2)` — triangle/triangle intersection (Möller).
@@ -244,7 +247,9 @@ These are callable inside `@wp.kernel` / `@wp.func` as `wp.<name>(...)`.
 - `expect_near(a, b, tolerance)` — print error if `a`/`b` differ by > tolerance.
 - `len(a)` — length of `a`.
 - `lerp(a, b, t)` — linear interpolation `a*(1-t)+b*t`.
-- `lower_bound(arr, value)` — first element >= `value` in sorted `arr`.
+- `lower_bound(arr, value)` / `lower_bound(arr, begin, end, value)` — index of the first element
+  >= `value` in sorted `arr` (optionally within `[begin, end)`). **Clamped to `end - 1`**: a `value`
+  past the last element returns the last index, *not* `n` like `numpy.searchsorted`.
 - `print(x)` / `printf(fmt, ...)` — print to stdout.
 - `select(cond, if_true, if_false)` / `where(cond, if_true, if_false)` — branchless select.
 - `smoothstep(a, b, x)` — cubic Hermite interpolation.

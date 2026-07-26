@@ -99,14 +99,8 @@ def solid_angle(a: wp.vec3, b: wp.vec3, c: wp.vec3, p: wp.vec3) -> wp.float32:
     vl0 = wp.length(v0)
     vl1 = wp.length(v1)
     vl2 = wp.length(v2)
-    detf = (
-        v0[0] * v1[1] * v2[2]
-        + v1[0] * v2[1] * v0[2]
-        + v2[0] * v0[1] * v1[2]
-        - v2[0] * v1[1] * v0[2]
-        - v1[0] * v0[1] * v2[2]
-        - v0[0] * v2[1] * v1[2]
-    )
+    # det([v0; v1; v2]) as the scalar triple product — cheaper than materializing the matrix.
+    detf = wp.dot(v0, wp.cross(v1, v2))
     dp0 = wp.dot(v1, v2)
     dp1 = wp.dot(v2, v0)
     dp2 = wp.dot(v0, v1)

@@ -11,12 +11,15 @@ Two traversal cores:
   scratch rows (a FIFO queue whose emitted prefix is the discovery order, an open-addressing
   visited hash set, and a small nearest-fallback pool). With a finite ``radius`` it enqueues only
   neighbors within ``radius`` of the center (and backfills the nearest out-of-ball vertices up to
-  ``min_count``) — the geodesic-ball query.
+  ``min_count``) — the geodesic-ball query. Its nearest-fallback pool scans with the shared
+  ``wp.ref`` argmin/argmax helpers, so any kernel calling it must be decorated
+  ``@wp.kernel(enable_backward=False)`` (see :mod:`triwarp.kernels.array`).
 """
 
 import warp as wp
 
 from triwarp.kernels import grouping as kernel_grouping
+from triwarp.kernels.array import update_argmax, update_argmin
 
 # Per-source scratch capacities (rows of the wrapper-allocated global-memory pools).
 # ``_PER_SOURCE_MAX_NEIGHBORS`` caps the queue — and therefore the collected set — as before;
@@ -72,12 +75,10 @@ def bfs_extras_push_nearest(
         ext_dist[count] = distance
         ext_idx[count] = neighbor
         return count + 1
-    farthest = wp.int32(0)
+    farthest = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
     farthest_distance = ext_dist[0]
     for k in range(1, cap):
-        if ext_dist[k] > farthest_distance:
-            farthest_distance = ext_dist[k]
-            farthest = k
+        update_argmax(farthest_distance, farthest, ext_dist[k], k)
     if distance < farthest_distance:
         ext_dist[farthest] = distance
         ext_idx[farthest] = neighbor
@@ -89,12 +90,10 @@ def bfs_extras_pop_nearest(
     ext_dist: wp.array[wp.float32], ext_idx: wp.array[wp.int32], count: wp.int32
 ) -> tuple[wp.int32, wp.int32]:
     """Remove and return the nearest candidate (swap-remove); caller ensures ``count > 0``."""
-    best = wp.int32(0)
+    best = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
     best_distance = ext_dist[0]
     for k in range(1, count):
-        if ext_dist[k] < best_distance:
-            best_distance = ext_dist[k]
-            best = k
+        update_argmin(best_distance, best, ext_dist[k], k)
     nearest = ext_idx[best]
     last = count - 1
     ext_dist[best] = ext_dist[last]

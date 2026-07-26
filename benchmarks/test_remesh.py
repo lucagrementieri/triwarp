@@ -5,6 +5,12 @@ Covers the four public entry points. ``subdivide`` / ``subdivide_to_size`` are s
 compared against the ``trimesh`` reference; ``flip_to_delaunay`` and ``isotropic_remesh`` are the
 iterative paths and have no CPU reference, so they are timed for ``triwarp`` only.
 
+``subdivide`` additionally has an exact open3d equivalent in ``subdivide_midpoint(1)`` — same 1:4
+midpoint split, and it returns a new mesh rather than mutating, so the shared mesh is reusable.
+Open3D has no ``subdivide_to_size`` (its ``subdivide_midpoint`` takes an iteration count, not an
+edge-length target, so it cannot split adaptively), no edge-flip pass, and no isotropic remesher —
+``simplify_quadric_decimation`` is decimation, which is the opposite operation.
+
 Sizing is derived from the mesh's own mean edge length (computed once from the NumPy source so
 every library gets the *same* target), which keeps the amount of work proportional to the mesh
 rather than to an absolute length that would explode on one mesh and no-op on another.
@@ -38,17 +44,22 @@ _SPLIT_FRACTION = 0.7
 
 
 @pytest.mark.benchmark(group="subdivide")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
 def test_subdivide(bench_case: BenchCase) -> None:
     skip_larger_than(bench_case, "dragon", "a 1:4 subdivision above dragon exceeds memory")
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         _new_vertices, new_faces = bench_case.run(lambda: tw.remesh.subdivide(vertices, faces))
         assert int(new_faces.shape[0]) == 4 * int(faces.shape[0])
-    else:
+    elif bench_case.kind == "trimesh":
         vertices, faces = bench_case.vertices_np, bench_case.faces_np
         _new_vertices, new_faces = bench_case.run(lambda: tm.remesh.subdivide(vertices, faces))
         assert new_faces.shape[0] == 4 * faces.shape[0]
+    else:  # open3d midpoint subdivision returns a new mesh, so the shared one is reusable
+        mesh_o3d = bench_case.mesh_o3d
+        n_faces = bench_case.faces_np.shape[0]
+        subdivided = bench_case.run(lambda: mesh_o3d.subdivide_midpoint(number_of_iterations=1))
+        assert len(subdivided.triangles) == 4 * n_faces
 
 
 @pytest.mark.benchmark(group="subdivide_to_size")

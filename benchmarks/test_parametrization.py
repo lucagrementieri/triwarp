@@ -21,6 +21,9 @@ that is what the batched-CG work targets.
 ``harmonic`` / ``lscm`` / ``arap`` solve with ``warp.optim.linear.cg``, which returns NaN on the
 Warp CPU backend (1.14-1.15), so the ``triwarp-cpu`` variant is skipped rather than timed.
 
+**open3d** has no mesh parametrization at all — no harmonic map, no LSCM, no ARAP, and no boundary
+circle map — so libigl remains the only reference for this module.
+
 The libigl reference is gated on mesh *conditioning*, not size — measured, not assumed. libigl goes
 through a direct LDLT factorization of the cotangent system, which fails outright on the scanned
 registry meshes (``RuntimeError: Failed to compute harmonic map`` / ``igl::lscm failed``): they are

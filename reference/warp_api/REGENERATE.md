@@ -1,6 +1,6 @@
 # Regenerating the Warp API reference
 
-These files mirror the Warp docs as of **Warp 1.14.0**. After a Warp upgrade,
+These files mirror the Warp docs as of **Warp 1.15.0**. After a Warp upgrade,
 refresh them so the function lists, signatures, and the version stamp at the top
 of each file match the installed version.
 

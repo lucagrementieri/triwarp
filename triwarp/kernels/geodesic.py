@@ -105,7 +105,7 @@ def geodesic_ball_reference_neighbors(
     out_reference[i] = minimum
 
 
-@wp.kernel
+@wp.kernel(enable_backward=False)
 def query_geodesic_ball_collect(
     vertices: wp.array[wp.vec3],
     adj_offsets: wp.array[wp.int32],

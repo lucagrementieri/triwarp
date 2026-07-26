@@ -1,5 +1,6 @@
 import warp as wp
 
+from triwarp.kernels.array import sort3
 from triwarp.kernels.triangles import face_vertices
 
 
@@ -14,27 +15,9 @@ def squared_edge_lengths(
 
 
 @wp.func
-def sort_three_lengths(
-    l0: wp.float32, l1: wp.float32, l2: wp.float32
-) -> tuple[wp.float32, wp.float32, wp.float32]:
-    if l0 > l1:
-        tmp = l0
-        l0 = l1
-        l1 = tmp
-    if l1 > l2:
-        tmp = l1
-        l1 = l2
-        l2 = tmp
-    if l0 > l1:
-        tmp = l0
-        l0 = l1
-        l1 = tmp
-    return l0, l1, l2
-
-
-@wp.func
 def doublearea_from_lengths(l0: wp.float32, l1: wp.float32, l2: wp.float32) -> wp.float32:
-    l0, l1, l2 = sort_three_lengths(l0, l1, l2)
+    # Kahan's numerically stable Heron form needs the sides sorted ascending.
+    l0, l1, l2 = sort3(l0, l1, l2)
     arg = (l0 + (l1 + l2)) * (l2 - (l0 - l1)) * (l2 + (l0 - l1)) * (l0 + (l1 - l2))
     dbl_area = wp.float32(0.5) * wp.sqrt(wp.max(arg, wp.float32(0.0)))
     if wp.isnan(dbl_area):

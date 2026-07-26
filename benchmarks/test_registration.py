@@ -1,0 +1,353 @@
+"""
+Benchmarks for ``triwarp.registration``.
+
+Times the Procrustes fit and the ICP variants against a source cloud built from the mesh itself:
+20k subsampled vertices pushed through a fixed 5-degree rotation plus a 2%-of-diagonal translation
+and 0.2%-of-diagonal Gaussian noise. Deriving the source from the target means the correspondence
+problem is well posed on every mesh in the registry, and the same perturbation goes to every
+library, so none of them gets an easier problem.
+
+References
+----------
+libigl exposes no Python binding for ``iterative_closest_point``, so **open3d** is the reference
+here: ``open3d.pipelines.registration`` is what triwarp's point-to-plane path is ported from
+(``TransformationEstimationPointToPlane`` with an optional ``RobustKernel``), and it is the only
+CPU library in the test group that implements the point-to-plane metric at all.
+
+* Procrustes — ``trimesh.registration.procrustes`` and open3d's
+  ``TransformationEstimationPointToPoint.compute_transformation``, which is the same Kabsch fit on
+  an explicit correspondence set.
+* Point-to-point ICP — ``trimesh.registration.icp`` (cKDTree) and open3d's ``registration_icp``
+  (KDTreeFlann).
+* Point-to-plane ICP — open3d only, on a point-cloud target so both sides consume the *same*
+  per-vertex normals (computed once with trimesh from the shared float64 source). The mesh-target
+  and robust variants have no reference and are timed for triwarp alone.
+
+Both sides are pinned to exactly ``_ICP_ITERATIONS`` iterations — triwarp with ``threshold=-inf``
+and open3d with ``relative_fitness=relative_rmse=0`` — otherwise a library that early-exits after
+three iterations would look fast for the wrong reason. ``max_correspondence_distance`` is set to the
+bbox diagonal so open3d rejects nothing, matching triwarp's ``max_distance=None`` default.
+
+What is inside the timed callable
+---------------------------------
+Everything the public function does, including the spatial index build: triwarp's ``wp.Mesh`` BVH
+for a mesh target, and open3d's ``KDTreeFlann`` for a point-cloud target. triwarp's public functions
+take raw buffers, so there is no way to hoist that without benchmarking something other than the
+API. Point-cloud construction (``Vector3dVector`` copies) and the shared vertex normals *are* setup
+and cached outside the timed region.
+
+The nearest-neighbour search dominates every ICP number here; the 6x6 solve and the tiled reductions
+are a small fraction of the total, so the number to read for a kernel change is the before/after
+delta on a *fixed* mesh, not the absolute time. Two things the absolute times do say, both measured
+on ``bunny`` (35 947 target points, 20 000 source points, 10 iterations):
+
+* triwarp's **mesh** target is far faster than its **point-cloud** target — 4.1 ms versus 191 ms —
+  because the former rides Warp's built-in ``wp.mesh_query_point_no_sign``, while the latter goes
+  through [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest], whose k-NN kernel costs
+  ~19 ms per call at ``k=1``. Rebuilding the BVH each iteration is *not* the cause: the build is
+  0.21 ms and the bounds reduction 0.15 ms, so ~99% of the call is the query kernel itself.
+* Consequently open3d's serial CPU ``KDTreeFlann`` beats triwarp's point-cloud ICP by ~10x
+  (17.8 ms versus 191 ms). The point-cloud k-NN path, not the registration solver, is what that
+  gap measures.
+"""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import open3d as o3d
+import pytest
+import trimesh as tm
+import warp as wp
+from conftest import BenchCase, skip_larger_than
+
+import triwarp as tw
+
+_SEED = 42
+_N_POINTS = 20_000
+_ICP_ITERATIONS = 10
+
+# Fixed misalignment applied to the source cloud, in degrees and in fractions of the bbox diagonal.
+_ROTATION_DEGREES = 5.0
+_TRANSLATION_FRACTION = 0.02
+_NOISE_FRACTION = 0.002
+
+# Tukey cut-off for the robust point-to-plane fit, in fractions of the bbox diagonal. Passed
+# explicitly (rather than letting triwarp derive it from the residual MAD) so triwarp and open3d
+# minimize the same objective.
+_TUKEY_FRACTION = 0.01
+
+_source_np_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+_source_wp_cache: dict[tuple[str, str], wp.array] = {}
+_normals_np_cache: dict[str, np.ndarray] = {}
+_normals_wp_cache: dict[tuple[str, str], wp.array] = {}
+_pcd_cache: dict[tuple[str, str], o3d.geometry.PointCloud] = {}
+
+
+def _rotation_matrix() -> np.ndarray:
+    """Rodrigues rotation of ``_ROTATION_DEGREES`` about the fixed axis ``(1, 2, 3)``."""
+    axis = np.array([1.0, 2.0, 3.0])
+    axis /= np.linalg.norm(axis)
+    cross = np.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]])
+    angle = np.deg2rad(_ROTATION_DEGREES)
+    return np.eye(3) + np.sin(angle) * cross + (1.0 - np.cos(angle)) * (cross @ cross)
+
+
+def _diagonal(bench_case: BenchCase) -> float:
+    """Bounding-box diagonal — the length scale every parameter below is expressed in."""
+    vertices = bench_case.vertices_np
+    return float(np.linalg.norm(vertices.max(axis=0) - vertices.min(axis=0)))
+
+
+def _source_np(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarray]:
+    """``(source_points, target_indices)``: perturbed vertex subsample and the source rows."""
+    name = bench_case.mesh_name
+    if name not in _source_np_cache:
+        rng = np.random.default_rng(_SEED)
+        vertices = bench_case.vertices_np
+        count = min(_N_POINTS, vertices.shape[0])
+        indices = rng.choice(vertices.shape[0], size=count, replace=False)
+        diagonal = _diagonal(bench_case)
+        offset = _TRANSLATION_FRACTION * diagonal * np.array([1.0, -1.0, 0.5]) / np.sqrt(2.25)
+        source = vertices[indices] @ _rotation_matrix().T + offset
+        source += rng.normal(scale=_NOISE_FRACTION * diagonal, size=source.shape)
+        _source_np_cache[name] = (np.ascontiguousarray(source), indices)
+    return _source_np_cache[name]
+
+
+def _source_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _source_wp_cache:
+        _source_wp_cache[key] = wp.array(
+            np.ascontiguousarray(_source_np(bench_case)[0], dtype=np.float32),
+            dtype=wp.vec3,
+            device=bench_case.device,
+        )
+    return _source_wp_cache[key]
+
+
+def _vertex_normals_np(bench_case: BenchCase) -> np.ndarray:
+    """
+    Area-weighted unit vertex normals, computed once with trimesh from the shared float64 source.
+
+    The point-to-plane comparison hinges on both libraries fitting to the *same* tangent planes, so
+    the normals are a shared input rather than something each library estimates for itself.
+    """
+    name = bench_case.mesh_name
+    if name not in _normals_np_cache:
+        mesh_tm = tm.Trimesh(bench_case.vertices_np, bench_case.faces_np, process=False)
+        # ``np.array`` (not ``ascontiguousarray``): trimesh hands back a read-only ``TrackedArray``
+        # view, and open3d's ``Vector3dVector`` rejects a non-writeable buffer.
+        _normals_np_cache[name] = np.array(mesh_tm.vertex_normals, dtype=np.float64)
+    return _normals_np_cache[name]
+
+
+def _vertex_normals_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _normals_wp_cache:
+        _normals_wp_cache[key] = wp.array(
+            np.ascontiguousarray(_vertex_normals_np(bench_case), dtype=np.float32),
+            dtype=wp.vec3,
+            device=bench_case.device,
+        )
+    return _normals_wp_cache[key]
+
+
+def _pcd(bench_case: BenchCase, role: str) -> o3d.geometry.PointCloud:
+    """Open3D point cloud for ``role`` (``"source"`` / ``"target"``), built once per mesh."""
+    key = (bench_case.mesh_name, role)
+    if key not in _pcd_cache:
+        if role == "source":
+            points = _source_np(bench_case)[0]
+            cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+        else:
+            cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(bench_case.vertices_np))
+            cloud.normals = o3d.utility.Vector3dVector(_vertex_normals_np(bench_case))
+        _pcd_cache[key] = cloud
+    return _pcd_cache[key]
+
+
+def _o3d_criteria() -> o3d.pipelines.registration.ICPConvergenceCriteria:
+    """Convergence criteria pinned to a fixed iteration count (no early exit)."""
+    return o3d.pipelines.registration.ICPConvergenceCriteria(
+        relative_fitness=0.0, relative_rmse=0.0, max_iteration=_ICP_ITERATIONS
+    )
+
+
+@pytest.mark.benchmark(group="procrustes")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+def test_procrustes(bench_case: BenchCase) -> None:
+    """Procrustes fit on exact correspondences: tiled reductions plus the SVD kernel."""
+    source_np, indices = _source_np(bench_case)
+    if bench_case.kind == "triwarp":
+        source = _source_wp(bench_case)
+        target = wp.array(
+            np.ascontiguousarray(bench_case.vertices_np[indices], dtype=np.float32),
+            dtype=wp.vec3,
+            device=bench_case.device,
+        )
+        matrix, _transformed, _cost = bench_case.run(
+            lambda: tw.registration.procrustes(source, target, reflection=False, scale=False)
+        )
+        assert matrix.shape == (1,)
+    elif bench_case.kind == "trimesh":
+        target_np = np.ascontiguousarray(bench_case.vertices_np[indices])
+        matrix_tm, _transformed, _cost = bench_case.run(
+            lambda: tm.registration.procrustes(source_np, target_np, reflection=False, scale=False)
+        )
+        assert matrix_tm.shape == (4, 4)
+    else:  # open3d: the same Kabsch fit, on an explicit index-pair correspondence set
+        estimation = o3d.pipelines.registration.TransformationEstimationPointToPoint(
+            with_scaling=False
+        )
+        source_pcd = _pcd(bench_case, "source")
+        target_pcd = _pcd(bench_case, "target")
+        pairs = np.column_stack((np.arange(source_np.shape[0]), indices)).astype(np.int32)
+        correspondences = o3d.utility.Vector2iVector(pairs)
+        matrix_o3d = bench_case.run(
+            lambda: estimation.compute_transformation(source_pcd, target_pcd, correspondences)
+        )
+        assert np.asarray(matrix_o3d).shape == (4, 4)
+
+
+@pytest.mark.benchmark(group="icp_point_cloud")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+def test_icp_point_cloud(bench_case: BenchCase) -> None:
+    """Point-to-point ICP against a point-cloud target: BVH versus cKDTree versus KDTreeFlann."""
+    if bench_case.kind == "triwarp":
+        source, target = _source_wp(bench_case), bench_case.vertices_wp
+        matrix, _transformed, _cost = bench_case.run(
+            lambda: tw.registration.icp(
+                source, target, max_iterations=_ICP_ITERATIONS, threshold=-math.inf
+            )
+        )
+        assert matrix.shape == (1,)
+    elif bench_case.kind == "trimesh":
+        skip_larger_than(bench_case, "bunny", "trimesh icp rebuilds a cKDTree every iteration")
+        source_np = _source_np(bench_case)[0]
+        target_np = bench_case.vertices_np
+        matrix_tm, _transformed, _cost = bench_case.run(
+            lambda: tm.registration.icp(
+                source_np,
+                target_np,
+                threshold=-math.inf,
+                max_iterations=_ICP_ITERATIONS,
+                scale=False,
+                reflection=False,
+            )
+        )
+        assert matrix_tm.shape == (4, 4)
+    else:
+        source_pcd, target_pcd = _pcd(bench_case, "source"), _pcd(bench_case, "target")
+        estimation = o3d.pipelines.registration.TransformationEstimationPointToPoint(
+            with_scaling=False
+        )
+        criteria, max_dist = _o3d_criteria(), _diagonal(bench_case)
+        result = bench_case.run(
+            lambda: o3d.pipelines.registration.registration_icp(
+                source_pcd, target_pcd, max_dist, np.eye(4), estimation, criteria
+            )
+        )
+        assert np.asarray(result.transformation).shape == (4, 4)
+
+
+@pytest.mark.benchmark(group="icp_mesh")
+@pytest.mark.benchlibs("triwarp")
+def test_icp_mesh(bench_case: BenchCase) -> None:
+    """Point-to-point ICP against the triangle surface (closest-point-on-mesh correspondences)."""
+    skip_larger_than(bench_case, "happy_buddha", "per-iteration mesh queries scale with face count")
+    source, vertices, faces = _source_wp(bench_case), bench_case.vertices_wp, bench_case.faces_wp
+    matrix, _transformed, _cost = bench_case.run(
+        lambda: tw.registration.icp(
+            source, vertices, faces, max_iterations=_ICP_ITERATIONS, threshold=-math.inf
+        )
+    )
+    assert matrix.shape == (1,)
+
+
+@pytest.mark.benchmark(group="icp_point_to_plane_cloud")
+@pytest.mark.benchlibs("triwarp", "open3d")
+def test_icp_point_to_plane_cloud(bench_case: BenchCase) -> None:
+    """Gauss-Newton point-to-plane ICP against a point-cloud target, on shared vertex normals."""
+    if bench_case.kind == "triwarp":
+        source, target = _source_wp(bench_case), bench_case.vertices_wp
+        normals = _vertex_normals_wp(bench_case)
+        matrix, _transformed, _cost = bench_case.run(
+            lambda: tw.registration.icp_point_to_plane(
+                source,
+                target,
+                target_normals=normals,
+                max_iterations=_ICP_ITERATIONS,
+                threshold=-math.inf,
+            )
+        )
+        assert matrix.shape == (1,)
+    else:
+        source_pcd, target_pcd = _pcd(bench_case, "source"), _pcd(bench_case, "target")
+        estimation = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+        criteria, max_dist = _o3d_criteria(), _diagonal(bench_case)
+        result = bench_case.run(
+            lambda: o3d.pipelines.registration.registration_icp(
+                source_pcd, target_pcd, max_dist, np.eye(4), estimation, criteria
+            )
+        )
+        assert np.asarray(result.transformation).shape == (4, 4)
+
+
+@pytest.mark.benchmark(group="icp_point_to_plane_tukey")
+@pytest.mark.benchlibs("triwarp", "open3d")
+def test_icp_point_to_plane_tukey(bench_case: BenchCase) -> None:
+    """Robust point-to-plane ICP: triwarp's Tukey weight dispatch against open3d's ``TukeyLoss``."""
+    tukey_k = _TUKEY_FRACTION * _diagonal(bench_case)
+    if bench_case.kind == "triwarp":
+        source, target = _source_wp(bench_case), bench_case.vertices_wp
+        normals = _vertex_normals_wp(bench_case)
+        matrix, _transformed, _cost = bench_case.run(
+            lambda: tw.registration.icp_point_to_plane(
+                source,
+                target,
+                target_normals=normals,
+                max_iterations=_ICP_ITERATIONS,
+                threshold=-math.inf,
+                robust_kernel="tukey",
+                robust_scale=tukey_k,
+            )
+        )
+        assert matrix.shape == (1,)
+    else:
+        source_pcd, target_pcd = _pcd(bench_case, "source"), _pcd(bench_case, "target")
+        estimation = o3d.pipelines.registration.TransformationEstimationPointToPlane(
+            o3d.pipelines.registration.TukeyLoss(k=tukey_k)
+        )
+        criteria, max_dist = _o3d_criteria(), _diagonal(bench_case)
+        result = bench_case.run(
+            lambda: o3d.pipelines.registration.registration_icp(
+                source_pcd, target_pcd, max_dist, np.eye(4), estimation, criteria
+            )
+        )
+        assert np.asarray(result.transformation).shape == (4, 4)
+
+
+@pytest.mark.benchmark(group="icp_point_to_plane_mesh")
+@pytest.mark.benchlibs("triwarp")
+def test_icp_point_to_plane_mesh(bench_case: BenchCase) -> None:
+    """
+    Point-to-plane ICP against the triangle surface: closest-face normals, no CPU equivalent.
+
+    Also the only case that exercises the MAD-derived robust scale, since ``robust_scale`` is left
+    to default here while the open3d comparison above pins it.
+    """
+    skip_larger_than(bench_case, "happy_buddha", "per-iteration mesh queries scale with face count")
+    source, vertices, faces = _source_wp(bench_case), bench_case.vertices_wp, bench_case.faces_wp
+    matrix, _transformed, _cost = bench_case.run(
+        lambda: tw.registration.icp_point_to_plane(
+            source,
+            vertices,
+            faces,
+            max_iterations=_ICP_ITERATIONS,
+            threshold=-math.inf,
+            robust_kernel="tukey",
+        )
+    )
+    assert matrix.shape == (1,)

@@ -276,15 +276,6 @@ def commit_triangles(
 
 
 @wp.kernel
-def init_available_from_used(
-    used: wp.array(dtype=wp.bool), out_available: wp.array(dtype=wp.bool)
-) -> None:
-    # Orphan (unused) points start available; front membership is added afterwards.
-    i = int(wp.tid())
-    out_available[i] = not used[i]
-
-
-@wp.kernel
 def mark_front_endpoints(
     front_src: wp.array(dtype=wp.int32),
     front_tgt: wp.array(dtype=wp.int32),

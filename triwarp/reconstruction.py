@@ -1211,10 +1211,9 @@ def _bpa_pivot_wave(
 
     # Availability guard: a candidate must be orphan or itself on the front (never fully interior).
     used = tw.array.indices_to_mask(faces_view, n, device=device)
+    # Orphan (unused) points start available; front membership is added afterwards.
     point_available = wp.empty(n, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_bpa.init_available_from_used, dim=n, inputs=[used, point_available], device=device
-    )
+    wp.map(kernel_array.mask_not, used, out=point_available)
     wp.launch(
         kernel_bpa.mark_front_endpoints,
         dim=n_front,

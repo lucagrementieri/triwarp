@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.constants import TILE_1D
+from triwarp.kernels.intersection import point_plane_dot
 from triwarp.kernels.reduce import outer_sum_tile
 
 
@@ -8,8 +9,10 @@ from triwarp.kernels.reduce import outer_sum_tile
 def point_plane_distance(
     point: wp.vec3, plane_normal: wp.vec3, plane_origin: wp.vec3
 ) -> wp.float32:
-    w = point - plane_origin
-    return wp.dot(plane_normal, w) / wp.length(plane_normal)
+    # Signed perpendicular distance: the shared unnormalized plane dot divided by the normal
+    # length, so a non-unit ``plane_normal`` behaves like trimesh's reference. This is the only
+    # caller that needs the division, so the dot stays the primitive.
+    return point_plane_dot(point, plane_origin, plane_normal) / wp.length(plane_normal)
 
 
 @wp.func

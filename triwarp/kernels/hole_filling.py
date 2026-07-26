@@ -4,7 +4,11 @@ from triwarp.constants import FLOAT32_INF_CONSTANT
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels.array import update_argmin
 from triwarp.kernels.array import wrap_index as _wrap
-from triwarp.kernels.predicates import circumcircle_diameter_sq, triangle_aspect_ratio
+from triwarp.kernels.predicates import (
+    circumcircle_diameter_sq,
+    dihedral_angle,
+    triangle_aspect_ratio,
+)
 
 # Big-but-finite penalty (MeshLib ``BadTriangulationMetric``): lets the DP keep a bad triangulation
 # rather than break entirely, while staying below ``float`` precision limits when summed.
@@ -284,16 +288,6 @@ def min_triangle_angle_sin(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.float32:
         return 0.0
     f = wp.length(wp.cross(b - a, c - a))
     return f * wp.min(wp.vec3(ab, ca, bc)) / (ab * ca * bc)
-
-
-@wp.func
-def dihedral_angle(left_norm: wp.vec3, right_norm: wp.vec3, edge_vec: wp.vec3) -> wp.float32:
-    # Signed dihedral angle from two (possibly un-normalized) face normals and the shared edge
-    # (MeshLib ``dihedralAngle`` = atan2(sin, cos)); atan2 is invariant to the common |L||R| scale.
-    edge_dir = wp.normalize(edge_vec)
-    sin_a = wp.dot(edge_dir, wp.cross(left_norm, right_norm))
-    cos_a = wp.dot(left_norm, right_norm)
-    return wp.atan2(sin_a, cos_a)
 
 
 @wp.func

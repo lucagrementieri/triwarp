@@ -8,14 +8,15 @@ Flags
 ``--device={auto,cpu,cuda,both}``
     Which ``triwarp`` targets to time. ``auto`` (default) uses cuda when CUDA is available,
     else falls back to cpu — ``triwarp-cpu`` is not timed alongside cuda by default. Pass
-    ``cpu`` for cpu only or ``both`` to time both triwarp targets. The ``trimesh`` / ``igl``
-    CPU baselines are always included.
+    ``cpu`` for cpu only or ``both`` to time both triwarp targets. The ``trimesh`` / ``igl`` /
+    ``open3d`` CPU baselines are always included.
 ``--size=<comma list | all>``
     Restrict meshes to these size categories (``small,medium,large,extralarge,huge``).
 ``--cpu-max-size=<category>``
-    CPU-bound libraries (``triwarp-cpu``, ``trimesh``, ``igl``) skip meshes larger than this
-    unless the size was named explicitly in ``--size``. Default ``large`` — so ``happy_buddha``
-    and ``lucy`` run GPU-only by default while ``bunny_decimated``/``bunny``/``dragon`` run on CPU.
+    CPU-bound libraries (``triwarp-cpu``, ``trimesh``, ``igl``, ``open3d``) skip meshes larger
+    than this unless the size was named explicitly in ``--size``. Default ``large`` — so
+    ``happy_buddha`` and ``lucy`` run GPU-only by default while
+    ``bunny_decimated``/``bunny``/``dragon`` run on CPU.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import pytest
 import warp as wp
 
 if TYPE_CHECKING:
+    import open3d as o3d
     from pytest_benchmark.fixture import BenchmarkFixture
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -111,12 +113,15 @@ def skip_larger_than(bench_case: BenchCase, largest: str, reason: str = "") -> N
 
 
 # ``cpu_bound`` marks references that only ever run on the CPU (the baselines), so the harness
-# can skip them on the largest meshes by default.
+# can skip them on the largest meshes by default. ``open3d`` is marked CPU-bound even though the
+# installed wheel is a CUDA build: the legacy ``open3d.pipelines`` / ``open3d.geometry`` APIs the
+# baselines use are CPU-only (only the newer ``open3d.t`` tensor API has GPU kernels).
 LIBRARIES: list[LibrarySpec] = [
     {"id": "triwarp-cpu", "kind": "triwarp", "device": "cpu", "cpu_bound": True},
     {"id": "triwarp-cuda", "kind": "triwarp", "device": "cuda:0", "cpu_bound": False},
     {"id": "trimesh", "kind": "trimesh", "device": None, "cpu_bound": True},
     {"id": "igl", "kind": "igl", "device": None, "cpu_bound": True},
+    {"id": "open3d", "kind": "open3d", "device": None, "cpu_bound": True},
 ]
 LIBRARIES_BY_ID = {lib["id"]: lib for lib in LIBRARIES}
 
@@ -128,6 +133,7 @@ LIBRARIES_BY_ID = {lib["id"]: lib for lib in LIBRARIES}
 _numpy_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 _wp_cache: dict[tuple[str, str, str], wp.array] = {}
 _mean_edge_cache: dict[str, float] = {}
+_o3d_cache: dict[str, o3d.geometry.TriangleMesh] = {}
 
 
 def _open_cylinder(rim: int) -> tuple[np.ndarray, np.ndarray]:
@@ -233,6 +239,22 @@ def _mean_edge(name: str) -> float:
         )
         _mean_edge_cache[name] = float(np.linalg.norm(edges, axis=1).mean())
     return _mean_edge_cache[name]
+
+
+def _new_mesh_o3d(name: str) -> o3d.geometry.TriangleMesh:
+    """
+    Build a fresh legacy ``open3d.geometry.TriangleMesh`` from the shared NumPy source.
+
+    Imported lazily (like ``meshio`` above) so the ~1 s open3d import is only paid by runs that
+    actually include an open3d case.
+    """
+    import open3d as o3d
+
+    vertices, faces = _load_numpy(name)
+    return o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(vertices),
+        o3d.utility.Vector3iVector(np.ascontiguousarray(faces, dtype=np.int32)),
+    )
 
 
 def _vertices_wp(name: str, device: str) -> wp.array[wp.vec3]:
@@ -364,7 +386,8 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
-        "markers", "benchlibs(*kinds): library kinds (triwarp/trimesh/igl) a benchmark supports."
+        "markers",
+        "benchlibs(*kinds): library kinds (triwarp/trimesh/igl/open3d) a benchmark supports.",
     )
     config.addinivalue_line(
         "markers",
@@ -393,7 +416,7 @@ class BenchCase:
 
     @property
     def kind(self) -> str:
-        """Library family: ``triwarp`` / ``trimesh`` / ``igl``."""
+        """Library family: ``triwarp`` / ``trimesh`` / ``igl`` / ``open3d``."""
         return self.library["kind"]
 
     @property
@@ -432,6 +455,22 @@ class BenchCase:
     def mean_edge(self) -> float:
         """Mean undirected edge length; the natural scale for remeshing / reconstruction sizing."""
         return _mean_edge(self.mesh_name)
+
+    @property
+    def mesh_o3d(self) -> o3d.geometry.TriangleMesh:
+        """
+        Shared legacy ``open3d`` mesh, built once per mesh.
+
+        Safe for references that either do not touch their input or recompute unconditionally
+        (``subdivide_midpoint`` and ``filter_smooth_laplacian`` return new meshes;
+        ``compute_vertex_normals`` overwrites but never caches). For a reference that mutates
+        *idempotently* — ``remove_duplicated_triangles``, where rounds 2..n would find nothing left
+        to do — construct the mesh inside the timed callable instead, the way the trimesh references
+        rebuild their ``tm.Trimesh`` (see ``test_repair.py``).
+        """
+        if self.mesh_name not in _o3d_cache:
+            _o3d_cache[self.mesh_name] = _new_mesh_o3d(self.mesh_name)
+        return _o3d_cache[self.mesh_name]
 
     def run(self, fn: Callable[[], Any]) -> Any:
         """

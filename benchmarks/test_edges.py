@@ -8,6 +8,11 @@ asserting equality. Every test is parametrised over ``(mesh_name, library)`` by 
 
 The triwarp ``edges_unique*`` calls pass ``n_vertices=`` (known from the mesh) so the API's
 internal ``.numpy().max()`` host sync does not dominate the GPU measurement.
+
+**open3d** has no equivalent for anything in this module. Its ``TriangleMesh`` exposes edges only as
+diagnostics over specific predicates (``get_non_manifold_edges``,
+``get_self_intersecting_triangles``) and never as a general edge list, so there is no
+``faces_to_edges`` / ``edges_unique`` / ``edge_lengths`` to time against.
 """
 
 from __future__ import annotations

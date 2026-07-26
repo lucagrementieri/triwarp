@@ -5,6 +5,11 @@ Covers winding number, AABB bounds, tangent spheres and geodesic-ball queries.
 ``winding_number`` is O(n_queries x n_faces) even in the tiled variant, so ``lucy`` is skipped;
 the pinned serial (``tiled=False``) path is additionally capped at ``bunny`` because one thread
 per query walking every face takes minutes beyond that.
+
+Only ``aabb_bounds`` has an open3d equivalent (``get_axis_aligned_bounding_box``). Open3D has no
+generalized winding number — its inside/outside test is raycasting-based
+(``RaycastingScene.compute_occupancy``), a different algorithm answering a coarser question — and no
+tangent-sphere, local-thickness or geodesic-ball query at all.
 """
 
 from __future__ import annotations
@@ -97,16 +102,21 @@ def test_winding_number_serial(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="aabb_bounds")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
 def test_aabb_bounds(bench_case: BenchCase) -> None:
     if bench_case.kind == "triwarp":
         vertices = bench_case.vertices_wp
         lower, upper = bench_case.run(lambda: tw.bounds.aabb_bounds(vertices))
         assert lower[0] <= upper[0]
-    else:  # what an uncached ``trimesh.Trimesh.bounds`` computes: numpy min/max per axis
+    elif bench_case.kind == "trimesh":
+        # what an uncached ``trimesh.Trimesh.bounds`` computes: numpy min/max per axis
         vertices = bench_case.vertices_np
         result = bench_case.run(lambda: np.vstack((vertices.min(axis=0), vertices.max(axis=0))))
         assert result.shape == (2, 3)
+    else:  # open3d's own bound reduction over the same vertices
+        mesh_o3d = bench_case.mesh_o3d
+        box_o3d = bench_case.run(mesh_o3d.get_axis_aligned_bounding_box)
+        assert box_o3d.get_min_bound()[0] <= box_o3d.get_max_bound()[0]
 
 
 @pytest.mark.benchmark(group="max_tangent_sphere_reach")

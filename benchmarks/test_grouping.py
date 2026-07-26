@@ -3,6 +3,9 @@ Benchmark for ``triwarp.grouping.group`` on edge-inverse ids.
 
 This is the ``face_adjacency`` workload: interior edges appear exactly twice, so ``length=2``
 groups are the adjacent face pairs.
+
+There is no open3d equivalent: grouping equal rows of an arbitrary id array is an array primitive,
+not a mesh operation, and open3d exposes nothing at that level.
 """
 
 from __future__ import annotations

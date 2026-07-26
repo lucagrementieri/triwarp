@@ -4,6 +4,11 @@ Benchmark for the differentiable Chamfer loss (forward + backward under ``wp.Tap
 Mesh B is the same mesh translated by 5% of its bbox diagonal (untimed setup). Both vertex
 buffers carry ``requires_grad=True``; each timed round records a fresh tape, runs backward and
 zeroes the gradients, which is the real optimization-loop cost.
+
+No open3d case: its ``compute_point_cloud_distance`` covers the *forward* nearest-neighbour distance
+only, and open3d has no autodiff, so it cannot produce the backward pass that dominates this
+measurement. Timing forward-only against forward-plus-backward would be a misleading ratio rather
+than a useful baseline.
 """
 
 from __future__ import annotations

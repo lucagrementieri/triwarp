@@ -397,10 +397,7 @@ def solve_point_to_plane(
 
     # Levenberg-style diagonal damping, scaled by the mean diagonal magnitude,
     # keeps the system positive-definite for planar / rank-deficient targets.
-    trace = wp.float32(0.0)
-    for i in range(6):
-        trace += a[i, i]
-    reg = damping * trace / wp.float32(6.0) + wp.float32(1e-12)
+    reg = damping * wp.trace(a) / wp.float32(6.0) + wp.float32(1e-12)
     for i in range(6):
         a[i, i] += reg
 

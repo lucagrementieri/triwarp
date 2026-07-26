@@ -5,6 +5,10 @@ Scan-mesh holes are short loops, so the registry meshes mostly measure the surro
 edge/grouping pipeline. The synthetic open-cylinder case (two rims of 2^16 vertices each) is
 the asymptotic demonstration: the pre-fix per-vertex successor walk is O(L^2) total on a loop
 of length L, while pointer-jumping list ranking is O(L log L).
+
+**open3d** has no boundary-loop extraction: it can report *which* edges are boundary edges
+(``get_non_manifold_edges(allow_boundary_edges=False)``) but never orders them into loops, which is
+the whole cost of this function.
 """
 
 from __future__ import annotations

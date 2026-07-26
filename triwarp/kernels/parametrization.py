@@ -256,24 +256,21 @@ def arap_rest_edges(
 
 @wp.func
 def scatter_arap_edge(
-    cos_t: wp.float64,
-    sin_t: wp.float64,
+    rotation: wp.mat22d,
     w: wp.vec2d,
     source: wp.int32,
     dest: wp.int32,
     out_rhs_x: wp.array[wp.float64],
     out_rhs_y: wp.array[wp.float64],
 ) -> None:
-    # Rotate the weight-folded rest edge, ``r = R * w`` with R = [[cos, -sin], [sin, cos]], and
-    # scatter the ARAP right-hand side ``+r`` to the edge source and ``-r`` to the edge dest. The
-    # two components go to separate 1D buffers so the atomic adds stay 1D (row-view outputs of the
-    # (2, n_vertices) rotation RHS).
-    rx = cos_t * w[0] - sin_t * w[1]
-    ry = sin_t * w[0] + cos_t * w[1]
-    wp.atomic_add(out_rhs_x, source, rx)
-    wp.atomic_add(out_rhs_y, source, ry)
-    wp.atomic_add(out_rhs_x, dest, -rx)
-    wp.atomic_add(out_rhs_y, dest, -ry)
+    # Rotate the weight-folded rest edge and scatter the ARAP right-hand side ``+r`` to the edge
+    # source and ``-r`` to the edge dest. The two components go to separate 1D buffers so the atomic
+    # adds stay 1D (row-view outputs of the (2, n_vertices) rotation RHS).
+    r = rotation * w
+    wp.atomic_add(out_rhs_x, source, r[0])
+    wp.atomic_add(out_rhs_y, source, r[1])
+    wp.atomic_add(out_rhs_x, dest, -r[0])
+    wp.atomic_add(out_rhs_y, dest, -r[1])
 
 
 @wp.kernel
@@ -304,17 +301,15 @@ def arap_local_step(
     w1 = rest_edges[f, 1]
     w2 = rest_edges[f, 2]
     # Covariance S = sum_e u_e (outer) w_e (rest edges already weight-folded with c_e).
-    s00 = u0[0] * w0[0] + u1[0] * w1[0] + u2[0] * w2[0]
-    s01 = u0[0] * w0[1] + u1[0] * w1[1] + u2[0] * w2[1]
-    s10 = u0[1] * w0[0] + u1[1] * w1[0] + u2[1] * w2[0]
-    s11 = u0[1] * w0[1] + u1[1] * w1[1] + u2[1] * w2[1]
+    s = wp.outer(u0, w0) + wp.outer(u1, w1) + wp.outer(u2, w2)
     # Closest proper rotation (reflections forbidden), fit_rotations_planar closed form.
-    theta = wp.atan2(s10 - s01, s00 + s11)
+    theta = wp.atan2(s[1, 0] - s[0, 1], s[0, 0] + s[1, 1])
     cos_t = wp.cos(theta)
     sin_t = wp.sin(theta)
-    scatter_arap_edge(cos_t, sin_t, w0, i1, i2, out_rhs_x, out_rhs_y)
-    scatter_arap_edge(cos_t, sin_t, w1, i2, i0, out_rhs_x, out_rhs_y)
-    scatter_arap_edge(cos_t, sin_t, w2, i0, i1, out_rhs_x, out_rhs_y)
+    rotation = wp.mat22d(cos_t, -sin_t, sin_t, cos_t)
+    scatter_arap_edge(rotation, w0, i1, i2, out_rhs_x, out_rhs_y)
+    scatter_arap_edge(rotation, w1, i2, i0, out_rhs_x, out_rhs_y)
+    scatter_arap_edge(rotation, w2, i0, i1, out_rhs_x, out_rhs_y)
 
 
 @wp.kernel

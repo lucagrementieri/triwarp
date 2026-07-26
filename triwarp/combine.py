@@ -17,7 +17,7 @@ from collections.abc import Sequence
 import warp as wp
 
 import triwarp as tw
-from triwarp.kernels import combine as kernel_combine
+from triwarp.kernels import array as kernel_array
 
 
 def concatenate(
@@ -142,13 +142,13 @@ def split(
     sorted_labels = wp.clone(labels_buffer[:n_faces])
     sorted_face_ids = wp.clone(face_ids[:n_faces])
 
+    # Segment boundaries of the label-sorted array: position 0, plus every label change. The
+    # change test is the adjacent-element map over two shifted views of the same buffer; the
+    # single-face guard is required because Warp rejects a zero-length slice outright.
     is_start = wp.empty(n_faces, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_combine.mark_label_starts,
-        dim=n_faces,
-        inputs=[sorted_labels, is_start],
-        device=device,
-    )
+    is_start[:1].fill_(True)
+    if n_faces > 1:
+        wp.map(kernel_array.not_equal, sorted_labels[1:], sorted_labels[:-1], out=is_start[1:])
     starts_np = tw.array.flatnonzero(is_start).numpy()
     bounds = [int(start) for start in starts_np] + [n_faces]
 

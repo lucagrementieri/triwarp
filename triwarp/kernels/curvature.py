@@ -1,5 +1,12 @@
 import warp as wp
 
+# The 5x5 quadric solve below uses Warp's own Householder QR instead of a hand-rolled elimination.
+# Unlike ``warp.fem``'s solvers (which ``triwarp.reconstruction`` imports lazily to dodge a
+# tens-of-seconds first-call codegen penalty), these are plain ``@wp.func``s that inline into this
+# module — no fem codegen is triggered. The import itself is eager and costs ~0.15 s of
+# ``import triwarp`` (measured), almost all of it ``warp/fem/__init__.py`` rather than ``linalg``.
+from warp.fem.linalg import householder_qr_decomposition, solve_triangular
+
 from triwarp.kernels import array as kernel_array
 
 # Custom fixed-size float64 types for the 5x5 quadric-fit normal equations: the rest of the
@@ -34,51 +41,19 @@ def _build_reference_frame(
 @wp.func
 def _solve_normal_equations(ata: mat55d, atb: vec5d) -> tuple[vec5d, wp.bool]:
     """
-    Solve the 5x5 system ``AtA x = Atb`` by Gaussian elimination with partial pivoting.
+    Solve the 5x5 system ``AtA x = Atb`` by Householder QR.
 
     Returns (solution, ok); ok is False if singular to tolerance 1e-14.
     """
-    m = ata
-    b = atb
-
-    # forward elimination
-    for col in range(5):
-        # find pivot row
-        pivot_row = col
-        pivot_val = wp.abs(m[col, col])
-        for row in range(col + 1, 5):
-            v = wp.abs(m[row, col])
-            if v > pivot_val:
-                pivot_val = v
-                pivot_row = row
-        if pivot_val < wp.float64(1e-14):
-            return b, False
-        # swap rows col and pivot_row
-        if pivot_row != col:
-            for k in range(5):
-                tmp = m[col, k]
-                m[col, k] = m[pivot_row, k]
-                m[pivot_row, k] = tmp
-            tmp_b = b[col]
-            b[col] = b[pivot_row]
-            b[pivot_row] = tmp_b
-        # eliminate rows below
-        inv = wp.float64(1.0) / m[col, col]
-        for row in range(col + 1, 5):
-            factor = m[row, col] * inv
-            for k in range(col, 5):
-                m[row, k] = m[row, k] - factor * m[col, k]
-            b[row] = b[row] - factor * b[col]
-
-    # back-substitution: iterate col = 4, 3, 2, 1, 0
-    x = vec5d()
-    for back_idx in range(5):
-        col = 4 - back_idx
-        val = b[col]
-        for k in range(col + 1, 5):
-            val = val - m[col, k] * x[k]
-        x[col] = val / m[col, col]
-    return x, True
+    q, r = householder_qr_decomposition(ata)
+    # ``|R[k, k]|`` is the norm of column k after the preceding reflections — the QR analogue of
+    # the partial-pivot magnitude the former Gaussian elimination tested, to within a sqrt(5)
+    # factor, so the 1e-14 singularity threshold carries over unchanged.
+    for k in range(5):
+        if wp.abs(r[k, k]) < wp.float64(1e-14):
+            return atb, False
+    # ``Q R x = AtA x = Atb`` with ``Q`` orthonormal, so back-substitute against ``Q^T Atb``.
+    return solve_triangular(r, wp.transpose(q) * atb), True
 
 
 @wp.func
