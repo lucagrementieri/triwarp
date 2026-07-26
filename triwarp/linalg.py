@@ -51,6 +51,10 @@ CG_TOLERANCE = 1e-10
 # hand-rolled ``maxiter=10 * n``.
 CG_MAXITER_FACTOR = 10
 
+# How often the conjugate-gradient loop tests the residual against the tolerance. Warp's own
+# default; see the ``check_every`` parameter docs for why raising it does not pay.
+CG_CHECK_EVERY = 10
+
 
 def min_quad_with_fixed(
     q: wps.BsrMatrix[wp.float64],
@@ -220,6 +224,7 @@ def solve_spd_columns(
     *,
     tol: float = CG_TOLERANCE,
     maxiter: int | None = None,
+    check_every: int = CG_CHECK_EVERY,
 ) -> tuple[int, float, float]:
     """
     Solve one symmetric positive-definite operator against several right-hand-side columns.
@@ -241,12 +246,32 @@ def solve_spd_columns(
         Relative residual tolerance, as a ratio of the right-hand-side norm.
     maxiter
         Iteration cap. Defaults to ``CG_MAXITER_FACTOR * n``.
+    check_every
+        How many iterations run between residual tests. See Notes: the default is the only setting
+        that is not measurably worse, and ``0`` changes the return type.
 
     Returns
     -------
     tuple[int, float, float]
         ``(iterations, residual_norm, absolute_tolerance)`` as returned by
-        ``warp.optim.linear.cg``, with the residual taken over the worst column.
+        ``warp.optim.linear.cg``, with the residual taken over the worst column. With
+        ``check_every=0`` these are 1-element **device arrays** instead of host scalars, because
+        nothing is ever read back.
+
+    Notes
+    -----
+    ``check_every`` is a pure performance knob — it cannot change the converged answer, only how far
+    past the tolerance the solver may overshoot before it notices. Measured on an RTX 5090 over the
+    ARAP solves of `benchmarks/test_parametrization.py`:
+
+    - **Raising it (25, 50) is a loss** of 0 % to 6 %. The readback it saves costs about 0.1 ms,
+      while the up-to-``check_every - 1`` extra iterations it causes are real work — the smaller the
+      solve, the worse the trade.
+    - **``0`` is neutral to slightly positive** (0.93x to 1.00x) and makes the whole solve
+      CUDA-graph capturable: ``warp.optim.linear`` then drives the loop with ``wp.capture_while``
+      and an on-device condition kernel, so it converges device-side with *no* host readback and
+      tests every iteration rather than every tenth. It requires conditional-CUDA-graph support and
+      changes the return type, so it is opt-in rather than the default.
 
     See Also
     --------
@@ -264,6 +289,7 @@ def solve_spd_columns(
         tol=tol,
         maxiter=maxiter if maxiter is not None else CG_MAXITER_FACTOR * n,
         M=preconditioner,
+        check_every=check_every,
     )
 
 
@@ -274,6 +300,7 @@ def spd_column_solver(
     *,
     tol: float = CG_TOLERANCE,
     maxiter: int | None = None,
+    check_every: int = CG_CHECK_EVERY,
 ) -> wpl.LinearSolverState:
     """
     Pre-allocated batched conjugate-gradient state, for repeated solves of one operator.
@@ -298,6 +325,9 @@ def spd_column_solver(
         Relative residual tolerance.
     maxiter
         Iteration cap. Defaults to ``CG_MAXITER_FACTOR * n``.
+    check_every
+        Iterations between residual tests; see
+        [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] for the measured tradeoff.
 
     Returns
     -------
@@ -329,6 +359,7 @@ def spd_column_solver(
         tol=tol,
         maxiter=maxiter if maxiter is not None else CG_MAXITER_FACTOR * n,
         M=preconditioner,
+        check_every=check_every,
         run=False,
     )
 

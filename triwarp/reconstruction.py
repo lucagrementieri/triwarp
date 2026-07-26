@@ -393,7 +393,8 @@ def screened_poisson(
     depth
         Finest grid depth: the finest grid has ``2**depth + 1`` nodes per axis. Memory grows as the
         cube of this; ``depth=8`` (a ``257**3`` grid, ~0.7 GB peak) is a safe default and ``depth``
-        is capped at ``10``.
+        is capped at ``10``. This is the single biggest speed lever here, and the *only* one whose
+        quality cost is not negligible — see Notes for the measured curve before lowering it.
     full_depth
         Coarsest depth of the cascade (``3 <= full_depth <= depth``). The system is solved at every
         depth from ``full_depth`` to ``depth``.
@@ -450,6 +451,27 @@ def screened_poisson(
     estimate and can bulge on strongly anisotropic clouds. The screening weight ``point_weight`` is
     not area-normalized as in PoissonRecon, so its numeric scale differs; ``4`` is a reasonable
     default for unit-scale clouds.
+
+    **Choosing ``depth``.** The useful depth follows the cloud's *sampling density*, not its size,
+    and past that point extra depth costs time without buying fidelity. Measured on an RTX 5090
+    over the bunny vertex clouds (mean symmetric chamfer back to the source mesh, in units of the
+    cloud's mean point spacing):
+
+    | depth | dense, 16k points | dense, 69k points |
+    |---|---|---|
+    | 6 | 14 ms, 0.044 | 14 ms, 0.096 |
+    | 7 | 26 ms, 0.042 | 27 ms, 0.043 |
+    | 8 (default) | 133 ms, 0.048 | 136 ms, 0.057 |
+    | 9 | 968 ms, 0.207 | 966 ms, 0.060 |
+
+    Both clouds bottom out at ``depth=7``, where the reconstruction is **5x faster than the default
+    and no less accurate**; ``depth=9`` on the sparser cloud is 5x *worse*, as the grid outruns the
+    samples. The default stays at ``8`` because it matches PoissonRecon's own and because mean
+    chamfer on two clouds from a single source is too narrow a basis on which to move a fidelity
+    default — but for a known cloud density, measure and lower it. The ``adaptive`` backend is much
+    flatter in depth (it already caps near-surface refinement at the sample spacing) and is the
+    better choice when the depth wanted for the extraction lattice exceeds what the sampling
+    supports.
     """
     if not (3 <= full_depth <= depth <= 10):
         raise ValueError(

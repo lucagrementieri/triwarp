@@ -476,6 +476,33 @@ def test_arap_free_boundary_matches_igl(device, hemisphere):
     assert np.allclose(uv_wp.numpy(), uv_igl, rtol=1e-3, atol=1e-3)
 
 
+def test_arap_default_tolerance_tracks_a_tight_solve(device, hemisphere):
+    # ``arap`` defaults its inner CG to 1e-7 rather than the 1e-8 the other solvers use: its global
+    # solves are inner steps of a truncated outer iteration. Guard that the looser default still
+    # tracks a tight solve two orders below it, far inside the 1e-4 gate the igl oracles use.
+    _skip_on_cpu(device)
+    _, mesh_wp = hemisphere
+    boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
+    boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)
+    uv_init_wp = tw.parametrization.harmonic(
+        mesh_wp.points, mesh_wp.indices, boundary_wp, boundary_uv_wp
+    )
+
+    uv_default_wp = tw.parametrization.arap(
+        mesh_wp.points, mesh_wp.indices, boundary_wp, boundary_uv_wp, uv_init_wp, max_iterations=10
+    )
+    uv_tight_wp = tw.parametrization.arap(
+        mesh_wp.points,
+        mesh_wp.indices,
+        boundary_wp,
+        boundary_uv_wp,
+        uv_init_wp,
+        max_iterations=10,
+        tolerance=1e-9,
+    )
+    assert np.allclose(uv_default_wp.numpy(), uv_tight_wp.numpy(), rtol=1e-5, atol=1e-5)
+
+
 def test_arap_fixed_vertices_pinned(device, hemisphere):
     # The pinned rows must equal the prescribed UV exactly (they are re-enforced every iteration).
     _skip_on_cpu(device)
@@ -541,6 +568,17 @@ def test_arap_bad_iterations_raises(device, hemisphere):
     with pytest.raises(ValueError, match="max_iterations"):
         tw.parametrization.arap(
             mesh_wp.points, mesh_wp.indices, boundary_wp, boundary_uv_wp, uv_init, max_iterations=0
+        )
+
+
+def test_arap_bad_tolerance_raises(device, hemisphere):
+    _, mesh_wp = hemisphere
+    boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
+    boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)
+    uv_init = wp.zeros(int(mesh_wp.points.shape[0]), dtype=wp.vec2, device=mesh_wp.device)
+    with pytest.raises(ValueError, match="tolerance"):
+        tw.parametrization.arap(
+            mesh_wp.points, mesh_wp.indices, boundary_wp, boundary_uv_wp, uv_init, tolerance=0.0
         )
 
 
