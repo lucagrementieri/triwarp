@@ -186,7 +186,8 @@ def scatter_free_solution(
 @wp.func
 def laplacian_step(v_prev: wp.vec3d, lv: wp.vec3d, coeff: wp.float64) -> wp.vec3d:
     # Explicit diffusion step v' = v + coeff * (L·v - v); coeff = +lambda (shrink) or -nu (inflate).
-    return v_prev + coeff * (lv - v_prev)
+    # ``wp.lerp`` extrapolates for coeff outside [0, 1], which the inflating step relies on.
+    return wp.lerp(v_prev, lv, coeff)
 
 
 @wp.func
@@ -202,13 +203,13 @@ def neighborhood_average(
 @wp.func
 def humphrey_residual(lv: wp.vec3d, original: wp.vec3d, q: wp.vec3d, alpha: wp.float64) -> wp.vec3d:
     # b = L·v - (alpha * original + (1 - alpha) * q), the Humphrey correction term.
-    return lv - (alpha * original + (wp.float64(1.0) - alpha) * q)
+    return lv - wp.lerp(q, original, alpha)
 
 
 @wp.func
 def humphrey_update(lv: wp.vec3d, b: wp.vec3d, lb: wp.vec3d, beta: wp.float64) -> wp.vec3d:
     # v' = L·v - (beta * b + (1 - beta) * L·b).
-    return lv - (beta * b + (wp.float64(1.0) - beta) * lb)
+    return lv - wp.lerp(lb, b, beta)
 
 
 @wp.func
@@ -222,9 +223,11 @@ def mut_dif_adil(normal: wp.vec3, v: wp.vec3d, lv: wp.vec3d) -> wp.float64:
 def mut_dif_step(
     v_prev: wp.vec3d, lv: wp.vec3d, adil: wp.float64, mean_adil: wp.float64, lamb: wp.float64
 ) -> wp.vec3d:
-    # v' = v + lamber * (L.v - v), lamber = clamp(lamb * adil / mean_adil, 0.2 * lamb, 1.0).
+    # v' = v + lamber * (L.v - v), lamber = max(0.2 * lamb, min(1.0, lamb * adil / mean_adil)).
+    # Not ``wp.clamp``: the two differ once ``0.2 * lamb > 1``, and this nesting order is the one
+    # trimesh's ``filter_mut_dif_laplacian`` uses (``np.maximum(..., np.minimum(...))``).
     lamber = wp.max(wp.float64(0.2) * lamb, wp.min(wp.float64(1.0), lamb * adil / mean_adil))
-    return v_prev + lamber * (lv - v_prev)
+    return wp.lerp(v_prev, lv, lamber)
 
 
 @wp.kernel

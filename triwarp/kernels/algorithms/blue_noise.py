@@ -115,7 +115,7 @@ def far_enough(
                 ni = selected[cell_idx]
                 if ni >= wp.int32(0):
                     diff = pool_points[mi] - pool_points[ni]
-                    if wp.dot(diff, diff) < rr:
+                    if wp.length_sq(diff) < rr:
                         return False
     return True
 
@@ -149,7 +149,7 @@ def try_activate_cell(
             continue
         if parent >= wp.int32(0):
             diff_parent = pool_points[parent] - pool_points[mi]
-            if wp.dot(diff_parent, diff_parent) > four_rr:
+            if wp.length_sq(diff_parent) > four_rr:
                 k += 1
                 continue
         if far_enough(pool_points, point_cell, cell_neighbors, selected, rr, mi):
@@ -195,7 +195,7 @@ def find_far_candidate(
             continue
         if parent >= wp.int32(0):
             diff_parent = pool_points[parent] - pool_points[mi]
-            if wp.dot(diff_parent, diff_parent) > four_rr:
+            if wp.length_sq(diff_parent) > four_rr:
                 continue
         if far_enough(pool_points, point_cell, cell_neighbors, selected, rr, mi):
             return wp.int32(mi)
@@ -368,7 +368,7 @@ def resolve_cross_cell(
                     continue
                 other = proposal_mi[t2]
                 diff = pool_points[mi] - pool_points[other]
-                if wp.dot(diff, diff) < rr:
+                if wp.length_sq(diff) < rr:
                     out_conflict[t] = wp.int32(1)
                     return
 
@@ -434,7 +434,7 @@ def prune_spawn_neighborhoods(
                     if not out_cand_alive[q]:
                         continue
                     diff = pool_points[q] - pool_points[s]
-                    if wp.dot(diff, diff) < rr:
+                    if wp.length_sq(diff) < rr:
                         out_cand_alive[q] = False
 
 

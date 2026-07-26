@@ -14,8 +14,8 @@ def bvh_aabb_collect(
 ) -> wp.int32:
     # Count (``write=False``) or emit at ``base`` (``write=True``) the BVH hits around ``q``.
     h = half_extent
-    lower = wp.vec3(q[0] - h, q[1] - h, q[2] - h)
-    upper = wp.vec3(q[0] + h, q[1] + h, q[2] + h)
+    lower = q - wp.vec3(h)  # wp.vec3(scalar) broadcasts the scalar to every component
+    upper = q + wp.vec3(h)
     query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
     j = wp.int32(0)
     c = wp.int32(0)
@@ -134,8 +134,8 @@ def bvh_ball_collect(
     out_distances: wp.array[wp.float32],
 ) -> wp.int32:
     # Count (``write=False``) or emit at ``base`` (``write=True``) points within ``radius``.
-    lower = wp.vec3(q[0] - radius, q[1] - radius, q[2] - radius)
-    upper = wp.vec3(q[0] + radius, q[1] + radius, q[2] + radius)
+    lower = q - wp.vec3(radius)  # wp.vec3(scalar) broadcasts the scalar to every component
+    upper = q + wp.vec3(radius)
     query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
     j = wp.int32(0)
     c = wp.int32(0)
@@ -230,8 +230,8 @@ def query_bvh_nearest_neighbors(
     tid = wp.tid()
     q = queries[tid]
     r = radius
-    lower = wp.vec3(q[0] - r, q[1] - r, q[2] - r)
-    upper = wp.vec3(q[0] + r, q[1] + r, q[2] + r)
+    lower = q - wp.vec3(r)  # wp.vec3(scalar) broadcasts the scalar to every component
+    upper = q + wp.vec3(r)
     query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
     point_index = wp.int32(0)
 

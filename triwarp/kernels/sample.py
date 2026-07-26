@@ -68,8 +68,10 @@ def sample_volume_tet(
     b = wp.randf(state)
     c = wp.randf(state)
 
-    s1 = wp.min(a, wp.min(b, c))
-    s3 = wp.max(a, wp.max(b, c))
+    # Single-argument wp.min / wp.max reduce a vector to its extreme element.
+    abc = wp.vec3(a, b, c)
+    s1 = wp.min(abc)
+    s3 = wp.max(abc)
     s2 = a + b + c - s1 - s3
 
     out_points[tid] = center * (1.0 - s3) + v0 * s1 + v1 * (s2 - s1) + v2 * (s3 - s2)

@@ -36,13 +36,11 @@ def weighted_centered_dot_tile(
     offset: int,
     remaining: int,
 ) -> wp.float32:
-    count = remaining
-    if count > TILE_1D:
-        count = TILE_1D
+    count = wp.min(remaining, TILE_1D)
     result = wp.float32(0.0)
     for k in range(count):
         v = values[offset + k] - center
-        result += (weights[offset + k] / w_sum) * wp.dot(v, v)
+        result += (weights[offset + k] / w_sum) * wp.length_sq(v)
     return result
 
 
@@ -151,23 +149,16 @@ def build_procrustes_matrix(
     # wp.svd3 may return negative singular values; absorb their signs into a
     # diagonal correction matrix so R = U @ D @ V^T matches the numpy convention
     # (all-positive sigma) and correctly handles reflective optimal solutions.
-    d0 = wp.float32(1.0)
-    d1 = wp.float32(1.0)
-    d2 = wp.float32(1.0)
-    if sigma[0] < wp.float32(0.0):
-        d0 = wp.float32(-1.0)
-    if sigma[1] < wp.float32(0.0):
-        d1 = wp.float32(-1.0)
-    if sigma[2] < wp.float32(0.0):
-        d2 = wp.float32(-1.0)
+    # wp.sign is -1 for negative components and +1 otherwise (including at exactly 0).
+    d = wp.sign(sigma)
 
     if not use_reflection:
         # Ensure det(R) = 1 by flipping the last correction factor when needed
-        R_test = U * wp.diag(wp.vec3(d0, d1, d2)) * Vt  # noqa: N806
+        R_test = U * wp.diag(d) * Vt  # noqa: N806
         if wp.determinant(R_test) < wp.float32(0.0):
-            d2 = -d2
+            d = wp.vec3(d[0], d[1], -d[2])
 
-    D = wp.diag(wp.vec3(d0, d1, d2))  # noqa: N806
+    D = wp.diag(d)  # noqa: N806
     R = U * D * Vt  # noqa: N806
 
     s = wp.float32(1.0)
@@ -188,10 +179,8 @@ def apply_transform_mat44(
     points: wp.array[wp.vec3], matrix: wp.array[wp.mat44], out_points: wp.array[wp.vec3]
 ) -> None:
     i = int(wp.tid())
-    M = matrix[0]  # noqa: N806
-    p = points[i]
-    r = M * wp.vec4(p[0], p[1], p[2], wp.float32(1.0))
-    out_points[i] = wp.vec3(r[0], r[1], r[2])
+    # wp.transform_point(mat44, vec3) is exactly ``(M * vec4(p, 1)).xyz``.
+    out_points[i] = wp.transform_point(matrix[0], points[i])
 
 
 @wp.kernel
@@ -205,7 +194,7 @@ def accumulate_cost(
     i = int(wp.tid())
     w_norm = weights[i] / w_sum[0]
     diff = b[i] - transformed[i]
-    wp.atomic_add(out_cost, 0, w_norm * wp.dot(diff, diff))
+    wp.atomic_add(out_cost, 0, w_norm * wp.length_sq(diff))
 
 
 # --- Iterative closest point (ICP) -----------------------------------------
@@ -278,9 +267,7 @@ def point_to_plane_tile(
     offset: int,
     remaining: int,
 ) -> tuple[wp.spatial_matrix, wp.spatial_vector, wp.float32]:
-    count = remaining
-    if count > TILE_1D:
-        count = TILE_1D
+    count = wp.min(remaining, TILE_1D)
     jtj = wp.spatial_matrix(wp.float32(0.0))
     jtr = wp.spatial_vector(
         wp.float32(0.0),
@@ -424,6 +411,6 @@ def solve_point_to_plane(
     angle = wp.length(omega)
     rot = wp.identity(n=3, dtype=wp.float32)
     if angle > wp.float32(1e-12):
-        rot = wp.quat_to_matrix(wp.quat_from_axis_angle(omega / angle, angle))
+        rot = wp.quat_to_matrix(wp.quat_from_axis_angle(wp.normalize(omega), angle))
 
     out_matrix[0] = make_affine44(rot, tvec)

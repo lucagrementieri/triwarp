@@ -51,11 +51,8 @@ def face_gradient_normalized(
             wp.float64(2.0) * area
         )
 
-    length = wp.length(grad)
-    unit = wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
-    if length > wp.float64(0.0):
-        unit = -grad / length
-    out_x[f] = unit
+    # ``normalize`` returns the zero vector for a zero-length gradient (Warp's ``kEps`` is 0).
+    out_x[f] = -wp.normalize(grad)
 
 
 @wp.kernel

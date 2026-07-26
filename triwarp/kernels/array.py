@@ -216,8 +216,9 @@ def isin_lookup_sorted(
 
 @wp.func
 def vector_angle_vec(a: wp.vec3, b: wp.vec3) -> wp.float32:
-    dot = wp.clamp(wp.dot(a, b), -1.0, 1.0)
-    return wp.abs(wp.acos(dot))
+    # wp.acos auto-clamps to [-1, 1] and returns a value in [0, pi], so neither an explicit
+    # wp.clamp on the dot product nor a wp.abs on the result is needed.
+    return wp.acos(wp.dot(a, b))
 
 
 @wp.func

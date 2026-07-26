@@ -97,8 +97,9 @@ def angles(
     v = wp.normalize(edges[1])
     w = wp.normalize(edges[2])
 
-    out_angles[f, 0] = wp.acos(wp.clamp(wp.dot(u, v), -1.0, 1.0))
-    out_angles[f, 1] = wp.acos(wp.clamp(wp.dot(-u, w), -1.0, 1.0))
+    # wp.acos auto-clamps its argument to [-1, 1], so no explicit wp.clamp is needed.
+    out_angles[f, 0] = wp.acos(wp.dot(u, v))
+    out_angles[f, 1] = wp.acos(wp.dot(-u, w))
     out_angles[f, 2] = PI - out_angles[f, 0] - out_angles[f, 1]
 
     degen = (

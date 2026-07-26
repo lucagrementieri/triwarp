@@ -388,9 +388,7 @@ def weighted_sum1d_tiled(
 def outer_sum_tile(
     points: wp.array[wp.vec3], center: wp.vec3, offset: int, remaining: int
 ) -> wp.mat33:
-    count = remaining
-    if count > TILE_1D:
-        count = TILE_1D
+    count = wp.min(remaining, TILE_1D)
     # M = sum_k outer(x_k, x_k) where x_k = points[k] - center
     m = wp.mat33(0.0)
     for k in range(count):
@@ -409,9 +407,7 @@ def cross_outer_sum_tile(
     offset: int,
     remaining: int,
 ) -> wp.mat33:
-    count = remaining
-    if count > TILE_1D:
-        count = TILE_1D
+    count = wp.min(remaining, TILE_1D)
     # masked cross-covariance H = sum_{k: w_k > 0} outer(b_k - b_center, a_k - a_center)
     m = wp.mat33(0.0)
     for k in range(count):

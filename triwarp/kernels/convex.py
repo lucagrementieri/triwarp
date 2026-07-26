@@ -35,9 +35,7 @@ def hull_support_extremes(
         return
 
     remaining = n_p - point_offset
-    count = remaining
-    if count > TILE_1D:
-        count = TILE_1D
+    count = wp.min(remaining, TILE_1D)
 
     direction = directions[int(k)]
     idx = point_offset + int(t)

@@ -7,9 +7,9 @@ from triwarp.kernels.triangles import face_vertices
 def squared_edge_lengths(
     v0: wp.vec3, v1: wp.vec3, v2: wp.vec3
 ) -> tuple[wp.float32, wp.float32, wp.float32]:
-    l2_0 = wp.dot(v1 - v2, v1 - v2)
-    l2_1 = wp.dot(v2 - v0, v2 - v0)
-    l2_2 = wp.dot(v0 - v1, v0 - v1)
+    l2_0 = wp.length_sq(v1 - v2)
+    l2_1 = wp.length_sq(v2 - v0)
+    l2_2 = wp.length_sq(v0 - v1)
     return l2_0, l2_1, l2_2
 
 
@@ -36,10 +36,8 @@ def sort_three_lengths(
 def doublearea_from_lengths(l0: wp.float32, l1: wp.float32, l2: wp.float32) -> wp.float32:
     l0, l1, l2 = sort_three_lengths(l0, l1, l2)
     arg = (l0 + (l1 + l2)) * (l2 - (l0 - l1)) * (l2 + (l0 - l1)) * (l0 + (l1 - l2))
-    if arg < wp.float32(0.0):
-        arg = wp.float32(0.0)
-    dbl_area = wp.float32(0.5) * wp.sqrt(arg)
-    if dbl_area != dbl_area:
+    dbl_area = wp.float32(0.5) * wp.sqrt(wp.max(arg, wp.float32(0.0)))
+    if wp.isnan(dbl_area):
         return wp.float32(0.0)
     return dbl_area
 

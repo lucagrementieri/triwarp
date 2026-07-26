@@ -45,9 +45,9 @@ def point_triangle_sq_dist(p: wp.vec3, a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp
     q = p - a
     e1 = b - a
     e2 = c - a
-    e1e1 = wp.dot(e1, e1)
+    e1e1 = wp.length_sq(e1)
     e1e2 = wp.dot(e1, e2)
-    e2e2 = wp.dot(e2, e2)
+    e2e2 = wp.length_sq(e2)
     det = e1e1 * e2e2 - e1e2 * e1e2
 
     # Initialize before branching (Warp leaves branch-local variables uninitialized
@@ -67,7 +67,7 @@ def point_triangle_sq_dist(p: wp.vec3, a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp
         d_e1 = project_segment_sq_dist(q, e1, e1e1)
         d_e2 = project_segment_sq_dist(q, e2, e2e2)
         d_e12 = project_segment_sq_dist(q - e1, e2 - e1, wp.length_sq(e2 - e1))
-        dist_sq = wp.min(wp.min(d_e1, d_e2), d_e12)
+        dist_sq = wp.min(wp.vec3(d_e1, d_e2, d_e12))
 
     return dist_sq
 
@@ -93,7 +93,7 @@ def chamfer_nn_term(
     contrib = wp.float32(0.0)
     if idx < x.shape[0]:
         diff = x[idx] - y[nearest[idx]]
-        contrib = scale * wp.dot(diff, diff)
+        contrib = scale * wp.length_sq(diff)
     total = wp.tile_sum(wp.tile(contrib))
     if t == 0:
         wp.tile_atomic_add(out_loss, total, (0,))

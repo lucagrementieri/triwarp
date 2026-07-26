@@ -120,8 +120,8 @@ def edge_removal_weight(
             prev_ind = prev
             next_ind = i
             other_id = prev
-        length_sq = wp.dot(a - points[nbr[i]], a - points[nbr[i]])
-        other_length_sq = wp.dot(a - points[nbr[other_id]], a - points[nbr[other_id]])
+        length_sq = wp.length_sq(a - points[nbr[i]])
+        other_length_sq = wp.length_sq(a - points[nbr[other_id]])
         if length_sq < other_length_sq:
             return stable
         bb = points[nbr[prev_ind]]
@@ -145,12 +145,12 @@ def edge_removal_weight(
     c = points[cv]
     d = points[dv]
 
-    ac_length_sq = wp.dot(a - c, a - c)
+    ac_length_sq = wp.length_sq(a - c)
     if (
-        ac_length_sq > wp.dot(b - a, b - a)
+        ac_length_sq > wp.length_sq(b - a)
         and triangle_aspect_ratio(a, b, c) > CRITICAL_ASPECT_RATIO
     ) or (
-        ac_length_sq > wp.dot(d - a, d - a)
+        ac_length_sq > wp.length_sq(d - a)
         and triangle_aspect_ratio(a, c, d) > CRITICAL_ASPECT_RATIO
     ):
         # degenerate triangle, longest edge -> remove as fast as possible
@@ -252,24 +252,22 @@ def build_local_triangulations(
         pv = d - wp.dot(n_center, d) * n_center
         if normalizer_sq <= 0.0:
             base = pv
-            normalizer_sq = wp.dot(pv, pv)
+            normalizer_sq = wp.length_sq(pv)
     if normalizer_sq <= 0.0:
         normalizer_sq = 1.0
-    if wp.dot(base, base) > 0.0:
-        base = wp.normalize(base)
+    base = wp.normalize(base)  # zero-length base normalizes to the zero vector (Warp kEps == 0)
 
     # --- polar angle of each neighbour around the center in the tangent plane ---
     for i in range(m):
         d = points[nbr[i]] - a
         pv = d - wp.dot(n_center, d) * n_center
-        if wp.dot(pv, pv) > 0.0:
+        if wp.length_sq(pv) > 0.0:
             vec = wp.normalize(pv)
         else:
             vec = base
         cp = wp.cross(vec, base)
-        s = float(1.0)  # noqa: UP018 — mutable Warp dynamic variable
-        if wp.dot(cp, n_center) < 0.0:
-            s = -1.0
+        # wp.sign is -1 below zero and +1 otherwise, matching the guard this replaces.
+        s = wp.sign(wp.dot(cp, n_center))
         ang[i] = wp.atan2(s * wp.length(cp), wp.dot(vec, base))
 
     # --- sort neighbours by angle (selection sort; m <= MAX_NEIGHBOURS) ---
@@ -390,21 +388,10 @@ def poisson_sample_grid(
     field: wp.array(dtype=wp.float32), res: wp.int32, gx: wp.float32, gy: wp.float32, gz: wp.float32
 ) -> wp.float32:
     # Trilinear interpolation of ``field`` at grid coordinate (gx, gy, gz) in [0, res - 1].
-    i0 = int(wp.floor(gx))
-    j0 = int(wp.floor(gy))
-    k0 = int(wp.floor(gz))
-    if i0 < 0:
-        i0 = 0
-    if j0 < 0:
-        j0 = 0
-    if k0 < 0:
-        k0 = 0
-    if i0 > res - 2:
-        i0 = res - 2
-    if j0 > res - 2:
-        j0 = res - 2
-    if k0 > res - 2:
-        k0 = res - 2
+    # Clamp the base cell so the (i0 + 1, j0 + 1, k0 + 1) corner reads stay in range.
+    i0 = wp.clamp(int(wp.floor(gx)), 0, res - 2)
+    j0 = wp.clamp(int(wp.floor(gy)), 0, res - 2)
+    k0 = wp.clamp(int(wp.floor(gz)), 0, res - 2)
     fx = wp.clamp(gx - float(i0), 0.0, 1.0)
     fy = wp.clamp(gy - float(j0), 0.0, 1.0)
     fz = wp.clamp(gz - float(k0), 0.0, 1.0)
@@ -416,13 +403,13 @@ def poisson_sample_grid(
     c101 = field[poisson_grid_index(i0 + 1, j0, k0 + 1, res)]
     c011 = field[poisson_grid_index(i0, j0 + 1, k0 + 1, res)]
     c111 = field[poisson_grid_index(i0 + 1, j0 + 1, k0 + 1, res)]
-    c00 = c000 * (1.0 - fx) + c100 * fx
-    c10 = c010 * (1.0 - fx) + c110 * fx
-    c01 = c001 * (1.0 - fx) + c101 * fx
-    c11 = c011 * (1.0 - fx) + c111 * fx
-    c0 = c00 * (1.0 - fy) + c10 * fy
-    c1 = c01 * (1.0 - fy) + c11 * fy
-    return c0 * (1.0 - fz) + c1 * fz
+    c00 = wp.lerp(c000, c100, fx)
+    c10 = wp.lerp(c010, c110, fx)
+    c01 = wp.lerp(c001, c101, fx)
+    c11 = wp.lerp(c011, c111, fx)
+    c0 = wp.lerp(c00, c10, fy)
+    c1 = wp.lerp(c01, c11, fy)
+    return wp.lerp(c0, c1, fz)
 
 
 @wp.kernel(enable_backward=False)
@@ -445,41 +432,23 @@ def splat_normals(
     weight = float(1.0)  # noqa: UP018 — mutable Warp dynamic variable
     if confidence != 0:
         weight = length
-    if length > 0.0:
-        n = n / length  # unit direction; magnitude carried by ``weight``
+    n = wp.normalize(n)  # unit direction; magnitude carried by ``weight``
 
     g = (points[s] - cube_lower) * inv_cell
-    i0 = int(wp.floor(g[0]))
-    j0 = int(wp.floor(g[1]))
-    k0 = int(wp.floor(g[2]))
-    if i0 < 0:
-        i0 = 0
-    if j0 < 0:
-        j0 = 0
-    if k0 < 0:
-        k0 = 0
-    if i0 > res - 2:
-        i0 = res - 2
-    if j0 > res - 2:
-        j0 = res - 2
-    if k0 > res - 2:
-        k0 = res - 2
+    # Clamp the base cell so the (i0 + 1, j0 + 1, k0 + 1) splat corner stays in range.
+    i0 = wp.clamp(int(wp.floor(g[0])), 0, res - 2)
+    j0 = wp.clamp(int(wp.floor(g[1])), 0, res - 2)
+    k0 = wp.clamp(int(wp.floor(g[2])), 0, res - 2)
     fx = wp.clamp(g[0] - float(i0), 0.0, 1.0)
     fy = wp.clamp(g[1] - float(j0), 0.0, 1.0)
     fz = wp.clamp(g[2] - float(k0), 0.0, 1.0)
 
     for di in range(2):
-        wx = fx
-        if di == 0:
-            wx = 1.0 - fx
+        wx = wp.where(di == 0, 1.0 - fx, fx)
         for dj in range(2):
-            wy = fy
-            if dj == 0:
-                wy = 1.0 - fy
+            wy = wp.where(dj == 0, 1.0 - fy, fy)
             for dk in range(2):
-                wz = fz
-                if dk == 0:
-                    wz = 1.0 - fz
+                wz = wp.where(dk == 0, 1.0 - fz, fz)
                 w = wx * wy * wz * weight
                 idx = poisson_grid_index(i0 + di, j0 + dj, k0 + dk, res)
                 wp.atomic_add(out_vx, idx, w * n[0])

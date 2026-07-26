@@ -153,20 +153,14 @@ def build_signed_face_edges(
     d1 = edge_forward_in_face(faces, f1, a, b)
     out_edges[r, 0] = f0
     out_edges[r, 1] = f1
-    if d0 == d1:
-        out_sign[r] = wp.int32(1)
-    else:
-        out_sign[r] = wp.int32(0)
+    out_sign[r] = wp.where(d0 == d1, wp.int32(1), wp.int32(0))
 
 
 @wp.kernel
 def seed_orientation(labels: wp.array[wp.int32], out_orient: wp.array[wp.int32]) -> None:
     """Seed one orientation bit (0) per component representative, -1 elsewhere."""
     f = int(wp.tid())
-    if labels[f] == f:
-        out_orient[f] = wp.int32(0)
-    else:
-        out_orient[f] = wp.int32(-1)
+    out_orient[f] = wp.where(labels[f] == f, wp.int32(0), wp.int32(-1))
 
 
 @wp.kernel

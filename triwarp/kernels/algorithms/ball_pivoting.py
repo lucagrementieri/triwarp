@@ -33,9 +33,9 @@ def compute_ball_center(
     # Returns a sentinel of (inf, inf, inf) when the ball does not exist (points too far apart or
     # nearly collinear), which the caller treats as failure.
     fail = wp.vec3(wp.inf, wp.inf, wp.inf)
-    c = wp.dot(v2 - v1, v2 - v1)
-    b = wp.dot(v1 - v3, v1 - v3)
-    a = wp.dot(v3 - v2, v3 - v2)
+    c = wp.length_sq(v2 - v1)
+    b = wp.length_sq(v1 - v3)
+    a = wp.length_sq(v3 - v2)
     alpha = a * (b + c - a)
     beta = b * (a + c - b)
     gamma = c * (a + b - c)
@@ -183,7 +183,7 @@ def pivot_front_edges(
     if center[0] == wp.inf:
         return
 
-    mp = 0.5 * (p_src + p_tgt)
+    mp = wp.lerp(p_src, p_tgt, 0.5)
     axis = wp.normalize(p_tgt - p_src)
     a_dir = wp.normalize(center - mp)
     tri_norm = face_normal(p_src, p_tgt, points[opp])
@@ -206,7 +206,7 @@ def pivot_front_edges(
         if new_center[0] == wp.inf:
             continue
         b_dir = wp.normalize(new_center - mp)
-        angle = wp.acos(wp.clamp(wp.dot(a_dir, b_dir), -1.0, 1.0))
+        angle = wp.acos(wp.dot(a_dir, b_dir))  # wp.acos auto-clamps to [-1, 1]
         if wp.dot(wp.cross(a_dir, b_dir), axis) < 0.0:
             angle = TWO_PI - angle
         if angle >= best_angle:

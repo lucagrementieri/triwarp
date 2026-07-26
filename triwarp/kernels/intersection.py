@@ -161,15 +161,6 @@ def mesh_with_plane_segments(
 
 
 @wp.func
-def vec3_get(v: wp.vec3, i: wp.int32) -> wp.float32:
-    if i == wp.int32(0):
-        return v[0]
-    if i == wp.int32(1):
-        return v[1]
-    return v[2]
-
-
-@wp.func
 def vec3_equal(a: wp.vec3, b: wp.vec3) -> wp.bool:
     return a[0] == b[0] and a[1] == b[1] and a[2] == b[2]
 
@@ -203,31 +194,23 @@ def intersection_line_coordinate(
 ) -> wp.float32:
     minors = wp.cross(direction1, direction2)
     order_x, _order_y, order_z = vec3_argsort(minors)
-    minor_x = vec3_get(minors, order_x)
-    minor_z = vec3_get(minors, order_z)
+    minor_x = minors[order_x]
+    minor_z = minors[order_z]
     i = order_z
     if minor_z >= -minor_x:
         i = order_z
     else:
         i = order_x
-    numerator = vec3_get(wp.cross(start2 - start1, direction2), i)
-    denominator = vec3_get(minors, i)
+    offset_minors = wp.cross(start2 - start1, direction2)
+    numerator = offset_minors[i]
+    denominator = minors[i]
     return numerator / denominator
 
 
 @wp.func
 def triangle_aabb(v0: wp.vec3, v1: wp.vec3, v2: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
-    lower = wp.vec3(
-        wp.min(v0[0], wp.min(v1[0], v2[0])),
-        wp.min(v0[1], wp.min(v1[1], v2[1])),
-        wp.min(v0[2], wp.min(v1[2], v2[2])),
-    )
-    upper = wp.vec3(
-        wp.max(v0[0], wp.max(v1[0], v2[0])),
-        wp.max(v0[1], wp.max(v1[1], v2[1])),
-        wp.max(v0[2], wp.max(v1[2], v2[2])),
-    )
-    return lower, upper
+    # wp.min / wp.max on vectors are element-wise.
+    return wp.min(v0, wp.min(v1, v2)), wp.max(v0, wp.max(v1, v2))
 
 
 @wp.func
@@ -249,10 +232,9 @@ def triangles_share_vertex(
 
 @wp.func
 def axis_interval_projection(axis: wp.vec3, v0: wp.vec3, v1: wp.vec3, v2: wp.vec3) -> wp.vec2:
-    p0 = wp.dot(axis, v0)
-    p1 = wp.dot(axis, v1)
-    p2 = wp.dot(axis, v2)
-    return wp.vec2(wp.min(p0, wp.min(p1, p2)), wp.max(p0, wp.max(p1, p2)))
+    p = wp.vec3(wp.dot(axis, v0), wp.dot(axis, v1), wp.dot(axis, v2))
+    # Single-argument wp.min / wp.max reduce a vector to its extreme element.
+    return wp.vec2(wp.min(p), wp.max(p))
 
 
 @wp.func
@@ -336,9 +318,9 @@ def triangle_intersection_segment(
     proj2 = wp.vec3(wp.dot(normal, b0 - a0), wp.dot(normal, b1 - a0), wp.dot(normal, b2 - a0))
 
     order1_x, order1_y, order1_z = vec3_argsort(proj1)
-    proj1a = vec3_get(proj1, order1_x)
-    proj1c = vec3_get(proj1, order1_z)
-    proj1b = vec3_get(proj1, order1_y)
+    proj1a = proj1[order1_x]
+    proj1c = proj1[order1_z]
+    proj1b = proj1[order1_y]
 
     va_min = vertex_at(order1_x, a0, a1, a2)
     va_max = vertex_at(order1_z, a0, a1, a2)
@@ -363,7 +345,7 @@ def triangle_intersection_segment(
         line_origin, line_direction, vertex_at(order2_x, b0, b1, b2), edge_direction
     )
     edge_direction = vertex_at(
-        order2_x if vec3_get(proj2, order2_y) >= wp.float32(0.0) else order2_z, b0, b1, b2
+        order2_x if proj2[order2_y] >= wp.float32(0.0) else order2_z, b0, b1, b2
     ) - vertex_at(order2_y, b0, b1, b2)
     s2 = intersection_line_coordinate(
         line_origin, line_direction, vertex_at(order2_y, b0, b1, b2), edge_direction

@@ -40,9 +40,9 @@ def _barycentric(q0: wp.vec2, q1: wp.vec2, q2: wp.vec2, p: wp.vec2) -> wp.vec3:
     v0 = q1 - q0
     v1 = q2 - q0
     v2 = p - q0
-    d00 = wp.dot(v0, v0)
+    d00 = wp.length_sq(v0)
     d01 = wp.dot(v0, v1)
-    d11 = wp.dot(v1, v1)
+    d11 = wp.length_sq(v1)
     d20 = wp.dot(v2, v0)
     d21 = wp.dot(v2, v1)
     denom = d00 * d11 - d01 * d01
@@ -78,15 +78,14 @@ def _pixel_bounds(
     q0: wp.vec2, q1: wp.vec2, q2: wp.vec2, resolution: wp.int32
 ) -> tuple[wp.int32, wp.int32, wp.int32, wp.int32]:
     """Clamped raster bounds ``(row_lo, row_hi, col_lo, col_hi)`` of the triangle's bbox."""
-    x_min = wp.min(q0[0], wp.min(q1[0], q2[0]))
-    x_max = wp.max(q0[0], wp.max(q1[0], q2[0]))
-    y_min = wp.min(q0[1], wp.min(q1[1], q2[1]))
-    y_max = wp.max(q0[1], wp.max(q1[1], q2[1]))
+    # wp.min / wp.max on vectors are element-wise, so these are the bbox corners in UV space.
+    lower = wp.min(q0, wp.min(q1, q2))
+    upper = wp.max(q0, wp.max(q1, q2))
 
-    col_lo = wp.clamp(int(wp.floor(x_min)), wp.int32(0), resolution - 1)
-    col_hi = wp.clamp(int(wp.ceil(x_max)), wp.int32(0), resolution - 1)
-    row_lo = wp.clamp(int(wp.floor(y_min)), wp.int32(0), resolution - 1)
-    row_hi = wp.clamp(int(wp.ceil(y_max)), wp.int32(0), resolution - 1)
+    col_lo = wp.clamp(int(wp.floor(lower[0])), wp.int32(0), resolution - 1)
+    col_hi = wp.clamp(int(wp.ceil(upper[0])), wp.int32(0), resolution - 1)
+    row_lo = wp.clamp(int(wp.floor(lower[1])), wp.int32(0), resolution - 1)
+    row_hi = wp.clamp(int(wp.ceil(upper[1])), wp.int32(0), resolution - 1)
     return row_lo, row_hi, col_lo, col_hi
 
 
@@ -233,9 +232,9 @@ def sample_texture(
         c0c = wp.clamp(c0, wp.int32(0), width - 1)
         c1c = wp.clamp(c0 + 1, wp.int32(0), width - 1)
         for k in range(n_channels):
-            top = image[r0c, c0c, k] * (1.0 - fc) + image[r0c, c1c, k] * fc
-            bottom = image[r1c, c0c, k] * (1.0 - fc) + image[r1c, c1c, k] * fc
-            out_values[v, k] = top * (1.0 - fr) + bottom * fr
+            top = wp.lerp(image[r0c, c0c, k], image[r0c, c1c, k], fc)
+            bottom = wp.lerp(image[r1c, c0c, k], image[r1c, c1c, k], fc)
+            out_values[v, k] = wp.lerp(top, bottom, fr)
 
 
 @wp.kernel

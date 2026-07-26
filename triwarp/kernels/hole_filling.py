@@ -283,7 +283,7 @@ def min_triangle_angle_sin(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.float32:
     if ab <= 0.0 or ca <= 0.0 or bc <= 0.0:
         return 0.0
     f = wp.length(wp.cross(b - a, c - a))
-    return f * wp.min(ab, wp.min(ca, bc)) / (ab * ca * bc)
+    return f * wp.min(wp.vec3(ab, ca, bc)) / (ab * ca * bc)
 
 
 @wp.func
@@ -388,7 +388,7 @@ def closed_edge_sq_lengths(
     # the ``char_area`` (1 / maxEdgeLengthSq) scale of the complex-fill metric.
     i = int(wp.tid())
     d = loop_pos[_wrap(i + 1, n)] - loop_pos[i]
-    out_sq[i] = wp.dot(d, d)
+    out_sq[i] = wp.length_sq(d)
 
 
 @wp.kernel
@@ -538,7 +538,7 @@ def pair_sq_distances(
     # (reused ``row_argmin`` + ``global_argmin``) is MeshLib's aligned start pair for stitchHoles.
     i, j = wp.tid()
     d = a_pos[i] - b_pos[j]
-    out_dist[i, j] = wp.dot(d, d)
+    out_dist[i, j] = wp.length_sq(d)
 
 
 @wp.kernel

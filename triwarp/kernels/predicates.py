@@ -38,12 +38,9 @@ def orient2d(a: Any, b: Any, c: Any):
 
 @wp.func
 def triangle_normal(a: Any, b: Any, c: Any):
-    # Unit normal of triangle ABC, or the zero vector when the triangle is degenerate.
-    normal = wp.cross(b - a, c - a)
-    length = wp.length(normal)
-    if length <= type(length)(0.0):
-        return normal * type(length)(0.0)
-    return normal / length
+    # Unit normal of triangle ABC, or the zero vector when the triangle is degenerate. Warp's
+    # ``kEps`` is 0, so ``normalize`` already returns the zero vector for a zero-length input.
+    return wp.normalize(wp.cross(b - a, c - a))
 
 
 @wp.func
@@ -116,7 +113,7 @@ def unfold_on_plane(b: Any, c: Any, d: Any, to_left: wp.bool):
     # 2D point ``d``, preserving the angle and length of the 3D pair (b, c).
     dot_bc = wp.dot(b, c)
     cross_bc = wp.length(wp.cross(b, c))
-    dd = wp.dot(d, d)
+    dd = wp.length_sq(d)
     zero = type(dd)(0.0)
     if dd <= zero:
         return d * zero
@@ -135,7 +132,7 @@ def line_isect(b: Any, c: Any, d: Any) -> wp.Float:
     c2 = cross2(c - b, d - b)
     zero = type(c1)(0.0)
     if c1 == zero and c2 == zero:
-        bb = wp.dot(b, b)
+        bb = wp.length_sq(b)
         if bb == zero:
             return zero
         return (wp.dot(c, b) + wp.dot(d, b)) / (type(c1)(2.0) * bb)

@@ -21,15 +21,14 @@ def segment_displacement(polyline: wp.array[wp.vec3], i: wp.int32) -> wp.vec3:
 def segment_coordinate(a: wp.vec3, b: wp.vec3, p: wp.vec3) -> wp.float32:
     """Clamped projection parameter of ``p`` onto segment ``a -> b`` in ``[0, 1]``."""
     ab = b - a
-    length_sq = wp.max(wp.dot(ab, ab), TOLERANCE_MERGE_CONSTANT)
+    length_sq = wp.max(wp.length_sq(ab), TOLERANCE_MERGE_CONSTANT)
     return wp.clamp(wp.dot(p - a, ab) / length_sq, 0.0, 1.0)
 
 
 @wp.func
 def closest_point_on_segment(a: wp.vec3, b: wp.vec3, p: wp.vec3) -> wp.vec3:
     """Point on segment ``a -> b`` closest to ``p``."""
-    t = segment_coordinate(a, b, p)
-    return a + t * (b - a)
+    return wp.lerp(a, b, segment_coordinate(a, b, p))
 
 
 @wp.func
@@ -55,9 +54,7 @@ def line_squared_distance(p: wp.vec3, s: wp.vec3, d: wp.vec3, seg_sq_len: wp.flo
     dms = d - s
     smp = s - p
     t = -wp.dot(dms, smp) / seg_sq_len
-    proj = (1.0 - t) * s + t * d
-    diff = p - proj
-    return wp.dot(diff, diff)
+    return wp.length_sq(p - wp.lerp(s, d, t))
 
 
 @wp.func
@@ -67,8 +64,7 @@ def segment_length(start: wp.vec3, end: wp.vec3) -> wp.float32:
 
 @wp.func
 def segment_midpoint_and_length(start: wp.vec3, end: wp.vec3) -> tuple[wp.vec3, wp.float32]:
-    displacement = end - start
-    return start + 0.5 * displacement, wp.length(displacement)
+    return wp.lerp(start, end, 0.5), wp.length(end - start)
 
 
 @wp.kernel
@@ -131,7 +127,7 @@ def upsample_gather(
     segment = binary_search_index(offsets, j) - 1
     k = j - offsets[segment]
     weight = wp.float32(k) / wp.float32(steps[segment])
-    out_points[j] = polyline[segment] + weight * segment_displacement(polyline, segment)
+    out_points[j] = wp.lerp(polyline[segment], polyline[segment + 1], weight)
 
 
 CURVATURE_EPS = wp.constant(wp.float32(1.0e-6))
@@ -148,7 +144,7 @@ def plane_normal(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.vec3:
     """
     n1 = wp.cross(b, a + c)
     n2 = wp.cross(b, a - c)
-    if wp.dot(n1, n1) >= wp.dot(n2, n2):
+    if wp.length_sq(n1) >= wp.length_sq(n2):
         return n1
     return n2
 
@@ -164,7 +160,7 @@ def endpoint_normals(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> tuple[wp.vec3, wp.ve
     straight chord.
     """
     normal = plane_normal(a, b, c)
-    if wp.dot(normal, normal) < CURVATURE_EPS:
+    if wp.length_sq(normal) < CURVATURE_EPS:
         return wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0)
     nod = wp.normalize(wp.cross(normal, b))
     no = wp.normalize(nod + wp.normalize(wp.cross(normal, a)))
@@ -185,22 +181,20 @@ def arc_point(po: wp.vec3, pd: wp.vec3, no: wp.vec3, nd: wp.vec3, t: wp.float32)
     """
     b = pd - po
     chord = wp.length(b)
-    linear = po + t * b
+    linear = wp.lerp(po, pd, t)
     if chord < CURVATURE_EPS:
         return po
     # Zero end-normals are the collinear sentinel from endpoint_normals; unit normals have norm 1.
-    if wp.dot(no, no) < 0.5 or wp.dot(nd, nd) < 0.5:
+    if wp.length_sq(no) < 0.5 or wp.length_sq(nd) < 0.5:
         return linear
     theta = vector_angle_vec(no, nd)
     if theta < CURVATURE_EPS:
         return linear
-    tangent = b / chord
-    sign = 1.0
-    if wp.dot(b, nd - no) < 0.0:
-        sign = -1.0
-    bulge = sign * (no + nd)
+    tangent = wp.normalize(b)
+    # wp.sign is -1 below zero and +1 otherwise, matching the guard this replaces.
+    bulge = wp.sign(wp.dot(b, nd - no)) * (no + nd)
     m = bulge - wp.dot(bulge, tangent) * tangent  # bulge direction, orthogonalised against chord
-    if wp.dot(m, m) < CURVATURE_EPS:
+    if wp.length_sq(m) < CURVATURE_EPS:
         return linear
     m = wp.normalize(m)
     alpha = 0.5 * theta
@@ -240,7 +234,7 @@ def smooth_upsample_gather(
         next_index = segment + 2
         has_neighbours = 1
     if has_neighbours == 0:
-        out_points[j] = po + t * (pd - po)
+        out_points[j] = wp.lerp(po, pd, t)
         return
     no, nd = endpoint_normals(po - polyline[prev_index], pd - po, polyline[next_index] - pd)
     out_points[j] = arc_point(po, pd, no, nd, t)
@@ -290,12 +284,12 @@ def rdp_keep_mask(
         ixc = int(-1)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
         if ixe - ixs > 1:
             seg = polyline[ixe] - polyline[ixs]
-            sdes = wp.dot(seg, seg)
+            sdes = wp.length_sq(seg)
             for k in range(ixs + 1, ixe):
                 sd = float(0.0)  # noqa: UP018 — mutable; initialize before branching
                 if sdes <= RDP_LINE_EPS:
                     dvec = polyline[k] - polyline[ixs]
-                    sd = wp.dot(dvec, dvec)
+                    sd = wp.length_sq(dvec)
                 else:
                     sd = line_squared_distance(polyline[k], polyline[ixs], polyline[ixe], sdes)
                 # strict '>' inside update_argmax keeps the first argmax (Eigen maxCoeff)
@@ -343,7 +337,7 @@ def resample_interp(
         t = wp.float32(0.0)
         if denominator > 0.0:
             t = (x - cumulative_lengths[hi - 1]) / denominator
-        out_points[j] = polyline[hi - 1] + t * (polyline[hi] - polyline[hi - 1])
+        out_points[j] = wp.lerp(polyline[hi - 1], polyline[hi], t)
 
 
 @wp.kernel

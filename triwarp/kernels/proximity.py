@@ -215,9 +215,7 @@ def winding_number_tiled(
         return
 
     remaining = n_f - face_offset
-    count = remaining
-    if count > TILE_1D:
-        count = TILE_1D
+    count = wp.min(remaining, TILE_1D)
 
     p = query_points[int(q)]
     face_idx = face_offset + int(t)
@@ -336,7 +334,7 @@ def init_sphere_radii_support(
         out_not_converged[tid] = False
         return
 
-    out_radii[tid] = wp.dot(diff, diff) / denom
+    out_radii[tid] = wp.length_sq(diff) / denom
     out_not_converged[tid] = True
 
 
@@ -389,7 +387,7 @@ def step_sphere_shrink(
         out_not_converged[tid] = False
         return
 
-    new_r = wp.dot(diff, diff) / denom
+    new_r = wp.length_sq(diff) / denom
     out_radii[tid] = new_r
     out_centers[tid] = p + normals[tid] * new_r
     out_not_converged[tid] = old_radii[tid] - new_r >= convergence_threshold

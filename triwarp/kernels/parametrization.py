@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp import constants as twc
-from triwarp.kernels.array import cross2
+from triwarp.kernels.array import cross2, to_vec2d
 from triwarp.kernels.laplacian import squared_edge_lengths
 from triwarp.kernels.triangles import face_vertices
 
@@ -244,9 +244,7 @@ def arap_rest_edges(
     # Flattened rest positions: P0 = (0, 0), P1 = (|v0 - v1|, 0), P2 from the law of cosines.
     base = wp.sqrt(l2_2)
     p2x = (-l2_0 + l2_1 + l2_2) / (wp.float64(2.0) * base)
-    p2y_sq = l2_1 - p2x * p2x
-    if p2y_sq < wp.float64(0.0):
-        p2y_sq = wp.float64(0.0)
+    p2y_sq = wp.max(l2_1 - p2x * p2x, wp.float64(0.0))
     p1 = wp.vec2d(base, wp.float64(0.0))
     p2 = wp.vec2d(p2x, wp.sqrt(p2y_sq))
     # p_e = P_source - P_dest per igl edge, folded with c_e: e0 -> P1 - P2, e1 -> P2 (P0 = 0),
@@ -299,9 +297,9 @@ def arap_local_step(
     uv1 = uv[i1]
     uv2 = uv[i2]
     # UV edges in igl order e0:(1,2), e1:(2,0), e2:(0,1), promoted to float64.
-    u0 = wp.vec2d(wp.float64(uv1[0]) - wp.float64(uv2[0]), wp.float64(uv1[1]) - wp.float64(uv2[1]))
-    u1 = wp.vec2d(wp.float64(uv2[0]) - wp.float64(uv0[0]), wp.float64(uv2[1]) - wp.float64(uv0[1]))
-    u2 = wp.vec2d(wp.float64(uv0[0]) - wp.float64(uv1[0]), wp.float64(uv0[1]) - wp.float64(uv1[1]))
+    u0 = to_vec2d(uv1) - to_vec2d(uv2)
+    u1 = to_vec2d(uv2) - to_vec2d(uv0)
+    u2 = to_vec2d(uv0) - to_vec2d(uv1)
     w0 = rest_edges[f, 0]
     w1 = rest_edges[f, 1]
     w2 = rest_edges[f, 2]

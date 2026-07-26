@@ -27,7 +27,7 @@ def edge_midpoint(
 ) -> wp.vec3:
     v0 = vertices[unique_edges[e, 0]]
     v1 = vertices[unique_edges[e, 1]]
-    return (v0 + v1) * wp.float32(0.5)
+    return wp.lerp(v0, v1, wp.float32(0.5))
 
 
 @wp.kernel
@@ -133,15 +133,9 @@ def emit_size_faces(
     fv = wp.vec3i(faces[f * 3 + 0], faces[f * 3 + 1], faces[f * 3 + 2])
     mv = wp.vec3i(face_mid[f, 0], face_mid[f, 1], face_mid[f, 2])
 
-    s0 = wp.int32(0)
-    s1 = wp.int32(0)
-    s2 = wp.int32(0)
-    if mv[0] >= 0:
-        s0 = 1
-    if mv[1] >= 0:
-        s1 = 1
-    if mv[2] >= 0:
-        s2 = 1
+    s0 = wp.where(mv[0] >= 0, wp.int32(1), wp.int32(0))
+    s1 = wp.where(mv[1] >= 0, wp.int32(1), wp.int32(0))
+    s2 = wp.where(mv[2] >= 0, wp.int32(1), wp.int32(0))
     count = s0 + s1 + s2
 
     # Four output triangle slots; unused slots are marked invalid.
@@ -252,8 +246,8 @@ def _segments_dist_sq_d(p1: wp.vec3d, q1: wp.vec3d, p2: wp.vec3d, q2: wp.vec3d) 
     d1 = q1 - p1
     d2 = q2 - p2
     r = p1 - p2
-    aa = wp.dot(d1, d1)
-    ee = wp.dot(d2, d2)
+    aa = wp.length_sq(d1)
+    ee = wp.length_sq(d2)
     f = wp.dot(d2, r)
     s = wp.float64(0.0)
     t = wp.float64(0.0)
@@ -630,7 +624,7 @@ def collapse_candidates(
     # Choose the surviving vertex and its target position (features/corners stay put).
     s = u
     r = v
-    p = 0.5 * (vertices[u] + vertices[v])
+    p = wp.lerp(vertices[u], vertices[v], 0.5)
     reject = False
     if cu == CORNER_VERTEX and cv == CORNER_VERTEX:
         reject = True
@@ -639,7 +633,7 @@ def collapse_candidates(
         if is_boundary and cu == CREASE_VERTEX and cv == CREASE_VERTEX:
             s = u
             r = v
-            p = 0.5 * (vertices[u] + vertices[v])
+            p = wp.lerp(vertices[u], vertices[v], 0.5)
         else:
             reject = True
     elif cu >= CREASE_VERTEX:
@@ -774,7 +768,7 @@ def valence_flip_candidates(
     n1 = triangle_normal(
         vertices[faces[f1 * 3 + 0]], vertices[faces[f1 * 3 + 1]], vertices[faces[f1 * 3 + 2]]
     )
-    if wp.acos(wp.clamp(wp.dot(n0, n1), -1.0, 1.0)) > feature_angle:
+    if wp.acos(wp.dot(n0, n1)) > feature_angle:  # wp.acos auto-clamps to [-1, 1]
         return
     quad = _resolve_flip_quad_guarded(
         faces, adjacency_edges, unshared, sorted_edge_keys, key_base, wp.int32(k), f0, out_quad
@@ -789,18 +783,11 @@ def valence_flip_candidates(
         to_vec3d(vertices[a]), to_vec3d(vertices[b]), to_vec3d(vertices[c]), to_vec3d(vertices[d])
     ):
         return
-    ta = 6
-    if boundary_vertex[a]:
-        ta = 4
-    tb = 6
-    if boundary_vertex[b]:
-        tb = 4
-    tc = 6
-    if boundary_vertex[c]:
-        tc = 4
-    td = 6
-    if boundary_vertex[d]:
-        td = 4
+    # Target valence: 4 on the boundary, 6 in the interior.
+    ta = wp.where(boundary_vertex[a], 4, 6)
+    tb = wp.where(boundary_vertex[b], 4, 6)
+    tc = wp.where(boundary_vertex[c], 4, 6)
+    td = wp.where(boundary_vertex[d], 4, 6)
     va = valence[a]
     vb = valence[b]
     vc = valence[c]
