@@ -3,18 +3,60 @@ Kernels for wave-parallel ball-pivoting surface reconstruction.
 
 Ports the geometry of Open3D's ``SurfaceReconstructionBallPivoting.cpp`` (``ComputeBallCenter``,
 ``IsCompatible``, ``FindCandidateVertex``, ``TryTriangleSeed``) to Warp. Instead of the serial
-advancing front with a persistent edge structure, the front is recomputed from the current triangle
-soup each wave: front edges are the boundary edges (used by exactly one triangle), and manifoldness
-is protected by a sorted interior-edge-key guard (edges already used by two triangles may not gain a
-third). Every wave commits a conflict-free independent set of triangles through a two-phase
-vertex-claim / commit (``wp.atomic_min`` priority on all three vertices), so at least the
-globally-lowest-priority triangle always commits and the loop cannot livelock.
+advancing front, every wave pivots a conflict-free independent set of front edges at once and
+commits them through a two-phase vertex claim (``wp.atomic_min`` priority on all three vertices),
+so at least the globally-lowest-priority triangle always commits and the loop cannot livelock.
+
+Persistent state
+----------------
+Everything the algorithm needs lives in device buffers that survive the whole run, so a wave costs
+launches only — no allocations, no host readbacks, and nothing is re-derived from scratch:
+
+* **Edge table.** An open-addressed hash keyed by the undirected edge (``edge_key``), holding the
+  incident-face count, the single incident face's directed orientation (``edge_src`` / ``edge_tgt``
+  / ``edge_opp``) while the edge is on the boundary, a retirement flag and a cached best candidate.
+  ``commit_triangles`` is its only mutator. This replaces re-deriving the front from the whole
+  triangle soup each wave with ``edges_unique`` + a sorted interior-key array, and turns the
+  manifold guard from a binary search into one hash probe.
+* **Front list.** Edge-table slots of the boundary edges, compacted by ``pivot_front_edges`` into a
+  second buffer each wave (the caller ping-pongs them) and extended by ``commit_triangles`` with
+  the boundary edges the new triangles create.
+* **Per-point state.** ``point_used`` and ``boundary_degree`` are maintained incrementally by
+  ``commit_triangles``; a point is available as a pivot candidate iff it is unused or still has an
+  incident boundary edge.
+* **Counters.** One ``int32`` array (see the ``CNT_*`` slots) carries the face count, the front and
+  proposal counts, the seeding/continue/done flags and the wave number, so the wave loop's control
+  flow is device-resident and can run inside a captured graph.
+
+Border edges
+------------
+``pivot_front_edges`` retires a front edge whose search found no candidate (Open3D's
+``BallPivotingEdgeType::Border``) and never looks at it again. Measured on ``bunny``, 96% of all
+pivots in a run were re-tests of edges already known to be dead, rising to 100% in the tail.
+
+Retiring them is **output-preserving, not an approximation**, because every rejection in the
+candidate loop is monotone in the wave index:
+
+* the geometric tests (``compute_ball_center``, ``is_compatible``, ``ball_is_empty``, the crease
+  and clustering guards) depend only on the fixed points, normals and radius;
+* availability is sticky-false — a vertex that is used and has no incident boundary edge can never
+  gain another triangle, since seeding needs an unused point and pivoting needs an available
+  candidate, so it can never become available again;
+* the interior-edge guard only ever tightens: faces are appended and never removed, so an edge's
+  face count only grows.
+
+So the set of valid candidates for a given front edge shrinks monotonically. Two consequences are
+used here: an edge with no candidate can be retired, and — the other half of the same theorem — a
+**cached** best candidate is still the argmin as long as it is still valid, so an edge that found
+one but lost the vertex claim (most of them, every wave) is re-checked in O(1) instead of
+re-searched over its whole neighbourhood. An edge is retired only when the *search* failed, never
+when it merely lost the claim.
 """
 
 import warp as wp
 
-from triwarp.kernels.array import binary_search_sorted_contains
-from triwarp.kernels.grouping import pack_edge_key
+from triwarp.constants import INT32_MAX_CONSTANT
+from triwarp.kernels.grouping import hash_find, hash_find_or_insert, pack_edge_key
 from triwarp.kernels.predicates import triangle_normal as face_normal
 
 # Per-thread neighbour scratch for the seed search (Open3D re-scans the KNN result twice).
@@ -23,6 +65,24 @@ MAX_SEED_NEIGHBORS = 64
 # (exactly on the ball in exact arithmetic) do not spuriously read as "inside".
 BALL_EPS = wp.constant(wp.float32(1e-4))
 TWO_PI = wp.constant(2.0 * wp.PI)
+
+# ``counters`` slots. Keeping the wave loop's whole control state on device is what lets the loop
+# body run without a host synchronisation, and ultimately inside a captured CUDA graph.
+CNT_FACE = wp.constant(0)  # committed triangles so far
+CNT_PREV_FACE = wp.constant(1)  # ... as of the start of this wave (the progress test)
+CNT_FRONT = wp.constant(2)  # entries in the incoming front list
+CNT_NEXT_FRONT = wp.constant(3)  # entries written to the outgoing front list
+CNT_LIVE = wp.constant(4)  # of those, how many were live (drives host-side compaction)
+CNT_PROPOSAL = wp.constant(5)  # triangles proposed this wave
+CNT_SEEDING = wp.constant(6)  # this wave seeds orphans instead of pivoting
+CNT_CONTINUE = wp.constant(7)  # the wave loop's condition
+CNT_DONE = wp.constant(8)  # the loop finished for good (as opposed to pausing to grow)
+CNT_WAVE = wp.constant(9)  # waves executed
+CNT_GROW = wp.constant(10)  # the triangle budget is exhausted; hand back to the host
+BPA_COUNTERS = 11
+
+EDGE_LIVE = wp.constant(0)
+EDGE_RETIRED = wp.constant(1)
 
 
 @wp.func
@@ -96,6 +156,46 @@ def ball_is_empty(
 
 
 @wp.kernel(enable_backward=False)
+def begin_wave(counters: wp.array(dtype=wp.int32)) -> None:
+    # Reset the per-wave counters and snapshot the face count the progress test compares against.
+    # The vertex claim is *not* cleared here: ``propose_triangle`` clears the three vertices it is
+    # about to contend for, which is the only part of an n-sized array a wave ever reads.
+    if counters[CNT_CONTINUE] == 0:
+        return
+    counters[CNT_NEXT_FRONT] = 0
+    counters[CNT_LIVE] = 0
+    counters[CNT_PROPOSAL] = 0
+    counters[CNT_PREV_FACE] = counters[CNT_FACE]
+
+
+@wp.func
+def propose_triangle(
+    a: wp.int32,
+    b: wp.int32,
+    c: wp.int32,
+    counters: wp.array(dtype=wp.int32),
+    out_owner: wp.array(dtype=wp.int32),
+    out_a: wp.array(dtype=wp.int32),
+    out_b: wp.array(dtype=wp.int32),
+    out_c: wp.array(dtype=wp.int32),
+) -> None:
+    # Append a candidate triangle to this wave's proposal list. Both the seed and the pivot path
+    # write here, so the claim and commit kernels have a single dense list to walk.
+    #
+    # Releasing the three vertices for this wave's claim happens here rather than in a sweep over
+    # all n: only a proposed vertex is ever read back, and two proposals sharing a vertex write the
+    # same sentinel. That removes an n-wide launch from every wave, which on a small cloud was most
+    # of the wave.
+    out_owner[a] = INT32_MAX_CONSTANT
+    out_owner[b] = INT32_MAX_CONSTANT
+    out_owner[c] = INT32_MAX_CONSTANT
+    slot = wp.atomic_add(counters, CNT_PROPOSAL, 1)
+    out_a[slot] = a
+    out_b[slot] = b
+    out_c[slot] = c
+
+
+@wp.kernel(enable_backward=False)
 def seed_triangles(
     points: wp.array(dtype=wp.vec3),
     normals: wp.array(dtype=wp.vec3),
@@ -103,14 +203,15 @@ def seed_triangles(
     grid_id: wp.uint64,
     radius: wp.float32,
     clustering: wp.float32,
+    counters: wp.array(dtype=wp.int32),
+    out_owner: wp.array(dtype=wp.int32),
     out_a: wp.array(dtype=wp.int32),
     out_b: wp.array(dtype=wp.int32),
     out_c: wp.array(dtype=wp.int32),
 ) -> None:
+    if counters[CNT_CONTINUE] == 0 or counters[CNT_SEEDING] == 0:
+        return
     p = int(wp.tid())
-    out_a[p] = -1
-    out_b[p] = -1
-    out_c[p] = -1
     if point_used[p]:
         return
 
@@ -147,87 +248,241 @@ def seed_triangles(
             ):
                 continue
             if ball_is_empty(grid_id, points, center, radius, p, a, b):
-                out_a[p] = p
-                out_b[p] = a
-                out_c[p] = b
+                propose_triangle(p, a, b, counters, out_owner, out_a, out_b, out_c)
                 return
+
+
+@wp.func
+def point_is_available(
+    p: wp.int32, point_used: wp.array(dtype=wp.bool), boundary_degree: wp.array(dtype=wp.int32)
+) -> bool:
+    # Orphan, or still on the advancing front. A used point with no incident boundary edge is
+    # fully interior and can never be pivoted onto again — which is what makes retirement sound.
+    return (not point_used[p]) or boundary_degree[p] > 0
+
+
+@wp.func
+def edge_is_interior(
+    u: wp.int32,
+    v: wp.int32,
+    key_base: wp.uint64,
+    edge_key: wp.array(dtype=wp.uint64),
+    edge_count: wp.array(dtype=wp.int32),
+    edge_mask: wp.int32,
+) -> bool:
+    # Manifold guard: an edge already shared by two triangles may not gain a third. One hash probe,
+    # where the previous design needed a binary search into a freshly sorted key array.
+    slot = hash_find(pack_edge_key(u, v, key_base), edge_key, edge_mask)
+    return slot >= 0 and edge_count[slot] >= 2
+
+
+@wp.func
+def candidate_prefilter(
+    points: wp.array(dtype=wp.vec3),
+    p_src: wp.vec3,
+    p_tgt: wp.vec3,
+    src: wp.int32,
+    tgt: wp.int32,
+    opp: wp.int32,
+    c: wp.int32,
+    min_cluster_sq: wp.float32,
+    point_used: wp.array(dtype=wp.bool),
+    boundary_degree: wp.array(dtype=wp.int32),
+) -> bool:
+    # The cheap half of the candidate test: identity, availability and vcglib clustering. Compared
+    # squared, since this runs once per point the grid hands back.
+    if c == src or c == tgt or c == opp:
+        return False
+    if not point_is_available(c, point_used, boundary_degree):
+        return False
+    p_c = points[c]
+    if wp.length_sq(p_c - p_src) < min_cluster_sq:
+        return False
+    return wp.length_sq(p_c - p_tgt) >= min_cluster_sq
+
+
+@wp.func
+def candidate_accepted(
+    points: wp.array(dtype=wp.vec3),
+    normals: wp.array(dtype=wp.vec3),
+    p_src: wp.vec3,
+    p_tgt: wp.vec3,
+    tri_norm: wp.vec3,
+    src: wp.int32,
+    tgt: wp.int32,
+    c: wp.int32,
+    center: wp.vec3,
+    grid_id: wp.uint64,
+    radius: wp.float32,
+    crease_cos: wp.float32,
+    key_base: wp.uint64,
+    edge_key: wp.array(dtype=wp.uint64),
+    edge_count: wp.array(dtype=wp.int32),
+    edge_mask: wp.int32,
+) -> bool:
+    # The expensive half: crease, manifoldness, normal compatibility and the empty-ball test, in
+    # increasing order of cost. Shared verbatim between the full search and the O(1) re-validation
+    # of a cached candidate, so the two can never disagree about what a valid candidate is.
+    #
+    # ``tri_norm`` (the pivoting triangle's normal) is loop-invariant and passed in.
+    if (
+        crease_cos > -1.0
+        and wp.abs(wp.dot(tri_norm, face_normal(p_src, p_tgt, points[c]))) < crease_cos
+    ):
+        return False
+    if edge_is_interior(src, c, key_base, edge_key, edge_count, edge_mask):
+        return False
+    if edge_is_interior(tgt, c, key_base, edge_key, edge_count, edge_mask):
+        return False
+    if not is_compatible(p_src, p_tgt, points[c], normals[src], normals[tgt], normals[c]):
+        return False
+    return ball_is_empty(grid_id, points, center, radius, src, tgt, c)
 
 
 @wp.kernel(enable_backward=False)
 def pivot_front_edges(
     points: wp.array(dtype=wp.vec3),
     normals: wp.array(dtype=wp.vec3),
-    front_src: wp.array(dtype=wp.int32),
-    front_tgt: wp.array(dtype=wp.int32),
-    front_opp: wp.array(dtype=wp.int32),
-    point_available: wp.array(dtype=wp.bool),
     grid_id: wp.uint64,
     radius: wp.float32,
     clustering: wp.float32,
     crease_cos: wp.float32,
-    interior_keys: wp.array(dtype=wp.uint64),
     key_base: wp.uint64,
-    out_candidate: wp.array(dtype=wp.int32),
+    edge_key: wp.array(dtype=wp.uint64),
+    edge_count: wp.array(dtype=wp.int32),
+    edge_src: wp.array(dtype=wp.int32),
+    edge_tgt: wp.array(dtype=wp.int32),
+    edge_opp: wp.array(dtype=wp.int32),
+    edge_state: wp.array(dtype=wp.int32),
+    edge_cand: wp.array(dtype=wp.int32),
+    edge_mask: wp.int32,
+    point_used: wp.array(dtype=wp.bool),
+    boundary_degree: wp.array(dtype=wp.int32),
+    front_in: wp.array(dtype=wp.int32),
+    grid_stride: wp.int32,
+    counters: wp.array(dtype=wp.int32),
+    out_owner: wp.array(dtype=wp.int32),
+    front_out: wp.array(dtype=wp.int32),
+    out_a: wp.array(dtype=wp.int32),
+    out_b: wp.array(dtype=wp.int32),
+    out_c: wp.array(dtype=wp.int32),
 ) -> None:
-    e = int(wp.tid())
-    out_candidate[e] = -1
-    src = front_src[e]
-    tgt = front_tgt[e]
-    opp = front_opp[e]
-    p_src = points[src]
-    p_tgt = points[tgt]
-
-    center = compute_ball_center(
-        p_src, p_tgt, points[opp], normals[src] + normals[tgt] + normals[opp], radius
-    )
-    if center[0] == wp.inf:
+    if counters[CNT_CONTINUE] == 0:
         return
+    # Grid-stride over the front so the launch dimension is a fixed constant — a hard requirement
+    # for capturing the wave loop as a CUDA graph, and it also keeps the cost proportional to the
+    # front rather than to its high-water mark.
+    seeding = counters[CNT_SEEDING] != 0
+    min_cluster_sq = (clustering * radius) * (clustering * radius)
+    for i in range(int(wp.tid()), counters[CNT_FRONT], grid_stride):
+        slot = front_in[i]
+        # An edge leaves the front for good when a second face closes it or its search failed.
+        if edge_count[slot] != 1 or edge_state[slot] != EDGE_LIVE:
+            continue
+        position = wp.atomic_add(counters, CNT_NEXT_FRONT, 1)
+        front_out[position] = slot
+        wp.atomic_add(counters, CNT_LIVE, 1)
+        if seeding:
+            continue  # a seeding wave only carries the front forward
 
-    mp = wp.lerp(p_src, p_tgt, 0.5)
-    axis = wp.normalize(p_tgt - p_src)
-    a_dir = wp.normalize(center - mp)
-    tri_norm = face_normal(p_src, p_tgt, points[opp])
-    min_cluster = clustering * radius
+        src = edge_src[slot]
+        tgt = edge_tgt[slot]
+        opp = edge_opp[slot]
+        p_src = points[src]
+        p_tgt = points[tgt]
+        tri_norm = face_normal(p_src, p_tgt, points[opp])
 
-    best_angle = TWO_PI
-    best = int(-1)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
-    query = wp.hash_grid_query(grid_id, mp, 2.0 * radius)
-    c = wp.int32(-1)
-    while wp.hash_grid_query_next(query, c):
-        if c == src or c == tgt or c == opp:
-            continue
-        if not point_available[c]:
-            continue  # skip fully-interior (Inner) vertices: prevents overlapping sheets
-        if wp.length(points[c] - p_src) < min_cluster or wp.length(points[c] - p_tgt) < min_cluster:
-            continue
-        new_center = compute_ball_center(
-            p_src, p_tgt, points[c], normals[src] + normals[tgt] + normals[c], radius
-        )
-        if new_center[0] == wp.inf:
-            continue
-        b_dir = wp.normalize(new_center - mp)
-        angle = wp.acos(wp.dot(a_dir, b_dir))  # wp.acos auto-clamps to [-1, 1]
-        if wp.dot(wp.cross(a_dir, b_dir), axis) < 0.0:
-            angle = TWO_PI - angle
-        if angle >= best_angle:
-            continue
-        # Crease guard: reject if the new triangle folds too sharply against the current one.
-        if crease_cos > -1.0:
-            cand_norm = face_normal(p_src, p_tgt, points[c])
-            if wp.abs(wp.dot(tri_norm, cand_norm)) < crease_cos:
+        # Re-validate the cached argmin first. It stays the argmin while it stays valid (the
+        # candidate set only shrinks), and ~75-80% of front edges lose the vertex claim each wave
+        # and come back here unchanged, so this is the difference between three hash probes and a
+        # full neighbourhood search.
+        cached = edge_cand[slot]
+        if cached >= 0 and candidate_prefilter(
+            points, p_src, p_tgt, src, tgt, opp, cached, min_cluster_sq, point_used, boundary_degree
+        ):
+            cached_center = compute_ball_center(
+                p_src, p_tgt, points[cached], normals[src] + normals[tgt] + normals[cached], radius
+            )
+            if cached_center[0] != wp.inf and candidate_accepted(
+                points,
+                normals,
+                p_src,
+                p_tgt,
+                tri_norm,
+                src,
+                tgt,
+                cached,
+                cached_center,
+                grid_id,
+                radius,
+                crease_cos,
+                key_base,
+                edge_key,
+                edge_count,
+                edge_mask,
+            ):
+                propose_triangle(src, tgt, cached, counters, out_owner, out_a, out_b, out_c)
                 continue
-        # Manifold guard: neither new edge may already be an interior (2-face) edge.
-        if binary_search_sorted_contains(interior_keys, pack_edge_key(src, c, key_base)):
+
+        center = compute_ball_center(
+            p_src, p_tgt, points[opp], normals[src] + normals[tgt] + normals[opp], radius
+        )
+        if center[0] == wp.inf:
+            edge_state[slot] = EDGE_RETIRED
             continue
-        if binary_search_sorted_contains(interior_keys, pack_edge_key(tgt, c, key_base)):
-            continue
-        if not is_compatible(p_src, p_tgt, points[c], normals[src], normals[tgt], normals[c]):
-            continue
-        if not ball_is_empty(grid_id, points, new_center, radius, src, tgt, c):
-            continue
-        best_angle = angle
-        best = c
-    out_candidate[e] = best
+
+        mp = wp.lerp(p_src, p_tgt, 0.5)
+        axis = wp.normalize(p_tgt - p_src)
+        a_dir = wp.normalize(center - mp)
+
+        best_angle = TWO_PI
+        best = wp.int32(-1)
+        query = wp.hash_grid_query(grid_id, mp, 2.0 * radius)
+        c = wp.int32(-1)
+        while wp.hash_grid_query_next(query, c):
+            if not candidate_prefilter(
+                points, p_src, p_tgt, src, tgt, opp, c, min_cluster_sq, point_used, boundary_degree
+            ):
+                continue
+            new_center = compute_ball_center(
+                p_src, p_tgt, points[c], normals[src] + normals[tgt] + normals[c], radius
+            )
+            if new_center[0] == wp.inf:
+                continue
+            b_dir = wp.normalize(new_center - mp)
+            angle = wp.acos(wp.dot(a_dir, b_dir))  # wp.acos auto-clamps to [-1, 1]
+            if wp.dot(wp.cross(a_dir, b_dir), axis) < 0.0:
+                angle = TWO_PI - angle
+            # Order matters: reject a non-improving candidate before the expensive tests.
+            if angle >= best_angle:
+                continue
+            if not candidate_accepted(
+                points,
+                normals,
+                p_src,
+                p_tgt,
+                tri_norm,
+                src,
+                tgt,
+                c,
+                new_center,
+                grid_id,
+                radius,
+                crease_cos,
+                key_base,
+                edge_key,
+                edge_count,
+                edge_mask,
+            ):
+                continue
+            best_angle = angle
+            best = c
+
+        edge_cand[slot] = best
+        if best < 0:
+            edge_state[slot] = EDGE_RETIRED  # provably impossible; see the module docstring
+        else:
+            propose_triangle(src, tgt, best, counters, out_owner, out_a, out_b, out_c)
 
 
 @wp.kernel(enable_backward=False)
@@ -235,16 +490,55 @@ def claim_triangle_vertices(
     tri_a: wp.array(dtype=wp.int32),
     tri_b: wp.array(dtype=wp.int32),
     tri_c: wp.array(dtype=wp.int32),
-    active: wp.array(dtype=wp.bool),
+    grid_stride: wp.int32,
+    counters: wp.array(dtype=wp.int32),
     out_owner: wp.array(dtype=wp.int32),
 ) -> None:
     # Priority claim (lowest index wins) on all three vertices of each proposed triangle.
-    t = int(wp.tid())
-    if not active[t]:
+    if counters[CNT_CONTINUE] == 0:
         return
-    wp.atomic_min(out_owner, tri_a[t], t)
-    wp.atomic_min(out_owner, tri_b[t], t)
-    wp.atomic_min(out_owner, tri_c[t], t)
+    for t in range(int(wp.tid()), counters[CNT_PROPOSAL], grid_stride):
+        wp.atomic_min(out_owner, tri_a[t], t)
+        wp.atomic_min(out_owner, tri_b[t], t)
+        wp.atomic_min(out_owner, tri_c[t], t)
+
+
+@wp.func
+def register_face_edge(
+    u: wp.int32,
+    v: wp.int32,
+    opp: wp.int32,
+    key_base: wp.uint64,
+    edge_mask: wp.int32,
+    edge_key: wp.array(dtype=wp.uint64),
+    edge_count: wp.array(dtype=wp.int32),
+    edge_src: wp.array(dtype=wp.int32),
+    edge_tgt: wp.array(dtype=wp.int32),
+    edge_opp: wp.array(dtype=wp.int32),
+    edge_cand: wp.array(dtype=wp.int32),
+    boundary_degree: wp.array(dtype=wp.int32),
+    counters: wp.array(dtype=wp.int32),
+    front_out: wp.array(dtype=wp.int32),
+) -> None:
+    # Fold one edge of a just-committed triangle into the persistent state.
+    #
+    # A wave's committed triangles are vertex-disjoint (that is exactly what the ``owner`` claim
+    # buys), so they share no edge and no vertex: within a wave each edge slot is touched by one
+    # thread. The atomics still make it safe, but the count transitions are unambiguous — 0 -> 1
+    # means a new boundary edge, 1 -> 2 means one just closed.
+    slot = hash_find_or_insert(pack_edge_key(u, v, key_base), edge_key, edge_mask)
+    previous = wp.atomic_add(edge_count, slot, 1)
+    if previous == 0:
+        edge_src[slot] = u
+        edge_tgt[slot] = v
+        edge_opp[slot] = opp
+        edge_cand[slot] = -1
+        front_out[wp.atomic_add(counters, CNT_NEXT_FRONT, 1)] = slot
+        wp.atomic_add(boundary_degree, u, 1)
+        wp.atomic_add(boundary_degree, v, 1)
+    elif previous == 1:
+        wp.atomic_add(boundary_degree, u, -1)
+        wp.atomic_add(boundary_degree, v, -1)
 
 
 @wp.kernel(enable_backward=False)
@@ -252,78 +546,154 @@ def commit_triangles(
     tri_a: wp.array(dtype=wp.int32),
     tri_b: wp.array(dtype=wp.int32),
     tri_c: wp.array(dtype=wp.int32),
-    active: wp.array(dtype=wp.bool),
     owner: wp.array(dtype=wp.int32),
     max_faces: wp.int32,
-    out_faces: wp.array(dtype=wp.int32),
-    out_count: wp.array(dtype=wp.int32),
-) -> None:
-    # A proposed triangle commits only if it owns all three of its vertices this wave.
-    t = int(wp.tid())
-    if not active[t]:
-        return
-    a = tri_a[t]
-    b = tri_b[t]
-    c = tri_c[t]
-    if owner[a] != t or owner[b] != t or owner[c] != t:
-        return
-    slot = wp.atomic_add(out_count, 0, 1)
-    if slot >= max_faces:
-        return
-    out_faces[slot * 3 + 0] = a
-    out_faces[slot * 3 + 1] = b
-    out_faces[slot * 3 + 2] = c
-
-
-@wp.kernel
-def mark_front_endpoints(
-    front_src: wp.array(dtype=wp.int32),
-    front_tgt: wp.array(dtype=wp.int32),
-    out_available: wp.array(dtype=wp.bool),
-) -> None:
-    e = int(wp.tid())
-    out_available[front_src[e]] = True
-    out_available[front_tgt[e]] = True
-
-
-@wp.kernel
-def emit_front_edges(
-    faces: wp.array(dtype=wp.int32),
-    inverse: wp.array(dtype=wp.int32),
-    edge_face_count: wp.array(dtype=wp.int32),
-    out_src: wp.array(dtype=wp.int32),
-    out_tgt: wp.array(dtype=wp.int32),
-    out_opp: wp.array(dtype=wp.int32),
-    out_count: wp.array(dtype=wp.int32),
-) -> None:
-    # One directed front edge per boundary (single-use) undirected edge, with its opposite vertex.
-    corner = int(wp.tid())
-    if edge_face_count[inverse[corner]] != 1:
-        return
-    f = corner / 3
-    i = corner % 3
-    a = faces[f * 3 + i]
-    b = faces[f * 3 + (i + 1) % 3]
-    opp = faces[f * 3 + (i + 2) % 3]
-    slot = wp.atomic_add(out_count, 0, 1)
-    out_src[slot] = a
-    out_tgt[slot] = b
-    out_opp[slot] = opp
-
-
-@wp.kernel
-def mark_interior_edge_keys(
-    unique_edges: wp.array2d(dtype=wp.int32),
-    edge_face_count: wp.array(dtype=wp.int32),
     key_base: wp.uint64,
-    out_flag: wp.array(dtype=wp.int32),
-    out_key: wp.array(dtype=wp.uint64),
+    edge_mask: wp.int32,
+    grid_stride: wp.int32,
+    edge_key: wp.array(dtype=wp.uint64),
+    edge_count: wp.array(dtype=wp.int32),
+    edge_src: wp.array(dtype=wp.int32),
+    edge_tgt: wp.array(dtype=wp.int32),
+    edge_opp: wp.array(dtype=wp.int32),
+    edge_cand: wp.array(dtype=wp.int32),
+    point_used: wp.array(dtype=wp.bool),
+    boundary_degree: wp.array(dtype=wp.int32),
+    counters: wp.array(dtype=wp.int32),
+    front_out: wp.array(dtype=wp.int32),
+    out_faces: wp.array(dtype=wp.int32),
 ) -> None:
-    # Flag (1) and key each undirected edge already used by two faces (an interior edge).
-    e = int(wp.tid())
-    if edge_face_count[e] >= 2:
-        out_flag[e] = 1
-        out_key[e] = pack_edge_key(unique_edges[e, 0], unique_edges[e, 1], key_base)
+    # The single mutator of the persistent state: a proposal that owns all three of its vertices
+    # this wave becomes a triangle, and the same thread folds it into the face buffer, the used
+    # mask, the edge table, the boundary degrees and the outgoing front.
+    if counters[CNT_CONTINUE] == 0:
+        return
+    for t in range(int(wp.tid()), counters[CNT_PROPOSAL], grid_stride):
+        a = tri_a[t]
+        b = tri_b[t]
+        c = tri_c[t]
+        if owner[a] != t or owner[b] != t or owner[c] != t:
+            continue
+        if counters[CNT_FACE] >= max_faces:
+            # Out of budget. Nothing is mutated, so the front edge keeps its cached candidate and
+            # is simply re-proposed after the caller grows the buffer — no triangle is lost.
+            counters[CNT_GROW] = 1
+            continue
+        slot = wp.atomic_add(counters, CNT_FACE, 1)
+        if slot >= max_faces:
+            counters[CNT_GROW] = 1
+            continue
+
+        out_faces[slot * 3 + 0] = a
+        out_faces[slot * 3 + 1] = b
+        out_faces[slot * 3 + 2] = c
+        point_used[a] = True
+        point_used[b] = True
+        point_used[c] = True
+        register_face_edge(
+            a, b, c, key_base, edge_mask, edge_key, edge_count, edge_src, edge_tgt, edge_opp,
+            edge_cand, boundary_degree, counters, front_out,
+        )  # fmt: skip
+        register_face_edge(
+            b, c, a, key_base, edge_mask, edge_key, edge_count, edge_src, edge_tgt, edge_opp,
+            edge_cand, boundary_degree, counters, front_out,
+        )  # fmt: skip
+        register_face_edge(
+            c, a, b, key_base, edge_mask, edge_key, edge_count, edge_src, edge_tgt, edge_opp,
+            edge_cand, boundary_degree, counters, front_out,
+        )  # fmt: skip
+
+
+@wp.kernel(enable_backward=False)
+def end_wave(max_waves: wp.int32, counters: wp.array(dtype=wp.int32)) -> None:
+    # Advance the device-resident wave state and decide whether the loop keeps going.
+    #
+    # A wave either pivots the current front or seeds orphans; seeding runs whenever the previous
+    # wave committed nothing, which is also the termination test — a stalled pivot followed by a
+    # stalled seed means there is nothing left to do.
+    if counters[CNT_CONTINUE] == 0:
+        return
+    counters[CNT_FRONT] = counters[CNT_NEXT_FRONT]
+    counters[CNT_WAVE] = counters[CNT_WAVE] + 1
+    if counters[CNT_FACE] == counters[CNT_PREV_FACE]:
+        if counters[CNT_SEEDING] != 0:
+            counters[CNT_DONE] = 1
+            counters[CNT_CONTINUE] = 0
+        else:
+            counters[CNT_SEEDING] = 1
     else:
-        out_flag[e] = 0
-        out_key[e] = wp.uint64(0)
+        counters[CNT_SEEDING] = 0
+    # Hand control back to the host to grow the triangle budget, to compact a front that has
+    # accumulated too many retired entries, or because the wave cap was hit.
+    if counters[CNT_GROW] != 0 or counters[CNT_WAVE] >= max_waves:
+        counters[CNT_CONTINUE] = 0
+    elif counters[CNT_NEXT_FRONT] > 4 * counters[CNT_LIVE] + 1024:
+        counters[CNT_CONTINUE] = 0
+
+
+@wp.kernel(enable_backward=False)
+def compact_front(
+    front_in: wp.array(dtype=wp.int32),
+    edge_count: wp.array(dtype=wp.int32),
+    edge_state: wp.array(dtype=wp.int32),
+    grid_stride: wp.int32,
+    counters: wp.array(dtype=wp.int32),
+    front_out: wp.array(dtype=wp.int32),
+) -> None:
+    # Drop closed and retired edges from the front. ``pivot_front_edges`` already does this as a
+    # side effect, but a long run of seeding waves (which carry the front forward untouched) or a
+    # burst of commits can still leave it sparse; the caller runs this when it does.
+    for i in range(int(wp.tid()), counters[CNT_FRONT], grid_stride):
+        slot = front_in[i]
+        if edge_count[slot] == 1 and edge_state[slot] == EDGE_LIVE:
+            front_out[wp.atomic_add(counters, CNT_NEXT_FRONT, 1)] = slot
+
+
+@wp.kernel(enable_backward=False)
+def rehash_edges(
+    old_key: wp.array(dtype=wp.uint64),
+    old_count: wp.array(dtype=wp.int32),
+    old_src: wp.array(dtype=wp.int32),
+    old_tgt: wp.array(dtype=wp.int32),
+    old_opp: wp.array(dtype=wp.int32),
+    old_state: wp.array(dtype=wp.int32),
+    old_cand: wp.array(dtype=wp.int32),
+    new_mask: wp.int32,
+    new_key: wp.array(dtype=wp.uint64),
+    new_count: wp.array(dtype=wp.int32),
+    new_src: wp.array(dtype=wp.int32),
+    new_tgt: wp.array(dtype=wp.int32),
+    new_opp: wp.array(dtype=wp.int32),
+    new_state: wp.array(dtype=wp.int32),
+    new_cand: wp.array(dtype=wp.int32),
+) -> None:
+    # Re-insert every occupied slot into a larger table when the triangle budget grows. Slot
+    # indices change, so the caller rebuilds the front list from the new table afterwards.
+    h = int(wp.tid())
+    stored = old_key[h]
+    if stored == wp.uint64(0):
+        return
+    key = stored - wp.uint64(1)  # undo ``encode_key``: 0 is the empty sentinel
+    slot = hash_find_or_insert(key, new_key, new_mask)
+    new_count[slot] = old_count[h]
+    new_src[slot] = old_src[h]
+    new_tgt[slot] = old_tgt[h]
+    new_opp[slot] = old_opp[h]
+    new_state[slot] = old_state[h]
+    new_cand[slot] = old_cand[h]
+
+
+@wp.kernel(enable_backward=False)
+def collect_front_from_table(
+    edge_key: wp.array(dtype=wp.uint64),
+    edge_count: wp.array(dtype=wp.int32),
+    edge_state: wp.array(dtype=wp.int32),
+    counters: wp.array(dtype=wp.int32),
+    out_front: wp.array(dtype=wp.int32),
+) -> None:
+    # Rebuild the front list by scanning the edge table, after a rehash has moved every slot.
+    h = int(wp.tid())
+    if edge_key[h] == wp.uint64(0):
+        return
+    if edge_count[h] == 1 and edge_state[h] == EDGE_LIVE:
+        out_front[wp.atomic_add(counters, CNT_NEXT_FRONT, 1)] = h

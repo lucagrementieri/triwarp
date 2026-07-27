@@ -1,6 +1,22 @@
 import warp as wp
 
+from triwarp.constants import FLOAT32_INF_CONSTANT
 from triwarp.kernels import array as kernel_array
+
+# Iterative-deepening k-nearest search. A scan at cube half-extent ``r`` enumerates every point
+# within Euclidean distance ``r`` (Chebyshev distance never exceeds Euclidean), so a row whose
+# k-th distance is at most ``r`` is provably the exact k-NN and the loop can stop.
+#
+# The loop is a bounded ``for``, never a ``while``: with a NaN query every comparison is false and
+# ``r * RADIUS_GROWTH`` stays NaN, which would hang the device. The last attempt is forced to the
+# complete radius, which makes termination unconditional and the result exact regardless.
+#
+# The attempt budget is generous because growth is geometric: the doublings before the successful
+# scan sum to less than that scan costs, so a spare attempt is nearly free — whereas running *out*
+# of attempts forces the complete scan, which is the whole-cloud brute force this change exists to
+# avoid. 16 doublings cover a query 3 x 10^4 spacings away from the cloud.
+MAX_SEARCH_ATTEMPTS = wp.constant(wp.int32(16))
+RADIUS_GROWTH = wp.constant(wp.float32(2.0))
 
 
 @wp.func
@@ -217,27 +233,133 @@ def knn_sorted_insert(
     kernel_array.array_shift_insert(out_indices_row, point_index, slot)
 
 
+@wp.func
+def knn_reset_row(
+    k: wp.int32, out_indices_row: wp.array[wp.int32], out_distances_row: wp.array[wp.float32]
+) -> None:
+    # Every scan starts from an empty row. ``knn_sorted_insert`` does not deduplicate, so a
+    # re-scan over a wider radius would otherwise insert each already-found point a second time.
+    for i in range(k):
+        out_indices_row[i] = wp.int32(-1)
+        out_distances_row[i] = FLOAT32_INF_CONSTANT
+
+
+@wp.func
+def complete_radius(q: wp.vec3, min_bound: wp.vec3, max_bound: wp.vec3) -> wp.float32:
+    # Smallest cube half-extent about ``q`` that contains the whole point bounding box, i.e. the
+    # radius at which a scan is provably complete. Per-query, so it is tighter than a global
+    # diagonal, and unbounded for a query far outside the box (which is what keeps that case exact).
+    lower = q - min_bound
+    upper = max_bound - q
+    r = wp.max(lower[0], upper[0])
+    r = wp.max(r, wp.max(lower[1], upper[1]))
+    return wp.max(r, wp.max(lower[2], upper[2]))
+
+
+@wp.func
+def knn_bvh_scan(
+    points: wp.array[wp.vec3],
+    bvh_id: wp.uint64,
+    q: wp.vec3,
+    k: wp.int32,
+    max_radius: wp.float32,
+    r: wp.float32,
+    out_indices_row: wp.array[wp.int32],
+    out_distances_row: wp.array[wp.float32],
+) -> wp.float32:
+    # Refill the row from the cube ``[q +/- r]`` and return the k-th best distance (``inf`` when
+    # fewer than ``k`` points were accepted). Acceptance stays ``d <= max_radius``; ``r`` bounds
+    # only the enumeration.
+    knn_reset_row(k, out_indices_row, out_distances_row)
+    lower = q - wp.vec3(r)  # wp.vec3(scalar) broadcasts the scalar to every component
+    upper = q + wp.vec3(r)
+    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
+    point_index = wp.int32(0)
+    while wp.bvh_query_next(query, point_index):
+        d = wp.length(points[point_index] - q)
+        knn_sorted_insert(point_index, d, k, max_radius, out_indices_row, out_distances_row)
+    return out_distances_row[k - 1]
+
+
 @wp.kernel
 def query_bvh_nearest_neighbors(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3],
     bvh_id: wp.uint64,
     k: wp.int32,
-    radius: wp.float32,
+    max_radius: wp.float32,
+    initial_radius: wp.float32,
+    min_bound: wp.vec3,
+    max_bound: wp.vec3,
     out_indices: wp.array2d[wp.int32],
     out_distances: wp.array2d[wp.float32],
 ) -> None:
     tid = wp.tid()
     q = queries[tid]
-    r = radius
-    lower = q - wp.vec3(r)  # wp.vec3(scalar) broadcasts the scalar to every component
-    upper = q + wp.vec3(r)
-    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    point_index = wp.int32(0)
+    out_indices_row = out_indices[tid]
+    out_distances_row = out_distances[tid]
 
-    while wp.bvh_query_next(query, point_index):
+    r_hard = wp.min(max_radius, complete_radius(q, min_bound, max_bound))
+    r = wp.min(initial_radius, r_hard)
+    # Exactly one ``wp.bvh_query_aabb`` call site in this kernel: ``bvh_query`` declares
+    # ``__shared__ int stack[32 * WP_TILE_BLOCK_DIM]`` (32 KB at block_dim=256), so a second
+    # textual call site would ask for 64 KB and fail to compile.
+    for attempt in range(MAX_SEARCH_ATTEMPTS):
+        if attempt == MAX_SEARCH_ATTEMPTS - 1:
+            r = r_hard  # forced-complete final attempt: exact whatever the growth did
+        worst = knn_bvh_scan(
+            points, bvh_id, q, k, max_radius, r, out_indices_row, out_distances_row
+        )
+        if worst <= r:
+            break  # every point outside the cube is farther than the k-th best: certified exact
+        if r >= r_hard:
+            break  # the scan was already complete, so the row is final
+        if worst < FLOAT32_INF_CONSTANT:
+            # The row is full but reaches past the cube. Re-scanning at exactly ``worst`` is
+            # guaranteed to certify, so this costs at most one more pass.
+            r = wp.min(worst, r_hard)
+        else:
+            r = wp.min(r * RADIUS_GROWTH, r_hard)
+
+
+@wp.func
+def knn_hashgrid_scan(
+    points: wp.array[wp.vec3],
+    grid_id: wp.uint64,
+    q: wp.vec3,
+    k: wp.int32,
+    max_radius: wp.float32,
+    r: wp.float32,
+    out_indices_row: wp.array[wp.int32],
+    out_distances_row: wp.array[wp.float32],
+) -> wp.float32:
+    # Hash-grid twin of ``knn_bvh_scan``; ``wp.hash_grid_query`` enumerates every cell overlapping
+    # ``[q +/- r]``, so the same "k-th distance <= r certifies" argument applies.
+    knn_reset_row(k, out_indices_row, out_distances_row)
+    query = wp.hash_grid_query(grid_id, q, r)
+    point_index = wp.int32(-1)
+    while wp.hash_grid_query_next(query, point_index):
         d = wp.length(points[point_index] - q)
-        knn_sorted_insert(point_index, d, k, radius, out_indices[tid], out_distances[tid])
+        knn_sorted_insert(point_index, d, k, max_radius, out_indices_row, out_distances_row)
+    return out_distances_row[k - 1]
+
+
+@wp.func
+def knn_linear_scan(
+    points: wp.array[wp.vec3],
+    q: wp.vec3,
+    k: wp.int32,
+    max_radius: wp.float32,
+    out_indices_row: wp.array[wp.int32],
+    out_distances_row: wp.array[wp.float32],
+) -> None:
+    # Exact fallback for the grid path once the radius outgrows the cell width. This is the same
+    # per-row cost the diagonal-radius query used to pay for *every* row, so it is never a
+    # regression against the previous behaviour.
+    knn_reset_row(k, out_indices_row, out_distances_row)
+    for point_index in range(points.shape[0]):
+        d = wp.length(points[point_index] - q)
+        knn_sorted_insert(point_index, d, k, max_radius, out_indices_row, out_distances_row)
 
 
 @wp.kernel
@@ -246,16 +368,35 @@ def query_hashgrid_nearest_neighbors(
     queries: wp.array[wp.vec3],
     grid_id: wp.uint64,
     k: wp.int32,
-    radius: wp.float32,
+    max_radius: wp.float32,
+    initial_radius: wp.float32,
+    widest: wp.float32,
+    min_bound: wp.vec3,
+    max_bound: wp.vec3,
     out_indices: wp.array2d[wp.int32],
     out_distances: wp.array2d[wp.float32],
 ) -> None:
     tid = wp.tid()
     q = queries[tid]
+    out_indices_row = out_indices[tid]
+    out_distances_row = out_distances[tid]
 
-    query = wp.hash_grid_query(grid_id, q, radius)
-    point_index = wp.int32(-1)
-
-    while wp.hash_grid_query_next(query, point_index):
-        d = wp.length(points[point_index] - q)
-        knn_sorted_insert(point_index, d, k, radius, out_indices[tid], out_distances[tid])
+    r_hard = wp.min(max_radius, complete_radius(q, min_bound, max_bound))
+    r = wp.min(initial_radius, r_hard)
+    for _attempt in range(MAX_SEARCH_ATTEMPTS):
+        if not r <= widest:
+            # Past ``widest`` a cell walk costs more than touching every point (and a NaN query
+            # lands here too, which is what bounds this loop). Finish exactly instead.
+            break
+        worst = knn_hashgrid_scan(
+            points, grid_id, q, k, max_radius, r, out_indices_row, out_distances_row
+        )
+        if worst <= r:
+            return  # certified exact
+        if r >= r_hard:
+            return  # the scan was already complete
+        if worst < FLOAT32_INF_CONSTANT:
+            r = wp.min(worst, r_hard)
+        else:
+            r = wp.min(r * RADIUS_GROWTH, r_hard)
+    knn_linear_scan(points, q, k, max_radius, out_indices_row, out_distances_row)

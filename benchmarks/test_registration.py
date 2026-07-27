@@ -41,14 +41,16 @@ are a small fraction of the total, so the number to read for a kernel change is 
 delta on a *fixed* mesh, not the absolute time. Two things the absolute times do say, both measured
 on ``bunny`` (35 947 target points, 20 000 source points, 10 iterations):
 
-* triwarp's **mesh** target is far faster than its **point-cloud** target — 4.1 ms versus 191 ms —
-  because the former rides Warp's built-in ``wp.mesh_query_point_no_sign``, while the latter goes
-  through [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest], whose k-NN kernel costs
-  ~19 ms per call at ``k=1``. Rebuilding the BVH each iteration is *not* the cause: the build is
-  0.21 ms and the bounds reduction 0.15 ms, so ~99% of the call is the query kernel itself.
-* Consequently open3d's serial CPU ``KDTreeFlann`` beats triwarp's point-cloud ICP by ~10x
-  (17.8 ms versus 191 ms). The point-cloud k-NN path, not the registration solver, is what that
-  gap measures.
+* The **mesh** target is still the faster of the two — 4.0 ms versus 7.9 ms — because it rides
+  Warp's built-in ``wp.mesh_query_point_no_sign`` and never touches the k-NN path at all.
+* The **point-cloud** target used to be 48x slower than that (191 ms), because
+  [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] searched the whole cloud on every
+  call: with ``max_radius=inf`` it clamped the query cube to the scene diagonal, so the BVH pruned
+  nothing. It now deepens iteratively from a density estimate, and the target's BVH, bounds and
+  radius are hoisted out of the loop, which moved point-cloud ICP from ~10x *slower* than open3d's
+  serial ``KDTreeFlann`` to ~2.3x faster (7.9 ms versus 18.0 ms). The residual gap to the mesh
+  target is per-iteration ``procrustes`` latency, not the search — which is why
+  ``icp_point_to_plane``, whose iteration has no ``procrustes`` call, lands at 5.6 ms.
 """
 
 from __future__ import annotations

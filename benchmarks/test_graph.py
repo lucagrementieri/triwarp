@@ -10,13 +10,19 @@ Only ``split`` has an open3d equivalent. ``connected_component_labels`` and both
 take an abstract CSR adjacency matrix, and open3d exposes no graph-traversal API over one — its
 connectivity work is mesh-bound (``cluster_connected_triangles``), which is what ``split`` uses.
 
-``split`` cost is dominated by the **component count**, not the mesh size, and the two registry
-meshes differ enormously there: ``bunny`` is a single component while ``bunny_decimated`` has 94
-(scan floaters). At ``_SPLIT_COPIES = 64`` that is 64 versus 6 016 returned submeshes, and triwarp
-takes 78 ms for the former but 3.8 s for the latter — ~0.64 ms of host work per submesh, against
-0.29 ms for open3d and 0.23 ms for trimesh. So triwarp wins by 34-120x when there are few
-components and loses by 2-3x per component when there are many: the per-component allocation and
-launch sequence in ``tw.combine.split``, not the labelling, is the thing to batch.
+``split`` cost used to be dominated by the **component count**, not the mesh size, and the two
+registry meshes differ enormously there: ``bunny`` is a single component while ``bunny_decimated``
+has 94 (scan floaters). At ``_SPLIT_COPIES = 64`` that is 64 versus 6 016 returned submeshes, and
+triwarp took 78 ms for the former but 3.8 s for the latter — ~0.64 ms of host work per submesh,
+because the extraction loop ran one sort, one scan and one readback *per component*.
+
+Batching that loop through a single packed-key ``unique_1d``
+([`submeshes_from_face_groups`][triwarp.selection.submeshes_from_face_groups]) makes every launch
+count ``O(1)`` in the component count: 3.8 s → **46 ms** on the 6 016-component case (against
+1.77 s for open3d and 1.40 s for trimesh) and 78 → 42 ms on the single-component one. The
+``split_batched`` group isolates what is left — at **5.6 ms** for the same 6 016 components, the
+40 ms difference is 12 032 Python-level ``wp.array`` view constructions at ~3.5 us each, which is
+the floor for any API that hands back one object per component.
 """
 
 from __future__ import annotations
@@ -178,3 +184,21 @@ def test_split(bench_case: BenchCase) -> None:
     # Scan meshes contain floater components, so each copy contributes its own component count.
     assert len(parts) >= _SPLIT_COPIES
     assert len(parts) % _SPLIT_COPIES == 0
+
+
+@pytest.mark.benchmark(group="split_batched")
+@pytest.mark.benchlibs("triwarp")
+def test_split_batched(bench_case: BenchCase) -> None:
+    """
+    The CSR form of ``split``: the same decomposition with no per-component Python at all.
+
+    triwarp-only — neither reference has a batched entry point, and the comparable numbers are in
+    the ``split`` group above. What this measures against ``split`` is the residual cost of
+    materialising ``k`` Python-level ``wp.array`` views, which is all that separates the two.
+    """
+    skip_larger_than(bench_case, "bunny")
+    vertices, faces = _split_inputs(bench_case)
+    _vertices_all, vertex_offsets, _faces_all, _face_offsets = bench_case.run(
+        lambda: tw.combine.split_batched(vertices, faces)
+    )
+    assert int(vertex_offsets.shape[0]) >= _SPLIT_COPIES

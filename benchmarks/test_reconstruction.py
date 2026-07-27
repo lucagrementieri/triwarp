@@ -22,16 +22,33 @@ What the open3d comparison showed when it was added (medians, RTX 5090, ``depth=
 
 - ``screened_poisson`` is a clear win — 134 ms (dense) against open3d's 2.0-2.3 s, so **15-25x
   faster** on both meshes.
-- ``ball_pivoting`` is the opposite and is worth investigating: 580 ms / 1085 ms against open3d's
-  97 ms / 435 ms, i.e. triwarp is **2.5-6x slower than a serial CPU BPA**, and its run-to-run
-  spread is ~40x open3d's (222 ms StdDev on ``bunny``), which points at the pivot-front iteration
-  count rather than at per-launch overhead.
+- ``ball_pivoting`` used to be the outlier of this module at 580 ms / 1085 ms against open3d's
+  100 ms / 445 ms. Rebuilding it around a **persistent front** — an edge hash table plus a
+  compacted boundary-edge list, mutated in place by ``commit_triangles`` and never re-derived from
+  the triangle soup — took it to **121 ms / 214 ms**, i.e. from 2.4x slower to **2.1x faster** on
+  ``bunny``. Three things paid for that: retiring provably-dead front edges (96% of all pivots in
+  a run were re-searches of edges already known to be impossible), caching each front edge's best
+  candidate so the ~73% that lose the vertex claim each wave re-validate in O(1), and dropping the
+  per-wave ``edges_unique`` + sort + three readbacks the front rebuild needed.
+
+  It also reconstructs a **much better surface**: 1.97 faces per referenced vertex against 3.08,
+  and 1.7% boundary edges against 23.6%. The old per-wave rebuild was letting colliding fronts
+  triangulate a neighbourhood in overlapping layers, which cleanup then tore back into open
+  patches. The run-to-run spread collapsed with it (148 ms StdDev -> 3 ms).
+
+  What is left is ``pivot_front_edges`` (94% of kernel time) and it is *occupancy*-bound, not
+  throughput-bound: a wave has a few thousand live front edges, so a few thousand threads do
+  serial, dependent hash-grid work on a device with 350k thread slots. ``bunny_decimated`` is
+  still 1.19x behind open3d for exactly that reason — it is too small to fill the GPU — while
+  ``bunny``, four times larger, is 2.1x ahead. Going further means parallelising *within* an
+  edge's candidate search (a warp per edge), not shaving the wave loop.
 
 Sizing notes measured on an RTX 5090 before the baseline was captured:
 
-- ``ball_pivoting`` uses ``1.5 * mean_edge`` as its radius. A larger multiple (2.5x) overflows the
-  ``4 * n + 16`` triangle budget and raises, so it is not benchmarked; that overflow is a
-  pre-existing robustness issue, not a benchmark artefact.
+- ``ball_pivoting`` uses ``1.5 * mean_edge`` as its radius. A larger multiple used to overflow the
+  ``4 * n + 16`` triangle budget and raise; the budget now doubles on demand (rehashing the edge
+  table and rebuilding the front from it), so 2.5x completes. It is still not benchmarked, because
+  a ball that wide searches a much larger neighbourhood per pivot and measures a different thing.
 - ``screened_poisson`` in ``dense`` mode is dominated by the ``2^depth`` cubed node grid, not by the
   point count — it costs the same on ``bunny_decimated`` and ``bunny``. The ``adaptive`` mode does
   scale with the cloud. Both are timed at the default ``depth=8``.

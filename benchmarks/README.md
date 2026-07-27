@@ -1,7 +1,7 @@
 # triwarp benchmarks
 
 Performance benchmarks comparing `triwarp` against the CPU references **trimesh**, **libigl
-(`igl`)** and **open3d** on real scan meshes, built on
+(`igl`)**, **open3d** and (for k-nearest search only) **scipy** on real scan meshes, built on
 [pytest-benchmark](https://pytest-benchmark.readthedocs.io).
 
 These are **not** collected by the normal test run (`pytest`'s `testpaths` is `tests/`); run them
@@ -31,7 +31,7 @@ Place mesh files in `benchmarks/data/` (gitignored, local-only). The registry in
 ## Run
 
 ```bash
-# Default: triwarp-cuda on all meshes; trimesh/igl/open3d on meshes up to 'large'.
+# Default: triwarp-cuda on all meshes; trimesh/igl/open3d/scipy on meshes up to 'large'.
 # triwarp-cpu is off by default when CUDA is available (pass --device=both to add it).
 uv run pytest benchmarks/
 
@@ -51,9 +51,9 @@ into a single table).
 
 | flag | default | meaning |
 |---|---|---|
-| `--device` | `auto` | `triwarp` target(s): `auto`/`cpu`/`cuda`/`both`. `auto` = cuda if CUDA is available, else cpu (triwarp-cpu is not timed alongside cuda; use `both` for that). The trimesh/igl/open3d baselines always run. |
+| `--device` | `auto` | `triwarp` target(s): `auto`/`cpu`/`cuda`/`both`. `auto` = cuda if CUDA is available, else cpu (triwarp-cpu is not timed alongside cuda; use `both` for that). The trimesh/igl/open3d/scipy baselines always run. |
 | `--size` | `all` | comma-separated size categories to include (`small,medium,large,extralarge,huge`). Naming a size explicitly also lifts the CPU cap for it. |
-| `--cpu-max-size` | `large` | CPU-bound libraries (`triwarp-cpu`, `trimesh`, `igl`, `open3d`) skip meshes larger than this unless the size is named in `--size`. |
+| `--cpu-max-size` | `large` | CPU-bound libraries (`triwarp-cpu`, `trimesh`, `igl`, `open3d`, `scipy`) skip meshes larger than this unless the size is named in `--size`. |
 
 ## Notes
 
@@ -103,12 +103,16 @@ built from the same NumPy source every other library gets.
 | `test_vertices` | `compute_vertex_normals` |
 | `test_proximity` | `get_axis_aligned_bounding_box` (`aabb_bounds` only) |
 | `test_points` | `PointCloud.estimate_normals` (`KDTreeSearchParamKNN`) |
+| `test_distance` | `PointCloud.compute_point_cloud_distance` (the non-differentiable Chamfer / Hausdorff cases) |
 | `test_convex` | `compute_convex_hull` (exact qhull vs the approximate support sweep) |
 
 Modules with **no** open3d equivalent, and why, are documented in each module's docstring:
 `test_edges` (no general edge list), `test_boundary` (no loop ordering), `test_grouping` (array
-primitive), `test_parametrization` (no harmonic/LSCM/ARAP), `test_distance` (no autodiff),
+primitive), `test_parametrization` (no harmonic/LSCM/ARAP), `test_distance`'s *differentiable*
+case (no autodiff),
 `test_laplacian` (no cotangent or mass matrix — the smoothing filters build their weights inline),
+`test_neighbors` (`KDTreeFlann` has no batched query — a Python loop over `search_knn_vector_3d`
+would time the interpreter, so `scipy.spatial.KDTree` is that module's reference instead),
 `test_curvature` (no curvature estimation at all), `test_intersection` (no plane section; its
 booleans need the `open3d.t` backend and a coupled remesh), `test_texture` (stores UVs but has no
 bake or resample), `test_polyline` (`LineSet` is unordered segments with no length/resample/simplify),

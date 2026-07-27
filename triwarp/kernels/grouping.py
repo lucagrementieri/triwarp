@@ -87,6 +87,53 @@ def decode_key(stored: wp.Int) -> wp.Int:
 # ---------------------------------------------------------------------------
 
 
+@wp.func
+def hash_find_or_insert(key: wp.Int, slot_key: wp.array[wp.Int], mask: wp.int32) -> wp.int32:
+    """
+    Slot holding ``key``, inserting it first if it is not there yet.
+
+    Publication is the single ``atomic_cas`` that claims an empty slot, so there is no separate
+    lock or ready state and no cross-thread visibility race. The probe cannot terminate on a
+    **full** table, so callers must size the table above the number of distinct keys.
+    """
+    empty = empty_key(key)
+    encoded = encode_key(key)
+    h = hash_slot(key, mask)
+    while True:
+        prev = wp.atomic_cas(slot_key, h, empty, encoded)
+        if prev == empty or prev == encoded:
+            break
+        h = next_slot(h, mask)
+    return h
+
+
+@wp.func
+def hash_find(key: wp.Int, slot_key: wp.array[wp.Int], mask: wp.int32) -> wp.int32:
+    """
+    Slot holding ``key``, or ``-1`` when it is absent.
+
+    Read-only, so it terminates at the first empty slot in the probe chain even on a full table.
+    """
+    empty = empty_key(key)
+    encoded = encode_key(key)
+    h = hash_slot(key, mask)
+    # No boolean accumulator: a bare ``True`` / ``False`` is a *constant* in kernel scope and Warp
+    # refuses to let a dynamic loop mutate one. The probe state itself carries the answer.
+    stored = slot_key[h]
+    while stored != empty and stored != encoded:
+        h = next_slot(h, mask)
+        stored = slot_key[h]
+    if stored != encoded:
+        h = wp.int32(-1)
+    return h
+
+
+@wp.func
+def hash_contains(key: wp.Int, slot_key: wp.array[wp.Int], mask: wp.int32) -> bool:
+    """Whether ``key`` is in the table, without inserting it."""
+    return hash_find(key, slot_key, mask) >= 0
+
+
 @wp.kernel
 def hash_insert(
     data: wp.array[wp.Int],
@@ -95,16 +142,7 @@ def hash_insert(
     mask: wp.int32,
 ) -> None:
     i = int(wp.tid())
-    key = data[i]
-    empty = empty_key(key)
-    encoded = encode_key(key)
-    h = hash_slot(key, mask)
-    while True:
-        prev = wp.atomic_cas(slot_key, h, empty, encoded)
-        if prev == empty or prev == encoded:
-            wp.atomic_add(slot_counts, h, wp.int32(1))
-            break
-        h = next_slot(h, mask)
+    wp.atomic_add(slot_counts, hash_find_or_insert(data[i], slot_key, mask), wp.int32(1))
 
 
 @wp.kernel

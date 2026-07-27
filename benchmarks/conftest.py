@@ -9,12 +9,12 @@ Flags
     Which ``triwarp`` targets to time. ``auto`` (default) uses cuda when CUDA is available,
     else falls back to cpu — ``triwarp-cpu`` is not timed alongside cuda by default. Pass
     ``cpu`` for cpu only or ``both`` to time both triwarp targets. The ``trimesh`` / ``igl`` /
-    ``open3d`` CPU baselines are always included.
+    ``open3d`` / ``scipy`` CPU baselines are always included.
 ``--size=<comma list | all>``
     Restrict meshes to these size categories (``small,medium,large,extralarge,huge``).
 ``--cpu-max-size=<category>``
-    CPU-bound libraries (``triwarp-cpu``, ``trimesh``, ``igl``, ``open3d``) skip meshes larger
-    than this unless the size was named explicitly in ``--size``. Default ``large`` — so
+    CPU-bound libraries (``triwarp-cpu``, ``trimesh``, ``igl``, ``open3d``, ``scipy``) skip meshes
+    larger than this unless the size was named explicitly in ``--size``. Default ``large`` — so
     ``happy_buddha`` and ``lucy`` run GPU-only by default while
     ``bunny_decimated``/``bunny``/``dragon`` run on CPU.
 """
@@ -116,12 +116,18 @@ def skip_larger_than(bench_case: BenchCase, largest: str, reason: str = "") -> N
 # can skip them on the largest meshes by default. ``open3d`` is marked CPU-bound even though the
 # installed wheel is a CUDA build: the legacy ``open3d.pipelines`` / ``open3d.geometry`` APIs the
 # baselines use are CPU-only (only the newer ``open3d.t`` tensor API has GPU kernels).
+#
+# ``scipy`` is a narrow baseline — it is only a *geometry* reference for the k-NN queries
+# (``spatial.KDTree``), which is what ``tests/test_neighbors.py`` already validates against. Every
+# benchmark carries an explicit ``benchlibs`` marker, so it generates cases only where a branch
+# exists.
 LIBRARIES: list[LibrarySpec] = [
     {"id": "triwarp-cpu", "kind": "triwarp", "device": "cpu", "cpu_bound": True},
     {"id": "triwarp-cuda", "kind": "triwarp", "device": "cuda:0", "cpu_bound": False},
     {"id": "trimesh", "kind": "trimesh", "device": None, "cpu_bound": True},
     {"id": "igl", "kind": "igl", "device": None, "cpu_bound": True},
     {"id": "open3d", "kind": "open3d", "device": None, "cpu_bound": True},
+    {"id": "scipy", "kind": "scipy", "device": None, "cpu_bound": True},
 ]
 LIBRARIES_BY_ID = {lib["id"]: lib for lib in LIBRARIES}
 
@@ -329,7 +335,7 @@ def _selected_libraries(config: pytest.Config) -> list[LibrarySpec]:
             continue
         if lib["id"] == "triwarp-cuda" and not (include_cuda and cuda_available):
             continue
-        # trimesh / igl baselines are always included.
+        # trimesh / igl / open3d / scipy baselines are always included.
         selected.append(lib)
     return selected
 
@@ -387,7 +393,7 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
-        "benchlibs(*kinds): library kinds (triwarp/trimesh/igl/open3d) a benchmark supports.",
+        "benchlibs(*kinds): library kinds (triwarp/trimesh/igl/open3d/scipy) a benchmark supports.",
     )
     config.addinivalue_line(
         "markers",
@@ -416,7 +422,7 @@ class BenchCase:
 
     @property
     def kind(self) -> str:
-        """Library family: ``triwarp`` / ``trimesh`` / ``igl`` / ``open3d``."""
+        """Library family: ``triwarp`` / ``trimesh`` / ``igl`` / ``open3d`` / ``scipy``."""
         return self.library["kind"]
 
     @property
@@ -438,7 +444,7 @@ class BenchCase:
 
     @property
     def vertices_np(self) -> np.ndarray:
-        """Float64 ``(n_vertices, 3)`` vertices for the trimesh / igl references."""
+        """Float64 ``(n_vertices, 3)`` vertices for the trimesh / igl / scipy references."""
         return _load_numpy(self.mesh_name)[0]
 
     @property

@@ -84,6 +84,114 @@ def test_submesh_from_face_indices_all_faces(
     assert np.array_equal(submesh_faces_wp.numpy(), submesh_tm.faces.reshape(-1))
 
 
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "half_torus"])
+def test_submeshes_from_face_groups_matches_single(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """Every group's slice must equal ``submesh_from_face_indices`` run on that group alone."""
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    device = mesh_wp.points.device
+    rng = np.random.default_rng(11)
+    n_faces = mesh_tm.faces.shape[0]
+
+    # Four disjoint, non-empty groups of ascending face indices (what ``split`` produces).
+    order_np = rng.permutation(n_faces).astype(np.int32)
+    cuts_np = np.sort(rng.choice(np.arange(1, n_faces), size=3, replace=False))
+    groups_np = [np.sort(part) for part in np.split(order_np, cuts_np)]
+    offsets_np = np.cumsum([0, *(len(group) for group in groups_np[:-1])]).astype(np.int32)
+
+    vertices_all_wp, vertex_offsets_wp, faces_all_wp = tw.selection.submeshes_from_face_groups(
+        mesh_wp.points,
+        mesh_wp.indices,
+        wp.array(np.concatenate(groups_np).astype(np.int32), dtype=wp.int32, device=device),
+        wp.array(offsets_np, dtype=wp.int32, device=device),
+    )
+    vertex_bounds_np = [*vertex_offsets_wp.numpy().tolist(), int(vertices_all_wp.shape[0])]
+    face_bounds_np = [*offsets_np.tolist(), n_faces]
+
+    for group, v_begin, v_end, f_begin, f_end in zip(
+        groups_np,
+        vertex_bounds_np[:-1],
+        vertex_bounds_np[1:],
+        face_bounds_np[:-1],
+        face_bounds_np[1:],
+        strict=True,
+    ):
+        single_vertices_wp, single_faces_wp = tw.selection.submesh_from_face_indices(
+            mesh_wp.points,
+            mesh_wp.indices,
+            wp.array(group.astype(np.int32), dtype=wp.int32, device=device),
+            unique_indices=True,
+        )
+        assert np.array_equal(vertices_all_wp.numpy()[v_begin:v_end], single_vertices_wp.numpy())
+        assert np.array_equal(
+            faces_all_wp.numpy()[3 * f_begin : 3 * f_end], single_faces_wp.numpy()
+        )
+
+    # ...and the first group also matches the trimesh reference directly.
+    submesh_tm = tm.util.submesh(mesh_tm, [groups_np[0]], repair=False, append=False)[0]
+    assert np.allclose(vertices_all_wp.numpy()[: vertex_bounds_np[1]], submesh_tm.vertices)
+    assert np.array_equal(
+        faces_all_wp.numpy()[: 3 * face_bounds_np[1]], submesh_tm.faces.reshape(-1)
+    )
+
+
+def test_submeshes_from_face_groups_shared_vertex(device: str) -> None:
+    """Two bodies touching at one vertex: the shared vertex is duplicated into both groups."""
+    # Two triangles meeting only at vertex 2, so face adjacency keeps them separate.
+    vertices_np = np.array(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 2, 0], [-1, 1, 0]], dtype=np.float32
+    )
+    faces_np = np.array([0, 1, 2, 2, 3, 4], dtype=np.int32)
+    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+
+    vertices_all_wp, vertex_offsets_wp, faces_all_wp = tw.selection.submeshes_from_face_groups(
+        vertices_wp,
+        faces_wp,
+        wp.array([0, 1], dtype=wp.int32, device=device),
+        wp.array([0, 1], dtype=wp.int32, device=device),
+    )
+    # 3 + 3 vertices, not 5: vertex 2 belongs to both groups and is emitted in each.
+    assert np.array_equal(vertex_offsets_wp.numpy(), [0, 3])
+    assert int(vertices_all_wp.shape[0]) == 6
+    assert np.array_equal(faces_all_wp.numpy(), [0, 1, 2, 0, 1, 2])
+    assert np.array_equal(vertices_all_wp.numpy()[:3], vertices_np[[0, 1, 2]])
+    assert np.array_equal(vertices_all_wp.numpy()[3:], vertices_np[[2, 3, 4]])
+
+
+def test_submeshes_from_face_groups_unreferenced_vertices(device: str) -> None:
+    """Vertices no face uses are dropped, exactly as the single-group path drops them."""
+    vertices_np = np.array(
+        [[0, 0, 0], [9, 9, 9], [1, 0, 0], [0, 1, 0], [8, 8, 8]], dtype=np.float32
+    )
+    faces_np = np.array([0, 2, 3], dtype=np.int32)
+    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+
+    vertices_all_wp, vertex_offsets_wp, faces_all_wp = tw.selection.submeshes_from_face_groups(
+        vertices_wp,
+        faces_wp,
+        wp.array([0], dtype=wp.int32, device=device),
+        wp.array([0], dtype=wp.int32, device=device),
+    )
+    assert np.array_equal(vertex_offsets_wp.numpy(), [0])
+    assert np.array_equal(vertices_all_wp.numpy(), vertices_np[[0, 2, 3]])
+    assert np.array_equal(faces_all_wp.numpy(), [0, 1, 2])
+
+
+def test_submeshes_from_face_groups_empty(device: str) -> None:
+    vertices_wp = wp.array(np.zeros((4, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    faces_wp = wp.array(np.array([0, 1, 2, 0, 2, 3], dtype=np.int32), dtype=wp.int32, device=device)
+    empty_wp = wp.empty(0, dtype=wp.int32, device=device)
+    vertices_all_wp, vertex_offsets_wp, faces_all_wp = tw.selection.submeshes_from_face_groups(
+        vertices_wp, faces_wp, empty_wp, empty_wp
+    )
+    assert vertices_all_wp.shape == (0,)
+    assert vertex_offsets_wp.shape == (0,)
+    assert faces_all_wp.shape == (0,)
+
+
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
 def test_submesh_from_face_mask(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)

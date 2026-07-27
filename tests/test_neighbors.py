@@ -175,6 +175,50 @@ def test_query_ball_empty(device: str, backend: Literal["bvh", "hashgrid"]):
     assert len(distances) == 0
 
 
+def test_knn_initial_radius_matches_uniform_density(device: str):
+    rng = np.random.default_rng(3)
+    points = rng.random((4000, 3), dtype=np.float32)
+    points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
+
+    for k in (1, 8):
+        radius_wp = tw.neighbors.knn_initial_radius(points_wp, k)
+        # Expected count in a ball of that radius under the uniform model that defines it.
+        volume_np = float(np.prod(points.max(axis=0) - points.min(axis=0)))
+        expected_np = (3.0 * (k / 4000) * volume_np / (4.0 * math.pi)) ** (1.0 / 3.0)
+        assert np.isclose(radius_wp, expected_np, rtol=1e-6)
+        # It really does find about k neighbours: the median count should be within a factor of a
+        # few of k, which is what makes a single scan the common case.
+        counts_np = np.asarray(
+            KDTree(points).query_ball_point(points[:200], radius_wp, return_length=True)
+        )
+        assert k <= np.median(counts_np) <= 12 * k + 12
+
+
+def test_knn_initial_radius_degenerate_clouds(device: str):
+    """Flat, collinear, coincident and ``k >= n`` clouds all get a usable (or infinite) radius."""
+    rng = np.random.default_rng(4)
+    planar_np = rng.random((500, 3), dtype=np.float32)
+    planar_np[:, 2] = 0.0
+    collinear_np = np.zeros((500, 3), dtype=np.float32)
+    collinear_np[:, 0] = np.linspace(0.0, 1.0, 500)
+    coincident_np = np.zeros((10, 3), dtype=np.float32)
+
+    def radius_of(points_np: np.ndarray, k: int = 4) -> float:
+        return tw.neighbors.knn_initial_radius(
+            wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device), k
+        )
+
+    # d = 2: pi r^2 = (k / n) * area
+    area_np = float(np.prod(planar_np[:, :2].max(axis=0) - planar_np[:, :2].min(axis=0)))
+    assert np.isclose(radius_of(planar_np), math.sqrt((4 / 500) * area_np / math.pi), rtol=1e-6)
+    # d = 1: 2 r = (k / n) * length
+    assert np.isclose(radius_of(collinear_np), 0.5 * (4 / 500) * 1.0, rtol=1e-5)
+    # Degenerate box and k >= n both mean "one complete scan".
+    assert radius_of(coincident_np) == math.inf
+    assert radius_of(planar_np, k=500) == math.inf
+    assert tw.neighbors.knn_initial_radius(wp.empty(0, dtype=wp.vec3, device=device), 1) == math.inf
+
+
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 @pytest.mark.parametrize("k", [1, 3, 40])
 @pytest.mark.parametrize("max_radius", [math.inf, 0.5, 1.0])
@@ -262,3 +306,133 @@ def test_query_nearest_empty(device: str, backend: Literal["bvh", "hashgrid"]):
     indices, distances = query_nearest(points_wp, empty_queries_wp, k=k)
     assert indices.shape == (0, k)
     assert distances.shape == (0, k)
+
+
+@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
+@pytest.mark.parametrize("k", [1, 3])
+def test_query_nearest_initial_radius_invariance(
+    device: str, backend: Literal["bvh", "hashgrid"], k: int
+):
+    """
+    ``initial_radius`` is a speed knob: every value must give byte-identical output.
+
+    The three values exercise all three loop paths — the default estimate (usually one certified
+    scan), ``inf`` (one forced complete scan), and a radius far too small (repeated geometric
+    growth, which is also the case that would double-insert if a scan forgot to reset its row).
+    """
+    rng = np.random.default_rng(5)
+    points = rng.random((400, 3), dtype=np.float32) * 3.0
+    queries = rng.random((60, 3), dtype=np.float32) * 3.0
+    diagonal = float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))
+
+    points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
+    queries_wp = wp.array(np.ascontiguousarray(queries), dtype=wp.vec3, device=device)
+    query_nearest = (
+        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
+    )
+
+    reference_indices_wp, reference_distances_wp = query_nearest(points_wp, queries_wp, k=k)
+    for initial_radius in (math.inf, 1e-6 * diagonal, 0.0):
+        indices_wp, distances_wp = query_nearest(
+            points_wp, queries_wp, k=k, initial_radius=initial_radius
+        )
+        assert np.array_equal(indices_wp.numpy(), reference_indices_wp.numpy())
+        assert np.array_equal(distances_wp.numpy(), reference_distances_wp.numpy())
+
+    query_distances_np, query_indices_np = KDTree(points).query(queries, k=k)
+    assert np.array_equal(reference_indices_wp.numpy(), np.asarray(query_indices_np))
+    assert np.allclose(reference_distances_wp.numpy(), query_distances_np, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
+def test_query_nearest_clustered(device: str, backend: Literal["bvh", "hashgrid"]):
+    """
+    Tight clusters in a mostly empty box: the density estimate under-shoots badly on purpose.
+
+    Queries sit in the void between clusters, so the first scans come back empty and the search
+    has to grow geometrically. On the hash-grid backend the radius outruns the cell width, which
+    is the path that hands off to the exact linear scan.
+    """
+    rng = np.random.default_rng(6)
+    centers = rng.random((6, 3)) * 100.0
+    points = np.concatenate([c + rng.normal(scale=0.01, size=(150, 3)) for c in centers])
+    points = np.ascontiguousarray(points, dtype=np.float32)
+    queries = np.ascontiguousarray(rng.random((80, 3)) * 100.0, dtype=np.float32)
+
+    points_wp = wp.array(points, dtype=wp.vec3, device=device)
+    queries_wp = wp.array(queries, dtype=wp.vec3, device=device)
+    query_nearest = (
+        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
+    )
+
+    for k in (1, 5):
+        indices_wp, distances_wp = query_nearest(points_wp, queries_wp, k=k)
+        query_distances_np, query_indices_np = KDTree(points).query(queries, k=k)
+        assert np.array_equal(indices_wp.numpy(), np.asarray(query_indices_np))
+        assert np.allclose(distances_wp.numpy(), query_distances_np, rtol=1e-5, atol=1e-4)
+
+
+@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
+def test_query_nearest_degenerate_clouds(device: str, backend: Literal["bvh", "hashgrid"]):
+    """Coincident, collinear and planar clouds: zero-extent axes must not break the search."""
+    rng = np.random.default_rng(7)
+    coincident_np = np.full((20, 3), 2.5, dtype=np.float32)
+    collinear_np = np.zeros((60, 3), dtype=np.float32)
+    collinear_np[:, 0] = np.linspace(-1.0, 1.0, 60)
+    planar_np = rng.random((60, 3), dtype=np.float32)
+    planar_np[:, 2] = 0.75
+
+    query_nearest = (
+        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
+    )
+    for points in (coincident_np, collinear_np, planar_np):
+        # Queries on the cloud and far outside it (the latter has an unbounded complete radius).
+        queries = np.ascontiguousarray(np.vstack((points[:5], points[:5] + 40.0)), dtype=np.float32)
+        points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
+        queries_wp = wp.array(queries, dtype=wp.vec3, device=device)
+
+        indices_wp, distances_wp = query_nearest(points_wp, queries_wp, k=3)
+        query_distances_np, _query_indices_np = KDTree(points).query(queries, k=3)
+        # Coincident points tie at every slot, so compare the distances (and that the indices are
+        # in range and distinct), not the arbitrary index order.
+        assert np.allclose(distances_wp.numpy(), query_distances_np, rtol=1e-5, atol=1e-5)
+        assert indices_wp.numpy().min() >= 0
+        assert all(len(set(row.tolist())) == 3 for row in indices_wp.numpy())
+
+
+@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
+def test_query_nearest_prebuilt_index(device: str, backend: Literal["bvh", "hashgrid"]):
+    """A hoisted BVH / hash grid gives the same answer as letting the query build its own."""
+    rng = np.random.default_rng(8)
+    points = rng.random((300, 3), dtype=np.float32) * 2.0
+    queries = rng.random((40, 3), dtype=np.float32) * 2.0
+    points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
+    queries_wp = wp.array(np.ascontiguousarray(queries), dtype=wp.vec3, device=device)
+
+    k = 4
+    initial_radius = tw.neighbors.knn_initial_radius(points_wp, k)
+    if backend == "bvh":
+        query_nearest = tw.neighbors.query_bvh_nearest
+        index = {"bvh": tw.neighbors.bvh_from_points(points_wp)}
+    else:
+        query_nearest = tw.neighbors.query_hashgrid_nearest
+        index = {"grid": tw.neighbors.hashgrid_from_points(points_wp, initial_radius)}
+
+    indices_wp, distances_wp = query_nearest(
+        points_wp, queries_wp, k=k, initial_radius=initial_radius, **index
+    )
+    built_indices_wp, built_distances_wp = query_nearest(points_wp, queries_wp, k=k)
+    assert np.array_equal(indices_wp.numpy(), built_indices_wp.numpy())
+    assert np.array_equal(distances_wp.numpy(), built_distances_wp.numpy())
+
+
+@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
+def test_query_nearest_rejects_negative_initial_radius(
+    device: str, backend: Literal["bvh", "hashgrid"]
+):
+    points_wp = wp.array(np.zeros((4, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    query_nearest = (
+        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
+    )
+    with pytest.raises(ValueError, match="initial_radius"):
+        query_nearest(points_wp, points_wp, k=1, initial_radius=-1.0)

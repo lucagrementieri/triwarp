@@ -6,23 +6,24 @@ import math
 
 import warp as wp
 
-import triwarp as tw
-import triwarp.typing as twt
+from triwarp.constants import TILE_1D
+from triwarp.kernels import bounds as kernel_bounds
 
 
 def aabb_bounds(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     """
     Axis-aligned bounding box of ``points`` (component-wise min / max).
 
-    The reduction runs on ``points.device`` in ``float32`` as a tiled per-column min/max
-    over a zero-copy ``(n, 3)`` scalar view of the ``wp.vec3`` buffer (see
-    [`minmax`][triwarp.reduce.minmax]).
+    The reduction runs on ``points.device`` in ``float32``: one chunked kernel writes both
+    corners into a single six-element buffer, which is then read back once. That is deliberately
+    *not* the generic [`minmax`][triwarp.reduce.minmax] path — this is called on the hot path of
+    every k-NN query, where it is entirely host-latency-bound, and ``minmax`` needs two
+    allocations, two fills and two readbacks for the same answer.
 
     Parameters
     ----------
     points
-        ``(n, 3)`` positions as ``wp.vec3``. Must be contiguous (any freshly allocated or
-        ``wp.Mesh``-owned buffer is).
+        ``(n, 3)`` positions as ``wp.vec3``.
 
     Returns
     -------
@@ -36,16 +37,23 @@ def aabb_bounds(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     [`aabb_diagonal`][triwarp.bounds.aabb_diagonal]
     [`aabb_union`][triwarp.bounds.aabb_union]
     """
-    if int(points.shape[0]) == 0:
+    n = int(points.shape[0])
+    if n == 0:
         return (wp.vec3(math.inf, math.inf, math.inf), wp.vec3(-math.inf, -math.inf, -math.inf))
-    components = twt.as_array2d_float32(points.view(wp.float32))
-    min_wp, max_wp = tw.reduce.minmax(components, axis=0)
-    min_np = min_wp.numpy()
-    max_np = max_wp.numpy()
-    return (
-        wp.vec3(float(min_np[0]), float(min_np[1]), float(min_np[2])),
-        wp.vec3(float(max_np[0]), float(max_np[1]), float(max_np[2])),
+    # One allocation, one launch, one readback. This is a pure reduction on the hot path of every
+    # k-NN query, so it is entirely host-latency-bound at any realistic size — the generic
+    # [`minmax`][triwarp.reduce.minmax] path costs two allocations, two fills and two readbacks
+    # for the same answer, which measured ~2x slower.
+    corners = wp.full(6, math.inf, dtype=wp.float32, device=points.device)
+    wp.launch(
+        kernel_bounds.aabb_corners,
+        dim=(n + TILE_1D - 1) // TILE_1D,
+        inputs=[points, corners],
+        device=points.device,
     )
+    corners_np = corners.numpy()
+    # Slots 3..5 hold the *negated* upper corner; see the kernel.
+    return (wp.vec3(*corners_np[:3].tolist()), wp.vec3(*(-corners_np[3:]).tolist()))
 
 
 def aabb_diagonal(min_bound: wp.vec3, max_bound: wp.vec3) -> float:

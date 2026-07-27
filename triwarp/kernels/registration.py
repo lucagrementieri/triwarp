@@ -1,7 +1,47 @@
 import warp as wp
 
 from triwarp.constants import TILE_1D
-from triwarp.kernels.reduce import cross_outer_sum_tile, sum1d_tile, weighted_sum_vec3_tile
+
+# ---------------------------------------------------------------------------
+# Packed Procrustes accumulator
+#
+# Every moment the fit needs lives in one ``float32`` buffer, so the whole thing costs a single
+# allocation and a single memset instead of six of each — which is most of the host-side latency
+# at the sizes this is called at (``icp`` calls it once per iteration, and the cost was flat in
+# ``n`` from 8k points upward).
+#
+# Slots 1..24 are the *shifted* moments: sums of ``a - p`` and ``b - q`` where ``p = a[0]`` and
+# ``q = b[0]``. Shifting by a point *of the cloud* is what lets one pass do the work of two. The
+# textbook single-pass identity shifts by the origin, which makes the cancellation in
+# ``E[x^2] - E[x]^2`` scale as ``(|centroid| / spread)^2`` — unbounded for a cloud far from the
+# origin. Shifting by a sample point bounds it at ``(diameter / spread)^2``, a handful of bits.
+# ---------------------------------------------------------------------------
+ACC_W_SUM = wp.constant(0)  # sum w
+ACC_A_SUM = wp.constant(1)  # vec3, slots 1..3:   sum w (a - p)
+ACC_B_SUM = wp.constant(4)  # vec3, slots 4..6:   sum w (b - q)
+ACC_A_SQ = wp.constant(7)  # sum w |a - p|^2
+ACC_B_SQ = wp.constant(8)  # sum w |b - q|^2
+ACC_COV = wp.constant(9)  # mat33, slots 9..17: sum_{w>0} outer(b - q, a - p), row-major
+ACC_MASK_A = wp.constant(18)  # vec3, slots 18..20: sum_{w>0} (a - p)
+ACC_MASK_B = wp.constant(21)  # vec3, slots 21..23: sum_{w>0} (b - q)
+ACC_MASK_N = wp.constant(24)  # count of w > 0
+ACC_COST = wp.constant(25)  # weighted mean squared residual
+PROCRUSTES_ACC_SIZE = 26
+
+
+@wp.func
+def procrustes_shifts(
+    a: wp.array[wp.vec3], b: wp.array[wp.vec3], use_translation: bool
+) -> tuple[wp.vec3, wp.vec3]:
+    # Read the shift origins straight off the device (a broadcast load, no host round trip).
+    # ``use_translation=False`` must shift by nothing at all, so the arithmetic stays bit-for-bit
+    # the uncentered form the caller asked for.
+    shift_a = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
+    shift_b = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
+    if use_translation and a.shape[0] > 0:
+        shift_a = a[0]
+        shift_b = b[0]
+    return shift_a, shift_b
 
 
 @wp.func
@@ -27,117 +67,140 @@ def make_affine44(rotation: wp.mat33, translation: wp.vec3) -> wp.mat44:
     )
 
 
-@wp.func
-def weighted_centered_dot_tile(
-    values: wp.array[wp.vec3],
-    weights: wp.array[wp.float32],
-    center: wp.vec3,
-    w_sum: wp.float32,
-    offset: int,
-    remaining: int,
-) -> wp.float32:
-    count = wp.min(remaining, TILE_1D)
-    result = wp.float32(0.0)
-    for k in range(count):
-        v = values[offset + k] - center
-        result += (weights[offset + k] / w_sum) * wp.length_sq(v)
-    return result
-
-
 @wp.kernel
-def accumulate_weighted_sums(
+def accumulate_procrustes_moments(
     a: wp.array[wp.vec3],
     b: wp.array[wp.vec3],
     weights: wp.array[wp.float32],
-    out_w_sum: wp.array[wp.float32],
-    out_a_sum: wp.array[wp.vec3],
-    out_b_sum: wp.array[wp.vec3],
-) -> None:
-    i, t = wp.tid()
-    n = weights.shape[0]
-    offset = i * TILE_1D
-    remaining = n - offset
-    if remaining <= 0:
-        return
-
-    tile_w = sum1d_tile(weights, offset, remaining)
-    tile_a = weighted_sum_vec3_tile(a, weights, offset, remaining)
-    tile_b = weighted_sum_vec3_tile(b, weights, offset, remaining)
-
-    if t == 0:
-        wp.atomic_add(out_w_sum, 0, tile_w)
-        wp.atomic_add(out_a_sum, 0, tile_a)
-        wp.atomic_add(out_b_sum, 0, tile_b)
-
-
-@wp.kernel
-def accumulate_scale_and_cov(
-    a: wp.array[wp.vec3],
-    b: wp.array[wp.vec3],
-    weights: wp.array[wp.float32],
-    w_sum: wp.array[wp.float32],
-    a_center_raw: wp.array[wp.vec3],
-    b_center_raw: wp.array[wp.vec3],
     use_translation: bool,
-    out_a_scale_sq: wp.array[wp.float32],
-    out_b_scale_sq: wp.array[wp.float32],
-    out_cov: wp.array[wp.mat33],
+    out_acc: wp.array[wp.float32],
 ) -> None:
-    i, t = wp.tid()
-    n = weights.shape[0]
-    offset = i * TILE_1D
-    remaining = n - offset
+    # Every moment the fit needs, in one pass over ``a`` and ``b``. The two-pass form this replaces
+    # could not be fused because the covariance needs the centroid the first pass computes; the
+    # shifted-moment identity in ``build_procrustes_matrix`` removes that dependency.
+    #
+    # Launched tiled, with *every* lane walking the whole chunk and lane 0 publishing the result.
+    # That looks wasteful but is the faster shape here: all lanes read the same ``a[offset + k]``
+    # on each step, so the loads broadcast out of one cache line, whereas one-thread-per-chunk
+    # gives each lane its own 64-element run and the reads stop coalescing (measured ~10% slower
+    # end-to-end on a 20k-point ICP). The redundant arithmetic is free — this is memory-bound.
+    #
+    # A zero-length ``weights`` means uniform weights, which is what ``icp`` passes: the
+    # alternative is a ``wp.full(n, 1.0)`` allocation *and* fill on every iteration, for a value
+    # the kernel can just assume.
+    chunk, lane = wp.tid()
+    offset = chunk * TILE_1D
+    remaining = a.shape[0] - offset
     if remaining <= 0:
         return
+    count = wp.min(remaining, TILE_1D)
+    uniform = weights.shape[0] == 0
+    shift_a, shift_b = procrustes_shifts(a, b, use_translation)
 
-    ws = w_sum[0]
-    acenter = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    bcenter = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    if use_translation:
-        acenter = a_center_raw[0] / ws
-        bcenter = b_center_raw[0] / ws
+    w_sum = wp.float32(0.0)
+    a_sum = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
+    b_sum = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
+    a_sq = wp.float32(0.0)
+    b_sq = wp.float32(0.0)
+    cov = wp.mat33(wp.float32(0.0))
+    mask_a = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
+    mask_b = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
+    mask_n = wp.float32(0.0)
 
-    tile_a_sq = weighted_centered_dot_tile(a, weights, acenter, ws, offset, remaining)
-    tile_b_sq = weighted_centered_dot_tile(b, weights, bcenter, ws, offset, remaining)
-    # Cross-covariance: H[row, col] = sum_k mask_k * bc[k, row] * ac[k, col]
-    tile_cov = cross_outer_sum_tile(a, b, weights, acenter, bcenter, offset, remaining)
+    for k in range(count):
+        index = offset + k
+        w = wp.float32(1.0)
+        if not uniform:
+            w = weights[index]
+        av = a[index] - shift_a
+        bv = b[index] - shift_b
+        w_sum += w
+        a_sum += w * av
+        b_sum += w * bv
+        a_sq += w * wp.length_sq(av)
+        b_sq += w * wp.length_sq(bv)
+        # The covariance is weighted by *membership*, not magnitude — trimesh's convention, and
+        # what ``test_procrustes_binary_weights`` pins.
+        if w > wp.float32(0.0):
+            cov += wp.outer(bv, av)
+            mask_a += av
+            mask_b += bv
+            mask_n += wp.float32(1.0)
 
-    if t == 0:
-        wp.atomic_add(out_a_scale_sq, 0, tile_a_sq)
-        wp.atomic_add(out_b_scale_sq, 0, tile_b_sq)
-        wp.atomic_add(out_cov, 0, tile_cov)
+    if lane == 0:
+        wp.atomic_add(out_acc, ACC_W_SUM, w_sum)
+        wp.atomic_add(out_acc, ACC_A_SQ, a_sq)
+        wp.atomic_add(out_acc, ACC_B_SQ, b_sq)
+        wp.atomic_add(out_acc, ACC_MASK_N, mask_n)
+        for c in range(3):
+            wp.atomic_add(out_acc, ACC_A_SUM + c, a_sum[c])
+            wp.atomic_add(out_acc, ACC_B_SUM + c, b_sum[c])
+            wp.atomic_add(out_acc, ACC_MASK_A + c, mask_a[c])
+            wp.atomic_add(out_acc, ACC_MASK_B + c, mask_b[c])
+            for r in range(3):
+                wp.atomic_add(out_acc, ACC_COV + c * 3 + r, cov[c, r])
+
+
+@wp.func
+def acc_vec3(acc: wp.array[wp.float32], base: wp.int32) -> wp.vec3:
+    """Read a three-slot vector out of the packed accumulator."""
+    return wp.vec3(acc[base], acc[base + 1], acc[base + 2])
 
 
 @wp.kernel
 def build_procrustes_matrix(
-    w_sum: wp.array[wp.float32],
-    a_center_raw: wp.array[wp.vec3],
-    b_center_raw: wp.array[wp.vec3],
-    a_scale_sq: wp.array[wp.float32],
-    b_scale_sq: wp.array[wp.float32],
-    cov: wp.array[wp.mat33],
+    a: wp.array[wp.vec3],
+    b: wp.array[wp.vec3],
+    acc: wp.array[wp.float32],
     use_reflection: bool,
     use_translation: bool,
     use_scale: bool,
     out_matrix: wp.array[wp.mat44],
 ) -> None:
-    ws = w_sum[0]
+    ws = acc[ACC_W_SUM]
+    shift_a, shift_b = procrustes_shifts(a, b, use_translation)
 
-    acenter = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    bcenter = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
+    # Centroids relative to the shift origins, then un-shifted back into world coordinates.
+    a_rel = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
+    b_rel = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
     if use_translation:
-        acenter = a_center_raw[0] / ws
-        bcenter = b_center_raw[0] / ws
+        a_rel = acc_vec3(acc, ACC_A_SUM) / ws
+        b_rel = acc_vec3(acc, ACC_B_SUM) / ws
+    acenter = shift_a + a_rel
+    bcenter = shift_b + b_rel
 
     ascale = wp.float32(1.0)
     bscale = wp.float32(1.0)
     if use_scale:
-        ascale = wp.sqrt(a_scale_sq[0])
-        bscale = wp.sqrt(b_scale_sq[0])
+        # Shifted second-moment identity: sum w |a - centroid|^2 / S_w = sum w |a - p|^2 / S_w
+        # minus |centroid - p|^2.
+        ascale = wp.sqrt(acc[ACC_A_SQ] / ws - wp.length_sq(a_rel))
+        bscale = wp.sqrt(acc[ACC_B_SQ] / ws - wp.length_sq(b_rel))
+
+    # Shifted cross-moment identity, over the membership-masked subset:
+    # H = sum_m outer(b - bc, a - ac)
+    #   = M - outer(Sm_b, ac') - outer(bc', Sm_a) + N_m outer(bc', ac')
+    cov = wp.mat33(
+        acc[ACC_COV + 0],
+        acc[ACC_COV + 1],
+        acc[ACC_COV + 2],
+        acc[ACC_COV + 3],
+        acc[ACC_COV + 4],
+        acc[ACC_COV + 5],
+        acc[ACC_COV + 6],
+        acc[ACC_COV + 7],
+        acc[ACC_COV + 8],
+    )
+    cov = (
+        cov
+        - wp.outer(acc_vec3(acc, ACC_MASK_B), a_rel)
+        - wp.outer(b_rel, acc_vec3(acc, ACC_MASK_A))
+        + acc[ACC_MASK_N] * wp.outer(b_rel, a_rel)
+    )
 
     # Normalise cross-covariance by scale product
     inv_scales = wp.float32(1.0) / (bscale * ascale)
-    target = cov[0] * inv_scales
+    target = cov * inv_scales
 
     U = wp.mat33(wp.float32(0.0))  # noqa: N806
     sigma = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
@@ -188,13 +251,15 @@ def accumulate_cost(
     transformed: wp.array[wp.vec3],
     b: wp.array[wp.vec3],
     weights: wp.array[wp.float32],
-    w_sum: wp.array[wp.float32],
-    out_cost: wp.array[wp.float32],
+    acc: wp.array[wp.float32],
 ) -> None:
+    # Weighted mean squared residual, into the packed accumulator's cost slot. A zero-length
+    # ``weights`` means uniform.
     i = int(wp.tid())
-    w_norm = weights[i] / w_sum[0]
-    diff = b[i] - transformed[i]
-    wp.atomic_add(out_cost, 0, w_norm * wp.length_sq(diff))
+    w = wp.float32(1.0)
+    if weights.shape[0] > 0:
+        w = weights[i]
+    wp.atomic_add(acc, ACC_COST, (w / acc[ACC_W_SUM]) * wp.length_sq(b[i] - transformed[i]))
 
 
 # --- Iterative closest point (ICP) -----------------------------------------

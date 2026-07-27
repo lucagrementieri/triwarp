@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Literal, cast, overload
+from typing import Literal, TypedDict, cast, overload
 
 import numpy as np
 import warp as wp
@@ -78,80 +78,112 @@ def procrustes(
     cost:
         Weighted sum of squared distances between *transformed* and *b*.
         Only returned when ``return_cost=True``.
+
+    Notes
+    -----
+    Latency-bound at every size that matters: the fit is two kernel launches (four with
+    ``return_cost``), one allocation for the packed moment accumulator and one readback, so the
+    cost is nearly flat in ``n``. Callers in a loop should use the workspace form — see
+    [`icp`][triwarp.registration.icp], which allocates once outside its iteration.
     """
-    n = a.shape[0]
+    n = int(a.shape[0])
     device = a.device
+    workspace = _procrustes_workspace(n, device, return_cost=return_cost)
+    return _procrustes_into(a, b, weights, reflection, translation, scale, return_cost, workspace)
 
+
+class _ProcrustesWorkspace(TypedDict):
+    """Buffers a [`procrustes`][triwarp.registration.procrustes] fit writes into."""
+
+    acc: wp.array[wp.float32]
+    matrix: wp.array[wp.mat44]
+    transformed: wp.array[wp.vec3] | None
+    uniform_weights: wp.array[wp.float32]
+
+
+def _procrustes_workspace(
+    n: int, device: wp.DeviceLike, *, return_cost: bool
+) -> _ProcrustesWorkspace:
+    """Allocate the buffers one Procrustes fit needs; reuse across iterations of a loop."""
+    return {
+        "acc": wp.empty(kernel_registration.PROCRUSTES_ACC_SIZE, dtype=wp.float32, device=device),
+        "matrix": wp.empty(1, dtype=wp.mat44, device=device),
+        "transformed": wp.empty(n, dtype=wp.vec3, device=device) if return_cost else None,
+        "uniform_weights": _uniform_weights(device),
+    }
+
+
+_UNIFORM_WEIGHTS: dict[str, wp.array[wp.float32]] = {}
+
+
+def _uniform_weights(device: wp.DeviceLike) -> wp.array[wp.float32]:
+    """
+    Return the kernels' "uniform weights" sentinel: a zero-length array, shared per device.
+
+    Length zero means "every weight is 1", so the common weightless call needs neither a
+    ``wp.full(n, 1.0)`` allocation nor its fill — and since the buffer carries no data, one
+    instance per device serves every caller.
+    """
+    key = str(device)
+    if key not in _UNIFORM_WEIGHTS:
+        _UNIFORM_WEIGHTS[key] = wp.empty(0, dtype=wp.float32, device=device)
+    return _UNIFORM_WEIGHTS[key]
+
+
+def _procrustes_into(
+    a: wp.array[wp.vec3],
+    b: wp.array[wp.vec3],
+    weights: wp.array[wp.float32] | None,
+    reflection: bool,
+    translation: bool,
+    scale: bool,
+    return_cost: bool,
+    workspace: _ProcrustesWorkspace,
+) -> tuple[wp.array[wp.mat44], wp.array[wp.vec3], float] | wp.array[wp.mat44]:
+    """Run one Procrustes fit into caller-owned buffers. See ``procrustes`` for the semantics."""
+    n = int(a.shape[0])
+    device = a.device
+    acc = workspace["acc"]
+    out_matrix = workspace["matrix"]
     if weights is None:
-        weights = wp.full(n, wp.float32(1.0), dtype=wp.float32, device=device)
+        weights = workspace["uniform_weights"]
 
-    # --- Phase 1a: weighted sums for centroids ---
-    w_sum = wp.zeros(1, dtype=wp.float32, device=device)
-    a_sum = wp.zeros(1, dtype=wp.vec3, device=device)
-    b_sum = wp.zeros(1, dtype=wp.vec3, device=device)
-    n_tiles = (n + TILE_1D - 1) // TILE_1D
+    n_chunks = (n + TILE_1D - 1) // TILE_1D
+    acc.zero_()
     wp.launch_tiled(
-        kernel_registration.accumulate_weighted_sums,
-        dim=[n_tiles],
-        inputs=[a, b, weights, w_sum, a_sum, b_sum],
+        kernel_registration.accumulate_procrustes_moments,
+        dim=[n_chunks],
+        inputs=[a, b, weights, translation, acc],
         block_dim=TILE_1D,
         device=device,
     )
-
-    # --- Phase 1b: weighted scale^2 and cross-covariance ---
-    a_scale_sq = wp.zeros(1, dtype=wp.float32, device=device)
-    b_scale_sq = wp.zeros(1, dtype=wp.float32, device=device)
-    cov = wp.zeros(1, dtype=wp.mat33, device=device)
-    wp.launch_tiled(
-        kernel_registration.accumulate_scale_and_cov,
-        dim=[n_tiles],
-        inputs=[a, b, weights, w_sum, a_sum, b_sum, translation, a_scale_sq, b_scale_sq, cov],
-        block_dim=TILE_1D,
-        device=device,
-    )
-
-    # --- Phase 2: SVD and 4x4 matrix construction (single thread) ---
-    out_matrix = wp.zeros(1, dtype=wp.mat44, device=device)
     wp.launch(
         kernel_registration.build_procrustes_matrix,
         dim=1,
-        inputs=[
-            w_sum,
-            a_sum,
-            b_sum,
-            a_scale_sq,
-            b_scale_sq,
-            cov,
-            reflection,
-            translation,
-            scale,
-            out_matrix,
-        ],
+        inputs=[a, b, acc, reflection, translation, scale, out_matrix],
         device=device,
     )
 
     if not return_cost:
         return out_matrix
 
-    # --- Phase 3a: apply transform to all points ---
-    out_transformed = wp.empty(n, dtype=wp.vec3, device=device)
+    out_transformed = workspace["transformed"]
+    assert out_transformed is not None
     wp.launch(
         kernel_registration.apply_transform_mat44,
         dim=n,
         inputs=[a, out_matrix, out_transformed],
         device=device,
     )
-
-    # --- Phase 3b: weighted cost reduction ---
-    out_cost = wp.zeros(1, dtype=wp.float32, device=device)
     wp.launch(
         kernel_registration.accumulate_cost,
         dim=n,
-        inputs=[out_transformed, b, weights, w_sum, out_cost],
+        inputs=[out_transformed, b, weights, acc],
         device=device,
     )
-
-    cost = float(out_cost.numpy()[0])
+    # One readback for the whole accumulator; ICP's convergence test needs the cost on the host,
+    # and at ~0.1 ms it is under 1% of an iteration (an extra device-side pass would cost more).
+    cost = float(acc.numpy()[kernel_registration.ACC_COST])
     return out_matrix, out_transformed, cost
 
 
@@ -176,6 +208,31 @@ def _resolve_initial(
 
 def _is_mesh_target(target_faces: wp.array[wp.int32] | None) -> bool:
     return target_faces is not None and int(target_faces.shape[0]) // 3 > 0
+
+
+class _TargetIndex(TypedDict):
+    """Everything [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] can be told once."""
+
+    bvh: wp.Bvh
+    initial_radius: float
+    bounds: tuple[wp.vec3, wp.vec3]
+
+
+def _target_index(target_vertices: wp.array[wp.vec3]) -> _TargetIndex:
+    """
+    Precompute the k-NN search state for a point-cloud target.
+
+    Only the *source* moves between ICP iterations, so the target's BVH, bounding box and density
+    estimate are all loop-invariant. Hoisting them turns each iteration's correspondence step into
+    a single launch with no host synchronisation at all — worth ~0.4 ms per iteration on a 36k
+    cloud, which is the dominant remaining cost once the search radius itself is sane.
+    """
+    bounds = tw.bounds.aabb_bounds(target_vertices)
+    return {
+        "bvh": tw.neighbors.bvh_from_points(target_vertices),
+        "initial_radius": tw.neighbors.knn_initial_radius(target_vertices, 1, bounds=bounds),
+        "bounds": bounds,
+    }
 
 
 def icp(
@@ -271,6 +328,7 @@ def icp(
 
     mesh: wp.Mesh | None = None
     query_max = wp.float32(0.0)
+    target_index: _TargetIndex | None = None
     if is_mesh:
         assert target_faces is not None
         require_nonempty_mesh(target_faces, "icp")
@@ -278,14 +336,19 @@ def icp(
         query_max = tw.proximity._default_mesh_query_max_dist(mesh.points, current)
         if max_distance is not None:
             query_max = max(query_max, max_distance)
+    else:
+        target_index = _target_index(target_vertices)
 
-    # Correspondence and weight buffers are allocated once and refilled every iteration.
+    # Correspondence and weight buffers are allocated once and refilled every iteration, and so is
+    # the Procrustes workspace — the fit is latency-bound, so its ~10 per-call allocations would
+    # otherwise dominate an iteration that is already down to a handful of launches.
     closest = wp.empty(n, dtype=wp.vec3, device=device)
     distance_mesh = wp.empty(n, dtype=wp.float32, device=device)
     triangle_id_mesh = wp.empty(n, dtype=wp.int32, device=device)
     weights: wp.array[wp.float32] | None = (
         wp.empty(n, dtype=wp.float32, device=device) if max_distance is not None else None
     )
+    workspace = _procrustes_workspace(n, device, return_cost=True)
 
     old_cost = math.inf
     for _ in range(max_iterations):
@@ -300,7 +363,10 @@ def icp(
                 device=device,
             )
         else:
-            index, distance = tw.neighbors.query_bvh_nearest(target_vertices, current, 1)
+            assert target_index is not None
+            index, distance = tw.neighbors.query_bvh_nearest(
+                target_vertices, current, 1, **target_index
+            )
             wp.copy(closest, target_vertices[index])
             triangle_id = index
 
@@ -315,8 +381,9 @@ def icp(
             if float(tw.reduce.sum(weights)) == 0.0:
                 break
 
-        total, transformed, cost = procrustes(
-            a, closest, weights=weights, reflection=reflection, translation=translation, scale=scale
+        total, transformed, cost = cast(
+            tuple[wp.array[wp.mat44], wp.array[wp.vec3], float],
+            _procrustes_into(a, closest, weights, reflection, translation, scale, True, workspace),
         )
         current = transformed
         if old_cost - cost < threshold:
@@ -482,6 +549,7 @@ def icp_point_to_plane(
     face_normals: wp.array[wp.vec3] | None = None
     mesh: wp.Mesh | None = None
     query_max = wp.float32(0.0)
+    target_index: _TargetIndex | None = None
     if is_mesh:
         assert target_faces is not None
         require_nonempty_mesh(target_faces, "icp_point_to_plane")
@@ -490,6 +558,8 @@ def icp_point_to_plane(
         query_max = tw.proximity._default_mesh_query_max_dist(mesh.points, current)
         if max_distance is not None:
             query_max = max(query_max, max_distance)
+    else:
+        target_index = _target_index(target_vertices)
 
     max_d = max_distance if max_distance is not None else math.inf
     scale_value = robust_scale
@@ -531,7 +601,10 @@ def icp_point_to_plane(
             )
         else:
             assert target_normals is not None
-            index, distance = tw.neighbors.query_bvh_nearest(target_vertices, current, 1)
+            assert target_index is not None
+            index, distance = tw.neighbors.query_bvh_nearest(
+                target_vertices, current, 1, **target_index
+            )
             wp.copy(closest, target_vertices[index])
             wp.launch(
                 kernel_array.gather_vec_skip_negative,

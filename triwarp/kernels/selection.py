@@ -1,5 +1,61 @@
 import warp as wp
 
+from triwarp.kernels.array import binary_search_index
+
+
+@wp.kernel
+def pack_group_vertex_keys(
+    faces: wp.array[wp.int32],
+    group_face_indices: wp.array[wp.int32],
+    group_offsets: wp.array[wp.int32],
+    radix: wp.int64,
+    out_keys: wp.array[wp.int64],
+) -> None:
+    # ``group * radix + vertex`` for every corner of every selected face, with ``radix`` the source
+    # vertex count. Ascending key order is exactly ``(group, vertex)`` lexicographic order, which is
+    # what lets a single global ``unique_1d`` do the work of one dedup per group and still emit each
+    # group's vertices ascending by original index.
+    #
+    # ``group_offsets`` is the CSR start of each group, so the group owning position ``p`` is the
+    # last one starting at or before it — a binary search rather than a materialized per-position
+    # label array. ``out_keys`` is ``wp.int64`` concretely, not ``wp.Int``: a generic packer cannot
+    # construct the promoted value portably.
+    corner = int(wp.tid())
+    position = corner // 3
+    group = binary_search_index(group_offsets, position) - 1
+    face = group_face_indices[position]
+    out_keys[corner] = wp.int64(group) * radix + wp.int64(faces[face * 3 + corner % 3])
+
+
+@wp.func
+def group_of_key(key: wp.int64, radix: wp.int64) -> wp.int32:
+    """Group index packed into ``key`` by [`pack_group_vertex_keys`][]."""
+    return wp.int32(key / radix)
+
+
+@wp.func
+def vertex_of_key(key: wp.int64, radix: wp.int64) -> wp.int32:
+    """Source vertex index packed into ``key`` by [`pack_group_vertex_keys`][]."""
+    return wp.int32(key % radix)
+
+
+@wp.kernel
+def count_group_slots(slot_groups: wp.array[wp.int32], out_counts: wp.array[wp.int32]) -> None:
+    # Vertices per group, as a histogram over the sorted unique slots.
+    wp.atomic_add(out_counts, slot_groups[int(wp.tid())], wp.int32(1))
+
+
+@wp.kernel
+def local_vertex_index(
+    slot_groups: wp.array[wp.int32],
+    vertex_offsets: wp.array[wp.int32],
+    out_local: wp.array[wp.int32],
+) -> None:
+    # Rank of each global slot within its own group: the compacted, zero-based vertex index the
+    # group's faces must refer to. A real kernel because the thread index *is* the datum.
+    slot = int(wp.tid())
+    out_local[slot] = slot - vertex_offsets[slot_groups[slot]]
+
 
 @wp.kernel
 def dilate_vertex_mask(

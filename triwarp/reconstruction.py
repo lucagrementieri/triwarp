@@ -12,9 +12,6 @@ import warp.optim.linear as wpl
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_cuda
-from triwarp.constants import INT32_MAX
-from triwarp.kernels import array as kernel_array
-from triwarp.kernels import edges as kernel_edges
 from triwarp.kernels import reconstruction as kernel_reconstruction
 from triwarp.kernels import remesh as kernel_remesh
 from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
@@ -976,13 +973,13 @@ def ball_pivoting(
     ``points``), unlike the implicit
     [`screened_poisson`][triwarp.reconstruction.screened_poisson].
 
-    Each wave recomputes the advancing front from the current triangle soup (front = boundary
-    edges), pivots every front edge independently through a hash-grid ball query, and commits a
-    conflict-free
-    independent set of triangles via a two-phase vertex claim. Manifoldness is protected by an
-    interior-edge guard (an edge already shared by two triangles never gains a third). The result is
-    passed through the standard cleanup tail (deduplicate, drop degenerate / non-manifold faces,
-    orient outward, optionally fill small holes).
+    The advancing front is a **persistent** device-side structure — an edge hash table plus a
+    compacted list of its boundary edges, mutated in place as triangles commit. Each wave pivots
+    every live front edge independently through a hash-grid ball query and commits a conflict-free
+    independent set via a two-phase vertex claim. Manifoldness is protected by an interior-edge
+    guard (an edge already shared by two triangles never gains a third). The result is passed
+    through the standard cleanup tail (deduplicate, drop degenerate / non-manifold faces, orient
+    outward, optionally fill small holes).
 
     Parameters
     ----------
@@ -1018,7 +1015,7 @@ def ball_pivoting(
     Raises
     ------
     ValueError
-        If fewer than 3 points are given, or the triangle budget (``4 n`` faces) overflows.
+        If fewer than 3 points are given.
 
     See Also
     --------
@@ -1029,18 +1026,18 @@ def ball_pivoting(
     Notes
     -----
     A single radius is used (the classic multi-radius schedule is a documented follow-up). Wave
-    order is non-deterministic, so the exact triangulation varies run to run.
+    order is non-deterministic, so the exact triangulation varies run to run, and the triangle
+    budget grows on demand rather than raising.
 
-    **v1 limitation (watertightness).** Unlike the serial reference algorithm, this wave-parallel
-    front is rebuilt from the triangle soup each wave and lacks the persistent per-vertex fan
-    structure that keeps colliding fronts aligned. On densely, uniformly sampled closed surfaces the
-    independent fronts can therefore triangulate a neighbourhood in slightly overlapping layers, so
-    the result is **interpolating and edge-manifold (after cleanup) but not guaranteed watertight**.
-    It is most useful for its interpolating, empty-ball guarantee and explicit radius control; for a
-    guaranteed watertight surface use [`screened_poisson`][triwarp.reconstruction.screened_poisson]
-    or [`triangulate_point_cloud`][triwarp.reconstruction.triangulate_point_cloud]. Regions sampled
-    too sparsely for the ball to rest are left as holes (widen ``radius`` or set
-    ``crit_hole_length``).
+    The result is **interpolating and edge-manifold**, and on a densely, uniformly sampled closed
+    surface it is watertight in practice: a subdivided icosphere reconstructs to exactly ``2 v - 4``
+    faces with no boundary edge at all, and ``bunny`` (a real scan, so genuinely open in places)
+    comes out at 1.97 faces per referenced vertex with 1.7% boundary edges. Watertightness is not
+    *guaranteed* — the wave-parallel front has no per-vertex fan structure to align colliding
+    sheets with, so pathological sampling can still leave a seam. Regions sampled too sparsely for
+    the ball to rest are left as holes by construction (widen ``radius`` or set
+    ``crit_hole_length``); for an implicit surface that is watertight by construction use
+    [`screened_poisson`][triwarp.reconstruction.screened_poisson].
     """
     device = points.device
     n = int(points.shape[0])
@@ -1057,247 +1054,308 @@ def ball_pivoting(
     if normals is None:
         normals = tw.points.estimate_normals(points, neighbor_idx)
 
-    grid = tw.neighbors.hashgrid_from_points(points, 2.0 * radius)
+    # Cell width equal to the ball radius, not to the ``2 * radius`` neighbourhood the pivot
+    # searches: the inner empty-ball test is by far the most frequent query, and a cell twice its
+    # radius made it enumerate ~8x the points it needed. Measured 12% end-to-end; going finer than
+    # this loses more to cell-probe overhead than it saves in point tests.
+    grid = tw.neighbors.hashgrid_from_points(points, radius)
     crease_cos = math.cos(crease_angle) if crease_angle < math.pi else -1.0
 
-    max_faces = 4 * n + 16
-    all_faces = wp.empty(max_faces * 3, dtype=wp.int32, device=device)
-    face_count = wp.zeros(1, dtype=wp.int32, device=device)
-    key_base = wp.uint64(n)
-    waves = max_waves if max_waves > 0 else 16 * n
+    state = _BpaState(points, normals, grid, radius, clustering, crease_cos, 4 * n + 16)
+    _bpa_run(state, max_waves if max_waves > 0 else 16 * n)
 
-    # One host readback per wave, at the *end*: the new face count gives the committed count (as a
-    # delta against the count this wave started from) and doubles as the triangle-budget check, so
-    # nothing in a wave's interior has to wait on the device. A wave either pivots the current front
-    # or seeds orphan triangles; seeding runs whenever the previous wave committed nothing, which is
-    # also the loop's termination test (a stalled pivot followed by a stalled seed means done).
-    count = 0
-    seeding = True
-    for _ in range(waves):
-        faces_view = all_faces[: count * 3]
-        if seeding:
-            _bpa_seed_wave(
-                points,
-                normals,
-                faces_view,
-                grid,
-                radius,
-                clustering,
-                n,
-                all_faces,
-                face_count,
-                max_faces,
-                device,
-            )
-        else:
-            _bpa_pivot_wave(
-                points,
-                normals,
-                faces_view,
-                grid,
-                radius,
-                clustering,
-                crease_cos,
-                key_base,
-                n,
-                all_faces,
-                face_count,
-                max_faces,
-                device,
-            )
-        total = int(face_count.numpy()[0])
-        if total >= max_faces:
-            raise ValueError(
-                "ball_pivoting exceeded its triangle budget; the radius is likely far too small."
-            )
-        if total == count:
-            if seeding:
-                break
-            seeding = True
-        else:
-            seeding = False
-        count = total
-
-    faces = wp.clone(all_faces[: count * 3])
+    count = int(state.counters.numpy()[kernel_bpa.CNT_FACE])
+    faces = wp.clone(state.all_faces[: count * 3])
     return _clean_reconstruction(points, faces, crit_hole_length)
 
 
-def _bpa_seed_wave(
-    points: wp.array[wp.vec3],
-    normals: wp.array[wp.vec3],
-    faces_view: wp.array[wp.int32],
-    grid: wp.HashGrid,
-    radius: float,
-    clustering: float,
-    n: int,
-    all_faces: wp.array[wp.int32],
-    face_count: wp.array[wp.int32],
-    max_faces: int,
-    device: wp.DeviceLike,
-) -> None:
-    """Seed one wave of orphan triangles and commit a conflict-free set of them."""
-    if int(faces_view.shape[0]) > 0:
-        point_used = tw.array.indices_to_mask(faces_view, n, device=device)
-    else:
-        point_used = wp.zeros(n, dtype=wp.bool, device=device)
-    tri_a = wp.empty(n, dtype=wp.int32, device=device)
-    tri_b = wp.empty(n, dtype=wp.int32, device=device)
-    tri_c = wp.empty(n, dtype=wp.int32, device=device)
+class _BpaState:
+    """
+    Every buffer a ball-pivoting run touches, allocated once and mutated in place.
+
+    The wave loop does no allocation and no host synchronisation, which is what makes it cheap
+    enough to matter: the previous design rebuilt the advancing front from the whole triangle soup
+    on every wave (a sort, a scan and three readbacks), and that host traffic — not the pivot
+    search — was two thirds of the runtime.
+    """
+
+    def __init__(
+        self,
+        points: wp.array[wp.vec3],
+        normals: wp.array[wp.vec3],
+        grid: wp.HashGrid,
+        radius: float,
+        clustering: float,
+        crease_cos: float,
+        max_faces: int,
+    ) -> None:
+        """Allocate the persistent state for a cloud of ``points`` and a triangle budget."""
+        self.points = points
+        self.normals = normals
+        self.grid = grid
+        self.radius = wp.float32(radius)
+        self.clustering = wp.float32(clustering)
+        self.crease_cos = wp.float32(crease_cos)
+        self.device = points.device
+        self.n = int(points.shape[0])
+        self.key_base = wp.uint64(self.n)
+
+        self.counters = wp.zeros(kernel_bpa.BPA_COUNTERS, dtype=wp.int32, device=self.device)
+        self.counters[kernel_bpa.CNT_SEEDING : kernel_bpa.CNT_SEEDING + 1].fill_(1)
+        self.point_used = wp.zeros(self.n, dtype=wp.bool, device=self.device)
+        self.boundary_degree = wp.zeros(self.n, dtype=wp.int32, device=self.device)
+        self.owner = wp.empty(self.n, dtype=wp.int32, device=self.device)
+        self._allocate_budget(max_faces)
+
+    def _allocate_budget(self, max_faces: int) -> None:
+        """(Re)size everything that scales with the triangle budget."""
+        self.max_faces = max_faces
+        self.all_faces = wp.empty(max_faces * 3, dtype=wp.int32, device=self.device)
+        # A triangle soup of ``max_faces`` faces has at most ``3 * max_faces`` distinct edges, and
+        # the insert probe does not terminate on a full table, so the hash is sized for a load
+        # factor of at most 1/2. The front and the proposal list share the same bound.
+        capacity = 1 << (6 * max_faces - 1).bit_length()
+        self.edge_mask = wp.int32(capacity - 1)
+        self.edge_key = wp.zeros(capacity, dtype=wp.uint64, device=self.device)
+        self.edge_count = wp.zeros(capacity, dtype=wp.int32, device=self.device)
+        self.edge_src = wp.empty(capacity, dtype=wp.int32, device=self.device)
+        self.edge_tgt = wp.empty(capacity, dtype=wp.int32, device=self.device)
+        self.edge_opp = wp.empty(capacity, dtype=wp.int32, device=self.device)
+        self.edge_state = wp.zeros(capacity, dtype=wp.int32, device=self.device)
+        self.edge_cand = wp.empty(capacity, dtype=wp.int32, device=self.device)
+
+        front_capacity = 3 * max_faces + self.n
+        self.front_in = wp.empty(front_capacity, dtype=wp.int32, device=self.device)
+        self.front_out = wp.empty(front_capacity, dtype=wp.int32, device=self.device)
+        self.tri_a = wp.empty(front_capacity, dtype=wp.int32, device=self.device)
+        self.tri_b = wp.empty(front_capacity, dtype=wp.int32, device=self.device)
+        self.tri_c = wp.empty(front_capacity, dtype=wp.int32, device=self.device)
+        # Grid-stride bounds: fixed launch dimensions, which a captured graph requires. Sized from
+        # the cloud, not from the budget — the live front peaks well below the point count, and a
+        # fixed 64k-wide launch spent most of a small mesh's wave scheduling no-op threads.
+        self.front_grid = min(front_capacity, max(_BPA_MIN_GRID, self.n))
+        self.claim_grid = self.front_grid
+
+    def grow(self) -> None:
+        """
+        Double the triangle budget in place, preserving the run in progress.
+
+        Slot indices move when the edge table is rehashed, so the front list is rebuilt from the
+        new table rather than remapped.
+        """
+        old = (
+            self.edge_key,
+            self.edge_count,
+            self.edge_src,
+            self.edge_tgt,
+            self.edge_opp,
+            self.edge_state,
+            self.edge_cand,
+        )
+        old_capacity = int(self.edge_key.shape[0])
+        old_faces = self.all_faces
+        old_count = min(int(self.counters.numpy()[kernel_bpa.CNT_FACE]), self.max_faces)
+
+        self._allocate_budget(2 * self.max_faces)
+        wp.copy(self.all_faces, old_faces, count=old_count * 3)
+        wp.launch(
+            kernel_bpa.rehash_edges,
+            dim=old_capacity,
+            inputs=[
+                *old,
+                self.edge_mask,
+                self.edge_key,
+                self.edge_count,
+                self.edge_src,
+                self.edge_tgt,
+                self.edge_opp,
+                self.edge_state,
+                self.edge_cand,
+            ],
+            device=self.device,
+        )
+        # The over-increment from the losing threads of the overflowing wave never wrote a face.
+        counters = self.counters.numpy()
+        counters[kernel_bpa.CNT_FACE] = old_count
+        counters[kernel_bpa.CNT_NEXT_FRONT] = 0
+        counters[kernel_bpa.CNT_GROW] = 0
+        self.counters.assign(counters)
+        wp.launch(
+            kernel_bpa.collect_front_from_table,
+            dim=int(self.edge_key.shape[0]),
+            inputs=[self.edge_key, self.edge_count, self.edge_state, self.counters],
+            outputs=[self.front_in],
+            device=self.device,
+        )
+        self._adopt_next_front()
+
+    def compact(self) -> None:
+        """Drop closed and retired edges from the front list."""
+        self.counters[kernel_bpa.CNT_NEXT_FRONT : kernel_bpa.CNT_NEXT_FRONT + 1].zero_()
+        wp.launch(
+            kernel_bpa.compact_front,
+            dim=self.front_grid,
+            inputs=[
+                self.front_in,
+                self.edge_count,
+                self.edge_state,
+                self.front_grid,
+                self.counters,
+                self.front_out,
+            ],
+            device=self.device,
+        )
+        self.front_in, self.front_out = self.front_out, self.front_in
+        self._adopt_next_front()
+
+    def _adopt_next_front(self) -> None:
+        wp.copy(
+            self.counters[kernel_bpa.CNT_FRONT : kernel_bpa.CNT_FRONT + 1],
+            self.counters[kernel_bpa.CNT_NEXT_FRONT : kernel_bpa.CNT_NEXT_FRONT + 1],
+        )
+
+
+# Floor on the launch width of the grid-strided wave kernels, for clouds too small to fill the
+# device on their own.
+_BPA_MIN_GRID = 1 << 12
+
+
+def _bpa_wave(state: _BpaState, max_waves: int) -> None:
+    """Queue one wave: seed or pivot, claim, commit, advance. No allocations, no readbacks."""
+    device = state.device
+    wp.launch(kernel_bpa.begin_wave, dim=1, inputs=[state.counters], device=device)
     wp.launch(
         kernel_bpa.seed_triangles,
-        dim=n,
+        dim=state.n,
         inputs=[
-            points,
-            normals,
-            point_used,
-            grid.id,
-            wp.float32(radius),
-            wp.float32(clustering),
-            tri_a,
-            tri_b,
-            tri_c,
+            state.points,
+            state.normals,
+            state.point_used,
+            state.grid.id,
+            state.radius,
+            state.clustering,
+            state.counters,
+            state.owner,
+            state.tri_a,
+            state.tri_b,
+            state.tri_c,
         ],
         device=device,
     )
-    active = wp.empty(n, dtype=wp.bool, device=device)
-    wp.map(kernel_array.greater_equal, tri_a, wp.int32(0), out=active)
-    _bpa_commit(tri_a, tri_b, tri_c, active, n, all_faces, face_count, max_faces, device)
-
-
-def _bpa_pivot_wave(
-    points: wp.array[wp.vec3],
-    normals: wp.array[wp.vec3],
-    faces_view: wp.array[wp.int32],
-    grid: wp.HashGrid,
-    radius: float,
-    clustering: float,
-    crease_cos: float,
-    key_base: wp.uint64,
-    n: int,
-    all_faces: wp.array[wp.int32],
-    face_count: wp.array[wp.int32],
-    max_faces: int,
-    device: wp.DeviceLike,
-) -> None:
-    """Pivot every front edge of the soup, commit a conflict-free set of new triangles."""
-    n_faces = int(faces_view.shape[0]) // 3
-    unique_edges, inverse = tw.edges.edges_unique(faces_view, n_vertices=n)
-    m = int(unique_edges.shape[0])
-    if m == 0:
-        return
-    edge_face_count = wp.zeros(m, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_edges.count_edge_faces,
-        dim=3 * n_faces,
-        inputs=[inverse, edge_face_count],
-        device=device,
-    )
-
-    # Sorted keys of interior (2-face) edges: the manifold guard for the pivot.
-    flags = wp.empty(m, dtype=wp.int32, device=device)
-    keys = wp.empty(m, dtype=wp.uint64, device=device)
-    wp.launch(
-        kernel_bpa.mark_interior_edge_keys,
-        dim=m,
-        inputs=[unique_edges, edge_face_count, key_base, flags, keys],
-        device=device,
-    )
-    flags_bool = wp.empty(m, dtype=wp.bool, device=device)
-    wp.map(kernel_array.greater, flags, wp.int32(0), out=flags_bool)
-    interior_keys = tw.array.sort_pairs(tw.array.gather(keys, tw.array.flatnonzero(flags_bool)))[0]
-
-    # Front (single-use) edges with their opposite vertex.
-    front_src = wp.empty(m, dtype=wp.int32, device=device)
-    front_tgt = wp.empty(m, dtype=wp.int32, device=device)
-    front_opp = wp.empty(m, dtype=wp.int32, device=device)
-    front_count = wp.zeros(1, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_bpa.emit_front_edges,
-        dim=3 * n_faces,
-        inputs=[faces_view, inverse, edge_face_count, front_src, front_tgt, front_opp, front_count],
-        device=device,
-    )
-    n_front = int(front_count.numpy()[0])
-    if n_front == 0:
-        return
-
-    src = front_src[:n_front]
-    tgt = front_tgt[:n_front]
-
-    # Availability guard: a candidate must be orphan or itself on the front (never fully interior).
-    used = tw.array.indices_to_mask(faces_view, n, device=device)
-    # Orphan (unused) points start available; front membership is added afterwards.
-    point_available = wp.empty(n, dtype=wp.bool, device=device)
-    wp.map(kernel_array.mask_not, used, out=point_available)
-    wp.launch(
-        kernel_bpa.mark_front_endpoints,
-        dim=n_front,
-        inputs=[src, tgt, point_available],
-        device=device,
-    )
-
-    candidate = wp.empty(n_front, dtype=wp.int32, device=device)
     wp.launch(
         kernel_bpa.pivot_front_edges,
-        dim=n_front,
+        dim=state.front_grid,
         inputs=[
-            points,
-            normals,
-            src,
-            tgt,
-            front_opp[:n_front],
-            point_available,
-            grid.id,
-            wp.float32(radius),
-            wp.float32(clustering),
-            wp.float32(crease_cos),
-            interior_keys,
-            key_base,
-            candidate,
+            state.points,
+            state.normals,
+            state.grid.id,
+            state.radius,
+            state.clustering,
+            state.crease_cos,
+            state.key_base,
+            state.edge_key,
+            state.edge_count,
+            state.edge_src,
+            state.edge_tgt,
+            state.edge_opp,
+            state.edge_state,
+            state.edge_cand,
+            state.edge_mask,
+            state.point_used,
+            state.boundary_degree,
+            state.front_in,
+            state.front_grid,
+            state.counters,
+            state.owner,
+            state.front_out,
+            state.tri_a,
+            state.tri_b,
+            state.tri_c,
         ],
         device=device,
     )
-    active = wp.empty(n_front, dtype=wp.bool, device=device)
-    wp.map(kernel_array.greater_equal, candidate, wp.int32(0), out=active)
-    _bpa_commit(
-        wp.clone(src), wp.clone(tgt), candidate, active, n, all_faces, face_count, max_faces, device
-    )
-
-
-def _bpa_commit(
-    tri_a: wp.array[wp.int32],
-    tri_b: wp.array[wp.int32],
-    tri_c: wp.array[wp.int32],
-    active: wp.array[wp.bool],
-    n: int,
-    all_faces: wp.array[wp.int32],
-    face_count: wp.array[wp.int32],
-    max_faces: int,
-    device: wp.DeviceLike,
-) -> None:
-    """
-    Two-phase vertex-claim / commit of the proposed triangles.
-
-    The number committed is not read back here: the caller derives it from the wave's single
-    end-of-wave ``face_count`` readback, so the claim and commit launches are queued back to back
-    with no host wait between them.
-    """
-    length = int(tri_a.shape[0])
-    if length == 0:
-        return
-    owner = wp.full(n, INT32_MAX, dtype=wp.int32, device=device)
     wp.launch(
         kernel_bpa.claim_triangle_vertices,
-        dim=length,
-        inputs=[tri_a, tri_b, tri_c, active, owner],
+        dim=state.claim_grid,
+        inputs=[
+            state.tri_a,
+            state.tri_b,
+            state.tri_c,
+            state.claim_grid,
+            state.counters,
+            state.owner,
+        ],
         device=device,
     )
     wp.launch(
         kernel_bpa.commit_triangles,
-        dim=length,
-        inputs=[tri_a, tri_b, tri_c, active, owner, wp.int32(max_faces), all_faces, face_count],
+        dim=state.claim_grid,
+        inputs=[
+            state.tri_a,
+            state.tri_b,
+            state.tri_c,
+            state.owner,
+            wp.int32(state.max_faces),
+            state.key_base,
+            state.edge_mask,
+            state.claim_grid,
+            state.edge_key,
+            state.edge_count,
+            state.edge_src,
+            state.edge_tgt,
+            state.edge_opp,
+            state.edge_cand,
+            state.point_used,
+            state.boundary_degree,
+            state.counters,
+            state.front_out,
+            state.all_faces,
+        ],
         device=device,
     )
+    wp.launch(
+        kernel_bpa.end_wave, dim=1, inputs=[wp.int32(max_waves), state.counters], device=device
+    )
+
+
+# Waves queued between host synchronisations. The wave loop is device-driven — ``end_wave`` keeps
+# the seeding flag, the progress test and the continue flag in ``counters`` — so the host only ever
+# needs to look in order to *stop*, and it can queue a batch and let the device run ahead. A wave
+# that runs after the flag clears costs six no-op launches, which is far less than a sync.
+#
+# ``wp.capture_while`` would remove even that, and it was tried: on this workload the conditional
+# graph's per-iteration overhead (~0.25 ms/wave on ``bunny_decimated``) is larger than the sync it
+# replaces, because a batch already amortises the sync over eight waves.
+_BPA_WAVES_PER_BATCH = 8
+
+# Host round-trips beyond the batching are only taken to grow the budget (doubling, so
+# logarithmically many) or to compact a front that ``pivot_front_edges`` left sparse (which needs
+# the front to have grown 4x against its live count, so also rare).
+_BPA_MAX_BATCHES = 1 << 16
+
+
+def _bpa_run(state: _BpaState, max_waves: int) -> None:
+    """
+    Drive the wave loop until the front and the orphan set are both exhausted.
+
+    The host is woken once per batch, and only acts when the device asks it to — to grow the
+    triangle budget, to compact a sparse front, or to stop.
+    """
+    state.counters[kernel_bpa.CNT_CONTINUE : kernel_bpa.CNT_CONTINUE + 1].fill_(1)
+    for _ in range(_BPA_MAX_BATCHES):
+        for _ in range(_BPA_WAVES_PER_BATCH):
+            _bpa_wave(state, max_waves)
+            state.front_in, state.front_out = state.front_out, state.front_in
+        counters = state.counters.numpy()
+        if counters[kernel_bpa.CNT_CONTINUE]:
+            continue
+        if counters[kernel_bpa.CNT_DONE] or counters[kernel_bpa.CNT_WAVE] >= max_waves:
+            return
+        if counters[kernel_bpa.CNT_GROW]:
+            state.grow()
+        else:
+            state.compact()
+        state.counters[kernel_bpa.CNT_CONTINUE : kernel_bpa.CNT_CONTINUE + 1].fill_(1)
 
 
 def _clean_reconstruction(

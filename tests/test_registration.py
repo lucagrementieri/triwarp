@@ -125,6 +125,52 @@ def test_procrustes_no_scale(device: str) -> None:
     assert np.allclose(cost_tw, cost_tm, rtol=1e-4, atol=1e-4)
 
 
+def test_procrustes_far_from_origin(device: str) -> None:
+    """
+    Single-pass moments must survive a cloud far from the origin.
+
+    The fused accumulation shifts by ``a[0]`` rather than by the origin precisely so the
+    cancellation in the second-moment identity stays bounded by ``(diameter / spread) ** 2``
+    instead of ``(|centroid| / spread) ** 2`` — the latter is unbounded and would be worth about
+    27 bits here, i.e. all of float32.
+
+    The reference is trimesh run on the **float32-rounded** clouds. At ``+1e4`` with unit spread,
+    representing the input in float32 at all costs ~2e-4 in the rotation and ~3 units in the
+    translation, whichever algorithm consumes it; comparing against the float64-input fit would
+    measure that instead of the accumulation.
+    """
+    rng = np.random.default_rng(11)
+    a_np, b_np = _make_point_clouds(rng)
+    a_np = (a_np + 1.0e4).astype(np.float32).astype(np.float64)
+    b_np = (b_np + 1.0e4).astype(np.float32).astype(np.float64)
+    matrix_tm, transformed_tm, cost_tm, matrix_tw, transformed_wp, cost_tw = _run_both(
+        a_np, b_np, device
+    )
+    assert np.allclose(matrix_tw[:3, :3], matrix_tm[:3, :3], rtol=1e-4, atol=1e-4)
+    # The translation is ``bcenter - sR @ acenter``, so its error scales with the *centroid*
+    # magnitude (1e4 here), not with its own — a component that happens to land near zero is not
+    # thereby more accurate. Tolerance is therefore ``1e-4`` of the coordinate scale.
+    coordinate_scale = float(np.abs(a_np).max())
+    assert np.allclose(matrix_tw[:3, 3], matrix_tm[:3, 3], rtol=1e-4, atol=1e-4 * coordinate_scale)
+    assert np.allclose(
+        transformed_wp.numpy(), transformed_tm, rtol=1e-4, atol=1e-4 * coordinate_scale
+    )
+    assert np.allclose(cost_tw, cost_tm, rtol=1e-4, atol=1e-4)
+
+
+def test_procrustes_fractional_weights(device: str) -> None:
+    """Non-binary weights: the masked covariance and the weighted moments must agree."""
+    rng = np.random.default_rng(12)
+    a_np, b_np = _make_point_clouds(rng)
+    weights_np = rng.uniform(0.1, 3.0, size=a_np.shape[0])
+    matrix_tm, transformed_tm, cost_tm, matrix_tw, transformed_wp, cost_tw = _run_both(
+        a_np, b_np, device, weights_np=weights_np
+    )
+    assert np.allclose(matrix_tw, matrix_tm, rtol=1e-4, atol=1e-4)
+    assert np.allclose(transformed_wp.numpy(), transformed_tm, rtol=1e-4, atol=1e-4)
+    assert np.allclose(cost_tw, cost_tm, rtol=1e-4, atol=1e-4)
+
+
 def test_procrustes_return_matrix_only(device: str) -> None:
     rng = np.random.default_rng(6)
     a_np, b_np = _make_point_clouds(rng)

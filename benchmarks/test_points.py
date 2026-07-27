@@ -37,7 +37,7 @@ Caps
 ----
 Both ``estimate_normals`` groups are capped at ``bunny``. The neighbour table is what costs: at
 ``k = 30`` triwarp's k-NN kernel is the dominant term (see
-[`test_registration.py`](test_registration.py) for the measured ``k=1`` figure), and open3d's serial
+[`test_neighbors.py`](test_neighbors.py), which times that kernel on its own), and open3d's serial
 ``KDTreeFlann`` scales the same way.
 
 ``fit_line``'s **trimesh** case is capped at ``bunny`` as well, and for a different reason:

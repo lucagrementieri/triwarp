@@ -286,6 +286,129 @@ def submesh_from_face_indices(
     return sub_vertices, sub_faces
 
 
+def submeshes_from_face_groups(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    group_face_indices: wp.array[wp.int32],
+    group_offsets: wp.array[wp.int32],
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Extract many face subsets at once: CSR groups in, CSR submeshes out.
+
+    The batched form of
+    [`submesh_from_face_indices`][triwarp.selection.submesh_from_face_indices]. Every launch count
+    is ``O(1)`` in the number of groups, so extracting ten thousand components costs the same
+    number of kernel launches and host synchronisations as extracting one — which is the whole
+    point, since the per-group loop it replaces pays a sort, a scan and a readback *each*.
+
+    How it stays batched: each corner of each selected face is packed into the single ``int64`` key
+    ``group * n_vertices + vertex``, and one global
+    [`unique_1d`][triwarp.grouping.unique_1d] deduplicates all groups together. Because the key is
+    ``group * radix + vertex``, ascending key order is exactly ``(group, vertex)`` lexicographic
+    order, so the unique slots come out already partitioned by group **and** ascending by original
+    vertex index within each group — bit-identical to running ``unique_1d`` per group.
+
+    A vertex shared by two groups is duplicated into both, matching
+    [`trimesh.util.submesh`][] and the per-group loop.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions on the target device.
+    faces
+        Length-``3 * n_faces`` flat triangle index buffer.
+    group_face_indices
+        Concatenated face indices of every group, as ``wp.int32``. Indices must be unique within a
+        group (duplicates would produce duplicate output faces).
+    group_offsets
+        Length-``k`` ``wp.int32`` start of each group in ``group_face_indices``, ascending, with
+        ``group_offsets[0] == 0`` — the repo's no-terminator CSR convention (as in
+        [`pack_1d_arrays`][triwarp.array.pack_1d_arrays] and
+        [`bfs_multi_source`][triwarp.graph.bfs_multi_source]). Groups must be non-empty.
+
+    Returns
+    -------
+    vertices_all : wp.array[wp.vec3]
+        Every group's compacted vertices, concatenated.
+    vertex_offsets : wp.array[wp.int32]
+        Length-``k`` start of each group in ``vertices_all``; group ``g`` owns
+        ``vertices_all[vertex_offsets[g] : vertex_offsets[g + 1]]``, with the last group running to
+        the end.
+    faces_all : wp.array[wp.int32]
+        Every group's reindexed flat faces, concatenated in the same group order. Group ``g`` owns
+        ``faces_all[3 * group_offsets[g] : 3 * group_offsets[g + 1]]`` — the *input* offsets,
+        scaled by three, because a group keeps exactly the faces it was given.
+
+    Raises
+    ------
+    ValueError
+        If ``k * n_vertices`` overflows the ``int64`` packing budget of ``2 ** 62``.
+
+    See Also
+    --------
+    [`submesh_from_face_indices`][triwarp.selection.submesh_from_face_indices]
+    [`split_batched`][triwarp.combine.split_batched]
+    [`unique_1d`][triwarp.grouping.unique_1d]
+    """
+    device = vertices.device
+    k = int(group_offsets.shape[0])
+    n_selected = int(group_face_indices.shape[0])
+    n_vertices = int(vertices.shape[0])
+    if k == 0 or n_selected == 0:
+        return (
+            wp.empty(0, dtype=wp.vec3, device=device),
+            wp.zeros(k, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+        )
+    radix = max(n_vertices, 1)
+    if k * radix >= 1 << 62:
+        raise ValueError(
+            f"submeshes_from_face_groups cannot pack {k} groups x {radix} vertices into int64"
+        )
+
+    n_corners = 3 * n_selected
+    keys = wp.empty(n_corners, dtype=wp.int64, device=device)
+    wp.launch(
+        kernel_selection.pack_group_vertex_keys,
+        dim=n_corners,
+        inputs=[faces, group_face_indices, group_offsets, wp.int64(radix), keys],
+        device=device,
+    )
+
+    unique_keys, inverse = tw.grouping.unique_1d(keys, return_inverse=True)
+    n_slots = int(unique_keys.shape[0])
+    slot_groups = wp.empty(n_slots, dtype=wp.int32, device=device)
+    vertex_ids = wp.empty(n_slots, dtype=wp.int32, device=device)
+    wp.map(kernel_selection.group_of_key, unique_keys, wp.int64(radix), out=slot_groups)
+    wp.map(kernel_selection.vertex_of_key, unique_keys, wp.int64(radix), out=vertex_ids)
+
+    # Group starts from a histogram plus an exclusive scan rather than ``flatnonzero`` on the run
+    # starts: no host synchronisation, and an empty group still gets a (zero-length) entry.
+    group_counts = wp.zeros(k, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_selection.count_group_slots,
+        dim=n_slots,
+        inputs=[slot_groups, group_counts],
+        device=device,
+    )
+    vertex_offsets = wp.empty(k, dtype=wp.int32, device=device)
+    wp.utils.array_scan(group_counts, out_array=vertex_offsets, inclusive=False)
+
+    local_of_slot = wp.empty(n_slots, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_selection.local_vertex_index,
+        dim=n_slots,
+        inputs=[slot_groups, vertex_offsets, local_of_slot],
+        device=device,
+    )
+
+    return (
+        tw.array.gather(vertices, vertex_ids),
+        vertex_offsets,
+        tw.array.gather(local_of_slot, inverse),
+    )
+
+
 def submesh_from_face_mask(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], face_mask: wp.array[wp.bool]
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:

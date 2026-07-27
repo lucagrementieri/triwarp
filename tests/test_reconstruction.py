@@ -8,12 +8,15 @@ property checks (watertightness, edge-manifoldness, Euler characteristic, surfac
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
 
 import triwarp as tw
+from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
 
 _meshlib = pytest.importorskip("meshlib")
 from meshlib import mrmeshnumpy as mn  # noqa: E402
@@ -691,6 +694,61 @@ def test_ball_pivoting_edge_manifold(device: str):
     _vertices, faces_wp = tw.reconstruction.ball_pivoting(points_wp, normals_wp)
     # The cleanup tail removes non-manifold faces, so no edge is shared by more than two faces.
     assert _edge_multiplicity(faces_wp.numpy().reshape(-1, 3)).max() <= 2
+
+
+def test_ball_pivoting_closes_a_dense_sphere(device: str):
+    """
+    The strongest end-to-end guard available: a uniformly sampled closed surface must close.
+
+    With a persistent front and Border-edge retirement, a subdivided icosphere reconstructs to
+    exactly the Euler face count with no boundary edge at all. That single assertion catches both
+    directions of failure at once — retiring an edge that could still have succeeded would leave
+    holes, and letting colliding fronts triangulate a neighbourhood twice (the artefact the
+    front-rebuilt-per-wave design produced, at 24% boundary edges and 3.1 faces per vertex) would
+    push the face count well past ``2 v - 4``.
+    """
+    from scipy.spatial import cKDTree
+
+    points_np, normals_np = _sphere_cloud(3)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    vertices_wp, faces_wp = tw.reconstruction.ball_pivoting(points_wp, normals_wp)
+    faces_np = faces_wp.numpy().reshape(-1, 3)
+    multiplicity = _edge_multiplicity(faces_np)
+
+    assert int((multiplicity == 1).sum()) == 0  # watertight
+    assert int(multiplicity.max()) == 2  # edge-manifold
+    n_referenced = len(np.unique(faces_np))
+    assert n_referenced == points_np.shape[0]  # every input point used
+    assert faces_np.shape[0] == 2 * n_referenced - 4  # Euler, for a closed genus-0 surface
+
+    # And it interpolates: every input point is a vertex of the result.
+    assert cKDTree(vertices_wp.numpy().astype(np.float64)).query(points_np)[0].max() < 1e-6
+
+
+def test_ball_pivoting_grows_the_triangle_budget(device: str):
+    """
+    A budget far below what the mesh needs must grow, not raise or truncate.
+
+    Growing rehashes the edge table (slot indices move) and rebuilds the front list from it, so
+    this also covers that path. The result has to match a run that never had to grow.
+    """
+    points_np, normals_np = _sphere_cloud(3)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+    grid = tw.neighbors.hashgrid_from_points(points_wp, 2.0 * 0.2)
+
+    faces_per_budget = []
+    for start_budget in (64, 4 * points_np.shape[0] + 16):
+        state = tw.reconstruction._BpaState(
+            points_wp, normals_wp, grid, 0.2, 0.2, math.cos(math.pi / 2.0), start_budget
+        )
+        tw.reconstruction._bpa_run(state, 16 * points_np.shape[0])
+        counters_np = state.counters.numpy()
+        assert counters_np[kernel_bpa.CNT_DONE] == 1
+        faces_per_budget.append(int(counters_np[kernel_bpa.CNT_FACE]))
+    grown, direct = faces_per_budget
+    assert grown > 64  # it really did outgrow the initial allocation
+    assert abs(grown - direct) <= 0.01 * direct
 
 
 def test_ball_pivoting_face_count_near_open3d(device: str):

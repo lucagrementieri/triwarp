@@ -397,27 +397,6 @@ def outer_sum_tile(
     return m
 
 
-@wp.func
-def cross_outer_sum_tile(
-    a: wp.array[wp.vec3],
-    b: wp.array[wp.vec3],
-    weights: wp.array[wp.float32],
-    a_center: wp.vec3,
-    b_center: wp.vec3,
-    offset: int,
-    remaining: int,
-) -> wp.mat33:
-    count = wp.min(remaining, TILE_1D)
-    # masked cross-covariance H = sum_{k: w_k > 0} outer(b_k - b_center, a_k - a_center)
-    m = wp.mat33(0.0)
-    for k in range(count):
-        if weights[offset + k] > wp.float32(0.0):
-            ac = a[offset + k] - a_center
-            bc = b[offset + k] - b_center
-            m += wp.outer(bc, ac)
-    return m
-
-
 @wp.kernel
 def sum_vec3_1d_tiled(values: wp.array[wp.vec3], out_sum: wp.array[wp.vec3]) -> None:
     i, t = wp.tid()

@@ -182,10 +182,58 @@ def test_split_meshes(request: pytest.FixtureRequest) -> None:
         assert np.array_equal(faces_wp.numpy(), mesh_tm.faces.reshape(-1))
 
 
+def test_split_batched_matches_split(request: pytest.FixtureRequest) -> None:
+    """``split`` slices ``split_batched``: the CSR must agree with it slice for slice."""
+    meshes_wp = [
+        request.getfixturevalue(name) for name in ("icosahedron", "hemisphere", "half_torus")
+    ]
+    concat_vertices_wp, concat_faces_wp = tw.combine.concatenate(
+        [(mesh_wp.points, mesh_wp.indices) for _mesh_tm, mesh_wp in meshes_wp]
+    )
+
+    vertices_all_wp, vertex_offsets_wp, faces_all_wp, face_offsets_wp = tw.combine.split_batched(
+        concat_vertices_wp, concat_faces_wp
+    )
+    split_wp = tw.combine.split(concat_vertices_wp, concat_faces_wp)
+    assert int(vertex_offsets_wp.shape[0]) == len(split_wp) == 3
+
+    vertex_bounds_np = [*vertex_offsets_wp.numpy().tolist(), int(vertices_all_wp.shape[0])]
+    face_bounds_np = [*face_offsets_wp.numpy().tolist(), int(faces_all_wp.shape[0]) // 3]
+    for index, (vertices_wp, faces_wp) in enumerate(split_wp):
+        v_begin, v_end = vertex_bounds_np[index], vertex_bounds_np[index + 1]
+        f_begin, f_end = face_bounds_np[index], face_bounds_np[index + 1]
+        assert np.array_equal(vertices_all_wp.numpy()[v_begin:v_end], vertices_wp.numpy())
+        assert np.array_equal(faces_all_wp.numpy()[3 * f_begin : 3 * f_end], faces_wp.numpy())
+
+    # ``copy=True`` returns the same data in independent buffers.
+    for (view_vertices_wp, view_faces_wp), (copy_vertices_wp, copy_faces_wp) in zip(
+        split_wp, tw.combine.split(concat_vertices_wp, concat_faces_wp, copy=True), strict=True
+    ):
+        assert np.array_equal(view_vertices_wp.numpy(), copy_vertices_wp.numpy())
+        assert np.array_equal(view_faces_wp.numpy(), copy_faces_wp.numpy())
+        assert copy_vertices_wp.ptr != view_vertices_wp.ptr
+
+
+def test_split_single_component(request: pytest.FixtureRequest) -> None:
+    """The ``k == 1`` fast path must return the same thing as the batched key packing."""
+    mesh_tm, mesh_wp = request.getfixturevalue("icosahedron")
+    split_wp = tw.combine.split(mesh_wp.points, mesh_wp.indices)
+    assert len(split_wp) == 1
+    assert np.allclose(split_wp[0][0].numpy(), mesh_tm.vertices, rtol=1e-5, atol=1e-5)
+    assert np.array_equal(split_wp[0][1].numpy(), mesh_tm.faces.reshape(-1))
+
+
 def test_split_empty(device: str) -> None:
     vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
     assert tw.combine.split(vertices_wp, faces_wp) == []
+    vertices_all_wp, vertex_offsets_wp, faces_all_wp, face_offsets_wp = tw.combine.split_batched(
+        vertices_wp, faces_wp
+    )
+    assert vertices_all_wp.shape == (0,)
+    assert vertex_offsets_wp.shape == (0,)
+    assert faces_all_wp.shape == (0,)
+    assert face_offsets_wp.shape == (0,)
 
 
 def test_edges_to_csr_roundtrip(device: str) -> None:
