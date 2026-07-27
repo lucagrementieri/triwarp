@@ -566,17 +566,14 @@ def screened_inverse_diagonal(
     out_inv_diag[idx] = 1.0 / d
 
 
-@wp.kernel(enable_backward=False)
-def diagonal_precond_matvec(
-    x: wp.array(dtype=wp.float32),
-    y: wp.array(dtype=wp.float32),
-    inv_diag: wp.array(dtype=wp.float32),
-    alpha: wp.float32,
-    beta: wp.float32,
-    out_z: wp.array(dtype=wp.float32),
-) -> None:
-    idx = int(wp.tid())
-    out_z[idx] = alpha * inv_diag[idx] * x[idx] + beta * y[idx]
+@wp.func
+def diagonal_precond_axpby(
+    x: wp.float32, y: wp.float32, inv_diag: wp.float32, alpha: wp.float32, beta: wp.float32
+) -> wp.float32:
+    # One element of ``z = alpha * M^-1 x + beta * y`` for the Jacobi preconditioner
+    # ``M = diag(d)``. Mapped (not a kernel) so the wrapper can hoist the launch out of the
+    # CG iteration; see ``reconstruction._diagonal_operator``.
+    return alpha * inv_diag * x + beta * y
 
 
 @wp.kernel(enable_backward=False)

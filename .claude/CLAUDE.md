@@ -57,6 +57,14 @@ At **Python scope**, Warp supports **gather** with integer indexing: `view = src
 
 - **1D gather:** `vertices[indices]`, `lookup[elements]`, etc.
 - **2D index arrays:** Warp requires **1D** index arrays for `[]` gather — flatten first (`elements.flatten()`), gather, `wp.copy`, then `.reshape(original_shape)`.
+- **⚠️ The index array must be CONTIGUOUS.** Warp 1.15 reads the index buffer as if contiguous and
+  **silently ignores a view's stride** — no exception is raised. `payload[edges[:, 0]]` returns the
+  flattened buffer's leading entries (`[0, 10, 1, 11, …]`), not column 0. A contiguous *prefix*
+  slice (`arr[:n]`) is safe; a column (`arr[:, k]`) or step slice (`arr[::2]`) is not — `wp.copy`
+  it into a dense buffer first. This is why `kernels/edges.py:edge_lengths` stays a kernel rather
+  than becoming `wp.map(seg_len, verts[edges[:, 0]], verts[edges[:, 1]])`. When converting a gather,
+  verify **values**, not just that it runs and is faster: the corrupt version reads a contiguous
+  prefix and is measurably *faster* than the correct one.
 - **Indexed assignment** (`arr[indices] = value`) is **not** supported on `wp.array` at Python scope — keep a small kernel for scatter / mask marking (e.g. `mark_membership_mask` in `triwarp/kernels/array.py`).
 
 Do **not** add custom per-element gather kernels when `[]` plus `wp.copy` suffices. Probe tests live in `tests/test_*_indexing_probe.py`.

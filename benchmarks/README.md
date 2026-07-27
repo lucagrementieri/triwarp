@@ -68,7 +68,17 @@ into a single table).
   them (they have non-manifold vertices, which its vertex-ring walk assumes away) — a hard crash
   that takes the pytest process with it, so `test_curvature` draws that comparison on the synthetic
   saddle patches instead. `test_parametrization` documents a milder version of the same problem
-  (igl's direct LDLT cannot factor the scan meshes' cotangent systems).
+  (igl's direct LDLT cannot factor the scan meshes' cotangent systems), and `test_geodesic` a third
+  (`igl.heat_geodesics_precompute` raises `Precomputation failed.` on every scan mesh) — both also
+  fall back to the saddle patches.
+- **Polyline benchmarks are driven by boundary loops, not mesh geometry.** `test_polyline` uses the
+  longest boundary loop of the *synthetic* meshes (the cylinder's `2**16`-vertex rim is the
+  asymptotic case); the scan meshes' holes are a few vertices each and would measure only launch
+  latency.
+- **`test_texture` uses projected, non-injective UVs** (vertex `xy` normalized to the unit square)
+  because the scan meshes carry no atlas and computing one would dominate the measurement. The
+  rasterizer cost is the number of (triangle, covered pixel) pairs, which a projection reproduces
+  faithfully; the module docstring explains why that is sound for timing but not for parity.
 
 ## open3d coverage
 
@@ -93,14 +103,24 @@ built from the same NumPy source every other library gets.
 | `test_vertices` | `compute_vertex_normals` |
 | `test_proximity` | `get_axis_aligned_bounding_box` (`aabb_bounds` only) |
 | `test_points` | `PointCloud.estimate_normals` (`KDTreeSearchParamKNN`) |
+| `test_convex` | `compute_convex_hull` (exact qhull vs the approximate support sweep) |
 
 Modules with **no** open3d equivalent, and why, are documented in each module's docstring:
 `test_edges` (no general edge list), `test_boundary` (no loop ordering), `test_grouping` (array
 primitive), `test_parametrization` (no harmonic/LSCM/ARAP), `test_distance` (no autodiff),
 `test_laplacian` (no cotangent or mass matrix — the smoothing filters build their weights inline),
-`test_curvature` (no curvature estimation at all), plus the individual functions noted inline
-(`winding_number`, `thickness`, `geodesic_ball`, `triangulate_point_cloud`, `subdivide_to_size`,
-`flip_to_delaunay`, `isotropic_remesh`, `centroid`, `n_vertices`, `is_volume`, `bfs`).
+`test_curvature` (no curvature estimation at all), `test_intersection` (no plane section; its
+booleans need the `open3d.t` backend and a coupled remesh), `test_texture` (stores UVs but has no
+bake or resample), `test_polyline` (`LineSet` is unordered segments with no length/resample/simplify),
+`test_geodesic` (no geodesic distance), `test_reduce` (array primitive), plus the individual
+functions noted inline (`winding_number`, `thickness`, `geodesic_ball`, `triangulate_point_cloud`,
+`subdivide_to_size`, `flip_to_delaunay`, `isotropic_remesh`, `centroid`, `n_vertices`, `is_volume`,
+`bfs`).
+
+Modules with no baseline from **any** of the three references are `test_texture`, `test_polyline`
+and `test_reduce` (plus `mesh_with_mesh` in `test_intersection`); each docstring says which
+reference was considered and why it is not apples-to-apples. Those are before/after
+self-comparisons.
 
 Where the reference is not algorithmically identical, the module docstring says so — `test_repair`
 (open3d's dedup is orientation-sensitive), `test_sample` (count- vs radius-parametrized),

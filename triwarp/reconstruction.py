@@ -727,12 +727,27 @@ def _diagonal_operator(
     inv_diag: wp.array[wp.float32], n_nodes: int, device: wp.DeviceLike
 ) -> wpl.LinearOperator:
     """Jacobi (inverse-diagonal) preconditioner as a ``LinearOperator``."""
+    # ``wpl.cg`` applies the preconditioner once per iteration, so the mapped kernel is derived
+    # once here and only relaunched inside the loop (CLAUDE.md section 4). ``return_kernel=True``
+    # returns before mapping, so passing ``inv_diag`` for the x / y / out slots writes nothing --
+    # it only supplies the dtype and length that ``x``, ``y`` and ``z`` will have.
+    precond = wp.map(
+        kernel_reconstruction.diagonal_precond_axpby,
+        inv_diag,
+        inv_diag,
+        inv_diag,
+        wp.float32(0.0),
+        wp.float32(0.0),
+        out=inv_diag,
+        return_kernel=True,
+    )
 
     def matvec(x, y, z, alpha, beta):
         wp.launch(
-            kernel_reconstruction.diagonal_precond_matvec,
+            precond,
             dim=n_nodes,
-            inputs=[x, y, inv_diag, wp.float32(alpha), wp.float32(beta), z],
+            inputs=[x, y, inv_diag, wp.float32(alpha), wp.float32(beta)],
+            outputs=[z],
             device=device,
         )
 

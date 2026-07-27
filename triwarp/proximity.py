@@ -240,14 +240,16 @@ def signed_distance_on_mesh(
     points: wp.array[wp.vec3],
     *,
     max_dist: float | None = None,
+    sign_mode: Literal["parity", "winding"] = "parity",
     n_sample: int = 5,
     perturbation_scale: float = 0.1,
+    accuracy: float = 2.0,
+    winding_threshold: float = 0.5,
 ) -> wp.array[wp.float32]:
     """
     Signed distance from each query point to a triangle mesh (Warp SDF convention).
 
-    Uses ``wp.mesh_query_point_sign_parity`` via ``wp.Mesh``. Distances follow
-    Warp's signed-distance field convention:
+    Distances follow Warp's signed-distance field convention:
 
     * Points **outside** the mesh have **positive** distance.
     * Points **inside** have **negative** distance.
@@ -257,6 +259,37 @@ def signed_distance_on_mesh(
     Trimesh ``signed_distance`` uses the opposite sign; negate its output to compare.
     See also [`contains_points`][triwarp.ray.contains_points] (inside iff signed distance is
     negative, except on the on-surface tolerance band).
+
+    The **unsigned** distance is identical in both ``sign_mode`` values — only the sign differs.
+
+    !!! note "Choosing a `sign_mode`"
+
+        ``"parity"`` (default) uses ``wp.mesh_query_point_sign_parity``: it casts ``n_sample``
+        perturbed rays and votes on the crossing parity. Exact on a watertight mesh, cheap, but
+        it has no principled answer on an open or holed surface — a ray that escapes through a
+        hole flips the verdict.
+
+        ``"winding"`` uses ``wp.mesh_query_point_sign_winding_number``, which evaluates the
+        *generalized winding number* on the mesh BVH (a Barnes-Hut style traversal governed by
+        ``accuracy``) and compares it against ``winding_threshold``. This is the
+        Jacobson et al. robust inside/outside criterion and it degrades gracefully on
+        non-watertight input, which is why it is the mode to reach for on raw scan data.
+
+        Measured on this repo's fixtures: the two modes agree on watertight meshes
+        (icosahedron, ``cave_cube``), but on a sphere with a patch of faces removed ``"winding"``
+        reproduces the exact generalized winding number's sign on 100% of query points while
+        ``"parity"`` manages 93.2%. The costs are a 1.2-1.5x slower query
+        (``benchmarks/test_proximity.py``) and a substantially larger ``wp.Mesh``:
+        ``support_winding_number=True`` stores a solid-angle expansion per BVH node, measured at
+        roughly 3x the mesh's device memory (+235 MB on dragon's 871k faces).
+
+        ``"winding"`` is still much cheaper than thresholding
+        [`winding_number`][triwarp.proximity.winding_number] yourself, because that sums the exact
+        solid angle over *every* face for *every* query: at 10k queries the same sign decision costs
+        8.1 ms this way versus 167 ms exactly on dragon (871k faces), and the gap widens with the
+        face count. Reach for [`winding_number`][triwarp.proximity.winding_number] only when you
+        need the winding *value* — Warp exposes no builtin for the approximated value, only its
+        sign.
 
     Parameters
     ----------
@@ -269,16 +302,39 @@ def signed_distance_on_mesh(
     max_dist
         Maximum search radius per query. When ``None``, derived from the
         axis-aligned box enclosing mesh vertices and query points.
+    sign_mode
+        ``"parity"`` (default) for ray-parity sign, ``"winding"`` for the generalized
+        winding-number sign. See the note above.
     n_sample
-        Perturbed rays for parity voting (off-triangle sign branch).
+        Perturbed rays for parity voting (off-triangle sign branch). ``"parity"`` only.
     perturbation_scale
-        Uniform perturbation scale for parity rays.
+        Uniform perturbation scale for parity rays. ``"parity"`` only.
+    accuracy
+        Barnes-Hut accuracy for the winding-number traversal: a node is expanded when the query
+        point is within ``accuracy`` times the node's radius, so larger values are more accurate
+        and slower. ``"winding"`` only; Warp's default is ``2.0``.
+    winding_threshold
+        Winding number above which a point counts as inside. ``"winding"`` only; ``0.5`` is the
+        standard choice for a once-wound closed surface.
 
     Returns
     -------
     wp.array[wp.float32]
         ``(m,)`` signed distances in ``float32``.
+
+    Raises
+    ------
+    ValueError
+        If ``sign_mode`` is not ``"parity"`` or ``"winding"``.
+
+    See Also
+    --------
+    [`winding_number`][triwarp.proximity.winding_number]
+    [`contains_points`][triwarp.ray.contains_points]
     """
+    if sign_mode not in ("parity", "winding"):
+        raise ValueError(f"sign_mode must be 'parity' or 'winding', got {sign_mode!r}")
+
     device = vertices.device
     m = int(points.shape[0])
     n_faces = int(faces.shape[0]) // 3
@@ -288,10 +344,31 @@ def signed_distance_on_mesh(
         return wp.full(m, float("inf"), dtype=wp.float32, device=device)
 
     require_nonempty_mesh(faces, "signed_distance_on_mesh")
-    mesh = wp.Mesh(points=wp.clone(vertices), indices=wp.clone(faces))
+    # The winding-number builtin silently degrades to ray parity unless the mesh carries the
+    # per-node solid-angle expansion, so the flag is bound to sign_mode here rather than exposed.
+    mesh = wp.Mesh(
+        points=wp.clone(vertices),
+        indices=wp.clone(faces),
+        support_winding_number=sign_mode == "winding",
+    )
     if max_dist is None:
         max_dist = _default_mesh_query_max_dist(mesh.points, points)
     out_distance = wp.empty(m, dtype=wp.float32, device=device)
+    if sign_mode == "winding":
+        wp.launch(
+            kernel_proximity.signed_distance_on_mesh_winding,
+            dim=m,
+            inputs=[
+                mesh.id,
+                points,
+                wp.float32(max_dist),
+                wp.float32(accuracy),
+                wp.float32(winding_threshold),
+                out_distance,
+            ],
+            device=device,
+        )
+        return out_distance
     wp.launch(
         kernel_proximity.signed_distance_on_mesh,
         dim=m,

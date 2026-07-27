@@ -174,6 +174,34 @@ def signed_distance_on_mesh(
 
 
 @wp.kernel
+def signed_distance_on_mesh_winding(
+    mesh_id: wp.uint64,
+    points: wp.array[wp.vec3],
+    max_dist: wp.float32,
+    accuracy: wp.float32,
+    winding_threshold: wp.float32,
+    out_distance: wp.array[wp.float32],
+) -> None:
+    # Same closest-point / tolerance-band handling as ``signed_distance_on_mesh``; only the sign
+    # differs. ``mesh_id`` MUST come from a ``wp.Mesh`` built with ``support_winding_number=True``
+    # -- otherwise this builtin silently falls back to ray parity (warp/native/mesh.h:1348).
+    tid = wp.tid()
+    p = points[tid]
+    query = wp.mesh_query_point_sign_winding_number(
+        mesh_id, p, max_dist, accuracy, winding_threshold
+    )
+    if not query.result:
+        out_distance[tid] = max_dist
+        return
+    closest = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
+    dist = wp.length(p - closest)
+    if dist <= TOLERANCE_MERGE_CONSTANT:
+        out_distance[tid] = dist
+    else:
+        out_distance[tid] = query.sign * dist
+
+
+@wp.kernel
 def winding_number(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],

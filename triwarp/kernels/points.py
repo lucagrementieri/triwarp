@@ -48,12 +48,10 @@ def finalize_fit_line(m: wp.array[wp.mat33], out_axis: wp.array[wp.vec3]) -> Non
     # the singular values / right singular vectors of M match the squared
     # singular values / right singular vectors of the (n, 3) point matrix.
     u, sigma, _v = wp.svd3(m[0])
-    # axis = sum_i S_i * rsv_i, where S_i = sqrt(sigma_i) are the point
-    # singular values and the right singular vectors are columns of u.
-    axis = wp.vec3(0.0, 0.0, 0.0)
-    for i in range(3):
-        s = wp.sqrt(sigma[i])
-        axis += s * wp.vec3(u[0, i], u[1, i], u[2, i])
+    # axis = sum_i S_i * rsv_i, where S_i = sqrt(sigma_i) are the point singular values and the
+    # right singular vectors are the columns of u -- i.e. exactly the matrix-vector product
+    # u * (S_0, S_1, S_2). ``wp.sqrt`` is scalar-only, so the weight vector is built explicitly.
+    axis = u * wp.vec3(wp.sqrt(sigma[0]), wp.sqrt(sigma[1]), wp.sqrt(sigma[2]))
     out_axis[0] = wp.normalize(axis)
 
 

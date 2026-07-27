@@ -264,6 +264,23 @@ def contains_points(
     would be negative; behavior on the on-surface tolerance band is undefined.
     Boolean results still match [`trimesh.Trimesh.contains`][].
 
+    !!! note "Non-watertight meshes"
+
+        Ray parity has no principled answer on an open or holed surface. For those, use the
+        generalized winding-number sign instead:
+
+        ```python
+        inside = tw.proximity.signed_distance_on_mesh(v, f, pts, sign_mode="winding") < 0.0
+        ```
+
+        That mode is deliberately **not** offered here. It needs a ``wp.Mesh`` built with
+        ``support_winding_number=True``, and Warp neither records that flag on the mesh object nor
+        errors when it is missing — it silently falls back to ray parity. Since this function takes
+        a caller-supplied ``wp.Mesh``, triwarp cannot verify the flag, so the option would be able
+        to quietly return the parity answer.
+        [`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh] builds its own mesh
+        and therefore can guarantee it.
+
     Parameters
     ----------
     mesh

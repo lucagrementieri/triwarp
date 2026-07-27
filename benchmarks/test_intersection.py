@@ -1,0 +1,171 @@
+"""
+Benchmarks for ``triwarp.intersection``.
+
+Four functions on two different cost shapes:
+
+* ``mesh_with_plane`` / ``slice_mesh_with_plane`` — one pass over the faces, a per-vertex plane dot,
+  then a compaction of the (few) faces the plane actually crosses. Memory-bound and dominated by
+  the full-mesh sweep, not by the segment count: a plane meets O(sqrt(n_faces)) triangles but every
+  face is still classified.
+* ``mesh_with_mesh`` — the only quadratic-ish one. A ``wp.Mesh`` BVH is built over the smaller mesh
+  and every triangle of the other supplies an AABB query, so the cost tracks the number of
+  *candidate* pairs (capped per query triangle by ``max_triangle_collisions``) rather than the face
+  count. This is the benchmark that moves when the separating-axis narrow phase changes.
+* ``segments_with_plane`` — a pure ``wp.map`` over independent segments; the array-primitive
+  baseline for the module.
+
+References
+----------
+**trimesh** is the reference for three of the four: ``mesh_plane``, ``slice_faces_plane`` and
+``plane_lines``. Its ``Trimesh`` is rebuilt inside the timed callable for ``mesh_plane`` because
+``triangles`` / ``face_normals`` are cached properties that would make rounds 2..n measure only the
+plane arithmetic. ``slice_faces_plane`` and ``plane_lines`` take raw arrays and need no rebuild.
+
+**mesh_with_mesh has no CPU reference here.** trimesh's mesh-mesh intersection is not in
+``trimesh.intersections`` at all — it routes through the optional ``python-fcl`` collision backend,
+which reports *whether* pairs collide rather than returning the intersection curve, and is not a
+declared dependency. open3d's boolean operations require the (also optional) ``open3d.t`` tensor
+backend with a coupled remesh, so neither is an apples-to-apples baseline for "return the
+intersection segments". triwarp is timed alone; the before/after delta is what this case is for.
+
+**libigl** has no plane-section or mesh-mesh intersection binding in the Python package
+(``igl.ray_mesh_intersect`` is the only intersection entry point, a different query), so igl is
+absent from every case in this module.
+
+Caps
+----
+``mesh_with_mesh`` is capped at ``bunny``: the broad phase allocates
+``max_triangle_collisions`` candidate slots per query triangle, so the pair buffer alone is
+``16 * n_faces`` ints before the narrow phase filters it.
+
+Geometry
+--------
+Every plane cuts through the middle of the mesh — the origin is the vertex-bounding-box centre and
+the normal is a fixed off-axis direction — so the section is a full cross-section rather than a
+near-miss that would exit early. ``mesh_with_mesh`` intersects the mesh with a copy of itself
+translated by a fraction of its own extent, which guarantees a large, genuinely overlapping
+intersection curve on every mesh.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import trimesh as tm
+import warp as wp
+from conftest import BenchCase, skip_larger_than
+
+import triwarp as tw
+
+# Off-axis so no cut is degenerate w.r.t. the (axis-aligned) scan-mesh geometry.
+_PLANE_NORMAL = np.array([0.3, 0.8, 0.5])
+_PLANE_NORMAL = _PLANE_NORMAL / np.linalg.norm(_PLANE_NORMAL)
+
+# Self-intersection offset, as a fraction of the mesh bounding-box diagonal.
+_SELF_OFFSET_FRACTION = 0.05
+
+_shifted_cache: dict[tuple[str, str], wp.array[wp.vec3]] = {}
+
+
+def _plane_origin(bench_case: BenchCase) -> np.ndarray:
+    """Centre of the vertex bounding box — guarantees the plane cuts the mesh."""
+    vertices = bench_case.vertices_np
+    return 0.5 * (vertices.min(axis=0) + vertices.max(axis=0))
+
+
+def _shifted_vertices_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
+    """Translate the mesh's own vertices along the plane normal, to act as the second mesh."""
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _shifted_cache:
+        vertices = bench_case.vertices_np
+        diagonal = float(np.linalg.norm(vertices.max(axis=0) - vertices.min(axis=0)))
+        shifted = vertices + _SELF_OFFSET_FRACTION * diagonal * _PLANE_NORMAL
+        _shifted_cache[key] = wp.array(
+            np.ascontiguousarray(shifted, dtype=np.float32), dtype=wp.vec3, device=bench_case.device
+        )
+    return _shifted_cache[key]
+
+
+@pytest.mark.benchmark(group="mesh_with_plane")
+@pytest.mark.benchlibs("triwarp", "trimesh")
+def test_mesh_with_plane(bench_case: BenchCase) -> None:
+    """Cross-section segments of a mid-mesh plane: a full face sweep plus a compaction."""
+    origin = _plane_origin(bench_case)
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        normal = wp.vec3(*_PLANE_NORMAL.tolist())
+        plane_origin = wp.vec3(*origin.tolist())
+        lines = bench_case.run(
+            lambda: tw.intersection.mesh_with_plane(vertices, faces, normal, plane_origin)
+        )
+        assert lines.shape[1] == 2
+    else:  # rebuild inside: triangles / face_normals are cached Trimesh properties
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        lines_tm = bench_case.run(
+            lambda: tm.intersections.mesh_plane(
+                tm.Trimesh(vertices_np, faces_np, process=False), _PLANE_NORMAL, origin
+            )
+        )
+        assert lines_tm.shape[1] == 2
+
+
+@pytest.mark.benchmark(group="slice_mesh_with_plane")
+@pytest.mark.benchlibs("triwarp", "trimesh")
+def test_slice_mesh_with_plane(bench_case: BenchCase) -> None:
+    """Keep the positive-normal half of the mesh: classify every face, then re-triangulate cuts."""
+    origin = _plane_origin(bench_case)
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        normal = wp.vec3(*_PLANE_NORMAL.tolist())
+        plane_origin = wp.vec3(*origin.tolist())
+        new_vertices, new_faces = bench_case.run(
+            lambda: tw.intersection.slice_mesh_with_plane(vertices, faces, normal, plane_origin)
+        )
+        assert int(new_faces.shape[0]) % 3 == 0
+        assert new_vertices.shape[0] >= 0
+    else:  # takes raw arrays, no Trimesh cache to defeat
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        sliced = bench_case.run(
+            lambda: tm.intersections.slice_faces_plane(vertices_np, faces_np, _PLANE_NORMAL, origin)
+        )
+        assert sliced[1].shape[1] == 3
+
+
+@pytest.mark.benchmark(group="mesh_with_mesh")
+@pytest.mark.benchlibs("triwarp")
+def test_mesh_with_mesh(bench_case: BenchCase) -> None:
+    """BVH broad phase plus the separating-axis narrow phase, against a translated self-copy."""
+    skip_larger_than(bench_case, "bunny", "broad phase allocates 16 candidate slots per triangle")
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    shifted = _shifted_vertices_wp(bench_case)
+    lines = bench_case.run(lambda: tw.intersection.mesh_with_mesh(vertices, faces, shifted, faces))
+    assert lines.shape[1] == 2
+
+
+@pytest.mark.benchmark(group="segments_with_plane")
+@pytest.mark.benchlibs("triwarp", "trimesh")
+def test_segments_with_plane(bench_case: BenchCase) -> None:
+    """Batched segment-plane hits over the mesh's directed edges: one ``wp.map``, no adjacency."""
+    origin = _plane_origin(bench_case)
+    faces_np = bench_case.faces_np
+    # One segment per face corner: (v0,v1) of every triangle, so the count scales with the mesh.
+    start_np = bench_case.vertices_np[faces_np[:, 0]]
+    end_np = bench_case.vertices_np[faces_np[:, 1]]
+    if bench_case.kind == "triwarp":
+        device = bench_case.device
+        start = wp.array(
+            np.ascontiguousarray(start_np, dtype=np.float32), dtype=wp.vec3, device=device
+        )
+        end = wp.array(np.ascontiguousarray(end_np, dtype=np.float32), dtype=wp.vec3, device=device)
+        normal = wp.vec3(*_PLANE_NORMAL.tolist())
+        plane_origin = wp.vec3(*origin.tolist())
+        _points, valid = bench_case.run(
+            lambda: tw.intersection.segments_with_plane(start, end, plane_origin, normal)
+        )
+        assert valid.shape[0] == start_np.shape[0]
+    else:
+        endpoints = np.stack((start_np, end_np))
+        points_tm, valid_tm = bench_case.run(
+            lambda: tm.intersections.plane_lines(origin, _PLANE_NORMAL, endpoints)
+        )
+        assert points_tm.shape[0] == valid_tm.sum()

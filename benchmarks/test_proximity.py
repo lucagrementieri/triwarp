@@ -1,10 +1,15 @@
 """
 Benchmarks for ``triwarp.proximity`` hot paths.
 
-Covers winding number, AABB bounds, tangent spheres and geodesic-ball queries.
+Covers winding number, signed distance, AABB bounds, tangent spheres and geodesic-ball queries.
 ``winding_number`` is O(n_queries x n_faces) even in the tiled variant, so ``lucy`` is skipped;
 the pinned serial (``tiled=False``) path is additionally capped at ``bunny`` because one thread
 per query walking every face takes minutes beyond that.
+
+Read ``winding_number`` and ``signed_distance_on_mesh[winding]`` together: both answer an
+inside/outside question from solid angle, but the first accumulates it exactly over every face while
+the second lets Warp's BVH traversal approximate it and keeps only the sign. The gap between them is
+the cost of needing the winding *value* rather than just its sign.
 
 Only ``aabb_bounds`` has an open3d equivalent (``get_axis_aligned_bounding_box``). Open3D has no
 generalized winding number — its inside/outside test is raycasting-based
@@ -13,6 +18,8 @@ tangent-sphere, local-thickness or geodesic-ball query at all.
 """
 
 from __future__ import annotations
+
+from typing import Literal
 
 import igl
 import numpy as np
@@ -99,6 +106,30 @@ def test_winding_number_serial(bench_case: BenchCase) -> None:
         lambda: tw.proximity.winding_number(vertices, faces, points, tiled=False)
     )
     assert result.shape == (_N_QUERIES,)
+
+
+@pytest.mark.benchmark(group="signed_distance_on_mesh")
+@pytest.mark.benchlibs("triwarp")
+@pytest.mark.parametrize("sign_mode", ["parity", "winding"])
+def test_signed_distance_on_mesh(
+    bench_case: BenchCase, sign_mode: Literal["parity", "winding"]
+) -> None:
+    """
+    The two sign modes, on the same closest-point query.
+
+    ``"winding"`` walks the BVH accumulating solid angle (Barnes-Hut, ``accuracy=2.0``) instead of
+    casting 5 perturbed parity rays, and needs a ``wp.Mesh`` carrying the per-node solid-angle
+    expansion — so the ``wp.Mesh`` build inside the timed region differs between the two, which is
+    intentional: it is part of what the mode costs. Both include that build because
+    ``signed_distance_on_mesh`` constructs its own mesh (it takes vertex/face arrays, not a
+    ``wp.Mesh``), so there is no way for a caller to hoist it.
+    """
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    points = _query_points_wp(bench_case)
+    distance = bench_case.run(
+        lambda: tw.proximity.signed_distance_on_mesh(vertices, faces, points, sign_mode=sign_mode)
+    )
+    assert distance.shape == (_N_QUERIES,)
 
 
 @pytest.mark.benchmark(group="aabb_bounds")

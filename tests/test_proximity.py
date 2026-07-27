@@ -209,6 +209,87 @@ def test_signed_distance_on_mesh_random(request: pytest.FixtureRequest, mesh_nam
     assert np.allclose(signed_wp.numpy(), expected_np, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+def test_signed_distance_on_mesh_winding_matches_trimesh(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """On a watertight mesh the winding-number sign must agree with the trimesh reference."""
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    rng = np.random.default_rng(42)
+    points_np = rng.random((200, 3), dtype=np.float64) * 4.0 - 2.0
+
+    distance_tm = -tm_proximity.signed_distance(mesh_tm, points_np)
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    distance_wp = tw.proximity.signed_distance_on_mesh(
+        mesh_wp.points, mesh_wp.indices, points_wp, sign_mode="winding"
+    )
+    assert np.allclose(distance_wp.numpy(), distance_tm, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "hemisphere", "half_torus"])
+def test_signed_distance_on_mesh_winding_sign_matches_exact_winding_number(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    The builtin's Barnes-Hut sign must match thresholding the exact solid-angle sum.
+
+    This is the property that makes ``sign_mode="winding"`` worth having: it holds on the open
+    fixtures (``hemisphere``, ``half_torus``) too, where ray parity has no principled answer.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    rng = np.random.default_rng(7)
+    lower_np, upper_np = mesh_tm.bounds
+    points_np = rng.uniform(lower_np, upper_np, size=(500, 3))
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+
+    inside_wp = (
+        tw.proximity.signed_distance_on_mesh(
+            mesh_wp.points, mesh_wp.indices, points_wp, sign_mode="winding"
+        ).numpy()
+        < 0.0
+    )
+    inside_exact = (
+        tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, points_wp).numpy() > 0.5
+    )
+    assert np.array_equal(inside_wp, inside_exact)
+
+
+def test_signed_distance_on_mesh_winding_unsigned_matches_parity(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """Only the sign may differ between the two modes; the unsigned distance is the same query."""
+    _, mesh_wp = icosahedron
+    rng = np.random.default_rng(11)
+    points_wp = wp.array(
+        np.ascontiguousarray(rng.uniform(-2.0, 2.0, size=(200, 3)), dtype=np.float32),
+        dtype=wp.vec3,
+        device=mesh_wp.device,
+    )
+    parity_wp = tw.proximity.signed_distance_on_mesh(mesh_wp.points, mesh_wp.indices, points_wp)
+    winding_wp = tw.proximity.signed_distance_on_mesh(
+        mesh_wp.points, mesh_wp.indices, points_wp, sign_mode="winding"
+    )
+    assert np.allclose(np.abs(parity_wp.numpy()), np.abs(winding_wp.numpy()), rtol=1e-5, atol=1e-5)
+
+
+def test_signed_distance_on_mesh_rejects_unknown_sign_mode(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    _, mesh_wp = icosahedron
+    points_wp = wp.empty(4, dtype=wp.vec3, device=mesh_wp.device)
+    with pytest.raises(ValueError, match="sign_mode"):
+        tw.proximity.signed_distance_on_mesh(
+            mesh_wp.points,
+            mesh_wp.indices,
+            points_wp,
+            sign_mode="nearest",  # pyright: ignore[reportArgumentType]
+        )
+
+
 def test_signed_distance_on_mesh_sign_direction(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     mesh_tm, mesh_wp = icosahedron
     outside_np = np.asarray([mesh_tm.bounds[0] + [100.0, 100.0, 100.0]], dtype=np.float32)

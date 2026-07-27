@@ -38,7 +38,17 @@ Caps
 Both ``estimate_normals`` groups are capped at ``bunny``. The neighbour table is what costs: at
 ``k = 30`` triwarp's k-NN kernel is the dominant term (see
 [`test_registration.py`](test_registration.py) for the measured ``k=1`` figure), and open3d's serial
-``KDTreeFlann`` scales the same way. Everything else in the module runs the full registry.
+``KDTreeFlann`` scales the same way.
+
+``fit_line``'s **trimesh** case is capped at ``bunny`` as well, and for a different reason:
+``trimesh.points.major_axis`` calls ``numpy.linalg.svd`` on the ``(n, 3)`` point matrix with the
+default ``full_matrices=True``, so it materializes the full ``(n, n)`` left-singular matrix — 1.39
+**TiB** for dragon's 437,645 points, which raises ``numpy._core._exceptions._ArrayMemoryError``. The
+triwarp side never forms that matrix (it accumulates a 3x3 Gram matrix and calls ``wp.svd3`` on it),
+so it runs the full registry. ``fit_plane`` needs no such cap — ``trimesh.points.plane_fit`` does
+not take the full-matrices path.
+
+Everything else in the module runs the full registry.
 """
 
 from __future__ import annotations
@@ -128,6 +138,8 @@ def test_fit_line(bench_case: BenchCase) -> None:
         axis = bench_case.run(lambda: tw.points.fit_line(points))
         assert len(axis) == 3
     else:
+        # major_axis SVDs with full_matrices=True -> an (n, n) allocation; see the module docstring.
+        skip_larger_than(bench_case, "bunny", "trimesh's major_axis allocates an (n, n) SVD matrix")
         points_np = bench_case.vertices_np
         axis_tm = bench_case.run(lambda: tm.points.major_axis(points_np))
         assert axis_tm.shape == (3,)

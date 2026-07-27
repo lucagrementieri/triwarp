@@ -204,8 +204,20 @@ These are callable inside `@wp.kernel` / `@wp.func` as `wp.<name>(...)`.
 - `mesh_query_point(id, point)` — closest point on mesh.
 - `mesh_query_point_no_sign(id, point)` — closest point, no sign.
 - `mesh_query_point_sign_normal(id, point)` — closest point, sign via normal.
-- `mesh_query_point_sign_parity(id, point)` — closest point, sign via parity.
-- `mesh_query_point_sign_winding_number(id, point)` — closest point, sign via winding number.
+- `mesh_query_point_sign_parity(id, point, max_dist, n_sample, perturbation_scale)` — closest
+  point, sign via ray-crossing parity over `n_sample` perturbed rays.
+- `mesh_query_point_sign_winding_number(id, point, max_dist, accuracy=2.0, threshold=0.5)` —
+  closest point, sign via the generalized winding number (Barnes-Hut traversal of the BVH; the
+  sign is `winding > threshold ? -1 : +1`, so only a sign is returned, never the winding value).
+  ⚠️ **Requires `wp.Mesh(..., support_winding_number=True)`.** Without it the call **silently
+  falls back to ray parity** — no error and no warning (`native/mesh.h:1348`) — and `wp.Mesh` does
+  not record the flag, so it cannot be checked from Python. The flag costs roughly 3x the mesh's
+  device memory (a per-BVH-node solid-angle expansion) and is rejected by
+  `bvh_constructor='cubql'`.
+- ⚠️ The *value*-returning `mesh_query_winding_number(id, p, accuracy)` exists in
+  `native/mesh.h:1160` — it is the fast (Barnes-Hut) winding number, ~40x faster than an exact
+  per-face solid-angle sum — but it is **not registered as a builtin**, so it is unreachable from
+  kernel scope, including via the `builtin_functions` dictionary trick (CLAUDE.md §4).
 - `mesh_query_ray(id, start, dir, max_t)` — closest ray hit (< max_t).
 - `mesh_query_ray_anyhit(id, start, dir, max_t)` — any ray hit.
 - `mesh_query_ray_count_intersections(id, start, dir, max_t)` — count ray/mesh intersections.

@@ -321,17 +321,20 @@ def _check_delone_quadrangle_d(
 
 @wp.func
 def _incircle_d(a: wp.vec2d, b: wp.vec2d, c: wp.vec2d, d: wp.vec2d) -> wp.float64:
-    # Positive iff d is inside the circumcircle of CCW triangle (a, b, c).
-    ax = a[0] - d[0]
-    ay = a[1] - d[1]
-    bx = b[0] - d[0]
-    by = b[1] - d[1]
-    cx = c[0] - d[0]
-    cy = c[1] - d[1]
-    a2 = ax * ax + ay * ay
-    b2 = bx * bx + by * by
-    c2 = cx * cx + cy * cy
-    return ax * (by * c2 - b2 * cy) - ay * (bx * c2 - b2 * cx) + a2 * (bx * cy - by * cx)
+    # Positive iff d is inside the circumcircle of CCW triangle (a, b, c). The 3x3 determinant is
+    # kept expanded in components (as in ``predicates.orient2d``) because the term order is what
+    # makes the sign reliable near cocircularity; only the squared radii go through ``length_sq``.
+    ad = a - d
+    bd = b - d
+    cd = c - d
+    a2 = wp.length_sq(ad)
+    b2 = wp.length_sq(bd)
+    c2 = wp.length_sq(cd)
+    return (
+        ad[0] * (bd[1] * c2 - b2 * cd[1])
+        - ad[1] * (bd[0] * c2 - b2 * cd[0])
+        + a2 * (bd[0] * cd[1] - bd[1] * cd[0])
+    )
 
 
 # ---------------------------------------------------------------------------
