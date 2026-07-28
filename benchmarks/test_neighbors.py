@@ -14,11 +14,36 @@ with a data point (which would make ``k=1`` trivially certifiable at radius 0) a
 has neighbours at a realistic spacing. Both ``k=1`` and ``k=7`` are timed: ``k=1`` is what
 ``distance.py`` and ICP use, ``k=7`` is ``ball_pivoting``'s seed table.
 
+Axes
+----
+Nothing here is driven by a mesh property — the meshes are used only as point clouds — so the axes
+are the structure's own parameters, and there are three:
+
+* **k**, expressed as separate groups (``_k1`` / ``_k7``) rather than as a parametrize sweep,
+  because the two are different call sites rather than two points on a curve: ``k=1`` is what
+  ``distance.py`` and ICP use and takes a fast path, ``k=7`` is ``ball_pivoting``'s seed table and
+  maintains a per-query heap.
+* **build against query**. The k-NN groups above include the build, which is what a caller passing
+  raw buffers pays. The ``*_from_points`` groups below time the build *alone*, so subtracting them
+  answers the question that matters for ICP: whether its per-iteration index rebuild is the cost or
+  a red herring.
+* **structure resolution** — ``leaf_size`` for the BVH, ``grid_bins`` for the hash grid, and
+  ``radius`` for the ball queries. A leaf too large makes a shallow tree that is cheap to build and
+  slow to traverse; too few bins degenerates into a linear scan and too many pays for empty cells.
+  Ball-query cost is the *expected neighbour count*, roughly ``density x radius^3``, and the
+  two-phase count-then-fill means it is paid twice.
+
+The ``*_with_offsets`` form is used for the ball queries rather than plain ``query_*_ball``: the
+latter returns a Python ``list`` of per-query arrays, adding ``O(n_queries)`` of host slicing that
+would swamp the kernel. That host cost is real but belongs to a different question.
+
 What is inside the timed callable
 ---------------------------------
-Everything the public function does, including the spatial-index build and the bounds reduction —
-that is what a caller passing raw buffers actually pays. The index build is small next to the query
-(a ``bunny`` BVH build is ~0.2 ms), but hiding it would misreport the API.
+For the k-NN groups, everything the public function does, including the spatial-index build and the
+bounds reduction — that is what a caller passing raw buffers actually pays. The index build is small
+next to the query (a ``bunny`` BVH build is ~0.2 ms), but hiding it would misreport the API. The
+build and ball groups instead pass a prebuilt structure where the signature allows one, so they
+isolate the piece they name.
 
 Reference
 ---------
@@ -47,8 +72,18 @@ _SEED = 42
 _N_QUERIES = 20_000
 _OFFSET_FRACTION = 0.01
 
+# BVH leaf sizes and hash-grid bin counts: the structure-resolution knobs.
+_LEAF_SIZES = [4, 32]
+_GRID_BINS = [32, 256]
+
+# Ball radii as multiples of the mean edge length. Expected neighbours grow ~cubically, so these
+# two points are roughly 8x apart in work.
+_RADIUS_SCALES = [2.0, 4.0]
+
 _queries_np_cache: dict[str, np.ndarray] = {}
 _queries_wp_cache: dict[tuple[str, str], wp.array] = {}
+_bvh_cache: dict[tuple[str, str], wp.Bvh] = {}
+_kdtree_cache: dict[str, KDTree] = {}
 
 
 def _queries_np(bench_case: BenchCase) -> np.ndarray:
@@ -74,6 +109,21 @@ def _queries_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
             device=bench_case.device,
         )
     return _queries_wp_cache[key]
+
+
+def _bvh(bench_case: BenchCase) -> wp.Bvh:
+    """Prebuilt BVH over the cloud -- an *input* for the ball group, timed on its own elsewhere."""
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _bvh_cache:
+        _bvh_cache[key] = tw.neighbors.bvh_from_points(bench_case.vertices_wp)
+    return _bvh_cache[key]
+
+
+def _kdtree(bench_case: BenchCase) -> KDTree:
+    """Prebuilt scipy KDTree over the same cloud, for the ball-query comparison."""
+    if bench_case.mesh_name not in _kdtree_cache:
+        _kdtree_cache[bench_case.mesh_name] = KDTree(bench_case.vertices_np)
+    return _kdtree_cache[bench_case.mesh_name]
 
 
 def _run_scipy(bench_case: BenchCase, k: int) -> None:
@@ -142,3 +192,81 @@ def test_query_hashgrid_nearest_k7(bench_case: BenchCase) -> None:
         assert indices.shape == (queries.shape[0], 7)
     else:
         _run_scipy(bench_case, 7)
+
+
+@pytest.mark.benchmark(group="bvh_from_points")
+@pytest.mark.benchlibs("triwarp", "scipy")
+@pytest.mark.parametrize("leaf_size", _LEAF_SIZES)
+def test_bvh_from_points(bench_case: BenchCase, leaf_size: int) -> None:
+    """
+    Structure build alone: the cost a caller amortizes, or fails to.
+
+    Subtract this from ``query_bvh_nearest_k1`` to get the query in isolation. scipy takes no
+    leaf-size parameter, so its two rows are identical by construction and are there as the fixed
+    bar; triwarp's own slope is the other half of the ``leaf_size`` trade-off.
+    """
+    skip_larger_than(bench_case, "dragon", "the scipy reference builds single-threaded")
+    if bench_case.kind == "triwarp":
+        points = bench_case.vertices_wp
+        bvh = bench_case.run(lambda: tw.neighbors.bvh_from_points(points, leaf_size=leaf_size))
+        assert bvh is not None
+    else:
+        points_np = bench_case.vertices_np
+        assert bench_case.run(lambda: KDTree(points_np)) is not None
+
+
+@pytest.mark.benchmark(group="hashgrid_from_points")
+@pytest.mark.benchlibs("triwarp")
+@pytest.mark.parametrize("grid_bins", _GRID_BINS)
+def test_hashgrid_from_points(bench_case: BenchCase, grid_bins: int) -> None:
+    """The hash-grid build, swept over its bin count: the other structure's amortization floor."""
+    skip_larger_than(bench_case, "dragon")
+    points = bench_case.vertices_wp
+    radius = _RADIUS_SCALES[0] * bench_case.mean_edge
+    grid = bench_case.run(
+        lambda: tw.neighbors.hashgrid_from_points(points, radius, grid_bins=grid_bins)
+    )
+    assert grid is not None
+
+
+@pytest.mark.benchmark(group="query_bvh_ball")
+@pytest.mark.benchlibs("triwarp", "scipy")
+@pytest.mark.parametrize("radius_scale", _RADIUS_SCALES)
+def test_query_bvh_ball(bench_case: BenchCase, radius_scale: float) -> None:
+    """Radius query over a prebuilt BVH: cost is the neighbour count, so ~8x between the radii."""
+    skip_larger_than(bench_case, "bunny", "the neighbour count grows cubically with the radius")
+    radius = radius_scale * bench_case.mean_edge
+    if bench_case.kind == "triwarp":
+        points, queries = bench_case.vertices_wp, _queries_wp(bench_case)
+        bvh = _bvh(bench_case)
+        neighbors, _distances, offsets = bench_case.run(
+            lambda: tw.neighbors.query_bvh_ball_with_offsets(points, queries, radius, bvh=bvh)
+        )
+        assert offsets.shape[0] == int(queries.shape[0])
+        assert neighbors.shape[0] >= 0
+    else:
+        tree, queries_np = _kdtree(bench_case), _queries_np(bench_case)
+        found = bench_case.run(lambda: tree.query_ball_point(queries_np, radius))
+        assert len(found) == queries_np.shape[0]
+
+
+@pytest.mark.benchmark(group="query_hashgrid_ball")
+@pytest.mark.benchlibs("triwarp")
+@pytest.mark.parametrize("grid_bins", _GRID_BINS)
+def test_query_hashgrid_ball(bench_case: BenchCase, grid_bins: int) -> None:
+    """
+    The hash-grid ball query, swept over the bin count at a fixed radius.
+
+    Too few bins and each cell holds enough points that the query degenerates into a linear scan;
+    too many and the build pays for cells nothing lands in. Where the optimum sits depends on the
+    cloud's density, so this pair is the cheapest way to see which side of it the default is on.
+    """
+    skip_larger_than(bench_case, "bunny")
+    radius = _RADIUS_SCALES[0] * bench_case.mean_edge
+    points, queries = bench_case.vertices_wp, _queries_wp(bench_case)
+    grid = tw.neighbors.hashgrid_from_points(points, radius, grid_bins=grid_bins)
+    neighbors, _distances, offsets = bench_case.run(
+        lambda: tw.neighbors.query_hashgrid_ball_with_offsets(points, queries, radius, grid=grid)
+    )
+    assert offsets.shape[0] == int(queries.shape[0])
+    assert neighbors.shape[0] >= 0

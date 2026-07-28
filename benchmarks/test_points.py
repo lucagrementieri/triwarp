@@ -66,20 +66,31 @@ import triwarp.typing as twt
 # Neighbour count for the PCA normal estimate (open3d's own default for KDTreeSearchParamKNN).
 _KNN = 30
 
+# Neighbourhood widths to sweep: the per-point 3x3 PCA is linear in k, and the k-NN table build
+# that feeds it is not, so the pair separates the estimator's cost from its input's.
+_KNN_SWEEP = [8, 64]
+
+# The trimesh references here are single-threaded host passes and one of them is far worse than
+# single-threaded: ``tm.points.fit_line`` measured **22 s a call** on ``bunny``'s 35 947 points
+# against 8 s for the whole 11-round case on ``bunny_decimated``'s 8 171. That one reference was 91%
+# of this module's wall clock, so every host branch is capped at the smallest scan mesh -- the ratio
+# against triwarp is four orders of magnitude and needs no larger input to establish.
+_HOST_CAP_REASON = "host reference is a single-threaded pass; capped at bunny_decimated"
+
 # Fixed plane / sort axis, deliberately not axis-aligned so no branch is skipped.
 _PLANE_NORMAL = np.array([0.3, -0.6, 0.74])
 
-_neighbors_cache: dict[tuple[str, str], twt.Array2dInt32] = {}
+_neighbors_cache: dict[tuple[str, str, int], twt.Array2dInt32] = {}
 _normals_wp_cache: dict[tuple[str, str], wp.array[wp.vec3]] = {}
 _pcd_cache: dict[str, o3d.geometry.PointCloud] = {}
 
 
-def _neighbor_table(bench_case: BenchCase) -> twt.Array2dInt32:
+def _neighbor_table(bench_case: BenchCase, k: int = _KNN) -> twt.Array2dInt32:
     """``(n, k)`` k-nearest table over the cloud itself — an *input* of ``estimate_normals``."""
-    key = (bench_case.mesh_name, str(bench_case.device))
+    key = (bench_case.mesh_name, str(bench_case.device), k)
     if key not in _neighbors_cache:
         points = bench_case.vertices_wp
-        _neighbors_cache[key] = tw.neighbors.query_bvh_nearest(points, points, k=_KNN)[0]
+        _neighbors_cache[key] = tw.neighbors.query_bvh_nearest(points, points, k=k)[0]
     return _neighbors_cache[key]
 
 
@@ -122,6 +133,7 @@ def test_point_plane_distance(bench_case: BenchCase) -> None:
         distances = bench_case.run(lambda: tw.points.point_plane_distance(points, normal))
         assert distances.shape == (n_points,)
     else:
+        skip_larger_than(bench_case, "bunny_decimated", _HOST_CAP_REASON)
         points_np = bench_case.vertices_np
         distances_tm = bench_case.run(
             lambda: tm.points.point_plane_distance(points_np, _PLANE_NORMAL)
@@ -138,6 +150,7 @@ def test_fit_line(bench_case: BenchCase) -> None:
         axis = bench_case.run(lambda: tw.points.fit_line(points))
         assert len(axis) == 3
     else:
+        skip_larger_than(bench_case, "bunny_decimated", _HOST_CAP_REASON)
         # major_axis SVDs with full_matrices=True -> an (n, n) allocation; see the module docstring.
         skip_larger_than(bench_case, "bunny", "trimesh's major_axis allocates an (n, n) SVD matrix")
         points_np = bench_case.vertices_np
@@ -155,6 +168,7 @@ def test_fit_plane(bench_case: BenchCase) -> None:
         assert len(centroid) == 3
         assert len(normal) == 3
     else:
+        skip_larger_than(bench_case, "bunny_decimated", _HOST_CAP_REASON)
         points_np = bench_case.vertices_np
         centroid_tm, normal_tm = bench_case.run(lambda: tm.points.plane_fit(points_np))
         assert centroid_tm.shape == (3,)
@@ -176,6 +190,7 @@ def test_vector_angle(bench_case: BenchCase) -> None:
         angles = bench_case.run(lambda: tw.points.vector_angle(normals, directions))
         assert angles.shape == (n_points,)
     else:
+        skip_larger_than(bench_case, "bunny_decimated", _HOST_CAP_REASON)
         mesh_tm = tm.Trimesh(bench_case.vertices_np, bench_case.faces_np, process=False)
         pairs_np = np.stack(
             (np.array(mesh_tm.vertex_normals), _unit_directions_np(bench_case)), axis=1
@@ -197,6 +212,7 @@ def test_radial_sort(bench_case: BenchCase) -> None:
         ordered = bench_case.run(lambda: tw.points.radial_sort(points, origin, normal))
         assert ordered.shape == (n_points,)
     else:
+        skip_larger_than(bench_case, "bunny_decimated", _HOST_CAP_REASON)
         points_np = bench_case.vertices_np
         ordered_tm = bench_case.run(
             lambda: tm.points.radial_sort(points_np, origin=origin_np, normal=_PLANE_NORMAL)
@@ -205,21 +221,30 @@ def test_radial_sort(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="estimate_normals")
+@pytest.mark.benchaxis("scale")
 @pytest.mark.benchlibs("triwarp")
-def test_estimate_normals(bench_case: BenchCase) -> None:
-    """PCA normals from a cached neighbour table: the covariance accumulation and ``svd3``."""
-    skip_larger_than(bench_case, "bunny", "the k-NN table build dominates beyond bunny")
+@pytest.mark.parametrize("k", _KNN_SWEEP)
+def test_estimate_normals(bench_case: BenchCase, k: int) -> None:
+    """
+    PCA normals from a cached neighbour table: the covariance accumulation and ``svd3``.
+
+    The table is an *input*, so this group is linear in ``k`` and nothing else. Comparing its slope
+    against ``estimate_normals_knn`` below separates the estimator from the search that feeds it --
+    which matters, because the search is where the time actually goes.
+    """
     points = bench_case.vertices_wp
-    neighbors = _neighbor_table(bench_case)
+    neighbors = _neighbor_table(bench_case, k)
     normals = bench_case.run(lambda: tw.points.estimate_normals(points, neighbors))
     assert normals.shape == (bench_case.n_vertices,)
 
 
 @pytest.mark.benchmark(group="estimate_normals_knn")
+@pytest.mark.benchaxis("scale")
 @pytest.mark.benchlibs("triwarp", "open3d")
 def test_estimate_normals_knn(bench_case: BenchCase) -> None:
     """Neighbour search plus PCA — what open3d's ``estimate_normals`` does in one call."""
-    skip_larger_than(bench_case, "bunny", "serial k-NN on both sides beyond bunny")
+    if bench_case.mesh_name == "sphere_large":
+        pytest.skip("open3d searches one point at a time; capped at sphere_med")
     if bench_case.kind == "triwarp":
         points = bench_case.vertices_wp
         normals = bench_case.run(

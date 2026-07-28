@@ -1,36 +1,45 @@
 """
 Benchmarks for ``triwarp.parametrization``.
 
-Times the four solver entry points against their libigl references. All of them need a mesh with a
-boundary loop to pin, so the mesh set is chosen explicitly: the ``synthetic_saddle`` patches
-(regular grids lifted onto a saddle -- **disk topology**, the domain these solvers are for) plus
-``bunny_decimated`` / ``bunny`` as the realistic scanned inputs with small hole loops.
+Two axes, because these solvers have two independent cost drivers and mesh size is neither of
+them outright:
 
-``synthetic_cylinder`` is deliberately **not** used here. It is an annulus, and pinning only its
-longer rim leaves ARAP free to fold: triwarp returns 32 767 flipped faces out of 131 072, disagrees
-with libigl by 0.35 regardless of CG tolerance (the two land on different local minima of a
-non-convex energy), and burns 8 200 CG iterations per solve on the resulting near-singular system.
-Timing that measures a pathology, not the algorithm. On the saddle patches triwarp instead agrees
-with libigl to ~1e-7 with zero flipped faces.
+* **patch** -- ``saddle_small`` / ``saddle`` / ``hemisphere``, the disk-topology inputs these
+  solvers are actually for, flat and curved, spanning 8 978 to 41 088 faces. This is the size
+  sweep, restricted to meshes that *have* a single boundary loop to pin.
+* **quality** -- ``saddle`` against ``saddle_graded``. Same vertices, same faces, same boundary,
+  same everything except the spacing along one axis, which pushes the worst triangle aspect ratio
+  from 1.6 to 4 719. Cotangent weights go large and the free-block condition number goes with them,
+  so the conjugate-gradient iteration count moves while nothing else does. That is the cleanest
+  available measurement of conditioning cost, and it is invisible to any face-count sweep.
 
-Setup that is *not* part of the measured operation is precomputed and cached: the boundary loop, its
-circle map, and the harmonic warm start ARAP iterates from. What remains inside the timed callable
-is what the function itself does — operator assembly plus the conjugate-gradient solve — because
-that is what the batched-CG work targets.
+Setup that is *not* part of the measured operation is precomputed and cached: the boundary loop,
+its circle map, and the harmonic warm start ARAP iterates from. What remains inside the timed
+callable is what the function itself does -- operator assembly plus the CG solve -- because that is
+what the batched-CG work targets.
 
 ``harmonic`` / ``lscm`` / ``arap`` solve with ``warp.optim.linear.cg``, which returns NaN on the
 Warp CPU backend (1.14-1.15), so the ``triwarp-cpu`` variant is skipped rather than timed.
 
-**open3d** has no mesh parametrization at all — no harmonic map, no LSCM, no ARAP, and no boundary
-circle map — so libigl remains the only reference for this module.
+References
+----------
+**libigl** now runs on every mesh in both axes, which it did not on the previous mesh set. It goes
+through a direct LDLT factorization of the cotangent system, and that failed outright on the
+scanned registry meshes (``RuntimeError: Failed to compute harmonic map`` / ``igl::lscm failed``):
+they are not disk topology and their cotangent Laplacian is not positive definite on the free set.
+The patch and quality meshes are disk topology by construction, so the comparison is drawn on
+exactly the meshes triwarp is measured on rather than on a small subset. This also makes the
+quality axis a genuine A/B between an iterative and a direct solver: CG pays for conditioning in
+iterations, LDLT pays for it in fill-in, and they do not have to move together.
 
-The libigl reference is gated on mesh *conditioning*, not size — measured, not assumed. libigl goes
-through a direct LDLT factorization of the cotangent system, which fails outright on the scanned
-registry meshes (``RuntimeError: Failed to compute harmonic map`` / ``igl::lscm failed``): they are
-not disk topology (``bunny`` has five hole loops, the longest only 80 vertices) and their cotangent
-Laplacian is not positive definite on the free set. triwarp's CG converges on exactly the same
-input, so those meshes are timed for triwarp only. The comparison is drawn on the saddle patches,
-where both solvers are well-conditioned and agree to ~1e-7.
+``rim_long`` is deliberately **not** used here. It is an annulus, and pinning only one of its rims
+leaves ARAP free to fold: triwarp returns 32 767 flipped faces out of 131 072, disagrees with
+libigl by 0.35 regardless of CG tolerance (the two land on different local minima of a non-convex
+energy), and burns 8 200 CG iterations per solve on the resulting near-singular system. Timing
+that measures a pathology, not the algorithm.
+
+**open3d** has no mesh parametrization at all -- no harmonic map, no LSCM, no ARAP, and no
+boundary circle map -- so libigl remains the only reference for this module.
 """
 
 from __future__ import annotations
@@ -43,24 +52,26 @@ from conftest import BenchCase
 
 import triwarp as tw
 
-_ARAP_ITERATIONS = 10
+# Local/global alternations for ARAP. The pair brackets "converged early" against "ran the full
+# schedule": each iteration is a per-face SVD pass plus a CG solve, so the slope is the per-
+# iteration cost and the intercept is the operator assembly.
+_ARAP_ITERATIONS = [3, 10]
 
-# Meshes whose cotangent system libigl's direct LDLT can actually factor (see module docstring).
-# The scanned registry meshes are not disk topology and make every igl solver here raise.
-_IGL_SOLVABLE_MESHES = frozenset({"synthetic_saddle_small", "synthetic_saddle"})
+# Harmonic order. k=2 is the bilaplacian: the operator is squared, so it is both denser and far
+# worse conditioned than k=1 at identical mesh size -- a second conditioning handle alongside the
+# quality axis, and one that moves nnz as well.
+_HARMONIC_ORDERS = [1, 2]
 
 _boundary_cache: dict[tuple[str, str], tuple[wp.array[wp.int32], wp.array[wp.vec2]]] = {}
 _warm_start_cache: dict[tuple[str, str], wp.array[wp.vec2]] = {}
 
 
-def _skip_unsupported(bench_case: BenchCase) -> None:
-    """Skip triwarp-on-CPU cases and libigl cases whose cotangent system it cannot factor."""
+def _skip_cpu(bench_case: BenchCase) -> None:
+    """Skip triwarp-on-CPU cases: every solver here goes through ``warp.optim.linear.cg``."""
     if bench_case.kind == "triwarp":
         assert bench_case.device is not None
         if wp.get_device(bench_case.device).is_cpu:
             pytest.skip("warp.optim.linear.cg returns NaN on the CPU device in Warp 1.14-1.15")
-    elif bench_case.mesh_name not in _IGL_SOLVABLE_MESHES:
-        pytest.skip(f"libigl's direct solver fails on {bench_case.mesh_name} (not disk topology)")
 
 
 def _boundary(bench_case: BenchCase) -> tuple[wp.array[wp.int32], wp.array[wp.vec2]]:
@@ -84,45 +95,117 @@ def _warm_start(bench_case: BenchCase) -> wp.array[wp.vec2]:
     return _warm_start_cache[key]
 
 
+def _igl_boundary(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(vertices, faces_i64, loop)`` for the libigl branches."""
+    faces_np = bench_case.faces_np.astype(np.int64)
+    return bench_case.vertices_np, faces_np, igl.boundary_loop(faces_np)
+
+
 @pytest.mark.benchmark(group="map_vertices_to_circle")
+@pytest.mark.benchaxis("patch")
 @pytest.mark.benchlibs("triwarp", "igl")
-@pytest.mark.benchmeshes("synthetic_saddle_small", "synthetic_saddle", "bunny_decimated", "bunny")
 def test_map_vertices_to_circle(bench_case: BenchCase) -> None:
+    """Arc-length parametrization of the rim: driven by loop length, not by mesh size."""
     if bench_case.kind == "triwarp":
         vertices = bench_case.vertices_wp
         loop, _loop_uv = _boundary(bench_case)
         circle = bench_case.run(lambda: tw.parametrization.map_vertices_to_circle(vertices, loop))
         assert int(circle.shape[0]) == int(loop.shape[0])
     else:
-        vertices_np = bench_case.vertices_np
-        loop_np = igl.boundary_loop(bench_case.faces_np.astype(np.int64))
+        vertices_np, _faces_np, loop_np = _igl_boundary(bench_case)
         circle_igl = bench_case.run(lambda: igl.map_vertices_to_circle(vertices_np, loop_np))
         assert circle_igl.shape[0] == loop_np.shape[0]
 
 
 @pytest.mark.benchmark(group="harmonic")
+@pytest.mark.benchaxis("patch")
 @pytest.mark.benchlibs("triwarp", "igl")
-@pytest.mark.benchmeshes("synthetic_saddle_small", "synthetic_saddle", "bunny_decimated", "bunny")
-def test_harmonic(bench_case: BenchCase) -> None:
-    _skip_unsupported(bench_case)
+@pytest.mark.parametrize("order", _HARMONIC_ORDERS)
+def test_harmonic(bench_case: BenchCase, order: int) -> None:
+    """Fixed-boundary harmonic map, at the Laplacian and the much stiffer bilaplacian."""
+    _skip_cpu(bench_case)
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        loop, loop_uv = _boundary(bench_case)
+        uv = bench_case.run(
+            lambda: tw.parametrization.harmonic(vertices, faces, loop, loop_uv, k=order)
+        )
+        assert int(uv.shape[0]) == int(vertices.shape[0])
+    else:
+        vertices_np, faces_np, loop_np = _igl_boundary(bench_case)
+        circle_np = igl.map_vertices_to_circle(vertices_np, loop_np)
+        uv_igl = bench_case.run(
+            lambda: igl.harmonic(vertices_np, faces_np, loop_np, circle_np, order)
+        )
+        assert uv_igl.shape[0] == vertices_np.shape[0]
+
+
+@pytest.mark.benchmark(group="harmonic_conditioning")
+@pytest.mark.benchaxis("quality")
+@pytest.mark.benchlibs("triwarp", "igl")
+def test_harmonic_conditioning(bench_case: BenchCase) -> None:
+    """
+    The same harmonic solve on the same connectivity, well- and ill-conditioned.
+
+    ``saddle`` and ``saddle_graded`` have identical vertex counts, face arrays and boundary loops;
+    only the spacing differs. Any gap between these two rows is conditioning and nothing else --
+    for triwarp, CG iterations; for libigl, LDLT fill-in.
+    """
+    _skip_cpu(bench_case)
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         loop, loop_uv = _boundary(bench_case)
         uv = bench_case.run(lambda: tw.parametrization.harmonic(vertices, faces, loop, loop_uv))
         assert int(uv.shape[0]) == int(vertices.shape[0])
     else:
-        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np.astype(np.int64)
-        loop_np = igl.boundary_loop(faces_np)
+        vertices_np, faces_np, loop_np = _igl_boundary(bench_case)
         circle_np = igl.map_vertices_to_circle(vertices_np, loop_np)
         uv_igl = bench_case.run(lambda: igl.harmonic(vertices_np, faces_np, loop_np, circle_np, 1))
         assert uv_igl.shape[0] == vertices_np.shape[0]
 
 
-@pytest.mark.benchmark(group="lscm")
+@pytest.mark.benchmark(group="arap")
+@pytest.mark.benchaxis("patch")
 @pytest.mark.benchlibs("triwarp", "igl")
-@pytest.mark.benchmeshes("synthetic_saddle_small", "synthetic_saddle", "bunny_decimated", "bunny")
+@pytest.mark.parametrize("iterations", _ARAP_ITERATIONS)
+def test_arap(bench_case: BenchCase, iterations: int) -> None:
+    """Local/global ARAP from a harmonic warm start: per-face SVD plus a CG solve per iteration."""
+    _skip_cpu(bench_case)
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        loop, loop_uv = _boundary(bench_case)
+        uv_init = _warm_start(bench_case)
+        uv = bench_case.run(
+            lambda: tw.parametrization.arap(
+                vertices, faces, loop, loop_uv, uv_init, max_iterations=iterations
+            )
+        )
+        assert int(uv.shape[0]) == int(vertices.shape[0])
+    else:
+        vertices_np, faces_np, loop_np = _igl_boundary(bench_case)
+        circle_np = igl.map_vertices_to_circle(vertices_np, loop_np)
+        uv_init_np = np.ascontiguousarray(
+            igl.harmonic(vertices_np, faces_np, loop_np, circle_np, 1)
+        )
+
+        # triwarp's ``arap`` rebuilds its operator on every call, so the igl side includes
+        # ``arap_precomputation`` for a like-for-like comparison rather than solve-only.
+        def run() -> np.ndarray:
+            data = igl.ARAPData()
+            data.max_iter = iterations
+            igl.arap_precomputation(vertices_np, faces_np, 2, loop_np.astype(np.int32), data)
+            return igl.arap_solve(circle_np, data, uv_init_np)
+
+        uv_igl = bench_case.run(run)
+        assert uv_igl.shape[0] == vertices_np.shape[0]
+
+
+@pytest.mark.benchmark(group="lscm")
+@pytest.mark.benchaxis("patch")
+@pytest.mark.benchlibs("triwarp", "igl")
 def test_lscm(bench_case: BenchCase) -> None:
-    _skip_unsupported(bench_case)
+    """Free-boundary conformal map: two pins, so the free block is nearly the whole system."""
+    _skip_cpu(bench_case)
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         loop, _loop_uv = _boundary(bench_case)
@@ -138,46 +221,10 @@ def test_lscm(bench_case: BenchCase) -> None:
         uv = bench_case.run(lambda: tw.parametrization.lscm(vertices, faces, pins, pins_uv))
         assert int(uv.shape[0]) == int(vertices.shape[0])
     else:
-        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np.astype(np.int64)
-        loop_np = igl.boundary_loop(faces_np)
+        vertices_np, faces_np, loop_np = _igl_boundary(bench_case)
         pins_np = np.array([loop_np[0], loop_np[len(loop_np) // 2]], dtype=np.int64)
         pins_uv_np = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float64)
         uv_igl, _hessian = bench_case.run(
             lambda: igl.lscm(vertices_np, faces_np, pins_np, pins_uv_np)
         )
-        assert uv_igl.shape[0] == vertices_np.shape[0]
-
-
-@pytest.mark.benchmark(group="arap")
-@pytest.mark.benchlibs("triwarp", "igl")
-@pytest.mark.benchmeshes("synthetic_saddle_small", "synthetic_saddle", "bunny_decimated", "bunny")
-def test_arap(bench_case: BenchCase) -> None:
-    _skip_unsupported(bench_case)
-    if bench_case.kind == "triwarp":
-        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-        loop, loop_uv = _boundary(bench_case)
-        uv_init = _warm_start(bench_case)
-        uv = bench_case.run(
-            lambda: tw.parametrization.arap(
-                vertices, faces, loop, loop_uv, uv_init, max_iterations=_ARAP_ITERATIONS
-            )
-        )
-        assert int(uv.shape[0]) == int(vertices.shape[0])
-    else:
-        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np.astype(np.int64)
-        loop_np = igl.boundary_loop(faces_np)
-        circle_np = igl.map_vertices_to_circle(vertices_np, loop_np)
-        uv_init_np = np.ascontiguousarray(
-            igl.harmonic(vertices_np, faces_np, loop_np, circle_np, 1)
-        )
-
-        # triwarp's ``arap`` rebuilds its operator on every call, so the igl side includes
-        # ``arap_precomputation`` for a like-for-like comparison rather than solve-only.
-        def run() -> np.ndarray:
-            data = igl.ARAPData()
-            data.max_iter = _ARAP_ITERATIONS
-            igl.arap_precomputation(vertices_np, faces_np, 2, loop_np.astype(np.int32), data)
-            return igl.arap_solve(circle_np, data, uv_init_np)
-
-        uv_igl = bench_case.run(run)
         assert uv_igl.shape[0] == vertices_np.shape[0]

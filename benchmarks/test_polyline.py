@@ -24,15 +24,18 @@ because within a class the kernels differ only in the per-segment expression:
 cost is the product of two sizes (query points x segments) rather than a function of the polyline
 alone.
 
-Inputs
-------
-Polylines come from **mesh boundary loops**, not from the registry scan meshes' geometry: the scan
-meshes are near-closed surfaces whose holes are a handful of vertices each, which would measure
-launch latency and nothing else. The synthetic meshes give the useful size spread — the open
-cylinder's rim is ``2**16`` vertices (the asymptotic case), the saddle patches' single boundary loop
-is ``4 * (k - 1)`` vertices (264 and 528). The longest loop of each mesh is used, gathered into a
-dense ``wp.vec3`` buffer once per (mesh, device) and reused across rounds, so the timed region
-contains only the polyline function itself.
+Axis: **polyline** -- longest boundary loop of 268, 528 and 65 536 vertices. Polylines come from
+**mesh boundary loops**, not from mesh geometry, and the axis is a loop-length sweep rather than a
+face-count one: nothing here reads a face. The scan meshes are excluded on the same grounds --
+they are near-closed surfaces whose holes are a handful of vertices each, so they would measure
+launch latency and nothing else.
+
+The longest loop of each mesh is gathered into a dense ``wp.vec3`` buffer once per (mesh, device)
+and reused across rounds, so the timed region contains only the polyline function itself.
+
+Two groups carry a second sweep, on the parameter that drives them rather than on length:
+``simplify_polyline`` on its tolerance (which sets the recursion depth of a serial algorithm) and
+``distance_to_polyline`` on the query count (the other half of its two-size product).
 
 References
 ----------
@@ -67,14 +70,17 @@ import triwarp as tw
 _UPSAMPLE_FRACTION = 0.5
 _DOWNSAMPLE_FRACTION = 4.0
 
-# Ramer-Douglas-Peucker tolerance, as a fraction of the polyline's bounding-box diagonal.
-_SIMPLIFY_FRACTION = 1e-3
+# Ramer-Douglas-Peucker tolerances, as a fraction of the polyline's bounding-box diagonal. A
+# tighter tolerance keeps more points and so recurses deeper, which on a single-thread kernel is
+# the whole cost; the pair is two orders of magnitude apart so the slope is unambiguous.
+_SIMPLIFY_FRACTIONS = [1e-3, 1e-1]
 
-# Query-point count for distance_to_polyline, independent of the polyline length.
-_N_QUERY = 1 << 14
+# Query-point counts for distance_to_polyline: the second size in its points x segments product,
+# swept independently of the polyline length the axis provides.
+_N_QUERIES = [1 << 12, 1 << 16]
 
 _polyline_cache: dict[tuple[str, str], wp.array[wp.vec3]] = {}
-_query_cache: dict[tuple[str, str], wp.array[wp.vec3]] = {}
+_query_cache: dict[tuple[str, str, int], wp.array[wp.vec3]] = {}
 
 
 def _polyline_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
@@ -100,13 +106,13 @@ def _segment_scale(bench_case: BenchCase) -> tuple[float, float]:
     return float(steps.mean()), diagonal
 
 
-def _query_points_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
-    """Fixed-count random query points inside the polyline's bounding box."""
-    key = (bench_case.mesh_name, str(bench_case.device))
+def _query_points_wp(bench_case: BenchCase, count: int) -> wp.array[wp.vec3]:
+    """Random query points inside the polyline's bounding box, cached per (case, count)."""
+    key = (bench_case.mesh_name, str(bench_case.device), count)
     if key not in _query_cache:
         polyline = _polyline_wp(bench_case).numpy()
         rng = np.random.default_rng(20260726)
-        points = rng.uniform(polyline.min(axis=0), polyline.max(axis=0), size=(_N_QUERY, 3))
+        points = rng.uniform(polyline.min(axis=0), polyline.max(axis=0), size=(count, 3))
         _query_cache[key] = wp.array(
             np.ascontiguousarray(points, dtype=np.float32), dtype=wp.vec3, device=bench_case.device
         )
@@ -114,7 +120,7 @@ def _query_points_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
 
 
 @pytest.mark.benchmark(group="polyline_length")
-@pytest.mark.benchmeshes("synthetic_saddle_small", "synthetic_saddle", "synthetic_cylinder")
+@pytest.mark.benchaxis("polyline")
 @pytest.mark.benchlibs("triwarp")
 def test_polyline_length(bench_case: BenchCase) -> None:
     """Summed segment length: the cheapest whole-polyline reduction, launch-latency bound."""
@@ -124,7 +130,7 @@ def test_polyline_length(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="polyline_radius")
-@pytest.mark.benchmeshes("synthetic_saddle_small", "synthetic_saddle", "synthetic_cylinder")
+@pytest.mark.benchaxis("polyline")
 @pytest.mark.benchlibs("triwarp")
 def test_polyline_radius(bench_case: BenchCase) -> None:
     """Per-segment plane projection and closest-point search, then a reduction."""
@@ -134,7 +140,7 @@ def test_polyline_radius(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="polyline_angles")
-@pytest.mark.benchmeshes("synthetic_saddle_small", "synthetic_saddle", "synthetic_cylinder")
+@pytest.mark.benchaxis("polyline")
 @pytest.mark.benchlibs("triwarp")
 def test_polyline_angles(bench_case: BenchCase) -> None:
     """Per-vertex turning angle: the ``wp.acos`` path, one angle per point."""
@@ -144,7 +150,7 @@ def test_polyline_angles(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="upsample_polyline")
-@pytest.mark.benchmeshes("synthetic_saddle_small", "synthetic_saddle", "synthetic_cylinder")
+@pytest.mark.benchaxis("polyline")
 @pytest.mark.benchlibs("triwarp")
 def test_upsample_polyline(bench_case: BenchCase) -> None:
     """Arc-length upsampling at half the mean segment length: scan, readback, then a lerp pass."""
@@ -155,7 +161,7 @@ def test_upsample_polyline(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="downsample_polyline")
-@pytest.mark.benchmeshes("synthetic_saddle_small", "synthetic_saddle", "synthetic_cylinder")
+@pytest.mark.benchaxis("polyline")
 @pytest.mark.benchlibs("triwarp")
 def test_downsample_polyline(bench_case: BenchCase) -> None:
     """Arc-length downsampling at four times the mean segment length."""
@@ -166,22 +172,24 @@ def test_downsample_polyline(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="simplify_polyline")
-@pytest.mark.benchmeshes("synthetic_saddle_small", "synthetic_saddle", "synthetic_cylinder")
+@pytest.mark.benchaxis("polyline")
 @pytest.mark.benchlibs("triwarp")
-def test_simplify_polyline(bench_case: BenchCase) -> None:
+@pytest.mark.parametrize("tolerance_fraction", _SIMPLIFY_FRACTIONS)
+def test_simplify_polyline(bench_case: BenchCase, tolerance_fraction: float) -> None:
     """Ramer-Douglas-Peucker on a *single* GPU thread — the module's deliberate serial outlier."""
     polyline = _polyline_wp(bench_case)
-    tol = _SIMPLIFY_FRACTION * _segment_scale(bench_case)[1]
+    tol = tolerance_fraction * _segment_scale(bench_case)[1]
     simplified, kept = bench_case.run(lambda: tw.polyline.simplify_polyline(polyline, tol))
     assert simplified.shape[0] == kept.shape[0]
 
 
 @pytest.mark.benchmark(group="distance_to_polyline")
-@pytest.mark.benchmeshes("synthetic_saddle_small", "synthetic_saddle", "synthetic_cylinder")
+@pytest.mark.benchaxis("polyline")
 @pytest.mark.benchlibs("triwarp")
-def test_distance_to_polyline(bench_case: BenchCase) -> None:
+@pytest.mark.parametrize("n_queries", _N_QUERIES)
+def test_distance_to_polyline(bench_case: BenchCase, n_queries: int) -> None:
     """Brute-force point-to-segment distance: the one case whose cost is points x segments."""
     polyline = _polyline_wp(bench_case)
-    points = _query_points_wp(bench_case)
+    points = _query_points_wp(bench_case, n_queries)
     distance = bench_case.run(lambda: tw.polyline.distance_to_polyline(points, polyline))
-    assert distance.shape[0] == _N_QUERY
+    assert distance.shape[0] == n_queries

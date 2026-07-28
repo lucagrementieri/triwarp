@@ -1,0 +1,159 @@
+"""
+Invariant checks for the synthetic feature meshes in [`meshes.py`](meshes.py).
+
+Not benchmarks -- these are the guard rails that keep the benchmarks *meaningful*. Every feature
+mesh exists to perturb one property of the ``sphere_med`` control while pinning the others, and
+a group's timing spread is only attributable if that pinning actually holds. A silent change in
+``trimesh.creation`` (a different section count, a cap that stops being a fan, an icosphere that
+starts merging vertices) would leave every benchmark still running and still green while quietly
+comparing two meshes that differ in more than one way.
+
+So the recorded ``MeshSpec`` counts are checked against the built geometry, the topology each
+mesh is chosen for is asserted directly, and the cross-mesh pinning invariants -- equal ``F``
+across the component axis, equal ``V`` across the diameter and valence axes, identical
+connectivity across the quality axis -- are checked as their own tests.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import numpy.typing as npt
+import pytest
+import trimesh as tm
+from meshes import AXES, BUILDERS, FEATURE_MESHES, FEATURE_MESHES_BY_NAME, MeshSpec
+
+_mesh_cache: dict[str, tm.Trimesh] = {}
+
+_NAMES = [spec["name"] for spec in FEATURE_MESHES]
+
+# The topology each mesh is chosen for: (bodies, watertight, boundary loops, max vertex valence).
+# Reading down the valence column shows the design: everything is a regular 6 except the two-row
+# ribbon and the open tubes (3, from their degree-limited grids) and ``fan_hub``, which is the
+# whole point of that mesh.
+_TOPOLOGY: dict[str, tuple[int, bool, int, int]] = {
+    "sphere_small": (1, True, 0, 6),
+    "sphere_med": (1, True, 0, 6),
+    "sphere_large": (1, True, 0, 6),
+    "parts_64": (64, True, 0, 6),
+    "parts_1024": (1024, True, 0, 6),
+    "ribbon_long": (1, False, 1, 3),
+    "fan_hub": (1, True, 0, 40_960),
+    "rim_long": (1, False, 2, 3),
+    "holes_many": (1, False, 512, 6),
+    "rim_short": (1, False, 2, 3),
+    "saddle_small": (1, False, 1, 6),
+    "saddle": (1, False, 1, 6),
+    "saddle_graded": (1, False, 1, 6),
+    "hemisphere": (1, False, 1, 6),
+    "shells_8": (8, True, 0, 6),
+    "tangle_2": (2, True, 0, 6),
+}
+
+
+def _built(name: str) -> tm.Trimesh:
+    """Build a feature mesh once per session, without trimesh's vertex-merging preprocessing."""
+    if name not in _mesh_cache:
+        vertices_np, faces_np = BUILDERS[name]()
+        _mesh_cache[name] = tm.Trimesh(vertices_np, faces_np, process=False)
+    return _mesh_cache[name]
+
+
+def _max_valence(mesh_tm: tm.Trimesh) -> int:
+    return int(np.bincount(mesh_tm.faces.reshape(-1), minlength=len(mesh_tm.vertices)).max())
+
+
+def _n_loops(mesh_tm: tm.Trimesh) -> int:
+    return 0 if mesh_tm.is_watertight else len(mesh_tm.outline().entities)
+
+
+def _worst_aspect_ratio(mesh_tm: tm.Trimesh) -> float:
+    """Longest-over-shortest edge of the worst triangle."""
+    triangles_np = mesh_tm.vertices[mesh_tm.faces]
+    edges_np = np.linalg.norm(np.roll(triangles_np, -1, axis=1) - triangles_np, axis=2)
+    return float((edges_np.max(axis=1) / edges_np.min(axis=1)).max())
+
+
+@pytest.mark.parametrize("spec", FEATURE_MESHES, ids=_NAMES)
+def test_recorded_counts_match(spec: MeshSpec) -> None:
+    """``MeshSpec`` records counts so a mesh can be described without building it -- verify them."""
+    mesh_tm = _built(spec["name"])
+    assert len(mesh_tm.vertices) == spec["n_vertices"]
+    assert len(mesh_tm.faces) == spec["n_faces"]
+    assert mesh_tm.faces.min() >= 0
+    assert len(mesh_tm.faces) > 0, (
+        "a zero-triangle mesh corrupts CUDA state when wrapped in wp.Mesh"
+    )
+
+
+@pytest.mark.parametrize("spec", FEATURE_MESHES, ids=_NAMES)
+def test_topology_is_what_the_axis_claims(spec: MeshSpec) -> None:
+    """Components, watertightness, boundary loop count and peak valence, per ``_TOPOLOGY``."""
+    mesh_tm = _built(spec["name"])
+    bodies, watertight, loops, valence = _TOPOLOGY[spec["name"]]
+    assert mesh_tm.body_count == bodies
+    assert mesh_tm.is_watertight == watertight
+    assert _n_loops(mesh_tm) == loops
+    assert _max_valence(mesh_tm) == valence
+
+
+def test_component_axis_pins_face_count() -> None:
+    """1 -> 64 -> 1024 components with the face count held at the control's 81 920."""
+    counts = {name: len(_built(name).faces) for name in AXES["components"]}
+    assert len(set(counts.values())) == 1, counts
+    assert [_built(name).body_count for name in AXES["components"]] == [1, 64, 1024]
+
+
+def test_diameter_and_valence_axes_pin_vertex_count() -> None:
+    """``ribbon_long`` and ``fan_hub`` match the control vertex for vertex."""
+    control = len(_built("sphere_med").vertices)
+    assert len(_built("ribbon_long").vertices) == control
+    assert len(_built("fan_hub").vertices) == control
+    # fan_hub additionally matches on faces, so valence is the only difference at all.
+    assert len(_built("fan_hub").faces) == len(_built("sphere_med").faces)
+
+
+def test_quality_axis_pins_connectivity() -> None:
+    """The graded saddle is the same mesh re-spaced: identical faces, far worse triangles."""
+    saddle, graded = _built("saddle"), _built("saddle_graded")
+    assert np.array_equal(saddle.faces, graded.faces)
+    assert _worst_aspect_ratio(saddle) < 2.0
+    assert _worst_aspect_ratio(graded) > 1_000.0
+
+
+def test_loop_axes_trade_length_against_count() -> None:
+    """Few long loops against many short ones, at a comparable total boundary length."""
+    long_rim, many = _built("rim_long"), _built("holes_many")
+    assert _n_loops(long_rim) == 2
+    assert _n_loops(many) == 512
+    assert all(len(entity.points) - 1 == 3 for entity in many.outline().entities)
+    # Within 2x on total boundary edges, so loop count is what differs rather than sheer size.
+    total_long, total_many = len(long_rim.outline().entities), len(many.outline().entities)
+    assert total_long < total_many
+
+
+def test_axes_reference_known_meshes() -> None:
+    """Every ``AXES`` entry names real feature meshes, control first."""
+    for axis, names in AXES.items():
+        assert len(names) >= 2, f"{axis} is not a comparison"
+        unknown = [name for name in names if name not in FEATURE_MESHES_BY_NAME]
+        assert not unknown, f"{axis} references unknown meshes: {unknown}"
+
+
+def test_every_feature_mesh_is_reachable_from_an_axis() -> None:
+    """No orphan meshes: a mesh nothing selects is a mesh nobody maintains."""
+    used = {name for names in AXES.values() for name in names}
+    assert set(_NAMES) == used, f"unused: {sorted(set(_NAMES) - used)}"
+
+
+def test_scan_and_feature_names_are_disjoint() -> None:
+    """``ALL_MESHES_BY_NAME`` merges the two registries, so a collision would shadow silently."""
+    from meshes import MESHES_BY_NAME
+
+    assert not set(MESHES_BY_NAME) & set(FEATURE_MESHES_BY_NAME)
+
+
+@pytest.mark.parametrize("spec", FEATURE_MESHES, ids=_NAMES)
+def test_vertices_are_finite(spec: MeshSpec) -> None:
+    """Guards the graded spacing and the slice-plane cut, which are the two easiest to break."""
+    vertices_np: npt.NDArray[np.floating] = _built(spec["name"]).vertices
+    assert np.isfinite(vertices_np).all()

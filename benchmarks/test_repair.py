@@ -1,16 +1,34 @@
 """
-Benchmarks for ``triwarp.repair.resolve_duplicated_faces``.
+Benchmarks for ``triwarp.repair``.
 
-The duplicated input is built untimed: a fixed-seed 10% subset of the faces is appended as
-*flipped* copies, so every duplicate group is a cancelling ``(+1, -1)`` pair (kept groups stay
-orientable; the flipped pairs are dropped by the signed-count rule).
+Axis: **defect count** for three of the four groups, and **diameter** for the fourth. Repair
+functions are the clearest case in the package of cost that a face count cannot predict -- they
+are all "find the broken things and fix them", so the number of broken things is the driver and
+the mesh they are embedded in is nearly irrelevant. Every defect group therefore runs on
+``sphere_med`` and sweeps the *injected defect count*, holding the mesh fixed:
 
-The pre-fix implementation is O(n_unique x n_faces) host Python, so the baseline only runs on
-``bunny_decimated``; raise the cap after the device rewrite lands.
+* ``resolve_duplicated_faces`` -- 0% against 10% cancelling flipped pairs.
+* ``remove_non_manifold_faces`` -- 0 against 1 024 extra faces, each one making its three edges
+  3-incident. This one also loops: removing faces can create *new* non-manifold edges, so a
+  pathological input uses all ``max_iter`` rounds where a clean one exits after the first test.
+* ``remove_duplicated_vertices`` -- run on an *unwelded* soup (every face owning its own three
+  vertices, the state a freshly loaded STL is in), sweeping ``epsilon``. The two values are two
+  code paths rather than two thresholds: positive ``epsilon`` snaps coordinates to
+  ``round(v / epsilon)``, while ``0`` buckets by the high bits of the float32 representation --
+  a *relative* cell about 2.4e-4 wide, not an equality test.
 
-**open3d** is the reference: ``remove_duplicated_triangles`` solves the same "deduplicate a face
-array" problem with a hash set over index triples, against triwarp's sort-based grouping. It is a
-comparison of dedup *machinery*, not of results — the semantics differ twice over:
+``make_winding_consistent`` is the exception and gets the **diameter** axis instead: it propagates
+orientation bits across the face-adjacency graph one level per round, so its cost is graph depth,
+not defect count. Measured at **7.4 ms on ``sphere_med`` against 642 ms on ``ribbon_long``** at an
+identical vertex count -- 87x -- while trimesh's equivalent goes the other way, 16.8 ms to 7.8 ms.
+Same finding as ``face_orientation_bits`` in [`test_validation.py`](test_validation.py), which is
+the machinery underneath it.
+
+References
+----------
+**open3d**'s ``remove_duplicated_triangles`` solves the same "deduplicate a face array" problem
+with a hash set over index triples, against triwarp's sort-based grouping. It is a comparison of
+dedup *machinery*, not of results -- the semantics differ twice over:
 
 1. open3d keeps one representative of each duplicate group, while triwarp applies a signed-count
    rule that drops cancelling ``(+1, -1)`` pairs outright;
@@ -19,67 +37,86 @@ comparison of dedup *machinery*, not of results — the semantics differ twice o
    nothing and returns the face count unchanged. The hash pass over all ``n`` triples still runs,
    which is the cost being compared; the assertion below only checks the count did not grow.
 
-Open3D mutates the mesh in place and returns ``self``, and the operation is idempotent, so the mesh
-is rebuilt inside the timed callable (rounds 2..n would otherwise dedup an already-deduped mesh).
+Open3D mutates in place and the operation is idempotent, so its mesh is rebuilt inside the timed
+callable (rounds 2..n would otherwise dedup an already-deduped mesh). ``remove_duplicated_vertices``
+is its counterpart for the vertex group. **trimesh**'s ``repair.fix_winding`` is the orientation
+reference; it has no non-manifold face removal.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
+import trimesh as tm
 import warp as wp
-from conftest import BenchCase, skip_larger_than
+from conftest import BenchCase
 
 import triwarp as tw
 
 _DUP_SEED = 7
 
-# The device rewrite scales; keep lucy out (the duplicated-input build is host-side numpy).
-_LARGEST_MESH = "happy_buddha"
+# Fraction of faces re-appended as flipped copies: nothing to do, against a tenth of the mesh.
+_DUPLICATE_FRACTIONS = [0.0, 0.1]
 
-_dup_np_cache: dict[str, np.ndarray] = {}
-_dup_cache: dict[tuple[str, str], wp.array] = {}
+# Extra same-orientation face copies, each making its three edges 3-incident.
+_NON_MANIFOLD_COUNTS = [0, 1_024]
 
+# Vertex merge tolerances: two different code paths, not two thresholds (see the module docstring).
+_MERGE_EPSILONS = [0.0, 1e-6]
 
-def _faces_with_duplicates_np(bench_case: BenchCase) -> np.ndarray:
-    """``(n_faces, 3)`` int32 faces plus a 10% subset re-appended flipped, cached per mesh."""
-    if bench_case.mesh_name not in _dup_np_cache:
-        faces = bench_case.faces_np
-        # Scan meshes ship with genuine same-orientation duplicates (non-orientable groups that
-        # the function rejects by contract) and degenerate faces; start from a clean base so the
-        # constructed input is exactly "unique faces + cancelling flipped pairs".
-        sorted_rows = np.sort(faces, axis=1)
-        _, inverse, counts = np.unique(sorted_rows, axis=0, return_inverse=True, return_counts=True)
-        base = faces[counts[inverse] == 1]
-        nondegenerate = (
-            (base[:, 0] != base[:, 1]) & (base[:, 1] != base[:, 2]) & (base[:, 0] != base[:, 2])
-        )
-        base = base[nondegenerate]
-        rng = np.random.default_rng(_DUP_SEED)
-        idx = rng.choice(base.shape[0], size=max(1, base.shape[0] // 10), replace=False)
-        flipped = base[idx][:, ::-1]
-        _dup_np_cache[bench_case.mesh_name] = np.ascontiguousarray(
-            np.vstack((base, flipped)), dtype=np.int32
-        )
-    return _dup_np_cache[bench_case.mesh_name]
+_defect_np_cache: dict[tuple[str, float], np.ndarray] = {}
+_defect_wp_cache: dict[tuple[str, str, float], wp.array] = {}
+_nonmanifold_cache: dict[tuple[str, str, int], wp.array] = {}
+_soup_cache: dict[tuple[str, str], tuple] = {}
 
 
-def _faces_with_duplicates_wp(bench_case: BenchCase) -> wp.array[wp.int32]:
-    key = (bench_case.mesh_name, str(bench_case.device))
-    if key not in _dup_cache:
-        combined = _faces_with_duplicates_np(bench_case).reshape(-1)
-        _dup_cache[key] = wp.array(
+def _clean_faces_np(bench_case: BenchCase) -> np.ndarray:
+    """Return the mesh faces with any pre-existing duplicate or degenerate triangle removed."""
+    faces = bench_case.faces_np
+    sorted_rows = np.sort(faces, axis=1)
+    _, inverse, counts = np.unique(sorted_rows, axis=0, return_inverse=True, return_counts=True)
+    base = faces[counts[inverse] == 1]
+    nondegenerate = (
+        (base[:, 0] != base[:, 1]) & (base[:, 1] != base[:, 2]) & (base[:, 0] != base[:, 2])
+    )
+    return np.ascontiguousarray(base[nondegenerate], dtype=np.int32)
+
+
+def _faces_with_duplicates_np(bench_case: BenchCase, fraction: float) -> np.ndarray:
+    """Append a fixed-seed subset of the faces back as *flipped* copies: cancelling pairs."""
+    key = (bench_case.mesh_name, fraction)
+    if key not in _defect_np_cache:
+        base = _clean_faces_np(bench_case)
+        if fraction <= 0.0:
+            _defect_np_cache[key] = base
+        else:
+            rng = np.random.default_rng(_DUP_SEED)
+            n_dup = max(1, int(base.shape[0] * fraction))
+            idx = rng.choice(base.shape[0], size=n_dup, replace=False)
+            _defect_np_cache[key] = np.ascontiguousarray(
+                np.vstack((base, base[idx][:, ::-1])), dtype=np.int32
+            )
+    return _defect_np_cache[key]
+
+
+def _faces_with_duplicates_wp(bench_case: BenchCase, fraction: float) -> wp.array[wp.int32]:
+    key = (bench_case.mesh_name, str(bench_case.device), fraction)
+    if key not in _defect_wp_cache:
+        combined = _faces_with_duplicates_np(bench_case, fraction).reshape(-1)
+        _defect_wp_cache[key] = wp.array(
             np.ascontiguousarray(combined), dtype=wp.int32, device=bench_case.device
         )
-    return _dup_cache[key]
+    return _defect_wp_cache[key]
 
 
 @pytest.mark.benchmark(group="resolve_duplicated_faces")
+@pytest.mark.benchmeshes("sphere_med")
 @pytest.mark.benchlibs("triwarp", "open3d")
-def test_resolve_duplicated_faces(bench_case: BenchCase) -> None:
-    skip_larger_than(bench_case, _LARGEST_MESH, "pre-fix host implementation is O(u*n)")
+@pytest.mark.parametrize("fraction", _DUPLICATE_FRACTIONS, ids=["clean", "dup10pct"])
+def test_resolve_duplicated_faces(bench_case: BenchCase, fraction: float) -> None:
+    """Sort-based grouping with a signed-count rule: nothing to do, against a tenth of the mesh."""
     if bench_case.kind == "triwarp":
-        faces_dup = _faces_with_duplicates_wp(bench_case)
+        faces_dup = _faces_with_duplicates_wp(bench_case, fraction)
         resolved, kept = bench_case.run(lambda: tw.repair.resolve_duplicated_faces(faces_dup))
         assert resolved.shape[0] == kept.shape[0] * 3
         assert kept.shape[0] > 0
@@ -88,7 +125,7 @@ def test_resolve_duplicated_faces(bench_case: BenchCase) -> None:
         import open3d as o3d
 
         vertices = o3d.utility.Vector3dVector(bench_case.vertices_np)
-        faces_dup_np = _faces_with_duplicates_np(bench_case)
+        faces_dup_np = _faces_with_duplicates_np(bench_case, fraction)
 
         def run() -> o3d.geometry.TriangleMesh:
             mesh = o3d.geometry.TriangleMesh(vertices, o3d.utility.Vector3iVector(faces_dup_np))
@@ -96,3 +133,103 @@ def test_resolve_duplicated_faces(bench_case: BenchCase) -> None:
 
         deduped = bench_case.run(run)
         assert 0 < len(deduped.triangles) <= faces_dup_np.shape[0]
+
+
+def _faces_with_non_manifold_wp(bench_case: BenchCase, extra: int) -> wp.array[wp.int32]:
+    """Append ``extra`` same-orientation face copies, so their edges become 3-incident."""
+    key = (bench_case.mesh_name, str(bench_case.device), extra)
+    if key not in _nonmanifold_cache:
+        base = _clean_faces_np(bench_case)
+        if extra > 0:
+            rng = np.random.default_rng(_DUP_SEED)
+            idx = rng.choice(base.shape[0], size=min(extra, base.shape[0]), replace=False)
+            base = np.vstack((base, base[idx]))
+        _nonmanifold_cache[key] = wp.array(
+            np.ascontiguousarray(base.reshape(-1), dtype=np.int32),
+            dtype=wp.int32,
+            device=bench_case.device,
+        )
+    return _nonmanifold_cache[key]
+
+
+@pytest.mark.benchmark(group="remove_non_manifold_faces")
+@pytest.mark.benchmeshes("sphere_med")
+@pytest.mark.benchlibs("triwarp")
+@pytest.mark.parametrize("extra", _NON_MANIFOLD_COUNTS, ids=["clean", "nm1024"])
+def test_remove_non_manifold_faces(bench_case: BenchCase, extra: int) -> None:
+    """Iterated edge-sort and manifold test: a clean mesh exits in one round, a broken one loops."""
+    vertices = bench_case.vertices_wp
+    faces = _faces_with_non_manifold_wp(bench_case, extra)
+    _kept_vertices, kept_faces = bench_case.run(
+        lambda: tw.repair.remove_non_manifold_faces(vertices, faces)
+    )
+    assert int(kept_faces.shape[0]) > 0
+
+
+def _soup(bench_case: BenchCase) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """Unweld the mesh so every face owns its three vertices: maximal duplication to collapse."""
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _soup_cache:
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        soup_np = vertices_np[faces_np].reshape(-1, 3)
+        _soup_cache[key] = (
+            wp.array(
+                np.ascontiguousarray(soup_np, dtype=np.float32),
+                dtype=wp.vec3,
+                device=bench_case.device,
+            ),
+            wp.array(
+                np.arange(soup_np.shape[0], dtype=np.int32),
+                dtype=wp.int32,
+                device=bench_case.device,
+            ),
+        )
+    return _soup_cache[key]
+
+
+@pytest.mark.benchmark(group="remove_duplicated_vertices")
+@pytest.mark.benchmeshes("sphere_med")
+@pytest.mark.benchlibs("triwarp", "open3d")
+@pytest.mark.parametrize("epsilon", _MERGE_EPSILONS, ids=["exact", "eps1e-6"])
+def test_remove_duplicated_vertices(bench_case: BenchCase, epsilon: float) -> None:
+    """Weld an unwelded soup: 245 760 positions down to 40 962, by two different bucketings."""
+    if bench_case.kind == "triwarp":
+        vertices, faces = _soup(bench_case)
+        unique_vertices, _unique_indices, _inverse, _faces = bench_case.run(
+            lambda: tw.repair.remove_duplicated_vertices(vertices, faces, epsilon)
+        )
+        assert int(unique_vertices.shape[0]) <= int(vertices.shape[0])
+    else:
+        import open3d as o3d
+
+        soup_np = np.ascontiguousarray(bench_case.vertices_np[bench_case.faces_np].reshape(-1, 3))
+        faces_np = np.ascontiguousarray(np.arange(soup_np.shape[0], dtype=np.int32).reshape(-1, 3))
+
+        def run() -> o3d.geometry.TriangleMesh:
+            mesh = o3d.geometry.TriangleMesh(
+                o3d.utility.Vector3dVector(soup_np), o3d.utility.Vector3iVector(faces_np)
+            )
+            return mesh.remove_duplicated_vertices()
+
+        welded = bench_case.run(run)
+        assert 0 < len(welded.vertices) <= soup_np.shape[0]
+
+
+@pytest.mark.benchmark(group="make_winding_consistent")
+@pytest.mark.benchaxis("diameter")
+@pytest.mark.benchlibs("triwarp", "trimesh")
+def test_make_winding_consistent(bench_case: BenchCase) -> None:
+    """Z2 orientation propagation: depth-bound, so 87x across the diameter axis."""
+    if bench_case.kind == "triwarp":
+        faces = bench_case.faces_wp
+        oriented = bench_case.run(lambda: tw.repair.make_winding_consistent(faces))
+        assert int(oriented.shape[0]) == faces.shape[0]
+    else:  # trimesh mutates in place: rebuild inside the timed callable
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+
+        def fix_winding_tm() -> tm.Trimesh:
+            mesh_tm = tm.Trimesh(vertices_np, faces_np, process=False)
+            tm.repair.fix_winding(mesh_tm)
+            return mesh_tm
+
+        assert len(bench_case.run(fix_winding_tm).faces) == bench_case.n_faces

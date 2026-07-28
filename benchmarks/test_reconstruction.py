@@ -78,7 +78,13 @@ _NUM_NEIGHBOURS = 18
 # Ball radius as a multiple of the mean edge length (a proxy for point spacing).
 _BPA_RADIUS_FRACTION = 1.5
 
-# Octree depth of ``triwarp.reconstruction.screened_poisson``, mirrored on the open3d side.
+# Octree depths of ``triwarp.reconstruction.screened_poisson``, mirrored on the open3d side. This
+# is the module's dominant knob by a wide margin: ``dense`` mode is a ``2^depth`` cubed node grid,
+# so each step is ~8x the nodes and the point count is almost secondary.
+_POISSON_DEPTHS = [7, 9]
+
+# A depth-9 dense solve and a ball-pivoting front are both seconds a call.
+_HEAVY_ROUNDS = 3
 _POISSON_DEPTH = 8
 
 _normals_cache: dict[tuple[str, str], wp.array[wp.vec3]] = {}
@@ -142,7 +148,8 @@ def test_ball_pivoting(bench_case: BenchCase) -> None:
     if bench_case.kind == "triwarp":
         points, normals = bench_case.vertices_wp, _normals(bench_case)
         _vertices, faces = bench_case.run(
-            lambda: tw.reconstruction.ball_pivoting(points, normals, radius=radius)
+            lambda: tw.reconstruction.ball_pivoting(points, normals, radius=radius),
+            rounds=_HEAVY_ROUNDS,
         )
         assert int(faces.shape[0]) > 0
     else:  # open3d's BPA takes a radius list; give it the single identical radius
@@ -158,8 +165,11 @@ def test_ball_pivoting(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="screened_poisson")
 @pytest.mark.benchlibs("triwarp", "open3d")
+@pytest.mark.parametrize("depth", _POISSON_DEPTHS)
 @pytest.mark.parametrize("method", ["dense", "adaptive"])
-def test_screened_poisson(bench_case: BenchCase, method: Literal["dense", "adaptive"]) -> None:
+def test_screened_poisson(
+    bench_case: BenchCase, method: Literal["dense", "adaptive"], depth: int
+) -> None:
     skip_larger_than(bench_case, "bunny", "screened Poisson above bunny dominates the suite")
     if bench_case.kind == "open3d":
         if method != "dense":
@@ -168,15 +178,14 @@ def test_screened_poisson(bench_case: BenchCase, method: Literal["dense", "adapt
 
         cloud = _cloud_o3d(bench_case)
         mesh_poisson, _density = bench_case.run(
-            lambda: o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-                cloud, depth=_POISSON_DEPTH
-            )
+            lambda: o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(cloud, depth=depth)
         )
         assert len(mesh_poisson.triangles) > 0
         return
     _skip_cg_on_cpu(bench_case)
     points, normals = bench_case.vertices_wp, _normals(bench_case)
     _vertices, faces = bench_case.run(
-        lambda: tw.reconstruction.screened_poisson(points, normals, method=method)
+        lambda: tw.reconstruction.screened_poisson(points, normals, depth=depth, method=method),
+        rounds=_HEAVY_ROUNDS,
     )
     assert int(faces.shape[0]) > 0

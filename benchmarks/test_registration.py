@@ -2,10 +2,19 @@
 Benchmarks for ``triwarp.registration``.
 
 Times the Procrustes fit and the ICP variants against a source cloud built from the mesh itself:
-20k subsampled vertices pushed through a fixed 5-degree rotation plus a 2%-of-diagonal translation
-and 0.2%-of-diagonal Gaussian noise. Deriving the source from the target means the correspondence
-problem is well posed on every mesh in the registry, and the same perturbation goes to every
-library, so none of them gets an easier problem.
+20k subsampled vertices pushed through a fixed rotation plus a 2%-of-diagonal translation and
+0.2%-of-diagonal Gaussian noise. Deriving the source from the target means the correspondence
+problem is well posed on every mesh, and the same perturbation goes to every library, so none of
+them gets an easier problem.
+
+Axis: **scale** for the ICP groups, and the scan sweep for ``procrustes``. ICP has two cost drivers
+and the target's face count is only half of one of them: the per-iteration nearest-neighbour search
+scales with the target, but the *number* of iterations scales with the initial misalignment, and
+that is what a caller actually varies. So the ICP groups take the clean three-point ``scale`` axis
+rather than the scan registry -- the largest scan meshes were adding ten minutes of wall clock for a
+ratio the axis already establishes -- and ``icp_convergence`` sweeps the starting angle to measure
+the other driver directly. ``procrustes`` keeps the scan sweep: it has no search at all, so it is a
+pure throughput case and cheap everywhere.
 
 References
 ----------
@@ -70,7 +79,11 @@ _SEED = 42
 _N_POINTS = 20_000
 _ICP_ITERATIONS = 10
 
-# Fixed misalignment applied to the source cloud, in degrees and in fractions of the bbox diagonal.
+# Misalignments applied to the source cloud, in degrees. ICP's cost is the *actual* iteration
+# count, not ``max_iterations``: it exits early once the cost improvement drops below ``threshold``,
+# so a nearly-aligned pair converges in two or three passes where a badly aligned one runs the full
+# schedule. That makes the starting angle the axis, and it is invisible to any mesh-size sweep.
+_ROTATION_SWEEP = [5.0, 45.0]
 _ROTATION_DEGREES = 5.0
 _TRANSLATION_FRACTION = 0.02
 _NOISE_FRACTION = 0.002
@@ -80,19 +93,19 @@ _NOISE_FRACTION = 0.002
 # minimize the same objective.
 _TUKEY_FRACTION = 0.01
 
-_source_np_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-_source_wp_cache: dict[tuple[str, str], wp.array] = {}
+_source_np_cache: dict[tuple[str, float], tuple[np.ndarray, np.ndarray]] = {}
+_source_wp_cache: dict[tuple[str, str, float], wp.array] = {}
 _normals_np_cache: dict[str, np.ndarray] = {}
 _normals_wp_cache: dict[tuple[str, str], wp.array] = {}
 _pcd_cache: dict[tuple[str, str], o3d.geometry.PointCloud] = {}
 
 
-def _rotation_matrix() -> np.ndarray:
-    """Rodrigues rotation of ``_ROTATION_DEGREES`` about the fixed axis ``(1, 2, 3)``."""
+def _rotation_matrix(degrees: float = _ROTATION_DEGREES) -> np.ndarray:
+    """Rodrigues rotation of ``degrees`` about the fixed axis ``(1, 2, 3)``."""
     axis = np.array([1.0, 2.0, 3.0])
     axis /= np.linalg.norm(axis)
     cross = np.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]])
-    angle = np.deg2rad(_ROTATION_DEGREES)
+    angle = np.deg2rad(degrees)
     return np.eye(3) + np.sin(angle) * cross + (1.0 - np.cos(angle)) * (cross @ cross)
 
 
@@ -102,27 +115,29 @@ def _diagonal(bench_case: BenchCase) -> float:
     return float(np.linalg.norm(vertices.max(axis=0) - vertices.min(axis=0)))
 
 
-def _source_np(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarray]:
+def _source_np(
+    bench_case: BenchCase, degrees: float = _ROTATION_DEGREES
+) -> tuple[np.ndarray, np.ndarray]:
     """``(source_points, target_indices)``: perturbed vertex subsample and the source rows."""
-    name = bench_case.mesh_name
-    if name not in _source_np_cache:
+    key = (bench_case.mesh_name, degrees)
+    if key not in _source_np_cache:
         rng = np.random.default_rng(_SEED)
         vertices = bench_case.vertices_np
         count = min(_N_POINTS, vertices.shape[0])
         indices = rng.choice(vertices.shape[0], size=count, replace=False)
         diagonal = _diagonal(bench_case)
         offset = _TRANSLATION_FRACTION * diagonal * np.array([1.0, -1.0, 0.5]) / np.sqrt(2.25)
-        source = vertices[indices] @ _rotation_matrix().T + offset
+        source = vertices[indices] @ _rotation_matrix(degrees).T + offset
         source += rng.normal(scale=_NOISE_FRACTION * diagonal, size=source.shape)
-        _source_np_cache[name] = (np.ascontiguousarray(source), indices)
-    return _source_np_cache[name]
+        _source_np_cache[key] = (np.ascontiguousarray(source), indices)
+    return _source_np_cache[key]
 
 
-def _source_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
-    key = (bench_case.mesh_name, str(bench_case.device))
+def _source_wp(bench_case: BenchCase, degrees: float = _ROTATION_DEGREES) -> wp.array[wp.vec3]:
+    key = (bench_case.mesh_name, str(bench_case.device), degrees)
     if key not in _source_wp_cache:
         _source_wp_cache[key] = wp.array(
-            np.ascontiguousarray(_source_np(bench_case)[0], dtype=np.float32),
+            np.ascontiguousarray(_source_np(bench_case, degrees)[0], dtype=np.float32),
             dtype=wp.vec3,
             device=bench_case.device,
         )
@@ -214,6 +229,7 @@ def test_procrustes(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="icp_point_cloud")
+@pytest.mark.benchaxis("scale")
 @pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
 def test_icp_point_cloud(bench_case: BenchCase) -> None:
     """Point-to-point ICP against a point-cloud target: BVH versus cKDTree versus KDTreeFlann."""
@@ -254,7 +270,29 @@ def test_icp_point_cloud(bench_case: BenchCase) -> None:
         assert np.asarray(result.transformation).shape == (4, 4)
 
 
+@pytest.mark.benchmark(group="icp_convergence")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp")
+@pytest.mark.parametrize("degrees", _ROTATION_SWEEP, ids=["near5deg", "far45deg"])
+def test_icp_convergence(bench_case: BenchCase, degrees: float) -> None:
+    """
+    Point-to-point ICP with early exit enabled, from a near and a far starting pose.
+
+    Every other ICP group here pins ``threshold=-inf`` so all ``max_iterations`` run, which is what
+    makes the cross-library comparison fair -- it measures *per-iteration* cost. This group does the
+    opposite: it leaves the default threshold in place so the loop exits when it converges, which
+    makes the timing report the *iteration count*. That is the number a caller actually pays, and
+    it is a function of the initial misalignment, not of the mesh.
+    """
+    source, target = _source_wp(bench_case, degrees), bench_case.vertices_wp
+    matrix, _transformed, _cost = bench_case.run(
+        lambda: tw.registration.icp(source, target, max_iterations=_ICP_ITERATIONS)
+    )
+    assert matrix.shape == (1,)
+
+
 @pytest.mark.benchmark(group="icp_mesh")
+@pytest.mark.benchaxis("scale")
 @pytest.mark.benchlibs("triwarp")
 def test_icp_mesh(bench_case: BenchCase) -> None:
     """Point-to-point ICP against the triangle surface (closest-point-on-mesh correspondences)."""
@@ -269,6 +307,7 @@ def test_icp_mesh(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="icp_point_to_plane_cloud")
+@pytest.mark.benchaxis("scale")
 @pytest.mark.benchlibs("triwarp", "open3d")
 def test_icp_point_to_plane_cloud(bench_case: BenchCase) -> None:
     """Gauss-Newton point-to-plane ICP against a point-cloud target, on shared vertex normals."""
@@ -298,6 +337,7 @@ def test_icp_point_to_plane_cloud(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="icp_point_to_plane_tukey")
+@pytest.mark.benchaxis("scale")
 @pytest.mark.benchlibs("triwarp", "open3d")
 def test_icp_point_to_plane_tukey(bench_case: BenchCase) -> None:
     """Robust point-to-plane ICP: triwarp's Tukey weight dispatch against open3d's ``TukeyLoss``."""
@@ -332,6 +372,7 @@ def test_icp_point_to_plane_tukey(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="icp_point_to_plane_mesh")
+@pytest.mark.benchaxis("scale")
 @pytest.mark.benchlibs("triwarp")
 def test_icp_point_to_plane_mesh(bench_case: BenchCase) -> None:
     """

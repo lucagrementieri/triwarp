@@ -61,10 +61,12 @@ import triwarp as tw
 _PLANE_NORMAL = np.array([0.3, 0.8, 0.5])
 _PLANE_NORMAL = _PLANE_NORMAL / np.linalg.norm(_PLANE_NORMAL)
 
-# Self-intersection offset, as a fraction of the mesh bounding-box diagonal.
-_SELF_OFFSET_FRACTION = 0.05
+# Self-intersection offsets, as fractions of the mesh bounding-box diagonal. ``mesh_with_mesh``
+# costs the number of *actually overlapping* triangle pairs, not the face count, so the offset is
+# the axis: a deep overlap intersects a broad band, a grazing one barely touches.
+_SELF_OFFSET_FRACTIONS = [0.05, 0.60]
 
-_shifted_cache: dict[tuple[str, str], wp.array[wp.vec3]] = {}
+_shifted_cache: dict[tuple[str, str, float], wp.array[wp.vec3]] = {}
 
 
 def _plane_origin(bench_case: BenchCase) -> np.ndarray:
@@ -73,13 +75,13 @@ def _plane_origin(bench_case: BenchCase) -> np.ndarray:
     return 0.5 * (vertices.min(axis=0) + vertices.max(axis=0))
 
 
-def _shifted_vertices_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
+def _shifted_vertices_wp(bench_case: BenchCase, offset_fraction: float) -> wp.array[wp.vec3]:
     """Translate the mesh's own vertices along the plane normal, to act as the second mesh."""
-    key = (bench_case.mesh_name, str(bench_case.device))
+    key = (bench_case.mesh_name, str(bench_case.device), offset_fraction)
     if key not in _shifted_cache:
         vertices = bench_case.vertices_np
         diagonal = float(np.linalg.norm(vertices.max(axis=0) - vertices.min(axis=0)))
-        shifted = vertices + _SELF_OFFSET_FRACTION * diagonal * _PLANE_NORMAL
+        shifted = vertices + offset_fraction * diagonal * _PLANE_NORMAL
         _shifted_cache[key] = wp.array(
             np.ascontiguousarray(shifted, dtype=np.float32), dtype=wp.vec3, device=bench_case.device
         )
@@ -133,11 +135,19 @@ def test_slice_mesh_with_plane(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="mesh_with_mesh")
 @pytest.mark.benchlibs("triwarp")
-def test_mesh_with_mesh(bench_case: BenchCase) -> None:
-    """BVH broad phase plus the separating-axis narrow phase, against a translated self-copy."""
+@pytest.mark.parametrize("offset_fraction", _SELF_OFFSET_FRACTIONS, ids=["deep", "grazing"])
+def test_mesh_with_mesh(bench_case: BenchCase, offset_fraction: float) -> None:
+    """
+    BVH broad phase plus the separating-axis narrow phase, against a translated self-copy.
+
+    Cost is the number of overlapping triangle *pairs*, so the translation distance is the axis
+    rather than the face count. The ``deep`` row shares most of its volume with the original and
+    the ``grazing`` row barely touches it; the gap is the collision density, and the fixed
+    ``max_triangle_collisions`` cap silently truncates once the broad phase saturates.
+    """
     skip_larger_than(bench_case, "bunny", "broad phase allocates 16 candidate slots per triangle")
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-    shifted = _shifted_vertices_wp(bench_case)
+    shifted = _shifted_vertices_wp(bench_case, offset_fraction)
     lines = bench_case.run(lambda: tw.intersection.mesh_with_mesh(vertices, faces, shifted, faces))
     assert lines.shape[1] == 2
 

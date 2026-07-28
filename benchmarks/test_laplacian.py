@@ -175,9 +175,10 @@ def test_uniform_laplacian(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="mass_matrix_entries")
+@pytest.mark.benchaxis("valence")
 @pytest.mark.benchlibs("triwarp", "igl")
 def test_mass_matrix_entries(bench_case: BenchCase) -> None:
-    """Barycentric lumped mass per vertex: a scatter-add over incident face areas."""
+    """Barycentric lumped mass per vertex: a scatter-add, so on the valence axis for contention."""
     n_vertices = bench_case.n_vertices
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
@@ -194,6 +195,7 @@ def test_mass_matrix_entries(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="mass_matrix")
+@pytest.mark.benchaxis("valence")
 @pytest.mark.benchlibs("triwarp", "igl")
 def test_mass_matrix(bench_case: BenchCase) -> None:
     """The same diagonal, assembled as a sparse matrix."""

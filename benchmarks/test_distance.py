@@ -122,12 +122,30 @@ def test_chamfer_mesh_to_mesh_loss(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="chamfer_points_to_points")
 @pytest.mark.benchlibs("triwarp", "open3d")
-def test_chamfer_points_to_points(bench_case: BenchCase) -> None:
-    """Symmetric point-cloud Chamfer: two ``k=1`` searches plus a mean-of-squares reduction."""
+@pytest.mark.parametrize("single_directional", [True, False], ids=["oneway", "symmetric"])
+def test_chamfer_points_to_points(bench_case: BenchCase, single_directional: bool) -> None:
+    """
+    Point-cloud Chamfer: ``k=1`` searches plus a mean-of-squares reduction.
+
+    ``single_directional=False`` does not merely double the work -- it builds a *second*
+    acceleration structure over the other cloud. So the symmetric row should be more than 2x the
+    one-way row, and how much more is the build cost, which is otherwise invisible.
+    """
     skip_larger_than(bench_case, "dragon")
     if bench_case.kind == "triwarp":
         cloud_a, cloud_b = _clouds_wp(bench_case)
-        chamfer = bench_case.run(lambda: tw.distance.chamfer_points_to_points(cloud_a, cloud_b))
+        chamfer = bench_case.run(
+            lambda: tw.distance.chamfer_points_to_points(
+                cloud_a, cloud_b, single_directional=single_directional
+            )
+        )
+    elif single_directional:
+        cloud_a, cloud_b = _clouds_o3d(bench_case)
+        chamfer = bench_case.run(
+            lambda: float(
+                np.square(np.asarray(cloud_a.compute_point_cloud_distance(cloud_b))).mean()
+            )
+        )
     else:
         cloud_a, cloud_b = _clouds_o3d(bench_case)
         chamfer = bench_case.run(

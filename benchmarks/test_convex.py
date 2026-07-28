@@ -56,6 +56,10 @@ from conftest import BenchCase, skip_larger_than
 
 import triwarp as tw
 
+# Direction counts for the support sweep. Cost is exactly ``points x n_directions`` -- the only
+# knob in the module, and the accuracy/speed trade against exact qhull.
+_N_DIRECTIONS = [32, 256]
+
 
 @pytest.mark.benchmark(group="face_adjacency_projections")
 @pytest.mark.benchlibs("triwarp")
@@ -84,11 +88,20 @@ def test_face_adjacency_convex(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="fast_convex_set_mask")
 @pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
-def test_fast_convex_set_mask(bench_case: BenchCase) -> None:
-    """Tiled support sweep over 128 directions vs exact qhull (see the module docstring)."""
+@pytest.mark.parametrize("n_directions", _N_DIRECTIONS)
+def test_fast_convex_set_mask(bench_case: BenchCase, n_directions: int) -> None:
+    """
+    Tiled support sweep vs exact qhull (see the module docstring).
+
+    Cost is ``points x n_directions`` with no topology involved, so the direction count is the
+    axis. The references are exact and take no such parameter, so their two rows are identical by
+    construction -- they are there as the fixed bar the approximation is trading accuracy against.
+    """
     if bench_case.kind == "triwarp":
         points = bench_case.vertices_wp
-        mask = bench_case.run(lambda: tw.convex.fast_convex_set_mask(points))
+        mask = bench_case.run(
+            lambda: tw.convex.fast_convex_set_mask(points, n_directions=n_directions)
+        )
         assert mask.shape[0] == bench_case.n_vertices
     elif bench_case.kind == "trimesh":
         skip_larger_than(bench_case, "dragon", "qhull is single-threaded on the host")

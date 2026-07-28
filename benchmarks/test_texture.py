@@ -17,10 +17,12 @@ Two inverse pairs, with opposite cost drivers:
   meshes. ``order=1`` is the ``wp.lerp`` path; ``order=0`` is the same gather without the blend, so
   timing both isolates the interpolation cost.
 
-Both directions are timed at a single fixed ``resolution`` — the resolution axis is not swept
-because the scaling there is analytically obvious (quadratic for rasterize, flat for remap) and a
-sweep would multiply the case count without telling us anything a change to these kernels would
-move.
+Axis: the **scan sweep** for the face-count half, plus a **resolution** sweep of 512 against 2048
+on every group. Those are the module's two independent sizes and they pull in opposite directions,
+so pinning either one hides half the story: the rasterizers should show a ~16x step across the
+resolution pair (4x the pixels each way) and the remappers should show none at all beyond cache
+effects. A rasterizer that fails to scale quadratically, or a remapper that *does*, is the signal
+this pair is here to produce.
 
 UV coordinates
 --------------
@@ -63,7 +65,11 @@ from conftest import BenchCase, skip_larger_than
 import triwarp as tw
 import triwarp.typing as twt
 
-# Texture size for every case (see the module docstring on why resolution is not swept).
+# Texture sizes: 4x the pixels between the two points, so the rasterizers' quadratic term and the
+# remappers' independence from resolution both read directly off the pair.
+_RESOLUTIONS = [512, 2048]
+
+# Resolution of the cached source textures the remap groups sample from.
 _RESOLUTION = 1024
 
 # Number of distinct labels for the discrete pair.
@@ -132,26 +138,26 @@ def _class_image_wp(bench_case: BenchCase) -> twt.Array2dInt32:
 
 @pytest.mark.benchmark(group="rasterize_attribute")
 @pytest.mark.benchlibs("triwarp")
-def test_rasterize_attribute(bench_case: BenchCase) -> None:
-    """Barycentric scatter of a 3-channel attribute into a 1024^2 texture."""
+@pytest.mark.parametrize("resolution", _RESOLUTIONS)
+def test_rasterize_attribute(bench_case: BenchCase, resolution: int) -> None:
+    """Barycentric scatter of a 3-channel attribute, at 512^2 and 2048^2."""
     uv, faces = _uv_wp(bench_case), bench_case.faces_wp
     attribute = _attribute_wp(bench_case)
-    image = bench_case.run(
-        lambda: tw.texture.rasterize_attribute(uv, faces, attribute, _RESOLUTION)
-    )
-    assert image.shape[:2] == (_RESOLUTION, _RESOLUTION)
+    image = bench_case.run(lambda: tw.texture.rasterize_attribute(uv, faces, attribute, resolution))
+    assert image.shape[:2] == (resolution, resolution)
 
 
 @pytest.mark.benchmark(group="rasterize_discrete_attribute")
 @pytest.mark.benchlibs("triwarp")
-def test_rasterize_discrete_attribute(bench_case: BenchCase) -> None:
+@pytest.mark.parametrize("resolution", _RESOLUTIONS)
+def test_rasterize_discrete_attribute(bench_case: BenchCase, resolution: int) -> None:
     """The same scatter, resolving a per-pixel label argmax instead of interpolating."""
     uv, faces = _uv_wp(bench_case), bench_case.faces_wp
     labels = _labels_wp(bench_case)
     class_image = bench_case.run(
-        lambda: tw.texture.rasterize_discrete_attribute(uv, faces, labels, _RESOLUTION)
+        lambda: tw.texture.rasterize_discrete_attribute(uv, faces, labels, resolution)
     )
-    assert class_image.shape == (_RESOLUTION, _RESOLUTION)
+    assert class_image.shape == (resolution, resolution)
 
 
 @pytest.mark.benchmark(group="remap_attribute_from_uv_linear")

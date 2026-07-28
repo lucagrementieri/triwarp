@@ -2,9 +2,11 @@
 Benchmarks for ``triwarp.creation``: parametric primitive generation.
 
 The only benchmarks in the suite with **no input mesh**, so they use the ``bench_lib`` fixture
-rather than ``bench_case`` — see the mesh-free path in ``conftest.pytest_generate_tests``. Work is
-sized by resolution instead of by mesh: ``sections`` for the revolution primitives and
-``subdivisions`` for the icosphere. The largest points are chosen so the device has real work
+rather than ``bench_case`` — see the mesh-free path in ``conftest.pytest_generate_tests``. Their
+axis is **resolution**, the mesh-free member of the axis set: work is sized by ``sections`` for the
+revolution primitives, ``subdivisions`` for the icosphere and ``face_count`` for the per-triangle
+generators, all as a plain ``pytest.mark.parametrize`` because there is no mesh for ``benchaxis`` to
+select. The largest points are chosen so the device has real work
 (``sections=4096`` on a 33-point torus profile is ~135k vertices / 270k faces; ``subdivisions=7``
 is ~164k faces), while staying inside the scale where the absolute degenerate-triangle threshold in
 ``revolve`` is meaningful.
@@ -61,6 +63,20 @@ falling behind above a few thousand sections (its ``create_sphere`` at 4096 is a
 ``icosphere`` is the exception to the flat profile, because it is genuinely iterative: each of the
 ``subdivisions`` passes is a full ``subdivide`` (edge dedup, a sort, a scan), so its cost grows with
 the subdivision count rather than being one launch.
+
+``triangulate_polygon`` is the second exception and the module's one real slowness path: ear
+clipping cannot be expressed in parallel, so it runs as a single-thread kernel at ``O(L^2)`` in the
+ring length. ``extrude_polygon`` only ever exercises the *convex* fast path (a single fan), which is
+why the ear clipper is benchmarked directly on a non-convex star ring — the same reasoning that puts
+``polyline.simplify_polyline`` in its own group in [`test_polyline.py`](test_polyline.py).
+
+Deliberately not benchmarked
+----------------------------
+``box``, ``icosahedron`` and ``axis`` are constant tables, so they measure only the per-wrapper
+floor — which is worth measuring exactly once, and ``test_box`` is where that happens (see its
+comment). ``capsule`` and ``extrude_triangulation`` are the same ``revolve`` and triangulation
+engines behind a different profile, already covered by ``cylinder`` / ``uv_sphere`` and
+``extrude_polygon`` respectively.
 """
 
 from __future__ import annotations
@@ -85,6 +101,10 @@ _SUBDIVISIONS = [3, 5, 7]
 # Sweep path and profile sizes for the polygon-based generators.
 _SWEEP_RING = 64
 _SWEEP_PATH = 4096
+
+# Ring sizes for the ear-clipping triangulator. Kept modest because the algorithm is serial and
+# quadratic: 1 024 points is already ~10^6 ear tests on one thread.
+_STAR_RINGS = [64, 1024]
 
 
 def _o3d_mesh(bench_lib: BenchLibrary) -> type[o3d.geometry.TriangleMesh]:
@@ -112,6 +132,19 @@ def _ring_np(n: int) -> np.ndarray:
     return np.column_stack((np.cos(angle_np), np.sin(angle_np)))
 
 
+def _star_np(n: int) -> np.ndarray:
+    """Non-convex star ring: alternating radii, so ear clipping cannot take the single-fan path."""
+    angle_np = 2.0 * np.pi * np.arange(n) / n
+    radius_np = np.where(np.arange(n) % 2 == 0, 1.0, 0.45)
+    return np.column_stack((radius_np * np.cos(angle_np), radius_np * np.sin(angle_np)))
+
+
+def _star_wp(n: int, device: str) -> wp.array[wp.vec2]:
+    return wp.array(
+        np.ascontiguousarray(_star_np(n), dtype=np.float32), dtype=wp.vec2, device=device
+    )
+
+
 def _helix_np(n: int) -> np.ndarray:
     """Open helix path: enough turning that every slice frame differs."""
     t_np = np.linspace(0.0, 6.0 * np.pi, n)
@@ -121,6 +154,23 @@ def _helix_np(n: int) -> np.ndarray:
 @pytest.mark.benchmark(group="box")
 @pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
 def test_box(bench_lib: BenchLibrary) -> None:
+    """
+    The suite's launch-overhead calibration probe.
+
+    ``box`` is a 12-triangle constant table, so there is nothing to sweep and nothing to scale: what
+    this group measures is the fixed host-side cost of *any* triwarp wrapper call — allocation plus
+    Warp's launch path, of which the NumPy prologue is ~75 us. Measured at ~340 us on an RTX 5090.
+
+    That number is the baseline every other group should be read against: a group sitting at the
+    floor across its whole axis is reporting launch overhead rather than an algorithm, and its
+    inputs are too small to tell anyone anything.
+
+    **Read it from a full-suite run, not from this module alone.** Being the first group in the
+    file, it absorbs each library's one-time initialization -- measured at 52 ms for triwarp and
+    102 ms for trimesh when ``test_creation.py`` runs by itself, against ~340 us and ~200 us once
+    anything else has already imported and JITed. That is a property of first-touch cost, not of
+    ``box``, and it applies to whichever group happens to run first in any module.
+    """
     if bench_lib.kind == "triwarp":
         device = bench_lib.device
         _, faces_wp = bench_lib.run(lambda: tw.creation.box(extents=(1.0, 2.0, 3.0), device=device))
@@ -291,6 +341,29 @@ def test_extrude_polygon(bench_lib: BenchLibrary, ring_size: int) -> None:
         polygon = shapely.Polygon(_ring_np(ring_size))
         mesh_tm = bench_lib.run(lambda: tm.creation.extrude_polygon(polygon, 1.0))
         assert len(mesh_tm.faces) > 0
+
+
+@pytest.mark.benchmark(group="triangulate_polygon")
+@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.parametrize("ring_size", _STAR_RINGS)
+def test_triangulate_polygon(bench_lib: BenchLibrary, ring_size: int) -> None:
+    """
+    Ear clipping on a *non-convex* ring: serial, quadratic, and the module's real slowness path.
+
+    ``extrude_polygon`` above hands the triangulator a convex ring, which takes the single-fan fast
+    path and never reaches the ear loop. A star ring forces it, so this is the only group here that
+    measures the clipper itself — expect it to be the one place a CPU implementation wins outright,
+    for the same reason ``polyline.simplify_polyline`` is. No open3d counterpart.
+    """
+    shapely = pytest.importorskip("shapely.geometry")
+    if bench_lib.kind == "triwarp":
+        ring_wp = _star_wp(ring_size, str(bench_lib.device))
+        _vertices, faces_wp = bench_lib.run(lambda: tw.creation.triangulate_polygon(ring_wp))
+        assert int(faces_wp.shape[0]) // 3 == ring_size - 2
+    else:
+        polygon = shapely.Polygon(_star_np(ring_size))
+        _vertices, faces_tm = bench_lib.run(lambda: tm.creation.triangulate_polygon(polygon))
+        assert faces_tm.shape[0] > 0
 
 
 @pytest.mark.benchmark(group="sweep_polygon")

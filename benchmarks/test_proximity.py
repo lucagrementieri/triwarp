@@ -32,25 +32,29 @@ import triwarp as tw
 _QUERY_SEED = 42
 _N_QUERIES = 10_000
 
-_query_cache: dict[tuple[str, str], wp.array] = {}
+# Query counts for ``winding_number``, the one genuinely O(queries x faces) function here: the
+# other half of its product, swept independently of the mesh.
+_N_QUERIES_SWEEP = [10_000, 100_000]
+
+_query_cache: dict[tuple[str, str, int], wp.array] = {}
 _surface_cache: dict[tuple[str, str], wp.array] = {}
 _mesh_cache: dict[tuple[str, str], wp.Mesh] = {}
 
 
-def _query_points_np(bench_case: BenchCase) -> np.ndarray:
-    """10k query points: subsampled vertices jittered by 10% of the bbox diagonal."""
+def _query_points_np(bench_case: BenchCase, count: int = _N_QUERIES) -> np.ndarray:
+    """Query points: subsampled vertices jittered by 10% of the bbox diagonal."""
     rng = np.random.default_rng(_QUERY_SEED)
     vertices = bench_case.vertices_np
-    idx = rng.integers(0, vertices.shape[0], size=_N_QUERIES)
+    idx = rng.integers(0, vertices.shape[0], size=count)
     diagonal = float(np.linalg.norm(vertices.max(axis=0) - vertices.min(axis=0)))
-    return vertices[idx] + rng.normal(scale=0.1 * diagonal, size=(_N_QUERIES, 3))
+    return vertices[idx] + rng.normal(scale=0.1 * diagonal, size=(count, 3))
 
 
-def _query_points_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
-    key = (bench_case.mesh_name, str(bench_case.device))
+def _query_points_wp(bench_case: BenchCase, count: int = _N_QUERIES) -> wp.array[wp.vec3]:
+    key = (bench_case.mesh_name, str(bench_case.device), count)
     if key not in _query_cache:
         _query_cache[key] = wp.array(
-            np.ascontiguousarray(_query_points_np(bench_case), dtype=np.float32),
+            np.ascontiguousarray(_query_points_np(bench_case, count), dtype=np.float32),
             dtype=wp.vec3,
             device=bench_case.device,
         )
@@ -81,18 +85,30 @@ def _mesh_wp(bench_case: BenchCase) -> wp.Mesh:
 
 @pytest.mark.benchmark(group="winding_number")
 @pytest.mark.benchlibs("triwarp", "igl")
-def test_winding_number(bench_case: BenchCase) -> None:
+@pytest.mark.parametrize("n_queries", _N_QUERIES_SWEEP)
+def test_winding_number(bench_case: BenchCase, n_queries: int) -> None:
+    """
+    Exact winding number: no BVH, every query sums over every face.
+
+    The one genuinely ``O(queries x faces)`` function in the module, so both sizes are swept --
+    the mesh by the registry and the query count here. A 10x step in queries that is not a 10x
+    step in time would mean the launch is not saturating the device.
+    """
     skip_larger_than(bench_case, "happy_buddha", "O(queries x faces): lucy is untenable")
+    if n_queries > _N_QUERIES:
+        # 100k queries against dragon is 8.7e10 pair evaluations, and against happy_buddha 1.1e11.
+        # The 10x query step is measurable on the medium meshes and the product is what it says.
+        skip_larger_than(bench_case, "bunny", "the wide query sweep is only tenable up to bunny")
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-        points = _query_points_wp(bench_case)
+        points = _query_points_wp(bench_case, n_queries)
         result = bench_case.run(lambda: tw.proximity.winding_number(vertices, faces, points))
-        assert result.shape == (_N_QUERIES,)
+        assert result.shape == (n_queries,)
     else:  # igl exact generalized winding number
         vertices, faces = bench_case.vertices_np, bench_case.faces_np
-        points = _query_points_np(bench_case)
+        points = _query_points_np(bench_case, n_queries)
         result = bench_case.run(lambda: igl.winding_number(vertices, faces, points))
-        assert result.shape == (_N_QUERIES,)
+        assert result.shape == (n_queries,)
 
 
 @pytest.mark.benchmark(group="winding_number_serial")
@@ -162,13 +178,22 @@ def test_max_tangent_sphere_reach(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="thickness_interior")
+@pytest.mark.benchaxis("depth")
 @pytest.mark.benchlibs("triwarp")
-def test_thickness_interior(bench_case: BenchCase) -> None:
-    """Interior thickness: regression guard for the finite-distance fast path."""
-    skip_larger_than(bench_case, "dragon")
+@pytest.mark.parametrize("method", ["ray", "max_sphere"])
+def test_thickness_interior(bench_case: BenchCase, method: Literal["ray", "max_sphere"]) -> None:
+    """
+    Interior thickness by one ray cast against up to 100 shrinking-sphere iterations.
+
+    On the **depth** axis because both methods pay for surface crossings: a ray through
+    ``shells_8`` meets 16 of them against ``sphere_med``'s 2, and the sphere method's convergence
+    depends on local thickness, which nested shells make small. The two rows are roughly two
+    orders of magnitude apart by construction -- the point is whether that ratio holds when the
+    geometry stops being convex.
+    """
     mesh = _mesh_wp(bench_case)
     points = _surface_points_wp(bench_case)
-    result = bench_case.run(lambda: tw.proximity.thickness(mesh, points))
+    result = bench_case.run(lambda: tw.proximity.thickness(mesh, points, method=method))
     assert result.shape == points.shape
 
 
