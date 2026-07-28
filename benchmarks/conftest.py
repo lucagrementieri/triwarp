@@ -21,6 +21,8 @@ Flags
 
 from __future__ import annotations
 
+import operator
+from collections import defaultdict
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -376,14 +378,20 @@ def _test_meshes(metafunc: pytest.Metafunc, lib: LibrarySpec) -> list[MeshSpec]:
 
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
-    if "mesh_name" not in metafunc.fixturenames or "library" not in metafunc.fixturenames:
+    if "library" not in metafunc.fixturenames:
         return
     supported = _supported_kinds(metafunc)
+    libraries = [lib for lib in _selected_libraries(metafunc.config) if lib["kind"] in supported]
+
+    if "mesh_name" not in metafunc.fixturenames:
+        # Mesh-free benchmark (``bench_lib``): parametrize over libraries alone. The mesh registry
+        # and its size filters have nothing to select here.
+        metafunc.parametrize("library", [lib["id"] for lib in libraries], ids=None)
+        return
+
     cases: list[tuple[str, str]] = []
     ids: list[str] = []
-    for lib in _selected_libraries(metafunc.config):
-        if lib["kind"] not in supported:
-            continue
+    for lib in libraries:
         for mesh in _test_meshes(metafunc, lib):
             cases.append((mesh["name"], lib["id"]))
             ids.append(f"{mesh['name']}-{lib['id']}")
@@ -406,17 +414,59 @@ def pytest_configure(config: pytest.Config) -> None:
         config.option.benchmark_group_by = "group,param:mesh_name"
 
 
+@pytest.hookimpl(tryfirst=True)
+def pytest_benchmark_group_stats(
+    config: pytest.Config, benchmarks: list[Any], group_by: str
+) -> list[tuple[str | None, list[Any]]]:
+    """
+    Group results like pytest-benchmark does, but tolerate a ``param:`` axis a case does not have.
+
+    The plugin's own implementation indexes ``bench["params"][name]`` directly, so the default
+    ``group,param:mesh_name`` grouping raises ``KeyError`` as soon as one mesh-free benchmark
+    (``bench_lib``) is collected alongside the mesh-driven ones. Missing axes are skipped instead,
+    which puts each mesh-free group under its ``group`` name alone.
+    """
+    del config
+    groups: dict[str | None, list[Any]] = defaultdict(list)
+    for bench in benchmarks:
+        key: tuple[object, ...] = ()
+        for grouping in group_by.split(","):
+            if grouping == "group":
+                key += (bench["group"],)
+            elif grouping == "name":
+                key += (bench["name"],)
+            elif grouping == "func":
+                key += (bench["name"].split("[")[0],)
+            elif grouping == "fullname":
+                key += (bench["fullname"],)
+            elif grouping == "fullfunc":
+                key += (bench["fullname"].split("[")[0],)
+            elif grouping == "param":
+                key += (bench["param"],)
+            elif grouping.startswith("param:"):
+                name = grouping[len("param:") :]
+                params = bench["params"] or {}
+                if name in params:
+                    key += (f"{name}={params[name]}",)
+            else:
+                raise NotImplementedError(f"Unsupported grouping {group_by!r}.")
+        groups[" ".join(str(part) for part in key if part) or None].append(bench)
+
+    for grouped in groups.values():
+        grouped.sort(key=operator.itemgetter("fullname" if "full" in group_by else "name"))
+    return sorted(groups.items(), key=lambda pair: pair[0] or "")
+
+
 # ---------------------------------------------------------------------------
 # per-case fixture: bundles inputs + a GPU-safe timing call
 # ---------------------------------------------------------------------------
 
 
-class BenchCase:
-    """One ``(mesh, library)`` benchmark case: lazily-built inputs plus a timed ``run``."""
+class BenchLibrary:
+    """One library variant plus a timed ``run``, with no mesh attached."""
 
-    def __init__(self, mesh_name: str, library: str, benchmark: BenchmarkFixture) -> None:
-        """Bind a mesh name, its library variant and the pytest-benchmark fixture."""
-        self.mesh_name = mesh_name
+    def __init__(self, library: str, benchmark: BenchmarkFixture) -> None:
+        """Bind a library variant and the pytest-benchmark fixture."""
         self.library: LibrarySpec = LIBRARIES_BY_ID[library]
         self._benchmark = benchmark
 
@@ -429,6 +479,35 @@ class BenchCase:
     def device(self) -> str | None:
         """Warp device for triwarp targets; ``None`` for CPU references."""
         return self.library["device"]
+
+    def run(self, fn: Callable[[], Any]) -> Any:
+        """
+        Time ``fn`` with pytest-benchmark, synchronising inside the timed region on CUDA.
+
+        Warp launches are asynchronous, so ``wp.synchronize_device`` must sit inside the timed
+        callable to capture real GPU compute; CPU targets/references skip it.
+        """
+        device = self.device
+        needs_sync = device is not None and device.startswith("cuda")
+
+        def target() -> Any:
+            result = fn()
+            if needs_sync:
+                wp.synchronize_device(device)
+            return result
+
+        return self._benchmark.pedantic(
+            target, rounds=_ROUNDS, warmup_rounds=_WARMUP_ROUNDS, iterations=1
+        )
+
+
+class BenchCase(BenchLibrary):
+    """One ``(mesh, library)`` benchmark case: lazily-built inputs plus a timed ``run``."""
+
+    def __init__(self, mesh_name: str, library: str, benchmark: BenchmarkFixture) -> None:
+        """Bind a mesh name, its library variant and the pytest-benchmark fixture."""
+        super().__init__(library, benchmark)
+        self.mesh_name = mesh_name
 
     @property
     def faces_wp(self) -> wp.array[wp.int32]:
@@ -478,27 +557,19 @@ class BenchCase:
             _o3d_cache[self.mesh_name] = _new_mesh_o3d(self.mesh_name)
         return _o3d_cache[self.mesh_name]
 
-    def run(self, fn: Callable[[], Any]) -> Any:
-        """
-        Time ``fn`` with pytest-benchmark, synchronising inside the timed region on CUDA.
-
-        Warp launches are asynchronous, so ``wp.synchronize_device`` must sit inside the timed
-        callable to capture real GPU compute; CPU targets/references skip it.
-        """
-        device = self.device
-        needs_sync = device is not None and device.startswith("cuda")
-
-        def target() -> Any:
-            result = fn()
-            if needs_sync:
-                wp.synchronize_device(device)
-            return result
-
-        return self._benchmark.pedantic(
-            target, rounds=_ROUNDS, warmup_rounds=_WARMUP_ROUNDS, iterations=1
-        )
-
 
 @pytest.fixture
 def bench_case(benchmark: BenchmarkFixture, mesh_name: str, library: str) -> BenchCase:
     return BenchCase(mesh_name, library, benchmark)
+
+
+@pytest.fixture
+def bench_lib(benchmark: BenchmarkFixture, library: str) -> BenchLibrary:
+    """
+    Time a benchmark that has no input mesh, e.g. the ``triwarp.creation`` generators.
+
+    Requesting this instead of ``bench_case`` parametrizes over libraries alone: ``--device`` still
+    selects the triwarp targets, but ``--size`` / ``--cpu-max-size`` and the ``benchmeshes`` marker
+    have nothing to act on. Size the work with a plain ``pytest.mark.parametrize`` instead.
+    """
+    return BenchLibrary(library, benchmark)

@@ -210,8 +210,9 @@ def unique_1d(
     log2_capacity = max(3, math.ceil(math.log2(n) + 1))
     mask = wp.int32((1 << log2_capacity) - 1)
 
-    data_int = bitcast_to_int(data, n)
-    return _unique_hash(data_int, data.dtype, n, mask, return_inverse, return_counts)
+    return _unique_hash(
+        data, bitcast_to_int(data, n), data.dtype, n, mask, return_inverse, return_counts
+    )
 
 
 @overload
@@ -473,26 +474,50 @@ def hash_vector_rows(data: wp.array[wp.vec3], epsilon: float = 0.0) -> wp.array[
     """
     Pack each ``wp.vec3`` row into a single ``uint64`` key.
 
-    With ``epsilon == 0.0``, each coordinate is interpreted as ``float32`` bits,
-    right-shifted by 11 to drop low mantissa bits, then concatenated into one key
-    per row for bucketing or near-duplicate grouping. With ``epsilon > 0.0``, each
-    coordinate is instead rounded to the nearest multiple of ``epsilon`` and the
-    resulting integer row is packed via
-    [`hash_indices_rows`][triwarp.grouping.hash_indices_rows], giving exact (non-bucketed)
-    equality up to the tolerance.
+    Two schemes, selected by ``epsilon``:
+
+    - ``epsilon > 0.0`` — an **absolute** tolerance. Each coordinate is snapped to a multiple of
+      ``epsilon`` measured from the data's own minimum corner, and the resulting integer row is
+      packed via [`hash_indices_rows`][triwarp.grouping.hash_indices_rows]. Equal keys mean the rows
+      landed in the same grid cell. Snapping relative to the minimum corner rather than to the
+      coordinate origin is what lets negative coordinates work at all, and it keeps the scaled
+      values at the size of the data's extent, where ``float32`` still resolves ``epsilon``.
+    - ``epsilon == 0.0`` — a **relative** bucket. Each coordinate's ``float32`` bits are
+      right-shifted by 11, so a key names an interval roughly ``2 ** -12`` (about ``2.4e-4``) wide
+      relative to the coordinate's own magnitude. This is *not* an equality test in either
+      direction, and callers that need one should pass an explicit ``epsilon``: see Notes.
 
     Parameters
     ----------
     data
         ``(n,)`` device array of ``wp.vec3`` values.
     epsilon
-        Uniqueness tolerance. ``0`` uses the bit-truncation hash; positive values
-        round coordinates to ``round(v / epsilon)`` before packing.
+        Uniqueness tolerance. ``0`` uses the relative bit-truncation bucket; positive values snap
+        coordinates to ``round(v / epsilon)`` before packing.
 
     Returns
     -------
     wp.array[wp.uint64]
         Length-``n`` array on ``data.device`` with one packed key per row.
+
+    Notes
+    -----
+    Both schemes quantize, so both split a pair that straddles a cell boundary no matter how close
+    the two values are. For ``epsilon > 0`` the packing is additionally injective only while
+    ``radix ** 3`` fits a ``uint64``, where ``radix`` is the widest per-axis extent in cells; beyond
+    that the row keys wrap and behave as a hash with a small collision probability rather than an
+    exact cell identity. The relative scheme additionally:
+
+    - **collides distinct coordinates** that share a bucket — ``1.0`` and ``1.000244`` produce the
+      same key, so a mesh whose vertex spacing is below ``2.4e-4`` relative is merged too
+      aggressively;
+    - has *unbounded* resolution approaching zero, so ``+1e-6`` and ``-1e-6`` are thousands of
+      buckets apart (correct — they are distinct points), but so are ``+1e-40`` and ``-1e-40``,
+      which for most purposes are the same point. Only ``+0.0`` and ``-0.0`` are folded together,
+      because IEEE-754 defines them as equal.
+
+    Neither is a defect of the packing so much as the nature of a fixed-width key; pass an explicit
+    ``epsilon`` when the tolerance has to be one you chose.
 
     See Also
     --------
@@ -501,15 +526,30 @@ def hash_vector_rows(data: wp.array[wp.vec3], epsilon: float = 0.0) -> wp.array[
     """
     if data.dtype != wp.vec3:
         raise ValueError(f"data must be a wp.array[wp.vec3], got wp.array[{data.dtype}]")
+    n = int(data.shape[0])
     if epsilon > 0.0:
-        rounded = twt.empty_int32_2d((data.shape[0], 3), device=data.device)
+        if n == 0:
+            return wp.empty(0, dtype=wp.uint64, device=data.device)
+        # `hash_indices_rows` packs each row as digits in a positive radix, so negative cell indices
+        # -- which every mesh spanning the origin produces -- cannot be packed. Snapping relative to
+        # the data's own minimum corner makes them non-negative *by construction*: subtracting the
+        # true minimum cannot give a negative result, so no validation pass or shift is needed. The
+        # bounds also supply the radix, and doing it per component keeps that radix as small as the
+        # widest single extent rather than the whole diagonal, which matters because the row packing
+        # is only injective while ``radix ** 3`` fits a ``uint64``.
+        min_bound, max_bound = tw.bounds.aabb_bounds(data)
+        rounded = twt.empty_int32_2d((n, 3), device=data.device)
         wp.launch(
             kernel_grouping.round_vec3_scaled,
-            dim=data.shape[0],
-            inputs=[data, wp.float32(1.0 / epsilon), rounded],
+            dim=n,
+            inputs=[data, min_bound, wp.float32(1.0 / epsilon), rounded],
             device=data.device,
         )
-        return hash_indices_rows(rounded)
+        extent = max(float(max_bound[c]) - float(min_bound[c]) for c in range(3)) / epsilon
+        # The device rounds a float32 product where this divides in float64; the relative slack plus
+        # the half-cell of rounding covers the difference, and an over-wide radix is harmless.
+        radix = int(extent * (1.0 + 1e-6)) + 3
+        return hash_indices_rows(rounded, max_index=radix, validate=False)
     hashes = wp.empty(data.shape[0], dtype=wp.uint64, device=data.device)
     wp.map(kernel_grouping.pack_vec3, data, out=hashes)
     return hashes
@@ -559,6 +599,13 @@ def hash_indices_rows(
     colliding keys, and therefore wrong groupings, rather than raising. Only use it where the bound
     is structurally guaranteed.
 
+    The mixed-radix key is injective only while ``max_index ** w`` fits a ``uint64``; past that the
+    positional sum wraps and equal keys no longer imply equal rows. Two 32-bit columns always fit,
+    but three columns need ``max_index <= 2 ** (64 / 3)``, about ``2.6e6``. Beyond that the keys
+    degrade from an exact row identity into a hash whose collision probability grows with the square
+    of the row count -- around ``2e-5`` for 28M rows at a radix of ``1.4e7``. This is deliberately
+    not validated: raising would reject meshes that group correctly in practice.
+
     See Also
     --------
     [`hash_vector_rows`][triwarp.grouping.hash_vector_rows]
@@ -593,7 +640,26 @@ def hash_indices_rows(
     return hashes
 
 
+def _sortable_dtype(dtype: type[Scalar]) -> type[Scalar]:
+    """
+    Same-width dtype that ``warp.utils.radix_sort_pairs`` accepts, preserving ``dtype``'s order.
+
+    The hash table works in one common signed-integer key space (see
+    [`bitcast_to_int`][triwarp.array.bitcast_to_int]), which is fine for equality but wrong for
+    ordering: negative floats have descending bit patterns, and a ``uint64`` with its top bit set
+    reads as a negative ``int64``. Warp 1.15 sorts ``uint32`` / ``uint64`` / ``float64`` keys
+    directly, so the sort is done in this dtype instead of on the reinterpreted bits.
+    """
+    wide = wp.types.type_size_in_bytes(dtype) > 4
+    if wp.types.type_is_float(dtype):
+        return wp.float64 if wide else wp.float32
+    if dtype.__name__.lower().startswith("u"):
+        return wp.uint64 if wide else wp.uint32
+    return wp.int64 if wide else wp.int32
+
+
 def _unique_hash(
+    data: wp.array[Scalar],
     data_int: wp.array[wp.int32] | wp.array[wp.int64],
     original_dtype: type[Scalar],
     n: int,
@@ -605,7 +671,9 @@ def _unique_hash(
     | tuple[wp.array[Scalar], wp.array[wp.int32]]
     | tuple[wp.array[Scalar], wp.array[wp.int32], wp.array[wp.int32]]
 ):
-    cap = int(mask) + 1
+    # One slot past the table is reserved for the single key that collides with the empty-slot
+    # sentinel; see the comment on ``kernel_grouping.hash_insert``.
+    cap = int(mask) + 2
     key_dtype = data_int.dtype
     device = data_int.device
 
@@ -621,7 +689,7 @@ def _unique_hash(
 
     # Phase 2: mark occupied slots, prefix-scan to get compact positions.
     occ_mask = wp.zeros(cap, dtype=wp.int32, device=device)
-    wp.launch(kernel_grouping.mark_occupied, dim=cap, inputs=[slot_key, occ_mask], device=device)
+    wp.launch(kernel_grouping.mark_occupied, dim=cap, inputs=[slot_counts, occ_mask], device=device)
     scan_pos = wp.empty(cap, dtype=wp.int32, device=device)
     wp.utils.array_scan(occ_mask, scan_pos, inclusive=True)
     wp.map(wp.sub, scan_pos, wp.int32(1), out=scan_pos)
@@ -637,13 +705,21 @@ def _unique_hash(
         device=device,
     )
 
-    # Phase 4: sort only the n_unique keys (typically n_unique << n).
-    keys_buf = wp.empty(2 * n_unique, dtype=key_dtype, device=device)
-    wp.copy(keys_buf, keys_compact, count=n_unique)
+    # Phase 4: sort only the n_unique keys (typically n_unique << n), in a dtype that orders them
+    # the way the caller's dtype does rather than by their reinterpreted bit pattern.
+    sort_dtype = _sortable_dtype(original_dtype)
+    keys_buf = bitcast_from_int(keys_compact, sort_dtype, count=2 * n_unique)
     perm_buf = init_range(2 * n_unique, device)
     wp.utils.radix_sort_pairs(keys_buf, perm_buf, count=n_unique)
 
-    unique_values = bitcast_from_int(keys_buf, original_dtype, count=n_unique)
+    if sort_dtype == original_dtype:
+        unique_values = wp.empty(n_unique, dtype=original_dtype, device=device)
+        wp.copy(unique_values, keys_buf, count=n_unique)
+    else:
+        # A dtype narrower than 32 bits was widened to be sortable; narrow it back.
+        unique_values = bitcast_from_int(
+            bitcast_to_int(keys_buf, n_unique), original_dtype, count=n_unique
+        )
 
     unique_counts = None
     if return_counts:
@@ -654,13 +730,17 @@ def _unique_hash(
 
     unique_inverse = None
     if return_inverse:
-        sorted_dense = wp.empty(n_unique, dtype=key_dtype, device=device)
+        sorted_dense = wp.empty(n_unique, dtype=sort_dtype, device=device)
         wp.copy(sorted_dense, keys_buf, count=n_unique)
+        # The binary search has to probe in the same space the keys were sorted in.
+        data_sorted_space = (
+            data if data.dtype == sort_dtype else bitcast_from_int(data_int, sort_dtype, count=n)
+        )
         unique_inverse = wp.empty(n, dtype=wp.int32, device=device)
         wp.launch(
             kernel_array.map_sorted_inverse,
             dim=n,
-            inputs=[data_int, sorted_dense, unique_inverse],
+            inputs=[data_sorted_space, sorted_dense, unique_inverse],
             device=device,
         )
 

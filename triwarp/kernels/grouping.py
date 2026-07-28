@@ -141,14 +141,28 @@ def hash_insert(
     slot_counts: wp.array[wp.int32],
     mask: wp.int32,
 ) -> None:
+    # `encode_key` reserves 0 as the empty-slot sentinel, so exactly one key -- the one that encodes
+    # to 0, i.e. -1 -- can never be published in the table: its CAS would look like an untouched
+    # slot. Since no bijection on the full integer range can avoid mapping *something* onto the
+    # sentinel, that key gets a dedicated slot one past the end of the table instead. Callers must
+    # therefore allocate `mask + 2` slots, and occupancy comes from `slot_counts` (see
+    # `mark_occupied`) so nothing downstream has to know which slot is which. `decode_key` turns the
+    # reserved slot's untouched 0 straight back into -1, so compaction needs no special case.
     i = int(wp.tid())
-    wp.atomic_add(slot_counts, hash_find_or_insert(data[i], slot_key, mask), wp.int32(1))
+    key = data[i]
+    if encode_key(key) == empty_key(key):
+        wp.atomic_add(slot_counts, mask + 1, wp.int32(1))
+    else:
+        wp.atomic_add(slot_counts, hash_find_or_insert(key, slot_key, mask), wp.int32(1))
 
 
 @wp.kernel
-def mark_occupied(slot_key: wp.array[wp.Int], out_mask: wp.array[wp.int32]) -> None:
+def mark_occupied(slot_counts: wp.array[wp.int32], out_mask: wp.array[wp.int32]) -> None:
+    # Occupancy is read from the counts rather than from `slot_key`, because a slot claimed by
+    # `hash_insert` always has its count incremented, whereas the reserved sentinel slot keeps a
+    # `slot_key` of 0 and would otherwise look empty.
     h = int(wp.tid())
-    if slot_key[h] != empty_key(slot_key[h]):
+    if slot_counts[h] > wp.int32(0):
         out_mask[h] = wp.int32(1)
 
 
@@ -169,15 +183,28 @@ def compact_from_table(
 
 
 @wp.func
-def pack_vec3(vector: wp.vec3) -> wp.uint64:
-    # 1. Bit-cast float32 to uint32 to look at raw bits
-    # 2. Shift right by 11 bits to discard the lower mantissa bits
-    ix = wp.cast(vector[0], wp.uint32) >> VEC3_PACK_SHIFT
-    iy = wp.cast(vector[1], wp.uint32) >> VEC3_PACK_SHIFT
-    iz = wp.cast(vector[2], wp.uint32) >> VEC3_PACK_SHIFT
+def bucket_float32(value: wp.float32) -> wp.uint32:
+    # Bit-cast float32 to uint32 and drop the low 11 mantissa bits, so each key names a bucket
+    # roughly 2^-12 wide *relative* to the value's magnitude.
+    #
+    # The sign bit is the most significant bit and survives the shift, so opposite signs never
+    # share a bucket. That is what you want everywhere except at zero, where IEEE-754 has two
+    # representations that compare equal: -0.0 has to fold onto +0.0 or a point sitting exactly on
+    # an axis will not match itself. A revolved sphere's pole is the standard way to hit this,
+    # since ``cos(theta) * 0.0`` is -0.0 for half the slices.
+    if value == 0.0:
+        return wp.uint32(0)
+    return wp.cast(value, wp.uint32) >> VEC3_PACK_SHIFT
 
-    # 3. Explicitly promote components to uint64 before shifting.
-    # This avoids 32-bit integer overflow during the large left-shifts (<< 21 and << 42)
+
+@wp.func
+def pack_vec3(vector: wp.vec3) -> wp.uint64:
+    ix = bucket_float32(vector[0])
+    iy = bucket_float32(vector[1])
+    iz = bucket_float32(vector[2])
+
+    # Promote each component to uint64 before shifting, to avoid 32-bit overflow in the large
+    # left-shifts (<< 21 and << 42).
     return wp.uint64(ix) | (
         (wp.uint64(iy) << VEC3_PACK_PRECISION)
         | (wp.uint64(iz) << (VEC3_PACK_PRECISION + VEC3_PACK_PRECISION))
@@ -210,10 +237,18 @@ def pack_indices(
 
 @wp.kernel
 def round_vec3_scaled(
-    vertices: wp.array[wp.vec3], inv_epsilon: wp.float32, out_rounded: wp.array2d[wp.int32]
+    vertices: wp.array[wp.vec3],
+    origin: wp.vec3,
+    inv_epsilon: wp.float32,
+    out_rounded: wp.array2d[wp.int32],
 ) -> None:
+    # Snapping relative to `origin` -- the data's own minimum corner -- rather than to the
+    # coordinate origin does two things. The cell indices come out non-negative, which the row
+    # packing needs since it treats a row as digits in a positive radix. And the product stays the
+    # size of the data's *extent* instead of its distance from zero: float32 carries about 7 digits,
+    # so scaling a coordinate near 100 by 1e6 has already quantised away the low bits.
     tid = int(wp.tid())
-    v = vertices[tid] * inv_epsilon
+    v = (vertices[tid] - origin) * inv_epsilon
     out_rounded[tid, 0] = wp.int32(wp.round(v[0]))
     out_rounded[tid, 1] = wp.int32(wp.round(v[1]))
     out_rounded[tid, 2] = wp.int32(wp.round(v[2]))

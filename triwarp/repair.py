@@ -90,8 +90,10 @@ def remove_duplicated_vertices(
     faces
         Flat triangle index buffer.
     epsilon
-        Uniqueness tolerance. ``0`` requires exact match (via row hashing). Positive values
-        round coordinates to ``round(v / epsilon)`` before deduplication.
+        Uniqueness tolerance. Positive values snap coordinates to ``round(v / epsilon)``, so the
+        tolerance is absolute and is the one you chose. ``0`` instead groups by a *relative*
+        bucket about ``2.4e-4`` wide (see Notes) — pass an explicit ``epsilon`` unless that is
+        what you want.
 
     Returns
     -------
@@ -103,6 +105,26 @@ def remove_duplicated_vertices(
         Length ``n_vertices``. Maps each input vertex to its slot in ``unique_vertices``.
     unique_faces : wp.array[wp.int32]
         Face buffer with indices remapped into ``unique_vertices``.
+
+    Notes
+    -----
+    Both tolerance modes quantize positions and group by cell, so both separate a pair straddling a
+    cell boundary however close it is. That is worth knowing about ``epsilon=0`` in particular,
+    which is **not** an exact-equality test despite requiring no tolerance: it buckets by the high
+    bits of each coordinate's ``float32`` representation, giving a *relative* cell about ``2.4e-4``
+    wide. So ``1.0`` and ``1.000244`` merge, while two adjacent ``float32`` values on either side of
+    a bucket edge do not. Prefer an explicit ``epsilon`` whenever the tolerance matters; use ``0``
+    only to collapse positions that are already bitwise equal, which it does reliably (including
+    across ``+0.0`` / ``-0.0``).
+
+    Duplicates that are known from construction rather than measured are better collapsed directly:
+    see [`revolve`][triwarp.creation.revolve], which derives them from its profile instead of
+    hashing positions.
+
+    See Also
+    --------
+    [`duplicate_vertex_inverse`][triwarp.repair.duplicate_vertex_inverse]
+    [`hash_vector_rows`][triwarp.grouping.hash_vector_rows]
     """
     inverse = duplicate_vertex_inverse(vertices, epsilon)
     n = int(inverse.shape[0])
@@ -133,8 +155,10 @@ def duplicate_vertex_inverse(vertices: wp.array[wp.vec3], epsilon: float) -> wp.
     vertices
         ``(n_vertices,)`` mesh vertex positions.
     epsilon
-        Uniqueness tolerance. ``0`` requires exact match (via row hashing). Positive values
-        round coordinates to ``round(v / epsilon)`` before deduplication.
+        Uniqueness tolerance, with the same meaning as in
+        [`remove_duplicated_vertices`][triwarp.repair.remove_duplicated_vertices]: positive values
+        snap coordinates to ``round(v / epsilon)``, while ``0`` groups by a *relative* bucket about
+        ``2.4e-4`` wide rather than testing for equality.
 
     Returns
     -------
@@ -144,6 +168,7 @@ def duplicate_vertex_inverse(vertices: wp.array[wp.vec3], epsilon: float) -> wp.
     See Also
     --------
     [`remove_duplicated_vertices`][triwarp.repair.remove_duplicated_vertices]
+    [`hash_vector_rows`][triwarp.grouping.hash_vector_rows]
     """
     device = vertices.device
     n = int(vertices.shape[0])

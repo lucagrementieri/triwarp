@@ -15,6 +15,9 @@ src = root / "triwarp"
 # adding a new module without classifying it here is caught immediately rather than silently
 # falling back to a flat alphabetical list.
 SECTIONS: dict[str, list[str]] = {
+    "Primitives": [
+        "creation",
+    ],
     "Mesh structure & topology": [
         "mesh",
         "vertices",

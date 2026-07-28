@@ -174,6 +174,55 @@ def test_hash_vector_rows(device: str) -> None:
         _ = tw.grouping.hash_vector_rows(vectors_double_wp)
 
 
+def test_hash_vector_rows_folds_signed_zero(device: str) -> None:
+    # IEEE-754's two zeros compare equal, so they have to share a key. Left unfolded, the sign bit
+    # is the most significant bit of the bucket and survives the shift, which is how a revolved
+    # pole (``cos(theta) * 0.0`` is -0.0 for half the slices) fails to match itself.
+    vectors_wp = wp.array(
+        np.array([[0.0, 0.0, 5.0], [-0.0, -0.0, 5.0], [-0.0, 0.0, 5.0]], dtype=np.float32),
+        dtype=wp.vec3,
+        device=device,
+    )
+    assert len(set(tw.grouping.hash_vector_rows(vectors_wp).numpy().tolist())) == 1
+
+
+def test_hash_vector_rows_epsilon_allows_negative_coordinates(device: str) -> None:
+    # The rounded grid indices are negative for any mesh spanning the origin. Packing them requires
+    # a positive radix, so the grid is translated by a whole number of cells first, which must not
+    # move a cell boundary: the +-1e-9 pairs below still merge and the two sites stay distinct.
+    vertices_np = np.array(
+        [[-1.0, -2.0, -3.0], [-1.0 + 1e-9, -2.0, -3.0], [4.0, 5.0, 6.0], [4.0, 5.0 + 1e-9, 6.0]],
+        dtype=np.float32,
+    )
+    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    keys_np = tw.grouping.hash_vector_rows(vertices_wp, epsilon=1e-6).numpy()
+    assert keys_np[0] == keys_np[1]
+    assert keys_np[2] == keys_np[3]
+    assert keys_np[0] != keys_np[2]
+
+    # Translating the input must not change how the rows group, only the keys themselves.
+    shifted_wp = wp.array(vertices_np + np.float32(100.0), dtype=wp.vec3, device=device)
+    shifted_np = tw.grouping.hash_vector_rows(shifted_wp, epsilon=1e-6).numpy()
+    assert shifted_np[0] == shifted_np[1]
+    assert shifted_np[2] == shifted_np[3]
+    assert shifted_np[0] != shifted_np[2]
+
+
+def test_hash_vector_rows_epsilon_far_from_origin(device: str) -> None:
+    # Cells are measured from the data's own minimum corner, not from the coordinate origin. That
+    # is what keeps a small epsilon meaningful far from zero: scaling a coordinate near 1e4 by 1e6
+    # would exceed float32's ~7 digits, quantising away the cell index, and it keeps the packing
+    # radix at the size of the extent so the row keys stay injective.
+    offset_np = np.float32(1.0e4)
+    rng = np.random.default_rng(5)
+    sites_np = (rng.random((64, 3)).astype(np.float32) + offset_np).astype(np.float32)
+    # Each site duplicated exactly, so the 128 rows must collapse to 64 distinct keys.
+    vertices_wp = wp.array(np.vstack((sites_np, sites_np)), dtype=wp.vec3, device=device)
+    keys_np = tw.grouping.hash_vector_rows(vertices_wp, epsilon=1e-6).numpy()
+    assert np.array_equal(keys_np[:64], keys_np[64:])
+    assert len(set(keys_np.tolist())) == 64
+
+
 def test_hash_indices_rows_valid(device: str) -> None:
     rng = np.random.default_rng(23)
     n_rows, n_cols = 64, 5
@@ -240,6 +289,8 @@ def _pack_vec3_np(vectors_np: np.ndarray) -> np.ndarray:
     if vectors_np.dtype != np.float32:
         vectors_np = vectors_np.astype(np.float32)
     bits = vectors_np.view(np.uint32)
+    # IEEE-754's two zeros compare equal, so -0.0 folds onto +0.0 rather than keeping its sign bit.
+    bits = np.where(vectors_np == 0.0, np.uint32(0), bits)
     ix = bits[:, 0].astype(np.uint64) >> VEC3_PACK_SHIFT.value
     iy = bits[:, 1].astype(np.uint64) >> VEC3_PACK_SHIFT.value
     iz = bits[:, 2].astype(np.uint64) >> VEC3_PACK_SHIFT.value

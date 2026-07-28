@@ -93,7 +93,10 @@ def _assert_duplicate_vertices_match(
         if faces_np is not None
         else (*igl.remove_duplicate_vertices(vertices_np, epsilon), None)
     )
-    assert np.array_equal(_sort_rows(sv_wp), _sort_rows(sv_igl))
+    # triwarp keeps float32 vertices where igl works in float64, so the surviving position sets are
+    # compared with a tolerance rather than exactly (exact equality happens to hold for coordinates
+    # that are exactly representable, but not for a mesh with irrational ones).
+    assert np.allclose(_sort_rows(sv_wp), _sort_rows(sv_igl), rtol=1e-5, atol=1e-5)
     for i, vertex in enumerate(vertices_np):
         assert np.allclose(sv_wp[svj_wp[i]], vertex, rtol=1e-5, atol=1e-5)
     if sf_wp is not None and faces_np is not None and sf_igl is not None:
@@ -181,6 +184,28 @@ def test_remove_duplicate_vertices_epsilon(device: str):
         vertices_wp, faces_wp, epsilon=epsilon
     )
     _assert_duplicate_vertices_match(vertices_np, sv_wp.numpy(), svj_wp.numpy(), epsilon=epsilon)
+
+
+def test_remove_duplicate_vertices_epsilon_negative_coordinates(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh], device: str
+) -> None:
+    # Any mesh spanning the origin rounds to negative grid indices, which the row packing cannot
+    # take directly. The fixture is centred at (-1, 0, 2), so every duplicated vertex below has at
+    # least one negative coordinate; igl is the oracle for which ones merge.
+    mesh_tm, _ = icosahedron
+    vertices_np = np.vstack((mesh_tm.vertices, mesh_tm.vertices[:4] + 1e-9)).astype(np.float64)
+    assert vertices_np.min() < 0.0
+    faces_np = np.asarray(mesh_tm.faces, dtype=np.int32)
+
+    epsilon = 1e-6
+    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    sv_wp, _, svj_wp, sf_wp = tw.repair.remove_duplicated_vertices(
+        vertices_wp, faces_wp, epsilon=epsilon
+    )
+    assert int(sv_wp.shape[0]) == mesh_tm.vertices.shape[0]
+    _assert_duplicate_vertices_match(
+        vertices_np, sv_wp.numpy(), svj_wp.numpy(), sf_wp.numpy(), faces_np, epsilon=epsilon
+    )
 
 
 def test_remove_duplicate_vertices_faces(device: str):

@@ -75,6 +75,14 @@ into a single table).
   longest boundary loop of the *synthetic* meshes (the cylinder's `2**16`-vertex rim is the
   asymptotic case); the scan meshes' holes are a few vertices each and would measure only launch
   latency.
+- **`test_creation` has no input mesh**, so it takes the `bench_lib` fixture instead of `bench_case`
+  and is parametrized over libraries alone; the mesh registry, `--size` and `--cpu-max-size` have
+  nothing to select, so work is sized with a plain `pytest.mark.parametrize` on the resolution
+  (`--device` still applies). Supporting that needed two harness changes: `BenchCase` now derives
+  from a mesh-free `BenchLibrary` base, and this package overrides
+  `pytest_benchmark_group_stats` — the plugin's own version indexes `bench["params"]["mesh_name"]`
+  directly and raises `KeyError` as soon as a mesh-free case is collected under the default
+  `group,param:mesh_name` grouping.
 - **`test_texture` uses projected, non-injective UVs** (vertex `xy` normalized to the unit square)
   because the scan meshes carry no atlas and computing one would dominate the measurement. The
   rasterizer cost is the number of (triangle, covered pixel) pairs, which a projection reproduces
@@ -105,6 +113,7 @@ built from the same NumPy source every other library gets.
 | `test_points` | `PointCloud.estimate_normals` (`KDTreeSearchParamKNN`) |
 | `test_distance` | `PointCloud.compute_point_cloud_distance` (the non-differentiable Chamfer / Hausdorff cases) |
 | `test_convex` | `compute_convex_hull` (exact qhull vs the approximate support sweep) |
+| `test_creation` | `create_box`, `create_sphere` (a UV sphere, so it pairs with `uv_sphere`), `create_cylinder`, `create_cone`, `create_torus` |
 
 Modules with **no** open3d equivalent, and why, are documented in each module's docstring:
 `test_edges` (no general edge list), `test_boundary` (no loop ordering), `test_grouping` (array
@@ -119,7 +128,9 @@ bake or resample), `test_polyline` (`LineSet` is unordered segments with no leng
 `test_geodesic` (no geodesic distance), `test_reduce` (array primitive), plus the individual
 functions noted inline (`winding_number`, `thickness`, `geodesic_ball`, `triangulate_point_cloud`,
 `subdivide_to_size`, `flip_to_delaunay`, `isotropic_remesh`, `centroid`, `n_vertices`, `is_volume`,
-`bfs`).
+`bfs`, and in `test_creation` the functions with no factory counterpart — `icosphere`
+(`create_icosahedron` is never subdivided), `revolve`, `annulus`, `capsule`, `extrude_polygon`,
+`sweep_polygon`, `truncated_prisms`, `axis` and `random_soup`).
 
 Modules with no baseline from **any** of the three references are `test_texture`, `test_polyline`
 and `test_reduce` (plus `mesh_with_mesh` in `test_intersection`); each docstring says which
