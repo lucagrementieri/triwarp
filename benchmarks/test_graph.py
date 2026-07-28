@@ -6,11 +6,20 @@ Two axes, matching the two ways a graph algorithm gets slow:
 * **components** for ``connected_component_labels``. ECL-CC is three launches whatever the graph
   looks like, but the pointer-jumping hook/flatten converges at a rate set by component structure,
   so 1 / 64 / 1024 components at a fixed 81 920 faces is the shape that would expose a regression.
-* **diameter** for ``bfs``. This is the one that hurts. Above ``_BFS_SERIAL_THRESHOLD`` the
-  traversal is level-synchronous under ``wp.capture_while`` -- **one iteration per BFS level** --
-  so a graph's *depth* sets the launch count and its size does not. Measured at **5.06 ms on
-  ``sphere_med`` (diameter ~130) against 371 ms on ``ribbon_long`` (diameter 20 481)**, at an
-  identical 40 962 vertices. 73x, from a property no face count records.
+  The same two labellings are *also* run on the **diameter** axis, where they must read flat --
+  that is a separate claim from the component sweep and it is load-bearing elsewhere in the
+  package, so it is regression-covered rather than measured once (see
+  ``test_connected_component_labels_depth``).
+* **diameter** for ``bfs``. This is the one that hurts, and the only group in the suite that still
+  loses to a CPU reference after being worked on. The traversal is level-synchronous under
+  ``wp.capture_while`` -- **one iteration per BFS level**, seven launches at a grid size CUDA
+  graphs bake in -- so a graph's *depth* sets the launch count and its size does not. It measured
+  **5.06 ms on ``sphere_med`` (diameter ~130) against 367 ms on ``ribbon_long`` (diameter
+  20 481)** at an identical 40 962 vertices: 73x, from a property no face count records. Bounding
+  the serial block scan to the frontier and handing narrow frontiers to a serial resume brings that
+  to **4.0 ms and 23 ms**, a 5.8x spread -- but scipy does the ribbon in 0.68 ms, so this group
+  stays a loss by 34x and is kept as the open item it is. Closing it needs a single-block
+  ``launch_tiled(dim=[1])`` traversal engine, which is a different program.
 
 The vertex-adjacency CSR matrix is prebuilt (untimed, cached per mesh/device) so the timings
 isolate the graph algorithms from the edge sort that produces them.
@@ -95,11 +104,55 @@ def test_connected_component_labels(bench_case: BenchCase) -> None:
         assert labels_np.shape == (n_vertices,)
 
 
+@pytest.mark.benchmark(group="connected_component_labels_depth")
+@pytest.mark.benchaxis("diameter")
+@pytest.mark.benchlibs("triwarp", "scipy")
+def test_connected_component_labels_depth(bench_case: BenchCase) -> None:
+    """
+    The depth-robustness gate: ECL-CC on a graph of diameter 130 against one of diameter 20 481.
+
+    Pointer jumping has no level loop, so this pair should read **flat** -- measured at 0.08 ms on
+    both. That is not a self-evident property (every level-synchronous traversal in the package
+    fails it, which is what the ``bfs`` group below shows), and it is the premise the parity
+    union-find in ``validation.face_orientation_bits`` rests on. A slope appearing here is the
+    regression that would invalidate it.
+    """
+    n_vertices = bench_case.n_vertices
+    if bench_case.kind == "triwarp":
+        adjacency = _adjacency(bench_case)
+        labels = bench_case.run(lambda: tw.graph.connected_component_labels(adjacency))
+        assert labels.shape == (n_vertices,)
+    else:
+        graph = _scipy_graph(bench_case)
+        n_labelled, labels_np = bench_case.run(lambda: sp.csgraph.connected_components(graph))
+        assert n_labelled == 1
+        assert labels_np.shape == (n_vertices,)
+
+
+@pytest.mark.benchmark(group="face_connected_component_labels_depth")
+@pytest.mark.benchaxis("diameter")
+@pytest.mark.benchlibs("triwarp")
+def test_face_connected_component_labels_depth(bench_case: BenchCase) -> None:
+    """
+    Same gate one level up, over the face-adjacency graph.
+
+    This is the build-plus-ECL-CC pair ``validation.face_orientation_bits`` actually calls.
+
+    Measured at 1.33 ms (sphere) against 1.26 ms (ribbon) -- the edge sort dominates and neither
+    half of it is depth-sensitive. No scipy counterpart: the comparison there would be against a
+    face-adjacency matrix triwarp has to build anyway, which is the part being measured.
+    """
+    labels = bench_case.run(
+        lambda: tw.adjacency.face_connected_component_labels(bench_case.faces_wp)
+    )
+    assert labels.shape == (bench_case.n_faces,)
+
+
 @pytest.mark.benchmark(group="bfs")
 @pytest.mark.benchaxis("diameter")
 @pytest.mark.benchlibs("triwarp", "scipy")
 def test_bfs(bench_case: BenchCase) -> None:
-    """Level-synchronous frontier BFS: one launch per level, so depth is the cost. 73x here."""
+    """Level-synchronous frontier BFS with a serial escape once the frontier narrows: 5.8x here."""
     if bench_case.kind == "triwarp":
         adjacency = _adjacency(bench_case)
         order, _, _ = bench_case.run(lambda: tw.graph.bfs(adjacency, 0), rounds=_ROUNDS)

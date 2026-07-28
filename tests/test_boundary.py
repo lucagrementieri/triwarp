@@ -122,6 +122,43 @@ def test_boundary_loops(request: pytest.FixtureRequest, mesh_name: str) -> None:
         assert np.array_equal(loop_wp.numpy(), np.asarray(loop_igl))
 
 
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+def test_boundary_loops_batched_matches_boundary_loops(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+
+    loops_wp = tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices)
+    flat_wp, offsets_wp, sizes_wp = tw.boundary.boundary_loops_batched(
+        mesh_wp.points, mesh_wp.indices
+    )
+
+    offsets_np, sizes_np = offsets_wp.numpy(), sizes_wp.numpy()
+    assert len(loops_wp) == offsets_np.shape[0]
+    assert int(flat_wp.shape[0]) == int(sizes_np.sum())
+    for i, loop_wp in enumerate(loops_wp):
+        begin = int(offsets_np[i])
+        assert np.array_equal(loop_wp.numpy(), flat_wp.numpy()[begin : begin + int(sizes_np[i])])
+
+
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+def test_boundary_loops_copy_detaches_from_packed_buffer(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    # The default is a view into one shared buffer; ``copy=True`` must give independent storage.
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    views = tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices)
+    copies = tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices, copy=True)
+
+    assert len(views) == len(copies)
+    for view_wp, copy_wp in zip(views, copies, strict=True):
+        assert np.array_equal(view_wp.numpy(), copy_wp.numpy())
+    if len(views) > 1:
+        assert views[0].ptr != views[1].ptr
+        # Adjacent views share one allocation; the copies do not.
+        assert views[1].ptr - views[0].ptr == 4 * int(views[0].shape[0])
+
+
 def test_boundary_loops_non_manifold_terminates(device: str) -> None:
     # A "bowtie" (two triangles sharing a single pinch vertex) has a vertex-non-manifold boundary:
     # the boundary successor chain is not one simple cycle, so vertex 2 gets two outgoing edges and

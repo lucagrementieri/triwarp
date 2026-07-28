@@ -388,6 +388,55 @@ def test_triangulate_polygon(device: str, ring_name: str) -> None:
     assert np.isclose(area_np, exact_area, rtol=1e-5)
 
 
+def _star_ring(n: int, inner: float = 0.45) -> np.ndarray:
+    """Alternating-radius star: every other vertex is reflex, so no ear has an ear-free ring-2."""
+    angle_np = 2.0 * np.pi * np.arange(n) / n
+    radius_np = np.where(np.arange(n) % 2 == 0, 1.0, inner)
+    return np.column_stack((radius_np * np.cos(angle_np), radius_np * np.sin(angle_np)))
+
+
+@pytest.mark.parametrize("n", [16, 64, 512])
+def test_triangulate_polygon_star(device: str, n: int) -> None:
+    """
+    A star ring is the worst case for the ear clipper's independent-set rule.
+
+    Half its vertices are reflex and the convex ones alternate, so competing ears sit exactly two
+    apart around the ring -- the configuration that made a raw-index rank clip one ear per round.
+    """
+    ring_np = _star_ring(n)
+    vertices_wp, faces_wp = tw.creation.triangulate_polygon(_ring(ring_np, device))
+    assert int(vertices_wp.shape[0]) == n
+    assert int(faces_wp.shape[0]) // 3 == n - 2
+
+    triangles_np = vertices_wp.numpy().astype(np.float64)[faces_wp.numpy().reshape(-1, 3)]
+    edge_a = triangles_np[:, 1] - triangles_np[:, 0]
+    edge_b = triangles_np[:, 2] - triangles_np[:, 0]
+    signed_np = 0.5 * (edge_a[:, 0] * edge_b[:, 1] - edge_a[:, 1] * edge_b[:, 0])
+    # Consistent winding: every triangle turns the same way as the ring, so no signed area flips.
+    assert np.all(signed_np > 0.0) or np.all(signed_np < 0.0)
+    # And they tile the star exactly (shoelace over the ring).
+    shoelace = 0.5 * abs(
+        np.dot(ring_np[:, 0], np.roll(ring_np[:, 1], -1))
+        - np.dot(np.roll(ring_np[:, 0], -1), ring_np[:, 1])
+    )
+    assert np.isclose(np.abs(signed_np).sum(), shoelace, rtol=1e-5)
+
+
+def test_triangulate_polygon_near_collinear(device: str) -> None:
+    # A ring whose interior vertices are almost on the line back to the start: every ear test is
+    # decided by a near-zero cross product, so this is where a ranking change could stall.
+    n = 64
+    x_np = np.linspace(0.0, 1.0, n - 1)
+    ring_np = np.vstack(
+        (np.column_stack((x_np, 1e-7 * np.sin(np.pi * x_np))), np.array([[0.5, -0.25]]))
+    )
+    vertices_wp, faces_wp = tw.creation.triangulate_polygon(_ring(ring_np, device))
+    assert int(vertices_wp.shape[0]) == n
+    # A degenerate ring may yield a partial triangulation, but never more than n - 2 faces and
+    # never a hang: the round cap is the guarantee being checked here.
+    assert 0 < int(faces_wp.shape[0]) // 3 <= n - 2
+
+
 def test_triangulate_polygon_drops_repeated_closing_point(device: str) -> None:
     closed_np = np.vstack((_SQUARE_RING, _SQUARE_RING[:1]))
     vertices_wp, faces_wp = tw.creation.triangulate_polygon(_ring(closed_np, device))

@@ -53,11 +53,9 @@ def boundary_edges(
 
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-
-    indices = tw.grouping.group_int_rows(
-        edges_sorted, 1, int(vertices.shape[0]), validate=False
-    ).flatten()
-    return twt.as_array2d_int32(tw.array.gather(edges_sorted, indices))
+    return twt.as_array2d_int32(
+        tw.array.gather(edges_sorted, _boundary_rows(vertices, edges_sorted))
+    )
 
 
 def oriented_boundary_edges(
@@ -99,11 +97,7 @@ def oriented_boundary_edges(
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
     if edges is None:
         edges = tw.edges.faces_to_edges(faces)
-
-    indices = tw.grouping.group_int_rows(
-        edges_sorted, 1, int(vertices.shape[0]), validate=False
-    ).flatten()
-    return twt.as_array2d_int32(tw.array.gather(edges, indices))
+    return twt.as_array2d_int32(tw.array.gather(edges, _boundary_rows(vertices, edges_sorted)))
 
 
 def boundary_loops(
@@ -111,6 +105,8 @@ def boundary_loops(
     faces: wp.array[wp.int32],
     edges_sorted: twt.Array2dInt32 | None = None,
     edges: twt.Array2dInt32 | None = None,
+    *,
+    copy: bool = False,
 ) -> list[wp.array[wp.int32]]:
     """
     Ordered vertex-index loops along each mesh boundary.
@@ -122,6 +118,16 @@ def boundary_loops(
     (the smallest vertex index in the loop) — entirely GPU-parallel, mirroring
     ``igl::boundary_loop`` (`reference/libigl/include/igl/boundary_loop.cpp`, first overload).
 
+    All loops are found in one batched pass
+    ([`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched]); this is the slicing
+    wrapper over it.
+
+    !!! note "The returned arrays are views"
+        Each loop slices the single packed buffer ``boundary_loops_batched`` produced, which costs
+        no device memory and no launches. Two consequences: holding on to a single loop keeps the
+        *whole* buffer alive, and writing into one loop writes into the shared allocation. Pass
+        ``copy=True`` for independent buffers.
+
     Parameters
     ----------
     vertices
@@ -131,11 +137,12 @@ def boundary_loops(
         Length-``3 * n_faces`` ``wp.int32`` face index buffer.
     edges_sorted
         Optional precomputed ``(n_faces * 3, 2)`` sorted edges, forwarded to
-        [`boundary_edges`][triwarp.boundary.boundary_edges] and
-        [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges].
+        [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched].
     edges
         Optional precomputed ``(n_faces * 3, 2)`` directed edges, forwarded to
-        [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges].
+        [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched].
+    copy
+        Return independent buffers instead of views into the packed result.
 
     Returns
     -------
@@ -152,21 +159,82 @@ def boundary_loops(
 
     See Also
     --------
+    [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched]
     [`boundary_loop`][triwarp.boundary.boundary_loop]
     [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]
     ``igl.boundary_loop_all``
     """
+    flat_loops, offsets, _loop_sizes = boundary_loops_batched(vertices, faces, edges_sorted, edges)
+    bounds = _loop_bounds(flat_loops, offsets)
+    return [
+        wp.clone(flat_loops[begin:end]) if copy else flat_loops[begin:end] for begin, end in bounds
+    ]
+
+
+def boundary_loops_batched(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    edges_sorted: twt.Array2dInt32 | None = None,
+    edges: twt.Array2dInt32 | None = None,
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Every boundary loop at once, packed into one buffer plus per-loop offsets.
+
+    Same loops, same order, same contents as
+    [`boundary_loops`][triwarp.boundary.boundary_loops] — but with no per-loop Python and no
+    per-loop allocation, which is the only form whose cost is independent of the loop *count*.
+    Prefer it when a mesh has many small holes or when the loops feed straight into another
+    batched kernel, as [`triwarp.hole_filling`][triwarp.hole_filling] does.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` vertex positions; only the count is used (as the row-hash base and
+        the successor-array size).
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` face index buffer.
+    edges_sorted
+        Optional precomputed ``(n_faces * 3, 2)`` sorted edges (each row min-first), as from
+        [`faces_to_edges`][triwarp.edges.faces_to_edges] with ``sorted=True``. Built from
+        ``faces`` when ``None``.
+    edges
+        Optional precomputed ``(n_faces * 3, 2)`` directed edges, as from
+        [`faces_to_edges`][triwarp.edges.faces_to_edges]. Built from ``faces`` when ``None``.
+
+    Returns
+    -------
+    flat_loops
+        Concatenated ordered vertex indices of every loop, on ``faces.device``.
+    offsets
+        Length-``n_loops`` exclusive prefix sum of the loop sizes: loop ``i`` occupies
+        ``flat_loops[offsets[i] : offsets[i] + loop_sizes[i]]``. Not a trailing-sentinel CSR
+        array — the last loop ends at ``flat_loops.shape[0]``.
+    loop_sizes
+        Length-``n_loops`` vertex count per loop.
+
+    See Also
+    --------
+    [`boundary_loops`][triwarp.boundary.boundary_loops]
+    [`boundary_loop`][triwarp.boundary.boundary_loop]
+    """
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
     if n_faces == 0:
-        return []
+        return _no_loops(device)
 
-    undirected = boundary_edges(vertices, faces, edges_sorted)
-    n_boundary_edges = int(undirected.shape[0])
+    if edges_sorted is None:
+        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+    # One boundary detection for all three edge views below; ``boundary_edges`` /
+    # ``oriented_boundary_edges`` / ``boundary_vertex_indices`` would each redo the row grouping.
+    rows = _boundary_rows(vertices, edges_sorted)
+    n_boundary_edges = int(rows.shape[0])
     if n_boundary_edges == 0:
-        return []
+        return _no_loops(device)
 
-    directed = oriented_boundary_edges(vertices, faces, edges_sorted, edges)
+    if edges is None:
+        edges = tw.edges.faces_to_edges(faces)
+    undirected = twt.as_array2d_int32(tw.array.gather(edges_sorted, rows))
+    directed = twt.as_array2d_int32(tw.array.gather(edges, rows))
 
     n_vertices = int(vertices.shape[0])
     next_vertex = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
@@ -177,9 +245,14 @@ def boundary_loops(
         device=device,
     )
 
-    labels = tw.graph.connected_component_labels_from_edges(undirected, node_count=n_vertices)
+    # ``undirected`` holds vertex indices this function just gathered out of ``faces``, so the
+    # range check would only re-derive a bound the caller already guarantees — at the cost of
+    # copying the whole edge buffer to the host.
+    labels = tw.graph.connected_component_labels_from_edges(
+        undirected, node_count=n_vertices, validate=False
+    )
 
-    boundary_vertices = boundary_vertex_indices(vertices, faces, edges_sorted)
+    boundary_vertices = tw.grouping.unique_1d(undirected.flatten())
     n_boundary_vertices = int(boundary_vertices.shape[0])
 
     label_min = wp.full(n_vertices, n_vertices, dtype=wp.int32, device=device)
@@ -241,12 +314,7 @@ def boundary_loops(
         device=device,
     )
 
-    offsets_np = offsets.numpy()
-    loop_sizes_np = loop_sizes.numpy()
-    return [
-        wp.clone(flat_loops[int(offsets_np[i]) : int(offsets_np[i]) + int(loop_sizes_np[i])])
-        for i in range(n_loops)
-    ]
+    return flat_loops, offsets, loop_sizes
 
 
 def boundary_loop(
@@ -261,23 +329,28 @@ def boundary_loop(
     Parameters
     ----------
     vertices, faces, edges_sorted, edges
-        Forwarded to [`boundary_loops`][triwarp.boundary.boundary_loops].
+        Forwarded to [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched].
 
     Returns
     -------
     wp.array[wp.int32]
-        Ordered vertex indices around the longest boundary loop, on ``faces.device``. Empty
-        when the mesh has no boundary.
+        Ordered vertex indices around the longest boundary loop, on ``faces.device``. An
+        independent buffer, not a view into the packed result. Empty when the mesh has no
+        boundary.
 
     See Also
     --------
     [`boundary_loops`][triwarp.boundary.boundary_loops]
+    [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched]
     ``igl.boundary_loop``
     """
-    loops = boundary_loops(vertices, faces, edges_sorted, edges)
-    if not loops:
+    flat_loops, offsets, _loop_sizes = boundary_loops_batched(vertices, faces, edges_sorted, edges)
+    bounds = _loop_bounds(flat_loops, offsets)
+    if not bounds:
         return wp.empty(0, dtype=wp.int32, device=faces.device)
-    return max(loops, key=lambda loop: int(loop.shape[0]))
+    # Only the winner is materialized: the other loops are never copied off the packed buffer.
+    begin, end = max(bounds, key=lambda span: span[1] - span[0])
+    return wp.clone(flat_loops[begin:end])
 
 
 def boundary_vertex_indices(
@@ -411,3 +484,39 @@ def ears(
     if n_ears == 0:
         return empty, empty
     return ear, ear_opp
+
+
+def _boundary_rows(
+    vertices: wp.array[wp.vec3], edges_sorted: twt.Array2dInt32
+) -> wp.array[wp.int32]:
+    """Row indices of the triangle edges appearing exactly once — the boundary edges."""
+    return tw.grouping.group_int_rows(
+        edges_sorted, 1, int(vertices.shape[0]), validate=False
+    ).flatten()
+
+
+def _no_loops(
+    device: wp.DeviceLike,
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
+    """Build the three empty buffers a boundary-free mesh yields, as distinct allocations."""
+    return (
+        wp.empty(0, dtype=wp.int32, device=device),
+        wp.empty(0, dtype=wp.int32, device=device),
+        wp.empty(0, dtype=wp.int32, device=device),
+    )
+
+
+def _loop_bounds(
+    flat_loops: wp.array[wp.int32], offsets: wp.array[wp.int32]
+) -> list[tuple[int, int]]:
+    """
+    Host ``[begin, end)`` span per loop, from **one** readback.
+
+    ``offsets`` is the exclusive scan of the loop sizes and the last loop ends at the packed
+    buffer's length, so the sizes need not be read back as well.
+    """
+    starts = [int(start) for start in offsets.numpy().tolist()]
+    if not starts:
+        return []
+    ends = [*starts[1:], int(flat_loops.shape[0])]
+    return list(zip(starts, ends, strict=True))

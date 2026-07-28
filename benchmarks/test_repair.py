@@ -17,12 +17,13 @@ the mesh they are embedded in is nearly irrelevant. Every defect group therefore
   ``round(v / epsilon)``, while ``0`` buckets by the high bits of the float32 representation --
   a *relative* cell about 2.4e-4 wide, not an equality test.
 
-``make_winding_consistent`` is the exception and gets the **diameter** axis instead: it propagates
-orientation bits across the face-adjacency graph one level per round, so its cost is graph depth,
-not defect count. Measured at **7.4 ms on ``sphere_med`` against 642 ms on ``ribbon_long``** at an
-identical vertex count -- 87x -- while trimesh's equivalent goes the other way, 16.8 ms to 7.8 ms.
-Same finding as ``face_orientation_bits`` in [`test_validation.py`](test_validation.py), which is
-the machinery underneath it.
+``make_winding_consistent`` is the exception and gets the **diameter** axis instead: its cost is a
+property of the face-adjacency graph, not of the defect count. It used to *propagate* the
+orientation bits one level per round and measured **7.4 ms on ``sphere_med`` against 642 ms on
+``ribbon_long``** at an identical vertex count -- 87x, while trimesh's equivalent went the other
+way, 16.8 ms to 7.8 ms. It now measures **1.0 ms and 0.85 ms**: flat, and faster than trimesh at
+both ends. Same finding, and same fix, as ``face_orientation_bits`` in
+[`test_validation.py`](test_validation.py), which is the machinery underneath it.
 
 References
 ----------
@@ -219,7 +220,7 @@ def test_remove_duplicated_vertices(bench_case: BenchCase, epsilon: float) -> No
 @pytest.mark.benchaxis("diameter")
 @pytest.mark.benchlibs("triwarp", "trimesh")
 def test_make_winding_consistent(bench_case: BenchCase) -> None:
-    """Z2 orientation propagation: depth-bound, so 87x across the diameter axis."""
+    """Flip mask from the parity union-find, then one relabel pass: flat across the axis."""
     if bench_case.kind == "triwarp":
         faces = bench_case.faces_wp
         oriented = bench_case.run(lambda: tw.repair.make_winding_consistent(faces))

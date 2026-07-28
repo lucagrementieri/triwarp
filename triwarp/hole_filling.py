@@ -59,48 +59,121 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels import hole_filling as kernel_hole_filling
 
 
-def _fillable_loops(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], preserve_largest_hole: bool = False
-) -> list[wp.array[wp.int32]]:
+class _PackedLoops:
     """
-    Boundary loops (>= 3 vertices) eligible for hole filling, as per-loop vertex-index arrays.
+    Every fillable loop of one mesh in one packed buffer, plus the host metadata to index it.
 
-    When ``preserve_largest_hole`` is ``True`` the single largest loop — the one with the greatest
-    perimeter arc length ([`closed_polyline_length`][triwarp.polyline.closed_polyline_length]; the
-    first one on a tie) — is excluded, leaving it open. This is the standard cut for disk-topology
-    repair and UV parametrization, where exactly one boundary must survive.
+    ``flat_loops`` concatenates the loop vertex indices; loop ``ell`` occupies
+    ``flat_loops[starts[ell] : starts[ell] + sizes[ell]]``. ``loop_id`` inverts that mapping so a
+    ``dim=total`` kernel can find its own loop without a search, and ``dp_offsets`` is the exclusive
+    scan of ``sizes ** 2`` — where each loop's ``B x B`` dynamic-programming block begins in the
+    ragged tables. The four device arrays are uploaded once and shared by every stage of the fill.
     """
-    loops = [
-        loop for loop in tw.boundary.boundary_loops(vertices, faces) if int(loop.shape[0]) >= 3
-    ]
-    if preserve_largest_hole and len(loops) > 0:
-        perimeters = [
-            tw.polyline.closed_polyline_length(tw.array.gather(vertices, loop)) for loop in loops
-        ]
-        largest = max(range(len(loops)), key=lambda i: perimeters[i])
-        del loops[largest]
-    return loops
+
+    def __init__(self, flat_loops: wp.array[wp.int32], sizes_np: np.ndarray) -> None:
+        device = flat_loops.device
+        self.device = device
+        self.flat_loops = flat_loops
+        self.sizes_np = sizes_np.astype(np.int64)
+        self.starts_np = np.concatenate([[0], np.cumsum(self.sizes_np)[:-1]]).astype(np.int64)
+        self.dp_offsets_np = np.concatenate(
+            [[0], np.cumsum(self.sizes_np * self.sizes_np)[:-1]]
+        ).astype(np.int64)
+
+        self.n_loops = int(sizes_np.shape[0])
+        self.total = int(self.sizes_np.sum())
+        self.max_size = int(self.sizes_np.max())
+        self.dp_total = int((self.sizes_np * self.sizes_np).sum())
+
+        self.starts = wp.array(self.starts_np.astype(np.int32), dtype=wp.int32, device=device)
+        self.sizes = wp.array(self.sizes_np.astype(np.int32), dtype=wp.int32, device=device)
+        self.dp_offsets = wp.array(
+            self.dp_offsets_np.astype(np.int32), dtype=wp.int32, device=device
+        )
+        self.loop_id = wp.array(
+            np.repeat(np.arange(self.n_loops, dtype=np.int32), self.sizes_np),
+            dtype=wp.int32,
+            device=device,
+        )
+
+    def loop_slice(self, index: int) -> slice:
+        """Host slice of ``flat_loops`` (and of any other length-``total`` buffer) for a loop."""
+        start = int(self.starts_np[index])
+        return slice(start, start + int(self.sizes_np[index]))
+
+    def dp_block(self, table_np: np.ndarray, index: int) -> np.ndarray:
+        """``(B, B)`` view of one loop's block inside a host copy of a ragged DP table."""
+        start = int(self.dp_offsets_np[index])
+        size = int(self.sizes_np[index])
+        return table_np[start : start + size * size].reshape(size, size)
 
 
 def _hole_loops(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], preserve_largest_hole: bool = False
-) -> tuple[wp.array[wp.int32], wp.array[wp.int32], int, int] | None:
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    preserve_largest_hole: bool = False,
+    edges_sorted: twt.Array2dInt32 | None = None,
+) -> _PackedLoops | None:
     """
-    Pack fillable boundary loops (>= 3 vertices) for on-device triangulation.
+    Pack the fillable boundary loops (>= 3 vertices) of a mesh for on-device triangulation.
 
-    Returns ``(flat_loops, loop_starts, n_loops, total)`` where ``flat_loops`` concatenates the
-    loop vertex indices, ``loop_starts`` is each loop's start offset in ``flat_loops`` (the
-    exclusive scan of the loop sizes, on device), ``n_loops`` is the loop count, and ``total`` is
-    ``flat_loops.shape[0]``. Returns ``None`` when there is no fillable boundary loop. Both counts
-    are read from array shapes (host metadata), so no device buffer is copied to the host.
+    Returns ``None`` when there is no fillable boundary loop. Costs **one** host readback (the loop
+    offsets, which the ragged indexing needs anyway), plus a second one only under
+    ``preserve_largest_hole``.
 
-    See [`_fillable_loops`][triwarp.hole_filling._fillable_loops] for ``preserve_largest_hole``.
+    When ``preserve_largest_hole`` is ``True`` the single largest loop — the one with the greatest
+    perimeter arc length; the first one on a tie — is excluded, leaving it open. This is the
+    standard cut for disk-topology repair and UV parametrization, where exactly one boundary must
+    survive. The perimeters come from one segmented-sum launch over the packed loops rather than a
+    [`closed_polyline_length`][triwarp.polyline.closed_polyline_length] call (two synchronizations)
+    per loop.
     """
-    loops = _fillable_loops(vertices, faces, preserve_largest_hole)
-    if len(loops) == 0:
+    flat_loops, offsets, _sizes = tw.boundary.boundary_loops_batched(vertices, faces, edges_sorted)
+    if int(offsets.shape[0]) == 0:
         return None
-    flat_loops, loop_starts = tw.array.pack_1d_arrays(loops)
-    return flat_loops, loop_starts, len(loops), int(flat_loops.shape[0])
+
+    starts_np = offsets.numpy().astype(np.int64)
+    sizes_np = np.diff(np.append(starts_np, int(flat_loops.shape[0])))
+    keep_np = sizes_np >= 3
+    if preserve_largest_hole and bool(keep_np.any()):
+        all_loops = _PackedLoops(flat_loops, sizes_np)
+        perimeter_np = _loop_perimeters(vertices, all_loops)
+        # Only a fillable loop can be the one preserved, matching the pre-filter order.
+        candidates_np = np.flatnonzero(keep_np)
+        keep_np[candidates_np[int(np.argmax(perimeter_np[candidates_np]))]] = False
+    if not keep_np.any():
+        return None
+    if keep_np.all():
+        return _PackedLoops(flat_loops, sizes_np)
+
+    # Compaction is one gather over the dropped loops' slots, not one copy per surviving loop.
+    keep_index_np = np.concatenate(
+        [
+            np.arange(start, start + size)
+            for start, size in zip(starts_np[keep_np], sizes_np[keep_np], strict=True)
+        ]
+    )
+    keep_index_wp = wp.array(
+        keep_index_np.astype(np.int32), dtype=wp.int32, device=flat_loops.device
+    )
+    return _PackedLoops(tw.array.gather(flat_loops, keep_index_wp), sizes_np[keep_np])
+
+
+def _loop_perimeters(vertices: wp.array[wp.vec3], loops: _PackedLoops) -> np.ndarray:
+    """Measure the closed arc length of every packed loop (one launch, one readback)."""
+    perimeter = wp.zeros(loops.n_loops, dtype=wp.float32, device=loops.device)
+    wp.launch(
+        kernel_hole_filling.loop_perimeters,
+        dim=loops.total,
+        inputs=[loops.flat_loops, loops.loop_id, loops.starts, loops.sizes, vertices, perimeter],
+        device=loops.device,
+    )
+    return perimeter.numpy()
+
+
+def _unpack_loops(loops: _PackedLoops) -> list[wp.array[wp.int32]]:
+    """Per-loop **views** into the packed buffer, for the callers that still want a list."""
+    return [loops.flat_loops[loops.loop_slice(index)] for index in range(loops.n_loops)]
 
 
 def fill_holes_fan(
@@ -149,7 +222,8 @@ def fill_holes_fan(
     if packed is None:
         return wp.clone(faces)
 
-    flat_loops, loop_starts, n_loops, total = packed
+    flat_loops, loop_starts = packed.flat_loops, packed.starts
+    n_loops, total = packed.n_loops, packed.total
     n_tri = total - 2 * n_loops
     fill_faces = wp.empty(3 * n_tri, dtype=wp.int32, device=device)
     wp.launch(
@@ -210,7 +284,8 @@ def fill_holes_cone(
     if packed is None:
         return wp.clone(vertices), wp.clone(faces)
 
-    flat_loops, loop_starts, n_loops, total = packed
+    flat_loops, loop_starts = packed.flat_loops, packed.starts
+    n_loops, total = packed.n_loops, packed.total
     n_vertices = int(vertices.shape[0])
 
     centroids = wp.empty(n_loops, dtype=wp.vec3, device=device)
@@ -263,7 +338,7 @@ class _EdgeTable:
     Built once per fill call from the (unsorted) packed sorted-edge keys: probing a rim edge
     with a binary search over ``sorted_keys`` yields its occurrence count (adjacent-face count)
     and, via ``sorted_rows`` -> ``thirds``, the opposite vertex of the single adjacent face. A
-    ``(n_vertices,)`` position scratch supports the forbidden-chord mask per loop.
+    ``(n_vertices,)`` slot scratch supports the forbidden-chord mask of every loop at once.
     """
 
     def __init__(
@@ -275,6 +350,7 @@ class _EdgeTable:
         self.vertices = vertices
         self.edges_sorted = edges_sorted
         self.max_index = wp.uint64(n_vertices)
+        self.n_vertices = n_vertices
         self.device = device
 
         self.thirds = wp.empty(n_rows, dtype=wp.int32, device=device)
@@ -291,20 +367,18 @@ class _EdgeTable:
         self.sorted_keys = wp.clone(sorted_keys)
         self.sorted_rows = wp.clone(sorted_rows)
 
-        self.position = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
-
-    def rim_opposite(
-        self, loop: wp.array[wp.int32]
-    ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-        """Opposite-vertex position + validity per rim edge of ``loop`` (device kernels)."""
-        b = int(loop.shape[0])
-        positions = wp.empty(b, dtype=wp.vec3, device=self.device)
-        valid = wp.empty(b, dtype=wp.int32, device=self.device)
+    def rim_opposite(self, loops: _PackedLoops) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+        """Opposite-vertex position + validity per rim edge, for every loop in one launch."""
+        positions = wp.empty(loops.total, dtype=wp.vec3, device=self.device)
+        valid = wp.empty(loops.total, dtype=wp.int32, device=self.device)
         wp.launch(
             kernel_hole_filling.rim_opposite_from_table,
-            dim=b,
+            dim=loops.total,
             inputs=[
-                loop,
+                loops.flat_loops,
+                loops.loop_id,
+                loops.starts,
+                loops.sizes,
                 self.vertices,
                 self.sorted_keys,
                 self.sorted_rows,
@@ -317,72 +391,92 @@ class _EdgeTable:
         )
         return positions, valid
 
-    def forbidden_chords(self, loop: wp.array[wp.int32]) -> twt.Array2dInt32:
-        """``(B, B)`` mask of chords that already exist as mesh edges (device kernels)."""
-        b = int(loop.shape[0])
-        mask = twt.as_array2d_int32(wp.zeros((b, b), dtype=wp.int32, device=self.device))
+    def forbidden_chords(self, loops: _PackedLoops) -> wp.array[wp.int32]:
+        """
+        Ragged mask of the chords that already exist as mesh edges, for every loop at once.
+
+        The ``(n_vertices,)`` scratch holds each vertex's *flat* slot rather than its position
+        within one loop, which is what lets every loop's mask be marked by a single pass over the
+        mesh edges — the per-loop version ran one full ``dim = 3 * n_faces`` pass per hole, and
+        cleared the scratch between them.
+        """
+        slot = wp.full(self.n_vertices, -1, dtype=wp.int32, device=self.device)
         wp.launch(
             kernel_hole_filling.scatter_loop_positions,
-            dim=b,
-            inputs=[loop, self.position],
+            dim=loops.total,
+            inputs=[loops.flat_loops, slot],
             device=self.device,
         )
+        mask = wp.zeros(loops.dp_total, dtype=wp.int32, device=self.device)
         wp.launch(
             kernel_hole_filling.mark_forbidden_chords,
             dim=int(self.edges_sorted.shape[0]),
-            inputs=[self.edges_sorted, self.position, wp.int32(b), mask],
-            device=self.device,
-        )
-        wp.launch(
-            kernel_hole_filling.clear_loop_positions,
-            dim=b,
-            inputs=[loop, self.position],
+            inputs=[
+                self.edges_sorted,
+                slot,
+                loops.loop_id,
+                loops.starts,
+                loops.sizes,
+                loops.dp_offsets,
+                mask,
+            ],
             device=self.device,
         )
         return mask
 
 
 def _run_hole_dp(
+    loops: _PackedLoops,
     loop_pos: wp.array[wp.vec3],
-    plane_normal: wp.vec3,
-    forbidden: twt.Array2dInt32,
+    plane_normals: wp.array[wp.vec3],
+    forbidden: wp.array[wp.int32],
     rim_opp_pos: wp.array[wp.vec3],
     rim_opp_valid: wp.array[wp.int32],
-    char_area: float,
+    char_areas: wp.array[wp.float32],
+    active: wp.array[wp.int32],
     metric_id: int,
     combine_id: int,
     smooth_boundary: bool,
-    device: wp.DeviceLike,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Run the interval DP for one hole; return the host ``(dp, prev)`` tables."""
-    b = int(loop_pos.shape[0])
-    dp = twt.empty_float32_2d((b, b), device=device)
-    prev = twt.empty_int32_2d((b, b), device=device)
+    dp: wp.array[wp.float32],
+    prev: wp.array[wp.int32],
+) -> None:
+    """
+    Fill the ragged ``dp`` / ``prev`` tables for every loop flagged in ``active``, in place.
+
+    One launch per triangulation span **across all loops**, so the launch count is
+    ``max(B) - 1`` for the whole mesh rather than ``B - 1`` per hole.
+    """
+    device = loops.device
     wp.launch(
-        kernel_hole_filling.init_dp_base, dim=(b, b), inputs=[dp, prev, wp.int32(b)], device=device
+        kernel_hole_filling.init_dp_base,
+        dim=(loops.n_loops, loops.max_size),
+        inputs=[loops.sizes, loops.dp_offsets, active, dp, prev],
+        device=device,
     )
-    for span in range(2, b):
+    for span in range(2, loops.max_size):
         wp.launch(
             kernel_hole_filling.fill_dp_span,
-            dim=b - span,
+            dim=(loops.n_loops, loops.max_size - span),
             inputs=[
                 loop_pos,
-                plane_normal,
+                loops.starts,
+                loops.sizes,
+                loops.dp_offsets,
+                active,
+                plane_normals,
                 forbidden,
                 rim_opp_pos,
                 rim_opp_valid,
-                wp.float32(char_area),
+                char_areas,
                 wp.int32(metric_id),
                 wp.int32(combine_id),
                 wp.int32(1 if smooth_boundary else 0),
                 wp.int32(span),
-                wp.int32(b),
                 dp,
                 prev,
             ],
             device=device,
         )
-    return dp.numpy(), prev.numpy()
 
 
 def _traceback_triangles(prev_np: np.ndarray, loop_np: np.ndarray) -> list[tuple[int, int, int]]:
@@ -425,8 +519,13 @@ def fill_holes_min_weight(
     than [`fill_holes_fan`][triwarp.hole_filling.fill_holes_fan] for non-convex or non-planar holes
     and, unlike [`fill_holes_cone`][triwarp.hole_filling.fill_holes_cone], adds no vertices.
 
-    The ``O(B^3)`` DP runs on device as ``B`` parallel kernel launches (one per triangulation span);
-    the small ``B x B`` predecessor table is traced back on the host to emit triangles.
+    The ``O(B^3)`` DP runs on device as one parallel kernel launch per triangulation span, and
+    **every hole is solved in the same launches**: the per-loop ``B x B`` tables are packed into one
+    ragged buffer, so the launch count is ``max(B) - 1`` for the whole mesh rather than ``B - 1``
+    per hole, and the chord test, the plane normals and the min-area fallback decision are likewise
+    one pass each. Only the ``O(B)`` traceback is host-side, over a single predecessor buffer. A
+    mesh with many small holes therefore costs about what one hole costs; before this was batched,
+    512 three-vertex holes ran to 376 ms, of which ~100 % was per-hole overhead.
 
     Parameters
     ----------
@@ -497,8 +596,13 @@ def fill_holes_min_weight(
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return wp.clone(faces)
-    loops = _fillable_loops(vertices, faces, preserve_largest_hole)
-    return fill_loops(vertices, faces, loops, metric, resolve_multiple_edges, smooth_boundary)
+    edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+    loops = _hole_loops(vertices, faces, preserve_largest_hole, edges_sorted)
+    if loops is None:
+        return wp.clone(faces)
+    return _fill_packed_loops(
+        vertices, faces, loops, metric, resolve_multiple_edges, smooth_boundary, edges_sorted
+    )
 
 
 def fill_loops(
@@ -516,8 +620,10 @@ def fill_loops(
     [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight] and
     [`triwarp.reconstruction.triangulate_point_cloud`]
     [triwarp.reconstruction.triangulate_point_cloud] (to close only a caller-selected subset of
-    boundary loops): each loop is sealed by the interval DP under ``metric`` (with a ``min_area``
-    fallback when the primary metric yields a bad triangulation), reusing only existing vertices.
+    boundary loops): every loop is sealed **together** by the interval DP under ``metric`` (with a
+    ``min_area`` fallback where the primary metric yields a bad triangulation), reusing only
+    existing vertices. Cost is set by the longest loop, not by the loop count; see
+    [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight].
 
     Parameters
     ----------
@@ -545,66 +651,120 @@ def fill_loops(
     --------
     [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight]
     """
-    device = faces.device
     if len(loops) == 0:
         return wp.clone(faces)
+    return _fill_packed_loops(
+        vertices, faces, _pack_loops(loops), metric, resolve_multiple_edges, smooth_boundary
+    )
 
-    # All pre-DP inputs (edge->third-vertex table, forbidden chords, rim opposites) are built
-    # on device; the host only reads back each loop for the O(B) DP traceback.
-    edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+
+def _fill_packed_loops(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    loops: _PackedLoops,
+    metric: str,
+    resolve_multiple_edges: bool,
+    smooth_boundary: bool,
+    edges_sorted: twt.Array2dInt32 | None = None,
+) -> wp.array[wp.int32]:
+    """
+    Min-weight-triangulate every packed loop **together** and append the fill faces.
+
+    The engine behind [`fill_loops`][triwarp.hole_filling.fill_loops]. Everything before the
+    traceback is batched across loops — one Newell-normal and longest-edge pass, one chord pass over
+    the mesh, one ragged ``dp`` / ``prev`` pair, one launch per span rather than per (loop, span),
+    and a device-side min-area retry mask instead of a host branch per loop. What is left on the
+    host is the ``O(B)`` traceback, which reads *one* packed predecessor table.
+    """
+    device = faces.device
+    if edges_sorted is None:
+        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
     edge_table = _EdgeTable(vertices, faces, edges_sorted)
     primary_id = _METRIC_IDS[metric]
     combine_id = _METRIC_COMBINE.get(metric, 0)
     min_area_id = _METRIC_IDS["min_area"]
 
-    triangles: list[tuple[int, int, int]] = []
-    for loop in loops:
-        loop_np = loop.numpy()
-        b = int(loop.shape[0])
-        loop_pos = tw.array.gather(vertices, loop)
-        plane_normal = tw.polyline.polyline_normal(loop_pos)
-        forbidden = (
-            edge_table.forbidden_chords(loop)
-            if resolve_multiple_edges
-            else twt.as_array2d_int32(wp.zeros((b, b), dtype=wp.int32, device=device))
-        )
-        rim_opp_pos, rim_opp_valid = edge_table.rim_opposite(loop)
-        edge_sq = wp.empty(b, dtype=wp.float32, device=device)
+    loop_pos = tw.array.gather(vertices, loops.flat_loops)
+    plane_normals = wp.zeros(loops.n_loops, dtype=wp.vec3, device=device)
+    max_edge_sq = wp.zeros(loops.n_loops, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_hole_filling.loop_rim_metrics,
+        dim=loops.total,
+        inputs=[
+            loops.flat_loops,
+            loops.loop_id,
+            loops.starts,
+            loops.sizes,
+            vertices,
+            max_edge_sq,
+            plane_normals,
+        ],
+        device=device,
+    )
+    wp.map(wp.normalize, plane_normals, out=plane_normals)
+    char_areas = wp.empty(loops.n_loops, dtype=wp.float32, device=device)
+    wp.map(kernel_hole_filling.char_area_from_max, max_edge_sq, out=char_areas)
+
+    forbidden = (
+        edge_table.forbidden_chords(loops)
+        if resolve_multiple_edges
+        else wp.zeros(loops.dp_total, dtype=wp.int32, device=device)
+    )
+    rim_opp_pos, rim_opp_valid = edge_table.rim_opposite(loops)
+
+    dp = wp.empty(loops.dp_total, dtype=wp.float32, device=device)
+    prev = wp.empty(loops.dp_total, dtype=wp.int32, device=device)
+    all_loops = wp.ones(loops.n_loops, dtype=wp.int32, device=device)
+    _run_hole_dp(
+        loops,
+        loop_pos,
+        plane_normals,
+        forbidden,
+        rim_opp_pos,
+        rim_opp_valid,
+        char_areas,
+        all_loops,
+        primary_id,
+        combine_id,
+        smooth_boundary,
+        dp,
+        prev,
+    )
+
+    if primary_id != min_area_id:
+        # Which loops the primary metric failed on is decided on device and fed straight back in as
+        # the re-run's active mask, so the fallback costs one more batched pass rather than a host
+        # readback and a branch per loop. Loops the primary metric handled keep their ``prev`` rows.
+        retry = wp.empty(loops.n_loops, dtype=wp.int32, device=device)
         wp.launch(
-            kernel_hole_filling.closed_edge_sq_lengths,
-            dim=b,
-            inputs=[loop_pos, wp.int32(b), edge_sq],
+            kernel_hole_filling.flag_bad_triangulations,
+            dim=loops.n_loops,
+            inputs=[loops.sizes, loops.dp_offsets, dp, retry],
             device=device,
         )
-        max_edge_sq = float(tw.reduce.max(edge_sq))
-        char_area = 1.0 / max_edge_sq if max_edge_sq > 0.0 else 1.0
-
-        dp_np, prev_np = _run_hole_dp(
+        _run_hole_dp(
+            loops,
             loop_pos,
-            plane_normal,
+            plane_normals,
             forbidden,
             rim_opp_pos,
             rim_opp_valid,
-            char_area,
-            primary_id,
-            combine_id,
+            char_areas,
+            retry,
+            min_area_id,
+            0,
             smooth_boundary,
-            device,
+            dp,
+            prev,
         )
-        if primary_id != min_area_id and dp_np[0, b - 1] >= _BAD_TRIANGULATION_METRIC:
-            _, prev_np = _run_hole_dp(
-                loop_pos,
-                plane_normal,
-                forbidden,
-                rim_opp_pos,
-                rim_opp_valid,
-                char_area,
-                min_area_id,
-                0,
-                smooth_boundary,
-                device,
-            )
-        triangles.extend(_traceback_triangles(prev_np, loop_np))
+
+    prev_np = prev.numpy()
+    flat_np = loops.flat_loops.numpy()
+    triangles: list[tuple[int, int, int]] = []
+    for index in range(loops.n_loops):
+        triangles.extend(
+            _traceback_triangles(loops.dp_block(prev_np, index), flat_np[loops.loop_slice(index)])
+        )
 
     if len(triangles) == 0:
         return wp.clone(faces)
@@ -612,6 +772,13 @@ def fill_loops(
         np.asarray(triangles, dtype=np.int32).reshape(-1), dtype=wp.int32, device=device
     )
     return tw.array.concatenate([faces, fill_faces])
+
+
+def _pack_loops(loops: list[wp.array[wp.int32]]) -> _PackedLoops:
+    """Concatenate a caller's per-loop arrays into the packed form the fill engine consumes."""
+    flat_loops, _offsets = tw.array.pack_1d_arrays(loops)
+    sizes_np = np.asarray([int(loop.shape[0]) for loop in loops], dtype=np.int64)
+    return _PackedLoops(flat_loops, sizes_np)
 
 
 def fill_small_holes(
@@ -647,24 +814,19 @@ def fill_small_holes(
     [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight]
     [`fill_loops`][triwarp.hole_filling.fill_loops]
     """
-    loops = tw.boundary.boundary_loops(vertices, faces)
-    if not loops:
+    packed = _hole_loops(vertices, faces)
+    if packed is None:
         return faces
 
-    vertices_np = vertices.numpy()
-    small_loops = []
-    for loop in loops:
-        loop_np = loop.numpy()
-        if int(loop_np.shape[0]) < 3:
-            continue
-        ring = vertices_np[loop_np]
-        perimeter = float(np.linalg.norm(np.diff(ring, axis=0, append=ring[:1]), axis=1).sum())
-        if perimeter <= max_perimeter:
-            small_loops.append(loop)
-
-    if not small_loops:
+    # One segmented-sum launch measures every rim, so the selection costs a single readback rather
+    # than a copy of the whole vertex buffer plus one of each loop.
+    small_np = _loop_perimeters(vertices, packed) <= max_perimeter
+    if not small_np.any():
         return faces
-    return fill_loops(vertices, faces, small_loops, "plane_normalized", True)
+    if not small_np.all():
+        kept = zip(_unpack_loops(packed), small_np, strict=True)
+        packed = _pack_loops([loop for loop, keep in kept if keep])
+    return _fill_packed_loops(vertices, faces, packed, "plane_normalized", True, True)
 
 
 def _longest_increasing_subsequence(numbers: np.ndarray) -> np.ndarray:
@@ -1049,8 +1211,9 @@ def triangulate_boundaries_min_weight(
     b_pos = tw.array.gather(vertices_b, lb_wp)
     table_a = _EdgeTable(vertices_a, faces_a, tw.edges.faces_to_edges(faces_a, sorted=True))
     table_b = _EdgeTable(vertices_b, faces_b, tw.edges.faces_to_edges(faces_b, sorted=True))
-    a_opp, a_opp_valid = table_a.rim_opposite(la_wp)
-    b_opp, b_opp_valid = table_b.rim_opposite(lb_wp)
+    # The stitch DP works on exactly one rim per side, so each rim is its own one-loop batch.
+    a_opp, a_opp_valid = table_a.rim_opposite(_PackedLoops(la_wp, np.array([n_a], dtype=np.int64)))
+    b_opp, b_opp_valid = table_b.rim_opposite(_PackedLoops(lb_wp, np.array([n_b], dtype=np.int64)))
     up = wp.vec3(*(up_dir if up_dir is not None else (0.0, 0.0, 1.0)))
 
     dp = twt.as_array2d_float32(
@@ -1314,16 +1477,16 @@ def fill_holes_nicely(
 
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
-    loops = _fillable_loops(vertices, faces, preserve_largest_hole) if n_faces > 0 else []
-    if len(loops) == 0:
+    packed = _hole_loops(vertices, faces, preserve_largest_hole) if n_faces > 0 else None
+    if packed is None:
         empty = _patch_mask(int(faces.shape[0]) // 3, int(faces.shape[0]) // 3, device)
         result = (wp.clone(vertices), wp.clone(faces))
         return (*result, empty) if return_patch else result
 
     n_faces_before = int(faces.shape[0]) // 3
     n_vertices_before = int(vertices.shape[0])
-    faces_filled = fill_loops(
-        vertices, faces, loops, metric, resolve_multiple_edges, smooth_boundary
+    faces_filled = _fill_packed_loops(
+        vertices, faces, packed, metric, resolve_multiple_edges, smooth_boundary
     )
     n_faces_after = int(faces_filled.shape[0]) // 3
     patch_mask = _patch_mask(n_faces_before, n_faces_after, device)
@@ -1332,7 +1495,9 @@ def fill_holes_nicely(
         result = (wp.clone(vertices), faces_filled)
         return (*result, patch_mask) if return_patch else result
 
-    target_edge = max_edge if max_edge is not None else _mean_rim_edge_length(vertices, loops)
+    target_edge = (
+        max_edge if max_edge is not None else _mean_rim_edge_length(vertices, _unpack_loops(packed))
+    )
     new_vertices, new_faces, out_patch = _finish_nicely(
         vertices,
         faces_filled,

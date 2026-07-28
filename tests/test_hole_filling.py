@@ -500,6 +500,62 @@ def test_fill_holes_min_weight_watertight(
     assert filled_tm.is_winding_consistent
 
 
+def _punched_sphere(n_holes: int, seed: int = 5) -> tuple[np.ndarray, np.ndarray]:
+    """Icosphere with ``n_holes`` scattered single-triangle holes: many independent small loops."""
+    mesh_tm = tm.creation.icosphere(subdivisions=3)
+    rng = np.random.default_rng(seed)
+    # Only drop faces whose one-rings are disjoint, so each hole stays a separate 3-vertex loop.
+    blocked: set[int] = set()
+    dropped: list[int] = []
+    adjacency = mesh_tm.face_adjacency
+    neighbors: dict[int, set[int]] = {face: set() for face in range(len(mesh_tm.faces))}
+    for left, right in adjacency:
+        neighbors[int(left)].add(int(right))
+        neighbors[int(right)].add(int(left))
+    for face in rng.permutation(len(mesh_tm.faces)):
+        face = int(face)
+        if len(dropped) == n_holes or face in blocked:
+            continue
+        dropped.append(face)
+        blocked.add(face)
+        blocked.update(neighbors[face])
+        for near in neighbors[face]:
+            blocked.update(neighbors[near])
+    keep = np.setdiff1d(np.arange(len(mesh_tm.faces)), np.asarray(dropped))
+    return mesh_tm.vertices, mesh_tm.faces[keep]
+
+
+@pytest.mark.parametrize("metric", ["plane_normalized", "min_area", "universal"])
+def test_fill_holes_min_weight_batched_equals_per_loop(device: str, metric: str) -> None:
+    """
+    Filling many holes in one call must match filling them one at a time.
+
+    The interval DP is solved for every loop in the same launches over one ragged table, so this is
+    the regression that would catch a loop bleeding into its neighbour's block -- an off-by-one in
+    ``dp_offsets``, a chord marked against the wrong loop, or a min-area fallback firing for the
+    whole batch instead of the loops that needed it.
+    """
+    vertices_np, faces_np = _punched_sphere(24)
+    vertices_wp = wp.array(
+        np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    faces_wp = wp.array(
+        np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
+    )
+    loops = _fillable_loops(vertices_wp, faces_wp)
+    assert len(loops) >= 8
+
+    batched_np = tw.hole_filling.fill_loops(vertices_wp, faces_wp, loops, metric, True).numpy()
+    per_loop = [
+        tw.hole_filling.fill_loops(vertices_wp, faces_wp, [loop], metric, True).numpy()[
+            int(faces_wp.shape[0]) :
+        ]
+        for loop in loops
+    ]
+    expected_np = np.concatenate([faces_wp.numpy(), *per_loop])
+    assert np.array_equal(batched_np, expected_np)
+
+
 def test_fill_holes_min_weight_optimal_vs_fan(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _, mesh_wp = hemisphere
     # Single-loop fixture: the DP minimizes the plane-normalized objective over all triangulations,

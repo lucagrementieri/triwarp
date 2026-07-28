@@ -8,13 +8,16 @@ the *shape* of the boundary, along two independent directions that the axis sepa
 - **loop length** decides the ranking work. ``rim_long``'s two rims of 65 536 vertices are the
   asymptotic case: a per-vertex successor walk is O(L^2) on a loop of length L, while the Wyllie
   pointer jumping the implementation uses is O(L log L), one kernel launch per round.
-- **loop count** decides the host work. Each loop costs a slice of a read-back offset table plus
-  its own ``wp.clone``, so ``holes_many``'s 512 three-vertex loops are *more* expensive than
+- **loop count** decides the host work. Each loop used to cost a slice of a read-back offset table
+  plus its own ``wp.clone``, so ``holes_many``'s 512 three-vertex loops were *more* expensive than
   ``rim_long``'s two enormous ones despite carrying a quarter of the boundary vertices.
 
-Measured medians (RTX 5090, ``--device=cuda``): 0.38 ms with no boundary, 3.4 ms for the two long
-rims, 12.2 ms for the 512 short loops. The 32x spread over an unchanged face count is the point,
-and the ordering says the per-loop host sequence is the thing to batch, not the ranking.
+Measured medians (RTX 5090, ``--device=cuda``): **0.35 / 2.4 / 4.1 ms** for no boundary / two long
+rims / 512 short loops. The spread over an unchanged face count is the point, and it is what said
+the per-loop host sequence was the thing to batch rather than the ranking: this group read
+0.38 / 3.4 / 12.2 ms -- a 32x spread with the *wrong* end on top -- before ``boundary_loops`` became
+a slicing wrapper over the packed ``boundary_loops_batched``, which extracts every loop in one pass
+and hands back views instead of ``k`` clones.
 
 References
 ----------
@@ -43,7 +46,7 @@ import triwarp as tw
 @pytest.mark.benchaxis("loops")
 @pytest.mark.benchlibs("triwarp", "trimesh", "igl")
 def test_boundary_loops(bench_case: BenchCase) -> None:
-    """Ranking plus per-loop extraction, across no boundary / two long rims / many short loops."""
+    """Ranking plus batched extraction, across no boundary / two long rims / many short loops."""
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         loops = bench_case.run(lambda: tw.boundary.boundary_loops(vertices, faces))
@@ -65,8 +68,9 @@ def test_boundary_edges(bench_case: BenchCase) -> None:
     The unordered predecessor of ``boundary_loops``: the edge sort without the ranking.
 
     Subtracting this group from ``boundary_loops`` separates the two costs, which is what says
-    whether a regression is in the sort (scales with faces) or in the per-loop host sequence
-    (scales with loop count).
+    whether a regression is in the sort (scales with faces) or in the loop extraction (scales with
+    loop count). It reads flat at ~0.4-0.5 ms across the whole axis, so everything above it in
+    ``boundary_loops`` is ranking and extraction.
     """
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp

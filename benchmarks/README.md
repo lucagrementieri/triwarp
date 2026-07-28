@@ -25,16 +25,40 @@ much the point as what varies — that is what makes a timing spread attributabl
 than to "a different mesh". A group whose spread is ~1× is telling you its axis does not drive that
 function, which is a useful answer too.
 
-Three examples of what this buys, all measured on an RTX 5090:
+Two examples of what this buys, both measured on an RTX 5090:
 
 | group | control | perturbed | spread |
 |---|---|---|---|
-| `combine.split`, F = 81 920 fixed | 1 component **2.6 ms** | 1024 components **669 ms** | **262×** |
-| `graph.bfs`, V = 40 962 fixed | sphere Ø ≈ 130 **5.1 ms** | ribbon Ø = 20 481 **365 ms** | **73×** |
-| `validation.face_orientation_bits`, V fixed | **7.9 ms** | ribbon **653 ms** | **83×** |
+| `combine.concatenate`, F = 81 920 fixed | 8 pieces **0.23 ms** | 512 pieces **5.7 ms** | **25×** |
+| `graph.bfs`, V = 40 962 fixed | sphere Ø ≈ 130 **4.0 ms** | ribbon Ø = 20 481 **23 ms** | **5.8×** |
 
-None of those are visible to a face-count sweep, and in all three triwarp *loses to a CPU reference*
-at the far end of the axis.
+Neither is visible to a face-count sweep, and `bfs` still *loses to scipy* at the far end of its
+axis (0.68 ms on the ribbon) even after the spread came down from 73×. `concatenate` came down from
+48× (0.39 → 19.0 ms) by collapsing its per-piece index renumbering into one launch; what is left is
+one `wp.copy` per input buffer, which Warp cannot batch — there is no gather across separate
+allocations — so the residual slope is real and bounded below by the piece count.
+
+Four more entries have already been retired from this table by the fixes they prompted, and all
+four are kept in their modules as worked examples of what the axis rule is for:
+
+- **`combine.split`** headed it at **262×** (2.6 ms → 669 ms, a 3× loss to trimesh at a thousand
+  components). Commit `f57d3f0` batched its per-component compaction; it now runs 2.5 / 3.1 /
+  9.4 ms against trimesh's 36.6 / 37.1 / 183 ms and open3d's 68.1 / 76.4 / 290 ms — a 3.7× spread
+  and a 19-31× win at every point.
+- **`validation.face_orientation_bits`** was **83×** (7.9 ms → 653 ms, an 83× loss to trimesh's
+  `fix_winding`) while it propagated its Z2 bits one launch per graph level. Solving them with a
+  parity-carrying union-find instead makes it depth-independent: **0.92 ms and 0.77 ms**, a win
+  over trimesh at both ends. `repair.make_winding_consistent` inherited the fix.
+- **`hole_filling.fill_holes_min_weight`** was *inverted*: 512 three-vertex holes cost 376 ms
+  against 273 ms for two 512-vertex rims, i.e. the trivial case cost more than the `B³` one,
+  because each hole paid its own readbacks, chord pass and span launches. Batching the interval DP
+  across loops took it to **4.2 ms**, and dropped the two-rim point to 157 ms by running both rims
+  in the same launches.
+- **`creation.triangulate_polygon`** was **23×** across its resolution points (6.1 ms → 141 ms on a
+  1024-point star) and an 80× loss to trimesh. The ear clipper is parallel; what was linear in the
+  ring size was its *round count*, because competing ears were ranked by raw ring index and a star
+  ring makes that rank suppress all but one ear per round. Ranking by a hash of the index gives
+  **2.8 / 4.6 ms** and 30 rounds instead of 1 022.
 
 ## Mesh registries
 
@@ -142,11 +166,16 @@ uv run pytest benchmarks/test_combine.py --device=cuda
 uv run pytest benchmarks/test_edges.py --device=cpu --size=medium
 ```
 
-A full default run is **~16 minutes** on an RTX 5090 (measured: 944 s across all 33 modules, one
-process each, 1 152 cases). The four slowest modules are `test_reconstruction` (123 s, the
-depth-9 Poisson solves), `test_laplacian` (94 s), `test_proximity` (83 s, the `O(Q x F)` winding
-number) and `test_smoothing` (67 s) — all of them measuring genuinely expensive work rather than
-paying overhead.
+A full default run is **~18 minutes** on an RTX 5090 (measured: 1 097 s across all 33 modules, one
+process each, 999 cases plus 139 skipped). The four slowest modules are `test_reconstruction`
+(235 s), `test_laplacian` (95 s), `test_proximity` (85 s, the `O(Q x F)` winding number) and
+`test_smoothing` (70 s).
+
+Only the first of those is not measuring triwarp: **190 of `test_reconstruction`'s 199 timed
+seconds are open3d's CPU `create_from_point_cloud_poisson`** (7.5 s a call at depth 9 on `bunny`),
+against 9.0 s for every triwarp case in the module combined. It is the largest single reference cost
+in the suite and the reason that module doubled the 123 s recorded here previously; before trimming
+anything in it, read the per-library split rather than the module total.
 
 By default the harness prints **one comparison table per (function, mesh)** — each table lists the
 libraries and any parameter points side by side — via `--benchmark-group-by=group,param:mesh_name`,

@@ -64,10 +64,23 @@ falling behind above a few thousand sections (its ``create_sphere`` at 4096 is a
 ``subdivisions`` passes is a full ``subdivide`` (edge dedup, a sort, a scan), so its cost grows with
 the subdivision count rather than being one launch.
 
-``triangulate_polygon`` is the second exception and the module's one real slowness path: ear
-clipping cannot be expressed in parallel, so it runs as a single-thread kernel at ``O(L^2)`` in the
-ring length. ``extrude_polygon`` only ever exercises the *convex* fast path (a single fan), which is
-why the ear clipper is benchmarked directly on a non-convex star ring — the same reasoning that puts
+``triangulate_polygon`` is the second exception, and the module's worked example of a cost that is
+not where it looks. It delegates to ``polyline.triangulate_polyline``, which is a **parallel**
+multi-round ear clipper — every launch in the round loop is ``dim=n``, and a round clips a whole
+*independent set* of ears at once. What is serial is the **round count**: a round costs three
+``dim=n`` launches plus one ``out_count`` readback whatever it clips, so the only thing that
+matters is how many ears survive per round.
+
+That is what this group caught. ``select_independent`` used to rank competing ears by their raw
+ring index, which on an alternating star lets ear ``i - 2`` suppress ear ``i`` for every ``i``, so
+exactly **one** ear was clipped per round and the loop ran to its ``n`` cap: 6.1 ms at 64 points
+and **141 ms** at 1 024, growing as ``n^1.12`` (rounds proportional to ``n`` times a slowly growing
+per-round cost) rather than the ``O(L^2)`` a serial clipper would give. Ranking by a bijective hash
+of the ring index makes it the textbook maximal-independent-set rule, which retires a constant
+fraction per round: **2.8 ms and 4.6 ms**, 30 rounds at 1 024 instead of 1 022.
+
+``extrude_polygon`` only ever exercises the *convex* fast path (a single fan), which is why the ear
+clipper is benchmarked directly on a non-convex star ring — the same reasoning that puts
 ``polyline.simplify_polyline`` in its own group in [`test_polyline.py`](test_polyline.py).
 
 Deliberately not benchmarked
@@ -102,8 +115,9 @@ _SUBDIVISIONS = [3, 5, 7]
 _SWEEP_RING = 64
 _SWEEP_PATH = 4096
 
-# Ring sizes for the ear-clipping triangulator. Kept modest because the algorithm is serial and
-# quadratic: 1 024 points is already ~10^6 ear tests on one thread.
+# Ring sizes for the ear-clipping triangulator. Kept modest because the *round count*, not the
+# per-round work, is what grows -- and because the two points are what showed the round count was
+# growing linearly rather than logarithmically in the ring size.
 _STAR_RINGS = [64, 1024]
 
 
@@ -348,12 +362,14 @@ def test_extrude_polygon(bench_lib: BenchLibrary, ring_size: int) -> None:
 @pytest.mark.parametrize("ring_size", _STAR_RINGS)
 def test_triangulate_polygon(bench_lib: BenchLibrary, ring_size: int) -> None:
     """
-    Ear clipping on a *non-convex* ring: serial, quadratic, and the module's real slowness path.
+    Ear clipping on a *non-convex* ring: round-count-bound, and the module's real slowness path.
 
     ``extrude_polygon`` above hands the triangulator a convex ring, which takes the single-fan fast
     path and never reaches the ear loop. A star ring forces it, so this is the only group here that
-    measures the clipper itself — expect it to be the one place a CPU implementation wins outright,
-    for the same reason ``polyline.simplify_polyline`` is. No open3d counterpart.
+    measures the clipper itself. Each round is fully parallel (three ``dim=n`` launches); what this
+    group actually measures is **how many rounds the independent-set rule needs**. Read the two
+    points as a rounds ratio, not a work ratio: 16 and 30 rounds, against 62 and 1 022 before the
+    ranking hash. No open3d counterpart.
     """
     shapely = pytest.importorskip("shapely.geometry")
     if bench_lib.kind == "triwarp":

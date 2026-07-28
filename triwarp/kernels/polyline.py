@@ -244,7 +244,16 @@ def smooth_upsample_gather(
 def greedy_downsample_mask(
     cumulative_lengths: wp.array[wp.float32], step_size: wp.float32, out_keep: wp.array[wp.bool]
 ) -> None:
-    # Single-thread greedy walk (dim == 1): the selection is inherently sequential.
+    # Single-thread greedy walk (dim == 1): the selection is sequential because each kept point
+    # moves the reference the next one is measured from.
+    #
+    # It is not *inherently* sequential — the same set can be produced by a parallel scan plus a
+    # segmented pick (bucket each point by ``floor(cumulative / step)``, take the first point of
+    # each bucket, then fix up buckets a kept point spilled past). That is a real rewrite and it has
+    # not been shown to be worth one: this kernel is on the live path of ``downsample_polyline`` /
+    # ``downsample_closed_polyline``, which measure 0.35 ms on a 528-point loop and 3.9 ms on a
+    # 65 536-point rim (RTX 5090) — the walk is ~60 ns a point and nothing else in those calls is
+    # faster. Revisit if a benchmark ever puts it on top.
     n = cumulative_lengths.shape[0]
     out_keep[0] = True
     last = cumulative_lengths[0]
@@ -268,9 +277,11 @@ def rdp_keep_mask(
     # (ixs, ixe) index ranges, since Warp forbids recursion. ``stack`` is scratch holding the
     # ranges interleaved; its size must be >= max(2 * n, 2). The first and last vertices are
     # always kept; interior vertices closer than sqrt(stol) to their bracketing chord are dropped.
+    #
+    # ``out_keep`` arrives pre-filled with ``True``: the caller does that with a parallel
+    # ``fill_``, because doing it here put an ``O(n)`` serial memset on thread 0 in front of an
+    # algorithm that is only serial because the *recursion* is.
     n = polyline.shape[0]
-    for i in range(n):
-        out_keep[i] = True
     stack[0] = 0
     stack[1] = n - 1
     # int()/float() declare mutable Warp dynamic variables; bare literals are compile-time
@@ -420,9 +431,13 @@ def accumulate_turning_angle(points2d: wp.array[wp.vec2], out_total: wp.array[wp
 
 
 @wp.kernel
-def orient_ccw(points2d: wp.array[wp.vec2]) -> None:
+def orient_ccw(points2d: wp.array[wp.vec2], turning_angle: wp.array[wp.float32]) -> None:
     # Mirror the y-axis to flip a clockwise loop to counter-clockwise (replaces libigl's row
-    # reversal); the convex/ear tests assume CCW orientation.
+    # reversal); the convex/ear tests assume CCW orientation. The sign test reads the accumulated
+    # turning angle *on device*, so the caller does not have to synchronize between the two: on the
+    # convex fast path that pair of readbacks was the entire cost of the call.
+    if turning_angle[0] >= 0.0:
+        return
     i = int(wp.tid())
     p = points2d[i]
     points2d[i] = wp.vec2(p[0], -p[1])
@@ -479,6 +494,28 @@ def compute_ears(
         out_is_ear[i] = wp.int32(0)
 
 
+@wp.func
+def ear_priority(i: wp.int32) -> wp.uint32:
+    # ``lowbias32`` finalizer: a bijection on uint32, so distinct ring indices never tie and the
+    # order it induces is an effectively random permutation of them. Being a pure function of the
+    # index it is also perfectly deterministic and needs no state.
+    x = wp.uint32(i)
+    x = (x ^ (x >> wp.uint32(16))) * wp.uint32(0x7FEB352D)
+    x = (x ^ (x >> wp.uint32(15))) * wp.uint32(0x846CA68B)
+    return x ^ (x >> wp.uint32(16))
+
+
+@wp.func
+def ear_outranks(a: wp.int32, b: wp.int32) -> wp.bool:
+    # Strict total order on ring indices. The hash is injective, so the index tiebreak below never
+    # fires; it is there so the order stays total if the mixer is ever changed.
+    key_a = ear_priority(a)
+    key_b = ear_priority(b)
+    if key_a != key_b:
+        return key_a < key_b
+    return a < b
+
+
 @wp.kernel
 def select_independent(
     is_ear: wp.array[wp.int32],
@@ -486,9 +523,16 @@ def select_independent(
     right: wp.array[wp.int32],
     out_selected: wp.array[wp.int32],
 ) -> None:
-    # Select ear i iff it has the smallest index among ears within ring-distance 2. This keeps
-    # chosen ears >= 3 apart, so their clip footprints {L[i], i, R[i]} are disjoint and can be
-    # clipped concurrently. The global-min-index ear is always selected, guaranteeing progress.
+    # Select ear i iff it outranks every ear within ring-distance 2. This keeps chosen ears >= 3
+    # apart, so their clip footprints {L[i], i, R[i]} are disjoint and can be clipped concurrently.
+    # The globally top-ranked ear is always selected, guaranteeing progress.
+    #
+    # Rank is a *hash* of the ring index rather than the index itself, which is what makes the
+    # round count logarithmic. Under the raw index, a ring whose ears alternate (any star polygon)
+    # lets the ear at i - 2 suppress the ear at i for every i, so exactly one ear is clipped per
+    # round and the clipper runs its full ``n``-round cap. Comparing by an effectively random key
+    # instead makes this the textbook maximal-independent-set rule, which retires a constant
+    # fraction of the ears per round.
     i = int(wp.tid())
     out_selected[i] = wp.int32(0)
     if is_ear[i] == 0:
@@ -497,13 +541,13 @@ def select_independent(
     left_i = left[i]
     r = right[i]
     rr = right[right[i]]
-    if is_ear[ll] == 1 and ll < i:
+    if is_ear[ll] == 1 and ear_outranks(ll, i):
         return
-    if is_ear[left_i] == 1 and left_i < i:
+    if is_ear[left_i] == 1 and ear_outranks(left_i, i):
         return
-    if is_ear[r] == 1 and r < i:
+    if is_ear[r] == 1 and ear_outranks(r, i):
         return
-    if is_ear[rr] == 1 and rr < i:
+    if is_ear[rr] == 1 and ear_outranks(rr, i):
         return
     out_selected[i] = wp.int32(1)
 

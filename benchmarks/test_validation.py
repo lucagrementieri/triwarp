@@ -6,12 +6,14 @@ reasons and a face-count sweep separates none of them.
 
 * **valence** for ``is_vertex_manifold``. It solves a miniature connected-components problem in
   every vertex's one-ring, so its cost is the valence *distribution*, not the vertex count.
-* **diameter** for ``face_orientation_bits``. Z2 orientation propagation over the face-adjacency
-  graph is depth-bound: one round per level, so a long strip costs O(V) rounds where a blob costs
-  O(log V). Measured at **7.7 ms on ``sphere_med`` and 633 ms on ``ribbon_long``** -- 82x at an
-  identical vertex count, and the direction reverses against trimesh, which goes 16.8 ms -> 7.8 ms
-  on the same pair. This is the clearest slowness path the axis set exposes and it is entirely
-  invisible to the scan registry, whose meshes are all compact blobs.
+* **diameter** for ``face_orientation_bits``. This is the group that justified the axis. The Z2
+  orientation bits used to be *propagated* across the face-adjacency graph, one launch per level,
+  so a long strip cost O(V) rounds where a blob cost O(log V): **7.7 ms on ``sphere_med`` against
+  633 ms on ``ribbon_long``**, 82x at an identical vertex count, with the direction reversing
+  against trimesh (16.8 ms -> 7.8 ms on the same pair). Entirely invisible to the scan registry,
+  whose meshes are all compact blobs. The bits are now *solved* by a parity-carrying union-find in
+  three launches, which measures **0.92 ms and 0.77 ms** -- flat, and a win over trimesh at both
+  ends. The axis is kept because flatness here is exactly what must not regress.
 * **overlap** for ``is_watertight`` / ``is_volume``. Both compose an edge-count test with a
   self-intersection test over a BVH, so what matters is collision density, not size.
 
@@ -20,7 +22,7 @@ Measured medians (RTX 5090, ``--device=cuda``)
 | group | ``sphere_med`` | perturbed | note |
 |---|---|---|---|
 | ``is_vertex_manifold`` | 1.9 ms | 2.0 ms (``fan_hub``) | valence is not a hot spot |
-| ``face_orientation_bits`` | 7.7 ms | 633 ms (``ribbon_long``) | **82x**, depth-bound |
+| ``face_orientation_bits`` | 0.92 ms | 0.77 ms (``ribbon_long``) | flat (was 7.7 -> 633 ms) |
 | ``is_watertight`` | 3.7 ms | 3.5 ms (``tangle_2``) | flat; the references are not |
 
 References
@@ -88,7 +90,7 @@ def test_is_vertex_manifold(bench_case: BenchCase) -> None:
 @pytest.mark.benchaxis("diameter")
 @pytest.mark.benchlibs("triwarp", "trimesh")
 def test_face_orientation_bits(bench_case: BenchCase) -> None:
-    """Z2 orientation propagation: one round per graph level, so depth is the whole cost."""
+    """Z2 orientation bits as a parity union-find: three launches, so depth costs nothing."""
     if bench_case.kind == "triwarp":
         faces = bench_case.faces_wp
         _bits, _edges, _seeds, n_components = bench_case.run(

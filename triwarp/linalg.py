@@ -51,9 +51,16 @@ CG_TOLERANCE = 1e-10
 # hand-rolled ``maxiter=10 * n``.
 CG_MAXITER_FACTOR = 10
 
-# How often the conjugate-gradient loop tests the residual against the tolerance. Warp's own
-# default; see the ``check_every`` parameter docs for why raising it does not pay.
-CG_CHECK_EVERY = 10
+# How often the conjugate-gradient loop tests the residual against the tolerance. ``0`` means
+# "every iteration, on device": ``warp.optim.linear`` then drives the loop with ``wp.capture_while``
+# and an on-device condition kernel, with no host readback at all. See the ``check_every`` parameter
+# docs for the measurements and for the return-type consequence.
+CG_CHECK_EVERY = 0
+
+# Cadence substituted for ``check_every=0`` on a device without conditional CUDA graphs, where Warp
+# cannot test the residual on device and would otherwise run every solve to ``maxiter``. Warp's own
+# default, and what this module shipped before the device-side check became the default.
+CG_CHECK_EVERY_FALLBACK = 10
 
 
 def min_quad_with_fixed(
@@ -62,6 +69,7 @@ def min_quad_with_fixed(
     fixed_values: twt.Array2dFloat,
     *,
     tol: float = CG_TOLERANCE,
+    check_every: int = CG_CHECK_EVERY,
 ) -> tuple[twt.Array2dFloat, wp.array[wp.int32], int]:
     """
     Minimize a quadratic form with pinned degrees of freedom (``igl::min_quad_with_fixed``).
@@ -83,6 +91,11 @@ def min_quad_with_fixed(
         read.
     tol
         Relative residual tolerance for the conjugate-gradient solve.
+    check_every
+        Iterations between residual tests, forwarded to
+        [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]. The default tests on device every
+        iteration; see there for the measured tradeoff. This entry point's own return type does not
+        depend on it — the solver's ``(iterations, residual, atol)`` triple is not surfaced here.
 
     Returns
     -------
@@ -115,7 +128,13 @@ def min_quad_with_fixed(
     require_cuda(device, "min_quad_with_fixed")
 
     q_uu, rhs = assemble_interior_system(q, fixed_mask, free_map, fixed_values, n_free)
-    solve_spd_columns(q_uu, rhs, twt.as_array2d_float(solution, dtype=wp.float64), tol=tol)
+    solve_spd_columns(
+        q_uu,
+        rhs,
+        twt.as_array2d_float(solution, dtype=wp.float64),
+        tol=tol,
+        check_every=check_every,
+    )
     return twt.as_array2d_float(solution, dtype=wp.float64), free_map, n_free
 
 
@@ -234,6 +253,21 @@ def solve_spd_columns(
     their sum. ``solution`` is used as the initial guess (warm starting is therefore free) and is
     overwritten in place.
 
+    !!! warning "``check_every=0`` returns device arrays, not host scalars"
+        Under the default ``check_every=0`` nothing is ever read back, so the three returned values
+        are 1-element **device arrays** — and the second and third are the *squared* residual norm
+        and *squared* absolute tolerance, matching ``warp.optim.linear.cg``. Code that formats or
+        compares them must call ``.numpy()`` first, which reintroduces the host sync the setting
+        exists to avoid. Pass a positive ``check_every`` to get host scalars back. ``solution`` is
+        unaffected either way.
+
+        On a device without conditional CUDA graphs there is nowhere to put the device-side test,
+        so ``check_every=0`` is replaced by
+        [`CG_CHECK_EVERY_FALLBACK`][triwarp.linalg.CG_CHECK_EVERY_FALLBACK] and host scalars come
+        back instead. Warp's own behaviour in that case is to run every solve to ``maxiter`` —
+        ``CG_MAXITER_FACTOR * n`` iterations of guaranteed waste — so substituting the cadence is
+        the only usable reading of the request.
+
     Parameters
     ----------
     matrix
@@ -247,31 +281,47 @@ def solve_spd_columns(
     maxiter
         Iteration cap. Defaults to ``CG_MAXITER_FACTOR * n``.
     check_every
-        How many iterations run between residual tests. See Notes: the default is the only setting
-        that is not measurably worse, and ``0`` changes the return type.
+        How many iterations run between residual tests. ``0`` (the default) tests every iteration
+        on device; see Notes for the measurements and the warning above for what it does to the
+        return type.
 
     Returns
     -------
     tuple[int, float, float]
         ``(iterations, residual_norm, absolute_tolerance)`` as returned by
-        ``warp.optim.linear.cg``, with the residual taken over the worst column. With
-        ``check_every=0`` these are 1-element **device arrays** instead of host scalars, because
-        nothing is ever read back.
+        ``warp.optim.linear.cg``, with the residual taken over the worst column. Device arrays
+        rather than host scalars under ``check_every=0``; see the warning above.
 
     Notes
     -----
     ``check_every`` is a pure performance knob — it cannot change the converged answer, only how far
-    past the tolerance the solver may overshoot before it notices. Measured on an RTX 5090 over the
-    ARAP solves of `benchmarks/test_parametrization.py`:
+    past the tolerance the solver may overshoot before it notices. Two regimes have been measured on
+    an RTX 5090, and they disagree, so read the one that matches the caller:
 
-    - **Raising it (25, 50) is a loss** of 0 % to 6 %. The readback it saves costs about 0.1 ms,
-      while the up-to-``check_every - 1`` extra iterations it causes are real work — the smaller the
-      solve, the worse the trade.
-    - **``0`` is neutral to slightly positive** (0.93x to 1.00x) and makes the whole solve
-      CUDA-graph capturable: ``warp.optim.linear`` then drives the loop with ``wp.capture_while``
-      and an on-device condition kernel, so it converges device-side with *no* host readback and
-      tests every iteration rather than every tenth. It requires conditional-CUDA-graph support and
-      changes the return type, so it is opt-in rather than the default.
+    - **Cold single solves** — one ``cg`` call from a zero initial guess, the shape
+      ``harmonic`` / ``tutte`` / ``position_verts_smoothly`` take. Measured on
+      `benchmarks/test_linalg.py`'s ``solve_spd_columns`` group, ``0`` against ``10``: 22.8 vs
+      31.7 ms well-conditioned and 104.7 vs 154.1 ms ill-conditioned, **28-32 % faster on both**.
+      This is the regime the default is set for.
+    - **Warm-started solves inside an iteration loop** — ``arap``, whose right-hand side changes
+      every iteration so each solve still runs tens of CG iterations from the previous answer.
+      Measured on `benchmarks/test_parametrization.py`, ``0`` is **neutral to positive** (0.90x to
+      1.00x): fewer readbacks, and enough iterations for them to matter a little.
+    - **Repeated near-converged solves over one [`spd_column_solver`]
+      [triwarp.linalg.spd_column_solver] state** — the same right-hand side re-solved back to back,
+      so every call after the first converges in one or two iterations. Here ``0`` is a **2x loss**:
+      49.6 ms against 24.5 ms for 50 calls on a 2 562-vertex system. The conditional-graph loop
+      costs about **0.5 ms per call** regardless of iteration count, which a solve that short cannot
+      recover. Pass a positive ``check_every`` to a state driven that way; a single cold call
+      through the same state is still 1.2x *faster* at ``0``.
+    - **Raising it (25, 50) is a loss** of 0 % to 6 % in every regime. The readback it saves costs
+      about 0.1 ms, while the up-to-``check_every - 1`` extra iterations it causes are real work —
+      the smaller the solve, the worse the trade.
+
+    So the device-side check scales with how much work a single ``cg`` call does: a large win on
+    long solves, a wash on medium ones, and a loss only once the solve is shorter than the
+    graph-launch overhead. The earlier "opt-in rather than the default" note recorded only the
+    middle regime.
 
     See Also
     --------
@@ -289,7 +339,7 @@ def solve_spd_columns(
         tol=tol,
         maxiter=maxiter if maxiter is not None else CG_MAXITER_FACTOR * n,
         M=preconditioner,
-        check_every=check_every,
+        check_every=_supported_check_every(check_every),
     )
 
 
@@ -327,13 +377,16 @@ def spd_column_solver(
         Iteration cap. Defaults to ``CG_MAXITER_FACTOR * n``.
     check_every
         Iterations between residual tests; see
-        [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] for the measured tradeoff.
+        [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] for the measured tradeoff and for
+        what the default ``0`` does to the values each call returns.
 
     Returns
     -------
     ``warp.optim.linear.LinearSolverState``
         Callable solver state. Substituted operands must match the construction-time shape, dtype,
-        device and batch layout.
+        device and batch layout. Each call returns what
+        [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] returns, including its
+        ``check_every=0`` device arrays.
 
     Examples
     --------
@@ -359,7 +412,7 @@ def spd_column_solver(
         tol=tol,
         maxiter=maxiter if maxiter is not None else CG_MAXITER_FACTOR * n,
         M=preconditioner,
-        check_every=check_every,
+        check_every=_supported_check_every(check_every),
         run=False,
     )
 
@@ -434,3 +487,17 @@ def replicated_operator(
     return wpl.LinearOperator(
         (total, total), base.dtype, base.device, matvec, batch_offsets=offsets
     )
+
+
+def _supported_check_every(check_every: int) -> int:
+    """
+    Substitute a host-side cadence for ``check_every=0`` where the device cannot test on device.
+
+    ``warp.optim.linear`` implements ``check_every=0`` with ``wp.capture_while``; without
+    conditional CUDA graphs it has nowhere to put the test and runs every solve to ``maxiter``
+    instead. Falling back to [`CG_CHECK_EVERY_FALLBACK`][triwarp.linalg.CG_CHECK_EVERY_FALLBACK]
+    keeps the request's *meaning* (stop when converged) at the cost of its return type.
+    """
+    if check_every == 0 and not wp.is_conditional_graph_supported():
+        return CG_CHECK_EVERY_FALLBACK
+    return check_every

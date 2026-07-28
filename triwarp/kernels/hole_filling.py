@@ -374,95 +374,189 @@ def combine_metric(accumulated: wp.float32, term: wp.float32, combine_id: wp.int
     return accumulated + term
 
 
+@wp.func
+def char_area_from_max(max_edge_sq: wp.float32) -> wp.float32:
+    # MeshLib's ``char_area`` scale for the complex-fill metric: 1 / maxEdgeLengthSq, or 1 for a
+    # fully degenerate rim.
+    if max_edge_sq > 0.0:
+        return 1.0 / max_edge_sq
+    return 1.0
+
+
 @wp.kernel
-def closed_edge_sq_lengths(
-    loop_pos: wp.array[wp.vec3], n: wp.int32, out_sq: wp.array[wp.float32]
+def loop_rim_metrics(
+    flat_loops: wp.array[wp.int32],
+    loop_id: wp.array[wp.int32],
+    loop_starts: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    vertices: wp.array[wp.vec3],
+    out_max_edge_sq: wp.array[wp.float32],
+    out_normal: wp.array[wp.vec3],
 ) -> None:
-    # Squared length of each closed-loop rim edge ``loop[i] -> loop[(i + 1) % n]``; the max feeds
-    # the ``char_area`` (1 / maxEdgeLengthSq) scale of the complex-fill metric.
-    i = int(wp.tid())
-    d = loop_pos[_wrap(i + 1, n)] - loop_pos[i]
-    out_sq[i] = wp.length_sq(d)
+    # One thread per rim vertex of every loop at once. Each thread owns the rim edge leaving its
+    # vertex and folds it into its loop's two per-loop scalars: the longest edge (segmented max,
+    # the ``char_area`` scale) and the Newell normal sum (segmented sum, the hole plane). The
+    # per-loop equivalents are ``tw.reduce.max`` over a gathered rim and
+    # ``tw.polyline.polyline_normal``, each of which costs a host synchronization per loop.
+    t = int(wp.tid())
+    ell = loop_id[t]
+    o = loop_starts[ell]
+    b = loop_sizes[ell]
+    a = vertices[flat_loops[t]]
+    c = vertices[flat_loops[o + _wrap(t - o + 1, b)]]
+    wp.atomic_max(out_max_edge_sq, ell, wp.length_sq(c - a))
+    wp.atomic_add(out_normal, ell, wp.cross(a, c))
 
 
 @wp.kernel
-def init_dp_base(dp: wp.array2d[wp.float32], prev: wp.array2d[wp.int32], b: wp.int32) -> None:
+def loop_perimeters(
+    flat_loops: wp.array[wp.int32],
+    loop_id: wp.array[wp.int32],
+    loop_starts: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    vertices: wp.array[wp.vec3],
+    out_perimeter: wp.array[wp.float32],
+) -> None:
+    # Segmented ``closed_polyline_length``: the arc length of every loop in one launch, so
+    # ``preserve_largest_hole`` costs one readback instead of two per loop.
+    t = int(wp.tid())
+    ell = loop_id[t]
+    o = loop_starts[ell]
+    b = loop_sizes[ell]
+    a = vertices[flat_loops[t]]
+    c = vertices[flat_loops[o + _wrap(t - o + 1, b)]]
+    wp.atomic_add(out_perimeter, ell, wp.length(c - a))
+
+
+@wp.kernel
+def init_dp_base(
+    loop_sizes: wp.array[wp.int32],
+    dp_offsets: wp.array[wp.int32],
+    active: wp.array[wp.int32],
+    out_dp: wp.array[wp.float32],
+    out_prev: wp.array[wp.int32],
+) -> None:
     # dp[i, j] = min metric to triangulate the sub-polygon on chord (i, j) and the arc i..j;
-    # adjacent spans (rim edges) cost 0, everything else starts unfilled.
-    i, j = wp.tid()
-    prev[i, j] = -1
-    if j == i + 1:
-        dp[i, j] = 0.0
-    else:
-        dp[i, j] = BAD_METRIC
+    # adjacent spans (rim edges) cost 0, everything else starts unfilled. The ragged table packs
+    # every loop's ``B x B`` block end to end, so loop ``ell`` owns
+    # ``out_dp[dp_offsets[ell] + i * B + j]``. Launched over ``(n_loops, max_B)`` with one thread
+    # per row: rows past a loop's own ``B`` exit immediately.
+    ell, i = wp.tid()
+    if active[ell] == 0:
+        return
+    b = loop_sizes[ell]
+    if i >= b:
+        return
+    row = dp_offsets[ell] + i * b
+    for j in range(b):
+        out_prev[row + j] = -1
+        if j == i + 1:
+            out_dp[row + j] = 0.0
+        else:
+            out_dp[row + j] = BAD_METRIC
 
 
 @wp.kernel(enable_backward=False)
 def fill_dp_span(
     loop_pos: wp.array[wp.vec3],
-    plane_normal: wp.vec3,
-    forbidden: wp.array2d[wp.int32],
+    loop_starts: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    dp_offsets: wp.array[wp.int32],
+    active: wp.array[wp.int32],
+    plane_normals: wp.array[wp.vec3],
+    forbidden: wp.array[wp.int32],
     rim_opp_pos: wp.array[wp.vec3],
     rim_opp_valid: wp.array[wp.int32],
-    char_area: wp.float32,
+    char_areas: wp.array[wp.float32],
     metric_id: wp.int32,
     combine_id: wp.int32,
     smooth_bd: wp.int32,
     span: wp.int32,
-    b: wp.int32,
-    dp: wp.array2d[wp.float32],
-    prev: wp.array2d[wp.int32],
+    dp: wp.array[wp.float32],
+    prev: wp.array[wp.int32],
 ) -> None:
-    # One thread per span-``span`` interval (i, j = i + span); reads only strictly smaller spans, so
-    # successive launches (span = 2, 3, ...) are the DP barriers. Adds per-edge (dihedral) terms for
-    # the interior chords (i, k) / (k, j) using the neighbouring sub-interval's apex, and the
-    # boundary (smoothBd) rim edges using the existing face's opposite vertex.
-    i = int(wp.tid())
-    j = i + span
-    if forbidden[i, j] != 0:
-        # Interior chord would duplicate an existing mesh edge (non-manifold) — leave it unfilled.
-        dp[i, j] = BAD_METRIC
-        prev[i, j] = -1
+    # One thread per span-``span`` interval (i, j = i + span) of every loop at once; reads only
+    # strictly smaller spans, so successive launches (span = 2, 3, ...) are the DP barriers. Adds
+    # per-edge (dihedral) terms for the interior chords (i, k) / (k, j) using the neighbouring
+    # sub-interval's apex, and the boundary (smoothBd) rim edges using the existing face's opposite
+    # vertex.
+    #
+    # Launched over ``(n_loops, max_B - span)``: threads whose loop is shorter than the current
+    # span exit at once, so a mesh whose loops differ wildly in length wastes some of the grid, but
+    # the launch *count* is ``max_B - 1`` for the whole mesh instead of ``B - 1`` per loop.
+    ell, i = wp.tid()
+    if active[ell] == 0:
         return
-    a_pos = loop_pos[i]
-    c_pos = loop_pos[j]
+    b = loop_sizes[ell]
+    if span >= b or i >= b - span:
+        return
+    j = i + span
+    base = dp_offsets[ell]
+    if forbidden[base + i * b + j] != 0:
+        # Interior chord would duplicate an existing mesh edge (non-manifold) — leave it unfilled.
+        dp[base + i * b + j] = BAD_METRIC
+        prev[base + i * b + j] = -1
+        return
+    o = loop_starts[ell]
+    plane_normal = plane_normals[ell]
+    char_area = char_areas[ell]
+    a_pos = loop_pos[o + i]
+    c_pos = loop_pos[o + j]
     is_top = i == 0 and j == b - 1
     best_val = FLOAT32_INF_CONSTANT
     best_k = int(-1)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
     for k in range(i + 1, j):
-        k_pos = loop_pos[k]
+        k_pos = loop_pos[o + k]
         tri = triangle_fill_metric(a_pos, k_pos, c_pos, plane_normal, char_area, metric_id)
-        val = combine_metric(dp[i, k], dp[k, j], combine_id)
+        val = combine_metric(dp[base + i * b + k], dp[base + k * b + j], combine_id)
         val = combine_metric(val, tri, combine_id)
 
         # Edge (i, k): neighbour on the other side is the sub-triangulation apex, or (rim edge) the
         # existing face's opposite vertex.
         if k > i + 1:
-            if prev[i, k] >= 0:
-                e = fill_edge_term(a_pos, k_pos, loop_pos[prev[i, k]], c_pos, metric_id)
+            if prev[base + i * b + k] >= 0:
+                e = fill_edge_term(
+                    a_pos, k_pos, loop_pos[o + prev[base + i * b + k]], c_pos, metric_id
+                )
                 val = combine_metric(val, e, combine_id)
-        elif smooth_bd != 0 and rim_opp_valid[i] != 0:
-            e = fill_edge_term(a_pos, k_pos, rim_opp_pos[i], c_pos, metric_id)
+        elif smooth_bd != 0 and rim_opp_valid[o + i] != 0:
+            e = fill_edge_term(a_pos, k_pos, rim_opp_pos[o + i], c_pos, metric_id)
             val = combine_metric(val, e, combine_id)
 
         # Edge (k, j).
         if j > k + 1:
-            if prev[k, j] >= 0:
-                e = fill_edge_term(k_pos, c_pos, loop_pos[prev[k, j]], a_pos, metric_id)
+            if prev[base + k * b + j] >= 0:
+                e = fill_edge_term(
+                    k_pos, c_pos, loop_pos[o + prev[base + k * b + j]], a_pos, metric_id
+                )
                 val = combine_metric(val, e, combine_id)
-        elif smooth_bd != 0 and rim_opp_valid[k] != 0:
-            e = fill_edge_term(k_pos, c_pos, rim_opp_pos[k], a_pos, metric_id)
+        elif smooth_bd != 0 and rim_opp_valid[o + k] != 0:
+            e = fill_edge_term(k_pos, c_pos, rim_opp_pos[o + k], a_pos, metric_id)
             val = combine_metric(val, e, combine_id)
 
         # Closing rim edge (loop[b-1] -> loop[0]) is the base of the whole loop and has no parent,
         # so its boundary term is added here for the top interval only.
-        if is_top and smooth_bd != 0 and rim_opp_valid[b - 1] != 0:
-            e = fill_edge_term(a_pos, c_pos, rim_opp_pos[b - 1], k_pos, metric_id)
+        if is_top and smooth_bd != 0 and rim_opp_valid[o + b - 1] != 0:
+            e = fill_edge_term(a_pos, c_pos, rim_opp_pos[o + b - 1], k_pos, metric_id)
             val = combine_metric(val, e, combine_id)
 
         update_argmin(best_val, best_k, val, k)
-    dp[i, j] = best_val
-    prev[i, j] = best_k
+    dp[base + i * b + j] = best_val
+    prev[base + i * b + j] = best_k
+
+
+@wp.kernel
+def flag_bad_triangulations(
+    loop_sizes: wp.array[wp.int32],
+    dp_offsets: wp.array[wp.int32],
+    dp: wp.array[wp.float32],
+    out_retry: wp.array[wp.int32],
+) -> None:
+    # Per-loop min-area retry mask: the whole-loop interval is dp[0, B - 1]. Testing it on device
+    # replaces copying every loop's ``B x B`` table to the host to read one scalar out of it.
+    ell = int(wp.tid())
+    top = dp[dp_offsets[ell] + loop_sizes[ell] - 1]
+    out_retry[ell] = wp.where(top >= BAD_METRIC, wp.int32(1), wp.int32(0))
 
 
 # --- Metric-based two-hole stitching (grid DP, port of MRMeshFillHole.cpp stitchHoles) ---------
@@ -618,7 +712,10 @@ def edge_third_vertex(faces: wp.array[wp.int32], out_third: wp.array[wp.int32]) 
 
 @wp.kernel
 def rim_opposite_from_table(
-    loop: wp.array[wp.int32],
+    flat_loops: wp.array[wp.int32],
+    loop_id: wp.array[wp.int32],
+    loop_starts: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
     vertices: wp.array[wp.vec3],
     sorted_keys: wp.array[wp.uint64],
     sorted_rows: wp.array[wp.int32],
@@ -627,56 +724,66 @@ def rim_opposite_from_table(
     out_positions: wp.array[wp.vec3],
     out_valid: wp.array[wp.int32],
 ) -> None:
-    # Per rim edge (loop[i], loop[i+1]): probe the sorted packed-edge table; a single hit means
-    # exactly one adjacent existing face, whose third vertex blends the fill dihedral metrics
-    # into the surface (host dict semantics of the former _rim_opposite).
-    i = int(wp.tid())
-    b = loop.shape[0]
-    u = loop[i]
-    v = loop[(i + 1) % b]
+    # Per rim edge (loop[i], loop[i+1]) of every loop at once: probe the sorted packed-edge table;
+    # a single hit means exactly one adjacent existing face, whose third vertex blends the fill
+    # dihedral metrics into the surface (host dict semantics of the former _rim_opposite).
+    t = int(wp.tid())
+    ell = loop_id[t]
+    o = loop_starts[ell]
+    u = flat_loops[t]
+    v = flat_loops[o + _wrap(t - o + 1, loop_sizes[ell])]
     lo_v = wp.min(u, v)
     hi_v = wp.max(u, v)
     key = wp.uint64(wp.uint32(lo_v)) + wp.uint64(wp.uint32(hi_v)) * max_index
     lo_idx = kernel_array.binary_search_index_left(sorted_keys, key)
     hi_idx = kernel_array.binary_search_index(sorted_keys, key)
-    out_positions[i] = wp.vec3(0.0, 0.0, 0.0)
-    out_valid[i] = wp.int32(0)
+    out_positions[t] = wp.vec3(0.0, 0.0, 0.0)
+    out_valid[t] = wp.int32(0)
     if hi_idx - lo_idx == 1:
-        out_positions[i] = vertices[thirds[sorted_rows[lo_idx]]]
-        out_valid[i] = wp.int32(1)
+        out_positions[t] = vertices[thirds[sorted_rows[lo_idx]]]
+        out_valid[t] = wp.int32(1)
 
 
 @wp.kernel
-def scatter_loop_positions(loop: wp.array[wp.int32], out_position: wp.array[wp.int32]) -> None:
-    # Highest position wins on duplicate loop vertices, matching the last-write-wins dict the
-    # host implementation built (dict insertion followed ascending positions).
-    i = int(wp.tid())
-    wp.atomic_max(out_position, loop[i], wp.int32(i))
+def scatter_loop_positions(
+    flat_loops: wp.array[wp.int32], out_flat_slot: wp.array[wp.int32]
+) -> None:
+    # Where each mesh vertex sits in the packed loop buffer, for the chord test below. The value
+    # stored is the *flat* index, which is globally unique and increases with position inside a
+    # loop — so the highest position still wins on a duplicated loop vertex (matching the
+    # last-write-wins dict the host implementation built), and a pinch vertex shared by two loops
+    # resolves to the later loop rather than needing the scratch cleared between loops.
+    t = int(wp.tid())
+    wp.atomic_max(out_flat_slot, flat_loops[t], wp.int32(t))
 
 
 @wp.kernel
 def mark_forbidden_chords(
     edges_sorted: wp.array2d[wp.int32],
-    position: wp.array[wp.int32],
-    b: wp.int32,
-    out_mask: wp.array2d[wp.int32],
+    flat_slot: wp.array[wp.int32],
+    loop_id: wp.array[wp.int32],
+    loop_starts: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    dp_offsets: wp.array[wp.int32],
+    out_mask: wp.array[wp.int32],
 ) -> None:
     # Chords (non-adjacent loop positions) that already exist as mesh edges are forbidden
-    # (MeshLib MultipleEdgesResolveMode::Simple). Idempotent writes: no atomics needed.
+    # (MeshLib MultipleEdgesResolveMode::Simple). Idempotent writes: no atomics needed. One pass
+    # over the whole mesh marks the masks of *all* loops, because ``flat_slot`` distinguishes them:
+    # an edge whose endpoints land in two different loops is not a chord of either.
     e = int(wp.tid())
-    pu = position[edges_sorted[e, 0]]
-    pv = position[edges_sorted[e, 1]]
-    if pu < 0 or pv < 0:
+    tu = flat_slot[edges_sorted[e, 0]]
+    tv = flat_slot[edges_sorted[e, 1]]
+    if tu < 0 or tv < 0:
         return
-    lo = wp.min(pu, pv)
-    hi = wp.max(pu, pv)
-    if hi - lo >= 2 and hi - lo <= int(b) - 2:
-        out_mask[lo, hi] = wp.int32(1)
-        out_mask[hi, lo] = wp.int32(1)
-
-
-@wp.kernel
-def clear_loop_positions(loop: wp.array[wp.int32], out_position: wp.array[wp.int32]) -> None:
-    # Reset the touched slots so the (n_vertices,) scratch is reusable across loops.
-    i = int(wp.tid())
-    out_position[loop[i]] = wp.int32(-1)
+    ell = loop_id[tu]
+    if ell != loop_id[tv]:
+        return
+    b = loop_sizes[ell]
+    o = loop_starts[ell]
+    lo = wp.min(tu, tv) - o
+    hi = wp.max(tu, tv) - o
+    if hi - lo >= 2 and hi - lo <= b - 2:
+        base = dp_offsets[ell]
+        out_mask[base + lo * b + hi] = wp.int32(1)
+        out_mask[base + hi * b + lo] = wp.int32(1)

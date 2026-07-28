@@ -13,13 +13,18 @@ Three knobs are swept on top of it, each isolating a different lever:
 * **fixed fraction** -- ``min_quad_with_fixed`` extracts the free-free block, whose ``nnz`` goes as
   ``(n_free / n)^2``, and a larger fixed set is also a better-conditioned system. Pinning 1% of the
   vertices against 50% moves both at once, which is what a caller actually chooses between. The
-  returned iteration count is asserted on, so a run that silently stops converging fails rather
-  than reporting a suspiciously good time.
+  returned free-degree-of-freedom count is asserted on, so a run that accidentally pins everything
+  -- and therefore skips the solve entirely -- fails rather than reporting a suspiciously good
+  time. It is *not* an iteration count: ``min_quad_with_fixed`` returns
+  ``(solution, free_map, n_free)`` and never surfaces one.
 * **check_every** -- how often ``solve_spd_columns`` tests the residual. ``1`` checks every
-  iteration (a host sync each time); ``0`` tests it on device via ``wp.capture_while``. Skipping
-  checks trades syncs for possibly-wasted iterations, and which side wins is a measurement, not a
-  derivation -- read this sweep together with the mesh pair, because on a well-conditioned system
-  the syncs dominate and on a badly conditioned one they should not.
+  iteration with a host sync each time; ``0`` (now the default) tests every iteration on device via
+  ``wp.capture_while``, with no readback at all. Skipping checks trades syncs for possibly-wasted
+  iterations, and which side wins is a measurement, not a derivation -- read this sweep together
+  with the mesh pair, because on a well-conditioned system the syncs dominate and on a badly
+  conditioned one they should not. It is this group that flipped the default: against the former
+  ``10`` the on-device row measured 22.8 vs 31.7 ms on ``saddle`` and 104.7 vs 154.1 ms on
+  ``saddle_graded``, 28-32 % on both.
 * **repeat count** -- ``spd_column_solver`` preallocates its temporaries and batch layout for reuse,
   which is what ``parametrization.arap`` builds outside its iteration loop. One solve against fifty
   is the amortization question: if ``x50`` lands near 50x ``once``, the preallocation is not earning
@@ -132,11 +137,11 @@ def test_min_quad_with_fixed(bench_case: BenchCase, fixed_fraction: float) -> No
     _skip_cpu(bench_case)
     operator = _operator(bench_case)
     fixed_mask, fixed_values = _fixed(bench_case, fixed_fraction)
-    solution, _free_map, iterations = bench_case.run(
+    solution, _free_map, n_free = bench_case.run(
         lambda: tw.linalg.min_quad_with_fixed(operator, fixed_mask, fixed_values)
     )
     assert solution.shape[0] == _N_RHS
-    assert iterations > 0, "a zero-iteration solve means the system was already converged"
+    assert n_free > 0, "a fully-pinned system returns without solving, so there is nothing to time"
 
 
 @pytest.mark.benchmark(group="solve_spd_columns")
@@ -174,6 +179,13 @@ def test_spd_column_solver_amortized(bench_case: BenchCase, repeats: int) -> Non
     ``parametrization.arap`` drives it -- so the later solves in the ``x50`` row are converging from
     a good guess and should be much cheaper than the first. That is the effect being measured; a
     ``x50`` row near 50x ``once`` would mean the reuse is buying nothing.
+
+    Unlike ``arap``, this group re-solves the *same* right-hand side, so calls 2..50 are essentially
+    no-ops -- which makes it the sharpest probe in the suite of per-call solver overhead. It is what
+    caught the one regime where the default ``check_every=0`` loses: the conditional-graph loop
+    costs ~0.5 ms a call whatever it does, so this row runs 2x slower than at ``check_every=10``
+    while every other solver group got faster. See the ``check_every`` notes on
+    ``triwarp.linalg.solve_spd_columns``.
     """
     _skip_cpu(bench_case)
     operator, rhs = _operator(bench_case), _rhs(bench_case)

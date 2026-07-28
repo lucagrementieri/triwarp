@@ -13,9 +13,15 @@ from triwarp.kernels import graph as kernel_graph
 from triwarp.kernels.algorithms import bfs as kernel_bfs
 from triwarp.kernels.algorithms import connected_components as kernel_connected_components
 
-# Below this node count the single-thread BFS kernel wins: the frontier-parallel path pays one
-# launch + sync per BFS level, which dominates on small or path-like graphs.
-_BFS_SERIAL_THRESHOLD = 16_384
+# Frontier width at which the level-synchronous BFS hands the rest of the traversal to one serial
+# thread. A level costs a fixed ~13 us of launch overhead whatever its frontier, while the serial
+# walk costs ~0.5 us a node (measured, RTX 5090), so the two break even around 26 nodes wide.
+#
+# This replaces a ``node_count < 16384`` guard, which was the wrong predicate: its own comment named
+# the failure mode as "small **or path-like**" but a node count only detects "small", and no static
+# function of ``(node_count, nnz)`` separates a ribbon (average degree 4.0) from a sphere (6.0).
+# Frontier width is observable and is the quantity that actually decides it.
+_BFS_ESCAPE_FRONTIER = 32
 
 
 def edges_to_csr(node_count: int, edges: twt.Array2dInt32) -> wps.BsrMatrix[wp.float32]:
@@ -127,7 +133,7 @@ def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[
 
 
 def connected_component_labels_from_edges(
-    edges: twt.Array2dInt32, node_count: int | None = None
+    edges: twt.Array2dInt32, node_count: int | None = None, *, validate: bool = True
 ) -> wp.array[wp.int32]:
     """
     Per-node connected-component labels from an undirected edge list.
@@ -143,6 +149,10 @@ def connected_component_labels_from_edges(
     node_count
         Number of nodes ``0 .. node_count - 1``. When ``None``, inferred as
         ``max(edges) + 1`` if ``m > 0``, else ``0``.
+    validate
+        When ``False``, skip the range check on ``edges`` and its host readback. Requires
+        ``node_count``; see the warning below. Follows the same convention as
+        [`group_int_rows`][triwarp.grouping.group_int_rows].
 
     Returns
     -------
@@ -155,9 +165,20 @@ def connected_component_labels_from_edges(
         If ``edges`` is not ``(m, 2)``, an endpoint is outside ``[0, node_count)``,
         or ``node_count`` is negative.
 
+    Warning
+    -------
+    !!! warning "``validate=False`` trades a guard for a synchronization"
+        The range check copies the whole ``(m, 2)`` edge buffer to the host, so it costs a device
+        synchronization on a path that otherwise has none. Pass ``validate=False`` **only** when
+        the caller produced ``edges`` itself and knows the bound holds — an adjacency list from
+        [`face_adjacency`][triwarp.adjacency.face_adjacency], say. With an out-of-range index the
+        unchecked path reads out of bounds rather than raising.
+
     See Also
     --------
     [`connected_component_labels`][triwarp.graph.connected_component_labels]
+    [`connected_component_parity_from_edges`]
+    [triwarp.graph.connected_component_parity_from_edges]
     [`face_connected_component_labels`][triwarp.adjacency.face_connected_component_labels]
     [`trimesh.graph.connected_component_labels`][]
     """
@@ -174,7 +195,7 @@ def connected_component_labels_from_edges(
         raise ValueError(f"node_count must be non-negative, got {node_count}")
     elif m == 0:
         return init_range(node_count, device)
-    else:
+    elif validate:
         edges_np = edges.numpy()
         if edges_np.min() < 0 or int(edges_np.max()) >= node_count:
             raise ValueError(
@@ -186,18 +207,119 @@ def connected_component_labels_from_edges(
     return connected_component_labels(adjacency)
 
 
+def connected_component_parity_from_edges(
+    edges: twt.Array2dInt32, signs: wp.array[wp.int32], node_count: int
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Component labels plus a Z2 potential satisfying the per-edge parity constraints.
+
+    Each edge ``(a, b)`` carries a sign in ``{0, 1}`` demanding ``parity[a] ^ parity[b] == sign``.
+    On a component where those constraints are consistent this determines ``parity`` uniquely once
+    the component representative is pinned to ``0``, and this function returns exactly that — the
+    discrete analog of a potential function, and the reason it can replace an iterative flood fill.
+
+    Extends ECL-CC by packing ``(parent, parity-to-parent)`` into a single ``int32`` word, so the
+    union-find still hooks with one ``wp.atomic_cas``: **three launches and no host
+    synchronization** whatever the graph's diameter, where propagating the bits edge by edge costs
+    one launch per graph level.
+
+    Parameters
+    ----------
+    edges
+        ``(m, 2)`` ``wp.int32`` undirected edge list; each row ``(a, b)`` constrains ``a`` and
+        ``b``. Endpoints must lie in ``[0, node_count)``. Self-loops are ignored.
+    signs
+        Length-``m`` ``wp.int32`` parity constraint per edge, ``0`` (equal) or ``1`` (opposite).
+    node_count
+        Number of nodes ``0 .. node_count - 1``.
+
+    Returns
+    -------
+    labels : wp.array[wp.int32]
+        Length ``node_count``; the smallest node id in each component, as in
+        [`connected_component_labels`][triwarp.graph.connected_component_labels]. Isolated nodes
+        label themselves.
+    parity : wp.array[wp.int32]
+        Length ``node_count`` of ``0`` / ``1`` bits, ``0`` at every component representative.
+
+    Raises
+    ------
+    ValueError
+        If ``edges`` is not ``(m, 2)``, ``signs`` is not length ``m``, or ``node_count`` is
+        negative.
+
+    Notes
+    -----
+    A component whose constraints are **contradictory** (an odd-signed cycle — a Möbius band, in
+    the orientation application) admits no potential at all. No error is raised: the constraints
+    along whichever spanning tree the union-find happened to build are satisfied and the remaining
+    edges are left violated, so a caller that needs to know must re-test the edges against the
+    returned ``parity``. This is the same best-effort contract a flood fill gives.
+
+    See Also
+    --------
+    [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
+    [`face_orientation_bits`][triwarp.validation.face_orientation_bits]
+    """
+    twt.ensure_ndim(edges, 2, dtype=wp.int32)
+    if int(edges.shape[1]) != 2:
+        raise ValueError(f"edges must have shape (m, 2), got {edges.shape}")
+    m = int(edges.shape[0])
+    if int(signs.shape[0]) != m:
+        raise ValueError(f"signs must have length {m} to match edges, got {int(signs.shape[0])}")
+    if node_count < 0:
+        raise ValueError(f"node_count must be non-negative, got {node_count}")
+
+    device = edges.device
+    labels = wp.empty(node_count, dtype=wp.int32, device=device)
+    parity = wp.zeros(node_count, dtype=wp.int32, device=device)
+    if node_count == 0:
+        return labels, parity
+
+    words = wp.empty(node_count, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_connected_components.ecl_init_parent_parity,
+        dim=node_count,
+        inputs=[words],
+        device=device,
+    )
+    if m > 0:
+        wp.launch(
+            kernel_connected_components.ecl_hook_parity,
+            dim=m,
+            inputs=[edges, signs, words],
+            device=device,
+        )
+    wp.launch(
+        kernel_connected_components.ecl_flatten_parity,
+        dim=node_count,
+        inputs=[words, labels, parity],
+        device=device,
+    )
+    return labels, parity
+
+
 def bfs(
     adjacency: wps.BsrMatrix[wp.Scalar], source: int
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
     """
     Single-source breadth-first search over a sparse CSR adjacency matrix.
 
-    Runs a serial traversal from ``source`` (one device thread) so the discovery order, parent
-    tree, and distances match [`scipy.sparse.csgraph.breadth_first_order`][] exactly when the
-    adjacency columns are sorted ascending per row (as produced by
-    [`edges_to_csr`][triwarp.graph.edges_to_csr]). This
-    mirrors ``igl::bfs`` (`reference/libigl/include/igl/bfs.cpp`), additionally returning the BFS
-    level of each node.
+    The discovery order, parent tree, and distances match
+    [`scipy.sparse.csgraph.breadth_first_order`][] exactly when the adjacency columns are sorted
+    ascending per row (as produced by [`edges_to_csr`][triwarp.graph.edges_to_csr]). This mirrors
+    ``igl::bfs`` (`reference/libigl/include/igl/bfs.cpp`), additionally returning the BFS level of
+    each node.
+
+    Two engines, chosen by the *observed frontier width* rather than by any property of the graph
+    known up front. The traversal starts level-synchronous and parallel, and hands over to a single
+    serial thread as soon as its frontier is both narrow and no longer growing: a level costs the
+    same seven fixed-size launches whatever it carries, so once the frontier is a handful of nodes
+    the serial walk is cheaper per node than the launches are per level. On a graph that stays wide
+    the handover never fires; on one whose frontier is narrow from the start (a path) it fires
+    almost immediately. Order-exactness survives it by construction — the parallel path builds the
+    same explicit FIFO the serial one drains, so the serial engine just continues from where the
+    queue got to.
 
     Parameters
     ----------
@@ -250,21 +372,17 @@ def bfs(
     distances = wp.full(node_count, -1, dtype=wp.int32, device=device)
     order_buffer = wp.empty(node_count, dtype=wp.int32, device=device)
 
-    if node_count < _BFS_SERIAL_THRESHOLD or device.is_cpu:
-        # Small graphs: per-level launch overhead dominates (a path graph runs one level per
-        # node), so the single-thread traversal is faster and trivially order-exact. The Warp
-        # CPU backend executes kernels serially anyway, so on CPU the single-thread traversal
-        # also beats the frontier loop at every size.
-        reached = wp.zeros(1, dtype=wp.int32, device=device)
+    reached = wp.zeros(1, dtype=wp.int32, device=device)
+    if device.is_cpu:
+        # The Warp CPU backend executes kernels serially anyway, so the frontier loop buys nothing
+        # there at any size and the single-thread traversal is trivially order-exact.
         wp.launch(
             kernel_bfs.single_source_bfs_kernel,
             dim=1,
             inputs=[wp.int32(source), offsets, columns, order_buffer, parents, distances, reached],
             device=device,
         )
-        n_reached = int(reached.numpy()[0])
-        order = wp.clone(order_buffer[:n_reached])
-        return order, parents, distances
+        return wp.clone(order_buffer[: int(reached.numpy()[0])]), parents, distances
 
     # Level-synchronous frontier BFS that reproduces scipy's FIFO discovery order exactly,
     # sort-free: unvisited neighbors are claimed with the parent dequeue rank via atomic_min
@@ -273,9 +391,13 @@ def bfs(
     # ascending CSR column order — (rank, ascending node id), the same order the former int64
     # claim-key radix sort produced. The whole loop runs on device via ``wp.capture_while``
     # (kernels launch at fixed dim=node_count and early-exit on the device-side frontier size),
-    # so the only host sync is the final tail readback; when conditional CUDA graphs are
+    # so the only host sync is the final window readback; when conditional CUDA graphs are
     # unavailable, ``capture_while`` itself falls back to direct execution with one pinned
     # 4-byte condition readback per level.
+    #
+    # The loop also *stops early* once the frontier narrows (``_BFS_ESCAPE_FRONTIER``) and hands
+    # its half-built FIFO to the serial kernel above, which is what keeps a long-diameter graph
+    # from paying seven fixed-size launches for a two-node frontier, tens of thousands of times.
     scan_block = kernel_bfs.BFS_SCAN_BLOCK
     n_blocks = (node_count + scan_block - 1) // scan_block
     padded = n_blocks * scan_block
@@ -314,7 +436,7 @@ def bfs(
             block_dim=scan_block,
             device=device,
         )
-        wp.launch(kernel_bfs.bfs_scan_block_sums, dim=1, inputs=[block_sums], device=device)
+        wp.launch(kernel_bfs.bfs_scan_block_sums, dim=1, inputs=[state, block_sums], device=device)
         wp.launch(
             kernel_bfs.bfs_add_block_offsets,
             dim=node_count,
@@ -336,7 +458,12 @@ def bfs(
             ],
             device=device,
         )
-        wp.launch(kernel_bfs.bfs_update_state, dim=1, inputs=[offsets_scan, state], device=device)
+        wp.launch(
+            kernel_bfs.bfs_update_state,
+            dim=1,
+            inputs=[offsets_scan, wp.int32(_BFS_ESCAPE_FRONTIER), state],
+            device=device,
+        )
 
     condition = state[3:4]
     if wp.is_conditional_graph_supported():
@@ -346,9 +473,20 @@ def bfs(
     else:
         wp.capture_while(condition, bfs_level_body)
 
-    tail = int(state[1:2].numpy()[0])
-    order = wp.clone(order_buffer[:tail])
-    return order, parents, distances
+    # One readback of the FIFO window tells both things there are to know: an empty window means
+    # the traversal ran out of frontier, a non-empty one means it escaped and the serial kernel
+    # takes over from exactly there.
+    window = state[:2].numpy()
+    head, tail = int(window[0]), int(window[1])
+    if head < tail:
+        wp.launch(
+            kernel_bfs.resume_bfs_kernel,
+            dim=1,
+            inputs=[state, offsets, columns, order_buffer, parents, distances, reached],
+            device=device,
+        )
+        tail = int(reached.numpy()[0])
+    return wp.clone(order_buffer[:tail]), parents, distances
 
 
 def bfs_from_edges(

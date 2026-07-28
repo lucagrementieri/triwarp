@@ -308,6 +308,77 @@ def test_connected_component_labels_star_graph(device: str) -> None:
     assert _same_partition(labels_wp.numpy(), labels_exp)
 
 
+def test_connected_component_parity_random(device: str) -> None:
+    # Signs drawn from a hidden potential, so the constraints are consistent everywhere and the
+    # returned parity must reproduce that potential up to a per-component flip.
+    rng = np.random.default_rng(11)
+    n = 4096
+    potential_np = rng.integers(0, 2, size=n).astype(np.int32)
+    a_np = rng.integers(0, n, size=12_000).astype(np.int32)
+    b_np = rng.integers(0, n, size=12_000).astype(np.int32)
+    edges_np = np.stack([a_np, b_np], axis=1)
+    signs_np = (potential_np[a_np] ^ potential_np[b_np]).astype(np.int32)
+
+    edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
+    signs_wp = wp.array(signs_np, dtype=wp.int32, device=device)
+    labels_wp, parity_wp = tw.graph.connected_component_parity_from_edges(edges_wp, signs_wp, n)
+
+    parity_np = parity_wp.numpy()
+    assert np.array_equal(parity_np[a_np] ^ parity_np[b_np], signs_np)
+    assert _same_partition(labels_wp.numpy(), _scipy_component_labels(edges_np, n))
+    # Each component representative anchors its own potential at 0.
+    labels_np = labels_wp.numpy()
+    assert np.array_equal(parity_np[np.unique(labels_np)], np.zeros(len(np.unique(labels_np))))
+
+
+def test_connected_component_parity_long_path(device: str) -> None:
+    # A path is the worst case for edge-by-edge propagation (one level per node) and the case the
+    # union-find is depth-independent on; the potential is then the running XOR of the signs.
+    n = 20_001
+    rng = np.random.default_rng(5)
+    edges_np = np.stack([np.arange(n - 1), np.arange(1, n)], axis=1).astype(np.int32)
+    signs_np = rng.integers(0, 2, size=n - 1).astype(np.int32)
+    edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
+    signs_wp = wp.array(signs_np, dtype=wp.int32, device=device)
+
+    labels_wp, parity_wp = tw.graph.connected_component_parity_from_edges(edges_wp, signs_wp, n)
+    parity_exp = np.concatenate([[0], np.cumsum(signs_np) % 2]).astype(np.int32)
+    assert np.array_equal(parity_wp.numpy(), parity_exp)
+    assert np.array_equal(labels_wp.numpy(), np.zeros(n, dtype=np.int32))
+
+
+def test_connected_component_parity_contradiction_terminates(device: str) -> None:
+    # An odd-signed cycle admits no potential. The contract is best-effort, not an exception: the
+    # call must still terminate and label the component, leaving some edge violated.
+    n = 1025
+    edges_np = np.stack([np.arange(n), (np.arange(n) + 1) % n], axis=1).astype(np.int32)
+    signs_np = np.ones(n, dtype=np.int32)
+    edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
+    signs_wp = wp.array(signs_np, dtype=wp.int32, device=device)
+
+    labels_wp, parity_wp = tw.graph.connected_component_parity_from_edges(edges_wp, signs_wp, n)
+    assert np.array_equal(labels_wp.numpy(), np.zeros(n, dtype=np.int32))
+    parity_np = parity_wp.numpy()
+    assert set(np.unique(parity_np).tolist()) <= {0, 1}
+    violated = parity_np[edges_np[:, 0]] ^ parity_np[edges_np[:, 1]] != signs_np
+    assert violated.sum() >= 1
+
+
+def test_connected_component_parity_no_edges(device: str) -> None:
+    edges_wp = wp.zeros((0, 2), dtype=wp.int32, device=device)
+    signs_wp = wp.zeros(0, dtype=wp.int32, device=device)
+    labels_wp, parity_wp = tw.graph.connected_component_parity_from_edges(edges_wp, signs_wp, 7)
+    assert np.array_equal(labels_wp.numpy(), np.arange(7, dtype=np.int32))
+    assert np.array_equal(parity_wp.numpy(), np.zeros(7, dtype=np.int32))
+
+
+def test_connected_component_parity_signs_length_mismatch(device: str) -> None:
+    edges_wp = wp.zeros((4, 2), dtype=wp.int32, device=device)
+    signs_wp = wp.zeros(3, dtype=wp.int32, device=device)
+    with pytest.raises(ValueError, match="signs must have length 4"):
+        tw.graph.connected_component_parity_from_edges(edges_wp, signs_wp, 4)
+
+
 def test_face_connected_component_labels(request: pytest.FixtureRequest) -> None:
     mesh_a_tm, mesh_a_wp = request.getfixturevalue("icosahedron")
     mesh_b_tm, mesh_b_wp = request.getfixturevalue("hemisphere")
@@ -416,6 +487,45 @@ def test_bfs_path_graph(device: str) -> None:
     assert np.array_equal(distances_wp.numpy(), np.arange(n, dtype=np.int32))
     parents_exp = np.concatenate([[-1], np.arange(n - 1)]).astype(np.int32)
     assert np.array_equal(parents_wp.numpy(), parents_exp)
+
+
+def test_bfs_long_path_graph(device: str) -> None:
+    # A path of 65 536 nodes: one BFS level per node, and a frontier of one throughout. The
+    # level-synchronous loop hands over to the serial resume almost immediately here, so this is
+    # the case that checks the handoff is order-exact and not just fast.
+    n = 65_536
+    edges_np = np.stack([np.arange(n - 1, dtype=np.int32), np.arange(1, n, dtype=np.int32)], axis=1)
+    edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
+
+    order_wp, parents_wp, distances_wp = tw.graph.bfs_from_edges(edges_wp, 0, node_count=n)
+    assert np.array_equal(order_wp.numpy(), np.arange(n, dtype=np.int32))
+    assert np.array_equal(distances_wp.numpy(), np.arange(n, dtype=np.int32))
+    parents_exp = np.concatenate([[-1], np.arange(n - 1)]).astype(np.int32)
+    assert np.array_equal(parents_wp.numpy(), parents_exp)
+
+
+def test_bfs_wide_then_narrow_matches_scipy(device: str) -> None:
+    # A "lollipop": a dense blob whose frontier is wide for a few levels, then a long tail where it
+    # is one node across. The traversal therefore runs parallel levels first and escapes to the
+    # serial resume part-way through -- the mixed case, where an off-by-one in the handed-over FIFO
+    # window would corrupt the discovery order without changing the reachable set.
+    rng = np.random.default_rng(19)
+    blob, tail = 2_000, 6_000
+    blob_edges = np.unique(
+        np.sort(rng.integers(0, blob, size=(40_000, 2)).astype(np.int32), axis=1), axis=0
+    )
+    blob_edges = blob_edges[blob_edges[:, 0] != blob_edges[:, 1]]
+    tail_nodes = np.arange(blob - 1, blob + tail, dtype=np.int32)
+    tail_edges = np.stack([tail_nodes[:-1], tail_nodes[1:]], axis=1)
+    edges_np = np.concatenate([blob_edges, tail_edges]).astype(np.int32)
+    n = blob + tail
+
+    edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
+    order_wp, parents_wp, distances_wp = tw.graph.bfs_from_edges(edges_wp, 0, node_count=n)
+    order_np, parents_np, distances_np = _scipy_bfs(edges_np, n, 0)
+    assert np.array_equal(order_wp.numpy(), order_np)
+    assert np.array_equal(parents_wp.numpy(), parents_np)
+    assert np.array_equal(distances_wp.numpy(), distances_np)
 
 
 def test_bfs_star_graph(device: str) -> None:

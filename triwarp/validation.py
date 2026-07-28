@@ -610,11 +610,17 @@ def face_orientation_bits(
     face-adjacency rows; when ``m == 0`` the returned ``signed_edges`` / ``signs`` are empty.
     Assumes ``n_faces > 0`` (callers guard).
 
-    This is a lower-level primitive (the underlying orientation-propagation engine behind
+    This is a lower-level primitive (the underlying orientation engine behind
     [`is_orientable`][triwarp.validation.is_orientable] and
     [`face_orientation_mask`][triwarp.validation.face_orientation_mask]) exposed for callers that
     need the raw flip bits together with the propagation edges, such as
     [`triwarp.repair.make_winding_consistent`][triwarp.repair.make_winding_consistent].
+
+    The bits are solved, not propagated: ``orient`` is the Z2 potential of the signed
+    face-adjacency graph, computed by a parity-carrying union-find
+    ([`connected_component_parity_from_edges`]
+    [triwarp.graph.connected_component_parity_from_edges]) in a fixed three launches. Cost
+    therefore depends on the mesh's *size*, not on the diameter of its face-adjacency graph.
 
     Parameters
     ----------
@@ -643,16 +649,10 @@ def face_orientation_bits(
     adjacency, adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
     m = int(adjacency.shape[0])
 
-    labels = tw.graph.connected_component_labels_from_edges(adjacency, node_count=n_faces)
-    orient = wp.empty(n_faces, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_validation.seed_orientation, dim=n_faces, inputs=[labels, orient], device=device
-    )
-
     if m == 0:
         signed_edges = twt.empty_int32_2d((0, 2), device=device)
         signs = wp.empty(0, dtype=wp.int32, device=device)
-        return orient, signed_edges, signs, m
+        return wp.zeros(n_faces, dtype=wp.int32, device=device), signed_edges, signs, m
 
     signed_edges = twt.empty_int32_2d((m, 2), device=device)
     signs = wp.empty(m, dtype=wp.int32, device=device)
@@ -663,25 +663,16 @@ def face_orientation_bits(
         device=device,
     )
 
-    changed = wp.zeros(1, dtype=wp.int32, device=device)
-    # Propagation is idempotent (a converged state stays converged), so the device flag is
-    # polled once per batch of launches instead of after every pass: 16x fewer host syncs on
-    # long propagation chains at the cost of at most 15 no-op launches at the end.
-    batch = 16
-    remaining = n_faces
-    while remaining > 0:
-        changed.zero_()
-        for _ in range(min(batch, remaining)):
-            wp.launch(
-                kernel_validation.propagate_orientation,
-                dim=m,
-                inputs=[signed_edges, signs, orient, changed],
-                device=device,
-            )
-            remaining -= 1
-        if changed.numpy().item() == 0:
-            break
-
+    # The flip bits *are* a Z2 potential over the signed face-adjacency graph, so a parity-carrying
+    # union-find produces them directly in three launches with no host synchronization
+    # ([`connected_component_parity_from_edges`]
+    # [triwarp.graph.connected_component_parity_from_edges]). The bits are unchanged from the
+    # edge-by-edge flood fill this replaces: that seeded ``0`` at each component's smallest face id
+    # and XOR-ed signs outward, and the union-find's root is that same smallest id at that same
+    # parity 0. What changes is the cost — the fill ran one launch per graph level, so a mesh whose
+    # face adjacency is a long path (a ribbon) paid tens of thousands of launches and thousands of
+    # readbacks for work bounded by a few milliseconds of bandwidth.
+    _labels, orient = tw.graph.connected_component_parity_from_edges(signed_edges, signs, n_faces)
     return orient, signed_edges, signs, m
 
 

@@ -7,16 +7,21 @@ independent drivers:
 
 * **Loop length**, cubed. ``fill_holes_min_weight`` runs a minimum-weight triangulation DP over a
   ``B x B`` table per loop, filled by ``B - 2`` *sequential* kernel launches and read back to the
-  host for the traceback. Total work is ``sum(B_i^3)``. Measured: two loops of 512 cost 275 ms,
-  two of 1 024 cost **1 025 ms** -- a doubling of ``B`` for 3.7x the time.
-* **Loop count**. Every loop pays a ``.numpy()`` readback, a forbidden-chord table and a host
-  traceback, so 512 tiny loops cost 385 ms almost entirely in host round trips.
+  host for the traceback. Total work is ``sum(B_i^3)`` and no batching can remove it: this is the
+  real cost the module exists to pay. Two loops of 512 measure **157 ms**.
+* **Loop count**, which should cost nothing and used to cost everything. Every loop paid a
+  ``.numpy()`` readback, its own forbidden-chord pass over the whole mesh and its own span
+  launches, so 512 three-vertex holes -- where the DP itself is one triangle per hole -- ran to
+  **376 ms**, *more* than the genuinely expensive ``rim_short``. Batching the DP across loops took
+  that to **4.2 ms** (90x) and, because it also runs ``rim_short``'s two rims concurrently, took
+  that point from 273 to 157 ms as a side effect.
 
-That is why the axis meshes are *small*: ``rim_short`` is 1 024 faces and ``holes_many`` is 81 408,
-yet they cost the same order of magnitude. Face count is not the variable, and sizing these meshes
-up would only add DP table entries that the ``B^3`` term already dominates. ``fill_holes_fan``
-runs on the wider **loops** axis instead, because it has no DP and so can afford ``rim_long``'s
-65 536-vertex rims -- it is the floor this module's cost is measured against.
+That is why the axis meshes are *small*: ``rim_short`` is 1 024 faces and ``holes_many`` is 81 408.
+Face count is not the variable, and sizing these meshes up would only add DP table entries that the
+``B^3`` term already dominates. The two points now differ by 37x in the right direction, which is
+what the axis is for -- the inversion is what said the per-loop sequence was the bug.
+``fill_holes_fan`` runs on the wider **loops** axis instead, because it has no DP and so can afford
+``rim_long``'s 65 536-vertex rims -- it is the floor this module's cost is measured against.
 
 References
 ----------

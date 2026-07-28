@@ -18,7 +18,10 @@ because within a class the kernels differ only in the per-segment expression:
   parallel (it is a recursive split, and Warp forbids recursion), so it runs as a *single-thread*
   stack-based kernel. This is the deliberate outlier of the module and the only case here whose
   cost is O(n) serial work on one GPU thread; expect it to be slower than everything else by
-  orders of magnitude and to be the one function where the CPU would win.
+  orders of magnitude and to be the one function where the CPU would win. Only the *recursion* has
+  to be serial, though: the keep-mask initialization was moved out to a parallel ``fill_``, which
+  this group measured as neutral (25.59 -> 25.53 ms on ``rim_long``) and so is a structural
+  cleanup rather than a win — the recursion dominates by two orders of magnitude.
 
 ``distance_to_polyline`` is timed separately from the rest because it is the only function whose
 cost is the product of two sizes (query points x segments) rather than a function of the polyline

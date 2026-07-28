@@ -3,10 +3,12 @@ Breadth-first search over a CSR adjacency graph.
 
 Two traversal cores:
 
-- :func:`single_source_bfs` — one Warp thread walks the whole graph from a single source using a
-  dense ``dist`` array as the visited marker (``dist[node] == -1`` ⇒ unvisited). Run at ``dim=1`` it
-  reproduces ``scipy.sparse.csgraph.breadth_first_order`` order/parents/distances exactly when the
-  CSR columns are sorted ascending (as produced by :func:`triwarp.graph.edges_to_csr`).
+- :func:`bfs_serial_drain` — one Warp thread walks the graph from whatever FIFO window it is
+  handed, using a dense ``dist`` array as the visited marker (``dist[node] == -1`` ⇒ unvisited).
+  Run at ``dim=1`` from a single seeded source (:func:`single_source_bfs_kernel`) it reproduces
+  ``scipy.sparse.csgraph.breadth_first_order`` order/parents/distances exactly when the CSR columns
+  are sorted ascending (as produced by :func:`triwarp.graph.edges_to_csr`); resumed from a window
+  the level-synchronous loop built (:func:`resume_bfs_kernel`) it continues that same order.
 - :func:`per_source_bfs_collect` — one thread per source over caller-provided global-memory
   scratch rows (a FIFO queue whose emitted prefix is the discovery order, an open-addressing
   visited hash set, and a small nearest-fallback pool). With a finite ``radius`` it enqueues only
@@ -205,8 +207,9 @@ def per_source_bfs_collect(
 
 
 @wp.func
-def single_source_bfs(
-    source: wp.int32,
+def bfs_serial_drain(
+    head: wp.int32,
+    tail: wp.int32,
     adj_offsets: wp.array[wp.int32],
     adj_columns: wp.array[wp.int32],
     out_order: wp.array[wp.int32],
@@ -214,25 +217,23 @@ def single_source_bfs(
     out_dist: wp.array[wp.int32],
 ) -> wp.int32:
     """
-    Run a serial single-source BFS over the CSR edge graph; return the reachable-node count.
+    Drain the FIFO ``out_order[head:tail]`` with a serial BFS; return the final tail.
 
-    ``out_dist`` doubles as the visited marker (caller pre-fills it and ``out_parent`` with ``-1``).
-    ``out_order`` (size N) also serves as the FIFO: in serial BFS its prefix *is* the queue, so the
-    first ``count`` entries are the discovery order. Each node is enqueued at most once, so the
-    size-N buffers never overflow. Visiting neighbors in CSR (ascending) column order reproduces
-    ``scipy.sparse.csgraph.breadth_first_order``.
+    ``out_dist`` doubles as the visited marker. ``out_order`` (size N) *is* the queue, so the
+    prefix it ends up holding is the discovery order. Each node is enqueued at most once, so the
+    size-N buffer never overflows. Visiting neighbors in CSR (ascending) column order reproduces
+    ``scipy.sparse.csgraph.breadth_first_order`` — and because the queue is explicit, that holds for
+    *any* prefix already enqueued in scipy order, which is what lets the level-synchronous path
+    hand its partially built FIFO over mid-traversal.
     """
-    head = wp.int32(0)
-    tail = wp.int32(1)
-    out_dist[source] = wp.int32(0)
-    out_order[0] = source
-
     current = wp.int32(0)
     neighbor = wp.int32(0)
     k = wp.int32(0)
-    while head < tail:
-        current = out_order[head]
-        head += wp.int32(1)
+    cursor = wp.int32(head)
+    end_of_queue = wp.int32(tail)
+    while cursor < end_of_queue:
+        current = out_order[cursor]
+        cursor += wp.int32(1)
         start = adj_offsets[current]
         end = adj_offsets[current + 1]
         for k in range(start, end):
@@ -240,9 +241,9 @@ def single_source_bfs(
             if out_dist[neighbor] == wp.int32(-1):
                 out_dist[neighbor] = out_dist[current] + wp.int32(1)
                 out_parent[neighbor] = current
-                out_order[tail] = neighbor
-                tail += wp.int32(1)
-    return tail
+                out_order[end_of_queue] = neighbor
+                end_of_queue += wp.int32(1)
+    return end_of_queue
 
 
 @wp.kernel
@@ -257,8 +258,10 @@ def single_source_bfs_kernel(
 ) -> None:
     # Launched at dim=1: a single thread runs the whole serial traversal for exact-order match.
     _ = int(wp.tid())
-    out_count[0] = single_source_bfs(
-        source, adj_offsets, adj_columns, out_order, out_parent, out_dist
+    out_dist[source] = wp.int32(0)
+    out_order[0] = source
+    out_count[0] = bfs_serial_drain(
+        wp.int32(0), wp.int32(1), adj_offsets, adj_columns, out_order, out_parent, out_dist
     )
 
 
@@ -351,10 +354,19 @@ def bfs_scan_blocks(
 
 
 @wp.kernel
-def bfs_scan_block_sums(out_block_sums: wp.array[wp.int32]) -> None:
-    # Capture-safe scan, pass 2 (dim=1): serial inclusive scan of the few thousand block sums.
+def bfs_scan_block_sums(state: wp.array[wp.int32], out_block_sums: wp.array[wp.int32]) -> None:
+    # Capture-safe scan, pass 2 (dim=1): serial inclusive scan of the block sums.
+    #
+    # Only the blocks the *frontier* reaches are scanned. The grid dim of every kernel in the level
+    # body is baked in at capture time, so this one thread would otherwise walk all
+    # ``node_count / BFS_SCAN_BLOCK`` blocks on every level however narrow the frontier — one
+    # dependent global load each, which on a long path graph is the single dominant cost of the
+    # traversal (measured: 161 blocks, ~32 us a level, 20 481 levels). Blocks past the frontier are
+    # left unscanned; their offsets are never read, exactly as the stale ``counts`` past the
+    # frontier are not (see ``bfs_count_claims``).
     _ = int(wp.tid())
-    n = out_block_sums.shape[0]
+    frontier = state[_STATE_TAIL] - state[_STATE_START]
+    n = wp.min((frontier + BFS_SCAN_BLOCK - 1) / BFS_SCAN_BLOCK, out_block_sums.shape[0])
     total = wp.int32(0)
     for k in range(n):
         total += out_block_sums[k]
@@ -408,9 +420,19 @@ def bfs_scatter_claims(
 
 
 @wp.kernel
-def bfs_update_state(offsets_inclusive: wp.array[wp.int32], out_state: wp.array[wp.int32]) -> None:
+def bfs_update_state(
+    offsets_inclusive: wp.array[wp.int32], escape_frontier: wp.int32, out_state: wp.array[wp.int32]
+) -> None:
     # dim=1, last op of each level: advance the frontier window to the freshly scattered
-    # segment, bump the level, and keep looping while the level emitted anything.
+    # segment, bump the level, and decide whether the level loop keeps going.
+    #
+    # It stops for one of two reasons, which the caller tells apart by whether the window it leaves
+    # behind is empty. Either the level emitted nothing and the traversal is done, or the frontier
+    # has gone **narrow and stopped growing** — at which point a level costs the same seven fixed
+    # ``dim=node_count`` launches as a wide one (CUDA graphs bake in the grid, so the kernels can
+    # only early-exit) while doing almost no work, and one serial thread finishes the rest faster.
+    # Requiring "not growing" as well as "narrow" is what keeps a *start* from escaping: every
+    # traversal begins at a frontier of one, but on a blob that one immediately fans out.
     _ = int(wp.tid())
     frontier_size = out_state[_STATE_TAIL] - out_state[_STATE_START]
     count = wp.int32(0)
@@ -419,4 +441,31 @@ def bfs_update_state(offsets_inclusive: wp.array[wp.int32], out_state: wp.array[
     out_state[_STATE_START] = out_state[_STATE_TAIL]
     out_state[_STATE_TAIL] = out_state[_STATE_TAIL] + count
     out_state[_STATE_LEVEL] = out_state[_STATE_LEVEL] + wp.int32(1)
-    out_state[_STATE_COND] = wp.where(count > wp.int32(0), wp.int32(1), wp.int32(0))
+    narrow = count < escape_frontier and count <= frontier_size
+    keep_going = count > wp.int32(0) and not narrow
+    out_state[_STATE_COND] = wp.where(keep_going, wp.int32(1), wp.int32(0))
+
+
+@wp.kernel
+def resume_bfs_kernel(
+    state: wp.array[wp.int32],
+    adj_offsets: wp.array[wp.int32],
+    adj_columns: wp.array[wp.int32],
+    out_order: wp.array[wp.int32],
+    out_parent: wp.array[wp.int32],
+    out_dist: wp.array[wp.int32],
+    out_count: wp.array[wp.int32],
+) -> None:
+    # dim=1: finish a traversal the level-synchronous loop handed over once its frontier went
+    # narrow. ``state`` carries the FIFO window the parallel path left behind, so this is the same
+    # serial BFS as above resumed mid-queue -- order-exact by construction, not by reconstruction.
+    _ = int(wp.tid())
+    out_count[0] = bfs_serial_drain(
+        state[_STATE_START],
+        state[_STATE_TAIL],
+        adj_offsets,
+        adj_columns,
+        out_order,
+        out_parent,
+        out_dist,
+    )

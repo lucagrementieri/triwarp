@@ -18,6 +18,7 @@ import warp as wp
 
 import triwarp as tw
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels import combine as kernel_combine
 
 
 def concatenate(
@@ -55,12 +56,7 @@ def concatenate(
         return wp.empty(0, dtype=wp.vec3), wp.empty(0, dtype=wp.int32)
 
     device = meshes_data[0][0].device
-    vertex_counts: list[int] = []
-    total_indices = 0
-    for _i, (vertices, faces) in enumerate(meshes_data):
-        f = int(faces.shape[0])
-        vertex_counts.append(int(vertices.shape[0]))
-        total_indices += f
+    vertex_counts = [int(vertices.shape[0]) for vertices, _ in meshes_data]
 
     if sum(vertex_counts) == 0:
         concatenated_vertices = wp.empty(0, dtype=wp.vec3, device=device)
@@ -69,21 +65,22 @@ def concatenate(
             [vertices for vertices, _ in meshes_data]
         )
 
-    concatenated_faces = wp.empty(total_indices, dtype=wp.int32, device=device)
-
-    vertex_offset = 0
-    dest_offset = 0
-    for count, (_, faces) in zip(vertex_counts, meshes_data, strict=True):
-        f = int(faces.shape[0])
-        if f > 0:
-            wp.map(
-                wp.add,
-                faces,
-                wp.int32(vertex_offset),
-                out=concatenated_faces[dest_offset : dest_offset + f],
-            )
-            dest_offset += f
-        vertex_offset += count
+    # Renumbering used to be one ``wp.map`` per input mesh, which put ~32 us of host-side launch
+    # marshalling on every piece — the dominant cost of the call once there were more than a
+    # handful. The packing copy is unavoidable (Warp has no gather across separate allocations),
+    # but the renumbering collapses into a single launch over the packed buffer.
+    concatenated_faces, piece_starts = tw.array.pack_1d_arrays([faces for _, faces in meshes_data])
+    total_indices = int(concatenated_faces.shape[0])
+    if total_indices > 0:
+        vertex_offsets = wp.array(
+            list(itertools.accumulate(vertex_counts[:-1], initial=0)), dtype=wp.int32, device=device
+        )
+        wp.launch(
+            kernel_combine.offset_packed_faces,
+            dim=total_indices,
+            inputs=[piece_starts, vertex_offsets, concatenated_faces],
+            device=device,
+        )
 
     return concatenated_vertices, concatenated_faces
 

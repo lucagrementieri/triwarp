@@ -157,35 +157,6 @@ def build_signed_face_edges(
 
 
 @wp.kernel
-def seed_orientation(labels: wp.array[wp.int32], out_orient: wp.array[wp.int32]) -> None:
-    """Seed one orientation bit (0) per component representative, -1 elsewhere."""
-    f = int(wp.tid())
-    out_orient[f] = wp.where(labels[f] == f, wp.int32(0), wp.int32(-1))
-
-
-@wp.kernel
-def propagate_orientation(
-    edges: wp.array2d[wp.int32],
-    signs: wp.array[wp.int32],
-    orient: wp.array[wp.int32],
-    changed: wp.array[wp.int32],
-) -> None:
-    """Push assigned orientation bits across face-adjacency edges via the flip bit."""
-    r = int(wp.tid())
-    f0 = edges[r, 0]
-    f1 = edges[r, 1]
-    s = signs[r]
-    o0 = orient[f0]
-    o1 = orient[f1]
-    if o0 >= wp.int32(0) and o1 < wp.int32(0):
-        orient[f1] = (o0 + s) & wp.int32(1)
-        changed[0] = wp.int32(1)
-    elif o1 >= wp.int32(0) and o0 < wp.int32(0):
-        orient[f0] = (o1 + s) & wp.int32(1)
-        changed[0] = wp.int32(1)
-
-
-@wp.kernel
 def verify_orientation(
     edges: wp.array2d[wp.int32],
     signs: wp.array[wp.int32],

@@ -404,6 +404,61 @@ def test_face_orientation_mask_all_false_on_consistent(
     assert bool(tw.reduce.any(mask_wp)) is False
 
 
+def _triangle_ribbon(n_quads: int) -> tuple[np.ndarray, np.ndarray]:
+    """Flat triangle strip: the face-adjacency graph is a path of ``2 * n_quads`` nodes."""
+    x = np.arange(n_quads + 1, dtype=np.float64)
+    vertices = np.empty((2 * (n_quads + 1), 3))
+    vertices[0::2] = np.column_stack((x, np.zeros_like(x), np.zeros_like(x)))
+    vertices[1::2] = np.column_stack((x, np.ones_like(x), np.zeros_like(x)))
+    i = np.arange(n_quads)
+    faces = np.empty((2 * n_quads, 3), dtype=np.int64)
+    faces[0::2] = np.column_stack((2 * i, 2 * i + 1, 2 * i + 2))
+    faces[1::2] = np.column_stack((2 * i + 1, 2 * i + 3, 2 * i + 2))
+    return vertices, faces
+
+
+def _canonical_winding(faces_np: np.ndarray) -> np.ndarray:
+    """Rotate each triangle to start at its smallest index; equal iff the winding is equal."""
+    roll = np.argmin(faces_np, axis=1)
+    return np.take_along_axis(faces_np, (roll[:, None] + np.arange(3)) % 3, axis=1)
+
+
+def test_face_orientation_mask_long_path(device: str) -> None:
+    """
+    A ribbon whose face-adjacency graph is a path of 8 192 nodes.
+
+    This is the deep-propagation case: an orientation flood fill needs one round per node here,
+    while the parity union-find behind
+    [`face_orientation_bits`][triwarp.validation.face_orientation_bits] is depth-independent. The
+    answer is unique because the component representative is the smallest face id, so face 0 keeps
+    its winding and every other face is determined relative to it.
+    """
+    vertices_np, faces_np = _triangle_ribbon(4096)
+    rng = np.random.default_rng(7)
+    scrambled_np = rng.random(faces_np.shape[0]) < 0.5
+    flipped_np = faces_np.copy()
+    flipped_np[scrambled_np] = flipped_np[scrambled_np][:, ::-1]
+    _, faces_wp = _mesh_to_wp(vertices_np, flipped_np, device)
+
+    assert tw.validation.is_orientable(faces_wp) is True
+    mask_np = tw.validation.face_orientation_mask(faces_wp).numpy()
+    assert bool(mask_np[0]) is False
+    assert np.array_equal(mask_np, scrambled_np != scrambled_np[0])
+
+    # Applying the mask must reproduce the original strip, up to the global flip face 0 anchors.
+    # Compared as cyclic windings: a flip is emitted as a rotation of the reversed triangle.
+    repaired_np = tw.repair.make_winding_consistent(faces_wp).numpy().reshape(-1, 3)
+    expected_np = faces_np[:, ::-1] if scrambled_np[0] else faces_np
+    assert np.array_equal(_canonical_winding(repaired_np), _canonical_winding(expected_np))
+    assert tw.validation.is_winding_consistent(faces_wp) is False
+
+    # trimesh reference: its fix_winding is a flood fill over the same face-adjacency graph, and
+    # agrees face for face (both anchor on the first face of the component).
+    mesh_tm = tm.Trimesh(vertices_np, flipped_np, process=False)
+    tm.repair.fix_winding(mesh_tm)
+    assert np.array_equal(_canonical_winding(mesh_tm.faces), _canonical_winding(expected_np))
+
+
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 def test_is_watertight(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)

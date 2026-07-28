@@ -297,4 +297,8 @@ def face_connected_component_labels(faces: wp.array[wp.int32]) -> wp.array[wp.in
     """
     n_faces = int(faces.shape[0]) // 3
     adjacency = face_adjacency(faces)
-    return tw.graph.connected_component_labels_from_edges(adjacency, node_count=n_faces)
+    # ``face_adjacency`` emits face indices, so they are in range by construction; validating would
+    # copy the whole adjacency buffer to the host on an otherwise sync-free path.
+    return tw.graph.connected_component_labels_from_edges(
+        adjacency, node_count=n_faces, validate=False
+    )

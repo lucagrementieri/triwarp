@@ -2,25 +2,26 @@
 Benchmarks for ``triwarp.combine``: assembling meshes from parts and splitting them apart.
 
 Axis: **components** for ``split`` and ``concatenate``, **loops_dp** for the stitching pair.
-Neither family scales with face count, and ``split`` is the sharpest example in the package of a
-function whose cost lives entirely somewhere else.
+Neither family scales with face count, and this pair is the sharpest example in the package of
+functions whose cost lives entirely somewhere else -- in the number of pieces going in or coming
+out.
 
 ``split`` is one labelling pass plus one stable radix sort -- both O(F) and both fast -- followed
-by a **host loop calling ``submesh_from_face_indices`` once per component**, each iteration a
-handful of allocations and launches. Measured at a fixed 81 920 faces:
+by a **batched compaction of every component at once**. Measured at a fixed 81 920 faces:
 
 | components | triwarp-cuda | trimesh | open3d |
 |---|---|---|---|
-| 1 | **2.55 ms** | -- | -- |
-| 64 | 41.4 ms | -- | -- |
-| 1024 | **669 ms** | 203 ms | 284 ms |
+| 1 | **2.5 ms** | 36.6 ms | 68.1 ms |
+| 64 | 3.1 ms | 37.1 ms | 76.4 ms |
+| 1024 | **9.4 ms** | 183 ms | 290 ms |
 
-262x across the axis, and the sign of the comparison flips: triwarp wins by orders of magnitude
-when there is one component and **loses by 3x** when there are a thousand. About 0.64 ms of host
-work per returned submesh. Batching that per-component sequence is the single highest-value fix
-the axis set has surfaced, and no face-count sweep would have shown it -- the scan registry's
-meshes happen to differ in component count by accident (``bunny_decimated`` has 94 scan floaters,
-``bunny`` has 1), which is how the effect was originally noticed at all.
+3.7x across the axis and a win at every point (19-31x). It did not start that way: until commit
+``f57d3f0`` the compaction was a **host loop calling ``submesh_from_face_indices`` once per
+component**, which measured 2.55 / 41.4 / 669 ms -- 262x across the axis, and a 3x *loss* to
+trimesh at a thousand components. This group is what surfaced that, and no face-count sweep would
+have: the scan registry's meshes happen to differ in component count by accident
+(``bunny_decimated`` has 94 scan floaters, ``bunny`` has 1), which is how the effect was originally
+noticed at all. The residual slope is what is left of the per-component cost.
 
 ``stitch_min_weight`` runs a grid dynamic program over the two rims: an O(La x Lb) table filled by
 O(La + Lb) *sequential* anti-diagonal launches, then a host traceback. So it is sized by rim
@@ -51,11 +52,11 @@ from conftest import BenchCase
 
 import triwarp as tw
 
-# Copies for the concatenate sweep: the function loops on the host once per input mesh, so the
-# input *count* is the driver and the total face count is held roughly fixed between the points.
+# Copies for the concatenate sweep: the function still issues one packing copy per input buffer, so
+# the input *count* is the driver and the total face count is held roughly fixed between the points.
 _CONCAT_COPIES = [8, 512]
 
-# split on a thousand components runs to two thirds of a second.
+# The min-weight stitch DP and split on a thousand components run to tens of milliseconds a call.
 _ROUNDS = 3
 
 _split_cache: dict[tuple[str, str], tuple] = {}
@@ -78,7 +79,7 @@ def _split_inputs(bench_case: BenchCase) -> tuple:
 @pytest.mark.benchaxis("components")
 @pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
 def test_split(bench_case: BenchCase) -> None:
-    """Label, sort, then one submesh extraction per component: 262x across the axis."""
+    """Label, sort, then one batched compaction of every component: 3.7x across the axis."""
     expected = {"sphere_med": 1, "parts_64": 64, "parts_1024": 1024}[bench_case.mesh_name]
     if bench_case.kind == "triwarp":
         vertices, faces = _split_inputs(bench_case)
@@ -139,10 +140,14 @@ def _parts(bench_case: BenchCase, copies: int) -> list:
 @pytest.mark.parametrize("copies", _CONCAT_COPIES)
 def test_concatenate(bench_case: BenchCase, copies: int) -> None:
     """
-    The inverse of ``split``, and the same shape of cost: a host loop over the *input count*.
+    The inverse of ``split``, and the same shape of cost: work proportional to the *input count*.
 
     Total face count is held at ``sphere_med``'s 81 920 and only the number of pieces changes, so
-    any slope here is per-mesh overhead rather than data movement.
+    any slope here is per-mesh overhead rather than data movement. Measured **0.23 ms at 8 pieces
+    and 5.7 ms at 512**, down from 0.39 / 19.0 ms: the index renumbering used to be one ``wp.map``
+    per input mesh (~32 us of host-side marshalling each) and is now a single launch over the
+    packed buffer. The 25x that remains is two ``wp.copy`` calls per piece -- Warp has no gather
+    across separate allocations, so the packing itself cannot be batched.
     """
     if bench_case.kind == "triwarp":
         pieces = _parts(bench_case, copies)
