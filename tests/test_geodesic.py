@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import igl
 import numpy as np
+import potpourri3d as pp3d
 import pytest
 import warp as wp
 
@@ -127,3 +128,49 @@ def test_heat_geodesic_cpu_solve_raises() -> None:
 
     with pytest.raises(NotImplementedError):
         tw.heat.distance.heat_geodesic(vertices, faces, sources)
+
+
+# --- the heat method's robust path (potpourri3d use_robust=True reference) -------------
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere", "half_torus"])
+def test_robust_heat_geodesic_matches_potpourri3d(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    if wp.get_device(device).is_cpu:
+        pytest.skip("heat_geodesic needs conjugate gradient, which Warp cannot run on CPU")
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    sources_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
+
+    distance_wp = tw.heat.distance.heat_geodesic(
+        mesh_wp.points, mesh_wp.indices, sources_wp, use_robust=True
+    )
+    distance_pp = np.asarray(
+        pp3d.MeshHeatMethodDistanceSolver(
+            np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),
+            np.ascontiguousarray(mesh_tm.faces, dtype=np.int32),
+            use_robust=True,
+        ).compute_distance(0)
+    )
+
+    # potpourri3d's robust path also flips to an intrinsic Delaunay triangulation, which this does
+    # not (see the module docstring), so the two agree to the heat method's own accuracy rather than
+    # tightly. The comparison is still worth making: it is the configuration potpourri3d ships.
+    scale = float(np.linalg.norm(mesh_tm.vertices.max(axis=0) - mesh_tm.vertices.min(axis=0)))
+    assert np.abs(distance_wp.numpy() - distance_pp).mean() < 0.1 * scale
+
+
+def test_robust_heat_geodesic_survives_a_degenerate_triangle(
+    device: str, sliver_patch: tuple
+) -> None:
+    if wp.get_device(device).is_cpu:
+        pytest.skip("heat_geodesic needs conjugate gradient, which Warp cannot run on CPU")
+    _, _, vertices_wp, faces_wp = sliver_patch
+    sources_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
+
+    plain = tw.heat.distance.heat_geodesic(vertices_wp, faces_wp, sources_wp).numpy()
+    robust = tw.heat.distance.heat_geodesic(
+        vertices_wp, faces_wp, sources_wp, use_robust=True
+    ).numpy()
+
+    assert not np.isfinite(plain).all()
+    assert np.isfinite(robust).all()
+    assert robust[0] == pytest.approx(0.0, abs=1e-6)

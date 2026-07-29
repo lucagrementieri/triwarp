@@ -233,3 +233,39 @@ def test_mass_matrix(bench_case: BenchCase) -> None:
             lambda: igl.massmatrix(vertices_np, faces_np, igl.MASSMATRIX_TYPE_BARYCENTRIC)
         )
         assert matrix_igl.shape == (n_vertices, n_vertices)
+
+
+@pytest.mark.benchmark(group="robust_laplacian")
+@pytest.mark.benchlibs("triwarp", "igl")
+def test_robust_laplacian(bench_case: BenchCase) -> None:
+    """Mollified edge lengths plus the intrinsic cotangent assembly."""
+    n_vertices = bench_case.n_vertices
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        matrix = bench_case.run(lambda: tw.laplacian.robust_laplacian(vertices, faces))
+        assert matrix.nrow == n_vertices
+    else:  # igl's intrinsic overload, from the same length table (built on the host with numpy)
+        triangles_np = bench_case.vertices_np[bench_case.faces_np]
+        lengths_np = np.ascontiguousarray(
+            np.stack(
+                [
+                    np.linalg.norm(triangles_np[:, 2] - triangles_np[:, 1], axis=1),
+                    np.linalg.norm(triangles_np[:, 0] - triangles_np[:, 2], axis=1),
+                    np.linalg.norm(triangles_np[:, 1] - triangles_np[:, 0], axis=1),
+                ],
+                axis=1,
+            ),
+            dtype=np.float64,
+        )
+        faces_np = np.ascontiguousarray(bench_case.faces_np, dtype=np.int64)
+        matrix_igl = bench_case.run(lambda: igl.cotmatrix_intrinsic(lengths_np, faces_np))
+        assert matrix_igl.shape == (n_vertices, n_vertices)
+
+
+@pytest.mark.benchmark(group="mollify_intrinsic")
+@pytest.mark.benchlibs("triwarp")
+def test_mollify_intrinsic(bench_case: BenchCase) -> None:
+    """The length table, the max-reduce and the two host readbacks it needs."""
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    lengths, _ = bench_case.run(lambda: tw.laplacian.mollify_intrinsic(vertices, faces))
+    assert lengths.shape == (bench_case.n_faces, 3)

@@ -29,6 +29,7 @@ import numpy as np
 import potpourri3d as pp3d
 import pytest
 import trimesh as tm
+from conftest import BenchCase
 
 import triwarp as tw
 
@@ -220,3 +221,12 @@ def test_mean_edge_length(bench_case) -> None:
     else:  # igl.avg_edge_length
         vertices, faces = bench_case.vertices_np, bench_case.faces_np
         bench_case.run(lambda: float(igl.avg_edge_length(vertices, faces)))
+
+
+@pytest.mark.benchmark(group="face_edge_lengths")
+@pytest.mark.benchlibs("triwarp")
+def test_face_edge_lengths(bench_case: BenchCase) -> None:
+    """The table alone: one pass, three lengths per face, no reduction."""
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    lengths = bench_case.run(lambda: tw.edges.face_edge_lengths(vertices, faces))
+    assert lengths.shape == (bench_case.n_faces, 3)

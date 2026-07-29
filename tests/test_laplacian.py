@@ -11,6 +11,9 @@ import trimesh.smoothing as tms
 import warp as wp
 
 import triwarp as tw
+from tests.conversions import bsr_to_dense
+
+_MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
 
 
 def _bsr_to_csr(matrix: wp.sparse.BsrMatrix) -> sp.csr_matrix:
@@ -190,3 +193,110 @@ def test_cotmatrix_empty_mesh(device: str) -> None:
     assert laplacian_wp.shape == laplacian_igl.shape == (3, 3)
     assert laplacian_wp.nnz == 0
     assert laplacian_igl.nnz == 0
+
+
+# --- robust_laplacian / mollify_intrinsic (libigl reference) ---------------------------
+@pytest.mark.parametrize("mesh_name", _MESHES)
+def test_robust_laplacian_is_unchanged_on_a_clean_mesh(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = len(mesh_tm.vertices)
+    robust = tw.laplacian.robust_laplacian(
+        mesh_wp.points, mesh_wp.indices, use_intrinsic_delaunay=False
+    )
+    plain = tw.laplacian.cotmatrix(mesh_wp.points, mesh_wp.indices)
+
+    # Mollification adds nothing when every triangle is already non-degenerate, so with the flips
+    # turned off the operator must be the ordinary one up to the intrinsic route's rounding.
+    assert np.allclose(
+        bsr_to_dense(robust, n_vertices), bsr_to_dense(plain, n_vertices), rtol=1e-4, atol=1e-5
+    )
+
+
+def test_robust_laplacian_is_finite_where_cotmatrix_is_not(sliver_patch: tuple) -> None:
+    vertices_np, _, vertices_wp, faces_wp = sliver_patch
+    n_vertices = len(vertices_np)
+    plain = tw.laplacian.cotmatrix(vertices_wp, faces_wp)
+    robust = tw.laplacian.robust_laplacian(vertices_wp, faces_wp, use_intrinsic_delaunay=False)
+
+    # The point of the module, in two lines.
+    assert not np.isfinite(bsr_to_dense(plain, n_vertices)).all()
+    assert np.isfinite(bsr_to_dense(robust, n_vertices)).all()
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
+def test_robust_laplacian_matches_igl_intrinsic_assembly(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    lengths_wp, delta = tw.laplacian.mollify_intrinsic(mesh_wp.points, mesh_wp.indices)
+    assert delta == 0.0  # these fixtures are clean, so the comparison is against the plain lengths
+
+    # igl takes the same (n_faces, 3) opposite-edge-length table, which pins the column order.
+    laplacian_igl = igl.cotmatrix_intrinsic(
+        np.ascontiguousarray(lengths_wp.numpy(), dtype=np.float64),
+        np.ascontiguousarray(mesh_tm.faces, dtype=np.int64),
+    )
+    entries_wp = tw.laplacian.cotmatrix_entries_intrinsic(lengths_wp)
+    laplacian_wp = tw.laplacian.cotmatrix(mesh_wp.points, mesh_wp.indices, cot_entries=entries_wp)
+
+    dense_igl = np.asarray(laplacian_igl.todense())
+    assert np.allclose(
+        bsr_to_dense(laplacian_wp, len(mesh_tm.vertices)), dense_igl, rtol=1e-4, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere", "half_torus", "torus"])
+def test_robust_laplacian_matches_igl_intrinsic_delaunay(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = len(mesh_tm.vertices)
+
+    # With the flips on, this *is* ``igl::intrinsic_delaunay_cotmatrix`` — the strongest oracle in
+    # the module, and one that pins the flip's new-edge-length formula and its winding bookkeeping
+    # at once. The intrinsic Delaunay triangulation is unique, so the two implementations need not
+    # (and do not) perform the same flips in the same order to agree on the matrix.
+    laplacian_igl, _, _ = igl.intrinsic_delaunay_cotmatrix(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),
+        np.ascontiguousarray(mesh_tm.faces, dtype=np.int64),
+    )
+    laplacian_wp = tw.laplacian.robust_laplacian(mesh_wp.points, mesh_wp.indices)
+    assert np.allclose(
+        bsr_to_dense(laplacian_wp, n_vertices),
+        np.asarray(laplacian_igl.todense()),
+        rtol=1e-4,
+        atol=1e-5,
+    )
+
+
+def test_mollify_intrinsic_is_a_no_op_on_a_clean_mesh(
+    icosahedron: tuple[object, wp.Mesh], device: str
+) -> None:
+    _, mesh_wp = icosahedron
+    original = tw.edges.face_edge_lengths(mesh_wp.points, mesh_wp.indices)
+    mollified, delta = tw.laplacian.mollify_intrinsic(mesh_wp.points, mesh_wp.indices)
+
+    assert delta == 0.0
+    assert np.array_equal(mollified.numpy(), original.numpy())
+
+
+def test_mollify_intrinsic_restores_the_triangle_inequality(sliver_patch: tuple) -> None:
+    _, _, vertices_wp, faces_wp = sliver_patch
+    original = tw.edges.face_edge_lengths(vertices_wp, faces_wp).numpy()
+    mollified, delta = tw.laplacian.mollify_intrinsic(vertices_wp, faces_wp)
+
+    assert delta > 0.0
+
+    # Every mollified triangle satisfies the inequality strictly; at least one original did not.
+    def worst_slack(lengths: np.ndarray) -> np.ndarray:
+        a, b, c = lengths[:, 0], lengths[:, 1], lengths[:, 2]
+        return np.minimum(np.minimum(a + b - c, b + c - a), c + a - b)
+
+    assert worst_slack(original).min() <= 0.0
+    assert worst_slack(mollified.numpy()).min() > 0.0
+    # One global constant, added to every length: that is what keeps the operator symmetric. The
+    # tolerance is loose because ``delta`` here is ~1e-5 against lengths of ~1, so the sum lands at
+    # the edge of float32's resolution.
+    assert np.allclose(mollified.numpy() - original, delta, rtol=5e-2, atol=1e-9)

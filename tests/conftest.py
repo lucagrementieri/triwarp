@@ -68,3 +68,25 @@ def hemisphere(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
     rotation[:3, 3] = np.array([-1.0, 0.0, 2.0])
     hemisphere.apply_transform(rotation)
     return hemisphere, trimesh_to_warp(hemisphere, device)
+
+
+@pytest.fixture
+def sliver_patch(device: str) -> tuple[np.ndarray, np.ndarray, wp.array, wp.array]:
+    """
+    Build a patch with one near-zero-area triangle, thin enough to break the triangle inequality.
+
+    Mollification and the robust Laplacian are only interesting on a mesh that needs them: the
+    plain cotangent Laplacian returns NaN here, the robust one must not. Returned as both NumPy
+    (``float64``, for the CPU references) and Warp (``float32``, where the inequality actually
+    fails) so the two sides see the same mesh.
+    """
+    vertices_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 1e-9, 0.0], [0.5, 1.0, 0.0]], dtype=np.float64
+    )
+    faces_np = np.array([[0, 1, 2], [0, 2, 3], [2, 1, 3]], dtype=np.int32)
+    return (
+        vertices_np,
+        faces_np,
+        wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=device),
+        wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device),
+    )

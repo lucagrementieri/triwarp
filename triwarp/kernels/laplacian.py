@@ -256,3 +256,24 @@ def connection_laplacian_triplets(
         out_rows[base + 3] = j
         out_cols[base + 3] = j
         out_vals[base + 3] = w * identity
+
+
+@wp.kernel
+def triangle_inequality_slack(
+    edge_lengths: wp.array2d[wp.float32], epsilon: wp.float32, out_slack: wp.array[wp.float32]
+) -> None:
+    # How far this triangle is from satisfying the strict triangle inequality with margin
+    # ``epsilon``, expressed as the constant that would have to be added to all three of its edges.
+    # Adding a constant lengthens the two short sides by ``2 * delta`` against the long side's
+    # ``delta``, so half the shortfall is enough.
+    f = int(wp.tid())
+    a = edge_lengths[f, 0]
+    b = edge_lengths[f, 1]
+    c = edge_lengths[f, 2]
+    worst = wp.max(wp.max(epsilon - (a + b - c), epsilon - (b + c - a)), epsilon - (c + a - b))
+    out_slack[f] = wp.max(worst, 0.0) * 0.5
+
+
+@wp.func
+def add_constant(length: wp.float32, delta: wp.float32) -> wp.float32:
+    return length + delta

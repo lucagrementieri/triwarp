@@ -1,12 +1,38 @@
+"""
+Discrete Laplacians on a triangle mesh, and the intrinsic repairs that keep them well-behaved.
+
+Every Laplacian this package builds lives here: the cotangent (stiffness) operator and its
+vector-valued sibling, the combinatorial and row-normalized 1-ring operators, and the lumped mass
+matrix that pairs with them.
+
+The cotangent operator needs only *edge lengths*, not vertex positions — which is what makes it
+repairable without moving anything. A sliver triangle produces a huge cotangent weight and solves
+that are ill-conditioned or NaN; a *degenerate* one, whose three edge lengths fail the triangle
+inequality outright (common after ``float32`` rounding, decimation, or a boolean), has no valid
+weight at all.
+
+[`mollify_intrinsic`][triwarp.laplacian.mollify_intrinsic] (Sharp & Crane 2020) fixes both by adding
+one global constant to every edge length — the smallest that restores the triangle inequality with a
+margin. The perturbation is slight and uniform, which beats the alternatives: the operator stays
+symmetric, no vertex moves, no connectivity changes, and a mesh that is already fine gets
+``delta = 0`` and is untouched. Mollification makes the weights *finite*;
+[`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay] (in
+[`triwarp.remesh`][triwarp.remesh], beside the extrinsic flipper) makes them *non-negative*.
+[`robust_laplacian`][triwarp.laplacian.robust_laplacian] combines them.
+"""
+
 from __future__ import annotations
 
 import warp as wp
 import warp.sparse as wps
 
+import triwarp as tw
 import triwarp.typing as twt
-from triwarp.edges import edges_unique, faces_to_edges
+from triwarp.constants import TOLERANCE_MOLLIFY
+from triwarp.edges import edges_unique, face_edge_lengths, faces_to_edges
 from triwarp.kernels import laplacian as kernel_laplacian
 from triwarp.kernels import scatter as kernel_scatter
+from triwarp.reduce import max as reduce_max
 from triwarp.tangent_space import halfedge_transport_angles
 from triwarp.triangles import face_normals_and_areas
 
@@ -173,6 +199,135 @@ def cotmatrix(
     return wps.bsr_from_triplets(
         n_vertices, n_vertices, rows, cols, vals, prune_numerical_zeros=False
     )
+
+
+def robust_laplacian(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    epsilon: float = TOLERANCE_MOLLIFY,
+    dtype: type = wp.float32,
+    *,
+    use_intrinsic_delaunay: bool = True,
+) -> wps.BsrMatrix[wp.float32]:
+    """
+    Cotangent Laplacian that a bad triangulation cannot poison, via mollification and flips.
+
+    Two independent repairs, both intrinsic — no vertex moves, so the surface is unchanged:
+
+    * **mollification** adds one constant to every edge length so that no triangle is degenerate,
+      which is what keeps the weights finite at all
+      ([`mollify_intrinsic`][triwarp.laplacian.mollify_intrinsic]);
+    * **intrinsic Delaunay flips** retriangulate until no edge has a negative cotangent weight,
+      which is what makes the operator satisfy a maximum principle
+      ([`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay]).
+
+    With both on this is ``igl::intrinsic_delaunay_cotmatrix``, and the operator
+    ``potpourri3d``'s ``use_robust=True`` solvers build. Turn the flips off for a drop-in
+    [`cotmatrix`][triwarp.laplacian.cotmatrix] that merely cannot produce NaN.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    epsilon
+        Triangle-inequality margin, relative to the mean edge length. The default ``1e-5`` is
+        Sharp & Crane's.
+    dtype
+        Scalar type of the matrix: ``wp.float32`` (default) or ``wp.float64``.
+    use_intrinsic_delaunay
+        Flip to the intrinsic Delaunay triangulation first (default), the name and the default
+        ``potpourri3d``'s solvers use. The vertex set — and so the matrix's shape and meaning — is
+        the same either way; only the edges it sums over change.
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        ``(n_vertices, n_vertices)`` cotangent stiffness matrix, in ``cotmatrix``'s sign convention
+        (negative diagonal, so ``-L`` is positive semi-definite).
+
+    See Also
+    --------
+    [`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay]
+    [`mollify_intrinsic`][triwarp.laplacian.mollify_intrinsic]
+    [`cotmatrix`][triwarp.laplacian.cotmatrix]
+    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
+    """
+    if use_intrinsic_delaunay:
+        intrinsic_faces, lengths, _ = tw.remesh.intrinsic_delaunay(vertices, faces, epsilon=epsilon)
+    else:
+        intrinsic_faces = faces
+        lengths, _ = mollify_intrinsic(vertices, faces, epsilon=epsilon)
+    entries = cotmatrix_entries_intrinsic(lengths, dtype=dtype)
+    return cotmatrix(vertices, intrinsic_faces, cot_entries=entries, dtype=dtype)
+
+
+def mollify_intrinsic(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    epsilon: float = TOLERANCE_MOLLIFY,
+    edge_lengths: twt.Array2dFloat32 | None = None,
+) -> tuple[twt.Array2dFloat32, float]:
+    """
+    Add the smallest constant to every edge length that makes every triangle non-degenerate.
+
+    Returns the mollified ``(n_faces, 3)`` length table and the constant used. The constant is a
+    single global number, which is the point: it keeps the perturbation uniform, so the operators
+    built from these lengths stay symmetric and no triangle is treated as a special case.
+
+    ``delta`` is zero, and the lengths unchanged, whenever every triangle already satisfies the
+    triangle inequality with margin ``epsilon * mean_edge_length``.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    epsilon
+        Required margin, relative to the mean edge length.
+    edge_lengths
+        Optional precomputed ``(n_faces, 3)`` table from
+        [`face_edge_lengths`][triwarp.edges.face_edge_lengths]; recomputed here when ``None``.
+
+    Returns
+    -------
+    lengths : twt.Array2dFloat32
+        ``(n_faces, 3)`` mollified edge lengths, column ``e`` opposite corner ``e``.
+    delta : float
+        The constant added to every length. Reading it costs one host readback, and it is returned
+        because it is the honest measure of how much the geometry had to be changed.
+
+    See Also
+    --------
+    [`robust_laplacian`][triwarp.laplacian.robust_laplacian]
+    [`face_edge_lengths`][triwarp.edges.face_edge_lengths]
+    [`cotmatrix_entries_intrinsic`][triwarp.laplacian.cotmatrix_entries_intrinsic]
+    """
+    device = vertices.device
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return twt.empty_float32_2d((0, 3), device=device), 0.0
+
+    if edge_lengths is None:
+        edge_lengths = face_edge_lengths(vertices, faces)
+
+    scale = float(reduce_max(edge_lengths))
+    slack = wp.empty(n_faces, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_laplacian.triangle_inequality_slack,
+        dim=n_faces,
+        inputs=[edge_lengths, wp.float32(epsilon * scale), slack],
+        device=device,
+    )
+    delta = float(reduce_max(slack))
+    if delta <= 0.0:
+        return twt.as_array2d_float32(edge_lengths), 0.0
+
+    mollified = twt.empty_float32_2d((n_faces, 3), device=device)
+    wp.map(kernel_laplacian.add_constant, edge_lengths, wp.float32(delta), out=mollified)
+    return twt.as_array2d_float32(mollified), delta
 
 
 def connection_laplacian(

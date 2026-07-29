@@ -6,6 +6,11 @@ TOLERANCE_MERGE = 1e-8
 TOLERANCE_PLANAR = 1e-5
 TOLERANCE_ZERO = 1e-12
 
+# Intrinsic mollification margin, as a fraction of the longest edge: the triangle inequality is
+# satisfied with this much slack rather than exactly, so a barely-valid triangle still yields a
+# finite cotangent weight. Shared by `laplacian.mollify_intrinsic` and `remesh.intrinsic_delaunay`.
+TOLERANCE_MOLLIFY = 1e-5
+
 TOLERANCE_MERGE_CONSTANT = wp.constant(wp.float32(TOLERANCE_MERGE))
 TOLERANCE_PLANAR_CONSTANT = wp.constant(wp.float32(TOLERANCE_PLANAR))
 TOLERANCE_ZERO_CONSTANT = wp.constant(wp.float32(TOLERANCE_ZERO))

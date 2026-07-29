@@ -12,10 +12,11 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_nonempty_mesh
-from triwarp.constants import INT32_MAX
+from triwarp.constants import INT32_MAX, TOLERANCE_MOLLIFY
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import edges as kernel_edges
 from triwarp.kernels import remesh as kernel_remesh
+from triwarp.laplacian import mollify_intrinsic
 
 # Callback that launches a predicate kernel filling ``out_flip``/``out_quad`` for one flip
 # iteration. Supplied by each consumer of ``_flip_interior_edges`` (3D Delone / 2D incircle).
@@ -605,6 +606,170 @@ def flip_to_delaunay(
 
     _flip_interior_edges(out_faces, n_vertices, launch, max_iter)
     return out_faces
+
+
+def intrinsic_delaunay(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    epsilon: float = TOLERANCE_MOLLIFY,
+    max_iter: int = 100,
+) -> tuple[wp.array[wp.int32], twt.Array2dFloat32, int]:
+    """
+    Retriangulate to the intrinsic Delaunay triangulation, without moving a vertex.
+
+    Flips edges whose two opposite angles sum past ``pi`` — exactly the edges whose cotangent weight
+    is negative — until none is left. The flip is *intrinsic*: the new edge is not a straight line
+    in space but the geodesic across the two triangles, and its length comes from unfolding them
+    into a plane and measuring the other diagonal. The surface, its vertices and its metric are all
+    untouched; only which pairs of vertices count as connected changes, so every operator built from
+    the result is a better-behaved operator for the *same* geometry.
+
+    Its practical effect is that the cotangent weights all become non-negative, which is what a
+    Laplacian needs to satisfy a maximum principle: no spurious extrema, no negative diffusion, far
+    better conditioned solves on a badly-shaped mesh.
+
+    Flips run in parallel rounds, each committing a conflict-free independent set (the same engine
+    behind [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay]) with the edge-length table carried
+    alongside the connectivity.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer. Not modified.
+    epsilon
+        Mollification margin applied before flipping, relative to the mean edge length: a degenerate
+        triangle has no well-defined angles to test.
+    max_iter
+        Cap on the number of parallel flip rounds.
+
+    Returns
+    -------
+    intrinsic_faces : wp.array[wp.int32]
+        Length-``3 * n_faces`` connectivity of the intrinsic triangulation, over the same vertices.
+    edge_lengths : twt.Array2dFloat32
+        ``(n_faces, 3)`` intrinsic edge lengths for those faces, column ``e`` opposite corner ``e``.
+    n_flips : int
+        How many edges were flipped. Zero means the input was already intrinsically Delaunay.
+
+    Notes
+    -----
+    A flip that would duplicate an existing edge is skipped rather than allowed to create a
+    multi-edge, so a few non-Delaunay edges can survive on coarse meshes — geometry-central's
+    signpost machinery represents those, this does not. The count is small in practice: on the
+    fixtures used in the tests the result matches ``igl.intrinsic_delaunay_cotmatrix`` exactly.
+
+    See Also
+    --------
+    [`robust_laplacian`][triwarp.laplacian.robust_laplacian]
+    [`mollify_intrinsic`][triwarp.laplacian.mollify_intrinsic]
+    [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay]
+    """
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    lengths, _ = mollify_intrinsic(vertices, faces, epsilon=epsilon)
+    intrinsic_faces = wp.clone(faces)
+    if n_faces == 0:
+        return intrinsic_faces, lengths, 0
+
+    total = 0
+    for _ in range(max_iter):
+        edges_sorted = tw.edges.faces_to_edges(intrinsic_faces, sorted=True)
+        adjacency, adjacency_edges = tw.adjacency.face_adjacency(
+            intrinsic_faces, edges_sorted, return_edges=True, n_vertices=n_vertices
+        )
+        n_interior = int(adjacency.shape[0])
+        if n_interior == 0:
+            break
+        unshared = tw.adjacency.face_adjacency_unshared(intrinsic_faces, adjacency, adjacency_edges)
+        keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=False)
+        sorted_keys, _order = tw.array.sort_pairs(keys)
+
+        flip = wp.zeros(n_interior, dtype=wp.bool, device=device)
+        quad = twt.empty_int32_2d((n_interior, 4), device=device)
+        new_length = wp.empty(n_interior, dtype=wp.float32, device=device)
+        wp.launch(
+            kernel_remesh.intrinsic_delaunay_candidates,
+            dim=n_interior,
+            inputs=[
+                intrinsic_faces,
+                lengths,
+                adjacency,
+                adjacency_edges,
+                unshared,
+                sorted_keys,
+                wp.uint64(n_vertices),
+                flip,
+                quad,
+                new_length,
+            ],
+            device=device,
+        )
+
+        # Independent set: a flip commits only if it wins both incident faces and its new edge's
+        # hashed slot, so no two committed flips share a face or invent the same edge.
+        table = 1
+        while table < 4 * n_interior + 1:
+            table <<= 1
+        face_claim = wp.full(n_faces, INT32_MAX, dtype=wp.int32, device=device)
+        edge_claim = wp.full(table, INT32_MAX, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_remesh.claim_flips,
+            dim=n_interior,
+            inputs=[
+                flip,
+                quad,
+                adjacency,
+                wp.int32(table - 1),
+                wp.uint64(n_vertices),
+                face_claim,
+                edge_claim,
+            ],
+            device=device,
+        )
+        # Lengths first: this pass needs the *old* connectivity to know which corner holds which
+        # vertex, and ``commit_flips`` is about to overwrite it.
+        wp.launch(
+            kernel_remesh.update_flipped_lengths,
+            dim=n_interior,
+            inputs=[
+                intrinsic_faces,
+                flip,
+                quad,
+                adjacency,
+                new_length,
+                face_claim,
+                edge_claim,
+                wp.int32(table - 1),
+                wp.uint64(n_vertices),
+                lengths,
+            ],
+            device=device,
+        )
+        count = wp.zeros(1, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_remesh.commit_flips,
+            dim=n_interior,
+            inputs=[
+                flip,
+                quad,
+                adjacency,
+                face_claim,
+                edge_claim,
+                wp.int32(table - 1),
+                wp.uint64(n_vertices),
+                intrinsic_faces,
+                count,
+            ],
+            device=device,
+        )
+        committed = int(count.numpy()[0])
+        total += committed
+        if committed == 0:
+            break
+    return intrinsic_faces, lengths, total
 
 
 def subdivide(

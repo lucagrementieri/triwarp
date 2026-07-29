@@ -7,13 +7,13 @@ import warp.optim.linear as wpl
 import warp.sparse as wps
 
 from triwarp.edges import mean_edge_length
-from triwarp.intrinsic import mollify_intrinsic
 from triwarp.kernels.heat import distance as kernel_heat_distance
 from triwarp.laplacian import (
     cotmatrix,
     cotmatrix_entries,
     cotmatrix_entries_intrinsic,
     mass_matrix_entries,
+    mollify_intrinsic,
 )
 from triwarp.triangles import face_normals_and_areas
 
@@ -58,18 +58,18 @@ def heat_operators(
         ``igl::heat_geodesics`` default).
     use_robust
         Build the Laplacian from *mollified* edge lengths
-        ([`mollify_intrinsic`][triwarp.intrinsic.mollify_intrinsic]) instead of straight from vertex
+        ([`mollify_intrinsic`][triwarp.laplacian.mollify_intrinsic]) instead of straight from vertex
         positions. Costs one extra pass and two host readbacks, and is what lets the method run on a
         mesh with degenerate triangles at all. It leaves a clean mesh's operator unchanged.
 
         This is mollification **only**, not the intrinsic Delaunay retriangulation that
-        [`robust_laplacian`][triwarp.intrinsic.robust_laplacian] also does by default (and that
+        [`robust_laplacian`][triwarp.laplacian.robust_laplacian] also does by default (and that
         ``potpourri3d``'s identically-named flag includes). The reason is structural rather than a
         shortcut: flipping changes which faces exist, and the gradient and divergence stages below
         integrate over faces. Swapping in an operator built on a different triangulation while those
         stages still use the original one is not a cheap approximation, it is inconsistent — so a
         fully intrinsic heat method needs intrinsic *mass*, *gradient* and *divergence* as well. Use
-        [`robust_laplacian`][triwarp.intrinsic.robust_laplacian] directly where only the operator
+        [`robust_laplacian`][triwarp.laplacian.robust_laplacian] directly where only the operator
         matters (smoothing, parametrization, spectral work).
 
     Returns

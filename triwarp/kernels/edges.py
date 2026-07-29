@@ -48,3 +48,18 @@ def count_edge_faces(inverse: wp.array[wp.int32], out_count: wp.array[wp.int32])
     # corner -> unique-edge map from ``edges.edges_unique``.
     c = int(wp.tid())
     wp.atomic_add(out_count, inverse[c], 1)
+
+
+@wp.kernel
+def face_edge_lengths(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_lengths: wp.array2d[wp.float32]
+) -> None:
+    # Column ``e`` is the edge *opposite* corner ``e``, the igl intrinsic convention that
+    # ``laplacian.cotmatrix_entries_intrinsic`` reads.
+    f = int(wp.tid())
+    v0 = vertices[faces[f * 3 + 0]]
+    v1 = vertices[faces[f * 3 + 1]]
+    v2 = vertices[faces[f * 3 + 2]]
+    out_lengths[f, 0] = wp.length(v2 - v1)
+    out_lengths[f, 1] = wp.length(v0 - v2)
+    out_lengths[f, 2] = wp.length(v1 - v0)

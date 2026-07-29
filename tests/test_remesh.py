@@ -9,7 +9,7 @@ import warp as wp
 from scipy.spatial import KDTree
 
 import triwarp as tw
-from tests.conversions import trimesh_to_warp
+from tests.conversions import bsr_to_dense, trimesh_to_warp
 
 
 def _undirected_edges(faces_np: np.ndarray) -> np.ndarray:
@@ -712,3 +712,53 @@ def test_remesh_empty_and_degenerate(device: str) -> None:
     _sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=1)
     _out_v, out_f = tw.remesh.isotropic_remesh(vertices_wp, faces_wp, iterations=0)
     assert int(out_f.shape[0]) == int(faces_wp.shape[0])
+
+
+# --- intrinsic_delaunay ---------------------------------------------------------------
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere", "half_torus", "torus"])
+def test_intrinsic_delaunay_removes_negative_cotangent_weights(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = len(mesh_tm.vertices)
+    flipped = bsr_to_dense(
+        tw.laplacian.robust_laplacian(mesh_wp.points, mesh_wp.indices), n_vertices
+    )
+
+    # A non-negative off-diagonal (in this sign convention, where the diagonal is negative) is what
+    # "Delaunay" buys: it is the condition for the Laplacian to satisfy a maximum principle.
+    off_diagonal = flipped - np.diag(np.diag(flipped))
+    assert off_diagonal.min() > -1e-6
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+def test_intrinsic_delaunay_leaves_a_delaunay_mesh_alone(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    original_lengths = tw.edges.face_edge_lengths(mesh_wp.points, mesh_wp.indices).numpy()
+    faces, lengths, n_flips = tw.remesh.intrinsic_delaunay(mesh_wp.points, mesh_wp.indices)
+
+    # These fixtures come from an icosphere, whose triangulation is already intrinsically Delaunay.
+    assert n_flips == 0
+    assert np.array_equal(faces.numpy(), mesh_wp.indices.numpy())
+    assert np.allclose(lengths.numpy(), original_lengths, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("mesh_name", ["half_torus", "torus"])
+def test_intrinsic_delaunay_flips_a_grid_and_preserves_the_metric(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces, lengths, n_flips = tw.remesh.intrinsic_delaunay(mesh_wp.points, mesh_wp.indices)
+
+    # A quad grid split by diagonals is not Delaunay, so there is work to do...
+    assert n_flips > 0
+    # ... but the flips are *intrinsic*: the vertex count, the face count and the total area are all
+    # properties of the surface, not of its triangulation, so none of them may change.
+    assert faces.shape == mesh_wp.indices.shape
+    assert np.array_equal(np.sort(np.unique(faces.numpy())), np.sort(np.unique(mesh_tm.faces)))
+    sides = lengths.numpy().astype(np.float64)
+    semi = sides.sum(axis=1) / 2.0
+    heron = semi * (semi - sides[:, 0]) * (semi - sides[:, 1]) * (semi - sides[:, 2])
+    assert np.isclose(np.sqrt(np.maximum(heron, 0.0)).sum(), mesh_tm.area, rtol=1e-3, atol=1e-3)

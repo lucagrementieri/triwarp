@@ -42,7 +42,7 @@ SECTIONS: dict[str, list[str]] = {
         "curvature",
         "convex",
     ],
-    "Operators & fields": ["laplacian", "intrinsic", "linalg", "interpolation", "parametrization"],
+    "Operators & fields": ["laplacian", "linalg", "interpolation", "parametrization"],
     "Heat-method solvers": ["heat.distance", "heat.vector", "heat.signed"],
     "Point clouds & registration": ["points", "sample", "reconstruction", "registration"],
     "Curves": ["polyline"],

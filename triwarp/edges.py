@@ -1,3 +1,18 @@
+"""
+Triangle edges: the directed corner edges, the deduplicated undirected set, and their lengths.
+
+Three representations, and which one a caller wants depends on what an edge means to them:
+
+- **directed corner edges** ([`faces_to_edges`][triwarp.edges.faces_to_edges]) — three per face, in
+  corner order, so index ``3 * f + k`` is face ``f``'s edge ``k``. This is the halfedge indexing
+  [`triwarp.halfedge`][triwarp.halfedge] builds on.
+- **unique undirected edges** ([`edges_unique`][triwarp.edges.edges_unique]) — one per mesh edge,
+  with [`edges_unique_inverse`][triwarp.edges.edges_unique_inverse] mapping each corner back to it.
+- **per-face length tables** ([`face_edge_lengths`][triwarp.edges.face_edge_lengths]) — an
+  ``(n_faces, 3)`` table in the *opposite-corner* column order the cotangent formulas want, which is
+  the intrinsic description [`triwarp.laplacian`][triwarp.laplacian] consumes.
+"""
+
 from __future__ import annotations
 
 import warp as wp
@@ -245,6 +260,47 @@ def edges_length(
     out = wp.empty(n, dtype=wp.float32, device=device)
     wp.launch(kernel_edges.edge_lengths, dim=n, inputs=[vertices, edges_in, out], device=device)
     return out
+
+
+def face_edge_lengths(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> twt.Array2dFloat32:
+    """
+    Per-face edge lengths, in the intrinsic column order the cotangent formulas expect.
+
+    Column ``e`` holds the length of the edge *opposite* corner ``e``, matching
+    [`cotmatrix_entries_intrinsic`][triwarp.laplacian.cotmatrix_entries_intrinsic] and
+    ``igl::cotmatrix_entries``' intrinsic overload. Unlike
+    [`edges_unique_length`][triwarp.edges.edges_unique_length] this is a per-*corner* table: an
+    interior edge appears twice, which is what lets the entries be perturbed per face.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+
+    Returns
+    -------
+    twt.Array2dFloat32
+        ``(n_faces, 3)`` edge lengths on ``vertices.device``.
+
+    See Also
+    --------
+    [`mollify_intrinsic`][triwarp.laplacian.mollify_intrinsic]
+    [`edges_unique_length`][triwarp.edges.edges_unique_length]
+    """
+    device = vertices.device
+    n_faces = int(faces.shape[0]) // 3
+    lengths = twt.empty_float32_2d((n_faces, 3), device=device)
+    if n_faces == 0:
+        return twt.as_array2d_float32(lengths)
+    wp.launch(
+        kernel_edges.face_edge_lengths,
+        dim=n_faces,
+        inputs=[vertices, faces, lengths],
+        device=device,
+    )
+    return twt.as_array2d_float32(lengths)
 
 
 def mean_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> float:

@@ -43,6 +43,8 @@ because a 1:4 subdivision of ``happy_buddha`` / ``lucy`` does not fit a sane mem
 
 from __future__ import annotations
 
+import igl
+import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
@@ -135,3 +137,31 @@ def test_isotropic_remesh(bench_case: BenchCase) -> None:
         rounds=_ROUNDS,
     )
     assert int(new_faces.shape[0]) > 0
+
+
+@pytest.mark.benchmark(group="intrinsic_delaunay")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "igl")
+def test_intrinsic_delaunay(bench_case: BenchCase) -> None:
+    """
+    The flip loop: rounds of predicate, claim, length update and commit until nothing is left.
+
+    On the ``scale`` axis this measures the *no-work* path -- an icosphere is already intrinsically
+    Delaunay, so the loop pays one round to discover that and stops -- which is the honest baseline
+    for the flag being on by default. The meshes that actually flip are the quad grids, and none of
+    them is on this axis; ``tests/test_intrinsic.py`` covers those for correctness.
+    """
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        intrinsic_faces, lengths, _ = bench_case.run(
+            lambda: tw.remesh.intrinsic_delaunay(vertices, faces)
+        )
+        assert intrinsic_faces.shape == faces.shape
+        assert lengths.shape == (bench_case.n_faces, 3)
+    else:  # igl does the flips and the assembly in one call, so its row includes both
+        vertices_np = bench_case.vertices_np
+        faces_np = np.ascontiguousarray(bench_case.faces_np, dtype=np.int64)
+        matrix_igl = bench_case.run(
+            lambda: igl.intrinsic_delaunay_cotmatrix(vertices_np, faces_np)[0]
+        )
+        assert matrix_igl.shape == (bench_case.n_vertices, bench_case.n_vertices)

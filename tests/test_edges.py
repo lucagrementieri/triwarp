@@ -10,6 +10,8 @@ import warp as wp
 
 import triwarp as tw
 
+_MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -227,3 +229,23 @@ def test_mean_edge_length_empty(device: str) -> None:
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
     verts_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
     assert tw.edges.mean_edge_length(verts_wp, faces_wp) == 0.0
+
+
+# --- face_edge_lengths ----------------------------------------------------------------
+@pytest.mark.parametrize("mesh_name", _MESHES)
+def test_face_edge_lengths_are_the_opposite_edges(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    lengths = tw.edges.face_edge_lengths(mesh_wp.points, mesh_wp.indices).numpy()
+
+    triangles = np.asarray(mesh_tm.vertices)[np.asarray(mesh_tm.faces)]
+    expected = np.stack(
+        [
+            np.linalg.norm(triangles[:, 2] - triangles[:, 1], axis=1),
+            np.linalg.norm(triangles[:, 0] - triangles[:, 2], axis=1),
+            np.linalg.norm(triangles[:, 1] - triangles[:, 0], axis=1),
+        ],
+        axis=1,
+    )
+    assert np.allclose(lengths, expected, rtol=1e-5, atol=1e-5)
