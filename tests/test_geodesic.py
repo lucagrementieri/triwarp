@@ -171,6 +171,11 @@ def test_robust_heat_geodesic_survives_a_degenerate_triangle(
         vertices_wp, faces_wp, sources_wp, use_robust=True
     ).numpy()
 
-    assert not np.isfinite(plain).all()
+    # Both are finite: the cotangent assembly refuses to divide by a degenerate face's zero area.
+    # What ``use_robust`` buys is *accuracy* -- the plain operator loses that face's edge couplings
+    # (see ``test_robust_laplacian_keeps_couplings_the_plain_one_drops``), so its distance across
+    # the collapsed edge is worse. Vertices 0 and 1 are one unit apart in a straight line.
+    assert np.isfinite(plain).all()
     assert np.isfinite(robust).all()
     assert robust[0] == pytest.approx(0.0, abs=1e-6)
+    assert abs(robust[1] - 1.0) < abs(plain[1] - 1.0)

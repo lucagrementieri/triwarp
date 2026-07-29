@@ -70,6 +70,8 @@ perturbation of the mass matrix.
 
 from __future__ import annotations
 
+import warnings
+
 import warp as wp
 import warp.optim.linear as wpl
 import warp.sparse as wps
@@ -279,6 +281,8 @@ def solve_spd(
     tol: float = CG_TOLERANCE,
     maxiter: int | None = None,
     check_every: int = CG_CHECK_EVERY_FALLBACK,
+    preconditioner: wpl.LinearOperator | None = None,
+    name: str = "solve_spd",
 ) -> tuple[int, float, float]:
     """
     Solve one symmetric positive-definite system by preconditioned conjugate gradient.
@@ -316,12 +320,26 @@ def solve_spd(
         [`CG_MAXITER_FACTOR`][triwarp.linalg.CG_MAXITER_FACTOR] times the number of rows.
     check_every
         Residual-test cadence; ``0`` tests on device every iteration and returns device arrays.
+    preconditioner
+        Optional Jacobi preconditioner for ``matrix``, built here when ``None``. Pass one to hoist
+        its construction out of a loop that solves against the same operator repeatedly.
+    name
+        Caller name, used in the non-convergence warning.
 
     Returns
     -------
     tuple[int, float, float]
         Whatever ``warp.optim.linear.cg`` returns: iteration count, residual and tolerance. Device
         1-element arrays instead of host scalars when ``check_every=0``.
+
+    Warns
+    -----
+    UserWarning
+        When the solve exhausts ``maxiter`` without reaching ``tol``. The returned ``solution`` is
+        then whatever the last iterate happened to be, not an answer -- silence here is how a
+        diverging solve reaches a caller looking like a converged one. Only detectable when
+        ``check_every > 0``; under ``check_every=0`` the counts stay on device and testing them
+        would reintroduce the readback that setting exists to avoid.
 
     Raises
     ------
@@ -333,17 +351,20 @@ def solve_spd(
     [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]
     [`spd_column_solver`][triwarp.linalg.spd_column_solver]
     """
-    require_cuda(rhs.device, "solve_spd")
+    require_cuda(rhs.device, name)
     n_rows = int(rhs.shape[0])
-    return wpl.cg(
+    iteration_cap = CG_MAXITER_FACTOR * n_rows if maxiter is None else maxiter
+    result = wpl.cg(
         matrix,
         rhs,
         solution,
         tol=tol,
-        maxiter=CG_MAXITER_FACTOR * n_rows if maxiter is None else maxiter,
-        M=wpl.preconditioner(matrix, "diag"),
+        maxiter=iteration_cap,
+        M=wpl.preconditioner(matrix, "diag") if preconditioner is None else preconditioner,
         check_every=_supported_check_every(check_every),
     )
+    _warn_if_not_converged(result, iteration_cap, name)
+    return result
 
 
 def solve_spd_columns(
@@ -602,6 +623,26 @@ def replicated_operator(
     return wpl.LinearOperator(
         (total, total), base.dtype, base.device, matvec, batch_offsets=offsets
     )
+
+
+def _warn_if_not_converged(result: tuple[int, float, float], iteration_cap: int, name: str) -> None:
+    """
+    Warn when conjugate gradient stopped because it ran out of iterations, not because it converged.
+
+    Skipped under ``check_every=0``, where the three values are 1-element *device* arrays and
+    inspecting them would cost the host sync that setting exists to avoid.
+    """
+    iterations, residual, atol = result
+    if isinstance(iterations, wp.array):
+        return
+    if int(iterations) >= iteration_cap and float(residual) > float(atol):
+        warnings.warn(
+            f"{name}: conjugate gradient hit its {iteration_cap}-iteration cap with squared "
+            f"residual {float(residual):.3e} against tolerance {float(atol):.3e}; the result is "
+            f"the last iterate, not a solution. The operator is likely ill-conditioned or "
+            f"singular — consider triwarp.laplacian.robust_laplacian, or a smaller step.",
+            stacklevel=3,
+        )
 
 
 def _supported_check_every(check_every: int) -> int:

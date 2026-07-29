@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 import warp as wp
@@ -75,3 +77,57 @@ def test_spd_column_solver_check_every_reused_across_calls(device: str) -> None:
     solver()
     solution_np = np.linalg.solve(dense_np, rhs_np.T).T
     assert np.allclose(solution_wp.numpy(), solution_np, rtol=1e-5, atol=1e-5)
+
+
+def test_solve_spd_warns_when_it_runs_out_of_iterations(device: str) -> None:
+    """
+    A conjugate gradient that stops on ``maxiter`` rather than on ``tol`` says so.
+
+    Without this the returned array is the last iterate and looks exactly like a solution --
+    which is how a diverging smoothing pass used to reach a caller silently.
+    """
+    if wp.get_device(device).is_cpu:
+        pytest.skip("warp.optim.linear.cg produces NaN on the CPU device in Warp 1.14-1.15")
+    # A 1-D Laplacian: SPD, but Jacobi-preconditioned CG needs O(n) iterations on it, so a budget
+    # of two cannot converge. (A *diagonal* system would be solved exactly in one, and a singular
+    # one makes the Jacobi preconditioner itself infinite, which CG bails out of instead.)
+    n = 64
+    rows, cols, values = [], [], []
+    for i in range(n):
+        rows.append(i), cols.append(i), values.append(2.0)
+        if i + 1 < n:
+            rows += [i, i + 1]
+            cols += [i + 1, i]
+            values += [-1.0, -1.0]
+    matrix = wps.bsr_from_triplets(
+        n,
+        n,
+        wp.array(np.array(rows, dtype=np.int32), dtype=wp.int32, device=device),
+        wp.array(np.array(cols, dtype=np.int32), dtype=wp.int32, device=device),
+        wp.array(np.array(values, dtype=np.float64), dtype=wp.float64, device=device),
+    )
+    rhs = wp.array(np.ones(n, dtype=np.float64), dtype=wp.float64, device=device)
+    solution = wp.zeros(n, dtype=wp.float64, device=device)
+
+    with pytest.warns(UserWarning, match="iteration cap"):
+        iterations, _, _ = tw.linalg.solve_spd(
+            matrix, rhs, solution, tol=1e-14, maxiter=2, name="test_solve_spd"
+        )
+    assert int(iterations) >= 2
+
+
+def test_solve_spd_is_quiet_when_it_converges(device: str) -> None:
+    """The warning is specific to non-convergence: a well-posed solve emits nothing."""
+    if wp.get_device(device).is_cpu:
+        pytest.skip("warp.optim.linear.cg produces NaN on the CPU device in Warp 1.14-1.15")
+    n = 8
+    indices = wp.array(np.arange(n, dtype=np.int32), dtype=wp.int32, device=device)
+    values = wp.array(np.full(n, 2.0, dtype=np.float64), dtype=wp.float64, device=device)
+    matrix = wps.bsr_from_triplets(n, n, indices, wp.clone(indices), values)
+    rhs = wp.array(np.ones(n, dtype=np.float64), dtype=wp.float64, device=device)
+    solution = wp.zeros(n, dtype=wp.float64, device=device)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any warning fails the test
+        tw.linalg.solve_spd(matrix, rhs, solution, maxiter=10 * n)
+    assert np.allclose(solution.numpy(), np.full(n, 0.5))

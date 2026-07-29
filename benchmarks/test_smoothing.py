@@ -38,6 +38,8 @@ triwarp-only before/after comparison.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 import trimesh as tm
@@ -141,8 +143,8 @@ def test_filter_laplacian_integration(bench_case: BenchCase, implicit: bool) -> 
     assert result.shape == vertices.shape
 
 
-# Implicit fairing diverges past two passes on every mesh in this suite -- see the group's docstring
-# -- so it is timed at two rather than at ``_ITERATIONS``.
+# Implicit fairing stops converging past two passes on every mesh in this suite -- see the group's
+# docstring -- so it is timed at two rather than at ``_ITERATIONS``.
 _FAIRING_ITERATIONS = 2
 
 
@@ -159,32 +161,30 @@ def test_filter_implicit_fairing(bench_case: BenchCase) -> None:
     setup cost that could be hoisted.
 
     !!! warning "Two passes, not ten"
-        This group runs ``iterations=2`` where the rest of the module runs ten, because
-        implicit fairing **diverges to NaN from the third pass** on every mesh in this
-        suite -- the graded and uniform saddles, the spheres and the hemisphere alike. The
-        flow collapses triangles (measured on ``saddle``: minimum barycentric mass 4.9e-5,
-        then 4.3e-8, then 1.4e-13), and ``cot_entries_from_l2`` divides by
-        ``4 * dbl_area`` with no zero guard, so the weights reach ``inf`` on the third
-        assembly and the solve returns NaN. Timing ten passes measures a CG that has
-        stopped converging and runs to its ``maxiter`` cap -- 103 s a call rather than 1 s,
-        and garbage either way.
+        This group runs ``iterations=2`` where the rest of the module runs ten, because the flow
+        itself stops converging after that on every mesh here. Unconstrained curvature flow
+        collapses the surface -- on ``saddle`` the minimum barycentric mass falls 4.9e-5, 4.3e-8,
+        1.4e-13 over three passes -- and once the triangles are that small the system is effectively
+        singular, so the conjugate gradient runs to its ``maxiter`` cap and returns its last
+        iterate. Timing that measures a failed solve, not fairing: 103 s a call rather than 1 s.
 
-        The regression test (``tests/test_smoothing.py``) stays inside the envelope by
-        using a 42-vertex icosahedron at six passes, which is why this is not caught
-        there. The divergence on *open* meshes is already documented as expected; that it
-        also happens on closed ones at these sizes is not, and wants its own fix rather
-        than a benchmark that measures around it.
+        This used to be worse. The collapse drove ``cot_entries_from_l2``'s unguarded division by
+        ``4 * dbl_area`` to ``inf`` and the result came back NaN; that division is now guarded, so
+        the output stays finite and ``triwarp.linalg.solve_spd`` *warns* when it exhausts its
+        iterations. The assertion below is that envelope check -- if this group ever starts warning,
+        the iteration count above is no longer safe.
     """
     assert bench_case.device is not None
     if wp.get_device(bench_case.device).is_cpu:
         pytest.skip("implicit fairing solves with warp.optim.linear.cg, CUDA-only in Warp 1.15")
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-    result = bench_case.run(
-        lambda: tw.smoothing.filter_implicit_fairing(
-            vertices, faces, iterations=_FAIRING_ITERATIONS
-        ),
-        rounds=3,
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)  # a non-converged solve fails the benchmark
+        result = bench_case.run(
+            lambda: tw.smoothing.filter_implicit_fairing(
+                vertices, faces, iterations=_FAIRING_ITERATIONS
+            ),
+            rounds=3,
+        )
     assert result.shape == vertices.shape
-    # Guard the envelope: if this ever trips, the iteration count above is no longer safe.
     assert np.isfinite(result.numpy()).all()

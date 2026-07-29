@@ -140,7 +140,15 @@ def filter_laplacian(
             wp.map(kernel_smoothing.extract_components, positions, out=list(components))
             for rhs, solution in zip(components, solutions, strict=True):
                 wp.copy(solution, rhs)
-                wpl.cg(system, rhs, solution, tol=twl.CG_TOLERANCE, maxiter=10 * n, M=precond)
+                twl.solve_spd(
+                    system,
+                    rhs,
+                    solution,
+                    tol=twl.CG_TOLERANCE,
+                    maxiter=10 * n,
+                    preconditioner=precond,
+                    name="filter_laplacian(implicit_time_integration=True)",
+                )
             wp.map(kernel_smoothing.combine_components, *solutions, out=positions)
             if volume_constraint:
                 _apply_volume_constraint(positions, faces, vol_ini)
@@ -605,7 +613,15 @@ def filter_implicit_fairing(
         precond = wpl.preconditioner(system, "diag")
         for b, solution, component in zip(rhs, solutions, components, strict=True):
             wp.copy(solution, component)
-            wpl.cg(system, b, solution, tol=twl.CG_TOLERANCE, maxiter=10 * n, M=precond)
+            twl.solve_spd(
+                system,
+                b,
+                solution,
+                tol=twl.CG_TOLERANCE,
+                maxiter=10 * n,
+                preconditioner=precond,
+                name="filter_implicit_fairing",
+            )
         wp.map(kernel_smoothing.combine_components, *solutions, out=positions)
 
     return tw.array._as_vec3(positions)

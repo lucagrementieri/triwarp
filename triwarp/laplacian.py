@@ -7,9 +7,11 @@ matrix that pairs with them.
 
 The cotangent operator needs only *edge lengths*, not vertex positions — which is what makes it
 repairable without moving anything. A sliver triangle produces a huge cotangent weight and solves
-that are ill-conditioned or NaN; a *degenerate* one, whose three edge lengths fail the triangle
-inequality outright (common after ``float32`` rounding, decimation, or a boolean), has no valid
-weight at all.
+that are ill-conditioned; a *degenerate* one, whose three edge lengths fail the triangle inequality
+outright (common after ``float32`` rounding, decimation, or a boolean), has no finite weight at all.
+The assembly refuses to divide by such a face's zero area, so it contributes nothing — the operator
+stays finite, but that face's edge couplings are simply **missing** from it, which is a wrong
+operator rather than an unusable one.
 
 [`mollify_intrinsic`][triwarp.laplacian.mollify_intrinsic] (Sharp & Crane 2020) fixes both by adding
 one global constant to every edge length — the smallest that restores the triangle inequality with a
@@ -223,7 +225,9 @@ def robust_laplacian(
 
     With both on this is ``igl::intrinsic_delaunay_cotmatrix``, and the operator
     ``potpourri3d``'s ``use_robust=True`` solvers build. Turn the flips off for a drop-in
-    [`cotmatrix`][triwarp.laplacian.cotmatrix] that merely cannot produce NaN.
+    [`cotmatrix`][triwarp.laplacian.cotmatrix] that keeps every edge coupling: the plain operator
+    drops the ones belonging to a degenerate face, because a zero-area triangle has no finite
+    cotangent to contribute.
 
     Parameters
     ----------

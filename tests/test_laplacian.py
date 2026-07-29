@@ -214,15 +214,54 @@ def test_robust_laplacian_is_unchanged_on_a_clean_mesh(
     )
 
 
-def test_robust_laplacian_is_finite_where_cotmatrix_is_not(sliver_patch: tuple) -> None:
+def test_robust_laplacian_keeps_couplings_the_plain_one_drops(sliver_patch: tuple) -> None:
+    """
+    Mollification's purpose, on a mesh with a triangle too thin to have cotangents.
+
+    Both operators are *finite* -- ``cot_entries_from_l2`` refuses to divide by a zero area, so a
+    degenerate face contributes nothing rather than an infinity. Contributing nothing is the only
+    finite choice available (a zero-area triangle's angles are 0 or pi), but it is not free: that
+    face's edge couplings vanish from the operator, which is what mollification exists to avoid.
+    Here vertices 0 and 1 share an edge of the degenerate face and end up **uncoupled** in the
+    plain operator while the mollified one couples them.
+    """
     vertices_np, _, vertices_wp, faces_wp = sliver_patch
     n_vertices = len(vertices_np)
-    plain = tw.laplacian.cotmatrix(vertices_wp, faces_wp)
-    robust = tw.laplacian.robust_laplacian(vertices_wp, faces_wp, use_intrinsic_delaunay=False)
+    plain = bsr_to_dense(tw.laplacian.cotmatrix(vertices_wp, faces_wp), n_vertices)
+    robust = bsr_to_dense(
+        tw.laplacian.robust_laplacian(vertices_wp, faces_wp, use_intrinsic_delaunay=False),
+        n_vertices,
+    )
 
-    # The point of the module, in two lines.
-    assert not np.isfinite(bsr_to_dense(plain, n_vertices)).all()
-    assert np.isfinite(bsr_to_dense(robust, n_vertices)).all()
+    assert np.isfinite(plain).all()
+    assert np.isfinite(robust).all()
+
+    # The coupling the degenerate face should have provided.
+    assert plain[0, 1] == 0.0
+    assert robust[0, 1] != 0.0
+    off_diagonal = ~np.eye(n_vertices, dtype=bool)
+    assert (np.abs(plain[off_diagonal]) > 0).sum() < (np.abs(robust[off_diagonal]) > 0).sum()
+
+
+def test_cotmatrix_entries_are_zero_for_a_zero_area_face(device: str) -> None:
+    """
+    A collinear triangle yields zero weights, not infinities.
+
+    Regression guard for the division in ``cot_entries_from_l2``: its denominator is
+    ``4 * doublearea``, and ``doublearea_from_lengths`` deliberately reports ``0.0`` for a
+    degenerate triangle, so an unguarded divide sends the whole assembled operator -- and any
+    solve against it -- to NaN off a single bad face.
+    """
+    collinear_wp = wp.array(
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float32),
+        dtype=wp.vec3,
+        device=device,
+    )
+    faces_wp = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=wp.int32, device=device)
+
+    entries_wp = tw.laplacian.cotmatrix_entries(collinear_wp, faces_wp)
+    assert np.array_equal(entries_wp.numpy(), np.zeros((1, 3), dtype=np.float32))
+    assert np.isfinite(bsr_to_dense(tw.laplacian.cotmatrix(collinear_wp, faces_wp), 3)).all()
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])

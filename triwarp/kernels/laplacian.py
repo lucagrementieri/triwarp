@@ -30,10 +30,22 @@ def doublearea_from_lengths(l0: wp.float32, l1: wp.float32, l2: wp.float32) -> w
 def cot_entries_from_l2(
     l2_0: wp.float32, l2_1: wp.float32, l2_2: wp.float32, dbl_area: wp.float32
 ) -> tuple[wp.float32, wp.float32, wp.float32]:
-    inv_denom = wp.float32(4.0) * dbl_area
-    c0 = (l2_1 + l2_2 - l2_0) / inv_denom
-    c1 = (l2_2 + l2_0 - l2_1) / inv_denom
-    c2 = (l2_0 + l2_1 - l2_2) / inv_denom
+    # A zero-area triangle contributes nothing rather than an infinity. Its angles are 0 or pi, so
+    # it has no finite cotangent, and ``doublearea_from_lengths`` deliberately reports 0.0 for one:
+    # without this guard that 0 divides straight through to +-inf, and a *single* collapsed face
+    # poisons the whole assembled operator -- and every solve against it -- with NaN.
+    #
+    # The test is against exact zero, not a tolerance. ``dbl_area`` is already clamped
+    # non-negative, so this changes results only where they used to be non-finite; a merely
+    # sliver triangle still yields its (huge, finite) weight, because that is ill-conditioning
+    # rather than a division by zero and the fix for it is mollification -- see
+    # ``laplacian.robust_laplacian``.
+    denominator = wp.float32(4.0) * dbl_area
+    if denominator <= wp.float32(0.0):
+        return wp.float32(0.0), wp.float32(0.0), wp.float32(0.0)
+    c0 = (l2_1 + l2_2 - l2_0) / denominator
+    c1 = (l2_2 + l2_0 - l2_1) / denominator
+    c2 = (l2_0 + l2_1 - l2_2) / denominator
     return c0, c1, c2
 
 
