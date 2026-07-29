@@ -1,5 +1,5 @@
 """
-Structural tests for ``triwarp.topology``.
+Structural tests for ``triwarp.homology``.
 
 This is the one module in the port with no reference implementation on either side: potpourri3d does
 not bind geometry-central's homology code, and neither trimesh nor libigl computes a homology basis.
@@ -35,7 +35,7 @@ def test_homology_generator_count_is_twice_the_genus(
     request: pytest.FixtureRequest, mesh_name: str, genus: int, device: str
 ) -> None:
     _, mesh_wp = request.getfixturevalue(mesh_name)
-    loops = tw.topology.homology_generators(mesh_wp.points, mesh_wp.indices)
+    loops = tw.homology.homology_generators(mesh_wp.points, mesh_wp.indices)
 
     # The genus the fixture is built for, and the genus the mesh actually has, must agree first.
     assert tw.validation.euler_characteristic(mesh_wp.indices) == 2 - 2 * genus
@@ -48,7 +48,7 @@ def test_homology_generators_are_simple_closed_edge_cycles(
 ) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     edges_tm = {tuple(sorted(edge)) for edge in mesh_tm.edges_unique.tolist()}
-    loops = tw.topology.homology_generators(mesh_wp.points, mesh_wp.indices)
+    loops = tw.homology.homology_generators(mesh_wp.points, mesh_wp.indices)
 
     assert len(loops) > 0
     for loop in loops:
@@ -59,7 +59,7 @@ def test_homology_generators_are_not_contractible(
     torus: tuple[tm.Trimesh, wp.Mesh], device: str
 ) -> None:
     mesh_tm, mesh_wp = torus
-    loops = tw.topology.homology_generators(mesh_wp.points, mesh_wp.indices)
+    loops = tw.homology.homology_generators(mesh_wp.points, mesh_wp.indices)
 
     # A contractible loop bounds a disk, so cutting the *faces* along it would split the mesh in
     # two. Removing a genuine generator's vertices instead leaves the surface in one piece: the
@@ -81,12 +81,12 @@ def test_homology_generators_reject_a_boundary(
 ) -> None:
     _, mesh_wp = hemisphere
     with pytest.raises(ValueError, match="closed surface"):
-        tw.topology.homology_generators(mesh_wp.points, mesh_wp.indices)
+        tw.homology.homology_generators(mesh_wp.points, mesh_wp.indices)
 
 
 def test_tree_cotree_partitions_the_edges(torus: tuple[tm.Trimesh, wp.Mesh], device: str) -> None:
     mesh_tm, mesh_wp = torus
-    unique_edges, generator_edges, parents = tw.topology.tree_cotree(
+    unique_edges, generator_edges, parents = tw.homology.tree_cotree(
         mesh_wp.points, mesh_wp.indices
     )
 
@@ -106,4 +106,4 @@ def test_tree_cotree_partitions_the_edges(torus: tuple[tm.Trimesh, wp.Mesh], dev
 def test_homology_generators_empty(device: str) -> None:
     vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
-    assert tw.topology.homology_generators(vertices_wp, faces_wp) == []
+    assert tw.homology.homology_generators(vertices_wp, faces_wp) == []

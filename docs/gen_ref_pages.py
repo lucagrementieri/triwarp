@@ -26,7 +26,7 @@ SECTIONS: dict[str, list[str]] = {
         "adjacency",
         "halfedge",
         "tangent",
-        "topology",
+        "homology",
         "validation",
         "selection",
     ],

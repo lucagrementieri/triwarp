@@ -69,7 +69,7 @@ def homology_generators(
 
     See Also
     --------
-    [`tree_cotree`][triwarp.topology.tree_cotree]
+    [`tree_cotree`][triwarp.homology.tree_cotree]
     [`euler_characteristic`][triwarp.validation.euler_characteristic]
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     """
@@ -101,7 +101,7 @@ def tree_cotree(
     Tree-cotree decomposition: the edges a primal and a dual spanning tree both leave alone.
 
     Three traversals' worth of structure, and the building block behind
-    [`homology_generators`][triwarp.topology.homology_generators]:
+    [`homology_generators`][triwarp.homology.homology_generators]:
 
     1. a breadth-first spanning tree of the **vertex** graph,
     2. a breadth-first spanning tree of the **dual** (face-adjacency) graph, restricted to dual
@@ -128,11 +128,11 @@ def tree_cotree(
     ------
     ValueError
         If the mesh has a boundary (see
-        [`homology_generators`][triwarp.topology.homology_generators]).
+        [`homology_generators`][triwarp.homology.homology_generators]).
 
     See Also
     --------
-    [`homology_generators`][triwarp.topology.homology_generators]
+    [`homology_generators`][triwarp.homology.homology_generators]
     [`bfs`][triwarp.graph.bfs]
     [`face_adjacency`][triwarp.adjacency.face_adjacency]
     """

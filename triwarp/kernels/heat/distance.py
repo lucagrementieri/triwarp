@@ -3,7 +3,7 @@ Kernels for the heat-method geodesic distance solver (Crane et al. 2013).
 
 Everything runs in ``float64``: far from the source the diffused heat decays exponentially and
 would underflow ``float32``, destroying the gradient direction and collapsing the far field. The
-per-face half-cotangent weights are reused from :mod:`triwarp.laplacian` (they are ``O(1)`` and
+per-face half-cotangent weights are reused from ``triwarp.laplacian`` (they are ``O(1)`` and
 numerically safe in ``float32``); only the assembled operators, the diffused field, and the two
 linear solves need double precision.
 """

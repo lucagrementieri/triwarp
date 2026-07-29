@@ -13,7 +13,7 @@ gracefully: the method does not need the curve to be closed, watertight, or even
 nothing about it depends on an inside/outside test.
 
 Curves are given as **vertex paths** — the form
-[`homology_generators`][triwarp.topology.homology_generators],
+[`homology_generators`][triwarp.homology.homology_generators],
 [`boundary_loops`][triwarp.boundary.boundary_loops] and
 [`boundary_loop`][triwarp.boundary.boundary_loop] all produce — packed into one flat buffer with CSR
 offsets. Curves at arbitrary barycentric points are not accepted yet.
@@ -115,7 +115,7 @@ def heat_signed_distance(
     --------
     [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
     [`transport_tangent_vectors`][triwarp.heat.vector.transport_tangent_vectors]
-    [`homology_generators`][triwarp.topology.homology_generators]
+    [`homology_generators`][triwarp.homology.homology_generators]
     [`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]
     """
     if level_set_constraint not in ("zero_set", "none"):
