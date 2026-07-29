@@ -73,6 +73,17 @@ def circumcircle_diameter_sq(a: Any, b: Any, c: Any) -> wp.Float:
 
 
 @wp.func
+def delone_metrics(a: Any, b: Any, c: Any, d: Any):
+    # For quadrangle ABCD, the pair of Delone metrics compared when deciding whether to flip the
+    # diagonal AC to BD: each is the larger circumcircle of the two triangles that diagonal makes.
+    # Either may be infinite (a degenerate triangle), so callers test with ``wp.isinf`` rather than
+    # subtracting blindly.
+    metric_ac = wp.max(circumcircle_diameter_sq(a, c, d), circumcircle_diameter_sq(c, a, b))
+    metric_bd = wp.max(circumcircle_diameter_sq(b, d, a), circumcircle_diameter_sq(d, b, c))
+    return metric_ac, metric_bd
+
+
+@wp.func
 def mincircle_diameter_sq(a: Any, b: Any, c: Any) -> wp.Float:
     # MRTriMath.h ``minCircleDiameterSq``: for an obtuse triangle the smallest enclosing circle is
     # the one on the longest side, otherwise it is the circumcircle.

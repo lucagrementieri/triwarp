@@ -230,12 +230,7 @@ def _classify(
             device=device,
         )
 
-    wp.launch(
-        kernel_remesh.finalize_vertex_codes,
-        dim=n_vertices,
-        inputs=[feature_count, codes],
-        device=device,
-    )
+    wp.map(kernel_remesh.finalize_vertex_codes, feature_count, out=codes)
     wp.map(kernel_array.greater, boundary_count, wp.int32(0), out=boundary_vertex)
     return codes, boundary_vertex
 

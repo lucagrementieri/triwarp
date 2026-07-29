@@ -4,7 +4,7 @@ from triwarp.constants import TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.array import binary_search_sorted_contains, to_vec2d, to_vec3d
 from triwarp.kernels.grouping import hash_slot, pack_edge_key
 from triwarp.kernels.predicates import (
-    circumcircle_diameter_sq,
+    delone_metrics,
     dihedral_angle,
     is_unfold_quadrangle_convex,
     mincircle_diameter_sq,
@@ -306,8 +306,7 @@ def _check_delone_quadrangle_d(
         if wp.abs(old_angle - new_angle) > max_angle_change:
             return True
 
-    metric_ac = wp.max(circumcircle_diameter_sq(a, c, d), circumcircle_diameter_sq(c, a, b))
-    metric_bd = wp.max(circumcircle_diameter_sq(b, d, a), circumcircle_diameter_sq(d, b, c))
+    metric_ac, metric_bd = delone_metrics(a, b, c, d)
 
     if wp.isinf(metric_ac):
         if wp.isinf(metric_bd):
@@ -571,20 +570,16 @@ def scatter_feature_endpoint_counts(
         wp.atomic_add(out_count, adjacency_edges[k, 1], 1)
 
 
-@wp.kernel
-def finalize_vertex_codes(
-    feature_count: wp.array(dtype=wp.int32), out_code: wp.array(dtype=wp.int32)
-) -> None:
+@wp.func
+def finalize_vertex_codes(feature_count: wp.int32) -> wp.int32:
     # 0 feature edges -> FREE; exactly 2 -> CREASE (on a smooth feature/boundary line);
     # anything else (1 = feature endpoint, >=3 = junction) -> CORNER (frozen).
-    v = int(wp.tid())
-    count = feature_count[v]
     code = CORNER_VERTEX
-    if count == 0:
+    if feature_count == 0:
         code = FREE_VERTEX
-    elif count == 2:
+    elif feature_count == 2:
         code = CREASE_VERTEX
-    out_code[v] = code
+    return code
 
 
 @wp.func

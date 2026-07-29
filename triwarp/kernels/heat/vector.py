@@ -4,13 +4,11 @@ from triwarp.constants import TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.triangles import face_unit_gradient
 
 
-@wp.kernel
-def block_mass(mass: wp.array[wp.float64], out_blocks: wp.array[wp.mat22d]) -> None:
+@wp.func
+def block_mass(mass: wp.float64) -> wp.mat22d:
     # The scalar lumped mass, as one 2x2 block per vertex: the vector problem carries two unknowns
     # per vertex and the same area weight applies to both.
-    i = int(wp.tid())
-    m = mass[i]
-    out_blocks[i] = wp.mat22d(m, 0.0, 0.0, m)
+    return wp.mat22d(mass, wp.float64(0.0), wp.float64(0.0), mass)
 
 
 @wp.kernel
@@ -104,23 +102,15 @@ def face_gradient_unit(
     out_gradient[f] = face_unit_gradient(vertices, faces, normals, areas, values, wp.int32(f))
 
 
-@wp.kernel
-def world_to_tangent_unit(
-    field: wp.array[wp.vec3],
-    basis_x: wp.array[wp.vec3],
-    basis_y: wp.array[wp.vec3],
-    out_tangent: wp.array[wp.vec2],
-) -> None:
+@wp.func
+def world_to_tangent_unit(value: wp.vec3, basis_x: wp.vec3, basis_y: wp.vec3) -> wp.vec2:
     # Express a 3D vertex field in each vertex's tangent basis, normalized. Only the direction
     # survives, which is all the log map's angle needs.
-    v = int(wp.tid())
-    value = field[v]
-    tangent = wp.vec2(wp.dot(value, basis_x[v]), wp.dot(value, basis_y[v]))
+    tangent = wp.vec2(wp.dot(value, basis_x), wp.dot(value, basis_y))
     length = wp.length(tangent)
     if length <= TOLERANCE_ZERO_CONSTANT:
-        out_tangent[v] = wp.vec2(0.0, 0.0)
-        return
-    out_tangent[v] = tangent / length
+        return wp.vec2(0.0, 0.0)
+    return tangent / length
 
 
 @wp.kernel

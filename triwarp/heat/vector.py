@@ -99,10 +99,7 @@ def vector_heat_operators(
     connection = connection_laplacian(vertices, faces)
     mass = mass_matrix_entries(vertices, faces, dtype=wp.float64)
     mass_blocks = wp.empty(n_vertices, dtype=wp.mat22d, device=device)
-    if n_vertices > 0:
-        wp.launch(
-            kernel_heat_vector.block_mass, dim=n_vertices, inputs=[mass, mass_blocks], device=device
-        )
+    wp.map(kernel_heat_vector.block_mass, mass, out=mass_blocks)
     vector_system = wps.bsr_axpy(
         x=connection, y=wps.bsr_diag(diag=mass_blocks), alpha=float(t), beta=1.0
     )
@@ -370,12 +367,7 @@ def log_map(
         device=device,
     )
     radial = wp.empty(n_vertices, dtype=wp.vec2, device=device)
-    wp.launch(
-        kernel_heat_vector.world_to_tangent_unit,
-        dim=n_vertices,
-        inputs=[vertex_gradient, basis_x, basis_y, radial],
-        device=device,
-    )
+    wp.map(kernel_heat_vector.world_to_tangent_unit, vertex_gradient, basis_x, basis_y, out=radial)
 
     logarithm = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     wp.launch(

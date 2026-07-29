@@ -14,7 +14,7 @@ import warp as wp
 from triwarp.constants import FLOAT32_INF_CONSTANT, PI, TWO_PI
 from triwarp.kernels.array import sort3, update_argmax
 from triwarp.kernels.predicates import (
-    circumcircle_diameter_sq,
+    delone_metrics,
     is_unfold_quadrangle_convex,
     triangle_aspect_ratio,
 )
@@ -37,8 +37,7 @@ NORMAL_FILTER_DOT = wp.constant(wp.float32(-0.3))
 @wp.func
 def delone_flip_profit_sq(a: wp.vec3, b: wp.vec3, c: wp.vec3, d: wp.vec3) -> wp.float32:
     # MRPointCloudTriangulationHelpers.cpp: profit of flipping diagonal AC to BD.
-    metric_ac = wp.max(circumcircle_diameter_sq(a, c, d), circumcircle_diameter_sq(c, a, b))
-    metric_bd = wp.max(circumcircle_diameter_sq(b, d, a), circumcircle_diameter_sq(d, b, c))
+    metric_ac, metric_bd = delone_metrics(a, b, c, d)
     return metric_ac - metric_bd
 
 
