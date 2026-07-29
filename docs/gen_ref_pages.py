@@ -45,7 +45,7 @@ SECTIONS: dict[str, list[str]] = {
     "Operators & fields": ["laplacian", "intrinsic", "linalg", "interpolation", "parametrization"],
     "Heat-method solvers": ["heat.distance", "heat.vector", "heat.signed"],
     "Point clouds & registration": ["points", "sample", "reconstruction", "registration"],
-    "Curves": ["polyline", "contour"],
+    "Curves": ["polyline"],
     "Attributes & I/O": ["texture", "io"],
     "Arrays & infrastructure": ["array", "reduce", "grouping", "graph", "typing", "constants"],
 }

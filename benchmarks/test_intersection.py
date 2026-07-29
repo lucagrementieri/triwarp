@@ -50,6 +50,7 @@ intersection curve on every mesh.
 from __future__ import annotations
 
 import numpy as np
+import potpourri3d as pp3d
 import pytest
 import trimesh as tm
 import warp as wp
@@ -179,3 +180,83 @@ def test_segments_with_plane(bench_case: BenchCase) -> None:
             lambda: tm.intersections.plane_lines(origin, _PLANE_NORMAL, endpoints)
         )
         assert points_tm.shape[0] == valid_tm.sum()
+
+
+# --- marching_triangles ---------------------------------------------------------------
+_ISOVALUE = 0.1137
+# potpourri3d runs into hundreds of milliseconds on the many-curve fields.
+_ROUNDS = 3
+
+# Field frequency -> (name, wavenumber). ``plane`` is the single-contour control.
+_FIELDS = {"plane": 0, "wave12": 12, "wave40": 40}
+
+_field_cache: dict[tuple[str, str], np.ndarray] = {}
+_field_wp_cache: dict[tuple[str, str, str], wp.array] = {}
+
+
+def _field_np(bench_case: BenchCase, field: str) -> np.ndarray:
+    """Scalar field on this mesh, cached: it is an input, not part of the measurement."""
+    key = (bench_case.mesh_name, field)
+    if key not in _field_cache:
+        vertices = bench_case.vertices_np
+        wavenumber = _FIELDS[field]
+        if wavenumber == 0:
+            values = vertices[:, 2]
+        else:
+            values = (
+                np.sin(wavenumber * vertices[:, 0])
+                * np.cos(wavenumber * vertices[:, 1])
+                * np.sin(wavenumber * vertices[:, 2])
+            )
+        _field_cache[key] = np.ascontiguousarray(values, dtype=np.float64)
+    return _field_cache[key]
+
+
+def _field_wp(bench_case: BenchCase, field: str) -> wp.array:
+    """Return the same field as a device buffer."""
+    key = (bench_case.mesh_name, field, str(bench_case.device))
+    if key not in _field_wp_cache:
+        _field_wp_cache[key] = wp.array(
+            _field_np(bench_case, field), dtype=wp.float64, device=bench_case.device
+        )
+    return _field_wp_cache[key]
+
+
+def _run_case(bench_case: BenchCase, field: str) -> None:
+    """Extract one level set, in triwarp or potpourri3d."""
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        values, n_vertices = _field_wp(bench_case, field), bench_case.n_vertices
+        curves, _ = bench_case.run(
+            lambda: tw.intersection.marching_triangles(
+                vertices, faces, values, _ISOVALUE, n_vertices=n_vertices
+            ),
+            rounds=_ROUNDS,
+        )
+        assert len(curves) > 0
+    else:
+        vertices_np = bench_case.vertices_np
+        faces_np = np.ascontiguousarray(bench_case.faces_np, dtype=np.int32)
+        values_np = _field_np(bench_case, field)
+        curves_pp = bench_case.run(
+            lambda: pp3d.marching_triangles(vertices_np, faces_np, values_np, _ISOVALUE),
+            rounds=_ROUNDS,
+        )
+        assert len(curves_pp) > 0
+
+
+@pytest.mark.benchmark(group="marching_triangles")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "potpourri3d")
+def test_marching_triangles(bench_case: BenchCase) -> None:
+    """One long closed contour of a coordinate function, over the clean size sweep."""
+    _run_case(bench_case, "plane")
+
+
+@pytest.mark.benchmark(group="marching_triangles_curves")
+@pytest.mark.benchmeshes("sphere_med")
+@pytest.mark.benchlibs("triwarp", "potpourri3d")
+@pytest.mark.parametrize("field", list(_FIELDS))
+def test_marching_triangles_curves(bench_case: BenchCase, field: str) -> None:
+    """One mesh, level sets from 1 to ~1 000 curves, to see whether linking cost shows up."""
+    _run_case(bench_case, field)

@@ -186,7 +186,7 @@ def heat_geodesic(
     [`heat_operators`][triwarp.heat.distance.heat_operators]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
     [`mean_edge_length`][triwarp.edges.mean_edge_length]
-    [`marching_triangles`][triwarp.contour.marching_triangles]
+    [`marching_triangles`][triwarp.intersection.marching_triangles]
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
