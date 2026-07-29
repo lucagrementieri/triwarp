@@ -174,15 +174,9 @@ def query_bvh_aabb_with_offsets(
         device=device,
     )
 
-    total_hits = int(tw.reduce.sum(hit_counts))
+    offsets, total_hits = tw.array.counts_to_offsets(hit_counts)
     if total_hits == 0:
-        return (
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.zeros(m, dtype=wp.int32, device=device),
-        )
-
-    offsets = wp.empty(m, dtype=wp.int32, device=device)
-    wp.utils.array_scan(hit_counts, out_array=offsets, inclusive=False)
+        return wp.empty(0, dtype=wp.int32, device=device), offsets
 
     candidate_indices_flat = wp.empty(total_hits, dtype=wp.int32, device=device)
     wp.launch(
@@ -349,17 +343,13 @@ def query_hashgrid_ball_with_offsets(
         grid = hashgrid_from_points(points, r, grid_bins)
 
     neighbor_counts = query_hashgrid_ball_count(points, queries, r, grid=grid)
-    total_neighbors = int(tw.reduce.sum(neighbor_counts))
-
+    offsets, total_neighbors = tw.array.counts_to_offsets(neighbor_counts)
     if total_neighbors == 0:
         return (
             wp.empty(0, dtype=wp.int32, device=device),
             wp.empty(0, dtype=wp.float32, device=device),
-            wp.zeros(m, dtype=wp.int32, device=device),
+            offsets,
         )
-
-    offsets = wp.empty(m, dtype=wp.int32, device=device)
-    wp.utils.array_scan(neighbor_counts, out_array=offsets, inclusive=False)
 
     flat_len = total_neighbors * (2 if return_sorted else 1)
     neighbor_indices_flat = wp.empty(flat_len, dtype=wp.int32, device=device)
@@ -640,17 +630,13 @@ def query_bvh_ball_with_offsets(
         bvh = bvh_from_points(points, leaf_size)
 
     neighbor_counts = query_bvh_ball_count(points, queries, r, bvh=bvh)
-    total_neighbors = int(tw.reduce.sum(neighbor_counts))
-
+    offsets, total_neighbors = tw.array.counts_to_offsets(neighbor_counts)
     if total_neighbors == 0:
         return (
             wp.empty(0, dtype=wp.int32, device=device),
             wp.empty(0, dtype=wp.float32, device=device),
-            wp.zeros(m, dtype=wp.int32, device=device),
+            offsets,
         )
-
-    offsets = wp.empty(m, dtype=wp.int32, device=device)
-    wp.utils.array_scan(neighbor_counts, out_array=offsets, inclusive=False)
 
     flat_len = total_neighbors * (2 if return_sorted else 1)
     neighbor_indices_flat = wp.empty(flat_len, dtype=wp.int32, device=device)

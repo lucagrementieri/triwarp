@@ -70,16 +70,11 @@ def query_mesh_aabb_bounds_with_offsets(
         device=device,
     )
 
-    total_hits = int(tw.reduce.sum(hit_counts))
+    # One scan pass yields both the row starts and their total; an all-zero ``hit_counts`` scans to
+    # all-zero offsets, which is exactly what the empty case wants to return.
+    offsets, total_hits = tw.array.counts_to_offsets(hit_counts)
     if total_hits == 0:
-        return (
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.zeros(m, dtype=wp.int32, device=device),
-            hit_counts,
-        )
-
-    offsets = wp.empty(m, dtype=wp.int32, device=device)
-    wp.utils.array_scan(hit_counts, out_array=offsets, inclusive=False)
+        return wp.empty(0, dtype=wp.int32, device=device), offsets, hit_counts
 
     candidate_indices_flat = wp.empty(total_hits, dtype=wp.int32, device=device)
     wp.launch(

@@ -351,11 +351,7 @@ def upsample_polyline(polyline: wp.array[wp.vec3], step_size: float) -> wp.array
         inputs=[polyline, wp.float32(step_size), steps],
         device=device,
     )
-    offsets = wp.empty(n_segments, dtype=wp.int32, device=device)
-    inclusive = wp.empty(n_segments, dtype=wp.int32, device=device)
-    wp.utils.array_scan(steps, out_array=offsets, inclusive=False)
-    wp.utils.array_scan(steps, out_array=inclusive, inclusive=True)
-    total = int(inclusive.numpy()[-1])
+    offsets, total = tw.array.counts_to_offsets(steps)
 
     out_points = wp.empty(total, dtype=wp.vec3, device=device)
     wp.launch(
@@ -405,11 +401,7 @@ def _smooth_upsample(
         inputs=[polyline, wp.float32(step_size), steps],
         device=device,
     )
-    offsets = wp.empty(n_segments, dtype=wp.int32, device=device)
-    inclusive = wp.empty(n_segments, dtype=wp.int32, device=device)
-    wp.utils.array_scan(steps, out_array=offsets, inclusive=False)
-    wp.utils.array_scan(steps, out_array=inclusive, inclusive=True)
-    total = int(inclusive.numpy()[-1])
+    offsets, total = tw.array.counts_to_offsets(steps)
 
     out_points = wp.empty(total, dtype=wp.vec3, device=device)
     wp.launch(

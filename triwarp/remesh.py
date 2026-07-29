@@ -940,11 +940,7 @@ def subdivide_to_size(
         # the inclusive total is the number of midpoints to add this pass.
         flags = wp.empty(m, dtype=wp.int32, device=device)
         wp.utils.array_cast(long_mask, flags)
-        offsets = wp.empty(m, dtype=wp.int32, device=device)
-        inclusive = wp.empty(m, dtype=wp.int32, device=device)
-        wp.utils.array_scan(flags, out_array=offsets, inclusive=False)
-        wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
-        n_long = int(inclusive.numpy()[-1])
+        offsets, n_long = tw.array.counts_to_offsets(flags)
 
         # Every edge is short enough: we are done.
         if n_long == 0:
@@ -1149,9 +1145,7 @@ def subdivide_region_to_size(
 
         flags = wp.empty(m, dtype=wp.int32, device=device)
         wp.utils.array_cast(long_mask, flags)
-        inclusive = wp.empty(m, dtype=wp.int32, device=device)
-        wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
-        n_long = int(inclusive.numpy()[-1]) if m > 0 else 0
+        offsets, n_long = tw.array.counts_to_offsets(flags)
 
         if n_long == 0:
             break
@@ -1167,11 +1161,7 @@ def subdivide_region_to_size(
             if n_long > remaining:
                 long_mask = _keep_longest_edges(long_mask, lengths, remaining, m, device)
                 wp.utils.array_cast(long_mask, flags)
-                wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
-                n_long = int(inclusive.numpy()[-1])
-
-        offsets = wp.empty(m, dtype=wp.int32, device=device)
-        wp.utils.array_scan(flags, out_array=offsets, inclusive=False)
+                offsets, n_long = tw.array.counts_to_offsets(flags)
 
         midpoint_idx = wp.empty(m, dtype=wp.int32, device=device)
         wp.launch(

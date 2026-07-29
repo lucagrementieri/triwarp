@@ -682,11 +682,55 @@ def mask_to_index_map(
         wp.map(kernel_array.complement_flag, mask, out=flags)
     else:
         wp.utils.array_cast(mask, flags)
-    index_map = wp.empty(n, dtype=wp.int32, device=device)
-    inclusive = wp.empty(n, dtype=wp.int32, device=device)
-    wp.utils.array_scan(flags, out_array=index_map, inclusive=False)
-    wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
-    return index_map, int(inclusive.numpy()[-1])
+    return counts_to_offsets(flags)
+
+
+def counts_to_offsets(counts: wp.array[wp.int32]) -> tuple[wp.array[wp.int32], int]:
+    """
+    Exclusive prefix sum of ``counts``, plus their total.
+
+    The CSR-building step that turns per-element counts into row starts. Done in **one** scan pass
+    and one 4-byte host read: the scan runs *inclusive* into the tail of an ``n + 1`` buffer whose
+    leading zero is already in place, which makes the first ``n`` entries the exclusive sum and the
+    last entry the total. The obvious spelling — one exclusive scan for the offsets and a second
+    inclusive scan (or a ``reduce.sum``) for the total — costs a second full pass over ``counts``,
+    and reading the total as ``inclusive.numpy()[-1]`` copies the whole array to the host to look at
+    one element of it.
+
+    Parameters
+    ----------
+    counts
+        Length-``n`` ``wp.int32`` per-element counts.
+
+    Returns
+    -------
+    offsets : wp.array[wp.int32]
+        Length-``n`` exclusive prefix sum, a **view** into an ``n + 1`` buffer that ``total`` keeps
+        alive. Element ``i`` owns ``[offsets[i], offsets[i] + counts[i])``.
+    total : int
+        Sum of ``counts``.
+
+    Notes
+    -----
+    Two offsets conventions coexist in this package: the length-``n`` form returned here, with the
+    total implicit, and a length-``n + 1`` form that stores it (``halfedge.vertex_one_rings``,
+    ``tracing.trace_geodesic_from_vertex``). This builds the latter internally, so a caller that
+    wants it can be given the whole buffer instead.
+
+    See Also
+    --------
+    [`flatnonzero`][triwarp.array.flatnonzero]
+    [`mask_to_index_map`][triwarp.array.mask_to_index_map]
+    """
+    n = int(counts.shape[0])
+    device = counts.device
+    if n == 0:
+        return wp.zeros(0, dtype=wp.int32, device=device), 0
+    # The leading zero from ``wp.zeros`` is the first exclusive offset; the inclusive scan fills the
+    # rest, so ``buffer[n]`` is the total and ``buffer[:n]`` the exclusive offsets.
+    buffer = wp.zeros(n + 1, dtype=wp.int32, device=device)
+    wp.utils.array_scan(counts, out_array=buffer[1:], inclusive=True)
+    return buffer[:n], int(buffer[n:].numpy()[0])
 
 
 def remap_indices(indices: wp.array[wp.int32], remap: wp.array[wp.int32]) -> wp.array[wp.int32]:
