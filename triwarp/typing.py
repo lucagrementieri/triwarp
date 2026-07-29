@@ -86,7 +86,31 @@ __all__ = [
 
 
 def ensure_ndim(arr: wp.array[T], ndim: int, *, dtype: type | None = None) -> wp.array[T]:
-    """Validate rank (and optionally dtype) of a Warp array."""
+    """
+    Validate the rank (and optionally the dtype) of a Warp array.
+
+    The runtime counterpart to the aliases in this module: `isinstance(x, wp.array2d)` is always
+    ``False``, so rank is checked here instead.
+
+    Parameters
+    ----------
+    arr
+        Array to validate.
+    ndim
+        Required rank.
+    dtype
+        When given, the required element dtype.
+
+    Returns
+    -------
+    wp.array
+        ``arr`` unchanged, so this can wrap an argument in place.
+
+    Raises
+    ------
+    TypeError
+        If the rank or dtype does not match.
+    """
     if int(arr.ndim) != ndim:
         raise TypeError(f"expected {ndim}D array, got ndim={arr.ndim}")
     if dtype is not None and arr.dtype != dtype:

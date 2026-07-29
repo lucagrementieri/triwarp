@@ -981,8 +981,8 @@ def query_bvh_nearest(
 
     # ``wp.empty``, not ``wp.full``: the kernel resets each row before every scan (it has to, since
     # the insert does not deduplicate), so pre-filling here would be two wasted launches.
-    neighbor_indices = wp.empty((m, k), dtype=wp.int32, device=device)
-    neighbor_distances = wp.empty((m, k), dtype=wp.float32, device=device)
+    neighbor_indices = twt.empty_int32_2d((m, k), device=device)
+    neighbor_distances = twt.empty_float32_2d((m, k), device=device)
     wp.launch(
         kernel_neighbors.query_bvh_nearest_neighbors,
         dim=m,
@@ -1149,8 +1149,8 @@ def query_hashgrid_nearest(
         cell_size = float(getattr(grid, "cell_width", initial_radius))
     widest = _knn_widest_grid_radius(cell_size, n)
 
-    neighbor_indices = wp.empty((m, k), dtype=wp.int32, device=device)
-    neighbor_distances = wp.empty((m, k), dtype=wp.float32, device=device)
+    neighbor_indices = twt.empty_int32_2d((m, k), device=device)
+    neighbor_distances = twt.empty_float32_2d((m, k), device=device)
     wp.launch(
         kernel_neighbors.query_hashgrid_nearest_neighbors,
         dim=m,
@@ -1258,8 +1258,8 @@ def geodesic_ball(
     visited_pool = wp.empty(
         (chunk, kernel_bfs._VISITED_HASH_CAPACITY), dtype=wp.int32, device=device
     )
-    ext_dist_pool = wp.empty((chunk, kernel_bfs._EXTRAS_CAPACITY), dtype=wp.float32, device=device)
-    ext_idx_pool = wp.empty((chunk, kernel_bfs._EXTRAS_CAPACITY), dtype=wp.int32, device=device)
+    ext_dist_pool = twt.empty_float32_2d((chunk, kernel_bfs._EXTRAS_CAPACITY), device=device)
+    ext_idx_pool = twt.empty_int32_2d((chunk, kernel_bfs._EXTRAS_CAPACITY), device=device)
 
     overflow = wp.zeros(1, dtype=wp.int32, device=device)
     counts = wp.empty(n, dtype=wp.int32, device=device)

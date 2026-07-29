@@ -24,7 +24,28 @@ SORT_ROWS_INSERTION_MAX_COLS = 8
 
 
 def init_range(n: int, device: str, *, dtype: type[wp.Int] = wp.int32) -> wp.array:
-    """Fill ``out[i] = i`` for ``i`` in ``[0, n)``."""
+    """
+    Fill ``out[i] = i`` for ``i`` in ``[0, n)`` (``numpy.arange``).
+
+    Parameters
+    ----------
+    n
+        Number of elements; must be non-negative.
+    device
+        Warp device for the result.
+    dtype
+        Integer dtype of the result. Must be able to represent ``n - 1``.
+
+    Returns
+    -------
+    wp.array
+        Length-``n`` array of consecutive indices on ``device``.
+
+    Raises
+    ------
+    ValueError
+        If ``n`` is negative, or ``n - 1`` does not fit in ``dtype``.
+    """
     dtype = _ensure_int_dtype(dtype)
     if n < 0:
         raise ValueError(f"n must be non-negative, got {n}")
@@ -39,7 +60,30 @@ def init_range(n: int, device: str, *, dtype: type[wp.Int] = wp.int32) -> wp.arr
 def init_range_step(
     count: int, step: int, device: str, *, dtype: type[wp.Int] = wp.int32
 ) -> wp.array:
-    """Fill ``out[i] = i * step`` (``numpy.arange(0, count * step, step)``)."""
+    """
+    Fill ``out[i] = i * step`` (``numpy.arange(0, count * step, step)``).
+
+    Parameters
+    ----------
+    count
+        Number of elements; must be non-negative.
+    step
+        Stride between consecutive values; must be non-negative.
+    device
+        Warp device for the result.
+    dtype
+        Integer dtype of the result. Must be able to represent ``(count - 1) * step``.
+
+    Returns
+    -------
+    wp.array
+        Length-``count`` array on ``device``.
+
+    Raises
+    ------
+    ValueError
+        If ``count`` or ``step`` is negative, or the largest value does not fit in ``dtype``.
+    """
     dtype = _ensure_int_dtype(dtype)
     if count < 0:
         raise ValueError(f"count must be non-negative, got {count}")
@@ -62,7 +106,37 @@ def init_range_step(
 def init_sort_pair_indices(
     n: int, fill_value: int, device: str, *, dtype: type[wp.Int] = wp.int32
 ) -> wp.array:
-    """Fill ``[0, 1, ..., n-1, fill_value, ..., fill_value]`` (length ``2 * n``)."""
+    """
+    Fill ``[0, 1, ..., n-1, fill_value, ..., fill_value]`` (length ``2 * n``).
+
+    The payload buffer ``warp.utils.radix_sort_pairs`` wants: the first half seeded with the
+    identity permutation, the second half (its scratch) filled with a padding value.
+
+    Parameters
+    ----------
+    n
+        Number of real entries; the result has length ``2 * n``.
+    fill_value
+        Padding written into the upper half.
+    device
+        Warp device for the result.
+    dtype
+        Integer dtype of the result.
+
+    Returns
+    -------
+    wp.array
+        Length-``2 * n`` array on ``device``.
+
+    Raises
+    ------
+    ValueError
+        If ``n`` is negative, or ``n - 1`` / ``fill_value`` does not fit in ``dtype``.
+
+    See Also
+    --------
+    [`sort_pairs`][triwarp.array.sort_pairs]
+    """
     dtype = _ensure_int_dtype(dtype)
     if n < 0:
         raise ValueError(f"n must be non-negative, got {n}")
@@ -83,7 +157,31 @@ def init_sort_pair_indices(
 def init_repeat_index(
     count: int, repeats: int, device: str, *, dtype: type[wp.Int] = wp.int32
 ) -> wp.array:
-    """Fill ``out[i] = i // repeats`` (repeat each index ``repeats`` times)."""
+    """
+    Fill ``out[i] = i // repeats`` (``numpy.repeat`` of an index range).
+
+    Parameters
+    ----------
+    count
+        Number of elements; must be non-negative.
+    repeats
+        How many consecutive entries share an index; must be positive.
+    device
+        Warp device for the result.
+    dtype
+        Integer dtype of the result.
+
+    Returns
+    -------
+    wp.array
+        Length-``count`` array on ``device``.
+
+    Raises
+    ------
+    ValueError
+        If ``count`` is negative, ``repeats`` is not positive, or the largest value does not fit
+        in ``dtype``.
+    """
     dtype = _ensure_int_dtype(dtype)
     if count < 0:
         raise ValueError(f"count must be non-negative, got {count}")

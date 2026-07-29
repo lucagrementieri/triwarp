@@ -241,7 +241,7 @@ def marching_triangles(
     edge_ids = tw.edges.edges_unique_inverse(faces, n_vertices=n_vertices)
     valid = wp.empty(n_faces, dtype=wp.bool, device=device)
     segments = wp.empty((n_faces, 2), dtype=wp.vec3, device=device)
-    segment_edges = wp.empty((n_faces, 2), dtype=wp.int32, device=device)
+    segment_edges = twt.empty_int32_2d((n_faces, 2), device=device)
     wp.launch(
         kernel_intersections.marching_triangles_segments,
         dim=n_faces,
@@ -256,7 +256,7 @@ def marching_triangles(
 
     hit_segments = wp.empty((n_segments, 2), dtype=wp.vec3, device=device)
     wp.copy(hit_segments, segments[cut_faces])
-    hit_edges = wp.empty((n_segments, 2), dtype=wp.int32, device=device)
+    hit_edges = twt.empty_int32_2d((n_segments, 2), device=device)
     wp.copy(hit_edges, segment_edges[cut_faces])
 
     chains, closed = _link_segments(hit_edges.numpy())
