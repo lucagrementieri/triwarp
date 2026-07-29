@@ -31,6 +31,41 @@ replicated in memory — the ``matvec`` issues ``k`` ``bsr_mv`` calls against th
 **Determinism.** Build each operator natively at its final dtype in a *single*
 ``warp.sparse.bsr_from_triplets`` and never recast or rebuild it: ``bsr_mm`` is only deterministic
 on single-build operators (see ``downloads/issue_report.md``). Nothing here recasts an operator.
+
+**Why Jacobi.** Every solve here preconditions with ``warp.optim.linear.preconditioner(A, "diag")``,
+and the alternatives were measured and rejected rather than overlooked. On a cotangent Laplacian a
+preconditioner costing ``k`` mat-vecs per iteration cuts the iteration count by only about
+``sqrt(k)``, so total work scales as ``k / sqrt(k) = sqrt(k)`` — single-level preconditioning loses
+on this operator class, and only a multilevel method escapes it. IC(0) is the instructive case: its
+quality is real (2.1x to 4.2x fewer iterations under an exact apply), but Warp 1.15 has no sparse
+triangular solve and no substitute for one keeps the win. Scored in mat-vec equivalents against
+Jacobi at ``tol=1e-8``, on ``-L`` with one degree of freedom pinned:
+
+- a fully parallel apply (``k`` Jacobi sweeps per triangular solve) runs **0.70x to 1.03x**;
+- an exact apply parallelized by graph coloring runs **1.02x to 1.26x**, and even that is
+  optimistic — it prices only ``nnz`` traffic, ignoring the twelve dependent launches per iteration
+  at ``n / 6`` occupancy and the uncoalesced access the color permutation causes;
+- natural-ordering level sets are not viable at all: 8 levels on an icosphere against 157 on a
+  torus, so throughput would swing with the input's vertex numbering;
+- Chebyshev — pure mat-vecs, trivially graph-capturable, no factorization — runs **0.60x to 0.92x**
+  at degrees 2, 4 and 8.
+
+Two further obstacles are specific to this repository. Obtuse triangles give negative cotangent
+weights (``triwarp/kernels/laplacian.py``), so a noisy sphere carries 16.75 % positive
+off-diagonals and ``-L`` is not the M-matrix that IC(0) existence requires; and both
+[`heat_geodesic`][triwarp.geodesic.heat_geodesic] and
+[`heat_signed_distance`][triwarp.signed_heat.heat_signed_distance] solve a ``-L`` with a genuine
+constant null space, where IC(0) hits a zero pivot on the last row of every connected component.
+If this is revisited, the direction is smoothed-aggregation multigrid — the only option that breaks
+the ``O(sqrt(n))`` iteration growth — and ``bsr_mm``, ``bsr_transposed`` and ``bsr_mv`` are all
+available to build it.
+
+The *target* was sound even though the tool is not: on an RTX 5090
+[`heat_geodesic`][triwarp.geodesic.heat_geodesic] with cached operators measures 8.1, 12.6 and
+30.3 ms at 10 242, 40 962 and 163 842 vertices, of which the heat solve is about 2 ms flat and
+assembly 1.1 to 2.3 ms — the Poisson solve is 75-90 % of the call. That heat system ``M - tL``
+needs no help of its own: 30 iterations at every size, because ``t = h**2`` makes it a small
+perturbation of the mass matrix.
 """
 
 from __future__ import annotations
@@ -322,6 +357,11 @@ def solve_spd_columns(
     long solves, a wash on medium ones, and a loss only once the solve is shorter than the
     graph-launch overhead. The earlier "opt-in rather than the default" note recorded only the
     middle regime.
+
+    The *preconditioner* has been measured on the same systems and is not a knob worth turning:
+    IC(0) and Chebyshev both come out a wash or a loss against the ``"diag"`` Jacobi used here. See
+    "Why Jacobi" in the [`triwarp.linalg`][triwarp.linalg] module documentation for the numbers and
+    for the one direction that would pay off.
 
     See Also
     --------

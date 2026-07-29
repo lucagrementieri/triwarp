@@ -317,8 +317,8 @@ def test_reused_operators_give_the_same_answer(
 
     # Reusing the operators must be an optimization and nothing else: the same assembly, so the same
     # matrices, so the same answer. Not *bit* for bit, though — conjugate gradient reduces with
-    # atomics, so two identical solves can differ in their last bits. Measured here: transport agrees
-    # to 2e-15, and the log map to 4e-7 absolute, which is float32 epsilon on its own output.
+    # atomics, so two identical solves can differ in their last bits. Measured: transport agrees to
+    # 2e-15, and the log map to 4e-7 absolute, which is float32 epsilon on its own output.
     for fresh, reused in (
         (
             tw.vector_heat.transport_tangent_vectors(
