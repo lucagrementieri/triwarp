@@ -10,8 +10,7 @@ linear solves need double precision.
 
 import warp as wp
 
-from triwarp.kernels.array import to_vec3d
-from triwarp.kernels.triangles import face_vertices_vec3d
+from triwarp.kernels.triangles import face_unit_gradient, face_vertices_vec3d
 
 
 @wp.kernel
@@ -30,28 +29,10 @@ def face_gradient_normalized(
     u: wp.array[wp.float64],
     out_x: wp.array[wp.vec3d],
 ) -> None:
-    # Per-face gradient of the scalar field u, then X = -grad(u)/|grad(u)| (unit, points away
-    # from the source).  grad(u) = 1/(2A) * sum_i u_i (n x e_i^opp), e_i^opp the CCW edge opposite
-    # vertex i. Geometry is read in float32 (input precision) and promoted; u is float64.
+    # X = -grad(u)/|grad(u)|: the unit field pointing *away* from the source, which is the direction
+    # the Poisson stage integrates back into a distance.
     f = int(wp.tid())
-    i0 = faces[f * 3 + 0]
-    i1 = faces[f * 3 + 1]
-    i2 = faces[f * 3 + 2]
-    v0, v1, v2 = face_vertices_vec3d(vertices, faces, wp.int32(f))
-    n = to_vec3d(normals[f])
-    area = wp.float64(areas[f])
-
-    grad = wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
-    if area > wp.float64(0.0):
-        e0 = v2 - v1  # opposite vertex i0
-        e1 = v0 - v2  # opposite vertex i1
-        e2 = v1 - v0  # opposite vertex i2
-        grad = (u[i0] * wp.cross(n, e0) + u[i1] * wp.cross(n, e1) + u[i2] * wp.cross(n, e2)) / (
-            wp.float64(2.0) * area
-        )
-
-    # ``normalize`` returns the zero vector for a zero-length gradient (Warp's ``kEps`` is 0).
-    out_x[f] = -wp.normalize(grad)
+    out_x[f] = -face_unit_gradient(vertices, faces, normals, areas, u, wp.int32(f))
 
 
 @wp.kernel

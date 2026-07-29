@@ -305,3 +305,38 @@ def closest_point(
     v = vb * denom
     w = vc * denom
     out_closest[f] = vertices[triangle_face[0]] + ab * v + ac * w
+
+
+@wp.func
+def face_unit_gradient(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    normals: wp.array[wp.vec3],
+    areas: wp.array[wp.float32],
+    values: wp.array[wp.float64],
+    f: wp.int32,
+) -> wp.vec3d:
+    # Unit gradient of a per-vertex scalar field inside face ``f``:
+    #   grad = 1/(2A) * sum_k values_k * (n x e_k^opp),   e_k^opp the CCW edge opposite corner k.
+    #
+    # Accumulated in float64. The fields this serves (diffused heat, geodesic distance) decay
+    # exponentially and a float32 sum of the cross products loses the far field, so the geometry is
+    # promoted rather than the result being widened after the fact.
+    #
+    # A degenerate face contributes nothing, and ``normalize`` returns the zero vector for a
+    # zero-length gradient (Warp's ``kEps`` is 0), so both degenerate cases fall out as zero.
+    i0 = faces[f * 3 + 0]
+    i1 = faces[f * 3 + 1]
+    i2 = faces[f * 3 + 2]
+    v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
+    n = to_vec3d(normals[f])
+    area = wp.float64(areas[f])
+
+    grad = wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
+    if area > wp.float64(0.0):
+        grad = (
+            values[i0] * wp.cross(n, v2 - v1)
+            + values[i1] * wp.cross(n, v0 - v2)
+            + values[i2] * wp.cross(n, v1 - v0)
+        ) / (wp.float64(2.0) * area)
+    return wp.normalize(grad)

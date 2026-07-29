@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.constants import TOLERANCE_ZERO_CONSTANT
+from triwarp.kernels.triangles import face_unit_gradient
 
 
 @wp.kernel
@@ -97,29 +98,10 @@ def face_gradient_unit(
     values: wp.array[wp.float64],
     out_gradient: wp.array[wp.vec3d],
 ) -> None:
-    # Unit gradient of a per-vertex scalar within each triangle. For a distance field this points
-    # away from the source, which is the radial direction the log map is measured against.
+    # For a distance field this points away from the source: the radial direction the log map's
+    # angle is measured against.
     f = int(wp.tid())
-    i0 = faces[f * 3 + 0]
-    i1 = faces[f * 3 + 1]
-    i2 = faces[f * 3 + 2]
-    normal = normals[f]
-    area = areas[f]
-    if area <= TOLERANCE_ZERO_CONSTANT:
-        out_gradient[f] = wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
-        return
-    # grad = sum_k value_k * (normal x opposite_edge_k) / (2 * area)
-    gradient = (
-        wp.float32(values[i0]) * wp.cross(normal, vertices[i2] - vertices[i1])
-        + wp.float32(values[i1]) * wp.cross(normal, vertices[i0] - vertices[i2])
-        + wp.float32(values[i2]) * wp.cross(normal, vertices[i1] - vertices[i0])
-    ) / (2.0 * area)
-    length = wp.length(gradient)
-    if length > TOLERANCE_ZERO_CONSTANT:
-        gradient = gradient / length
-    out_gradient[f] = wp.vec3d(
-        wp.float64(gradient[0]), wp.float64(gradient[1]), wp.float64(gradient[2])
-    )
+    out_gradient[f] = face_unit_gradient(vertices, faces, normals, areas, values, wp.int32(f))
 
 
 @wp.kernel
