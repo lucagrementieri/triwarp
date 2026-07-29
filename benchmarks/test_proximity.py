@@ -15,6 +15,24 @@ Only ``aabb_bounds`` has an open3d equivalent (``get_axis_aligned_bounding_box``
 generalized winding number — its inside/outside test is raycasting-based
 (``RaycastingScene.compute_occupancy``), a different algorithm answering a coarser question — and no
 tangent-sphere, local-thickness or geodesic-ball query at all.
+
+**pymeshlab** is the first reference of any kind for ``signed_distance_on_mesh``:
+``compute_scalar_by_distance_from_another_mesh_per_vertex(signeddist=True)`` (MeshLab's Distance
+from Reference Mesh) measures every vertex of one mesh against another, so the query points go in as
+a second, face-less mesh and the answer comes back on their vertex scalar attribute. Three things to
+read its row against:
+
+- **Its sign is a third algorithm.** MeshLab takes the dot product with the reference normal at the
+  closest point — neither triwarp's 5-ray parity test nor its Barnes-Hut winding accumulation. So it
+  appears once rather than twice, in the ``parity`` row.
+- **Its per-query cost grows with the reference mesh.** At a fixed 10 000 queries it costs
+  **206 / 627 / 7 678 ms** on bunny_decimated / bunny / dragon — 20, 63 and 768 µs per query — while
+  being cleanly linear in the query count at a fixed mesh (69 ms at 1 k, 642 at 10 k, 6 125 at 100 k
+  on bunny). A closest-point query that is *not* sublinear in the face count is the opposite of what
+  triwarp's BVH does — measured **95x** and **235x** against it on bunny_decimated and bunny, a
+  ratio that widens with the mesh — which is why it is capped at ``bunny`` with ``rounds=3`` rather
+  than allowed to spend 85 s on dragon.
+- It writes only the vertex scalar, so the two-mesh MeshSet is built once and shared.
 """
 
 from __future__ import annotations
@@ -23,6 +41,7 @@ from typing import Literal
 
 import igl
 import numpy as np
+import pymeshlab as ml
 import pytest
 import warp as wp
 from conftest import BenchCase, skip_larger_than
@@ -39,6 +58,7 @@ _N_QUERIES_SWEEP = [10_000, 100_000]
 _query_cache: dict[tuple[str, str, int], wp.array] = {}
 _surface_cache: dict[tuple[str, str], wp.array] = {}
 _mesh_cache: dict[tuple[str, str], wp.Mesh] = {}
+_pml_distance_cache: dict[tuple[str, str], ml.MeshSet] = {}
 
 
 def _query_points_np(bench_case: BenchCase, count: int = _N_QUERIES) -> np.ndarray:
@@ -124,8 +144,25 @@ def test_winding_number_serial(bench_case: BenchCase) -> None:
     assert result.shape == (_N_QUERIES,)
 
 
+def _distance_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
+    """
+    Build the reference mesh at id 0 and the query points as a face-less mesh at id 1, once.
+
+    The filter writes only mesh 1's vertex scalar attribute and leaves both geometries alone, so
+    sharing is sound (verified: repeated calls return bit-identical scalars at the same cost).
+    """
+    key = (bench_case.mesh_name, "pml")
+    if key not in _pml_distance_cache:
+        meshset_pml = bench_case.new_meshset_pml()
+        meshset_pml.add_mesh(
+            ml.Mesh(vertex_matrix=np.ascontiguousarray(_query_points_np(bench_case)))
+        )
+        _pml_distance_cache[key] = meshset_pml
+    return _pml_distance_cache[key]
+
+
 @pytest.mark.benchmark(group="signed_distance_on_mesh")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
 @pytest.mark.parametrize("sign_mode", ["parity", "winding"])
 def test_signed_distance_on_mesh(
     bench_case: BenchCase, sign_mode: Literal["parity", "winding"]
@@ -140,6 +177,20 @@ def test_signed_distance_on_mesh(
     ``signed_distance_on_mesh`` constructs its own mesh (it takes vertex/face arrays, not a
     ``wp.Mesh``), so there is no way for a caller to hoist it.
     """
+    if bench_case.kind == "pymeshlab":
+        if sign_mode != "parity":
+            pytest.skip("MeshLab signs by the closest-point normal: a third mode, so one row only")
+        skip_larger_than(bench_case, "bunny", "768 us per query on dragon: 85 s for one row")
+        meshset_pml = _distance_meshset_pml(bench_case)
+        bench_case.run(
+            lambda: meshset_pml.compute_scalar_by_distance_from_another_mesh_per_vertex(
+                measuremesh=1, refmesh=0, signeddist=True
+            ),
+            rounds=3,
+        )
+        assert meshset_pml.mesh(1).vertex_scalar_array().shape == (_N_QUERIES,)
+        return
+
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     points = _query_points_wp(bench_case)
     distance = bench_case.run(

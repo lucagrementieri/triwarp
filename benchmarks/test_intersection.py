@@ -28,6 +28,15 @@ declared dependency. open3d's boolean operations require the (also optional) ``o
 backend with a coupled remesh, so neither is an apples-to-apples baseline for "return the
 intersection segments". triwarp is timed alone; the before/after delta is what this case is for.
 
+**pymeshlab** has the right filter and cannot run it here. ``generate_polyline_from_planar_section``
+does exactly what ``mesh_with_plane`` does and more (it *orders* the segments into a polyline), and
+it works on the synthetic meshes -- but it raises ``PyMeshLabException: Failed to apply filter`` on
+**every scan mesh**, at any ``planeaxis``, ``planeoffset`` or ``relativeto`` (probed on
+``bunny_decimated`` with both ``'Z Axis'`` and ``'Custom Axis'``). That is the same non-manifold
+boundary the libigl and potpourri3d references run into elsewhere in the suite, and this module's
+groups are all on the scan sweep, so there is nowhere for the row to move. Recorded rather than
+skipped, so it is not re-derived.
+
 **libigl** has no plane-section or mesh-mesh intersection binding in the Python package
 (``igl.ray_mesh_intersect`` is the only intersection entry point, a different query), so igl is
 absent from every case in this module.

@@ -47,6 +47,38 @@ closest analogue of the orientation propagation and is timed against it.
 
 There is no open3d ``is_volume``: its closest composition (``is_watertight() and is_orientable()``)
 short-circuits on the first check, so it would time ``is_watertight`` under a different name.
+
+**pymeshlab** covers all three groups, and it answers the watertightness question in a way neither
+other reference does: ``get_topological_measures`` returns
+``{boundary_edges, connected_components_number, edges_number, faces_number, genus,
+is_mesh_two_manifold, non_two_manifold_edges, non_two_manifold_vertices, ...}`` -- **one call for
+every predicate this module exposes plus the genus and the Euler characteristic**. So its row is
+simultaneously the reference for ``is_watertight`` and ``is_volume``, an *upper* bound for each one
+alone.
+
+It does *not* include the self-intersection test, which is half of triwarp's and open3d's
+definition, so the honest composition is both calls together: ``get_topological_measures`` (51.7 ms
+on ``sphere_med``) plus ``compute_selection_by_self_intersections_per_face`` (105.9 ms), timed as
+one callable at **140.8 ms**. Which is the useful number here, because open3d computes the *same*
+composition in **13.8 s** -- so 98x of open3d's cost is its brute-force self-intersection scan, and
+nothing about the definition requires it.
+
+Both pymeshlab rows are also **flat across the overlap axis in the same direction as everything
+else** (140.8 -> 65.6 ms watertight, 130.7 -> 65.6 is_volume, i.e. *faster* on the self-intersecting
+mesh), which is the third independent confirmation that collision density is not what drives this
+predicate.
+
+For the valence group, ``compute_selection_by_non_manifold_per_vertex`` is the direct equivalent of
+``is_vertex_manifold`` -- a per-vertex one-ring test writing a bool selection array, exactly
+triwarp's shape. It reads 18.0 ms on ``sphere_med`` and 13.6 on ``fan_hub``: flat, like triwarp (1.8
+/ 2.2) and like libigl (100 / 107), so all three agree the valence distribution is not a hot spot.
+Both selection filters touch only the selected bit, so they share the MeshSet;
+``get_topological_measures`` is read-only.
+
+``face_orientation_bits`` has no pymeshlab equivalent that returns the *bits*:
+``meshing_re_orient_faces_coherently`` applies them and is benchmarked in
+[`test_repair.py`](test_repair.py) against ``make_winding_consistent``, which is the function that
+consumes them.
 """
 
 from __future__ import annotations
@@ -66,7 +98,7 @@ _O3D_ROUNDS = 1
 
 @pytest.mark.benchmark(group="is_vertex_manifold")
 @pytest.mark.benchaxis("valence")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
 def test_is_vertex_manifold(bench_case: BenchCase) -> None:
     """
     A connected-components problem per one-ring: driven by the valence distribution.
@@ -80,6 +112,10 @@ def test_is_vertex_manifold(bench_case: BenchCase) -> None:
             True,
             False,
         )
+    elif bench_case.kind == "pymeshlab":  # writes a per-vertex bool selection: triwarp's shape
+        meshset_pml = bench_case.meshset_pml
+        bench_case.run(meshset_pml.compute_selection_by_non_manifold_per_vertex)
+        assert meshset_pml.current_mesh().vertex_selection_array().shape == (bench_case.n_vertices,)
     else:
         faces_np = np.ascontiguousarray(bench_case.faces_np, dtype=np.int64)
         mask_igl = np.asarray(bench_case.run(lambda: igl.is_vertex_manifold(faces_np)))
@@ -108,11 +144,33 @@ def test_face_orientation_bits(bench_case: BenchCase) -> None:
         assert len(bench_case.run(fix_winding_tm).faces) == bench_case.n_faces
 
 
+def _run_topology_pml(bench_case: BenchCase) -> None:
+    """
+    Time MeshLab's whole topology report plus its self-intersection pass.
+
+    ``get_topological_measures`` alone answers edge-manifoldness, boundary-edge count, component
+    count and genus, but triwarp's and open3d's watertightness definition also requires "no self
+    intersection" -- so both calls are timed together rather than quoting the cheaper half. Its
+    manifoldness verdict is asserted on, which is what makes this a check and not just a stopwatch.
+    """
+    meshset_pml = bench_case.meshset_pml
+
+    def measure_pml() -> dict:
+        meshset_pml.compute_selection_by_self_intersections_per_face()
+        return meshset_pml.get_topological_measures()
+
+    assert measure_pml()["is_mesh_two_manifold"] in (True, False)
+    bench_case.run(measure_pml, rounds=_O3D_ROUNDS)
+
+
 @pytest.mark.benchmark(group="is_watertight")
 @pytest.mark.benchaxis("overlap")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
 def test_is_watertight(bench_case: BenchCase) -> None:
     """Edge counts plus a self-intersection pass: driven by collision density, not size."""
+    if bench_case.kind == "pymeshlab":
+        _run_topology_pml(bench_case)
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         result = bench_case.run(lambda: tw.validation.is_watertight(vertices, faces))
@@ -127,9 +185,12 @@ def test_is_watertight(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="is_volume")
 @pytest.mark.benchaxis("overlap")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
 def test_is_volume(bench_case: BenchCase) -> None:
     """``is_watertight`` plus winding plus a signed-volume sign: the priciest predicate."""
+    if bench_case.kind == "pymeshlab":  # the same one call: genus and manifoldness come together
+        _run_topology_pml(bench_case)
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         result = bench_case.run(lambda: tw.validation.is_volume(vertices, faces))

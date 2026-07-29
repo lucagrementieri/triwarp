@@ -779,9 +779,26 @@ def valence_flip_candidates(
     d = quad[3]
     if a < 0:
         return
-    if not is_unfold_quadrangle_convex(
-        to_vec3d(vertices[a]), to_vec3d(vertices[b]), to_vec3d(vertices[c]), to_vec3d(vertices[d])
-    ):
+    ap = to_vec3d(vertices[a])
+    bp = to_vec3d(vertices[b])
+    cp = to_vec3d(vertices[c])
+    dp = to_vec3d(vertices[d])
+    if not is_unfold_quadrangle_convex(ap, bp, cp, dp):
+        return
+    # Shape guard. Convexity makes the flip *legal* but says nothing about the shape of what it
+    # produces, and the valence objective below is blind to geometry: on a graded mesh it will
+    # happily turn two slivers into two worse ones, which in float32 lands on exactly-zero area.
+    # (Measured on ``saddle_graded``: the swap stage alone produced 3 992 zero-area faces out of
+    # 92 100, and none survive this guard. ``delone_flip_candidates`` has its own deviation and
+    # aspect gates; this is the equivalent for the valence objective.)
+    #
+    # ``triangle_aspect_ratio`` is circumradius / 2 * inradius and returns +inf for a degenerate
+    # triangle, so the two tests below read as "never create a degenerate triangle" and "never make
+    # the worse of the pair worse". Post-flip faces are (a, b, d) and (c, d, b) -- see commit_flips.
+    aspect_after = wp.max(triangle_aspect_ratio(ap, bp, dp), triangle_aspect_ratio(cp, dp, bp))
+    if not wp.isfinite(aspect_after):
+        return
+    if aspect_after > wp.max(triangle_aspect_ratio(ap, cp, dp), triangle_aspect_ratio(cp, ap, bp)):
         return
     # Target valence: 4 on the boundary, 6 in the interior.
     ta = wp.where(boundary_vertex[a], 4, 6)
@@ -814,6 +831,13 @@ def accumulate_one_ring(
     out_sum: wp.array(dtype=wp.vec3),
     out_degree: wp.array(dtype=wp.int32),
 ) -> None:
+    # Unweighted one-ring centroid. Note this is *not* the area-equalizing relaxation that
+    # Botsch-Kobbelt specify: on a regular graded grid every vertex already sits at the plain
+    # average of its neighbours, so this smoother is at a fixed point and cannot equalize the
+    # sampling. Area-weighting it takes the 99th-percentile aspect ratio on such a patch from 352
+    # to 20, but also makes ``is_watertight`` fail on ``cave_cube`` through a self-intersection at
+    # *every* step size down to lam=0.1, so it needs a fold guard first. See
+    # ``tests/test_remesh.py::test_remesh_emits_no_degenerate_faces``.
     e = int(wp.tid())
     u = unique_edges[e, 0]
     v = unique_edges[e, 1]

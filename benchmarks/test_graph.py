@@ -38,6 +38,14 @@ labelling counterpart.
 Neither **trimesh** nor **open3d** appears: both functions take an abstract CSR adjacency matrix,
 and open3d exposes no graph-traversal API over one -- its connectivity work is mesh-bound
 (``cluster_connected_triangles``), which is what ``split`` uses over in ``test_combine``.
+
+**pymeshlab** appears in ``connected_component_labels`` only, and with a caveat: it has no filter
+that returns a label array. The closest thing that runs the component pass *without* also splitting
+or deleting anything is ``compute_selection_by_small_disconnected_components_per_face`` at
+``nbfaceratio=0.0`` -- it labels every component and then thresholds against a fraction of the
+largest one, selecting nothing. So the row is "label everything, then one threshold pass", against
+triwarp's "label everything". It is also mesh-bound rather than CSR-bound, which is why it cannot
+appear in the ``bfs`` groups at all; the labelling is the only graph work MeshLab exposes.
 """
 
 from __future__ import annotations
@@ -89,10 +97,24 @@ def _scipy_graph(bench_case: BenchCase) -> sp.csr_matrix:
 
 @pytest.mark.benchmark(group="connected_component_labels")
 @pytest.mark.benchaxis("components")
-@pytest.mark.benchlibs("triwarp", "scipy")
+@pytest.mark.benchlibs("triwarp", "scipy", "pymeshlab")
 def test_connected_component_labels(bench_case: BenchCase) -> None:
     """ECL-CC hook and flatten, over 1 / 64 / 1024 components at a fixed face count."""
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pymeshlab":
+        # MeshLab has no filter that hands back a label array; the closest thing that *runs* the
+        # component pass without also splitting the mesh is the small-component face selection,
+        # which labels every component and then thresholds against a fraction of the largest one.
+        # ``nbfaceratio=0.0`` selects nothing, so the timing is the labelling pass and the
+        # threshold, not a deletion.
+        meshset_pml = bench_case.meshset_pml
+        bench_case.run(
+            lambda: meshset_pml.compute_selection_by_small_disconnected_components_per_face(
+                nbfaceratio=0.0
+            )
+        )
+        assert meshset_pml.current_mesh().face_selection_array().shape == (bench_case.n_faces,)
+        return
     if bench_case.kind == "triwarp":
         adjacency = _adjacency(bench_case)
         labels = bench_case.run(lambda: tw.graph.connected_component_labels(adjacency))

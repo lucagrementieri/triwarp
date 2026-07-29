@@ -23,12 +23,12 @@ Flags
     Which ``triwarp`` targets to time. ``auto`` (default) uses cuda when CUDA is available,
     else falls back to cpu — ``triwarp-cpu`` is not timed alongside cuda by default. Pass
     ``cpu`` for cpu only or ``both`` to time both triwarp targets. The ``trimesh`` / ``igl`` /
-    ``open3d`` / ``scipy`` / ``potpourri3d`` CPU baselines are always included.
+    ``open3d`` / ``scipy`` / ``potpourri3d`` / ``pymeshlab`` CPU baselines are always included.
 ``--size=<comma list | all>``
     Restrict meshes to these size categories (``small,medium,large,extralarge,huge``).
 ``--cpu-max-size=<category>``
     CPU-bound libraries (``triwarp-cpu``, ``trimesh``, ``igl``, ``open3d``, ``scipy``,
-    ``potpourri3d``) skip meshes
+    ``potpourri3d``, ``pymeshlab``) skip meshes
     larger than this unless the size was named explicitly in ``--size``. Default ``large`` — so
     ``happy_buddha`` and ``lucy`` run GPU-only by default while
     ``bunny_decimated``/``bunny``/``dragon`` run on CPU.
@@ -58,6 +58,7 @@ from meshes import (
 
 if TYPE_CHECKING:
     import open3d as o3d
+    import pymeshlab as ml
     from pytest_benchmark.fixture import BenchmarkFixture
 
 # Number of timed rounds and untimed warm-up rounds. The warm-up covers Warp kernel JIT
@@ -103,6 +104,13 @@ def skip_larger_than(bench_case: BenchCase, largest: str, reason: str = "") -> N
 # ``potpourri3d`` (pybind11 bindings over geometry-central) is CPU-only and the only reference for
 # the heat-method family; note that its solver objects cache their factorizations, so a benchmark
 # must construct the solver *inside* the timed callable to measure the work triwarp does per call.
+#
+# ``pymeshlab`` (pybind11 bindings over MeshLab / VCGlib) is CPU-only and the broadest reference in
+# the list -- 281 filters, of which 61 map onto something triwarp already has. Two things shape
+# every row: almost every filter *mutates* ``current_mesh()`` in place, and building the ``MeshSet``
+# costs ~0.47 us/vertex (17 ms on ``bunny``). So the MeshSet is built inside the timed callable via
+# ``BenchCase.new_meshset_pml`` unless the filter is verified pure, and any row cheaper than the
+# build cost is reporting the build. See ``BenchCase.new_meshset_pml`` for the full rule.
 LIBRARIES: list[LibrarySpec] = [
     {"id": "triwarp-cpu", "kind": "triwarp", "device": "cpu", "cpu_bound": True},
     {"id": "triwarp-cuda", "kind": "triwarp", "device": "cuda:0", "cpu_bound": False},
@@ -111,6 +119,7 @@ LIBRARIES: list[LibrarySpec] = [
     {"id": "open3d", "kind": "open3d", "device": None, "cpu_bound": True},
     {"id": "scipy", "kind": "scipy", "device": None, "cpu_bound": True},
     {"id": "potpourri3d", "kind": "potpourri3d", "device": None, "cpu_bound": True},
+    {"id": "pymeshlab", "kind": "pymeshlab", "device": None, "cpu_bound": True},
 ]
 LIBRARIES_BY_ID = {lib["id"]: lib for lib in LIBRARIES}
 
@@ -123,6 +132,7 @@ _numpy_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 _wp_cache: dict[tuple[str, str, str], wp.array] = {}
 _mean_edge_cache: dict[str, float] = {}
 _o3d_cache: dict[str, o3d.geometry.TriangleMesh] = {}
+_pml_cache: dict[str, ml.MeshSet] = {}
 
 
 def _load_numpy(name: str) -> tuple[np.ndarray, np.ndarray]:
@@ -204,6 +214,22 @@ def _new_mesh_o3d(name: str) -> o3d.geometry.TriangleMesh:
     )
 
 
+def _new_meshset_pml(name: str) -> ml.MeshSet:
+    """
+    Build a fresh single-mesh ``pymeshlab.MeshSet`` from the shared NumPy source.
+
+    Imported lazily (like ``meshio`` and ``open3d`` above) so the pymeshlab import and its Qt
+    dependencies are only paid by runs that include a pymeshlab case. MeshLab wants float64
+    positions and takes the ``(n_faces, 3)`` index array as-is.
+    """
+    import pymeshlab as ml
+
+    vertices, faces = _load_numpy(name)
+    meshset = ml.MeshSet()
+    meshset.add_mesh(ml.Mesh(vertices, faces))
+    return meshset
+
+
 def _vertices_wp(name: str, device: str) -> wp.array[wp.vec3]:
     """``wp.vec3`` (float32) vertex buffer on ``device``, cached per ``(name, device)``."""
     key = ("verts", name, device)
@@ -276,7 +302,7 @@ def _selected_libraries(config: pytest.Config) -> list[LibrarySpec]:
             continue
         if lib["id"] == "triwarp-cuda" and not (include_cuda and cuda_available):
             continue
-        # trimesh / igl / open3d / scipy baselines are always included.
+        # trimesh / igl / open3d / scipy / potpourri3d / pymeshlab baselines are always included.
         selected.append(lib)
     return selected
 
@@ -363,8 +389,8 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
-        "benchlibs(*kinds): library kinds (triwarp/trimesh/igl/open3d/scipy/potpourri3d) a "
-        "benchmark supports.",
+        "benchlibs(*kinds): library kinds "
+        "(triwarp/trimesh/igl/open3d/scipy/potpourri3d/pymeshlab) a benchmark supports.",
     )
     config.addinivalue_line(
         "markers",
@@ -439,7 +465,7 @@ class BenchLibrary:
 
     @property
     def kind(self) -> str:
-        """Library family: ``triwarp``/``trimesh``/``igl``/``open3d``/``scipy``/``potpourri3d``."""
+        """The library family: triwarp, trimesh, igl, open3d, scipy, potpourri3d or pymeshlab."""
         return self.library["kind"]
 
     @property
@@ -534,6 +560,61 @@ class BenchCase(BenchLibrary):
         if self.mesh_name not in _o3d_cache:
             _o3d_cache[self.mesh_name] = _new_mesh_o3d(self.mesh_name)
         return _o3d_cache[self.mesh_name]
+
+    def new_meshset_pml(self) -> ml.MeshSet:
+        """
+        Build a **fresh** single-mesh ``pymeshlab.MeshSet``; call this *inside* the timed callable.
+
+        Almost every MeshLab filter mutates ``current_mesh()`` in place -- ``apply_coord_*`` moves
+        vertices, ``meshing_*`` rewrites the topology, ``compute_*_per_vertex`` writes an attribute,
+        and ``generate_*`` pushes a new mesh onto the set -- so a shared MeshSet would have rounds
+        2..n measure a filter applied to its own output. That is the trimesh situation rather than
+        the open3d one, so the build goes inside the timed region, exactly as ``test_repair.py``'s
+        trimesh rows rebuild their ``tm.Trimesh`` and the potpourri3d rows construct their solver.
+
+        Two filters were checked and are *not* idempotent even in geometry, because they default to
+        ``autoclean=True`` and delete unreferenced vertices under you:
+        ``compute_curvature_principal_directions_per_vertex`` and
+        ``meshing_decimation_quadric_edge_collapse``.
+
+        The build is **not free** and it is the floor under every pymeshlab row: ~0.47 us/vertex,
+        measured at 0.91 ms on 2 562 vertices, 4.55 ms on 10 242 and **17.1 ms on ``bunny``**'s
+        35 947. Any pymeshlab row cheaper than that floor is reporting the build and nothing else --
+        read it that way rather than as a filter cost. Use ``meshset_pml`` for the narrow set of
+        filters verified to leave the geometry alone.
+        """
+        return _new_meshset_pml(self.mesh_name)
+
+    @property
+    def meshset_pml(self) -> ml.MeshSet:
+        """
+        Return a shared ``pymeshlab.MeshSet``, built once per mesh -- geometry-preserving only.
+
+        Two families qualify, both of which leave positions and topology untouched so that rounds
+        2..n do the identical work:
+
+        - the ``compute_scalar_*`` / ``compute_normal_*`` filters, which write one vertex or face
+          attribute and read only positions (``compute_scalar_ambient_occlusion``,
+          ``compute_scalar_by_volumetric_obscurance``,
+          ``compute_scalar_by_shape_diameter_function_per_vertex``,
+          ``compute_scalar_by_aspect_ratio_per_face``, ``compute_normal_per_vertex``);
+        - the selection filters, which write only the per-element *selected* bit. These are not
+          idempotent -- ``apply_selection_dilatation`` grows the set every call -- but their cost is
+          independent of how much is selected, because each one is a full pass over the face set.
+          Measured on ``sphere_med``: 120 consecutive dilatations taking the selection from 0.9% to
+          86% of 81 920 faces cost **0.86-1.21 ms** each (median 0.93), and 120 erosions back down
+          cost 1.18-1.23. So a group may seed the selection once, outside the timed callable, and
+          still read a clean per-call cost.
+
+        Because the state persists, a group that *depends* on the selection (the heat-geodesic
+        source set, say) must establish it itself rather than inherit what a previous group left.
+
+        Everything else -- including every ``meshing_*``, ``apply_coord_*`` and ``generate_*``
+        filter -- must call ``new_meshset_pml`` instead.
+        """
+        if self.mesh_name not in _pml_cache:
+            _pml_cache[self.mesh_name] = _new_meshset_pml(self.mesh_name)
+        return _pml_cache[self.mesh_name]
 
 
 @pytest.fixture

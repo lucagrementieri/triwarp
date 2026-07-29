@@ -23,15 +23,38 @@ References
 face-index groups and returns a list of meshes, so it is given a single group to match triwarp's
 single submesh.
 
-Neither trimesh nor open3d nor libigl has selection *morphology* -- growing or shrinking a vertex
-mask across the edge graph. trimesh's ``graph.connected_component_labels`` could reproduce
-``exclude_fully_selected_components`` in several steps, but not as one call, so those two groups are
-before/after self-comparisons.
+Neither trimesh nor open3d nor libigl has selection *morphology* -- growing or shrinking a mask
+across the mesh graph. **pymeshlab** does, and is the only reference the morphology pair has:
+``apply_selection_dilatation`` / ``apply_selection_erosion``, MeshLab's Dilate / Erode Selection.
+
+Two differences to read the rows against, neither of them correctable:
+
+- **It is face morphology, not vertex morphology.** MeshLab dilates the selected *face* set (via
+  VCGlib's loose vertex-from-face / face-from-vertex pair), so seeding it needs
+  ``compute_selection_by_condition_per_face`` and a vertex selection handed to it is simply cleared.
+  triwarp grows a vertex mask over the unique-edge table. Same operation class, same asymptotic work
+  -- one full pass over the elements per hop -- on a different element type.
+- **One filter call is one hop**, so the reference is a host loop of ``hops`` calls, which is
+  structurally what ``expand_vertex_mask``'s own per-hop launch loop does.
+
+The MeshSet is *shared* here rather than rebuilt per round, which is the exception to the rule in
+``BenchCase.new_meshset_pml``: these filters touch only the selected bit, and their cost does not
+depend on how much is selected (measured flat at 0.86-1.21 ms over 120 consecutive dilatations
+carrying ``sphere_med`` from 0.9% to 86% selected). Rebuilding instead would put a 22 ms MeshSet
+build on a 1 ms filter and flatten the slope this group exists to measure. It reads
+**1.03 -> 7.45 ms** for 1 -> 8 dilatations and **1.19 -> 9.54 ms** for 1 -> 8 erosions -- slopes of
+7.3x and 8.0x, i.e. the reference confirms independently that a hop is constant work. triwarp runs
+0.061 -> 0.30 ms and 0.13 -> 0.39 ms against it, so 17x and 9x at one hop and 25x at eight.
+
+trimesh's ``graph.connected_component_labels`` could reproduce
+``exclude_fully_selected_components`` in several steps, but not as one call, so that group remains a
+before/after self-comparison.
 """
 
 from __future__ import annotations
 
 import numpy as np
+import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
@@ -77,36 +100,71 @@ def _unique_edges(bench_case: BenchCase) -> wp.array:
     return _edges_cache[key]
 
 
+def _seeded_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
+    """
+    Return the shared MeshSet with a small face selection already established.
+
+    Seeded *outside* the timed callable, which the module docstring justifies: MeshLab's dilate and
+    erode cost the same whatever fraction is selected, so what the rounds start from does not change
+    what they measure. The condition picks a polar cap rather than the random 1% ``_seed_mask``
+    uses -- MeshLab has no way to set a selection array directly, only to derive one.
+    """
+    meshset_pml = bench_case.meshset_pml
+    meshset_pml.compute_selection_by_condition_per_face(condselect="(z0 > 0.98)")
+    return meshset_pml
+
+
 @pytest.mark.benchmark(group="expand_vertex_mask")
 @pytest.mark.benchmeshes("sphere_med")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
 @pytest.mark.parametrize("hops", _HOPS)
 def test_expand_vertex_mask(bench_case: BenchCase, hops: int) -> None:
     """One full edge pass per hop, regardless of selection size: the slope should be exactly 8."""
-    faces, mask = bench_case.faces_wp, _seed_mask(bench_case)
-    edges = _unique_edges(bench_case)
-    grown = bench_case.run(
-        lambda: tw.selection.expand_vertex_mask(faces, mask, hops, unique_edges=edges)
-    )
-    assert grown.shape == mask.shape
+    if bench_case.kind == "triwarp":
+        faces, mask = bench_case.faces_wp, _seed_mask(bench_case)
+        edges = _unique_edges(bench_case)
+        grown = bench_case.run(
+            lambda: tw.selection.expand_vertex_mask(faces, mask, hops, unique_edges=edges)
+        )
+        assert grown.shape == mask.shape
+    else:  # one Dilate Selection call per hop, on the face set
+        meshset_pml = _seeded_meshset_pml(bench_case)
+
+        def dilate_pml() -> int:
+            for _ in range(hops):
+                meshset_pml.apply_selection_dilatation()
+            return meshset_pml.current_mesh().selected_face_number()
+
+        assert bench_case.run(dilate_pml) > 0
 
 
 @pytest.mark.benchmark(group="shrink_vertex_mask")
 @pytest.mark.benchmeshes("sphere_med")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
 @pytest.mark.parametrize("hops", _HOPS)
 def test_shrink_vertex_mask(bench_case: BenchCase, hops: int) -> None:
     """The erosion counterpart, on the same input: should match ``expand`` row for row."""
-    faces = bench_case.faces_wp
-    edges = _unique_edges(bench_case)
-    # Grow first so there is something left to erode after 8 hops.
-    mask = tw.selection.expand_vertex_mask(
-        faces, _seed_mask(bench_case), max(_HOPS), unique_edges=edges
-    )
-    shrunk = bench_case.run(
-        lambda: tw.selection.shrink_vertex_mask(faces, mask, hops, unique_edges=edges)
-    )
-    assert shrunk.shape == mask.shape
+    if bench_case.kind == "triwarp":
+        faces = bench_case.faces_wp
+        edges = _unique_edges(bench_case)
+        # Grow first so there is something left to erode after 8 hops.
+        mask = tw.selection.expand_vertex_mask(
+            faces, _seed_mask(bench_case), max(_HOPS), unique_edges=edges
+        )
+        shrunk = bench_case.run(
+            lambda: tw.selection.shrink_vertex_mask(faces, mask, hops, unique_edges=edges)
+        )
+        assert shrunk.shape == mask.shape
+    else:  # dilate well past the erosion depth first, so there is something left to erode
+        meshset_pml = _seeded_meshset_pml(bench_case)
+        for _ in range(2 * max(_HOPS)):
+            meshset_pml.apply_selection_dilatation()
+
+        def erode_pml() -> None:
+            for _ in range(hops):
+                meshset_pml.apply_selection_erosion()
+
+        bench_case.run(erode_pml)
 
 
 def _face_indices(bench_case: BenchCase) -> tuple:

@@ -34,6 +34,20 @@ wraps a hole-filling pass over the boundary loops, which is the closest analogue
 minimum-weight triangulation. It returns a new tensor mesh, but ``from_legacy`` is a full
 conversion, so that conversion is hoisted out of the timed callable and only ``fill_holes`` is
 measured.
+
+**pymeshlab**'s ``meshing_close_holes`` is a third algorithm again -- an ear-clipping fill with an
+optional self-intersection check (``selfintersection=True`` by default, left on) rather than a
+minimum-weight DP. One parameter matters and it is a trap: **``maxholesize`` is an edge count with a
+default of 30**, so on ``rim_short``'s two 512-edge rims the filter closes *nothing* and returns in
+0.66 ms with ``{'closed_holes': 0}``. Lifting it to 10^6 is what makes the axis points comparable at
+all, and it moves ``rim_short`` from 0.66 to 64.9 ms while leaving ``holes_many`` at 38.5 (from
+36.9, where 30 edges was already enough for a three-edge hole). The dict it returns is what makes
+that checkable, and the assertion below reads it.
+
+Note what the axis then says: the reference spends **1.7x** on two 512-edge rims what it spends on
+512 three-edge holes, against triwarp's 37x. That is the ``B^3`` term -- MeshLab's ear clipping is
+quadratic at worst, so it does not pay it, and its rows are the honest price of *not* computing a
+minimum-weight triangulation.
 """
 
 from __future__ import annotations
@@ -78,9 +92,20 @@ def test_fill_holes_fan(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="fill_holes_min_weight")
 @pytest.mark.benchaxis("loops_dp")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
 def test_fill_holes_min_weight(bench_case: BenchCase) -> None:
     """The ``B^3`` DP: few long loops against many short ones, at a comparable total boundary."""
+    if bench_case.kind == "pymeshlab":
+        # ``maxholesize`` is an *edge count* cap, and its default of 30 would silently close nothing
+        # on ``rim_short``'s two 512-edge rims -- measured at 0.66 ms for zero holes closed. Lifting
+        # it is what makes the two axis points comparable at all, and the returned dict is asserted
+        # on so a future default change cannot quietly turn this row back into a no-op.
+        statistics_pml = bench_case.run(
+            lambda: bench_case.new_meshset_pml().meshing_close_holes(maxholesize=1_000_000),
+            rounds=_ROUNDS,
+        )
+        assert statistics_pml["closed_holes"] > 0
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         result = bench_case.run(

@@ -8,6 +8,7 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
+from tests.conversions import trimesh_to_pymeshlab
 
 
 def test_submesh_from_face_indices_empty(device: str) -> None:
@@ -338,6 +339,48 @@ def test_expand_vertex_mask(device: str):
         got = tw.selection.expand_vertex_mask(faces_wp, seed_wp, hops).numpy()
         expected = _graph_distance(faces_np, n, seed) <= hops
         assert np.array_equal(got, expected)
+
+
+def test_expand_vertex_mask_matches_pymeshlab_dilatation(device: str):
+    """
+    Mask growth against MeshLab's Dilate Selection, which is the only external check it has.
+
+    Neither trimesh nor open3d nor libigl has selection morphology. MeshLab does, but it dilates the
+    *face* set, so the composition that lines up with a vertex-mask hop is:
+
+        seed one vertex -> transfer to faces (``inclusive=False``, any selected vertex)
+        -> k x Dilate Selection -> read the *vertex* selection back
+
+    which is exactly ``expand_vertex_mask(seed, k)``. Verified to the element on a 9x9 grid for
+    ``k = 1..4``. Note ``inclusive=False`` is load-bearing: the default ``True`` selects only faces
+    whose *every* vertex is selected, which on a single-vertex seed is no faces at all and clears
+    the selection.
+
+    **Erosion does not map the same way** and is deliberately not checked here: MeshLab's Erode
+    Selection removes a face when any of its vertices is on the boundary of the selection, so
+    reading the vertex selection back gives the vertices of the surviving *faces* -- measured at
+    51 / 39 / 25 vertices after 1 / 2 / 3 erosions where ``shrink_vertex_mask`` gives 19 / 7 / 1.
+    Different operation, not a discrepancy. ``test_shrink_vertex_mask`` keeps the scipy oracle.
+    """
+    vertices_np, faces_np = _grid_mesh(9)
+    n_vertices = len(vertices_np)
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+    seed_np = np.zeros(n_vertices, dtype=bool)
+    centre = n_vertices // 2
+    seed_np[centre] = True
+    seed_wp = wp.array(seed_np, dtype=wp.bool, device=device)
+
+    mesh_tm = tm.Trimesh(vertices_np, faces_np.reshape(-1, 3), process=False)
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    meshset_pml.compute_selection_by_condition_per_vertex(condselect=f"(vi == {centre})")
+    meshset_pml.compute_selection_transfer_vertex_to_face(inclusive=False)
+
+    for hops in (1, 2, 3, 4):
+        meshset_pml.apply_selection_dilatation()
+        assert np.array_equal(
+            tw.selection.expand_vertex_mask(faces_wp, seed_wp, hops).numpy(),
+            meshset_pml.current_mesh().vertex_selection_array(),
+        )
 
 
 def test_shrink_vertex_mask(device: str):

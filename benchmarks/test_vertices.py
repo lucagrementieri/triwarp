@@ -29,8 +29,23 @@ libraries.
 
 ``n_vertices`` has no open3d equivalent worth timing: open3d stores the vertex count explicitly, so
 ``len(mesh.vertices)`` is O(1) and does not measure the max-reduce triwarp performs.
-``average_onto_vertices`` has no reference at all in any of the three -- it is an array primitive,
-not a mesh operation.
+
+**pymeshlab** covers three of the five groups, and its ``weightmode`` enum is what makes it useful
+here: ``compute_normal_per_vertex`` implements four weighting schemes behind one filter, two of
+which are exactly triwarp's -- ``'Simple Average'`` is ``mean_vertex_normals`` and ``'By Area'`` is
+``area_weighted_vertex_normals``, so the pair also isolates what the area weight costs on the
+reference's side (1.15 -> 1.34 ms). ``compute_scalar_transfer_face_to_vertex(areaweight=False)`` is
+``average_onto_vertices``, the plain incident-corner mean, and gives that group its first reference
+of any kind -- it had none, being an array primitive rather than a mesh operation.
+
+All three write only an attribute (vertex normals or the vertex scalar) and are idempotent, so they
+run against the shared MeshSet with no build inside the timed region.
+
+The reference **agrees with this module's headline result independently**: across the valence axis
+it reads 1.34 against 1.22 ms for the area-weighted normals and 0.72 against 0.71 ms for the
+transfer -- i.e. also flat, and if anything marginally *faster* on the hub mesh. Two
+implementations with nothing in common both saying valence is not a cost driver here is a stronger
+statement than triwarp's own under-2x spread was on its own.
 """
 
 from __future__ import annotations
@@ -76,9 +91,14 @@ def test_n_vertices(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="mean_vertex_normals")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
 def test_mean_vertex_normals(bench_case: BenchCase) -> None:
     """The unweighted scatter, on the scan sweep: the throughput baseline for the group below."""
+    if bench_case.kind == "pymeshlab":  # 'Simple Average' is exactly the unweighted scheme
+        meshset_pml = bench_case.meshset_pml
+        bench_case.run(lambda: meshset_pml.compute_normal_per_vertex(weightmode="Simple Average"))
+        assert meshset_pml.current_mesh().vertex_normal_matrix().shape[0] == bench_case.n_vertices
+        return
     face_normals, _areas = _face_normals_and_areas(bench_case)
     n_vertices = bench_case.n_vertices
     faces = bench_case.faces_wp
@@ -90,10 +110,15 @@ def test_mean_vertex_normals(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="area_weighted_vertex_normals")
 @pytest.mark.benchaxis("valence")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
 def test_area_weighted_vertex_normals(bench_case: BenchCase) -> None:
     """Area-weighted scatter, uniform valence 6 against two 40 960-valence hubs."""
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pymeshlab":  # 'By Area' is triwarp's weighting exactly
+        meshset_pml = bench_case.meshset_pml
+        bench_case.run(lambda: meshset_pml.compute_normal_per_vertex(weightmode="By Area"))
+        assert meshset_pml.current_mesh().vertex_normal_matrix().shape == (n_vertices, 3)
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         result = bench_case.run(
@@ -138,9 +163,18 @@ def test_area_weighted_vertex_normals_precomputed(bench_case: BenchCase) -> None
 
 @pytest.mark.benchmark(group="average_onto_vertices")
 @pytest.mark.benchaxis("valence")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
 def test_average_onto_vertices(bench_case: BenchCase) -> None:
     """``triwarp.interpolation``'s face-to-vertex scatter: the same contention, without the math."""
+    if bench_case.kind == "pymeshlab":
+        # MeshLab transfers whatever is in the face scalar attribute, so it is seeded once (with the
+        # barycentre's z rather than the face areas triwarp scatters -- values do not change what a
+        # scatter costs, only the indices do) and ``areaweight=False`` gives the plain corner mean.
+        meshset_pml = bench_case.meshset_pml
+        meshset_pml.compute_scalar_by_function_per_face(q="z0")
+        bench_case.run(lambda: meshset_pml.compute_scalar_transfer_face_to_vertex(areaweight=False))
+        assert meshset_pml.current_mesh().vertex_scalar_array().shape == (bench_case.n_vertices,)
+        return
     _normals, face_areas = _face_normals_and_areas(bench_case)
     n_vertices = bench_case.n_vertices
     faces = bench_case.faces_wp

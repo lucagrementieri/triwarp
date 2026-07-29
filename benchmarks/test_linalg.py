@@ -36,13 +36,28 @@ Everything runs in **float64** (the operator dtype these entry points require) a
 
 References
 ----------
-None. These are the raw solver entry points over a ``warp.sparse`` BSR operator, and no reference in
-the test group exposes an equivalent: scipy's ``cg`` would be a host solver over a scipy matrix
+**pymeshlab** is the only reference this module has, and it covers exactly one of the three groups:
+``compute_scalar_by_scalar_harmonic_field_per_vertex`` (MeshLab's Generate Scalar Harmonic Field) is
+a Dirichlet-constrained solve of the same cotangent system ``min_quad_with_fixed`` solves, so the
+two answer the same question by opposite means -- MeshLab factors the free-free block directly,
+triwarp runs batched CG on it.
+
+That makes it worth more than a timing row: it is the **conditioning control**. Measured on the axis
+meshes (RTX 5090 host) it runs **39.0 ms on ``saddle`` and 39.6 ms on ``saddle_graded``** -- flat --
+against triwarp's **33.7 -> 83.5 ms** at 1% pinned. So triwarp wins by 1.2x on the well-conditioned
+mesh and loses by **2.1x** on the graded one, and the entire spread is its CG iteration count rather
+than anything intrinsic about the problem: a direct factorization of the identical system does not
+care. It is the same observation the potpourri3d rows make in
+[`test_geodesic.py`](test_geodesic.py) and libigl's LDLT makes in
+[`test_parametrization.py`](test_parametrization.py).
+
+Two limits on it, both structural. MeshLab pins **exactly two vertices** (``point1`` / ``point2``
+with scalar values), so it has no fixed-fraction axis at all and appears only in the ``pin1pct``
+row, the closer and harder of the two. And it is *only* the harmonic solve: nothing in the reference
+group exposes a raw iterative solver, so ``solve_spd_columns`` and ``spd_column_solver_amortized``
+remain before/after self-comparisons. scipy's ``cg`` would be a host solver over a scipy matrix
 (timing SciPy's sparse layer, not this one), libigl solves only through its own direct
-factorizations with no iterative entry point, and neither trimesh nor open3d has a linear solver at
-all. The cross-library conditioning comparison lives in
-[`test_parametrization.py`](test_parametrization.py), where libigl's direct LDLT solves the same
-systems end to end. These groups are before/after self-comparisons.
+factorizations, and neither trimesh nor open3d has a linear solver at all.
 """
 
 from __future__ import annotations
@@ -122,9 +137,16 @@ def _rhs(bench_case: BenchCase) -> wp.array:
     return _rhs_cache[key]
 
 
+def _harmonic_endpoints_pml(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarray]:
+    """Return the two extremal-``x`` vertices, the Dirichlet pair MeshLab's harmonic field takes."""
+    vertices_np = bench_case.vertices_np
+    order = np.argsort(vertices_np[:, 0])
+    return vertices_np[order[0]], vertices_np[order[-1]]
+
+
 @pytest.mark.benchmark(group="min_quad_with_fixed")
 @pytest.mark.benchaxis("quality")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
 @pytest.mark.parametrize("fixed_fraction", _FIXED_FRACTIONS, ids=["pin1pct", "pin50pct"])
 def test_min_quad_with_fixed(bench_case: BenchCase, fixed_fraction: float) -> None:
     """
@@ -133,7 +155,26 @@ def test_min_quad_with_fixed(bench_case: BenchCase, fixed_fraction: float) -> No
     Four rows per table. Across the mesh pair the gap is conditioning; across the pin pair it is
     both a smaller free block and a better-conditioned one. The interesting cell is
     ``saddle_graded`` at 1% pinned -- the worst-conditioned, largest free system.
+
+    The pymeshlab row is the control for exactly that cell: its direct factorization of the same
+    system is flat across the mesh pair, so whatever spread triwarp shows is the CG iteration count
+    and not the problem.
     """
+    if bench_case.kind == "pymeshlab":
+        if fixed_fraction != min(_FIXED_FRACTIONS):
+            pytest.skip("MeshLab's harmonic field pins exactly two vertices: no fraction axis")
+        # Geometry-preserving with ``colorize=False`` (it writes only the vertex scalar), so the
+        # shared MeshSet is sound and the ~9 ms build stays out of a ~40 ms row.
+        meshset_pml = bench_case.meshset_pml
+        point1, point2 = _harmonic_endpoints_pml(bench_case)
+        bench_case.run(
+            lambda: meshset_pml.compute_scalar_by_scalar_harmonic_field_per_vertex(
+                point1=point1, point2=point2, colorize=False
+            )
+        )
+        assert meshset_pml.current_mesh().vertex_scalar_array().shape[0] == bench_case.n_vertices
+        return
+
     _skip_cpu(bench_case)
     operator = _operator(bench_case)
     fixed_mask, fixed_values = _fixed(bench_case, fixed_fraction)

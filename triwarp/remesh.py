@@ -379,7 +379,15 @@ def _valence_flip_pass(
 def _smooth_pass(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], codes: wp.array[wp.int32]
 ) -> wp.array[wp.vec3]:
-    """One tangential Laplacian smoothing step over free vertices."""
+    """
+    One tangential Laplacian smoothing step over free vertices.
+
+    This is the *unweighted* one-ring centroid, which is a documented gap rather than a choice: the
+    area-equalizing form Botsch-Kobbelt specify (and which ``isotropic_remesh``'s Notes describe) is
+    what actually removes anisotropy, and this one cannot -- on a regular graded grid every vertex
+    already sits at the plain average of its neighbours, so the smoother is at a fixed point. See
+    ``accumulate_one_ring`` for the measurement and the blocker.
+    """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     normals = tw.vertices.area_weighted_vertex_normals(n_vertices, vertices, faces)

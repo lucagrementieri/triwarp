@@ -30,6 +30,18 @@ References
 ``KDTreeSearchParamKNN`` is the same k-nearest PCA estimator (its ``FastEigen3x3`` picks the
 smallest-eigenvalue eigenvector, as triwarp's ``wp.svd3`` path does).
 
+**pymeshlab** covers two: ``compute_normal_for_point_clouds(k=)`` is the same k-nearest PCA
+estimator at the same ``k`` (and it exists for exactly this case -- a dataset with no faces -- so
+its input is a *face-less* MeshSet); and ``compute_matrix_by_fitting_to_plane`` is the ``fit_plane``
+counterpart, reporting the fitted normal and the average fitting error. That one has a
+precondition: it raises ``Cannot compute rotation: there is no selection`` unless something is
+selected, so ``set_selection_all`` runs first, untimed -- it is how the filter is told "fit all the
+points", not part of the fit. It also builds a rotation matrix onto a target plane, which triwarp
+does not, so its row is an upper bound.
+
+MeshLab has nothing for ``fit_line`` / ``major_axis``, ``point_plane_distance``, ``vector_angle`` or
+``radial_sort``: those are array primitives rather than filters.
+
 **libigl** has no equivalent for anything in this module — it is a mesh library, and its
 point-cloud entry points (``igl.fit_plane`` does not exist in the Python bindings) are not exposed.
 
@@ -55,6 +67,7 @@ from __future__ import annotations
 
 import numpy as np
 import open3d as o3d
+import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
@@ -83,6 +96,7 @@ _PLANE_NORMAL = np.array([0.3, -0.6, 0.74])
 _neighbors_cache: dict[tuple[str, str, int], twt.Array2dInt32] = {}
 _normals_wp_cache: dict[tuple[str, str], wp.array[wp.vec3]] = {}
 _pcd_cache: dict[str, o3d.geometry.PointCloud] = {}
+_cloud_pml_cache: dict[str, ml.MeshSet] = {}
 
 
 def _neighbor_table(bench_case: BenchCase, k: int = _KNN) -> twt.Array2dInt32:
@@ -159,9 +173,22 @@ def test_fit_line(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="fit_plane")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
 def test_fit_plane(bench_case: BenchCase) -> None:
     """Least-squares plane: centroid reduction, centred covariance, then the smallest-sigma axis."""
+    if bench_case.kind == "pymeshlab":
+        # ``compute_matrix_by_fitting_to_plane`` raises ``Cannot compute rotation: there is no
+        # selection`` unless something is selected, so ``set_selection_all`` runs first (untimed --
+        # it is how the filter is told "fit all the points", not part of the fit). It returns the
+        # fitted normal and the average fitting error, which is triwarp's answer plus a residual;
+        # the rotation matrix it also builds is the part triwarp does not do.
+        meshset_pml = bench_case.meshset_pml
+        meshset_pml.set_selection_all()
+        result_pml = bench_case.run(
+            lambda: meshset_pml.compute_matrix_by_fitting_to_plane(targetplane="XY plane")
+        )
+        assert result_pml["fitting_plane_normal"].shape == (3,)
+        return
     if bench_case.kind == "triwarp":
         points = bench_case.vertices_wp
         centroid, normal = bench_case.run(lambda: tw.points.fit_plane(points))
@@ -238,13 +265,37 @@ def test_estimate_normals(bench_case: BenchCase, k: int) -> None:
     assert normals.shape == (bench_case.n_vertices,)
 
 
+def _cloud_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
+    """
+    Build the same vertices as a *face-less* pymeshlab mesh, once per mesh.
+
+    ``compute_normal_for_point_clouds`` exists precisely for datasets with no faces, and writing the
+    vertex normals leaves the positions alone, so this is cached rather than rebuilt per round.
+    """
+    if bench_case.mesh_name not in _cloud_pml_cache:
+        meshset_pml = ml.MeshSet()
+        meshset_pml.add_mesh(
+            ml.Mesh(vertex_matrix=np.ascontiguousarray(bench_case.vertices_np, dtype=np.float64))
+        )
+        _cloud_pml_cache[bench_case.mesh_name] = meshset_pml
+    return _cloud_pml_cache[bench_case.mesh_name]
+
+
 @pytest.mark.benchmark(group="estimate_normals_knn")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "open3d")
+@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab")
 def test_estimate_normals_knn(bench_case: BenchCase) -> None:
     """Neighbour search plus PCA — what open3d's ``estimate_normals`` does in one call."""
     if bench_case.mesh_name == "sphere_large":
         pytest.skip("open3d searches one point at a time; capped at sphere_med")
+    if bench_case.kind == "pymeshlab":
+        # The same search-plus-PCA in one call, at the same ``k``; ``smoothiter=0`` keeps it to that
+        # and leaves out the orientation propagation triwarp does not do either. A *point-cloud*
+        # MeshSet: the filter is for datasets with no faces.
+        cloud_pml = _cloud_meshset_pml(bench_case)
+        bench_case.run(lambda: cloud_pml.compute_normal_for_point_clouds(k=_KNN, smoothiter=0))
+        assert cloud_pml.current_mesh().vertex_normal_matrix().shape == (bench_case.n_vertices, 3)
+        return
     if bench_case.kind == "triwarp":
         points = bench_case.vertices_wp
         normals = bench_case.run(

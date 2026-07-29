@@ -25,6 +25,14 @@ uses), Hausdorff as the overall maximum. Both baselines therefore run the same t
 does, and the host-side ``numpy`` reduction over the returned vector is inside the timed region
 because open3d has no device-side equivalent to hide it behind.
 
+**pymeshlab**'s ``get_hausdorff_distance`` is the second reference for the Hausdorff group, and it
+returns ``{min, max, mean, RMS, n_samples, ...}`` in one call. Two parameters decide whether the row
+means anything: it samples **one** layer and searches the other, so it is one-directional and the
+symmetric answer needs both calls (both are timed); and ``samplenum`` defaults to **8**, so
+``samplevert=True`` with ``samplenum`` set to the full cloud size is what makes it sample every
+point instead of measuring almost nothing. It has no Chamfer entry point -- the mean of the squares
+is not among the statistics it returns -- so it appears in the Hausdorff group alone.
+
 trimesh and libigl have no point-cloud Chamfer/Hausdorff entry point (``igl.hausdorff`` is
 mesh-to-mesh only and is already the documented reference for
 [`hausdorff_mesh_to_mesh`][triwarp.distance.hausdorff_mesh_to_mesh] in ``tests/``), so neither
@@ -37,6 +45,7 @@ from typing import cast
 
 import numpy as np
 import open3d as o3d
+import pymeshlab as ml
 import pytest
 import warp as wp
 from conftest import BenchCase, skip_larger_than
@@ -50,6 +59,7 @@ _grad_cache: dict[tuple[str, str], tuple] = {}
 _cloud_np_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 _cloud_wp_cache: dict[tuple[str, str], tuple] = {}
 _cloud_o3d_cache: dict[str, tuple] = {}
+_cloud_pml_cache: dict[str, ml.MeshSet] = {}
 
 
 def _clouds_np(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarray]:
@@ -157,11 +167,47 @@ def test_chamfer_points_to_points(bench_case: BenchCase, single_directional: boo
     assert chamfer > 0.0
 
 
+def _clouds_meshset_pml(bench_case: BenchCase) -> tuple[ml.MeshSet, int]:
+    """
+    Return the two clouds as face-less meshes 0 and 1 of one MeshSet, plus their point count.
+
+    ``get_hausdorff_distance`` writes the per-sample distance into the sampled mesh's vertex scalar
+    attribute and touches nothing else, so this is cached rather than rebuilt per round.
+    """
+    if bench_case.mesh_name not in _cloud_pml_cache:
+        meshset_pml = ml.MeshSet()
+        for cloud_np in _clouds_np(bench_case):
+            meshset_pml.add_mesh(
+                ml.Mesh(vertex_matrix=np.ascontiguousarray(cloud_np, dtype=np.float64))
+            )
+        _cloud_pml_cache[bench_case.mesh_name] = meshset_pml
+    count = int(_clouds_np(bench_case)[0].shape[0])
+    return _cloud_pml_cache[bench_case.mesh_name], count
+
+
 @pytest.mark.benchmark(group="hausdorff_points_to_points")
-@pytest.mark.benchlibs("triwarp", "open3d")
+@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab")
 def test_hausdorff_points_to_points(bench_case: BenchCase) -> None:
     """Symmetric point-cloud Hausdorff: the same two searches, reduced with ``max`` instead."""
     skip_larger_than(bench_case, "dragon")
+    if bench_case.kind == "pymeshlab":
+        # ``get_hausdorff_distance`` is *one-directional* by construction -- it samples one layer
+        # and searches the other -- so the symmetric answer is both directions, and both are timed.
+        # ``samplevert=True`` with ``samplenum`` at the full cloud size makes it sample every point
+        # rather than its default 8, which would otherwise measure almost nothing.
+        meshset_pml, count = _clouds_meshset_pml(bench_case)
+
+        def hausdorff_pml() -> float:
+            forward = meshset_pml.get_hausdorff_distance(
+                sampledmesh=0, targetmesh=1, samplevert=True, samplenum=count
+            )
+            backward = meshset_pml.get_hausdorff_distance(
+                sampledmesh=1, targetmesh=0, samplevert=True, samplenum=count
+            )
+            return max(float(forward["max"]), float(backward["max"]))
+
+        assert bench_case.run(hausdorff_pml) > 0.0
+        return
     if bench_case.kind == "triwarp":
         cloud_a, cloud_b = _clouds_wp(bench_case)
         hausdorff = bench_case.run(lambda: tw.distance.hausdorff_points_to_points(cloud_a, cloud_b))

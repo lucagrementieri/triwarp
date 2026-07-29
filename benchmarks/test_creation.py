@@ -35,6 +35,26 @@ open3d builds these on the CPU in C++ with per-vertex loops, so at low resolutio
 latency and at high resolution the comparison is the intended one: loop-per-vertex versus one kernel
 launch per buffer.
 
+**pymeshlab** covers five, and it is the only reference for ``icosphere``:
+
+- ``create_sphere(subdiv=)`` is "a regular subdivision of an icosahedron" -- so unlike open3d's
+  ``create_sphere`` it pairs with ``icosphere``, **not** with ``uv_sphere``, and it takes the same
+  subdivision count. That closes the gap open3d left.
+- ``create_torus(hsubdiv=, vsubdiv=)``, ``create_annulus(sides=)`` and ``create_cone(subdiv=)`` map
+  directly onto the section counts, and the annulus is the only annular factory outside trimesh.
+- ``create_cube(size=)`` is the ``box`` counterpart, with one caveat: it takes a single scale factor
+  rather than three extents, so it builds a cube where the other three build a 1x2x3 box. Twelve
+  triangles either way, which is all that group measures.
+
+There is no ``uv_sphere``, ``revolve``, ``capsule``, ``extrude_polygon``, ``sweep_polygon``,
+``truncated_prisms``, ``axis`` or ``random_soup`` counterpart -- MeshLab's parametric primitives are
+a fixed catalogue, not a profile-and-sweep toolkit, which is the structural difference this module's
+open3d note already makes.
+
+Every ``create_*`` filter pushes a new mesh onto the MeshSet, so each row builds a fresh
+``ml.MeshSet`` inside the timed callable. That construction is ~30 us empty, so unlike the
+mesh-driven modules the build is not a meaningful share of these rows.
+
 Measured medians
 ----------------
 RTX 5090 / Warp 1.15, ``--device=cuda``. ``sections`` are 32 / 512 / 4096 unless noted.
@@ -97,6 +117,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
+import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
@@ -165,8 +186,15 @@ def _helix_np(n: int) -> np.ndarray:
     return np.column_stack((5.0 * np.cos(t_np), 5.0 * np.sin(t_np), t_np))
 
 
+def _new_cube_pml() -> ml.MeshSet:
+    """Build a fresh MeshSet carrying MeshLab's unit cube; every ``create_*`` pushes a mesh."""
+    meshset_pml = ml.MeshSet()
+    meshset_pml.create_cube(size=1.0)
+    return meshset_pml
+
+
 @pytest.mark.benchmark(group="box")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
 def test_box(bench_lib: BenchLibrary) -> None:
     """
     The suite's launch-overhead calibration probe.
@@ -185,6 +213,10 @@ def test_box(bench_lib: BenchLibrary) -> None:
     anything else has already imported and JITed. That is a property of first-touch cost, not of
     ``box``, and it applies to whichever group happens to run first in any module.
     """
+    if bench_lib.kind == "pymeshlab":  # a cube, not a 1x2x3 box: one scale factor is all it takes
+        assert _new_cube_pml().current_mesh().face_number() == 12
+        bench_lib.run(_new_cube_pml)
+        return
     if bench_lib.kind == "triwarp":
         device = bench_lib.device
         _, faces_wp = bench_lib.run(lambda: tw.creation.box(extents=(1.0, 2.0, 3.0), device=device))
@@ -199,10 +231,22 @@ def test_box(bench_lib: BenchLibrary) -> None:
 
 
 @pytest.mark.benchmark(group="icosphere")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
 @pytest.mark.parametrize("subdivisions", _SUBDIVISIONS)
 def test_icosphere(bench_lib: BenchLibrary, subdivisions: int) -> None:
-    # No open3d counterpart: create_icosahedron is never subdivided.
+    # No open3d counterpart: create_icosahedron is never subdivided. MeshLab's create_sphere is
+    # exactly this scheme, so it is the only reference this group has beyond trimesh.
+    if bench_lib.kind == "pymeshlab":
+        if subdivisions > 8:
+            pytest.skip("MeshLab's create_sphere caps subdiv at 8")
+
+        def sphere_pml() -> int:
+            meshset_pml = ml.MeshSet()
+            meshset_pml.create_sphere(radius=1.0, subdiv=subdivisions)
+            return meshset_pml.current_mesh().face_number()
+
+        assert bench_lib.run(sphere_pml) == 20 * 4**subdivisions
+        return
     if bench_lib.kind == "triwarp":
         device = bench_lib.device
         _, faces_wp = bench_lib.run(
@@ -258,9 +302,17 @@ def test_cylinder(bench_lib: BenchLibrary, sections: int) -> None:
 
 
 @pytest.mark.benchmark(group="cone")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
 @pytest.mark.parametrize("sections", _SECTIONS)
 def test_cone(bench_lib: BenchLibrary, sections: int) -> None:
+    if bench_lib.kind == "pymeshlab":
+
+        def cone_pml() -> None:
+            meshset_pml = ml.MeshSet()
+            meshset_pml.create_cone(r0=1.0, r1=0.0, h=2.0, subdiv=sections)
+
+        bench_lib.run(cone_pml)
+        return
     if bench_lib.kind == "triwarp":
         device = bench_lib.device
         _, faces_wp = bench_lib.run(
@@ -279,10 +331,20 @@ def test_cone(bench_lib: BenchLibrary, sections: int) -> None:
 
 
 @pytest.mark.benchmark(group="annulus")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
 @pytest.mark.parametrize("sections", _SECTIONS)
 def test_annulus(bench_lib: BenchLibrary, sections: int) -> None:
-    # No open3d counterpart: there is no annular-cylinder factory.
+    # No open3d counterpart: there is no annular-cylinder factory. MeshLab's annulus is a flat holed
+    # disk rather than triwarp's annular *cylinder*, so it builds fewer faces at the same section
+    # count -- a floor for this row rather than an equivalent.
+    if bench_lib.kind == "pymeshlab":
+
+        def annulus_pml() -> None:
+            meshset_pml = ml.MeshSet()
+            meshset_pml.create_annulus(internalradius=0.5, externalradius=1.0, sides=sections)
+
+        bench_lib.run(annulus_pml)
+        return
     if bench_lib.kind == "triwarp":
         device = bench_lib.device
         _, faces_wp = bench_lib.run(
@@ -297,9 +359,18 @@ def test_annulus(bench_lib: BenchLibrary, sections: int) -> None:
 
 
 @pytest.mark.benchmark(group="torus")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
 @pytest.mark.parametrize("sections", _SECTIONS)
 def test_torus(bench_lib: BenchLibrary, sections: int) -> None:
+    if bench_lib.kind == "pymeshlab":
+
+        def torus_pml() -> int:
+            meshset_pml = ml.MeshSet()
+            meshset_pml.create_torus(hradius=1.0, vradius=0.25, hsubdiv=sections, vsubdiv=32)
+            return meshset_pml.current_mesh().face_number()
+
+        assert bench_lib.run(torus_pml) == 2 * 32 * sections
+        return
     if bench_lib.kind == "triwarp":
         device = bench_lib.device
         _, faces_wp = bench_lib.run(

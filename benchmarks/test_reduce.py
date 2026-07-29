@@ -35,18 +35,34 @@ timed region holds only the reduction.
 
 References
 ----------
-**No baseline is registered.** ``reduce`` is an array primitive, not a geometry operation — the same
-reason [`test_grouping.py`](test_grouping.py) is triwarp-only. The natural reference is
-``numpy.sum`` / ``numpy.median``, but NumPy is not a library *kind* in the harness registry (it is
-the substrate every CPU baseline is already built on), and timing a host reduction against a device
-one measures PCIe and thread count rather than anything a change to these kernels would move.
-trimesh, libigl and open3d expose no array-reduction API at all. These are before/after
-self-comparisons, which is what the tile-tail-clamp batch touching this module needs.
+``reduce`` is an array primitive, not a geometry operation — the same reason
+[`test_grouping.py`](test_grouping.py) is triwarp-only. NumPy would be the natural reference but is
+not a library *kind* in the harness registry (it is the substrate every CPU baseline is already
+built on), and timing a host reduction against a device one measures PCIe and thread count rather
+than anything a change to these kernels would move. trimesh, libigl and open3d expose no
+array-reduction API at all.
+
+**pymeshlab** is the one exception and lands in the ``median`` group.
+``get_scalar_statistics_per_vertex`` reduces a per-vertex scalar attribute to ``{min, max, avg, med,
+stddev, variance}`` — so it is genuinely the same work, over the same input (the scalar is seeded
+from the vertices' ``z`` with ``compute_scalar_by_function_per_vertex(q='z')``, which reproduces
+``_scalars_wp`` exactly). Two things follow:
+
+- **It answers six questions in one call**, so its single number is simultaneously the reference for
+  ``median``, ``minmax_scalar``, ``min_scalar`` and a scalar mean — an *upper* bound for each one
+  taken alone and a *lower* bound for computing all of them. It appears once, in ``median``, because
+  the percentile is the part that needs a sort and therefore the part that dominates both sides.
+- **It is read-only** (it returns a dict and touches nothing), so the MeshSet is shared and only the
+  attribute seeding sits outside the timed callable.
+
+Everything else here stays a before/after self-comparison, which is what the tile-tail-clamp batch
+touching this module needs.
 """
 
 from __future__ import annotations
 
 import numpy as np
+import pymeshlab as ml
 import pytest
 import warp as wp
 from conftest import BenchCase
@@ -145,10 +161,22 @@ def test_max_axis1(bench_case: BenchCase) -> None:
     assert maxima.shape[0] == bench_case.n_vertices
 
 
+def _scalar_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
+    """Return the shared MeshSet with the vertices' ``z`` in the vertex scalar attribute."""
+    meshset_pml = bench_case.meshset_pml
+    meshset_pml.compute_scalar_by_function_per_vertex(q="z")
+    return meshset_pml
+
+
 @pytest.mark.benchmark(group="median")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
 def test_median(bench_case: BenchCase) -> None:
     """Radix-sorts a copy and reads the middle: O(n log n) where the rest are one pass."""
+    if bench_case.kind == "pymeshlab":  # one call: min, max, avg, med, stddev, variance
+        meshset_pml = _scalar_meshset_pml(bench_case)
+        statistics_pml = bench_case.run(meshset_pml.get_scalar_statistics_per_vertex)
+        assert np.isfinite(statistics_pml["med"])
+        return
     values = _scalars_wp(bench_case)
     middle = bench_case.run(lambda: tw.reduce.median(values))
     assert np.isfinite(middle)

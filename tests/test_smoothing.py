@@ -47,6 +47,17 @@ def test_filter_laplacian_volume_constraint(icosahedron: tuple[tm.Trimesh, wp.Me
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 def test_filter_humphrey(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    HC filtering against trimesh, which is the only oracle this filter has.
+
+    **pymeshlab is not a second oracle here**, recorded so it is not re-tried:
+    ``apply_coord_hc_laplacian_smoothing`` implements the same Vollmer et al. paper but exposes no
+    parameters at all -- no step count, no ``alpha``, no ``beta`` -- and its single pass matches
+    ``filter_humphrey`` at *none* of the 8 x 11 x 11 ``(iterations, alpha, beta)`` combinations
+    probed (best max-coordinate deviation 0.019 on a mesh carrying 0.016 of noise). It is a
+    different formulation, not this one with other constants, and it is used only as a per-pass
+    timing reference in ``benchmarks/test_smoothing.py``.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     smoothed_wp = tw.smoothing.filter_humphrey(

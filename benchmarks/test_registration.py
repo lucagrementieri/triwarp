@@ -29,8 +29,15 @@ CPU library in the test group that implements the point-to-plane metric at all.
 * Point-to-point ICP — ``trimesh.registration.icp`` (cKDTree) and open3d's ``registration_icp``
   (KDTreeFlann).
 * Point-to-plane ICP — open3d only, on a point-cloud target so both sides consume the *same*
-  per-vertex normals (computed once with trimesh from the shared float64 source). The mesh-target
-  and robust variants have no reference and are timed for triwarp alone.
+  per-vertex normals (computed once with trimesh from the shared float64 source). The robust variant
+  has no reference and is timed for triwarp alone.
+* Mesh-target ICP — **pymeshlab**'s ``compute_matrix_by_icp_between_meshes``, which correspondences
+  against the reference *mesh* rather than a point cloud and so is the equivalent of ``icp`` rather
+  than of ``icp_point_cloud``. It is the only reference that group has. One constraint shapes it:
+  **both layers must carry faces** -- a face-less source raises ``Failed to apply filter`` -- so its
+  source is the whole mesh under the same rotation, translation and noise the point sample gets,
+  with ``samplenum`` matched to triwarp's point count so both minimize over the same number of
+  correspondences.
 
 Both sides are pinned to exactly ``_ICP_ITERATIONS`` iterations — triwarp with ``threshold=-inf``
 and open3d with ``relative_fitness=relative_rmse=0`` — otherwise a library that early-exits after
@@ -68,6 +75,7 @@ import math
 
 import numpy as np
 import open3d as o3d
+import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
@@ -93,7 +101,12 @@ _NOISE_FRACTION = 0.002
 # minimize the same objective.
 _TUKEY_FRACTION = 0.01
 
+# MeshLab's ICP rebuilds its MeshSet per round on top of running ten serial iterations, so it lands
+# in the hundreds of milliseconds where the other libraries are in the tens.
+_PML_ROUNDS = 3
+
 _source_np_cache: dict[tuple[str, float], tuple[np.ndarray, np.ndarray]] = {}
+_source_mesh_np_cache: dict[str, np.ndarray] = {}
 _source_wp_cache: dict[tuple[str, str, float], wp.array] = {}
 _normals_np_cache: dict[str, np.ndarray] = {}
 _normals_wp_cache: dict[tuple[str, str], wp.array] = {}
@@ -131,6 +144,25 @@ def _source_np(
         source += rng.normal(scale=_NOISE_FRACTION * diagonal, size=source.shape)
         _source_np_cache[key] = (np.ascontiguousarray(source), indices)
     return _source_np_cache[key]
+
+
+def _source_mesh_np(bench_case: BenchCase) -> np.ndarray:
+    """
+    Apply the same misalignment ``_source_np`` gives its subsample to *every* vertex.
+
+    MeshLab's ICP needs both layers to carry faces, so its source is the whole mesh rather than a
+    point sample; keeping the transform and the noise identical is what makes the two rows
+    comparable.
+    """
+    if bench_case.mesh_name not in _source_mesh_np_cache:
+        rng = np.random.default_rng(_SEED)
+        vertices = bench_case.vertices_np
+        diagonal = _diagonal(bench_case)
+        offset = _TRANSLATION_FRACTION * diagonal * np.array([1.0, -1.0, 0.5]) / np.sqrt(2.25)
+        source = vertices @ _rotation_matrix(_ROTATION_DEGREES).T + offset
+        source += rng.normal(scale=_NOISE_FRACTION * diagonal, size=source.shape)
+        _source_mesh_np_cache[bench_case.mesh_name] = np.ascontiguousarray(source, dtype=np.float64)
+    return _source_mesh_np_cache[bench_case.mesh_name]
 
 
 def _source_wp(bench_case: BenchCase, degrees: float = _ROTATION_DEGREES) -> wp.array[wp.vec3]:
@@ -293,10 +325,34 @@ def test_icp_convergence(bench_case: BenchCase, degrees: float) -> None:
 
 @pytest.mark.benchmark(group="icp_mesh")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
 def test_icp_mesh(bench_case: BenchCase) -> None:
     """Point-to-point ICP against the triangle surface (closest-point-on-mesh correspondences)."""
     skip_larger_than(bench_case, "happy_buddha", "per-iteration mesh queries scale with face count")
+    if bench_case.kind == "pymeshlab":
+        # ``compute_matrix_by_icp_between_meshes`` correspondences run against the *reference mesh*
+        # rather than a point cloud, which is what makes it the equivalent of ``icp`` here rather
+        # than of ``icp_point_cloud``. Both layers must carry faces: handing it a face-less source
+        # raises ``Failed to apply filter``, so the source is the whole mesh under the same
+        # rotation / translation / noise the point sample gets rather than the sample itself.
+        # ``samplenum`` is matched to triwarp's point count so both sides minimize over the same
+        # number of correspondences. It writes the source layer's transform, so the set is rebuilt.
+        source_mesh_np = _source_mesh_np(bench_case)
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+
+        def icp_pml() -> None:
+            meshset_pml = ml.MeshSet()
+            faces_i32 = np.ascontiguousarray(faces_np, dtype=np.int32)
+            meshset_pml.add_mesh(
+                ml.Mesh(np.ascontiguousarray(vertices_np, dtype=np.float64), faces_i32)
+            )
+            meshset_pml.add_mesh(ml.Mesh(source_mesh_np, faces_i32))
+            meshset_pml.compute_matrix_by_icp_between_meshes(
+                referencemesh=0, sourcemesh=1, samplenum=min(_N_POINTS, vertices_np.shape[0])
+            )
+
+        bench_case.run(icp_pml, rounds=_PML_ROUNDS)
+        return
     source, vertices, faces = _source_wp(bench_case), bench_case.vertices_wp, bench_case.faces_wp
     matrix, _transformed, _cost = bench_case.run(
         lambda: tw.registration.icp(

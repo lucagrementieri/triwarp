@@ -4,11 +4,13 @@ import warnings
 
 import numpy as np
 import pytest
+import trimesh as tm
 import warp as wp
 import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
+from tests.conversions import trimesh_to_pymeshlab
 
 
 def _skip_on_cpu(device: str) -> None:
@@ -34,6 +36,59 @@ def _spd_system(device: str, n: int = 64, n_rhs: int = 3, seed: int = 11):
     rhs_np = rng.standard_normal((n_rhs, n))
     rhs_wp = wp.array(np.ascontiguousarray(rhs_np), dtype=wp.float64, device=device)
     return matrix_wp, twt.as_array2d_float(rhs_wp, dtype=wp.float64), dense_np, rhs_np
+
+
+def test_min_quad_with_fixed_matches_pymeshlab_harmonic_field(
+    device: str, icosahedron: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Dirichlet-constrained cotangent solve against MeshLab's Generate Scalar Harmonic Field.
+
+    The only external check ``min_quad_with_fixed`` has: everywhere else it is validated indirectly,
+    through ``parametrization.tutte`` against ``igl.min_quad_with_fixed``. MeshLab's harmonic field
+    pins exactly two vertices and solves the same cotangent system directly, so pinning the same two
+    to 0 and 1 makes the two answers the same field -- measured to 1.4e-8.
+    """
+    _skip_on_cpu(device)
+    mesh_tm, mesh_wp = icosahedron
+    vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float64)
+    n_vertices = vertices_np.shape[0]
+
+    # The two poles, so the field spans the whole mesh rather than a local patch.
+    low, high = int(np.argmin(vertices_np[:, 2])), int(np.argmax(vertices_np[:, 2]))
+    fixed_np = np.zeros(n_vertices, dtype=bool)
+    fixed_np[[low, high]] = True
+    values_np = np.zeros((1, n_vertices), dtype=np.float64)
+    values_np[0, high] = 1.0
+
+    operator_wp = tw.laplacian.cotmatrix(mesh_wp.points, mesh_wp.indices, dtype=wp.float64)
+    solution_wp, free_map_wp, n_free = tw.linalg.min_quad_with_fixed(
+        operator_wp,
+        wp.array(fixed_np, dtype=wp.bool, device=device),
+        twt.as_array2d_float(
+            wp.array(np.ascontiguousarray(values_np), dtype=wp.float64, device=device),
+            dtype=wp.float64,
+        ),
+    )
+    assert n_free == n_vertices - 2
+
+    # ``min_quad_with_fixed`` returns the free degrees of freedom only; the scatter back through
+    # ``free_map`` is the caller's, as its docstring says.
+    field_wp = values_np[0].copy()
+    free_np = np.flatnonzero(~fixed_np)
+    field_wp[free_np] = solution_wp.numpy()[0][free_map_wp.numpy()[free_np]]
+
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    meshset_pml.compute_scalar_by_scalar_harmonic_field_per_vertex(
+        point1=np.ascontiguousarray(vertices_np[low]),
+        point2=np.ascontiguousarray(vertices_np[high]),
+        value1=0.0,
+        value2=1.0,
+        colorize=False,
+    )
+    assert np.allclose(
+        field_wp, meshset_pml.current_mesh().vertex_scalar_array(), rtol=1e-5, atol=1e-5
+    )
 
 
 def test_solve_spd_columns_matches_numpy(device: str) -> None:

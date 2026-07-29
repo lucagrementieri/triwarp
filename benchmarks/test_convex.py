@@ -37,6 +37,11 @@ this benchmark is the cost side. ``scipy.spatial.ConvexHull`` — the reference 
 docstring cross-links — is the same qhull algorithm as both registered baselines, so it would add
 a third timing of the same thing and is not registered separately.
 
+**pymeshlab**'s ``generate_convex_hull`` is qhull a third time, so it adds no new algorithm -- what
+it adds is a *second* wrapper cost around the same computation, which is the only way to tell
+whether trimesh's number is qhull or trimesh. It pushes the hull onto the MeshSet as a new mesh, so
+the set is rebuilt per round, and it is capped at ``dragon`` with the other two for the same reason.
+
 **libigl** has no convex-hull or local-convexity binding in the Python package, so igl is absent
 from every case here.
 
@@ -87,7 +92,7 @@ def test_face_adjacency_convex(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="fast_convex_set_mask")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
 @pytest.mark.parametrize("n_directions", _N_DIRECTIONS)
 def test_fast_convex_set_mask(bench_case: BenchCase, n_directions: int) -> None:
     """
@@ -97,6 +102,10 @@ def test_fast_convex_set_mask(bench_case: BenchCase, n_directions: int) -> None:
     axis. The references are exact and take no such parameter, so their two rows are identical by
     construction -- they are there as the fixed bar the approximation is trading accuracy against.
     """
+    if bench_case.kind == "pymeshlab":  # qhull again, through MeshLab's own wrapper
+        skip_larger_than(bench_case, "dragon", "qhull is single-threaded on the host")
+        bench_case.run(lambda: bench_case.new_meshset_pml().generate_convex_hull())
+        return
     if bench_case.kind == "triwarp":
         points = bench_case.vertices_wp
         mask = bench_case.run(

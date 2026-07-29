@@ -8,6 +8,7 @@ import trimesh.repair as tm_repair
 import warp as wp
 
 import triwarp as tw
+from tests.conversions import trimesh_to_pymeshlab
 
 CLOSED_MESHES = ["icosahedron", "cave_cube"]
 OPEN_MESHES = ["hemisphere", "half_torus"]
@@ -111,6 +112,49 @@ def _mobius_strip(n: int) -> tuple[np.ndarray, np.ndarray]:
         faces.append([a0, a1, b1])
         faces.append([a0, b1, b0])
     return np.array(vertices), np.array(faces)
+
+
+@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+def test_topological_measures_match_pymeshlab(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Cross-check four independent predicates against MeshLab's one topology report.
+
+    ``get_topological_measures`` returns edge count, boundary-edge count, component count, genus and
+    edge-manifoldness together, so a single call checks the whole family at once and -- unlike the
+    per-function trimesh and libigl oracles -- checks them *for mutual consistency* as well. That is
+    the value here: an inconsistent set (a genus that does not follow from the Euler characteristic,
+    say) is a class of bug no single-quantity comparison can see.
+
+    MeshLab reports a genus for open meshes too, so the genus check is written as the full ``chi =
+    2C - 2g - L`` identity (components, genus, boundary loops) rather than the closed-surface ``chi
+    = 2 - 2g``. That form is what makes it a *joint* constraint tying four independently computed
+    quantities together, and it is the one that catches ``cave_cube``: a hollow shell is two
+    components, so its Euler characteristic is 4 and the single-component form would be wrong.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    measures_pml = trimesh_to_pymeshlab(mesh_tm).get_topological_measures()
+
+    assert tw.validation.is_edge_manifold(mesh_wp.indices, allow_boundary_edges=True) == bool(
+        measures_pml["is_mesh_two_manifold"]
+    )
+
+    unique_edges_wp, _ = tw.edges.edges_unique(mesh_wp.indices)
+    assert int(unique_edges_wp.shape[0]) == int(measures_pml["edges_number"])
+
+    boundary_edges_wp = tw.boundary.boundary_edges(mesh_wp.points, mesh_wp.indices)
+    assert int(boundary_edges_wp.shape[0]) == int(measures_pml["boundary_edges"])
+
+    n_vertices = int(mesh_wp.points.shape[0])
+    labels_np = tw.graph.connected_component_labels_from_edges(unique_edges_wp, n_vertices).numpy()
+    assert len(np.unique(labels_np)) == int(measures_pml["connected_components_number"])
+
+    n_loops = len(tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices))
+    assert (mesh_name in CLOSED_MESHES) == (n_loops == 0)
+    n_components = int(measures_pml["connected_components_number"])
+    euler_wp = tw.validation.euler_characteristic(mesh_wp.indices)
+    assert euler_wp == 2 * n_components - 2 * int(measures_pml["genus"]) - n_loops
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)

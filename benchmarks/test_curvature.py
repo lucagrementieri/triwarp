@@ -51,6 +51,52 @@ query points and the same radius.
 measure. Vertex angle defects are also not exposed (``open3d.geometry`` stops at normals and
 areas), so there is nothing to compare against for any of the three.
 
+**pymeshlab** covers all three groups and is the only reference that survives the *whole* scale axis
+on the two measures, where trimesh is capped at ``sphere_small`` by its per-point cKDTree ball. Two
+filters:
+
+``compute_curvature_principal_directions_per_vertex`` is the quadric-fit analogue, and its
+``method=`` enum is worth reading as a cost table in its own right. Measured on ``sphere_med``:
+
+| method | cost | note |
+|---|---|---|
+| ``'Normal Cycles'`` | 57 ms | Cohen-Steiner / Morvan tensor, no fit |
+| ``'Taubin approximation'`` | 63 ms | — |
+| ``'Quadric Fitting'`` | **197 ms** | benchmarked here; MeshLab's default, triwarp's scheme |
+| ``'Principal Component Analysis'`` | 3 599 ms | |
+| ``'Scale Dependent Quadric Fitting'`` | 4 762 ms | |
+
+so the two expensive variants are 18-24x the one triwarp implements, and are deliberately not
+benchmarked. **The radius sweep does not map**: MeshLab exposes no neighborhood size for the quadric
+fit (it derives one internally), so the pymeshlab row appears at the narrow radius only.
+
+That internal neighborhood is worth knowing, because it is what the row is actually measuring.
+Measured against the analytic ``H = 1`` of a unit icosphere: MeshLab reads **1.020** (subdivision 3)
+and **1.005** (subdivision 4), while triwarp reads 1.018 / 1.039 / 1.113 / 1.356 at ``radius = 2 / 3
+/ 5 / 8`` on the first and 1.005 / 1.010 / 1.027 / 1.073 on the second. So MeshLab's derived
+neighborhood is equivalent to ``radius = 2``, and the benchmarked ``radius = 3`` row is already
+doing more work than the reference -- read the ratio with that in mind rather than as like-for-like.
+
+It is **not** used as a test oracle, and that is a deliberate rejection rather than an omission. On
+the ``torus`` fixture at ``radius = 2`` the two correlate at 0.982 but carry a ~7% systematic level
+offset (median absolute deviation 0.18 on a 1.2-wide range), which is the neighborhood-size effect
+above; ``igl.principal_curvature(useKring=False)`` already agrees element-wise to **1e-3** in
+``tests/test_curvature.py``, so libigl is strictly the better oracle and pymeshlab would only loosen
+it. The other three ``method=`` variants are worse still: ``'Normal Cycles'`` is area-integrated
+rather than pointwise (0.039 against 1.0 on the unit sphere), ``'Taubin approximation'`` produces
+outliers three orders of magnitude out (max 291.8 on the same mesh), and
+``'Scale Dependent Quadric Fitting'`` reproduces plain Quadric Fitting to 1e-4 at 24x the cost.
+
+``compute_scalar_by_discrete_curvature_per_vertex(curvaturetype=...)`` gives Gaussian and Mean from
+the same filter, but it is the Meyer / Desbrun **pointwise 1-ring** operator, not the Cohen-Steiner
+/ Morvan ball measure triwarp and trimesh compute. So it has no radius axis either and its absolute
+value is not comparable — it is a *throughput* reference for a per-vertex curvature pass over the
+same mesh, which is what makes it useful where trimesh cannot run.
+
+Both mutate only an attribute, but ``compute_curvature_principal_directions_per_vertex`` defaults to
+``autoclean=True`` and would delete unreferenced vertices under a shared MeshSet, so both build
+inside the timed callable. On the ``scale`` axis the build is 1-19 ms against rows of 57-197 ms.
+
 What is inside the timed callable
 ---------------------------------
 Everything the public function does. For the Gaussian measure that includes the vertex-defect
@@ -98,13 +144,25 @@ def _face_angles(bench_case: BenchCase) -> twt.Array2dFloat32:
 
 @pytest.mark.benchmark(group="principal_curvature")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
 @pytest.mark.parametrize("radius", _QUADRIC_RADII)
 def test_principal_curvature(bench_case: BenchCase, radius: int) -> None:
     """Per-vertex quadric fit over a geodesic ball: the 5x5 solve in bulk, at two radii."""
     if bench_case.kind == "igl" and bench_case.mesh_name == "sphere_large":
         pytest.skip("igl.principal_curvature is ~2 s a call at this size; capped at sphere_med")
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pymeshlab":
+        if radius != min(_QUADRIC_RADII):
+            pytest.skip("MeshLab derives the fit neighborhood itself: no radius axis")
+        # ``autoclean=True`` (the default) deletes unreferenced vertices, so this one cannot share
+        # a MeshSet even though it writes only curvature attributes.
+        bench_case.run(
+            lambda: bench_case.new_meshset_pml().compute_curvature_principal_directions_per_vertex(
+                method="Quadric Fitting"
+            ),
+            rounds=_HEAVY_ROUNDS,
+        )
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         *_, pv1, _pv2 = bench_case.run(
@@ -121,14 +179,36 @@ def test_principal_curvature(bench_case: BenchCase, radius: int) -> None:
         assert pv1_igl.shape == (n_vertices,)
 
 
+def _run_discrete_curvature_pml(
+    bench_case: BenchCase, radius_scale: float, curvature_type: str
+) -> None:
+    """
+    Time MeshLab's pointwise Meyer / Desbrun curvature, which has no radius to sweep.
+
+    Shared by both measure groups because one filter serves both through ``curvaturetype``. It
+    writes only the vertex scalar, but the MeshSet is rebuilt anyway so the two curvature groups in
+    this module stay consistent with the quadric-fit row above, which has no choice.
+    """
+    if radius_scale != min(_MEASURE_RADII):
+        pytest.skip("MeshLab's discrete curvature is a pointwise 1-ring operator: no radius axis")
+    bench_case.run(
+        lambda: bench_case.new_meshset_pml().compute_scalar_by_discrete_curvature_per_vertex(
+            curvaturetype=curvature_type
+        )
+    )
+
+
 @pytest.mark.benchmark(group="discrete_gaussian_curvature")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
 @pytest.mark.parametrize("radius_scale", _MEASURE_RADII)
 def test_discrete_gaussian_curvature(bench_case: BenchCase, radius_scale: float) -> None:
     """Summed vertex defects inside a ball around every vertex (Cohen-Steiner / Morvan)."""
     n_vertices = bench_case.n_vertices
     radius = radius_scale * bench_case.mean_edge
+    if bench_case.kind == "pymeshlab":
+        _run_discrete_curvature_pml(bench_case, radius_scale, "Gaussian Curvature")
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         face_angles = _face_angles(bench_case)
@@ -156,12 +236,15 @@ def test_discrete_gaussian_curvature(bench_case: BenchCase, radius_scale: float)
 
 @pytest.mark.benchmark(group="discrete_mean_curvature")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
 @pytest.mark.parametrize("radius_scale", _MEASURE_RADII)
 def test_discrete_mean_curvature(bench_case: BenchCase, radius_scale: float) -> None:
     """Summed edge dihedral angles inside a ball around every vertex: adjacency plus the query."""
     n_vertices = bench_case.n_vertices
     radius = radius_scale * bench_case.mean_edge
+    if bench_case.kind == "pymeshlab":
+        _run_discrete_curvature_pml(bench_case, radius_scale, "Mean Curvature")
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         curvature = bench_case.run(

@@ -559,6 +559,111 @@ def _icosphere_wp(device: str, subdivisions: int = 3):
     return sphere, vertices, faces
 
 
+def _graded_patch(n: int = 96, ratio: float = 60.0) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build a saddle patch whose ``x`` spacing varies by ``ratio``: anisotropic, valence-perfect.
+
+    The shape ``benchmarks/meshes.py`` calls ``saddle_graded``, reduced to test size. Every interior
+    vertex has valence exactly 6 and the triangulation is already Delaunay, so neither a
+    valence-driven flip nor a Delaunay flip can see the anisotropy -- only the collapse and the
+    *area-equalizing* tangential relaxation can remove it. That combination is what makes this the
+    input the remesher's stages are individually blind to, and it is why it is worth a test.
+    """
+    t_np = np.linspace(0.0, 1.0, n) ** 2.0  # quadratic spacing -> strong grading along x
+    x_np = t_np * ratio
+    y_np = np.linspace(0.0, ratio, n)
+    x_grid, y_grid = np.meshgrid(x_np, y_np, indexing="ij")
+    z_grid = 0.02 * (x_grid**2 - y_grid**2) / ratio
+    vertices = np.column_stack([x_grid.ravel(), y_grid.ravel(), z_grid.ravel()]).astype(np.float64)
+    faces = []
+    for i in range(n - 1):
+        for j in range(n - 1):
+            a = i * n + j
+            faces += [[a, a + 1, a + n + 1], [a, a + n + 1, a + n]]
+    return vertices, np.ascontiguousarray(faces, dtype=np.int32)
+
+
+def _icosphere_arrays() -> tuple[np.ndarray, np.ndarray]:
+    """Clean closed control input, as plain NumPy arrays."""
+    sphere = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    return (
+        np.ascontiguousarray(sphere.vertices, dtype=np.float64),
+        np.ascontiguousarray(sphere.faces, dtype=np.int32),
+    )
+
+
+def _degenerate_face_count(vertices_np: np.ndarray, faces_np: np.ndarray) -> int:
+    """Faces with exactly zero area -- a repeated index or two coincident corners."""
+    triangles = vertices_np[faces_np]
+    cross = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+    return int((np.linalg.norm(cross, axis=1) == 0.0).sum())
+
+
+def _worst_aspect_ratio(vertices_np: np.ndarray, faces_np: np.ndarray) -> float:
+    """Longest / shortest edge over the non-degenerate faces (``inf`` if any is degenerate)."""
+    triangles = vertices_np[faces_np]
+    lengths = np.linalg.norm(
+        np.stack(
+            [
+                triangles[:, 1] - triangles[:, 0],
+                triangles[:, 2] - triangles[:, 1],
+                triangles[:, 0] - triangles[:, 2],
+            ],
+            axis=1,
+        ),
+        axis=2,
+    )
+    if (lengths.min(axis=1) == 0.0).any():
+        return float("inf")
+    return float((lengths.max(axis=1) / lengths.min(axis=1)).max())
+
+
+def test_remesh_emits_no_degenerate_faces(device: str) -> None:
+    """
+    No output face may have exactly zero area, on a clean *and* a badly graded input.
+
+    This is the regression gate for two bugs the pymeshlab benchmark reference exposed, neither of
+    which any other assertion in this file would catch -- they all run on clean closed icospheres:
+
+    * ``valence_flip_candidates`` flipped on the valence objective alone. Convexity makes a flip
+      legal but bounds nothing about the shape it produces, so on a graded mesh it turned slivers
+      into worse slivers and in float32 landed on exactly-zero area: **2 738 of 84 406 faces** on a
+      ``saddle_graded``-shaped patch. It now rejects a flip that would create a degenerate triangle
+      or increase the worse aspect ratio of the pair.
+    A second, *unfixed* gap this input also exposes: ``_smooth_pass`` computes the **unweighted**
+    one-ring centroid while ``isotropic_remesh``'s Notes promise the area-equalizing form. On a
+    regular graded grid every vertex already sits at the plain average of its neighbours, so the
+    smoother is at a fixed point and cannot equalize the sampling at all. Area-weighting it was
+    measured to take the 99th-percentile aspect ratio here from **352 to 20** -- but it also makes
+    ``is_watertight`` fail on ``cave_cube`` through a self-intersection, at every step size down to
+    ``lam=0.1``, so it needs a fold guard first. Hence this test asserts only the degeneracy and
+    do-no-harm properties, which do hold.
+    """
+    for label, (vertices_np, faces_np) in (
+        ("icosphere", _icosphere_arrays()),
+        ("graded_patch", _graded_patch()),
+    ):
+        vertices_wp = wp.array(
+            np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device
+        )
+        faces_wp = wp.array(
+            np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
+        target = float(tw.edges.mean_edge_length(vertices_wp, faces_wp))
+        out_vertices, out_faces = tw.remesh.isotropic_remesh(
+            vertices_wp, faces_wp, target_length=target, iterations=3
+        )
+        out_vertices_np = out_vertices.numpy().astype(np.float64)
+        out_faces_np = out_faces.numpy().reshape(-1, 3)
+        assert _degenerate_face_count(out_vertices_np, out_faces_np) == 0, label
+        # And it must never leave the mesh worse-shaped than it found it.
+        assert _worst_aspect_ratio(out_vertices_np, out_faces_np) < 2.0 * _worst_aspect_ratio(
+            vertices_np, faces_np
+        ), label
+
+
 def test_remesh_edge_concentration(device: str) -> None:
     sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=3)
     target = 0.5 * tw.edges.mean_edge_length(vertices_wp, faces_wp)

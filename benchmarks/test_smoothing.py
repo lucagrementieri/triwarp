@@ -1,8 +1,8 @@
 """
 Benchmarks for ``triwarp.smoothing``.
 
-Two groups, two axes, chosen because this module has two genuinely different cost regimes and the
-switch between them is a keyword argument rather than a mesh property:
+Four groups over two axes, chosen because this module has two genuinely different cost regimes and
+the switch between them is a keyword argument rather than a mesh property:
 
 * ``filter_mut_dif_laplacian`` on **scale** -- the explicit branch. One sparse mat-vec per
   iteration plus a diffusion-coefficient recomputation, so cost is ``iterations x nnz``: linear,
@@ -14,6 +14,11 @@ switch between them is a keyword argument rather than a mesh property:
   ``saddle`` against ``saddle_graded`` (identical connectivity, worst aspect ratio 1.6 against
   4 719) puts the two regimes and the two conditionings in one table, which is where the cost of
   choosing implicit actually becomes visible.
+
+* ``filter_taubin`` and ``filter_humphrey`` on **scale** -- the two shrinkage-controlled variants of
+  the same SpMV loop. Taubin alternates a shrinking and an inflating pass, Humphrey adds a
+  push-back toward the original positions; both cost a small constant multiple of
+  ``filter_laplacian``, and both existed unbenchmarked until pymeshlab gave them a reference.
 
 ``iterations`` is deliberately not swept. In the explicit branch it is exactly linear by
 construction, so a second point measures multiplication; in the implicit branch the interesting
@@ -32,8 +37,35 @@ scheme), so the ``vol`` case stays triwarp/trimesh only. Open3D returns a new me
 mesh is reusable across rounds. **trimesh** mutates in place and is rebuilt inside the timed
 callable.
 
-Neither has an implicit / backward-Euler smoother at all, so the ``quality`` group is a
-triwarp-only before/after comparison.
+Neither has an implicit / backward-Euler smoother at all, so the implicit half of the ``quality``
+group is a triwarp-only before/after comparison.
+
+**pymeshlab** carries four of MeshLab's ``apply_coord_*`` smoothers and is what gives this module a
+second independent implementation of each explicit scheme:
+
+* ``filter_mut_dif_laplacian`` -> ``apply_coord_laplacian_smoothing_scale_dependent``: the *same*
+  scheme, Desbrun et al.'s scale-dependent umbrella, which is the mutual-diffusion filter.
+* ``filter_laplacian_integration`` -> ``apply_coord_laplacian_smoothing(cotangentweight=False)``:
+  the same uniform-weight explicit loop. MeshLab has no implicit variant, so it appears in the
+  ``explicit`` row only.
+* ``filter_taubin`` -> ``apply_coord_taubin_smoothing``: the same lambda-mu alternation, at
+  MeshLab's ``mu=-0.53`` against triwarp's ``nu=0.5``.
+* ``filter_humphrey`` -> ``apply_coord_hc_laplacian_smoothing``: Vollmer et al.'s HC, but **not
+  parameter-comparable** -- see below.
+
+Two caveats govern every row:
+
+- **Every one of them mutates the coordinates**, so the MeshSet is rebuilt inside the timed callable
+  and the row carries the build. That is a large fraction at these sizes: on ``bunny`` the build is
+  16.8 of the 48.2 ms a ten-step Laplacian costs, so **35% of that row is not smoothing**. Subtract
+  the build (0.47 us/vertex) before quoting a ratio. - **HC Laplacian exposes no parameters at all**
+  -- no step count, no ``alpha``/``beta`` -- so its row is a *single* filter call against triwarp's
+  ten iterations, and its output does not match ``filter_humphrey`` at any of the 8 x 11 x 11
+  ``(iterations, alpha, beta)`` combinations probed (best max-coordinate deviation 0.019 on a mesh
+  carrying 0.016 of noise). MeshLab's HC is a different formulation of Vollmer's scheme, not
+  triwarp's with other constants. It is a per-pass cost reference and nothing more: it is
+  deliberately **not** used as a test oracle in ``tests/test_smoothing.py``, where trimesh remains
+  the only HC check.
 """
 
 from __future__ import annotations
@@ -62,12 +94,29 @@ def _laplacian_operator(bench_case: BenchCase) -> wps.BsrMatrix[wp.float32]:
     return _operator_cache[key]
 
 
+def _skip_pml_beyond_bunny(bench_case: BenchCase) -> None:
+    """Cap the pymeshlab smoothers at ``bunny``, the way the trimesh rows are capped."""
+    skip_larger_than(bench_case, "bunny", "MeshLab's serial smoothers take seconds beyond bunny")
+
+
 @pytest.mark.benchmark(group="filter_mut_dif_laplacian")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
 @pytest.mark.parametrize("volume_constraint", [False, True], ids=["novol", "vol"])
 def test_filter_mut_dif_laplacian(bench_case: BenchCase, volume_constraint: bool) -> None:
     """The explicit SpMV loop on the scan sweep: linear in iterations, linear in nnz."""
     skip_larger_than(bench_case, "dragon")
+    if bench_case.kind == "pymeshlab":
+        if volume_constraint:
+            pytest.skip("MeshLab's scale-dependent Laplacian has no volume-constraint variant")
+        _skip_pml_beyond_bunny(bench_case)
+        # Desbrun et al.'s scale-dependent umbrella: the same scheme, mutating coordinates, so the
+        # MeshSet is rebuilt per round and the row carries the build.
+        bench_case.run(
+            lambda: bench_case.new_meshset_pml().apply_coord_laplacian_smoothing_scale_dependent(
+                stepsmoothnum=_ITERATIONS
+            )
+        )
+        return
     if bench_case.kind == "open3d":
         if volume_constraint:
             pytest.skip("open3d has no volume-constrained Laplacian smoother")
@@ -115,7 +164,7 @@ def test_filter_mut_dif_laplacian(bench_case: BenchCase, volume_constraint: bool
 
 @pytest.mark.benchmark(group="filter_laplacian_integration")
 @pytest.mark.benchaxis("quality")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
 @pytest.mark.parametrize("implicit", [False, True], ids=["explicit", "implicit"])
 def test_filter_laplacian_integration(bench_case: BenchCase, implicit: bool) -> None:
     """
@@ -124,7 +173,22 @@ def test_filter_laplacian_integration(bench_case: BenchCase, implicit: bool) -> 
     Four rows per table: the explicit pair should be flat across the two meshes (an SpMV does not
     care about aspect ratio) and the implicit pair should not (CG does). A flat implicit pair would
     mean the solve is not actually conditioning-bound, which is worth knowing either way.
+
+    pymeshlab confirms the explicit half independently -- 19.2 against 19.8 ms across the mesh pair,
+    flat to within noise, against triwarp's 0.57 / 0.50 ms (34x and 40x) -- which is the same
+    statement its harmonic-field row makes in [`test_linalg.py`](test_linalg.py) about where the
+    conditioning cost actually lives.
     """
+    if bench_case.kind == "pymeshlab":
+        if implicit:
+            pytest.skip("MeshLab has no implicit / backward-Euler Laplacian smoother")
+        # ``cotangentweight=False`` to match triwarp's uniform-weight operator.
+        bench_case.run(
+            lambda: bench_case.new_meshset_pml().apply_coord_laplacian_smoothing(
+                stepsmoothnum=_ITERATIONS, cotangentweight=False
+            )
+        )
+        return
     assert bench_case.device is not None
     if implicit and wp.get_device(bench_case.device).is_cpu:
         pytest.skip("the implicit branch solves with warp.optim.linear.cg, CUDA-only in Warp 1.15")
@@ -141,6 +205,82 @@ def test_filter_laplacian_integration(bench_case: BenchCase, implicit: bool) -> 
         )
     )
     assert result.shape == vertices.shape
+
+
+@pytest.mark.benchmark(group="filter_taubin")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
+def test_filter_taubin(bench_case: BenchCase) -> None:
+    """
+    The lambda-nu alternation: two SpMVs per iteration instead of one.
+
+    Against ``filter_laplacian_integration``'s explicit row this measures exactly the second pass,
+    so the two rows should sit at a ratio near 2 and nothing else should separate them. All three
+    libraries implement Taubin's 1995 scheme; MeshLab's inflating step is ``mu=-0.53`` against
+    triwarp's and trimesh's ``nu=0.5``, which changes the fixed point but not the work per pass.
+    """
+    skip_larger_than(bench_case, "dragon")
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        operator = _laplacian_operator(bench_case)
+        result = bench_case.run(
+            lambda: tw.smoothing.filter_taubin(
+                vertices, faces, iterations=_ITERATIONS, laplacian_operator=operator
+            )
+        )
+        assert result.shape == vertices.shape
+    elif bench_case.kind == "pymeshlab":
+        _skip_pml_beyond_bunny(bench_case)
+        bench_case.run(
+            lambda: bench_case.new_meshset_pml().apply_coord_taubin_smoothing(
+                stepsmoothnum=_ITERATIONS
+            )
+        )
+    else:  # trimesh mutates in place: rebuild inside the timed callable
+        _skip_pml_beyond_bunny(bench_case)
+        vertices, faces = bench_case.vertices_np, bench_case.faces_np
+
+        def run() -> tm.Trimesh:
+            mesh = tm.Trimesh(vertices, faces, process=False)
+            tm.smoothing.filter_taubin(mesh, iterations=_ITERATIONS)
+            return mesh
+
+        assert bench_case.run(run).vertices.shape == vertices.shape
+
+
+@pytest.mark.benchmark(group="filter_humphrey")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
+def test_filter_humphrey(bench_case: BenchCase) -> None:
+    """
+    HC filtering: a Laplacian pass plus a push-back toward the original positions.
+
+    Read the pymeshlab row as a **per-pass** cost only. MeshLab's HC Laplacian takes no parameters,
+    so it is one filter call here against ten triwarp iterations, and the module docstring records
+    that its output matches ``filter_humphrey`` at no parameter setting -- it is a different
+    formulation of the same paper's scheme. trimesh's is the parameter-comparable reference.
+    """
+    skip_larger_than(bench_case, "dragon")
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        operator = _laplacian_operator(bench_case)
+        result = bench_case.run(
+            lambda: tw.smoothing.filter_humphrey(
+                vertices, faces, iterations=_ITERATIONS, laplacian_operator=operator
+            )
+        )
+        assert result.shape == vertices.shape
+    elif bench_case.kind == "pymeshlab":  # one fixed pass, no step count to match
+        _skip_pml_beyond_bunny(bench_case)
+        bench_case.run(lambda: bench_case.new_meshset_pml().apply_coord_hc_laplacian_smoothing())
+    else:  # trimesh mutates in place: rebuild inside the timed callable
+        _skip_pml_beyond_bunny(bench_case)
+        vertices, faces = bench_case.vertices_np, bench_case.faces_np
+
+        def run() -> tm.Trimesh:
+            mesh = tm.Trimesh(vertices, faces, process=False)
+            tm.smoothing.filter_humphrey(mesh, iterations=_ITERATIONS)
+            return mesh
+
+        assert bench_case.run(run).vertices.shape == vertices.shape
 
 
 @pytest.mark.benchmark(group="filter_implicit_fairing")

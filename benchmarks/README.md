@@ -1,7 +1,8 @@
 # triwarp benchmarks
 
 Performance benchmarks comparing `triwarp` against the CPU references **trimesh**, **libigl
-(`igl`)**, **open3d**, **scipy** and **potpourri3d** (geometry-central), built on
+(`igl`)**, **open3d**, **scipy**, **potpourri3d** (geometry-central) and **pymeshlab**
+(MeshLab / VCGlib), built on
 [pytest-benchmark](https://pytest-benchmark.readthedocs.io).
 
 These are **not** collected by the normal test run (`pytest`'s `testpaths` is `tests/`); run them
@@ -171,6 +172,12 @@ process each, 999 cases plus 139 skipped). The four slowest modules are `test_re
 (235 s), `test_laplacian` (95 s), `test_proximity` (85 s, the `O(Q x F)` winding number) and
 `test_smoothing` (70 s).
 
+The **pymeshlab** rows add roughly **six minutes** on top of that, spread over 26 modules; the
+largest single contributions are `test_geodesic` (+40 s, its heat solver at `setup=full` rebuilds the
+factorization every round), `test_proximity` (+3 s even capped at `bunny`), `test_combine` (+18 s, the
+1 630 ms-per-call component split on `parts_1024`) and `test_curvature` (+9 s). Three groups are
+explicitly capped for that reason — see the pymeshlab hazards below.
+
 That measurement predates the six modules added with the potpourri3d port
 (`test_halfedge`, `test_tangent`, `test_contour`, `test_tracing`, `test_vector_heat`,
 `test_intrinsic`, `test_signed_heat`) and the potpourri3d rows in the existing ones. The three Phase-1 modules add ~10 s;
@@ -194,9 +201,9 @@ set automatically. Pass your own `--benchmark-group-by=...` to override.
 
 | flag | default | meaning |
 |---|---|---|
-| `--device` | `auto` | `triwarp` target(s): `auto`/`cpu`/`cuda`/`both`. `auto` = cuda if available, else cpu. The CPU references always run. |
+| `--device` | `auto` | `triwarp` target(s): `auto`/`cpu`/`cuda`/`both`. `auto` = cuda if available, else cpu. The CPU references (trimesh / igl / open3d / scipy / potpourri3d / pymeshlab) always run. |
 | `--size` | `all` | comma-separated size categories for the **scan** sweep (`small,medium,large,extralarge,huge`). Naming a size also lifts the CPU cap for it. Has no effect on axis-driven groups. |
-| `--cpu-max-size` | `large` | CPU-bound libraries skip scan meshes larger than this unless the size is named in `--size`. |
+| `--cpu-max-size` | `large` | CPU-bound libraries (every reference, plus `triwarp-cpu`) skip scan meshes larger than this unless the size is named in `--size`. |
 
 ## Notes
 
@@ -236,6 +243,9 @@ set automatically. Pass your own `--benchmark-group-by=...` to override.
 - `edges_unique*` triwarp calls pass `n_vertices=` to avoid a host sync skewing GPU numbers.
 - Every benchmark carries an explicit `benchlibs` marker, so adding a library kind to `LIBRARIES`
   never silently generates cases for modules that have no branch for it.
+- **pymeshlab rows build their `MeshSet` inside the timed callable** unless the filter is verified
+  geometry-preserving, because almost every MeshLab filter mutates `current_mesh()` in place. See the
+  pymeshlab hazards section for the build cost and the shared-MeshSet whitelist.
 - **`test_texture` uses projected, non-injective UVs** (vertex `xy` normalized to the unit square)
   because the scan meshes carry no atlas and computing one would dominate the measurement. The
   rasterizer cost is the number of (triangle, covered pixel) pairs, which a projection reproduces
@@ -283,14 +293,115 @@ Also: never construct a `wp.Mesh` with zero triangles on CUDA (it corrupts devic
 
 ## Reference coverage
 
-`trimesh`, `igl`, `open3d`, `scipy` and `potpourri3d` are all registered in `LIBRARIES` and used for
+`trimesh`, `igl`, `open3d`, `scipy`, `potpourri3d` and `pymeshlab` are all registered in `LIBRARIES`
+and used for
 **every** benchmarked function that has a genuine equivalent — the point is to have independent
 implementations to spot outliers against, not only to fill gaps. `open3d` is marked `cpu_bound`
 even though the installed wheel is a CUDA build: the legacy `open3d.pipelines` / `open3d.geometry`
 APIs used here are CPU-only (only `open3d.t` has GPU kernels). `scipy` covers the k-nearest and
 radius searches (`spatial.KDTree`) and the graph traversals (`sparse.csgraph`), which is where
 trimesh itself delegates. `potpourri3d` is CPU-only (geometry-central) and is the **only** reference
-for the heat-method family, tangent spaces and isocontours.
+for the heat-method family, tangent spaces and isocontours. `pymeshlab` is CPU-only (MeshLab /
+VCGlib) and is the **broadest** — it reaches 26 modules, more than any other single reference.
+
+### pymeshlab
+
+MeshLab exposes 281 filters. 61 of them map onto something triwarp already has, and they are what
+these rows are drawn from. Eight of the groups they land in **had no reference of any kind** before:
+
+| module | group | filter | what it settled |
+|---|---|---|---|
+| `test_linalg` | `min_quad_with_fixed` | `compute_scalar_by_scalar_harmonic_field_per_vertex` | its direct solve is **flat** (39.0 / 39.6 ms) across the `quality` axis where triwarp's CG goes 33.7 → 83.5, so the whole spread is iteration count |
+| `test_selection` | `expand_vertex_mask` / `shrink_vertex_mask` | `apply_selection_dilatation` / `..._erosion` | slopes of 7.3× and 8.0× over 1 → 8 hops, confirming a hop is constant work |
+| `test_proximity` | `signed_distance_on_mesh` | `compute_scalar_by_distance_from_another_mesh_per_vertex` | its per-query cost **grows** with the face count (20 / 63 / 768 µs) where triwarp's BVH does not |
+| `test_smoothing` | `filter_taubin`, `filter_humphrey` (new groups) | `apply_coord_taubin_smoothing`, `apply_coord_hc_laplacian_smoothing` | two triwarp filters that were unbenchmarked |
+| `test_remesh` | `isotropic_remesh` | `meshing_isotropic_explicit_remeshing` | 3.3× across `quality` against triwarp's **flat** 123 ms — the fixed-pass loop is not adapting |
+| `test_reduce` | `median` | `get_scalar_statistics_per_vertex` | six statistics in one call, 2.5 / 11 / 110× |
+| `test_vertices` | `average_onto_vertices` | `compute_scalar_transfer_face_to_vertex` | also *faster* on `fan_hub` — valence is not a hot spot, independently |
+| `test_repair` | `remove_non_manifold_faces` | `meshing_repair_non_manifold_edges` | nothing else in the set removes non-manifold faces at all |
+
+The rest are second or third independent implementations:
+
+| module | pymeshlab reference |
+|---|---|
+| `test_boundary` | `compute_selection_from_mesh_border` (`boundary_edges` only — no loop ordering) |
+| `test_combine` | `generate_splitting_by_connected_components` — one call for label *and* compaction, and a **39× spread** across the `components` axis against triwarp's 3.7× |
+| `test_convex` | `generate_convex_hull` (qhull a third time, so it prices the wrapper rather than the algorithm) |
+| `test_creation` | `create_cube`, `create_sphere` (an *icosphere*, so it pairs with `icosphere` where open3d's pairs with `uv_sphere`), `create_torus`, `create_annulus`, `create_cone` |
+| `test_curvature` | `compute_curvature_principal_directions_per_vertex(method='Quadric Fitting')` and `compute_scalar_by_discrete_curvature_per_vertex` — the only reference that survives the whole `scale` axis, where trimesh is capped at `sphere_small` |
+| `test_distance` | `get_hausdorff_distance` (one-directional, so both directions are timed) |
+| `test_edges` | `get_geometric_measures()['avg_edge_length']` |
+| `test_geodesic` | `compute_scalar_by_heat_geodesic_distance_from_selection_per_vertex` — the fourth heat-method implementation, and the only one whose amortized path is just "call it twice"; plus `..._geodesic_distance_from_given_point_...` as a non-PDE alternative |
+| `test_graph` | `compute_selection_by_small_disconnected_components_per_face(nbfaceratio=0.0)` |
+| `test_hole_filling` | `meshing_close_holes` (ear clipping, so **1.7×** across `loops_dp` against triwarp's 37× — the price of *not* running a `B³` DP) |
+| `test_parametrization` | `compute_texcoord_parametrization_harmonic` / `..._least_squares_conformal_maps` — both wrap **libigl's own code**, so they price MeshLab's wrapper rather than a third algorithm |
+| `test_points` | `compute_normal_for_point_clouds(k=)`, `compute_matrix_by_fitting_to_plane` |
+| `test_reconstruction` | `generate_surface_reconstruction_ball_pivoting` (VCGlib's original BPA) and `..._screened_poisson` (Kazhdan's own code, the same one open3d wraps) |
+| `test_registration` | `compute_matrix_by_icp_between_meshes` — the only reference the mesh-target `icp` group has |
+| `test_remesh` | `meshing_surface_subdivision_midpoint(threshold=)` in `subdivide_to_size`, landing on the identical output face count |
+| `test_sample` | `generate_sampling_poisson_disk(radius=)` — the only blue-noise reference that takes a *radius*, so the radius sweep maps for the first time |
+| `test_smoothing` | `apply_coord_laplacian_smoothing_scale_dependent` (Desbrun's, = `filter_mut_dif_laplacian`) and `apply_coord_laplacian_smoothing` |
+| `test_triangles` | `compute_normal_per_face`, `get_geometric_measures` (`shell_barycenter` = `centroid`) |
+| `test_validation` | `get_topological_measures` + `compute_selection_by_self_intersections_per_face` — the same composition open3d does in **13.8 s** and MeshLab in 140.8 ms; plus `compute_selection_by_non_manifold_per_vertex` |
+| `test_vertices` | `compute_normal_per_vertex` at `weightmode='Simple Average'` and `'By Area'` — one filter covering both normal groups |
+
+#### Hazards, all measured
+
+- **The MeshSet build is the floor under every row**, at ~0.47 µs/vertex: 0.91 ms on 2 562 vertices,
+  4.55 ms on 10 242, **17.1 ms on `bunny`**'s 35 947. Any row cheaper than that is reporting the
+  build. It is a large share of the mutating rows — 16.4 of the 17.8 ms a clean
+  `meshing_remove_duplicate_faces` costs, 35% of a ten-step Laplacian on `bunny` — so subtract it
+  before quoting a ratio.
+- **Almost every filter mutates `current_mesh()` in place**, so the MeshSet goes *inside* the timed
+  callable (`BenchCase.new_meshset_pml`), the same precedent as the trimesh rebuilds and
+  potpourri3d's in-callable solver construction. `BenchCase.meshset_pml` is the shared exception, for
+  filters verified geometry-preserving: the `compute_scalar_*` / `compute_normal_*` family, and the
+  selection filters — whose cost is *independent of how much is selected* (120 consecutive dilatations
+  carrying `sphere_med` from 0.9% to 86% selected cost 0.86–1.21 ms each), which is what lets
+  `test_selection` seed once outside the timed region and still read a clean per-hop cost.
+- **`compute_curvature_principal_directions_per_vertex` and
+  `meshing_decimation_quadric_edge_collapse` default to `autoclean=True`** and delete unreferenced
+  vertices under you, so they cannot share a MeshSet even though they only write attributes.
+- **Length parameters take a wrapper type.** `ml.PercentageValue(1)` is 1% of the bbox diagonal;
+  `ml.PureValue(x)` is absolute (this version has no `AbsoluteValue`). Every row that sizes work by
+  length passes `PureValue` fed from `bench_case.mean_edge` so both sides get the identical parameter.
+- **Three filters have defaults that silently measure nothing.** `meshing_close_holes(maxholesize=30)`
+  closes *zero* of `rim_short`'s two 512-edge rims (0.66 ms); `get_hausdorff_distance(samplenum=8)`
+  samples eight points out of the whole cloud; `generate_sampling_poisson_disk(radius=0%)` autoguesses
+  a radius instead of using yours. Each row overrides them and asserts on the returned dict where one
+  exists.
+- **Non-manifold input is a hard boundary, not a slow path** — the same one that shapes the libigl and
+  potpourri3d rows. `meshing_surface_subdivision_midpoint` raises `Mesh has some not 2 manifold faces,
+  subdivision surfaces require manifoldness` on **every scan mesh**, so its reference row lives on the
+  `scale` axis with `subdivide_to_size`; `generate_polyline_from_planar_section` raises
+  `Failed to apply filter` on every scan mesh at any plane, and `test_intersection`'s groups are *all*
+  on the scan sweep, so that row does not exist at all.
+- **Two more preconditions raise rather than degrade.**
+  `compute_texcoord_parametrization_{harmonic,lscm}` reject a **closed** mesh (a boundary loop is
+  required); `compute_matrix_by_fitting_to_plane` raises `Cannot compute rotation: there is no
+  selection` unless something is selected; and `compute_matrix_by_icp_between_meshes` needs **both**
+  layers to carry faces.
+- **`harm_function` is a no-op in pymeshlab 2025.7.** `compute_texcoord_parametrization_harmonic`
+  returns **bit-identical** texture coordinates at `harm_function=1`, `2` and `3` (max deviation
+  exactly 0.0) and identical timings, where libigl's own `k=2` costs 4.3× its `k=1`. So the harmonic
+  order axis does not map and the pymeshlab row appears at `k=1` only — a row tracking triwarp's
+  `k=2` would be silently reporting the `k=1` solve.
+- **Selection morphology is face-based.** `apply_selection_dilatation` / `..._erosion` dilate the
+  *face* set (VCGlib's loose vertex-from-face / face-from-vertex pair); handing them a vertex
+  selection simply clears it. Seeding needs `compute_selection_by_condition_per_face`, or
+  `compute_selection_transfer_vertex_to_face(inclusive=False)` from a vertex seed — `inclusive=True`,
+  the default, selects only faces whose *every* vertex is selected.
+- **`generate_surface_reconstruction_vcg` was tried and rejected**: it returns **zero faces** on an
+  oriented point cloud at every voxel size probed (`PureValue` 0.02 / 0.05 / 0.10), reporting
+  `Mesh Saved 'plymcout.ply': 0 vertices, 0 faces`. It reconstructs from all *visible* layers via a
+  temporary `.vmi` file and did not produce geometry from a single cloud.
+- **Several filters print to stdout regardless of `verbose=False`** (ICP's `Found N pairs`, the point-
+  cloud normal estimator's `UG 34 34 34`, the VCG reconstructor's whole volume report). pytest's
+  fd-level capture absorbs it; a bare script will not.
+- **Three groups are capped** because the reference, not triwarp, is the cost:
+  `signed_distance_on_mesh` at `bunny` (768 µs/query on dragon = 85 s a row),
+  `get_geometric_measures` at `bunny` (1.12 s a call on dragon, in *two* modules), and the
+  `apply_coord_*` smoothers at `bunny` alongside the trimesh rows.
 
 ### potpourri3d
 

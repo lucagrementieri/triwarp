@@ -39,7 +39,34 @@ energy), and burns 8 200 CG iterations per solve on the resulting near-singular 
 that measures a pathology, not the algorithm.
 
 **open3d** has no mesh parametrization at all -- no harmonic map, no LSCM, no ARAP, and no
-boundary circle map -- so libigl remains the only reference for this module.
+boundary circle map.
+
+**pymeshlab** covers ``harmonic`` and ``lscm``, and its own filter descriptions say why it is a
+*second* reference rather than a third implementation: both
+``compute_texcoord_parametrization_harmonic`` and
+``compute_texcoord_parametrization_least_squares_conformal_maps`` state that they use "the original
+code provided in the libigl library". So they wrap the same solver the ``igl`` rows call directly,
+and the gap between the two is MeshLab's own boundary detection, attribute plumbing and MeshSet
+build rather than a different algorithm. That is worth having -- it prices what a *library wrapper*
+adds over the bare call -- but it is not independent evidence, and it should not be read as such.
+
+**Its ``harm_function`` parameter is documented as triwarp's ``k`` (1 harmonic, 2 biharmonic) and is
+a no-op in pymeshlab 2025.7.** Measured on ``saddle_small``: ``harm_function=1``, ``2`` and ``3``
+return **bit-identical** texture coordinates (max deviation exactly 0.0), and identical timings
+(94.4 / 92.7 ms on ``hemisphere``) where libigl's own ``k=2`` costs 4.3x its ``k=1``. So the
+harmonic order axis does not map, and the pymeshlab row appears at ``k=1`` only. Do not re-derive
+this: a row that tracked triwarp's ``k=2`` here would be silently reporting the ``k=1`` solve.
+
+LSCM takes no parameters at all: MeshLab pins the boundary condition itself rather than accepting a
+pin set, so unlike triwarp's two-pin call there is nothing to match there.
+
+**It rejects closed meshes outright**, with ``PyMeshLabException: Harmonic Parametrization can be
+applied only on meshes ...`` -- a boundary loop is required. Both axes here are disk-topology by
+construction, so that is a documented hazard rather than a skip, but it is the reason a pymeshlab
+parametrization row can never move to the scan sweep or the ``scale`` axis.
+
+Both filters rewrite the per-vertex texture coordinates, so the MeshSet is rebuilt per round; on the
+``patch`` axis the build is 2-5 ms against rows of 18-335 ms.
 """
 
 from __future__ import annotations
@@ -117,12 +144,32 @@ def test_map_vertices_to_circle(bench_case: BenchCase) -> None:
         assert circle_igl.shape[0] == loop_np.shape[0]
 
 
+def _run_harmonic_pml(bench_case: BenchCase, order: int) -> None:
+    """
+    Time MeshLab's harmonic parametrization at ``k = 1``, the only order it actually honours.
+
+    ``harm_function`` is a no-op in pymeshlab 2025.7 -- see the module docstring for the
+    measurement. Higher orders are skipped rather than run, so the table cannot show a ``k=2`` row
+    that is really solving ``k=1``.
+    """
+    if order != min(_HARMONIC_ORDERS):
+        pytest.skip("MeshLab's harm_function is a no-op in 2025.7: identical output at every order")
+    bench_case.run(
+        lambda: bench_case.new_meshset_pml().compute_texcoord_parametrization_harmonic(
+            harm_function=order
+        )
+    )
+
+
 @pytest.mark.benchmark(group="harmonic")
 @pytest.mark.benchaxis("patch")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
 @pytest.mark.parametrize("order", _HARMONIC_ORDERS)
 def test_harmonic(bench_case: BenchCase, order: int) -> None:
     """Fixed-boundary harmonic map, at the Laplacian and the much stiffer bilaplacian."""
+    if bench_case.kind == "pymeshlab":
+        _run_harmonic_pml(bench_case, order)
+        return
     _skip_cpu(bench_case)
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
@@ -142,15 +189,20 @@ def test_harmonic(bench_case: BenchCase, order: int) -> None:
 
 @pytest.mark.benchmark(group="harmonic_conditioning")
 @pytest.mark.benchaxis("quality")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
 def test_harmonic_conditioning(bench_case: BenchCase) -> None:
     """
     The same harmonic solve on the same connectivity, well- and ill-conditioned.
 
     ``saddle`` and ``saddle_graded`` have identical vertex counts, face arrays and boundary loops;
     only the spacing differs. Any gap between these two rows is conditioning and nothing else --
-    for triwarp, CG iterations; for libigl, LDLT fill-in.
+    for triwarp, CG iterations; for libigl, LDLT fill-in. The pymeshlab row wraps libigl's own
+    solver, so it should track the ``igl`` row's *shape* and differ only by a constant; a pair that
+    diverges here would mean MeshLab's boundary detection is doing something size-dependent.
     """
+    if bench_case.kind == "pymeshlab":
+        _run_harmonic_pml(bench_case, 1)
+        return
     _skip_cpu(bench_case)
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
@@ -202,9 +254,16 @@ def test_arap(bench_case: BenchCase, iterations: int) -> None:
 
 @pytest.mark.benchmark(group="lscm")
 @pytest.mark.benchaxis("patch")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
 def test_lscm(bench_case: BenchCase) -> None:
     """Free-boundary conformal map: two pins, so the free block is nearly the whole system."""
+    if bench_case.kind == "pymeshlab":  # MeshLab picks its own pins; there is no pin set to pass
+        bench_case.run(
+            lambda: (
+                bench_case.new_meshset_pml()
+            ).compute_texcoord_parametrization_least_squares_conformal_maps()
+        )
+        return
     _skip_cpu(bench_case)
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp

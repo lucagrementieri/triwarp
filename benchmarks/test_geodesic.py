@@ -42,6 +42,26 @@ and flips to an intrinsic Delaunay triangulation first, which is more work and a
 It also ships **fast marching** (``MeshFastMarchingDistanceSolver``), a different algorithm for the
 same task, timed as its own group; triwarp has no equivalent by design.
 
+**pymeshlab** implements the same method a *fourth* way
+(``compute_scalar_by_heat_geodesic_distance_from_selection_per_vertex``), and its own documentation
+states the two properties this module is built around: "as this implementation does not use
+intrinsic triangulation it is very sensitive to triangulation" -- the same caveat the ``quality``
+axis exists to measure -- and "first run takes longer as factorization has to be built", which is
+exactly the ``setup=full`` / ``setup=amortized`` split. So it is the only reference whose amortized
+row needs no API gymnastics: calling the filter twice on the same MeshSet *is* the amortized path.
+Sources go in as a vertex selection (``compute_selection_by_condition_per_vertex(condselect='(vi ==
+0)')``, i.e. vertex 0, the same source the other three libraries get).
+
+Measured, it is the third independent confirmation of the ``quality`` axis's point: **71.4 against
+71.1 ms** across ``saddle`` / ``saddle_graded`` -- dead flat, like the other two direct solvers --
+while triwarp goes 22.4 -> 68.7 ms. Three factorizing implementations all insensitive to a
+conditioning change that costs triwarp's CG 3x is about as clear as this suite gets.
+
+It also ships a **second, unrelated** algorithm for the same task --
+``compute_scalar_by_geodesic_distance_from_given_point_per_vertex``, a Dijkstra-style front over the
+edge graph rather than a PDE solve -- which is timed in the ``fast_marching_distance`` group
+alongside potpourri3d's, since that group exists to price the non-PDE alternatives.
+
 **trimesh** has no geodesic distance of any kind (``trimesh.graph`` offers only combinatorial
 traversal over the edge graph, not a distance field on the surface). **open3d** has none either --
 its legacy geometry module stops at normals and clustering. Neither appears in this module.
@@ -75,6 +95,7 @@ from __future__ import annotations
 import igl
 import numpy as np
 import potpourri3d as pp3d
+import pymeshlab as ml
 import pytest
 import warp as wp
 from conftest import BenchCase
@@ -98,6 +119,40 @@ def _sources_wp(bench_case: BenchCase) -> wp.array[wp.int32]:
     return _sources_cache[key]
 
 
+def _seeded_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
+    """Build a fresh MeshSet with vertex 0 selected -- the single source the other libraries get."""
+    meshset_pml = bench_case.new_meshset_pml()
+    meshset_pml.compute_selection_by_condition_per_vertex(condselect="(vi == 0)")
+    return meshset_pml
+
+
+def _run_case_pml(bench_case: BenchCase, *, amortized: bool) -> None:
+    """
+    Time MeshLab's heat method, with its factorization cache either cold or warm.
+
+    The filter caches its factorization on the mesh, so ``amortized=True`` is a *warm* MeshSet --
+    the cache primed by one untimed call outside -- and ``amortized=False`` rebuilds the MeshSet per
+    round so every round pays the factorization. That is the same distinction the triwarp and
+    reference rows draw, expressed in the one API where it needs no special path.
+    """
+    if amortized:
+        warm_pml = _seeded_meshset_pml(bench_case)
+        warm_pml.compute_scalar_by_heat_geodesic_distance_from_selection_per_vertex()
+        bench_case.run(
+            warm_pml.compute_scalar_by_heat_geodesic_distance_from_selection_per_vertex,
+            rounds=_ROUNDS,
+        )
+        assert warm_pml.current_mesh().vertex_scalar_array().shape == (bench_case.n_vertices,)
+        return
+
+    def solve_pml() -> None:
+        _seeded_meshset_pml(
+            bench_case
+        ).compute_scalar_by_heat_geodesic_distance_from_selection_per_vertex()
+
+    bench_case.run(solve_pml, rounds=_ROUNDS)
+
+
 def _run_case(bench_case: BenchCase, *, amortized: bool = False) -> None:
     """
     Time one heat-geodesic field from vertex 0, in triwarp, libigl or potpourri3d.
@@ -107,6 +162,9 @@ def _run_case(bench_case: BenchCase, *, amortized: bool = False) -> None:
     docstring for why both are reported.
     """
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pymeshlab":
+        _run_case_pml(bench_case, amortized=amortized)
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         sources = _sources_wp(bench_case)
@@ -152,7 +210,7 @@ def _run_case(bench_case: BenchCase, *, amortized: bool = False) -> None:
 
 @pytest.mark.benchmark(group="heat_geodesic")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "igl", "potpourri3d")
+@pytest.mark.benchlibs("triwarp", "igl", "potpourri3d", "pymeshlab")
 @pytest.mark.parametrize("setup", ["full", "amortized"])
 def test_heat_geodesic(bench_case: BenchCase, setup: str) -> None:
     """Two float64 CG solves plus the gradient normalization, over the clean size sweep."""
@@ -161,7 +219,7 @@ def test_heat_geodesic(bench_case: BenchCase, setup: str) -> None:
 
 @pytest.mark.benchmark(group="heat_geodesic_conditioning")
 @pytest.mark.benchaxis("quality")
-@pytest.mark.benchlibs("triwarp", "igl", "potpourri3d")
+@pytest.mark.benchlibs("triwarp", "igl", "potpourri3d", "pymeshlab")
 def test_heat_geodesic_conditioning(bench_case: BenchCase) -> None:
     """The same field on the same connectivity, well- and ill-conditioned: 3.4x for triwarp."""
     _run_case(bench_case)
@@ -169,16 +227,34 @@ def test_heat_geodesic_conditioning(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="fast_marching_distance")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("potpourri3d")
+@pytest.mark.benchlibs("potpourri3d", "pymeshlab")
 def test_fast_marching_distance(bench_case: BenchCase) -> None:
     """
     potpourri3d's serial fast marching, for scale against the heat solvers on the same meshes.
 
     triwarp deliberately has no equivalent -- fast marching advances a priority queue one vertex at
-    a time and has no parallel formulation -- so this group has a single row. It is here to price
-    that decision: the alternative algorithm for the same task, on the same axis and the same
-    meshes, so the numbers can be read next to the ``heat_geodesic`` table.
+    a time and has no parallel formulation -- so it has no row here. It is here to price that
+    decision: the non-PDE alternatives for the same task, on the same axis and the same meshes, so
+    the numbers can be read next to the ``heat_geodesic`` table.
+
+    Two rows, two different serial fronts: potpourri3d's fast marching solves the local Eikonal
+    update per triangle, MeshLab's
+    ``compute_scalar_by_geodesic_distance_from_given_point_per_vertex`` advances a Dijkstra-style
+    front over the edge graph. Both are inherently sequential, which is the point being priced.
     """
+    if bench_case.kind == "pymeshlab":
+        # ``maxdistance=PureValue(0)`` disables the cut-off, so the front covers the whole mesh --
+        # the default 50% of the bbox diagonal would stop early and measure less work.
+        start_np = np.ascontiguousarray(bench_case.vertices_np[int(_SOURCES[0])], dtype=np.float64)
+        bench_case.run(
+            lambda: (
+                bench_case.new_meshset_pml()
+            ).compute_scalar_by_geodesic_distance_from_given_point_per_vertex(
+                startpoint=start_np, maxdistance=ml.PureValue(0.0)
+            ),
+            rounds=_ROUNDS,
+        )
+        return
     vertices_np = bench_case.vertices_np
     faces_np = np.ascontiguousarray(bench_case.faces_np, dtype=np.int32)
     # One source vertex, as a single-point "curve" of barycentric points.

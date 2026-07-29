@@ -12,10 +12,37 @@ Both take an oriented ``PointCloud``; open3d gets the same points and computes i
 vertex normals, which is the same quantity triwarp's
 [`area_weighted_vertex_normals`][triwarp.vertices.area_weighted_vertex_normals] produces.
 
-``triangulate_point_cloud`` has no open3d counterpart: it is a port of MeshLib's local-fan
-triangulation, and open3d's nearest analogue (``create_from_point_cloud_alpha_shape``) is a
-different algorithm solving the problem a different way, so timing them against each other would
-compare algorithm choices rather than implementations.
+**pymeshlab** is the third implementation of both, and the reason it is worth a row is that in each
+case it wraps *the same upstream code as one of the other two*:
+``generate_surface_reconstruction_ball_pivoting`` is VCGlib's original BPA (Bernardini was
+co-authored out of that lab) and ``generate_surface_reconstruction_screened_poisson`` is Kazhdan's
+own implementation, which is also what open3d wraps. So the pymeshlab-versus-open3d gap on the
+Poisson row is two wrappers over one solver, and only triwarp's is a different program. Its BPA is
+given the identical absolute radius via ``PureValue`` (the ``0%`` default autoguesses one, which
+would compare two different parameters) with ``clustering=0`` to disable the merge-nearby-vertices
+step triwarp does not do. Both filters push their output as a new layer without touching the cloud,
+so the cloud MeshSet is cached; ``set_current_mesh(0)`` inside the callable restores the layer the
+previous round's push moved away from.
+
+**Its cloud is not quite the same cloud**, and that is forced rather than chosen. Screened Poisson
+rejects a point set carrying *any* null normal outright -- ``Failed to apply filter: Filter requires
+correct per vertex normals`` -- and every scan mesh has unreferenced vertices, whose area-weighted
+normal is exactly zero: **47 of bunny_decimated's 8 171 and 1 113 of bunny's 35 947**. So the
+pymeshlab cloud drops those points, leaving it 0.6% / 3.1% smaller than the one triwarp and open3d
+reconstruct from. The alternative, ``preclean=True``, moves the same cleaning *inside* the timed
+filter, which is worse: it puts a pass triwarp does not run into the measured region.
+
+``generate_surface_reconstruction_vcg`` was tried as a *fourth* algorithm and **rejected**: it
+returns **zero faces** on this input at every voxel size probed (``PureValue`` 0.02 / 0.05 / 0.10),
+reporting ``Mesh Saved 'plymcout.ply': 0 vertices, 0 faces``. It reconstructs from all *visible*
+layers through a temporary ``.vmi`` file and did not produce geometry from a single oriented cloud;
+a row that silently measures a no-op is worse than no row.
+
+``triangulate_point_cloud`` has no open3d or pymeshlab counterpart: it is a port of MeshLib's
+local-fan triangulation, and the nearest analogues (open3d's
+``create_from_point_cloud_alpha_shape``, MeshLab's ``generate_alpha_shape``) are a different
+algorithm solving the problem a different way, so timing them against each other would compare
+algorithm choices rather than implementations.
 
 What the open3d comparison showed when it was added (medians, RTX 5090, ``depth=8``,
 ``radius = 1.5 * mean_edge``):
@@ -63,7 +90,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
+import numpy as np
+import pymeshlab as ml
 import pytest
+import trimesh as tm
 import warp as wp
 from conftest import BenchCase, skip_larger_than
 
@@ -89,6 +119,7 @@ _POISSON_DEPTH = 8
 
 _normals_cache: dict[tuple[str, str], wp.array[wp.vec3]] = {}
 _cloud_o3d_cache: dict[str, o3d.geometry.PointCloud] = {}
+_cloud_pml_cache: dict[str, ml.MeshSet] = {}
 
 
 def _skip_cg_on_cpu(bench_case: BenchCase) -> None:
@@ -127,6 +158,44 @@ def _cloud_o3d(bench_case: BenchCase) -> o3d.geometry.PointCloud:
     return _cloud_o3d_cache[bench_case.mesh_name]
 
 
+def _cloud_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
+    """
+    Build the oriented point cloud as a face-less pymeshlab mesh, cached per mesh.
+
+    Both reconstruction filters *push* their output onto the MeshSet rather than editing mesh 0, so
+    the cloud itself is never touched -- but ``current_mesh()`` moves to the new layer, so the
+    filter is always called on the cached set with mesh 0 still current from the previous round's
+    push. ``set_current_mesh(0)`` restores that, and is part of the timed callable because it is the
+    cost of driving the MeshSet API rather than of the reconstruction.
+    """
+    if bench_case.mesh_name not in _cloud_pml_cache:
+        # ``_normals`` goes through ``bench_case.vertices_wp``, which needs a Warp device -- and a
+        # pymeshlab case has none. trimesh's ``vertex_normals`` is area-weighted too, which is the
+        # same argument the open3d branch makes for using open3d's own.
+        mesh_tm = tm.Trimesh(bench_case.vertices_np, bench_case.faces_np, process=False)
+        normals_np = np.asarray(mesh_tm.vertex_normals, dtype=np.float64)
+        # Screened Poisson *rejects* a cloud carrying any null normal outright ("Filter requires
+        # correct per vertex normals"), and every scan mesh has unreferenced vertices, whose
+        # area-weighted normal is exactly zero -- 47 of bunny_decimated's 8 171 and 1 113 of bunny's
+        # 35 947. Dropping them here rather than passing ``preclean=True`` keeps the cleaning out of
+        # the timed region; the cost is that the reference reconstructs from 0.6% / 3.1% fewer
+        # points than triwarp and open3d do, which is recorded in the module docstring.
+        keep_np = np.linalg.norm(normals_np, axis=1) > 0.0
+        meshset_pml = ml.MeshSet()
+        meshset_pml.add_mesh(
+            ml.Mesh(
+                vertex_matrix=np.ascontiguousarray(
+                    bench_case.vertices_np[keep_np], dtype=np.float64
+                ),
+                v_normals_matrix=np.ascontiguousarray(normals_np[keep_np], dtype=np.float64),
+            )
+        )
+        _cloud_pml_cache[bench_case.mesh_name] = meshset_pml
+    meshset_pml = _cloud_pml_cache[bench_case.mesh_name]
+    meshset_pml.set_current_mesh(0)
+    return meshset_pml
+
+
 @pytest.mark.benchmark(group="triangulate_point_cloud")
 @pytest.mark.benchlibs("triwarp")
 def test_triangulate_point_cloud(bench_case: BenchCase) -> None:
@@ -141,10 +210,22 @@ def test_triangulate_point_cloud(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="ball_pivoting")
-@pytest.mark.benchlibs("triwarp", "open3d")
+@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab")
 def test_ball_pivoting(bench_case: BenchCase) -> None:
     skip_larger_than(bench_case, "bunny", "ball pivoting above bunny dominates the suite")
     radius = _BPA_RADIUS_FRACTION * bench_case.mean_edge
+    if bench_case.kind == "pymeshlab":
+        # VCGlib's original BPA, given the identical absolute radius via ``PureValue`` (its default
+        # ``0%`` autoguesses one, which would compare two different algorithms' parameters).
+        # ``clustering=0`` disables the merge-nearby-vertices step triwarp does not do.
+        cloud_pml = _cloud_meshset_pml(bench_case)
+        bench_case.run(
+            lambda: cloud_pml.generate_surface_reconstruction_ball_pivoting(
+                ballradius=ml.PureValue(radius), clustering=0.0
+            ),
+            rounds=_HEAVY_ROUNDS,
+        )
+        return
     if bench_case.kind == "triwarp":
         points, normals = bench_case.vertices_wp, _normals(bench_case)
         _vertices, faces = bench_case.run(
@@ -164,13 +245,24 @@ def test_ball_pivoting(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="screened_poisson")
-@pytest.mark.benchlibs("triwarp", "open3d")
+@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab")
 @pytest.mark.parametrize("depth", _POISSON_DEPTHS)
 @pytest.mark.parametrize("method", ["dense", "adaptive"])
 def test_screened_poisson(
     bench_case: BenchCase, method: Literal["dense", "adaptive"], depth: int
 ) -> None:
     skip_larger_than(bench_case, "bunny", "screened Poisson above bunny dominates the suite")
+    if bench_case.kind == "pymeshlab":
+        if method != "dense":
+            pytest.skip("MeshLab has a single screened-Poisson path; timed once under 'dense'")
+        # Kazhdan's own code, the same implementation open3d wraps -- so its row prices MeshLab's
+        # wrapper against open3d's over an identical solver, and only triwarp's is a different one.
+        cloud_pml = _cloud_meshset_pml(bench_case)
+        bench_case.run(
+            lambda: cloud_pml.generate_surface_reconstruction_screened_poisson(depth=depth),
+            rounds=_HEAVY_ROUNDS,
+        )
+        return
     if bench_case.kind == "open3d":
         if method != "dense":
             pytest.skip("open3d has a single screened-Poisson path; timed once under 'dense'")

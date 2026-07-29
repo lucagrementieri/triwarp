@@ -36,10 +36,19 @@ References
 ``split``; both do the same labelling-then-compaction, and the open3d branch's ``np.unique`` over
 each cluster's faces is part of what an open3d user pays, exactly as scipy is for the trimesh path.
 
-Neither has an equivalent of ``stitch`` / ``stitch_min_weight``: joining two open meshes along
-their boundary loops with a minimum-weight triangulation is not in either API (trimesh's
-``util.concatenate`` merges without stitching, and open3d's boolean operations need closed
-inputs). Those two groups are before/after self-comparisons.
+**pymeshlab**'s ``generate_splitting_by_connected_components`` is the third, and the cheapest to
+state: one filter call does both halves and *pushes one new mesh per component* onto the MeshSet, so
+the component count is read straight off ``mesh_number()``. It is also the group's sharpest
+reference, because it has the same per-component host cost triwarp used to have -- measured **42 /
+133 / 1 630 ms** across the axis, a **39x spread** against triwarp's 3.7x. That is the shape the
+batched compaction removed, reproduced independently.
+
+Neither trimesh, open3d nor pymeshlab has an equivalent of ``stitch`` / ``stitch_min_weight``:
+joining two open meshes along their boundary loops with a minimum-weight triangulation is not in any
+of the three APIs (trimesh's ``util.concatenate`` merges without stitching, open3d's boolean
+operations need closed inputs, and MeshLab's ``meshing_snap_mismatched_borders`` snaps *coincident*
+borders together rather than triangulating a gap between them). Those two groups are before/after
+self-comparisons.
 """
 
 from __future__ import annotations
@@ -77,10 +86,21 @@ def _split_inputs(bench_case: BenchCase) -> tuple:
 
 @pytest.mark.benchmark(group="split")
 @pytest.mark.benchaxis("components")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
 def test_split(bench_case: BenchCase) -> None:
     """Label, sort, then one batched compaction of every component: 3.7x across the axis."""
     expected = {"sphere_med": 1, "parts_64": 64, "parts_1024": 1024}[bench_case.mesh_name]
+    if bench_case.kind == "pymeshlab":
+        # One filter, but it *pushes* one new mesh per component onto the MeshSet, so it mutates the
+        # set and must be rebuilt per round. The mesh count is asserted on, which is the same
+        # component-count check the other three branches make.
+        def split_pml() -> int:
+            meshset_pml = bench_case.new_meshset_pml()
+            meshset_pml.generate_splitting_by_connected_components()
+            return meshset_pml.mesh_number() - 1
+
+        assert bench_case.run(split_pml, rounds=_ROUNDS) == expected
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = _split_inputs(bench_case)
         parts = bench_case.run(lambda: tw.combine.split(vertices, faces), rounds=_ROUNDS)

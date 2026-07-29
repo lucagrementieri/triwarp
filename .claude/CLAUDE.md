@@ -173,7 +173,7 @@ All new geometry functions MUST have regression tests that compare against the `
 - Name variables with a suffix for the library: `_np` for NumPy/SciPy, `_tm` for Trimesh, `_wp` for Warp. Avoid `got` / `exp` but use instead clear names.
 - When passing a NumPy 1D vector to a `wp.vec3` scalar argument at Python scope, use `wp.vec3(*array_np.tolist())` — not `wp.vec3(*map(float, np.asanyarray(...).reshape(3)))`.
 
-### Fallback references: libigl and potpourri3d
+### Fallback references: libigl, potpourri3d and pymeshlab
 
 When `trimesh` has no equivalent function, use the `igl` Python package (bindings for the C++
 reference mirrored under `reference/libigl/`) as the CPU reference instead — import as
@@ -205,6 +205,36 @@ A zero cotangent weight (an edge whose two opposite angles are both right angles
 grid split by a diagonal — `cave_cube`, `half_torus`) erases that edge's phase from
 `get_connection_laplacian()`, so it cannot serve as an oracle there at all; see
 `tests/test_tangent.py`.
+
+**pymeshlab** (pybind11 over MeshLab / VCGlib, mirrored under `reference/PyMeshLab/`) is the
+broadest reference of the three — 281 filters — and a hard test dependency like `igl`, so
+`import pymeshlab as ml` plainly, never through `pytest.importorskip`. Reference variables take a
+**`_pml`** suffix. Build the MeshSet with `tests.conversions.trimesh_to_pymeshlab(mesh_tm)` (or
+`warp_to_pymeshlab(vertices_wp, faces_wp)` for a triwarp output) rather than hand-rolling
+`ml.MeshSet()`. Use it where it is a *better* oracle than the incumbent, not everywhere — trimesh /
+igl / potpourri3d stay the reference where they already are one. Four hazards, all found by probing:
+
+- **Almost every filter mutates `current_mesh()` in place.** `apply_coord_*` moves vertices,
+  `meshing_*` rewrites the topology, `compute_*_per_vertex` writes an attribute, `generate_*` pushes
+  a *new* mesh onto the set. So one MeshSet serves one filter call; build a fresh one per comparison.
+  `compute_curvature_principal_directions_per_vertex` and
+  `meshing_decimation_quadric_edge_collapse` additionally default to `autoclean=True` and will
+  delete unreferenced vertices under you.
+- **`get_*` filters return a dict; `compute_*` / `meshing_*` / `apply_*` return `None`** (or a small
+  dict of statistics) and the answer must be read back off `current_mesh()` — `vertex_matrix`,
+  `face_matrix`, `vertex_normal_matrix`, `vertex_scalar_array`, `face_scalar_array`,
+  `vertex_selection_array`, `face_selection_array`,
+  `vertex_curvature_principal_dir{1,2}_matrix`, `edge_matrix`. Selections come back as bool arrays
+  and scalars as float arrays, so `np.array_equal` / `np.allclose` apply directly.
+- **Length parameters take a wrapper type.** `ml.PercentageValue(1)` is 1% of the bbox diagonal;
+  `ml.PureValue(x)` is an absolute length (this version has no `AbsoluteValue` — that name is gone).
+  Pass `PureValue` fed from the same number triwarp gets so both sides see the identical parameter.
+- **It rejects some inputs outright.** `compute_texcoord_parametrization_harmonic` and
+  `..._least_squares_conformal_maps` raise `PyMeshLabException: Failed to apply filter` on a
+  **closed** mesh — they need a boundary, so use `hemisphere` / `half_torus`, not `icosahedron`.
+  `face_face_adjacency_matrix()` raises `MissingComponentException` unless the FF component was
+  requested (`update_topology()` alone does not enable it). And `generate_boolean_*` takes
+  `first_mesh` / `second_mesh`, not the `first` / `second` older docs show.
 
 ### Mesh fixtures (prefer over inline construction)
 

@@ -20,6 +20,14 @@ vertex, and every scan mesh has some -- so it is timed in the separate ``edges_u
 group on the synthetic ``scale`` axis instead. Its ordering is geometry-central's own, so that row
 is a timing comparison rather than a parity check, and it includes building the halfedge mesh those
 indices refer to. It has no counterpart for the directed, per-corner or length variants.
+
+**pymeshlab** appears in ``mean_edge_length`` alone. ``get_geometric_measures`` returns
+``avg_edge_length`` in a dict alongside the area, volume, barycentre and inertia tensor, so it is an
+*upper* bound on the mean edge length taken by itself; the same call is the ``centroid`` reference
+in [`test_triangles.py`](test_triangles.py), so those two rows are literally the same measurement
+read twice. It has no general edge list either: ``Mesh.edge_matrix()`` exists but is populated only
+by filters that build the edge topology, not on demand, so there is nothing to time for
+``faces_to_edges`` / ``edges_unique`` / the length variants.
 """
 
 from __future__ import annotations
@@ -29,7 +37,7 @@ import numpy as np
 import potpourri3d as pp3d
 import pytest
 import trimesh as tm
-from conftest import BenchCase
+from conftest import BenchCase, skip_larger_than
 
 import triwarp as tw
 
@@ -204,8 +212,17 @@ def test_edges_length(bench_case) -> None:
 
 
 @pytest.mark.benchmark(group="mean_edge_length")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pymeshlab")
 def test_mean_edge_length(bench_case) -> None:
+    if bench_case.kind == "pymeshlab":
+        # ``get_geometric_measures`` is read-only and returns ``avg_edge_length`` alongside the
+        # area, volume, barycentre and inertia tensor -- one call for all of them, so this row is an
+        # upper bound on the mean edge length taken alone. Capped at ``bunny`` for the same reason
+        # as its twin row in ``test_triangles``: 1.12 s a call on ``dragon``.
+        skip_larger_than(bench_case, "bunny", "get_geometric_measures is 1.12 s a call on dragon")
+        meshset_pml = bench_case.meshset_pml
+        assert bench_case.run(meshset_pml.get_geometric_measures)["avg_edge_length"] >= 0.0
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         result = bench_case.run(lambda: tw.edges.mean_edge_length(vertices, faces))

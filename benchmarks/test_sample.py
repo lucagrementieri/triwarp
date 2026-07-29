@@ -11,12 +11,26 @@ surface sampling problem, parametrized by sample *count* rather than by radius, 
 starts from a dense uniform sample and eliminates points down to the target (Yuksel's sample
 elimination), where triwarp does Bridson dart throwing directly; the comparison is of cost per
 sample delivered, not of identical work.
+
+**pymeshlab**'s ``generate_sampling_poisson_disk`` is the only reference that can be given the
+*radius* rather than a count: ``radius=PureValue(r)`` overrides ``samplenum`` outright, so both
+sides receive the identical parameter and the radius sweep this group is built around maps across
+libraries for the first time. Its algorithm is Corsini et al.'s hierarchical dart throwing, which is
+neither triwarp's flat Bridson grid nor open3d's sample elimination -- three implementations, three
+schemes, one parametrization. It pushes the sample cloud onto the MeshSet as a new mesh, so the set
+is rebuilt per round.
+
+MeshLab's uniform ``generate_sampling_montecarlo`` is deliberately **not** a row here: it is not a
+blue-noise sampler at all (no minimum-distance guarantee), so it would be a floor rather than a
+comparison. ``generate_sampling_volumetric`` and ``generate_simplified_point_cloud`` are likewise
+different problems.
 """
 
 from __future__ import annotations
 
 import math
 
+import pymeshlab as ml
 import pytest
 import trimesh as tm
 from conftest import BenchCase, skip_larger_than
@@ -45,7 +59,7 @@ def _radius_for_mesh(bench_case: BenchCase) -> float:
 
 
 @pytest.mark.benchmark(group="blue_noise")
-@pytest.mark.benchlibs("triwarp", "open3d")
+@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab")
 @pytest.mark.parametrize("radius_scale", _RADIUS_SCALES, ids=["r1", "rhalf"])
 def test_sample_surface_blue_noise(bench_case: BenchCase, radius_scale: float) -> None:
     """
@@ -58,6 +72,18 @@ def test_sample_surface_blue_noise(bench_case: BenchCase, radius_scale: float) -
     skip_larger_than(bench_case, "bunny")
     # Halving the radius quadruples the samples that fit (area / radius^2).
     target = int(_TARGET_SAMPLES / (radius_scale * radius_scale))
+    if bench_case.kind == "pymeshlab":
+        # MeshLab takes *either* a count or an explicit radius, so this is the one blue-noise
+        # reference that can be matched to triwarp's actual parameter: ``radius=PureValue(r)``
+        # overrides ``samplenum`` and is fed the identical radius. It pushes a new point-cloud mesh
+        # onto the set, so the MeshSet is rebuilt per round.
+        radius = radius_scale * _radius_for_mesh(bench_case)
+        bench_case.run(
+            lambda: bench_case.new_meshset_pml().generate_sampling_poisson_disk(
+                radius=ml.PureValue(radius)
+            )
+        )
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         radius = radius_scale * _radius_for_mesh(bench_case)

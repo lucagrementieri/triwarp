@@ -29,6 +29,12 @@ the alternative is not comparing against it at all.
 **open3d** has no boundary-loop extraction: it can report *which* edges are boundary edges
 (``get_non_manifold_edges(allow_boundary_edges=False)``) but never orders them into loops, which is
 the whole cost of this function.
+
+**pymeshlab** is in the same position and appears in the ``boundary_edges`` group only:
+``compute_selection_from_mesh_border`` marks the boundary *vertices* as a bool selection array,
+which is the same find-the-boundary pass stopped one step short of an edge list -- and it has
+nothing that orders the result into loops either. It is read-only apart from the selection bit, so
+it shares the MeshSet.
 """
 
 from __future__ import annotations
@@ -62,7 +68,7 @@ def test_boundary_loops(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="boundary_edges")
 @pytest.mark.benchaxis("loops")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
 def test_boundary_edges(bench_case: BenchCase) -> None:
     """
     The unordered predecessor of ``boundary_loops``: the edge sort without the ranking.
@@ -76,6 +82,12 @@ def test_boundary_edges(bench_case: BenchCase) -> None:
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         edges = bench_case.run(lambda: tw.boundary.boundary_edges(vertices, faces))
         assert edges.ndim == 2
+    elif bench_case.kind == "pymeshlab":
+        # ``compute_selection_from_mesh_border`` marks the boundary *vertices* rather than returning
+        # the edge pairs, so it does the same find-the-boundary pass and stops one step earlier.
+        meshset_pml = bench_case.meshset_pml
+        bench_case.run(meshset_pml.compute_selection_from_mesh_border)
+        assert meshset_pml.current_mesh().vertex_selection_array().shape == (bench_case.n_vertices,)
     else:  # the pure trimesh.grouping path, not a cached Trimesh property
         faces_np = bench_case.faces_np
 

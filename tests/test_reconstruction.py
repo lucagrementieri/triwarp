@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
@@ -508,7 +509,6 @@ def test_poisson_finer_depth_reduces_error(device: str):
 
 def test_poisson_matches_pymeshlab_metric(device: str):
     _skip_poisson_on_cpu(device)
-    pymeshlab = pytest.importorskip("pymeshlab")
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
@@ -517,15 +517,17 @@ def test_poisson_matches_pymeshlab_metric(device: str):
     )
     mesh_tw = _mesh_trimesh(vertices_wp, faces_wp)
 
-    ms = pymeshlab.MeshSet()
-    ms.add_mesh(
-        pymeshlab.Mesh(
+    # An oriented point cloud, so this is one of the few places a MeshSet is built from vertices
+    # alone rather than through ``conversions.trimesh_to_pymeshlab``.
+    meshset_pml = ml.MeshSet()
+    meshset_pml.add_mesh(
+        ml.Mesh(
             vertex_matrix=np.ascontiguousarray(points_np),
             v_normals_matrix=np.ascontiguousarray(normals_np),
         )
     )
-    ms.generate_surface_reconstruction_screened_poisson(depth=6)
-    mesh_current = ms.current_mesh()
+    meshset_pml.generate_surface_reconstruction_screened_poisson(depth=6)
+    mesh_current = meshset_pml.current_mesh()
     mesh_pml = tm.Trimesh(
         vertices=mesh_current.vertex_matrix(), faces=mesh_current.face_matrix(), process=False
     )
