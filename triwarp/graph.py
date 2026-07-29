@@ -586,7 +586,7 @@ def bfs_multi_source(
     See Also
     --------
     [`bfs`][triwarp.graph.bfs]
-    [`geodesic_ball`][triwarp.geodesic.geodesic_ball]
+    [`geodesic_ball`][triwarp.neighbors.geodesic_ball]
     """
     node_count = adjacency.nrow  # pyright: ignore[reportAttributeAccessIssue]
     ncol = adjacency.ncol  # pyright: ignore[reportAttributeAccessIssue]

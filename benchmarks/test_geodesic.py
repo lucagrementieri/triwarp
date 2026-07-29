@@ -21,9 +21,9 @@ The whole computation runs in ``float64`` (the diffused heat decays exponentiall
 ``float32``, collapsing the far field), which on a consumer GPU means the solves run at the
 device's much lower double-precision rate. That is inherent to the method, not a tuning choice.
 
-``geodesic_ball`` -- the other public function in this module -- is **not** benchmarked here: it is
-already timed as ``query_geodesic_ball`` in [`test_proximity.py`](test_proximity.py), next to the
-other neighborhood queries it belongs with.
+``geodesic_ball`` is **not** benchmarked here -- it lives in ``triwarp.neighbors`` and is timed as
+``query_geodesic_ball`` in [`test_proximity.py`](test_proximity.py), next to the other neighborhood
+queries it belongs with.
 
 References
 ----------

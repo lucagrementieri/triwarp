@@ -1,18 +1,14 @@
-"""Geodesic distance and geodesic-ball neighborhoods on triangle meshes."""
+"""Geodesic distance on triangle meshes via the heat method."""
 
 from __future__ import annotations
-
-import warnings
 
 import warp as wp
 import warp.optim.linear as wpl
 import warp.sparse as wps
 
-import triwarp as tw
 from triwarp.edges import mean_edge_length
 from triwarp.intrinsic import mollify_intrinsic
 from triwarp.kernels import geodesic as kernel_geodesic
-from triwarp.kernels.algorithms import bfs as kernel_bfs
 from triwarp.laplacian import (
     cotmatrix,
     cotmatrix_entries,
@@ -267,164 +263,3 @@ def heat_geodesic(
     offset = float(phi.numpy().min())
     wp.map(wp.sub, phi, wp.float64(offset), out=phi)
     return phi
-
-
-def geodesic_ball(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], radius: float, min_count: int = 6
-) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
-    """
-    Per-vertex geodesic-ball neighborhoods matching ``igl::principal_curvature``'s ``getSphere``.
-
-    For each vertex this is a breadth-first traversal of the mesh edge graph, enqueueing a neighbor
-    only when it lies within Euclidean ``radius`` of the center — i.e. the connected component of
-    the center within the radius ball. This is a *geodesic* ball rather than a pure Euclidean one,
-    so it excludes vertices that are spatially close but lie across a fold of the surface (e.g. the
-    opposite wall of a torus tube), which a Euclidean hash-grid query would wrongly include and
-    which corrupts the quadric fit. When fewer than ``min_count`` vertices are reachable, the
-    nearest out-of-ball vertices are appended (libigl's ``extra_candidates`` path).
-
-    Also returns the per-vertex reference neighbor used to build the tangent frame: the
-    lowest-indexed edge neighbor, matching libigl's ``adjacency_list[i][0]``. libigl's symmetrized
-    shape operator is frame-dependent, so reproducing its principal values (
-    [`principal_curvature`][triwarp.curvature.principal_curvature] with ``frame_independent=False``)
-    requires this exact frame; the default frame-independent computation does not depend on it.
-    Isolated vertices reference themselves.
-
-    The traversal runs entirely on device. Vertex adjacency is built as a CSR graph via
-    [`edges_unique`][triwarp.edges.edges_unique] +
-    [`edges_to_csr`][triwarp.graph.edges_to_csr], then a single-pass BFS collects each ball into
-    its per-source queue row (the queue prefix *is* the result) and a scan + gather compacts the
-    rows into the CSR neighbor buffer. Each source uses fixed-capacity scratch of 512 neighbors;
-    if a vertex collects more than that the surplus is dropped and a warning is emitted.
-
-    !!! note
-
-        Distances and tie-breaking are computed in ``float32`` (set-equivalent to the libigl
-        reference; borderline ties between equidistant neighbors may resolve differently but leave
-        the order-independent quadric fit unchanged).
-
-    Parameters
-    ----------
-    vertices
-        ``(n_vertices,)`` mesh vertex positions as ``wp.vec3``.
-    faces
-        Length-``3 * n_faces`` flat triangle index buffer as ``wp.int32``.
-    radius
-        Geodesic-ball radius in world units.
-    min_count
-        Minimum neighbors per vertex; the nearest out-of-ball vertices backfill any shortfall.
-
-    Returns
-    -------
-    tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]
-        ``(neighbor_indices, offsets, reference_neighbors)``. ``offsets`` is the
-        length-``n_vertices`` exclusive prefix sum of per-vertex neighbor counts (CSR starts);
-        vertex ``i`` owns ``neighbor_indices[offsets[i] : offsets[i + 1]]`` with ``offsets[n]``
-        implied as the total. ``reference_neighbors`` has length ``n_vertices``.
-    """
-    device = vertices.device
-    n = int(vertices.shape[0])
-    if n == 0:
-        empty = wp.empty(0, dtype=wp.int32, device=device)
-        return (
-            empty,
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=wp.int32, device=device),
-        )
-
-    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n)
-    adjacency = tw.graph.edges_to_csr(n, unique_edges)
-    adj_offsets = adjacency.offsets
-    adj_columns = adjacency.columns
-
-    reference_neighbors = wp.empty(n, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_geodesic.geodesic_ball_reference_neighbors,
-        dim=n,
-        inputs=[adj_offsets, adj_columns, reference_neighbors],
-        device=device,
-    )
-
-    # Per-source scratch lives in shared global-memory pools sized for one chunk of sources
-    # (queue rows, an open-addressing visited row pre-filled with -1 per launch, and a small
-    # nearest-fallback pool) instead of ~8 KB of per-thread local arrays.
-    chunk = min(n, 1 << 15)
-    queue_pool = wp.empty(
-        (chunk, kernel_bfs._PER_SOURCE_MAX_NEIGHBORS), dtype=wp.int32, device=device
-    )
-    visited_pool = wp.empty(
-        (chunk, kernel_bfs._VISITED_HASH_CAPACITY), dtype=wp.int32, device=device
-    )
-    ext_dist_pool = wp.empty((chunk, kernel_bfs._EXTRAS_CAPACITY), dtype=wp.float32, device=device)
-    ext_idx_pool = wp.empty((chunk, kernel_bfs._EXTRAS_CAPACITY), dtype=wp.int32, device=device)
-
-    overflow = wp.zeros(1, dtype=wp.int32, device=device)
-    counts = wp.empty(n, dtype=wp.int32, device=device)
-    local_offsets = wp.empty(chunk, dtype=wp.int32, device=device)
-    chunk_total_buf = wp.empty(1, dtype=wp.int32, device=device)
-    chunk_flats: list[wp.array[wp.int32]] = []
-    for start in range(0, n, chunk):
-        m = min(chunk, n - start)
-        visited_pool.fill_(-1)
-        wp.launch(
-            kernel_geodesic.query_geodesic_ball_collect,
-            dim=m,
-            inputs=[
-                vertices,
-                adj_offsets,
-                adj_columns,
-                wp.float32(radius),
-                wp.int32(min_count),
-                wp.int32(start),
-                queue_pool,
-                visited_pool,
-                ext_dist_pool,
-                ext_idx_pool,
-                counts,
-                overflow,
-            ],
-            device=device,
-        )
-        # Gather this chunk's queue rows before the next chunk reuses the pools: chunk-local
-        # exclusive scan of counts, one 4-byte readback for the chunk total, then a coalesced
-        # 2D copy into the chunk's flat buffer.
-        wp.utils.array_scan(counts[start : start + m], out_array=local_offsets[:m], inclusive=False)
-        wp.map(
-            wp.add, local_offsets[m - 1 : m], counts[start + m - 1 : start + m], out=chunk_total_buf
-        )
-        chunk_total = int(chunk_total_buf.numpy()[0])
-        flat_chunk = wp.empty(chunk_total, dtype=wp.int32, device=device)
-        if chunk_total > 0:
-            wp.launch(
-                kernel_geodesic.gather_queue_rows,
-                dim=(m, kernel_bfs._PER_SOURCE_MAX_NEIGHBORS),
-                inputs=[queue_pool, counts, local_offsets, wp.int32(start), flat_chunk],
-                device=device,
-            )
-        chunk_flats.append(flat_chunk)
-
-    n_overflow = int(overflow.numpy()[0])
-    if n_overflow > 0:
-        warnings.warn(
-            f"geodesic_ball: {n_overflow} neighborhood capacity breaches "
-            f"(fixed cap 512); surplus neighbors dropped.",
-            stacklevel=2,
-        )
-
-    offsets = wp.empty(n, dtype=wp.int32, device=device)
-    wp.utils.array_scan(counts, out_array=offsets, inclusive=False)
-
-    if len(chunk_flats) == 1:
-        # Single chunk (n <= chunk): the chunk buffer already is the global CSR neighbor buffer.
-        return chunk_flats[0], offsets, reference_neighbors
-
-    # Chunk order equals ascending source order, so concatenation lines up with the global scan.
-    total = sum(int(flat_chunk.shape[0]) for flat_chunk in chunk_flats)
-    neighbor_indices = wp.empty(total, dtype=wp.int32, device=device)
-    position = 0
-    for flat_chunk in chunk_flats:
-        length = int(flat_chunk.shape[0])
-        if length > 0:
-            wp.copy(neighbor_indices[position : position + length], flat_chunk)
-            position += length
-    return neighbor_indices, offsets, reference_neighbors

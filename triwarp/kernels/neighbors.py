@@ -2,6 +2,7 @@ import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels.algorithms import bfs as kernel_bfs
 
 # Iterative-deepening k-nearest search. A scan at cube half-extent ``r`` enumerates every point
 # within Euclidean distance ``r`` (Chebyshev distance never exceeds Euclidean), so a row whose
@@ -400,3 +401,77 @@ def query_hashgrid_nearest_neighbors(
         else:
             r = wp.min(r * RADIUS_GROWTH, r_hard)
     knn_linear_scan(points, q, k, max_radius, out_indices_row, out_distances_row)
+
+
+@wp.kernel
+def geodesic_ball_reference_neighbors(
+    adj_offsets: wp.array[wp.int32],
+    adj_columns: wp.array[wp.int32],
+    out_reference: wp.array[wp.int32],
+) -> None:
+    """Lowest-indexed edge neighbor per vertex (libigl ``adjacency_list[i][0]``); self if alone."""
+    i = int(wp.tid())
+    start = int(adj_offsets[i])
+    end = int(adj_offsets[i + 1])
+    if start == end:
+        out_reference[i] = i
+        return
+    minimum = adj_columns[start]
+    for k in range(start + 1, end):
+        if adj_columns[k] < minimum:
+            minimum = adj_columns[k]
+    out_reference[i] = minimum
+
+
+@wp.kernel(enable_backward=False)
+def query_geodesic_ball_collect(
+    vertices: wp.array[wp.vec3],
+    adj_offsets: wp.array[wp.int32],
+    adj_columns: wp.array[wp.int32],
+    radius: wp.float32,
+    min_count: wp.int32,
+    chunk_start: wp.int32,
+    queue_pool: wp.array2d[wp.int32],
+    visited_pool: wp.array2d[wp.int32],
+    ext_dist_pool: wp.array2d[wp.float32],
+    ext_idx_pool: wp.array2d[wp.int32],
+    out_counts: wp.array[wp.int32],
+    out_overflow: wp.array[wp.int32],
+) -> None:
+    # Scratch lives in wrapper-allocated global-memory pools (one row per thread of the current
+    # chunk) instead of ~8 KB of per-thread local arrays; the wrapper pre-fills the visited pool
+    # with -1 before each launch. Single pass: after this kernel the thread's queue row holds
+    # the collected set (``queue_pool[t][:out_counts[chunk_start + t]]``) ready to gather.
+    t = int(wp.tid())
+    i = int(chunk_start) + t
+    out_counts[i] = kernel_bfs.per_source_bfs_collect(
+        wp.int32(i),
+        vertices,
+        adj_offsets,
+        adj_columns,
+        radius,
+        min_count,
+        queue_pool[t],
+        visited_pool[t],
+        ext_dist_pool[t],
+        ext_idx_pool[t],
+        out_overflow,
+    )
+
+
+@wp.kernel
+def gather_queue_rows(
+    queue_pool: wp.array2d[wp.int32],
+    counts: wp.array[wp.int32],
+    local_offsets: wp.array[wp.int32],
+    chunk_start: wp.int32,
+    out_flat: wp.array[wp.int32],
+) -> None:
+    # Compact the chunk's queue rows into its flat CSR buffer. Adjacent j threads read one
+    # queue row and write one out_flat segment contiguously (coalesced on both sides).
+    # ``counts`` is the global per-source array (indexed at chunk_start + t); ``local_offsets``
+    # is the chunk-local exclusive scan of this chunk's counts.
+    t, j = wp.tid()
+    if j >= counts[int(chunk_start) + t]:
+        return
+    out_flat[local_offsets[t] + j] = queue_pool[t, j]

@@ -78,7 +78,7 @@ def test_geodesic_ball_neighborhoods(mesh_name: str, request: pytest.FixtureRequ
     faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
 
     radius = 3.0 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
-    neighbor_indices_wp, offsets_wp, reference_wp = tw.geodesic.geodesic_ball(
+    neighbor_indices_wp, offsets_wp, reference_wp = tw.neighbors.geodesic_ball(
         vertices_wp, faces_wp, radius
     )
     per_vertex_oracle, reference_oracle = _geodesic_ball_neighborhoods_oracle(
@@ -112,7 +112,7 @@ def test_geodesic_ball_neighborhoods_overflow_warns() -> None:
     radius = 100.0 * float(mesh_tm.scale)
 
     with pytest.warns(UserWarning, match="capacity breaches"):
-        neighbor_indices_wp, offsets_wp, _ = tw.geodesic.geodesic_ball(
+        neighbor_indices_wp, offsets_wp, _ = tw.neighbors.geodesic_ball(
             vertices_wp, faces_wp, radius
         )
     # Clamped, not crashed: every per-vertex count fits within the fixed capacity.

@@ -61,8 +61,8 @@ def principal_curvature(
 
     # Collect vertex neighborhoods as geodesic balls (libigl getSphere) on device. A Euclidean ball
     # would pull in vertices across surface folds and corrupt the quadric fit; see
-    # tw.geodesic.geodesic_ball.
-    neighbor_indices, offsets, reference_neighbors = tw.geodesic.geodesic_ball(
+    # tw.neighbors.geodesic_ball.
+    neighbor_indices, offsets, reference_neighbors = tw.neighbors.geodesic_ball(
         vertices, faces, scaled_radius
     )
 

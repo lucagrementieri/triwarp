@@ -11,7 +11,7 @@ value that would hide the exponent.
 Three functions, three cost profiles:
 
 * ``principal_curvature`` -- a per-vertex 5x5 float64 least-squares quadric fit over a geodesic-ball
-  neighborhood. The neighborhood collection ([`geodesic_ball`][triwarp.geodesic.geodesic_ball],
+  neighborhood. The neighborhood collection ([`geodesic_ball`][triwarp.neighbors.geodesic_ball],
   timed on its own in [`test_proximity.py`](test_proximity.py)) is part of the call, so the number
   here is "ball + fit"; the fit is what a change to the 5x5 solver moves.
 * ``discrete_gaussian_curvature`` -- a hash-grid ball query plus a segmented scatter-sum of vertex
