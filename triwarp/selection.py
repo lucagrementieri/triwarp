@@ -13,107 +13,6 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels import selection as kernel_selection
 
 
-def expand_vertex_mask(
-    faces: wp.array[wp.int32],
-    mask: wp.array[wp.bool],
-    hops: int,
-    unique_edges: twt.Array2dInt32 | None = None,
-) -> wp.array[wp.bool]:
-    """
-    Grow a vertex selection by ``hops`` one-ring layers (MeshLib ``expand``).
-
-    Each round adds every vertex sharing a mesh edge with a currently-selected vertex, so after
-    ``hops`` rounds the mask covers all vertices within graph distance ``hops`` of the input
-    selection.
-
-    Parameters
-    ----------
-    faces
-        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
-    mask
-        Length-``n_vertices`` ``wp.bool`` selection to dilate.
-    hops
-        Number of one-ring dilation rounds (``0`` returns a copy).
-    unique_edges
-        Optional precomputed ``(m, 2)`` unique edges (from
-        [`edges_unique`][triwarp.edges.edges_unique]); rebuilt when ``None``.
-
-    Returns
-    -------
-    wp.array[wp.bool]
-        Dilated mask on ``mask.device``.
-
-    See Also
-    --------
-    [`shrink_vertex_mask`][triwarp.selection.shrink_vertex_mask]
-    """
-    device = mask.device
-    n = int(mask.shape[0])
-    current = wp.clone(mask)
-    if hops <= 0 or n == 0:
-        return current
-    if unique_edges is None:
-        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n)
-    m = int(unique_edges.shape[0])
-    for _ in range(hops):
-        nxt = wp.clone(current)
-        if m > 0:
-            wp.launch(
-                kernel_selection.dilate_vertex_mask,
-                dim=m,
-                inputs=[unique_edges, current, nxt],
-                device=device,
-            )
-        current = nxt
-    return current
-
-
-def shrink_vertex_mask(
-    faces: wp.array[wp.int32],
-    mask: wp.array[wp.bool],
-    hops: int,
-    unique_edges: twt.Array2dInt32 | None = None,
-) -> wp.array[wp.bool]:
-    """
-    Erode a vertex selection by ``hops`` one-ring layers (MeshLib ``shrink``).
-
-    Implemented as the complement of an [`expand_vertex_mask`][triwarp.selection.expand_vertex_mask]
-    of the complement: a vertex is removed if any vertex within ``hops`` hops is unselected.
-
-    Parameters
-    ----------
-    faces
-        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
-    mask
-        Length-``n_vertices`` ``wp.bool`` selection to erode.
-    hops
-        Number of one-ring erosion rounds.
-    unique_edges
-        Optional precomputed ``(m, 2)`` unique edges; rebuilt when ``None``.
-
-    Returns
-    -------
-    wp.array[wp.bool]
-        Eroded mask on ``mask.device``.
-
-    See Also
-    --------
-    [`expand_vertex_mask`][triwarp.selection.expand_vertex_mask]
-    """
-    device = mask.device
-    n = int(mask.shape[0])
-    if hops <= 0 or n == 0:
-        return wp.clone(mask)
-    if unique_edges is None:
-        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n)
-    complement = wp.empty(n, dtype=wp.bool, device=device)
-    wp.map(kernel_array.mask_not, mask, out=complement)
-    dilated = expand_vertex_mask(faces, complement, hops, unique_edges)
-    out = wp.empty(n, dtype=wp.bool, device=device)
-    wp.map(kernel_array.mask_not, dilated, out=out)
-    return out
-
-
 def region_boundary_edges(
     faces: wp.array[wp.int32], face_mask: wp.array[wp.bool], n_vertices: int | None = None
 ) -> twt.Array2dInt32:
@@ -522,6 +421,107 @@ def submesh_from_vertex_mask(
 
     vertex_indices = tw.array.flatnonzero(vertex_mask)
     return submesh_from_vertex_indices(vertices, faces, vertex_indices, face_mode=face_mode)
+
+
+def expand_vertex_mask(
+    faces: wp.array[wp.int32],
+    mask: wp.array[wp.bool],
+    hops: int,
+    unique_edges: twt.Array2dInt32 | None = None,
+) -> wp.array[wp.bool]:
+    """
+    Grow a vertex selection by ``hops`` one-ring layers (MeshLib ``expand``).
+
+    Each round adds every vertex sharing a mesh edge with a currently-selected vertex, so after
+    ``hops`` rounds the mask covers all vertices within graph distance ``hops`` of the input
+    selection.
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    mask
+        Length-``n_vertices`` ``wp.bool`` selection to dilate.
+    hops
+        Number of one-ring dilation rounds (``0`` returns a copy).
+    unique_edges
+        Optional precomputed ``(m, 2)`` unique edges (from
+        [`edges_unique`][triwarp.edges.edges_unique]); rebuilt when ``None``.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Dilated mask on ``mask.device``.
+
+    See Also
+    --------
+    [`shrink_vertex_mask`][triwarp.selection.shrink_vertex_mask]
+    """
+    device = mask.device
+    n = int(mask.shape[0])
+    current = wp.clone(mask)
+    if hops <= 0 or n == 0:
+        return current
+    if unique_edges is None:
+        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n)
+    m = int(unique_edges.shape[0])
+    for _ in range(hops):
+        nxt = wp.clone(current)
+        if m > 0:
+            wp.launch(
+                kernel_selection.dilate_vertex_mask,
+                dim=m,
+                inputs=[unique_edges, current, nxt],
+                device=device,
+            )
+        current = nxt
+    return current
+
+
+def shrink_vertex_mask(
+    faces: wp.array[wp.int32],
+    mask: wp.array[wp.bool],
+    hops: int,
+    unique_edges: twt.Array2dInt32 | None = None,
+) -> wp.array[wp.bool]:
+    """
+    Erode a vertex selection by ``hops`` one-ring layers (MeshLib ``shrink``).
+
+    Implemented as the complement of an [`expand_vertex_mask`][triwarp.selection.expand_vertex_mask]
+    of the complement: a vertex is removed if any vertex within ``hops`` hops is unselected.
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    mask
+        Length-``n_vertices`` ``wp.bool`` selection to erode.
+    hops
+        Number of one-ring erosion rounds.
+    unique_edges
+        Optional precomputed ``(m, 2)`` unique edges; rebuilt when ``None``.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Eroded mask on ``mask.device``.
+
+    See Also
+    --------
+    [`expand_vertex_mask`][triwarp.selection.expand_vertex_mask]
+    """
+    device = mask.device
+    n = int(mask.shape[0])
+    if hops <= 0 or n == 0:
+        return wp.clone(mask)
+    if unique_edges is None:
+        unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n)
+    complement = wp.empty(n, dtype=wp.bool, device=device)
+    wp.map(kernel_array.mask_not, mask, out=complement)
+    dilated = expand_vertex_mask(faces, complement, hops, unique_edges)
+    out = wp.empty(n, dtype=wp.bool, device=device)
+    wp.map(kernel_array.mask_not, dilated, out=out)
+    return out
 
 
 def face_indices_from_vertex_indices(

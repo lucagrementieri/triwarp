@@ -25,92 +25,6 @@ from triwarp.kernels import proximity as kernel_proximity
 from triwarp.triangles import face_normals_and_areas
 
 
-def query_mesh_aabb_bounds_with_offsets(
-    mesh: wp.Mesh,
-    query_lower: wp.array[wp.vec3],
-    query_upper: wp.array[wp.vec3],
-    *,
-    max_hits: int = 16,
-) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
-    """
-    Low-level mesh AABB query with per-query axis-aligned bounds.
-
-    For each query primitive ``k``, tests intersection of ``[query_lower[k],
-    query_upper[k]]`` against every triangle in ``mesh`` via ``wp.mesh_query_aabb``.
-    At most ``max_hits`` candidate face indices are recorded per query.
-
-    Requires the default Warp mesh BVH backend; ``bvh_constructor="cubql"`` meshes
-    do not support AABB queries.
-
-    Returns
-    -------
-    candidate_indices_flat, offsets, hit_counts
-        ``offsets`` is the exclusive prefix sum of per-query hit counts.
-        Query ``k`` owns ``candidate_indices_flat[offsets[k] : offsets[k] + hit_counts[k]]``.
-    """
-    device = query_lower.device
-    m = int(query_lower.shape[0])
-    if int(query_upper.shape[0]) != m:
-        raise ValueError("query_lower and query_upper must have the same length")
-    if max_hits < 1:
-        raise ValueError("max_hits must be >= 1")
-
-    if m == 0:
-        return (
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=wp.int32, device=device),
-        )
-
-    hit_counts = wp.empty(m, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_proximity.query_mesh_aabb_bounds_count,
-        dim=m,
-        inputs=[query_lower, query_upper, mesh.id, wp.int32(max_hits), hit_counts],
-        device=device,
-    )
-
-    # One scan pass yields both the row starts and their total; an all-zero ``hit_counts`` scans to
-    # all-zero offsets, which is exactly what the empty case wants to return.
-    offsets, total_hits = tw.array.counts_to_offsets(hit_counts)
-    if total_hits == 0:
-        return wp.empty(0, dtype=wp.int32, device=device), offsets, hit_counts
-
-    candidate_indices_flat = wp.empty(total_hits, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_proximity.query_mesh_aabb_bounds_neighbors,
-        dim=m,
-        inputs=[
-            query_lower,
-            query_upper,
-            mesh.id,
-            wp.int32(max_hits),
-            offsets,
-            candidate_indices_flat,
-        ],
-        device=device,
-    )
-
-    return candidate_indices_flat, offsets, hit_counts
-
-
-def _default_mesh_query_max_dist(
-    mesh_points: wp.array[wp.vec3], query_points: wp.array[wp.vec3] | None = None
-) -> float:
-    """
-    Diagonal of the AABB enclosing ``mesh_points`` and ``query_points``.
-
-    When ``query_points`` is ``None`` (or empty), returns the diagonal of the
-    axis-aligned bounding box of ``mesh_points`` alone.
-    """
-    mesh_min, mesh_max = tw.bounds.aabb_bounds(mesh_points)
-    if query_points is None or int(query_points.shape[0]) == 0:
-        return tw.bounds.aabb_diagonal(mesh_min, mesh_max)
-    query_min, query_max = tw.bounds.aabb_bounds(query_points)
-    combined_min, combined_max = tw.bounds.aabb_union(mesh_min, mesh_max, query_min, query_max)
-    return tw.bounds.aabb_diagonal(combined_min, combined_max)
-
-
 def closest_point_on_mesh(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -606,6 +520,75 @@ def max_tangent_sphere(
     return centers, radii
 
 
+def query_mesh_aabb_bounds_with_offsets(
+    mesh: wp.Mesh,
+    query_lower: wp.array[wp.vec3],
+    query_upper: wp.array[wp.vec3],
+    *,
+    max_hits: int = 16,
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Low-level mesh AABB query with per-query axis-aligned bounds.
+
+    For each query primitive ``k``, tests intersection of ``[query_lower[k],
+    query_upper[k]]`` against every triangle in ``mesh`` via ``wp.mesh_query_aabb``.
+    At most ``max_hits`` candidate face indices are recorded per query.
+
+    Requires the default Warp mesh BVH backend; ``bvh_constructor="cubql"`` meshes
+    do not support AABB queries.
+
+    Returns
+    -------
+    candidate_indices_flat, offsets, hit_counts
+        ``offsets`` is the exclusive prefix sum of per-query hit counts.
+        Query ``k`` owns ``candidate_indices_flat[offsets[k] : offsets[k] + hit_counts[k]]``.
+    """
+    device = query_lower.device
+    m = int(query_lower.shape[0])
+    if int(query_upper.shape[0]) != m:
+        raise ValueError("query_lower and query_upper must have the same length")
+    if max_hits < 1:
+        raise ValueError("max_hits must be >= 1")
+
+    if m == 0:
+        return (
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+        )
+
+    hit_counts = wp.empty(m, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_proximity.query_mesh_aabb_bounds_count,
+        dim=m,
+        inputs=[query_lower, query_upper, mesh.id, wp.int32(max_hits), hit_counts],
+        device=device,
+    )
+
+    # One scan pass yields both the row starts and their total; an all-zero ``hit_counts`` scans to
+    # all-zero offsets, which is exactly what the empty case wants to return.
+    offsets, total_hits = tw.array.counts_to_offsets(hit_counts)
+    if total_hits == 0:
+        return wp.empty(0, dtype=wp.int32, device=device), offsets, hit_counts
+
+    candidate_indices_flat = wp.empty(total_hits, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_proximity.query_mesh_aabb_bounds_neighbors,
+        dim=m,
+        inputs=[
+            query_lower,
+            query_upper,
+            mesh.id,
+            wp.int32(max_hits),
+            offsets,
+            candidate_indices_flat,
+        ],
+        device=device,
+    )
+
+    return candidate_indices_flat, offsets, hit_counts
+
+
 def thickness(
     mesh: wp.Mesh,
     points: wp.array[wp.vec3],
@@ -649,3 +632,20 @@ def thickness(
 
     else:
         raise ValueError('Invalid method, use "max_sphere" or "ray"')
+
+
+def _default_mesh_query_max_dist(
+    mesh_points: wp.array[wp.vec3], query_points: wp.array[wp.vec3] | None = None
+) -> float:
+    """
+    Diagonal of the AABB enclosing ``mesh_points`` and ``query_points``.
+
+    When ``query_points`` is ``None`` (or empty), returns the diagonal of the
+    axis-aligned bounding box of ``mesh_points`` alone.
+    """
+    mesh_min, mesh_max = tw.bounds.aabb_bounds(mesh_points)
+    if query_points is None or int(query_points.shape[0]) == 0:
+        return tw.bounds.aabb_diagonal(mesh_min, mesh_max)
+    query_min, query_max = tw.bounds.aabb_bounds(query_points)
+    combined_min, combined_max = tw.bounds.aabb_union(mesh_min, mesh_max, query_min, query_max)
+    return tw.bounds.aabb_diagonal(combined_min, combined_max)

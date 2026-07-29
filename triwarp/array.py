@@ -23,24 +23,6 @@ _ISIN_MASK_SIZE_FACTOR = 8
 SORT_ROWS_INSERTION_MAX_COLS = 8
 
 
-def _ensure_int_dtype(dtype: type) -> type[wp.Int]:
-    if not wp.types.type_is_int(dtype):
-        raise TypeError(f"dtype must be a Warp integer type, got {dtype!r}")
-    return dtype
-
-
-def _check_int_fits(dtype: type[wp.Int], value: int, name: str) -> None:
-    vmin = twt.dtype_min(dtype)
-    vmax = twt.dtype_max(dtype)
-    if value < vmin or value > vmax:
-        raise ValueError(f"{name}={value} is out of range for {dtype} [{vmin}, {vmax}]")
-
-
-def _int_scalar(dtype: type[wp.Int], value: int) -> wp.Int:
-    _check_int_fits(dtype, value, "value")
-    return dtype(value)
-
-
 def init_range(n: int, device: str, *, dtype: type[wp.Int] = wp.int32) -> wp.array:
     """Fill ``out[i] = i`` for ``i`` in ``[0, n)``."""
     dtype = _ensure_int_dtype(dtype)
@@ -956,3 +938,21 @@ def _as_vec3(positions: wp.array[wp.vec3d]) -> wp.array[wp.vec3]:
     out = wp.empty(int(positions.shape[0]), dtype=wp.vec3, device=positions.device)
     wp.map(kernel_array.to_vec3, positions, out=out)
     return out
+
+
+def _ensure_int_dtype(dtype: type) -> type[wp.Int]:
+    if not wp.types.type_is_int(dtype):
+        raise TypeError(f"dtype must be a Warp integer type, got {dtype!r}")
+    return dtype
+
+
+def _check_int_fits(dtype: type[wp.Int], value: int, name: str) -> None:
+    vmin = twt.dtype_min(dtype)
+    vmax = twt.dtype_max(dtype)
+    if value < vmin or value > vmax:
+        raise ValueError(f"{name}={value} is out of range for {dtype} [{vmin}, {vmax}]")
+
+
+def _int_scalar(dtype: type[wp.Int], value: int) -> wp.Int:
+    _check_int_fits(dtype, value, "value")
+    return dtype(value)
