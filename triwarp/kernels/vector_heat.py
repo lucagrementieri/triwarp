@@ -1,57 +1,6 @@
 import warp as wp
 
 from triwarp.constants import TOLERANCE_ZERO_CONSTANT
-from triwarp.kernels.halfedge import halfedge_destination
-
-
-@wp.func
-def rotation22(angle: wp.float32) -> wp.mat22d:
-    # Real 2x2 form of the unit complex number ``exp(i * angle)``: the rotation that re-expresses a
-    # tangent vector in a neighbour's frame.
-    c = wp.float64(wp.cos(angle))
-    s = wp.float64(wp.sin(angle))
-    return wp.mat22d(c, -s, s, c)
-
-
-@wp.kernel
-def connection_laplacian_triplets(
-    faces: wp.array[wp.int32],
-    cot_entries: wp.array2d[wp.Float],
-    transport_angles: wp.array[wp.float32],
-    out_rows: wp.array[wp.int32],
-    out_cols: wp.array[wp.int32],
-    out_vals: wp.array[wp.mat22d],
-) -> None:
-    # The vector Laplacian's 12 block triplets per triangle, laid out exactly like
-    # ``laplacian.cotmatrix_triplets`` but with each off-diagonal weight turned into a rotation: the
-    # two endpoints of an edge measure tangent directions from different reference directions, so a
-    # difference between them is only meaningful after transporting one into the other's frame.
-    #
-    # Built positive semi-definite (positive diagonal), unlike ``cotmatrix``'s igl sign convention,
-    # because every consumer here feeds it straight to a conjugate-gradient solve.
-    f = int(wp.tid())
-    identity = wp.mat22d(1.0, 0.0, 0.0, 1.0)
-    for e in range(3):
-        # Corner ``e``'s half-cotangent weights the opposite edge, which is halfedge ``e + 1``.
-        h = f * 3 + (e + 1) % 3
-        i = faces[h]
-        j = halfedge_destination(faces, h)
-        w = wp.float64(cot_entries[f, e])
-        rho = transport_angles[h]
-        base = f * 12 + e * 4
-
-        out_rows[base + 0] = i
-        out_cols[base + 0] = j
-        out_vals[base + 0] = -w * rotation22(-rho)
-        out_rows[base + 1] = j
-        out_cols[base + 1] = i
-        out_vals[base + 1] = -w * rotation22(rho)
-        out_rows[base + 2] = i
-        out_cols[base + 2] = i
-        out_vals[base + 2] = w * identity
-        out_rows[base + 3] = j
-        out_cols[base + 3] = j
-        out_vals[base + 3] = w * identity
 
 
 @wp.kernel

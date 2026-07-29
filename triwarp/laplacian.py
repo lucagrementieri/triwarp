@@ -7,7 +7,6 @@ import triwarp.typing as twt
 from triwarp.edges import edges_unique, faces_to_edges
 from triwarp.kernels import laplacian as kernel_laplacian
 from triwarp.kernels import scatter as kernel_scatter
-from triwarp.kernels import vector_heat as kernel_vector_heat
 from triwarp.tangent import halfedge_transport_angles
 from triwarp.triangles import face_normals_and_areas
 
@@ -249,7 +248,7 @@ def connection_laplacian(
     cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
     vals = wp.empty(n_triplets, dtype=wp.mat22d, device=device)
     wp.launch(
-        kernel_vector_heat.connection_laplacian_triplets,
+        kernel_laplacian.connection_laplacian_triplets,
         dim=n_faces,
         inputs=[faces, cot_entries, transport_angles, rows, cols, vals],
         device=device,

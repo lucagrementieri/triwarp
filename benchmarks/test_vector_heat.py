@@ -30,7 +30,9 @@ the reference's 38.3 / 38.1; ``transport_tangent_vectors`` 10.4 ms at ``saddle``
 **72.7 ms** against 182 / 188. That last row is the module's real result: triwarp's vector solve
 pays **2.7x** for the worse aspect ratio while the reference's factorization pays nothing -- the
 same iterative-versus-direct trade ``heat_geodesic_conditioning`` shows for the scalar. Assembly
-alone (``connection_laplacian``) is 1.11 / 1.23 / 2.82 ms over the scale axis.
+alone is measured as ``connection_laplacian`` in
+[`test_laplacian.py`](test_laplacian.py) -- 1.11 / 1.23 / 2.82 ms over the scale axis -- since the
+operator itself lives in ``triwarp.laplacian``.
 
 References
 ----------
@@ -70,16 +72,6 @@ def _solver_pp(bench_case: BenchCase) -> pp3d.MeshVectorHeatSolver:
         np.ascontiguousarray(bench_case.faces_np, dtype=np.int32),
         use_intrinsic_delaunay=False,
     )
-
-
-@pytest.mark.benchmark(group="connection_laplacian")
-@pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp")
-def test_connection_laplacian(bench_case: BenchCase) -> None:
-    """Assembly only: the same triplets as ``cotmatrix`` with a rotation in every off-diagonal."""
-    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-    matrix = bench_case.run(lambda: tw.laplacian.connection_laplacian(vertices, faces))
-    assert matrix.nrow == bench_case.n_vertices
 
 
 @pytest.mark.benchmark(group="extend_scalar")

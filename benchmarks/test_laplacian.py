@@ -134,6 +134,16 @@ def test_cotmatrix(bench_case: BenchCase) -> None:
         assert matrix_igl.shape == (n_vertices, n_vertices)
 
 
+@pytest.mark.benchmark(group="connection_laplacian")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp")
+def test_connection_laplacian(bench_case: BenchCase) -> None:
+    """Assembly only: the same triplets as ``cotmatrix`` with a rotation in every off-diagonal."""
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    matrix = bench_case.run(lambda: tw.laplacian.connection_laplacian(vertices, faces))
+    assert matrix.nrow == bench_case.n_vertices
+
+
 @pytest.mark.benchmark(group="laplacian_uniform")
 @pytest.mark.benchlibs("triwarp", "trimesh")
 def test_laplacian_uniform(bench_case: BenchCase) -> None:
