@@ -237,12 +237,10 @@ def sample_texture(
             out_values[v, k] = wp.lerp(top, bottom, fr)
 
 
-@wp.kernel
-def round_labels(sampled: wp.array2d[wp.float32], out_labels: wp.array[wp.int32]) -> None:
-    """Round nearest-sampled float labels back to int32; non-finite (NaN-UV) rows map to -1."""
-    v = int(wp.tid())
-    x = sampled[v, 0]
-    if wp.isfinite(x):
-        out_labels[v] = wp.int32(wp.round(x))
-    else:
-        out_labels[v] = wp.int32(-1)
+@wp.func
+def round_labels(sampled: wp.float32) -> wp.int32:
+    # Round a nearest-sampled float label back to int32; a non-finite value (a NaN UV that hit no
+    # texel) maps to -1.
+    if wp.isfinite(sampled):
+        return wp.int32(wp.round(sampled))
+    return wp.int32(-1)

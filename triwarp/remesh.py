@@ -394,11 +394,15 @@ def _smooth_pass(
         device=device,
     )
     out_positions = wp.empty(n_vertices, dtype=wp.vec3, device=device)
-    wp.launch(
+    wp.map(
         kernel_remesh.tangential_smooth_step,
-        dim=n_vertices,
-        inputs=[vertices, codes, normals, ring_sum, degree, wp.float32(1.0), out_positions],
-        device=device,
+        vertices,
+        codes,
+        normals,
+        ring_sum,
+        degree,
+        wp.float32(1.0),
+        out=out_positions,
     )
     return out_positions
 
@@ -410,11 +414,15 @@ def _reproject_pass(
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     out_positions = wp.empty(n_vertices, dtype=wp.vec3, device=device)
-    wp.launch(
+    # ``wp.uint64(...)`` is required: a bare ``wp.Mesh.id`` is a Python int and ``wp.map`` would
+    # infer ``int32`` for it (see tests/test_map_uniform_probe.py).
+    wp.map(
         kernel_remesh.reproject_vertices,
-        dim=n_vertices,
-        inputs=[original_mesh.id, codes, vertices, wp.float32(max_dist), out_positions],
-        device=device,
+        vertices,
+        codes,
+        wp.uint64(original_mesh.id),
+        wp.float32(max_dist),
+        out=out_positions,
     )
     return out_positions
 

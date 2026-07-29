@@ -351,18 +351,20 @@ def resample_interp(
         out_points[j] = wp.lerp(polyline[hi - 1], polyline[hi], t)
 
 
-@wp.kernel
+@wp.func
 def radius_segment_distances(
-    polyline: wp.array[wp.vec3],
-    center: wp.vec3,
-    normal: wp.vec3,
-    out_distances: wp.array[wp.float32],
-) -> None:
-    i = int(wp.tid())
+    start: wp.vec3, end: wp.vec3, center: wp.vec3, normal: wp.vec3
+) -> wp.float32:
+    # In-plane distance from ``center`` to one projected segment. Mapped over a shifted pair of
+    # views (``polyline[:-1]``, ``polyline[1:]``), so the two endpoints arrive as separate inputs
+    # rather than being indexed as ``i`` and ``i + 1``.
+    #
+    # ``normal`` is normalized here rather than at Python scope to keep the arithmetic identical to
+    # the kernel this replaced.
     unit_normal = wp.normalize(normal)
-    a = project_point_to_plane(polyline[i], center, unit_normal)
-    b = project_point_to_plane(polyline[i + 1], center, unit_normal)
-    out_distances[i] = wp.length(closest_point_on_segment(a, b, center) - center)
+    a = project_point_to_plane(start, center, unit_normal)
+    b = project_point_to_plane(end, center, unit_normal)
+    return wp.length(closest_point_on_segment(a, b, center) - center)
 
 
 # --- polygon triangulation (parallel ear clipping); port of libigl ear_clipping.cpp ---

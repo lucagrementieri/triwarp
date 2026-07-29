@@ -276,8 +276,6 @@ def remap_discrete_attribute_from_uv(
 
     n_vertices = int(uv.shape[0])
     out_labels = wp.empty(n_vertices, dtype=wp.int32, device=device)
-    if n_vertices > 0:
-        wp.launch(
-            kernel_texture.round_labels, dim=n_vertices, inputs=[sampled, out_labels], device=device
-        )
+    # ``sampled`` is ``(n_vertices, 1)`` and contiguous, so ``flatten()`` is a reshape view.
+    wp.map(kernel_texture.round_labels, sampled.flatten(), out=out_labels)
     return cast(twt.Array1dInt32, out_labels)

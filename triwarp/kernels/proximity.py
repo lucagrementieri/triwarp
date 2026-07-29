@@ -251,26 +251,14 @@ def winding_number_tiled(
         wp.tile_atomic_add(out_winding, tile_sum, (int(q),))
 
 
-@wp.kernel
-def init_sphere_radii_finite(
-    distances: wp.array[wp.float32],
-    out_radii: wp.array[wp.float32],
-    out_not_converged: wp.array[wp.bool],
-    out_needs_support: wp.array[wp.bool],
-) -> None:
+@wp.func
+def init_sphere_radii_finite(distance: wp.float32) -> tuple[wp.float32, wp.bool, wp.bool]:
     # Finite longest-ray hits initialise directly; escaped rays (inf distance) are deferred to
     # the tiled support-point passes below. Their slots default to the "no valid support"
     # outcome so an empty support subset needs no fix-up.
-    tid = wp.tid()
-    d = distances[tid]
-    if not wp.isinf(d):
-        out_radii[tid] = d * wp.float32(0.5)
-        out_not_converged[tid] = True
-        out_needs_support[tid] = False
-    else:
-        out_radii[tid] = wp.inf
-        out_not_converged[tid] = False
-        out_needs_support[tid] = True
+    if not wp.isinf(distance):
+        return distance * wp.float32(0.5), True, False
+    return wp.inf, False, True
 
 
 @wp.func

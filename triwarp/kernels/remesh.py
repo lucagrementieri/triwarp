@@ -823,44 +823,38 @@ def accumulate_one_ring(
     wp.atomic_add(out_degree, v, 1)
 
 
-@wp.kernel
+@wp.func
 def tangential_smooth_step(
-    vertices: wp.array(dtype=wp.vec3),
-    codes: wp.array(dtype=wp.int32),
-    normals: wp.array(dtype=wp.vec3),
-    ring_sum: wp.array(dtype=wp.vec3),
-    degree: wp.array(dtype=wp.int32),
+    vertex: wp.vec3,
+    code: wp.int32,
+    normal: wp.vec3,
+    ring_sum: wp.vec3,
+    degree: wp.int32,
     lam: wp.float32,
-    out_positions: wp.array(dtype=wp.vec3),
-) -> None:
-    i = int(wp.tid())
-    p = vertices[i]
-    out_positions[i] = p
-    if codes[i] != FREE_VERTEX or degree[i] == 0:
-        return
-    centroid = ring_sum[i] / float(degree[i])
+) -> wp.vec3:
+    # Move a free vertex toward its one-ring centroid, but only within the tangent plane, so the
+    # surface is smoothed without being shrunk. Pinned vertices and isolated ones stay put.
+    p = vertex
+    if code != FREE_VERTEX or degree == 0:
+        return p
+    centroid = ring_sum / float(degree)
     delta = centroid - p
-    n = normals[i]
-    tangential = project_out_normal(delta, n)
-    out_positions[i] = p + lam * tangential
+    tangential = project_out_normal(delta, normal)
+    return p + lam * tangential
 
 
-@wp.kernel(enable_backward=False)
+@wp.func
 def reproject_vertices(
-    mesh_id: wp.uint64,
-    codes: wp.array(dtype=wp.int32),
-    vertices: wp.array(dtype=wp.vec3),
-    max_dist: wp.float32,
-    out_positions: wp.array(dtype=wp.vec3),
-) -> None:
-    i = int(wp.tid())
-    p = vertices[i]
-    out_positions[i] = p
-    if codes[i] != FREE_VERTEX:
-        return
-    query = wp.mesh_query_point_no_sign(mesh_id, p, max_dist)
+    vertex: wp.vec3, code: wp.int32, mesh_id: wp.uint64, max_dist: wp.float32
+) -> wp.vec3:
+    # Snap a free vertex back onto the closest point of the original surface, undoing the drift the
+    # smoothing pass introduces. Pinned vertices and failed queries keep their position.
+    if code != FREE_VERTEX:
+        return vertex
+    query = wp.mesh_query_point_no_sign(mesh_id, vertex, max_dist)
     if query.result:
-        out_positions[i] = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
+        return wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
+    return vertex
 
 
 @wp.func

@@ -422,11 +422,10 @@ def max_tangent_sphere(
     radii = wp.empty(m, dtype=wp.float32, device=device)
     not_converged = wp.empty(m, dtype=wp.bool, device=device)
     needs_support = wp.empty(m, dtype=wp.bool, device=device)
-    wp.launch(
+    wp.map(
         kernel_proximity.init_sphere_radii_finite,
-        dim=m,
-        inputs=[distances, radii, not_converged, needs_support],
-        device=device,
+        distances,
+        out=[radii, not_converged, needs_support],
     )
     # Escaped rays (typically exterior/reach queries) need the support point of the vertex
     # cloud in the ray direction. Compact them first — interior queries usually leave the

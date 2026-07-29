@@ -786,11 +786,13 @@ def polyline_radius(
         normal = polyline_normal(polyline)
 
     distances = wp.empty(n_segments, dtype=wp.float32, device=device)
-    wp.launch(
+    wp.map(
         kernel_polyline.radius_segment_distances,
-        dim=n_segments,
-        inputs=[polyline, center, normal, distances],
-        device=device,
+        polyline[:-1],
+        polyline[1:],
+        center,
+        normal,
+        out=distances,
     )
     if reduction == "min":
         return float(tw.reduce.min(distances))

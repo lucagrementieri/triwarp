@@ -137,11 +137,13 @@ def find_local_maxima(
     out_is_max[i] = is_max
 
 
-@wp.kernel
-def apply_deletions(deleted_mask: wp.array[wp.int32], alive: wp.array[wp.int32]) -> None:
-    i = int(wp.tid())
-    if deleted_mask[i] == 1:
-        alive[i] = 0
+@wp.func
+def apply_deletions(deleted_mask: wp.int32, alive: wp.int32) -> wp.int32:
+    # Clear the alive flag where a sample was deleted, leaving it otherwise. Mapped in place over
+    # ``alive``, so it must return the untouched value rather than skip the write.
+    if deleted_mask == 1:
+        return wp.int32(0)
+    return alive
 
 
 @wp.kernel

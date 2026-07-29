@@ -156,14 +156,17 @@ def hash_insert(
         wp.atomic_add(slot_counts, hash_find_or_insert(key, slot_key, mask), wp.int32(1))
 
 
-@wp.kernel
-def mark_occupied(slot_counts: wp.array[wp.int32], out_mask: wp.array[wp.int32]) -> None:
+@wp.func
+def mark_occupied(slot_counts: wp.int32) -> wp.int32:
     # Occupancy is read from the counts rather than from `slot_key`, because a slot claimed by
     # `hash_insert` always has its count incremented, whereas the reserved sentinel slot keeps a
     # `slot_key` of 0 and would otherwise look empty.
-    h = int(wp.tid())
-    if slot_counts[h] > wp.int32(0):
-        out_mask[h] = wp.int32(1)
+    #
+    # Returns 0 as well as 1: the kernel this replaced only ever wrote the 1s and leaned on a
+    # zero-filled destination, so writing every slot lets the caller allocate with ``wp.empty``.
+    if slot_counts > wp.int32(0):
+        return wp.int32(1)
+    return wp.int32(0)
 
 
 @wp.kernel

@@ -688,8 +688,8 @@ def _unique_hash(
     )
 
     # Phase 2: mark occupied slots, prefix-scan to get compact positions.
-    occ_mask = wp.zeros(cap, dtype=wp.int32, device=device)
-    wp.launch(kernel_grouping.mark_occupied, dim=cap, inputs=[slot_counts, occ_mask], device=device)
+    occ_mask = wp.empty(cap, dtype=wp.int32, device=device)
+    wp.map(kernel_grouping.mark_occupied, slot_counts, out=occ_mask)
     scan_pos = wp.empty(cap, dtype=wp.int32, device=device)
     wp.utils.array_scan(occ_mask, scan_pos, inclusive=True)
     wp.map(wp.sub, scan_pos, wp.int32(1), out=scan_pos)
