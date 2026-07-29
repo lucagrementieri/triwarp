@@ -8,6 +8,7 @@ from triwarp.edges import edges_unique, faces_to_edges
 from triwarp.kernels import laplacian as kernel_laplacian
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import vector_heat as kernel_vector_heat
+from triwarp.tangent import halfedge_transport_angles
 from triwarp.triangles import face_normals_and_areas
 
 
@@ -180,7 +181,6 @@ def connection_laplacian(
     faces: wp.array[wp.int32],
     cot_entries: twt.Array2dFloat | None = None,
     transport_angles: wp.array[wp.float32] | None = None,
-    frames: tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.vec3]] | None = None,
 ) -> wps.BsrMatrix[wp.float64]:
     """
     Vector (connection) Laplacian: the cotangent Laplacian for *tangent vector* fields.
@@ -208,10 +208,12 @@ def connection_laplacian(
     transport_angles
         Optional precomputed per-halfedge
         [`halfedge_transport_angles`][triwarp.tangent.halfedge_transport_angles].
-    frames
-        Optional precomputed [`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames], only
-        used when ``transport_angles`` has to be computed here. The operator depends on the frames
-        only through those angles, and its solutions transform consistently with them.
+
+        There is deliberately no ``frames`` argument. The gauge is fixed by the one-ring
+        flattening — angles are measured from each vertex's first outgoing halfedge, the same
+        convention [`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames] uses to pick
+        ``basis_x`` — so a caller-supplied frame cannot change these angles, and solutions are
+        already consistent with the frames that convention produces.
 
     Returns
     -------
@@ -224,8 +226,6 @@ def connection_laplacian(
     [`halfedge_transport_angles`][triwarp.tangent.halfedge_transport_angles]
     [`transport_tangent_vectors`][triwarp.vector_heat.transport_tangent_vectors]
     """
-    from triwarp.tangent import halfedge_transport_angles
-
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
     device = vertices.device
@@ -242,12 +242,7 @@ def connection_laplacian(
     if cot_entries is None:
         cot_entries = cotmatrix_entries(vertices, faces, dtype=wp.float64)
     if transport_angles is None:
-        rings = None
-        if frames is None:
-            transport_angles = halfedge_transport_angles(vertices, faces)
-        else:
-            transport_angles = halfedge_transport_angles(vertices, faces)
-        del rings
+        transport_angles = halfedge_transport_angles(vertices, faces)
 
     n_triplets = 12 * n_faces
     rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
