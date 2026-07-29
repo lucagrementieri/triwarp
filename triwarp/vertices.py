@@ -1,3 +1,22 @@
+"""
+Per-vertex quantities: normals under five averaging rules, and the angle defect.
+
+A vertex has no normal of its own -- only the faces around it do -- so a vertex normal is always a
+weighted average of incident face normals, and the weight is a modelling choice rather than a
+detail. The five here differ only in that weight: unweighted
+([`mean_vertex_normals`][triwarp.vertices.mean_vertex_normals]), caller-supplied
+([`weighted_vertex_normals`][triwarp.vertices.weighted_vertex_normals]), by face area
+([`area_weighted_vertex_normals`][triwarp.vertices.area_weighted_vertex_normals]), by incident angle
+([`angle_weighted_vertex_normals`][triwarp.vertices.angle_weighted_vertex_normals], the one that is
+invariant to how a neighbour is triangulated), and by sine times edge length
+([`sine_and_edge_length_weighted_vertex_normals`][triwarp.vertices.sine_and_edge_length_weighted_vertex_normals]).
+
+[`vertex_defects`][triwarp.vertices.vertex_defects] is the odd one out and not a normal at all:
+``2 * pi`` minus the incident angle sum, which is the intrinsic curvature concentrated at that
+vertex and the quantity
+[`discrete_gaussian_curvature`][triwarp.curvature.discrete_gaussian_curvature] reports.
+"""
+
 from __future__ import annotations
 
 import warp as wp

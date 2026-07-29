@@ -1,3 +1,22 @@
+"""
+Flatten a mesh into the plane: harmonic, Tutte, ARAP and LSCM parametrizations.
+
+Four maps, differing in what they hold fixed and what they minimize. The first three pin the
+boundary and solve for the interior:
+[`harmonic`][triwarp.parametrization.harmonic] minimizes Dirichlet energy with cotangent weights,
+[`tutte`][triwarp.parametrization.tutte] is the same solve with uniform weights (guaranteeing an
+injective map for a convex boundary), and [`arap`][triwarp.parametrization.arap] alternates local
+rotation fits with a global solve to trade conformality for low area distortion.
+[`lscm`][triwarp.parametrization.lscm] instead pins only two vertices and lets the boundary find its
+own shape, minimizing conformal rather than Dirichlet energy.
+
+[`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle] supplies the boundary
+condition the fixed-boundary three need, and
+[`flipped_faces`][triwarp.parametrization.flipped_faces] is the diagnostic that says whether a
+result is actually injective. Ports of the corresponding ``igl::`` routines; the solves are
+conjugate-gradient and therefore CUDA-only.
+"""
+
 from __future__ import annotations
 
 import warp as wp

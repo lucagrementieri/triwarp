@@ -1,3 +1,18 @@
+"""
+Convexity of a mesh's face adjacency, and greedy convex face sets.
+
+A pair of edge-adjacent faces is *convex* when each face's third vertex lies on the inner side of
+the other's plane. [`face_adjacency_convex`][triwarp.convex.face_adjacency_convex] answers that per
+adjacency row, and
+[`face_adjacency_projections`][triwarp.convex.face_adjacency_projections] returns the signed
+distances it thresholds, for callers that want the margin rather than the verdict.
+
+The two ``fast_convex_set`` entry points grow a maximal set of faces whose pairwise adjacencies are
+all convex, starting from a seed -- the "fast" is because the test is local (per adjacency) rather
+than a global convex-hull computation, so it accepts a locally convex patch of a globally
+non-convex mesh.
+"""
+
 from __future__ import annotations
 
 import warp as wp

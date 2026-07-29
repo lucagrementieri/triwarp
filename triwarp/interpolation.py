@@ -1,3 +1,19 @@
+"""
+Move a scalar or vector field between the mesh's elements: faces, vertices and edges.
+
+Averaging is the only honest transfer between element types on a mesh, and the direction determines
+what it costs: face-to-vertex
+([`average_onto_vertices`][triwarp.interpolation.average_onto_vertices]) and edge-to-vertex
+([`average_from_edges_onto_vertices`][triwarp.interpolation.average_from_edges_onto_vertices]) are
+gathers over the incident elements, while vertex-to-face
+([`average_onto_faces`][triwarp.interpolation.average_onto_faces]) is the mean of exactly three
+corners and needs no adjacency at all.
+
+These are unweighted means. For an area- or angle-weighted transfer of *normals* specifically, see
+[`triwarp.vertices`][triwarp.vertices]; for a UV-space resampling, see
+[`triwarp.texture`][triwarp.texture].
+"""
+
 from __future__ import annotations
 
 from typing import cast

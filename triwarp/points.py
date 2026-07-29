@@ -1,3 +1,24 @@
+"""
+Unstructured point-cloud geometry: fitting, second moments and normal estimation.
+
+No connectivity here -- everything takes a bare ``(n,)`` array of positions. Two groups:
+
+- **Whole-cloud fits.** [`centroid`][triwarp.points.centroid],
+  [`covariance`][triwarp.points.covariance] and
+  [`centered_covariance`][triwarp.points.centered_covariance] give the second moments;
+  [`fit_line`][triwarp.points.fit_line] and [`fit_plane`][triwarp.points.fit_plane] read the
+  dominant and weakest eigenvector off them. [`gram_matrix`][triwarp.points.gram_matrix] is the
+  uncentered form, for callers that want to center differently.
+- **Per-point.** [`estimate_normals`][triwarp.points.estimate_normals] fits a plane to each point's
+  k-nearest neighbourhood, which is how an unoriented cloud acquires normals before
+  reconstruction. [`plane_basis`][triwarp.points.plane_basis] and
+  [`radial_sort`][triwarp.points.radial_sort] then let a caller work in the tangent plane it
+  defines.
+
+Normals from [`estimate_normals`][triwarp.points.estimate_normals] are *unoriented* -- a plane fit
+cannot pick a side. See [`triwarp.repair`][triwarp.repair] for orientation propagation.
+"""
+
 import warp as wp
 
 import triwarp as tw

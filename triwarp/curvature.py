@@ -1,3 +1,22 @@
+"""
+Discrete curvature: principal directions and magnitudes, Gaussian and mean.
+
+Three quantities computed three different ways, because on a mesh "curvature" is not one thing:
+
+- [`principal_curvature`][triwarp.curvature.principal_curvature] fits a quadric to a geodesic-ball
+  neighbourhood of each vertex and reads the shape operator off it, giving both principal
+  directions and magnitudes. This is the extrinsic, neighbourhood-scale answer, and the only one
+  with a ``radius`` to tune (``igl::principal_curvature``).
+- [`discrete_gaussian_curvature`][triwarp.curvature.discrete_gaussian_curvature] is the angle
+  defect: purely *intrinsic*, exact rather than fitted, and computable from the angles alone.
+- [`discrete_mean_curvature`][triwarp.curvature.discrete_mean_curvature] sums dihedral angle times
+  edge length over the one ring, which is the integrated mean curvature rather than a pointwise one.
+
+The neighbourhood the first one fits over is a *geodesic* ball
+([`geodesic_ball`][triwarp.neighbors.geodesic_ball]), not a Euclidean one: a spatial query would
+pull in vertices across a fold of the surface and corrupt the fit.
+"""
+
 import warp as wp
 
 import triwarp as tw
