@@ -183,6 +183,46 @@ def scatter_free_solution(
         out_points[v] = wp.vec3(wp.float32(sol_x[i]), wp.float32(sol_y[i]), wp.float32(sol_z[i]))
 
 
+@wp.kernel
+def add_interior_mass_rhs(
+    fixed_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    mass: wp.array[wp.float64],
+    positions: wp.array[wp.vec3d],
+    out_rhs: wp.array2d[wp.float64],
+) -> None:
+    # Add the linear term ``b_u = (M V)_u`` into the reduced right-hand side, which arrives holding
+    # only ``-A_ub x_b`` from ``linalg.assemble_interior_system`` (that helper eliminates the pinned
+    # columns of a quadratic form, which has no linear term of its own).
+    v = int(wp.tid())
+    if fixed_mask[v]:
+        return
+    i = free_map[v]
+    m = mass[v]
+    p = positions[v]
+    out_rhs[0, i] = out_rhs[0, i] + m * p[0]
+    out_rhs[1, i] = out_rhs[1, i] + m * p[1]
+    out_rhs[2, i] = out_rhs[2, i] + m * p[2]
+
+
+@wp.kernel
+def scatter_free_positions(
+    fixed_mask: wp.array[wp.bool],
+    free_map: wp.array[wp.int32],
+    sol_x: wp.array[wp.float64],
+    sol_y: wp.array[wp.float64],
+    sol_z: wp.array[wp.float64],
+    out_positions: wp.array[wp.vec3d],
+) -> None:
+    # Write the reduced solution back to the unpinned vertices only. Pinned ones are left holding
+    # whatever they already have, which is their original position -- they never move.
+    v = int(wp.tid())
+    if fixed_mask[v]:
+        return
+    i = free_map[v]
+    out_positions[v] = wp.vec3d(sol_x[i], sol_y[i], sol_z[i])
+
+
 @wp.func
 def laplacian_step(v_prev: wp.vec3d, lv: wp.vec3d, coeff: wp.float64) -> wp.vec3d:
     # Explicit diffusion step v' = v + coeff * (L·v - v); coeff = +lambda (shrink) or -nu (inflate).

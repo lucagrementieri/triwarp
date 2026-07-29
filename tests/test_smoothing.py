@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import igl
 import numpy as np
 import pytest
@@ -313,3 +315,69 @@ def test_position_verts_smoothly_empty_region(device: str):
     empty = wp.zeros(len(vertices_np), dtype=wp.bool, device=device)
     result = tw.smoothing.position_verts_smoothly_sharp_boundary(v_wp, f_wp, empty)
     assert np.array_equal(result.numpy(), v_wp.numpy())
+
+
+def test_filter_implicit_fairing_pins_the_boundary(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """Boundary vertices are held exactly; the interior is the part that moves."""
+    _, mesh_wp = hemisphere
+    _skip_without_cuda(mesh_wp)
+    original_np = mesh_wp.points.numpy()
+    boundary_np = tw.boundary.boundary_vertex_indices(mesh_wp.points, mesh_wp.indices).numpy()
+    interior_np = np.setdiff1d(np.arange(len(original_np)), boundary_np)
+    assert len(boundary_np) > 0  # the fixture must actually be open for this to mean anything
+
+    smoothed_np = tw.smoothing.filter_implicit_fairing(
+        mesh_wp.points, mesh_wp.indices, iterations=5
+    ).numpy()
+
+    assert np.array_equal(smoothed_np[boundary_np], original_np[boundary_np])
+    assert np.abs(smoothed_np[interior_np] - original_np[interior_np]).max() > 1e-6
+
+
+def test_filter_implicit_fairing_pinned_stays_stable_on_an_open_mesh(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Many passes on an open mesh converge instead of diverging.
+
+    The unconstrained flow pulls the free boundary inward until the triangles there collapse, after
+    which the system is effectively singular and the conjugate gradient runs to its iteration cap.
+    Pinning makes each pass a Dirichlet problem over the interior, which is well posed however many
+    times it is applied — so this asserts *no* non-convergence warning, not merely finiteness.
+    """
+    _, mesh_wp = hemisphere
+    _skip_without_cuda(mesh_wp)
+    extent = float(np.abs(mesh_wp.points.numpy()).max())
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        smoothed_np = tw.smoothing.filter_implicit_fairing(
+            mesh_wp.points, mesh_wp.indices, iterations=25
+        ).numpy()
+
+    assert np.isfinite(smoothed_np).all()
+    # Smoothing cannot inflate the patch beyond its pinned rim.
+    assert np.abs(smoothed_np).max() <= extent * 1.01
+
+
+def test_filter_implicit_fairing_pin_boundary_is_a_no_op_on_a_closed_mesh(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    A watertight mesh has no boundary, so the flag routes down the same unreduced solve either way.
+
+    Compared at ``float64`` round-off rather than bitwise: the sparse mat-vec accumulates with
+    atomics, so *any* two runs of this function differ in the last bits, flag or no flag.
+    """
+    _, mesh_wp = icosahedron
+    _skip_without_cuda(mesh_wp)
+    assert int(tw.boundary.boundary_vertex_indices(mesh_wp.points, mesh_wp.indices).shape[0]) == 0
+
+    pinned_np = tw.smoothing.filter_implicit_fairing(
+        mesh_wp.points, mesh_wp.indices, iterations=6, pin_boundary=True
+    ).numpy()
+    unpinned_np = tw.smoothing.filter_implicit_fairing(
+        mesh_wp.points, mesh_wp.indices, iterations=6, pin_boundary=False
+    ).numpy()
+
+    assert np.allclose(pinned_np, unpinned_np, rtol=0, atol=1e-12)

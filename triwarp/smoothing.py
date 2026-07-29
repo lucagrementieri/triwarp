@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import warp as wp
 import warp.optim.linear as wpl
 import warp.sparse as wps
@@ -540,7 +542,12 @@ def filter_mut_dif_laplacian(
 
 
 def filter_implicit_fairing(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], lamb: float = 0.1, iterations: int = 10
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    lamb: float = 0.1,
+    iterations: int = 10,
+    *,
+    pin_boundary: bool = True,
 ) -> wp.array[wp.vec3]:
     """
     Implicit fairing with the cotangent Laplace-Beltrami operator (Desbrun et al.).
@@ -552,10 +559,16 @@ def filter_implicit_fairing(
     libigl tutorial 205, MeshLib ``Laplacian`` in cotangent mode) and is **CUDA only** (raises on
     CPU). The solve uses ``float64`` throughout.
 
-    Intended for closed (watertight) meshes. On meshes with an open boundary the unconstrained
-    flow shrinks and degrades the boundary triangles; because the linear system is solved by
-    conjugate gradient (the only Warp solver available), repeated passes on such meshes may
-    diverge.
+    On a mesh with an open boundary the flow needs a boundary condition, which is what
+    ``pin_boundary`` supplies: without one the unconstrained boundary is pulled inward, collapsing
+    the triangles there, and since the system is solved by conjugate gradient (the only Warp solver
+    available) further passes diverge rather than degrade gracefully. Pinning turns the pass into a
+    Dirichlet problem over the interior, which is the formulation Desbrun et al. give for a surface
+    with boundary and is well posed for any number of passes.
+
+    A closed mesh has no boundary, so ``pin_boundary`` costs nothing and changes nothing there --
+    the solve is over every vertex either way, and curvature flow on a closed surface still shrinks
+    it (a sphere contracts toward a point, which is the method working, not failing).
 
     Parameters
     ----------
@@ -568,6 +581,10 @@ def filter_implicit_fairing(
         stable.
     iterations
         Number of smoothing passes.
+    pin_boundary
+        Hold boundary vertices at their input positions and solve only for the interior. A no-op on
+        a closed mesh. Set ``False`` for the unconstrained flow, which is free to shrink the
+        boundary — expect [`solve_spd`][triwarp.linalg.solve_spd] to warn once it stops converging.
 
     Returns
     -------
@@ -594,6 +611,11 @@ def filter_implicit_fairing(
     rhs = _empty_components(n, device)
     solutions = _empty_components(n, device)
 
+    # Boundary topology is fixed for the whole flow, so the partition is built once. ``None`` means
+    # "solve over every vertex" -- either the caller asked for the unconstrained flow, or the mesh
+    # is closed and there is nothing to pin.
+    dirichlet = _dirichlet_state(vertices, faces, positions, n, device) if pin_boundary else None
+
     for _ in range(iterations):
         current = tw.array._as_vec3(positions)
         # Rebuilt every iteration on purpose: the cotangent weights depend on ``current``, which
@@ -610,21 +632,110 @@ def filter_implicit_fairing(
 
         # A = M - lamb L (SPD: L has a negative diagonal, so subtracting it adds to the diagonal).
         system = wps.bsr_axpy(x=stiffness, y=wps.bsr_diag(diag=mass), alpha=-float(lamb), beta=1.0)
-        precond = wpl.preconditioner(system, "diag")
-        for b, solution, component in zip(rhs, solutions, components, strict=True):
-            wp.copy(solution, component)
+
+        if dirichlet is None:
+            precond = wpl.preconditioner(system, "diag")
+            for b, solution, component in zip(rhs, solutions, components, strict=True):
+                wp.copy(solution, component)
+                twl.solve_spd(
+                    system,
+                    b,
+                    solution,
+                    tol=twl.CG_TOLERANCE,
+                    maxiter=10 * n,
+                    preconditioner=precond,
+                    name="filter_implicit_fairing",
+                )
+            wp.map(kernel_smoothing.combine_components, *solutions, out=positions)
+            continue
+
+        # Dirichlet pass: eliminate the pinned rows and columns, then solve over the interior.
+        # ``assemble_interior_system`` supplies ``-A_ub x_b``; the linear term ``(M V)_u`` is added
+        # on top, since that helper eliminates a quadratic form which has none of its own.
+        interior_system, interior_rhs = twl.assemble_interior_system(
+            system, dirichlet.fixed_mask, dirichlet.free_map, dirichlet.pinned, dirichlet.n_free
+        )
+        wp.launch(
+            kernel_smoothing.add_interior_mass_rhs,
+            dim=n,
+            inputs=[dirichlet.fixed_mask, dirichlet.free_map, mass, positions, interior_rhs],
+            device=device,
+        )
+        interior_precond = wpl.preconditioner(interior_system, "diag")
+        solution_2d = dirichlet.solution
+        for column in range(3):
+            wp.copy(solution_2d[column], interior_rhs[column])
             twl.solve_spd(
-                system,
-                b,
-                solution,
+                interior_system,
+                interior_rhs[column],
+                solution_2d[column],
                 tol=twl.CG_TOLERANCE,
-                maxiter=10 * n,
-                preconditioner=precond,
+                maxiter=10 * dirichlet.n_free,
+                preconditioner=interior_precond,
                 name="filter_implicit_fairing",
             )
-        wp.map(kernel_smoothing.combine_components, *solutions, out=positions)
+        wp.launch(
+            kernel_smoothing.scatter_free_positions,
+            dim=n,
+            inputs=[
+                dirichlet.fixed_mask,
+                dirichlet.free_map,
+                solution_2d[0],
+                solution_2d[1],
+                solution_2d[2],
+                positions,
+            ],
+            device=device,
+        )
 
     return tw.array._as_vec3(positions)
+
+
+class _Dirichlet(NamedTuple):
+    """Everything a boundary-pinned fairing pass needs, built once because the boundary is fixed."""
+
+    fixed_mask: wp.array[wp.bool]
+    free_map: wp.array[wp.int32]
+    n_free: int
+    pinned: twt.Array2dFloat
+    """``(3, n_vertices)`` prescribed values; only the pinned rows are ever read."""
+    solution: twt.Array2dFloat
+    """``(3, n_free)`` scratch for the reduced solve."""
+
+
+def _dirichlet_state(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    positions: wp.array[wp.vec3d],
+    n: int,
+    device: wp.DeviceLike,
+) -> _Dirichlet | None:
+    """
+    Boundary-pinned solve state, or ``None`` when there is no boundary to pin.
+
+    Returning ``None`` for a closed mesh is deliberate: it routes the caller down the unreduced
+    path, so a watertight input runs exactly the same code as it did before pinning existed.
+    """
+    boundary_wp = tw.boundary.boundary_vertex_indices(vertices, faces)
+    if int(boundary_wp.shape[0]) == 0:
+        return None
+    fixed_mask = tw.array.indices_to_mask(boundary_wp, n, device=device)
+    free_map, n_free = twl.free_partition(fixed_mask)
+    if n_free == 0:
+        return None
+    pinned = wp.zeros((3, n), dtype=wp.float64, device=device)
+    wp.map(
+        kernel_smoothing.extract_components, positions, out=[pinned[column] for column in range(3)]
+    )
+    return _Dirichlet(
+        fixed_mask,
+        free_map,
+        n_free,
+        twt.as_array2d_float(pinned, dtype=wp.float64),
+        twt.as_array2d_float(
+            wp.zeros((3, n_free), dtype=wp.float64, device=device), dtype=wp.float64
+        ),
+    )
 
 
 def _empty_components(

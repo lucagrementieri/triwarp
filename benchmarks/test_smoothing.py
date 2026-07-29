@@ -143,11 +143,6 @@ def test_filter_laplacian_integration(bench_case: BenchCase, implicit: bool) -> 
     assert result.shape == vertices.shape
 
 
-# Implicit fairing stops converging past two passes on every mesh in this suite -- see the group's
-# docstring -- so it is timed at two rather than at ``_ITERATIONS``.
-_FAIRING_ITERATIONS = 2
-
-
 @pytest.mark.benchmark(group="filter_implicit_fairing")
 @pytest.mark.benchaxis("quality")
 @pytest.mark.benchlibs("triwarp")
@@ -160,30 +155,31 @@ def test_filter_implicit_fairing(bench_case: BenchCase) -> None:
     matrices before solving. Assembly is therefore *inside* the timed loop by construction, not a
     setup cost that could be hoisted.
 
-    !!! warning "Two passes, not ten"
-        This group runs ``iterations=2`` where the rest of the module runs ten, because the flow
-        itself stops converging after that on every mesh here. Unconstrained curvature flow
-        collapses the surface -- on ``saddle`` the minimum barycentric mass falls 4.9e-5, 4.3e-8,
-        1.4e-13 over three passes -- and once the triangles are that small the system is effectively
-        singular, so the conjugate gradient runs to its ``maxiter`` cap and returns its last
-        iterate. Timing that measures a failed solve, not fairing: 103 s a call rather than 1 s.
+    Both meshes on this axis are open patches, so this measures the default ``pin_boundary=True``:
+    the rim is held and each pass is a Dirichlet problem over the interior, which converges however
+    many passes are applied. Hence the assertion of *no* non-convergence warning below -- if this
+    group ever starts warning, the flow has stopped being well posed.
 
-        This used to be worse. The collapse drove ``cot_entries_from_l2``'s unguarded division by
-        ``4 * dbl_area`` to ``inf`` and the result came back NaN; that division is now guarded, so
-        the output stays finite and ``triwarp.linalg.solve_spd`` *warns* when it exhausts its
-        iterations. The assertion below is that envelope check -- if this group ever starts warning,
-        the iteration count above is no longer safe.
+    ``pin_boundary=False`` is deliberately **not** a row here. The unconstrained flow pulls the rim
+    inward until the triangles there collapse, and past two passes the system is effectively
+    singular: the conjugate gradient runs to its ``maxiter`` cap and returns its last iterate, so
+    timing it measures a failed solve. Measured once, at ``iterations=10``, for the record:
+
+    * ``saddle`` -- 0.54 s pinned against **67 s** free, a 124x gap;
+    * ``saddle_graded`` -- 1.74 s pinned against **66 s** free, 38x.
+
+    Those rows also cost nine minutes of suite time to measure divergence at high precision, which
+    is not worth having. Finiteness in the free case is itself recent: the collapse used to drive
+    ``cot_entries_from_l2``'s division by ``4 * dbl_area`` to ``inf`` and the result came back NaN.
     """
     assert bench_case.device is not None
     if wp.get_device(bench_case.device).is_cpu:
         pytest.skip("implicit fairing solves with warp.optim.linear.cg, CUDA-only in Warp 1.15")
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     with warnings.catch_warnings():
-        warnings.simplefilter("error", UserWarning)  # a non-converged solve fails the benchmark
+        warnings.simplefilter("error", UserWarning)  # a non-converged pass fails the benchmark
         result = bench_case.run(
-            lambda: tw.smoothing.filter_implicit_fairing(
-                vertices, faces, iterations=_FAIRING_ITERATIONS
-            ),
+            lambda: tw.smoothing.filter_implicit_fairing(vertices, faces, iterations=_ITERATIONS),
             rounds=3,
         )
     assert result.shape == vertices.shape
