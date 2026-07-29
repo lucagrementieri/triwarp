@@ -912,6 +912,28 @@ def square(values: wp.array[wp.Scalar]) -> wp.array[wp.Scalar]:
     return out
 
 
+def sortable_dtype(dtype: type[wp.Scalar]) -> type[wp.Scalar]:
+    """
+    Same-width dtype that ``warp.utils.radix_sort_pairs`` accepts, preserving ``dtype``'s order.
+
+    The single widening rule for every radix sort in this package. Sorting a sub-32-bit dtype is
+    not supported by Warp, and sorting the reinterpreted *bits* of a float or an unsigned value
+    gets the order wrong, so callers ask here rather than widening ad hoc.
+
+    The hash table works in one common signed-integer key space (see
+    [`bitcast_to_int`][triwarp.array.bitcast_to_int]), which is fine for equality but wrong for
+    ordering: negative floats have descending bit patterns, and a ``uint64`` with its top bit set
+    reads as a negative ``int64``. Warp 1.15 sorts ``uint32`` / ``uint64`` / ``float64`` keys
+    directly, so the sort is done in this dtype instead of on the reinterpreted bits.
+    """
+    wide = wp.types.type_size_in_bytes(dtype) > 4
+    if wp.types.type_is_float(dtype):
+        return wp.float64 if wide else wp.float32
+    if dtype.__name__.lower().startswith("u"):
+        return wp.uint64 if wide else wp.uint32
+    return wp.int64 if wide else wp.int32
+
+
 def bitcast_to_int(
     data: wp.array[wp.Scalar], count: int | None = None
 ) -> wp.array[wp.int32] | wp.array[wp.int64]:

@@ -15,6 +15,7 @@ from triwarp.array import (
     gather,
     init_range,
     init_sort_pair_indices,
+    sortable_dtype,
 )
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import edges as kernel_edges
@@ -55,7 +56,7 @@ def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
     if n < length or length <= 0:
         return twt.as_array2d_int32(twt.empty_int32_2d((0, max(length, 0)), device=device))
 
-    sort_dtype = values.dtype if wp.types.type_size_in_bytes(values.dtype) >= 4 else wp.int32
+    sort_dtype = sortable_dtype(values.dtype)
     values_buffer = wp.empty(2 * n, dtype=sort_dtype, device=device)
     if sort_dtype == values.dtype:
         wp.copy(values_buffer, values, count=n)
@@ -640,24 +641,6 @@ def hash_indices_rows(
     return hashes
 
 
-def _sortable_dtype(dtype: type[Scalar]) -> type[Scalar]:
-    """
-    Same-width dtype that ``warp.utils.radix_sort_pairs`` accepts, preserving ``dtype``'s order.
-
-    The hash table works in one common signed-integer key space (see
-    [`bitcast_to_int`][triwarp.array.bitcast_to_int]), which is fine for equality but wrong for
-    ordering: negative floats have descending bit patterns, and a ``uint64`` with its top bit set
-    reads as a negative ``int64``. Warp 1.15 sorts ``uint32`` / ``uint64`` / ``float64`` keys
-    directly, so the sort is done in this dtype instead of on the reinterpreted bits.
-    """
-    wide = wp.types.type_size_in_bytes(dtype) > 4
-    if wp.types.type_is_float(dtype):
-        return wp.float64 if wide else wp.float32
-    if dtype.__name__.lower().startswith("u"):
-        return wp.uint64 if wide else wp.uint32
-    return wp.int64 if wide else wp.int32
-
-
 def _unique_hash(
     data: wp.array[Scalar],
     data_int: wp.array[wp.int32] | wp.array[wp.int64],
@@ -707,7 +690,7 @@ def _unique_hash(
 
     # Phase 4: sort only the n_unique keys (typically n_unique << n), in a dtype that orders them
     # the way the caller's dtype does rather than by their reinterpreted bit pattern.
-    sort_dtype = _sortable_dtype(original_dtype)
+    sort_dtype = sortable_dtype(original_dtype)
     keys_buf = bitcast_from_int(keys_compact, sort_dtype, count=2 * n_unique)
     perm_buf = init_range(2 * n_unique, device)
     wp.utils.radix_sort_pairs(keys_buf, perm_buf, count=n_unique)
