@@ -2,6 +2,7 @@ import warp as wp
 
 from triwarp.constants import PI, TOLERANCE_ZERO_CONSTANT, TWO_PI
 from triwarp.kernels.halfedge import halfedge_destination
+from triwarp.kernels.predicates import unit_tangent
 
 
 @wp.func
@@ -84,10 +85,9 @@ def vertex_tangent_frames(
     if ring_offsets[v + 1] > begin:
         h = ring_halfedges[begin]
         direction = vertices[halfedge_destination(faces, h)] - vertices[v]
-        tangential = direction - wp.dot(direction, normal) * normal
-        length = wp.length(tangential)
+        tangential, length = unit_tangent(direction, normal, TOLERANCE_ZERO_CONSTANT)
         if length > TOLERANCE_ZERO_CONSTANT:
-            basis_x = tangential / length
+            basis_x = tangential
     out_basis_x[v] = basis_x
     out_basis_y[v] = wp.cross(normal, basis_x)
 

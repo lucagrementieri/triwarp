@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.constants import TOLERANCE_ZERO_CONSTANT
+from triwarp.kernels.predicates import unit_tangent
 
 
 @wp.kernel
@@ -35,11 +36,10 @@ def splat_curve_normals(
         # plane. ``cross(normal, direction)`` is the left normal, which is the orientation
         # geometry-central signs with: the region a counter-clockwise curve encloses comes out
         # positive.
-        tangential = direction - wp.dot(direction, normal) * normal
-        tangential_length = wp.length(tangential)
+        tangential, tangential_length = unit_tangent(direction, normal, TOLERANCE_ZERO_CONSTANT)
         if tangential_length <= TOLERANCE_ZERO_CONSTANT:
             continue
-        curve_normal = wp.cross(normal, tangential / tangential_length)
+        curve_normal = wp.cross(normal, tangential)
         wp.atomic_add(
             out_field,
             v,
@@ -80,10 +80,7 @@ def vertex_field_to_face_field(
         v = faces[f * 3 + k]
         value = field[v]
         total += wp.float32(value[0]) * basis_x[v] + wp.float32(value[1]) * basis_y[v]
-    tangential = total - wp.dot(total, normal) * normal
-    length = wp.length(tangential)
-    if length > TOLERANCE_ZERO_CONSTANT:
-        tangential = tangential / length
+    tangential, _length = unit_tangent(total, normal, TOLERANCE_ZERO_CONSTANT)
     out_face_field[f] = wp.vec3d(
         wp.float64(tangential[0]), wp.float64(tangential[1]), wp.float64(tangential[2])
     )

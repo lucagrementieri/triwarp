@@ -2,7 +2,7 @@ import warp as wp
 
 from triwarp.constants import PI, TOLERANCE_ZERO_CONSTANT, TWO_PI
 from triwarp.kernels.halfedge import halfedge_destination
-from triwarp.kernels.predicates import triangle_normal
+from triwarp.kernels.predicates import triangle_normal, unit_tangent
 from triwarp.kernels.tangent_space import corner_angle
 from triwarp.kernels.triangles import face_vertices
 
@@ -65,11 +65,10 @@ def unfold_direction(
     rotated = wp.quat_rotate(wp.quat_from_axis_angle(unit_axis, angle), direction)
     # Re-project: the rotation is exact in theory but drifts, and a direction with a component along
     # the new normal would walk off the surface.
-    tangential = rotated - wp.dot(rotated, normal_to) * normal_to
-    length = wp.length(tangential)
+    tangential, length = unit_tangent(rotated, normal_to, TOLERANCE_ZERO_CONSTANT)
     if length <= TOLERANCE_ZERO_CONSTANT:
         return rotated
-    return tangential / length
+    return tangential
 
 
 @wp.func
@@ -92,8 +91,7 @@ def trace_walk(
     face = start_face
     normal = face_normal_of(vertices, faces, face)
     point = start_point
-    tangential = start_direction - wp.dot(start_direction, normal) * normal
-    tangential_length = wp.length(tangential)
+    tangential, tangential_length = unit_tangent(start_direction, normal, TOLERANCE_ZERO_CONSTANT)
     remaining = arc_length
 
     count = wp.int32(0)
@@ -103,7 +101,8 @@ def trace_walk(
     if remaining <= TOLERANCE_ZERO_CONSTANT or tangential_length <= TOLERANCE_ZERO_CONSTANT:
         return count
 
-    direction = tangential / tangential_length
+    # ``unit_tangent`` already normalized it (the length guard above proved it could).
+    direction = tangential
     entry_edge = wp.int32(-1)
     for _step in range(max_steps):
         edge, distance = exit_edge(
@@ -201,12 +200,11 @@ def start_direction_at_vertex(
     f = chosen // wp.int32(3)
     normal = face_normal_of(vertices, faces, f)
     edge = vertices[halfedge_destination(faces, chosen)] - vertices[vertex]
-    tangential = edge - wp.dot(edge, normal) * normal
-    length = wp.length(tangential)
+    tangential, length = unit_tangent(edge, normal, TOLERANCE_ZERO_CONSTANT)
     if length <= TOLERANCE_ZERO_CONSTANT:
         return wp.int32(-1), wp.vec3(0.0, 0.0, 0.0)
     rotation = wp.quat_from_axis_angle(normal, offset_in_wedge)
-    return f, wp.quat_rotate(rotation, tangential / length)
+    return f, wp.quat_rotate(rotation, tangential)
 
 
 @wp.kernel

@@ -9,6 +9,7 @@ from triwarp.kernels.predicates import (
     is_unfold_quadrangle_convex,
     mincircle_diameter_sq,
     orient2d,
+    project_out_normal,
     triangle_aspect_ratio,
     triangle_normal,
 )
@@ -845,7 +846,7 @@ def tangential_smooth_step(
     centroid = ring_sum[i] / float(degree[i])
     delta = centroid - p
     n = normals[i]
-    tangential = delta - n * wp.dot(n, delta)  # project out the normal component
+    tangential = project_out_normal(delta, n)
     out_positions[i] = p + lam * tangential
 
 

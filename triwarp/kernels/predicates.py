@@ -154,3 +154,26 @@ def is_unfold_quadrangle_convex(a: Any, b: Any, c: Any, d: Any) -> wp.bool:
     x = line_isect(unfold_c, unfold_b, unfold_d)
     # MeshLib clamps ``x`` to [0, 1] first; that cannot change this strict test, so it is dropped.
     return x > type(x)(0.0) and x < type(x)(1.0)
+
+
+@wp.func
+def project_out_normal(vector: Any, normal: Any):
+    # Component of ``vector`` in the plane orthogonal to unit ``normal``.
+    return vector - wp.dot(vector, normal) * normal
+
+
+@wp.func
+def unit_tangent(vector: Any, normal: Any, tolerance: Any):
+    # Project ``vector`` into the plane orthogonal to unit ``normal`` and normalize it, returning
+    # the projection's length alongside.
+    #
+    # The length is returned rather than folded into a fallback because every caller wants a
+    # different one when it is degenerate: keep a precomputed perpendicular, return the unprojected
+    # input, skip the contribution entirely, or report failure. Callers compare the length against
+    # their own tolerance and branch; when it is above tolerance the first result is the unit
+    # tangent, and when it is not the first result is the *unnormalized* projection.
+    tangential = project_out_normal(vector, normal)
+    length = wp.length(tangential)
+    if length > tolerance:
+        return tangential / length, length
+    return tangential, length
