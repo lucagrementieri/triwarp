@@ -223,7 +223,7 @@ def connection_laplacian(
     --------
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
     [`halfedge_transport_angles`][triwarp.tangent.halfedge_transport_angles]
-    [`transport_tangent_vectors`][triwarp.vector_heat.transport_tangent_vectors]
+    [`transport_tangent_vectors`][triwarp.heat.vector.transport_tangent_vectors]
     """
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3

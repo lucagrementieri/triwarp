@@ -1,4 +1,4 @@
-"""Regression tests for ``triwarp.geodesic`` against igl (CPU reference)."""
+"""Regression tests for ``triwarp.heat.distance`` against igl (CPU reference)."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ def test_heat_geodesic_matches_igl(
     sources_wp = wp.array(sources_np.astype(np.int32), dtype=wp.int32, device=mesh_wp.device)
 
     distance_igl = _heat_geodesic_igl(vertices_np, faces_np, sources_np)
-    distance_wp = tw.geodesic.heat_geodesic(mesh_wp.points, mesh_wp.indices, sources_wp)
+    distance_wp = tw.heat.distance.heat_geodesic(mesh_wp.points, mesh_wp.indices, sources_wp)
 
     assert np.allclose(distance_wp.numpy(), distance_igl, rtol=5e-2, atol=5e-2)
 
@@ -56,7 +56,7 @@ def test_heat_geodesic_multi_source_matches_igl(
     sources_wp = wp.array(sources_np.astype(np.int32), dtype=wp.int32, device=mesh_wp.device)
 
     distance_igl = _heat_geodesic_igl(vertices_np, faces_np, sources_np)
-    distance_wp = tw.geodesic.heat_geodesic(mesh_wp.points, mesh_wp.indices, sources_wp)
+    distance_wp = tw.heat.distance.heat_geodesic(mesh_wp.points, mesh_wp.indices, sources_wp)
 
     assert np.allclose(distance_wp.numpy(), distance_igl, rtol=5e-2, atol=5e-2)
 
@@ -74,7 +74,7 @@ def test_heat_geodesic_approximates_exact(device: str, icosahedron: tuple[object
         vertices_np, faces_np, sources_np, empty, np.arange(n_vertices, dtype=np.int64), empty
     )
     sources_wp = wp.array(sources_np.astype(np.int32), dtype=wp.int32, device=mesh_wp.device)
-    distance_wp = tw.geodesic.heat_geodesic(mesh_wp.points, mesh_wp.indices, sources_wp)
+    distance_wp = tw.heat.distance.heat_geodesic(mesh_wp.points, mesh_wp.indices, sources_wp)
 
     # Heat method is an approximation of the true geodesic distance; a loose tolerance.
     assert np.allclose(distance_wp.numpy(), distance_exact, rtol=8e-2, atol=1e-1)
@@ -88,7 +88,7 @@ def test_heat_geodesic_source_is_zero_and_nonnegative(
     sources_np = np.array([0], dtype=np.int32)
     sources_wp = wp.array(sources_np, dtype=wp.int32, device=mesh_wp.device)
 
-    distance = tw.geodesic.heat_geodesic(mesh_wp.points, mesh_wp.indices, sources_wp).numpy()
+    distance = tw.heat.distance.heat_geodesic(mesh_wp.points, mesh_wp.indices, sources_wp).numpy()
 
     assert np.all(distance >= -1e-6)
     assert np.allclose(distance[sources_np], 0.0, atol=1e-4)
@@ -99,7 +99,7 @@ def test_heat_geodesic_empty_faces(device: str) -> None:
     faces = wp.empty(0, dtype=wp.int32, device=device)
     sources = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
 
-    distance = tw.geodesic.heat_geodesic(vertices, faces, sources)
+    distance = tw.heat.distance.heat_geodesic(vertices, faces, sources)
 
     assert distance.shape[0] == 4
     assert np.array_equal(distance.numpy(), np.zeros(4))
@@ -109,7 +109,7 @@ def test_heat_geodesic_empty_sources(icosahedron: tuple[object, wp.Mesh]) -> Non
     _, mesh_wp = icosahedron
     sources = wp.empty(0, dtype=wp.int32, device=mesh_wp.device)
 
-    distance = tw.geodesic.heat_geodesic(mesh_wp.points, mesh_wp.indices, sources)
+    distance = tw.heat.distance.heat_geodesic(mesh_wp.points, mesh_wp.indices, sources)
 
     assert np.array_equal(distance.numpy(), np.zeros(int(mesh_wp.points.shape[0])))
 
@@ -126,4 +126,4 @@ def test_heat_geodesic_cpu_solve_raises() -> None:
     sources = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device="cpu")
 
     with pytest.raises(NotImplementedError):
-        tw.geodesic.heat_geodesic(vertices, faces, sources)
+        tw.heat.distance.heat_geodesic(vertices, faces, sources)

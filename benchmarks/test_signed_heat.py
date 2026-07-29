@@ -1,5 +1,5 @@
 """
-Benchmarks for ``triwarp.signed_heat.heat_signed_distance``.
+Benchmarks for ``triwarp.heat.signed.heat_signed_distance``.
 
 The axis is the **source curve**, not the mesh: the mesh sets the solve size (fixed here at
 ``sphere_med``) while the curve sets how much of the surface the source touches. Two points along
@@ -104,7 +104,7 @@ def test_heat_signed_distance(bench_case: BenchCase, curve_kind: str) -> None:
         curve = wp.array(curve_np, dtype=wp.int32, device=bench_case.device)
         offsets = wp.array(bounds_np, dtype=wp.int32, device=bench_case.device)
         distance = bench_case.run(
-            lambda: tw.signed_heat.heat_signed_distance(vertices, faces, curve, offsets),
+            lambda: tw.heat.signed.heat_signed_distance(vertices, faces, curve, offsets),
             rounds=_ROUNDS,
         )
         assert distance.shape == (bench_case.n_vertices,)
@@ -132,7 +132,7 @@ def test_heat_signed_distance_constraint(bench_case: BenchCase, level_set_constr
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     curve = wp.array(_curve(bench_case, "ring")[0], dtype=wp.int32, device=bench_case.device)
     distance = bench_case.run(
-        lambda: tw.signed_heat.heat_signed_distance(
+        lambda: tw.heat.signed.heat_signed_distance(
             vertices, faces, curve, level_set_constraint=level_set_constraint
         ),
         rounds=_ROUNDS,

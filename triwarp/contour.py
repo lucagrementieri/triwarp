@@ -58,7 +58,8 @@ def marching_triangles(
         Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
     values
         ``(n_vertices,)`` scalar field, ``wp.float32`` or ``wp.float64``. A ``float64`` field (what
-        [`heat_geodesic`][triwarp.geodesic.heat_geodesic] returns) is interpolated in ``float64``.
+        [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] returns) is interpolated in
+        ``float64``.
     isovalue
         Level to extract.
     n_vertices
@@ -84,7 +85,7 @@ def marching_triangles(
     See Also
     --------
     [`mesh_with_plane`][triwarp.intersection.mesh_with_plane]
-    [`heat_geodesic`][triwarp.geodesic.heat_geodesic]
+    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
     [`polyline_length`][triwarp.polyline.polyline_length]
     ``potpourri3d.MarchingTrianglesSolver``
     """

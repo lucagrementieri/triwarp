@@ -10,14 +10,13 @@ root = Path(__file__).parent.parent
 src = root / "triwarp"
 
 # Curated theme groups. Order within a group matters: it is the docs nav order for that
-# section. Every triwarp/*.py module (except __init__.py and private "_*.py" modules) must
-# appear in exactly one group below — the guard at the bottom fails the build otherwise, so
-# adding a new module without classifying it here is caught immediately rather than silently
-# falling back to a flat alphabetical list.
+# section. Every public module under triwarp/ — including subpackages such as triwarp/heat/,
+# named by its dotted path relative to the package, and excluding triwarp/kernels/,
+# __init__.py and private "_*.py" modules — must appear in exactly one group below. The guard
+# at the bottom fails the build otherwise, so adding a new module without classifying it here
+# is caught immediately rather than silently falling back to a flat alphabetical list.
 SECTIONS: dict[str, list[str]] = {
-    "Primitives": [
-        "creation",
-    ],
+    "Primitives": ["creation"],
     "Mesh structure & topology": [
         "mesh",
         "vertices",
@@ -31,76 +30,48 @@ SECTIONS: dict[str, list[str]] = {
         "validation",
         "selection",
     ],
-    "Mesh editing & repair": [
-        "repair",
-        "hole_filling",
-        "combine",
-        "remesh",
-        "smoothing",
-    ],
+    "Mesh editing & repair": ["repair", "hole_filling", "combine", "remesh", "smoothing"],
     "Queries & measures": [
         "proximity",
         "neighbors",
         "bounds",
         "ray",
         "distance",
-        "geodesic",
         "tracing",
-        "signed_heat",
         "intersection",
         "curvature",
         "convex",
     ],
-    "Operators & fields": [
-        "laplacian",
-        "intrinsic",
-        "vector_heat",
-        "linalg",
-        "interpolation",
-        "parametrization",
-    ],
-    "Point clouds & registration": [
-        "points",
-        "sample",
-        "reconstruction",
-        "registration",
-    ],
-    "Curves": [
-        "polyline",
-        "contour",
-    ],
-    "Attributes & I/O": [
-        "texture",
-        "io",
-    ],
-    "Arrays & infrastructure": [
-        "array",
-        "reduce",
-        "grouping",
-        "graph",
-        "typing",
-        "constants",
-    ],
+    "Operators & fields": ["laplacian", "intrinsic", "linalg", "interpolation", "parametrization"],
+    "Heat-method solvers": ["heat.distance", "heat.vector", "heat.signed"],
+    "Point clouds & registration": ["points", "sample", "reconstruction", "registration"],
+    "Curves": ["polyline", "contour"],
+    "Attributes & I/O": ["texture", "io"],
+    "Arrays & infrastructure": ["array", "reduce", "grouping", "graph", "typing", "constants"],
 }
 
 listed = {module_name for modules in SECTIONS.values() for module_name in modules}
 actual = {
-    path.stem
-    for path in src.glob("*.py")
-    if path.name != "__init__.py" and not path.name.startswith("_")
+    ".".join(path.relative_to(src).with_suffix("").parts)
+    for path in src.rglob("*.py")
+    if path.name != "__init__.py"
+    and not path.name.startswith("_")
+    # Kernel modules are the Warp DSL and are deliberately undocumented. Testing the first path
+    # component (rather than a substring) keeps a future triwarp/<pkg>/kernels.py documentable.
+    and path.relative_to(src).parts[0] != "kernels"
 }
 if listed != actual:
     unmapped = actual - listed
     stale = listed - actual
     raise SystemExit(
-        "gen_ref_pages: SECTIONS is out of sync with triwarp/*.py — "
+        "gen_ref_pages: SECTIONS is out of sync with the modules under triwarp/ — "
         f"unmapped modules (add to a section): {sorted(unmapped)}; "
         f"stale entries (module no longer exists): {sorted(stale)}"
     )
 
 for section, modules in SECTIONS.items():
     for module_name in modules:
-        module_path = src / f"{module_name}.py"
+        module_path = src.joinpath(*module_name.split(".")).with_suffix(".py")
         doc_path = Path("api", f"{module_name}.md")
         nav[("API Reference", section, module_name)] = doc_path.as_posix()
 

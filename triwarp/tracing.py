@@ -92,7 +92,7 @@ def trace_geodesic_from_vertex(
     --------
     [`trace_geodesic_from_face`][triwarp.tracing.trace_geodesic_from_face]
     [`trace_geodesic_polylines`][triwarp.tracing.trace_geodesic_polylines]
-    [`heat_geodesic`][triwarp.geodesic.heat_geodesic]
+    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
     """
     device = vertices.device
     n_rays = int(start_vertices.shape[0])

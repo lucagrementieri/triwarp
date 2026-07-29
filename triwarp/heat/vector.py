@@ -10,12 +10,12 @@ something after transporting one into the other's frame.
 
 Every function here returns tangent vectors as ``wp.vec2`` in each vertex's own frame from
 [`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames]. Use
-[`tangent_to_world`][triwarp.vector_heat.tangent_to_world] to get 3D vectors — and note that
+[`tangent_to_world`][triwarp.heat.vector.tangent_to_world] to get 3D vectors — and note that
 comparing 2D components against another library's is meaningless, since each library picks its own
 reference direction per vertex.
 
 All three solvers need conjugate gradient and are therefore CUDA-only, like
-[`heat_geodesic`][triwarp.geodesic.heat_geodesic].
+[`heat_geodesic`][triwarp.heat.distance.heat_geodesic].
 """
 
 from __future__ import annotations
@@ -25,21 +25,24 @@ import warp.optim.linear as wpl
 import warp.sparse as wps
 
 import triwarp as tw
-from triwarp.geodesic import heat_geodesic, heat_operators
-from triwarp.kernels import vector_heat as kernel_vector_heat
+from triwarp.heat.distance import HeatOperators, heat_geodesic, heat_operators
+from triwarp.kernels.heat import vector as kernel_heat_vector
 from triwarp.laplacian import connection_laplacian, mass_matrix_entries
 from triwarp.tangent import vertex_tangent_frames
 
 _CG_TOLERANCE = 1e-8
 
 
+# ``HeatOperators`` is imported directly rather than reached through ``tw.heat.distance``: this is
+# evaluated at module scope, and while ``triwarp.heat.__init__`` is still executing the ``heat``
+# attribute does not yet exist on the ``triwarp`` module.
 VectorHeatOperators = tuple[
     wps.BsrMatrix[wp.float64],
-    tw.geodesic.HeatOperators,
+    HeatOperators,
     tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.vec3]],
 ]
-"""What [`vector_heat_operators`][triwarp.vector_heat.vector_heat_operators] returns: the vector
-heat system, the scalar [`heat_operators`][triwarp.geodesic.heat_operators], and the frames."""
+"""What [`vector_heat_operators`][triwarp.heat.vector.vector_heat_operators] returns: the vector
+heat system, the scalar [`heat_operators`][triwarp.heat.distance.heat_operators], and the frames."""
 
 
 def vector_heat_operators(
@@ -52,8 +55,8 @@ def vector_heat_operators(
 
     1. the **vector heat system** ``M + t * L_connection``, whose ``2 x 2`` blocks act on tangent
        vectors ([`connection_laplacian`][triwarp.laplacian.connection_laplacian]);
-    2. the scalar [`heat_operators`][triwarp.geodesic.heat_operators], for the magnitude extension
-       and the distance field the log map needs;
+    2. the scalar [`heat_operators`][triwarp.heat.distance.heat_operators], for the magnitude
+       extension and the distance field the log map needs;
     3. the [`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames] every 2D component is
        measured in.
 
@@ -76,15 +79,15 @@ def vector_heat_operators(
     vector_system : warp.sparse.BsrMatrix
         ``M + t * L_connection`` in ``float64`` with ``wp.mat22d`` blocks.
     scalar : tuple
-        The [`heat_operators`][triwarp.geodesic.heat_operators] bundle for the same ``t``.
+        The [`heat_operators`][triwarp.heat.distance.heat_operators] bundle for the same ``t``.
     frames : tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.vec3]]
         ``(basis_x, basis_y, normal)`` per vertex.
 
     See Also
     --------
-    [`transport_tangent_vectors`][triwarp.vector_heat.transport_tangent_vectors]
-    [`log_map`][triwarp.vector_heat.log_map]
-    [`heat_signed_distance`][triwarp.signed_heat.heat_signed_distance]
+    [`transport_tangent_vectors`][triwarp.heat.vector.transport_tangent_vectors]
+    [`log_map`][triwarp.heat.vector.log_map]
+    [`heat_signed_distance`][triwarp.heat.signed.heat_signed_distance]
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
@@ -97,7 +100,7 @@ def vector_heat_operators(
     mass_blocks = wp.empty(n_vertices, dtype=wp.mat22d, device=device)
     if n_vertices > 0:
         wp.launch(
-            kernel_vector_heat.block_mass, dim=n_vertices, inputs=[mass, mass_blocks], device=device
+            kernel_heat_vector.block_mass, dim=n_vertices, inputs=[mass, mass_blocks], device=device
         )
     vector_system = wps.bsr_axpy(
         x=connection, y=wps.bsr_diag(diag=mass_blocks), alpha=float(t), beta=1.0
@@ -111,7 +114,7 @@ def extend_scalar(
     sources: wp.array[wp.int32],
     values: wp.array[wp.float64],
     t: float | None = None,
-    operators: tw.geodesic.HeatOperators | None = None,
+    operators: tw.heat.distance.HeatOperators | None = None,
 ) -> wp.array[wp.float64]:
     """
     Extend values from a few source vertices over the whole surface by nearest-source interpolation.
@@ -135,7 +138,7 @@ def extend_scalar(
     t
         Diffusion time; defaults to the squared mean edge length.
     operators
-        Optional precomputed [`heat_operators`][triwarp.geodesic.heat_operators] for this mesh.
+        Optional precomputed [`heat_operators`][triwarp.heat.distance.heat_operators] for this mesh.
 
     Returns
     -------
@@ -151,8 +154,8 @@ def extend_scalar(
 
     See Also
     --------
-    [`transport_tangent_vectors`][triwarp.vector_heat.transport_tangent_vectors]
-    [`heat_geodesic`][triwarp.geodesic.heat_geodesic]
+    [`transport_tangent_vectors`][triwarp.heat.vector.transport_tangent_vectors]
+    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
@@ -168,7 +171,7 @@ def extend_scalar(
     indicator = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     weighted = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     wp.launch(
-        kernel_vector_heat.seed_source_scalars,
+        kernel_heat_vector.seed_source_scalars,
         dim=n_sources,
         inputs=[sources, values, indicator, weighted],
         device=device,
@@ -177,7 +180,7 @@ def extend_scalar(
     diffused_indicator = _solve_scalar(heat_system, indicator, n_vertices, device)
     diffused_values = _solve_scalar(heat_system, weighted, n_vertices, device)
     extended = wp.empty(n_vertices, dtype=wp.float64, device=device)
-    wp.map(kernel_vector_heat.divide_positive, diffused_values, diffused_indicator, out=extended)
+    wp.map(kernel_heat_vector.divide_positive, diffused_values, diffused_indicator, out=extended)
     return extended
 
 
@@ -213,7 +216,7 @@ def transport_tangent_vectors(
         given, which already fixes it.
     operators
         Optional precomputed
-        [`vector_heat_operators`][triwarp.vector_heat.vector_heat_operators] for this mesh: they
+        [`vector_heat_operators`][triwarp.heat.vector.vector_heat_operators] for this mesh: they
         depend on the mesh alone, so passing them back skips the assembly on every call after the
         first.
 
@@ -229,13 +232,13 @@ def transport_tangent_vectors(
     ------
     NotImplementedError
         On the CPU device (conjugate gradient; see
-        [`extend_scalar`][triwarp.vector_heat.extend_scalar]).
+        [`extend_scalar`][triwarp.heat.vector.extend_scalar]).
 
     See Also
     --------
-    [`log_map`][triwarp.vector_heat.log_map]
+    [`log_map`][triwarp.heat.vector.log_map]
     [`connection_laplacian`][triwarp.laplacian.connection_laplacian]
-    [`tangent_to_world`][triwarp.vector_heat.tangent_to_world]
+    [`tangent_to_world`][triwarp.heat.vector.tangent_to_world]
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
@@ -255,9 +258,9 @@ def transport_tangent_vectors(
     extended = extend_scalar(vertices, faces, sources, magnitudes, operators=scalar)
 
     scaled = wp.empty(n_vertices, dtype=wp.vec2d, device=device)
-    wp.map(kernel_vector_heat.scale_to_magnitude, direction, extended, out=scaled)
+    wp.map(kernel_heat_vector.scale_to_magnitude, direction, extended, out=scaled)
     transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
-    wp.map(kernel_vector_heat.to_vec2, scaled, out=transported)
+    wp.map(kernel_heat_vector.to_vec2, scaled, out=transported)
     return transported
 
 
@@ -278,10 +281,11 @@ def log_map(
     computes, and the standard way to lay out a local coordinate patch around a point.
 
     Assembled from two fields that are each cheap: the distance to the source
-    ([`heat_geodesic`][triwarp.geodesic.heat_geodesic]) gives the radius, and the source's reference
-    direction parallel-transported outwards gives the angle — at any vertex the angle between that
-    transported direction and the outward radial direction is exactly the angle at which the
-    connecting geodesic left the source, because transport along that geodesic preserves it. This is
+    ([`heat_geodesic`][triwarp.heat.distance.heat_geodesic]) gives the radius, and the source's
+    reference direction parallel-transported outwards gives the angle — at any vertex the angle
+    between that transported direction and the outward radial direction is exactly the angle at
+    which the connecting geodesic left the source, because transport along that geodesic preserves
+    it. This is
     the ``VectorHeat`` strategy in ``potpourri3d.MeshVectorHeatSolver.compute_log_map``; its
     ``AffineLocal`` and ``AffineAdaptive`` strategies solve a small dense problem per vertex and are
     deliberately not ported.
@@ -299,7 +303,7 @@ def log_map(
         given.
     operators
         Optional precomputed
-        [`vector_heat_operators`][triwarp.vector_heat.vector_heat_operators]. Pass the same bundle
+        [`vector_heat_operators`][triwarp.heat.vector.vector_heat_operators]. Pass the same bundle
         used elsewhere when the frames matter: the *angles* this function returns are measured from
         the source's ``basis_x``.
 
@@ -316,11 +320,11 @@ def log_map(
     ------
     NotImplementedError
         On the CPU device (conjugate gradient; see
-        [`extend_scalar`][triwarp.vector_heat.extend_scalar]).
+        [`extend_scalar`][triwarp.heat.vector.extend_scalar]).
 
     See Also
     --------
-    [`transport_tangent_vectors`][triwarp.vector_heat.transport_tangent_vectors]
+    [`transport_tangent_vectors`][triwarp.heat.vector.transport_tangent_vectors]
     [`trace_geodesic_from_vertex`][triwarp.tracing.trace_geodesic_from_vertex]
     """
     device = vertices.device
@@ -340,7 +344,7 @@ def log_map(
     reference = wp.array([[1.0, 0.0]], dtype=wp.vec2, device=device)
     transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     wp.map(
-        kernel_vector_heat.to_vec2,
+        kernel_heat_vector.to_vec2,
         _diffuse_from_sources(vector_system, sources, reference, n_vertices, device),
         out=transported,
     )
@@ -352,21 +356,21 @@ def log_map(
     n_faces = int(faces.shape[0]) // 3
     face_gradient = wp.empty(n_faces, dtype=wp.vec3d, device=device)
     wp.launch(
-        kernel_vector_heat.face_gradient_unit,
+        kernel_heat_vector.face_gradient_unit,
         dim=n_faces,
         inputs=[vertices, faces, normals, areas, distance, face_gradient],
         device=device,
     )
     vertex_gradient = wp.zeros(n_vertices, dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_vector_heat.scatter_face_field_to_vertices,
+        kernel_heat_vector.scatter_face_field_to_vertices,
         dim=n_faces,
         inputs=[faces, areas, face_gradient, vertex_gradient],
         device=device,
     )
     radial = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     wp.launch(
-        kernel_vector_heat.world_to_tangent_unit,
+        kernel_heat_vector.world_to_tangent_unit,
         dim=n_vertices,
         inputs=[vertex_gradient, basis_x, basis_y, radial],
         device=device,
@@ -374,7 +378,7 @@ def log_map(
 
     logarithm = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     wp.launch(
-        kernel_vector_heat.log_map_from_angles,
+        kernel_heat_vector.log_map_from_angles,
         dim=n_vertices,
         inputs=[radial, transported, distance, logarithm],
         device=device,
@@ -410,7 +414,7 @@ def tangent_to_world(
     [`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames]
     """
     world = wp.empty(int(tangent.shape[0]), dtype=wp.vec3, device=tangent.device)
-    wp.map(kernel_vector_heat.tangent_to_world, tangent, basis_x, basis_y, out=world)
+    wp.map(kernel_heat_vector.tangent_to_world, tangent, basis_x, basis_y, out=world)
     return world
 
 
@@ -424,7 +428,7 @@ def _diffuse_from_sources(
     """Seed a tangent field at the source vertices, then diffuse it."""
     field = wp.zeros(n_vertices, dtype=wp.vec2d, device=device)
     wp.launch(
-        kernel_vector_heat.seed_source_vectors,
+        kernel_heat_vector.seed_source_vectors,
         dim=int(sources.shape[0]),
         inputs=[sources, _as_vec2d(vectors), field],
         device=device,
@@ -440,7 +444,7 @@ def diffuse_tangent_field(
 
     Public because the source term is where the vector-valued methods differ from one another — a
     handful of vertices for parallel transport, a whole splatted curve for
-    [`heat_signed_distance`][triwarp.signed_heat.heat_signed_distance] — while the solve is the same
+    [`heat_signed_distance`][triwarp.heat.signed.heat_signed_distance] — while the solve is the same
     for all of them.
 
     Only the *directions* of the result carry meaning: magnitudes decay away from the source, and
@@ -450,7 +454,7 @@ def diffuse_tangent_field(
     ----------
     system
         The vector heat system from
-        [`vector_heat_operators`][triwarp.vector_heat.vector_heat_operators].
+        [`vector_heat_operators`][triwarp.heat.vector.vector_heat_operators].
     source
         ``(n_vertices,)`` ``wp.vec2d`` right-hand side, in each vertex's own tangent frame.
 
@@ -461,8 +465,8 @@ def diffuse_tangent_field(
 
     See Also
     --------
-    [`vector_heat_operators`][triwarp.vector_heat.vector_heat_operators]
-    [`transport_tangent_vectors`][triwarp.vector_heat.transport_tangent_vectors]
+    [`vector_heat_operators`][triwarp.heat.vector.vector_heat_operators]
+    [`transport_tangent_vectors`][triwarp.heat.vector.transport_tangent_vectors]
     """
     n_vertices = int(source.shape[0])
     diffused = wp.zeros(n_vertices, dtype=wp.vec2d, device=source.device)
@@ -501,7 +505,7 @@ def _solve_scalar(
 def _as_vec2d(vectors: wp.array[wp.vec2]) -> wp.array[wp.vec2d]:
     """Widen a tangent field to float64, the precision the diffusion solves run in."""
     widened = wp.empty(int(vectors.shape[0]), dtype=wp.vec2d, device=vectors.device)
-    wp.map(kernel_vector_heat.to_vec2d, vectors, out=widened)
+    wp.map(kernel_heat_vector.to_vec2d, vectors, out=widened)
     return widened
 
 

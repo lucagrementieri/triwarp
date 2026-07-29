@@ -250,7 +250,7 @@ def test_robust_heat_geodesic_matches_potpourri3d(
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     sources_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
 
-    distance_wp = tw.geodesic.heat_geodesic(
+    distance_wp = tw.heat.distance.heat_geodesic(
         mesh_wp.points, mesh_wp.indices, sources_wp, use_robust=True
     )
     distance_pp = np.asarray(
@@ -274,8 +274,10 @@ def test_robust_heat_geodesic_survives_a_degenerate_triangle(device: str) -> Non
     _, _, vertices_wp, faces_wp = _sliver_mesh(device)
     sources_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
 
-    plain = tw.geodesic.heat_geodesic(vertices_wp, faces_wp, sources_wp).numpy()
-    robust = tw.geodesic.heat_geodesic(vertices_wp, faces_wp, sources_wp, use_robust=True).numpy()
+    plain = tw.heat.distance.heat_geodesic(vertices_wp, faces_wp, sources_wp).numpy()
+    robust = tw.heat.distance.heat_geodesic(
+        vertices_wp, faces_wp, sources_wp, use_robust=True
+    ).numpy()
 
     assert not np.isfinite(plain).all()
     assert np.isfinite(robust).all()

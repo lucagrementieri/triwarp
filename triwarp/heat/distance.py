@@ -8,7 +8,7 @@ import warp.sparse as wps
 
 from triwarp.edges import mean_edge_length
 from triwarp.intrinsic import mollify_intrinsic
-from triwarp.kernels import geodesic as kernel_geodesic
+from triwarp.kernels.heat import distance as kernel_heat_distance
 from triwarp.laplacian import (
     cotmatrix,
     cotmatrix_entries,
@@ -27,7 +27,8 @@ HeatOperators = tuple[
     wp.array[wp.vec3],
     wp.array[wp.float32],
 ]
-"""What [`heat_operators`][triwarp.geodesic.heat_operators] returns for the heat method's solves."""
+"""What [`heat_operators`][triwarp.heat.distance.heat_operators] returns for the heat method's
+solves."""
 
 
 def heat_operators(
@@ -38,7 +39,7 @@ def heat_operators(
     use_robust: bool = False,
 ) -> HeatOperators:
     """
-    Assemble everything [`heat_geodesic`][triwarp.geodesic.heat_geodesic] needs before its solves.
+    Assemble the source-independent operators the heat method solves against.
 
     Every quantity here depends on the mesh alone, not on the source set, so a caller computing
     distance from many different sources on one mesh can build these once and pass them back through
@@ -87,7 +88,7 @@ def heat_operators(
 
     See Also
     --------
-    [`heat_geodesic`][triwarp.geodesic.heat_geodesic]
+    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
     [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries]
     """
@@ -157,15 +158,15 @@ def heat_geodesic(
         ``igl::heat_geodesics`` default), which balances accuracy and smoothing. Ignored when
         ``operators`` is given, which already fixes it.
     operators
-        Optional precomputed [`heat_operators`][triwarp.geodesic.heat_operators] for this mesh. They
-        depend on the mesh only, so passing them back skips the assembly on every solve after the
-        first — worth it when computing distance from many different source sets.
+        Optional precomputed [`heat_operators`][triwarp.heat.distance.heat_operators] for this mesh.
+        They depend on the mesh only, so passing them back skips the assembly on every solve after
+        the first — worth it when computing distance from many different source sets.
     use_robust
-        Forwarded to [`heat_operators`][triwarp.geodesic.heat_operators]: build the Laplacian from
-        mollified edge lengths, which is what makes the solves survive degenerate triangles. Ignored
-        when ``operators`` is supplied. ``potpourri3d.MeshHeatMethodDistanceSolver`` has the same
-        flag and defaults it to ``True``; this defaults to ``False`` so the plain call stays exactly
-        ``igl::heat_geodesics``.
+        Forwarded to [`heat_operators`][triwarp.heat.distance.heat_operators]: build the Laplacian
+        from mollified edge lengths, which is what makes the solves survive degenerate triangles.
+        Ignored when ``operators`` is supplied. ``potpourri3d.MeshHeatMethodDistanceSolver`` has
+        the same flag and defaults it to ``True``; this defaults to ``False`` so the plain call
+        stays exactly ``igl::heat_geodesics``.
 
     Returns
     -------
@@ -182,7 +183,7 @@ def heat_geodesic(
 
     See Also
     --------
-    [`heat_operators`][triwarp.geodesic.heat_operators]
+    [`heat_operators`][triwarp.heat.distance.heat_operators]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
     [`mean_edge_length`][triwarp.edges.mean_edge_length]
     [`marching_triangles`][triwarp.contour.marching_triangles]
@@ -209,7 +210,7 @@ def heat_geodesic(
     # Heat solve: (M - t L) u = u0, with u0 the source indicator.
     u0 = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     wp.launch(
-        kernel_geodesic.seed_source_indicator,
+        kernel_heat_distance.seed_source_indicator,
         dim=int(sources.shape[0]),
         inputs=[sources, u0],
         device=device,
@@ -228,7 +229,7 @@ def heat_geodesic(
     # Unit vector field X = -grad(u)/|grad(u)|.
     field = wp.empty(n_faces, dtype=wp.vec3d, device=device)
     wp.launch(
-        kernel_geodesic.face_gradient_normalized,
+        kernel_heat_distance.face_gradient_normalized,
         dim=n_faces,
         inputs=[vertices, faces, normals, areas, heat, field],
         device=device,
@@ -238,7 +239,7 @@ def heat_geodesic(
     # positive semi-definite operator.
     divergence = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     wp.launch(
-        kernel_geodesic.integrated_divergence,
+        kernel_heat_distance.integrated_divergence,
         dim=n_faces,
         inputs=[vertices, faces, cot_entries, field, divergence],
         device=device,

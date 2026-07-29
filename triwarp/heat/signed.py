@@ -34,8 +34,8 @@ import warp.sparse as wps
 import triwarp as tw
 import triwarp.linalg as twl
 import triwarp.typing as twt
-from triwarp.kernels import geodesic as kernel_geodesic
-from triwarp.kernels import signed_heat as kernel_signed_heat
+from triwarp.kernels.heat import distance as kernel_heat_distance
+from triwarp.kernels.heat import signed as kernel_heat_signed
 
 _CG_TOLERANCE = 1e-8
 
@@ -49,7 +49,7 @@ def heat_signed_distance(
     *,
     closed: bool = True,
     level_set_constraint: str = "zero_set",
-    operators: tw.vector_heat.VectorHeatOperators | None = None,
+    operators: tw.heat.vector.VectorHeatOperators | None = None,
 ) -> wp.array[wp.float64]:
     """
     Signed distance from every vertex to a set of oriented curves.
@@ -93,7 +93,7 @@ def heat_signed_distance(
         modes ``potpourri3d`` offers under the same names.
     operators
         Optional precomputed
-        [`vector_heat_operators`][triwarp.vector_heat.vector_heat_operators] for this mesh — the
+        [`vector_heat_operators`][triwarp.heat.vector.vector_heat_operators] for this mesh — the
         vector heat system, the scalar operators and the frames. They depend on the mesh alone, so
         passing them back skips every assembly on calls after the first, which for this method is
         three matrices.
@@ -113,8 +113,8 @@ def heat_signed_distance(
 
     See Also
     --------
-    [`heat_geodesic`][triwarp.geodesic.heat_geodesic]
-    [`transport_tangent_vectors`][triwarp.vector_heat.transport_tangent_vectors]
+    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
+    [`transport_tangent_vectors`][triwarp.heat.vector.transport_tangent_vectors]
     [`homology_generators`][triwarp.topology.homology_generators]
     [`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]
     """
@@ -134,7 +134,7 @@ def heat_signed_distance(
         )
 
     if operators is None:
-        operators = tw.vector_heat.vector_heat_operators(vertices, faces, t)
+        operators = tw.heat.vector.vector_heat_operators(vertices, faces, t)
     vector_system, scalar, frames = operators
     basis_x, basis_y, vertex_normals = frames
     _, laplacian, cot_entries, face_normals, _ = scalar
@@ -143,30 +143,30 @@ def heat_signed_distance(
     segments = _curve_segments(curve_vertices, curve_offsets, closed=closed)
     source = wp.zeros(n_vertices, dtype=wp.vec2d, device=device)
     wp.launch(
-        kernel_signed_heat.splat_curve_normals,
+        kernel_heat_signed.splat_curve_normals,
         dim=int(segments.shape[0]),
         inputs=[vertices, segments, vertex_normals, basis_x, basis_y, source],
         device=device,
     )
 
     # Stage 2: diffuse the tangent field, then keep only its direction.
-    diffused = tw.vector_heat.diffuse_tangent_field(vector_system, source)
+    diffused = tw.heat.vector.diffuse_tangent_field(vector_system, source)
     unit_field = wp.empty(n_vertices, dtype=wp.vec2d, device=device)
-    wp.map(kernel_signed_heat.normalize_or_zero, diffused, out=unit_field)
+    wp.map(kernel_heat_signed.normalize_or_zero, diffused, out=unit_field)
 
     # Stage 3: integrate the unit field back into a scalar with a Poisson solve. The cotangent
     # weights and face normals come from the same bundle, so the Poisson stage and the diffusion
     # cannot drift apart.
     face_field = wp.empty(n_faces, dtype=wp.vec3d, device=device)
     wp.launch(
-        kernel_signed_heat.vertex_field_to_face_field,
+        kernel_heat_signed.vertex_field_to_face_field,
         dim=n_faces,
         inputs=[faces, face_normals, unit_field, basis_x, basis_y, face_field],
         device=device,
     )
     divergence = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     wp.launch(
-        kernel_geodesic.integrated_divergence,
+        kernel_heat_distance.integrated_divergence,
         dim=n_faces,
         inputs=[vertices, faces, cot_entries, face_field, divergence],
         device=device,
@@ -237,7 +237,7 @@ def _solve_poisson_zero_set(
     negated = wp.empty(n_vertices, dtype=wp.float64, device=device)
     wp.map(wp.neg, divergence, out=negated)
     wp.launch(
-        kernel_signed_heat.scatter_free_rhs,
+        kernel_heat_signed.scatter_free_rhs,
         dim=n_vertices,
         inputs=[fixed_mask, free_map, negated, rhs],
         device=device,
@@ -249,7 +249,7 @@ def _solve_poisson_zero_set(
     )
     field = wp.empty(n_vertices, dtype=wp.float64, device=device)
     wp.launch(
-        kernel_signed_heat.gather_free_solution,
+        kernel_heat_signed.gather_free_solution,
         dim=n_vertices,
         inputs=[fixed_mask, free_map, solution, field],
         device=device,

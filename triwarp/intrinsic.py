@@ -93,7 +93,7 @@ def robust_laplacian(
     [`intrinsic_delaunay`][triwarp.intrinsic.intrinsic_delaunay]
     [`mollify_intrinsic`][triwarp.intrinsic.mollify_intrinsic]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
-    [`heat_geodesic`][triwarp.geodesic.heat_geodesic]
+    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
     """
     if use_intrinsic_delaunay:
         intrinsic_faces, lengths, _ = intrinsic_delaunay(vertices, faces, epsilon=epsilon)

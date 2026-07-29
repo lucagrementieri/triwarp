@@ -1,5 +1,5 @@
 """
-Benchmarks for ``triwarp.geodesic.heat_geodesic``.
+Benchmarks for ``triwarp.heat.distance.heat_geodesic``.
 
 Two axes, and the second is the interesting one:
 
@@ -110,9 +110,9 @@ def _run_case(bench_case: BenchCase, *, amortized: bool = False) -> None:
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         sources = _sources_wp(bench_case)
-        operators = tw.geodesic.heat_operators(vertices, faces) if amortized else None
+        operators = tw.heat.distance.heat_operators(vertices, faces) if amortized else None
         distance = bench_case.run(
-            lambda: tw.geodesic.heat_geodesic(vertices, faces, sources, operators=operators),
+            lambda: tw.heat.distance.heat_geodesic(vertices, faces, sources, operators=operators),
             rounds=_ROUNDS,
         )
         assert distance.shape == (n_vertices,)

@@ -1,5 +1,5 @@
 """
-Regression tests for ``triwarp.signed_heat`` against potpourri3d (CPU reference).
+Regression tests for ``triwarp.heat.signed`` against potpourri3d (CPU reference).
 
 Every curve here is a **vertex one-ring cycle**, for a reason that is easy to trip over:
 ``potpourri3d.MeshSignedHeatSolver`` rejects a curve whose consecutive points do not share a face
@@ -9,7 +9,7 @@ closed, *and* separating — which is what makes the sign meaningful — and it 
 [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings].
 
 The strongest check is not against the reference at all: the *magnitude* of the signed field has to
-agree with the unsigned [`heat_geodesic`][triwarp.geodesic.heat_geodesic] distance to the same
+agree with the unsigned [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] distance to the same
 curve, which is a completely different solve.
 """
 
@@ -87,7 +87,7 @@ def test_heat_signed_distance_matches_potpourri3d(
     _, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)
     curve_wp = wp.array(curve_np, dtype=wp.int32, device=mesh_wp.device)
 
-    distance_wp = tw.signed_heat.heat_signed_distance(
+    distance_wp = tw.heat.signed.heat_signed_distance(
         mesh_wp.points, mesh_wp.indices, curve_wp
     ).numpy()
     distance_pp = _distance_pp(mesh_tm, curve_np)
@@ -113,8 +113,8 @@ def test_signed_distance_magnitude_is_the_unsigned_distance(
     _, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)
     curve_wp = wp.array(curve_np, dtype=wp.int32, device=mesh_wp.device)
 
-    signed = tw.signed_heat.heat_signed_distance(mesh_wp.points, mesh_wp.indices, curve_wp).numpy()
-    unsigned = tw.geodesic.heat_geodesic(mesh_wp.points, mesh_wp.indices, curve_wp).numpy()
+    signed = tw.heat.signed.heat_signed_distance(mesh_wp.points, mesh_wp.indices, curve_wp).numpy()
+    unsigned = tw.heat.distance.heat_geodesic(mesh_wp.points, mesh_wp.indices, curve_wp).numpy()
 
     # Two independent solves — a vector diffusion plus Poisson against a scalar diffusion plus
     # Poisson — that have to agree about *how far* the curve is, whatever they say about which side.
@@ -133,7 +133,7 @@ def test_signed_distance_is_positive_inside_the_curve(
     center, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)
     curve_wp = wp.array(curve_np, dtype=wp.int32, device=mesh_wp.device)
 
-    distance = tw.signed_heat.heat_signed_distance(
+    distance = tw.heat.signed.heat_signed_distance(
         mesh_wp.points, mesh_wp.indices, curve_wp
     ).numpy()
 
@@ -154,10 +154,10 @@ def test_reversing_the_curve_negates_the_field(
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     _, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)
 
-    forward = tw.signed_heat.heat_signed_distance(
+    forward = tw.heat.signed.heat_signed_distance(
         mesh_wp.points, mesh_wp.indices, wp.array(curve_np, dtype=wp.int32, device=mesh_wp.device)
     ).numpy()
-    backward = tw.signed_heat.heat_signed_distance(
+    backward = tw.heat.signed.heat_signed_distance(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(curve_np[::-1].copy(), dtype=wp.int32, device=mesh_wp.device),
@@ -176,10 +176,10 @@ def test_zero_set_constraint_pins_the_curve(
     _, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)
     curve_wp = wp.array(curve_np, dtype=wp.int32, device=mesh_wp.device)
 
-    pinned = tw.signed_heat.heat_signed_distance(
+    pinned = tw.heat.signed.heat_signed_distance(
         mesh_wp.points, mesh_wp.indices, curve_wp, level_set_constraint="zero_set"
     ).numpy()
-    shifted = tw.signed_heat.heat_signed_distance(
+    shifted = tw.heat.signed.heat_signed_distance(
         mesh_wp.points, mesh_wp.indices, curve_wp, level_set_constraint="none"
     ).numpy()
 
@@ -205,10 +205,10 @@ def test_multiple_curves_via_offsets(icosahedron: tuple[tm.Trimesh, wp.Mesh], de
         device=mesh_wp.device,
     )
 
-    both = tw.signed_heat.heat_signed_distance(
+    both = tw.heat.signed.heat_signed_distance(
         mesh_wp.points, mesh_wp.indices, packed, offsets
     ).numpy()
-    only_first = tw.signed_heat.heat_signed_distance(
+    only_first = tw.heat.signed.heat_signed_distance(
         mesh_wp.points, mesh_wp.indices, wp.array(first, dtype=wp.int32, device=mesh_wp.device)
     ).numpy()
 
@@ -229,7 +229,7 @@ def test_open_curve_still_changes_sign_across_itself(
 
     # An open curve has no inside, so the far field means nothing — but the method does not need a
     # closed curve to run, and the result must still be finite and vanish on the source.
-    distance = tw.signed_heat.heat_signed_distance(
+    distance = tw.heat.signed.heat_signed_distance(
         mesh_wp.points, mesh_wp.indices, curve_wp, closed=False
     ).numpy()
     assert np.isfinite(distance).all()
@@ -244,13 +244,13 @@ def test_reused_operators_give_the_same_answer(
     mesh_tm, mesh_wp = half_torus
     _, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)
     curve_wp = wp.array(curve_np, dtype=wp.int32, device=mesh_wp.device)
-    operators = tw.vector_heat.vector_heat_operators(mesh_wp.points, mesh_wp.indices)
+    operators = tw.heat.vector.vector_heat_operators(mesh_wp.points, mesh_wp.indices)
 
     # This method assembles three matrices; reusing them must change nothing but the time taken.
     # Compared at solver precision, not exactly: conjugate gradient's reductions are not
     # bit-reproducible run to run.
-    fresh = tw.signed_heat.heat_signed_distance(mesh_wp.points, mesh_wp.indices, curve_wp)
-    reused = tw.signed_heat.heat_signed_distance(
+    fresh = tw.heat.signed.heat_signed_distance(mesh_wp.points, mesh_wp.indices, curve_wp)
+    reused = tw.heat.signed.heat_signed_distance(
         mesh_wp.points, mesh_wp.indices, curve_wp, operators=operators
     )
     span = float(np.abs(fresh.numpy()).max())
@@ -260,7 +260,7 @@ def test_reused_operators_give_the_same_answer(
 def test_invalid_level_set_constraint(icosahedron: tuple[tm.Trimesh, wp.Mesh], device: str) -> None:
     _, mesh_wp = icosahedron
     with pytest.raises(ValueError, match="level_set_constraint"):
-        tw.signed_heat.heat_signed_distance(
+        tw.heat.signed.heat_signed_distance(
             mesh_wp.points,
             mesh_wp.indices,
             wp.array(np.array([0, 1], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device),
@@ -272,4 +272,4 @@ def test_heat_signed_distance_empty(device: str) -> None:
     vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
     empty_int = wp.empty(0, dtype=wp.int32, device=device)
-    assert tw.signed_heat.heat_signed_distance(vertices_wp, faces_wp, empty_int).shape == (0,)
+    assert tw.heat.signed.heat_signed_distance(vertices_wp, faces_wp, empty_int).shape == (0,)

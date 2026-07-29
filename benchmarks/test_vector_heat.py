@@ -1,5 +1,5 @@
 """
-Benchmarks for ``triwarp.vector_heat`` and the connection Laplacian it runs on.
+Benchmarks for ``triwarp.heat.vector`` and the connection Laplacian it runs on.
 
 Everything here is conjugate gradient, so **quality** is the axis that matters: ``saddle`` against
 ``saddle_graded`` holds vertices, faces and connectivity fixed and only worsens the aspect ratio,
@@ -85,7 +85,7 @@ def test_extend_scalar(bench_case: BenchCase) -> None:
         sources = _sources_wp(bench_case)
         values = wp.array(np.array([1.0]), dtype=wp.float64, device=bench_case.device)
         extended = bench_case.run(
-            lambda: tw.vector_heat.extend_scalar(vertices, faces, sources, values), rounds=_ROUNDS
+            lambda: tw.heat.vector.extend_scalar(vertices, faces, sources, values), rounds=_ROUNDS
         )
         assert extended.shape == (n_vertices,)
     else:
@@ -103,9 +103,9 @@ def _run_transport(bench_case: BenchCase, *, amortized: bool) -> None:
         vectors = wp.array(
             np.array([[1.0, 0.0]], dtype=np.float32), dtype=wp.vec2, device=bench_case.device
         )
-        operators = tw.vector_heat.vector_heat_operators(vertices, faces) if amortized else None
+        operators = tw.heat.vector.vector_heat_operators(vertices, faces) if amortized else None
         transported = bench_case.run(
-            lambda: tw.vector_heat.transport_tangent_vectors(
+            lambda: tw.heat.vector.transport_tangent_vectors(
                 vertices, faces, sources, vectors, operators=operators
             ),
             rounds=_ROUNDS,
@@ -146,7 +146,7 @@ def test_log_map(bench_case: BenchCase) -> None:
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         logarithm = bench_case.run(
-            lambda: tw.vector_heat.log_map(vertices, faces, 0), rounds=_ROUNDS
+            lambda: tw.heat.vector.log_map(vertices, faces, 0), rounds=_ROUNDS
         )
         assert logarithm.shape == (n_vertices,)
     else:

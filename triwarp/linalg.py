@@ -53,15 +53,15 @@ Jacobi at ``tol=1e-8``, on ``-L`` with one degree of freedom pinned:
 Two further obstacles are specific to this repository. Obtuse triangles give negative cotangent
 weights (``triwarp/kernels/laplacian.py``), so a noisy sphere carries 16.75 % positive
 off-diagonals and ``-L`` is not the M-matrix that IC(0) existence requires; and both
-[`heat_geodesic`][triwarp.geodesic.heat_geodesic] and
-[`heat_signed_distance`][triwarp.signed_heat.heat_signed_distance] solve a ``-L`` with a genuine
+[`heat_geodesic`][triwarp.heat.distance.heat_geodesic] and
+[`heat_signed_distance`][triwarp.heat.signed.heat_signed_distance] solve a ``-L`` with a genuine
 constant null space, where IC(0) hits a zero pivot on the last row of every connected component.
 If this is revisited, the direction is smoothed-aggregation multigrid — the only option that breaks
 the ``O(sqrt(n))`` iteration growth — and ``bsr_mm``, ``bsr_transposed`` and ``bsr_mv`` are all
 available to build it.
 
 The *target* was sound even though the tool is not: on an RTX 5090
-[`heat_geodesic`][triwarp.geodesic.heat_geodesic] with cached operators measures 8.1, 12.6 and
+[`heat_geodesic`][triwarp.heat.distance.heat_geodesic] with cached operators measures 8.1, 12.6 and
 30.3 ms at 10 242, 40 962 and 163 842 vertices, of which the heat solve is about 2 ms flat and
 assembly 1.1 to 2.3 ms — the Poisson solve is 75-90 % of the call. That heat system ``M - tL``
 needs no help of its own: 30 iterations at every size, because ``t = h**2`` makes it a small

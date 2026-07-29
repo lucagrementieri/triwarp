@@ -1,5 +1,5 @@
 """
-Regression tests for ``triwarp.vector_heat`` against potpourri3d (CPU reference).
+Regression tests for ``triwarp.heat.vector`` against potpourri3d (CPU reference).
 
 Comparing tangent fields across libraries needs care in two places, and both are load-bearing here:
 
@@ -61,7 +61,7 @@ def test_extend_scalar_matches_potpourri3d(
     sources_np = np.array([0, n_vertices // 3, 2 * n_vertices // 3], dtype=np.int32)
     values_np = np.array([1.0, 2.0, 5.0])
 
-    extended_wp = tw.vector_heat.extend_scalar(
+    extended_wp = tw.heat.vector.extend_scalar(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(sources_np, dtype=wp.int32, device=mesh_wp.device),
@@ -85,7 +85,7 @@ def test_extend_scalar_single_source_is_constant(
 ) -> None:
     _skip_on_cpu(device)
     _, mesh_wp = icosahedron
-    extended = tw.vector_heat.extend_scalar(
+    extended = tw.heat.vector.extend_scalar(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device),
@@ -124,7 +124,7 @@ def test_transport_on_a_flat_patch_is_constant(device: str) -> None:
     vertices_wp = wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=device)
     faces_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
 
-    transported = tw.vector_heat.transport_tangent_vectors(
+    transported = tw.heat.vector.transport_tangent_vectors(
         vertices_wp,
         faces_wp,
         wp.array(np.array([size * size // 2], dtype=np.int32), dtype=wp.int32, device=device),
@@ -171,7 +171,7 @@ def test_transport_tangent_vectors_matches_potpourri3d(
         [float(basis_x[source] @ basis_x_pp[source]), float(basis_x[source] @ basis_y_pp[source])]
     ]
 
-    transported_wp = tw.vector_heat.transport_tangent_vectors(
+    transported_wp = tw.heat.vector.transport_tangent_vectors(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(np.array([source], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device),
@@ -200,7 +200,7 @@ def test_transport_preserves_source_magnitudes(
     _skip_on_cpu(device)
     _, mesh_wp = request.getfixturevalue(mesh_name)
     magnitude = 2.5
-    transported = tw.vector_heat.transport_tangent_vectors(
+    transported = tw.heat.vector.transport_tangent_vectors(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device),
@@ -220,7 +220,7 @@ def test_transport_does_not_cross_components(
     # ``cave_cube`` is a cube shell around a smaller cube shell: two components. Nothing can be
     # transported across the gap, so the cavity's vertices must come back at zero rather than with a
     # smeared value (potpourri3d returns NaN on this mesh; see the note above).
-    transported = tw.vector_heat.transport_tangent_vectors(
+    transported = tw.heat.vector.transport_tangent_vectors(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device),
@@ -249,8 +249,8 @@ def test_log_map_radius_is_the_geodesic_distance(
     _skip_on_cpu(device)
     _, mesh_wp = request.getfixturevalue(mesh_name)
     sources_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
-    distance = tw.geodesic.heat_geodesic(mesh_wp.points, mesh_wp.indices, sources_wp).numpy()
-    logarithm = tw.vector_heat.log_map(mesh_wp.points, mesh_wp.indices, 0).numpy()
+    distance = tw.heat.distance.heat_geodesic(mesh_wp.points, mesh_wp.indices, sources_wp).numpy()
+    logarithm = tw.heat.vector.log_map(mesh_wp.points, mesh_wp.indices, 0).numpy()
 
     # By construction the radius *is* the distance field: this pins the assembly, not the accuracy.
     assert np.allclose(np.linalg.norm(logarithm, axis=1), distance, rtol=1e-4, atol=1e-4)
@@ -270,7 +270,7 @@ def test_log_map_matches_potpourri3d(
     basis_x_pp, basis_y_pp, _ = (np.asarray(basis) for basis in solver_pp.get_tangent_frames())
     basis_x, _, _ = _frames(mesh_wp)
 
-    logarithm_wp = tw.vector_heat.log_map(mesh_wp.points, mesh_wp.indices, 0).numpy()
+    logarithm_wp = tw.heat.vector.log_map(mesh_wp.points, mesh_wp.indices, 0).numpy()
     logarithm_pp = np.asarray(solver_pp.compute_log_map(0, "VectorHeat"))
 
     # Both maps live in the source vertex's tangent plane but measure angles from their own
@@ -294,7 +294,7 @@ def test_log_map_matches_potpourri3d(
 def test_log_map_is_zero_at_its_source(icosahedron: tuple[object, wp.Mesh], device: str) -> None:
     _skip_on_cpu(device)
     _, mesh_wp = icosahedron
-    logarithm = tw.vector_heat.log_map(mesh_wp.points, mesh_wp.indices, 3).numpy()
+    logarithm = tw.heat.vector.log_map(mesh_wp.points, mesh_wp.indices, 3).numpy()
     assert np.allclose(logarithm[3], 0.0, rtol=1e-6, atol=1e-6)
 
 
@@ -313,7 +313,7 @@ def test_reused_operators_give_the_same_answer(
     vectors = wp.array(
         np.array([[1.0, 0.0]], dtype=np.float32), dtype=wp.vec2, device=mesh_wp.device
     )
-    operators = tw.vector_heat.vector_heat_operators(mesh_wp.points, mesh_wp.indices)
+    operators = tw.heat.vector.vector_heat_operators(mesh_wp.points, mesh_wp.indices)
 
     # Reusing the operators must be an optimization and nothing else: the same assembly, so the same
     # matrices, so the same answer. Not *bit* for bit, though — conjugate gradient reduces with
@@ -321,16 +321,16 @@ def test_reused_operators_give_the_same_answer(
     # 2e-15, and the log map to 4e-7 absolute, which is float32 epsilon on its own output.
     for fresh, reused in (
         (
-            tw.vector_heat.transport_tangent_vectors(
+            tw.heat.vector.transport_tangent_vectors(
                 mesh_wp.points, mesh_wp.indices, sources, vectors
             ),
-            tw.vector_heat.transport_tangent_vectors(
+            tw.heat.vector.transport_tangent_vectors(
                 mesh_wp.points, mesh_wp.indices, sources, vectors, operators=operators
             ),
         ),
         (
-            tw.vector_heat.log_map(mesh_wp.points, mesh_wp.indices, 0),
-            tw.vector_heat.log_map(mesh_wp.points, mesh_wp.indices, 0, operators=operators),
+            tw.heat.vector.log_map(mesh_wp.points, mesh_wp.indices, 0),
+            tw.heat.vector.log_map(mesh_wp.points, mesh_wp.indices, 0, operators=operators),
         ),
     ):
         # Compared against the *field's* magnitude rather than per element: a component that is
@@ -346,15 +346,15 @@ def test_operators_fix_the_diffusion_time(icosahedron: tuple[object, wp.Mesh], d
     vectors = wp.array(
         np.array([[1.0, 0.0]], dtype=np.float32), dtype=wp.vec2, device=mesh_wp.device
     )
-    slow = tw.vector_heat.vector_heat_operators(mesh_wp.points, mesh_wp.indices, t=1.0)
+    slow = tw.heat.vector.vector_heat_operators(mesh_wp.points, mesh_wp.indices, t=1.0)
 
     # ``t`` lives in the assembled system, so a bundle built with one ``t`` must win over the
     # argument rather than being silently re-derived. A wrong precedence here would not be subtle:
     # ``t`` differs by six orders of magnitude between the two.
-    with_bundle = tw.vector_heat.transport_tangent_vectors(
+    with_bundle = tw.heat.vector.transport_tangent_vectors(
         mesh_wp.points, mesh_wp.indices, sources, vectors, t=1e-6, operators=slow
     )
-    direct = tw.vector_heat.transport_tangent_vectors(
+    direct = tw.heat.vector.transport_tangent_vectors(
         mesh_wp.points, mesh_wp.indices, sources, vectors, t=1.0
     )
     span = float(np.abs(direct.numpy()).max())
@@ -377,7 +377,7 @@ def test_tangent_to_world_reproduces_the_frames(
         dtype=wp.vec2,
         device=mesh_wp.device,
     )
-    world = tw.vector_heat.tangent_to_world(tangent, basis_x_wp, basis_y_wp)
+    world = tw.heat.vector.tangent_to_world(tangent, basis_x_wp, basis_y_wp)
     assert np.allclose(world.numpy(), basis_y_wp.numpy(), rtol=1e-6, atol=1e-6)
 
 
@@ -385,10 +385,10 @@ def test_vector_heat_empty(device: str) -> None:
     vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
     empty_int = wp.empty(0, dtype=wp.int32, device=device)
-    assert tw.vector_heat.extend_scalar(
+    assert tw.heat.vector.extend_scalar(
         vertices_wp, faces_wp, empty_int, wp.empty(0, dtype=wp.float64, device=device)
     ).shape == (0,)
-    assert tw.vector_heat.transport_tangent_vectors(
+    assert tw.heat.vector.transport_tangent_vectors(
         vertices_wp, faces_wp, empty_int, wp.empty(0, dtype=wp.vec2, device=device)
     ).shape == (0,)
-    assert tw.vector_heat.log_map(vertices_wp, faces_wp, 0).shape == (0,)
+    assert tw.heat.vector.log_map(vertices_wp, faces_wp, 0).shape == (0,)
