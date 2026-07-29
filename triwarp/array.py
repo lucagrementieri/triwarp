@@ -489,18 +489,16 @@ def isin(
 
 
 def _sorted_copy(values: wp.array[DType]) -> wp.array[DType]:
-    """Ascending-sorted copy of a 1D scalar array via ``radix_sort_pairs``."""
-    n = int(values.shape[0])
-    device = values.device
-    if n <= 1:
+    """
+    Ascending-sorted copy of a 1D scalar array.
+
+    ``sort_pairs`` returns a *view* into its own scratch and this outlives the caller's frame, so
+    the keys are cloned. The order payload is discarded, which is why the padding value it seeds
+    does not matter here.
+    """
+    if int(values.shape[0]) <= 1:
         return values
-    keys_wp = wp.empty(2 * n, dtype=values.dtype, device=device)
-    wp.copy(keys_wp, values, count=n)
-    indices_wp = init_sort_pair_indices(n, n, device)
-    wp.utils.radix_sort_pairs(keys_wp, indices_wp, count=n)
-    sorted_wp = wp.empty(n, dtype=values.dtype, device=device)
-    wp.copy(sorted_wp, keys_wp, count=n)
-    return sorted_wp
+    return wp.clone(sort_pairs(values)[0])
 
 
 def _isin_lookup_mask(

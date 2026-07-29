@@ -19,8 +19,6 @@ from triwarp.kernels import triangles as kernel_triangles
 from triwarp.triangles import face_normals_and_areas
 from triwarp.vertices import mean_vertex_normals
 
-_CG_TOLERANCE = 1e-10
-
 
 def _apply_operator(
     operator: wps.BsrMatrix[wp.float32], v_in: wp.array[wp.vec3d], out_lv: wp.array[wp.vec3d]
@@ -142,7 +140,7 @@ def filter_laplacian(
             wp.map(kernel_smoothing.extract_components, positions, out=list(components))
             for rhs, solution in zip(components, solutions, strict=True):
                 wp.copy(solution, rhs)
-                wpl.cg(system, rhs, solution, tol=_CG_TOLERANCE, maxiter=10 * n, M=precond)
+                wpl.cg(system, rhs, solution, tol=twl.CG_TOLERANCE, maxiter=10 * n, M=precond)
             wp.map(kernel_smoothing.combine_components, *solutions, out=positions)
             if volume_constraint:
                 _apply_volume_constraint(positions, faces, vol_ini)
@@ -607,7 +605,7 @@ def filter_implicit_fairing(
         precond = wpl.preconditioner(system, "diag")
         for b, solution, component in zip(rhs, solutions, components, strict=True):
             wp.copy(solution, component)
-            wpl.cg(system, b, solution, tol=_CG_TOLERANCE, maxiter=10 * n, M=precond)
+            wpl.cg(system, b, solution, tol=twl.CG_TOLERANCE, maxiter=10 * n, M=precond)
         wp.map(kernel_smoothing.combine_components, *solutions, out=positions)
 
     return tw.array._as_vec3(positions)
@@ -652,8 +650,6 @@ def _build_implicit_system(
 # ---------------------------------------------------------------------------
 # Region smoothing solves (positionVertsSmoothly / positionVertsSmoothlySharpBd)
 # ---------------------------------------------------------------------------
-
-_CG_TOLERANCE_POSITION = 1e-10
 
 
 def _edge_weight_matrix(
@@ -782,7 +778,7 @@ def position_verts_smoothly_sharp_boundary(
         system,
         twt.as_array2d_float(rhs, dtype=wp.float64),
         twt.as_array2d_float(sol, dtype=wp.float64),
-        tol=_CG_TOLERANCE_POSITION,
+        tol=twl.CG_TOLERANCE,
         maxiter=10 * n_free,
     )
     wp.launch(
@@ -896,7 +892,7 @@ def position_verts_smoothly(
         system,
         twt.as_array2d_float(atb, dtype=wp.float64),
         twt.as_array2d_float(sol, dtype=wp.float64),
-        tol=_CG_TOLERANCE_POSITION,
+        tol=twl.CG_TOLERANCE,
         maxiter=10 * n_free,
     )
     wp.launch(

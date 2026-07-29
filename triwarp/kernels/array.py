@@ -168,15 +168,6 @@ def gather_1d_skip_negative(
 
 
 @wp.kernel
-def gather_2d_from_1d(
-    array: wp.array[wp.Scalar], indices: wp.array2d[wp.int32], out_gathered: wp.array2d[wp.Scalar]
-) -> None:
-    i, j = wp.tid()
-    index = indices[i, j]
-    out_gathered[i, j] = array[index]
-
-
-@wp.kernel
 def sort_rows_insertion(data: wp.array2d[wp.Scalar]) -> None:
     # One thread per row, in-place insertion sort across the row. For the narrow rows this library
     # actually sorts (vertex pairs, triangle corners) that is 1-3 register comparisons, versus a

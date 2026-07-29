@@ -2,15 +2,16 @@ import warp as wp
 
 from triwarp.constants import PI, TOLERANCE_ZERO_CONSTANT, TWO_PI
 from triwarp.kernels.halfedge import halfedge_destination
+from triwarp.kernels.predicates import triangle_normal
 from triwarp.kernels.tangent_space import corner_angle
+from triwarp.kernels.triangles import face_vertices
 
 
 @wp.func
 def face_normal_of(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: wp.int32) -> wp.vec3:
-    v0 = vertices[faces[f * 3 + 0]]
-    v1 = vertices[faces[f * 3 + 1]]
-    v2 = vertices[faces[f * 3 + 2]]
-    return wp.normalize(wp.cross(v1 - v0, v2 - v0))
+    # Adapter: ``triangle_normal`` by face index rather than by three corners.
+    v0, v1, v2 = face_vertices(vertices, faces, f)
+    return triangle_normal(v0, v1, v2)
 
 
 @wp.func

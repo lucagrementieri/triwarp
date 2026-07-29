@@ -9,7 +9,6 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.kernels import adjacency as kernel_adjacency
-from triwarp.kernels import array as kernel_array
 
 
 @overload
@@ -104,13 +103,10 @@ def face_adjacency(
     edge_groups = tw.grouping.group_int_rows(
         edges_sorted, length=2, max_value=n_vertices, validate=n_vertices is None
     )
-    adjacency = twt.empty_int32_2d((edge_groups.shape[0], 2), device=faces.device)
-    wp.launch(
-        kernel_array.gather_2d_from_1d,
-        dim=edge_groups.shape,
-        inputs=[edges_face, edge_groups, adjacency],
-        device=faces.device,
-    )
+    # ``edge_groups`` is a dense contiguous ``(m, 2)`` buffer from ``group_int_rows``, so flattening
+    # it yields a contiguous index array and Python-scope gather is safe. (A *column* of it would
+    # not be — see the stride note below.)
+    adjacency = tw.array.gather(edges_face, edge_groups.flatten()).reshape(edge_groups.shape)
     tw.array.sort_rows(adjacency)
     if return_edges:
         if edge_groups.shape[0] > 0:
