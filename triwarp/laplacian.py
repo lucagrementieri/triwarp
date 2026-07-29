@@ -7,6 +7,7 @@ import triwarp.typing as twt
 from triwarp.edges import edges_unique, faces_to_edges
 from triwarp.kernels import laplacian as kernel_laplacian
 from triwarp.kernels import scatter as kernel_scatter
+from triwarp.kernels import vector_heat as kernel_vector_heat
 from triwarp.triangles import face_normals_and_areas
 
 
@@ -167,6 +168,95 @@ def cotmatrix(
         kernel_laplacian.cotmatrix_triplets,
         dim=n_faces,
         inputs=[faces, cot_entries, rows, cols, vals],
+        device=device,
+    )
+    return wps.bsr_from_triplets(
+        n_vertices, n_vertices, rows, cols, vals, prune_numerical_zeros=False
+    )
+
+
+def connection_laplacian(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    cot_entries: twt.Array2dFloat | None = None,
+    transport_angles: wp.array[wp.float32] | None = None,
+    frames: tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.vec3]] | None = None,
+) -> wps.BsrMatrix[wp.float64]:
+    """
+    Vector (connection) Laplacian: the cotangent Laplacian for *tangent vector* fields.
+
+    Same cotangent weights and same sparsity as [`cotmatrix`][triwarp.laplacian.cotmatrix], but each
+    scalar becomes a ``2 x 2`` block and each off-diagonal weight is multiplied by the rotation that
+    re-expresses a tangent vector in the neighbouring vertex's frame
+    ([`halfedge_transport_angles`][triwarp.tangent.halfedge_transport_angles]). Without those
+    rotations a difference between vectors at two vertices would subtract components measured from
+    two unrelated reference directions.
+
+    Assembled ``float64`` and **positive semi-definite** (positive diagonal) — the opposite sign to
+    ``cotmatrix``'s igl convention — because its consumers feed it to a conjugate-gradient solve. It
+    is symmetric, since transporting from ``i`` to ``j`` and back are inverse rotations.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    cot_entries
+        Optional precomputed ``(n_faces, 3)`` half-cotangent weights from
+        [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries].
+    transport_angles
+        Optional precomputed per-halfedge
+        [`halfedge_transport_angles`][triwarp.tangent.halfedge_transport_angles].
+    frames
+        Optional precomputed [`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames], only
+        used when ``transport_angles`` has to be computed here. The operator depends on the frames
+        only through those angles, and its solutions transform consistently with them.
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        ``(n_vertices, n_vertices)`` matrix of ``wp.mat22d`` blocks on ``vertices.device``.
+
+    See Also
+    --------
+    [`cotmatrix`][triwarp.laplacian.cotmatrix]
+    [`halfedge_transport_angles`][triwarp.tangent.halfedge_transport_angles]
+    [`transport_tangent_vectors`][triwarp.vector_heat.transport_tangent_vectors]
+    """
+    from triwarp.tangent import halfedge_transport_angles
+
+    n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    device = vertices.device
+    if n_faces == 0:
+        return wps.bsr_from_triplets(
+            n_vertices,
+            n_vertices,
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.mat22d, device=device),
+            prune_numerical_zeros=False,
+        )
+
+    if cot_entries is None:
+        cot_entries = cotmatrix_entries(vertices, faces, dtype=wp.float64)
+    if transport_angles is None:
+        rings = None
+        if frames is None:
+            transport_angles = halfedge_transport_angles(vertices, faces)
+        else:
+            transport_angles = halfedge_transport_angles(vertices, faces)
+        del rings
+
+    n_triplets = 12 * n_faces
+    rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
+    cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
+    vals = wp.empty(n_triplets, dtype=wp.mat22d, device=device)
+    wp.launch(
+        kernel_vector_heat.connection_laplacian_triplets,
+        dim=n_faces,
+        inputs=[faces, cot_entries, transport_angles, rows, cols, vals],
         device=device,
     )
     return wps.bsr_from_triplets(

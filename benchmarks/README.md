@@ -1,7 +1,7 @@
 # triwarp benchmarks
 
 Performance benchmarks comparing `triwarp` against the CPU references **trimesh**, **libigl
-(`igl`)**, **open3d** and **scipy**, built on
+(`igl`)**, **open3d**, **scipy** and **potpourri3d** (geometry-central), built on
 [pytest-benchmark](https://pytest-benchmark.readthedocs.io).
 
 These are **not** collected by the normal test run (`pytest`'s `testpaths` is `tests/`); run them
@@ -171,6 +171,15 @@ process each, 999 cases plus 139 skipped). The four slowest modules are `test_re
 (235 s), `test_laplacian` (95 s), `test_proximity` (85 s, the `O(Q x F)` winding number) and
 `test_smoothing` (70 s).
 
+That measurement predates the six modules added with the potpourri3d port
+(`test_halfedge`, `test_tangent`, `test_contour`, `test_tracing`, `test_vector_heat`,
+`test_intrinsic`, `test_signed_heat`) and the potpourri3d rows in the existing ones. The three Phase-1 modules add ~10 s;
+`test_vector_heat` and `test_tracing` add ~40 s between them (the reference factors two sparse systems
+per case, and traces one ray per call); `test_signed_heat` adds ~15 s, most of it the reference's
+1 s-per-call solver; and the potpourri3d rows add most of their cost to
+`test_geodesic`, now 74 s for the module with its `heat_geodesic` group carrying three libraries at two
+setup points each.
+
 Only the first of those is not measuring triwarp: **190 of `test_reconstruction`'s 199 timed
 seconds are open3d's CPU `create_from_point_cloud_poisson`** (7.5 s a call at depth 9 on `bunny`),
 against 9.0 s for every triwarp case in the module combined. It is the largest single reference cost
@@ -242,7 +251,23 @@ succeeds on all sixteen feature meshes; `igl.harmonic` / `igl.lscm` cannot facto
 cotangent systems but handle every mesh on the `patch` axis. So those three comparisons are now
 drawn on the same meshes triwarp is measured on rather than on two tiny saddle patches.
 
-Two hazards remain and are encoded as explicit skips:
+`potpourri3d` needs the same treatment for a different reason, and the boundary is not
+manifoldness but *which* geometry-central mesh class a call builds. Measured:
+
+| call | input | result |
+|---|---|---|
+| `cotan_laplacian`, `face_areas`, `vertex_areas` | anything | fine — pure numpy/scipy, no mesh built |
+| `MeshHeatMethodDistanceSolver`, `marching_triangles` | non-manifold edges | fine — `SurfaceMesh` tolerates them |
+| `pp3d.edges` | a mesh with an **unreferenced vertex** | `RuntimeError: GC_SAFETY_ASSERT FAILURE … unreferenced vertex`, on **every scan mesh** |
+| `MeshVectorHeatSolver` | non-manifold | `RuntimeError: GC_SAFETY_ASSERT FAILURE … manifold_surface_mesh` |
+| `MeshFastMarchingDistanceSolver` | non-manifold | `RuntimeError: handling of nonmanifold mesh not yet implemented` |
+
+So potpourri3d rows live on the synthetic axes, which are manifold and fully referenced by
+construction. Where the group's own axis is the scan sweep, the comparison moves to a sibling group
+on the `scale` axis rather than being skipped — `edges_unique_manifold` is that case — the same move
+that unblocked the libigl comparisons above.
+
+Two more hazards remain and are encoded as explicit skips:
 
 | call | mesh | measured | handling |
 |---|---|---|---|
@@ -250,19 +275,79 @@ Two hazards remain and are encoded as explicit skips:
 | `igl.principal_curvature` | `sphere_large` | ~2 s/call | igl capped at `sphere_med` |
 | `open3d.is_watertight` | `sphere_med` | **13.6 s** (brute-force self-intersection scan) | `rounds=1` |
 | `open3d.is_watertight` | `tangle_2` | 3.5 s — *faster on the harder mesh*, because the scan early-exits on the first hit | `rounds=1` |
+| `pp3d.marching_triangles` | `sphere_med`, 1 072-curve field | 932 ms/call | `rounds=3` |
+| `MeshVectorHeatSolver` construction | `sphere_large` | 373 ms/call | `rounds=3` |
 
 Also: never construct a `wp.Mesh` with zero triangles on CUDA (it corrupts device state silently);
 `test_meshes.py` asserts every feature mesh is non-empty.
 
 ## Reference coverage
 
-`trimesh`, `igl`, `open3d` and `scipy` are all registered in `LIBRARIES` and used for **every**
-benchmarked function that has a genuine equivalent — the point is to have independent
+`trimesh`, `igl`, `open3d`, `scipy` and `potpourri3d` are all registered in `LIBRARIES` and used for
+**every** benchmarked function that has a genuine equivalent — the point is to have independent
 implementations to spot outliers against, not only to fill gaps. `open3d` is marked `cpu_bound`
 even though the installed wheel is a CUDA build: the legacy `open3d.pipelines` / `open3d.geometry`
 APIs used here are CPU-only (only `open3d.t` has GPU kernels). `scipy` covers the k-nearest and
 radius searches (`spatial.KDTree`) and the graph traversals (`sparse.csgraph`), which is where
-trimesh itself delegates.
+trimesh itself delegates. `potpourri3d` is CPU-only (geometry-central) and is the **only** reference
+for the heat-method family, tangent spaces and isocontours.
+
+### potpourri3d
+
+| module | potpourri3d reference |
+|---|---|
+| `test_geodesic` | `MeshHeatMethodDistanceSolver` (`use_robust=False`, the same discretization as triwarp's), and `MeshFastMarchingDistanceSolver` as a different algorithm for the same task |
+| `test_contour` | `marching_triangles` — the only reference for isocontours of an arbitrary vertex field |
+| `test_tracing` | `GeodesicTracer.trace_geodesic_from_vertex` — one ray per call, so its row is linear in the ray count by construction |
+| `test_signed_heat` | `MeshSignedHeatSolver.compute_distance` — requires every curve segment inside one face, which is why the source curves are edge paths |
+| `test_vector_heat` | `MeshVectorHeatSolver.{extend_scalar,transport_tangent_vectors,compute_log_map}` (`use_intrinsic_delaunay=False`) |
+| `test_tangent` | `MeshVectorHeatSolver.get_tangent_frames` (`use_intrinsic_delaunay=False`) — an *upper bound*: the frames only come out of the solver's construction, which also factors two sparse systems |
+| `test_laplacian` | `cotan_laplacian` (a numpy/scipy build, not C++) and `vertex_areas` (the barycentric lumped mass diagonal) |
+| `test_triangles` | `face_areas` |
+| `test_edges` | `edges` — in the `edges_unique_manifold` group only, see the hazard table |
+
+`test_intrinsic` uses **libigl** (`cotmatrix_intrinsic`) rather than potpourri3d, which exposes
+mollification only inside its heat solver. `test_halfedge` and `test_topology`'s subject matter has no
+reference anywhere.
+
+Two things shape every potpourri3d row:
+
+- **Its solvers cache their factorizations**, so the solver is constructed **inside** the timed
+  callable — that is where geometry-central does the work triwarp's per-call assembly does. Timing
+  only `compute_*` would compare a back-substitution against a full iterative solve. Where triwarp
+  has its own reusable precompute the amortized case is measured explicitly instead of argued about:
+  `heat_geodesic` carries a `setup=full`/`setup=amortized` parameter layer, and on triwarp's side the
+  amortized row is a real API path (`heat_operators` passed back through `heat_geodesic`).
+- **Its defaults do more work than triwarp's.** `MeshHeatMethodDistanceSolver(use_robust=True)` and
+  `MeshVectorHeatSolver(use_intrinsic_delaunay=True)` mollify and flip to an intrinsic Delaunay
+  triangulation first. Every row here passes `False` so both sides discretize the same triangulation;
+  the robust path becomes a parameter layer when triwarp grows one.
+
+Measured against it on an RTX 5090: `marching_triangles` is **25x** faster at `sphere_med` and 59x at
+`sphere_large`; `heat_geodesic` is 2.8x faster at `saddle` but **1.2x slower** at `saddle_graded`,
+where triwarp's CG pays for the conditioning and geometry-central's direct solve does not; the
+amortized solve is **19x slower** than potpourri3d's back-substitution at `sphere_small`, which is
+the clearest statement in the suite of what an iterative solver costs per extra source set.
+
+`heat_signed_distance` is **13x** faster than the reference on `sphere_med` (81 ms against 1 060 ms),
+and its own axis answers a design question rather than a competitive one: a 370-segment source curve
+costs *less* than a 6-segment one (71 vs 81 ms), because a source spread over the surface converges in
+fewer conjugate-gradient iterations. Pinning the level set costs 4.7x an unconstrained solve
+(80.6 against 17.3 ms).
+
+The tangent-space and tracing groups repeat both halves of that story. `trace_geodesic_rays` is **flat
+at 1.15 ms from 1 to 4 096 rays** against potpourri3d's 63 → 77 ms (55x → 67x), because one thread
+traces one ray and the reference's API traces one ray per call. `log_map` is 6.8x faster at `saddle`
+and only 2.6x at `saddle_graded` — triwarp's vector solve pays **2.7x** for the aspect ratio there,
+the reference's factorization nothing. `heat_signed_distance_conditioning` shows the same at **3.1x**
+(40.3 → 125.8 ms against a flat 525 → 519), which is the worst of the three because that method runs
+three solves. `robust_laplacian` runs 9.5-22x faster than
+`igl.cotmatrix_intrinsic` on the scan meshes, and `mollify_intrinsic` sits at 0.28 ms on `bunny`,
+which is its two host readbacks and essentially nothing else. `intrinsic_delaunay` runs
+1.15 / 1.20 / 2.18 ms over the `scale` axis against `igl.intrinsic_delaunay_cotmatrix`'s
+7.2 / 58.9 / 260 ms — read with the caveat that igl's call assembles the matrix too, but the
+crossover is real: one round of the parallel flip loop finding nothing to do costs about a
+millisecond.
 
 | module | open3d reference |
 |---|---|
@@ -293,8 +378,9 @@ unordered segments with no length/resample/simplify), `test_geodesic` (no geodes
 traversal over an abstract CSR), `test_neighbors` (no batched k-NN query), plus the individual
 functions noted inline.
 
-Modules with no baseline from **any** reference are `test_texture`, `test_polyline`, `test_reduce`
-and `test_linalg` (plus `stitch*` in `test_combine` and the morphology groups in `test_selection`);
+Modules with no baseline from **any** reference are `test_texture`, `test_polyline`, `test_reduce`,
+`test_linalg` and `test_halfedge` (plus `stitch*` in `test_combine`, the morphology groups in
+`test_selection`, and the two transport groups in `test_tangent`);
 each docstring says which reference was considered and why it is not apples-to-apples. Those are
 before/after self-comparisons.
 

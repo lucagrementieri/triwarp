@@ -13,12 +13,20 @@ internal ``.numpy().max()`` host sync does not dominate the GPU measurement.
 diagnostics over specific predicates (``get_non_manifold_edges``,
 ``get_self_intersecting_triangles``) and never as a general edge list, so there is no
 ``faces_to_edges`` / ``edges_unique`` / ``edge_lengths`` to time against.
+
+**potpourri3d** does have one: ``pp3d.edges`` returns geometry-central's internal undirected edge
+list. It cannot run on the scan meshes -- geometry-central rejects a mesh with an unreferenced
+vertex, and every scan mesh has some -- so it is timed in the separate ``edges_unique_manifold``
+group on the synthetic ``scale`` axis instead. Its ordering is geometry-central's own, so that row
+is a timing comparison rather than a parity check, and it includes building the halfedge mesh those
+indices refer to. It has no counterpart for the directed, per-corner or length variants.
 """
 
 from __future__ import annotations
 
 import igl
 import numpy as np
+import potpourri3d as pp3d
 import pytest
 import trimesh as tm
 
@@ -99,6 +107,35 @@ def test_edges_unique_auto_n_vertices(bench_case) -> None:
     faces = bench_case.faces_wp
     unique_edges, _ = bench_case.run(lambda: tw.edges.edges_unique(faces))
     assert unique_edges.shape[1] == 2
+
+
+@pytest.mark.benchmark(group="edges_unique_manifold")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "igl", "potpourri3d")
+def test_edges_unique_manifold(bench_case) -> None:
+    """
+    The same unique-edge list on the clean synthetic meshes, where potpourri3d can run.
+
+    ``pp3d.edges`` raises ``GC_SAFETY_ASSERT FAILURE ... unreferenced vertex`` on every scan mesh --
+    geometry-central refuses to build a mesh with a vertex no face references, and the scans all
+    have some. Rather than skip the row, this group draws the comparison on the ``scale`` axis, the
+    same move that unblocked several libigl comparisons (see the README's measured-hazards section).
+    igl is kept alongside so the group is not a two-row table.
+    """
+    if bench_case.kind == "triwarp":
+        faces, nv = bench_case.faces_wp, bench_case.n_vertices
+        unique_edges, _ = bench_case.run(lambda: tw.edges.edges_unique(faces, n_vertices=nv))
+        assert unique_edges.shape[1] == 2
+    elif bench_case.kind == "potpourri3d":
+        # geometry-central's internal edge list, in its own ordering: a timing comparison, not a
+        # parity one. Building the halfedge mesh those indices refer to is the cost being shown.
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        result = bench_case.run(lambda: pp3d.edges(vertices_np, faces_np))
+        assert result.shape[1] == 2
+    else:  # igl.unique_edge_map -> (E, uE, EMAP, uEC, uEE); uE is the unique undirected edges
+        faces = bench_case.faces_np
+        result = bench_case.run(lambda: igl.unique_edge_map(faces)[1])
+        assert result.shape[1] == 2
 
 
 @pytest.mark.benchmark(group="edges_unique_inverse")

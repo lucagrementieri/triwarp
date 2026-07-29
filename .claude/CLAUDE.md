@@ -173,13 +173,38 @@ All new geometry functions MUST have regression tests that compare against the `
 - Name variables with a suffix for the library: `_np` for NumPy/SciPy, `_tm` for Trimesh, `_wp` for Warp. Avoid `got` / `exp` but use instead clear names.
 - When passing a NumPy 1D vector to a `wp.vec3` scalar argument at Python scope, use `wp.vec3(*array_np.tolist())` — not `wp.vec3(*map(float, np.asanyarray(...).reshape(3)))`.
 
-### Fallback reference: libigl Python bindings
+### Fallback references: libigl and potpourri3d
 
 When `trimesh` has no equivalent function, use the `igl` Python package (bindings for the C++
 reference mirrored under `reference/libigl/`) as the CPU reference instead — import as
 `import igl`, name reference variables with an `_igl` suffix. Pass triwarp's flat face buffer
 as `mesh_tm.faces` (`(n_faces, 3)` int array) to the igl function. Otherwise follow the same
 comparison conventions (`np.array_equal`/`np.allclose`, inline `.numpy()`).
+
+For the heat-method family, tangent spaces and isocontours — where neither trimesh nor igl has an
+equivalent — use `potpourri3d` (pybind11 over geometry-central, mirrored under
+`reference/potpourri3d/`): `import potpourri3d as pp3d`, reference variables suffixed `_pp`. It takes
+`float64` `(n, 3)` vertices and `(n_faces, 3)` `int32` faces. Four things to know before writing the
+comparison:
+
+- **Construct solvers with the non-default flags** `use_robust=False` /
+  `use_intrinsic_delaunay=False` so both sides discretize the same triangulation; the defaults
+  mollify and flip to an intrinsic Delaunay triangulation first.
+- **Tangent-space quantities are gauge-dependent.** Frames agree only up to a rotation about the
+  normal, and transport angles only through gauge-invariant combinations (the holonomy around a
+  face). Never compare 2D tangent components or single connection phases element-wise.
+- **Barycentric output must be decoded.** `marching_triangles` returns `(element_index, coords)`
+  pairs in geometry-central's *own* element numbering — decode edges through `pp3d.edges(V, F)`,
+  dispatching on `len(coords)` (0 = vertex, 1 = edge, 2 = face). Its closed curves repeat their first
+  point; open ones do not.
+- **It rejects some inputs outright**, with a `RuntimeError` rather than a wrong answer:
+  `MeshVectorHeatSolver` / `GeodesicTracer` / fast marching need a manifold mesh, and `pp3d.edges`
+  needs every vertex referenced by a face. Pick fixtures accordingly instead of catching the error.
+
+A zero cotangent weight (an edge whose two opposite angles are both right angles, i.e. every quad
+grid split by a diagonal — `cave_cube`, `half_torus`) erases that edge's phase from
+`get_connection_laplacian()`, so it cannot serve as an oracle there at all; see
+`tests/test_tangent.py`.
 
 ### Mesh fixtures (prefer over inline construction)
 

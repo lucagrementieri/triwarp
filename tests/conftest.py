@@ -33,6 +33,21 @@ def half_torus(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
 
 
 @pytest.fixture
+def torus(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
+    torus = tm.creation.torus(major_radius=1.0, minor_radius=0.4)
+    return torus, trimesh_to_warp(torus, device)
+
+
+@pytest.fixture
+def genus_two(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
+    left = tm.creation.torus(major_radius=1.0, minor_radius=0.35)
+    right = tm.creation.torus(major_radius=1.0, minor_radius=0.35)
+    right.apply_translation(translation=np.array([1.8, 0.0, 0.0]))
+    mesh = tm.boolean.union([left, right])
+    return mesh, trimesh_to_warp(mesh, device)
+
+
+@pytest.fixture
 def cave_cube(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
     mesh = tm.boolean.difference(
         [tm.creation.box(extents=[1.0, 1.0, 1.0]), tm.creation.box(extents=[0.1, 0.1, 0.1])]

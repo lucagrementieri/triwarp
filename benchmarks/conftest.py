@@ -23,11 +23,12 @@ Flags
     Which ``triwarp`` targets to time. ``auto`` (default) uses cuda when CUDA is available,
     else falls back to cpu — ``triwarp-cpu`` is not timed alongside cuda by default. Pass
     ``cpu`` for cpu only or ``both`` to time both triwarp targets. The ``trimesh`` / ``igl`` /
-    ``open3d`` / ``scipy`` CPU baselines are always included.
+    ``open3d`` / ``scipy`` / ``potpourri3d`` CPU baselines are always included.
 ``--size=<comma list | all>``
     Restrict meshes to these size categories (``small,medium,large,extralarge,huge``).
 ``--cpu-max-size=<category>``
-    CPU-bound libraries (``triwarp-cpu``, ``trimesh``, ``igl``, ``open3d``, ``scipy``) skip meshes
+    CPU-bound libraries (``triwarp-cpu``, ``trimesh``, ``igl``, ``open3d``, ``scipy``,
+    ``potpourri3d``) skip meshes
     larger than this unless the size was named explicitly in ``--size``. Default ``large`` — so
     ``happy_buddha`` and ``lucy`` run GPU-only by default while
     ``bunny_decimated``/``bunny``/``dragon`` run on CPU.
@@ -98,6 +99,10 @@ def skip_larger_than(bench_case: BenchCase, largest: str, reason: str = "") -> N
 # (``spatial.KDTree``), which is what ``tests/test_neighbors.py`` already validates against. Every
 # benchmark carries an explicit ``benchlibs`` marker, so it generates cases only where a branch
 # exists.
+#
+# ``potpourri3d`` (pybind11 bindings over geometry-central) is CPU-only and the only reference for
+# the heat-method family; note that its solver objects cache their factorizations, so a benchmark
+# must construct the solver *inside* the timed callable to measure the work triwarp does per call.
 LIBRARIES: list[LibrarySpec] = [
     {"id": "triwarp-cpu", "kind": "triwarp", "device": "cpu", "cpu_bound": True},
     {"id": "triwarp-cuda", "kind": "triwarp", "device": "cuda:0", "cpu_bound": False},
@@ -105,6 +110,7 @@ LIBRARIES: list[LibrarySpec] = [
     {"id": "igl", "kind": "igl", "device": None, "cpu_bound": True},
     {"id": "open3d", "kind": "open3d", "device": None, "cpu_bound": True},
     {"id": "scipy", "kind": "scipy", "device": None, "cpu_bound": True},
+    {"id": "potpourri3d", "kind": "potpourri3d", "device": None, "cpu_bound": True},
 ]
 LIBRARIES_BY_ID = {lib["id"]: lib for lib in LIBRARIES}
 
@@ -357,7 +363,8 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
-        "benchlibs(*kinds): library kinds (triwarp/trimesh/igl/open3d/scipy) a benchmark supports.",
+        "benchlibs(*kinds): library kinds (triwarp/trimesh/igl/open3d/scipy/potpourri3d) a "
+        "benchmark supports.",
     )
     config.addinivalue_line(
         "markers",
@@ -432,7 +439,7 @@ class BenchLibrary:
 
     @property
     def kind(self) -> str:
-        """Library family: ``triwarp`` / ``trimesh`` / ``igl`` / ``open3d`` / ``scipy``."""
+        """Library family: ``triwarp``/``trimesh``/``igl``/``open3d``/``scipy``/``potpourri3d``."""
         return self.library["kind"]
 
     @property

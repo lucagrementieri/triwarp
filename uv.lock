@@ -1648,6 +1648,58 @@ wheels = [
 ]
 
 [[package]]
+name = "potpourri3d"
+version = "1.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/62/ab/1385878462411b548a909b66f8e925dbefa6faab1ca704dd43a098905ed3/potpourri3d-1.4.0.tar.gz", hash = "sha256:83c31ac4ee69b90cc0f3af1139f91ec952077defcc9166056cc4434712679292", size = 30618500, upload-time = "2026-03-25T05:52:51.022Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0b/be/f550d69d919a54de0a42cb8ea80bbc1be4f3c259770abe635cfe485be8b2/potpourri3d-1.4.0-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:55b090b98a92ebbb31f2efc5ec5f3e74ed52378aa6871423a9f5e539b700e7c2", size = 3537497, upload-time = "2026-03-25T05:51:30.641Z" },
+    { url = "https://files.pythonhosted.org/packages/47/66/e1df34035138f8cf009552974e599aa1e13a361d8f10d867db3e9f120d59/potpourri3d-1.4.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:170d13ce72c51c22b7406dfb81335fd9e51b99597896024077f1a4d1a2b39c46", size = 3146971, upload-time = "2026-03-25T05:51:32.479Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/d5/ef959678eeddc2e910f60f4586949b04c87f52537ba253fd0fb9b10ad99c/potpourri3d-1.4.0-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:27212912af65ffda9269605de2a94e375289035c754e97ee4ae5e190dc035991", size = 3386607, upload-time = "2026-03-25T05:51:34.306Z" },
+    { url = "https://files.pythonhosted.org/packages/de/5a/5fccf69e1e8ab577d2386b187d038fc7d9688c29281e0d6b6ed753305fbf/potpourri3d-1.4.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:dc607d506c7f263567ff202e45403042035f3ef8ddcc0896beda607ae88db48d", size = 3585988, upload-time = "2026-03-25T05:51:36.139Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/0c/86a764c174cfdeeebe88fa1535124dc7801fbdc91c2a24a9819b45be5dcb/potpourri3d-1.4.0-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:9d7ca029ce37ea794f768a68631977b0c9c86ec1bde978a33b32abe362cf7eb2", size = 4636718, upload-time = "2026-03-25T05:51:37.923Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/8b/191e897c9ecb050d0a15f5980ecc9bd69e91a784e0c654cbc909e11147f2/potpourri3d-1.4.0-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:b1a1a849b247cdffbbed134c26ec0f9ced429a5d722bcd6c67402ee603b633e4", size = 4786559, upload-time = "2026-03-25T05:51:39.56Z" },
+    { url = "https://files.pythonhosted.org/packages/64/ab/652e30714dde0ccf60ceb472b79a4a30a2d3f473badcfd1fb5595e645faf/potpourri3d-1.4.0-cp311-cp311-win32.whl", hash = "sha256:ed3ea1351a5a2daf3dc000edb3e02b66c8a040c9e1fe20eddb4ce6f98e252be2", size = 4472422, upload-time = "2026-03-25T05:51:41.099Z" },
+    { url = "https://files.pythonhosted.org/packages/4a/74/9cf3ee61cc39476bc6d7be0c7891434460ccca78d410ab9f03ae7217ffd2/potpourri3d-1.4.0-cp311-cp311-win_amd64.whl", hash = "sha256:807c963db5ba38867c095e4711eeef80272f328241b4ffe6a790cf22c13e6445", size = 6136012, upload-time = "2026-03-25T05:51:42.673Z" },
+    { url = "https://files.pythonhosted.org/packages/38/2e/487d59d1be46ea9724534325c96ef172ed16aff610ace62d427758084404/potpourri3d-1.4.0-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:a448a72232ca43ffc392fd13408ad4f77a69b6c43578f82a4b3cef7bd012516d", size = 3542611, upload-time = "2026-03-25T05:51:44.16Z" },
+    { url = "https://files.pythonhosted.org/packages/35/b3/f53e111fa7fb194fe928d4dbdae97f67c301282863ca3e3fda93609e3c40/potpourri3d-1.4.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:f401f0da41b075a5206af276c3c24fe03114b142aaea8608be08ecfecd806dfc", size = 3147602, upload-time = "2026-03-25T05:51:45.919Z" },
+    { url = "https://files.pythonhosted.org/packages/10/fe/46ff1b577bdb1c3b536c406256a155e5f628b5caee1f99669dd54b1ebcd2/potpourri3d-1.4.0-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e84d78a1758a821b42fdf54304d1d14aa2609579600c1b26a03134dbc367a4bb", size = 3387591, upload-time = "2026-03-25T05:51:48.032Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/58/5500f7e6a5ec66b8df50d84cf908041c8fa0344b15a1ad705e2e56c8b8fd/potpourri3d-1.4.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:33310bd58527ff1e19d975d9ba53150b258a3886f32b4ab7fb250188acaba175", size = 3585869, upload-time = "2026-03-25T05:51:49.687Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/64/b7ac23e7a3c194df9e9eff3792fceaf9b289e2d9dfbcc691c631f25b3505/potpourri3d-1.4.0-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:15120a5b948a23b67613658db9dcbdaef71ce002c6b82dddfea313f0bef71180", size = 4639939, upload-time = "2026-03-25T05:51:51.292Z" },
+    { url = "https://files.pythonhosted.org/packages/60/d0/6d896897cd8a64949c8511ef37eedc9e593e1c339a6466a330619fd43c6d/potpourri3d-1.4.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:948bc691012d689871056dffed52c18b100654eac3fada092c37cf457278c0f9", size = 4787902, upload-time = "2026-03-25T05:51:52.816Z" },
+    { url = "https://files.pythonhosted.org/packages/7b/f1/e207cebd6ceb6cfdeee811076a6b9eeea4d10cb29025e79375196ad64982/potpourri3d-1.4.0-cp312-cp312-win32.whl", hash = "sha256:664334a2ad80db717adb338f766ea2cbbf1ae8933b34402edc94d74a7c41b1b5", size = 4473626, upload-time = "2026-03-25T05:51:54.187Z" },
+    { url = "https://files.pythonhosted.org/packages/01/a9/19d538c2d58b5834086e28b9f1962fbdb9412998d1c7ff51ad9b45ccf7b1/potpourri3d-1.4.0-cp312-cp312-win_amd64.whl", hash = "sha256:771c1795f2542c92789fadbd699d23d470948997cf3202846ec8a55d9a44f7a5", size = 6137810, upload-time = "2026-03-25T05:51:55.796Z" },
+    { url = "https://files.pythonhosted.org/packages/58/e6/b5299cc75fc5335b1e2cb61943bdb5bdb322be86b4703f967495ce0fa052/potpourri3d-1.4.0-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:84a2996dd78de8e9a58a572e8649fcc1b1d068989c987b721d8ce20657db5f2e", size = 3542705, upload-time = "2026-03-25T05:51:57.195Z" },
+    { url = "https://files.pythonhosted.org/packages/63/90/62691ec8ac8ba32eafd1e003170a68bb4bb436d96a14e1cea287e4a80c86/potpourri3d-1.4.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:c575f50fe3b146ac4954ce7dd5793a8f28acb94561dfca62952092a982ba5949", size = 3147726, upload-time = "2026-03-25T05:51:58.659Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/60/21a94518a95686bee922c5113d230be653238e9ee6985ef0eba9b251ccd9/potpourri3d-1.4.0-cp313-cp313-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0c24c4203a475a255d0731f8b45f530a49d9c577e865479ef4c55dbcb44f7ee4", size = 3387611, upload-time = "2026-03-25T05:52:00.039Z" },
+    { url = "https://files.pythonhosted.org/packages/28/fb/12afb909150af89dd199c9360fa759701cf97a682cb84c7c60a9fb7d8cf8/potpourri3d-1.4.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c09d55f65f92010ce8d745bbba7d18c034d539afb209de6f8e129f2c40424978", size = 3585538, upload-time = "2026-03-25T05:52:02.087Z" },
+    { url = "https://files.pythonhosted.org/packages/5d/61/50d601a2e7c4c9e768f2617dfbe54c6d320c3e5f9cf91fa0f5799e15abd8/potpourri3d-1.4.0-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:25defb1c9d205852e061c260999f35e8d86f9fc99022cf8d86070515685cb0e0", size = 4639773, upload-time = "2026-03-25T05:52:03.95Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/ec/cf8cd2b32a4bf030852a4b534192233500bf31860041f64be26e39997db1/potpourri3d-1.4.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:a245ff2212768a8764799078664ebf2f7e5f80c7b384650d2af2996d3fabb1e2", size = 4787781, upload-time = "2026-03-25T05:52:05.742Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/56/98bc09f6aa3cc2637046b09f3a9f92bc0f4f89a6b60786f05959e71a8783/potpourri3d-1.4.0-cp313-cp313-win32.whl", hash = "sha256:99ffee489c34d77af103e895241d2a34a4fc36c03fabe7462256885b71ff29fb", size = 4473719, upload-time = "2026-03-25T05:52:07.692Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/6e/3ca6cf54f907e2b9a73efa35b29f5fb5fbc5963f958fff8642b6413cd10c/potpourri3d-1.4.0-cp313-cp313-win_amd64.whl", hash = "sha256:a17ade63286b3a54f11458c504f48e97059af1a6c128afae88c87a0fa3de2d7e", size = 6137822, upload-time = "2026-03-25T05:52:09.653Z" },
+    { url = "https://files.pythonhosted.org/packages/d2/75/e482ad0cc361c6ba4cca005558ca6cc231bcfbb72127b46f090ed368773c/potpourri3d-1.4.0-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:a812d6dac19b6759ecec86f9f50d8fb81f9235d9ab481519e0fa681cd1715c0a", size = 3545267, upload-time = "2026-03-25T05:52:11.232Z" },
+    { url = "https://files.pythonhosted.org/packages/6b/ab/eece1e1847af56541d991ea9afa9d56a080247756bbb0e638d6f342c3b31/potpourri3d-1.4.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:44aab06ca9dc0a7c40204351ee130d00d89c200e52946caf58e32a3f517c7abd", size = 3148040, upload-time = "2026-03-25T05:52:12.752Z" },
+    { url = "https://files.pythonhosted.org/packages/2b/b9/e3cdce27d3dfc43e146bd2ac984749e8ed2c41180ebb01218ee78010a599/potpourri3d-1.4.0-cp314-cp314-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0844aac607ac9d17b1a949392a67b0901524d01af330d201428a42e2c48ee022", size = 3388360, upload-time = "2026-03-25T05:52:14.246Z" },
+    { url = "https://files.pythonhosted.org/packages/55/1b/b99e7c3b1289a39c9f9e8c6d659fa2ebadd5935153b6c612f64af231967d/potpourri3d-1.4.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:79805619ca9aaf0c2faa999b6fab9809a8ec50488bd02b38d8855563d9714171", size = 3585784, upload-time = "2026-03-25T05:52:15.676Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/99/1959528d4a48a7773adaad9e2d7557ec1c737d3ec1c276eed60406ea2e8f/potpourri3d-1.4.0-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:d6391ee9fe405e60322599df567930e8062e1a861667642f19060e1baf63586e", size = 4640603, upload-time = "2026-03-25T05:52:17.496Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/77/48b406d37d0b6810fb06903305b3f77c5983b85076173cb1b868b1ed7e0e/potpourri3d-1.4.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:0c466061ac34d9b6dd1e6b26290b99a26c18d4a76b1803e34ecf7146301522e1", size = 4788065, upload-time = "2026-03-25T05:52:19.064Z" },
+    { url = "https://files.pythonhosted.org/packages/a1/21/9b379ad0fa86e9fbe4c208fcd228ed01770df3b4825e942e3d56500bd476/potpourri3d-1.4.0-cp314-cp314-win32.whl", hash = "sha256:eaf9feb59feac3d79f4ba78a97e64d10f1975fd9267cda29ae4ca5e6526208e9", size = 4546780, upload-time = "2026-03-25T05:52:20.6Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/12/7fa0b11826304bc14edd84adf4ca7d62b8225b20d0d69e53c39b37c24e17/potpourri3d-1.4.0-cp314-cp314-win_amd64.whl", hash = "sha256:175ac38372d857f88b64f211834de9eb19b7c7258823c82568473dd0c7e7119d", size = 6259790, upload-time = "2026-03-25T05:52:22.48Z" },
+    { url = "https://files.pythonhosted.org/packages/1d/38/8c0b9233887c4b8fdd8b5a88ece711f95250532dfffe70819957c7017cea/potpourri3d-1.4.0-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:37c416d5b903ebf9fe41c7a8b19e1051bf244faabfffeeee5e78b094e3e86ce3", size = 3553756, upload-time = "2026-03-25T05:52:24.37Z" },
+    { url = "https://files.pythonhosted.org/packages/e7/61/f3da1db6e2a502a5577fb8cb14d32bea02d0a0ebd441a3094550b0f7c866/potpourri3d-1.4.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:040202b00acaddc474dbfbed04a7786f3366f2c94233ae31dc80381e8b23cebd", size = 3161572, upload-time = "2026-03-25T05:52:25.956Z" },
+    { url = "https://files.pythonhosted.org/packages/c0/29/4ca84d40842ec1eb2a03944628cc66fb010b5f1fdc8a702377773e39062e/potpourri3d-1.4.0-cp314-cp314t-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:493b0566e19e51a16c20189a6643d55525b7da85a3a02104e3a1860ebe539b4e", size = 3391295, upload-time = "2026-03-25T05:52:27.509Z" },
+    { url = "https://files.pythonhosted.org/packages/35/bb/78b6c615dc6655365077e43cd30673f28dbc064bc4c32437b545a03fbed8/potpourri3d-1.4.0-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5244afc1f66191c0048d4822586de007c8acb2616caf1bf71e488188a794024b", size = 3589125, upload-time = "2026-03-25T05:52:29.114Z" },
+    { url = "https://files.pythonhosted.org/packages/9c/04/669769db8de168c94b5a0b7a3b6d209c88768df4d01e885fbfc4d656e191/potpourri3d-1.4.0-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:48394a731d87cab21b007146cf14df9ee1fa050185eeaf04246586f58c7526c7", size = 4642350, upload-time = "2026-03-25T05:52:30.953Z" },
+    { url = "https://files.pythonhosted.org/packages/09/a6/8c379d3e47f68462d16dc4112378855f3324ab962eed9a907ad10de8b630/potpourri3d-1.4.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:51c18c6faf7587119eb589d10395b7d4132ceb0ca3ded7d0b27d3df4251e5268", size = 4791000, upload-time = "2026-03-25T05:52:32.523Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/1e/e895305f05d87129ce0ee3f6124f58d64270d59a4f42115a3045a47f2fe8/potpourri3d-1.4.0-cp314-cp314t-win32.whl", hash = "sha256:aaa02ed42a4295e9e32bdc1a043203b629337603111b9916c63e072405bc4d3b", size = 4558065, upload-time = "2026-03-25T05:52:34.071Z" },
+    { url = "https://files.pythonhosted.org/packages/84/57/b6f8f5aba4d2bd80588a094f65bd5f1ec7542d1ffd81fb6f9587cff9aa57/potpourri3d-1.4.0-cp314-cp314t-win_amd64.whl", hash = "sha256:792bbbd67af0d251345bb94ed436946e6344fb45db508e54034061060dcf628b", size = 6275645, upload-time = "2026-03-25T05:52:35.493Z" },
+]
+
+[[package]]
 name = "properdocs"
 version = "1.6.7"
 source = { registry = "https://pypi.org/simple" }
@@ -2530,6 +2582,7 @@ bench = [
     { name = "networkx" },
     { name = "numpy" },
     { name = "open3d" },
+    { name = "potpourri3d" },
     { name = "pymeshlab" },
     { name = "pytest" },
     { name = "pytest-benchmark" },
@@ -2563,6 +2616,7 @@ test = [
     { name = "networkx" },
     { name = "numpy" },
     { name = "open3d" },
+    { name = "potpourri3d" },
     { name = "pymeshlab" },
     { name = "pytest" },
     { name = "pyvista" },
@@ -2591,6 +2645,7 @@ bench = [
     { name = "networkx", specifier = ">=3.0" },
     { name = "numpy", specifier = ">=2.4.4" },
     { name = "open3d", specifier = ">=0.18" },
+    { name = "potpourri3d", specifier = ">=1.4" },
     { name = "pymeshlab", specifier = ">=2023.12" },
     { name = "pytest", specifier = ">=9.0" },
     { name = "pytest-benchmark", specifier = ">=5.1" },
@@ -2623,6 +2678,7 @@ test = [
     { name = "networkx", specifier = ">=3.0" },
     { name = "numpy", specifier = ">=2.4.4" },
     { name = "open3d", specifier = ">=0.18" },
+    { name = "potpourri3d", specifier = ">=1.4" },
     { name = "pymeshlab", specifier = ">=2023.12" },
     { name = "pytest", specifier = ">=9.0" },
     { name = "pyvista", specifier = ">=0.48" },

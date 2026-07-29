@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import igl
 import numpy as np
+import potpourri3d as pp3d
 import pytest
 import trimesh as tm
 import trimesh.smoothing as tms
@@ -113,7 +114,7 @@ def test_cotmatrix_entries_intrinsic(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="cotmatrix")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "potpourri3d")
 def test_cotmatrix(bench_case: BenchCase) -> None:
     """Assembled cotangent stiffness matrix: weight kernel plus the sparse build."""
     n_vertices = bench_case.n_vertices
@@ -121,6 +122,12 @@ def test_cotmatrix(bench_case: BenchCase) -> None:
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         matrix = bench_case.run(lambda: tw.laplacian.cotmatrix(vertices, faces))
         assert matrix.nrow == n_vertices
+    elif bench_case.kind == "potpourri3d":
+        # potpourri3d assembles this one in Python (vectorized numpy into a scipy COO), not in
+        # geometry-central, so this row measures a numpy + scipy build rather than C++.
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        matrix_pp = bench_case.run(lambda: pp3d.cotan_laplacian(vertices_np, faces_np))
+        assert matrix_pp.shape == (n_vertices, n_vertices)
     else:
         vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
         matrix_igl = bench_case.run(lambda: igl.cotmatrix(vertices_np, faces_np))
@@ -176,7 +183,7 @@ def test_uniform_laplacian(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="mass_matrix_entries")
 @pytest.mark.benchaxis("valence")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "potpourri3d")
 def test_mass_matrix_entries(bench_case: BenchCase) -> None:
     """Barycentric lumped mass per vertex: a scatter-add, so on the valence axis for contention."""
     n_vertices = bench_case.n_vertices
@@ -184,6 +191,12 @@ def test_mass_matrix_entries(bench_case: BenchCase) -> None:
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         mass = bench_case.run(lambda: tw.laplacian.mass_matrix_entries(vertices, faces))
         assert mass.shape == (n_vertices,)
+    elif bench_case.kind == "potpourri3d":
+        # ``vertex_areas`` is one third of the incident face areas, i.e. exactly this diagonal;
+        # it scatters with ``np.bincount`` per corner rather than atomics.
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        mass_pp = bench_case.run(lambda: pp3d.vertex_areas(vertices_np, faces_np))
+        assert mass_pp.shape == (n_vertices,)
     else:
         vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
         mass_igl = bench_case.run(

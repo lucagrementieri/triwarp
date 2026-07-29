@@ -42,6 +42,7 @@ test = [
     "meshlib>=3.1.3.249",
     "open3d>=0.18",
     "pymeshlab>=2023.12",
+    "potpourri3d>=1.4",
 ]
 
 

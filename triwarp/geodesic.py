@@ -10,12 +10,119 @@ import warp.sparse as wps
 
 import triwarp as tw
 from triwarp.edges import mean_edge_length
+from triwarp.intrinsic import mollify_intrinsic
 from triwarp.kernels import geodesic as kernel_geodesic
 from triwarp.kernels.algorithms import bfs as kernel_bfs
-from triwarp.laplacian import cotmatrix, cotmatrix_entries, mass_matrix_entries
+from triwarp.laplacian import (
+    cotmatrix,
+    cotmatrix_entries,
+    cotmatrix_entries_intrinsic,
+    mass_matrix_entries,
+)
 from triwarp.triangles import face_normals_and_areas
 
 _CG_TOLERANCE = 1e-8
+
+
+HeatOperators = tuple[
+    wps.BsrMatrix[wp.float64],
+    wps.BsrMatrix[wp.float64],
+    wp.array[wp.float32],
+    wp.array[wp.vec3],
+    wp.array[wp.float32],
+]
+"""What [`heat_operators`][triwarp.geodesic.heat_operators] returns for the heat method's solves."""
+
+
+def heat_operators(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    t: float | None = None,
+    *,
+    use_robust: bool = False,
+) -> HeatOperators:
+    """
+    Assemble everything [`heat_geodesic`][triwarp.geodesic.heat_geodesic] needs before its solves.
+
+    Every quantity here depends on the mesh alone, not on the source set, so a caller computing
+    distance from many different sources on one mesh can build these once and pass them back through
+    ``heat_geodesic(..., operators=...)``. That is the split
+    ``potpourri3d.MeshHeatMethodDistanceSolver`` and ``igl::heat_geodesics`` expose as a stateful
+    solver object; here it stays a plain tuple of buffers.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    t
+        Diffusion time. When ``None``, defaults to the squared mean edge length (the
+        ``igl::heat_geodesics`` default).
+    use_robust
+        Build the Laplacian from *mollified* edge lengths
+        ([`mollify_intrinsic`][triwarp.intrinsic.mollify_intrinsic]) instead of straight from vertex
+        positions. Costs one extra pass and two host readbacks, and is what lets the method run on a
+        mesh with degenerate triangles at all. It leaves a clean mesh's operator unchanged.
+
+        This is mollification **only**, not the intrinsic Delaunay retriangulation that
+        [`robust_laplacian`][triwarp.intrinsic.robust_laplacian] also does by default (and that
+        ``potpourri3d``'s identically-named flag includes). The reason is structural rather than a
+        shortcut: flipping changes which faces exist, and the gradient and divergence stages below
+        integrate over faces. Swapping in an operator built on a different triangulation while those
+        stages still use the original one is not a cheap approximation, it is inconsistent — so a
+        fully intrinsic heat method needs intrinsic *mass*, *gradient* and *divergence* as well. Use
+        [`robust_laplacian`][triwarp.intrinsic.robust_laplacian] directly where only the operator
+        matters (smoothing, parametrization, spectral work).
+
+    Returns
+    -------
+    heat_system : warp.sparse.BsrMatrix
+        ``M - t * L`` in ``float64``, the heat-diffusion system.
+    laplacian : warp.sparse.BsrMatrix
+        The ``float64`` cotangent stiffness matrix ``L`` (igl sign convention, so ``-L`` is positive
+        semi-definite), reused for the Poisson stage.
+    cot_entries : wp.array[wp.float32]
+        Per-face half-cotangent weights, reused by the divergence.
+    face_normals : wp.array[wp.vec3]
+        One unit normal per face.
+    face_areas : wp.array[wp.float32]
+        One area per face.
+
+    See Also
+    --------
+    [`heat_geodesic`][triwarp.geodesic.heat_geodesic]
+    [`cotmatrix`][triwarp.laplacian.cotmatrix]
+    [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries]
+    """
+    if t is None:
+        h = mean_edge_length(vertices, faces)
+        t = h * h
+
+    # Per-face half-cotangent weights (float32, O(1) and safe) reused for both the Laplacian and
+    # the divergence. The cotangent stiffness follows the igl convention (negative diagonal, so
+    # ``-L`` is positive semi-definite) but is assembled here in float64.
+    if use_robust:
+        # Mollified lengths: one global constant added to every edge so no triangle is degenerate.
+        # The gradient and divergence stages below still use the extrinsic positions, so this makes
+        # the *solves* robust rather than turning the whole method intrinsic.
+        lengths, _ = mollify_intrinsic(vertices, faces)
+        cot_entries = cotmatrix_entries_intrinsic(lengths)
+    else:
+        cot_entries = cotmatrix_entries(vertices, faces)
+    # ``cotmatrix`` casts the shared float32 half-cotangent weights to float64 and assembles the
+    # operator natively in a single build (see issue_report.md).
+    laplacian = cotmatrix(vertices, faces, cot_entries=cot_entries, dtype=wp.float64)
+
+    # Face normals / areas (float32) for the gradient; the lumped mass is built natively in float64
+    # by ``mass_matrix_entries``.
+    normals, areas = face_normals_and_areas(vertices, faces)
+    mass = mass_matrix_entries(vertices, faces, dtype=wp.float64)
+
+    # Heat system (M - t L). ``bsr_axpy`` overwrites the mass matrix in place (no longer needed).
+    mass_diag = wps.bsr_diag(diag=mass)
+    heat_system = wps.bsr_axpy(x=laplacian, y=mass_diag, alpha=-float(t), beta=1.0)
+    return heat_system, laplacian, cot_entries, normals, areas
 
 
 def heat_geodesic(
@@ -23,6 +130,9 @@ def heat_geodesic(
     faces: wp.array[wp.int32],
     sources: wp.array[wp.int32],
     t: float | None = None,
+    operators: HeatOperators | None = None,
+    *,
+    use_robust: bool = False,
 ) -> wp.array[wp.float64]:
     """
     Approximate geodesic distance to the nearest source vertex (Crane et al. heat method).
@@ -48,7 +158,18 @@ def heat_geodesic(
         the nearest source and is zero at the source set.
     t
         Diffusion time. When ``None``, defaults to the squared mean edge length (the
-        ``igl::heat_geodesics`` default), which balances accuracy and smoothing.
+        ``igl::heat_geodesics`` default), which balances accuracy and smoothing. Ignored when
+        ``operators`` is given, which already fixes it.
+    operators
+        Optional precomputed [`heat_operators`][triwarp.geodesic.heat_operators] for this mesh. They
+        depend on the mesh only, so passing them back skips the assembly on every solve after the
+        first — worth it when computing distance from many different source sets.
+    use_robust
+        Forwarded to [`heat_operators`][triwarp.geodesic.heat_operators]: build the Laplacian from
+        mollified edge lengths, which is what makes the solves survive degenerate triangles. Ignored
+        when ``operators`` is supplied. ``potpourri3d.MeshHeatMethodDistanceSolver`` has the same
+        flag and defaults it to ``True``; this defaults to ``False`` so the plain call stays exactly
+        ``igl::heat_geodesics``.
 
     Returns
     -------
@@ -65,8 +186,10 @@ def heat_geodesic(
 
     See Also
     --------
+    [`heat_operators`][triwarp.geodesic.heat_operators]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
     [`mean_edge_length`][triwarp.edges.mean_edge_length]
+    [`marching_triangles`][triwarp.contour.marching_triangles]
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
@@ -83,25 +206,11 @@ def heat_geodesic(
             "device in Warp 1.14-1.15."
         )
 
-    if t is None:
-        h = mean_edge_length(vertices, faces)
-        t = h * h
+    if operators is None:
+        operators = heat_operators(vertices, faces, t, use_robust=use_robust)
+    heat_system, laplacian, cot_entries, normals, areas = operators
 
-    # Per-face half-cotangent weights (float32, O(1) and safe) reused for both the Laplacian and
-    # the divergence. The cotangent stiffness follows the igl convention (negative diagonal, so
-    # ``-L`` is positive semi-definite) but is assembled here in float64.
-    cot_entries = cotmatrix_entries(vertices, faces)
-    # ``cotmatrix`` casts the shared float32 half-cotangent weights to float64 and assembles the
-    # operator natively in a single build (see issue_report.md).
-    laplacian = cotmatrix(vertices, faces, cot_entries=cot_entries, dtype=wp.float64)
-
-    # Face normals / areas (float32) for the gradient below; the lumped mass is built natively in
-    # float64 by ``mass_matrix_entries``.
-    normals, areas = face_normals_and_areas(vertices, faces)
-    mass = mass_matrix_entries(vertices, faces, dtype=wp.float64)
-
-    # Heat solve: (M - t L) u = u0, with u0 the source indicator. ``bsr_axpy`` overwrites the mass
-    # matrix in place (no longer needed) to form the system.
+    # Heat solve: (M - t L) u = u0, with u0 the source indicator.
     u0 = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     wp.launch(
         kernel_geodesic.seed_source_indicator,
@@ -109,8 +218,6 @@ def heat_geodesic(
         inputs=[sources, u0],
         device=device,
     )
-    mass_diag = wps.bsr_diag(diag=mass)
-    heat_system = wps.bsr_axpy(x=laplacian, y=mass_diag, alpha=-float(t), beta=1.0)
 
     heat = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     wpl.cg(
