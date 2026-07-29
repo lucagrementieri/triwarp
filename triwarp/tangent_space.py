@@ -10,13 +10,13 @@ around the vertex.
 
 Three quantities, in the order they build on each other:
 
-1. [`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames] — an extrinsic
+1. [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames] — an extrinsic
    ``(basis_x, basis_y, normal)`` triple per vertex, for moving between 2D tangent coordinates and
    3D. This is what ``potpourri3d.MeshVectorHeatSolver.get_tangent_frames`` returns.
-2. [`halfedge_tangent_angles`][triwarp.tangent.halfedge_tangent_angles] — the polar angle of each
-   outgoing halfedge, measured from that vertex's ``basis_x``.
-3. [`halfedge_transport_angles`][triwarp.tangent.halfedge_transport_angles] — the rotation that
-   carries a tangent vector across an edge, the off-diagonal phase of the connection Laplacian.
+2. [`halfedge_tangent_angles`][triwarp.tangent_space.halfedge_tangent_angles] — the polar angle of
+   each outgoing halfedge, measured from that vertex's ``basis_x``.
+3. [`halfedge_transport_angles`][triwarp.tangent_space.halfedge_transport_angles] — the rotation
+   that carries a tangent vector across an edge, the off-diagonal phase of the connection Laplacian.
 
 Frames are only defined up to a rotation within the tangent plane, so they are *not* comparable
 across libraries element-wise; the transport angles inherit that gauge freedom and are comparable
@@ -30,7 +30,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.halfedge import halfedge_twins, vertex_one_rings
-from triwarp.kernels import tangent as kernel_tangent
+from triwarp.kernels import tangent_space as kernel_tangent_space
 
 
 def vertex_tangent_frames(
@@ -49,11 +49,11 @@ def vertex_tangent_frames(
     tangent vector ``(a, b)`` in these coordinates is ``a * basis_x + b * basis_y`` in world space.
 
     Because ``basis_x`` follows the ring's first halfedge, it is the direction that
-    [`halfedge_tangent_angles`][triwarp.tangent.halfedge_tangent_angles] assigns polar angle ``0``:
-    the two functions describe one coordinate system, not two. Which halfedge that is depends on the
-    face ordering, so a frame agrees with another library's only up to a rotation about the normal.
-    A vertex with no incident faces has no tangent plane; it gets the fixed frame
-    ``((1, 0, 0), (0, 1, 0))`` so that downstream normalizations see unit vectors rather than NaN.
+    [`halfedge_tangent_angles`][triwarp.tangent_space.halfedge_tangent_angles] assigns polar angle
+    ``0``: the two functions describe one coordinate system, not two. Which halfedge that is depends
+    on the face ordering, so a frame agrees with another library's only up to a rotation about the
+    normal. A vertex with no incident faces has no tangent plane; it gets the fixed frame ``((1, 0,
+    0), (0, 1, 0))`` so that downstream normalizations see unit vectors rather than NaN.
 
     Parameters
     ----------
@@ -76,7 +76,7 @@ def vertex_tangent_frames(
 
     See Also
     --------
-    [`halfedge_tangent_angles`][triwarp.tangent.halfedge_tangent_angles]
+    [`halfedge_tangent_angles`][triwarp.tangent_space.halfedge_tangent_angles]
     [`angle_weighted_vertex_normals`][triwarp.vertices.angle_weighted_vertex_normals]
     [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings]
     """
@@ -94,7 +94,7 @@ def vertex_tangent_frames(
     ring_offsets, ring_halfedges, _ = rings
 
     wp.launch(
-        kernel_tangent.vertex_tangent_frames,
+        kernel_tangent_space.vertex_tangent_frames,
         dim=n,
         inputs=[vertices, faces, normals, ring_offsets, ring_halfedges, basis_x, basis_y],
         device=device,
@@ -116,7 +116,7 @@ def halfedge_tangent_angles(
     ``s = 2 * pi / Theta`` scales the total angle ``Theta`` to a full turn — ``s = pi / Theta`` at a
     boundary vertex, whose fan covers a half-disk. The first halfedge of each ring therefore has
     angle ``0``, aligning this coordinate system with ``basis_x`` from
-    [`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames].
+    [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames].
 
     Parameters
     ----------
@@ -138,8 +138,8 @@ def halfedge_tangent_angles(
 
     See Also
     --------
-    [`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames]
-    [`halfedge_transport_angles`][triwarp.tangent.halfedge_transport_angles]
+    [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames]
+    [`halfedge_transport_angles`][triwarp.tangent_space.halfedge_transport_angles]
     [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings]
     """
     device = vertices.device
@@ -156,7 +156,7 @@ def halfedge_tangent_angles(
     ring_offsets, ring_halfedges, is_boundary = rings
 
     wp.launch(
-        kernel_tangent.halfedge_tangent_angles,
+        kernel_tangent_space.halfedge_tangent_angles,
         dim=n,
         inputs=[face_angles, ring_offsets, ring_halfedges, is_boundary, angles],
         device=device,
@@ -175,10 +175,10 @@ def halfedge_transport_angles(
 
     For halfedge ``h`` from ``i`` to ``j``, a vector expressed in ``i``'s tangent basis is expressed
     in ``j``'s by rotating it through ``rho = theta_ji + pi - theta_ij``, where ``theta`` are the
-    [`halfedge_tangent_angles`][triwarp.tangent.halfedge_tangent_angles] of the halfedge and its
-    twin: the two vertices see the shared edge along directions that differ by ``pi``, and the rest
-    is the mismatch between their reference directions. These are the off-diagonal phases of the
-    connection Laplacian, ``-w_ij * exp(i * rho_ij)``.
+    [`halfedge_tangent_angles`][triwarp.tangent_space.halfedge_tangent_angles] of the halfedge and
+    its twin: the two vertices see the shared edge along directions that differ by ``pi``, and the
+    rest is the mismatch between their reference directions. These are the off-diagonal phases of
+    the connection Laplacian, ``-w_ij * exp(i * rho_ij)``.
 
     A boundary edge exists as a halfedge in one direction only. At its destination vertex it is the
     fan-closing edge, whose rescaled polar angle is ``pi``, and that value stands in for the missing
@@ -199,7 +199,7 @@ def halfedge_transport_angles(
         computed here.
     tangent_angles
         Optional precomputed
-        [`halfedge_tangent_angles`][triwarp.tangent.halfedge_tangent_angles]. When ``None``,
+        [`halfedge_tangent_angles`][triwarp.tangent_space.halfedge_tangent_angles]. When ``None``,
         computed here.
 
     Returns
@@ -209,8 +209,8 @@ def halfedge_transport_angles(
 
     See Also
     --------
-    [`halfedge_tangent_angles`][triwarp.tangent.halfedge_tangent_angles]
-    [`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames]
+    [`halfedge_tangent_angles`][triwarp.tangent_space.halfedge_tangent_angles]
+    [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames]
     """
     device = vertices.device
     n_halfedges = int(faces.shape[0]) // 3 * 3
@@ -226,7 +226,7 @@ def halfedge_transport_angles(
         tangent_angles = halfedge_tangent_angles(vertices, faces, rings=rings)
 
     wp.launch(
-        kernel_tangent.halfedge_transport_angles,
+        kernel_tangent_space.halfedge_transport_angles,
         dim=n_halfedges,
         inputs=[twins, tangent_angles, rho],
         device=device,

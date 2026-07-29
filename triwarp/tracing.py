@@ -51,11 +51,11 @@ def trace_geodesic_from_vertex(
     That is ``potpourri3d.GeodesicTracer``'s convention too.
 
     Which incident face the ray starts in is decided in the vertex's *flattened* tangent space
-    ([`halfedge_tangent_angles`][triwarp.tangent.halfedge_tangent_angles]): rescaling the incident
-    corner angles to a full turn makes the fan a disk, so every tangent direction lands in exactly
-    one wedge, including directions a naive per-face projection would place outside all of them.
-    At a boundary vertex the fan spans only half a disk, and a direction outside it — pointing off
-    the surface — traces nothing.
+    ([`halfedge_tangent_angles`][triwarp.tangent_space.halfedge_tangent_angles]): rescaling the
+    incident corner angles to a full turn makes the fan a disk, so every tangent direction lands in
+    exactly one wedge, including directions a naive per-face projection would place outside all of
+    them. At a boundary vertex the fan spans only half a disk, and a direction outside it — pointing
+    off the surface — traces nothing.
 
     A walk stops early when it reaches the mesh boundary or exceeds ``max_steps`` edge crossings.
 
@@ -75,8 +75,9 @@ def trace_geodesic_from_vertex(
         Optional precomputed [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings], used to find
         each ray's starting face.
     frames
-        Optional precomputed [`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames]. They
-        define each vertex's tangent plane, which sets both the trace length and the starting wedge.
+        Optional precomputed [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames].
+        They define each vertex's tangent plane, which sets both the trace length and the starting
+        wedge.
     max_steps
         Maximum edge crossings per ray.
 
@@ -108,7 +109,7 @@ def trace_geodesic_from_vertex(
         rings = vertex_one_rings(faces, twins=twins, n_vertices=n_vertices)
     ring_offsets, ring_halfedges, is_boundary = rings
     if frames is None:
-        frames = tw.tangent.vertex_tangent_frames(vertices, faces, rings=rings)
+        frames = tw.tangent_space.vertex_tangent_frames(vertices, faces, rings=rings)
     basis_x, basis_y, normals = frames
 
     inputs = [

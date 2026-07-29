@@ -54,7 +54,7 @@ def test_trace_from_vertex_walks_the_requested_distance(
 ) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     start_np, directions_np = _rays(mesh_tm, 24, seed=0)
-    frames_wp = tw.tangent.vertex_tangent_frames(mesh_wp.points, mesh_wp.indices)
+    frames_wp = tw.tangent_space.vertex_tangent_frames(mesh_wp.points, mesh_wp.indices)
     points_wp, offsets_wp = tw.tracing.trace_geodesic_from_vertex(
         mesh_wp.points,
         mesh_wp.indices,

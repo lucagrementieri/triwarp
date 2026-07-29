@@ -25,7 +25,7 @@ SECTIONS: dict[str, list[str]] = {
         "boundary",
         "adjacency",
         "halfedge",
-        "tangent",
+        "tangent_space",
         "homology",
         "validation",
         "selection",

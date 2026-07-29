@@ -1,5 +1,5 @@
 """
-Benchmarks for ``triwarp.tangent``: vertex tangent frames, halfedge polar angles and transport.
+Benchmarks for ``triwarp.tangent_space``: frames, polar angles and transport.
 
 Three groups over two axes:
 
@@ -58,7 +58,7 @@ def test_vertex_tangent_frames(bench_case: BenchCase) -> None:
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         basis_x, _, _ = bench_case.run(
-            lambda: tw.tangent.vertex_tangent_frames(vertices, faces), rounds=_ROUNDS
+            lambda: tw.tangent_space.vertex_tangent_frames(vertices, faces), rounds=_ROUNDS
         )
         assert basis_x.shape == (n_vertices,)
     else:
@@ -80,7 +80,7 @@ def test_vertex_tangent_frames(bench_case: BenchCase) -> None:
 def test_halfedge_tangent_angles(bench_case: BenchCase) -> None:
     """Two serial ring walks per vertex: the valence-sensitive group of this module."""
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-    angles = bench_case.run(lambda: tw.tangent.halfedge_tangent_angles(vertices, faces))
+    angles = bench_case.run(lambda: tw.tangent_space.halfedge_tangent_angles(vertices, faces))
     assert angles.shape == (faces.shape[0],)
 
 
@@ -93,9 +93,9 @@ def test_halfedge_transport_angles(bench_case: BenchCase) -> None:
     n_vertices = bench_case.n_vertices
     twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
     rings = tw.halfedge.vertex_one_rings(faces, twins=twins, n_vertices=n_vertices)
-    angles = tw.tangent.halfedge_tangent_angles(vertices, faces, rings=rings)
+    angles = tw.tangent_space.halfedge_tangent_angles(vertices, faces, rings=rings)
     rho = bench_case.run(
-        lambda: tw.tangent.halfedge_transport_angles(
+        lambda: tw.tangent_space.halfedge_transport_angles(
             vertices, faces, twins=twins, tangent_angles=angles
         )
     )

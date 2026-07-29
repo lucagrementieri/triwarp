@@ -9,7 +9,7 @@ edge measure directions from different reference directions and a difference bet
 something after transporting one into the other's frame.
 
 Every function here returns tangent vectors as ``wp.vec2`` in each vertex's own frame from
-[`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames]. Use
+[`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames]. Use
 [`tangent_to_world`][triwarp.heat.vector.tangent_to_world] to get 3D vectors — and note that
 comparing 2D components against another library's is meaningless, since each library picks its own
 reference direction per vertex.
@@ -28,7 +28,7 @@ import triwarp as tw
 from triwarp.heat.distance import HeatOperators, heat_geodesic, heat_operators
 from triwarp.kernels.heat import vector as kernel_heat_vector
 from triwarp.laplacian import connection_laplacian, mass_matrix_entries
-from triwarp.tangent import vertex_tangent_frames
+from triwarp.tangent_space import vertex_tangent_frames
 
 _CG_TOLERANCE = 1e-8
 
@@ -57,8 +57,8 @@ def vector_heat_operators(
        vectors ([`connection_laplacian`][triwarp.laplacian.connection_laplacian]);
     2. the scalar [`heat_operators`][triwarp.heat.distance.heat_operators], for the magnitude
        extension and the distance field the log map needs;
-    3. the [`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames] every 2D component is
-       measured in.
+    3. the [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames] every 2D component
+       is measured in.
 
     Pass the result back through any solver's ``operators=`` argument to skip the assembly — most of
     the cost on a coarse mesh, and all of it when the solve converges quickly. That is the split
@@ -225,7 +225,7 @@ def transport_tangent_vectors(
     wp.array[wp.vec2]
         ``(n_vertices,)`` transported vectors, each in that vertex's own frame. No frames need to be
         passed in: the components come out in the canonical frames of
-        [`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames] by construction (see
+        [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames] by construction (see
         [`connection_laplacian`][triwarp.laplacian.connection_laplacian]).
 
     Raises
@@ -402,7 +402,7 @@ def tangent_to_world(
         ``(n_vertices,)`` tangent vectors in each vertex's frame.
     basis_x, basis_y
         The frames those components refer to, from
-        [`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames].
+        [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames].
 
     Returns
     -------
@@ -411,7 +411,7 @@ def tangent_to_world(
 
     See Also
     --------
-    [`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames]
+    [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames]
     """
     world = wp.empty(int(tangent.shape[0]), dtype=wp.vec3, device=tangent.device)
     wp.map(kernel_heat_vector.tangent_to_world, tangent, basis_x, basis_y, out=world)

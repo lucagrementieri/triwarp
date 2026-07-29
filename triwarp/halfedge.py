@@ -8,9 +8,9 @@ face are consecutive. Exactly two arrays are needed to navigate a mesh:
 [`halfedge_twins`][triwarp.halfedge.halfedge_twins] to cross an edge, and
 [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings] to rotate around a vertex.
 
-This is the ordering the tangent-space machinery in [`triwarp.tangent`][triwarp.tangent] is built
-on: a rotational order of the outgoing halfedges at a vertex is what turns per-corner angles into a
-polar coordinate system on the tangent plane.
+This is the ordering the tangent-space machinery in [`triwarp.tangent_space`][triwarp.tangent_space]
+is built on: a rotational order of the outgoing halfedges at a vertex is what turns per-corner
+angles into a polar coordinate system on the tangent plane.
 """
 
 from __future__ import annotations
@@ -145,7 +145,7 @@ def vertex_one_rings(
     See Also
     --------
     [`halfedge_twins`][triwarp.halfedge.halfedge_twins]
-    [`halfedge_tangent_angles`][triwarp.tangent.halfedge_tangent_angles]
+    [`halfedge_tangent_angles`][triwarp.tangent_space.halfedge_tangent_angles]
     """
     device = faces.device
     n_halfedges = int(faces.shape[0]) // 3 * 3

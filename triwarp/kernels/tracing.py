@@ -2,7 +2,7 @@ import warp as wp
 
 from triwarp.constants import PI, TOLERANCE_ZERO_CONSTANT, TWO_PI
 from triwarp.kernels.halfedge import halfedge_destination
-from triwarp.kernels.tangent import corner_angle
+from triwarp.kernels.tangent_space import corner_angle
 
 
 @wp.func

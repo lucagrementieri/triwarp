@@ -22,9 +22,9 @@ All three run in ``float64`` and require CUDA: the diffused field decays exponen
 underflows ``float32``, and ``warp.optim.linear.cg`` returns NaN on the CPU backend.
 
 The operators these solvers assemble are **not** here — the cotangent and connection Laplacians live
-in [`triwarp.laplacian`][triwarp.laplacian], tangent frames in [`triwarp.tangent`][triwarp.tangent],
-and the batched conjugate-gradient machinery in [`triwarp.linalg`][triwarp.linalg]. This package is
-the three algorithms only.
+in [`triwarp.laplacian`][triwarp.laplacian], tangent frames in
+[`triwarp.tangent_space`][triwarp.tangent_space], and the batched conjugate-gradient machinery in
+[`triwarp.linalg`][triwarp.linalg]. This package is the three algorithms only.
 """
 
 from . import distance, signed, vector

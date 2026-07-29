@@ -38,7 +38,8 @@ def _solver_pp(mesh_tm: object) -> pp3d.MeshVectorHeatSolver:
 
 def _frames(mesh_wp: wp.Mesh) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return tuple(  # type: ignore[return-value]
-        basis.numpy() for basis in tw.tangent.vertex_tangent_frames(mesh_wp.points, mesh_wp.indices)
+        basis.numpy()
+        for basis in tw.tangent_space.vertex_tangent_frames(mesh_wp.points, mesh_wp.indices)
     )
 
 
@@ -131,7 +132,7 @@ def test_transport_on_a_flat_patch_is_constant(device: str) -> None:
         wp.array(np.array([[1.0, 0.0]], dtype=np.float32), dtype=wp.vec2, device=device),
     )
     basis_x, basis_y, _ = (
-        basis.numpy() for basis in tw.tangent.vertex_tangent_frames(vertices_wp, faces_wp)
+        basis.numpy() for basis in tw.tangent_space.vertex_tangent_frames(vertices_wp, faces_wp)
     )
     world = _to_world(transported.numpy(), basis_x, basis_y)
     world /= np.linalg.norm(world, axis=1, keepdims=True)
@@ -370,7 +371,9 @@ def test_tangent_to_world_reproduces_the_frames(
     icosahedron: tuple[object, wp.Mesh], device: str
 ) -> None:
     _, mesh_wp = icosahedron
-    basis_x_wp, basis_y_wp, _ = tw.tangent.vertex_tangent_frames(mesh_wp.points, mesh_wp.indices)
+    basis_x_wp, basis_y_wp, _ = tw.tangent_space.vertex_tangent_frames(
+        mesh_wp.points, mesh_wp.indices
+    )
     n_vertices = int(mesh_wp.points.shape[0])
     tangent = wp.array(
         np.tile(np.array([[0.0, 1.0]], dtype=np.float32), (n_vertices, 1)),

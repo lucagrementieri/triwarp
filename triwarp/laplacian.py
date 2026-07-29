@@ -7,7 +7,7 @@ import triwarp.typing as twt
 from triwarp.edges import edges_unique, faces_to_edges
 from triwarp.kernels import laplacian as kernel_laplacian
 from triwarp.kernels import scatter as kernel_scatter
-from triwarp.tangent import halfedge_transport_angles
+from triwarp.tangent_space import halfedge_transport_angles
 from triwarp.triangles import face_normals_and_areas
 
 
@@ -187,7 +187,7 @@ def connection_laplacian(
     Same cotangent weights and same sparsity as [`cotmatrix`][triwarp.laplacian.cotmatrix], but each
     scalar becomes a ``2 x 2`` block and each off-diagonal weight is multiplied by the rotation that
     re-expresses a tangent vector in the neighbouring vertex's frame
-    ([`halfedge_transport_angles`][triwarp.tangent.halfedge_transport_angles]). Without those
+    ([`halfedge_transport_angles`][triwarp.tangent_space.halfedge_transport_angles]). Without those
     rotations a difference between vectors at two vertices would subtract components measured from
     two unrelated reference directions.
 
@@ -206,12 +206,12 @@ def connection_laplacian(
         [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries].
     transport_angles
         Optional precomputed per-halfedge
-        [`halfedge_transport_angles`][triwarp.tangent.halfedge_transport_angles].
+        [`halfedge_transport_angles`][triwarp.tangent_space.halfedge_transport_angles].
 
         There is deliberately no ``frames`` argument. The gauge is fixed by the one-ring
         flattening — angles are measured from each vertex's first outgoing halfedge, the same
-        convention [`vertex_tangent_frames`][triwarp.tangent.vertex_tangent_frames] uses to pick
-        ``basis_x`` — so a caller-supplied frame cannot change these angles, and solutions are
+        convention [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames] uses to
+        pick ``basis_x`` — so a caller-supplied frame cannot change these angles, and solutions are
         already consistent with the frames that convention produces.
 
     Returns
@@ -222,7 +222,7 @@ def connection_laplacian(
     See Also
     --------
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
-    [`halfedge_transport_angles`][triwarp.tangent.halfedge_transport_angles]
+    [`halfedge_transport_angles`][triwarp.tangent_space.halfedge_transport_angles]
     [`transport_tangent_vectors`][triwarp.heat.vector.transport_tangent_vectors]
     """
     n_vertices = int(vertices.shape[0])
