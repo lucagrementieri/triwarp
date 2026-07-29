@@ -271,6 +271,81 @@ def assemble_interior_system(
     return q_uu, twt.as_array2d_float(rhs, dtype=wp.float64)
 
 
+def solve_spd(
+    matrix: wps.BsrMatrix,
+    rhs: wp.array,
+    solution: wp.array,
+    *,
+    tol: float = CG_TOLERANCE,
+    maxiter: int | None = None,
+    check_every: int = CG_CHECK_EVERY_FALLBACK,
+) -> tuple[int, float, float]:
+    """
+    Solve one symmetric positive-definite system by preconditioned conjugate gradient.
+
+    The single-right-hand-side form of
+    [`solve_spd_columns`][triwarp.linalg.solve_spd_columns], and deliberately dtype-agnostic: it
+    carries scalar ``float64`` systems as well as the ``wp.mat22d``-block operators the
+    tangent-field solvers build, whose right-hand side is an array of ``wp.vec2d``. ``solution`` is
+    the initial guess and is overwritten in place, so warm starting is free.
+
+    This exists so the Jacobi preconditioner and the iteration cap are decided in one place rather
+    than re-derived at every call site.
+
+    !!! note "``check_every`` defaults to the host-side cadence here"
+        Unlike [`solve_spd_columns`][triwarp.linalg.solve_spd_columns], which defaults to
+        [`CG_CHECK_EVERY`][triwarp.linalg.CG_CHECK_EVERY] (the device-side test), this defaults to
+        [`CG_CHECK_EVERY_FALLBACK`][triwarp.linalg.CG_CHECK_EVERY_FALLBACK] — Warp's own default —
+        so the return values stay host scalars. The device-side check trades a host readback for a
+        conditional-graph loop, which only pays off when the solve runs long enough to amortize it;
+        the short solves that call this (tens of iterations) measured slower with it. Pass
+        ``check_every=0`` where a solve is known to be long.
+
+    Parameters
+    ----------
+    matrix
+        Symmetric positive-(semi-)definite operator. Scalar or block dtype.
+    rhs
+        Right-hand side, with as many rows as ``matrix``.
+    solution
+        Initial guess, overwritten with the result. Same shape and dtype as ``rhs``.
+    tol
+        Relative residual tolerance.
+    maxiter
+        Iteration cap. When ``None``, uses
+        [`CG_MAXITER_FACTOR`][triwarp.linalg.CG_MAXITER_FACTOR] times the number of rows.
+    check_every
+        Residual-test cadence; ``0`` tests on device every iteration and returns device arrays.
+
+    Returns
+    -------
+    tuple[int, float, float]
+        Whatever ``warp.optim.linear.cg`` returns: iteration count, residual and tolerance. Device
+        1-element arrays instead of host scalars when ``check_every=0``.
+
+    Raises
+    ------
+    NotImplementedError
+        On a CPU device: ``warp.optim.linear.cg`` produces ``NaN`` there in Warp 1.14-1.15.
+
+    See Also
+    --------
+    [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]
+    [`spd_column_solver`][triwarp.linalg.spd_column_solver]
+    """
+    require_cuda(rhs.device, "solve_spd")
+    n_rows = int(rhs.shape[0])
+    return wpl.cg(
+        matrix,
+        rhs,
+        solution,
+        tol=tol,
+        maxiter=CG_MAXITER_FACTOR * n_rows if maxiter is None else maxiter,
+        M=wpl.preconditioner(matrix, "diag"),
+        check_every=_supported_check_every(check_every),
+    )
+
+
 def solve_spd_columns(
     matrix: wps.BsrMatrix[wp.float64],
     rhs: twt.Array2dFloat,

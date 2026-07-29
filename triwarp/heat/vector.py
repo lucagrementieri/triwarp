@@ -21,10 +21,11 @@ All three solvers need conjugate gradient and are therefore CUDA-only, like
 from __future__ import annotations
 
 import warp as wp
-import warp.optim.linear as wpl
 import warp.sparse as wps
 
 import triwarp as tw
+import triwarp.linalg as twl
+from triwarp._device import require_cuda
 from triwarp.heat.distance import HeatOperators, heat_geodesic, heat_operators
 from triwarp.kernels.heat import vector as kernel_heat_vector
 from triwarp.laplacian import connection_laplacian, mass_matrix_entries
@@ -162,7 +163,7 @@ def extend_scalar(
     n_sources = int(sources.shape[0])
     if n_vertices == 0 or int(faces.shape[0]) == 0 or n_sources == 0:
         return wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    _require_cuda(device, "extend_scalar")
+    require_cuda(device, "extend_scalar")
 
     if operators is None:
         operators = heat_operators(vertices, faces, t)
@@ -245,7 +246,7 @@ def transport_tangent_vectors(
     n_sources = int(sources.shape[0])
     if n_vertices == 0 or int(faces.shape[0]) == 0 or n_sources == 0:
         return wp.zeros(n_vertices, dtype=wp.vec2, device=device)
-    _require_cuda(device, "transport_tangent_vectors")
+    require_cuda(device, "transport_tangent_vectors")
 
     if operators is None:
         operators = vector_heat_operators(vertices, faces, t)
@@ -331,7 +332,7 @@ def log_map(
     n_vertices = int(vertices.shape[0])
     if n_vertices == 0 or int(faces.shape[0]) == 0:
         return wp.zeros(n_vertices, dtype=wp.vec2, device=device)
-    _require_cuda(device, "log_map")
+    require_cuda(device, "log_map")
 
     if operators is None:
         operators = vector_heat_operators(vertices, faces, t)
@@ -472,14 +473,7 @@ def diffuse_tangent_field(
     diffused = wp.zeros(n_vertices, dtype=wp.vec2d, device=source.device)
     if n_vertices == 0:
         return diffused
-    wpl.cg(
-        system,
-        source,
-        diffused,
-        tol=_CG_TOLERANCE,
-        maxiter=10 * n_vertices,
-        M=wpl.preconditioner(system, "diag"),
-    )
+    twl.solve_spd(system, source, diffused, tol=_CG_TOLERANCE)
     return diffused
 
 
@@ -491,14 +485,7 @@ def _solve_scalar(
 ) -> wp.array[wp.float64]:
     """Diffuse one scalar right-hand side through an already-assembled heat system."""
     solution = wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    wpl.cg(
-        system,
-        right_hand_side,
-        solution,
-        tol=_CG_TOLERANCE,
-        maxiter=10 * n_vertices,
-        M=wpl.preconditioner(system, "diag"),
-    )
+    twl.solve_spd(system, right_hand_side, solution, tol=_CG_TOLERANCE)
     return solution
 
 
@@ -507,12 +494,3 @@ def _as_vec2d(vectors: wp.array[wp.vec2]) -> wp.array[wp.vec2d]:
     widened = wp.empty(int(vectors.shape[0]), dtype=wp.vec2d, device=vectors.device)
     wp.map(kernel_heat_vector.to_vec2d, vectors, out=widened)
     return widened
-
-
-def _require_cuda(device: wp.DeviceLike, name: str) -> None:
-    """Reject the CPU device up front: every solver here runs a conjugate gradient."""
-    if wp.get_device(device).is_cpu:
-        raise NotImplementedError(
-            f"{name} requires a CUDA device: warp.optim.linear.cg produces NaN on the CPU "
-            f"device in Warp 1.14-1.15."
-        )

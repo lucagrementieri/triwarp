@@ -28,12 +28,12 @@ import itertools
 
 import numpy as np
 import warp as wp
-import warp.optim.linear as wpl
 import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.linalg as twl
 import triwarp.typing as twt
+from triwarp._device import require_cuda
 from triwarp.kernels.heat import distance as kernel_heat_distance
 from triwarp.kernels.heat import signed as kernel_heat_signed
 
@@ -127,11 +127,7 @@ def heat_signed_distance(
     n_faces = int(faces.shape[0]) // 3
     if n_vertices == 0 or n_faces == 0 or int(curve_vertices.shape[0]) == 0:
         return wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    if wp.get_device(device).is_cpu:
-        raise NotImplementedError(
-            "heat_signed_distance requires a CUDA device: warp.optim.linear.cg produces NaN on the "
-            "CPU device in Warp 1.14-1.15."
-        )
+    require_cuda(device, "heat_signed_distance")
 
     if operators is None:
         operators = tw.heat.vector.vector_heat_operators(vertices, faces, t)
@@ -276,14 +272,7 @@ def _solve_poisson_shifted(
     wp.map(wp.neg, divergence, out=negated)
 
     field = wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    wpl.cg(
-        operator,
-        negated,
-        field,
-        tol=_CG_TOLERANCE,
-        maxiter=10 * n_vertices,
-        M=wpl.preconditioner(operator, "diag"),
-    )
+    twl.solve_spd(operator, negated, field, tol=_CG_TOLERANCE)
     offset = tw.reduce.mean(tw.array.gather(field, curve_vertices))
     wp.map(wp.sub, field, wp.float64(offset), out=field)
     return field

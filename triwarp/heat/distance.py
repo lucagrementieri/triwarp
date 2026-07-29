@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import warp as wp
-import warp.optim.linear as wpl
 import warp.sparse as wps
 
+import triwarp.linalg as twl
+from triwarp._device import require_cuda
 from triwarp.edges import mean_edge_length
 from triwarp.kernels.heat import distance as kernel_heat_distance
 from triwarp.laplacian import (
@@ -195,13 +196,8 @@ def heat_geodesic(
     if n_vertices == 0 or n_faces == 0 or int(sources.shape[0]) == 0:
         return wp.zeros(n_vertices, dtype=wp.float64, device=device)
 
-    # The two linear solves rely on ``warp.optim.linear.cg``, which returns NaN on the CPU device
-    # in Warp 1.14-1.15 (even for a trivial well-conditioned system). Require a CUDA device.
-    if wp.get_device(device).is_cpu:
-        raise NotImplementedError(
-            "heat_geodesic requires a CUDA device: warp.optim.linear.cg produces NaN on the CPU "
-            "device in Warp 1.14-1.15."
-        )
+    # Both stages are conjugate-gradient solves, which Warp cannot run on the CPU.
+    require_cuda(device, "heat_geodesic")
 
     if operators is None:
         operators = heat_operators(vertices, faces, t, use_robust=use_robust)
@@ -217,14 +213,7 @@ def heat_geodesic(
     )
 
     heat = wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    wpl.cg(
-        heat_system,
-        u0,
-        heat,
-        tol=_CG_TOLERANCE,
-        maxiter=10 * n_vertices,
-        M=wpl.preconditioner(heat_system, "diag"),
-    )
+    twl.solve_spd(heat_system, u0, heat, tol=_CG_TOLERANCE)
 
     # Unit vector field X = -grad(u)/|grad(u)|.
     field = wp.empty(n_faces, dtype=wp.vec3d, device=device)
@@ -250,14 +239,7 @@ def heat_geodesic(
     wp.map(wp.neg, divergence, out=neg_divergence)
 
     phi = wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    wpl.cg(
-        poisson_system,
-        neg_divergence,
-        phi,
-        tol=_CG_TOLERANCE,
-        maxiter=10 * n_vertices,
-        M=wpl.preconditioner(poisson_system, "diag"),
-    )
+    twl.solve_spd(poisson_system, neg_divergence, phi, tol=_CG_TOLERANCE)
 
     # Shift so the distance field is zero at the (nearest) source. For a correctly signed field
     # the global minimum sits at the source set, so subtracting it yields a nonnegative field.
