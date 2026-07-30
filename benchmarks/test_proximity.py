@@ -33,6 +33,15 @@ read its row against:
   ratio that widens with the mesh — which is why it is capped at ``bunny`` with ``rounds=3`` rather
   than allowed to spend 85 s on dragon.
 - It writes only the vertex scalar, so the two-mesh MeshSet is built once and shared.
+
+``shape_diameter`` is the one group in this module whose reference is *not* faster than a
+millisecond and not close either: ``compute_scalar_by_shape_diameter_function_per_vertex`` is the
+most expensive per-vertex filter MeshLab ships (674 ms on ``bunny``), because it traces 64 rays from
+every vertex on one core. That is exactly the shape of work a GPU should win outright, which is why
+the port exists. Two caveats for reading its row: its ``cone_amplitude`` parameter is a **no-op** in
+the 2025.07 build (byte-identical output at 90 and 120 degrees), so its cone is whatever it is, and
+it writes only the vertex scalar, so the MeshSet is shared. The ``rays`` sweep is the axis, not the
+mesh: the cost is exactly linear in it on both sides, and the pair pins that.
 """
 
 from __future__ import annotations
@@ -59,6 +68,7 @@ _query_cache: dict[tuple[str, str, int], wp.array] = {}
 _surface_cache: dict[tuple[str, str], wp.array] = {}
 _mesh_cache: dict[tuple[str, str], wp.Mesh] = {}
 _pml_distance_cache: dict[tuple[str, str], ml.MeshSet] = {}
+_normals_cache: dict[tuple[str, str], wp.array[wp.vec3]] = {}
 
 
 def _query_points_np(bench_case: BenchCase, count: int = _N_QUERIES) -> np.ndarray:
@@ -256,3 +266,67 @@ def test_query_geodesic_ball(bench_case: BenchCase) -> None:
     radius = 5.0 * float(tw.edges.mean_edge_length(vertices, faces))
     _, offsets, _ = bench_case.run(lambda: tw.neighbors.geodesic_ball(vertices, faces, radius))
     assert offsets.shape == (vertices.shape[0],)
+
+
+# Rays per point for the bundle groups. MeshLab's default is 64; 256 shows the cost is exactly
+# linear in it on both sides, which is the whole shape of these two groups.
+_N_RAYS_SWEEP = [64, 256]
+
+
+def _vertex_normals_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
+    """Smooth outward normals over the mesh's own vertices -- an *input* of the bundle queries."""
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _normals_cache:
+        _normals_cache[key] = tw.vertices.area_weighted_vertex_normals(
+            bench_case.n_vertices, bench_case.vertices_wp, bench_case.faces_wp
+        )
+    return _normals_cache[key]
+
+
+@pytest.mark.benchmark(group="ambient_occlusion")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.parametrize("n_rays", _N_RAYS_SWEEP)
+def test_ambient_occlusion(bench_case: BenchCase, n_rays: int) -> None:
+    """A hemisphere ray bundle per vertex: the embarrassingly parallel case, against one core."""
+    n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pymeshlab":
+        skip_larger_than(bench_case, "bunny", "MeshLab traces the whole bundle on one core")
+        meshset_pml = bench_case.meshset_pml  # writes only the vertex scalar
+        bench_case.run(lambda: meshset_pml.compute_scalar_ambient_occlusion(rays=n_rays), rounds=3)
+        assert meshset_pml.current_mesh().vertex_scalar_array().shape == (n_vertices,)
+        return
+    mesh, points = _mesh_wp(bench_case), bench_case.vertices_wp
+    normals = _vertex_normals_wp(bench_case)
+    occlusion = bench_case.run(
+        lambda: tw.shading.ambient_occlusion(mesh, points, normals=normals, n_rays=n_rays)
+    )
+    assert occlusion.shape == (n_vertices,)
+
+
+@pytest.mark.benchmark(group="shape_diameter")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.parametrize("n_rays", _N_RAYS_SWEEP)
+def test_shape_diameter(bench_case: BenchCase, n_rays: int) -> None:
+    """
+    The same bundle fired inward, plus the trimming passes over a ``(n_vertices, n_rays)`` scratch.
+
+    Read against ``ambient_occlusion``: identical ray count, and the gap between the two rows is
+    what the two extra passes over the distance scratch cost. It should be small -- the rays
+    dominate -- and if it ever is not, the scratch is the thing to attack.
+    """
+    n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pymeshlab":
+        skip_larger_than(bench_case, "bunny", "674 ms a call on bunny at the default ray count")
+        meshset_pml = bench_case.meshset_pml
+        bench_case.run(
+            lambda: meshset_pml.compute_scalar_by_shape_diameter_function_per_vertex(rays=n_rays),
+            rounds=3,
+        )
+        assert meshset_pml.current_mesh().vertex_scalar_array().shape == (n_vertices,)
+        return
+    mesh, points = _mesh_wp(bench_case), bench_case.vertices_wp
+    normals = _vertex_normals_wp(bench_case)
+    diameter = bench_case.run(
+        lambda: tw.proximity.shape_diameter(mesh, points, normals=normals, n_rays=n_rays)
+    )
+    assert diameter.shape == (n_vertices,)

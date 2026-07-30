@@ -1,6 +1,13 @@
 """
 Queries against a ``wp.Mesh`` surface: closest point, signed distance, winding number, thickness.
 
+[`thickness`][triwarp.proximity.thickness] and
+[`shape_diameter`][triwarp.proximity.shape_diameter] both measure how thick the volume is under a
+surface point, at two levels of robustness: the first fires one inward ray (or fits one tangent
+sphere), the second fires a whole cone and takes an outlier-trimmed mean. For the *outward*
+counterpart -- how open a point is rather than how thick -- see
+[`triwarp.shading`][triwarp.shading].
+
 Mesh point queries ([`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh],
 [`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh])
 and [`contains_points`][triwarp.ray.contains_points] follow Warp's SDF sign convention: outside
@@ -13,16 +20,23 @@ Point-set acceleration structures (``wp.Bvh`` / ``wp.HashGrid``) and raw neighbo
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 import numpy as np
 import warp as wp
 
 import triwarp as tw
+import triwarp.typing as twt
 from triwarp._device import require_nonempty_mesh
 from triwarp.constants import TILE_1D
 from triwarp.kernels import proximity as kernel_proximity
+from triwarp.kernels import shading as kernel_shading
 from triwarp.triangles import face_normals_and_areas
+
+# Ray-origin offset *below* the surface along the inward normal, as a fraction of the query AABB
+# diagonal: without it the cone's own starting triangle is the nearest hit for every ray.
+_SDF_SURFACE_OFFSET = 1e-4
 
 
 def closest_point_on_mesh(
@@ -631,6 +645,133 @@ def thickness(
 
     else:
         raise ValueError('Invalid method, use "max_sphere" or "ray"')
+
+
+def shape_diameter(
+    mesh: wp.Mesh,
+    points: wp.array[wp.vec3],
+    *,
+    normals: wp.array[wp.vec3] | None = None,
+    n_rays: int = 64,
+    cone_angle: float = math.pi / 3.0,
+    trim: float = 1.0,
+    max_t: float | None = None,
+) -> wp.array[wp.float32]:
+    """
+    Shape diameter function: local thickness of the volume, from an inward cone of rays.
+
+    Shapira et al.'s SDF and MeshLab's ``compute_scalar_by_shape_diameter_function_per_vertex``. A
+    cone of ``n_rays`` rays is fired *into* the volume about ``-normal``, each is traced to the far
+    side, and the result is the cosine-weighted mean of those distances **after discarding the
+    outliers** — the rays that escaped through a nearby opening or crossed the entire model, which
+    would otherwise dominate the average near any concavity.
+
+    This is the many-ray generalization of
+    [`thickness(method="ray")`][triwarp.proximity.thickness]: at ``n_rays=1`` with a vanishing
+    ``cone_angle`` the bundle collapses to the inward normal and the two agree to float32. The extra
+    rays are what make it stable — a single ray through a thin sliver of geometry reads a thickness
+    the neighbourhood does not have — and the reason it is the quantity used for skeleton extraction
+    and part segmentation rather than the one-ray version.
+
+    Parameters
+    ----------
+    mesh
+        Triangle mesh with a built BVH (``wp.Mesh``). Should be closed: on an open surface the rays
+        that find nothing on the far side are simply absent from the mean.
+    points
+        ``(m,)`` surface positions to measure at, normally the mesh's own vertices.
+    normals
+        ``(m,)`` **outward** unit normals; the cone opens along ``-normals``. When ``None`` they are
+        taken from the closest face of ``mesh``. Pass
+        [`area_weighted_vertex_normals`][triwarp.vertices.area_weighted_vertex_normals] for a smooth
+        field over a mesh's own vertices.
+    n_rays
+        Rays per point. MeshLab's default is ``64``, which is this one. Note that the single ray of
+        ``n_rays=1`` is the *centroid* of the cone's Fibonacci lattice rather than its axis, so it
+        only coincides with the inward normal as ``cone_angle`` goes to zero.
+    cone_angle
+        Half-angle of the cone in **radians**, measured from the inward normal. The default
+        ``pi / 3`` (60 degrees) is Shapira's 120-degree cone. Must be in ``(0, pi / 2]`` — beyond
+        that the cone reaches around to the outside of the surface and the distances stop meaning
+        thickness.
+    trim
+        Keep only rays whose distance is within ``trim`` standard deviations of the mean before
+        averaging. ``1.0`` (the default) is Shapira's rule; a large value keeps everything and turns
+        this into a plain weighted mean. Must be non-negative.
+    max_t
+        Maximum ray length. When ``None``, the diagonal of the AABB enclosing the mesh and the query
+        points.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        ``(m,)`` diameters in the mesh's own length units on ``points.device``. ``inf`` at a point
+        where no ray in the cone found the far side at all.
+
+    Raises
+    ------
+    ValueError
+        If ``n_rays < 1``, ``cone_angle`` is outside ``(0, pi / 2]``, ``trim < 0``, or ``normals``
+        has a different length from ``points``.
+
+    See Also
+    --------
+    [`thickness`][triwarp.proximity.thickness]
+    [`max_tangent_sphere`][triwarp.proximity.max_tangent_sphere]
+    [`triwarp.shading.ambient_occlusion`][triwarp.shading.ambient_occlusion]
+    [`triwarp.sample.sample_fibonacci_cone`][triwarp.sample.sample_fibonacci_cone]
+
+    Notes
+    -----
+    MeshLab's ``cone_amplitude`` parameter is a **no-op** in the 2025.07 build — its output is
+    byte-identical at ``90`` and ``120`` degrees — and its trimming rule is not the one documented
+    in the paper, so its values differ from these by a roughly constant factor on a given mesh.
+    Compare against it by rank rather than by value; the exactly-checkable statements are the
+    reduction to [`thickness`][triwarp.proximity.thickness] at ``n_rays=1`` and the analytic ``2 R``
+    on a sphere.
+    """
+    if n_rays < 1:
+        raise ValueError(f"shape_diameter requires n_rays >= 1, got {n_rays}")
+    if not 0.0 < cone_angle <= math.pi / 2.0:
+        raise ValueError(f"cone_angle must be in (0, pi / 2] radians, got {cone_angle}")
+    if trim < 0.0:
+        raise ValueError(f"trim must be non-negative, got {trim}")
+
+    device = points.device
+    m = int(points.shape[0])
+    if m == 0:
+        return wp.empty(0, dtype=wp.float32, device=device)
+
+    if normals is None:
+        normals = normals_at_closest_faces(mesh, points)
+    elif int(normals.shape[0]) != m:
+        raise ValueError(
+            f"normals must have one entry per point, got {normals.shape[0]} for {m} points"
+        )
+
+    diagonal = _default_mesh_query_max_dist(mesh.points, points)
+    directions = tw.sample.sample_fibonacci_cone(n_rays, cone_angle, device=device)
+    # Distances are kept so the trimming pass can revisit them against a mean the first pass had not
+    # finished computing; re-tracing instead would double the only expensive part of the kernel.
+    scratch = twt.empty_float32_2d((m, n_rays), device=device)
+    out_diameter = wp.empty(m, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_shading.shape_diameter,
+        dim=m,
+        inputs=[
+            mesh.id,
+            points,
+            normals,
+            directions,
+            wp.float32(max_t if max_t is not None else diagonal),
+            wp.float32(_SDF_SURFACE_OFFSET * max(diagonal, 1e-12)),
+            wp.float32(trim),
+            scratch,
+            out_diameter,
+        ],
+        device=device,
+    )
+    return out_diameter
 
 
 def _default_mesh_query_max_dist(

@@ -120,6 +120,7 @@ def test_geodesic_ball_neighborhoods_overflow_warns() -> None:
     assert counts.max() <= 512
 
 
+@pytest.mark.parity("principal_curvature", "igl")
 def test_principal_curvature(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """Curvature values against libigl reference on an icosahedron (frame-dependent path)."""
     mesh_tm, mesh_wp = icosahedron
@@ -219,6 +220,7 @@ def test_principal_curvature_frame_independent(half_torus: tuple[tm.Trimesh, wp.
     assert within_pv2.mean() > 0.95
 
 
+@pytest.mark.parity("discrete_gaussian_curvature", "trimesh")
 def test_discrete_gaussian_curvature(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = hemisphere
 
@@ -239,6 +241,7 @@ def test_discrete_gaussian_curvature(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     assert np.allclose(gauss_curvature_wp.numpy(), gauss_curvature_tm, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parity("discrete_mean_curvature", "trimesh")
 def test_discrete_mean_curvature(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     mesh_tm, mesh_wp = icosahedron
     radius = 2.0

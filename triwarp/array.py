@@ -912,6 +912,45 @@ def square(values: wp.array[wp.Scalar]) -> wp.array[wp.Scalar]:
     return out
 
 
+def clamp(
+    values: wp.array[wp.Scalar], minimum: wp.Scalar, maximum: wp.Scalar
+) -> wp.array[wp.Scalar]:
+    """
+    Element-wise clamp of a scalar array to ``[minimum, maximum]``.
+
+    Computes ``out[i] = min(max(values[i], minimum), maximum)`` on the device, returning a freshly
+    allocated array of the same dtype and length. The counterpart of MeshLab's
+    ``apply_scalar_clamping_per_vertex`` for a per-vertex field, though nothing here is mesh-aware.
+
+    Parameters
+    ----------
+    values
+        Length-``n`` scalar Warp array.
+    minimum
+        Lower bound, in ``values.dtype``.
+    maximum
+        Upper bound, in ``values.dtype``. Must not be below ``minimum``; when it is, ``wp.clamp``
+        returns ``maximum`` for every element rather than raising.
+
+    Returns
+    -------
+    wp.array[wp.Scalar]
+        Length-``n`` clamped values on ``values.device``. Empty when ``n == 0``.
+
+    See Also
+    --------
+    [`square`][triwarp.array.square]
+    [`triwarp.smoothing.saturate_scalar_gradient`][triwarp.smoothing.saturate_scalar_gradient]
+    """
+    device = values.device
+    n = int(values.shape[0])
+    out = wp.empty(n, dtype=values.dtype, device=device)
+    if n == 0:
+        return out
+    wp.map(wp.clamp, values, minimum, maximum, out=out)
+    return out
+
+
 def sortable_dtype(dtype: type[wp.Scalar]) -> type[wp.Scalar]:
     """
     Same-width dtype that ``warp.utils.radix_sort_pairs`` accepts, preserving ``dtype``'s order.

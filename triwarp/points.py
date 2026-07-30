@@ -11,13 +11,18 @@ No connectivity here -- everything takes a bare ``(n,)`` array of positions. Two
   uncentered form, for callers that want to center differently.
 - **Per-point.** [`estimate_normals`][triwarp.points.estimate_normals] fits a plane to each point's
   k-nearest neighbourhood, which is how an unoriented cloud acquires normals before
-  reconstruction. [`plane_basis`][triwarp.points.plane_basis] and
+  reconstruction. [`outlier_probability`][triwarp.points.outlier_probability] and
+  [`statistical_outlier_mask`][triwarp.points.statistical_outlier_mask] score the same
+  neighbourhood for isolation, which is how a scanned cloud loses its stragglers *before* the
+  normals are fitted. [`plane_basis`][triwarp.points.plane_basis] and
   [`radial_sort`][triwarp.points.radial_sort] then let a caller work in the tangent plane it
   defines.
 
 Normals from [`estimate_normals`][triwarp.points.estimate_normals] are *unoriented* -- a plane fit
 cannot pick a side. See [`triwarp.repair`][triwarp.repair] for orientation propagation.
 """
+
+import math
 
 import warp as wp
 
@@ -401,6 +406,194 @@ def estimate_normals(
         device=device,
     )
     return out_normals
+
+
+def outlier_probability(
+    neighbor_idx: twt.Array2dInt32, neighbor_distance: twt.Array2dFloat32, *, scale: float = 3.0
+) -> wp.array[wp.float32]:
+    """
+    Local Outlier Probability (LoOP) of each point, in ``[0, 1]``.
+
+    A point is an outlier to the extent that its own neighbourhood is *stretched* relative to the
+    neighbourhoods of the points in it. Following Kriegel et al., each point gets a "standard
+    distance" ``sigma`` (the RMS distance to its neighbours), a local factor
+    ``plof = sigma / mean(sigma over the neighbourhood) - 1``, and a probability
+    ``max(0, erf(plof / (nplof * sqrt(2))))`` where ``nplof = scale * sqrt(mean(plof^2))`` over the
+    whole cloud. Because the normalization is cloud-wide, the score is comparable across points but
+    **not** across clouds — it is a rank, calibrated so that a threshold near ``0.8`` selects the
+    tail.
+
+    This is the measure behind MeshLab's ``compute_selection_point_cloud_outliers``, whose own
+    ``propthreshold`` default is ``0.8``; threshold the result to reproduce a selection:
+
+    ```python
+    probability = tw.points.outlier_probability(neighbor_idx, neighbor_distance)
+    outliers = tw.array.flatnonzero(probability.numpy() > 0.8)
+    ```
+
+    Parameters
+    ----------
+    neighbor_idx
+        ``(n, k)`` int32 neighbour table, as returned by
+        [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] (unused slots marked ``-1``).
+        A self-query table includes each point itself, which is counted normally — the same
+        convention MeshLab's k-d tree query uses.
+    neighbor_distance
+        ``(n, k)`` float32 distances aligned with ``neighbor_idx``; unused slots are ``inf``.
+    scale
+        The LoOP normalization factor ``lambda``. Larger values make the score more conservative
+        (fewer points near ``1``). MeshLab fixes it at ``3``, which is the default here.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        Length-``n`` probabilities on ``neighbor_idx.device``. A point whose neighbour row is empty
+        scores ``0``. All-zeros when the cloud has no spread at all.
+
+    Raises
+    ------
+    ValueError
+        If ``scale <= 0``, or the two tables disagree in shape.
+
+    See Also
+    --------
+    [`statistical_outlier_mask`][triwarp.points.statistical_outlier_mask]
+    [`estimate_normals`][triwarp.points.estimate_normals]
+    [`triwarp.neighbors.query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest]
+    """
+    twt.ensure_ndim(neighbor_idx, 2, dtype=wp.int32)
+    twt.ensure_ndim(neighbor_distance, 2, dtype=wp.float32)
+    if neighbor_idx.shape != neighbor_distance.shape:
+        raise ValueError(
+            "neighbor_idx and neighbor_distance must have the same shape, got "
+            f"{neighbor_idx.shape} and {neighbor_distance.shape}"
+        )
+    if scale <= 0.0:
+        raise ValueError(f"scale must be positive, got {scale}")
+
+    device = neighbor_idx.device
+    n = int(neighbor_idx.shape[0])
+    if n == 0:
+        return wp.empty(0, dtype=wp.float32, device=device)
+
+    _mean, standard_distance, _count = _neighbor_distance_moments(neighbor_distance)
+    plof = wp.empty(n, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_points.local_outlier_factor,
+        dim=n,
+        inputs=[standard_distance, neighbor_idx, plof],
+        device=device,
+    )
+
+    # nplof = scale * sqrt(E[plof^2]) over the whole cloud: one readback, because the normalizer is
+    # a scalar every point divides by and Warp cannot pass a device scalar as a uniform argument.
+    normalizer = scale * math.sqrt(tw.reduce.mean(tw.array.square(plof)))
+    out_probability = wp.zeros(n, dtype=wp.float32, device=device)
+    if normalizer <= 0.0:
+        return out_probability  # a cloud with no spread: every plof is zero
+    wp.map(
+        kernel_points.outlier_probability,
+        plof,
+        wp.float32(1.0 / (normalizer * math.sqrt(2.0))),
+        out=out_probability,
+    )
+    return out_probability
+
+
+def statistical_outlier_mask(
+    neighbor_distance: twt.Array2dFloat32, *, std_ratio: float = 2.0
+) -> wp.array[wp.bool]:
+    """
+    Flag points whose mean neighbour distance exceeds ``mean + std_ratio * std`` over the cloud.
+
+    Open3D's ``remove_statistical_outlier`` criterion, and the cheaper cousin of
+    [`outlier_probability`][triwarp.points.outlier_probability]: one global threshold on a single
+    per-point statistic rather than a neighbourhood-relative one. It is the right choice for a
+    cloud of roughly uniform density and the wrong one for a cloud that is dense in places and
+    sparse in others, where the sparse region is entirely above a global threshold.
+
+    Parameters
+    ----------
+    neighbor_distance
+        ``(n, k)`` float32 distances from
+        [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest]; unused slots are ``inf`` and
+        are excluded from the per-point mean. A self-query table contributes one zero distance per
+        row, exactly as Open3D's ``SearchKNN`` does, so pass the same ``k`` Open3D gets as
+        ``nb_neighbors``.
+    std_ratio
+        Multiplier on the cloud-wide standard deviation of the per-point means. Lower is stricter.
+        Open3D's own examples use ``2.0``, the default here.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Length-``n`` mask on ``neighbor_distance.device``; ``True`` marks an **outlier** (the
+        complement of Open3D's *keep* mask). A point with an empty or fully coincident
+        neighbourhood is marked as an outlier, matching Open3D's ``avg > 0`` guard.
+
+    Raises
+    ------
+    ValueError
+        If ``neighbor_distance`` is not a rank-2 float32 array.
+
+    See Also
+    --------
+    [`outlier_probability`][triwarp.points.outlier_probability]
+    [`triwarp.neighbors.query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest]
+    """
+    twt.ensure_ndim(neighbor_distance, 2, dtype=wp.float32)
+
+    device = neighbor_distance.device
+    n = int(neighbor_distance.shape[0])
+    out_mask = wp.zeros(n, dtype=wp.bool, device=device)
+    if n == 0:
+        return out_mask
+
+    mean_distance, _rms, count = _neighbor_distance_moments(neighbor_distance)
+    # Cloud mean and (ddof=1) deviation over the *counted* rows only, exactly as Open3D divides by
+    # its ``valid_distances``. Empty rows contribute zero to both sums, so a plain reduction works.
+    counted_mask = wp.empty(n, dtype=wp.bool, device=device)
+    wp.map(kernel_array.greater, count, wp.int32(0), out=counted_mask)
+    counted = int(tw.reduce.sum(counted_mask))
+    if counted < 2:
+        return out_mask  # no deviation to threshold against
+    cloud_mean = float(tw.reduce.sum(mean_distance)) / float(counted)
+    deviations = wp.empty(n, dtype=wp.float32, device=device)
+    wp.map(
+        kernel_points.centered_square_if_counted,
+        mean_distance,
+        count,
+        wp.float32(cloud_mean),
+        out=deviations,
+    )
+    cloud_std = math.sqrt(float(tw.reduce.sum(deviations)) / float(counted - 1))
+
+    wp.map(
+        kernel_points.is_statistical_outlier,
+        mean_distance,
+        count,
+        wp.float32(cloud_mean + std_ratio * cloud_std),
+        out=out_mask,
+    )
+    return out_mask
+
+
+def _neighbor_distance_moments(
+    neighbor_distance: twt.Array2dFloat32,
+) -> tuple[wp.array[wp.float32], wp.array[wp.float32], wp.array[wp.int32]]:
+    """Per-row ``(mean, rms, count)`` of a neighbour-distance table, ignoring ``inf`` slots."""
+    device = neighbor_distance.device
+    n = int(neighbor_distance.shape[0])
+    out_mean = wp.empty(n, dtype=wp.float32, device=device)
+    out_rms = wp.empty(n, dtype=wp.float32, device=device)
+    out_count = wp.empty(n, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_points.neighbor_distance_moments,
+        dim=n,
+        inputs=[neighbor_distance, out_mean, out_rms, out_count],
+        device=device,
+    )
+    return out_mean, out_rms, out_count
 
 
 def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3]) -> wp.array[wp.float32]:

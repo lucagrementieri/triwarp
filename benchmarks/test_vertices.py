@@ -46,6 +46,15 @@ it reads 1.34 against 1.22 ms for the area-weighted normals and 0.72 against 0.7
 transfer -- i.e. also flat, and if anything marginally *faster* on the hub mesh. Two
 implementations with nothing in common both saying valence is not a cost driver here is a stronger
 statement than triwarp's own under-2x spread was on its own.
+
+``transfer_onto_vertices`` is the one group here on the **scale** sweep rather than an accumulation
+axis, because it is not an accumulation at all: it is a closest-point query per target vertex plus a
+barycentric blend, so its cost is the BVH's and nothing this module owns. It transfers a field from
+a mesh onto its own vertices, which is the degenerate-but-realistic case (every query hits at
+distance zero) and keeps the two libraries doing identical work. MeshLab's
+``transfer_attributes_per_vertex`` needs *two* meshes in the set and writes into the second, so that
+row builds a fresh two-mesh MeshSet inside the timed callable -- twice the ~0.47 us/vertex build
+cost, which at ``bunny`` is 34 of its milliseconds before any transfer happens.
 """
 
 from __future__ import annotations
@@ -53,15 +62,17 @@ from __future__ import annotations
 from typing import cast
 
 import numpy as np
+import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase
+from conftest import BenchCase, skip_larger_than
 
 import triwarp as tw
 import triwarp.typing as twt
 
 _face_data_cache: dict[tuple[str, str], tuple[wp.array[wp.vec3], wp.array[wp.float32]]] = {}
+_z_field_cache: dict[tuple[str, str], wp.array[wp.float32]] = {}
 
 
 def _face_normals_and_areas(
@@ -182,3 +193,50 @@ def test_average_onto_vertices(bench_case: BenchCase) -> None:
         lambda: tw.interpolation.average_onto_vertices(n_vertices, faces, face_areas)
     )
     assert result.shape == (n_vertices,)
+
+
+@pytest.mark.benchmark(group="transfer_onto_vertices")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+def test_transfer_onto_vertices(bench_case: BenchCase) -> None:
+    """Closest-point plus barycentric blend, transferring a field from a mesh onto itself."""
+    n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pymeshlab":
+        skip_larger_than(bench_case, "bunny", "MeshLab's transfer is a serial closest-point walk")
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        faces_i32 = np.ascontiguousarray(faces_np, dtype=np.int32)
+        values_np = np.ascontiguousarray(vertices_np[:, 2])
+
+        def transfer_pml() -> int:
+            meshset_pml = ml.MeshSet()
+            meshset_pml.add_mesh(ml.Mesh(vertices_np, faces_i32, v_scalar_array=values_np))
+            meshset_pml.add_mesh(ml.Mesh(vertices_np, faces_i32))
+            meshset_pml.transfer_attributes_per_vertex(
+                sourcemesh=0,
+                targetmesh=1,
+                qualitytransfer=True,
+                colortransfer=False,
+                upperbound=ml.PercentageValue(50),
+            )
+            meshset_pml.set_current_mesh(1)
+            return meshset_pml.current_mesh().vertex_scalar_array().shape[0]
+
+        assert bench_case.run(transfer_pml) == n_vertices
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    values = _z_field_wp(bench_case)
+    transferred, _distance = bench_case.run(
+        lambda: tw.interpolation.transfer_onto_vertices(vertices, faces, values, vertices)
+    )
+    assert transferred.shape == (n_vertices,)
+
+
+def _z_field_wp(bench_case: BenchCase) -> wp.array[wp.float32]:
+    """Upload the vertices' own z as a scalar field, cached per (mesh, device) -- an input."""
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _z_field_cache:
+        _z_field_cache[key] = wp.array(
+            np.ascontiguousarray(bench_case.vertices_np[:, 2], dtype=np.float32),
+            dtype=wp.float32,
+            device=bench_case.device,
+        )
+    return _z_field_cache[key]

@@ -32,6 +32,7 @@ def _vertices_np_to_wp(vertices_np: np.ndarray, device: str) -> wp.array:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parity("faces_to_edges", "trimesh")
 def test_edges(device: str) -> None:
     rng = np.random.default_rng(0)
     faces_np = rng.integers(0, 50, size=(20, 3), dtype=np.int32)
@@ -42,6 +43,7 @@ def test_edges(device: str) -> None:
     assert np.array_equal(edges_wp.numpy(), edges_np)
 
 
+@pytest.mark.parity("faces_to_edges_sorted", "trimesh")
 def test_edges_sorted(device: str) -> None:
     rng = np.random.default_rng(1)
     faces_np = rng.integers(0, 50, size=(20, 3), dtype=np.int32)
@@ -63,6 +65,7 @@ def test_edges_empty(device: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parity("edges_face", "trimesh")
 def test_edges_face(device: str) -> None:
     rng = np.random.default_rng(3)
     n_faces = 24
@@ -87,6 +90,7 @@ def test_edges_face_empty(device: str) -> None:
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("edges_unique", "trimesh")
 def test_edges_unique(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
@@ -140,6 +144,7 @@ def test_edges_unique_inverse_standalone(request: pytest.FixtureRequest, mesh_na
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("edges_unique_length", "trimesh")
 def test_edges_unique_length(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
@@ -179,6 +184,7 @@ def test_edges_unique_length_precomputed(device: str) -> None:
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("edges_length", "trimesh")
 def test_edges_length(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
@@ -212,6 +218,7 @@ def test_edges_length_empty(device: str) -> None:
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("mean_edge_length", "trimesh")
 def test_mean_edge_length(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 

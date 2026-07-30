@@ -9,10 +9,13 @@ face layout, so results feed straight into the rest of the package or into
 [`uv_sphere`][triwarp.creation.uv_sphere], [`capsule`][triwarp.creation.capsule],
 [`cylinder`][triwarp.creation.cylinder], [`cone`][triwarp.creation.cone],
 [`annulus`][triwarp.creation.annulus] and [`torus`][triwarp.creation.torus] each build a small 2D
-profile and sweep it around the Z axis. [`box`][triwarp.creation.box] and
-[`icosahedron`][triwarp.creation.icosahedron] are constant tables, and
-[`icosphere`][triwarp.creation.icosphere] refines the latter with
-[`subdivide`][triwarp.remesh.subdivide].
+profile and sweep it around the Z axis. [`box`][triwarp.creation.box] and the four Platonic solids
+([`tetrahedron`][triwarp.creation.tetrahedron], [`octahedron`][triwarp.creation.octahedron],
+[`icosahedron`][triwarp.creation.icosahedron], [`dodecahedron`][triwarp.creation.dodecahedron]) are
+constant tables, and [`icosphere`][triwarp.creation.icosphere] refines one of them with
+[`subdivide`][triwarp.remesh.subdivide]. [`grid`][triwarp.creation.grid] and
+[`sphere_cap`][triwarp.creation.sphere_cap] are the two *open* primitives — a flat patch and a
+curved one, each with exactly one boundary loop.
 
 Differences from `trimesh.creation` that apply module-wide:
 
@@ -131,6 +134,110 @@ _ICOSAHEDRON_FACES = np.array(
 ).reshape(-1)
 
 
+# The remaining three Platonic solids, as MeshLab's ``create_tetrahedron`` /
+# ``create_octahedron`` / ``create_dodecahedron`` tables normalized onto the unit sphere (MeshLab
+# emits them at whatever circumradius the integer coordinates give). Kept verbatim, exactly as
+# ``_BOX_VERTICES`` is kept verbatim from trimesh, so both the vertex order and the pentagon-fan
+# triangulation of the dodecahedron match the reference they came from.
+_TETRAHEDRON_VERTICES = np.array(
+    [
+        [0.5773502691896258, 0.5773502691896258, 0.5773502691896258],
+        [-0.5773502691896258, 0.5773502691896258, -0.5773502691896258],
+        [-0.5773502691896258, -0.5773502691896258, 0.5773502691896258],
+        [0.5773502691896258, -0.5773502691896258, -0.5773502691896258],
+    ],
+    dtype=np.float64,
+)
+_TETRAHEDRON_FACES = np.array([[0, 1, 2], [0, 2, 3], [0, 3, 1], [3, 2, 1]], dtype=np.int32).reshape(
+    -1
+)
+
+_OCTAHEDRON_VERTICES = np.array(
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, -1.0],
+    ],
+    dtype=np.float64,
+)
+_OCTAHEDRON_FACES = np.array(
+    [[0, 1, 2], [0, 2, 4], [0, 4, 5], [0, 5, 1], [3, 1, 5], [3, 5, 4], [3, 4, 2], [3, 2, 1]],
+    dtype=np.int32,
+).reshape(-1)
+
+# 20 vertices: the 8 cube corners at 1/sqrt(3) plus the 12 golden rectangle points. The 12
+# pentagonal faces are each fanned from one cube corner, giving 36 triangles.
+_DODECAHEDRON_VERTICES = np.array(
+    [
+        [0.5773502691896258, 0.5773502691896258, 0.5773502691896258],
+        [0.5773502691896258, 0.5773502691896258, -0.5773502691896258],
+        [0.5773502691896258, -0.5773502691896258, 0.5773502691896258],
+        [0.5773502691896258, -0.5773502691896258, -0.5773502691896258],
+        [-0.5773502691896258, 0.5773502691896258, 0.5773502691896258],
+        [-0.5773502691896258, 0.5773502691896258, -0.5773502691896258],
+        [-0.5773502691896258, -0.5773502691896258, 0.5773502691896258],
+        [-0.5773502691896258, -0.5773502691896258, -0.5773502691896258],
+        [0.0, 0.35682208977309, 0.9341723589627156],
+        [0.0, 0.35682208977309, -0.9341723589627156],
+        [0.0, -0.35682208977309, 0.9341723589627156],
+        [0.0, -0.35682208977309, -0.9341723589627156],
+        [0.35682208977309, 0.9341723589627156, 0.0],
+        [0.35682208977309, -0.9341723589627156, 0.0],
+        [-0.35682208977309, 0.9341723589627156, 0.0],
+        [-0.35682208977309, -0.9341723589627156, 0.0],
+        [0.9341723589627156, 0.0, 0.35682208977309],
+        [0.9341723589627156, 0.0, -0.35682208977309],
+        [-0.9341723589627156, 0.0, 0.35682208977309],
+        [-0.9341723589627156, 0.0, -0.35682208977309],
+    ],
+    dtype=np.float64,
+)
+_DODECAHEDRON_FACES = np.array(
+    [
+        [0, 8, 10],
+        [0, 10, 2],
+        [0, 2, 16],
+        [0, 16, 17],
+        [0, 17, 1],
+        [0, 1, 12],
+        [0, 12, 14],
+        [0, 14, 4],
+        [0, 4, 8],
+        [5, 14, 12],
+        [5, 12, 1],
+        [5, 1, 9],
+        [5, 19, 18],
+        [5, 18, 4],
+        [5, 4, 14],
+        [5, 9, 11],
+        [5, 11, 7],
+        [5, 7, 19],
+        [3, 11, 9],
+        [3, 9, 1],
+        [3, 1, 17],
+        [3, 13, 15],
+        [3, 15, 7],
+        [3, 7, 11],
+        [3, 17, 16],
+        [3, 16, 2],
+        [3, 2, 13],
+        [6, 18, 19],
+        [6, 19, 7],
+        [6, 7, 15],
+        [6, 15, 13],
+        [6, 13, 2],
+        [6, 2, 10],
+        [6, 10, 8],
+        [6, 8, 4],
+        [6, 4, 18],
+    ],
+    dtype=np.int32,
+).reshape(-1)
+
+
 def box(
     extents: tuple[float, float, float] | None = None,
     transform: wp.mat44 | wp.array[wp.mat44] | None = None,
@@ -195,6 +302,84 @@ def box(
     return _apply_transform(vertices, faces, transform)
 
 
+def grid(
+    count: tuple[int, int] = (10, 10),
+    extents: tuple[float, float] = (1.0, 1.0),
+    center: bool = True,
+    transform: wp.mat44 | wp.array[wp.mat44] | None = None,
+    device: wp.DeviceLike = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Create a flat, regularly triangulated rectangle in the ``z = 0`` plane.
+
+    The cheapest mesh with interior vertices and a boundary loop, which is what makes it the
+    default fixture for anything that needs one: parametrization, boundary conditions, texture
+    baking. Every quad cell is split by the same diagonal, so both triangles of a cell are
+    right-angled — be aware that this makes every diagonal's cotangent weight exactly zero, which
+    some solvers are sensitive to.
+
+    Parameters
+    ----------
+    count
+        ``(nx, ny)`` **vertex** counts along X and Y; each must be at least 2. The result has
+        ``nx * ny`` vertices and ``2 * (nx - 1) * (ny - 1)`` triangles.
+    extents
+        ``(width, height)`` total span along X and Y.
+    center
+        When ``True`` (the default) the patch spans ``[-extents / 2, extents / 2]``; when
+        ``False`` its lower corner sits at the origin, matching MeshLab's ``create_grid``.
+    transform
+        Transform applied after construction, as a ``(1,)`` ``wp.mat44`` array or a scalar
+        ``wp.mat44``. Face winding is reversed when the transform has negative determinant.
+    device
+        Warp device for the result. Defaults to the current device.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        ``(vertices, faces)`` on ``device``, wound so the normals point along ``+Z``.
+
+    Raises
+    ------
+    ValueError
+        If either entry of ``count`` is less than 2, or either entry of ``extents`` is negative.
+
+    See Also
+    --------
+    [`box`][triwarp.creation.box]
+    [`extrude_triangulation`][triwarp.creation.extrude_triangulation]
+    """
+    nx, ny = int(count[0]), int(count[1])
+    if nx < 2 or ny < 2:
+        raise ValueError(f"count must be at least 2 along each axis, got {count}")
+    width, height = float(extents[0]), float(extents[1])
+    if width < 0.0 or height < 0.0:
+        raise ValueError(f"extents must be non-negative, got {extents}")
+
+    x = np.linspace(0.0, width, nx)
+    y = np.linspace(0.0, height, ny)
+    if center:
+        x = x - 0.5 * width
+        y = y - 0.5 * height
+    grid_x, grid_y = np.meshgrid(x, y, indexing="ij")
+    vertices_np = np.column_stack(
+        (grid_x.ravel(), grid_y.ravel(), np.zeros(nx * ny, dtype=np.float64))
+    )
+
+    # Row-major layout (X is the slow axis), so a cell's four corners are ``corner``,
+    # ``corner + ny`` (next X) and ``+ 1`` (next Y). The two triangles are wound
+    # counter-clockwise seen from +Z.
+    i, j = np.meshgrid(np.arange(nx - 1), np.arange(ny - 1), indexing="ij")
+    corner = (i * ny + j).ravel()
+    faces_np = np.empty((corner.shape[0], 2, 3), dtype=np.int32)
+    faces_np[:, 0] = np.column_stack((corner, corner + ny, corner + ny + 1))
+    faces_np[:, 1] = np.column_stack((corner, corner + ny + 1, corner + 1))
+
+    vertices = _upload_vertices(vertices_np, device)
+    faces = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
+    return _apply_transform(vertices, faces, transform)
+
+
 def icosahedron(device: wp.DeviceLike = None) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
     Create a regular icosahedron on the unit sphere, centered on the origin.
@@ -217,6 +402,99 @@ def icosahedron(device: wp.DeviceLike = None) -> tuple[wp.array[wp.vec3], wp.arr
     vertices = _upload_vertices(_ICOSAHEDRON_VERTICES, device)
     faces = wp.array(_ICOSAHEDRON_FACES, dtype=wp.int32, device=device)
     return vertices, faces
+
+
+def tetrahedron(device: wp.DeviceLike = None) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Create a regular tetrahedron on the unit sphere, centered on the origin.
+
+    The four vertices are the even-parity cube corners ``(+-1, +-1, +-1) / sqrt(3)``. This is the
+    coarsest closed triangle mesh there is, which makes it the natural stress case for anything
+    that assumes a vertex has a large ring: every vertex has valence 3 and every face borders every
+    other.
+
+    Parameters
+    ----------
+    device
+        Warp device for the result. Defaults to the current device.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        ``(vertices, faces)`` with 4 vertices and 4 triangles.
+
+    See Also
+    --------
+    [`octahedron`][triwarp.creation.octahedron]
+    [`icosahedron`][triwarp.creation.icosahedron]
+    """
+    return (
+        _upload_vertices(_TETRAHEDRON_VERTICES, device),
+        wp.array(_TETRAHEDRON_FACES, dtype=wp.int32, device=device),
+    )
+
+
+def octahedron(device: wp.DeviceLike = None) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Create a regular octahedron on the unit sphere, centered on the origin.
+
+    The six vertices are the ``+-`` unit axis directions, so every face is an octant of the
+    coordinate frame — the shape to reach for when a test wants a closed mesh whose faces are
+    exactly axis-aligned.
+
+    Parameters
+    ----------
+    device
+        Warp device for the result. Defaults to the current device.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        ``(vertices, faces)`` with 6 vertices and 8 triangles.
+
+    See Also
+    --------
+    [`tetrahedron`][triwarp.creation.tetrahedron]
+    [`icosahedron`][triwarp.creation.icosahedron]
+    """
+    return (
+        _upload_vertices(_OCTAHEDRON_VERTICES, device),
+        wp.array(_OCTAHEDRON_FACES, dtype=wp.int32, device=device),
+    )
+
+
+def dodecahedron(device: wp.DeviceLike = None) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Create a regular dodecahedron on the unit sphere, centered on the origin.
+
+    triwarp is triangle-only, so the twelve pentagonal faces arrive triangulated: each pentagon is
+    fanned from one of the eight cube-corner vertices, giving 36 triangles over 20 vertices with no
+    added centroid. The fan is MeshLab's, so this is vertex- and face-for-face identical to
+    ``create_dodecahedron`` up to the uniform scaling onto the unit sphere.
+
+    Because the triangulation is a fan rather than a symmetric split, the triangles are *not*
+    congruent and the mesh is not a good uniform-sampling proxy — use
+    [`icosphere`][triwarp.creation.icosphere] for that.
+
+    Parameters
+    ----------
+    device
+        Warp device for the result. Defaults to the current device.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        ``(vertices, faces)`` with 20 vertices and 36 triangles.
+
+    See Also
+    --------
+    [`icosahedron`][triwarp.creation.icosahedron]
+    [`octahedron`][triwarp.creation.octahedron]
+    """
+    return (
+        _upload_vertices(_DODECAHEDRON_VERTICES, device),
+        wp.array(_DODECAHEDRON_FACES, dtype=wp.int32, device=device),
+    )
 
 
 def icosphere(
@@ -346,6 +624,114 @@ def uv_sphere(
     profile[-1] = (0.0, radius_f)
 
     return revolve(_upload_profile(profile, device), sections=longitude, transform=transform)
+
+
+def sphere_cap(
+    angle: float = math.pi / 6.0,
+    subdivisions: int = 3,
+    radius: float = 1.0,
+    device: wp.DeviceLike = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Create a spherical cap around ``+Z``: an open disc of a sphere, with one boundary loop.
+
+    A triangular lattice of ``2 ** subdivisions`` concentric rings is projected onto the sphere, so
+    ring ``r`` carries ``6 * r`` vertices evenly spaced in azimuth at polar angle
+    ``angle * r / n_rings``. Unlike a sliced [`icosphere`][triwarp.creation.icosphere] the rim is a
+    clean circle of exactly ``6 * n_rings`` vertices, which is what makes this the fixture of choice
+    for boundary-condition work on a curved surface.
+
+    Parameters
+    ----------
+    angle
+        Polar half-angle of the cap in **radians**, measured from ``+Z``. Must be in ``(0, pi)``
+        exclusive: at ``pi`` the whole rim collapses onto the south pole and every rim triangle
+        would be degenerate. MeshLab's ``create_sphere_cap`` takes the full aperture in degrees
+        instead, so its ``angle=60`` is ``math.radians(30)`` here.
+    subdivisions
+        Number of refinement passes; the lattice has ``2 ** subdivisions`` rings, giving
+        ``1 + 3 * n * (n + 1)`` vertices and ``6 * n ** 2`` triangles for ``n = 2 **
+        subdivisions``. Must be ``>= 0``.
+    radius
+        Sphere radius.
+    device
+        Warp device for the result. Defaults to the current device.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        ``(vertices, faces)`` on ``device``, wound so the normals point away from the sphere
+        center. Vertex 0 is the apex at ``(0, 0, radius)`` and the last ``6 * n`` vertices are the
+        rim, in azimuthal order.
+
+    Raises
+    ------
+    ValueError
+        If ``angle`` is outside ``(0, pi)`` or ``subdivisions`` is negative.
+
+    See Also
+    --------
+    [`icosphere`][triwarp.creation.icosphere]
+    [`uv_sphere`][triwarp.creation.uv_sphere]
+    """
+    if not 0.0 < angle < math.pi:
+        raise ValueError(f"angle must be in (0, pi) radians, got {angle}")
+    if subdivisions < 0:
+        raise ValueError(f"subdivisions must be non-negative, got {subdivisions}")
+
+    n_rings = 2 ** int(subdivisions)
+    # ``ring_start[r]`` is where ring r's ``6 * r`` vertices begin; ring 0 is the single apex.
+    ring_start = [0] + [1 + 3 * r * (r - 1) for r in range(1, n_rings + 1)]
+
+    vertices_np = np.empty((1 + 3 * n_rings * (n_rings + 1), 3), dtype=np.float64)
+    vertices_np[0] = (0.0, 0.0, radius)
+    for r in range(1, n_rings + 1):
+        theta = angle * r / n_rings
+        phi = 2.0 * math.pi * np.arange(6 * r) / (6 * r)
+        vertices_np[ring_start[r] : ring_start[r] + 6 * r] = np.column_stack(
+            (
+                radius * math.sin(theta) * np.cos(phi),
+                radius * math.sin(theta) * np.sin(phi),
+                np.full(6 * r, radius * math.cos(theta)),
+            )
+        )
+
+    # Stitch ring r-1 to ring r: six sectors, and in each the outer ring carries one more vertex
+    # than the inner one. That extra vertex is what turns the strip into ``2 * r - 1`` triangles --
+    # ``6 * r`` outward-pointing (one per outer edge) and ``6 * (r - 1)`` inward-pointing (one per
+    # inner edge) -- rather than an even fan, and it is why the total lands on exactly ``6 * n **
+    # 2``.
+    faces_np = np.empty((6 * n_rings * n_rings, 3), dtype=np.int32)
+    written = 0
+    for r in range(1, n_rings + 1):
+        outer_base, inner_base = ring_start[r], ring_start[r - 1]
+        inner_count = 6 * (r - 1) if r > 1 else 1
+        outer_index = np.arange(6 * r)
+        sector, step = np.divmod(outer_index, r)
+        faces_np[written : written + 6 * r] = np.column_stack(
+            (
+                outer_base + outer_index,
+                outer_base + (outer_index + 1) % (6 * r),
+                inner_base + (sector * (r - 1) + step) % inner_count,
+            )
+        )
+        written += 6 * r
+        if r > 1:
+            inner_index = np.arange(inner_count)
+            sector, step = np.divmod(inner_index, r - 1)
+            faces_np[written : written + inner_count] = np.column_stack(
+                (
+                    inner_base + inner_index,
+                    outer_base + (sector * r + step + 1) % (6 * r),
+                    inner_base + (inner_index + 1) % inner_count,
+                )
+            )
+            written += inner_count
+
+    return (
+        _upload_vertices(vertices_np, device),
+        wp.array(np.ascontiguousarray(faces_np.reshape(-1)), dtype=wp.int32, device=device),
+    )
 
 
 def capsule(

@@ -11,12 +11,15 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import open3d as o3d
 import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
 
 import triwarp as tw
+import triwarp.typing as twt
+from tests.conversions import open3d_to_trimesh, points_to_open3d
 from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
 
 _meshlib = pytest.importorskip("meshlib")
@@ -404,14 +407,9 @@ def _points_to_surface(points_np: np.ndarray, mesh: tm.Trimesh) -> float:
 
 
 def _open3d_poisson(points_np: np.ndarray, normals_np: np.ndarray, depth: int) -> tm.Trimesh:
-    o3d = pytest.importorskip("open3d")
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(np.ascontiguousarray(points_np, dtype=np.float64))
-    pcd.normals = o3d.utility.Vector3dVector(np.ascontiguousarray(normals_np, dtype=np.float64))
+    pcd = points_to_open3d(points_np, normals_np)
     mesh_o3d, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth)
-    return tm.Trimesh(
-        vertices=np.asarray(mesh_o3d.vertices), faces=np.asarray(mesh_o3d.triangles), process=False
-    )
+    return open3d_to_trimesh(mesh_o3d)
 
 
 def test_poisson_sphere_watertight_manifold(device: str):
@@ -765,10 +763,7 @@ def test_ball_pivoting_face_count_near_open3d(device: str):
     _vertices, faces_wp = tw.reconstruction.ball_pivoting(points_wp, normals_wp, radius=radius)
     n_faces_tw = int(faces_wp.shape[0]) // 3
 
-    o3d = pytest.importorskip("open3d")
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(np.ascontiguousarray(points_np))
-    pcd.normals = o3d.utility.Vector3dVector(np.ascontiguousarray(normals_np))
+    pcd = points_to_open3d(points_np, normals_np)
     mesh_o3d = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
         pcd, o3d.utility.DoubleVector([radius, 2.0 * radius])
     )
@@ -805,3 +800,201 @@ def test_ball_pivoting_too_few_points(device: str):
     normals_wp = wp.array(np.ones((2, 3), dtype=np.float64), dtype=wp.vec3, device=device)
     _vertices, faces_wp = tw.reconstruction.ball_pivoting(points_wp, normals_wp)
     assert int(faces_wp.shape[0]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Marching cubes and uniform resampling (analytic + pymeshlab / skimage)
+# ---------------------------------------------------------------------------
+
+
+def _sphere_field(resolution: int, radius: float) -> np.ndarray:
+    """Build an analytic SDF of a sphere on a ``[-1, 1]`` lattice: the exact-answer fixture."""
+    axis_np = np.linspace(-1.0, 1.0, resolution)
+    x_np, y_np, z_np = np.meshgrid(axis_np, axis_np, axis_np, indexing="ij")
+    return (np.sqrt(x_np**2 + y_np**2 + z_np**2) - radius).astype(np.float32)
+
+
+def _upload_mesh(mesh_tm: tm.Trimesh, device: str):
+    return (
+        wp.array(
+            np.ascontiguousarray(mesh_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
+        ),
+        wp.array(
+            np.ascontiguousarray(mesh_tm.faces.reshape(-1), dtype=np.int32),
+            dtype=wp.int32,
+            device=device,
+        ),
+    )
+
+
+def test_marching_cubes_extracts_an_analytic_sphere(device: str) -> None:
+    """Every extracted vertex must land on the sphere the field describes, to grid resolution."""
+    radius, resolution = 0.6, 32
+    field_wp = wp.array(_sphere_field(resolution, radius), dtype=wp.float32, device=device)
+    vertices_wp, faces_wp = tw.reconstruction.marching_cubes(
+        twt.as_array3d_float32(field_wp), bounds=(wp.vec3(-1.0, -1.0, -1.0), wp.vec3(1.0, 1.0, 1.0))
+    )
+    assert int(faces_wp.shape[0]) > 0
+    spacing = 2.0 / (resolution - 1)
+    radii_np = np.linalg.norm(vertices_wp.numpy(), axis=1)
+    assert np.abs(radii_np - radius).max() < spacing
+
+
+def test_marching_cubes_index_space_by_default(device: str) -> None:
+    """Without ``bounds`` the vertices are lattice indices, which is the documented convention."""
+    resolution = 24
+    field_wp = wp.array(_sphere_field(resolution, 0.6), dtype=wp.float32, device=device)
+    vertices_np = tw.reconstruction.marching_cubes(twt.as_array3d_float32(field_wp))[0].numpy()
+    assert vertices_np.min() >= 0.0
+    assert vertices_np.max() <= float(resolution - 1)
+    # Centred field, so the extracted surface is centred on the lattice centre.
+    assert np.allclose(vertices_np.mean(axis=0), 0.5 * (resolution - 1), atol=0.5)
+
+
+def test_marching_cubes_empty_when_the_field_never_crosses(device: str) -> None:
+    field_wp = wp.array(np.full((8, 8, 8), 1.0, dtype=np.float32), dtype=wp.float32, device=device)
+    _vertices_wp, faces_wp = tw.reconstruction.marching_cubes(twt.as_array3d_float32(field_wp))
+    assert int(faces_wp.shape[0]) == 0
+
+
+def test_marching_cubes_invalid(device: str) -> None:
+    thin_wp = wp.array(np.zeros((1, 8, 8), dtype=np.float32), dtype=wp.float32, device=device)
+    with pytest.raises(ValueError, match="at least 2 wide"):
+        tw.reconstruction.marching_cubes(twt.as_array3d_float32(thin_wp))
+
+
+@pytest.mark.parametrize("offset", [0.0, 0.2, -0.2])
+def test_resample_uniform_offsets_a_sphere(device: str, offset: float) -> None:
+    """
+    Offset the one shape whose offset surface is known exactly: a sphere by ``d`` gives ``1 + d``.
+
+    Both signs are covered because they are different code paths in spirit — a positive offset needs
+    the lattice padded beyond the bounding box (or it clips) and a negative one does not.
+    """
+    sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    vertices_wp, faces_wp = _upload_mesh(sphere_tm, device)
+    voxel_size = 0.05
+
+    out_vertices_wp, out_faces_wp = tw.reconstruction.resample_uniform(
+        vertices_wp, faces_wp, voxel_size=voxel_size, offset=offset
+    )
+    radii_np = np.linalg.norm(out_vertices_wp.numpy(), axis=1)
+    # The icosphere is *inscribed*, so its own surface sits between ``cos`` of half the face angle
+    # and 1; the offset shifts that band without widening it much.
+    assert np.abs(radii_np - (1.0 + offset)).max() < 2.0 * voxel_size
+
+    out_tm = tm.Trimesh(
+        out_vertices_wp.numpy().astype(np.float64),
+        out_faces_wp.numpy().reshape(-1, 3),
+        process=False,
+    )
+    assert out_tm.is_watertight
+    assert out_tm.volume > 0.0
+
+
+def test_resample_uniform_repairs_a_broken_mesh(device: str) -> None:
+    """
+    The bluntest repair there is: the topology comes from the grid, so the input's cannot leak.
+
+    The input here has duplicated faces, an inverted one and a non-manifold edge — three defects
+    that each need their own function in [`triwarp.repair`][triwarp.repair] — and the resampled
+    result is a clean watertight sphere regardless.
+    """
+    sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    faces_np = np.asarray(sphere_tm.faces)
+    broken_np = np.vstack([faces_np, faces_np[:20], faces_np[30:40][:, ::-1]])
+    vertices_wp = wp.array(
+        np.ascontiguousarray(sphere_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    faces_wp = wp.array(
+        np.ascontiguousarray(broken_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
+    )
+    assert not tw.validation.is_edge_manifold(faces_wp)
+
+    out_vertices_wp, out_faces_wp = tw.reconstruction.resample_uniform(
+        vertices_wp, faces_wp, voxel_size=0.06
+    )
+    assert tw.validation.is_edge_manifold(out_faces_wp, allow_boundary_edges=False)
+    out_tm = tm.Trimesh(
+        out_vertices_wp.numpy().astype(np.float64),
+        out_faces_wp.numpy().reshape(-1, 3),
+        process=False,
+    )
+    assert out_tm.is_watertight
+    assert np.isclose(np.abs(out_tm.volume), 4.0 / 3.0 * np.pi, rtol=0.1)
+
+
+def test_resample_uniform_matches_pymeshlab(device: str) -> None:
+    """
+    ``generate_resampled_uniform_mesh`` is the same algorithm at the same absolute cell size.
+
+    One parameter hazard, found by probing: its ``offset`` as a ``PercentageValue`` runs from full
+    erosion at ``0%`` to full dilation at ``100%``, so **``PercentageValue(50)`` — its default — is
+    the *zero* offset** and ``PercentageValue(0)`` erodes a unit sphere down to radius 0.30. Passing
+    ``PureValue(0.0)`` instead means an absolute offset of zero, which is what ``offset=0.0`` is
+    here.
+
+    What must agree is the surface: both watertight, both enclosing the sphere's volume, and a
+    two-sided Hausdorff distance between them of well under a cell.
+    """
+    sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    voxel_size = 0.06
+    meshset_pml = ml.MeshSet()
+    meshset_pml.add_mesh(
+        ml.Mesh(
+            np.ascontiguousarray(sphere_tm.vertices, dtype=np.float64),
+            np.ascontiguousarray(sphere_tm.faces, dtype=np.int32),
+        )
+    )
+    meshset_pml.generate_resampled_uniform_mesh(
+        cellsize=ml.PureValue(voxel_size), offset=ml.PureValue(0.0)
+    )
+    mesh_pml = meshset_pml.current_mesh()
+    pml_tm = tm.Trimesh(mesh_pml.vertex_matrix(), mesh_pml.face_matrix(), process=False)
+
+    vertices_wp, faces_wp = _upload_mesh(sphere_tm, device)
+    out_vertices_wp, out_faces_wp = tw.reconstruction.resample_uniform(
+        vertices_wp, faces_wp, voxel_size=voxel_size
+    )
+    out_tm = tm.Trimesh(
+        out_vertices_wp.numpy().astype(np.float64),
+        out_faces_wp.numpy().reshape(-1, 3),
+        process=False,
+    )
+    assert out_tm.is_watertight
+    assert np.isclose(np.abs(out_tm.volume), np.abs(pml_tm.volume), rtol=0.05)
+
+    # Two-sided Hausdorff between the surfaces, within a cell.
+    sample_wp, _face = tm.sample.sample_surface(out_tm, 4000, seed=0)
+    sample_pml, _face_pml = tm.sample.sample_surface(pml_tm, 4000, seed=1)
+    assert np.abs(tm.proximity.signed_distance(pml_tm, sample_wp)).max() < 2.0 * voxel_size
+    assert np.abs(tm.proximity.signed_distance(out_tm, sample_pml)).max() < 2.0 * voxel_size
+
+
+def test_resample_uniform_coarser_is_smaller(device: str) -> None:
+    """A wider voxel can only produce fewer triangles, and still a closed surface."""
+    sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    vertices_wp, faces_wp = _upload_mesh(sphere_tm, device)
+    counts = []
+    for voxel_size in (0.05, 0.1, 0.2):
+        _out_vertices_wp, out_faces_wp = tw.reconstruction.resample_uniform(
+            vertices_wp, faces_wp, voxel_size=voxel_size
+        )
+        counts.append(int(out_faces_wp.shape[0]) // 3)
+        assert tw.validation.is_edge_manifold(out_faces_wp, allow_boundary_edges=False)
+    assert counts == sorted(counts, reverse=True)
+
+
+def test_resample_uniform_invalid(device: str) -> None:
+    sphere_tm = tm.creation.icosphere(subdivisions=1, radius=1.0)
+    vertices_wp, faces_wp = _upload_mesh(sphere_tm, device)
+    with pytest.raises(ValueError, match="voxel_size > 0"):
+        tw.reconstruction.resample_uniform(vertices_wp, faces_wp, voxel_size=0.0)
+
+
+def test_resample_uniform_empty(device: str) -> None:
+    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    out_vertices_wp, out_faces_wp = tw.reconstruction.resample_uniform(vertices_wp, faces_wp)
+    assert int(out_vertices_wp.shape[0]) == 0
+    assert int(out_faces_wp.shape[0]) == 0

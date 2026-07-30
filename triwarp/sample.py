@@ -99,6 +99,60 @@ def sample_fibonacci_hemisphere(count: int, device: wp.DeviceLike = None) -> wp.
     return out_directions
 
 
+def sample_fibonacci_cone(
+    count: int, half_angle: float, device: wp.DeviceLike = None
+) -> wp.array[wp.vec3]:
+    """
+    Generate near-uniform unit vectors inside a cone around ``+z``.
+
+    The same Fibonacci-spiral construction as
+    [`sample_fibonacci_sphere`][triwarp.sample.sample_fibonacci_sphere], with ``z`` descending
+    uniformly through ``(cos(half_angle), 1)`` instead of the whole range — which is the *correct*
+    restriction, because a uniform ``z`` is a uniform solid angle (Archimedes) whether the band is
+    the full sphere or a cap. Rejection-sampling a sphere lattice down to the cone would not stay
+    low-discrepancy; this does.
+
+    Parameters
+    ----------
+    count
+        Number of directions to generate.
+    half_angle
+        Half-angle of the cone in **radians**, measured from ``+z``. ``pi / 2`` reproduces
+        [`sample_fibonacci_hemisphere`][triwarp.sample.sample_fibonacci_hemisphere] and ``pi``
+        reproduces [`sample_fibonacci_sphere`][triwarp.sample.sample_fibonacci_sphere]. Must be in
+        ``(0, pi]``.
+    device
+        Warp device for the result. Defaults to the current device.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        ``(count,)`` unit vectors inside the cone. Empty when ``count`` is 0.
+
+    Raises
+    ------
+    ValueError
+        If ``half_angle`` is outside ``(0, pi]``.
+
+    See Also
+    --------
+    [`sample_fibonacci_hemisphere`][triwarp.sample.sample_fibonacci_hemisphere]
+    [`triwarp.proximity.shape_diameter`][triwarp.proximity.shape_diameter]
+    """
+    if not 0.0 < half_angle <= math.pi:
+        raise ValueError(f"half_angle must be in (0, pi] radians, got {half_angle}")
+    if count <= 0:
+        return wp.empty(0, dtype=wp.vec3, device=device)
+    out_directions = wp.empty(count, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_sample.fibonacci_lattice,
+        dim=count,
+        inputs=[count, wp.float32(1.0 - math.cos(half_angle)), out_directions],
+        device=device,
+    )
+    return out_directions
+
+
 def sample_surface(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],

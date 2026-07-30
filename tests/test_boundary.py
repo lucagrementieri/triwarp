@@ -16,6 +16,7 @@ OPEN_MESHES = ["hemisphere", "half_torus"]
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+@pytest.mark.parity("boundary_edges", "trimesh")
 def test_boundary_edges(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
@@ -111,6 +112,7 @@ def test_boundary_empty(device: str) -> None:
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+@pytest.mark.parity("boundary_loops", "igl")
 def test_boundary_loops(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 

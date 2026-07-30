@@ -134,3 +134,60 @@ def flip_faces_masked(
 def negative_volume_flag(volume: wp.float32) -> wp.int32:
     """Flag a face for flipping when its component's signed volume is negative (inward)."""
     return wp.where(volume < wp.float32(0.0), wp.int32(1), wp.int32(0))
+
+
+@wp.kernel
+def accumulate_neighbor_normals(
+    face_normals: wp.array[wp.vec3],
+    face_adjacency: wp.array2d[wp.int32],
+    adjacency_angles: wp.array[wp.float32],
+    out_neighbor_sum: wp.array[wp.vec3],
+    out_max_angle: wp.array[wp.float32],
+) -> None:
+    # One pass over the adjacency pairs, scattering both per-face quantities the bad-face criteria
+    # need: the sum of the neighbouring face normals (whose direction is the local consensus) and
+    # the sharpest dihedral angle to any neighbour (which is what a fold looks like).
+    k = int(wp.tid())
+    f0 = face_adjacency[k, 0]
+    f1 = face_adjacency[k, 1]
+    angle = adjacency_angles[k]
+    wp.atomic_add(out_neighbor_sum, f0, face_normals[f1])
+    wp.atomic_add(out_neighbor_sum, f1, face_normals[f0])
+    wp.atomic_max(out_max_angle, f0, angle)
+    wp.atomic_max(out_max_angle, f1, angle)
+
+
+@wp.kernel
+def bad_face_mask(
+    quality: wp.array[wp.float32],
+    face_normals: wp.array[wp.vec3],
+    neighbor_sum: wp.array[wp.vec3],
+    max_angle: wp.array[wp.float32],
+    min_quality: wp.float32,
+    max_normal_cos: wp.float32,
+    max_fold_cos: wp.float32,
+    out_bad: wp.array[wp.bool],
+) -> None:
+    # A face is bad if it is too thin, too far from its neighbourhood's consensus normal, or folded
+    # back onto its own ring. Each criterion is disabled by passing a cosine of -2 / a quality of
+    # -1, which no real value can reach, so the three gates compose without a separate flag
+    # argument.
+    f = int(wp.tid())
+    if quality[f] < min_quality:
+        out_bad[f] = wp.bool(True)
+        return
+
+    # Direction of the sum of the neighbouring normals: the local consensus. ``wp.normalize`` of a
+    # zero vector is zero in Warp, which is how an isolated face -- and a face whose neighbours
+    # cancel each other exactly -- ends up with no consensus to disagree with.
+    consensus = wp.normalize(neighbor_sum[f])
+    agreement = wp.dot(face_normals[f], consensus)
+    if wp.length_sq(consensus) > 0.0 and agreement < max_normal_cos:
+        out_bad[f] = wp.bool(True)
+        return
+
+    # Fold: some neighbour meets this face at nearly pi (an unsigned dihedral, so the gate is on its
+    # cosine) *and* this face is the one facing against its own neighbourhood. Both halves matter --
+    # a fold has two faces and only one of them is the mistake, so flagging both would delete a good
+    # triangle along with it.
+    out_bad[f] = wp.cos(max_angle[f]) < max_fold_cos and agreement < 0.0

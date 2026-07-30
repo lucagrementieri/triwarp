@@ -1,7 +1,7 @@
 import warp as wp
 
-from triwarp.constants import TOLERANCE_ZERO_CONSTANT
-from triwarp.kernels.array import binary_search_sorted_contains, to_vec2d, to_vec3d
+from triwarp.constants import INT32_MAX_CONSTANT, TOLERANCE_ZERO_CONSTANT
+from triwarp.kernels.array import binary_search_sorted_contains, to_vec2d, to_vec3, to_vec3d
 from triwarp.kernels.grouping import hash_slot, pack_edge_key
 from triwarp.kernels.predicates import (
     delone_metrics,
@@ -13,6 +13,7 @@ from triwarp.kernels.predicates import (
     triangle_aspect_ratio,
     triangle_normal,
 )
+from triwarp.kernels.triangles import face_vertices_vec3d, triangle_quality
 
 # Delaunay / Delone edge-flip constants (ported from MRMeshDelone.cpp). The flip predicate
 # runs in float64: MeshLib deliberately widens to double because circumcircle diameters of
@@ -679,13 +680,14 @@ def claim_collapses(
     s = out_survivor[k]
     if s < 0:
         return
+    key = k
     r = out_removed[k]
-    wp.atomic_min(out_claim, s, k)
-    wp.atomic_min(out_claim, r, k)
+    wp.atomic_min(out_claim, s, key)
+    wp.atomic_min(out_claim, r, key)
     for i in range(offsets[s], offsets[s + 1]):
-        wp.atomic_min(out_claim, columns[i], k)
+        wp.atomic_min(out_claim, columns[i], key)
     for i in range(offsets[r], offsets[r + 1]):
-        wp.atomic_min(out_claim, columns[i], k)
+        wp.atomic_min(out_claim, columns[i], key)
 
 
 @wp.kernel(enable_backward=False)
@@ -704,15 +706,16 @@ def commit_collapses(
     s = out_survivor[k]
     if s < 0:
         return
+    key = k
     r = out_removed[k]
     won = True
-    if claim[s] != k or claim[r] != k:
+    if claim[s] != key or claim[r] != key:
         won = False
     for i in range(offsets[s], offsets[s + 1]):
-        if claim[columns[i]] != k:
+        if claim[columns[i]] != key:
             won = False
     for i in range(offsets[r], offsets[r + 1]):
-        if claim[columns[i]] != k:
+        if claim[columns[i]] != key:
             won = False
     if not won:
         return
@@ -1029,3 +1032,607 @@ def update_flipped_lengths(
     out_edge_lengths[f1, 0] = diagonal
     out_edge_lengths[f1, 1] = second_apex1
     out_edge_lengths[f1, 2] = second_apex0
+
+
+@wp.func
+def voxel_size_inverse(voxel_size: wp.float32) -> wp.float32:
+    # Reciprocal cell width, so the two ``cluster_*`` kernels can take the width itself (which they
+    # also need for the cell centre) without the caller passing both.
+    return 1.0 / voxel_size
+
+
+@wp.func
+def voxel_cell(position: wp.vec3, origin: wp.vec3, inverse_size: wp.float32) -> wp.vec3i:
+    # Integer voxel a position falls in, for the grid anchored at ``origin`` with cell width
+    # ``1 / inverse_size``. ``wp.floor`` rather than a cast, so negative coordinates round the same
+    # way positive ones do (a C-style truncation would fold the two cells either side of the origin
+    # into one).
+    local = (position - origin) * inverse_size
+    return wp.vec3i(
+        wp.int32(wp.floor(local[0])), wp.int32(wp.floor(local[1])), wp.int32(wp.floor(local[2]))
+    )
+
+
+@wp.kernel
+def voxel_cell_indices(
+    vertices: wp.array[wp.vec3],
+    origin: wp.vec3,
+    inverse_size: wp.float32,
+    out_cells: wp.array2d[wp.int32],
+) -> None:
+    v = int(wp.tid())
+    cell = voxel_cell(vertices[v], origin, inverse_size)
+    out_cells[v, 0] = cell[0]
+    out_cells[v, 1] = cell[1]
+    out_cells[v, 2] = cell[2]
+
+
+@wp.kernel
+def cluster_accumulate(
+    labels: wp.array[wp.int32],
+    vertices: wp.array[wp.vec3],
+    out_sum: wp.array[wp.vec3],
+    out_count: wp.array[wp.int32],
+) -> None:
+    v = int(wp.tid())
+    wp.atomic_add(out_sum, labels[v], vertices[v])
+    wp.atomic_add(out_count, labels[v], 1)
+
+
+@wp.kernel
+def cluster_min_center_distance(
+    labels: wp.array[wp.int32],
+    vertices: wp.array[wp.vec3],
+    origin: wp.vec3,
+    voxel_size: wp.float32,
+    out_min_distance: wp.array[wp.float32],
+) -> None:
+    # Pass 1 of the "closest to the cell centre" representative: the winning *distance* per cluster.
+    # Split from the index pick so both passes use 32-bit atomics only; the two together are
+    # deterministic because pass 2 breaks ties by lowest vertex index.
+    v = int(wp.tid())
+    cell = voxel_cell(vertices[v], origin, voxel_size_inverse(voxel_size))
+    center = origin + wp.vec3(
+        (wp.float32(cell[0]) + 0.5) * voxel_size,
+        (wp.float32(cell[1]) + 0.5) * voxel_size,
+        (wp.float32(cell[2]) + 0.5) * voxel_size,
+    )
+    wp.atomic_min(out_min_distance, labels[v], wp.length_sq(vertices[v] - center))
+
+
+@wp.kernel
+def cluster_pick_closest(
+    labels: wp.array[wp.int32],
+    vertices: wp.array[wp.vec3],
+    origin: wp.vec3,
+    voxel_size: wp.float32,
+    min_distance: wp.array[wp.float32],
+    out_representative: wp.array[wp.int32],
+) -> None:
+    # Pass 2: whichever vertices tie for their cluster's winning distance, the lowest index wins.
+    v = int(wp.tid())
+    cell = voxel_cell(vertices[v], origin, voxel_size_inverse(voxel_size))
+    center = origin + wp.vec3(
+        (wp.float32(cell[0]) + 0.5) * voxel_size,
+        (wp.float32(cell[1]) + 0.5) * voxel_size,
+        (wp.float32(cell[2]) + 0.5) * voxel_size,
+    )
+    if wp.length_sq(vertices[v] - center) <= min_distance[labels[v]]:
+        wp.atomic_min(out_representative, labels[v], v)
+
+
+@wp.kernel
+def faces_with_distinct_indices(faces: wp.array[wp.int32], out_mask: wp.array[wp.bool]) -> None:
+    # A face survives vertex clustering only if its three corners landed in three different cells.
+    f = int(wp.tid())
+    i0 = faces[f * 3 + 0]
+    i1 = faces[f * 3 + 1]
+    i2 = faces[f * 3 + 2]
+    out_mask[f] = i0 != i1 and i1 != i2 and i0 != i2
+
+
+# Objective for ``objective_flip_candidates``. A warp-uniform kernel argument rather than a
+# ``wp.Function``, so both predicates share one compiled module (AGENTS.md section 4).
+OBJECTIVE_PLANARITY = wp.constant(wp.int32(0))  # improve triangle shape on a near-planar quad
+OBJECTIVE_CURVATURE = wp.constant(wp.int32(1))  # pick whichever diagonal bends the surface less
+OBJECTIVE_T_VERTEX = wp.constant(wp.int32(2))  # break up a sliver whose apex sits on the far edge
+
+# Relative margin a flip must beat the current diagonal by. Without it a quad whose two diagonals
+# score equally (every quad of a regular grid) flips back and forth forever, one pass each way.
+OBJECTIVE_EPS = wp.constant(wp.float32(1e-6))
+
+
+@wp.kernel
+def objective_flip_candidates(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    adjacency: wp.array2d[wp.int32],
+    adjacency_edges: wp.array2d[wp.int32],
+    unshared: wp.array2d[wp.int32],
+    region_flags: wp.array[wp.int32],
+    sorted_edge_keys: wp.array[wp.uint64],
+    key_base: wp.uint64,
+    objective: wp.int32,
+    metric: wp.int32,
+    planar_cos: wp.float32,
+    aspect_threshold: wp.float32,
+    out_flip: wp.array[wp.bool],
+    out_quad: wp.array2d[wp.int32],
+) -> None:
+    # Quad convention (shared with ``delone_flip_candidates``): the current diagonal is a-c, with
+    # faces (a, b, c) and (a, c, d); the flip replaces it with b-d, giving (a, b, d) and (d, b, c).
+    k = int(wp.tid())
+    out_flip[k] = wp.bool(False)
+    f0 = adjacency[k, 0]
+    f1 = adjacency[k, 1]
+    if region_flags[f0] == 0 or region_flags[f1] == 0:
+        return
+    quad = _resolve_flip_quad_guarded(
+        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, wp.int32(k), f0, out_quad
+    )
+    a = quad[0]
+    b = quad[1]
+    c = quad[2]
+    d = quad[3]
+    if a < 0:
+        return
+    ap = vertices[a]
+    bp = vertices[b]
+    cp = vertices[c]
+    dp = vertices[d]
+
+    # A non-convex quad has no valid flip: the new diagonal would fall outside it.
+    if not is_unfold_quadrangle_convex(to_vec3d(ap), to_vec3d(bp), to_vec3d(cp), to_vec3d(dp)):
+        return
+
+    if objective == OBJECTIVE_T_VERTEX:
+        # A T-vertex shows up as a sliver: one apex sits (nearly) on the opposite edge, which drives
+        # the circumradius-to-inradius ratio through the roof. Flip only when the sliver is *that*
+        # bad and the flip actually improves it, so a merely thin triangle is left alone.
+        old_worst = wp.max(triangle_aspect_ratio(ap, bp, cp), triangle_aspect_ratio(ap, cp, dp))
+        if not (old_worst > aspect_threshold):  # also excludes a NaN ratio
+            return
+        new_worst = wp.max(triangle_aspect_ratio(ap, bp, dp), triangle_aspect_ratio(dp, bp, cp))
+        out_flip[k] = new_worst < old_worst
+        return
+
+    normal_abc = triangle_normal(ap, bp, cp)
+    normal_acd = triangle_normal(ap, cp, dp)
+    normal_abd = triangle_normal(ap, bp, dp)
+    normal_dbc = triangle_normal(dp, bp, cp)
+
+    if objective == OBJECTIVE_PLANARITY:
+        # Only rewrite a quad that is flat enough for the rewrite not to change the surface. The
+        # gate is on the *cosine* of the dihedral so the kernel needs no inverse trigonometry.
+        if wp.dot(normal_abc, normal_acd) < planar_cos:
+            return
+        old_score = wp.min(
+            triangle_quality(ap, bp, cp, metric), triangle_quality(ap, cp, dp, metric)
+        )
+        new_score = wp.min(
+            triangle_quality(ap, bp, dp, metric), triangle_quality(dp, bp, cp, metric)
+        )
+        out_flip[k] = new_score > old_score * (1.0 + OBJECTIVE_EPS)
+        return
+
+    # Curvature: keep whichever diagonal leaves the two triangles closer to coplanar. Unlike the
+    # planarity objective this deliberately *does* change the surface -- that is the point.
+    old_bend = wp.abs(dihedral_angle(normal_abc, normal_acd, cp - ap))
+    new_bend = wp.abs(dihedral_angle(normal_abd, normal_dbc, dp - bp))
+    out_flip[k] = new_bend < old_bend * (1.0 - OBJECTIVE_EPS)
+
+
+# ---------------------------------------------------------------------------
+# Quadric error metric (Garland-Heckbert) decimation
+# ---------------------------------------------------------------------------
+
+# Quadrics are accumulated in float64. That is not caution: the entries are sums of ``area * d^2``
+# with ``d`` an absolute plane offset, so on a mesh whose coordinates are far from the origin they
+# span many orders of magnitude and a float32 accumulation loses the small ones -- which are exactly
+# the terms that distinguish two candidate collapses. libigl and MeshLab both use double here.
+
+# Below this determinant (relative to the quadric's own scale) the 3x3 system is treated as singular
+# and the optimum falls back to the edge midpoint: a planar neighbourhood has a whole plane of
+# equally good positions and picking one by inversion amplifies noise.
+QUADRIC_SINGULAR_EPS = wp.constant(wp.float64(1e-12))
+
+# A collapse is rejected when it would turn an incident face's normal by more than this. Zero would
+# allow a face to become exactly degenerate; 0.2 (~78 degrees) still permits real simplification of
+# a curved region while refusing an outright fold.
+COLLAPSE_MIN_NORMAL_DOT = wp.constant(wp.float32(0.2))
+
+
+@wp.func
+def plane_quadric(normal: wp.vec3d, offset: wp.float64, weight: wp.float64) -> wp.mat44d:
+    # Garland-Heckbert fundamental quadric of the plane ``dot(normal, x) + offset = 0``, scaled by
+    # ``weight``. Laid out so that ``[p, 1]^T Q [p, 1]`` is the weighted squared distance to the
+    # plane: the leading 3x3 block is ``n n^T``, the last row and column are ``offset * n``, and the
+    # corner is ``offset^2``.
+    a = weight * normal[0]
+    b = weight * normal[1]
+    c = weight * normal[2]
+    d = weight * offset
+    return wp.mat44d(
+        a * normal[0],
+        a * normal[1],
+        a * normal[2],
+        a * offset,
+        b * normal[0],
+        b * normal[1],
+        b * normal[2],
+        b * offset,
+        c * normal[0],
+        c * normal[1],
+        c * normal[2],
+        c * offset,
+        d * normal[0],
+        d * normal[1],
+        d * normal[2],
+        d * offset,
+    )
+
+
+@wp.func
+def quadric_error(quadric: wp.mat44d, p: wp.vec3d) -> wp.float64:
+    # ``[p, 1]^T Q [p, 1]``: the accumulated squared distance from ``p`` to every plane folded into
+    # ``Q``. Clamped at zero, since a float64 sum of positive-semidefinite terms can still land a
+    # hair below it and a negative "error" would sort ahead of every real candidate.
+    homogeneous = wp.vec4d(p[0], p[1], p[2], wp.float64(1.0))
+    return wp.max(wp.float64(0.0), wp.dot(homogeneous, quadric * homogeneous))
+
+
+@wp.func
+def quadric_optimum(quadric: wp.mat44d, fallback: wp.vec3d) -> wp.vec3d:
+    # Position minimizing the quadric: solve ``A p = -b`` for the leading 3x3 block ``A`` and the
+    # last column ``b``. ``fallback`` (the edge midpoint) is returned when ``A`` is singular
+    # relative to its own scale, which is the planar case -- there the minimum is a whole plane and
+    # inverting a near-singular matrix would place the vertex arbitrarily far away.
+    a = wp.mat33d(
+        quadric[0, 0],
+        quadric[0, 1],
+        quadric[0, 2],
+        quadric[1, 0],
+        quadric[1, 1],
+        quadric[1, 2],
+        quadric[2, 0],
+        quadric[2, 1],
+        quadric[2, 2],
+    )
+    scale = wp.abs(quadric[0, 0]) + wp.abs(quadric[1, 1]) + wp.abs(quadric[2, 2])
+    if scale <= wp.float64(0.0):
+        return fallback
+    if wp.abs(wp.determinant(a)) <= QUADRIC_SINGULAR_EPS * scale * scale * scale:
+        return fallback
+    b = wp.vec3d(quadric[0, 3], quadric[1, 3], quadric[2, 3])
+    return -(wp.inverse(a) * b)
+
+
+@wp.kernel
+def accumulate_face_quadrics(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_quadrics: wp.array[wp.mat44d]
+) -> None:
+    # Area-weighted plane quadric of each face, scattered onto its three corners. Area weighting is
+    # Garland-Heckbert's: a large triangle constrains its vertices more than a sliver does.
+    f = int(wp.tid())
+    v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
+    cross = wp.cross(v1 - v0, v2 - v0)
+    double_area = wp.length(cross)
+    if double_area <= wp.float64(0.0):
+        return
+    normal = cross / double_area
+    quadric = plane_quadric(normal, -wp.dot(normal, v0), double_area * wp.float64(0.5))
+    for k in range(3):
+        wp.atomic_add(out_quadrics, faces[f * 3 + k], quadric)
+
+
+@wp.kernel
+def count_vertex_faces(faces: wp.array[wp.int32], out_counts: wp.array[wp.int32]) -> None:
+    f = int(wp.tid())
+    for k in range(3):
+        wp.atomic_add(out_counts, faces[f * 3 + k], 1)
+
+
+@wp.kernel
+def scatter_vertex_faces(
+    faces: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    cursor: wp.array[wp.int32],
+    out_vertex_faces: wp.array[wp.int32],
+) -> None:
+    # Vertex-to-face CSR payload. Row order is thread-order and therefore arbitrary, which is fine:
+    # the normal-flip guard reads the row as a *set*. A rotational order would need halfedge twins
+    # and would refuse a vertex-non-manifold mesh, which a decimator must not.
+    f = int(wp.tid())
+    for k in range(3):
+        v = faces[f * 3 + k]
+        out_vertex_faces[offsets[v] + wp.atomic_add(cursor, v, 1)] = f
+
+
+@wp.func
+def collapse_flips_normal(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    vertex_face_offsets: wp.array[wp.int32],
+    vertex_faces: wp.array[wp.int32],
+    moved: wp.int32,
+    partner: wp.int32,
+    target: wp.vec3,
+) -> wp.bool:
+    # Would moving ``moved`` to ``target`` (and welding it onto ``partner``) invert any face it
+    # still belongs to? The two faces containing *both* endpoints vanish in the collapse and are
+    # skipped; every other incident face keeps its other two corners and must keep its orientation.
+    #
+    # This is the guard that separates a usable decimator from one that produces self-intersecting
+    # geometry, and it is why the vertex-face CSR is built at all.
+    for slot in range(vertex_face_offsets[moved], vertex_face_offsets[moved + 1]):
+        f = vertex_faces[slot]
+        i0 = faces[f * 3 + 0]
+        i1 = faces[f * 3 + 1]
+        i2 = faces[f * 3 + 2]
+        if i0 == partner or i1 == partner or i2 == partner:
+            continue
+        p0 = vertices[i0]
+        p1 = vertices[i1]
+        p2 = vertices[i2]
+        before = wp.cross(p1 - p0, p2 - p0)
+        if i0 == moved:
+            p0 = target
+        elif i1 == moved:
+            p1 = target
+        else:
+            p2 = target
+        after = wp.cross(p1 - p0, p2 - p0)
+        before_length = wp.length(before)
+        after_length = wp.length(after)
+        if before_length <= 0.0:
+            continue  # already degenerate: nothing to invert
+        if after_length <= 0.0:
+            return True  # the collapse would flatten it outright
+        if wp.dot(before / before_length, after / after_length) < COLLAPSE_MIN_NORMAL_DOT:
+            return True
+    return False
+
+
+@wp.kernel
+def quadric_collapse_candidates(
+    unique_edges: wp.array2d[wp.int32],
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    quadrics: wp.array[wp.mat44d],
+    codes: wp.array[wp.int32],
+    edge_face_count: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    vertex_face_offsets: wp.array[wp.int32],
+    vertex_faces: wp.array[wp.int32],
+    out_survivor: wp.array[wp.int32],
+    out_removed: wp.array[wp.int32],
+    out_pos: wp.array[wp.vec3],
+    out_cost: wp.array[wp.float32],
+) -> None:
+    # Garland-Heckbert candidate: the cost of collapsing this edge and where its survivor lands.
+    # ``out_cost`` is left at +inf for a rejected edge, so the caller's cost sort puts every
+    # rejection past every candidate and the budget cut never picks one up.
+    k = int(wp.tid())
+    out_survivor[k] = -1
+    out_cost[k] = wp.inf
+    u = unique_edges[k, 0]
+    v = unique_edges[k, 1]
+    cu = codes[u]
+    cv = codes[v]
+    is_boundary = edge_face_count[k] == 1
+
+    # Feature handling mirrors ``collapse_candidates``: a corner never moves, a crease only
+    # collapses along its own feature, and otherwise the quadric chooses the position freely.
+    s = u
+    r = v
+    free_position = wp.bool(True)
+    if cu == CORNER_VERTEX and cv == CORNER_VERTEX:
+        return
+    if cu >= CREASE_VERTEX and cv >= CREASE_VERTEX:
+        if not (is_boundary and cu == CREASE_VERTEX and cv == CREASE_VERTEX):
+            return
+    elif cu >= CREASE_VERTEX:
+        s = u
+        r = v
+        free_position = wp.bool(False)
+    elif cv >= CREASE_VERTEX:
+        s = v
+        r = u
+        free_position = wp.bool(False)
+
+    # Link condition: exactly 2 shared neighbours for an interior edge, 1 for a boundary edge.
+    required = 2
+    if is_boundary:
+        required = 1
+    if csr_common_neighbor_count(offsets, columns, u, v) != required:
+        return
+
+    quadric = quadrics[u] + quadrics[v]
+    midpoint = (to_vec3d(vertices[u]) + to_vec3d(vertices[v])) * wp.float64(0.5)
+    optimum = midpoint
+    if free_position:
+        optimum = quadric_optimum(quadric, midpoint)
+    else:
+        optimum = to_vec3d(vertices[s])
+    target = to_vec3(optimum)
+
+    if collapse_flips_normal(
+        vertices, faces, vertex_face_offsets, vertex_faces, r, s, target
+    ) or collapse_flips_normal(vertices, faces, vertex_face_offsets, vertex_faces, s, r, target):
+        return
+
+    out_survivor[k] = s
+    out_removed[k] = r
+    out_pos[k] = target
+    out_cost[k] = wp.float32(quadric_error(quadric, optimum))
+
+
+@wp.kernel
+def assign_collapse_priority(
+    order: wp.array[wp.int32],
+    budget: wp.int32,
+    out_priority: wp.array[wp.int32],
+    out_survivor: wp.array[wp.int32],
+) -> None:
+    # Turn the cost ranking into the key the claim/commit pass locks with, and drop everything past
+    # the pass budget. Ranking by cost rather than by edge index is the whole difference between a
+    # quadric decimation and a shortest-edge one: the cheapest collapse must win a contested ring.
+    i = int(wp.tid())
+    k = order[i]
+    if i < int(budget):
+        out_priority[k] = i
+        return
+    out_priority[k] = INT32_MAX_CONSTANT
+    out_survivor[k] = -1
+
+
+@wp.func
+def scramble_index(index: wp.int32) -> wp.int32:
+    # Spatially incoherent lock key for the independent-set pass, from the candidate's own index.
+    #
+    # This is the load-bearing detail of the whole parallel selection. ``edges_unique`` orders edges
+    # lexicographically by endpoint index, which on any structured mesh is *spatially monotone* --
+    # and a monotone key field has essentially one local minimum, so a min-key lock commits a single
+    # collapse per pass however many candidates there are. Measured on ``saddle_graded``: locking by
+    # raw edge index yields exactly **1** winner out of 51 546 candidates, and locking by quadric
+    # cost yields 23 (the cost field is smoothly graded there, so it is monotone too). Hashing the
+    # index breaks the correlation and restores the expected ~candidates/valence winners.
+    #
+    # Murmur-style 32-bit finalizer; the top bit is cleared so the key stays a non-negative int32
+    # and ``INT32_MAX`` remains usable as the unclaimed sentinel.
+    x = wp.uint32(index)
+    x = (x ^ (x >> wp.uint32(16))) * wp.uint32(0x7FEB352D)
+    x = (x ^ (x >> wp.uint32(15))) * wp.uint32(0x846CA68B)
+    x = x ^ (x >> wp.uint32(16))
+    return wp.int32(x & wp.uint32(0x7FFFFFFF))
+
+
+@wp.kernel(enable_backward=False)
+def claim_collapse_key(
+    survivor: wp.array[wp.int32],
+    removed: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    out_min_key: wp.array[wp.int32],
+) -> None:
+    # Pass 1 of 3: the winning (smallest scrambled) key over the closed 1-rings of both endpoints.
+    k = int(wp.tid())
+    s = survivor[k]
+    if s < 0:
+        return
+    key = scramble_index(wp.int32(k))
+    r = removed[k]
+    wp.atomic_min(out_min_key, s, key)
+    wp.atomic_min(out_min_key, r, key)
+    for i in range(offsets[s], offsets[s + 1]):
+        wp.atomic_min(out_min_key, columns[i], key)
+    for i in range(offsets[r], offsets[r + 1]):
+        wp.atomic_min(out_min_key, columns[i], key)
+
+
+@wp.func
+def wins_key_everywhere(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    min_key: wp.array[wp.int32],
+    s: wp.int32,
+    r: wp.int32,
+    key: wp.int32,
+) -> wp.bool:
+    # Does ``key`` win at every vertex of the two closed 1-rings? ``min_key`` is a minimum over
+    # candidates including this one, so the test is equality rather than ``<=``.
+    if min_key[s] != key or min_key[r] != key:
+        return False
+    for i in range(offsets[s], offsets[s + 1]):
+        if min_key[columns[i]] != key:
+            return False
+    for i in range(offsets[r], offsets[r + 1]):
+        if min_key[columns[i]] != key:
+            return False
+    return True
+
+
+@wp.kernel(enable_backward=False)
+def claim_collapse_index(
+    survivor: wp.array[wp.int32],
+    removed: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    min_key: wp.array[wp.int32],
+    out_claim: wp.array[wp.int32],
+) -> None:
+    # Pass 2 of 3: two candidates whose scrambled keys collide would both believe they won, which
+    # would break independence -- unlikely at 2^31 keys, but a corrupted mesh when it happens. Among
+    # the key winners in a neighbourhood the lowest edge index takes it.
+    k = int(wp.tid())
+    s = survivor[k]
+    if s < 0:
+        return
+    r = removed[k]
+    if not wins_key_everywhere(offsets, columns, min_key, s, r, scramble_index(wp.int32(k))):
+        return
+    wp.atomic_min(out_claim, s, k)
+    wp.atomic_min(out_claim, r, k)
+    for i in range(offsets[s], offsets[s + 1]):
+        wp.atomic_min(out_claim, columns[i], k)
+    for i in range(offsets[r], offsets[r + 1]):
+        wp.atomic_min(out_claim, columns[i], k)
+
+
+@wp.kernel(enable_backward=False)
+def mark_collapse_winners(
+    survivor: wp.array[wp.int32],
+    removed: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    min_key: wp.array[wp.int32],
+    claim: wp.array[wp.int32],
+    cost: wp.array[wp.float32],
+    out_survivor: wp.array[wp.int32],
+    out_cost: wp.array[wp.float32],
+) -> None:
+    # Pass 3 of 3: the win test, kept separate from the commit so the caller can apply its per-pass
+    # budget *after* the independent set is known. Trimming members from an independent set keeps it
+    # independent; trimming the candidate list beforehand would change which set is found.
+    k = int(wp.tid())
+    out_cost[k] = wp.inf
+    s = survivor[k]
+    if s < 0:
+        out_survivor[k] = -1
+        return
+    r = removed[k]
+    won = wins_key_everywhere(offsets, columns, min_key, s, r, scramble_index(wp.int32(k)))
+    if claim[s] != k or claim[r] != k:
+        won = False
+    for i in range(offsets[s], offsets[s + 1]):
+        if claim[columns[i]] != k:
+            won = False
+    for i in range(offsets[r], offsets[r + 1]):
+        if claim[columns[i]] != k:
+            won = False
+    if not won:
+        out_survivor[k] = -1
+        return
+    out_survivor[k] = s
+    out_cost[k] = cost[k]
+
+
+@wp.kernel(enable_backward=False)
+def commit_selected_collapses(
+    survivor: wp.array[wp.int32],
+    removed: wp.array[wp.int32],
+    target_pos: wp.array[wp.vec3],
+    out_remap: wp.array[wp.int32],
+    out_positions: wp.array[wp.vec3],
+    out_count: wp.array[wp.int32],
+) -> None:
+    # Apply an already-independent set: no claim test, because ``mark_collapse_winners`` established
+    # independence and the budget cut only ever *removes* members from it.
+    k = int(wp.tid())
+    s = survivor[k]
+    if s < 0:
+        return
+    out_remap[removed[k]] = s
+    out_positions[s] = target_pos[k]
+    wp.atomic_add(out_count, 0, 1)

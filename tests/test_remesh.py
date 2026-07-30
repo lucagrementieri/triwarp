@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import numpy as np
+import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
 from scipy.spatial import KDTree
 
 import triwarp as tw
-from tests.conversions import bsr_to_dense, trimesh_to_warp
+from tests.conversions import bsr_to_dense, open3d_to_trimesh, trimesh_to_open3d, trimesh_to_warp
 
 
 def _undirected_edges(faces_np: np.ndarray) -> np.ndarray:
@@ -867,3 +868,500 @@ def test_intrinsic_delaunay_flips_a_grid_and_preserves_the_metric(
     semi = sides.sum(axis=1) / 2.0
     heron = semi * (semi - sides[:, 0]) * (semi - sides[:, 1]) * (semi - sides[:, 2])
     assert np.isclose(np.sqrt(np.maximum(heron, 0.0)).sum(), mesh_tm.area, rtol=1e-3, atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Vertex-clustering decimation vs open3d / pymeshlab
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("voxel_size", [0.1, 0.3])
+@pytest.mark.parametrize("contraction", ["average", "closest"])
+def test_cluster_decimate_matches_open3d(device: str, voxel_size: float, contraction: str) -> None:
+    """
+    Cell assignment is Open3D's, so the face count must match exactly, not approximately.
+
+    Open3D's grid anchor is ``min_bound - voxel_size / 2``; this pins that choice, since an anchor
+    at ``min_bound`` splits the vertices on the box face into two cells and the counts diverge.
+    """
+    sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=4)
+    simplified_o3d = trimesh_to_open3d(sphere_tm).simplify_vertex_clustering(voxel_size=voxel_size)
+
+    decimated_vertices_wp, decimated_faces_wp = tw.remesh.cluster_decimate(
+        vertices_wp, faces_wp, voxel_size=voxel_size, contraction=contraction
+    )
+    assert int(decimated_faces_wp.shape[0]) // 3 == len(simplified_o3d.triangles)
+    assert int(decimated_vertices_wp.shape[0]) == len(simplified_o3d.vertices)
+
+    if contraction == "average":
+        # Same cells and the same mean per cell, so the vertex *sets* coincide pointwise.
+        distance_np, _index = KDTree(np.asarray(simplified_o3d.vertices)).query(
+            decimated_vertices_wp.numpy().astype(np.float64)
+        )
+        assert distance_np.max() < 1e-5
+    else:
+        # 'Closest to centre' keeps every output vertex on the input surface, exactly.
+        distance_np, _index = KDTree(np.asarray(sphere_tm.vertices)).query(
+            decimated_vertices_wp.numpy().astype(np.float64)
+        )
+        assert distance_np.max() < 1e-5
+
+
+def test_cluster_decimate_stays_near_the_input_surface(device: str) -> None:
+    """A resampling, so the shape has to survive: Hausdorff within about one cell."""
+    sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=4)
+    voxel_size = 0.2
+    decimated_vertices_wp, decimated_faces_wp = tw.remesh.cluster_decimate(
+        vertices_wp, faces_wp, voxel_size=voxel_size
+    )
+    deviation = _two_sided_hausdorff(
+        np.asarray(sphere_tm.vertices),
+        np.asarray(sphere_tm.faces),
+        decimated_vertices_wp.numpy().astype(np.float64),
+        decimated_faces_wp.numpy().reshape(-1, 3),
+    )
+    assert deviation < voxel_size
+
+
+def test_cluster_decimate_emits_no_degenerate_or_duplicated_faces(device: str) -> None:
+    """Collapsed faces are dropped and welded duplicates deduped: both are part of the algorithm."""
+    _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=4)
+    decimated_vertices_wp, decimated_faces_wp = tw.remesh.cluster_decimate(
+        vertices_wp, faces_wp, voxel_size=0.25
+    )
+    faces_np = decimated_faces_wp.numpy().reshape(-1, 3)
+    assert _degenerate_face_count(decimated_vertices_wp.numpy().astype(np.float64), faces_np) == 0
+    assert len(np.unique(np.sort(faces_np, axis=1), axis=0)) == faces_np.shape[0]
+    # Every output vertex is referenced by a face.
+    assert len(np.unique(faces_np)) == int(decimated_vertices_wp.shape[0])
+
+
+def test_cluster_decimate_decimates_monotonically(device: str) -> None:
+    """A wider cell can only ever produce fewer faces."""
+    _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=4)
+    counts = [
+        int(tw.remesh.cluster_decimate(vertices_wp, faces_wp, voxel_size=size)[1].shape[0]) // 3
+        for size in (0.05, 0.1, 0.2, 0.4)
+    ]
+    assert counts == sorted(counts, reverse=True)
+    assert counts[-1] < counts[0]
+
+
+def test_cluster_decimate_default_voxel_size(device: str) -> None:
+    """The default is 1% of the bounding-box diagonal, matching MeshLab's ``threshold``."""
+    _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=4)
+    default_faces_wp = tw.remesh.cluster_decimate(vertices_wp, faces_wp)[1]
+    diagonal = float(np.linalg.norm(np.array([2.0, 2.0, 2.0])))
+    explicit_faces_wp = tw.remesh.cluster_decimate(
+        vertices_wp, faces_wp, voxel_size=0.01 * diagonal
+    )[1]
+    assert int(default_faces_wp.shape[0]) == int(explicit_faces_wp.shape[0])
+
+
+def test_cluster_decimate_invalid(device: str) -> None:
+    _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=2)
+    with pytest.raises(ValueError, match="voxel_size > 0"):
+        tw.remesh.cluster_decimate(vertices_wp, faces_wp, voxel_size=0.0)
+    with pytest.raises(ValueError, match="contraction must be"):
+        tw.remesh.cluster_decimate(vertices_wp, faces_wp, contraction="quadric")  # type: ignore[arg-type]
+
+
+def test_cluster_decimate_empty(device: str) -> None:
+    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    out_vertices_wp, out_faces_wp = tw.remesh.cluster_decimate(vertices_wp, faces_wp)
+    assert int(out_vertices_wp.shape[0]) == 0
+    assert int(out_faces_wp.shape[0]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Objective-driven edge flips vs pymeshlab
+# ---------------------------------------------------------------------------
+
+
+def _sheared_grid(n: int = 24, shear: float = 4.0) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build a **flat** grid of sheared parallelograms, split along each cell's long diagonal.
+
+    Shear is what makes this a fixture: a rectangle's two diagonals are the same length, so both
+    triangulations of it are congruent and no quality objective can prefer either — an
+    axis-aligned grid, however anisotropic, has nothing to flip. Shearing by ``shear`` cells makes
+    one diagonal ``(1 + shear, 1)`` and the other ``(1 - shear, -1)``, so the right flip exists at
+    every quad and the planarity objective must find it. The default ``shear=4`` maximizes the
+    *relative* gain: pushing it higher makes both triangles worse, so the ratio shrinks back
+    toward 1 even as the mesh gets uglier. Flat, so the flip is a pure
+    retriangulation and cannot change the surface.
+    """
+    i_grid, j_grid = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
+    vertices = np.column_stack(
+        [
+            (i_grid + shear * j_grid).ravel().astype(np.float64),
+            j_grid.ravel().astype(np.float64),
+            np.zeros(n * n),
+        ]
+    )
+    faces = []
+    for i in range(n - 1):
+        for j in range(n - 1):
+            a = i * n + j
+            faces += [[a, a + 1, a + n + 1], [a, a + n + 1, a + n]]
+    return vertices, np.ascontiguousarray(faces, dtype=np.int32)
+
+
+def _saddle_grid(n: int = 16, step: float = 0.15) -> tuple[np.ndarray, np.ndarray]:
+    """
+    ``z = x y`` over a square grid: the fixture the curvature objective exists for.
+
+    On a hyperbolic paraboloid the two diagonals of a quad have *opposite* curvature — one runs
+    along a ruling of the surface and is nearly straight, the other bends. So the choice is
+    maximally consequential, and the current diagonal is deliberately the bending one.
+    """
+    i_grid, j_grid = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
+    x_np = (i_grid * step).ravel().astype(np.float64)
+    y_np = (j_grid * step).ravel().astype(np.float64)
+    vertices = np.column_stack([x_np, y_np, x_np * y_np])
+    faces = []
+    for i in range(n - 1):
+        for j in range(n - 1):
+            a = i * n + j
+            faces += [[a, a + 1, a + n + 1], [a, a + n + 1, a + n]]
+    return vertices, np.ascontiguousarray(faces, dtype=np.int32)
+
+
+def _upload(vertices_np: np.ndarray, faces_np: np.ndarray, device: str):
+    return (
+        wp.array(np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device),
+        wp.array(
+            np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32),
+            dtype=wp.int32,
+            device=device,
+        ),
+    )
+
+
+def _min_quality(vertices_wp, faces_wp, metric: str = "area_max_side") -> float:
+    return float(tw.triangles.face_quality(vertices_wp, faces_wp, metric=metric).numpy().min())
+
+
+def _total_bend(vertices_np: np.ndarray, faces_np: np.ndarray) -> float:
+    """Sum of the absolute dihedral angle over every interior edge — the curvature objective."""
+    mesh_tm = tm.Trimesh(vertices_np, faces_np, process=False)
+    return float(np.abs(mesh_tm.face_adjacency_angles).sum())
+
+
+def test_flip_by_objective_planarity_improves_the_worst_triangle(device: str) -> None:
+    """Every quad of a flat sheared grid has a better diagonal, and the flip must take it."""
+    vertices_np, faces_np = _sheared_grid()
+    vertices_wp, faces_wp = _upload(vertices_np, faces_np, device)
+    before = _min_quality(vertices_wp, faces_wp)
+
+    flipped_wp = tw.remesh.flip_by_objective(vertices_wp, faces_wp, objective="planarity")
+    after = _min_quality(vertices_wp, flipped_wp)
+    assert after > before * 1.4
+
+    # A retriangulation: same faces, same vertices, still a clean manifold patch.
+    assert int(flipped_wp.shape[0]) == int(faces_wp.shape[0])
+    assert tw.validation.is_winding_consistent(flipped_wp)
+    assert tw.validation.is_edge_manifold(flipped_wp)
+    assert _degenerate_face_count(vertices_np, flipped_wp.numpy().reshape(-1, 3)) == 0
+
+
+def test_flip_by_objective_planarity_at_least_matches_pymeshlab(device: str) -> None:
+    """
+    MeshLab runs the same objective serially, so it is a bar on how many flips this port finds.
+
+    ``meshing_edge_flip_by_planar_optimization`` takes the *same* planarity threshold and the *same*
+    quality metric (``planartype='area/max side'``), and its greedy serial pass is free to take
+    every flip in any order. A parallel independent-set pass can only ever match it, so requiring
+    the resulting worst triangle to be within 10% is a real check that the predicate agrees.
+    """
+    vertices_np, faces_np = _sheared_grid()
+    meshset_pml = ml.MeshSet()
+    meshset_pml.add_mesh(ml.Mesh(vertices_np, np.ascontiguousarray(faces_np, dtype=np.int32)))
+    meshset_pml.meshing_edge_flip_by_planar_optimization(
+        pthreshold=1.0, planartype="area/max side", iterations=10
+    )
+    faces_pml = meshset_pml.current_mesh().face_matrix()
+    assert faces_pml.shape[0] == faces_np.shape[0]
+
+    vertices_wp, faces_wp = _upload(vertices_np, faces_np, device)
+    _vertices_pml_wp, faces_pml_wp = _upload(vertices_np, faces_pml, device)
+    flipped_wp = tw.remesh.flip_by_objective(vertices_wp, faces_wp, objective="planarity")
+    assert _min_quality(vertices_wp, flipped_wp) >= 0.9 * _min_quality(vertices_wp, faces_pml_wp)
+
+
+def test_flip_by_objective_planarity_refuses_a_curved_quad(device: str) -> None:
+    """With ``planar_angle=0`` nothing is flat enough, so the triangulation must be untouched."""
+    _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=3)
+    flipped_wp = tw.remesh.flip_by_objective(
+        vertices_wp, faces_wp, objective="planarity", planar_angle=0.0
+    )
+    assert np.array_equal(flipped_wp.numpy(), faces_wp.numpy())
+
+
+def test_flip_by_objective_curvature_flattens(device: str) -> None:
+    """The curvature objective must lower the total absolute dihedral angle."""
+    vertices_np, faces_np = _saddle_grid()
+    vertices_wp, faces_wp = _upload(vertices_np, faces_np, device)
+    before = _total_bend(vertices_np, faces_np)
+
+    flipped_wp = tw.remesh.flip_by_objective(vertices_wp, faces_wp, objective="curvature")
+    after = _total_bend(vertices_np, flipped_wp.numpy().reshape(-1, 3))
+    assert after < before
+    assert int(flipped_wp.shape[0]) == int(faces_wp.shape[0])
+    assert tw.validation.is_winding_consistent(flipped_wp)
+    assert tw.validation.is_edge_manifold(flipped_wp)
+
+
+def test_flip_by_objective_curvature_leaves_a_sphere_alone(device: str) -> None:
+    """
+    An icosphere's diagonals are already the flat ones, so a converged pass changes nothing much.
+
+    Not an equality assertion: the icosphere's quads are close enough to symmetric that a handful
+    genuinely tie, and the relative ``1e-6`` margin is what keeps those from oscillating. What must
+    hold is that the total bend does not *increase*.
+    """
+    sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=3)
+    before = _total_bend(np.asarray(sphere_tm.vertices), np.asarray(sphere_tm.faces))
+    flipped_wp = tw.remesh.flip_by_objective(vertices_wp, faces_wp, objective="curvature")
+    after = _total_bend(np.asarray(sphere_tm.vertices), flipped_wp.numpy().reshape(-1, 3))
+    assert after <= before * (1.0 + 1e-6)
+
+
+def test_flip_by_objective_region_gated(device: str) -> None:
+    """Faces outside the region keep their edges, so the flip count can only go down."""
+    vertices_np, faces_np = _sheared_grid()
+    vertices_wp, faces_wp = _upload(vertices_np, faces_np, device)
+    n_faces = int(faces_wp.shape[0]) // 3
+    region_np = np.zeros(n_faces, dtype=bool)
+    region_np[: n_faces // 4] = True
+    region_wp = wp.array(region_np, dtype=wp.bool, device=device)
+
+    full_wp = tw.remesh.flip_by_objective(vertices_wp, faces_wp, objective="planarity")
+    gated_wp = tw.remesh.flip_by_objective(
+        vertices_wp, faces_wp, objective="planarity", region=region_wp
+    )
+    changed_full = int((full_wp.numpy() != faces_wp.numpy()).sum())
+    changed_gated = int((gated_wp.numpy() != faces_wp.numpy()).sum())
+    assert 0 < changed_gated < changed_full
+
+
+def test_flip_by_objective_invalid(device: str) -> None:
+    _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=1)
+    with pytest.raises(ValueError, match="objective must be"):
+        tw.remesh.flip_by_objective(vertices_wp, faces_wp, objective="delaunay")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="metric must be one of"):
+        tw.remesh.flip_by_objective(vertices_wp, faces_wp, metric="aspect_ratio")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="planar_angle must be in"):
+        tw.remesh.flip_by_objective(vertices_wp, faces_wp, planar_angle=200.0)
+    with pytest.raises(ValueError, match="region must have length"):
+        tw.remesh.flip_by_objective(
+            vertices_wp, faces_wp, region=wp.zeros(2, dtype=wp.bool, device=device)
+        )
+
+
+def test_flip_by_objective_empty(device: str) -> None:
+    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    assert int(tw.remesh.flip_by_objective(vertices_wp, faces_wp).shape[0]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Quadric edge-collapse decimation vs igl / open3d / pymeshlab
+# ---------------------------------------------------------------------------
+
+
+def _inverted_face_count(vertices_np: np.ndarray, faces_np: np.ndarray) -> int:
+    """
+    Faces whose outward normal points *inward* on a star-shaped mesh centred on the origin.
+
+    The failure mode an unguarded quadric method produces at a high reduction ratio, and cheap to
+    detect on a sphere: a correctly oriented face has its normal agreeing with its own centroid.
+    """
+    mesh_tm = tm.Trimesh(vertices_np, faces_np, process=False)
+    centroids_np = mesh_tm.vertices[mesh_tm.faces].mean(axis=1)
+    return int((np.einsum("ij,ij->i", mesh_tm.face_normals, centroids_np) < 0.0).sum())
+
+
+@pytest.mark.parametrize("target_faces", [2560, 1024, 512])
+def test_quadric_decimate_beats_igl_and_open3d_on_deviation(device: str, target_faces: int) -> None:
+    """
+    At the same face count this port must be no *worse* than the two serial references.
+
+    The plan for this port said to expect the batched-parallel formulation to pick a different
+    sequence of collapses from a serial priority queue, and to compare by deviation rather than by
+    equality. It does, and it comes out ahead: measured two-sided Hausdorff to the input icosphere
+    at 512 faces is **0.0147 here against igl's 0.0250 and Open3D's 0.0236**, and the ordering holds
+    at every target. Spreading the collapses over independent sets rather than draining a queue
+    keeps the error evenly distributed, which is what a max-norm rewards.
+
+    The assertion is one-sided with slack, not an equality — the point is that the parallel method
+    is competitive, not that this exact ratio is a contract.
+    """
+    igl_module = pytest.importorskip("igl")
+    sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=4)
+    vertices_np = np.ascontiguousarray(sphere_tm.vertices, dtype=np.float64)
+    faces_np = np.ascontiguousarray(sphere_tm.faces, dtype=np.int64)
+
+    decimated_igl = igl_module.decimate(vertices_np, faces_np, target_faces)
+    igl_tm = tm.Trimesh(np.asarray(decimated_igl[0]), np.asarray(decimated_igl[1]), process=False)
+    mesh_o3d = trimesh_to_open3d(sphere_tm).simplify_quadric_decimation(
+        target_number_of_triangles=target_faces
+    )
+    o3d_tm = open3d_to_trimesh(mesh_o3d)
+
+    decimated_vertices_wp, decimated_faces_wp = tw.remesh.quadric_decimate(
+        vertices_wp, faces_wp, target_faces=target_faces
+    )
+    assert int(decimated_faces_wp.shape[0]) // 3 == target_faces
+
+    deviation_wp = _two_sided_hausdorff(
+        vertices_np,
+        np.asarray(sphere_tm.faces),
+        decimated_vertices_wp.numpy().astype(np.float64),
+        decimated_faces_wp.numpy().reshape(-1, 3),
+    )
+    deviation_igl = _two_sided_hausdorff(
+        vertices_np, np.asarray(sphere_tm.faces), igl_tm.vertices, igl_tm.faces
+    )
+    deviation_o3d = _two_sided_hausdorff(
+        vertices_np, np.asarray(sphere_tm.faces), o3d_tm.vertices, o3d_tm.faces
+    )
+    assert deviation_wp <= 1.2 * min(deviation_igl, deviation_o3d)
+
+
+def test_quadric_decimate_emits_no_inverted_or_degenerate_faces(device: str) -> None:
+    """The normal-flip guard's job: even at 5% of the triangles, nothing folds over."""
+    _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=4)
+    decimated_vertices_wp, decimated_faces_wp = tw.remesh.quadric_decimate(
+        vertices_wp, faces_wp, target_ratio=0.05
+    )
+    vertices_np = decimated_vertices_wp.numpy().astype(np.float64)
+    faces_np = decimated_faces_wp.numpy().reshape(-1, 3)
+    assert _inverted_face_count(vertices_np, faces_np) == 0
+    assert _degenerate_face_count(vertices_np, faces_np) == 0
+    assert tw.validation.is_edge_manifold(decimated_faces_wp, allow_boundary_edges=False)
+    assert tw.validation.is_winding_consistent(decimated_faces_wp)
+
+
+def test_quadric_decimate_preserves_the_topology(device: str) -> None:
+    """A closed genus-0 surface stays closed and genus 0, and its volume barely moves."""
+    sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=4)
+    decimated_vertices_wp, decimated_faces_wp = tw.remesh.quadric_decimate(
+        vertices_wp, faces_wp, target_ratio=0.2
+    )
+    decimated_tm = tm.Trimesh(
+        decimated_vertices_wp.numpy().astype(np.float64),
+        decimated_faces_wp.numpy().reshape(-1, 3),
+        process=False,
+    )
+    assert decimated_tm.is_watertight
+    assert decimated_tm.euler_number == 2
+    assert np.isclose(decimated_tm.volume, sphere_tm.volume, rtol=0.02)
+
+
+def test_quadric_decimate_keeps_the_features_of_a_cube(device: str) -> None:
+    """
+    A cube's twelve edges are its whole shape, and the metric has to spend its budget elsewhere.
+
+    This is the property that distinguishes a quadric method from a length-driven one: the flat
+    faces have zero quadric cost to collapse and the creases have a large one, so the sharp edges
+    survive down to the coarsest usable mesh. Checked as the surviving dihedral distribution, which
+    is invariant to *which* particular collapses happened.
+    """
+    box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0]).subdivide().subdivide().subdivide()
+    vertices_wp, faces_wp = _upload(np.asarray(box_tm.vertices), np.asarray(box_tm.faces), device)
+    decimated_vertices_wp, decimated_faces_wp = tw.remesh.quadric_decimate(
+        vertices_wp, faces_wp, target_ratio=0.1
+    )
+    decimated_tm = tm.Trimesh(
+        decimated_vertices_wp.numpy().astype(np.float64),
+        decimated_faces_wp.numpy().reshape(-1, 3),
+        process=False,
+    )
+    # Still a box: the same eight corners, the same volume, and 90-degree edges intact.
+    assert np.allclose(decimated_tm.bounds, box_tm.bounds, atol=1e-4)
+    assert np.isclose(decimated_tm.volume, box_tm.volume, rtol=0.02)
+    angles_np = np.rad2deg(np.abs(decimated_tm.face_adjacency_angles))
+    assert np.percentile(angles_np, 95.0) > 85.0
+
+
+def test_quadric_decimate_reaches_pymeshlab_quality(device: str) -> None:
+    """
+    ``meshing_decimation_quadric_edge_collapse`` is the same metric, driven serially.
+
+    Its ``autoclean`` default deletes unreferenced vertices, so the MeshSet is built fresh here (it
+    is one of the two filters recorded as not idempotent even in geometry). Compared by deviation,
+    as with the other two references.
+    """
+    sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=4)
+    target_faces = 1024
+    meshset_pml = ml.MeshSet()
+    meshset_pml.add_mesh(
+        ml.Mesh(
+            np.ascontiguousarray(sphere_tm.vertices, dtype=np.float64),
+            np.ascontiguousarray(sphere_tm.faces, dtype=np.int32),
+        )
+    )
+    meshset_pml.meshing_decimation_quadric_edge_collapse(targetfacenum=target_faces)
+    mesh_pml = meshset_pml.current_mesh()
+    pml_tm = tm.Trimesh(mesh_pml.vertex_matrix(), mesh_pml.face_matrix(), process=False)
+
+    decimated_vertices_wp, decimated_faces_wp = tw.remesh.quadric_decimate(
+        vertices_wp, faces_wp, target_faces=target_faces
+    )
+    vertices_np = np.ascontiguousarray(sphere_tm.vertices, dtype=np.float64)
+    deviation_wp = _two_sided_hausdorff(
+        vertices_np,
+        np.asarray(sphere_tm.faces),
+        decimated_vertices_wp.numpy().astype(np.float64),
+        decimated_faces_wp.numpy().reshape(-1, 3),
+    )
+    deviation_pml = _two_sided_hausdorff(
+        vertices_np, np.asarray(sphere_tm.faces), pml_tm.vertices, pml_tm.faces
+    )
+    assert deviation_wp <= 1.2 * deviation_pml
+
+
+def test_quadric_decimate_is_monotone_in_the_target(device: str) -> None:
+    _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=4)
+    counts = [
+        int(tw.remesh.quadric_decimate(vertices_wp, faces_wp, target_ratio=ratio)[1].shape[0]) // 3
+        for ratio in (0.8, 0.4, 0.2, 0.1)
+    ]
+    assert counts == sorted(counts, reverse=True)
+
+
+def test_quadric_decimate_target_at_or_above_the_input_is_a_copy(device: str) -> None:
+    _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=2)
+    n_faces = int(faces_wp.shape[0]) // 3
+    for kwargs in (
+        {"target_faces": n_faces},
+        {"target_faces": n_faces + 100},
+        {"target_ratio": 1.0},
+    ):
+        out_vertices_wp, out_faces_wp = tw.remesh.quadric_decimate(vertices_wp, faces_wp, **kwargs)
+        assert np.array_equal(out_faces_wp.numpy(), faces_wp.numpy())
+        assert np.array_equal(out_vertices_wp.numpy(), vertices_wp.numpy())
+
+
+def test_quadric_decimate_invalid(device: str) -> None:
+    _sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=1)
+    with pytest.raises(ValueError, match="exactly one of target_faces and target_ratio"):
+        tw.remesh.quadric_decimate(vertices_wp, faces_wp)
+    with pytest.raises(ValueError, match="exactly one of target_faces and target_ratio"):
+        tw.remesh.quadric_decimate(vertices_wp, faces_wp, target_faces=10, target_ratio=0.5)
+    with pytest.raises(ValueError, match="target_faces must be non-negative"):
+        tw.remesh.quadric_decimate(vertices_wp, faces_wp, target_faces=-1)
+    with pytest.raises(ValueError, match=r"target_ratio must be in \(0, 1\]"):
+        tw.remesh.quadric_decimate(vertices_wp, faces_wp, target_ratio=0.0)
+
+
+def test_quadric_decimate_empty(device: str) -> None:
+    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    out_vertices_wp, out_faces_wp = tw.remesh.quadric_decimate(
+        vertices_wp, faces_wp, target_faces=0
+    )
+    assert int(out_vertices_wp.shape[0]) == 0
+    assert int(out_faces_wp.shape[0]) == 0

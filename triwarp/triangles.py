@@ -77,6 +77,85 @@ def face_angles(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> twt.A
     return twt.as_array2d_float32(out_angle)
 
 
+_QUALITY_METRICS: dict[str, wp.int32] = {
+    "aspect_ratio": kernel_triangles.QUALITY_ASPECT_RATIO,
+    "radius_ratio": kernel_triangles.QUALITY_RADIUS_RATIO,
+    "area_max_side": kernel_triangles.QUALITY_AREA_MAX_SIDE,
+    "mean_ratio": kernel_triangles.QUALITY_MEAN_RATIO,
+    "area": kernel_triangles.QUALITY_AREA,
+}
+
+FaceQualityMetric = Literal["aspect_ratio", "radius_ratio", "area_max_side", "mean_ratio", "area"]
+"""Shape-quality measure selected by [`face_quality`][triwarp.triangles.face_quality]."""
+
+
+def face_quality(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    metric: FaceQualityMetric = "aspect_ratio",
+) -> wp.array[wp.float32]:
+    """
+    Per-face shape-quality measure.
+
+    This is the quantity the library already uses internally to decide whether a triangle is worth
+    keeping — [`isotropic_remesh`][triwarp.remesh.isotropic_remesh] and
+    [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay] gate on ``aspect_ratio``, and the
+    hole-filling cost functions weight candidate triangles by it — exposed so a caller can inspect
+    or threshold it directly.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    metric
+        Which measure to compute. All but ``"area"`` are invariant to a uniform scaling of the
+        mesh, and all but ``"aspect_ratio"`` are *larger is better*:
+
+        - ``"aspect_ratio"`` (default) — circumradius over twice the inradius. ``1`` for an
+          equilateral triangle and unbounded above, so **smaller is better**; a degenerate
+          triangle reads ``+inf``. This is MeshLib's ``triangleAspectRatio`` and the measure the
+          remeshing gates use.
+        - ``"radius_ratio"`` — inradius over circumradius, rescaled so an equilateral triangle
+          reads ``1``; ``0`` when degenerate. MeshLab's ``inradius/circumradius``.
+        - ``"area_max_side"`` — twice the area over the longest side squared, ``sqrt(3)/2`` at
+          best. MeshLab's ``area/max side`` (scale-invariant despite the name).
+        - ``"mean_ratio"`` — ``4 sqrt(3) A / (a^2 + b^2 + c^2)``, ``1`` at best. MeshLab's
+          ``Mean ratio``.
+        - ``"area"`` — the plain triangle area, for parity with MeshLab's ``Area``; identical to
+          the second return of
+          [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas].
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        Length-``n_faces`` quality values on ``vertices.device``.
+
+    Raises
+    ------
+    ValueError
+        If ``metric`` is not one of the listed names.
+
+    See Also
+    --------
+    [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]
+    [`nondegenerate`][triwarp.triangles.nondegenerate]
+    [`triwarp.remesh.isotropic_remesh`][triwarp.remesh.isotropic_remesh]
+    """
+    if metric not in _QUALITY_METRICS:
+        raise ValueError(f"unknown metric {metric!r}, expected one of {sorted(_QUALITY_METRICS)}")
+    f = faces.shape[0] // 3
+    out_quality = wp.empty(f, dtype=wp.float32, device=vertices.device)
+    wp.launch(
+        kernel_triangles.face_quality,
+        dim=f,
+        inputs=[vertices, faces, _QUALITY_METRICS[metric], out_quality],
+        device=vertices.device,
+    )
+    return out_quality
+
+
 def centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.vec3:
     """
     Area-weighted centroid of the mesh surface.

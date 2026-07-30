@@ -12,18 +12,27 @@ corners and needs no adjacency at all.
 These are unweighted means. For an area- or angle-weighted transfer of *normals* specifically, see
 [`triwarp.vertices`][triwarp.vertices]; for a UV-space resampling, see
 [`triwarp.texture`][triwarp.texture].
+
+[`transfer_onto_vertices`][triwarp.interpolation.transfer_onto_vertices] moves a field between two
+*different* meshes instead of between one mesh's element types, by closest-point projection onto the
+source surface — the operation you need after a remesh or a decimation has changed the vertex set
+under a field.
 """
 
 from __future__ import annotations
 
-from typing import cast
+from typing import TypeVar, cast
 
 import warp as wp
 
+import triwarp as tw
 import triwarp.typing as twt
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import interpolation as kernel_interpolation
 from triwarp.kernels import scatter as kernel_scatter
+
+DType = TypeVar("DType")
+"""Element type of a transferred field: any Warp dtype closed under scaling and addition."""
 
 
 def average_onto_faces(
@@ -151,3 +160,91 @@ def average_from_edges_onto_vertices(
     )
     wp.map(kernel_array.divide_if_positive, out_sum, out_valence, out=out_sum)
     return out_sum
+
+
+def transfer_onto_vertices(
+    source_vertices: wp.array[wp.vec3],
+    source_faces: wp.array[wp.int32],
+    source_values: wp.array[DType],
+    target_vertices: wp.array[wp.vec3],
+    *,
+    max_dist: float | None = None,
+) -> tuple[wp.array[DType], wp.array[wp.float32]]:
+    """
+    Resample a source mesh's per-vertex field onto another mesh's vertices.
+
+    For each target vertex, the closest point on the *source surface* is found and the source field
+    is interpolated there barycentrically. This is the transfer to use when two meshes describe the
+    same shape at different resolutions — after a remesh, a decimation or a reconstruction — and a
+    field computed on one of them has to follow. It is MeshLab's ``transfer_attributes_per_vertex``
+    with ``vertexsampling=False``.
+
+    Because the closest point is taken on the surface rather than at the nearest *vertex*, the
+    result is continuous in the target positions and exact for a field that is already linear on the
+    source triangles — which is what makes it safe to chain (a transfer onto a refinement of the
+    same mesh reproduces the field, not a blur of it).
+
+    Parameters
+    ----------
+    source_vertices
+        ``(n_source,)`` source mesh vertex positions.
+    source_faces
+        Length-``3 * n_source_faces`` ``wp.int32`` source triangle index buffer.
+    source_values
+        Length-``n_source`` field on the source vertices. Any Warp dtype closed under scaling and
+        addition works: ``wp.float32`` for a scalar, ``wp.vec3`` for a normal or a colour.
+    target_vertices
+        ``(n_target,)`` positions to sample at — usually another mesh's vertices, but any point set
+        will do.
+    max_dist
+        Maximum search radius per target vertex. Targets with no source face within it keep the
+        zero-filled output and report ``inf`` in the returned distance, which is how a caller
+        detects them. When ``None``, derived from the box enclosing both meshes, so every target
+        hits.
+
+    Returns
+    -------
+    values : wp.array[DType]
+        Length-``n_target`` transferred field on ``target_vertices.device``. Zero-filled wherever
+        the closest-point query missed.
+    distance : wp.array[wp.float32]
+        Length-``n_target`` distance from each target vertex to the source surface — the transfer's
+        own confidence measure, and ``inf`` for a miss.
+
+    See Also
+    --------
+    [`average_onto_vertices`][triwarp.interpolation.average_onto_vertices]
+    [`triwarp.proximity.closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]
+    [`triwarp.triangles.barycentric_to_points`][triwarp.triangles.barycentric_to_points]
+    """
+    device = target_vertices.device
+    n_target = int(target_vertices.shape[0])
+    n_source = int(source_vertices.shape[0])
+    if int(source_values.shape[0]) != n_source:
+        raise ValueError(
+            f"source_values must have one entry per source vertex, got "
+            f"{source_values.shape[0]} for {n_source} vertices"
+        )
+
+    out_values = wp.zeros(n_target, dtype=source_values.dtype, device=device)
+    if n_target == 0 or int(source_faces.shape[0]) == 0:
+        return out_values, wp.full(n_target, float("inf"), dtype=wp.float32, device=device)
+
+    closest, distance, face_id = tw.proximity.closest_point_on_mesh(
+        source_vertices, source_faces, target_vertices, max_dist=max_dist
+    )
+    wp.launch(
+        kernel_interpolation.transfer_onto_vertices,
+        dim=n_target,
+        inputs=[
+            source_vertices,
+            source_faces,
+            source_values,
+            closest,
+            face_id,
+            out_values,
+            distance,
+        ],
+        device=device,
+    )
+    return out_values, distance

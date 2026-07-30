@@ -1,7 +1,33 @@
-"""Laplacian mesh smoothing filters (Warp)."""
+"""
+Laplacian smoothing filters (Warp), for vertex positions and for per-vertex scalar fields.
+
+Most of the module moves *geometry*: [`filter_laplacian`][triwarp.smoothing.filter_laplacian],
+[`filter_taubin`][triwarp.smoothing.filter_taubin],
+[`filter_humphrey`][triwarp.smoothing.filter_humphrey],
+[`filter_neighborhood_average`][triwarp.smoothing.filter_neighborhood_average],
+[`filter_mut_dif_laplacian`][triwarp.smoothing.filter_mut_dif_laplacian] and
+[`filter_implicit_fairing`][triwarp.smoothing.filter_implicit_fairing] all diffuse vertex positions
+through the same row-stochastic 1-ring operator, differing in the time integration and in what they
+do to counteract shrinkage. [`position_verts_smoothly`][triwarp.smoothing.position_verts_smoothly]
+and its sharp-boundary variant instead solve a Dirichlet problem over a *region*, holding the rest
+of the mesh fixed.
+
+Three functions break that pattern by working on the *normal* field instead of positions, which is
+what lets them keep a crease sharp: [`filter_normals`][triwarp.smoothing.filter_normals] diffuses
+face normals with a crease gate, [`filter_two_step`][triwarp.smoothing.filter_two_step] then refits
+the vertices to them, and [`filter_unsharp_mask`][triwarp.smoothing.filter_unsharp_mask] runs the
+whole idea backwards to *sharpen*.
+
+The last two functions run the same operator over a per-vertex **scalar** field rather than
+positions: [`filter_scalar_laplacian`][triwarp.smoothing.filter_scalar_laplacian] diffuses it, and
+[`saturate_scalar_gradient`][triwarp.smoothing.saturate_scalar_gradient] caps how fast it may vary
+along an edge. The second is not a smoothing filter at all — it is a one-sided Lipschitz projection,
+which is what turns a raw scalar into a usable sizing or falloff field.
+"""
 
 from __future__ import annotations
 
+import math
 from typing import NamedTuple
 
 import warp as wp
@@ -1027,5 +1053,465 @@ def position_verts_smoothly(
         dim=n,
         inputs=[free_mask, free_map, sol[0], sol[1], sol[2], out],
         device=device,
+    )
+    return out
+
+
+def filter_scalar_laplacian(
+    values: wp.array[wp.float32],
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    lamb: float = 0.5,
+    iterations: int = 10,
+    laplacian_operator: wps.BsrMatrix[wp.float32] | None = None,
+) -> wp.array[wp.float32]:
+    """
+    Diffuse a per-vertex scalar field through the 1-ring averaging operator.
+
+    The scalar counterpart of [`filter_laplacian`][triwarp.smoothing.filter_laplacian], running the
+    identical explicit step ``q' = q + lamb (L q - q)`` on a field rather than on positions. Reach
+    for it whenever a computed per-vertex quantity is noisier than the thing it will drive —
+    curvature before it selects features, a heat or occlusion field before it becomes a weight, a
+    per-vertex sizing function before it drives remeshing.
+
+    On a **closed** mesh, ``lamb=1.0, iterations=1`` is exactly MeshLab's
+    ``apply_scalar_smoothing_per_vertex``: one unweighted 1-ring average with the vertex's own value
+    excluded. The defaults instead match the rest of this module (a partial step, repeated), which
+    is the gentler behaviour a caller usually wants.
+
+    !!! note "It differs from MeshLab on a boundary"
+        VCG's ``VertexQualityLaplacian`` smooths a boundary vertex along the **boundary curve
+        only** — it averages just that vertex's two boundary neighbours and ignores the rest of its
+        ring, so the boundary values evolve as an independent 1D field. That is a different
+        operator, not this one with other constants, and it is why the pymeshlab oracle in
+        ``tests/test_smoothing.py`` runs on closed fixtures. Here a boundary vertex averages its
+        whole ring like any other; to hold the boundary fixed instead, restore its values after the
+        call.
+
+    Parameters
+    ----------
+    values
+        Length-``n_vertices`` ``wp.float32`` field to smooth. Not modified.
+    vertices
+        ``(n_vertices,)`` mesh vertex positions — needed only to build the operator, and ignored
+        when ``laplacian_operator`` is supplied.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    lamb
+        Step size. ``0`` leaves the field unchanged, ``1`` replaces each value by its 1-ring
+        average outright. Values above ``1`` overshoot and are unstable.
+    iterations
+        Number of passes. ``0`` returns a copy of the input.
+    laplacian_operator
+        Optional precomputed row-stochastic operator (see
+        [`laplacian`][triwarp.laplacian.laplacian]). Pass it to hoist the build out of a loop, or
+        to smooth with inverse-edge-length weights instead.
+
+        When ``None`` it is built as ``laplacian(vertices, faces, symmetric=True)`` — the
+        **symmetric** 1-ring, unlike [`filter_laplacian`][triwarp.smoothing.filter_laplacian],
+        which defaults to trimesh's directed ``mesh.edges`` adjacency. The two agree on a closed
+        mesh and differ on a boundary vertex, where the directed adjacency is missing some of its
+        neighbours; for a scalar field the symmetric ring is both the defensible choice and the one
+        MeshLab makes.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        Length-``n_vertices`` smoothed field on ``values.device``.
+
+    Raises
+    ------
+    ValueError
+        If ``values`` is not length ``n_vertices``.
+
+    See Also
+    --------
+    [`saturate_scalar_gradient`][triwarp.smoothing.saturate_scalar_gradient]
+    [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
+    [`triwarp.laplacian.laplacian`][triwarp.laplacian.laplacian]
+    """
+    device = values.device
+    n = int(vertices.shape[0])
+    if int(values.shape[0]) != n:
+        raise ValueError(
+            f"values must have one entry per vertex, got {values.shape[0]} for {n} vertices"
+        )
+
+    out = wp.empty(n, dtype=wp.float32, device=device)
+    wp.copy(out, values)
+    if n == 0 or iterations == 0:
+        return out
+
+    operator = (
+        laplacian_operator
+        if laplacian_operator is not None
+        else laplacian.laplacian(vertices, faces, symmetric=True)
+    )
+    average = wp.empty(n, dtype=wp.float32, device=device)
+    nxt = wp.empty(n, dtype=wp.float32, device=device)
+    coeff = wp.float32(lamb)
+    step = wp.map(
+        kernel_smoothing.scalar_laplacian_step, out, average, coeff, out=nxt, return_kernel=True
+    )
+    for _ in range(iterations):
+        wp.launch(
+            kernel_smoothing.apply_operator_scalar,
+            dim=n,
+            inputs=[operator.offsets, operator.columns, operator.values, out, average],
+            device=device,
+        )
+        wp.launch(step, dim=n, inputs=[out, average, coeff], outputs=[nxt], device=device)
+        out, nxt = nxt, out
+    return out
+
+
+def saturate_scalar_gradient(
+    values: wp.array[wp.float32],
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    threshold: float = 1.0,
+    max_iterations: int = 0,
+) -> wp.array[wp.float32]:
+    """
+    Cap how fast a per-vertex scalar may grow with distance, by lowering values only.
+
+    Enforces the one-sided Lipschitz bound ``q_i <= q_j + |p_i - p_j| / threshold`` on every edge,
+    which after convergence gives the *upper envelope*
+    ``q(v) = min_u (q_0(u) + d(u, v) / threshold)`` over shortest paths ``d`` through the edge
+    graph. Nothing is ever raised, so every local minimum of the input survives untouched and only
+    peaks that rise too steeply out of them are shaved down.
+
+    This is MeshLab's ``apply_scalar_saturation_per_vertex`` (VCG ``VertexSaturate``), and the
+    standard way to make a raw scalar usable as a **sizing field**: an adaptive remesher fed an
+    ungraded target-length field produces a band of bad triangles where the field jumps, and this is
+    the projection that removes the jump while respecting the field's small values.
+
+    !!! note "``threshold`` is a reciprocal slope"
+        The admissible change per unit distance is ``1 / threshold``, matching MeshLab. So a
+        *larger* ``threshold`` is a *stricter* cap — ``threshold=2`` allows half the variation
+        ``threshold=1`` does.
+
+    Parameters
+    ----------
+    values
+        Length-``n_vertices`` ``wp.float32`` field. Not modified.
+    vertices
+        ``(n_vertices,)`` mesh vertex positions; edge lengths are measured from these.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    threshold
+        Reciprocal of the maximum admissible slope; must be positive.
+    max_iterations
+        Cap on relaxation passes. Each pass propagates the bound one edge further, so the number
+        needed is the graph diameter of the region that violates it. ``0`` (the default) means
+        ``n_vertices``, which can never be exceeded.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        Length-``n_vertices`` saturated field on ``values.device``.
+
+    Raises
+    ------
+    ValueError
+        If ``threshold <= 0``, ``max_iterations < 0``, or ``values`` is not length ``n_vertices``.
+
+    See Also
+    --------
+    [`filter_scalar_laplacian`][triwarp.smoothing.filter_scalar_laplacian]
+    [`triwarp.remesh.isotropic_remesh`][triwarp.remesh.isotropic_remesh]
+    """
+    if threshold <= 0.0:
+        raise ValueError(f"threshold must be positive, got {threshold}")
+    if max_iterations < 0:
+        raise ValueError(f"max_iterations must be non-negative, got {max_iterations}")
+
+    device = values.device
+    n = int(vertices.shape[0])
+    if int(values.shape[0]) != n:
+        raise ValueError(
+            f"values must have one entry per vertex, got {values.shape[0]} for {n} vertices"
+        )
+
+    out = wp.empty(n, dtype=wp.float32, device=device)
+    wp.copy(out, values)
+    if n == 0 or int(faces.shape[0]) == 0:
+        return out
+
+    adjacency = tw.graph.edges_to_csr(n, tw.edges.faces_to_edges(faces))
+    nxt = wp.empty(n, dtype=wp.float32, device=device)
+    changed = wp.zeros(1, dtype=wp.int32, device=device)
+    inverse_threshold = wp.float32(1.0 / threshold)
+    # The pass count is data-dependent (it is the diameter of the violating region), and the flag
+    # readback is ~0.1 ms against ~1 ms of launches per pass, so checking every pass is the cheaper
+    # side of that trade -- see the ``linalg`` note on ``check_every``.
+    for _ in range(max_iterations or n):
+        changed.zero_()
+        wp.launch(
+            kernel_smoothing.saturate_gradient_pass,
+            dim=n,
+            inputs=[
+                adjacency.offsets,
+                adjacency.columns,
+                vertices,
+                inverse_threshold,
+                out,
+                nxt,
+                changed,
+            ],
+            device=device,
+        )
+        out, nxt = nxt, out
+        if int(changed.numpy()[0]) == 0:
+            break
+    return out
+
+
+def filter_normals(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    iterations: int = 20,
+    threshold: float = 60.0,
+    face_adjacency: twt.Array2dInt32 | None = None,
+) -> wp.array[wp.vec3]:
+    """
+    Smooth the *face normals* without moving a vertex, preserving creases.
+
+    Each pass replaces a face's normal with the area-weighted average of its own and those of its
+    edge-neighbours **whose normal is within ``threshold`` of it**. That gate is what makes this
+    feature-preserving rather than isotropic: across a crease the two normals disagree by more than
+    the threshold and never average, so a sharp edge survives any number of passes while noise on a
+    flat region diffuses away in a few. MeshLab's ``apply_normal_smoothing_per_face``.
+
+    The result is a normal field that is no longer the geometric normal of any triangle — it is the
+    *target* for [`filter_two_step`][triwarp.smoothing.filter_two_step]'s second half, and useful on
+    its own for shading.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions. Not modified.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    iterations
+        Number of diffusion passes over the normal field. MeshLab's ``stepnormalnum``, whose default
+        of ``20`` is this one.
+    threshold
+        Angle in **degrees** beyond which two neighbouring faces refuse to average. ``0`` averages
+        nothing and ``180`` averages everything (isotropic). MeshLab's ``normalthr``, default
+        ``60``. Must be in ``[0, 180]``.
+    face_adjacency
+        Optional ``(m, 2)`` adjacency from
+        [`face_adjacency`][triwarp.adjacency.face_adjacency]; recomputed when ``None``. Pass it to
+        hoist the build out of a loop — the topology never changes here, so it is safe to reuse.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        Length-``n_faces`` unit normals on ``vertices.device``.
+
+    Raises
+    ------
+    ValueError
+        If ``threshold`` is outside ``[0, 180]``.
+
+    See Also
+    --------
+    [`filter_two_step`][triwarp.smoothing.filter_two_step]
+    [`triwarp.triangles.face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]
+    """
+    if not 0.0 <= threshold <= 180.0:
+        raise ValueError(f"threshold must be in [0, 180] degrees, got {threshold}")
+
+    device = vertices.device
+    n_faces = int(faces.shape[0]) // 3
+    normals, areas = face_normals_and_areas(vertices, faces)
+    if n_faces == 0 or iterations <= 0:
+        return normals
+
+    if face_adjacency is None:
+        face_adjacency = tw.adjacency.face_adjacency(faces)
+    m = int(face_adjacency.shape[0])
+    threshold_cos = wp.float32(math.cos(math.radians(threshold)))
+
+    accumulated = wp.empty(n_faces, dtype=wp.vec3, device=device)
+    for _ in range(iterations):
+        wp.map(kernel_smoothing.seed_weighted_normal, normals, areas, out=accumulated)
+        if m > 0:
+            wp.launch(
+                kernel_smoothing.accumulate_smoothed_normals,
+                dim=m,
+                inputs=[normals, areas, face_adjacency, threshold_cos, accumulated],
+                device=device,
+            )
+        wp.map(wp.normalize, accumulated, out=normals)
+    return normals
+
+
+def filter_two_step(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    iterations: int = 3,
+    threshold: float = 60.0,
+    normal_iterations: int = 20,
+    fit_iterations: int = 20,
+) -> wp.array[wp.vec3]:
+    """
+    Feature-preserving smoothing: filter the face normals, then fit the vertices to them.
+
+    The one filter in this module that does **not** blur a crease. Every other scheme here diffuses
+    positions directly, which cannot distinguish noise from a sharp edge — both are high-frequency.
+    Two-step smoothing (Ohtake et al., and MeshLab's ``apply_coord_two_steps_smoothing``) separates
+    the two questions:
+
+    1. **Where should the surface face?** Diffuse the *normal* field with
+       [`filter_normals`][triwarp.smoothing.filter_normals], whose threshold refuses to average
+       across a crease. Noise is removed; the crease is not.
+    2. **Where should the vertices go?** Move each vertex so the planes through its incident faces'
+       centroids with those filtered normals agree as well as possible — a gradient step repeated
+       ``fit_iterations`` times, with no free step size (the average over incident faces is the
+       step).
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions. Not modified.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer. The topology never changes.
+    iterations
+        Number of outer passes; each one re-derives the normals from the current positions and
+        refits. MeshLab's ``stepsmoothnum``, default ``3``.
+    threshold
+        Crease threshold in **degrees** for the normal filter. See
+        [`filter_normals`][triwarp.smoothing.filter_normals]. MeshLab's ``normalthr``, default
+        ``60``.
+    normal_iterations
+        Normal-diffusion passes per outer pass. MeshLab's ``stepnormalnum``, default ``20``.
+    fit_iterations
+        Vertex-fitting gradient steps per outer pass. MeshLab's ``stepfitnum``, default ``20``.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        Smoothed ``(n_vertices,)`` vertex positions on ``vertices.device``.
+
+    Raises
+    ------
+    ValueError
+        If ``threshold`` is outside ``[0, 180]``.
+
+    See Also
+    --------
+    [`filter_normals`][triwarp.smoothing.filter_normals]
+    [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
+    [`filter_unsharp_mask`][triwarp.smoothing.filter_unsharp_mask]
+
+    Notes
+    -----
+    There is no volume constraint and none is needed: the fitting step moves each vertex *along* the
+    filtered normals rather than toward its neighbours' mean, so the systematic inward drift that
+    [`filter_laplacian`][triwarp.smoothing.filter_laplacian] has to correct for does not arise. A
+    flat region is already a fixed point of both halves.
+    """
+    device = vertices.device
+    n = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    out = wp.empty(n, dtype=wp.vec3, device=device)
+    wp.copy(out, vertices)
+    if n == 0 or n_faces == 0 or iterations <= 0:
+        return out
+
+    # The topology is fixed, so the adjacency is built once for every pass of both halves.
+    adjacency = tw.adjacency.face_adjacency(faces)
+    delta = wp.empty(n, dtype=wp.vec3, device=device)
+    counts = wp.empty(n, dtype=wp.float32, device=device)
+    for _ in range(iterations):
+        normals = filter_normals(
+            out, faces, iterations=normal_iterations, threshold=threshold, face_adjacency=adjacency
+        )
+        for _fit in range(fit_iterations):
+            delta.zero_()
+            counts.zero_()
+            wp.launch(
+                kernel_smoothing.fit_vertices_to_normals,
+                dim=n_faces,
+                inputs=[out, faces, normals, delta, counts],
+                device=device,
+            )
+            wp.map(kernel_smoothing.apply_fit_step, out, delta, counts, out=out)
+    return out
+
+
+def filter_unsharp_mask(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    weight: float = 0.3,
+    weight_original: float = 1.0,
+    iterations: int = 5,
+    laplacian_operator: wps.BsrMatrix[wp.float32] | None = None,
+) -> wp.array[wp.vec3]:
+    """
+    Sharpen a surface by adding back the detail a smoothing pass removes.
+
+    The inverse of a smoothing filter, built from one: the difference between the mesh and its
+    Laplacian-smoothed self *is* its high-frequency content, so adding a multiple of that difference
+    exaggerates every feature. MeshLab's ``apply_coord_unsharp_mask``, and the standard way to
+    recover crispness lost to an earlier smoothing or a decimation.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions. Not modified.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    weight
+        How much of the detail to add back. ``0`` leaves the mesh unchanged and large values amplify
+        noise as readily as features. MeshLab's ``weight``, default ``0.3``.
+    weight_original
+        Multiplier on the original position, MeshLab's ``weightorig``. ``1`` (the default) keeps the
+        surface where it is and only sharpens; anything else scales the whole mesh about the origin.
+    iterations
+        Laplacian passes used to define "smoothed", so this sets the *scale* of detail that gets
+        amplified: more passes remove lower frequencies and therefore sharpen more coarsely.
+        MeshLab's ``iterations``, default ``5``.
+    laplacian_operator
+        Optional precomputed operator, forwarded to
+        [`filter_laplacian`][triwarp.smoothing.filter_laplacian].
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        Sharpened ``(n_vertices,)`` vertex positions on ``vertices.device``.
+
+    See Also
+    --------
+    [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
+    [`filter_two_step`][triwarp.smoothing.filter_two_step]
+    """
+    device = vertices.device
+    n = int(vertices.shape[0])
+    out = wp.empty(n, dtype=wp.vec3, device=device)
+    if n == 0:
+        return out
+    # No volume constraint on the inner smoothing: its rescaling would leak into the difference and
+    # show up as a uniform scaling of the sharpened mesh rather than as detail.
+    smoothed = filter_laplacian(
+        vertices,
+        faces,
+        lamb=1.0,
+        iterations=iterations,
+        volume_constraint=False,
+        laplacian_operator=laplacian_operator,
+    )
+    wp.map(
+        kernel_smoothing.unsharp_step,
+        vertices,
+        smoothed,
+        wp.float32(weight),
+        wp.float32(weight_original),
+        out=out,
     )
     return out

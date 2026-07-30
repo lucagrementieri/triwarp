@@ -400,6 +400,16 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "benchmeshes(*names): mesh names for a benchmark (registry or feature); bypasses --size.",
     )
+    # Declared here but enforced from tests/: the parity gate is a static scan so that it runs in
+    # the default ``pytest`` invocation, which does not collect this directory at all. Validating
+    # here as well would put the same rule in two places, and the weaker of the two would be the
+    # one that only fires when somebody remembers to run the benchmarks.
+    config.addinivalue_line(
+        "markers",
+        "noparity(kind, reason=..., oracle=...): a reference this benchmark times whose *result* "
+        "is not comparable with triwarp's. reason= is required prose; oracle= names the library "
+        "that is the correctness oracle instead, and must itself be covered. See tests/parity.py.",
+    )
     # Default to one comparison table per (function, mesh): the ``group`` marker is the function
     # name and ``param:mesh_name`` splits by mesh, so each table lists the libraries side by side.
     # Only applied when the user did not pass their own ``--benchmark-group-by``.

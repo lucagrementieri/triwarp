@@ -281,3 +281,55 @@ def test_screened_poisson(
         rounds=_HEAVY_ROUNDS,
     )
     assert int(faces.shape[0]) > 0
+
+
+# Cell sizes for the resampling group, as a fraction of the bbox diagonal. 2% is MeshLab's own
+# default; 1% is eight times the field evaluation, which is what makes the pair worth having.
+_RESAMPLE_CELL_FRACTIONS = [0.02, 0.01]
+
+
+@pytest.mark.benchmark(group="resample_uniform")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.parametrize("cell_fraction", _RESAMPLE_CELL_FRACTIONS)
+def test_resample_uniform(bench_case: BenchCase, cell_fraction: float) -> None:
+    """
+    Sample the signed distance field on a grid and march it: the one **cubic** group in the suite.
+
+    Both rows get the identical absolute cell size, derived from the mesh's own bounding-box
+    diagonal on the host so neither side computes its own. The pair is a slope check: halving the
+    cell is 8x the lattice on both sides, and on ``bunny`` triwarp measures **9.9 to 13.5 ms** for
+    it -- a 1.4x rise against an 8x lattice, so the field evaluation is *not* what dominates and the
+    fixed marching and cleanup passes are. MeshLab rises 206 to 292 ms over the same step, also
+    sublinear. Read a regression here as the slope steepening rather than the absolute number
+    moving.
+
+    MeshLab's ``offset`` parameter is passed as ``PureValue(0.0)``: as a ``PercentageValue`` it runs
+    from full erosion at 0% to full dilation at 100%, so its own 50% default is the *zero* offset
+    and ``PercentageValue(0)`` would erode the mesh away (measured: a unit sphere down to radius
+    0.30).
+    """
+    diagonal = float(
+        np.linalg.norm(bench_case.vertices_np.max(axis=0) - bench_case.vertices_np.min(axis=0))
+    )
+    voxel_size = cell_fraction * diagonal
+    if bench_case.kind == "pymeshlab":
+        # ``generate_*`` pushes a new mesh onto the set, so the MeshSet is rebuilt per round.
+        skip_larger_than(bench_case, "bunny", "MeshLab marches the whole lattice on one core")
+        new_meshset_pml = bench_case.new_meshset_pml
+
+        def resample_pml() -> int:
+            meshset_pml = new_meshset_pml()
+            meshset_pml.generate_resampled_uniform_mesh(
+                cellsize=ml.PureValue(voxel_size), offset=ml.PureValue(0.0)
+            )
+            return meshset_pml.current_mesh().face_number()
+
+        assert bench_case.run(resample_pml, rounds=_HEAVY_ROUNDS) > 0
+        return
+    skip_larger_than(bench_case, "bunny", "a 1% lattice over dragon is 8 GB of field")
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    _out_vertices, out_faces = bench_case.run(
+        lambda: tw.reconstruction.resample_uniform(vertices, faces, voxel_size=voxel_size),
+        rounds=_HEAVY_ROUNDS,
+    )
+    assert int(out_faces.shape[0]) > 0

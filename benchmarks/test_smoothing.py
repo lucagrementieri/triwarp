@@ -66,6 +66,26 @@ Two caveats govern every row:
   triwarp's with other constants. It is a per-pass cost reference and nothing more: it is
   deliberately **not** used as a test oracle in ``tests/test_smoothing.py``, where trimesh remains
   the only HC check.
+
+``filter_two_step`` is the module's other regime change, and the one on the **quality** axis for a
+different reason from ``filter_laplacian``: it is *three* nested loops (outer passes x normal
+diffusion x vertex fitting, 3 x 20 x 20 at MeshLab's defaults), so its cost is a fixed 1 200 passes
+over the adjacency whatever the mesh, and the axis is there to confirm that triangle shape does not
+change it. ``filter_normals`` times the inner half alone, which is what separates the normal
+diffusion from the fitting solve. Both have pymeshlab references at the same four parameters;
+``apply_coord_two_steps_smoothing`` rewrites the coordinates, so that row carries the MeshSet build
+like the other ``apply_coord_*`` rows.
+
+The last two groups leave positions alone and run over a per-vertex **scalar** field:
+``filter_scalar_laplacian`` against ``apply_scalar_smoothing_per_vertex`` and
+``saturate_scalar_gradient`` against ``apply_scalar_saturation_per_vertex``. Both are on the
+**scale** axis, and they are the two ends of a spectrum this module otherwise does not cover:
+diffusion is a fixed number of SpMV passes, while saturation is a Bellman-Ford relaxation whose pass
+count is the *graph diameter of the violating region*, so it is the one group here whose cost is
+genuinely data-dependent. Seeding it from a single spike is the worst case on purpose -- the cap has
+to propagate across the whole mesh -- so read that row as an upper bound rather than a typical one.
+Both filters need the scalar attribute to exist on the MeshSet, which means those rows rebuild it
+(they mutate the attribute, and saturation is not idempotent in it either).
 """
 
 from __future__ import annotations
@@ -73,6 +93,7 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
+import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
@@ -84,6 +105,7 @@ import triwarp as tw
 _ITERATIONS = 10
 
 _operator_cache: dict[tuple[str, str], wps.BsrMatrix[wp.float32]] = {}
+_scalar_cache: dict[tuple[str, str], wp.array[wp.float32]] = {}
 
 
 def _laplacian_operator(bench_case: BenchCase) -> wps.BsrMatrix[wp.float32]:
@@ -324,3 +346,192 @@ def test_filter_implicit_fairing(bench_case: BenchCase) -> None:
         )
     assert result.shape == vertices.shape
     assert np.isfinite(result.numpy()).all()
+
+
+def _spike_field_np(bench_case: BenchCase) -> np.ndarray:
+    """Build a delta at vertex 0: the steepest field there is, so saturation travels furthest."""
+    values_np = np.zeros(bench_case.n_vertices, dtype=np.float64)
+    values_np[0] = 10.0
+    return values_np
+
+
+def _scalar_field_wp(bench_case: BenchCase) -> wp.array[wp.float32]:
+    """Upload the same spike as a device ``float32`` buffer, cached per (mesh, device)."""
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _scalar_cache:
+        _scalar_cache[key] = wp.array(
+            _spike_field_np(bench_case).astype(np.float32),
+            dtype=wp.float32,
+            device=bench_case.device,
+        )
+    return _scalar_cache[key]
+
+
+def _new_scalar_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
+    """Build a fresh MeshSet carrying the spike as its vertex scalar attribute."""
+    meshset_pml = ml.MeshSet()
+    meshset_pml.add_mesh(
+        ml.Mesh(
+            bench_case.vertices_np,
+            np.ascontiguousarray(bench_case.faces_np, dtype=np.int32),
+            v_scalar_array=_spike_field_np(bench_case),
+        )
+    )
+    return meshset_pml
+
+
+@pytest.mark.benchmark(group="filter_scalar_laplacian")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+def test_filter_scalar_laplacian(bench_case: BenchCase) -> None:
+    """Ten diffusion passes over a scalar field, against MeshLab's single full-step pass."""
+    n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pymeshlab":
+        _skip_pml_beyond_bunny(bench_case)
+
+        def smooth_pml() -> int:
+            meshset_pml = _new_scalar_meshset_pml(bench_case)
+            meshset_pml.apply_scalar_smoothing_per_vertex()
+            return meshset_pml.current_mesh().vertex_number()
+
+        assert bench_case.run(smooth_pml) == n_vertices
+        return
+    values, vertices, faces = (
+        _scalar_field_wp(bench_case),
+        bench_case.vertices_wp,
+        bench_case.faces_wp,
+    )
+    operator = _laplacian_operator(bench_case)
+    smoothed = bench_case.run(
+        lambda: tw.smoothing.filter_scalar_laplacian(
+            values, vertices, faces, iterations=_ITERATIONS, laplacian_operator=operator
+        )
+    )
+    assert smoothed.shape == (n_vertices,)
+
+
+@pytest.mark.benchmark(group="saturate_scalar_gradient")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+def test_saturate_scalar_gradient(bench_case: BenchCase) -> None:
+    """
+    Lipschitz projection of a scalar field: a relaxation whose pass count is the graph diameter.
+
+    Capped at ``bunny_decimated`` on both sides. The spike seed makes every pass matter, so the
+    triwarp row is ``diameter`` launches deep and the MeshLab row is a serial flood over the same
+    region -- neither says anything new at larger scale that the two smallest meshes do not.
+    """
+    skip_larger_than(bench_case, "bunny_decimated", "a spike-seeded relaxation is diameter-deep")
+    n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pymeshlab":
+
+        def saturate_pml() -> int:
+            meshset_pml = _new_scalar_meshset_pml(bench_case)
+            meshset_pml.apply_scalar_saturation_per_vertex(gradientthr=1.0)
+            return meshset_pml.current_mesh().vertex_number()
+
+        assert bench_case.run(saturate_pml) == n_vertices
+        return
+    values, vertices, faces = (
+        _scalar_field_wp(bench_case),
+        bench_case.vertices_wp,
+        bench_case.faces_wp,
+    )
+    saturated = bench_case.run(
+        lambda: tw.smoothing.saturate_scalar_gradient(values, vertices, faces, threshold=1.0),
+        rounds=3,
+    )
+    assert saturated.shape == (n_vertices,)
+
+
+# MeshLab's two-step defaults, used verbatim on both sides: 3 outer passes, a 60-degree crease
+# threshold, 20 normal-diffusion steps and 20 fitting steps.
+_TWO_STEP_OUTER = 3
+_TWO_STEP_NORMAL_THRESHOLD = 60.0
+_TWO_STEP_NORMAL_STEPS = 20
+_TWO_STEP_FIT_STEPS = 20
+
+
+@pytest.mark.benchmark(group="filter_normals")
+@pytest.mark.benchaxis("quality")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+def test_filter_normals(bench_case: BenchCase) -> None:
+    """The crease-gated normal diffusion alone: 20 scatter passes over the face adjacency."""
+    n_faces = bench_case.n_faces
+    if bench_case.kind == "pymeshlab":
+        # ``apply_normal_smoothing_per_face`` exposes no parameters at all -- no step count, no
+        # threshold -- so its row is a *single* pass against triwarp's 20 and is a per-pass
+        # reference only. It writes the face normal attribute and leaves the coordinates alone, so
+        # the MeshSet is shared.
+        meshset_pml = bench_case.meshset_pml
+        bench_case.run(meshset_pml.apply_normal_smoothing_per_face)
+        assert meshset_pml.current_mesh().face_normal_matrix().shape == (n_faces, 3)
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    normals = bench_case.run(
+        lambda: tw.smoothing.filter_normals(
+            vertices, faces, iterations=_TWO_STEP_NORMAL_STEPS, threshold=_TWO_STEP_NORMAL_THRESHOLD
+        )
+    )
+    assert normals.shape == (n_faces,)
+
+
+@pytest.mark.benchmark(group="filter_two_step")
+@pytest.mark.benchaxis("quality")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+def test_filter_two_step(bench_case: BenchCase) -> None:
+    """Normal diffusion plus vertex fitting, at MeshLab's own 3 x 20 x 20 defaults on both sides."""
+    n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pymeshlab":
+        _skip_pml_beyond_bunny(bench_case)
+        new_meshset_pml = bench_case.new_meshset_pml  # mutates the coordinates
+
+        def two_step_pml() -> int:
+            meshset_pml = new_meshset_pml()
+            meshset_pml.apply_coord_two_steps_smoothing(
+                stepsmoothnum=_TWO_STEP_OUTER,
+                normalthr=_TWO_STEP_NORMAL_THRESHOLD,
+                stepnormalnum=_TWO_STEP_NORMAL_STEPS,
+                stepfitnum=_TWO_STEP_FIT_STEPS,
+            )
+            return meshset_pml.current_mesh().vertex_number()
+
+        assert bench_case.run(two_step_pml, rounds=3) == n_vertices
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    smoothed = bench_case.run(
+        lambda: tw.smoothing.filter_two_step(
+            vertices,
+            faces,
+            iterations=_TWO_STEP_OUTER,
+            threshold=_TWO_STEP_NORMAL_THRESHOLD,
+            normal_iterations=_TWO_STEP_NORMAL_STEPS,
+            fit_iterations=_TWO_STEP_FIT_STEPS,
+        ),
+        rounds=3,
+    )
+    assert smoothed.shape == (n_vertices,)
+
+
+@pytest.mark.benchmark(group="filter_unsharp_mask")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+def test_filter_unsharp_mask(bench_case: BenchCase) -> None:
+    """Five Laplacian passes plus one blend: the cheapest thing in the module, on the scan sweep."""
+    n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pymeshlab":
+        _skip_pml_beyond_bunny(bench_case)
+        new_meshset_pml = bench_case.new_meshset_pml
+
+        def unsharp_pml() -> int:
+            meshset_pml = new_meshset_pml()
+            meshset_pml.apply_coord_unsharp_mask(weight=0.3, weightorig=1.0, iterations=5)
+            return meshset_pml.current_mesh().vertex_number()
+
+        assert bench_case.run(unsharp_pml) == n_vertices
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    operator = _laplacian_operator(bench_case)
+    sharpened = bench_case.run(
+        lambda: tw.smoothing.filter_unsharp_mask(
+            vertices, faces, weight=0.3, iterations=5, laplacian_operator=operator
+        )
+    )
+    assert sharpened.shape == (n_vertices,)

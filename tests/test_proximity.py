@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import igl
 import numpy as np
+import pymeshlab as ml
 import pytest
 import trimesh as tm
 import trimesh.proximity as tm_proximity
@@ -502,3 +503,209 @@ def test_max_tangent_sphere_empty(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> No
     centers_wp, radii_wp = tw.proximity.max_tangent_sphere(mesh_wp, points_wp)
     assert centers_wp.shape == (0,)
     assert radii_wp.shape == (0,)
+
+
+# ---------------------------------------------------------------------------
+# Shape diameter function (pymeshlab reference; analytic on a sphere)
+# ---------------------------------------------------------------------------
+
+
+def _sphere_wp(device: str, radius: float, subdivisions: int = 3):
+    sphere_tm = tm.creation.icosphere(subdivisions=subdivisions, radius=radius)
+    vertices_wp = wp.array(
+        np.ascontiguousarray(sphere_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    faces_wp = wp.array(
+        np.ascontiguousarray(sphere_tm.faces.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=device,
+    )
+    mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
+    normals_wp = tw.vertices.area_weighted_vertex_normals(
+        int(vertices_wp.shape[0]), vertices_wp, faces_wp
+    )
+    return sphere_tm, mesh_wp, normals_wp
+
+
+@pytest.mark.parametrize("radius", [1.0, 3.0])
+def test_shape_diameter_is_the_diameter_of_a_sphere(device: str, radius: float) -> None:
+    """
+    A cone through a sphere is bracketed analytically, at any radius — the exact check.
+
+    A ray leaving the surface at angle ``theta`` from the inward normal crosses a chord of exactly
+    ``2 R cos(theta)``, so every ray in a cone of half-angle ``alpha`` lands in
+    ``[2 R cos(alpha), 2 R]`` and so does any weighted mean of them. Both ends are tight: widening
+    the cone lowers the answer by exactly that factor, which is why this is a bracket rather than an
+    ``allclose`` against ``2 R``.
+    """
+    _sphere_tm, mesh_wp, normals_wp = _sphere_wp(device, radius)
+    cone_angle = np.deg2rad(5.0)
+    diameter_np = tw.proximity.shape_diameter(
+        mesh_wp, mesh_wp.points, normals=normals_wp, n_rays=128, cone_angle=cone_angle
+    ).numpy()
+    assert (diameter_np <= 2.0 * radius * (1.0 + 1e-4)).all()
+    assert (diameter_np >= 2.0 * radius * np.cos(cone_angle) * (1.0 - 1e-4)).all()
+
+
+def test_shape_diameter_reduces_to_thickness(device: str) -> None:
+    """One ray down a vanishing cone *is* ``thickness(method="ray")``, to float32."""
+    _sphere_tm, mesh_wp, normals_wp = _sphere_wp(device, 1.5)
+    diameter_np = tw.proximity.shape_diameter(
+        mesh_wp, mesh_wp.points, normals=normals_wp, n_rays=1, cone_angle=1e-4
+    ).numpy()
+    thickness_np = tw.proximity.thickness(
+        mesh_wp, mesh_wp.points, normals=normals_wp, method="ray"
+    ).numpy()
+    assert np.allclose(diameter_np, thickness_np, rtol=1e-5, atol=1e-5)
+
+
+def test_shape_diameter_measures_a_slab(device: str) -> None:
+    """On a 1 x 1 x 4 box the large faces are 1 apart, and the cone must say so."""
+    box_tm = tm.creation.box(extents=[1.0, 1.0, 4.0]).subdivide().subdivide().subdivide()
+    vertices_wp = wp.array(
+        np.ascontiguousarray(box_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    faces_wp = wp.array(
+        np.ascontiguousarray(box_tm.faces.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=device,
+    )
+    mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
+    normals_wp = tw.vertices.area_weighted_vertex_normals(
+        int(vertices_wp.shape[0]), vertices_wp, faces_wp
+    )
+    diameter_np = tw.proximity.shape_diameter(
+        mesh_wp, mesh_wp.points, normals=normals_wp, n_rays=128, cone_angle=np.deg2rad(10.0)
+    ).numpy()
+
+    # Vertices strictly *inside* one of the two x-walls: away from the y edges (where the smooth
+    # normal is diagonal and the ray crosses the 1.41 diagonal instead) and away from the z ends.
+    vertices_np = np.asarray(box_tm.vertices)
+    on_wall_np = (
+        (np.abs(np.abs(vertices_np[:, 0]) - 0.5) < 1e-6)
+        & (np.abs(vertices_np[:, 1]) < 0.5 - 1e-6)
+        & (np.abs(vertices_np[:, 2]) < 1.5)
+    )
+    assert on_wall_np.sum() > 10
+    assert np.allclose(diameter_np[on_wall_np], 1.0, rtol=1e-2)
+
+
+def test_shape_diameter_trimming_rejects_the_escaping_rays(device: str) -> None:
+    """
+    On a hollow shell the untrimmed mean is dragged out by the rays that cross the whole cavity.
+
+    This is what the outlier rejection is *for*, so it has to be visible: with ``trim`` wide open
+    the inner-shell diameters inflate well past the shell's own thickness.
+    """
+    outer_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    inner_tm = tm.creation.icosphere(subdivisions=3, radius=0.8)
+    inner_tm.invert()
+    shell_tm = tm.util.concatenate([outer_tm, inner_tm])
+    vertices_wp = wp.array(
+        np.ascontiguousarray(shell_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    faces_wp = wp.array(
+        np.ascontiguousarray(shell_tm.faces.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=device,
+    )
+    mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
+    normals_wp = tw.vertices.area_weighted_vertex_normals(
+        int(vertices_wp.shape[0]), vertices_wp, faces_wp
+    )
+    trimmed_np = tw.proximity.shape_diameter(
+        mesh_wp, mesh_wp.points, normals=normals_wp, n_rays=128, trim=1.0
+    ).numpy()
+    untrimmed_np = tw.proximity.shape_diameter(
+        mesh_wp, mesh_wp.points, normals=normals_wp, n_rays=128, trim=100.0
+    ).numpy()
+    assert trimmed_np.mean() < untrimmed_np.mean()
+    # The shell is 0.2 thick; trimming has to keep the outer wall near that, untrimmed does not.
+    outer_np = np.linalg.norm(np.asarray(shell_tm.vertices), axis=1) > 0.9
+    assert trimmed_np[outer_np].mean() < 0.5
+    assert untrimmed_np[outer_np].mean() > trimmed_np[outer_np].mean()
+
+
+def test_shape_diameter_agrees_with_pymeshlab_on_which_part_is_thinner(device: str) -> None:
+    """
+    MeshLab's SDF differs from this one by roughly a constant factor, so compare *structure*.
+
+    Its ``cone_amplitude`` parameter is a **no-op** in the 2025.07 build (byte-identical output at
+    90 and 120 degrees) and its trimming is not the paper's, so neither a value comparison nor a
+    per-vertex rank correlation is available. What both must agree on is the thing the field is
+    *for*: on a dumbbell — two radius-1 balls joined by a radius-0.2 bar — the bar is thin and the
+    balls are thick, which is the segmentation cue SDF exists to provide.
+
+    Note this is *not* a test that either side reports the bar's diameter as 0.4. A cone of rays
+    from a point on a slender bar mostly hits the bar's own walls, so SDF measures the local
+    cross-section rather than any global extent — which is exactly why a 1 x 1 x 4 box reads ~1 at
+    both ends and is useless as a fixture here.
+    """
+    ball_left_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    ball_right_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    ball_right_tm.apply_translation([4.0, 0.0, 0.0])
+    bar_tm = tm.creation.cylinder(radius=0.2, height=5.0, sections=24)
+    bar_tm.apply_transform(tm.transformations.rotation_matrix(np.pi / 2.0, [0.0, 1.0, 0.0]))
+    bar_tm.apply_translation([2.0, 0.0, 0.0])
+    # Subdivided after the union: the raw cylinder carries vertices only at its two end caps, which
+    # the union buries inside the balls, leaving the bar's *surface* with nothing to measure on.
+    dumbbell_tm = tm.boolean.union([ball_left_tm, ball_right_tm, bar_tm]).subdivide_to_size(0.25)
+
+    meshset_pml = ml.MeshSet()
+    meshset_pml.add_mesh(
+        ml.Mesh(
+            np.ascontiguousarray(dumbbell_tm.vertices, dtype=np.float64),
+            np.ascontiguousarray(dumbbell_tm.faces, dtype=np.int32),
+        )
+    )
+    meshset_pml.compute_scalar_by_shape_diameter_function_per_vertex(rays=256)
+    diameter_pml = meshset_pml.current_mesh().vertex_scalar_array()
+
+    vertices_wp = wp.array(
+        np.ascontiguousarray(dumbbell_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    faces_wp = wp.array(
+        np.ascontiguousarray(dumbbell_tm.faces.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=device,
+    )
+    mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
+    normals_wp = tw.vertices.area_weighted_vertex_normals(
+        int(vertices_wp.shape[0]), vertices_wp, faces_wp
+    )
+    diameter_np = tw.proximity.shape_diameter(
+        mesh_wp, mesh_wp.points, normals=normals_wp, n_rays=256
+    ).numpy()
+
+    vertices_np = np.asarray(dumbbell_tm.vertices)
+    bar_np = (np.abs(vertices_np[:, 0] - 2.0) < 0.8) & (
+        np.linalg.norm(vertices_np[:, 1:], axis=1) < 0.3
+    )
+    ball_np = vertices_np[:, 0] < -0.3  # only the left ball reaches there
+    assert bar_np.sum() > 10
+    assert ball_np.sum() > 10
+    # Both must call the bar the thinner part. The margin is loose because MeshLab compresses the
+    # contrast: it reads a 0.68 bar-to-ball ratio here where this port reads 0.55.
+    for field_np in (diameter_np, diameter_pml):
+        assert field_np[bar_np].mean() < 0.8 * field_np[ball_np].mean()
+
+
+def test_shape_diameter_invalid(device: str) -> None:
+    _sphere_tm, mesh_wp, normals_wp = _sphere_wp(device, 1.0, subdivisions=1)
+    with pytest.raises(ValueError, match="n_rays >= 1"):
+        tw.proximity.shape_diameter(mesh_wp, mesh_wp.points, n_rays=0)
+    with pytest.raises(ValueError, match=r"cone_angle must be in \(0, pi / 2\]"):
+        tw.proximity.shape_diameter(mesh_wp, mesh_wp.points, cone_angle=2.0)
+    with pytest.raises(ValueError, match="trim must be non-negative"):
+        tw.proximity.shape_diameter(mesh_wp, mesh_wp.points, trim=-1.0)
+    with pytest.raises(ValueError, match="one entry per point"):
+        tw.proximity.shape_diameter(
+            mesh_wp, mesh_wp.points, normals=wp.zeros(2, dtype=wp.vec3, device=device)
+        )
+    assert normals_wp.shape[0] > 0
+
+
+def test_shape_diameter_empty(device: str) -> None:
+    _sphere_tm, mesh_wp, _normals_wp = _sphere_wp(device, 1.0, subdivisions=1)
+    points_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    assert tw.proximity.shape_diameter(mesh_wp, points_wp).shape == (0,)

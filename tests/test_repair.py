@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import igl
 import numpy as np
+import pymeshlab as ml
 import pytest
 import trimesh as tm
 import trimesh.repair as tm_repair
@@ -623,3 +624,224 @@ def test_collapse_small_triangles_empty(device: str) -> None:
     out_vertices_wp, out_faces_wp = tw.repair.collapse_small_triangles(vertices_wp, faces_wp)
     assert out_vertices_wp.shape[0] == 0
     assert out_faces_wp.shape[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Geometric defects: bad faces, folds and T-vertices (pymeshlab reference)
+# ---------------------------------------------------------------------------
+
+
+def _t_vertex_patch() -> tuple[np.ndarray, np.ndarray]:
+    """
+    Two quads stitched at different resolutions, so the left one carries a T-vertex.
+
+    Vertex 4 sits on the interior of the edge ``(1, 2)`` of the right quad's triangulation, which is
+    exactly a T-junction: the triangle ``(1, 2, 4)`` is a sliver whose apex is on its own long edge.
+    Flipping ``(1, 2)`` to ``(3, 4)`` removes it without moving a vertex.
+    """
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],  # 0
+            [1.0, 0.0, 0.0],  # 1
+            [1.0, 2.0, 0.0],  # 2
+            [0.0, 2.0, 0.0],  # 3
+            [1.0, 1.0, 0.02],  # 4 -- barely off the (1, 2) edge, and off-plane so a flip is legal
+            [2.0, 0.0, 0.0],  # 5
+            [2.0, 2.0, 0.0],  # 6
+        ],
+        dtype=np.float64,
+    )
+    faces = np.array(
+        [[0, 1, 3], [1, 2, 3], [1, 5, 4], [4, 5, 6], [4, 6, 2], [1, 4, 2]], dtype=np.int32
+    )
+    return vertices, faces
+
+
+def _folded_patch() -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build a flat two-triangle quad plus a third triangle folded back on top of it.
+
+    Face 2 shares edge ``(1, 3)`` with face 1 and lies almost in the same plane with the *opposite*
+    normal, so the dihedral there is ~179 degrees. Every edge still has at most two faces — a third
+    face on the folded edge would make it non-manifold, which ``face_adjacency`` drops entirely and
+    which would make this fixture measure nothing.
+    """
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.1, 0.9, 0.02],  # the folded apex: back over the quad
+        ],
+        dtype=np.float64,
+    )
+    faces = np.array([[0, 1, 2], [1, 3, 2], [3, 1, 4]], dtype=np.int32)
+    return vertices, faces
+
+
+def _worst_aspect(vertices_wp, faces_wp) -> float:
+    return float(
+        tw.triangles.face_quality(vertices_wp, faces_wp, metric="aspect_ratio").numpy().max()
+    )
+
+
+def test_bad_face_mask_flags_the_thin_face(device: str) -> None:
+    vertices_np, faces_np = _t_vertex_patch()
+    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    bad_np = tw.repair.bad_face_mask(vertices_wp, faces_wp, min_quality=0.2).numpy()
+    # The sliver (1, 4, 2) is the last face, and it is the only thin one.
+    assert bad_np[-1]
+    assert bad_np.sum() == 1
+
+
+def test_bad_face_mask_flags_the_fold(device: str) -> None:
+    """Only the *culprit* of a fold is flagged, not the good face on the other side of the edge."""
+    vertices_np, faces_np = _folded_patch()
+    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    folded_np = tw.repair.bad_face_mask(
+        vertices_wp, faces_wp, min_quality=None, max_fold_angle=160.0
+    ).numpy()
+    assert np.array_equal(folded_np.astype(bool), np.array([False, False, True]))
+
+
+def test_bad_face_mask_flags_the_misoriented_face(device: str) -> None:
+    """One face wound the wrong way in a consistent patch reads 180 degrees off the consensus."""
+    n = 5
+    i_grid, j_grid = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
+    vertices_np = np.column_stack(
+        [i_grid.ravel().astype(np.float64), j_grid.ravel().astype(np.float64), np.zeros(n * n)]
+    )
+    faces = []
+    for i in range(n - 1):
+        for j in range(n - 1):
+            a = i * n + j
+            faces += [[a, a + 1, a + n + 1], [a, a + n + 1, a + n]]
+    faces_np = np.ascontiguousarray(faces, dtype=np.int32)
+    # A grid rather than a three-triangle strip: the criterion compares a face against the *sum* of
+    # its neighbours' normals, and on a strip the flipped face's own neighbours have only it to
+    # agree with, so they would be flagged too.
+    target = faces_np.shape[0] // 2
+    faces_np[target] = faces_np[target][::-1]
+
+    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    bad_np = tw.repair.bad_face_mask(
+        vertices_wp, faces_wp, min_quality=None, max_normal_angle=60.0
+    ).numpy()
+    assert np.array_equal(np.flatnonzero(bad_np), np.array([target]))
+
+
+def test_bad_face_mask_all_criteria_disabled(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _mesh_tm, mesh_wp = icosahedron
+    bad_np = tw.repair.bad_face_mask(
+        mesh_wp.points, mesh_wp.indices, min_quality=None, max_normal_angle=None
+    ).numpy()
+    assert not bad_np.any()
+
+
+def test_bad_face_mask_invalid(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _mesh_tm, mesh_wp = icosahedron
+    with pytest.raises(ValueError, match="max_fold_angle must be in"):
+        tw.repair.bad_face_mask(mesh_wp.points, mesh_wp.indices, max_fold_angle=200.0)
+    with pytest.raises(ValueError, match="max_normal_angle must be in"):
+        tw.repair.bad_face_mask(mesh_wp.points, mesh_wp.indices, max_normal_angle=0.0)
+
+
+def test_bad_face_mask_empty(device: str) -> None:
+    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    assert tw.repair.bad_face_mask(vertices_wp, faces_wp).shape == (0,)
+
+
+def test_remove_folded_faces_drops_the_fold(device: str) -> None:
+    vertices_np, faces_np = _folded_patch()
+    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    kept_vertices_wp, kept_faces_wp = tw.repair.remove_folded_faces(vertices_wp, faces_wp)
+    # Only the fold goes, so the flat quad it folded over survives intact.
+    assert int(kept_faces_wp.shape[0]) // 3 == 2
+    # The folded apex was referenced only by the dropped face, so it is gone too.
+    assert int(kept_vertices_wp.shape[0]) == vertices_np.shape[0] - 1
+    assert (
+        not tw.repair.bad_face_mask(
+            kept_vertices_wp, kept_faces_wp, min_quality=None, max_fold_angle=160.0
+        )
+        .numpy()
+        .any()
+    )
+
+
+def test_remove_folded_faces_matches_pymeshlab_on_which_faces_are_folded(device: str) -> None:
+    """
+    MeshLab flips the fold where this deletes it, so compare the *detection*, not the output.
+
+    ``compute_selection_bad_faces(select_folded_faces=True)`` is the same dihedral criterion at the
+    same threshold, and it reports a selection rather than editing the mesh — which makes it the
+    oracle for ``bad_face_mask``'s fold gate even though ``meshing_remove_folded_faces`` and
+    ``remove_folded_faces`` then do different things with the answer.
+    """
+    vertices_np, faces_np = _folded_patch()
+    meshset_pml = ml.MeshSet()
+    meshset_pml.add_mesh(ml.Mesh(vertices_np, np.ascontiguousarray(faces_np, dtype=np.int32)))
+    meshset_pml.compute_selection_bad_faces(
+        usear=False, usenf=False, select_folded_faces=True, folded_faces_angle_threshold=160.0
+    )
+    selected_pml = meshset_pml.current_mesh().face_selection_array()
+
+    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    folded_np = tw.repair.bad_face_mask(
+        vertices_wp, faces_wp, min_quality=None, max_fold_angle=160.0
+    ).numpy()
+    assert np.array_equal(folded_np.astype(bool), selected_pml.astype(bool))
+
+
+def test_remove_folded_faces_leaves_a_clean_mesh_alone(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    _mesh_tm, mesh_wp = icosahedron
+    kept_vertices_wp, kept_faces_wp = tw.repair.remove_folded_faces(mesh_wp.points, mesh_wp.indices)
+    assert int(kept_faces_wp.shape[0]) == int(mesh_wp.indices.shape[0])
+    assert int(kept_vertices_wp.shape[0]) == int(mesh_wp.points.shape[0])
+
+
+def test_remove_folded_faces_empty(device: str) -> None:
+    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    out_vertices_wp, out_faces_wp = tw.repair.remove_folded_faces(vertices_wp, faces_wp)
+    assert int(out_vertices_wp.shape[0]) == 0
+    assert int(out_faces_wp.shape[0]) == 0
+
+
+def test_remove_t_vertices_flips_the_sliver(device: str) -> None:
+    """The sliver goes, the face count and the vertices stay, and the patch stays manifold."""
+    vertices_np, faces_np = _t_vertex_patch()
+    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    before = _worst_aspect(vertices_wp, faces_wp)
+    assert before > 40.0  # the fixture really does carry a T-vertex sliver
+
+    flipped_wp = tw.repair.remove_t_vertices(vertices_wp, faces_wp, threshold=40.0)
+    assert _worst_aspect(vertices_wp, flipped_wp) < before
+    assert int(flipped_wp.shape[0]) == int(faces_wp.shape[0])
+    assert tw.validation.is_winding_consistent(flipped_wp)
+    assert tw.validation.is_edge_manifold(flipped_wp)
+
+
+def test_remove_t_vertices_leaves_a_clean_mesh_alone(device: str) -> None:
+    """No triangle of an icosphere is anywhere near the threshold, so nothing may move."""
+    sphere_tm = tm.creation.icosphere(subdivisions=3)
+    vertices_wp, faces_wp = _to_wp_mesh(
+        np.asarray(sphere_tm.vertices), np.asarray(sphere_tm.faces), device
+    )
+    flipped_wp = tw.repair.remove_t_vertices(vertices_wp, faces_wp)
+    assert np.array_equal(flipped_wp.numpy(), faces_wp.numpy())
+
+
+def test_remove_t_vertices_invalid(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _mesh_tm, mesh_wp = icosahedron
+    with pytest.raises(ValueError, match="aspect_threshold must be positive"):
+        tw.repair.remove_t_vertices(mesh_wp.points, mesh_wp.indices, threshold=0.0)
+
+
+def test_remove_t_vertices_empty(device: str) -> None:
+    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    assert int(tw.repair.remove_t_vertices(vertices_wp, faces_wp).shape[0]) == 0

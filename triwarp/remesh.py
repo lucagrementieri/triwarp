@@ -522,6 +522,481 @@ def _flip_interior_edges(
     return total
 
 
+def cluster_decimate(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    voxel_size: float | None = None,
+    contraction: Literal["average", "closest"] = "average",
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Decimate by snapping vertices to a uniform voxel grid and welding each cell to one vertex.
+
+    The one decimation scheme that is *naturally* parallel: there is no priority queue and no
+    sequential dependence anywhere, so the whole thing is a handful of kernel launches whatever the
+    mesh size. Every vertex is binned into a cell of width ``voxel_size``, each occupied cell
+    becomes a single output vertex, faces are remapped onto those, and the faces that collapsed
+    (two or three corners in the same cell) or duplicated are dropped.
+
+    Ports MeshLab's ``meshing_decimation_clustering`` and Open3D's ``simplify_vertex_clustering``;
+    the grid is anchored half a cell below the bounding box, which is Open3D's convention, so both
+    libraries produce the same cell assignment for the same ``voxel_size``. The vertex output alone
+    is also MeshLab's ``generate_sampling_clustered_vertex``.
+
+    !!! warning "This does not preserve topology"
+        Two sheets of the surface that pass within ``voxel_size`` of each other get welded
+        together, and a thin feature narrower than a cell disappears. That is the *point* of the
+        algorithm — it is a resampling, not a simplification — but it means the result can be
+        non-manifold even when the input is not. Use
+        [`isotropic_remesh`][triwarp.remesh.isotropic_remesh] when the topology matters and
+        [`quadric_decimate`][triwarp.remesh.quadric_decimate] when a face budget does.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` vertex positions on the target device.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    voxel_size
+        Cell width. Defaults to ``1 %`` of the bounding-box diagonal, matching MeshLab's
+        ``threshold`` default of ``1 %``. Larger cells decimate harder.
+    contraction
+        How each cell picks its output position:
+
+        - ``"average"`` (default) — the mean of the cell's vertices, which is Open3D's
+          ``SimplificationContraction.Average``. Smooths slightly and cannot land off the input's
+          convex hull.
+        - ``"closest"`` — the input vertex nearest the cell centre, which is MeshLab's
+          ``'Closest to center'`` sampling. Keeps every output vertex *on* the input surface, so it
+          is the right choice when the positions must stay exact (ties break to the lowest index).
+
+    Returns
+    -------
+    vertices : wp.array[wp.vec3]
+        One position per occupied cell that still carries a face, compacted from index zero.
+    faces : wp.array[wp.int32]
+        Flat ``3 * n_faces`` triangle index buffer, free of collapsed and duplicate faces.
+
+    Raises
+    ------
+    ValueError
+        If ``voxel_size`` is not positive, or ``contraction`` is not one of the two names.
+
+    See Also
+    --------
+    [`isotropic_remesh`][triwarp.remesh.isotropic_remesh]
+    [`triwarp.repair.remove_duplicated_vertices`][triwarp.repair.remove_duplicated_vertices]
+    [`triwarp.grouping.unique_faces`][triwarp.grouping.unique_faces]
+
+    Notes
+    -----
+    Cells whose every face collapsed are dropped from the output, where Open3D keeps them as
+    unreferenced vertices. So the face counts agree exactly and the vertex counts can differ by the
+    number of such cells — usually zero, and never in a way that changes the surface.
+    """
+    if contraction not in ("average", "closest"):
+        raise ValueError(f"contraction must be 'average' or 'closest', got {contraction!r}")
+
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    if n_vertices == 0 or n_faces == 0:
+        return wp.clone(vertices), wp.clone(faces)
+
+    lo, hi = tw.bounds.aabb_bounds(vertices)
+    if voxel_size is None:
+        voxel_size = 0.01 * float(wp.length(hi - lo))
+    if voxel_size <= 0.0:
+        raise ValueError(f"cluster_decimate requires voxel_size > 0, got {voxel_size}")
+
+    # Half a cell of slack below the box, so no vertex sits exactly on a cell boundary (Open3D's
+    # anchor, and what makes the two libraries agree cell for cell).
+    origin = lo - wp.vec3(0.5 * voxel_size, 0.5 * voxel_size, 0.5 * voxel_size)
+    cells = twt.empty_int32_2d((n_vertices, 3), device=device)
+    wp.launch(
+        kernel_remesh.voxel_cell_indices,
+        dim=n_vertices,
+        inputs=[vertices, origin, wp.float32(1.0 / voxel_size), cells],
+        device=device,
+    )
+    _unique_cells, labels = tw.grouping.unique_rows(cells, return_inverse=True)
+    n_clusters = int(tw.reduce.max(labels)) + 1
+
+    cluster_vertices = _cluster_positions(
+        vertices, labels, n_clusters, origin, voxel_size, contraction
+    )
+    remapped = tw.array.remap_indices(faces, labels)
+    keep_mask = wp.empty(n_faces, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_remesh.faces_with_distinct_indices,
+        dim=n_faces,
+        inputs=[remapped, keep_mask],
+        device=device,
+    )
+    kept_vertices, kept_faces = tw.selection.submesh_from_face_mask(
+        cluster_vertices, remapped, keep_mask
+    )
+    # Welding can map two distinct input faces onto the same triple, which would leave a duplicated
+    # face rather than a manifold one, so the dedup is part of the algorithm rather than polish.
+    out_vertices, out_faces, _remap = tw.repair.remove_unreferenced_vertices(
+        kept_vertices, tw.grouping.unique_faces(kept_faces)
+    )
+    return out_vertices, out_faces
+
+
+def _cluster_positions(
+    vertices: wp.array[wp.vec3],
+    labels: wp.array[wp.int32],
+    n_clusters: int,
+    origin: wp.vec3,
+    voxel_size: float,
+    contraction: Literal["average", "closest"],
+) -> wp.array[wp.vec3]:
+    """One representative position per occupied cell, by cell mean or by nearest-to-centre."""
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    if contraction == "average":
+        out = wp.zeros(n_clusters, dtype=wp.vec3, device=device)
+        counts = wp.zeros(n_clusters, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_remesh.cluster_accumulate,
+            dim=n_vertices,
+            inputs=[labels, vertices, out, counts],
+            device=device,
+        )
+        counts_f32 = wp.empty(n_clusters, dtype=wp.float32, device=device)
+        wp.utils.array_cast(counts, counts_f32)
+        wp.map(wp.div, out, counts_f32, out=out)
+        return out
+
+    min_distance = wp.full(n_clusters, float("inf"), dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_remesh.cluster_min_center_distance,
+        dim=n_vertices,
+        inputs=[labels, vertices, origin, wp.float32(voxel_size), min_distance],
+        device=device,
+    )
+    representative = wp.full(n_clusters, n_vertices, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_remesh.cluster_pick_closest,
+        dim=n_vertices,
+        inputs=[labels, vertices, origin, wp.float32(voxel_size), min_distance, representative],
+        device=device,
+    )
+    out = wp.empty(n_clusters, dtype=wp.vec3, device=device)
+    wp.copy(out, vertices[representative])
+    return out
+
+
+def quadric_decimate(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    target_faces: int | None = None,
+    target_ratio: float | None = None,
+    feature_angle: float = 30.0,
+    max_iter: int = 100,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Simplify to a target face count by quadric-error edge collapses (Garland-Heckbert).
+
+    The decimation to reach for when the requirement is a **face budget** rather than an edge
+    length: [`isotropic_remesh`][triwarp.remesh.isotropic_remesh] targets a length and
+    [`cluster_decimate`][triwarp.remesh.cluster_decimate] a voxel size, and neither lets a caller
+    ask for "this mesh at 10 % of its triangles". This does, and it is the method every comparable
+    library exposes for the purpose (MeshLab's ``meshing_decimation_quadric_edge_collapse``,
+    ``igl.decimate``, Open3D's ``simplify_quadric_decimation``).
+
+    Each vertex accumulates the area-weighted plane quadrics of its incident faces; the cost of
+    collapsing an edge is the residual of the summed quadric at its own minimizer, which is also
+    where the surviving vertex is placed. Cheap collapses are the ones that barely move the surface,
+    so the flat regions go first and the features last — the property that makes this the standard
+    method.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` vertex positions on the target device. Never mutated.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    target_faces
+        Desired face count. Mutually exclusive with ``target_ratio``; exactly one must be given.
+        Values at or above the input count return a copy.
+    target_ratio
+        Desired face count as a fraction of the input's, so ``0.1`` is MeshLab's usual "10 %". Must
+        be in ``(0, 1]``.
+    feature_angle
+        Dihedral angle in **degrees** above which an edge is a feature. Feature and boundary
+        structure is preserved exactly as in
+        [`isotropic_remesh`][triwarp.remesh.isotropic_remesh]: corners are frozen, a crease vertex
+        only collapses along its own feature, and a crease is never dragged off it.
+    max_iter
+        Cap on collapse passes. Each pass commits a conflict-free independent set, so a large
+        reduction needs many; the loop also stops early once the target is met or a pass commits
+        nothing.
+
+    Returns
+    -------
+    vertices : wp.array[wp.vec3]
+        Simplified vertex positions on ``vertices.device``, compacted from index zero.
+    faces : wp.array[wp.int32]
+        Flat ``3 * n_faces`` triangle index buffer. The count is ``<= target_faces`` but not
+        necessarily equal to it — see Notes.
+
+    Raises
+    ------
+    ValueError
+        If neither or both of ``target_faces`` / ``target_ratio`` is given, ``target_faces`` is
+        negative, or ``target_ratio`` is outside ``(0, 1]``.
+
+    See Also
+    --------
+    [`cluster_decimate`][triwarp.remesh.cluster_decimate]
+    [`isotropic_remesh`][triwarp.remesh.isotropic_remesh]
+    [`triwarp.repair.collapse_small_triangles`][triwarp.repair.collapse_small_triangles]
+
+    Notes
+    -----
+    **This is a batched-parallel greedy method, not the textbook serial one, and the difference is
+    visible in the output.** Textbook QEM pops one edge at a time from a global priority queue,
+    which is inherently sequential. Here each pass scores every edge, ranks the candidates by cost,
+    and commits the cheapest *independent set* of them — two collapses may commit together only if
+    their closed 1-rings are disjoint. So the sequence of collapses differs from a serial run's and
+    the resulting triangulation is not the same mesh, even though both are driven by the same
+    metric. Compare the two by deviation from the input rather than by equality.
+
+    In exchange the *quality* is competitive and then some: at 512 faces from a subdivision-4
+    icosphere the two-sided Hausdorff distance to the input is **0.0147 here against
+    ``igl.decimate``'s 0.0250 and Open3D's 0.0236**, and the ordering holds at every target tried.
+    Committing an independent set spreads the error over the surface where draining a queue
+    concentrates it, and a max-norm rewards that.
+
+    Three consequences to plan around:
+
+    - **The target is usually reached exactly, but is not guaranteed.** A pass is budgeted at half
+      the remaining surplus (an interior collapse removes two faces) and the loop stops early when a
+      pass can commit nothing — a mesh whose remaining edges all fail the link condition or the
+      normal-flip guard cannot be reduced further at any ``max_iter``. Check the returned face count
+      if it matters.
+    - Every collapse is checked against a **normal-flip guard**: an incident face whose normal would
+      turn by more than ~78 degrees vetoes it. That is what keeps the output free of the inverted,
+      self-intersecting triangles an unguarded quadric method produces at high reduction ratios, and
+      it is the usual reason a target is not reached.
+    - The independent set is chosen under a **hashed** lock key rather than by cost rank. That looks
+      like a detail and is not: on a structured mesh both the edge index and the quadric cost are
+      spatially monotone fields, and a monotone key has one local minimum, so either of those keys
+      commits a single collapse per pass. See ``scramble_index`` in ``kernels/remesh.py`` for the
+      measured numbers.
+    """
+    n_faces = int(faces.shape[0]) // 3
+    target = _resolve_decimation_target(target_faces, target_ratio, n_faces)
+
+    current_vertices = wp.clone(vertices)
+    current_faces = wp.clone(faces)
+    if n_faces == 0 or target >= n_faces:
+        return current_vertices, current_faces
+
+    device = faces.device
+    feature = wp.float32(math.radians(feature_angle))
+    for _ in range(max_iter):
+        n_current = int(current_faces.shape[0]) // 3
+        if n_current <= target:
+            break
+        n_vertices = int(current_vertices.shape[0])
+
+        edges_sorted = tw.edges.faces_to_edges(current_faces, sorted=True)
+        unique_edges, inverse = tw.edges.edges_unique(
+            current_faces, edges_sorted=edges_sorted, n_vertices=n_vertices
+        )
+        m = int(unique_edges.shape[0])
+        if m == 0:
+            break
+
+        edge_face_count = wp.zeros(m, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_edges.count_edge_faces,
+            dim=int(inverse.shape[0]),
+            inputs=[inverse, edge_face_count],
+            device=device,
+        )
+        codes, _boundary = _classify(
+            current_vertices, current_faces, feature, edges_sorted=edges_sorted
+        )
+        csr = tw.graph.edges_to_csr(n_vertices, unique_edges)
+        quadrics = _vertex_quadrics(current_vertices, current_faces)
+        face_offsets, vertex_faces = _vertex_face_csr(current_faces, n_vertices)
+
+        survivor = wp.full(m, -1, dtype=wp.int32, device=device)
+        removed = wp.empty(m, dtype=wp.int32, device=device)
+        target_pos = wp.empty(m, dtype=wp.vec3, device=device)
+        cost = wp.empty(m, dtype=wp.float32, device=device)
+        wp.launch(
+            kernel_remesh.quadric_collapse_candidates,
+            dim=m,
+            inputs=[
+                unique_edges,
+                current_vertices,
+                current_faces,
+                quadrics,
+                codes,
+                edge_face_count,
+                csr.offsets,
+                csr.columns,
+                face_offsets,
+                vertex_faces,
+                survivor,
+                removed,
+                target_pos,
+                cost,
+            ],
+            device=device,
+        )
+
+        # Two-stage selection, and both stages matter.
+        #
+        # Stage one narrows the field to the cheapest *half* of the candidate edges, which is what
+        # makes the method quadric-driven. Stage two picks a maximal independent set from those,
+        # locking each winner's closed 2-ring under a **hashed** key -- see ``scramble_index`` for
+        # why the obvious keys (edge index, or the cost itself) both collapse to one winner a pass
+        # on a structured mesh.
+        _sorted_cost, order = tw.array.sort_pairs(cost)
+        priority = wp.empty(m, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_remesh.assign_collapse_priority,
+            dim=m,
+            inputs=[order, wp.int32(max(1, m // 2)), priority, survivor],
+            device=device,
+        )
+        min_key = wp.full(n_vertices, INT32_MAX, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_remesh.claim_collapse_key,
+            dim=m,
+            inputs=[survivor, removed, csr.offsets, csr.columns, min_key],
+            device=device,
+        )
+        claim = wp.full(n_vertices, INT32_MAX, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_remesh.claim_collapse_index,
+            dim=m,
+            inputs=[survivor, removed, csr.offsets, csr.columns, min_key, claim],
+            device=device,
+        )
+        winner_cost = wp.empty(m, dtype=wp.float32, device=device)
+        wp.launch(
+            kernel_remesh.mark_collapse_winners,
+            dim=m,
+            inputs=[
+                survivor,
+                removed,
+                csr.offsets,
+                csr.columns,
+                min_key,
+                claim,
+                cost,
+                survivor,
+                winner_cost,
+            ],
+            device=device,
+        )
+
+        # Keep the cheapest half of the remaining surplus: an interior collapse removes two faces,
+        # so that budget is what stops a pass from blowing past the target. The set is already
+        # independent, so dropping members of it keeps it independent.
+        _sorted_winner_cost, winner_order = tw.array.sort_pairs(winner_cost)
+        budget = max(1, (n_current - target) // 2)
+        wp.launch(
+            kernel_remesh.assign_collapse_priority,
+            dim=m,
+            inputs=[winner_order, wp.int32(budget), priority, survivor],
+            device=device,
+        )
+
+        remap = tw.array.init_range(n_vertices, device)
+        positions = wp.clone(current_vertices)
+        count = wp.zeros(1, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_remesh.commit_selected_collapses,
+            dim=m,
+            inputs=[survivor, removed, target_pos, remap, positions, count],
+            device=device,
+        )
+        if int(count.numpy()[0]) == 0:
+            break  # nothing legal left to collapse; the target is unreachable from here
+
+        remapped = tw.array.gather(remap, current_faces)
+        valid = wp.empty(n_current, dtype=wp.bool, device=device)
+        wp.launch(
+            kernel_remesh.mark_distinct_faces,
+            dim=n_current,
+            inputs=[remapped, valid],
+            device=device,
+        )
+        kept = tw.array.flatnonzero(valid)
+        current_faces = tw.array.gather(remapped.reshape((n_current, 3)), kept).reshape(-1)
+        current_vertices, current_faces, _remap = tw.repair.remove_unreferenced_vertices(
+            positions, current_faces
+        )
+
+    return current_vertices, current_faces
+
+
+def _resolve_decimation_target(
+    target_faces: int | None, target_ratio: float | None, n_faces: int
+) -> int:
+    """Validate the mutually exclusive target arguments and reduce them to a face count."""
+    if (target_faces is None) == (target_ratio is None):
+        raise ValueError("pass exactly one of target_faces and target_ratio")
+    if target_faces is not None:
+        if target_faces < 0:
+            raise ValueError(f"target_faces must be non-negative, got {target_faces}")
+        return int(target_faces)
+    assert target_ratio is not None
+    if not 0.0 < target_ratio <= 1.0:
+        raise ValueError(f"target_ratio must be in (0, 1], got {target_ratio}")
+    return math.ceil(target_ratio * n_faces)
+
+
+def _vertex_quadrics(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array[wp.mat44d]:
+    """Area-weighted sum of the incident faces' plane quadrics at each vertex, in float64."""
+    device = vertices.device
+    quadrics = wp.zeros(int(vertices.shape[0]), dtype=wp.mat44d, device=device)
+    wp.launch(
+        kernel_remesh.accumulate_face_quadrics,
+        dim=int(faces.shape[0]) // 3,
+        inputs=[vertices, faces, quadrics],
+        device=device,
+    )
+    return quadrics
+
+
+def _vertex_face_csr(
+    faces: wp.array[wp.int32], n_vertices: int
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    ``(offsets, vertex_faces)`` incidence CSR: the faces touching each vertex, in arbitrary order.
+
+    Length-``n_vertices + 1`` offsets, which is the convention the kernels index with. Built by
+    counting sort rather than from halfedge twins deliberately: the normal-flip guard reads a row as
+    a set, and a rotational order would refuse a vertex-non-manifold mesh — which a decimator, of
+    all things, must not.
+    """
+    device = faces.device
+    counts = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+    n_faces = int(faces.shape[0]) // 3
+    wp.launch(kernel_remesh.count_vertex_faces, dim=n_faces, inputs=[faces, counts], device=device)
+    offsets = wp.zeros(n_vertices + 1, dtype=wp.int32, device=device)
+    wp.utils.array_scan(counts, out_array=offsets[1:], inclusive=True)
+    cursor = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+    vertex_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_remesh.scatter_vertex_faces,
+        dim=n_faces,
+        inputs=[faces, offsets, cursor, vertex_faces],
+        device=device,
+    )
+    return offsets, vertex_faces
+
+
 def flip_to_delaunay(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -609,6 +1084,164 @@ def flip_to_delaunay(
                 mac,
                 mdsq,
                 car,
+                out_flip,
+                out_quad,
+            ],
+            device=device,
+        )
+
+    _flip_interior_edges(out_faces, n_vertices, launch, max_iter)
+    return out_faces
+
+
+_OBJECTIVE_QUALITY_METRICS = ("radius_ratio", "area_max_side", "mean_ratio")
+
+
+def flip_by_objective(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    objective: Literal["planarity", "curvature", "t_vertex"] = "planarity",
+    region: wp.array[wp.bool] | None = None,
+    planar_angle: float = 1.0,
+    metric: Literal["radius_ratio", "area_max_side", "mean_ratio"] = "area_max_side",
+    aspect_threshold: float = 40.0,
+    max_iter: int = 100,
+) -> wp.array[wp.int32]:
+    """
+    Flip interior edges to optimize triangle shape or surface flatness, instead of the Delone test.
+
+    Runs the same parallel flip engine as [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay] —
+    independent-set selection over the face adjacency, iterated until no edge is a candidate — with
+    a different predicate at the front. That is the whole port: the machinery was already there, and
+    these two objectives are what MeshLab's ``meshing_edge_flip_by_planar_optimization`` and
+    ``meshing_edge_flip_by_curvature_optimization`` put in front of it.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` vertex positions. Never modified — only the triangulation changes.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    objective
+        Which predicate to flip on:
+
+        - ``"planarity"`` (default) — **shape only, surface preserved.** A quad is eligible when its
+          two triangles meet within ``planar_angle`` of flat, and its diagonal is flipped when doing
+          so raises the ``metric`` score of the *worse* of the two triangles. Because the quad is
+          near-planar to begin with, the rewrite is a retriangulation and not a deformation. This is
+          the one to reach for after any operation that leaves thin triangles across a flat region.
+        - ``"curvature"`` — **flatness, surface changed.** The diagonal is flipped whenever the
+          other one bends less, i.e. whenever the dihedral angle across it is smaller. This *does*
+          move the surface (it chooses between two interpolations of the same four points) and is
+          what makes a coarse triangulation of a curved shape follow its principal directions.
+          ``planar_angle`` and ``metric`` are ignored.
+        - ``"t_vertex"`` — **slivers only.** A quad is eligible only when one of its two triangles
+          is a sliver: its ``aspect_ratio`` (circumradius over twice the inradius) exceeds
+          ``aspect_threshold``; the diagonal is then flipped if that improves the worse of the two.
+          A T-vertex — a vertex sitting in the interior of a neighbouring edge — is exactly what
+          produces such a sliver, which is why this is the repair for one; see
+          [`remove_t_vertices`][triwarp.repair.remove_t_vertices] for the wrapper that says so.
+          ``planar_angle`` and ``metric`` are ignored.
+    region
+        Optional length-``n_faces`` ``wp.bool`` mask; only edges interior to the ``True`` faces are
+        flippable. ``None`` treats the whole mesh as flippable.
+    planar_angle
+        Planarity tolerance in **degrees** for ``objective="planarity"``: a quad whose dihedral
+        exceeds it is left alone. MeshLab's ``pthreshold``, whose default of ``1`` is this one. Must
+        be in ``[0, 180]``.
+    metric
+        Which [`face_quality`][triwarp.triangles.face_quality] measure ``objective="planarity"``
+        maximizes. Only the three larger-is-better shape measures are accepted — ``"aspect_ratio"``
+        runs the other way and ``"area"`` is not a shape measure at all. MeshLab's ``planartype``,
+        whose default ``'area/max side'`` is this one.
+    aspect_threshold
+        Sliver threshold for ``objective="t_vertex"``: only a quad whose worse triangle has an
+        ``aspect_ratio`` above this is eligible. MeshLab's ``meshing_remove_t_vertices`` threshold,
+        whose default of ``40`` is this one. Must be positive.
+    max_iter
+        Maximum number of parallel flip passes. Each pass commits a conflict-free independent set,
+        so a mesh needing many local rewrites needs several.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        Flat face buffer with the region re-triangulated, on ``faces.device`` (a copy; the input is
+        not modified).
+
+    Raises
+    ------
+    ValueError
+        If ``objective`` or ``metric`` is unknown, ``planar_angle`` is outside ``[0, 180]``, or
+        ``region`` has the wrong length.
+
+    See Also
+    --------
+    [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay]
+    [`triwarp.triangles.face_quality`][triwarp.triangles.face_quality]
+    [`isotropic_remesh`][triwarp.remesh.isotropic_remesh]
+
+    Notes
+    -----
+    A quad whose two diagonals score *equally* — every quad of a regular grid — would flip back and
+    forth forever, one pass each way, so a flip must beat the incumbent by a relative ``1e-6``
+    rather than merely tie it. That margin is what makes ``max_iter`` a safety net rather than the
+    normal stopping condition.
+    """
+    if objective not in ("planarity", "curvature", "t_vertex"):
+        raise ValueError(
+            f"objective must be 'planarity', 'curvature' or 't_vertex', got {objective!r}"
+        )
+    if aspect_threshold <= 0.0:
+        raise ValueError(f"aspect_threshold must be positive, got {aspect_threshold}")
+    if metric not in _OBJECTIVE_QUALITY_METRICS:
+        raise ValueError(
+            f"metric must be one of {list(_OBJECTIVE_QUALITY_METRICS)}, got {metric!r}"
+        )
+    if not 0.0 <= planar_angle <= 180.0:
+        raise ValueError(f"planar_angle must be in [0, 180] degrees, got {planar_angle}")
+
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    out_faces = wp.clone(faces)
+    if n_faces == 0:
+        return out_faces
+    if region is not None and int(region.shape[0]) != n_faces:
+        raise ValueError(f"region must have length n_faces={n_faces}, got {int(region.shape[0])}")
+
+    n_vertices = tw.vertices.n_vertices(faces)
+    region_flags = wp.empty(n_faces, dtype=wp.int32, device=device)
+    if region is None:
+        region_flags.fill_(1)
+    else:
+        wp.utils.array_cast(region, region_flags)
+
+    objective_flag = {
+        "planarity": kernel_remesh.OBJECTIVE_PLANARITY,
+        "curvature": kernel_remesh.OBJECTIVE_CURVATURE,
+        "t_vertex": kernel_remesh.OBJECTIVE_T_VERTEX,
+    }[objective]
+    metric_flag = tw.triangles._QUALITY_METRICS[metric]
+    # The gate is on the dihedral's cosine so the kernel needs no inverse trigonometry.
+    planar_cos = wp.float32(math.cos(math.radians(planar_angle)))
+
+    def launch(adjacency, adjacency_edges, unshared, sorted_keys, key_base, out_flip, out_quad):
+        wp.launch(
+            kernel_remesh.objective_flip_candidates,
+            dim=int(adjacency.shape[0]),
+            inputs=[
+                vertices,
+                out_faces,
+                adjacency,
+                adjacency_edges,
+                unshared,
+                region_flags,
+                sorted_keys,
+                key_base,
+                objective_flag,
+                metric_flag,
+                planar_cos,
+                wp.float32(aspect_threshold),
                 out_flip,
                 out_quad,
             ],

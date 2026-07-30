@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
@@ -153,6 +154,145 @@ def test_icosahedron(device: str) -> None:
     _assert_same_vertices_and_faces(
         *tw.creation.icosahedron(device=device), tm.creation.icosahedron()
     )
+
+
+@pytest.mark.parametrize(
+    ("builder", "filter_name", "n_vertices", "n_faces"),
+    [
+        ("tetrahedron", "create_tetrahedron", 4, 4),
+        ("octahedron", "create_octahedron", 6, 8),
+        ("dodecahedron", "create_dodecahedron", 20, 36),
+    ],
+)
+def test_platonic_solids_match_pymeshlab(
+    device: str, builder: str, filter_name: str, n_vertices: int, n_faces: int
+) -> None:
+    """
+    The three tables came from MeshLab, so they must still be it up to the unit-sphere scaling.
+
+    trimesh has no tetrahedron / octahedron / dodecahedron, and igl has no generators at all, so
+    pymeshlab is the only reference here.
+    """
+    vertices_wp, faces_wp = getattr(tw.creation, builder)(device=device)
+    assert int(vertices_wp.shape[0]) == n_vertices
+    assert int(faces_wp.shape[0]) // 3 == n_faces
+    assert np.allclose(np.linalg.norm(vertices_wp.numpy(), axis=1), 1.0, rtol=1e-5, atol=1e-5)
+    _assert_closed(vertices_wp, faces_wp)
+
+    meshset_pml = ml.MeshSet()
+    getattr(meshset_pml, filter_name)()
+    vertices_pml = meshset_pml.current_mesh().vertex_matrix()
+    vertices_pml = vertices_pml / np.linalg.norm(vertices_pml, axis=1, keepdims=True)
+    _assert_same_vertices_and_faces(
+        vertices_wp,
+        faces_wp,
+        tm.Trimesh(vertices_pml, meshset_pml.current_mesh().face_matrix(), process=False),
+    )
+
+
+@pytest.mark.parametrize("count", [(2, 2), (3, 7), (10, 10)])
+def test_grid(device: str, count: tuple[int, int]) -> None:
+    vertices_wp, faces_wp = tw.creation.grid(count=count, extents=(2.0, 3.0), device=device)
+    assert int(vertices_wp.shape[0]) == count[0] * count[1]
+    assert int(faces_wp.shape[0]) // 3 == 2 * (count[0] - 1) * (count[1] - 1)
+
+    mesh_tm = _mesh(vertices_wp, faces_wp)
+    assert np.allclose(mesh_tm.bounds, [[-1.0, -1.5, 0.0], [1.0, 1.5, 0.0]], rtol=1e-5, atol=1e-5)
+    assert np.isclose(mesh_tm.area, 6.0, rtol=1e-5)
+    # Flat, wound outward along +Z, and one boundary loop around the rim.
+    assert np.allclose(mesh_tm.face_normals, [0.0, 0.0, 1.0], rtol=1e-5, atol=1e-5)
+    assert tw.validation.is_winding_consistent(faces_wp)
+    assert len(tw.boundary.boundary_loops(vertices_wp, faces_wp)) == 1
+
+
+def test_grid_matches_pymeshlab(device: str) -> None:
+    """MeshLab's ``create_grid`` is the same lattice, in its uncentered form."""
+    vertices_wp, faces_wp = tw.creation.grid(
+        count=(10, 8), extents=(0.3, 0.5), center=False, device=device
+    )
+    meshset_pml = ml.MeshSet()
+    meshset_pml.create_grid(numvertx=10, numverty=8, absscalex=0.3, absscaley=0.5, center=False)
+    mesh_pml = meshset_pml.current_mesh()
+    assert int(vertices_wp.shape[0]) == mesh_pml.vertex_number()
+    assert int(faces_wp.shape[0]) // 3 == mesh_pml.face_number()
+    # MeshLab lays the patch out along -X; compare the shape after mirroring that back.
+    vertices_pml = mesh_pml.vertex_matrix() * np.array([-1.0, 1.0, 1.0])
+    assert np.allclose(
+        np.sort(vertices_wp.numpy().astype(np.float64), axis=0),
+        np.sort(vertices_pml, axis=0),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_grid_invalid(device: str) -> None:
+    with pytest.raises(ValueError, match="count must be at least 2"):
+        tw.creation.grid(count=(1, 4), device=device)
+    with pytest.raises(ValueError, match="extents must be non-negative"):
+        tw.creation.grid(extents=(-1.0, 1.0), device=device)
+
+
+@pytest.mark.parametrize("subdivisions", [0, 1, 2, 3, 4])
+def test_sphere_cap(device: str, subdivisions: int) -> None:
+    angle, radius = np.deg2rad(35.0), 1.5
+    vertices_wp, faces_wp = tw.creation.sphere_cap(
+        angle=angle, subdivisions=subdivisions, radius=radius, device=device
+    )
+    n_rings = 2**subdivisions
+    assert int(vertices_wp.shape[0]) == 1 + 3 * n_rings * (n_rings + 1)
+    assert int(faces_wp.shape[0]) // 3 == 6 * n_rings**2
+
+    # Every vertex on the sphere, the apex at the pole, and the rim at exactly ``angle``.
+    vertices_np = vertices_wp.numpy().astype(np.float64)
+    assert np.allclose(np.linalg.norm(vertices_np, axis=1), radius, rtol=1e-5, atol=1e-5)
+    assert np.allclose(vertices_np[0], [0.0, 0.0, radius], rtol=1e-5, atol=1e-5)
+    polar_np = np.arccos(np.clip(vertices_np[:, 2] / radius, -1.0, 1.0))
+    assert np.isclose(polar_np.max(), angle, rtol=1e-5, atol=1e-5)
+
+    # An open disc: one boundary loop, of exactly the rim's ``6 * n_rings`` vertices.
+    loops = tw.boundary.boundary_loops(vertices_wp, faces_wp)
+    assert len(loops) == 1
+    assert int(loops[0].shape[0]) == 6 * n_rings
+    assert tw.validation.is_winding_consistent(faces_wp)
+    # Wound outward: the area-weighted normal of a cap around +Z points along +Z.
+    normals_wp, areas_wp = tw.triangles.face_normals_and_areas(vertices_wp, faces_wp)
+    assert (normals_wp.numpy() * areas_wp.numpy()[:, None]).sum(axis=0)[2] > 0.0
+
+    # Area of a spherical cap of half-angle ``angle``, approached from below by the inscribed mesh.
+    exact_area = 2.0 * np.pi * radius**2 * (1.0 - np.cos(angle))
+    assert _mesh(vertices_wp, faces_wp).area <= exact_area * (1.0 + 1e-6)
+    if subdivisions >= 3:
+        assert _mesh(vertices_wp, faces_wp).area > exact_area * 0.99
+
+
+def test_sphere_cap_matches_pymeshlab_size(device: str) -> None:
+    """MeshLab's ``create_sphere_cap`` builds the same lattice; ``angle`` is its full aperture."""
+    vertices_wp, faces_wp = tw.creation.sphere_cap(
+        angle=np.deg2rad(30.0), subdivisions=3, device=device
+    )
+    meshset_pml = ml.MeshSet()
+    meshset_pml.create_sphere_cap(angle=60.0, subdiv=3)
+    mesh_pml = meshset_pml.current_mesh()
+    assert int(vertices_wp.shape[0]) == mesh_pml.vertex_number()
+    assert int(faces_wp.shape[0]) // 3 == mesh_pml.face_number()
+    # MeshLab puts the rim plane at z = 0 rather than centering the sphere; shift it back and the
+    # two caps are the same surface (its lattice rings are rotated in azimuth, so compare radii).
+    vertices_pml = mesh_pml.vertex_matrix() + np.array([0.0, 0.0, np.cos(np.deg2rad(30.0))])
+    assert np.allclose(
+        np.sort(np.linalg.norm(vertices_wp.numpy().astype(np.float64), axis=1)),
+        np.sort(np.linalg.norm(vertices_pml, axis=1)),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_sphere_cap_invalid(device: str) -> None:
+    with pytest.raises(ValueError, match=r"angle must be in \(0, pi\)"):
+        tw.creation.sphere_cap(angle=0.0, device=device)
+    with pytest.raises(ValueError, match=r"angle must be in \(0, pi\)"):
+        tw.creation.sphere_cap(angle=np.pi, device=device)
+    with pytest.raises(ValueError, match="subdivisions must be non-negative"):
+        tw.creation.sphere_cap(subdivisions=-1, device=device)
 
 
 @pytest.mark.parametrize("subdivisions", [0, 1, 2, 3])

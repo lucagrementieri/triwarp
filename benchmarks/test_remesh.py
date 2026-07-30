@@ -51,6 +51,44 @@ subdivision surfaces require manifoldness`` on every scan mesh. That is the same
 and potpourri3d references run into (see the benchmarks README hazard table), so the midpoint
 reference lives on the ``scale`` axis with ``subdivide_to_size`` instead.
 
+``flip_by_objective`` joins ``flip_to_delaunay`` on the **quality** axis for the same reason: it is
+the same engine with a different predicate at the front, so the pair isolates what the predicate
+costs from what the flip machinery costs. Both objectives are rows, and they behave differently on
+that axis by construction — the planarity one refuses any quad that is not flat, so on a curved
+input it converges in one pass, while the curvature one has something to do everywhere. MeshLab's
+``meshing_edge_flip_by_planar_optimization`` is the reference for the first, at the same
+``pthreshold`` and the same ``planartype``; it rewrites the topology, so that row rebuilds the
+MeshSet.
+
+``quadric_decimate`` is the module's **quality**-axis decimator, and the pair with
+``cluster_decimate`` is the point: they solve the same problem with opposite structures. Clustering
+is three data-independent passes; the quadric method is an iterated greedy loop whose pass count
+depends on how contested the rings are, which is exactly what triangle shape changes. All three
+serial references are here -- ``igl.decimate``, Open3D's ``simplify_quadric_decimation`` and
+MeshLab's ``meshing_decimation_quadric_edge_collapse`` -- because this is the best-referenced port
+in the package. Two notes for reading them: the MeshLab filter defaults to ``autoclean=True`` and
+deletes unreferenced vertices, so its MeshSet is rebuilt per round; and the *quality* comparison is
+in ``tests/test_remesh.py`` rather than here, where triwarp measures a **lower** Hausdorff error
+than all three at the same face count (0.0147 against igl's 0.0250 and Open3D's 0.0236 at 512
+faces).
+
+**And triwarp is the slower one on this group**, which is worth stating plainly: on
+``saddle_graded`` it measures 88 ms at ``target_ratio=0.5`` and 346 ms at ``0.1`` against igl's 50
+and 80 ms. The reason is the *pass count*, not the per-pass work -- one pass commits an independent
+set of roughly ``candidates / valence`` collapses, so reaching a tenth of the faces takes tens of
+passes and each of them pays a full edge/adjacency/quadric rebuild plus two radix sorts. A serial
+queue pays none of that per collapse. So this is the one port in the package where the parallel
+formulation buys quality rather than speed; the thing to attack is the number of quantities rebuilt
+per pass, not any kernel.
+
+``cluster_decimate`` is the module's other **scan sweep** group, and the interesting one to read
+against ``subdivide``: it is the same shape of work in reverse (bin, remap, dedup -- no data
+dependence, no iteration), so if the two do not scale alike something is wrong with one of them.
+Both open3d (``simplify_vertex_clustering``) and pymeshlab (``meshing_decimation_clustering``) are
+references, and the open3d one is *exact* -- same grid anchor, same cell means, identical face count
+-- which is rare enough in this suite to be worth stating. Cell width is a fraction of the mean edge
+length so the decimation ratio is comparable across meshes.
+
 Caps: ``isotropic_remesh`` is capped at ``bunny`` on the scan sweep (it runs ~1.2 s there and ~10x
 that on ``dragon``, which would dominate the whole suite); the split paths are capped at ``dragon``
 because a 1:4 subdivision of ``happy_buddha`` / ``lucy`` does not fit a sane memory budget. The
@@ -250,3 +288,120 @@ def test_intrinsic_delaunay(bench_case: BenchCase) -> None:
             lambda: igl.intrinsic_delaunay_cotmatrix(vertices_np, faces_np)[0]
         )
         assert matrix_igl.shape == (bench_case.n_vertices, bench_case.n_vertices)
+
+
+# Cluster cell widths as a multiple of the mean edge length. 2x welds most 1-rings into one vertex
+# (roughly a 4x face reduction) and 6x is aggressive decimation; below 1x almost nothing merges.
+_CLUSTER_FACTORS = [2.0, 6.0]
+
+
+@pytest.mark.benchmark(group="cluster_decimate")
+@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab")
+@pytest.mark.parametrize("cell_factor", _CLUSTER_FACTORS)
+def test_cluster_decimate(bench_case: BenchCase, cell_factor: float) -> None:
+    """Bin, remap, dedup: decimation with no priority queue, against two exact-ish references."""
+    voxel_size = cell_factor * bench_case.mean_edge
+    if bench_case.kind == "pymeshlab":
+        # ``meshing_decimation_clustering`` rewrites the topology, so the MeshSet is rebuilt inside
+        # the timed callable. Its ``threshold`` is a length, hence ``PureValue`` fed from the same
+        # ``voxel_size`` both other rows get rather than a percentage of its own bbox diagonal.
+        skip_larger_than(bench_case, "bunny", "MeshLab's clustering is a serial pass over the grid")
+        new_meshset_pml = bench_case.new_meshset_pml
+
+        def cluster_pml() -> int:
+            meshset_pml = new_meshset_pml()
+            meshset_pml.meshing_decimation_clustering(threshold=ml.PureValue(voxel_size))
+            return meshset_pml.current_mesh().face_number()
+
+        assert bench_case.run(cluster_pml) >= 0
+        return
+    if bench_case.kind == "open3d":
+        # Returns a new mesh and never touches its input, so the shared mesh is safe across rounds.
+        mesh_o3d = bench_case.mesh_o3d
+        simplified_o3d = bench_case.run(
+            lambda: mesh_o3d.simplify_vertex_clustering(voxel_size=voxel_size)
+        )
+        assert len(simplified_o3d.triangles) <= bench_case.n_faces
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    _decimated_vertices, decimated_faces = bench_case.run(
+        lambda: tw.remesh.cluster_decimate(vertices, faces, voxel_size=voxel_size)
+    )
+    assert int(decimated_faces.shape[0]) // 3 <= bench_case.n_faces
+
+
+@pytest.mark.benchmark(group="flip_by_objective")
+@pytest.mark.benchaxis("quality")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.parametrize("objective", ["planarity", "curvature"])
+def test_flip_by_objective(bench_case: BenchCase, objective: str) -> None:
+    """The Delone engine with another predicate: the same passes, a different candidate set."""
+    if bench_case.kind == "pymeshlab":
+        if objective == "curvature":
+            pytest.skip("MeshLab's curvature flip has no comparable parameterization")
+        new_meshset_pml = bench_case.new_meshset_pml
+
+        def flip_pml() -> int:
+            meshset_pml = new_meshset_pml()
+            meshset_pml.meshing_edge_flip_by_planar_optimization(
+                pthreshold=1.0, planartype="area/max side", iterations=1
+            )
+            return meshset_pml.current_mesh().face_number()
+
+        assert bench_case.run(flip_pml, rounds=_ROUNDS) == bench_case.n_faces
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    flipped = bench_case.run(
+        lambda: tw.remesh.flip_by_objective(vertices, faces, objective=objective), rounds=_ROUNDS
+    )
+    assert int(flipped.shape[0]) == int(faces.shape[0])
+
+
+# Reduction ratios for the quadric decimator. 0.5 is a mild pass and 0.1 is the ratio MeshLab's own
+# dialogue defaults near; the loop count grows as the target falls, which is the shape of this
+# group.
+_QUADRIC_RATIOS = [0.5, 0.1]
+
+
+@pytest.mark.benchmark(group="quadric_decimate")
+@pytest.mark.benchaxis("quality")
+@pytest.mark.benchlibs("triwarp", "igl", "open3d", "pymeshlab")
+@pytest.mark.parametrize("target_ratio", _QUADRIC_RATIOS)
+def test_quadric_decimate(bench_case: BenchCase, target_ratio: float) -> None:
+    """Greedy quadric collapses to a face budget: batched independent sets against three queues."""
+    target_faces = max(4, int(target_ratio * bench_case.n_faces))
+    if bench_case.kind == "pymeshlab":
+        # ``autoclean=True`` (the default) deletes unreferenced vertices, so this filter is not
+        # idempotent even in geometry and the MeshSet has to be rebuilt inside the timed callable.
+        new_meshset_pml = bench_case.new_meshset_pml
+
+        def decimate_pml() -> int:
+            meshset_pml = new_meshset_pml()
+            meshset_pml.meshing_decimation_quadric_edge_collapse(targetfacenum=target_faces)
+            return meshset_pml.current_mesh().face_number()
+
+        assert bench_case.run(decimate_pml, rounds=_ROUNDS) > 0
+        return
+    if bench_case.kind == "igl":
+        vertices_np = bench_case.vertices_np
+        faces_np = np.ascontiguousarray(bench_case.faces_np, dtype=np.int64)
+        result_igl = bench_case.run(
+            lambda: igl.decimate(vertices_np, faces_np, target_faces), rounds=_ROUNDS
+        )
+        assert np.asarray(result_igl[1]).shape[0] > 0
+        return
+    if bench_case.kind == "open3d":
+        # Returns a new mesh and never touches its input, so the shared mesh is safe across rounds.
+        mesh_o3d = bench_case.mesh_o3d
+        simplified_o3d = bench_case.run(
+            lambda: mesh_o3d.simplify_quadric_decimation(target_number_of_triangles=target_faces),
+            rounds=_ROUNDS,
+        )
+        assert len(simplified_o3d.triangles) > 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    _decimated_vertices, decimated_faces = bench_case.run(
+        lambda: tw.remesh.quadric_decimate(vertices, faces, target_faces=target_faces),
+        rounds=_ROUNDS,
+    )
+    assert int(decimated_faces.shape[0]) // 3 <= bench_case.n_faces

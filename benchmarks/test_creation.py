@@ -46,6 +46,15 @@ launch per buffer.
   rather than three extents, so it builds a cube where the other three build a 1x2x3 box. Twelve
   triangles either way, which is all that group measures.
 
+- ``create_tetrahedron`` / ``create_octahedron`` / ``create_dodecahedron`` are where triwarp's
+  three constant Platonic tables came from, and the *only* reference for them: trimesh has no
+  Platonic solid but the icosahedron and igl has no generators at all. They take no parameters on
+  either side, so those rows are pure fixed cost, like ``box``.
+- ``create_grid(numvertx=, numverty=)`` and ``create_sphere_cap(angle=, subdiv=)`` are the two open
+  primitives, and both have a real axis: the grid's vertex counts and the cap's subdivision level.
+  ``create_sphere_cap`` takes the full aperture in degrees where triwarp takes the polar half-angle
+  in radians, so its ``angle`` is twice triwarp's -- both rows generate the identical lattice.
+
 There is no ``uv_sphere``, ``revolve``, ``capsule``, ``extrude_polygon``, ``sweep_polygon``,
 ``truncated_prisms``, ``axis`` or ``random_soup`` counterpart -- MeshLab's parametric primitives are
 a fixed catalogue, not a profile-and-sweep toolkit, which is the structural difference this module's
@@ -114,6 +123,7 @@ engines behind a different profile, already covered by ``cylinder`` / ``uv_spher
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -228,6 +238,84 @@ def test_box(bench_lib: BenchLibrary) -> None:
         mesh_class = _o3d_mesh(bench_lib)
         mesh_o3d = bench_lib.run(lambda: mesh_class.create_box(1.0, 2.0, 3.0))
         assert len(mesh_o3d.triangles) == 12
+
+
+@pytest.mark.benchmark(group="platonic_solids")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.parametrize(
+    ("builder", "filter_name", "n_faces"),
+    [
+        ("tetrahedron", "create_tetrahedron", 4),
+        ("octahedron", "create_octahedron", 8),
+        ("dodecahedron", "create_dodecahedron", 36),
+    ],
+)
+def test_platonic_solids(
+    bench_lib: BenchLibrary, builder: str, filter_name: str, n_faces: int
+) -> None:
+    """Constant tables on both sides, so this is ``box``'s fixed-cost probe once per solid."""
+    if bench_lib.kind == "pymeshlab":
+
+        def solid_pml() -> int:
+            meshset_pml = ml.MeshSet()
+            getattr(meshset_pml, filter_name)()
+            return meshset_pml.current_mesh().face_number()
+
+        assert bench_lib.run(solid_pml) == n_faces
+        return
+    device = bench_lib.device
+    _, faces_wp = bench_lib.run(lambda: getattr(tw.creation, builder)(device=device))
+    assert int(faces_wp.shape[0]) // 3 == n_faces
+
+
+@pytest.mark.benchmark(group="grid")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.parametrize("count", [32, 512])
+def test_grid(bench_lib: BenchLibrary, count: int) -> None:
+    """A ``count x count`` vertex lattice: one NumPy prologue against MeshLab's per-vertex loop."""
+    n_faces = 2 * (count - 1) ** 2
+    if bench_lib.kind == "pymeshlab":
+
+        def grid_pml() -> int:
+            meshset_pml = ml.MeshSet()
+            meshset_pml.create_grid(numvertx=count, numverty=count)
+            return meshset_pml.current_mesh().face_number()
+
+        assert bench_lib.run(grid_pml) == n_faces
+        return
+    device = bench_lib.device
+    _, faces_wp = bench_lib.run(lambda: tw.creation.grid(count=(count, count), device=device))
+    assert int(faces_wp.shape[0]) // 3 == n_faces
+
+
+@pytest.mark.benchmark(group="sphere_cap")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.parametrize("subdivisions", [3, 6])
+def test_sphere_cap(bench_lib: BenchLibrary, subdivisions: int) -> None:
+    """
+    The concentric-ring lattice, whose cost is a Python loop over ``2 ** subdivisions`` rings.
+
+    Unlike the revolution primitives this one is *not* flat in resolution on the triwarp side: the
+    ring loop is host-side NumPy and grows linearly in the ring count, so read the slope here as the
+    prologue's rather than the device's. MeshLab's own generator is a per-vertex C++ loop.
+    """
+    n_faces = 6 * (2**subdivisions) ** 2
+    if bench_lib.kind == "pymeshlab":
+
+        def cap_pml() -> int:
+            meshset_pml = ml.MeshSet()
+            meshset_pml.create_sphere_cap(angle=60.0, subdiv=subdivisions)
+            return meshset_pml.current_mesh().face_number()
+
+        assert bench_lib.run(cap_pml) == n_faces
+        return
+    device = bench_lib.device
+    _, faces_wp = bench_lib.run(
+        lambda: tw.creation.sphere_cap(
+            angle=math.radians(30.0), subdivisions=subdivisions, device=device
+        )
+    )
+    assert int(faces_wp.shape[0]) // 3 == n_faces
 
 
 @pytest.mark.benchmark(group="icosphere")

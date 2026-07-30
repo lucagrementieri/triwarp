@@ -38,6 +38,7 @@ def _spd_system(device: str, n: int = 64, n_rhs: int = 3, seed: int = 11):
     return matrix_wp, twt.as_array2d_float(rhs_wp, dtype=wp.float64), dense_np, rhs_np
 
 
+@pytest.mark.parity("min_quad_with_fixed", "pymeshlab")
 def test_min_quad_with_fixed_matches_pymeshlab_harmonic_field(
     device: str, icosahedron: tuple[tm.Trimesh, wp.Mesh]
 ) -> None:

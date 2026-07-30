@@ -345,6 +345,40 @@ The rest are second or third independent implementations:
 | `test_validation` | `get_topological_measures` + `compute_selection_by_self_intersections_per_face` — the same composition open3d does in **13.8 s** and MeshLab in 140.8 ms; plus `compute_selection_by_non_manifold_per_vertex` |
 | `test_vertices` | `compute_normal_per_vertex` at `weightmode='Simple Average'` and `'By Area'` — one filter covering both normal groups |
 
+#### Ported gaps: rows where pymeshlab is the *source*, not the reference
+
+The 24 filters MeshLab exposed that triwarp did not have were ported (bucket B of
+`plans/make-pymeshlab-a-first-class-reference.md`). Their benchmark rows read the other way round —
+the pymeshlab filter is the thing being caught up with, and in every case the port is the newer code:
+
+| group | module | pymeshlab source filter | measured |
+|---|---|---|---|
+| `face_quality` | `test_triangles` | `compute_scalar_by_aspect_ratio_per_face` | 34 µs against 445 µs, flat across `quality` on both sides |
+| `outlier_probability` | `test_points` | `compute_selection_point_cloud_outliers` (LoOP) | 2.6 ms against 0.66 ms at `sphere_small` — the k-NN table dominates, see `test_neighbors` |
+| `platonic_solids`, `grid`, `sphere_cap` | `test_creation` | `create_{tetrahedron,octahedron,dodecahedron,grid,sphere_cap}` | fixed-cost ties on the tables; 2.2 ms against 12.5 ms on a subdiv-6 cap |
+| `filter_scalar_laplacian`, `saturate_scalar_gradient` | `test_smoothing` | `apply_scalar_{smoothing,saturation}_per_vertex` | 0.60 ms against 5.3 ms on a spike-seeded Lipschitz projection |
+| `transfer_onto_vertices` | `test_vertices` | `transfer_attributes_per_vertex` | closest-point plus barycentric blend, against a serial closest-point walk |
+| `cluster_decimate` | `test_remesh` | `meshing_decimation_clustering` | exact agreement with `open3d.simplify_vertex_clustering` on face *and* vertex count |
+| `ambient_occlusion`, `shape_diameter` | `test_proximity` | `compute_scalar_ambient_occlusion`, `..._shape_diameter_function_per_vertex` | **9.3 ms against 662 ms** on `bunny` at 64 rays — the largest ratio in the suite |
+| `flip_by_objective` | `test_remesh` | `meshing_edge_flip_by_planar_optimization` | 2.0 ms against 28.6 ms on `saddle_graded` |
+| `bad_face_mask`, `remove_t_vertices` | `test_repair` | `compute_selection_bad_faces`, `meshing_remove_t_vertices` | 8.9 ms against 24.2 ms on `saddle_graded` |
+| `crease_edges`, `cut_along_edges` | `test_seams` | `compute_selection_crease_per_edge`, `meshing_cut_along_crease_edges` | 1.3 ms against 51.6 ms on `sphere_med`, and **24 output vertices against 32** on a cut cube |
+| `filter_normals`, `filter_two_step`, `filter_unsharp_mask` | `test_smoothing` | `apply_normal_smoothing_per_face`, `apply_coord_two_steps_smoothing`, `apply_coord_unsharp_mask` | 8.3 ms against 124 ms; 0.34 ms against 51.8 ms |
+| `resample_uniform` | `test_reconstruction` | `generate_resampled_uniform_mesh` | 13.5 ms against 292 ms on `bunny` at a 1% cell |
+| `quadric_decimate` | `test_remesh` | `meshing_decimation_quadric_edge_collapse` | **the one port that is slower**: 88 / 346 ms against igl's 50 / 80 — see below |
+
+Two of those rows are worth reading as findings rather than ratios:
+
+- **`quadric_decimate` trades speed for quality.** Its Hausdorff error at 512 faces from a subdiv-4
+  icosphere is 0.0147 against `igl.decimate`'s 0.0250 and Open3D's 0.0236, and it is 1.8–4.3× slower
+  than igl. The cost is the *pass count*, not the per-pass work: one pass commits an independent set of
+  roughly `candidates / valence` collapses, and each pass rebuilds the edge list, adjacency, quadrics
+  and two radix sorts. A serial queue pays none of that per collapse.
+- **`cut_along_edges` is faster when it cuts *more*.** Cutting every interior edge of `sphere_med`
+  costs 1.34 ms against 1.63 ms for a quarter of them, because the corner graph then has no edges and
+  the connected-components pass converges immediately instead of contracting `3F` nodes into `V`. So
+  the components contraction is the cost in that group, not the ray/key work.
+
 #### Hazards, all measured
 
 - **The MeshSet build is the floor under every row**, at ~0.47 µs/vertex: 0.91 ms on 2 562 vertices,
@@ -395,6 +429,23 @@ The rest are second or third independent implementations:
   oriented point cloud at every voxel size probed (`PureValue` 0.02 / 0.05 / 0.10), reporting
   `Mesh Saved 'plymcout.ply': 0 vertices, 0 faces`. It reconstructs from all *visible* layers via a
   temporary `.vmi` file and did not produce geometry from a single cloud.
+- **Three more silent-no-op parameters, found while porting bucket B.**
+  `compute_scalar_by_shape_diameter_function_per_vertex`'s `cone_amplitude` is a **no-op**: the output
+  is byte-identical at 90 and 120 degrees. `generate_resampled_uniform_mesh`'s `offset` as a
+  `PercentageValue` runs from *full erosion* at 0% to full dilation at 100%, so its own 50% default is
+  the **zero** offset and `PercentageValue(0)` erodes a unit sphere to radius 0.30 — pass
+  `PureValue(0.0)` for an absolute zero. And `apply_normal_smoothing_per_face` exposes no parameters at
+  all, so its row is a single pass against triwarp's twenty.
+- **Two filters disagree with the port in ways that are not tolerances.**
+  `apply_scalar_smoothing_per_vertex` smooths a *boundary* vertex along the boundary curve alone
+  (dividing by 2 rather than by its degree), so the oracle in `tests/test_smoothing.py` runs on closed
+  fixtures only. `apply_coord_two_steps_smoothing` at its own four defaults moves a noisy cube
+  **further** from clean than the noise was (RMS 0.0244 against 0.0156) because its fitting step rounds
+  the corners in — so that comparison asserts crease preservation, which both pass, and a one-sided
+  RMS bound.
+- **`bunny_decimated` is not edge-manifold** (150 edges with three or more faces), which is why
+  `test_seams`' cut group runs on the synthetic icospheres: both triwarp's halfedge twins and
+  MeshLab's `meshing_cut_along_crease_edges` reject it outright rather than degrading.
 - **Several filters print to stdout regardless of `verbose=False`** (ICP's `Found N pairs`, the point-
   cloud normal estimator's `UG 34 34 34`, the VCG reconstructor's whole volume report). pytest's
   fd-level capture absorbs it; a bare script will not.

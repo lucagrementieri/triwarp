@@ -171,6 +171,7 @@ def test_procrustes_fractional_weights(device: str) -> None:
     assert np.allclose(cost_tw, cost_tm, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parity("procrustes", "trimesh")
 def test_procrustes_return_matrix_only(device: str) -> None:
     rng = np.random.default_rng(6)
     a_np, b_np = _make_point_clouds(rng)

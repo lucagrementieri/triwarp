@@ -6,9 +6,18 @@ See [`remove_unreferenced_vertices`][triwarp.repair.remove_unreferenced_vertices
 [`resolve_duplicated_faces`][triwarp.repair.resolve_duplicated_faces],
 [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces], and
 [`collapse_small_triangles`][triwarp.repair.collapse_small_triangles].
+
+Two further defects need geometry rather than topology to detect, so they have their own detector:
+[`bad_face_mask`][triwarp.repair.bad_face_mask] flags faces that are too thin, misoriented against
+their neighbourhood, or folded back over it.
+[`remove_folded_faces`][triwarp.repair.remove_folded_faces] deletes the folded ones and
+[`remove_t_vertices`][triwarp.repair.remove_t_vertices] flips away the slivers a T-junction leaves
+behind.
 """
 
 from __future__ import annotations
+
+import math
 
 import warp as wp
 
@@ -649,3 +658,226 @@ def make_normals_outward(
     """
     wound = make_winding_consistent(faces)
     return make_volume(vertices, wound, multibody=multibody)
+
+
+def bad_face_mask(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    min_quality: float | None = 0.02,
+    max_normal_angle: float | None = None,
+    max_fold_angle: float | None = None,
+) -> wp.array[wp.bool]:
+    """
+    Flag faces that are thin, misoriented relative to their neighbourhood, or folded over it.
+
+    MeshLab's ``compute_selection_bad_faces``, and the detector behind
+    [`remove_folded_faces`][triwarp.repair.remove_folded_faces]. The three criteria are independent
+    and a face is bad if *any* enabled one fires; each is disabled by passing ``None``.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    min_quality
+        Flag a face whose ``radius_ratio``
+        ([`face_quality`][triwarp.triangles.face_quality]) is below this. ``0`` is fully degenerate
+        and ``1`` is equilateral, so this is a *thinness* gate; MeshLab's ``aratio``, whose default
+        of ``0.02`` is this one. ``None`` disables it.
+    max_normal_angle
+        Flag a face whose normal is more than this many **degrees** from the direction of the sum of
+        its edge-neighbours' normals — the local consensus. This catches a single face inserted the
+        wrong way round in an otherwise consistent patch. MeshLab's ``nfratio`` (default ``60``,
+        off by default). ``None`` disables it.
+    max_fold_angle
+        Flag a face that meets *some* neighbour at more than this many **degrees** — a fold, where
+        the two triangles lie almost on top of each other with opposing normals. Of the two faces at
+        such an edge only the one facing *against* its own wider neighbourhood is flagged, since
+        only one of them is the mistake; a face whose neighbours give it no consensus (an isolated
+        face, or a strip of exactly three) is therefore never flagged on this criterion alone.
+        MeshLab's ``folded_faces_angle_threshold`` (default ``160``, off by default). Must be in
+        ``(0, 180]``. ``None`` disables it.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Length-``n_faces`` mask on ``faces.device``; ``True`` marks a bad face. All-``False`` when
+        every criterion is disabled.
+
+    Raises
+    ------
+    ValueError
+        If ``max_normal_angle`` or ``max_fold_angle`` is outside ``(0, 180]``.
+
+    See Also
+    --------
+    [`remove_folded_faces`][triwarp.repair.remove_folded_faces]
+    [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
+    [`triwarp.triangles.face_quality`][triwarp.triangles.face_quality]
+    """
+    for name, angle in (("max_normal_angle", max_normal_angle), ("max_fold_angle", max_fold_angle)):
+        if angle is not None and not 0.0 < angle <= 180.0:
+            raise ValueError(f"{name} must be in (0, 180] degrees, got {angle}")
+
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    out_bad = wp.zeros(n_faces, dtype=wp.bool, device=device)
+    if n_faces == 0:
+        return out_bad
+
+    quality = (
+        tw.triangles.face_quality(vertices, faces, metric="radius_ratio")
+        if min_quality is not None
+        else wp.full(n_faces, 1.0, dtype=wp.float32, device=device)
+    )
+    face_normals, _areas = tw.triangles.face_normals_and_areas(vertices, faces)
+    neighbor_sum = wp.zeros(n_faces, dtype=wp.vec3, device=device)
+    max_angle = wp.zeros(n_faces, dtype=wp.float32, device=device)
+    if max_normal_angle is not None or max_fold_angle is not None:
+        adjacency = tw.adjacency.face_adjacency(faces)
+        if int(adjacency.shape[0]) > 0:
+            angles = tw.adjacency.face_adjacency_angles(
+                vertices, faces, face_adjacency=adjacency, face_normals=face_normals
+            )
+            wp.launch(
+                kernel_repair.accumulate_neighbor_normals,
+                dim=int(adjacency.shape[0]),
+                inputs=[face_normals, adjacency, angles, neighbor_sum, max_angle],
+                device=device,
+            )
+
+    # -2 is unreachable for a cosine and -1 for the normalized quality, so a disabled criterion
+    # simply never fires and the kernel needs no per-criterion flag.
+    wp.launch(
+        kernel_repair.bad_face_mask,
+        dim=n_faces,
+        inputs=[
+            quality,
+            face_normals,
+            neighbor_sum,
+            max_angle,
+            wp.float32(min_quality if min_quality is not None else -1.0),
+            wp.float32(
+                math.cos(math.radians(max_normal_angle)) if max_normal_angle is not None else -2.0
+            ),
+            wp.float32(
+                math.cos(math.radians(max_fold_angle)) if max_fold_angle is not None else -2.0
+            ),
+            out_bad,
+        ],
+        device=device,
+    )
+    return out_bad
+
+
+def remove_folded_faces(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], *, angle: float = 160.0
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Drop faces that fold back over their own ring, and reindex.
+
+    A folded face is one whose dihedral angle to a neighbour is near ``pi``: the two triangles lie
+    almost on top of each other with opposite normals, which is what a badly reconstructed or
+    self-intersecting patch looks like locally. Such a face contributes no surface and breaks every
+    normal-based computation downstream, so removing it is a repair rather than a simplification.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    angle
+        Dihedral threshold in **degrees**; a face with a neighbour above it is dropped. MeshLab's
+        ``folded_faces_angle_threshold``, whose default of ``160`` is this one. Must be in
+        ``(0, 180]``.
+
+    Returns
+    -------
+    new_vertices : wp.array[wp.vec3]
+        Vertices still referenced by a kept face, compacted from index zero.
+    new_faces : wp.array[wp.int32]
+        Flat buffer of the kept faces, remapped into ``new_vertices``.
+
+    See Also
+    --------
+    [`bad_face_mask`][triwarp.repair.bad_face_mask]
+    [`remove_t_vertices`][triwarp.repair.remove_t_vertices]
+    [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
+
+    Notes
+    -----
+    MeshLab's ``meshing_remove_folded_faces`` *flips* the offending edge instead of deleting the
+    face, which preserves the face count but can only help when the fold is a triangulation mistake
+    rather than genuinely folded geometry. Deletion is the choice the rest of this module makes (see
+    [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces] and
+    [`remove_non_manifold_faces`][triwarp.repair.remove_non_manifold_faces]), and it leaves a hole
+    that [`triwarp.hole_filling`][triwarp.hole_filling] can retriangulate properly.
+    """
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return wp.clone(vertices), wp.clone(faces)
+    folded = bad_face_mask(vertices, faces, min_quality=None, max_fold_angle=angle)
+    keep = wp.empty(n_faces, dtype=wp.bool, device=faces.device)
+    wp.map(kernel_array.mask_not, folded, out=keep)
+    return tw.selection.submesh_from_face_mask(vertices, faces, keep)
+
+
+def remove_t_vertices(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    threshold: float = 40.0,
+    max_iter: int = 10,
+) -> wp.array[wp.int32]:
+    """
+    Repair T-vertices by flipping the long edge of each sliver they create.
+
+    A **T-vertex** is a vertex that sits in the interior of a neighbouring triangle's edge rather
+    than at one of its corners — the classic symptom of two patches stitched at different
+    resolutions. The vertex is topologically fine, but the triangle opposite it is a sliver: its
+    apex lies (nearly) on the far edge, which sends its circumradius-to-inradius ratio to infinity
+    and makes every cotangent weight, normal and curvature estimate around it unusable.
+
+    The repair is a flip, not a deletion: flipping the sliver's long edge moves the diagonal off the
+    T and leaves two well-shaped triangles, with the same vertices and the same face count.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions. Never modified.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    threshold
+        Aspect ratio above which a triangle counts as a T-vertex sliver, in the
+        ``aspect_ratio`` sense of [`face_quality`][triwarp.triangles.face_quality] (``1`` is
+        equilateral, unbounded above). MeshLab's ``meshing_remove_t_vertices`` threshold, whose
+        default of ``40`` is this one. Must be positive.
+    max_iter
+        Maximum number of parallel flip passes. Each pass commits a conflict-free independent set of
+        flips; MeshLab's ``repeat=True`` is the same idea serially.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        Flat face buffer with the slivers re-triangulated, on ``faces.device`` (a copy; the input is
+        not modified).
+
+    See Also
+    --------
+    [`triwarp.remesh.flip_by_objective`][triwarp.remesh.flip_by_objective]
+    [`remove_folded_faces`][triwarp.repair.remove_folded_faces]
+    [`collapse_small_triangles`][triwarp.repair.collapse_small_triangles]
+
+    Notes
+    -----
+    A flip cannot fix a T-vertex on the mesh **boundary** or on a non-manifold edge, because there
+    is no second triangle to flip against. MeshLab offers an edge *collapse* method for that case;
+    here the equivalent is [`collapse_small_triangles`][triwarp.repair.collapse_small_triangles],
+    which removes the sliver by merging its short edge instead.
+    """
+    return tw.remesh.flip_by_objective(
+        vertices, faces, objective="t_vertex", aspect_threshold=threshold, max_iter=max_iter
+    )

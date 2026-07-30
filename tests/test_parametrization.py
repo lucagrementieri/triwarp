@@ -115,6 +115,7 @@ def test_flipped_faces_empty_mesh(device):
 
 
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
+@pytest.mark.parity("map_vertices_to_circle", "igl")
 def test_map_vertices_to_circle_matches_igl(request, device, mesh_name):
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np, _ = _mesh_numpy(mesh_tm)
@@ -146,6 +147,8 @@ def test_uniform_laplacian_matches_igl(device, hemisphere):
 
 
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
+@pytest.mark.parity("harmonic", "igl")
+@pytest.mark.parity("harmonic_conditioning", "igl")
 def test_harmonic_matches_igl(request, device, mesh_name):
     _skip_on_cpu(device)
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
@@ -260,6 +263,7 @@ def test_tutte_disk_is_fold_free(device, hemisphere):
 
 
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
+@pytest.mark.parity("lscm", "igl")
 def test_lscm_matches_igl(request, device, mesh_name):
     _skip_on_cpu(device)
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
@@ -425,6 +429,7 @@ def _arap_igl(vertices_np, faces_np, fixed_np, fixed_uv_np, uv_init_np, max_iter
 
 
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
+@pytest.mark.parity("arap", "igl")
 def test_arap_matches_igl(request, device, mesh_name):
     _skip_on_cpu(device)
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)

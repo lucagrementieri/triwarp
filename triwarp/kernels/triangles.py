@@ -4,6 +4,15 @@ import warp as wp
 
 from triwarp.constants import PI, TILE_1D, TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.array import to_vec3d
+from triwarp.kernels.predicates import triangle_aspect_ratio
+
+# ``face_quality`` metric selectors. Passed as a warp-uniform kernel argument so all four share one
+# compiled module (a ``wp.Function`` cannot be a kernel argument -- see AGENTS.md section 4).
+QUALITY_ASPECT_RATIO = wp.constant(wp.int32(0))  # circumradius / (2 * inradius), 1 .. +inf
+QUALITY_RADIUS_RATIO = wp.constant(wp.int32(1))  # VCG QualityRadii, 0 .. 1
+QUALITY_AREA_MAX_SIDE = wp.constant(wp.int32(2))  # 2 * area / longest_side^2, 0 .. sqrt(3)/2
+QUALITY_MEAN_RATIO = wp.constant(wp.int32(3))  # 4 * sqrt(3) * area / (a^2 + b^2 + c^2), 0 .. 1
+QUALITY_AREA = wp.constant(wp.int32(4))  # plain triangle area
 
 
 @wp.func
@@ -113,6 +122,72 @@ def angles(
         out_angles[f, 2] = 0.0
 
 
+@wp.func
+def triangle_radius_ratio(a: Any, b: Any, c: Any) -> wp.Float:
+    # VCG ``QualityRadii`` ("inradius/circumradius"): the ratio of the two radii, rescaled so an
+    # equilateral triangle reads 1 (the bare geometric ratio is 1/2 there). Symmetric in the three
+    # side lengths; zero for a degenerate triangle.
+    bc = wp.length(c - b)
+    ca = wp.length(a - c)
+    ab = wp.length(b - a)
+    product = ab * ca * bc
+    if product <= type(product)(0.0):
+        return type(product)(0.0)
+    return (ab + ca - bc) * (bc + ab - ca) * (ca + bc - ab) / product
+
+
+@wp.func
+def triangle_area_max_side(a: Any, b: Any, c: Any) -> wp.Float:
+    # VCG ``Quality`` ("area/max side"): twice the area over the longest side squared, so it is
+    # scale-invariant despite the name. ``sqrt(3)/2`` for an equilateral triangle, 0 for a
+    # degenerate one.
+    ab = b - a
+    ac = c - a
+    longest_sq = wp.max(wp.max(wp.length_sq(ab), wp.length_sq(ac)), wp.length_sq(wp.sub(c, b)))
+    if longest_sq <= type(longest_sq)(0.0):
+        return type(longest_sq)(0.0)
+    return wp.length(wp.cross(ab, ac)) / longest_sq
+
+
+@wp.func
+def triangle_mean_ratio(a: Any, b: Any, c: Any) -> wp.Float:
+    # VCG ``QualityMeanRatio``: ``4 * sqrt(3) * area / (a^2 + b^2 + c^2)`` -- 1 for an equilateral
+    # triangle, 0 for a degenerate one.
+    ab = b - a
+    ac = c - a
+    sum_sq = wp.length_sq(ab) + wp.length_sq(ac) + wp.length_sq(wp.sub(c, b))
+    if sum_sq <= type(sum_sq)(0.0):
+        return type(sum_sq)(0.0)
+    return type(sum_sq)(2.0) * wp.sqrt(type(sum_sq)(3.0)) * wp.length(wp.cross(ab, ac)) / sum_sq
+
+
+@wp.func
+def triangle_quality(a: Any, b: Any, c: Any, metric: wp.int32) -> wp.Float:
+    # Warp-uniform dispatch over the ``QUALITY_*`` selectors: one compiled module for all five
+    # metrics, since a ``wp.Function`` cannot cross the ``wp.launch`` boundary.
+    if metric == QUALITY_ASPECT_RATIO:
+        return triangle_aspect_ratio(a, b, c)
+    if metric == QUALITY_RADIUS_RATIO:
+        return triangle_radius_ratio(a, b, c)
+    if metric == QUALITY_AREA_MAX_SIDE:
+        return triangle_area_max_side(a, b, c)
+    if metric == QUALITY_MEAN_RATIO:
+        return triangle_mean_ratio(a, b, c)
+    return type(a[0])(0.5) * wp.length(wp.cross(b - a, c - a))
+
+
+@wp.kernel
+def face_quality(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    metric: wp.int32,
+    out_quality: wp.array[wp.float32],
+) -> None:
+    f = wp.tid()
+    v0, v1, v2 = face_vertices(vertices, faces, wp.int32(f))
+    out_quality[f] = triangle_quality(v0, v1, v2, metric)
+
+
 @wp.kernel
 def centroid(
     vertices: wp.array[wp.vec3],
@@ -185,6 +260,26 @@ def barycentric_to_points(
     )
 
 
+@wp.func
+def point_barycentric_cramer(v0: wp.vec3, v1: wp.vec3, v2: wp.vec3, point: wp.vec3) -> wp.vec3:
+    # Barycentric coordinates of ``point`` projected into the plane of triangle (v0, v1, v2),
+    # by Cramer's rule on the 2x2 Gram system of the two edge vectors. A degenerate triangle makes
+    # the determinant zero and the result infinite, which is the caller's cue rather than this
+    # function's business (the kernel form has always behaved that way).
+    e0 = v1 - v0
+    e1 = v2 - v0
+    w = point - v0
+    dot00 = wp.length_sq(e0)
+    dot01 = wp.dot(e0, e1)
+    dot02 = wp.dot(e0, w)
+    dot11 = wp.length_sq(e1)
+    dot12 = wp.dot(e1, w)
+    inverse_denominator = 1.0 / (dot00 * dot11 - dot01 * dot01)
+    v = (dot11 * dot02 - dot01 * dot12) * inverse_denominator
+    w2 = (dot00 * dot12 - dot01 * dot02) * inverse_denominator
+    return wp.vec3(1.0 - v - w2, v, w2)
+
+
 @wp.kernel
 def points_to_barycentric_cramer(
     vertices: wp.array[wp.vec3],
@@ -193,18 +288,8 @@ def points_to_barycentric_cramer(
     out_barycentric: wp.array[wp.vec3],
 ) -> None:
     f = wp.tid()
-    triangle_face = faces[f * 3 : (f + 1) * 3]
-    e0, e1, _ = triangle_edges(vertices, triangle_face)
-    w = points[f] - vertices[triangle_face[0]]
-    dot00 = wp.length_sq(e0)
-    dot01 = wp.dot(e0, e1)
-    dot02 = wp.dot(e0, w)
-    dot11 = wp.length_sq(e1)
-    dot12 = wp.dot(e1, w)
-    inverse_denominator = 1.0 / (dot00 * dot11 - dot01 * dot01)
-    out_barycentric[f][2] = (dot00 * dot12 - dot01 * dot02) * inverse_denominator
-    out_barycentric[f][1] = (dot11 * dot02 - dot01 * dot12) * inverse_denominator
-    out_barycentric[f][0] = 1.0 - out_barycentric[f][1] - out_barycentric[f][2]
+    v0, v1, v2 = face_vertices(vertices, faces, wp.int32(f))
+    out_barycentric[f] = point_barycentric_cramer(v0, v1, v2, points[f])
 
 
 @wp.kernel

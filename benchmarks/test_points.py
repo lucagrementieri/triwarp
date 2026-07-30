@@ -30,14 +30,21 @@ References
 ``KDTreeSearchParamKNN`` is the same k-nearest PCA estimator (its ``FastEigen3x3`` picks the
 smallest-eigenvalue eigenvector, as triwarp's ``wp.svd3`` path does).
 
-**pymeshlab** covers two: ``compute_normal_for_point_clouds(k=)`` is the same k-nearest PCA
+**pymeshlab** covers three: ``compute_normal_for_point_clouds(k=)`` is the same k-nearest PCA
 estimator at the same ``k`` (and it exists for exactly this case -- a dataset with no faces -- so
-its input is a *face-less* MeshSet); and ``compute_matrix_by_fitting_to_plane`` is the ``fit_plane``
+its input is a *face-less* MeshSet); ``compute_matrix_by_fitting_to_plane`` is the ``fit_plane``
 counterpart, reporting the fitted normal and the average fitting error. That one has a
 precondition: it raises ``Cannot compute rotation: there is no selection`` unless something is
 selected, so ``set_selection_all`` runs first, untimed -- it is how the filter is told "fit all the
 points", not part of the fit. It also builds a rotation matrix onto a target plane, which triwarp
-does not, so its row is an upper bound.
+does not, so its row is an upper bound. Third, ``compute_selection_point_cloud_outliers`` is the
+LoOP score behind ``outlier_probability``, at the same ``knearest``.
+
+The outlier groups are timed the same way as ``estimate_normals_knn``: the neighbour table is an
+*input* of triwarp's functions and is built inside the timed callable, because both references build
+their own k-d tree per call and there would otherwise be nothing to compare. ``open3d`` covers only
+the statistical variant (``remove_statistical_outlier``), which additionally *copies* the surviving
+points into a new cloud -- triwarp returns a mask, so that row is an upper bound.
 
 MeshLab has nothing for ``fit_line`` / ``major_axis``, ``point_plane_distance``, ``vector_angle`` or
 ``radial_sort``: those are array primitives rather than filters.
@@ -309,3 +316,54 @@ def test_estimate_normals_knn(bench_case: BenchCase) -> None:
         search = o3d.geometry.KDTreeSearchParamKNN(knn=_KNN)
         bench_case.run(lambda: cloud.estimate_normals(search_param=search))
         assert np.asarray(cloud.normals).shape == (bench_case.n_vertices, 3)
+
+
+@pytest.mark.benchmark(group="outlier_probability")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+def test_outlier_probability(bench_case: BenchCase) -> None:
+    """LoOP scores: the k-NN table plus four passes over it, against the filter they came from."""
+    if bench_case.mesh_name == "sphere_large":
+        pytest.skip("MeshLab's k-d tree searches one point at a time; capped at sphere_med")
+    if bench_case.kind == "pymeshlab":
+        # Selection-only, so the geometry is untouched and the MeshSet is shared; the filter still
+        # rebuilds its k-d tree every call, which is why triwarp's row builds its table in-callable.
+        cloud_pml = _cloud_meshset_pml(bench_case)
+        bench_case.run(
+            lambda: cloud_pml.compute_selection_point_cloud_outliers(
+                propthreshold=0.8, knearest=_KNN
+            )
+        )
+        assert cloud_pml.current_mesh().vertex_selection_array().shape == (bench_case.n_vertices,)
+        return
+    points = bench_case.vertices_wp
+    probability = bench_case.run(
+        lambda: tw.points.outlier_probability(
+            *tw.neighbors.query_bvh_nearest(points, points, k=_KNN)
+        )
+    )
+    assert probability.shape == (bench_case.n_vertices,)
+
+
+@pytest.mark.benchmark(group="statistical_outlier_mask")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "open3d")
+def test_statistical_outlier_mask(bench_case: BenchCase) -> None:
+    """One global threshold on the mean neighbour distance — open3d's own outlier criterion."""
+    if bench_case.mesh_name == "sphere_large":
+        pytest.skip("open3d searches one point at a time; capped at sphere_med")
+    if bench_case.kind == "triwarp":
+        points = bench_case.vertices_wp
+        mask = bench_case.run(
+            lambda: tw.points.statistical_outlier_mask(
+                tw.neighbors.query_bvh_nearest(points, points, k=_KNN)[1]
+            )
+        )
+        assert mask.shape == (bench_case.n_vertices,)
+    else:
+        # ``remove_statistical_outlier`` also materializes the kept subset, which triwarp does not.
+        cloud = _pcd(bench_case)
+        _kept, keep_indices = bench_case.run(
+            lambda: cloud.remove_statistical_outlier(nb_neighbors=_KNN, std_ratio=2.0)
+        )
+        assert len(keep_indices) <= bench_case.n_vertices

@@ -26,6 +26,7 @@ def _bsr_to_csr(matrix: wp.sparse.BsrMatrix) -> sp.csr_matrix:
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("cotmatrix_entries", "igl")
 def test_cotmatrix_entries(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
@@ -38,6 +39,7 @@ def test_cotmatrix_entries(request: pytest.FixtureRequest, mesh_name: str) -> No
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("cotmatrix_entries_intrinsic", "igl")
 def test_cotmatrix_entries_intrinsic(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
@@ -54,6 +56,7 @@ def test_cotmatrix_entries_intrinsic(request: pytest.FixtureRequest, mesh_name: 
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("cotmatrix", "igl")
 def test_cotmatrix(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
@@ -82,6 +85,8 @@ def test_cotmatrix_null_space(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parametrize("equal_weight", [True, False])
+@pytest.mark.parity("laplacian_uniform", "trimesh")
+@pytest.mark.parity("laplacian_inverse_distance", "trimesh")
 def test_laplacian_operator(
     request: pytest.FixtureRequest, mesh_name: str, equal_weight: bool
 ) -> None:
@@ -120,6 +125,7 @@ def test_laplacian_symmetric_flag(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> Non
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("mass_matrix_entries", "igl")
 def test_mass_matrix(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
@@ -287,6 +293,7 @@ def test_robust_laplacian_matches_igl_intrinsic_assembly(
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere", "half_torus", "torus"])
+@pytest.mark.parity("robust_laplacian", "igl")
 def test_robust_laplacian_matches_igl_intrinsic_delaunay(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:

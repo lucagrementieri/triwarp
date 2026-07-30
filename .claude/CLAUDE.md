@@ -212,7 +212,7 @@ broadest reference of the three — 281 filters — and a hard test dependency l
 **`_pml`** suffix. Build the MeshSet with `tests.conversions.trimesh_to_pymeshlab(mesh_tm)` (or
 `warp_to_pymeshlab(vertices_wp, faces_wp)` for a triwarp output) rather than hand-rolling
 `ml.MeshSet()`. Use it where it is a *better* oracle than the incumbent, not everywhere — trimesh /
-igl / potpourri3d stay the reference where they already are one. Four hazards, all found by probing:
+igl / potpourri3d stay the reference where they already are one. Six hazards, all found by probing:
 
 - **Almost every filter mutates `current_mesh()` in place.** `apply_coord_*` moves vertices,
   `meshing_*` rewrites the topology, `compute_*_per_vertex` writes an attribute, `generate_*` pushes
@@ -235,6 +235,18 @@ igl / potpourri3d stay the reference where they already are one. Four hazards, a
   `face_face_adjacency_matrix()` raises `MissingComponentException` unless the FF component was
   requested (`update_topology()` alone does not enable it). And `generate_boolean_*` takes
   `first_mesh` / `second_mesh`, not the `first` / `second` older docs show.
+- **Some parameters are silent no-ops, and one runs backwards.**
+  `compute_scalar_by_shape_diameter_function_per_vertex`'s `cone_amplitude` produces byte-identical
+  output at 90 and 120 degrees; `apply_normal_smoothing_per_face` and
+  `apply_scalar_smoothing_per_vertex` expose no parameters at all (one pass, take it or leave it); and
+  `generate_resampled_uniform_mesh`'s `offset` as a `PercentageValue` runs from *full erosion* at 0%
+  to full dilation at 100%, so its own 50% default is the **zero** offset — pass `PureValue(0.0)` when
+  you mean zero. Probe a parameter before building an axis on it.
+- **Two filters differ from triwarp's port by definition, not tolerance**, and the tests say so
+  rather than papering over it: `apply_scalar_smoothing_per_vertex` averages a *boundary* vertex over
+  its two boundary neighbours alone (so its oracle runs on closed fixtures), and
+  `apply_coord_two_steps_smoothing` at its own defaults moves a noisy cube *further* from clean than
+  the noise was, because its fitting step rounds corners in.
 
 ### Mesh fixtures (prefer over inline construction)
 
@@ -251,6 +263,61 @@ Reuse shared mesh fixtures from `tests/conftest.py` instead of building meshes i
 - Parametrize over multiple fixtures with `request.getfixturevalue(mesh_name)` when coverage should span mesh types (see `test_signed_distance_on_mesh_random`).
 - Use `mesh_wp.device` (not the `device` fixture) for query-point allocation when a mesh fixture is already in scope.
 - Edge-case tests (empty points/faces, single-triangle pathology) may still use minimal inline buffers.
+
+### The parity gate: a benchmarked reference must be a tested reference
+
+`benchmarks/` asserts only shapes and finiteness, so on its own it cannot tell whether two timed
+implementations compute the same thing. `tests/test_parity.py` closes that loop and **fails the
+default `pytest` run** when a benchmarked `(group, library)` pair is neither tested nor exempted.
+Two markers join the suites; the benchmark's `benchmark(group=...)` name is the key, which makes
+group names a cross-suite API — renaming one breaks every `parity` marker that cites it.
+
+```python
+# tests/test_edges.py -- "this test proves triwarp agrees with trimesh for that group"
+@pytest.mark.parity("faces_to_edges", "trimesh")
+
+# benchmarks/test_curvature.py -- "timed, but the results are not comparable"
+@pytest.mark.noparity("pymeshlab", oracle="trimesh", reason="MeshLab computes the Meyer/Desbrun "
+                      "pointwise 1-ring operator, not the Cohen-Steiner/Morvan ball measure, so "
+                      "its absolute value is not comparable; measured 0.982 correlation with a 7% "
+                      "offset. trimesh is the oracle for this group.")
+```
+
+Both are stackable and take string **literals** only — a computed argument is invisible to a static
+scan, so the scanner rejects it. Run `uv run python -m tests.parity` for the full matrix.
+
+Classify every comparison, and say which class it is in the docstring:
+
+- **A** direct `np.allclose` / `np.array_equal`. The default.
+- **B** equal after a *named* transform, still at `1e-5`: a dict index, a unit fix
+  (`igl.doublearea / 2`), a reduction (igl's per-vertex mask → triwarp's bool), a projection
+  (`igl.boundary_loop` is the longest loop), `lexsort` for unordered rows, a sign or gauge fix.
+  **Most apparent non-equivalence lands here.** The benchmark docstrings' "does strictly less",
+  "upper bound" and "output shape differs" caveats are about *cost*, not about the value.
+- **C** a derived scalar, set distance or statistic, because no correspondence exists. Must name the
+  bug class it excludes, and record a mutation probe *and its margin* in the docstring — threshold
+  ≥ 3x from the measured agreement. `fraction_within` bounds must be shown to fail under shuffling
+  one side, or they are testing marginal distributions rather than the correspondence.
+- **D** exemption. Only for: not an independent implementation (`oracle=` required); a different
+  algorithm with a measured disagreement; a parameter the reference lacks; an answer not observable
+  in isolation; stochastic with no invariant; or input classes where triwarp is undefined.
+  **Not** admissible: "awkward", "the tolerance would be loose", or any class-B situation.
+
+Never a parity assert: shape-only or `isfinite`-only (that is the *benchmark's* assert, and this
+gate exists to stop it migrating inward); triwarp compared with itself; a threshold a constant
+output would pass. A boolean assert must be parametrized over inputs producing both answers.
+
+Reuse `tests/comparisons.py` (`lexsort_rows`, `canonical_winding`, `assert_same_up_to_sign`,
+`assert_cyclic_permutation_equal`, `fraction_within`, `symmetric_chamfer`, `hausdorff_two_sided`)
+and `tests/conversions.py` (`trimesh_to_open3d`, `points_to_open3d`, `open3d_to_trimesh`,
+`trimesh_to_pymeshlab`, `warp_to_pymeshlab`, `points_to_pymeshlab`, `faces_igl`) rather than
+re-rolling either. `open3d` is a hard test dependency like `pymeshlab` and `igl` — import it plainly
+as `import open3d as o3d`, never through `pytest.importorskip`.
+
+Two measured gotchas worth not rediscovering: MeshLab's `face_normal_matrix()` after
+`compute_normal_per_face()` is the **unnormalised** cross product (magnitude exactly `2 * area`), so
+it checks normals *and* areas; and `symmetric_chamfer` has a sampling noise floor — a mesh against
+itself scores ~0.028 on `icosphere(3)`, so a threshold must clear that, not sit under it.
 
 ---
 

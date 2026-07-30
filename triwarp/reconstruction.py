@@ -951,6 +951,187 @@ def _extract_poisson_surface_fem(
     return _extract_poisson_surface(values, res, iso, cube_lower, cube_upper)
 
 
+def marching_cubes(
+    field: twt.Array3dFloat32, iso: float = 0.0, *, bounds: tuple[wp.vec3, wp.vec3] | None = None
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Extract the ``iso`` level set of a dense scalar lattice as a triangle mesh.
+
+    The extraction tail of every implicit-surface pipeline, exposed on its own so a caller with a
+    field of their own — an SDF, an occupancy volume, a simulation state — does not have to route it
+    through [`screened_poisson`][triwarp.reconstruction.screened_poisson] to get a surface out. It
+    is what [`resample_uniform`][triwarp.reconstruction.resample_uniform] is built from.
+
+    Parameters
+    ----------
+    field
+        ``(nx, ny, nz)`` ``wp.float32`` lattice of scalar values, with ``x`` the slowest axis. The
+        surface is extracted where the field crosses ``iso``; the sign convention is the caller's,
+        and the winding follows it (with triwarp's outside-positive
+        [`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh] convention the
+        normals come out pointing outward).
+    iso
+        Level to extract. Defaults to ``0``, which is the zero level set of a signed distance field.
+    bounds
+        ``(lower, upper)`` world-space corners the lattice spans, so ``field[0, 0, 0]`` sits at
+        ``lower`` and ``field[nx - 1, ny - 1, nz - 1]`` at ``upper``. When ``None`` the result is in
+        *index* space: vertex coordinates are lattice indices.
+
+    Returns
+    -------
+    vertices : wp.array[wp.vec3]
+        Level-set vertices on ``field.device``. Empty when the field does not cross ``iso``.
+    faces : wp.array[wp.int32]
+        Flat ``3 * n_faces`` triangle index buffer.
+
+    Raises
+    ------
+    ValueError
+        If ``field`` is not a rank-3 ``wp.float32`` array, or any of its dimensions is below 2.
+
+    See Also
+    --------
+    [`resample_uniform`][triwarp.reconstruction.resample_uniform]
+    [`screened_poisson`][triwarp.reconstruction.screened_poisson]
+    [`triwarp.proximity.signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]
+
+    Notes
+    -----
+    A thin wrapper over Warp's own ``warp.MarchingCubes``, so the triangulation, its vertex
+    deduplication and its handling of the ambiguous cube cases are Warp's rather than triwarp's. The
+    consequence worth knowing is that the result is **not guaranteed manifold** at an ambiguous
+    cell, and can carry duplicate vertices where two cells agree on a crossing —
+    [`resample_uniform`][triwarp.reconstruction.resample_uniform] runs
+    [`triwarp.repair`][triwarp.repair] over it for exactly that reason.
+    """
+    field = twt.as_array3d_float32(field)
+    shape = tuple(int(dim) for dim in field.shape)
+    if min(shape) < 2:
+        raise ValueError(f"field must be at least 2 wide along every axis, got {shape}")
+
+    if bounds is None:
+        lower = wp.vec3(0.0, 0.0, 0.0)
+        upper = wp.vec3(float(shape[0] - 1), float(shape[1] - 1), float(shape[2] - 1))
+    else:
+        lower, upper = bounds
+    return wp.MarchingCubes.extract_surface_marching_cubes(field, wp.float32(iso), lower, upper)
+
+
+def resample_uniform(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    voxel_size: float | None = None,
+    offset: float = 0.0,
+    sign_mode: Literal["parity", "winding"] = "winding",
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Rebuild a mesh by sampling its signed distance field on a uniform grid and re-extracting it.
+
+    MeshLab's ``generate_resampled_uniform_mesh``. Three uses, all the same call:
+
+    - **Regularize.** The output triangulation comes from the grid, not from the input, so every
+      pathology of the input topology — self-intersections, non-manifold edges, duplicated or
+      inverted faces, a soup — is simply not carried over. This is the bluntest repair there is and
+      the one that always works.
+    - **Offset.** A positive ``offset`` extracts the level set *outside* the surface (a dilation)
+      and a negative one inside (an erosion): how shells, clearances and tool paths are built.
+    - **Shrink-wrap.** A coarse ``voxel_size`` with ``offset=0`` gives a watertight envelope of a
+      complicated input.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    voxel_size
+        Grid spacing. Defaults to ``1 %`` of the bounding-box diagonal, which is a ~100-cell grid
+        across the mesh. **Cost is cubic in the reciprocal**, so halving it is eight times the field
+        evaluation; and no feature thinner than a voxel survives.
+    offset
+        Level set to extract, in world units. ``0`` (the default) reproduces the surface.
+    sign_mode
+        How the sign of the distance field is decided, forwarded to
+        [`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]. The default here is
+        ``"winding"`` rather than that function's ``"parity"``: resampling is usually applied to a
+        mesh that is *broken*, and ray parity has no principled answer through a hole, while the
+        generalized winding number degrades gracefully.
+
+    Returns
+    -------
+    vertices : wp.array[wp.vec3]
+        Resampled vertex positions on ``vertices.device``.
+    faces : wp.array[wp.int32]
+        Flat ``3 * n_faces`` triangle index buffer.
+
+    Raises
+    ------
+    ValueError
+        If ``voxel_size`` is not positive.
+
+    See Also
+    --------
+    [`marching_cubes`][triwarp.reconstruction.marching_cubes]
+    [`triwarp.proximity.signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]
+    [`triwarp.remesh.cluster_decimate`][triwarp.remesh.cluster_decimate]
+
+    Notes
+    -----
+    The grid is padded by three voxels beyond the bounding box *plus* ``offset``, so a dilated level
+    set is never clipped by the lattice boundary and the extracted surface is always closed. That
+    padding is why the memory cost is a little above ``(extent / voxel_size) ** 3``.
+    """
+    device = vertices.device
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return wp.clone(vertices), wp.clone(faces)
+
+    lower, upper = tw.bounds.aabb_bounds(vertices)
+    diagonal = float(wp.length(upper - lower))
+    if voxel_size is None:
+        voxel_size = 0.01 * diagonal
+    if voxel_size <= 0.0:
+        raise ValueError(f"resample_uniform requires voxel_size > 0, got {voxel_size}")
+
+    # Three voxels of slack beyond the box and beyond the offset, so a dilated level set closes
+    # inside the lattice instead of being cut off by it.
+    pad = 3.0 * voxel_size + max(offset, 0.0)
+    grid_lower = wp.vec3(lower[0] - pad, lower[1] - pad, lower[2] - pad)
+    grid_upper = wp.vec3(upper[0] + pad, upper[1] + pad, upper[2] + pad)
+    resolution = wp.vec3i(
+        *(
+            max(2, math.ceil((grid_upper[axis] - grid_lower[axis]) / voxel_size) + 1)
+            for axis in range(3)
+        )
+    )
+    spacing = wp.vec3(
+        *((grid_upper[axis] - grid_lower[axis]) / float(resolution[axis] - 1) for axis in range(3))
+    )
+
+    n_points = int(resolution[0]) * int(resolution[1]) * int(resolution[2])
+    points = wp.empty(n_points, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_reconstruction.lattice_points,
+        dim=(int(resolution[0]), int(resolution[1]), int(resolution[2])),
+        inputs=[resolution, grid_lower, spacing, points],
+        device=device,
+    )
+    field = tw.proximity.signed_distance_on_mesh(vertices, faces, points, sign_mode=sign_mode)
+    out_vertices, out_faces = marching_cubes(
+        twt.as_array3d_float32(
+            field.reshape((int(resolution[0]), int(resolution[1]), int(resolution[2])))
+        ),
+        iso=offset,
+        bounds=(grid_lower, grid_upper),
+    )
+    # Warp's extractor emits a vertex per crossing per cell, so coincident duplicates are normal
+    # rather than exceptional; welding them is what makes the result a closed surface. Hole filling
+    # is off (``crit_hole_length=0``): a level set of a signed field is already closed, so any hole
+    # here would be a symptom worth surfacing rather than patching over.
+    return _clean_reconstruction(out_vertices, out_faces, 0.0)
+
+
 def ball_pivoting(
     points: wp.array[wp.vec3],
     normals: wp.array[wp.vec3] | None = None,

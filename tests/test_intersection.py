@@ -53,6 +53,7 @@ def _segments_equal(
     return bool(np.allclose(got, exp, rtol=rtol, atol=atol))
 
 
+@pytest.mark.parity("segments_with_plane", "trimesh")
 def test_segments_with_plane_axis_aligned(device: str) -> None:
     plane_origin = np.array([0.0, 0.0, 0.0], dtype=np.float32)
     plane_normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
@@ -116,6 +117,7 @@ def test_mesh_with_plane_empty(device: str) -> None:
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("mesh_with_plane", "trimesh")
 def test_mesh_with_plane_axis_planes(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
@@ -229,6 +231,7 @@ def test_slice_mesh_with_plane_empty(device: str) -> None:
     assert out_faces_wp.shape == (0,)
 
 
+@pytest.mark.parity("slice_mesh_with_plane", "trimesh")
 def test_slice_mesh_with_plane_box_corner() -> None:
     mesh_tm = tm.creation.box()
     plane_origin_np = mesh_tm.bounds[1] - 0.05

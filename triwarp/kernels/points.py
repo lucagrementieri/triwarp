@@ -131,3 +131,93 @@ def estimate_point_normals(
     if wp.dot(normal, ref) < 0.0:
         normal = -normal
     out_normals[v] = normal
+
+
+@wp.kernel
+def neighbor_distance_moments(
+    neighbor_distance: wp.array2d[wp.float32],
+    out_mean: wp.array[wp.float32],
+    out_rms: wp.array[wp.float32],
+    out_count: wp.array[wp.int32],
+) -> None:
+    # First and second moments of each point's neighbour distances, over the *filled* slots only:
+    # ``query_bvh_nearest`` leaves unused slots at ``inf`` (index -1), and a row can be short when
+    # ``max_radius`` bites or the cloud is smaller than ``k``. An empty row reports zeros with a
+    # zero count, which is how both callers detect it.
+    #
+    # The mean feeds Open3D's statistical criterion and the RMS is the LoOP "standard distance".
+    i = int(wp.tid())
+    k = neighbor_distance.shape[1]
+    total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    total_sq = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    count = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
+    for s in range(k):
+        d = neighbor_distance[i, s]
+        if not wp.isinf(d):
+            total += d
+            total_sq += d * d
+            count += 1
+    out_count[i] = count
+    if count == 0:
+        out_mean[i] = 0.0
+        out_rms[i] = 0.0
+        return
+    inverse = 1.0 / float(count)
+    out_mean[i] = total * inverse
+    out_rms[i] = wp.sqrt(total_sq * inverse)
+
+
+@wp.kernel
+def local_outlier_factor(
+    standard_distance: wp.array[wp.float32],
+    neighbor_idx: wp.array2d[wp.int32],
+    out_plof: wp.array[wp.float32],
+) -> None:
+    # LoOP's probabilistic local outlier factor: how far this point's standard distance sits above
+    # the mean standard distance of its own neighbourhood. Zero when the neighbourhood is empty or
+    # collapsed, so such a point never reads as an outlier on this term alone.
+    #
+    # The LoOP normalization factor lambda cancels here (it scales numerator and denominator
+    # alike); it only enters through the cloud-wide nplof the caller divides by.
+    i = int(wp.tid())
+    k = neighbor_idx.shape[1]
+    total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    count = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
+    for s in range(k):
+        j = neighbor_idx[i, s]
+        if j >= 0:
+            total += standard_distance[j]
+            count += 1
+    if count == 0 or total <= 0.0:
+        out_plof[i] = 0.0
+        return
+    out_plof[i] = standard_distance[i] * float(count) / total - 1.0
+
+
+@wp.func
+def outlier_probability(plof: wp.float32, inverse_normalizer: wp.float32) -> wp.float32:
+    # LoOP score: the error function of the normalized factor, clamped at zero so an
+    # inlier-or-better point reads exactly 0 rather than a negative "probability".
+    return wp.max(wp.float32(0.0), wp.erf(plof * inverse_normalizer))
+
+
+@wp.func
+def centered_square_if_counted(
+    value: wp.float32, count: wp.int32, center: wp.float32
+) -> wp.float32:
+    # ``(value - center)^2`` for a counted row, 0 for an empty one: the masked variance term behind
+    # the statistical threshold, so empty rows neither shift the mean nor inflate the deviation.
+    if count == 0:
+        return 0.0
+    d = value - center
+    return d * d
+
+
+@wp.func
+def is_statistical_outlier(
+    mean_distance: wp.float32, count: wp.int32, threshold: wp.float32
+) -> wp.bool:
+    # Open3D's ``remove_statistical_outlier`` keeps a point when its mean neighbour distance is
+    # strictly positive and strictly below the cloud threshold; everything else -- an empty
+    # neighbourhood, a coincident one, or a far one -- is an outlier.
+    return count == 0 or mean_distance <= 0.0 or mean_distance >= threshold

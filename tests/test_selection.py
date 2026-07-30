@@ -22,6 +22,7 @@ def test_submesh_from_face_indices_empty(device: str) -> None:
     assert submesh_faces_wp.shape == (0,)
 
 
+@pytest.mark.parity("submesh_from_face_indices", "trimesh")
 def test_submesh_from_face_indices_single_face(request: pytest.FixtureRequest) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue("icosahedron")
     face_indices = wp.array([0], dtype=wp.int32, device=mesh_wp.points.device)
@@ -341,6 +342,7 @@ def test_expand_vertex_mask(device: str):
         assert np.array_equal(got, expected)
 
 
+@pytest.mark.parity("expand_vertex_mask", "pymeshlab")
 def test_expand_vertex_mask_matches_pymeshlab_dilatation(device: str):
     """
     Mask growth against MeshLab's Dilate Selection, which is the only external check it has.

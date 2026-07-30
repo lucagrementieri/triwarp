@@ -1,0 +1,137 @@
+"""
+Benchmarks for ``triwarp.seams``: crease detection and the topological cut along a seam set.
+
+Two groups, on two different mesh sets, because they have two different preconditions:
+
+* ``crease_edges`` runs the **scan sweep**. It is a face-adjacency build plus one threshold — pure
+  throughput, and the group to read as a floor for anything that consumes a feature set. Face
+  adjacency tolerates a non-manifold edge (it drops it), so every registry mesh is fair game.
+* ``cut_along_edges`` runs on the synthetic **icospheres** instead, and the reason is a hard
+  precondition rather than a preference: the cut is defined through halfedge twins, so it needs an
+  edge-manifold mesh, and ``bunny_decimated`` has **150 edges shared by three or more faces**.
+  triwarp raises there and so does MeshLab (``this filter require manifoldness``), so neither side
+  has a number to report — the same boundary the midpoint-subdivision references run into (see the
+  benchmarks README hazard table).
+
+The cut's cost is halfedge twins, a key set for the marked edges, a corner-graph build and a
+**connected-components pass over ``3F`` nodes**. The sweep that matters for it is therefore not only
+size but *how much* is cut, since that sets how far the components pass has to contract: the
+``cut_fraction`` parameter takes it from a quarter of the interior edges to all of them.
+
+References
+----------
+**pymeshlab** covers both: ``compute_selection_crease_per_edge`` is the same dihedral threshold
+(reported as a vertex selection, so it is selection-only and shares the MeshSet) and
+``meshing_cut_along_crease_edges`` is the cut — which finds the creases *and* cuts them in one call,
+so that row is an upper bound on triwarp's cut alone and should be read against the sum of the two
+triwarp rows. It rewrites the topology, so its MeshSet is rebuilt inside the timed callable. Its cut
+row exists only at ``cut_fraction=1.0``: the filter takes a dihedral threshold rather than an edge
+set, so ``angledeg=0`` (cut everything non-coplanar) is the only setting comparable to a triwarp
+fraction.
+
+One structural difference is worth knowing before comparing outputs rather than times: on a cube cut
+at every crease, triwarp emits the **minimal** 24 vertices and MeshLab 32 (see
+``tests/test_seams.py``). Both give 6 components and the same area, so the extra copies are
+redundant rather than wrong — but they are extra memory in every downstream pass.
+
+Neither trimesh, igl nor open3d has a cut along a marked edge set at all: trimesh's
+``unmerge_vertices`` splits *every* edge (a full soup) rather than a chosen set, which is the
+degenerate case rather than the operation.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import warp as wp
+from conftest import BenchCase, skip_larger_than
+
+import triwarp as tw
+import triwarp.typing as twt
+
+# Crease threshold in degrees. 30 is MeshLab's own documentation default for a "hard" edge and picks
+# out a real feature set on every scan mesh rather than everything or nothing.
+_CREASE_ANGLE = 30.0
+
+_cut_cache: dict[tuple[str, str, float], twt.Array2dInt32] = {}
+
+
+def _cut_edges(bench_case: BenchCase, fraction: float) -> twt.Array2dInt32:
+    """
+    Take a deterministic ``fraction`` of the mesh's interior edges -- an *input* of the cut.
+
+    Strided rather than sampled, so the marked set is spread evenly over the surface and the corner
+    graph it leaves is the same shape on every mesh. Cached per (mesh, device, fraction).
+    """
+    key = (bench_case.mesh_name, str(bench_case.device), fraction)
+    if key not in _cut_cache:
+        # ``angle=0`` on an icosphere is every interior edge, since no two of its faces are
+        # coplanar.
+        all_edges = tw.seams.crease_edges(
+            bench_case.vertices_wp, bench_case.faces_wp, angle=0.0
+        ).numpy()
+        stride = max(1, round(1.0 / fraction))
+        _cut_cache[key] = twt.as_array2d_int32(
+            wp.array(
+                np.ascontiguousarray(all_edges[::stride], dtype=np.int32),
+                dtype=wp.int32,
+                device=bench_case.device,
+            )
+        )
+    return _cut_cache[key]
+
+
+@pytest.mark.benchmark(group="crease_edges")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+def test_crease_edges(bench_case: BenchCase) -> None:
+    """Face adjacency plus a dihedral threshold: the cheap half of the seam workflow."""
+    if bench_case.kind == "pymeshlab":
+        skip_larger_than(bench_case, "bunny", "MeshLab's crease selection is a serial edge walk")
+        meshset_pml = bench_case.meshset_pml  # selection-only, so the geometry survives
+        bench_case.run(
+            lambda: meshset_pml.compute_selection_crease_per_edge(
+                angledegneg=-_CREASE_ANGLE, angledegpos=_CREASE_ANGLE
+            )
+        )
+        assert meshset_pml.current_mesh().vertex_selection_array().shape == (bench_case.n_vertices,)
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    creases = bench_case.run(lambda: tw.seams.crease_edges(vertices, faces, angle=_CREASE_ANGLE))
+    assert int(creases.shape[1]) == 2
+
+
+@pytest.mark.benchmark(group="cut_along_edges")
+@pytest.mark.benchmeshes("sphere_small", "sphere_med", "sphere_large")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.parametrize("cut_fraction", [0.25, 1.0])
+def test_cut_along_edges(bench_case: BenchCase, cut_fraction: float) -> None:
+    """
+    Twins, key set, corner graph and a components pass over ``3F`` nodes.
+
+    The two fractions are the two ends of the components pass: at ``0.25`` most corners still merge,
+    so the pass contracts ``3F`` nodes down toward ``V``, while at ``1.0`` the corner graph has no
+    edges at all and every node is already its own component. If the second is *faster*, the
+    contraction is the cost and is the thing to attack.
+    """
+    if bench_case.kind == "pymeshlab":
+        if cut_fraction != 1.0:
+            pytest.skip("MeshLab's cut takes a dihedral threshold, not an edge set")
+        skip_larger_than(bench_case, "sphere_med", "MeshLab's cut is a serial per-face rewrite")
+        # Rewrites the topology, so the MeshSet is rebuilt inside the timed callable. This filter
+        # also *finds* the creases, so read it against both triwarp rows summed.
+        new_meshset_pml = bench_case.new_meshset_pml
+
+        def cut_pml() -> int:
+            meshset_pml = new_meshset_pml()
+            meshset_pml.meshing_cut_along_crease_edges(angledeg=0.0)
+            return meshset_pml.current_mesh().vertex_number()
+
+        assert bench_case.run(cut_pml, rounds=3) >= bench_case.n_vertices
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    edges = _cut_edges(bench_case, cut_fraction)
+    cut_vertices, cut_faces = bench_case.run(
+        lambda: tw.seams.cut_along_edges(vertices, faces, edges), rounds=3
+    )
+    assert int(cut_faces.shape[0]) == int(faces.shape[0])
+    assert np.isfinite(cut_vertices.numpy()[:1]).all()

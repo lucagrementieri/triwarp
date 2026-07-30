@@ -329,3 +329,130 @@ def implicit_laplacian_triplets(
     out_rows[diag] = i
     out_cols[diag] = i
     out_vals[diag] = wp.float64(1.0) + lamb
+
+
+@wp.func
+def scalar_laplacian_step(value: wp.float32, average: wp.float32, lamb: wp.float32) -> wp.float32:
+    # Explicit diffusion step on a scalar field: move it a fraction ``lamb`` of the way to the
+    # 1-ring average. ``lamb = 1`` replaces the value outright, which is MeshLab's single pass.
+    return value + lamb * (average - value)
+
+
+@wp.kernel
+def apply_operator_scalar(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    values: wp.array[wp.float32],
+    field: wp.array[wp.float32],
+    out_average: wp.array[wp.float32],
+) -> None:
+    # Scalar counterpart of ``kernels/laplacian.apply_operator``: one row of the row-stochastic
+    # averaging operator against a per-vertex scalar. An isolated vertex (empty row) keeps its own
+    # value, so it neither drifts to zero nor contaminates its (nonexistent) neighbours.
+    i = int(wp.tid())
+    start = offsets[i]
+    end = offsets[i + 1]
+    if end == start:
+        out_average[i] = field[i]
+        return
+    total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    for k in range(start, end):
+        total += values[k] * field[columns[k]]
+    out_average[i] = total
+
+
+@wp.kernel
+def saturate_gradient_pass(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    vertices: wp.array[wp.vec3],
+    inverse_threshold: wp.float32,
+    field: wp.array[wp.float32],
+    out_field: wp.array[wp.float32],
+    out_changed: wp.array[wp.int32],
+) -> None:
+    # One Bellman-Ford relaxation of the Lipschitz cap ``q_i <= q_j + |p_i - p_j| / threshold``
+    # (VCG ``UpdateQuality::VertexSaturate``). Values only ever go *down*, so the iteration is
+    # monotone and converges in at most (graph diameter) passes; ``out_changed`` is the host's
+    # early-exit signal.
+    i = int(wp.tid())
+    position = vertices[i]
+    best = field[i]
+    for k in range(offsets[i], offsets[i + 1]):
+        j = columns[k]
+        capped = field[j] + wp.length(vertices[j] - position) * inverse_threshold
+        if capped < best:
+            best = capped
+    out_field[i] = best
+    if best < field[i]:
+        out_changed[0] = 1
+
+
+@wp.kernel
+def accumulate_smoothed_normals(
+    face_normals: wp.array[wp.vec3],
+    face_areas: wp.array[wp.float32],
+    face_adjacency: wp.array2d[wp.int32],
+    threshold_cos: wp.float32,
+    out_accumulated: wp.array[wp.vec3],
+) -> None:
+    # Area-weighted average of a face's normal with those of its edge-neighbours -- but only the
+    # neighbours pointing *within* ``threshold_cos`` of it. That gate is the whole point: across a
+    # crease the two normals disagree by more than the threshold and simply do not average, so a
+    # sharp edge survives an arbitrary number of passes while noise on a flat region diffuses away.
+    k = int(wp.tid())
+    f0 = face_adjacency[k, 0]
+    f1 = face_adjacency[k, 1]
+    if wp.dot(face_normals[f0], face_normals[f1]) <= threshold_cos:
+        return
+    wp.atomic_add(out_accumulated, f0, face_areas[f1] * face_normals[f1])
+    wp.atomic_add(out_accumulated, f1, face_areas[f0] * face_normals[f0])
+
+
+@wp.func
+def seed_weighted_normal(normal: wp.vec3, area: wp.float32) -> wp.vec3:
+    # A face's own area-weighted normal: the seed of the accumulator above, so the face always
+    # contributes to its own average even when every neighbour is across a crease.
+    return area * normal
+
+
+@wp.kernel
+def fit_vertices_to_normals(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_normals: wp.array[wp.vec3],
+    out_delta: wp.array[wp.vec3],
+    out_count: wp.array[wp.float32],
+) -> None:
+    # One gradient step of the vertex-fitting half of two-step smoothing (Ohtake et al.): each
+    # incident face wants its corner to lie in the plane through the face centroid with the
+    # *filtered* normal, and the correction is the component of that offset along the normal.
+    #
+    # Summed per vertex and divided by the incident-face count by the caller, which is the step size
+    # that makes the iteration a contraction without a tuning constant.
+    f = int(wp.tid())
+    i0 = faces[f * 3 + 0]
+    i1 = faces[f * 3 + 1]
+    i2 = faces[f * 3 + 2]
+    normal = face_normals[f]
+    centroid = (vertices[i0] + vertices[i1] + vertices[i2]) / 3.0
+    for k in range(3):
+        v = faces[f * 3 + k]
+        wp.atomic_add(out_delta, v, normal * wp.dot(normal, centroid - vertices[v]))
+        wp.atomic_add(out_count, v, 1.0)
+
+
+@wp.func
+def apply_fit_step(position: wp.vec3, delta: wp.vec3, count: wp.float32) -> wp.vec3:
+    if count <= 0.0:
+        return position
+    return position + delta / count
+
+
+@wp.func
+def unsharp_step(
+    position: wp.vec3, smoothed: wp.vec3, weight: wp.float32, weight_original: wp.float32
+) -> wp.vec3:
+    # MeshLab's ``apply_coord_unsharp_mask``: add back a multiple of the high-frequency detail the
+    # smoothing pass removed. ``weight_original = 1`` keeps the surface in place and only sharpens.
+    return weight_original * position + weight * (position - smoothed)

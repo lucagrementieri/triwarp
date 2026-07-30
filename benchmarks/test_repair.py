@@ -31,6 +31,13 @@ high-diameter mesh, the same direction trimesh goes. So graph diameter is not in
 expensive for this problem; it was expensive only for the level-propagating formulation triwarp
 used to have.
 
+The two *geometric* defect groups sit on the **quality** axis instead of a defect sweep, because
+their defects are not injectable: ``bad_face_mask`` and ``remove_t_vertices`` look for thin and
+folded triangles, and ``saddle_graded`` already has them by construction (worst aspect ratio 4 719
+against ``saddle``'s 1.6). ``bad_face_mask`` is a fixed number of passes over the adjacency whatever
+it finds, so it should be flat across that axis; ``remove_t_vertices`` is a flip loop and should
+*not* be, since only the graded mesh gives it work to do. That contrast is the point of the pair.
+
 References
 ----------
 **open3d**'s ``remove_duplicated_triangles`` solves the same "deduplicate a face array" problem
@@ -329,3 +336,56 @@ def test_make_winding_consistent(bench_case: BenchCase) -> None:
             return mesh_tm
 
         assert len(bench_case.run(fix_winding_tm).faces) == bench_case.n_faces
+
+
+@pytest.mark.benchmark(group="bad_face_mask")
+@pytest.mark.benchaxis("quality")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+def test_bad_face_mask(bench_case: BenchCase) -> None:
+    """All three defect criteria at once: face quality, adjacency scatter, per-face gate."""
+    n_faces = bench_case.n_faces
+    if bench_case.kind == "pymeshlab":
+        # Selection-only, so the geometry survives and the MeshSet is shared.
+        meshset_pml = bench_case.meshset_pml
+        bench_case.run(
+            lambda: meshset_pml.compute_selection_bad_faces(
+                usear=True,
+                aratio=0.02,
+                usenf=True,
+                nfratio=60.0,
+                select_folded_faces=True,
+                folded_faces_angle_threshold=160.0,
+            )
+        )
+        assert meshset_pml.current_mesh().face_selection_array().shape == (n_faces,)
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    bad = bench_case.run(
+        lambda: tw.repair.bad_face_mask(
+            vertices, faces, min_quality=0.02, max_normal_angle=60.0, max_fold_angle=160.0
+        )
+    )
+    assert bad.shape == (n_faces,)
+
+
+@pytest.mark.benchmark(group="remove_t_vertices")
+@pytest.mark.benchaxis("quality")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+def test_remove_t_vertices(bench_case: BenchCase) -> None:
+    """A flip loop over the slivers: no work on ``saddle``, real work on ``saddle_graded``."""
+    if bench_case.kind == "pymeshlab":
+        # Rewrites the topology, so the MeshSet is rebuilt inside the timed callable.
+        # ``repeat=True`` is MeshLab's own iterate-to-convergence, which is what triwarp's
+        # ``max_iter`` passes are.
+        new_meshset_pml = bench_case.new_meshset_pml
+
+        def repair_pml() -> int:
+            meshset_pml = new_meshset_pml()
+            meshset_pml.meshing_remove_t_vertices(method="Edge Flip", threshold=40.0, repeat=True)
+            return meshset_pml.current_mesh().face_number()
+
+        assert bench_case.run(repair_pml, rounds=3) > 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    flipped = bench_case.run(lambda: tw.repair.remove_t_vertices(vertices, faces), rounds=3)
+    assert int(flipped.shape[0]) == int(faces.shape[0])

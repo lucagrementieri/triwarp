@@ -30,7 +30,14 @@ SECTIONS: dict[str, list[str]] = {
         "validation",
         "selection",
     ],
-    "Mesh editing & repair": ["repair", "hole_filling", "combine", "remesh", "smoothing"],
+    "Mesh editing & repair": [
+        "repair",
+        "hole_filling",
+        "combine",
+        "remesh",
+        "smoothing",
+        "seams",
+    ],
     "Queries & measures": [
         "proximity",
         "neighbors",
@@ -41,6 +48,7 @@ SECTIONS: dict[str, list[str]] = {
         "intersection",
         "curvature",
         "convex",
+        "shading",
     ],
     "Operators & fields": ["laplacian", "linalg", "interpolation", "parametrization"],
     "Heat-method solvers": ["heat.distance", "heat.vector", "heat.signed"],

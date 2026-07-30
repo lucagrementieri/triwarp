@@ -19,6 +19,14 @@ mean), the surface area, the mesh volume, the average edge length and the inerti
 row is an **upper** bound on the centroid alone — and the same number appears as the
 ``mean_edge_length`` reference in [`test_edges.py`](test_edges.py), which is worth knowing before
 reading either as a per-quantity cost. Both are geometry-preserving, so they share the MeshSet.
+
+``face_quality`` runs on the **quality** axis rather than the scan sweep: it is the quantity that
+axis is *defined* by (``saddle`` and ``saddle_graded`` share connectivity and differ only in
+triangle shape), so measuring it there says whether reading the measure costs anything once the
+triangles get bad. It should not — every metric is branch-free arithmetic on three edge vectors —
+and that flatness is the point of the row. ``compute_scalar_by_aspect_ratio_per_face`` is the exact
+filter the four VCG metrics were ported from and is geometry-preserving, so it shares the MeshSet;
+``igl`` needs two calls (``circumradius`` and ``inradius``) to build the same ratio.
 """
 
 from __future__ import annotations
@@ -92,3 +100,34 @@ def test_face_normals_and_areas(bench_case: BenchCase) -> None:
         normals_tm, valid_tm = bench_case.run(lambda: tm.triangles.normals(triangles_np))
         assert valid_tm.shape == (n_faces,)
         assert normals_tm.shape[1] == 3
+
+
+@pytest.mark.benchmark(group="face_quality")
+@pytest.mark.benchaxis("quality")
+@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
+def test_face_quality(bench_case: BenchCase) -> None:
+    """Per-face shape measure, on the axis it defines: bad triangles must not cost more."""
+    n_faces = bench_case.n_faces
+    if bench_case.kind == "pymeshlab":
+        meshset_pml = bench_case.meshset_pml
+        bench_case.run(
+            lambda: meshset_pml.compute_scalar_by_aspect_ratio_per_face(
+                metric="inradius/circumradius"
+            )
+        )
+        assert meshset_pml.current_mesh().face_scalar_array().shape == (n_faces,)
+    elif bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        quality = bench_case.run(
+            lambda: tw.triangles.face_quality(vertices, faces, metric="radius_ratio")
+        )
+        assert quality.shape == (n_faces,)
+    else:  # igl: the same ratio, but as two separate passes over the faces
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        ratio_igl = bench_case.run(
+            lambda: (
+                np.asarray(igl.inradius(vertices_np, faces_np))
+                / np.asarray(igl.circumradius(vertices_np, faces_np)[0])
+            )
+        )
+        assert ratio_igl.shape == (n_faces,)

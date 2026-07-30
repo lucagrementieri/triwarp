@@ -1,0 +1,174 @@
+"""
+Comparison helpers for parity tests, where the two sides agree only up to a known transform.
+
+Kept separate from [`tests/conversions.py`](conversions.py) because these are not format
+conversions: each one encodes a *reason* why two correct implementations disagree elementwise --
+ordering, winding, sign, gauge, or the absence of any correspondence at all -- and that reasoning
+should have one home rather than being re-derived per module.
+
+The classes of comparison, and the bar each has to clear (see CLAUDE.md section 6):
+
+- **A** direct ``np.allclose`` / ``np.array_equal``. No helper needed.
+- **B** equal after a named transform, at full ``1e-5`` tolerance. Most helpers here are class B:
+  the transform is exact, so loosening the tolerance to accommodate it means the transform was
+  wrong.
+- **C** a derived scalar or set distance, because no correspondence between the two answers exists.
+  [`symmetric_chamfer`][tests.comparisons.symmetric_chamfer],
+  [`hausdorff_two_sided`][tests.comparisons.hausdorff_two_sided] and
+  [`fraction_within`][tests.comparisons.fraction_within] are the class-C machinery. A class-C assert
+  must name the bug class it excludes and record its measured margin in the test docstring -- a
+  threshold sitting at the measured value is a latent flake *and* a weak test.
+
+!!! warning
+    ``fraction_within(a, b, ...) > f`` is the easiest of these to make vacuous, because a fraction
+    computed over marginal distributions is invariant to shuffling one side. Before trusting one,
+    check that shuffling ``b`` makes it fail.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import trimesh as tm
+from scipy.spatial import cKDTree
+
+
+def lexsort_rows(rows_np: np.ndarray) -> np.ndarray:
+    """
+    Sort rows into a canonical order so two unordered row sets can be compared elementwise.
+
+    The workhorse transform for index tables -- edge lists, face lists, adjacency pairs -- where
+    triwarp's parallel construction and a reference's serial one both produce the right set in
+    different orders. Note this canonicalises the row *order*, not the entries within a row; sort
+    those first (``np.sort(edges, axis=1)``) when the pair itself is undirected.
+    """
+    rows_np = np.asarray(rows_np)
+    return rows_np[np.lexsort(rows_np.T[::-1])]
+
+
+def assert_unordered_rows_equal(rows_a: np.ndarray, rows_b: np.ndarray) -> None:
+    """Assert two row sets are equal as sets, ignoring row order."""
+    sorted_a, sorted_b = lexsort_rows(rows_a), lexsort_rows(rows_b)
+    assert sorted_a.shape == sorted_b.shape, (
+        f"row counts differ: {sorted_a.shape} vs {sorted_b.shape}"
+    )
+    assert np.array_equal(sorted_a, sorted_b)
+
+
+def canonical_winding(faces_np: np.ndarray) -> np.ndarray:
+    """
+    Rotate each triangle to start at its smallest index, preserving orientation.
+
+    Two triangulations with the same faces *and* the same winding compare equal after this; a face
+    whose winding was flipped does not, because rotation cannot undo a reflection. That is what
+    makes it the right canonicalisation for orientation-repair comparisons -- insensitive to the
+    arbitrary choice of starting corner and sensitive to the thing under test.
+    """
+    faces_np = np.asarray(faces_np).reshape(-1, 3)
+    roll = np.argmin(faces_np, axis=1)
+    return np.take_along_axis(faces_np, (roll[:, None] + np.arange(3)) % 3, axis=1)
+
+
+def assert_same_up_to_sign(
+    vectors_a: np.ndarray, vectors_b: np.ndarray, atol: float = 1e-5
+) -> None:
+    """
+    Assert two sets of directions agree up to a per-element sign flip, via ``|dot| == 1``.
+
+    Eigenvector-valued answers -- fitted line and plane normals, principal curvature directions,
+    estimated point normals -- have no canonical sign: the reference's solver may return ``-v``
+    where triwarp returns ``v`` and both are correct. ``|dot| == 1`` is the gauge-invariant
+    statement, and it stays a class-B assert at full tolerance because the transform is exact.
+
+    Does **not** admit an arbitrary rotation. If the two sides disagree by more than a sign -- a
+    tangent frame rotated about its normal -- the answer is gauge-dependent in a stronger sense and
+    must be compared through a genuinely invariant quantity instead (see CLAUDE.md section 6 on
+    potpourri3d's tangent spaces).
+    """
+    a = np.asarray(vectors_a, dtype=np.float64).reshape(-1, np.shape(vectors_a)[-1])
+    b = np.asarray(vectors_b, dtype=np.float64).reshape(-1, np.shape(vectors_b)[-1])
+    assert a.shape == b.shape, f"shapes differ: {a.shape} vs {b.shape}"
+    dots = np.abs(np.einsum("ij,ij->i", a, b))
+    assert np.allclose(dots, 1.0, atol=atol), (
+        f"worst |dot| deviation {np.abs(dots - 1.0).max():.3e}"
+    )
+
+
+def assert_cyclic_permutation_equal(loop_a: np.ndarray, loop_b: np.ndarray) -> None:
+    """
+    Assert two closed loops list the same cycle, up to starting point and direction.
+
+    A boundary loop is a cyclic sequence; where it starts and which way it runs are conventions, not
+    results. Comparing after canonicalising both is the only way to test the part that matters (the
+    adjacency order) without testing the part that does not.
+    """
+    a, b = np.asarray(loop_a).ravel(), np.asarray(loop_b).ravel()
+    assert a.shape == b.shape, f"loop lengths differ: {a.shape[0]} vs {b.shape[0]}"
+    if a.size == 0:
+        return
+    assert set(a.tolist()) == set(b.tolist()), "loops visit different vertices"
+    start = int(np.flatnonzero(b == a[0])[0])
+    forward = np.roll(b, -start)
+    backward = np.roll(b[::-1], -int(np.flatnonzero(b[::-1] == a[0])[0]))
+    assert np.array_equal(a, forward) or np.array_equal(a, backward), (
+        "same vertices but a different cyclic order"
+    )
+
+
+def fraction_within(
+    values_a: np.ndarray, values_b: np.ndarray, rtol: float = 5e-2, atol: float = 5e-2
+) -> float:
+    """
+    Fraction of elements agreeing within a relative-plus-absolute band.
+
+    For references that are elementwise comparable *in principle* but carry a few genuinely
+    unreliable entries -- libigl's principal curvature near a degenerate ring, say -- where masking
+    them out individually would encode the reference's bugs into the test.
+
+    A threshold on this is class C and needs the shuffle probe: if
+    ``fraction_within(a, rng.permuted(b))`` also clears the bar, the number is describing the
+    marginal distributions rather than the correspondence, and the assert is vacuous.
+    """
+    a = np.asarray(values_a, dtype=np.float64).ravel()
+    b = np.asarray(values_b, dtype=np.float64).ravel()
+    assert a.shape == b.shape, f"shapes differ: {a.shape} vs {b.shape}"
+    return float(np.mean(np.abs(a - b) <= atol + rtol * np.abs(b)))
+
+
+def symmetric_chamfer(mesh_a: tm.Trimesh, mesh_b: tm.Trimesh, n_samples: int = 4000) -> float:
+    """
+    Mean symmetric surface distance between two meshes, via surface sampling.
+
+    The class-C fallback when two reconstructions of the same shape have no vertex correspondence
+    at all -- different algorithms, vertex counts, topology. It measures whether the two describe
+    the same *surface*, which is the strongest statement available.
+
+    !!! warning "There is a sampling noise floor; a threshold must clear it"
+        The two point sets are drawn independently, so a mesh compared with *itself* does not score
+        zero. Measured on ``icosphere(subdivisions=3)`` at the default ``n_samples``:
+        ``symmetric_chamfer(m, m)`` is **0.028**, while the same mesh translated by 0.05 scores
+        **0.040**. A threshold below the floor can never pass, and one just above it cannot
+        distinguish a 0.05 displacement from none. Raise ``n_samples`` to lower the floor, and quote
+        both the self-distance and the real distance in the test docstring.
+
+    Blind to anything that preserves the surface: a winding flip, a vertex permutation, or a
+    duplicated face all score zero. Pair it with a structural assert when those matter.
+    """
+    rng = np.random.default_rng(0)
+    sample_a, _ = tm.sample.sample_surface(mesh_a, n_samples, seed=int(rng.integers(1 << 30)))
+    sample_b, _ = tm.sample.sample_surface(mesh_b, n_samples, seed=int(rng.integers(1 << 30)))
+    a_to_b = cKDTree(sample_b).query(sample_a)[0].mean()
+    b_to_a = cKDTree(sample_a).query(sample_b)[0].mean()
+    return float(0.5 * (a_to_b + b_to_a))
+
+
+def hausdorff_two_sided(points_a: np.ndarray, points_b: np.ndarray) -> float:
+    """
+    Two-sided Hausdorff distance between two point sets -- the worst-case counterpart to chamfer.
+
+    Where [`symmetric_chamfer`][tests.comparisons.symmetric_chamfer] averages and so tolerates a few
+    stray elements, this reports the single worst one. Use it when the claim is "no part of either
+    answer is far from the other", e.g. comparing intersection curves or sliced boundaries.
+    """
+    a = np.asarray(points_a, dtype=np.float64)
+    b = np.asarray(points_b, dtype=np.float64)
+    return float(max(cKDTree(b).query(a)[0].max(), cKDTree(a).query(b)[0].max()))

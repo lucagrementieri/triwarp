@@ -253,6 +253,7 @@ def test_is_watertight_is_volume_precomputed_shortcut(
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parity("is_vertex_manifold", "igl")
 def test_is_vertex_manifold(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     manifold_wp = tw.validation.is_vertex_manifold(mesh_wp.indices)
@@ -504,6 +505,7 @@ def test_face_orientation_mask_long_path(device: str) -> None:
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parity("is_watertight", "trimesh")
 def test_is_watertight(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     watertight_wp = tw.validation.is_watertight(mesh_wp.points, mesh_wp.indices)
@@ -539,6 +541,7 @@ def test_face_watertight_mask_broken_faces_reference(
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parity("is_volume", "trimesh")
 def test_is_volume(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     volume_wp = tw.validation.is_volume(mesh_wp.points, mesh_wp.indices)
