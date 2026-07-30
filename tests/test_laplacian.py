@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import igl
 import numpy as np
+import potpourri3d as pp3d
 import pytest
 import scipy.sparse as sp
 import trimesh as tm
@@ -67,6 +68,70 @@ def test_cotmatrix(request: pytest.FixtureRequest, mesh_name: str) -> None:
 
     assert laplacian_wp.shape == laplacian_igl.shape
     assert np.allclose(laplacian_wp.toarray(), laplacian_igl.toarray(), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("cotmatrix", "potpourri3d")
+@pytest.mark.parity("mass_matrix_entries", "potpourri3d")
+def test_cotmatrix_and_mass_match_potpourri3d(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    The two operator builds against geometry-central's bindings, which already agree with libigl.
+
+    A third independent implementation of quantities libigl already pins is worth having precisely
+    because it is cheap: these are the operators every solver in the library is built on, so a
+    regression here surfaces as a wrong answer several modules away.
+
+    ``vertex_areas`` is class A: it is one third of the incident face areas, which is exactly the
+    barycentric lumped mass diagonal ``mass_matrix_entries`` returns.
+
+    ``cotan_laplacian`` is class B, and the transform is a **sign flip**. geometry-central builds
+    the positive-semidefinite Laplacian while libigl -- and triwarp with it -- builds the negative
+    one: measured on ``icosahedron``, ``pp3d.cotan_laplacian`` is ``-igl.cotmatrix`` to 1e-9 entry
+    for entry, with a ``+2.887`` diagonal against igl's ``-2.887``. Neither is wrong, but handing
+    one to a solver expecting the other flips the sign of every diffusion step, so the negation
+    here is the substance of the comparison rather than bookkeeping.
+
+    Read potpourri3d as the *weakest* of the three references rather than the strongest: it
+    assembles both of these in vectorized numpy into a scipy COO, not in geometry-central's C++, so
+    it is closer to an independent re-derivation of the same formula than to a separate codebase.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
+    faces_np = np.ascontiguousarray(mesh_tm.faces, dtype=np.int32)
+
+    cotmatrix_pp = pp3d.cotan_laplacian(vertices_np, faces_np).tocsr()
+    cotmatrix_wp = _bsr_to_csr(tw.laplacian.cotmatrix(mesh_wp.points, mesh_wp.indices))
+    assert cotmatrix_wp.shape == cotmatrix_pp.shape
+    assert np.allclose(cotmatrix_wp.toarray(), -cotmatrix_pp.toarray(), rtol=1e-5, atol=1e-5)
+
+    mass_pp = pp3d.vertex_areas(vertices_np, faces_np)
+    mass_wp = tw.laplacian.mass_matrix_entries(mesh_wp.points, mesh_wp.indices)
+    assert np.allclose(mass_wp.numpy(), mass_pp, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("mass_matrix", "igl")
+def test_mass_matrix_assembled_matches_igl(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    The *assembled* barycentric mass matrix, not just its diagonal.
+
+    ``test_mass_matrix`` already pins ``mass_matrix_entries`` against ``igl.massmatrix(...)
+    .diagonal()``, which is the same numbers; what this adds is the sparse build around them, and
+    that is a separate benchmark group for the same reason. Class A on the dense form: the matrix is
+    diagonal, so every off-diagonal entry must be zero, and asserting on the full array rather than
+    on ``.diagonal()`` is what makes a stray off-diagonal triplet visible.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
+    faces_np = np.array(mesh_tm.faces, dtype=np.int64)
+
+    mass_igl = igl.massmatrix(vertices_np, faces_np, igl.MASSMATRIX_TYPE_BARYCENTRIC).tocsr()
+    mass_wp = _bsr_to_csr(tw.laplacian.mass_matrix(mesh_wp.points, mesh_wp.indices))
+
+    assert mass_wp.shape == mass_igl.shape
+    assert np.allclose(mass_wp.toarray(), mass_igl.toarray(), rtol=1e-5, atol=1e-5)
 
 
 def test_cotmatrix_null_space(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:

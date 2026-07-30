@@ -72,6 +72,7 @@ def _transfer_meshes(device: str) -> tuple[tm.Trimesh, tm.Trimesh]:
     return tm.creation.icosphere(subdivisions=3), tm.creation.icosphere(subdivisions=2)
 
 
+@pytest.mark.parity("transfer_onto_vertices", "pymeshlab")
 def test_transfer_onto_vertices_matches_pymeshlab(device: str):
     """``transfer_attributes_per_vertex`` with ``qualitytransfer`` is the same barycentric pull."""
     source_tm, target_tm = _transfer_meshes(device)

@@ -70,6 +70,7 @@ def test_crease_edges_thresholds(device: str) -> None:
     assert int(tw.seams.crease_edges(vertices_wp, faces_wp, angle=180.0).shape[0]) == 0
 
 
+@pytest.mark.parity("crease_edges", "pymeshlab")
 def test_crease_edges_matches_pymeshlab(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
     ``compute_selection_crease_per_edge`` is the same dihedral threshold, reported as a selection.
@@ -215,6 +216,7 @@ def test_cut_along_edges_round_trips_through_a_weld(device: str) -> None:
     assert _face_component_count(welded_vertices_wp, welded_faces_wp) == 1
 
 
+@pytest.mark.parity("cut_along_edges", "pymeshlab")
 def test_cut_along_edges_matches_pymeshlab_topology(device: str) -> None:
     """
     ``meshing_cut_along_crease_edges`` opens the same seams; only the vertex count differs.

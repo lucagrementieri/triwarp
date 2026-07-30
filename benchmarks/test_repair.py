@@ -165,6 +165,21 @@ def _faces_with_duplicates_wp(bench_case: BenchCase, fraction: float) -> wp.arra
     return _defect_wp_cache[key]
 
 
+@pytest.mark.noparity(
+    "open3d",
+    reason="D2 three different dedup rules: triwarp applies a signed-count rule that cancels "
+    "(+1, -1) pairs outright, while open3d hashes orientation-*sensitively* and keeps one "
+    "representative of each duplicate group -- on this deliberately-flipped input it therefore "
+    "removes nothing and returns the face count unchanged. The rows compare dedup machinery, not "
+    "results.",
+)
+@pytest.mark.noparity(
+    "pymeshlab",
+    reason="D2 as above but the other way round: MeshLab's hash is orientation-*insensitive*, so "
+    "it does see the flipped copies, yet it still keeps one representative per group where "
+    "triwarp cancels a (+1, -1) pair to nothing. Same input, three different survivor sets by "
+    "design; the numpy oracle in tests/test_repair.py covers the signed-count rule itself.",
+)
 @pytest.mark.benchmark(group="resolve_duplicated_faces")
 @pytest.mark.benchmeshes("sphere_med")
 @pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab")
@@ -223,6 +238,14 @@ def _faces_with_non_manifold_wp(bench_case: BenchCase, extra: int) -> wp.array[w
     return _nonmanifold_cache[key]
 
 
+@pytest.mark.noparity(
+    "pymeshlab",
+    reason="D2 the same idea, greedier: for each non-manifold edge MeshLab iteratively deletes the "
+    "smallest-area incident face until that edge is 2-manifold, where triwarp drops every face on "
+    "an over-incident edge and re-tests. Both leave an edge-manifold mesh but they delete "
+    "different faces and different numbers of them, so only the post-condition is shared and "
+    "tests/test_repair.py asserts that directly rather than through MeshLab.",
+)
 @pytest.mark.benchmark(group="remove_non_manifold_faces")
 @pytest.mark.benchmeshes("sphere_med")
 @pytest.mark.benchlibs("triwarp", "pymeshlab")

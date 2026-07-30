@@ -79,6 +79,7 @@ def test_query_ball_empty_ball(device: str, backend: Literal["bvh", "hashgrid"])
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
+@pytest.mark.parity("query_bvh_ball", "scipy")
 def test_query_ball_batch(device: str, backend: Literal["bvh", "hashgrid"]):
     rng = np.random.default_rng(1)
     points = rng.random((50, 3), dtype=np.float32) * 3.0
@@ -222,6 +223,9 @@ def test_knn_initial_radius_degenerate_clouds(device: str):
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 @pytest.mark.parametrize("k", [1, 3, 40])
 @pytest.mark.parametrize("max_radius", [math.inf, 0.5, 1.0])
+@pytest.mark.parity("query_bvh_nearest_k1", "scipy")
+@pytest.mark.parity("query_hashgrid_nearest_k1", "scipy")
+@pytest.mark.parity("bvh_from_points", "scipy")
 def test_query_nearest_single(
     device: str, backend: Literal["bvh", "hashgrid"], k: int, max_radius: float
 ):
@@ -251,6 +255,8 @@ def test_query_nearest_single(
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 @pytest.mark.parametrize("k", [1, 3, 10])
 @pytest.mark.parametrize("max_radius", [math.inf, 0.5, 1.0])
+@pytest.mark.parity("query_bvh_nearest_k7", "scipy")
+@pytest.mark.parity("query_hashgrid_nearest_k7", "scipy")
 def test_query_nearest_batch(
     device: str, backend: Literal["bvh", "hashgrid"], k: int, max_radius: float
 ):

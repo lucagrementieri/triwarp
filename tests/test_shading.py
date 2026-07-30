@@ -56,6 +56,7 @@ def test_ambient_occlusion_finds_the_cavity(cave_cube: tuple[tm.Trimesh, wp.Mesh
     assert occlusion_np[~inner_np].mean() < 0.1
 
 
+@pytest.mark.parity("ambient_occlusion", "pymeshlab")
 def test_ambient_occlusion_ranks_like_pymeshlab(torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
     MeshLab's scalar is the unnormalized *complement*, so the two agree by rank, not by value.

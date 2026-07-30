@@ -456,6 +456,7 @@ def test_poisson_torus_genus(device: str):
     assert mesh_tw.euler_number == 0  # genus-1 torus: V - E + F = 0
 
 
+@pytest.mark.parity("screened_poisson", "open3d")
 def test_poisson_matches_open3d_metric(device: str):
     _skip_poisson_on_cpu(device)
     points_np, normals_np = _sphere_cloud(3)
@@ -505,6 +506,7 @@ def test_poisson_finer_depth_reduces_error(device: str):
     assert error_fine <= error_coarse
 
 
+@pytest.mark.parity("screened_poisson", "pymeshlab")
 def test_poisson_matches_pymeshlab_metric(device: str):
     _skip_poisson_on_cpu(device)
     points_np, normals_np = _sphere_cloud(3)
@@ -751,6 +753,7 @@ def test_ball_pivoting_grows_the_triangle_budget(device: str):
     assert abs(grown - direct) <= 0.01 * direct
 
 
+@pytest.mark.parity("ball_pivoting", "open3d")
 def test_ball_pivoting_face_count_near_open3d(device: str):
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
@@ -924,6 +927,7 @@ def test_resample_uniform_repairs_a_broken_mesh(device: str) -> None:
     assert np.isclose(np.abs(out_tm.volume), 4.0 / 3.0 * np.pi, rtol=0.1)
 
 
+@pytest.mark.parity("resample_uniform", "pymeshlab")
 def test_resample_uniform_matches_pymeshlab(device: str) -> None:
     """
     ``generate_resampled_uniform_mesh`` is the same algorithm at the same absolute cell size.

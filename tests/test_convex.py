@@ -5,9 +5,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import scipy.spatial
+import trimesh as tm
 import warp as wp
 
 import triwarp as tw
+from tests.conversions import points_to_open3d, points_to_pymeshlab
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
@@ -171,6 +173,58 @@ def test_face_adjacency_convex_empty(device: str) -> None:
     vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
     convex_wp = tw.convex.face_adjacency_convex(vertices_wp, faces_wp)
     assert convex_wp.shape == (0,)
+
+
+@pytest.mark.parity("fast_convex_set_mask", "trimesh", "open3d", "pymeshlab")
+def test_fast_convex_set_mask_against_the_three_qhull_backends(device: str) -> None:
+    """
+    Soundness and recall against exact qhull.
+
+    ``benchmarks/test_convex.py`` says of these three rows that "this is not a parity comparison":
+    trimesh, Open3D and pymeshlab all run **qhull** and return the exact hull as a *mesh*, while
+    ``fast_convex_set`` returns an approximate *vertex subset* from a direction sweep. That rules
+    out equality -- it does not rule out a test. Two properties are checkable and are exactly
+    what an approximate hull filter has to guarantee:
+
+    - **soundness**, asserted exactly: every point triwarp selects must be a true hull vertex. This
+      is the half that catches a real bug -- an implementation that returned interior points, or the
+      whole cloud, fails immediately, and no tolerance is involved.
+    - **recall**, asserted with a bound: measured **27 of 31** hull vertices at
+      ``n_directions=256`` (0.871) against all three references, which agree with each other on the
+      hull exactly. The 0.70 floor leaves room for a different direction set without admitting a
+      filter that has stopped finding most of the hull.
+
+    Marked for all three libraries deliberately: they compute the identical answer here, so one
+    assertion covers all three rows, and confirming they agree is itself worth a line -- it says the
+    benchmark's three qhull rows are pricing wrappers around one algorithm, not three algorithms.
+    """
+    rng = np.random.default_rng(0)
+    points_np = rng.standard_normal((500, 3)).astype(np.float64)
+    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+
+    selected = set(
+        np.flatnonzero(tw.convex.fast_convex_set_mask(points_wp, n_directions=256).numpy()).tolist()
+    )
+
+    def hull_indices(hull_vertices: np.ndarray) -> set[int]:
+        """Map a hull's vertex positions back onto indices into the input cloud."""
+        distance_np, index_np = scipy.spatial.cKDTree(points_np).query(np.asarray(hull_vertices))
+        return set(index_np[distance_np < 1e-9].tolist())
+
+    hull_tm = hull_indices(tm.points.PointCloud(points_np).convex_hull.vertices)
+    mesh_o3d, _kept = points_to_open3d(points_np).compute_convex_hull()
+    hull_o3d = hull_indices(np.asarray(mesh_o3d.vertices))
+    meshset_pml = points_to_pymeshlab(points_np)
+    meshset_pml.generate_convex_hull()
+    hull_pml = hull_indices(meshset_pml.current_mesh().vertex_matrix())
+
+    # The three qhull wrappers agree, so any one of them is "the" exact hull.
+    assert hull_tm == hull_o3d == hull_pml
+    assert len(hull_tm) > 0
+
+    for name, hull in (("trimesh", hull_tm), ("open3d", hull_o3d), ("pymeshlab", hull_pml)):
+        assert selected <= hull, f"{name}: selected a point that is not a hull vertex"
+        assert len(selected & hull) / len(hull) > 0.70, f"{name}: recall too low"
 
 
 def test_fast_convex_set_mask_sound(device: str) -> None:

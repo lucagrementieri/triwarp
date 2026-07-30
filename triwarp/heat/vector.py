@@ -93,7 +93,11 @@ def vector_heat_operators(
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     if t is None:
-        h = tw.edges.mean_edge_length(vertices, faces)
+        # Shares ``heat.distance``'s timestep convention -- the unique-edge mean, matching
+        # ``igl::heat_geodesics``. The two solvers must agree: ``log_map``'s radius is asserted to
+        # *be* the ``heat_geodesic`` distance, so giving them different diffusion times would split
+        # a quantity that is supposed to be one number.
+        h = tw.edges.mean_unique_edge_length(vertices, faces)
         t = h * h
 
     connection = connection_laplacian(vertices, faces)

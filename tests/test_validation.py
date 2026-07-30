@@ -8,7 +8,7 @@ import trimesh.repair as tm_repair
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import trimesh_to_pymeshlab
+from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab
 
 CLOSED_MESHES = ["icosahedron", "cave_cube"]
 OPEN_MESHES = ["hemisphere", "half_torus"]
@@ -115,6 +115,9 @@ def _mobius_strip(n: int) -> tuple[np.ndarray, np.ndarray]:
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parity("is_vertex_manifold", "pymeshlab")
+@pytest.mark.parity("is_watertight", "pymeshlab")
+@pytest.mark.parity("is_volume", "pymeshlab")
 def test_topological_measures_match_pymeshlab(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -149,6 +152,28 @@ def test_topological_measures_match_pymeshlab(
     n_vertices = int(mesh_wp.points.shape[0])
     labels_np = tw.graph.connected_component_labels_from_edges(unique_edges_wp, n_vertices).numpy()
     assert len(np.unique(labels_np)) == int(measures_pml["connected_components_number"])
+
+    assert tw.validation.is_vertex_manifold(mesh_wp.indices) == (
+        int(measures_pml["non_two_manifold_vertices"]) == 0
+    )
+
+    # ``is_watertight`` follows Open3D, which is two-manifold + no boundary + no self-intersection.
+    # MeshLab's topology report covers the first two; the third needs a second filter, so the
+    # composition below is what ``benchmarks/test_validation.py`` times as its pymeshlab row.
+    selfx_meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    selfx_meshset_pml.compute_selection_by_self_intersections_per_face()
+    n_self_intersecting = int(selfx_meshset_pml.current_mesh().face_selection_array().sum())
+    watertight_pml = (
+        bool(measures_pml["is_mesh_two_manifold"])
+        and int(measures_pml["boundary_edges"]) == 0
+        and int(measures_pml["non_two_manifold_vertices"]) == 0
+        and n_self_intersecting == 0
+    )
+    assert tw.validation.is_watertight(mesh_wp.points, mesh_wp.indices) == watertight_pml
+    # ``is_volume`` adds consistent winding on top, which is true of every fixture here.
+    assert tw.validation.is_volume(mesh_wp.points, mesh_wp.indices) == (
+        watertight_pml and tw.validation.is_winding_consistent(mesh_wp.indices)
+    )
 
     n_loops = len(tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices))
     assert (mesh_name in CLOSED_MESHES) == (n_loops == 0)
@@ -502,6 +527,59 @@ def test_face_orientation_mask_long_path(device: str) -> None:
     mesh_tm = tm.Trimesh(vertices_np, flipped_np, process=False)
     tm.repair.fix_winding(mesh_tm)
     assert np.array_equal(_canonical_winding(mesh_tm.faces), _canonical_winding(expected_np))
+
+
+@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parity("is_watertight", "open3d")
+def test_is_watertight_matches_open3d(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    The definitional claim: ``is_watertight`` follows Open3D's ``IsWatertight``, not trimesh's.
+
+    Worth a test of its own because the docstring makes that claim explicitly and nothing checked
+    it. The two definitions genuinely differ -- trimesh's ``is_watertight`` is edge-manifoldness
+    alone, while Open3D additionally requires vertex-manifoldness *and* the absence of
+    self-intersections -- so the trimesh row in ``benchmarks/test_validation.py`` is timing context
+    rather than an oracle, and open3d is the one that pins the semantics.
+
+    Parametrized over closed and open fixtures so both answers appear; a boolean asserted only over
+    watertight meshes would pass on a function that returned ``True`` unconditionally.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    watertight_o3d = trimesh_to_open3d(mesh_tm).is_watertight()
+
+    assert tw.validation.is_watertight(mesh_wp.points, mesh_wp.indices) == watertight_o3d
+    assert watertight_o3d == (mesh_name in CLOSED_MESHES)
+
+
+def test_is_watertight_rejects_self_intersection_like_open3d(device: str) -> None:
+    """
+    The self-intersection clause, which is the half of Open3D's definition trimesh does not have.
+
+    Two interpenetrating unit boxes are closed, edge-manifold and vertex-manifold, so every test
+    above passes them and ``trimesh.is_watertight`` calls them watertight. Open3D does not, and
+    neither may triwarp -- this is the only case in the module that separates the two definitions,
+    and without it the parametrized test above would be satisfied by an edge-manifold check alone.
+    """
+    first_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
+    second_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
+    second_tm.apply_translation([0.5, 0.5, 0.5])
+    tangled_tm = tm.util.concatenate([first_tm, second_tm])
+    tangled_tm.merge_vertices()
+
+    vertices_wp = wp.array(
+        np.ascontiguousarray(tangled_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    faces_wp = wp.array(
+        np.ascontiguousarray(tangled_tm.faces.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=device,
+    )
+
+    assert trimesh_to_open3d(tangled_tm).is_watertight() is False
+    assert tw.validation.is_watertight(vertices_wp, faces_wp) is False
+    # The clause that does the work: it *is* edge-manifold and closed, which is all trimesh checks.
+    assert tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=False)
+    assert bool(tangled_tm.is_watertight) is True
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)

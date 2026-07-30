@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import numpy as np
+import open3d as o3d
 import pytest
 import trimesh as tm
 import trimesh.registration as tm_reg
 import warp as wp
 
 import triwarp as tw
+from tests.conversions import points_to_open3d
 
 
 def _make_point_clouds(rng: np.random.Generator, n: int = 200) -> tuple[np.ndarray, np.ndarray]:
@@ -203,6 +205,155 @@ def _rms(points_a: np.ndarray, points_b: np.ndarray) -> float:
 
 def _mesh_vertices_faces(mesh_tm: tm.Trimesh) -> tuple[np.ndarray, np.ndarray]:
     return mesh_tm.vertices.astype(np.float32), mesh_tm.faces.reshape(-1).astype(np.int32)
+
+
+@pytest.mark.parity("procrustes", "open3d")
+def test_procrustes_matches_open3d(device: str) -> None:
+    """
+    Closed-form Kabsch against Open3D's, with the correspondence handed to both.
+
+    Open3D's ``TransformationEstimationPointToPoint.compute_transformation`` takes an explicit
+    correspondence list, which is exactly triwarp's ``procrustes`` contract, so this is class A on
+    the 4x4 matrix -- no ICP loop, no nearest-neighbour search, just the SVD. Measured worst entry
+    deviation **1.4e-7**, well inside the 1e-5 asserted here.
+
+    ``with_scaling=False`` on Open3D's side pairs with ``scale=False``; the two also agree that a
+    reflection must not be introduced, which the determinant check pins.
+    """
+    rng = np.random.default_rng(10)
+    target_np = rng.standard_normal((300, 3)).astype(np.float32)
+    rotation_np, translation_np = _rigid_transform(0.15, [0.2, 0.7, 0.1], [0.05, -0.03, 0.04])
+    source_np = (target_np @ rotation_np.T + translation_np).astype(np.float32)
+
+    matrix_wp, _transformed_wp, _cost = tw.registration.procrustes(
+        _to_wp(source_np, device), _to_wp(target_np, device), reflection=False, scale=False
+    )
+
+    correspondence = o3d.utility.Vector2iVector(np.stack([np.arange(300), np.arange(300)], axis=1))
+    matrix_o3d = np.asarray(
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(
+            with_scaling=False
+        ).compute_transformation(
+            points_to_open3d(source_np), points_to_open3d(target_np), correspondence
+        )
+    )
+
+    assert np.allclose(matrix_wp.numpy()[0], matrix_o3d, rtol=1e-5, atol=1e-5)
+    assert np.isclose(np.linalg.det(matrix_o3d[:3, :3]), 1.0, atol=1e-5)
+
+
+@pytest.mark.parity("icp_point_cloud", "open3d", "trimesh")
+def test_icp_point_to_point_matches_open3d_and_trimesh(device: str) -> None:
+    """
+    ICP against both references by the recovered *transform*, not by each side's own cost.
+
+    ``test_icp_point_to_point_cloud`` checks that triwarp and trimesh each reach a low cost, which
+    is two independent self-consistency checks rather than a comparison -- both could converge to
+    different transforms and still pass. Here the three transforms are applied to the same source
+    and the resulting point clouds compared directly, which is what "the same registration" means.
+
+    Class C only in that a small rigid offset is required for it to be well posed: nearest-neighbour
+    correspondence has to be unique, or the three solvers may legitimately land in different local
+    minima and no comparison is meaningful. With the offset small enough (0.15 rad, 0.07
+    translation) all three recover the exact alignment and agree to **1.4e-6**, so the 1e-4 bound
+    below carries a 70x margin. A solver landing in a different minimum would miss by orders of
+    magnitude, not by a tolerance.
+    """
+    rng = np.random.default_rng(10)
+    target_np = rng.standard_normal((300, 3)).astype(np.float32)
+    rotation_np, translation_np = _rigid_transform(0.15, [0.2, 0.7, 0.1], [0.05, -0.03, 0.04])
+    source_np = (target_np @ rotation_np.T + translation_np).astype(np.float32)
+
+    _matrix_wp, transformed_wp, _cost_wp = tw.registration.icp(
+        _to_wp(source_np, device),
+        _to_wp(target_np, device),
+        None,
+        max_iterations=100,
+        reflection=False,
+        scale=False,
+    )
+
+    result_o3d = o3d.pipelines.registration.registration_icp(
+        points_to_open3d(source_np),
+        points_to_open3d(target_np),
+        1e9,
+        np.eye(4),
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100),
+    )
+    matrix_o3d = np.asarray(result_o3d.transformation)
+    moved_o3d = (matrix_o3d[:3, :3] @ source_np.T).T + matrix_o3d[:3, 3]
+
+    _matrix_tm, moved_tm, _cost_tm = tm_reg.icp(
+        source_np.astype(np.float64),
+        target_np.astype(np.float64),
+        threshold=-np.inf,
+        max_iterations=100,
+        scale=False,
+        reflection=False,
+    )
+
+    assert np.allclose(transformed_wp.numpy(), moved_o3d, rtol=1e-4, atol=1e-4)
+    assert np.allclose(transformed_wp.numpy(), moved_tm, rtol=1e-4, atol=1e-4)
+    # All three land on the target itself, so none of the above is a comparison of two failures.
+    assert _rms(transformed_wp.numpy(), target_np) < 1e-3
+
+
+@pytest.mark.parametrize("robust_kernel", ["none", "tukey"])
+@pytest.mark.parity("icp_point_to_plane_cloud", "open3d")
+@pytest.mark.parity("icp_point_to_plane_tukey", "open3d")
+def test_icp_point_to_plane_matches_open3d(device: str, robust_kernel: str) -> None:
+    """
+    Point-to-plane ICP against Open3D's, plain and under a Tukey loss.
+
+    Both benchmark groups are the same solver at two robust-kernel settings, and Open3D exposes the
+    matching pair -- ``TransformationEstimationPointToPlane()`` and the same wrapped in
+    ``TukeyLoss(k=)`` -- so the parameter maps one-for-one, which is not true of most rows in this
+    module.
+
+    Compared by the recovered alignment rather than by each side's cost, for the reason given in
+    ``test_icp_point_to_point_matches_open3d_and_trimesh``. Measured worst per-point deviation
+    **1.2e-5** plain and **1.1e-5** with Tukey, against the 1e-3 bound here -- a ~90x margin. The
+    bound is looser than the point-to-point test's because the linearized point-to-plane step is
+    solved slightly differently on the two sides, so they stop at marginally different iterates;
+    both still land on the target to better than 1e-5 RMS, which the final assert pins.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=3)
+    target_np = np.asarray(mesh_tm.vertices, dtype=np.float32)
+    normals_np = np.asarray(mesh_tm.vertex_normals, dtype=np.float32)
+    rotation_np, translation_np = _rigid_transform(0.08, [0.1, 0.9, 0.2], [0.02, -0.01, 0.015])
+    source_np = (target_np @ rotation_np.T + translation_np).astype(np.float32)
+    scale = 0.1
+
+    _matrix_wp, transformed_wp, _cost_wp = tw.registration.icp_point_to_plane(
+        _to_wp(source_np, device),
+        _to_wp(target_np, device),
+        target_normals=_to_wp(normals_np, device),
+        max_iterations=50,
+        threshold=-np.inf,
+        robust_kernel=robust_kernel,
+        robust_scale=scale,
+    )
+
+    estimation_o3d = o3d.pipelines.registration.TransformationEstimationPointToPlane(
+        o3d.pipelines.registration.TukeyLoss(k=scale)
+        if robust_kernel == "tukey"
+        else o3d.pipelines.registration.L2Loss()
+    )
+    result_o3d = o3d.pipelines.registration.registration_icp(
+        points_to_open3d(source_np),
+        points_to_open3d(target_np, normals_np),
+        1e9,
+        np.eye(4),
+        estimation_o3d,
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50),
+    )
+    matrix_o3d = np.asarray(result_o3d.transformation)
+    moved_o3d = (matrix_o3d[:3, :3] @ source_np.T).T + matrix_o3d[:3, 3]
+
+    assert np.allclose(transformed_wp.numpy(), moved_o3d, rtol=1e-3, atol=1e-3)
+    assert _rms(transformed_wp.numpy(), target_np) < 1e-4
+    assert _rms(moved_o3d, target_np) < 1e-4
 
 
 def test_icp_point_to_point_cloud(device: str) -> None:

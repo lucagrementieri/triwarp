@@ -79,6 +79,8 @@ def _distance_pp(
 # tests
 # below still cover ``half_torus``, and they pass.
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+@pytest.mark.parity("heat_signed_distance", "potpourri3d")
+@pytest.mark.parity("heat_signed_distance_conditioning", "potpourri3d")
 def test_heat_signed_distance_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:

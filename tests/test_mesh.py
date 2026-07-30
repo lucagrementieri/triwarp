@@ -85,6 +85,7 @@ def test_mesh_from_numpy_round_trip(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> 
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parity("mesh_vertex_normals", "trimesh")
 def test_geometry_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
@@ -128,6 +129,7 @@ def test_edges_unique_matches_trimesh(request: pytest.FixtureRequest, mesh_name:
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parity("mesh_face_adjacency", "trimesh")
 def test_face_adjacency_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mesh = tw.Trimesh.from_warp_mesh(mesh_wp)

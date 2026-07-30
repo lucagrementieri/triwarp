@@ -53,6 +53,7 @@ def test_vertex_tangent_frames_are_orthonormal(
 
 
 @pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parity("vertex_tangent_frames", "potpourri3d")
 def test_vertex_tangent_frames_match_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:

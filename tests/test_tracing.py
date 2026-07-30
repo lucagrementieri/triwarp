@@ -103,6 +103,7 @@ def test_trace_from_vertex_stays_on_the_surface(
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+@pytest.mark.parity("trace_geodesic_rays", "potpourri3d")
 def test_trace_from_vertex_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:

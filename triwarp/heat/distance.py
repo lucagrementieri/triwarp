@@ -7,7 +7,7 @@ import warp.sparse as wps
 
 import triwarp.linalg as twl
 from triwarp._device import require_cuda
-from triwarp.edges import mean_edge_length
+from triwarp.edges import mean_unique_edge_length
 from triwarp.kernels.heat import distance as kernel_heat_distance
 from triwarp.laplacian import (
     cotmatrix,
@@ -94,7 +94,8 @@ def heat_operators(
     [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries]
     """
     if t is None:
-        h = mean_edge_length(vertices, faces)
+        # The unique-edge average, which is what ``igl::heat_geodesics`` uses for its timestep.
+        h = mean_unique_edge_length(vertices, faces)
         t = h * h
 
     # Per-face half-cotangent weights (float32, O(1) and safe) reused for both the Laplacian and
@@ -186,7 +187,7 @@ def heat_geodesic(
     --------
     [`heat_operators`][triwarp.heat.distance.heat_operators]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
-    [`mean_edge_length`][triwarp.edges.mean_edge_length]
+    [`mean_unique_edge_length`][triwarp.edges.mean_unique_edge_length]
     [`marching_triangles`][triwarp.intersection.marching_triangles]
     """
     device = vertices.device

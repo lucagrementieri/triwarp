@@ -124,6 +124,7 @@ def test_face_adjacency_angles_empty(device: str) -> None:
     assert angles_wp.shape == (0,)
 
 
+@pytest.mark.parity("concatenate", "trimesh")
 def test_concatenate_meshes(request: pytest.FixtureRequest) -> None:
     mesh_a_tm, mesh_a_wp = request.getfixturevalue("icosahedron")
     mesh_b_tm, mesh_b_wp = request.getfixturevalue("hemisphere")
@@ -156,6 +157,7 @@ def test_concatenate_empty() -> None:
     assert faces_wp.shape == (0,)
 
 
+@pytest.mark.parity("split", "trimesh")
 def test_split_meshes(request: pytest.FixtureRequest) -> None:
     mesh_a_tm, mesh_a_wp = request.getfixturevalue("icosahedron")
     mesh_b_tm, mesh_b_wp = request.getfixturevalue("hemisphere")
@@ -261,6 +263,7 @@ def test_edges_to_csr_roundtrip(device: str) -> None:
         assert set(row.tolist()) == neighbors[v]
 
 
+@pytest.mark.parity("connected_component_labels", "scipy")
 def test_connected_component_labels_random(device: str) -> None:
     rng = np.random.default_rng(7)
     node_count = 64
@@ -288,6 +291,7 @@ def test_connected_component_labels_zero_nodes(device: str) -> None:
     assert labels_wp.shape == (0,)
 
 
+@pytest.mark.parity("connected_component_labels_depth", "scipy")
 def test_connected_component_labels_path_graph(device: str) -> None:
     n = 2048
     edges_np = np.stack([np.arange(n - 1, dtype=np.int32), np.arange(1, n, dtype=np.int32)], axis=1)
@@ -418,6 +422,7 @@ def _same_partition(a: np.ndarray, b: np.ndarray) -> bool:
     return bool(np.array_equal(same_a, same_b))
 
 
+@pytest.mark.parity("bfs", "scipy")
 def test_bfs_random(device: str) -> None:
     rng = np.random.default_rng(7)
     node_count = 48

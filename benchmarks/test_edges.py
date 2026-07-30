@@ -17,11 +17,13 @@ diagnostics over specific predicates (``get_non_manifold_edges``,
 **potpourri3d** does have one: ``pp3d.edges`` returns geometry-central's internal undirected edge
 list. It cannot run on the scan meshes -- geometry-central rejects a mesh with an unreferenced
 vertex, and every scan mesh has some -- so it is timed in the separate ``edges_unique_manifold``
-group on the synthetic ``scale`` axis instead. Its ordering is geometry-central's own, so that row
-is a timing comparison rather than a parity check, and it includes building the halfedge mesh those
-indices refer to. It has no counterpart for the directed, per-corner or length variants.
+group on the synthetic ``scale`` axis instead. Its ordering is geometry-central's own, so the row
+includes building the halfedge mesh those indices refer to. That ordering does *not* make it
+unusable as an oracle -- sorting dissolves it, and
+``tests/test_edges.py::test_edges_unique_matches_potpourri3d`` asserts the two edge sets are equal.
+It has no counterpart for the directed, per-corner or length variants.
 
-**pymeshlab** appears in ``mean_edge_length`` alone. ``get_geometric_measures`` returns
+**pymeshlab** appears in ``mean_unique_edge_length`` alone. ``get_geometric_measures`` returns
 ``avg_edge_length`` in a dict alongside the area, volume, barycentre and inertia tensor, so it is an
 *upper* bound on the mean edge length taken by itself; the same call is the ``centroid`` reference
 in [`test_triangles.py`](test_triangles.py), so those two rows are literally the same measurement
@@ -212,8 +214,52 @@ def test_edges_length(bench_case) -> None:
 
 
 @pytest.mark.benchmark(group="mean_edge_length")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl")
 def test_mean_edge_length(bench_case) -> None:
+    """
+    The **per-face** edge average -- ``3 * n_faces`` lengths, every interior edge counted twice.
+
+    Paired with ``igl.edge_lengths(...).mean()``, which is the same quantity: it is what
+    ``CurvatureCalculator::getAverageEdge`` computes and therefore what ``igl::principal_curvature``
+    scales its sphere radius by. **Not** ``igl.avg_edge_length`` -- that averages the unique edge
+    list and is a different number on any mesh with a boundary, which every scan mesh here has. It
+    is timed in the ``mean_unique_edge_length`` group below against the triwarp function that
+    matches it.
+
+    So this group is the cheap one: no deduplication, one pass and a reduction.
+    """
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        assert bench_case.run(lambda: tw.edges.mean_edge_length(vertices, faces)) >= 0.0
+    elif bench_case.kind == "trimesh":  # mean of all per-face edge norms
+        vertices, faces = bench_case.vertices_np, bench_case.faces_np
+
+        def run():
+            tri = vertices[faces]
+            return float(np.linalg.norm(tri - tri[:, [1, 2, 0]], axis=2).mean())
+
+        bench_case.run(run)
+    else:  # igl.edge_lengths -> (#F, 3), the per-face table; its mean is getAverageEdge
+        vertices, faces = bench_case.vertices_np, bench_case.faces_np
+        bench_case.run(lambda: float(igl.edge_lengths(vertices, faces).mean()))
+
+
+@pytest.mark.benchmark(group="mean_unique_edge_length")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pymeshlab")
+def test_mean_unique_edge_length(bench_case) -> None:
+    """
+    The **unique** edge average, where the deduplication is most of the cost.
+
+    Every row here computes the identical number: ``igl::avg_edge_length`` builds the unique edge
+    list and averages it, MeshLab reports the same value as ``avg_edge_length``, and the trimesh row
+    is that formula in numpy. Contrast the ``mean_edge_length`` group above, which is the per-face
+    average -- the two differ by 0.55% on an open half-torus and this sweep's meshes all have
+    boundaries.
+
+    The interesting comparison is the dedup: triwarp reaches the unique edges through a sort where
+    the numpy row goes through ``np.unique(axis=0)``, which is why this group is several times the
+    cost of its per-face twin on both sides.
+    """
     if bench_case.kind == "pymeshlab":
         # ``get_geometric_measures`` is read-only and returns ``avg_edge_length`` alongside the
         # area, volume, barycentre and inertia tensor -- one call for all of them, so this row is an
@@ -225,17 +271,18 @@ def test_mean_edge_length(bench_case) -> None:
         return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-        result = bench_case.run(lambda: tw.edges.mean_edge_length(vertices, faces))
-        assert result >= 0.0
-    elif bench_case.kind == "trimesh":  # mean of all per-face edge norms (test reference)
+        assert bench_case.run(lambda: tw.edges.mean_unique_edge_length(vertices, faces)) >= 0.0
+    elif bench_case.kind == "trimesh":
         vertices, faces = bench_case.vertices_np, bench_case.faces_np
 
         def run():
-            tri = vertices[faces]
-            return float(np.linalg.norm(tri - tri[:, [1, 2, 0]], axis=2).mean())
+            edges = np.unique(np.sort(tm.geometry.faces_to_edges(faces), axis=1), axis=0)
+            return float(
+                np.linalg.norm(vertices[edges[:, 1]] - vertices[edges[:, 0]], axis=1).mean()
+            )
 
         bench_case.run(run)
-    else:  # igl.avg_edge_length
+    else:
         vertices, faces = bench_case.vertices_np, bench_case.faces_np
         bench_case.run(lambda: float(igl.avg_edge_length(vertices, faces)))
 

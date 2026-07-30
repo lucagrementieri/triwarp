@@ -470,6 +470,7 @@ def _hausdorff(left: np.ndarray, right: np.ndarray) -> float:
 
 @pytest.mark.parametrize("mesh_name", _MESHES)
 @pytest.mark.parametrize("axis", [0, 2])
+@pytest.mark.parity("marching_triangles", "potpourri3d")
 def test_marching_triangles_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, axis: int, device: str
 ) -> None:
@@ -505,6 +506,7 @@ def test_marching_triangles_matches_potpourri3d(
     )
 
 
+@pytest.mark.parity("marching_triangles_curves", "potpourri3d")
 def test_marching_triangles_many_components_matches_potpourri3d(device: str) -> None:
     # An oscillating field breaks the level set into many small loops, which is what exercises the
     # segment linking rather than the per-face crossing arithmetic.

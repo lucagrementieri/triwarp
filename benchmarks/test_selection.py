@@ -138,6 +138,15 @@ def test_expand_vertex_mask(bench_case: BenchCase, hops: int) -> None:
         assert bench_case.run(dilate_pml) > 0
 
 
+@pytest.mark.noparity(
+    "pymeshlab",
+    reason="D4: MeshLab's Erode Selection removes a face when *any* of its vertices is on the "
+    "selection boundary, so reading the vertex selection back gives the vertices of the "
+    "surviving faces, not an eroded vertex set. Measured on a 9x9 grid: 51 / 39 / 25 vertices "
+    "after 1 / 2 / 3 erosions where shrink_vertex_mask gives 19 / 7 / 1. Dilation does map and is "
+    "covered; erosion is a different operation, and the scipy oracle in "
+    "tests/test_selection.py::test_shrink_vertex_mask is the one for this function.",
+)
 @pytest.mark.benchmark(group="shrink_vertex_mask")
 @pytest.mark.benchmeshes("sphere_med")
 @pytest.mark.benchlibs("triwarp", "pymeshlab")

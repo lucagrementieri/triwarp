@@ -90,6 +90,14 @@ def test_fill_holes_fan(bench_case: BenchCase) -> None:
     assert result.shape[0] >= faces.shape[0]
 
 
+@pytest.mark.noparity(
+    "trimesh",
+    reason="D2 a weaker algorithm for the same task: tm.repair.fill_holes fans triangles across "
+    "small holes and gives up on large ones, where fill_holes_min_weight runs the minimum-weight "
+    "interval DP, so the two produce different triangulations by design and trimesh has no "
+    "minimum-weight answer to compare against. meshlib is the oracle for the DP itself, in "
+    "tests/test_hole_filling.py::test_fill_holes_min_weight_matches_meshlib.",
+)
 @pytest.mark.benchmark(group="fill_holes_min_weight")
 @pytest.mark.benchaxis("loops_dp")
 @pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")

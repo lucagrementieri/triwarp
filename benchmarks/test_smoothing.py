@@ -269,6 +269,16 @@ def test_filter_taubin(bench_case: BenchCase) -> None:
         assert bench_case.run(run).vertices.shape == vertices.shape
 
 
+@pytest.mark.noparity(
+    "pymeshlab",
+    oracle="trimesh",
+    reason="D2 measured disagreement: apply_coord_hc_laplacian_smoothing implements the same "
+    "Vollmer et al. paper but exposes no parameters at all, and its single pass matches "
+    "filter_humphrey at none of the 8 x 11 x 11 (iterations, alpha, beta) combinations probed "
+    "(best max-coordinate deviation 0.019 on a mesh carrying 0.016 of noise). It is a different "
+    "formulation, not this one with other constants; trimesh is the oracle, in "
+    "tests/test_smoothing.py::test_filter_humphrey.",
+)
 @pytest.mark.benchmark(group="filter_humphrey")
 @pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
 def test_filter_humphrey(bench_case: BenchCase) -> None:

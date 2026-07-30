@@ -2,10 +2,79 @@
 
 import igl
 import numpy as np
+import pytest
 import trimesh as tm
 import warp as wp
 
 import triwarp as tw
+from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab
+
+
+@pytest.mark.parity("area_weighted_vertex_normals", "open3d", "pymeshlab")
+@pytest.mark.parity("mean_vertex_normals", "pymeshlab")
+def test_vertex_normal_weightings_match_open3d_and_pymeshlab(
+    half_torus: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    The two unweighted-and-area weightings against the libraries that implement the same ones.
+
+    Class A for all three, and they agree to **3.5e-7**, tighter than the 1e-5 tolerance, because
+    ``compute_vertex_normals`` and ``compute_normal_per_vertex(weightmode="By Area")`` are the
+    same scheme triwarp implements, and ``"Simple Average"`` is the unweighted one.
+
+    **trimesh is deliberately absent**, and that is the finding worth recording:
+    ``Trimesh.vertex_normals`` is *angle*-weighted, not area-weighted. It matches
+    ``angle_weighted_vertex_normals`` to 4.3e-7 (see ``test_angle_weighted_vertex_normals``) and
+    differs from the area-weighted answer by up to **0.072** on this fixture. The
+    ``area_weighted_vertex_normals`` benchmark group timed it as though it were the same quantity;
+    it is now exempted there with a redirect to open3d.
+    """
+    mesh_tm, mesh_wp = half_torus
+    n_vertices = int(mesh_wp.points.shape[0])
+
+    area_wp = tw.vertices.area_weighted_vertex_normals(n_vertices, mesh_wp.points, mesh_wp.indices)
+
+    mesh_o3d = trimesh_to_open3d(mesh_tm)
+    mesh_o3d.compute_vertex_normals()
+    assert np.allclose(area_wp.numpy(), np.asarray(mesh_o3d.vertex_normals), rtol=1e-5, atol=1e-5)
+
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    meshset_pml.compute_normal_per_vertex(weightmode="By Area")
+    normals_pml = meshset_pml.current_mesh().vertex_normal_matrix()
+    assert np.allclose(area_wp.numpy(), normals_pml, rtol=1e-5, atol=1e-5)
+
+    # The unweighted scheme, from the same filter under a different weightmode.
+    face_normals_wp, _areas_wp = tw.triangles.face_normals_and_areas(
+        mesh_wp.points, mesh_wp.indices
+    )
+    mean_wp = tw.vertices.mean_vertex_normals(n_vertices, mesh_wp.indices, face_normals_wp)
+    mean_meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    mean_meshset_pml.compute_normal_per_vertex(weightmode="Simple Average")
+    mean_pml = mean_meshset_pml.current_mesh().vertex_normal_matrix()
+    assert np.allclose(mean_wp.numpy(), mean_pml, rtol=1e-5, atol=1e-5)
+
+    # The two weightings are genuinely different, so neither assert above is weightless.
+    assert not np.allclose(area_wp.numpy(), mean_wp.numpy(), atol=1e-3)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("n_vertices", "trimesh")
+def test_n_vertices_matches_the_index_maximum(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Vertex count inferred from the face buffer, against the numpy formula the benchmark times.
+
+    ``Trimesh`` has no uncached equivalent -- its vertex count comes from the array it was built
+    with -- so the benchmark's "trimesh" row is the stand-in formula ``int(faces.max()) + 1``, and
+    that is the reference here. The value is checked against the fixture's actual vertex count too,
+    which is the part that would catch an off-by-one that the formula shares.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_np = mesh_tm.faces
+
+    assert tw.vertices.n_vertices(mesh_wp.indices) == int(faces_np.max()) + 1
+    assert tw.vertices.n_vertices(mesh_wp.indices) == len(mesh_tm.vertices)
 
 
 def test_mean_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):

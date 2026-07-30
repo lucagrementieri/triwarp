@@ -350,19 +350,31 @@ def test_icosphere(bench_lib: BenchLibrary, subdivisions: int) -> None:
 @pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
 @pytest.mark.parametrize("sections", _SECTIONS)
 def test_uv_sphere(bench_lib: BenchLibrary, sections: int) -> None:
+    """
+    UV sphere at matched tessellation -- open3d's ``resolution`` is neither axis on its own.
+
+    Measured, exactly, at every point on this axis: ``create_sphere(resolution=r)`` produces the
+    same vertex and face counts as ``uv_sphere(count=(2 * r, r // 2))``, so ``resolution`` is *half*
+    the longitude count and *twice* the latitude count. Pairing it with ``count=(32, r)``, as this
+    group used to, compared meshes of different sizes -- and the gap widened along the axis, because
+    open3d's face count is quadratic in ``resolution`` while a fixed 32-longitude sweep is linear:
+    15 360 triwarp faces against 65 024 open3d ones at ``sections=256``, a 4.2x mismatch reported as
+    a speed ratio.
+
+    ``tests/test_creation.py::test_uv_sphere_matches_open3d`` pins the mapping so it cannot drift
+    back.
+    """
+    count = (2 * sections, sections // 2)
     if bench_lib.kind == "triwarp":
         device = bench_lib.device
-        _, faces_wp = bench_lib.run(
-            lambda: tw.creation.uv_sphere(count=(32, sections // 2), device=device)
-        )
+        _, faces_wp = bench_lib.run(lambda: tw.creation.uv_sphere(count=count, device=device))
         assert int(faces_wp.shape[0]) > 0
     elif bench_lib.kind == "trimesh":
-        mesh_tm = bench_lib.run(lambda: tm.creation.uv_sphere(count=[32, sections // 2]))
+        mesh_tm = bench_lib.run(lambda: tm.creation.uv_sphere(count=list(count)))
         assert len(mesh_tm.faces) > 0
     else:
-        # open3d's resolution is the latitude count and longitude is derived as 2 * resolution.
         mesh_class = _o3d_mesh(bench_lib)
-        mesh_o3d = bench_lib.run(lambda: mesh_class.create_sphere(1.0, resolution=sections // 2))
+        mesh_o3d = bench_lib.run(lambda: mesh_class.create_sphere(1.0, resolution=sections))
         assert len(mesh_o3d.triangles) > 0
 
 
@@ -418,6 +430,14 @@ def test_cone(bench_lib: BenchLibrary, sections: int) -> None:
         assert len(mesh_o3d.triangles) == 2 * sections
 
 
+@pytest.mark.noparity(
+    "pymeshlab",
+    oracle="trimesh",
+    reason="D6 different primitive: MeshLab's create_annulus builds a flat holed *disk* while "
+    "triwarp's annulus is an annular *cylinder* with height, so the two do not bound the same "
+    "solid and MeshLab emits fewer faces at the same side count. trimesh is the oracle here and "
+    "is asserted in tests/test_creation.py::test_annulus.",
+)
 @pytest.mark.benchmark(group="annulus")
 @pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
 @pytest.mark.parametrize("sections", _SECTIONS)
@@ -587,6 +607,13 @@ def test_truncated_prisms(bench_lib: BenchLibrary, face_count: int) -> None:
         assert len(mesh_tm.faces) == 8 * face_count
 
 
+@pytest.mark.noparity(
+    "trimesh",
+    reason="D5 stochastic with no shared invariant: both draw n random triangles in the unit "
+    "cube, but triwarp takes a seed and trimesh does not, so no two runs can be aligned. Only "
+    "the shape, the bounds and the cost are comparable, and the first two are asserted in "
+    "tests/test_creation.py::test_random_soup without needing trimesh.",
+)
 @pytest.mark.benchmark(group="random_soup")
 @pytest.mark.benchlibs("triwarp", "trimesh")
 @pytest.mark.parametrize("face_count", [1_024, 262_144])

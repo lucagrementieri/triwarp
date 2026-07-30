@@ -30,6 +30,8 @@ def _skip_on_cpu(device: str) -> None:
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+@pytest.mark.parity("heat_geodesic", "igl")
+@pytest.mark.parity("heat_geodesic_conditioning", "igl")
 def test_heat_geodesic_matches_igl(
     request: pytest.FixtureRequest, device: str, mesh_name: str
 ) -> None:
@@ -128,6 +130,62 @@ def test_heat_geodesic_cpu_solve_raises() -> None:
 
     with pytest.raises(NotImplementedError):
         tw.heat.distance.heat_geodesic(vertices, faces, sources)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere", "half_torus"])
+@pytest.mark.parity("heat_geodesic", "potpourri3d")
+@pytest.mark.parity("heat_geodesic_conditioning", "potpourri3d")
+def test_heat_geodesic_matches_potpourri3d_plain(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    """
+    The plain heat method against geometry-central on the *same* discretization.
+
+    Distinct from ``test_robust_heat_geodesic_matches_potpourri3d``, which runs both sides with
+    ``use_robust=True``. That is a different configuration from the one
+    ``benchmarks/test_geodesic.py`` times, and it is the looser of the two comparisons:
+    potpourri3d's
+    robust path additionally flips to an intrinsic Delaunay triangulation, so the two solve on
+    different triangulations and can only agree to the heat method's own accuracy.
+
+    Passing ``use_robust=False`` on both sides removes that difference -- same mesh, same cotangent
+    weights, same lumped mass -- which is what makes this the honest oracle for the benchmark row
+    and
+    lets the tolerance be far tighter than the robust comparison's ``0.1 * scale``.
+
+    Class C: an error norm against the mesh diameter rather than element-wise, because the two sides
+    still differ in the *solver* -- triwarp runs conjugate gradient to a tolerance where
+    geometry-central factors directly, so the residuals differ even though the systems match.
+
+    Measured across the three fixtures: mean error **0.00 / 0.00 / 0.01%** of the diameter and
+    maximum **0.00 / 0.00 / 0.99%**, the worst being ``half_torus``, whose non-uniform scaling gives
+    it the widest triangle-quality spread. The bounds below sit 10x and 5x off those, which is the
+    margin rule; they are this tight *because* both sides discretize identically, and a regression
+    to
+    the robust comparison's ``0.1 * scale`` would mean the two are no longer solving the same
+    system.
+    Mean and maximum are held separately so a single blown-up vertex cannot hide inside a mean taken
+    over thousands.
+    """
+    _skip_on_cpu(device)
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    sources_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
+
+    distance_wp = tw.heat.distance.heat_geodesic(
+        mesh_wp.points, mesh_wp.indices, sources_wp, use_robust=False
+    )
+    distance_pp = np.asarray(
+        pp3d.MeshHeatMethodDistanceSolver(
+            np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),
+            np.ascontiguousarray(mesh_tm.faces, dtype=np.int32),
+            use_robust=False,
+        ).compute_distance(0)
+    )
+
+    diameter = float(np.linalg.norm(mesh_tm.vertices.max(axis=0) - mesh_tm.vertices.min(axis=0)))
+    error = np.abs(distance_wp.numpy() - distance_pp)
+    assert error.mean() < 0.001 * diameter
+    assert error.max() < 0.05 * diameter
 
 
 # --- the heat method's robust path (potpourri3d use_robust=True reference) -------------

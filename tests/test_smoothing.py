@@ -48,6 +48,7 @@ def test_filter_laplacian_volume_constraint(icosahedron: tuple[tm.Trimesh, wp.Me
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("filter_humphrey", "trimesh")
 def test_filter_humphrey(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
     HC filtering against trimesh, which is the only oracle this filter has.
@@ -72,6 +73,7 @@ def test_filter_humphrey(request: pytest.FixtureRequest, mesh_name: str) -> None
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("filter_taubin", "trimesh")
 def test_filter_taubin(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
@@ -85,6 +87,7 @@ def test_filter_taubin(request: pytest.FixtureRequest, mesh_name: str) -> None:
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+@pytest.mark.parity("filter_mut_dif_laplacian", "trimesh")
 def test_filter_mut_dif_laplacian_volume_constraint(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -416,6 +419,7 @@ def _meshset_with_scalars(mesh_tm: tm.Trimesh, values_np: np.ndarray) -> ml.Mesh
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "torus", "cave_cube"])
+@pytest.mark.parity("filter_scalar_laplacian", "pymeshlab")
 def test_filter_scalar_laplacian_matches_pymeshlab(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
@@ -486,6 +490,7 @@ def test_filter_scalar_laplacian_length_mismatch(icosahedron: tuple[tm.Trimesh, 
 
 @pytest.mark.parametrize("threshold", [0.5, 1.0, 3.0])
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("saturate_scalar_gradient", "pymeshlab")
 def test_saturate_scalar_gradient_matches_pymeshlab(
     request: pytest.FixtureRequest, mesh_name: str, threshold: float
 ) -> None:
@@ -648,6 +653,7 @@ def test_filter_two_step_denoises_without_rounding_the_creases(device: str) -> N
     )
 
 
+@pytest.mark.parity("filter_two_step", "pymeshlab")
 def test_filter_two_step_matches_pymeshlab_on_crease_preservation(device: str) -> None:
     """
     ``apply_coord_two_steps_smoothing`` is the same two-stage scheme at the same four parameters.

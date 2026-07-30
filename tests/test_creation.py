@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import open3d as o3d
 import pymeshlab as ml
 import pytest
 import trimesh as tm
@@ -10,6 +11,7 @@ import warp as wp
 from scipy.spatial import cKDTree
 
 import triwarp as tw
+from tests.conversions import open3d_to_trimesh
 
 
 def _mesh(vertices_wp: wp.array[wp.vec3], faces_wp: wp.array[wp.int32]) -> tm.Trimesh:
@@ -102,9 +104,102 @@ _SQUARE_RING = np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0]])
 _L_RING = np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0], [1.0, 2.0], [0.0, 2.0]])
 
 
+# --- open3d primitives ------------------------------------------------------------------
+
+
+@pytest.mark.parity("box", "open3d")
+@pytest.mark.parity("cylinder", "open3d")
+@pytest.mark.parity("cone", "open3d")
+@pytest.mark.parity("torus", "open3d")
+def test_primitives_match_open3d(device: str) -> None:
+    """
+    Four primitives against Open3D's, which agree exactly -- same counts, same volume, same area.
+
+    Worth asserting rather than assuming: these are table-driven generators, so a wrong cap winding
+    or a dropped seam ring changes the enclosed volume while leaving the face count intact, and a
+    count check alone would miss it. Class A on the counts, class B on volume and area (both are
+    functions of the mesh, not of its vertex ordering, which the two libraries do not share).
+
+    ``uv_sphere`` is deliberately not here -- its tessellation parameter does not map
+    one-for-one, and it gets its own test below.
+    """
+    for name, (vertices_wp, faces_wp), mesh_o3d in (
+        (
+            "box",
+            tw.creation.box(extents=(1.0, 2.0, 3.0), device=device),
+            o3d.geometry.TriangleMesh.create_box(1.0, 2.0, 3.0),
+        ),
+        (
+            "cylinder",
+            tw.creation.cylinder(radius=1.0, height=2.0, sections=32, device=device),
+            o3d.geometry.TriangleMesh.create_cylinder(1.0, 2.0, resolution=32, split=1),
+        ),
+        (
+            "cone",
+            tw.creation.cone(radius=1.0, height=2.0, sections=32, device=device),
+            o3d.geometry.TriangleMesh.create_cone(1.0, 2.0, resolution=32, split=1),
+        ),
+        (
+            "torus",
+            tw.creation.torus(1.0, 0.25, major_sections=32, minor_sections=32, device=device),
+            o3d.geometry.TriangleMesh.create_torus(
+                1.0, 0.25, radial_resolution=32, tubular_resolution=32
+            ),
+        ),
+    ):
+        mesh_ref = open3d_to_trimesh(mesh_o3d)
+        assert int(vertices_wp.shape[0]) == len(mesh_ref.vertices), name
+        assert int(faces_wp.shape[0]) // 3 == len(mesh_ref.faces), name
+        mesh_wp = _mesh(vertices_wp, faces_wp)
+        assert np.isclose(mesh_wp.volume, mesh_ref.volume, rtol=1e-4), name
+        assert np.isclose(mesh_wp.area, mesh_ref.area, rtol=1e-4), name
+
+
+@pytest.mark.parametrize("sections", [16, 32, 64])
+@pytest.mark.parity("uv_sphere", "open3d")
+def test_uv_sphere_matches_open3d(device: str, sections: int) -> None:
+    """
+    Pin the tessellation mapping between the two UV spheres, which is not the obvious one.
+
+    ``create_sphere(resolution=r)`` is neither ``count=(r, r)`` nor ``count=(32, r)``: measured
+    exactly at r = 16, 32, 64, 128 and 256, it equals ``uv_sphere(count=(2 * r, r // 2))`` in both
+    vertex and face count. ``benchmarks/test_creation.py`` paired it with ``count=(32, r)`` and so
+    timed a linear sweep against a quadratic one -- 15 360 faces against 65 024 at ``sections=256``.
+    Pinning the count mapping, so that fix cannot drift back, is the substance of this test.
+
+    The two are **not** the same mesh, and the assertions say so rather than pretending otherwise.
+    Both are exact unit spheres -- every vertex sits at radius 1 to float32 -- but they distribute
+    their latitude rings differently, so at equal tessellation the enclosed volumes differ by
+    **1.22 / 0.30 / 0.08%** at ``sections`` 16 / 32 / 64. That gap is a discretization difference,
+    not an error in either, and the shape of it is the check worth making: it must *shrink* as the
+    tessellation refines, and both must converge on ``4 pi / 3``. A sphere generator with a wrong
+    ring placement would hold a constant offset instead.
+    """
+    vertices_wp, faces_wp = tw.creation.uv_sphere(
+        radius=1.0, count=(2 * sections, sections // 2), device=device
+    )
+    mesh_ref = open3d_to_trimesh(o3d.geometry.TriangleMesh.create_sphere(1.0, resolution=sections))
+
+    assert int(vertices_wp.shape[0]) == len(mesh_ref.vertices)
+    assert int(faces_wp.shape[0]) // 3 == len(mesh_ref.faces)
+
+    # Both are unit spheres: every vertex on the surface, not merely near it.
+    assert np.allclose(np.linalg.norm(vertices_wp.numpy(), axis=1), 1.0, rtol=1e-5, atol=1e-5)
+    assert np.allclose(np.linalg.norm(mesh_ref.vertices, axis=1), 1.0, rtol=1e-5, atol=1e-5)
+
+    # Both inscribe the true sphere and converge on it; the tolerance tracks the tessellation.
+    exact_volume = 4.0 / 3.0 * np.pi
+    tolerance = {16: 0.03, 32: 0.01, 64: 0.005}[sections]
+    mesh_wp = _mesh(vertices_wp, faces_wp)
+    for volume in (mesh_wp.volume, mesh_ref.volume):
+        assert volume < exact_volume
+        assert abs(volume - exact_volume) / exact_volume < tolerance
+
+
 # --- table primitives -------------------------------------------------------------------
 
 
+@pytest.mark.parity("box", "trimesh")
 def test_box(device: str) -> None:
     _assert_same_vertices_and_faces(*tw.creation.box(device=device), tm.creation.box())
     _assert_same_vertices_and_faces(
@@ -164,6 +259,7 @@ def test_icosahedron(device: str) -> None:
         ("dodecahedron", "create_dodecahedron", 20, 36),
     ],
 )
+@pytest.mark.parity("platonic_solids", "pymeshlab")
 def test_platonic_solids_match_pymeshlab(
     device: str, builder: str, filter_name: str, n_vertices: int, n_faces: int
 ) -> None:
@@ -205,6 +301,7 @@ def test_grid(device: str, count: tuple[int, int]) -> None:
     assert len(tw.boundary.boundary_loops(vertices_wp, faces_wp)) == 1
 
 
+@pytest.mark.parity("grid", "pymeshlab")
 def test_grid_matches_pymeshlab(device: str) -> None:
     """MeshLab's ``create_grid`` is the same lattice, in its uncentered form."""
     vertices_wp, faces_wp = tw.creation.grid(
@@ -265,6 +362,7 @@ def test_sphere_cap(device: str, subdivisions: int) -> None:
         assert _mesh(vertices_wp, faces_wp).area > exact_area * 0.99
 
 
+@pytest.mark.parity("sphere_cap", "pymeshlab")
 def test_sphere_cap_matches_pymeshlab_size(device: str) -> None:
     """MeshLab's ``create_sphere_cap`` builds the same lattice; ``angle`` is its full aperture."""
     vertices_wp, faces_wp = tw.creation.sphere_cap(
@@ -296,6 +394,7 @@ def test_sphere_cap_invalid(device: str) -> None:
 
 
 @pytest.mark.parametrize("subdivisions", [0, 1, 2, 3])
+@pytest.mark.parity("icosphere", "trimesh")
 def test_icosphere(device: str, subdivisions: int) -> None:
     vertices_wp, faces_wp = tw.creation.icosphere(subdivisions=subdivisions, device=device)
     _assert_same_vertices_and_faces(
@@ -316,6 +415,7 @@ def test_icosphere_radius(device: str) -> None:
 # --- revolution primitives --------------------------------------------------------------
 
 
+@pytest.mark.parity("uv_sphere", "trimesh")
 def test_uv_sphere(device: str) -> None:
     _assert_same_faces(*tw.creation.uv_sphere(device=device), tm.creation.uv_sphere())
     vertices_wp, _ = tw.creation.uv_sphere(radius=3.0, device=device)
@@ -337,6 +437,7 @@ def test_capsule(device: str) -> None:
     assert np.allclose(_mesh(vertices_wp, faces_wp).bounds[:, 2], [-1.5, 1.5], rtol=1e-5, atol=1e-4)
 
 
+@pytest.mark.parity("cylinder", "trimesh")
 def test_cylinder(device: str) -> None:
     vertices_wp, faces_wp = tw.creation.cylinder(radius=1.0, height=2.0, device=device)
     _assert_same_faces(vertices_wp, faces_wp, tm.creation.cylinder(radius=1.0, height=2.0))
@@ -360,6 +461,7 @@ def test_cylinder_requires_height_or_segment(device: str) -> None:
         tw.creation.cylinder(radius=1.0, segment=np.zeros((3, 3)), device=device)
 
 
+@pytest.mark.parity("cone", "trimesh")
 def test_cone(device: str) -> None:
     vertices_wp, faces_wp = tw.creation.cone(radius=1.0, height=2.0, device=device)
     _assert_same_faces(vertices_wp, faces_wp, tm.creation.cone(radius=1.0, height=2.0))
@@ -368,6 +470,7 @@ def test_cone(device: str) -> None:
     _assert_closed(vertices_wp, faces_wp)
 
 
+@pytest.mark.parity("annulus", "trimesh")
 def test_annulus(device: str) -> None:
     vertices_wp, faces_wp = tw.creation.annulus(0.5, 1.0, height=2.0, device=device)
     _assert_same_faces(vertices_wp, faces_wp, tm.creation.annulus(0.5, 1.0, height=2.0))
@@ -388,6 +491,7 @@ def test_annulus_requires_height_or_segment(device: str) -> None:
         tw.creation.annulus(0.5, 1.0, device=device)
 
 
+@pytest.mark.parity("torus", "trimesh")
 def test_torus(device: str) -> None:
     vertices_wp, faces_wp = tw.creation.torus(1.0, 0.25, device=device)
     _assert_same_faces(vertices_wp, faces_wp, tm.creation.torus(1.0, 0.25))
@@ -425,6 +529,7 @@ def test_primitives_are_deterministic(device: str, name: str) -> None:
     assert np.array_equal(first_f.numpy(), second_f.numpy())
 
 
+@pytest.mark.parity("revolve", "trimesh")
 def test_revolve_matches_trimesh(device: str) -> None:
     profile_np = np.array([[0.25, 0.0], [1.0, 0.0], [1.0, 1.0], [0.25, 1.0], [0.25, 0.0]])
     _assert_same_faces(
@@ -474,6 +579,7 @@ def test_revolve_absolute_tolerance_is_scale_dependent(device: str) -> None:
 
 @pytest.mark.parametrize("ring_name", ["square", "L"])
 @pytest.mark.parametrize("height", [0.5, -0.5])
+@pytest.mark.parity("extrude_polygon", "trimesh")
 def test_extrude_polygon(device: str, ring_name: str, height: float) -> None:
     shapely = pytest.importorskip("shapely.geometry")
     ring_np = _SQUARE_RING if ring_name == "square" else _L_RING
@@ -605,6 +711,7 @@ _SWEEP_PATHS = {
 
 
 @pytest.mark.parametrize("path_name", sorted(_SWEEP_PATHS))
+@pytest.mark.parity("sweep_polygon", "trimesh")
 def test_sweep_polygon(device: str, path_name: str) -> None:
     shapely = pytest.importorskip("shapely.geometry")
     ring_np = np.array([[-0.25, -0.25], [0.25, -0.25], [0.25, 0.25], [-0.25, 0.25]])
@@ -676,6 +783,7 @@ def _triangle_soup(device: str, seed: int = 7) -> tuple[np.ndarray, wp.array, wp
     return triangles_np, vertices_wp, faces_wp
 
 
+@pytest.mark.parity("truncated_prisms", "trimesh")
 def test_truncated_prisms(device: str) -> None:
     triangles_np, vertices_wp, faces_wp = _triangle_soup(device)
     prism_v, prism_f = tw.creation.truncated_prisms(vertices_wp, faces_wp)

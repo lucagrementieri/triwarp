@@ -16,7 +16,41 @@ import trimesh.proximity as tm_proximity
 import warp as wp
 
 import triwarp as tw
+from tests.conversions import trimesh_to_open3d
 from triwarp.constants import TOLERANCE_MERGE
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "hemisphere", "half_torus"])
+@pytest.mark.parity("aabb_bounds", "trimesh", "open3d")
+def test_aabb_bounds_matches_trimesh_and_open3d(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    The axis-aligned bounding box against both references, which is class A and exact.
+
+    Trivial to compute and trivial to get subtly wrong -- a reduction that seeds its accumulator at
+    zero rather than at +/-inf returns a box clamped to the origin, which is correct for any mesh
+    straddling it and wrong for every mesh that does not. Every fixture here is translated away from
+    the origin, so that bug would show.
+
+    The benchmark's trimesh row is the uncached ``vstack((v.min(0), v.max(0)))`` formula behind
+    ``Trimesh.bounds`` rather than the cached property, and that formula is what is compared here.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    lower_wp, upper_wp = tw.bounds.aabb_bounds(mesh_wp.points)
+    bounds_wp = np.stack(
+        [
+            np.array([lower_wp.x, lower_wp.y, lower_wp.z]),
+            np.array([upper_wp.x, upper_wp.y, upper_wp.z]),
+        ]
+    )
+
+    bounds_np = np.vstack((mesh_tm.vertices.min(axis=0), mesh_tm.vertices.max(axis=0)))
+    assert np.allclose(bounds_wp, bounds_np, rtol=1e-5, atol=1e-5)
+
+    box_o3d = trimesh_to_open3d(mesh_tm).get_axis_aligned_bounding_box()
+    bounds_o3d = np.stack([box_o3d.get_min_bound(), box_o3d.get_max_bound()])
+    assert np.allclose(bounds_wp, bounds_o3d, rtol=1e-5, atol=1e-5)
 
 
 def test_query_mesh_aabb_bounds_with_offsets(device: str) -> None:
@@ -365,6 +399,7 @@ def test_signed_distance_on_mesh_empty_faces(device: str) -> None:
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "hemisphere"])
 @pytest.mark.parametrize("tiled", [False, True])
+@pytest.mark.parity("winding_number", "igl")
 def test_winding_number_random(request: pytest.FixtureRequest, mesh_name: str, tiled: bool) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     rng = np.random.default_rng(42)
@@ -626,6 +661,7 @@ def test_shape_diameter_trimming_rejects_the_escaping_rays(device: str) -> None:
     assert untrimmed_np[outer_np].mean() > trimmed_np[outer_np].mean()
 
 
+@pytest.mark.parity("shape_diameter", "pymeshlab")
 def test_shape_diameter_agrees_with_pymeshlab_on_which_part_is_thinner(device: str) -> None:
     """
     MeshLab's SDF differs from this one by roughly a constant factor, so compare *structure*.

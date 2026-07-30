@@ -11,6 +11,8 @@ import trimesh.repair as tm_repair
 import warp as wp
 
 import triwarp as tw
+from tests.comparisons import canonical_winding, lexsort_rows
+from tests.conversions import trimesh_to_open3d
 
 
 def _to_wp_mesh(vertices_np: np.ndarray, faces_np: np.ndarray, device: str):
@@ -279,6 +281,100 @@ def _faces_2d(faces_wp: wp.array) -> np.ndarray:
     return faces_wp.numpy().reshape(-1, 3)
 
 
+@pytest.mark.parametrize("epsilon", [0.0, 1e-6])
+@pytest.mark.parity("remove_duplicated_vertices", "open3d", "pymeshlab")
+def test_remove_duplicated_vertices_matches_open3d_and_pymeshlab(
+    device: str, epsilon: float
+) -> None:
+    """
+    Welding an unwelded soup, the one repair group whose ``epsilon`` sweep maps across all three.
+
+    ``benchmarks/test_repair.py`` singles this out: MeshLab has a filter per path
+    (``meshing_remove_duplicate_vertices`` for exact, ``meshing_merge_close_vertices`` for a
+    tolerance) that line up with triwarp's two code paths one-for-one, and Open3D's
+    ``remove_duplicated_vertices`` is the exact path. So unlike its siblings in this module this is
+    a straight comparison rather than a semantics negotiation.
+
+    Class B on the *positions*: all three renumber the survivors differently, so the vertex sets are
+    compared after a lexsort. Counting alone would be too weak -- a welder that merged the wrong
+    pairs can still land on 162 -- which is why the positions are asserted and the count is only
+    the headline. Measured: 960 soup positions collapse to exactly 162 on all three sides at both
+    epsilon values, matching the icosphere's true vertex count.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    soup_np = np.ascontiguousarray(mesh_tm.vertices[mesh_tm.faces].reshape(-1, 3))
+    faces_np = np.arange(soup_np.shape[0], dtype=np.int32).reshape(-1, 3)
+
+    vertices_wp = wp.array(soup_np.astype(np.float32), dtype=wp.vec3, device=device)
+    faces_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
+    unique_wp, _indices_wp, _inverse_wp, _faces_wp = tw.repair.remove_duplicated_vertices(
+        vertices_wp, faces_wp, epsilon
+    )
+
+    meshset_pml = ml.MeshSet()
+    meshset_pml.add_mesh(ml.Mesh(soup_np, faces_np))
+    if epsilon > 0.0:
+        meshset_pml.meshing_merge_close_vertices(threshold=ml.PureValue(epsilon))
+    else:
+        meshset_pml.meshing_remove_duplicate_vertices()
+    vertices_pml = meshset_pml.current_mesh().vertex_matrix()
+
+    soup_tm = tm.Trimesh(soup_np, faces_np, process=False)
+    vertices_o3d = np.asarray(trimesh_to_open3d(soup_tm).remove_duplicated_vertices().vertices)
+
+    assert int(unique_wp.shape[0]) == len(mesh_tm.vertices)
+    assert vertices_pml.shape[0] == len(mesh_tm.vertices)
+    assert vertices_o3d.shape[0] == len(mesh_tm.vertices)
+
+    survivors_wp = lexsort_rows(np.round(unique_wp.numpy().astype(np.float64), 5))
+    assert np.allclose(survivors_wp, lexsort_rows(np.round(vertices_pml, 5)), atol=1e-5)
+    assert np.allclose(survivors_wp, lexsort_rows(np.round(vertices_o3d, 5)), atol=1e-5)
+
+
+@pytest.mark.parity("make_winding_consistent", "pymeshlab")
+def test_make_winding_consistent_matches_pymeshlab(device: str) -> None:
+    """
+    Orientation repair against MeshLab's, which reaches the identical winding on every face.
+
+    The two algorithms are not the same -- ``benchmarks/test_repair.py`` notes MeshLab does a
+    serial face-to-face visit where triwarp solves the Z2 bits with a parity-carrying union-find --
+    but on a connected orientable surface the answer is unique up to one global flip, so
+    agreement is not
+    only possible, it is required.
+
+    Class B twice: ``canonical_winding`` rotates each triangle to start at its lowest index (a
+    rotation preserves orientation, so a flipped face still compares unequal) and a lexsort removes
+    the face ordering. Measured on an icosphere with every third face reversed, the two agree face
+    for face **without** needing the global-flip escape -- both anchor on the first face of the
+    component -- so the test asserts the strict form and would catch a flip if one appeared.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    flipped_np = mesh_tm.faces.copy()
+    flipped_np[::3] = flipped_np[::3][:, ::-1]
+
+    faces_wp = wp.array(
+        np.ascontiguousarray(flipped_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
+    )
+    repaired_wp = tw.repair.make_winding_consistent(faces_wp)
+
+    meshset_pml = ml.MeshSet()
+    meshset_pml.add_mesh(
+        ml.Mesh(
+            np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),
+            np.ascontiguousarray(flipped_np, dtype=np.int32),
+        )
+    )
+    meshset_pml.meshing_re_orient_faces_coherently()
+    faces_pml = meshset_pml.current_mesh().face_matrix()
+
+    assert np.array_equal(
+        lexsort_rows(canonical_winding(repaired_wp.numpy())),
+        lexsort_rows(canonical_winding(faces_pml)),
+    )
+    assert tw.validation.is_winding_consistent(repaired_wp)
+
+
+@pytest.mark.parity("make_winding_consistent", "trimesh")
 def test_make_winding_consistent_repairs_flipped(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     mesh_tm, mesh_wp = icosahedron
     faces_flipped = mesh_tm.faces.copy()
@@ -770,6 +866,7 @@ def test_remove_folded_faces_drops_the_fold(device: str) -> None:
     )
 
 
+@pytest.mark.parity("bad_face_mask", "pymeshlab")
 def test_remove_folded_faces_matches_pymeshlab_on_which_faces_are_folded(device: str) -> None:
     """
     MeshLab flips the fold where this deletes it, so compare the *detection*, not the output.

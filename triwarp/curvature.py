@@ -74,7 +74,11 @@ def principal_curvature(
         n_vertices, vertices, faces, face_normals, face_areas
     )
 
-    # Average edge length (per-face, matching libigl's getAverageEdge) for sphere-radius scaling.
+    # ``mean_edge_length`` is the per-face average, matching libigl's
+    # ``CurvatureCalculator::getAverageEdge`` -- the one ``igl::principal_curvature`` uses to set
+    # ``scaledRadius``. Not ``mean_unique_edge_length``: switching to it takes the mean deviation
+    # from ``igl.principal_curvature`` on an open half-torus from 0.0056 to 0.0117 and drops the
+    # within-5% fraction from 99.3% to 98.5%.
     avg_edge = tw.edges.mean_edge_length(vertices, faces)
     scaled_radius = float(radius) * avg_edge
 

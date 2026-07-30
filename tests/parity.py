@@ -87,6 +87,39 @@ _LIBRARY_SUFFIXES: dict[str, frozenset[str]] = {
     "pymeshlab": frozenset({"_pml"}),
 }
 
+# The second half of the anti-vacuity signal: a test may consult a reference without ever naming
+# the result, e.g. ``_assert_same_faces(v_wp, f_wp, tm.creation.cylinder(...))``. Calling into the
+# library's own module is as good a trace as binding a suffixed variable, so either satisfies the
+# check. Roots are matched exactly against the import aliases each suite actually uses.
+_LIBRARY_ROOTS: dict[str, frozenset[str]] = {
+    "trimesh": frozenset(
+        {
+            "tm",
+            "tms",
+            "tm_geometry",
+            "tm_grouping",
+            "tm_repair",
+            "tm_proximity",
+            "tm_reg",
+            "tm_segments",
+            "tm_traversal",
+            "tm_intersections",
+            "tm_curvature",
+            "tm_points",
+            "tm_sample",
+        }
+    ),
+    "igl": frozenset({"igl", "igl_module"}),
+    "open3d": frozenset({"o3d", "trimesh_to_open3d", "points_to_open3d", "open3d_to_trimesh"}),
+    "scipy": frozenset(
+        {"sp", "scipy", "spla", "KDTree", "cKDTree", "csgraph", "Delaunay", "ConvexHull"}
+    ),
+    "potpourri3d": frozenset({"pp3d"}),
+    "pymeshlab": frozenset(
+        {"ml", "trimesh_to_pymeshlab", "warp_to_pymeshlab", "points_to_pymeshlab"}
+    ),
+}
+
 
 @dataclass(frozen=True)
 class Site:
@@ -120,7 +153,10 @@ class Claim:
     library: str
     site: Site
     names: frozenset[str]
-    """Every name assigned in the test's body, for the anti-vacuity suffix check."""
+    """Every name assigned in the test's body, for the anti-vacuity check."""
+
+    roots: frozenset[str]
+    """Every dotted-call root used in the body, for the anti-vacuity check."""
 
 
 @dataclass
@@ -409,6 +445,7 @@ def scan_tests() -> TestScan:
                 continue
             where = f"{relative}:{node.lineno}"
             names = frozenset(_assigned_names(node))
+            roots = frozenset(_called_roots(node))
             groups_seen: set[str] = set()
 
             for decorator in node.decorator_list:
@@ -442,10 +479,30 @@ def scan_tests() -> TestScan:
                     continue
                 site = Site(relative, node.lineno, node.name)
                 for library in libraries:
-                    scan.claims.append(Claim(group, library, site, names))
+                    scan.claims.append(Claim(group, library, site, names, roots))
 
         scan.errors.extend(_unconsumed(tree, _TEST_MARKERS, consumed, relative))
     return scan
+
+
+def _called_roots(node: ast.FunctionDef) -> set[str]:
+    """
+    Collect the base name of every call and attribute chain in a test's body.
+
+    ``tm.creation.cylinder(...)`` contributes ``tm``, ``mesh_tm.outline()`` contributes ``mesh_tm``.
+    Half of the anti-vacuity signal: a test may consult a reference inline without ever binding its
+    result to a name, which the suffix half alone would read as a triwarp-only test.
+    """
+    roots: set[str] = set()
+    for child in ast.walk(node):
+        if not isinstance(child, (ast.Call, ast.Attribute)):
+            continue
+        current: ast.expr = child
+        while isinstance(current, (ast.Attribute, ast.Call, ast.Subscript)):
+            current = current.func if isinstance(current, ast.Call) else current.value
+        if isinstance(current, ast.Name):
+            roots.add(current.id)
+    return roots
 
 
 def _assigned_names(node: ast.FunctionDef) -> set[str]:
@@ -483,23 +540,33 @@ def reason_problem(exemption: Exemption) -> str | None:
 
 def suffix_problem(claim: Claim) -> str | None:
     """
-    Describe why a claim looks vacuous, or ``None`` when it names a reference variable.
+    Describe why a claim looks vacuous, or ``None`` when the test really consults the reference.
 
     A ``parity`` marker is a self-assertion, and the likeliest way for one to be wrong is to sit on
-    a test that only compares triwarp with itself (a precomputed-argument shortcut, say). Requiring
-    the CLAUDE.md reference-variable suffix catches that statically. Matching on suffixes rather
-    than imports is deliberate: ``tests/test_convex.py`` compares against trimesh throughout without
-    ever importing it, because the comparison arrives as ``mesh_tm`` from a fixture tuple.
+    a test that only compares triwarp with itself -- a precomputed-argument shortcut, or an
+    invariant check. Two signals count as consulting the reference, and either suffices:
+
+    - a **name** carrying the CLAUDE.md reference-variable suffix (``_tm`` / ``_igl`` / ``_pp`` /
+      ``_pml`` / ``_o3d``, plus ``_np`` where the oracle is hand-rolled NumPy). Matching on suffixes
+      rather than on imports is deliberate: ``tests/test_convex.py`` compares against trimesh
+      throughout without ever importing it, because the comparison arrives as ``mesh_tm`` from a
+      fixture tuple;
+    - a **call rooted at the library**, for the tests that pass the reference inline and never name
+      it -- ``_assert_same_faces(vertices_wp, faces_wp, tm.creation.cylinder(...))`` throughout
+      ``tests/test_creation.py``. Requiring a binding there would be asking for a variable that
+      exists only to satisfy this check.
     """
     suffixes = _LIBRARY_SUFFIXES.get(claim.library)
     if suffixes is None:
         return None
     if any(name.endswith(suffix) for name in claim.names for suffix in suffixes):
         return None
+    if claim.roots & _LIBRARY_ROOTS.get(claim.library, frozenset()):
+        return None
     expected = " / ".join(f"*{suffix}" for suffix in sorted(suffixes))
     return (
-        f"claims {claim.library!r} but binds no {expected} variable; a parity test must read the "
-        "reference's answer, not compare triwarp with itself"
+        f"claims {claim.library!r} but neither binds a {expected} variable nor calls into it; "
+        "a parity test must read the reference's answer, not compare triwarp with itself"
     )
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
@@ -34,6 +35,7 @@ def _signed_volume(vertices_np: np.ndarray, faces_np: np.ndarray) -> float:
     return float(np.einsum("ij,ij->i", tris[:, 0], np.cross(tris[:, 1], tris[:, 2])).sum() / 6.0)
 
 
+@pytest.mark.parity("subdivide", "trimesh")
 def test_subdivide(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     mesh_tm, mesh_wp = icosahedron
 
@@ -99,6 +101,7 @@ _MESH_FIXTURES = ["icosahedron", "half_torus", "cave_cube", "hemisphere"]
 _CLOSED_FIXTURES = ["icosahedron", "cave_cube"]
 
 
+@pytest.mark.parity("subdivide_to_size", "trimesh")
 def test_subdivide_to_size_reference_regular(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """A single pass on a regular mesh (all faces 1->4) matches trimesh exactly."""
     mesh_tm, mesh_wp = icosahedron
@@ -852,6 +855,39 @@ def test_intrinsic_delaunay_leaves_a_delaunay_mesh_alone(
 
 
 @pytest.mark.parametrize("mesh_name", ["half_torus", "torus"])
+@pytest.mark.parity("intrinsic_delaunay", "igl")
+def test_intrinsic_delaunay_metric_matches_igl(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    """
+    The intrinsic metric after flipping, against libigl's serial flipper.
+
+    The two cannot be compared face for face: triwarp flips independent sets in parallel rounds
+    where libigl drains a queue, so the *sequence* differs and so does the face ordering. What must
+    agree is where they land, because the intrinsic Delaunay triangulation of a surface is unique
+    away from cocircular degeneracies -- so the multiset of edge lengths is the invariant, and this
+    is class B with a sort rather than a weakened tolerance.
+
+    That makes it a real check rather than a formality: on ``half_torus`` triwarp performs **298**
+    flips and still reaches libigl's metric to 1e-4, which a wrong flip rule or a mis-unfolded
+    diagonal would not. ``igl.intrinsic_delaunay_cotmatrix`` is used for its second return value
+    (the lengths); it assembles a matrix as well, which is why the benchmark reads its row as
+    including work triwarp's does not.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    _lengths_igl = igl.intrinsic_delaunay_cotmatrix(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64), mesh_tm.faces.astype(np.int64)
+    )[1]
+
+    _faces_wp, lengths_wp, n_flips = tw.remesh.intrinsic_delaunay(mesh_wp.points, mesh_wp.indices)
+
+    assert n_flips > 0, "fixture is already Delaunay; this would assert nothing"
+    assert np.allclose(
+        np.sort(lengths_wp.numpy().ravel()), np.sort(_lengths_igl.ravel()), rtol=1e-4, atol=1e-4
+    )
+
+
+@pytest.mark.parametrize("mesh_name", ["half_torus", "torus"])
 def test_intrinsic_delaunay_flips_a_grid_and_preserves_the_metric(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -877,6 +913,7 @@ def test_intrinsic_delaunay_flips_a_grid_and_preserves_the_metric(
 
 @pytest.mark.parametrize("voxel_size", [0.1, 0.3])
 @pytest.mark.parametrize("contraction", ["average", "closest"])
+@pytest.mark.parity("cluster_decimate", "open3d")
 def test_cluster_decimate_matches_open3d(device: str, voxel_size: float, contraction: str) -> None:
     """
     Cell assignment is Open3D's, so the face count must match exactly, not approximately.
@@ -1066,6 +1103,7 @@ def test_flip_by_objective_planarity_improves_the_worst_triangle(device: str) ->
     assert _degenerate_face_count(vertices_np, flipped_wp.numpy().reshape(-1, 3)) == 0
 
 
+@pytest.mark.parity("flip_by_objective", "pymeshlab")
 def test_flip_by_objective_planarity_at_least_matches_pymeshlab(device: str) -> None:
     """
     MeshLab runs the same objective serially, so it is a bar on how many flips this port finds.
@@ -1184,6 +1222,7 @@ def _inverted_face_count(vertices_np: np.ndarray, faces_np: np.ndarray) -> int:
 
 
 @pytest.mark.parametrize("target_faces", [2560, 1024, 512])
+@pytest.mark.parity("quadric_decimate", "igl", "open3d")
 def test_quadric_decimate_beats_igl_and_open3d_on_deviation(device: str, target_faces: int) -> None:
     """
     At the same face count this port must be no *worse* than the two serial references.
@@ -1286,6 +1325,7 @@ def test_quadric_decimate_keeps_the_features_of_a_cube(device: str) -> None:
     assert np.percentile(angles_np, 95.0) > 85.0
 
 
+@pytest.mark.parity("quadric_decimate", "pymeshlab")
 def test_quadric_decimate_reaches_pymeshlab_quality(device: str) -> None:
     """
     ``meshing_decimation_quadric_edge_collapse`` is the same metric, driven serially.
