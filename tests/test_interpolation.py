@@ -23,7 +23,17 @@ def test_average_onto_faces(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     assert np.allclose(face_values_wp.numpy(), face_values_igl, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parity("average_onto_vertices", "pymeshlab")
 def test_average_onto_vertices(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A against libigl, class B against MeshLab's face-to-vertex scalar transfer.
+
+    ``compute_scalar_transfer_face_to_vertex`` reads the *face* scalar attribute and writes the
+    *vertex* one rather than taking and returning arrays, so the transform is seeding
+    ``f_scalar_array`` on the way in and reading ``vertex_scalar_array()`` on the way out.
+    ``areaweight=False`` is load-bearing and is what the benchmark passes: its default weights each
+    incident face by area, where this function takes the plain corner mean.
+    """
     mesh_tm, mesh_wp = half_torus
     rng = np.random.default_rng(1)
 
@@ -33,11 +43,23 @@ def test_average_onto_vertices(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     face_values_np = rng.uniform(size=mesh_tm.faces.shape[0])
     vertex_values_igl = igl.average_onto_vertices(vertices_np, faces_np, face_values_np)
 
+    meshset_pml = ml.MeshSet()
+    meshset_pml.add_mesh(
+        ml.Mesh(
+            np.ascontiguousarray(vertices_np),
+            np.ascontiguousarray(mesh_tm.faces, dtype=np.int32),
+            f_scalar_array=np.ascontiguousarray(face_values_np),
+        )
+    )
+    meshset_pml.compute_scalar_transfer_face_to_vertex(areaweight=False)
+    vertex_values_pml = np.asarray(meshset_pml.current_mesh().vertex_scalar_array())
+
     face_values_wp = wp.array(face_values_np, dtype=wp.float32, device=mesh_wp.device)
     vertex_values_wp = tw.interpolation.average_onto_vertices(
         n_vertices, mesh_wp.indices, face_values_wp
     )
     assert np.allclose(vertex_values_wp.numpy(), vertex_values_igl, rtol=1e-5, atol=1e-5)
+    assert np.allclose(vertex_values_wp.numpy(), vertex_values_pml, rtol=1e-5, atol=1e-5)
 
 
 def test_average_from_edges_onto_vertices(half_torus: tuple[tm.Trimesh, wp.Mesh]):

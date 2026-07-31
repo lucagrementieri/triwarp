@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import numpy as np
+import open3d as o3d
 import pytest
 import trimesh as tm
 import trimesh.repair as tm_repair
 import warp as wp
 
 import triwarp as tw
+from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab
 from triwarp.hole_filling import _non_increasing_indices
 
 # Open-surface fixtures that actually have a boundary to fill.
@@ -498,6 +500,103 @@ def test_fill_holes_min_weight_watertight(
     )
     assert filled_tm.is_watertight
     assert filled_tm.is_winding_consistent
+
+
+def _sealed_volume(vertices_np: np.ndarray, faces_np: np.ndarray) -> float:
+    """
+    Enclosed volume of a sealed mesh, after canonicalising the winding.
+
+    The ``fix_winding`` pass is load-bearing for Open3D: ``fill_holes`` emits its cap triangles
+    wound
+    *against* the rest of the mesh, so a raw signed-volume read of its output is meaningless (-1.06
+    on ``hemisphere``, where the true volume is 2.02). Repairing the winding first is the named
+    transform that makes the three libraries' volumes comparable.
+    """
+    mesh_tm = tm.Trimesh(vertices_np, np.asarray(faces_np).reshape(-1, 3), process=False)
+    tm_repair.fix_winding(mesh_tm)
+    return float(mesh_tm.volume)
+
+
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+@pytest.mark.parity("fill_holes_min_weight", "open3d", "pymeshlab")
+def test_fill_holes_min_weight_matches_open3d_and_pymeshlab(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class C: three hole fillers pick three different triangulations of the same loop.
+
+    All three seal the identical boundary with the identical budget -- ``B - 2`` triangles over the
+    existing vertices only -- but no two agree triangle for triangle, so there is no correspondence
+    to recover and the comparison has to be on the sealed *surface* plus the achieved optimum.
+    Open3D's is read through the tensor API (``o3d.t`` ``fill_holes``) and MeshLab's through
+    ``meshing_close_holes``, whose default ``maxholesize=30`` would close nothing on these rims, so
+    the cap is lifted exactly as the benchmark lifts it.
+
+    Three asserts. The counts are class A: same vertex count, same face count, and every added
+    triangle drawn only from the boundary loops. The **volume** is class B under the named
+    [`_sealed_volume`][tests.test_hole_filling._sealed_volume] transform -- these rims are planar,
+    so the enclosed volume is triangulation-invariant and all three must agree exactly. And the
+    **cost** is the optimality claim: triwarp runs the exact minimum-weight DP, so its
+    ``plane_normalized`` cost must be no worse than either reference's triangulation of the same
+    loop.
+
+    **Bug class excluded:** a DP that finds a valid but *suboptimal* triangulation -- the failure
+    the volume and count asserts are both blind to, since every triangulation of a planar rim has
+    the same volume and the same triangle count.
+
+    **Mutation probe, measured:** on ``hemisphere`` the costs are triwarp **290.7**, MeshLab 1 821.1
+    (6.3x) and Open3D 827.3 (2.8x); on ``half_torus`` **686.0** against 2 740.6 (4.0x) and 1 127.9
+    (1.6x). The bound is not one any answer passes: this module's own
+    [`fill_holes_fan`][triwarp.hole_filling.fill_holes_fan] emits the same ``B - 2`` triangles over
+    the same vertices and scores 860.1 and 3 509.5 -- it *fails* against Open3D on both fixtures.
+    ``zeros_like`` and "return the input faces" fail at the face-count assert.
+    """
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh_tm = tm.Trimesh(
+        vertices=mesh_wp.points.numpy().astype(np.float64),
+        faces=mesh_wp.indices.numpy().reshape(-1, 3),
+        process=False,
+    )
+    vertices_np = mesh_tm.vertices
+    n_original = int(mesh_wp.indices.shape[0])
+
+    filled_wp = tw.hole_filling.fill_holes_min_weight(mesh_wp.points, mesh_wp.indices).numpy()
+
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    statistics_pml = meshset_pml.meshing_close_holes(maxholesize=1_000_000)
+    assert statistics_pml["closed_holes"] > 0
+    faces_pml = np.asarray(meshset_pml.current_mesh().face_matrix())
+    assert np.allclose(meshset_pml.current_mesh().vertex_matrix(), vertices_np, atol=1e-6)
+
+    # The tensor mesh must be held in a name: chaining ``from_legacy(...).fill_holes()`` lets the
+    # temporary be collected and the result's ``positions`` then read freed memory (observed as
+    # 2052.1 and 4.4e-41 in the first rows) rather than raising.
+    tensor_o3d = o3d.t.geometry.TriangleMesh.from_legacy(trimesh_to_open3d(mesh_tm))
+    mesh_o3d = tensor_o3d.fill_holes()
+    faces_o3d = mesh_o3d.triangle["indices"].numpy()
+    assert np.allclose(mesh_o3d.vertex["positions"].numpy(), vertices_np, atol=1e-6)
+
+    loop_vertices = {
+        int(vertex)
+        for loop_wp in _fillable_loops(mesh_wp.points, mesh_wp.indices)
+        for vertex in loop_wp.numpy()
+    }
+    cost_wp = _total_fill_metric(
+        mesh_wp.points, mesh_wp.indices, filled_wp[n_original:], "plane_normalized"
+    )
+    for faces_ref in (faces_pml, faces_o3d):
+        assert faces_ref.shape[0] == filled_wp.shape[0] // 3
+        added_ref = np.asarray(faces_ref).reshape(-1)[n_original:].astype(np.int32)
+        assert set(np.unique(added_ref).tolist()) <= loop_vertices
+        assert np.isclose(
+            _sealed_volume(vertices_np, filled_wp),
+            _sealed_volume(vertices_np, faces_ref),
+            rtol=1e-5,
+        )
+        cost_ref = _total_fill_metric(
+            mesh_wp.points, mesh_wp.indices, added_ref, "plane_normalized"
+        )
+        assert cost_wp <= cost_ref, f"the minimum-weight DP scored worse: {cost_wp} > {cost_ref}"
 
 
 def _punched_sphere(n_holes: int, seed: int = 5) -> tuple[np.ndarray, np.ndarray]:

@@ -217,11 +217,18 @@ def test_ball_pivoting(bench_case: BenchCase) -> None:
     if bench_case.kind == "pymeshlab":
         # VCGlib's original BPA, given the identical absolute radius via ``PureValue`` (its default
         # ``0%`` autoguesses one, which would compare two different algorithms' parameters).
-        # ``clustering=0`` disables the merge-nearby-vertices step triwarp does not do.
+        #
+        # ``clustering`` stays at MeshLab's default 20%: at ``0`` the filter reconstructs
+        # **nothing** -- measured 0 faces against 1 277 at the default, on the same cloud and the
+        # same radius -- and returns in 9.6 ms against 2.7 ms, so this row previously timed a
+        # failure and read *slower* for it. The clustering fraction is a seed-triangle spacing
+        # floor, not an optional post-pass. At the default the two agree: 1 277 faces against
+        # triwarp's 1 280, asserted in
+        # tests/test_reconstruction.py::test_ball_pivoting_matches_pymeshlab.
         cloud_pml = _cloud_meshset_pml(bench_case)
         bench_case.run(
             lambda: cloud_pml.generate_surface_reconstruction_ball_pivoting(
-                ballradius=ml.PureValue(radius), clustering=0.0
+                ballradius=ml.PureValue(radius), clustering=20.0
             ),
             rounds=_HEAVY_ROUNDS,
         )

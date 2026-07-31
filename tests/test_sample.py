@@ -5,12 +5,15 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
+from scipy.spatial import cKDTree
 from scipy.spatial.distance import pdist
 
 import triwarp as tw
+from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab
 
 
 def test_sample_surface(half_torus: tuple[tm.Trimesh, wp.Mesh]):
@@ -161,6 +164,101 @@ def test_sample_surface_blue_noise_count_order_of_magnitude(
         surface_area * (math.pi * math.sqrt(3.0) / 6.0) / (math.pi * radius * radius / 4.0)
     )
     assert 0.5 * igl_expected <= n <= 1.5 * igl_expected
+
+
+def _blue_noise_statistics(
+    mesh_tm: tm.Trimesh, points_np: np.ndarray, radius: float, dense_np: np.ndarray
+) -> tuple[float, float, int]:
+    """
+    Return the three radius-relative quantities comparable across blue-noise samplers.
+
+    Returns the closest pair as a multiple of ``radius`` (the Poisson-disk property itself), the
+    worst uncovered gap as a multiple of ``radius`` (how space-filling the set is, measured against
+    a dense uniform sample of the same surface), and the number of faces carrying at least one
+    sample.
+    """
+    points_np = np.asarray(points_np, dtype=np.float64).reshape(-1, 3)
+    _closest, _distance, face_index_np = tm.proximity.closest_point(mesh_tm, points_np)
+    return (
+        float(pdist(points_np).min()) / radius,
+        float(cKDTree(points_np).query(dense_np)[0].max()) / radius,
+        int(np.unique(face_index_np).shape[0]),
+    )
+
+
+@pytest.mark.parity("blue_noise", "open3d", "pymeshlab")
+def test_sample_surface_blue_noise_matches_open3d_and_pymeshlab(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Class C: three blue-noise samplers, three algorithms, no correspondence between the point sets.
+
+    triwarp does Bridson dart throwing on a background grid, Open3D's ``sample_points_poisson_disk``
+    runs Yuksel's sample *elimination* from a dense uniform cloud, and MeshLab's
+    ``generate_sampling_poisson_disk`` is Corsini et al.'s hierarchical dart throwing. Nothing about
+    the individual samples is shared -- not their count, not their positions, not even their number
+    given the same parameter -- so the comparison is on the properties all three claim. MeshLab is
+    the only reference that accepts a *radius* (``radius=PureValue(r)`` overrides ``samplenum``), so
+    it gets triwarp's own parameter; Open3D takes a count and gets triwarp's output count, exactly
+    as the benchmark parametrizes them.
+
+    **Bug class excluded:** a sampler that is not blue noise at all (assert 1) and one that is blue
+    noise over only part of the surface (asserts 2 and 3). Both are live failure modes for a
+    grid-based dart thrower -- a mis-sized background cell rejects too little, a mis-mapped cell-to-
+    face seeding covers too little -- and neither is visible to
+    ``test_sample_surface_blue_noise_min_distance``, which tests triwarp against itself.
+
+    **Measured, with both mutation probes.** Two degenerate stand-ins are scored alongside: a
+    uniform Monte-Carlo cloud of the *same size* (blue noise's null hypothesis) and one confined to
+    4 of the 20 faces.
+
+    | | closest pair / r | worst gap / r | faces hit |
+    |---|---|---|---|
+    | triwarp | 1.000 | 1.056 | 20 / 20 |
+    | MeshLab, same radius | 1.000 | 1.076 | 20 / 20 |
+    | Open3D, same count | 0.891 | 1.327 | 20 / 20 |
+    | uniform Monte Carlo | **0.008** | 1.763 | 20 / 20 |
+    | one patch | **0.005** | **17.680** | **4 / 20** |
+
+    So assert 1 (``>= 0.85``) clears the worst reference by 4.8% and both probes by **>100x** -- it
+    is the assert carrying the bug class. Assert 3 (every face hit) is what separates the clumped
+    probe, by a factor of 5. Assert 2 (worst gap ``<= 1.4``) is the weakest of the three at a 1.25x
+    margin over the Monte-Carlo probe, and it is applied only to triwarp and MeshLab: Open3D's
+    elimination sampler genuinely leaves larger gaps on a 20-face mesh (1.327), which is a property
+    of its algorithm rather than a disagreement. Sample *counts* at the identical radius are 791
+    against MeshLab's 769, 2.9% apart against a 25% bound (8.6x margin).
+    """
+    mesh_tm, mesh_wp = icosahedron
+    radius = _blue_noise_radius_for_count(float(mesh_tm.area), 300)
+    dense_np, _face_index = tm.sample.sample_surface(mesh_tm, 20_000, seed=3)
+
+    points_wp, _face_index_wp = tw.sample.sample_surface_blue_noise(
+        mesh_wp.points, mesh_wp.indices, radius, seed=11
+    )
+    n_samples = int(points_wp.shape[0])
+
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    meshset_pml.generate_sampling_poisson_disk(radius=ml.PureValue(radius))
+    points_pml = np.asarray(meshset_pml.current_mesh().vertex_matrix(), dtype=np.float64)
+
+    points_o3d = np.asarray(
+        trimesh_to_open3d(mesh_tm).sample_points_poisson_disk(number_of_points=n_samples).points
+    )
+
+    closest_wp, gap_wp, faces_wp = _blue_noise_statistics(
+        mesh_tm, points_wp.numpy(), radius, dense_np
+    )
+    closest_pml, gap_pml, faces_pml = _blue_noise_statistics(mesh_tm, points_pml, radius, dense_np)
+    closest_o3d, _gap_o3d, faces_o3d = _blue_noise_statistics(mesh_tm, points_o3d, radius, dense_np)
+
+    # 1. The Poisson-disk property, on all three.
+    assert min(closest_wp, closest_pml, closest_o3d) >= 0.85
+    # 2. Space-filling, against the reference that received the identical radius.
+    assert max(gap_wp, gap_pml) <= 1.4
+    # 3. Every face reached, on all three.
+    assert faces_wp == faces_pml == faces_o3d == mesh_tm.faces.shape[0]
+    # 4. And the radius parametrization agrees: the same radius yields the same order of samples.
+    assert 0.8 <= n_samples / points_pml.shape[0] <= 1.25
 
 
 def test_sample_surface_blue_noise_radius_invalid(icosahedron: tuple[tm.Trimesh, wp.Mesh]):

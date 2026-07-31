@@ -192,6 +192,20 @@ def test_flip_to_delaunay(bench_case: BenchCase) -> None:
     assert int(flipped.shape[0]) == int(faces.shape[0])
 
 
+@pytest.mark.noparity(
+    "pymeshlab",
+    reason="D2 the same five stages under a different stopping rule, with the disagreement "
+    "measured and tabulated in this function's own docstring: triwarp runs a fixed iterations x "
+    "five parallel launches while MeshLab works a serial local-operation queue until the "
+    "operations stop paying off, so at iterations=3 and the identical target length the two "
+    "return different meshes with no vertex correspondence -- 39 100 faces against 34 946 on "
+    "saddle, and on saddle_graded triwarp misses the target edge length by 27% (0.73 of target "
+    "against 0.98) and leaves a 99th-percentile "
+    "aspect ratio of 352 against 1.87. That gap is the finding this row exists to report, not a "
+    "tolerance to widen; the quality statistics themselves are asserted against the *input* in "
+    "tests/test_remesh.py, in test_remesh_edge_concentration and "
+    "test_remesh_emits_no_degenerate_faces, rather than against MeshLab.",
+)
 @pytest.mark.benchmark(group="isotropic_remesh")
 @pytest.mark.benchaxis("quality")
 @pytest.mark.benchlibs("triwarp", "pymeshlab")
@@ -295,6 +309,19 @@ def test_intrinsic_delaunay(bench_case: BenchCase) -> None:
 _CLUSTER_FACTORS = [2.0, 6.0]
 
 
+@pytest.mark.noparity(
+    "pymeshlab",
+    oracle="open3d",
+    reason="D2 a differently anchored grid with a different cell representative, and open3d is "
+    "the exact oracle right beside it: meshing_decimation_clustering keeps a per-cell "
+    "representative on a grid whose origin is not open3d's min_bound - voxel_size / 2, so at the "
+    "same threshold it returns measurably different meshes -- 2 792 faces against triwarp's 2 768 "
+    "at a 0.1 cell on icosphere(4), then 656 against 768 at 0.2 and 156 against 252 at 0.4, i.e. "
+    "1% to 62% apart and diverging as the cell grows. open3d assigns cells identically and is "
+    "asserted to the exact face and vertex count in "
+    "tests/test_remesh.py::test_cluster_decimate_matches_open3d, which also pins the grid anchor; "
+    "MeshLab cannot be a second oracle for a quantity open3d already fixes exactly.",
+)
 @pytest.mark.benchmark(group="cluster_decimate")
 @pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab")
 @pytest.mark.parametrize("cell_factor", _CLUSTER_FACTORS)

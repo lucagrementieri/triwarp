@@ -9,7 +9,8 @@ import warp as wp
 import triwarp.neighbors as tw_neighbors
 import triwarp.points as tw
 import triwarp.typing as twt
-from tests.conversions import points_to_open3d
+from tests.comparisons import assert_same_up_to_sign
+from tests.conversions import points_to_open3d, points_to_pymeshlab
 
 
 def _fibonacci_sphere(n: int) -> np.ndarray:
@@ -104,12 +105,34 @@ def test_centered_covariance_precomputed_center(device: str) -> None:
     assert np.allclose(cov_wp.numpy()[0], scatter_np, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.parity("fit_plane", "trimesh")
+@pytest.mark.parity("fit_plane", "trimesh", "pymeshlab")
 def test_fit_plane(device: str) -> None:
+    """
+    Class B against both references, each needing one named transform.
+
+    trimesh's ``plane_fit`` returns the centroid and normal directly. **MeshLab** returns a *dict*,
+    so the transform is the ``"fitting_plane_normal"`` key -- the rotation matrix and average error
+    it also builds are work triwarp does not do. Two of its quirks are load-bearing and match what
+    the benchmark passes: it raises ``Cannot compute rotation: there is no selection`` unless
+    something is selected, so ``set_selection_all`` is how it is told to fit *all* the points; and
+    it takes a face-less MeshSet, which is what these bare points are. Both references leave the
+    normal
+    **sign** free (it is a covariance eigenvector), so all three are compared up to sign.
+    """
     rng = np.random.default_rng(3)
     points_np = rng.standard_normal((80, 3))
 
     centroid_tm, normal_tm = tm.plane_fit(points_np)
+
+    meshset_pml = points_to_pymeshlab(points_np)
+    meshset_pml.set_selection_all()
+    normal_pml = np.asarray(
+        meshset_pml.compute_matrix_by_fitting_to_plane(targetplane="XY plane")[
+            "fitting_plane_normal"
+        ],
+        dtype=np.float64,
+    )
+    normal_pml /= np.linalg.norm(normal_pml)
 
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
     centroid_wp, normal_wp = tw.fit_plane(points_wp)
@@ -117,6 +140,7 @@ def test_fit_plane(device: str) -> None:
     assert np.allclose(np.array(centroid_wp), centroid_tm, rtol=1e-4, atol=1e-4)
     # normal is sign-ambiguous: compare up to sign.
     assert np.isclose(np.abs(np.dot(np.array(normal_wp), normal_tm)), 1.0, atol=1e-4)
+    assert np.isclose(np.abs(np.dot(np.array(normal_wp), normal_pml)), 1.0, atol=1e-4)
 
 
 def test_covariance(device: str) -> None:
@@ -249,8 +273,21 @@ def test_radial_sort_parallel_start_raises(device: str) -> None:
         )
 
 
-@pytest.mark.parity("estimate_normals_knn", "open3d")
+@pytest.mark.parity("estimate_normals_knn", "open3d", "pymeshlab")
 def test_estimate_normals_matches_open3d(device: str) -> None:
+    """
+    Class B against both references: the same search-plus-PCA, with the normal's sign left free.
+
+    Both fix the smallest-eigenvalue covariance eigenvector and neither fixes its direction, so the
+    named transform on all three sides is ``|dot| == 1``. **MeshLab** additionally needs
+    ``smoothiter=0`` -- its default runs a normal-smoothing pass afterwards, which triwarp does not
+    do -- and a face-less MeshSet, since ``compute_normal_for_point_clouds`` is for datasets with no
+    faces. Both parameters are the ones the benchmark passes.
+
+    MeshLab agrees essentially exactly (worst measured ``|dot|`` 0.9999999), so it gets a hard
+    bound; Open3D disagrees on a handful of points because the two break k-nearest *ties*
+    differently, which is why its assert is a fraction rather than a per-point bound.
+    """
     knn = 30
     points_np = _fibonacci_sphere(2000)
 
@@ -258,6 +295,10 @@ def test_estimate_normals_matches_open3d(device: str) -> None:
     pcd = points_to_open3d(points_np)
     pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=knn))
     normals_o3d = np.asarray(pcd.normals)
+
+    meshset_pml = points_to_pymeshlab(points_np)
+    meshset_pml.compute_normal_for_point_clouds(k=knn, smoothiter=0)
+    normals_pml = np.asarray(meshset_pml.current_mesh().vertex_normal_matrix())
 
     # triwarp: build the same k-neighbourhood (self + knn-1 = knn points total), then PCA.
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
@@ -269,6 +310,7 @@ def test_estimate_normals_matches_open3d(device: str) -> None:
     # majority to align.
     abs_dots = np.abs(np.einsum("ij,ij->i", normals_wp.numpy(), normals_o3d))
     assert np.mean(abs_dots > 0.99) > 0.98
+    assert_same_up_to_sign(normals_wp.numpy(), normals_pml, atol=1e-5)
 
 
 def test_estimate_normals_orientation(device: str) -> None:

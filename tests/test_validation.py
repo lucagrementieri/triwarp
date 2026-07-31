@@ -8,6 +8,7 @@ import trimesh.repair as tm_repair
 import warp as wp
 
 import triwarp as tw
+from tests.comparisons import canonical_winding
 from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab
 
 CLOSED_MESHES = ["icosahedron", "cave_cube"]
@@ -487,12 +488,7 @@ def _triangle_ribbon(n_quads: int) -> tuple[np.ndarray, np.ndarray]:
     return vertices, faces
 
 
-def _canonical_winding(faces_np: np.ndarray) -> np.ndarray:
-    """Rotate each triangle to start at its smallest index; equal iff the winding is equal."""
-    roll = np.argmin(faces_np, axis=1)
-    return np.take_along_axis(faces_np, (roll[:, None] + np.arange(3)) % 3, axis=1)
-
-
+@pytest.mark.parity("face_orientation_bits", "trimesh")
 def test_face_orientation_mask_long_path(device: str) -> None:
     """
     A ribbon whose face-adjacency graph is a path of 8 192 nodes.
@@ -502,6 +498,14 @@ def test_face_orientation_mask_long_path(device: str) -> None:
     [`face_orientation_bits`][triwarp.validation.face_orientation_bits] is depth-independent. The
     answer is unique because the component representative is the smallest face id, so face 0 keeps
     its winding and every other face is determined relative to it.
+
+    Class B against ``trimesh.repair.fix_winding``, the flood fill the benchmark times. Two named
+    transforms. The reference *rewrites the mesh* rather than returning bits, so triwarp's bits are
+    applied via [`make_winding_consistent`][triwarp.repair.make_winding_consistent] to compare the
+    two rewritten face arrays; and a flip is emitted as a rotation of the reversed triangle, so both
+    go through [`tests.comparisons.canonical_winding`][] -- which is insensitive to the starting
+    corner and still sensitive to the orientation under test. No global sign fix is needed: both
+    libraries anchor on the lowest-numbered face of each component, so the answer is unique.
     """
     vertices_np, faces_np = _triangle_ribbon(4096)
     rng = np.random.default_rng(7)
@@ -511,7 +515,9 @@ def test_face_orientation_mask_long_path(device: str) -> None:
     _, faces_wp = _mesh_to_wp(vertices_np, flipped_np, device)
 
     assert tw.validation.is_orientable(faces_wp) is True
+    bits_wp, _signed_edges_wp, _signs_wp, _m = tw.validation.face_orientation_bits(faces_wp)
     mask_np = tw.validation.face_orientation_mask(faces_wp).numpy()
+    assert np.array_equal(mask_np, bits_wp.numpy().astype(bool))
     assert bool(mask_np[0]) is False
     assert np.array_equal(mask_np, scrambled_np != scrambled_np[0])
 
@@ -519,14 +525,18 @@ def test_face_orientation_mask_long_path(device: str) -> None:
     # Compared as cyclic windings: a flip is emitted as a rotation of the reversed triangle.
     repaired_np = tw.repair.make_winding_consistent(faces_wp).numpy().reshape(-1, 3)
     expected_np = faces_np[:, ::-1] if scrambled_np[0] else faces_np
-    assert np.array_equal(_canonical_winding(repaired_np), _canonical_winding(expected_np))
+    assert np.array_equal(canonical_winding(repaired_np), canonical_winding(expected_np))
     assert tw.validation.is_winding_consistent(faces_wp) is False
 
     # trimesh reference: its fix_winding is a flood fill over the same face-adjacency graph, and
     # agrees face for face (both anchor on the first face of the component).
     mesh_tm = tm.Trimesh(vertices_np, flipped_np, process=False)
     tm.repair.fix_winding(mesh_tm)
-    assert np.array_equal(_canonical_winding(mesh_tm.faces), _canonical_winding(expected_np))
+    assert np.array_equal(canonical_winding(mesh_tm.faces), canonical_winding(repaired_np))
+    # ... and so the bits themselves are the faces trimesh chose to flip.
+    assert np.array_equal(
+        mask_np, np.any(canonical_winding(mesh_tm.faces) != canonical_winding(flipped_np), axis=1)
+    )
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)

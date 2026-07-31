@@ -8,9 +8,11 @@ import scipy.sparse as sp
 import scipy.sparse.csgraph as csgraph
 import trimesh as tm
 import warp as wp
+from scipy.spatial import cKDTree
 
 import triwarp as tw
 import triwarp.typing as twt
+from tests.conversions import open3d_to_trimesh, trimesh_to_open3d, trimesh_to_pymeshlab
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
@@ -184,6 +186,77 @@ def test_split_meshes(request: pytest.FixtureRequest) -> None:
         assert np.array_equal(faces_wp.numpy(), mesh_tm.faces.reshape(-1))
 
 
+@pytest.mark.parity("split", "open3d", "pymeshlab")
+def test_split_matches_open3d_and_pymeshlab(request: pytest.FixtureRequest) -> None:
+    """
+    Class B against both references, each of which returns the components a different way.
+
+    **Open3D** has no single split call: ``cluster_connected_triangles`` returns the *labelling*, so
+    the named transform is the compaction the benchmark also pays -- ``select_by_index`` per label,
+    fed the label's vertex indices via ``np.unique``. **MeshLab** does compact, but
+    ``generate_splitting_by_connected_components`` *pushes* the components onto the MeshSet after
+    the original, so the transform is to skip mesh 0 and read ``vertex_matrix`` / ``face_matrix``
+    off each of the rest.
+
+    None of the three defines a component order, so all three lists are sorted by face count -- the
+    fixtures have 20, 168 and 1 024 faces, so that pairing is unambiguous -- and each paired
+    component is compared by its face-centroid set through a bijective nearest-neighbour match.
+    """
+    mesh_a_tm, mesh_a_wp = request.getfixturevalue("icosahedron")
+    mesh_b_tm, mesh_b_wp = request.getfixturevalue("hemisphere")
+    mesh_c_tm, mesh_c_wp = request.getfixturevalue("half_torus")
+    combined_tm = tm.util.concatenate([mesh_a_tm, mesh_b_tm, mesh_c_tm])
+    concat_vertices_wp, concat_faces_wp = tw.combine.concatenate(
+        [
+            (mesh_a_wp.points, mesh_a_wp.indices),
+            (mesh_b_wp.points, mesh_b_wp.indices),
+            (mesh_c_wp.points, mesh_c_wp.indices),
+        ]
+    )
+
+    mesh_o3d = trimesh_to_open3d(combined_tm)
+    labels_o3d = np.asarray(mesh_o3d.cluster_connected_triangles()[0])
+    faces_i32 = np.ascontiguousarray(combined_tm.faces, dtype=np.int32)
+    parts_o3d = [
+        open3d_to_trimesh(mesh_o3d.select_by_index(np.unique(faces_i32[labels_o3d == label])))
+        for label in range(int(labels_o3d.max()) + 1)
+    ]
+
+    meshset_pml = trimesh_to_pymeshlab(combined_tm)
+    meshset_pml.generate_splitting_by_connected_components()
+    parts_pml = []
+    for index in range(1, meshset_pml.mesh_number()):
+        meshset_pml.set_current_mesh(index)
+        parts_pml.append(
+            (
+                np.asarray(meshset_pml.current_mesh().vertex_matrix(), dtype=np.float64),
+                np.asarray(meshset_pml.current_mesh().face_matrix()),
+            )
+        )
+
+    parts_wp = [
+        (vertices_wp.numpy().astype(np.float64), faces_wp.numpy().reshape(-1, 3))
+        for vertices_wp, faces_wp in tw.combine.split(concat_vertices_wp, concat_faces_wp)
+    ]
+    assert len(parts_wp) == len(parts_o3d) == len(parts_pml) == 3
+
+    def by_faces(parts: list) -> list:
+        return sorted(parts, key=lambda part: part[1].shape[0])
+
+    reference_parts = [(part.vertices, part.faces) for part in parts_o3d]
+    for part_wp, part_o3d, part_pml in zip(
+        by_faces(parts_wp), by_faces(reference_parts), by_faces(parts_pml), strict=True
+    ):
+        for vertices_ref, faces_ref in (part_o3d, part_pml):
+            assert part_wp[0].shape[0] == vertices_ref.shape[0]
+            assert part_wp[1].shape[0] == faces_ref.shape[0]
+            centroids_wp = part_wp[0][part_wp[1]].mean(axis=1)
+            centroids_ref = vertices_ref[faces_ref].mean(axis=1)
+            distance_np, match_np = cKDTree(centroids_ref).query(centroids_wp)
+            assert distance_np.max() < 1e-5
+            assert len(set(match_np.tolist())) == match_np.shape[0]
+
+
 def test_split_batched_matches_split(request: pytest.FixtureRequest) -> None:
     """``split`` slices ``split_batched``: the CSR must agree with it slice for slice."""
     meshes_wp = [
@@ -275,6 +348,57 @@ def test_connected_component_labels_random(device: str) -> None:
     labels_np = _scipy_component_labels(edges_np, node_count)
 
     assert _same_partition(labels_wp.numpy(), labels_np)
+
+
+@pytest.mark.parametrize("face_ratio", [0.0, 0.1, 0.5])
+@pytest.mark.parity("connected_component_labels", "pymeshlab")
+def test_connected_component_labels_matches_pymeshlab(
+    request: pytest.FixtureRequest, face_ratio: float
+) -> None:
+    """
+    Class B: MeshLab has no filter that returns labels, so the labelling is observed through a mask.
+
+    ``compute_selection_by_small_disconnected_components_per_face`` is the closest thing that runs
+    the component pass without also splitting the mesh -- it labels every component, then selects
+    the faces of every component holding fewer than ``nbfaceratio`` times the largest component's
+    face count. So the named transform runs triwarp's labels through exactly that rule: push the
+    per-vertex labels onto faces (all three corners of a face share a component), count faces per
+    label, and select where the count is below the threshold. Equality is then exact on the bool
+    array.
+
+    This does more than re-express the same thing twice: the *sizes* of all the components and their
+    ranking have to agree, not just the partition, which is what a label array compared up to
+    renumbering (the scipy oracle above) deliberately does not pin.
+
+    Parametrized over three ratios that produce **different** answers on a 20 / 320 / 2 048-face
+    three-component mesh -- 0, 20 and 340 faces selected -- so no constant mask can pass.
+    """
+    mesh_a_tm, _mesh_a_wp = request.getfixturevalue("icosahedron")
+    mesh_b_tm, _mesh_b_wp = request.getfixturevalue("hemisphere")
+    mesh_c_tm, _mesh_c_wp = request.getfixturevalue("half_torus")
+    combined_tm = tm.util.concatenate([mesh_a_tm, mesh_b_tm, mesh_c_tm])
+    device = str(_mesh_a_wp.points.device)
+    faces_wp = wp.array(
+        np.ascontiguousarray(combined_tm.faces.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=device,
+    )
+    n_vertices = combined_tm.vertices.shape[0]
+
+    meshset_pml = trimesh_to_pymeshlab(combined_tm)
+    meshset_pml.compute_selection_by_small_disconnected_components_per_face(nbfaceratio=face_ratio)
+    selection_pml = np.asarray(meshset_pml.current_mesh().face_selection_array())
+
+    unique_edges_wp, _inverse_wp = tw.edges.edges_unique(faces_wp, n_vertices=n_vertices)
+    labels_np = tw.graph.connected_component_labels(
+        tw.graph.edges_to_csr(n_vertices, unique_edges_wp)
+    ).numpy()
+
+    face_labels_np = labels_np[combined_tm.faces[:, 0]]
+    _label, size_np = np.unique(face_labels_np, return_counts=True)
+    threshold = face_ratio * size_np.max()
+    sizes_by_face_np = size_np[np.searchsorted(_label, face_labels_np)]
+    assert np.array_equal(sizes_by_face_np < threshold, selection_pml)
 
 
 def test_connected_component_labels_empty_edges(device: str) -> None:

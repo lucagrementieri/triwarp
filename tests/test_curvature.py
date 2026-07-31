@@ -10,6 +10,7 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
+from tests.conversions import trimesh_to_pymeshlab
 
 
 def _geodesic_ball_neighborhoods_oracle(
@@ -218,6 +219,62 @@ def test_principal_curvature_frame_independent(half_torus: tuple[tm.Trimesh, wp.
     within_pv2 = np.abs(pv2_indep[mask] - pv2_igl[mask]) <= 5e-2 + 5e-2 * np.abs(pv2_igl[mask])
     assert within_pv1.mean() > 0.95
     assert within_pv2.mean() > 0.95
+
+
+@pytest.mark.parity("principal_curvature", "pymeshlab")
+def test_principal_curvature_directions_match_pymeshlab(torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B on the principal *direction*, which is the only quantity MeshLab exposes comparably.
+
+    ``compute_curvature_principal_directions_per_vertex`` writes two direction matrices and its
+    ``vertex_curvature_principal_dir1_matrix()`` entries are **unit vectors** -- measured ``|d1| ==
+    1`` at every vertex -- so the curvature *magnitudes* are simply not in them. Its scalar output
+    is a mean curvature over a neighbourhood MeshLab derives itself rather than from a radius, and
+    it correlates 0.94 with triwarp's with a systematic offset (max deviation 0.82), so it is not a
+    value oracle either. The direction is, and the transform is the usual eigenvector sign freedom:
+    an eigenvector is defined up to sign, so the comparison is ``|dot| == 1``.
+
+    **Fixture choice is the substance here.** Principal directions are only defined where the two
+    principal curvatures differ, so ``torus`` -- whose curvature gap is at minimum 2.63 and median
+    3.25 -- is the fixture, and the two obvious alternatives are excluded for measured reasons: on
+    an ``icosphere`` every point is umbilic (``k1 == k2``, so any orthonormal tangent pair is a
+    valid answer and the agreement reads a meaningless 0.62), and ``half_torus``'s gap falls to
+    0.096, where only 54% of vertices reach ``|dot| > 0.99``.
+
+    **Measured, and the mutation probes.** On ``torus`` the worst ``|dot|`` over all 1 024 vertices
+    is **0.9997** against a 0.99 bound -- a 33x margin on the deviation from 1. Pairing triwarp's
+    first direction with MeshLab's *second* instead collapses it to a mean of 0.058 and only 2.3% of
+    vertices above the bound; comparing it against the vertex normal gives a mean of 0.002 and 0%.
+    So neither an axis swap nor "return any tangent vector" survives.
+
+    MeshLab's second direction is deliberately **not** asserted: 94.8% of vertices agree to 0.99 but
+    the remaining 5% fall to 0.009, i.e. MeshLab and triwarp order the two eigenvectors differently
+    at some vertices. That is an ordering convention, and pinning the first direction is the part
+    that says the two computed the same shape operator.
+
+    ``autoclean=False`` is load-bearing: the filter defaults to deleting unreferenced vertices,
+    which would silently renumber the output against triwarp's.
+    """
+    mesh_tm, mesh_wp = torus
+
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    meshset_pml.compute_curvature_principal_directions_per_vertex(
+        method="Quadric Fitting", autoclean=False
+    )
+    assert meshset_pml.current_mesh().vertex_number() == mesh_tm.vertices.shape[0]
+    direction_pml = np.asarray(
+        meshset_pml.current_mesh().vertex_curvature_principal_dir1_matrix(), dtype=np.float64
+    )
+    direction_pml /= np.linalg.norm(direction_pml, axis=1, keepdims=True)
+
+    direction_wp, _direction2_wp, pv1_wp, pv2_wp = tw.curvature.principal_curvature(
+        mesh_wp.points, mesh_wp.indices
+    )
+    # The fixture must actually have distinct principal curvatures, or the directions are arbitrary.
+    assert np.abs(pv1_wp.numpy() - pv2_wp.numpy()).min() > 1.0
+
+    dots_np = np.abs(np.einsum("ij,ij->i", direction_pml, direction_wp.numpy()))
+    assert dots_np.min() > 0.99, f"worst |dot| {dots_np.min():.4f}"
 
 
 @pytest.mark.parity("discrete_gaussian_curvature", "trimesh")

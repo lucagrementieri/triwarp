@@ -121,6 +121,30 @@ def _skip_pml_beyond_bunny(bench_case: BenchCase) -> None:
     skip_larger_than(bench_case, "bunny", "MeshLab's serial smoothers take seconds beyond bunny")
 
 
+@pytest.mark.noparity(
+    "open3d",
+    oracle="trimesh",
+    reason="D2 a different diffusion scheme with no mutable coefficient: filter_smooth_laplacian "
+    "diffuses at a fixed rate toward the inverse-distance-weighted 1-ring mean, where "
+    "filter_mut_dif_laplacian scales each vertex's rate by how much of its Laplacian residual lies "
+    "along the normal. Measured 0.0428 max-coordinate deviation on a noisy icosphere(2) of extent "
+    "2.02 at 10 iterations. trimesh is the oracle for this group, in "
+    "tests/test_smoothing.py::test_filter_mut_dif_laplacian_volume_constraint. Recorded so it is "
+    "not re-derived: open3d's filter IS triwarp's filter_laplacian under an inverse-distance "
+    "operator, matching it to 6.6e-08 at *one* iteration and diverging to 0.032 by ten only "
+    "because open3d re-derives the edge weights from the current positions every pass while "
+    "triwarp holds the assembled operator fixed.",
+)
+@pytest.mark.noparity(
+    "pymeshlab",
+    oracle="trimesh",
+    reason="D2 Desbrun et al.'s scale-dependent umbrella, not Barroqueiro et al.'s mutable "
+    "diffusion: apply_coord_laplacian_smoothing_scale_dependent weights the 1-ring by edge length "
+    "and exposes no per-vertex rate at all, and its step count is its only parameter. Measured "
+    "0.171 max-coordinate deviation on a noisy icosphere(2) of extent 2.02 at 10 iterations -- 4x "
+    "further from triwarp than open3d's row is. trimesh is the oracle for this group, in "
+    "tests/test_smoothing.py::test_filter_mut_dif_laplacian_volume_constraint.",
+)
 @pytest.mark.benchmark(group="filter_mut_dif_laplacian")
 @pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
 @pytest.mark.parametrize("volume_constraint", [False, True], ids=["novol", "vol"])
@@ -238,7 +262,13 @@ def test_filter_taubin(bench_case: BenchCase) -> None:
     Against ``filter_laplacian_integration``'s explicit row this measures exactly the second pass,
     so the two rows should sit at a ratio near 2 and nothing else should separate them. All three
     libraries implement Taubin's 1995 scheme; MeshLab's inflating step is ``mu=-0.53`` against
-    triwarp's and trimesh's ``nu=0.5``, which changes the fixed point but not the work per pass.
+    triwarp's and trimesh's ``nu=0.53``, which changes the fixed point but not the work per pass.
+
+    **MeshLab's ``stepsmoothnum`` counts lambda-mu pairs, not half-steps**, where triwarp and
+    trimesh do one half-step per ``iterations`` and alternate. So it gets ``_ITERATIONS // 2``:
+    passing ``_ITERATIONS`` to both, as this row originally did, timed MeshLab doing twice the
+    passes. The mapping is pinned exactly (5e-08) in
+    ``tests/test_smoothing.py::test_filter_taubin_matches_pymeshlab``.
     """
     skip_larger_than(bench_case, "dragon")
     if bench_case.kind == "triwarp":
@@ -254,7 +284,7 @@ def test_filter_taubin(bench_case: BenchCase) -> None:
         _skip_pml_beyond_bunny(bench_case)
         bench_case.run(
             lambda: bench_case.new_meshset_pml().apply_coord_taubin_smoothing(
-                stepsmoothnum=_ITERATIONS
+                stepsmoothnum=_ITERATIONS // 2
             )
         )
     else:  # trimesh mutates in place: rebuild inside the timed callable
@@ -460,6 +490,16 @@ _TWO_STEP_NORMAL_STEPS = 20
 _TWO_STEP_FIT_STEPS = 20
 
 
+@pytest.mark.noparity(
+    "pymeshlab",
+    reason="D3 neither parameter exists on the reference: apply_normal_smoothing_per_face takes no "
+    "arguments at all -- no iteration count and no crease threshold -- so the two things "
+    "filter_normals is parametrized by cannot be set, and its single unconditional pass is not the "
+    "crease-gated 20-pass diffusion under test. It is a per-pass cost reference only, which is why "
+    "this row's numbers must be read as time-per-pass rather than compared directly. The gated "
+    "diffusion is asserted against MeshLab where MeshLab does expose the parameters, in the "
+    "filter_two_step group, whose 3 x 20 x 20 defaults both sides are given.",
+)
 @pytest.mark.benchmark(group="filter_normals")
 @pytest.mark.benchaxis("quality")
 @pytest.mark.benchlibs("triwarp", "pymeshlab")

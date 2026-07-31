@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import open3d as o3d
+import pymeshlab as ml
 import pytest
 import trimesh as tm
 import trimesh.registration as tm_reg
@@ -396,6 +397,75 @@ def test_icp_point_to_point_mesh(half_torus: tuple[tm.Trimesh, wp.Mesh], device:
     # tangential slide on the curved surface keeps RMS small but non-zero).
     assert cost_tw < 1e-3
     assert _rms(transformed_wp.numpy(), vertices_np) < 5e-2
+
+
+@pytest.mark.parametrize("angle", [0.15, 0.30])
+@pytest.mark.parity("icp_mesh", "pymeshlab")
+def test_icp_mesh_matches_pymeshlab(device: str, angle: float) -> None:
+    """
+    Class B: both recover the exact alignment, and agree to **0.0** RMS at both offsets.
+
+    ``compute_matrix_by_icp_between_meshes`` runs its correspondences against the reference *mesh*
+    rather than a point cloud, which is what makes it the equivalent of the mesh-target ``icp``
+    rather than of ``icp_point_cloud``. Three named transforms, all of them plumbing:
+
+    * The filter returns ``None`` and **does not move the vertices**. It writes the source layer's
+      *transformation matrix*, so ``vertex_matrix()`` reads back byte-identical to the input -- the
+      answer is in ``transform_matrix()`` / ``transformed_vertex_matrix()``. This is the trap here:
+      a comparison against ``vertex_matrix()`` looks like a total ICP failure (RMS unchanged at
+      0.105) and would be read as a disagreement.
+    * Both layers must carry faces; a face-less source raises ``Failed to apply filter``.
+    * ``samplenum`` is matched to the vertex count so both sides minimize over the same number of
+      correspondences.
+
+    **The fixture is chosen so the problem is well posed.** ICP has no unique answer on a
+    rotationally symmetric shape: on an ``icosphere`` any rotation maps the surface onto itself, and
+    measured there triwarp reduces the RMS only 0.141 -> 0.124 while MeshLab's own result is equally
+    arbitrary -- neither is wrong and the comparison is meaningless. A **notched** cube breaks every
+    symmetry, and on it both solvers drive the RMS to zero exactly. MeshLab also needs enough
+    samples: at 64 vertices the filter raises, so the cube is subdivided twice to 256.
+
+    Two offsets, 0.15 and 0.30 rad, so the assert is not resting on one starting point.
+    """
+    mesh_tm = tm.boolean.difference(
+        [tm.creation.box(extents=[1.0, 1.0, 1.0]), tm.creation.box(extents=[0.4, 0.4, 2.0])]
+    ).subdivide()
+    mesh_tm = mesh_tm.subdivide()
+    vertices_np = mesh_tm.vertices.astype(np.float64)
+    faces_np = np.ascontiguousarray(mesh_tm.faces, dtype=np.int32)
+    rotation_np, translation_np = _rigid_transform(angle, [0.2, 0.7, 0.1], [0.05, -0.03, 0.04])
+    source_np = vertices_np @ rotation_np.T.astype(np.float64) + translation_np
+
+    meshset_pml = ml.MeshSet()
+    meshset_pml.add_mesh(ml.Mesh(np.ascontiguousarray(vertices_np), faces_np))
+    meshset_pml.add_mesh(ml.Mesh(np.ascontiguousarray(source_np), faces_np))
+    meshset_pml.compute_matrix_by_icp_between_meshes(
+        referencemesh=0, sourcemesh=1, samplenum=vertices_np.shape[0]
+    )
+    meshset_pml.set_current_mesh(1)
+    # Read the *transformed* vertices: the filter writes the layer transform, not the positions.
+    assert np.allclose(meshset_pml.current_mesh().vertex_matrix(), source_np)
+    moved_pml = np.asarray(meshset_pml.current_mesh().transformed_vertex_matrix(), dtype=np.float64)
+    assert np.isclose(
+        np.linalg.det(np.asarray(meshset_pml.current_mesh().transform_matrix())[:3, :3]), 1.0
+    )
+
+    _matrix_wp, transformed_wp, _cost_wp = tw.registration.icp(
+        _to_wp(source_np, device),
+        _to_wp(vertices_np, device),
+        wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device),
+        max_iterations=100,
+        threshold=-np.inf,
+        reflection=False,
+        scale=False,
+    )
+    moved_wp = transformed_wp.numpy().astype(np.float64)
+
+    # Both land on the reference itself, so neither comparison below is two failures agreeing.
+    assert _rms(source_np, vertices_np) > 0.1
+    assert _rms(moved_pml, vertices_np) < 1e-4
+    assert _rms(moved_wp, vertices_np) < 1e-4
+    assert np.allclose(moved_wp, moved_pml, rtol=1e-4, atol=1e-4)
 
 
 def test_icp_point_to_plane_mesh(half_torus: tuple[tm.Trimesh, wp.Mesh], device: str) -> None:

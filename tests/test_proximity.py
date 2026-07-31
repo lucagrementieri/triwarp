@@ -16,7 +16,7 @@ import trimesh.proximity as tm_proximity
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import trimesh_to_open3d
+from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab
 from triwarp.constants import TOLERANCE_MERGE
 
 
@@ -242,6 +242,51 @@ def test_signed_distance_on_mesh_random(request: pytest.FixtureRequest, mesh_nam
     )
     signed_wp = tw.proximity.signed_distance_on_mesh(mesh_wp.points, mesh_wp.indices, points_wp)
     assert np.allclose(signed_wp.numpy(), expected_np, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "torus"])
+@pytest.mark.parity("signed_distance_on_mesh", "pymeshlab")
+def test_signed_distance_on_mesh_matches_pymeshlab(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A: a **third** sign convention that nevertheless returns the same number.
+
+    triwarp's default mode casts perturbed parity rays and MeshLab signs by the dot product with the
+    *closest point's normal*, so a priori this is the pair most at risk of a systematic sign flip --
+    the plan flagged it as needing thought for that reason. It does not flip: measured on all three
+    fixtures, sign agreement is **400 / 400** and the signed values match to **3.3e-07 / 1.5e-08 /
+    1.9e-07**, so the assert is a direct ``allclose`` with no transform on the value at all.
+
+    The fixture set is chosen to put the closest-point-normal rule under load rather than to flatter
+    it: ``cave_cube`` is non-convex, so points inside the cavity have a nearest face whose normal
+    faces the other way from the outer shell's, and ``torus`` is genus 1, where a point in the hole
+    is outside the solid but surrounded by surface. Both are exactly where a normal-based sign is
+    supposed to be unreliable.
+
+    Two named transforms on the *plumbing*, not the value: the query points go in as a second,
+    face-less mesh (``measuremesh=1``, ``refmesh=0``) and the answer is read off that mesh's
+    ``vertex_scalar_array()``. ``signeddist=True`` is what makes it signed rather than absolute, and
+    is the parameter the benchmark passes.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    rng = np.random.default_rng(4)
+    points_np = mesh_tm.bounds[0] + rng.random((400, 3)) * (mesh_tm.bounds[1] - mesh_tm.bounds[0])
+
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    meshset_pml.add_mesh(ml.Mesh(vertex_matrix=np.ascontiguousarray(points_np)))
+    meshset_pml.compute_scalar_by_distance_from_another_mesh_per_vertex(
+        measuremesh=1, refmesh=0, signeddist=True
+    )
+    signed_pml = np.asarray(meshset_pml.current_mesh().vertex_scalar_array())
+
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    signed_wp = tw.proximity.signed_distance_on_mesh(mesh_wp.points, mesh_wp.indices, points_wp)
+
+    assert np.array_equal(np.sign(signed_wp.numpy()), np.sign(signed_pml))
+    assert np.allclose(signed_wp.numpy(), signed_pml, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])

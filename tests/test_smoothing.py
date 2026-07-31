@@ -12,9 +12,10 @@ import scipy.sparse.linalg as spla
 import trimesh as tm
 import trimesh.smoothing as tms
 import warp as wp
+import warp.sparse as wps
 
 import triwarp as tw
-from tests.conversions import trimesh_to_open3d
+from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab, trimesh_to_warp
 
 
 def _skip_without_cuda(mesh_wp: wp.Mesh) -> None:
@@ -84,6 +85,185 @@ def test_filter_taubin(request: pytest.FixtureRequest, mesh_name: str) -> None:
     tms.filter_taubin(mesh_ref, lamb=0.5, nu=0.53, iterations=9)
 
     assert np.allclose(smoothed_wp.numpy(), mesh_ref.vertices, rtol=1e-5, atol=1e-5)
+
+
+# --- MeshLab's two coordinate umbrellas -------------------------------------------------
+#
+# MeshLab does not use one Laplacian for its coordinate smoothers, it uses two, and which one a
+# filter picks was recovered numerically rather than read off any documentation: one pass of each
+# filter is a linear map, so running it over 12 random position sets on one connectivity and solving
+# least-squares for the per-vertex stencil determines the weights exactly (residual 2e-16).
+#
+#   * ``apply_coord_laplacian_smoothing`` and ``apply_coord_unsharp_mask`` weight each neighbour by
+#     the number of faces the edge to it shares and count the vertex *itself* once, so on a closed
+#     mesh a degree-d vertex gets ``1 / (2d + 1)`` on itself and ``2 / (2d + 1)`` on each neighbour.
+#     That is `_meshlab_umbrella` below, and it is why these two filters are NOT the plain 1-ring
+#     mean -- the difference is 8% of the displacement, far too large to read as a tolerance.
+#   * ``apply_coord_taubin_smoothing`` uses the plain 1-ring mean instead, which is triwarp's own
+#     default operator.
+
+
+def _meshlab_umbrella(mesh_tm: tm.Trimesh, device: str) -> wps.BsrMatrix[wp.float32]:
+    """
+    Assemble MeshLab's face-count-weighted umbrella as a row-stochastic operator.
+
+    Each neighbour is weighted by the number of faces its edge shares (2 for an interior edge, 1 on
+    a boundary) and the vertex itself by 1, then the row is normalized. Feeding this to triwarp's
+    ``laplacian_operator=`` parameter is what makes the comparison class B rather than an exemption.
+    """
+    shared: dict[tuple[int, int], int] = {}
+    for face_np in mesh_tm.faces:
+        for start, end in ((0, 1), (1, 2), (2, 0)):
+            key = (int(face_np[start]), int(face_np[end]))
+            shared[key] = shared.get(key, 0) + 1
+            shared[key[::-1]] = shared.get(key[::-1], 0) + 1
+
+    n_vertices = mesh_tm.vertices.shape[0]
+    row_sum_np = np.ones(n_vertices)
+    for (row, _column), count in shared.items():
+        row_sum_np[row] += count
+    rows_np = np.arange(n_vertices, dtype=np.int32)
+    columns_np = rows_np.copy()
+    values_np = 1.0 / row_sum_np
+    entries_np = np.array(list(shared.items()), dtype=object)
+    neighbor_rows = np.array([row for (row, _column), _count in entries_np], dtype=np.int32)
+    neighbor_columns = np.array([column for (_row, column), _count in entries_np], dtype=np.int32)
+    neighbor_values = (
+        np.array([count for _key, count in entries_np], dtype=np.float64)
+        / row_sum_np[neighbor_rows]
+    )
+
+    return wps.bsr_from_triplets(
+        n_vertices,
+        n_vertices,
+        wp.array(np.concatenate((rows_np, neighbor_rows)), dtype=wp.int32, device=device),
+        wp.array(np.concatenate((columns_np, neighbor_columns)), dtype=wp.int32, device=device),
+        wp.array(
+            np.concatenate((values_np, neighbor_values)).astype(np.float32),
+            dtype=wp.float32,
+            device=device,
+        ),
+    )
+
+
+def _noisy_icosphere() -> tm.Trimesh:
+    """Build a closed, evenly tessellated mesh carrying 0.01 of noise for a smoother to remove."""
+    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    mesh_tm.vertices = mesh_tm.vertices + np.random.default_rng(0).normal(
+        0.0, 0.01, mesh_tm.vertices.shape
+    )
+    return mesh_tm
+
+
+@pytest.mark.parametrize("iterations", [1, 3, 10])
+@pytest.mark.parity("filter_laplacian_integration", "pymeshlab")
+def test_filter_laplacian_matches_pymeshlab(device: str, iterations: int) -> None:
+    """
+    Class B: exact, once MeshLab's own umbrella is passed through ``laplacian_operator=``.
+
+    Three named transforms. ``cotangentweight=False`` selects the uniform scheme (the benchmark
+    passes it too); ``lamb=1.0`` matches MeshLab's full step, which replaces the vertex by the
+    weighted mean rather than interpolating toward it; and the operator is
+    [`_meshlab_umbrella`][tests.test_smoothing._meshlab_umbrella] rather than triwarp's default,
+    because MeshLab's uniform Laplacian is *not* the 1-ring mean.
+
+    Measured agreement **6.5e-08 / 1.2e-07 / 2.6e-07** at 1 / 3 / 10 passes -- float32 accumulation
+    noise -- against **5.0e-03** at one pass with the plain 1-ring mean. So this is the assert that
+    pins which of MeshLab's two umbrellas this filter uses; with the wrong one it fails by 4 orders
+    of magnitude. This also exercises the pluggable-operator path the benchmark's
+    ``filter_laplacian_integration`` group times.
+
+    A closed fixture, because the ``1`` self-weight and per-face neighbour counts were solved for on
+    one; the boundary generalization (a shared count of 1) is written but not asserted here.
+    """
+    mesh_tm = _noisy_icosphere()
+    mesh_wp = trimesh_to_warp(mesh_tm, device)
+
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    meshset_pml.apply_coord_laplacian_smoothing(
+        stepsmoothnum=iterations, cotangentweight=False, boundary=True
+    )
+
+    smoothed_wp = tw.smoothing.filter_laplacian(
+        mesh_wp.points,
+        mesh_wp.indices,
+        lamb=1.0,
+        iterations=iterations,
+        volume_constraint=False,
+        laplacian_operator=_meshlab_umbrella(mesh_tm, device),
+    )
+    assert np.allclose(
+        smoothed_wp.numpy(), meshset_pml.current_mesh().vertex_matrix(), rtol=1e-5, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("steps", [1, 3, 5])
+@pytest.mark.parity("filter_taubin", "pymeshlab")
+def test_filter_taubin_matches_pymeshlab(device: str, steps: int) -> None:
+    """
+    Class B: exact, once the *pass count* is mapped -- and the mapping is a factor of two.
+
+    MeshLab's ``stepsmoothnum`` counts lambda-mu **pairs**, where triwarp follows trimesh and does
+    one half-step per ``iterations``, alternating the shrinking and inflating passes. So
+    ``iterations = 2 * stepsmoothnum`` is the named transform, and ``mu=-0.53`` is triwarp's
+    ``nu=0.53`` (the sign is in the convention, not the value). Unlike the two filters above, this
+    one uses the plain 1-ring mean, so triwarp's default operator is the right one.
+
+    Measured **5.2e-08 / 4.4e-08 / 4.6e-08** at 1 / 3 / 5 MeshLab steps under the doubled count,
+    against **2.7e-02 / 2.6e-02 / 2.6e-02** at the naive equal count -- a 5-orders-of-magnitude
+    separation, so this assert is what holds the pass mapping in place.
+    ``benchmarks/test_smoothing`` originally gave MeshLab ``stepsmoothnum=_ITERATIONS`` against
+    triwarp's ``iterations=_ITERATIONS`` and so timed it doing twice the passes; that row now halves
+    it.
+    """
+    mesh_tm = _noisy_icosphere()
+    mesh_wp = trimesh_to_warp(mesh_tm, device)
+
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    meshset_pml.apply_coord_taubin_smoothing(lambda_=0.5, mu=-0.53, stepsmoothnum=steps)
+
+    smoothed_wp = tw.smoothing.filter_taubin(
+        mesh_wp.points, mesh_wp.indices, lamb=0.5, nu=0.53, iterations=2 * steps
+    )
+    assert np.allclose(
+        smoothed_wp.numpy(), meshset_pml.current_mesh().vertex_matrix(), rtol=1e-5, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("iterations", [1, 5])
+@pytest.mark.parity("filter_unsharp_mask", "pymeshlab")
+def test_filter_unsharp_mask_matches_pymeshlab(device: str, iterations: int) -> None:
+    """
+    Class B: exact under the same operator substitution as the Laplacian test above.
+
+    See [`test_filter_laplacian_matches_pymeshlab`]
+    [tests.test_smoothing.test_filter_laplacian_matches_pymeshlab] for how the operator is derived.
+
+    ``apply_coord_unsharp_mask`` takes ``weight`` and ``iterations`` under triwarp's own names and
+    meanings, and ``weightorig=1.0`` is its default (the original-position weight triwarp fixes at
+    1), so the only transform is passing
+    [`_meshlab_umbrella`][tests.test_smoothing._meshlab_umbrella] as the smoothing operator.
+
+    Measured **1.4e-07** at both 1 and 5 iterations, against **1.5e-03 / 4.4e-03** with the plain
+    1-ring mean -- so, like the Laplacian test, this doubles as the check on which umbrella the
+    filter uses.
+    """
+    mesh_tm = _noisy_icosphere()
+    mesh_wp = trimesh_to_warp(mesh_tm, device)
+
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    meshset_pml.apply_coord_unsharp_mask(weight=0.3, weightorig=1.0, iterations=iterations)
+
+    sharpened_wp = tw.smoothing.filter_unsharp_mask(
+        mesh_wp.points,
+        mesh_wp.indices,
+        weight=0.3,
+        iterations=iterations,
+        laplacian_operator=_meshlab_umbrella(mesh_tm, device),
+    )
+    assert np.allclose(
+        sharpened_wp.numpy(), meshset_pml.current_mesh().vertex_matrix(), rtol=1e-5, atol=1e-5
+    )
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])

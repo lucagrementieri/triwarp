@@ -319,6 +319,43 @@ Two measured gotchas worth not rediscovering: MeshLab's `face_normal_matrix()` a
 it checks normals *and* areas; and `symmetric_chamfer` has a sampling noise floor — a mesh against
 itself scores ~0.028 on `icosphere(3)`, so a threshold must clear that, not sit under it.
 
+### Where the reference put the answer
+
+A reference that looks like it *disagrees* is more often one whose result was read from the wrong
+place. Every one of these was measured, and each first presented as a total failure:
+
+- **MeshLab writes a layer transform, not vertices.** `compute_matrix_by_icp_between_meshes` leaves
+  `vertex_matrix()` byte-identical to the input; the answer is `transform_matrix()` /
+  `transformed_vertex_matrix()`. Read the wrong one and a converged ICP looks like a no-op.
+- **Open3D's tensor meshes must be held in a name.** `o3d.t.geometry.TriangleMesh.from_legacy(x)
+  .fill_holes()` lets the temporary be collected and the result reads freed memory — garbage floats
+  (2052.1, 4.4e-41) rather than an exception. Bind the intermediate.
+- **Open3D's `fill_holes` winds its cap against the rest of the mesh**, so a raw signed volume of its
+  output is meaningless (−1.06 where the truth is 2.02). `trimesh.repair.fix_winding` first.
+- **A reference's zero is not always "off".** `generate_surface_reconstruction_ball_pivoting`
+  reconstructs **nothing** at `clustering=0` (0 faces against 1 277 at its 20% default) and returns
+  *faster* for it; `meshing_close_holes` closes nothing at its `maxholesize=30` default. Assert the
+  reference produced output before comparing to it.
+- **MeshLab has two uniform coordinate umbrellas, and neither is documented.** Recovered by solving
+  least-squares for the per-vertex stencil over 12 random position sets on one connectivity (residual
+  2e-16): `apply_coord_laplacian_smoothing` and `apply_coord_unsharp_mask` weight each neighbour by
+  its shared-face count and include the vertex itself once (`1/(2d+1)` self, `2/(2d+1)` per
+  neighbour on a closed mesh), while `apply_coord_taubin_smoothing` uses the plain 1-ring mean. The
+  difference is 8% of the displacement — far too large to read as a tolerance. That technique is the
+  general one: **one pass of a linear filter is a linear map, so its stencil is solvable.**
+- **Pass counts are conventions too.** MeshLab's Taubin `stepsmoothnum` counts lambda-mu *pairs*
+  where triwarp and trimesh do one half-step per `iterations`, so the mapping is `2 *
+  stepsmoothnum`; and `get_scalar_statistics_per_vertex`'s `"med"` is the sorted element at index
+  `n // 2 - 1`, one *below* the middle, for both parities.
+
+### `lexsort` is unusable on float coordinates with ties
+
+`tests.comparisons.lexsort_rows` sorts exactly, so two sides that tie in `float32` but differ in the
+16th digit in `float64` order those rows differently and the compare fails by the full coordinate
+range (measured 1.59 on a subdivided icosahedron, 0.83 on a star ring). Both are false negatives.
+For **positions**, match with a `cKDTree` nearest-neighbour query plus a bijection check, or use
+[`hausdorff_two_sided`]; keep `lexsort_rows` for integer index rows, where it is exact.
+
 ---
 
 ## 7. Python wrapper typing (`triwarp.typing`)

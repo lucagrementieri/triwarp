@@ -12,7 +12,7 @@ import warp as wp
 
 import triwarp as tw
 from tests.comparisons import canonical_winding, lexsort_rows
-from tests.conversions import trimesh_to_open3d
+from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab
 
 
 def _to_wp_mesh(vertices_np: np.ndarray, faces_np: np.ndarray, device: str):
@@ -920,6 +920,48 @@ def test_remove_t_vertices_flips_the_sliver(device: str) -> None:
     assert int(flipped_wp.shape[0]) == int(faces_wp.shape[0])
     assert tw.validation.is_winding_consistent(flipped_wp)
     assert tw.validation.is_edge_manifold(flipped_wp)
+
+
+@pytest.mark.parametrize("mesh_kind", ["t_vertex_patch", "clean_icosphere"])
+@pytest.mark.parity("remove_t_vertices", "pymeshlab")
+def test_remove_t_vertices_matches_pymeshlab(device: str, mesh_kind: str) -> None:
+    """
+    Class B: MeshLab's ``Edge Flip`` mode picks the *identical* flips, face for face.
+
+    ``meshing_remove_t_vertices`` rewrites the topology in place rather than returning a face
+    buffer, so the transform is reading ``face_matrix()`` back and comparing the two as sorted face
+    sets (neither library defines a face or corner order). ``method="Edge Flip"`` selects the
+    flip-only mode -- its other modes split edges and would change the vertex count -- and
+    ``repeat=True`` is MeshLab's own iterate-to-convergence, which is what triwarp's ``max_iter``
+    passes are. Both are what the benchmark passes.
+
+    Two-sided by construction, so neither answer can be reached by a constant: on the T-vertex patch
+    both flip the sliver and land on the same 6 faces, **different from the input's 6**; on a clean
+    icosphere neither touches anything. Vertex counts are unchanged on both sides in both cases,
+    which is the check that MeshLab really took the flip path and not a split.
+    """
+    if mesh_kind == "t_vertex_patch":
+        vertices_np, faces_np = _t_vertex_patch()
+        expect_change = True
+    else:
+        sphere_tm = tm.creation.icosphere(subdivisions=3)
+        vertices_np, faces_np = np.asarray(sphere_tm.vertices), np.asarray(sphere_tm.faces)
+        expect_change = False
+    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+
+    meshset_pml = trimesh_to_pymeshlab(tm.Trimesh(vertices_np, faces_np, process=False))
+    meshset_pml.meshing_remove_t_vertices(method="Edge Flip", threshold=40.0, repeat=True)
+    assert meshset_pml.current_mesh().vertex_number() == vertices_np.shape[0]
+    faces_pml = np.asarray(meshset_pml.current_mesh().face_matrix())
+
+    flipped_np = tw.repair.remove_t_vertices(vertices_wp, faces_wp, threshold=40.0).numpy()
+
+    def face_set(faces: np.ndarray) -> np.ndarray:
+        sorted_np = np.sort(np.asarray(faces).reshape(-1, 3), axis=1)
+        return sorted_np[np.lexsort(sorted_np.T[::-1])]
+
+    assert np.array_equal(face_set(flipped_np), face_set(faces_pml))
+    assert (not np.array_equal(face_set(flipped_np), face_set(faces_np))) is expect_change
 
 
 def test_remove_t_vertices_leaves_a_clean_mesh_alone(device: str) -> None:

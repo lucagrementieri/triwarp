@@ -304,6 +304,42 @@ trimesh itself delegates. `potpourri3d` is CPU-only (geometry-central) and is th
 for the heat-method family, tangent spaces and isocontours. `pymeshlab` is CPU-only (MeshLab /
 VCGlib) and is the **broadest** — it reaches 26 modules, more than any other single reference.
 
+### The parity gate: a benchmarked reference must be a tested reference
+
+Nothing in this directory asserts that two timed implementations compute the same thing — every
+assert here is a shape, `isfinite` or count guard whose only job is to prove the timed work was not
+optimised away. `tests/test_parity.py` closes that loop and **fails the default `pytest` run** when a
+benchmarked `(group, library)` pair is neither tested nor exempted. Run
+`uv run python -m tests.parity` for the full matrix.
+
+The `benchmark(group=...)` name is the join key, which makes group names a **cross-suite API**:
+renaming one breaks every `parity` marker in `tests/` that cites it.
+
+Either a test in `tests/` claims the pair:
+
+```python
+@pytest.mark.parity("faces_to_edges", "trimesh")     # one marker per group, all its libraries listed
+```
+
+…or the benchmark function declares, at its own call site and in prose, why the two results are not
+comparable:
+
+```python
+@pytest.mark.noparity("pymeshlab", oracle="trimesh", reason="D2 ...measured number... trimesh is "
+                      "the oracle for this group, in tests/test_x.py::test_y.")
+```
+
+`reason` is mandatory and is checked for substance (≥ 40 chars, ≥ 6 words, no `"see above"`-class
+filler). `oracle=` names the library that *is* the oracle, and the gate then requires **that** pair to
+be covered — so an exemption is a checked claim rather than an escape hatch. Both markers take string
+literals only; a computed argument is invisible to the static scan and is rejected. Nineteen of the
+211 pairs are exempt; the category rubric (D1–D6) is in `.claude/CLAUDE.md` §6.
+
+**Exemptions are for results that cannot be compared, not comparisons that are awkward.** Three rows
+here were heading for exemptions on an 8%-of-displacement Laplacian disagreement until MeshLab's
+actual smoothing stencil was recovered numerically; they are now exact class-B asserts. "Does strictly
+less", "the output shape differs" and "the ordering differs" are transforms, not exemptions.
+
 ### pymeshlab
 
 MeshLab exposes 281 filters. 61 of them map onto something triwarp already has, and they are what
@@ -399,11 +435,31 @@ Two of those rows are worth reading as findings rather than ratios:
 - **Length parameters take a wrapper type.** `ml.PercentageValue(1)` is 1% of the bbox diagonal;
   `ml.PureValue(x)` is absolute (this version has no `AbsoluteValue`). Every row that sizes work by
   length passes `PureValue` fed from `bench_case.mean_edge` so both sides get the identical parameter.
-- **Three filters have defaults that silently measure nothing.** `meshing_close_holes(maxholesize=30)`
-  closes *zero* of `rim_short`'s two 512-edge rims (0.66 ms); `get_hausdorff_distance(samplenum=8)`
-  samples eight points out of the whole cloud; `generate_sampling_poisson_disk(radius=0%)` autoguesses
-  a radius instead of using yours. Each row overrides them and asserts on the returned dict where one
-  exists.
+- **Four filters have parameters that silently measure nothing**, and one of them is a value *we*
+  chose. `meshing_close_holes(maxholesize=30)` closes *zero* of `rim_short`'s two 512-edge rims
+  (0.66 ms); `get_hausdorff_distance(samplenum=8)` samples eight points out of the whole cloud;
+  `generate_sampling_poisson_disk(radius=0%)` autoguesses a radius instead of using yours. And
+  `generate_surface_reconstruction_ball_pivoting(clustering=0)` reconstructs **nothing** — 0 faces
+  against 1 277 at MeshLab's 20% default, returning *faster* for it (9.6 ms against 2.7 ms), so the
+  row read as a triwarp win while timing a failure. The clustering fraction is a seed-triangle
+  spacing floor, not the optional merge-nearby-vertices post-pass it looks like. Each row overrides
+  these and asserts the reference produced output. **Probe a parameter's zero before assuming it means
+  "off".**
+- **Pass counts are conventions, and mismatching them silently doubles a row's work.** MeshLab's
+  `apply_coord_taubin_smoothing(stepsmoothnum=n)` runs `n` lambda-mu **pairs** where triwarp and
+  trimesh do one half-step per `iterations` and alternate, so the row passes `_ITERATIONS // 2`;
+  passing `_ITERATIONS` to both timed MeshLab doing twice the passes. The mapping is pinned exactly
+  (5e-08) in `tests/test_smoothing.py::test_filter_taubin_matches_pymeshlab`.
+- **MeshLab has two different uniform coordinate umbrellas.** `apply_coord_laplacian_smoothing` and
+  `apply_coord_unsharp_mask` weight each neighbour by its shared-face count and include the vertex
+  itself once (`1/(2d+1)` self, `2/(2d+1)` per neighbour on a closed mesh); `apply_coord_taubin_
+  smoothing` uses the plain 1-ring mean. Neither is documented; both were recovered by solving
+  least-squares for the per-vertex stencil over 12 random position sets on one connectivity (residual
+  2e-16). The difference from the 1-ring mean is 8% of the displacement.
+- **`compute_matrix_by_icp_between_meshes` does not move the vertices.** It writes the source layer's
+  *transformation matrix*, so `vertex_matrix()` reads back byte-identical to the input and a converged
+  registration looks like a total no-op; the answer is `transform_matrix()` /
+  `transformed_vertex_matrix()`.
 - **Non-manifold input is a hard boundary, not a slow path** — the same one that shapes the libigl and
   potpourri3d rows. `meshing_surface_subdivision_midpoint` raises `Mesh has some not 2 manifold faces,
   subdivision surfaces require manifoldness` on **every scan mesh**, so its reference row lives on the
@@ -453,6 +509,20 @@ Two of those rows are worth reading as findings rather than ratios:
   `signed_distance_on_mesh` at `bunny` (768 µs/query on dragon = 85 s a row),
   `get_geometric_measures` at `bunny` (1.12 s a call on dragon, in *two* modules), and the
   `apply_coord_*` smoothers at `bunny` alongside the trimesh rows.
+
+### open3d — two hazards in the tensor API
+
+Both were found while writing the parity asserts, and both fail *silently* rather than raising:
+
+- **A tensor mesh must be held in a name.** Chaining
+  `o3d.t.geometry.TriangleMesh.from_legacy(x).fill_holes()` lets the temporary be collected, and the
+  result's `vertex["positions"]` then reads freed memory — observed as 2052.1 and 4.4e-41 in the
+  leading rows. Bind the intermediate before calling the filter.
+- **`fill_holes` winds its cap against the rest of the mesh.** A raw signed volume of its output is
+  therefore meaningless: −1.06 on a hemisphere whose true sealed volume is 2.02. Run
+  `trimesh.repair.fix_winding` (or triwarp's `make_winding_consistent`) before any volume or
+  orientation read. Its cap triangulation is otherwise a valid `B − 2` fill over the existing
+  vertices, matching triwarp's and MeshLab's counts exactly.
 
 ### potpourri3d
 

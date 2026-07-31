@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pymeshlab as ml
 import pytest
 import warp as wp
 
@@ -498,3 +499,43 @@ def test_weighted_sum_vec3_1d(device: str) -> None:
     sum_wp = tw_reduce.weighted_sum(values_wp, weights_wp)
     exp_np = (weights_np[:, None] * values_np).sum(axis=0)
     assert np.allclose(np.array(sum_wp), exp_np, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("n", [100, 101])
+@pytest.mark.parity("median", "pymeshlab")
+def test_scalar_statistics_match_pymeshlab(device: str, n: int) -> None:
+    """
+    Class B: ``get_scalar_statistics_per_vertex`` answers four of these reductions in one call.
+
+    The named transform is the dict index -- ``"min"``, ``"max"``, ``"avg"`` -- and those three are
+    exact. Reading all of them off the one call is also what makes them *mutually* consistent, which
+    no single-reduction comparison can check.
+
+    **``"med"`` is not triwarp's median, and the difference is a definition rather than a
+    tolerance.** MeshLab reports the sorted element at index ``n // 2 - 1``, one *below* the middle,
+    for both parities: measured at n = 100, 101 and 1001 it returns ranks 49, 49 and 499 where the
+    middle is 49.5, 50 and 500. So it is compared against that named order statistic instead, which
+    still checks that the two see the same sorted distribution, while
+    [`tests.test_polyline.test_reduce_median_matches_numpy`][] is the oracle for
+    [`triwarp.reduce.median`][] itself.
+    """
+    rng = np.random.default_rng(0)
+    values_np = rng.standard_normal(n)
+    # A face-less MeshSet carrying the values as its vertex scalar attribute: the reduction is over
+    # a bare array, so the positions are arbitrary and only the scalars matter.
+    meshset_pml = ml.MeshSet()
+    meshset_pml.add_mesh(
+        ml.Mesh(
+            np.ascontiguousarray(rng.standard_normal((n, 3))),
+            v_scalar_array=np.ascontiguousarray(values_np),
+        )
+    )
+    statistics_pml = meshset_pml.get_scalar_statistics_per_vertex()
+
+    values_wp = wp.array(values_np.astype(np.float32), dtype=wp.float32, device=device)
+    assert np.isclose(tw_reduce.min(values_wp), statistics_pml["min"], rtol=1e-5, atol=1e-5)
+    assert np.isclose(tw_reduce.max(values_wp), statistics_pml["max"], rtol=1e-5, atol=1e-5)
+    assert np.isclose(tw_reduce.mean(values_wp), statistics_pml["avg"], rtol=1e-5, atol=1e-5)
+
+    assert np.isclose(tw_reduce.median(values_wp), np.median(values_np), rtol=1e-5, atol=1e-5)
+    assert np.isclose(statistics_pml["med"], np.sort(values_np)[n // 2 - 1], rtol=1e-5, atol=1e-5)

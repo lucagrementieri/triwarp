@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import igl
 import numpy as np
+import pymeshlab as ml
 import pytest
 import warp as wp
 from scipy.spatial import KDTree
 from scipy.spatial.distance import directed_hausdorff
 
 import triwarp as tw
+from tests.conversions import points_to_open3d, points_to_pymeshlab
 
 # igl requires float64 vertices / int64 faces; Warp uses float32 / int32, so mesh-surface
 # references diverge from Warp at roughly float32 precision.
@@ -117,6 +119,36 @@ def test_chamfer_points_to_points_unreduced(device: str) -> None:
     assert np.allclose(backward_wp.numpy(), squared_yx_np, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("single_directional", [True, False], ids=["oneway", "symmetric"])
+@pytest.mark.parity("chamfer_points_to_points", "open3d")
+def test_chamfer_points_to_points_matches_open3d(device: str, single_directional: bool) -> None:
+    """
+    Class B: Open3D returns the per-point nearest distances, not the Chamfer scalar.
+
+    ``PointCloud.compute_point_cloud_distance`` is the *unsquared, unreduced* one-way answer, so the
+    named transform is triwarp's own reduction applied to it -- square, then mean, and add the
+    reverse direction when ``single_directional=False``. That is exactly what the benchmark's open3d
+    branch does, so this asserts the two sides of that row compute the same number.
+    """
+    rng = np.random.default_rng(21)
+    x_np = (rng.random((80, 3), dtype=np.float32) * 4.0 - 2.0).astype(np.float32)
+    y_np = (rng.random((60, 3), dtype=np.float32) * 4.0 - 2.0).astype(np.float32)
+
+    cloud_x_o3d, cloud_y_o3d = points_to_open3d(x_np), points_to_open3d(y_np)
+    chamfer_o3d = np.square(
+        np.asarray(cloud_x_o3d.compute_point_cloud_distance(cloud_y_o3d))
+    ).mean()
+    if not single_directional:
+        chamfer_o3d += np.square(
+            np.asarray(cloud_y_o3d.compute_point_cloud_distance(cloud_x_o3d))
+        ).mean()
+
+    chamfer_wp = tw.distance.chamfer_points_to_points(
+        _points_wp(x_np, device), _points_wp(y_np, device), single_directional=single_directional
+    )
+    assert np.allclose(chamfer_wp, chamfer_o3d, rtol=1e-5, atol=1e-5)
+
+
 # ---------------------------------------------------------------------------
 # Chamfer: mesh to mesh (vertex-to-surface)
 # ---------------------------------------------------------------------------
@@ -202,6 +234,55 @@ def test_hausdorff_points_to_points_single_directional(device: str) -> None:
         _points_wp(x_np, device), _points_wp(y_np, device), single_directional=True
     )
     assert np.allclose(hausdorff_wp, hausdorff_np, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parity("hausdorff_points_to_points", "open3d", "pymeshlab")
+def test_hausdorff_points_to_points_matches_open3d_and_pymeshlab(device: str) -> None:
+    """
+    Class B against both references the benchmark times, each needing a different named transform.
+
+    **Open3D** returns the per-point one-way distances from ``compute_point_cloud_distance``, so the
+    transform is the ``max`` reduction plus the second direction -- the symmetric Hausdorff is
+    ``max`` over both.
+
+    **MeshLab** returns a *dict of statistics* from ``get_hausdorff_distance``, so the transform is
+    the ``"max"`` key, again over both directions. Two further parameters are load-bearing and are
+    the same ones the benchmark passes: the filter is one-directional by construction (it samples
+    ``sampledmesh`` and searches ``targetmesh``), and its default ``samplenum=8`` would compare
+    eight random points rather than the cloud, so ``samplevert=True`` with ``samplenum`` at the full
+    count is what makes it sample every point. The clouds go in as **face-less** meshes, since
+    MeshLab's sampler would otherwise sample the surface instead of the vertices.
+    """
+    rng = np.random.default_rng(22)
+    x_np = (rng.random((80, 3), dtype=np.float32) * 4.0 - 2.0).astype(np.float32)
+    y_np = (rng.random((60, 3), dtype=np.float32) * 4.0 - 2.0).astype(np.float32)
+
+    cloud_x_o3d, cloud_y_o3d = points_to_open3d(x_np), points_to_open3d(y_np)
+    hausdorff_o3d = max(
+        np.asarray(cloud_x_o3d.compute_point_cloud_distance(cloud_y_o3d)).max(),
+        np.asarray(cloud_y_o3d.compute_point_cloud_distance(cloud_x_o3d)).max(),
+    )
+
+    meshset_pml = points_to_pymeshlab(x_np)
+    meshset_pml.add_mesh(ml.Mesh(np.ascontiguousarray(y_np, dtype=np.float64)))
+    hausdorff_pml = max(
+        float(
+            meshset_pml.get_hausdorff_distance(
+                sampledmesh=0, targetmesh=1, samplevert=True, samplenum=x_np.shape[0]
+            )["max"]
+        ),
+        float(
+            meshset_pml.get_hausdorff_distance(
+                sampledmesh=1, targetmesh=0, samplevert=True, samplenum=y_np.shape[0]
+            )["max"]
+        ),
+    )
+
+    hausdorff_wp = tw.distance.hausdorff_points_to_points(
+        _points_wp(x_np, device), _points_wp(y_np, device)
+    )
+    assert np.allclose(hausdorff_wp, hausdorff_o3d, rtol=1e-5, atol=1e-5)
+    assert np.allclose(hausdorff_wp, hausdorff_pml, rtol=1e-5, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------

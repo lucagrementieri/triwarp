@@ -7,6 +7,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from tests.comparisons import lexsort_rows
 from triwarp.kernels.grouping import VEC3_PACK_PRECISION, VEC3_PACK_SHIFT
 
 group_test_data = (
@@ -114,6 +115,36 @@ def test_unique_rows_inverse_counts(device: str):
     assert np.array_equal(np.sort(counts_wp.numpy()), np.sort(counts_np))
     for i in range(data_np.shape[0]):
         assert np.array_equal(unique_wp.numpy()[inverse_wp.numpy()[i]], data_np[i])
+
+
+@pytest.mark.parametrize("unique_fraction", [1.0, 0.1], ids=["allunique", "tenth"])
+@pytest.mark.parity("unique_rows", "trimesh")
+def test_unique_rows_matches_trimesh(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh], device: str, unique_fraction: float
+) -> None:
+    """
+    Class B: ``trimesh.grouping.unique_rows`` returns row *indices*, triwarp returns the rows.
+
+    Two named transforms. ``unique_rows_tm[0]`` indexes back into the input to get the rows
+    themselves, and neither library defines the output order, so both sides go through
+    [`tests.comparisons.lexsort_rows`][]. The inverse map is compared through its defining property
+    -- ``unique[inverse[i]] == data[i]`` -- rather than elementwise, because the label *numbering*
+    is a function of each library's own output order.
+
+    Parametrized over the same two duplicate densities the benchmark sweeps: every row distinct, and
+    a tenth as many distinct rows repeated ten times.
+    """
+    mesh_tm, _mesh_wp = icosahedron
+    faces_np = mesh_tm.faces.astype(np.int32)
+    n_unique = max(1, int(faces_np.shape[0] * unique_fraction))
+    rows_np = np.ascontiguousarray(faces_np[np.arange(faces_np.shape[0]) % n_unique])
+    rows_wp = wp.array(rows_np.reshape(-1), dtype=wp.int32, device=device).reshape(rows_np.shape)
+
+    unique_tm, inverse_tm = tm.grouping.unique_rows(rows_np)
+    unique_wp, inverse_wp = tw.grouping.unique_rows(rows_wp, return_inverse=True)
+
+    assert np.array_equal(lexsort_rows(unique_wp.numpy()), lexsort_rows(rows_np[unique_tm]))
+    assert np.array_equal(unique_wp.numpy()[inverse_wp.numpy()], rows_np[unique_tm][inverse_tm])
 
 
 def test_unique_rows_vec3(device: str):

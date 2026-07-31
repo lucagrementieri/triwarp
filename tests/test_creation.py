@@ -6,11 +6,13 @@ import numpy as np
 import open3d as o3d
 import pymeshlab as ml
 import pytest
+import shapely.geometry as sg
 import trimesh as tm
 import warp as wp
 from scipy.spatial import cKDTree
 
 import triwarp as tw
+from tests.comparisons import hausdorff_two_sided
 from tests.conversions import open3d_to_trimesh
 
 
@@ -194,6 +196,101 @@ def test_uv_sphere_matches_open3d(device: str, sections: int) -> None:
     for volume in (mesh_wp.volume, mesh_ref.volume):
         assert volume < exact_volume
         assert abs(volume - exact_volume) / exact_volume < tolerance
+
+
+# --- pymeshlab primitives ---------------------------------------------------------------
+
+
+def _pymeshlab_mesh(meshset_pml: ml.MeshSet) -> tm.Trimesh:
+    """Read MeshLab's current mesh back as a `trimesh.Trimesh`, unprocessed."""
+    mesh_pml = meshset_pml.current_mesh()
+    return tm.Trimesh(
+        np.asarray(mesh_pml.vertex_matrix(), dtype=np.float64),
+        np.asarray(mesh_pml.face_matrix()),
+        process=False,
+    )
+
+
+def _sorted_edge_lengths(mesh_tm: tm.Trimesh) -> np.ndarray:
+    """
+    Sorted multiset of unique-edge lengths: a rotation- and ordering-invariant mesh fingerprint.
+
+    Two generators of the same primitive that seat their seam at a different angle produce the same
+    multiset while sharing no vertex position, so this pins the tessellation where a
+    position-by-position compare cannot.
+    """
+    edges_np = mesh_tm.edges_unique
+    return np.sort(
+        np.linalg.norm(mesh_tm.vertices[edges_np[:, 0]] - mesh_tm.vertices[edges_np[:, 1]], axis=1)
+    )
+
+
+@pytest.mark.parity("box", "pymeshlab")
+@pytest.mark.parity("icosphere", "pymeshlab")
+@pytest.mark.parity("cone", "pymeshlab")
+@pytest.mark.parity("torus", "pymeshlab")
+def test_primitives_match_pymeshlab(device: str) -> None:
+    """
+    Four primitives against MeshLab's ``create_*`` generators, which agree exactly on the shape.
+
+    Class B throughout, with one named transform per primitive and one shared one. Each
+    ``create_*`` **pushes a new mesh onto the MeshSet** rather than returning it, so every call gets
+    a fresh set and the answer is read off ``current_mesh()``.
+
+    Two of the four are the *same mesh*: ``create_cube`` and ``create_torus`` match triwarp's vertex
+    set as a bijection (to 0 and 4.4e-07). The other two are the same mesh under a rotation about
+    the axis -- MeshLab seats the icosahedron base and the cone seam at a different angle, so the
+    vertex positions differ by up to 0.163 and 1.43 while every measure agrees -- and
+    ``create_cone`` is additionally *centred* on the origin where triwarp's cone stands on ``z =
+    0``, hence the ``h / 2`` translation. Those two are therefore compared through
+    [`_sorted_edge_lengths`][tests.test_creation._sorted_edge_lengths], which is invariant to both,
+    matching to 8.0e-08 and 4.0e-07.
+
+    ``create_cube`` takes one ``size``, so the box is compared as a unit cube rather than the
+    ``1x2x3`` box the trimesh and open3d rows use; ``create_sphere`` caps ``subdiv`` at 8.
+    """
+    cube_pml = ml.MeshSet()
+    cube_pml.create_cube(size=1.0)
+    sphere_pml = ml.MeshSet()
+    sphere_pml.create_sphere(radius=1.0, subdiv=2)
+    cone_pml = ml.MeshSet()
+    cone_pml.create_cone(r0=1.0, r1=0.0, h=2.0, subdiv=32)
+    torus_pml = ml.MeshSet()
+    torus_pml.create_torus(hradius=1.0, vradius=0.25, hsubdiv=32, vsubdiv=32)
+
+    for name, (vertices_wp, faces_wp), mesh_ref, exact_vertices in (
+        ("box", tw.creation.box(extents=(1.0, 1.0, 1.0), device=device), cube_pml, True),
+        ("icosphere", tw.creation.icosphere(subdivisions=2, device=device), sphere_pml, False),
+        (
+            "cone",
+            tw.creation.cone(radius=1.0, height=2.0, sections=32, device=device),
+            cone_pml,
+            False,
+        ),
+        (
+            "torus",
+            tw.creation.torus(1.0, 0.25, major_sections=32, minor_sections=32, device=device),
+            torus_pml,
+            True,
+        ),
+    ):
+        mesh_pml = _pymeshlab_mesh(mesh_ref)
+        if name == "cone":  # MeshLab centres the cone on the origin; triwarp bases it at z = 0.
+            mesh_pml.vertices = mesh_pml.vertices + np.array([0.0, 0.0, 1.0])
+        mesh_wp = _mesh(vertices_wp, faces_wp)
+
+        assert int(vertices_wp.shape[0]) == mesh_pml.vertices.shape[0], name
+        assert int(faces_wp.shape[0]) // 3 == mesh_pml.faces.shape[0], name
+        assert np.isclose(mesh_wp.volume, mesh_pml.volume, rtol=1e-4), name
+        assert np.isclose(mesh_wp.area, mesh_pml.area, rtol=1e-4), name
+        assert np.allclose(mesh_wp.bounds, mesh_pml.bounds, rtol=1e-5, atol=1e-5), name
+        assert np.allclose(
+            _sorted_edge_lengths(mesh_wp), _sorted_edge_lengths(mesh_pml), rtol=1e-5, atol=1e-5
+        ), name
+        if exact_vertices:
+            distance_np, match_np = cKDTree(mesh_pml.vertices).query(mesh_wp.vertices)
+            assert distance_np.max() < 1e-5, name
+            assert len(set(match_np.tolist())) == match_np.shape[0], name
 
 
 # --- table primitives -------------------------------------------------------------------
@@ -666,6 +763,82 @@ def test_triangulate_polygon_star(device: str, n: int) -> None:
         - np.dot(np.roll(ring_np[:, 0], -1), ring_np[:, 1])
     )
     assert np.isclose(np.abs(signed_np).sum(), shoelace, rtol=1e-5)
+
+
+def _triangle_cover_count(
+    vertices_np: np.ndarray, faces_np: np.ndarray, points_np: np.ndarray, margin: float
+) -> np.ndarray:
+    """
+    Count, per query point, how many of the triangles strictly contain it.
+
+    ``margin`` is a barycentric slack that excludes points lying on a triangle edge, so a point
+    shared by two triangles of a valid tiling is not double-counted -- with random queries such a
+    point is measure-zero anyway, and the slack makes that robust rather than lucky.
+    """
+    triangles_np = vertices_np[faces_np]
+    edge_a = triangles_np[:, 1] - triangles_np[:, 0]
+    edge_b = triangles_np[:, 2] - triangles_np[:, 0]
+    offset_np = points_np[None, :, :] - triangles_np[:, None, 0, :]
+    twice_area = edge_a[:, 0] * edge_b[:, 1] - edge_b[:, 0] * edge_a[:, 1]
+    weight_b = (
+        offset_np[..., 0] * edge_b[:, None, 1] - offset_np[..., 1] * edge_b[:, None, 0]
+    ) / twice_area[:, None]
+    weight_c = (
+        edge_a[:, None, 0] * offset_np[..., 1] - edge_a[:, None, 1] * offset_np[..., 0]
+    ) / twice_area[:, None]
+    weight_a = 1.0 - weight_b - weight_c
+    inside_np = (weight_a > margin) & (weight_b > margin) & (weight_c > margin)
+    return inside_np.sum(axis=0)
+
+
+@pytest.mark.parametrize("n", [16, 64])
+@pytest.mark.parity("triangulate_polygon", "trimesh")
+def test_triangulate_polygon_covers_same_region_as_trimesh(device: str, n: int) -> None:
+    """
+    Class C: two valid ear clippings, so only the tiled region is comparable.
+
+    ``trimesh.creation.triangulate_polygon`` cuts *different* diagonals from triwarp's clipper.
+
+    There is no elementwise correspondence to recover -- two valid ear clippings of one polygon are
+    genuinely different triangle sets -- so the comparison is the tiled region itself, sampled at
+    4 000 uniform points over the bounding box and reduced to a per-point cover count.
+
+    **Bug class excluded:** an ear clipper that emits a triangle *outside* the ring, or that lets
+    two ears overlap. Either shows up as a cover count of 0 or 2 where the reference says 1, and
+    neither is visible to the area sum in
+    [`test_triangulate_polygon_star`][tests.test_creation.test_triangulate_polygon_star] when the
+    surplus and the deficit happen to cancel. The cover count is deliberately *blind* to winding
+    (the barycentric weights are scale-invariant, so reversing a triangle changes nothing); the
+    signed-area assert in that same star test is what covers orientation.
+
+    **Mutation probe, measured on ``n=64``, 1 275 of the 4 000 samples interior:** the two agree on
+    **4 000 / 4 000** points, and the assert is exact equality, so every probe below clears it by
+    its full count. Dropping one triwarp triangle disagrees on 25; translating the ring by 1% of its
+    radius, on 206. Both degenerate implementations fail too: an all-zero face buffer keeps the
+    ``n - 2`` count and still disagrees on all 1 275 interior points, and the naive single fan --
+    valid only for a convex ring -- disagrees on 1 777.
+
+    Both sides are additionally checked to introduce no Steiner points, which is what makes the
+    vertex arrays directly comparable as sets.
+    """
+    ring_np = _star_ring(n)
+    vertices_wp, faces_wp = tw.creation.triangulate_polygon(_ring(ring_np, device))
+    vertices_tm, faces_tm = tm.creation.triangulate_polygon(sg.Polygon(ring_np))
+
+    assert int(faces_wp.shape[0]) // 3 == faces_tm.shape[0] == n - 2
+    assert int(vertices_wp.shape[0]) == vertices_tm.shape[0] == n
+    # Same vertex set: equal counts plus a two-sided Hausdorff distance at float32 resolution. A
+    # lexsort compare is not usable here -- the star has coordinate pairs that tie to 1e-16, so the
+    # row order is decided by rounding noise rather than by the values.
+    assert hausdorff_two_sided(vertices_wp.numpy().astype(np.float64), vertices_tm) < 1e-6
+
+    rng = np.random.default_rng(11)
+    points_np = rng.uniform(-1.05, 1.05, size=(4000, 2))
+    count_wp = _triangle_cover_count(
+        vertices_wp.numpy().astype(np.float64), faces_wp.numpy().reshape(-1, 3), points_np, 1e-9
+    )
+    count_tm = _triangle_cover_count(vertices_tm, faces_tm, points_np, 1e-9)
+    assert np.array_equal(count_wp, count_tm)
 
 
 def test_triangulate_polygon_near_collinear(device: str) -> None:

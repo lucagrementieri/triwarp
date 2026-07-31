@@ -19,7 +19,8 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from tests.conversions import open3d_to_trimesh, points_to_open3d
+from tests.comparisons import hausdorff_two_sided, symmetric_chamfer
+from tests.conversions import open3d_to_trimesh, points_to_open3d, points_to_pymeshlab
 from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
 
 _meshlib = pytest.importorskip("meshlib")
@@ -773,6 +774,72 @@ def test_ball_pivoting_face_count_near_open3d(device: str):
     n_faces_o3d = np.asarray(mesh_o3d.triangles).shape[0]
     # Same order of magnitude as open3d (both reconstruct ~2n triangles on a closed sphere).
     assert 0.5 * n_faces_o3d <= n_faces_tw <= 2.0 * n_faces_o3d
+
+
+@pytest.mark.parity("ball_pivoting", "pymeshlab")
+def test_ball_pivoting_matches_pymeshlab(device: str):
+    """
+    Class C against VCGlib's original BPA -- but a much tighter one than the open3d row above.
+
+    Two ball-pivoting fronts advance in different orders and produce different triangles, so there
+    is no face correspondence to recover. What is comparable is sharp: BPA adds no vertices, so the
+    **vertex sets are identical** (Hausdorff **3.8e-08**, class A), and at the same radius the two
+    close the same surface -- **1 280 faces against 1 277**, 0.23% apart.
+
+    **The reference's ``clustering`` parameter is load-bearing and its zero is not "off".** At
+    ``clustering=0`` the filter returns **0 faces**; 20% is MeshLab's default and the seed-triangle
+    spacing floor the algorithm needs. ``benchmarks/test_reconstruction.py`` passed 0 and so timed a
+    filter that reconstructed nothing (9.6 ms for no output, against 2.7 ms for the real thing);
+    that row now passes the default.
+
+    **Bug class excluded:** a front that closes the surface at the wrong scale or drifts off the
+    samples. **Mutation probe** on the chamfer, normalized by the reference's own sampling floor
+    (0.0196 at 8 000 samples, essentially the whole signal, so the raw number is not usable):
+    measured ratio **0.99**, against **1.47** for a 2% scale of triwarp's output, **2.76** for 5%
+    and
+    **3.57** for a half-spacing translation. The 1.3 bound therefore sits 1.3x above the measured
+    agreement and 1.13x below the smallest probe -- deliberately recorded as the weakest link here,
+    because two BPA meshes over one point set cannot differ by more than the sampling density. The
+    face-count and vertex-set asserts are the ones with real margin (21x and exact).
+
+    One genuine difference, asserted rather than smoothed over: triwarp's result is watertight and
+    MeshLab's is not, because those 3 missing faces are unclosed holes.
+    """
+    points_np, normals_np = _sphere_cloud(3)
+    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+
+    _index_wp, distance_wp = tw.neighbors.query_bvh_nearest(points_wp, points_wp, k=7)
+    neighbor_distance_np = distance_wp.numpy()[:, 1:]
+    spacing = float(np.mean(neighbor_distance_np[np.isfinite(neighbor_distance_np)]))
+    radius = 1.5 * spacing
+
+    vertices_wp, faces_wp = tw.reconstruction.ball_pivoting(points_wp, normals_wp, radius=radius)
+    mesh_wp = tm.Trimesh(
+        vertices_wp.numpy().astype(np.float64), faces_wp.numpy().reshape(-1, 3), process=False
+    )
+
+    meshset_pml = points_to_pymeshlab(points_np, normals_np)
+    meshset_pml.generate_surface_reconstruction_ball_pivoting(
+        ballradius=ml.PureValue(radius), clustering=20.0
+    )
+    mesh_pml = tm.Trimesh(
+        np.asarray(meshset_pml.current_mesh().vertex_matrix(), dtype=np.float64),
+        np.asarray(meshset_pml.current_mesh().face_matrix()),
+        process=False,
+    )
+    assert mesh_pml.faces.shape[0] > 0, "clustering=0 reconstructs nothing; this must not regress"
+
+    # BPA adds no vertices, so both must be exactly the input samples.
+    assert hausdorff_two_sided(mesh_wp.vertices, points_np) < 1e-5
+    assert hausdorff_two_sided(mesh_wp.vertices, mesh_pml.vertices) < 1e-5
+    assert 0.95 <= mesh_wp.faces.shape[0] / mesh_pml.faces.shape[0] <= 1.05
+
+    floor = symmetric_chamfer(mesh_pml, mesh_pml, n_samples=8000)
+    assert symmetric_chamfer(mesh_wp, mesh_pml, n_samples=8000) < 1.3 * floor
+
+    # triwarp closes the surface; MeshLab leaves those three faces as holes.
+    assert mesh_wp.is_watertight
+    assert not mesh_pml.is_watertight
 
 
 def test_ball_pivoting_small_radius_leaves_holes(device: str):

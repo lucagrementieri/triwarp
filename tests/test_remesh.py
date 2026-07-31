@@ -11,7 +11,13 @@ import warp as wp
 from scipy.spatial import KDTree
 
 import triwarp as tw
-from tests.conversions import bsr_to_dense, open3d_to_trimesh, trimesh_to_open3d, trimesh_to_warp
+from tests.conversions import (
+    bsr_to_dense,
+    open3d_to_trimesh,
+    trimesh_to_open3d,
+    trimesh_to_pymeshlab,
+    trimesh_to_warp,
+)
 
 
 def _undirected_edges(faces_np: np.ndarray) -> np.ndarray:
@@ -65,6 +71,35 @@ def test_subdivide(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     assert np.allclose(centroids_wp[order_wp], centroids_tm[order_tm], rtol=1e-5, atol=1e-5), (
         "face centroid sets do not match"
     )
+
+
+@pytest.mark.parity("subdivide", "open3d")
+def test_subdivide_matches_open3d(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B: Open3D's ``subdivide_midpoint`` is the same 1:4 split under a different vertex order.
+
+    Neither library defines the output ordering -- triwarp appends one new vertex per unique edge in
+    its own edge order, Open3D in its -- so the named transform matches the face **centroid sets**
+    and requires the match to be a bijection. A lexsort compare is not usable: the icosahedron's
+    centroids carry coordinate ties that triwarp resolves in ``float32`` and Open3D in ``float64``,
+    so the row order is decided by rounding noise (measured: a 1.59 spurious mismatch).
+    """
+    mesh_tm, mesh_wp = icosahedron
+
+    mesh_o3d = trimesh_to_open3d(mesh_tm).subdivide_midpoint(number_of_iterations=1)
+    mesh_ref = open3d_to_trimesh(mesh_o3d)
+    vertices_wp, faces_wp = tw.remesh.subdivide(mesh_wp.points, mesh_wp.indices)
+
+    assert int(vertices_wp.shape[0]) == mesh_ref.vertices.shape[0]
+    assert int(faces_wp.shape[0]) // 3 == mesh_ref.faces.shape[0]
+
+    centroids_wp = (
+        vertices_wp.numpy().astype(np.float64)[faces_wp.numpy().reshape(-1, 3)].mean(axis=1)
+    )
+    centroids_o3d = mesh_ref.vertices[mesh_ref.faces].mean(axis=1)
+    distance_np, match_np = KDTree(centroids_o3d).query(centroids_wp)
+    assert distance_np.max() < 1e-5, f"face centroids differ by up to {distance_np.max():.3e}"
+    assert len(set(match_np.tolist())) == match_np.shape[0], "the centroid match is not a bijection"
 
 
 def test_subdivide_empty(device: str) -> None:
@@ -135,6 +170,62 @@ def test_subdivide_to_size_reference_regular(icosahedron: tuple[tm.Trimesh, wp.M
     hist_wp = np.bincount(index_wp.numpy(), minlength=n_in_faces)
     hist_ref = np.bincount(ref_index, minlength=n_in_faces)
     assert np.array_equal(hist_wp, hist_ref)
+
+
+@pytest.mark.parametrize("split_fraction", [0.7, 0.35])
+@pytest.mark.parity("subdivide_to_size", "pymeshlab")
+def test_subdivide_to_size_matches_pymeshlab(device: str, split_fraction: float) -> None:
+    """
+    Class A: MeshLab's midpoint refinement produces the *identical* mesh, vertex for vertex.
+
+    ``meshing_surface_subdivision_midpoint`` splits every edge over ``threshold`` at its midpoint
+    and repeats, which is exactly what this function does, and at both split fractions the two agree
+    on the vertex count, the face count, the resulting longest edge and every vertex *position* --
+    worst nearest-neighbour distance **6.5e-08**. So no transform on the geometry is needed at all.
+
+    Two on the plumbing, both matching what the benchmark passes. ``threshold`` takes a wrapper type
+    and gets ``ml.PureValue`` fed from the same absolute length triwarp receives, not a
+    ``PercentageValue`` of MeshLab's own bounding box. And ``iterations`` is a pass *cap* rather
+    than a convergence criterion, so it is set well above the ``log2`` depth the target needs and
+    the surplus passes find nothing left to refine; this is why the two converge to the same fixed
+    point despite counting passes differently.
+
+    Measured on ``icosphere(2)``: 642 vertices / 1 280 faces at 0.7x the mean edge, 2 562 / 5 120 at
+    0.35x, identical on both sides.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    mesh_wp = trimesh_to_warp(mesh_tm, device)
+    edges_np = mesh_tm.edges_unique
+    mean_edge = float(
+        np.linalg.norm(
+            mesh_tm.vertices[edges_np[:, 0]] - mesh_tm.vertices[edges_np[:, 1]], axis=1
+        ).mean()
+    )
+    max_edge = split_fraction * mean_edge
+
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    meshset_pml.meshing_surface_subdivision_midpoint(
+        iterations=10, threshold=ml.PureValue(max_edge)
+    )
+    vertices_pml = np.asarray(meshset_pml.current_mesh().vertex_matrix(), dtype=np.float64)
+    faces_pml = np.asarray(meshset_pml.current_mesh().face_matrix())
+
+    vertices_wp, faces_wp = tw.remesh.subdivide_to_size(mesh_wp.points, mesh_wp.indices, max_edge)
+    vertices_np = vertices_wp.numpy().astype(np.float64)
+    faces_np = faces_wp.numpy().reshape(-1, 3)
+
+    assert vertices_np.shape[0] == vertices_pml.shape[0]
+    assert faces_np.shape[0] == faces_pml.shape[0]
+
+    # Same vertex set, then the same faces once triwarp's indices are remapped onto MeshLab's.
+    distance_np, remap_np = KDTree(vertices_pml).query(vertices_np)
+    assert distance_np.max() < 1e-5, f"vertices differ by up to {distance_np.max():.3e}"
+    assert len(set(remap_np.tolist())) == remap_np.shape[0]
+    mapped_np = np.sort(remap_np[faces_np], axis=1)
+    reference_np = np.sort(faces_pml, axis=1)
+    assert np.array_equal(
+        mapped_np[np.lexsort(mapped_np.T[::-1])], reference_np[np.lexsort(reference_np.T[::-1])]
+    )
 
 
 def test_subdivide_to_size_reference_mixed(device: str) -> None:

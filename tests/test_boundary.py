@@ -10,6 +10,8 @@ import trimesh.grouping as tm_grouping
 import warp as wp
 
 import triwarp as tw
+from tests.comparisons import assert_cyclic_permutation_equal
+from tests.conversions import trimesh_to_pymeshlab
 
 # Open-surface fixtures that actually have a boundary (watertight solids do not).
 OPEN_MESHES = ["hemisphere", "half_torus"]
@@ -42,14 +44,33 @@ def test_oriented_boundary_edges(request: pytest.FixtureRequest, mesh_name: str)
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+@pytest.mark.parity("boundary_edges", "pymeshlab")
 def test_boundary_vertex_indices(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B: MeshLab marks the boundary *vertices* where triwarp returns the edge pairs.
+
+    ``compute_selection_from_mesh_border`` does the same find-the-boundary pass and stops one step
+    earlier, writing a per-vertex bool selection rather than the edges. Two named transforms make
+    them comparable: the reference is read off ``vertex_selection_array()`` (the filter returns
+    ``None``), and triwarp's edge pairs are projected down with ``np.unique`` -- which is exactly
+    what [`boundary_vertex_indices`][triwarp.boundary.boundary_vertex_indices] computes, so the
+    projection is a function under test rather than test-side glue.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     boundary_edges_tm = mesh_tm.edges_sorted[_boundary_indices_tm(mesh_tm)]
     vertex_indices_tm = np.unique(boundary_edges_tm)
     vertex_indices_wp = tw.boundary.boundary_vertex_indices(mesh_wp.points, mesh_wp.indices)
 
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm)
+    meshset_pml.compute_selection_from_mesh_border()
+    selection_pml = np.asarray(meshset_pml.current_mesh().vertex_selection_array())
+
     assert np.array_equal(vertex_indices_wp.numpy(), vertex_indices_tm)
+    assert np.array_equal(np.flatnonzero(selection_pml), vertex_indices_wp.numpy())
+    # And the edges themselves project onto the same vertex set.
+    edges_wp = tw.boundary.boundary_edges(mesh_wp.points, mesh_wp.indices)
+    assert np.array_equal(np.unique(edges_wp.numpy()), np.flatnonzero(selection_pml))
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
@@ -122,6 +143,43 @@ def test_boundary_loops(request: pytest.FixtureRequest, mesh_name: str) -> None:
     assert len(loops_wp) == len(loops_igl)
     for loop_wp, loop_igl in zip(loops_wp, loops_igl, strict=True):
         assert np.array_equal(loop_wp.numpy(), np.asarray(loop_igl))
+
+
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+@pytest.mark.parity("boundary_loops", "trimesh")
+def test_boundary_loops_matches_trimesh_outline(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B: ``Trimesh.outline()`` returns the same loops as ``Path3D`` entities.
+
+    Three named transforms, all conventions rather than results. The entities index into
+    ``Path3D.vertices``, which is the mesh's own vertex array unchanged, so no remapping is needed.
+    A closed entity **repeats its first point** as the last one, so that trailing duplicate is
+    dropped. And neither the loop *order* within the list (triwarp ranks by length, trimesh by
+    traversal) nor the starting point and direction *within* a loop are defined by either library,
+    so the lists are paired by lowest vertex index and compared with
+    [`tests.comparisons.assert_cyclic_permutation_equal`][].
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+
+    outline_tm = mesh_tm.outline()
+    assert np.allclose(outline_tm.vertices, mesh_tm.vertices)
+    loops_tm = []
+    for entity in outline_tm.entities:
+        assert bool(entity.closed), "an open outline entity means the fixture is not a clean rim"
+        points = np.asarray(entity.points)
+        assert points[0] == points[-1]
+        loops_tm.append(points[:-1])
+    loops_wp = tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices)
+
+    assert len(loops_wp) == len(loops_tm)
+    for loop_wp, loop_tm in zip(
+        sorted((loop.numpy() for loop in loops_wp), key=lambda loop: int(loop.min())),
+        sorted(loops_tm, key=lambda loop: int(loop.min())),
+        strict=True,
+    ):
+        assert_cyclic_permutation_equal(loop_wp, loop_tm)
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
