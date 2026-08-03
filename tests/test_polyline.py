@@ -505,21 +505,6 @@ def test_reduce_median_matches_numpy(device: str, n: int, dtype_wp: type, dtype_
     assert np.allclose(tw.reduce.median(values_wp), np.median(values_np), rtol=1e-5, atol=1e-5)
 
 
-def test_array_allclose_matches_numpy(device: str) -> None:
-    rng = np.random.default_rng(95)
-    a_np = rng.standard_normal((6, 3)).astype(np.float32)
-    a_wp = wp.array(a_np, dtype=wp.vec3, device=device)
-    b_close = wp.array(a_np + 1e-9, dtype=wp.vec3, device=device)
-    b_far = wp.array(a_np + 1e-2, dtype=wp.vec3, device=device)
-    assert tw.array.allclose(a_wp, b_close) == bool(np.allclose(a_np, a_np + 1e-9))
-    assert tw.array.allclose(a_wp, b_far) == bool(np.allclose(a_np, a_np + 1e-2))
-
-
-def test_array_allclose_empty_is_true(device: str) -> None:
-    empty = wp.empty(0, dtype=wp.vec3, device=device)
-    assert tw.array.allclose(empty, empty) is True
-
-
 # --- edge cases ---
 
 

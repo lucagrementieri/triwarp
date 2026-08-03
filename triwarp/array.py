@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Sequence
 from typing import TypeVar
 
@@ -135,7 +136,7 @@ def init_sort_pair_indices(
 
     See Also
     --------
-    [`sort_pairs`][triwarp.array.sort_pairs]
+    [`sort_and_argsort`][triwarp.array.sort_and_argsort]
     """
     dtype = _ensure_int_dtype(dtype)
     if n < 0:
@@ -200,20 +201,6 @@ def init_repeat_index(
     return out
 
 
-def append(arr: wp.array[wp.Scalar], value: wp.Scalar) -> wp.array[wp.Scalar]:
-    """
-    Return a new 1-D array with ``value`` appended after ``arr``.
-
-    Allocates ``len(arr) + 1`` elements initialized to ``value``, then copies
-    ``arr`` into the prefix with a single ``wp.copy``.
-    """
-    n = int(arr.shape[0])
-    out = wp.full(n + 1, value, dtype=arr.dtype, device=arr.device)
-    if n > 0:
-        wp.copy(out, arr, dest_offset=0, src_offset=0, count=n)
-    return out
-
-
 def pack_1d_arrays(
     arrays: Sequence[wp.array[wp.Scalar]],
 ) -> tuple[wp.array[wp.Scalar], wp.array[wp.int32]]:
@@ -244,31 +231,14 @@ def pack_1d_arrays(
     Raises
     ------
     ValueError
-        If ``arrays`` is empty, ranks differ from one, or ``dtype`` / ``device`` are inconsistent.
+        If ``arrays`` is empty, any input is not rank-1, or their ``dtype`` differs.
+
+    See Also
+    --------
+    [`concatenate`][triwarp.array.concatenate]
     """
-    if len(arrays) == 0:
-        raise ValueError("arrays must be non-empty")
-
-    dtype = arrays[0].dtype
-    device = arrays[0].device
-    sizes = []
-    offsets = [0]
-    for i, arr in enumerate(arrays):
-        if arr.dtype != dtype:
-            raise ValueError(
-                f"all arrays must have the same dtype, got {dtype} and {arr.dtype} at index {i}"
-            )
-        sizes.append(int(arr.size))
-        offsets.append(offsets[-1] + sizes[-1])
-
-    total = offsets.pop()
-    flat = wp.empty(total, dtype=dtype, device=device)
-    for array, offset in zip(arrays, offsets, strict=True):
-        array_length = int(array.size)
-        if array_length > 0:
-            wp.copy(flat, array, dest_offset=offset, src_offset=0, count=array_length)
-
-    return flat, wp.array(offsets, dtype=wp.int32, device=device)
+    flat, offsets = _pack_segments(arrays, caller="pack_1d_arrays")
+    return flat, wp.array(offsets, dtype=wp.int32, device=flat.device)
 
 
 def concatenate(arrays: Sequence[wp.array[DType]]) -> wp.array[DType]:
@@ -291,7 +261,11 @@ def concatenate(arrays: Sequence[wp.array[DType]]) -> wp.array[DType]:
     Raises
     ------
     ValueError
-        If ``arrays`` is empty, any input is not rank-1, or ``dtype`` / ``device`` differ.
+        If ``arrays`` is empty, any input is not rank-1, or their ``dtype`` differs.
+
+    See Also
+    --------
+    [`pack_1d_arrays`][triwarp.array.pack_1d_arrays]
     """
     if len(arrays) == 0:
         raise ValueError("arrays must be non-empty")
@@ -300,37 +274,46 @@ def concatenate(arrays: Sequence[wp.array[DType]]) -> wp.array[DType]:
         if int(arr.ndim) != 1:
             raise ValueError(f"concatenate requires rank-1 arrays, got ndim={arr.ndim}")
         return arr
+    return _pack_segments(arrays, caller="concatenate")[0]
+
+
+def _pack_segments(
+    arrays: Sequence[wp.array[DType]], *, caller: str
+) -> tuple[wp.array[DType], list[int]]:
+    """
+    Validate rank-1 segments and copy them into one contiguous buffer.
+
+    The shared body of [`pack_1d_arrays`][triwarp.array.pack_1d_arrays] and
+    [`concatenate`][triwarp.array.concatenate], which differ only in whether the caller wants the
+    segment offsets back as a device array. Returns them as a Python list so ``concatenate`` pays
+    nothing for the offsets it discards.
+    """
+    if len(arrays) == 0:
+        raise ValueError("arrays must be non-empty")
 
     dtype = arrays[0].dtype
     device = arrays[0].device
-    total = 0
+    sizes = []
     for i, arr in enumerate(arrays):
         if int(arr.ndim) != 1:
-            raise ValueError(
-                f"concatenate requires rank-1 arrays, got ndim={arr.ndim} at index {i}"
-            )
+            raise ValueError(f"{caller} requires rank-1 arrays, got ndim={arr.ndim} at index {i}")
         if arr.dtype != dtype:
             raise ValueError(
                 f"all arrays must have the same dtype, got {dtype} and {arr.dtype} at index {i}"
             )
-        total += int(arr.shape[0])
+        sizes.append(int(arr.shape[0]))
 
-    if total == 0:
-        return wp.empty(0, dtype=dtype, device=device)
-
-    out = wp.empty(total, dtype=dtype, device=device)
-    dest = 0
-    for arr in arrays:
-        n = int(arr.shape[0])
+    offsets = list(itertools.accumulate(sizes[:-1], initial=0))
+    flat = wp.empty(offsets[-1] + sizes[-1], dtype=dtype, device=device)
+    for arr, offset, n in zip(arrays, offsets, sizes, strict=True):
         if n > 0:
-            wp.copy(out, arr, dest_offset=dest, count=n)
-            dest += n
-    return out
+            wp.copy(flat, arr, dest_offset=offset, count=n)
+    return flat, offsets
 
 
 def allclose(
-    a: wp.array[wp.float32] | wp.array[wp.vec3],
-    b: wp.array[wp.float32] | wp.array[wp.vec3],
+    a: wp.array[wp.Float] | wp.array[wp.vec3],
+    b: wp.array[wp.Float] | wp.array[wp.vec3],
     *,
     rtol: float = 1e-05,
     atol: float = 1e-08,
@@ -345,13 +328,15 @@ def allclose(
     Parameters
     ----------
     a
-        Length-``n`` ``wp.float32`` or ``wp.vec3`` array on the target device.
+        Length-``n`` array of any float dtype (``float16`` / ``float32`` / ``float64``) or of
+        ``wp.vec3``, on the target device.
     b
-        Array of the same length and dtype as ``a``, on the same device.
+        Array of the same length and dtype as ``a``.
     rtol
-        Relative tolerance. Defaults to ``1e-05``.
+        Relative tolerance. Defaults to ``1e-05``. Converted to ``a``'s precision.
     atol
-        Absolute tolerance. Defaults to ``1e-08``.
+        Absolute tolerance. Defaults to ``1e-08``. Converted to ``a``'s precision, so a
+        ``float16`` comparison cannot resolve a tolerance below its own epsilon.
 
     Returns
     -------
@@ -372,18 +357,27 @@ def allclose(
     if n == 0:
         return True
 
-    device = a.device
-    mask = wp.empty(n, dtype=wp.bool, device=device)
-    is_close = kernel_array.is_close_vec3 if a.dtype == wp.vec3 else kernel_array.is_close_scalar
-    wp.map(is_close, a, b, wp.float32(rtol), wp.float32(atol), out=mask)
+    mask = wp.empty(n, dtype=wp.bool, device=a.device)
+    # ``is_close_scalar`` is generic over ``wp.Float`` and instantiates at the input's precision, so
+    # the tolerances have to arrive at that precision too. Vectors get a concrete overload: Warp has
+    # no generic vector annotation, and no ``wp.all`` over components to fold one with.
+    if a.dtype == wp.vec3:
+        wp.map(kernel_array.is_close_vec3, a, b, wp.float32(rtol), wp.float32(atol), out=mask)
+    else:
+        scalar = a.dtype
+        wp.map(kernel_array.is_close_scalar, a, b, scalar(rtol), scalar(atol), out=mask)
     return bool(tw.reduce.all(mask))
 
 
-def sort_pairs(
+def sort_and_argsort(
     keys: wp.array[wp.Scalar], *, fill_value: int = -1
 ) -> tuple[wp.array[wp.Scalar], wp.array[wp.int32]]:
     """
-    Ascending radix sort of ``keys``, returning the sorted keys and their original positions.
+    Ascending sort of ``keys`` together with the permutation that produced it.
+
+    Both halves of ``numpy.sort`` and ``numpy.argsort`` at once: a radix sort produces the ordered
+    keys as a side effect of computing the order, so returning only one of the two would throw work
+    away. ``sorted_keys[i] == keys[order[i]]``.
 
     Wraps ``warp.utils.radix_sort_pairs``, which needs double-width scratch for both the keys and
     the payload; this allocates that scratch, seeds the payload with ``0..n-1`` and hands back
@@ -392,7 +386,8 @@ def sort_pairs(
     Parameters
     ----------
     keys
-        Length-``n`` sort keys (any radix-sortable scalar dtype).
+        Length-``n`` sort keys (any radix-sortable scalar dtype; see
+        [`sortable_dtype`][triwarp.array.sortable_dtype] for which those are).
     fill_value
         Padding written into the upper half of the payload buffer, where the sort's scratch lives.
         Only matters to callers that read past ``n``.
@@ -408,6 +403,15 @@ def sort_pairs(
     -----
     Both results are **views** into the scratch buffers, kept alive by the returned arrays. Clone
     them if they must outlive the caller's frame alongside another sort.
+
+    Ties are broken arbitrarily -- the radix sort is not documented as stable -- so ``order`` is
+    only one of several valid permutations when ``keys`` has duplicates.
+
+    See Also
+    --------
+    [`sort_rows`][triwarp.array.sort_rows]
+    [`init_sort_pair_indices`][triwarp.array.init_sort_pair_indices]
+    [`sortable_dtype`][triwarp.array.sortable_dtype]
     """
     device = keys.device
     n = int(keys.shape[0])
@@ -518,9 +522,7 @@ def index_sparse(
     )
 
 
-def isin(
-    elements: twt.Array1dInt32 | twt.Array2dInt32, test_elements: twt.Array1dInt32
-) -> wp.array[wp.bool]:
+def isin(elements: twt.ArrayNdInt32, test_elements: twt.Array1dInt32) -> wp.array[wp.bool]:
     """
     Test whether each element appears in ``test_elements`` (``numpy.isin`` for ``int32``).
 
@@ -532,9 +534,11 @@ def isin(
     Parameters
     ----------
     elements
-        Rank-1 or rank-2 ``wp.int32`` array on the target device.
+        ``wp.int32`` array of **any rank** on the target device. Membership is a per-element
+        predicate, so the array is flattened, tested, and the result reshaped back; nothing in
+        the two strategies looks at the shape.
     test_elements
-        1D ``wp.int32`` array of values to test membership against, on the same device.
+        1D ``wp.int32`` array of values to test membership against.
 
     Returns
     -------
@@ -542,10 +546,10 @@ def isin(
         Boolean array with the same shape as ``elements``. All ``False`` when either
         input is empty.
 
-    Raises
-    ------
-    ValueError
-        If ``elements`` and ``test_elements`` live on different devices.
+    See Also
+    --------
+    [`indices_to_mask`][triwarp.array.indices_to_mask]
+    [`numpy.isin`][]
     """
     device = elements.device
 
@@ -553,32 +557,29 @@ def isin(
     if k == 0 or int(elements.size) == 0:
         return wp.zeros(elements.shape, dtype=wp.bool, device=device)
 
-    if int(elements.ndim) > 1:
-        twt.ensure_ndim(elements, 2, dtype=wp.int32)
-    elements_flat = elements.flatten() if int(elements.ndim) > 1 else elements
+    is_flat = int(elements.ndim) == 1
+    elements_flat = elements if is_flat else elements.flatten()
 
-    max_index = int(max(tw.reduce.max(elements), tw.reduce.max(test_elements)) + 1)
+    max_index = int(max(tw.reduce.max(elements_flat), tw.reduce.max(test_elements)) + 1)
     if max_index <= _ISIN_MASK_SIZE_FACTOR * k:
         out_flat = _isin_lookup_mask(elements_flat, test_elements, max_index)
     else:
         out_flat = _isin_lookup_sorted(elements_flat, test_elements)
 
-    if int(elements.ndim) > 1:
-        return out_flat.reshape(elements.shape)
-    return out_flat
+    return out_flat if is_flat else out_flat.reshape(elements.shape)
 
 
 def _sorted_copy(values: wp.array[DType]) -> wp.array[DType]:
     """
     Ascending-sorted copy of a 1D scalar array.
 
-    ``sort_pairs`` returns a *view* into its own scratch and this outlives the caller's frame, so
-    the keys are cloned. The order payload is discarded, which is why the padding value it seeds
-    does not matter here.
+    ``sort_and_argsort`` returns a *view* into its own scratch and this outlives the caller's
+    frame, so the keys are cloned. The order payload is discarded, which is why the padding value
+    it seeds does not matter here.
     """
     if int(values.shape[0]) <= 1:
         return values
-    return wp.clone(sort_pairs(values)[0])
+    return wp.clone(sort_and_argsort(values)[0])
 
 
 def _isin_lookup_mask(
@@ -612,35 +613,52 @@ def _isin_lookup_sorted(
     return out_wp
 
 
-def flatnonzero(mask: wp.array[wp.bool]) -> wp.array[wp.int32]:
+def flatnonzero(values: wp.array[wp.bool] | wp.array[wp.Scalar]) -> wp.array[wp.int32]:
     """
-    Return indices of ``True`` entries in a 1D boolean mask (``numpy.flatnonzero``).
+    Return the indices of the non-zero entries of a 1D array (``numpy.flatnonzero``).
+
+    Takes a boolean mask, which is the common case, or any scalar array — every non-zero value
+    selects its index, exactly as ``numpy.flatnonzero`` does, so ``-2`` and ``3`` both count and
+    only ``0`` does not.
 
     Parameters
     ----------
-    mask
-        Length-``n`` ``wp.bool`` array on the target device.
+    values
+        Length-``n`` ``wp.bool`` mask, or a ``wp.int32`` / float / other scalar array, on the
+        target device.
 
     Returns
     -------
     wp.array[wp.int32]
-        Selected indices on ``mask.device``. Empty when no entries are ``True``.
+        Selected indices on ``values.device``, ascending. Empty when nothing is non-zero.
 
     Raises
     ------
     ValueError
-        If ``mask`` is not rank-1.
-    """
-    if int(mask.ndim) != 1:
-        raise ValueError(f"flatnonzero requires a 1D mask, got ndim={mask.ndim}")
+        If ``values`` is not rank-1.
 
-    device = mask.device
-    n = int(mask.shape[0])
+    See Also
+    --------
+    [`indices_to_mask`][triwarp.array.indices_to_mask]
+    [`mask_to_index_map`][triwarp.array.mask_to_index_map]
+    [`numpy.flatnonzero`][]
+    """
+    if int(values.ndim) != 1:
+        raise ValueError(f"flatnonzero requires a 1D array, got ndim={values.ndim}")
+
+    device = values.device
+    n = int(values.shape[0])
     if n == 0:
         return wp.empty(0, dtype=wp.int32, device=device)
 
     flags = wp.empty(n, dtype=wp.int32, device=device)
-    wp.utils.array_cast(mask, flags)
+    if values.dtype == wp.bool:
+        # ``array_cast`` already yields exactly 0/1 from a mask, and ``wp.Scalar`` does not
+        # instantiate for ``wp.bool`` anyway. For every other dtype the cast would copy the
+        # *values*, and the scan below would then sum them instead of counting them.
+        wp.utils.array_cast(values, flags)
+    else:
+        wp.map(kernel_array.nonzero_flag, values, out=flags)
 
     # Inclusive scan: the total is its last element, so one 4-byte tail read sizes the output
     # (the scatter kernel derives each exclusive position as inclusive[i] - 1).
@@ -655,13 +673,15 @@ def flatnonzero(mask: wp.array[wp.bool]) -> wp.array[wp.int32]:
     wp.launch(
         kernel_scatter.scatter_index_where,
         dim=n,
-        inputs=[mask, inclusive, out_indices],
+        inputs=[flags, inclusive, out_indices],
         device=device,
     )
     return out_indices
 
 
-def gather(src: wp.array[DType], indices: wp.array[wp.int32]) -> wp.array[DType]:
+def gather(
+    src: wp.array[DType] | twt.ArrayNd, indices: wp.array[wp.int32]
+) -> wp.array[DType] | twt.ArrayNd:
     """
     Dense copy of ``src`` gathered along its first axis by ``indices`` (``numpy.take``).
 
@@ -671,12 +691,17 @@ def gather(src: wp.array[DType], indices: wp.array[wp.int32]) -> wp.array[DType]
     (``src[indices]``) and rank-2 row gather (``src[indices, :]``), with any scalar or vector
     ``dtype``.
 
+    Only the first axis is indexable, which is what every caller in this package needs. To take a
+    *column*, materialize it with ``wp.clone(src[:, k])`` — a column view is strided, and Warp's
+    fancy indexing silently ignores the stride of an index array.
+
     Parameters
     ----------
     src
         Rank-1 or rank-2 ``wp.array`` on the target device.
     indices
-        1D ``wp.int32`` array of indices into the first axis of ``src``, on the same device.
+        1D ``wp.int32`` array of indices into the first axis of ``src``. **Must be contiguous**;
+        see the warning above.
 
     Returns
     -------
@@ -684,6 +709,11 @@ def gather(src: wp.array[DType], indices: wp.array[wp.int32]) -> wp.array[DType]
         Contiguous gathered copy on ``src.device`` with shape
         ``(len(indices), *src.shape[1:])`` and the same ``dtype`` as ``src``. Empty along the
         first axis when ``indices`` is empty.
+
+    See Also
+    --------
+    [`index_sparse`][triwarp.array.index_sparse]
+    [`remap_indices`][triwarp.array.remap_indices]
     """
     k = int(indices.shape[0])
     out_shape = (k, *(int(dim) for dim in src.shape[1:]))
@@ -715,6 +745,11 @@ def indices_to_mask(
     -------
     wp.array[wp.bool]
         Length-``n`` mask, all ``False`` except at positions named by ``indices``.
+
+    See Also
+    --------
+    [`flatnonzero`][triwarp.array.flatnonzero]
+    [`isin`][triwarp.array.isin]
     """
     device = device if device is not None else indices.device
     mask = wp.zeros(n, dtype=wp.bool, device=device)
@@ -765,7 +800,9 @@ def mask_to_index_map(
     return counts_to_offsets(flags)
 
 
-def counts_to_offsets(counts: wp.array[wp.int32]) -> tuple[wp.array[wp.int32], int]:
+def counts_to_offsets(
+    counts: wp.array[wp.int32], *, sentinel: bool = False
+) -> tuple[wp.array[wp.int32], int]:
     """
     Exclusive prefix sum of ``counts``, plus their total.
 
@@ -781,21 +818,26 @@ def counts_to_offsets(counts: wp.array[wp.int32]) -> tuple[wp.array[wp.int32], i
     ----------
     counts
         Length-``n`` ``wp.int32`` per-element counts.
+    sentinel
+        Return the length-``n + 1`` CSR form, whose trailing element is ``total``, instead of the
+        length-``n`` form. Free — that buffer is what gets built either way — and it is what
+        ``warp.utils.segmented_sort_pairs`` and the other segment-bounds consumers want.
 
     Returns
     -------
     offsets : wp.array[wp.int32]
-        Length-``n`` exclusive prefix sum, a **view** into an ``n + 1`` buffer that ``total`` keeps
-        alive. Element ``i`` owns ``[offsets[i], offsets[i] + counts[i])``.
+        Exclusive prefix sum: length ``n`` by default, or ``n + 1`` with ``offsets[n] == total``
+        when ``sentinel`` is set. The default is a **view** into the ``n + 1`` buffer, which the
+        returned array keeps alive. Element ``i`` owns ``[offsets[i], offsets[i] + counts[i])``.
     total : int
         Sum of ``counts``.
 
     Notes
     -----
-    Two offsets conventions coexist in this package: the length-``n`` form returned here, with the
-    total implicit, and a length-``n + 1`` form that stores it (``halfedge.vertex_one_rings``,
-    ``tracing.trace_geodesic_from_vertex``). This builds the latter internally, so a caller that
-    wants it can be given the whole buffer instead.
+    Two offsets conventions coexist in this package: the length-``n`` form, with the total
+    implicit, and the length-``n + 1`` form that stores it (``halfedge.vertex_one_rings``,
+    ``tracing.trace_geodesic_from_vertex``, and every ``segmented_sort_pairs`` caller). Both come
+    out of here, so no caller has to append the terminator afterwards.
 
     See Also
     --------
@@ -805,12 +847,12 @@ def counts_to_offsets(counts: wp.array[wp.int32]) -> tuple[wp.array[wp.int32], i
     n = int(counts.shape[0])
     device = counts.device
     if n == 0:
-        return wp.zeros(0, dtype=wp.int32, device=device), 0
+        return wp.zeros(1 if sentinel else 0, dtype=wp.int32, device=device), 0
     # The leading zero from ``wp.zeros`` is the first exclusive offset; the inclusive scan fills the
     # rest, so ``buffer[n]`` is the total and ``buffer[:n]`` the exclusive offsets.
     buffer = wp.zeros(n + 1, dtype=wp.int32, device=device)
     wp.utils.array_scan(counts, out_array=buffer[1:], inclusive=True)
-    return buffer[:n], int(buffer[n:].numpy()[0])
+    return buffer if sentinel else buffer[:n], int(buffer[n:].numpy()[0])
 
 
 def remap_indices(indices: wp.array[wp.int32], remap: wp.array[wp.int32]) -> wp.array[wp.int32]:
@@ -964,6 +1006,23 @@ def sortable_dtype(dtype: type[wp.Scalar]) -> type[wp.Scalar]:
     ordering: negative floats have descending bit patterns, and a ``uint64`` with its top bit set
     reads as a negative ``int64``. Warp 1.15 sorts ``uint32`` / ``uint64`` / ``float64`` keys
     directly, so the sort is done in this dtype instead of on the reinterpreted bits.
+
+    Parameters
+    ----------
+    dtype
+        Any Warp scalar dtype.
+
+    Returns
+    -------
+    type[wp.Scalar]
+        ``dtype`` itself when Warp can already sort it, otherwise the narrowest same-signedness,
+        same-kind dtype it can (``float32`` / ``float64``, ``uint32`` / ``uint64``, ``int32`` /
+        ``int64``), chosen by whether ``dtype`` is wider than four bytes.
+
+    See Also
+    --------
+    [`sort_and_argsort`][triwarp.array.sort_and_argsort]
+    [`bitcast_to_int`][triwarp.array.bitcast_to_int]
     """
     wide = wp.types.type_size_in_bytes(dtype) > 4
     if wp.types.type_is_float(dtype):

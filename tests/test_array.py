@@ -56,18 +56,6 @@ def test_init_repeat_index_zero_count(device: str) -> None:
     assert out_wp.shape == (0,)
 
 
-def test_append(device: str) -> None:
-    arr_wp = wp.array([0, 3, 7], dtype=wp.int32, device=device)
-    out_wp = tw.array.append(arr_wp, 12)
-    assert np.array_equal(out_wp.numpy(), np.array([0, 3, 7, 12], dtype=np.int32))
-
-
-def test_append_empty(device: str) -> None:
-    arr_wp = wp.empty(0, dtype=wp.int32, device=device)
-    out_wp = tw.array.append(arr_wp, 5)
-    assert np.array_equal(out_wp.numpy(), np.array([5], dtype=np.int32))
-
-
 def test_square(device: str) -> None:
     rng = np.random.default_rng(0)
     values_np = (rng.random(64, dtype=np.float32) * 4.0 - 2.0).astype(np.float32)
@@ -101,6 +89,69 @@ def test_concatenate_single_returns_input(device: str) -> None:
 def test_concatenate_empty_segments(device: str) -> None:
     out_wp = tw.array.concatenate([wp.empty(0, dtype=wp.int32, device=device)])
     assert out_wp.shape == (0,)
+
+
+@pytest.mark.parametrize(
+    ("dtype_wp", "dtype_np"),
+    [(wp.float32, np.float32), (wp.float64, np.float64), (wp.vec3, np.float32)],
+    ids=["float32", "float64", "vec3"],
+)
+def test_allclose_matches_numpy(device: str, dtype_wp: type, dtype_np: type) -> None:
+    """The tolerances must instantiate at the input's precision, not always at ``float32``."""
+    rng = np.random.default_rng(95)
+    shape = (6, 3) if dtype_wp is wp.vec3 else (18,)
+    a_np = rng.standard_normal(shape).astype(dtype_np)
+    a_wp = wp.array(a_np, dtype=dtype_wp, device=device)
+    close_wp = wp.array(a_np + dtype_np(1e-9), dtype=dtype_wp, device=device)
+    far_wp = wp.array(a_np + dtype_np(1e-2), dtype=dtype_wp, device=device)
+    assert tw.array.allclose(a_wp, close_wp) == bool(np.allclose(a_np, a_np + dtype_np(1e-9)))
+    assert tw.array.allclose(a_wp, far_wp) == bool(np.allclose(a_np, a_np + dtype_np(1e-2)))
+
+
+def test_allclose_empty_is_true(device: str) -> None:
+    empty_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    assert tw.array.allclose(empty_wp, empty_wp) is True
+
+
+def test_allclose_rejects_mismatched_dtypes(device: str) -> None:
+    a_wp = wp.zeros(3, dtype=wp.float32, device=device)
+    b_wp = wp.zeros(3, dtype=wp.float64, device=device)
+    with pytest.raises(ValueError, match="matching dtypes"):
+        tw.array.allclose(a_wp, b_wp)
+
+
+def test_sort_and_argsort_distinct_keys(device: str) -> None:
+    """With distinct keys the permutation is unique, so it must equal ``numpy.argsort``."""
+    rng = np.random.default_rng(31)
+    keys_np = rng.permutation(64).astype(np.int32)
+    keys_wp = wp.array(keys_np, dtype=wp.int32, device=device)
+    sorted_keys_wp, order_wp = tw.array.sort_and_argsort(keys_wp)
+    assert np.array_equal(sorted_keys_wp.numpy(), np.sort(keys_np))
+    assert np.array_equal(order_wp.numpy(), np.argsort(keys_np).astype(np.int32))
+
+
+def test_sort_and_argsort_duplicate_keys(device: str) -> None:
+    """
+    With ties the radix sort is not documented as stable, so only the permutation property holds.
+
+    ``sorted_keys[i] == keys[order[i]]`` and ``order`` is a permutation of ``0..n-1`` -- that is
+    everything the contract promises, and it is what distinguishes a correct sort from one that
+    dropped or duplicated an entry.
+    """
+    rng = np.random.default_rng(32)
+    keys_np = rng.integers(0, 8, size=64).astype(np.int32)
+    keys_wp = wp.array(keys_np, dtype=wp.int32, device=device)
+    sorted_keys_wp, order_wp = tw.array.sort_and_argsort(keys_wp)
+    assert np.array_equal(sorted_keys_wp.numpy(), np.sort(keys_np))
+    assert np.array_equal(np.sort(order_wp.numpy()), np.arange(64, dtype=np.int32))
+    assert np.array_equal(keys_np[order_wp.numpy()], sorted_keys_wp.numpy())
+
+
+def test_sort_and_argsort_empty(device: str) -> None:
+    keys_wp = wp.empty(0, dtype=wp.int32, device=device)
+    sorted_keys_wp, order_wp = tw.array.sort_and_argsort(keys_wp)
+    assert sorted_keys_wp.shape == (0,)
+    assert order_wp.shape == (0,)
 
 
 def test_pack_1d_wp_arrays(device: str):
@@ -214,6 +265,20 @@ def test_isin_empty_test(device: str) -> None:
     assert np.array_equal(mask_wp.numpy(), mask_ref_np)
 
 
+@pytest.mark.parametrize("shape", [(4, 3, 2), (2, 2, 3, 5)], ids=["rank3", "rank4"])
+def test_isin_higher_rank(device: str, shape: tuple[int, ...]) -> None:
+    """Membership is a per-element predicate, so any rank round-trips through flatten/reshape."""
+    rng = np.random.default_rng(13)
+    elements_np = rng.integers(0, 15, size=shape, dtype=np.int32)
+    test_np = rng.choice(15, size=5, replace=False).astype(np.int32)
+
+    elements_wp = wp.array(elements_np, dtype=wp.int32, device=device)
+    test_wp = wp.array(test_np, dtype=wp.int32, device=device)
+    mask_wp = tw.array.isin(elements_wp, test_wp)
+    assert mask_wp.shape == shape
+    assert np.array_equal(mask_wp.numpy(), np.isin(elements_np, test_np))
+
+
 def test_isin_sparse_large_indices(device: str) -> None:
     """Forces sort + binary-search path (max index >> len(test_elements))."""
     elements_np = np.array([1, 1_000_000, 2, 999_999, 3], dtype=np.int32)
@@ -238,6 +303,85 @@ def test_flatnonzero_empty(device: str) -> None:
     mask_wp = wp.array(np.zeros(8, dtype=bool), dtype=wp.bool, device=device)
     indices_wp = tw.array.flatnonzero(mask_wp)
     assert indices_wp.shape == (0,)
+
+
+@pytest.mark.parametrize(
+    ("dtype_wp", "dtype_np"),
+    [(wp.int32, np.int32), (wp.int8, np.int8), (wp.float32, np.float32)],
+    ids=["int32", "int8", "float32"],
+)
+def test_flatnonzero_nonboolean(device: str, dtype_wp: type, dtype_np: type) -> None:
+    """
+    Any non-zero value selects its index, matching ``numpy.flatnonzero``.
+
+    Values above one and negative values both count -- the flag pass must map to 0/1 rather than
+    cast, or the prefix sum would total the values instead of counting them.
+    """
+    values_np = np.array([0, 3, 0, -2, 1, 0, 7, -1], dtype=dtype_np)
+    values_wp = wp.array(values_np, dtype=dtype_wp, device=device)
+    indices_wp = tw.array.flatnonzero(values_wp)
+    assert np.array_equal(indices_wp.numpy(), np.flatnonzero(values_np).astype(np.int32))
+
+
+def test_flatnonzero_rejects_rank2(device: str) -> None:
+    values_wp = wp.array(np.zeros((3, 4), dtype=np.int32), dtype=wp.int32, device=device)
+    with pytest.raises(ValueError, match="1D"):
+        tw.array.flatnonzero(values_wp)
+
+
+@pytest.mark.parametrize("n", [16, 257], ids=["small", "large"])
+def test_flatnonzero_indices_to_mask_round_trip(device: str, n: int) -> None:
+    """
+    The two are inverses: each recovers the other's input.
+
+    ``flatnonzero`` returns ascending unique indices, so the mask direction round-trips exactly
+    while the index direction round-trips up to ``numpy.unique`` (duplicate indices mark the same
+    slot once).
+    """
+    rng = np.random.default_rng(23)
+    mask_np = rng.random(n) < 0.3
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+    assert np.array_equal(
+        tw.array.indices_to_mask(tw.array.flatnonzero(mask_wp), n).numpy(), mask_np
+    )
+
+    indices_np = rng.choice(n, size=n // 4, replace=True).astype(np.int32)
+    indices_wp = wp.array(indices_np, dtype=wp.int32, device=device)
+    assert np.array_equal(
+        tw.array.flatnonzero(tw.array.indices_to_mask(indices_wp, n)).numpy(), np.unique(indices_np)
+    )
+
+
+@pytest.mark.parametrize("sentinel", [False, True], ids=["plain", "sentinel"])
+def test_counts_to_offsets(device: str, sentinel: bool) -> None:
+    """
+    Exclusive prefix sum, in both offset conventions.
+
+    The sentinel form is the length-``n + 1`` CSR array that ``segmented_sort_pairs`` wants; it is
+    the same buffer, so the two must agree on their common prefix and the total.
+    """
+    rng = np.random.default_rng(41)
+    counts_np = rng.integers(0, 7, size=32).astype(np.int32)
+    counts_wp = wp.array(counts_np, dtype=wp.int32, device=device)
+    offsets_wp, total = tw.array.counts_to_offsets(counts_wp, sentinel=sentinel)
+
+    exclusive_np = np.concatenate([[0], np.cumsum(counts_np)]).astype(np.int32)
+    assert total == int(counts_np.sum())
+    assert np.array_equal(offsets_wp.numpy(), exclusive_np if sentinel else exclusive_np[:-1])
+
+
+@pytest.mark.parametrize("sentinel", [False, True], ids=["plain", "sentinel"])
+def test_counts_to_offsets_empty(device: str, sentinel: bool) -> None:
+    counts_wp = wp.empty(0, dtype=wp.int32, device=device)
+    offsets_wp, total = tw.array.counts_to_offsets(counts_wp, sentinel=sentinel)
+    assert total == 0
+    assert np.array_equal(offsets_wp.numpy(), np.zeros(1 if sentinel else 0, dtype=np.int32))
+
+
+def test_indices_to_mask_empty(device: str) -> None:
+    indices_wp = wp.empty(0, dtype=wp.int32, device=device)
+    mask_wp = tw.array.indices_to_mask(indices_wp, 5)
+    assert np.array_equal(mask_wp.numpy(), np.zeros(5, dtype=bool))
 
 
 def test_gather_1d(device: str) -> None:

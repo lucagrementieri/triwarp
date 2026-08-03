@@ -11,7 +11,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.array import append, flatnonzero, gather, init_sort_pair_indices
+from triwarp.array import flatnonzero, gather, init_sort_pair_indices
 from triwarp.constants import INT32_MAX
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import sample as kernel_sample
@@ -301,8 +301,9 @@ def sample_surface_poisson_disk(
     r_min = wp.float32(r_max * beta * (1.0 - ratio**gamma))
 
     # 4. Neighbor lists (GPU, computed once for the full initial pool)
-    nbr_idx, nbr_dists, offsets = query_hashgrid_ball_with_offsets(init_points, init_points, r_max)
-    offsets = append(offsets, int(nbr_idx.shape[0]))
+    nbr_idx, nbr_dists, offsets = query_hashgrid_ball_with_offsets(
+        init_points, init_points, r_max, sentinel_offsets=True
+    )
 
     # 5. Initial per-point weights (parallel)
     alive = wp.ones(init_count, dtype=wp.int32, device=device)
@@ -407,9 +408,9 @@ def _bridson_blue_noise(
 
     unique_keys, counts = tw.grouping.unique_1d(sorted_keys, return_counts=True)
     n_cells = int(unique_keys.shape[0])
-    cell_offsets_inner = wp.empty(n_cells, dtype=wp.int32, device=device)
-    wp.utils.array_scan(counts, out_array=cell_offsets_inner, inclusive=False)
-    cell_offsets = append(cell_offsets_inner, nx)
+    # Sentinel-terminated cell bounds: ``cell_offsets[c + 1] - cell_offsets[c]`` is cell ``c``'s
+    # population and ``cell_offsets[n_cells] == nx``, all from the one scan.
+    cell_offsets, _ = tw.array.counts_to_offsets(counts, sentinel=True)
 
     # One-time lookup tables (the grid never changes): each pool point's compacted cell index,
     # and every cell's 9x9x9 shell of compacted neighbor indices. The round kernels then replace

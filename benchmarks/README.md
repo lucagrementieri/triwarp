@@ -399,6 +399,7 @@ the pymeshlab filter is the thing being caught up with, and in every case the po
 | `flip_by_objective` | `test_remesh` | `meshing_edge_flip_by_planar_optimization` | 2.0 ms against 28.6 ms on `saddle_graded` |
 | `bad_face_mask`, `remove_t_vertices` | `test_repair` | `compute_selection_bad_faces`, `meshing_remove_t_vertices` | 8.9 ms against 24.2 ms on `saddle_graded` |
 | `crease_edges`, `cut_along_edges` | `test_seams` | `compute_selection_crease_per_edge`, `meshing_cut_along_crease_edges` | 1.3 ms against 51.6 ms on `sphere_med`, and **24 output vertices against 32** on a cut cube |
+| `uv_seam_edges` | `test_seams` | `compute_selection_by_texture_seams_per_vertex` | **0.94 ms against 300 ms** on `sphere_large`; the filter returns only the seam *vertex set*, unioned with the boundary, so it does strictly less than the triwarp row (which also splits boundaries out and finds foldovers) |
 | `filter_normals`, `filter_two_step`, `filter_unsharp_mask` | `test_smoothing` | `apply_normal_smoothing_per_face`, `apply_coord_two_steps_smoothing`, `apply_coord_unsharp_mask` | 8.3 ms against 124 ms; 0.34 ms against 51.8 ms |
 | `resample_uniform` | `test_reconstruction` | `generate_resampled_uniform_mesh` | 13.5 ms against 292 ms on `bunny` at a 1% cell |
 | `quadric_decimate` | `test_remesh` | `meshing_decimation_quadric_edge_collapse` | **the one port that is slower**: 88 / 346 ms against igl's 50 / 80 — see below |
@@ -500,8 +501,13 @@ Two of those rows are worth reading as findings rather than ratios:
   the corners in — so that comparison asserts crease preservation, which both pass, and a one-sided
   RMS bound.
 - **`bunny_decimated` is not edge-manifold** (150 edges with three or more faces), which is why
-  `test_seams`' cut group runs on the synthetic icospheres: both triwarp's halfedge twins and
-  MeshLab's `meshing_cut_along_crease_edges` reject it outright rather than degrading.
+  `test_seams`' cut *and* `uv_seam_edges` groups run on the synthetic icospheres: both are defined
+  through halfedge twins, and triwarp and MeshLab's `meshing_cut_along_crease_edges` alike reject
+  such a mesh outright rather than degrading.
+- **The registry meshes carry no UVs at all**, so `uv_seam_edges` synthesizes a per-corner spherical
+  atlas (seamed at the `±π` longitude wrap) and feeds the *same* array to both sides through
+  MeshLab's `w_tex_coords_matrix`. A continuous atlas would leave the seam set empty and a
+  per-triangle one would make every interior edge a seam, so neither would time the compaction.
 - **Several filters print to stdout regardless of `verbose=False`** (ICP's `Found N pairs`, the point-
   cloud normal estimator's `UG 34 34 34`, the VCG reconstructor's whole volume report). pytest's
   fd-level capture absorbs it; a bare script will not.

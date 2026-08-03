@@ -88,27 +88,30 @@ def face_adjacency(
     [`face_connected_component_labels`][triwarp.adjacency.face_connected_component_labels]
     [`trimesh.graph.face_adjacency`][]
     """
+    device = faces.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
-        empty_array = twt.empty_int32_2d((0, 2), device=faces.device)
+        empty_array = twt.empty_int32_2d((0, 2), device=device)
         if return_edges:
-            return empty_array, twt.empty_int32_2d((0, 2), device=faces.device)
+            return empty_array, twt.empty_int32_2d((0, 2), device=device)
         return empty_array
-    if edges_sorted is None:
+
+    if return_edges and edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    edges_face = tw.edges.edges_face(faces)
-    # Hash edge rows over the vertex-index range (inferred max + 1); using ``n_faces`` as the base
-    # is wrong whenever the largest vertex index is >= n_faces (e.g. small meshes with more
-    # vertices than faces). The grouping partition is invariant to the (sufficiently large) base.
-    edge_groups = tw.grouping.group_int_rows(
-        edges_sorted, length=2, max_value=n_vertices, validate=n_vertices is None
-    )
-    # ``edge_groups`` is a dense contiguous ``(m, 2)`` buffer from ``group_int_rows``, so flattening
-    # it yields a contiguous index array and Python-scope gather is safe. (A *column* of it would
-    # not be — see the stride note below.)
-    adjacency = tw.array.gather(edges_face, edge_groups.flatten()).reshape(edge_groups.shape)
-    tw.array.sort_rows(adjacency)
+    edge_groups = _edge_groups(faces, edges_sorted, n_vertices)
+
+    # Edge ``e`` belongs to face ``e // 3``, so the owning faces need no ``edges_face`` table, no
+    # gather through it, and no row sort — one kernel does the division and orders the pair.
+    adjacency = twt.empty_int32_2d((int(edge_groups.shape[0]), 2), device=device)
+    if int(edge_groups.shape[0]) > 0:
+        wp.launch(
+            kernel_adjacency.edge_pairs_to_face_pairs,
+            dim=int(edge_groups.shape[0]),
+            inputs=[edge_groups, adjacency],
+            device=device,
+        )
     if return_edges:
+        assert edges_sorted is not None
         if edge_groups.shape[0] > 0:
             # ``edge_groups[:, 0]`` is a strided column view; Warp's fancy indexing reads the
             # underlying flat buffer and ignores the stride, so materialize a contiguous index
@@ -116,9 +119,63 @@ def face_adjacency(
             first_edge_index = wp.clone(edge_groups[:, 0])
             adjacency_edges = tw.array.gather(edges_sorted, first_edge_index)
         else:
-            adjacency_edges = twt.empty_int32_2d((0, 2), device=faces.device)
+            adjacency_edges = twt.empty_int32_2d((0, 2), device=device)
         return twt.as_array2d_int32(adjacency), twt.as_array2d_int32(adjacency_edges)
     return twt.as_array2d_int32(adjacency)
+
+
+def _edge_groups(
+    faces: wp.array[wp.int32], edges_sorted: twt.Array2dInt32 | None, n_vertices: int | None
+) -> twt.Array2dInt32:
+    """
+    Group the ``3 * n_faces`` undirected edges into the pairs that occur exactly twice.
+
+    Returns ``(m, 2)`` *edge* indices into ``0 .. 3 * n_faces - 1``, from which both the owning
+    faces (``e // 3``) and the shared edge itself are recoverable — which is why nothing downstream
+    needs a materialized edge table.
+
+    Edge rows are hashed over the vertex-index range (inferred max + 1); using ``n_faces`` as the
+    base is wrong whenever the largest vertex index is >= n_faces (e.g. small meshes with more
+    vertices than faces). The grouping partition is invariant to the (sufficiently large) base.
+
+    When ``edges_sorted`` is ``None`` the keys are built straight off ``faces`` in one launch, so
+    the ``(3 * n_faces, 2)`` edge rows are never written or read back — measured 1.1-1.6x over
+    building them first. Both spellings produce byte-identical keys, hence identical group order,
+    so callers can mix the two paths and still get row-aligned results.
+    """
+    if edges_sorted is not None:
+        return tw.grouping.group_int_rows(
+            edges_sorted, length=2, max_value=n_vertices, validate=n_vertices is None
+        )
+    n_faces = int(faces.shape[0]) // 3
+    edge_keys = wp.empty(n_faces * 3, dtype=wp.uint64, device=faces.device)
+    wp.launch(
+        kernel_adjacency.face_edge_keys,
+        dim=n_faces,
+        inputs=[faces, wp.uint64(_hash_radix(faces, n_vertices)), edge_keys],
+        device=faces.device,
+    )
+    return twt.as_array2d_int32(tw.grouping.group(edge_keys, 2))
+
+
+def _hash_radix(faces: wp.array[wp.int32], n_vertices: int | None) -> int:
+    """
+    Resolve the row-hash base for the fused edge keys: ``n_vertices``, or one past the largest.
+
+    Inferring it costs a ``reduce.minmax`` and the host readback that ends it, which is the sync
+    ``n_vertices=`` exists to skip (measured 1.25-1.74x on the whole call). The reduction runs over
+    the ``3 * n_faces`` face buffer rather than the ``(3 * n_faces, 2)`` edge rows the composed
+    path scans, so it also sees half the data. The negativity check matches
+    [`hash_indices_rows`][triwarp.grouping.hash_indices_rows].
+    """
+    if n_vertices is not None:
+        if n_vertices <= 0:
+            raise ValueError(f"n_vertices must be positive, got {n_vertices}")
+        return n_vertices
+    min_index, max_index = tw.reduce.minmax(faces)
+    if min_index < 0:
+        raise ValueError(f"faces must be non-negative, got a minimum of {min_index}")
+    return int(max_index) + 1
 
 
 _compute_face_adjacency = face_adjacency
@@ -128,6 +185,8 @@ def face_adjacency_unshared(
     faces: wp.array[wp.int32],
     face_adjacency: twt.Array2dInt32 | None = None,
     face_adjacency_edges: twt.Array2dInt32 | None = None,
+    *,
+    n_vertices: int | None = None,
 ) -> twt.Array2dInt32:
     """
     Vertex on each adjacent face that is not on their shared edge.
@@ -135,6 +194,13 @@ def face_adjacency_unshared(
     For each row of ``face_adjacency``, column 0 is the unshared vertex index on
     the first face and column 1 on the second face. When a face does not have
     exactly one vertex off the shared edge (degenerate case), that entry is ``-1``.
+
+    The answer is defined by the **recorded shared edge** of each adjacency row, matching
+    [`trimesh.graph.face_adjacency_unshared`][] exactly. This matters only for duplicate faces:
+    two coincident triangles meet along all three of their edges, so they produce three adjacency
+    rows and each one reports the corner off *its own* edge (``[[2, 2], [1, 1], [0, 0]]`` for two
+    copies of ``(0, 1, 2)``). A cheaper "vertex of one face absent from the other" rule would
+    return ``-1`` for all three, and would not be trimesh.
 
     Parameters
     ----------
@@ -144,19 +210,26 @@ def face_adjacency_unshared(
     face_adjacency
         Optional ``(m, 2)`` face index pairs from
         [`face_adjacency`][triwarp.adjacency.face_adjacency]. When
-        ``None``, adjacency and shared edges are computed from ``faces``.
+        ``None``, adjacency and shared edges are derived from ``faces`` directly and neither table
+        is materialized.
     face_adjacency_edges
         Optional ``(m, 2)`` sorted shared vertex pairs (as from
         [`face_adjacency`][triwarp.adjacency.face_adjacency] with ``return_edges=True``).
         Must be supplied
         together with ``face_adjacency`` or omitted with it.
+    n_vertices
+        Optional vertex count used as the row-hashing radix, forwarded to
+        [`face_adjacency`][triwarp.adjacency.face_adjacency]. Ignored when the adjacency tables are
+        supplied. Skips a host readback; see that function's note.
 
     Returns
     -------
     twt.Array2dInt32
         Shape ``(m, 2)`` on ``faces.device``. Row ``k`` gives vertex indices into
         ``faces`` for the corners not on ``face_adjacency_edges[k]``, or ``-1``
-        when degenerate.
+        when degenerate. Rows are in the same order
+        [`face_adjacency`][triwarp.adjacency.face_adjacency] returns for the same ``faces``, so the
+        two line up row-for-row whether or not the tables were passed in.
 
     Raises
     ------
@@ -174,8 +247,25 @@ def face_adjacency_unshared(
             "face_adjacency and face_adjacency_edges must both be provided or both omitted"
         )
     if face_adjacency is None:
-        face_adjacency, face_adjacency_edges = _compute_face_adjacency(faces, return_edges=True)
-    assert face_adjacency is not None
+        # Both the owning faces and the shared edge are recoverable from the two grouped *edge*
+        # indices, so the adjacency and edge tables this used to build (and gather through) are
+        # never needed. Identical values to the branch below, including row order.
+        n_faces = int(faces.shape[0]) // 3
+        edge_groups = (
+            _edge_groups(faces, None, n_vertices)
+            if n_faces > 0
+            else twt.empty_int32_2d((0, 2), device=faces.device)
+        )
+        m = int(edge_groups.shape[0])
+        unshared = twt.empty_int32_2d((m, 2), device=faces.device)
+        if m > 0:
+            wp.launch(
+                kernel_adjacency.face_adjacency_unshared_from_edges,
+                dim=m,
+                inputs=[faces, edge_groups, unshared],
+                device=faces.device,
+            )
+        return twt.as_array2d_int32(unshared)
     assert face_adjacency_edges is not None
     if face_adjacency.shape[0] != face_adjacency_edges.shape[0]:
         raise ValueError(
@@ -229,11 +319,6 @@ def face_adjacency_angles(
     wp.array[wp.float32]
         Length ``m`` unsigned angles in radians on ``faces.device``, one per
         ``face_adjacency`` row. Empty when there are no faces or no adjacency pairs.
-
-    Raises
-    ------
-    ValueError
-        If ``vertices`` and ``faces`` live on different devices.
 
     See Also
     --------

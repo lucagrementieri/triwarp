@@ -4,6 +4,48 @@ from triwarp.kernels import array as kernel_array
 
 
 @wp.func
+def sorted_edge_key(a: wp.int32, b: wp.int32, radix: wp.uint64) -> wp.uint64:
+    # Row hash of the undirected edge ``{a, b}``, byte-identical to what ``pack_indices`` produces
+    # for the sorted edge row ``[min, max]``: ``lo + hi * radix``. Matching it exactly keeps the
+    # radix sort's key order -- and so the adjacency row order -- the same as the composed path.
+    lo = wp.uint64(wp.uint32(wp.min(a, b)))
+    hi = wp.uint64(wp.uint32(wp.max(a, b)))
+    return lo + hi * radix
+
+
+@wp.kernel
+def face_edge_keys(
+    faces: wp.array[wp.int32], radix: wp.uint64, out_keys: wp.array[wp.uint64]
+) -> None:
+    # One launch in place of ``faces_to_edges`` + ``pack_indices``: the three undirected edge keys
+    # of face ``tid`` straight from the face buffer, so the intermediate ``(3F, 2)`` edge rows are
+    # never materialized. Edge ``3f + k`` belongs to face ``f``, which is what lets
+    # ``edge_pairs_to_face_pairs`` recover the face index as ``e // 3``.
+    tid = int(wp.tid())
+    f = tid * 3
+    i0 = faces[f + 0]
+    i1 = faces[f + 1]
+    i2 = faces[f + 2]
+    out_keys[f + 0] = sorted_edge_key(i0, i1, radix)
+    out_keys[f + 1] = sorted_edge_key(i1, i2, radix)
+    out_keys[f + 2] = sorted_edge_key(i2, i0, radix)
+
+
+@wp.kernel
+def edge_pairs_to_face_pairs(
+    edge_groups: wp.array2d[wp.int32], out_adjacency: wp.array2d[wp.int32]
+) -> None:
+    # Two edge indices sharing a key -> the ascending pair of faces owning them. Replaces a gather
+    # through a materialized ``edges_face`` table plus an in-place row sort: the owning face of
+    # edge ``e`` is just ``e // 3``, and ordering two values needs no sort kernel.
+    tid = int(wp.tid())
+    f0 = edge_groups[tid, 0] // 3
+    f1 = edge_groups[tid, 1] // 3
+    out_adjacency[tid, 0] = wp.min(f0, f1)
+    out_adjacency[tid, 1] = wp.max(f0, f1)
+
+
+@wp.func
 def unshared_vertex(
     v0: wp.int32, v1: wp.int32, v2: wp.int32, e0: wp.int32, e1: wp.int32
 ) -> wp.int32:
@@ -39,6 +81,47 @@ def face_adjacency_unshared(
     e1 = face_adjacency_edges[tid, 1]
     out_unshared[tid, 0] = unshared_vertex(faces[f0 + 0], faces[f0 + 1], faces[f0 + 2], e0, e1)
     out_unshared[tid, 1] = unshared_vertex(faces[f1 + 0], faces[f1 + 1], faces[f1 + 2], e0, e1)
+
+
+@wp.func
+def edge_endpoints(faces: wp.array[wp.int32], edge_index: wp.int32) -> tuple[wp.int32, wp.int32]:
+    # The sorted endpoints of edge ``3f + c``, recovered from the edge index alone. Corner ``c`` of
+    # face ``f`` spans ``(v[c], v[(c + 1) % 3])``, matching ``kernels/edges.py:faces_to_edges``, so
+    # this reproduces exactly the row ``faces_to_edges(sorted=True)`` would have written there.
+    face_base = (edge_index / 3) * 3
+    corner = edge_index % 3
+    a = faces[face_base + corner]
+    b = faces[face_base + (corner + 1) % 3]
+    return wp.min(a, b), wp.max(a, b)
+
+
+@wp.kernel
+def face_adjacency_unshared_from_edges(
+    faces: wp.array[wp.int32], edge_groups: wp.array2d[wp.int32], out_unshared: wp.array2d[wp.int32]
+) -> None:
+    # Same answer as ``face_adjacency_unshared`` with no edge table and no adjacency table: the
+    # shared edge and both owning faces all come out of the two edge indices. Column order follows
+    # ``edge_pairs_to_face_pairs``, which emits the face pair ascending.
+    tid = int(wp.tid())
+    edge_0 = edge_groups[tid, 0]
+    edge_1 = edge_groups[tid, 1]
+    shared_a, shared_b = edge_endpoints(faces, edge_0)
+    face_0 = edge_0 / 3
+    face_1 = edge_1 / 3
+    base_0 = face_0 * 3
+    base_1 = face_1 * 3
+    unshared_0 = unshared_vertex(
+        faces[base_0 + 0], faces[base_0 + 1], faces[base_0 + 2], shared_a, shared_b
+    )
+    unshared_1 = unshared_vertex(
+        faces[base_1 + 0], faces[base_1 + 1], faces[base_1 + 2], shared_a, shared_b
+    )
+    if face_0 <= face_1:
+        out_unshared[tid, 0] = unshared_0
+        out_unshared[tid, 1] = unshared_1
+    else:
+        out_unshared[tid, 0] = unshared_1
+        out_unshared[tid, 1] = unshared_0
 
 
 @wp.kernel

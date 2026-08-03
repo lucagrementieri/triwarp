@@ -42,11 +42,6 @@ def concatenate(
     tuple[wp.array[wp.vec3], wp.array[wp.int32]]
         Combined vertices and reindexed faces on the shared device.
 
-    Raises
-    ------
-    ValueError
-        If any pair uses a different device.
-
     See Also
     --------
     [`split`][triwarp.combine.split]
@@ -121,11 +116,6 @@ def split(
     list[tuple[wp.array[wp.vec3], wp.array[wp.int32]]]
         One ``(vertices, faces)`` pair per face-connected component on
         ``vertices.device``. Empty when ``n_faces == 0``.
-
-    Raises
-    ------
-    ValueError
-        If ``vertices`` and ``faces`` live on different devices.
 
     See Also
     --------

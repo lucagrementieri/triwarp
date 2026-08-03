@@ -618,7 +618,7 @@ def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3]) -> wp.array[wp.floa
     Raises
     ------
     ValueError
-        If ``a`` and ``b`` live on different devices or have different lengths.
+        If ``a`` and ``b`` have different lengths.
 
     See Also
     --------
@@ -694,7 +694,7 @@ def radial_sort(
     wp.map(kernel_points.radial_sort_key, points, origin, axis0, axis1, out=out_keys)
 
     # Ascending radix sort of the negated angles yields the descending-angle order.
-    _sorted_keys, order = tw.array.sort_pairs(out_keys, fill_value=n)
+    _sorted_keys, order = tw.array.sort_and_argsort(out_keys, fill_value=n)
     out = wp.empty(n, dtype=wp.vec3, device=device)
     wp.copy(out, points[order])
     return out

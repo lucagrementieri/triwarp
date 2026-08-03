@@ -72,8 +72,7 @@ def face_adjacency_projections(
     Raises
     ------
     ValueError
-        If ``vertices`` and ``faces`` live on different devices, or if only one
-        of ``face_adjacency`` and ``face_adjacency_edges`` is provided.
+        If only one of ``face_adjacency`` and ``face_adjacency_edges`` is provided.
 
     See Also
     --------

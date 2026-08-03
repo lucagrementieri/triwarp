@@ -452,7 +452,13 @@ class Trimesh:
         [`trimesh.graph.face_adjacency`][]
         """
         adjacency, adjacency_edges = tw.adjacency.face_adjacency(
-            self._faces, edges_sorted=self.edges_sorted, return_edges=True
+            self._faces,
+            edges_sorted=self.edges_sorted,
+            return_edges=True,
+            # The mesh knows its own vertex count, so the row-hash radix never has to be inferred
+            # -- that inference is a device reduction ending in a host readback (1.25-1.74x on the
+            # whole call, measured in benchmarks/test_adjacency.py).
+            n_vertices=int(self._vertices.shape[0]),
         )
         self._cache["face_adjacency_edges"] = adjacency_edges
         return adjacency

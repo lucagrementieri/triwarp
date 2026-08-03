@@ -9,7 +9,7 @@ Kernels should continue to use ``wp.array2d[dtype]`` in ``@wp.kernel`` signature
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, TypeAlias, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypeVar, cast, overload
 
 import warp as wp
 
@@ -36,6 +36,12 @@ if TYPE_CHECKING:
     IntArray: TypeAlias = Array1dInt | Array2dInt
     FloatArray: TypeAlias = Array1dFloat | Array2dFloat
     ScalarArray: TypeAlias = Array1dScalar | Array2dScalar
+
+    # Any rank, for the handful of operations that are genuinely rank-agnostic because they
+    # flatten and reshape back (``array.isin``, ``array.gather``). Prefer a concrete rank alias
+    # everywhere else -- this one deliberately gives up the rank check.
+    ArrayNdInt32: TypeAlias = wp.array[wp.int32, Any]
+    ArrayNd: TypeAlias = wp.array[Any, Any]
 else:
     Array1dInt32 = wp.array
     Array1dFloat32 = wp.array
@@ -53,6 +59,8 @@ else:
     IntArray = wp.array
     FloatArray = wp.array
     ScalarArray = wp.array
+    ArrayNdInt32 = wp.array
+    ArrayNd = wp.array
 
 __all__ = [
     "Array1dFloat",
@@ -68,6 +76,8 @@ __all__ = [
     "Array2dInt32",
     "Array2dScalar",
     "Array3dFloat32",
+    "ArrayNd",
+    "ArrayNdInt32",
     "FloatArray",
     "IntArray",
     "ScalarArray",

@@ -56,6 +56,29 @@ def warp_to_pymeshlab(vertices_wp: wp.array, faces_wp: wp.array) -> ml.MeshSet:
     return meshset
 
 
+def wedge_uv_to_pymeshlab(
+    vertices_np: np.ndarray, faces_np: np.ndarray, wedge_uv_np: np.ndarray
+) -> ml.MeshSet:
+    """
+    Build a MeshSet carrying a **per-wedge** (per-corner) texture atlas.
+
+    MeshLab stores UVs on face corners rather than on vertices, which is why it has no texcoord
+    *index* buffer at all and why its seam predicate compares coordinates. ``w_tex_coords_matrix``
+    takes exactly triwarp's per-corner layout, ``(3 * n_faces, 2)`` in ``3 * f + k`` order, so any
+    numpy atlas can drive ``compute_selection_by_texture_seams_per_vertex`` without going through a
+    file.
+    """
+    meshset = ml.MeshSet()
+    meshset.add_mesh(
+        ml.Mesh(
+            vertex_matrix=np.ascontiguousarray(vertices_np, dtype=np.float64),
+            face_matrix=np.ascontiguousarray(faces_np, dtype=np.int32),
+            w_tex_coords_matrix=np.ascontiguousarray(wedge_uv_np, dtype=np.float64),
+        )
+    )
+    return meshset
+
+
 def points_to_pymeshlab(points_np: np.ndarray, normals_np: np.ndarray | None = None) -> ml.MeshSet:
     """
     Wrap a bare point cloud in a **face-less** single-mesh ``pymeshlab.MeshSet``.

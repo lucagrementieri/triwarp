@@ -362,7 +362,7 @@ class _EdgeTable:
         )
 
         keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices)
-        sorted_keys, sorted_rows = tw.array.sort_pairs(keys)
+        sorted_keys, sorted_rows = tw.array.sort_and_argsort(keys)
         # Cloned: the views alias scratch that must not be shared with a later sort.
         self.sorted_keys = wp.clone(sorted_keys)
         self.sorted_rows = wp.clone(sorted_rows)

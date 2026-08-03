@@ -42,6 +42,7 @@ degenerate case rather than the operation.
 from __future__ import annotations
 
 import numpy as np
+import pymeshlab as ml
 import pytest
 import warp as wp
 from conftest import BenchCase, skip_larger_than
@@ -54,6 +55,8 @@ import triwarp.typing as twt
 _CREASE_ANGLE = 30.0
 
 _cut_cache: dict[tuple[str, str, float], twt.Array2dInt32] = {}
+_atlas_cache: dict[str, np.ndarray] = {}
+_seam_meshset_cache: dict[str, ml.MeshSet] = {}
 
 
 def _cut_edges(bench_case: BenchCase, fraction: float) -> twt.Array2dInt32:
@@ -135,3 +138,73 @@ def test_cut_along_edges(bench_case: BenchCase, cut_fraction: float) -> None:
     )
     assert int(cut_faces.shape[0]) == int(faces.shape[0])
     assert np.isfinite(cut_vertices.numpy()[:1]).all()
+
+
+def _wedge_atlas_np(bench_case: BenchCase) -> np.ndarray:
+    """
+    Build a ``(3 * n_faces, 2)`` per-corner atlas whose only seam is the ``+-pi`` wrap.
+
+    Both sides need *some* atlas -- the registry meshes carry no UVs -- and this one is the honest
+    input to time on: a continuous map would leave the seam mask empty and a per-triangle one would
+    make every interior edge a seam, so neither exercises the compaction the way a real atlas does.
+    Cached per mesh, since it is an input rather than part of the measurement.
+    """
+    if bench_case.mesh_name not in _atlas_cache:
+        vertices_np = bench_case.vertices_np - bench_case.vertices_np.mean(axis=0)
+        corners_np = vertices_np[bench_case.faces_np]
+        u_np = np.arctan2(corners_np[..., 1], corners_np[..., 0]) / (2.0 * np.pi) + 0.5
+        u_np = u_np - np.round(u_np - u_np[:, :1])
+        radius_np = np.maximum(np.linalg.norm(corners_np, axis=-1), 1e-12)
+        v_np = np.arccos(np.clip(corners_np[..., 2] / radius_np, -1.0, 1.0)) / np.pi
+        _atlas_cache[bench_case.mesh_name] = np.stack([u_np, v_np], axis=-1).reshape(-1, 2)
+    return _atlas_cache[bench_case.mesh_name]
+
+
+@pytest.mark.benchmark(group="uv_seam_edges")
+@pytest.mark.benchmeshes("sphere_small", "sphere_med", "sphere_large")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+def test_uv_seam_edges(bench_case: BenchCase) -> None:
+    """
+    Halfedge twins plus a per-edge texcoord comparison and three compactions.
+
+    On the icospheres for the same reason the cut is: the classification is defined through twins,
+    so it needs an edge-manifold mesh and ``bunny_decimated`` is not one.
+
+    The cost split is worth knowing before optimizing this: twins is a radix sort over ``3F`` keys
+    and the classification is one pass, so this group should track ``cut_along_edges``' first half
+    almost exactly and any gap between them is the components pass, not the seam test.
+    """
+    if bench_case.kind == "pymeshlab":
+        # Selection-only, so the wedge-UV MeshSet survives its own filter and is cached.
+        if bench_case.mesh_name not in _seam_meshset_cache:
+            meshset_pml = ml.MeshSet()
+            meshset_pml.add_mesh(
+                ml.Mesh(
+                    vertex_matrix=np.ascontiguousarray(bench_case.vertices_np, dtype=np.float64),
+                    face_matrix=np.ascontiguousarray(bench_case.faces_np, dtype=np.int32),
+                    w_tex_coords_matrix=np.ascontiguousarray(
+                        _wedge_atlas_np(bench_case), dtype=np.float64
+                    ),
+                )
+            )
+            _seam_meshset_cache[bench_case.mesh_name] = meshset_pml
+        meshset_pml = _seam_meshset_cache[bench_case.mesh_name]
+        bench_case.run(meshset_pml.compute_selection_by_texture_seams_per_vertex)
+        # MeshLab reports only the vertex set, and unions boundaries into it -- so it does strictly
+        # less than the triwarp row, which also splits boundaries out and finds foldovers.
+        assert meshset_pml.current_mesh().vertex_selection_array().shape == (bench_case.n_vertices,)
+        return
+    faces = bench_case.faces_wp
+    texcoords = wp.array(
+        np.ascontiguousarray(_wedge_atlas_np(bench_case), dtype=np.float32),
+        dtype=wp.vec2,
+        device=bench_case.device,
+    )
+    n_vertices = bench_case.n_vertices
+    seams, boundaries, foldovers = bench_case.run(
+        lambda: tw.seams.uv_seam_edges(faces, texcoords, n_vertices=n_vertices)
+    )
+    assert int(seams.shape[0]) > 0
+    assert int(seams.shape[1]) == 4
+    assert int(boundaries.shape[1]) == 2
+    assert int(foldovers.shape[1]) == 4

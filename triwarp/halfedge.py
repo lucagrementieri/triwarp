@@ -77,7 +77,7 @@ def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> 
     # construction: the range check would only add a readback.
     edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
     keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=False)
-    sorted_keys, order = tw.array.sort_pairs(keys)
+    sorted_keys, order = tw.array.sort_and_argsort(keys)
 
     nonmanifold = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(

@@ -387,6 +387,7 @@ def query_hashgrid_ball_with_offsets(
     grid: wp.HashGrid | None = None,
     grid_bins: int = 128,
     return_sorted: bool = False,
+    sentinel_offsets: bool = False,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.float32], wp.array[wp.int32]]:
     """
     Low-level ball query: neighbors in one concatenated pair plus per-query offsets.
@@ -418,20 +419,26 @@ def query_hashgrid_ball_with_offsets(
     return_sorted
         If ``True``, neighbors within each query are ordered by increasing distance.
         If ``False``, order follows grid traversal (undefined ordering).
+    sentinel_offsets
+        Return ``offsets`` in the length-``m + 1`` CSR form, whose trailing element is the total
+        neighbor count, instead of the length-``m`` form. Free — the terminator is built either
+        way, since the ``return_sorted`` path needs it as segment bounds.
 
     Returns
     -------
     neighbor_indices_flat, neighbor_distances_flat, offsets
         Three rank-1 arrays. Let ``m = queries.shape[0]`` after any ``wp.vec3`` wrap.
 
-        ``offsets`` has length ``m`` and is the exclusive prefix sum of per-query neighbor
-        counts (same layout as ``wp.utils.array_scan(..., inclusive=False)``): query ``k``
-        owns ``neighbor_indices_flat[offsets[k] : offsets[k+1]]`` where ``offsets[m]`` is
-        understood as ``neighbor_indices_flat.shape[0]`` (the total neighbor count).
+        ``offsets`` has length ``m`` (or ``m + 1`` with ``sentinel_offsets``) and is the exclusive
+        prefix sum of per-query neighbor counts (same layout as
+        ``wp.utils.array_scan(..., inclusive=False)``): query ``k`` owns
+        ``neighbor_indices_flat[offsets[k] : offsets[k+1]]`` where ``offsets[m]`` is
+        ``neighbor_indices_flat.shape[0]`` (the total neighbor count), stored only in the
+        sentinel form.
 
         ``neighbor_indices_flat`` and ``neighbor_distances_flat`` have that total length
         and list point indices and distances ``‖points[i] - q‖₂`` in parallel. Empty
-        ``points`` still returns length-``m`` zero ``offsets``; empty neighbor sets yield
+        ``points`` still returns zero ``offsets``; empty neighbor sets yield
         length-0 flat arrays and zero ``offsets``.
 
     Notes
@@ -459,14 +466,17 @@ def query_hashgrid_ball_with_offsets(
         return (
             wp.empty(0, dtype=wp.int32, device=device),
             wp.empty(0, dtype=wp.float32, device=device),
-            wp.zeros(m, dtype=wp.int32, device=device),
+            wp.zeros(m + 1 if sentinel_offsets else m, dtype=wp.int32, device=device),
         )
 
     if grid is None:
         grid = hashgrid_from_points(points, r, grid_bins)
 
     neighbor_counts = query_hashgrid_ball_count(points, queries, r, grid=grid)
-    offsets, total_neighbors = tw.array.counts_to_offsets(neighbor_counts)
+    # The sentinel form is the segment-bounds array ``segmented_sort_pairs`` wants below, and the
+    # length-``m`` form is a view of its prefix, so both come out of the one scan buffer.
+    segment_bounds, total_neighbors = tw.array.counts_to_offsets(neighbor_counts, sentinel=True)
+    offsets = segment_bounds if sentinel_offsets else segment_bounds[:m]
     if total_neighbors == 0:
         return (
             wp.empty(0, dtype=wp.int32, device=device),
@@ -485,7 +495,7 @@ def query_hashgrid_ball_with_offsets(
             queries,
             grid.id,
             wp.float32(r),
-            offsets,
+            segment_bounds,
             neighbor_indices_flat,
             neighbor_distances_flat,
         ],
@@ -493,7 +503,6 @@ def query_hashgrid_ball_with_offsets(
     )
 
     if return_sorted:
-        segment_bounds = tw.array.append(offsets, total_neighbors)
         wp.utils.segmented_sort_pairs(
             neighbor_distances_flat, neighbor_indices_flat, total_neighbors, segment_bounds
         )
@@ -673,6 +682,7 @@ def query_bvh_ball_with_offsets(
     bvh: wp.Bvh | None = None,
     leaf_size: int = 4,
     return_sorted: bool = False,
+    sentinel_offsets: bool = False,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.float32], wp.array[wp.int32]]:
     """
     Low-level BVH ball query: neighbors in one concatenated pair plus per-query offsets.
@@ -695,6 +705,9 @@ def query_bvh_ball_with_offsets(
         Leaf size when constructing ``bvh`` (ignored if ``bvh`` is provided).
     return_sorted
         If ``True``, neighbors within each query are ordered by increasing distance.
+    sentinel_offsets
+        Return ``offsets`` in the length-``m + 1`` CSR form whose trailing element is the total
+        neighbor count, instead of the length-``m`` form.
 
     Returns
     -------
@@ -721,14 +734,17 @@ def query_bvh_ball_with_offsets(
         return (
             wp.empty(0, dtype=wp.int32, device=device),
             wp.empty(0, dtype=wp.float32, device=device),
-            wp.zeros(m, dtype=wp.int32, device=device),
+            wp.zeros(m + 1 if sentinel_offsets else m, dtype=wp.int32, device=device),
         )
 
     if bvh is None:
         bvh = bvh_from_points(points, leaf_size)
 
     neighbor_counts = query_bvh_ball_count(points, queries, r, bvh=bvh)
-    offsets, total_neighbors = tw.array.counts_to_offsets(neighbor_counts)
+    # The sentinel form is the segment-bounds array ``segmented_sort_pairs`` wants below, and the
+    # length-``m`` form is a view of its prefix, so both come out of the one scan buffer.
+    segment_bounds, total_neighbors = tw.array.counts_to_offsets(neighbor_counts, sentinel=True)
+    offsets = segment_bounds if sentinel_offsets else segment_bounds[:m]
     if total_neighbors == 0:
         return (
             wp.empty(0, dtype=wp.int32, device=device),
@@ -747,7 +763,7 @@ def query_bvh_ball_with_offsets(
             queries,
             bvh.id,
             wp.float32(r),
-            offsets,
+            segment_bounds,
             neighbor_indices_flat,
             neighbor_distances_flat,
         ],
@@ -755,7 +771,6 @@ def query_bvh_ball_with_offsets(
     )
 
     if return_sorted:
-        segment_bounds = tw.array.append(offsets, total_neighbors)
         wp.utils.segmented_sort_pairs(
             neighbor_distances_flat, neighbor_indices_flat, total_neighbors, segment_bounds
         )

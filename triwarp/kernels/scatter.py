@@ -132,12 +132,13 @@ def scatter_index(index: wp.array[wp.int32], out_scattered: wp.array[wp.int32]) 
 
 @wp.kernel
 def scatter_index_where(
-    mask: wp.array[wp.bool], inclusive: wp.array[wp.int32], out_scattered: wp.array[wp.int32]
+    flags: wp.array[wp.int32], inclusive: wp.array[wp.int32], out_scattered: wp.array[wp.int32]
 ) -> None:
-    # ``inclusive`` is the inclusive prefix sum of the mask, so a set position lands at
-    # ``inclusive[i] - 1`` (its exclusive-scan value).
+    # ``flags`` is the 0/1 selection array and ``inclusive`` its inclusive prefix sum, so a set
+    # position lands at ``inclusive[i] - 1`` (its exclusive-scan value). Reading the flags rather
+    # than the original mask is what lets ``flatnonzero`` take non-boolean input from one kernel.
     i = int(wp.tid())
-    if mask[i]:
+    if flags[i] != wp.int32(0):
         out_scattered[inclusive[i] - 1] = wp.int32(i)
 
 

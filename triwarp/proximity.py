@@ -550,11 +550,30 @@ def query_mesh_aabb_bounds_with_offsets(
     Requires the default Warp mesh BVH backend; ``bvh_constructor="cubql"`` meshes
     do not support AABB queries.
 
+    Parameters
+    ----------
+    mesh
+        Target ``warp.Mesh`` built with the default BVH backend.
+    query_lower
+        Length-``m`` lower corners of the query boxes, on the target device.
+    query_upper
+        Length-``m`` upper corners of the query boxes.
+    max_hits
+        Maximum candidate faces recorded per query. Hits past this cap are dropped, so the
+        result is a bounded sample rather than the full candidate set when a query straddles
+        more than ``max_hits`` triangles.
+
     Returns
     -------
     candidate_indices_flat, offsets, hit_counts
         ``offsets`` is the exclusive prefix sum of per-query hit counts.
         Query ``k`` owns ``candidate_indices_flat[offsets[k] : offsets[k] + hit_counts[k]]``.
+        All three are empty when ``m == 0``.
+
+    Raises
+    ------
+    ValueError
+        If ``query_lower`` and ``query_upper`` have different lengths, or ``max_hits < 1``.
     """
     device = query_lower.device
     m = int(query_lower.shape[0])

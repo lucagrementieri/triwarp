@@ -527,3 +527,69 @@ uv sync --all-groups
 ```
 
 Running basedpyright in a dev-only env yields spurious `reportMissingImports` on `meshio` and other test-group packages.
+
+---
+
+## 13. Performance Work: Measure Before You Change
+
+- **A benchmark lands before the optimization does.** Never restructure code for speed without a
+  `benchmarks/test_<module>.py` group timing the *current* implementation first. A belief about
+  where the cost sits ("two Python loops", "too many derived launches") is a hypothesis until that
+  group exists and prints a number.
+- **Attribute a change only with a back-to-back A/B in one session.** Saved baselines drift ±10%
+  (±30% under 100 µs) between sessions, so a comparison against a stored number proves nothing —
+  run old and new in the same session, in the same process order.
+- **Verify values, not just timing.** This is the §4 gather warning generalised: the *wrong*
+  implementation is frequently the faster one, because it reads less. Every perf change must keep
+  its parity / regression test green, which means a function about to be optimized needs one first.
+- **Cost model for wrappers.** Host-side Python is a real cost: ~11 µs per cached `wp.map` call,
+  ~32 µs of launch marshalling per `wp.launch` (measured in `combine.concatenate`), ~0.1 ms per
+  host readback, against 0.9–2.4 ms for a full extra device pass on a mid-size mesh. So: collapse
+  per-item launches into one launch over a packed buffer, and single-pass the host-side metadata
+  loops — but do not chase Python microseconds in a wrapper whose cost is really per-segment
+  `wp.copy` launches. Measure which regime you are in before optimizing for either.
+- **Budget the host–device syncs.** Every `.numpy()` / `int(<device value>)` readback in a wrapper
+  carries a comment naming why it is unavoidable. When the caller can supply the bound the readback
+  infers, expose it as a keyword (`face_adjacency(n_vertices=...)`,
+  `hash_indices_rows(validate=False)`) **and pass it from every in-repo caller that knows it** — an
+  escape hatch nothing uses is not an optimization. Note that trading one readback for an extra
+  device pass is usually a *loss*; see the cost model above.
+- **Size buffers for their final use at allocation time.** Do not allocate-then-grow at Python
+  scope. When a consumer needs an `n + 1` sentinel-terminated form, the *producer* allocates
+  `n + 1` and hands back a view (`counts_to_offsets`); a helper whose only job is to patch up
+  another function's output convention is a smell to be fixed at the producer.
+
+---
+
+## 14. Evolving the Public API
+
+- **Name a function after what it returns, in NumPy vocabulary — never after the Warp call it
+  wraps.** `sort_pairs` named `warp.utils.radix_sort_pairs`'s key/value mechanism rather than its
+  result (a sort *and* an argsort), which is why it became `sort_and_argsort`.
+- **Docstring, signature, and body must agree.** Three specific gates:
+  - A documented `Raises` must be reachable. In particular §8 forbids device-mismatch checks, so
+    **no docstring may document a `ValueError` for arrays "on different devices"** — Warp raises
+    that itself, and the wrapper never does.
+  - A documented validation must actually be performed, or the claim goes.
+  - Annotations must cover every rank and dtype the docstring claims and the body supports (a
+    docstring promising rank-2 support needs an annotation that admits rank 2).
+- **A guard must encode a real limitation.** When the implementation is naturally rank- or
+  dtype-agnostic — a flatten/reshape, a generic `@wp.func` — drop the `ensure_ndim` cap and widen
+  the annotation instead of validating a restriction that is not there.
+- **Prefer dtype-generic `@wp.func`s** (`wp.Float` / `wp.Scalar` for scalars, `Any` for vectors —
+  the `kernels/predicates.py` convention) over hardcoded `float32` / `vec3` variants, *as long as
+  the dispatch stays readable*. Where Warp cannot express the generic — there is no `wp.any` /
+  `wp.all` over vector components and no generic vector annotation — keep named per-type funcs
+  behind a small dtype-keyed dispatch rather than contorting the kernel.
+- **No speculative generality.** Add an axis, parameter, or mode only when an in-repo call site
+  needs it. The absence of a caller is a reason not to build it, not a gap to fill.
+- **No near-duplicate wrappers.** Two public functions that are the same algorithm with different
+  returns share one private helper (`concatenate` / `pack_1d_arrays` behind `_pack_segments`).
+- **Inverse and dual pairs cross-reference each other and have a round-trip test** — e.g.
+  `flatnonzero` / `indices_to_mask`. Bidirectional `See Also` is required for inverse pairs and for
+  simple/advanced variants of one operation; it is *not* required for hub→spoke references (most
+  of the ~250 one-way links in the package are correct — `cotmatrix` should not list every
+  consumer).
+- **Coverage is per module.** Every public `triwarp/<module>.py` gets both `tests/test_<module>.py`
+  and `benchmarks/test_<module>.py`, and a function's tests live in the file mirroring *its* module
+  (§11), not in a neighbour's.

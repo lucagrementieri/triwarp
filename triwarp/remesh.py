@@ -463,7 +463,7 @@ def _flip_interior_edges(
         # Sorted table of existing undirected-edge keys, for the "flip would duplicate an edge"
         # guard. Keys match kernels.grouping.pack_indices (min + max * n_vertices).
         keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=False)
-        sorted_keys, _order = tw.array.sort_pairs(keys)
+        sorted_keys, _order = tw.array.sort_and_argsort(keys)
 
         out_flip = wp.zeros(m, dtype=wp.bool, device=device)
         out_quad = twt.empty_int32_2d((m, 4), device=device)
@@ -859,7 +859,7 @@ def quadric_decimate(
         # locking each winner's closed 2-ring under a **hashed** key -- see ``scramble_index`` for
         # why the obvious keys (edge index, or the cost itself) both collapse to one winner a pass
         # on a structured mesh.
-        _sorted_cost, order = tw.array.sort_pairs(cost)
+        _sorted_cost, order = tw.array.sort_and_argsort(cost)
         priority = wp.empty(m, dtype=wp.int32, device=device)
         wp.launch(
             kernel_remesh.assign_collapse_priority,
@@ -902,7 +902,7 @@ def quadric_decimate(
         # Keep the cheapest half of the remaining surplus: an interior collapse removes two faces,
         # so that budget is what stops a pass from blowing past the target. The set is already
         # independent, so dropping members of it keeps it independent.
-        _sorted_winner_cost, winner_order = tw.array.sort_pairs(winner_cost)
+        _sorted_winner_cost, winner_order = tw.array.sort_and_argsort(winner_cost)
         budget = max(1, (n_current - target) // 2)
         wp.launch(
             kernel_remesh.assign_collapse_priority,
@@ -1329,7 +1329,7 @@ def intrinsic_delaunay(
             break
         unshared = tw.adjacency.face_adjacency_unshared(intrinsic_faces, adjacency, adjacency_edges)
         keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=False)
-        sorted_keys, _order = tw.array.sort_pairs(keys)
+        sorted_keys, _order = tw.array.sort_and_argsort(keys)
 
         flip = wp.zeros(n_interior, dtype=wp.bool, device=device)
         quad = twt.empty_int32_2d((n_interior, 4), device=device)

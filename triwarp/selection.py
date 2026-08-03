@@ -150,11 +150,6 @@ def submesh_from_face_indices(
         Compact ``(sub_vertices, sub_faces)`` on ``vertices.device``. When
         ``face_indices`` is empty, both arrays have length ``0``.
 
-    Raises
-    ------
-    ValueError
-        If ``vertices``, ``faces``, and ``face_indices`` live on different devices.
-
     See Also
     --------
     [`submesh_from_face_mask`][triwarp.selection.submesh_from_face_mask]
@@ -328,11 +323,6 @@ def submesh_from_face_mask(
     tuple[wp.array[wp.vec3], wp.array[wp.int32]]
         Compact ``(sub_vertices, sub_faces)`` on ``vertices.device``.
 
-    Raises
-    ------
-    ValueError
-        If array devices differ.
-
     See Also
     --------
     [`submesh_from_face_indices`][triwarp.selection.submesh_from_face_indices]
@@ -407,7 +397,7 @@ def submesh_from_vertex_mask(
     Raises
     ------
     ValueError
-        If array devices differ or ``vertex_mask`` length does not equal ``n_vertices``.
+        If ``vertex_mask`` length does not equal ``n_vertices``.
 
     See Also
     --------

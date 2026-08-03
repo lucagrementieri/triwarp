@@ -230,6 +230,15 @@ def complement_flag(a: wp.bool) -> wp.int32:
 
 
 @wp.func
+def nonzero_flag(value: wp.Scalar) -> wp.int32:
+    # ``1`` for any non-zero value, ``0`` otherwise: the scan input that lets ``flatnonzero``
+    # accept integer and float arrays as well as masks. A bool array does not need this -- Warp's
+    # ``wp.Scalar`` does not instantiate for ``wp.bool``, and ``wp.utils.array_cast`` already
+    # produces exactly 0/1 for one, which is why the wrapper keeps that path separate.
+    return wp.where(value != type(value)(0), wp.int32(1), wp.int32(0))
+
+
+@wp.func
 def greater(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
     return a > b
 
@@ -255,7 +264,9 @@ def not_equal(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
 
 
 @wp.func
-def is_close_scalar(a: wp.float32, b: wp.float32, rtol: wp.float32, atol: wp.float32) -> wp.bool:
+def is_close_scalar(a: wp.Float, b: wp.Float, rtol: wp.Float, atol: wp.Float) -> wp.bool:
+    # Generic over the caller's float precision, so ``allclose`` works on float16/32/64 from one
+    # definition. The tolerances must arrive at that same precision -- see the wrapper.
     return wp.abs(a - b) <= atol + rtol * wp.abs(b)
 
 
