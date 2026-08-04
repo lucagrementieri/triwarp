@@ -655,6 +655,74 @@ def test_fill_holes_min_weight_batched_equals_per_loop(device: str, metric: str)
     assert np.array_equal(batched_np, expected_np)
 
 
+def _star_tube(n: int = 64, seed: int = 3) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Open tube whose free rim is a non-convex, non-planar star of ``n`` vertices.
+
+    A rim this long (spans past ``HOLE_DP_BLOCK``, so a lane covers several apexes) and this
+    irregular is what gives the interval DP genuine ties to break; a convex planar rim does not.
+    """
+    angle = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    radius = np.where(np.arange(n) % 2 == 0, 1.0, 0.45)
+    rng = np.random.default_rng(seed)
+    rim = np.stack(
+        [radius * np.cos(angle), radius * np.sin(angle), rng.normal(scale=0.08, size=n)], axis=1
+    )
+    skirt = np.stack([1.6 * np.cos(angle), 1.6 * np.sin(angle), np.full(n, -0.5)], axis=1)
+    faces = []
+    for i in range(n):
+        j = (i + 1) % n
+        faces.append([i, n + i, n + j])
+        faces.append([i, n + j, j])
+    return np.vstack([rim, skirt]), np.asarray(faces, dtype=np.int64)
+
+
+@pytest.mark.parametrize("metric", FILL_METRICS)
+@pytest.mark.parametrize("smooth_boundary", [True, False])
+def test_fill_dp_span_tiled_matches_serial(
+    monkeypatch: pytest.MonkeyPatch, device: str, metric: str, smooth_boundary: bool
+) -> None:
+    """
+    The tiled per-span engine must emit the **identical face set** as the serial one.
+
+    This is the gate the rest of the file cannot be: the interval DP's ``update_argmin`` takes the
+    *smallest* apex ``k`` at equal cost, and that choice picks the triangles, so a reduction that
+    resolves a tie to a different ``k`` produces an equal-count, equal-cost, **different**
+    triangulation. Measured on this very fixture set: inverting the tie-break to the largest ``k``
+    changes 76 of 144 (fixture, metric, flag) cases and every other test in this file still passes.
+    So byte-equality against the serial reference is the only thing that pins the tiled reduction,
+    and ``fill_dp_span`` stays in the module as that reference (it is also the CPU engine).
+    """
+    if wp.get_device(device).is_cpu:
+        pytest.skip(
+            "fill_dp_span_tiled needs a block of lanes; CPU launch_tiled runs one per block"
+        )
+
+    vertices_np, faces_np = _star_tube()
+    vertices_wp = wp.array(
+        np.ascontiguousarray(vertices_np, dtype=np.float64), dtype=wp.vec3, device=device
+    )
+    faces_wp = wp.array(
+        np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
+    )
+    n_orig = int(faces_wp.shape[0])
+
+    original = tw.hole_filling._run_hole_dp
+    fills = {}
+    for tiled in (True, False):
+        monkeypatch.setattr(
+            tw.hole_filling,
+            "_run_hole_dp",
+            lambda *args, _tiled=tiled, **kwargs: original(*args, **kwargs, tiled=_tiled),
+        )
+        fills[tiled] = tw.hole_filling.fill_holes_min_weight(
+            vertices_wp, faces_wp, metric=metric, smooth_boundary=smooth_boundary
+        ).numpy()[n_orig:]
+
+    assert fills[True].shape[0] > 3 * 3, "fixture produced no fill to compare"
+    assert np.array_equal(fills[True], fills[False])
+
+
 def test_fill_holes_min_weight_optimal_vs_fan(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _, mesh_wp = hemisphere
     # Single-loop fixture: the DP minimizes the plane-normalized objective over all triangulations,

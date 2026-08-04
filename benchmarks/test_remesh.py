@@ -69,17 +69,18 @@ MeshLab's ``meshing_decimation_quadric_edge_collapse`` -- because this is the be
 in the package. Two notes for reading them: the MeshLab filter defaults to ``autoclean=True`` and
 deletes unreferenced vertices, so its MeshSet is rebuilt per round; and the *quality* comparison is
 in ``tests/test_remesh.py`` rather than here, where triwarp measures a **lower** Hausdorff error
-than all three at the same face count (0.0147 against igl's 0.0250 and Open3D's 0.0236 at 512
+than all three at the same face count (0.0133 against igl's 0.0250 and Open3D's 0.0236 at 512
 faces).
 
-**And triwarp is the slower one on this group**, which is worth stating plainly: on
-``saddle_graded`` it measures 88 ms at ``target_ratio=0.5`` and 346 ms at ``0.1`` against igl's 50
-and 80 ms. The reason is the *pass count*, not the per-pass work -- one pass commits an independent
-set of roughly ``candidates / valence`` collapses, so reaching a tenth of the faces takes tens of
-passes and each of them pays a full edge/adjacency/quadric rebuild plus two radix sorts. A serial
-queue pays none of that per collapse. So this is the one port in the package where the parallel
-formulation buys quality rather than speed; the thing to attack is the number of quantities rebuilt
-per pass, not any kernel.
+**And triwarp is still the slower one on this group**, which is worth stating plainly: it measures
+~253 ms on ``saddle_graded`` at ``target_ratio=0.1`` against igl's 80. The reason is the *pass
+count*, not the per-pass work -- one hashed-key independent set commits roughly ``candidates / 50``
+collapses, so reaching a tenth of the faces takes tens of passes and each pays a full
+edge/adjacency/quadric rebuild plus two radix sorts, which a serial queue pays none of. Committing
+**several** independent sets against one rebuild closed 1.3-1.8x of that (see ``_QUADRIC_RATIOS``
+below for the numbers and for what the *other* candidate lever was measured to be worth), and the
+rest of the gap is the same structural trade: the parallel formulation buys quality rather than
+speed here.
 
 ``cluster_decimate`` is the module's other **scan sweep** group, and the interesting one to read
 against ``subdivide``: it is the same shape of work in reverse (bin, remap, dedup -- no data
@@ -393,6 +394,16 @@ def test_flip_by_objective(bench_case: BenchCase, objective: str) -> None:
 # Reduction ratios for the quadric decimator. 0.5 is a mild pass and 0.1 is the ratio MeshLab's own
 # dialogue defaults near; the loop count grows as the target falls, which is the shape of this
 # group.
+#
+# That shape is the whole cost: at 0.1 the call is **92 % host** (354 ms wall against 28.5 ms of
+# device time on ``saddle_graded``) across 69-93 geometry rebuilds of ~40 wrapper calls each. Two
+# things were priced against that. Hoisting the twelve per-pass allocations is worth **3.6 % at
+# most** and was not done: a memset that initializes a kernel input cannot be removed by moving
+# the allocation. Committing several independent sets per rebuild *is* the lever, and cuts the
+# rebuild count by roughly the round count: **1.3-1.8x**, measured back to back
+# (``saddle_graded`` at 0.1: 461 -> 253 ms; ``icosphere(4)`` to 2 048 faces: 158 -> 94). Note
+# that graph capture is **not** available behind either: the pass body contains a host readback
+# that decides the loop's exit, and two data-dependent output shapes.
 _QUADRIC_RATIOS = [0.5, 0.1]
 
 

@@ -11,8 +11,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.array import flatnonzero, gather, init_sort_pair_indices
-from triwarp.constants import INT32_MAX
+from triwarp.array import flatnonzero, gather, init_range, init_sort_pair_indices
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import sample as kernel_sample
 from triwarp.kernels import triangles as kernel_triangles
@@ -366,312 +365,143 @@ def sample_surface_poisson_disk(
     return selected_points, selected_face_indices
 
 
-def _bridson_blue_noise(
+def _dart_throw_blue_noise(
     pool_points: wp.array[wp.vec3], pool_faces: wp.array[wp.int32], radius: float, seed: int
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-    """GPU parallel Bridson dart-throwing on a uniform surface candidate pool."""
+    """
+    Maximal Poisson-disk subset of ``pool_points`` by randomized-priority parallel dart throwing.
+
+    See ``kernels/algorithms/blue_noise.py`` for why the result has the same distribution as one
+    pass of the serial algorithm. The loop is a handful of rounds over a shrinking work list;
+    the one host readback per round is the survivor count, which is also the termination test.
+    """
     device = pool_points.device
-    nx = int(pool_points.shape[0])
-    if nx == 0:
-        return (
-            wp.empty(0, dtype=wp.vec3, device=device),
-            wp.empty(0, dtype=wp.int32, device=device),
-        )
+    n_pool = int(pool_points.shape[0])
+    empty = (wp.empty(0, dtype=wp.vec3, device=device), wp.empty(0, dtype=wp.int32, device=device))
+    if n_pool == 0:
+        return empty
 
-    cell_size = radius / math.sqrt(3.0)
-    inv_cell_size = wp.float32(1.0 / cell_size)
-    rr = wp.float32(radius * radius)
-    four_rr = wp.float32(4.0 * radius * radius)
-
-    # Bounding-box min and grid extent via device reductions (no full-pool host copies).
+    # Background grid at cell size ``radius``, so a 3x3x3 neighbourhood covers the disk exactly.
     bbox_min, _ = tw.bounds.aabb_bounds(pool_points)
-
-    grid_coords = wp.empty(nx, dtype=wp.vec3i, device=device)
-    wp.map(kernel_blue_noise.grid_coord, pool_points, bbox_min, inv_cell_size, out=grid_coords)
-
-    coord_components = cast(twt.Array2dInt32, grid_coords.view(wp.int32))
-    grid_w = int(tw.reduce.max(coord_components)) + 1
-
-    cell_keys = wp.empty(nx, dtype=wp.int64, device=device)
+    grid_coords = wp.empty(n_pool, dtype=wp.vec3i, device=device)
+    wp.map(
+        kernel_blue_noise.grid_coord,
+        pool_points,
+        bbox_min,
+        wp.float32(1.0 / radius),
+        out=grid_coords,
+    )
+    grid_w = int(tw.reduce.max(cast(twt.Array2dInt32, grid_coords.view(wp.int32)))) + 1
+    cell_keys = wp.empty(n_pool, dtype=wp.int64, device=device)
     wp.map(kernel_blue_noise.grid_cell_key, grid_coords, wp.int32(grid_w), out=cell_keys)
 
-    keys_buf = wp.empty(2 * nx, dtype=wp.int64, device=device)
-    wp.copy(keys_buf, cell_keys, count=nx)
-    perm = init_sort_pair_indices(nx, nx, device)
-    wp.utils.radix_sort_pairs(keys_buf, perm, count=nx)
-
-    sorted_pool_idx = wp.empty(nx, dtype=wp.int32, device=device)
-    wp.copy(sorted_pool_idx, perm, count=nx)
-
-    sorted_keys = wp.empty(nx, dtype=wp.int64, device=device)
-    wp.copy(sorted_keys, keys_buf, count=nx)
-
+    # Bucket the pool by cell: one radix sort gives both the per-cell membership lists and, through
+    # the unique run lengths, the sentinel-terminated bounds that index them.
+    keys_buf = wp.empty(2 * n_pool, dtype=wp.int64, device=device)
+    wp.copy(keys_buf, cell_keys, count=n_pool)
+    perm = init_sort_pair_indices(n_pool, n_pool, device)
+    wp.utils.radix_sort_pairs(keys_buf, perm, count=n_pool)
+    bucket = wp.empty(n_pool, dtype=wp.int32, device=device)
+    wp.copy(bucket, perm, count=n_pool)
+    sorted_keys = wp.empty(n_pool, dtype=wp.int64, device=device)
+    wp.copy(sorted_keys, keys_buf, count=n_pool)
     unique_keys, counts = tw.grouping.unique_1d(sorted_keys, return_counts=True)
     n_cells = int(unique_keys.shape[0])
-    # Sentinel-terminated cell bounds: ``cell_offsets[c + 1] - cell_offsets[c]`` is cell ``c``'s
-    # population and ``cell_offsets[n_cells] == nx``, all from the one scan.
     cell_offsets, _ = tw.array.counts_to_offsets(counts, sentinel=True)
 
-    # One-time lookup tables (the grid never changes): each pool point's compacted cell index,
-    # and every cell's 9x9x9 shell of compacted neighbor indices. The round kernels then replace
-    # every binary search over ``unique_keys`` with a single table load. The table costs
-    # ``n_cells * 729`` int32 (~2.9 KB per occupied cell).
-    point_cell = wp.empty(nx, dtype=wp.int32, device=device)
+    point_cell = wp.empty(n_pool, dtype=wp.int32, device=device)
     wp.launch(
         kernel_blue_noise.init_point_cells,
-        dim=nx,
+        dim=n_pool,
         inputs=[grid_coords, wp.int32(grid_w), unique_keys, point_cell],
         device=device,
     )
-    cell_neighbors = twt.empty_int32_2d((n_cells, kernel_blue_noise.SHELL_CELLS), device=device)
+    cell_neighbors = twt.empty_int32_2d(
+        (n_cells, kernel_blue_noise.DART_SHELL_CELLS), device=device
+    )
     wp.launch(
-        kernel_blue_noise.build_cell_neighbors,
-        dim=(n_cells, kernel_blue_noise.SHELL_CELLS),
+        kernel_blue_noise.dart_cell_neighbors,
+        dim=(n_cells, kernel_blue_noise.DART_SHELL_CELLS),
         inputs=[unique_keys, wp.int32(grid_w), cell_neighbors],
         device=device,
     )
 
-    selected = wp.full(n_cells, -1, dtype=wp.int32, device=device)
-    cand_alive = wp.ones(nx, dtype=wp.bool, device=device)
-
-    # Round-loop scratch, allocated once and reused via slice views: every active entry is a
-    # distinct CAS-committed selected point (spawns are fresh cells, survivors earlier spawns),
-    # so the active count is bounded by the number of occupied cells.
-    cap = n_cells
-    active_buf = wp.empty(cap, dtype=wp.int32, device=device)
-    next_buf = wp.empty(cap, dtype=wp.int32, device=device)
-    spawned_buf = wp.empty(cap, dtype=wp.int32, device=device)
-    retire_buf = wp.empty(cap, dtype=wp.int32, device=device)
-    conflict_buf = wp.empty(cap, dtype=wp.int32, device=device)
-    proposal_cell_buf = wp.empty(cap, dtype=wp.int32, device=device)
-    proposal_mi_buf = wp.empty(cap, dtype=wp.int32, device=device)
-    cell_owner = wp.empty(n_cells, dtype=wp.int32, device=device)
-    flags_buf = wp.empty(2 * cap, dtype=wp.int32, device=device)
-    positions_buf = wp.empty(2 * cap, dtype=wp.int32, device=device)
-    total_buf = wp.empty(1, dtype=wp.int32, device=device)
-
-    seed_cursor = 0
-    winner = wp.empty(1, dtype=wp.int32, device=device)
-    seed_state = wp.empty(2, dtype=wp.int32, device=device)
-
-    def _try_seed() -> int:
-        # Parallel scan for the lowest seedable cell at/after the cursor (a read-only dry run
-        # of the activation predicate), then a single-thread commit of the winner: one packed
-        # 8-byte host read per drain event instead of a dim=1 launch + sync per scanned cell.
-        nonlocal seed_cursor
-        while seed_cursor < n_cells:
-            winner.fill_(n_cells)
-            wp.launch(
-                kernel_blue_noise.bridson_seed_scan,
-                dim=n_cells - seed_cursor,
-                inputs=[
-                    pool_points,
-                    point_cell,
-                    cell_neighbors,
-                    sorted_pool_idx,
-                    cell_offsets,
-                    selected,
-                    cand_alive,
-                    rr,
-                    wp.int32(seed_cursor),
-                    winner,
-                ],
-                device=device,
-            )
-            wp.launch(
-                kernel_blue_noise.bridson_seed_commit,
-                dim=1,
-                inputs=[
-                    pool_points,
-                    point_cell,
-                    cell_neighbors,
-                    sorted_pool_idx,
-                    cell_offsets,
-                    selected,
-                    cand_alive,
-                    rr,
-                    four_rr,
-                    wp.int32(n_cells),
-                    winner,
-                    seed_state,
-                ],
-                device=device,
-            )
-            state_np = seed_state.numpy()
-            if int(state_np[0]) >= n_cells:
-                seed_cursor = n_cells
-                return 0
-            seed_cursor = int(state_np[0]) + 1
-            if int(state_np[1]) >= 0:
-                wp.copy(active_buf[0:1], seed_state[1:2])
-                return 1
-        return 0
-
-    # Per-round elementwise kernels, hoisted once (see ``triwarp/smoothing.py``): flag survivors
-    # (retire == 0) and fresh spawns, and pack the two scan tail scalars into one readback.
-    zero_flag = wp.map(
-        kernel_blue_noise.is_zero_int32, retire_buf, out=flags_buf[:cap], return_kernel=True
+    priority = wp.empty(n_pool, dtype=wp.uint32, device=device)
+    wp.launch(
+        kernel_blue_noise.dart_priorities,
+        dim=n_pool,
+        inputs=[wp.int32(seed), priority],
+        device=device,
     )
-    nonneg_flag = wp.map(
-        kernel_blue_noise.is_nonnegative_int32, spawned_buf, out=flags_buf[cap:], return_kernel=True
-    )
-    tail_total = wp.map(wp.add, positions_buf[:1], flags_buf[:1], out=total_buf, return_kernel=True)
+    state = wp.zeros(n_pool, dtype=wp.int32, device=device)
 
-    active_count = _try_seed()
-    if active_count == 0:
-        return (
-            wp.empty(0, dtype=wp.vec3, device=device),
-            wp.empty(0, dtype=wp.int32, device=device),
-        )
+    # Work-list buffers sized for their final use once: the first round's list is the whole pool and
+    # every later one is a prefix of it, so nothing here is reallocated per round.
+    alive = init_range(n_pool, device)
+    next_alive = wp.empty(n_pool, dtype=wp.int32, device=device)
+    survivor_flag = wp.empty(n_pool, dtype=wp.int32, device=device)
+    positions = wp.empty(n_pool, dtype=wp.int32, device=device)
+    alive_count = n_pool
+    rr = wp.float32(radius * radius)
 
-    round_idx = 0
-    max_rounds = nx * 4
-    while round_idx < max_rounds:
-        if active_count == 0:
-            active_count = _try_seed()
-            if active_count == 0:
-                break
-            round_idx += 1
-            continue
-
-        # Propose -> resolve -> commit: the parallel propose phase is read-only against the
-        # frozen committed state, and the two resolve passes pick winners deterministically
-        # (same-cell by active-list rank, cross-cell min-distance conflicts by cell index), so
-        # each round — and therefore the whole sampling — is deterministic by construction.
-        cell_owner.fill_(INT32_MAX)
+    while alive_count > 0:
+        view = alive[:alive_count]
         wp.launch(
-            kernel_blue_noise.bridson_propose,
-            dim=active_count,
+            kernel_blue_noise.dart_select_minima,
+            dim=alive_count,
             inputs=[
                 pool_points,
+                priority,
                 point_cell,
                 cell_neighbors,
-                sorted_pool_idx,
+                bucket,
                 cell_offsets,
-                selected,
-                cand_alive,
-                active_buf[:active_count],
+                view,
                 rr,
-                four_rr,
-                wp.int32(seed),
-                wp.int32(round_idx),
-                proposal_cell_buf[:active_count],
-                proposal_mi_buf[:active_count],
-                retire_buf[:active_count],
+                state,
             ],
             device=device,
         )
         wp.launch(
-            kernel_blue_noise.resolve_same_cell,
-            dim=active_count,
-            inputs=[proposal_cell_buf[:active_count], cell_owner],
+            kernel_blue_noise.dart_cover_neighbors,
+            dim=alive_count,
+            inputs=[pool_points, point_cell, cell_neighbors, bucket, cell_offsets, view, rr, state],
             device=device,
         )
+        # Survivors of this round, compacted in place. ``array_scan`` is exclusive, so the total
+        # is the last position plus the last flag -- one 8-byte readback serving both the next
+        # launch dimension and the loop's exit test, which the round structure needs regardless.
         wp.launch(
-            kernel_blue_noise.resolve_cross_cell,
-            dim=active_count,
-            inputs=[
-                pool_points,
-                cell_neighbors,
-                proposal_cell_buf[:active_count],
-                proposal_mi_buf[:active_count],
-                cell_owner,
-                rr,
-                conflict_buf[:active_count],
-            ],
-            device=device,
-        )
-        wp.launch(
-            kernel_blue_noise.commit_proposals,
-            dim=active_count,
-            inputs=[
-                proposal_cell_buf[:active_count],
-                proposal_mi_buf[:active_count],
-                cell_owner,
-                conflict_buf[:active_count],
-                selected,
-                spawned_buf[:active_count],
-            ],
-            device=device,
-        )
-        wp.launch(
-            kernel_blue_noise.prune_spawn_neighborhoods,
-            dim=active_count,
-            inputs=[
-                pool_points,
-                point_cell,
-                cell_neighbors,
-                sorted_pool_idx,
-                cell_offsets,
-                spawned_buf[:active_count],
-                rr,
-                cand_alive,
-            ],
-            device=device,
-        )
-
-        # Survivors and fresh spawns compact into the next active list with one scan + one
-        # scatter and a single small host read per round; all buffers are reused slice views.
-        wp.launch(
-            zero_flag,
-            dim=active_count,
-            inputs=[retire_buf[:active_count]],
-            outputs=[flags_buf[:active_count]],
-            device=device,
-        )
-        wp.launch(
-            nonneg_flag,
-            dim=active_count,
-            inputs=[spawned_buf[:active_count]],
-            outputs=[flags_buf[active_count : 2 * active_count]],
+            kernel_blue_noise.dart_alive_flags,
+            dim=alive_count,
+            inputs=[view, state, survivor_flag[:alive_count]],
             device=device,
         )
         wp.utils.array_scan(
-            flags_buf[: 2 * active_count],
-            out_array=positions_buf[: 2 * active_count],
-            inclusive=False,
+            survivor_flag[:alive_count], out_array=positions[:alive_count], inclusive=False
         )
-        tail = 2 * active_count - 1
-        wp.launch(
-            tail_total,
-            dim=1,
-            inputs=[positions_buf[tail : tail + 1], flags_buf[tail : tail + 1]],
-            outputs=[total_buf],
-            device=device,
+        tail = np.concatenate(
+            [
+                positions[alive_count - 1 : alive_count].numpy(),
+                survivor_flag[alive_count - 1 : alive_count].numpy(),
+            ]
         )
-        total = int(total_buf.numpy()[0])
-        if total == 0:
-            active_count = 0
-            round_idx += 1
-            continue
-        wp.launch(
-            kernel_blue_noise.compact_active_and_spawned,
-            dim=2 * active_count,
-            inputs=[
-                active_buf[:active_count],
-                spawned_buf[:active_count],
-                flags_buf[: 2 * active_count],
-                positions_buf[: 2 * active_count],
-                next_buf[:total],
-            ],
-            device=device,
-        )
-        active_buf, next_buf = next_buf, active_buf
-        active_count = total
-        round_idx += 1
+        total = int(tail[0]) + int(tail[1])
+        if total > 0:
+            wp.launch(
+                kernel_blue_noise.dart_compact_alive,
+                dim=alive_count,
+                inputs=[view, state, positions[:alive_count], next_alive[:total]],
+                device=device,
+            )
+            alive, next_alive = next_alive, alive
+        alive_count = total
 
-    # Every activated point was committed into ``selected`` at claim time (atomic CAS), so the
-    # result is exactly the non-empty cells — including points still active at the round cap,
-    # which the retirement-order bookkeeping used to drop.
-    selected_mask = wp.empty(n_cells, dtype=wp.bool, device=device)
-    wp.map(kernel_array.greater_equal, selected, wp.int32(0), out=selected_mask)
-    kept_cells = flatnonzero(selected_mask)
-    if int(kept_cells.shape[0]) == 0:
-        return (
-            wp.empty(0, dtype=wp.vec3, device=device),
-            wp.empty(0, dtype=wp.int32, device=device),
-        )
-    kept = gather(selected, kept_cells)
+    accepted_mask = wp.empty(n_pool, dtype=wp.bool, device=device)
+    wp.map(kernel_array.equal, state, kernel_blue_noise.DART_ACCEPTED, out=accepted_mask)
+    kept = flatnonzero(accepted_mask)
+    if int(kept.shape[0]) == 0:
+        return empty
     return gather(pool_points, kept), gather(pool_faces, kept)
 
 
@@ -679,13 +509,14 @@ def sample_surface_blue_noise(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], radius: float, seed: int | None = None
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
-    Sample points on a triangle mesh surface with Bridson blue-noise distribution.
+    Sample points on a triangle mesh surface with a blue-noise (Poisson-disk) distribution.
 
-    Uses "Fast Poisson Disk Sampling in Arbitrary Dimensions" (Bridson 2007),
-    following ``igl::blue_noise``. Generates a large uniform surface pool on GPU,
-    then runs a parallel round-based active-list dart-throwing loop on GPU (all
-    active points attempt to claim neighboring cells each round; hard minimum
-    radius ``radius`` is enforced).
+    Draws a dense uniform surface pool — ``30x`` the expected output, the oversampling factor
+    ``igl::blue_noise`` uses — and reduces it to a **maximal** subset in which no two points are
+    within ``radius`` of each other, by randomized-priority parallel dart throwing. The result has
+    the distribution of sequential dart throwing over a uniformly random order of the pool; see
+    ``kernels/algorithms/blue_noise.py`` for why the parallelism costs nothing in distribution, and
+    for the measured spacing and coverage against MeshLab and Open3D.
 
     Parameters
     ----------
@@ -694,10 +525,12 @@ def sample_surface_blue_noise(
     faces
         Flat triangle indices ``(i0, i1, i2)`` per face.
     radius
-        Minimum Poisson disk radius (Euclidean distance in 3D).
+        Minimum Poisson disk radius (Euclidean distance in 3D). Enforced exactly: the closest pair
+        in the output is never below it.
     seed
-        RNG seed for the initial uniform sampling and Bridson loop. If ``None``,
-        a random seed is chosen.
+        RNG seed for the initial uniform sampling and the sampling order. If ``None``, a random seed
+        is chosen. With a seed the output is reproducible — every round of the loop is a
+        deterministic function of its input state.
 
     Returns
     -------
@@ -711,6 +544,13 @@ def sample_surface_blue_noise(
     ------
     ValueError
         If ``radius <= 0`` or if the mesh has no faces.
+
+    Notes
+    -----
+    The count is **derived**, never requested: it is what a maximal ``radius``-packing of the
+    surface comes to, so it lands near — not at — the hexagonal-packing estimate the radius is
+    usually chosen from. Ask for a *count* with
+    [`sample_surface_poisson_disk`][triwarp.sample.sample_surface_poisson_disk] instead.
     """
     device = vertices.device
     n_faces = faces.shape[0] // 3
@@ -729,9 +569,8 @@ def sample_surface_blue_noise(
     expected = surface_area * (math.pi * math.sqrt(3.0) / 6.0) / (math.pi * radius * radius / 4.0)
     nx = max(1, int(30.0 * expected))
 
-    bridson_seed = _get_seed(seed)
     init_points, init_face_indices = sample_surface(vertices, faces, nx, seed=seed)
-    return _bridson_blue_noise(init_points, init_face_indices, radius, bridson_seed)
+    return _dart_throw_blue_noise(init_points, init_face_indices, radius, _get_seed(seed))
 
 
 def sample_volume(

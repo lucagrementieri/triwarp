@@ -1636,3 +1636,62 @@ def commit_selected_collapses(
     out_remap[removed[k]] = s
     out_positions[s] = target_pos[k]
     wp.atomic_add(out_count, 0, 1)
+
+
+@wp.kernel(enable_backward=False)
+def lock_collapse_neighborhoods(
+    survivor: wp.array[wp.int32],
+    removed: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    out_locked: wp.array[wp.int32],
+) -> None:
+    # Mark the closed 1-rings of both endpoints of every committed collapse, so a later
+    # independent-set round in the *same* pass can be told which candidates the commit invalidated
+    # (see ``drop_locked_candidates``). Plain stores rather than atomics: every write is the same
+    # value.
+    k = int(wp.tid())
+    s = survivor[k]
+    if s < 0:
+        return
+    r = removed[k]
+    out_locked[s] = 1
+    out_locked[r] = 1
+    for i in range(offsets[s], offsets[s + 1]):
+        out_locked[columns[i]] = 1
+    for i in range(offsets[r], offsets[r + 1]):
+        out_locked[columns[i]] = 1
+
+
+@wp.kernel(enable_backward=False)
+def drop_locked_candidates(
+    candidates: wp.array[wp.int32],
+    removed: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    locked: wp.array[wp.int32],
+    out_survivor: wp.array[wp.int32],
+) -> None:
+    # Restore the pass's candidate list for another independent-set round, retiring every candidate
+    # whose two closed 1-rings touch an already-collapsed neighbourhood.
+    #
+    # That disjointness is exactly what makes reusing the pass's scoring legal. A candidate whose
+    # closed 1-rings miss every locked vertex has *no incident face* holding a collapsed endpoint,
+    # so its endpoints' quadrics, its cost, its target position, its link condition and its
+    # normal-flip veto are all still the ones the scoring pass computed. Fail that test and the
+    # candidate must wait for the next geometry rebuild.
+    k = int(wp.tid())
+    out_survivor[k] = -1
+    s = candidates[k]
+    if s < 0:
+        return
+    r = removed[k]
+    if locked[s] != 0 or locked[r] != 0:
+        return
+    for i in range(offsets[s], offsets[s + 1]):
+        if locked[columns[i]] != 0:
+            return
+    for i in range(offsets[r], offsets[r + 1]):
+        if locked[columns[i]] != 0:
+            return
+    out_survivor[k] = s

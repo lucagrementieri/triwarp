@@ -33,6 +33,16 @@ _LaunchCandidates = Callable[
     None,
 ]
 
+# Backstop on the independent-set rounds per geometry rebuild in ``quadric_decimate``.
+#
+# One round commits only a fraction of the scored candidates -- each winner locks the closed 1-rings
+# of both endpoints, so a hashed-key round takes on the order of ``m / 50`` of them -- and the
+# rebuild that follows is ~40 wrapper calls against a handful of launches for another round. So the
+# pass loop runs rounds against the same scoring **until one finds nothing new**, which is the real
+# stopping rule; this constant only bounds it. 6 and 8 produce byte-identical output on every
+# fixture measured, i.e. saturation happens first, and a round that finds nothing costs ~8 launches.
+_QUADRIC_ROUNDS = 8
+
 
 def isotropic_remesh(
     vertices: wp.array[wp.vec3],
@@ -766,18 +776,28 @@ def quadric_decimate(
     metric. Compare the two by deviation from the input rather than by equality.
 
     In exchange the *quality* is competitive and then some: at 512 faces from a subdivision-4
-    icosphere the two-sided Hausdorff distance to the input is **0.0147 here against
+    icosphere the two-sided Hausdorff distance to the input is **0.0133 here against
     ``igl.decimate``'s 0.0250 and Open3D's 0.0236**, and the ordering holds at every target tried.
     Committing an independent set spreads the error over the surface where draining a queue
     concentrates it, and a max-norm rewards that.
 
-    Three consequences to plan around:
+    A pass commits **several independent sets against one scoring**, not one. A single hashed-key
+    round takes on the order of ``m / 50`` of the candidates, because each winner locks the closed
+    1-rings of both its endpoints; the geometry rebuild that would otherwise follow is ~40 wrapper
+    calls, which is 92 % of this function's wall clock. So the pass retires only the candidates the
+    previous round's commits actually invalidated — those whose closed 1-rings touch a collapsed
+    neighbourhood, for which the cached quadric, cost, target position, link condition and
+    normal-flip verdict are the only things that went stale — and runs another round until one finds
+    nothing new. Worth **1.3-1.8x**, and it *improves* the deviation above at two of three targets
+    (the max-norm moves by ±20 % run to run on a tied fixture in any case; see below).
+
+    Four consequences to plan around:
 
     - **The target is usually reached exactly, but is not guaranteed.** A pass is budgeted at half
-      the remaining surplus (an interior collapse removes two faces) and the loop stops early when a
-      pass can commit nothing — a mesh whose remaining edges all fail the link condition or the
-      normal-flip guard cannot be reduced further at any ``max_iter``. Check the returned face count
-      if it matters.
+      the remaining surplus (an interior collapse removes two faces), shared across its rounds, and
+      the loop stops early when a pass can commit nothing — a mesh whose remaining edges all fail
+      the link condition or the normal-flip guard cannot be reduced further at any ``max_iter``.
+      Check the returned face count if it matters.
     - Every collapse is checked against a **normal-flip guard**: an incident face whose normal would
       turn by more than ~78 degrees vetoes it. That is what keeps the output free of the inverted,
       self-intersecting triangles an unguarded quadric method produces at high reduction ratios, and
@@ -787,6 +807,13 @@ def quadric_decimate(
       spatially monotone fields, and a monotone key has one local minimum, so either of those keys
       commits a single collapse per pass. See ``scramble_index`` in ``kernels/remesh.py`` for the
       measured numbers.
+    - **The output is not bit-reproducible on a mesh with tied costs, and never was.** The
+      vertex-face incidence CSR is built by an atomic counting scatter, so a row's order varies run
+      to run; where two candidate edges tie on cost, which one the sort keeps varies with it. On the
+      ``saddle`` grid at 10 % this moves the two-sided Hausdorff between 0.21 and 0.77 across
+      identical runs, so **treat the max-norm as a band, not a value**: the mean deviation is stable
+      to three digits over the same runs (0.0144-0.0149). Compare a change to this function on the
+      mean, or on many repeats.
     """
     n_faces = int(faces.shape[0]) // 3
     target = _resolve_decimation_target(target_faces, target_ratio, n_faces)
@@ -867,60 +894,99 @@ def quadric_decimate(
             inputs=[order, wp.int32(max(1, m // 2)), priority, survivor],
             device=device,
         )
-        min_key = wp.full(n_vertices, INT32_MAX, dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_remesh.claim_collapse_key,
-            dim=m,
-            inputs=[survivor, removed, csr.offsets, csr.columns, min_key],
-            device=device,
-        )
-        claim = wp.full(n_vertices, INT32_MAX, dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_remesh.claim_collapse_index,
-            dim=m,
-            inputs=[survivor, removed, csr.offsets, csr.columns, min_key, claim],
-            device=device,
-        )
+
+        # One independent set is a *fraction* of the candidates, not all of them: each winner locks
+        # the closed 1-rings of both endpoints, so a hashed-key round commits roughly ``m / 50`` of
+        # them and the geometry then gets rebuilt for the next fraction. That rebuild is ~40 wrapper
+        # calls and is what the pass count multiplies, so run several rounds against the *same*
+        # scoring, retiring only the candidates the previous round's commits invalidated
+        # (``drop_locked_candidates`` states the disjointness argument that makes this exact rather
+        # than approximate).
+        candidates = wp.clone(survivor)
+        locked = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+        min_key = wp.empty(n_vertices, dtype=wp.int32, device=device)
+        claim = wp.empty(n_vertices, dtype=wp.int32, device=device)
         winner_cost = wp.empty(m, dtype=wp.float32, device=device)
-        wp.launch(
-            kernel_remesh.mark_collapse_winners,
-            dim=m,
-            inputs=[
-                survivor,
-                removed,
-                csr.offsets,
-                csr.columns,
-                min_key,
-                claim,
-                cost,
-                survivor,
-                winner_cost,
-            ],
-            device=device,
-        )
-
-        # Keep the cheapest half of the remaining surplus: an interior collapse removes two faces,
-        # so that budget is what stops a pass from blowing past the target. The set is already
-        # independent, so dropping members of it keeps it independent.
-        _sorted_winner_cost, winner_order = tw.array.sort_and_argsort(winner_cost)
-        budget = max(1, (n_current - target) // 2)
-        wp.launch(
-            kernel_remesh.assign_collapse_priority,
-            dim=m,
-            inputs=[winner_order, wp.int32(budget), priority, survivor],
-            device=device,
-        )
-
         remap = tw.array.init_range(n_vertices, device)
         positions = wp.clone(current_vertices)
         count = wp.zeros(1, dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_remesh.commit_selected_collapses,
-            dim=m,
-            inputs=[survivor, removed, target_pos, remap, positions, count],
-            device=device,
-        )
-        if int(count.numpy()[0]) == 0:
+        committed = 0
+        for round_index in range(_QUADRIC_ROUNDS):
+            # An interior collapse removes two faces, so half the remaining surplus is what stops a
+            # pass from blowing past the target; the rounds share that one budget. The first round
+            # keeps the floor of one collapse the single-round loop had, which is what lets a pass
+            # with a surplus of a single face still finish the job.
+            budget = (n_current - target) // 2 - committed
+            if round_index > 0 and budget <= 0:
+                break
+            budget = max(1, budget)
+            if round_index > 0:
+                wp.launch(
+                    kernel_remesh.drop_locked_candidates,
+                    dim=m,
+                    inputs=[candidates, removed, csr.offsets, csr.columns, locked, survivor],
+                    device=device,
+                )
+            min_key.fill_(INT32_MAX)
+            wp.launch(
+                kernel_remesh.claim_collapse_key,
+                dim=m,
+                inputs=[survivor, removed, csr.offsets, csr.columns, min_key],
+                device=device,
+            )
+            claim.fill_(INT32_MAX)
+            wp.launch(
+                kernel_remesh.claim_collapse_index,
+                dim=m,
+                inputs=[survivor, removed, csr.offsets, csr.columns, min_key, claim],
+                device=device,
+            )
+            wp.launch(
+                kernel_remesh.mark_collapse_winners,
+                dim=m,
+                inputs=[
+                    survivor,
+                    removed,
+                    csr.offsets,
+                    csr.columns,
+                    min_key,
+                    claim,
+                    cost,
+                    survivor,
+                    winner_cost,
+                ],
+                device=device,
+            )
+
+            # The set is already independent, so dropping members of it keeps it independent.
+            _sorted_winner_cost, winner_order = tw.array.sort_and_argsort(winner_cost)
+            wp.launch(
+                kernel_remesh.assign_collapse_priority,
+                dim=m,
+                inputs=[winner_order, wp.int32(max(1, budget)), priority, survivor],
+                device=device,
+            )
+            wp.launch(
+                kernel_remesh.commit_selected_collapses,
+                dim=m,
+                inputs=[survivor, removed, target_pos, remap, positions, count],
+                device=device,
+            )
+            # ``count`` accumulates across rounds, so this one readback per round both drives the
+            # shared budget and answers "did this round commit anything" -- the same readback the
+            # single-round loop already paid, moved inside.
+            round_total = int(count.numpy()[0])
+            if round_total == committed:
+                break  # this round found nothing new; a further one against the same scoring cannot
+            committed = round_total
+            if round_index + 1 < _QUADRIC_ROUNDS:
+                wp.launch(
+                    kernel_remesh.lock_collapse_neighborhoods,
+                    dim=m,
+                    inputs=[survivor, removed, csr.offsets, csr.columns, locked],
+                    device=device,
+                )
+        if committed == 0:
             break  # nothing legal left to collapse; the target is unreachable from here
 
         remapped = tw.array.gather(remap, current_faces)

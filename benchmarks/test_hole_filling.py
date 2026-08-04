@@ -8,7 +8,18 @@ independent drivers:
 * **Loop length**, cubed. ``fill_holes_min_weight`` runs a minimum-weight triangulation DP over a
   ``B x B`` table per loop, filled by ``B - 2`` *sequential* kernel launches and read back to the
   host for the traceback. Total work is ``sum(B_i^3)`` and no batching can remove it: this is the
-  real cost the module exists to pay. Two loops of 512 measure **157 ms**.
+  real cost the module exists to pay. Two loops of 512 measure **20-35 ms**.
+
+  It measured **157 ms** until the per-span launch went from one thread per interval to one *block*
+  per interval, its lanes striding the apex loop: the grid was ``n_loops * (max_B - span)`` wide, so
+  two long rims put at most ~1 024 threads on a 170-SM part and the whole ``B^3`` term ran at 0.3 %
+  of the machine. Same launch count, same DP, byte-identical triangulation (see
+  ``fill_dp_span_tiled``). Measured by running this module twice in one session with only the engine
+  switched: ``fill_holes_min_weight[rim_short]`` **168.6 -> 35.0 ms (4.8x)**, its two
+  ``_chords`` rows **7.6x** and **5.5x**, and ``[holes_many]`` **20.9 -> 7.0 (3.0x)**. An isolated
+  in-process timer on the same fixtures reads 173.8 -> 19.7 and 18.4 -> 4.4, so read the ratio, not
+  the absolute -- this group's median moves by up to 80 % between runs of the *same* code depending
+  on which reference rows share the process.
 * **Loop count**, which should cost nothing and used to cost everything. Every loop paid a
   ``.numpy()`` readback, its own forbidden-chord pass over the whole mesh and its own span
   launches, so 512 three-vertex holes -- where the DP itself is one triangle per hole -- ran to
@@ -18,8 +29,10 @@ independent drivers:
 
 That is why the axis meshes are *small*: ``rim_short`` is 1 024 faces and ``holes_many`` is 81 408.
 Face count is not the variable, and sizing these meshes up would only add DP table entries that the
-``B^3`` term already dominates. The two points now differ by 37x in the right direction, which is
-what the axis is for -- the inversion is what said the per-loop sequence was the bug.
+``B^3`` term already dominates. The two points now differ by ~5x in the right direction, which is
+what the axis is for -- the inversion is what said the per-loop sequence was the bug. (The gap was
+37x before the per-span launch was widened to a block per interval; that change is worth ~4.8x on
+the long rims and ~3.0x on the short ones, so it narrows the axis without inverting it.)
 ``fill_holes_fan`` runs on the wider **loops** axis instead, because it has no DP and so can afford
 ``rim_long``'s 65 536-vertex rims -- it is the floor this module's cost is measured against.
 

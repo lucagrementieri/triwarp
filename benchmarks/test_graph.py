@@ -18,8 +18,13 @@ Two axes, matching the two ways a graph algorithm gets slow:
   20 481)** at an identical 40 962 vertices: 73x, from a property no face count records. Bounding
   the serial block scan to the frontier and handing narrow frontiers to a serial resume brings that
   to **4.0 ms and 23 ms**, a 5.8x spread -- but scipy does the ribbon in 0.68 ms, so this group
-  stays a loss by 34x and is kept as the open item it is. Closing it needs a single-block
-  ``launch_tiled(dim=[1])`` traversal engine, which is a different program.
+  stays a loss by 34x. **It is now a closed item rather than an open one: the single-block
+  ``launch_tiled(dim=[1])`` traversal engine was written, is order-exact, and is a 2.2x loss.**
+  The serial drain is memory-op *throughput* bound on one thread (481 ns/node against 524 ns for
+  fifteen independent loads), so there is no latency to hide (software pipelining measured 1.05x)
+  and a ribbon's ~2-node frontier means block barriers cost more than the level's work
+  (``tile_scan_exclusive`` alone is 353 ns against 962 ns for the whole level). Full measurements in
+  the ``Notes`` of [`triwarp.graph.bfs`][triwarp.graph.bfs].
 
 The vertex-adjacency CSR matrix is prebuilt (untimed, cached per mesh/device) so the timings
 isolate the graph algorithms from the edge sort that produces them.

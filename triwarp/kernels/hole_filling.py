@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.constants import FLOAT32_INF_CONSTANT
+from triwarp.constants import FLOAT32_INF_CONSTANT, INT32_MAX_CONSTANT
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels.array import update_argmin
 from triwarp.kernels.array import wrap_index as _wrap
@@ -456,6 +456,75 @@ def init_dp_base(
             out_dp[row + j] = BAD_METRIC
 
 
+# Lanes per block of ``fill_dp_span_tiled``: one block owns one interval and its lanes stride the
+# apex loop. Short spans leave lanes idle, which costs nothing the one-thread-per-interval kernel
+# was not already wasting on its ~1 024-wide grid.
+#
+# **Measured flat between 32 and 128** on ``rim_short`` (two 512-vertex loops, medians of 15 over
+# two runs each): 19.0/20.1 at 32, 20.5/35.4 at 64, 19.6/23.9 at 128, against 24.0/36.0 at 256 —
+# i.e. within the noise band up to 128 and a regression past it, so the apex loop is not what the
+# call is bound by. 32 wins the tie on cost per barrier: a single-warp block takes the
+# ``warp_count == 1`` fast path in Warp's ``tile_reduce_impl`` (a ballot plus a warp shuffle, no
+# cross-warp shared-memory round trip), measured at 126 ns per ``tile_min`` against 325 ns at 64
+# and 369 ns at 128.
+HOLE_DP_BLOCK = 32
+
+
+@wp.func
+def apex_cost(
+    loop_pos: wp.array[wp.vec3],
+    rim_opp_pos: wp.array[wp.vec3],
+    rim_opp_valid: wp.array[wp.int32],
+    dp: wp.array[wp.float32],
+    prev: wp.array[wp.int32],
+    metric_id: wp.int32,
+    combine_id: wp.int32,
+    smooth_bd: wp.int32,
+    o: wp.int32,
+    b: wp.int32,
+    base: wp.int32,
+    i: wp.int32,
+    j: wp.int32,
+    k: wp.int32,
+    is_top: wp.bool,
+    a_pos: wp.vec3,
+    c_pos: wp.vec3,
+    plane_normal: wp.vec3,
+    char_area: wp.float32,
+) -> wp.float32:
+    # Metric of triangulating the interval (i, j) with apex ``k``: the two sub-intervals' costs,
+    # this triangle's term, and the per-edge (dihedral) terms for the interior chords (i, k) /
+    # (k, j) taken at the neighbouring sub-interval's apex — or, for a rim edge, at the existing
+    # face's opposite vertex when ``smooth_bd`` is set.
+    k_pos = loop_pos[o + k]
+    tri = triangle_fill_metric(a_pos, k_pos, c_pos, plane_normal, char_area, metric_id)
+    val = combine_metric(dp[base + i * b + k], dp[base + k * b + j], combine_id)
+    val = combine_metric(val, tri, combine_id)
+
+    if k > i + 1:
+        if prev[base + i * b + k] >= 0:
+            e = fill_edge_term(a_pos, k_pos, loop_pos[o + prev[base + i * b + k]], c_pos, metric_id)
+            val = combine_metric(val, e, combine_id)
+    elif smooth_bd != 0 and rim_opp_valid[o + i] != 0:
+        e = fill_edge_term(a_pos, k_pos, rim_opp_pos[o + i], c_pos, metric_id)
+        val = combine_metric(val, e, combine_id)
+
+    if j > k + 1:
+        if prev[base + k * b + j] >= 0:
+            e = fill_edge_term(k_pos, c_pos, loop_pos[o + prev[base + k * b + j]], a_pos, metric_id)
+            val = combine_metric(val, e, combine_id)
+    elif smooth_bd != 0 and rim_opp_valid[o + k] != 0:
+        e = fill_edge_term(k_pos, c_pos, rim_opp_pos[o + k], a_pos, metric_id)
+        val = combine_metric(val, e, combine_id)
+
+    # Closing rim edge (loop[b-1] -> loop[0]) is the base of the whole loop and has no parent, so
+    # its boundary term is added here for the top interval only.
+    if is_top and smooth_bd != 0 and rim_opp_valid[o + b - 1] != 0:
+        e = fill_edge_term(a_pos, c_pos, rim_opp_pos[o + b - 1], k_pos, metric_id)
+        val = combine_metric(val, e, combine_id)
+    return val
+
+
 @wp.kernel(enable_backward=False)
 def fill_dp_span(
     loop_pos: wp.array[wp.vec3],
@@ -476,14 +545,15 @@ def fill_dp_span(
     prev: wp.array[wp.int32],
 ) -> None:
     # One thread per span-``span`` interval (i, j = i + span) of every loop at once; reads only
-    # strictly smaller spans, so successive launches (span = 2, 3, ...) are the DP barriers. Adds
-    # per-edge (dihedral) terms for the interior chords (i, k) / (k, j) using the neighbouring
-    # sub-interval's apex, and the boundary (smoothBd) rim edges using the existing face's opposite
-    # vertex.
+    # strictly smaller spans, so successive launches (span = 2, 3, ...) are the DP barriers.
     #
     # Launched over ``(n_loops, max_B - span)``: threads whose loop is shorter than the current
     # span exit at once, so a mesh whose loops differ wildly in length wastes some of the grid, but
     # the launch *count* is ``max_B - 1`` for the whole mesh instead of ``B - 1`` per loop.
+    #
+    # This is the **CPU** engine and the tie-break reference; CUDA runs
+    # :func:`fill_dp_span_tiled`, which must agree with it apex for apex (see
+    # ``tests/test_hole_filling.py::test_fill_dp_span_tiled_matches_serial``).
     ell, i = wp.tid()
     if active[ell] == 0:
         return
@@ -506,43 +576,117 @@ def fill_dp_span(
     best_val = FLOAT32_INF_CONSTANT
     best_k = int(-1)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
     for k in range(i + 1, j):
-        k_pos = loop_pos[o + k]
-        tri = triangle_fill_metric(a_pos, k_pos, c_pos, plane_normal, char_area, metric_id)
-        val = combine_metric(dp[base + i * b + k], dp[base + k * b + j], combine_id)
-        val = combine_metric(val, tri, combine_id)
-
-        # Edge (i, k): neighbour on the other side is the sub-triangulation apex, or (rim edge) the
-        # existing face's opposite vertex.
-        if k > i + 1:
-            if prev[base + i * b + k] >= 0:
-                e = fill_edge_term(
-                    a_pos, k_pos, loop_pos[o + prev[base + i * b + k]], c_pos, metric_id
-                )
-                val = combine_metric(val, e, combine_id)
-        elif smooth_bd != 0 and rim_opp_valid[o + i] != 0:
-            e = fill_edge_term(a_pos, k_pos, rim_opp_pos[o + i], c_pos, metric_id)
-            val = combine_metric(val, e, combine_id)
-
-        # Edge (k, j).
-        if j > k + 1:
-            if prev[base + k * b + j] >= 0:
-                e = fill_edge_term(
-                    k_pos, c_pos, loop_pos[o + prev[base + k * b + j]], a_pos, metric_id
-                )
-                val = combine_metric(val, e, combine_id)
-        elif smooth_bd != 0 and rim_opp_valid[o + k] != 0:
-            e = fill_edge_term(k_pos, c_pos, rim_opp_pos[o + k], a_pos, metric_id)
-            val = combine_metric(val, e, combine_id)
-
-        # Closing rim edge (loop[b-1] -> loop[0]) is the base of the whole loop and has no parent,
-        # so its boundary term is added here for the top interval only.
-        if is_top and smooth_bd != 0 and rim_opp_valid[o + b - 1] != 0:
-            e = fill_edge_term(a_pos, c_pos, rim_opp_pos[o + b - 1], k_pos, metric_id)
-            val = combine_metric(val, e, combine_id)
-
+        val = apex_cost(
+            loop_pos,
+            rim_opp_pos,
+            rim_opp_valid,
+            dp,
+            prev,
+            metric_id,
+            combine_id,
+            smooth_bd,
+            o,
+            b,
+            base,
+            i,
+            j,
+            k,
+            is_top,
+            a_pos,
+            c_pos,
+            plane_normal,
+            char_area,
+        )
         update_argmin(best_val, best_k, val, k)
     dp[base + i * b + j] = best_val
     prev[base + i * b + j] = best_k
+
+
+@wp.kernel(enable_backward=False)
+def fill_dp_span_tiled(
+    loop_pos: wp.array[wp.vec3],
+    loop_starts: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    dp_offsets: wp.array[wp.int32],
+    active: wp.array[wp.int32],
+    plane_normals: wp.array[wp.vec3],
+    forbidden: wp.array[wp.int32],
+    rim_opp_pos: wp.array[wp.vec3],
+    rim_opp_valid: wp.array[wp.int32],
+    char_areas: wp.array[wp.float32],
+    metric_id: wp.int32,
+    combine_id: wp.int32,
+    smooth_bd: wp.int32,
+    span: wp.int32,
+    dp: wp.array[wp.float32],
+    prev: wp.array[wp.int32],
+) -> None:
+    # One *block* per span-``span`` interval, its ``HOLE_DP_BLOCK`` lanes striding the apex loop.
+    # Same DP, same launch count, ``HOLE_DP_BLOCK`` times the parallelism: the serial kernel above
+    # puts at most ``n_loops * (max_B - span)`` threads on the machine, which for a single long
+    # boundary is a few hundred out of a few hundred thousand.
+    #
+    # **The tie-break is the contract, not the cost.** ``update_argmin`` takes the *smallest* apex
+    # ``k`` at equal cost, and that choice decides the emitted triangles, so a differently-tied
+    # reduction is a valid, equal-cost, *different* filling — which every metric/count test in the
+    # suite passes. The two-stage reduction below reproduces it exactly and without any float
+    # bit-packing: the block minimum of the cost, then the block minimum of ``k`` over just the
+    # lanes that attained it. A lane's own ``update_argmin`` already holds the smallest ``k`` at its
+    # own minimum, so the pair is (min cost, min k attaining it) — which is what an ascending strict
+    # ``<`` scan returns. Lanes with no apex, and an all-non-finite interval, both leave
+    # ``(inf, -1)`` and agree with the serial kernel there too.
+    ell, i, t = wp.tid()
+    # Every guard below is warp-uniform (it reads only ``ell``, ``i`` and ``span``), so the whole
+    # block returns together and the tile reductions never run in divergent control flow.
+    if active[ell] == 0:
+        return
+    b = loop_sizes[ell]
+    if span >= b or i >= b - span:
+        return
+    j = i + span
+    base = dp_offsets[ell]
+    if forbidden[base + i * b + j] != 0:
+        if t == 0:
+            dp[base + i * b + j] = BAD_METRIC
+            prev[base + i * b + j] = -1
+        return
+    o = loop_starts[ell]
+    plane_normal = plane_normals[ell]
+    char_area = char_areas[ell]
+    a_pos = loop_pos[o + i]
+    c_pos = loop_pos[o + j]
+    is_top = i == 0 and j == b - 1
+    best_val = FLOAT32_INF_CONSTANT
+    best_k = int(-1)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
+    for k in range(i + 1 + t, j, HOLE_DP_BLOCK):
+        val = apex_cost(
+            loop_pos,
+            rim_opp_pos,
+            rim_opp_valid,
+            dp,
+            prev,
+            metric_id,
+            combine_id,
+            smooth_bd,
+            o,
+            b,
+            base,
+            i,
+            j,
+            k,
+            is_top,
+            a_pos,
+            c_pos,
+            plane_normal,
+            char_area,
+        )
+        update_argmin(best_val, best_k, val, k)
+    block_val = wp.tile_min(wp.tile(best_val))[0]
+    attained = wp.where(best_val == block_val, best_k, INT32_MAX_CONSTANT)
+    block_k = wp.tile_min(wp.tile(attained))[0]
+    if t == 0:
+        dp[base + i * b + j] = block_val
+        prev[base + i * b + j] = block_k
 
 
 @wp.kernel

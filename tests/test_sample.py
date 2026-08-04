@@ -193,11 +193,12 @@ def test_sample_surface_blue_noise_matches_open3d_and_pymeshlab(
     """
     Class C: three blue-noise samplers, three algorithms, no correspondence between the point sets.
 
-    triwarp does Bridson dart throwing on a background grid, Open3D's ``sample_points_poisson_disk``
-    runs Yuksel's sample *elimination* from a dense uniform cloud, and MeshLab's
-    ``generate_sampling_poisson_disk`` is Corsini et al.'s hierarchical dart throwing. Nothing about
-    the individual samples is shared -- not their count, not their positions, not even their number
-    given the same parameter -- so the comparison is on the properties all three claim. MeshLab is
+    triwarp reduces a dense pool by randomized priority (flat background grid), Open3D's
+    ``sample_points_poisson_disk`` runs Yuksel's sample *elimination* from a dense uniform cloud,
+    and MeshLab's ``generate_sampling_poisson_disk`` is Corsini's hierarchical dart throwing.
+    Nothing about the individual samples is shared -- not their count, not their positions, not even
+    their number given the same parameter -- so the comparison is on the properties all three claim.
+    MeshLab is
     the only reference that accepts a *radius* (``radius=PureValue(r)`` overrides ``samplenum``), so
     it gets triwarp's own parameter; Open3D takes a count and gets triwarp's output count, exactly
     as the benchmark parametrizes them.
@@ -214,19 +215,24 @@ def test_sample_surface_blue_noise_matches_open3d_and_pymeshlab(
 
     | | closest pair / r | worst gap / r | faces hit |
     |---|---|---|---|
-    | triwarp | 1.000 | 1.056 | 20 / 20 |
-    | MeshLab, same radius | 1.000 | 1.076 | 20 / 20 |
-    | Open3D, same count | 0.891 | 1.327 | 20 / 20 |
-    | uniform Monte Carlo | **0.008** | 1.763 | 20 / 20 |
-    | one patch | **0.005** | **17.680** | **4 / 20** |
+    | triwarp | 1.000 | 1.103 | 20 / 20 |
+    | MeshLab, same radius | 1.000 | 1.112 | 20 / 20 |
+    | Open3D, same count | 0.926 | 1.197 | 20 / 20 |
+    | uniform Monte Carlo | **0.005** | 1.878 | 20 / 20 |
+    | one patch | **0.005** | **17.781** | **4 / 20** |
 
-    So assert 1 (``>= 0.85``) clears the worst reference by 4.8% and both probes by **>100x** -- it
-    is the assert carrying the bug class. Assert 3 (every face hit) is what separates the clumped
-    probe, by a factor of 5. Assert 2 (worst gap ``<= 1.4``) is the weakest of the three at a 1.25x
-    margin over the Monte-Carlo probe, and it is applied only to triwarp and MeshLab: Open3D's
-    elimination sampler genuinely leaves larger gaps on a 20-face mesh (1.327), which is a property
-    of its algorithm rather than a disagreement. Sample *counts* at the identical radius are 791
-    against MeshLab's 769, 2.9% apart against a 25% bound (8.6x margin).
+    So assert 1 (``>= 0.85``) clears the worst reference by 8% and both probes by **200x** -- it is
+    the assert carrying the bug class. Assert 3 (every face hit) separates the clumped probe by a
+    factor of 5. Assert 2 (worst gap ``<= 1.4``) is the weakest of the three at a 1.34x margin
+    over the Monte-Carlo probe, and it is applied only to triwarp and MeshLab: Open3D's elimination
+    sampler genuinely leaves larger gaps on a 20-face mesh, which is a property of its algorithm
+    rather than a disagreement. Sample *counts* at the identical radius are 749 against MeshLab's
+    769, 2.6% apart against a 25% bound.
+
+    triwarp's ``1.000`` in the first column is **exact rather than tolerant**, and is a property of
+    the algorithm rather than of this fixture: an accepted point is never within ``r`` of another
+    accepted one, because the later of any such pair would already have been discarded by the
+    earlier one's ball. The two ``0.005`` probe rows are what the column looks like without that.
     """
     mesh_tm, mesh_wp = icosahedron
     radius = _blue_noise_radius_for_count(float(mesh_tm.area), 300)

@@ -439,14 +439,23 @@ def _run_hole_dp(
     smooth_boundary: bool,
     dp: wp.array[wp.float32],
     prev: wp.array[wp.int32],
+    tiled: bool | None = None,
 ) -> None:
     """
     Fill the ragged ``dp`` / ``prev`` tables for every loop flagged in ``active``, in place.
 
     One launch per triangulation span **across all loops**, so the launch count is
     ``max(B) - 1`` for the whole mesh rather than ``B - 1`` per hole.
+
+    ``tiled`` selects the per-span engine: a block per interval with its lanes striding the apex
+    loop (CUDA default), or one thread per interval (CPU, and the tie-break reference). Both
+    produce byte-identical ``dp`` / ``prev``; ``tiled`` exists so a test can force either. It must
+    stay ``False`` on CPU, where ``wp.launch_tiled`` runs a single lane per block and the strided
+    apex loop would silently cover only every ``HOLE_DP_BLOCK``-th apex.
     """
     device = loops.device
+    if tiled is None:
+        tiled = not wp.get_device(device).is_cpu
     wp.launch(
         kernel_hole_filling.init_dp_base,
         dim=(loops.n_loops, loops.max_size),
@@ -454,29 +463,35 @@ def _run_hole_dp(
         device=device,
     )
     for span in range(2, loops.max_size):
-        wp.launch(
-            kernel_hole_filling.fill_dp_span,
-            dim=(loops.n_loops, loops.max_size - span),
-            inputs=[
-                loop_pos,
-                loops.starts,
-                loops.sizes,
-                loops.dp_offsets,
-                active,
-                plane_normals,
-                forbidden,
-                rim_opp_pos,
-                rim_opp_valid,
-                char_areas,
-                wp.int32(metric_id),
-                wp.int32(combine_id),
-                wp.int32(1 if smooth_boundary else 0),
-                wp.int32(span),
-                dp,
-                prev,
-            ],
-            device=device,
-        )
+        inputs = [
+            loop_pos,
+            loops.starts,
+            loops.sizes,
+            loops.dp_offsets,
+            active,
+            plane_normals,
+            forbidden,
+            rim_opp_pos,
+            rim_opp_valid,
+            char_areas,
+            wp.int32(metric_id),
+            wp.int32(combine_id),
+            wp.int32(1 if smooth_boundary else 0),
+            wp.int32(span),
+            dp,
+            prev,
+        ]
+        dim = (loops.n_loops, loops.max_size - span)
+        if tiled:
+            wp.launch_tiled(
+                kernel_hole_filling.fill_dp_span_tiled,
+                dim=dim,
+                inputs=inputs,
+                block_dim=kernel_hole_filling.HOLE_DP_BLOCK,
+                device=device,
+            )
+        else:
+            wp.launch(kernel_hole_filling.fill_dp_span, dim=dim, inputs=inputs, device=device)
 
 
 def _traceback_triangles(prev_np: np.ndarray, loop_np: np.ndarray) -> list[tuple[int, int, int]]:
@@ -526,6 +541,14 @@ def fill_holes_min_weight(
     one pass each. Only the ``O(B)`` traceback is host-side, over a single predecessor buffer. A
     mesh with many small holes therefore costs about what one hole costs; before this was batched,
     512 three-vertex holes ran to 376 ms, of which ~100 % was per-hole overhead.
+
+    Each span launch puts a **block** on every interval rather than a thread, with the block's lanes
+    striding the apex loop and a two-stage tile reduction picking the winner. That is where the
+    parallelism is: the interval grid is only ``n_loops * (max(B) - span)`` wide, so a mesh with a
+    couple of long rims had a few hundred threads carrying the whole cubic term. Worth **4.8-7.6x on
+    two 512-vertex rims and 3.0x on 512 three-vertex ones**, at a byte-identical triangulation — the
+    reduction reproduces the DP's smallest-apex tie-break exactly, which it has to, because the tie
+    decides the triangles (see ``kernels/hole_filling.py::fill_dp_span_tiled``).
 
     Parameters
     ----------

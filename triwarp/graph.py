@@ -354,6 +354,42 @@ def bfs(
     [`bfs_multi_source`][triwarp.graph.bfs_multi_source]
     [`connected_component_labels`][triwarp.graph.connected_component_labels]
     [`scipy.sparse.csgraph.breadth_first_order`][]
+
+    Notes
+    -----
+    !!! note "A long-diameter graph is at its ceiling here, and the ceiling is measured"
+
+        On a two-wide ribbon of 40 962 vertices (diameter 20 480) the serial engine takes almost
+        the whole traversal and runs **23.3 ms against scipy's 0.74 ms**. That is not a defect in
+        the serial kernel, and three ways of attacking it were measured and all failed:
+
+        - **It is memory-op *throughput* per thread, not a latency chain.** 481 ns per node against
+          524 ns for fifteen *independent* loads issued from one thread on the same device (one
+          dependent L2 load is 118 ns), so there is no stall left to hide. One- and two-deep
+          software pipelining of the ``order -> offsets`` half measured **1.05x and 1.01x**, and
+          batching the neighbours' ``dist`` loads through a register vector was a **loss**
+          (21.0 against 19.7 ms).
+        - **More threads cannot pay for their own synchronization.** A single-block cooperative
+          rewrite — level-synchronous, order-exact by construction, verified byte-identical in
+          ``order`` / ``parents`` / ``distances`` at 4, 8, 16 and 32 lanes — runs **39.9-44.1 ms, a
+          2.2x loss**. A ribbon's frontier is ~2 nodes, so the block barriers *are* the cost:
+          ``wp.tile_sum(wp.tile(x))[0]`` is 126 ns and ``wp.tile_scan_exclusive`` 353 ns, and a
+          correct round needs one of each plus a second barrier — ~600 ns of synchronization against
+          the serial engine's 962 ns for the whole level. Over 20 480 levels that is a ~12 ms floor
+          on the synchronization alone, so no barrier arrangement reaches even 2x.
+        - **The host is not available.** One CPU core does this in well under a millisecond, but
+          Warp 1.15's CPU backend corrupts the process heap on this stack, so a host fallback would
+          trade a slow row for a random crash.
+
+        The parallel engine is far worse on this shape (seven fixed-size launches per level,
+        ~410 ms even under conditional-graph capture), which is why the handover exists at all.
+        Single-source BFS on a path graph has two-way parallelism, and one GPU thread
+        pointer-chasing is ~30x slower than one CPU core doing the same, so **triwarp will not beat
+        scipy on this axis.** The
+        narrower ``sphere_med`` gap (2.2x) is a *different* problem: there the captured parallel
+        engine launches all seven kernels at ``dim=node_count`` for a 130-wide frontier, and Warp
+        cannot take a device-side launch dimension, so the lever there is fusing the seven kernels
+        into two or three.
     """
     node_count = adjacency.nrow  # pyright: ignore[reportAttributeAccessIssue]
     ncol = adjacency.ncol  # pyright: ignore[reportAttributeAccessIssue]
