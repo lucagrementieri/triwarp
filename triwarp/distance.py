@@ -28,7 +28,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.constants import TILE_1D
+from triwarp.constants import ITEMS_PER_SLICE
 from triwarp.kernels import distance as kernel_distance
 
 _PointReduction = Literal["mean", "sum", "max"]
@@ -383,8 +383,9 @@ def _reduction_scale(point_reduction: _DiffReduction, count: int) -> float:
     return (1.0 / count) if point_reduction == "mean" else 1.0
 
 
-def _loss_tiles(count: int) -> int:
-    return (count + TILE_1D - 1) // TILE_1D
+def _loss_slices(count: int) -> int:
+    """Thread count for the lane-free chamfer reductions: one thread per strided slice."""
+    return max(1, (count + ITEMS_PER_SLICE - 1) // ITEMS_PER_SLICE)
 
 
 def _zero_loss(device: wp.DeviceLike) -> twt.Array1dFloat32:
@@ -456,19 +457,31 @@ def chamfer_points_to_points_loss(
         nearest_yx = tw.neighbors.query_hashgrid_nearest(x, y, k=1)[0]
 
     def _record() -> None:
-        wp.launch_tiled(
+        wp.launch(
             kernel_distance.chamfer_nn_term,
-            dim=[_loss_tiles(n)],
-            inputs=[x, y, nearest_xy, wp.float32(_reduction_scale(point_reduction, n)), loss],
-            block_dim=TILE_1D,
+            dim=_loss_slices(n),
+            inputs=[
+                x,
+                y,
+                nearest_xy,
+                wp.float32(_reduction_scale(point_reduction, n)),
+                wp.int32(_loss_slices(n)),
+                loss,
+            ],
             device=device,
         )
         if not single_directional:
-            wp.launch_tiled(
+            wp.launch(
                 kernel_distance.chamfer_nn_term,
-                dim=[_loss_tiles(m)],
-                inputs=[y, x, nearest_yx, wp.float32(_reduction_scale(point_reduction, m)), loss],
-                block_dim=TILE_1D,
+                dim=_loss_slices(m),
+                inputs=[
+                    y,
+                    x,
+                    nearest_yx,
+                    wp.float32(_reduction_scale(point_reduction, m)),
+                    wp.int32(_loss_slices(m)),
+                    loss,
+                ],
                 device=device,
             )
 
@@ -540,32 +553,32 @@ def chamfer_points_to_mesh_loss(
         nearest_vp = tw.neighbors.query_hashgrid_nearest(points, vertices, k=1)[0]
 
     def _record() -> None:
-        wp.launch_tiled(
+        wp.launch(
             kernel_distance.chamfer_surface_term,
-            dim=[_loss_tiles(n)],
+            dim=_loss_slices(n),
             inputs=[
                 points,
                 vertices,
                 faces,
                 face_id,
                 wp.float32(_reduction_scale(point_reduction, n)),
+                wp.int32(_loss_slices(n)),
                 loss,
             ],
-            block_dim=TILE_1D,
             device=device,
         )
         if not single_directional:
-            wp.launch_tiled(
+            wp.launch(
                 kernel_distance.chamfer_nn_term,
-                dim=[_loss_tiles(v)],
+                dim=_loss_slices(v),
                 inputs=[
                     vertices,
                     points,
                     nearest_vp,
                     wp.float32(_reduction_scale(point_reduction, v)),
+                    wp.int32(_loss_slices(v)),
                     loss,
                 ],
-                block_dim=TILE_1D,
                 device=device,
             )
 
@@ -637,33 +650,33 @@ def chamfer_mesh_to_mesh_loss(
         face_id_ba = tw.proximity.closest_point_on_mesh(vertices_a, faces_a, vertices_b)[2]
 
     def _record() -> None:
-        wp.launch_tiled(
+        wp.launch(
             kernel_distance.chamfer_surface_term,
-            dim=[_loss_tiles(va)],
+            dim=_loss_slices(va),
             inputs=[
                 vertices_a,
                 vertices_b,
                 faces_b,
                 face_id_ab,
                 wp.float32(_reduction_scale(point_reduction, va)),
+                wp.int32(_loss_slices(va)),
                 loss,
             ],
-            block_dim=TILE_1D,
             device=device,
         )
         if not single_directional:
-            wp.launch_tiled(
+            wp.launch(
                 kernel_distance.chamfer_surface_term,
-                dim=[_loss_tiles(vb)],
+                dim=_loss_slices(vb),
                 inputs=[
                     vertices_b,
                     vertices_a,
                     faces_a,
                     face_id_ba,
                     wp.float32(_reduction_scale(point_reduction, vb)),
+                    wp.int32(_loss_slices(vb)),
                     loss,
                 ],
-                block_dim=TILE_1D,
                 device=device,
             )
 

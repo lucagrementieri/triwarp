@@ -6,7 +6,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.constants import TILE_1D
+from triwarp.constants import ITEMS_PER_SLICE
 from triwarp.kernels import triangles as kernel_triangles
 
 
@@ -180,17 +180,18 @@ def centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.vec3:
     if f == 0:
         return wp.vec3(float("nan"), float("nan"), float("nan"))
     device = vertices.device
-    out_centroid = wp.zeros(3, dtype=wp.float32, device=device)
+    out_centroid = wp.zeros(1, dtype=wp.vec3, device=device)
     out_total_area = wp.zeros(1, dtype=wp.float32, device=device)
-    n_tiles = (f + TILE_1D - 1) // TILE_1D
-    wp.launch_tiled(
+    n_slices = max(1, (f + ITEMS_PER_SLICE - 1) // ITEMS_PER_SLICE)
+    wp.launch(
         kernel_triangles.centroid,
-        dim=[n_tiles],
-        inputs=[vertices, faces, wp.int32(f), out_centroid, out_total_area],
-        block_dim=TILE_1D,
+        dim=n_slices,
+        inputs=[vertices, faces, wp.int32(f), wp.int32(n_slices), out_centroid, out_total_area],
         device=device,
     )
-    centroid = out_centroid.numpy()
+    # Two unavoidable readbacks: the return type is a host-side wp.vec3, so the sums have to
+    # cross to the host to be divided.
+    centroid = out_centroid.numpy()[0]
     total_area = float(out_total_area.numpy()[0])
     return wp.vec3(
         float(centroid[0]) / total_area,

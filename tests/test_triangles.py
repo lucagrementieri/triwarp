@@ -10,7 +10,7 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import faces_igl, trimesh_to_pymeshlab
+from tests.conversions import faces_igl, trimesh_to_pymeshlab, trimesh_to_warp
 
 
 @pytest.mark.parity("face_normals_and_areas", "trimesh")
@@ -229,6 +229,35 @@ def test_centroid(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     centroid_wp = tw.triangles.centroid(mesh_wp.points, mesh_wp.indices)
     centroid_wp = np.array([centroid_wp.x, centroid_wp.y, centroid_wp.z])
     assert np.allclose(centroid_wp, centroid_tm, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("kernel_device", ["cpu", "cuda:0"])
+def test_centroid_matches_trimesh_on_a_skewed_mesh_on_both_devices(kernel_device: str):
+    """
+    Pin the area-weighted centroid sum on the CPU device, on a deliberately asymmetric mesh.
+
+    Two things this guards. ``wp.launch_tiled`` runs exactly one lane per block on Warp 1.15's CPU
+    backend, so the block-wide ``wp.tile_sum`` this reduction used to perform accumulated one face
+    per 64-face tile there. And a *symmetric* mesh hides that completely -- the centroid of every
+    64th face of a sphere is still the sphere's centre -- which is why the mesh is stretched and
+    sheared first. Measured: the sub-sampled sum was off by 1.1e-2 on this shape and by 4e-8 on the
+    unmodified sphere.
+    """
+    if kernel_device.startswith("cuda") and not wp.is_cuda_available():
+        pytest.skip("no CUDA device")
+
+    mesh_tm = tm.creation.icosphere(subdivisions=3)
+    mesh_tm.vertices[:, 0] *= 6.0
+    mesh_tm.vertices[:, 2] += 0.4 * mesh_tm.vertices[:, 1] ** 3
+    mesh_wp = trimesh_to_warp(mesh_tm, kernel_device)
+
+    centroid_wp = tw.triangles.centroid(mesh_wp.points, mesh_wp.indices)
+    assert np.allclose(
+        np.array([centroid_wp.x, centroid_wp.y, centroid_wp.z]),
+        mesh_tm.centroid,
+        rtol=1e-4,
+        atol=1e-4,
+    )
 
 
 def test_centroid_empty(device: str):

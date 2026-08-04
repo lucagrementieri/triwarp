@@ -29,10 +29,16 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_nonempty_mesh
-from triwarp.constants import TILE_1D
 from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import shading as kernel_shading
 from triwarp.triangles import face_normals_and_areas
+
+# Elements per thread for the two *per-query* lane-free reductions here (solid-angle sum, packed
+# support argmax). Unlike a global reduction, these have one accumulator per query, so the query
+# dimension already supplies the parallelism and a short slice only multiplies the atomic traffic:
+# measured on 20k faces x 5000 queries, 128 runs 0.49 ms against 3.7 ms at 8 and 13.8 ms at 4. The
+# optimum is flat over 128-256 and degrades again past 512, so this is not a sensitive knob.
+ITEMS_PER_QUERY_SLICE = 128
 
 # Ray-origin offset *below* the surface along the inward normal, as a fraction of the query AABB
 # diagonal: without it the cone's own starting triangle is the nearest hit for every ray.
@@ -331,10 +337,11 @@ def winding_number(
     query_points
         ``(m,)`` query positions in space as ``wp.vec3``.
     tiled
-        When ``True`` (default), sum solid angles with a per-query tiled reduction over
-        faces: each ``(query, face_tile)`` block assigns one face per lane via
-        ``wp.tile``, cooperatively reduces with ``wp.tile_sum``, and
-        accumulates via ``wp.tile_atomic_add``. When ``False``, each query thread
+        When ``True`` (default), sum solid angles with the face list partitioned across
+        threads: one thread per ``(query, face slice)`` walks a strided slice of
+        [`ITEMS_PER_SLICE`][triwarp.constants.ITEMS_PER_SLICE] faces and accumulates one
+        ``wp.atomic_add`` per slice, so the summation order is nondeterministic and the result
+        can differ in the last float32 digits between runs. When ``False``, each query thread
         loops over all faces serially — orders of magnitude slower on large meshes,
         but the fixed left-to-right summation makes it the exact-sum reference.
 
@@ -357,12 +364,18 @@ def winding_number(
         else wp.empty(n_queries, dtype=wp.float32, device=device)
     )
     if tiled:
-        n_face_tiles = (n_faces + TILE_1D - 1) // TILE_1D
-        wp.launch_tiled(
+        n_face_slices = max(1, (n_faces + ITEMS_PER_QUERY_SLICE - 1) // ITEMS_PER_QUERY_SLICE)
+        wp.launch(
             kernel_proximity.winding_number_tiled,
-            dim=[n_queries, n_face_tiles],
-            inputs=[vertices, faces, wp.int32(n_faces), query_points, out_winding],
-            block_dim=TILE_1D,
+            dim=(n_queries, n_face_slices),
+            inputs=[
+                vertices,
+                faces,
+                wp.int32(n_faces),
+                wp.int32(n_face_slices),
+                query_points,
+                out_winding,
+            ],
             device=device,
         )
     else:
@@ -448,21 +461,19 @@ def max_tangent_sphere(
     support_indices = tw.array.flatnonzero(needs_support)
     k = int(support_indices.shape[0])
     if k > 0:
-        n_vert_tiles = (n_verts + TILE_1D - 1) // TILE_1D
-        stride_blocks = min(n_vert_tiles, 64)
+        n_vert_slices = max(1, (n_verts + ITEMS_PER_QUERY_SLICE - 1) // ITEMS_PER_QUERY_SLICE)
         packed_support = wp.zeros(k, dtype=wp.uint64, device=device)
-        wp.launch_tiled(
+        wp.launch(
             kernel_proximity.support_argmax_tiled,
-            dim=[k, stride_blocks],
+            dim=(k, n_vert_slices),
             inputs=[
                 mesh.points,
                 wp.int32(n_verts),
-                wp.int32(stride_blocks),
+                wp.int32(n_vert_slices),
                 ray_dirs,
                 support_indices,
                 packed_support,
             ],
-            block_dim=TILE_1D,
             device=device,
         )
         wp.launch(

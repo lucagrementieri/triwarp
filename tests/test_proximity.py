@@ -16,7 +16,7 @@ import trimesh.proximity as tm_proximity
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab
+from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab, trimesh_to_warp
 from triwarp.constants import TOLERANCE_MERGE
 
 
@@ -470,6 +470,65 @@ def test_winding_number_tiled_matches_exact(icosahedron: tuple[tm.Trimesh, wp.Me
     exact_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, query_wp, tiled=False)
     tiled_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, query_wp, tiled=True)
     assert np.allclose(tiled_wp.numpy(), exact_wp.numpy(), rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("kernel_device", ["cpu", "cuda:0"])
+def test_winding_number_tiled_matches_igl_on_both_devices(kernel_device: str) -> None:
+    """
+    Pin the tiled winding sum on the CPU device, where the ``device`` fixture never runs it.
+
+    ``wp.launch_tiled`` executes exactly one lane per block on Warp 1.15's CPU backend -- the lane
+    index from ``wp.tid()`` is always 0 -- so the block-wide ``wp.tile_sum`` this reduction used to
+    perform summed one face per 64-face tile and returned a winding number off by up to 0.99 there,
+    i.e. a whole turn. The reduction is lane-free now; this is the test that fails if it regresses.
+    """
+    if kernel_device.startswith("cuda") and not wp.is_cuda_available():
+        pytest.skip("no CUDA device")
+
+    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    mesh_wp = trimesh_to_warp(mesh_tm, kernel_device)
+    rng = np.random.default_rng(43)
+    query_np = rng.random((200, 3), dtype=np.float64) * 3.0 - 1.5
+
+    winding_igl = igl.winding_number(
+        np.array(mesh_tm.vertices, dtype=np.float64),
+        np.array(mesh_tm.faces, dtype=np.int64),
+        query_np,
+    )
+    query_wp = wp.array(
+        np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=kernel_device
+    )
+    winding_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, query_wp, tiled=True)
+    assert np.allclose(winding_wp.numpy(), winding_igl.ravel(), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("kernel_device", ["cpu", "cuda:0"])
+def test_max_tangent_sphere_agrees_across_devices(kernel_device: str) -> None:
+    """
+    Pin the packed support-argmax reduction, which had the same one-lane-per-block CPU bug.
+
+    Query points are pulled *inside* the surface on purpose: with them exactly on it the
+    shrinking-sphere iteration is ill-conditioned (the sphere collapses to a 0.0018 radius on a unit
+    sphere) and the two devices then differ by 23% from float ordering alone, which would make this
+    a test of that degeneracy rather than of the reduction.
+    """
+    if kernel_device.startswith("cuda") and not wp.is_cuda_available():
+        pytest.skip("no CUDA device")
+
+    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    mesh_wp = trimesh_to_warp(mesh_tm, kernel_device)
+    vertices_np = np.asarray(mesh_tm.vertices)
+    points_wp = wp.array(
+        np.ascontiguousarray(vertices_np * 0.95), dtype=wp.vec3, device=kernel_device
+    )
+    normals_wp = wp.array(
+        np.ascontiguousarray(np.asarray(mesh_tm.vertex_normals)),
+        dtype=wp.vec3,
+        device=kernel_device,
+    )
+    _centers_wp, radii_wp = tw.proximity.max_tangent_sphere(mesh_wp, points_wp, normals=normals_wp)
+    # The inscribed tangent sphere of a unit sphere, from just inside it, is the sphere itself.
+    assert np.allclose(radii_wp.numpy(), 0.95, rtol=0.1, atol=0.1)
 
 
 def test_winding_number_inside_outside(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:

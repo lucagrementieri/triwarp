@@ -175,24 +175,31 @@ def test_face_adjacency_convex_empty(device: str) -> None:
     assert convex_wp.shape == (0,)
 
 
-@pytest.mark.parity("fast_convex_set_mask", "trimesh", "open3d", "pymeshlab")
-def test_fast_convex_set_mask_against_the_three_qhull_backends(device: str) -> None:
+@pytest.mark.parity("convex_subset_mask", "trimesh", "open3d", "pymeshlab")
+def test_convex_subset_mask_against_the_three_qhull_backends(device: str) -> None:
     """
     Soundness and recall against exact qhull.
 
     ``benchmarks/test_convex.py`` says of these three rows that "this is not a parity comparison":
     trimesh, Open3D and pymeshlab all run **qhull** and return the exact hull as a *mesh*, while
-    ``fast_convex_set`` returns an approximate *vertex subset* from a direction sweep. That rules
+    ``convex_subset`` returns an approximate *vertex subset* from a direction sweep. That rules
     out equality -- it does not rule out a test. Two properties are checkable and are exactly
     what an approximate hull filter has to guarantee:
 
     - **soundness**, asserted exactly: every point triwarp selects must be a true hull vertex. This
       is the half that catches a real bug -- an implementation that returned interior points, or the
-      whole cloud, fails immediately, and no tolerance is involved.
+      whole cloud, fails immediately, and no tolerance is involved. Note this is the *fixture's*
+      guarantee, not the function's: it holds because 500 standard-normal points are in general
+      position, so no support direction ties. The invariant that holds for every input is the weaker
+      "every selected point lies on the hull boundary" -- on a cloud with coplanar ties (a grid over
+      each face of a cube) the mask also selects face-edge midpoints, which are boundary points but
+      not hull vertices, and this assertion would fail there by design.
     - **recall**, asserted with a bound: measured **27 of 31** hull vertices at
       ``n_directions=256`` (0.871) against all three references, which agree with each other on the
       hull exactly. The 0.70 floor leaves room for a different direction set without admitting a
-      filter that has stopped finding most of the hull.
+      filter that has stopped finding most of the hull. The gap is not slack in the test -- the four
+      missed vertices have normal cones spanning 3e-5 to 2e-3 of the sphere, so no direction sample
+      this size is expected to find them; recall reaches 1.00 on this cloud at 16384 directions.
 
     Marked for all three libraries deliberately: they compute the identical answer here, so one
     assertion covers all three rows, and confirming they agree is itself worth a line -- it says the
@@ -203,7 +210,7 @@ def test_fast_convex_set_mask_against_the_three_qhull_backends(device: str) -> N
     points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
 
     selected = set(
-        np.flatnonzero(tw.convex.fast_convex_set_mask(points_wp, n_directions=256).numpy()).tolist()
+        np.flatnonzero(tw.convex.convex_subset_mask(points_wp, n_directions=256).numpy()).tolist()
     )
 
     def hull_indices(hull_vertices: np.ndarray) -> set[int]:
@@ -227,19 +234,19 @@ def test_fast_convex_set_mask_against_the_three_qhull_backends(device: str) -> N
         assert len(selected & hull) / len(hull) > 0.70, f"{name}: recall too low"
 
 
-def test_fast_convex_set_mask_sound(device: str) -> None:
+def test_convex_subset_mask_sound(device: str) -> None:
     rng = np.random.default_rng(0)
     points_np = rng.standard_normal((500, 3)).astype(np.float64)
     points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
 
-    mask_wp = tw.convex.fast_convex_set_mask(points_wp, n_directions=256)
+    mask_wp = tw.convex.convex_subset_mask(points_wp, n_directions=256)
     selected = np.flatnonzero(mask_wp.numpy())
 
     hull_scipy = scipy.spatial.ConvexHull(points_np)
     assert set(selected.tolist()) <= set(hull_scipy.vertices.tolist())
 
 
-def test_fast_convex_set_mask_scale_invariant(device: str) -> None:
+def test_convex_subset_mask_scale_invariant(device: str) -> None:
     rng = np.random.default_rng(7)
     points_np = rng.standard_normal((500, 3)).astype(np.float64)
     scaled_np = points_np * 1e4
@@ -247,8 +254,8 @@ def test_fast_convex_set_mask_scale_invariant(device: str) -> None:
     points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
     scaled_wp = wp.array(np.ascontiguousarray(scaled_np), dtype=wp.vec3, device=device)
 
-    mask_wp = tw.convex.fast_convex_set_mask(points_wp, n_directions=256)
-    mask_scaled_wp = tw.convex.fast_convex_set_mask(scaled_wp, n_directions=256)
+    mask_wp = tw.convex.convex_subset_mask(points_wp, n_directions=256)
+    mask_scaled_wp = tw.convex.convex_subset_mask(scaled_wp, n_directions=256)
     assert np.array_equal(mask_wp.numpy(), mask_scaled_wp.numpy())
 
     hull_scipy = scipy.spatial.ConvexHull(scaled_np)
@@ -256,32 +263,185 @@ def test_fast_convex_set_mask_scale_invariant(device: str) -> None:
     assert set(selected.tolist()) <= set(hull_scipy.vertices.tolist())
 
 
-def test_fast_convex_set_recall(device: str) -> None:
+def test_convex_subset_recall(device: str) -> None:
     rng = np.random.default_rng(2)
     points_np = rng.standard_normal((200, 3)).astype(np.float64)
     points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
 
-    mask_wp = tw.convex.fast_convex_set_mask(points_wp, n_directions=4096)
+    mask_wp = tw.convex.convex_subset_mask(points_wp, n_directions=4096)
     selected = set(np.flatnonzero(mask_wp.numpy()).tolist())
 
     hull_scipy = scipy.spatial.ConvexHull(points_np)
     assert selected == set(hull_scipy.vertices.tolist())
 
 
-def test_fast_convex_set_points(device: str) -> None:
+def test_convex_subset_points(device: str) -> None:
     rng = np.random.default_rng(4)
     points_np = rng.standard_normal((300, 3)).astype(np.float64)
     points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
 
-    mask_wp = tw.convex.fast_convex_set_mask(points_wp, n_directions=256)
-    subset_wp = tw.convex.fast_convex_set(points_wp, n_directions=256)
+    mask_wp = tw.convex.convex_subset_mask(points_wp, n_directions=256)
+    subset_wp = tw.convex.convex_subset(points_wp, n_directions=256)
 
     selected = np.flatnonzero(mask_wp.numpy())
     expected_points = points_np[np.sort(selected)]
     assert np.allclose(subset_wp.numpy(), expected_points, rtol=1e-5, atol=1e-5)
 
 
-def test_fast_convex_set_mask_empty(device: str) -> None:
+def test_convex_subset_mask_empty(device: str) -> None:
     points_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    mask_wp = tw.convex.fast_convex_set_mask(points_wp)
+    mask_wp = tw.convex.convex_subset_mask(points_wp)
     assert mask_wp.shape == (0,)
+
+
+def _cloud(kind: str, n: int, seed: int) -> np.ndarray:
+    """Build one of the point distributions the superset filter behaves differently on."""
+    rng = np.random.default_rng(seed)
+    if kind == "gaussian":
+        return rng.standard_normal((n, 3))
+    if kind == "cube":
+        return rng.random((n, 3))
+    direction_np = rng.standard_normal((n, 3))
+    direction_np /= np.linalg.norm(direction_np, axis=1, keepdims=True)
+    return direction_np * rng.random((n, 1)) ** (1.0 / 3.0)
+
+
+# Fraction of the cloud the filter is allowed to keep, per distribution, at ``subdivisions=3`` on
+# 20k points. Measured 0.40% / 3.60% / 1.46% for gaussian / ball / cube; these bounds sit ~3x above
+# that, which is what makes the containment assertion below non-vacuous -- an all-``True`` mask
+# (the trivially correct superset) keeps 100% and fails every one of them.
+_MAX_KEPT_FRACTION = {"gaussian": 0.012, "ball": 0.11, "cube": 0.05}
+
+
+@pytest.mark.parametrize("kind", ["gaussian", "ball", "cube"])
+@pytest.mark.parity("convex_superset_mask", "scipy")
+def test_convex_superset_mask_contains_the_exact_hull(device: str, kind: str) -> None:
+    """
+    Assert exact containment of the reference hull's vertex set (class B).
+
+    The one named transform is reading [`scipy.spatial.ConvexHull`][]'s hull vertex *indices* as a
+    boolean mask.
+
+    Containment rather than equality is the point, not a weakening: ``convex_superset_mask`` is
+    defined as a conservative filter, and "no hull vertex is ever discarded" is the whole contract.
+    The assertion is exact -- no tolerance -- and it is the assertion that fails if the tetrahedron
+    interior test is ever wrong in the unsafe direction.
+
+    Containment alone would be vacuous (an all-``True`` mask satisfies it), so the second assertion
+    bounds how much the filter keeps. Both must hold: the first catches a filter that discards too
+    much, the second a filter that discards too little. Parametrized over three distributions
+    because selectivity varies by two orders of magnitude between them -- near-spherical clouds are
+    the easy case and flat-faced ones the hard case -- so a single fixture would hide a regression
+    on the others.
+    """
+    points_np = _cloud(kind, 20_000, seed=11)
+    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+
+    mask_np = tw.convex.convex_superset_mask(points_wp, subdivisions=3).numpy()
+    kept = set(np.flatnonzero(mask_np).tolist())
+    hull_scipy = set(scipy.spatial.ConvexHull(points_np).vertices.tolist())
+
+    assert hull_scipy <= kept, f"{kind}: discarded {len(hull_scipy - kept)} true hull vertices"
+    assert mask_np.mean() < _MAX_KEPT_FRACTION[kind], f"{kind}: filter kept {mask_np.mean():.3%}"
+
+
+@pytest.mark.parametrize("kind", ["gaussian", "cube"])
+def test_convex_superset_mask_tightens_with_subdivisions(device: str, kind: str) -> None:
+    """More directions wrap the hull more closely, and the guarantee holds at every level."""
+    points_np = _cloud(kind, 5_000, seed=12)
+    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    hull_scipy = set(scipy.spatial.ConvexHull(points_np).vertices.tolist())
+
+    counts = []
+    for subdivisions in (0, 1, 2, 3):
+        mask_np = tw.convex.convex_superset_mask(points_wp, subdivisions=subdivisions).numpy()
+        assert hull_scipy <= set(np.flatnonzero(mask_np).tolist())
+        counts.append(int(mask_np.sum()))
+
+    assert counts == sorted(counts, reverse=True), f"not monotone in subdivisions: {counts}"
+    assert counts[-1] < counts[0]
+    assert counts[-1] >= len(hull_scipy)
+
+
+def test_convex_superset_mask_contains_the_subset_mask(device: str) -> None:
+    """The two one-sided filters bracket the hull: subset ``<=`` hull vertices ``<=`` superset."""
+    points_np = _cloud("gaussian", 5_000, seed=13)
+    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+
+    subset_np = tw.convex.convex_subset_mask(points_wp, n_directions=256).numpy()
+    superset_np = tw.convex.convex_superset_mask(points_wp, subdivisions=3).numpy()
+    hull_scipy = set(scipy.spatial.ConvexHull(points_np).vertices.tolist())
+
+    assert set(np.flatnonzero(subset_np).tolist()) <= hull_scipy
+    assert hull_scipy <= set(np.flatnonzero(superset_np).tolist())
+    assert np.array_equal(subset_np & superset_np, subset_np)
+
+
+def test_convex_superset_mask_scale_invariant(device: str) -> None:
+    """The flatness and margin tests are relative, so scaling the cloud cannot change the mask."""
+    points_np = _cloud("gaussian", 5_000, seed=14)
+    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    scaled_wp = wp.array(np.ascontiguousarray(points_np * 1e4), dtype=wp.vec3, device=device)
+
+    assert np.array_equal(
+        tw.convex.convex_superset_mask(points_wp).numpy(),
+        tw.convex.convex_superset_mask(scaled_wp).numpy(),
+    )
+
+
+@pytest.mark.parametrize("kind", ["coplanar", "collinear", "identical", "three_points"])
+def test_convex_superset_mask_degenerate_keeps_everything(device: str, kind: str) -> None:
+    """
+    Degenerate clouds have no non-flat tetrahedron, so nothing is certified interior.
+
+    Keeping every point is the conservative answer and a valid (if useless) superset -- the failure
+    mode this guards against is the opposite one, where a flat tetrahedron's ill-conditioned inverse
+    reports arbitrary points as interior and discards hull vertices.
+    """
+    rng = np.random.default_rng(15)
+    if kind == "coplanar":
+        points_np = np.column_stack([rng.standard_normal((500, 2)), np.zeros(500)])
+    elif kind == "collinear":
+        points_np = np.outer(np.linspace(0.0, 1.0, 100), np.array([1.0, 2.0, 3.0]))
+    elif kind == "identical":
+        points_np = np.ones((50, 3))
+    else:
+        points_np = rng.standard_normal((3, 3))
+
+    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    assert tw.convex.convex_superset_mask(points_wp).numpy().all()
+
+
+def test_convex_superset_mask_empty(device: str) -> None:
+    points_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    mask_wp = tw.convex.convex_superset_mask(points_wp)
+    assert mask_wp.shape == (0,)
+
+
+@pytest.mark.parametrize("mask_device", ["cpu", "cuda:0"])
+def test_support_sweep_agrees_across_devices(mask_device: str) -> None:
+    """
+    Both hull filters must agree on CPU and CUDA, which is not automatic.
+
+    ``wp.launch_tiled`` runs exactly **one** lane per block on Warp 1.15's CPU backend -- the lane
+    index from ``wp.tid()`` is always 0 -- so the block-wide ``wp.tile_max`` reduction the support
+    sweep originally used silently reduced over one point per 64-point tile there. That returned an
+    under-estimated support maximum, which made ``convex_subset_mask`` mark interior points (its
+    soundness assertion above fails outright on CPU) and made ``convex_superset_mask`` build a
+    shrunken shell. Both kernels are now lane-free; this pins that, on the device where every
+    ``device``-fixture test is silent because the fixture prefers ``cuda:0``.
+    """
+    if mask_device.startswith("cuda") and not wp.is_cuda_available():
+        pytest.skip("no CUDA device")
+
+    points_np = _cloud("gaussian", 5_000, seed=16)
+    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=mask_device)
+    hull_scipy = set(scipy.spatial.ConvexHull(points_np).vertices.tolist())
+
+    subset_np = tw.convex.convex_subset_mask(points_wp, n_directions=128).numpy()
+    superset_np = tw.convex.convex_superset_mask(points_wp, subdivisions=2).numpy()
+
+    assert set(np.flatnonzero(subset_np).tolist()) <= hull_scipy
+    assert hull_scipy <= set(np.flatnonzero(superset_np).tolist())
+    # The tile bug's signature was a wildly less selective filter, not a wrong-shaped one.
+    assert superset_np.mean() < 0.05

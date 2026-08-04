@@ -13,12 +13,14 @@ import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import trimesh as tm
+import trimesh.proximity as tm_proximity
 import warp as wp
 from scipy.spatial import KDTree
 from scipy.spatial.distance import directed_hausdorff
 
 import triwarp as tw
-from tests.conversions import points_to_open3d, points_to_pymeshlab
+from tests.conversions import points_to_open3d, points_to_pymeshlab, trimesh_to_warp
 
 # igl requires float64 vertices / int64 faces; Warp uses float32 / int32, so mesh-surface
 # references diverge from Warp at roughly float32 precision.
@@ -580,6 +582,42 @@ def test_chamfer_mesh_to_mesh_loss_grad(
     assert np.allclose(verts_a_wp.grad.numpy(), grad_a_ref, rtol=_FD_RTOL, atol=_FD_ATOL)
     if not single_directional:
         assert np.allclose(verts_b_wp.grad.numpy(), grad_b_ref, rtol=_FD_RTOL, atol=_FD_ATOL)
+
+
+@pytest.mark.parametrize("kernel_device", ["cpu", "cuda:0"])
+def test_chamfer_losses_match_numpy_on_both_devices(kernel_device: str) -> None:
+    """
+    Pin both chamfer loss reductions on the CPU device against a closed-form NumPy sum.
+
+    ``wp.launch_tiled`` runs exactly one lane per block on Warp 1.15's CPU backend, so the
+    block-wide ``wp.tile_sum`` these losses used to perform accumulated one point per 64-point tile
+    there and returned a loss roughly 64x too small -- measured 0.43 absolute on this size of cloud.
+    Both reductions are lane-free now.
+    """
+    if kernel_device.startswith("cuda") and not wp.is_cuda_available():
+        pytest.skip("no CUDA device")
+
+    rng = np.random.default_rng(91)
+    x_np = rng.standard_normal((500, 3))
+    y_np = rng.standard_normal((300, 3)) * 0.7
+    x_wp = wp.array(np.ascontiguousarray(x_np), dtype=wp.vec3, device=kernel_device)
+    y_wp = wp.array(np.ascontiguousarray(y_np), dtype=wp.vec3, device=kernel_device)
+
+    # Bidirectional mean-reduced squared chamfer, exactly what the default arguments compute.
+    squared_np = ((x_np[:, None, :] - y_np[None, :, :]) ** 2).sum(-1)
+    loss_np = squared_np.min(1).mean() + squared_np.min(0).mean()
+    loss_wp = tw.distance.chamfer_points_to_points_loss(x_wp, y_wp)
+    assert np.allclose(loss_wp.numpy()[0], loss_np, rtol=1e-4, atol=1e-4)
+
+    # Single-directional points-to-mesh: the reference is the distance to the nearest triangle,
+    # which for a convex mesh sampled outside it is the distance to its surface.
+    mesh_tm = tm.creation.icosphere(subdivisions=3)
+    mesh_wp = trimesh_to_warp(mesh_tm, kernel_device)
+    surface_loss_wp = tw.distance.chamfer_points_to_mesh_loss(
+        x_wp, mesh_wp.points, mesh_wp.indices, single_directional=True
+    )
+    _closest_np, distance_np, _face_np = tm_proximity.closest_point(mesh_tm, x_np)
+    assert np.allclose(surface_loss_wp.numpy()[0], (distance_np**2).mean(), rtol=1e-3, atol=1e-3)
 
 
 def test_chamfer_loss_no_tape_has_value_but_no_grad(device: str) -> None:

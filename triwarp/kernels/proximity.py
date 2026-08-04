@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.constants import TILE_1D, TOLERANCE_MERGE_CONSTANT, TOLERANCE_PLANAR_CONSTANT, TWO_PI
+from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_PLANAR_CONSTANT, TWO_PI
 from triwarp.kernels import triangles as kernel_triangles
 
 
@@ -227,28 +227,20 @@ def winding_number_tiled(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     n_faces: wp.int32,
+    n_slices: wp.int32,
     query_points: wp.array[wp.vec3],
     out_winding: wp.array[wp.float32],
 ) -> None:
-    q, tile_i, t = wp.tid()
-    n_f = int(n_faces)
-    face_offset = int(tile_i) * TILE_1D
-    if face_offset >= n_f:
-        return
-
-    remaining = n_f - face_offset
-    count = wp.min(remaining, TILE_1D)
-
+    # One thread per (query, face slice): each walks a strided slice of the face list and commits
+    # one atomic. Deliberately lane-free -- a block-wide `wp.tile_sum` would be the natural
+    # reduction, but `wp.launch_tiled` runs exactly one lane per block on Warp 1.15's CPU backend,
+    # so every lane-parallel form silently sums one face per tile and under-counts there.
+    q, j = wp.tid()
     p = query_points[int(q)]
-    face_idx = face_offset + int(t)
-    contrib = wp.float32(0.0)
-    if int(t) < count:
-        contrib = solid_angle_at_face(vertices, faces, face_idx, p)
-
-    tile = wp.tile(contrib)
-    tile_sum = wp.tile_sum(tile)
-    if t == 0:
-        wp.tile_atomic_add(out_winding, tile_sum, (int(q),))
+    total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    for face_idx in range(int(j), int(n_faces), int(n_slices)):
+        total = total + solid_angle_at_face(vertices, faces, face_idx, p)
+    wp.atomic_add(out_winding, int(q), total)
 
 
 @wp.func
@@ -279,32 +271,28 @@ def pack_support_candidate(projection: wp.float32, index: wp.int32) -> wp.uint64
 def support_argmax_tiled(
     mesh_vertices: wp.array[wp.vec3],
     n_vertices: wp.int32,
-    stride_blocks: wp.int32,
+    n_slices: wp.int32,
     normals: wp.array[wp.vec3],
     support_indices: wp.array[wp.int32],
     out_packed: wp.array[wp.uint64],
 ) -> None:
-    # Support point of the vertex cloud per deferred query: argmax of dot(v, n). Each lane
-    # strides over the vertices (grid-stride keeps the block count bounded), reduces its own
-    # running best into a packed (projection, index) key, and the block commits one atomic.
-    q, block_j, t = wp.tid()
+    # Support point of the vertex cloud per deferred query: argmax of dot(v, n). One thread per
+    # (query, vertex slice) strides over the vertices, reduces its own running best into a packed
+    # (projection, index) key, and commits one atomic; the packed key's ordering makes atomic_max
+    # the global argmax with the lowest index as tie-break. Lane-free on purpose -- the block-wide
+    # `wp.tile_max` this replaces reduced a single lane on Warp 1.15's CPU backend, where
+    # `wp.launch_tiled` runs one lane per block.
+    q, j = wp.tid()
     normal = normals[support_indices[int(q)]]
-    stride = int(stride_blocks) * TILE_1D
-    idx = int(block_j) * TILE_1D + int(t)
     best = wp.float32(-wp.inf)
     best_index = wp.int32(0)
-    while idx < int(n_vertices):
+    for idx in range(int(j), int(n_vertices), int(n_slices)):
         projection = wp.dot(mesh_vertices[idx], normal)
         if projection > best or (projection == best and idx < best_index):
             best = projection
             best_index = idx
-        idx += stride
-    packed = wp.uint64(0)
     if not wp.isinf(best):
-        packed = pack_support_candidate(best, best_index)
-    tile_best = wp.tile_max(wp.tile(packed))
-    if t == 0:
-        wp.atomic_max(out_packed, int(q), tile_best[0])
+        wp.atomic_max(out_packed, int(q), pack_support_candidate(best, best_index))
 
 
 @wp.kernel
