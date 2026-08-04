@@ -134,3 +134,26 @@ def face_adjacency_angles(
     normal_a = face_normals[face_adjacency[tid, 0]]
     normal_b = face_normals[face_adjacency[tid, 1]]
     out_angles[tid] = kernel_array.vector_angle_vec(normal_a, normal_b)
+
+
+@wp.kernel
+def count_vertex_faces(faces: wp.array[wp.int32], out_counts: wp.array[wp.int32]) -> None:
+    f = int(wp.tid())
+    for k in range(3):
+        wp.atomic_add(out_counts, faces[f * 3 + k], 1)
+
+
+@wp.kernel
+def scatter_vertex_faces(
+    faces: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    cursor: wp.array[wp.int32],
+    out_vertex_faces: wp.array[wp.int32],
+) -> None:
+    # Vertex-to-face CSR payload. Row order is thread-order and therefore arbitrary, which is what
+    # the wrapper documents: a rotational order would need halfedge twins and would refuse a
+    # vertex-non-manifold mesh, which the decimator that consumes this must not do.
+    f = int(wp.tid())
+    for k in range(3):
+        v = faces[f * 3 + k]
+        out_vertex_faces[offsets[v] + wp.atomic_add(cursor, v, 1)] = f

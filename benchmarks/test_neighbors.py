@@ -53,16 +53,43 @@ Reference
 **scipy** ``spatial.KDTree`` — the same reference ``tests/test_neighbors.py`` validates against, and
 the only exact k-NN in the test group with a matching signature (``query(x, k=k)`` returns distances
 and indices in the same layout). ``KDTree`` construction is inside the timed region for the same
-reason triwarp's index build is. trimesh has no k-NN entry point and libigl's is not exposed in the
-Python bindings; open3d's ``KDTreeFlann`` has no batched query (it is a Python loop over
-``search_knn_vector_3d``, which would time the interpreter rather than the search), so the
-cross-library k-NN comparison lives in
-[`test_registration.py`](test_registration.py) and [`test_points.py`](test_points.py) where open3d
-drives the whole algorithm from C++.
+reason triwarp's index build is.
+
+**libigl** ``igl.knn`` is the second exact k-NN, and it *is* bound — an earlier version of this
+docstring claimed it was not, which was wrong. It returns ``(n_queries, k)`` ``int64`` indices
+sorted by distance, byte-identical to ``KDTree``'s on a tie-free cloud, so it is a genuine
+independent implementation rather than a shape-compatible stand-in. Three things shape its rows:
+
+* **Seven positional arguments, and the octree is built over the *data* cloud**:
+  ``igl.knn(queries, points, k, *igl.octree(points)[:4])``. The build goes inside the timed
+  callable, like scipy's ``KDTree`` and triwarp's own, and is *also* timed alone in
+  ``bvh_from_points`` — where ``igl.octree`` is the only structure build the reference side of that
+  group has ever had.
+* **``igl.octree``'s cost is mostly Python objects, and its variance is entirely the garbage
+  collector.** It returns its per-cell point lists as a **Python ``list`` of 151 233 nested lists**
+  on ``bunny``'s 35 947 points (54 851 of them non-empty), so the binding allocates ~150k list
+  objects per call. Measured back to back: **40.6-44.6 ms with ``gc`` disabled against 90.6-176.9 ms
+  with it enabled** — a tight distribution becomes a 2-4x spread, which is why this row's ``Min``
+  and ``Median`` differ by 5x where every other row in the module agrees to within 20%. Read the igl
+  rows' *medians*, not their minima, and read the build-included k-NN numbers as pricing the binding
+  as much as the search. It is the same hazard as the ``*_lists`` variants elsewhere in the suite,
+  except here it lands on the only structure igl exposes for k-NN, so there is no array form to
+  switch to.
+* **It is capped at ``bunny``**, one step below scipy's ``dragon``, because that object churn grows
+  with the cell count. In-harness medians on ``bunny`` at 20 000 queries: **250 / 340 ms** at ``k``
+  = 1 / 64 build-included (minima 122 / 211), against triwarp's 0.65 / 2.65 ms. ``k > n_points``
+  silently returns ``n_points`` columns rather than raising, which no row here hits but a future one
+  might.
+
+trimesh has no k-NN entry point; open3d's ``KDTreeFlann`` has no batched query (it is a Python loop
+over ``search_knn_vector_3d``, which would time the interpreter rather than the search), so the
+open3d k-NN comparison lives in [`test_registration.py`](test_registration.py) and
+[`test_points.py`](test_points.py) where open3d drives the whole algorithm from C++.
 """
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import pytest
 import warp as wp
@@ -137,8 +164,18 @@ def _run_scipy(bench_case: BenchCase, k: int) -> None:
     assert np.asarray(distances_np).shape[0] == queries_np.shape[0]
 
 
+def _run_igl_knn(bench_case: BenchCase, k: int) -> None:
+    """``igl.knn`` with the octree build inside the timed region, as scipy's ``KDTree`` is."""
+    skip_larger_than(bench_case, "bunny", "igl.octree allocates one Python list per octree cell")
+    queries_np, points_np = _queries_np(bench_case), bench_case.vertices_np
+    indices_igl = bench_case.run(
+        lambda: igl.knn(queries_np, points_np, k, *igl.octree(points_np)[:4])
+    )
+    assert indices_igl.shape == (queries_np.shape[0], k)
+
+
 @pytest.mark.benchmark(group="query_bvh_nearest_k1")
-@pytest.mark.benchlibs("triwarp", "scipy")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl")
 def test_query_bvh_nearest_k1(bench_case: BenchCase) -> None:
     """``k=1`` BVH k-NN — the exact call ICP and the Chamfer family make."""
     skip_larger_than(bench_case, "dragon")
@@ -148,6 +185,8 @@ def test_query_bvh_nearest_k1(bench_case: BenchCase) -> None:
             lambda: tw.neighbors.query_bvh_nearest(points, queries, k=1)
         )
         assert indices.shape == (queries.shape[0],)
+    elif bench_case.kind == "igl":
+        _run_igl_knn(bench_case, 1)
     else:
         _run_scipy(bench_case, 1)
 
@@ -168,7 +207,7 @@ def test_query_hashgrid_nearest_k1(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="query_bvh_nearest_k7")
-@pytest.mark.benchlibs("triwarp", "scipy")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl")
 def test_query_bvh_nearest_k7(bench_case: BenchCase) -> None:
     """``k=7`` BVH k-NN — ``ball_pivoting``'s seed-candidate table."""
     skip_larger_than(bench_case, "dragon")
@@ -178,12 +217,14 @@ def test_query_bvh_nearest_k7(bench_case: BenchCase) -> None:
             lambda: tw.neighbors.query_bvh_nearest(points, queries, k=7)
         )
         assert indices.shape == (queries.shape[0], 7)
+    elif bench_case.kind == "igl":
+        _run_igl_knn(bench_case, 7)
     else:
         _run_scipy(bench_case, 7)
 
 
 @pytest.mark.benchmark(group="query_bvh_nearest_k64")
-@pytest.mark.benchlibs("triwarp", "scipy")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl")
 def test_query_bvh_nearest_k64(bench_case: BenchCase) -> None:
     """
     ``k=64`` BVH k-NN — the largest register-row bucket, and the k axis's far end.
@@ -200,6 +241,8 @@ def test_query_bvh_nearest_k64(bench_case: BenchCase) -> None:
             lambda: tw.neighbors.query_bvh_nearest(points, queries, k=64)
         )
         assert indices.shape == (queries.shape[0], 64)
+    elif bench_case.kind == "igl":
+        _run_igl_knn(bench_case, 64)
     else:
         _run_scipy(bench_case, 64)
 
@@ -220,21 +263,31 @@ def test_query_hashgrid_nearest_k7(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="bvh_from_points")
-@pytest.mark.benchlibs("triwarp", "scipy")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl")
 @pytest.mark.parametrize("leaf_size", _LEAF_SIZES)
 def test_bvh_from_points(bench_case: BenchCase, leaf_size: int) -> None:
     """
     Structure build alone: the cost a caller amortizes, or fails to.
 
-    Subtract this from ``query_bvh_nearest_k1`` to get the query in isolation. scipy takes no
-    leaf-size parameter, so its two rows are identical by construction and are there as the fixed
-    bar; triwarp's own slope is the other half of the ``leaf_size`` trade-off.
+    Subtract this from ``query_bvh_nearest_k1`` to get the query in isolation. Neither reference
+    takes a leaf-size parameter, so each one's two rows are identical by construction and are there
+    as fixed bars; triwarp's own slope is the other half of the ``leaf_size`` trade-off.
+
+    ``igl.octree`` is the structure ``igl.knn`` consumes, so this row is also what the k-NN groups'
+    build-included numbers carry: ~198 ms of ``bunny``'s 250 ms at ``k=1``, against triwarp's
+    0.22 ms — and most of that 198 is the 151 233 Python lists it returns rather than the tree, see
+    the module docstring.
     """
     skip_larger_than(bench_case, "dragon", "the scipy reference builds single-threaded")
     if bench_case.kind == "triwarp":
         points = bench_case.vertices_wp
         bvh = bench_case.run(lambda: tw.neighbors.bvh_from_points(points, leaf_size=leaf_size))
         assert bvh is not None
+    elif bench_case.kind == "igl":
+        skip_larger_than(bench_case, "bunny", "igl.octree is superlinear in the point count")
+        points_np = bench_case.vertices_np
+        point_indices_igl, _, _, _ = bench_case.run(lambda: igl.octree(points_np))[:4]
+        assert len(point_indices_igl) > 0
     else:
         points_np = bench_case.vertices_np
         assert bench_case.run(lambda: KDTree(points_np)) is not None

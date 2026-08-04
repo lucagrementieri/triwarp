@@ -108,7 +108,9 @@ def _assert_duplicate_vertices_match(
         assert np.allclose(np.sort(tri_wp, axis=1), np.sort(tri_igl, axis=1), rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parity("remove_unreferenced_vertices", "igl")
 def test_remove_unreferenced_identity(icosahedron, device: str):
+    """Class A: all four returns against ``igl.remove_unreferenced``, on a fully-referenced mesh."""
     mesh_tm, mesh_wp = icosahedron
     vertices_np = mesh_tm.vertices
     faces_np = mesh_tm.faces
@@ -127,7 +129,15 @@ def test_remove_unreferenced_identity(icosahedron, device: str):
     assert np.array_equal(inverse_wp.numpy(), inverse_igl.ravel())
 
 
+@pytest.mark.parity("remove_unreferenced_vertices", "igl")
 def test_remove_unreferenced_extra_vertices(device: str):
+    """
+    Class A with four unreferenced vertices appended -- the case the identity test cannot see.
+
+    The forward map and the inverse map are both compared, not just the compacted buffers: a
+    compaction that dropped the right vertices but numbered them differently would pass on the first
+    two returns alone, and every caller that keeps per-vertex data alongside relies on the maps.
+    """
     rng = np.random.default_rng(0)
     vertices_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
     faces_np = np.array([[0, 1, 2]], dtype=np.int32)
@@ -372,6 +382,39 @@ def test_make_winding_consistent_matches_pymeshlab(device: str) -> None:
         lexsort_rows(canonical_winding(faces_pml)),
     )
     assert tw.validation.is_winding_consistent(repaired_wp)
+
+
+@pytest.mark.parity("make_winding_consistent", "igl")
+def test_make_winding_consistent_matches_igl(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B (cyclic winding): the repaired face table against ``igl.bfs_orient``'s ``FF``, exactly.
+
+    No global sign fix is needed and that is the interesting part: both libraries anchor each
+    component on its lowest-numbered face, so on a connected mesh the answer is unique rather than
+    determined up to a per-component flip. The only transform is
+    [`tests.comparisons.canonical_winding`][], because a flip is emitted as a rotation of the
+    reversed triangle.
+
+    ``bfs_orient``'s second return is the per-face **component id**, not a flip mask -- the trap
+    recorded in ``tests/test_validation.py::test_face_orientation_mask_matches_igl``. Here it is
+    asserted to be single-valued, which is what makes "no global sign fix" a claim about the
+    anchoring rather than a coincidence of this fixture.
+    """
+    mesh_tm, mesh_wp = icosahedron
+    faces_flipped = mesh_tm.faces.copy()
+    faces_flipped[::2] = faces_flipped[::2][:, ::-1]
+    _, faces_wp = _to_wp_mesh(mesh_tm.vertices, faces_flipped, mesh_wp.device)
+
+    oriented_igl, components_igl = igl.bfs_orient(
+        np.ascontiguousarray(faces_flipped, dtype=np.int64)
+    )
+    assert np.unique(components_igl).shape[0] == 1
+
+    repaired_wp = tw.repair.make_winding_consistent(faces_wp)
+
+    assert np.array_equal(
+        canonical_winding(_faces_2d(repaired_wp)), canonical_winding(oriented_igl)
+    )
 
 
 @pytest.mark.parity("make_winding_consistent", "trimesh")

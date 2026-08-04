@@ -11,7 +11,7 @@ import trimesh.grouping as tm_grouping
 import warp as wp
 
 import triwarp as tw
-from tests.comparisons import assert_unordered_rows_equal
+from tests.comparisons import assert_unordered_rows_equal, lexsort_rows
 from tests.conversions import trimesh_to_pymeshlab
 
 _MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
@@ -45,6 +45,30 @@ def test_edges(device: str) -> None:
     faces_wp = _faces_np_to_wp(faces_np, device)
     edges_wp = tw.edges.faces_to_edges(faces_wp)
     assert np.array_equal(edges_wp.numpy(), edges_np)
+
+
+@pytest.mark.parity("faces_to_edges", "igl")
+def test_edges_match_igl(device: str) -> None:
+    """
+    Class B (row order): ``igl.oriented_facets`` emits the same ``3F`` directed pairs, permuted.
+
+    trimesh lists all three edges of face 0, then all three of face 1, and triwarp matches that
+    exactly (the test above). igl groups by *corner* instead -- every face's edge 0, then every
+    face's edge 1 -- so the row order differs while the multiset does not, which is what
+    [`tests.comparisons.lexsort_rows`][] canonicalises.
+
+    The rows are compared **directed**, without sorting the pair itself: ``oriented_facets`` keeps
+    the winding, so a comparison that sorted within each row would stop testing the orientation and
+    pass for a table with any edge reversed.
+    """
+    rng = np.random.default_rng(0)
+    faces_np = rng.integers(0, 50, size=(20, 3), dtype=np.int32)
+
+    edges_igl = igl.oriented_facets(np.ascontiguousarray(faces_np, dtype=np.int64))
+    edges_wp = tw.edges.faces_to_edges(_faces_np_to_wp(faces_np, device))
+
+    assert edges_igl.shape == (faces_np.shape[0] * 3, 2)
+    assert np.array_equal(lexsort_rows(edges_wp.numpy()), lexsort_rows(edges_igl))
 
 
 @pytest.mark.parity("faces_to_edges_sorted", "trimesh")

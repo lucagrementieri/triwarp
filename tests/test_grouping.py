@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import igl
 import numpy as np
 import pytest
 import trimesh as tm
@@ -7,7 +8,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from tests.comparisons import lexsort_rows
+from tests.comparisons import lexsort_rows, same_partition
 from triwarp.kernels.grouping import VEC3_PACK_PRECISION, VEC3_PACK_SHIFT
 
 group_test_data = (
@@ -158,7 +159,20 @@ def test_unique_rows_vec3(device: str):
         )
 
 
+@pytest.mark.parity("unique_faces", "igl")
 def test_unique_faces(device: str):
+    """
+    Class B (rows sorted): ``igl.unique_simplices`` returns the sorted rows, triwarp the winding.
+
+    Both dedup faces up to vertex permutation and both return the inverse map. The difference is the
+    *representative*: igl documents ``FF == sort(F(IA, :), 2)``, so its rows come out ascending,
+    while triwarp keeps the first occurrence's original winding -- the property the last two asserts
+    below pin, and the reason the igl comparison sorts triwarp's rows first.
+
+    The input deliberately contains both a rotation (``[2, 0, 1]``) and a reflection (``[2, 1, 0]``)
+    of face 0, so a dedup that collapsed only rotations -- i.e. an orientation-*sensitive* one --
+    would report four unique faces instead of three and fail against both references.
+    """
     # Faces sharing the same three vertices (any orientation) collapse to one representative.
     faces_np = np.array(
         [[0, 1, 2], [2, 0, 1], [3, 4, 5], [2, 1, 0], [3, 5, 4], [6, 7, 8]], dtype=np.int32
@@ -179,6 +193,13 @@ def test_unique_faces(device: str):
     # Representatives are the first occurrence with original vertex order preserved.
     assert np.array_equal(unique_faces_np[inverse[0]], faces_np[0])
     assert np.array_equal(unique_faces_np[inverse[2]], faces_np[2])
+
+    unique_igl, _representatives_igl, inverse_igl = igl.unique_simplices(
+        np.ascontiguousarray(faces_np, dtype=np.int64)
+    )[:3]
+    assert np.array_equal(lexsort_rows(np.sort(unique_faces_np, axis=1)), lexsort_rows(unique_igl))
+    # The two inverse maps agree as *partitions* of the input, whatever the slot numbering.
+    assert same_partition(inverse, np.asarray(inverse_igl).ravel())
 
 
 def test_unique_faces_empty(device: str):

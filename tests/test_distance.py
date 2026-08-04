@@ -188,7 +188,20 @@ def test_chamfer_mesh_to_mesh_identical_is_zero(icosahedron) -> None:
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+@pytest.mark.parity("chamfer_points_to_mesh", "igl")
 def test_chamfer_points_to_mesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B (a named composition): igl supplies the forward half, scipy the backward one.
+
+    ``igl.point_mesh_squared_distance`` *is* the cloud-to-surface query and is exact, but there is
+    no igl cloud-to-cloud counterpart, so the reference Chamfer is assembled from it plus a
+    ``KDTree`` ``k=1`` search back from the mesh vertices -- the same two halves triwarp computes,
+    in the same order, each from an independent implementation. That composition is why the
+    benchmark's igl row is the forward half alone and reads as a lower bound.
+
+    The tolerance is ``_MESH_RTOL`` rather than ``1e-5`` for a stated reason: igl consumes float64
+    vertices where Warp carries float32, so the two agree only to float32 precision here.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float64)
     faces_np = np.asarray(mesh_tm.faces, dtype=np.int64)
@@ -197,9 +210,9 @@ def test_chamfer_points_to_mesh(request: pytest.FixtureRequest, mesh_name: str) 
     center = vertices_np.mean(axis=0)
     points_np = (center + rng.normal(scale=0.6, size=(120, 3))).astype(np.float32)
 
-    forward_sqr_np = _igl_point_mesh_sqr_dist(points_np, vertices_np, faces_np)
+    forward_sqr_igl = _igl_point_mesh_sqr_dist(points_np, vertices_np, faces_np)
     backward_sqr_np = KDTree(points_np.astype(np.float64)).query(vertices_np)[0] ** 2
-    chamfer_np = np.mean(forward_sqr_np) + np.mean(backward_sqr_np)
+    chamfer_np = np.mean(forward_sqr_igl) + np.mean(backward_sqr_np)
 
     chamfer_wp = tw.distance.chamfer_points_to_mesh(
         _points_wp(points_np, mesh_wp.device), mesh_wp.points, mesh_wp.indices

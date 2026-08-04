@@ -196,7 +196,21 @@ def test_euler_characteristic_icosahedron(icosahedron: tuple[tm.Trimesh, wp.Mesh
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parity("is_edge_manifold", "igl")
 def test_is_edge_manifold_allow_boundary(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: the reduced verdict against ``igl.is_edge_manifold``'s first return, plus NumPy.
+
+    igl always allows boundary edges, so this is the comparison at triwarp's default
+    ``allow_boundary_edges=True``; the ``False`` setting has no igl counterpart and is pinned
+    against the NumPy reference in the test below.
+
+    The fixture list spans closed and open meshes, so the assert is not a constant: every fixture
+    here is edge-manifold, and the *non*-manifold direction -- where a constant ``True`` would fail
+    -- is covered by the deliberately non-manifold inputs in
+    [`test_edge_manifold_mask`][tests.test_validation.test_edge_manifold_mask] and the two
+    single-edge fan cases further down.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     manifold_wp = tw.validation.is_edge_manifold(mesh_wp.indices, allow_boundary_edges=True)
     manifold_igl = bool(igl.is_edge_manifold(_faces_igl(mesh_tm))[0])
@@ -486,6 +500,45 @@ def _triangle_ribbon(n_quads: int) -> tuple[np.ndarray, np.ndarray]:
     faces[0::2] = np.column_stack((2 * i, 2 * i + 1, 2 * i + 2))
     faces[1::2] = np.column_stack((2 * i + 1, 2 * i + 3, 2 * i + 2))
     return vertices, faces
+
+
+@pytest.mark.parity("face_orientation_bits", "igl")
+def test_face_orientation_mask_matches_igl(device: str) -> None:
+    """
+    Class B: igl's flip mask is *derived* from its reoriented face table, not returned.
+
+    ``igl.bfs_orient(F)`` returns ``(FF, C)`` and ``C`` is the per-face **component id** -- all
+    zeros on a connected mesh -- which is the trap this test exists to pin: comparing triwarp's bits
+    against ``C`` would compare them against a constant and pass for the wrong reason. The named
+    transform is therefore *recover the mask*: a face was flipped iff its row in ``FF`` is the
+    reversal of its row in ``F``, which the first assert checks is the only possibility (every row
+    is either identical or reversed, never a different triangle).
+
+    With that mask recovered the two agree **exactly, with no global sign fix**: both libraries
+    anchor each component on its lowest-numbered face, so the answer is unique rather than
+    determined up to a per-component flip. The second half of the test pins the same statement one
+    level up, on the repaired face table, through
+    [`tests.comparisons.canonical_winding`][] -- a flip is emitted as a rotation of the reversed
+    triangle, so the rows are compared cyclically.
+    """
+    vertices_np, faces_np = _triangle_ribbon(1024)
+    rng = np.random.default_rng(11)
+    scrambled_np = rng.random(faces_np.shape[0]) < 0.5
+    flipped_np = faces_np.copy()
+    flipped_np[scrambled_np] = flipped_np[scrambled_np][:, ::-1]
+    _, faces_wp = _mesh_to_wp(vertices_np, flipped_np, device)
+
+    oriented_igl, components_igl = igl.bfs_orient(np.ascontiguousarray(flipped_np, dtype=np.int64))
+    unchanged_igl = (oriented_igl == flipped_np).all(axis=1)
+    reversed_igl = (oriented_igl == flipped_np[:, ::-1]).all(axis=1)
+    assert bool((unchanged_igl | reversed_igl).all()), "a row is neither kept nor reversed"
+    assert np.unique(components_igl).shape[0] == 1, "the ribbon is one component"
+
+    mask_wp = tw.validation.face_orientation_mask(faces_wp).numpy()
+    repaired_np = tw.repair.make_winding_consistent(faces_wp).numpy().reshape(-1, 3)
+
+    assert np.array_equal(mask_wp, ~unchanged_igl)
+    assert np.array_equal(canonical_winding(repaired_np), canonical_winding(oriented_igl))
 
 
 @pytest.mark.parity("face_orientation_bits", "trimesh")

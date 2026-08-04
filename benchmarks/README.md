@@ -413,15 +413,18 @@ the pymeshlab filter is the thing being caught up with, and in every case the po
 | `uv_seam_edges` | `test_seams` | `compute_selection_by_texture_seams_per_vertex` | **0.94 ms against 300 ms** on `sphere_large`; the filter returns only the seam *vertex set*, unioned with the boundary, so it does strictly less than the triwarp row (which also splits boundaries out and finds foldovers) |
 | `filter_normals`, `filter_two_step`, `filter_unsharp_mask` | `test_smoothing` | `apply_normal_smoothing_per_face`, `apply_coord_two_steps_smoothing`, `apply_coord_unsharp_mask` | 8.3 ms against 124 ms; 0.34 ms against 51.8 ms |
 | `resample_uniform` | `test_reconstruction` | `generate_resampled_uniform_mesh` | 13.5 ms against 292 ms on `bunny` at a 1% cell |
-| `quadric_decimate` | `test_remesh` | `meshing_decimation_quadric_edge_collapse` | **the one port that is slower**: 88 / 346 ms against igl's 50 / 80 — see below |
+| `quadric_decimate` | `test_remesh` | `meshing_decimation_quadric_edge_collapse` | **the one port that is slower**: ~253 ms on `saddle_graded` at `target_ratio=0.1` against igl's 80 — see below |
 
 Two of those rows are worth reading as findings rather than ratios:
 
 - **`quadric_decimate` trades speed for quality.** Its Hausdorff error at 512 faces from a subdiv-4
-  icosphere is 0.0147 against `igl.decimate`'s 0.0250 and Open3D's 0.0236, and it is 1.8–4.3× slower
-  than igl. The cost is the *pass count*, not the per-pass work: one pass commits an independent set of
-  roughly `candidates / valence` collapses, and each pass rebuilds the edge list, adjacency, quadrics
-  and two radix sorts. A serial queue pays none of that per collapse.
+  icosphere is 0.0133 against `igl.decimate`'s 0.0250 and Open3D's 0.0236, and it is ~3× slower than
+  igl (253 ms on `saddle_graded` at `target_ratio=0.1` against 80). The cost is the *pass count*, not
+  the per-pass work: one hashed-key independent set commits roughly `candidates / 50` collapses, and
+  each pass rebuilds the edge list, adjacency, quadrics and two radix sorts. A serial queue pays none
+  of that per collapse. Committing **several** independent sets against one rebuild closed 1.3–1.8× of
+  the gap (`saddle_graded` at 0.1: 461 → 253 ms); the rest is structural. Full numbers in
+  `test_remesh.py`'s `_QUADRIC_RATIOS` comment.
 - **`cut_along_edges` is faster when it cuts *more*.** Cutting every interior edge of `sphere_med`
   costs 1.34 ms against 1.63 ms for a quarter of them, because the corner graph then has no edges and
   the connected-components pass converges immediately instead of contracting `3F` nodes into `V`. So
@@ -526,6 +529,109 @@ Two of those rows are worth reading as findings rather than ratios:
   `signed_distance_on_mesh` at `bunny` (768 µs/query on dragon = 85 s a row),
   `get_geometric_measures` at `bunny` (1.12 s a call on dragon, in *two* modules), and the
   `apply_coord_*` smoothers at `bunny` alongside the trimesh rows.
+
+### libigl
+
+igl is the reference whose input convention matches the harness most closely: `BenchCase.vertices_np`
+is `float64` `(n, 3)` and `BenchCase.faces_np` is `int64` `(n_faces, 3)`, which is exactly what every
+binding wants, so an igl row is a `benchlibs` entry plus an `elif bench_case.kind == "igl":` branch
+with no conversion layer. Every bound function is **pure** — arrays in, arrays out — so unlike
+pymeshlab there is no per-call construction cost to amortize and no in-place mutation to defend
+against. The exceptions are the stateful solver objects (`HeatGeodesicsData`, `ARAPData`, `SLIMData`,
+`min_quad_with_fixed_data`, `AABB`), which cache a factorization and therefore go **inside** the timed
+callable, for the same reason potpourri3d's solvers do.
+
+Only **150** of the ~493 top-level C++ headers are bound, so confirm a name exists in the installed
+wheel before planning a row around it. Two that do not, and will be looked for because
+`triwarp.repair` carries functions named after them: **`collapse_small_triangles` and
+`resolve_duplicated_faces` are not bound** (`AttributeError`), so neither group can have an igl row.
+
+#### Coverage: 53 pairs over 24 modules
+
+igl reaches **53** of the matrix's 247 `(group, library)` pairs — third after pymeshlab's 71 and
+trimesh's 68, and up from 27 before the coverage pass. Nine of its groups did not exist before it:
+`sample_surface`, `face_angles`, `vertex_defects`, `face_connected_component_labels`, `ears`,
+`is_edge_manifold`, `remove_unreferenced_vertices`, `unique_faces`, plus the `icosahedron` case of
+`platonic_solids`.
+
+Where the margins sit, on medians:
+
+| group | igl | triwarp-cuda | ratio |
+|---|---|---|---|
+| `face_angles` | 12.5 ms | 0.044 ms | **282x** |
+| `ears` | 161–399 ms | 0.72–0.84 ms | **200–500x** |
+| `bvh_from_points` | 198 ms | 0.22 ms | 896x (but see the GC hazard below) |
+| `query_bvh_nearest_k1` | 250 ms | 0.65 ms | 385x |
+| `sample_surface` (100k) | 55.2 ms | 0.25 ms | 218x |
+| `vertex_defects` | 13.9–14.7 ms | 0.19–0.22 ms | 62–78x |
+| `is_edge_manifold` | 32–53 ms | 1.15–1.18 ms | 28–48x |
+| `face_orientation_bits` | 62 / 17.3 ms | 1.99 / 1.00 ms | 31x / 17x |
+| `signed_distance_on_mesh` | 150–520 ms | 4.0–6.6 ms | 10–100x |
+| `blue_noise` | 334 / 1 592 ms | 55 / 140 ms | 6.1x / 11.4x |
+| `face_adjacency` | 16.5 ms | 0.65 ms | 25x |
+| `face_connected_component_labels` | 15.2 ms | 1.27 ms | 12x |
+| `make_winding_consistent` | 22.8 ms | 1.02 ms | 22x |
+| `remove_unreferenced_vertices` | 0.73 ms | 0.30 ms | 2.5x |
+
+**There is no igl row that triwarp loses**, and one of them used to be the exception: `blue_noise`
+was a **0.80x loss** (igl 78.4 ms against 98.5) while `sample_surface_blue_noise` ran Bridson
+active-list dart throwing, the algorithm `igl.blue_noise` implements. After the rewrite to
+randomized-priority selection the same pair reads 4.1x at that radius, and the margin *grows as the
+radius falls* — 5.4x at the 2k-sample radius, 9.0x at half of it, 24x on `bunny_decimated` — because
+igl's serial cost is per accepted sample where triwarp's is per round. igl also returns 2–7% *fewer*
+samples at the same radius and has the tightest coverage of the three references (1.073 r against
+triwarp's 1.103), so neither side is trading quality for speed. That row is the clearest argument in
+the suite for keeping a reference that a port was originally written from.
+
+Two rows read the other way round and are worth knowing before quoting them: `face_adjacency_unshared`
+and `face_adjacency` time the **same** `igl.triangle_triangle_adjacency` call, because igl computes
+both in one pass — so the `unshared` row is an upper bound rather than like-for-like — and
+`chamfer_points_to_mesh`'s igl row is the *forward half only*, a lower bound.
+
+#### Hazards, all measured
+
+- **An out-of-range face index is a SIGSEGV, not an exception.** `igl.cotmatrix(V, F)` with one entry
+  of `F` set to `len(V) + 500` kills the interpreter with **exit code 139** and no traceback; igl
+  bounds-checks nothing. So every igl row is handed the *unreduced* `(V, F)` pair from `BenchCase`,
+  never a `remove_unreferenced`-style reduced `V` with the original `F`. This is the same failure class
+  as `igl.principal_curvature` on the scan meshes' non-manifold vertices, above.
+- **F-only functions size their output by `F.max() + 1`, not by `len(V)`.** Measured on an
+  `icosphere(2)` padded with five unreferenced trailing vertices (167 V, 162 referenced):
+  `igl.adjacency_matrix`, `igl.vertex_components` and `igl.is_vertex_manifold` return **162** rows
+  where `igl.cotmatrix` and `igl.gaussian_curvature` return **167**. The two families disagree with
+  each other and only the `(V, F)` family matches triwarp. This is not academic: **`bunny` has 1 113
+  unreferenced vertices** (`igl.remove_unreferenced` returns 34 834 of 35 947), so
+  `igl.connected_components(igl.adjacency_matrix(F))` reports **1 114 components** on it — 1 113
+  isolated vertices plus the mesh. Every F-only parity assert is therefore class B with the transform
+  named, and must run on a fixture where the distinction is visible.
+- **`igl.octree` is priced by the garbage collector, not by the tree.** It returns its per-cell point
+  lists as a Python `list` of **151 233 nested lists** on `bunny`'s 35 947 points, so it allocates
+  ~150k list objects a call: **40.6–44.6 ms with `gc` disabled against 90.6–176.9 ms with it enabled**,
+  measured back to back. In-harness that shows up as a `Min` of 39 ms against a `Median` of 198 ms in
+  one ten-round row — so **quote igl's medians, never its minima**, and read `query_bvh_nearest_*`'s
+  build-included igl numbers as pricing the binding as much as the search. This is the `*_lists`
+  hazard below, except it lands on the only structure igl exposes for k-NN, so there is no array form
+  to switch to; it is also why the igl k-NN rows are capped a size below scipy's.
+- **Nine call signatures are not what the docs suggest, and two of them fail silently.** Each of these
+  failed on the first plausible attempt:
+
+| function | the trap | the working call |
+|---|---|---|
+| `exact_geodesic` | **Returns an empty array** rather than raising when the trailing arguments are omitted: `VS/FS/VT/FT` all default to `array([])`, so a 4-argument call binds `vt` to `FS` | `igl.exact_geodesic(V, F, VS, FS, VT, FT)`, face arrays explicitly `np.array([], dtype=np.int64)` |
+| `knn` | Seven positional arguments; the octree is built over the *data* cloud, not the queries | `igl.knn(queries, points, k, *igl.octree(points)[:4])` |
+| `in_element` | Takes a live `igl.AABB`; there is no 3-argument overload | `aabb = igl.AABB(); aabb.init(V, Ele); igl.in_element(V, Ele, Q, aabb)` |
+| `crouzeix_raviart_cotmatrix` / `..._massmatrix` | Need `(V, F, E, EMAP)`, not `(V, F)` | `uem = igl.unique_edge_map(F)`, then `uem[1]` as `E` and `uem[2].ravel()` as `EMAP` |
+| `slim_precompute` | **Returns** the `SLIMData` rather than taking one, and demands Fortran order with **int32** faces, unlike every other binding | see `plans/igl-first-class.md` §2.3 |
+| `isolines_intrinsic` | Takes `(F, S, vals)`; the `uE/EMAP/uEC/uEE` quintet the C++ header shows is not in the binding | `igl.isolines_intrinsic(F, S, vals)` |
+| `average_onto_vertices` | Its `S` is a per-face **scalar** `(n_faces,)`, not a per-face vector | `igl.average_onto_vertices(V, F, face_scalars)` |
+| `cut_mesh` | `C` is a **bool** `(n_faces, 3)` per-corner cut mask, not an edge list | `igl.cut_mesh(V, F, cuts_bool)` |
+
+- **The `*_lists` variants cannot be timed as rows.** `adjacency_list`,
+  `triangle_triangle_adjacency_lists`, `vertex_triangle_adjacency_lists` and `unique_edge_map_lists`
+  are the same computation as their array siblings with a `list[list[int]]` result, so a row would
+  price nanobind's list construction (`triangle_triangle_adjacency_lists` is 321 ms on `bunny` against
+  4.25 ms for the array form). Use the array forms. `igl.is_border_vertex` returns a Python
+  `list[bool]` and has no array form, so its 3.4 ms is read as an upper bound.
 
 ### open3d — two hazards in the tensor API
 

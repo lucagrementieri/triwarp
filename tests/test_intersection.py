@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import cast
 
+import igl
 import numpy as np
 import potpourri3d as pp3d
 import pytest
@@ -503,6 +504,65 @@ def test_marching_triangles_matches_potpourri3d(
             np.concatenate([curve.numpy() for curve in curves_wp]), np.concatenate(curves_pp)
         )
         < 1e-6 * bounding_diagonal
+    )
+
+
+@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parity("marching_triangles", "igl")
+@pytest.mark.parity("marching_triangles_curves", "igl")
+def test_marching_triangles_matches_igl(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    """
+    Class B: ``igl.isolines`` returns a segment **soup**, so the linking must be undone first.
+
+    igl gives ``(points, segments, segment_values)`` with no curve structure at all -- every
+    crossing is an independent 2-point segment -- where ``marching_triangles`` returns polylines.
+    The named transform is therefore to reduce triwarp's curves to the same soup: each consecutive
+    pair of a curve is a segment, plus the closing pair for a closed curve. Two quantities are then
+    directly comparable and both are asserted: the total segment length, and the point sets through
+    a two-sided Hausdorff distance.
+
+    Segment *count* is not compared, and that is deliberate: a polyline of ``n`` points contributes
+    ``n - 1`` segments (``n`` closed), so triwarp's count is derived from its linking while igl's is
+    the raw crossing count -- they agree here but the equality is a property of this input rather
+    than of the two algorithms, and asserting it would be asserting the wrong thing.
+
+    Both this group and ``marching_triangles_curves`` are covered because the transform is the same
+    for one long contour and for a thousand short ones; the linking count is what differs, and it is
+    exactly what this comparison steps around.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
+    faces_np = np.ascontiguousarray(mesh_tm.faces, dtype=np.int64)
+    values_np = np.ascontiguousarray(vertices_np[:, 2])
+    isovalue = float(0.5137 * values_np.min() + 0.4863 * values_np.max())
+    values_wp = wp.array(values_np, dtype=wp.float64, device=mesh_wp.device)
+
+    points_igl, segments_igl, _values_igl = igl.isolines(
+        vertices_np, faces_np, values_np, np.array([isovalue])
+    )
+    curves_wp, closed_wp = tw.intersection.marching_triangles(
+        mesh_wp.points, mesh_wp.indices, values_wp, isovalue, n_vertices=len(vertices_np)
+    )
+
+    assert segments_igl.shape[0] > 0
+    length_igl = float(
+        np.linalg.norm(
+            points_igl[segments_igl[:, 0]] - points_igl[segments_igl[:, 1]], axis=1
+        ).sum()
+    )
+    assert np.isclose(
+        _total_length([curve.numpy() for curve in curves_wp], closed_wp),
+        length_igl,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+    bounding_diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
+    assert (
+        _hausdorff(np.concatenate([curve.numpy() for curve in curves_wp]), points_igl)
+        < 1e-5 * bounding_diagonal
     )
 
 

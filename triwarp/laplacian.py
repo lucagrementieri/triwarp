@@ -34,9 +34,81 @@ from triwarp.constants import TOLERANCE_MOLLIFY
 from triwarp.edges import edges_unique, face_edge_lengths, faces_to_edges
 from triwarp.kernels import laplacian as kernel_laplacian
 from triwarp.kernels import scatter as kernel_scatter
+from triwarp.kernels import triangles as kernel_triangles
 from triwarp.reduce import max as reduce_max
 from triwarp.tangent_space import halfedge_transport_angles
 from triwarp.triangles import face_normals_and_areas
+
+
+def face_gradients(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    *,
+    face_normals: wp.array[wp.vec3] | None = None,
+    face_areas: wp.array[wp.float32] | None = None,
+) -> wp.array[wp.vec3d]:
+    """
+    Gradient of a per-vertex scalar field inside each face, as a vector in that face's plane.
+
+    The piecewise-linear gradient is constant per triangle:
+    ``grad = 1/(2A) * sum_k values[k] * (n x e_k)``, with ``e_k`` the counter-clockwise edge
+    opposite corner ``k``. It satisfies ``dot(grad, e) == values[end] - values[start]`` for every
+    edge of the face, which is the property that makes it the discrete gradient rather than a finite
+    difference.
+
+    Accumulated in ``float64`` and returned as ``wp.vec3d``: the fields this serves decay
+    exponentially (diffused heat, geodesic distance), and a ``float32`` sum of the three cross
+    products loses the far field. A degenerate face gets the zero vector rather than a division by
+    its zero area.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    values
+        ``(n_vertices,)`` ``wp.float64`` scalar field.
+    face_normals, face_areas
+        Optional precomputed per-face unit normals and areas, as returned by
+        [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]. Recomputed when
+        either is ``None``.
+
+    Returns
+    -------
+    wp.array[wp.vec3d]
+        ``(n_faces,)`` gradient vectors on ``vertices.device``.
+
+    Notes
+    -----
+    ``igl.grad(V, F)`` is the same operator in *matrix* form, a sparse ``(3 * n_faces, n_vertices)``
+    map whose product with the field stacks the gradients as ``[all x; all y; all z]``. triwarp
+    returns the applied result instead of the matrix, because that is what every in-repo consumer
+    wants -- the heat method takes the normalized gradient face by face and never needs the operator
+    itself. ``tests/test_laplacian.py`` compares the two through that product.
+
+    See Also
+    --------
+    [`cotmatrix`][triwarp.laplacian.cotmatrix]
+    [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]
+    ``igl.grad``
+    """
+    device = vertices.device
+    n_faces = int(faces.shape[0]) // 3
+    gradients = wp.empty(n_faces, dtype=wp.vec3d, device=device)
+    if n_faces == 0:
+        return gradients
+
+    if face_normals is None or face_areas is None:
+        face_normals, face_areas = face_normals_and_areas(vertices, faces)
+    wp.launch(
+        kernel_triangles.face_gradients,
+        dim=n_faces,
+        inputs=[vertices, faces, face_normals, face_areas, values, gradients],
+        device=device,
+    )
+    return gradients
 
 
 def cotmatrix_entries(

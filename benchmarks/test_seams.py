@@ -41,6 +41,7 @@ degenerate case rather than the operation.
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
@@ -105,7 +106,7 @@ def test_crease_edges(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="cut_along_edges")
 @pytest.mark.benchmeshes("sphere_small", "sphere_med", "sphere_large")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
 @pytest.mark.parametrize("cut_fraction", [0.25, 1.0])
 def test_cut_along_edges(bench_case: BenchCase, cut_fraction: float) -> None:
     """
@@ -115,7 +116,30 @@ def test_cut_along_edges(bench_case: BenchCase, cut_fraction: float) -> None:
     so the pass contracts ``3F`` nodes down toward ``V``, while at ``1.0`` the corner graph has no
     edges at all and every node is already its own component. If the second is *faster*, the
     contraction is the cost and is the thing to attack.
+
+    ``igl.cut_mesh`` is the reference that takes the same *edge set* triwarp does, once it is
+    rewritten as the ``(n_faces, 3)`` per-corner bool mask the binding wants -- that rewrite is an
+    input transform and is cached outside the timed callable, like ``_cut_edges`` itself. It is the
+    only reference here that can run at both fractions, since MeshLab takes a dihedral threshold
+    instead of a set. It also **agrees with triwarp on the output size** where MeshLab does not (24
+    vertices against 32 on a cut cube; see ``tests/test_seams.py``), which is what makes the third
+    row worth having.
+
+    **The two sides slope in opposite directions across the fraction**, and that is the finding this
+    row adds: measured on ``sphere_large``, triwarp goes 2.90 -> 2.12 ms from ``0.25`` to ``1.0``
+    (faster when everything is cut, because the components pass has nothing left to contract) while
+    igl goes 34.4 -> 61.9 (slower, because its per-corner walk pays for each new vertex it emits).
+    So the contraction really is triwarp's cost here, and it is not a cost igl has.
     """
+    if bench_case.kind == "igl":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        mask_igl = _cut_corner_mask_np(bench_case, cut_fraction)
+        vertices_cut_igl, faces_cut_igl = bench_case.run(
+            lambda: igl.cut_mesh(vertices_np, faces_np, mask_igl)[:2], rounds=3
+        )
+        assert faces_cut_igl.shape[0] == bench_case.n_faces
+        assert vertices_cut_igl.shape[0] >= bench_case.n_vertices
+        return
     if bench_case.kind == "pymeshlab":
         if cut_fraction != 1.0:
             pytest.skip("MeshLab's cut takes a dihedral threshold, not an edge set")
@@ -138,6 +162,49 @@ def test_cut_along_edges(bench_case: BenchCase, cut_fraction: float) -> None:
     )
     assert int(cut_faces.shape[0]) == int(faces.shape[0])
     assert np.isfinite(cut_vertices.numpy()[:1]).all()
+
+
+_cut_mask_cache: dict[tuple[str, float], np.ndarray] = {}
+
+
+def _cut_corner_mask_np(bench_case: BenchCase, fraction: float) -> np.ndarray:
+    """
+    Re-encode the same cut set as igl's ``(n_faces, 3)`` per-corner bool mask.
+
+    ``igl.cut_mesh``'s ``C`` marks *corners*, not edges: ``C[f, i]`` is set when edge
+    ``(F[f, i], F[f, (i + 1) % 3])`` is cut, so every cut edge is marked twice, once from each
+    incident face. Note the ``(i, i + 1)`` numbering -- ``igl.ears`` uses the opposite-vertex one
+    instead, and the two conventions coexist inside libigl (see ``tests/test_seams.py``).
+
+    The edge set is rebuilt on the **cpu** rather than read from ``_cut_edges``: a reference case
+    carries no Warp device, so ``bench_case.vertices_wp`` is unavailable there. Same mesh, same
+    ``angle=0`` crease set, same stride, so the two paths receive the identical cut. Cached per
+    (mesh, fraction), because it is a re-encoding of an *input* rather than part of the operation.
+    """
+    key = (bench_case.mesh_name, fraction)
+    if key not in _cut_mask_cache:
+        faces_np = bench_case.faces_np
+        vertices_cpu = wp.array(
+            np.ascontiguousarray(bench_case.vertices_np, dtype=np.float32),
+            dtype=wp.vec3,
+            device="cpu",
+        )
+        faces_cpu = wp.array(
+            np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device="cpu"
+        )
+        all_edges_np = tw.seams.crease_edges(vertices_cpu, faces_cpu, angle=0.0).numpy()
+        edges_np = all_edges_np[:: max(1, round(1.0 / fraction))]
+        cut_keys = np.sort(edges_np.astype(np.int64), axis=1)
+        cut_hashes = cut_keys[:, 0] * (int(faces_np.max()) + 1) + cut_keys[:, 1]
+        mask = np.zeros(faces_np.shape, dtype=bool)
+        for corner in range(3):
+            pairs = np.sort(
+                np.stack([faces_np[:, corner], faces_np[:, (corner + 1) % 3]], axis=1), axis=1
+            )
+            hashes = pairs[:, 0] * (int(faces_np.max()) + 1) + pairs[:, 1]
+            mask[:, corner] = np.isin(hashes, cut_hashes)
+        _cut_mask_cache[key] = np.ascontiguousarray(mask)
+    return _cut_mask_cache[key]
 
 
 def _wedge_atlas_np(bench_case: BenchCase) -> np.ndarray:

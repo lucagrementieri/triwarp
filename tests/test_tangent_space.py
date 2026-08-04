@@ -9,6 +9,7 @@ face, which is what the connection Laplacian's phases encode independently of an
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import potpourri3d as pp3d
 import pytest
@@ -189,3 +190,75 @@ def test_halfedge_transport_angles_are_antisymmetric(
     interior = np.flatnonzero(twins >= 0)
     round_trip = np.angle(np.exp(1j * (rho[interior] + rho[twins[interior]])))
     assert np.allclose(round_trip, 0.0, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("face_tangent_frames", "igl")
+def test_face_tangent_frames_matches_igl(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A on all three vectors -- the one tangent-space comparison in the package that can be.
+
+    Every other frame in this module is **gauge-dependent**: a vertex frame is pinned to "the first
+    halfedge of the ring", which depends on face ordering, so it agrees with another library's only
+    up to a rotation about the normal -- which is why the potpourri3d comparison above uses
+    invariants. A *face* frame is not: "the first edge of the face" is a property of the face table
+    itself, and ``igl.local_basis`` uses the same rule, so ``basis_x``, ``basis_y`` and the normal
+    are each compared element-wise with no transform.
+
+    That makes this the test that pins the **convention** rather than a property: were triwarp to
+    switch to, say, the longest edge or a projected global axis, the frame would still be
+    orthonormal and still span the face, and only this comparison would notice.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    basis_x_igl, basis_y_igl, normal_igl = igl.local_basis(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),
+        np.ascontiguousarray(mesh_tm.faces, dtype=np.int64),
+    )
+
+    basis_x_wp, basis_y_wp, normal_wp = tw.tangent_space.face_tangent_frames(
+        mesh_wp.points, mesh_wp.indices
+    )
+
+    assert np.allclose(basis_x_wp.numpy(), basis_x_igl, rtol=1e-5, atol=1e-5)
+    assert np.allclose(basis_y_wp.numpy(), basis_y_igl, rtol=1e-5, atol=1e-5)
+    assert np.allclose(normal_wp.numpy(), normal_igl, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
+def test_face_tangent_frames_are_orthonormal_and_in_plane(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    The frame is right-handed, unit and lies in the face -- checked without any reference.
+
+    ``basis_x`` along the first edge is asserted directly rather than inferred: it is the property
+    the whole gauge rests on, and the one a refactor could silently change.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    basis_x_wp, basis_y_wp, normal_wp = tw.tangent_space.face_tangent_frames(
+        mesh_wp.points, mesh_wp.indices
+    )
+    basis_x_np = basis_x_wp.numpy()
+    basis_y_np = basis_y_wp.numpy()
+    normal_np = normal_wp.numpy()
+
+    assert np.allclose(np.linalg.norm(basis_x_np, axis=1), 1.0, atol=1e-5)
+    assert np.allclose(np.linalg.norm(basis_y_np, axis=1), 1.0, atol=1e-5)
+    assert np.allclose(np.einsum("ij,ij->i", basis_x_np, basis_y_np), 0.0, atol=1e-5)
+    assert np.allclose(np.einsum("ij,ij->i", basis_x_np, normal_np), 0.0, atol=1e-5)
+    # Right-handed: basis_x x basis_y == normal.
+    assert np.allclose(np.cross(basis_x_np, basis_y_np), normal_np, atol=1e-5)
+    # And basis_x really is the first edge.
+    faces_np = mesh_tm.faces
+    edges_np = mesh_tm.vertices[faces_np[:, 1]] - mesh_tm.vertices[faces_np[:, 0]]
+    edges_np = edges_np / np.linalg.norm(edges_np, axis=1, keepdims=True)
+    assert np.allclose(basis_x_np, edges_np, atol=1e-5)
+
+
+def test_face_tangent_frames_empty(device: str) -> None:
+    faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
+    vertices_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    basis_x, basis_y, normals = tw.tangent_space.face_tangent_frames(vertices_wp, faces_wp)
+    assert basis_x.shape == (0,)
+    assert basis_y.shape == (0,)
+    assert normals.shape == (0,)

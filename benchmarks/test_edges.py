@@ -45,12 +45,23 @@ import triwarp as tw
 
 
 @pytest.mark.benchmark(group="faces_to_edges")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl")
 def test_faces_to_edges(bench_case) -> None:
+    """
+    The directed ``(3F, 2)`` all-edges table: the cheapest thing in the module on every library.
+
+    ``igl.oriented_facets`` is the same expansion and the fastest single igl call in the whole
+    reference suite relative to its output size -- it emits the same 3F directed pairs, in a
+    different row order (class B, see ``tests/test_edges.py``).
+    """
     if bench_case.kind == "triwarp":
         faces = bench_case.faces_wp
         result = bench_case.run(lambda: tw.edges.faces_to_edges(faces))
         assert result.shape == (faces.shape[0], 2)
+    elif bench_case.kind == "igl":
+        faces_np = bench_case.faces_np
+        result_igl = bench_case.run(lambda: igl.oriented_facets(faces_np))
+        assert result_igl.shape == (bench_case.n_faces * 3, 2)
     else:  # trimesh
         faces = bench_case.faces_np
         result = bench_case.run(lambda: tm.geometry.faces_to_edges(faces))

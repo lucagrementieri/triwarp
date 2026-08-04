@@ -269,3 +269,58 @@ def test_mollify_intrinsic(bench_case: BenchCase) -> None:
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     lengths, _ = bench_case.run(lambda: tw.laplacian.mollify_intrinsic(vertices, faces))
     assert lengths.shape == (bench_case.n_faces, 3)
+
+
+_field_cache: dict[tuple[str, str], wp.array] = {}
+
+
+def _scalar_field_wp(bench_case: BenchCase) -> wp.array[wp.float64]:
+    """Return the vertices' own z as a ``float64`` field: an *input*, cached per (mesh, device)."""
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _field_cache:
+        _field_cache[key] = wp.array(
+            np.ascontiguousarray(bench_case.vertices_np[:, 2], dtype=np.float64),
+            dtype=wp.float64,
+            device=bench_case.device,
+        )
+    return _field_cache[key]
+
+
+@pytest.mark.benchmark(group="face_gradients")
+@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.parametrize("precomputed", [False, True], ids=["from_positions", "face_data"])
+def test_face_gradients(bench_case: BenchCase, precomputed: bool) -> None:
+    """
+    The piecewise-linear gradient per face: three cross products, no connectivity, no solve.
+
+    The pair of ids is the same amortization question the ``*_precomputed`` rows elsewhere ask:
+    ``from_positions`` recomputes the per-face normals and areas, ``face_data`` is handed them. The
+    gap is what a caller who already holds that pair saves -- and the heat solvers, which are the
+    in-repo consumers, always do.
+
+    **The two sides return different things and that is the comparison.** ``igl.grad(V, F)``
+    *assembles* a sparse ``(3F, V)`` operator and never applies it; triwarp applies the same
+    operator face by face and never materialises it. So igl's row is dominated by building 3F x 3
+    triplets and triwarp's by reading the field, which is exactly the trade the two designs make --
+    read it as "assemble once, apply many" against "apply directly", not as one side being faster at
+    the same job. The values agree, through the matrix product, in ``tests/test_laplacian.py``.
+    """
+    if bench_case.kind == "igl":
+        if precomputed:
+            pytest.skip("igl assembles the operator; there is no face-data shortcut to pass it")
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        matrix_igl = bench_case.run(lambda: igl.grad(vertices_np, faces_np))
+        assert matrix_igl.shape == (3 * bench_case.n_faces, bench_case.n_vertices)
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    values = _scalar_field_wp(bench_case)
+    if precomputed:
+        normals, areas = tw.triangles.face_normals_and_areas(vertices, faces)
+        gradients = bench_case.run(
+            lambda: tw.laplacian.face_gradients(
+                vertices, faces, values, face_normals=normals, face_areas=areas
+            )
+        )
+    else:
+        gradients = bench_case.run(lambda: tw.laplacian.face_gradients(vertices, faces, values))
+    assert gradients.shape == (bench_case.n_faces,)

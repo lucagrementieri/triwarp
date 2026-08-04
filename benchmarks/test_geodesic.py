@@ -227,21 +227,51 @@ def test_heat_geodesic_conditioning(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="fast_marching_distance")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("potpourri3d", "pymeshlab")
+@pytest.mark.benchlibs("potpourri3d", "pymeshlab", "igl")
 def test_fast_marching_distance(bench_case: BenchCase) -> None:
     """
-    potpourri3d's serial fast marching, for scale against the heat solvers on the same meshes.
+    The serial single-source geodesics, for scale against the heat solvers on the same meshes.
 
     triwarp deliberately has no equivalent -- fast marching advances a priority queue one vertex at
     a time and has no parallel formulation -- so it has no row here. It is here to price that
     decision: the non-PDE alternatives for the same task, on the same axis and the same meshes, so
-    the numbers can be read next to the ``heat_geodesic`` table.
+    the numbers can be read next to the ``heat_geodesic`` table. This group therefore contributes no
+    ``parity`` pairs by construction (see ``tests/parity.py``): "triwarp agrees" is not a statement
+    about a row triwarp does not have.
 
-    Two rows, two different serial fronts: potpourri3d's fast marching solves the local Eikonal
-    update per triangle, MeshLab's
-    ``compute_scalar_by_geodesic_distance_from_given_point_per_vertex`` advances a Dijkstra-style
-    front over the edge graph. Both are inherently sequential, which is the point being priced.
+    Three rows, three serial fronts: potpourri3d's fast marching solves the local Eikonal update per
+    triangle, MeshLab's ``compute_scalar_by_geodesic_distance_from_given_point_per_vertex`` advances
+    a Dijkstra-style front over the edge graph, and **libigl's ``exact_geodesic``** propagates the
+    MMP exact windows -- the only one of the three that is exact rather than first-order.
+
+    **igl is capped at ``sphere_small`` with ``rounds=1``, and the numbers say why.** Measured on
+    icospheres at one source with every vertex as a target: **57 ms at 2 562 vertices, 839 ms at
+    10 242, 20.9 s at 40 962** -- roughly 15-25x per 4x step, so ``sphere_med`` alone would cost
+    ~21 s a round and ``sphere_large`` minutes. Window propagation is the price of exactness, and
+    that slope is the most useful thing this row records.
+
+    Its call is also the one signature trap in the module: ``exact_geodesic(V, F, VS, FS, VT, FT)``
+    needs **all six** arguments. A four-argument call binds ``vt`` to ``FS`` and returns an *empty
+    array* rather than raising, so the two face arrays are passed explicitly empty.
     """
+    if bench_case.kind == "igl":
+        # ``skip_larger_than`` is a no-op on the synthetic feature meshes (they are not on the size
+        # ladder), so the cap is by name.
+        if bench_case.mesh_name != "sphere_small":
+            pytest.skip("MMP window propagation: 839 ms at 10k vertices, 20.9 s at 41k")
+        vertices_np = bench_case.vertices_np
+        faces_np = np.ascontiguousarray(bench_case.faces_np, dtype=np.int64)
+        sources_np = np.array([int(_SOURCES[0])], dtype=np.int64)
+        targets_np = np.arange(bench_case.n_vertices, dtype=np.int64)
+        no_faces_np = np.array([], dtype=np.int64)
+        distance_igl = bench_case.run(
+            lambda: igl.exact_geodesic(
+                vertices_np, faces_np, sources_np, no_faces_np, targets_np, no_faces_np
+            ),
+            rounds=1,
+        )
+        assert distance_igl.shape == (bench_case.n_vertices,)
+        return
     if bench_case.kind == "pymeshlab":
         # ``maxdistance=PureValue(0)`` disables the cut-off, so the front covers the whole mesh --
         # the default 50% of the bbox diagonal would stop early and measure less work.

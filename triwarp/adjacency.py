@@ -181,6 +181,70 @@ def _hash_radix(faces: wp.array[wp.int32], n_vertices: int | None) -> int:
 _compute_face_adjacency = face_adjacency
 
 
+def vertex_face_adjacency(
+    faces: wp.array[wp.int32], *, n_vertices: int | None = None
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Incidence CSR of the faces touching each vertex, as ``(offsets, vertex_faces)``.
+
+    Row ``v`` is ``vertex_faces[offsets[v] : offsets[v + 1]]`` and lists every face that references
+    vertex ``v``, once per reference. ``offsets`` has length ``n_vertices + 1``, so its last entry
+    is the total ``3 * n_faces`` and no caller needs a sentinel appended.
+
+    Built by counting sort rather than from halfedge twins, and that is a deliberate limitation
+    rather than an omission: **each row is a set, not a rotation**. Ordering a row would require the
+    halfedge structure, which does not exist at a vertex-non-manifold vertex — and the decimator and
+    normal-flip guards that consume this must run on exactly such meshes. Use
+    [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings] when the rotational order is what is
+    wanted; it requires an edge-manifold mesh in exchange.
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    n_vertices
+        Number of vertices, i.e. the number of CSR rows. When ``None`` it is inferred from
+        ``faces`` with [`n_vertices`][triwarp.vertices.n_vertices], which costs one host readback;
+        pass it when the caller already knows it. Rows for vertices no face references come out
+        empty.
+
+    Returns
+    -------
+    offsets : wp.array[wp.int32]
+        Length ``n_vertices + 1`` row offsets on ``faces.device``.
+    vertex_faces : wp.array[wp.int32]
+        Length ``3 * n_faces`` face indices, grouped by vertex, arbitrary order within a row.
+
+    See Also
+    --------
+    [`face_adjacency`][triwarp.adjacency.face_adjacency]
+    [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings]
+    ``igl.vertex_triangle_adjacency``
+    """
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    row_count = tw.vertices.n_vertices(faces) if n_vertices is None else int(n_vertices)
+
+    offsets = wp.zeros(row_count + 1, dtype=wp.int32, device=device)
+    vertex_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
+    if n_faces == 0 or row_count == 0:
+        return offsets, vertex_faces
+
+    counts = wp.zeros(row_count, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_adjacency.count_vertex_faces, dim=n_faces, inputs=[faces, counts], device=device
+    )
+    wp.utils.array_scan(counts, out_array=offsets[1:], inclusive=True)
+    cursor = wp.zeros(row_count, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_adjacency.scatter_vertex_faces,
+        dim=n_faces,
+        inputs=[faces, offsets, cursor, vertex_faces],
+        device=device,
+    )
+    return offsets, vertex_faces
+
+
 def face_adjacency_unshared(
     faces: wp.array[wp.int32],
     face_adjacency: twt.Array2dInt32 | None = None,

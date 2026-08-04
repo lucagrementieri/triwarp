@@ -39,9 +39,15 @@ rotational order -- the property that makes the one-ring useful for tangent spac
 
 **libigl** has ``igl.triangle_triangle_adjacency``, whose ``(F, 3)`` ``TT``/``TTi`` pair carries the
 same information as ``twins`` in a different layout. It is the one reference that could be lined up
-here; it is left out because the closest triwarp function is ``adjacency.face_adjacency``, already
-timed in [`test_mesh.py`](test_mesh.py), and adding a second row for a reshaped copy of the same
-computation would double-count it.
+here; it is left out because the closest triwarp function is ``adjacency.face_adjacency``, where it
+is now a row ([`test_adjacency.py`](test_adjacency.py)), and adding a second row for a reshaped copy
+of the same computation would double-count it.
+
+``igl.vertex_triangle_adjacency`` is **not** a ``vertex_one_rings`` reference either, for the reason
+given for ``vertex_neighbors`` above: it returns the incident faces per vertex in a ``(VF, NI)`` CSR
+with no rotational order, so timing it here would again compare "group the neighbours" against
+"order them". It is the reference for the *unordered* CSR instead, in
+[`test_adjacency.py`](test_adjacency.py).
 
 **potpourri3d** builds geometry-central's halfedge mesh internally for every solver, and
 ``pp3d.edges`` is the only place it surfaces the result -- an undirected edge list, not the twin

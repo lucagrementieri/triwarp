@@ -93,6 +93,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
+import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
@@ -306,7 +307,7 @@ _RESAMPLE_CELL_FRACTIONS = [0.02, 0.01]
 
 
 @pytest.mark.benchmark(group="resample_uniform")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
 @pytest.mark.parametrize("cell_fraction", _RESAMPLE_CELL_FRACTIONS)
 def test_resample_uniform(bench_case: BenchCase, cell_fraction: float) -> None:
     """
@@ -324,11 +325,34 @@ def test_resample_uniform(bench_case: BenchCase, cell_fraction: float) -> None:
     from full erosion at 0% to full dilation at 100%, so its own 50% default is the *zero* offset
     and ``PercentageValue(0)`` would erode the mesh away (measured: a unit sphere down to radius
     0.30).
+
+    **libigl's ``offset_surface`` is the same operation at ``isolevel=0``** -- sample the signed
+    distance field on a grid, march it -- and its ``signed_distance_type`` is given
+    ``PSEUDONORMAL``, the mode ``tests/test_proximity.py`` establishes agrees with triwarp's default
+    sign to 8e-8. Its resolution parameter ``s`` is a *cell count along the longest axis*, not a
+    length, so it receives ``round(longest_extent / voxel_size)`` -- the named transform that puts
+    all three rows on the identical lattice. In-harness on ``bunny_decimated`` it reads 29.7 and
+    40.3 ms over the cell pair and on ``bunny`` 117 and 119, so it is sublinear in the lattice like
+    the other two and needs no cap of its own beyond the group's.
     """
     diagonal = float(
         np.linalg.norm(bench_case.vertices_np.max(axis=0) - bench_case.vertices_np.min(axis=0))
     )
     voxel_size = cell_fraction * diagonal
+    if bench_case.kind == "igl":
+        skip_larger_than(bench_case, "bunny", "the field is evaluated on one core")
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        extent = float((vertices_np.max(axis=0) - vertices_np.min(axis=0)).max())
+        resolution = max(2, round(extent / voxel_size))
+        vertices_igl, faces_igl = bench_case.run(
+            lambda: igl.offset_surface(
+                vertices_np, faces_np, 0.0, resolution, igl.SIGNED_DISTANCE_TYPE_PSEUDONORMAL
+            )[:2],
+            rounds=_HEAVY_ROUNDS,
+        )
+        assert faces_igl.shape[0] > 0
+        assert vertices_igl.shape[1] == 3
+        return
     if bench_case.kind == "pymeshlab":
         # ``generate_*`` pushes a new mesh onto the set, so the MeshSet is rebuilt per round.
         skip_larger_than(bench_case, "bunny", "MeshLab marches the whole lattice on one core")

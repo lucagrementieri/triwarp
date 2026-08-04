@@ -17,11 +17,12 @@ is an array primitive, not a mesh operation, and open3d exposes nothing at that 
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase
+from conftest import BenchCase, skip_larger_than
 
 import triwarp as tw
 
@@ -66,6 +67,41 @@ def test_group(bench_case: BenchCase) -> None:
     pairs = bench_case.run(lambda: tw.grouping.group(inverse, 2))
     assert pairs.shape[1] == 2
     assert pairs.shape[0] > 0
+
+
+@pytest.mark.benchmark(group="unique_faces")
+@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.parametrize("duplicate_fraction", [0.0, 0.5], ids=["allunique", "half"])
+def test_unique_faces(bench_case: BenchCase, duplicate_fraction: float) -> None:
+    """
+    Orientation-agnostic face deduplication: sort each row, then dedup.
+
+    The axis is the duplicate density, as in ``unique_rows`` above: at ``half`` the input carries a
+    *flipped* copy of half its faces, which is the case that separates an orientation-agnostic dedup
+    from a plain row dedup -- the flipped copies must collapse.
+
+    ``igl.unique_simplices`` is the same operation and returns ``(FF, IA, IC)`` where ``IC`` is
+    triwarp's inverse. One difference to know before comparing: **igl returns the sorted rows**
+    (``FF == sort(F(IA, :), 2)``) where triwarp returns the first occurrence with its original
+    winding intact, so the parity comparison sorts triwarp's rows first.
+    """
+    faces_np = bench_case.faces_np
+    if duplicate_fraction:
+        n_duplicated = int(duplicate_fraction * faces_np.shape[0])
+        faces_np = np.concatenate([faces_np, faces_np[:n_duplicated, ::-1]])
+    if bench_case.kind == "igl":
+        skip_larger_than(bench_case, "bunny", "the reference sorts and dedups on one core")
+        faces_igl = np.ascontiguousarray(faces_np, dtype=np.int64)
+        unique_igl = bench_case.run(lambda: igl.unique_simplices(faces_igl))
+        assert unique_igl[0].shape[0] == bench_case.n_faces
+        return
+    faces_wp = wp.array(
+        np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=bench_case.device,
+    )
+    unique_wp = bench_case.run(lambda: tw.grouping.unique_faces(faces_wp))
+    assert int(unique_wp.shape[0]) // 3 == bench_case.n_faces
 
 
 @pytest.mark.benchmark(group="unique_rows")

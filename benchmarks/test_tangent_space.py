@@ -37,6 +37,7 @@ flattening, so it answers a different question and is not comparable.
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import potpourri3d as pp3d
 import pytest
@@ -72,6 +73,37 @@ def test_vertex_tangent_frames(bench_case: BenchCase) -> None:
             return np.asarray(solver.get_tangent_frames()[0])
 
         assert bench_case.run(frames_pp, rounds=_ROUNDS).shape == (n_vertices, 3)
+
+
+@pytest.mark.benchmark(group="face_tangent_frames")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "igl")
+def test_face_tangent_frames(bench_case: BenchCase) -> None:
+    """
+    A frame per face: one edge normalize and one cross product, plus the face normals.
+
+    Read it against ``vertex_tangent_frames`` above, which is the same idea one dimension up and an
+    order of magnitude more work: a vertex frame needs the angle-weighted normal and the one-ring
+    walk that picks its reference halfedge, where a face frame needs only the face's own first edge.
+    That contrast is the reason both exist -- and why this one is not gauge-dependent.
+
+    ``igl.local_basis`` uses the identical convention (first edge, then ``normal x basis_x``), so
+    unlike every other row in this module the two sides are element-wise comparable rather than
+    comparable up to a rotation; ``tests/test_tangent_space.py`` asserts exactly that.
+    """
+    n_faces = bench_case.n_faces
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        basis_x, _basis_y, _normals = bench_case.run(
+            lambda: tw.tangent_space.face_tangent_frames(vertices, faces)
+        )
+        assert basis_x.shape == (n_faces,)
+        return
+    vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+    basis_x_igl, _basis_y_igl, _normal_igl = bench_case.run(
+        lambda: igl.local_basis(vertices_np, faces_np)
+    )
+    assert basis_x_igl.shape == (n_faces, 3)
 
 
 @pytest.mark.benchmark(group="halfedge_tangent_angles")

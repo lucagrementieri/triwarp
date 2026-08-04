@@ -68,7 +68,7 @@ def test_boundary_loops(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="boundary_edges")
 @pytest.mark.benchaxis("loops")
-@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pymeshlab")
 def test_boundary_edges(bench_case: BenchCase) -> None:
     """
     The unordered predecessor of ``boundary_loops``: the edge sort without the ranking.
@@ -77,7 +77,17 @@ def test_boundary_edges(bench_case: BenchCase) -> None:
     whether a regression is in the sort (scales with faces) or in the loop extraction (scales with
     loop count). It reads flat at ~0.4-0.5 ms across the whole axis, so everything above it in
     ``boundary_loops`` is ranking and extraction.
+
+    ``igl.boundary_facets`` is the one reference here that returns the same *thing* triwarp does --
+    an ``(n_boundary, 2)`` edge list, plus the incident face and corner indices as second and third
+    returns, which is strictly more than triwarp's two columns. It is the right row for this group
+    and not for ``boundary_loops``, where ``igl.boundary_loop`` returns only the longest loop.
     """
+    if bench_case.kind == "igl":
+        faces_np = bench_case.faces_np
+        edges_igl, _face_igl, _corner_igl = bench_case.run(lambda: igl.boundary_facets(faces_np))
+        assert edges_igl.ndim == 2
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         edges = bench_case.run(lambda: tw.boundary.boundary_edges(vertices, faces))
@@ -96,3 +106,26 @@ def test_boundary_edges(bench_case: BenchCase) -> None:
             return edges_np[tm.grouping.group_rows(edges_np, require_count=1)]
 
         assert bench_case.run(boundary_tm).ndim == 2
+
+
+@pytest.mark.benchmark(group="ears")
+@pytest.mark.benchaxis("loops")
+@pytest.mark.benchlibs("triwarp", "igl")
+def test_ears(bench_case: BenchCase) -> None:
+    """
+    Ear triangles -- two boundary edges each -- as ``(face, opposite corner)`` pairs.
+
+    ``hole_filling`` uses these to recognise a rim that closes with a single triangle, so the axis
+    is the boundary shape rather than the mesh size, like the rest of the module. ``igl.ears``
+    returns the identical pair of arrays, which is unusual enough to note: this is one of the few
+    groups where triwarp and igl agree on the *output convention* and not merely the quantity, so
+    the parity assert in ``tests/test_boundary.py`` needs only a row sort.
+    """
+    if bench_case.kind == "triwarp":
+        faces = bench_case.faces_wp
+        ears, opposite = bench_case.run(lambda: tw.boundary.ears(faces))
+        assert ears.shape == opposite.shape
+        return
+    faces_np = bench_case.faces_np
+    ears_igl, opposite_igl = bench_case.run(lambda: igl.ears(faces_np))
+    assert ears_igl.shape == opposite_igl.shape

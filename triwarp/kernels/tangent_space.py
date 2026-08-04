@@ -92,6 +92,25 @@ def vertex_tangent_frames(
     out_basis_y[v] = wp.cross(normal, basis_x)
 
 
+@wp.kernel
+def face_tangent_frames(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    normals: wp.array[wp.vec3],
+    out_basis_x: wp.array[wp.vec3],
+    out_basis_y: wp.array[wp.vec3],
+) -> None:
+    # The face's own plane needs no projection: the first edge already lies in it, so ``basis_x`` is
+    # just that edge normalized and ``basis_y`` closes the right-handed frame. A degenerate face has
+    # no first edge to speak of; ``normalize`` returns zero there (Warp's ``kEps`` is 0) and the
+    # cross product follows, so the frame degrades to zeros rather than to NaN.
+    f = int(wp.tid())
+    edge = vertices[faces[f * 3 + 1]] - vertices[faces[f * 3 + 0]]
+    basis_x = wp.normalize(edge)
+    out_basis_x[f] = basis_x
+    out_basis_y[f] = wp.cross(normals[f], basis_x)
+
+
 @wp.func
 def wrap_angle(angle: wp.float32) -> wp.float32:
     # Fold into (-pi, pi] without a modulo: the round trip through the unit circle is branch-free

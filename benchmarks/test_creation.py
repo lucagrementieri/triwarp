@@ -48,8 +48,10 @@ launch per buffer.
 
 - ``create_tetrahedron`` / ``create_octahedron`` / ``create_dodecahedron`` are where triwarp's
   three constant Platonic tables came from, and the *only* reference for them: trimesh has no
-  Platonic solid but the icosahedron and igl has no generators at all. They take no parameters on
-  either side, so those rows are pure fixed cost, like ``box``.
+  Platonic solid but the icosahedron. **libigl has exactly one**, ``igl.icosahedron()``, which is
+  why the ``platonic_solids`` group carries an ``icosahedron`` case that igl and trimesh answer and
+  MeshLab's three others they do not. They take no parameters on any side, so those rows are pure
+  fixed cost, like ``box``.
 - ``create_grid(numvertx=, numverty=)`` and ``create_sphere_cap(angle=, subdiv=)`` are the two open
   primitives, and both have a real axis: the grid's vertex counts and the cap's subdivision level.
   ``create_sphere_cap`` takes the full aperture in degrees where triwarp takes the polar half-angle
@@ -144,6 +146,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
@@ -259,19 +262,38 @@ def test_box(bench_lib: BenchLibrary) -> None:
 
 
 @pytest.mark.benchmark(group="platonic_solids")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pymeshlab")
 @pytest.mark.parametrize(
     ("builder", "filter_name", "n_faces"),
     [
         ("tetrahedron", "create_tetrahedron", 4),
         ("octahedron", "create_octahedron", 8),
         ("dodecahedron", "create_dodecahedron", 36),
+        ("icosahedron", "create_icosahedron", 20),
     ],
 )
 def test_platonic_solids(
     bench_lib: BenchLibrary, builder: str, filter_name: str, n_faces: int
 ) -> None:
-    """Constant tables on both sides, so this is ``box``'s fixed-cost probe once per solid."""
+    """
+    Constant tables on every side, so this is ``box``'s fixed-cost probe once per solid.
+
+    Coverage is uneven by necessity and the ``builder`` id says which library can answer: MeshLab
+    has all four, **igl and trimesh have only the icosahedron** (``igl.icosahedron`` is libigl's one
+    and only generator of this kind), so their rows skip the other three rather than substituting a
+    different solid.
+    """
+    if bench_lib.kind in {"igl", "trimesh"} and builder != "icosahedron":
+        pytest.skip(f"neither igl nor trimesh has a {builder}")
+    if bench_lib.kind == "igl":
+        vertices_igl, faces_igl = bench_lib.run(igl.icosahedron)
+        assert faces_igl.shape == (n_faces, 3)
+        assert vertices_igl.shape == (12, 3)
+        return
+    if bench_lib.kind == "trimesh":
+        mesh_tm = bench_lib.run(tm.creation.icosahedron)
+        assert mesh_tm.faces.shape == (n_faces, 3)
+        return
     if bench_lib.kind == "pymeshlab":
 
         def solid_pml() -> int:
@@ -287,11 +309,23 @@ def test_platonic_solids(
 
 
 @pytest.mark.benchmark(group="grid")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
 @pytest.mark.parametrize("count", [32, 512])
 def test_grid(bench_lib: BenchLibrary, count: int) -> None:
-    """A ``count x count`` vertex lattice: one NumPy prologue against MeshLab's per-vertex loop."""
+    """
+    A ``count x count`` vertex lattice: one NumPy prologue against two per-vertex loops.
+
+    ``igl.triangulated_grid(nx, ny)`` is the same lattice with the same diagonal, and returns **2D**
+    ``(n, 2)`` vertices in the unit square -- so it carries no extents, no centring and no third
+    coordinate, which is the class-B transform the parity test applies. That also makes it the
+    cheapest of the three: it writes two floats per vertex where the others write three.
+    """
     n_faces = 2 * (count - 1) ** 2
+    if bench_lib.kind == "igl":
+        vertices_igl, faces_igl = bench_lib.run(lambda: igl.triangulated_grid(count, count))
+        assert faces_igl.shape == (n_faces, 3)
+        assert vertices_igl.shape == (count * count, 2)
+        return
     if bench_lib.kind == "pymeshlab":
 
         def grid_pml() -> int:

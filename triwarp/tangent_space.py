@@ -102,6 +102,62 @@ def vertex_tangent_frames(
     return basis_x, basis_y, normals
 
 
+def face_tangent_frames(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], normals: wp.array[wp.vec3] | None = None
+) -> tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.vec3]]:
+    """
+    Orthonormal tangent frame on every face as ``(basis_x, basis_y, normal)``.
+
+    ``basis_x`` is the face's first edge ``v1 - v0`` normalized, ``normal`` its unit face normal and
+    ``basis_y = normal x basis_x``. A tangent vector ``(a, b)`` in these coordinates is
+    ``a * basis_x + b * basis_y`` in world space.
+
+    Unlike [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames], **this frame is
+    not gauge-dependent**: the first edge of a face is a property of the face table, so any library
+    using the same rule produces the identical frame rather than one rotated about the normal.
+    ``igl.local_basis`` uses exactly this rule, which is why ``tests/test_tangent_space.py`` can
+    compare all three vectors element-wise instead of through an invariant.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    normals
+        Optional precomputed ``(n_faces,)`` unit face normals, as returned by
+        [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]. Computed here when
+        ``None``.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.vec3], wp.array[wp.vec3]]
+        ``(basis_x, basis_y, normal)``, each ``(n_faces,)`` on ``vertices.device``.
+
+    See Also
+    --------
+    [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames]
+    [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]
+    ``igl.local_basis``
+    """
+    device = vertices.device
+    n_faces = int(faces.shape[0]) // 3
+    basis_x = wp.empty(n_faces, dtype=wp.vec3, device=device)
+    basis_y = wp.empty(n_faces, dtype=wp.vec3, device=device)
+    if normals is None:
+        normals, _areas = tw.triangles.face_normals_and_areas(vertices, faces)
+    if n_faces == 0:
+        return basis_x, basis_y, normals
+
+    wp.launch(
+        kernel_tangent_space.face_tangent_frames,
+        dim=n_faces,
+        inputs=[vertices, faces, normals, basis_x, basis_y],
+        device=device,
+    )
+    return basis_x, basis_y, normals
+
+
 def halfedge_tangent_angles(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],

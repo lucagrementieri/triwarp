@@ -2,6 +2,7 @@
 
 from typing import Literal
 
+import numpy as np
 import warp as wp
 
 import triwarp as tw
@@ -157,6 +158,44 @@ def face_quality(
     return out_quality
 
 
+def face_centroids(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array[wp.vec3]:
+    """
+    Barycentre of every face: the mean of its three corners.
+
+    Not to be confused with [`centroid`][triwarp.triangles.centroid], which is the *mesh's* single
+    area-weighted centre. This is one point per triangle and no weighting is involved.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        ``(n_faces,)`` face barycentres on ``vertices.device``.
+
+    See Also
+    --------
+    [`centroid`][triwarp.triangles.centroid]
+    [`moments`][triwarp.triangles.moments]
+    ``igl.barycenter``
+    """
+    n_faces = int(faces.shape[0]) // 3
+    out_centroids = wp.empty(n_faces, dtype=wp.vec3, device=vertices.device)
+    if n_faces == 0:
+        return out_centroids
+    wp.launch(
+        kernel_triangles.face_centroids,
+        dim=n_faces,
+        inputs=[vertices, faces, out_centroids],
+        device=vertices.device,
+    )
+    return out_centroids
+
+
 def centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.vec3:
     """
     Area-weighted centroid of the mesh surface.
@@ -251,6 +290,95 @@ def volume(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> float:
         device=device,
     )
     return tw.reduce.sum(volumes)
+
+
+def moments(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> tuple[float, wp.vec3, np.ndarray]:
+    """
+    Mass properties of the solid bounded by the mesh: volume, centre of mass and inertia tensor.
+
+    Integrates over the enclosed solid at unit density by summing the contribution of every
+    (origin, face) tetrahedron, so the result is only meaningful for a **closed, consistently
+    wound** surface -- the same precondition [`volume`][triwarp.triangles.volume] carries, and
+    [`is_volume`][triwarp.validation.is_volume] is the check for it.
+
+    The integrals accumulate in ``float64`` even though the positions are ``float32``: the second
+    moments scale as ``length ** 5``, so a ``float32`` sum loses their low digits on any sizeable
+    mesh.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+
+    Returns
+    -------
+    volume : float
+        Signed volume, identical to [`volume`][triwarp.triangles.volume] up to its ``float32``
+        accumulation.
+    center_of_mass : wp.vec3
+        Volume centroid, i.e. the first moment divided by the volume. This is **not**
+        [`centroid`][triwarp.triangles.centroid], the area-weighted centre of the *surface*; the two
+        differ on any solid whose mass is not distributed like its shell.
+    inertia : numpy.ndarray
+        ``(3, 3)`` inertia tensor about the centre of mass, at unit density.
+
+    Notes
+    -----
+    ``igl.moments`` returns ``(m0, m1, m2)`` where ``m1`` is the first moment -- the centre of mass
+    times the mass -- rather than the centre of mass itself, and ``m2`` is already referred to the
+    centre of mass (verified against a translated mesh, not assumed). This function returns the
+    decoded forms, so the transform between the two is ``m1 / m0``.
+
+    Three host readbacks are unavoidable here: all three returns are host-side values, so the ten
+    accumulated sums have to cross the device boundary to be combined.
+
+    See Also
+    --------
+    [`volume`][triwarp.triangles.volume]
+    [`centroid`][triwarp.triangles.centroid]
+    [`is_volume`][triwarp.validation.is_volume]
+    [`trimesh.Trimesh.moment_inertia`][]
+    ``igl.moments``
+    """
+    device = vertices.device
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return 0.0, wp.vec3(float("nan"), float("nan"), float("nan")), np.zeros((3, 3))
+
+    volumes = wp.empty(n_faces, dtype=wp.float64, device=device)
+    first = wp.empty(n_faces, dtype=wp.vec3d, device=device)
+    squares = wp.empty(n_faces, dtype=wp.vec3d, device=device)
+    products = wp.empty(n_faces, dtype=wp.vec3d, device=device)
+    wp.launch(
+        kernel_triangles.moment_integrands,
+        dim=n_faces,
+        inputs=[vertices, faces, volumes, first, squares, products],
+        device=device,
+    )
+
+    # Three readbacks, one per accumulated group: every return is a host-side value.
+    total_volume = float(wp.utils.array_sum(volumes))
+    first_moment = first.numpy().sum(axis=0)
+    integral_squares = squares.numpy().sum(axis=0)
+    integral_products = products.numpy().sum(axis=0)
+
+    center = first_moment / total_volume if total_volume != 0.0 else np.full(3, np.nan)
+
+    # Inertia about the origin from the raw integrals, then shifted to the centre of mass.
+    x2, y2, z2 = integral_squares
+    xy, xz, yz = integral_products
+    inertia = np.array(
+        [[y2 + z2, -xy, -xz], [-xy, x2 + z2, -yz], [-xz, -yz, x2 + y2]], dtype=np.float64
+    )
+    if total_volume != 0.0:
+        shift = total_volume * (float(center @ center) * np.eye(3) - np.outer(center, center))
+        inertia = inertia - shift
+
+    return total_volume, wp.vec3(*center.tolist()), inertia
 
 
 def nondegenerate(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array[wp.bool]:

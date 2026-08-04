@@ -7,7 +7,7 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab
+from tests.conversions import faces_igl, trimesh_to_open3d, trimesh_to_pymeshlab
 
 
 @pytest.mark.parity("area_weighted_vertex_normals", "open3d", "pymeshlab")
@@ -227,13 +227,33 @@ def test_sine_and_edge_length_weighted_vertex_normals(half_torus: tuple[tm.Trime
     assert np.allclose(vertex_normals_explicit_wp.numpy(), vertex_normals_np, rtol=1e-5, atol=1e-5)
 
 
-def test_vertex_defects(half_torus: tuple[tm.Trimesh, wp.Mesh]):
-    mesh_tm, mesh_wp = half_torus
+@pytest.mark.parametrize("mesh_name", ["half_torus", "icosahedron"])
+@pytest.mark.parity("vertex_defects", "trimesh", "igl")
+def test_vertex_defects(request: pytest.FixtureRequest, mesh_name: str):
+    """
+    Class A on both references, on an open fixture and a closed one.
+
+    ``igl.gaussian_curvature`` is the *pointwise* angle defect ``2π - Σθ`` -- the same quantity
+    ``tm.curvature.vertex_defects`` returns and emphatically **not** the ball-integrated
+    Cohen-Steiner/Morvan measure ``curvature.discrete_gaussian_curvature`` computes, which is
+    exempted from parity against MeshLab for exactly that reason. Sharing a name with a different
+    measure is the whole hazard here, so the comparison is worth having twice over.
+
+    Both fixtures are needed because the interesting disagreement would be at the **boundary**: a
+    reference could reasonably use ``π - Σθ`` there. Measured, none of the three does --
+    ``half_torus``'s 56 boundary vertices agree element-wise with the closed ``icosahedron``'s
+    interior ones -- so the assert is a plain ``allclose`` over every vertex.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     n_vertices = mesh_tm.vertices.shape[0]
-    face_angles_tm = mesh_tm.face_angles
     vertex_defects_tm = tm.curvature.vertex_defects(mesh_tm)
+    vertex_defects_igl = igl.gaussian_curvature(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64), faces_igl(mesh_tm)
+    ).ravel()
 
-    face_angles_wp = wp.array(face_angles_tm, dtype=wp.float32, device=mesh_wp.device)
+    face_angles_wp = wp.array(mesh_tm.face_angles, dtype=wp.float32, device=mesh_wp.device)
     vertex_defects_wp = tw.vertices.vertex_defects(n_vertices, mesh_wp.indices, face_angles_wp)
+
     assert np.allclose(vertex_defects_wp.numpy(), vertex_defects_tm, rtol=1e-5, atol=1e-5)
+    assert np.allclose(vertex_defects_wp.numpy(), vertex_defects_igl, rtol=1e-5, atol=1e-5)

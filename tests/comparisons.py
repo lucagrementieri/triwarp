@@ -54,6 +54,38 @@ def assert_unordered_rows_equal(rows_a: np.ndarray, rows_b: np.ndarray) -> None:
     assert np.array_equal(sorted_a, sorted_b)
 
 
+def canonical_labels(labels_np: np.ndarray) -> np.ndarray:
+    """
+    Relabel a partition by first occurrence, so two labellings of it compare elementwise.
+
+    Component ids are arbitrary names for a partition: triwarp's label-propagation returns a
+    *representative element's* index per component, scipy returns ``0..k-1`` in discovery order and
+    ``igl.facet_components`` returns ``0..k-1`` in its own. Renaming each label to the position of
+    its first appearance is the transform that makes the three comparable without hiding a genuine
+    disagreement about *which* elements share a component.
+    """
+    labels_np = np.asarray(labels_np).ravel()
+    _first, inverse = np.unique(labels_np, return_inverse=True)
+    # np.unique's inverse is ordered by sorted label value, not by first appearance; rank the
+    # first-appearance positions to get the discovery order.
+    order = np.argsort(
+        np.array([np.flatnonzero(inverse == i)[0] for i in range(inverse.max() + 1)])
+    )
+    rank = np.empty_like(order)
+    rank[order] = np.arange(order.shape[0])
+    return rank[inverse]
+
+
+def same_partition(labels_a: np.ndarray, labels_b: np.ndarray) -> bool:
+    """
+    Whether two labellings induce the same partition, ignoring the label names.
+
+    See [`canonical_labels`][tests.comparisons.canonical_labels] for why the names differ between
+    every implementation of this quantity.
+    """
+    return bool(np.array_equal(canonical_labels(labels_a), canonical_labels(labels_b)))
+
+
 def canonical_winding(faces_np: np.ndarray) -> np.ndarray:
     """
     Rotate each triangle to start at its smallest index, preserving orientation.

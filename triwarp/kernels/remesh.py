@@ -1325,29 +1325,6 @@ def accumulate_face_quadrics(
         wp.atomic_add(out_quadrics, faces[f * 3 + k], quadric)
 
 
-@wp.kernel
-def count_vertex_faces(faces: wp.array[wp.int32], out_counts: wp.array[wp.int32]) -> None:
-    f = int(wp.tid())
-    for k in range(3):
-        wp.atomic_add(out_counts, faces[f * 3 + k], 1)
-
-
-@wp.kernel
-def scatter_vertex_faces(
-    faces: wp.array[wp.int32],
-    offsets: wp.array[wp.int32],
-    cursor: wp.array[wp.int32],
-    out_vertex_faces: wp.array[wp.int32],
-) -> None:
-    # Vertex-to-face CSR payload. Row order is thread-order and therefore arbitrary, which is fine:
-    # the normal-flip guard reads the row as a *set*. A rotational order would need halfedge twins
-    # and would refuse a vertex-non-manifold mesh, which a decimator must not.
-    f = int(wp.tid())
-    for k in range(3):
-        v = faces[f * 3 + k]
-        out_vertex_faces[offsets[v] + wp.atomic_add(cursor, v, 1)] = f
-
-
 @wp.func
 def collapse_flips_normal(
     vertices: wp.array[wp.vec3],

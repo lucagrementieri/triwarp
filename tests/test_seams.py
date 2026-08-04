@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import pytest
 import trimesh as tm
@@ -256,6 +257,74 @@ def test_cut_along_edges_matches_pymeshlab_topology(device: str) -> None:
     assert np.isclose(cut_tm.area, box_tm.area, rtol=1e-5)
     assert np.isclose(mesh_cut_pml.area, box_tm.area, rtol=1e-5)
     assert int(cut_vertices_wp.shape[0]) == 24 < mesh_pml.vertex_number()
+
+
+@pytest.mark.parity("cut_along_edges", "igl")
+def test_cut_along_edges_matches_igl(device: str) -> None:
+    """
+    Class B (an edge set becomes a per-corner mask), and it **settles** the MeshLab disagreement.
+
+    ``igl.cut_mesh(V, F, C)`` takes ``C`` as a ``(n_faces, 3)`` **bool** per-corner mask rather than
+    an edge list, so the named transform is to mark ``C[f, i]`` for every face-corner whose edge is
+    in triwarp's cut set. On the cube cut at every crease igl emits **24 vertices, exactly triwarp's
+    answer**, against MeshLab's 32 -- which is the point of having a third implementation on this
+    group: 24 is minimal and now independently confirmed, so MeshLab's extra 8 are its own.
+
+    **The corner numbering is ``(i, i + 1)`` here, unlike ``igl.ears``.** ``cut_mesh``'s edge ``i``
+    of face ``f`` is ``(F[f, i], F[f, (i + 1) % 3])`` -- the same convention triwarp uses -- where
+    ``igl.ears`` inherits ``igl::on_boundary``'s *opposite-vertex* numbering. The two conventions
+    coexist inside one library, so the mask is built with the ``(i, i + 1)`` rule and the
+    alternative is checked to be wrong rather than assumed: it yields 28 vertices, so a
+    convention slip would fail this test rather than pass it.
+    """
+    box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
+    vertices_np = np.ascontiguousarray(box_tm.vertices, dtype=np.float64)
+    faces_np = np.ascontiguousarray(box_tm.faces, dtype=np.int64)
+
+    vertices_wp, faces_wp = _upload(box_tm, device)
+    creases_wp = tw.seams.crease_edges(vertices_wp, faces_wp, angle=30.0)
+    cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(vertices_wp, faces_wp, creases_wp)
+
+    cut_set = {tuple(sorted(pair)) for pair in creases_wp.numpy().tolist()}
+    corner_mask_igl = np.array(
+        [
+            [
+                tuple(sorted((int(faces_np[f, i]), int(faces_np[f, (i + 1) % 3])))) in cut_set
+                for i in range(3)
+            ]
+            for f in range(faces_np.shape[0])
+        ],
+        dtype=bool,
+    )
+    assert int(corner_mask_igl.sum()) == 2 * len(cut_set), (
+        "every cut edge is marked from both sides"
+    )
+
+    vertices_cut_igl, faces_cut_igl = igl.cut_mesh(vertices_np, faces_np, corner_mask_igl)[:2]
+
+    assert vertices_cut_igl.shape[0] == int(cut_vertices_wp.shape[0]) == 24
+    assert faces_cut_igl.shape[0] == int(cut_faces_wp.shape[0]) // 3
+    cut_tm = tm.Trimesh(
+        cut_vertices_wp.numpy().astype(np.float64),
+        cut_faces_wp.numpy().reshape(-1, 3),
+        process=False,
+    )
+    mesh_cut_igl = tm.Trimesh(vertices_cut_igl, faces_cut_igl, process=False)
+    assert _face_component_count(cut_vertices_wp, cut_faces_wp) == 6
+    assert np.isclose(mesh_cut_igl.area, cut_tm.area, rtol=1e-5)
+    # The opposite-vertex convention is genuinely a different answer, so the mask above is a choice.
+    opposite_mask_igl = np.array(
+        [
+            [
+                tuple(sorted((int(faces_np[f, (i + 1) % 3]), int(faces_np[f, (i + 2) % 3]))))
+                in cut_set
+                for i in range(3)
+            ]
+            for f in range(faces_np.shape[0])
+        ],
+        dtype=bool,
+    )
+    assert igl.cut_mesh(vertices_np, faces_np, opposite_mask_igl)[0].shape[0] == 28
 
 
 def test_cut_along_edges_invalid(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:

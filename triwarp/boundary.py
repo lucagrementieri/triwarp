@@ -419,8 +419,17 @@ def ears(
     """
     Find ear faces (triangles with exactly two boundary edges).
 
-    Mirrors ``igl::ears`` (`reference/libigl/include/igl/ears.cpp`): for each ear face,
-    ``ear_opp`` is the local edge index (0, 1, or 2) of the non-boundary edge.
+    For each ear face, ``ear_opp`` is the local index of the non-boundary edge, where local edge
+    ``i`` is ``(faces[f, i], faces[f, (i + 1) % 3])``.
+
+    !!! note "``igl::ears`` numbers the edge differently"
+
+        The same quantity in ``igl.ears`` is indexed *opposite-vertex* style -- edge ``i`` is the
+        one facing vertex ``i``, ``(faces[f, (i + 1) % 3], faces[f, (i + 2) % 3])`` -- because it
+        reads its mask from ``igl::on_boundary``, whose columns are documented that way. The two
+        agree on *which* faces are ears and differ on the index by a cyclic shift:
+        ``triwarp_opp == (igl_opp + 1) % 3``. See
+        ``tests/test_boundary.py::test_ears_match_igl``.
 
     Parameters
     ----------

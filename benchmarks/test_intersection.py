@@ -37,9 +37,11 @@ boundary the libigl and potpourri3d references run into elsewhere in the suite, 
 groups are all on the scan sweep, so there is nowhere for the row to move. Recorded rather than
 skipped, so it is not re-derived.
 
-**libigl** has no plane-section or mesh-mesh intersection binding in the Python package
-(``igl.ray_mesh_intersect`` is the only intersection entry point, a different query), so igl is
-absent from every case in this module.
+**libigl** has no plane-section or mesh-mesh intersection binding in the Python package, so it is
+absent from the ``mesh_with_*`` and ``segments_with_plane`` groups. It *does* have the isocontour
+operation, though -- an earlier version of this docstring claimed ``igl.ray_mesh_intersect`` was its
+only intersection entry point, which was wrong: ``igl.isolines(V, F, S, vals)`` is precisely what
+``marching_triangles`` computes, and it is a row in both of that function's groups.
 
 Caps
 ----
@@ -58,6 +60,7 @@ intersection curve on every mesh.
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import potpourri3d as pp3d
 import pytest
@@ -232,7 +235,20 @@ def _field_wp(bench_case: BenchCase, field: str) -> wp.array:
 
 
 def _run_case(bench_case: BenchCase, field: str) -> None:
-    """Extract one level set, in triwarp or potpourri3d."""
+    """Extract one level set, in triwarp, potpourri3d or libigl."""
+    if bench_case.kind == "igl":
+        # igl returns a segment *soup* -- (points, segments, segment_values), no curve linkage --
+        # so it does strictly less than triwarp and potpourri3d, both of which return linked
+        # polylines. Read the row as the floor for the extraction without the linking.
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        values_np = _field_np(bench_case, field)
+        points_igl, segments_igl, _values_igl = bench_case.run(
+            lambda: igl.isolines(vertices_np, faces_np, values_np, np.array([_ISOVALUE])),
+            rounds=_ROUNDS,
+        )
+        assert points_igl.shape[1] == 3
+        assert segments_igl.shape[0] > 0
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         values, n_vertices = _field_wp(bench_case, field), bench_case.n_vertices
@@ -256,7 +272,7 @@ def _run_case(bench_case: BenchCase, field: str) -> None:
 
 @pytest.mark.benchmark(group="marching_triangles")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "potpourri3d")
+@pytest.mark.benchlibs("triwarp", "potpourri3d", "igl")
 def test_marching_triangles(bench_case: BenchCase) -> None:
     """One long closed contour of a coordinate function, over the clean size sweep."""
     _run_case(bench_case, "plane")
@@ -264,7 +280,7 @@ def test_marching_triangles(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="marching_triangles_curves")
 @pytest.mark.benchmeshes("sphere_med")
-@pytest.mark.benchlibs("triwarp", "potpourri3d")
+@pytest.mark.benchlibs("triwarp", "potpourri3d", "igl")
 @pytest.mark.parametrize("field", list(_FIELDS))
 def test_marching_triangles_curves(bench_case: BenchCase, field: str) -> None:
     """One mesh, level sets from 1 to ~1 000 curves, to see whether linking cost shows up."""

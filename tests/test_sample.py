@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
@@ -16,7 +17,21 @@ import triwarp as tw
 from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab
 
 
+@pytest.mark.parity("sample_surface", "trimesh", "igl")
 def test_sample_surface(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class B, three samplers against the area law they all claim: per-face frequency / area fraction.
+
+    Two seeded RNGs cannot be aligned, so the comparable quantity is the *distribution* rather than
+    the samples: each library's per-face sample frequency must match that face's share of the total
+    area. All three return the face index directly, so the only transform is the ``bincount``.
+
+    The bug class this excludes is a mis-weighted CDF -- sampling by face *index* or uniformly per
+    face instead of by area, which is the classic error in this routine and is invisible to a
+    count-and-on-surface check. ``half_torus`` is the fixture because its faces vary in area by
+    construction, so a uniform-per-face sampler fails the assert; on an icosahedron, where every
+    face has the same area, it would pass.
+    """
     mesh_tm, mesh_wp = half_torus
     count = 10_000
     n_faces = int(mesh_tm.faces.shape[0])
@@ -26,9 +41,18 @@ def test_sample_surface(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     face_idx_wp = tw.sample.sample_surface(mesh_wp.points, mesh_wp.indices, count, seed=0)[1]
     freq_wp = np.bincount(face_idx_wp.numpy(), minlength=n_faces) / count
 
+    face_idx_igl = igl.random_points_on_mesh(
+        count,
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),
+        np.ascontiguousarray(mesh_tm.faces, dtype=np.int64),
+        0,
+    )[1]
+    freq_igl = np.bincount(face_idx_igl, minlength=n_faces) / count
+
     freq_expected = mesh_tm.area_faces / mesh_tm.area_faces.sum()
     assert np.allclose(freq_wp, freq_expected, rtol=0.08, atol=0.008)
     assert np.allclose(freq_tm, freq_expected, rtol=0.08, atol=0.008)
+    assert np.allclose(freq_igl, freq_expected, rtol=0.08, atol=0.008)
 
 
 def test_sample_surface_with_face_weights(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
@@ -186,22 +210,23 @@ def _blue_noise_statistics(
     )
 
 
-@pytest.mark.parity("blue_noise", "open3d", "pymeshlab")
-def test_sample_surface_blue_noise_matches_open3d_and_pymeshlab(
+@pytest.mark.parity("blue_noise", "open3d", "pymeshlab", "igl")
+def test_sample_surface_blue_noise_matches_open3d_pymeshlab_and_igl(
     icosahedron: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:
     """
-    Class C: three blue-noise samplers, three algorithms, no correspondence between the point sets.
+    Class C: four blue-noise samplers, four algorithms, no correspondence between the point sets.
 
     triwarp reduces a dense pool by randomized priority (flat background grid), Open3D's
     ``sample_points_poisson_disk`` runs Yuksel's sample *elimination* from a dense uniform cloud,
-    and MeshLab's ``generate_sampling_poisson_disk`` is Corsini's hierarchical dart throwing.
+    MeshLab's ``generate_sampling_poisson_disk`` is Corsini's hierarchical dart throwing, and
+    ``igl.blue_noise`` is Bridson active-list dart throwing -- which is what triwarp itself ran
+    until the algorithm was replaced, and whose ``30x`` pool oversampling triwarp still uses.
     Nothing about the individual samples is shared -- not their count, not their positions, not even
-    their number given the same parameter -- so the comparison is on the properties all three claim.
-    MeshLab is
-    the only reference that accepts a *radius* (``radius=PureValue(r)`` overrides ``samplenum``), so
-    it gets triwarp's own parameter; Open3D takes a count and gets triwarp's output count, exactly
-    as the benchmark parametrizes them.
+    their number given the same parameter -- so the comparison is on the properties all four claim.
+    MeshLab and igl both accept a *radius* (``radius=PureValue(r)`` overrides ``samplenum``; igl's
+    third argument is ``r``), so they get triwarp's own parameter; Open3D takes a count and gets
+    triwarp's output count, exactly as the benchmark parametrizes them.
 
     **Bug class excluded:** a sampler that is not blue noise at all (assert 1) and one that is blue
     noise over only part of the surface (asserts 2 and 3). Both are live failure modes for a
@@ -216,6 +241,7 @@ def test_sample_surface_blue_noise_matches_open3d_and_pymeshlab(
     | | closest pair / r | worst gap / r | faces hit |
     |---|---|---|---|
     | triwarp | 1.000 | 1.103 | 20 / 20 |
+    | igl, same radius | 1.000 | **1.073** | 20 / 20 |
     | MeshLab, same radius | 1.000 | 1.112 | 20 / 20 |
     | Open3D, same count | 0.926 | 1.197 | 20 / 20 |
     | uniform Monte Carlo | **0.005** | 1.878 | 20 / 20 |
@@ -224,10 +250,14 @@ def test_sample_surface_blue_noise_matches_open3d_and_pymeshlab(
     So assert 1 (``>= 0.85``) clears the worst reference by 8% and both probes by **200x** -- it is
     the assert carrying the bug class. Assert 3 (every face hit) separates the clumped probe by a
     factor of 5. Assert 2 (worst gap ``<= 1.4``) is the weakest of the three at a 1.34x margin
-    over the Monte-Carlo probe, and it is applied only to triwarp and MeshLab: Open3D's elimination
-    sampler genuinely leaves larger gaps on a 20-face mesh, which is a property of its algorithm
-    rather than a disagreement. Sample *counts* at the identical radius are 749 against MeshLab's
-    769, 2.6% apart against a 25% bound.
+    over the Monte-Carlo probe, and it is applied to triwarp, igl and MeshLab -- the three that
+    received the identical radius. Open3D is exempt from it: its elimination sampler genuinely
+    leaves larger gaps on a 20-face mesh, a property of its algorithm rather than a disagreement.
+
+    igl is the **closest of the three in output** and the only one that beats triwarp on a column:
+    747 samples against triwarp's 749 (0.3% apart, against MeshLab's 769) and the tightest coverage
+    of the four at 1.073 r. That is worth stating next to the benchmark, where triwarp is 4-24x
+    faster than it -- the port is not buying its speed with quality.
 
     triwarp's ``1.000`` in the first column is **exact rather than tolerant**, and is a property of
     the algorithm rather than of this fixture: an accepted point is never within ``r`` of another
@@ -251,18 +281,25 @@ def test_sample_surface_blue_noise_matches_open3d_and_pymeshlab(
         trimesh_to_open3d(mesh_tm).sample_points_poisson_disk(number_of_points=n_samples).points
     )
 
+    points_igl = igl.blue_noise(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),
+        np.ascontiguousarray(mesh_tm.faces, dtype=np.int64),
+        radius,
+    )[2]
+
     closest_wp, gap_wp, faces_wp = _blue_noise_statistics(
         mesh_tm, points_wp.numpy(), radius, dense_np
     )
     closest_pml, gap_pml, faces_pml = _blue_noise_statistics(mesh_tm, points_pml, radius, dense_np)
     closest_o3d, _gap_o3d, faces_o3d = _blue_noise_statistics(mesh_tm, points_o3d, radius, dense_np)
+    closest_igl, gap_igl, faces_igl = _blue_noise_statistics(mesh_tm, points_igl, radius, dense_np)
 
-    # 1. The Poisson-disk property, on all three.
-    assert min(closest_wp, closest_pml, closest_o3d) >= 0.85
-    # 2. Space-filling, against the reference that received the identical radius.
-    assert max(gap_wp, gap_pml) <= 1.4
-    # 3. Every face reached, on all three.
-    assert faces_wp == faces_pml == faces_o3d == mesh_tm.faces.shape[0]
+    # 1. The Poisson-disk property, on all four.
+    assert min(closest_wp, closest_pml, closest_o3d, closest_igl) >= 0.85
+    # 2. Space-filling, on the three that received the identical radius.
+    assert max(gap_wp, gap_pml, gap_igl) <= 1.4
+    # 3. Every face reached, on all four.
+    assert faces_wp == faces_pml == faces_o3d == faces_igl == mesh_tm.faces.shape[0]
     # 4. And the radius parametrization agrees: the same radius yields the same order of samples.
     assert 0.8 <= n_samples / points_pml.shape[0] <= 1.25
 

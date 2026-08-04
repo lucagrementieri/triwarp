@@ -265,25 +265,121 @@ def test_boundary_loops_empty(device: str) -> None:
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
-def test_ears(request: pytest.FixtureRequest, mesh_name: str) -> None:
+@pytest.mark.parity("boundary_edges", "igl")
+def test_boundary_edges_match_igl(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B (row order): ``igl.boundary_facets`` returns the same edge set plus two extra columns.
+
+    Its three returns are the ``(n_boundary, 2)`` edge list, the incident face of each edge and that
+    edge's corner index within the face -- so it computes strictly more than triwarp's two columns,
+    and the benchmark reads its row that way. Only the first return is compared here, after a
+    canonical row sort, since neither side defines an order over boundary edges.
+
+    igl's edges come out **oriented** (they carry the incident face's winding), so the rows are
+    sorted within themselves before the set comparison -- the same transform the trimesh test
+    above applies. ``oriented_boundary_edges`` is the triwarp function whose *direction* is
+    comparable, and it agrees with igl's orientation vertex for vertex, which the second assert
+    pins.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    faces_np = mesh_tm.faces.astype(np.int64)
+    edges_igl, _face_igl, _corner_igl = igl.boundary_facets(mesh_tm.faces.astype(np.int64))
 
-    ear_igl, ear_opp_igl = igl.ears(faces_np)
-    ear_wp, ear_opp_wp = tw.boundary.ears(mesh_wp.indices)
+    boundary_edges_wp = tw.boundary.boundary_edges(mesh_wp.points, mesh_wp.indices)
+    oriented_wp = tw.boundary.oriented_boundary_edges(mesh_wp.points, mesh_wp.indices)
 
-    pairs_igl = np.stack([ear_igl, ear_opp_igl], axis=1)
+    assert np.array_equal(
+        _lexsort_rows(boundary_edges_wp.numpy()), _lexsort_rows(np.sort(edges_igl, axis=1))
+    )
+    assert np.array_equal(_lexsort_rows(oriented_wp.numpy()), _lexsort_rows(edges_igl))
+
+
+@pytest.mark.parametrize(
+    ("faces_np", "expected_ears"),
+    [
+        # An open fan: centre 0 with a 4-vertex boundary chain, so the two end triangles are ears.
+        (np.array([[0, 1, 2], [0, 2, 3], [0, 3, 4]], dtype=np.int32), 2),
+        # Two triangles sharing one edge: both are ears.
+        (np.array([[0, 1, 2], [1, 3, 2]], dtype=np.int32), 2),
+        # A four-triangle strip: only the two ends are ears, the middle pair has one boundary edge.
+        (np.array([[0, 1, 2], [1, 3, 2], [3, 4, 2], [4, 5, 2]], dtype=np.int32), 2),
+    ],
+    ids=["fan3", "strip2", "strip4"],
+)
+@pytest.mark.parity("ears", "igl")
+def test_ears_match_igl(device: str, faces_np: np.ndarray, expected_ears: int) -> None:
+    """
+    Class B (an edge-numbering shift): ``ear_opp`` is offset by one between the two libraries.
+
+    Both report an ear as ``(face, index of the non-boundary edge)`` and both find the same faces,
+    but the *edge numbering* differs and the difference is exactly a cyclic shift:
+
+    - triwarp numbers local edge ``i`` as ``(faces[f, i], faces[f, (i + 1) % 3])``;
+    - libigl's ``ears`` reads its mask from ``on_boundary``, whose column ``i`` is documented as
+      "whether **opposite** facet is on boundary" -- edge ``i`` is the one *opposite vertex* ``i``,
+      i.e. ``(faces[f, (i + 1) % 3], faces[f, (i + 2) % 3])``.
+
+    So ``triwarp_opp == (igl_opp + 1) % 3``, and that is the named transform. Neither convention is
+    wrong; ``boundary.ears``'s docstring states triwarp's.
+
+    **This test replaces a vacuous one.** The previous version compared the two libraries on
+    ``hemisphere`` and ``half_torus``, where *neither* returns any ear at all -- the assert was
+    ``[] == []`` on both fixtures, so the numbering difference went unnoticed and any regression
+    would have too. The inputs here are the smallest meshes that produce ears, and each case asserts
+    the expected count first, so an implementation returning nothing fails rather than passes.
+
+    The last assert is the one that does not lean on igl: for every reported ear it checks against
+    ``oriented_boundary_edges`` that the two edges *other* than ``ear_opp`` really are boundary
+    edges, under triwarp's own numbering.
+    """
+    faces_wp = wp.array(np.ascontiguousarray(faces_np.reshape(-1)), dtype=wp.int32, device=device)
+    # Positions are irrelevant to ears (pure connectivity) but boundary_edges wants a vertex buffer.
+    n_vertices = int(faces_np.max()) + 1
+    vertices_wp = wp.array(
+        np.ascontiguousarray(
+            np.stack([np.arange(n_vertices), np.zeros(n_vertices), np.zeros(n_vertices)], axis=1),
+            dtype=np.float32,
+        ),
+        dtype=wp.vec3,
+        device=device,
+    )
+
+    ear_igl, ear_opp_igl = igl.ears(np.ascontiguousarray(faces_np, dtype=np.int64))
+    ear_wp, ear_opp_wp = tw.boundary.ears(faces_wp)
+
+    assert int(ear_wp.shape[0]) == expected_ears
+    assert ear_igl.shape[0] == expected_ears
+
+    pairs_igl = np.stack([ear_igl, (ear_opp_igl + 1) % 3], axis=1)
     pairs_wp = np.stack([ear_wp.numpy(), ear_opp_wp.numpy()], axis=1)
     assert np.array_equal(_lexsort_rows(pairs_wp), _lexsort_rows(pairs_igl))
 
-    oriented_boundary = tw.boundary.oriented_boundary_edges(mesh_wp.points, mesh_wp.indices)
+    oriented_boundary = tw.boundary.oriented_boundary_edges(vertices_wp, faces_wp)
     boundary_set = {tuple(row) for row in oriented_boundary.numpy()}
-    directed_edges = tw.edges.faces_to_edges(mesh_wp.indices).numpy()
+    directed_edges = tw.edges.faces_to_edges(faces_wp).numpy()
     for face_idx, opp in zip(ear_wp.numpy(), ear_opp_wp.numpy(), strict=True):
         f = int(face_idx)
         for local_edge in ((int(opp) + 1) % 3, (int(opp) + 2) % 3):
-            edge = tuple(directed_edges[3 * f + local_edge])
-            assert edge in boundary_set
+            assert tuple(directed_edges[3 * f + local_edge]) in boundary_set
+
+
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+def test_ears_none_on_smooth_boundary(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Neither library finds an ear on either open fixture, which is why they cannot carry parity.
+
+    A rim built by subdivision never leaves a triangle with two boundary edges, so this is the
+    negative half of ``test_ears_match_igl`` and is kept separate from it rather than standing in
+    for a comparison.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_np = mesh_tm.faces.astype(np.int64)
+
+    ear_igl, _ear_opp_igl = igl.ears(faces_np)
+    ear_wp, ear_opp_wp = tw.boundary.ears(mesh_wp.indices)
+
+    assert ear_igl.shape[0] == 0
+    assert ear_wp.shape == (0,)
+    assert ear_opp_wp.shape == (0,)
 
 
 def test_ears_watertight(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:

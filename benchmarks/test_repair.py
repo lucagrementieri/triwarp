@@ -83,12 +83,13 @@ before quoting a ratio.
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase
+from conftest import BenchCase, skip_larger_than
 
 import triwarp as tw
 
@@ -272,6 +273,50 @@ def test_remove_non_manifold_faces(bench_case: BenchCase, extra: int) -> None:
     assert int(kept_faces.shape[0]) > 0
 
 
+@pytest.mark.benchmark(group="remove_unreferenced_vertices")
+@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.parametrize("unreferenced", [0, 1], ids=["clean", "padded"])
+def test_remove_unreferenced_vertices(bench_case: BenchCase, unreferenced: int) -> None:
+    """
+    Compact away vertices no face indexes: a mask, a scan and a gather.
+
+    The ``padded`` id appends a *copy* of the vertex buffer that no face references, so half the
+    vertices are dead and the compaction has real work to do; ``clean`` is the identity case, where
+    the whole cost is the mask-and-scan that proves there is nothing to remove. Both are on the scan
+    sweep because the operation has no other axis: it is one pass over ``V`` plus one over ``3F``.
+
+    ``igl.remove_unreferenced`` returns the same four things in the same order (vertices, faces,
+    forward map, inverse map) and is already the oracle in ``tests/test_repair.py``. Note it takes
+    ``int32`` faces here while most of the package wants ``int64`` -- passing ``faces_np`` directly
+    works because nanobind casts, but the cast is a copy of the face buffer on every call and it is
+    inside the timing.
+
+    ``bunny`` itself carries **1 113 unreferenced vertices** of 35 947, so the ``clean`` id is only
+    clean in the sense of "nothing added": both libraries really do drop those.
+    """
+    vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+    if unreferenced:
+        vertices_np = np.ascontiguousarray(np.vstack([vertices_np, vertices_np]))
+    if bench_case.kind == "igl":
+        skip_larger_than(bench_case, "bunny", "the reference is a single-threaded scan and gather")
+        faces_igl = np.ascontiguousarray(faces_np, dtype=np.int32)
+        kept_vertices_igl, kept_faces_igl, _remap_igl, _inverse_igl = bench_case.run(
+            lambda: igl.remove_unreferenced(vertices_np, faces_igl)
+        )
+        assert kept_faces_igl.shape == (bench_case.n_faces, 3)
+        assert kept_vertices_igl.shape[0] <= vertices_np.shape[0]
+        return
+    vertices_wp = wp.array(
+        np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=bench_case.device
+    )
+    faces_wp = bench_case.faces_wp
+    kept_vertices, kept_faces, _remap = bench_case.run(
+        lambda: tw.repair.remove_unreferenced_vertices(vertices_wp, faces_wp)
+    )
+    assert int(kept_faces.shape[0]) == int(faces_wp.shape[0])
+    assert int(kept_vertices.shape[0]) <= vertices_np.shape[0]
+
+
 def _soup(bench_case: BenchCase) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """Unweld the mesh so every face owns its three vertices: maximal duplication to collapse."""
     key = (bench_case.mesh_name, str(bench_case.device))
@@ -337,9 +382,26 @@ def test_remove_duplicated_vertices(bench_case: BenchCase, epsilon: float) -> No
 
 @pytest.mark.benchmark(group="make_winding_consistent")
 @pytest.mark.benchaxis("diameter")
-@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pymeshlab")
 def test_make_winding_consistent(bench_case: BenchCase) -> None:
-    """Flip mask from the parity union-find, then one relabel pass: flat across the axis."""
+    """
+    Flip mask from the parity union-find, then one relabel pass: flat across the axis.
+
+    Three references, three traversals, and this is the group where the ``diameter`` axis earns its
+    keep: ``igl.bfs_orient`` is a breadth-first walk, MeshLab's
+    ``meshing_re_orient_faces_coherently`` a serial face-to-face visit and ``trimesh.repair
+    .fix_winding`` a flood fill, so all three grow with graph depth where the union-find does not.
+
+    ``igl.bfs_orient`` returns ``(FF, C)`` -- the reoriented faces and the per-face *component id*,
+    not the flip mask; the mask is recovered by comparing ``FF`` to ``F`` (see
+    ``tests/test_validation.py``). Unlike the other two it does not mutate an input, so nothing is
+    rebuilt inside the callable.
+    """
+    if bench_case.kind == "igl":
+        faces_np = np.ascontiguousarray(bench_case.faces_np, dtype=np.int64)
+        oriented_igl, _components_igl = bench_case.run(lambda: igl.bfs_orient(faces_np))
+        assert oriented_igl.shape == (bench_case.n_faces, 3)
+        return
     if bench_case.kind == "pymeshlab":  # a serial face-to-face visit, against the union-find
         vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
         bench_case.run(

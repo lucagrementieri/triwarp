@@ -411,3 +411,89 @@ def test_mollify_intrinsic_restores_the_triangle_inequality(sliver_patch: tuple)
     # tolerance is loose because ``delta`` here is ~1e-5 against lengths of ~1, so the sum lands at
     # the edge of float32's resolution.
     assert np.allclose(mollified.numpy() - original, delta, rtol=5e-2, atol=1e-9)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("face_gradients", "igl")
+def test_face_gradients_matches_igl(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B (matrix form applied): ``igl.grad`` is the same operator as a sparse ``(3F, V)`` map.
+
+    igl returns the operator; triwarp returns its product with the field. The named transform is
+    therefore to *apply* igl's matrix and unstack the result, which comes back as
+    ``[all x; all y; all z]`` rather than interleaved -- getting that wrong yields a permutation of
+    the right numbers, so the test also checks the defining property below, which no permutation
+    satisfies.
+
+    The tolerance is the package's standard ``1e-5`` rather than something tighter, and the reason
+    is structural rather than a fudge: triwarp accumulates in ``float64`` but takes its normals and
+    areas from ``face_normals_and_areas``, which is ``float32``, so the geometry enters at single
+    precision where igl's is double throughout. Measured worst deviation across these fixtures is
+    **1.4e-6 relative** (on ``half_torus``, whose faces are the smallest), so the bound has a 7x
+    margin -- and it is a float32-vs-float64 gap, not a disagreement about the operator.
+
+    The second assert is the gradient's defining identity, checked without igl:
+    ``dot(grad, v1 - v0) == values[v1] - values[v0]`` for every face. A finite difference along the
+    edges, or a gradient left in the wrong plane, fails it.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
+    faces_np = np.ascontiguousarray(mesh_tm.faces, dtype=np.int64)
+    values_np = np.ascontiguousarray(vertices_np[:, 2])
+
+    n_faces = faces_np.shape[0]
+    stacked_igl = igl.grad(vertices_np, faces_np) @ values_np
+    gradients_igl = np.stack(
+        [stacked_igl[:n_faces], stacked_igl[n_faces : 2 * n_faces], stacked_igl[2 * n_faces :]],
+        axis=1,
+    )
+
+    values_wp = wp.array(values_np, dtype=wp.float64, device=mesh_wp.device)
+    gradients_wp = tw.laplacian.face_gradients(mesh_wp.points, mesh_wp.indices, values_wp)
+
+    assert np.allclose(gradients_wp.numpy(), gradients_igl, rtol=1e-5, atol=1e-5)
+
+    # The identity that defines a piecewise-linear gradient, independent of either library.
+    edges_np = vertices_np[faces_np[:, 1]] - vertices_np[faces_np[:, 0]]
+    differences_np = values_np[faces_np[:, 1]] - values_np[faces_np[:, 0]]
+    assert np.allclose(
+        np.einsum("ij,ij->i", gradients_wp.numpy(), edges_np), differences_np, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
+def test_face_gradients_of_a_constant_field_is_zero(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """A constant field has no gradient, and a degenerate face has none either."""
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = int(mesh_wp.points.shape[0])
+    constant_wp = wp.array(
+        np.full(n_vertices, 3.25, dtype=np.float64), dtype=wp.float64, device=mesh_wp.device
+    )
+    gradients_wp = tw.laplacian.face_gradients(mesh_wp.points, mesh_wp.indices, constant_wp)
+    assert np.allclose(gradients_wp.numpy(), 0.0, atol=1e-9)
+
+
+def test_face_gradients_precomputed_face_data(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """Passing the face normals and areas must not change the answer -- only skip recomputing."""
+    _mesh_tm, mesh_wp = half_torus
+    values_wp = wp.array(
+        np.ascontiguousarray(mesh_wp.points.numpy()[:, 2], dtype=np.float64),
+        dtype=wp.float64,
+        device=mesh_wp.device,
+    )
+    normals_wp, areas_wp = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
+
+    derived = tw.laplacian.face_gradients(mesh_wp.points, mesh_wp.indices, values_wp)
+    supplied = tw.laplacian.face_gradients(
+        mesh_wp.points, mesh_wp.indices, values_wp, face_normals=normals_wp, face_areas=areas_wp
+    )
+    assert np.array_equal(derived.numpy(), supplied.numpy())
+
+
+def test_face_gradients_empty(device: str) -> None:
+    faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
+    vertices_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    values_wp = wp.array(np.array([], dtype=np.float64), dtype=wp.float64, device=device)
+    assert tw.laplacian.face_gradients(vertices_wp, faces_wp, values_wp).shape == (0,)

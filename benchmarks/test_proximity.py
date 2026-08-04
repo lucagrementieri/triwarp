@@ -1,7 +1,8 @@
 """
 Benchmarks for ``triwarp.proximity`` hot paths.
 
-Covers winding number, signed distance, AABB bounds, tangent spheres and geodesic-ball queries.
+Covers winding number, signed distance, tangent spheres and geodesic-ball queries. The AABB
+reduction moved to [`test_bounds.py`](test_bounds.py), where ``triwarp.bounds`` lives.
 ``winding_number`` is O(n_queries x n_faces) even in the tiled variant, so ``lucy`` is skipped;
 the pinned serial (``tiled=False``) path is additionally capped at ``bunny`` because one thread
 per query walking every face takes minutes beyond that.
@@ -11,12 +12,34 @@ inside/outside question from solid angle, but the first accumulates it exactly o
 the second lets Warp's BVH traversal approximate it and keeps only the sign. The gap between them is
 the cost of needing the winding *value* rather than just its sign.
 
-Only ``aabb_bounds`` has an open3d equivalent (``get_axis_aligned_bounding_box``). Open3D has no
+Open3D has no equivalent for anything in this module: it has no
 generalized winding number — its inside/outside test is raycasting-based
 (``RaycastingScene.compute_occupancy``), a different algorithm answering a coarser question — and no
 tangent-sphere, local-thickness or geodesic-ball query at all.
 
-**pymeshlab** is the first reference of any kind for ``signed_distance_on_mesh``:
+``signed_distance_on_mesh`` has **two** references, and they are the only two that exist: libigl's
+``igl.signed_distance``, whose ``sign_type`` axis maps onto triwarp's ``sign_mode`` one-for-one, and
+pymeshlab's, whose sign rule is a third algorithm and therefore appears once. See
+``test_signed_distance_on_mesh`` for the igl mapping and its numbers.
+
+**One thing libigl's signed distance does that no assert may ignore:** for both winding-based sign
+types it returns ``(1 - 2w) * d`` rather than ``sign(1 - 2w) * d``, with ``w`` the *continuous*
+winding number. So its magnitude is only ``|d|`` where ``w`` is exactly 0 or 1, and near the surface
+it is scaled down — measured on ``bunny_decimated``, ``|S|`` deviates from the pseudonormal type's
+by **2.7e-2 of the bbox diagonal** for both ``WINDING_NUMBER`` and ``FAST_WINDING_NUMBER``, while
+the pseudonormal type agrees with triwarp to **8e-8**. That is why the parity oracle in
+``tests/test_proximity.py`` is the pseudonormal type and why the winding row here is a *cost*
+comparison only.
+
+**And the Barnes-Hut approximation does pay**, which is worth recording because a 5 000-query probe
+had suggested otherwise. At this module's 10 000 queries on ``bunny``, ``igl.fast_winding_number``
+is **76.5 ms against ``igl.winding_number``'s 272.5** (25.1 against 65.5 on ``bunny_decimated``) —
+3.6x and 2.6x — for a maximum winding deviation of 0.004. It is not a row of its own because triwarp
+exposes no approximate-winding entry point to put on the other side of it (``winding_number`` is the
+exact sum; the Barnes-Hut walk exists only inside
+``signed_distance_on_mesh(sign_mode="winding")``), but it is the number to weigh a fast-winding port
+against.
+
 ``compute_scalar_by_distance_from_another_mesh_per_vertex(signeddist=True)`` (MeshLab's Distance
 from Reference Mesh) measures every vertex of one mesh against another, so the query points go in as
 a second, face-less mesh and the answer comes back on their vertex scalar attribute. Three things to
@@ -172,7 +195,7 @@ def _distance_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
 
 
 @pytest.mark.benchmark(group="signed_distance_on_mesh")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
 @pytest.mark.parametrize("sign_mode", ["parity", "winding"])
 def test_signed_distance_on_mesh(
     bench_case: BenchCase, sign_mode: Literal["parity", "winding"]
@@ -186,7 +209,35 @@ def test_signed_distance_on_mesh(
     intentional: it is part of what the mode costs. Both include that build because
     ``signed_distance_on_mesh`` constructs its own mesh (it takes vertex/face arrays, not a
     ``wp.Mesh``), so there is no way for a caller to hoist it.
+
+    **libigl is the only reference whose sign axis maps onto triwarp's**, which is why it appears
+    twice where pymeshlab appears once: ``SIGNED_DISTANCE_TYPE_PSEUDONORMAL`` against ``"parity"``
+    and ``SIGNED_DISTANCE_TYPE_FAST_WINDING_NUMBER`` against ``"winding"`` — the second is the same
+    Barnes-Hut family triwarp's mode is. Its AABB tree is built per call, as triwarp's ``wp.Mesh``
+    is, and it gets ``rounds=3`` like the pymeshlab row.
+
+    In-harness medians at 10 000 queries, igl rows run in isolation: **64 / 150 ms on
+    ``bunny_decimated`` and 394 / 520 on ``bunny``** against triwarp's 6.3 / 6.6 and 4.3 / 4.0 — so
+    10-100x, and note that **the mode ratio disagrees between the two sides**: igl's winding sign
+    costs 2.3x its pseudonormal one where triwarp's two modes are within 1.3x of each other,
+    because the solid-angle walk rides the BVH traversal triwarp is already doing. Read igl's
+    *medians* here, not its minima: the pseudonormal row spreads 225-399 ms on ``bunny``.
     """
+    if bench_case.kind == "igl":
+        skip_larger_than(bench_case, "bunny", "igl rebuilds a single-threaded AABB tree per call")
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        points_np = _query_points_np(bench_case)
+        sign_type = (
+            igl.SIGNED_DISTANCE_TYPE_PSEUDONORMAL
+            if sign_mode == "parity"
+            else igl.SIGNED_DISTANCE_TYPE_FAST_WINDING_NUMBER
+        )
+        distance_igl, _, _, _ = bench_case.run(
+            lambda: igl.signed_distance(points_np, vertices_np, faces_np, sign_type), rounds=3
+        )
+        assert distance_igl.shape == (_N_QUERIES,)
+        return
+
     if bench_case.kind == "pymeshlab":
         if sign_mode != "parity":
             pytest.skip("MeshLab signs by the closest-point normal: a third mode, so one row only")
@@ -207,32 +258,6 @@ def test_signed_distance_on_mesh(
         lambda: tw.proximity.signed_distance_on_mesh(vertices, faces, points, sign_mode=sign_mode)
     )
     assert distance.shape == (_N_QUERIES,)
-
-
-@pytest.mark.benchmark(group="aabb_bounds")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
-def test_aabb_bounds(bench_case: BenchCase) -> None:
-    """
-    A min/max reduce over the vertices, and the module's floor row.
-
-    Below roughly ``10 ** 3`` vertices this reports the ~340 µs wrapper floor rather than the
-    reduction (see ``test_creation::test_box``), so the small end of the axis loses to a NumPy
-    ``min``/``max`` pair by orders of magnitude and the large end wins. The row is here for the
-    crossover; neither endpoint means anything on its own.
-    """
-    if bench_case.kind == "triwarp":
-        vertices = bench_case.vertices_wp
-        lower, upper = bench_case.run(lambda: tw.bounds.aabb_bounds(vertices))
-        assert lower[0] <= upper[0]
-    elif bench_case.kind == "trimesh":
-        # what an uncached ``trimesh.Trimesh.bounds`` computes: numpy min/max per axis
-        vertices = bench_case.vertices_np
-        result = bench_case.run(lambda: np.vstack((vertices.min(axis=0), vertices.max(axis=0))))
-        assert result.shape == (2, 3)
-    else:  # open3d's own bound reduction over the same vertices
-        mesh_o3d = bench_case.mesh_o3d
-        box_o3d = bench_case.run(mesh_o3d.get_axis_aligned_bounding_box)
-        assert box_o3d.get_min_bound()[0] <= box_o3d.get_max_bound()[0]
 
 
 @pytest.mark.benchmark(group="max_tangent_sphere_reach")

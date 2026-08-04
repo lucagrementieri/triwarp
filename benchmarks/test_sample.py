@@ -1,5 +1,5 @@
 """
-Benchmarks for ``triwarp.sample.sample_surface_blue_noise`` (parallel dart throwing).
+Benchmarks for ``triwarp.sample``: uniform surface sampling and blue-noise selection.
 
 The radius targets ~2,000 samples (same helper formula as ``tests/test_sample.py``). Capped at
 ``bunny``.
@@ -25,25 +25,42 @@ starts from a dense uniform sample and eliminates points down to the target (Yuk
 elimination), where triwarp reduces a dense pool by randomized priority; the comparison is of
 cost per sample delivered, not of identical work.
 
-**pymeshlab**'s ``generate_sampling_poisson_disk`` is the only reference that can be given the
-*radius* rather than a count: ``radius=PureValue(r)`` overrides ``samplenum`` outright, so both
-sides receive the identical parameter and the radius sweep this group is built around maps across
-libraries for the first time. Its algorithm is Corsini et al.'s *hierarchical* dart throwing, which
-is neither triwarp's flat-grid parallel dart throwing nor open3d's sample elimination -- three
-implementations, three schemes, one parametrization. It is also the closest of the three in output:
-same exact minimum distance, coverage within 3 %. It pushes the sample cloud onto the MeshSet as
-a new mesh, so the set is rebuilt per round.
+**pymeshlab**'s ``generate_sampling_poisson_disk`` and **libigl**'s ``igl.blue_noise`` are the two
+references that can be given the *radius* rather than a count (``radius=PureValue(r)`` overrides
+MeshLab's ``samplenum`` outright; igl's third positional argument *is* ``r``), so they receive the
+identical parameter and the radius sweep this group is built around maps across libraries. MeshLab's
+algorithm is Corsini et al.'s *hierarchical* dart throwing and igl's is Bridson active-list dart
+throwing -- **four implementations, four schemes, one parametrization**, with triwarp's randomized-
+priority selection and open3d's sample elimination as the other two. MeshLab is the closest of the
+three in output: same exact minimum distance, coverage within 3 %. It pushes the sample cloud onto
+the MeshSet as a new mesh, so the set is rebuilt per round.
 
-MeshLab's uniform ``generate_sampling_montecarlo`` is deliberately **not** a row here: it is not a
-blue-noise sampler at all (no minimum-distance guarantee), so it would be a floor rather than a
-comparison. ``generate_sampling_volumetric`` and ``generate_simplified_point_cloud`` are likewise
-different problems.
+**libigl is where this port came from, and the row inverted when the algorithm changed.** The
+``30x`` oversampling factor ``sample_surface_blue_noise`` draws its pool at is
+``igl::blue_noise``'s, and while triwarp ran Bridson too, igl was *faster*: 78.4 ms against 98.5 on
+``bunny`` at ``4 * mean_edge``.
+After ``ae26e8f`` the same pair reads **18.0 ms against 73.8** — and the margin
+**grows as the radius falls** (4.1x at ``4 * mean_edge``, 5.4x at the 2k radius, 9.0x at half of it,
+24x on ``bunny_decimated`` at half), because igl's serial cost is per accepted sample where
+triwarp's is per round. igl also returns 2-7% *fewer* samples at the same radius, so the ratios are
+a lower bound per sample delivered — and its *quality* is the best of the three references
+(``tests/test_sample.py`` measures its coverage gap at 1.073 r against triwarp's 1.103 and MeshLab's
+1.112), so this is not speed bought with quality on either side. It gets ``rounds=3``: 278 ms at the
+2k radius on ``bunny`` and 1 196 at half of it.
+
+MeshLab's uniform ``generate_sampling_montecarlo`` is deliberately **not** a row in ``blue_noise``:
+it is not a blue-noise sampler at all (no minimum-distance guarantee), so it would be a floor
+rather than a comparison. It belongs to the same question as the ``sample_surface`` group below,
+where it is not a row either -- for a different reason, given there.
+``generate_sampling_volumetric`` and ``generate_simplified_point_cloud`` are likewise different
+problems.
 """
 
 from __future__ import annotations
 
 import math
 
+import igl
 import pymeshlab as ml
 import pytest
 import trimesh as tm
@@ -59,6 +76,10 @@ _SEED = 11
 # knob -- the output count is *derived* from the radius, never requested.
 _RADIUS_SCALES = [1.0, 0.5]
 
+# Sample counts for the uniform group: a decade apart, since the cost is linear in the count and
+# the mesh contributes only the one-off area CDF.
+_UNIFORM_COUNTS = [10_000, 100_000]
+
 _radius_cache: dict[str, float] = {}
 
 
@@ -72,8 +93,62 @@ def _radius_for_mesh(bench_case: BenchCase) -> float:
     return _radius_cache[bench_case.mesh_name]
 
 
+@pytest.mark.benchmark(group="sample_surface")
+@pytest.mark.benchlibs("triwarp", "igl", "trimesh")
+@pytest.mark.parametrize("count", _UNIFORM_COUNTS, ids=["n10k", "n100k"])
+def test_sample_surface(bench_case: BenchCase, count: int) -> None:
+    """
+    Uniform area-weighted surface sampling: the dense pool every blue-noise sampler starts from.
+
+    All three libraries take the same two parameters (a count and a seed) and return the same two
+    things (positions and the face index each sample landed on), so this is the module's one group
+    where nothing has to be matched up -- ``igl.random_points_on_mesh(n, V, F, seed)`` and
+    ``tm.sample.sample_surface(mesh, n, seed=)`` are the same call as triwarp's.
+
+    The axis is the count, and it separates the two sides cleanly: **the references are linear in it
+    and triwarp is flat.** Measured on ``bunny``, medians: igl 21.1 -> 55.2 ms and trimesh
+    25.8 -> 55.0 from 10k to 100k, against triwarp's **260.8 -> 252.8 µs** — a decade more samples
+    for no more time, because at these counts triwarp's row is the two launches and the area CDF
+    rather than the sampling. So read this group as 80-200x, and read the *slope* as the statement:
+    the crossover where triwarp's per-sample cost becomes visible is above 100 000 samples.
+
+    open3d's ``sample_points_uniformly`` and MeshLab's ``generate_sampling_montecarlo`` are the same
+    operation but return a bare point cloud with no face index, so they would need a closest-point
+    decode before they could be asserted against the area law -- a transform on the *reference* to
+    make it comparable, which is what the two references above avoid.
+
+    trimesh rebuilds its ``tm.Trimesh`` inside the timed callable, as the other trimesh rows in the
+    suite do, because the area CDF is cached on the mesh object and reusing it would time a
+    lookup.
+    """
+    skip_larger_than(bench_case, "bunny", "the CPU references are single-threaded per sample")
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        points, face_index = bench_case.run(
+            lambda: tw.sample.sample_surface(vertices, faces, count, seed=_SEED)
+        )
+        assert points.shape == (count,)
+        assert face_index.shape == (count,)
+    elif bench_case.kind == "igl":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        _barycentric, face_index_igl, points_igl = bench_case.run(
+            lambda: igl.random_points_on_mesh(count, vertices_np, faces_np, _SEED)
+        )
+        assert points_igl.shape == (count, 3)
+        assert face_index_igl.shape == (count,)
+    else:
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        points_tm, face_index_tm = bench_case.run(
+            lambda: tm.sample.sample_surface(
+                tm.Trimesh(vertices_np, faces_np, process=False), count, seed=_SEED
+            )
+        )
+        assert points_tm.shape == (count, 3)
+        assert face_index_tm.shape == (count,)
+
+
 @pytest.mark.benchmark(group="blue_noise")
-@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "igl", "open3d", "pymeshlab")
 @pytest.mark.parametrize("radius_scale", _RADIUS_SCALES, ids=["r1", "rhalf"])
 def test_sample_surface_blue_noise(bench_case: BenchCase, radius_scale: float) -> None:
     """
@@ -83,10 +158,24 @@ def test_sample_surface_blue_noise(bench_case: BenchCase, radius_scale: float) -
     superlinear step -- and it is now a *mild* one (44 -> 54 ms on ``bunny_decimated``), because the
     round count no longer grows with it. open3d is parametrized by *count* rather than radius, so
     its two rows are matched to the sample count each radius implies rather than to the radius.
+
+    **libigl is the reference this port was written from** -- ``sample_surface_blue_noise`` still
+    sizes its pool at the ``30x`` oversampling factor ``igl::blue_noise`` uses -- and it takes the
+    radius directly, so it and MeshLab both receive triwarp's own parameter. It is Bridson
+    active-list dart throwing, which is what triwarp *was* before ``ae26e8f``: four schemes across
+    four libraries on one parametrization.
     """
     skip_larger_than(bench_case, "bunny")
     # Halving the radius quadruples the samples that fit (area / radius^2).
     target = int(_TARGET_SAMPLES / (radius_scale * radius_scale))
+    if bench_case.kind == "igl":
+        radius = radius_scale * _radius_for_mesh(bench_case)
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        _barycentric, _face_index, points_igl = bench_case.run(
+            lambda: igl.blue_noise(vertices_np, faces_np, radius), rounds=3
+        )
+        assert points_igl.shape[0] > 0
+        return
     if bench_case.kind == "pymeshlab":
         # MeshLab takes *either* a count or an explicit radius, so this is the one blue-noise
         # reference that can be matched to triwarp's actual parameter: ``radius=PureValue(r)``

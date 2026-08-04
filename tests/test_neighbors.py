@@ -1,7 +1,7 @@
 """
 Regression tests for ``triwarp.neighbors`` ball / k-nearest query APIs.
 
-Against SciPy ``KDTree`` (BVH and HashGrid backends).
+Against SciPy ``KDTree`` (BVH and HashGrid backends), and ``igl.knn`` as a second exact k-NN.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 from typing import Literal
 
+import igl
 import numpy as np
 import pytest
 import warp as wp
@@ -319,6 +320,48 @@ def test_query_nearest_row_buckets(device: str, backend: Literal["bvh", "hashgri
 
     assert np.array_equal(query_indices_wp.numpy(), np.asarray(query_indices_np))
     assert np.allclose(query_distances_wp.numpy(), query_distances_np, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
+@pytest.mark.parametrize("k", [1, 7, 64])
+@pytest.mark.parity("query_bvh_nearest_k1", "igl")
+@pytest.mark.parity("query_bvh_nearest_k7", "igl")
+@pytest.mark.parity("query_bvh_nearest_k64", "igl")
+@pytest.mark.parity("bvh_from_points", "igl")
+def test_query_nearest_matches_igl(device: str, backend: Literal["bvh", "hashgrid"], k: int):
+    """
+    Class A, against the second exact k-NN. Indices, element-wise, at the three benchmarked ``k``.
+
+    ``igl.knn`` returns ``(n_queries, k)`` ``int64`` neighbour indices sorted by distance -- the
+    same layout and the same order as ``KDTree``'s -- so this is a direct comparison and not a set
+    one. It is a genuinely independent implementation: an octree walk against triwarp's BVH / hash
+    grid and scipy's k-d tree, three different structures for one answer.
+
+    The ``bvh_from_points`` marker rides here for the reason the scipy one does: a structure build
+    has no output to compare, so it is validated through the query that consumes it -- and on the
+    igl side the octree is quite literally an argument to ``igl.knn``, passed as
+    ``*igl.octree(points)[:4]``.
+
+    The cloud is random in a box, so no two points tie in ``float32`` distance from a query and the
+    index comparison is exact.
+    """
+    rng = np.random.default_rng(11)
+    points = rng.random((300, 3)) * 5.0
+    queries = rng.random((40, 3)) * 5.0
+
+    points_wp = wp.array(
+        np.ascontiguousarray(points, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    queries_wp = wp.array(
+        np.ascontiguousarray(queries, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    query_nearest = (
+        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
+    )
+    query_indices_wp, _distances_wp = query_nearest(points_wp, queries_wp, k=k)
+    query_indices_igl = igl.knn(queries, points, k, *igl.octree(points)[:4])
+
+    assert np.array_equal(query_indices_wp.numpy().reshape(queries.shape[0], k), query_indices_igl)
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])

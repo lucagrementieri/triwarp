@@ -126,6 +126,33 @@ def test_face_quality_against_pymeshlab(
     assert np.allclose(quality_wp.numpy(), quality_pml, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parity("face_angles", "trimesh", "igl")
+def test_face_angles(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A on both references: ``(n_faces, 3)`` interior angles, element-wise, no transform.
+
+    All three libraries index the angle by the corner it sits at -- column ``j`` is the angle at
+    ``faces[f, j]`` -- so ``igl.internal_angles``, ``trimesh``'s ``face_angles`` property and
+    ``triangles.face_angles`` are directly comparable. That is worth pinning rather than assuming:
+    the natural alternative convention indexes an angle by the *edge* opposite it, which is a
+    cyclic shift of the row and would still pass a per-face sum check.
+
+    ``half_torus`` rather than ``icosahedron`` because every corner of an icosahedron's faces
+    carries the same angle, which is exactly the fixture a shifted row would survive.
+    """
+    mesh_tm, mesh_wp = half_torus
+    angles_igl = igl.internal_angles(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64), faces_igl(mesh_tm)
+    )
+
+    angles_wp = tw.triangles.face_angles(mesh_wp.points, mesh_wp.indices)
+
+    assert np.allclose(angles_wp.numpy(), mesh_tm.face_angles, rtol=1e-5, atol=1e-5)
+    assert np.allclose(angles_wp.numpy(), angles_igl, rtol=1e-5, atol=1e-5)
+    # The row is not merely a permutation: the angle in column j sits at vertex faces[f, j].
+    assert np.allclose(angles_wp.numpy().sum(axis=1), np.pi, rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.parity("face_quality", "igl")
 def test_face_quality_aspect_ratio_against_igl(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     """``aspect_ratio`` is circumradius over twice the inradius, which igl gives as two arrays."""
@@ -196,18 +223,38 @@ def test_barycentric_to_points(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
 
 
 @pytest.mark.parametrize("method", ["cramer", "cross"])
+@pytest.mark.parity("points_to_barycentric", "trimesh", "igl")
 def test_points_to_barycentric(hemisphere: tuple[tm.Trimesh, wp.Mesh], method: str):
+    """
+    Class A on both references, for both solver methods.
+
+    ``igl.barycentric_coordinates(P, A, B, C)`` takes the three corner arrays rather than a mesh, so
+    the only difference from a call convention standpoint is that the triangle soup is unpacked into
+    three ``(n, 3)`` blocks -- the values are compared with no transform at all.
+
+    The points are generated *from* barycentric weights, so each one lies exactly in its triangle's
+    plane and the coordinates are the ones that produced it; a solver that got the plane projection
+    wrong rather than the in-plane solve would still pass a "sums to one" check, which is why the
+    comparison is against two independent solvers instead.
+    """
     mesh_tm, mesh_wp = hemisphere
 
     barycentric_np = np.random.rand(mesh_tm.triangles.shape[0], 3)
     points_np = tm.triangles.barycentric_to_points(mesh_tm.triangles, barycentric_np)
     barycentric_tm = tm.triangles.points_to_barycentric(mesh_tm.triangles, points_np, method=method)
+    barycentric_igl = igl.barycentric_coordinates(
+        np.ascontiguousarray(points_np),
+        np.ascontiguousarray(mesh_tm.triangles[:, 0]),
+        np.ascontiguousarray(mesh_tm.triangles[:, 1]),
+        np.ascontiguousarray(mesh_tm.triangles[:, 2]),
+    )
 
     points_wp = wp.array(points_np, dtype=wp.vec3, device=mesh_wp.points.device)
     barycentric_wp = tw.triangles.points_to_barycentric(
         mesh_wp.points, mesh_wp.indices, points_wp, method=method
     )
     assert np.allclose(barycentric_wp.numpy(), barycentric_tm, rtol=1e-5, atol=1e-5)
+    assert np.allclose(barycentric_wp.numpy(), barycentric_igl, rtol=1e-5, atol=1e-5)
 
 
 def test_closest_point(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
@@ -290,3 +337,131 @@ def test_volume_empty(device: str):
     vertices = wp.zeros(1, dtype=wp.vec3, device=device)
     faces = wp.array([], dtype=wp.int32, device=device)
     assert tw.triangles.volume(vertices, faces) == 0.0
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("face_centroids", "igl")
+def test_face_centroids(request: pytest.FixtureRequest, mesh_name: str):
+    """
+    Class A: one barycentre per face, element-wise against ``igl.barycenter``.
+
+    The assert that matters beyond the comparison is the second one: the barycentre must lie *in*
+    its own triangle, which the barycentric coordinates ``(1/3, 1/3, 1/3)`` state exactly. A
+    function that returned the mesh centroid broadcast, or the first corner, would match neither.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    centroids_igl = igl.barycenter(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64), faces_igl(mesh_tm)
+    )
+
+    centroids_wp = tw.triangles.face_centroids(mesh_wp.points, mesh_wp.indices)
+
+    assert np.allclose(centroids_wp.numpy(), centroids_igl, rtol=1e-5, atol=1e-5)
+    barycentric_wp = tw.triangles.points_to_barycentric(
+        mesh_wp.points, mesh_wp.indices, centroids_wp
+    )
+    assert np.allclose(barycentric_wp.numpy(), 1.0 / 3.0, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+@pytest.mark.parity("moments", "igl", "trimesh")
+def test_moments(request: pytest.FixtureRequest, mesh_name: str):
+    """
+    Class B on igl (its first moment is un-normalised), class A on trimesh.
+
+    ``igl.moments`` returns ``(m0, m1, m2)`` where ``m1`` is the centre of mass **times the mass**,
+    so the named transform is ``m1 / m0``. ``m2`` needs no transform: it is already referred to the
+    centre of mass rather than the origin, which was verified against a *translated* mesh rather
+    than assumed -- on a mesh centred at the origin the two references coincide and the check would
+    be vacuous.
+
+    trimesh answers all three too (``volume`` / ``center_mass`` / ``moment_inertia``), so this is a
+    three-way comparison of the same integrals.
+
+    The inertia tolerance is relative to the tensor's own scale: triwarp integrates ``float32``
+    positions in ``float64``, so the deviation tracks the positions' precision (measured 3.5e-8
+    relative on ``icosahedron``, and 3.6e-15 on an axis-aligned box whose coordinates are exact in
+    ``float32``).
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
+
+    volume_igl, first_moment_igl, inertia_igl = igl.moments(vertices_np, faces_igl(mesh_tm))
+    volume_wp, center_wp, inertia_wp = tw.triangles.moments(mesh_wp.points, mesh_wp.indices)
+
+    assert np.isclose(volume_wp, volume_igl, rtol=1e-5)
+    assert np.isclose(volume_wp, mesh_tm.volume, rtol=1e-5)
+    assert np.allclose(
+        [center_wp.x, center_wp.y, center_wp.z],
+        np.asarray(first_moment_igl) / volume_igl,
+        rtol=1e-4,
+        atol=1e-5,
+    )
+    assert np.allclose(
+        [center_wp.x, center_wp.y, center_wp.z], mesh_tm.center_mass, rtol=1e-4, atol=1e-5
+    )
+    scale = float(np.abs(np.asarray(inertia_igl)).max())
+    assert np.abs(inertia_wp - np.asarray(inertia_igl)).max() < 1e-5 * scale
+    assert np.abs(inertia_wp - mesh_tm.moment_inertia).max() < 1e-5 * scale
+
+
+def test_moments_center_of_mass_differs_from_the_surface_centroid(
+    half_torus: tuple[tm.Trimesh, wp.Mesh],
+):
+    """
+    The two centres are different quantities, which is why both functions exist.
+
+    ``centroid`` is the area-weighted centre of the *shell* and ``moments``' is the volume centre of
+    the solid. On a closed uniform sphere they coincide; on anything asymmetric they do not, and
+    asserting they differ is what keeps ``moments`` from being a synonym.
+    """
+    _mesh_tm, mesh_wp = half_torus
+    surface_centroid = tw.triangles.centroid(mesh_wp.points, mesh_wp.indices)
+    _volume, center_of_mass, _inertia = tw.triangles.moments(mesh_wp.points, mesh_wp.indices)
+    assert not np.allclose(
+        [surface_centroid.x, surface_centroid.y, surface_centroid.z],
+        [center_of_mass.x, center_of_mass.y, center_of_mass.z],
+        atol=1e-3,
+    )
+
+
+def test_moments_translation_shifts_only_the_center(device: str):
+    """
+    Translation moves the centre of mass and leaves the volume and inertia tensor alone.
+
+    The parallel-axis shift is what makes that true, and getting it wrong is invisible on any mesh
+    centred at the origin -- which is why this fixture is deliberately offset.
+    """
+    box_tm = tm.creation.box(extents=[1.0, 2.0, 3.0])
+    offset_np = np.array([1.5, -2.0, 0.5])
+
+    def moments_of(vertices_np: np.ndarray):
+        vertices_wp = wp.array(
+            np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device
+        )
+        faces_wp = wp.array(
+            np.ascontiguousarray(box_tm.faces.reshape(-1), dtype=np.int32),
+            dtype=wp.int32,
+            device=device,
+        )
+        return tw.triangles.moments(vertices_wp, faces_wp)
+
+    volume_a, center_a, inertia_a = moments_of(box_tm.vertices)
+    volume_b, center_b, inertia_b = moments_of(box_tm.vertices + offset_np)
+
+    assert np.isclose(volume_a, volume_b, rtol=1e-5)
+    assert np.allclose(
+        [center_b.x, center_b.y, center_b.z],
+        np.array([center_a.x, center_a.y, center_a.z]) + offset_np,
+        atol=1e-5,
+    )
+    assert np.abs(inertia_a - inertia_b).max() < 1e-4 * float(np.abs(inertia_a).max())
+
+
+def test_moments_empty(device: str):
+    faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
+    vertices_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    volume, center, inertia = tw.triangles.moments(vertices_wp, faces_wp)
+    assert volume == 0.0
+    assert np.isnan([center.x, center.y, center.z]).all()
+    assert np.array_equal(inertia, np.zeros((3, 3)))

@@ -122,17 +122,59 @@ def test_is_vertex_manifold(bench_case: BenchCase) -> None:
         assert mask_igl.shape == (bench_case.n_vertices,)
 
 
+@pytest.mark.benchmark(group="is_edge_manifold")
+@pytest.mark.benchaxis("valence")
+@pytest.mark.benchlibs("triwarp", "igl")
+def test_is_edge_manifold(bench_case: BenchCase) -> None:
+    """
+    The cheaper manifoldness predicate: an edge sort and a per-edge count, no one-ring components.
+
+    It sits next to ``is_vertex_manifold`` on the same axis deliberately -- edge-manifoldness is
+    ``O(3F)`` counting where vertex-manifoldness needs a connected-components pass *per vertex*, so
+    the pair prices what the stronger predicate costs. A mesh can be edge-manifold and not
+    vertex-manifold (two cones joined at a tip), which is why both exist.
+
+    ``igl.is_edge_manifold`` returns ``(verdict, per_corner_mask, ...)`` -- the reduced ``bool``
+    first, matching triwarp's return, with the per-corner detail behind it. It has no
+    ``allow_boundary_edges`` switch (it always allows them), so only triwarp's default is timed.
+    """
+    if bench_case.kind == "triwarp":
+        faces = bench_case.faces_wp
+        assert bench_case.run(lambda: tw.validation.is_edge_manifold(faces)) in (True, False)
+        return
+    faces_np = np.ascontiguousarray(bench_case.faces_np, dtype=np.int64)
+    assert bool(bench_case.run(lambda: igl.is_edge_manifold(faces_np))[0]) in (True, False)
+
+
 @pytest.mark.benchmark(group="face_orientation_bits")
 @pytest.mark.benchaxis("diameter")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl")
 def test_face_orientation_bits(bench_case: BenchCase) -> None:
-    """Z2 orientation bits as a parity union-find: three launches, so depth costs nothing."""
+    """
+    Z2 orientation bits as a parity union-find: three launches, so depth costs nothing.
+
+    ``igl.bfs_orient`` is the reference that does the same work by a different route -- a serial
+    breadth-first walk of the face-adjacency graph. Being a traversal, it is the row where this
+    group's ``diameter`` axis should show something on the reference side and nothing on triwarp's;
+    that contrast is the point of putting it here.
+
+    **Its second return is the per-face component id, not the flip mask.** ``bfs_orient`` returns
+    ``(FF, C)``: the reoriented face table and ``C``, which is all zeros on a connected mesh. The
+    flips are recoverable only by comparing ``FF`` against ``F`` row by row, which is what the
+    parity test does; reading ``C`` as the mask would silently compare triwarp's bits against a
+    constant.
+    """
     if bench_case.kind == "triwarp":
         faces = bench_case.faces_wp
         _bits, _edges, _seeds, n_components = bench_case.run(
             lambda: tw.validation.face_orientation_bits(faces)
         )
         assert n_components >= 1
+    elif bench_case.kind == "igl":
+        faces_np = np.ascontiguousarray(bench_case.faces_np, dtype=np.int64)
+        faces_oriented_igl, components_igl = bench_case.run(lambda: igl.bfs_orient(faces_np))
+        assert faces_oriented_igl.shape == (bench_case.n_faces, 3)
+        assert components_igl.ravel().shape == (bench_case.n_faces,)
     else:  # trimesh's winding fix walks the same adjacency graph; rebuild inside (it mutates)
         vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
 

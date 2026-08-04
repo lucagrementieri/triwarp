@@ -16,41 +16,8 @@ import trimesh.proximity as tm_proximity
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab, trimesh_to_warp
+from tests.conversions import trimesh_to_pymeshlab, trimesh_to_warp
 from triwarp.constants import TOLERANCE_MERGE
-
-
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "hemisphere", "half_torus"])
-@pytest.mark.parity("aabb_bounds", "trimesh", "open3d")
-def test_aabb_bounds_matches_trimesh_and_open3d(
-    request: pytest.FixtureRequest, mesh_name: str
-) -> None:
-    """
-    The axis-aligned bounding box against both references, which is class A and exact.
-
-    Trivial to compute and trivial to get subtly wrong -- a reduction that seeds its accumulator at
-    zero rather than at +/-inf returns a box clamped to the origin, which is correct for any mesh
-    straddling it and wrong for every mesh that does not. Every fixture here is translated away from
-    the origin, so that bug would show.
-
-    The benchmark's trimesh row is the uncached ``vstack((v.min(0), v.max(0)))`` formula behind
-    ``Trimesh.bounds`` rather than the cached property, and that formula is what is compared here.
-    """
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    lower_wp, upper_wp = tw.bounds.aabb_bounds(mesh_wp.points)
-    bounds_wp = np.stack(
-        [
-            np.array([lower_wp.x, lower_wp.y, lower_wp.z]),
-            np.array([upper_wp.x, upper_wp.y, upper_wp.z]),
-        ]
-    )
-
-    bounds_np = np.vstack((mesh_tm.vertices.min(axis=0), mesh_tm.vertices.max(axis=0)))
-    assert np.allclose(bounds_wp, bounds_np, rtol=1e-5, atol=1e-5)
-
-    box_o3d = trimesh_to_open3d(mesh_tm).get_axis_aligned_bounding_box()
-    bounds_o3d = np.stack([box_o3d.get_min_bound(), box_o3d.get_max_bound()])
-    assert np.allclose(bounds_wp, bounds_o3d, rtol=1e-5, atol=1e-5)
 
 
 def test_query_mesh_aabb_bounds_with_offsets(device: str) -> None:
@@ -287,6 +254,49 @@ def test_signed_distance_on_mesh_matches_pymeshlab(
 
     assert np.array_equal(np.sign(signed_wp.numpy()), np.sign(signed_pml))
     assert np.allclose(signed_wp.numpy(), signed_pml, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "torus"])
+@pytest.mark.parity("signed_distance_on_mesh", "igl")
+def test_signed_distance_on_mesh_matches_igl(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B (a named sign-rule choice): a direct ``allclose`` against the pseudonormal sign type.
+
+    igl's angle-weighted pseudonormal sign is a *fourth* rule beside triwarp's parity rays,
+    trimesh's and MeshLab's closest-point normal, and on these three watertight fixtures it agrees
+    with triwarp exactly -- so the value comparison needs no transform.
+
+    The named choice is *which* ``sign_type`` is the oracle, and it is not free: for both
+    ``WINDING_NUMBER`` and ``FAST_WINDING_NUMBER`` igl returns ``(1 - 2 * w) * d`` with ``w`` the
+    **continuous** winding number, not ``sign(1 - 2 * w) * d``. Its magnitude is therefore ``|d|``
+    only where ``w`` is exactly 0 or 1 and is scaled down near the surface -- measured on
+    ``bunny_decimated``, ``|S|`` departs from the pseudonormal type's by 2.7e-2 of the bbox diagonal
+    where the pseudonormal type agrees with triwarp to 8e-8. So the winding types cannot be compared
+    on value at all, and the benchmark's ``sign_mode="winding"`` igl row is a cost comparison only.
+
+    ``cave_cube`` and ``torus`` are here for the same reason they are in the pymeshlab test: a
+    normal-based sign rule is supposed to be unreliable in a cavity and in a genus-1 hole.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    rng = np.random.default_rng(4)
+    points_np = mesh_tm.bounds[0] + rng.random((400, 3)) * (mesh_tm.bounds[1] - mesh_tm.bounds[0])
+
+    signed_igl, _, _, _ = igl.signed_distance(
+        np.ascontiguousarray(points_np),
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),
+        np.ascontiguousarray(mesh_tm.faces, dtype=np.int64),
+        igl.SIGNED_DISTANCE_TYPE_PSEUDONORMAL,
+    )
+
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    signed_wp = tw.proximity.signed_distance_on_mesh(mesh_wp.points, mesh_wp.indices, points_wp)
+
+    assert np.array_equal(np.sign(signed_wp.numpy()), np.sign(signed_igl))
+    assert np.allclose(signed_wp.numpy(), signed_igl, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])

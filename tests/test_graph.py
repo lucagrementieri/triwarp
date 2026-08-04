@@ -12,6 +12,7 @@ from scipy.spatial import cKDTree
 
 import triwarp as tw
 import triwarp.typing as twt
+from tests.comparisons import same_partition
 from tests.conversions import open3d_to_trimesh, trimesh_to_open3d, trimesh_to_pymeshlab
 
 
@@ -236,7 +237,7 @@ def test_connected_component_labels_random(device: str) -> None:
     labels_wp = tw.graph.connected_component_labels_from_edges(edges_wp, node_count=node_count)
     labels_np = _scipy_component_labels(edges_np, node_count)
 
-    assert _same_partition(labels_wp.numpy(), labels_np)
+    assert same_partition(labels_wp.numpy(), labels_np)
 
 
 @pytest.mark.parametrize("face_ratio", [0.0, 0.1, 0.5])
@@ -311,7 +312,7 @@ def test_connected_component_labels_path_graph(device: str) -> None:
     edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
     labels_wp = tw.graph.connected_component_labels_from_edges(edges_wp, node_count=n)
     labels_exp = _scipy_component_labels(edges_np, n)
-    assert _same_partition(labels_wp.numpy(), labels_exp)
+    assert same_partition(labels_wp.numpy(), labels_exp)
 
 
 def test_connected_component_labels_star_graph(device: str) -> None:
@@ -322,7 +323,7 @@ def test_connected_component_labels_star_graph(device: str) -> None:
     edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
     labels_wp = tw.graph.connected_component_labels_from_edges(edges_wp, node_count=n)
     labels_exp = _scipy_component_labels(edges_np, n)
-    assert _same_partition(labels_wp.numpy(), labels_exp)
+    assert same_partition(labels_wp.numpy(), labels_exp)
 
 
 def test_connected_component_parity_random(device: str) -> None:
@@ -342,7 +343,7 @@ def test_connected_component_parity_random(device: str) -> None:
 
     parity_np = parity_wp.numpy()
     assert np.array_equal(parity_np[a_np] ^ parity_np[b_np], signs_np)
-    assert _same_partition(labels_wp.numpy(), _scipy_component_labels(edges_np, n))
+    assert same_partition(labels_wp.numpy(), _scipy_component_labels(edges_np, n))
     # Each component representative anchors its own potential at 0.
     labels_np = labels_wp.numpy()
     assert np.array_equal(parity_np[np.unique(labels_np)], np.zeros(len(np.unique(labels_np))))
@@ -412,7 +413,7 @@ def test_face_connected_component_labels(request: pytest.FixtureRequest) -> None
     face_labels_wp = tw.adjacency.face_connected_component_labels(concat_faces_wp)
     n_faces = concat_tm.faces.shape[0]
     face_labels_tm = _scipy_component_labels(concat_tm.face_adjacency.astype(np.int32), n_faces)
-    assert _same_partition(face_labels_wp.numpy(), face_labels_tm)
+    assert same_partition(face_labels_wp.numpy(), face_labels_tm)
 
 
 def _scipy_component_labels(edges: np.ndarray, node_count: int) -> np.ndarray:
@@ -427,12 +428,6 @@ def _scipy_component_labels(edges: np.ndarray, node_count: int) -> np.ndarray:
     matrix = matrix + matrix.T
     _n_comp, labels = csgraph.connected_components(matrix, directed=False)
     return labels.astype(np.int32)
-
-
-def _same_partition(a: np.ndarray, b: np.ndarray) -> bool:
-    same_a = a[:, None] == a[None, :]
-    same_b = b[:, None] == b[None, :]
-    return bool(np.array_equal(same_a, same_b))
 
 
 @pytest.mark.parity("bfs", "scipy")

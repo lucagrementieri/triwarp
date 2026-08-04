@@ -43,6 +43,7 @@ from __future__ import annotations
 
 from typing import cast
 
+import igl
 import numpy as np
 import open3d as o3d
 import pymeshlab as ml
@@ -223,17 +224,33 @@ def test_hausdorff_points_to_points(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="chamfer_points_to_mesh")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "igl")
 def test_chamfer_points_to_mesh(bench_case: BenchCase) -> None:
     """
     Cloud-to-surface Chamfer: an exact mesh query forward, a ``k=1`` cloud search backward.
 
-    triwarp-only. open3d's closest-point-on-surface equivalent lives in the *tensor* API
+    open3d's closest-point-on-surface equivalent lives in the *tensor* API
     (``o3d.t.geometry.RaycastingScene.compute_distance``), which is a different implementation from
     the legacy ``o3d.geometry`` baselines the rest of this suite uses; mixing the two in one table
     would compare implementations, not libraries.
+
+    **libigl's row is the forward half only**, and is a *lower* bound rather than a race:
+    ``igl.point_mesh_squared_distance`` is exactly the cloud-to-surface query -- it is already the
+    oracle for this group in ``tests/test_distance.py`` -- but it has no cloud-to-cloud counterpart,
+    so the backward ``k=1`` search triwarp also performs has no igl equivalent to pair it with. Read
+    the row as "what the expensive half costs on one core"; the same partial-reference convention as
+    ``igl.doublearea`` in [`test_triangles.py`](test_triangles.py).
     """
     skip_larger_than(bench_case, "dragon")
+    if bench_case.kind == "igl":
+        skip_larger_than(bench_case, "bunny", "the reference builds its AABB tree per call")
+        cloud_np = _clouds_np(bench_case)[1]
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        squared_igl, _face_igl, _closest_igl = bench_case.run(
+            lambda: igl.point_mesh_squared_distance(cloud_np, vertices_np, faces_np), rounds=3
+        )
+        assert squared_igl.shape[0] == cloud_np.shape[0]
+        return
     cloud = _clouds_wp(bench_case)[1]
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     chamfer = bench_case.run(lambda: tw.distance.chamfer_points_to_mesh(cloud, vertices, faces))

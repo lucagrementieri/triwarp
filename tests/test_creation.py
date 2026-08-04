@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import open3d as o3d
 import pymeshlab as ml
@@ -342,10 +343,41 @@ def test_box_invalid(device: str) -> None:
         tw.creation.box(extents=np.zeros(4), device=device)
 
 
+@pytest.mark.parity("platonic_solids", "trimesh", "igl")
 def test_icosahedron(device: str) -> None:
-    _assert_same_vertices_and_faces(
-        *tw.creation.icosahedron(device=device), tm.creation.icosahedron()
-    )
+    """
+    Class A against trimesh; class B against igl, whose icosahedron sits in a **rotated frame**.
+
+    ``igl.icosahedron`` is libigl's only Platonic generator, and it is the same solid in a different
+    orientation: triwarp and trimesh use the ``(0, ±1, ±φ)`` form (every coordinate ±0.851 or 0)
+    where igl puts a vertex at the pole (coordinates ±0.894 / ±0.447 / ±1). Positions therefore
+    cannot be matched at all, and a comparison that tried would be reporting the frame.
+
+    The named transform is *compare the rigid-motion invariants*: counts, unit circumradius, the
+    single edge length shared by all 30 edges, surface area and enclosed volume. Together those pin
+    the solid uniquely up to a rotation, which is exactly the equivalence igl's output sits in. A
+    wrong vertex table -- the bug class this excludes -- moves the edge-length spread off zero or
+    the area off its exact value, and both are asserted.
+    """
+    vertices_wp, faces_wp = tw.creation.icosahedron(device=device)
+    _assert_same_vertices_and_faces(vertices_wp, faces_wp, tm.creation.icosahedron())
+
+    vertices_igl, faces_igl = igl.icosahedron()
+    mesh_igl = tm.Trimesh(vertices_igl, faces_igl, process=False)
+    mesh_wp = _mesh(vertices_wp, faces_wp)
+
+    assert vertices_igl.shape == (12, 3)
+    assert faces_igl.shape == (20, 3)
+    assert np.allclose(np.linalg.norm(vertices_igl, axis=1), 1.0, rtol=1e-5, atol=1e-5)
+    # One edge length, the same on both sides (a regular icosahedron on the unit sphere).
+    edges_igl = np.linalg.norm(np.diff(vertices_igl[mesh_igl.edges_unique], axis=1), axis=2).ravel()
+    edges_wp = np.linalg.norm(
+        np.diff(mesh_wp.vertices[mesh_wp.edges_unique], axis=1), axis=2
+    ).ravel()
+    assert np.allclose(edges_igl, edges_igl[0], rtol=1e-5, atol=1e-5)
+    assert np.allclose(edges_wp.mean(), edges_igl.mean(), rtol=1e-5, atol=1e-5)
+    assert np.isclose(mesh_wp.area, mesh_igl.area, rtol=1e-5)
+    assert np.isclose(abs(mesh_wp.volume), abs(mesh_igl.volume), rtol=1e-5)
 
 
 @pytest.mark.parametrize(
@@ -363,8 +395,10 @@ def test_platonic_solids_match_pymeshlab(
     """
     The three tables came from MeshLab, so they must still be it up to the unit-sphere scaling.
 
-    trimesh has no tetrahedron / octahedron / dodecahedron, and igl has no generators at all, so
-    pymeshlab is the only reference here.
+    trimesh has no tetrahedron / octahedron / dodecahedron, and libigl's only Platonic generator is
+    ``igl.icosahedron`` (compared in
+    [`test_icosahedron`][tests.test_creation.test_icosahedron]), so pymeshlab is the only reference
+    for these three.
     """
     vertices_wp, faces_wp = getattr(tw.creation, builder)(device=device)
     assert int(vertices_wp.shape[0]) == n_vertices
@@ -396,6 +430,54 @@ def test_grid(device: str, count: tuple[int, int]) -> None:
     assert np.allclose(mesh_tm.face_normals, [0.0, 0.0, 1.0], rtol=1e-5, atol=1e-5)
     assert tw.validation.is_winding_consistent(faces_wp)
     assert len(tw.boundary.boundary_loops(vertices_wp, faces_wp)) == 1
+
+
+@pytest.mark.parity("grid", "igl")
+def test_grid_matches_igl(device: str) -> None:
+    """
+    Class B: ``igl.triangulated_grid`` is the same lattice in 2D over the unit square.
+
+    Two named transforms, both exact: the reference's ``(n, 2)`` vertices gain a zero third column,
+    and triwarp is asked for the matching patch (``extents=(1, 1)``, ``center=False``) so the two
+    cover the same square. The **vertex sets then agree exactly**, which is the assert.
+
+    **The two triangulate each cell along the opposite diagonal**, and that is measured rather than
+    assumed: triwarp's first two face centroids are ``(0.222, 0.111)`` and ``(0.111, 0.222)`` where
+    igl's are ``(0.111, 0.111)`` and ``(0.222, 0.222)`` on a 4x4 grid. Both are valid grids, so a
+    face-centroid comparison is *not* available here -- it fails by the cell size -- and the
+    triangulation is instead pinned by the invariants both must satisfy: the same face count, the
+    same total area, and every triangle right-angled with legs one cell wide.
+    """
+    count = 10
+    vertices_wp, faces_wp = tw.creation.grid(
+        count=(count, count), extents=(1.0, 1.0), center=False, device=device
+    )
+    vertices_igl, faces_igl = igl.triangulated_grid(count, count)
+
+    assert int(faces_wp.shape[0]) // 3 == faces_igl.shape[0]
+    padded_igl = np.column_stack([vertices_igl, np.zeros(vertices_igl.shape[0])])
+    assert np.allclose(
+        np.sort(vertices_wp.numpy().astype(np.float64), axis=0),
+        np.sort(padded_igl, axis=0),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+    # The diagonals differ, so compare what both triangulations must satisfy.
+    mesh_wp, mesh_igl = (
+        _mesh(vertices_wp, faces_wp),
+        tm.Trimesh(padded_igl, faces_igl, process=False),
+    )
+    assert np.isclose(mesh_wp.area, 1.0, rtol=1e-5)
+    assert np.isclose(mesh_igl.area, mesh_wp.area, rtol=1e-5)
+    cell = 1.0 / (count - 1)
+    for mesh in (mesh_wp, mesh_igl):
+        sides = np.sort(
+            np.linalg.norm(np.diff(mesh.vertices[mesh.faces[:, [0, 1, 2, 0]]], axis=1), axis=2),
+            axis=1,
+        )
+        assert np.allclose(sides[:, :2], cell, rtol=1e-5, atol=1e-6)
+        assert np.allclose(sides[:, 2], cell * np.sqrt(2.0), rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parity("grid", "pymeshlab")

@@ -36,9 +36,25 @@ import numpy as np
 import potpourri3d as pp3d
 import pytest
 import trimesh as tm
+import warp as wp
 from conftest import BenchCase, skip_larger_than
 
 import triwarp as tw
+
+_barycentre_cache: dict[tuple[str, str], wp.array] = {}
+
+
+def _barycentres_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
+    """One query point per triangle -- its own barycentre -- as an *input*, not part of the work."""
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _barycentre_cache:
+        centres_np = bench_case.vertices_np[bench_case.faces_np].mean(axis=1)
+        _barycentre_cache[key] = wp.array(
+            np.ascontiguousarray(centres_np, dtype=np.float32),
+            dtype=wp.vec3,
+            device=bench_case.device,
+        )
+    return _barycentre_cache[key]
 
 
 @pytest.mark.benchmark(group="centroid")
@@ -102,6 +118,36 @@ def test_face_normals_and_areas(bench_case: BenchCase) -> None:
         assert normals_tm.shape[1] == 3
 
 
+@pytest.mark.benchmark(group="face_angles")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl")
+def test_face_angles(bench_case: BenchCase) -> None:
+    """
+    The three interior angles per face, and the group with the widest margin in the module.
+
+    They are the input to ``vertex_defects`` and to the angle-weighted normals.
+
+    Nothing has to be matched up here -- ``igl.internal_angles``, ``trimesh``'s ``face_angles``
+    property and triwarp all return ``(n_faces, 3)`` angles aligned with the corners
+    ``(i0, i1, i2)``, agreeing element-wise with no transform (verified in
+    ``tests/test_triangles.py``). trimesh rebuilds its ``tm.Trimesh`` inside the callable because
+    ``face_angles`` is a cached property; a shared mesh would time the cache lookup.
+    """
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        angles = bench_case.run(lambda: tw.triangles.face_angles(vertices, faces))
+        assert angles.shape == (bench_case.n_faces, 3)
+    elif bench_case.kind == "igl":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        angles_igl = bench_case.run(lambda: igl.internal_angles(vertices_np, faces_np))
+        assert angles_igl.shape == (bench_case.n_faces, 3)
+    else:
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        angles_tm = bench_case.run(
+            lambda: tm.Trimesh(vertices_np, faces_np, process=False).face_angles
+        )
+        assert angles_tm.shape == (bench_case.n_faces, 3)
+
+
 @pytest.mark.benchmark(group="face_quality")
 @pytest.mark.benchaxis("quality")
 @pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
@@ -131,3 +177,109 @@ def test_face_quality(bench_case: BenchCase) -> None:
             )
         )
         assert ratio_igl.shape == (n_faces,)
+
+
+@pytest.mark.benchmark(group="points_to_barycentric")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl")
+@pytest.mark.parametrize("method", ["cramer", "cross"])
+def test_points_to_barycentric(bench_case: BenchCase, method: str) -> None:
+    """
+    One point per triangle, back to barycentric coordinates: the module's other soup operation.
+
+    triwarp's two ``method`` settings are two formulations of the same solve -- Cramer's rule on the
+    2x2 system against a ratio of cross products -- and they should not differ measurably, which is
+    what the pair checks. trimesh exposes the same choice and gets both ids; ``igl`` has one
+    formulation, so its two rows are identical by construction and sit there as the fixed bar (the
+    same convention as scipy's leaf-size rows in [`test_neighbors.py`](test_neighbors.py)).
+
+    The query points are the face barycentres, so every one lies in its triangle's plane: this
+    measures the in-plane solve rather than a projection.
+    """
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        points = _barycentres_wp(bench_case)
+        barycentric = bench_case.run(
+            lambda: tw.triangles.points_to_barycentric(vertices, faces, points, method=method)
+        )
+        assert barycentric.shape == (bench_case.n_faces,)
+        return
+    triangles_np = bench_case.vertices_np[bench_case.faces_np]
+    points_np = triangles_np.mean(axis=1)
+    if bench_case.kind == "igl":
+        barycentric_igl = bench_case.run(
+            lambda: igl.barycentric_coordinates(
+                np.ascontiguousarray(points_np),
+                np.ascontiguousarray(triangles_np[:, 0]),
+                np.ascontiguousarray(triangles_np[:, 1]),
+                np.ascontiguousarray(triangles_np[:, 2]),
+            )
+        )
+        assert barycentric_igl.shape == (bench_case.n_faces, 3)
+        return
+    barycentric_tm = bench_case.run(
+        lambda: tm.triangles.points_to_barycentric(triangles_np, points_np, method=method)
+    )
+    assert barycentric_tm.shape == (bench_case.n_faces, 3)
+
+
+@pytest.mark.benchmark(group="face_centroids")
+@pytest.mark.benchlibs("triwarp", "igl")
+def test_face_centroids(bench_case: BenchCase) -> None:
+    """
+    One barycentre per face: a ``3F`` gather and a divide, the module's cheapest kernel.
+
+    It shares the scan sweep with ``face_normals_and_areas`` for a reason -- both are pure per-face
+    arithmetic with no connectivity -- so the pair prices a cross product against a mean.
+    ``igl.barycenter`` computes the identical quantity.
+    """
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        centroids = bench_case.run(lambda: tw.triangles.face_centroids(vertices, faces))
+        assert centroids.shape == (bench_case.n_faces,)
+        return
+    vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+    centroids_igl = bench_case.run(lambda: igl.barycenter(vertices_np, faces_np))
+    assert centroids_igl.shape == (bench_case.n_faces, 3)
+
+
+@pytest.mark.benchmark(group="moments")
+@pytest.mark.benchlibs("triwarp", "igl", "trimesh")
+def test_moments(bench_case: BenchCase) -> None:
+    """
+    Volume, centre of mass and inertia tensor: ten ``float64`` sums over the faces.
+
+    The one row in this module that is **readback-bound rather than kernel-bound**, and deliberately
+    so: all three returns are host-side values, so four device reductions are followed by three
+    crossings that no amount of kernel work amortises. Compare it against ``centroid`` above, which
+    pays two -- the gap is what the extra quantities cost, and it is nearly all latency.
+
+    ``igl.moments`` returns the first moment un-normalised and the inertia already about the centre
+    of mass; ``trimesh``'s ``mass_properties`` computes the same three from the same integrals on
+    the host. Both are timed on the whole call, since neither exposes the integrals separately.
+
+    **And triwarp loses this one**, which the readback account predicts and the numbers confirm: on
+    ``bunny`` it reads **3.19 ms against igl's 1.23** (and trimesh's 41.1), because ten ``float64``
+    sums over 69 451 faces is less work than three host crossings cost in latency. It is the
+    clearest case in the suite of a row where the *shape of the API* -- three host-side scalars --
+    sets the cost, not the arithmetic. A caller wanting only the volume should call
+    [`volume`][triwarp.triangles.volume], which pays one.
+    """
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        volume, _center, inertia = bench_case.run(lambda: tw.triangles.moments(vertices, faces))
+        assert np.isfinite(volume)
+        assert inertia.shape == (3, 3)
+        return
+    vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+    if bench_case.kind == "igl":
+        volume_igl, first_igl, inertia_igl = bench_case.run(
+            lambda: igl.moments(vertices_np, faces_np)
+        )
+        assert np.isfinite(volume_igl)
+        assert np.asarray(first_igl).shape == (3,)
+        assert np.asarray(inertia_igl).shape == (3, 3)
+        return
+    properties_tm = bench_case.run(
+        lambda: tm.Trimesh(vertices_np, faces_np, process=False).mass_properties
+    )
+    assert np.asarray(properties_tm["inertia"]).shape == (3, 3)

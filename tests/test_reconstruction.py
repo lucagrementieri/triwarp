@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 
+import igl
 import numpy as np
 import open3d as o3d
 import pymeshlab as ml
@@ -1040,6 +1041,66 @@ def test_resample_uniform_matches_pymeshlab(device: str) -> None:
     sample_pml, _face_pml = tm.sample.sample_surface(pml_tm, 4000, seed=1)
     assert np.abs(tm.proximity.signed_distance(pml_tm, sample_wp)).max() < 2.0 * voxel_size
     assert np.abs(tm.proximity.signed_distance(out_tm, sample_pml)).max() < 2.0 * voxel_size
+
+
+@pytest.mark.parity("resample_uniform", "igl")
+def test_resample_uniform_matches_igl(device: str) -> None:
+    """
+    Class C (no vertex correspondence): the two isosurfaces coincide to **0.06 of a voxel**.
+
+    ``igl.offset_surface(V, F, isolevel, s, sign_type)`` samples the same signed distance field on a
+    grid and marches it. Two named parameter transforms put the two on one lattice: ``isolevel=0``
+    is triwarp's zero offset, and ``s`` is a *cell count along the longest axis* rather than a
+    length, so it gets ``round(longest_extent / voxel_size)``. The sign mode is ``PSEUDONORMAL``,
+    which ``tests/test_proximity.py::test_signed_distance_on_mesh_matches_igl`` establishes agrees
+    with triwarp's default to 8e-8 -- the winding modes would scale the field by ``1 - 2w`` and move
+    the isosurface.
+
+    No correspondence exists between the outputs (4 186 vertices against triwarp's 5 310 on this
+    fixture, since the two march the lattice into different triangle sets), so the comparison is the
+    surface: both watertight, enclosed volumes within 5%, and a two-sided Hausdorff distance under a
+    quarter of a voxel.
+
+    **Bug class excluded:** a grid anchored differently, or an isolevel or sign convention that
+    shifts the surface -- exactly what the plan flagged as the risk for this pair. **Mutation probe,
+    measured:** re-running igl at ``isolevel=0.02`` and ``0.05`` moves the one-sided Hausdorff to
+    **0.36 and 0.86 voxels** against 0.06 at zero, so the ``0.25``-voxel bound sits 4.2x above the
+    measured agreement and fails on a shift of a third of a voxel. That is what makes it a test of
+    the anchoring rather than of "both are roughly a sphere".
+    """
+    sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    voxel_size = 0.06
+    vertices_np = np.ascontiguousarray(sphere_tm.vertices, dtype=np.float64)
+    faces_np = np.ascontiguousarray(sphere_tm.faces, dtype=np.int64)
+
+    extent = float((vertices_np.max(axis=0) - vertices_np.min(axis=0)).max())
+    vertices_igl, faces_igl = igl.offset_surface(
+        vertices_np,
+        faces_np,
+        0.0,
+        max(2, round(extent / voxel_size)),
+        igl.SIGNED_DISTANCE_TYPE_PSEUDONORMAL,
+    )[:2]
+    mesh_igl = tm.Trimesh(vertices_igl, faces_igl, process=False)
+
+    vertices_wp, faces_wp = _upload_mesh(sphere_tm, device)
+    out_vertices_wp, out_faces_wp = tw.reconstruction.resample_uniform(
+        vertices_wp, faces_wp, voxel_size=voxel_size
+    )
+    out_tm = tm.Trimesh(
+        out_vertices_wp.numpy().astype(np.float64),
+        out_faces_wp.numpy().reshape(-1, 3),
+        process=False,
+    )
+
+    assert mesh_igl.is_watertight
+    assert out_tm.is_watertight
+    assert np.isclose(np.abs(out_tm.volume), np.abs(mesh_igl.volume), rtol=0.05)
+
+    sample_wp, _face_wp = tm.sample.sample_surface(out_tm, 4000, seed=0)
+    sample_igl, _face_igl = tm.sample.sample_surface(mesh_igl, 4000, seed=1)
+    assert np.abs(tm.proximity.signed_distance(mesh_igl, sample_wp)).max() < 0.25 * voxel_size
+    assert np.abs(tm.proximity.signed_distance(out_tm, sample_igl)).max() < 0.25 * voxel_size
 
 
 def test_resample_uniform_coarser_is_smaller(device: str) -> None:

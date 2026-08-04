@@ -123,10 +123,24 @@ _ROUNDS = 3
 
 
 @pytest.mark.benchmark(group="subdivide")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "open3d")
 def test_subdivide(bench_case: BenchCase) -> None:
-    """Exactly 4x the faces in one pass: the module's clean throughput baseline."""
+    """
+    Exactly 4x the faces in one pass: the module's clean throughput baseline.
+
+    Four libraries, one algorithm -- ``igl.upsample`` is midpoint 1:4 subdivision with triwarp's
+    semantics exactly (new vertex per unique edge, original vertices untouched), so this is the
+    module's widest reference agreement. All three references differ from triwarp only in the output
+    *ordering*, which is what makes the parity comparison a centroid match rather than an array
+    compare (``tests/test_remesh.py``).
+    """
     skip_larger_than(bench_case, "dragon", "a 1:4 subdivision above dragon exceeds memory")
+    if bench_case.kind == "igl":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        vertices_igl, faces_igl = bench_case.run(lambda: igl.upsample(vertices_np, faces_np))
+        assert faces_igl.shape[0] == 4 * bench_case.n_faces
+        assert vertices_igl.shape[0] > bench_case.n_vertices
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         _new_vertices, new_faces = bench_case.run(lambda: tw.remesh.subdivide(vertices, faces))

@@ -424,7 +424,88 @@ def closest_point(
 
 
 @wp.func
-def face_unit_gradient(
+def face_centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: wp.int32) -> wp.vec3:
+    # Barycentre of face ``f``: the mean of its three corners.
+    return (
+        vertices[faces[f * 3 + 0]] + vertices[faces[f * 3 + 1]] + vertices[faces[f * 3 + 2]]
+    ) / 3.0
+
+
+@wp.kernel
+def face_centroids(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_centroids: wp.array[wp.vec3]
+) -> None:
+    f = int(wp.tid())
+    out_centroids[f] = face_centroid(vertices, faces, wp.int32(f))
+
+
+@wp.kernel
+def moment_integrands(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    out_volume: wp.array[wp.float64],
+    out_first: wp.array[wp.vec3d],
+    out_squares: wp.array[wp.vec3d],
+    out_products: wp.array[wp.vec3d],
+) -> None:
+    # Per-face contribution to the mass integrals of the solid bounded by the mesh, taking each
+    # face with the origin as a tetrahedron. Everything accumulates in float64: the second moments
+    # scale as length^5, so a float32 sum over a large mesh loses the answer's low digits well
+    # before the reduction finishes.
+    #
+    # For the tet (0, a, b, c) with det = dot(a, cross(b, c)):
+    #   ∫dV      = det / 6
+    #   ∫x dV    = det * (a.x + b.x + c.x) / 24
+    #   ∫x^2 dV  = det * (a.x^2 + b.x^2 + c.x^2 + a.x b.x + a.x c.x + b.x c.x) / 60
+    #   ∫xy dV   = det * (2(a.x a.y + b.x b.y + c.x c.y)
+    #                     + a.x b.y + b.x a.y + a.x c.y + c.x a.y + b.x c.y + c.x b.y) / 120
+    f = int(wp.tid())
+    a, b, c = face_vertices_vec3d(vertices, faces, wp.int32(f))
+    det = wp.dot(a, wp.cross(b, c))
+
+    out_volume[f] = det / wp.float64(6.0)
+    out_first[f] = det * (a + b + c) / wp.float64(24.0)
+    out_squares[f] = (
+        det
+        * wp.vec3d(
+            a[0] * a[0] + b[0] * b[0] + c[0] * c[0] + a[0] * b[0] + a[0] * c[0] + b[0] * c[0],
+            a[1] * a[1] + b[1] * b[1] + c[1] * c[1] + a[1] * b[1] + a[1] * c[1] + b[1] * c[1],
+            a[2] * a[2] + b[2] * b[2] + c[2] * c[2] + a[2] * b[2] + a[2] * c[2] + b[2] * c[2],
+        )
+        / wp.float64(60.0)
+    )
+    # (xy, xz, yz), in the same order the wrapper reads them back.
+    out_products[f] = (
+        det
+        * wp.vec3d(
+            wp.float64(2.0) * (a[0] * a[1] + b[0] * b[1] + c[0] * c[1])
+            + a[0] * b[1]
+            + b[0] * a[1]
+            + a[0] * c[1]
+            + c[0] * a[1]
+            + b[0] * c[1]
+            + c[0] * b[1],
+            wp.float64(2.0) * (a[0] * a[2] + b[0] * b[2] + c[0] * c[2])
+            + a[0] * b[2]
+            + b[0] * a[2]
+            + a[0] * c[2]
+            + c[0] * a[2]
+            + b[0] * c[2]
+            + c[0] * b[2],
+            wp.float64(2.0) * (a[1] * a[2] + b[1] * b[2] + c[1] * c[2])
+            + a[1] * b[2]
+            + b[1] * a[2]
+            + a[1] * c[2]
+            + c[1] * a[2]
+            + b[1] * c[2]
+            + c[1] * b[2],
+        )
+        / wp.float64(120.0)
+    )
+
+
+@wp.func
+def face_gradient(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     normals: wp.array[wp.vec3],
@@ -432,15 +513,14 @@ def face_unit_gradient(
     values: wp.array[wp.float64],
     f: wp.int32,
 ) -> wp.vec3d:
-    # Unit gradient of a per-vertex scalar field inside face ``f``:
+    # Gradient of a per-vertex scalar field inside face ``f``, in the face's plane:
     #   grad = 1/(2A) * sum_k values_k * (n x e_k^opp),   e_k^opp the CCW edge opposite corner k.
     #
     # Accumulated in float64. The fields this serves (diffused heat, geodesic distance) decay
     # exponentially and a float32 sum of the cross products loses the far field, so the geometry is
     # promoted rather than the result being widened after the fact.
     #
-    # A degenerate face contributes nothing, and ``normalize`` returns the zero vector for a
-    # zero-length gradient (Warp's ``kEps`` is 0), so both degenerate cases fall out as zero.
+    # A degenerate face contributes nothing and returns the zero vector.
     i0 = faces[f * 3 + 0]
     i1 = faces[f * 3 + 1]
     i2 = faces[f * 3 + 2]
@@ -455,4 +535,31 @@ def face_unit_gradient(
             + values[i1] * wp.cross(n, v0 - v2)
             + values[i2] * wp.cross(n, v1 - v0)
         ) / (wp.float64(2.0) * area)
-    return wp.normalize(grad)
+    return grad
+
+
+@wp.func
+def face_unit_gradient(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    normals: wp.array[wp.vec3],
+    areas: wp.array[wp.float32],
+    values: wp.array[wp.float64],
+    f: wp.int32,
+) -> wp.vec3d:
+    # The direction of ``face_gradient``. ``normalize`` returns the zero vector for a zero-length
+    # gradient (Warp's ``kEps`` is 0), so a degenerate face and a constant field both give zero.
+    return wp.normalize(face_gradient(vertices, faces, normals, areas, values, f))
+
+
+@wp.kernel
+def face_gradients(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    normals: wp.array[wp.vec3],
+    areas: wp.array[wp.float32],
+    values: wp.array[wp.float64],
+    out_gradients: wp.array[wp.vec3d],
+) -> None:
+    f = int(wp.tid())
+    out_gradients[f] = face_gradient(vertices, faces, normals, areas, values, wp.int32(f))

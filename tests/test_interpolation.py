@@ -10,7 +10,9 @@ import warp as wp
 import triwarp as tw
 
 
+@pytest.mark.parity("average_onto_faces", "igl")
 def test_average_onto_faces(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """Class A: the vertex-to-face mean, element-wise against ``igl.average_onto_faces``."""
     mesh_tm, mesh_wp = half_torus
     rng = np.random.default_rng(0)
 
@@ -23,7 +25,7 @@ def test_average_onto_faces(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     assert np.allclose(face_values_wp.numpy(), face_values_igl, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parity("average_onto_vertices", "pymeshlab")
+@pytest.mark.parity("average_onto_vertices", "pymeshlab", "igl")
 def test_average_onto_vertices(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     """
     Class A against libigl, class B against MeshLab's face-to-vertex scalar transfer.
@@ -62,7 +64,16 @@ def test_average_onto_vertices(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     assert np.allclose(vertex_values_wp.numpy(), vertex_values_pml, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parity("average_from_edges_onto_vertices", "igl")
 def test_average_from_edges_onto_vertices(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: the edge-to-vertex mean, over igl's own halfedge numbering.
+
+    ``igl.orient_halfedges(F)`` supplies the ``(E, oE)`` tables *both* sides consume, so this does
+    not compare two edge numberings -- it compares the averaging over one. That is the honest split:
+    triwarp has no ``orient_halfedges`` of its own to pair against igl's, and giving each side its
+    own numbering would make a mismatch of index conventions look like a mismatch of averages.
+    """
     mesh_tm, mesh_wp = half_torus
     rng = np.random.default_rng(2)
 

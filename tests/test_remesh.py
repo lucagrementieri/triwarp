@@ -13,6 +13,7 @@ from scipy.spatial import KDTree
 import triwarp as tw
 from tests.conversions import (
     bsr_to_dense,
+    faces_igl,
     open3d_to_trimesh,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
@@ -98,6 +99,42 @@ def test_subdivide_matches_open3d(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> No
     )
     centroids_o3d = mesh_ref.vertices[mesh_ref.faces].mean(axis=1)
     distance_np, match_np = KDTree(centroids_o3d).query(centroids_wp)
+    assert distance_np.max() < 1e-5, f"face centroids differ by up to {distance_np.max():.3e}"
+    assert len(set(match_np.tolist())) == match_np.shape[0], "the centroid match is not a bijection"
+
+
+@pytest.mark.parity("subdivide", "igl")
+def test_subdivide_matches_igl(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B: ``igl.upsample`` is the same 1:4 midpoint split under a different vertex order.
+
+    igl keeps the original vertices in place and appends one per unique edge, exactly as triwarp
+    does, so the *vertex* arrays agree on their leading ``n_vertices`` rows -- which is asserted
+    directly and is a stronger statement than the centroid match alone. The new vertices and the
+    faces are ordered by each library's own edge enumeration, so those go through the same
+    bijective centroid match the Open3D test uses, and for the same reason: a lexsort over
+    coordinates is decided by rounding noise where the icosahedron's centroids tie.
+    """
+    mesh_tm, mesh_wp = icosahedron
+
+    vertices_upsampled_igl, faces_upsampled_igl = igl.upsample(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64), faces_igl(mesh_tm)
+    )
+    vertices_wp, faces_wp = tw.remesh.subdivide(mesh_wp.points, mesh_wp.indices)
+
+    assert int(vertices_wp.shape[0]) == vertices_upsampled_igl.shape[0]
+    assert int(faces_wp.shape[0]) // 3 == faces_upsampled_igl.shape[0]
+    # The original vertices are untouched and stay in place on both sides.
+    n_original = mesh_tm.vertices.shape[0]
+    assert np.allclose(
+        vertices_wp.numpy()[:n_original], vertices_upsampled_igl[:n_original], rtol=1e-5, atol=1e-5
+    )
+
+    centroids_wp = (
+        vertices_wp.numpy().astype(np.float64)[faces_wp.numpy().reshape(-1, 3)].mean(axis=1)
+    )
+    centroids_igl = vertices_upsampled_igl[faces_upsampled_igl].mean(axis=1)
+    distance_np, match_np = KDTree(centroids_igl).query(centroids_wp)
     assert distance_np.max() < 1e-5, f"face centroids differ by up to {distance_np.max():.3e}"
     assert len(set(match_np.tolist())) == match_np.shape[0], "the centroid match is not a bijection"
 

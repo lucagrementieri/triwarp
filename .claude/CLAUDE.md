@@ -181,6 +181,44 @@ reference mirrored under `reference/libigl/`) as the CPU reference instead — i
 as `mesh_tm.faces` (`(n_faces, 3)` int array) to the igl function. Otherwise follow the same
 comparison conventions (`np.array_equal`/`np.allclose`, inline `.numpy()`).
 
+igl is the reference whose input convention matches triwarp's most closely — `float64` `(n, 3)`
+vertices and `int64` `(n_faces, 3)` faces, which is exactly what `mesh_tm.vertices` / `mesh_tm.faces`
+already are — and every bound function is *pure* (arrays in, arrays out), so there is no in-place
+mutation to defend against. The exceptions are the stateful solver objects (`HeatGeodesicsData`,
+`ARAPData`, `min_quad_with_fixed_data`, `AABB`), which cache a factorization and must therefore be
+constructed **inside** a timed callable. Four hazards, all measured:
+
+- **An out-of-range face index is a SIGSEGV, not an exception.** `igl.cotmatrix(V, F)` with one entry
+  of `F` set to `len(V) + 500` kills the interpreter with exit code 139 and no traceback — igl
+  bounds-checks nothing. Never hand it a reduced `V` with the original `F`. The same class of crash
+  hits `igl.principal_curvature` on a non-manifold vertex, and `igl.heat_geodesics_precompute` /
+  `igl.harmonic` / `igl.lscm` refuse (raise) rather than crash on meshes they cannot factor.
+- **F-only functions size their output by `F.max() + 1`, not by `len(V)`.** `igl.adjacency_matrix`,
+  `igl.vertex_components` and `igl.is_vertex_manifold` return `F.max() + 1` rows where
+  `igl.cotmatrix` and `igl.gaussian_curvature` return `len(V)`. So on a mesh with unreferenced
+  vertices the two families disagree with each other and only the `(V, F)` family matches triwarp;
+  a comparison against the F-only family is class B with the transform named ("pad igl's answer to
+  `n_vertices`"). Also note `igl.connected_components(igl.adjacency_matrix(F))` counts every isolated
+  vertex as its own component.
+- **Several call signatures are not what the docs suggest, and two fail silently.**
+  `igl.exact_geodesic(V, F, vs, vt)` returns an *empty array* rather than raising, because `VS/FS/VT/FT`
+  all default to `array([])` and a 4-argument call binds `vt` to `FS` — pass all six, with the face
+  arrays explicitly `np.array([], dtype=np.int64)`. `igl.knn(P, V, k, *igl.octree(V)[:4])` takes seven
+  positional arguments. `igl.in_element` needs a live `igl.AABB`. `igl.crouzeix_raviart_*` need
+  `(V, F, E, EMAP)` from `igl.unique_edge_map(F)`. `igl.average_onto_vertices`'s `S` is a per-face
+  *scalar*; `igl.cut_mesh`'s `C` is a per-corner **bool** mask, not an edge list.
+- **`collapse_small_triangles` and `resolve_duplicated_faces` are not bound**, despite the C++ headers
+  existing and `triwarp.repair` carrying functions named after them (`AttributeError`). Generally: the
+  C++ surface is ~493 headers and only 150 functions are bound, so confirm a name exists in the wheel
+  before planning a comparison around it. A hand port of the C++ into a test file is a legitimate
+  *test* oracle (see `tests/test_distance.py`, `tests/test_polyline.py`, `tests/test_seams.py`) but
+  never a benchmark row.
+
+**Licensing:** libigl's core is MPL2, but everything under `reference/libigl/include/igl/copyleft/`
+is **GPL** — the CGAL boolean suite, `progressive_hulls`, `quadprog`, tetgen and
+`copyleft/marching_cubes`. No triwarp code may be derived from that subtree; read the MPL2 top-level
+`marching_cubes.h` if a reference is needed, never the `copyleft/` one.
+
 For the heat-method family, tangent spaces and isocontours — where neither trimesh nor igl has an
 equivalent — use `potpourri3d` (pybind11 over geometry-central, mirrored under
 `reference/potpourri3d/`): `import potpourri3d as pp3d`, reference variables suffixed `_pp`. It takes
@@ -306,6 +344,15 @@ Classify every comparison, and say which class it is in the docstring:
 Never a parity assert: shape-only or `isfinite`-only (that is the *benchmark's* assert, and this
 gate exists to stop it migrating inward); triwarp compared with itself; a threshold a constant
 output would pass. A boolean assert must be parametrized over inputs producing both answers.
+
+**Check the comparison is not vacuous on its fixture**, which the gate cannot do for you. A test
+comparing two *empty* answers passes, reads as coverage, and tests nothing — measured: `test_ears`
+compared `igl.ears` against `boundary.ears` on `hemisphere` and `half_torus`, where neither library
+finds a single ear, so the assert was `[] == []` and the loop body checking the corner convention
+never ran. Making it non-vacuous immediately surfaced a real disagreement (the two number the ear's
+local edge differently, `triwarp_opp == (igl_opp + 1) % 3`). So: assert the reference produced a
+non-empty answer, or assert its expected count, before comparing to it — and treat "this function is
+already the oracle in tests/" as no evidence at all that the comparison is live.
 
 Reuse `tests/comparisons.py` (`lexsort_rows`, `canonical_winding`, `assert_same_up_to_sign`,
 `assert_cyclic_permutation_equal`, `fraction_within`, `symmetric_chamfer`, `hausdorff_two_sided`)

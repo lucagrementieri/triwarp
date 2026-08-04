@@ -851,7 +851,9 @@ def quadric_decimate(
         )
         csr = tw.graph.edges_to_csr(n_vertices, unique_edges)
         quadrics = _vertex_quadrics(current_vertices, current_faces)
-        face_offsets, vertex_faces = _vertex_face_csr(current_faces, n_vertices)
+        face_offsets, vertex_faces = tw.adjacency.vertex_face_adjacency(
+            current_faces, n_vertices=n_vertices
+        )
 
         survivor = wp.full(m, -1, dtype=wp.int32, device=device)
         removed = wp.empty(m, dtype=wp.int32, device=device)
@@ -1033,34 +1035,6 @@ def _vertex_quadrics(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
         device=device,
     )
     return quadrics
-
-
-def _vertex_face_csr(
-    faces: wp.array[wp.int32], n_vertices: int
-) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
-    """
-    ``(offsets, vertex_faces)`` incidence CSR: the faces touching each vertex, in arbitrary order.
-
-    Length-``n_vertices + 1`` offsets, which is the convention the kernels index with. Built by
-    counting sort rather than from halfedge twins deliberately: the normal-flip guard reads a row as
-    a set, and a rotational order would refuse a vertex-non-manifold mesh — which a decimator, of
-    all things, must not.
-    """
-    device = faces.device
-    counts = wp.zeros(n_vertices, dtype=wp.int32, device=device)
-    n_faces = int(faces.shape[0]) // 3
-    wp.launch(kernel_remesh.count_vertex_faces, dim=n_faces, inputs=[faces, counts], device=device)
-    offsets = wp.zeros(n_vertices + 1, dtype=wp.int32, device=device)
-    wp.utils.array_scan(counts, out_array=offsets[1:], inclusive=True)
-    cursor = wp.zeros(n_vertices, dtype=wp.int32, device=device)
-    vertex_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_remesh.scatter_vertex_faces,
-        dim=n_faces,
-        inputs=[faces, offsets, cursor, vertex_faces],
-        device=device,
-    )
-    return offsets, vertex_faces
 
 
 def flip_to_delaunay(
