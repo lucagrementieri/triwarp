@@ -2,7 +2,7 @@ from typing import Any
 
 import warp as wp
 
-from triwarp.constants import PI, TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
+from triwarp.constants import PI, TILE_1D, TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.array import to_vec3d
 from triwarp.kernels.predicates import triangle_aspect_ratio
 
@@ -189,19 +189,53 @@ def face_quality(
 
 
 @wp.kernel
-def centroid(
+def centroid_tiled(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    n_faces: wp.int32,
+    out_weighted_centroid: wp.array[wp.float32],
+    out_total_area: wp.array[wp.float32],
+) -> None:
+    # CUDA path, launched via wp.launch_tiled with block_dim=TILE_1D: each lane computes one face's
+    # area-weighted centroid contribution, the block reduces each component cooperatively with
+    # wp.tile_sum, and lane 0 commits four atomics per block (out-of-range lanes contribute zero).
+    # CPU MUST NOT use this: `wp.launch_tiled` runs one lane per block there, so the block reduction
+    # would see one face per tile. See `centroid_sliced` and `_device.prefers_tiled_reduction`.
+    i, t = wp.tid()
+    f = i * TILE_1D + int(t)
+    contrib = wp.vec3(0.0, 0.0, 0.0)
+    area = wp.float32(0.0)
+    if f < int(n_faces):
+        triangle_face = faces[f * 3 : (f + 1) * 3]
+        _, area = face_normals_and_area(vertices, triangle_face)
+        contrib = (
+            vertices[triangle_face[0]] + vertices[triangle_face[1]] + vertices[triangle_face[2]]
+        ) * (area / 3.0)
+    sum_x = wp.tile_sum(wp.tile(contrib[0]))
+    sum_y = wp.tile_sum(wp.tile(contrib[1]))
+    sum_z = wp.tile_sum(wp.tile(contrib[2]))
+    area_sum = wp.tile_sum(wp.tile(area))
+    if t == 0:
+        wp.tile_atomic_add(out_weighted_centroid, sum_x, (0,))
+        wp.tile_atomic_add(out_weighted_centroid, sum_y, (1,))
+        wp.tile_atomic_add(out_weighted_centroid, sum_z, (2,))
+        wp.tile_atomic_add(out_total_area, area_sum, (0,))
+
+
+@wp.kernel
+def centroid_sliced(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     n_faces: wp.int32,
     n_slices: wp.int32,
-    out_weighted_centroid: wp.array[wp.vec3],
+    out_weighted_centroid: wp.array[wp.float32],
     out_total_area: wp.array[wp.float32],
 ) -> None:
-    # One thread per face slice: each walks a strided slice of the face list, accumulates the
-    # area-weighted centroid numerator and the area denominator locally, and commits two atomics.
-    # Deliberately lane-free -- the block-wide `wp.tile_sum` this replaces reduced a single lane on
-    # Warp 1.15's CPU backend, where `wp.launch_tiled` runs one lane per block. That bug was
-    # invisible on a symmetric mesh, whose every-Nth-face centroid is still the true centroid.
+    # Portable path: one thread per face slice walks a strided slice, accumulates locally and
+    # commits four atomics. Lane-free, so it is correct on the CPU device where `centroid_tiled`
+    # is not; it gives up the block shuffle-reduce and measures 1.67x slower on CUDA at 327k faces
+    # (16.0 -> 26.7 us), which is why both exist. That bug was invisible on a symmetric mesh, whose
+    # every-Nth-face centroid is still the true centroid.
     j = wp.tid()
     total = wp.vec3(0.0, 0.0, 0.0)
     area_total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
@@ -212,7 +246,9 @@ def centroid(
             vertices[triangle_face[0]] + vertices[triangle_face[1]] + vertices[triangle_face[2]]
         ) * (area / 3.0)
         area_total = area_total + area
-    wp.atomic_add(out_weighted_centroid, 0, total)
+    wp.atomic_add(out_weighted_centroid, 0, total[0])
+    wp.atomic_add(out_weighted_centroid, 1, total[1])
+    wp.atomic_add(out_weighted_centroid, 2, total[2])
     wp.atomic_add(out_total_area, 0, area_total)
 
 

@@ -732,9 +732,9 @@ def _fill_packed_loops(
     )
 
     if primary_id != min_area_id:
-        # Which loops the primary metric failed on is decided on device and fed straight back in as
-        # the re-run's active mask, so the fallback costs one more batched pass rather than a host
-        # readback and a branch per loop. Loops the primary metric handled keep their ``prev`` rows.
+        # *Which* loops the primary metric failed on is decided on device and fed straight back in
+        # as the re-run's active mask, so the fallback is one more batched pass rather than a branch
+        # per loop. Loops the primary metric handled keep their ``prev`` rows.
         retry = wp.empty(loops.n_loops, dtype=wp.int32, device=device)
         wp.launch(
             kernel_hole_filling.flag_bad_triangulations,
@@ -742,21 +742,31 @@ def _fill_packed_loops(
             inputs=[loops.sizes, loops.dp_offsets, dp, retry],
             device=device,
         )
-        _run_hole_dp(
-            loops,
-            loop_pos,
-            plane_normals,
-            forbidden,
-            rim_opp_pos,
-            rim_opp_valid,
-            char_areas,
-            retry,
-            min_area_id,
-            0,
-            smooth_boundary,
-            dp,
-            prev,
-        )
+        # ...but *whether* any loop failed is worth one host read of ``n_loops`` int32s, because a
+        # pass with an all-zero mask is still a full ``max(B) - 1`` launch sweep -- 510 launches on
+        # ``rim_short`` -- in which every thread returns immediately. Measured back to back:
+        # 155.6 -> 152.5 ms on ``rim_short`` and 4.16 -> 4.03 on ``holes_many``, so about 3 ms and
+        # 3 %. That is the *marshalling* of an empty sweep and nothing else; do not expect more from
+        # it. In particular the ~33 ms gap between the ``plane_normalized`` default and a single
+        # ``min_area`` pass is **not** this pass -- it is ``plane_normalized``'s own per-span kernel
+        # doing more work (plane normals, dihedral terms) than ``min_area``'s. ``prev`` is read back
+        # a few lines below regardless, so this adds no synchronisation point that was not there.
+        if int(retry.numpy().sum()) > 0:
+            _run_hole_dp(
+                loops,
+                loop_pos,
+                plane_normals,
+                forbidden,
+                rim_opp_pos,
+                rim_opp_valid,
+                char_areas,
+                retry,
+                min_area_id,
+                0,
+                smooth_boundary,
+                dp,
+                prev,
+            )
 
     prev_np = prev.numpy()
     flat_np = loops.flat_loops.numpy()

@@ -221,6 +221,17 @@ set automatically. Pass your own `--benchmark-group-by=...` to override.
   overhead, not an algorithm. **Read the floor from a full-suite run**: whichever group runs first
   in a module absorbs that library's one-time initialization (52 ms for triwarp, 102 ms for trimesh,
   measured on `test_creation.py` alone).
+
+  **A full-suite ratio matrix (605 comparisons) found 24 rows that are entirely this floor**, and
+  each now says so in its own docstring rather than reading as a defect: the `creation` revolution
+  primitives and Platonic tables (`creation`'s module docstring covers them collectively),
+  `icosphere` since its connectivity became closed-form, `vertices.n_vertices`,
+  `proximity.aabb_bounds`, `points.point_plane_distance` and `remesh.cluster_decimate` at
+  `bunny_decimated`. **Every one of them inverts further along its own axis** — `cluster_decimate`
+  wins 76x at `dragon`, `n_vertices` 259x at `lucy` — so a floor row is a statement about the input
+  size, not about the code, and optimizing one would mean removing allocations from correct code for
+  microseconds nobody experiences. Below roughly 10³ elements, prefer to fix the *input size* of the
+  benchmark over the function it measures.
 - **A CPU reference can be the whole cost of a module.** Two were, before being capped: trimesh's
   `discrete_mean_curvature_measure` (one `cKDTree` ball query per point) took **40 s a call** on
   `sphere_med` and was 95% of `test_curvature`, and `tm.points.fit_line` took **22 s a call** on

@@ -339,8 +339,8 @@ def winding_number(
     tiled
         When ``True`` (default), sum solid angles with the face list partitioned across
         threads: one thread per ``(query, face slice)`` walks a strided slice of
-        [`ITEMS_PER_SLICE`][triwarp.constants.ITEMS_PER_SLICE] faces and accumulates one
-        ``wp.atomic_add`` per slice, so the summation order is nondeterministic and the result
+        [`ITEMS_PER_QUERY_SLICE`][triwarp.proximity.ITEMS_PER_QUERY_SLICE] faces and accumulates
+        one ``wp.atomic_add`` per slice, so the summation order is nondeterministic and the result
         can differ in the last float32 digits between runs. When ``False``, each query thread
         loops over all faces serially — orders of magnitude slower on large meshes,
         but the fixed left-to-right summation makes it the exact-sum reference.

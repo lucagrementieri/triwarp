@@ -76,7 +76,7 @@ RTX 5090 / Warp 1.15, ``--device=cuda``. ``sections`` are 32 / 512 / 4096 unless
 | ``annulus`` | 338 / 338 / 338 µs | 237 / 847 µs / 6.2 ms | — |
 | ``torus`` (32 minor) | 361 / 355 / 362 µs | 493 µs / 5.8 / 52.1 ms | 11.4 / 167 µs / 1.3 ms |
 | ``uv_sphere`` | 576 / 560 / 550 µs | 789 µs / 8.3 / 46.1 ms | 10.1 µs / 2.4 / 319 ms |
-| ``icosphere`` (3 / 5 / 7) | 2.7 / 4.4 / 6.3 ms | 429 µs / 2.7 / 65.7 ms | — |
+| ``icosphere`` (3 / 5 / 7) | 245 / 253 / 345 µs | 472 µs / 2.7 / 67.1 ms | — |
 | ``truncated_prisms`` (1k / 256k) | 70 / 164 µs | 180 µs / 112 ms | — |
 | ``random_soup`` (1k / 256k) | 92 / 90 µs | 1.2 / 310 ms | — |
 | ``sweep_polygon`` (64-gon, 4k path) | 2.1 ms | 13.6 ms | — |
@@ -89,28 +89,46 @@ not anything specific to ``creation``: the profile round trip and the NumPy prol
 loses by 12-150x above it, and open3d's tight C++ loops win outright at small sizes while still
 falling behind above a few thousand sections (its ``create_sphere`` at 4096 is a 580x outlier).
 
-``icosphere`` is the exception to the flat profile, because it is genuinely iterative: each of the
-``subdivisions`` passes is a full ``subdivide`` (edge dedup, a sort, a scan), so its cost grows with
-the subdivision count rather than being one launch.
+``icosphere`` **used to be** the exception to the flat profile, and this group is what retired it.
+It was iterative — one full ``subdivide`` per level (edge dedup, a radix sort, a count readback,
+~17 launches), so its cost grew with the subdivision count rather than being one launch: 4.8 / 7.9 /
+6.9 ms at levels 3 / 5 / 7, the non-monotonicity itself the tell that host cost and not the 164k
+output faces was being measured. Generating the connectivity in closed form instead (see the Notes
+of [`triwarp.creation.icosphere`][]) makes it ``subdivisions + 2`` launches and puts it back on the
+floor with everything else: **19-31x** faster, and it now beats trimesh at every level rather than
+losing 6x at level 3 (245 µs against 472, and 345 µs against 67.1 ms at level 7, a 195x win).
 
-``triangulate_polygon`` is the second exception, and the module's worked example of a cost that is
-not where it looks. It delegates to ``polyline.triangulate_polyline``, which is a **parallel**
+``triangulate_polygon`` is the remaining exception, and the module's worked example of a cost
+that is not where it looks. It delegates to ``polyline.triangulate_polyline``, a **parallel**
 multi-round ear clipper — every launch in the round loop is ``dim=n``, and a round clips a whole
-*independent set* of ears at once. What is serial is the **round count**: a round costs three
-``dim=n`` launches plus one ``out_count`` readback whatever it clips, so the only thing that
-matters is how many ears survive per round.
+*independent set* of ears at once. What is serial is the **round count**: a round costs four
+``dim=n`` launches whatever it clips, so the only thing that matters is how many ears survive per
+round. Since the round loop moved onto the device (``wp.capture_while``, so no readback per round)
+that costs 14 µs a round at 64 points, and the group measures **2.2 / 4.5 ms** against 4.5 / 6.9
+before — 2.07x and 1.53x.
 
-That is what this group caught. ``select_independent`` used to rank competing ears by their raw
-ring index, which on an alternating star lets ear ``i - 2`` suppress ear ``i`` for every ``i``, so
-exactly **one** ear was clipped per round and the loop ran to its ``n`` cap: 6.1 ms at 64 points
-and **141 ms** at 1 024, growing as ``n^1.12`` (rounds proportional to ``n`` times a slowly growing
-per-round cost) rather than the ``O(L^2)`` a serial clipper would give. Ranking by a bijective hash
-of the ring index makes it the textbook maximal-independent-set rule, which retires a constant
-fraction per round: **2.8 ms and 4.6 ms**, 30 rounds at 1 024 instead of 1 022.
+Read the residual against its attribution rather than against the round loop, because the round loop
+is no longer the cost: at 64 points the clip itself is 0.22 ms of the 2.2, and **1.05 ms is the
+prologue** — ``open_polyline``'s ``is_closed`` (0.24), ``polyline_normal`` (0.35) and
+``polyline_centroid`` (0.25), three reductions that each end in a host readback because their result
+is a Python-scope ``wp.vec3``, plus the reflex-count readback. That share is *flat in n*, so it is
+the whole gap to trimesh's 0.12 ms at 64 points and none of it at 1 024.
+
+The round *count* is what this group caught first. ``select_independent`` used to rank competing
+ear candidates by their raw ring index, which on an alternating star lets ear ``i - 2`` suppress
+ear ``i`` for every ``i``, so exactly **one** ear was clipped per round and the loop ran to its
+``n`` cap: 6.1 ms at 64 points and **141 ms** at 1 024, growing as ``n^1.12`` (rounds proportional
+to ``n`` times a slowly growing per-round cost) rather than the ``O(L^2)`` a serial clipper would
+give. Ranking by a bijective hash of the ring index makes it the textbook maximal-independent-set
+rule, which retires a constant fraction per round: 16 and 30 rounds, the latter instead of 1 022.
 
 ``extrude_polygon`` only ever exercises the *convex* fast path (a single fan), which is why the ear
 clipper is benchmarked directly on a non-convex star ring — the same reasoning that puts
-``polyline.simplify_polyline`` in its own group in [`test_polyline.py`](test_polyline.py).
+``polyline.simplify_polyline`` in its own group in [`test_polyline.py`](test_polyline.py). It is
+also why this row does **not** move with anything done to the ear loop (measured flat, 0.81-1.05x
+across an A/B of the device-driven round loop): a convex ring reaches the fan and returns, so
+``extrude_polygon`` is a floor row wearing a triangulator's name, and its loss to trimesh at 64
+points is the ~340 µs wrapper floor plus the same flat prologue.
 
 Deliberately not benchmarked
 ----------------------------
@@ -324,6 +342,10 @@ def test_sphere_cap(bench_lib: BenchLibrary, subdivisions: int) -> None:
 def test_icosphere(bench_lib: BenchLibrary, subdivisions: int) -> None:
     # No open3d counterpart: create_icosahedron is never subdivided. MeshLab's create_sphere is
     # exactly this scheme, so it is the only reference this group has beyond trimesh.
+    #
+    # Since the connectivity became closed-form this row is *also* a floor row at every subdivision
+    # level it is asked for -- 245 / 253 / 345 us at 3 / 5 / 7 is one launch per level over buffers
+    # that reach 164k faces, so the axis reports the wrapper floor rather than the output size.
     if bench_lib.kind == "pymeshlab":
         if subdivisions > 8:
             pytest.skip("MeshLab's create_sphere caps subdiv at 8")
@@ -541,14 +563,17 @@ def test_extrude_polygon(bench_lib: BenchLibrary, ring_size: int) -> None:
 @pytest.mark.parametrize("ring_size", _STAR_RINGS)
 def test_triangulate_polygon(bench_lib: BenchLibrary, ring_size: int) -> None:
     """
-    Ear clipping on a *non-convex* ring: round-count-bound, and the module's real slowness path.
+    Ear clipping on a *non-convex* ring: the only group here that reaches the clipper at all.
 
     ``extrude_polygon`` above hands the triangulator a convex ring, which takes the single-fan fast
-    path and never reaches the ear loop. A star ring forces it, so this is the only group here that
-    measures the clipper itself. Each round is fully parallel (three ``dim=n`` launches); what this
-    group actually measures is **how many rounds the independent-set rule needs**. Read the two
-    points as a rounds ratio, not a work ratio: 16 and 30 rounds, against 62 and 1 022 before the
-    ranking hash. No open3d counterpart.
+    path and never reaches the ear loop. A star ring forces it. Each round is fully parallel (four
+    ``dim=n`` launches) and the round loop itself runs on device, so what this group measures is
+    **how many rounds the independent-set rule needs**: 16 and 30, against 62 and 1 022 before the
+    ranking hash.
+
+    At ``ring_size=64`` that is no longer the dominant term -- the clip is 0.22 ms of a 2.2 ms call
+    and the flat plane-fitting prologue is 1.05 -- so read the small point as a floor row and the
+    large one as a rounds ratio. No open3d counterpart.
     """
     shapely = pytest.importorskip("shapely.geometry")
     if bench_lib.kind == "triwarp":

@@ -30,7 +30,11 @@ replicated in memory — the ``matvec`` issues ``k`` ``bsr_mv`` calls against th
 
 **Determinism.** Build each operator natively at its final dtype in a *single*
 ``warp.sparse.bsr_from_triplets`` and never recast or rebuild it: ``bsr_mm`` is only deterministic
-on single-build operators (see ``downloads/issue_report.md``). Nothing here recasts an operator.
+on single-build operators (see ``downloads/issue_report.md``). Nothing here recasts an operator. The
+one exception is deliberate and safe: ``Q_uu`` is assembled as a CSR *directly*, without any triplet
+build (see [`assemble_interior_system`][triwarp.linalg.assemble_interior_system]), and it only ever
+reaches ``bsr_mv`` and ``bsr_get_diag`` — the caller's ``Q``, which *is* multiplied, keeps the
+single-build rule.
 
 **Why Jacobi.** Every solve here preconditions with ``warp.optim.linear.preconditioner(A, "diag")``,
 and the alternatives were measured and rejected rather than overlooked. On a cotangent Laplacian a
@@ -213,9 +217,25 @@ def assemble_interior_system(
     """
     Extract the free-free block ``Q_uu`` and the constant right-hand side ``-Q_ub bc``.
 
-    One launch over the ``n_dofs`` rows of ``q`` emits the free-free COO block (remapped through
-    ``free_map``) and accumulates the pinned-column contributions into ``n_rhs`` right-hand-side
-    rows, followed by a single ``bsr_from_triplets``.
+    A **CSR-to-CSR** extraction in two launches over the ``n_dofs`` rows of ``q``: the first counts
+    each free row's surviving entries (and accumulates the pinned-column contributions into the
+    ``n_rhs`` right-hand-side rows, which needs the same row scan), a prefix sum turns those counts
+    into row offsets, and the second fills ``columns`` / ``values`` in place, remapped through
+    ``free_map``. The result is handed to a ``warp.sparse.BsrMatrix`` directly.
+
+    !!! note "Why not ``bsr_from_triplets``"
+        Because the input is *already* a CSR. Emitting ``q.nnz`` triplets and letting
+        ``bsr_from_triplets`` sort and duplicate-accumulate them re-derives an order the input
+        already had -- measured at **20.7 ms in a single launch, 91 % of all device time** in
+        ``min_quad_with_fixed`` on ``benchmarks/test_linalg.py``'s ``saddle`` case, against 1.65 ms
+        for the entire CG solve it feeds. Row order comes from the launch index and column order
+        from ``q``'s own rows through the monotone ``free_map``, so the extracted matrix is sorted
+        by construction.
+
+        It also fixes a second, quieter cost: ``bsr_from_triplets`` leaves ``nnz`` at the *triplet*
+        count, which is ``q.nnz`` — an upper bound measured at 3.5x the true entry count of a
+        lightly-pinned ``Q_uu`` — so every downstream ``bsr_mv`` was dimensioned for the unreduced
+        matrix. The count here is exact.
 
     Parameters
     ----------
@@ -245,31 +265,36 @@ def assemble_interior_system(
     device = fixed_mask.device
     n_dofs = int(fixed_mask.shape[0])
     n_rhs = int(fixed_values.shape[0])
-    nnz = int(q.nnz)
-    out_rows = wp.zeros(nnz, dtype=wp.int32, device=device)
-    out_cols = wp.zeros(nnz, dtype=wp.int32, device=device)
-    out_vals = wp.zeros(nnz, dtype=wp.float64, device=device)
+    # Every free row writes its own count exactly once (``free_map`` is a bijection onto
+    # ``[0, n_free)``), so there is nothing to pre-zero.
+    counts = wp.empty(n_free, dtype=wp.int32, device=device)
     rhs = wp.zeros((n_rhs, n_free), dtype=wp.float64, device=device)
     wp.launch(
-        kernel_linalg.interior_system_triplets,
+        kernel_linalg.interior_row_counts,
         dim=n_dofs,
-        inputs=[
-            q.offsets,
-            q.columns,
-            q.values,
-            fixed_mask,
-            free_map,
-            fixed_values,
-            out_rows,
-            out_cols,
-            out_vals,
-            rhs,
-        ],
+        inputs=[q.offsets, q.columns, q.values, fixed_mask, free_map, fixed_values, counts, rhs],
         device=device,
     )
-    q_uu = wps.bsr_from_triplets(
-        n_free, n_free, out_rows, out_cols, out_vals, prune_numerical_zeros=False
+    # The sentinel form *is* the CSR offsets array, and the one host read it costs (~0.1 ms) is what
+    # sizes ``columns`` / ``values`` for their final use at allocation time.
+    row_offsets, nnz_uu = tw.array.counts_to_offsets(counts, sentinel=True)
+    columns = wp.empty(nnz_uu, dtype=wp.int32, device=device)
+    values = wp.empty(nnz_uu, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_linalg.interior_system_csr,
+        dim=n_dofs,
+        inputs=[q.offsets, q.columns, q.values, fixed_mask, free_map, row_offsets, columns, values],
+        device=device,
     )
+    # Hand the finished CSR to a compact ``BsrMatrix`` directly. ``notify_nnz_changed`` is Warp's
+    # documented entry point for exactly this -- storage metadata assigned from outside
+    # ``warp.sparse`` -- and ``bsr_zeros`` leaves ``row_counts`` at ``None``, which is the compact
+    # topology these arrays describe.
+    q_uu = wps.bsr_zeros(n_free, n_free, wp.float64, device=device)
+    q_uu.offsets = row_offsets
+    q_uu.columns = columns
+    q_uu.values = values
+    q_uu.notify_nnz_changed(nnz=nnz_uu)
     return q_uu, twt.as_array2d_float(rhs, dtype=wp.float64)
 
 

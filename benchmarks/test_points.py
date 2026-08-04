@@ -87,7 +87,9 @@ import triwarp.typing as twt
 _KNN = 30
 
 # Neighbourhood widths to sweep: the per-point 3x3 PCA is linear in k, and the k-NN table build
-# that feeds it is not, so the pair separates the estimator's cost from its input's.
+# that feeds it is not, so the pair separates the estimator's cost from its input's. The table is
+# cached (``_neighbor_table``), so this sweep times the estimator *only* — the query's own k axis is
+# ``query_bvh_nearest_k1`` / ``_k7`` / ``_k64`` in ``test_neighbors.py``.
 _KNN_SWEEP = [8, 64]
 
 # The trimesh references here are single-threaded host passes and one of them is far worse than
@@ -146,7 +148,15 @@ def _pcd(bench_case: BenchCase) -> o3d.geometry.PointCloud:
 @pytest.mark.benchmark(group="point_plane_distance")
 @pytest.mark.benchlibs("triwarp", "trimesh")
 def test_point_plane_distance(bench_case: BenchCase) -> None:
-    """Signed point-to-plane distance of every point: a single ``wp.map`` over the cloud."""
+    """
+    Signed point-to-plane distance of every point: a single ``wp.map`` over the cloud.
+
+    The thinnest kernel in the module, so it is the module's floor row: below roughly ``10 ** 3``
+    points it reports the ~340 µs wrapper floor rather than the map (see
+    ``test_creation::test_box``), and being a ~50 µs GPU row it also has the widest run-to-run
+    spread in the suite -- measured at 46x on unchanged code across two processes. Only read it as
+    part of its axis.
+    """
     n_points = bench_case.n_vertices
     if bench_case.kind == "triwarp":
         points = bench_case.vertices_wp

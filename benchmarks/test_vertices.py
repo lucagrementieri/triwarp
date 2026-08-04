@@ -90,7 +90,14 @@ def _face_normals_and_areas(
 @pytest.mark.benchmark(group="n_vertices")
 @pytest.mark.benchlibs("triwarp", "trimesh")
 def test_n_vertices(bench_case: BenchCase) -> None:
-    """A max-reduce over ``3F`` indices; the scan sweep is here for ``lucy``'s 84M of them."""
+    """
+    A max-reduce over ``3F`` indices; the scan sweep is here for ``lucy``'s 84M of them.
+
+    Below roughly ``10 ** 3`` indices this row reports the ~340 µs wrapper floor and nothing else
+    (see ``test_creation::test_box``), so the small end of the axis loses to ``faces.max()`` by up
+    to two orders of magnitude while ``lucy`` wins by 259x. Read the whole axis, not one point: the
+    crossover, not either endpoint, is what this group establishes.
+    """
     if bench_case.kind == "triwarp":
         faces = cast(twt.Array1dInt32, bench_case.faces_wp)
         result = bench_case.run(lambda: tw.vertices.n_vertices(faces))

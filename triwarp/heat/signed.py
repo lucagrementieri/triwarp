@@ -28,6 +28,7 @@ import itertools
 
 import numpy as np
 import warp as wp
+import warp.optim.linear as wpl
 import warp.sparse as wps
 
 import triwarp as tw
@@ -133,7 +134,8 @@ def heat_signed_distance(
         operators = tw.heat.vector.vector_heat_operators(vertices, faces, t)
     vector_system, scalar, frames = operators
     basis_x, basis_y, vertex_normals = frames
-    _, laplacian, cot_entries, face_normals, _ = scalar
+    poisson_system, poisson_preconditioner = scalar[3], scalar[4]
+    cot_entries, face_normals = scalar[5], scalar[6]
 
     # Stage 1: splat each segment's normal onto its endpoints.
     segments = _curve_segments(curve_vertices, curve_offsets, closed=closed)
@@ -169,8 +171,12 @@ def heat_signed_distance(
     )
 
     if level_set_constraint == "zero_set":
-        return _solve_poisson_zero_set(laplacian, divergence, curve_vertices, n_vertices, device)
-    return _solve_poisson_shifted(laplacian, divergence, curve_vertices, n_vertices, device)
+        return _solve_poisson_zero_set(
+            poisson_system, divergence, curve_vertices, n_vertices, device
+        )
+    return _solve_poisson_shifted(
+        poisson_system, poisson_preconditioner, divergence, curve_vertices, n_vertices, device
+    )
 
 
 def _curve_segments(
@@ -205,7 +211,7 @@ def _curve_segments(
 
 
 def _solve_poisson_zero_set(
-    laplacian: wps.BsrMatrix[wp.float64],
+    operator: wps.BsrMatrix[wp.float64],
     divergence: wp.array[wp.float64],
     curve_vertices: wp.array[wp.int32],
     n_vertices: int,
@@ -219,7 +225,6 @@ def _solve_poisson_zero_set(
     [`assemble_interior_system`][triwarp.linalg.assemble_interior_system] (whose own right-hand side
     is zero here, the pinned values being zero) and the divergence is compacted into it.
     """
-    operator = wps.bsr_axpy(x=laplacian, alpha=-1.0)
     fixed_mask = tw.array.indices_to_mask(curve_vertices, n_vertices)
     free_map, n_free = twl.free_partition(fixed_mask)
     if n_free == 0:
@@ -254,7 +259,8 @@ def _solve_poisson_zero_set(
 
 
 def _solve_poisson_shifted(
-    laplacian: wps.BsrMatrix[wp.float64],
+    operator: wps.BsrMatrix[wp.float64],
+    preconditioner: wpl.LinearOperator,
     divergence: wp.array[wp.float64],
     curve_vertices: wp.array[wp.int32],
     n_vertices: int,
@@ -267,12 +273,11 @@ def _solve_poisson_shifted(
     gradient handles while the right-hand side is consistent; the shift afterwards picks that
     constant, and putting the curve at zero is the choice that makes the result a distance.
     """
-    operator = wps.bsr_axpy(x=laplacian, alpha=-1.0)
     negated = wp.empty(n_vertices, dtype=wp.float64, device=device)
     wp.map(wp.neg, divergence, out=negated)
 
     field = wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    twl.solve_spd(operator, negated, field, tol=_CG_TOLERANCE)
+    twl.solve_spd(operator, negated, field, tol=_CG_TOLERANCE, preconditioner=preconditioner)
     offset = tw.reduce.mean(tw.array.gather(field, curve_vertices))
     wp.map(wp.sub, field, wp.float64(offset), out=field)
     return field

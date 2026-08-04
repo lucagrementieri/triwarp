@@ -12,8 +12,8 @@ face layout, so results feed straight into the rest of the package or into
 profile and sweep it around the Z axis. [`box`][triwarp.creation.box] and the four Platonic solids
 ([`tetrahedron`][triwarp.creation.tetrahedron], [`octahedron`][triwarp.creation.octahedron],
 [`icosahedron`][triwarp.creation.icosahedron], [`dodecahedron`][triwarp.creation.dodecahedron]) are
-constant tables, and [`icosphere`][triwarp.creation.icosphere] refines one of them with
-[`subdivide`][triwarp.remesh.subdivide]. [`grid`][triwarp.creation.grid] and
+constant tables, and [`icosphere`][triwarp.creation.icosphere] refines one of them in closed form.
+[`grid`][triwarp.creation.grid] and
 [`sphere_cap`][triwarp.creation.sphere_cap] are the two *open* primitives — a flat patch and a
 curved one, each with exactly one boundary loop.
 
@@ -28,6 +28,22 @@ Differences from `trimesh.creation` that apply module-wide:
   with ``process=False`` keep their duplicates here too.
 - Polygon inputs are ``wp.vec2`` rings rather than ``shapely`` polygons; interior rings (holes)
   are not supported. See [`triangulate_polygon`][triwarp.creation.triangulate_polygon].
+
+!!! note "Every function here costs at least ~340 µs, and most of them cost exactly that"
+
+    A triwarp wrapper call carries a fixed host-side cost — allocation plus Warp's launch path,
+    ~75 µs of it a NumPy prologue — measured at **~340 µs on an RTX 5090** by
+    ``benchmarks/test_creation.py::test_box``, which builds a 12-triangle constant table and so
+    measures nothing else. That floor is a property of the wrapper layer, not of this module.
+
+    It dominates this module more than any other, because these functions are *small*: `box`,
+    `axis` and the four Platonic solids are constant tables, and every
+    [`revolve`][triwarp.creation.revolve]-based primitive is two launches over one buffer each, so
+    each is flat in its section count from 32 sections to 4096. Below roughly ``10 ** 3``
+    elements of output, a timing of any of them reports launch overhead and nothing else, and a
+    CPU library returning the same mesh from a per-vertex loop wins outright; above a few thousand
+    the flatness is what wins, by 12-150x. Build primitives once and reuse them rather than calling
+    these in a loop — that is the only thing the floor actually asks of a caller.
 """
 
 from __future__ import annotations
@@ -132,6 +148,35 @@ _ICOSAHEDRON_FACES = np.array(
     ],
     dtype=np.int32,
 ).reshape(-1)
+
+
+def _icosphere_face_table() -> np.ndarray:
+    """
+    Per-base-face topology of the icosahedron, as the ``(20, 9)`` int table the icosphere needs.
+
+    Columns are ``(a, b, c)`` — the face's corner vertices, which are also their own global
+    indices — then the base-edge id of each of the three sides ``a-b``, ``b-c``, ``c-a``, then a
+    flag per side saying whether that side runs from the edge's higher-numbered endpoint to its
+    lower one. Base edges are numbered by first appearance in ``_ICOSAHEDRON_FACES``.
+
+    The two flags together are what makes the numbering *shared*: the ``n - 1`` interior points of
+    a base edge are stored once, in the direction of its lower-numbered endpoint, and each of the
+    two faces holding that edge walks them in whichever direction its own winding needs.
+    """
+    faces_np = _ICOSAHEDRON_FACES.reshape(-1, 3)
+    edge_ids: dict[tuple[int, int], int] = {}
+    table_np = np.empty((faces_np.shape[0], 9), dtype=np.int32)
+    for f, (a, b, c) in enumerate(faces_np.tolist()):
+        table_np[f, :3] = (a, b, c)
+        for side, (u, v) in enumerate(((a, b), (b, c), (c, a))):
+            key = (min(u, v), max(u, v))
+            table_np[f, 3 + side] = edge_ids.setdefault(key, len(edge_ids))
+            table_np[f, 6 + side] = u > v
+    return table_np
+
+
+# Built once: the icosahedron's topology is a constant, so the only per-call cost is the upload.
+_ICOSPHERE_FACE_TABLE = _icosphere_face_table()
 
 
 # The remaining three Platonic solids, as MeshLab's ``create_tetrahedron`` /
@@ -503,15 +548,16 @@ def icosphere(
     """
     Create a geodesic sphere by recursively subdividing an icosahedron.
 
-    Each pass splits every triangle into four ([`subdivide`][triwarp.remesh.subdivide]) and
-    projects the new vertices back onto the sphere, so the result has ``20 * 4 ** subdivisions``
-    faces and ``10 * 4 ** subdivisions + 2`` vertices. Triangles stay far more uniform than
-    [`uv_sphere`][triwarp.creation.uv_sphere]'s, at roughly an order of magnitude more work.
+    Each refinement level splits every triangle into four and projects the new vertices back onto
+    the sphere, so the result has ``20 * 4 ** subdivisions`` faces and ``10 * 4 ** subdivisions +
+    2`` vertices — the same mesh [`trimesh.creation.icosphere`][] builds. Triangles stay far more
+    uniform than [`uv_sphere`][triwarp.creation.uv_sphere]'s, at roughly an order of magnitude
+    more work.
 
     Parameters
     ----------
     subdivisions
-        Number of refinement passes. Face count grows as ``4 ** subdivisions``, so values above
+        Number of refinement levels. Face count grows as ``4 ** subdivisions``, so values above
         ~7 get expensive. Values ``<= 0`` return a plain icosahedron scaled to ``radius``.
     radius
         Sphere radius.
@@ -523,6 +569,38 @@ def icosphere(
     tuple[wp.array[wp.vec3], wp.array[wp.int32]]
         ``(vertices, faces)`` on ``device``.
 
+    Notes
+    -----
+    The connectivity is generated in closed form rather than by iterating
+    [`subdivide`][triwarp.remesh.subdivide]: every vertex of the refined mesh is addressed directly
+    by its barycentric coordinates within one of the 20 base faces (see
+    ``kernels.creation.icosphere_vertex_index``), so the whole face buffer is written by **one**
+    kernel and the vertices by one launch per refinement level. That is ``subdivisions + 2``
+    launches and no host synchronization, against ~17 launches per level — an edge dedup, a radix
+    sort and a count readback each time — for the iterated form.
+
+    Measured back to back on an RTX 5090 (`benchmarks/test_creation.py`'s ``icosphere`` group,
+    medians from ``--benchmark-json``): **19-31x**, and flat where the iterated form was not.
+
+    | ``subdivisions`` | iterated | closed form | |
+    |---|---|---|---|
+    | 3 (1 280 faces) | 4.76 ms | **245 µs** | 19.4x |
+    | 5 (20 480 faces) | 7.86 ms | **253 µs** | 31.1x |
+    | 7 (327 680 faces) | 6.87 ms | **345 µs** | 22.3x |
+
+    The iterated column being *non-monotonic* is the tell that it was measuring host cost rather
+    than the output: seven `subdivide` passes cost more than five of them, and neither cost is about
+    the faces. What is left is the ~340 µs wrapper floor, so this now beats
+    [`trimesh.creation.icosphere`][] at every level (472 µs at 3, 67.1 ms at 7) instead of losing 6x
+    at level 3.
+
+    The *geometry* is still the recursive one, level by level, because that is what the reference
+    produces: a vertex is the projected midpoint of two vertices of the previous level, which is
+    not the same point as the projection of the corresponding barycentric point of the base face
+    (the two differ by a few percent of the edge length). Vertex *order* differs from both trimesh
+    and the former iterated implementation — vertices come out as the 12 base corners, then the
+    interior points of each base edge, then the interior points of each base face.
+
     See Also
     --------
     [`icosahedron`][triwarp.creation.icosahedron]
@@ -530,32 +608,31 @@ def icosphere(
     [`subdivide`][triwarp.remesh.subdivide]
     [`trimesh.creation.icosphere`][]
     """
+    levels = max(0, int(subdivisions))
+    n = 1 << levels
     radius_f = wp.float32(float(radius))
-    vertices, faces = icosahedron(device=device)
 
-    project = wp.map(
-        kernel_creation.project_to_radius, vertices, radius_f, out=vertices, return_kernel=True
+    table = wp.array(_ICOSPHERE_FACE_TABLE, dtype=wp.int32, device=device)
+    corners = _upload_vertices(_ICOSAHEDRON_VERTICES, device)
+    vertices = wp.empty(10 * 4**levels + 2, dtype=wp.vec3, device=corners.device)
+    # The 12 base corners occupy the first block of the numbering, so scaling them to `radius` is
+    # the whole of level 0.
+    wp.map(kernel_creation.project_to_radius, corners, radius_f, out=vertices[:12])
+    for level in range(1, levels + 1):
+        wp.launch(
+            kernel_creation.icosphere_generation,
+            dim=(20, (1 << level) + 1, (1 << level) + 1),
+            inputs=[table, wp.int32(n), wp.int32(1 << level), radius_f, vertices],
+            device=vertices.device,
+        )
+
+    faces = wp.empty(20 * n * n * 3, dtype=wp.int32, device=vertices.device)
+    wp.launch(
+        kernel_creation.icosphere_faces,
+        dim=(20, n, n),
+        inputs=[table, wp.int32(n), faces],
+        device=vertices.device,
     )
-    for _ in range(int(subdivisions)):
-        vertices, faces = tw.remesh.subdivide(vertices, faces)
-        wp.launch(
-            project,
-            dim=int(vertices.shape[0]),
-            inputs=[vertices, radius_f],
-            outputs=[vertices],
-            device=vertices.device,
-        )
-
-    if int(subdivisions) <= 0:
-        # No subdivision happened, so the radius still has to be honored once.
-        wp.launch(
-            project,
-            dim=int(vertices.shape[0]),
-            inputs=[vertices, radius_f],
-            outputs=[vertices],
-            device=vertices.device,
-        )
-
     return vertices, faces
 
 

@@ -16,6 +16,7 @@ reductions differ only by the ``scale`` passed from Python scope. Following the
 
 import warp as wp
 
+from triwarp.constants import TILE_1D
 from triwarp.kernels.triangles import face_vertices
 
 # Relative coplanarity tolerance for the triangle-interior test, matching
@@ -72,7 +73,39 @@ def point_triangle_sq_dist(p: wp.vec3, a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp
 
 
 @wp.kernel
-def chamfer_nn_term(
+def chamfer_nn_term_tiled(
+    x: wp.array[wp.vec3],
+    y: wp.array[wp.vec3],
+    nearest: wp.array[wp.int32],
+    scale: wp.float32,
+    out_loss: wp.array[wp.float32],
+) -> None:
+    """
+    Accumulate ``scale * ||x[i] - y[nearest[i]]||^2`` into ``out_loss[0]``.
+
+    ``nearest[i]`` is the (fixed, non-differentiable) index in ``y`` closest to ``x[i]``.
+    CUDA path, launched via ``wp.launch_tiled`` (block ``TILE_1D``): each block reduces its lanes
+    cooperatively and commits one atomic; out-of-range lanes contribute zero. Tile ops carry
+    adjoints, so the kernel stays differentiable under ``wp.Tape``.
+
+    The CPU device MUST use
+    [`chamfer_nn_term_sliced`][triwarp.kernels.distance.chamfer_nn_term_sliced] instead:
+    ``wp.launch_tiled`` runs exactly one lane per block there, so this block reduction would see
+    one point per tile and the loss would come out roughly 64x too small.
+    """
+    i, t = wp.tid()
+    idx = i * TILE_1D + int(t)
+    contrib = wp.float32(0.0)
+    if idx < x.shape[0]:
+        diff = x[idx] - y[nearest[idx]]
+        contrib = scale * wp.length_sq(diff)
+    total = wp.tile_sum(wp.tile(contrib))
+    if t == 0:
+        wp.tile_atomic_add(out_loss, total, (0,))
+
+
+@wp.kernel
+def chamfer_nn_term_sliced(
     x: wp.array[wp.vec3],
     y: wp.array[wp.vec3],
     nearest: wp.array[wp.int32],
@@ -83,12 +116,13 @@ def chamfer_nn_term(
     """
     Accumulate ``scale * ||x[i] - y[nearest[i]]||^2`` into ``out_loss[0]``.
 
-    ``nearest[i]`` is the (fixed, non-differentiable) index in ``y`` closest to ``x[i]``.
-    One thread per slice walks a strided slice of ``x``, accumulates locally and commits one
-    ``wp.atomic_add``. Both the dynamic loop and the atomic carry adjoints, so the kernel stays
-    differentiable under ``wp.Tape``. Deliberately lane-free: the block-wide ``wp.tile_sum`` this
-    replaces reduced a single lane on Warp 1.15's CPU device, where ``wp.launch_tiled`` runs one
-    lane per block, so the loss came out roughly 64x too small there.
+    Portable path, correct on both devices: one thread per slice walks a strided slice of ``x``,
+    accumulates locally and commits one ``wp.atomic_add``. Both the dynamic loop and the atomic
+    carry adjoints, so the kernel stays differentiable under ``wp.Tape``. Lane-free, so it is
+    correct on the CPU device where
+    [`chamfer_nn_term_tiled`][triwarp.kernels.distance.chamfer_nn_term_tiled] is not; it gives up
+    the block shuffle-reduce and measures 1.57x slower on CUDA at 500k points (19.0 -> 29.7 us),
+    which is why both exist.
     """
     j = wp.tid()
     total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
@@ -99,7 +133,38 @@ def chamfer_nn_term(
 
 
 @wp.kernel
-def chamfer_surface_term(
+def chamfer_surface_term_tiled(
+    points: wp.array[wp.vec3],
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_id: wp.array[wp.int32],
+    scale: wp.float32,
+    out_loss: wp.array[wp.float32],
+) -> None:
+    """
+    Accumulate ``scale * d(points[i], triangle face_id[i])^2`` into ``out_loss[0]``.
+
+    ``face_id[i]`` is the (fixed, non-differentiable) index of the triangle of the mesh
+    closest to ``points[i]``. Gradients flow to both ``points`` and ``vertices``. Points
+    with ``face_id[i] < 0`` (no face within the search radius) contribute nothing. Same tiled
+    CUDA reduction as [`chamfer_nn_term_tiled`][triwarp.kernels.distance.chamfer_nn_term_tiled],
+    and CPU-unsafe for the same reason.
+    """
+    i, t = wp.tid()
+    idx = i * TILE_1D + int(t)
+    contrib = wp.float32(0.0)
+    if idx < points.shape[0]:
+        f = face_id[idx]
+        if f >= 0:
+            a, b, c = face_vertices(vertices, faces, f)
+            contrib = scale * point_triangle_sq_dist(points[idx], a, b, c)
+    total = wp.tile_sum(wp.tile(contrib))
+    if t == 0:
+        wp.tile_atomic_add(out_loss, total, (0,))
+
+
+@wp.kernel
+def chamfer_surface_term_sliced(
     points: wp.array[wp.vec3],
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -114,7 +179,8 @@ def chamfer_surface_term(
     ``face_id[i]`` is the (fixed, non-differentiable) index of the triangle of the mesh
     closest to ``points[i]``. Gradients flow to both ``points`` and ``vertices``. Points
     with ``face_id[i] < 0`` (no face within the search radius) contribute nothing. Same lane-free
-    sliced reduction as [`chamfer_nn_term`][triwarp.kernels.distance.chamfer_nn_term], for the same
+    sliced reduction as
+    [`chamfer_nn_term_sliced`][triwarp.kernels.distance.chamfer_nn_term_sliced], for the same
     reason.
     """
     j = wp.tid()

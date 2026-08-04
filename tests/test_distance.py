@@ -587,12 +587,13 @@ def test_chamfer_mesh_to_mesh_loss_grad(
 @pytest.mark.parametrize("kernel_device", ["cpu", "cuda:0"])
 def test_chamfer_losses_match_numpy_on_both_devices(kernel_device: str) -> None:
     """
-    Pin both chamfer loss reductions on the CPU device against a closed-form NumPy sum.
+    Pin both chamfer loss reductions on **both** devices against a closed-form NumPy sum.
 
     ``wp.launch_tiled`` runs exactly one lane per block on Warp 1.15's CPU backend, so the
     block-wide ``wp.tile_sum`` these losses used to perform accumulated one point per 64-point tile
     there and returned a loss roughly 64x too small -- measured 0.43 absolute on this size of cloud.
-    Both reductions are lane-free now.
+    Each term now has a lane-free ``*_sliced`` kernel for CPU and keeps the ``*_tiled`` one on CUDA,
+    so the parametrization is what covers both: dropping either device leaves a kernel untested.
     """
     if kernel_device.startswith("cuda") and not wp.is_cuda_available():
         pytest.skip("no CUDA device")

@@ -21,6 +21,7 @@ All three solvers need conjugate gradient and are therefore CUDA-only, like
 from __future__ import annotations
 
 import warp as wp
+import warp.optim.linear as wpl
 import warp.sparse as wps
 
 import triwarp as tw
@@ -168,7 +169,7 @@ def extend_scalar(
 
     if operators is None:
         operators = heat_operators(vertices, faces, t)
-    heat_system = operators[0]
+    heat_system, heat_preconditioner = operators[0], operators[1]
 
     indicator = wp.zeros(n_vertices, dtype=wp.float64, device=device)
     weighted = wp.zeros(n_vertices, dtype=wp.float64, device=device)
@@ -179,8 +180,10 @@ def extend_scalar(
         device=device,
     )
 
-    diffused_indicator = _solve_scalar(heat_system, indicator, n_vertices, device)
-    diffused_values = _solve_scalar(heat_system, weighted, n_vertices, device)
+    diffused_indicator = _solve_scalar(
+        heat_system, indicator, n_vertices, device, heat_preconditioner
+    )
+    diffused_values = _solve_scalar(heat_system, weighted, n_vertices, device, heat_preconditioner)
     extended = wp.empty(n_vertices, dtype=wp.float64, device=device)
     wp.map(kernel_heat_vector.divide_positive, diffused_values, diffused_indicator, out=extended)
     return extended
@@ -354,7 +357,7 @@ def log_map(
     # Radial direction: the unit gradient of the distance field, averaged onto vertices and
     # expressed in each vertex's frame.
     distance = heat_geodesic(vertices, faces, sources, operators=scalar)
-    _, _, _, normals, areas = scalar
+    normals, areas = scalar[6], scalar[7]
     n_faces = int(faces.shape[0]) // 3
     face_gradient = wp.empty(n_faces, dtype=wp.vec3d, device=device)
     wp.launch(
@@ -478,10 +481,13 @@ def _solve_scalar(
     right_hand_side: wp.array[wp.float64],
     n_vertices: int,
     device: wp.DeviceLike,
+    preconditioner: wpl.LinearOperator,
 ) -> wp.array[wp.float64]:
     """Diffuse one scalar right-hand side through an already-assembled heat system."""
     solution = wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    twl.solve_spd(system, right_hand_side, solution, tol=_CG_TOLERANCE)
+    twl.solve_spd(
+        system, right_hand_side, solution, tol=_CG_TOLERANCE, preconditioner=preconditioner
+    )
     return solution
 
 

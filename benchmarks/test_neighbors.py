@@ -21,8 +21,11 @@ are the structure's own parameters, and there are three:
 
 * **k**, expressed as separate groups (``_k1`` / ``_k7``) rather than as a parametrize sweep,
   because the two are different call sites rather than two points on a curve: ``k=1`` is what
-  ``distance.py`` and ICP use and takes a fast path, ``k=7`` is ``ball_pivoting``'s seed table and
-  maintains a per-query heap.
+  ``distance.py`` and ICP use, ``k=7`` is ``ball_pivoting``'s seed table and maintains a sorted
+  candidate row. The two land in different generated kernels — the row is register-resident and one
+  kernel exists per row-size bucket (``kernels.neighbors.KNN_ROW_BUCKETS``), so ``k=1`` and ``k=7``
+  are not the same code. The larger ``k`` values in-repo (30 and 64) are timed by
+  [`test_points.py`](test_points.py), where they are what the outlier statistics ask for.
 * **build against query**. The k-NN groups above include the build, which is what a caller passing
   raw buffers pays. The ``*_from_points`` groups below time the build *alone*, so subtracting them
   answers the question that matters for ICP: whether its per-iteration index rebuild is the cost or
@@ -177,6 +180,28 @@ def test_query_bvh_nearest_k7(bench_case: BenchCase) -> None:
         assert indices.shape == (queries.shape[0], 7)
     else:
         _run_scipy(bench_case, 7)
+
+
+@pytest.mark.benchmark(group="query_bvh_nearest_k64")
+@pytest.mark.benchlibs("triwarp", "scipy")
+def test_query_bvh_nearest_k64(bench_case: BenchCase) -> None:
+    """
+    ``k=64`` BVH k-NN — the largest register-row bucket, and the k axis's far end.
+
+    The candidate row costs ``2 * k`` registers, so this is the last ``k`` the row fits in them; at
+    65 the search falls back to the global-memory-row kernel and the cost per neighbour jumps
+    (measured 7.8x between the two at this ``k``). The group exists to keep that boundary visible:
+    without it the suite's k axis stops at 7 and the regime the row storage governs is unmeasured.
+    """
+    skip_larger_than(bench_case, "dragon")
+    if bench_case.kind == "triwarp":
+        points, queries = bench_case.vertices_wp, _queries_wp(bench_case)
+        indices, _distances = bench_case.run(
+            lambda: tw.neighbors.query_bvh_nearest(points, queries, k=64)
+        )
+        assert indices.shape == (queries.shape[0], 64)
+    else:
+        _run_scipy(bench_case, 64)
 
 
 @pytest.mark.benchmark(group="query_hashgrid_nearest_k7")

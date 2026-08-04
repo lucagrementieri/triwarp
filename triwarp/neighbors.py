@@ -910,6 +910,16 @@ def query_bvh_nearest(
     The last attempt always runs at the per-query radius that provably covers the whole point
     cloud, so the result is exact however the growth went.
 
+    The candidate row itself is held **in registers** for ``k <= 64``, in a kernel generated per
+    row-size bucket (``kernels.neighbors.KNN_ROW_BUCKETS``; the row keeps the bucket's worth of
+    nearest points and returns the first ``k``). That is what makes a larger ``k`` affordable — the
+    row, not the geometry, is the cost of a k-NN scan, and a global-memory row pays a shift per
+    accepted candidate: at ``k=32`` on ``bunny``, 225 candidates are enumerated per query against
+    2 305 shifted row elements. Measured against that global-memory row on 20 000 ``bunny``
+    queries: 1.09x at ``k=1``, 1.5x at ``k=7``, 2.9x at ``k=30``, 7.8x at ``k=64``. Past ``k=64`` a
+    register row would spill, so there is no bucket for it: the search falls back to the
+    global-memory kernel and the super-linear growth in ``k`` resumes.
+
     !!! note "``initial_radius`` is a performance knob, not a filter"
         Only ``max_radius`` restricts *which* neighbors are returned. ``initial_radius`` sets
         where the deepening starts, so any non-negative value — including ``0`` and ``math.inf``
@@ -994,12 +1004,12 @@ def query_bvh_nearest(
     if bvh is None:
         bvh = bvh_from_points(points, leaf_size)
 
-    # ``wp.empty``, not ``wp.full``: the kernel resets each row before every scan (it has to, since
-    # the insert does not deduplicate), so pre-filling here would be two wasted launches.
+    # ``wp.empty``, not ``wp.full``: every row is written in full by the kernel, so pre-filling
+    # here would be two wasted launches.
     neighbor_indices = twt.empty_int32_2d((m, k), device=device)
     neighbor_distances = twt.empty_float32_2d((m, k), device=device)
     wp.launch(
-        kernel_neighbors.query_bvh_nearest_neighbors,
+        kernel_neighbors.bvh_nearest_kernel(k),
         dim=m,
         inputs=[
             points,
@@ -1069,9 +1079,10 @@ def query_hashgrid_nearest(
     For each query center, find the ``k`` nearest data points (HashGrid backend).
 
     Same semantics and the same iterative deepening as
-    [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest]; broad-phase uses
-    ``warp.HashGrid`` with ``wp.hash_grid_query``, which enumerates every cell overlapping the
-    query cube, so the same "``k``-th distance at most ``r`` certifies the row" argument holds.
+    [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] — including the register-resident
+    candidate row for ``k <= 64``; broad-phase uses ``warp.HashGrid`` with ``wp.hash_grid_query``,
+    which enumerates every cell overlapping the query cube, so the same "``k``-th distance at most
+    ``r`` certifies the row" argument holds.
 
     Two things differ from the BVH backend, both because a grid cannot follow an unbounded radius:
     ``wp.hash_grid_query`` visits ``(2 ceil(r / cell) + 1) ** 3`` cells, so the search falls back
@@ -1167,7 +1178,7 @@ def query_hashgrid_nearest(
     neighbor_indices = twt.empty_int32_2d((m, k), device=device)
     neighbor_distances = twt.empty_float32_2d((m, k), device=device)
     wp.launch(
-        kernel_neighbors.query_hashgrid_nearest_neighbors,
+        kernel_neighbors.hashgrid_nearest_kernel(k),
         dim=m,
         inputs=[
             points,

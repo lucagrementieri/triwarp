@@ -575,3 +575,21 @@ def clip_selected(
     active[i] = wp.int32(0)
     right[a] = b
     left[b] = a
+
+
+@wp.kernel
+def ear_loop_continue(
+    out_count: wp.array[wp.int32],
+    target: wp.int32,
+    max_rounds: wp.int32,
+    out_state: wp.array[wp.int32],
+) -> None:
+    # Ear-clipping loop control, kept on device so ``wp.capture_while`` can drive the rounds without
+    # a readback each time: ``out_state[0]`` counts rounds and ``out_state[1]`` is the condition.
+    # The round cap is what stops a degenerate or self-intersecting loop that never retires an ear
+    # -- the same bound the host-driven form got from iterating ``range(n)``.
+    out_state[0] = out_state[0] + 1
+    if out_count[0] < target and out_state[0] < max_rounds:
+        out_state[1] = wp.int32(1)
+    else:
+        out_state[1] = wp.int32(0)

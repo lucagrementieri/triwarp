@@ -19,6 +19,22 @@ from triwarp.kernels.algorithms import bfs as kernel_bfs
 MAX_SEARCH_ATTEMPTS = wp.constant(wp.int32(16))
 RADIUS_GROWTH = wp.constant(wp.float32(2.0))
 
+# Candidate-row sizes the register-resident k-NN kernels are generated for. The row is held in a
+# ``wp.types.vector(length=K)`` value type, i.e. in registers, so ``K`` must be a compile-time
+# constant and one kernel exists per bucket. A query takes the smallest bucket that fits its ``k``,
+# keeps the ``K`` nearest (a superset of the ``k`` nearest) and writes out only the first ``k``
+# slots; a ``k`` past the largest bucket falls back to the global-memory row kernels.
+#
+# Measured on an RTX 5090 against the global-memory row, bunny / 20 000 queries: 1.09x at k=1,
+# 1.5x at k=7, 1.9x at k=16, 2.9x at k=30, 7.8x at k=64. 64 is the last bucket because that is
+# where the curve turns, not because the gain runs out: a 96-wide row spills (2 x K registers) and
+# drops back to 1.66x, so a bucket past 64 would buy little and no in-repo caller asks for one.
+#
+# The buckets are not free: they cost ``2 x len(KNN_ROW_BUCKETS)`` generated kernels, which take
+# this module's cold-cache compile from 3.9 s to ~12 s (once per Warp version and arch) and its
+# warm per-process load from 2.4 ms to ~5 ms.
+KNN_ROW_BUCKETS = (1, 4, 8, 16, 32, 64)
+
 
 @wp.func
 def bvh_aabb_collect(
@@ -323,6 +339,120 @@ def query_bvh_nearest_neighbors(
             r = wp.min(r * RADIUS_GROWTH, r_hard)
 
 
+# ---------------------------------------------------------------------------------------------
+# Register-row k-NN kernel factories.
+#
+# ``query_bvh_nearest_neighbors`` above keeps its candidate row in the *output* arrays, so every
+# accepted candidate pays a binary search plus two shift passes over global memory, and the row is
+# re-zeroed there on every deepening attempt. Measured on bunny at k=32: 225 candidates enumerated
+# per query against 2 305 shifted row elements, i.e. the row traffic — not the geometry — is the
+# call. Holding the row in a ``wp.types.vector(length=K)`` value type puts it in registers, which
+# is why these kernels exist and why ``K`` has to be a compile-time constant.
+#
+# The insert is written out inline rather than factored into a ``@wp.func``: passing a vector to a
+# helper takes its address, which forces the row back into local memory and gives up the whole
+# point. A ``wp.zeros(shape=K)`` stack array has the same problem — measured a **2x loss** against
+# the global row, because nothing promotes it to registers.
+#
+# Tie-break equivalence is the contract, not just the values: the shipped kernel inserts *after*
+# equals (``binary_search_index`` is ``searchsorted(side="right")``), so among candidates at the
+# same float32 distance the first one enumerated wins the slot. The carry below reproduces that
+# exactly — it walks past equals before displacing, and ``placed`` keeps a run of equal distances
+# further down the row from stopping the shift chain (without it, an equal element in the row
+# silently drops a neighbour, which was measured as one differing row in 20 000 on bunny at k=32).
+# ---------------------------------------------------------------------------------------------
+
+
+def _bvh_nearest_row_kernel(row_size: int, name: str):
+    """``K = row_size`` register-row variant of ``query_bvh_nearest_neighbors``."""
+    vec_distances = wp.types.vector(length=row_size, dtype=wp.float32)
+    vec_indices = wp.types.vector(length=row_size, dtype=wp.int32)
+
+    def _kernel(
+        points: wp.array[wp.vec3],
+        queries: wp.array[wp.vec3],
+        bvh_id: wp.uint64,
+        k: wp.int32,
+        max_radius: wp.float32,
+        initial_radius: wp.float32,
+        min_bound: wp.vec3,
+        max_bound: wp.vec3,
+        out_indices: wp.array2d[wp.int32],
+        out_distances: wp.array2d[wp.float32],
+    ) -> None:
+        tid = wp.tid()
+        q = queries[tid]
+        row_indices = vec_indices()
+        row_distances = vec_distances()
+
+        r_hard = wp.min(max_radius, complete_radius(q, min_bound, max_bound))
+        r = wp.min(initial_radius, r_hard)
+        # Exactly one ``wp.bvh_query_aabb`` call site, for the 32 KB shared-memory reason given on
+        # ``query_bvh_nearest_neighbors``.
+        for attempt in range(MAX_SEARCH_ATTEMPTS):
+            if attempt == MAX_SEARCH_ATTEMPTS - 1:
+                r = r_hard  # forced-complete final attempt: exact whatever the growth did
+            for slot in range(row_size):
+                row_indices[slot] = wp.int32(-1)
+                row_distances[slot] = FLOAT32_INF_CONSTANT
+            query = wp.bvh_query_aabb(bvh_id, q - wp.vec3(r), q + wp.vec3(r), root=-1)
+            point_index = wp.int32(0)
+            while wp.bvh_query_next(query, point_index):
+                d = wp.length(points[point_index] - q)
+                if d <= max_radius and d < row_distances[row_size - 1]:
+                    carry_distance = d
+                    carry_index = point_index
+                    placed = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
+                    for slot in range(row_size):
+                        if placed == 1 or carry_distance < row_distances[slot]:
+                            placed = 1
+                            held_distance = row_distances[slot]
+                            held_index = row_indices[slot]
+                            row_distances[slot] = carry_distance
+                            row_indices[slot] = carry_index
+                            carry_distance = held_distance
+                            carry_index = held_index
+            # The k-th distance certifies the scan. Read through an unrolled compare rather than
+            # ``row_distances[k - 1]``: a runtime index into a vector spills it to local memory.
+            worst = FLOAT32_INF_CONSTANT
+            for slot in range(row_size):
+                if slot == k - 1:
+                    worst = row_distances[slot]
+            if worst <= r:
+                break  # every point outside the cube is farther than the k-th best: exact
+            if r >= r_hard:
+                break  # the scan was already complete, so the row is final
+            if worst < FLOAT32_INF_CONSTANT:
+                # The row is full but reaches past the cube. Re-scanning at exactly ``worst`` is
+                # guaranteed to certify, so this costs at most one more pass.
+                r = wp.min(worst, r_hard)
+            else:
+                r = wp.min(r * RADIUS_GROWTH, r_hard)
+
+        for slot in range(row_size):
+            if slot < k:
+                out_indices[tid, slot] = row_indices[slot]
+                out_distances[tid, slot] = row_distances[slot]
+
+    _kernel.__name__ = name
+    _kernel.__qualname__ = name
+    return wp.kernel(_kernel)
+
+
+_BVH_NEAREST_ROW_KERNELS = {
+    row_size: _bvh_nearest_row_kernel(row_size, f"query_bvh_nearest_neighbors_row{row_size}")
+    for row_size in KNN_ROW_BUCKETS
+}
+
+
+def bvh_nearest_kernel(k: int) -> wp.Kernel:
+    """Register-row BVH k-NN kernel for the smallest bucket fitting ``k``, else global-row."""
+    for row_size in KNN_ROW_BUCKETS:
+        if k <= row_size:
+            return _BVH_NEAREST_ROW_KERNELS[row_size]
+    return query_bvh_nearest_neighbors
+
+
 @wp.func
 def knn_hashgrid_scan(
     points: wp.array[wp.vec3],
@@ -401,6 +531,120 @@ def query_hashgrid_nearest_neighbors(
         else:
             r = wp.min(r * RADIUS_GROWTH, r_hard)
     knn_linear_scan(points, q, k, max_radius, out_indices_row, out_distances_row)
+
+
+def _hashgrid_nearest_row_kernel(row_size: int, name: str):
+    """``K = row_size`` register-row variant of ``query_hashgrid_nearest_neighbors``."""
+    vec_distances = wp.types.vector(length=row_size, dtype=wp.float32)
+    vec_indices = wp.types.vector(length=row_size, dtype=wp.int32)
+
+    def _kernel(
+        points: wp.array[wp.vec3],
+        queries: wp.array[wp.vec3],
+        grid_id: wp.uint64,
+        k: wp.int32,
+        max_radius: wp.float32,
+        initial_radius: wp.float32,
+        widest: wp.float32,
+        min_bound: wp.vec3,
+        max_bound: wp.vec3,
+        out_indices: wp.array2d[wp.int32],
+        out_distances: wp.array2d[wp.float32],
+    ) -> None:
+        tid = wp.tid()
+        q = queries[tid]
+        row_indices = vec_indices()
+        row_distances = vec_distances()
+
+        r_hard = wp.min(max_radius, complete_radius(q, min_bound, max_bound))
+        r = wp.min(initial_radius, r_hard)
+        certified = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
+        for _attempt in range(MAX_SEARCH_ATTEMPTS):
+            if not r <= widest:
+                # Past ``widest`` a cell walk costs more than touching every point (and a NaN
+                # query lands here too, which is what bounds this loop). Finish exactly instead.
+                break
+            for slot in range(row_size):
+                row_indices[slot] = wp.int32(-1)
+                row_distances[slot] = FLOAT32_INF_CONSTANT
+            query = wp.hash_grid_query(grid_id, q, r)
+            point_index = wp.int32(-1)
+            while wp.hash_grid_query_next(query, point_index):
+                d = wp.length(points[point_index] - q)
+                if d <= max_radius and d < row_distances[row_size - 1]:
+                    carry_distance = d
+                    carry_index = point_index
+                    placed = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
+                    for slot in range(row_size):
+                        if placed == 1 or carry_distance < row_distances[slot]:
+                            placed = 1
+                            held_distance = row_distances[slot]
+                            held_index = row_indices[slot]
+                            row_distances[slot] = carry_distance
+                            row_indices[slot] = carry_index
+                            carry_distance = held_distance
+                            carry_index = held_index
+            worst = FLOAT32_INF_CONSTANT  # unrolled k-th read, as in the BVH twin
+            for slot in range(row_size):
+                if slot == k - 1:
+                    worst = row_distances[slot]
+            if worst <= r:
+                certified = 1  # certified exact
+                break
+            if r >= r_hard:
+                certified = 1  # the scan was already complete
+                break
+            if worst < FLOAT32_INF_CONSTANT:
+                r = wp.min(worst, r_hard)
+            else:
+                r = wp.min(r * RADIUS_GROWTH, r_hard)
+
+        if certified == 0:
+            # Exact fallback once the radius outgrows the cell width or the attempt budget runs
+            # out — the register twin of ``knn_linear_scan``.
+            for slot in range(row_size):
+                row_indices[slot] = wp.int32(-1)
+                row_distances[slot] = FLOAT32_INF_CONSTANT
+            for point_index in range(points.shape[0]):
+                d = wp.length(points[point_index] - q)
+                if d <= max_radius and d < row_distances[row_size - 1]:
+                    carry_distance = d
+                    carry_index = point_index
+                    placed = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
+                    for slot in range(row_size):
+                        if placed == 1 or carry_distance < row_distances[slot]:
+                            placed = 1
+                            held_distance = row_distances[slot]
+                            held_index = row_indices[slot]
+                            row_distances[slot] = carry_distance
+                            row_indices[slot] = carry_index
+                            carry_distance = held_distance
+                            carry_index = held_index
+
+        for slot in range(row_size):
+            if slot < k:
+                out_indices[tid, slot] = row_indices[slot]
+                out_distances[tid, slot] = row_distances[slot]
+
+    _kernel.__name__ = name
+    _kernel.__qualname__ = name
+    return wp.kernel(_kernel)
+
+
+_HASHGRID_NEAREST_ROW_KERNELS = {
+    row_size: _hashgrid_nearest_row_kernel(
+        row_size, f"query_hashgrid_nearest_neighbors_row{row_size}"
+    )
+    for row_size in KNN_ROW_BUCKETS
+}
+
+
+def hashgrid_nearest_kernel(k: int) -> wp.Kernel:
+    """Register-row grid k-NN kernel for the smallest bucket fitting ``k``, else global-row."""
+    for row_size in KNN_ROW_BUCKETS:
+        if k <= row_size:
+            return _HASHGRID_NEAREST_ROW_KERNELS[row_size]
+    return query_hashgrid_nearest_neighbors
 
 
 @wp.kernel

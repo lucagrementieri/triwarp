@@ -35,6 +35,130 @@ def reverse_face_winding(faces: wp.array[wp.int32], out_faces: wp.array[wp.int32
     out_faces[f * 3 + 2] = a
 
 
+# Vertex and edge counts of the base icosahedron, which set the two block boundaries of the
+# icosphere's closed-form vertex numbering: the 12 corners, then 30 blocks of ``n - 1`` base-edge
+# points, then 20 blocks of face-interior points.
+ICOSAHEDRON_VERTICES = wp.constant(wp.int32(12))
+ICOSAHEDRON_EDGES = wp.constant(wp.int32(30))
+
+
+@wp.func
+def icosphere_vertex_index(
+    table: wp.array2d[wp.int32], n: wp.int32, f: wp.int32, i: wp.int32, j: wp.int32
+) -> wp.int32:
+    # Global index of the icosphere vertex at barycentric ``(i, j, n - i - j)`` of base face ``f``,
+    # under the numbering described in the ``table`` docstring of ``_icosphere_face_table``: the 12
+    # base corners, then the interior points of each base edge from its lower-numbered endpoint,
+    # then the interior points of each base face in row-major barycentric order.
+    #
+    # The map is many-to-one on purpose: a point on a shared base edge is addressed by both of the
+    # faces holding it and lands on the same index from either side, which is what makes the result
+    # watertight with no merge pass.
+    k = n - i - j
+    index = 0
+    if i == n:
+        index = table[f, 0]
+    elif j == n:
+        index = table[f, 1]
+    elif k == n:
+        index = table[f, 2]
+    elif k == 0 or i == 0 or j == 0:
+        # On a base edge. ``side`` is 0 for a->b (parameter j), 1 for b->c (k), 2 for c->a (i),
+        # and the stored flag says whether that side runs against the edge's own direction.
+        side = 0
+        t = int(j)
+        if i == 0:
+            side = 1
+            t = k
+        elif j == 0:
+            side = 2
+            t = i
+        if table[f, 6 + side] != 0:
+            t = n - t
+        index = ICOSAHEDRON_VERTICES + table[f, 3 + side] * (n - 1) + t - 1
+    else:
+        interior = (n - 1) * (n - 2) // 2
+        local = (i - 1) * (n - 1) - (i - 1) * i // 2 + (j - 1)
+        index = ICOSAHEDRON_VERTICES + ICOSAHEDRON_EDGES * (n - 1) + f * interior + local
+    return index
+
+
+@wp.kernel
+def icosphere_generation(
+    table: wp.array2d[wp.int32],
+    n: wp.int32,
+    level: wp.int32,
+    radius: wp.float32,
+    out_vertices: wp.array[wp.vec3],
+) -> None:
+    # One refinement generation of the icosphere, in place: every vertex introduced at this level
+    # is the projected midpoint of an edge of the previous level, and both of that edge's endpoints
+    # are already written. The grid is one thread per (base face, level-local barycentric pair), so
+    # a vertex on a shared base edge is computed twice from the same two parents -- identical
+    # arithmetic, identical result.
+    f, bi, bj = wp.tid()
+    bk = level - bi - bj
+    if bk < 0:
+        return
+    # A vertex is new at this level exactly when its level-local coordinates have two odd entries;
+    # all-even means it already existed one level up.
+    if (bi & 1) + (bj & 1) + (bk & 1) != 2:
+        return
+
+    step = n // level
+    i = int(bi) * step
+    j = int(bj) * step
+    # The two parents are the ends of the previous level's edge this vertex bisects, which is the
+    # pair of coordinates that came out odd.
+    i0 = int(i)
+    j0 = int(j)
+    i1 = int(i)
+    j1 = int(j)
+    if (bi & 1) != 0 and (bj & 1) != 0:
+        i0 = i + step
+        j0 = j - step
+        i1 = i - step
+        j1 = j + step
+    elif (bj & 1) != 0:
+        j0 = j + step
+        j1 = j - step
+    else:
+        i0 = i + step
+        i1 = i - step
+
+    a = icosphere_vertex_index(table, n, f, i0, j0)
+    b = icosphere_vertex_index(table, n, f, i1, j1)
+    # Lerp from the lower index, matching ``remesh.subdivide``'s sorted unique edges, so the
+    # float32 midpoint is the same one the iterated-subdivide implementation produced.
+    lo = wp.min(a, b)
+    hi = wp.max(a, b)
+    midpoint = wp.lerp(out_vertices[lo], out_vertices[hi], wp.float32(0.5))
+    out_vertices[icosphere_vertex_index(table, n, f, i, j)] = project_to_radius(midpoint, radius)
+
+
+@wp.kernel
+def icosphere_faces(
+    table: wp.array2d[wp.int32], n: wp.int32, out_faces: wp.array[wp.int32]
+) -> None:
+    # The ``n ** 2`` sub-triangles of one base face, one per thread over the full ``n x n`` block.
+    # The ``n (n + 1) / 2`` upward triangles are the threads with ``i + j < n``; the rest of the
+    # block is remapped by ``(i, j) -> (n - 1 - i, n - 1 - j)`` onto the ``n (n - 1) / 2``
+    # downward ones, which is a bijection -- so every thread writes exactly one triangle and no
+    # prefix-sum over rows is needed.
+    f, i, j = wp.tid()
+    slot = (int(f) * n * n + int(i) * n + int(j)) * 3
+    if i + j < n:
+        out_faces[slot + 0] = icosphere_vertex_index(table, n, f, i + 1, j)
+        out_faces[slot + 1] = icosphere_vertex_index(table, n, f, i, j + 1)
+        out_faces[slot + 2] = icosphere_vertex_index(table, n, f, i, j)
+    else:
+        di = n - 1 - i
+        dj = n - 1 - j
+        out_faces[slot + 0] = icosphere_vertex_index(table, n, f, di, dj + 1)
+        out_faces[slot + 1] = icosphere_vertex_index(table, n, f, di + 1, dj)
+        out_faces[slot + 2] = icosphere_vertex_index(table, n, f, di + 1, dj + 1)
+
+
 @wp.func
 def revolve_template_triangle(t: wp.int32, per: wp.int32) -> wp.vec3i:
     # trimesh's quad template [0, per, 1, 1, per, per + 1] tiled over profile segment i = t // 2

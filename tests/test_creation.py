@@ -490,9 +490,17 @@ def test_sphere_cap_invalid(device: str) -> None:
         tw.creation.sphere_cap(subdivisions=-1, device=device)
 
 
-@pytest.mark.parametrize("subdivisions", [0, 1, 2, 3])
+@pytest.mark.parametrize("subdivisions", [0, 1, 2, 3, 4])
 @pytest.mark.parity("icosphere", "trimesh")
 def test_icosphere(device: str, subdivisions: int) -> None:
+    """
+    Class A: the same vertex set and the same face set as trimesh, at every refinement level.
+
+    This is the gate on the closed-form vertex numbering, which is why it runs past
+    ``subdivisions=2``: a base edge carries ``2 ** subdivisions - 1`` interior points, so at levels
+    0 and 1 there are none or one and an edge walked in the *wrong direction* still lands on the
+    same index. From level 2 up, any error in the shared numbering shows as a different face set.
+    """
     vertices_wp, faces_wp = tw.creation.icosphere(subdivisions=subdivisions, device=device)
     _assert_same_vertices_and_faces(
         vertices_wp, faces_wp, tm.creation.icosphere(subdivisions=subdivisions)
@@ -500,6 +508,16 @@ def test_icosphere(device: str, subdivisions: int) -> None:
     assert int(faces_wp.shape[0]) // 3 == 20 * 4**subdivisions
     assert int(vertices_wp.shape[0]) == 10 * 4**subdivisions + 2
     assert np.allclose(np.linalg.norm(vertices_wp.numpy(), axis=1), 1.0, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("subdivisions", [1, 2, 3, 5])
+def test_icosphere_is_crack_free(device: str, subdivisions: int) -> None:
+    # The whole point of the closed-form numbering is that a point on a base edge gets the same
+    # index from both faces holding it. A seam is exactly what that failing looks like, and it is
+    # invisible in a vertex *count* -- the count is closed-form too, so it would still be right.
+    vertices_wp, faces_wp = tw.creation.icosphere(subdivisions=subdivisions, device=device)
+    _assert_closed(vertices_wp, faces_wp)
+    assert int(vertices_wp.shape[0]) == len(np.unique(vertices_wp.numpy(), axis=0))
 
 
 def test_icosphere_radius(device: str) -> None:

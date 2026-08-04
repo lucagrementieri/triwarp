@@ -287,6 +287,76 @@ def test_query_nearest_batch(
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
+@pytest.mark.parametrize("k", [1, 4, 8, 9, 16, 17, 32, 33, 64, 65])
+@pytest.mark.parity("query_bvh_nearest_k7", "scipy")
+@pytest.mark.parity("query_hashgrid_nearest_k7", "scipy")
+@pytest.mark.parity("query_bvh_nearest_k64", "scipy")
+def test_query_nearest_row_buckets(device: str, backend: Literal["bvh", "hashgrid"], k: int):
+    """
+    Class A. Every candidate-row bucket size and one ``k`` past each, against ``KDTree``.
+
+    The row lives in a ``wp.types.vector(length=K)`` register value whose ``K`` is one of
+    ``kernels.neighbors.KNN_ROW_BUCKETS``, so a ``k`` that does not equal its bucket keeps ``K``
+    neighbours and returns the first ``k``. An off-by-one in that tail is invisible at ``k == K``
+    and shows only just above and just below a boundary, which is what this sweep pins. ``k=65``
+    is past the largest bucket and exercises the global-memory fallback kernel.
+
+    The cloud is random in a box, so no two points tie in ``float32`` distance from a query and the
+    index comparison is exact; ties are covered by
+    [`test_query_nearest_ties`][tests.test_neighbors.test_query_nearest_ties].
+    """
+    rng = np.random.default_rng(11)
+    points = rng.random((300, 3), dtype=np.float32) * 5.0
+    queries = rng.random((40, 3), dtype=np.float32) * 5.0
+
+    points_wp = wp.array(np.ascontiguousarray(points), dtype=wp.vec3, device=device)
+    queries_wp = wp.array(np.ascontiguousarray(queries), dtype=wp.vec3, device=device)
+    query_nearest = (
+        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
+    )
+    query_indices_wp, query_distances_wp = query_nearest(points_wp, queries_wp, k=k)
+    query_distances_np, query_indices_np = KDTree(points).query(queries, k=k)
+
+    assert np.array_equal(query_indices_wp.numpy(), np.asarray(query_indices_np))
+    assert np.allclose(query_distances_wp.numpy(), query_distances_np, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
+@pytest.mark.parametrize("k", [8, 32])
+def test_query_nearest_ties(device: str, backend: Literal["bvh", "hashgrid"], k: int):
+    """
+    Class B (reduction: which of two equidistant points wins a slot is not specified).
+
+    On an integer lattice a query has dozens of *exactly* tied neighbours, so the row's insert
+    order is exercised rather than assumed — a shift chain that breaks on a run of equal distances
+    drops a neighbour and keeps a farther one, which no random cloud reveals. Half the queries sit
+    on lattice points (maximal ties), half at cell centres.
+
+    The ``k`` distances must match ``KDTree`` exactly and every returned index must actually sit at
+    the distance reported for it; the *identity* of a tied neighbour is not compared, because both
+    choices are correct answers.
+    """
+    axis = np.arange(12, dtype=np.float32)
+    lattice = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1).reshape(-1, 3)
+    rng = np.random.default_rng(12)
+    on_lattice = lattice[rng.choice(lattice.shape[0], size=30, replace=False)]
+    at_centers = lattice[rng.choice(lattice.shape[0], size=30, replace=False)] + 0.5
+    queries = np.ascontiguousarray(np.vstack([on_lattice, at_centers]), dtype=np.float32)
+
+    points_wp = wp.array(np.ascontiguousarray(lattice), dtype=wp.vec3, device=device)
+    queries_wp = wp.array(queries, dtype=wp.vec3, device=device)
+    query_nearest = (
+        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
+    )
+    query_indices_wp, query_distances_wp = query_nearest(points_wp, queries_wp, k=k)
+    query_distances_np, _query_indices_np = KDTree(lattice).query(queries, k=k)
+
+    assert np.allclose(query_distances_wp.numpy(), query_distances_np, rtol=1e-5, atol=1e-5)
+    gathered = np.linalg.norm(lattice[query_indices_wp.numpy()] - queries[:, None, :], axis=-1)
+    assert np.allclose(gathered, query_distances_wp.numpy(), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 def test_query_nearest_empty(device: str, backend: Literal["bvh", "hashgrid"]):
     rng = np.random.default_rng(0)
     points = rng.random((10, 3), dtype=np.float32)

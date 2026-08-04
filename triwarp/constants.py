@@ -29,15 +29,23 @@ TWO_PI = wp.constant(2 * wp.PI)
 TILE_1D = 64
 TILE_2D = 8
 
-# Elements reduced per thread by the *lane-free* reductions -- those that cannot use ``wp.tile``
-# because they must also be correct on the CPU device, where ``wp.launch_tiled`` runs exactly one
-# lane per block (Warp 1.15) and any lane-parallel body silently reduces a single element per tile.
-# Each thread walks a strided slice of its input and commits one atomic, so this trades launch width
-# against atomic traffic.
+# Elements reduced per thread by the *lane-free* reductions -- those whose body must stay correct on
+# the CPU device, where ``wp.launch_tiled`` runs exactly one lane per block (Warp 1.15) and any
+# lane-parallel body silently reduces a single element per tile. Each thread walks a strided slice
+# of its input and commits one atomic, so this trades launch width against atomic traffic.
 #
-# 32 is for reductions landing in ONE or a few accumulators, where the slice count is the only
-# source of parallelism. Measured over 1.2k-1M elements (area-weighted centroid, chamfer loss, hull
-# support sweep), the optimum walks from 8 to 64 across that range and 32 is within ~7% of it
-# everywhere, while 128 costs up to 2.4x on the small end. A per-query reduction wants a much
-# longer slice -- the query dimension already fills the device -- and sets its own value locally.
-ITEMS_PER_SLICE = 32
+# The optimum splits by device, so there are two values and
+# [`items_per_slice`][triwarp._device.items_per_slice] picks between them; do not read either
+# directly. Swept over 8-256 on a 5k and a 200k point cloud (hull support extremes, the only CUDA
+# consumer left after the tiled reductions were restored) plus the CPU-only centroid and chamfer
+# reductions:
+#
+# - CUDA wants long slices: at 200k points 32 costs 1.54x of the 256 optimum, while 128 is within 1%
+#   of it and within 4% at 5k points, where the whole sweep is flat.
+# - CPU wants short ones: 128 costs 1.43x of the 32 optimum on the 5k cloud, and the CPU sweep is
+#   otherwise flat (32 within 1.11x of best everywhere measured).
+#
+# A *per-query* reduction wants a much longer slice on both devices -- the query dimension already
+# fills the device -- and sets its own value locally (see ``proximity.ITEMS_PER_QUERY_SLICE``).
+ITEMS_PER_SLICE_CUDA = 128
+ITEMS_PER_SLICE_CPU = 32

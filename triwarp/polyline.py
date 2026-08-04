@@ -935,11 +935,35 @@ def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
 
     Notes
     -----
-    The per-round convergence readback is 45 us of each ~150 us round (measured, RTX 5090), so
-    replacing it with a ``wp.capture_while`` loop as [`triwarp.graph.bfs`][triwarp.graph.bfs] does
-    would have to cost less than that per round to pay. It does not: conditional-graph iteration is
-    recorded at ~0.25 ms an iteration elsewhere in this package, five times the readback it would
-    remove. The loop stays host-driven.
+    The round loop runs **on device**, driven by ``wp.capture_while`` over a device-side condition
+    exactly as [`bfs`][triwarp.graph.bfs] drives its levels, so the whole clip costs one graph
+    launch and one readback (the final face count) rather than a readback per round. The reason is
+    worth recording because this docstring previously said the opposite: a *replayed*
+    conditional-graph iteration of a four-launch body costs **14 us** at 64 points (0.224 ms over
+    16 rounds, measured on an RTX 5090), against **86-93 us** for the same body launched from the
+    host with its convergence readback. The ~0.25 ms per iteration quoted elsewhere in this package
+    is the one-off cost of *capturing* the graph — measured at 0.104 ms here, independent of ``n``
+    — not of iterating it, so at one round the captured form is slower and it breaks even by round
+    three.
+
+    Measured on `benchmarks/test_creation.py`'s ``triangulate_polygon`` group, back to back:
+    **2.07x** at a 64-point star (4.53 -> 2.19 ms) and **1.53x** at 1 024 (6.89 -> 4.51).
+
+    **What is left is not the clip.** Attributed one stage per measurement at 64 points, where the
+    whole call is 2.19 ms: the captured round loop is 0.22 ms and the *prologue* is 1.05 ms, of
+    which ``open_polyline``'s [`is_closed`][triwarp.polyline.is_closed] is 0.24,
+    [`polyline_normal`][triwarp.polyline.polyline_normal] 0.35 and
+    [`polyline_centroid`][triwarp.polyline.polyline_centroid] 0.25 — three reductions that each end
+    in a host readback because each returns a Python-scope value the next one consumes. That
+    prologue is **flat in ``n``** (1.05 ms at 64 points and 1.04 at 1 024), so it is the whole of
+    this function's remaining fixed cost and the only lever left for small loops; fusing the three
+    into one kernel writing the frame to device memory would remove two of the four readbacks.
+
+    When conditional graph nodes are unavailable (CPU, or a CUDA driver below 12.4)
+    ``wp.capture_while`` executes the same loop directly with one pinned 4-byte readback per round,
+    which is the behaviour this loop had throughout. Verified equal: the CPU fallback and the
+    captured CUDA loop produce the same triangulation up to row order on a 64-point star, and that
+    row order was never stable on CUDA either — ``clip_selected`` appends through an atomic.
 
     See Also
     --------
@@ -981,7 +1005,10 @@ def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     selected = wp.empty(n, dtype=wp.int32, device=device)
     wp.launch(kernel_polyline.init_ring, dim=n, inputs=[left, right, active], device=device)
 
-    for _ in range(n):
+    # state = [rounds run, loop condition], both written by ``ear_loop_continue``.
+    state = wp.array([0, 1], dtype=wp.int32, device=device)
+
+    def clip_round() -> None:
         wp.launch(
             kernel_polyline.compute_ears,
             dim=n,
@@ -1000,8 +1027,22 @@ def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
             inputs=[selected, left, right, active, out_faces, out_count],
             device=device,
         )
-        if int(out_count.numpy()[0]) >= n - 2:
-            break
+        wp.launch(
+            kernel_polyline.ear_loop_continue,
+            dim=1,
+            inputs=[out_count, wp.int32(n - 2), wp.int32(n), state],
+            device=device,
+        )
+
+    condition = state[1:2]
+    # Graph capture needs a CUDA stream, so the CPU device takes the direct-execution branch even
+    # when the driver supports conditional nodes.
+    if wp.get_device(device).is_cuda and wp.is_conditional_graph_supported():
+        with wp.ScopedCapture(device) as capture:
+            wp.capture_while(condition, clip_round)
+        wp.capture_launch(capture.graph)
+    else:
+        wp.capture_while(condition, clip_round)
 
     count = int(out_count.numpy()[0])
     return twt.as_array2d_int32(out_faces[0:count])

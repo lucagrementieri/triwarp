@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warp as wp
+import warp.optim.linear as wpl
 import warp.sparse as wps
 
 import triwarp.linalg as twl
@@ -23,7 +24,10 @@ _CG_TOLERANCE = 1e-8
 
 HeatOperators = tuple[
     wps.BsrMatrix[wp.float64],
+    wpl.LinearOperator,
     wps.BsrMatrix[wp.float64],
+    wps.BsrMatrix[wp.float64],
+    wpl.LinearOperator,
     wp.array[wp.float32],
     wp.array[wp.vec3],
     wp.array[wp.float32],
@@ -77,15 +81,33 @@ def heat_operators(
     -------
     heat_system : warp.sparse.BsrMatrix
         ``M - t * L`` in ``float64``, the heat-diffusion system.
+    heat_preconditioner : ``warp.optim.linear.LinearOperator``
+        Jacobi preconditioner for ``heat_system``.
     laplacian : warp.sparse.BsrMatrix
         The ``float64`` cotangent stiffness matrix ``L`` (igl sign convention, so ``-L`` is positive
-        semi-definite), reused for the Poisson stage.
+        semi-definite).
+    poisson_system : warp.sparse.BsrMatrix
+        ``-L``, the positive-semi-definite Poisson operator.
+    poisson_preconditioner : ``warp.optim.linear.LinearOperator``
+        Jacobi preconditioner for ``poisson_system``.
     cot_entries : wp.array[wp.float32]
         Per-face half-cotangent weights, reused by the divergence.
     face_normals : wp.array[wp.vec3]
         One unit normal per face.
     face_areas : wp.array[wp.float32]
         One area per face.
+
+    Notes
+    -----
+    The Poisson operator and both Jacobi preconditioners are here because they satisfy this
+    function's own contract — they depend on the mesh alone — and
+    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] used to rebuild all three on every call.
+    Measured on ``sphere_small`` (2 562 vertices), that was 0.33 ms for the ``bsr_axpy`` and 0.12 ms
+    per preconditioner out of a 6.29 ms amortized call, and the same on ``sphere_med`` where the
+    call is 12.57 ms: about 10 % and 5 % respectively. It is *only* those three — the solver
+    **state** is deliberately not cached, because a ``warp.optim.linear`` state captures its
+    right-hand-side and solution buffers at construction, which would make these operators
+    stateful and unsafe to share between two concurrent solves.
 
     See Also
     --------
@@ -121,7 +143,19 @@ def heat_operators(
     # Heat system (M - t L). ``bsr_axpy`` overwrites the mass matrix in place (no longer needed).
     mass_diag = wps.bsr_diag(diag=mass)
     heat_system = wps.bsr_axpy(x=laplacian, y=mass_diag, alpha=-float(t), beta=1.0)
-    return heat_system, laplacian, cot_entries, normals, areas
+    # Poisson operator ``-L`` and the two Jacobi preconditioners: mesh-only, so they belong here
+    # rather than in every solve. See Notes.
+    poisson_system = wps.bsr_axpy(x=laplacian, alpha=-1.0)
+    return (
+        heat_system,
+        wpl.preconditioner(heat_system, "diag"),
+        laplacian,
+        poisson_system,
+        wpl.preconditioner(poisson_system, "diag"),
+        cot_entries,
+        normals,
+        areas,
+    )
 
 
 def heat_geodesic(
@@ -202,7 +236,16 @@ def heat_geodesic(
 
     if operators is None:
         operators = heat_operators(vertices, faces, t, use_robust=use_robust)
-    heat_system, laplacian, cot_entries, normals, areas = operators
+    (
+        heat_system,
+        heat_preconditioner,
+        _laplacian,
+        poisson_system,
+        poisson_preconditioner,
+        cot_entries,
+        normals,
+        areas,
+    ) = operators
 
     # Heat solve: (M - t L) u = u0, with u0 the source indicator.
     u0 = wp.zeros(n_vertices, dtype=wp.float64, device=device)
@@ -214,7 +257,7 @@ def heat_geodesic(
     )
 
     heat = wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    twl.solve_spd(heat_system, u0, heat, tol=_CG_TOLERANCE)
+    twl.solve_spd(heat_system, u0, heat, tol=_CG_TOLERANCE, preconditioner=heat_preconditioner)
 
     # Unit vector field X = -grad(u)/|grad(u)|.
     field = wp.empty(n_faces, dtype=wp.vec3d, device=device)
@@ -234,13 +277,18 @@ def heat_geodesic(
         inputs=[vertices, faces, cot_entries, field, divergence],
         device=device,
     )
-    poisson_system = wps.bsr_axpy(x=laplacian, alpha=-1.0)
     # Flip sign so the Poisson right-hand side matches the positive semi-definite operator ``-L``.
     neg_divergence = wp.empty(n_vertices, dtype=wp.float64, device=device)
     wp.map(wp.neg, divergence, out=neg_divergence)
 
     phi = wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    twl.solve_spd(poisson_system, neg_divergence, phi, tol=_CG_TOLERANCE)
+    twl.solve_spd(
+        poisson_system,
+        neg_divergence,
+        phi,
+        tol=_CG_TOLERANCE,
+        preconditioner=poisson_preconditioner,
+    )
 
     # Shift so the distance field is zero at the (nearest) source. For a correctly signed field
     # the global minimum sits at the source set, so subtracting it yields a nonnegative field.

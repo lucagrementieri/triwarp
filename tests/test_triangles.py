@@ -234,14 +234,16 @@ def test_centroid(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
 @pytest.mark.parametrize("kernel_device", ["cpu", "cuda:0"])
 def test_centroid_matches_trimesh_on_a_skewed_mesh_on_both_devices(kernel_device: str):
     """
-    Pin the area-weighted centroid sum on the CPU device, on a deliberately asymmetric mesh.
+    Pin the area-weighted centroid sum on **both** devices, on a deliberately asymmetric mesh.
 
-    Two things this guards. ``wp.launch_tiled`` runs exactly one lane per block on Warp 1.15's CPU
+    Three things this guards. ``wp.launch_tiled`` runs exactly one lane per block on Warp 1.15's CPU
     backend, so the block-wide ``wp.tile_sum`` this reduction used to perform accumulated one face
-    per 64-face tile there. And a *symmetric* mesh hides that completely -- the centroid of every
-    64th face of a sphere is still the sphere's centre -- which is why the mesh is stretched and
-    sheared first. Measured: the sub-sampled sum was off by 1.1e-2 on this shape and by 4e-8 on the
-    unmodified sphere.
+    per 64-face tile there. A *symmetric* mesh hides that completely -- the centroid of every 64th
+    face of a sphere is still the sphere's centre -- which is why the mesh is stretched and sheared
+    first. Measured: the sub-sampled sum was off by 1.1e-2 on this shape and by 4e-8 on the
+    unmodified sphere. And the reduction now has two implementations (``centroid_tiled`` on CUDA,
+    ``centroid_sliced`` on CPU), so the parametrization is what covers both of them -- running this
+    on one device only would leave a whole kernel untested.
     """
     if kernel_device.startswith("cuda") and not wp.is_cuda_available():
         pytest.skip("no CUDA device")

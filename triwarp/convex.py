@@ -31,7 +31,8 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.constants import ITEMS_PER_SLICE, TOLERANCE_MERGE_CONSTANT
+from triwarp._device import items_per_slice
+from triwarp.constants import TOLERANCE_MERGE_CONSTANT
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import convex as kernel_convex
 
@@ -243,9 +244,10 @@ def convex_subset_mask(
     orientations at half the dot-product cost of sampling the full sphere.
 
     The extrema are computed by one thread per ``(direction, point slice)``, each reducing a
-    strided slice of [`ITEMS_PER_SLICE`][triwarp.constants.ITEMS_PER_SLICE] points and committing
-    one atomic, then a second pass marks the maximizers and minimizers. At most roughly
-    ``2 * n_directions`` points (plus ties) can be marked.
+    strided slice of [`ITEMS_PER_SLICE_CUDA`][triwarp.constants.ITEMS_PER_SLICE_CUDA] points
+    (``ITEMS_PER_SLICE_CPU`` on the CPU device) and committing one atomic, then a second pass marks
+    the maximizers and minimizers. At most roughly ``2 * n_directions`` points (plus ties) can be
+    marked.
 
     !!! warning "The result is an inner approximation, not a superset"
 
@@ -506,14 +508,17 @@ def _support_extremes(
     """
     Per-direction maximum and minimum of the support function over ``points``.
 
-    Each thread reduces a strided slice of the cloud, so the launch is sized by ``ITEMS_PER_SLICE``
-    points per thread rather than by the point count -- enough parallelism to fill the device while
-    keeping the number of atomics into the ``n_directions`` accumulator slots low.
+    Each thread reduces a strided slice of the cloud, so the launch is sized by
+    [`items_per_slice`][triwarp._device.items_per_slice] points per thread rather than by the point
+    count -- enough parallelism to fill the device while keeping the number of atomics into the
+    ``n_directions`` accumulator slots low. This is the only reduction of this shape that still runs
+    the strided form on CUDA, which is why the slice length is chosen per device.
     """
     device = points.device
     n_points = int(points.shape[0])
     n_dir = int(directions.shape[0])
-    n_slices = max(1, (n_points + ITEMS_PER_SLICE - 1) // ITEMS_PER_SLICE)
+    per_slice = items_per_slice(device)
+    n_slices = max(1, (n_points + per_slice - 1) // per_slice)
 
     best_max = wp.full(n_dir, value=-float("inf"), dtype=wp.float32, device=device)
     best_min = wp.full(n_dir, value=float("inf"), dtype=wp.float32, device=device)

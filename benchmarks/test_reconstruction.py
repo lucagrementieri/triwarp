@@ -80,10 +80,13 @@ Sizing notes measured on an RTX 5090 before the baseline was captured:
   point count — it costs the same on ``bunny_decimated`` and ``bunny``. The ``adaptive`` mode does
   scale with the cloud. Both are timed at the default ``depth=8``.
 
-Everything is capped at ``bunny``: point-cloud triangulation and ball pivoting are superlinear in
-the cloud size, and at ``dragon`` (871k points) they would dominate the whole suite. This is a
-deliberate coverage gap — the optimizations these benchmarks gate are host-sync and launch-overhead
-fixes, which show up at these sizes.
+Everything is capped at ``bunny``, and the cap is load-bearing rather than tidy: point-cloud
+triangulation and ball pivoting are superlinear in the cloud size, and the CPU screened-Poisson
+references are worse than superlinear in practice -- ``test_screened_poisson[dragon-open3d-*]`` was
+measured running **93 minutes without completing a single round** before it was killed, which is
+more wall clock than the other 40 benchmark modules combined. See the comment on that cap. This is
+a deliberate coverage gap -- the optimizations these benchmarks gate are host-sync and
+launch-overhead fixes, which show up at these sizes.
 """
 
 from __future__ import annotations
@@ -258,7 +261,14 @@ def test_ball_pivoting(bench_case: BenchCase) -> None:
 def test_screened_poisson(
     bench_case: BenchCase, method: Literal["dense", "adaptive"], depth: int
 ) -> None:
-    skip_larger_than(bench_case, "bunny", "screened Poisson above bunny dominates the suite")
+    # Do not lift this cap. open3d's CPU ``create_from_point_cloud_poisson`` is 7.5 s per call at
+    # depth 9 on ``bunny``'s 35 947 points; ``dragon`` has 437 645, and the ``[dragon-open3d-*]``
+    # rows were measured running for **93 minutes without completing a single round** (GPU idle,
+    # 42 cores saturated) before being killed. That one parametrization is worth more wall clock
+    # than the other 40 benchmark modules combined, and what it measures is open3d, not triwarp.
+    skip_larger_than(
+        bench_case, "bunny", "screened Poisson above bunny dominates the suite (93 min at dragon)"
+    )
     if bench_case.kind == "pymeshlab":
         if method != "dense":
             pytest.skip("MeshLab has a single screened-Poisson path; timed once under 'dense'")

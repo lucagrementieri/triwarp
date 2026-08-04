@@ -43,13 +43,22 @@ two answer the same question by opposite means -- MeshLab factors the free-free 
 triwarp runs batched CG on it.
 
 That makes it worth more than a timing row: it is the **conditioning control**. Measured on the axis
-meshes (RTX 5090 host) it runs **39.0 ms on ``saddle`` and 39.6 ms on ``saddle_graded``** -- flat --
-against triwarp's **33.7 -> 83.5 ms** at 1% pinned. So triwarp wins by 1.2x on the well-conditioned
-mesh and loses by **2.1x** on the graded one, and the entire spread is its CG iteration count rather
+meshes (RTX 5090 host) it runs **38.2 ms on ``saddle`` and 39.6 ms on ``saddle_graded``** -- flat --
+against triwarp's **14.2 -> 72.5 ms** at 1% pinned. So triwarp wins by 2.7x on the well-conditioned
+mesh and loses by **1.8x** on the graded one, and the entire spread is its CG iteration count rather
 than anything intrinsic about the problem: a direct factorization of the identical system does not
 care. It is the same observation the potpourri3d rows make in
 [`test_geodesic.py`](test_geodesic.py) and libigl's LDLT makes in
 [`test_parametrization.py`](test_parametrization.py).
+
+Those triwarp figures moved a long way when ``assemble_interior_system`` stopped routing an
+already-sorted CSR through ``bsr_from_triplets``, and the *shape* of the move is the interesting
+part. At 1% pinned this group went 33.7 -> 14.2 ms (``saddle``) and 82.9 -> 72.5 (``graded``); at
+50% pinned it went **30.1 -> 3.1** and **29.4 -> 4.7**, a 6-10x. The triplet build cost ``q.nnz``
+regardless of how much of ``Q`` survived, and it left ``q_uu.nnz`` at ``q.nnz`` as well -- an upper
+bound 3.5x the true count on a lightly-pinned system -- so every CG mat-vec was dimensioned for the
+*unreduced* matrix too. That is why the pin50pct rows, where the free block is smallest, gained the
+most: they were the rows paying most for work proportional to the wrong matrix.
 
 Two limits on it, both structural. MeshLab pins **exactly two vertices** (``point1`` / ``point2``
 with scalar values), so it has no fixed-fraction axis at all and appears only in the ``pin1pct``

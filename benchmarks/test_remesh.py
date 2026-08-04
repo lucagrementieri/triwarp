@@ -326,7 +326,13 @@ _CLUSTER_FACTORS = [2.0, 6.0]
 @pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab")
 @pytest.mark.parametrize("cell_factor", _CLUSTER_FACTORS)
 def test_cluster_decimate(bench_case: BenchCase, cell_factor: float) -> None:
-    """Bin, remap, dedup: decimation with no priority queue, against two exact-ish references."""
+    """
+    Bin, remap, dedup: decimation with no priority queue, against two exact-ish references.
+
+    Its axis spans the wrapper floor and the win: ``bunny_decimated`` sits at the ~340 µs floor
+    (see ``test_creation::test_box``) and loses 1.5x, while ``dragon`` wins **76x**. A single point
+    from this group is uninterpretable in either direction.
+    """
     voxel_size = cell_factor * bench_case.mean_edge
     if bench_case.kind == "pymeshlab":
         # ``meshing_decimation_clustering`` rewrites the topology, so the MeshSet is rebuilt inside

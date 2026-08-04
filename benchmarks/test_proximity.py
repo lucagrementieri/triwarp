@@ -212,6 +212,14 @@ def test_signed_distance_on_mesh(
 @pytest.mark.benchmark(group="aabb_bounds")
 @pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
 def test_aabb_bounds(bench_case: BenchCase) -> None:
+    """
+    A min/max reduce over the vertices, and the module's floor row.
+
+    Below roughly ``10 ** 3`` vertices this reports the ~340 µs wrapper floor rather than the
+    reduction (see ``test_creation::test_box``), so the small end of the axis loses to a NumPy
+    ``min``/``max`` pair by orders of magnitude and the large end wins. The row is here for the
+    crossover; neither endpoint means anything on its own.
+    """
     if bench_case.kind == "triwarp":
         vertices = bench_case.vertices_wp
         lower, upper = bench_case.run(lambda: tw.bounds.aabb_bounds(vertices))

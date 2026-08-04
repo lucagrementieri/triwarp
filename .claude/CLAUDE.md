@@ -593,3 +593,31 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
 - **Coverage is per module.** Every public `triwarp/<module>.py` gets both `tests/test_<module>.py`
   and `benchmarks/test_<module>.py`, and a function's tests live in the file mirroring *its* module
   (§11), not in a neighbour's.
+
+---
+
+## 15. Running Long Commands: Never Poll With `until`
+
+The benchmark suite and the measurement probes §13 asks for routinely run for minutes. **Do not
+write a wait loop around them.** A backgrounded command re-invokes you when it exits, reporting its
+exit code and its output file path — verified in-session: a 25-second background command returned
+`completed (exit code 0)` on its own with no polling. Launch it, do something else, and read the
+output file when the notification arrives.
+
+- **`until ! pgrep -f <name>; do sleep 5; done` never terminates.** `pgrep -f` matches the *full
+  command line of every process*, including the polling shell itself, whose command line contains
+  `<name>`. The condition is therefore permanently true. Measured cost of not knowing this: **seven
+  such loops in one session, each spinning for 3-4 hours** until killed by hand, every one of them
+  redundant because the command it was watching had already sent its completion notification and its
+  output file was already on disk.
+- **A watcher is never the record.** The benchmark's or probe's own stdout file is. If you find
+  yourself launching a second command to learn whether the first finished, delete it.
+- **When a poll genuinely is unavoidable** — external state the harness cannot see, such as a CI run
+  — make the pattern unable to self-match (`pgrep -f '[p]robe_p4'`) or test a sentinel file the
+  process writes on exit, and give the loop a **bounded** iteration count so a logic error costs
+  seconds instead of hours.
+- **Do not chain short sleeps** to approximate a long wait. Pass a longer `timeout` to the command,
+  or background it and let the notification arrive.
+
+A foreground command that outruns its timeout is *also* moved to the background and notified the same
+way, so exceeding a timeout is not a reason to start polling either — the result is still coming.

@@ -471,14 +471,24 @@ def edge_plane_intersection(
     return origin + direction * dist
 
 
+# How a face meets the slicing plane. The three kept classes are numbered in the order the fused
+# compaction below lays them out, so a class is also its block index plus one. ``ON_PLANE`` is a
+# provisional answer that ``resolve_on_plane_faces`` turns into ``INSIDE`` or ``DROP``.
+SLICE_CLASS_DROP = wp.constant(wp.int32(0))
+SLICE_CLASS_INSIDE = wp.constant(wp.int32(1))
+SLICE_CLASS_CUT_QUAD = wp.constant(wp.int32(2))
+SLICE_CLASS_CUT_TRI = wp.constant(wp.int32(3))
+SLICE_CLASS_ON_PLANE = wp.constant(wp.int32(4))
+
+# Kept classes, i.e. the number of blocks the flag buffer carries.
+SLICE_CLASSES = 3
+
+
 @wp.kernel
 def classify_faces_for_slice(
     faces: wp.array[wp.int32],
     vertex_dots: wp.array[wp.float32],
-    out_inside: wp.array[wp.bool],
-    out_cut_quad: wp.array[wp.bool],
-    out_cut_tri: wp.array[wp.bool],
-    out_on_plane: wp.array[wp.bool],
+    out_classes: wp.array[wp.int32],
     out_signs: wp.array2d[wp.int32],
 ) -> None:
     f = wp.tid()
@@ -495,16 +505,19 @@ def classify_faces_for_slice(
     signs_sum = s0 + s1 + s2
     signs_asum = wp.abs(s0) + wp.abs(s1) + wp.abs(s2)
 
-    inside = signs_sum == -signs_asum
-    onedge = (signs_asum >= wp.int32(2)) and (wp.abs(signs_sum) <= wp.int32(1))
-    on_plane = signs_asum == wp.int32(0)
-    cut_quad = onedge and (signs_sum < wp.int32(0))
-    cut_tri = onedge and (signs_sum >= wp.int32(0))
-
-    out_inside[f] = inside
-    out_cut_quad[f] = cut_quad
-    out_cut_tri[f] = cut_tri
-    out_on_plane[f] = on_plane
+    # A face lying in the plane also satisfies the "wholly inside" test (both sums are zero), so
+    # it has to be tested first -- its side is decided from its normal, not from its vertices.
+    face_class = SLICE_CLASS_DROP
+    if signs_asum == wp.int32(0):
+        face_class = SLICE_CLASS_ON_PLANE
+    elif signs_sum == -signs_asum:
+        face_class = SLICE_CLASS_INSIDE
+    elif signs_asum >= wp.int32(2) and wp.abs(signs_sum) <= wp.int32(1):
+        if signs_sum < wp.int32(0):
+            face_class = SLICE_CLASS_CUT_QUAD
+        else:
+            face_class = SLICE_CLASS_CUT_TRI
+    out_classes[f] = face_class
 
 
 @wp.kernel
@@ -512,19 +525,64 @@ def resolve_on_plane_faces(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     plane_normal: wp.vec3,
-    out_on_plane: wp.array[wp.bool],
-    out_inside: wp.array[wp.bool],
+    out_classes: wp.array[wp.int32],
 ) -> None:
     f = wp.tid()
-    if not out_on_plane[f]:
+    if out_classes[f] != SLICE_CLASS_ON_PLANE:
         return
     normal, area = kernel_triangles.face_normals_and_area(vertices, faces[f * 3 : (f + 1) * 3])
-    valid = area > TOLERANCE_ZERO_CONSTANT
-    if not valid:
-        out_on_plane[f] = False
-        out_inside[f] = False
+    if area <= TOLERANCE_ZERO_CONSTANT:
+        out_classes[f] = SLICE_CLASS_DROP
         return
-    out_inside[f] = wp.dot(normal, plane_normal) < wp.float32(0.0)
+    if wp.dot(normal, plane_normal) < wp.float32(0.0):
+        out_classes[f] = SLICE_CLASS_INSIDE
+    else:
+        out_classes[f] = SLICE_CLASS_DROP
+
+
+@wp.kernel
+def slice_class_flags(
+    classes: wp.array[wp.int32], n_faces: wp.int32, out_flags: wp.array[wp.int32]
+) -> None:
+    # Selection flags for all three kept classes at once, as three ``n_faces``-long blocks of one
+    # buffer. Scanning that buffer once compacts the three classes into one index array with the
+    # blocks contiguous, so the whole partition costs one scan and one host readback rather than
+    # three of each. Every thread writes all three of its slots, which is what keeps the buffer
+    # from needing a memset first.
+    f = wp.tid()
+    face_class = classes[f]
+    for block in range(SLICE_CLASSES):
+        flag = 0
+        if face_class == block + 1:
+            flag = 1
+        out_flags[block * n_faces + f] = flag
+
+
+@wp.kernel
+def slice_class_counts(
+    inclusive: wp.array[wp.int32], n_faces: wp.int32, out_counts: wp.array[wp.int32]
+) -> None:
+    # Per-class counts from the block ends of the inclusive scan: block ``b``'s own count is its
+    # running total minus the previous block's. One launch so the host reads 12 bytes once.
+    previous = 0
+    for block in range(SLICE_CLASSES):
+        total = inclusive[(block + 1) * n_faces - 1]
+        out_counts[block] = total - previous
+        previous = total
+
+
+@wp.kernel
+def scatter_slice_class(
+    flags: wp.array[wp.int32],
+    inclusive: wp.array[wp.int32],
+    n_faces: wp.int32,
+    out_indices: wp.array[wp.int32],
+) -> None:
+    # ``scatter.scatter_index_where`` over the blocked flag buffer, except that the value written is
+    # the *face* index rather than the flag index, so each block comes out addressing faces.
+    t = wp.tid()
+    if flags[t] != 0:
+        out_indices[inclusive[t] - 1] = t % n_faces
 
 
 @wp.kernel
