@@ -2,6 +2,7 @@ import warp as wp
 
 from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_PLANAR_CONSTANT, TWO_PI
 from triwarp.kernels import triangles as kernel_triangles
+from triwarp.kernels.predicates import barycentric_2d
 
 
 @wp.func
@@ -389,3 +390,51 @@ def step_sphere_shrink(
     out_radii[tid] = new_r
     out_centers[tid] = p + normals[tid] * new_r
     out_not_converged[tid] = old_radii[tid] - new_r >= convergence_threshold
+
+
+@wp.func
+def lift_vec2(p: wp.vec2) -> wp.vec3:
+    """Embed a 2D point in the ``z = 0`` plane."""
+    return wp.vec3(p[0], p[1], wp.float32(0.0))
+
+
+@wp.kernel
+def face_containing_point_2d(
+    mesh_id: wp.uint64,
+    vertices: wp.array[wp.vec2],
+    faces: wp.array[wp.int32],
+    points: wp.array[wp.vec2],
+    search_radius: wp.float32,
+    barycentric_epsilon: wp.float32,
+    out_face: wp.array[wp.int32],
+) -> None:
+    # Point location in a 2D triangulation: a closest-point query against the same triangulation
+    # lifted to ``z = 0`` picks the *candidate* face, and a barycentric sign test decides.
+    #
+    # The candidate is sufficient rather than merely plausible: a point inside some triangle is at
+    # distance zero from it, so the closest triangle is a containing one whenever any exists.
+    #
+    # The two-stage form is not redundant. Accepting on the query radius alone was measured to
+    # misclassify ~0.2% of random queries on a 3 979-triangle Delaunay mesh -- the closest-point
+    # distance for an in-plane point is not exactly zero in float32, so a radius tight enough to
+    # reject points just outside the triangulation also rejects points just inside it, and no radius
+    # separates the two (73 / 28 / 6 interior points missed at 1e-7 / 1e-6 / 1e-5 of the bounding
+    # diagonal, against 0 / 14 / 59 exterior points falsely accepted at 1e-5 / 1e-4 / 1e-3). The
+    # barycentric test is a sign test on the query's own coordinates, ~1000x sharper, so the radius
+    # only has to be loose enough to find the candidate.
+    tid = int(wp.tid())
+    p = points[tid]
+    out_face[tid] = wp.int32(-1)
+    query = wp.mesh_query_point_no_sign(mesh_id, lift_vec2(p), search_radius)
+    if not query.result:
+        return
+
+    face = wp.int32(query.face)
+    barycentric = barycentric_2d(
+        vertices[faces[face * 3 + 0]],
+        vertices[faces[face * 3 + 1]],
+        vertices[faces[face * 3 + 2]],
+        p,
+    )
+    if wp.min(barycentric[0], wp.min(barycentric[1], barycentric[2])) >= -barycentric_epsilon:
+        out_face[tid] = face

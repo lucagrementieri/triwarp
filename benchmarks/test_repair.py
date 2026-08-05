@@ -273,6 +273,52 @@ def test_remove_non_manifold_faces(bench_case: BenchCase, extra: int) -> None:
     assert int(kept_faces.shape[0]) > 0
 
 
+@pytest.mark.benchmark(group="split_nonmanifold")
+@pytest.mark.benchmeshes("sphere_med")
+@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.parametrize("extra", _NON_MANIFOLD_COUNTS, ids=["clean", "nm1024"])
+def test_split_nonmanifold(bench_case: BenchCase, extra: int) -> None:
+    """
+    Vertex duplication instead of face deletion: the non-lossy repair for the same defect.
+
+    Read against ``remove_non_manifold_faces`` above, which is timed on the identical input: the
+    two reach an edge-manifold mesh from opposite directions, one by dropping every face on an
+    over-incident edge and the other by splitting vertices apart and keeping all of them. The
+    ``clean`` case is the floor -- both must detect that there is nothing to do -- and the
+    ``nm1024`` case is the work.
+
+    triwarp's cost is an edge sort plus a connected-components pass over ``3 * n_faces`` corner
+    nodes, so it barely moves between the two cases. ``igl.split_nonmanifold`` is sequential by
+    construction -- it explodes the mesh to ``3 * n_faces`` singleton vertices and greedily re-
+    merges pairs, re-testing manifoldness after each candidate, with the source calling its own
+    inner check "Omega(m) and probably O(m log m) or worse" -- and it does move: measured
+    standalone at 84 ms clean against 122 ms with the duplicates on an 81 920-face sphere. It
+    takes ``rounds=3``.
+
+    The two libraries agree on the split exactly for a bowtie vertex, a same-wound fan of three
+    faces on one edge, a flipped face and a boundary, but **not on this group's defect**: for a
+    duplicated face igl keeps one arbitrarily chosen pair joined where triwarp splits all copies
+    (18 vertices against 15 on an icosahedron with one face duplicated). Both outputs are
+    manifold with every face kept; the rows are a cost comparison, and ``tests/test_repair.py``
+    carries both the agreement and the divergence.
+    """
+    if bench_case.kind == "igl":
+        faces_nm_np = np.ascontiguousarray(
+            _faces_with_non_manifold_np(bench_case, extra), dtype=np.int64
+        )
+        faces_igl, source_igl = bench_case.run(lambda: igl.split_nonmanifold(faces_nm_np), rounds=3)
+        assert faces_igl.shape[0] == faces_nm_np.shape[0]
+        assert source_igl.shape[0] >= bench_case.n_vertices
+        return
+    vertices = bench_case.vertices_wp
+    faces = _faces_with_non_manifold_wp(bench_case, extra)
+    split_vertices, split_faces, _source = bench_case.run(
+        lambda: tw.repair.split_nonmanifold(vertices, faces)
+    )
+    assert int(split_faces.shape[0]) == int(faces.shape[0])
+    assert int(split_vertices.shape[0]) >= bench_case.n_vertices
+
+
 @pytest.mark.benchmark(group="remove_unreferenced_vertices")
 @pytest.mark.benchlibs("triwarp", "igl")
 @pytest.mark.parametrize("unreferenced", [0, 1], ids=["clean", "padded"])

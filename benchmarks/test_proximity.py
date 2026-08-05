@@ -76,7 +76,8 @@ import numpy as np
 import pymeshlab as ml
 import pytest
 import warp as wp
-from conftest import BenchCase, skip_larger_than
+from conftest import BenchCase, BenchLibrary, skip_larger_than
+from scipy.spatial import Delaunay
 
 import triwarp as tw
 
@@ -363,3 +364,78 @@ def test_shape_diameter(bench_case: BenchCase, n_rays: int) -> None:
         lambda: tw.proximity.shape_diameter(mesh, points, normals=normals, n_rays=n_rays)
     )
     assert diameter.shape == (n_vertices,)
+
+
+_LATTICE_ROWS = [26, 80, 240]
+_lattice_cache: dict[int, tuple[np.ndarray, Delaunay, np.ndarray]] = {}
+
+
+def _triangular_lattice_2d(rows: int) -> tuple[np.ndarray, Delaunay, np.ndarray]:
+    """
+    Build lattice points, their Delaunay triangulation and a query cloud overhanging it by 10%.
+
+    Cached per size: the triangulation is the benchmark's *input*, so building it inside the timed
+    region would price scipy's Delaunay rather than either library's point location.
+    """
+    if rows not in _lattice_cache:
+        cols = rows + 4
+        height = np.sqrt(3.0) / 2.0
+        points_np = np.array(
+            [(col + 0.5 * (row % 2), row * height) for row in range(rows) for col in range(cols)],
+            dtype=np.float64,
+        )
+        triangulation_sp = Delaunay(points_np)
+        extent_np = points_np.max(axis=0) - points_np.min(axis=0)
+        rng = np.random.default_rng(4)
+        queries_np = (
+            points_np.min(axis=0) - 0.05 * extent_np + rng.random((_N_QUERIES, 2)) * 1.1 * extent_np
+        )
+        _lattice_cache[rows] = (points_np, triangulation_sp, queries_np)
+    return _lattice_cache[rows]
+
+
+@pytest.mark.benchmark(group="containing_faces_2d")
+@pytest.mark.benchlibs("triwarp", "scipy")
+@pytest.mark.parametrize("rows", _LATTICE_ROWS, ids=["lattice26", "lattice80", "lattice240"])
+def test_containing_faces_2d(bench_lib: BenchLibrary, rows: int) -> None:
+    """
+    Point location in a planar triangulation: BVH candidate, then a barycentric sign test.
+
+    The only group in this module with **no input mesh** -- a 2D triangulation is not one of the
+    registry's surfaces -- so it takes ``bench_lib`` and builds its own: a triangular lattice
+    whose Delaunay triangulation is equilateral throughout, swept over three sizes. The lattice
+    is not arbitrary. Any Delaunay of a bounded point set has needle triangles on its hull, and
+    a query within float32 noise of two needles' shared edge resolves to neither, so a random-
+    point triangulation would make this row's own correctness assert flaky for a reason that has
+    nothing to do with cost.
+
+    **The comparison is deliberately unfavourable to triwarp.**
+    ``scipy.spatial.Delaunay.find_simplex`` is timed on a triangulation built *outside* the
+    timed region, while triwarp's row includes building its BVH on every call -- there is no
+    prebuilt-index entry point on this side. Read the row as a floor on triwarp's margin, not as
+    a like-for-like split; scipy is doing strictly less work per call.
+    """
+    points_np, triangulation_sp, queries_np = _triangular_lattice_2d(rows)
+    if bench_lib.kind == "scipy":
+        located_sp = bench_lib.run(lambda: triangulation_sp.find_simplex(queries_np))
+        assert located_sp.shape == (_N_QUERIES,)
+        assert (located_sp >= 0).any()
+        return
+
+    device = bench_lib.device
+    vertices_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec2, device=device
+    )
+    faces_wp = wp.array(
+        np.ascontiguousarray(triangulation_sp.simplices, dtype=np.int32).ravel(),
+        dtype=wp.int32,
+        device=device,
+    )
+    queries_wp = wp.array(
+        np.ascontiguousarray(queries_np, dtype=np.float32), dtype=wp.vec2, device=device
+    )
+    located_wp = bench_lib.run(
+        lambda: tw.proximity.containing_faces_2d(vertices_wp, faces_wp, queries_wp)
+    )
+    # Exact on this lattice, which is why the fixture is a lattice; see the docstring.
+    assert np.array_equal(located_wp.numpy(), triangulation_sp.find_simplex(queries_np))

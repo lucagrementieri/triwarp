@@ -186,13 +186,22 @@ vertices and `int64` `(n_faces, 3)` faces, which is exactly what `mesh_tm.vertic
 already are — and every bound function is *pure* (arrays in, arrays out), so there is no in-place
 mutation to defend against. The exceptions are the stateful solver objects (`HeatGeodesicsData`,
 `ARAPData`, `min_quad_with_fixed_data`, `AABB`), which cache a factorization and must therefore be
-constructed **inside** a timed callable. Four hazards, all measured:
+constructed **inside** a timed callable. Five hazards, all measured:
 
 - **An out-of-range face index is a SIGSEGV, not an exception.** `igl.cotmatrix(V, F)` with one entry
   of `F` set to `len(V) + 500` kills the interpreter with exit code 139 and no traceback — igl
   bounds-checks nothing. Never hand it a reduced `V` with the original `F`. The same class of crash
   hits `igl.principal_curvature` on a non-manifold vertex, and `igl.heat_geodesics_precompute` /
   `igl.harmonic` / `igl.lscm` refuse (raise) rather than crash on meshes they cannot factor.
+- **Two bound functions are memory-unsafe on ordinary input, so a "works" probe is not enough** —
+  check *values*, and prefer a fixture class where the function is known safe. `igl.loop` aborts with
+  `free(): invalid pointer` on a five-vertex mesh with three faces on one edge and SIGSEGVs (139) on
+  `bunny_decimated`, whose 87 duplicated faces leave it non-edge-manifold; on `bunny` it silently
+  returns 1 113 `NaN` rows, one per unreferenced vertex, because it indexes `igl::adjacency_list`
+  (sized `F.max() + 1`) up to `n_verts`. And **`igl.in_element` is unusable outright**: on a
+  two-triangle square it never reports element 0 for any query inside it, the same query returns a
+  face in a 3-query batch and `-1` in a 7-query batch, and a 200-point Delaunay input aborts with
+  `malloc(): invalid size`. Use `scipy.spatial.Delaunay.find_simplex` as the point-location oracle.
 - **F-only functions size their output by `F.max() + 1`, not by `len(V)`.** `igl.adjacency_matrix`,
   `igl.vertex_components` and `igl.is_vertex_manifold` return `F.max() + 1` rows where
   `igl.cotmatrix` and `igl.gaussian_curvature` return `len(V)`. So on a mesh with unreferenced

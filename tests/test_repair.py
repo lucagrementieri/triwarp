@@ -11,7 +11,7 @@ import trimesh.repair as tm_repair
 import warp as wp
 
 import triwarp as tw
-from tests.comparisons import canonical_winding, lexsort_rows
+from tests.comparisons import canonical_winding, lexsort_rows, same_partition
 from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab
 
 
@@ -646,6 +646,205 @@ def _triangle_set_close(a: np.ndarray, b: np.ndarray, atol: float = 1e-4) -> boo
         return True
     key = lambda t: np.lexsort(t.reshape(t.shape[0], -1).T[::-1])  # noqa: E731
     return bool(np.allclose(a[key(a)], b[key(b)], atol=atol))
+
+
+# --------------------------------------------------------------------------------------
+# split_nonmanifold
+# --------------------------------------------------------------------------------------
+
+
+def _bowtie_np() -> tuple[np.ndarray, np.ndarray]:
+    """Two triangles meeting at a single vertex: edge-manifold, vertex-non-manifold."""
+    vertices_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [-1.0, -1.0, 0.0]],
+        dtype=np.float32,
+    )
+    return vertices_np, np.array([[0, 1, 2], [0, 3, 4]], dtype=np.int32)
+
+
+def _three_faces_on_one_edge_np() -> tuple[np.ndarray, np.ndarray]:
+    """Build a fan of three faces on edge ``(0, 1)``, all wound the same way round it."""
+    vertices_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    return vertices_np, np.array([[0, 1, 2], [0, 1, 3], [0, 1, 4]], dtype=np.int32)
+
+
+def _split_nonmanifold_wp(
+    vertices_np: np.ndarray, faces_np: np.ndarray, device: str
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run ``split_nonmanifold`` on NumPy input and bring all three results back."""
+    vertices_wp = wp.array(np.ascontiguousarray(vertices_np), dtype=wp.vec3, device=device)
+    faces_wp = wp.array(np.ascontiguousarray(faces_np).ravel(), dtype=wp.int32, device=device)
+    new_vertices_wp, new_faces_wp, source_wp = tw.repair.split_nonmanifold(vertices_wp, faces_wp)
+    return new_vertices_wp.numpy(), new_faces_wp.numpy().reshape(-1, 3), source_wp.numpy()
+
+
+@pytest.mark.parametrize(
+    "mesh_kind", ["manifold", "bowtie", "three_faces_on_one_edge", "flipped_face", "boundary"]
+)
+@pytest.mark.parity("split_nonmanifold", "igl")
+def test_split_nonmanifold_matches_igl(
+    mesh_kind: str, device: str, icosahedron: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Class B: the same vertex split as ``igl.split_nonmanifold``, up to which copy gets which index.
+
+    Neither library's vertex numbering is meaningful -- both invent copies -- so what is compared is
+    the *partition of corners* the two induce, canonicalised by first occurrence with
+    [`same_partition`][tests.comparisons.same_partition]. That is exact rather than tolerant, and it
+    is the whole answer: given the partition, the face table and the source map follow.
+
+    The two implementations are unrelated. triwarp takes connected components of a corner graph in
+    one parallel pass; ``igl::split_nonmanifold`` explodes the mesh into ``3 * n_faces`` singleton
+    vertices and greedily re-merges pairs, re-testing manifoldness after each candidate. They agree
+    on every input class here, including the two that a naive implementation gets wrong: a fan of
+    three faces round one edge must split into three (not two-plus-one), and a face wound against
+    its neighbours must be cut free rather than silently kept.
+
+    ``manifold`` is the identity case and is *not* vacuous coverage -- it is asserted to return the
+    input unchanged, which an implementation that split on every edge would fail.
+    """
+    if mesh_kind == "bowtie":
+        vertices_np, faces_np = _bowtie_np()
+        expected_new = 6
+    elif mesh_kind == "three_faces_on_one_edge":
+        vertices_np, faces_np = _three_faces_on_one_edge_np()
+        expected_new = 9  # every corner its own vertex: no pair of the three is oppositely wound
+    elif mesh_kind == "flipped_face":
+        mesh_tm, _ = icosahedron
+        vertices_np = mesh_tm.vertices.astype(np.float32)
+        faces_np = mesh_tm.faces.astype(np.int32).copy()
+        faces_np[-1] = faces_np[-1][::-1]
+        expected_new = 15  # the flipped face is cut free of all three neighbours
+    elif mesh_kind == "boundary":
+        sphere_tm = tm.creation.icosphere(subdivisions=2)
+        hemisphere_tm = sphere_tm.slice_plane(
+            plane_origin=np.zeros(3), plane_normal=np.array([0.0, 0.0, 1.0]), cap=False
+        )
+        hemisphere_tm.merge_vertices()
+        vertices_np = hemisphere_tm.vertices.astype(np.float32)
+        faces_np = hemisphere_tm.faces.astype(np.int32)
+        expected_new = int(vertices_np.shape[0])  # a boundary is not a reason to split
+    else:
+        mesh_tm, _ = icosahedron
+        vertices_np = mesh_tm.vertices.astype(np.float32)
+        faces_np = mesh_tm.faces.astype(np.int32)
+        expected_new = int(vertices_np.shape[0])
+
+    new_vertices_np, new_faces_np, source_np = _split_nonmanifold_wp(vertices_np, faces_np, device)
+
+    faces_igl, source_igl = igl.split_nonmanifold(
+        np.ascontiguousarray(faces_np, dtype=np.int64).reshape(-1, 3)
+    )
+    assert source_igl.shape[0] == expected_new, "the reference produced the expected split"
+    assert new_vertices_np.shape[0] == expected_new
+    assert same_partition(new_faces_np.ravel(), np.asarray(faces_igl).ravel())
+
+    # The split moves nothing and drops nothing: every copy sits on the vertex it came from.
+    assert new_faces_np.shape == faces_np.reshape(-1, 3).shape
+    assert np.allclose(new_vertices_np, vertices_np[source_np], atol=1e-6)
+    assert np.array_equal(np.sort(source_igl), np.sort(source_np.astype(np.int64)))
+
+
+@pytest.mark.parametrize(
+    "mesh_kind", ["bowtie", "three_faces_on_one_edge", "flipped_face", "duplicated_face"]
+)
+def test_split_nonmanifold_leaves_a_manifold_mesh(
+    mesh_kind: str, device: str, icosahedron: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    The post-condition, on inputs that violate it: edge-manifold out, same face count.
+
+    Checked independently of igl because it is the property callers actually depend on, and because
+    it covers ``duplicated_face`` -- the one input class where the two libraries deliberately
+    disagree on *how much* to split (see the next test), while both must still satisfy this.
+    """
+    mesh_tm, _ = icosahedron
+    if mesh_kind == "bowtie":
+        vertices_np, faces_np = _bowtie_np()
+    elif mesh_kind == "three_faces_on_one_edge":
+        vertices_np, faces_np = _three_faces_on_one_edge_np()
+    else:
+        vertices_np = mesh_tm.vertices.astype(np.float32)
+        faces_np = mesh_tm.faces.astype(np.int32)
+        if mesh_kind == "flipped_face":
+            faces_np = faces_np.copy()
+            faces_np[-1] = faces_np[-1][::-1]
+        else:
+            faces_np = np.vstack([faces_np, faces_np[:1]])
+
+    faces_wp = wp.array(np.ascontiguousarray(faces_np).ravel(), dtype=wp.int32, device=device)
+    vertices_wp = wp.array(np.ascontiguousarray(vertices_np), dtype=wp.vec3, device=device)
+    # Each input violates a *different* precondition, and the guards say which -- a bowtie is
+    # edge-manifold with a non-manifold vertex, and a flipped face is manifold but not orientable.
+    if mesh_kind in ("three_faces_on_one_edge", "duplicated_face"):
+        assert not tw.validation.is_edge_manifold(faces_wp)
+    elif mesh_kind == "flipped_face":
+        assert not tw.validation.is_winding_consistent(faces_wp)
+    else:
+        assert not tw.validation.is_vertex_manifold(faces_wp)
+
+    new_vertices_wp, new_faces_wp, _source_wp = tw.repair.split_nonmanifold(vertices_wp, faces_wp)
+
+    assert tw.validation.is_edge_manifold(new_faces_wp)
+    assert int(new_faces_wp.shape[0]) == int(faces_wp.shape[0])
+    assert int(new_vertices_wp.shape[0]) >= int(vertices_wp.shape[0])
+    # Idempotent: a second pass has nothing left to split.
+    again_vertices_wp, again_faces_wp, _ = tw.repair.split_nonmanifold(
+        new_vertices_wp, new_faces_wp
+    )
+    assert int(again_vertices_wp.shape[0]) == int(new_vertices_wp.shape[0])
+    assert np.array_equal(again_faces_wp.numpy(), new_faces_wp.numpy())
+
+
+def test_split_nonmanifold_splits_a_duplicated_face_further_than_igl(
+    device: str, icosahedron: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    The one documented divergence from igl, pinned so it cannot drift unnoticed.
+
+    Where an edge carries one half-edge in one direction and several in the other -- what a
+    duplicated face produces -- igl keeps one arbitrarily chosen pair joined while triwarp
+    splits every copy. Both answers are manifold with the input's face count; triwarp's is
+    order-independent and makes no arbitrary choice.
+
+    Asserted as exact counts in both directions, so a change to either library's rule fails here
+    rather than quietly altering the output of a repair function.
+    """
+    mesh_tm, _ = icosahedron
+    vertices_np = mesh_tm.vertices.astype(np.float32)
+    faces_np = np.vstack([mesh_tm.faces.astype(np.int32), mesh_tm.faces.astype(np.int32)[:1]])
+
+    new_vertices_np, _new_faces_np, _source_np = _split_nonmanifold_wp(
+        vertices_np, faces_np, device
+    )
+    _faces_igl, source_igl = igl.split_nonmanifold(
+        np.ascontiguousarray(faces_np, dtype=np.int64).reshape(-1, 3)
+    )
+
+    assert new_vertices_np.shape[0] == 18, "all three copies of each shared vertex split apart"
+    assert source_igl.shape[0] == 15, "igl keeps one pair of the three joined"
+    # Both answers are legal repairs of the same input: manifold, with every face kept.
+    assert _new_faces_np.shape[0] == faces_np.shape[0] == np.asarray(_faces_igl).shape[0]
+    faces_wp = wp.array(np.ascontiguousarray(faces_np).ravel(), dtype=wp.int32, device=device)
+    vertices_wp = wp.array(np.ascontiguousarray(vertices_np), dtype=wp.vec3, device=device)
+    assert tw.validation.is_edge_manifold(tw.repair.split_nonmanifold(vertices_wp, faces_wp)[1])
+    # And `resolve_duplicated_faces` is *not* the escape hatch here: libigl's cancellation rules
+    # cover a +1/-1 imbalance, so a face duplicated in the *same* orientation makes it raise.
+    with pytest.raises(ValueError, match="non-orientable duplicate face group"):
+        tw.repair.resolve_duplicated_faces(faces_wp)
+
+
+def test_split_nonmanifold_empty(device: str) -> None:
+    """An empty mesh passes through with an empty source map."""
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    new_vertices_wp, new_faces_wp, source_wp = tw.repair.split_nonmanifold(vertices_wp, faces_wp)
+    assert int(new_vertices_wp.shape[0]) == 0
+    assert int(new_faces_wp.shape[0]) == 0
+    assert int(source_wp.shape[0]) == 0
 
 
 def test_remove_degenerate_faces_matches_trimesh(device: str) -> None:

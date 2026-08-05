@@ -191,3 +191,69 @@ def bad_face_mask(
     # a fold has two faces and only one of them is the mistake, so flagging both would delete a good
     # triangle along with it.
     out_bad[f] = wp.cos(max_angle[f]) < max_fold_cos and agreement < 0.0
+
+
+@wp.kernel
+def halfedge_orientation_slots(
+    faces: wp.array[wp.int32],
+    edge_of_corner: wp.array[wp.int32],
+    out_forward_count: wp.array[wp.int32],
+    out_backward_count: wp.array[wp.int32],
+    out_forward_corner: wp.array[wp.int32],
+    out_backward_corner: wp.array[wp.int32],
+) -> None:
+    # Per unique edge: how many half-edges traverse it each way, and which corner they belong to.
+    #
+    # Corner ``c = 3f + j`` is the half-edge ``(fv[j], fv[j + 1])``. ``unique_edges`` rows are
+    # sorted min-first, so a half-edge is "forward" when it runs low index to high. A
+    # *consistently oriented manifold* edge has exactly one of each; anything else -- two forward
+    # (a flipped neighbour), three or more of either (a non-manifold edge), or one alone (a
+    # boundary) -- is not mergeable, so its corner slot is never read and the ``atomic_max`` only
+    # keeps the write deterministic.
+    c = int(wp.tid())
+    e = edge_of_corner[c]
+    f = c / 3
+    j = c % 3
+    if faces[c] < faces[f * 3 + (j + 1) % 3]:
+        wp.atomic_add(out_forward_count, e, 1)
+        wp.atomic_max(out_forward_corner, e, c)
+    else:
+        wp.atomic_add(out_backward_count, e, 1)
+        wp.atomic_max(out_backward_corner, e, c)
+
+
+@wp.kernel
+def corner_merge_links(
+    forward_count: wp.array[wp.int32],
+    backward_count: wp.array[wp.int32],
+    forward_corner: wp.array[wp.int32],
+    backward_corner: wp.array[wp.int32],
+    out_links: wp.array2d[wp.int32],
+) -> None:
+    # Two corner-graph links per mergeable edge: one joining the corners at each endpoint.
+    #
+    # Nodes are ``(face, vertex slot)`` pairs under the same ``3f + k`` numbering, so node
+    # ``3f + k`` *is* the corner whose vertex is ``faces[3f + k]``, and a link only ever joins two
+    # copies of one original vertex. Connected components of this graph are the vertex copies.
+    #
+    # A non-mergeable edge emits two self-loops on node 0 rather than nothing, which keeps the
+    # output a fixed ``(2 * n_edges, 2)`` buffer with no compaction pass; a self-loop merges
+    # nothing.
+    e = int(wp.tid())
+    out_links[e * 2 + 0, 0] = 0
+    out_links[e * 2 + 0, 1] = 0
+    out_links[e * 2 + 1, 0] = 0
+    out_links[e * 2 + 1, 1] = 0
+    if forward_count[e] != 1 or backward_count[e] != 1:
+        return
+
+    forward = forward_corner[e]
+    backward = backward_corner[e]
+    # The forward half-edge runs (low, high) from its own corner; the backward one runs (high, low),
+    # so its *next* slot holds the low endpoint.
+    forward_next = (forward / 3) * 3 + (forward + 1) % 3
+    backward_next = (backward / 3) * 3 + (backward + 1) % 3
+    out_links[e * 2 + 0, 0] = forward  # low endpoint, forward face
+    out_links[e * 2 + 0, 1] = backward_next  # low endpoint, backward face
+    out_links[e * 2 + 1, 0] = forward_next  # high endpoint, forward face
+    out_links[e * 2 + 1, 1] = backward  # high endpoint, backward face

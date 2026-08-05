@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import igl
 import numpy as np
 import pytest
+import trimesh as tm
 import warp as wp
 
 import triwarp as tw
 from tests.conversions import trimesh_to_open3d
 
 _MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
+
+_Objective = Literal["volume", "surface_area", "diagonal"]
+_OBJECTIVES: list[_Objective] = ["volume", "surface_area", "diagonal"]
 
 
 def _bounds_np(lower_wp: wp.vec3, upper_wp: wp.vec3) -> np.ndarray:
@@ -139,3 +145,234 @@ def test_aabb_union_matches_a_pooled_reduction(device: str) -> None:
         wp.array(np.ascontiguousarray(np.vstack([cloud_a, cloud_b])), dtype=wp.vec3, device=device)
     )
     assert np.allclose(_bounds_np(union_min, union_max), _bounds_np(pooled_min, pooled_max))
+
+
+def _tilted_cloud(mesh_tm: tm.Trimesh, device: str) -> tuple[np.ndarray, wp.array[wp.vec3]]:
+    """
+    Stretch a fixture's vertices anisotropically and rotate them off the coordinate axes.
+
+    Every oriented-box comparison below runs on this rather than on the raw fixture, and it is not
+    cosmetic: on a shape whose extent is the same in every direction, *all* candidate orientations
+    score nearly the same, so an agreement on the achieved objective would hold for an
+    implementation that returned any orientation at all. Stretching by ``(1, 2, 3)`` makes the
+    minimizer both unique and far from the identity, which is what gives the assertions teeth --
+    and the rotation is what stops the axis-aligned box from already being the answer.
+    """
+    tilt_np = tm.transformations.random_rotation_matrix(np.random.default_rng(7).random(3))[:3, :3]
+    points_np = np.ascontiguousarray(mesh_tm.vertices * np.array([1.0, 2.0, 3.0]) @ tilt_np.T)
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    return points_np, points_wp
+
+
+def _frame_np(rotation_wp: wp.mat33) -> np.ndarray:
+    """Return triwarp's world-to-box frame as ``(3, 3)`` NumPy, its rows still the box axes."""
+    return np.array([[rotation_wp[i, j] for j in range(3)] for i in range(3)])
+
+
+def _achieved_loss(
+    points_np: np.ndarray, frame_np: np.ndarray, objective: _Objective = "volume"
+) -> float:
+    """
+    Recompute, in NumPy, the objective a world-to-box frame achieves on ``points_np``.
+
+    Both libraries are scored through this, from the matrix each one returns, so the comparison is
+    of the *boxes* rather than of two self-reported numbers.
+    """
+    sides_np = np.ptp(points_np @ frame_np.T, axis=0)
+    if objective == "volume":
+        return float(np.prod(sides_np))
+    if objective == "surface_area":
+        return float(2.0 * (sides_np * np.roll(sides_np, 1)).sum())
+    return float(np.square(sides_np).sum())
+
+
+@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parametrize("objective", _OBJECTIVES)
+@pytest.mark.parity("oriented_bounding_box", "igl")
+def test_oriented_bounding_box_matches_igl(
+    request: pytest.FixtureRequest, mesh_name: str, objective: _Objective
+) -> None:
+    """
+    Class A on the achieved objective, for all three of them: the two searches find the same box.
+
+    This is a *search*, and the comparison is only meaningful because both libraries search the
+    identical candidate set -- the Super-Fibonacci spiral of [Alexa 2022] with the identity
+    appended, which triwarp adopts precisely so that the two are comparable. So this is not "two
+    heuristics landed near each other": with the same candidates and the same three objectives the
+    argmin is the same element, and the assertion is tight rather than statistical (measured
+    agreement 1e-7 relative, asserted at 1e-5).
+
+    Both sides are scored by ``_achieved_loss`` from the matrix they return, not by trusting the
+    number each reports, so a library that returned a good loss with the wrong frame would fail.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    points_np, points_wp = _tilted_cloud(mesh_tm, mesh_wp.device)
+    igl_objective = {
+        "volume": igl.ORIENTED_BOUNDING_BOX_MINIMIZE_VOLUME,
+        "surface_area": igl.ORIENTED_BOUNDING_BOX_MINIMIZE_SURFACE_AREA,
+        "diagonal": igl.ORIENTED_BOUNDING_BOX_MINIMIZE_DIAGONAL_LENGTH,
+    }[objective]
+
+    rotation_wp, lower_wp, upper_wp = tw.bounds.oriented_bounding_box(points_wp, 512, objective)
+
+    # igl applies its matrix on the right of a row vector, so its frame is triwarp's transposed.
+    frame_igl = igl.oriented_bounding_box(points_np, 512, igl_objective).T
+    frame_wp = _frame_np(rotation_wp)
+    loss_wp = _achieved_loss(points_np, frame_wp, objective)
+    loss_igl = _achieved_loss(points_np, frame_igl, objective)
+    assert np.isclose(loss_wp, loss_igl, rtol=1e-5)
+
+    # The search is worth running on this fixture: the identity is one of the 512 candidates, so a
+    # tie with the axis-aligned box would mean the other 511 never improved on it.
+    assert loss_wp < _achieved_loss(points_np, np.eye(3), objective) * 0.99
+
+    # And triwarp's own bounds are the extent in its own frame -- the convention the docstring
+    # states, and the only part of the answer igl does not return.
+    projected_np = points_np @ frame_wp.T
+    assert np.allclose(
+        _bounds_np(lower_wp, upper_wp),
+        np.stack([projected_np.min(0), projected_np.max(0)]),
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parity("oriented_bounding_box", "igl")
+def test_oriented_bounding_box_frame_matches_igl_transposed(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B: the same frame as igl, element-wise, once transposed for the row-vector convention.
+
+    Stronger than the objective comparison above and it pins the one thing that comparison cannot --
+    which of the two transpose conventions triwarp returns. Reading it the wrong way round still
+    gives an orthonormal matrix and a plausible box, so nothing else here would catch it.
+
+    Element-wise equality of the *frames* is only well posed because the minimizer is unique on a
+    stretched, tilted cloud; that is why this does not run on the raw fixtures.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    points_np, points_wp = _tilted_cloud(mesh_tm, mesh_wp.device)
+
+    rotation_wp, _, _ = tw.bounds.oriented_bounding_box(points_wp, 512)
+
+    frame_np = _frame_np(rotation_wp)
+    assert np.allclose(frame_np, igl.oriented_bounding_box(points_np, 512).T, atol=1e-5)
+    # A proper rotation, not a reflection: the box axes are right-handed.
+    assert np.allclose(frame_np @ frame_np.T, np.eye(3), atol=1e-5)
+    assert np.isclose(np.linalg.det(frame_np), 1.0, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parity("oriented_bounding_box", "trimesh")
+def test_oriented_bounding_box_agrees_with_trimesh_hull_search(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class C: the sampled box and trimesh's hull-face search find the same box within a band.
+
+    A derived scalar -- box volume -- because no correspondence exists between the two frames: the
+    two libraries minimize the same quantity over *different* candidate sets, triwarp over a
+    low-discrepancy sampling of ``SO(3)`` and trimesh over the orientations flush with a convex-hull
+    face, and different orientations can realise the same volume.
+
+    **Neither side bounds the other, and that was measured rather than assumed.** trimesh's answer
+    reads like an exact minimum and is not one: on the stretched icosahedron triwarp returns **1.2%
+    less** volume here, and locally refining triwarp's frame reaches 2.1% below trimesh, so the
+    hull-face restriction can miss the optimum. Hence a two-sided band rather than an inequality.
+
+    The bug class it excludes is a search that does not search -- a mis-scored objective, candidates
+    that fail to cover ``SO(3)``, or a frame paired with extents it did not produce -- all of which
+    leave the volume far above a real minimum.
+
+    Margins, measured at 32 768 candidates across the four fixtures: the excess runs from -1.5%
+    (half_torus) through -1.2% (icosahedron) and +0.8% (hemisphere) to +5.2% (cave_cube, the cube
+    whose single exact orientation sampling cannot land on), so the ``[0.95, 1.20]`` band clears the
+    worst reading by 3.9x above and 3.3x below. Mutation probe: re-running at ``rotations=1``, i.e.
+    the axis-aligned box, which is what a search that silently scored nothing would return, gives
+    +75% to +437% and breaks the ceiling by 3.7x to 22x on every fixture.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    points_np, points_wp = _tilted_cloud(mesh_tm, mesh_wp.device)
+
+    rotation_wp, lower_wp, upper_wp = tw.bounds.oriented_bounding_box(points_wp, 32768)
+
+    volume_wp = float(np.prod(np.ptp(_bounds_np(lower_wp, upper_wp), axis=0)))
+    _, extents_tm = tm.bounds.oriented_bounds(tm.PointCloud(points_np))
+    volume_tm = float(np.prod(extents_tm))
+    assert volume_tm > 0.0, "the reference produced a box before it is compared to"
+
+    assert volume_tm * 0.95 <= volume_wp <= volume_tm * 1.20
+    # The reported extents are the box the reported frame achieves, so the volume above is the
+    # quantity that was minimized and not an unrelated pair of numbers.
+    assert np.isclose(
+        volume_wp, _achieved_loss(points_np, _frame_np(rotation_wp), "volume"), rtol=1e-5
+    )
+
+
+def test_oriented_bounding_box_single_rotation_is_the_aabb(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    ``rotations=1`` scores only the identity, so it must reproduce ``aabb_bounds`` exactly.
+
+    The identity is deliberately the *last* candidate rather than the first, which is what makes
+    this an edge case worth pinning: an off-by-one in the spiral's ``n - 1`` split would drop it and
+    return some arbitrary orientation here.
+    """
+    _, mesh_wp = icosahedron
+    rotation_wp, lower_wp, upper_wp = tw.bounds.oriented_bounding_box(mesh_wp.points, 1)
+
+    assert np.array_equal(_frame_np(rotation_wp), np.eye(3))
+    assert np.array_equal(
+        _bounds_np(lower_wp, upper_wp), _bounds_np(*tw.bounds.aabb_bounds(mesh_wp.points))
+    )
+
+
+def test_oriented_bounding_box_never_loses_to_the_aabb(
+    half_torus: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Including the identity in the candidate set makes the result monotone in ``rotations``.
+
+    Adding candidates can only lower the minimum, and every count contains the axis-aligned box, so
+    the volume sequence must be non-increasing and never above the AABB's. That is a property of the
+    candidate construction rather than of any one answer, and it is what lets a caller raise
+    ``rotations`` without checking the result got better.
+    """
+    mesh_tm, mesh_wp = half_torus
+    _, points_wp = _tilted_cloud(mesh_tm, mesh_wp.device)
+
+    volumes = [
+        float(
+            np.prod(np.ptp(_bounds_np(*tw.bounds.oriented_bounding_box(points_wp, n)[1:]), axis=0))
+        )
+        for n in (1, 16, 256, 4096)
+    ]
+
+    assert volumes == sorted(volumes, reverse=True)
+    assert volumes[-1] < volumes[0] * 0.95, "the tilted cloud's box is materially tighter"
+    assert np.isclose(
+        volumes[0], float(np.prod(np.ptp(_bounds_np(*tw.bounds.aabb_bounds(points_wp)), axis=0)))
+    )
+
+
+def test_oriented_bounding_box_empty_cloud(device: str) -> None:
+    """An empty cloud gives the identity frame and the same inverted box ``aabb_bounds`` returns."""
+    empty_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    rotation_wp, lower_wp, upper_wp = tw.bounds.oriented_bounding_box(empty_wp)
+
+    assert np.array_equal(_frame_np(rotation_wp), np.eye(3))
+    assert np.all(np.isposinf(_bounds_np(lower_wp, upper_wp)[0]))
+    assert np.all(np.isneginf(_bounds_np(lower_wp, upper_wp)[1]))
+
+
+def test_oriented_bounding_box_rejects_bad_arguments(device: str) -> None:
+    """Both documented ``ValueError``s are reachable, and neither is raised for a valid call."""
+    points_wp = wp.array(
+        np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]], dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    with pytest.raises(ValueError, match="rotations must be >= 1"):
+        tw.bounds.oriented_bounding_box(points_wp, 0)
+    with pytest.raises(ValueError, match="objective must be"):
+        tw.bounds.oriented_bounding_box(points_wp, 8, "perimeter")  # type: ignore[arg-type]

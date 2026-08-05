@@ -380,6 +380,136 @@ def remove_non_manifold_faces(
     return vertices, faces
 
 
+def split_nonmanifold(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Make a mesh manifold and orientable by duplicating vertices, keeping every face.
+
+    The non-lossy counterpart of
+    [`remove_non_manifold_faces`][triwarp.repair.remove_non_manifold_faces], which deletes geometry
+    to reach the same property: this changes no position and drops no triangle, it only splits
+    vertices apart, so the surface is unchanged and the face count is exactly preserved. Use it to
+    feed a mesh to code that requires manifold input -- the potpourri3d references in
+    ``benchmarks/README.md`` reject non-manifold meshes outright, and so do triwarp's own halfedge
+    consumers.
+
+    Two corners are kept together only across an edge that is **manifold and consistently
+    oriented**: exactly one half-edge each way. Every other edge -- a boundary edge, one shared by
+    three or more faces, or one whose two faces traverse it the same way -- separates the copies. So
+    a bowtie vertex splits in two, an edge with three faces splits into three boundary edges, and a
+    flipped face is cut free of its neighbours rather than reoriented (that is
+    [`make_winding_consistent`][triwarp.repair.make_winding_consistent]'s job, and running it first
+    leaves less to split).
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+
+    Returns
+    -------
+    new_vertices : wp.array[wp.vec3]
+        ``(n_new,)`` positions with ``n_new >= n_referenced``; each is a copy of the original vertex
+        it came from, so the point set is unchanged as a *set*.
+    new_faces : wp.array[wp.int32]
+        Flat buffer of the same ``n_faces`` triangles in input order, indexing ``new_vertices``.
+    source : wp.array[wp.int32]
+        Length ``n_new`` map from each new vertex to the original it duplicates, so
+        ``new_vertices == vertices[source]`` and a per-vertex attribute transfers with
+        [`gather`][triwarp.array.gather]. This is ``igl.split_nonmanifold``'s ``SVI``.
+
+    Notes
+    -----
+    Vertices unreferenced by any face are **dropped**, since a new vertex only exists as some face's
+    corner -- the same convention as
+    [`remove_unreferenced_vertices`][triwarp.repair.remove_unreferenced_vertices], and the reason
+    this function cannot simply return an ``n_vertices``-length remap.
+
+    Remove degenerate faces first, with
+    [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]: a triangle with a repeated
+    index has two corners at one vertex that no edge can join, so it survives as two copies of
+    that vertex and the face stays degenerate.
+
+    The implementation is a connected-components pass over a graph of ``3 * n_faces`` corner nodes
+    rather than a per-vertex star walk: one kernel counts each edge's half-edges by direction, a
+    second emits two links per mergeable edge, and
+    [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
+    does the merging. ``igl::split_nonmanifold`` instead explodes the mesh to ``3 * n_faces``
+    singleton vertices and greedily re-merges pairs, re-testing manifoldness after each candidate --
+    order-dependent and sequential by construction. The two agree exactly on a manifold mesh, a
+    bowtie vertex, a consistently-wound fan of three faces on one edge (both split it into three),
+    a flipped face and an open boundary.
+
+    **They differ on one input class, by design.** Where an edge carries one half-edge in one
+    direction and *several* in the other -- which is what a duplicated face produces -- igl keeps
+    one arbitrarily chosen pair joined, while this splits every copy: 18 vertices against igl's 15
+    on an icosahedron with one face duplicated, and 8 527 against 8 320 on ``bunny_decimated``,
+    whose 87 duplicated faces are its only non-manifoldness. Both results are edge- and
+    vertex-manifold with the input's face count; this one is order-independent and makes no
+    arbitrary choice. Note that
+    [`resolve_duplicated_faces`][triwarp.repair.resolve_duplicated_faces] is not a way around the
+    difference: libigl's cancellation rules it implements cover a ``+1``/``-1`` imbalance, so a face
+    duplicated in the *same* orientation makes it raise rather than dropping the copy.
+
+    See Also
+    --------
+    [`remove_non_manifold_faces`][triwarp.repair.remove_non_manifold_faces]
+    [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
+    [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
+    [`is_edge_manifold`][triwarp.validation.is_edge_manifold]
+    ``igl.split_nonmanifold``
+    """
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        empty_index = wp.empty(0, dtype=wp.int32, device=device)
+        return wp.empty(0, dtype=wp.vec3, device=vertices.device), faces, empty_index
+
+    n_corners = 3 * n_faces
+    _unique_edges, edge_of_corner = tw.edges.edges_unique(faces, n_vertices=int(vertices.shape[0]))
+    n_unique = int(_unique_edges.shape[0])
+
+    forward_count = wp.zeros(n_unique, dtype=wp.int32, device=device)
+    backward_count = wp.zeros(n_unique, dtype=wp.int32, device=device)
+    forward_corner = wp.full(n_unique, wp.int32(-1), dtype=wp.int32, device=device)
+    backward_corner = wp.full(n_unique, wp.int32(-1), dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_repair.halfedge_orientation_slots,
+        dim=n_corners,
+        inputs=[
+            faces,
+            edge_of_corner,
+            forward_count,
+            backward_count,
+            forward_corner,
+            backward_corner,
+        ],
+        device=device,
+    )
+
+    links = twt.empty_int32_2d((2 * n_unique, 2), device=device)
+    wp.launch(
+        kernel_repair.corner_merge_links,
+        dim=n_unique,
+        inputs=[forward_count, backward_count, forward_corner, backward_corner, links],
+        device=device,
+    )
+
+    # ``validate=False``: the links are corner ids this function just built, so the range check
+    # would buy nothing but a full readback of the link buffer.
+    labels = tw.graph.connected_component_labels_from_edges(
+        links, node_count=n_corners, validate=False
+    )
+    # ECL-CC labels each component by its smallest node id, and a node id *is* a corner, so the
+    # representative's vertex is the original this copy came from.
+    representatives, new_faces = tw.grouping.unique_1d(labels, return_inverse=True)
+    source = tw.array.gather(faces, representatives)
+    return tw.array.gather(vertices, source), new_faces, source
+
+
 def collapse_small_triangles(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], epsilon: float = 1e-6
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:

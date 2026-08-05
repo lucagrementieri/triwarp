@@ -188,3 +188,29 @@ def unit_tangent(vector: Any, normal: Any, tolerance: Any):
     if length > tolerance:
         return tangential / length, length
     return tangential, length
+
+
+@wp.func
+def barycentric_2d(q0: wp.vec2, q1: wp.vec2, q2: wp.vec2, p: wp.vec2) -> wp.vec3:
+    """
+    Barycentric coordinates ``(b0, b1, b2)`` of ``p`` in the 2D triangle ``(q0, q1, q2)``.
+
+    Returns a vector with a negative component for degenerate triangles, so a caller testing
+    ``min(b) >= -eps`` for containment rejects them without a separate area check.
+    """
+    v0 = q1 - q0
+    v1 = q2 - q0
+    v2 = p - q0
+    d00 = wp.length_sq(v0)
+    d01 = wp.dot(v0, v1)
+    d11 = wp.length_sq(v1)
+    d20 = wp.dot(v2, v0)
+    d21 = wp.dot(v2, v1)
+    denom = d00 * d11 - d01 * d01
+    if wp.abs(denom) < wp.float32(1e-20):
+        return wp.vec3(-1.0, -1.0, -1.0)
+    inverse_denominator = 1.0 / denom
+    b1 = (d11 * d20 - d01 * d21) * inverse_denominator
+    b2 = (d00 * d21 - d01 * d20) * inverse_denominator
+    b0 = 1.0 - b1 - b2
+    return wp.vec3(b0, b1, b2)

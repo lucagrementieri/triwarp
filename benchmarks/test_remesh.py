@@ -156,6 +156,64 @@ def test_subdivide(bench_case: BenchCase) -> None:
         assert len(subdivided.triangles) == 4 * n_faces
 
 
+@pytest.mark.benchmark(group="subdivide_loop")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "igl", "open3d")
+def test_subdivide_loop(bench_case: BenchCase) -> None:
+    """
+    Loop subdivision: the same 1:4 split as ``subdivide``, with smooth stencils not midpoints.
+
+    Read against ``subdivide`` above, which does identical topology work and returns the same
+    output size: the gap between them is the cost of the stencils alone -- two extra atomic
+    accumulation passes (per-edge opposite vertices, per-vertex ring sums) and two position
+    kernels over grids the midpoint split never visits. The two groups sit on different axes for
+    the reason below, so compare per-triangle throughput rather than raw medians.
+
+    ``igl.loop`` and Open3D's ``subdivide_loop`` are the same variant as triwarp -- the two
+    agree with each other to 2e-16 on the relocated originals, all three using **Warren's**
+    ``beta`` (``3/(8k)``, ``3/16`` at ``k = 3``). ``igl.loop``'s ``number_of_subdivs`` stays at
+    1, which is one triwarp call. Both references run into the hundreds of milliseconds here and
+    take ``rounds=3``.
+
+    **This group is on the ``scale`` axis, not the scan sweep, because ``igl.loop`` cannot
+    survive the scan meshes.** Measured, with no Warp in the process: it aborts with ``free():
+    invalid pointer`` on a five-vertex mesh with three faces on one edge, and SIGSEGVs (exit
+    139) on ``bunny_decimated``, whose 87 duplicated faces leave it not edge-manifold. On
+    ``bunny`` it does return, with **1 113 silent ``NaN`` rows** -- one per unreferenced vertex,
+    since ``igl::adjacency_list`` is sized ``F.max() + 1`` where ``igl::loop`` indexes it to
+    ``n_verts``. That is exactly the hazard the ``scale`` axis exists for.
+
+    ``trimesh.remesh.subdivide_loop`` gets no row either, for two independent reasons: it uses
+    Loop's *original* trigonometric ``beta``, ``(1/k)(5/8 - (3/8 + cos(2 pi/k)/4)^2)``, which
+    agrees with Warren's exactly at valence 6 and differs elsewhere (6.79e-3 at the twelve
+    valence-5 vertices of ``icosphere(1)`` against 1.2e-16 at the thirty valence-6 ones), so it
+    could not be a parity oracle; and it divides by the neighbour count, so its own ``assert
+    np.isfinite`` fails on any mesh with an unreferenced vertex.
+
+    triwarp keeps an unreferenced vertex where it is and has no stencil that can divide by zero,
+    which is why its row is the one that asserts finiteness.
+    """
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        new_vertices, new_faces = bench_case.run(lambda: tw.remesh.subdivide_loop(vertices, faces))
+        assert int(new_faces.shape[0]) == 4 * int(faces.shape[0])
+        assert np.isfinite(new_vertices.numpy()).all()
+    elif bench_case.kind == "igl":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        vertices_loop_igl, faces_loop_igl = bench_case.run(
+            lambda: igl.loop(vertices_np, faces_np), rounds=3
+        )
+        assert faces_loop_igl.shape[0] == 4 * bench_case.n_faces
+        assert np.isfinite(vertices_loop_igl).all()
+    else:  # open3d returns a new mesh, so the shared one is reusable
+        mesh_o3d = bench_case.mesh_o3d
+        n_faces = bench_case.n_faces
+        subdivided = bench_case.run(
+            lambda: mesh_o3d.subdivide_loop(number_of_iterations=1), rounds=3
+        )
+        assert len(subdivided.triangles) == 4 * n_faces
+
+
 @pytest.mark.benchmark(group="subdivide_to_size")
 @pytest.mark.benchaxis("scale")
 @pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")

@@ -1501,22 +1501,150 @@ def subdivide(
         device=device,
     )
 
-    # Build (n_faces, 3) array of midpoint vertex indices: unique-edge index + vertex offset.
+    new_vertices, _ = tw.array.pack_1d_arrays([vertices, out_midpoints])
+    return new_vertices, _split_faces_four(faces, inverse, n_vertices)
+
+
+def subdivide_loop(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Subdivide a mesh with one pass of Loop subdivision.
+
+    Same 1-to-4 split as [`subdivide`][triwarp.remesh.subdivide] -- identical face table, identical
+    index layout -- but the positions are the smooth Loop stencils rather than midpoints, so the
+    surface is *approximated* instead of interpolated: original vertices move, and repeated
+    application converges to a C² limit surface (C¹ at irregular vertices).
+
+    - **Odd (edge) vertices**, one per unique edge: ``3/8`` on each endpoint and ``1/8`` on each of
+      the two vertices opposite the edge. A boundary edge takes the midpoint instead.
+    - **Even (original) vertices**, interior: ``(1 - n * beta) * v + beta * sum(ring)`` with
+      **Warren's** ``beta`` -- ``3/16`` at valence 3, ``3/(8n)`` above -- which is the variant
+      ``igl.loop`` uses, rather than Loop's original trigonometric weight.
+    - **Even vertices on a boundary**: ``3/4 * v`` plus ``1/8`` of each of the two neighbours along
+      the boundary, with interior neighbours excluded, so a boundary curve subdivides identically
+      from either side of a seam.
+
+    The mesh should be edge-manifold. Where it is not, the stencils are not defined and the
+    fallbacks are conservative rather than arbitrary: an edge with three or more incident faces
+    takes the midpoint rule, and a vertex where one or three-plus boundary edges meet -- or one with
+    no edges at all -- keeps its position.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions on the target device.
+    faces
+        Length-``3 * n_faces`` flat triangle index buffer.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        ``(new_vertices, new_faces)`` on ``vertices.device``. ``new_vertices`` holds the
+        ``n_vertices`` relocated originals first and then one vertex per unique edge, so its leading
+        ``n_vertices`` rows are the input vertex set *displaced* -- unlike ``subdivide``, where that
+        prefix is unchanged.
+
+    Notes
+    -----
+    Four launches over three grids -- faces, unique edges, vertices -- plus the shared topology.
+    Neither stencil needs an ordered 1-ring: the valence and the ring sum come from an atomic pass
+    over the *unique* edges, which is the deduplicated neighbour count ``igl::loop`` reads off a
+    sorted adjacency list, and the two boundary neighbours are found as the ones joined by boundary
+    edges rather than as the ends of that list.
+
+    For several passes, call this repeatedly -- that is what ``igl.loop``'s ``number_of_subdivs``
+    does internally, and each pass multiplies the face count by four.
+
+    See Also
+    --------
+    [`subdivide`][triwarp.remesh.subdivide]
+    [`subdivide_to_size`][triwarp.remesh.subdivide_to_size]
+    ``igl.loop``
+    """
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return vertices, faces
+
+    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    n_unique = int(unique_edges.shape[0])
+
+    # How many faces each edge carries, and the sum of the vertices opposite it.
+    edge_opposite_sum = wp.zeros(n_unique, dtype=wp.vec3, device=device)
+    edge_face_count = wp.zeros(n_unique, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_remesh.loop_edge_opposites,
+        dim=n_faces,
+        inputs=[vertices, faces, inverse, edge_opposite_sum, edge_face_count],
+        device=device,
+    )
+
+    valence = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+    ring_sum = wp.zeros(n_vertices, dtype=wp.vec3, device=device)
+    boundary_count = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+    boundary_sum = wp.zeros(n_vertices, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_remesh.loop_vertex_rings,
+        dim=n_unique,
+        inputs=[
+            vertices,
+            unique_edges,
+            edge_face_count,
+            valence,
+            ring_sum,
+            boundary_count,
+            boundary_sum,
+        ],
+        device=device,
+    )
+
+    # One buffer sized for its final use, written through two views: the relocated originals in the
+    # prefix and the new edge vertices after them, which is the index layout `_split_faces_four`
+    # assumes and the one ``igl.loop`` returns.
+    new_vertices = wp.empty(n_vertices + n_unique, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_remesh.loop_even_positions,
+        dim=n_vertices,
+        inputs=[vertices, valence, ring_sum, boundary_count, boundary_sum],
+        outputs=[new_vertices[:n_vertices]],
+        device=device,
+    )
+    wp.launch(
+        kernel_remesh.loop_odd_positions,
+        dim=n_unique,
+        inputs=[vertices, unique_edges, edge_opposite_sum, edge_face_count],
+        outputs=[new_vertices[n_vertices:]],
+        device=device,
+    )
+    return new_vertices, _split_faces_four(faces, inverse, n_vertices)
+
+
+def _split_faces_four(
+    faces: wp.array[wp.int32], inverse: wp.array[wp.int32], n_vertices: int
+) -> wp.array[wp.int32]:
+    """
+    Build the 1-to-4 face table both uniform subdivisions share, from the per-corner edge map.
+
+    New vertex ``n_vertices + e`` belongs to unique edge ``e``, and corner ``j`` of face ``f`` spans
+    ``(fv[j], fv[j + 1])``, so shifting ``inverse`` by ``n_vertices`` is the whole index translation
+    [`subdivide`][triwarp.remesh.subdivide] and [`subdivide_loop`][triwarp.remesh.subdivide_loop]
+    need before the split -- the two differ only in where they put the new positions.
+    """
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
     mid_idx_flat = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
     wp.map(wp.add, inverse, wp.int32(n_vertices), out=mid_idx_flat)
-    mid_idx = mid_idx_flat.reshape((n_faces, 3))
 
-    # Emit 4 new triangles per face, shape (n_faces*12,)
     out_new_faces = wp.empty(n_faces * 12, dtype=wp.int32, device=device)
     wp.launch(
         kernel_remesh.subdivide_faces,
         dim=n_faces,
-        inputs=[faces, mid_idx, out_new_faces],
+        inputs=[faces, mid_idx_flat.reshape((n_faces, 3)), out_new_faces],
         device=device,
     )
-
-    new_vertices, _ = tw.array.pack_1d_arrays([vertices, out_midpoints])
-    return new_vertices, out_new_faces
+    return out_new_faces
 
 
 @overload

@@ -166,6 +166,219 @@ def test_subdivide_edge_lengths(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None
 
 
 # --------------------------------------------------------------------------------------
+# subdivide_loop
+# --------------------------------------------------------------------------------------
+
+_LOOP_FIXTURES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
+
+
+def _loop_odd_correspondence(
+    faces_wp_np: np.ndarray, faces_igl: np.ndarray, n_new: int, n_original: int
+) -> np.ndarray:
+    """
+    Map each of triwarp's new edge vertices onto igl's, decoded from the two face tables.
+
+    Both libraries emit four children per face in input face order, and one of those children is the
+    central triangle spanning the face's three *new* vertices -- triwarp emits it fourth and igl
+    third. Reading that row off both tables therefore pairs the two enumerations corner by corner,
+    which is exact where a coordinate ``lexsort`` would be decided by rounding noise. Returns
+    ``perm`` with ``perm[triwarp_index] == igl_index`` over the new vertices.
+    """
+    perm = np.full(n_new, -1, dtype=np.int64)
+    perm[faces_wp_np[3::4].ravel()] = faces_igl[2::4].ravel()
+    new_ids = np.arange(n_original, n_new)
+    assert perm[new_ids].min() >= n_original, "a new vertex was paired with an original one"
+    assert len(set(perm[new_ids].tolist())) == new_ids.shape[0], "the pairing is not a bijection"
+    return perm
+
+
+@pytest.mark.parametrize("mesh_name", _LOOP_FIXTURES)
+@pytest.mark.parity("subdivide_loop", "igl")
+def test_subdivide_loop_matches_igl(mesh_name: str, request: pytest.FixtureRequest) -> None:
+    """
+    Class A on the moved originals, class B on the new vertices: the same Loop stencils as igl.
+
+    Every weight in Loop subdivision is a convention another library may pick differently, and this
+    pins all four of them against ``igl.loop`` at ``1e-5``: the interior ``beta`` (**Warren's**
+    ``3/16`` at valence 3 and ``3/(8n)`` above, not Loop's trigonometric one), the ``3/8``-``1/8``
+    edge rule, the ``1/2`` boundary-edge rule, and the ``3/4``-``1/8`` boundary-vertex rule.
+    Getting any one of them wrong still yields a smooth-looking surface, so a shape-only assertion
+    would not see it.
+
+    The originals correspond by index on both sides -- igl returns them first too -- so that half is
+    class A and directly comparable. The new vertices are ordered by each library's own edge
+    enumeration, and ``_loop_odd_correspondence`` decodes the exact pairing from the face tables
+    rather than matching coordinates.
+
+    The fixtures cover what the branches need: two closed meshes (``cave_cube`` supplies valence-3
+    and valence-6 corners) and two with a boundary, so the boundary rules are not dead code here --
+    ``hemisphere`` and ``half_torus`` both have a rim, which is asserted before the comparison.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_original = int(mesh_tm.vertices.shape[0])
+
+    vertices_wp, faces_wp = tw.remesh.subdivide_loop(mesh_wp.points, mesh_wp.indices)
+
+    vertices_igl, faces_loop_igl = igl.loop(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64), faces_igl(mesh_tm)
+    )
+    assert int(vertices_wp.shape[0]) == vertices_igl.shape[0]
+    assert int(faces_wp.shape[0]) // 3 == faces_loop_igl.shape[0]
+
+    vertices_new_np = vertices_wp.numpy()
+    # The originals moved -- that is what makes this Loop and not `subdivide` -- and they moved the
+    # same way on both sides.
+    assert np.allclose(
+        vertices_new_np[:n_original], vertices_igl[:n_original], rtol=1e-5, atol=1e-5
+    )
+    assert not np.allclose(vertices_new_np[:n_original], mesh_tm.vertices, atol=1e-4)
+
+    perm_np = _loop_odd_correspondence(
+        faces_wp.numpy().reshape(-1, 3),
+        np.asarray(faces_loop_igl),
+        int(vertices_wp.shape[0]),
+        n_original,
+    )
+    new_ids = np.arange(n_original, int(vertices_wp.shape[0]))
+    assert np.allclose(
+        vertices_new_np[new_ids], vertices_igl[perm_np[new_ids]], rtol=1e-5, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("mesh_name", _LOOP_FIXTURES)
+@pytest.mark.parity("subdivide_loop", "open3d")
+def test_subdivide_loop_matches_open3d(mesh_name: str, request: pytest.FixtureRequest) -> None:
+    """
+    Class B: Open3D's ``subdivide_loop`` is the same variant, under its own new-vertex order.
+
+    A second oracle beside igl, worth having because it is independent: Open3D agrees with igl to
+    **2e-16** on the relocated originals, so the two references corroborate each other on the one
+    choice that is genuinely ambiguous here -- Warren's ``beta`` against Loop's original. trimesh
+    picks the other one and is exempted in the benchmark for it.
+
+    Open3D also returns the originals first, so that prefix compares directly; the new vertices and
+    faces follow its own edge enumeration and go through the bijective centroid match the
+    ``subdivide`` / Open3D test uses, for the same reason (a coordinate ``lexsort`` is decided by
+    rounding noise where centroids tie).
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_original = int(mesh_tm.vertices.shape[0])
+
+    vertices_wp, faces_wp = tw.remesh.subdivide_loop(mesh_wp.points, mesh_wp.indices)
+
+    mesh_o3d = trimesh_to_open3d(mesh_tm).subdivide_loop(number_of_iterations=1)
+    vertices_o3d = np.asarray(mesh_o3d.vertices)
+    assert vertices_o3d.shape[0] == int(vertices_wp.shape[0])
+    assert np.allclose(
+        vertices_wp.numpy()[:n_original], vertices_o3d[:n_original], rtol=1e-5, atol=1e-5
+    )
+
+    centroids_wp = (
+        vertices_wp.numpy().astype(np.float64)[faces_wp.numpy().reshape(-1, 3)].mean(axis=1)
+    )
+    centroids_o3d = vertices_o3d[np.asarray(mesh_o3d.triangles)].mean(axis=1)
+    distance_np, match_np = KDTree(centroids_o3d).query(centroids_wp)
+    assert distance_np.max() < 1e-5, f"face centroids differ by up to {distance_np.max():.3e}"
+    assert len(set(match_np.tolist())) == match_np.shape[0], "the centroid match is not a bijection"
+
+
+@pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
+def test_subdivide_loop_keeps_the_boundary_in_the_boundary(
+    mesh_name: str, request: pytest.FixtureRequest
+) -> None:
+    """
+    The boundary stencils close on the boundary: a rim vertex is a combination of rim vertices only.
+
+    That is the property that lets two patches sharing a seam subdivide independently and still
+    meet, and it is exactly what a stencil that let interior neighbours leak in would break -- while
+    still passing every smoothness or shape check. Asserted geometrically, by checking a rim vertex
+    lands in the affine hull of the *old* rim, which the interior rule's ``beta`` term would leave.
+    """
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    boundary_wp = tw.boundary.boundary_vertex_indices(mesh_wp.points, mesh_wp.indices)
+    assert int(boundary_wp.shape[0]) > 0, "the fixture has a boundary to preserve"
+
+    vertices_wp, faces_wp = tw.remesh.subdivide_loop(mesh_wp.points, mesh_wp.indices)
+
+    rim_before_np = mesh_wp.points.numpy()[boundary_wp.numpy()]
+    rim_after_np = vertices_wp.numpy()[
+        tw.boundary.boundary_vertex_indices(vertices_wp, faces_wp).numpy()
+    ]
+    # Every new rim vertex is a convex combination of old rim vertices, so it cannot leave their
+    # bounding box; an interior stencil leaking in would pull it inward, off the rim.
+    assert np.all(rim_after_np >= rim_before_np.min(axis=0) - 1e-5)
+    assert np.all(rim_after_np <= rim_before_np.max(axis=0) + 1e-5)
+
+
+def test_subdivide_loop_shrinks_a_convex_solid_towards_its_limit(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Loop approximates where ``subdivide`` interpolates, so it must move the surface and shrink it.
+
+    The pair of assertions is what distinguishes the two functions on a convex solid: the midpoint
+    split leaves every original vertex on the surface and the volume grows, while Loop pulls the
+    vertices in and the volume falls. Iterating three times also checks the passes compose --
+    each one is a fresh call, which is how ``igl.loop``'s ``number_of_subdivs`` is meant to be
+    reproduced.
+    """
+    _, mesh_wp = icosahedron
+    volume_before = tw.triangles.volume(mesh_wp.points, mesh_wp.indices)
+
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    volumes = []
+    for _ in range(3):
+        vertices_wp, faces_wp = tw.remesh.subdivide_loop(vertices_wp, faces_wp)
+        volumes.append(tw.triangles.volume(vertices_wp, faces_wp))
+
+    assert volumes[0] < volume_before, "Loop pulls a convex surface inward"
+    # Converging, not collapsing: successive passes change the volume by less and less, and the
+    # limit surface stays a sizeable fraction of the original solid.
+    steps = [abs(volumes[i + 1] - volumes[i]) for i in range(len(volumes) - 1)]
+    assert steps[1] < steps[0]
+    assert volumes[-1] > 0.5 * volume_before
+
+    # The midpoint split on the same input goes the other way, which is the contrast being drawn.
+    vertices_mid_wp, faces_mid_wp = tw.remesh.subdivide(mesh_wp.points, mesh_wp.indices)
+    assert tw.triangles.volume(vertices_mid_wp, faces_mid_wp) > volume_before
+
+
+def test_subdivide_loop_leaves_a_nonmanifold_edge_at_its_midpoint(device: str) -> None:
+    """
+    Three faces on one edge: the interior stencil is undefined there, so the midpoint rule applies.
+
+    The documented fallback, asserted rather than assumed because the alternative -- summing three
+    opposite vertices into a stencil scaled for two -- fails silently, moving that vertex off the
+    edge entirely instead of raising.
+    """
+    vertices_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    # Edge (0, 1) is shared by all three faces.
+    faces_np = np.array([[0, 1, 2], [0, 1, 3], [0, 1, 4]], dtype=np.int32).ravel()
+    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+
+    vertices_new_wp, faces_new_wp = tw.remesh.subdivide_loop(vertices_wp, faces_wp)
+
+    positions_np = vertices_new_wp.numpy()
+    midpoint_np = 0.5 * (vertices_np[0] + vertices_np[1])
+    distances_np = np.linalg.norm(positions_np - midpoint_np, axis=1)
+    assert distances_np.min() < 1e-6, "the vertex on the non-manifold edge is at its midpoint"
+    assert int(faces_new_wp.shape[0]) // 3 == 12
+
+
+def test_subdivide_loop_empty(device: str) -> None:
+    """An empty mesh passes through, matching ``subdivide``."""
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    vertices_new_wp, faces_new_wp = tw.remesh.subdivide_loop(vertices_wp, faces_wp)
+    assert int(vertices_new_wp.shape[0]) == 0
+    assert int(faces_new_wp.shape[0]) == 0
+
+
+# --------------------------------------------------------------------------------------
 # subdivide_to_size
 # --------------------------------------------------------------------------------------
 

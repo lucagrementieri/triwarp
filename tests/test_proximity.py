@@ -14,6 +14,7 @@ import pytest
 import trimesh as tm
 import trimesh.proximity as tm_proximity
 import warp as wp
+from scipy.spatial import Delaunay
 
 import triwarp as tw
 from tests.conversions import trimesh_to_pymeshlab, trimesh_to_warp
@@ -859,3 +860,159 @@ def test_shape_diameter_empty(device: str) -> None:
     _sphere_tm, mesh_wp, _normals_wp = _sphere_wp(device, 1.0, subdivisions=1)
     points_wp = wp.zeros(0, dtype=wp.vec3, device=device)
     assert tw.proximity.shape_diameter(mesh_wp, points_wp).shape == (0,)
+
+
+# --------------------------------------------------------------------------------------
+# containing_faces_2d
+# --------------------------------------------------------------------------------------
+
+
+def _triangular_lattice_np(rows: int = 26, cols: int = 30) -> np.ndarray:
+    """
+    Points of a triangular lattice, whose Delaunay triangulation is equilateral throughout.
+
+    The fixture choice is the whole reason the comparison below can be exact. Any Delaunay
+    triangulation of a *bounded* point set has needle triangles along its convex hull, and this
+    function's single-candidate query cannot resolve a query lying within ``float32`` noise of the
+    shared edge of two needles -- measured at 3 in 20 000 on random points, aspect ratios 2 000 to
+    12 000. A triangular lattice has no needles anywhere (aspect ratio 6.93 at worst, 2.31 median),
+    including along its hull, so it isolates the algorithm from that resolution limit.
+    """
+    height = np.sqrt(3.0) / 2.0
+    return np.array(
+        [(col + 0.5 * (row % 2), row * height) for row in range(rows) for col in range(cols)],
+        dtype=np.float64,
+    )
+
+
+@pytest.mark.parity("containing_faces_2d", "scipy")
+def test_containing_faces_2d_matches_scipy(device: str) -> None:
+    """
+    Class A: the same triangle index as ``scipy.spatial.Delaunay.find_simplex``, exactly.
+
+    Both sides are given the *same* triangulation -- scipy's own ``simplices`` are what triwarp
+    locates against -- so the face numbering is shared and the comparison is an integer array
+    equality, ``-1`` for outside included, with no transform at all. Measured agreement is
+    ``1.0000000`` over 40 000 queries.
+
+    Non-vacuous in both directions by construction: the query box overhangs the lattice, so roughly
+    72% of queries land inside and 28% outside, and both counts are asserted before comparing. An
+    implementation returning ``-1`` everywhere, or a face for everything, fails one of them.
+    """
+    points_np = _triangular_lattice_np()
+    triangulation_sp = Delaunay(points_np)
+    faces_np = np.ascontiguousarray(triangulation_sp.simplices, dtype=np.int32)
+    rng = np.random.default_rng(11)
+    queries_np = rng.random((40_000, 2)) * np.array([34.0, 26.0]) - 2.0
+
+    vertices_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec2, device=device
+    )
+    faces_wp = wp.array(faces_np.ravel(), dtype=wp.int32, device=device)
+    queries_wp = wp.array(
+        np.ascontiguousarray(queries_np, dtype=np.float32), dtype=wp.vec2, device=device
+    )
+
+    faces_wp_np = tw.proximity.containing_faces_2d(vertices_wp, faces_wp, queries_wp).numpy()
+
+    faces_sp = triangulation_sp.find_simplex(queries_np)
+    assert (faces_sp >= 0).sum() > 20_000, "the reference places most queries inside"
+    assert (faces_sp < 0).sum() > 5_000, "and a substantial minority outside"
+    assert np.array_equal(faces_wp_np, faces_sp)
+
+
+def test_containing_faces_2d_locates_every_triangle_from_its_centroid(device: str) -> None:
+    """
+    Every triangle contains its own centroid, so locating the centroids must be the identity.
+
+    A different failure mode from the random-query test: it visits *all* faces exactly once, so a
+    face never reachable by the query -- one dropped from the BVH, or one whose barycentric test is
+    mis-signed -- shows up here even if random queries happen to miss it.
+    """
+    points_np = _triangular_lattice_np(rows=12, cols=14)
+    faces_np = np.ascontiguousarray(Delaunay(points_np).simplices, dtype=np.int32)
+    centroids_np = points_np[faces_np].mean(axis=1)
+
+    vertices_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec2, device=device
+    )
+    faces_wp = wp.array(faces_np.ravel(), dtype=wp.int32, device=device)
+    centroids_wp = wp.array(
+        np.ascontiguousarray(centroids_np, dtype=np.float32), dtype=wp.vec2, device=device
+    )
+
+    located_np = tw.proximity.containing_faces_2d(vertices_wp, faces_wp, centroids_wp).numpy()
+
+    assert np.array_equal(located_np, np.arange(faces_np.shape[0], dtype=np.int32))
+
+
+def test_containing_faces_2d_degrades_only_on_needle_triangles(device: str) -> None:
+    """
+    The documented resolution limit, pinned: on extreme slivers a query can come back ``-1``.
+
+    A Delaunay triangulation of random points always has needles along its convex hull, and a query
+    within ``float32`` noise of the shared edge of two of them may be attributed to neither: the
+    nearest triangle by distance is the neighbour, and the barycentric test then rejects it.
+
+    Asserted as a *bounded* failure of a *specific* shape, not as a tolerance: at least 99.9% of
+    queries agree with scipy, and every disagreement is triwarp reporting ``-1`` -- never a
+    different face, which would be a wrong answer rather than a declined one. Measured: 3 in
+    20 000, on triangles of aspect ratio 1 900 to 12 400.
+    """
+    rng = np.random.default_rng(0)
+    points_np = rng.random((2_000, 2)) * 4.0 - 2.0
+    triangulation_sp = Delaunay(points_np)
+    faces_np = np.ascontiguousarray(triangulation_sp.simplices, dtype=np.int32)
+    queries_np = rng.random((20_000, 2)) * 5.0 - 2.5
+
+    vertices_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec2, device=device
+    )
+    faces_wp = wp.array(faces_np.ravel(), dtype=wp.int32, device=device)
+    queries_wp = wp.array(
+        np.ascontiguousarray(queries_np, dtype=np.float32), dtype=wp.vec2, device=device
+    )
+
+    faces_wp_np = tw.proximity.containing_faces_2d(vertices_wp, faces_wp, queries_wp).numpy()
+
+    faces_sp = triangulation_sp.find_simplex(queries_np)
+    assert (faces_wp_np == faces_sp).mean() >= 0.999
+    disagreement = faces_wp_np != faces_sp
+    assert np.all(faces_wp_np[disagreement] == -1), "declines, never a different face"
+
+
+def test_containing_faces_2d_single_triangle(device: str) -> None:
+    """One triangle: inside, outside, and a vertex, with the tolerance carrying no weight."""
+    vertices_wp = wp.array(
+        np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+        dtype=wp.vec2,
+        device=device,
+    )
+    faces_wp = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=wp.int32, device=device)
+    queries_wp = wp.array(
+        np.array([[0.25, 0.25], [0.9, 0.9], [0.0, 0.0], [-5.0, 3.0]], dtype=np.float32),
+        dtype=wp.vec2,
+        device=device,
+    )
+
+    located_np = tw.proximity.containing_faces_2d(vertices_wp, faces_wp, queries_wp).numpy()
+
+    assert np.array_equal(located_np, [0, -1, 0, -1])
+
+
+def test_containing_faces_2d_empty(device: str) -> None:
+    """No queries gives no answers; no faces gives ``-1`` for every query."""
+    vertices_wp = wp.array(
+        np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+        dtype=wp.vec2,
+        device=device,
+    )
+    faces_wp = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=wp.int32, device=device)
+    no_queries_wp = wp.zeros(0, dtype=wp.vec2, device=device)
+    assert int(tw.proximity.containing_faces_2d(vertices_wp, faces_wp, no_queries_wp).shape[0]) == 0
+
+    queries_wp = wp.array(np.array([[0.25, 0.25]], dtype=np.float32), dtype=wp.vec2, device=device)
+    no_faces_wp = wp.zeros(0, dtype=wp.int32, device=device)
+    assert np.array_equal(
+        tw.proximity.containing_faces_2d(vertices_wp, no_faces_wp, queries_wp).numpy(), [-1]
+    )

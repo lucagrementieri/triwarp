@@ -23,6 +23,15 @@ DELONE_EPS = wp.constant(wp.float64(1e-7))
 NO_ANGLE_CHANGE_LIMIT = wp.constant(wp.float64(6.283185307179586))  # 2*pi (NoAngleChangeLimit)
 F32_LARGE = wp.constant(wp.float32(3.0e38))  # "disabled gate" sentinel (~FLT_MAX)
 
+# Loop subdivision stencil weights. The even-vertex relaxation uses Warren's beta rather than Loop's
+# original trigonometric weight, which is the choice ``igl::loop`` makes; see `loop_even_positions`.
+LOOP_ODD_ENDPOINT = wp.constant(wp.float32(3.0 / 8.0))
+LOOP_ODD_OPPOSITE = wp.constant(wp.float32(1.0 / 8.0))
+LOOP_BOUNDARY_SELF = wp.constant(wp.float32(3.0 / 4.0))
+LOOP_BOUNDARY_NEIGHBOR = wp.constant(wp.float32(1.0 / 8.0))
+LOOP_BETA_VALENCE_3 = wp.constant(wp.float32(3.0 / 16.0))
+LOOP_BETA_NUMERATOR = wp.constant(wp.float32(3.0 / 8.0))
+
 
 @wp.func
 def edge_midpoint(
@@ -74,6 +83,104 @@ def subdivide_faces(
     out_faces[base + 9] = t3[0]
     out_faces[base + 10] = t3[1]
     out_faces[base + 11] = t3[2]
+
+
+@wp.kernel
+def loop_edge_opposites(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    edge_of_corner: wp.array[wp.int32],
+    out_opposite_sum: wp.array[wp.vec3],
+    out_face_count: wp.array[wp.int32],
+) -> None:
+    # Per unique edge: how many faces use it, and the sum of the vertices opposite it in each.
+    # Corner ``j`` of face ``f`` spans ``(fv[j], fv[j + 1])`` and its opposite vertex is
+    # ``fv[j + 2]``, so one pass over the faces gathers both halves of the Loop odd-vertex stencil.
+    f = int(wp.tid())
+    for j in range(3):
+        e = edge_of_corner[f * 3 + j]
+        wp.atomic_add(out_opposite_sum, e, vertices[faces[f * 3 + (j + 2) % 3]])
+        wp.atomic_add(out_face_count, e, 1)
+
+
+@wp.kernel
+def loop_vertex_rings(
+    vertices: wp.array[wp.vec3],
+    unique_edges: wp.array2d[wp.int32],
+    edge_face_count: wp.array[wp.int32],
+    out_valence: wp.array[wp.int32],
+    out_ring_sum: wp.array[wp.vec3],
+    out_boundary_count: wp.array[wp.int32],
+    out_boundary_sum: wp.array[wp.vec3],
+) -> None:
+    # Per vertex: its valence and 1-ring position sum, plus the same two restricted to boundary
+    # edges. Driven by the *unique* edge list rather than by the faces, so the valence is the number
+    # of distinct neighbours on any input -- the count a per-face pass would have to deduplicate
+    # (each neighbour appears twice around an interior vertex but once at a boundary).
+    e = int(wp.tid())
+    v0 = unique_edges[e, 0]
+    v1 = unique_edges[e, 1]
+    p0 = vertices[v0]
+    p1 = vertices[v1]
+    wp.atomic_add(out_valence, v0, 1)
+    wp.atomic_add(out_valence, v1, 1)
+    wp.atomic_add(out_ring_sum, v0, p1)
+    wp.atomic_add(out_ring_sum, v1, p0)
+    if edge_face_count[e] == 1:
+        wp.atomic_add(out_boundary_count, v0, 1)
+        wp.atomic_add(out_boundary_count, v1, 1)
+        wp.atomic_add(out_boundary_sum, v0, p1)
+        wp.atomic_add(out_boundary_sum, v1, p0)
+
+
+@wp.kernel
+def loop_odd_positions(
+    vertices: wp.array[wp.vec3],
+    unique_edges: wp.array2d[wp.int32],
+    edge_opposite_sum: wp.array[wp.vec3],
+    edge_face_count: wp.array[wp.int32],
+    out_positions: wp.array[wp.vec3],
+) -> None:
+    # Loop's odd (edge) vertices: 3/8 on each endpoint and 1/8 on each of the two opposite vertices.
+    e = int(wp.tid())
+    endpoints = vertices[unique_edges[e, 0]] + vertices[unique_edges[e, 1]]
+    if edge_face_count[e] == 2:
+        out_positions[e] = LOOP_ODD_ENDPOINT * endpoints + LOOP_ODD_OPPOSITE * edge_opposite_sum[e]
+    else:
+        # A boundary edge (one face) or a non-manifold one (three or more): the interior stencil
+        # needs exactly two opposite vertices, so both take the midpoint rule instead.
+        out_positions[e] = wp.float32(0.5) * endpoints
+
+
+@wp.kernel
+def loop_even_positions(
+    vertices: wp.array[wp.vec3],
+    valence: wp.array[wp.int32],
+    ring_sum: wp.array[wp.vec3],
+    boundary_count: wp.array[wp.int32],
+    boundary_sum: wp.array[wp.vec3],
+    out_positions: wp.array[wp.vec3],
+) -> None:
+    # Loop's even (original) vertices, relaxed towards their 1-ring. Warren's beta -- 3/16 at
+    # valence 3 and 3/(8n) above it -- which is the variant ``igl::loop`` uses, not Loop's original
+    # trigonometric weight.
+    v = int(wp.tid())
+    position = vertices[v]
+    n = valence[v]
+    out_positions[v] = position  # the fallbacks below leave the vertex where it is
+    if boundary_count[v] == 2:
+        # Boundary vertex: 3/4 of itself, 1/8 of each neighbour along the boundary. Its interior
+        # neighbours do not enter, which is what keeps a shared boundary curve identical on both
+        # sides of a seam.
+        out_positions[v] = LOOP_BOUNDARY_SELF * position + LOOP_BOUNDARY_NEIGHBOR * boundary_sum[v]
+    elif boundary_count[v] == 0 and n > 0:
+        beta = LOOP_BETA_VALENCE_3
+        if n != 3:
+            beta = LOOP_BETA_NUMERATOR / wp.float32(n)
+        out_positions[v] = (wp.float32(1.0) - wp.float32(n) * beta) * position + beta * ring_sum[v]
+    # Anything else keeps the position written above: an isolated vertex with no edges, or a
+    # non-manifold boundary vertex where one or three-plus boundary edges meet and neither stencil
+    # is defined.
 
 
 @wp.kernel

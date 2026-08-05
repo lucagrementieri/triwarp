@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.kernels.array import update_argmax_lowest_index
+from triwarp.kernels.predicates import barycentric_2d
 from triwarp.kernels.triangles import face_vertices
 
 # NaN payload for vertices whose UV is non-finite (never sampled) and out-of-bounds reads.
@@ -27,32 +28,6 @@ def _uv_to_pixel(uv: wp.vec2, resolution: wp.int32) -> wp.vec2:
     """
     size = wp.float32(resolution)
     return wp.vec2(uv[0] * size - 0.5, (1.0 - uv[1]) * size - 0.5)
-
-
-@wp.func
-def _barycentric(q0: wp.vec2, q1: wp.vec2, q2: wp.vec2, p: wp.vec2) -> wp.vec3:
-    """
-    Barycentric coordinates ``(b0, b1, b2)`` of ``p`` in triangle ``(q0, q1, q2)``.
-
-    Returns a vector with a negative component for degenerate triangles so the coverage
-    test rejects them.
-    """
-    v0 = q1 - q0
-    v1 = q2 - q0
-    v2 = p - q0
-    d00 = wp.length_sq(v0)
-    d01 = wp.dot(v0, v1)
-    d11 = wp.length_sq(v1)
-    d20 = wp.dot(v2, v0)
-    d21 = wp.dot(v2, v1)
-    denom = d00 * d11 - d01 * d01
-    if wp.abs(denom) < wp.float32(1e-20):
-        return wp.vec3(-1.0, -1.0, -1.0)
-    inverse_denominator = 1.0 / denom
-    b1 = (d11 * d20 - d01 * d21) * inverse_denominator
-    b2 = (d00 * d21 - d01 * d20) * inverse_denominator
-    b0 = 1.0 - b1 - b2
-    return wp.vec3(b0, b1, b2)
 
 
 @wp.func
@@ -103,7 +78,7 @@ def rasterize_owner(
 
     for row in range(row_lo, row_hi + 1):
         for col in range(col_lo, col_hi + 1):
-            bary = _barycentric(q0, q1, q2, wp.vec2(wp.float32(col), wp.float32(row)))
+            bary = barycentric_2d(q0, q1, q2, wp.vec2(wp.float32(col), wp.float32(row)))
             if _covered(bary):
                 wp.atomic_min(out_owner, row, col, f)
 
@@ -130,7 +105,7 @@ def rasterize_scatter(
         for col in range(col_lo, col_hi + 1):
             if owner[row, col] != f:
                 continue
-            bary = _barycentric(q0, q1, q2, wp.vec2(wp.float32(col), wp.float32(row)))
+            bary = barycentric_2d(q0, q1, q2, wp.vec2(wp.float32(col), wp.float32(row)))
             for k in range(n_channels):
                 out_image[row, col, k] = (
                     bary[0] * attribute[i0, k]
@@ -170,7 +145,7 @@ def rasterize_labels(
         for col in range(col_lo, col_hi + 1):
             if owner[row, col] != f:
                 continue
-            bary = _barycentric(q0, q1, q2, wp.vec2(wp.float32(col), wp.float32(row)))
+            bary = barycentric_2d(q0, q1, q2, wp.vec2(wp.float32(col), wp.float32(row)))
             # Per-class weight = sum of barycentric weights of vertices sharing that class.
             s0 = bary[0] + wp.where(l1 == l0, bary[1], 0.0) + wp.where(l2 == l0, bary[2], 0.0)
             s1 = bary[1] + wp.where(l0 == l1, bary[0], 0.0) + wp.where(l2 == l1, bary[2], 0.0)

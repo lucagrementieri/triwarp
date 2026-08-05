@@ -44,6 +44,14 @@ ITEMS_PER_QUERY_SLICE = 128
 # diagonal: without it the cone's own starting triangle is the nearest hit for every ray.
 _SDF_SURFACE_OFFSET = 1e-4
 
+# [`containing_faces_2d`][triwarp.proximity.containing_faces_2d]'s candidate search radius, as a
+# fraction of the triangulation's bounding-box diagonal, and the barycentric slack that then decides
+# containment. The radius only has to exceed the float32 rounding of a closest-point query on a flat
+# mesh (measured at ~1e-5 of the diagonal), and being generous costs only BVH descent on queries
+# that land outside; the sign test classifies, so the two are not a precision trade-off.
+_CONTAINMENT_SEARCH_SCALE = 1e-3
+_CONTAINMENT_BARYCENTRIC_EPS = wp.float32(1e-6)
+
 
 def closest_point_on_mesh(
     vertices: wp.array[wp.vec3],
@@ -802,6 +810,100 @@ def shape_diameter(
         device=device,
     )
     return out_diameter
+
+
+def containing_faces_2d(
+    vertices: wp.array[wp.vec2], faces: wp.array[wp.int32], points: wp.array[wp.vec2]
+) -> wp.array[wp.int32]:
+    """
+    For each 2D query point, the triangle of a planar triangulation that contains it.
+
+    Point location in the plane -- the primitive an inverse UV lookup needs, and the counterpart of
+    [`triwarp.texture`][]'s forward direction: ``remap_attribute_from_uv`` *samples an image* at a
+    UV coordinate, where this answers which triangle of a UV atlas a coordinate falls in, and so
+    which surface point it corresponds to. Pair it with
+    [`points_to_barycentric`][triwarp.triangles.points_to_barycentric] on the returned face to
+    finish the inverse map.
+
+    The triangulation must not overlap itself -- a UV atlas, a Delaunay triangulation, or the
+    ``xy`` projection of a height field. Where triangles do overlap, each query gets one of the
+    containing faces and which one is unspecified.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` planar vertex positions as ``wp.vec2``.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    points
+        ``(m,)`` planar query positions as ``wp.vec2``.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        Length ``m`` on ``vertices.device``: the containing triangle's index, or ``-1`` where the
+        query lies outside the triangulation. A query exactly on a shared edge is inside *both* its
+        triangles and which one is returned is not specified.
+
+    Notes
+    -----
+    Two stages: a closest-point query against the triangulation lifted to the ``z = 0`` plane picks
+    a candidate face -- sufficient because a point inside any triangle is at distance zero from it,
+    so the *closest* triangle contains it whenever one does -- and a barycentric sign test on the
+    query's own coordinates decides. That reuses the BVH ``wp.Mesh`` already builds, at the cost of
+    one lifted ``wp.vec3`` copy of ``vertices``.
+
+    The second stage is not redundant. Deciding on the query radius alone misclassifies ~0.2% of
+    random queries on a 3 979-triangle Delaunay mesh, because an in-plane point's closest-point
+    distance is not exactly zero in ``float32``: measured against
+    ``scipy.spatial.Delaunay.find_simplex``, a radius of 1e-7 / 1e-6 / 1e-5 of the bounding diagonal
+    misses 73 / 28 / 6 interior points, while 1e-5 / 1e-4 / 1e-3 falsely accepts 0 / 14 / 59
+    exterior ones -- no radius separates them. The barycentric test is ~1000x sharper, so the radius
+    is only a search bound and there is no tolerance to tune.
+
+    Building that BVH is per call, so a caller locating several point sets in one triangulation pays
+    for it each time -- there is no prebuilt-index entry point, which is also why the benchmark's
+    scipy row (``scipy.spatial.Delaunay.find_simplex`` on a triangulation built outside the timed
+    region) is the *unfavourable* comparison for triwarp rather than the flattering one.
+
+    See Also
+    --------
+    [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]
+    [`points_to_barycentric`][triwarp.triangles.points_to_barycentric]
+    [`remap_attribute_from_uv`][triwarp.texture.remap_attribute_from_uv]
+    """
+    device = vertices.device
+    m = int(points.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    if m == 0:
+        return wp.empty(0, dtype=wp.int32, device=device)
+    if n_faces == 0:
+        return wp.full(m, -1, dtype=wp.int32, device=device)
+
+    lifted = wp.empty(int(vertices.shape[0]), dtype=wp.vec3, device=device)
+    wp.map(kernel_proximity.lift_vec2, vertices, out=lifted)
+    # One readback, the same one `closest_point_on_mesh` pays and for the same reason: the search
+    # radius has to be in the triangulation's own units and nothing else knows its scale.
+    search_radius = _CONTAINMENT_SEARCH_SCALE * _default_mesh_query_max_dist(lifted)
+
+    require_nonempty_mesh(faces, "containing_faces_2d")
+    mesh = wp.Mesh(points=lifted, indices=wp.clone(faces))
+    out_face = wp.empty(m, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_proximity.face_containing_point_2d,
+        dim=m,
+        inputs=[
+            mesh.id,
+            vertices,
+            faces,
+            points,
+            wp.float32(search_radius),
+            _CONTAINMENT_BARYCENTRIC_EPS,
+            out_face,
+        ],
+        device=device,
+    )
+    return out_face
 
 
 def _default_mesh_query_max_dist(
