@@ -546,13 +546,17 @@ wheel before planning a row around it. Two that do not, and will be looked for b
 `triwarp.repair` carries functions named after them: **`collapse_small_triangles` and
 `resolve_duplicated_faces` are not bound** (`AttributeError`), so neither group can have an igl row.
 
-#### Coverage: 53 pairs over 24 modules
+#### Coverage: 74 pairs over 25 modules
 
-igl reaches **53** of the matrix's 247 `(group, library)` pairs — third after pymeshlab's 71 and
-trimesh's 68, and up from 27 before the coverage pass. Nine of its groups did not exist before it:
-`sample_surface`, `face_angles`, `vertex_defects`, `face_connected_component_labels`, `ears`,
-`is_edge_manifold`, `remove_unreferenced_vertices`, `unique_faces`, plus the `icosahedron` case of
-`platonic_solids`.
+igl reaches **74** of the matrix's 273 `(group, library)` pairs — **the most-covered reference in
+the suite** (trimesh and pymeshlab are next at 71 each), up from 27 before the coverage pass and 53
+before the twelve `plans/igl-first-class.md` ports landed. Nine of its groups did not exist before
+the coverage pass: `sample_surface`, `face_angles`, `vertex_defects`,
+`face_connected_component_labels`, `ears`, `is_edge_manifold`, `remove_unreferenced_vertices`,
+`unique_faces`, plus the `icosahedron` case of `platonic_solids` — and the port pass added the
+operator family (`harmonic_integrated`, `hessian_energy`, `curved_hessian_energy`,
+`crouzeix_raviart_cotmatrix` / `_massmatrix`), all five on the `scale` axis because igl's
+Crouzeix-Raviart entry points assume edge-manifold input.
 
 Where the margins sit, on medians:
 
@@ -572,8 +576,21 @@ Where the margins sit, on medians:
 | `face_connected_component_labels` | 15.2 ms | 1.27 ms | 12x |
 | `make_winding_consistent` | 22.8 ms | 1.02 ms | 22x |
 | `remove_unreferenced_vertices` | 0.73 ms | 0.30 ms | 2.5x |
+| `crouzeix_raviart_cotmatrix` † | 3.6–84.8 ms | 0.37–0.99 ms | 9.6–86x |
+| `curved_hessian_energy` † | 24.8–1 578 ms | 2.3–20.3 ms | 11–78x |
+| `crouzeix_raviart_massmatrix` † | 0.15–13.0 ms | 0.18–0.21 ms | **0.73x**–72x |
+| `hessian_energy` † | 17.2–1 137 ms | 1.3–22.3 ms | 13–51x |
+| `harmonic_integrated` (k=2) † | 1.7–162.6 ms | 0.96–4.6 ms | 1.7–35x |
 
-**There is no igl row that triwarp loses**, and one of them used to be the exception: `blue_noise`
+† Operator-family rows are the `scale` axis (`sphere_small` → `sphere_med` → `sphere_large`); the
+ranges span it, and the ratio grows with size on every one of them because igl's side is Eigen
+sparse products where triwarp's is a fixed number of launches.
+
+**One igl row now loses one axis point**: `crouzeix_raviart_massmatrix` at `sphere_small` reads igl
+0.150 ms against triwarp 0.206 ms (1.37x). triwarp's side is flat at 0.18–0.21 ms across the axis's
+16x size range — a pure host launch/alloc floor (one scatter kernel plus `bsr_diag`), not kernel
+time — and the same row is a 72x win at `sphere_large`. Every other igl row triwarp wins, and one of
+them used to be the exception: `blue_noise`
 was a **0.80x loss** (igl 78.4 ms against 98.5) while `sample_surface_blue_noise` ran Bridson
 active-list dart throwing, the algorithm `igl.blue_noise` implements. After the rewrite to
 randomized-priority selection the same pair reads 4.1x at that radius, and the margin *grows as the

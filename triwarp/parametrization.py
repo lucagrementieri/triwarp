@@ -27,7 +27,13 @@ import triwarp.linalg as twl
 import triwarp.typing as twt
 from triwarp._device import require_cuda
 from triwarp.kernels import parametrization as kernel_parametrization
-from triwarp.laplacian import cotmatrix, cotmatrix_entries, mass_matrix_entries, uniform_laplacian
+from triwarp.laplacian import (
+    cotmatrix,
+    cotmatrix_entries,
+    harmonic_integrated,
+    mass_matrix_entries,
+    uniform_laplacian,
+)
 
 _CG_TOLERANCE = 1e-8
 
@@ -180,26 +186,12 @@ def _solve_fixed_boundary(
 
     Forms the positive-semi-definite operator ``Q = -L`` for ``k == 1`` and
     ``Q = (-L) (M^-1 (-L))^(k-1)`` for ``k > 1`` (``M`` the diagonal mass, identity when
-    ``mass_diag is None``), then solves the interior Dirichlet system ``Q_uu x_u = -Q_ub bc`` per
-    UV column with conjugate gradient, keeping the fixed vertices at ``boundary_uv``. ``laplacian``
-    must be float64: ``k > 1`` squares its condition number, and building the operator natively in a
-    single ``bsr_from_triplets`` (never recast/rebuilt) is what keeps ``bsr_mm`` deterministic — see
-    issue_report.md.
+    ``mass_diag is None``) via [`harmonic_integrated`][triwarp.laplacian.harmonic_integrated],
+    then solves the interior Dirichlet system ``Q_uu x_u = -Q_ub bc`` per UV column with conjugate
+    gradient, keeping the fixed vertices at ``boundary_uv``. ``laplacian`` must be float64:
+    ``k > 1`` squares its condition number.
     """
-    # Operator Q. neg_l aliases -L; bsr_mm returns fresh matrices so neg_l stays valid across the
-    # accumulation. Chained products stay deterministic because neg_l is a single-build operator.
-    neg_l = wps.bsr_axpy(x=laplacian, alpha=-1.0)
-    q = neg_l
-    if k > 1:
-        if mass_diag is None:
-            for _ in range(k - 1):
-                q = wps.bsr_mm(q, neg_l)
-        else:
-            inv_mass = wp.empty(n_vertices, dtype=wp.float64, device=device)
-            wp.map(kernel_parametrization.reciprocal64, mass_diag, out=inv_mass)
-            mass_inv = wps.bsr_diag(diag=inv_mass)
-            for _ in range(k - 1):
-                q = wps.bsr_mm(wps.bsr_mm(q, mass_inv), neg_l)
+    q = harmonic_integrated(laplacian, mass_diag, k=k)
 
     # A mesh with interior vertices and no fixed boundary is a singular Dirichlet system. Raised up
     # front (CPU-safe): once every vertex is fixed (n_vertices > 0, n_boundary == 0 is impossible

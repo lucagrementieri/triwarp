@@ -47,17 +47,6 @@ def scatter_fixed_uv(
     out_fixed_values[1, i] = wp.float64(uv[1])
 
 
-@wp.func
-def reciprocal64(value: wp.Float) -> wp.float64:
-    # Diagonal inverse (``igl::invert_diag``) of the lumped mass into float64, for the ``k > 1``
-    # operator ``Q = (-L) (M^-1 (-L))^(k-1)``. ``value`` is generic (float32 or float64). A zero
-    # entry maps to zero, not infinity.
-    v = wp.float64(value)
-    if v != wp.float64(0.0):
-        return wp.float64(1.0) / v
-    return wp.float64(0.0)
-
-
 @wp.kernel
 def scatter_solution(
     fixed_mask: wp.array[wp.bool],
