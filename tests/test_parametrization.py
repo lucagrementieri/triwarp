@@ -284,49 +284,6 @@ def test_lscm_matches_igl(request, device, mesh_name):
     assert np.allclose(uv_wp.numpy(), uv_igl, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
-def test_lscm_hessian_matches_igl(request, device, mesh_name):
-    # No CPU skip: this builds the Hessian only, no conjugate-gradient solve.
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    vertices_np, faces_np = _mesh_numpy(mesh_tm)
-    n_vertices = int(mesh_wp.points.shape[0])
-
-    # igl.lscm returns (V_uv, Q); its Q equals -repdiag(L, 2) - 2A exactly.
-    pins_np = np.array([0, 1], dtype=np.int64)
-    pins_uv_np = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float64)
-    _, hessian_igl = igl.lscm(vertices_np, faces_np, pins_np, pins_uv_np)
-
-    hessian_wp = tw.parametrization.lscm_hessian(mesh_wp.points, mesh_wp.indices)
-    hessian_dense = scipy.sparse.csr_matrix(
-        (hessian_wp.values.numpy(), hessian_wp.columns.numpy(), hessian_wp.offsets.numpy()),
-        shape=(2 * n_vertices, 2 * n_vertices),
-    ).toarray()
-
-    assert np.allclose(hessian_dense, hessian_igl.toarray(), rtol=1e-5, atol=1e-5)
-
-
-@pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
-def test_vector_area_matrix_matches_igl_derived(request, device, mesh_name):
-    # The bindings do not expose vector_area_matrix; derive it from A = (-repdiag(L,2) - Q) / 2.
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    vertices_np, faces_np = _mesh_numpy(mesh_tm)
-    n_vertices = int(mesh_wp.points.shape[0])
-
-    pins_np = np.array([0, 1], dtype=np.int64)
-    pins_uv_np = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float64)
-    _, hessian_igl = igl.lscm(vertices_np, faces_np, pins_np, pins_uv_np)
-    laplacian_igl = igl.cotmatrix(vertices_np, faces_np)
-    area_igl = (-scipy.sparse.block_diag([laplacian_igl, laplacian_igl]) - hessian_igl) / 2.0
-
-    area_wp = tw.parametrization.vector_area_matrix(mesh_wp.points, mesh_wp.indices)
-    area_dense = scipy.sparse.csr_matrix(
-        (area_wp.values.numpy(), area_wp.columns.numpy(), area_wp.offsets.numpy()),
-        shape=(2 * n_vertices, 2 * n_vertices),
-    ).toarray()
-
-    assert np.allclose(area_dense, area_igl.toarray(), rtol=1e-5, atol=1e-5)
-
-
 def test_lscm_closed_mesh_matches_igl(device, icosahedron):
     # Closed mesh: A = 0, Q = -repdiag(L, 2). igl.lscm accepts closed input.
     _skip_on_cpu(device)

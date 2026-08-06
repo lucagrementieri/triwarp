@@ -43,7 +43,11 @@ SECTIONS: dict[str, list[str]] = {
         "convex",
         "visibility",
     ],
-    "Operators & fields": ["laplacian", "linalg", "interpolation", "parametrization"],
+    # ``energies`` immediately after ``laplacian``: the two halves of one subject, split because
+    # 1 346 lines cannot carry both in one source order (which is the docs order). A reader
+    # arriving from libigl looks for ``cotmatrix`` and ``crouzeix_raviart_*`` together, and the
+    # adjacency plus the See Also in both directions is what replaces that.
+    "Operators & fields": ["laplacian", "energies", "linalg", "interpolation", "parametrization"],
     # ``geodesic_walk`` first: a direct combinatorial walk is the simpler thing, and section 11
     # orders a section by expected frequency of use. It is listed here rather than under
     # "Queries & measures" so the package's two geodesic entry points -- the walk and

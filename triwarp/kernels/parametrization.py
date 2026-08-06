@@ -98,65 +98,6 @@ def circle_positions(
 
 
 @wp.kernel
-def neg_repdiag2_triplets(
-    offsets: wp.array[wp.int32],
-    columns: wp.array[wp.int32],
-    values: wp.array[wp.float64],
-    n_vertices: wp.int32,
-    out_rows: wp.array[wp.int32],
-    out_cols: wp.array[wp.int32],
-    out_vals: wp.array[wp.float64],
-) -> None:
-    # ``-repdiag(L, 2)``: the block-diagonal ``[[-L, 0], [0, -L]]`` (2n x 2n) of the LSCM Hessian.
-    # One thread per CSR row ``i`` of ``L``; each entry ``e`` emits both diagonal-block copies into
-    # slots ``2*e`` (upper block) and ``2*e + 1`` (lower block, shifted by ``n_vertices``).
-    i = int(wp.tid())
-    start = offsets[i]
-    end = offsets[i + 1]
-    for e in range(start, end):
-        j = columns[e]
-        v = -values[e]
-        out_rows[2 * e] = i
-        out_cols[2 * e] = j
-        out_vals[2 * e] = v
-        out_rows[2 * e + 1] = i + n_vertices
-        out_cols[2 * e + 1] = j + n_vertices
-        out_vals[2 * e + 1] = v
-
-
-@wp.kernel
-def vector_area_triplets(
-    boundary_edges: wp.array2d[wp.int32],
-    n_vertices: wp.int32,
-    scale: wp.float64,
-    out_rows: wp.array[wp.int32],
-    out_cols: wp.array[wp.int32],
-    out_vals: wp.array[wp.float64],
-) -> None:
-    # ``igl::vector_area_matrix``: per oriented boundary edge ``(i, j)`` emit the four
-    # cross-quadrant triplets ``(i+n, j, -q)``, ``(j, i+n, -q)``, ``(i, j+n, +q)``, ``(j+n, i, +q)``
-    # with ``q = 0.25 * scale``. ``scale = 1`` builds ``A`` itself; ``scale = -2`` builds the
-    # ``-2A`` term of the LSCM Hessian with the same kernel. Slot base ``4 * b``.
-    b = int(wp.tid())
-    i = boundary_edges[b, 0]
-    j = boundary_edges[b, 1]
-    q = wp.float64(0.25) * scale
-    base = 4 * b
-    out_rows[base] = i + n_vertices
-    out_cols[base] = j
-    out_vals[base] = -q
-    out_rows[base + 1] = j
-    out_cols[base + 1] = i + n_vertices
-    out_vals[base + 1] = -q
-    out_rows[base + 2] = i
-    out_cols[base + 2] = j + n_vertices
-    out_vals[base + 2] = q
-    out_rows[base + 3] = j + n_vertices
-    out_cols[base + 3] = i
-    out_vals[base + 3] = q
-
-
-@wp.kernel
 def scatter_pinned_stacked(
     pinned_indices: wp.array[wp.int32],
     pinned_uv: wp.array[wp.vec2],

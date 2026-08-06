@@ -6,6 +6,7 @@ import numpy as np
 import open3d as o3d
 import pymeshlab as ml
 import pyvista as pv
+import scipy.sparse as sp
 import trimesh as tm
 import warp as wp
 
@@ -179,3 +180,25 @@ def bsr_to_dense(matrix: object, n_vertices: int) -> np.ndarray:
         for slot in range(offsets[row], offsets[row + 1]):
             dense[row, columns[slot]] = values[slot]
     return dense
+
+
+def bsr_to_csr(matrix: object) -> sp.csr_matrix:
+    """
+    Convert a ``BsrMatrix`` to a scipy CSR, at its own declared shape.
+
+    The scipy-side counterpart of [`bsr_to_dense`][tests.conversions.bsr_to_dense], for the operator
+    comparisons that want a sparse matrix rather than a dense block -- the Crouzeix-Raviart pair is
+    ``(n_edges, n_edges)`` and the LSCM Hessian ``(2n, 2n)``, both too large to densify comfortably
+    on the larger fixtures. Reads through the row offsets for the same reason ``bsr_to_dense`` does:
+    ``values`` is allocated at the triplet count and its tail is uninitialized scratch.
+    """
+    nrow = int(matrix.nrow)  # type: ignore[attr-defined]
+    ncol = int(matrix.ncol)  # type: ignore[attr-defined]
+    return sp.csr_matrix(
+        (
+            matrix.values.numpy(),  # type: ignore[attr-defined]
+            matrix.columns.numpy(),  # type: ignore[attr-defined]
+            matrix.offsets.numpy(),  # type: ignore[attr-defined]
+        ),
+        shape=(nrow, ncol),
+    )

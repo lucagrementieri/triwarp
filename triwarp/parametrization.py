@@ -27,13 +27,7 @@ import triwarp.linalg as twl
 import triwarp.typing as twt
 from triwarp._device import require_cuda
 from triwarp.kernels import parametrization as kernel_parametrization
-from triwarp.laplacian import (
-    cotmatrix,
-    cotmatrix_entries,
-    harmonic_integrated,
-    mass_matrix_entries,
-    uniform_laplacian,
-)
+from triwarp.laplacian import cotmatrix, cotmatrix_entries, mass_matrix_entries, uniform_laplacian
 
 _CG_TOLERANCE = 1e-8
 
@@ -186,12 +180,12 @@ def _solve_fixed_boundary(
 
     Forms the positive-semi-definite operator ``Q = -L`` for ``k == 1`` and
     ``Q = (-L) (M^-1 (-L))^(k-1)`` for ``k > 1`` (``M`` the diagonal mass, identity when
-    ``mass_diag is None``) via [`harmonic_integrated`][triwarp.laplacian.harmonic_integrated],
+    ``mass_diag is None``) via [`k_harmonic`][triwarp.energies.k_harmonic],
     then solves the interior Dirichlet system ``Q_uu x_u = -Q_ub bc`` per UV column with conjugate
     gradient, keeping the fixed vertices at ``boundary_uv``. ``laplacian`` must be float64:
     ``k > 1`` squares its condition number.
     """
-    q = harmonic_integrated(laplacian, mass_diag, k=k)
+    q = tw.energies.k_harmonic(laplacian, mass_diag, k=k)
 
     # A mesh with interior vertices and no fixed boundary is a singular Dirichlet system. Raised up
     # front (CPU-safe): once every vertex is fixed (n_vertices > 0, n_boundary == 0 is impossible
@@ -283,6 +277,9 @@ def harmonic(
     See Also
     --------
     [`tutte`][triwarp.parametrization.tutte]
+    [`k_harmonic`][triwarp.energies.k_harmonic]
+        The *operator* this minimizes, as opposed to this *map* -- the two are the only two
+        "harmonic" names in the package and they are not interchangeable.
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
     [`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle]
 
@@ -625,7 +622,7 @@ def lscm(
     Computes the conformal (angle-preserving) parametrization that minimizes the LSCM (Levy)
     conformal energy subject to a set of pinned vertices, by solving a single quadratic program
     over the stacked ``[u; v]`` vector of ``2 * n_vertices`` unknowns with the LSCM Hessian
-    [`lscm_hessian`][triwarp.parametrization.lscm_hessian] as the operator. Unlike
+    [`lscm_hessian`][triwarp.energies.lscm_hessian] as the operator. Unlike
     [`harmonic`][triwarp.parametrization.harmonic] / [`tutte`][triwarp.parametrization.tutte] (which
     pin the whole boundary and solve two independent columns), LSCM couples ``u`` and ``v`` through
     the boundary vector-area term, so it needs only a few pins — typically **two** — to fix the
@@ -664,8 +661,8 @@ def lscm(
 
     See Also
     --------
-    [`lscm_hessian`][triwarp.parametrization.lscm_hessian]
-    [`vector_area_matrix`][triwarp.parametrization.vector_area_matrix]
+    [`lscm_hessian`][triwarp.energies.lscm_hessian]
+    [`vector_area_matrix`][triwarp.energies.vector_area_matrix]
     [`harmonic`][triwarp.parametrization.harmonic]
     [`flipped_faces`][triwarp.parametrization.flipped_faces]
 
@@ -674,7 +671,7 @@ def lscm(
     The unknowns are stacked ``[u; v]`` (all ``u`` DOFs then all ``v`` DOFs), matching igl's
     ``lscm``: pin ``i`` fixes DOF ``i`` (``u``) and DOF ``i + n_vertices`` (``v``). The returned
     ``Q`` of ``igl.lscm`` equals ``-repdiag(L, 2) - 2 A`` exactly (see
-    [`lscm_hessian`][triwarp.parametrization.lscm_hessian]).
+    [`lscm_hessian`][triwarp.energies.lscm_hessian]).
     """
     device = vertices.device
     n = int(vertices.shape[0])
@@ -688,7 +685,7 @@ def lscm(
             f"similarity-transform null space; got {n_pinned}."
         )
 
-    q = lscm_hessian(vertices, faces)
+    q = tw.energies.lscm_hessian(vertices, faces)
     fixed_mask = wp.zeros(2 * n, dtype=wp.bool, device=device)
     fixed_values = wp.zeros((1, 2 * n), dtype=wp.float64, device=device)
     if n_pinned > 0:
@@ -711,168 +708,3 @@ def lscm(
         device=device,
     )
     return out_uv
-
-
-def lscm_hessian(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
-) -> wps.BsrMatrix[wp.float64]:
-    """
-    LSCM Hessian ``Q = -repdiag(L, 2) - 2 A``.
-
-    Assembles the ``(2n, 2n)`` symmetric operator behind the least-squares conformal map, where
-    ``L`` is the cotangent Laplacian [`cotmatrix`][triwarp.laplacian.cotmatrix] (negative-diagonal
-    convention), ``repdiag(L, 2)`` is the block-diagonal ``[[L, 0], [0, L]]``, and ``A`` is the
-    boundary [`vector_area_matrix`][triwarp.parametrization.vector_area_matrix]. Built natively in
-    float64 in a single ``bsr_from_triplets`` (the within-quadrant repdiag triplets and the
-    cross-quadrant ``-2 A`` triplets never collide), so it feeds the float64 conjugate-gradient
-    solve directly. Matches the ``Q`` returned by ``igl.lscm`` exactly.
-
-    Parameters
-    ----------
-    vertices
-        ``(n_vertices,)`` mesh vertex positions.
-    faces
-        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
-
-    Returns
-    -------
-    warp.sparse.BsrMatrix
-        Square ``(2n, 2n)`` float64 matrix in 1x1-block BSR form on ``vertices.device``.
-
-    See Also
-    --------
-    [`lscm`][triwarp.parametrization.lscm]
-    [`vector_area_matrix`][triwarp.parametrization.vector_area_matrix]
-    [`cotmatrix`][triwarp.laplacian.cotmatrix]
-
-    Notes
-    -----
-    Matches ``igl::lscm_hessian``.
-    """
-    n = int(vertices.shape[0])
-    device = vertices.device
-    laplacian = cotmatrix(vertices, faces, dtype=wp.float64)
-    # The real compressed-CSR entry count is offsets[-1], not laplacian.nnz: bsr_from_triplets
-    # reports nnz as the (over-allocated) triplet capacity, so sizing by nnz would leave an
-    # uninitialized gap in the wp.empty buffers that bsr_from_triplets reads back as garbage.
-    n_entries = int(laplacian.offsets.numpy()[-1])
-    boundary = tw.boundary.oriented_boundary_edges(vertices, faces)
-    n_be = int(boundary.shape[0])
-
-    # Combined triplet buffers: 2 per Laplacian entry (the two diagonal blocks) plus 4 per oriented
-    # boundary edge (the vector-area cross-quadrant terms). Every slot is written, so wp.empty.
-    total = 2 * n_entries + 4 * n_be
-    rows = wp.empty(total, dtype=wp.int32, device=device)
-    cols = wp.empty(total, dtype=wp.int32, device=device)
-    vals = wp.empty(total, dtype=wp.float64, device=device)
-    wp.launch(
-        kernel_parametrization.neg_repdiag2_triplets,
-        dim=n,
-        inputs=[
-            laplacian.offsets,
-            laplacian.columns,
-            laplacian.values,
-            wp.int32(n),
-            rows,
-            cols,
-            vals,
-        ],
-        device=device,
-    )
-    if n_be > 0:
-        # The ``-2 A`` term shares its triplet kernel with
-        # [`vector_area_matrix`][triwarp.parametrization.vector_area_matrix] but writes into a slice
-        # of the combined buffer: assembling ``A`` as its own matrix and adding it would need a
-        # second build plus a ``bsr_axpy``, which breaks the single-``bsr_from_triplets`` rule this
-        # operator relies on for deterministic ``bsr_mm``.
-        _vector_area_triplets(
-            boundary, n, -2.0, rows[2 * n_entries :], cols[2 * n_entries :], vals[2 * n_entries :]
-        )
-    return wps.bsr_from_triplets(2 * n, 2 * n, rows, cols, vals, prune_numerical_zeros=False)
-
-
-def vector_area_matrix(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
-) -> wps.BsrMatrix[wp.float64]:
-    """
-    Boundary vector-area matrix ``A``: the signed area enclosed by the UV boundary curve.
-
-    Assembles the ``(2n, 2n)`` matrix that turns the ``[u; v]`` quadratic form into the signed area
-    enclosed by the boundary UV curve: for each **oriented** boundary edge ``(i, j)`` (from the face
-    winding, via [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]) it adds the
-    cross-quadrant entries ``(i+n, j, -1/4)``, ``(j, i+n, -1/4)``, ``(i, j+n, +1/4)``,
-    ``(j+n, i, +1/4)``. On a closed mesh (no boundary) ``A`` is the zero matrix. Built natively in
-    float64 in a single ``bsr_from_triplets``.
-
-    Parameters
-    ----------
-    vertices
-        ``(n_vertices,)`` mesh vertex positions; only the count and device are used.
-    faces
-        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
-
-    Returns
-    -------
-    warp.sparse.BsrMatrix
-        Square ``(2n, 2n)`` float64 matrix in 1x1-block BSR form on ``vertices.device``.
-
-    See Also
-    --------
-    [`lscm_hessian`][triwarp.parametrization.lscm_hessian]
-    [`lscm`][triwarp.parametrization.lscm]
-    [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]
-
-    Notes
-    -----
-    Matches ``igl::vector_area_matrix``.
-    """
-    n = int(vertices.shape[0])
-    device = vertices.device
-    boundary = tw.boundary.oriented_boundary_edges(vertices, faces)
-    n_be = int(boundary.shape[0])
-    if n_be == 0:
-        return wps.bsr_from_triplets(
-            2 * n,
-            2 * n,
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=wp.float64, device=device),
-            prune_numerical_zeros=False,
-        )
-
-    rows = wp.empty(4 * n_be, dtype=wp.int32, device=device)
-    cols = wp.empty(4 * n_be, dtype=wp.int32, device=device)
-    vals = wp.empty(4 * n_be, dtype=wp.float64, device=device)
-    _vector_area_triplets(boundary, n, 1.0, rows, cols, vals)
-    return wps.bsr_from_triplets(2 * n, 2 * n, rows, cols, vals, prune_numerical_zeros=False)
-
-
-def _vector_area_triplets(
-    boundary_edges: twt.Array2dInt32,
-    n_vertices: int,
-    scale: float,
-    out_rows: wp.array[wp.int32],
-    out_cols: wp.array[wp.int32],
-    out_vals: wp.array[wp.float64],
-) -> None:
-    """
-    Emit the four cross-quadrant vector-area triplets per oriented boundary edge.
-
-    Writes ``4 * n_boundary_edges`` triplets from slot zero of the given buffers, which may be
-    slices of a larger triplet array. ``scale = 1`` builds ``A`` itself
-    ([`vector_area_matrix`][triwarp.parametrization.vector_area_matrix]); ``scale = -2`` builds the
-    ``-2 A`` term of the LSCM Hessian ([`lscm_hessian`][triwarp.parametrization.lscm_hessian]).
-    """
-    wp.launch(
-        kernel_parametrization.vector_area_triplets,
-        dim=int(boundary_edges.shape[0]),
-        inputs=[
-            boundary_edges,
-            wp.int32(n_vertices),
-            wp.float64(scale),
-            out_rows,
-            out_cols,
-            out_vals,
-        ],
-        device=out_rows.device,
-    )

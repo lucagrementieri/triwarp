@@ -1,0 +1,780 @@
+"""
+Quadratic energies assembled *from* a Laplacian, and the operators the solvers minimize.
+
+Every function here returns a ``warp.sparse.BsrMatrix`` that is the ``Q`` of a quadratic form
+``x' Q x``, and every one is consumed by [`triwarp.linalg`][triwarp.linalg]'s solvers rather than
+read for its own sake. That is the line between this module and
+[`triwarp.laplacian`][triwarp.laplacian], which builds the *first*-order operators these are
+assembled out of: the cotangent stiffness matrix, its mass matrix and the intrinsic repairs that
+keep them finite.
+
+Three families:
+
+- **Smoothness energies over vertices.** [`k_harmonic`][triwarp.energies.k_harmonic] is the
+  integrated ``k``-harmonic form -- ``k = 1`` is Dirichlet, ``k = 2`` the biharmonic operator behind
+  smooth interpolation -- and it distorts a field near the boundary, because clamping a biharmonic
+  solve there is not a natural condition. [`hessian_energy`][triwarp.energies.hessian_energy] and
+  [`curved_hessian_energy`][triwarp.energies.curved_hessian_energy] are the alternatives that do
+  not: both integrate a squared Hessian instead, so linear (respectively, locally linear)
+  functions sit exactly in the null space, boundary or not.
+- **The edge-based Crouzeix-Raviart pair.**
+  [`crouzeix_raviart_cotmatrix`][triwarp.energies.crouzeix_raviart_cotmatrix] and
+  [`crouzeix_raviart_massmatrix`][triwarp.energies.crouzeix_raviart_massmatrix] put the degrees of
+  freedom on edge midpoints rather than vertices, which is the nonconforming-FEM discretization
+  ``curved_hessian_energy`` is built on. They are the siblings of
+  [`cotmatrix`][triwarp.laplacian.cotmatrix] and [`mass_matrix`][triwarp.laplacian.mass_matrix] --
+  a reader arriving from libigl, where all four sit together, should start there.
+- **The LSCM operator.** [`lscm_hessian`][triwarp.energies.lscm_hessian] is the
+  ``(2n, 2n)`` form behind the least-squares conformal map, and
+  [`vector_area_matrix`][triwarp.energies.vector_area_matrix] is the boundary term that couples its
+  two coordinate blocks. [`lscm`][triwarp.parametrization.lscm] is the solve; these are what it
+  minimizes.
+
+Everything is assembled in ``float64`` in a single ``bsr_from_triplets`` per operator, because the
+conjugate-gradient solves these feed run in ``float64`` for determinism and a ``float32``
+intermediate would be the accuracy floor.
+"""
+
+from __future__ import annotations
+
+import warp as wp
+import warp.sparse as wps
+
+import triwarp as tw
+import triwarp.typing as twt
+from triwarp.edges import edges_unique
+from triwarp.kernels import energies as kernel_energies
+from triwarp.laplacian import cotmatrix, cotmatrix_entries
+
+
+def k_harmonic(
+    laplacian: wps.BsrMatrix[wp.float32], mass: twt.Array1dFloat | None = None, k: int = 2
+) -> wps.BsrMatrix[wp.float32]:
+    """
+    Integrated k-harmonic operator ``Q = (-L) (M^-1 (-L))^(k-1)`` from a Laplacian and a mass.
+
+    The quadratic form whose minimizers are k-harmonic functions: ``k == 1`` gives the Dirichlet
+    energy ``-L`` (positive semi-definite for a [`cotmatrix`][triwarp.laplacian.cotmatrix]-sign
+    Laplacian), ``k == 2`` the biharmonic operator ``L M^-1 L`` behind
+    [`harmonic`][triwarp.parametrization.harmonic]'s smooth interpolation, and so on
+    (``igl::harmonic_integrated_from_laplacian_and_mass``). Like igl's, the composition is not
+    numerically robust for ``k > 2`` — the entries grow as the k-th power of the inverse mesh
+    size — so high powers want a float64 ``laplacian``.
+
+    **Named for the operator, not the map.** This used to be ``laplacian.harmonic_integrated``,
+    which put a second unrelated "harmonic" in the package beside
+    [`harmonic`][triwarp.parametrization.harmonic] — a *map* into the plane, not an operator. The
+    two are related (``harmonic`` minimizes this form with the boundary pinned) but they are not
+    interchangeable, and neither docstring named the other.
+
+    Each power is assembled by one triplet pass over matching CSR rows —
+    ``(A M^-1 B)_ij = sum_t A_ti M_t^-1 B_tj`` with both operands symmetric — followed by a single
+    ``bsr_from_triplets``. Deliberately **no** ``warp.sparse.bsr_mm``: the chained sparse triple
+    product is exactly the shape that reproduces its nondeterministic-output bug (Warp 1.15,
+    ``issue_report.md``).
+
+    Parameters
+    ----------
+    laplacian
+        Square 1x1-block BSR Laplacian in igl's sign convention (negative diagonal, each row
+        summing to zero), e.g. from [`cotmatrix`][triwarp.laplacian.cotmatrix] or
+        [`uniform_laplacian`][triwarp.laplacian.uniform_laplacian].
+    mass
+        Length-``n_vertices`` lumped mass diagonal, e.g. from
+        [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries]; cast to the Laplacian's
+        scalar type if it differs. ``None`` (identity mass) composes plain powers of ``-L``, the
+        [`tutte`][triwarp.parametrization.tutte] convention. Zero entries are treated as killed
+        degrees of freedom (their rows contribute nothing), matching ``igl::invert_diag``.
+    k
+        Harmonic power (``>= 1``): 1 harmonic, 2 biharmonic, 3 triharmonic, ...
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        Square ``(n_vertices, n_vertices)`` positive semi-definite operator in the Laplacian's
+        scalar type on its device.
+
+    Raises
+    ------
+    ValueError
+        If ``k < 1``.
+
+    See Also
+    --------
+    [`cotmatrix`][triwarp.laplacian.cotmatrix]
+    [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries]
+    [`hessian_energy`][triwarp.energies.hessian_energy]
+    [`harmonic`][triwarp.parametrization.harmonic]
+    """
+    if k < 1:
+        raise ValueError(f"harmonic power k must be >= 1, got {k}.")
+    negated = wps.bsr_axpy(x=laplacian, alpha=-1.0)
+    if k == 1:
+        return negated
+
+    dtype = laplacian.values.dtype
+    n_rows = int(laplacian.nrow)
+    device = laplacian.values.device
+    if mass is None:
+        inverse_mass = wp.ones(n_rows, dtype=dtype, device=device)
+    else:
+        if mass.dtype != dtype:
+            mass_typed = wp.empty(n_rows, dtype=dtype, device=device)
+            wp.utils.array_cast(mass, mass_typed)
+            mass = mass_typed
+        inverse_mass = wp.empty(n_rows, dtype=dtype, device=device)
+        wp.map(kernel_energies.reciprocal_or_zero, mass, out=inverse_mass)
+
+    operator = negated
+    for _ in range(k - 1):
+        operator = _diagonal_sandwich(operator, inverse_mass, negated)
+    return operator
+
+
+def _diagonal_sandwich(
+    a: wps.BsrMatrix[wp.float32], inverse_mass: wp.array[wp.Float], b: wps.BsrMatrix[wp.float32]
+) -> wps.BsrMatrix[wp.float32]:
+    """
+    Assemble ``A diag(inverse_mass) B`` for symmetric ``A``, ``B`` by one triplet pass.
+
+    Row ``t`` of the product is the outer product of ``A``'s and ``B``'s rows ``t`` scaled by the
+    diagonal weight, so the whole product is one count kernel, one scan, one emission kernel and a
+    single ``bsr_from_triplets`` — never ``bsr_mm``.
+    """
+    n_rows = int(a.nrow)
+    device = inverse_mass.device
+    counts = wp.empty(n_rows, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_energies.sandwich_row_counts,
+        dim=n_rows,
+        inputs=[a.offsets, b.offsets, inverse_mass, counts],
+        device=device,
+    )
+    segment_offsets = wp.zeros(n_rows + 1, dtype=wp.int32, device=device)
+    wp.utils.array_scan(counts, out_array=segment_offsets[1:], inclusive=True)
+    # Host readback: only the device knows the scan total, and it sizes the triplet buffers.
+    n_triplets = int(segment_offsets[n_rows : n_rows + 1].numpy()[0])
+
+    dtype = a.values.dtype
+    rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
+    cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
+    vals = wp.empty(n_triplets, dtype=dtype, device=device)
+    if n_triplets > 0:
+        wp.launch(
+            kernel_energies.sandwich_row_triplets,
+            dim=n_rows,
+            inputs=[
+                a.offsets,
+                a.columns,
+                a.values,
+                b.offsets,
+                b.columns,
+                b.values,
+                inverse_mass,
+                segment_offsets,
+                rows,
+                cols,
+                vals,
+            ],
+            device=device,
+        )
+    return wps.bsr_from_triplets(n_rows, n_rows, rows, cols, vals, prune_numerical_zeros=False)
+
+
+def hessian_energy(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], dtype: type = wp.float64
+) -> wps.BsrMatrix[wp.float64]:
+    """
+    Hessian smoothness energy with natural boundary conditions.
+
+    The mixed-FEM quadratic form ``Q = H^T M^-1 H`` of Stein et al. 2018, *Natural Boundary
+    Conditions for Smoothing in Geometry Processing*: ``x' Q x`` integrates the squared Hessian of
+    the piecewise-linear field ``x``, so minimizing it smooths **without** the boundary distortion
+    the clamped biharmonic operator
+    ([`k_harmonic`][triwarp.energies.k_harmonic] at ``k == 2``) produces —
+    linear functions are exactly in its null space, boundary or not. ``M`` is the Voronoi lumped
+    mass with boundary degrees of freedom killed, per the reference.
+
+    Rather than materializing the sparse ``(9 n_faces, n_vertices)`` stacked Hessian ``H``, the
+    product is contracted analytically over its nine component pairs and assembled in one triplet
+    pass per vertex: ``Q_ij = sum_k M_k^-1 sum_{f,g ni k} A_f A_g (g_fk . g_gk)(g_fi . g_gj)``
+    with ``g_fc`` corner ``c``'s hat-function gradient in face ``f``. The per-vertex triplet count
+    is ``9 * valence^2``, so cost is quadratic in valence. A degenerate face contributes nothing
+    (igl emits NaN there).
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    dtype
+        Scalar block type of the assembled matrix: ``wp.float64`` (default) or ``wp.float32``.
+        Float64 is the default, unlike the first-order operators in this module, because the
+        entries scale as the inverse fourth power of the mesh size and the operator exists to be
+        solved against.
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        Square ``(n_vertices, n_vertices)`` positive semi-definite energy matrix on
+        ``vertices.device``.
+
+    See Also
+    --------
+    [`curved_hessian_energy`][triwarp.energies.curved_hessian_energy]
+    [`k_harmonic`][triwarp.energies.k_harmonic]
+    [`cotmatrix`][triwarp.laplacian.cotmatrix]
+
+    Notes
+    -----
+    Matches ``igl::hessian_energy`` except on degenerate faces, which contribute nothing here and
+    ``NaN`` there.
+    """
+    n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    device = vertices.device
+    if n_faces == 0:
+        return _empty_square_operator(n_vertices, dtype, device)
+
+    gradients = wp.empty(3 * n_faces, dtype=wp.vec3d, device=device)
+    areas = wp.empty(n_faces, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_energies.hessian_corner_gradients,
+        dim=n_faces,
+        inputs=[vertices, faces, gradients, areas],
+        device=device,
+    )
+
+    mass = wp.zeros(n_vertices, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_energies.voronoi_mass, dim=n_faces, inputs=[vertices, faces, mass], device=device
+    )
+    inverse_mass = _interior_inverse(vertices, faces, mass)
+
+    vf_offsets, vertex_faces = tw.adjacency.vertex_face_adjacency(faces, n_vertices=n_vertices)
+    counts = wp.empty(n_vertices, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_energies.hessian_energy_counts,
+        dim=n_vertices,
+        inputs=[vf_offsets, inverse_mass, counts],
+        device=device,
+    )
+    segment_offsets = wp.zeros(n_vertices + 1, dtype=wp.int32, device=device)
+    wp.utils.array_scan(counts, out_array=segment_offsets[1:], inclusive=True)
+    # Host readback: only the device knows the scan total, and it sizes the triplet buffers.
+    n_triplets = int(segment_offsets[n_vertices : n_vertices + 1].numpy()[0])
+
+    rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
+    cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
+    vals = wp.empty(n_triplets, dtype=dtype, device=device)
+    if n_triplets > 0:
+        wp.launch(
+            kernel_energies.hessian_energy_triplets,
+            dim=n_vertices,
+            inputs=[
+                faces,
+                vf_offsets,
+                vertex_faces,
+                gradients,
+                areas,
+                inverse_mass,
+                segment_offsets,
+                rows,
+                cols,
+                vals,
+            ],
+            device=device,
+        )
+    return wps.bsr_from_triplets(
+        n_vertices, n_vertices, rows, cols, vals, prune_numerical_zeros=False
+    )
+
+
+def _interior_inverse(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], mass: wp.array[wp.float64]
+) -> wp.array[wp.float64]:
+    """Invert a mass diagonal, first zeroing (in place) its boundary degrees of freedom."""
+    device = mass.device
+    boundary = tw.boundary.boundary_vertex_indices(vertices, faces)
+    if int(boundary.shape[0]) > 0:
+        wp.launch(
+            kernel_energies.zero_at_indices,
+            dim=int(boundary.shape[0]),
+            inputs=[boundary, mass],
+            device=device,
+        )
+    inverse_mass = wp.empty(int(mass.shape[0]), dtype=wp.float64, device=device)
+    wp.map(kernel_energies.reciprocal_or_zero, mass, out=inverse_mass)
+    return inverse_mass
+
+
+def curved_hessian_energy(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], dtype: type = wp.float64
+) -> wps.BsrMatrix[wp.float64]:
+    """
+    Curved Hessian smoothness energy on the Crouzeix-Raviart discretization.
+
+    ``igl::curved_hessian_energy``, from Stein et al. 2020, *A Smoothness Energy without Boundary
+    Distortion for Curved Surfaces*: where [`hessian_energy`][triwarp.energies.hessian_energy]
+    treats the surface as locally flat, this one carries the Gaussian curvature into the operator
+    through a per-vertex angle-defect correction, so the energy is intrinsic to the curved surface
+    rather than to its triangles' planes. Constant functions are exactly in its null space.
+
+    Assembled as ``Q = D^T M^-1 (L + K) M^-1 D`` over edge-based Crouzeix-Raviart vector elements
+    — ``D`` the scalar-to-CR-vector gradient, ``M`` the CR vector mass, ``L`` the CR vector
+    Laplacian and ``K`` the curvature correction — but contracted per face in one pass: ``L + K``
+    couples edges within a face only, so each face emits its own 6x6 block sandwiched between its
+    edges' gradient rows (a fixed 144 triplets per face), and no intermediate ``(2 n_edges, ...)``
+    matrix or sparse product exists. Requires an edge-manifold mesh, like the igl original (which
+    asserts it); a degenerate face contributes nothing.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    dtype
+        Scalar block type of the assembled matrix: ``wp.float64`` (default) or ``wp.float32``,
+        with float64 the default for the same conditioning reason as
+        [`hessian_energy`][triwarp.energies.hessian_energy].
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        Square ``(n_vertices, n_vertices)`` positive semi-definite energy matrix on
+        ``vertices.device``.
+
+    See Also
+    --------
+    [`hessian_energy`][triwarp.energies.hessian_energy]
+    [`crouzeix_raviart_cotmatrix`][triwarp.energies.crouzeix_raviart_cotmatrix]
+    [`vertex_defects`][triwarp.vertices.vertex_defects]
+    """
+    n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    device = vertices.device
+    if n_faces == 0:
+        return _empty_square_operator(n_vertices, dtype, device)
+
+    unique_edges, inverse = edges_unique(faces, n_vertices=n_vertices)
+    n_edges = int(unique_edges.shape[0])
+
+    angles = wp.empty((n_faces, 3), dtype=wp.float64, device=device)
+    angle_sums = wp.zeros(n_vertices, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_energies.internal_angles_and_sums,
+        dim=n_faces,
+        inputs=[vertices, faces, angles, angle_sums],
+        device=device,
+    )
+    # Angle defect, zeroed on the boundary (curvature is only corrected at interior vertices),
+    # weighted by the actual angle sum -- igl::cr_vector_curvature_correction's kappa scaling.
+    kappa = wp.empty(n_vertices, dtype=wp.float64, device=device)
+    wp.map(kernel_energies.angle_defect_from_sum, angle_sums, out=kappa)
+    boundary = tw.boundary.boundary_vertex_indices(vertices, faces)
+    if int(boundary.shape[0]) > 0:
+        wp.launch(
+            kernel_energies.zero_at_indices,
+            dim=int(boundary.shape[0]),
+            inputs=[boundary, kappa],
+            device=device,
+        )
+    scaled_kappa = wp.empty(n_vertices, dtype=wp.float64, device=device)
+    wp.map(kernel_energies.divide_or_zero, kappa, angle_sums, out=scaled_kappa)
+
+    mass = wp.zeros(n_edges, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_energies.crouzeix_raviart_mass_diag,
+        dim=n_faces,
+        inputs=[vertices, faces, inverse, mass],
+        device=device,
+    )
+    inverse_mass = wp.empty(n_edges, dtype=wp.float64, device=device)
+    wp.map(kernel_energies.reciprocal_or_zero, mass, out=inverse_mass)
+
+    edge_halfedges = wp.full((n_edges, 2), -1, dtype=wp.int32, device=device)
+    cursor = wp.zeros(n_edges, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_energies.scatter_edge_halfedges,
+        dim=3 * n_faces,
+        inputs=[inverse, cursor, edge_halfedges],
+        device=device,
+    )
+    vertex_slots = wp.full((n_edges, 4), -1, dtype=wp.int32, device=device)
+    par = wp.zeros((n_edges, 4), dtype=wp.float64, device=device)
+    perp = wp.zeros((n_edges, 4), dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_energies.cr_gradient_rows,
+        dim=n_edges,
+        inputs=[vertices, faces, unique_edges, edge_halfedges, vertex_slots, par, perp],
+        device=device,
+    )
+
+    n_triplets = 144 * n_faces
+    rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
+    cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
+    vals = wp.empty(n_triplets, dtype=dtype, device=device)
+    wp.launch(
+        kernel_energies.curved_hessian_triplets,
+        dim=n_faces,
+        inputs=[
+            vertices,
+            faces,
+            inverse,
+            angles,
+            scaled_kappa,
+            inverse_mass,
+            vertex_slots,
+            par,
+            perp,
+            rows,
+            cols,
+            vals,
+        ],
+        device=device,
+    )
+    return wps.bsr_from_triplets(
+        n_vertices, n_vertices, rows, cols, vals, prune_numerical_zeros=False
+    )
+
+
+def crouzeix_raviart_cotmatrix(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    cot_entries: twt.Array2dFloat | None = None,
+    dtype: type = wp.float32,
+    *,
+    unique_edges: twt.Array2dInt32 | None = None,
+    edge_map: wp.array[wp.int32] | None = None,
+) -> wps.BsrMatrix[wp.float32]:
+    """
+    Edge-based Crouzeix-Raviart cotangent stiffness matrix.
+
+    The nonconforming-FEM sibling of [`cotmatrix`][triwarp.laplacian.cotmatrix]: degrees of
+    freedom live on edge midpoints, so the matrix is ``(n_edges, n_edges)`` and each face couples
+    its three edges pairwise with minus four times the half-cotangent at their shared corner
+    (positive diagonal — the igl sign convention for this operator, opposite to ``cotmatrix``'s).
+    Rows follow [`edges_unique`][triwarp.edges.edges_unique]'s edge numbering. Requires an
+    edge-manifold mesh, like the igl original (which asserts it).
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    cot_entries
+        Optional precomputed ``(n_faces, 3)`` weights from
+        [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries]; computed in ``dtype`` when
+        ``None``.
+    dtype
+        Scalar block type of the assembled matrix: ``wp.float32`` (default) or ``wp.float64``.
+    unique_edges, edge_map
+        Optional precomputed edge numbering from
+        [`edges_unique`][triwarp.edges.edges_unique] — pass both or neither. Sharing it with
+        [`crouzeix_raviart_massmatrix`][triwarp.energies.crouzeix_raviart_massmatrix] keeps the
+        two operators on identical rows without recomputing the sort.
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        Square ``(n_edges, n_edges)`` stiffness matrix in 1x1-block BSR form on
+        ``vertices.device``.
+
+    Raises
+    ------
+    ValueError
+        If exactly one of ``unique_edges`` / ``edge_map`` is provided.
+
+    See Also
+    --------
+    [`crouzeix_raviart_massmatrix`][triwarp.energies.crouzeix_raviart_massmatrix]
+    [`cotmatrix`][triwarp.laplacian.cotmatrix]
+    [`edges_unique`][triwarp.edges.edges_unique]
+
+    Notes
+    -----
+    Matches ``igl::crouzeix_raviart_cotmatrix`` up to the edge numbering, which follows
+    [`edges_unique`][triwarp.edges.edges_unique] rather than ``igl::unique_edge_map``.
+    """
+    unique_edges, edge_map = _edge_numbering(vertices, faces, unique_edges, edge_map)
+    n_edges = int(unique_edges.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    device = faces.device
+    if n_faces == 0:
+        return _empty_square_operator(n_edges, dtype, device)
+
+    if cot_entries is None:
+        cot_entries = cotmatrix_entries(vertices, faces, dtype=dtype)
+
+    n_triplets = 12 * n_faces
+    rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
+    cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
+    vals = wp.empty(n_triplets, dtype=dtype, device=device)
+    wp.launch(
+        kernel_energies.crouzeix_raviart_cotmatrix_triplets,
+        dim=n_faces,
+        inputs=[edge_map, cot_entries, rows, cols, vals],
+        device=device,
+    )
+    return wps.bsr_from_triplets(n_edges, n_edges, rows, cols, vals, prune_numerical_zeros=False)
+
+
+def crouzeix_raviart_massmatrix(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    dtype: type = wp.float32,
+    *,
+    unique_edges: twt.Array2dInt32 | None = None,
+    edge_map: wp.array[wp.int32] | None = None,
+) -> wps.BsrMatrix[wp.float32]:
+    """
+    Edge-based Crouzeix-Raviart mass matrix.
+
+    Diagonal ``(n_edges, n_edges)``: each face donates a third of its area to each of its three
+    edges, so an interior edge's entry is a third of its two incident faces' summed area. Rows
+    follow [`edges_unique`][triwarp.edges.edges_unique]'s edge numbering, the same numbering
+    [`crouzeix_raviart_cotmatrix`][triwarp.energies.crouzeix_raviart_cotmatrix] uses.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    dtype
+        Scalar block type of the assembled matrix: ``wp.float32`` (default) or ``wp.float64``.
+    unique_edges, edge_map
+        Optional precomputed edge numbering from
+        [`edges_unique`][triwarp.edges.edges_unique] — pass both or neither.
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        Square ``(n_edges, n_edges)`` diagonal mass matrix in 1x1-block BSR form on
+        ``vertices.device``.
+
+    Raises
+    ------
+    ValueError
+        If exactly one of ``unique_edges`` / ``edge_map`` is provided.
+
+    See Also
+    --------
+    [`crouzeix_raviart_cotmatrix`][triwarp.energies.crouzeix_raviart_cotmatrix]
+    [`mass_matrix`][triwarp.laplacian.mass_matrix]
+    [`edges_unique`][triwarp.edges.edges_unique]
+
+    Notes
+    -----
+    Matches ``igl::crouzeix_raviart_massmatrix`` up to the edge numbering, as above.
+    """
+    unique_edges, edge_map = _edge_numbering(vertices, faces, unique_edges, edge_map)
+    n_edges = int(unique_edges.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    device = faces.device
+
+    mass = wp.zeros(n_edges, dtype=dtype, device=device)
+    if n_faces > 0:
+        wp.launch(
+            kernel_energies.crouzeix_raviart_mass_diag,
+            dim=n_faces,
+            inputs=[vertices, faces, edge_map, mass],
+            device=device,
+        )
+    return wps.bsr_diag(diag=mass)
+
+
+def lscm_hessian(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> wps.BsrMatrix[wp.float64]:
+    """
+    LSCM Hessian ``Q = -repdiag(L, 2) - 2 A``.
+
+    Assembles the ``(2n, 2n)`` symmetric operator behind the least-squares conformal map, where
+    ``L`` is the cotangent Laplacian [`cotmatrix`][triwarp.laplacian.cotmatrix] (negative-diagonal
+    convention), ``repdiag(L, 2)`` is the block-diagonal ``[[L, 0], [0, L]]``, and ``A`` is the
+    boundary [`vector_area_matrix`][triwarp.energies.vector_area_matrix]. Built natively in
+    float64 in a single ``bsr_from_triplets`` (the within-quadrant repdiag triplets and the
+    cross-quadrant ``-2 A`` triplets never collide), so it feeds the float64 conjugate-gradient
+    solve directly. Matches the ``Q`` returned by ``igl.lscm`` exactly.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        Square ``(2n, 2n)`` float64 matrix in 1x1-block BSR form on ``vertices.device``.
+
+    See Also
+    --------
+    [`lscm`][triwarp.parametrization.lscm]
+    [`vector_area_matrix`][triwarp.energies.vector_area_matrix]
+    [`cotmatrix`][triwarp.laplacian.cotmatrix]
+
+    Notes
+    -----
+    Matches ``igl::lscm_hessian``.
+    """
+    n = int(vertices.shape[0])
+    device = vertices.device
+    laplacian = cotmatrix(vertices, faces, dtype=wp.float64)
+    # The real compressed-CSR entry count is offsets[-1], not laplacian.nnz: bsr_from_triplets
+    # reports nnz as the (over-allocated) triplet capacity, so sizing by nnz would leave an
+    # uninitialized gap in the wp.empty buffers that bsr_from_triplets reads back as garbage.
+    n_entries = int(laplacian.offsets.numpy()[-1])
+    boundary = tw.boundary.oriented_boundary_edges(vertices, faces)
+    n_be = int(boundary.shape[0])
+
+    # Combined triplet buffers: 2 per Laplacian entry (the two diagonal blocks) plus 4 per oriented
+    # boundary edge (the vector-area cross-quadrant terms). Every slot is written, so wp.empty.
+    total = 2 * n_entries + 4 * n_be
+    rows = wp.empty(total, dtype=wp.int32, device=device)
+    cols = wp.empty(total, dtype=wp.int32, device=device)
+    vals = wp.empty(total, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_energies.neg_repdiag2_triplets,
+        dim=n,
+        inputs=[
+            laplacian.offsets,
+            laplacian.columns,
+            laplacian.values,
+            wp.int32(n),
+            rows,
+            cols,
+            vals,
+        ],
+        device=device,
+    )
+    if n_be > 0:
+        # The ``-2 A`` term shares its triplet kernel with
+        # [`vector_area_matrix`][triwarp.energies.vector_area_matrix] but writes into a slice
+        # of the combined buffer: assembling ``A`` as its own matrix and adding it would need a
+        # second build plus a ``bsr_axpy``, which breaks the single-``bsr_from_triplets`` rule this
+        # operator relies on for deterministic ``bsr_mm``.
+        _vector_area_triplets(
+            boundary, n, -2.0, rows[2 * n_entries :], cols[2 * n_entries :], vals[2 * n_entries :]
+        )
+    return wps.bsr_from_triplets(2 * n, 2 * n, rows, cols, vals, prune_numerical_zeros=False)
+
+
+def vector_area_matrix(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> wps.BsrMatrix[wp.float64]:
+    """
+    Boundary vector-area matrix ``A``: the signed area enclosed by the UV boundary curve.
+
+    Assembles the ``(2n, 2n)`` matrix that turns the ``[u; v]`` quadratic form into the signed area
+    enclosed by the boundary UV curve: for each **oriented** boundary edge ``(i, j)`` (from the face
+    winding, via [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]) it adds the
+    cross-quadrant entries ``(i+n, j, -1/4)``, ``(j, i+n, -1/4)``, ``(i, j+n, +1/4)``,
+    ``(j+n, i, +1/4)``. On a closed mesh (no boundary) ``A`` is the zero matrix. Built natively in
+    float64 in a single ``bsr_from_triplets``.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions; only the count and device are used.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        Square ``(2n, 2n)`` float64 matrix in 1x1-block BSR form on ``vertices.device``.
+
+    See Also
+    --------
+    [`lscm_hessian`][triwarp.energies.lscm_hessian]
+    [`lscm`][triwarp.parametrization.lscm]
+    [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]
+
+    Notes
+    -----
+    Matches ``igl::vector_area_matrix``.
+    """
+    n = int(vertices.shape[0])
+    device = vertices.device
+    boundary = tw.boundary.oriented_boundary_edges(vertices, faces)
+    n_be = int(boundary.shape[0])
+    if n_be == 0:
+        return wps.bsr_from_triplets(
+            2 * n,
+            2 * n,
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.float64, device=device),
+            prune_numerical_zeros=False,
+        )
+
+    rows = wp.empty(4 * n_be, dtype=wp.int32, device=device)
+    cols = wp.empty(4 * n_be, dtype=wp.int32, device=device)
+    vals = wp.empty(4 * n_be, dtype=wp.float64, device=device)
+    _vector_area_triplets(boundary, n, 1.0, rows, cols, vals)
+    return wps.bsr_from_triplets(2 * n, 2 * n, rows, cols, vals, prune_numerical_zeros=False)
+
+
+def _vector_area_triplets(
+    boundary_edges: twt.Array2dInt32,
+    n_vertices: int,
+    scale: float,
+    out_rows: wp.array[wp.int32],
+    out_cols: wp.array[wp.int32],
+    out_vals: wp.array[wp.float64],
+) -> None:
+    """
+    Emit the four cross-quadrant vector-area triplets per oriented boundary edge.
+
+    Writes ``4 * n_boundary_edges`` triplets from slot zero of the given buffers, which may be
+    slices of a larger triplet array. ``scale = 1`` builds ``A`` itself
+    ([`vector_area_matrix`][triwarp.energies.vector_area_matrix]); ``scale = -2`` builds the
+    ``-2 A`` term of the LSCM Hessian ([`lscm_hessian`][triwarp.energies.lscm_hessian]).
+    """
+    wp.launch(
+        kernel_energies.vector_area_triplets,
+        dim=int(boundary_edges.shape[0]),
+        inputs=[
+            boundary_edges,
+            wp.int32(n_vertices),
+            wp.float64(scale),
+            out_rows,
+            out_cols,
+            out_vals,
+        ],
+        device=out_rows.device,
+    )
+
+
+def _edge_numbering(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    unique_edges: twt.Array2dInt32 | None,
+    edge_map: wp.array[wp.int32] | None,
+) -> tuple[twt.Array2dInt32, wp.array[wp.int32]]:
+    """Validate or build the shared ``edges_unique`` numbering the edge-based operators index."""
+    if (unique_edges is None) != (edge_map is None):
+        raise ValueError("pass unique_edges and edge_map together, or neither.")
+    if unique_edges is None or edge_map is None:
+        unique_edges, edge_map = edges_unique(faces, n_vertices=int(vertices.shape[0]))
+    return unique_edges, edge_map
+
+
+def _empty_square_operator(
+    n_rows: int, dtype: type, device: wp.DeviceLike
+) -> wps.BsrMatrix[wp.float32]:
+    """Zero-nnz square operator, the empty-mesh return shared by the assembly wrappers."""
+    return wps.bsr_from_triplets(
+        n_rows,
+        n_rows,
+        wp.empty(0, dtype=wp.int32, device=device),
+        wp.empty(0, dtype=wp.int32, device=device),
+        wp.empty(0, dtype=dtype, device=device),
+        prune_numerical_zeros=False,
+    )

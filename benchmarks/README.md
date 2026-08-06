@@ -352,6 +352,7 @@ public and tested, only untimed.
 | `totals.volume` | `get_geometric_measures["mesh_volume"]`, `trimesh.Trimesh.volume`, `igl.moments[0]` | untimed since before it moved out of `triangles.py`. Its device pass is now `triangles.face_signed_volumes` plus one `reduce.sum`, and the `moments` row already prices the same integrals at three readbacks against this one's — so the row would isolate the readback count, which is the axis this module is about. Worth adding. |
 | `totals.euler_characteristic` | `get_geometric_measures["genus"]`, `trimesh.Trimesh.euler_number` | untimed since before it moved out of `validation.py`. It is a `unique_1d` plus an `edges_unique`, so it prices the grouping machinery rather than anything of its own, which is the argument against — but it is also the only whole-mesh integer with no row at all. |
 | `triangles.face_signed_volumes` | none | deliberately none: it is the per-face primitive `totals.volume` reduces, and a group over it would measure the same launch twice. Time it through a `volume` row instead. |
+| `energies.lscm_hessian`, `energies.vector_area_matrix` | none with a binding | libigl exposes neither on its own — `lscm_hessian` only as `igl.lscm`'s second return, and `vector_area_matrix` not at all (`tests/test_energies.py` derives it as `(-repdiag(L, 2) - Q) / 2`). Their cost is measured through the `lscm` group in `test_parametrization`, which is also the only way a caller reaches them. |
 
 ### The parity gate: a benchmarked reference must be a tested reference
 
@@ -593,7 +594,7 @@ before the twelve `plans/igl-first-class.md` ports landed. Nine of its groups di
 the coverage pass: `sample_surface`, `face_angles`, `vertex_defects`,
 `face_connected_component_labels`, `ears`, `is_edge_manifold`, `remove_unreferenced_vertices`,
 `unique_faces`, plus the `icosahedron` case of `platonic_solids` — and the port pass added the
-operator family (`harmonic_integrated`, `hessian_energy`, `curved_hessian_energy`,
+operator family in `test_energies` (`k_harmonic`, `hessian_energy`, `curved_hessian_energy`,
 `crouzeix_raviart_cotmatrix` / `_massmatrix`), all five on the `scale` axis because igl's
 Crouzeix-Raviart entry points assume edge-manifold input.
 
@@ -619,7 +620,7 @@ Where the margins sit, on medians:
 | `curved_hessian_energy` † | 24.8–1 578 ms | 2.3–20.3 ms | 11–78x |
 | `crouzeix_raviart_massmatrix` † | 0.15–13.0 ms | 0.18–0.21 ms | **0.73x**–72x |
 | `hessian_energy` † | 17.2–1 137 ms | 1.3–22.3 ms | 13–51x |
-| `harmonic_integrated` (k=2) † | 1.7–162.6 ms | 0.96–4.6 ms | 1.7–35x |
+| `k_harmonic` (k=2) † | 1.7–162.6 ms | 0.96–4.6 ms | 1.7–35x |
 
 † Operator-family rows are the `scale` axis (`sphere_small` → `sphere_med` → `sphere_large`); the
 ranges span it, and the ratio grows with size on every one of them because igl's side is Eigen
