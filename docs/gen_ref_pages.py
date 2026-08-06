@@ -28,6 +28,7 @@ SECTIONS: dict[str, list[str]] = {
         "tangent_space",
         "homology",
         "validation",
+        "totals",
         "selection",
     ],
     "Mesh editing & repair": [

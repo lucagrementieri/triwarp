@@ -46,7 +46,7 @@ def sample_surface(
 
 
 @wp.kernel
-def sample_volume_tet(
+def sample_volume_tetrahedra(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     center: wp.vec3,
@@ -60,7 +60,7 @@ def sample_volume_tet(
 
     v0, v1, v2 = face_vertices(vertices, faces, wp.int32(fi))
 
-    # Uniform sampling in tet (center, v0, v1, v2) via order statistics of
+    # Uniform sampling in the tetrahedron (center, v0, v1, v2) via order statistics of
     # 3 U(0,1) samples. Sorted values s1 ≤ s2 ≤ s3 give spacings
     # (s1, s2-s1, s3-s2, 1-s3) as barycentric coords for (center, v0, v1, v2):
     # P = center*(1-s3) + v0*s1 + v1*(s2-s1) + v2*(s3-s2)

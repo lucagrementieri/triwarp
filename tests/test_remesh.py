@@ -323,13 +323,13 @@ def test_subdivide_loop_shrinks_a_convex_solid_towards_its_limit(
     reproduced.
     """
     _, mesh_wp = icosahedron
-    volume_before = tw.triangles.volume(mesh_wp.points, mesh_wp.indices)
+    volume_before = tw.totals.volume(mesh_wp.points, mesh_wp.indices)
 
     vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
     volumes = []
     for _ in range(3):
         vertices_wp, faces_wp = tw.remesh.subdivide_loop(vertices_wp, faces_wp)
-        volumes.append(tw.triangles.volume(vertices_wp, faces_wp))
+        volumes.append(tw.totals.volume(vertices_wp, faces_wp))
 
     assert volumes[0] < volume_before, "Loop pulls a convex surface inward"
     # Converging, not collapsing: successive passes change the volume by less and less, and the
@@ -340,7 +340,7 @@ def test_subdivide_loop_shrinks_a_convex_solid_towards_its_limit(
 
     # The midpoint split on the same input goes the other way, which is the contrast being drawn.
     vertices_mid_wp, faces_mid_wp = tw.remesh.subdivide(mesh_wp.points, mesh_wp.indices)
-    assert tw.triangles.volume(vertices_mid_wp, faces_mid_wp) > volume_before
+    assert tw.totals.volume(vertices_mid_wp, faces_mid_wp) > volume_before
 
 
 def test_subdivide_loop_leaves_a_nonmanifold_edge_at_its_midpoint(device: str) -> None:

@@ -30,6 +30,7 @@ from __future__ import annotations
 import math
 from typing import NamedTuple
 
+import numpy as np
 import warp as wp
 import warp.optim.linear as wpl
 import warp.sparse as wps
@@ -40,10 +41,10 @@ import triwarp.typing as twt
 from triwarp import laplacian
 from triwarp._device import require_cuda
 from triwarp.constants import TILE_1D
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import laplacian as kernel_laplacian
 from triwarp.kernels import reduce as kernel_reduce
 from triwarp.kernels import smoothing as kernel_smoothing
-from triwarp.kernels import triangles as kernel_triangles
 from triwarp.triangles import face_normals_and_areas
 from triwarp.vertices import mean_vertex_normals
 
@@ -62,14 +63,7 @@ def _apply_operator(
 def _mesh_volume(positions: wp.array[wp.vec3d], faces: wp.array[wp.int32]) -> float:
     n_faces = int(faces.shape[0]) // 3
     device = positions.device
-    volumes = wp.empty(n_faces, dtype=wp.float64, device=device)
-    origin = wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
-    wp.launch(
-        kernel_triangles.signed_tet_volumes,
-        dim=n_faces,
-        inputs=[positions, faces, origin, volumes],
-        device=device,
-    )
+    volumes = tw.triangles.face_signed_volumes(positions, faces)
     # Device-side tiled sum: only the 8-byte total crosses to the host, not the whole array.
     total = wp.zeros(1, dtype=wp.float64, device=device)
     n_tiles = (n_faces + TILE_1D - 1) // TILE_1D
@@ -1055,6 +1049,79 @@ def smooth_region(
         device=device,
     )
     return out
+
+
+def _boundary_verts_mask(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> wp.array[wp.bool]:
+    """Length-``n_vertices`` mask of mesh-boundary vertices (MeshLib ``findBdVerts``)."""
+    device = faces.device
+    n = int(vertices.shape[0])
+    boundary = tw.boundary.boundary_vertex_indices(vertices, faces)
+    return tw.array.indices_to_mask(boundary, n, device=device)
+
+
+def refine_and_smooth_region(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    n_vertices_before: int,
+    patch_face_mask: wp.array[wp.bool],
+    max_edge: float,
+    max_edge_splits: int,
+    max_angle_change_after_flip: float,
+    smooth_curvature: bool,
+    smooth_boundary: bool,
+    natural_smooth: bool,
+    edge_weights: str,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.bool]]:
+    """
+    Subdivide the patch and smooth its new vertices.
+
+    Ports MeshLib ``subdivideFillingNicely`` + ``smoothFillingNicely``.
+
+    Shared finisher of [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth] and
+    [`stitch_smooth`][triwarp.combine.stitch_smooth].
+    """
+    device = faces.device
+    vertices, faces, patch_face_mask = tw.remesh.subdivide_region_to_size(
+        vertices,
+        faces,
+        patch_face_mask,
+        max_edge=max_edge,
+        max_splits=max_edge_splits,
+        max_angle_change=max_angle_change_after_flip,
+    )
+    if not smooth_curvature:
+        return vertices, faces, patch_face_mask
+
+    n = int(vertices.shape[0])
+    # New (interior patch) vertices are the tail appended by subdivision, minus mesh-boundary verts.
+    new_verts_np = np.zeros(n, dtype=bool)
+    new_verts_np[n_vertices_before:] = True
+    new_verts = wp.array(new_verts_np, dtype=wp.bool, device=device)
+    bd_mask = _boundary_verts_mask(vertices, faces)
+    free = wp.empty(n, dtype=wp.bool, device=device)
+    wp.map(kernel_array.mask_and_not, new_verts, bd_mask, out=free)
+
+    vertices = smooth_region_fixed_rim(vertices, faces, free)
+    if smooth_boundary:
+        vertices = smooth_region(vertices, faces, free, edge_weights)
+
+    if natural_smooth:
+        edges_bd = tw.selection.region_boundary_edges(faces, patch_face_mask, n_vertices=n)
+        endpoints = wp.clone(twt.as_array2d_int32(edges_bd).reshape(-1))
+        incident = tw.array.indices_to_mask(endpoints, n, device=device)
+        incident = tw.selection.expand_vertex_mask(faces, incident, 5)
+        incident = tw.selection.shrink_vertex_mask(faces, incident, 2)
+        incident = tw.selection.exclude_fully_selected_components(faces, incident, n)
+        if bool(incident.numpy().any()):
+            bd_mask = _boundary_verts_mask(vertices, faces)
+            free2 = wp.empty(n, dtype=wp.bool, device=device)
+            wp.map(kernel_array.mask_and_not, incident, bd_mask, out=free2)
+            vertices = smooth_region_fixed_rim(vertices, faces, free2)
+            vertices = smooth_region(vertices, faces, free2, edge_weights)
+
+    return vertices, faces, patch_face_mask
 
 
 def filter_scalar_laplacian(

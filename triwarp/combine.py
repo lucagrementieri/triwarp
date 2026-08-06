@@ -14,9 +14,12 @@ import itertools
 import math
 from collections.abc import Sequence
 
+import numpy as np
 import warp as wp
 
 import triwarp as tw
+import triwarp.typing as twt
+from triwarp.hole_filling import _BAD_TRIANGULATION_METRIC, _EdgeTable, _PackedLoops
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import combine as kernel_combine
 
@@ -45,6 +48,11 @@ def concatenate(
     See Also
     --------
     [`split`][triwarp.combine.split]
+        The inverse, by connected component.
+    [`concatenate`][triwarp.array.concatenate]
+        The buffer-level operation of the same name, which joins plain 1-D arrays and does no
+        reindexing. Both names are required: this one mirrors
+        [`trimesh.util.concatenate`][], that one [`numpy.concatenate`][].
     [`trimesh.util.concatenate`][]
     """
     if len(meshes_data) == 0:
@@ -234,8 +242,8 @@ def stitch(
 
     Extracts the single boundary loop of each mesh
     ([`boundary_loops`][triwarp.boundary.boundary_loops]) and joins them with
-    [`triangulate_boundaries`][triwarp.hole_filling.triangulate_boundaries]. Each mesh must have
-    exactly one boundary loop (the promesh assumption); use ``triangulate_boundaries`` directly to
+    [`stitch_loops`][triwarp.combine.stitch_loops]. Each mesh must have
+    exactly one boundary loop (the promesh assumption); use ``stitch_loops`` directly to
     join specific loops of multi-boundary meshes. **No smoothing** is applied.
 
     Parameters
@@ -259,7 +267,7 @@ def stitch(
 
     See Also
     --------
-    [`triangulate_boundaries`][triwarp.hole_filling.triangulate_boundaries]
+    [`stitch_loops`][triwarp.combine.stitch_loops]
     [`stitch_min_weight`][triwarp.combine.stitch_min_weight]
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     """
@@ -274,9 +282,7 @@ def stitch(
             "stitch requires each mesh to have exactly one boundary loop (>= 3 vertices); "
             f"got {len(loops_a)} and {len(loops_b)}"
         )
-    return tw.hole_filling.triangulate_boundaries(
-        vertices_a, faces_a, loops_a[0], vertices_b, faces_b, loops_b[0]
-    )
+    return stitch_loops(vertices_a, faces_a, loops_a[0], vertices_b, faces_b, loops_b[0])
 
 
 def stitch_min_weight(
@@ -291,7 +297,7 @@ def stitch_min_weight(
     Stitch two single-boundary open meshes with a minimum-weight band.
 
     Like [`stitch`][triwarp.combine.stitch] but joins the two rims with the metric-minimizing band
-    of [`triangulate_boundaries_min_weight`][triwarp.hole_filling.triangulate_boundaries_min_weight]
+    of [`stitch_loops_min_weight`][triwarp.combine.stitch_loops_min_weight]
     instead of the greedy correspondence. Each mesh must have exactly one boundary loop.
 
     Parameters
@@ -302,7 +308,7 @@ def stitch_min_weight(
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffers of each mesh.
     metric
         Stitch metric; see
-        [`triangulate_boundaries_min_weight`][triwarp.hole_filling.triangulate_boundaries_min_weight].
+        [`stitch_loops_min_weight`][triwarp.combine.stitch_loops_min_weight].
     up_dir
         Up direction for the ``"vertical"`` metric.
 
@@ -321,7 +327,7 @@ def stitch_min_weight(
 
     See Also
     --------
-    [`triangulate_boundaries_min_weight`][triwarp.hole_filling.triangulate_boundaries_min_weight]
+    [`stitch_loops_min_weight`][triwarp.combine.stitch_loops_min_weight]
     [`stitch`][triwarp.combine.stitch]
 
     Notes
@@ -339,7 +345,7 @@ def stitch_min_weight(
             "stitch_min_weight requires each mesh to have exactly one boundary loop (>=3 verts); "
             f"got {len(loops_a)} and {len(loops_b)}"
         )
-    return tw.hole_filling.triangulate_boundaries_min_weight(
+    return stitch_loops_min_weight(
         vertices_a, faces_a, loops_a[0], vertices_b, faces_b, loops_b[0], metric, up_dir
     )
 
@@ -380,7 +386,7 @@ def stitch_smooth(
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffers of each mesh.
     metric
         Stitch metric; see
-        [`triangulate_boundaries_min_weight`][triwarp.hole_filling.triangulate_boundaries_min_weight].
+        [`stitch_loops_min_weight`][triwarp.combine.stitch_loops_min_weight].
     up_dir
         Up direction for the ``"vertical"`` stitch metric.
     triangulate_only
@@ -423,10 +429,8 @@ def stitch_smooth(
     -----
     The three-stage pipeline is MeshLib's ``stitchHolesNicely``.
     """
-    if metric not in tw.hole_filling._STITCH_METRIC_IDS:
-        raise ValueError(
-            f"metric must be one of {sorted(tw.hole_filling._STITCH_METRIC_IDS)}, got {metric!r}"
-        )
+    if metric not in _STITCH_METRIC_IDS:
+        raise ValueError(f"metric must be one of {sorted(_STITCH_METRIC_IDS)}, got {metric!r}")
     if edge_weights not in ("cotan", "unit"):
         raise ValueError(f"edge_weights must be 'cotan' or 'unit', got {edge_weights!r}")
 
@@ -445,7 +449,7 @@ def stitch_smooth(
     device = faces_a.device
     n_faces_before = (int(faces_a.shape[0]) + int(faces_b.shape[0])) // 3
     n_vertices_before = int(vertices_a.shape[0]) + int(vertices_b.shape[0])
-    combined_vertices, combined_faces = tw.hole_filling.triangulate_boundaries_min_weight(
+    combined_vertices, combined_faces = stitch_loops_min_weight(
         vertices_a, faces_a, loops_a[0], vertices_b, faces_b, loops_b[0], metric, up_dir
     )
     n_faces_after = int(combined_faces.shape[0]) // 3
@@ -464,7 +468,7 @@ def stitch_smooth(
         if max_edge is not None
         else tw.hole_filling._mean_rim_edge_length(combined_vertices, rim_loops)
     )
-    new_vertices, new_faces, out_patch = tw.hole_filling._finish_nicely(
+    new_vertices, new_faces, out_patch = tw.smoothing.refine_and_smooth_region(
         combined_vertices,
         combined_faces,
         n_vertices_before,
@@ -478,3 +482,452 @@ def stitch_smooth(
         edge_weights,
     )
     return (new_vertices, new_faces, out_patch) if return_patch else (new_vertices, new_faces)
+
+
+def stitch_loops(
+    vertices_a: wp.array[wp.vec3],
+    faces_a: wp.array[wp.int32],
+    loop_a: wp.array[wp.int32],
+    vertices_b: wp.array[wp.vec3],
+    faces_b: wp.array[wp.int32],
+    loop_b: wp.array[wp.int32],
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Join two meshes by triangulating the band between one boundary loop on each.
+
+    The two rims are zippered into a watertight seam by a greedy, order-preserving correspondence
+    (the Warp port of promesh's ``triangulate_boundaries``): every A-edge is matched to the B
+    vertex minimizing the added-triangle perimeter, the association is rotated so its shortest
+    pair comes first, and a longest-increasing-subsequence correction forces the matching to be
+    monotone (non-self-intersecting). **No smoothing or refinement** is applied — the seam reuses
+    only the two loops' existing vertices, adding ``len(loop_a) + len(loop_b)`` bridge triangles.
+
+    The larger loop is treated as A (the meshes are swapped internally when
+    ``len(loop_a) < len(loop_b)``), so the output is invariant to argument order. Both loops must
+    wind following the face orientation, as returned by
+    [`boundary_loops`][triwarp.boundary.boundary_loops]; the two boundaries are assumed to wind in
+    opposite directions (as two open meshes facing each other do), so loop A is reversed to align
+    them.
+
+    Parameters
+    ----------
+    vertices_a, vertices_b
+        ``(n_vertices,)`` vertex positions of each mesh.
+    faces_a, faces_b
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffers of each mesh.
+    loop_a, loop_b
+        Ordered vertex-index loops (``>= 3`` vertices each) around the boundary to join on each
+        mesh, indexing ``vertices_a`` / ``vertices_b`` respectively.
+
+    Returns
+    -------
+    new_vertices : wp.array[wp.vec3]
+        Concatenation of ``vertices_a`` then ``vertices_b`` (larger loop first), on
+        ``faces_a.device``.
+    new_faces : wp.array[wp.int32]
+        Original faces (B reindexed by ``len(vertices_a)``) followed by the bridge triangles, on
+        ``faces_a.device``.
+
+    Raises
+    ------
+    ValueError
+        If either loop has fewer than 3 vertices.
+
+    See Also
+    --------
+    [`stitch`][triwarp.combine.stitch]
+    [`boundary_loops`][triwarp.boundary.boundary_loops]
+    [`concatenate`][triwarp.combine.concatenate]
+
+    Notes
+    -----
+    The correspondence and its monotonicity correction are inherently sequential and run on the
+    host over the length-``len(loop_a)`` association array; the O(N·M) perimeter matrix, the
+    reductions, and the triangle emission run in Warp kernels, and the perimeter matrix itself is
+    never copied off the device.
+    """
+    device = faces_a.device
+    n = int(loop_a.shape[0])
+    m = int(loop_b.shape[0])
+    if n < m:
+        vertices_a, vertices_b = vertices_b, vertices_a
+        faces_a, faces_b = faces_b, faces_a
+        loop_a, loop_b = loop_b, loop_a
+        n, m = m, n
+    if m < 3:
+        raise ValueError(f"each boundary loop must have at least 3 vertices, got {n} and {m}")
+    n_vertices_a = int(vertices_a.shape[0])
+
+    # Reverse loop A so both rims wind the same way, then take rim positions.
+    flipped_loop_a = wp.empty(n, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_combine.cyclic_gather,
+        dim=n,
+        inputs=[loop_a, wp.int32(n), wp.int32(0), wp.bool(True), wp.int32(0), flipped_loop_a],
+        device=device,
+    )
+    a_pos = tw.array.gather(vertices_a, flipped_loop_a)
+    b_pos = tw.array.gather(vertices_b, loop_b)
+
+    # perimeters[i, j] = |a_i - b_j| + |a_{i+1} - b_j| for A-edge i and B-vertex j.
+    perimeters = twt.empty_float32_2d((n, m), device=device)
+    wp.launch(
+        kernel_combine.boundary_perimeters,
+        dim=(n, m),
+        inputs=[a_pos, b_pos, wp.int32(n), perimeters],
+        device=device,
+    )
+
+    col_min = wp.empty(n, dtype=wp.int32, device=device)
+    val_min = wp.empty(n, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_combine.row_argmin,
+        dim=n,
+        inputs=[perimeters, wp.int32(m), col_min, val_min],
+        device=device,
+    )
+
+    shift = wp.empty(2, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_combine.global_argmin,
+        dim=1,
+        inputs=[col_min, val_min, wp.int32(n), shift],
+        device=device,
+    )
+    shift_np = shift.numpy()
+    shift_a = int(shift_np[0])
+    shift_b = int(shift_np[1])
+
+    edge_dev = wp.empty(n, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_combine.rolled_edge_map,
+        dim=n,
+        inputs=[col_min, wp.int32(shift_a), wp.int32(shift_b), wp.int32(n), wp.int32(m), edge_dev],
+        device=device,
+    )
+    edge = edge_dev.numpy()
+
+    row_roll = shift_a
+    col_roll = shift_b
+
+    # Wraparound-group fix: if the lowest-index group is split across the ends of ``edge``, roll
+    # A so the group is contiguous (promesh's correction before the monotonicity pass).
+    if edge[-1] == edge[0]:
+        trailing = int(np.argmin(np.flip(edge) == edge[0]))
+        if trailing > 0:
+            edge = np.roll(edge, trailing)
+            row_roll = (shift_a - trailing) % n
+
+    # Monotonicity correction: re-pick the B vertex of every edge outside the longest
+    # non-decreasing subsequence within the bracket of its stable neighbours, so the matching is
+    # order-preserving. The sentinel value ``m`` closes the last bracket.
+    edge_ext = np.append(edge, np.int32(m))
+    out_edge = wp.array(edge_ext.astype(np.int32), dtype=wp.int32, device=device)
+    if not np.all(np.diff(edge) >= 0):
+        unsorted_indices = _non_increasing_indices(edge_ext)
+        stable_indices = np.delete(np.arange(edge_ext.size), unsorted_indices)
+        next_indices = stable_indices[np.searchsorted(stable_indices, unsorted_indices)]
+        wp.launch(
+            kernel_combine.resolve_corrections,
+            dim=1,
+            inputs=[
+                perimeters,
+                wp.array(unsorted_indices.astype(np.int32), dtype=wp.int32, device=device),
+                wp.array(next_indices.astype(np.int32), dtype=wp.int32, device=device),
+                wp.int32(int(unsorted_indices.size)),
+                wp.int32(row_roll),
+                wp.int32(col_roll),
+                wp.int32(n),
+                wp.int32(m),
+                out_edge,
+            ],
+            device=device,
+        )
+
+    # Rolled loops referencing the concatenated vertex buffer (A first, then B offset).
+    roll_a = wp.empty(n, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_combine.cyclic_gather,
+        dim=n,
+        inputs=[
+            flipped_loop_a,
+            wp.int32(n),
+            wp.int32(row_roll),
+            wp.bool(False),
+            wp.int32(0),
+            roll_a,
+        ],
+        device=device,
+    )
+    roll_b = wp.empty(m, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_combine.cyclic_gather,
+        dim=m,
+        inputs=[
+            loop_b,
+            wp.int32(m),
+            wp.int32(col_roll),
+            wp.bool(False),
+            wp.int32(n_vertices_a),
+            roll_b,
+        ],
+        device=device,
+    )
+
+    bridge_a = wp.empty(3 * n, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_combine.bridge_a_faces,
+        dim=n,
+        inputs=[roll_a, roll_b, out_edge, wp.int32(n), bridge_a],
+        device=device,
+    )
+    bridge_b = wp.empty(3 * m, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_combine.bridge_b_faces,
+        dim=m,
+        inputs=[roll_a, roll_b, out_edge, wp.int32(n), wp.int32(m), bridge_b],
+        device=device,
+    )
+
+    combined_vertices, combined_faces = tw.combine.concatenate(
+        [(vertices_a, faces_a), (vertices_b, faces_b)]
+    )
+    return combined_vertices, tw.array.concatenate([combined_faces, bridge_a, bridge_b])
+
+
+# Stitch-metric name -> kernel selector (must match the METRIC_*_STITCH constants in
+# kernels/hole_filling.py).
+def _longest_increasing_subsequence(numbers: np.ndarray) -> np.ndarray:
+    """
+    Longest strictly increasing subsequence of ``numbers`` (patience-sorting, O(N log N)).
+
+    Repeated values must be pre-perturbed to distinct values (see
+    [`_non_increasing_indices`][triwarp.combine._non_increasing_indices]); the algorithm does
+    not handle ties. Mirrors promesh's private helper of the same name.
+    """
+    p = np.zeros_like(numbers, dtype=np.int64)
+    m = -np.ones(numbers.size + 1, dtype=np.int64)
+    size = 0
+    for i, x in enumerate(numbers):
+        subseq_size = int(np.searchsorted(numbers[m[1 : size + 1]], x))
+        p[i] = m[subseq_size]
+        m[subseq_size + 1] = i
+        size = max(subseq_size + 1, size)
+    subseq = np.empty(size, numbers.dtype)
+    k = m[size]
+    for i in range(size - 1, -1, -1):
+        subseq[i] = numbers[k]
+        k = p[k]
+    return subseq
+
+
+def _non_increasing_indices(numbers: np.ndarray) -> np.ndarray:
+    """
+    Return the entry indices **not** in the longest non-decreasing subsequence of ``numbers``.
+
+    Repeated integers are perturbed by adding ``linspace(0, 1, count, endpoint=False)`` within
+    each equal-value group, so a run of equal values is treated as (weakly) increasing and kept.
+    Mirrors promesh's private helper (with a NumPy grouping in place of ``trimesh.grouping.group``
+    to avoid a runtime ``trimesh`` dependency).
+    """
+    different = numbers.astype(np.float64)
+    order = np.argsort(numbers, kind="stable")
+    sorted_values = numbers[order]
+    cut = np.flatnonzero(np.diff(sorted_values)) + 1
+    for group in np.split(order, cut):
+        different[group] += np.linspace(0.0, 1.0, num=len(group), endpoint=False)
+    subsequence = _longest_increasing_subsequence(different)
+    absence_mask = np.isin(different, subsequence, assume_unique=True, invert=True)
+    return np.flatnonzero(absence_mask)
+
+
+_STITCH_METRIC_IDS = {"complex_stitch": 0, "edge_length_stitch": 1, "vertical": 2}
+
+
+def _closest_loop_pair(a_pos: wp.array[wp.vec3], b_pos: wp.array[wp.vec3]) -> tuple[int, int]:
+    """
+    Return the closest vertex pair ``(i, j)`` between the two rims (MeshLib's start pair).
+
+    The full ``(n_a, n_b)`` squared-distance matrix and its argmin run in Warp kernels (the same
+    ``row_argmin`` / ``global_argmin`` reduction the greedy zippering uses); only the two winning
+    indices come back to the host. Ties resolve to the smallest ``i`` then smallest ``j``, matching
+    ``numpy.argmin`` on the flattened matrix.
+    """
+    device = a_pos.device
+    n_a = int(a_pos.shape[0])
+    n_b = int(b_pos.shape[0])
+    dist_sq = twt.empty_float32_2d((n_a, n_b), device=device)
+    wp.launch(
+        kernel_combine.pair_sq_distances,
+        dim=(n_a, n_b),
+        inputs=[a_pos, b_pos, dist_sq],
+        device=device,
+    )
+    col_min = wp.empty(n_a, dtype=wp.int32, device=device)
+    val_min = wp.empty(n_a, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_combine.row_argmin,
+        dim=n_a,
+        inputs=[dist_sq, wp.int32(n_b), col_min, val_min],
+        device=device,
+    )
+    pair = wp.empty(2, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_combine.global_argmin,
+        dim=1,
+        inputs=[col_min, val_min, wp.int32(n_a), pair],
+        device=device,
+    )
+    pair_np = pair.numpy()
+    return int(pair_np[0]), int(pair_np[1])
+
+
+def stitch_loops_min_weight(
+    vertices_a: wp.array[wp.vec3],
+    faces_a: wp.array[wp.int32],
+    loop_a: wp.array[wp.int32],
+    vertices_b: wp.array[wp.vec3],
+    faces_b: wp.array[wp.int32],
+    loop_b: wp.array[wp.int32],
+    metric: str = "complex_stitch",
+    up_dir: tuple[float, float, float] | None = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Join two meshes with a **minimum-weight** cylindrical band between one boundary loop on each.
+
+    Ports MeshLib's ``stitchHoles``: the two rims are aligned at their closest vertex pair and
+    zippered by the band of ``len(loop_a) + len(loop_b)`` triangles that minimizes a stitch metric,
+    found by a grid dynamic program over the two loops (``dp[i, j]`` = best band consuming ``i``
+    A-edges and ``j`` B-edges; each anti-diagonal is one parallel kernel launch). Reuses only the
+    loops' existing vertices. The metric-free greedy
+    [`stitch_loops`][triwarp.combine.stitch_loops] remains available.
+
+    Parameters
+    ----------
+    vertices_a, vertices_b
+        ``(n_vertices,)`` vertex positions of each mesh.
+    faces_a, faces_b
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffers of each mesh.
+    loop_a, loop_b
+        Ordered vertex-index loops (``>= 3`` vertices each) around the boundary to join on each.
+    metric
+        Stitch metric to minimize (MeshLib ``MRMeshMetrics.cpp``):
+
+        - ``"complex_stitch"`` (default) — triangle aspect ratio plus a dihedral-smoothness edge
+          term between adjacent band triangles and the surface (``getComplexStitchMetric``).
+        - ``"edge_length_stitch"`` — summed connection-edge length (``getEdgeLengthStitchMetric``).
+        - ``"vertical"`` — penalizes band area and normal deviation from ``up_dir``
+          (``getVerticalStitchMetric``); pass ``up_dir``.
+    up_dir
+        Up direction for the ``"vertical"`` metric (defaults to ``(0, 0, 1)``); ignored otherwise.
+
+    Returns
+    -------
+    new_vertices : wp.array[wp.vec3]
+        Concatenation of ``vertices_a`` then ``vertices_b``, on ``faces_a.device``.
+    new_faces : wp.array[wp.int32]
+        Original faces (B reindexed by ``len(vertices_a)``) followed by the band triangles.
+
+    Raises
+    ------
+    ValueError
+        If either loop has fewer than 3 vertices, or ``metric`` is unknown.
+
+    See Also
+    --------
+    [`stitch_loops`][triwarp.combine.stitch_loops]
+    [`stitch_min_weight`][triwarp.combine.stitch_min_weight]
+    """
+    if metric not in _STITCH_METRIC_IDS:
+        raise ValueError(f"metric must be one of {sorted(_STITCH_METRIC_IDS)}, got {metric!r}")
+    n_a = int(loop_a.shape[0])
+    n_b = int(loop_b.shape[0])
+    if n_a < 3 or n_b < 3:
+        raise ValueError(f"each boundary loop must have at least 3 vertices, got {n_a} and {n_b}")
+
+    device = faces_a.device
+    metric_id = _STITCH_METRIC_IDS[metric]
+    offset = int(vertices_a.shape[0])
+
+    # Reverse loop A so the two rims wind oppositely (facing), then align both at the closest pair.
+    # ``la`` / ``lb`` stay on the host for the sequential band traceback, but the closest-pair
+    # search, rim gathers and rim-opposite lookups all run on device.
+    la = loop_a.numpy()[::-1].copy()
+    lb = loop_b.numpy().copy()
+    a_rim = tw.array.gather(vertices_a, wp.array(la, dtype=wp.int32, device=device))
+    b_rim = tw.array.gather(vertices_b, wp.array(lb, dtype=wp.int32, device=device))
+    start_a, start_b = _closest_loop_pair(a_rim, b_rim)
+    la = np.roll(la, -start_a)
+    lb = np.roll(lb, -start_b)
+
+    la_wp = wp.array(la, dtype=wp.int32, device=device)
+    lb_wp = wp.array(lb, dtype=wp.int32, device=device)
+    a_pos = tw.array.gather(vertices_a, la_wp)
+    b_pos = tw.array.gather(vertices_b, lb_wp)
+    table_a = _EdgeTable(vertices_a, faces_a, tw.edges.faces_to_edges(faces_a, sorted=True))
+    table_b = _EdgeTable(vertices_b, faces_b, tw.edges.faces_to_edges(faces_b, sorted=True))
+    # The stitch DP works on exactly one rim per side, so each rim is its own one-loop batch.
+    a_opp, a_opp_valid = table_a.rim_opposite(_PackedLoops(la_wp, np.array([n_a], dtype=np.int64)))
+    b_opp, b_opp_valid = table_b.rim_opposite(_PackedLoops(lb_wp, np.array([n_b], dtype=np.int64)))
+    up = wp.vec3(*(up_dir if up_dir is not None else (0.0, 0.0, 1.0)))
+
+    dp = twt.as_array2d_float32(
+        wp.full((n_a + 1, n_b + 1), _BAD_TRIANGULATION_METRIC, dtype=wp.float32, device=device)
+    )
+    wp.launch(kernel_combine.set_dp_origin, dim=1, inputs=[dp], device=device)
+    came = twt.as_array2d_int32(wp.full((n_a + 1, n_b + 1), -1, dtype=wp.int32, device=device))
+    for diag in range(1, n_a + n_b + 1):
+        wp.launch(
+            kernel_combine.stitch_dp_diag,
+            dim=min(diag, n_a) - max(0, diag - n_b) + 1,
+            inputs=[
+                a_pos,
+                b_pos,
+                a_opp,
+                a_opp_valid,
+                b_opp,
+                b_opp_valid,
+                up,
+                wp.int32(metric_id),
+                wp.int32(n_a),
+                wp.int32(n_b),
+                wp.int32(diag),
+                dp,
+                came,
+            ],
+            device=device,
+        )
+    came_np = came.numpy()
+
+    band = _stitch_band_triangles(came_np, la, lb, n_a, n_b, offset)
+    combined_vertices, combined_faces = tw.combine.concatenate(
+        [(vertices_a, faces_a), (vertices_b, faces_b)]
+    )
+    band_faces = wp.array(band.reshape(-1), dtype=wp.int32, device=device)
+    return combined_vertices, tw.array.concatenate([combined_faces, band_faces])
+
+
+def _stitch_band_triangles(
+    came_np: np.ndarray, la: np.ndarray, lb: np.ndarray, n_a: int, n_b: int, offset: int
+) -> np.ndarray:
+    """Trace the grid-DP came-from table from ``(n_a, n_b)`` to ``(0, 0)`` into band triangles."""
+    triangles: list[tuple[int, int, int]] = []
+    i, j = n_a, n_b
+    while i > 0 or j > 0:
+        if came_np[i, j] == 0:  # advanced A: triangle (a[i-1], a[i], b[j])
+            triangles.append((int(la[(i - 1) % n_a]), int(la[i % n_a]), int(lb[j % n_b]) + offset))
+            i -= 1
+        elif came_np[i, j] == 1:  # advanced B: triangle (a[i], b[j], b[j-1])
+            triangles.append(
+                (int(la[i % n_a]), int(lb[j % n_b]) + offset, int(lb[(j - 1) % n_b]) + offset)
+            )
+            j -= 1
+        else:  # unreachable cell (should not happen for valid rims)
+            break
+    return np.asarray(triangles, dtype=np.int32)
+
+
+# ---------------------------------------------------------------------------
+# "Nicely" pipeline: min-weight fill / stitch -> region subdivision -> region smoothing
+# (MeshLib fillHoleNicely / stitchHolesNicely, MRFillHoleNicely.cpp).
+# ---------------------------------------------------------------------------

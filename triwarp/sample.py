@@ -14,10 +14,9 @@ import triwarp.typing as twt
 from triwarp.array import flatnonzero, gather, init_range, init_sort_pair_indices
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import sample as kernel_sample
-from triwarp.kernels import triangles as kernel_triangles
 from triwarp.kernels.algorithms import blue_noise as kernel_blue_noise
 from triwarp.neighbors import query_hashgrid_ball_with_offsets
-from triwarp.triangles import centroid, face_normals_and_areas
+from triwarp.triangles import face_normals_and_areas
 
 
 def sample_fibonacci_sphere(count: int, device: wp.DeviceLike = None) -> wp.array[wp.vec3]:
@@ -580,7 +579,7 @@ def sample_volume(
     Sample points uniformly inside a watertight triangle mesh volume.
 
     Fans tetrahedra from the mesh's area-weighted surface centroid, builds a CDF
-    from signed tet volumes, and draws uniform points inside each selected tet via
+    from signed tetrahedron volumes, and draws uniform points inside each selected one via
     the order-statistics barycentric method (zero rejection for meshes that are
     star-shaped with respect to their centroid).
 
@@ -605,9 +604,9 @@ def sample_volume(
     ValueError
         If the mesh is not watertight (open boundary edges detected).
     ValueError
-        If the mesh has zero total volume, or some signed tet volumes are negative after fanning
-        from the centroid (the mesh is not star-shaped with respect to its own centroid, e.g. a
-        torus).
+        If the mesh has zero total volume, or some signed tetrahedron volumes are negative after
+        fanning from the centroid (the mesh is not star-shaped with respect to its own centroid,
+        e.g. a torus).
     """
     n_faces = faces.shape[0] // 3
 
@@ -619,15 +618,9 @@ def sample_volume(
             "mesh is not watertight; tetrahedral decomposition requires a closed surface"
         )
 
-    center = centroid(vertices, faces)
+    center = tw.totals.surface_centroid(vertices, faces)
 
-    signed_vols = wp.empty(n_faces, dtype=wp.float32, device=vertices.device)
-    wp.launch(
-        kernel_triangles.signed_tet_volumes,
-        dim=n_faces,
-        inputs=[vertices, faces, center, signed_vols],
-        device=vertices.device,
-    )
+    signed_vols = tw.triangles.face_signed_volumes(vertices, faces, center)
 
     vols_np = signed_vols.numpy()
     total_vol = float(vols_np.sum())
@@ -647,7 +640,7 @@ def sample_volume(
 
     out_points = wp.empty(count, dtype=wp.vec3, device=vertices.device)
     wp.launch(
-        kernel_sample.sample_volume_tet,
+        kernel_sample.sample_volume_tetrahedra,
         dim=count,
         inputs=[vertices, faces, center, cdf, _get_seed(seed), out_points],
         device=vertices.device,

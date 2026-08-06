@@ -68,7 +68,7 @@ def test_sphere_is_closed_manifold(device: str, subdivisions: int):
     assert faces_np.shape[0] // 3 == 2 * n_points - 4
     assert tw.validation.is_watertight(vertices_wp, faces_wp)
     assert tw.validation.is_edge_manifold(faces_wp)
-    assert tw.validation.euler_characteristic(faces_wp) == 2
+    assert tw.totals.euler_characteristic(faces_wp) == 2
     # every input point is referenced
     assert np.unique(faces_np).size == n_points
 
@@ -91,7 +91,7 @@ def test_torus_is_genus_one(device: str):
     assert tw.validation.is_watertight(vertices_wp, faces_wp)
     assert tw.validation.is_edge_manifold(faces_wp)
     # genus-1 closed surface: V - E + F = 0
-    assert tw.validation.euler_characteristic(faces_wp) == 0
+    assert tw.totals.euler_characteristic(faces_wp) == 0
 
 
 @pytest.mark.parametrize("subdivisions", [3])

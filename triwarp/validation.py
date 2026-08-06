@@ -11,41 +11,7 @@ import triwarp.typing as twt
 from triwarp._device import require_nonempty_mesh
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import intersection as kernel_intersections
-from triwarp.kernels import triangles as kernel_triangles
 from triwarp.kernels import validation as kernel_validation
-
-
-def euler_characteristic(faces: wp.array[wp.int32]) -> int:
-    """
-    Euler characteristic ``V - E + F`` of the mesh (topological invariant).
-
-    Counts distinct referenced vertices, unique undirected edges, and faces, matching
-    [`trimesh.Trimesh.euler_number`][] (which uses referenced vertices, ``edges_unique``, and
-    faces). For a closed genus-``g`` surface this equals ``2 - 2 * g``.
-
-    Parameters
-    ----------
-    faces
-        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
-
-    Returns
-    -------
-    int
-        ``(#distinct referenced vertices) - (#unique edges) + (#faces)``. ``0`` for an empty mesh.
-
-    See Also
-    --------
-    [`edges_unique`][triwarp.edges.edges_unique]
-    [`trimesh.Trimesh.euler_number`][]
-    """
-    n_faces = int(faces.shape[0]) // 3
-    if n_faces == 0:
-        return 0
-
-    n_referenced = int(tw.grouping.unique_1d(faces).shape[0])
-    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=tw.vertices.n_vertices(faces))
-    n_edges = int(unique_edges.shape[0])
-    return n_referenced - n_edges + n_faces
 
 
 def is_edge_manifold(
@@ -908,6 +874,10 @@ def is_volume(
 
     See Also
     --------
+    [`make_volume`][triwarp.repair.make_volume]
+        Produce one: flip whatever fails this test.
+    [`volume`][triwarp.totals.volume]
+        Measure one, once this returns ``True``.
     [`is_winding_consistent`][triwarp.validation.is_winding_consistent]
     [`is_watertight`][triwarp.validation.is_watertight]
     [`is_orientable`][triwarp.validation.is_orientable]
@@ -946,11 +916,4 @@ def is_volume(
     if not bool(tw.reduce.all(consistent)):
         return False
 
-    signed_volumes = wp.empty(n_faces, dtype=wp.float32, device=device)
-    wp.launch(
-        kernel_triangles.signed_tet_volumes,
-        dim=n_faces,
-        inputs=[vertices, faces, wp.vec3(0.0, 0.0, 0.0), signed_volumes],
-        device=device,
-    )
-    return tw.reduce.sum(signed_volumes) > 0.0
+    return tw.reduce.sum(tw.triangles.face_signed_volumes(vertices, faces)) > 0.0

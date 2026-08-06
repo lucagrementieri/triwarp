@@ -29,7 +29,6 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels import edges as kernel_edges
 from triwarp.kernels import repair as kernel_repair
 from triwarp.kernels import scatter as kernel_scatter
-from triwarp.kernels import triangles as kernel_triangles
 
 
 def remove_unreferenced_vertices(
@@ -695,6 +694,9 @@ def make_volume(
     See Also
     --------
     [`is_volume`][triwarp.validation.is_volume]
+        Test whether this succeeded.
+    [`volume`][triwarp.totals.volume]
+        Measure the result.
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
     [`make_normals_outward`][triwarp.repair.make_normals_outward]
 
@@ -714,13 +716,7 @@ def make_volume(
         return wp.empty(0, dtype=wp.int32, device=device)
 
     out_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
-    signed_volumes = wp.empty(n_faces, dtype=wp.float32, device=device)
-    wp.launch(
-        kernel_triangles.signed_tet_volumes,
-        dim=n_faces,
-        inputs=[vertices, faces, wp.vec3(0.0, 0.0, 0.0), signed_volumes],
-        device=device,
-    )
+    signed_volumes = tw.triangles.face_signed_volumes(vertices, faces)
 
     if multibody:
         labels = tw.adjacency.face_connected_component_labels(faces)

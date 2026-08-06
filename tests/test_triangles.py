@@ -10,7 +10,7 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import faces_igl, trimesh_to_pymeshlab, trimesh_to_warp
+from tests.conversions import faces_igl, trimesh_to_pymeshlab
 
 
 @pytest.mark.parity("face_normals_and_areas", "trimesh")
@@ -68,33 +68,6 @@ def test_face_normals_and_areas_against_the_partial_references(
     assert np.allclose(
         normals_wp.numpy(), crosses_pml / magnitudes_pml[:, None], rtol=1e-5, atol=1e-5
     )
-
-
-@pytest.mark.parity("centroid", "pymeshlab")
-def test_centroid_matches_pymeshlab_shell_barycenter(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
-    """
-    The area-weighted centroid against MeshLab's ``shell_barycenter``.
-
-    ``get_geometric_measures`` answers six questions in one call -- which is why
-    ``benchmarks/test_triangles.py`` reads its row as an *upper* bound on the centroid alone -- but
-    "upper bound" is a statement about cost, not about the value. Indexing the dict is the whole
-    transform (class B).
-
-    The distinction that matters here is that the same call also returns ``barycenter``, the plain
-    *vertex* mean, and the two differ on any mesh with uneven triangle areas. Asserting against
-    ``shell_barycenter`` while checking that ``barycenter`` is measurably different is what makes
-    this a real test of the area weighting rather than of a centre of mass in general: on
-    ``hemisphere`` they sit about 0.02 apart, some 400x the 1e-5 tolerance.
-    """
-    mesh_tm, mesh_wp = hemisphere
-    measures_pml = trimesh_to_pymeshlab(mesh_tm).get_geometric_measures()
-
-    centroid_wp = tw.triangles.centroid(mesh_wp.points, mesh_wp.indices)
-    centroid_np = np.array([centroid_wp.x, centroid_wp.y, centroid_wp.z])
-
-    assert np.allclose(centroid_np, measures_pml["shell_barycenter"], rtol=1e-5, atol=1e-5)
-    # The vertex mean is a different quantity; if it were not, the assert above would be weightless.
-    assert not np.allclose(measures_pml["barycenter"], measures_pml["shell_barycenter"], atol=1e-3)
 
 
 def test_angles(half_torus: tuple[tm.Trimesh, wp.Mesh]):
@@ -267,78 +240,6 @@ def test_closest_point(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     assert np.allclose(closest_points_wp.numpy(), closest_points_tm, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parity("centroid", "trimesh")
-def test_centroid(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
-    mesh_tm, mesh_wp = hemisphere
-
-    centroid_tm = mesh_tm.centroid
-
-    centroid_wp = tw.triangles.centroid(mesh_wp.points, mesh_wp.indices)
-    centroid_wp = np.array([centroid_wp.x, centroid_wp.y, centroid_wp.z])
-    assert np.allclose(centroid_wp, centroid_tm, rtol=1e-5, atol=1e-5)
-
-
-@pytest.mark.parametrize("kernel_device", ["cpu", "cuda:0"])
-def test_centroid_matches_trimesh_on_a_skewed_mesh_on_both_devices(kernel_device: str):
-    """
-    Pin the area-weighted centroid sum on **both** devices, on a deliberately asymmetric mesh.
-
-    Three things this guards. ``wp.launch_tiled`` runs exactly one lane per block on Warp 1.15's CPU
-    backend, so the block-wide ``wp.tile_sum`` this reduction used to perform accumulated one face
-    per 64-face tile there. A *symmetric* mesh hides that completely -- the centroid of every 64th
-    face of a sphere is still the sphere's centre -- which is why the mesh is stretched and sheared
-    first. Measured: the sub-sampled sum was off by 1.1e-2 on this shape and by 4e-8 on the
-    unmodified sphere. And the reduction now has two implementations (``centroid_tiled`` on CUDA,
-    ``centroid_sliced`` on CPU), so the parametrization is what covers both of them -- running this
-    on one device only would leave a whole kernel untested.
-    """
-    if kernel_device.startswith("cuda") and not wp.is_cuda_available():
-        pytest.skip("no CUDA device")
-
-    mesh_tm = tm.creation.icosphere(subdivisions=3)
-    mesh_tm.vertices[:, 0] *= 6.0
-    mesh_tm.vertices[:, 2] += 0.4 * mesh_tm.vertices[:, 1] ** 3
-    mesh_wp = trimesh_to_warp(mesh_tm, kernel_device)
-
-    centroid_wp = tw.triangles.centroid(mesh_wp.points, mesh_wp.indices)
-    assert np.allclose(
-        np.array([centroid_wp.x, centroid_wp.y, centroid_wp.z]),
-        mesh_tm.centroid,
-        rtol=1e-4,
-        atol=1e-4,
-    )
-
-
-def test_centroid_empty(device: str):
-    vertices = wp.zeros(1, dtype=wp.vec3, device=device)
-    faces = wp.array([], dtype=wp.int32, device=device)
-    centroid_wp = tw.triangles.centroid(vertices, faces)
-    centroid_wp = np.array([centroid_wp.x, centroid_wp.y, centroid_wp.z])
-    assert np.isnan(centroid_wp).all()
-
-
-def test_volume(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
-    mesh_tm, mesh_wp = icosahedron
-    volume_wp = tw.triangles.volume(mesh_wp.points, mesh_wp.indices)
-    assert np.isclose(volume_wp, mesh_tm.volume, rtol=1e-5, atol=1e-5)
-
-
-def test_volume_inward_normals_negative(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
-    mesh_tm, mesh_wp = icosahedron
-    faces_np = mesh_tm.faces[:, ::-1].reshape(-1).astype(np.int32)
-    faces_flipped_wp = wp.array(
-        np.ascontiguousarray(faces_np), dtype=wp.int32, device=mesh_wp.device
-    )
-    volume_wp = tw.triangles.volume(mesh_wp.points, faces_flipped_wp)
-    assert np.isclose(volume_wp, -mesh_tm.volume, rtol=1e-5, atol=1e-5)
-
-
-def test_volume_empty(device: str):
-    vertices = wp.zeros(1, dtype=wp.vec3, device=device)
-    faces = wp.array([], dtype=wp.int32, device=device)
-    assert tw.triangles.volume(vertices, faces) == 0.0
-
-
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("face_centroids", "igl")
 def test_face_centroids(request: pytest.FixtureRequest, mesh_name: str):
@@ -363,105 +264,83 @@ def test_face_centroids(request: pytest.FixtureRequest, mesh_name: str):
     assert np.allclose(barycentric_wp.numpy(), 1.0 / 3.0, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
-@pytest.mark.parity("moments", "igl", "trimesh")
-def test_moments(request: pytest.FixtureRequest, mesh_name: str):
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "half_torus"])
+def test_face_signed_volumes(request: pytest.FixtureRequest, mesh_name: str):
     """
-    Class B on igl (its first moment is un-normalised), class A on trimesh.
+    Class A against the NumPy oracle, element-wise, plus class B on the sum.
 
-    ``igl.moments`` returns ``(m0, m1, m2)`` where ``m1`` is the centre of mass **times the mass**,
-    so the named transform is ``m1 / m0``. ``m2`` needs no transform: it is already referred to the
-    centre of mass rather than the origin, which was verified against a *translated* mesh rather
-    than assumed -- on a mesh centred at the origin the two references coincide and the check would
-    be vacuous.
-
-    trimesh answers all three too (``volume`` / ``center_mass`` / ``moment_inertia``), so this is a
-    three-way comparison of the same integrals.
-
-    The inertia tolerance is relative to the tensor's own scale: triwarp integrates ``float32``
-    positions in ``float64``, so the deviation tracks the positions' precision (measured 3.5e-8
-    relative on ``icosahedron``, and 3.6e-15 on an axis-aligned box whose coordinates are exact in
-    ``float32``).
+    ``dot(v0, cross(v1, v2)) / 6`` per face, which is a one-liner in NumPy and therefore an exact
+    oracle rather than an approximate one. The class-B half is that the sum over a closed mesh is
+    ``mesh_tm.volume`` -- the transform being the reduction -- and it is the assert that would catch
+    a per-face sign error the element-wise comparison could only catch if the oracle had the same
+    bug. ``half_torus`` is open, so it is here for the element-wise half only, which is exactly the
+    point: the per-face quantity is defined whether or not the surface bounds anything.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
+    triangles_np = np.asarray(mesh_tm.triangles, dtype=np.float64)
+    v0, v1, v2 = triangles_np[:, 0], triangles_np[:, 1], triangles_np[:, 2]
+    volumes_np = np.einsum("ij,ij->i", v0, np.cross(v1, v2)) / 6.0
 
-    volume_igl, first_moment_igl, inertia_igl = igl.moments(vertices_np, faces_igl(mesh_tm))
-    volume_wp, center_wp, inertia_wp = tw.triangles.moments(mesh_wp.points, mesh_wp.indices)
+    volumes_wp = tw.triangles.face_signed_volumes(mesh_wp.points, mesh_wp.indices)
 
-    assert np.isclose(volume_wp, volume_igl, rtol=1e-5)
-    assert np.isclose(volume_wp, mesh_tm.volume, rtol=1e-5)
-    assert np.allclose(
-        [center_wp.x, center_wp.y, center_wp.z],
-        np.asarray(first_moment_igl) / volume_igl,
-        rtol=1e-4,
-        atol=1e-5,
-    )
-    assert np.allclose(
-        [center_wp.x, center_wp.y, center_wp.z], mesh_tm.center_mass, rtol=1e-4, atol=1e-5
-    )
-    scale = float(np.abs(np.asarray(inertia_igl)).max())
-    assert np.abs(inertia_wp - np.asarray(inertia_igl)).max() < 1e-5 * scale
-    assert np.abs(inertia_wp - mesh_tm.moment_inertia).max() < 1e-5 * scale
+    scale = float(np.abs(volumes_np).max())
+    assert np.allclose(volumes_wp.numpy(), volumes_np, rtol=1e-5, atol=1e-5 * scale)
+    if mesh_tm.is_watertight:
+        assert np.isclose(volumes_wp.numpy().sum(), mesh_tm.volume, rtol=1e-5, atol=1e-5)
 
 
-def test_moments_center_of_mass_differs_from_the_surface_centroid(
-    half_torus: tuple[tm.Trimesh, wp.Mesh],
-):
+def test_face_signed_volumes_apex_shifts_each_face_but_not_the_sum(device: str):
     """
-    The two centres are different quantities, which is why both functions exist.
+    Moving the apex changes every per-face volume and leaves the closed-mesh total alone.
 
-    ``centroid`` is the area-weighted centre of the *shell* and ``moments``' is the volume centre of
-    the solid. On a closed uniform sphere they coincide; on anything asymmetric they do not, and
-    asserting they differ is what keeps ``moments`` from being a synonym.
+    Both halves are needed. The invariance of the sum is the property ``totals.volume`` relies on
+    when it passes no apex at all; the *variance* of the individual entries is what makes ``apex``
+    a real parameter rather than a decoration, and it is the axis ``sample.sample_volume`` uses --
+    it fans from the surface centroid precisely so that no entry comes out negative.
     """
-    _mesh_tm, mesh_wp = half_torus
-    surface_centroid = tw.triangles.centroid(mesh_wp.points, mesh_wp.indices)
-    _volume, center_of_mass, _inertia = tw.triangles.moments(mesh_wp.points, mesh_wp.indices)
-    assert not np.allclose(
-        [surface_centroid.x, surface_centroid.y, surface_centroid.z],
-        [center_of_mass.x, center_of_mass.y, center_of_mass.z],
-        atol=1e-3,
+    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    vertices_wp = wp.array(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    faces_wp = wp.array(
+        np.ascontiguousarray(mesh_tm.faces.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=device,
     )
 
+    at_origin_np = tw.triangles.face_signed_volumes(vertices_wp, faces_wp).numpy()
+    shifted_np = tw.triangles.face_signed_volumes(
+        vertices_wp, faces_wp, wp.vec3(2.0, -1.0, 0.5)
+    ).numpy()
 
-def test_moments_translation_shifts_only_the_center(device: str):
-    """
-    Translation moves the centre of mass and leaves the volume and inertia tensor alone.
+    assert not np.allclose(at_origin_np, shifted_np, atol=1e-4)
+    assert np.isclose(at_origin_np.sum(), shifted_np.sum(), rtol=1e-4)
 
-    The parallel-axis shift is what makes that true, and getting it wrong is invisible on any mesh
-    centred at the origin -- which is why this fixture is deliberately offset.
-    """
-    box_tm = tm.creation.box(extents=[1.0, 2.0, 3.0])
-    offset_np = np.array([1.5, -2.0, 0.5])
 
-    def moments_of(vertices_np: np.ndarray):
-        vertices_wp = wp.array(
-            np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device
-        )
-        faces_wp = wp.array(
-            np.ascontiguousarray(box_tm.faces.reshape(-1), dtype=np.int32),
-            dtype=wp.int32,
-            device=device,
-        )
-        return tw.triangles.moments(vertices_wp, faces_wp)
-
-    volume_a, center_a, inertia_a = moments_of(box_tm.vertices)
-    volume_b, center_b, inertia_b = moments_of(box_tm.vertices + offset_np)
-
-    assert np.isclose(volume_a, volume_b, rtol=1e-5)
-    assert np.allclose(
-        [center_b.x, center_b.y, center_b.z],
-        np.array([center_a.x, center_a.y, center_a.z]) + offset_np,
-        atol=1e-5,
+def test_face_signed_volumes_follows_the_input_dtype(device: str):
+    """``vec3d`` in, ``float64`` out -- the axis ``smoothing``'s volume constraint needs."""
+    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    faces_wp = wp.array(
+        np.ascontiguousarray(mesh_tm.faces.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=device,
     )
-    assert np.abs(inertia_a - inertia_b).max() < 1e-4 * float(np.abs(inertia_a).max())
+    vertices_f64_wp = wp.array(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64), dtype=wp.vec3d, device=device
+    )
+    vertices_f32_wp = wp.array(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+
+    volumes_f64_wp = tw.triangles.face_signed_volumes(vertices_f64_wp, faces_wp)
+    volumes_f32_wp = tw.triangles.face_signed_volumes(vertices_f32_wp, faces_wp)
+
+    assert volumes_f64_wp.dtype is wp.float64
+    assert volumes_f32_wp.dtype is wp.float32
+    assert np.allclose(volumes_f64_wp.numpy(), volumes_f32_wp.numpy(), rtol=1e-6, atol=1e-7)
 
 
-def test_moments_empty(device: str):
-    faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
-    vertices_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
-    volume, center, inertia = tw.triangles.moments(vertices_wp, faces_wp)
-    assert volume == 0.0
-    assert np.isnan([center.x, center.y, center.z]).all()
-    assert np.array_equal(inertia, np.zeros((3, 3)))
+def test_face_signed_volumes_empty(device: str):
+    vertices_wp = wp.zeros(1, dtype=wp.vec3, device=device)
+    faces_wp = wp.array([], dtype=wp.int32, device=device)
+    assert tw.triangles.face_signed_volumes(vertices_wp, faces_wp).shape == (0,)

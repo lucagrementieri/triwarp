@@ -38,7 +38,7 @@ def test_homology_generator_count_is_twice_the_genus(
     loops = tw.homology.homology_generators(mesh_wp.points, mesh_wp.indices)
 
     # The genus the fixture is built for, and the genus the mesh actually has, must agree first.
-    assert tw.validation.euler_characteristic(mesh_wp.indices) == 2 - 2 * genus
+    assert tw.totals.euler_characteristic(mesh_wp.indices) == 2 - 2 * genus
     assert len(loops) == 2 * genus
 
 

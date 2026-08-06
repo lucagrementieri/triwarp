@@ -15,7 +15,7 @@ which is ``2 * g``.
 Unlike the rest of this package there is no reference implementation to compare against —
 potpourri3d does not expose geometry-central's homology code — so the tests check structural
 invariants instead: the loop count against
-[`euler_characteristic`][triwarp.validation.euler_characteristic], and that every loop is a closed
+[`euler_characteristic`][triwarp.totals.euler_characteristic], and that every loop is a closed
 walk along real mesh edges that visits no vertex twice.
 """
 
@@ -70,7 +70,7 @@ def homology_generators(
     See Also
     --------
     [`tree_cotree`][triwarp.homology.tree_cotree]
-    [`euler_characteristic`][triwarp.validation.euler_characteristic]
+    [`euler_characteristic`][triwarp.totals.euler_characteristic]
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     """
     device = faces.device

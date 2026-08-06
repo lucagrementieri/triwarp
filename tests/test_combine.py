@@ -8,6 +8,7 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
+from triwarp.combine import _non_increasing_indices
 
 
 def _fillable_loops(vertices: wp.array, faces: wp.array) -> list[wp.array]:
@@ -293,3 +294,122 @@ def test_stitch_smooth_requires_single_loop(device: str, icosahedron: tuple[tm.T
     _, mesh_wp = icosahedron
     with pytest.raises(ValueError, match="exactly one boundary loop"):
         tw.combine.stitch_smooth(mesh_wp.points, mesh_wp.indices, mesh_wp.points, mesh_wp.indices)
+
+
+# ---------------------------------------------------------------------------
+# The loop-level engines (``stitch_loops`` / ``stitch_loops_min_weight``)
+# ---------------------------------------------------------------------------
+
+
+def _stitch_loops_np(
+    vertices_a: np.ndarray,
+    faces_a: np.ndarray,
+    loop_a: np.ndarray,
+    vertices_b: np.ndarray,
+    faces_b: np.ndarray,
+    loop_b: np.ndarray,
+) -> np.ndarray:
+    """
+    Pure-NumPy port of the boundary zippering, used as the CPU reference for the kernels.
+
+    Mirrors ``triwarp.combine.stitch_loops`` (itself the port of promesh's
+    ``triangulate_boundaries``). Perimeters are computed in ``float32`` so the argmin tie-breaks
+    match the Warp kernels. Returns the flat ``(3 * n_faces,)`` face buffer.
+    """
+    vertices_a = vertices_a.astype(np.float32)
+    vertices_b = vertices_b.astype(np.float32)
+    n, m = loop_a.size, loop_b.size
+    if n < m:
+        vertices_a, vertices_b = vertices_b, vertices_a
+        faces_a, faces_b = faces_b, faces_a
+        loop_a, loop_b = loop_b, loop_a
+        n, m = m, n
+
+    flipped_a = loop_a[::-1]
+    loop_b_shifted = loop_b + len(vertices_a)
+    a_pos = vertices_a[flipped_a]
+    b_pos = vertices_b[loop_b]
+
+    difference = a_pos[:, None, :] - b_pos[None, :, :]
+    distances = np.sqrt((difference**2).sum(-1)).astype(np.float32)
+    perimeters = distances + np.roll(distances, -1, axis=0)
+
+    shift_a, shift_b = np.unravel_index(int(np.argmin(perimeters)), perimeters.shape)
+    flipped_a = np.roll(flipped_a, -shift_a)
+    loop_b_shifted = np.roll(loop_b_shifted, -shift_b)
+    perimeters = np.roll(np.roll(perimeters, -shift_a, axis=0), -shift_b, axis=1)
+    edge = np.argmin(perimeters, axis=1)
+
+    if edge[-1] == edge[0]:
+        trailing = int(np.argmin(np.flip(edge) == edge[0]))
+        flipped_a = np.roll(flipped_a, trailing)
+        edge = np.roll(edge, trailing)
+        perimeters = np.roll(perimeters, trailing, axis=0)
+
+    if not np.all(np.diff(edge) >= 0):
+        edge = np.append(edge, loop_b.size)
+        perimeters = np.vstack([perimeters, perimeters[0]])
+        unsorted_indices = _non_increasing_indices(edge)
+        stable = np.delete(np.arange(edge.size), unsorted_indices)
+        next_indices = stable[np.searchsorted(stable, unsorted_indices)]
+        for index, next_index in zip(unsorted_indices, next_indices, strict=True):
+            edge[index] = (
+                int(np.argmin(perimeters[index, edge[index - 1] : edge[next_index] + 1]))
+                + edge[index - 1]
+            )
+        edge = edge[:-1]
+
+    window_a = np.lib.stride_tricks.sliding_window_view(
+        np.append(flipped_a, flipped_a[0]), window_shape=2
+    )
+    bridge_a = np.column_stack([window_a, loop_b_shifted[edge]])
+    window_b = np.lib.stride_tricks.sliding_window_view(
+        np.append(loop_b_shifted, loop_b_shifted[0]), window_shape=2
+    )
+    apex = flipped_a[np.searchsorted(edge, np.arange(loop_b.size), side="right") % flipped_a.size]
+    bridge_b = np.column_stack([np.fliplr(window_b), apex])
+
+    faces = np.vstack(
+        [faces_a.reshape(-1, 3), faces_b.reshape(-1, 3) + len(vertices_a), bridge_a, bridge_b]
+    )
+    return faces.reshape(-1).astype(np.int32)
+
+
+@pytest.mark.parametrize(
+    ("n_a", "n_b", "phase", "offset"),
+    [(16, 11, 0.3, 0.0), (7, 13, 0.7, 0.0), (24, 5, 1.1, 0.0), (17, 11, 0.9, 1.2)],
+)
+def test_stitch_loops_matches_numpy(
+    device: str, n_a: int, n_b: int, phase: float, offset: float
+) -> None:
+    bottom, top = _capsule_halves(device, n_a, n_b, phase, offset)
+    va_np, fa_np, va, fa = bottom
+    vb_np, fb_np, vb, fb = top
+
+    loop_a = tw.boundary.boundary_loop(va, fa)
+    loop_b = tw.boundary.boundary_loop(vb, fb)
+
+    _, faces_wp = tw.combine.stitch_loops(va, fa, loop_a, vb, fb, loop_b)
+    faces_np = _stitch_loops_np(va_np, fa_np, loop_a.numpy(), vb_np, fb_np, loop_b.numpy())
+
+    assert np.array_equal(_sorted_triangle_rows(faces_wp.numpy()), _sorted_triangle_rows(faces_np))
+
+
+def test_stitch_loops_rejects_small_loop(device: str) -> None:
+    _, _, va, fa = _cone_wp(device=device, n=8, apex_z=-1.0, rim_z=0.0)
+    _, _, vb, fb = _cone_wp(device=device, n=8, apex_z=1.0, rim_z=0.5)
+
+    loop_a = tw.boundary.boundary_loop(va, fa)
+    tiny_loop = wp.array(np.array([0, 1], dtype=np.int32), dtype=wp.int32, device=device)
+    with pytest.raises(ValueError, match="at least 3 vertices"):
+        tw.combine.stitch_loops(va, fa, loop_a, vb, fb, tiny_loop)
+
+
+def test_non_increasing_indices() -> None:
+    # The longest non-decreasing subsequence keeps the repeated 1s and 4s; only 5 (at index 4)
+    # falls outside it, so its index is flagged for correction.
+    numbers = np.array([0, 1, 1, 2, 5, 3, 4, 4, 7], dtype=np.int64)
+    assert np.array_equal(_non_increasing_indices(numbers), np.array([4]))
+
+    # A strictly sorted sequence needs no correction.
+    assert _non_increasing_indices(np.arange(6, dtype=np.int64)).size == 0

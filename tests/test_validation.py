@@ -179,20 +179,8 @@ def test_topological_measures_match_pymeshlab(
     n_loops = len(tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices))
     assert (mesh_name in CLOSED_MESHES) == (n_loops == 0)
     n_components = int(measures_pml["connected_components_number"])
-    euler_wp = tw.validation.euler_characteristic(mesh_wp.indices)
+    euler_wp = tw.totals.euler_characteristic(mesh_wp.indices)
     assert euler_wp == 2 * n_components - 2 * int(measures_pml["genus"]) - n_loops
-
-
-@pytest.mark.parametrize("mesh_name", ALL_MESHES)
-def test_euler_characteristic(request: pytest.FixtureRequest, mesh_name: str) -> None:
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    euler_wp = tw.validation.euler_characteristic(mesh_wp.indices)
-    assert euler_wp == int(mesh_tm.euler_number)
-
-
-def test_euler_characteristic_icosahedron(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    _, mesh_wp = icosahedron
-    assert tw.validation.euler_characteristic(mesh_wp.indices) == 2
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
@@ -710,7 +698,7 @@ def test_empty_mesh(device: str) -> None:
     assert tw.validation.is_orientable(faces_wp) is True
     assert tw.validation.is_winding_consistent(faces_wp) is True
     assert tw.validation.is_volume(vertices_wp, faces_wp) is False
-    assert tw.validation.euler_characteristic(faces_wp) == 0
+    assert tw.totals.euler_characteristic(faces_wp) == 0
     assert tw.validation.edge_manifold_mask(faces_wp).shape[0] == 0
     assert tw.validation.vertex_manifold_mask(vertices_wp, faces_wp).shape[0] == 0
 

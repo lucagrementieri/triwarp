@@ -323,6 +323,9 @@ public and tested, only untimed.
 | function | reference that exists | why there is no group yet |
 |---|---|---|
 | `visibility.volumetric_obscurance` | `compute_scalar_by_volumetric_obscurance` | it shares `ambient_occlusion`'s kernel and differs only in a per-hit `exp(-tau * t)` factor, so a triwarp-only group would re-measure that group's axis. MeshLab's filter *is* a real second reference, so the row is worth adding — with `tau` as its axis, not `rays`. |
+| `totals.volume` | `get_geometric_measures["mesh_volume"]`, `trimesh.Trimesh.volume`, `igl.moments[0]` | untimed since before it moved out of `triangles.py`. Its device pass is now `triangles.face_signed_volumes` plus one `reduce.sum`, and the `moments` row already prices the same integrals at three readbacks against this one's — so the row would isolate the readback count, which is the axis this module is about. Worth adding. |
+| `totals.euler_characteristic` | `get_geometric_measures["genus"]`, `trimesh.Trimesh.euler_number` | untimed since before it moved out of `validation.py`. It is a `unique_1d` plus an `edges_unique`, so it prices the grouping machinery rather than anything of its own, which is the argument against — but it is also the only whole-mesh integer with no row at all. |
+| `triangles.face_signed_volumes` | none | deliberately none: it is the per-face primitive `totals.volume` reduces, and a group over it would measure the same launch twice. Time it through a `volume` row instead. |
 
 ### The parity gate: a benchmarked reference must be a tested reference
 
@@ -397,7 +400,8 @@ The rest are second or third independent implementations:
 | `test_remesh` | `meshing_surface_subdivision_midpoint(threshold=)` in `subdivide_to_size`, landing on the identical output face count |
 | `test_sample` | `generate_sampling_poisson_disk(radius=)` — the only blue-noise reference that takes a *radius*, so the radius sweep maps for the first time |
 | `test_smoothing` | `apply_coord_laplacian_smoothing_scale_dependent` (Desbrun's, = `filter_mut_dif_laplacian`) and `apply_coord_laplacian_smoothing` |
-| `test_triangles` | `compute_normal_per_face`, `get_geometric_measures` (`shell_barycenter` = `centroid`) |
+| `test_triangles` | `compute_normal_per_face` |
+| `test_totals` | `get_geometric_measures` (`shell_barycenter` = `surface_centroid`) |
 | `test_validation` | `get_topological_measures` + `compute_selection_by_self_intersections_per_face` — the same composition open3d does in **13.8 s** and MeshLab in 140.8 ms; plus `compute_selection_by_non_manifold_per_vertex` |
 | `test_vertices` | `compute_normal_per_vertex` at `weightmode='Simple Average'` and `'By Area'` — one filter covering both normal groups |
 

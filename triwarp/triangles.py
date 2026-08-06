@@ -15,13 +15,9 @@ by row, without a BVH -- for a query against the whole surface see
 
 from typing import Literal
 
-import numpy as np
 import warp as wp
 
-import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import items_per_slice, prefers_tiled_reduction
-from triwarp.constants import TILE_1D
 from triwarp.kernels import triangles as kernel_triangles
 
 
@@ -175,8 +171,9 @@ def face_centroids(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp
     """
     Barycentre of every face: the mean of its three corners.
 
-    Not to be confused with [`centroid`][triwarp.triangles.centroid], which is the *mesh's* single
-    area-weighted centre. This is one point per triangle and no weighting is involved.
+    Not to be confused with [`surface_centroid`][triwarp.totals.surface_centroid], which is the
+    *mesh's* single area-weighted centre. This is one point per triangle and no weighting is
+    involved.
 
     Parameters
     ----------
@@ -192,8 +189,8 @@ def face_centroids(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp
 
     See Also
     --------
-    [`centroid`][triwarp.triangles.centroid]
-    [`moments`][triwarp.triangles.moments]
+    [`centroid`][triwarp.totals.surface_centroid]
+    [`moments`][triwarp.totals.moments]
     ``igl.barycenter``
     """
     n_faces = int(faces.shape[0]) // 3
@@ -209,189 +206,66 @@ def face_centroids(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp
     return out_centroids
 
 
-def centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.vec3:
+def face_signed_volumes(
+    vertices: wp.array[wp.vec3] | wp.array[wp.vec3d],
+    faces: wp.array[wp.int32],
+    apex: wp.vec3 | wp.vec3d | None = None,
+) -> wp.array[wp.float32] | wp.array[wp.float64]:
     """
-    Area-weighted centroid of the mesh surface.
+    Signed volume of the tetrahedron ``(apex, v0, v1, v2)`` for each face.
+
+    ``dot(v0 - apex, cross(v1 - apex, v2 - apex)) / 6``, so the sign follows the face's winding:
+    positive where the face turns its front to the apex. Summed over a closed, consistently wound
+    surface this is the enclosed volume ([`volume`][triwarp.totals.volume]) and is independent of
+    ``apex``; per face it is not, which is why the argument exists —
+    [`sample_volume`][triwarp.sample.sample_volume] fans from the surface centroid so that every
+    tetrahedron is positive on a star-shaped mesh, and uses the array as a cumulative distribution.
 
     Parameters
     ----------
     vertices
-        ``(n_vertices,)`` mesh vertex positions.
+        ``(n_vertices,)`` positions, ``wp.vec3`` or ``wp.vec3d``. The output dtype follows: pass
+        ``vec3d`` where the sum's low digits matter, as
+        [`filter_laplacian`][triwarp.smoothing.filter_laplacian]'s volume constraint does.
     faces
         Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    apex
+        Common apex of every tetrahedron, in ``vertices``' dtype. ``None`` (the default) means the
+        world origin, which is what every whole-mesh volume wants.
 
     Returns
     -------
-    wp.vec3
-        Area-weighted mean of per-face centroids. All-``NaN`` when ``faces`` is empty.
+    wp.array[wp.float32] | wp.array[wp.float64]
+        ``(n_faces,)`` signed volumes on ``vertices.device``, in ``vertices``' scalar type. Empty
+        when ``faces`` is empty.
 
     See Also
     --------
-    [`trimesh.Trimesh.centroid`][]
-    """
-    f = faces.shape[0] // 3
-    if f == 0:
-        return wp.vec3(float("nan"), float("nan"), float("nan"))
-    device = vertices.device
-    out_centroid = wp.zeros(3, dtype=wp.float32, device=device)
-    out_total_area = wp.zeros(1, dtype=wp.float32, device=device)
-    if prefers_tiled_reduction(device):
-        wp.launch_tiled(
-            kernel_triangles.centroid_tiled,
-            dim=[(f + TILE_1D - 1) // TILE_1D],
-            inputs=[vertices, faces, wp.int32(f), out_centroid, out_total_area],
-            block_dim=TILE_1D,
-            device=device,
-        )
-    else:
-        per_slice = items_per_slice(device)
-        n_slices = max(1, (f + per_slice - 1) // per_slice)
-        wp.launch(
-            kernel_triangles.centroid_sliced,
-            dim=n_slices,
-            inputs=[vertices, faces, wp.int32(f), wp.int32(n_slices), out_centroid, out_total_area],
-            device=device,
-        )
-    # Two unavoidable readbacks: the return type is a host-side wp.vec3, so the sums have to
-    # cross to the host to be divided.
-    centroid = out_centroid.numpy()
-    total_area = float(out_total_area.numpy()[0])
-    return wp.vec3(
-        float(centroid[0]) / total_area,
-        float(centroid[1]) / total_area,
-        float(centroid[2]) / total_area,
-    )
-
-
-def volume(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> float:
-    """
-    Signed volume enclosed by the mesh.
-
-    Sum of per-face signed tetrahedron volumes measured from the origin
-    (``dot(v0, cross(v1, v2)) / 6``); for a closed, consistently wound surface this is
-    independent of the reference point, and its sign follows the orientation of the face
-    normals (positive for outward-facing normals). For an open or inconsistently wound mesh
-    the result is not a meaningful volume.
-
-    Parameters
-    ----------
-    vertices
-        ``(n_vertices,)`` mesh vertex positions.
-    faces
-        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
-
-    Returns
-    -------
-    float
-        Signed volume in ``float32``. ``0.0`` for an empty mesh.
-
-    See Also
-    --------
-    [`centroid`][triwarp.triangles.centroid]
+    [`volume`][triwarp.totals.volume]
+        The sum of these over the whole mesh.
     [`is_volume`][triwarp.validation.is_volume]
-    [`trimesh.Trimesh.volume`][]
+        Whether that sum is a meaningful volume at all.
+    [`face_centroids`][triwarp.triangles.face_centroids]
     """
     n_faces = int(faces.shape[0]) // 3
-    if n_faces == 0:
-        return 0.0
     device = vertices.device
-    volumes = wp.empty(n_faces, dtype=wp.float32, device=device)
+    scalar = wp.float64 if vertices.dtype is wp.vec3d else wp.float32
+    volumes = wp.empty(n_faces, dtype=scalar, device=device)
+    if n_faces == 0:
+        return volumes
+    if apex is None:
+        apex = (
+            wp.vec3d(wp.float64(0.0), wp.float64(0.0), wp.float64(0.0))
+            if vertices.dtype is wp.vec3d
+            else wp.vec3(0.0, 0.0, 0.0)
+        )
     wp.launch(
-        kernel_triangles.signed_tet_volumes,
+        kernel_triangles.face_signed_volumes,
         dim=n_faces,
-        inputs=[vertices, faces, wp.vec3(0.0, 0.0, 0.0), volumes],
+        inputs=[vertices, faces, apex, volumes],
         device=device,
     )
-    return tw.reduce.sum(volumes)
-
-
-def moments(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
-) -> tuple[float, wp.vec3, np.ndarray]:
-    """
-    Mass properties of the solid bounded by the mesh: volume, centre of mass and inertia tensor.
-
-    Integrates over the enclosed solid at unit density by summing the contribution of every
-    (origin, face) tetrahedron, so the result is only meaningful for a **closed, consistently
-    wound** surface -- the same precondition [`volume`][triwarp.triangles.volume] carries, and
-    [`is_volume`][triwarp.validation.is_volume] is the check for it.
-
-    The integrals accumulate in ``float64`` even though the positions are ``float32``: the second
-    moments scale as ``length ** 5``, so a ``float32`` sum loses their low digits on any sizeable
-    mesh.
-
-    Parameters
-    ----------
-    vertices
-        ``(n_vertices,)`` mesh vertex positions.
-    faces
-        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
-
-    Returns
-    -------
-    volume : float
-        Signed volume, identical to [`volume`][triwarp.triangles.volume] up to its ``float32``
-        accumulation.
-    center_of_mass : wp.vec3
-        Volume centroid, i.e. the first moment divided by the volume. This is **not**
-        [`centroid`][triwarp.triangles.centroid], the area-weighted centre of the *surface*; the two
-        differ on any solid whose mass is not distributed like its shell.
-    inertia : numpy.ndarray
-        ``(3, 3)`` inertia tensor about the centre of mass, at unit density.
-
-    Notes
-    -----
-    ``igl.moments`` returns ``(m0, m1, m2)`` where ``m1`` is the first moment -- the centre of mass
-    times the mass -- rather than the centre of mass itself, and ``m2`` is already referred to the
-    centre of mass (verified against a translated mesh, not assumed). This function returns the
-    decoded forms, so the transform between the two is ``m1 / m0``.
-
-    Three host readbacks are unavoidable here: all three returns are host-side values, so the ten
-    accumulated sums have to cross the device boundary to be combined.
-
-    See Also
-    --------
-    [`volume`][triwarp.triangles.volume]
-    [`centroid`][triwarp.triangles.centroid]
-    [`is_volume`][triwarp.validation.is_volume]
-    [`trimesh.Trimesh.moment_inertia`][]
-    ``igl.moments``
-    """
-    device = vertices.device
-    n_faces = int(faces.shape[0]) // 3
-    if n_faces == 0:
-        return 0.0, wp.vec3(float("nan"), float("nan"), float("nan")), np.zeros((3, 3))
-
-    volumes = wp.empty(n_faces, dtype=wp.float64, device=device)
-    first = wp.empty(n_faces, dtype=wp.vec3d, device=device)
-    squares = wp.empty(n_faces, dtype=wp.vec3d, device=device)
-    products = wp.empty(n_faces, dtype=wp.vec3d, device=device)
-    wp.launch(
-        kernel_triangles.moment_integrands,
-        dim=n_faces,
-        inputs=[vertices, faces, volumes, first, squares, products],
-        device=device,
-    )
-
-    # Three readbacks, one per accumulated group: every return is a host-side value.
-    total_volume = float(wp.utils.array_sum(volumes))
-    first_moment = first.numpy().sum(axis=0)
-    integral_squares = squares.numpy().sum(axis=0)
-    integral_products = products.numpy().sum(axis=0)
-
-    center = first_moment / total_volume if total_volume != 0.0 else np.full(3, np.nan)
-
-    # Inertia about the origin from the raw integrals, then shifted to the centre of mass.
-    x2, y2, z2 = integral_squares
-    xy, xz, yz = integral_products
-    inertia = np.array(
-        [[y2 + z2, -xy, -xz], [-xy, x2 + z2, -yz], [-xz, -yz, x2 + y2]], dtype=np.float64
-    )
-    if total_volume != 0.0:
-        shift = total_volume * (float(center @ center) * np.eye(3) - np.outer(center, center))
-        inertia = inertia - shift
-
-    return total_volume, wp.vec3(*center.tolist()), inertia
+    return volumes
 
 
 def nondegenerate(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array[wp.bool]:

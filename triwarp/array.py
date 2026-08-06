@@ -267,6 +267,11 @@ def concatenate(arrays: Sequence[wp.array[DType]]) -> wp.array[DType]:
     See Also
     --------
     [`pack_1d_arrays`][triwarp.array.pack_1d_arrays]
+    [`concatenate`][triwarp.combine.concatenate]
+        The mesh-level operation of the same name, which joins ``(vertices, faces)`` pairs and
+        reindexes as it goes. Both names are required: this one mirrors
+        [`numpy.concatenate`][], that one [`trimesh.util.concatenate`][].
+    [`numpy.concatenate`][]
     """
     if len(arrays) == 0:
         raise ValueError("arrays must be non-empty")

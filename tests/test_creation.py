@@ -673,7 +673,7 @@ def test_annulus(device: str) -> None:
     _assert_same_faces(vertices_wp, faces_wp, tm.creation.annulus(0.5, 1.0, height=2.0))
     # The closing point of the annulus profile has to collapse, or the inner-wall seam stays open.
     _assert_closed(vertices_wp, faces_wp)
-    assert tw.validation.euler_characteristic(faces_wp) == 0
+    assert tw.totals.euler_characteristic(faces_wp) == 0
 
 
 def test_annulus_zero_inner_radius_is_a_cylinder(device: str) -> None:
