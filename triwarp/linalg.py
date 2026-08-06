@@ -458,7 +458,7 @@ def solve_spd_columns(
     an RTX 5090, and they disagree, so read the one that matches the caller:
 
     - **Cold single solves** — one ``cg`` call from a zero initial guess, the shape
-      ``harmonic`` / ``tutte`` / ``position_verts_smoothly`` take. Measured on
+      ``harmonic`` / ``tutte`` / ``smooth_region`` take. Measured on
       `benchmarks/test_linalg.py`'s ``solve_spd_columns`` group, ``0`` against ``10``: 22.8 vs
       31.7 ms well-conditioned and 104.7 vs 154.1 ms ill-conditioned, **28-32 % faster on both**.
       This is the regime the default is set for.

@@ -976,13 +976,13 @@ def test_non_increasing_indices() -> None:
 
 
 # ---------------------------------------------------------------------------
-# fill_holes_nicely (MeshLib fillHoleNicely)
+# fill_holes_smooth (MeshLib fillHoleNicely)
 # ---------------------------------------------------------------------------
 
 
 def _skip_cpu(device: str) -> None:
     if wp.get_device(device).is_cpu:
-        pytest.skip("fill_holes_nicely subdivision/smoothing requires CUDA (warp.optim.linear.cg)")
+        pytest.skip("fill_holes_smooth subdivision/smoothing requires CUDA (warp.optim.linear.cg)")
 
 
 def _mesh_volume_area(vertices_np: np.ndarray, faces_np: np.ndarray) -> tuple[float, float]:
@@ -1008,12 +1008,12 @@ def _meshlib_fill_nicely_volume(
     return float(tm.Trimesh(verts, faces, process=False).volume)
 
 
-def test_fill_holes_nicely_invariants(device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+def test_fill_holes_smooth_invariants(device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     _skip_cpu(device)
     _, mesh_wp = hemisphere
     n_v0 = int(mesh_wp.points.shape[0])
 
-    new_vertices, new_faces, patch = tw.hole_filling.fill_holes_nicely(
+    new_vertices, new_faces, patch = tw.hole_filling.fill_holes_smooth(
         mesh_wp.points, mesh_wp.indices, return_patch=True
     )
     verts_np = new_vertices.numpy()
@@ -1028,9 +1028,9 @@ def test_fill_holes_nicely_invariants(device: str, hemisphere: tuple[tm.Trimesh,
     assert np.allclose(verts_np[:n_v0], mesh_wp.points.numpy(), atol=1e-6)
 
 
-def test_fill_holes_nicely_triangulate_only(device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+def test_fill_holes_smooth_triangulate_only(device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     _, mesh_wp = hemisphere
-    new_vertices, new_faces = tw.hole_filling.fill_holes_nicely(
+    new_vertices, new_faces = tw.hole_filling.fill_holes_smooth(
         mesh_wp.points, mesh_wp.indices, triangulate_only=True
     )
     expected_faces = tw.hole_filling.fill_holes_min_weight(mesh_wp.points, mesh_wp.indices)
@@ -1038,7 +1038,7 @@ def test_fill_holes_nicely_triangulate_only(device: str, hemisphere: tuple[tm.Tr
     assert np.array_equal(new_vertices.numpy(), mesh_wp.points.numpy())
 
 
-def test_fill_holes_nicely_statistics_vs_meshlib(
+def test_fill_holes_smooth_statistics_vs_meshlib(
     device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]
 ):
     _skip_cpu(device)
@@ -1048,7 +1048,7 @@ def test_fill_holes_nicely_statistics_vs_meshlib(
     faces_np = mesh_wp.indices.numpy().reshape(-1, 3)
     max_edge = 0.3
 
-    new_vertices, new_faces = tw.hole_filling.fill_holes_nicely(
+    new_vertices, new_faces = tw.hole_filling.fill_holes_smooth(
         mesh_wp.points, mesh_wp.indices, max_edge=max_edge
     )
     volume_tw, _ = _mesh_volume_area(new_vertices.numpy(), new_faces.numpy().reshape(-1, 3))
@@ -1056,7 +1056,7 @@ def test_fill_holes_nicely_statistics_vs_meshlib(
     assert np.isclose(volume_tw, volume_ml, rtol=0.05)
 
 
-def test_fill_holes_nicely_natural_smooth(device: str):
+def test_fill_holes_smooth_natural_smooth(device: str):
     _skip_cpu(device)
     sphere = tm.creation.icosphere(subdivisions=3, radius=1.0)
     hemi = sphere.slice_plane(
@@ -1069,31 +1069,31 @@ def test_fill_holes_nicely_natural_smooth(device: str):
     f_wp = wp.array(faces_np, dtype=wp.int32, device=device)
     n_v0 = len(vertices_np)
 
-    verts_off = tw.hole_filling.fill_holes_nicely(v_wp, f_wp, natural_smooth=False)[0].numpy()
-    verts_on = tw.hole_filling.fill_holes_nicely(v_wp, f_wp, natural_smooth=True)[0].numpy()
+    verts_off = tw.hole_filling.fill_holes_smooth(v_wp, f_wp, natural_smooth=False)[0].numpy()
+    verts_on = tw.hole_filling.fill_holes_smooth(v_wp, f_wp, natural_smooth=True)[0].numpy()
 
     # naturalSmooth grows a collar past the rim, so some original vertices move.
     disp = np.linalg.norm(verts_off[:n_v0] - verts_on[:n_v0], axis=1)
     assert int((disp > 1e-5).sum()) > 0
 
-    _, new_faces = tw.hole_filling.fill_holes_nicely(v_wp, f_wp, natural_smooth=True)
+    _, new_faces = tw.hole_filling.fill_holes_smooth(v_wp, f_wp, natural_smooth=True)
     mesh_tm = tm.Trimesh(verts_on, new_faces.numpy().reshape(-1, 3), process=False)
     assert mesh_tm.is_watertight
     assert mesh_tm.is_winding_consistent
 
 
-def test_fill_holes_nicely_watertight_unchanged(
+def test_fill_holes_smooth_watertight_unchanged(
     device: str, icosahedron: tuple[tm.Trimesh, wp.Mesh]
 ):
     _, mesh_wp = icosahedron
-    new_vertices, new_faces = tw.hole_filling.fill_holes_nicely(mesh_wp.points, mesh_wp.indices)
+    new_vertices, new_faces = tw.hole_filling.fill_holes_smooth(mesh_wp.points, mesh_wp.indices)
     assert np.array_equal(new_vertices.numpy(), mesh_wp.points.numpy())
     assert np.array_equal(new_faces.numpy(), mesh_wp.indices.numpy())
 
 
-def test_fill_holes_nicely_rejects_unknown(device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+def test_fill_holes_smooth_rejects_unknown(device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     _, mesh_wp = hemisphere
     with pytest.raises(ValueError, match="metric must be one of"):
-        tw.hole_filling.fill_holes_nicely(mesh_wp.points, mesh_wp.indices, metric="nope")
+        tw.hole_filling.fill_holes_smooth(mesh_wp.points, mesh_wp.indices, metric="nope")
     with pytest.raises(ValueError, match="edge_weights must be"):
-        tw.hole_filling.fill_holes_nicely(mesh_wp.points, mesh_wp.indices, edge_weights="nope")
+        tw.hole_filling.fill_holes_smooth(mesh_wp.points, mesh_wp.indices, edge_weights="nope")

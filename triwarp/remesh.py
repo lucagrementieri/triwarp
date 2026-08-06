@@ -1942,7 +1942,7 @@ def subdivide_region_to_size(
     --------
     [`subdivide_to_size`][triwarp.remesh.subdivide_to_size]
     [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay]
-    [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely]
+    [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth]
     """
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3

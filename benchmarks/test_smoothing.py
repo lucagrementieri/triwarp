@@ -561,9 +561,9 @@ def test_filter_two_step(bench_case: BenchCase) -> None:
     assert smoothed.shape == (n_vertices,)
 
 
-@pytest.mark.benchmark(group="filter_unsharp_mask")
+@pytest.mark.benchmark(group="filter_sharpen")
 @pytest.mark.benchlibs("triwarp", "pymeshlab")
-def test_filter_unsharp_mask(bench_case: BenchCase) -> None:
+def test_filter_sharpen(bench_case: BenchCase) -> None:
     """Five Laplacian passes plus one blend: the cheapest thing in the module, on the scan sweep."""
     n_vertices = bench_case.n_vertices
     if bench_case.kind == "pymeshlab":
@@ -580,7 +580,7 @@ def test_filter_unsharp_mask(bench_case: BenchCase) -> None:
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     operator = _laplacian_operator(bench_case)
     sharpened = bench_case.run(
-        lambda: tw.smoothing.filter_unsharp_mask(
+        lambda: tw.smoothing.filter_sharpen(
             vertices, faces, weight=0.3, iterations=5, laplacian_operator=operator
         )
     )

@@ -242,13 +242,13 @@ def test_stitch_min_weight_rejects_unknown_metric(device: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# stitch_nicely (MeshLib stitchHolesNicely)
+# stitch_smooth (MeshLib stitchHolesNicely)
 # ---------------------------------------------------------------------------
 
 
 def _skip_cpu(device: str) -> None:
     if wp.get_device(device).is_cpu:
-        pytest.skip("stitch_nicely subdivision/smoothing requires CUDA (warp.optim.linear.cg)")
+        pytest.skip("stitch_smooth subdivision/smoothing requires CUDA (warp.optim.linear.cg)")
 
 
 def _hemisphere_pair(device: str):
@@ -273,12 +273,12 @@ def _hemisphere_pair(device: str):
     return meshes[0], meshes[1]
 
 
-def test_stitch_nicely_watertight(device: str):
+def test_stitch_smooth_watertight(device: str):
     _skip_cpu(device)
     (va, fa), (vb, fb) = _hemisphere_pair(device)
     n_v0 = int(va.shape[0]) + int(vb.shape[0])
 
-    new_vertices, new_faces = tw.combine.stitch_nicely(va, fa, vb, fb)
+    new_vertices, new_faces = tw.combine.stitch_smooth(va, fa, vb, fb)
     verts_np = new_vertices.numpy()
     mesh_tm = tm.Trimesh(verts_np, new_faces.numpy().reshape(-1, 3), process=False)
 
@@ -289,7 +289,7 @@ def test_stitch_nicely_watertight(device: str):
     assert np.allclose(verts_np[:n_v0], np.concatenate([va.numpy(), vb.numpy()]), atol=1e-6)
 
 
-def test_stitch_nicely_requires_single_loop(device: str, icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+def test_stitch_smooth_requires_single_loop(device: str, icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     _, mesh_wp = icosahedron
     with pytest.raises(ValueError, match="exactly one boundary loop"):
-        tw.combine.stitch_nicely(mesh_wp.points, mesh_wp.indices, mesh_wp.points, mesh_wp.indices)
+        tw.combine.stitch_smooth(mesh_wp.points, mesh_wp.indices, mesh_wp.points, mesh_wp.indices)

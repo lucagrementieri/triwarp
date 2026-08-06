@@ -3,7 +3,7 @@ Assembling meshes from parts and splitting them back apart.
 
 [`concatenate`][triwarp.combine.concatenate] and [`split`][triwarp.combine.split] combine and
 decompose whole meshes by connected component. [`stitch`][triwarp.combine.stitch] (and its
-``_min_weight`` / ``_nicely`` variants) instead **joins two open meshes** across one boundary
+``_min_weight`` / ``_smooth`` variants) instead **joins two open meshes** across one boundary
 loop each into a single watertight seam — see [`triwarp.hole_filling`][triwarp.hole_filling] for
 the lower-level triangulation engines these build on, and for closing holes within a single mesh.
 """
@@ -344,7 +344,7 @@ def stitch_min_weight(
     )
 
 
-def stitch_nicely(
+def stitch_smooth(
     vertices_a: wp.array[wp.vec3],
     faces_a: wp.array[wp.int32],
     vertices_b: wp.array[wp.vec3],
@@ -369,7 +369,7 @@ def stitch_nicely(
 
     Like [`stitch_min_weight`][triwarp.combine.stitch_min_weight] but the connecting band is then
     subdivided and smoothed by the same finisher as
-    [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely]. Each mesh must have exactly one
+    [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth]. Each mesh must have exactly one
     boundary loop. The cross-boundary smooth solve is always applied (MeshLib forces ``smoothBd``).
 
     Parameters
@@ -384,21 +384,21 @@ def stitch_nicely(
     up_dir
         Up direction for the ``"vertical"`` stitch metric.
     triangulate_only
-        See [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely].
+        See [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth].
     max_edge
-        See [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely].
+        See [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth].
     max_edge_splits
-        See [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely].
+        See [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth].
     max_angle_change_after_flip
-        See [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely].
+        See [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth].
     smooth_curvature
-        See [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely].
+        See [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth].
     natural_smooth
-        See [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely].
+        See [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth].
     edge_weights
-        See [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely].
+        See [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth].
     return_patch
-        See [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely].
+        See [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth].
 
     Returns
     -------
@@ -417,7 +417,7 @@ def stitch_nicely(
     See Also
     --------
     [`stitch_min_weight`][triwarp.combine.stitch_min_weight]
-    [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely]
+    [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth]
 
     Notes
     -----
@@ -438,7 +438,7 @@ def stitch_nicely(
     ]
     if len(loops_a) != 1 or len(loops_b) != 1:
         raise ValueError(
-            "stitch_nicely requires each mesh to have exactly one boundary loop (>=3 verts); "
+            "stitch_smooth requires each mesh to have exactly one boundary loop (>=3 verts); "
             f"got {len(loops_a)} and {len(loops_b)}"
         )
 

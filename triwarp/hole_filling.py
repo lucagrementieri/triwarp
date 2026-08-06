@@ -34,15 +34,15 @@ with a band of bridge triangles via a greedy correspondence, producing a single 
 instead chooses the band that minimizes a stitch metric (the MeshLib ``stitchHoles`` grid DP).
 No smoothing or refinement is applied by these lower-level fillers.
 
-For a smooth, well-graded patch, [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely] and
-[`combine.stitch_nicely`][triwarp.combine.stitch_nicely] run the full MeshLib ``fillHoleNicely`` /
+For a smooth, well-graded patch, [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth] and
+[`combine.stitch_smooth`][triwarp.combine.stitch_smooth] run the full MeshLib ``fillHoleNicely`` /
 ``stitchHolesNicely`` pipeline on top of the min-weight fill/stitch: the patch is refined to a
 target edge length with Delaunay edge flips
 ([`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size]) and its new interior
 vertices are smoothed into the surrounding surface — a sharp-boundary umbrella solve
-([`position_verts_smoothly_sharp_boundary`][triwarp.smoothing.position_verts_smoothly_sharp_boundary])
+([`smooth_region_fixed_rim`][triwarp.smoothing.smooth_region_fixed_rim])
 followed by a cross-boundary least-squares solve
-([`position_verts_smoothly`][triwarp.smoothing.position_verts_smoothly]), with an optional
+([`smooth_region`][triwarp.smoothing.smooth_region]), with an optional
 ``natural_smooth`` collar that blends the patch into the neighbouring surface.
 """
 
@@ -1353,8 +1353,8 @@ def _finish_nicely(
 
     Ports MeshLib ``subdivideFillingNicely`` + ``smoothFillingNicely``.
 
-    Shared finisher of [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely] and
-    [`stitch_nicely`][triwarp.combine.stitch_nicely].
+    Shared finisher of [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth] and
+    [`stitch_smooth`][triwarp.combine.stitch_smooth].
     """
     device = faces.device
     vertices, faces, patch_face_mask = tw.remesh.subdivide_region_to_size(
@@ -1377,9 +1377,9 @@ def _finish_nicely(
     free = wp.empty(n, dtype=wp.bool, device=device)
     wp.map(kernel_array.mask_and_not, new_verts, bd_mask, out=free)
 
-    vertices = tw.smoothing.position_verts_smoothly_sharp_boundary(vertices, faces, free)
+    vertices = tw.smoothing.smooth_region_fixed_rim(vertices, faces, free)
     if smooth_boundary:
-        vertices = tw.smoothing.position_verts_smoothly(vertices, faces, free, edge_weights)
+        vertices = tw.smoothing.smooth_region(vertices, faces, free, edge_weights)
 
     if natural_smooth:
         edges_bd = tw.selection.region_boundary_edges(faces, patch_face_mask, n_vertices=n)
@@ -1392,8 +1392,8 @@ def _finish_nicely(
             bd_mask = _boundary_verts_mask(vertices, faces)
             free2 = wp.empty(n, dtype=wp.bool, device=device)
             wp.map(kernel_array.mask_and_not, incident, bd_mask, out=free2)
-            vertices = tw.smoothing.position_verts_smoothly_sharp_boundary(vertices, faces, free2)
-            vertices = tw.smoothing.position_verts_smoothly(vertices, faces, free2, edge_weights)
+            vertices = tw.smoothing.smooth_region_fixed_rim(vertices, faces, free2)
+            vertices = tw.smoothing.smooth_region(vertices, faces, free2, edge_weights)
 
     return vertices, faces, patch_face_mask
 
@@ -1407,7 +1407,7 @@ def _patch_mask(
     return wp.array(mask, dtype=wp.bool, device=device)
 
 
-def fill_holes_nicely(
+def fill_holes_smooth(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     metric: str = "plane_normalized",
@@ -1435,8 +1435,8 @@ def fill_holes_nicely(
     the patch is then subdivided to ``max_edge`` with Delaunay edge flips
     ([`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size]), and finally the new
     interior patch vertices are smoothed into the surrounding surface
-    ([`position_verts_smoothly_sharp_boundary`][triwarp.smoothing.position_verts_smoothly_sharp_boundary]
-    then [`position_verts_smoothly`][triwarp.smoothing.position_verts_smoothly]). Unlike the purely
+    ([`smooth_region_fixed_rim`][triwarp.smoothing.smooth_region_fixed_rim]
+    then [`smooth_region`][triwarp.smoothing.smooth_region]). Unlike the purely
     topological fillers, this produces a well-graded, curvature-continuous patch.
 
     Parameters
@@ -1494,7 +1494,7 @@ def fill_holes_nicely(
     See Also
     --------
     [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight]
-    [`stitch_nicely`][triwarp.combine.stitch_nicely]
+    [`stitch_smooth`][triwarp.combine.stitch_smooth]
     [`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size]
 
     Notes

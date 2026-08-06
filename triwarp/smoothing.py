@@ -8,14 +8,14 @@ Most of the module moves *geometry*: [`filter_laplacian`][triwarp.smoothing.filt
 [`filter_mut_dif_laplacian`][triwarp.smoothing.filter_mut_dif_laplacian] and
 [`filter_implicit_fairing`][triwarp.smoothing.filter_implicit_fairing] all diffuse vertex positions
 through the same row-stochastic 1-ring operator, differing in the time integration and in what they
-do to counteract shrinkage. [`position_verts_smoothly`][triwarp.smoothing.position_verts_smoothly]
+do to counteract shrinkage. [`smooth_region`][triwarp.smoothing.smooth_region]
 and its sharp-boundary variant instead solve a Dirichlet problem over a *region*, holding the rest
 of the mesh fixed.
 
 Three functions break that pattern by working on the *normal* field instead of positions, which is
 what lets them keep a crease sharp: [`filter_normals`][triwarp.smoothing.filter_normals] diffuses
 face normals with a crease gate, [`filter_two_step`][triwarp.smoothing.filter_two_step] then refits
-the vertices to them, and [`filter_unsharp_mask`][triwarp.smoothing.filter_unsharp_mask] runs the
+the vertices to them, and [`filter_sharpen`][triwarp.smoothing.filter_sharpen] runs the
 whole idea backwards to *sharpen*.
 
 The last two functions run the same operator over a per-vertex **scalar** field rather than
@@ -838,7 +838,7 @@ def _edge_weight_matrix(
     return wps.bsr_from_triplets(n, n, rows, cols, vals, prune_numerical_zeros=False)
 
 
-def position_verts_smoothly_sharp_boundary(
+def smooth_region_fixed_rim(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     free_mask: wp.array[wp.bool],
@@ -876,8 +876,8 @@ def position_verts_smoothly_sharp_boundary(
 
     See Also
     --------
-    [`position_verts_smoothly`][triwarp.smoothing.position_verts_smoothly]
-    [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely]
+    [`smooth_region`][triwarp.smoothing.smooth_region]
+    [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth]
 
     Notes
     -----
@@ -892,7 +892,7 @@ def position_verts_smoothly_sharp_boundary(
     free_map, n_free = tw.array.mask_to_index_map(free_mask)
     if n_free == 0:
         return out
-    require_cuda(device, "position_verts_smoothly_sharp_boundary")
+    require_cuda(device, "smooth_region_fixed_rim")
 
     weight_matrix = _edge_weight_matrix(vertices, faces, "unit")
     nnz = int(weight_matrix.nnz)
@@ -943,7 +943,7 @@ def position_verts_smoothly_sharp_boundary(
     return out
 
 
-def position_verts_smoothly(
+def smooth_region(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     free_mask: wp.array[wp.bool],
@@ -957,7 +957,7 @@ def position_verts_smoothly(
     umbrella equation ``p_v = Σ_d (w_vd / ΣW) p_d``; free vertices are unknowns and fixed
     neighbours move to the right-hand side. The normal equations ``(MᵀM) x = Mᵀ b`` are solved per
     coordinate, giving a patch that is smooth (C¹) *across* the region rim, unlike the sharp-rim
-    [`position_verts_smoothly_sharp_boundary`][triwarp.smoothing.position_verts_smoothly_sharp_boundary].
+    [`smooth_region_fixed_rim`][triwarp.smoothing.smooth_region_fixed_rim].
 
     Parameters
     ----------
@@ -984,8 +984,8 @@ def position_verts_smoothly(
 
     See Also
     --------
-    [`position_verts_smoothly_sharp_boundary`][triwarp.smoothing.position_verts_smoothly_sharp_boundary]
-    [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely]
+    [`smooth_region_fixed_rim`][triwarp.smoothing.smooth_region_fixed_rim]
+    [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth]
     """
     device = vertices.device
     n = int(vertices.shape[0])
@@ -995,7 +995,7 @@ def position_verts_smoothly(
     free_map, n_free = tw.array.mask_to_index_map(free_mask)
     if n_free == 0:
         return out
-    require_cuda(device, "position_verts_smoothly")
+    require_cuda(device, "smooth_region")
 
     row_mask = tw.selection.expand_vertex_mask(faces, free_mask, 1)
     row_map, n_rows = tw.array.mask_to_index_map(row_mask)
@@ -1406,7 +1406,7 @@ def filter_two_step(
     --------
     [`filter_normals`][triwarp.smoothing.filter_normals]
     [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
-    [`filter_unsharp_mask`][triwarp.smoothing.filter_unsharp_mask]
+    [`filter_sharpen`][triwarp.smoothing.filter_sharpen]
 
     Notes
     -----
@@ -1444,7 +1444,7 @@ def filter_two_step(
     return out
 
 
-def filter_unsharp_mask(
+def filter_sharpen(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     *,
@@ -1458,8 +1458,12 @@ def filter_unsharp_mask(
 
     The inverse of a smoothing filter, built from one: the difference between the mesh and its
     Laplacian-smoothed self *is* its high-frequency content, so adding a multiple of that difference
-    exaggerates every feature. MeshLab's ``apply_coord_unsharp_mask``, and the standard way to
-    recover crispness lost to an earlier smoothing or a decimation.
+    exaggerates every feature. This is **unsharp masking**, the photographic technique, applied to
+    vertex positions instead of pixels — MeshLab spells it ``apply_coord_unsharp_mask`` — and it is
+    the standard way to recover crispness lost to an earlier smoothing or a decimation.
+
+    The name says what it returns, which is *positions* rather than a mask: the ``*_mask`` family
+    in this package is boolean throughout.
 
     Parameters
     ----------

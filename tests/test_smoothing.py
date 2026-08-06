@@ -231,8 +231,8 @@ def test_filter_taubin_matches_pymeshlab(device: str, steps: int) -> None:
 
 
 @pytest.mark.parametrize("iterations", [1, 5])
-@pytest.mark.parity("filter_unsharp_mask", "pymeshlab")
-def test_filter_unsharp_mask_matches_pymeshlab(device: str, iterations: int) -> None:
+@pytest.mark.parity("filter_sharpen", "pymeshlab")
+def test_filter_sharpen_matches_pymeshlab(device: str, iterations: int) -> None:
     """
     Class B: exact under the same operator substitution as the Laplacian test above.
 
@@ -254,7 +254,7 @@ def test_filter_unsharp_mask_matches_pymeshlab(device: str, iterations: int) -> 
     meshset_pml = trimesh_to_pymeshlab(mesh_tm)
     meshset_pml.apply_coord_unsharp_mask(weight=0.3, weightorig=1.0, iterations=iterations)
 
-    sharpened_wp = tw.smoothing.filter_unsharp_mask(
+    sharpened_wp = tw.smoothing.filter_sharpen(
         mesh_wp.points,
         mesh_wp.indices,
         weight=0.3,
@@ -435,7 +435,7 @@ def _sphere_region(subdivisions: int = 2, z_cut: float = 0.5):
     return vertices, faces, free
 
 
-def test_position_verts_smoothly_sharp_boundary_matches_meshlib(device: str):
+def test_smooth_region_fixed_rim_matches_meshlib(device: str):
     if wp.get_device(device).is_cpu:
         pytest.skip("region smoothing requires a CUDA device (warp.optim.linear.cg)")
     vertices_np, faces_np, free_np = _sphere_region()
@@ -443,7 +443,7 @@ def test_position_verts_smoothly_sharp_boundary_matches_meshlib(device: str):
     f_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
     free_wp = wp.array(free_np, dtype=wp.bool, device=device)
 
-    result_wp = tw.smoothing.position_verts_smoothly_sharp_boundary(v_wp, f_wp, free_wp)
+    result_wp = tw.smoothing.smooth_region_fixed_rim(v_wp, f_wp, free_wp)
 
     mesh_ml = _mn.meshFromFacesVerts(faces_np, vertices_np.astype(np.float32))
     params_ml = _mm.PositionVertsSmoothlyParams()
@@ -456,7 +456,7 @@ def test_position_verts_smoothly_sharp_boundary_matches_meshlib(device: str):
 
 
 @pytest.mark.parametrize("edge_weights", ["cotan", "unit"])
-def test_position_verts_smoothly_matches_meshlib(device: str, edge_weights: str):
+def test_smooth_region_matches_meshlib(device: str, edge_weights: str):
     if wp.get_device(device).is_cpu:
         pytest.skip("region smoothing requires a CUDA device (warp.optim.linear.cg)")
     vertices_np, faces_np, free_np = _sphere_region()
@@ -464,7 +464,7 @@ def test_position_verts_smoothly_matches_meshlib(device: str, edge_weights: str)
     f_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
     free_wp = wp.array(free_np, dtype=wp.bool, device=device)
 
-    result_wp = tw.smoothing.position_verts_smoothly(v_wp, f_wp, free_wp, edge_weights=edge_weights)
+    result_wp = tw.smoothing.smooth_region(v_wp, f_wp, free_wp, edge_weights=edge_weights)
 
     mesh_ml = _mn.meshFromFacesVerts(faces_np, vertices_np.astype(np.float32))
     ew_ml = _mm.EdgeWeights.Cotan if edge_weights == "cotan" else _mm.EdgeWeights.Unit
@@ -475,7 +475,7 @@ def test_position_verts_smoothly_matches_meshlib(device: str, edge_weights: str)
     assert np.array_equal(result_wp.numpy()[~free_np], v_wp.numpy()[~free_np])
 
 
-def test_position_verts_sharp_boundary_dirichlet_residual(device: str):
+def test_smooth_region_fixed_rim_dirichlet_residual(device: str):
     if wp.get_device(device).is_cpu:
         pytest.skip("region smoothing requires a CUDA device (warp.optim.linear.cg)")
     vertices_np, faces_np, free_np = _sphere_region()
@@ -483,7 +483,7 @@ def test_position_verts_sharp_boundary_dirichlet_residual(device: str):
     f_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
     free_wp = wp.array(free_np, dtype=wp.bool, device=device)
 
-    result = tw.smoothing.position_verts_smoothly_sharp_boundary(v_wp, f_wp, free_wp).numpy()
+    result = tw.smoothing.smooth_region_fixed_rim(v_wp, f_wp, free_wp).numpy()
 
     # Umbrella (unit-weight) residual: deg(v) * p_v - sum_neighbors p_d == 0 for every free vertex.
     adjacency: dict[int, list[int]] = {}
@@ -499,12 +499,12 @@ def test_position_verts_sharp_boundary_dirichlet_residual(device: str):
     assert max_residual < 1e-4
 
 
-def test_position_verts_smoothly_empty_region(device: str):
+def test_smooth_region_empty_region(device: str):
     vertices_np, faces_np, _ = _sphere_region()
     v_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
     f_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
     empty = wp.zeros(len(vertices_np), dtype=wp.bool, device=device)
-    result = tw.smoothing.position_verts_smoothly_sharp_boundary(v_wp, f_wp, empty)
+    result = tw.smoothing.smooth_region_fixed_rim(v_wp, f_wp, empty)
     assert np.array_equal(result.numpy(), v_wp.numpy())
 
 
@@ -886,7 +886,7 @@ def test_filter_two_step_empty(device: str) -> None:
     assert tw.smoothing.filter_two_step(vertices_wp, faces_wp).shape == (0,)
 
 
-def test_filter_unsharp_mask_amplifies_detail(device: str) -> None:
+def test_filter_sharpen_amplifies_detail(device: str) -> None:
     """Sharpening inverts smoothing, so it must move the mesh *away* from its smooth self."""
     sphere_tm = tm.creation.icosphere(subdivisions=3)
     rng = np.random.default_rng(4)
@@ -908,7 +908,7 @@ def test_filter_unsharp_mask_amplifies_detail(device: str) -> None:
         .astype(np.float64)
     )
     sharpened_np = (
-        tw.smoothing.filter_unsharp_mask(vertices_wp, faces_wp, weight=0.5, iterations=5)
+        tw.smoothing.filter_sharpen(vertices_wp, faces_wp, weight=0.5, iterations=5)
         .numpy()
         .astype(np.float64)
     )
@@ -919,15 +919,15 @@ def test_filter_unsharp_mask_amplifies_detail(device: str) -> None:
     assert np.abs(sharpened_np - smoothed_np).max() > np.abs(bumpy_np - smoothed_np).max()
 
 
-def test_filter_unsharp_mask_zero_weight_is_the_identity(
+def test_filter_sharpen_zero_weight_is_the_identity(
     icosahedron: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:
     _mesh_tm, mesh_wp = icosahedron
-    out_wp = tw.smoothing.filter_unsharp_mask(mesh_wp.points, mesh_wp.indices, weight=0.0)
+    out_wp = tw.smoothing.filter_sharpen(mesh_wp.points, mesh_wp.indices, weight=0.0)
     assert np.allclose(out_wp.numpy(), mesh_wp.points.numpy(), rtol=1e-6, atol=1e-6)
 
 
-def test_filter_unsharp_mask_empty(device: str) -> None:
+def test_filter_sharpen_empty(device: str) -> None:
     vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
-    assert tw.smoothing.filter_unsharp_mask(vertices_wp, faces_wp).shape == (0,)
+    assert tw.smoothing.filter_sharpen(vertices_wp, faces_wp).shape == (0,)

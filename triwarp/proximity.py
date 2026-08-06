@@ -335,7 +335,7 @@ def signed_distance_on_mesh(
 def winding_number(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
-    query_points: wp.array[wp.vec3],
+    points: wp.array[wp.vec3],
     *,
     tiled: bool = True,
 ) -> wp.array[wp.float32]:
@@ -352,7 +352,7 @@ def winding_number(
         ``(n,)`` mesh vertex positions as ``wp.vec3``.
     faces
         ``(f * 3,)`` flat triangle index array as ``wp.int32``.
-    query_points
+    points
         ``(m,)`` query positions in space as ``wp.vec3``.
     tiled
         When ``True`` (default), sum solid angles with the face list partitioned across
@@ -368,8 +368,8 @@ def winding_number(
     wp.array[wp.float32]
         ``(m,)`` winding numbers in ``float32``.
     """
-    device = query_points.device
-    n_queries = int(query_points.shape[0])
+    device = points.device
+    n_queries = int(points.shape[0])
     n_faces = int(faces.shape[0]) // 3
     if n_queries == 0:
         return wp.empty(0, dtype=wp.float32, device=device)
@@ -391,7 +391,7 @@ def winding_number(
                 faces,
                 wp.int32(n_faces),
                 wp.int32(n_face_slices),
-                query_points,
+                points,
                 out_winding,
             ],
             device=device,
@@ -400,7 +400,7 @@ def winding_number(
         wp.launch(
             kernel_proximity.winding_number,
             dim=n_queries,
-            inputs=[vertices, faces, wp.int32(n_faces), query_points, out_winding],
+            inputs=[vertices, faces, wp.int32(n_faces), points, out_winding],
             device=device,
         )
     return out_winding
