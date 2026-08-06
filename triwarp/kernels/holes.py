@@ -392,7 +392,7 @@ def fill_dp_span(
     #
     # This is the **CPU** engine and the tie-break reference; CUDA runs
     # :func:`fill_dp_span_tiled`, which must agree with it apex for apex (see
-    # ``tests/test_hole_filling.py::test_fill_dp_span_tiled_matches_serial``).
+    # ``tests/test_holes.py::test_fill_dp_span_tiled_matches_serial``).
     ell, i = wp.tid()
     if active[ell] == 0:
         return

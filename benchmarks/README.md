@@ -50,7 +50,7 @@ four are kept in their modules as worked examples of what the axis rule is for:
   `fix_winding`) while it propagated its Z2 bits one launch per graph level. Solving them with a
   parity-carrying union-find instead makes it depth-independent: **0.92 ms and 0.77 ms**, a win
   over trimesh at both ends. `repair.make_winding_consistent` inherited the fix.
-- **`hole_filling.fill_holes_min_weight`** was *inverted*: 512 three-vertex holes cost 376 ms
+- **`holes.fill_min_weight`** was *inverted*: 512 three-vertex holes cost 376 ms
   against 273 ms for two 512-vertex rims, i.e. the trivial case cost more than the `B³` one,
   because each hole paid its own readbacks, chord pass and span launches. Batching the interval DP
   across loops took it to **4.2 ms**, and dropped the two-rim point to 157 ms by running both rims
@@ -392,7 +392,7 @@ The rest are second or third independent implementations:
 | `test_edges` | `get_geometric_measures()['avg_edge_length']` |
 | `test_heat_distance` | `compute_scalar_by_heat_geodesic_distance_from_selection_per_vertex` — the fourth heat-method implementation, and the only one whose amortized path is just "call it twice"; plus `..._geodesic_distance_from_given_point_...` as a non-PDE alternative |
 | `test_graph` | `compute_selection_by_small_disconnected_components_per_face(nbfaceratio=0.0)` |
-| `test_hole_filling` | `meshing_close_holes` (ear clipping, so **1.7×** across `loops_dp` against triwarp's 37× — the price of *not* running a `B³` DP) |
+| `test_holes` | `meshing_close_holes` (ear clipping, so **1.7×** across `loops_dp` against triwarp's 37× — the price of *not* running a `B³` DP) |
 | `test_parametrization` | `compute_texcoord_parametrization_harmonic` / `..._least_squares_conformal_maps` — both wrap **libigl's own code**, so they price MeshLab's wrapper rather than a third algorithm |
 | `test_points` | `compute_normal_for_point_clouds(k=)`, `compute_matrix_by_fitting_to_plane` |
 | `test_reconstruction` | `generate_surface_reconstruction_ball_pivoting` (VCGlib's original BPA) and `..._screened_poisson` (Kazhdan's own code, the same one open3d wraps) |
@@ -743,7 +743,7 @@ millisecond.
 | `test_smoothing` | `filter_smooth_laplacian` (`novol` only) |
 | `test_sample` | `sample_points_poisson_disk` |
 | `test_combine` | `cluster_connected_triangles` + `select_by_index` (`split` only) |
-| `test_hole_filling` | `open3d.t.geometry.TriangleMesh.fill_holes` |
+| `test_holes` | `open3d.t.geometry.TriangleMesh.fill_holes` |
 | `test_repair` | `remove_duplicated_triangles`, `remove_duplicated_vertices` |
 | `test_validation` | `is_watertight` |
 | `test_vertices` | `compute_vertex_normals` |
@@ -771,5 +771,5 @@ before/after self-comparisons.
 
 Where the reference is not algorithmically identical, the module docstring says so — `test_repair`
 (open3d's dedup is orientation-sensitive), `test_sample` (count- vs radius-parametrized),
-`test_hole_filling` and `test_smoothing` (different algorithms for the same task), `test_convex`
+`test_holes` and `test_smoothing` (different algorithms for the same task), `test_convex`
 (approximate vs exact).

@@ -945,7 +945,7 @@ def remove_folded_faces(
     rather than genuinely folded geometry. Deletion is the choice the rest of this module makes (see
     [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces] and
     [`remove_non_manifold_faces`][triwarp.repair.remove_non_manifold_faces]), and it leaves a hole
-    that [`triwarp.hole_filling`][triwarp.hole_filling] can retriangulate properly.
+    that [`triwarp.holes`][triwarp.holes] can retriangulate properly.
     """
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:

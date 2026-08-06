@@ -7,12 +7,12 @@ Every boundary of a triangle mesh is an ordered vertex loop
 of ``B`` vertices is sealed with a purely topological triangulation — **no smoothing or
 refinement**:
 
-- [`fill_holes_fan`][triwarp.hole_filling.fill_holes_fan] fans ``B - 2`` triangles from the loop's
+- [`fill_fan`][triwarp.holes.fill_fan] fans ``B - 2`` triangles from the loop's
   first vertex, reusing only existing vertices (``trimesh.repair.fill_holes(use_fan=True)``).
-- [`fill_holes_cone`][triwarp.hole_filling.fill_holes_cone] inserts one centroid vertex per hole
+- [`fill_cone`][triwarp.holes.fill_cone] inserts one centroid vertex per hole
   and cones ``B`` triangles onto it (``igl::topological_hole_fill``,
   ``trimesh.repair.stitch(insert_vertices=True)``).
-- [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight] instead computes the
+- [`fill_min_weight`][triwarp.holes.fill_min_weight] instead computes the
   **minimum-weight triangulation** of each loop (the Liepa/Klincsek interval DP ported from
   MeshLib's ``fillHole``): the ``B - 2`` triangles over the existing loop vertices that minimize a
   geometric metric (plane-normalized circumcircle by default, with a min-area fallback), avoiding
@@ -32,7 +32,7 @@ the loop-level engines [`stitch_loops`][triwarp.combine.stitch_loops] and
 module is the minimum-weight machinery: the same interval DP, the same rim bookkeeping and the same
 metric vocabulary, applied to a band between two rims rather than a cap over one.
 
-For a smooth, well-graded patch, [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth] and
+For a smooth, well-graded patch, [`fill_smooth`][triwarp.holes.fill_smooth] and
 [`combine.stitch_smooth`][triwarp.combine.stitch_smooth] run the full MeshLib ``fillHoleNicely`` /
 ``stitchHolesNicely`` pipeline on top of the min-weight fill/stitch: the patch is refined to a
 target edge length with Delaunay edge flips
@@ -53,7 +53,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.kernels import hole_filling as kernel_hole_filling
+from triwarp.kernels import holes as kernel_holes
 
 
 class _PackedLoops:
@@ -160,7 +160,7 @@ def _loop_perimeters(vertices: wp.array[wp.vec3], loops: _PackedLoops) -> np.nda
     """Measure the closed arc length of every packed loop (one launch, one readback)."""
     perimeter = wp.zeros(loops.n_loops, dtype=wp.float32, device=loops.device)
     wp.launch(
-        kernel_hole_filling.loop_perimeters,
+        kernel_holes.loop_perimeters,
         dim=loops.total,
         inputs=[loops.flat_loops, loops.loop_id, loops.starts, loops.sizes, vertices, perimeter],
         device=loops.device,
@@ -173,7 +173,7 @@ def _unpack_loops(loops: _PackedLoops) -> list[wp.array[wp.int32]]:
     return [loops.flat_loops[loops.loop_slice(index)] for index in range(loops.n_loops)]
 
 
-def fill_holes_fan(
+def fill_fan(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], preserve_largest_hole: bool = False
 ) -> wp.array[wp.int32]:
     """
@@ -204,7 +204,7 @@ def fill_holes_fan(
 
     See Also
     --------
-    [`fill_holes_cone`][triwarp.hole_filling.fill_holes_cone]
+    [`fill_cone`][triwarp.holes.fill_cone]
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
 
@@ -224,7 +224,7 @@ def fill_holes_fan(
     n_tri = total - 2 * n_loops
     fill_faces = wp.empty(3 * n_tri, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_hole_filling.fan_faces,
+        kernel_holes.fan_faces,
         dim=n_loops,
         inputs=[flat_loops, loop_starts, wp.int32(total), wp.int32(n_loops), fill_faces],
         device=device,
@@ -232,7 +232,7 @@ def fill_holes_fan(
     return tw.array.concatenate([faces, fill_faces])
 
 
-def fill_holes_cone(
+def fill_cone(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], preserve_largest_hole: bool = False
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
@@ -241,7 +241,7 @@ def fill_holes_cone(
     A boundary loop of ``B`` vertices is sealed with ``B`` triangles fanning from one new vertex
     placed at the loop's centroid (``igl::topological_hole_fill``,
     ``trimesh.repair.stitch(insert_vertices=True)``). Unlike
-    [`fill_holes_fan`][triwarp.hole_filling.fill_holes_fan] this appends one vertex per hole, so
+    [`fill_fan`][triwarp.holes.fill_fan] this appends one vertex per hole, so
     the vertex buffer grows.
 
     Parameters
@@ -266,7 +266,7 @@ def fill_holes_cone(
 
     See Also
     --------
-    [`fill_holes_fan`][triwarp.hole_filling.fill_holes_fan]
+    [`fill_fan`][triwarp.holes.fill_fan]
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
 
@@ -287,7 +287,7 @@ def fill_holes_cone(
 
     centroids = wp.empty(n_loops, dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_hole_filling.loop_centroids,
+        kernel_holes.loop_centroids,
         dim=n_loops,
         inputs=[vertices, flat_loops, loop_starts, wp.int32(total), wp.int32(n_loops), centroids],
         device=device,
@@ -295,7 +295,7 @@ def fill_holes_cone(
 
     fill_faces = wp.empty(3 * total, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_hole_filling.cone_faces,
+        kernel_holes.cone_faces,
         dim=n_loops,
         inputs=[
             flat_loops,
@@ -311,7 +311,7 @@ def fill_holes_cone(
 
 
 # Fill-metric name -> kernel selector (must match the METRIC_* constants in
-# kernels/hole_filling.py).
+# kernels/holes.py).
 _METRIC_IDS = {
     "plane_normalized": 0,
     "min_area": 1,
@@ -352,10 +352,7 @@ class _EdgeTable:
 
         self.thirds = wp.empty(n_rows, dtype=wp.int32, device=device)
         wp.launch(
-            kernel_hole_filling.edge_third_vertex,
-            dim=n_rows,
-            inputs=[faces, self.thirds],
-            device=device,
+            kernel_holes.edge_third_vertex, dim=n_rows, inputs=[faces, self.thirds], device=device
         )
 
         keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices)
@@ -369,7 +366,7 @@ class _EdgeTable:
         positions = wp.empty(loops.total, dtype=wp.vec3, device=self.device)
         valid = wp.empty(loops.total, dtype=wp.int32, device=self.device)
         wp.launch(
-            kernel_hole_filling.rim_opposite_from_table,
+            kernel_holes.rim_opposite_from_table,
             dim=loops.total,
             inputs=[
                 loops.flat_loops,
@@ -399,14 +396,14 @@ class _EdgeTable:
         """
         slot = wp.full(self.n_vertices, -1, dtype=wp.int32, device=self.device)
         wp.launch(
-            kernel_hole_filling.scatter_loop_positions,
+            kernel_holes.scatter_loop_positions,
             dim=loops.total,
             inputs=[loops.flat_loops, slot],
             device=self.device,
         )
         mask = wp.zeros(loops.dp_total, dtype=wp.int32, device=self.device)
         wp.launch(
-            kernel_hole_filling.mark_forbidden_chords,
+            kernel_holes.mark_forbidden_chords,
             dim=int(self.edges_sorted.shape[0]),
             inputs=[
                 self.edges_sorted,
@@ -454,7 +451,7 @@ def _run_hole_dp(
     if tiled is None:
         tiled = not wp.get_device(device).is_cpu
     wp.launch(
-        kernel_hole_filling.init_dp_base,
+        kernel_holes.init_dp_base,
         dim=(loops.n_loops, loops.max_size),
         inputs=[loops.sizes, loops.dp_offsets, active, dp, prev],
         device=device,
@@ -481,14 +478,14 @@ def _run_hole_dp(
         dim = (loops.n_loops, loops.max_size - span)
         if tiled:
             wp.launch_tiled(
-                kernel_hole_filling.fill_dp_span_tiled,
+                kernel_holes.fill_dp_span_tiled,
                 dim=dim,
                 inputs=inputs,
-                block_dim=kernel_hole_filling.HOLE_DP_BLOCK,
+                block_dim=kernel_holes.HOLE_DP_BLOCK,
                 device=device,
             )
         else:
-            wp.launch(kernel_hole_filling.fill_dp_span, dim=dim, inputs=inputs, device=device)
+            wp.launch(kernel_holes.fill_dp_span, dim=dim, inputs=inputs, device=device)
 
 
 def _traceback_triangles(prev_np: np.ndarray, loop_np: np.ndarray) -> list[tuple[int, int, int]]:
@@ -514,7 +511,7 @@ def _traceback_triangles(prev_np: np.ndarray, loop_np: np.ndarray) -> list[tuple
     return triangles
 
 
-def fill_holes_min_weight(
+def fill_min_weight(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     metric: str = "plane_normalized",
@@ -528,8 +525,8 @@ def fill_holes_min_weight(
     Ports MeshLib's ``fillHole`` (the classic Liepa/Klincsek interval dynamic program): each
     boundary loop of ``B`` vertices is sealed with the ``B - 2`` triangles that minimize a geometric
     metric, reusing only existing vertices (the vertex buffer is unchanged). This is far more robust
-    than [`fill_holes_fan`][triwarp.hole_filling.fill_holes_fan] for non-convex or non-planar holes
-    and, unlike [`fill_holes_cone`][triwarp.hole_filling.fill_holes_cone], adds no vertices.
+    than [`fill_fan`][triwarp.holes.fill_fan] for non-convex or non-planar holes
+    and, unlike [`fill_cone`][triwarp.holes.fill_cone], adds no vertices.
 
     The ``O(B^3)`` DP runs on device as one parallel kernel launch per triangulation span, and
     **every hole is solved in the same launches**: the per-loop ``B x B`` tables are packed into one
@@ -545,7 +542,7 @@ def fill_holes_min_weight(
     couple of long rims had a few hundred threads carrying the whole cubic term. Worth **4.8-7.6x on
     two 512-vertex rims and 3.0x on 512 three-vertex ones**, at a byte-identical triangulation — the
     reduction reproduces the DP's smallest-apex tie-break exactly, which it has to, because the tie
-    decides the triangles (see ``kernels/hole_filling.py::fill_dp_span_tiled``).
+    decides the triangles (see ``kernels/holes.py::fill_dp_span_tiled``).
 
     Parameters
     ----------
@@ -601,8 +598,8 @@ def fill_holes_min_weight(
 
     See Also
     --------
-    [`fill_holes_fan`][triwarp.hole_filling.fill_holes_fan]
-    [`fill_holes_cone`][triwarp.hole_filling.fill_holes_cone]
+    [`fill_fan`][triwarp.holes.fill_fan]
+    [`fill_cone`][triwarp.holes.fill_cone]
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
 
@@ -637,13 +634,13 @@ def fill_loops(
     Min-weight-triangulate the given boundary ``loops`` and append the fill faces.
 
     Lower-level engine shared by
-    [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight] and
+    [`fill_min_weight`][triwarp.holes.fill_min_weight] and
     [`triwarp.reconstruction.triangulate_point_cloud`]
     [triwarp.reconstruction.triangulate_point_cloud] (to close only a caller-selected subset of
     boundary loops): every loop is sealed **together** by the interval DP under ``metric`` (with a
     ``min_area`` fallback where the primary metric yields a bad triangulation), reusing only
     existing vertices. Cost is set by the longest loop, not by the loop count; see
-    [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight].
+    [`fill_min_weight`][triwarp.holes.fill_min_weight].
 
     Parameters
     ----------
@@ -655,11 +652,11 @@ def fill_loops(
         Boundary loops to fill, as ordered vertex-index arrays (``>= 3`` vertices each), e.g. from
         [`boundary_loops`][triwarp.boundary.boundary_loops].
     metric
-        Fill metric name; see [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight].
+        Fill metric name; see [`fill_min_weight`][triwarp.holes.fill_min_weight].
     resolve_multiple_edges
         When ``True``, forbid chords that duplicate an existing mesh edge.
     smooth_boundary
-        See [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight].
+        See [`fill_min_weight`][triwarp.holes.fill_min_weight].
 
     Returns
     -------
@@ -669,7 +666,7 @@ def fill_loops(
 
     See Also
     --------
-    [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight]
+    [`fill_min_weight`][triwarp.holes.fill_min_weight]
     """
     if len(loops) == 0:
         return wp.clone(faces)
@@ -690,7 +687,7 @@ def _fill_packed_loops(
     """
     Min-weight-triangulate every packed loop **together** and append the fill faces.
 
-    The engine behind [`fill_loops`][triwarp.hole_filling.fill_loops]. Everything before the
+    The engine behind [`fill_loops`][triwarp.holes.fill_loops]. Everything before the
     traceback is batched across loops — one Newell-normal and longest-edge pass, one chord pass over
     the mesh, one ragged ``dp`` / ``prev`` pair, one launch per span rather than per (loop, span),
     and a device-side min-area retry mask instead of a host branch per loop. What is left on the
@@ -708,7 +705,7 @@ def _fill_packed_loops(
     plane_normals = wp.zeros(loops.n_loops, dtype=wp.vec3, device=device)
     max_edge_sq = wp.zeros(loops.n_loops, dtype=wp.float32, device=device)
     wp.launch(
-        kernel_hole_filling.loop_rim_metrics,
+        kernel_holes.loop_rim_metrics,
         dim=loops.total,
         inputs=[
             loops.flat_loops,
@@ -723,7 +720,7 @@ def _fill_packed_loops(
     )
     wp.map(wp.normalize, plane_normals, out=plane_normals)
     char_areas = wp.empty(loops.n_loops, dtype=wp.float32, device=device)
-    wp.map(kernel_hole_filling.char_area_from_max, max_edge_sq, out=char_areas)
+    wp.map(kernel_holes.char_area_from_max, max_edge_sq, out=char_areas)
 
     forbidden = (
         edge_table.forbidden_chords(loops)
@@ -757,7 +754,7 @@ def _fill_packed_loops(
         # per loop. Loops the primary metric handled keep their ``prev`` rows.
         retry = wp.empty(loops.n_loops, dtype=wp.int32, device=device)
         wp.launch(
-            kernel_hole_filling.flag_bad_triangulations,
+            kernel_holes.flag_bad_triangulations,
             dim=loops.n_loops,
             inputs=[loops.sizes, loops.dp_offsets, dp, retry],
             device=device,
@@ -811,14 +808,14 @@ def _pack_loops(loops: list[wp.array[wp.int32]]) -> _PackedLoops:
     return _PackedLoops(flat_loops, sizes_np)
 
 
-def fill_small_holes(
+def fill_small(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], max_perimeter: float
 ) -> wp.array[wp.int32]:
     """
     Fill only boundary loops whose perimeter is at most ``max_perimeter``.
 
     Intended open boundaries (large loops) are left untouched; spurious small holes are sealed by
-    the shared min-weight interval DP ([`fill_loops`][triwarp.hole_filling.fill_loops]). Used by
+    the shared min-weight interval DP ([`fill_loops`][triwarp.holes.fill_loops]). Used by
     [`triwarp.reconstruction.triangulate_point_cloud`][triwarp.reconstruction.triangulate_point_cloud]
     to seal small gaps left by sparse or non-uniform point-cloud sampling (MeshLib ``makeMesh_``
     tail).
@@ -841,8 +838,8 @@ def fill_small_holes(
 
     See Also
     --------
-    [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight]
-    [`fill_loops`][triwarp.hole_filling.fill_loops]
+    [`fill_min_weight`][triwarp.holes.fill_min_weight]
+    [`fill_loops`][triwarp.holes.fill_loops]
     """
     packed = _hole_loops(vertices, faces)
     if packed is None:
@@ -882,7 +879,7 @@ def _patch_mask(
     return wp.array(mask, dtype=wp.bool, device=device)
 
 
-def fill_holes_smooth(
+def fill_smooth(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     metric: str = "plane_normalized",
@@ -906,7 +903,7 @@ def fill_holes_smooth(
     Fill every boundary hole with a smooth, refined patch.
 
     Runs the full three-stage pipeline: a minimum-weight triangulation seals each hole over its
-    existing rim vertices ([`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight]),
+    existing rim vertices ([`fill_min_weight`][triwarp.holes.fill_min_weight]),
     the patch is then subdivided to ``max_edge`` with Delaunay edge flips
     ([`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size]), and finally the new
     interior patch vertices are smoothed into the surrounding surface
@@ -922,10 +919,10 @@ def fill_holes_smooth(
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
     metric
         Minimum-weight fill metric; see
-        [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight].
+        [`fill_min_weight`][triwarp.holes.fill_min_weight].
     triangulate_only
         When ``True``, only fill (no subdivision or smoothing) — equivalent to
-        [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight].
+        [`fill_min_weight`][triwarp.holes.fill_min_weight].
     max_edge
         Target maximum patch edge length. ``None`` (default) derives it from the mean rim edge
         length of the holes being filled (MeshLib's ``maxEdgeLen = 0`` budget target has no
@@ -968,7 +965,7 @@ def fill_holes_smooth(
 
     See Also
     --------
-    [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight]
+    [`fill_min_weight`][triwarp.holes.fill_min_weight]
     [`stitch_smooth`][triwarp.combine.stitch_smooth]
     [`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size]
 

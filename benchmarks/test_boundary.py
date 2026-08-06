@@ -115,7 +115,7 @@ def test_ears(bench_case: BenchCase) -> None:
     """
     Ear triangles -- two boundary edges each -- as ``(face, opposite corner)`` pairs.
 
-    ``hole_filling`` uses these to recognise a rim that closes with a single triangle, so the axis
+    ``holes`` uses these to recognise a rim that closes with a single triangle, so the axis
     is the boundary shape rather than the mesh size, like the rest of the module. ``igl.ears``
     returns the identical pair of arrays, which is unusual enough to note: this is one of the few
     groups where triwarp and igl agree on the *output convention* and not merely the quantity, so

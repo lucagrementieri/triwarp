@@ -9,7 +9,7 @@ from triwarp.kernels.array import wrap_index as _wrap
 from triwarp.kernels.predicates import triangle_aspect_ratio
 
 # Sentinel standing in for "this band is unusable", finite so it can be compared and accumulated.
-# The same value ``kernels.hole_filling`` uses for the single-hole DP, kept separate rather than
+# The same value ``kernels.holes`` uses for the single-hole DP, kept separate rather than
 # imported: the two dynamic programs are independent and neither reads the other's tables.
 BAD_METRIC = wp.constant(wp.float32(1e10))
 

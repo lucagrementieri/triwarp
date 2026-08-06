@@ -4,7 +4,7 @@ Assembling meshes from parts and splitting them back apart.
 [`concatenate`][triwarp.combine.concatenate] and [`split`][triwarp.combine.split] combine and
 decompose whole meshes by connected component. [`stitch`][triwarp.combine.stitch] (and its
 ``_min_weight`` / ``_smooth`` variants) instead **joins two open meshes** across one boundary
-loop each into a single watertight seam — see [`triwarp.hole_filling`][triwarp.hole_filling] for
+loop each into a single watertight seam — see [`triwarp.holes`][triwarp.holes] for
 the lower-level triangulation engines these build on, and for closing holes within a single mesh.
 """
 
@@ -19,7 +19,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.hole_filling import _BAD_TRIANGULATION_METRIC, _EdgeTable, _PackedLoops
+from triwarp.holes import _BAD_TRIANGULATION_METRIC, _EdgeTable, _PackedLoops
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import combine as kernel_combine
 
@@ -375,7 +375,7 @@ def stitch_smooth(
 
     Like [`stitch_min_weight`][triwarp.combine.stitch_min_weight] but the connecting band is then
     subdivided and smoothed by the same finisher as
-    [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth]. Each mesh must have exactly one
+    [`fill_smooth`][triwarp.holes.fill_smooth]. Each mesh must have exactly one
     boundary loop. The cross-boundary smooth solve is always applied (MeshLib forces ``smoothBd``).
 
     Parameters
@@ -390,21 +390,21 @@ def stitch_smooth(
     up_dir
         Up direction for the ``"vertical"`` stitch metric.
     triangulate_only
-        See [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth].
+        See [`fill_smooth`][triwarp.holes.fill_smooth].
     max_edge
-        See [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth].
+        See [`fill_smooth`][triwarp.holes.fill_smooth].
     max_edge_splits
-        See [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth].
+        See [`fill_smooth`][triwarp.holes.fill_smooth].
     max_angle_change_after_flip
-        See [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth].
+        See [`fill_smooth`][triwarp.holes.fill_smooth].
     smooth_curvature
-        See [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth].
+        See [`fill_smooth`][triwarp.holes.fill_smooth].
     natural_smooth
-        See [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth].
+        See [`fill_smooth`][triwarp.holes.fill_smooth].
     edge_weights
-        See [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth].
+        See [`fill_smooth`][triwarp.holes.fill_smooth].
     return_patch
-        See [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth].
+        See [`fill_smooth`][triwarp.holes.fill_smooth].
 
     Returns
     -------
@@ -423,7 +423,7 @@ def stitch_smooth(
     See Also
     --------
     [`stitch_min_weight`][triwarp.combine.stitch_min_weight]
-    [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth]
+    [`fill_smooth`][triwarp.holes.fill_smooth]
 
     Notes
     -----
@@ -453,7 +453,7 @@ def stitch_smooth(
         vertices_a, faces_a, loops_a[0], vertices_b, faces_b, loops_b[0], metric, up_dir
     )
     n_faces_after = int(combined_faces.shape[0]) // 3
-    patch_mask = tw.hole_filling._patch_mask(n_faces_before, n_faces_after, device)
+    patch_mask = tw.holes._patch_mask(n_faces_before, n_faces_after, device)
 
     if triangulate_only:
         result = (combined_vertices, combined_faces)
@@ -466,7 +466,7 @@ def stitch_smooth(
     target_edge = (
         max_edge
         if max_edge is not None
-        else tw.hole_filling._mean_rim_edge_length(combined_vertices, rim_loops)
+        else tw.holes._mean_rim_edge_length(combined_vertices, rim_loops)
     )
     new_vertices, new_faces, out_patch = tw.smoothing.refine_and_smooth_region(
         combined_vertices,
@@ -696,7 +696,7 @@ def stitch_loops(
 
 
 # Stitch-metric name -> kernel selector (must match the METRIC_*_STITCH constants in
-# kernels/hole_filling.py).
+# kernels/holes.py).
 def _longest_increasing_subsequence(numbers: np.ndarray) -> np.ndarray:
     """
     Longest strictly increasing subsequence of ``numbers`` (patience-sorting, O(N log N)).

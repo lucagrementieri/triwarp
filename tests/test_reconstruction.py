@@ -158,7 +158,7 @@ def test_estimated_normals_path_runs(device: str):
     assert np.allclose(radii, 1.0, rtol=1e-5, atol=1e-5)
 
 
-def test_hole_filling_seals_small_hole(device: str):
+def test_holes_seal_small_hole(device: str):
     rng = np.random.default_rng(0)
     points_np, normals_np = _sphere_cloud(4)
     # Remove a small cluster of points to open a genuine boundary hole.

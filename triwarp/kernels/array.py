@@ -318,7 +318,7 @@ def binary_search_index_left(values: wp.array[wp.Scalar], value: wp.Scalar) -> w
     # ``wp.lower_bound`` is the same search, but it clamps its result to ``n - 1``
     # (``warp/native/array.h``), so a value past the last element reads back as the last index
     # instead of ``n``. Both callers (``graph.component_segment_bounds`` probes one past the
-    # highest component key, ``hole_filling.rim_opposite_from_table`` probes edges absent from the
+    # highest component key, ``holes.rim_opposite_from_table`` probes edges absent from the
     # table) do query past the end, so the fix-up is mandatory, not defensive.
     n = values.shape[0]
     index = wp.lower_bound(values, value)

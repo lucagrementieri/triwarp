@@ -3,7 +3,7 @@ Precision-generic geometric predicates (ports of MeshLib ``MRTriMath.h`` / ``MRR
 
 These were duplicated three times before this module existed: a ``float32`` set in
 ``kernels/reconstruction.py``, a byte-equivalent ``float64`` set in ``kernels/remesh.py``, and a
-third partial copy in ``kernels/hole_filling.py``. Each `@wp.func` here is generic over the scalar
+third partial copy in ``kernels/holes.py``. Each `@wp.func` here is generic over the scalar
 type, so one definition instantiates at whatever precision the calling kernel uses.
 
 Degenerate inputs return [`float_inf`][triwarp.kernels.predicates.float_inf] — an actual infinity,

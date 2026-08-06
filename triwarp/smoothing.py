@@ -871,7 +871,7 @@ def smooth_region_fixed_rim(
     See Also
     --------
     [`smooth_region`][triwarp.smoothing.smooth_region]
-    [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth]
+    [`fill_smooth`][triwarp.holes.fill_smooth]
 
     Notes
     -----
@@ -979,7 +979,7 @@ def smooth_region(
     See Also
     --------
     [`smooth_region_fixed_rim`][triwarp.smoothing.smooth_region_fixed_rim]
-    [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth]
+    [`fill_smooth`][triwarp.holes.fill_smooth]
     """
     device = vertices.device
     n = int(vertices.shape[0])
@@ -1079,7 +1079,7 @@ def refine_and_smooth_region(
 
     Ports MeshLib ``subdivideFillingNicely`` + ``smoothFillingNicely``.
 
-    Shared finisher of [`fill_holes_smooth`][triwarp.hole_filling.fill_holes_smooth] and
+    Shared finisher of [`fill_smooth`][triwarp.holes.fill_smooth] and
     [`stitch_smooth`][triwarp.combine.stitch_smooth].
     """
     device = faces.device

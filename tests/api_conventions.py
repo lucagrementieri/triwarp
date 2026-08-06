@@ -109,30 +109,30 @@ _PRIVATE_IMPORT_ALLOWLIST: dict[tuple[str, str], str] = {
         "returns vec3 and this is the seam where the f64 solve meets it"
     ),
     ("smoothing", "array._as_vec3d"): "as above, the other direction",
-    ("combine", "hole_filling._PackedLoops"): (
-        "the flat-plus-sizes loop representation both dynamic programs consume. It is a data type, "
-        "not an operation -- publishing it would make an internal layout part of the API, and every "
-        "public entry point on both sides takes and returns plain arrays"
+    ("combine", "holes._PackedLoops"): (
+        "the flat-plus-sizes loop representation both dynamic programs consume. It is a data "
+        "type, not an operation -- publishing it would make an internal layout part of the API, "
+        "and every public entry point on both sides takes and returns plain arrays"
     ),
-    ("combine", "hole_filling._EdgeTable"): (
+    ("combine", "holes._EdgeTable"): (
         "the rim-opposite-vertex lookup the dihedral term of both metrics needs; shared for the "
         "same reason as the metric table below, so the single-hole cap and the two-rim band cannot "
         "disagree about what an edge's opposite vertex is"
     ),
-    ("combine", "hole_filling._BAD_TRIANGULATION_METRIC"): (
+    ("combine", "holes._BAD_TRIANGULATION_METRIC"): (
         "the host-side twin of the kernels' BAD_METRIC sentinel, so the two DP tables are "
         "initialised to the same unusable value; a second copy would be a second constant to keep "
         "in step with the kernel's"
     ),
-    ("combine", "hole_filling._STITCH_METRIC_IDS"): (
+    ("combine", "holes._STITCH_METRIC_IDS"): (
         "the metric-name-to-kernel-flag table, shared so the two entry points validate the same "
         "spellings; a public copy would be a second source of truth for one enum"
     ),
-    ("combine", "hole_filling._patch_mask"): (
+    ("combine", "holes._patch_mask"): (
         "marks which faces a fill added, by index range -- bookkeeping over another function's "
         "return convention rather than a mesh operation"
     ),
-    ("combine", "hole_filling._mean_rim_edge_length"): (
+    ("combine", "holes._mean_rim_edge_length"): (
         "the default target edge length for a patch, derived from the rim it was fitted to; it is "
         "one caller's default, not a measurement anyone would reach for"
     ),

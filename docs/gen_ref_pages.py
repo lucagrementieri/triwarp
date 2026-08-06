@@ -33,7 +33,7 @@ SECTIONS: dict[str, list[str]] = {
     ],
     "Mesh editing & repair": [
         "repair",
-        "hole_filling",
+        "holes",
         "combine",
         "remesh",
         "smoothing",

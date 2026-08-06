@@ -1,11 +1,11 @@
 """
-Benchmarks for ``triwarp.hole_filling``.
+Benchmarks for ``triwarp.holes``.
 
 Axis: **loops_dp** -- ``rim_short`` (two loops of 512) against ``holes_many`` (512 loops of 3).
 The module has the highest non-``N`` sensitivity in the package and this pair separates its two
 independent drivers:
 
-* **Loop length**, cubed. ``fill_holes_min_weight`` runs a minimum-weight triangulation DP over a
+* **Loop length**, cubed. ``fill_min_weight`` runs a minimum-weight triangulation DP over a
   ``B x B`` table per loop, filled by ``B - 2`` *sequential* kernel launches and read back to the
   host for the traceback. Total work is ``sum(B_i^3)`` and no batching can remove it: this is the
   real cost the module exists to pay. Two loops of 512 measure **20-35 ms**.
@@ -15,7 +15,7 @@ independent drivers:
   two long rims put at most ~1 024 threads on a 170-SM part and the whole ``B^3`` term ran at 0.3 %
   of the machine. Same launch count, same DP, byte-identical triangulation (see
   ``fill_dp_span_tiled``). Measured by running this module twice in one session with only the engine
-  switched: ``fill_holes_min_weight[rim_short]`` **168.6 -> 35.0 ms (4.8x)**, its two
+  switched: ``fill_min_weight[rim_short]`` **168.6 -> 35.0 ms (4.8x)**, its two
   ``_chords`` rows **7.6x** and **5.5x**, and ``[holes_many]`` **20.9 -> 7.0 (3.0x)**. An isolated
   in-process timer on the same fixtures reads 173.8 -> 19.7 and 18.4 -> 4.4, so read the ratio, not
   the absolute -- this group's median moves by up to 80 % between runs of the *same* code depending
@@ -33,7 +33,7 @@ Face count is not the variable, and sizing these meshes up would only add DP tab
 what the axis is for -- the inversion is what said the per-loop sequence was the bug. (The gap was
 37x before the per-span launch was widened to a block per interval; that change is worth ~4.8x on
 the long rims and ~3.0x on the short ones, so it narrows the axis without inverting it.)
-``fill_holes_fan`` runs on the wider **loops** axis instead, because it has no DP and so can afford
+``fill_fan`` runs on the wider **loops** axis instead, because it has no DP and so can afford
 ``rim_long``'s 65 536-vertex rims -- it is the floor this module's cost is measured against.
 
 References
@@ -93,28 +93,28 @@ def _tensor_mesh_o3d(bench_case: BenchCase) -> o3d.t.geometry.TriangleMesh:
     return _tensor_mesh_cache[bench_case.mesh_name]
 
 
-@pytest.mark.benchmark(group="fill_holes_fan")
+@pytest.mark.benchmark(group="fill_fan")
 @pytest.mark.benchaxis("loops")
 @pytest.mark.benchlibs("triwarp")
-def test_fill_holes_fan(bench_case: BenchCase) -> None:
+def test_fill_fan(bench_case: BenchCase) -> None:
     """The cheapest filler -- one fan per loop, no DP -- so it can take the long-rim axis."""
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-    result = bench_case.run(lambda: tw.hole_filling.fill_holes_fan(vertices, faces))
+    result = bench_case.run(lambda: tw.holes.fill_fan(vertices, faces))
     assert result.shape[0] >= faces.shape[0]
 
 
 @pytest.mark.noparity(
     "trimesh",
     reason="D2 a weaker algorithm for the same task: tm.repair.fill_holes fans triangles across "
-    "small holes and gives up on large ones, where fill_holes_min_weight runs the minimum-weight "
+    "small holes and gives up on large ones, where fill_min_weight runs the minimum-weight "
     "interval DP, so the two produce different triangulations by design and trimesh has no "
     "minimum-weight answer to compare against. meshlib is the oracle for the DP itself, in "
-    "tests/test_hole_filling.py::test_fill_holes_min_weight_matches_meshlib.",
+    "tests/test_holes.py::test_fill_min_weight_matches_meshlib.",
 )
-@pytest.mark.benchmark(group="fill_holes_min_weight")
+@pytest.mark.benchmark(group="fill_min_weight")
 @pytest.mark.benchaxis("loops_dp")
 @pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
-def test_fill_holes_min_weight(bench_case: BenchCase) -> None:
+def test_fill_min_weight(bench_case: BenchCase) -> None:
     """The ``B^3`` DP: few long loops against many short ones, at a comparable total boundary."""
     if bench_case.kind == "pymeshlab":
         # ``maxholesize`` is an *edge count* cap, and its default of 30 would silently close nothing
@@ -129,9 +129,7 @@ def test_fill_holes_min_weight(bench_case: BenchCase) -> None:
         return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-        result = bench_case.run(
-            lambda: tw.hole_filling.fill_holes_min_weight(vertices, faces), rounds=_ROUNDS
-        )
+        result = bench_case.run(lambda: tw.holes.fill_min_weight(vertices, faces), rounds=_ROUNDS)
         assert result.shape[0] >= faces.shape[0]
     elif bench_case.kind == "trimesh":  # mutates in place: rebuild inside the timed callable
         vertices, faces = bench_case.vertices_np, bench_case.faces_np
@@ -150,11 +148,11 @@ def test_fill_holes_min_weight(bench_case: BenchCase) -> None:
         assert int(filled.triangle["indices"].shape[0]) >= n_faces
 
 
-@pytest.mark.benchmark(group="fill_holes_min_weight_chords")
+@pytest.mark.benchmark(group="fill_min_weight_chords")
 @pytest.mark.benchaxis("loops_dp")
 @pytest.mark.benchlibs("triwarp")
 @pytest.mark.parametrize("resolve_multiple_edges", [False, True], ids=["plain", "chords"])
-def test_fill_holes_min_weight_chords(bench_case: BenchCase, resolve_multiple_edges: bool) -> None:
+def test_fill_min_weight_chords(bench_case: BenchCase, resolve_multiple_edges: bool) -> None:
     """
     What the forbidden-chord pass costs on top of the DP.
 
@@ -165,7 +163,7 @@ def test_fill_holes_min_weight_chords(bench_case: BenchCase, resolve_multiple_ed
     """
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     result = bench_case.run(
-        lambda: tw.hole_filling.fill_holes_min_weight(
+        lambda: tw.holes.fill_min_weight(
             vertices, faces, resolve_multiple_edges=resolve_multiple_edges
         ),
         rounds=_ROUNDS,

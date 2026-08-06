@@ -184,7 +184,7 @@ def boundary_loops_batched(
     [`boundary_loops`][triwarp.boundary.boundary_loops] — but with no per-loop Python and no
     per-loop allocation, which is the only form whose cost is independent of the loop *count*.
     Prefer it when a mesh has many small holes or when the loops feed straight into another
-    batched kernel, as [`triwarp.hole_filling`][triwarp.hole_filling] does.
+    batched kernel, as [`triwarp.holes`][triwarp.holes] does.
 
     Parameters
     ----------

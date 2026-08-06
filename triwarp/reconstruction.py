@@ -281,7 +281,7 @@ def triangulate_point_cloud(
 
     See Also
     --------
-    [`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight]
+    [`fill_min_weight`][triwarp.holes.fill_min_weight]
     [`triwarp.repair.remove_degenerate_faces`][]
     """
     if num_neighbours > 0 and radius > 0.0:
@@ -1588,5 +1588,5 @@ def _clean_reconstruction(
             if hole_length < 0.0:
                 lo, hi = tw.bounds.aabb_bounds(points)
                 hole_length = 0.1 * float(wp.length(hi - lo))
-            faces = tw.hole_filling.fill_small_holes(vertices, faces, hole_length)
+            faces = tw.holes.fill_small(vertices, faces, hole_length)
     return vertices, faces
