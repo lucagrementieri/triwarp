@@ -1,7 +1,8 @@
 """
-Mesh repair utilities (libigl unreferenced/duplicated vertex and duplicated face cleanup).
+Removing what should not be in a mesh: redundant elements, bad triangles and inconsistent winding.
 
-See [`remove_unreferenced_vertices`][triwarp.repair.remove_unreferenced_vertices],
+Five defects are visible in the index buffer alone, and each has a remover:
+[`remove_unreferenced_vertices`][triwarp.repair.remove_unreferenced_vertices],
 [`remove_duplicated_vertices`][triwarp.repair.remove_duplicated_vertices],
 [`resolve_duplicated_faces`][triwarp.repair.resolve_duplicated_faces],
 [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces], and
@@ -202,7 +203,7 @@ def resolve_duplicated_faces(
     faces: wp.array[wp.int32],
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
     """
-    Resolve duplicated triangles by orientation-aware cancellation rules (libigl).
+    Resolve duplicated triangles by orientation-aware cancellation rules.
 
     For each geometric duplicate:
     - equal positive and negative counts: remove all copies;
@@ -514,7 +515,7 @@ def collapse_small_triangles(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], epsilon: float = 1e-6
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
-    Collapse triangles smaller than a bounding-box-relative area threshold (libigl).
+    Collapse triangles smaller than a bounding-box-relative area threshold.
 
     Mirrors ``igl::collapse_small_triangles``. A triangle is *small* when its doubled area is below
     ``2 * epsilon * bbd ** 2``, where ``bbd`` is the diagonal of the axis-aligned bounding box of

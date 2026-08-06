@@ -197,9 +197,18 @@ def gather_vec_skip_negative(
         out_gathered[i] = wp.vec3(0.0, 0.0, 0.0)
 
 
+@wp.func
+def shifted_index(value: wp.Scalar, offset: wp.Scalar) -> wp.int32:
+    # Position of ``value`` in a table anchored at ``offset``. The subtraction happens in the
+    # value's own dtype, which is exact for every dtype ``array.isin`` reaches this with: it widens
+    # sub-32-bit dtypes first (so the span cannot overflow the type) and only takes the table path
+    # when the span is small (so a 64-bit difference cannot overflow either).
+    return wp.int32(value - offset)
+
+
 @wp.kernel
 def isin_lookup_sorted(
-    elements: wp.array[wp.int32], sorted_test: wp.array[wp.int32], out_mask: wp.array[wp.bool]
+    elements: wp.array[wp.Scalar], sorted_test: wp.array[wp.Scalar], out_mask: wp.array[wp.bool]
 ) -> None:
     tid = int(wp.tid())
     out_mask[tid] = binary_search_sorted_contains(sorted_test, elements[tid])

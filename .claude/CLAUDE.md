@@ -44,6 +44,7 @@ You are an expert in NVIDIA Warp (wp). Follow all rules below when writing kerne
 ## 4. Python-Scope Wrappers
 
 - Every kernel lives in a `kernels/` sub-module. Import it with an alias: `from triwarp.kernels import triangles as kernel_triangles`.
+- **A top-level kernel module is named exactly for the public module it backs**: `triwarp/kernels/<module>.py` ↔ `triwarp/<module>.py`, one-to-one. The only admissible exceptions are the shared kernel-side libraries that back no single public module — `kernels/predicates.py` (geometric `@wp.func` predicates, imported by 12 *kernel* modules) and `kernels/scatter.py` (scatter/accumulate kernels, imported by 7 wrappers). Sub-packages (`kernels/algorithms/`, `kernels/heat/`) mirror a folder rather than a module and are exempt. Adding a kernel module with no public counterpart, or a public module whose kernels live under another name, is a defect — fix the name, do not document the exception.
 - Python-scope wrapper functions accept `wp.array[T]` for 1D buffers; use `twt.Array2dInt32`, `twt.Array2dFloat32`, etc. for rank-2 results (see §7).
 - For **2D** outputs, allocate with `twt.empty_int32_2d((rows, cols), device=...)` or `twt.empty_float32_2d(...)` instead of bare `wp.empty((rows, cols), ...)`.
 - For **1D** outputs, keep `wp.empty(n, dtype=..., device=input.device)` when all elements will be written by the kernel (avoid unnecessary zero-initialization).
@@ -649,6 +650,25 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
 - **Coverage is per module.** Every public `triwarp/<module>.py` gets both `tests/test_<module>.py`
   and `benchmarks/test_<module>.py`, and a function's tests live in the file mirroring *its* module
   (§11), not in a neighbour's.
+- **Moving or renaming a public function moves everything derived from it — in the same commit.**
+  A move is not done when the wrapper compiles; it is done when nothing still points at the old
+  home. Five artifacts, every time:
+  1. **Its kernels, if they are exclusively its.** A kernel referenced by only the moved function
+     moves to the destination's `kernels/` module; a kernel shared with a function that stays put
+     does **not** move, and the new kernel module imports it (kernel-to-kernel imports are normal —
+     `kernels/predicates.py` has 12 importers). Decide by measuring, not by reading: an AST scan of
+     which wrappers reference each `kernel_<mod>.<name>` is the authority, because a kernel that
+     *looks* single-purpose is often reached from a private helper in a third module.
+  2. **Its tests**, into `tests/test_<destination>.py`, keeping the §11 source order.
+  3. **Its benchmark rows**, into `benchmarks/test_<destination>.py`.
+  4. **Its `benchmark(group=...)` name**, when the group is named after the function or its old
+     module. Renaming a group is allowed and is sometimes required to keep the suites consistent —
+     but the group name is the parity key, so **every `parity` / `noparity` marker citing it must be
+     updated in the same commit**, and `uv run python -m tests.parity` must show the same pair count
+     before and after (the *names* change, the matrix shape does not).
+  5. **Its docs entry** in `docs/gen_ref_pages.py` `SECTIONS`, plus every
+     `[`name`][triwarp.old.path]` cross-reference — `mkdocs build --strict` is what finds the ones
+     you missed.
 
 ---
 

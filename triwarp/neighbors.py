@@ -1202,7 +1202,7 @@ def geodesic_ball(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], radius: float, min_count: int = 6
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
     """
-    Per-vertex geodesic-ball neighborhoods matching ``igl::principal_curvature``'s ``getSphere``.
+    Per-vertex geodesic-ball neighborhoods, and the reference neighbor that frames each one.
 
     For each vertex this is a breadth-first traversal of the mesh edge graph, enqueueing a neighbor
     only when it lies within Euclidean ``radius`` of the center — i.e. the connected component of

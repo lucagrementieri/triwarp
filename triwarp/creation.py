@@ -1,5 +1,5 @@
 """
-Parametric mesh generators, mirroring `trimesh.creation`.
+Parametric mesh generators: boxes, Platonic solids, surfaces of revolution and extrusions.
 
 Every function returns a bare ``(vertices, faces)`` pair using triwarp's flat ``(3 * n_faces,)``
 face layout, so results feed straight into the rest of the package or into

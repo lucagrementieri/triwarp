@@ -1,4 +1,27 @@
-"""Mesh subdivision on NVIDIA Warp."""
+"""
+Changing a mesh's triangulation: subdividing it, coarsening it, and improving its triangle shapes.
+
+Four families, in decreasing order of how much they rearrange:
+
+- **Remeshing.** [`isotropic_remesh`][triwarp.remesh.isotropic_remesh] runs the Botsch-Kobbelt
+  split / collapse / flip / smooth / reproject loop until every edge is near a target length. It is
+  the only entry point here that does all four of the others' jobs at once.
+- **Decimation.** [`quadric_decimate`][triwarp.remesh.quadric_decimate] collapses edges in
+  quadric-error order to a target face count; [`cluster_decimate`][triwarp.remesh.cluster_decimate]
+  instead welds each voxel of a uniform grid to a single vertex, which is far cheaper and far
+  blunter.
+- **Edge flipping**, which moves no vertex and changes no vertex count:
+  [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay] toward the Delaunay criterion,
+  [`flip_by_objective`][triwarp.remesh.flip_by_objective] toward a triangle-shape or flatness
+  objective, and [`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay] toward the *intrinsic*
+  Delaunay triangulation, which flips the connectivity a Laplacian sees without touching the
+  embedding.
+- **Subdivision**, which only ever adds: [`subdivide`][triwarp.remesh.subdivide] (one-to-four
+  splits), [`subdivide_loop`][triwarp.remesh.subdivide_loop] (Loop's approximating scheme),
+  [`subdivide_to_size`][triwarp.remesh.subdivide_to_size] and
+  [`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size] (until every edge, or every
+  edge of a face region, is under a target length).
+"""
 
 from __future__ import annotations
 

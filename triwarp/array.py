@@ -16,7 +16,8 @@ from triwarp.kernels import scatter as kernel_scatter
 
 DType = TypeVar("DType")
 
-# Use a direct-index membership table when max(value)+1 is at most this multiple of |test_elements|.
+# Use a direct-index membership table when the value *span* (max - min + 1, over both inputs) is at
+# most this multiple of |test_elements|.
 _ISIN_MASK_SIZE_FACTOR = 8
 
 # Row width up to which [`sort_rows`][triwarp.array.sort_rows] uses a per-row insertion sort instead
@@ -522,23 +523,27 @@ def index_sparse(
     )
 
 
-def isin(elements: twt.ArrayNdInt32, test_elements: twt.Array1dInt32) -> wp.array[wp.bool]:
+def isin(elements: twt.ArrayNd, test_elements: wp.array[wp.Int]) -> wp.array[wp.bool]:
     """
-    Test whether each element appears in ``test_elements`` (``numpy.isin`` for ``int32``).
+    Test whether each element appears in ``test_elements`` (``numpy.isin`` for integers).
 
-    When ``max(elements, test_elements) + 1`` is modest relative to ``len(test_elements)``,
-    membership is implemented with a boolean lookup table (fast for dense mesh indices).
-    Otherwise ``test_elements`` is sorted and each query uses binary search (bounded memory
-    when values are sparse in ``int32``).
+    Works for every Warp integer dtype -- ``int8`` through ``int64``, ``uint8`` through ``uint64``
+    -- and for negative values. Both arrays must share one dtype.
+
+    Two strategies, chosen by the value **span** ``max - min + 1`` taken over both inputs together.
+    When the span is modest relative to ``len(test_elements)``, membership is a boolean lookup table
+    indexed by ``value - min`` (fast for dense mesh indices). Otherwise ``test_elements`` is sorted
+    and each query is a binary search, which keeps memory bounded when the values are sparse in
+    their dtype.
 
     Parameters
     ----------
     elements
-        ``wp.int32`` array of **any rank** on the target device. Membership is a per-element
-        predicate, so the array is flattened, tested, and the result reshaped back; nothing in
-        the two strategies looks at the shape.
+        Integer array of **any rank** on the target device. Membership is a per-element predicate,
+        so the array is flattened, tested, and the result reshaped back; nothing in the two
+        strategies looks at the shape.
     test_elements
-        1D ``wp.int32`` array of values to test membership against.
+        1D array of values to test membership against, of the same dtype as ``elements``.
 
     Returns
     -------
@@ -546,12 +551,34 @@ def isin(elements: twt.ArrayNdInt32, test_elements: twt.Array1dInt32) -> wp.arra
         Boolean array with the same shape as ``elements``. All ``False`` when either
         input is empty.
 
+    Raises
+    ------
+    TypeError
+        If either array is not an integer dtype, or the two dtypes differ.
+
     See Also
     --------
     [`indices_to_mask`][triwarp.array.indices_to_mask]
+    [`sortable_dtype`][triwarp.array.sortable_dtype]
     [`numpy.isin`][]
+
+    Notes
+    -----
+    Dtypes narrower than four bytes are widened to ``int32`` / ``uint32`` (the
+    [`sortable_dtype`][triwarp.array.sortable_dtype] rule) before either strategy runs: Warp's
+    radix sort does not accept them, and neither does the tiled min/max reduction the span needs.
+
+    Two host readbacks, one min/max reduction per input, which is what selects the strategy and
+    anchors the table.
     """
     device = elements.device
+    dtype = elements.dtype
+    if dtype != test_elements.dtype:
+        raise TypeError(
+            f"isin requires one dtype for both arrays, got {dtype} and {test_elements.dtype}"
+        )
+    if not wp.types.type_is_int(dtype) or dtype == wp.bool:
+        raise TypeError(f"isin requires an integer dtype, got {dtype}")
 
     k = int(test_elements.shape[0])
     if k == 0 or int(elements.size) == 0:
@@ -559,14 +586,30 @@ def isin(elements: twt.ArrayNdInt32, test_elements: twt.Array1dInt32) -> wp.arra
 
     is_flat = int(elements.ndim) == 1
     elements_flat = elements if is_flat else elements.flatten()
+    # Widen sub-32-bit dtypes once, up front: neither ``reduce.minmax`` nor the radix sort accepts
+    # them, and a widened span cannot overflow the type it is measured in (int8's span reaches 256).
+    if wp.types.type_size_in_bytes(dtype) < 4:
+        wide = sortable_dtype(dtype)
+        elements_flat = _cast_to_dtype(elements_flat, wide)
+        test_elements = _cast_to_dtype(test_elements, wide)
 
-    max_index = int(max(tw.reduce.max(elements_flat), tw.reduce.max(test_elements)) + 1)
-    if max_index <= _ISIN_MASK_SIZE_FACTOR * k:
-        out_flat = _isin_lookup_mask(elements_flat, test_elements, max_index)
+    lo_elements, hi_elements = tw.reduce.minmax(elements_flat)
+    lo_test, hi_test = tw.reduce.minmax(test_elements)
+    offset = min(int(lo_elements), int(lo_test))
+    span = max(int(hi_elements), int(hi_test)) - offset + 1
+    if span <= _ISIN_MASK_SIZE_FACTOR * k:
+        out_flat = _isin_lookup_mask(elements_flat, test_elements, span, offset)
     else:
         out_flat = _isin_lookup_sorted(elements_flat, test_elements)
 
     return out_flat if is_flat else out_flat.reshape(elements.shape)
+
+
+def _cast_to_dtype(values: wp.array[DType], dtype: type[wp.Scalar]) -> wp.array[wp.Scalar]:
+    """Element-wise dtype conversion of a 1D array (``wp.cast`` has no Python-scope form)."""
+    out = wp.empty(int(values.shape[0]), dtype=dtype, device=values.device)
+    wp.utils.array_cast(values, out)
+    return out
 
 
 def _sorted_copy(values: wp.array[DType]) -> wp.array[DType]:
@@ -583,23 +626,33 @@ def _sorted_copy(values: wp.array[DType]) -> wp.array[DType]:
 
 
 def _isin_lookup_mask(
-    elements_flat: wp.array[wp.int32], test_elements: wp.array[wp.int32], max_index: int
+    elements_flat: wp.array[wp.Scalar], test_elements: wp.array[wp.Scalar], span: int, offset: int
 ) -> wp.array[wp.bool]:
-    k = int(test_elements.shape[0])
+    # The table is anchored at ``offset`` (the global minimum over both inputs) rather than at zero,
+    # so it holds negative values and stays span-sized instead of max-sized. Anchoring at zero
+    # instead is a *silent wrong answer* for negative input: ``mark_membership_mask`` drops the
+    # negative test values as out of range, so they read back as absent.
     device = elements_flat.device
-    membership_wp = wp.zeros(max_index, dtype=wp.bool, device=device)
+    dtype = elements_flat.dtype
+    anchor = dtype(offset)
+    test_slots = wp.empty(int(test_elements.shape[0]), dtype=wp.int32, device=device)
+    wp.map(kernel_array.shifted_index, test_elements, anchor, out=test_slots)
+    element_slots = wp.empty(int(elements_flat.shape[0]), dtype=wp.int32, device=device)
+    wp.map(kernel_array.shifted_index, elements_flat, anchor, out=element_slots)
+
+    membership_wp = wp.zeros(span, dtype=wp.bool, device=device)
     wp.launch(
         kernel_scatter.mark_membership_mask,
-        dim=k,
-        inputs=[test_elements, wp.int32(max_index), membership_wp],
+        dim=int(test_slots.shape[0]),
+        inputs=[test_slots, wp.int32(span), membership_wp],
         device=device,
     )
-    # ``membership_wp[elements_flat]`` gathers the boolean membership flag per element.
-    return gather(membership_wp, elements_flat)
+    # ``membership_wp[element_slots]`` gathers the boolean membership flag per element.
+    return gather(membership_wp, element_slots)
 
 
 def _isin_lookup_sorted(
-    elements_flat: wp.array[wp.int32], test_elements: wp.array[wp.int32]
+    elements_flat: wp.array[wp.Scalar], test_elements: wp.array[wp.Scalar]
 ) -> wp.array[wp.bool]:
     device = elements_flat.device
     sorted_test_wp = _sorted_copy(test_elements)

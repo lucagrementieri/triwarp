@@ -1,5 +1,5 @@
 """
-Chamfer and Hausdorff distances between point clouds and meshes on NVIDIA Warp.
+Chamfer and Hausdorff distances between point clouds and meshes.
 
 All metrics are fully GPU-resident: they compose the nearest-neighbor and
 point-to-surface primitives in [`triwarp.proximity`][] with the tiled reductions

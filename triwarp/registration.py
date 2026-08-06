@@ -1,4 +1,4 @@
-"""Point cloud registration (Procrustes analysis, ICP) on NVIDIA Warp."""
+"""Point cloud registration: Procrustes analysis and ICP."""
 
 from __future__ import annotations
 

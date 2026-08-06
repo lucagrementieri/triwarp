@@ -1,4 +1,17 @@
-"""Per-triangle geometry queries (Warp), mirroring `trimesh.triangles`."""
+"""
+Quantities carried by one triangle at a time: its normal, area, angles, shape and barycentre.
+
+[`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas],
+[`face_angles`][triwarp.triangles.face_angles],
+[`face_centroids`][triwarp.triangles.face_centroids] and
+[`face_quality`][triwarp.triangles.face_quality] are the per-face fields the rest of the package
+reduces over; [`nondegenerate`][triwarp.triangles.nondegenerate] flags the faces those quantities
+are meaningless on. [`barycentric_to_points`][triwarp.triangles.barycentric_to_points],
+[`points_to_barycentric`][triwarp.triangles.points_to_barycentric] and
+[`closest_point`][triwarp.triangles.closest_point] work one query point against one triangle, row
+by row, without a BVH -- for a query against the whole surface see
+[`triwarp.proximity`][triwarp.proximity].
+"""
 
 from typing import Literal
 

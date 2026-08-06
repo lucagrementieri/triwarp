@@ -125,7 +125,7 @@ def cotmatrix_entries(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], dtype: type = wp.float32
 ) -> twt.Array2dFloat:
     """
-    Per-triangle half-cotangent weights (``igl::cotmatrix_entries``).
+    Per-triangle half-cotangent weights.
 
     For each triangle face, column ``e`` stores ``1/2 * cot(angle at vertex e)`` for the
     edge opposite that vertex. Columns follow igl edge order: opposite vertices 0, 1, 2.
@@ -150,6 +150,10 @@ def cotmatrix_entries(
     --------
     [`cotmatrix_entries_intrinsic`][triwarp.laplacian.cotmatrix_entries_intrinsic]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
+
+    Notes
+    -----
+    Matches ``igl::cotmatrix_entries``, column order included.
     """
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
@@ -217,7 +221,7 @@ def cotmatrix(
     dtype: type = wp.float32,
 ) -> wps.BsrMatrix[wp.float32]:
     """
-    Cotangent stiffness matrix / discrete Laplacian (``igl::cotmatrix``).
+    Cotangent stiffness matrix of the mesh: the discrete Laplace-Beltrami operator.
 
     Builds the sparse ``(n_vertices, n_vertices)`` matrix from triangle geometry. Diagonal
     entries are **negative** (each row sums to zero); ``-L`` is positive semi-definite on
@@ -250,6 +254,10 @@ def cotmatrix(
     --------
     [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries]
     [`edges_to_csr`][triwarp.graph.edges_to_csr]
+
+    Notes
+    -----
+    Matches ``igl::cotmatrix``, sign convention included; asserted in ``tests/test_laplacian.py``.
     """
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
@@ -720,7 +728,7 @@ def mass_matrix_entries(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], dtype: type = wp.float32
 ) -> twt.Array1dFloat:
     """
-    Per-vertex barycentric lumped mass (diagonal of ``igl::massmatrix``).
+    Per-vertex barycentric lumped mass: a third of each incident triangle's area.
 
     Each triangle donates a third of its area to each of its three vertices, so entry ``i`` is
     the summed one-third incident-face area at vertex ``i``. This is the
@@ -746,6 +754,10 @@ def mass_matrix_entries(
     See Also
     --------
     [`mass_matrix`][triwarp.laplacian.mass_matrix]
+
+    Notes
+    -----
+    This is the diagonal of ``igl::massmatrix`` under ``MASSMATRIX_TYPE_BARYCENTRIC``.
     """
     n_vertices = int(vertices.shape[0])
     device = vertices.device
@@ -772,7 +784,7 @@ def mass_matrix(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], dtype: type = wp.float32
 ) -> wps.BsrMatrix[wp.float32]:
     """
-    Diagonal barycentric lumped mass matrix (``igl::massmatrix``, barycentric).
+    Diagonal barycentric lumped mass matrix of the mesh.
 
     Parameters
     ----------
@@ -794,6 +806,10 @@ def mass_matrix(
     --------
     [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
+
+    Notes
+    -----
+    Matches ``igl::massmatrix`` under ``MASSMATRIX_TYPE_BARYCENTRIC``.
     """
     return wps.bsr_diag(diag=mass_matrix_entries(vertices, faces, dtype=dtype))
 
@@ -930,7 +946,7 @@ def hessian_energy(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], dtype: type = wp.float64
 ) -> wps.BsrMatrix[wp.float64]:
     """
-    Hessian smoothness energy with natural boundary conditions (``igl::hessian_energy``).
+    Hessian smoothness energy with natural boundary conditions.
 
     The mixed-FEM quadratic form ``Q = H^T M^-1 H`` of Stein et al. 2018, *Natural Boundary
     Conditions for Smoothing in Geometry Processing*: ``x' Q x`` integrates the squared Hessian of
@@ -970,6 +986,11 @@ def hessian_energy(
     [`curved_hessian_energy`][triwarp.laplacian.curved_hessian_energy]
     [`harmonic_integrated`][triwarp.laplacian.harmonic_integrated]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
+
+    Notes
+    -----
+    Matches ``igl::hessian_energy`` except on degenerate faces, which contribute nothing here and
+    ``NaN`` there.
     """
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
@@ -1190,7 +1211,7 @@ def crouzeix_raviart_cotmatrix(
     edge_map: wp.array[wp.int32] | None = None,
 ) -> wps.BsrMatrix[wp.float32]:
     """
-    Edge-based Crouzeix-Raviart cotangent stiffness matrix (``igl::crouzeix_raviart_cotmatrix``).
+    Edge-based Crouzeix-Raviart cotangent stiffness matrix.
 
     The nonconforming-FEM sibling of [`cotmatrix`][triwarp.laplacian.cotmatrix]: degrees of
     freedom live on edge midpoints, so the matrix is ``(n_edges, n_edges)`` and each face couples
@@ -1233,6 +1254,11 @@ def crouzeix_raviart_cotmatrix(
     [`crouzeix_raviart_massmatrix`][triwarp.laplacian.crouzeix_raviart_massmatrix]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
     [`edges_unique`][triwarp.edges.edges_unique]
+
+    Notes
+    -----
+    Matches ``igl::crouzeix_raviart_cotmatrix`` up to the edge numbering, which follows
+    [`edges_unique`][triwarp.edges.edges_unique] rather than ``igl::unique_edge_map``.
     """
     unique_edges, edge_map = _edge_numbering(vertices, faces, unique_edges, edge_map)
     n_edges = int(unique_edges.shape[0])
@@ -1266,7 +1292,7 @@ def crouzeix_raviart_massmatrix(
     edge_map: wp.array[wp.int32] | None = None,
 ) -> wps.BsrMatrix[wp.float32]:
     """
-    Edge-based Crouzeix-Raviart mass matrix (``igl::crouzeix_raviart_massmatrix``).
+    Edge-based Crouzeix-Raviart mass matrix.
 
     Diagonal ``(n_edges, n_edges)``: each face donates a third of its area to each of its three
     edges, so an interior edge's entry is a third of its two incident faces' summed area. Rows
@@ -1301,6 +1327,10 @@ def crouzeix_raviart_massmatrix(
     [`crouzeix_raviart_cotmatrix`][triwarp.laplacian.crouzeix_raviart_cotmatrix]
     [`mass_matrix`][triwarp.laplacian.mass_matrix]
     [`edges_unique`][triwarp.edges.edges_unique]
+
+    Notes
+    -----
+    Matches ``igl::crouzeix_raviart_massmatrix`` up to the edge numbering, as above.
     """
     unique_edges, edge_map = _edge_numbering(vertices, faces, unique_edges, edge_map)
     n_edges = int(unique_edges.shape[0])

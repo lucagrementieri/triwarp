@@ -1,5 +1,5 @@
 """
-Closing mesh boundary holes (Warp).
+Closing mesh boundary holes.
 
 Every boundary of a triangle mesh is an ordered vertex loop
 ([`boundary_loops`][triwarp.boundary.boundary_loops], the analog of
@@ -1428,7 +1428,7 @@ def fill_holes_nicely(
     | tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.bool]]
 ):
     """
-    Fill every boundary hole with a smooth, refined patch (MeshLib ``fillHoleNicely``).
+    Fill every boundary hole with a smooth, refined patch.
 
     Runs the full three-stage pipeline: a minimum-weight triangulation seals each hole over its
     existing rim vertices ([`fill_holes_min_weight`][triwarp.hole_filling.fill_holes_min_weight]),
@@ -1499,6 +1499,8 @@ def fill_holes_nicely(
 
     Notes
     -----
+    The three-stage pipeline is MeshLib's ``fillHoleNicely``.
+
     The subdivision and smoothing stages require a CUDA device (``warp.optim.linear.cg`` produces
     NaN on CPU in Warp 1.14-1.15); ``triangulate_only=True`` stays CPU-capable. Winding is
     consistent with the surrounding faces only for a consistently wound input.

@@ -1,5 +1,5 @@
 """
-Laplacian smoothing filters (Warp), for vertex positions and for per-vertex scalar fields.
+Laplacian smoothing filters, for vertex positions and for per-vertex scalar fields.
 
 Most of the module moves *geometry*: [`filter_laplacian`][triwarp.smoothing.filter_laplacian],
 [`filter_taubin`][triwarp.smoothing.filter_taubin],

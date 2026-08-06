@@ -39,7 +39,7 @@ def average_onto_faces(
     faces: wp.array[wp.int32], vertex_values: wp.array[wp.float32]
 ) -> twt.Array1dFloat32:
     """
-    Move a scalar field defined on vertices to faces by averaging (``igl::average_onto_faces``).
+    Move a scalar field defined on vertices to faces by averaging.
 
     Each face value is the mean of ``vertex_values`` at its three corners.
 
@@ -74,7 +74,7 @@ def average_onto_vertices(
     n_vertices: int, faces: wp.array[wp.int32], face_values: wp.array[wp.float32]
 ) -> wp.array[wp.float32]:
     """
-    Move a scalar field defined on faces to vertices by averaging (``igl::average_onto_vertices``).
+    Move a scalar field defined on faces to vertices by averaging.
 
     Each vertex value is the mean of ``face_values`` over incident triangle corners.
     Vertices referenced by no face divide by a zero valence and are ``nan``, matching

@@ -351,7 +351,7 @@ def mean_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
 
 def mean_unique_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> float:
     """
-    Mean length of the **unique** undirected edges (``igl::avg_edge_length``).
+    Mean length of the **unique** undirected edges.
 
     Each edge is counted once, however many faces share it. This is the definition
     ``igl::avg_edge_length`` and MeshLab's ``avg_edge_length`` both use, and the one

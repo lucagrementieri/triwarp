@@ -1,4 +1,4 @@
-"""Open and closed 3D polyline operations on NVIDIA Warp."""
+"""Open and closed 3D polyline operations."""
 
 from __future__ import annotations
 

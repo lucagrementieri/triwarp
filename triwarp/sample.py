@@ -1,4 +1,4 @@
-"""Surface and volume sampling for triangular meshes (Warp)."""
+"""Surface and volume sampling for triangular meshes."""
 
 from __future__ import annotations
 

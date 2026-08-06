@@ -1,5 +1,16 @@
 """
-Queries against a ``wp.Mesh`` surface: closest point, signed distance, winding number, thickness.
+Queries that ask where a point stands relative to a triangle mesh.
+
+Three answers, in increasing order of what they need from the mesh:
+[`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh] and
+[`normals_at_closest_faces`][triwarp.proximity.normals_at_closest_faces] need only a surface;
+[`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh] needs a consistent winding
+to give the distance a sign; and [`winding_number`][triwarp.proximity.winding_number] needs neither
+watertightness nor manifoldness, which is why it is the robust inside test on damaged input.
+[`containing_faces_2d`][triwarp.proximity.containing_faces_2d] is the planar case -- point location
+in a 2D triangulation -- and
+[`query_mesh_aabb_bounds_with_offsets`][triwarp.proximity.query_mesh_aabb_bounds_with_offsets] is
+the low-level box query the others are built over.
 
 [`thickness`][triwarp.proximity.thickness] and
 [`shape_diameter`][triwarp.proximity.shape_diameter] both measure how thick the volume is under a
@@ -8,10 +19,9 @@ sphere), the second fires a whole cone and takes an outlier-trimmed mean. For th
 counterpart -- how open a point is rather than how thick -- see
 [`triwarp.shading`][triwarp.shading].
 
-Mesh point queries ([`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh],
-[`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh])
-and [`contains_points`][triwarp.ray.contains_points] follow Warp's SDF sign convention: outside
-positive, inside negative. Trimesh ``signed_distance`` uses the opposite sign.
+Everything signed here, plus [`contains_points`][triwarp.ray.contains_points], follows Warp's SDF
+sign convention: outside positive, inside negative. Trimesh's ``signed_distance`` uses the opposite
+sign.
 
 Point-set acceleration structures (``wp.Bvh`` / ``wp.HashGrid``) and raw neighbor queries live in
 [`triwarp.neighbors`][triwarp.neighbors]; axis-aligned bounding boxes in
@@ -330,7 +340,7 @@ def winding_number(
     tiled: bool = True,
 ) -> wp.array[wp.float32]:
     """
-    Generalized winding number at each query point (``igl::winding_number``).
+    Generalized winding number at each query point.
 
     Sums the signed solid angle subtended by each oriented triangle. For a
     closed, consistently oriented watertight mesh, interior points have

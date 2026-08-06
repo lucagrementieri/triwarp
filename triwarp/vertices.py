@@ -144,7 +144,7 @@ def area_weighted_vertex_normals(
     face_areas: wp.array[wp.float32] | None = None,
 ) -> wp.array[wp.vec3]:
     """
-    Area-weighted vertex normals (``igl::PER_VERTEX_NORMALS_WEIGHTING_TYPE_AREA``).
+    Area-weighted vertex normals.
 
     Each face contributes its normal scaled by the triangle area at all three corners;
     contributions are summed per vertex and L2-normalized. This matches libigl's default

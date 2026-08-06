@@ -1,4 +1,4 @@
-"""Face-subset extraction and vertex-selection morphology (Warp)."""
+"""Face-subset extraction and vertex-selection morphology."""
 
 from __future__ import annotations
 
@@ -42,6 +42,11 @@ def region_boundary_edges(
     See Also
     --------
     [`expand_vertex_mask`][triwarp.selection.expand_vertex_mask]
+
+    Notes
+    -----
+    The same erosion as MeshLib's ``shrink``. MeshLab's Erode Selection is a *face*-based
+    operation and gives a different answer; see ``benchmarks/test_selection.py``.
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
@@ -420,7 +425,7 @@ def expand_vertex_mask(
     unique_edges: twt.Array2dInt32 | None = None,
 ) -> wp.array[wp.bool]:
     """
-    Grow a vertex selection by ``hops`` one-ring layers (MeshLib ``expand``).
+    Grow a vertex selection by ``hops`` one-ring layers.
 
     Each round adds every vertex sharing a mesh edge with a currently-selected vertex, so after
     ``hops`` rounds the mask covers all vertices within graph distance ``hops`` of the input
@@ -446,6 +451,10 @@ def expand_vertex_mask(
     See Also
     --------
     [`shrink_vertex_mask`][triwarp.selection.shrink_vertex_mask]
+
+    Notes
+    -----
+    The same dilation as MeshLib's ``expand``.
     """
     device = mask.device
     n = int(mask.shape[0])
@@ -475,7 +484,7 @@ def shrink_vertex_mask(
     unique_edges: twt.Array2dInt32 | None = None,
 ) -> wp.array[wp.bool]:
     """
-    Erode a vertex selection by ``hops`` one-ring layers (MeshLib ``shrink``).
+    Erode a vertex selection by ``hops`` one-ring layers.
 
     Implemented as the complement of an [`expand_vertex_mask`][triwarp.selection.expand_vertex_mask]
     of the complement: a vertex is removed if any vertex within ``hops`` hops is unselected.
@@ -499,6 +508,11 @@ def shrink_vertex_mask(
     See Also
     --------
     [`expand_vertex_mask`][triwarp.selection.expand_vertex_mask]
+
+    Notes
+    -----
+    The same erosion as MeshLib's ``shrink``. MeshLab's Erode Selection is a *face*-based
+    operation and gives a different answer; see ``benchmarks/test_selection.py``.
     """
     device = mask.device
     n = int(mask.shape[0])

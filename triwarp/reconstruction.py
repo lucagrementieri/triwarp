@@ -1,4 +1,20 @@
-"""Point-cloud surface reconstruction on NVIDIA Warp."""
+"""
+Building a triangle mesh out of something that is not one: a point cloud, or a scalar field.
+
+- **From an oriented point cloud.**
+  [`screened_poisson`][triwarp.reconstruction.screened_poisson] fits an implicit indicator function
+  and contours it, so it closes gaps and returns a watertight surface that need not pass through
+  any input point; [`ball_pivoting`][triwarp.reconstruction.ball_pivoting] instead *interpolates*
+  the points, rolling a ball over them, and leaves a hole wherever the ball falls through.
+  [`triangulate_point_cloud`][triwarp.reconstruction.triangulate_point_cloud] picks between them.
+- **From a scalar field.** [`marching_cubes`][triwarp.reconstruction.marching_cubes] extracts an
+  iso-level set of a dense lattice.
+- **From a mesh.** [`resample_uniform`][triwarp.reconstruction.resample_uniform] samples an
+  existing mesh's signed distance field on a uniform grid and re-extracts it, which is the way to
+  get a clean, uniformly-sampled surface out of a self-intersecting or badly-triangulated one.
+- **In the plane.** [`delaunay_triangulation`][triwarp.reconstruction.delaunay_triangulation]
+  triangulates a 2D point set.
+"""
 
 from __future__ import annotations
 

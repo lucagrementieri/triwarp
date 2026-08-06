@@ -290,6 +290,78 @@ def test_isin_sparse_large_indices(device: str) -> None:
     assert np.array_equal(mask_wp.numpy(), mask_np)
 
 
+def test_isin_negative_values(device: str) -> None:
+    """
+    Regression: the membership table is anchored at the global minimum, not at zero.
+
+    Anchored at zero this returned a *silent wrong answer* -- ``mark_membership_mask`` drops a
+    negative test value as out of range, so ``-5`` read back as absent while ``3`` was found.
+    """
+    elements_np = np.array([-5, 3, -1, 4, -5], dtype=np.int32)
+    test_np = np.array([3, -5], dtype=np.int32)
+    elements_wp = wp.array(elements_np, dtype=wp.int32, device=device)
+    test_wp = wp.array(test_np, dtype=wp.int32, device=device)
+    assert np.array_equal(
+        tw.array.isin(elements_wp, test_wp).numpy(), np.isin(elements_np, test_np)
+    )
+
+
+_ISIN_DTYPES = [
+    (wp.int8, np.int8),
+    (wp.uint8, np.uint8),
+    (wp.int16, np.int16),
+    (wp.uint16, np.uint16),
+    (wp.int32, np.int32),
+    (wp.uint32, np.uint32),
+    (wp.int64, np.int64),
+    (wp.uint64, np.uint64),
+]
+
+
+@pytest.mark.parametrize(
+    ("dtype_wp", "dtype_np"), _ISIN_DTYPES, ids=lambda d: getattr(d, "__name__", "")
+)
+def test_isin_integer_dtypes(device: str, dtype_wp: type, dtype_np: type) -> None:
+    """Every Warp integer dtype, on the membership-table branch. Sub-32-bit ones are widened."""
+    info = np.iinfo(dtype_np)
+    low, high = max(int(info.min), -60), min(int(info.max), 60)
+    rng = np.random.default_rng(19)
+    elements_np = rng.integers(low, high + 1, size=97).astype(dtype_np)
+    test_np = rng.integers(low, high + 1, size=11).astype(dtype_np)
+
+    elements_wp = wp.array(elements_np, dtype=dtype_wp, device=device)
+    test_wp = wp.array(test_np, dtype=dtype_wp, device=device)
+    assert np.array_equal(
+        tw.array.isin(elements_wp, test_wp).numpy(), np.isin(elements_np, test_np)
+    )
+
+
+@pytest.mark.parametrize(
+    ("dtype_wp", "dtype_np"), _ISIN_DTYPES, ids=lambda d: getattr(d, "__name__", "")
+)
+def test_isin_integer_dtypes_sparse(device: str, dtype_wp: type, dtype_np: type) -> None:
+    """The same dtypes on the sort + binary-search branch, where the span dwarfs the test set."""
+    span = min(int(np.iinfo(dtype_np).max), 2**40)
+    test_np = np.array([0, span // 3, span // 2, span], dtype=dtype_np)
+    elements_np = np.array([0, 1, span // 2, span], dtype=dtype_np)
+
+    elements_wp = wp.array(elements_np, dtype=dtype_wp, device=device)
+    test_wp = wp.array(test_np, dtype=dtype_wp, device=device)
+    assert np.array_equal(
+        tw.array.isin(elements_wp, test_wp).numpy(), np.isin(elements_np, test_np)
+    )
+
+
+def test_isin_rejects_mismatched_and_non_integer_dtypes(device: str) -> None:
+    """Both arrays must share one integer dtype: the kernels are instantiated per dtype."""
+    elements_wp = wp.array(np.arange(4, dtype=np.int64), dtype=wp.int64, device=device)
+    with pytest.raises(TypeError, match="one dtype"):
+        tw.array.isin(elements_wp, wp.array(np.array([1], np.int32), dtype=wp.int32, device=device))
+    floats_wp = wp.array(np.zeros(3, np.float32), dtype=wp.float32, device=device)
+    with pytest.raises(TypeError, match="integer dtype"):
+        tw.array.isin(floats_wp, floats_wp)
+
+
 def test_flatnonzero(device: str) -> None:
     rng = np.random.default_rng(11)
     mask_np = rng.choice([False, True], size=64, replace=True)

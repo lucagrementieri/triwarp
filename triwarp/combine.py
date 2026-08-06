@@ -288,7 +288,7 @@ def stitch_min_weight(
     up_dir: tuple[float, float, float] | None = None,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
-    Stitch two single-boundary open meshes with a minimum-weight band (MeshLib ``stitchHoles``).
+    Stitch two single-boundary open meshes with a minimum-weight band.
 
     Like [`stitch`][triwarp.combine.stitch] but joins the two rims with the metric-minimizing band
     of [`triangulate_boundaries_min_weight`][triwarp.hole_filling.triangulate_boundaries_min_weight]
@@ -323,6 +323,10 @@ def stitch_min_weight(
     --------
     [`triangulate_boundaries_min_weight`][triwarp.hole_filling.triangulate_boundaries_min_weight]
     [`stitch`][triwarp.combine.stitch]
+
+    Notes
+    -----
+    The band is MeshLib's ``stitchHoles``, and its metrics are that function's.
     """
     loops_a = [
         loop for loop in tw.boundary.boundary_loops(vertices_a, faces_a) if int(loop.shape[0]) >= 3
@@ -361,7 +365,7 @@ def stitch_nicely(
     | tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.bool]]
 ):
     """
-    Stitch two open meshes with a smooth, refined band (MeshLib ``stitchHolesNicely``).
+    Stitch two open meshes with a smooth, refined band.
 
     Like [`stitch_min_weight`][triwarp.combine.stitch_min_weight] but the connecting band is then
     subdivided and smoothed by the same finisher as
@@ -414,6 +418,10 @@ def stitch_nicely(
     --------
     [`stitch_min_weight`][triwarp.combine.stitch_min_weight]
     [`fill_holes_nicely`][triwarp.hole_filling.fill_holes_nicely]
+
+    Notes
+    -----
+    The three-stage pipeline is MeshLib's ``stitchHolesNicely``.
     """
     if metric not in tw.hole_filling._STITCH_METRIC_IDS:
         raise ValueError(

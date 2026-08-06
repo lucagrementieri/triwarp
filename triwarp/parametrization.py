@@ -241,7 +241,7 @@ def harmonic(
     k: int = 1,
 ) -> wp.array[wp.vec2]:
     """
-    Harmonic parametrization with fixed boundary (``igl::harmonic``).
+    Harmonic parametrization with fixed boundary.
 
     Minimizes the ``k``-harmonic energy built from the cotangent Laplacian
     [`cotmatrix`][triwarp.laplacian.cotmatrix] subject to the boundary vertices being pinned to
@@ -285,6 +285,10 @@ def harmonic(
     [`tutte`][triwarp.parametrization.tutte]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
     [`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle]
+
+    Notes
+    -----
+    Matches ``igl::harmonic``, ``k`` included.
     """
     if k < 1:
         raise ValueError(f"harmonic power k must be >= 1, got {k}.")
@@ -374,7 +378,7 @@ def arap(
     tolerance: float = 1e-7,
 ) -> wp.array[wp.vec2]:
     """
-    As-rigid-as-possible (ARAP) parametrization with fixed vertices (``igl::arap``, ``dim = 2``).
+    As-rigid-as-possible (ARAP) parametrization with fixed vertices.
 
     Minimizes the ARAP energy of the 2D parametrization by local/global alternation, starting from
     ``uv_init`` and keeping ``fixed_indices`` pinned to ``fixed_uv`` at every iteration. The local
@@ -616,7 +620,7 @@ def lscm(
     pinned_uv: wp.array[wp.vec2],
 ) -> wp.array[wp.vec2]:
     """
-    Constrained least-squares conformal map (``igl::lscm``).
+    Constrained least-squares conformal map.
 
     Computes the conformal (angle-preserving) parametrization that minimizes the LSCM (Levy)
     conformal energy subject to a set of pinned vertices, by solving a single quadratic program
@@ -713,7 +717,7 @@ def lscm_hessian(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
 ) -> wps.BsrMatrix[wp.float64]:
     """
-    LSCM Hessian ``Q = -repdiag(L, 2) - 2 A`` (``igl::lscm_hessian``).
+    LSCM Hessian ``Q = -repdiag(L, 2) - 2 A``.
 
     Assembles the ``(2n, 2n)`` symmetric operator behind the least-squares conformal map, where
     ``L`` is the cotangent Laplacian [`cotmatrix`][triwarp.laplacian.cotmatrix] (negative-diagonal
@@ -740,6 +744,10 @@ def lscm_hessian(
     [`lscm`][triwarp.parametrization.lscm]
     [`vector_area_matrix`][triwarp.parametrization.vector_area_matrix]
     [`cotmatrix`][triwarp.laplacian.cotmatrix]
+
+    Notes
+    -----
+    Matches ``igl::lscm_hessian``.
     """
     n = int(vertices.shape[0])
     device = vertices.device
@@ -787,7 +795,7 @@ def vector_area_matrix(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
 ) -> wps.BsrMatrix[wp.float64]:
     """
-    Boundary vector-area matrix ``A`` (``igl::vector_area_matrix``).
+    Boundary vector-area matrix ``A``: the signed area enclosed by the UV boundary curve.
 
     Assembles the ``(2n, 2n)`` matrix that turns the ``[u; v]`` quadratic form into the signed area
     enclosed by the boundary UV curve: for each **oriented** boundary edge ``(i, j)`` (from the face
@@ -813,6 +821,10 @@ def vector_area_matrix(
     [`lscm_hessian`][triwarp.parametrization.lscm_hessian]
     [`lscm`][triwarp.parametrization.lscm]
     [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]
+
+    Notes
+    -----
+    Matches ``igl::vector_area_matrix``.
     """
     n = int(vertices.shape[0])
     device = vertices.device

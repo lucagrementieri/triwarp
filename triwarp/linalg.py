@@ -113,7 +113,7 @@ def min_quad_with_fixed(
     check_every: int = CG_CHECK_EVERY,
 ) -> tuple[twt.Array2dFloat, wp.array[wp.int32], int]:
     """
-    Minimize a quadratic form with pinned degrees of freedom (``igl::min_quad_with_fixed``).
+    Minimize a quadratic form with pinned degrees of freedom.
 
     Eliminates the fixed degrees of freedom from ``0.5 x' Q x`` and solves the reduced symmetric
     system ``Q_uu x_u = -Q_ub bc`` for every right-hand-side column at once. Handles both shapes the
@@ -149,6 +149,9 @@ def min_quad_with_fixed(
 
     Notes
     -----
+    The elimination is ``igl::min_quad_with_fixed``'s, without its ``Aeq`` linear-equality block --
+    no caller here needs one.
+
     When every degree of freedom is pinned (``n_free == 0``) the prescribed values are the whole
     answer: an empty solution is returned without a solve, so this case also works on the CPU.
     Reconstructing the full field from ``solution`` / ``free_map`` is left to the caller's scatter.

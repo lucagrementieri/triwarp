@@ -1,5 +1,5 @@
 """
-Mesh boundary edges and vertices (Warp).
+Mesh boundary edges and vertices.
 
 A mesh edge lies on the boundary when it appears exactly once among all triangle edges.
 Boundary detection reuses [`group_int_rows`][triwarp.grouping.group_int_rows] (the analog of
