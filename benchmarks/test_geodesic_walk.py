@@ -1,5 +1,5 @@
 """
-Benchmarks for ``triwarp.tracing``: batched straightest-geodesic tracing.
+Benchmarks for ``triwarp.geodesic_walk``: batched straightest-geodesic geodesic_walk.
 
 Two axes, and the parameter is the interesting one:
 
@@ -10,8 +10,8 @@ Two axes, and the parameter is the interesting one:
   arc length, so meshes with similar triangle sizes give the same per-ray step count; what changes
   is locality, and this axis says whether that matters.
 
-Both entry points do the same walk. ``trace_geodesic_from_face`` skips the wedge search that
-``trace_geodesic_from_vertex`` needs to pick a starting face, so timing them apart separates the
+Both entry points do the same walk. ``trace_from_face`` skips the wedge search that
+``trace_from_vertex`` needs to pick a starting face, so timing them apart separates the
 walk from the setup.
 
 References
@@ -67,7 +67,7 @@ def _run_case(bench_case: BenchCase, n_rays: int) -> None:
             directions_np.astype(np.float32), dtype=wp.vec3, device=bench_case.device
         )
         _, offsets = bench_case.run(
-            lambda: tw.tracing.trace_geodesic_from_vertex(vertices, faces, start, directions),
+            lambda: tw.geodesic_walk.trace_from_vertex(vertices, faces, start, directions),
             rounds=_ROUNDS,
         )
         assert offsets.shape == (n_rays + 1,)
@@ -85,27 +85,27 @@ def _run_case(bench_case: BenchCase, n_rays: int) -> None:
         assert bench_case.run(trace_pp, rounds=_ROUNDS) > 0
 
 
-@pytest.mark.benchmark(group="trace_geodesic_rays")
+@pytest.mark.benchmark(group="trace_rays")
 @pytest.mark.benchmeshes("sphere_med")
 @pytest.mark.benchlibs("triwarp", "potpourri3d")
 @pytest.mark.parametrize("n_rays", _RAY_COUNTS)
-def test_trace_geodesic_ray_count(bench_case: BenchCase, n_rays: int) -> None:
+def test_trace_ray_count(bench_case: BenchCase, n_rays: int) -> None:
     """One mesh, 1 to 4 096 rays: the axis batching exists for."""
     _run_case(bench_case, n_rays)
 
 
-@pytest.mark.benchmark(group="trace_geodesic_locality")
+@pytest.mark.benchmark(group="trace_locality")
 @pytest.mark.benchaxis("diameter")
 @pytest.mark.benchlibs("triwarp")
-def test_trace_geodesic_locality(bench_case: BenchCase) -> None:
+def test_trace_locality(bench_case: BenchCase) -> None:
     """The same 1 024 rays on meshes of equal size but very different shape."""
     _run_case(bench_case, 1024)
 
 
-@pytest.mark.benchmark(group="trace_geodesic_from_face")
+@pytest.mark.benchmark(group="trace_from_face")
 @pytest.mark.benchaxis("scale")
 @pytest.mark.benchlibs("triwarp")
-def test_trace_geodesic_from_face(bench_case: BenchCase) -> None:
+def test_trace_from_face(bench_case: BenchCase) -> None:
     """The walk without the wedge search, from face-interior start points."""
     n_rays = 1024
     rng = np.random.default_rng(1)
@@ -122,7 +122,7 @@ def test_trace_geodesic_from_face(bench_case: BenchCase) -> None:
     )
     directions = wp.array(directions_np.astype(np.float32), dtype=wp.vec3, device=bench_case.device)
     _, offsets = bench_case.run(
-        lambda: tw.tracing.trace_geodesic_from_face(
+        lambda: tw.geodesic_walk.trace_from_face(
             vertices, faces, start_faces, barycentric, directions
         ),
         rounds=_ROUNDS,

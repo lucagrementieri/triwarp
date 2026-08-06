@@ -3,13 +3,21 @@ Straightest geodesics: walk a fixed distance across a mesh in a fixed direction.
 
 A *straightest* geodesic is what you get by walking forward and, at every edge, unfolding the two
 incident triangles into a common plane and continuing in a straight line. It is the surface analogue
-of "go that way for this far", which makes it the tool for exponential maps, streamline tracing and
+of "go that way for this far", which makes it the tool for exponential maps, streamline tracing
+and
 extending a direction field along a surface — and unlike a shortest path it is fixed by an initial
 condition rather than by two endpoints.
 
 Both entry points are batched over many rays: one thread walks one ray, and the traced polylines
 come back packed into one buffer with CSR offsets, the same shape
 [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched] uses.
+
+[`trace_from_vertex`][triwarp.geodesic_walk.trace_from_vertex] is the **exponential map** of the
+surface, and its inverse is [`log_map`][triwarp.heat.vector.log_map]: one takes a tangent direction
+and a distance to a point, the other takes a point back to the direction and distance that reach it.
+The two live apart because they are different methods -- this one unfolds triangles combinatorially,
+that one solves a vector-heat system -- and geodesic *distance* by the heat method is a third,
+[`heat_geodesic`][triwarp.heat.distance.heat_geodesic].
 
 !!! note "Cone points"
     A path that runs exactly into a vertex has no unique straightest continuation — the angle around
@@ -27,12 +35,12 @@ import warp as wp
 
 import triwarp as tw
 from triwarp.halfedge import halfedge_twins, vertex_one_rings
-from triwarp.kernels import tracing as kernel_tracing
+from triwarp.kernels import geodesic_walk as kernel_geodesic_walk
 
 _DEFAULT_MAX_STEPS = 4096
 
 
-def trace_geodesic_from_vertex(
+def trace_from_vertex(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     start_vertices: wp.array[wp.int32],
@@ -91,8 +99,8 @@ def trace_geodesic_from_vertex(
 
     See Also
     --------
-    [`trace_geodesic_from_face`][triwarp.tracing.trace_geodesic_from_face]
-    [`trace_geodesic_polylines`][triwarp.tracing.trace_geodesic_polylines]
+    [`trace_from_face`][triwarp.geodesic_walk.trace_from_face]
+    [`trace_polylines`][triwarp.geodesic_walk.trace_polylines]
     [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
     """
     device = vertices.device
@@ -128,10 +136,10 @@ def trace_geodesic_from_vertex(
         wp.int32(max_steps),
         wp.float32(_length_epsilon(vertices, faces)),
     ]
-    return _trace(kernel_tracing.trace_from_vertices, inputs, n_rays, device)
+    return _trace(kernel_geodesic_walk.trace_from_vertices, inputs, n_rays, device)
 
 
-def trace_geodesic_from_face(
+def trace_from_face(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     start_faces: wp.array[wp.int32],
@@ -143,7 +151,7 @@ def trace_geodesic_from_face(
     """
     Trace a straightest geodesic from each of a batch of barycentric points inside faces.
 
-    As [`trace_geodesic_from_vertex`][triwarp.tracing.trace_geodesic_from_vertex], but each ray
+    As [`trace_from_vertex`][triwarp.geodesic_walk.trace_from_vertex], but each ray
     starts at an interior point of a known face, so no wedge search is needed. This is the form for
     streamlines of a face-based vector field.
 
@@ -173,7 +181,7 @@ def trace_geodesic_from_face(
 
     See Also
     --------
-    [`trace_geodesic_from_vertex`][triwarp.tracing.trace_geodesic_from_vertex]
+    [`trace_from_vertex`][triwarp.geodesic_walk.trace_from_vertex]
     [`barycentric_to_points`][triwarp.triangles.barycentric_to_points]
     """
     device = vertices.device
@@ -196,10 +204,10 @@ def trace_geodesic_from_face(
         wp.int32(max_steps),
         wp.float32(_length_epsilon(vertices, faces)),
     ]
-    return _trace(kernel_tracing.trace_from_faces, inputs, n_rays, device)
+    return _trace(kernel_geodesic_walk.trace_from_faces, inputs, n_rays, device)
 
 
-def trace_geodesic_polylines(
+def trace_polylines(
     points: wp.array[wp.vec3], offsets: wp.array[wp.int32], *, copy: bool = False
 ) -> list[wp.array[wp.vec3]]:
     """
@@ -213,8 +221,8 @@ def trace_geodesic_polylines(
     ----------
     points
         Packed traced points from
-        [`trace_geodesic_from_vertex`][triwarp.tracing.trace_geodesic_from_vertex] or
-        [`trace_geodesic_from_face`][triwarp.tracing.trace_geodesic_from_face].
+        [`trace_from_vertex`][triwarp.geodesic_walk.trace_from_vertex] or
+        [`trace_from_face`][triwarp.geodesic_walk.trace_from_face].
     offsets
         The matching length-``n_rays + 1`` CSR bounds.
     copy

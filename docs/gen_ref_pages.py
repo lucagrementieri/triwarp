@@ -31,28 +31,30 @@ SECTIONS: dict[str, list[str]] = {
         "totals",
         "selection",
     ],
-    "Mesh editing & repair": [
-        "repair",
-        "holes",
-        "combine",
-        "remesh",
-        "smoothing",
-        "seams",
-    ],
+    "Mesh editing & repair": ["repair", "holes", "combine", "remesh", "smoothing", "seams"],
     "Queries & measures": [
         "proximity",
         "neighbors",
         "bounds",
         "ray",
         "distance",
-        "tracing",
         "intersection",
         "curvature",
         "convex",
         "visibility",
     ],
     "Operators & fields": ["laplacian", "linalg", "interpolation", "parametrization"],
-    "Heat-method solvers": ["heat.distance", "heat.vector", "heat.signed"],
+    # ``geodesic_walk`` first: a direct combinatorial walk is the simpler thing, and section 11
+    # orders a section by expected frequency of use. It is listed here rather than under
+    # "Queries & measures" so the package's two geodesic entry points -- the walk and
+    # ``heat.distance.heat_geodesic`` -- are shelved together; a module may appear in exactly one
+    # section, so widening this one is the fix and moving ``heat_geodesic`` is not.
+    "Geodesics & heat-method solvers": [
+        "geodesic_walk",
+        "heat.distance",
+        "heat.vector",
+        "heat.signed",
+    ],
     "Point clouds & registration": ["points", "sample", "reconstruction", "registration"],
     "Curves": ["polyline"],
     "Attributes & I/O": ["texture", "io"],

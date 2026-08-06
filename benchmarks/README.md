@@ -683,7 +683,7 @@ Both were found while writing the parity asserts, and both fail *silently* rathe
 |---|---|
 | `test_heat_distance` | `MeshHeatMethodDistanceSolver` (`use_robust=False`, the same discretization as triwarp's), and `MeshFastMarchingDistanceSolver` as a different algorithm for the same task |
 | `test_contour` | `marching_triangles` — the only reference for isocontours of an arbitrary vertex field |
-| `test_tracing` | `GeodesicTracer.trace_geodesic_from_vertex` — one ray per call, so its row is linear in the ray count by construction |
+| `test_geodesic_walk` | `GeodesicTracer.trace_geodesic_from_vertex` — one ray per call, so its row is linear in the ray count by construction |
 | `test_heat_signed` | `MeshSignedHeatSolver.compute_distance` — requires every curve segment inside one face, which is why the source curves are edge paths |
 | `test_heat_vector` | `MeshVectorHeatSolver.{extend_scalar,transport_tangent_vectors,compute_log_map}` (`use_intrinsic_delaunay=False`) |
 | `test_tangent` | `MeshVectorHeatSolver.get_tangent_frames` (`use_intrinsic_delaunay=False`) — an *upper bound*: the frames only come out of the solver's construction, which also factors two sparse systems |
@@ -720,7 +720,7 @@ costs *less* than a 6-segment one (71 vs 81 ms), because a source spread over th
 fewer conjugate-gradient iterations. Pinning the level set costs 4.7x an unconstrained solve
 (80.6 against 17.3 ms).
 
-The tangent-space and tracing groups repeat both halves of that story. `trace_geodesic_rays` is **flat
+The tangent-space and geodesic-walk groups repeat both halves of that story. `trace_rays` is **flat
 at 1.15 ms from 1 to 4 096 rays** against potpourri3d's 63 → 77 ms (55x → 67x), because one thread
 traces one ray and the reference's API traces one ray per call. `log_map` is 6.8x faster at `saddle`
 and only 2.6x at `saddle_graded` — triwarp's vector solve pays **2.7x** for the aspect ratio there,

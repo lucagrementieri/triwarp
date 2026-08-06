@@ -1,5 +1,5 @@
 """
-Regression tests for ``triwarp.tracing`` against potpourri3d (CPU reference).
+Regression tests for ``triwarp.geodesic_walk`` against potpourri3d (CPU reference).
 
 Two things are checked independently of the reference, because they are what "a geodesic" means: the
 traced arc length equals the requested one (the direction's tangential magnitude), and every traced
@@ -44,7 +44,7 @@ def _path_length(points: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
-# trace_geodesic_from_vertex
+# trace_from_vertex
 # ---------------------------------------------------------------------------
 
 
@@ -55,7 +55,7 @@ def test_trace_from_vertex_walks_the_requested_distance(
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     start_np, directions_np = _rays(mesh_tm, 24, seed=0)
     frames_wp = tw.tangent_space.vertex_tangent_frames(mesh_wp.points, mesh_wp.indices)
-    points_wp, offsets_wp = tw.tracing.trace_geodesic_from_vertex(
+    points_wp, offsets_wp = tw.geodesic_walk.trace_from_vertex(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(start_np, dtype=wp.int32, device=mesh_wp.device),
@@ -67,7 +67,7 @@ def test_trace_from_vertex_walks_the_requested_distance(
     is_boundary = tw.halfedge.vertex_one_rings(mesh_wp.indices, n_vertices=len(mesh_tm.vertices))[
         2
     ].numpy()
-    curves = tw.tracing.trace_geodesic_polylines(points_wp, offsets_wp)
+    curves = tw.geodesic_walk.trace_polylines(points_wp, offsets_wp)
     for ray, (start, direction) in enumerate(zip(start_np, directions_np, strict=True)):
         points = curves[ray].numpy()
         requested = _tangential_length(direction.astype(np.float64), normals[start])
@@ -87,7 +87,7 @@ def test_trace_from_vertex_stays_on_the_surface(
 ) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     start_np, directions_np = _rays(mesh_tm, 24, seed=1)
-    points_wp, _ = tw.tracing.trace_geodesic_from_vertex(
+    points_wp, _ = tw.geodesic_walk.trace_from_vertex(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(start_np, dtype=wp.int32, device=mesh_wp.device),
@@ -103,7 +103,7 @@ def test_trace_from_vertex_stays_on_the_surface(
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
-@pytest.mark.parity("trace_geodesic_rays", "potpourri3d")
+@pytest.mark.parity("trace_rays", "potpourri3d")
 def test_trace_from_vertex_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
@@ -112,13 +112,13 @@ def test_trace_from_vertex_matches_potpourri3d(
     faces_np = np.ascontiguousarray(mesh_tm.faces, dtype=np.int32)
     start_np, directions_np = _rays(mesh_tm, 12, seed=2)
 
-    points_wp, offsets_wp = tw.tracing.trace_geodesic_from_vertex(
+    points_wp, offsets_wp = tw.geodesic_walk.trace_from_vertex(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(start_np, dtype=wp.int32, device=mesh_wp.device),
         wp.array(directions_np, dtype=wp.vec3, device=mesh_wp.device),
     )
-    curves = tw.tracing.trace_geodesic_polylines(points_wp, offsets_wp)
+    curves = tw.geodesic_walk.trace_polylines(points_wp, offsets_wp)
 
     tracer_pp = pp3d.GeodesicTracer(vertices_np, faces_np)
     edge_length = float(
@@ -153,7 +153,7 @@ def test_trace_from_vertex_stops_at_the_boundary(
     outward = np.asarray(mesh_tm.vertices)[boundary] - centroid  # type: ignore[attr-defined]
     outward *= 100.0 / np.linalg.norm(outward, axis=1, keepdims=True)
 
-    points_wp, offsets_wp = tw.tracing.trace_geodesic_from_vertex(
+    points_wp, offsets_wp = tw.geodesic_walk.trace_from_vertex(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(boundary, dtype=wp.int32, device=mesh_wp.device),
@@ -171,7 +171,7 @@ def test_trace_from_vertex_stops_at_the_boundary(
 
 
 # ---------------------------------------------------------------------------
-# trace_geodesic_from_face
+# trace_from_face
 # ---------------------------------------------------------------------------
 
 
@@ -194,14 +194,14 @@ def test_trace_from_face_matches_potpourri3d(
     directions = rng.normal(size=(n_rays, 3))
     directions *= scale / np.linalg.norm(directions, axis=1, keepdims=True)
 
-    points_wp, offsets_wp = tw.tracing.trace_geodesic_from_face(
+    points_wp, offsets_wp = tw.geodesic_walk.trace_from_face(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(start_faces, dtype=wp.int32, device=mesh_wp.device),
         wp.array(barycentric.astype(np.float32), dtype=wp.vec3, device=mesh_wp.device),
         wp.array(directions.astype(np.float32), dtype=wp.vec3, device=mesh_wp.device),
     )
-    curves = tw.tracing.trace_geodesic_polylines(points_wp, offsets_wp)
+    curves = tw.geodesic_walk.trace_polylines(points_wp, offsets_wp)
 
     tracer_pp = pp3d.GeodesicTracer(vertices_np, faces_np)
     for ray in range(n_rays):
@@ -219,7 +219,7 @@ def test_trace_from_face_zero_direction_is_a_single_point(
     icosahedron: tuple[object, wp.Mesh], device: str
 ) -> None:
     _, mesh_wp = icosahedron
-    points_wp, offsets_wp = tw.tracing.trace_geodesic_from_face(
+    points_wp, offsets_wp = tw.geodesic_walk.trace_from_face(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device),
@@ -237,7 +237,7 @@ def test_trace_empty(device: str) -> None:
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
     empty_int = wp.empty(0, dtype=wp.int32, device=device)
     empty_vec = wp.empty(0, dtype=wp.vec3, device=device)
-    points_wp, offsets_wp = tw.tracing.trace_geodesic_from_vertex(
+    points_wp, offsets_wp = tw.geodesic_walk.trace_from_vertex(
         vertices_wp, faces_wp, empty_int, empty_vec
     )
     assert points_wp.shape == (0,)

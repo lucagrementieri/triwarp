@@ -894,7 +894,7 @@ def counts_to_offsets(
     -----
     Two offsets conventions coexist in this package: the length-``n`` form, with the total
     implicit, and the length-``n + 1`` form that stores it (``halfedge.vertex_one_rings``,
-    ``tracing.trace_geodesic_from_vertex``, and every ``segmented_sort_pairs`` caller). Both come
+    ``geodesic_walk.trace_from_vertex``, and every ``segmented_sort_pairs`` caller). Both come
     out of here, so no caller has to append the terminator afterwards.
 
     See Also

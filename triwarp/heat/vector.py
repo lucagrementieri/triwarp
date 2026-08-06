@@ -282,7 +282,7 @@ def log_map(
     ``log_map(...)[v]`` is the 2D point in the *source's* frame whose length is the geodesic
     distance to ``v``, and whose direction is the initial direction of the geodesic that reaches
     ``v``. It is the inverse of the exponential map
-    [`trace_geodesic_from_vertex`][triwarp.tracing.trace_geodesic_from_vertex]
+    [`trace_from_vertex`][triwarp.geodesic_walk.trace_from_vertex]
     computes, and the standard way to lay out a local coordinate patch around a point.
 
     Assembled from two fields that are each cheap: the distance to the source
@@ -330,7 +330,7 @@ def log_map(
     See Also
     --------
     [`transport_tangent_vectors`][triwarp.heat.vector.transport_tangent_vectors]
-    [`trace_geodesic_from_vertex`][triwarp.tracing.trace_geodesic_from_vertex]
+    [`trace_from_vertex`][triwarp.geodesic_walk.trace_from_vertex]
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
