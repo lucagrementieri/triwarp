@@ -1,4 +1,10 @@
-"""Bounding boxes: the axis-aligned box, its diagonal and union, and the oriented box."""
+"""
+Bounding boxes: the axis-aligned box, its diagonal and union, and the oriented box.
+
+[`enclosing_diagonal`][triwarp.bounds.enclosing_diagonal] is the one entry point here that
+exists for another module's sake rather than its own: it is the default search radius every
+mesh query in the package derives from its input's extent.
+"""
 
 from __future__ import annotations
 
@@ -129,6 +135,45 @@ def aabb_union(
         max(a_max[0], b_max[0]), max(a_max[1], b_max[1]), max(a_max[2], b_max[2])
     )
     return combined_min, combined_max
+
+
+def enclosing_diagonal(points: wp.array[wp.vec3], other: wp.array[wp.vec3] | None = None) -> float:
+    """
+    Diagonal of the axis-aligned box enclosing one or two point sets.
+
+    The default search radius for every mesh query in the package: no closest point, ray hit or
+    tangent sphere can be further away than the diagonal of a box containing both the surface and
+    the query points, so it is the smallest bound that is guaranteed not to cut an answer off. Pass
+    ``other`` whenever the queries may lie outside the mesh's own box, which is the usual case --
+    with ``points`` alone a query far outside would get a radius too short to reach the surface.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` positions as ``wp.vec3``, typically a mesh's vertices.
+    other
+        Optional second ``(m,)`` set, typically the query points. ``None`` or empty measures
+        ``points`` alone.
+
+    Returns
+    -------
+    float
+        ``|max_bound - min_bound|`` of the union box. ``inf`` when ``points`` is empty, since an
+        empty box has infinite negative extent -- callers guard on the point count first.
+
+    See Also
+    --------
+    [`aabb_bounds`][triwarp.bounds.aabb_bounds]
+    [`aabb_union`][triwarp.bounds.aabb_union]
+    [`aabb_diagonal`][triwarp.bounds.aabb_diagonal]
+        The same length from corners the caller already holds.
+    """
+    points_min, points_max = aabb_bounds(points)
+    if other is None or int(other.shape[0]) == 0:
+        return aabb_diagonal(points_min, points_max)
+    other_min, other_max = aabb_bounds(other)
+    union_min, union_max = aabb_union(points_min, points_max, other_min, other_max)
+    return aabb_diagonal(union_min, union_max)
 
 
 def oriented_bounding_box(

@@ -147,6 +147,56 @@ def test_aabb_union_matches_a_pooled_reduction(device: str) -> None:
     assert np.allclose(_bounds_np(union_min, union_max), _bounds_np(pooled_min, pooled_max))
 
 
+@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parity("enclosing_diagonal", "igl")
+def test_enclosing_diagonal_matches_igl_on_the_pooled_cloud(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B: equal to ``igl.bounding_box_diagonal`` of the two clouds *stacked*.
+
+    The named transform is the stacking -- igl takes one point set, so the two-set signature maps
+    onto it by concatenating, which is exactly the quantity ``enclosing_diagonal`` is defined as.
+    Non-vacuous by construction: the queries are pushed outside the mesh's own box along every axis,
+    so the union box is strictly larger than either input's and a one-sided implementation
+    (measuring ``points`` alone, or ``other`` alone) fails.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float64)
+    rng = np.random.default_rng(11)
+    # Offset by the full extent so no query lands inside the mesh's box.
+    extent_np = vertices_np.max(axis=0) - vertices_np.min(axis=0)
+    queries_np = rng.random((64, 3)) * extent_np + vertices_np.max(axis=0)
+
+    queries_wp = wp.array(
+        np.ascontiguousarray(queries_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    diagonal_wp = tw.bounds.enclosing_diagonal(mesh_wp.points, queries_wp)
+    diagonal_igl = igl.bounding_box_diagonal(np.vstack([vertices_np, queries_np]))
+
+    assert diagonal_igl > 0.0
+    # Strictly larger than either side alone, or the union is not being taken.
+    assert diagonal_wp > tw.bounds.enclosing_diagonal(mesh_wp.points) + 1e-4
+    assert diagonal_wp > tw.bounds.enclosing_diagonal(queries_wp) + 1e-4
+    assert np.allclose(diagonal_wp, diagonal_igl, rtol=1e-5, atol=1e-5)
+
+
+def test_enclosing_diagonal_ignores_an_empty_second_set(device: str) -> None:
+    """``other=None`` and ``other=<empty>`` both measure ``points`` alone."""
+    rng = np.random.default_rng(12)
+    cloud_wp = wp.array(
+        np.ascontiguousarray(rng.normal(size=(128, 3)), dtype=np.float32),
+        dtype=wp.vec3,
+        device=device,
+    )
+    empty_wp = wp.empty(0, dtype=wp.vec3, device=device)
+
+    alone = tw.bounds.enclosing_diagonal(cloud_wp)
+    assert alone == tw.bounds.enclosing_diagonal(cloud_wp, None)
+    assert alone == tw.bounds.enclosing_diagonal(cloud_wp, empty_wp)
+    assert alone == tw.bounds.aabb_diagonal(*tw.bounds.aabb_bounds(cloud_wp))
+
+
 def _tilted_cloud(mesh_tm: tm.Trimesh, device: str) -> tuple[np.ndarray, wp.array[wp.vec3]]:
     """
     Stretch a fixture's vertices anisotropically and rotate them off the coordinate axes.

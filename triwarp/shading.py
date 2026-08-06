@@ -25,8 +25,9 @@ from typing import Literal
 import warp as wp
 
 import triwarp as tw
+from triwarp.bounds import enclosing_diagonal
 from triwarp.kernels import shading as kernel_shading
-from triwarp.proximity import _default_mesh_query_max_dist, normals_at_closest_faces
+from triwarp.proximity import normals_at_closest_faces
 
 # Ray-origin offset along the normal, as a fraction of the query AABB diagonal. Without it every
 # ray would hit the surface it started on; the value is small enough not to shadow a real occluder
@@ -208,7 +209,7 @@ def _occlusion_bundle(
             f"normals must have one entry per point, got {normals.shape[0]} for {m} points"
         )
 
-    diagonal = _default_mesh_query_max_dist(mesh.points, points)
+    diagonal = enclosing_diagonal(mesh.points, points)
     directions = tw.sample.sample_fibonacci_hemisphere(n_rays, device=device)
     wp.launch(
         kernel_shading.obscurance,

@@ -118,7 +118,7 @@ def closest_point_on_mesh(
     require_nonempty_mesh(faces, "closest_point_on_mesh")
     mesh = wp.Mesh(points=wp.clone(vertices), indices=wp.clone(faces))
     if max_dist is None:
-        max_dist = _default_mesh_query_max_dist(mesh.points, points)
+        max_dist = tw.bounds.enclosing_diagonal(mesh.points, points)
 
     out_closest = wp.empty(m, dtype=wp.vec3, device=device)
     out_distance = wp.empty(m, dtype=wp.float32, device=device)
@@ -164,7 +164,7 @@ def normals_at_closest_faces(
         return wp.empty(0, dtype=wp.vec3, device=device)
 
     if max_dist is None:
-        max_dist = _default_mesh_query_max_dist(mesh.points, points)
+        max_dist = tw.bounds.enclosing_diagonal(mesh.points, points)
 
     out_closest = wp.empty(m, dtype=wp.vec3, device=device)
     out_dist = wp.empty(m, dtype=wp.float32, device=device)
@@ -299,7 +299,7 @@ def signed_distance_on_mesh(
         support_winding_number=sign_mode == "winding",
     )
     if max_dist is None:
-        max_dist = _default_mesh_query_max_dist(mesh.points, points)
+        max_dist = tw.bounds.enclosing_diagonal(mesh.points, points)
     out_distance = wp.empty(m, dtype=wp.float32, device=device)
     if sign_mode == "winding":
         wp.launch(
@@ -460,7 +460,7 @@ def max_tangent_sphere(
 
     ray_dirs: wp.array[wp.vec3] = -normals if inwards else normals
 
-    max_t = _default_mesh_query_max_dist(mesh.points, points)
+    max_t = tw.bounds.enclosing_diagonal(mesh.points, points)
     distances = tw.ray.longest_ray(mesh, points, ray_dirs, max_t=max_t)
 
     n_verts = int(mesh.points.shape[0])
@@ -688,7 +688,7 @@ def thickness(
             normals = normals_at_closest_faces(mesh, points)
 
         ray_dirs = normals if exterior else -normals
-        max_t = _default_mesh_query_max_dist(mesh.points, points)
+        max_t = tw.bounds.enclosing_diagonal(mesh.points, points)
         return tw.ray.longest_ray(mesh, points, ray_dirs, max_t=max_t)
 
     else:
@@ -797,7 +797,7 @@ def shape_diameter(
             f"normals must have one entry per point, got {normals.shape[0]} for {m} points"
         )
 
-    diagonal = _default_mesh_query_max_dist(mesh.points, points)
+    diagonal = tw.bounds.enclosing_diagonal(mesh.points, points)
     directions = tw.sample.sample_fibonacci_cone(n_rays, cone_angle, device=device)
     # Distances are kept so the trimming pass can revisit them against a mean the first pass had not
     # finished computing; re-tracing instead would double the only expensive part of the kernel.
@@ -894,7 +894,7 @@ def containing_faces_2d(
     wp.map(kernel_proximity.lift_vec2, vertices, out=lifted)
     # One readback, the same one `closest_point_on_mesh` pays and for the same reason: the search
     # radius has to be in the triangulation's own units and nothing else knows its scale.
-    search_radius = _CONTAINMENT_SEARCH_SCALE * _default_mesh_query_max_dist(lifted)
+    search_radius = _CONTAINMENT_SEARCH_SCALE * tw.bounds.enclosing_diagonal(lifted)
 
     require_nonempty_mesh(faces, "containing_faces_2d")
     mesh = wp.Mesh(points=lifted, indices=wp.clone(faces))
@@ -914,20 +914,3 @@ def containing_faces_2d(
         device=device,
     )
     return out_face
-
-
-def _default_mesh_query_max_dist(
-    mesh_points: wp.array[wp.vec3], query_points: wp.array[wp.vec3] | None = None
-) -> float:
-    """
-    Diagonal of the AABB enclosing ``mesh_points`` and ``query_points``.
-
-    When ``query_points`` is ``None`` (or empty), returns the diagonal of the
-    axis-aligned bounding box of ``mesh_points`` alone.
-    """
-    mesh_min, mesh_max = tw.bounds.aabb_bounds(mesh_points)
-    if query_points is None or int(query_points.shape[0]) == 0:
-        return tw.bounds.aabb_diagonal(mesh_min, mesh_max)
-    query_min, query_max = tw.bounds.aabb_bounds(query_points)
-    combined_min, combined_max = tw.bounds.aabb_union(mesh_min, mesh_max, query_min, query_max)
-    return tw.bounds.aabb_diagonal(combined_min, combined_max)

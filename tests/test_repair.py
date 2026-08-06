@@ -910,7 +910,7 @@ def test_collapse_small_triangles_removes_sliver(icosahedron: tuple[tm.Trimesh, 
     # Sliver is gone.
     assert out_faces_wp.shape[0] // 3 < faces_np.shape[0]
     # Invariant (libigl fixpoint guarantee): no surviving triangle is below threshold.
-    bbd = tw.proximity._default_mesh_query_max_dist(out_vertices_wp)
+    bbd = tw.bounds.enclosing_diagonal(out_vertices_wp)
     _, areas_wp = tw.triangles.face_normals_and_areas(out_vertices_wp, out_faces_wp)
     assert (2.0 * areas_wp.numpy()).min() >= epsilon * bbd * bbd * (1.0 - 1e-3)
     # Surviving triangle geometry matches the CPU reference.
@@ -946,7 +946,7 @@ def test_collapse_small_triangles_fan_chain(device: str) -> None:
         vertices_wp, faces_wp, epsilon=epsilon
     )
 
-    bbd = tw.proximity._default_mesh_query_max_dist(out_vertices_wp)
+    bbd = tw.bounds.enclosing_diagonal(out_vertices_wp)
     _, areas_wp = tw.triangles.face_normals_and_areas(out_vertices_wp, out_faces_wp)
     assert (2.0 * areas_wp.numpy()).min() >= epsilon * bbd * bbd * (1.0 - 1e-3)
     ref = _collapse_small_triangles_ref(vertices_np.astype(np.float64), faces_np, epsilon)

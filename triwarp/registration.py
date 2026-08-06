@@ -333,7 +333,7 @@ def icp(
         assert target_faces is not None
         require_nonempty_mesh(target_faces, "icp")
         mesh = wp.Mesh(points=wp.clone(target_vertices), indices=wp.clone(target_faces))
-        query_max = tw.proximity._default_mesh_query_max_dist(mesh.points, current)
+        query_max = tw.bounds.enclosing_diagonal(mesh.points, current)
         if max_distance is not None:
             query_max = max(query_max, max_distance)
     else:
@@ -555,7 +555,7 @@ def icp_point_to_plane(
         require_nonempty_mesh(target_faces, "icp_point_to_plane")
         mesh = wp.Mesh(points=wp.clone(target_vertices), indices=wp.clone(target_faces))
         face_normals, _ = tw.triangles.face_normals_and_areas(target_vertices, target_faces)
-        query_max = tw.proximity._default_mesh_query_max_dist(mesh.points, current)
+        query_max = tw.bounds.enclosing_diagonal(mesh.points, current)
         if max_distance is not None:
             query_max = max(query_max, max_distance)
     else:

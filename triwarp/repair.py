@@ -568,7 +568,7 @@ def collapse_small_triangles(
     if n_faces == 0 or int(vertices.shape[0]) == 0:
         return wp.clone(vertices), wp.clone(faces)
 
-    bbd = tw.proximity._default_mesh_query_max_dist(vertices)
+    bbd = tw.bounds.enclosing_diagonal(vertices)
     min_dbl_area = wp.float32(2.0 * epsilon * bbd * bbd)
 
     current_vertices = vertices

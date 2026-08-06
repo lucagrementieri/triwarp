@@ -59,6 +59,7 @@ import igl
 import numpy as np
 import pytest
 import trimesh as tm
+import warp as wp
 from conftest import BenchCase
 
 import triwarp as tw
@@ -67,6 +68,33 @@ import triwarp as tw
 # Fixed and shared: the two libraries search the identical candidate set, so a row that let them
 # score different counts would compare quality against cost. It is also triwarp's own default.
 _ROTATIONS = 4096
+
+# Query points for the ``enclosing_diagonal`` row. Fixed count and seed: the cost is two box
+# reductions and is flat in the second cloud's size at any realistic count, so sweeping it would
+# add a second axis measuring nothing.
+_N_QUERIES = 10_000
+_QUERY_SEED = 7
+
+_query_cache: dict[tuple[str, str], wp.array[wp.vec3]] = {}
+
+
+def _queries_np(bench_case: BenchCase) -> np.ndarray:
+    """Query points outside the mesh's own box, so the union is strictly larger than either side."""
+    rng = np.random.default_rng(_QUERY_SEED)
+    vertices = bench_case.vertices_np
+    extent = vertices.max(axis=0) - vertices.min(axis=0)
+    return rng.random((_N_QUERIES, 3)) * extent + vertices.max(axis=0)
+
+
+def _queries_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _query_cache:
+        _query_cache[key] = wp.array(
+            np.ascontiguousarray(_queries_np(bench_case), dtype=np.float32),
+            dtype=wp.vec3,
+            device=bench_case.device,
+        )
+    return _query_cache[key]
 
 
 @pytest.mark.benchmark(group="aabb_bounds")
@@ -114,6 +142,34 @@ def test_aabb_diagonal(bench_case: BenchCase) -> None:
     vertices_np = bench_case.vertices_np
     diagonal_igl = bench_case.run(lambda: igl.bounding_box_diagonal(vertices_np))
     assert diagonal_igl >= 0.0
+
+
+@pytest.mark.benchmark(group="enclosing_diagonal")
+@pytest.mark.benchlibs("triwarp", "igl")
+def test_enclosing_diagonal(bench_case: BenchCase) -> None:
+    """
+    The default search radius every mesh query derives, over the mesh *and* the query points.
+
+    Two clouds rather than one, which is the axis that separates this from ``aabb_diagonal`` above:
+    it is two box reductions and therefore two host readbacks, so the row answers whether the
+    default costs twice the single-cloud reduction or whether the second readback disappears into
+    the first launch's latency. Every ``max_dist=None`` call in ``proximity``, ``ray``,
+    ``visibility`` and ``registration`` pays exactly this.
+
+    igl's ``bounding_box_diagonal`` takes one point set, so its side is fed the stacked cloud --
+    which makes its row also price the ``vstack`` a caller would need, and that copy is the point:
+    triwarp never materializes the union.
+    """
+    if bench_case.kind == "triwarp":
+        vertices, queries = bench_case.vertices_wp, _queries_wp(bench_case)
+        diagonal = bench_case.run(lambda: tw.bounds.enclosing_diagonal(vertices, queries))
+        assert diagonal > 0.0
+        return
+    vertices_np, queries_np = bench_case.vertices_np, _queries_np(bench_case)
+    diagonal_igl = bench_case.run(
+        lambda: igl.bounding_box_diagonal(np.vstack([vertices_np, queries_np]))
+    )
+    assert diagonal_igl > 0.0
 
 
 @pytest.mark.benchmark(group="oriented_bounding_box")

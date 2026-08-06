@@ -5,11 +5,10 @@ from __future__ import annotations
 import warp as wp
 
 import triwarp as tw
-from triwarp.bounds import aabb_bounds
+from triwarp.bounds import aabb_bounds, enclosing_diagonal
 from triwarp.constants import TOLERANCE_PLANAR
 from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import ray as kernel_ray
-from triwarp.proximity import _default_mesh_query_max_dist as default_mesh_query_max_dist
 
 
 def _validate_ray_inputs(
@@ -63,7 +62,7 @@ def intersects_location(
 
     _validate_ray_inputs(mesh, ray_origins, ray_directions)
     if max_t is None:
-        max_t = default_mesh_query_max_dist(mesh.points, ray_origins)
+        max_t = enclosing_diagonal(mesh.points, ray_origins)
 
     index_ray = wp.empty(n, dtype=wp.int32, device=device)
     index_tri = wp.empty(n, dtype=wp.int32, device=device)
@@ -126,7 +125,7 @@ def intersects_first(
         return wp.empty(0, dtype=wp.int32, device=ray_origins.device)
     _validate_ray_inputs(mesh, ray_origins, ray_directions)
     if max_t is None:
-        max_t = default_mesh_query_max_dist(mesh.points, ray_origins)
+        max_t = enclosing_diagonal(mesh.points, ray_origins)
 
     out_triangle_index = wp.empty(n, dtype=wp.int32, device=ray_origins.device)
     locations_scratch = wp.empty(n, dtype=wp.vec3, device=ray_origins.device)
@@ -177,7 +176,7 @@ def intersects_any(
         return wp.empty(0, dtype=wp.bool, device=ray_origins.device)
     _validate_ray_inputs(mesh, ray_origins, ray_directions)
     if max_t is None:
-        max_t = default_mesh_query_max_dist(mesh.points, ray_origins)
+        max_t = enclosing_diagonal(mesh.points, ray_origins)
 
     out_hit = wp.empty(n, dtype=wp.bool, device=ray_origins.device)
     wp.map(
@@ -233,7 +232,7 @@ def longest_ray(
         return wp.empty(0, dtype=wp.float32, device=ray_origins.device)
     _validate_ray_inputs(mesh, ray_origins, ray_directions)
     if max_t is None:
-        max_t = default_mesh_query_max_dist(mesh.points, ray_origins)
+        max_t = enclosing_diagonal(mesh.points, ray_origins)
 
     out_distances = wp.empty(n, dtype=wp.float32, device=ray_origins.device)
     wp.map(
@@ -305,7 +304,7 @@ def contains_points(
     if n == 0:
         return wp.empty(0, dtype=wp.bool, device=points.device)
     mesh_min, mesh_max = aabb_bounds(mesh.points)
-    max_dist = default_mesh_query_max_dist(mesh.points)
+    max_dist = enclosing_diagonal(mesh.points)
     out_contains = wp.empty(n, dtype=wp.bool, device=points.device)
     wp.launch(
         kernel_proximity.contains_points_sign_parity,
