@@ -136,7 +136,7 @@ def sample_fibonacci_cone(
     See Also
     --------
     [`sample_fibonacci_hemisphere`][triwarp.sample.sample_fibonacci_hemisphere]
-    [`triwarp.proximity.shape_diameter`][triwarp.proximity.shape_diameter]
+    [`triwarp.visibility.shape_diameter`][triwarp.visibility.shape_diameter]
     """
     if not 0.0 < half_angle <= math.pi:
         raise ValueError(f"half_angle must be in (0, pi] radians, got {half_angle}")

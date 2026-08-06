@@ -40,7 +40,6 @@ from . import (
     sample,
     seams,
     selection,
-    shading,
     smoothing,
     tangent_space,
     texture,
@@ -49,6 +48,7 @@ from . import (
     typing,
     validation,
     vertices,
+    visibility,
 )
 
 __all__ = [
@@ -90,7 +90,6 @@ __all__ = [
     "sample",
     "seams",
     "selection",
-    "shading",
     "smoothing",
     "tangent_space",
     "texture",
@@ -99,4 +98,5 @@ __all__ = [
     "typing",
     "validation",
     "vertices",
+    "visibility",
 ]

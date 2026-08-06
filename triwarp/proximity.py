@@ -12,12 +12,11 @@ in a 2D triangulation -- and
 [`query_mesh_aabb_bounds_with_offsets`][triwarp.proximity.query_mesh_aabb_bounds_with_offsets] is
 the low-level box query the others are built over.
 
-[`thickness`][triwarp.proximity.thickness] and
-[`shape_diameter`][triwarp.proximity.shape_diameter] both measure how thick the volume is under a
-surface point, at two levels of robustness: the first fires one inward ray (or fits one tangent
-sphere), the second fires a whole cone and takes an outlier-trimmed mean. For the *outward*
-counterpart -- how open a point is rather than how thick -- see
-[`triwarp.shading`][triwarp.shading].
+Everything here takes raw ``(vertices, faces)`` buffers. The queries phrased the other way round --
+*how far away* the surface is rather than *where* it is, all taking a prebuilt ``wp.Mesh`` and a set
+of points to measure at -- live in [`triwarp.visibility`][triwarp.visibility]: ambient occlusion and
+obscurance outward, shape diameter and thickness inward, and the maximal tangent sphere in every
+direction at once.
 
 Everything signed here, plus [`contains_points`][triwarp.ray.contains_points], follows Warp's SDF
 sign convention: outside positive, inside negative. Trimesh's ``signed_distance`` uses the opposite
@@ -30,17 +29,14 @@ Point-set acceleration structures (``wp.Bvh`` / ``wp.HashGrid``) and raw neighbo
 
 from __future__ import annotations
 
-import math
 from typing import Literal
 
 import numpy as np
 import warp as wp
 
 import triwarp as tw
-import triwarp.typing as twt
 from triwarp._device import require_nonempty_mesh
 from triwarp.kernels import proximity as kernel_proximity
-from triwarp.kernels import shading as kernel_shading
 from triwarp.triangles import face_normals_and_areas
 
 # Elements per thread for the two *per-query* lane-free reductions here (solid-angle sum, packed
@@ -406,162 +402,6 @@ def winding_number(
     return out_winding
 
 
-def max_tangent_sphere(
-    mesh: wp.Mesh,
-    points: wp.array[wp.vec3],
-    *,
-    inwards: bool = True,
-    normals: wp.array[wp.vec3] | None = None,
-    threshold: float = 1e-6,
-    max_iter: int = 100,
-) -> tuple[wp.array[wp.vec3], wp.array[wp.float32]]:
-    """
-    Find the center and radius of the sphere tangent to the mesh at each point.
-
-    Implements the shrinking-sphere algorithm (Inui et al. 2016): iteratively
-    finds the largest sphere tangent to the mesh at ``points`` with no
-    non-tangential intersections.
-
-    Parameters
-    ----------
-    mesh
-        Warp mesh (BVH built by caller).
-    points
-        ``(m,)`` surface points as ``wp.vec3``.
-    inwards
-        If ``True``, sphere grows inward (into the mesh interior). If ``False``,
-        grows outward.
-    normals
-        ``(m,)`` unit surface normals at ``points``. If ``None``, computed from
-        the closest triangle.
-    threshold
-        Convergence threshold as a fraction of the scene diagonal.
-    max_iter
-        Maximum number of shrink iterations.
-
-    Returns
-    -------
-    centers
-        ``(m,)`` sphere center positions as ``wp.vec3``.
-    radii
-        ``(m,)`` sphere radii as ``float32``. ``inf`` when the sphere is
-        unbounded.
-    """
-    device = points.device
-    m = int(points.shape[0])
-    if m == 0:
-        return (
-            wp.empty(0, dtype=wp.vec3, device=device),
-            wp.empty(0, dtype=wp.float32, device=device),
-        )
-
-    if normals is None:
-        normals = normals_at_closest_faces(mesh, points)
-
-    ray_dirs: wp.array[wp.vec3] = -normals if inwards else normals
-
-    max_t = tw.bounds.enclosing_diagonal(mesh.points, points)
-    distances = tw.ray.longest_ray(mesh, points, ray_dirs, max_t=max_t)
-
-    n_verts = int(mesh.points.shape[0])
-    radii = wp.empty(m, dtype=wp.float32, device=device)
-    not_converged = wp.empty(m, dtype=wp.bool, device=device)
-    needs_support = wp.empty(m, dtype=wp.bool, device=device)
-    wp.map(
-        kernel_proximity.init_sphere_radii_finite,
-        distances,
-        out=[radii, not_converged, needs_support],
-    )
-    # Escaped rays (typically exterior/reach queries) need the support point of the vertex
-    # cloud in the ray direction. Compact them first — interior queries usually leave the
-    # subset empty — then run one grid-stride packed-argmax pass over the vertices for just
-    # that subset instead of a serial all-vertices loop per query thread.
-    support_indices = tw.array.flatnonzero(needs_support)
-    k = int(support_indices.shape[0])
-    if k > 0:
-        n_vert_slices = max(1, (n_verts + ITEMS_PER_QUERY_SLICE - 1) // ITEMS_PER_QUERY_SLICE)
-        packed_support = wp.zeros(k, dtype=wp.uint64, device=device)
-        wp.launch(
-            kernel_proximity.support_argmax_tiled,
-            dim=(k, n_vert_slices),
-            inputs=[
-                mesh.points,
-                wp.int32(n_verts),
-                wp.int32(n_vert_slices),
-                ray_dirs,
-                support_indices,
-                packed_support,
-            ],
-            device=device,
-        )
-        wp.launch(
-            kernel_proximity.init_sphere_radii_support,
-            dim=k,
-            inputs=[
-                mesh.points,
-                points,
-                ray_dirs,
-                support_indices,
-                packed_support,
-                radii,
-                not_converged,
-            ],
-            device=device,
-        )
-
-    centers = wp.empty(m, dtype=wp.vec3, device=device)
-    wp.map(kernel_proximity.sphere_center, points, ray_dirs, radii, out=centers)
-
-    mesh_min, mesh_max = tw.bounds.aabb_bounds(mesh.points)
-    D = float(wp.length(mesh_max - mesh_min))  # noqa: N806
-    convergence_threshold = wp.float32(threshold * D)
-
-    # All per-iteration buffers are preallocated once and ping-ponged (the step kernel writes
-    # every lane, passing converged state through). The convergence count is checked every
-    # iteration on purpose: an extra iteration runs a full BVH closest-point pass, far more
-    # expensive than the 8-byte readback the check costs.
-    n_pts_wp = wp.empty(m, dtype=wp.vec3, device=device)
-    n_dists_wp = wp.empty(m, dtype=wp.float32, device=device)
-    n_face_wp = wp.empty(m, dtype=wp.int32, device=device)
-    new_radii = wp.empty(m, dtype=wp.float32, device=device)
-    new_centers = wp.empty(m, dtype=wp.vec3, device=device)
-    new_nc = wp.empty(m, dtype=wp.bool, device=device)
-
-    for _ in range(max_iter):
-        if tw.reduce.sum(not_converged) == 0:
-            break
-
-        wp.launch(
-            kernel_proximity.closest_point_on_mesh,
-            dim=m,
-            inputs=[mesh.id, centers, wp.float32(max_t), n_pts_wp, n_dists_wp, n_face_wp],
-            device=device,
-        )
-        wp.launch(
-            kernel_proximity.step_sphere_shrink,
-            dim=m,
-            inputs=[
-                points,
-                ray_dirs,
-                n_pts_wp,
-                n_dists_wp,
-                centers,
-                radii,
-                convergence_threshold,
-                not_converged,
-                new_radii,
-                new_centers,
-                new_nc,
-            ],
-            device=device,
-        )
-        radii, new_radii = new_radii, radii
-        centers, new_centers = new_centers, centers
-        not_converged, new_nc = new_nc, not_converged
-
-    return centers, radii
-
-
 def query_mesh_aabb_bounds_with_offsets(
     mesh: wp.Mesh,
     query_lower: wp.array[wp.vec3],
@@ -648,178 +488,6 @@ def query_mesh_aabb_bounds_with_offsets(
     )
 
     return candidate_indices_flat, offsets, hit_counts
-
-
-def thickness(
-    mesh: wp.Mesh,
-    points: wp.array[wp.vec3],
-    *,
-    exterior: bool = False,
-    normals: wp.array[wp.vec3] | None = None,
-    method: Literal["max_sphere", "ray"] = "max_sphere",
-) -> wp.array[wp.float32]:
-    """
-    Thickness of the mesh at each point.
-
-    Parameters
-    ----------
-    mesh
-        Warp mesh (BVH built by caller).
-    points
-        ``(m,)`` surface points as ``wp.vec3``.
-    exterior
-        If ``True``, compute exterior thickness (reach). If ``False``, interior.
-    normals
-        ``(m,)`` unit surface normals. If ``None``, computed automatically.
-    method
-        ``"max_sphere"`` (default) or ``"ray"``.
-
-    Returns
-    -------
-    wp.array[wp.float32]
-        ``(m,)`` thickness values. ``inf`` for unbounded.
-    """
-    if method == "max_sphere":
-        _centers, radii = max_tangent_sphere(mesh, points, inwards=not exterior, normals=normals)
-        return radii * wp.float32(2.0)
-
-    elif method == "ray":
-        if normals is None:
-            normals = normals_at_closest_faces(mesh, points)
-
-        ray_dirs = normals if exterior else -normals
-        max_t = tw.bounds.enclosing_diagonal(mesh.points, points)
-        return tw.ray.longest_ray(mesh, points, ray_dirs, max_t=max_t)
-
-    else:
-        raise ValueError('Invalid method, use "max_sphere" or "ray"')
-
-
-def shape_diameter(
-    mesh: wp.Mesh,
-    points: wp.array[wp.vec3],
-    *,
-    normals: wp.array[wp.vec3] | None = None,
-    n_rays: int = 64,
-    cone_angle: float = math.pi / 3.0,
-    trim: float = 1.0,
-    max_t: float | None = None,
-) -> wp.array[wp.float32]:
-    """
-    Shape diameter function: local thickness of the volume, from an inward cone of rays.
-
-    Shapira et al.'s SDF and MeshLab's ``compute_scalar_by_shape_diameter_function_per_vertex``. A
-    cone of ``n_rays`` rays is fired *into* the volume about ``-normal``, each is traced to the far
-    side, and the result is the cosine-weighted mean of those distances **after discarding the
-    outliers** — the rays that escaped through a nearby opening or crossed the entire model, which
-    would otherwise dominate the average near any concavity.
-
-    This is the many-ray generalization of
-    [`thickness(method="ray")`][triwarp.proximity.thickness]: at ``n_rays=1`` with a vanishing
-    ``cone_angle`` the bundle collapses to the inward normal and the two agree to float32. The extra
-    rays are what make it stable — a single ray through a thin sliver of geometry reads a thickness
-    the neighbourhood does not have — and the reason it is the quantity used for skeleton extraction
-    and part segmentation rather than the one-ray version.
-
-    Parameters
-    ----------
-    mesh
-        Triangle mesh with a built BVH (``wp.Mesh``). Should be closed: on an open surface the rays
-        that find nothing on the far side are simply absent from the mean.
-    points
-        ``(m,)`` surface positions to measure at, normally the mesh's own vertices.
-    normals
-        ``(m,)`` **outward** unit normals; the cone opens along ``-normals``. When ``None`` they are
-        taken from the closest face of ``mesh``. Pass
-        [`area_weighted_vertex_normals`][triwarp.vertices.area_weighted_vertex_normals] for a smooth
-        field over a mesh's own vertices.
-    n_rays
-        Rays per point. MeshLab's default is ``64``, which is this one. Note that the single ray of
-        ``n_rays=1`` is the *centroid* of the cone's Fibonacci lattice rather than its axis, so it
-        only coincides with the inward normal as ``cone_angle`` goes to zero.
-    cone_angle
-        Half-angle of the cone in **radians**, measured from the inward normal. The default
-        ``pi / 3`` (60 degrees) is Shapira's 120-degree cone. Must be in ``(0, pi / 2]`` — beyond
-        that the cone reaches around to the outside of the surface and the distances stop meaning
-        thickness.
-    trim
-        Keep only rays whose distance is within ``trim`` standard deviations of the mean before
-        averaging. ``1.0`` (the default) is Shapira's rule; a large value keeps everything and turns
-        this into a plain weighted mean. Must be non-negative.
-    max_t
-        Maximum ray length. When ``None``, the diagonal of the AABB enclosing the mesh and the query
-        points.
-
-    Returns
-    -------
-    wp.array[wp.float32]
-        ``(m,)`` diameters in the mesh's own length units on ``points.device``. ``inf`` at a point
-        where no ray in the cone found the far side at all.
-
-    Raises
-    ------
-    ValueError
-        If ``n_rays < 1``, ``cone_angle`` is outside ``(0, pi / 2]``, ``trim < 0``, or ``normals``
-        has a different length from ``points``.
-
-    See Also
-    --------
-    [`thickness`][triwarp.proximity.thickness]
-    [`max_tangent_sphere`][triwarp.proximity.max_tangent_sphere]
-    [`triwarp.shading.ambient_occlusion`][triwarp.shading.ambient_occlusion]
-    [`triwarp.sample.sample_fibonacci_cone`][triwarp.sample.sample_fibonacci_cone]
-
-    Notes
-    -----
-    MeshLab's ``cone_amplitude`` parameter is a **no-op** in the 2025.07 build — its output is
-    byte-identical at ``90`` and ``120`` degrees — and its trimming rule is not the one documented
-    in the paper, so its values differ from these by a roughly constant factor on a given mesh.
-    Compare against it by rank rather than by value; the exactly-checkable statements are the
-    reduction to [`thickness`][triwarp.proximity.thickness] at ``n_rays=1`` and the analytic ``2 R``
-    on a sphere.
-    """
-    if n_rays < 1:
-        raise ValueError(f"shape_diameter requires n_rays >= 1, got {n_rays}")
-    if not 0.0 < cone_angle <= math.pi / 2.0:
-        raise ValueError(f"cone_angle must be in (0, pi / 2] radians, got {cone_angle}")
-    if trim < 0.0:
-        raise ValueError(f"trim must be non-negative, got {trim}")
-
-    device = points.device
-    m = int(points.shape[0])
-    if m == 0:
-        return wp.empty(0, dtype=wp.float32, device=device)
-
-    if normals is None:
-        normals = normals_at_closest_faces(mesh, points)
-    elif int(normals.shape[0]) != m:
-        raise ValueError(
-            f"normals must have one entry per point, got {normals.shape[0]} for {m} points"
-        )
-
-    diagonal = tw.bounds.enclosing_diagonal(mesh.points, points)
-    directions = tw.sample.sample_fibonacci_cone(n_rays, cone_angle, device=device)
-    # Distances are kept so the trimming pass can revisit them against a mean the first pass had not
-    # finished computing; re-tracing instead would double the only expensive part of the kernel.
-    scratch = twt.empty_float32_2d((m, n_rays), device=device)
-    out_diameter = wp.empty(m, dtype=wp.float32, device=device)
-    wp.launch(
-        kernel_shading.shape_diameter,
-        dim=m,
-        inputs=[
-            mesh.id,
-            points,
-            normals,
-            directions,
-            wp.float32(max_t if max_t is not None else diagonal),
-            wp.float32(_SDF_SURFACE_OFFSET * max(diagonal, 1e-12)),
-            wp.float32(trim),
-            scratch,
-            out_diameter,
-        ],
-        device=device,
-    )
-    return out_diameter
 
 
 def containing_faces_2d(

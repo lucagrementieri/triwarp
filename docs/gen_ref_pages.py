@@ -48,7 +48,7 @@ SECTIONS: dict[str, list[str]] = {
         "intersection",
         "curvature",
         "convex",
-        "shading",
+        "visibility",
     ],
     "Operators & fields": ["laplacian", "linalg", "interpolation", "parametrization"],
     "Heat-method solvers": ["heat.distance", "heat.vector", "heat.signed"],

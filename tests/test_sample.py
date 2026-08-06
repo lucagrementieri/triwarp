@@ -390,3 +390,35 @@ def test_sample_fibonacci_hemisphere_positive_z(device: str):
 def test_sample_fibonacci_hemisphere_empty(device: str):
     directions_wp = tw.sample.sample_fibonacci_hemisphere(0, device=device)
     assert directions_wp.shape == (0,)
+
+
+def test_sample_fibonacci_cone(device: str) -> None:
+    """Every direction inside the cone, and both ends of the range match sphere/hemisphere."""
+    half_angle = np.deg2rad(25.0)
+    directions_np = tw.sample.sample_fibonacci_cone(512, half_angle, device=device).numpy()
+    assert np.allclose(np.linalg.norm(directions_np, axis=1), 1.0, rtol=1e-5, atol=1e-5)
+    polar_np = np.arccos(np.clip(directions_np[:, 2], -1.0, 1.0))
+    assert polar_np.max() <= half_angle + 1e-6
+    # Uniform in solid angle means uniform in z, so the mean z is the midpoint of the band.
+    assert np.isclose(directions_np[:, 2].mean(), 0.5 * (1.0 + np.cos(half_angle)), atol=1e-3)
+
+    assert np.allclose(
+        tw.sample.sample_fibonacci_cone(64, np.pi / 2.0, device=device).numpy(),
+        tw.sample.sample_fibonacci_hemisphere(64, device=device).numpy(),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert np.allclose(
+        tw.sample.sample_fibonacci_cone(64, np.pi, device=device).numpy(),
+        tw.sample.sample_fibonacci_sphere(64, device=device).numpy(),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_sample_fibonacci_cone_invalid(device: str) -> None:
+    with pytest.raises(ValueError, match=r"half_angle must be in \(0, pi\]"):
+        tw.sample.sample_fibonacci_cone(8, 0.0, device=device)
+    with pytest.raises(ValueError, match=r"half_angle must be in \(0, pi\]"):
+        tw.sample.sample_fibonacci_cone(8, 4.0, device=device)
+    assert tw.sample.sample_fibonacci_cone(0, 1.0, device=device).shape == (0,)

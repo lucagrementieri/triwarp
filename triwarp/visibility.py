@@ -1,0 +1,575 @@
+"""
+How far the surface is from a point.
+
+Outward until nothing is hit ([`ambient_occlusion`][triwarp.visibility.ambient_occlusion],
+[`volumetric_obscurance`][triwarp.visibility.volumetric_obscurance]); inward until it is hit again
+([`shape_diameter`][triwarp.visibility.shape_diameter],
+[`thickness`][triwarp.visibility.thickness]); or in every direction at once, which is the radius at
+which the surface first appears
+([`max_tangent_sphere`][triwarp.visibility.max_tangent_sphere]).
+
+All five take ``(mesh: wp.Mesh, points, *, normals=None, ...)`` -- a prebuilt BVH and a set of
+positions to measure at -- which is what separates this module from
+[`triwarp.proximity`][triwarp.proximity], where the queries take raw ``(vertices, faces)`` and ask
+*where* the surface is rather than how far away.
+
+The two outward fields integrate the same bundle of rays over the outward hemisphere at each point,
+weighted by Lambert's cosine law, and differ only in what a blocked ray costs: ambient occlusion
+charges a hit its full weight however far away it is, obscurance discounts it by
+``exp(-tau * distance)`` so that only nearby geometry darkens a point. Ambient occlusion is the
+``tau -> 0`` limit, which is why they share a kernel. Neither is normalized against a scene, so both
+are comparable across meshes and resolutions, and on a **convex** closed surface no ray can return
+and every point reads exactly ``0`` -- the cheapest available sanity check on a result.
+
+The three inward measures differ in how much evidence they take.
+[`thickness`][triwarp.visibility.thickness] is a dispatcher over the other two: one inward ray, or
+one tangent sphere. [`shape_diameter`][triwarp.visibility.shape_diameter] fires a whole cone and
+takes an outlier-trimmed mean, which is what makes it stable enough for skeleton extraction and part
+segmentation. [`max_tangent_sphere`][triwarp.visibility.max_tangent_sphere] uses no rays at all: it
+shrinks a sphere until nothing but the surface touches it, so it answers the question for a *volume*
+rather than along a direction, and it is the reason this module's name is a loose fit for one of its
+five members.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Literal
+
+import warp as wp
+
+import triwarp as tw
+import triwarp.typing as twt
+from triwarp.bounds import enclosing_diagonal
+from triwarp.kernels import proximity as kernel_proximity
+from triwarp.kernels import visibility as kernel_visibility
+from triwarp.proximity import ITEMS_PER_QUERY_SLICE, normals_at_closest_faces
+
+# Ray-origin offset along the normal, as a fraction of the query AABB diagonal. Without it every
+# ray would hit the surface it started on; the value is small enough not to shadow a real occluder
+# and large enough to clear float32 error on the starting triangle. The inward bundles offset
+# *below* the surface by the same fraction, for the same reason.
+_SURFACE_OFFSET = 1e-4
+
+_WEIGHT_MODES: dict[str, wp.int32] = {
+    "cosine": kernel_visibility.WEIGHT_COSINE,
+    "uniform": kernel_visibility.WEIGHT_UNIFORM,
+}
+
+RayWeight = Literal["cosine", "uniform"]
+"""Weighting of a ray; see [`ambient_occlusion`][triwarp.visibility.ambient_occlusion]."""
+
+
+def ambient_occlusion(
+    mesh: wp.Mesh,
+    points: wp.array[wp.vec3],
+    *,
+    normals: wp.array[wp.vec3] | None = None,
+    n_rays: int = 64,
+    weight: RayWeight = "cosine",
+    max_t: float | None = None,
+) -> wp.array[wp.float32]:
+    """
+    Fraction of the outward hemisphere at each point that is blocked by the mesh itself.
+
+    A Fibonacci hemisphere lattice is rotated into each point's tangent frame and every direction is
+    traced against the mesh; the result is the weighted share of directions that hit something. This
+    is MeshLab's ``compute_scalar_ambient_occlusion`` and libigl's ``igl::ambient_occlusion``, which
+    differ from each other exactly in the ``weight`` argument below.
+
+    Parameters
+    ----------
+    mesh
+        Triangle mesh with a built BVH (``wp.Mesh``). The occluder *and* the surface being shaded.
+    points
+        ``(m,)`` positions to shade, normally the mesh's own vertices.
+    normals
+        ``(m,)`` outward unit normals, defining which hemisphere is "outward" at each point. When
+        ``None`` they are taken from the closest face of ``mesh``
+        ([`normals_at_closest_faces`][triwarp.proximity.normals_at_closest_faces]), which is right
+        for points on the surface and meaningless for points far off it — pass them explicitly in
+        that case. For a smooth result on the mesh's own vertices, pass
+        [`area_weighted_vertex_normals`][triwarp.vertices.area_weighted_vertex_normals] instead:
+        face normals make the field piecewise constant across each vertex's ring.
+    n_rays
+        Directions per point. Error falls as ``1 / sqrt(n_rays)``; MeshLab's default is ``64``,
+        which is this one. Cost is exactly linear in it.
+    weight
+        How a direction is weighted in the integral:
+
+        - ``"cosine"`` (default) — by ``dot(direction, normal)``, which is the physically correct
+          weighting for ambient irradiance and MeshLab's. Grazing directions barely matter.
+        - ``"uniform"`` — every direction counts once, which is libigl's convention and reads as a
+          solid-angle fraction rather than an irradiance one.
+    max_t
+        Maximum ray length. Anything beyond it does not occlude. When ``None``, the diagonal of the
+        AABB enclosing the mesh and the query points, so nothing in the mesh is missed.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        ``(m,)`` occlusion in ``[0, 1]`` on ``points.device``: ``0`` where the hemisphere is fully
+        open and ``1`` where it is fully blocked. **Exactly ``0`` everywhere on a convex closed
+        mesh**, which is the cheapest available sanity check on a result.
+
+    Raises
+    ------
+    ValueError
+        If ``n_rays < 1``, ``weight`` is not one of the two names, or ``normals`` has a different
+        length from ``points``.
+
+    See Also
+    --------
+    [`volumetric_obscurance`][triwarp.visibility.volumetric_obscurance]
+    [`triwarp.visibility.shape_diameter`][triwarp.visibility.shape_diameter]
+    [`triwarp.sample.sample_fibonacci_hemisphere`][triwarp.sample.sample_fibonacci_hemisphere]
+
+    Notes
+    -----
+    MeshLab reports the *complement* of this (higher is more exposed) and leaves it unnormalized —
+    its number is roughly ``(1 - occlusion) * n_rays / 4`` for a cosine-weighted bundle over
+    ``n_rays`` whole-sphere directions. Its direction set is also its own, so the two agree in
+    distribution and in ranking rather than value by value.
+    """
+    return _occlusion_bundle(mesh, points, normals, n_rays, weight, 0.0, max_t, "ambient_occlusion")
+
+
+def volumetric_obscurance(
+    mesh: wp.Mesh,
+    points: wp.array[wp.vec3],
+    *,
+    normals: wp.array[wp.vec3] | None = None,
+    n_rays: int = 64,
+    tau: float = 0.1,
+    weight: RayWeight = "cosine",
+    max_t: float | None = None,
+) -> wp.array[wp.float32]:
+    """
+    Distance-attenuated ambient occlusion: an occluder at range ``t`` counts ``exp(-tau * t)``.
+
+    Iones et al.'s obscurance, and MeshLab's ``compute_scalar_by_volumetric_obscurance``. It exists
+    because binary [`ambient_occlusion`][triwarp.visibility.ambient_occlusion] treats a wall across
+    the room like a crevice wall a millimetre away, which darkens the interior of any closed room
+    uniformly and hides exactly the small-scale detail the field is usually wanted for. Attenuating
+    by distance keeps the response local.
+
+    Parameters
+    ----------
+    mesh
+        Triangle mesh with a built BVH (``wp.Mesh``).
+    points
+        ``(m,)`` positions to shade.
+    normals
+        ``(m,)`` outward unit normals; see
+        [`ambient_occlusion`][triwarp.visibility.ambient_occlusion] for the default.
+    n_rays
+        Directions per point.
+    tau
+        Attenuation rate, in inverse length units of the mesh — so it is **not** scale-invariant,
+        and a mesh scaled by ``k`` wants ``tau / k`` for the same result. MeshLab's default is
+        ``0.1``, which suits a mesh of extent order 1. As ``tau -> 0`` this becomes
+        [`ambient_occlusion`][triwarp.visibility.ambient_occlusion]; as ``tau -> inf`` everything
+        reads ``0``. Must be positive.
+    weight
+        Ray weighting, as in [`ambient_occlusion`][triwarp.visibility.ambient_occlusion].
+    max_t
+        Maximum ray length.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        ``(m,)`` obscurance-weighted occlusion in ``[0, 1]`` on ``points.device``, ``0`` where
+        nothing nearby blocks. Exactly ``0`` on a convex closed mesh.
+
+    Raises
+    ------
+    ValueError
+        If ``tau <= 0``, ``n_rays < 1``, ``weight`` is unknown, or ``normals`` is the wrong length.
+
+    See Also
+    --------
+    [`ambient_occlusion`][triwarp.visibility.ambient_occlusion]
+    """
+    if tau <= 0.0:
+        raise ValueError(f"tau must be positive, got {tau}; use ambient_occlusion for the limit")
+    return _occlusion_bundle(
+        mesh, points, normals, n_rays, weight, tau, max_t, "volumetric_obscurance"
+    )
+
+
+def _occlusion_bundle(
+    mesh: wp.Mesh,
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3] | None,
+    n_rays: int,
+    weight: RayWeight,
+    tau: float,
+    max_t: float | None,
+    name: str,
+) -> wp.array[wp.float32]:
+    """Shared hemisphere-bundle trace behind both public functions; ``tau <= 0`` means binary."""
+    if n_rays < 1:
+        raise ValueError(f"{name} requires n_rays >= 1, got {n_rays}")
+    if weight not in _WEIGHT_MODES:
+        raise ValueError(f"weight must be 'cosine' or 'uniform', got {weight!r}")
+
+    device = points.device
+    m = int(points.shape[0])
+    out_occlusion = wp.zeros(m, dtype=wp.float32, device=device)
+    if m == 0:
+        return out_occlusion
+
+    if normals is None:
+        normals = normals_at_closest_faces(mesh, points)
+    elif int(normals.shape[0]) != m:
+        raise ValueError(
+            f"normals must have one entry per point, got {normals.shape[0]} for {m} points"
+        )
+
+    diagonal = enclosing_diagonal(mesh.points, points)
+    directions = tw.sample.sample_fibonacci_hemisphere(n_rays, device=device)
+    wp.launch(
+        kernel_visibility.obscurance,
+        dim=m,
+        inputs=[
+            mesh.id,
+            points,
+            normals,
+            directions,
+            wp.float32(tau),
+            _WEIGHT_MODES[weight],
+            wp.float32(max_t if max_t is not None else diagonal),
+            wp.float32(_SURFACE_OFFSET * max(diagonal, 1e-12)),
+            out_occlusion,
+        ],
+        device=device,
+    )
+    return out_occlusion
+
+
+def shape_diameter(
+    mesh: wp.Mesh,
+    points: wp.array[wp.vec3],
+    *,
+    normals: wp.array[wp.vec3] | None = None,
+    n_rays: int = 64,
+    cone_angle: float = math.pi / 3.0,
+    trim: float = 1.0,
+    max_t: float | None = None,
+) -> wp.array[wp.float32]:
+    """
+    Shape diameter function: local thickness of the volume, from an inward cone of rays.
+
+    Shapira et al.'s SDF and MeshLab's ``compute_scalar_by_shape_diameter_function_per_vertex``. A
+    cone of ``n_rays`` rays is fired *into* the volume about ``-normal``, each is traced to the far
+    side, and the result is the cosine-weighted mean of those distances **after discarding the
+    outliers** — the rays that escaped through a nearby opening or crossed the entire model, which
+    would otherwise dominate the average near any concavity.
+
+    This is the many-ray generalization of
+    [`thickness(method="ray")`][triwarp.visibility.thickness]: at ``n_rays=1`` with a vanishing
+    ``cone_angle`` the bundle collapses to the inward normal and the two agree to float32. The extra
+    rays are what make it stable — a single ray through a thin sliver of geometry reads a thickness
+    the neighbourhood does not have — and the reason it is the quantity used for skeleton extraction
+    and part segmentation rather than the one-ray version.
+
+    Parameters
+    ----------
+    mesh
+        Triangle mesh with a built BVH (``wp.Mesh``). Should be closed: on an open surface the rays
+        that find nothing on the far side are simply absent from the mean.
+    points
+        ``(m,)`` surface positions to measure at, normally the mesh's own vertices.
+    normals
+        ``(m,)`` **outward** unit normals; the cone opens along ``-normals``. When ``None`` they are
+        taken from the closest face of ``mesh``. Pass
+        [`area_weighted_vertex_normals`][triwarp.vertices.area_weighted_vertex_normals] for a smooth
+        field over a mesh's own vertices.
+    n_rays
+        Rays per point. MeshLab's default is ``64``, which is this one. Note that the single ray of
+        ``n_rays=1`` is the *centroid* of the cone's Fibonacci lattice rather than its axis, so it
+        only coincides with the inward normal as ``cone_angle`` goes to zero.
+    cone_angle
+        Half-angle of the cone in **radians**, measured from the inward normal. The default
+        ``pi / 3`` (60 degrees) is Shapira's 120-degree cone. Must be in ``(0, pi / 2]`` — beyond
+        that the cone reaches around to the outside of the surface and the distances stop meaning
+        thickness.
+    trim
+        Keep only rays whose distance is within ``trim`` standard deviations of the mean before
+        averaging. ``1.0`` (the default) is Shapira's rule; a large value keeps everything and turns
+        this into a plain weighted mean. Must be non-negative.
+    max_t
+        Maximum ray length. When ``None``, the diagonal of the AABB enclosing the mesh and the query
+        points.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        ``(m,)`` diameters in the mesh's own length units on ``points.device``. ``inf`` at a point
+        where no ray in the cone found the far side at all.
+
+    Raises
+    ------
+    ValueError
+        If ``n_rays < 1``, ``cone_angle`` is outside ``(0, pi / 2]``, ``trim < 0``, or ``normals``
+        has a different length from ``points``.
+
+    See Also
+    --------
+    [`thickness`][triwarp.visibility.thickness]
+    [`max_tangent_sphere`][triwarp.visibility.max_tangent_sphere]
+    [`triwarp.visibility.ambient_occlusion`][triwarp.visibility.ambient_occlusion]
+    [`triwarp.sample.sample_fibonacci_cone`][triwarp.sample.sample_fibonacci_cone]
+
+    Notes
+    -----
+    MeshLab's ``cone_amplitude`` parameter is a **no-op** in the 2025.07 build — its output is
+    byte-identical at ``90`` and ``120`` degrees — and its trimming rule is not the one documented
+    in the paper, so its values differ from these by a roughly constant factor on a given mesh.
+    Compare against it by rank rather than by value; the exactly-checkable statements are the
+    reduction to [`thickness`][triwarp.visibility.thickness] at ``n_rays=1`` and the analytic
+    ``2 R`` on a sphere.
+    """
+    if n_rays < 1:
+        raise ValueError(f"shape_diameter requires n_rays >= 1, got {n_rays}")
+    if not 0.0 < cone_angle <= math.pi / 2.0:
+        raise ValueError(f"cone_angle must be in (0, pi / 2] radians, got {cone_angle}")
+    if trim < 0.0:
+        raise ValueError(f"trim must be non-negative, got {trim}")
+
+    device = points.device
+    m = int(points.shape[0])
+    if m == 0:
+        return wp.empty(0, dtype=wp.float32, device=device)
+
+    if normals is None:
+        normals = normals_at_closest_faces(mesh, points)
+    elif int(normals.shape[0]) != m:
+        raise ValueError(
+            f"normals must have one entry per point, got {normals.shape[0]} for {m} points"
+        )
+
+    diagonal = enclosing_diagonal(mesh.points, points)
+    directions = tw.sample.sample_fibonacci_cone(n_rays, cone_angle, device=device)
+    # Distances are kept so the trimming pass can revisit them against a mean the first pass had not
+    # finished computing; re-tracing instead would double the only expensive part of the kernel.
+    scratch = twt.empty_float32_2d((m, n_rays), device=device)
+    out_diameter = wp.empty(m, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_visibility.shape_diameter,
+        dim=m,
+        inputs=[
+            mesh.id,
+            points,
+            normals,
+            directions,
+            wp.float32(max_t if max_t is not None else diagonal),
+            wp.float32(_SURFACE_OFFSET * max(diagonal, 1e-12)),
+            wp.float32(trim),
+            scratch,
+            out_diameter,
+        ],
+        device=device,
+    )
+    return out_diameter
+
+
+def thickness(
+    mesh: wp.Mesh,
+    points: wp.array[wp.vec3],
+    *,
+    exterior: bool = False,
+    normals: wp.array[wp.vec3] | None = None,
+    method: Literal["max_sphere", "ray"] = "max_sphere",
+) -> wp.array[wp.float32]:
+    """
+    Thickness of the mesh at each point.
+
+    Parameters
+    ----------
+    mesh
+        Warp mesh (BVH built by caller).
+    points
+        ``(m,)`` surface points as ``wp.vec3``.
+    exterior
+        If ``True``, compute exterior thickness (reach). If ``False``, interior.
+    normals
+        ``(m,)`` unit surface normals. If ``None``, computed automatically.
+    method
+        ``"max_sphere"`` (default) or ``"ray"``.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        ``(m,)`` thickness values. ``inf`` for unbounded.
+    """
+    if method == "max_sphere":
+        _centers, radii = max_tangent_sphere(mesh, points, inwards=not exterior, normals=normals)
+        return radii * wp.float32(2.0)
+
+    elif method == "ray":
+        if normals is None:
+            normals = normals_at_closest_faces(mesh, points)
+
+        ray_dirs = normals if exterior else -normals
+        max_t = enclosing_diagonal(mesh.points, points)
+        return tw.ray.longest_ray(mesh, points, ray_dirs, max_t=max_t)
+
+    else:
+        raise ValueError('Invalid method, use "max_sphere" or "ray"')
+
+
+def max_tangent_sphere(
+    mesh: wp.Mesh,
+    points: wp.array[wp.vec3],
+    *,
+    inwards: bool = True,
+    normals: wp.array[wp.vec3] | None = None,
+    threshold: float = 1e-6,
+    max_iter: int = 100,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.float32]]:
+    """
+    Find the center and radius of the sphere tangent to the mesh at each point.
+
+    Implements the shrinking-sphere algorithm (Inui et al. 2016): iteratively
+    finds the largest sphere tangent to the mesh at ``points`` with no
+    non-tangential intersections.
+
+    Parameters
+    ----------
+    mesh
+        Warp mesh (BVH built by caller).
+    points
+        ``(m,)`` surface points as ``wp.vec3``.
+    inwards
+        If ``True``, sphere grows inward (into the mesh interior). If ``False``,
+        grows outward.
+    normals
+        ``(m,)`` unit surface normals at ``points``. If ``None``, computed from
+        the closest triangle.
+    threshold
+        Convergence threshold as a fraction of the scene diagonal.
+    max_iter
+        Maximum number of shrink iterations.
+
+    Returns
+    -------
+    centers
+        ``(m,)`` sphere center positions as ``wp.vec3``.
+    radii
+        ``(m,)`` sphere radii as ``float32``. ``inf`` when the sphere is
+        unbounded.
+    """
+    device = points.device
+    m = int(points.shape[0])
+    if m == 0:
+        return (
+            wp.empty(0, dtype=wp.vec3, device=device),
+            wp.empty(0, dtype=wp.float32, device=device),
+        )
+
+    if normals is None:
+        normals = normals_at_closest_faces(mesh, points)
+
+    ray_dirs: wp.array[wp.vec3] = -normals if inwards else normals
+
+    max_t = enclosing_diagonal(mesh.points, points)
+    distances = tw.ray.longest_ray(mesh, points, ray_dirs, max_t=max_t)
+
+    n_verts = int(mesh.points.shape[0])
+    radii = wp.empty(m, dtype=wp.float32, device=device)
+    not_converged = wp.empty(m, dtype=wp.bool, device=device)
+    needs_support = wp.empty(m, dtype=wp.bool, device=device)
+    wp.map(
+        kernel_visibility.init_sphere_radii_finite,
+        distances,
+        out=[radii, not_converged, needs_support],
+    )
+    # Escaped rays (typically exterior/reach queries) need the support point of the vertex
+    # cloud in the ray direction. Compact them first — interior queries usually leave the
+    # subset empty — then run one grid-stride packed-argmax pass over the vertices for just
+    # that subset instead of a serial all-vertices loop per query thread.
+    support_indices = tw.array.flatnonzero(needs_support)
+    k = int(support_indices.shape[0])
+    if k > 0:
+        n_vert_slices = max(1, (n_verts + ITEMS_PER_QUERY_SLICE - 1) // ITEMS_PER_QUERY_SLICE)
+        packed_support = wp.zeros(k, dtype=wp.uint64, device=device)
+        wp.launch(
+            kernel_visibility.support_argmax_tiled,
+            dim=(k, n_vert_slices),
+            inputs=[
+                mesh.points,
+                wp.int32(n_verts),
+                wp.int32(n_vert_slices),
+                ray_dirs,
+                support_indices,
+                packed_support,
+            ],
+            device=device,
+        )
+        wp.launch(
+            kernel_visibility.init_sphere_radii_support,
+            dim=k,
+            inputs=[
+                mesh.points,
+                points,
+                ray_dirs,
+                support_indices,
+                packed_support,
+                radii,
+                not_converged,
+            ],
+            device=device,
+        )
+
+    centers = wp.empty(m, dtype=wp.vec3, device=device)
+    wp.map(kernel_visibility.sphere_center, points, ray_dirs, radii, out=centers)
+
+    mesh_min, mesh_max = tw.bounds.aabb_bounds(mesh.points)
+    D = float(wp.length(mesh_max - mesh_min))  # noqa: N806
+    convergence_threshold = wp.float32(threshold * D)
+
+    # All per-iteration buffers are preallocated once and ping-ponged (the step kernel writes
+    # every lane, passing converged state through). The convergence count is checked every
+    # iteration on purpose: an extra iteration runs a full BVH closest-point pass, far more
+    # expensive than the 8-byte readback the check costs.
+    n_pts_wp = wp.empty(m, dtype=wp.vec3, device=device)
+    n_dists_wp = wp.empty(m, dtype=wp.float32, device=device)
+    n_face_wp = wp.empty(m, dtype=wp.int32, device=device)
+    new_radii = wp.empty(m, dtype=wp.float32, device=device)
+    new_centers = wp.empty(m, dtype=wp.vec3, device=device)
+    new_nc = wp.empty(m, dtype=wp.bool, device=device)
+
+    for _ in range(max_iter):
+        if tw.reduce.sum(not_converged) == 0:
+            break
+
+        wp.launch(
+            kernel_proximity.closest_point_on_mesh,
+            dim=m,
+            inputs=[mesh.id, centers, wp.float32(max_t), n_pts_wp, n_dists_wp, n_face_wp],
+            device=device,
+        )
+        wp.launch(
+            kernel_visibility.step_sphere_shrink,
+            dim=m,
+            inputs=[
+                points,
+                ray_dirs,
+                n_pts_wp,
+                n_dists_wp,
+                centers,
+                radii,
+                convergence_threshold,
+                not_converged,
+                new_radii,
+                new_centers,
+                new_nc,
+            ],
+            device=device,
+        )
+        radii, new_radii = new_radii, radii
+        centers, new_centers = new_centers, centers
+        not_converged, new_nc = new_nc, not_converged
+
+    return centers, radii

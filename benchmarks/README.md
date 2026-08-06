@@ -315,6 +315,15 @@ trimesh itself delegates. `potpourri3d` is CPU-only (geometry-central) and is th
 for the heat-method family, tangent spaces and isocontours. `pymeshlab` is CPU-only (MeshLab /
 VCGlib) and is the **broadest** — it reaches 26 modules, more than any other single reference.
 
+#### Known coverage gaps
+
+Recorded so they are not rediscovered as surprises. A gap here is a *benchmark* gap: the function is
+public and tested, only untimed.
+
+| function | reference that exists | why there is no group yet |
+|---|---|---|
+| `visibility.volumetric_obscurance` | `compute_scalar_by_volumetric_obscurance` | it shares `ambient_occlusion`'s kernel and differs only in a per-hit `exp(-tau * t)` factor, so a triwarp-only group would re-measure that group's axis. MeshLab's filter *is* a real second reference, so the row is worth adding — with `tau` as its axis, not `rays`. |
+
 ### The parity gate: a benchmarked reference must be a tested reference
 
 Nothing in this directory asserts that two timed implementations compute the same thing — every
@@ -406,7 +415,7 @@ the pymeshlab filter is the thing being caught up with, and in every case the po
 | `filter_scalar_laplacian`, `saturate_scalar_gradient` | `test_smoothing` | `apply_scalar_{smoothing,saturation}_per_vertex` | 0.60 ms against 5.3 ms on a spike-seeded Lipschitz projection |
 | `transfer_onto_vertices` | `test_vertices` | `transfer_attributes_per_vertex` | closest-point plus barycentric blend, against a serial closest-point walk |
 | `cluster_decimate` | `test_remesh` | `meshing_decimation_clustering` | exact agreement with `open3d.simplify_vertex_clustering` on face *and* vertex count |
-| `ambient_occlusion`, `shape_diameter` | `test_proximity` | `compute_scalar_ambient_occlusion`, `..._shape_diameter_function_per_vertex` | **9.3 ms against 662 ms** on `bunny` at 64 rays — the largest ratio in the suite |
+| `ambient_occlusion`, `shape_diameter` | `test_visibility` | `compute_scalar_ambient_occlusion`, `..._shape_diameter_function_per_vertex` | **9.3 ms against 662 ms** on `bunny` at 64 rays — the largest ratio in the suite |
 | `flip_by_objective` | `test_remesh` | `meshing_edge_flip_by_planar_optimization` | 2.0 ms against 28.6 ms on `saddle_graded` |
 | `bad_face_mask`, `remove_t_vertices` | `test_repair` | `compute_selection_bad_faces`, `meshing_remove_t_vertices` | 8.9 ms against 24.2 ms on `saddle_graded` |
 | `crease_edges`, `cut_along_edges` | `test_seams` | `compute_selection_crease_per_edge`, `meshing_cut_along_crease_edges` | 1.3 ms against 51.6 ms on `sphere_med`, and **24 output vertices against 32** on a cut cube |
@@ -734,7 +743,7 @@ millisecond.
 | `test_repair` | `remove_duplicated_triangles`, `remove_duplicated_vertices` |
 | `test_validation` | `is_watertight` |
 | `test_vertices` | `compute_vertex_normals` |
-| `test_proximity` | `get_axis_aligned_bounding_box` (`aabb_bounds` only) |
+| `test_bounds` | `get_axis_aligned_bounding_box` (`aabb_bounds` only) |
 | `test_points` | `PointCloud.estimate_normals` (`KDTreeSearchParamKNN`) |
 | `test_distance` | `PointCloud.compute_point_cloud_distance` (the non-differentiable Chamfer / Hausdorff cases) |
 | `test_convex` | `compute_convex_hull` (exact qhull vs the approximate support sweep) |
