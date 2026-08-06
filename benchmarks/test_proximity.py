@@ -292,16 +292,6 @@ def test_thickness_interior(bench_case: BenchCase, method: Literal["ray", "max_s
     assert result.shape == points.shape
 
 
-@pytest.mark.benchmark(group="query_geodesic_ball")
-@pytest.mark.benchlibs("triwarp")
-def test_query_geodesic_ball(bench_case: BenchCase) -> None:
-    skip_larger_than(bench_case, "happy_buddha")
-    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-    radius = 5.0 * float(tw.edges.mean_edge_length(vertices, faces))
-    _, offsets, _ = bench_case.run(lambda: tw.neighbors.geodesic_ball(vertices, faces, radius))
-    assert offsets.shape == (vertices.shape[0],)
-
-
 # Rays per point for the bundle groups. MeshLab's default is 64; 256 shows the cost is exactly
 # linear in it on both sides, which is the whole shape of these two groups.
 _N_RAYS_SWEEP = [64, 256]

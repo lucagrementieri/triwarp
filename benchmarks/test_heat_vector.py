@@ -41,7 +41,7 @@ timed callable per this suite's convention -- which for ``MeshVectorHeatSolver``
 halfedge mesh and factoring both the cotangent and connection Laplacians. It is constructed with
 ``use_intrinsic_delaunay=False`` so the discretization matches triwarp's. Note that it cannot run on
 ``cave_cube`` at all: its right-angle diagonals give zero cotangent weights and geometry-central's
-factorization fails there (see ``tests/test_vector_heat.py``). No group here uses that mesh.
+factorization fails there (see ``tests/test_heat_vector.py``). No group here uses that mesh.
 
 **trimesh**, **libigl** and **open3d** have no tangent-space machinery, so nothing else appears
 here.

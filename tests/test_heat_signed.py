@@ -70,7 +70,7 @@ def _distance_pp(
 
 
 # ``cave_cube`` and ``half_torus`` are left out, both for the same reason as in
-# ``tests/test_vector_heat.py``: every one of their faces carries an edge whose two opposite angles
+# ``tests/test_heat_vector.py``: every one of their faces carries an edge whose two opposite angles
 # are
 # right angles, so that edge's cotangent weight is exactly zero. potpourri3d cannot even factor
 # ``cave_cube`` (it returns NaN), and on ``half_torus`` the two libraries agree only to a

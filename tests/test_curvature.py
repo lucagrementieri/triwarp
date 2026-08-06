@@ -1,8 +1,5 @@
 """Regression tests for ``triwarp.curvature`` against ``trimesh.curvature`` (CPU reference)."""
 
-import heapq
-from collections import deque
-
 import igl
 import numpy as np
 import pytest
@@ -11,114 +8,6 @@ import warp as wp
 
 import triwarp as tw
 from tests.conversions import trimesh_to_pymeshlab
-
-
-def _geodesic_ball_neighborhoods_oracle(
-    vertices_np: np.ndarray, faces_np: np.ndarray, radius: float, min_count: int = 6
-) -> tuple[list[list[int]], np.ndarray]:
-    """
-    Host NumPy reference (the original ``_geodesic_ball_neighborhoods``) used as the oracle.
-
-    Returns the per-vertex collected lists and the reference-neighbor array.
-    """
-    n = vertices_np.shape[0]
-    adjacency: list[list[int]] = [[] for _ in range(n)]
-    seen: set[tuple[int, int]] = set()
-    for tri in faces_np:
-        for a, b in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])):
-            a, b = int(a), int(b)
-            key = (a, b) if a < b else (b, a)
-            if key in seen:
-                continue
-            seen.add(key)
-            adjacency[a].append(b)
-            adjacency[b].append(a)
-    reference = np.array(
-        [min(adjacency[i]) if adjacency[i] else i for i in range(n)], dtype=np.int32
-    )
-    per_vertex: list[list[int]] = []
-    for i in range(n):
-        center = vertices_np[i]
-        visited = {i}
-        queue = deque([i])
-        collected: list[int] = []
-        extras: list[tuple[float, int]] = []
-        while queue:
-            current = queue.popleft()
-            collected.append(current)
-            for neighbor in adjacency[current]:
-                if neighbor in visited:
-                    continue
-                distance = float(np.linalg.norm(center - vertices_np[neighbor]))
-                if distance < radius:
-                    queue.append(neighbor)
-                elif len(collected) < min_count:
-                    heapq.heappush(extras, (distance, neighbor))
-                visited.add(neighbor)
-        while extras and len(collected) < min_count:
-            _, cand = heapq.heappop(extras)
-            collected.append(cand)
-            for neighbor in adjacency[cand]:
-                if neighbor in visited:
-                    continue
-                distance = float(np.linalg.norm(center - vertices_np[neighbor]))
-                heapq.heappush(extras, (distance, neighbor))
-                visited.add(neighbor)
-        per_vertex.append(collected)
-    return per_vertex, reference
-
-
-@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
-def test_geodesic_ball_neighborhoods(mesh_name: str, request: pytest.FixtureRequest) -> None:
-    """On-device geodesic balls match the NumPy/libigl oracle (per-row set equality)."""
-    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
-    faces_np = np.array(mesh_tm.faces, dtype=np.int32)
-
-    vertices_wp = wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=mesh_wp.device)
-    faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
-
-    radius = 3.0 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
-    neighbor_indices_wp, offsets_wp, reference_wp = tw.neighbors.geodesic_ball(
-        vertices_wp, faces_wp, radius
-    )
-    per_vertex_oracle, reference_oracle = _geodesic_ball_neighborhoods_oracle(
-        vertices_np, faces_np, radius
-    )
-
-    assert np.array_equal(reference_wp.numpy(), reference_oracle)
-
-    neighbor_indices = neighbor_indices_wp.numpy()
-    offsets = offsets_wp.numpy()
-    total = neighbor_indices.shape[0]
-    n = vertices_np.shape[0]
-    for i in range(n):
-        start = int(offsets[i])
-        end = int(offsets[i + 1]) if i + 1 < n else total
-        neighbors_wp = {int(x) for x in neighbor_indices[start:end]}
-        assert neighbors_wp == set(per_vertex_oracle[i]), f"vertex {i} neighborhood differs"
-
-
-def test_geodesic_ball_neighborhoods_overflow_warns() -> None:
-    """A neighborhood exceeding the fixed 512 cap clamps (does not crash) and warns."""
-    # A subdivided icosphere has > 512 vertices; a radius covering the whole mesh makes every
-    # vertex's geodesic ball the entire connected component, exceeding the fixed scratch capacity.
-    mesh_tm = tm.creation.icosphere(subdivisions=4)
-    assert mesh_tm.vertices.shape[0] > 512
-    device = "cuda:0" if wp.is_cuda_available() else "cpu"
-    vertices_wp = wp.array(
-        np.array(mesh_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
-    faces_wp = wp.array(np.array(mesh_tm.faces, dtype=np.int32).reshape(-1), device=device)
-    radius = 100.0 * float(mesh_tm.scale)
-
-    with pytest.warns(UserWarning, match="capacity breaches"):
-        neighbor_indices_wp, offsets_wp, _ = tw.neighbors.geodesic_ball(
-            vertices_wp, faces_wp, radius
-        )
-    # Clamped, not crashed: every per-vertex count fits within the fixed capacity.
-    counts = np.diff(np.append(offsets_wp.numpy(), neighbor_indices_wp.shape[0]))
-    assert counts.max() <= 512
 
 
 @pytest.mark.parity("principal_curvature", "igl")

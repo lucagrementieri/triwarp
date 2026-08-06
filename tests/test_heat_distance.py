@@ -144,7 +144,7 @@ def test_heat_geodesic_matches_potpourri3d_plain(
 
     Distinct from ``test_robust_heat_geodesic_matches_potpourri3d``, which runs both sides with
     ``use_robust=True``. That is a different configuration from the one
-    ``benchmarks/test_geodesic.py`` times, and it is the looser of the two comparisons:
+    ``benchmarks/test_heat_distance.py`` times, and it is the looser of the two comparisons:
     potpourri3d's
     robust path additionally flips to an intrinsic Delaunay triangulation, so the two solve on
     different triangulations and can only agree to the heat method's own accuracy.
@@ -199,7 +199,7 @@ def test_heat_geodesic_matches_pymeshlab(
     A fourth independent implementation of the same PDE, and the cheapest strong check on it.
 
     Class C on the same footing as
-    [`test_heat_geodesic_matches_potpourri3d_plain`][tests.test_geodesic.test_heat_geodesic_matches_potpourri3d_plain]
+    [`test_heat_geodesic_matches_potpourri3d_plain`][tests.test_heat_distance.test_heat_geodesic_matches_potpourri3d_plain]
     -- an error norm against the mesh diameter, because triwarp runs conjugate gradient to a
     tolerance where MeshLab factorizes directly, so the residuals differ even where the systems
     match. The named transform is how the source is specified: MeshLab has no source argument at all

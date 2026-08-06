@@ -173,18 +173,18 @@ process each, 999 cases plus 139 skipped). The four slowest modules are `test_re
 `test_smoothing` (70 s).
 
 The **pymeshlab** rows add roughly **six minutes** on top of that, spread over 26 modules; the
-largest single contributions are `test_geodesic` (+40 s, its heat solver at `setup=full` rebuilds the
+largest single contributions are `test_heat_distance` (+40 s, its heat solver at `setup=full` rebuilds the
 factorization every round), `test_proximity` (+3 s even capped at `bunny`), `test_combine` (+18 s, the
 1 630 ms-per-call component split on `parts_1024`) and `test_curvature` (+9 s). Three groups are
 explicitly capped for that reason — see the pymeshlab hazards below.
 
 That measurement predates the six modules added with the potpourri3d port
-(`test_halfedge`, `test_tangent`, `test_contour`, `test_tracing`, `test_vector_heat`,
-`test_intrinsic`, `test_signed_heat`) and the potpourri3d rows in the existing ones. The three Phase-1 modules add ~10 s;
-`test_vector_heat` and `test_tracing` add ~40 s between them (the reference factors two sparse systems
-per case, and traces one ray per call); `test_signed_heat` adds ~15 s, most of it the reference's
+(`test_halfedge`, `test_tangent`, `test_contour`, `test_tracing`, `test_heat_vector`,
+`test_intrinsic`, `test_heat_signed`) and the potpourri3d rows in the existing ones. The three Phase-1 modules add ~10 s;
+`test_heat_vector` and `test_tracing` add ~40 s between them (the reference factors two sparse systems
+per case, and traces one ray per call); `test_heat_signed` adds ~15 s, most of it the reference's
 1 s-per-call solver; and the potpourri3d rows add most of their cost to
-`test_geodesic`, now 74 s for the module with its `heat_geodesic` group carrying three libraries at two
+`test_heat_distance`, now 74 s for the module with its `heat_geodesic` group carrying three libraries at two
 setup points each.
 
 Only the first of those is not measuring triwarp: **190 of `test_reconstruction`'s 199 timed
@@ -378,7 +378,7 @@ The rest are second or third independent implementations:
 | `test_curvature` | `compute_curvature_principal_directions_per_vertex(method='Quadric Fitting')` and `compute_scalar_by_discrete_curvature_per_vertex` — the only reference that survives the whole `scale` axis, where trimesh is capped at `sphere_small` |
 | `test_distance` | `get_hausdorff_distance` (one-directional, so both directions are timed) |
 | `test_edges` | `get_geometric_measures()['avg_edge_length']` |
-| `test_geodesic` | `compute_scalar_by_heat_geodesic_distance_from_selection_per_vertex` — the fourth heat-method implementation, and the only one whose amortized path is just "call it twice"; plus `..._geodesic_distance_from_given_point_...` as a non-PDE alternative |
+| `test_heat_distance` | `compute_scalar_by_heat_geodesic_distance_from_selection_per_vertex` — the fourth heat-method implementation, and the only one whose amortized path is just "call it twice"; plus `..._geodesic_distance_from_given_point_...` as a non-PDE alternative |
 | `test_graph` | `compute_selection_by_small_disconnected_components_per_face(nbfaceratio=0.0)` |
 | `test_hole_filling` | `meshing_close_holes` (ear clipping, so **1.7×** across `loops_dp` against triwarp's 37× — the price of *not* running a `B³` DP) |
 | `test_parametrization` | `compute_texcoord_parametrization_harmonic` / `..._least_squares_conformal_maps` — both wrap **libigl's own code**, so they price MeshLab's wrapper rather than a third algorithm |
@@ -668,11 +668,11 @@ Both were found while writing the parity asserts, and both fail *silently* rathe
 
 | module | potpourri3d reference |
 |---|---|
-| `test_geodesic` | `MeshHeatMethodDistanceSolver` (`use_robust=False`, the same discretization as triwarp's), and `MeshFastMarchingDistanceSolver` as a different algorithm for the same task |
+| `test_heat_distance` | `MeshHeatMethodDistanceSolver` (`use_robust=False`, the same discretization as triwarp's), and `MeshFastMarchingDistanceSolver` as a different algorithm for the same task |
 | `test_contour` | `marching_triangles` — the only reference for isocontours of an arbitrary vertex field |
 | `test_tracing` | `GeodesicTracer.trace_geodesic_from_vertex` — one ray per call, so its row is linear in the ray count by construction |
-| `test_signed_heat` | `MeshSignedHeatSolver.compute_distance` — requires every curve segment inside one face, which is why the source curves are edge paths |
-| `test_vector_heat` | `MeshVectorHeatSolver.{extend_scalar,transport_tangent_vectors,compute_log_map}` (`use_intrinsic_delaunay=False`) |
+| `test_heat_signed` | `MeshSignedHeatSolver.compute_distance` — requires every curve segment inside one face, which is why the source curves are edge paths |
+| `test_heat_vector` | `MeshVectorHeatSolver.{extend_scalar,transport_tangent_vectors,compute_log_map}` (`use_intrinsic_delaunay=False`) |
 | `test_tangent` | `MeshVectorHeatSolver.get_tangent_frames` (`use_intrinsic_delaunay=False`) — an *upper bound*: the frames only come out of the solver's construction, which also factors two sparse systems |
 | `test_laplacian` | `cotan_laplacian` (a numpy/scipy build, not C++) and `vertex_areas` (the barycentric lumped mass diagonal) |
 | `test_triangles` | `face_areas` |
@@ -745,7 +745,7 @@ Modules with **no** open3d equivalent, and why, are documented in each module's 
 iterative solver), `test_laplacian` (no cotangent or mass matrix — the smoothing filters build their
 weights inline), `test_curvature` (no curvature estimation at all), `test_intersection` (no plane
 section), `test_texture` (stores UVs but has no bake or resample), `test_polyline` (`LineSet` is
-unordered segments with no length/resample/simplify), `test_geodesic` (no geodesic distance),
+unordered segments with no length/resample/simplify), `test_heat_distance` (no geodesic distance),
 `test_selection` (no selection morphology), `test_mesh` (no caching container), `test_graph` (no
 traversal over an abstract CSR), `test_neighbors` (no batched k-NN query), plus the individual
 functions noted inline.

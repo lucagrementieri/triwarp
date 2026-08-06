@@ -348,3 +348,23 @@ def test_query_hashgrid_ball(bench_case: BenchCase, grid_bins: int) -> None:
     )
     assert offsets.shape[0] == int(queries.shape[0])
     assert neighbors.shape[0] >= 0
+
+
+@pytest.mark.benchmark(group="query_geodesic_ball")
+@pytest.mark.benchlibs("triwarp")
+def test_query_geodesic_ball(bench_case: BenchCase) -> None:
+    """
+    The mesh-graph ball: a BFS that enqueues a neighbour only when it is inside the radius.
+
+    The one query here that is not a spatial one, and the reason it is not: a Euclidean
+    hash-grid query at the same radius would also return vertices across a fold of the surface
+    -- the opposite wall of a torus tube -- which is what corrupts the quadric fit in
+    ``curvature.principal_curvature``, its only caller. So this row prices the surface-aware
+    alternative to the ball groups above rather than a variant of them, and no reference
+    library exposes it to time against.
+    """
+    skip_larger_than(bench_case, "happy_buddha")
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    radius = 5.0 * float(tw.edges.mean_edge_length(vertices, faces))
+    _, offsets, _ = bench_case.run(lambda: tw.neighbors.geodesic_ball(vertices, faces, radius))
+    assert offsets.shape == (vertices.shape[0],)

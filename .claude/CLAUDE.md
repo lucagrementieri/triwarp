@@ -97,7 +97,8 @@ identical to a hand-written kernel; cached calls cost ~11 µs extra host-side Py
   (`wp.map(segment_length, polyline[:-1], polyline[1:], out=lengths)`), and offset writes map
   into `out=dst[o : o + n]`. CSR row degrees: pass `offsets[:-1]` and `offsets[1:]`.
 - **Python-scope gather composes**: `wp.map(pred, table[indices], out=mask)` maps over the
-  `wp.indexedarray` view (see `repair.orient_faces`).
+  `wp.indexedarray` view (see `repair.make_volume`, which maps a sign predicate over a
+  per-component volume table gathered by face label).
 - Inside **per-iteration wrapper loops**, hoist the kernel once with
   `wp.map(..., return_kernel=True)` and `wp.launch(kernel, dim, inputs=[...], outputs=[...])`
   in the loop (see `triwarp/smoothing.py`) — this removes the per-call Python overhead.

@@ -48,7 +48,7 @@ against triwarp's **14.2 -> 72.5 ms** at 1% pinned. So triwarp wins by 2.7x on t
 mesh and loses by **1.8x** on the graded one, and the entire spread is its CG iteration count rather
 than anything intrinsic about the problem: a direct factorization of the identical system does not
 care. It is the same observation the potpourri3d rows make in
-[`test_geodesic.py`](test_geodesic.py) and libigl's LDLT makes in
+[`test_heat_distance.py`](test_heat_distance.py) and libigl's LDLT makes in
 [`test_parametrization.py`](test_parametrization.py).
 
 Those triwarp figures moved a long way when ``assemble_interior_system`` stopped routing an
