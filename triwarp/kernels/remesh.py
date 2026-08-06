@@ -14,6 +14,7 @@ from triwarp.kernels.predicates import (
     triangle_normal,
 )
 from triwarp.kernels.triangles import face_vertices_vec3d, triangle_quality
+from triwarp.kernels.voxels import voxel_cell
 
 # Delaunay / Delone edge-flip constants (ported from MRMeshDelone.cpp). The flip predicate
 # runs in float64: MeshLib deliberately widens to double because circumcircle diameters of
@@ -1146,32 +1147,6 @@ def voxel_size_inverse(voxel_size: wp.float32) -> wp.float32:
     # Reciprocal cell width, so the two ``cluster_*`` kernels can take the width itself (which they
     # also need for the cell centre) without the caller passing both.
     return 1.0 / voxel_size
-
-
-@wp.func
-def voxel_cell(position: wp.vec3, origin: wp.vec3, inverse_size: wp.float32) -> wp.vec3i:
-    # Integer voxel a position falls in, for the grid anchored at ``origin`` with cell width
-    # ``1 / inverse_size``. ``wp.floor`` rather than a cast, so negative coordinates round the same
-    # way positive ones do (a C-style truncation would fold the two cells either side of the origin
-    # into one).
-    local = (position - origin) * inverse_size
-    return wp.vec3i(
-        wp.int32(wp.floor(local[0])), wp.int32(wp.floor(local[1])), wp.int32(wp.floor(local[2]))
-    )
-
-
-@wp.kernel
-def voxel_cell_indices(
-    vertices: wp.array[wp.vec3],
-    origin: wp.vec3,
-    inverse_size: wp.float32,
-    out_cells: wp.array2d[wp.int32],
-) -> None:
-    v = int(wp.tid())
-    cell = voxel_cell(vertices[v], origin, inverse_size)
-    out_cells[v, 0] = cell[0]
-    out_cells[v, 1] = cell[1]
-    out_cells[v, 2] = cell[2]
 
 
 @wp.kernel

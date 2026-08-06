@@ -1,0 +1,1692 @@
+"""
+Sparse voxel grids: voxelize a mesh or a cloud, test membership, reshape, and mesh the result.
+
+The grid is a ``warp.Volume`` -- a NanoVDB *index* grid -- rather than a triwarp value type, and
+every function here either produces one or consumes one. Four measured properties are what make
+that the right centre, and they are worth knowing before reading anything else:
+
+- **The builder is the dedup.** ``Volume.allocate_by_voxels`` collapses repeated cells as it builds,
+  2.3x faster than a sort-and-unique over the same rows on *both* devices, so no function here ever
+  calls [`triwarp.grouping.unique_rows`][triwarp.grouping.unique_rows].
+- **The volume's linear index is the row index of its cell array.** ``wp.volume_lookup_index``
+  returns exactly the row [`cells`][triwarp.voxels.cells] puts that voxel in, so a per-voxel payload
+  is a plain ``wp.array`` of length ``n_voxels`` and membership costs one ``O(1)`` probe.
+- **NanoVDB centres voxels on integers**, so the volume's translation is ``origin + 0.5 * s`` where
+  ``origin`` is the world position of the lower corner of cell ``(0, 0, 0)``. Under that shift cell
+  ``c`` covers world ``[origin + c * s, origin + (c + 1) * s)`` exactly, which is Open3D's cell and
+  the anchor [`triwarp.remesh.cluster_decimate`][triwarp.remesh.cluster_decimate] already uses.
+  [`grid_transform`][triwarp.voxels.grid_transform] undoes the shift so callers never see it.
+- **The cell order is leaf-major, not lexicographic**: ``get_voxels`` walks NanoVDB's 8-cubed leaves
+  and the cells within each. It is deterministic and identical on CPU and CUDA, but it is *not* a
+  C-order ``reshape``, so [`cells`][triwarp.voxels.cells] carries an ``order`` flag for callers who
+  need the ascending-key order [`triwarp.grouping.unique_rows`][triwarp.grouping.unique_rows]
+  produces.
+
+Because the grid *is* a ``warp.Volume``, a caller can sample it (``wp.volume_sample_f``), probe it
+(``wp.volume_lookup_index``) inside their own kernels, save it with ``grid.save_to_nvdb(path)``, and
+hand it straight to ``warp.fem``'s nanogrid geometries. There is deliberately no ``to_volume`` pair.
+
+!!! note "Recipes this module does not wrap"
+    - **Set algebra** (trimesh's ``boolean_sparse``): union is
+      ``from_cells(array.concatenate([cells(a), cells(b)]), s, o)`` -- the builder dedups;
+      intersection is ``cells(a)[occupancy_at_cells(b, cells(a))]``; difference negates the mask.
+    - **Closing and opening**: ``erode(dilate(g))`` and ``dilate(erode(g))``.
+    - **Revoxelize at another pitch**: ``voxelize_points(cell_centers(g), new_size)``.
+    - **Implicit CSG**: [`grid_points`][triwarp.voxels.grid_points] →
+      [`triwarp.proximity.signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh] per
+      solid → ``wp.map(wp.min, ...)`` for a union →
+      [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes].
+    - **A full dense box**: ``from_dense(wp.full(shape, True), s, o)``.
+
+Notes
+-----
+An 8-cubed NanoVDB leaf carries a 64-byte occupancy mask, so a set with one voxel per leaf costs
+more than the ``(n, 3)`` ``int32`` cell array would. [`cells`][triwarp.voxels.cells] is 0.03 ms per
+million voxels, so that array form is always one call away.
+
+The grid build is the module's floor and it is where the data-structure choice was decided: on one
+million random cells over a 128-cubed box collapsing to 794 875 voxels, ``allocate_by_voxels``
+medians **0.64 ms on CUDA and 138 ms on CPU** against **1.51 ms / 316 ms** for the equivalent
+[`triwarp.grouping.unique_rows`][triwarp.grouping.unique_rows] dedup -- 2.3x on both devices, which
+is why there is no per-device path here.
+
+Measured medians on ``bunny`` (35 947 vertices, RTX 5090, cells at ``diagonal / 96`` unless noted),
+against the reference each function is tested for:
+
+| function | triwarp | reference |
+|---|---|---|
+| ``voxelize_mesh`` at ``diagonal / 64`` | 0.63 ms | 19.3 ms (open3d) |
+| ``voxelize_mesh`` at ``diagonal / 256`` | 0.67 ms | 61.1 ms (open3d) |
+| ``voxelize_points`` | 0.55 ms | 2.29 ms (open3d) |
+| ``voxel_down_sample`` | 0.80 ms | 1.34 ms (open3d) |
+| ``occupancy_at_points``, 10^6 queries | 0.083 ms | 44.0 ms (open3d) |
+| ``dilate`` | 0.41 ms | 1.77 ms (trimesh / ndimage) |
+| ``fill_holes`` | 0.74 ms | 5.32 ms (trimesh / ndimage) |
+| ``fill_orthographic`` | 1.13 ms | 4.73 ms (trimesh) |
+| ``to_boxes`` | 1.01 ms | 23.8 ms (trimesh ``multibox``) |
+| ``voxel_corners`` | 0.67 ms | 4.83 ms (igl) |
+| ``grid_points`` at 64-cubed | 0.053 ms | 1.62 ms (igl) |
+
+The one place the grid build is *not* the cheap part is [`dilate`][triwarp.voxels.dilate], where it
+is **68 %** of the call (0.67 of 0.99 ms at 179 k voxels, against 3 % for the candidate kernel). A
+1.16 rebuildable volume was measured as the obvious fix and **rejected**: ``Volume.rebuild`` into a
+pre-reserved topology is only 5-7 % faster than a fresh ``allocate_by_voxels`` (0.344 against 0.369
+ms at 179 k voxels, 0.836 against 0.885 at 262 k), because the cost is inserting the points and
+building the leaves, not the allocation. Two traps found while measuring that, in case it is
+retried: the four ``max_*`` capacities **cascade** (``max_leaf_nodes`` defaults to
+``max_active_voxels`` and so on down), so supplying only ``max_active_voxels`` at 800 k voxels asks
+for 800 k *upper* nodes and dies of out-of-memory -- reported as ``Failed to create volume``, after
+which the CUDA context raises illegal-memory-access on everything; and a rebuildable grid reports
+its **capacity** through ``get_voxel_count``, which is why [`cells`][triwarp.voxels.cells] never
+uses it.
+
+See Also
+--------
+[`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes]
+[`triwarp.remesh.cluster_decimate`][triwarp.remesh.cluster_decimate]
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+import numpy as np
+import warp as wp
+
+import triwarp as tw
+import triwarp.typing as twt
+from triwarp.kernels import voxels as kernel_voxels
+
+# Neighbourhood stencils, in the order ``scipy.ndimage.generate_binary_structure`` induces:
+# 6 = face-adjacent (rank 1), 18 = face + edge (rank 2), 26 = the full 3-cubed shell (rank 3).
+_CONNECTIVITY_RANK = {6: 1, 18: 2, 26: 3}
+
+# The six axis directions, in the order the cube-face table below expects: -x, +x, -y, +y, -z, +z.
+_FACE_NEIGHBORS = np.array(
+    [[-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1]], dtype=np.int32
+)
+
+# The four corners of each cube face, as local corner indices ``c = 4 * dx + 2 * dy + dz``, wound so
+# that the quad's normal points along the corresponding row of ``_FACE_NEIGHBORS`` -- i.e. away from
+# the voxel, which is what makes [`to_boxes`][triwarp.voxels.to_boxes] outward-facing by
+# construction rather than by a sign convention applied afterwards.
+_FACE_CORNERS = np.array(
+    [[0, 1, 3, 2], [4, 6, 7, 5], [0, 4, 5, 1], [2, 3, 7, 6], [0, 2, 6, 4], [1, 5, 7, 3]],
+    dtype=np.int32,
+)
+
+_STENCIL_CACHE: dict[tuple[str, int, bool], twt.Array2dInt32] = {}
+
+
+def voxelize_mesh(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    voxel_size: float | None = None,
+    *,
+    origin: wp.vec3 | None = None,
+    mode: Literal["surface", "solid"] = "surface",
+    max_candidates: int = 1 << 28,
+) -> wp.Volume:
+    """
+    Occupancy grid of a triangle mesh, by an exact triangle-box overlap test per candidate cell.
+
+    A cell is occupied when the closed triangle actually meets the closed cell, decided by the
+    13-axis separating-axis test (three box normals, the triangle plane, nine edge cross-products).
+    No sampling, no subdivision heuristic, no tolerance: the accept set is the same one Open3D's
+    ``CreateFromTriangleMesh`` produces, and it is what makes ``mode="solid"`` sound.
+
+    The work is flattened into one thread per **(triangle, candidate cell)** pair rather than one
+    per triangle, because per-triangle window sizes span orders of magnitude on any real mesh and a
+    thread-per-triangle launch is load-imbalanced by that same factor. Each triangle's window is its
+    exact inclusive AABB span, whose sizes are prefix-summed into the work-item offsets.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    voxel_size
+        Cell width. Defaults to ``1 %`` of the bounding-box diagonal, a ~100-cell grid across the
+        mesh. **Cost is cubic in the reciprocal.**
+    origin
+        World position of the lower corner of cell ``(0, 0, 0)``. Defaults to
+        ``aabb_bounds(vertices).min - 0.5 * voxel_size``, Open3D's half-voxel pad.
+    mode
+        ``"surface"`` (default) keeps only the cells the surface passes through. ``"solid"`` fills
+        the enclosed interior afterwards with [`fill_holes`][triwarp.voxels.fill_holes], which is
+        correct for a closed input: an exact tri-box voxelization of a closed surface is
+        **6-connected sealed**, so no face-adjacent path leaves the interior and the fill needs no
+        containment query at all. On an open surface it fills whatever the shell happens to enclose.
+    max_candidates
+        Guard on the total number of (triangle, cell) pairs, which grows cubically as
+        ``voxel_size`` shrinks. Exceeding it raises rather than attempting the allocation.
+
+    Returns
+    -------
+    wp.Volume
+        A NanoVDB index grid on ``vertices.device`` with one active voxel per occupied cell. Empty
+        (zero active voxels) when the mesh has no faces.
+
+    Raises
+    ------
+    ValueError
+        If ``voxel_size`` is not positive, if ``mode`` is not one of the two names, if
+        ``max_candidates`` is not positive, or if the candidate count exceeds ``max_candidates``.
+
+    See Also
+    --------
+    [`voxelize_points`][triwarp.voxels.voxelize_points]
+    [`fill_holes`][triwarp.voxels.fill_holes]
+    [`triwarp.reconstruction.resample_uniform`][triwarp.reconstruction.resample_uniform]
+
+    Notes
+    -----
+    Open3D runs the same test in ``float64`` and this one runs in ``float32``, so a triangle exactly
+    tangent to a cell plane can be resolved differently by the two. Nothing else differs: Open3D's
+    ``round((max - min) / voxel_size) + 2`` candidate window is a superset of the exact AABB window
+    used here, and a cell outside a triangle's AABB cannot overlap the triangle.
+
+    trimesh's ``voxelize_subdivide`` is a *different* algorithm -- subdivide until every edge is
+    under half a pitch, then round each vertex to a cell -- and its result neither contains nor is
+    contained in this one.
+    """
+    if mode not in ("surface", "solid"):
+        raise ValueError(f"mode must be 'surface' or 'solid', got {mode!r}")
+    if max_candidates <= 0:
+        raise ValueError(f"max_candidates must be positive, got {max_candidates}")
+
+    device = vertices.device
+    n_faces = int(faces.shape[0]) // 3
+    voxel_size, origin = _resolve_grid(vertices, voxel_size, origin, "voxelize_mesh")
+    if n_faces == 0:
+        return _empty_grid(voxel_size, origin, device)
+
+    counts = wp.empty(n_faces, dtype=wp.int32, device=device)
+    counts_f32 = wp.empty(n_faces, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_voxels.count_triangle_candidates,
+        dim=n_faces,
+        inputs=[vertices, faces, origin, wp.float32(1.0 / voxel_size), counts, counts_f32],
+        device=device,
+    )
+    # The budget check runs on the float32 copy: the exact count can overflow ``int32`` for an
+    # absurd voxel_size, and the whole point of the guard is to catch exactly that case before the
+    # prefix sum is asked to represent it.
+    approximate_total = tw.reduce.sum(counts_f32)
+    if approximate_total > float(max_candidates):
+        raise ValueError(
+            f"voxelize_mesh would test {approximate_total:.3g} (triangle, cell) pairs, above "
+            f"max_candidates={max_candidates}: voxel_size={voxel_size:.6g} is too small for this "
+            "mesh (the count grows as its reciprocal cubed)"
+        )
+    offsets, total = tw.array.counts_to_offsets(counts)
+    if total == 0:
+        return _empty_grid(voxel_size, origin, device)
+
+    candidate_cells = twt.empty_int32_2d((total, 3), device=device)
+    accepted = wp.empty(total, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_voxels.test_triangle_candidates,
+        dim=total,
+        inputs=[
+            vertices,
+            faces,
+            offsets,
+            origin,
+            wp.float32(voxel_size),
+            wp.float32(1.0 / voxel_size),
+            candidate_cells,
+            accepted,
+        ],
+        device=device,
+    )
+    # ``point_mask`` lets the builder skip the rejected candidates in place, so no compaction pass
+    # and no second cell buffer.
+    grid = wp.Volume.allocate_by_voxels(
+        candidate_cells,
+        voxel_size=voxel_size,
+        translation=_translation(origin, voxel_size),
+        point_mask=accepted,
+        device=device,
+    )
+    if mode == "solid":
+        return fill_holes(grid)
+    return grid
+
+
+def voxelize_points(
+    points: wp.array[wp.vec3], voxel_size: float | None = None, *, origin: wp.vec3 | None = None
+) -> wp.Volume:
+    """
+    Occupancy grid of a point cloud: one active voxel per cell that contains at least one point.
+
+    Open3D's ``VoxelGrid.create_from_point_cloud``. There is no dedup step to write — the builder
+    collapses repeated cells itself, faster than a sort-and-unique over the same rows.
+
+    Parameters
+    ----------
+    points
+        ``(n_points,)`` positions.
+    voxel_size
+        Cell width. Defaults to ``1 %`` of the cloud's bounding-box diagonal.
+    origin
+        World position of the lower corner of cell ``(0, 0, 0)``. Defaults to
+        ``aabb_bounds(points).min - 0.5 * voxel_size``.
+
+    Returns
+    -------
+    wp.Volume
+        A NanoVDB index grid on ``points.device``. Empty when ``points`` is empty.
+
+    Raises
+    ------
+    ValueError
+        If ``voxel_size`` is not positive.
+
+    See Also
+    --------
+    [`voxelize_mesh`][triwarp.voxels.voxelize_mesh]
+    [`voxel_down_sample`][triwarp.voxels.voxel_down_sample]
+    [`cell_indices`][triwarp.voxels.cell_indices]
+    """
+    device = points.device
+    voxel_size, origin = _resolve_grid(points, voxel_size, origin, "voxelize_points")
+    if int(points.shape[0]) == 0:
+        return _empty_grid(voxel_size, origin, device)
+    return from_cells(cell_indices(points, voxel_size, origin=origin), voxel_size, origin)
+
+
+def voxel_down_sample(
+    points: wp.array[wp.vec3],
+    voxel_size: float | None = None,
+    *,
+    origin: wp.vec3 | None = None,
+    pooling: Literal["mean", "min", "max", "sum"] = "mean",
+    return_inverse: bool = False,
+) -> wp.array[wp.vec3] | tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Reduce a cloud to one point per occupied voxel.
+
+    Open3D's ``PointCloud.voxel_down_sample``: the standard uniform decimation for a scan, and the
+    cheapest way to put two clouds on a common sampling density before registration. The default
+    ``"mean"`` is Open3D's ``AccumulatedPoint`` average and does **not** renormalize, so the same
+    call pools per-point normals or colours through
+    [`pool_by_voxel`][triwarp.voxels.pool_by_voxel].
+
+    Parameters
+    ----------
+    points
+        ``(n_points,)`` positions.
+    voxel_size
+        Cell width. Defaults to ``1 %`` of the cloud's bounding-box diagonal.
+    origin
+        World position of the lower corner of cell ``(0, 0, 0)``. Defaults to
+        ``aabb_bounds(points).min - 0.5 * voxel_size``.
+    pooling
+        How each voxel reduces the points inside it: ``"mean"`` (default), ``"sum"``, ``"min"`` or
+        ``"max"`` (both component-wise).
+    return_inverse
+        Also return, for each input point, the row of the output it was pooled into.
+
+    Returns
+    -------
+    points : wp.array[wp.vec3]
+        ``(n_voxels,)`` pooled positions, in the grid's own cell order (see
+        [`cells`][triwarp.voxels.cells]).
+    inverse : wp.array[wp.int32], optional
+        Present when ``return_inverse=True``. ``inverse[i]`` is the output row of input point ``i``.
+
+    Raises
+    ------
+    ValueError
+        If ``voxel_size`` is not positive, or ``pooling`` is not one of the four names.
+
+    See Also
+    --------
+    [`pool_by_voxel`][triwarp.voxels.pool_by_voxel]
+    [`voxelize_points`][triwarp.voxels.voxelize_points]
+    [`triwarp.remesh.cluster_decimate`][triwarp.remesh.cluster_decimate]
+
+    Notes
+    -----
+    ``"mean"`` and ``"sum"`` are bitwise reproducible run to run: they sort the points by voxel and
+    reduce each segment in index order rather than accumulating with float atomics, whose ordering
+    varies between launches. That costs one radix sort over the point count. ``"min"`` and ``"max"``
+    use atomics directly, since those are order-independent for floats.
+    """
+    grid = voxelize_points(points, voxel_size, origin=origin)
+    pooled = pool_by_voxel(grid, points, points, pooling=pooling)
+    if not return_inverse:
+        return pooled
+    return pooled, _point_slots(grid, points)
+
+
+def pool_by_voxel(
+    grid: wp.Volume,
+    points: wp.array[wp.vec3],
+    values: wp.array[wp.vec3],
+    *,
+    pooling: Literal["mean", "min", "max", "sum"] = "mean",
+) -> wp.array[wp.vec3]:
+    """
+    Reduce a per-point ``wp.vec3`` payload onto the voxels of ``grid``.
+
+    The general form of [`voxel_down_sample`][triwarp.voxels.voxel_down_sample]: positions,
+    normals, colours or velocities, pooled onto whichever grid the caller already has. It takes the
+    grid rather than a precomputed inverse map because the grid *is* the inverse map — one
+    ``O(1)`` probe per point recovers its output row.
+
+    Parameters
+    ----------
+    grid
+        Index grid whose voxels are the output rows.
+    points
+        ``(n_points,)`` positions locating each payload value. Points falling outside ``grid`` are
+        ignored.
+    values
+        ``(n_points,)`` payload, one per entry of ``points``.
+    pooling
+        ``"mean"`` (default), ``"sum"``, ``"min"`` or ``"max"`` (both component-wise).
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        ``(n_voxels,)`` pooled values, indexed by the grid's own voxel numbering. Voxels no point
+        landed in are zero, for every ``pooling``.
+
+    Raises
+    ------
+    ValueError
+        If ``pooling`` is not one of the four names, or ``points`` and ``values`` differ in length.
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`voxel_down_sample`][triwarp.voxels.voxel_down_sample]
+    [`cell_centers`][triwarp.voxels.cell_centers]
+    """
+    if pooling not in ("mean", "min", "max", "sum"):
+        raise ValueError(f"pooling must be 'mean', 'sum', 'min' or 'max', got {pooling!r}")
+    if int(points.shape[0]) != int(values.shape[0]):
+        raise ValueError(
+            f"points and values must be the same length, got {int(points.shape[0])} and "
+            f"{int(values.shape[0])}"
+        )
+    _require_index_grid(grid)
+    device = points.device
+    n_points = int(points.shape[0])
+    n_voxels = _voxel_count(grid)
+    if n_voxels == 0:
+        return wp.empty(0, dtype=wp.vec3, device=device)
+    if n_points == 0:
+        return wp.zeros(n_voxels, dtype=wp.vec3, device=device)
+
+    slots = _point_slots(grid, points)
+    # One sentinel bucket past the last voxel collects the points that fall outside the grid.
+    counts = wp.zeros(n_voxels + 1, dtype=wp.int32, device=device)
+    buckets = wp.empty(n_points, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_voxels.bucket_point_slots,
+        dim=n_points,
+        inputs=[slots, wp.int32(n_voxels), buckets, counts],
+        device=device,
+    )
+
+    if pooling in ("min", "max"):
+        largest = pooling == "max"
+        limit = -float("inf") if largest else float("inf")
+        pooled = wp.full(n_voxels, wp.vec3(limit, limit, limit), device=device)
+        wp.launch(
+            kernel_voxels.pool_extremum_vec3,
+            dim=n_points,
+            inputs=[slots, values, largest, pooled],
+            device=device,
+        )
+    else:
+        sorted_buckets, order = tw.array.sort_and_argsort(buckets)
+        del sorted_buckets
+        offsets, _total = tw.array.counts_to_offsets(counts)
+        pooled = wp.empty(n_voxels, dtype=wp.vec3, device=device)
+        wp.launch(
+            kernel_voxels.segment_reduce_vec3,
+            dim=n_voxels,
+            inputs=[order, values, offsets, counts, pooling == "mean", pooled],
+            device=device,
+        )
+    wp.launch(kernel_voxels.zero_empty_voxels, dim=n_voxels, inputs=[counts, pooled], device=device)
+    return pooled
+
+
+def cells(grid: wp.Volume, *, order: Literal["grid", "sorted"] = "grid") -> twt.Array2dInt32:
+    """
+    Integer cell coordinates of every active voxel, one row per voxel.
+
+    The array-facing half of the grid, and the only place its row order is observable: everything
+    else here returns an opaque ``warp.Volume``.
+
+    Parameters
+    ----------
+    grid
+        Index grid to read.
+    order
+        Row order of the result:
+
+        - ``"grid"`` (default) — the volume's own leaf-major order, free because it is what the
+          volume already holds. Deterministic, and identical on CPU and CUDA.
+        - ``"sorted"`` — ascending in the packed cell key, which costs one radix sort over the voxel
+          count. Column 0 is the key's *least* significant digit, so this is lexicographic with
+          ``x`` as the last tiebreak — chosen that way because it is then bit-identical to
+          [`triwarp.grouping.unique_rows`][triwarp.grouping.unique_rows]'s order, which is what
+          callers comparing against the pre-volume code path need.
+
+    Returns
+    -------
+    Array2dInt32
+        ``(n_voxels, 3)`` cell coordinates on the grid's device. Coordinates may be negative.
+
+    Raises
+    ------
+    ValueError
+        If ``order`` is not one of the two names.
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`from_cells`][triwarp.voxels.from_cells]
+    [`cell_centers`][triwarp.voxels.cell_centers]
+
+    Notes
+    -----
+    The length comes from ``Volume.get_active_stats``, never from ``get_voxel_count``: on a
+    *rebuildable* grid the latter reports the reserved **capacity**, and the trailing rows of
+    ``get_voxels`` are padding at ``[0, 0, 0]`` that would read as real voxels.
+    """
+    if order not in ("grid", "sorted"):
+        raise ValueError(f"order must be 'grid' or 'sorted', got {order!r}")
+    _require_index_grid(grid)
+    n_voxels = _voxel_count(grid)
+    if n_voxels == 0:
+        return twt.empty_int32_2d((0, 3), device=grid.device)
+    rows = twt.as_array2d_int32(grid.get_voxels()[:n_voxels])
+    if order == "grid":
+        return rows
+
+    # Shift only where a column actually goes negative, so a non-negative cell set keeps exactly
+    # the keys ``grouping.hash_indices_rows`` would produce and therefore exactly its order.
+    lower, upper = tw.reduce.minmax(rows, axis=0)
+    base = np.minimum(lower.numpy(), 0)
+    radix = int(upper.numpy().max() - base.min()) + 1
+    keys = wp.empty(n_voxels, dtype=wp.uint64, device=grid.device)
+    wp.launch(
+        kernel_voxels.pack_cell_keys,
+        dim=n_voxels,
+        inputs=[rows, wp.vec3i(*(int(x) for x in base)), wp.uint64(radix), keys],
+        device=grid.device,
+    )
+    _sorted_keys, permutation = tw.array.sort_and_argsort(keys)
+    return twt.as_array2d_int32(tw.array.gather(rows, permutation))
+
+
+def from_cells(cells: twt.Array2dInt32, voxel_size: float, origin: wp.vec3) -> wp.Volume:
+    """
+    Build an index grid from integer cell coordinates.
+
+    The inverse of [`cells`][triwarp.voxels.cells], and the constructor every other producer here
+    ends in. Repeated rows are collapsed by the builder, so the input need not be unique.
+
+    Parameters
+    ----------
+    cells
+        ``(n_cells, 3)`` ``wp.int32`` cell coordinates. Negative coordinates are fine.
+    voxel_size
+        Cell width.
+    origin
+        World position of the lower corner of cell ``(0, 0, 0)``.
+
+    Returns
+    -------
+    wp.Volume
+        A NanoVDB index grid on ``cells.device``, empty when ``cells`` is empty.
+
+    Raises
+    ------
+    ValueError
+        If ``voxel_size`` is not positive, or ``cells`` does not have three columns.
+    TypeError
+        If ``cells`` is not a rank-2 ``wp.int32`` array.
+
+    See Also
+    --------
+    [`cells`][triwarp.voxels.cells]
+    [`from_dense`][triwarp.voxels.from_dense]
+    """
+    twt.ensure_ndim(cells, 2, dtype=wp.int32)
+    if int(cells.shape[1]) != 3:
+        raise ValueError(f"cells must have three columns, got {int(cells.shape[1])}")
+    if voxel_size <= 0.0:
+        raise ValueError(f"from_cells requires voxel_size > 0, got {voxel_size}")
+    if int(cells.shape[0]) == 0:
+        return _empty_grid(voxel_size, origin, cells.device)
+    # The builder reads the buffer as if contiguous, so a strided view has to be densified first.
+    rows = cells if cells.is_contiguous else wp.clone(cells)
+    return wp.Volume.allocate_by_voxels(
+        rows,
+        voxel_size=voxel_size,
+        translation=_translation(origin, voxel_size),
+        device=cells.device,
+    )
+
+
+def grid_transform(grid: wp.Volume) -> tuple[float, wp.vec3]:
+    """
+    Cell width and world origin of an index grid.
+
+    Undoes the half-voxel shift NanoVDB's integer-centred voxels need, so ``origin`` here is the
+    world position of the lower corner of cell ``(0, 0, 0)`` — the same anchor
+    [`from_cells`][triwarp.voxels.from_cells] takes, not the volume's own translation.
+
+    Parameters
+    ----------
+    grid
+        Index grid to read.
+
+    Returns
+    -------
+    voxel_size : float
+        Cell width.
+    origin : wp.vec3
+        World position of the lower corner of cell ``(0, 0, 0)``.
+
+    Raises
+    ------
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`from_cells`][triwarp.voxels.from_cells]
+    [`cell_centers`][triwarp.voxels.cell_centers]
+    """
+    return _require_index_grid(grid)
+
+
+def cell_indices(
+    points: wp.array[wp.vec3], voxel_size: float, *, origin: wp.vec3
+) -> twt.Array2dInt32:
+    """
+    Cell each point falls in, one row per point and no deduplication.
+
+    trimesh's ``points_to_indices`` and Open3D's ``VoxelGrid.get_voxel``. It takes the transform
+    explicitly rather than a grid because its job is to be used *before* a grid exists — it is what
+    [`voxelize_points`][triwarp.voxels.voxelize_points] feeds to the builder.
+
+    Parameters
+    ----------
+    points
+        ``(n_points,)`` positions.
+    voxel_size
+        Cell width.
+    origin
+        World position of the lower corner of cell ``(0, 0, 0)``.
+
+    Returns
+    -------
+    Array2dInt32
+        ``(n_points, 3)`` cell coordinates on ``points.device``, negative below ``origin``.
+
+    Raises
+    ------
+    ValueError
+        If ``voxel_size`` is not positive.
+
+    See Also
+    --------
+    [`occupancy_at_points`][triwarp.voxels.occupancy_at_points]
+    [`voxelize_points`][triwarp.voxels.voxelize_points]
+    """
+    if voxel_size <= 0.0:
+        raise ValueError(f"cell_indices requires voxel_size > 0, got {voxel_size}")
+    n_points = int(points.shape[0])
+    out_cells = twt.empty_int32_2d((n_points, 3), device=points.device)
+    if n_points == 0:
+        return out_cells
+    wp.launch(
+        kernel_voxels.voxel_cell_indices,
+        dim=n_points,
+        inputs=[points, origin, wp.float32(1.0 / voxel_size), out_cells],
+        device=points.device,
+    )
+    return out_cells
+
+
+def cell_centers(grid: wp.Volume) -> wp.array[wp.vec3]:
+    """
+    World position of the centre of every active voxel.
+
+    Parameters
+    ----------
+    grid
+        Index grid to read.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        ``(n_voxels,)`` centres, in the grid's own voxel order.
+
+    Raises
+    ------
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`cells`][triwarp.voxels.cells]
+    [`to_boxes`][triwarp.voxels.to_boxes]
+    """
+    voxel_size, origin = _require_index_grid(grid)
+    voxels = cells(grid)
+    n_voxels = int(voxels.shape[0])
+    centers = wp.empty(n_voxels, dtype=wp.vec3, device=grid.device)
+    if n_voxels == 0:
+        return centers
+    wp.launch(
+        kernel_voxels.cell_center_positions,
+        dim=n_voxels,
+        inputs=[voxels, origin, wp.float32(voxel_size), centers],
+        device=grid.device,
+    )
+    return centers
+
+
+def occupancy_at_points(grid: wp.Volume, points: wp.array[wp.vec3]) -> wp.array[wp.bool]:
+    """
+    Occupancy mask of the voxel each query point falls in.
+
+    Open3D's ``VoxelGrid.check_if_included`` and trimesh's ``VoxelGrid.is_filled``, which are one
+    hash lookup per query on one core; here it is one ``O(1)`` probe per query in a single kernel,
+    with no host work.
+
+    Parameters
+    ----------
+    grid
+        Index grid to test against.
+    points
+        ``(n_points,)`` query positions.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Length-``n_points`` mask on ``points.device``.
+
+    Raises
+    ------
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`occupancy_at_cells`][triwarp.voxels.occupancy_at_cells]
+    [`cell_indices`][triwarp.voxels.cell_indices]
+    """
+    _require_index_grid(grid)
+    n_points = int(points.shape[0])
+    mask = wp.empty(n_points, dtype=wp.bool, device=points.device)
+    if n_points == 0:
+        return mask
+    wp.map(kernel_voxels.is_present, _point_slots(grid, points), out=mask)
+    return mask
+
+
+def occupancy_at_cells(grid: wp.Volume, cells: twt.Array2dInt32) -> wp.array[wp.bool]:
+    """
+    Occupancy mask of a list of integer cells.
+
+    The index-space form of [`occupancy_at_points`][triwarp.voxels.occupancy_at_points], and the
+    primitive the set-algebra recipes in this module's docstring are written in: intersection is
+    ``cells(a)[occupancy_at_cells(b, cells(a))]`` and difference negates the mask.
+
+    Parameters
+    ----------
+    grid
+        Index grid to test against.
+    cells
+        ``(n_cells, 3)`` ``wp.int32`` cell coordinates.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Length-``n_cells`` mask on ``cells.device``.
+
+    Raises
+    ------
+    ValueError
+        If ``cells`` does not have three columns.
+    TypeError
+        If ``cells`` is not a rank-2 ``wp.int32`` array, or ``grid`` is not a NanoVDB index grid
+        with isotropic voxels.
+
+    See Also
+    --------
+    [`occupancy_at_points`][triwarp.voxels.occupancy_at_points]
+    [`cells`][triwarp.voxels.cells]
+    """
+    _require_index_grid(grid)
+    twt.ensure_ndim(cells, 2, dtype=wp.int32)
+    if int(cells.shape[1]) != 3:
+        raise ValueError(f"cells must have three columns, got {int(cells.shape[1])}")
+    n_cells = int(cells.shape[0])
+    mask = wp.empty(n_cells, dtype=wp.bool, device=cells.device)
+    if n_cells == 0:
+        return mask
+    wp.map(kernel_voxels.is_present, _cell_slots(grid, cells), out=mask)
+    return mask
+
+
+def grid_points(
+    shape: tuple[int, int, int],
+    *,
+    bounds: tuple[wp.vec3, wp.vec3] | None = None,
+    device: wp.DeviceLike = None,
+) -> wp.array[wp.vec3]:
+    """
+    Regular lattice of sample positions spanning a box, flattened in C order.
+
+    ``igl.grid``, and the producer side of the implicit-surface round trip: it takes the same
+    ``(lower, upper)`` corner-mapping tuple
+    [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes] takes, so a
+    per-point scalar answer ``.reshape(shape)``s straight back into a field that function accepts.
+    This is a **corner lattice**, not a voxel grid: it has nothing to do with the rest of the module
+    except that both speak the same ``bounds`` convention.
+
+    Parameters
+    ----------
+    shape
+        ``(nx, ny, nz)`` number of samples per axis, each at least 1.
+    bounds
+        ``(lower, upper)`` world corners the lattice spans, so sample ``(0, 0, 0)`` sits at
+        ``lower`` and sample ``(nx-1, ny-1, nz-1)`` at ``upper``. ``None`` (the default) gives index
+        space: the coordinates are the lattice indices, matching
+        [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes]'s own
+        default.
+    device
+        Target Warp device.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        ``nx * ny * nz`` positions, ``z`` fastest.
+
+    Raises
+    ------
+    ValueError
+        If ``shape`` is not three positive integers.
+
+    See Also
+    --------
+    [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes]
+    [`to_field`][triwarp.voxels.to_field]
+
+    Notes
+    -----
+    ``igl.voxel_grid`` produces this same lattice up to its own transform: ``s`` cells along the
+    longest side, ``pad_count`` cells beyond the box, then an isotropic rescale re-centred on the
+    box centre.
+    """
+    if len(shape) != 3 or min(int(n) for n in shape) < 1:
+        raise ValueError(f"shape must be three positive integers, got {shape!r}")
+    dims = (int(shape[0]), int(shape[1]), int(shape[2]))
+    if bounds is None:
+        lower = wp.vec3(0.0, 0.0, 0.0)
+        step = wp.vec3(1.0, 1.0, 1.0)
+    else:
+        lower, upper = bounds
+        step = wp.vec3(
+            *(
+                (upper[axis] - lower[axis]) / float(dims[axis] - 1) if dims[axis] > 1 else 0.0
+                for axis in range(3)
+            )
+        )
+    lattice = wp.empty(dims, dtype=wp.vec3, device=device)
+    wp.launch(kernel_voxels.lattice_points, dim=dims, inputs=[lower, step, lattice], device=device)
+    return lattice.reshape((dims[0] * dims[1] * dims[2],))
+
+
+def fill_holes(grid: wp.Volume) -> wp.Volume:
+    """
+    Fill every enclosed cavity: an empty cell is kept empty only if it reaches the outside.
+
+    trimesh's ``morphology.fill_holes`` (``scipy.ndimage.binary_fill_holes``) and the default of
+    ``VoxelGrid.fill``. The one operation here the sparse grid cannot answer by itself, because it
+    is a statement about the *empty* complement, so this densifies over the occupied bounding box
+    plus one cell of padding and labels the empty cells' 6-connected components.
+
+    Parameters
+    ----------
+    grid
+        Index grid to fill.
+
+    Returns
+    -------
+    wp.Volume
+        A new index grid containing ``grid``'s voxels plus every enclosed empty cell.
+
+    Raises
+    ------
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`fill_orthographic`][triwarp.voxels.fill_orthographic]
+    [`voxelize_mesh`][triwarp.voxels.voxelize_mesh]
+
+    Notes
+    -----
+    The 6-neighbour stencil is *implicit*: the union-find hooks three backward probes per cell
+    straight off the dense occupancy, so no edge list is ever built. An explicit one would cost
+    ``3 * n_empty`` rows — 400 MB over a 256-cubed box — which is why the connected-component pass
+    is written against the stencil rather than against
+    [`triwarp.graph.connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges].
+    """
+    voxel_size, origin = _require_index_grid(grid)
+    device = grid.device
+    if _voxel_count(grid) == 0:
+        return _empty_grid(voxel_size, origin, device)
+
+    occupancy, origin_cell = _to_dense_padded(grid, pad=1)
+    dims = (int(occupancy.shape[0]), int(occupancy.shape[1]), int(occupancy.shape[2]))
+    n_nodes = dims[0] * dims[1] * dims[2]
+
+    from triwarp.kernels.algorithms import connected_components as kernel_components
+
+    parents = wp.empty(n_nodes, dtype=wp.int32, device=device)
+    wp.launch(kernel_voxels.flood_init_parent, dim=dims, inputs=[occupancy, parents], device=device)
+    wp.launch(kernel_voxels.flood_hook, dim=dims, inputs=[occupancy, parents], device=device)
+    labels = wp.empty(n_nodes, dtype=wp.int32, device=device)
+    wp.launch(kernel_components.ecl_flatten, dim=n_nodes, inputs=[parents, labels], device=device)
+
+    outside = wp.zeros(n_nodes, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_voxels.mark_outside_roots,
+        dim=dims,
+        inputs=[occupancy, labels, outside],
+        device=device,
+    )
+    filled = twt.empty_bool_3d(dims, device=device)
+    wp.launch(
+        kernel_voxels.fill_enclosed_cells,
+        dim=dims,
+        inputs=[occupancy, labels, outside, filled],
+        device=device,
+    )
+    return from_dense(filled, voxel_size, origin, origin_cell=origin_cell)
+
+
+def fill_orthographic(grid: wp.Volume) -> wp.Volume:
+    """
+    Fill the intersection of the three axis-aligned solid shadows of the voxel set.
+
+    trimesh's ``ops.fill_orthographic``: along every line parallel to an axis, fill from the first
+    occupied cell to the last, then keep only the cells all three axes agree on. Cheaper and blunter
+    than [`fill_holes`][triwarp.voxels.fill_holes] — it fills concavities that are open in only one
+    or two directions, and it cannot fill a cavity whose enclosing shell is not convex along all
+    three axes.
+
+    Parameters
+    ----------
+    grid
+        Index grid to fill.
+
+    Returns
+    -------
+    wp.Volume
+        A new index grid containing ``grid``'s voxels plus the cells all three axis fills agree on.
+
+    Raises
+    ------
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`fill_holes`][triwarp.voxels.fill_holes]
+    """
+    voxel_size, origin = _require_index_grid(grid)
+    device = grid.device
+    if _voxel_count(grid) == 0:
+        return _empty_grid(voxel_size, origin, device)
+
+    occupancy, origin_cell = _to_dense_padded(grid, pad=0)
+    dims = (int(occupancy.shape[0]), int(occupancy.shape[1]), int(occupancy.shape[2]))
+    filled = twt.empty_bool_3d(dims, device=device)
+    scratch = twt.empty_bool_3d(dims, device=device)
+    for axis in range(3):
+        other = [dims[a] for a in range(3) if a != axis]
+        target = filled if axis == 0 else scratch
+        wp.launch(
+            kernel_voxels.fill_axis_span,
+            dim=(other[0], other[1]),
+            inputs=[occupancy, wp.int32(axis), wp.int32(dims[axis]), target],
+            device=device,
+        )
+        if axis > 0:
+            wp.launch(
+                kernel_voxels.intersect_occupancy,
+                dim=dims,
+                inputs=[filled, scratch, filled],
+                device=device,
+            )
+    return from_dense(filled, voxel_size, origin, origin_cell=origin_cell)
+
+
+def dilate(
+    grid: wp.Volume, *, connectivity: Literal[6, 18, 26] = 6, iterations: int = 1
+) -> wp.Volume:
+    """
+    Grow the voxel set by one shell of neighbours per iteration.
+
+    trimesh's ``morphology.binary_dilation`` (``scipy.ndimage.binary_dilation``). Every voxel writes
+    its whole neighbourhood as candidate cells and the builder dedups them, so there is no unique
+    pass — but the candidate buffer is ``(connectivity + 1) * n_voxels`` cells, which is
+    **324 MB at a million voxels and ``connectivity=26``**. That bound is why 6 is the default.
+
+    Parameters
+    ----------
+    grid
+        Index grid to dilate.
+    connectivity
+        Neighbourhood: ``6`` face-adjacent (the default, and
+        ``scipy.ndimage.generate_binary_structure(3, 1)``), ``18`` face and edge, ``26`` the full
+        3-cubed shell.
+    iterations
+        Number of dilation passes. Each is a separate grid build; a widened stencil is deliberately
+        not used, since a ``(2r+1)``-cubed structure is strictly more candidate work.
+
+    Returns
+    -------
+    wp.Volume
+        A new index grid on ``grid``'s device.
+
+    Raises
+    ------
+    ValueError
+        If ``connectivity`` is not 6, 18 or 26, or ``iterations`` is negative.
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`erode`][triwarp.voxels.erode]
+    [`surface_voxels`][triwarp.voxels.surface_voxels]
+
+    Notes
+    -----
+    Binary closing is ``erode(dilate(g))`` and opening ``dilate(erode(g))``; neither is wrapped,
+    since each is one line from two exported functions.
+    """
+    voxel_size, origin = _require_index_grid(grid)
+    _check_iterations(connectivity, iterations)
+    device = grid.device
+    for _ in range(iterations):
+        voxels = cells(grid)
+        n_voxels = int(voxels.shape[0])
+        if n_voxels == 0:
+            return _empty_grid(voxel_size, origin, device)
+        stencil = _stencil(connectivity, device, include_self=True)
+        n_offsets = int(stencil.shape[0])
+        candidates = twt.empty_int32_2d((n_voxels * n_offsets, 3), device=device)
+        wp.launch(
+            kernel_voxels.neighborhood_candidates,
+            dim=(n_voxels, n_offsets),
+            inputs=[voxels, stencil, candidates],
+            device=device,
+        )
+        grid = from_cells(candidates, voxel_size, origin)
+    return grid
+
+
+def erode(
+    grid: wp.Volume, *, connectivity: Literal[6, 18, 26] = 6, iterations: int = 1
+) -> wp.Volume:
+    """
+    Shrink the voxel set to the voxels whose whole neighbourhood is occupied.
+
+    trimesh's ``morphology.binary_erosion``. One thread per voxel and ``connectivity`` ``O(1)``
+    probes, with no allocation and no sort: neighbours usually live in the same 8-cubed NanoVDB
+    leaf, so the probes are cache-local.
+
+    Parameters
+    ----------
+    grid
+        Index grid to erode.
+    connectivity
+        Neighbourhood: ``6`` (the default), ``18`` or ``26``.
+    iterations
+        Number of erosion passes.
+
+    Returns
+    -------
+    wp.Volume
+        A new index grid on ``grid``'s device, possibly empty.
+
+    Raises
+    ------
+    ValueError
+        If ``connectivity`` is not 6, 18 or 26, or ``iterations`` is negative.
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`dilate`][triwarp.voxels.dilate]
+    [`surface_voxels`][triwarp.voxels.surface_voxels]
+
+    Notes
+    -----
+    Cells outside the grid are empty by definition, so a voxel on the boundary of the occupied
+    region always erodes away — the same convention ``scipy.ndimage.binary_erosion`` takes with
+    ``border_value=0``.
+    """
+    voxel_size, origin = _require_index_grid(grid)
+    _check_iterations(connectivity, iterations)
+    for _ in range(iterations):
+        interior = _interior_flags(grid, connectivity)
+        if interior is None:
+            return _empty_grid(voxel_size, origin, grid.device)
+        grid = _grid_from_flagged_cells(grid, interior)
+    return grid
+
+
+def surface_voxels(grid: wp.Volume, *, connectivity: Literal[6, 18, 26] = 6) -> wp.Volume:
+    """
+    Keep the occupied voxels that touch an empty one: the boundary shell of the set.
+
+    trimesh's ``VoxelGrid.surface``, i.e. ``grid`` minus [`erode`][triwarp.voxels.erode]``(grid)``,
+    computed with the same probes and one launch.
+
+    Parameters
+    ----------
+    grid
+        Index grid to read.
+    connectivity
+        Neighbourhood deciding adjacency: ``6`` (the default), ``18`` or ``26``.
+
+    Returns
+    -------
+    wp.Volume
+        A new index grid holding only the boundary voxels.
+
+    Raises
+    ------
+    ValueError
+        If ``connectivity`` is not 6, 18 or 26.
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`erode`][triwarp.voxels.erode]
+    [`to_boxes`][triwarp.voxels.to_boxes]
+
+    Notes
+    -----
+    A voxel on the edge of the grid's occupied region counts as surface, since everything outside
+    the set is empty by definition.
+    """
+    voxel_size, origin = _require_index_grid(grid)
+    interior = _interior_flags(grid, connectivity)
+    if interior is None:
+        return _empty_grid(voxel_size, origin, grid.device)
+    boundary = wp.empty(int(interior.shape[0]), dtype=wp.int32, device=grid.device)
+    wp.map(kernel_voxels.flip_flag, interior, out=boundary)
+    return _grid_from_flagged_cells(grid, boundary)
+
+
+def to_dense(
+    grid: wp.Volume,
+    *,
+    origin_cell: tuple[int, int, int] | None = None,
+    shape: tuple[int, int, int] | None = None,
+) -> tuple[twt.Array3dBool, tuple[int, int, int]]:
+    """
+    Occupancy of a cell box as a dense boolean lattice.
+
+    trimesh's ``sparse_to_matrix``, plus the cell offset that makes it invertible: unlike trimesh's
+    grids, cell coordinates here can be negative, so the lattice's own origin has to be returned
+    alongside it.
+
+    Parameters
+    ----------
+    grid
+        Index grid to read.
+    origin_cell
+        Cell that becomes ``occupancy[0, 0, 0]``. Defaults to the component-wise minimum of the
+        occupied cells, i.e. the tight bounding box.
+    shape
+        ``(nx, ny, nz)`` extent of the lattice in cells. Defaults to the tight bounding box of the
+        occupied cells, measured from ``origin_cell``.
+
+    Returns
+    -------
+    occupancy : Array3dBool
+        ``(nx, ny, nz)`` occupancy on ``grid``'s device.
+    origin_cell : tuple[int, int, int]
+        The cell at ``occupancy[0, 0, 0]``, to hand back to
+        [`from_dense`][triwarp.voxels.from_dense].
+
+    Raises
+    ------
+    ValueError
+        If ``shape`` is not three positive integers.
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`from_dense`][triwarp.voxels.from_dense]
+    [`to_field`][triwarp.voxels.to_field]
+    """
+    _require_index_grid(grid)
+    if origin_cell is None or shape is None:
+        bounding_lower, bounding_shape = _cell_bounds(grid)
+        if origin_cell is None:
+            origin_cell = bounding_lower
+        if shape is None:
+            shape = (
+                bounding_shape[0] + bounding_lower[0] - origin_cell[0],
+                bounding_shape[1] + bounding_lower[1] - origin_cell[1],
+                bounding_shape[2] + bounding_lower[2] - origin_cell[2],
+            )
+    dims = (int(shape[0]), int(shape[1]), int(shape[2]))
+    if len(dims) != 3 or min(dims) < 1:
+        raise ValueError(f"shape must be three positive integers, got {shape!r}")
+    occupancy = twt.empty_bool_3d(dims, device=grid.device)
+    wp.launch(
+        kernel_voxels.dense_occupancy,
+        dim=dims,
+        inputs=[grid.id, wp.vec3i(*(int(c) for c in origin_cell)), occupancy],
+        device=grid.device,
+    )
+    return occupancy, (int(origin_cell[0]), int(origin_cell[1]), int(origin_cell[2]))
+
+
+def from_dense(
+    occupancy: twt.Array3dBool,
+    voxel_size: float,
+    origin: wp.vec3,
+    *,
+    origin_cell: tuple[int, int, int] = (0, 0, 0),
+) -> wp.Volume:
+    """
+    Build an index grid from a dense boolean occupancy lattice.
+
+    trimesh's ``DenseEncoding``, and the inverse of [`to_dense`][triwarp.voxels.to_dense]: pass back
+    the ``origin_cell`` that function returned and the round trip is exact, negative cells included.
+
+    Parameters
+    ----------
+    occupancy
+        ``(nx, ny, nz)`` ``wp.bool`` lattice; ``True`` marks an occupied cell.
+    voxel_size
+        Cell width.
+    origin
+        World position of the lower corner of cell ``(0, 0, 0)``.
+    origin_cell
+        Cell coordinate of ``occupancy[0, 0, 0]``.
+
+    Returns
+    -------
+    wp.Volume
+        A NanoVDB index grid on ``occupancy``'s device, empty when nothing is occupied.
+
+    Raises
+    ------
+    ValueError
+        If ``voxel_size`` is not positive.
+    TypeError
+        If ``occupancy`` is not a rank-3 ``wp.bool`` array.
+
+    See Also
+    --------
+    [`to_dense`][triwarp.voxels.to_dense]
+    [`from_cells`][triwarp.voxels.from_cells]
+    """
+    occupancy = twt.as_array3d_bool(occupancy)
+    if voxel_size <= 0.0:
+        raise ValueError(f"from_dense requires voxel_size > 0, got {voxel_size}")
+    device = occupancy.device
+    dims = (int(occupancy.shape[0]), int(occupancy.shape[1]), int(occupancy.shape[2]))
+    n_cells = dims[0] * dims[1] * dims[2]
+    if n_cells == 0:
+        return _empty_grid(voxel_size, origin, device)
+
+    candidates = twt.empty_int32_2d((n_cells, 3), device=device)
+    mask = wp.empty(n_cells, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_voxels.occupied_cells,
+        dim=dims,
+        inputs=[occupancy, wp.vec3i(*(int(c) for c in origin_cell)), candidates, mask],
+        device=device,
+    )
+    return wp.Volume.allocate_by_voxels(
+        candidates,
+        voxel_size=voxel_size,
+        translation=_translation(origin, voxel_size),
+        point_mask=mask,
+        device=device,
+    )
+
+
+def to_field(
+    grid: wp.Volume, *, pad: int = 1
+) -> tuple[twt.Array3dFloat32, tuple[wp.vec3, wp.vec3]]:
+    """
+    Occupancy as a padded ``float32`` lattice on the cell centres, with the box it spans.
+
+    The bridge to [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes]:
+    ``marching_cubes(*to_field(grid), 0.5)`` reproduces trimesh's ``ops.matrix_to_marching_cubes``,
+    ``VoxelGrid.marching_cubes`` and ``ops.points_to_marching_cubes``, which are all the same recipe
+    (pad by one, threshold at ``0.5``). The padding is what closes the surface: without it a voxel
+    on the lattice boundary has no zero outside it to cross.
+
+    Parameters
+    ----------
+    grid
+        Index grid to read.
+    pad
+        Empty cells of margin added on every side.
+
+    Returns
+    -------
+    field : Array3dFloat32
+        ``(nx, ny, nz)`` lattice, ``1.0`` inside an occupied voxel and ``0.0`` outside.
+    bounds : tuple[wp.vec3, wp.vec3]
+        ``(lower, upper)`` world corners the lattice spans, i.e. the centres of its first and last
+        cells — exactly the tuple
+        [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes] takes.
+
+    Raises
+    ------
+    ValueError
+        If ``pad`` is negative.
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes]
+    [`to_dense`][triwarp.voxels.to_dense]
+    [`to_boxes`][triwarp.voxels.to_boxes]
+
+    Notes
+    -----
+    Because the samples sit on cell *centres*, the extracted surface runs half a voxel inside the
+    occupied cells' outer faces — the same half-voxel offset trimesh's marching-cubes path has.
+    """
+    if pad < 0:
+        raise ValueError(f"pad must be non-negative, got {pad}")
+    voxel_size, origin = _require_index_grid(grid)
+    lower_cell, extent = _cell_bounds(grid)
+    base = (lower_cell[0] - pad, lower_cell[1] - pad, lower_cell[2] - pad)
+    dims = (extent[0] + 2 * pad, extent[1] + 2 * pad, extent[2] + 2 * pad)
+    field = twt.empty_float32_3d(dims, device=grid.device)
+    wp.launch(
+        kernel_voxels.dense_field,
+        dim=dims,
+        inputs=[grid.id, wp.vec3i(*(int(c) for c in base)), field],
+        device=grid.device,
+    )
+    lower = wp.vec3(*(origin[axis] + (base[axis] + 0.5) * voxel_size for axis in range(3)))
+    upper = wp.vec3(
+        *(origin[axis] + (base[axis] + dims[axis] - 0.5) * voxel_size for axis in range(3))
+    )
+    return twt.as_array3d_float32(field), (lower, upper)
+
+
+def to_boxes(
+    grid: wp.Volume, *, cull_internal: bool = True
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Triangulate the voxel set as a mesh of axis-aligned cubes.
+
+    trimesh's ``ops.multibox`` / ``VoxelGrid.as_boxes``, and the cube rendering Open3D draws a
+    ``VoxelGrid`` as. Corners are shared rather than duplicated — the deduplicated corner lattice
+    comes from [`voxel_corners`][triwarp.voxels.voxel_corners] — so no welding pass runs afterwards.
+
+    Parameters
+    ----------
+    grid
+        Index grid to mesh.
+    cull_internal
+        Drop the faces between two occupied voxels (the default), leaving only the visible shell.
+        ``False`` emits all six faces of every voxel, which is what ``multibox`` builds.
+
+    Returns
+    -------
+    vertices : wp.array[wp.vec3]
+        Corner positions on ``grid``'s device.
+    faces : wp.array[wp.int32]
+        Flat ``3 * n_faces`` triangle index buffer, wound so that normals point away from the
+        voxel they belong to.
+
+    Raises
+    ------
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`voxel_corners`][triwarp.voxels.voxel_corners]
+    [`to_field`][triwarp.voxels.to_field]
+    [`surface_voxels`][triwarp.voxels.surface_voxels]
+
+    Notes
+    -----
+    With ``cull_internal=True`` on a solid set the result is closed and manifold; with ``False`` it
+    is not, since interior faces are duplicated back to back. Corner sharing means the output has
+    unreferenced vertices in the culled case (a corner interior to the set is still in the lattice);
+    run [`triwarp.repair.remove_unreferenced_vertices`][triwarp.repair.remove_unreferenced_vertices]
+    if that matters.
+    """
+    voxel_size, origin = _require_index_grid(grid)
+    device = grid.device
+    corner_cells, cell_corners = voxel_corners(grid)
+    n_corners = int(corner_cells.shape[0])
+    n_voxels = int(cell_corners.shape[0])
+    vertices = wp.empty(n_corners, dtype=wp.vec3, device=device)
+    if n_voxels == 0:
+        return vertices, wp.empty(0, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_voxels.corner_positions,
+        dim=n_corners,
+        inputs=[corner_cells, origin, wp.float32(voxel_size), vertices],
+        device=device,
+    )
+
+    voxels = cells(grid)
+    neighbors = _face_neighbors(device)
+    counts = wp.empty(n_voxels, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_voxels.count_box_faces,
+        dim=n_voxels,
+        inputs=[grid.id, voxels, neighbors, cull_internal, counts],
+        device=device,
+    )
+    offsets, n_quads = tw.array.counts_to_offsets(counts)
+    faces = wp.empty(n_quads * 6, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_voxels.emit_box_faces,
+        dim=n_voxels,
+        inputs=[
+            grid.id,
+            voxels,
+            cell_corners,
+            neighbors,
+            _face_corner_table(device),
+            offsets,
+            cull_internal,
+            faces,
+        ],
+        device=device,
+    )
+    return vertices, faces
+
+
+def voxel_corners(grid: wp.Volume) -> tuple[twt.Array2dInt32, twt.Array2dInt32]:
+    """
+    Build the deduplicated corner lattice of the voxel set, plus each voxel's eight corners.
+
+    ``igl.unique_sparse_voxel_corners``. The lattice is not computed here: ``warp.fem``'s sparse
+    nanogrid geometry derives its own vertex grid from the cell grid, and that grid *is* the
+    deduplicated corner set — so this is eight ``O(1)`` probes per voxel and no ``8 * n_voxels``
+    candidate buffer, no unique pass, and no hand-built dual grid.
+
+    Corner ``(i, j, k)`` is the **lower** corner of cell ``(i, j, k)``, at world position
+    ``origin + (i, j, k) * voxel_size``.
+
+    Parameters
+    ----------
+    grid
+        Index grid to read.
+
+    Returns
+    -------
+    corners : Array2dInt32
+        ``(n_corners, 3)`` corner coordinates, in the corner grid's own leaf-major order.
+    cell_corners : Array2dInt32
+        ``(n_voxels, 8)`` indices into ``corners``, one row per voxel of
+        [`cells`][triwarp.voxels.cells], ordered by binary counting on ``(dx, dy, dz)`` with ``dx``
+        the most significant bit.
+
+    Raises
+    ------
+    TypeError
+        If ``grid`` is not a NanoVDB index grid with isotropic voxels.
+
+    See Also
+    --------
+    [`to_boxes`][triwarp.voxels.to_boxes]
+    [`cells`][triwarp.voxels.cells]
+
+    Notes
+    -----
+    igl numbers a cell's corners in ``yxz`` binary-counting order, a fixed permutation of the order
+    used here.
+
+    ``warp.fem`` is imported inside this function, not at module scope: it costs ~0.15 s to import
+    and nothing else in this module needs it.
+    """
+    _require_index_grid(grid)
+    device = grid.device
+    voxels = cells(grid)
+    n_voxels = int(voxels.shape[0])
+    if n_voxels == 0:
+        return twt.empty_int32_2d((0, 3), device=device), twt.empty_int32_2d((0, 8), device=device)
+
+    import warp.fem as fem
+
+    corner_grid = fem.Nanogrid(grid).vertex_grid
+    n_corners = int(corner_grid.get_active_stats().voxel_count)
+    corner_cells = twt.as_array2d_int32(corner_grid.get_voxels()[:n_corners])
+    cell_corners = twt.empty_int32_2d((n_voxels, 8), device=device)
+    wp.launch(
+        kernel_voxels.cell_corner_indices,
+        dim=n_voxels,
+        inputs=[corner_grid.id, voxels, cell_corners],
+        device=device,
+    )
+    return corner_cells, cell_corners
+
+
+def _require_index_grid(grid: wp.Volume) -> tuple[float, wp.vec3]:
+    """Validate that ``grid`` is an isotropic index grid; return ``(voxel_size, origin)``."""
+    if not grid.is_index:
+        raise TypeError(
+            "voxels functions need a NanoVDB *index* grid, whose linear indices address a "
+            "per-voxel payload; build one with triwarp.voxels.from_cells"
+        )
+    sizes = grid.get_voxel_size()
+    if not (sizes[0] == sizes[1] == sizes[2]):
+        raise TypeError(f"voxels functions need isotropic voxels, got voxel_size={tuple(sizes)}")
+    voxel_size = float(sizes[0])
+    translation = grid.get_grid_info().translation
+    origin = wp.vec3(*(float(translation[axis]) - 0.5 * voxel_size for axis in range(3)))
+    return voxel_size, origin
+
+
+def _voxel_count(grid: wp.Volume) -> int:
+    """Count the *active* voxels: ``get_voxel_count`` reports capacity instead (see `cells`)."""
+    return int(grid.get_active_stats().voxel_count)
+
+
+def _translation(origin: wp.vec3, voxel_size: float) -> tuple[float, float, float]:
+    """NanoVDB centres voxels on integers, so the volume's translation is half a cell above."""
+    half = 0.5 * voxel_size
+    return (float(origin[0]) + half, float(origin[1]) + half, float(origin[2]) + half)
+
+
+def _empty_grid(voxel_size: float, origin: wp.vec3, device: wp.DeviceLike) -> wp.Volume:
+    """
+    Build an index grid with the given transform and no active voxels.
+
+    ``allocate_by_voxels`` raises ``Failed to create volume`` on a zero-length point set, but a
+    one-point set that ``point_mask`` rejects builds a legal empty topology.
+    """
+    return wp.Volume.allocate_by_voxels(
+        wp.zeros((1, 3), dtype=wp.int32, device=device),
+        voxel_size=voxel_size,
+        translation=_translation(origin, voxel_size),
+        point_mask=wp.zeros(1, dtype=wp.int32, device=device),
+        device=device,
+    )
+
+
+def _resolve_grid(
+    points: wp.array[wp.vec3], voxel_size: float | None, origin: wp.vec3 | None, caller: str
+) -> tuple[float, wp.vec3]:
+    """Fill in the ``voxel_size`` / ``origin`` defaults from the input's bounding box."""
+    if voxel_size is None or origin is None:
+        if int(points.shape[0]) == 0:
+            lower = wp.vec3(0.0, 0.0, 0.0)
+            diagonal = 1.0
+        else:
+            lower, upper = tw.bounds.aabb_bounds(points)
+            diagonal = float(wp.length(upper - lower))
+        if voxel_size is None:
+            voxel_size = 0.01 * diagonal
+        if origin is None:
+            # Half a cell of slack below the box: Open3D's anchor, and the one
+            # ``remesh.cluster_decimate`` uses, so all three agree cell for cell.
+            origin = wp.vec3(*(float(lower[axis]) - 0.5 * voxel_size for axis in range(3)))
+    if voxel_size <= 0.0:
+        raise ValueError(f"{caller} requires voxel_size > 0, got {voxel_size}")
+    return voxel_size, origin
+
+
+def _point_slots(grid: wp.Volume, points: wp.array[wp.vec3]) -> wp.array[wp.int32]:
+    """Voxel row of each point, ``-1`` outside the grid."""
+    slots = wp.empty(int(points.shape[0]), dtype=wp.int32, device=points.device)
+    wp.launch(
+        kernel_voxels.lookup_point_slots,
+        dim=int(points.shape[0]),
+        inputs=[grid.id, points, slots],
+        device=points.device,
+    )
+    return slots
+
+
+def _cell_slots(grid: wp.Volume, cells: twt.Array2dInt32) -> wp.array[wp.int32]:
+    """Voxel row of each cell, ``-1`` when the cell is empty."""
+    slots = wp.empty(int(cells.shape[0]), dtype=wp.int32, device=cells.device)
+    wp.launch(
+        kernel_voxels.lookup_cell_slots,
+        dim=int(cells.shape[0]),
+        inputs=[grid.id, cells, slots],
+        device=cells.device,
+    )
+    return slots
+
+
+def _cell_bounds(grid: wp.Volume) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """Tight cell bounding box of the occupied voxels, as ``(lower_cell, extent)``."""
+    voxels = cells(grid)
+    if int(voxels.shape[0]) == 0:
+        return (0, 0, 0), (1, 1, 1)
+    # One readback of six integers: the dense lattice has to be sized on the host.
+    lower_wp, upper_wp = tw.reduce.minmax(voxels, axis=0)
+    lower = lower_wp.numpy()
+    upper = upper_wp.numpy()
+    return (
+        (int(lower[0]), int(lower[1]), int(lower[2])),
+        (int(upper[0] - lower[0]) + 1, int(upper[1] - lower[1]) + 1, int(upper[2] - lower[2]) + 1),
+    )
+
+
+def _to_dense_padded(grid: wp.Volume, *, pad: int) -> tuple[twt.Array3dBool, tuple[int, int, int]]:
+    """Dense occupancy of the tight cell box grown by ``pad`` empty cells on every side."""
+    lower_cell, extent = _cell_bounds(grid)
+    base = (lower_cell[0] - pad, lower_cell[1] - pad, lower_cell[2] - pad)
+    shape = (extent[0] + 2 * pad, extent[1] + 2 * pad, extent[2] + 2 * pad)
+    return to_dense(grid, origin_cell=base, shape=shape)
+
+
+def _check_iterations(connectivity: int, iterations: int) -> None:
+    """Shared argument validation for the two morphology passes."""
+    if connectivity not in _CONNECTIVITY_RANK:
+        raise ValueError(f"connectivity must be 6, 18 or 26, got {connectivity!r}")
+    if iterations < 0:
+        raise ValueError(f"iterations must be non-negative, got {iterations}")
+
+
+def _interior_flags(grid: wp.Volume, connectivity: int) -> wp.array[wp.int32] | None:
+    """Per-voxel 1 / 0 flag: is the whole neighbourhood occupied? ``None`` for an empty grid."""
+    if connectivity not in _CONNECTIVITY_RANK:
+        raise ValueError(f"connectivity must be 6, 18 or 26, got {connectivity!r}")
+    voxels = cells(grid)
+    n_voxels = int(voxels.shape[0])
+    if n_voxels == 0:
+        return None
+    flags = wp.empty(n_voxels, dtype=wp.int32, device=grid.device)
+    wp.launch(
+        kernel_voxels.neighborhood_complete,
+        dim=n_voxels,
+        inputs=[grid.id, voxels, _stencil(connectivity, grid.device, include_self=False), flags],
+        device=grid.device,
+    )
+    return flags
+
+
+def _grid_from_flagged_cells(grid: wp.Volume, flags: wp.array[wp.int32]) -> wp.Volume:
+    """Rebuild ``grid`` keeping only the voxels whose flag is non-zero."""
+    voxel_size, origin = _require_index_grid(grid)
+    return wp.Volume.allocate_by_voxels(
+        cells(grid),
+        voxel_size=voxel_size,
+        translation=_translation(origin, voxel_size),
+        point_mask=flags,
+        device=grid.device,
+    )
+
+
+def _stencil(connectivity: int, device: wp.DeviceLike, *, include_self: bool) -> twt.Array2dInt32:
+    """Return the ``connectivity`` neighbour offsets, cached per device (6 to 27 rows)."""
+    key = (str(device), connectivity, include_self)
+    cached = _STENCIL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    rank = _CONNECTIVITY_RANK[connectivity]
+    offsets = [
+        (i, j, k)
+        for i in (-1, 0, 1)
+        for j in (-1, 0, 1)
+        for k in (-1, 0, 1)
+        if (abs(i) + abs(j) + abs(k) <= rank) and (include_self or (i, j, k) != (0, 0, 0))
+    ]
+    stencil = twt.as_array2d_int32(
+        wp.array(np.array(offsets, dtype=np.int32), dtype=wp.int32, device=device)
+    )
+    _STENCIL_CACHE[key] = stencil
+    return stencil
+
+
+def _face_neighbors(device: wp.DeviceLike) -> twt.Array2dInt32:
+    """Return the six axis directions, in the order ``_FACE_CORNERS`` is written against."""
+    key = (str(device), 0, False)
+    cached = _STENCIL_CACHE.get(key)
+    if cached is None:
+        cached = twt.as_array2d_int32(wp.array(_FACE_NEIGHBORS, dtype=wp.int32, device=device))
+        _STENCIL_CACHE[key] = cached
+    return cached
+
+
+def _face_corner_table(device: wp.DeviceLike) -> twt.Array2dInt32:
+    """Return the four local corner indices of each cube face, wound outward."""
+    key = (str(device), 1, False)
+    cached = _STENCIL_CACHE.get(key)
+    if cached is None:
+        cached = twt.as_array2d_int32(wp.array(_FACE_CORNERS, dtype=wp.int32, device=device))
+        _STENCIL_CACHE[key] = cached
+    return cached

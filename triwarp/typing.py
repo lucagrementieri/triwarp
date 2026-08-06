@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     Array2dFloat32: TypeAlias = wp.array[wp.float32, Literal[2]]
     Array2dFloat64: TypeAlias = wp.array[wp.float64, Literal[2]]
     Array3dFloat32: TypeAlias = wp.array[wp.float32, Literal[3]]
+    Array3dBool: TypeAlias = wp.array[wp.bool, Literal[3]]
 
     # wp.Int / wp.Float / wp.Scalar are TypeVars; subscripting wp.array[...] with them
     # yields a generic alias that requires type arguments under basedpyright.
@@ -50,6 +51,7 @@ else:
     Array2dFloat32 = wp.array
     Array2dFloat64 = wp.array
     Array3dFloat32 = wp.array
+    Array3dBool = wp.array
     Array1dInt = wp.array
     Array2dInt = wp.array
     Array1dFloat = wp.array
@@ -75,6 +77,7 @@ __all__ = [
     "Array2dInt",
     "Array2dInt32",
     "Array2dScalar",
+    "Array3dBool",
     "Array3dFloat32",
     "ArrayNd",
     "ArrayNdInt32",
@@ -84,11 +87,14 @@ __all__ = [
     "as_array2d_float",
     "as_array2d_float32",
     "as_array2d_int32",
+    "as_array3d_bool",
     "as_array3d_float32",
     "dtype_max",
     "dtype_min",
     "dtype_zero",
+    "empty_bool_3d",
     "empty_float32_2d",
+    "empty_float32_3d",
     "empty_float_2d",
     "empty_int32_2d",
     "ensure_ndim",
@@ -226,6 +232,29 @@ def as_array3d_float32(arr: wp.array[T]) -> Array3dFloat32:
     return cast(Array3dFloat32, arr)
 
 
+def as_array3d_bool(arr: wp.array[T]) -> Array3dBool:
+    """
+    Validate and narrow a Warp array to [`Array3dBool`][triwarp.typing.Array3dBool].
+
+    Parameters
+    ----------
+    arr
+        Warp array expected to be rank-3 ``wp.bool``.
+
+    Returns
+    -------
+    Array3dBool
+        ``arr`` unchanged, narrowed to the checked alias.
+
+    Raises
+    ------
+    TypeError
+        If ``arr`` is not rank-3 ``wp.bool``.
+    """
+    ensure_ndim(arr, 3, dtype=wp.bool)
+    return cast(Array3dBool, arr)
+
+
 @overload
 def dtype_max(dtype: type[wp.Int]) -> int: ...
 @overload
@@ -346,6 +375,55 @@ def empty_float32_2d(
         Uninitialized ``(rows, cols)`` ``float32`` array on ``device``.
     """
     return cast(Array2dFloat32, wp.empty(_shape_2d(shape), dtype=wp.float32, device=device))
+
+
+def _shape_3d(shape: tuple[int, int, int] | list[int]) -> tuple[int, int, int]:
+    dims = tuple(int(x) for x in shape)
+    if len(dims) != 3:
+        raise ValueError(f"3D shape must have length 3, got {shape!r}")
+    return (dims[0], dims[1], dims[2])
+
+
+def empty_bool_3d(
+    shape: tuple[int, int, int] | list[int], *, device: wp.DeviceLike = None
+) -> Array3dBool:
+    """
+    Allocate an uninitialized rank-3 ``wp.bool`` Warp array.
+
+    Parameters
+    ----------
+    shape
+        ``(nx, ny, nz)`` shape of the allocated array.
+    device
+        Target Warp device.
+
+    Returns
+    -------
+    Array3dBool
+        Uninitialized ``(nx, ny, nz)`` ``wp.bool`` array on ``device``.
+    """
+    return cast(Array3dBool, wp.empty(_shape_3d(shape), dtype=wp.bool, device=device))
+
+
+def empty_float32_3d(
+    shape: tuple[int, int, int] | list[int], *, device: wp.DeviceLike = None
+) -> Array3dFloat32:
+    """
+    Allocate an uninitialized rank-3 ``float32`` Warp array.
+
+    Parameters
+    ----------
+    shape
+        ``(nx, ny, nz)`` shape of the allocated array.
+    device
+        Target Warp device.
+
+    Returns
+    -------
+    Array3dFloat32
+        Uninitialized ``(nx, ny, nz)`` ``float32`` array on ``device``.
+    """
+    return cast(Array3dFloat32, wp.empty(_shape_3d(shape), dtype=wp.float32, device=device))
 
 
 def empty_float_2d(

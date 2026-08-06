@@ -51,6 +51,7 @@ from . import (
     validation,
     vertices,
     visibility,
+    voxels,
 )
 
 __all__ = [
@@ -103,4 +104,5 @@ __all__ = [
     "validation",
     "vertices",
     "visibility",
+    "voxels",
 ]

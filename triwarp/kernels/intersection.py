@@ -247,6 +247,81 @@ def overlaps_along_axis(
 
 
 @wp.func
+def unit_axis(axis: wp.int32) -> wp.vec3:
+    if axis == 0:
+        return wp.vec3(1.0, 0.0, 0.0)
+    if axis == 1:
+        return wp.vec3(0.0, 1.0, 0.0)
+    return wp.vec3(0.0, 0.0, 1.0)
+
+
+@wp.func
+def plane_box_overlap(normal: wp.vec3, offset: wp.float32, half: wp.vec3) -> wp.bool:
+    # Moller's ``planeBoxOverlap``: the plane ``dot(normal, x) == offset`` meets the box
+    # ``[-half, half]`` iff ``|offset|`` is within the box's support along ``normal``.
+    support = (
+        wp.abs(normal[0]) * half[0] + wp.abs(normal[1]) * half[1] + wp.abs(normal[2]) * half[2]
+    )
+    return wp.abs(offset) <= support
+
+
+@wp.func
+def edge_axes_separate(
+    edge: wp.vec3, half: wp.vec3, a0: wp.vec3, a1: wp.vec3, a2: wp.vec3
+) -> wp.bool:
+    # The three cross-product axes ``e_i x edge`` of Moller's tribox3, written out rather than
+    # crossed with a unit vector: ``e_x x (x, y, z) == (0, -z, y)`` and cyclically. A degenerate
+    # edge gives a zero axis, whose intervals are both ``[0, 0]`` and therefore never separate.
+    axis_x = wp.vec3(0.0, -edge[2], edge[1])
+    axis_y = wp.vec3(edge[2], 0.0, -edge[0])
+    axis_z = wp.vec3(-edge[1], edge[0], 0.0)
+    for a in range(3):
+        axis = axis_x
+        if a == 1:
+            axis = axis_y
+        elif a == 2:
+            axis = axis_z
+        # The two endpoints of ``edge`` project to the same value on ``e_i x edge``, so projecting
+        # all three vertices gives the identical interval the AXISTEST_* macros compute from two.
+        interval = axis_interval_projection(axis, a0, a1, a2)
+        radius = wp.abs(axis[0]) * half[0] + wp.abs(axis[1]) * half[1] + wp.abs(axis[2]) * half[2]
+        if interval[0] > radius or interval[1] < -radius:
+            return True
+    return False
+
+
+@wp.func
+def triangle_aabb_overlap(
+    center: wp.vec3, half: wp.vec3, v0: wp.vec3, v1: wp.vec3, v2: wp.vec3
+) -> wp.bool:
+    # Moller's tribox3, the 13-axis separating-axis test between a triangle and an axis-aligned
+    # box: the three box face normals, the triangle's own plane, and the nine edge-cross axes. No
+    # epsilon, matching Open3D's ``IntersectionTest::TriangleAABB`` (which runs it in ``float64``,
+    # so tangency within ``float32`` rounding is where the two can disagree).
+    a0 = v0 - center
+    a1 = v1 - center
+    a2 = v2 - center
+
+    for axis in range(3):
+        interval = axis_interval_projection(unit_axis(axis), a0, a1, a2)
+        if interval[0] > half[axis] or interval[1] < -half[axis]:
+            return False
+
+    edge0 = a1 - a0
+    edge1 = a2 - a1
+    edge2 = a0 - a2
+    if edge_axes_separate(edge0, half, a0, a1, a2):
+        return False
+    if edge_axes_separate(edge1, half, a0, a1, a2):
+        return False
+    if edge_axes_separate(edge2, half, a0, a1, a2):
+        return False
+
+    normal = wp.cross(edge0, edge1)
+    return plane_box_overlap(normal, wp.dot(normal, a0), half)
+
+
+@wp.func
 def triangles_intersect_sat(
     a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3
 ) -> wp.bool:

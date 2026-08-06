@@ -36,6 +36,7 @@ SECTIONS: dict[str, list[str]] = {
         "proximity",
         "neighbors",
         "bounds",
+        "voxels",
         "ray",
         "distance",
         "intersection",

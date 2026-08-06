@@ -598,6 +598,13 @@ operator family in `test_energies` (`k_harmonic`, `hessian_energy`, `curved_hess
 `crouzeix_raviart_cotmatrix` / `_massmatrix`), all five on the `scale` axis because igl's
 Crouzeix-Raviart entry points assume edge-manifold input.
 
+`test_voxels` added two more: `igl.grid` for the corner lattice and
+`igl.unique_sparse_voxel_corners` for the deduplicated cell corners. The second has a trap worth
+recording — its subscripts are packed with radix `2 ** depth + 1`, so the documented `depth=0` makes
+every coordinate alias and it silently returns a handful of corners for hundreds of cells. It also
+reads column 0 of a subscript as *y* and numbers a cell's corners in yxz binary-counting order, both
+of which are named transforms in the parity test.
+
 Where the margins sit, on medians:
 
 | group | igl | triwarp-cuda | ratio |
@@ -778,6 +785,7 @@ millisecond.
 | `test_points` | `PointCloud.estimate_normals` (`KDTreeSearchParamKNN`) |
 | `test_distance` | `PointCloud.compute_point_cloud_distance` (the non-differentiable Chamfer / Hausdorff cases) |
 | `test_convex` | `compute_convex_hull` (exact qhull vs the approximate support sweep) |
+| `test_voxels` | `VoxelGrid.create_from_triangle_mesh_within_bounds`, `create_from_point_cloud`, `PointCloud.voxel_down_sample`, `check_if_included` — the same four answers, from a `std::unordered_map<Eigen::Vector3i>` on one core |
 
 Modules with **no** open3d equivalent, and why, are documented in each module's docstring:
 `test_edges` (no general edge list), `test_boundary` (no loop ordering), `test_grouping` and

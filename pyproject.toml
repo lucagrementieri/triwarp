@@ -9,7 +9,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 version = "0.1.0"
 
-dependencies = ["warp-lang>=1.15"]
+# ``triwarp.voxels`` is the package's first hard 1.16 dependency: it needs CPU
+# ``wp.Volume.allocate_by_voxels`` (CUDA-only through 1.15) and ``Volume.get_active_stats``, which
+# is the only occupancy read that is correct on a rebuildable grid.
+dependencies = ["warp-lang>=1.16"]
 
 [project.optional-dependencies]
 io = ["meshio>=5.0", "numpy>=1.20"]

@@ -1010,6 +1010,8 @@ def marching_cubes(
     [`resample_uniform`][triwarp.reconstruction.resample_uniform]
     [`screened_poisson`][triwarp.reconstruction.screened_poisson]
     [`triwarp.proximity.signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]
+    [`triwarp.voxels.to_field`][triwarp.voxels.to_field]
+    [`triwarp.voxels.grid_points`][triwarp.voxels.grid_points]
 
     Notes
     -----
@@ -1091,6 +1093,7 @@ def resample_uniform(
     [`marching_cubes`][triwarp.reconstruction.marching_cubes]
     [`triwarp.proximity.signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]
     [`triwarp.remesh.cluster_decimate`][triwarp.remesh.cluster_decimate]
+    [`triwarp.voxels.voxelize_mesh`][triwarp.voxels.voxelize_mesh]
 
     Notes
     -----

@@ -620,12 +620,25 @@ def cluster_decimate(
     [`isotropic_remesh`][triwarp.remesh.isotropic_remesh]
     [`triwarp.repair.remove_duplicated_vertices`][triwarp.repair.remove_duplicated_vertices]
     [`triwarp.grouping.unique_faces`][triwarp.grouping.unique_faces]
+    [`triwarp.voxels.voxel_down_sample`][triwarp.voxels.voxel_down_sample]
 
     Notes
     -----
     Cells whose every face collapsed are dropped from the output, where Open3D keeps them as
     unreferenced vertices. So the face counts agree exactly and the vertex counts can differ by the
     number of such cells — usually zero, and never in a way that changes the surface.
+
+    The binning goes through [`triwarp.voxels.cell_indices`][triwarp.voxels.cell_indices], but the
+    *dedup* deliberately stays on [`triwarp.grouping.unique_rows`][triwarp.grouping.unique_rows]
+    rather than moving onto a NanoVDB grid, which was measured back to back and rejected. The grid
+    dedups 2.6-3.0x faster as a stage (0.34 against 0.90 ms), but it numbers the clusters
+    leaf-major, so keeping today's vertex order costs a restoring sort that gives the whole
+    advantage back: end to end over three icospheres at two cell widths, the grid with its own
+    ordering is 0.80-0.88x of today (12-20 % faster) and the grid with today's ordering is
+    0.94-1.02x, i.e. inside the session drift. Neither clears the bar for changing a public output
+    convention, and the 12-20 % is the ceiling because the dedup is only a quarter of the call —
+    ``_cluster_positions``, the face remap, ``submesh_from_face_mask``, ``unique_faces`` and
+    ``remove_unreferenced_vertices`` are untouched by it.
     """
     if contraction not in ("average", "closest"):
         raise ValueError(f"contraction must be 'average' or 'closest', got {contraction!r}")
@@ -645,13 +658,7 @@ def cluster_decimate(
     # Half a cell of slack below the box, so no vertex sits exactly on a cell boundary (Open3D's
     # anchor, and what makes the two libraries agree cell for cell).
     origin = lo - wp.vec3(0.5 * voxel_size, 0.5 * voxel_size, 0.5 * voxel_size)
-    cells = twt.empty_int32_2d((n_vertices, 3), device=device)
-    wp.launch(
-        kernel_remesh.voxel_cell_indices,
-        dim=n_vertices,
-        inputs=[vertices, origin, wp.float32(1.0 / voxel_size), cells],
-        device=device,
-    )
+    cells = tw.voxels.cell_indices(vertices, voxel_size, origin=origin)
     _unique_cells, labels = tw.grouping.unique_rows(cells, return_inverse=True)
     n_clusters = int(tw.reduce.max(labels)) + 1
 
