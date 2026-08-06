@@ -26,7 +26,7 @@ def _loop_sizes_of(vertices: wp.array, faces: wp.array) -> list[int]:
 
 def _loop_perimeters_of(vertices: wp.array, faces: wp.array) -> list[float]:
     return [
-        tw.polyline.closed_polyline_length(tw.array.gather(vertices, loop))
+        tw.polyline.polyline_length(tw.array.gather(vertices, loop), closed=True)
         for loop in _fillable_loops(vertices, faces)
     ]
 

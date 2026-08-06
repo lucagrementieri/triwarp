@@ -219,12 +219,12 @@ def test_polyline_length_matches_trimesh(device: str, seed: int) -> None:
     assert np.allclose(length_wp, length_tm, rtol=1e-4, atol=1e-4)
 
 
-def test_closed_polyline_length_matches_trimesh(device: str) -> None:
+def test_polyline_length_closed_matches_trimesh(device: str) -> None:
     pts_np = _random_open_polyline(12)
     closed_np = _closed_from(pts_np)
     segs = np.stack([closed_np[:-1], closed_np[1:]], axis=1)
     length_tm = tm_segments.length(segs, summed=True)
-    length_wp = tw.polyline.closed_polyline_length(_polyline_wp(pts_np, device))
+    length_wp = tw.polyline.polyline_length(_polyline_wp(pts_np, device), closed=True)
     assert np.allclose(length_wp, length_tm, rtol=1e-4, atol=1e-4)
 
 
@@ -235,6 +235,26 @@ def test_polyline_centroid_matches_reference(device: str) -> None:
     pts_np = _random_open_polyline(20)
     centroid_wp = tw.polyline.polyline_centroid(_polyline_wp(pts_np, device))
     assert np.allclose(list(centroid_wp), _centroid_np(pts_np), rtol=1e-4, atol=1e-4)
+
+
+def test_polyline_centroid_closed_matches_reference(device: str) -> None:
+    """
+    ``closed=True`` weights the seam segment like any other, which moves the centroid.
+
+    Both halves matter. The first assert is the value, against the same NumPy reference fed the
+    explicitly-closed points -- so ``closed=True`` and ``close_polyline`` agree. The second is that
+    the two answers *differ*: this is a length-weighted mean, so adding a segment reweights every
+    other one, and a collapse that quietly ignored the keyword would pass the first assert alone.
+    """
+    pts_np = _random_open_polyline(20)
+    polyline_wp = _polyline_wp(pts_np, device)
+
+    centroid_wp = tw.polyline.polyline_centroid(polyline_wp, closed=True)
+
+    assert np.allclose(list(centroid_wp), _centroid_np(_closed_from(pts_np)), rtol=1e-4, atol=1e-4)
+    assert not np.allclose(
+        list(centroid_wp), list(tw.polyline.polyline_centroid(polyline_wp)), atol=1e-3
+    )
 
 
 def test_polyline_normal_matches_reference(device: str) -> None:
@@ -265,9 +285,9 @@ def test_polyline_angles_closed_matches_reference(device: str) -> None:
     assert np.allclose(angles_wp.numpy(), _angles_np(closed_np), rtol=1e-4, atol=1e-4)
 
 
-def test_closed_polyline_angles_length_matches_original(device: str) -> None:
+def test_polyline_angles_closed_length_matches_original(device: str) -> None:
     pts_np = _random_open_polyline(32)
-    angles_wp = tw.polyline.closed_polyline_angles(_polyline_wp(pts_np, device))
+    angles_wp = tw.polyline.polyline_angles(_polyline_wp(pts_np, device), closed=True)
     assert angles_wp.shape[0] == pts_np.shape[0]
 
 
@@ -328,7 +348,9 @@ def test_smooth_upsample_matches_reference(device: str, step: float) -> None:
 @pytest.mark.parametrize("step", [0.3, 0.75])
 def test_smooth_upsample_closed_matches_reference(device: str, step: float) -> None:
     pts_np = _closed_from(_random_open_polyline(52))
-    smoothed_wp = tw.polyline.smooth_upsample_closed_polyline(_polyline_wp(pts_np, device), step)
+    smoothed_wp = tw.polyline.smooth_upsample_polyline(
+        _polyline_wp(pts_np, device), step, closed=True
+    )
     assert np.allclose(
         smoothed_wp.numpy(), _smooth_upsample_np(pts_np, step, closed=True), rtol=1e-4, atol=1e-4
     )
@@ -365,12 +387,14 @@ def test_smooth_upsample_closed_recovers_circle(device: str) -> None:
     # arcs, so every inserted point lies on the circle (a linear upsample would cut inside it).
     radius = 2.0
     polygon_np = _planar_circle(8, radius)
-    smoothed = tw.polyline.smooth_upsample_closed_polyline(
-        _polyline_wp(polygon_np, device), 0.35
+    smoothed = tw.polyline.smooth_upsample_polyline(
+        _polyline_wp(polygon_np, device), 0.35, closed=True
     ).numpy()
     assert np.allclose(np.linalg.norm(smoothed, axis=-1), radius, rtol=1e-3, atol=1e-3)
     # The added points genuinely bulge outward relative to the straight-chord upsample.
-    linear = tw.polyline.upsample_closed_polyline(_polyline_wp(polygon_np, device), 0.35).numpy()
+    linear = tw.polyline.upsample_polyline(
+        _polyline_wp(polygon_np, device), 0.35, closed=True
+    ).numpy()
     assert np.linalg.norm(linear, axis=-1).min() < radius - 1e-2
 
 
@@ -427,10 +451,12 @@ def test_resample_polyline_matches_trimesh(device: str) -> None:
     assert np.allclose(resampled_wp.numpy(), resampled_tm, rtol=1e-3, atol=1e-3)
 
 
-def test_resample_closed_polyline_shape_and_endpoints(device: str) -> None:
+def test_resample_polyline_closed_shape_and_endpoints(device: str) -> None:
     pts_np = _random_open_polyline(72)
     num_points = 16
-    resampled_wp = tw.polyline.resample_closed_polyline(_polyline_wp(pts_np, device), num_points)
+    resampled_wp = tw.polyline.resample_polyline(
+        _polyline_wp(pts_np, device), num_points, closed=True
+    )
     resampled = resampled_wp.numpy()
     assert resampled.shape == (num_points, 3)
     # first sample is the closed-polyline start; there is no duplicated closing point
@@ -472,6 +498,39 @@ def test_polyline_radius_default_plane_matches_reference(device: str, reduction:
     radius_wp = tw.polyline.polyline_radius(_polyline_wp(pts_np, device), reduction)
     radius_np = _radius_np(pts_np, reduction)
     assert np.allclose(radius_wp, radius_np, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("reduction", ["min", "max", "mean", "median"])
+def test_polyline_radius_closed_matches_reference(device: str, reduction: str) -> None:
+    """
+    ``closed=True`` adds the seam segment, which changes both the reduction and the default plane.
+
+    On a *sampled circle* stored without its closing point the open form misses the arc between the
+    last and first sample entirely, so its ``max`` and ``mean`` differ from the closed form's --
+    which is why the second assert is on a reduction that must move, not on ``min`` (nearest point,
+    unchanged by adding one more chord at the same radius).
+    """
+    pts_np = _planar_circle(24, radius=2.0)
+    polyline_wp = _polyline_wp(pts_np, device)
+    center_wp, normal_wp = wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 1.0)
+
+    radius_wp = tw.polyline.polyline_radius(
+        polyline_wp, reduction, center_wp, normal_wp, closed=True
+    )
+
+    radius_np = _radius_np(_closed_from(pts_np), reduction, np.zeros(3), np.array([0.0, 0.0, 1.0]))
+    assert np.allclose(radius_wp, radius_np, rtol=1e-4, atol=1e-4)
+
+
+def test_polyline_radius_closed_default_plane_differs_from_open(device: str) -> None:
+    """The default ``center`` / ``normal`` come from the closed polyline, so the keyword reaches."""
+    pts_np = _random_open_polyline(80)
+    polyline_wp = _polyline_wp(pts_np, device)
+    assert not np.isclose(
+        tw.polyline.polyline_radius(polyline_wp, "mean", closed=True),
+        tw.polyline.polyline_radius(polyline_wp, "mean"),
+        rtol=1e-3,
+    )
 
 
 def test_polyline_radius_rejects_unknown_reduction(device: str) -> None:
@@ -720,11 +779,73 @@ def test_simplify_two_points_kept(device: str) -> None:
 def test_simplify_closed_matches_reference(device: str, tol: float) -> None:
     pts_np = _random_open_polyline(3, n=30)
     closed_np = _closed_from(pts_np)
-    simplified_wp, indices_wp = tw.polyline.simplify_closed_polyline(
-        _polyline_wp(pts_np, device), tol
+    simplified_wp, indices_wp = tw.polyline.simplify_polyline(
+        _polyline_wp(pts_np, device), tol, closed=True
     )
     simplified_np, indices_np = _simplify_np(closed_np, tol)
     assert np.array_equal(indices_wp.numpy(), indices_np.astype(np.int32))
     assert np.allclose(
         simplified_wp.numpy(), simplified_np.astype(np.float32), rtol=1e-4, atol=1e-4
+    )
+
+
+def test_closed_keyword_equals_closing_the_polyline_explicitly(device: str) -> None:
+    """
+    ``closed=True`` is exactly the open computation on ``close_polyline(polyline)``.
+
+    The convention, asserted once for every function that carries the keyword rather than seven
+    times in seven near-identical tests. Three of the ten additionally drop the duplicated seam
+    point on the way out, so they are checked against the sliced form instead -- which is the whole
+    difference between the two groups and the thing most likely to drift.
+    """
+    pts_np = _random_open_polyline(33, n=20)
+    polyline_wp = _polyline_wp(pts_np, device)
+    closed_wp = tw.polyline.close_polyline(polyline_wp)
+    queries_wp = _polyline_wp(_random_open_polyline(34, n=15), device)
+    n_original = int(polyline_wp.shape[0])
+
+    # Pure delegation: closed=True adds the segment and changes nothing else.
+    assert np.isclose(
+        tw.polyline.polyline_length(polyline_wp, closed=True),
+        tw.polyline.polyline_length(closed_wp),
+    )
+    assert np.allclose(
+        list(tw.polyline.polyline_centroid(polyline_wp, closed=True)),
+        list(tw.polyline.polyline_centroid(closed_wp)),
+    )
+    assert np.isclose(
+        tw.polyline.polyline_radius(polyline_wp, "mean", closed=True),
+        tw.polyline.polyline_radius(closed_wp, "mean"),
+    )
+    assert np.array_equal(
+        tw.polyline.distance_to_polyline(queries_wp, polyline_wp, closed=True).numpy(),
+        tw.polyline.distance_to_polyline(queries_wp, closed_wp).numpy(),
+    )
+    assert np.array_equal(
+        tw.polyline.upsample_polyline(polyline_wp, 0.3, closed=True).numpy(),
+        tw.polyline.upsample_polyline(closed_wp, 0.3).numpy(),
+    )
+    assert np.array_equal(
+        tw.polyline.downsample_polyline(polyline_wp, 0.3, closed=True).numpy(),
+        tw.polyline.downsample_polyline(closed_wp, 0.3).numpy(),
+    )
+    simplified_closed, indices_closed = tw.polyline.simplify_polyline(
+        polyline_wp, 0.05, closed=True
+    )
+    simplified_explicit, indices_explicit = tw.polyline.simplify_polyline(closed_wp, 0.05)
+    assert np.array_equal(simplified_closed.numpy(), simplified_explicit.numpy())
+    assert np.array_equal(indices_closed.numpy(), indices_explicit.numpy())
+
+    # ...and the three that drop the duplicated seam point, so their result is a cyclic ring.
+    assert np.array_equal(
+        tw.polyline.resample_polyline(polyline_wp, 17, closed=True).numpy(),
+        tw.polyline.resample_polyline(closed_wp, 18).numpy()[0:17],
+    )
+    assert np.array_equal(
+        tw.polyline.polyline_angles(polyline_wp, closed=True).numpy(),
+        tw.polyline.polyline_angles(closed_wp).numpy()[0:n_original],
+    )
+    assert np.array_equal(
+        tw.polyline.smooth_upsample_polyline(polyline_wp, 0.3, closed=True).numpy(),
+        tw.polyline.smooth_upsample_polyline(closed_wp, 0.3, closed=True).numpy(),
     )

@@ -256,7 +256,7 @@ def loop_perimeters(
     vertices: wp.array[wp.vec3],
     out_perimeter: wp.array[wp.float32],
 ) -> None:
-    # Segmented ``closed_polyline_length``: the arc length of every loop in one launch, so
+    # Segmented ``polyline_length(closed=True)``: the arc length of every loop in one launch, so
     # ``preserve_largest_hole`` costs one readback instead of two per loop.
     t = int(wp.tid())
     ell = loop_id[t]

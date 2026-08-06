@@ -122,8 +122,8 @@ def _hole_loops(
     perimeter arc length; the first one on a tie — is excluded, leaving it open. This is the
     standard cut for disk-topology repair and UV parametrization, where exactly one boundary must
     survive. The perimeters come from one segmented-sum launch over the packed loops rather than a
-    [`closed_polyline_length`][triwarp.polyline.closed_polyline_length] call (two synchronizations)
-    per loop.
+    [`polyline_length`][triwarp.polyline.polyline_length] call per loop (two synchronizations
+    each).
     """
     flat_loops, offsets, _sizes = tw.boundary.boundary_loops_batched(vertices, faces, edges_sorted)
     if int(offsets.shape[0]) == 0:
