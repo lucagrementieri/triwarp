@@ -689,15 +689,20 @@ class Trimesh:
 
         Notes
         -----
-        Triggers a device-to-host synchronization on first access.
+        Triggers a device-to-host synchronization on first access. Passes the cached `warp_mesh`,
+        so the self-intersection broad phase reuses that BVH instead of building a second one --
+        the same reuse [`is_self_intersecting`][triwarp.mesh.Trimesh.is_self_intersecting] gets
+        for free by taking a `wp.Mesh` directly.
 
         See Also
         --------
         [`triwarp.validation.is_watertight`][]
         [`is_volume`][triwarp.mesh.Trimesh.is_volume]
         """
+        if self.n_faces == 0:
+            return True
         return tw.validation.is_watertight(
-            self._vertices, self._faces, edges_sorted=self.edges_sorted
+            self._vertices, self._faces, edges_sorted=self.edges_sorted, mesh=self.warp_mesh
         )
 
     @_CachedProperty

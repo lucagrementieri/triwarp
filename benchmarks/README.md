@@ -262,6 +262,32 @@ set automatically. Pass your own `--benchmark-group-by=...` to override.
   rasterizer cost is the number of (triangle, covered pixel) pairs, which a projection reproduces
   faithfully; the module docstring explains why that is sound for timing but not for parity.
 
+### What a prebuilt `wp.Mesh` saves (measured, RTX 5090)
+
+`proximity.closest_point_on_mesh`, `proximity.signed_distance_on_mesh`,
+`validation.face_self_intersecting_mask` and `validation.is_watertight` take an optional
+`mesh: wp.Mesh | None = None`, and `Trimesh.is_watertight` passes its cached `warp_mesh` through it.
+Measured back to back in one process, both orders, values asserted equal — the saving is the clone
+plus the BVH build, and it is **flat in the query count**:
+
+| n_faces | 1 query | 1 000 | 10 000 | 100 000 |
+|---|---|---|---|---|
+| 1 280 | 0.149 ms (35%) | 0.119 (22%) | 0.149 (21%) | 0.132 (13%) |
+| 20 480 | 0.228 ms (37%) | 0.217 (13%) | 0.217 (8.5%) | 0.144 (2.7%) |
+| 81 920 | 0.273 ms (32%) | 0.285 (8.9%) | 0.264 (5.2%) | 0.182 (1.7%) |
+
+So it is a constant ~0.15–0.29 ms, which is a third of a single-query call and noise against a
+100 000-query one. **The regime it pays in is repeated queries against one mesh**, which is exactly
+the `Trimesh` case: `warp_mesh` is a `_CachedProperty`, so the second query onward pays nothing.
+It is *not* a way to make one large query faster — there the BVH build has already vanished into the
+traversal.
+
+`signed_distance_on_mesh(sign_mode="winding")` refuses a supplied mesh rather than accepting one:
+it needs `wp.Mesh(support_winding_number=True)` and `wp.Mesh` exposes no way to read that flag back,
+so an unflagged mesh would silently degrade to ray parity. `intersection.mesh_with_mesh` has no such
+keyword either, for a different reason — it picks the *smaller* of its two meshes as the BVH target
+at runtime, so a caller cannot know which one to build.
+
 ### Measured hazards — do not re-enable these without reading the numbers
 
 Clean synthetic meshes **unblocked libigl** where it previously had to be skipped:

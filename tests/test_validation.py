@@ -721,3 +721,29 @@ def test_new_masks_empty_mesh(device: str) -> None:
     assert tw.validation.face_self_intersecting_mask(vertices_wp, faces_wp).shape[0] == 0
     assert tw.validation.face_watertight_mask(faces_wp).shape[0] == 0
     assert tw.validation.face_orientation_mask(faces_wp).shape[0] == 0
+
+
+@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+def test_supplied_mesh_gives_the_same_answer(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    ``mesh=`` spares the broad phase a BVH build and must change nothing; asserted exactly.
+
+    Both entry points that build one: the per-face mask and the whole-mesh predicate it feeds.
+    Non-vacuous over the fixture set, which spans watertight (icosahedron, cave_cube) and open
+    (hemisphere, half_torus) meshes, so ``is_watertight`` returns both answers across the
+    parametrization rather than one constant.
+    """
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    prebuilt_wp = wp.Mesh(points=mesh_wp.points, indices=mesh_wp.indices)
+
+    assert np.array_equal(
+        tw.validation.face_self_intersecting_mask(mesh_wp.points, mesh_wp.indices).numpy(),
+        tw.validation.face_self_intersecting_mask(
+            mesh_wp.points, mesh_wp.indices, mesh=prebuilt_wp
+        ).numpy(),
+    )
+    assert tw.validation.is_watertight(
+        mesh_wp.points, mesh_wp.indices
+    ) == tw.validation.is_watertight(mesh_wp.points, mesh_wp.indices, mesh=prebuilt_wp)

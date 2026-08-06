@@ -381,6 +381,66 @@ def test_signed_distance_on_mesh_rejects_unknown_sign_mode(
         )
 
 
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+def test_supplied_mesh_gives_the_same_answer(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    ``mesh=`` is an optimization, so its only correctness obligation is to change nothing.
+
+    Asserted **exactly**, not approximately: both paths query the same BVH over the same buffers,
+    so the results must be bit-identical, and a tolerance here would hide a mesh built over the
+    wrong geometry. Covers both queries and both of ``signed_distance_on_mesh``'s parity settings
+    that accept a mesh at all.
+    """
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    rng = np.random.default_rng(21)
+    points_wp = wp.array(
+        np.ascontiguousarray(rng.normal(scale=1.5, size=(256, 3)), dtype=np.float32),
+        dtype=wp.vec3,
+        device=mesh_wp.device,
+    )
+    prebuilt_wp = wp.Mesh(points=wp.clone(mesh_wp.points), indices=wp.clone(mesh_wp.indices))
+
+    rebuilt = tw.proximity.closest_point_on_mesh(mesh_wp.points, mesh_wp.indices, points_wp)
+    supplied = tw.proximity.closest_point_on_mesh(
+        mesh_wp.points, mesh_wp.indices, points_wp, mesh=prebuilt_wp
+    )
+    for from_rebuild, from_supplied in zip(rebuilt, supplied, strict=True):
+        assert np.array_equal(from_rebuild.numpy(), from_supplied.numpy())
+
+    assert np.array_equal(
+        tw.proximity.signed_distance_on_mesh(mesh_wp.points, mesh_wp.indices, points_wp).numpy(),
+        tw.proximity.signed_distance_on_mesh(
+            mesh_wp.points, mesh_wp.indices, points_wp, mesh=prebuilt_wp
+        ).numpy(),
+    )
+
+
+def test_signed_distance_on_mesh_refuses_a_supplied_mesh_in_winding_mode(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    The winding mode needs ``support_winding_number=True`` and cannot check for it, so it refuses.
+
+    ``wp.Mesh`` exposes no way to read the flag back after construction, and without the per-node
+    solid-angle expansion the winding builtin silently falls back to ray parity -- a wrong answer
+    that looks like a right one. Refusing is the only safe response, and this pins it.
+    """
+    _mesh_tm, mesh_wp = icosahedron
+    points_wp = wp.empty(4, dtype=wp.vec3, device=mesh_wp.device)
+    prebuilt_wp = wp.Mesh(points=wp.clone(mesh_wp.points), indices=wp.clone(mesh_wp.indices))
+
+    with pytest.raises(ValueError, match="support_winding_number"):
+        tw.proximity.signed_distance_on_mesh(
+            mesh_wp.points, mesh_wp.indices, points_wp, sign_mode="winding", mesh=prebuilt_wp
+        )
+    # ...and the same call without mesh= works, so the guard is on the combination, not the mode.
+    assert tw.proximity.signed_distance_on_mesh(
+        mesh_wp.points, mesh_wp.indices, points_wp, sign_mode="winding"
+    ).shape == (4,)
+
+
 def test_signed_distance_on_mesh_sign_direction(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     mesh_tm, mesh_wp = icosahedron
     outside_np = np.asarray([mesh_tm.bounds[0] + [100.0, 100.0, 100.0]], dtype=np.float32)

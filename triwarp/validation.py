@@ -384,7 +384,11 @@ def is_self_intersecting(mesh: wp.Mesh, *, max_triangle_collisions: int = 32) ->
 
 
 def face_self_intersecting_mask(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], *, max_triangle_collisions: int = 32
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    max_triangle_collisions: int = 32,
+    mesh: wp.Mesh | None = None,
 ) -> wp.array[wp.bool]:
     """
     Per-face flag: whether each triangle intersects some non-adjacent triangle.
@@ -404,6 +408,10 @@ def face_self_intersecting_mask(
     max_triangle_collisions
         Broad-phase candidate cap per query triangle. Raise this for meshes with many triangles
         packed into overlapping bounding boxes.
+    mesh
+        A ``wp.Mesh`` already built over ``vertices`` and ``faces``, to spare the BVH build the
+        broad phase otherwise pays on every call. Purely an optimization, and not checked against
+        ``vertices`` / ``faces``.
 
     Returns
     -------
@@ -422,8 +430,9 @@ def face_self_intersecting_mask(
     if max_triangle_collisions < 1:
         raise ValueError("max_triangle_collisions must be >= 1")
 
-    require_nonempty_mesh(faces, "face_self_intersecting_mask")
-    mesh = wp.Mesh(points=vertices, indices=faces)
+    if mesh is None:
+        require_nonempty_mesh(faces, "face_self_intersecting_mask")
+        mesh = wp.Mesh(points=vertices, indices=faces)
 
     lower = wp.empty(n_faces, dtype=wp.vec3, device=device)
     upper = wp.empty(n_faces, dtype=wp.vec3, device=device)
@@ -744,6 +753,7 @@ def is_watertight(
     faces: wp.array[wp.int32],
     *,
     edges_sorted: twt.Array2dInt32 | None = None,
+    mesh: wp.Mesh | None = None,
 ) -> bool:
     """
     Whether the mesh bounds a closed volume with no self-intersections.
@@ -761,6 +771,10 @@ def is_watertight(
         Optional precomputed ``(n_faces * 3, 2)`` sorted edges in
         [`faces_to_edges`][triwarp.edges.faces_to_edges] row order. When ``None``, built once
         and shared by the edge- and vertex-manifold checks.
+    mesh
+        A ``wp.Mesh`` already built over ``vertices`` and ``faces``, forwarded to the
+        self-intersection broad phase so its BVH is not rebuilt. Purely an optimization, and not
+        checked against ``vertices`` / ``faces``.
 
     Returns
     -------
@@ -801,8 +815,10 @@ def is_watertight(
         faces, face_adjacency=adjacency, face_adjacency_edges=adjacency_edges
     ):
         return False
-    require_nonempty_mesh(faces, "is_watertight")
-    return not is_self_intersecting(wp.Mesh(points=vertices, indices=faces))
+    if mesh is None:
+        require_nonempty_mesh(faces, "is_watertight")
+        mesh = wp.Mesh(points=vertices, indices=faces)
+    return not is_self_intersecting(mesh)
 
 
 def face_watertight_mask(
