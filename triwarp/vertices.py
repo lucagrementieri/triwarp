@@ -309,6 +309,15 @@ def vertex_defects(
     wp.array[wp.float32]
         Length-``n_vertices`` device array ``2π - Σ angles`` at each vertex. Vertices not
         referenced by any face have defect ``2π`` (empty angle sum).
+
+    See Also
+    --------
+    [`discrete_gaussian_curvature`][triwarp.curvature.discrete_gaussian_curvature]
+        The same quantity at a *scale*: the Cohen-Steiner/Morvan ball measure sums these defects
+        over a ball of given radius, where this is the pointwise value at one vertex. The ball
+        measure is what converges under refinement; the pointwise defect does not.
+    [`face_angles`][triwarp.triangles.face_angles]
+        The angles this sums.
     """
     angle_sum = wp.zeros(n_vertices, dtype=wp.float32, device=faces.device)
     faces2d = faces.reshape((-1, 3))

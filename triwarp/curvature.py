@@ -150,6 +150,15 @@ def discrete_gaussian_curvature(
     -------
     wp.array[wp.float32]
         Length ``n`` discrete Gaussian curvature measure on ``points.device``.
+
+    See Also
+    --------
+    [`vertex_defects`][triwarp.vertices.vertex_defects]
+        The pointwise angle defect this integrates. Same quantity, no scale: at ``radius = 0`` with
+        the vertices as query points the two agree, and it is the ball measure rather than the
+        pointwise defect that converges under refinement.
+    [`discrete_mean_curvature`][triwarp.curvature.discrete_mean_curvature]
+        The mean-curvature measure over the same ball.
     """
     nearest_indices, _, nearest_offsets = tw.neighbors.query_hashgrid_ball_with_offsets(
         vertices, points, radius

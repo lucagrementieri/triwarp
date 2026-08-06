@@ -513,6 +513,15 @@ class Trimesh:
         """
         Length-``n_faces`` connected-component label per face (face-adjacency graph).
 
+        Notes
+        -----
+        Calls
+        [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
+        directly rather than going through
+        [`face_connected_component_labels`][triwarp.adjacency.face_connected_component_labels], so
+        that the cached `face_adjacency` is reused instead of rebuilt. Same labelling engine, same
+        answer.
+
         See Also
         --------
         [`triwarp.adjacency.face_connected_component_labels`][]

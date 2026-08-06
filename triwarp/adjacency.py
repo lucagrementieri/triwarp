@@ -418,10 +418,13 @@ def face_connected_component_labels(faces: wp.array[wp.int32]) -> wp.array[wp.in
     """
     Connected-component label per face (face-adjacency graph).
 
-    Equivalent to
+    The mesh entry point to the one labelling engine: this builds
+    [`face_adjacency`][triwarp.adjacency.face_adjacency] and hands it to
     [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
-    on [`face_adjacency`][triwarp.adjacency.face_adjacency]
-    with ``node_count = n_faces``.
+    with ``node_count = n_faces``. There is no second implementation -- ``graph``'s is
+    mesh-agnostic and is what every caller in the package bottoms out in, including
+    [`Trimesh.face_connected_component_labels`][triwarp.mesh.Trimesh], which calls it directly to
+    reuse its own cached adjacency instead of rebuilding one here.
 
     Parameters
     ----------
