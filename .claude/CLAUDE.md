@@ -505,6 +505,8 @@ BEFORE using an unfamiliar Warp builtin, sparse, or utils function, `grep` these
 
 Docs are built with **MkDocs Material** + **mkdocstrings** (`python` handler, `docstring_style: numpy`), configured in `mkdocs.yml`. `docs/gen_ref_pages.py` auto-generates one API reference page per public module under `triwarp/` on every build, including subpackages such as `triwarp/heat/` (named by dotted path, e.g. `heat.distance`; `triwarp/kernels/` is excluded) — a new module needs **no manual nav entry**, it appears automatically. Preview locally with `DISABLE_MKDOCS_2_WARNING=true uv run mkdocs serve`; validate with `DISABLE_MKDOCS_2_WARNING=true uv run mkdocs build --strict` (fails the build on any broken cross-reference or unresolved external inventory). The `DISABLE_MKDOCS_2_WARNING` prefix silences a promotional banner injected by the `properdocs` transitive dependency of `mkdocs-gen-files`/`mkdocs-literate-nav`/`mkdocs-section-index`.
 
+**The one-line summary says what the function returns, never which C++ call it wraps.** mkdocstrings renders that first line as the function's entry in its module's API index, so a reference library's name there turns the index into a table of bindings — `laplacian.cotmatrix` read `"Cotangent stiffness matrix / discrete Laplacian (``igl::cotmatrix``)"` where it should read `"Cotangent stiffness matrix of the mesh: the discrete Laplace-Beltrami operator."` This is §14's naming rule one level out. Attribution is *wanted* and stays — 32 of the 49 wrapper modules mention a reference library somewhere in their prose, and that is right — but one line down, in `Notes` or `See Also`. Enforced by `tests/test_api_conventions.py`, whose allowlist is `mesh.py`'s "mirrors `trimesh.Trimesh`" alone (the property names are chosen to match, which a reader has to be told at the top). The same test forbids a module summary ending in `(Warp)` or `on NVIDIA Warp`: the whole package is Warp.
+
 Docstrings stay **NumPy-style** (`Parameters`/`Returns`/`Raises`/`See Also`), but cross-references use **mkdocs-autorefs** link syntax, not Sphinx roles — Sphinx interpreted-text roles (`:func:`, `:attr:`, `:meth:`, `:class:`, `:data:`, `:mod:`) have no Markdown equivalent and render as literal, broken text (e.g. `:func:`x``) under MkDocs.
 
 ### Cross-reference rules
@@ -528,6 +530,28 @@ Docstrings stay **NumPy-style** (`Parameters`/`Returns`/`Raises`/`See Also`), bu
 ## 11. Function Ordering Within a Module
 
 `mkdocstrings` is configured with `members_order: source` (see `mkdocs.yml`), so **source order is the rendered docs order** — placement in the file is part of the public API's discoverability, not cosmetic.
+
+### Which module a function belongs in
+
+- **One operation family, one module.** Functions with the same shape of signature computing the
+  same *kind* of answer belong together, and a family split across two modules is a defect however
+  reasonable each half looked when it landed. The five per-point surface descriptors
+  (`ambient_occlusion`, `volumetric_obscurance`, `shape_diameter`, `thickness`,
+  `max_tangent_sphere`) sat in two modules while sharing one kernel module, and
+  `benchmarks/test_proximity.py` had already voted by holding all five rows — **the suite disagreeing
+  with the split is the signal to look for**, since coverage follows the family and not the file.
+- **Place a function by what it computes and what machinery it shares, not by where the reference
+  library keeps it.** Several modules mirror a trimesh module, and mirrored membership is a weak
+  reason: `triangles.volume` / `moments` / `centroid` sat in `triangles.py` because
+  `trimesh.triangles.mass_properties` exists, and they are whole-mesh reductions in a per-triangle
+  module. Names keep their trimesh / igl spelling where that is the field's vocabulary — this rule
+  is about *placement* only.
+- **The machinery half of that test outranks the subject half, and it is measurable.** A function
+  that is a *component* of another module's solver stays with it, however well it reads elsewhere:
+  `heat.distance.heat_geodesic` computes geodesic distance, but `heat/vector.py` calls it,
+  `VectorHeatOperators` embeds its operator tuple, and `log_map`'s radius is asserted to be its
+  answer — moving it would invert the dependency. Check with an import/call scan before moving
+  anything, not by reading.
 
 ### Python wrapper modules (`triwarp/*.py`)
 
@@ -620,6 +644,16 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
 ---
 
 ## 14. Evolving the Public API
+
+**`tests/test_api_conventions.py` is the mechanical half of this section**, and it fails the default
+`pytest` run. Seven static checks over `triwarp/` (excluding `kernels/`): a summary line naming a
+reference library (§10); a `*_mask` producer that does not return `wp.array[wp.bool]`; a module
+summary advertising Warp; a module without a `tests/` **and** a `benchmarks/` file named for it; a
+private name reached across a module boundary; one public name exported by two modules; and a
+top-level `kernels/<name>.py` without its `triwarp/<name>.py` or the reverse (§4). Each check carries
+a written allowlist — read the reason before adding an entry, and prefer fixing the code. It does not
+replace review: it cannot tell whether a *new* name is a good one, only that it does not break a
+convention the package already holds to.
 
 - **Name a function after what it returns, in NumPy vocabulary — never after the Warp call it
   wraps.** `sort_pairs` named `warp.utils.radix_sort_pairs`'s key/value mechanism rather than its

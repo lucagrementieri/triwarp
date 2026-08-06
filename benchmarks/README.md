@@ -179,9 +179,9 @@ factorization every round), `test_proximity` (+3 s even capped at `bunny`), `tes
 explicitly capped for that reason — see the pymeshlab hazards below.
 
 That measurement predates the six modules added with the potpourri3d port
-(`test_halfedge`, `test_tangent`, `test_contour`, `test_tracing`, `test_heat_vector`,
-`test_intrinsic`, `test_heat_signed`) and the potpourri3d rows in the existing ones. The three Phase-1 modules add ~10 s;
-`test_heat_vector` and `test_tracing` add ~40 s between them (the reference factors two sparse systems
+(`test_halfedge`, `test_tangent_space`, `test_intersection`, `test_geodesic_walk`, `test_heat_vector`,
+`test_laplacian`, `test_heat_signed`) and the potpourri3d rows in the existing ones. The three Phase-1 modules add ~10 s;
+`test_heat_vector` and `test_geodesic_walk` add ~40 s between them (the reference factors two sparse systems
 per case, and traces one ray per call); `test_heat_signed` adds ~15 s, most of it the reference's
 1 s-per-call solver; and the potpourri3d rows add most of their cost to
 `test_heat_distance`, now 74 s for the module with its `heat_geodesic` group carrying three libraries at two
@@ -709,17 +709,17 @@ Both were found while writing the parity asserts, and both fail *silently* rathe
 | module | potpourri3d reference |
 |---|---|
 | `test_heat_distance` | `MeshHeatMethodDistanceSolver` (`use_robust=False`, the same discretization as triwarp's), and `MeshFastMarchingDistanceSolver` as a different algorithm for the same task |
-| `test_contour` | `marching_triangles` — the only reference for isocontours of an arbitrary vertex field |
+| `test_intersection` | `marching_triangles` — the only reference for isocontours of an arbitrary vertex field |
 | `test_geodesic_walk` | `GeodesicTracer.trace_geodesic_from_vertex` — one ray per call, so its row is linear in the ray count by construction |
 | `test_heat_signed` | `MeshSignedHeatSolver.compute_distance` — requires every curve segment inside one face, which is why the source curves are edge paths |
 | `test_heat_vector` | `MeshVectorHeatSolver.{extend_scalar,transport_tangent_vectors,compute_log_map}` (`use_intrinsic_delaunay=False`) |
-| `test_tangent` | `MeshVectorHeatSolver.get_tangent_frames` (`use_intrinsic_delaunay=False`) — an *upper bound*: the frames only come out of the solver's construction, which also factors two sparse systems |
+| `test_tangent_space` | `MeshVectorHeatSolver.get_tangent_frames` (`use_intrinsic_delaunay=False`) — an *upper bound*: the frames only come out of the solver's construction, which also factors two sparse systems |
 | `test_laplacian` | `cotan_laplacian` (a numpy/scipy build, not C++) and `vertex_areas` (the barycentric lumped mass diagonal) |
 | `test_triangles` | `face_areas` |
 | `test_edges` | `edges` — in the `edges_unique_manifold` group only, see the hazard table |
 
-`test_intrinsic` uses **libigl** (`cotmatrix_intrinsic`) rather than potpourri3d, which exposes
-mollification only inside its heat solver. `test_halfedge` and `test_topology`'s subject matter has no
+`test_laplacian` uses **libigl** (`cotmatrix_intrinsic`) rather than potpourri3d, which exposes
+mollification only inside its heat solver. `test_halfedge` and `test_validation`'s subject matter has no
 reference anywhere.
 
 Two things shape every potpourri3d row:
@@ -792,7 +792,7 @@ functions noted inline.
 
 Modules with no baseline from **any** reference are `test_texture`, `test_polyline`, `test_reduce`,
 `test_linalg` and `test_halfedge` (plus `stitch*` in `test_combine`, the morphology groups in
-`test_selection`, and the two transport groups in `test_tangent`);
+`test_selection`, and the two transport groups in `test_tangent_space`);
 each docstring says which reference was considered and why it is not apples-to-apples. Those are
 before/after self-comparisons.
 
