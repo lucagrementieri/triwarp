@@ -497,7 +497,7 @@ Authoritative Warp function lists are mirrored locally under `reference/warp_api
 | `reference/warp_api/utils.md` | `warp.utils` Python-scope utilities |
 | `reference/warp_api/fem_linalg.md` | `warp.fem.linalg` linear-algebra utilities |
 
-BEFORE using an unfamiliar Warp builtin, sparse, or utils function, `grep` these files to confirm the exact name, signature, and scope rather than guessing. Each file lists its source URL (Warp 1.14.0) at the top — fetch it for full argument details or examples when the one-line description is insufficient.
+BEFORE using an unfamiliar Warp builtin, sparse, or utils function, `grep` these files to confirm the exact name, signature, and scope rather than guessing. Each file stamps the Warp version it was transcribed from, and its source URL, at the top — fetch the URL for full argument details or examples when the one-line description is insufficient. Do not restate that version here; run `uv run reference/warp_api/warp_version.py` to compare every stamp against the installed `warp-lang` and see which files a Warp upgrade has left stale. `reference/warp_api/REGENERATE.md` records how to re-extract them.
 
 ---
 

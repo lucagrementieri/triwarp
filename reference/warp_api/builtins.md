@@ -1,6 +1,6 @@
 # Warp Built-In Functions (kernel scope)
 
-Source: https://nvidia.github.io/warp/stable/language_reference/builtins.html (Warp 1.15.0)
+Source: https://nvidia.github.io/warp/stable/language_reference/builtins.html (Warp 1.16.0)
 > Regenerate after a Warp upgrade — see `reference/warp_api/REGENERATE.md`.
 
 These are callable inside `@wp.kernel` / `@wp.func` as `wp.<name>(...)`.
@@ -96,8 +96,11 @@ These are callable inside `@wp.kernel` / `@wp.func` as `wp.<name>(...)`.
 - `quat_to_euler(q, axes)` — quaternion -> Euler angles.
 - `quat_to_matrix(q)` — quaternion -> 3x3 rotation matrix.
 - `quat_to_rpy(q)` — quaternion -> roll-pitch-yaw (ZYX).
-- `quat_twist(q, axis)` — twist quaternion around `axis`.
-- `quat_twist_angle(q, axis)` — twist magnitude around `axis`.
+- `quat_twist(axis, q)` — twist quaternion around `axis`. Note the argument order: the **axis comes first**.
+- `quat_twist_angle(axis, q)` — unsigned twist magnitude around `axis`.
+- `quat_twist_angle_signed(axis, q)` — (1.16) signed twist angle around `axis`, so `+theta` and `-theta`
+  return opposite values. `axis` must be normalized by the caller; `q` and `-q` are the same
+  orientation but different branches, so their signed angles may differ by `2*pi`.
 - `quaternion(...)` — construct a quaternion.
 
 ## Transformations
@@ -131,6 +134,14 @@ These are callable inside `@wp.kernel` / `@wp.func` as `wp.<name>(...)`.
 - `velocity_at_point(s, offset)` — linear velocity of an offset point on a rigid body.
 
 ## Tile Primitives
+
+**NumPy-style slicing (1.16).** Tiles support `t[5, :]`, `t[10:20, :]`, `t[:, 0:32]`, `t[::2, ::2]`,
+`t[::-1, :]`, negative indices (`t[-1, :]`), and slice assignment (`t[0:4, :] = src`). Basic slicing
+compiles down to `tile_view` and aliases the source tile's memory; an integer index collapses that
+dimension. Slicing is differentiable. **Slice bounds must be compile-time constants** — a dynamic
+remainder length cannot be expressed as a slice, so tail handling still needs a scalar loop or a
+padded `tile_load`.
+
 - `tile(...)` — construct a tile from per-thread values.
 - `tile_arange(start, stop, dtype)` — tile of linearly spaced elements.
 - `tile_argmax(t)` / `tile_argmin(t)` — cooperative index of max/min element.
@@ -153,7 +164,8 @@ These are callable inside `@wp.kernel` / `@wp.func` as `wp.<name>(...)`.
 - `tile_from_thread(value, shape, dtype)` — tile filled with value from a thread.
 - `tile_full(value, shape, dtype)` — tile filled with value.
 - `tile_load(arr, offset)` — load a tile from global memory.
-- `tile_load_indexed(arr, axis, indices)` — load tile mapped by index tile.
+- `tile_load_indexed(arr, axis, indices)` — load tile mapped by index tile. Since 1.16 a **negative
+  index yields zero** (like an index past the end), so `-1` works as a padding sentinel.
 - `tile_lower_solve(L, y)` / `_inplace` — solve `Lz=y` (lower triangular).
 - `tile_map(func, t)` — apply a function to tile elements.
 - `tile_matmul(a, b)` — matrix product `a*b`.
@@ -168,6 +180,10 @@ These are callable inside `@wp.kernel` / `@wp.func` as `wp.<name>(...)`.
 - `tile_scan_max_inclusive(t)` / `tile_scan_min_inclusive(t)` — inclusive max/min scan.
 - `tile_scatter_add(t, indices)` — scatter-add per-thread value into shared tile.
 - `tile_scatter_masked(t, indices, value)` — write value into shared tile.
+- `tile_slice_indexed(t, indices)` — (1.16) gather elements along a single axis using a 1D integer
+  index tile; equivalently `t[indices, :]`. Returns a new **non-aliasing** register tile. Negative
+  values wrap; duplicates accumulate gradients atomically on the backward pass. **Not bounds-checked
+  in release builds** — an out-of-range index reads out of bounds.
 - `tile_sort(keys, values)` — cooperative sort by keys.
 - `tile_squeeze(t)` — squeezed view.
 - `tile_stack(dtype, capacity)` — block stack in shared memory.
@@ -176,7 +192,8 @@ These are callable inside `@wp.kernel` / `@wp.func` as `wp.<name>(...)`.
 - `tile_sum(t)` — cooperative sum of tile elements.
 - `tile_transpose(t)` — transpose a tile.
 - `tile_upper_solve(U, z)` / `_inplace` — solve `Ux=z` (upper triangular).
-- `tile_view(t, offset, shape)` — slice [offset, offset+shape].
+- `tile_view(t, offset, shape)` — slice [offset, offset+shape]. `offset` also accepts `slice` objects
+  (1.16), in which case `shape` must be omitted — the view shape is inferred from the bounds.
 - `untile(t)` — convert a tile back to per-thread values.
 
 ## Geometry
@@ -189,7 +206,9 @@ These are callable inside `@wp.kernel` / `@wp.func` as `wp.<name>(...)`.
   `vec3(s, t, d)`: the barycentric weight along each edge and the distance between the closest
   points. `vec3`/`float32` only — there is no float64 overload.
 - `hash_grid_point_id(grid, index)` — index of a point in the HashGrid.
-- `hash_grid_query(grid, point)` / `hash_grid_query_next(query)` — HashGrid point query.
+- `hash_grid_query(grid, point, max_dist)` / `hash_grid_query_next(query)` — HashGrid point query.
+  An optional trailing `group: int32` (1.16) restricts traversal to points sharing that group ID —
+  see `HashGrid.build(points, radius, groups=...)` in `warp.md`.
 - `intersect_tri_tri(v0,v1,v2,u0,u1,u2)` — triangle/triangle intersection (Möller).
 - `mesh_eval_face_normal(mesh, face_index)` — face normal.
 - `mesh_eval_position(mesh, face_index, bary)` — position from face + barycentrics.

@@ -1,6 +1,6 @@
 # warp.sparse API
 
-Source: https://nvidia.github.io/warp/stable/api_reference/warp_sparse.html (Warp 1.15.0)
+Source: https://nvidia.github.io/warp/stable/api_reference/warp_sparse.html (Warp 1.16.0)
 > Regenerate after a Warp upgrade — see `reference/warp_api/REGENERATE.md`.
 
 Block-sparse (BSR/CSR) matrix support. Import via `from warp.sparse import ...` or `wp.sparse.<name>`.
@@ -10,6 +10,17 @@ Block-sparse (BSR/CSR) matrix support. Import via `from warp.sparse import ...` 
 - `bsr_matrix_t` — typed BSR matrix class.
 - `bsr_mm_work_arrays` — persists temporary work buffers across matrix-matrix multiply calls.
 - `bsr_axpy_work_arrays` — persists temporary work buffers across addition calls.
+
+## `BsrMatrix` members
+Fields `nrow` / `ncol` / `nnz` / `offsets` / `row_counts` / `columns` / `values`; properties
+`shape`, `dtype`, `device`, `scalar_type`, `scalar_values`, `block_shape`, `block_size`,
+`requires_grad`.
+- `nnz_sync()` — host-sync the block count after a topology change (a device readback).
+- `notify_nnz_changed(nnz=None, nnz_capacity=None)` — declare a new block count without a readback,
+  for when the caller already knows it (used by `triwarp.linalg`).
+- `copy_nnz_async()` — **deprecated in 1.16**; use `notify_nnz_changed()` instead.
+- `status_sync()` / `status_message()` / `clear_status()` — read/clear the status code below.
+- `uncompress_rows(out=None)` / `transpose()`.
 
 ## Status Codes (new in 1.15)
 - `BSR_STATUS_SUCCESS` — operation completed successfully.
