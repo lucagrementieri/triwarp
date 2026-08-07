@@ -173,7 +173,7 @@ def test_enclosing_diagonal(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="oriented_bounding_box")
-@pytest.mark.benchlibs("triwarp", "igl", "trimesh")
+@pytest.mark.benchlibs("triwarp", "igl", "trimesh", "open3d")
 def test_oriented_bounding_box(bench_case: BenchCase) -> None:
     """
     The sampled minimum-volume box: ``_ROTATIONS`` candidate frames, each scored by an extent.
@@ -183,9 +183,26 @@ def test_oriented_bounding_box(bench_case: BenchCase) -> None:
     every candidate in parallel and finishes the objective and the ``argmin`` on the host over a
     ``(rotations, 6)`` table; igl walks the same candidates over a CPU ``parallel_for``.
 
-    Both CPU references run into hundreds of milliseconds on ``bunny`` and take ``rounds=3`` for it,
+    The CPU references run into hundreds of milliseconds on ``bunny`` and take ``rounds=3`` for it,
     the same allowance the other second-scale rows in the suite use.
+
+    open3d times ``get_minimal_oriented_bounding_box`` -- its hull-based approximate minimizer,
+    the same algorithm family as trimesh's row -- not ``get_oriented_bounding_box``, whose PCA box
+    does not minimize anything (measured 12.9% above triwarp's volume on the tilted half_torus
+    where the minimal box sits within 2%). Like both other references it is insensitive to
+    ``_ROTATIONS`` by construction.
     """
+    if bench_case.kind == "open3d":
+        import open3d as o3d
+
+        vertices_np = bench_case.vertices_np
+
+        def minimal_box_o3d() -> object:
+            cloud_o3d = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(vertices_np))
+            return cloud_o3d.get_minimal_oriented_bounding_box()
+
+        assert bench_case.run(minimal_box_o3d, rounds=3).volume() > 0.0
+        return
     if bench_case.kind == "triwarp":
         vertices = bench_case.vertices_wp
         rotation, lower, upper = bench_case.run(

@@ -84,6 +84,13 @@ def test_moments(bench_case: BenchCase) -> None:
     of mass; ``trimesh``'s ``mass_properties`` computes the same three from the same integrals on
     the host. Both are timed on the whole call, since neither exposes the integrals separately.
 
+    There is no open3d row, measured rather than assumed: ``get_volume`` validates before it
+    integrates, and the validation is the same brute-force ``IsWatertight`` composition its
+    ``is_watertight`` row times -- **13.8 s on a watertight 82k-face sphere** whose integral is
+    microseconds. A row here would re-time ``is_watertight`` under this group's name (the same
+    trap the validation module documents for ``is_volume``), and it raises outright on the
+    non-watertight sweep meshes.
+
     **And triwarp loses this one**, which the readback account predicts and the numbers confirm: on
     ``bunny`` it reads **3.19 ms against igl's 1.23** (and trimesh's 41.1), because ten ``float64``
     sums over 69 451 faces is less work than three host crossings cost in latency. It is the

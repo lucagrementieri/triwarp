@@ -417,6 +417,52 @@ def test_platonic_solids_match_pymeshlab(
     )
 
 
+@pytest.mark.parametrize(
+    ("builder", "creator_name"),
+    [
+        ("tetrahedron", "create_tetrahedron"),
+        ("octahedron", "create_octahedron"),
+        ("icosahedron", "create_icosahedron"),
+    ],
+)
+@pytest.mark.parity("platonic_solids", "open3d")
+def test_platonic_solids_match_open3d(device: str, builder: str, creator_name: str) -> None:
+    """
+    Class B via rigid-motion invariants, the ``test_icosahedron`` transform against a third table.
+
+    Probed before this test was written: open3d's octahedron matches triwarp's vertex set exactly,
+    but its tetrahedron sits in a rotated frame (nearest-vertex distance 0.92 after scaling) and
+    its icosahedron is the raw ``(0, ±1, ±phi)`` table at circumradius 1.902 in yet another
+    orientation -- so positions cannot be compared across the family and the invariants are the
+    honest common ground: counts, one shared edge length, surface area and enclosed volume, all
+    after scaling open3d's solid to triwarp's unit circumradius. open3d has no dodecahedron, which
+    is why the parametrization stops at three where the pymeshlab test above has four.
+    """
+    vertices_wp, faces_wp = getattr(tw.creation, builder)(device=device)
+    mesh_wp = _mesh(vertices_wp, faces_wp)
+
+    mesh_o3d = getattr(o3d.geometry.TriangleMesh, creator_name)()
+    vertices_o3d = np.asarray(mesh_o3d.vertices)
+    radii_o3d = np.linalg.norm(vertices_o3d, axis=1)
+    assert np.allclose(radii_o3d, radii_o3d[0], rtol=1e-5)  # centred: circumradius well-defined
+    mesh_o3d_unit = tm.Trimesh(
+        vertices_o3d / radii_o3d[0], np.asarray(mesh_o3d.triangles), process=False
+    )
+
+    assert len(mesh_o3d_unit.vertices) == len(mesh_wp.vertices)
+    assert len(mesh_o3d_unit.faces) == len(mesh_wp.faces)
+    edges_o3d = np.linalg.norm(
+        np.diff(mesh_o3d_unit.vertices[mesh_o3d_unit.edges_unique], axis=1), axis=2
+    ).ravel()
+    edges_wp = np.linalg.norm(
+        np.diff(mesh_wp.vertices[mesh_wp.edges_unique], axis=1), axis=2
+    ).ravel()
+    assert np.allclose(edges_o3d, edges_o3d[0], rtol=1e-5, atol=1e-5)
+    assert np.allclose(edges_wp.mean(), edges_o3d.mean(), rtol=1e-5, atol=1e-5)
+    assert np.isclose(mesh_wp.area, mesh_o3d_unit.area, rtol=1e-5)
+    assert np.isclose(abs(mesh_wp.volume), abs(mesh_o3d_unit.volume), rtol=1e-5)
+
+
 @pytest.mark.parametrize("count", [(2, 2), (3, 7), (10, 10)])
 def test_grid(device: str, count: tuple[int, int]) -> None:
     vertices_wp, faces_wp = tw.creation.grid(count=count, extents=(2.0, 3.0), device=device)

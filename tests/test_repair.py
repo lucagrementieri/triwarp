@@ -157,6 +157,37 @@ def test_remove_unreferenced_extra_vertices(device: str):
     assert np.array_equal(inverse_wp.numpy(), inverse_igl.ravel())
 
 
+@pytest.mark.parity("remove_unreferenced_vertices", "open3d")
+def test_remove_unreferenced_matches_open3d(device: str):
+    """
+    Class A on both compacted buffers -- open3d keeps first-occurrence order like triwarp does.
+
+    open3d returns no forward or inverse map (the mesh is mutated in place and read back), so
+    unlike the igl tests only the vertices and faces are comparable; the maps stay pinned by igl.
+    The four appended vertices make the compaction real, and the interleaved layout (an
+    unreferenced vertex *between* referenced ones) is what catches a compaction that preserves
+    a prefix instead of an order.
+    """
+    rng = np.random.default_rng(0)
+    referenced_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]], dtype=np.float64
+    )
+    # Interleave dead vertices among live ones rather than appending them.
+    vertices_full_np = np.insert(referenced_np, [1, 3, 4, 4], rng.normal(size=(4, 3)), axis=0)
+    faces_np = np.array([[0, 2, 4], [2, 5, 4]], dtype=np.int32)
+
+    vertices_wp, faces_wp = _to_wp_mesh(vertices_full_np, faces_np, device)
+    nv_wp, nf_wp, _remap_wp = tw.repair.remove_unreferenced_vertices(vertices_wp, faces_wp)
+
+    mesh_o3d = trimesh_to_open3d(tm.Trimesh(vertices_full_np, faces_np, process=False))
+    mesh_o3d.remove_unreferenced_vertices()
+    vertices_o3d = np.asarray(mesh_o3d.vertices)
+
+    assert vertices_o3d.shape[0] == referenced_np.shape[0]  # the reference really compacted
+    assert np.allclose(nv_wp.numpy(), vertices_o3d, rtol=1e-5, atol=1e-5)
+    assert np.array_equal(nf_wp.numpy().reshape(-1, 3), np.asarray(mesh_o3d.triangles))
+
+
 def test_remove_unreferenced_sentinel(device: str):
     vertices_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
     faces_np = np.array([[0, 1, -1], [0, 2, 1]], dtype=np.int32)

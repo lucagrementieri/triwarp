@@ -219,6 +219,48 @@ def test_is_edge_manifold_no_boundary(request: pytest.FixtureRequest, mesh_name:
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 @pytest.mark.parametrize("allow_boundary_edges", [True, False])
+@pytest.mark.parity("is_edge_manifold", "open3d")
+def test_is_edge_manifold_matches_open3d(
+    request: pytest.FixtureRequest, mesh_name: str, allow_boundary_edges: bool
+) -> None:
+    """
+    Class A: Open3D's ``is_edge_manifold`` shares triwarp's switch with identical semantics.
+
+    Unlike igl (which always allows boundary edges), Open3D exposes ``allow_boundary_edges`` with
+    the same two meanings as triwarp's, so both settings are compared. The fixture list spans
+    closed and open meshes, so at ``allow_boundary_edges=False`` both answers appear; the
+    non-manifold direction at ``True`` is pinned by the three-faces-one-edge case below.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    manifold_wp = tw.validation.is_edge_manifold(
+        mesh_wp.indices, allow_boundary_edges=allow_boundary_edges
+    )
+    manifold_o3d = trimesh_to_open3d(mesh_tm).is_edge_manifold(
+        allow_boundary_edges=allow_boundary_edges
+    )
+    assert manifold_wp == manifold_o3d
+    if not allow_boundary_edges:
+        assert manifold_o3d == (mesh_name in CLOSED_MESHES)
+
+
+def test_is_edge_manifold_nonmanifold_fan_matches_open3d(device: str) -> None:
+    """Three faces on one edge: non-manifold under both switches, for both libraries."""
+    vertices_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    faces_np = np.array([[0, 1, 2], [0, 3, 1], [0, 1, 4]])
+    _, faces_wp = _mesh_to_wp(vertices_np, faces_np, device)
+    mesh_o3d = trimesh_to_open3d(tm.Trimesh(vertices_np, faces_np, process=False))
+    for allow_boundary_edges in (True, False):
+        manifold_wp = tw.validation.is_edge_manifold(
+            faces_wp, allow_boundary_edges=allow_boundary_edges
+        )
+        assert manifold_wp == mesh_o3d.is_edge_manifold(allow_boundary_edges=allow_boundary_edges)
+        assert manifold_wp is False
+
+
+@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parametrize("allow_boundary_edges", [True, False])
 def test_edge_manifold_mask(
     request: pytest.FixtureRequest, mesh_name: str, allow_boundary_edges: bool
 ) -> None:
@@ -303,6 +345,52 @@ def test_is_vertex_manifold_bowtie(device: str) -> None:
     assert manifold_wp is False
     # The bow-tie is still edge-manifold (each edge used once).
     assert tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=True) is True
+
+
+@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parity("is_vertex_manifold", "open3d")
+def test_is_vertex_manifold_matches_open3d(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B: equal on edge-manifold input, which every fixture here is.
+
+    Open3D's ``IsVertexManifold`` tests whether the faces incident to a vertex are *edge-connected
+    at all*; triwarp and igl require a manifold fan. The two definitions coincide exactly when the
+    mesh is edge-manifold, and diverge on vertices sitting on a non-manifold edge -- three faces
+    sharing one edge are mutually connected (Open3D: manifold) but not a fan (triwarp: not). The
+    divergent input class is asserted below so the restriction stays measured, and the bow-tie
+    case supplies the ``False`` answer that keeps this comparison non-vacuous.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    assert tw.validation.is_edge_manifold(mesh_wp.indices) is True  # the class-B precondition
+    manifold_o3d = trimesh_to_open3d(mesh_tm).is_vertex_manifold()
+    assert tw.validation.is_vertex_manifold(mesh_wp.indices) == manifold_o3d
+
+
+def test_is_vertex_manifold_open3d_agreement_and_divergence(device: str) -> None:
+    """
+    The two sides of the class-B restriction, both pinned.
+
+    On the edge-manifold bow-tie the libraries agree (both ``False``); on the edge-non-manifold
+    three-face fan they deliberately diverge (Open3D ``True``, triwarp ``False``) because Open3D
+    checks connectivity where triwarp checks for a fan. If Open3D ever changes its answer here,
+    the class-B precondition in the test above stops being the right restriction.
+    """
+    bow_v = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]]
+    )
+    bow_f = np.array([[0, 1, 2], [0, 3, 4]])
+    _, bow_faces_wp = _mesh_to_wp(bow_v, bow_f, device)
+    bow_o3d = trimesh_to_open3d(tm.Trimesh(bow_v, bow_f, process=False)).is_vertex_manifold()
+    assert bow_o3d is False
+    assert tw.validation.is_vertex_manifold(bow_faces_wp) == bow_o3d
+
+    fan_v = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    fan_f = np.array([[0, 1, 2], [0, 3, 1], [0, 1, 4]])
+    _, fan_faces_wp = _mesh_to_wp(fan_v, fan_f, device)
+    assert trimesh_to_open3d(tm.Trimesh(fan_v, fan_f, process=False)).is_vertex_manifold() is True
+    assert tw.validation.is_vertex_manifold(fan_faces_wp) is False
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)

@@ -6,6 +6,7 @@ from typing import Literal
 
 import igl
 import numpy as np
+import open3d as o3d
 import pytest
 import trimesh as tm
 import warp as wp
@@ -355,6 +356,47 @@ def test_oriented_bounding_box_agrees_with_trimesh_hull_search(
     assert volume_tm * 0.95 <= volume_wp <= volume_tm * 1.20
     # The reported extents are the box the reported frame achieves, so the volume above is the
     # quantity that was minimized and not an unrelated pair of numbers.
+    assert np.isclose(
+        volume_wp, _achieved_loss(points_np, _frame_np(rotation_wp), "volume"), rtol=1e-5
+    )
+
+
+@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parity("oriented_bounding_box", "open3d")
+def test_oriented_bounding_box_agrees_with_open3d_minimal_box(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class C: the sampled box and open3d's hull-based approximate minimal box, within a band.
+
+    The same derived-scalar comparison as the trimesh test above, against a third independent
+    minimizer -- ``get_minimal_oriented_bounding_box``, a convex-hull search like trimesh's. Not
+    ``get_oriented_bounding_box``: that one is PCA of the hull and minimizes nothing (measured
+    12.9% above triwarp on the tilted half_torus, and *exact* on cave_cube where axis-snapping is
+    what PCA happens to do), so a band around it would be a band around an unrelated quantity.
+
+    Neither side bounds the other, measured on these four tilted fixtures before the test was
+    written: ``volume_wp / volume_o3d`` runs 0.988 (icosahedron) through 1.004 (hemisphere) and
+    1.019 (half_torus) to 1.052 (cave_cube -- the exact cube orientation sampling cannot land on,
+    the same worst case the trimesh band carries). The ``[0.90, 1.20]`` band clears the worst
+    reading by 3.8x above and 8.3x below. Mutation probe: the axis-aligned box (``rotations=1``,
+    what a search that scored nothing returns) reads 1.58-5.37x open3d's minimal volume on the
+    same fixtures, breaking the 1.20 ceiling on every one.
+
+    The bug class excluded is the trimesh test's: a search that does not search, candidates that
+    miss ``SO(3)``, or extents decoupled from the reported frame.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    points_np, points_wp = _tilted_cloud(mesh_tm, mesh_wp.device)
+
+    rotation_wp, lower_wp, upper_wp = tw.bounds.oriented_bounding_box(points_wp, 32768)
+
+    volume_wp = float(np.prod(np.ptp(_bounds_np(lower_wp, upper_wp), axis=0)))
+    cloud_o3d = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points_np))
+    volume_o3d = cloud_o3d.get_minimal_oriented_bounding_box().volume()
+    assert volume_o3d > 0.0, "the reference produced a box before it is compared to"
+
+    assert volume_o3d * 0.90 <= volume_wp <= volume_o3d * 1.20
     assert np.isclose(
         volume_wp, _achieved_loss(points_np, _frame_np(rotation_wp), "volume"), rtol=1e-5
     )

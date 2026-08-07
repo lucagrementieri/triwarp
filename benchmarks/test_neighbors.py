@@ -81,10 +81,18 @@ independent implementation rather than a shape-compatible stand-in. Three things
   silently returns ``n_points`` columns rather than raising, which no row here hits but a future one
   might.
 
-trimesh has no k-NN entry point; open3d's ``KDTreeFlann`` has no batched query (it is a Python loop
-over ``search_knn_vector_3d``, which would time the interpreter rather than the search), so the
-open3d k-NN comparison lives in [`test_registration.py`](test_registration.py) and
-[`test_points.py`](test_points.py) where open3d drives the whole algorithm from C++.
+**open3d** ``o3d.core.nns.NearestNeighborSearch`` is the third exact k-NN, and it is **batched** --
+an earlier version of this docstring pointed at the legacy ``KDTreeFlann``, whose only query is a
+Python loop over ``search_knn_vector_3d`` (measured 62 ms against 10 ms for the batched
+``knn_search`` at 20 000 queries over a 36k cloud, i.e. the loop times the interpreter). Probed
+before these rows landed: ``knn_search`` returns indices byte-identical to ``KDTree``'s on a
+tie-free cloud, distances come back **squared** (as FLANN's do), and ``fixed_radius_search``
+returns a CSR-like ``(indices, distances, offsets)`` triple whose per-query counts matched
+triwarp's ball counts exactly on a 36k random cloud. The index build (``knn_index`` /
+``fixed_radius_index``) sits inside the timed callable for the k-NN groups, exactly like scipy's
+``KDTree`` and triwarp's own build; the ball group passes a prebuilt index, like scipy's cached
+tree. Note ``fixed_radius_index(radius)`` bakes the radius into the structure, so each radius
+point pays its own build. trimesh has no k-NN entry point.
 """
 
 from __future__ import annotations
@@ -174,8 +182,25 @@ def _run_igl_knn(bench_case: BenchCase, k: int) -> None:
     assert indices_igl.shape == (queries_np.shape[0], k)
 
 
+def _run_o3d_nns_knn(bench_case: BenchCase, k: int) -> None:
+    """Batched ``o3d.core.nns.knn_search`` with the index build inside the timed region."""
+    import open3d as o3d
+
+    queries_np, points_np = _queries_np(bench_case), bench_case.vertices_np
+    queries_t = o3d.core.Tensor(queries_np)
+    points_t = o3d.core.Tensor(points_np)
+
+    def knn_o3d() -> tuple:
+        nns = o3d.core.nns.NearestNeighborSearch(points_t)
+        nns.knn_index()
+        return nns.knn_search(queries_t, k)
+
+    indices_o3d, _squared_o3d = bench_case.run(knn_o3d)
+    assert indices_o3d.shape == (queries_np.shape[0], k)
+
+
 @pytest.mark.benchmark(group="query_bvh_nearest_k1")
-@pytest.mark.benchlibs("triwarp", "scipy", "igl")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl", "open3d")
 def test_query_bvh_nearest_k1(bench_case: BenchCase) -> None:
     """``k=1`` BVH k-NN — the exact call ICP and the Chamfer family make."""
     skip_larger_than(bench_case, "dragon")
@@ -187,6 +212,8 @@ def test_query_bvh_nearest_k1(bench_case: BenchCase) -> None:
         assert indices.shape == (queries.shape[0],)
     elif bench_case.kind == "igl":
         _run_igl_knn(bench_case, 1)
+    elif bench_case.kind == "open3d":
+        _run_o3d_nns_knn(bench_case, 1)
     else:
         _run_scipy(bench_case, 1)
 
@@ -207,7 +234,7 @@ def test_query_hashgrid_nearest_k1(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="query_bvh_nearest_k7")
-@pytest.mark.benchlibs("triwarp", "scipy", "igl")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl", "open3d")
 def test_query_bvh_nearest_k7(bench_case: BenchCase) -> None:
     """``k=7`` BVH k-NN — ``ball_pivoting``'s seed-candidate table."""
     skip_larger_than(bench_case, "dragon")
@@ -219,12 +246,14 @@ def test_query_bvh_nearest_k7(bench_case: BenchCase) -> None:
         assert indices.shape == (queries.shape[0], 7)
     elif bench_case.kind == "igl":
         _run_igl_knn(bench_case, 7)
+    elif bench_case.kind == "open3d":
+        _run_o3d_nns_knn(bench_case, 7)
     else:
         _run_scipy(bench_case, 7)
 
 
 @pytest.mark.benchmark(group="query_bvh_nearest_k64")
-@pytest.mark.benchlibs("triwarp", "scipy", "igl")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl", "open3d")
 def test_query_bvh_nearest_k64(bench_case: BenchCase) -> None:
     """
     ``k=64`` BVH k-NN — the largest register-row bucket, and the k axis's far end.
@@ -243,6 +272,8 @@ def test_query_bvh_nearest_k64(bench_case: BenchCase) -> None:
         assert indices.shape == (queries.shape[0], 64)
     elif bench_case.kind == "igl":
         _run_igl_knn(bench_case, 64)
+    elif bench_case.kind == "open3d":
+        _run_o3d_nns_knn(bench_case, 64)
     else:
         _run_scipy(bench_case, 64)
 
@@ -308,10 +339,17 @@ def test_hashgrid_from_points(bench_case: BenchCase, grid_bins: int) -> None:
 
 
 @pytest.mark.benchmark(group="query_bvh_ball")
-@pytest.mark.benchlibs("triwarp", "scipy")
+@pytest.mark.benchlibs("triwarp", "scipy", "open3d")
 @pytest.mark.parametrize("radius_scale", _RADIUS_SCALES)
 def test_query_bvh_ball(bench_case: BenchCase, radius_scale: float) -> None:
-    """Radius query over a prebuilt BVH: cost is the neighbour count, so ~8x between the radii."""
+    """
+    Radius query over a prebuilt BVH: cost is the neighbour count, so ~8x between the radii.
+
+    All three structures are prebuilt: triwarp's BVH, scipy's cached ``KDTree``, and open3d's
+    ``fixed_radius_index`` -- the last per radius, because that index bakes the radius in.
+    ``fixed_radius_search`` returns a CSR-like triple, which is exactly the ``*_with_offsets``
+    layout triwarp's row times, so neither side pays per-query host slicing.
+    """
     skip_larger_than(bench_case, "bunny", "the neighbour count grows cubically with the radius")
     radius = radius_scale * bench_case.mean_edge
     if bench_case.kind == "triwarp":
@@ -322,6 +360,16 @@ def test_query_bvh_ball(bench_case: BenchCase, radius_scale: float) -> None:
         )
         assert offsets.shape[0] == int(queries.shape[0])
         assert neighbors.shape[0] >= 0
+    elif bench_case.kind == "open3d":
+        import open3d as o3d
+
+        queries_t = o3d.core.Tensor(_queries_np(bench_case))
+        nns = o3d.core.nns.NearestNeighborSearch(o3d.core.Tensor(bench_case.vertices_np))
+        assert nns.fixed_radius_index(radius)
+        _indices_o3d, _squared_o3d, offsets_o3d = bench_case.run(
+            lambda: nns.fixed_radius_search(queries_t, radius)
+        )
+        assert offsets_o3d.shape[0] == queries_t.shape[0] + 1
     else:
         tree, queries_np = _kdtree(bench_case), _queries_np(bench_case)
         found = bench_case.run(lambda: tree.query_ball_point(queries_np, radius))

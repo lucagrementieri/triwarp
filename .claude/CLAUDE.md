@@ -297,6 +297,51 @@ igl / potpourri3d stay the reference where they already are one. Six hazards, al
   `apply_coord_two_steps_smoothing` at its own defaults moves a noisy cube *further* from clean than
   the noise was, because its fitting step rounds corners in.
 
+**open3d** (pybind11 over Open3D, mirrored under `reference/Open3D/`) is a hard test dependency
+like `pymeshlab` and `igl` — import it plainly as `import open3d as o3d` (the alias is pinned in
+ruff's import conventions), never through `pytest.importorskip`; reference variables take an
+**`_o3d`** suffix. Build meshes with `tests.conversions.trimesh_to_open3d` (reusable across calls,
+unlike a MeshSet), clouds with `points_to_open3d`, and tensor-API meshes with
+`trimesh_to_open3d_t` — never chain off an unbound `from_legacy(...)` (see the freed-memory hazard
+below). The installed wheel is a CUDA build whose legacy `open3d.geometry` / `open3d.pipelines`
+APIs are CPU-only; only `open3d.t` has GPU kernels. Seven hazards, all measured:
+
+- **Legacy `remove_*` / `orient_*` / `filter_*` methods mutate in place** (build inside the timed
+  callable, the `test_repair.py` rule); the pure `compute_*` / `get_*` / `is_*` calls recompute
+  unconditionally and can share one mesh. The trap in the second family: **`get_volume` validates
+  before it integrates**, and the validation is the full brute-force `IsWatertight` composition —
+  13.8 s on a watertight 82k-face sphere whose integral is microseconds — and it *raises* on
+  non-watertight input. Never benchmark it as "volume".
+- **k-NN distances come back squared** from both `KDTreeFlann` and `o3d.core.nns` — take the square
+  root before `allclose`. Use `o3d.core.nns.NearestNeighborSearch` for anything batched (indices
+  match `scipy.spatial.KDTree` byte-for-byte on a tie-free cloud); the legacy tree's only query is
+  a per-point Python loop, 6x slower at 20k queries. `KDTreeFlann`'s radius search is **exclusive
+  at exactly `r`** where triwarp's ball queries are inclusive — random clouds never tie, so only a
+  constructed fixture can expose it.
+- **`is_vertex_manifold` tests connectivity, not a fan**: three faces sharing one edge pass it
+  (their faces are edge-connected) and fail triwarp's and igl's fan definition. The answers agree
+  exactly on edge-manifold input — restrict the comparison to that class and pin the divergence.
+  `is_edge_manifold` shares triwarp's `allow_boundary_edges` switch with identical semantics.
+- **Smoothing filters re-derive inverse-distance weights from current positions every pass**
+  (`filter_smooth_laplacian`, `filter_smooth_taubin`), so they match triwarp's fixed assembled
+  operator at one iteration (6.6e-08) and diverge over ten; Taubin's `number_of_iterations` counts
+  lambda-mu *pairs* like MeshLab's. `filter_sharpen` adds `strength * (deg(v) * v - Σ neighbours)`
+  — the *unnormalized* residual, so its displacement is triwarp's times the vertex degree (measured
+  ratio = degree to 7 digits) and no parameter mapping fixes an irregular mesh. All three are D2
+  exemptions with the numbers in the `noparity` reasons.
+- **Platonic solids come in rotated frames and odd scales**: the octahedron matches triwarp's
+  vertex table exactly, but the tetrahedron is rotated (nearest-vertex distance 0.92 after
+  scaling) and the icosahedron is the raw `(0, ±1, ±φ)` table at circumradius 1.902 — compare
+  rigid-motion invariants after scaling to unit circumradius, never positions. There is no
+  `create_dodecahedron`.
+- **`RaycastingScene.compute_signed_distance` shares triwarp's convention exactly** (negative
+  inside, parity-ray sign; 1.8e-7 agreement) — no negation, unlike trimesh. But
+  `compute_closest_points` diverges ~2e-4 at equidistant-face ties, so compare *distances*, not
+  the returned points.
+- **`get_oriented_bounding_box` is PCA of the hull and minimizes nothing** (12.9% above triwarp's
+  volume on a tilted half_torus); the comparable entry point is
+  `get_minimal_oriented_bounding_box`, the hull-face search of trimesh's family.
+
 ### Mesh fixtures (prefer over inline construction)
 
 Reuse shared mesh fixtures from `tests/conftest.py` instead of building meshes in each test. Fixtures return `(mesh_tm: tm.Trimesh, mesh_wp: wp.Mesh)` via `tests.conversions.trimesh_to_warp`.
@@ -368,9 +413,10 @@ already the oracle in tests/" as no evidence at all that the comparison is live.
 Reuse `tests/comparisons.py` (`lexsort_rows`, `canonical_winding`, `assert_same_up_to_sign`,
 `assert_cyclic_permutation_equal`, `fraction_within`, `symmetric_chamfer`, `hausdorff_two_sided`)
 and `tests/conversions.py` (`trimesh_to_open3d`, `points_to_open3d`, `open3d_to_trimesh`,
-`trimesh_to_pymeshlab`, `warp_to_pymeshlab`, `points_to_pymeshlab`, `faces_igl`) rather than
-re-rolling either. `open3d` is a hard test dependency like `pymeshlab` and `igl` — import it plainly
-as `import open3d as o3d`, never through `pytest.importorskip`.
+`trimesh_to_open3d_t`, `trimesh_to_pymeshlab`, `warp_to_pymeshlab`, `points_to_pymeshlab`,
+`faces_igl`) rather than re-rolling either. `open3d` is a hard test dependency like `pymeshlab` and
+`igl` — import it plainly as `import open3d as o3d`, never through `pytest.importorskip`; see the
+open3d hazards block above.
 
 Two measured gotchas worth not rediscovering: MeshLab's `face_normal_matrix()` after
 `compute_normal_per_face()` is the **unnormalised** cross product (magnitude exactly `2 * area`), so

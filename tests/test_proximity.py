@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import igl
 import numpy as np
+import open3d as o3d
 import pymeshlab as ml
 import pytest
 import trimesh as tm
@@ -17,7 +18,7 @@ import warp as wp
 from scipy.spatial import Delaunay
 
 import triwarp as tw
-from tests.conversions import trimesh_to_pymeshlab, trimesh_to_warp
+from tests.conversions import trimesh_to_open3d_t, trimesh_to_pymeshlab, trimesh_to_warp
 from triwarp.constants import TOLERANCE_MERGE
 
 
@@ -298,6 +299,41 @@ def test_signed_distance_on_mesh_matches_igl(
 
     assert np.array_equal(np.sign(signed_wp.numpy()), np.sign(signed_igl))
     assert np.allclose(signed_wp.numpy(), signed_igl, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "torus"])
+@pytest.mark.parity("signed_distance_on_mesh", "open3d")
+def test_signed_distance_on_mesh_matches_open3d(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A: Embree's ``compute_signed_distance`` shares triwarp's parity sign and its convention.
+
+    Open3D signs by counting ray crossings -- the same rule as triwarp's default ``"parity"`` mode
+    -- and uses the same Warp-SDF orientation (negative inside), so no transform is needed on
+    either the sign or the value. Probed to 1.8e-7 agreement on an icosphere before this test was
+    written. ``cave_cube`` and ``torus`` ride along because a parity rule is exactly what should
+    *not* fail in a cavity or through a genus-1 hole, unlike the normal-based rules in the
+    pymeshlab test above.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    rng = np.random.default_rng(4)
+    points_np = mesh_tm.bounds[0] + rng.random((400, 3)) * (mesh_tm.bounds[1] - mesh_tm.bounds[0])
+
+    mesh_t = trimesh_to_open3d_t(mesh_tm)
+    scene_o3d = o3d.t.geometry.RaycastingScene()
+    scene_o3d.add_triangles(mesh_t)
+    signed_o3d = scene_o3d.compute_signed_distance(
+        o3d.core.Tensor(np.ascontiguousarray(points_np, dtype=np.float32))
+    ).numpy()
+
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+    signed_wp = tw.proximity.signed_distance_on_mesh(mesh_wp.points, mesh_wp.indices, points_wp)
+
+    assert np.array_equal(np.sign(signed_wp.numpy()), np.sign(signed_o3d))
+    assert np.allclose(signed_wp.numpy(), signed_o3d, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])

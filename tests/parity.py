@@ -110,7 +110,9 @@ _LIBRARY_ROOTS: dict[str, frozenset[str]] = {
         }
     ),
     "igl": frozenset({"igl", "igl_module"}),
-    "open3d": frozenset({"o3d", "trimesh_to_open3d", "points_to_open3d", "open3d_to_trimesh"}),
+    "open3d": frozenset(
+        {"o3d", "trimesh_to_open3d", "points_to_open3d", "open3d_to_trimesh", "trimesh_to_open3d_t"}
+    ),
     "scipy": frozenset(
         {"sp", "scipy", "spla", "KDTree", "cKDTree", "csgraph", "Delaunay", "ConvexHull"}
     ),

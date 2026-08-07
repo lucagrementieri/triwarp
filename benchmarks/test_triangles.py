@@ -54,7 +54,7 @@ def _barycentres_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
 
 
 @pytest.mark.benchmark(group="face_normals_and_areas")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "potpourri3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "open3d", "potpourri3d", "pymeshlab")
 def test_face_normals_and_areas(bench_case: BenchCase) -> None:
     """One cross product per face: the operator prologue every solver in the library pays."""
     n_faces = bench_case.n_faces
@@ -62,6 +62,11 @@ def test_face_normals_and_areas(bench_case: BenchCase) -> None:
         meshset_pml = bench_case.meshset_pml
         bench_case.run(meshset_pml.compute_normal_per_face)
         assert meshset_pml.current_mesh().face_normal_matrix().shape == (n_faces, 3)
+        return
+    if bench_case.kind == "open3d":  # unit normals only; recomputed unconditionally per call
+        mesh_o3d = bench_case.mesh_o3d
+        bench_case.run(mesh_o3d.compute_triangle_normals)
+        assert np.asarray(mesh_o3d.triangle_normals).shape == (n_faces, 3)
         return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp

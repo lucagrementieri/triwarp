@@ -40,6 +40,13 @@ record, so open3d runs here at ``rounds=1`` rather than being dropped; that one 
 ``sphere_med``, and safe on ``fan_hub`` at 92.8 ms -- unlike ``igl.principal_curvature``, which
 takes 110 s on the same mesh; see [`test_curvature.py`](test_curvature.py)).
 
+open3d also covers both manifoldness groups directly: ``is_edge_manifold`` shares triwarp's
+``allow_boundary_edges`` switch with identical semantics on both settings, and
+``is_vertex_manifold`` agrees with triwarp everywhere except vertices sitting *on* a non-manifold
+edge -- open3d tests whether the incident faces are edge-connected at all, triwarp and igl whether
+they form a manifold fan, so three faces sharing one edge pass open3d and fail the other two
+(measured on a three-faces-one-edge probe; the parity tests state the input class).
+
 **trimesh** rebuilds its mesh inside the timed callable because it caches derived properties.
 Note its ``is_watertight`` is edge-manifold-only, so it is timing context rather than an
 equivalent computation. It has no ``is_vertex_manifold`` in 5.0; ``tm.repair.fix_winding`` is the
@@ -98,7 +105,7 @@ _O3D_ROUNDS = 1
 
 @pytest.mark.benchmark(group="is_vertex_manifold")
 @pytest.mark.benchaxis("valence")
-@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "igl", "open3d", "pymeshlab")
 def test_is_vertex_manifold(bench_case: BenchCase) -> None:
     """
     A connected-components problem per one-ring: driven by the valence distribution.
@@ -106,12 +113,18 @@ def test_is_vertex_manifold(bench_case: BenchCase) -> None:
     Note the two sides return different shapes -- triwarp reduces to a single ``bool`` while
     ``igl.is_vertex_manifold`` hands back the per-vertex mask (triwarp's ``vertex_manifold_mask``
     is the equivalent of that). The work is the same either way; only the final reduction differs.
+
+    ``open3d.is_vertex_manifold`` tests *connectivity* of the incident faces rather than a manifold
+    fan, so a vertex sitting on a non-manifold edge still passes it where triwarp and igl say no --
+    the answers agree exactly on edge-manifold input (the parity test pins that class down).
     """
     if bench_case.kind == "triwarp":
         assert bench_case.run(lambda: tw.validation.is_vertex_manifold(bench_case.faces_wp)) in (
             True,
             False,
         )
+    elif bench_case.kind == "open3d":
+        assert bench_case.run(bench_case.mesh_o3d.is_vertex_manifold) in (True, False)
     elif bench_case.kind == "pymeshlab":  # writes a per-vertex bool selection: triwarp's shape
         meshset_pml = bench_case.meshset_pml
         bench_case.run(meshset_pml.compute_selection_by_non_manifold_per_vertex)
@@ -124,7 +137,7 @@ def test_is_vertex_manifold(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="is_edge_manifold")
 @pytest.mark.benchaxis("valence")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "open3d")
 def test_is_edge_manifold(bench_case: BenchCase) -> None:
     """
     The cheaper manifoldness predicate: an edge sort and a per-edge count, no one-ring components.
@@ -137,10 +150,19 @@ def test_is_edge_manifold(bench_case: BenchCase) -> None:
     ``igl.is_edge_manifold`` returns ``(verdict, per_corner_mask, ...)`` -- the reduced ``bool``
     first, matching triwarp's return, with the per-corner detail behind it. It has no
     ``allow_boundary_edges`` switch (it always allows them), so only triwarp's default is timed.
+    ``open3d.is_edge_manifold`` has the same switch with the same two semantics as triwarp's and is
+    timed at the shared default.
     """
     if bench_case.kind == "triwarp":
         faces = bench_case.faces_wp
         assert bench_case.run(lambda: tw.validation.is_edge_manifold(faces)) in (True, False)
+        return
+    if bench_case.kind == "open3d":
+        mesh_o3d = bench_case.mesh_o3d
+        assert bench_case.run(lambda: mesh_o3d.is_edge_manifold(allow_boundary_edges=True)) in (
+            True,
+            False,
+        )
         return
     faces_np = np.ascontiguousarray(bench_case.faces_np, dtype=np.int64)
     assert bool(bench_case.run(lambda: igl.is_edge_manifold(faces_np))[0]) in (True, False)

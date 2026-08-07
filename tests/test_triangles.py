@@ -10,7 +10,7 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import faces_igl, trimesh_to_pymeshlab
+from tests.conversions import faces_igl, trimesh_to_open3d, trimesh_to_pymeshlab
 
 
 @pytest.mark.parity("face_normals_and_areas", "trimesh")
@@ -68,6 +68,25 @@ def test_face_normals_and_areas_against_the_partial_references(
     assert np.allclose(
         normals_wp.numpy(), crosses_pml / magnitudes_pml[:, None], rtol=1e-5, atol=1e-5
     )
+
+
+@pytest.mark.parity("face_normals_and_areas", "open3d")
+def test_face_normals_matches_open3d(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A on the normals half; the areas reduce to open3d's one total.
+
+    ``compute_triangle_normals`` returns *unit* normals, unlike MeshLab's raw cross product above,
+    so no transform is needed. The area half has no per-face open3d counterpart
+    (``get_surface_area`` is the total), so the sum is compared as its class-B reduction.
+    ``half_torus`` for the same varying-area reason as the partial-references test.
+    """
+    mesh_tm, mesh_wp = half_torus
+    normals_wp, areas_wp = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
+
+    mesh_o3d = trimesh_to_open3d(mesh_tm)
+    mesh_o3d.compute_triangle_normals()
+    assert np.allclose(normals_wp.numpy(), np.asarray(mesh_o3d.triangle_normals), atol=1e-5)
+    assert np.isclose(float(areas_wp.numpy().sum()), mesh_o3d.get_surface_area(), rtol=1e-5)
 
 
 def test_angles(half_torus: tuple[tm.Trimesh, wp.Mesh]):

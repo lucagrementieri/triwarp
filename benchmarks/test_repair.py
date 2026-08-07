@@ -320,7 +320,7 @@ def test_split_nonmanifold(bench_case: BenchCase, extra: int) -> None:
 
 
 @pytest.mark.benchmark(group="remove_unreferenced_vertices")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "open3d")
 @pytest.mark.parametrize("unreferenced", [0, 1], ids=["clean", "padded"])
 def test_remove_unreferenced_vertices(bench_case: BenchCase, unreferenced: int) -> None:
     """
@@ -338,11 +338,32 @@ def test_remove_unreferenced_vertices(bench_case: BenchCase, unreferenced: int) 
     inside the timing.
 
     ``bunny`` itself carries **1 113 unreferenced vertices** of 35 947, so the ``clean`` id is only
-    clean in the sense of "nothing added": both libraries really do drop those.
+    clean in the sense of "nothing added": all the libraries really do drop those.
+
+    open3d's ``remove_unreferenced_vertices`` mutates its mesh in place, so the legacy container is
+    rebuilt inside the timed callable (the ``test_repair.py`` rule) -- its row prices the pybind
+    ``Vector3dVector`` copy along with the compaction, which is what a caller holding NumPy buffers
+    pays. It agrees with triwarp element-wise on both compacted buffers
+    (``tests/test_repair.py::test_remove_unreferenced_matches_open3d``).
     """
     vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
     if unreferenced:
         vertices_np = np.ascontiguousarray(np.vstack([vertices_np, vertices_np]))
+    if bench_case.kind == "open3d":
+        skip_larger_than(bench_case, "bunny", "the container rebuild dominates past bunny")
+        import open3d as o3d
+
+        faces_i32 = np.ascontiguousarray(faces_np, dtype=np.int32)
+
+        def remove_unreferenced_o3d() -> int:
+            mesh_o3d = o3d.geometry.TriangleMesh(
+                o3d.utility.Vector3dVector(vertices_np), o3d.utility.Vector3iVector(faces_i32)
+            )
+            mesh_o3d.remove_unreferenced_vertices()
+            return len(mesh_o3d.vertices)
+
+        assert bench_case.run(remove_unreferenced_o3d) <= vertices_np.shape[0]
+        return
     if bench_case.kind == "igl":
         skip_larger_than(bench_case, "bunny", "the reference is a single-threaded scan and gather")
         faces_igl = np.ascontiguousarray(faces_np, dtype=np.int32)

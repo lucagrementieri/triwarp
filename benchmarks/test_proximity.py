@@ -179,7 +179,7 @@ def _distance_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
 
 
 @pytest.mark.benchmark(group="signed_distance_on_mesh")
-@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "igl", "open3d", "pymeshlab")
 @pytest.mark.parametrize("sign_mode", ["parity", "winding"])
 def test_signed_distance_on_mesh(
     bench_case: BenchCase, sign_mode: Literal["parity", "winding"]
@@ -194,11 +194,16 @@ def test_signed_distance_on_mesh(
     ``signed_distance_on_mesh`` constructs its own mesh (it takes vertex/face arrays, not a
     ``wp.Mesh``), so there is no way for a caller to hoist it.
 
-    **libigl is the only reference whose sign axis maps onto triwarp's**, which is why it appears
-    twice where pymeshlab appears once: ``SIGNED_DISTANCE_TYPE_PSEUDONORMAL`` against ``"parity"``
-    and ``SIGNED_DISTANCE_TYPE_FAST_WINDING_NUMBER`` against ``"winding"`` — the second is the same
-    Barnes-Hut family triwarp's mode is. Its AABB tree is built per call, as triwarp's ``wp.Mesh``
-    is, and it gets ``rounds=3`` like the pymeshlab row.
+    **libigl is the only reference whose sign axis maps onto both of triwarp's modes**, which is
+    why it appears twice where pymeshlab appears once: ``SIGNED_DISTANCE_TYPE_PSEUDONORMAL``
+    against ``"parity"`` and ``SIGNED_DISTANCE_TYPE_FAST_WINDING_NUMBER`` against ``"winding"`` —
+    the second is the same Barnes-Hut family triwarp's mode is. Its AABB tree is built per call, as
+    triwarp's ``wp.Mesh`` is, and it gets ``rounds=3`` like the pymeshlab row.
+
+    **open3d's row is Embree**: ``RaycastingScene.compute_signed_distance`` signs by ray parity, so
+    it pairs with ``"parity"`` only, and it shares triwarp's sign convention exactly (negative
+    inside; probed to 1.8e-7 agreement on an icosphere before the row landed). The scene build sits
+    inside the timed callable for the same no-hoisting reason triwarp's ``wp.Mesh`` build does.
 
     In-harness medians at 10 000 queries, igl rows run in isolation: **64 / 150 ms on
     ``bunny_decimated`` and 394 / 520 on ``bunny``** against triwarp's 6.3 / 6.6 and 4.3 / 4.0 — so
@@ -220,6 +225,24 @@ def test_signed_distance_on_mesh(
             lambda: igl.signed_distance(points_np, vertices_np, faces_np, sign_type), rounds=3
         )
         assert distance_igl.shape == (_N_QUERIES,)
+        return
+
+    if bench_case.kind == "open3d":
+        if sign_mode != "parity":
+            pytest.skip("Embree signs by ray parity, so it pairs with triwarp's parity mode only")
+        import open3d as o3d
+
+        vertices_f32 = np.ascontiguousarray(bench_case.vertices_np, dtype=np.float32)
+        faces_u32 = np.ascontiguousarray(bench_case.faces_np, dtype=np.uint32)
+        queries_t = o3d.core.Tensor(np.ascontiguousarray(_query_points_np(bench_case), np.float32))
+
+        def signed_distance_o3d() -> o3d.core.Tensor:
+            # The Embree BVH build goes inside, mirroring triwarp's own in-call wp.Mesh build.
+            scene = o3d.t.geometry.RaycastingScene()
+            scene.add_triangles(o3d.core.Tensor(vertices_f32), o3d.core.Tensor(faces_u32))
+            return scene.compute_signed_distance(queries_t)
+
+        assert bench_case.run(signed_distance_o3d).shape == (_N_QUERIES,)
         return
 
     if bench_case.kind == "pymeshlab":

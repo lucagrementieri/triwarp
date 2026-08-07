@@ -146,6 +146,19 @@ def open3d_to_trimesh(mesh_o3d: o3d.geometry.TriangleMesh) -> tm.Trimesh:
     )
 
 
+def trimesh_to_open3d_t(mesh: tm.Trimesh) -> o3d.t.geometry.TriangleMesh:
+    """
+    Wrap a ``tm.Trimesh`` in a tensor-API ``open3d.t.geometry.TriangleMesh``.
+
+    The result must be **bound to a name** by the caller before anything is chained off it:
+    ``o3d.t.geometry.TriangleMesh.from_legacy(x).fill_holes()`` lets the temporary be collected
+    mid-expression and the result reads freed memory -- garbage floats rather than an exception.
+    Routing every tensor-mesh construction through this helper keeps that binding explicit. For
+    ``RaycastingScene`` work, bind this result, then ``scene.add_triangles(mesh_t)``.
+    """
+    return o3d.t.geometry.TriangleMesh.from_legacy(trimesh_to_open3d(mesh))
+
+
 def faces_igl(mesh: tm.Trimesh) -> np.ndarray:
     """
     Faces as the ``(n_faces, 3)`` int64 array the libigl bindings expect.

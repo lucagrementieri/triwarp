@@ -262,7 +262,7 @@ def test_box(bench_lib: BenchLibrary) -> None:
 
 
 @pytest.mark.benchmark(group="platonic_solids")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "open3d", "pymeshlab")
 @pytest.mark.parametrize(
     ("builder", "filter_name", "n_faces"),
     [
@@ -279,12 +279,20 @@ def test_platonic_solids(
     Constant tables on every side, so this is ``box``'s fixed-cost probe once per solid.
 
     Coverage is uneven by necessity and the ``builder`` id says which library can answer: MeshLab
-    has all four, **igl and trimesh have only the icosahedron** (``igl.icosahedron`` is libigl's one
-    and only generator of this kind), so their rows skip the other three rather than substituting a
-    different solid.
+    has all four, open3d lacks only the dodecahedron, and **igl and trimesh have only the
+    icosahedron** (``igl.icosahedron`` is libigl's one and only generator of this kind), so each
+    row skips what its library cannot build rather than substituting a different solid.
     """
     if bench_lib.kind in {"igl", "trimesh"} and builder != "icosahedron":
         pytest.skip(f"neither igl nor trimesh has a {builder}")
+    if bench_lib.kind == "open3d":
+        if builder == "dodecahedron":
+            pytest.skip("open3d has no create_dodecahedron")
+        import open3d as o3d
+
+        mesh_o3d = bench_lib.run(getattr(o3d.geometry.TriangleMesh, filter_name))
+        assert len(mesh_o3d.triangles) == n_faces
+        return
     if bench_lib.kind == "igl":
         vertices_igl, faces_igl = bench_lib.run(igl.icosahedron)
         assert faces_igl.shape == (n_faces, 3)

@@ -697,19 +697,31 @@ both in one pass — so the `unshared` row is an upper bound rather than like-fo
   4.25 ms for the array form). Use the array forms. `igl.is_border_vertex` returns a Python
   `list[bool]` and has no array form, so its 3.4 ms is read as an upper bound.
 
-### open3d — two hazards in the tensor API
+### open3d — hazards, all found while writing parity asserts
 
-Both were found while writing the parity asserts, and both fail *silently* rather than raising:
+The first two fail *silently* rather than raising:
 
 - **A tensor mesh must be held in a name.** Chaining
   `o3d.t.geometry.TriangleMesh.from_legacy(x).fill_holes()` lets the temporary be collected, and the
   result's `vertex["positions"]` then reads freed memory — observed as 2052.1 and 4.4e-41 in the
-  leading rows. Bind the intermediate before calling the filter.
+  leading rows. Bind the intermediate before calling the filter
+  (`tests.conversions.trimesh_to_open3d_t` exists so the binding is structural).
 - **`fill_holes` winds its cap against the rest of the mesh.** A raw signed volume of its output is
   therefore meaningless: −1.06 on a hemisphere whose true sealed volume is 2.02. Run
   `trimesh.repair.fix_winding` (or triwarp's `make_winding_consistent`) before any volume or
   orientation read. Its cap triangulation is otherwise a valid `B − 2` fill over the existing
   vertices, matching triwarp's and MeshLab's counts exactly.
+- **k-NN distances come back squared**, from both the legacy `KDTreeFlann` and the batched
+  `o3d.core.nns` searches — take the square root before any `allclose`. And use `o3d.core.nns`
+  for anything batched: the legacy tree's only query is per-point Python (62 ms against 10 ms at
+  20 000 queries on a 36k cloud), while `nns.knn_search` matches `scipy.spatial.KDTree` indices
+  byte-for-byte on a tie-free cloud.
+- **`KDTreeFlann.search_radius_vector_3d` is exclusive at exactly `r`** (a point at distance
+  exactly 1.0 is not returned at radius 1.0) where triwarp's ball queries are inclusive. Random
+  clouds never tie, so only constructed fixtures can see the difference — construct accordingly.
+- **`get_volume` validates before it integrates**, and the validation is the full brute-force
+  `IsWatertight` composition: 13.8 s on a watertight 82k-face sphere whose divergence integral is
+  microseconds. Never put it inside a timed row that claims to measure volume.
 
 ### potpourri3d
 
@@ -770,22 +782,25 @@ millisecond.
 
 | module | open3d reference |
 |---|---|
-| `test_creation` | `create_box`, `create_sphere` (a UV sphere, so it pairs with `uv_sphere`), `create_cylinder`, `create_cone`, `create_torus` |
+| `test_creation` | `create_box`, `create_sphere` (a UV sphere, so it pairs with `uv_sphere`), `create_cylinder`, `create_cone`, `create_torus`, `create_tetrahedron` / `create_octahedron` / `create_icosahedron` (no dodecahedron) |
 | `test_registration` | `TransformationEstimationPointToPoint.compute_transformation`, `registration_icp` (point-to-point, point-to-plane, `TukeyLoss`) |
 | `test_reconstruction` | `create_from_point_cloud_ball_pivoting`, `create_from_point_cloud_poisson` |
 | `test_remesh` | `subdivide_midpoint` (`subdivide` only) |
-| `test_smoothing` | `filter_smooth_laplacian` (`novol` only) |
+| `test_smoothing` | `filter_smooth_laplacian` (`novol` only), `filter_smooth_taubin`, `filter_sharpen` — all three exempt (D2): the first two re-derive inverse-distance weights every pass, the third multiplies the residual by the vertex degree |
 | `test_sample` | `sample_points_poisson_disk` |
 | `test_combine` | `cluster_connected_triangles` + `select_by_index` (`split` only) |
 | `test_holes` | `open3d.t.geometry.TriangleMesh.fill_holes` |
-| `test_repair` | `remove_duplicated_triangles`, `remove_duplicated_vertices` |
-| `test_validation` | `is_watertight` |
+| `test_repair` | `remove_duplicated_triangles`, `remove_duplicated_vertices`, `remove_unreferenced_vertices` |
+| `test_validation` | `is_watertight`, `is_edge_manifold` (same `allow_boundary_edges` switch), `is_vertex_manifold` (connectivity-based: agrees with triwarp exactly on edge-manifold input, passes vertices on a non-manifold edge that the fan definition fails) |
 | `test_vertices` | `compute_vertex_normals` |
-| `test_bounds` | `get_axis_aligned_bounding_box` (`aabb_bounds` only) |
+| `test_bounds` | `get_axis_aligned_bounding_box` (`aabb_bounds`), `get_minimal_oriented_bounding_box` (hull-based, trimesh's algorithm family — not the PCA `get_oriented_bounding_box`, which minimizes nothing) |
 | `test_points` | `PointCloud.estimate_normals` (`KDTreeSearchParamKNN`) |
 | `test_distance` | `PointCloud.compute_point_cloud_distance` (the non-differentiable Chamfer / Hausdorff cases) |
 | `test_convex` | `compute_convex_hull` (exact qhull vs the approximate support sweep) |
 | `test_voxels` | `VoxelGrid.create_from_triangle_mesh_within_bounds`, `create_from_point_cloud`, `PointCloud.voxel_down_sample`, `check_if_included` — the same four answers, from a `std::unordered_map<Eigen::Vector3i>` on one core |
+| `test_neighbors` | `o3d.core.nns.NearestNeighborSearch.knn_search` / `fixed_radius_search` — the batched tensor queries, **not** the legacy `KDTreeFlann` per-query Python loop (62 ms against 10 ms at 20k queries) |
+| `test_proximity` | `o3d.t.geometry.RaycastingScene.compute_signed_distance` (Embree; parity-ray sign, same convention as triwarp's `"parity"` mode to 1.8e-7) |
+| `test_triangles` | `compute_triangle_normals` (unit normals, unlike MeshLab's raw cross product) |
 
 Modules with **no** open3d equivalent, and why, are documented in each module's docstring:
 `test_edges` (no general edge list), `test_boundary` (no loop ordering), `test_grouping` and
@@ -795,8 +810,12 @@ weights inline), `test_curvature` (no curvature estimation at all), `test_inters
 section), `test_texture` (stores UVs but has no bake or resample), `test_polyline` (`LineSet` is
 unordered segments with no length/resample/simplify), `test_heat_distance` (no geodesic distance),
 `test_selection` (no selection morphology), `test_mesh` (no caching container), `test_graph` (no
-traversal over an abstract CSR), `test_neighbors` (no batched k-NN query), plus the individual
-functions noted inline.
+traversal over an abstract CSR), plus the individual functions noted inline. Two rows were
+*rejected on measurement* rather than absence and carry the numbers in their module docstrings:
+`test_totals`' `get_volume` validates before it integrates (13.8 s of `IsWatertight` for a
+microsecond integral — it would re-time the watertightness row under another name), and
+`test_sample`'s `sample_points_uniformly` returns a bare cloud with no face index, so asserting it
+against the area law would transform the reference.
 
 Modules with no baseline from **any** reference are `test_texture`, `test_polyline`, `test_reduce`,
 `test_linalg` and `test_halfedge` (plus `stitch*` in `test_combine`, the morphology groups in

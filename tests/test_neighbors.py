@@ -13,6 +13,7 @@ from typing import Literal
 
 import igl
 import numpy as np
+import open3d as o3d
 import pytest
 import trimesh as tm
 import warp as wp
@@ -365,6 +366,102 @@ def test_query_nearest_matches_igl(device: str, backend: Literal["bvh", "hashgri
     query_indices_igl = igl.knn(queries, points, k, *igl.octree(points)[:4])
 
     assert np.array_equal(query_indices_wp.numpy().reshape(queries.shape[0], k), query_indices_igl)
+
+
+@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
+@pytest.mark.parametrize("k", [1, 7, 64])
+@pytest.mark.parity("query_bvh_nearest_k1", "open3d")
+@pytest.mark.parity("query_bvh_nearest_k7", "open3d")
+@pytest.mark.parity("query_bvh_nearest_k64", "open3d")
+def test_query_nearest_matches_open3d(
+    device: str, backend: Literal["bvh", "hashgrid"], k: int
+) -> None:
+    """
+    Class A, against the third exact k-NN: ``o3d.core.nns.NearestNeighborSearch.knn_search``.
+
+    Open3D's batched tensor search (not the legacy ``KDTreeFlann`` per-query loop) returns
+    ``(n_queries, k)`` indices sorted by distance in ``KDTree``'s layout, plus **squared**
+    distances -- the square root is the named transform that makes the distance half class B on
+    its own; the index half needs none. The cloud is random in a box, so no two points tie in
+    ``float32`` distance from a query and the index comparison is exact.
+    """
+    rng = np.random.default_rng(11)
+    points = rng.random((300, 3)) * 5.0
+    queries = rng.random((40, 3)) * 5.0
+
+    points_wp = wp.array(
+        np.ascontiguousarray(points, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    queries_wp = wp.array(
+        np.ascontiguousarray(queries, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    query_nearest = (
+        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
+    )
+    query_indices_wp, query_distances_wp = query_nearest(points_wp, queries_wp, k=k)
+
+    nns_o3d = o3d.core.nns.NearestNeighborSearch(o3d.core.Tensor(points))
+    assert nns_o3d.knn_index()
+    indices_o3d, squared_o3d = nns_o3d.knn_search(o3d.core.Tensor(queries), k)
+
+    assert np.array_equal(
+        query_indices_wp.numpy().reshape(queries.shape[0], k), indices_o3d.numpy()
+    )
+    assert np.allclose(
+        query_distances_wp.numpy().reshape(queries.shape[0], k),
+        np.sqrt(squared_o3d.numpy()),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
+@pytest.mark.parity("query_bvh_ball", "open3d")
+def test_query_ball_matches_open3d(device: str, backend: Literal["bvh", "hashgrid"]) -> None:
+    """
+    Class A on the neighbour sets: ``fixed_radius_search`` against the ``*_with_offsets`` form.
+
+    Open3D returns the same CSR-like ``(indices, distances, offsets)`` triple triwarp's offsets
+    form does, with squared distances. Per-query neighbour *sets* are compared (order within a
+    radius query is not part of either contract), and the counts vector is compared exactly. The
+    cloud is random, so no point sits at exactly the radius and the two libraries' boundary rules
+    (Open3D's radius searches are exclusive at exactly ``r``; triwarp's inclusive) cannot differ.
+    """
+    rng = np.random.default_rng(3)
+    points = rng.random((400, 3)) * 3.0
+    queries = rng.random((60, 3)) * 3.0
+    radius = 0.4
+
+    points_wp = wp.array(
+        np.ascontiguousarray(points, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    queries_wp = wp.array(
+        np.ascontiguousarray(queries, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    query_ball_with_offsets = (
+        tw.neighbors.query_bvh_ball_with_offsets
+        if backend == "bvh"
+        else tw.neighbors.query_hashgrid_ball_with_offsets
+    )
+    neighbors_wp, _distances_wp, offsets_wp = query_ball_with_offsets(points_wp, queries_wp, radius)
+
+    nns_o3d = o3d.core.nns.NearestNeighborSearch(o3d.core.Tensor(points))
+    assert nns_o3d.fixed_radius_index(radius)
+    indices_o3d, _squared_o3d, offsets_o3d = nns_o3d.fixed_radius_search(
+        o3d.core.Tensor(queries), radius
+    )
+    indices_o3d = indices_o3d.numpy()
+    offsets_o3d = offsets_o3d.numpy()
+
+    neighbors_np = neighbors_wp.numpy()
+    starts_np = offsets_wp.numpy()  # per-query slice starts; the last slice ends at the total
+    ends_np = np.concatenate([starts_np[1:], [neighbors_np.shape[0]]])
+    assert np.array_equal(ends_np - starts_np, np.diff(offsets_o3d))
+    for query_index in range(queries.shape[0]):
+        set_wp = set(neighbors_np[starts_np[query_index] : ends_np[query_index]])
+        set_o3d = set(indices_o3d[offsets_o3d[query_index] : offsets_o3d[query_index + 1]])
+        assert set_wp == set_o3d
+    assert neighbors_np.shape[0] > 0  # non-vacuous: the radius actually finds neighbours
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])

@@ -253,22 +253,37 @@ def test_filter_laplacian_integration(bench_case: BenchCase, implicit: bool) -> 
     assert result.shape == vertices.shape
 
 
+@pytest.mark.noparity(
+    "open3d",
+    oracle="trimesh",
+    reason="D2 the filter_mut_dif_laplacian finding again, on Taubin's scheme: "
+    "filter_smooth_taubin alternates lambda/mu passes toward the inverse-distance-weighted 1-ring "
+    "mean and re-derives those weights from the current positions every pass, while triwarp holds "
+    "one assembled operator fixed. Probed before the row landed: the closest mapping (one o3d "
+    "iteration against triwarp's lamb=0.5, nu=0.53, iterations=2 under the inverse-distance "
+    "operator) still deviates 3.5e-3 max-coordinate on an icosphere(3) carrying 0.01 noise, and "
+    "8.8e-3 under the uniform operator -- 350x past tolerance. Like MeshLab, its iteration count "
+    "is in lambda-mu PAIRS. trimesh is the oracle for this group, in "
+    "tests/test_smoothing.py::test_filter_taubin.",
+)
 @pytest.mark.benchmark(group="filter_taubin")
-@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
 def test_filter_taubin(bench_case: BenchCase) -> None:
     """
     The lambda-nu alternation: two SpMVs per iteration instead of one.
 
     Against ``filter_laplacian_integration``'s explicit row this measures exactly the second pass,
-    so the two rows should sit at a ratio near 2 and nothing else should separate them. All three
-    libraries implement Taubin's 1995 scheme; MeshLab's inflating step is ``mu=-0.53`` against
-    triwarp's and trimesh's ``nu=0.53``, which changes the fixed point but not the work per pass.
+    so the two rows should sit at a ratio near 2 and nothing else should separate them. All four
+    libraries implement Taubin's 1995 scheme; MeshLab's and open3d's inflating step is ``mu=-0.53``
+    against triwarp's and trimesh's ``nu=0.53``, which changes the fixed point but not the work per
+    pass.
 
-    **MeshLab's ``stepsmoothnum`` counts lambda-mu pairs, not half-steps**, where triwarp and
-    trimesh do one half-step per ``iterations`` and alternate. So it gets ``_ITERATIONS // 2``:
-    passing ``_ITERATIONS`` to both, as this row originally did, timed MeshLab doing twice the
-    passes. The mapping is pinned exactly (5e-08) in
-    ``tests/test_smoothing.py::test_filter_taubin_matches_pymeshlab``.
+    **MeshLab's ``stepsmoothnum`` and open3d's ``number_of_iterations`` count lambda-mu pairs, not
+    half-steps**, where triwarp and trimesh do one half-step per ``iterations`` and alternate. So
+    both get ``_ITERATIONS // 2``: passing ``_ITERATIONS`` to both, as this row originally did for
+    MeshLab, timed twice the passes. The MeshLab mapping is pinned exactly (5e-08) in
+    ``tests/test_smoothing.py::test_filter_taubin_matches_pymeshlab``; open3d's cannot be (see the
+    exemption above).
     """
     skip_larger_than(bench_case, "dragon")
     if bench_case.kind == "triwarp":
@@ -280,6 +295,15 @@ def test_filter_taubin(bench_case: BenchCase) -> None:
             )
         )
         assert result.shape == vertices.shape
+    elif bench_case.kind == "open3d":
+        _skip_pml_beyond_bunny(bench_case)
+        mesh_o3d = bench_case.mesh_o3d
+        smoothed_o3d = bench_case.run(
+            lambda: mesh_o3d.filter_smooth_taubin(
+                number_of_iterations=_ITERATIONS // 2, lambda_filter=0.5, mu=-0.53
+            )
+        )
+        assert len(smoothed_o3d.vertices) == bench_case.n_vertices
     elif bench_case.kind == "pymeshlab":
         _skip_pml_beyond_bunny(bench_case)
         bench_case.run(
@@ -561,11 +585,32 @@ def test_filter_two_step(bench_case: BenchCase) -> None:
     assert smoothed.shape == (n_vertices,)
 
 
+@pytest.mark.noparity(
+    "open3d",
+    oracle="pymeshlab",
+    reason="D2 a per-vertex factor no parameter can absorb: open3d's filter_sharpen adds "
+    "strength * (deg(v) * v - sum of neighbours), the UNNORMALIZED uniform residual, where "
+    "triwarp's unsharp mask adds weight * (v - mean of neighbours) through a row-stochastic "
+    "operator. Probed before the row landed: the per-vertex displacement ratio o3d/triwarp equals "
+    "the vertex degree to 7 significant digits (4.99977-6.00074 on icosphere(3), correlation with "
+    "degree 0.9999993), so the two agree only on degree-regular meshes and no strength mapping "
+    "fixes an irregular one. pymeshlab is the oracle for this group, in "
+    "tests/test_smoothing.py::test_filter_sharpen_matches_pymeshlab.",
+)
 @pytest.mark.benchmark(group="filter_sharpen")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab")
 def test_filter_sharpen(bench_case: BenchCase) -> None:
     """Five Laplacian passes plus one blend: the cheapest thing in the module, on the scan sweep."""
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "open3d":
+        _skip_pml_beyond_bunny(bench_case)
+        mesh_o3d = bench_case.mesh_o3d
+        # Small strength: the degree factor in its update amplifies noise fast (see the exemption).
+        sharpened_o3d = bench_case.run(
+            lambda: mesh_o3d.filter_sharpen(number_of_iterations=5, strength=0.05)
+        )
+        assert len(sharpened_o3d.vertices) == n_vertices
+        return
     if bench_case.kind == "pymeshlab":
         _skip_pml_beyond_bunny(bench_case)
         new_meshset_pml = bench_case.new_meshset_pml
