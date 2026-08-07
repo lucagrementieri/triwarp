@@ -255,6 +255,9 @@ def test_oriented_bounding_box_matches_igl(
 
     Both sides are scored by ``_achieved_loss`` from the matrix they return, not by trusting the
     number each reports, so a library that returned a good loss with the wrong frame would fail.
+
+    ``refine_iterations=0``: igl has no refinement, and the identical-candidate-set argument is
+    only about the sampled phase -- refined, triwarp is strictly better than this comparison.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     points_np, points_wp = _tilted_cloud(mesh_tm, mesh_wp.device)
@@ -264,7 +267,9 @@ def test_oriented_bounding_box_matches_igl(
         "diagonal": igl.ORIENTED_BOUNDING_BOX_MINIMIZE_DIAGONAL_LENGTH,
     }[objective]
 
-    rotation_wp, lower_wp, upper_wp = tw.bounds.oriented_bounding_box(points_wp, 512, objective)
+    rotation_wp, lower_wp, upper_wp = tw.bounds.oriented_bounding_box(
+        points_wp, 512, objective, refine_iterations=0
+    )
 
     # igl applies its matrix on the right of a row vector, so its frame is triwarp's transposed.
     frame_igl = igl.oriented_bounding_box(points_np, 512, igl_objective).T
@@ -305,7 +310,7 @@ def test_oriented_bounding_box_frame_matches_igl_transposed(
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     points_np, points_wp = _tilted_cloud(mesh_tm, mesh_wp.device)
 
-    rotation_wp, _, _ = tw.bounds.oriented_bounding_box(points_wp, 512)
+    rotation_wp, _, _ = tw.bounds.oriented_bounding_box(points_wp, 512, refine_iterations=0)
 
     frame_np = _frame_np(rotation_wp)
     assert np.allclose(frame_np, igl.oriented_bounding_box(points_np, 512).T, atol=1e-5)
@@ -328,20 +333,21 @@ def test_oriented_bounding_box_agrees_with_trimesh_hull_search(
     face, and different orientations can realise the same volume.
 
     **Neither side bounds the other, and that was measured rather than assumed.** trimesh's answer
-    reads like an exact minimum and is not one: on the stretched icosahedron triwarp returns **1.2%
-    less** volume here, and locally refining triwarp's frame reaches 2.1% below trimesh, so the
-    hull-face restriction can miss the optimum. Hence a two-sided band rather than an inequality.
+    reads like an exact minimum and is not one: with refinement triwarp returns **3.4% less**
+    volume on the tilted half torus and 2.1% less on the icosahedron, so the hull-face restriction
+    can miss the optimum. Hence a two-sided band rather than an inequality.
 
     The bug class it excludes is a search that does not search -- a mis-scored objective, candidates
     that fail to cover ``SO(3)``, or a frame paired with extents it did not produce -- all of which
     leave the volume far above a real minimum.
 
-    Margins, measured at 32 768 candidates across the four fixtures: the excess runs from -1.5%
-    (half_torus) through -1.2% (icosahedron) and +0.8% (hemisphere) to +5.2% (cave_cube, the cube
-    whose single exact orientation sampling cannot land on), so the ``[0.95, 1.20]`` band clears the
-    worst reading by 3.9x above and 3.3x below. Mutation probe: re-running at ``rotations=1``, i.e.
-    the axis-aligned box, which is what a search that silently scored nothing would return, gives
-    +75% to +437% and breaks the ceiling by 3.7x to 22x on every fixture.
+    Margins, measured refined at 32 768 candidates across the four fixtures: ``volume_wp /
+    volume_tm`` runs from 0.966 (half_torus) through 0.979 (icosahedron) and 1.0001 (hemisphere) to
+    1.0005 (cave_cube -- refinement recovers the cube's exact orientation to 0.05%, the case that
+    used to read +5.2%), so the ``[0.88, 1.02]`` band clears the worst reading by 3.5x below and
+    40x above. Mutation probe: the axis-aligned box (``rotations=1, refine_iterations=0``, what a
+    search that silently scored nothing would return) reads 1.58x to 5.37x trimesh's volume and
+    breaks the 1.02 ceiling on every fixture.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     points_np, points_wp = _tilted_cloud(mesh_tm, mesh_wp.device)
@@ -353,7 +359,7 @@ def test_oriented_bounding_box_agrees_with_trimesh_hull_search(
     volume_tm = float(np.prod(extents_tm))
     assert volume_tm > 0.0, "the reference produced a box before it is compared to"
 
-    assert volume_tm * 0.95 <= volume_wp <= volume_tm * 1.20
+    assert volume_tm * 0.88 <= volume_wp <= volume_tm * 1.02
     # The reported extents are the box the reported frame achieves, so the volume above is the
     # quantity that was minimized and not an unrelated pair of numbers.
     assert np.isclose(
@@ -375,13 +381,14 @@ def test_oriented_bounding_box_agrees_with_open3d_minimal_box(
     12.9% above triwarp on the tilted half_torus, and *exact* on cave_cube where axis-snapping is
     what PCA happens to do), so a band around it would be a band around an unrelated quantity.
 
-    Neither side bounds the other, measured on these four tilted fixtures before the test was
-    written: ``volume_wp / volume_o3d`` runs 0.988 (icosahedron) through 1.004 (hemisphere) and
-    1.019 (half_torus) to 1.052 (cave_cube -- the exact cube orientation sampling cannot land on,
-    the same worst case the trimesh band carries). The ``[0.90, 1.20]`` band clears the worst
-    reading by 3.8x above and 8.3x below. Mutation probe: the axis-aligned box (``rotations=1``,
-    what a search that scored nothing returns) reads 1.58-5.37x open3d's minimal volume on the
-    same fixtures, breaking the 1.20 ceiling on every one.
+    Neither side bounds the other, measured refined on these four tilted fixtures:
+    ``volume_wp / volume_o3d`` runs 0.979 (icosahedron) through 1.0000 (half_torus and hemisphere,
+    ties to 4 digits) to 1.0005 (cave_cube -- refinement recovers the cube's exact orientation to
+    0.05%; sampled alone this fixture read +5.2%). The ``[0.90, 1.02]`` band clears the worst
+    reading by 4.7x below and 40x above. Mutation probe: the axis-aligned box
+    (``rotations=1, refine_iterations=0``, what a search that scored nothing returns) reads
+    1.58-5.37x open3d's minimal volume on the same fixtures, breaking the 1.02 ceiling on every
+    one.
 
     The bug class excluded is the trimesh test's: a search that does not search, candidates that
     miss ``SO(3)``, or extents decoupled from the reported frame.
@@ -396,7 +403,7 @@ def test_oriented_bounding_box_agrees_with_open3d_minimal_box(
     volume_o3d = cloud_o3d.get_minimal_oriented_bounding_box().volume()
     assert volume_o3d > 0.0, "the reference produced a box before it is compared to"
 
-    assert volume_o3d * 0.90 <= volume_wp <= volume_o3d * 1.20
+    assert volume_o3d * 0.90 <= volume_wp <= volume_o3d * 1.02
     assert np.isclose(
         volume_wp, _achieved_loss(points_np, _frame_np(rotation_wp), "volume"), rtol=1e-5
     )
@@ -410,10 +417,13 @@ def test_oriented_bounding_box_single_rotation_is_the_aabb(
 
     The identity is deliberately the *last* candidate rather than the first, which is what makes
     this an edge case worth pinning: an off-by-one in the spiral's ``n - 1`` split would drop it and
-    return some arbitrary orientation here.
+    return some arbitrary orientation here. ``refine_iterations=0``, because refinement exists to
+    *improve* on the sampled answer -- refined ``rotations=1`` legitimately beats the AABB.
     """
     _, mesh_wp = icosahedron
-    rotation_wp, lower_wp, upper_wp = tw.bounds.oriented_bounding_box(mesh_wp.points, 1)
+    rotation_wp, lower_wp, upper_wp = tw.bounds.oriented_bounding_box(
+        mesh_wp.points, 1, refine_iterations=0
+    )
 
     assert np.array_equal(_frame_np(rotation_wp), np.eye(3))
     assert np.array_equal(
@@ -430,14 +440,24 @@ def test_oriented_bounding_box_never_loses_to_the_aabb(
     Adding candidates can only lower the minimum, and every count contains the axis-aligned box, so
     the volume sequence must be non-increasing and never above the AABB's. That is a property of the
     candidate construction rather than of any one answer, and it is what lets a caller raise
-    ``rotations`` without checking the result got better.
+    ``rotations`` without checking the result got better. ``refine_iterations=0`` for the sequence:
+    refinement converges to whichever basin each count's winner lands in, so *refined* volumes are
+    not monotone in ``rotations`` -- the refined guarantee is the separate one pinned in
+    [`test_oriented_bounding_box_refinement_is_monotone`][tests.test_bounds.test_oriented_bounding_box_refinement_is_monotone].
     """
     mesh_tm, mesh_wp = half_torus
     _, points_wp = _tilted_cloud(mesh_tm, mesh_wp.device)
 
     volumes = [
         float(
-            np.prod(np.ptp(_bounds_np(*tw.bounds.oriented_bounding_box(points_wp, n)[1:]), axis=0))
+            np.prod(
+                np.ptp(
+                    _bounds_np(
+                        *tw.bounds.oriented_bounding_box(points_wp, n, refine_iterations=0)[1:]
+                    ),
+                    axis=0,
+                )
+            )
         )
         for n in (1, 16, 256, 4096)
     ]
@@ -447,6 +467,39 @@ def test_oriented_bounding_box_never_loses_to_the_aabb(
     assert np.isclose(
         volumes[0], float(np.prod(np.ptp(_bounds_np(*tw.bounds.aabb_bounds(points_wp)), axis=0)))
     )
+
+
+@pytest.mark.parametrize("mesh_name", _MESHES)
+def test_oriented_bounding_box_refinement_is_monotone(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Refinement never loses to sampling, and the refined default ties or beats the sampled 32k box.
+
+    The monotonicity is by construction -- every round's candidate ball includes the identity
+    perturbation, so each chain re-scores its own base -- but the construction is exactly the kind
+    of thing a refactor breaks silently, so it is pinned per fixture. The second assert is the
+    reason the refinement exists: eight rounds on top of the *default* 4 096 candidates reach at
+    least the quality of an unrefined 32 768-candidate search (measured: strictly better on every
+    fixture here, from 0.3% on the icosahedron to 4.9% on the cube shell).
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    points_np, points_wp = _tilted_cloud(mesh_tm, mesh_wp.device)
+
+    def volume(rotations: int, refine_iterations: int) -> float:
+        rotation_wp, lower_wp, upper_wp = tw.bounds.oriented_bounding_box(
+            points_wp, rotations, refine_iterations=refine_iterations
+        )
+        volume_box = float(np.prod(np.ptp(_bounds_np(lower_wp, upper_wp), axis=0)))
+        assert np.isclose(
+            volume_box, _achieved_loss(points_np, _frame_np(rotation_wp), "volume"), rtol=1e-5
+        )
+        return volume_box
+
+    sampled = volume(4096, 0)
+    refined = volume(4096, 8)
+    assert refined <= sampled * (1.0 + 1e-6)
+    assert refined <= volume(32768, 0) * (1.0 + 1e-6)
 
 
 def test_oriented_bounding_box_empty_cloud(device: str) -> None:
@@ -460,7 +513,7 @@ def test_oriented_bounding_box_empty_cloud(device: str) -> None:
 
 
 def test_oriented_bounding_box_rejects_bad_arguments(device: str) -> None:
-    """Both documented ``ValueError``s are reachable, and neither is raised for a valid call."""
+    """All three documented ``ValueError``s are reachable, and none is raised for a valid call."""
     points_wp = wp.array(
         np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]], dtype=np.float32), dtype=wp.vec3, device=device
     )
@@ -468,3 +521,5 @@ def test_oriented_bounding_box_rejects_bad_arguments(device: str) -> None:
         tw.bounds.oriented_bounding_box(points_wp, 0)
     with pytest.raises(ValueError, match="objective must be"):
         tw.bounds.oriented_bounding_box(points_wp, 8, "perimeter")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="refine_iterations must be >= 0"):
+        tw.bounds.oriented_bounding_box(points_wp, 8, refine_iterations=-1)

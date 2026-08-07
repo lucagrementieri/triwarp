@@ -33,14 +33,17 @@ upper bounds, and read the ``aabb_diagonal`` pair as what a caller pays *with* a
 already in hand: triwarp's row includes its own ``aabb_bounds`` call for exactly that reason, since
 there is no other way to produce the number.
 
-For the **oriented** box, both references answer it a different way and the rows say which:
-``igl.oriented_bounding_box`` searches the *same* candidate set triwarp does (Super-Fibonacci over
-``SO(3)``, identity appended) so it is a like-for-like comparison at an identical ``rotations``,
-while ``trimesh.bounds.oriented_bounds`` is a different algorithm -- convex hull, then the minimal
-box flush with each hull face -- so its row prices a hull triwarp never builds and its cost does not
-scale with the candidate count at all. Read the trimesh row as the cost of the *other* approach
-rather than as the same work done slower: on ``bunny`` it is the *slower* of the two references
-(98.4 ms against igl's 60.6 at 4 096 candidates, triwarp 0.61) even though the hull collapses 35 947
+For the **oriented** box, the references answer it a different way and the rows say which:
+``igl.oriented_bounding_box`` searches the *same* global candidate set triwarp's first phase does
+(Super-Fibonacci over ``SO(3)``, identity appended) but has no refinement phase, so triwarp's row
+carries ~3-5 ms of trust-region rounds igl's does not -- rounds that buy the quality the
+``tests/test_bounds.py`` bands pin (the sampled-only phase is reachable with
+``refine_iterations=0`` and measured 0.45 ms on a 36k cloud back to back against 3.3-5.8 refined).
+``trimesh.bounds.oriented_bounds`` and open3d's ``get_minimal_oriented_bounding_box`` are the
+*other* algorithm family -- convex hull, then the minimal box flush with each hull face -- so their
+rows price a hull triwarp never builds and their cost does not scale with the candidate count at
+all. Read them as the cost of that approach rather than as the same work done slower: on ``bunny``
+trimesh reads 98.4 ms against igl's 60.6 at 4 096 candidates, even though the hull collapses 35 947
 points to 1 564, because the caliper search then runs over all 3 124 hull faces serially.
 
 One measured warning about igl's row, in the spirit of the ``igl.octree`` finding in
@@ -176,12 +179,14 @@ def test_enclosing_diagonal(bench_case: BenchCase) -> None:
 @pytest.mark.benchlibs("triwarp", "igl", "trimesh", "open3d")
 def test_oriented_bounding_box(bench_case: BenchCase) -> None:
     """
-    The sampled minimum-volume box: ``_ROTATIONS`` candidate frames, each scored by an extent.
+    The sampled-plus-refined minimum-volume box: ``_ROTATIONS`` global frames, then eight rounds.
 
-    Cost is ``rotations * n_vertices`` point transforms, so this is the one group here whose work is
-    not a single pass over the vertices -- at ``_ROTATIONS`` it is 4 096 of them. triwarp scores
-    every candidate in parallel and finishes the objective and the ``argmin`` on the host over a
-    ``(rotations, 6)`` table; igl walks the same candidates over a CPU ``parallel_for``.
+    Cost is ``rotations * n_vertices`` point transforms for the global phase plus eight 512-frame
+    refinement rounds whose cost is almost entirely host-device latency (~0.4-0.7 ms per round;
+    measured back to back on a 36k cloud, 0.45 ms sampled against 3.3-5.8 ms refined). The row
+    times the *default*, refinement included, because that is what a caller gets -- and what the
+    quality bands in ``tests/test_bounds.py`` are measured against; igl walks the same global
+    candidates over a CPU ``parallel_for`` with no refinement phase.
 
     The CPU references run into hundreds of milliseconds on ``bunny`` and take ``rounds=3`` for it,
     the same allowance the other second-scale rows in the suite use.
