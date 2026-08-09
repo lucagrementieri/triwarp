@@ -148,7 +148,7 @@ def filter_laplacian(
         if laplacian_operator is not None
         else laplacian.laplacian(vertices, faces)
     )
-    positions = tw.array._as_vec3d(vertices)
+    positions = _as_vec3d(vertices)
     vol_ini = _mesh_volume(positions, faces) if volume_constraint else 0.0
 
     if implicit_time_integration:
@@ -187,7 +187,7 @@ def filter_laplacian(
             if volume_constraint:
                 _apply_volume_constraint(positions, faces, vol_ini)
 
-    return tw.array._as_vec3(positions)
+    return _as_vec3(positions)
 
 
 def filter_humphrey(
@@ -244,7 +244,7 @@ def filter_humphrey(
         if laplacian_operator is not None
         else laplacian.laplacian(vertices, faces)
     )
-    positions = tw.array._as_vec3d(vertices)
+    positions = _as_vec3d(vertices)
     original = wp.empty(n, dtype=wp.vec3d, device=device)
     wp.copy(original, positions)
 
@@ -276,7 +276,7 @@ def filter_humphrey(
         wp.launch(update, dim=n, inputs=[lv, b, lb, beta64], outputs=[nxt], device=device)
         positions, nxt = nxt, positions
 
-    return tw.array._as_vec3(positions)
+    return _as_vec3(positions)
 
 
 def filter_taubin(
@@ -332,7 +332,7 @@ def filter_taubin(
         if laplacian_operator is not None
         else laplacian.laplacian(vertices, faces)
     )
-    positions = tw.array._as_vec3d(vertices)
+    positions = _as_vec3d(vertices)
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
     step = wp.map(
@@ -351,7 +351,7 @@ def filter_taubin(
         )
         positions, nxt = nxt, positions
 
-    return tw.array._as_vec3(positions)
+    return _as_vec3(positions)
 
 
 def filter_neighborhood_average(
@@ -408,7 +408,7 @@ def filter_neighborhood_average(
         if laplacian_operator is not None
         else laplacian.laplacian(vertices, faces, symmetric=True)
     )
-    positions = tw.array._as_vec3d(vertices)
+    positions = _as_vec3d(vertices)
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
     # CSR row bounds as aligned per-vertex inputs: degree(i) = offsets[i + 1] - offsets[i].
@@ -428,7 +428,7 @@ def filter_neighborhood_average(
         wp.launch(step, dim=n, inputs=[positions, lv, starts, ends], outputs=[nxt], device=device)
         positions, nxt = nxt, positions
 
-    return tw.array._as_vec3(positions)
+    return _as_vec3(positions)
 
 
 def filter_mut_dif_laplacian(
@@ -494,7 +494,7 @@ def filter_mut_dif_laplacian(
         if laplacian_operator is not None
         else laplacian.laplacian(vertices, faces)
     )
-    positions = tw.array._as_vec3d(vertices)
+    positions = _as_vec3d(vertices)
 
     # Vertex normals and eps are computed once from the input mesh and reused every pass, matching
     # the trimesh reference (which reads normals off the un-mutated mesh inside its loop).
@@ -557,7 +557,7 @@ def filter_mut_dif_laplacian(
                 out=positions,
             )
 
-    return tw.array._as_vec3(positions)
+    return _as_vec3(positions)
 
 
 def filter_implicit_fairing(
@@ -625,7 +625,7 @@ def filter_implicit_fairing(
         return out
 
     require_cuda(device, "filter_implicit_fairing")
-    positions = tw.array._as_vec3d(vertices)
+    positions = _as_vec3d(vertices)
     components = _empty_components(n, device)
     rhs = _empty_components(n, device)
     solutions = _empty_components(n, device)
@@ -636,7 +636,7 @@ def filter_implicit_fairing(
     dirichlet = _dirichlet_state(vertices, faces, positions, n, device) if pin_boundary else None
 
     for _ in range(iterations):
-        current = tw.array._as_vec3(positions)
+        current = _as_vec3(positions)
         # Rebuilt every iteration on purpose: the cotangent weights depend on ``current``, which
         # the fairing step moves, so implicit fairing must re-linearise on the moving surface.
         cot_entries = laplacian.cotmatrix_entries(current, faces)
@@ -707,7 +707,7 @@ def filter_implicit_fairing(
             device=device,
         )
 
-    return tw.array._as_vec3(positions)
+    return _as_vec3(positions)
 
 
 class _Dirichlet(NamedTuple):
@@ -1588,4 +1588,23 @@ def filter_sharpen(
         wp.float32(weight_original),
         out=out,
     )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Private cross-cutting helpers
+# ---------------------------------------------------------------------------
+
+
+def _as_vec3d(vertices: wp.array[wp.vec3]) -> wp.array[wp.vec3d]:
+    """Widen a ``wp.vec3`` array to ``wp.vec3d``: the seam where the float64 solves start."""
+    out = wp.empty(int(vertices.shape[0]), dtype=wp.vec3d, device=vertices.device)
+    wp.utils.array_cast(vertices, out)
+    return out
+
+
+def _as_vec3(positions: wp.array[wp.vec3d]) -> wp.array[wp.vec3]:
+    """Narrow a ``wp.vec3d`` array back to ``wp.vec3``: the seam where the float64 solves end."""
+    out = wp.empty(int(positions.shape[0]), dtype=wp.vec3, device=positions.device)
+    wp.utils.array_cast(positions, out)
     return out

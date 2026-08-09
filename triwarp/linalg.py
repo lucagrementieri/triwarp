@@ -278,9 +278,9 @@ def assemble_interior_system(
         inputs=[q.offsets, q.columns, q.values, fixed_mask, free_map, fixed_values, counts, rhs],
         device=device,
     )
-    # The sentinel form *is* the CSR offsets array, and the one host read it costs (~0.1 ms) is what
-    # sizes ``columns`` / ``values`` for their final use at allocation time.
-    row_offsets, nnz_uu = tw.array.counts_to_offsets(counts, sentinel=True)
+    # The total-terminated form *is* the CSR offsets array, and the one host read it costs
+    # (~0.1 ms) is what sizes ``columns`` / ``values`` for their final use at allocation time.
+    row_offsets, nnz_uu = tw.array.counts_to_offsets(counts, include_total=True)
     columns = wp.empty(nnz_uu, dtype=wp.int32, device=device)
     values = wp.empty(nnz_uu, dtype=wp.float64, device=device)
     wp.launch(

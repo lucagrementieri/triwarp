@@ -9,8 +9,6 @@ returns the original row indices of edges occurring exactly once.
 
 from __future__ import annotations
 
-import math
-
 import warp as wp
 
 import triwarp as tw
@@ -119,8 +117,8 @@ def boundary_loops(
     ``igl::boundary_loop`` (`reference/libigl/include/igl/boundary_loop.cpp`, first overload).
 
     All loops are found in one batched pass
-    ([`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched]); this is the slicing
-    wrapper over it.
+    ([`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched]); this is
+    [`split`][triwarp.array.split] over its packed result.
 
     !!! note "The returned arrays are views"
         Each loop slices the single packed buffer ``boundary_loops_batched`` produced, which costs
@@ -165,10 +163,7 @@ def boundary_loops(
     ``igl.boundary_loop_all``
     """
     flat_loops, offsets, _loop_sizes = boundary_loops_batched(vertices, faces, edges_sorted, edges)
-    bounds = _loop_bounds(flat_loops, offsets)
-    return [
-        wp.clone(flat_loops[begin:end]) if copy else flat_loops[begin:end] for begin, end in bounds
-    ]
+    return tw.array.split(flat_loops, offsets, copy=copy)
 
 
 def boundary_loops_batched(
@@ -184,7 +179,9 @@ def boundary_loops_batched(
     [`boundary_loops`][triwarp.boundary.boundary_loops] — but with no per-loop Python and no
     per-loop allocation, which is the only form whose cost is independent of the loop *count*.
     Prefer it when a mesh has many small holes or when the loops feed straight into another
-    batched kernel, as [`triwarp.holes`][triwarp.holes] does.
+    batched kernel, as [`triwarp.holes`][triwarp.holes] does. The loop ordering itself is the
+    general successor-graph machinery of [`successor_cycles`][triwarp.graph.successor_cycles];
+    this function contributes the boundary-edge detection.
 
     Parameters
     ----------
@@ -207,7 +204,7 @@ def boundary_loops_batched(
         Concatenated ordered vertex indices of every loop, on ``faces.device``.
     offsets
         Length-``n_loops`` exclusive prefix sum of the loop sizes: loop ``i`` occupies
-        ``flat_loops[offsets[i] : offsets[i] + loop_sizes[i]]``. Not a trailing-sentinel CSR
+        ``flat_loops[offsets[i] : offsets[i] + loop_sizes[i]]``. Not a total-terminated CSR
         array — the last loop ends at ``flat_loops.shape[0]``.
     loop_sizes
         Length-``n_loops`` vertex count per loop.
@@ -216,11 +213,13 @@ def boundary_loops_batched(
     --------
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     [`boundary_loop`][triwarp.boundary.boundary_loop]
+    [`successor_cycles`][triwarp.graph.successor_cycles]
     """
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
     if n_faces == 0:
-        return _no_loops(device)
+        # Three *distinct* empty allocations, so callers may write into them independently.
+        return tuple(wp.empty(0, dtype=wp.int32, device=device) for _ in range(3))
 
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
@@ -229,92 +228,16 @@ def boundary_loops_batched(
     rows = _boundary_rows(vertices, edges_sorted)
     n_boundary_edges = int(rows.shape[0])
     if n_boundary_edges == 0:
-        return _no_loops(device)
+        return tuple(wp.empty(0, dtype=wp.int32, device=device) for _ in range(3))
 
     if edges is None:
         edges = tw.edges.faces_to_edges(faces)
-    undirected = twt.as_array2d_int32(tw.array.gather(edges_sorted, rows))
     directed = twt.as_array2d_int32(tw.array.gather(edges, rows))
 
-    n_vertices = int(vertices.shape[0])
-    next_vertex = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_boundary.scatter_successor,
-        dim=n_boundary_edges,
-        inputs=[directed, next_vertex],
-        device=device,
-    )
-
-    # ``undirected`` holds vertex indices this function just gathered out of ``faces``, so the
-    # range check would only re-derive a bound the caller already guarantees — at the cost of
-    # copying the whole edge buffer to the host.
-    labels = tw.graph.connected_component_labels_from_edges(
-        undirected, node_count=n_vertices, validate=False
-    )
-
-    boundary_vertices = tw.grouping.unique_1d(undirected.flatten())
-    n_boundary_vertices = int(boundary_vertices.shape[0])
-
-    label_min = wp.full(n_vertices, n_vertices, dtype=wp.int32, device=device)
-    label_count = wp.zeros(n_vertices, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_boundary.scatter_loop_min_and_count,
-        dim=n_boundary_vertices,
-        inputs=[boundary_vertices, labels, label_min, label_count],
-        device=device,
-    )
-
-    # Pointer-jumping list ranking (Wyllie): O(log L) rounds of pointer doubling replace the
-    # per-vertex successor walk, whose total work was quadratic in the boundary-loop length.
-    successor = wp.empty(n_vertices, dtype=wp.int32, device=device)
-    steps = wp.empty(n_vertices, dtype=wp.int32, device=device)
-    successor_next = wp.empty(n_vertices, dtype=wp.int32, device=device)
-    steps_next = wp.empty(n_vertices, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_boundary.init_rank_arrays,
-        dim=n_boundary_vertices,
-        inputs=[boundary_vertices, next_vertex, labels, label_min, successor, steps],
-        device=device,
-    )
-    rounds = max(1, math.ceil(math.log2(max(n_boundary_vertices, 2))))
-    for _ in range(rounds):
-        wp.launch(
-            kernel_boundary.jump_rank,
-            dim=n_boundary_vertices,
-            inputs=[boundary_vertices, successor, steps, successor_next, steps_next],
-            device=device,
-        )
-        successor, successor_next = successor_next, successor
-        steps, steps_next = steps_next, steps
-
-    position = wp.empty(n_boundary_vertices, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_boundary.finalize_rank_positions,
-        dim=n_boundary_vertices,
-        inputs=[boundary_vertices, labels, label_count, steps, position],
-        device=device,
-    )
-
-    vertex_labels = tw.array.gather(labels, boundary_vertices)
-    unique_labels, loop_index = tw.grouping.unique_1d(vertex_labels, return_inverse=True)
-    n_loops = int(unique_labels.shape[0])
-
-    loop_sizes = tw.array.gather(label_count, unique_labels)
-    offsets = wp.empty(n_loops, dtype=wp.int32, device=device)
-    wp.utils.array_scan(loop_sizes, out_array=offsets, inclusive=False)
-
-    # Zero-initialised (not wp.empty): on a non-manifold boundary the position ranks can collide,
-    # leaving some slots unwritten by scatter_loop_slot. Zero is a valid vertex index, so a
-    # malformed loop stays in-range rather than returning uninitialised garbage to callers.
-    flat_loops = wp.zeros(n_boundary_vertices, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_boundary.scatter_loop_slot,
-        dim=n_boundary_vertices,
-        inputs=[boundary_vertices, loop_index, position, offsets, flat_loops],
-        device=device,
-    )
-
-    return flat_loops, offsets, loop_sizes
+    # ``validate=False``: ``directed`` holds vertex indices this function just gathered out of
+    # ``faces``, so the range check would only re-derive a bound the caller already guarantees —
+    # at the cost of a device synchronization.
+    return tw.graph.successor_cycles(directed, int(vertices.shape[0]), validate=False)
 
 
 def boundary_loop(
@@ -345,12 +268,11 @@ def boundary_loop(
     ``igl.boundary_loop``
     """
     flat_loops, offsets, _loop_sizes = boundary_loops_batched(vertices, faces, edges_sorted, edges)
-    bounds = _loop_bounds(flat_loops, offsets)
-    if not bounds:
+    loops = tw.array.split(flat_loops, offsets)
+    if not loops:
         return wp.empty(0, dtype=wp.int32, device=faces.device)
-    # Only the winner is materialized: the other loops are never copied off the packed buffer.
-    begin, end = max(bounds, key=lambda span: span[1] - span[0])
-    return wp.clone(flat_loops[begin:end])
+    # Only the winner is materialized: the other loops stay views into the packed buffer.
+    return wp.clone(max(loops, key=lambda loop: int(loop.shape[0])))
 
 
 def boundary_vertex_indices(
@@ -502,30 +424,3 @@ def _boundary_rows(
     return tw.grouping.group_int_rows(
         edges_sorted, 1, int(vertices.shape[0]), validate=False
     ).flatten()
-
-
-def _no_loops(
-    device: wp.DeviceLike,
-) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
-    """Build the three empty buffers a boundary-free mesh yields, as distinct allocations."""
-    return (
-        wp.empty(0, dtype=wp.int32, device=device),
-        wp.empty(0, dtype=wp.int32, device=device),
-        wp.empty(0, dtype=wp.int32, device=device),
-    )
-
-
-def _loop_bounds(
-    flat_loops: wp.array[wp.int32], offsets: wp.array[wp.int32]
-) -> list[tuple[int, int]]:
-    """
-    Host ``[begin, end)`` span per loop, from **one** readback.
-
-    ``offsets`` is the exclusive scan of the loop sizes and the last loop ends at the packed
-    buffer's length, so the sizes need not be read back as well.
-    """
-    starts = [int(start) for start in offsets.numpy().tolist()]
-    if not starts:
-        return []
-    ends = [*starts[1:], int(flat_loops.shape[0])]
-    return list(zip(starts, ends, strict=True))

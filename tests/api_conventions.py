@@ -104,11 +104,6 @@ _PRIVATE_IMPORT_ALLOWLIST: dict[tuple[str, str], str] = {
         "reduce.median needs a sorted copy, and array.sort_and_argsort is the public form -- which "
         "also builds the permutation median throws away"
     ),
-    ("smoothing", "array._as_vec3"): (
-        "a float64-to-float32 vertex-buffer cast, not an operation; the public surface takes and "
-        "returns vec3 and this is the seam where the f64 solve meets it"
-    ),
-    ("smoothing", "array._as_vec3d"): "as above, the other direction",
     ("combine", "holes._PackedLoops"): (
         "the flat-plus-sizes loop representation both dynamic programs consume. It is a data "
         "type, not an operation -- publishing it would make an internal layout part of the API, "
@@ -148,11 +143,13 @@ _PRIVATE_IMPORT_ALLOWLIST: dict[tuple[str, str], str] = {
 
 # --- check 6 -----------------------------------------------------------------------------------
 
-# Duplicate public names that are correct in both vocabularies. ``array.concatenate`` mirrors
-# ``numpy.concatenate`` and ``combine.concatenate`` mirrors ``trimesh.util.concatenate``; neither is
-# reachable unqualified and the naming rule requires both spellings.
+# Duplicate public names that are correct in both vocabularies. ``array.concatenate`` /
+# ``array.split`` mirror ``numpy.concatenate`` / ``numpy.split``, while ``combine.concatenate``
+# mirrors ``trimesh.util.concatenate`` and ``combine.split`` mirrors ``trimesh.Trimesh.split``;
+# none is reachable unqualified and the naming rule requires both spellings of each.
 _DUPLICATE_NAME_ALLOWLIST: dict[str, frozenset[str]] = {
-    "concatenate": frozenset({"array", "combine"})
+    "concatenate": frozenset({"array", "combine"}),
+    "split": frozenset({"array", "combine"}),
 }
 
 # --- check 7 -----------------------------------------------------------------------------------

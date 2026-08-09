@@ -78,3 +78,94 @@ def scatter_sorted_positions(
 ) -> None:
     i = int(wp.tid())
     out_rank[sorted_nodes[i]] = i
+
+
+@wp.kernel
+def scatter_successor(directed_edges: wp.array2d[wp.int32], out_next: wp.array[wp.int32]) -> None:
+    tid = int(wp.tid())
+    out_next[directed_edges[tid, 0]] = directed_edges[tid, 1]
+
+
+@wp.kernel
+def scatter_cycle_min_and_count(
+    cycle_nodes: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+    out_label_min: wp.array[wp.int32],
+    out_label_count: wp.array[wp.int32],
+) -> None:
+    tid = int(wp.tid())
+    v = cycle_nodes[tid]
+    label = labels[v]
+    wp.atomic_min(out_label_min, label, v)
+    wp.atomic_add(out_label_count, label, wp.int32(1))
+
+
+@wp.kernel
+def init_rank_arrays(
+    cycle_nodes: wp.array[wp.int32],
+    next_node: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+    label_min: wp.array[wp.int32],
+    out_successor: wp.array[wp.int32],
+    out_steps: wp.array[wp.int32],
+) -> None:
+    # Pointer-jumping list ranking, step 1: cut each cycle at its canonical start (the smallest
+    # node index, label_min) so cycles become chains ending in a fixed point (successor ==
+    # self, steps == 0). Broken chains (-1 sentinel where a node has no out-edge) also terminate
+    # at a fixed point, so the whole ranking finishes in a fixed round count on any input.
+    tid = int(wp.tid())
+    v = cycle_nodes[tid]
+    start = label_min[labels[v]]
+    nxt = next_node[v]
+    if v == start or nxt < 0:
+        out_successor[v] = v
+        out_steps[v] = wp.int32(0)
+    else:
+        out_successor[v] = nxt
+        out_steps[v] = wp.int32(1)
+
+
+@wp.kernel
+def jump_rank(
+    cycle_nodes: wp.array[wp.int32],
+    successor_in: wp.array[wp.int32],
+    steps_in: wp.array[wp.int32],
+    out_successor: wp.array[wp.int32],
+    out_steps: wp.array[wp.int32],
+) -> None:
+    # Pointer doubling (Wyllie): after k rounds each node knows its 2^k-th successor and the
+    # exact hop count to it; the fixed point at the cycle start contributes zero, so steps
+    # converges to the hop distance to the start in ceil(log2(chain length)) rounds.
+    tid = int(wp.tid())
+    v = cycle_nodes[tid]
+    s = successor_in[v]
+    out_steps[v] = steps_in[v] + steps_in[s]
+    out_successor[v] = successor_in[s]
+
+
+@wp.kernel
+def finalize_rank_positions(
+    cycle_nodes: wp.array[wp.int32],
+    labels: wp.array[wp.int32],
+    label_count: wp.array[wp.int32],
+    steps: wp.array[wp.int32],
+    out_position: wp.array[wp.int32],
+) -> None:
+    # position = (cycle_length - hops to start) mod cycle_length; the positive modulo keeps
+    # malformed chains (steps beyond cycle_length when in-edges collide) in range.
+    tid = int(wp.tid())
+    v = cycle_nodes[tid]
+    cycle_length = label_count[labels[v]]
+    out_position[tid] = kernel_array.wrap_index(cycle_length - steps[v], cycle_length)
+
+
+@wp.kernel
+def scatter_cycle_slot(
+    cycle_nodes: wp.array[wp.int32],
+    cycle_index: wp.array[wp.int32],
+    position: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    out_cycles: wp.array[wp.int32],
+) -> None:
+    tid = int(wp.tid())
+    out_cycles[offsets[cycle_index[tid]] + position[tid]] = cycle_nodes[tid]

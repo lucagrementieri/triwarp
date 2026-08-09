@@ -56,20 +56,6 @@ def test_init_repeat_index_zero_count(device: str) -> None:
     assert out_wp.shape == (0,)
 
 
-def test_square(device: str) -> None:
-    rng = np.random.default_rng(0)
-    values_np = (rng.random(64, dtype=np.float32) * 4.0 - 2.0).astype(np.float32)
-    values_wp = wp.array(values_np, dtype=wp.float32, device=device)
-    squared_wp = tw.array.square(values_wp)
-    assert np.allclose(squared_wp.numpy(), values_np**2, rtol=1e-5, atol=1e-5)
-
-
-def test_square_empty(device: str) -> None:
-    values_wp = wp.empty(0, dtype=wp.float32, device=device)
-    squared_wp = tw.array.square(values_wp)
-    assert squared_wp.shape == (0,)
-
-
 def test_concatenate(device: str) -> None:
     parts = [
         wp.array([0, 3], dtype=wp.int32, device=device),
@@ -89,6 +75,47 @@ def test_concatenate_single_returns_input(device: str) -> None:
 def test_concatenate_empty_segments(device: str) -> None:
     out_wp = tw.array.concatenate([wp.empty(0, dtype=wp.int32, device=device)])
     assert out_wp.shape == (0,)
+
+
+def test_split_roundtrips_pack_1d_arrays(device: str) -> None:
+    """``split(*pack_1d_arrays(arrays))`` recovers every input segment (the inverse pair)."""
+    rng = np.random.default_rng(3)
+    parts_np = [rng.integers(0, 100, size=size).astype(np.int32) for size in (4, 1, 0, 7)]
+    parts_wp = [wp.array(part, dtype=wp.int32, device=device) for part in parts_np]
+
+    flat_wp, offsets_wp = tw.array.pack_1d_arrays(parts_wp)
+    segments_wp = tw.array.split(flat_wp, offsets_wp)
+
+    assert len(segments_wp) == len(parts_np)
+    for segment_wp, part_np in zip(segments_wp, parts_np, strict=True):
+        assert np.array_equal(segment_wp.numpy(), part_np)
+
+
+def test_split_views_share_storage_and_copies_do_not(device: str) -> None:
+    """Default segments alias the packed buffer; ``copy=True`` detaches them."""
+    flat_wp = wp.array(np.arange(6, dtype=np.int32), dtype=wp.int32, device=device)
+    offsets_wp = wp.array(np.array([0, 2], dtype=np.int32), dtype=wp.int32, device=device)
+
+    views = tw.array.split(flat_wp, offsets_wp)
+    copies = tw.array.split(flat_wp, offsets_wp, copy=True)
+    flat_wp.fill_(9)
+
+    assert np.array_equal(views[0].numpy(), np.array([9, 9], dtype=np.int32))
+    assert np.array_equal(copies[0].numpy(), np.array([0, 1], dtype=np.int32))
+    assert np.array_equal(copies[1].numpy(), np.array([2, 3, 4, 5], dtype=np.int32))
+
+
+def test_split_rejects_bad_offsets(device: str) -> None:
+    flat_wp = wp.array(np.arange(4, dtype=np.int32), dtype=wp.int32, device=device)
+    for bad in ([1, 2], [0, 3, 2], [0, 5]):
+        offsets_wp = wp.array(np.array(bad, dtype=np.int32), dtype=wp.int32, device=device)
+        with pytest.raises(ValueError, match="offsets must start at 0"):
+            tw.array.split(flat_wp, offsets_wp)
+
+
+def test_split_empty_offsets(device: str) -> None:
+    flat_wp = wp.array(np.arange(3, dtype=np.int32), dtype=wp.int32, device=device)
+    assert tw.array.split(flat_wp, wp.empty(0, dtype=wp.int32, device=device)) == []
 
 
 @pytest.mark.parametrize(
@@ -424,30 +451,52 @@ def test_flatnonzero_indices_to_mask_round_trip(device: str, n: int) -> None:
     )
 
 
-@pytest.mark.parametrize("sentinel", [False, True], ids=["plain", "sentinel"])
-def test_counts_to_offsets(device: str, sentinel: bool) -> None:
+@pytest.mark.parametrize("include_total", [False, True], ids=["plain", "total"])
+def test_counts_to_offsets(device: str, include_total: bool) -> None:
     """
     Exclusive prefix sum, in both offset conventions.
 
-    The sentinel form is the length-``n + 1`` CSR array that ``segmented_sort_pairs`` wants; it is
+    The total-terminated form is the length-``n + 1`` CSR array ``segmented_sort_pairs`` wants; it
     the same buffer, so the two must agree on their common prefix and the total.
     """
     rng = np.random.default_rng(41)
     counts_np = rng.integers(0, 7, size=32).astype(np.int32)
     counts_wp = wp.array(counts_np, dtype=wp.int32, device=device)
-    offsets_wp, total = tw.array.counts_to_offsets(counts_wp, sentinel=sentinel)
+    offsets_wp, total = tw.array.counts_to_offsets(counts_wp, include_total=include_total)
 
     exclusive_np = np.concatenate([[0], np.cumsum(counts_np)]).astype(np.int32)
     assert total == int(counts_np.sum())
-    assert np.array_equal(offsets_wp.numpy(), exclusive_np if sentinel else exclusive_np[:-1])
+    assert np.array_equal(offsets_wp.numpy(), exclusive_np if include_total else exclusive_np[:-1])
 
 
-@pytest.mark.parametrize("sentinel", [False, True], ids=["plain", "sentinel"])
-def test_counts_to_offsets_empty(device: str, sentinel: bool) -> None:
+@pytest.mark.parametrize("include_total", [False, True], ids=["plain", "total"])
+def test_counts_to_offsets_empty(device: str, include_total: bool) -> None:
     counts_wp = wp.empty(0, dtype=wp.int32, device=device)
-    offsets_wp, total = tw.array.counts_to_offsets(counts_wp, sentinel=sentinel)
+    offsets_wp, total = tw.array.counts_to_offsets(counts_wp, include_total=include_total)
     assert total == 0
-    assert np.array_equal(offsets_wp.numpy(), np.zeros(1 if sentinel else 0, dtype=np.int32))
+    assert np.array_equal(offsets_wp.numpy(), np.zeros(1 if include_total else 0, dtype=np.int32))
+
+
+def test_remap_indices_passes_negative_sentinels_through(device: str) -> None:
+    """
+    ``-1`` entries survive the remap unchanged; everything else reads the table.
+
+    This is the behavior that separates ``remap_indices`` from a plain ``gather`` — a gather
+    would read out of bounds on the sentinel — and what ``repair``'s sentinel-preserving face
+    remaps rely on.
+    """
+    indices_wp = wp.array(
+        np.array([2, -1, 0, 1, -1], dtype=np.int32), dtype=wp.int32, device=device
+    )
+    remap_wp = wp.array(np.array([10, 11, 12], dtype=np.int32), dtype=wp.int32, device=device)
+    remapped_wp = tw.array.remap_indices(indices_wp, remap_wp)
+    assert np.array_equal(remapped_wp.numpy(), np.array([12, -1, 10, 11, -1], dtype=np.int32))
+
+
+def test_remap_indices_empty(device: str) -> None:
+    indices_wp = wp.empty(0, dtype=wp.int32, device=device)
+    remap_wp = wp.array(np.array([0, 1], dtype=np.int32), dtype=wp.int32, device=device)
+    assert tw.array.remap_indices(indices_wp, remap_wp).shape == (0,)
 
 
 def test_indices_to_mask_empty(device: str) -> None:

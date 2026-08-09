@@ -27,18 +27,16 @@ returns an object with ``get_min_bound`` / ``get_max_bound``.
 **libigl** answers both groups, and in both cases it returns *more* than the number asked for:
 ``igl.bounding_box(V)`` builds the box as geometry -- 8 corner vertices and the 12 triangles of its
 hull -- so its row includes constructing a mesh triwarp never materialises, and
-``igl.bounding_box_diagonal(V)`` recomputes the box internally where
-[`aabb_diagonal`][triwarp.bounds.aabb_diagonal] takes the two corners it is given. Read both as
-upper bounds, and read the ``aabb_diagonal`` pair as what a caller pays *with* and *without* the box
-already in hand: triwarp's row includes its own ``aabb_bounds`` call for exactly that reason, since
-there is no other way to produce the number.
+``igl.bounding_box_diagonal(V)`` computes the box internally, exactly as
+[`enclosing_diagonal`][triwarp.bounds.enclosing_diagonal] does on triwarp's side. Read both as
+upper bounds.
 
 For the **oriented** box, the references answer it a different way and the rows say which:
 ``igl.oriented_bounding_box`` searches the *same* global candidate set triwarp's first phase does
 (Super-Fibonacci over ``SO(3)``, identity appended) but has no refinement phase, so triwarp's row
 carries ~3-5 ms of trust-region rounds igl's does not -- rounds that buy the quality the
 ``tests/test_bounds.py`` bands pin (the sampled-only phase is reachable with
-``refine_iterations=0`` and measured 0.45 ms on a 36k cloud back to back against 3.3-5.8 refined).
+``refine_iterations=0`` and measured 0.45 ms on a 36k cloud back to back against ~2.4 refined).
 ``trimesh.bounds.oriented_bounds`` and open3d's ``get_minimal_oriented_bounding_box`` are the
 *other* algorithm family -- convex hull, then the minimal box flush with each hull face -- so their
 rows price a hull triwarp never builds and their cost does not scale with the candidate count at
@@ -125,38 +123,16 @@ def test_aabb_bounds(bench_case: BenchCase) -> None:
         assert box_o3d.get_min_bound()[0] <= box_o3d.get_max_bound()[0]
 
 
-@pytest.mark.benchmark(group="aabb_diagonal")
-@pytest.mark.benchlibs("triwarp", "igl")
-def test_aabb_diagonal(bench_case: BenchCase) -> None:
-    """
-    The bbox diagonal length, which on triwarp's side *is* the box reduction plus arithmetic.
-
-    ``aabb_diagonal`` takes the two corners, so the timed callable composes it with ``aabb_bounds``
-    -- the only path by which a caller obtains this number, and what makes the row comparable to
-    igl's, which computes the box internally too. The gap against ``aabb_bounds`` above is therefore
-    the ``sqrt`` and three subtractions, i.e. it should be nil; if it is not, the composition is
-    paying a second readback.
-    """
-    if bench_case.kind == "triwarp":
-        vertices = bench_case.vertices_wp
-        diagonal = bench_case.run(lambda: tw.bounds.aabb_diagonal(*tw.bounds.aabb_bounds(vertices)))
-        assert diagonal >= 0.0
-        return
-    vertices_np = bench_case.vertices_np
-    diagonal_igl = bench_case.run(lambda: igl.bounding_box_diagonal(vertices_np))
-    assert diagonal_igl >= 0.0
-
-
 @pytest.mark.benchmark(group="enclosing_diagonal")
 @pytest.mark.benchlibs("triwarp", "igl")
 def test_enclosing_diagonal(bench_case: BenchCase) -> None:
     """
     The default search radius every mesh query derives, over the mesh *and* the query points.
 
-    Two clouds rather than one, which is the axis that separates this from ``aabb_diagonal`` above:
-    it is two box reductions and therefore two host readbacks, so the row answers whether the
-    default costs twice the single-cloud reduction or whether the second readback disappears into
-    the first launch's latency. Every ``max_dist=None`` call in ``proximity``, ``ray``,
+    Two clouds rather than one, so against the ``aabb_bounds`` group above this is two box
+    reductions and therefore two host readbacks; the row answers whether the default costs twice
+    the single-cloud reduction or whether the second readback disappears into the first launch's
+    latency. Every ``max_dist=None`` call in ``proximity``, ``ray``,
     ``visibility`` and ``registration`` pays exactly this.
 
     igl's ``bounding_box_diagonal`` takes one point set, so its side is fed the stacked cloud --
@@ -182,8 +158,9 @@ def test_oriented_bounding_box(bench_case: BenchCase) -> None:
     The sampled-plus-refined minimum-volume box: ``_ROTATIONS`` global frames, then eight rounds.
 
     Cost is ``rotations * n_vertices`` point transforms for the global phase plus eight 512-frame
-    refinement rounds whose cost is almost entirely host-device latency (~0.4-0.7 ms per round;
-    measured back to back on a 36k cloud, 0.45 ms sampled against 3.3-5.8 ms refined). The row
+    refinement rounds of device-side frame generation, extent scoring and one table readback
+    (~0.24 ms per round; measured back to back on a 36k cloud, 0.45 ms sampled against ~2.4 ms
+    refined). The row
     times the *default*, refinement included, because that is what a caller gets -- and what the
     quality bands in ``tests/test_bounds.py`` are measured against; igl walks the same global
     candidates over a CPU ``parallel_for`` with no refinement phase.

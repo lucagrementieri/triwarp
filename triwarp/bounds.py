@@ -14,7 +14,7 @@ from typing import Literal
 import numpy as np
 import warp as wp
 
-from triwarp.constants import TILE_1D
+import triwarp as tw
 from triwarp.kernels import bounds as kernel_bounds
 
 # Points reduced per thread by the per-candidate extent reduction in
@@ -31,16 +31,29 @@ from triwarp.kernels import bounds as kernel_bounds
 # ones; 256 is the compromise, and its worst case is the 10 000-rotation row at 1.24x.
 ITEMS_PER_CANDIDATE_SLICE = 256
 
+# Cloud size at which [`oriented_bounding_box`][triwarp.bounds.oriented_bounding_box] first runs
+# [`convex_superset_mask`][triwarp.convex.convex_superset_mask] and searches only the survivors.
+# The mask keeps every convex-hull vertex and the extent reduction is decided by hull vertices
+# alone, so the box is *identical* (min/max are order-independent; measured dVol == 0 on every
+# probe) — the threshold trades only time. Measured interleaved on anisotropic normal clouds
+# (RTX 5090, defaults): below ~60k the search is launch-latency-bound at ~3.5-4 ms and the
+# prefilter's ~0.5 ms sweep is pure overhead (60k: 3.83 vs 4.12 ms); the crossover sits near 80k
+# (100k: 4.34 vs 4.15 ms), and the win grows without bound past it (500k: 11.4 vs 4.1 ms, 2.8x)
+# because the filtered search runs on ~1k survivors whatever the input size. ``subdivisions=2``
+# beat 3 at every size probed (at 500k: 4.09 vs 5.84 ms) — more directions cost more sweep and
+# buy nothing the box can see.
+CONVEX_PREFILTER_MIN_POINTS = 100_000
+
 
 def aabb_bounds(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     """
     Axis-aligned bounding box of ``points`` (component-wise min / max).
 
-    The reduction runs on ``points.device`` in ``float32``: one chunked kernel writes both
-    corners into a single six-element buffer, which is then read back once. That is deliberately
-    *not* the generic [`minmax`][triwarp.reduce.minmax] path — this is called on the hot path of
-    every k-NN query, where it is entirely host-latency-bound, and ``minmax`` needs two
-    allocations, two fills and two readbacks for the same answer.
+    The reduction is [`minmax`][triwarp.reduce.minmax]'s ``wp.vec3`` path: one chunked kernel
+    writes both corners into a single six-element buffer, read back once — it is called on the
+    hot path of every k-NN query, where it is entirely host-latency-bound, so nothing beyond
+    that single launch and readback is spent. This wrapper contributes only the empty-input
+    ``(+inf, -inf)`` convention, where ``minmax`` raises.
 
     Parameters
     ----------
@@ -56,53 +69,13 @@ def aabb_bounds(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
 
     See Also
     --------
-    [`aabb_diagonal`][triwarp.bounds.aabb_diagonal]
     [`aabb_union`][triwarp.bounds.aabb_union]
+    [`enclosing_diagonal`][triwarp.bounds.enclosing_diagonal]
+    [`triwarp.reduce.minmax`][triwarp.reduce.minmax]
     """
-    n = int(points.shape[0])
-    if n == 0:
+    if int(points.shape[0]) == 0:
         return (wp.vec3(math.inf, math.inf, math.inf), wp.vec3(-math.inf, -math.inf, -math.inf))
-    # One allocation, one launch, one readback. This is a pure reduction on the hot path of every
-    # k-NN query, so it is entirely host-latency-bound at any realistic size — the generic
-    # [`minmax`][triwarp.reduce.minmax] path costs two allocations, two fills and two readbacks
-    # for the same answer, which measured ~2x slower.
-    corners = wp.full(6, math.inf, dtype=wp.float32, device=points.device)
-    wp.launch(
-        kernel_bounds.aabb_corners,
-        dim=(n + TILE_1D - 1) // TILE_1D,
-        inputs=[points, corners],
-        device=points.device,
-    )
-    corners_np = corners.numpy()
-    # Slots 3..5 hold the *negated* upper corner; see the kernel.
-    return (wp.vec3(*corners_np[:3].tolist()), wp.vec3(*(-corners_np[3:]).tolist()))
-
-
-def aabb_diagonal(min_bound: wp.vec3, max_bound: wp.vec3) -> float:
-    """
-    Diagonal length of an axis-aligned bounding box.
-
-    A standard scale heuristic used to derive query radii and search-distance defaults from a
-    mesh or point cloud's extent.
-
-    Parameters
-    ----------
-    min_bound
-        Minimum corner, as returned by [`aabb_bounds`][triwarp.bounds.aabb_bounds].
-    max_bound
-        Maximum corner, as returned by [`aabb_bounds`][triwarp.bounds.aabb_bounds].
-
-    Returns
-    -------
-    float
-        ``|max_bound - min_bound|``.
-
-    See Also
-    --------
-    [`aabb_bounds`][triwarp.bounds.aabb_bounds]
-    [`aabb_union`][triwarp.bounds.aabb_union]
-    """
-    return float(wp.length(max_bound - min_bound))
+    return tw.reduce.minmax(points)
 
 
 def aabb_union(
@@ -126,15 +99,10 @@ def aabb_union(
     See Also
     --------
     [`aabb_bounds`][triwarp.bounds.aabb_bounds]
-    [`aabb_diagonal`][triwarp.bounds.aabb_diagonal]
+    [`enclosing_diagonal`][triwarp.bounds.enclosing_diagonal]
     """
-    combined_min = wp.vec3(
-        min(a_min[0], b_min[0]), min(a_min[1], b_min[1]), min(a_min[2], b_min[2])
-    )
-    combined_max = wp.vec3(
-        max(a_max[0], b_max[0]), max(a_max[1], b_max[1]), max(a_max[2], b_max[2])
-    )
-    return combined_min, combined_max
+    # ``wp.min`` / ``wp.max`` are component-wise on vectors and work at Python scope.
+    return wp.min(a_min, b_min), wp.max(a_max, b_max)
 
 
 def enclosing_diagonal(points: wp.array[wp.vec3], other: wp.array[wp.vec3] | None = None) -> float:
@@ -165,15 +133,12 @@ def enclosing_diagonal(points: wp.array[wp.vec3], other: wp.array[wp.vec3] | Non
     --------
     [`aabb_bounds`][triwarp.bounds.aabb_bounds]
     [`aabb_union`][triwarp.bounds.aabb_union]
-    [`aabb_diagonal`][triwarp.bounds.aabb_diagonal]
-        The same length from corners the caller already holds.
     """
-    points_min, points_max = aabb_bounds(points)
-    if other is None or int(other.shape[0]) == 0:
-        return aabb_diagonal(points_min, points_max)
-    other_min, other_max = aabb_bounds(other)
-    union_min, union_max = aabb_union(points_min, points_max, other_min, other_max)
-    return aabb_diagonal(union_min, union_max)
+    lower, upper = aabb_bounds(points)
+    if other is not None and int(other.shape[0]) > 0:
+        other_lower, other_upper = aabb_bounds(other)
+        lower, upper = aabb_union(lower, upper, other_lower, other_upper)
+    return float(wp.length(upper - lower))
 
 
 def oriented_bounding_box(
@@ -198,8 +163,13 @@ def oriented_bounding_box(
     it reproduces the axis-aligned box exactly.
 
     Cost is ``rotations * len(points)`` point transforms for the global phase plus
-    ``refine_iterations * 512 * len(points)`` for refinement; pass the convex hull rather than a
-    dense cloud when one is at hand. Refinement is what makes the *default* polyhedron-safe: it
+    ``refine_iterations * 512 * len(points)`` for refinement — but past
+    ``CONVEX_PREFILTER_MIN_POINTS`` a
+    [`convex_superset_mask`][triwarp.convex.convex_superset_mask] prefilter first drops every
+    point that provably cannot touch the box, so both phases run on the few hull-candidate
+    survivors and the cost stops growing with the cloud (the box is identical: the mask keeps
+    every hull vertex and the extents are order-independent reductions over them).
+    Refinement is what makes the *default* polyhedron-safe: it
     recovers the flat-flush orientation a sampled grid can only land near (measured on a tilted
     cube whose exact minimum is 6.0: 6.31 sampled at 32 768 candidates against **6.0013** refined
     at the default 4 096 — from 5.2% over the true box to 0.02%).
@@ -219,10 +189,10 @@ def oriented_bounding_box(
         Trust-region rounds after the global phase, ``>= 0``. ``0`` disables refinement and returns
         the pure sampled answer, which is what makes the result element-wise comparable to
         ``igl.oriented_bounding_box``'s identical candidate set (the parity tests pass ``0`` for
-        exactly that reason). Each round costs one 512-frame launch and one small readback --
-        measured back to back on a 36k cloud, 0.45 ms sampled against 3.3-5.8 ms at the default
-        eight rounds, i.e. ~0.4-0.7 ms of host-device latency per round; the quality gain past
-        eight rounds is under 0.05% on every fixture measured.
+        exactly that reason). Each round costs two launches (frame generation and extents) and
+        one small table readback -- measured back to back on a 36k cloud, ~0.24 ms per round,
+        ~1.9 ms at the default eight rounds; the quality gain past eight rounds is under 0.05%
+        on every fixture measured.
 
     Returns
     -------
@@ -249,9 +219,10 @@ def oriented_bounding_box(
     -----
     Host traffic: the ``(rotations, 6)`` extent table (its objective and ``argmin`` are
     ``O(rotations)`` host arithmetic over a buffer far too small to be worth a device pass), the
-    36 bytes of the winning frame, and one ``(512, 6)`` table per refinement round. The refinement
-    frames are composed on the host -- 512 small matrix products per round is microseconds -- and
-    uploaded, so the extent kernel is the only device work either phase does.
+    36 bytes of the winning frame, and one ``(512, 6)`` table per refinement round. The
+    refinement frames are generated and composed **on the device** (the host quaternion math,
+    einsum and per-round upload they replace measured 63% of every round), so the chains live on
+    the device and the extent tables are the only per-round traffic.
 
     **The result is a converged local minimum, not a certified global one.** Certifying the true
     minimum-volume box requires the exact-arithmetic search over the convex hull's face and edge
@@ -294,6 +265,14 @@ def oriented_bounding_box(
             wp.vec3(math.inf, math.inf, math.inf),
             wp.vec3(-math.inf, -math.inf, -math.inf),
         )
+
+    if n >= CONVEX_PREFILTER_MIN_POINTS:
+        # Identical box, decided at the threshold above: only hull vertices can touch an
+        # enclosing box, the mask keeps all of them, and min/max extents do not care about the
+        # discarded interior points.
+        mask = tw.convex.convex_superset_mask(points)
+        points = tw.array.gather(points, tw.array.flatnonzero(mask))
+        n = int(points.shape[0])
 
     device = points.device
     axes = wp.empty(rotations, dtype=wp.mat33, device=device)
@@ -348,10 +327,13 @@ def _refine_box(
     Trust-region refinement of the sampled winner(s): shrink a low-discrepancy ball per round.
 
     Chains start from the best sampled candidates of mutually distant basins (greedy spread over
-    the top of the loss table). Each round composes ``delta @ base`` perturbations on the host --
-    512 small matrix products, microseconds -- scores them with the same extent kernel as the
-    global phase, and keeps each chain's best; the last delta is the identity, which is what makes
-    the refinement monotone per chain.
+    the top of the loss table) and live on the device: each round one kernel generates the
+    ``delta @ base`` perturbations in place of the host quaternion math, einsum and 18 KB upload
+    the loop used to pay (measured 63% of every round -- 0.245 ms of 0.386 ms on a 36k cloud;
+    the extent launch plus its table readback is the irreducible rest). The same extent kernel
+    as the global phase scores them, the per-chain argmin stays host arithmetic over the
+    already-read-back table, and an improved chain is refreshed with a 36-byte device copy; the
+    last delta is the identity, which is what makes the refinement monotone per chain.
     """
     device = points.device
     order = np.argsort(loss_np)
@@ -361,15 +343,21 @@ def _refine_box(
     chain_lower = np.zeros((n_chains, 3))
     chain_upper = np.zeros((n_chains, 3))
 
+    chains = wp.array(
+        np.ascontiguousarray(chains_np, dtype=np.float32), dtype=wp.mat33, device=device
+    )
+    total = n_chains * _REFINE_CANDIDATES
+    axes = wp.empty(total, dtype=wp.mat33, device=device)
+
     # Start at the covering radius of the global grid: the sampled winner is at most about this
     # far from its basin's optimum, and each round halves the radius.
     sigma = 2.0 * (math.pi**2 / max(rotations, 2)) ** (1.0 / 3.0)
-    total = n_chains * _REFINE_CANDIDATES
     for _ in range(refine_iterations):
-        deltas_np = _ball_rotations(_REFINE_CANDIDATES, sigma)
-        axes_np = np.einsum("pij,cjk->cpik", deltas_np, chains_np).reshape(total, 3, 3)
-        axes = wp.array(
-            np.ascontiguousarray(axes_np, dtype=np.float32), dtype=wp.mat33, device=device
+        wp.launch(
+            kernel_bounds.oriented_box_refine_axes,
+            dim=total,
+            inputs=[chains, wp.float64(sigma / math.pi), wp.int32(_REFINE_CANDIDATES), axes],
+            device=device,
         )
         lower_np, upper_np = _scored_extents(points, axes, n_slices)
         round_loss = _objective_losses(upper_np - lower_np, objective).reshape(
@@ -380,7 +368,7 @@ def _refine_box(
             if round_loss[chain, best] < chain_loss[chain]:
                 chain_loss[chain] = round_loss[chain, best]
                 row = chain * _REFINE_CANDIDATES + best
-                chains_np[chain] = axes_np[row]
+                wp.copy(chains, axes, dest_offset=chain, src_offset=row, count=1)
                 chain_lower[chain] = lower_np[row]
                 chain_upper[chain] = upper_np[row]
         # 0.4 rather than 0.5: a flat-flush optimum is a *kink*, so the volume error is linear in
@@ -391,7 +379,9 @@ def _refine_box(
         sigma *= 0.4
 
     winner = int(chain_loss.argmin())
-    return chains_np[winner], chain_lower[winner], chain_upper[winner]
+    # The winning frame alone, 36 bytes off a contiguous one-element slice.
+    frame_np = chains[winner : winner + 1].numpy()[0].astype(np.float64)
+    return frame_np, chain_lower[winner], chain_upper[winner]
 
 
 def _scored_extents(
@@ -484,47 +474,6 @@ def _spiral_frames(indices: np.ndarray, rotations: int) -> np.ndarray:
     )
     # World -> box frames: the transpose of the rotation each quaternion names.
     return _quat_matrices(quats).transpose(0, 2, 1)
-
-
-def _ball_rotations(count: int, sigma: float) -> np.ndarray:
-    """
-    Low-discrepancy rotations within angular radius ``sigma``, the identity last.
-
-    The Super-Fibonacci sample of the whole group, geodesically shrunk toward the identity: each
-    quaternion's rotation angle is rescaled by ``sigma / pi``, which keeps the sample's spread
-    while confining it to the trust region.
-    """
-    s = np.arange(count - 1, dtype=np.float64) + 0.5
-    phase = 2.0 * math.pi * s
-    alpha = phase / math.sqrt(2.0)
-    beta = phase / 1.533751168755204288118041
-    height = s / float(count - 1)
-    radius = np.sqrt(height)
-    radius_conjugate = np.sqrt(1.0 - height)
-    quats = np.stack(
-        [
-            radius * np.sin(alpha),
-            radius * np.cos(alpha),
-            radius_conjugate * np.sin(beta),
-            radius_conjugate * np.cos(beta),
-        ],
-        axis=1,
-    )
-    quats[quats[:, 3] < 0.0] *= -1.0  # same rotation, angle in [0, pi]
-    angle = 2.0 * np.arccos(np.clip(quats[:, 3], -1.0, 1.0))
-    axis_norm = np.linalg.norm(quats[:, :3], axis=1)
-    safe = axis_norm > 1e-12
-    axes = np.zeros((count - 1, 3))
-    axes[safe] = quats[safe, :3] / axis_norm[safe, None]
-    axes[~safe, 0] = 1.0
-    shrunk_half = 0.5 * angle * (sigma / math.pi)
-    shrunk = np.concatenate(
-        [axes * np.sin(shrunk_half)[:, None], np.cos(shrunk_half)[:, None]], axis=1
-    )
-    deltas = np.empty((count, 3, 3))
-    deltas[: count - 1] = _quat_matrices(shrunk)
-    deltas[count - 1] = np.eye(3)  # re-scores the base: what makes each chain monotone
-    return deltas
 
 
 def _quat_matrices(quats: np.ndarray) -> np.ndarray:

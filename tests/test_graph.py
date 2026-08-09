@@ -430,6 +430,79 @@ def _scipy_component_labels(edges: np.ndarray, node_count: int) -> np.ndarray:
     return labels.astype(np.int32)
 
 
+def test_successor_cycles_single_cycle(device: str) -> None:
+    """One 4-cycle: the result starts at the smallest node and follows the edge direction."""
+    edges_wp = wp.array(
+        np.array([[5, 2], [2, 7], [7, 3], [3, 5]], dtype=np.int32), dtype=wp.int32, device=device
+    )
+    flat_wp, offsets_wp, sizes_wp = tw.graph.successor_cycles(edges_wp, 8)
+
+    assert np.array_equal(flat_wp.numpy(), np.array([2, 7, 3, 5], dtype=np.int32))
+    assert np.array_equal(offsets_wp.numpy(), np.array([0], dtype=np.int32))
+    assert np.array_equal(sizes_wp.numpy(), np.array([4], dtype=np.int32))
+
+
+def test_successor_cycles_multiple_cycles(device: str) -> None:
+    """
+    Interleaved node ids across three cycles, plus nodes on no cycle.
+
+    Every cycle must come back in successor order from its own minimum; the per-cycle offsets
+    partition the packed buffer; nodes 1 and 8 appear in no edge and in no cycle.
+    """
+    rng = np.random.default_rng(7)
+    cycles = [[0, 4, 2], [3, 9, 6, 5], [7, 10]]
+    edge_rows = [
+        (cycle[i], cycle[(i + 1) % len(cycle)]) for cycle in cycles for i in range(len(cycle))
+    ]
+    order = rng.permutation(len(edge_rows))
+    edges_np = np.array(edge_rows, dtype=np.int32)[order]
+    edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
+
+    flat_wp, offsets_wp, sizes_wp = tw.graph.successor_cycles(edges_wp, 11)
+
+    flat_np = flat_wp.numpy()
+    starts_np = offsets_wp.numpy()
+    sizes_np = sizes_wp.numpy()
+    assert sizes_np.sum() == flat_np.shape[0] == 9
+    recovered = [
+        flat_np[start : start + size].tolist()
+        for start, size in zip(starts_np, sizes_np, strict=True)
+    ]
+    # Each cycle starts at its minimum and follows the successor direction.
+    assert sorted(recovered) == sorted([[0, 4, 2], [3, 9, 6, 5], [7, 10]])
+
+
+def test_successor_cycles_validates_range(device: str) -> None:
+    """The default range check rejects an endpoint outside ``[0, node_count)``."""
+    edges_wp = wp.array(np.array([[0, 9], [9, 0]], dtype=np.int32), dtype=wp.int32, device=device)
+    with pytest.raises(ValueError, match="edge indices must lie in"):
+        tw.graph.successor_cycles(edges_wp, 4)
+
+
+def test_successor_cycles_malformed_input_stays_in_range(device: str) -> None:
+    """
+    Two in-edges on one node (not a successor graph) must not return garbage.
+
+    The documented behavior: ranks may collide and slots fall back to zero, but every value in
+    the packed buffer stays a valid node index and the sizes still partition it.
+    """
+    edges_np = np.array([[0, 1], [1, 2], [2, 0], [3, 1]], dtype=np.int32)
+    edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
+    flat_wp, _offsets_wp, sizes_wp = tw.graph.successor_cycles(edges_wp, 4)
+
+    flat_np = flat_wp.numpy()
+    assert flat_np.shape[0] == int(sizes_wp.numpy().sum()) == 4
+    assert np.all((flat_np >= 0) & (flat_np < 4))
+
+
+def test_successor_cycles_empty(device: str) -> None:
+    edges_wp = twt.empty_int32_2d((0, 2), device=device)
+    flat_wp, offsets_wp, sizes_wp = tw.graph.successor_cycles(edges_wp, 5)
+    assert flat_wp.shape == (0,)
+    assert offsets_wp.shape == (0,)
+    assert sizes_wp.shape == (0,)
+
+
 @pytest.mark.parity("bfs", "scipy")
 def test_bfs_random(device: str) -> None:
     rng = np.random.default_rng(7)

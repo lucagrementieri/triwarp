@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from typing import Literal, NamedTuple, cast, overload
 
@@ -102,18 +103,31 @@ def minmax(
     array: twt.Array1dFloat32 | twt.Array2dFloat32, *, axis: None = ...
 ) -> tuple[float, float]: ...
 @overload
+def minmax(array: wp.array[wp.vec3], *, axis: None = ...) -> tuple[wp.vec3, wp.vec3]: ...
+@overload
 def minmax(
     array: twt.Array2dScalar, *, axis: Literal[0, 1]
 ) -> tuple[twt.Array1dScalar, twt.Array1dScalar]: ...
 def minmax(
-    array: twt.ScalarArray, *, axis: Literal[0, 1] | None = None
-) -> tuple[float, float] | tuple[int, int] | tuple[twt.Array1dScalar, twt.Array1dScalar]:
+    array: twt.ScalarArray | wp.array[wp.vec3], *, axis: Literal[0, 1] | None = None
+) -> (
+    tuple[float, float]
+    | tuple[int, int]
+    | tuple[wp.vec3, wp.vec3]
+    | tuple[twt.Array1dScalar, twt.Array1dScalar]
+):
     """
     Minimum and maximum of ``array``.
 
     With ``axis=None`` (default), reduces every element to two Python scalars using
     tiled kernels (``wp.tile_load`` + ``wp.tile_min``/``tile_max`` +
-    ``wp.atomic_min``/``atomic_max``).
+    ``wp.atomic_min``/``atomic_max``). Either direction alone would be one launch, one
+    buffer and one readback too, so asking for both costs nothing extra.
+
+    A rank-1 ``wp.vec3`` array reduces component-wise to a ``(wp.vec3, wp.vec3)`` corner
+    pair — one chunked kernel into a single six-slot buffer (the upper corner negated so
+    one ``inf`` fill seeds both ends) and one readback, which is what keeps
+    [`aabb_bounds`][triwarp.bounds.aabb_bounds] host-latency-bound and nothing more.
 
     With ``axis=0`` or ``axis=1`` on a rank-2 input, reduces along that axis to a
     pair of 1D ``wp.array`` buffers (min, max) of the same dtype.
@@ -121,26 +135,38 @@ def minmax(
     Parameters
     ----------
     array
-        Rank-1 ``(n,)`` or rank-2 ``(n, m)`` scalar Warp array. Must be non-empty.
+        Rank-1 ``(n,)`` or rank-2 ``(n, m)`` scalar Warp array, or a rank-1 ``wp.vec3``
+        array. Must be non-empty.
     axis
         ``None`` for a global scalar result. ``0`` or ``1`` for per-axis 1D
-        results (rank-2 input only).
+        results (rank-2 scalar input only).
 
     Returns
     -------
-    tuple[float, float] | tuple[int, int] | tuple[wp.array, wp.array]
-        ``(min, max)`` as Python scalars when ``axis=None``; pair of 1D arrays
-        of length ``n`` (``axis=1``) or ``m`` (``axis=0``) otherwise.
+    tuple[float, float] | tuple[int, int] | tuple[wp.vec3, wp.vec3] | tuple[wp.array, wp.array]
+        ``(min, max)`` as Python scalars — or ``wp.vec3`` corners for a ``wp.vec3`` input —
+        when ``axis=None``; pair of 1D arrays of length ``n`` (``axis=1``) or ``m``
+        (``axis=0``) otherwise.
 
     Raises
     ------
     ValueError
-        If ``array`` is empty, its rank is not 1 or 2, or ``axis`` is not
-        ``None`` for a rank-1 input.
+        If ``array`` is empty, its rank is not 1 or 2, ``axis`` is not ``None`` for a
+        rank-1 or ``wp.vec3`` input.
+
+    See Also
+    --------
+    [`aabb_bounds`][triwarp.bounds.aabb_bounds]
+        The mesh-facing spelling of the ``wp.vec3`` reduction, with the empty-input
+        ``(+inf, -inf)`` convention instead of a raise.
     """
+    if array.dtype == wp.vec3:
+        if axis is not None:
+            raise ValueError("minmax requires axis=None for a wp.vec3 array.")
+        return _launch_global_vec3_minmax(cast("wp.array[wp.vec3]", array))
     return cast(
         tuple[float, float] | tuple[int, int] | tuple[twt.Array1dScalar, twt.Array1dScalar],
-        _reduce_scalar(array, axis, _SCALAR_REDUCE["minmax"]),
+        _reduce_scalar(cast(twt.ScalarArray, array), axis, _SCALAR_REDUCE["minmax"]),
     )
 
 
@@ -632,6 +658,25 @@ def _launch_global_scalar_tiled(
     if spec.global_output_slots == 2:
         return cast(tuple[int, int] | tuple[float, float], (out_np[0].item(), out_np[1].item()))
     return cast(float | int, out_np.item())
+
+
+def _launch_global_vec3_minmax(array: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
+    """Component-wise corner pair of a ``wp.vec3`` array: one launch, one buffer, one readback."""
+    n = int(array.shape[0])
+    if n == 0:
+        raise ValueError("minmax requires a non-empty array.")
+    if int(array.ndim) != 1:
+        raise ValueError("minmax requires a rank-1 wp.vec3 array.")
+    corners = wp.full(6, math.inf, dtype=wp.float32, device=array.device)
+    wp.launch(
+        kernel_reduce.minmax_vec3_chunked,
+        dim=(n + TILE_1D - 1) // TILE_1D,
+        inputs=[array, corners],
+        device=array.device,
+    )
+    corners_np = corners.numpy()
+    # Slots 3..5 hold the *negated* upper corner; see the kernel.
+    return wp.vec3(*corners_np[:3].tolist()), wp.vec3(*(-corners_np[3:]).tolist())
 
 
 def _reduce_scalar(

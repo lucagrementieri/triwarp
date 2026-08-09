@@ -485,9 +485,10 @@ def outlier_probability(
         device=device,
     )
 
-    # nplof = scale * sqrt(E[plof^2]) over the whole cloud: one readback, because the normalizer is
-    # a scalar every point divides by and Warp cannot pass a device scalar as a uniform argument.
-    normalizer = scale * math.sqrt(tw.reduce.mean(tw.array.square(plof)))
+    # nplof = scale * sqrt(E[plof^2]) over the whole cloud: one fused sum-of-squares reduction and
+    # one readback, because the normalizer is a scalar every point divides by and Warp cannot pass
+    # a device scalar as a uniform argument.
+    normalizer = scale * math.sqrt(wp.utils.array_inner(plof, plof) / n)
     out_probability = wp.zeros(n, dtype=wp.float32, device=device)
     if normalizer <= 0.0:
         return out_probability  # a cloud with no spread: every plof is zero

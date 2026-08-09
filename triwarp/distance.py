@@ -6,7 +6,7 @@ point-to-surface primitives in [`triwarp.proximity`][] with the tiled reductions
 in [`triwarp.reduce`][], and never move per-element data to the host.
 
 Chamfer distances follow the ``pytorch3d`` convention and are built on **squared**
-Euclidean distances (via [`square`][triwarp.array.square]). Hausdorff distances follow
+Euclidean distances. Hausdorff distances follow
 libigl's ``igl::hausdorff`` and reduce the (already Euclidean) per-element distances with
 a maximum, so no squaring or final square root is needed.
 
@@ -22,7 +22,7 @@ Two families of geometry are supported and can be mixed:
 
 from __future__ import annotations
 
-from typing import Any, Literal, cast, overload
+from typing import Literal, cast, overload
 
 import warp as wp
 
@@ -30,6 +30,7 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import items_per_slice, prefers_tiled_reduction
 from triwarp.constants import TILE_1D
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import distance as kernel_distance
 
 _PointReduction = Literal["mean", "sum", "max"]
@@ -47,7 +48,11 @@ def _validate_point_reduction(point_reduction: _PointReduction | None) -> None:
 
 
 def _square(distances: wp.array[wp.float32]) -> twt.Array1dFloat32:
-    return cast(twt.Array1dFloat32, tw.array.square(cast(Any, distances)))
+    n = int(distances.shape[0])
+    squared = wp.empty(n, dtype=wp.float32, device=distances.device)
+    if n > 0:
+        wp.map(kernel_array.square_scalar, distances, out=squared)
+    return cast(twt.Array1dFloat32, squared)
 
 
 def _reduce(distances: twt.Array1dFloat32, point_reduction: _PointReduction) -> float:

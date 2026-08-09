@@ -114,6 +114,23 @@ def test_pack_1d_arrays(bench_case: BenchCase, n_segments: int) -> None:
     assert int(offsets.shape[0]) == n_segments
 
 
+@pytest.mark.benchmark(group="split_array")
+@pytest.mark.benchlibs("triwarp")
+@pytest.mark.parametrize("n_segments", _SEGMENT_COUNTS, ids=["few", "many"])
+@pytest.mark.parametrize("copy", [False, True], ids=["views", "copies"])
+def test_split(bench_case: BenchCase, n_segments: int, copy: bool) -> None:
+    """
+    The inverse of ``pack_1d_arrays``: one offsets readback, then views or per-segment clones.
+
+    The ``views`` rows price the readback plus Python slicing alone; the gap to ``copies`` at
+    ``many`` is the per-segment ``wp.clone`` launches, the same per-segment floor the packing
+    direction pays.
+    """
+    flat, offsets = tw.array.pack_1d_arrays(_segments(bench_case, n_segments))
+    parts = bench_case.run(lambda: tw.array.split(flat, offsets, copy=copy))
+    assert len(parts) == n_segments
+
+
 @pytest.mark.benchmark(group="sort_and_argsort")
 @pytest.mark.benchlibs("triwarp")
 def test_sort_and_argsort(bench_case: BenchCase) -> None:

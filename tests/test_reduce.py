@@ -98,6 +98,26 @@ def test_minmax_2d(device: str) -> None:
     assert np.allclose(max_wp, max_np)
 
 
+def test_minmax_vec3(device: str) -> None:
+    """Component-wise corner pair of a ``wp.vec3`` array (the ``aabb_bounds`` reduction)."""
+    rng = np.random.default_rng(42)
+    points_np = rng.standard_normal((500, 3)).astype(np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+
+    lower_wp, upper_wp = tw_reduce.minmax(points_wp)
+
+    assert np.allclose(np.array(list(lower_wp)), points_np.min(axis=0), rtol=1e-6, atol=1e-6)
+    assert np.allclose(np.array(list(upper_wp)), points_np.max(axis=0), rtol=1e-6, atol=1e-6)
+
+
+def test_minmax_vec3_rejects_axis_and_empty(device: str) -> None:
+    points_wp = wp.array(np.zeros((4, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    with pytest.raises(ValueError, match="axis=None"):
+        tw_reduce.minmax(points_wp, axis=0)
+    with pytest.raises(ValueError, match="non-empty"):
+        tw_reduce.minmax(wp.empty(0, dtype=wp.vec3, device=device))
+
+
 @pytest.mark.parametrize("axis", [0, 1])
 def test_minmax_2d_axis(device: str, axis: int) -> None:
     rng = np.random.default_rng(42)

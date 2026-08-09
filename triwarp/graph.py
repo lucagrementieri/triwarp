@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import warp as wp
 import warp.sparse as wps
 
@@ -298,6 +300,144 @@ def connected_component_parity_from_edges(
         device=device,
     )
     return labels, parity
+
+
+def successor_cycles(
+    edges: twt.Array2dInt32, node_count: int, *, validate: bool = True
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Every cycle of a successor graph in traversal order, packed flat plus per-cycle offsets.
+
+    The edges of a **successor graph** — one in which each node has at most one outgoing edge —
+    decompose into node-disjoint cycles and chains. This orders every node along its cycle,
+    following the edge direction from the cycle's smallest node index, with no per-cycle Python
+    and no per-cycle allocation. The ranking is pointer-jumping (Wyllie's list ranking), so the
+    work is ``O(k log L)`` over ``k`` cycle nodes with longest cycle ``L`` rather than the
+    quadratic per-node successor walk. A mesh boundary's oriented edges are the motivating input
+    (see [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched]).
+
+    Parameters
+    ----------
+    edges
+        ``(m, 2)`` ``wp.int32`` directed edges; row ``(a, b)`` makes ``b`` the successor of
+        ``a``. At most one out-edge per node. Nodes appearing in no edge belong to no cycle and
+        do not appear in the result.
+    node_count
+        Number of nodes ``0 .. node_count - 1``.
+    validate
+        When ``False``, skip the range check on ``edges`` and the device synchronization it
+        costs; forwarded to [`connected_component_labels_from_edges`]
+        [triwarp.graph.connected_component_labels_from_edges] — see the warning there.
+
+    Returns
+    -------
+    flat_cycles : wp.array[wp.int32]
+        Concatenated ordered node indices of every cycle, on ``edges.device``. Each cycle starts
+        at its smallest node index and follows the edge direction.
+    offsets : wp.array[wp.int32]
+        Length-``n_cycles`` exclusive prefix sum of the cycle sizes: cycle ``i`` occupies
+        ``flat_cycles[offsets[i] : offsets[i] + cycle_sizes[i]]``. Not a total-terminated CSR
+        array — the last cycle ends at ``flat_cycles.shape[0]``.
+    cycle_sizes : wp.array[wp.int32]
+        Length-``n_cycles`` node count per cycle.
+
+    Raises
+    ------
+    ValueError
+        If ``edges`` is not ``(m, 2)``, ``node_count`` is negative, or (with ``validate``) an
+        endpoint is out of range.
+
+    Notes
+    -----
+    On malformed input — a node with several in-edges, so two chains merge — the cycle ranks can
+    collide. Colliding nodes overwrite one slot and leave another at ``0``, which is a valid node
+    index, so the result stays in-range rather than returning uninitialized garbage; it is the
+    caller's job to pass a true successor graph if exact cycles are required.
+
+    See Also
+    --------
+    [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
+    [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched]
+    """
+    twt.ensure_ndim(edges, 2, dtype=wp.int32)
+    if int(edges.shape[1]) != 2:
+        raise ValueError(f"edges must have shape (m, 2), got {edges.shape}")
+    if node_count < 0:
+        raise ValueError(f"node_count must be non-negative, got {node_count}")
+
+    device = edges.device
+    m = int(edges.shape[0])
+    if m == 0 or node_count == 0:
+        # Three *distinct* empty allocations, so callers may write into them independently.
+        return tuple(wp.empty(0, dtype=wp.int32, device=device) for _ in range(3))
+
+    next_node = wp.full(node_count, -1, dtype=wp.int32, device=device)
+    wp.launch(kernel_graph.scatter_successor, dim=m, inputs=[edges, next_node], device=device)
+
+    labels = connected_component_labels_from_edges(edges, node_count=node_count, validate=validate)
+
+    cycle_nodes = tw.grouping.unique_1d(edges.flatten())
+    n_nodes = int(cycle_nodes.shape[0])
+
+    label_min = wp.full(node_count, node_count, dtype=wp.int32, device=device)
+    label_count = wp.zeros(node_count, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_graph.scatter_cycle_min_and_count,
+        dim=n_nodes,
+        inputs=[cycle_nodes, labels, label_min, label_count],
+        device=device,
+    )
+
+    # Pointer-jumping list ranking (Wyllie): O(log L) rounds of pointer doubling replace the
+    # per-node successor walk, whose total work was quadratic in the cycle length.
+    successor = wp.empty(node_count, dtype=wp.int32, device=device)
+    steps = wp.empty(node_count, dtype=wp.int32, device=device)
+    successor_next = wp.empty(node_count, dtype=wp.int32, device=device)
+    steps_next = wp.empty(node_count, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_graph.init_rank_arrays,
+        dim=n_nodes,
+        inputs=[cycle_nodes, next_node, labels, label_min, successor, steps],
+        device=device,
+    )
+    rounds = max(1, math.ceil(math.log2(max(n_nodes, 2))))
+    for _ in range(rounds):
+        wp.launch(
+            kernel_graph.jump_rank,
+            dim=n_nodes,
+            inputs=[cycle_nodes, successor, steps, successor_next, steps_next],
+            device=device,
+        )
+        successor, successor_next = successor_next, successor
+        steps, steps_next = steps_next, steps
+
+    position = wp.empty(n_nodes, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_graph.finalize_rank_positions,
+        dim=n_nodes,
+        inputs=[cycle_nodes, labels, label_count, steps, position],
+        device=device,
+    )
+
+    node_labels = tw.array.gather(labels, cycle_nodes)
+    unique_labels, cycle_index = tw.grouping.unique_1d(node_labels, return_inverse=True)
+    n_cycles = int(unique_labels.shape[0])
+
+    cycle_sizes = tw.array.gather(label_count, unique_labels)
+    offsets = wp.empty(n_cycles, dtype=wp.int32, device=device)
+    wp.utils.array_scan(cycle_sizes, out_array=offsets, inclusive=False)
+
+    # Zero-initialised (not wp.empty): colliding ranks on malformed input (see Notes) can leave
+    # slots unwritten by scatter_cycle_slot, and zero is a valid node index.
+    flat_cycles = wp.zeros(n_nodes, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_graph.scatter_cycle_slot,
+        dim=n_nodes,
+        inputs=[cycle_nodes, cycle_index, position, offsets, flat_cycles],
+        device=device,
+    )
+
+    return flat_cycles, offsets, cycle_sizes
 
 
 def bfs(

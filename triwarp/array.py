@@ -225,7 +225,7 @@ def pack_1d_arrays(
     offsets
         Length ``len(arrays)`` (the start offset of each segment, an exclusive scan of the
         segment sizes), ``dtype`` ``wp.int32``, same ``device`` as the inputs. ``offsets[0] == 0``.
-        This is *not* a trailing-sentinel CSR array — there is no ``offsets[-1] == flat.size``
+        This is *not* a total-terminated CSR array — there is no ``offsets[-1] == flat.size``
         terminator, so the last segment's length must be taken from ``arrays[-1].size`` (or
         ``flat.size - offsets[-1]``).
 
@@ -236,6 +236,8 @@ def pack_1d_arrays(
 
     See Also
     --------
+    [`split`][triwarp.array.split]
+        The inverse: recovers the per-segment arrays from ``(flat, offsets)``.
     [`concatenate`][triwarp.array.concatenate]
     """
     flat, offsets = _pack_segments(arrays, caller="pack_1d_arrays")
@@ -281,6 +283,70 @@ def concatenate(arrays: Sequence[wp.array[DType]]) -> wp.array[DType]:
             raise ValueError(f"concatenate requires rank-1 arrays, got ndim={arr.ndim}")
         return arr
     return _pack_segments(arrays, caller="concatenate")[0]
+
+
+def split(
+    array: wp.array[DType], offsets: wp.array[wp.int32], *, copy: bool = False
+) -> list[wp.array[DType]]:
+    """
+    Break a packed 1-D array into its per-segment arrays (``numpy.split``).
+
+    The inverse of [`pack_1d_arrays`][triwarp.array.pack_1d_arrays]: segment ``i`` is
+    ``array[offsets[i] : offsets[i + 1]]``, with the last segment running to the end of
+    ``array``. One host readback of ``offsets``, then zero copies by default — the segments are
+    views into ``array``, which they keep alive.
+
+    Parameters
+    ----------
+    array
+        Rank-1 array to split, any ``dtype``.
+    offsets
+        Length-``n_segments`` ``wp.int32`` exclusive prefix sum of the segment sizes, starting
+        at ``0`` — exactly what [`pack_1d_arrays`][triwarp.array.pack_1d_arrays] and
+        [`counts_to_offsets`][triwarp.array.counts_to_offsets] return. The total-terminated
+        ``n + 1`` form (``include_total=True``) is also accepted; its trailing entry simply
+        yields one final empty segment, so pass the length-``n`` form when that matters.
+    copy
+        When ``True``, return independent ``wp.clone`` copies instead of views.
+
+    Returns
+    -------
+    list[wp.array]
+        One array per segment, on ``array.device``, in segment order. Empty list when
+        ``offsets`` is empty.
+
+    Raises
+    ------
+    ValueError
+        If ``array`` or ``offsets`` is not rank-1, or ``offsets`` is not a non-decreasing
+        sequence starting at ``0`` and bounded by ``array``'s length.
+
+    See Also
+    --------
+    [`pack_1d_arrays`][triwarp.array.pack_1d_arrays]
+        The inverse: packs per-segment arrays into one buffer plus these offsets.
+    [`split`][triwarp.combine.split]
+        The mesh-level operation of the same name, which separates a mesh into connected
+        components. Both names are required: this one mirrors [`numpy.split`][], that one
+        ``trimesh.Trimesh.split``.
+    [`numpy.split`][]
+    """
+    if int(array.ndim) != 1:
+        raise ValueError(f"split requires a rank-1 array, got ndim={array.ndim}")
+    if int(offsets.ndim) != 1:
+        raise ValueError(f"split requires rank-1 offsets, got ndim={offsets.ndim}")
+
+    n = int(array.shape[0])
+    starts = [int(start) for start in offsets.numpy().tolist()]
+    if not starts:
+        return []
+    bounds = [*starts, n]
+    if starts[0] != 0 or any(a > b for a, b in itertools.pairwise(bounds)):
+        raise ValueError(
+            f"offsets must start at 0 and be non-decreasing within [0, {n}], got {starts}"
+        )
+    segments = [array[begin:end] for begin, end in itertools.pairwise(bounds)]
+    return [wp.clone(segment) for segment in segments] if copy else segments
 
 
 def _pack_segments(
@@ -610,13 +676,6 @@ def isin(elements: twt.ArrayNd, test_elements: wp.array[wp.Int]) -> wp.array[wp.
     return out_flat if is_flat else out_flat.reshape(elements.shape)
 
 
-def _cast_to_dtype(values: wp.array[DType], dtype: type[wp.Scalar]) -> wp.array[wp.Scalar]:
-    """Element-wise dtype conversion of a 1D array (``wp.cast`` has no Python-scope form)."""
-    out = wp.empty(int(values.shape[0]), dtype=dtype, device=values.device)
-    wp.utils.array_cast(values, out)
-    return out
-
-
 def _sorted_copy(values: wp.array[DType]) -> wp.array[DType]:
     """
     Ascending-sorted copy of a 1D scalar array.
@@ -772,6 +831,7 @@ def gather(
     --------
     [`index_sparse`][triwarp.array.index_sparse]
     [`remap_indices`][triwarp.array.remap_indices]
+        The sentinel-preserving variant for index buffers that may carry ``-1`` entries.
     """
     k = int(indices.shape[0])
     out_shape = (k, *(int(dim) for dim in src.shape[1:]))
@@ -828,6 +888,14 @@ def mask_to_index_map(
     """
     Compact index map over the ``True`` entries of a boolean mask, plus their count.
 
+    Not [`flatnonzero`][triwarp.array.flatnonzero], though the two come from the same scan:
+    ``flatnonzero`` returns *which* elements are selected (length ``count``, values are positions
+    into ``mask``), while this returns *where each element lands* in the compacted numbering
+    (length ``n``, values are compact ranks). Renumbering consumers — the free/fixed
+    degree-of-freedom partitions in [`triwarp.smoothing`][triwarp.smoothing] and
+    [`triwarp.linalg`][triwarp.linalg] — need this full-length scatter-side form, which
+    ``flatnonzero`` cannot provide without an extra pass.
+
     Parameters
     ----------
     mask
@@ -859,7 +927,7 @@ def mask_to_index_map(
 
 
 def counts_to_offsets(
-    counts: wp.array[wp.int32], *, sentinel: bool = False
+    counts: wp.array[wp.int32], *, include_total: bool = False
 ) -> tuple[wp.array[wp.int32], int]:
     """
     Exclusive prefix sum of ``counts``, plus their total.
@@ -876,7 +944,7 @@ def counts_to_offsets(
     ----------
     counts
         Length-``n`` ``wp.int32`` per-element counts.
-    sentinel
+    include_total
         Return the length-``n + 1`` CSR form, whose trailing element is ``total``, instead of the
         length-``n`` form. Free — that buffer is what gets built either way — and it is what
         ``warp.utils.segmented_sort_pairs`` and the other segment-bounds consumers want.
@@ -885,8 +953,8 @@ def counts_to_offsets(
     -------
     offsets : wp.array[wp.int32]
         Exclusive prefix sum: length ``n`` by default, or ``n + 1`` with ``offsets[n] == total``
-        when ``sentinel`` is set. The default is a **view** into the ``n + 1`` buffer, which the
-        returned array keeps alive. Element ``i`` owns ``[offsets[i], offsets[i] + counts[i])``.
+        when ``include_total`` is set. The default is a **view** into the ``n + 1`` buffer, which
+        the returned array keeps alive. Element ``i`` owns ``[offsets[i], offsets[i] + counts[i])``.
     total : int
         Sum of ``counts``.
 
@@ -905,17 +973,24 @@ def counts_to_offsets(
     n = int(counts.shape[0])
     device = counts.device
     if n == 0:
-        return wp.zeros(1 if sentinel else 0, dtype=wp.int32, device=device), 0
+        return wp.zeros(1 if include_total else 0, dtype=wp.int32, device=device), 0
     # The leading zero from ``wp.zeros`` is the first exclusive offset; the inclusive scan fills the
     # rest, so ``buffer[n]`` is the total and ``buffer[:n]`` the exclusive offsets.
     buffer = wp.zeros(n + 1, dtype=wp.int32, device=device)
     wp.utils.array_scan(counts, out_array=buffer[1:], inclusive=True)
-    return buffer if sentinel else buffer[:n], int(buffer[n:].numpy()[0])
+    return buffer if include_total else buffer[:n], int(buffer[n:].numpy()[0])
 
 
 def remap_indices(indices: wp.array[wp.int32], remap: wp.array[wp.int32]) -> wp.array[wp.int32]:
     """
-    Remap an index buffer through a lookup table, skipping negative (sentinel) entries.
+    Remap an index buffer through a lookup table, passing negative (sentinel) entries through.
+
+    Not a plain [`gather`][triwarp.array.gather]: the ``-1`` slots that mark padded or removed
+    entries in an index buffer must survive the remap unchanged, where a gather would read out of
+    bounds on them. [`triwarp.repair`][triwarp.repair] relies on this — its functions preserve
+    ``-1`` face sentinels through vertex renumbering (see
+    ``remove_unreferenced_vertices``, pinned by ``tests/test_repair.py::
+    test_remove_unreferenced_sentinel``).
 
     Parameters
     ----------
@@ -930,6 +1005,11 @@ def remap_indices(indices: wp.array[wp.int32], remap: wp.array[wp.int32]) -> wp.
     wp.array[wp.int32]
         Length ``len(indices)`` array on ``indices.device`` with ``out[i] = remap[indices[i]]``
         for non-negative ``indices[i]``, and ``out[i] = indices[i]`` otherwise.
+
+    See Also
+    --------
+    [`gather`][triwarp.array.gather]
+        The sentinel-free form: a dense first-axis gather for index buffers known to be in range.
     """
     n = int(indices.shape[0])
     device = indices.device
@@ -984,71 +1064,6 @@ def trim_to_count(
             wp.copy(out, buffer[:n_out])
         trimmed.append(out)
     return n_out, trimmed
-
-
-def square(values: wp.array[wp.Scalar]) -> wp.array[wp.Scalar]:
-    """
-    Element-wise square of a scalar array.
-
-    Computes ``out[i] = values[i] ** 2`` on the device, returning a freshly
-    allocated array of the same dtype and length.
-
-    Parameters
-    ----------
-    values
-        Length-``n`` scalar Warp array (e.g. ``wp.float32`` or ``wp.int32``).
-
-    Returns
-    -------
-    wp.array[wp.Scalar]
-        Length-``n`` squared values on ``values.device``. Empty when ``n == 0``.
-    """
-    device = values.device
-    n = int(values.shape[0])
-    out = wp.empty(n, dtype=values.dtype, device=device)
-    if n == 0:
-        return out
-    wp.map(kernel_array.square_scalar, values, out=out)
-    return out
-
-
-def clamp(
-    values: wp.array[wp.Scalar], minimum: wp.Scalar, maximum: wp.Scalar
-) -> wp.array[wp.Scalar]:
-    """
-    Element-wise clamp of a scalar array to ``[minimum, maximum]``.
-
-    Computes ``out[i] = min(max(values[i], minimum), maximum)`` on the device, returning a freshly
-    allocated array of the same dtype and length. The counterpart of MeshLab's
-    ``apply_scalar_clamping_per_vertex`` for a per-vertex field, though nothing here is mesh-aware.
-
-    Parameters
-    ----------
-    values
-        Length-``n`` scalar Warp array.
-    minimum
-        Lower bound, in ``values.dtype``.
-    maximum
-        Upper bound, in ``values.dtype``. Must not be below ``minimum``; when it is, ``wp.clamp``
-        returns ``maximum`` for every element rather than raising.
-
-    Returns
-    -------
-    wp.array[wp.Scalar]
-        Length-``n`` clamped values on ``values.device``. Empty when ``n == 0``.
-
-    See Also
-    --------
-    [`square`][triwarp.array.square]
-    [`triwarp.smoothing.saturate_scalar_gradient`][triwarp.smoothing.saturate_scalar_gradient]
-    """
-    device = values.device
-    n = int(values.shape[0])
-    out = wp.empty(n, dtype=values.dtype, device=device)
-    if n == 0:
-        return out
-    wp.map(wp.clamp, values, minimum, maximum, out=out)
-    return out
 
 
 def sortable_dtype(dtype: type[wp.Scalar]) -> type[wp.Scalar]:
@@ -1202,17 +1217,10 @@ def bitcast_from_int(
 # ---------------------------------------------------------------------------
 
 
-def _as_vec3d(vertices: wp.array[wp.vec3]) -> wp.array[wp.vec3d]:
-    """Widen a ``wp.vec3`` array to ``wp.vec3d`` (used by ``smoothing``'s float64 solves)."""
-    out = wp.empty(int(vertices.shape[0]), dtype=wp.vec3d, device=vertices.device)
-    wp.map(kernel_array.to_vec3d, vertices, out=out)
-    return out
-
-
-def _as_vec3(positions: wp.array[wp.vec3d]) -> wp.array[wp.vec3]:
-    """Narrow a ``wp.vec3d`` array back to ``wp.vec3`` (used by ``smoothing``'s float64 solves)."""
-    out = wp.empty(int(positions.shape[0]), dtype=wp.vec3, device=positions.device)
-    wp.map(kernel_array.to_vec3, positions, out=out)
+def _cast_to_dtype(values: wp.array[DType], dtype: type) -> wp.array:
+    """Element-wise dtype conversion of a 1D array (``wp.cast`` has no Python-scope form)."""
+    out = wp.empty(int(values.shape[0]), dtype=dtype, device=values.device)
+    wp.utils.array_cast(values, out)
     return out
 
 

@@ -300,7 +300,7 @@ def sample_surface_poisson_disk(
 
     # 4. Neighbor lists (GPU, computed once for the full initial pool)
     nbr_idx, nbr_dists, offsets = query_hashgrid_ball_with_offsets(
-        init_points, init_points, r_max, sentinel_offsets=True
+        init_points, init_points, r_max, include_total=True
     )
 
     # 5. Initial per-point weights (parallel)
@@ -406,7 +406,7 @@ def _dart_throw_blue_noise(
     wp.copy(sorted_keys, keys_buf, count=n_pool)
     unique_keys, counts = tw.grouping.unique_1d(sorted_keys, return_counts=True)
     n_cells = int(unique_keys.shape[0])
-    cell_offsets, _ = tw.array.counts_to_offsets(counts, sentinel=True)
+    cell_offsets, _ = tw.array.counts_to_offsets(counts, include_total=True)
 
     point_cell = wp.empty(n_pool, dtype=wp.int32, device=device)
     wp.launch(

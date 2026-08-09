@@ -72,14 +72,15 @@ def test_aabb_bounds_matches_trimesh_open3d_and_igl(
 
 
 @pytest.mark.parametrize("mesh_name", _MESHES)
-@pytest.mark.parity("aabb_diagonal", "igl")
-def test_aabb_diagonal_matches_igl(request: pytest.FixtureRequest, mesh_name: str) -> None:
+@pytest.mark.parity("enclosing_diagonal", "igl")
+def test_enclosing_diagonal_single_cloud_matches_igl(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
     """
     Class A: the bbox diagonal length, against ``igl.bounding_box_diagonal``.
 
-    igl computes the box itself internally where triwarp takes the two corners as arguments, so
-    this also checks the composition ``aabb_diagonal(*aabb_bounds(...))`` a caller actually writes
-    -- the only path by which triwarp produces this number.
+    Both sides compute the box internally from one point set: ``enclosing_diagonal`` with no
+    ``other`` is the single-cloud form, and the only path by which triwarp produces this number.
 
     The fixtures span a cube-like solid and two thin open surfaces, so no single axis dominates the
     answer on all of them: an implementation returning the longest *extent* rather than the diagonal
@@ -90,7 +91,7 @@ def test_aabb_diagonal_matches_igl(request: pytest.FixtureRequest, mesh_name: st
         np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
     )
 
-    diagonal_wp = tw.bounds.aabb_diagonal(*tw.bounds.aabb_bounds(mesh_wp.points))
+    diagonal_wp = tw.bounds.enclosing_diagonal(mesh_wp.points)
 
     assert np.isclose(diagonal_wp, diagonal_igl, rtol=1e-5, atol=1e-5)
     # Not merely the longest extent: on these fixtures the two differ by more than the tolerance.
@@ -106,7 +107,7 @@ def test_aabb_bounds_single_point(device: str) -> None:
     lower_wp, upper_wp = tw.bounds.aabb_bounds(points_wp)
 
     assert np.allclose(_bounds_np(lower_wp, upper_wp), [[1.5, -2.5, 3.5]] * 2, rtol=1e-6)
-    assert tw.bounds.aabb_diagonal(lower_wp, upper_wp) == 0.0
+    assert tw.bounds.enclosing_diagonal(points_wp) == 0.0
 
 
 def test_aabb_union_encloses_both_boxes() -> None:
@@ -195,7 +196,6 @@ def test_enclosing_diagonal_ignores_an_empty_second_set(device: str) -> None:
     alone = tw.bounds.enclosing_diagonal(cloud_wp)
     assert alone == tw.bounds.enclosing_diagonal(cloud_wp, None)
     assert alone == tw.bounds.enclosing_diagonal(cloud_wp, empty_wp)
-    assert alone == tw.bounds.aabb_diagonal(*tw.bounds.aabb_bounds(cloud_wp))
 
 
 def _tilted_cloud(mesh_tm: tm.Trimesh, device: str) -> tuple[np.ndarray, wp.array[wp.vec3]]:
@@ -407,6 +407,31 @@ def test_oriented_bounding_box_agrees_with_open3d_minimal_box(
     assert np.isclose(
         volume_wp, _achieved_loss(points_np, _frame_np(rotation_wp), "volume"), rtol=1e-5
     )
+
+
+def test_oriented_bounding_box_prefilter_returns_the_identical_box(device: str) -> None:
+    """
+    Above ``CONVEX_PREFILTER_MIN_POINTS`` the convex-superset prefilter must change nothing.
+
+    The dense cloud (prefiltered internally) and its explicit hull-candidate subset (below the
+    threshold, so searched directly) score the same support points, and min/max extents are
+    order-independent, so the two boxes must agree to float32 exactness — not merely in volume.
+    """
+    rng = np.random.default_rng(23)
+    n = tw.bounds.CONVEX_PREFILTER_MIN_POINTS + 10_000
+    cloud_np = (rng.standard_normal((n, 3)) @ np.diag([3.0, 1.0, 0.5])).astype(np.float32)
+    cloud_wp = wp.array(cloud_np, dtype=wp.vec3, device=device)
+
+    kept_wp = tw.array.gather(
+        cloud_wp, tw.array.flatnonzero(tw.convex.convex_superset_mask(cloud_wp))
+    )
+    assert int(kept_wp.shape[0]) < n // 10, "the prefilter must actually discard interior points"
+
+    rotation_dense, lower_dense, upper_dense = tw.bounds.oriented_bounding_box(cloud_wp)
+    rotation_kept, lower_kept, upper_kept = tw.bounds.oriented_bounding_box(kept_wp)
+
+    assert np.allclose(_frame_np(rotation_dense), _frame_np(rotation_kept), rtol=0, atol=0)
+    assert np.array_equal(_bounds_np(lower_dense, upper_dense), _bounds_np(lower_kept, upper_kept))
 
 
 def test_oriented_bounding_box_single_rotation_is_the_aabb(

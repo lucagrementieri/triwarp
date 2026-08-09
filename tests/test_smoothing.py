@@ -727,18 +727,6 @@ def test_saturate_scalar_gradient_invalid(icosahedron: tuple[tm.Trimesh, wp.Mesh
         )
 
 
-def test_clamp(device: str) -> None:
-    values_np = np.array([-2.0, -0.5, 0.0, 0.5, 3.0], dtype=np.float32)
-    values_wp = wp.array(values_np, dtype=wp.float32, device=device)
-    clamped_wp = tw.array.clamp(values_wp, wp.float32(-1.0), wp.float32(1.0))
-    assert np.array_equal(clamped_wp.numpy(), np.clip(values_np, -1.0, 1.0))
-
-
-def test_clamp_empty(device: str) -> None:
-    values_wp = wp.empty(0, dtype=wp.float32, device=device)
-    assert tw.array.clamp(values_wp, wp.float32(0.0), wp.float32(1.0)).shape == (0,)
-
-
 # ---------------------------------------------------------------------------
 # Feature-preserving smoothing vs pymeshlab (two-step / normal filtering / unsharp)
 # ---------------------------------------------------------------------------
