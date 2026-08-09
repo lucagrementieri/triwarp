@@ -167,8 +167,7 @@ def isotropic_remesh(
     if n_faces == 0 or iterations <= 0:
         return current_vertices, current_faces
 
-    lo, hi = tw.bounds.aabb_bounds(vertices)
-    diag = float(wp.length(hi - lo))
+    diag = tw.bounds.enclosing_diagonal(vertices)
     target = target_length if target_length is not None else 0.01 * diag
     if target <= 0.0:
         raise ValueError(f"isotropic_remesh requires target_length > 0, got {target}.")

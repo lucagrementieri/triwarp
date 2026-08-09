@@ -1597,7 +1597,6 @@ def _clean_reconstruction(
         if crit_hole_length != 0.0:
             hole_length = crit_hole_length
             if hole_length < 0.0:
-                lo, hi = tw.bounds.aabb_bounds(points)
-                hole_length = 0.1 * float(wp.length(hi - lo))
+                hole_length = 0.1 * tw.bounds.enclosing_diagonal(points)
             faces = tw.holes.fill_small(vertices, faces, hole_length)
     return vertices, faces
