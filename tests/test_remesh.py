@@ -1140,12 +1140,6 @@ def test_remesh_flags_off(device: str) -> None:
     assert tw.validation.is_watertight(out_vertices, out_faces)
 
 
-def test_remesh_adaptive_not_implemented(device: str) -> None:
-    _sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=1)
-    with pytest.raises(NotImplementedError, match="adaptive"):
-        tw.remesh.isotropic_remesh(vertices_wp, faces_wp, adaptive=True)
-
-
 def test_remesh_target_validation(device: str) -> None:
     _sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=1)
     with pytest.raises(ValueError, match="target_length"):

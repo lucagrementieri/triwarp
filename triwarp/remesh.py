@@ -73,10 +73,7 @@ def isotropic_remesh(
     *,
     target_length: float | None = None,
     iterations: int = 10,
-    adaptive: bool = False,
     feature_angle: float = 30.0,
-    check_surface_distance: bool = True,
-    max_surface_distance: float | None = None,
     split: bool = True,
     collapse: bool = True,
     swap: bool = True,
@@ -114,18 +111,9 @@ def isotropic_remesh(
         Desired uniform edge length. Defaults to ``1 %`` of the bounding-box diagonal.
     iterations
         Number of full remeshing passes.
-    adaptive
-        Curvature-adaptive target length. Not implemented in this version (raises
-        ``NotImplementedError`` when ``True``).
     feature_angle
         Dihedral angle in **degrees** above which an interior edge is treated as a sharp feature
         (protected from flipping and collapsing across).
-    check_surface_distance
-        Reserved for an explicit surface-deviation rejection gate; in this version surface fidelity
-        is maintained by the ``reproject`` step (see Notes).
-    max_surface_distance
-        Companion tolerance for ``check_surface_distance`` (defaults to ``1 %`` of the bounding-box
-        diagonal). Reserved (see Notes).
     split, collapse, swap, smooth, reproject
         Enable/disable each stage of the per-iteration pipeline.
 
@@ -140,8 +128,6 @@ def isotropic_remesh(
     ------
     ValueError
         If ``target_length`` is non-positive.
-    NotImplementedError
-        If ``adaptive`` is ``True``.
 
     See Also
     --------
@@ -153,14 +139,13 @@ def isotropic_remesh(
     Hysteresis (split above ``4/3 t``, collapse below ``4/5 t``) keeps split and collapse from
     fighting. The collapse primitive guarantees manifoldness through the link condition but has no
     normal-flip guard in this version, relying on the reprojection step to keep free vertices on the
-    original surface; ``check_surface_distance`` / ``max_surface_distance`` are accepted for API
-    parity and reserved for a future explicit rejection gate. Adaptive (curvature-driven) sizing is
-    a documented follow-up.
+    original surface.
+
+    Two limitations, stated because the parameters that used to advertise them are gone: there is
+    no explicit surface-deviation rejection gate (fidelity comes from the ``reproject`` step), and
+    the sizing is uniform rather than curvature-adaptive. PyMeshLab's filter exposes knobs for
+    both; accepting them here and ignoring them was worse than not accepting them.
     """
-    if adaptive:
-        raise NotImplementedError(
-            "adaptive isotropic remeshing is not implemented yet; call with adaptive=False."
-        )
     n_faces = int(faces.shape[0]) // 3
     current_vertices = wp.clone(vertices)
     current_faces = wp.clone(faces)
@@ -174,7 +159,6 @@ def isotropic_remesh(
     low = wp.float32(4.0 / 5.0 * target)
     high = wp.float32(4.0 / 3.0 * target)
     feature = wp.float32(math.radians(feature_angle))
-    _ = max_surface_distance if max_surface_distance is not None else 0.01 * diag
 
     # Original surface, built once, for reprojecting free vertices (never a 0-triangle mesh).
     original_mesh = None
