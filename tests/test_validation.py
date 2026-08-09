@@ -304,7 +304,9 @@ def test_is_vertex_manifold_precomputed_shortcut(icosahedron: tuple[tm.Trimesh, 
     assert tw.validation.is_vertex_manifold(
         mesh_wp.indices, face_adjacency=adjacency, face_adjacency_edges=adjacency_edges
     ) == tw.validation.is_vertex_manifold(mesh_wp.indices)
-    with pytest.raises(ValueError, match="together"):
+    # The half-pair raise now comes from the shared ``adjacency.resolved_face_adjacency``, so the
+    # message is the one every caller of that resolver reports rather than this module's own.
+    with pytest.raises(ValueError, match="both be provided or both omitted"):
         tw.validation.is_vertex_manifold(mesh_wp.indices, face_adjacency=adjacency)
 
 

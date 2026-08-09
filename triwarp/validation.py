@@ -57,6 +57,10 @@ def is_edge_manifold(
     -----
     Equivalent to ``open3d.geometry.TriangleMesh.is_edge_manifold``; libigl ``is_edge_manifold``
     corresponds to the ``allow_boundary_edges=True`` case.
+
+    Deliberately **not** ``all(edge_manifold_mask(faces))``, unlike the other ``is_*`` / ``*_mask``
+    pairs here: this reduces the per-edge counts directly, where the mask additionally needs
+    ``unique_1d``'s inverse and a per-face gather pass. Delegating would add both to the cheap path.
     """
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -193,47 +197,15 @@ def is_vertex_manifold(
     [`vertex_manifold_mask`][triwarp.validation.vertex_manifold_mask] for a per-vertex flag
     sized to a caller-provided vertex buffer.
     """
-    if (face_adjacency is None) != (face_adjacency_edges is None):
-        raise ValueError(
-            "is_vertex_manifold: pass face_adjacency and face_adjacency_edges together"
-        )
-    device = faces.device
-    n_faces = int(faces.shape[0]) // 3
-    if n_faces == 0:
-        return True
-
-    n_vertices = tw.vertices.n_vertices(faces)
-    n_corners = n_faces * 3
-    if face_adjacency is None or face_adjacency_edges is None:
-        adjacency, adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
-    else:
-        adjacency, adjacency_edges = face_adjacency, face_adjacency_edges
-    m = int(adjacency.shape[0])
-
-    corner_edges = twt.empty_int32_2d((2 * m, 2), device=device)
-    if m > 0:
-        wp.launch(
-            kernel_validation.build_corner_adjacency_edges,
-            dim=m,
-            inputs=[faces, adjacency, adjacency_edges, corner_edges],
-            device=device,
-        )
-
-    labels = tw.graph.connected_component_labels_from_edges(corner_edges, node_count=n_corners)
-
-    min_label = wp.full(n_vertices, twt.dtype_max(wp.int32), dtype=wp.int32, device=device)
-    manifold = wp.zeros(n_vertices, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_validation.corner_vertex_reduce,
-        dim=n_corners,
-        inputs=[faces, labels, min_label, manifold],
-        device=device,
+    # Resolved before the empty-mesh guard so a caller passing only one half of the pair is told
+    # about it whatever the mesh is; on an empty buffer the resolve itself is two empty arrays.
+    adjacency, adjacency_edges = tw.adjacency.resolved_face_adjacency(
+        faces, face_adjacency, face_adjacency_edges
     )
-    wp.launch(
-        kernel_validation.corner_vertex_check,
-        dim=n_corners,
-        inputs=[faces, labels, min_label, manifold],
-        device=device,
+    if int(faces.shape[0]) // 3 == 0:
+        return True
+    manifold = _vertex_manifold_flags(
+        faces, tw.vertices.n_vertices(faces), adjacency, adjacency_edges
     )
     return bool(tw.reduce.all(manifold))
 
@@ -267,22 +239,56 @@ def vertex_manifold_mask(
     [`is_vertex_manifold`][triwarp.validation.is_vertex_manifold]
     [`edge_manifold_mask`][triwarp.validation.edge_manifold_mask]
     """
-    device = faces.device
     n_vertices = int(vertices.shape[0])
-    n_faces = int(faces.shape[0]) // 3
-    if n_faces == 0:
-        return wp.zeros(n_vertices, dtype=wp.bool, device=device)
-
-    n_corners = n_faces * 3
+    if int(faces.shape[0]) // 3 == 0:
+        return wp.zeros(n_vertices, dtype=wp.bool, device=faces.device)
     adjacency, adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
-    m = int(adjacency.shape[0])
+    return _vertex_manifold_flags(faces, n_vertices, adjacency, adjacency_edges)
+
+
+def _vertex_manifold_flags(
+    faces: wp.array[wp.int32],
+    n_vertices: int,
+    face_adjacency: twt.Array2dInt32,
+    face_adjacency_edges: twt.Array2dInt32,
+) -> wp.array[wp.bool]:
+    """
+    Per-vertex manifold flags shared by the predicate and the mask.
+
+    Builds the corner graph (node ``3 * f + k`` per face corner), links the corresponding corners of
+    edge-adjacent faces, and flags a vertex when all of its corners land in one component.
+
+    ``n_vertices`` is a parameter rather than derived because the two public callers size their
+    answer differently on purpose:
+    [`is_vertex_manifold`][triwarp.validation.is_vertex_manifold] uses ``max(faces) + 1`` (libigl's
+    convention, so unreferenced vertices in that range count as non-manifold) while
+    [`vertex_manifold_mask`][triwarp.validation.vertex_manifold_mask] uses the caller's vertex
+    buffer length.
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer, non-empty.
+    n_vertices
+        Output length.
+    face_adjacency, face_adjacency_edges
+        Resolved ``(m, 2)`` adjacency pairs and their shared-edge vertex pairs.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Length ``n_vertices`` on ``faces.device``.
+    """
+    device = faces.device
+    n_corners = int(faces.shape[0]) // 3 * 3
+    m = int(face_adjacency.shape[0])
 
     corner_edges = twt.empty_int32_2d((2 * m, 2), device=device)
     if m > 0:
         wp.launch(
             kernel_validation.build_corner_adjacency_edges,
             dim=m,
-            inputs=[faces, adjacency, adjacency_edges, corner_edges],
+            inputs=[faces, face_adjacency, face_adjacency_edges, corner_edges],
             device=device,
         )
 
@@ -340,46 +346,10 @@ def is_self_intersecting(mesh: wp.Mesh, *, max_triangle_collisions: int = 32) ->
     -----
     Equivalent to ``open3d.geometry.TriangleMesh.is_self_intersecting``.
     """
-    vertices = mesh.points
-    faces = mesh.indices
-    device = vertices.device
-    n_faces = int(faces.shape[0]) // 3
-    if n_faces < 2:
+    found = _intersecting_pairs(mesh, mesh.points, mesh.indices, max_triangle_collisions)
+    if found is None:
         return False
-    if max_triangle_collisions < 1:
-        raise ValueError("max_triangle_collisions must be >= 1")
-
-    lower = wp.empty(n_faces, dtype=wp.vec3, device=device)
-    upper = wp.empty(n_faces, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_intersections.face_aabb_bounds,
-        dim=n_faces,
-        inputs=[vertices, faces, lower, upper],
-        device=device,
-    )
-
-    target_indices, offsets, hit_counts = tw.proximity.query_mesh_aabb_bounds_with_offsets(
-        mesh, lower, upper, max_hits=max_triangle_collisions
-    )
-    n_pairs = int(target_indices.shape[0])
-    if n_pairs == 0:
-        return False
-
-    pairs = twt.empty_int32_2d((n_pairs, 2), device=device)
-    wp.launch(
-        kernel_intersections.expand_query_target_pairs,
-        dim=n_faces,
-        inputs=[offsets, hit_counts, target_indices, pairs],
-        device=device,
-    )
-
-    valid = wp.empty(n_pairs, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_intersections.filter_intersecting_pairs,
-        dim=n_pairs,
-        inputs=[vertices, faces, vertices, faces, pairs, valid],
-        device=device,
-    )
+    _pairs, valid = found
     return bool(tw.reduce.any(valid))
 
 
@@ -427,12 +397,59 @@ def face_self_intersecting_mask(
     mask = wp.zeros(n_faces, dtype=wp.bool, device=device)
     if n_faces < 2:
         return mask
-    if max_triangle_collisions < 1:
-        raise ValueError("max_triangle_collisions must be >= 1")
 
     if mesh is None:
         require_nonempty_mesh(faces, "face_self_intersecting_mask")
         mesh = wp.Mesh(points=vertices, indices=faces)
+
+    found = _intersecting_pairs(mesh, vertices, faces, max_triangle_collisions)
+    if found is None:
+        return mask
+    pairs, valid = found
+    wp.launch(
+        kernel_validation.mark_intersecting_faces,
+        dim=int(pairs.shape[0]),
+        inputs=[pairs, valid, mask],
+        device=device,
+    )
+    return mask
+
+
+def _intersecting_pairs(
+    mesh: wp.Mesh,
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    max_triangle_collisions: int,
+) -> tuple[twt.Array2dInt32, wp.array[wp.bool]] | None:
+    """
+    Candidate face pairs and their triangle-triangle verdicts, shared by the predicate and the mask.
+
+    Broad phase queries each triangle's AABB against ``mesh``'s BVH; narrow phase runs a
+    separating-axis test on every candidate pair, skipping pairs that share a vertex.
+
+    Parameters
+    ----------
+    mesh
+        Mesh supplying the BVH for the broad phase.
+    vertices, faces
+        Geometry the narrow phase tests. Must be what ``mesh`` was built over.
+    max_triangle_collisions
+        Broad-phase candidate cap per query triangle.
+
+    Returns
+    -------
+    tuple[twt.Array2dInt32, wp.array[wp.bool]] | None
+        ``(pairs, valid)``, or ``None`` when the broad phase found no candidate at all.
+
+    Raises
+    ------
+    ValueError
+        If ``max_triangle_collisions < 1``.
+    """
+    if max_triangle_collisions < 1:
+        raise ValueError("max_triangle_collisions must be >= 1")
+    device = vertices.device
+    n_faces = int(faces.shape[0]) // 3
 
     lower = wp.empty(n_faces, dtype=wp.vec3, device=device)
     upper = wp.empty(n_faces, dtype=wp.vec3, device=device)
@@ -448,7 +465,7 @@ def face_self_intersecting_mask(
     )
     n_pairs = int(target_indices.shape[0])
     if n_pairs == 0:
-        return mask
+        return None
 
     pairs = twt.empty_int32_2d((n_pairs, 2), device=device)
     wp.launch(
@@ -465,13 +482,7 @@ def face_self_intersecting_mask(
         inputs=[vertices, faces, vertices, faces, pairs, valid],
         device=device,
     )
-    wp.launch(
-        kernel_validation.mark_intersecting_faces,
-        dim=n_pairs,
-        inputs=[pairs, valid, mask],
-        device=device,
-    )
-    return mask
+    return pairs, valid
 
 
 def is_winding_consistent(faces: wp.array[wp.int32]) -> bool:
@@ -796,6 +807,12 @@ def is_watertight(
     by exactly two faces" test (trimesh semantics) use
     [`is_edge_manifold`][triwarp.validation.is_edge_manifold] with
     ``allow_boundary_edges=False``.
+
+    **This is not the predicate form of
+    [`face_watertight_mask`][triwarp.validation.face_watertight_mask]**, despite the names: that
+    mask is trimesh's per-face edge test, while this is Open3D's three-part composition, so
+    ``all(face_watertight_mask(faces))`` is the *first* of the three conditions and not this
+    function. Every other ``is_*`` / ``*_mask`` pair in this module does relate that way.
     """
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
@@ -911,24 +928,20 @@ def is_volume(
     if n_faces == 0:
         return False
 
-    device = vertices.device
     if edges is None:
         edges = tw.edges.faces_to_edges(faces)
-    if edges_sorted is None:
-        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
 
-    edge_groups = tw.grouping.group_int_rows(edges_sorted, length=2)
-    n_groups = int(edge_groups.shape[0])
+    # The winding mask is built over edge groups of exactly two faces, so its *length* is the
+    # watertightness test: every directed edge must belong to one such group.
+    consistent = edge_winding_consistent_mask(faces, edges, edges_sorted)
+    n_groups = int(consistent.shape[0])
     if n_groups * 2 != int(edges.shape[0]):
         return False  # not watertight: some undirected edge is not shared by exactly two faces
-
-    consistent = wp.empty(n_groups, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_validation.edge_pair_winding_mask,
-        dim=n_groups,
-        inputs=[edges, edge_groups, consistent],
-        device=device,
-    )
+    # Unreachable for n_faces > 0 -- the length test above already rejects a mesh with no shared
+    # edges -- but ``reduce.all`` raises on an empty array, so the guard stays rather than relying
+    # on that.
+    if n_groups == 0:
+        return False
     if not bool(tw.reduce.all(consistent)):
         return False
 
