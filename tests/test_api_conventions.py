@@ -17,6 +17,7 @@ import pytest
 from tests.api_conventions import (
     coverage_location_problems,
     duplicate_name_problems,
+    helper_order_problems,
     kernel_module_problems,
     library_in_summary_problems,
     mask_return_problems,
@@ -122,3 +123,15 @@ def test_kernel_modules_are_named_for_their_wrapper() -> None:
     libraries that back no single module; sub-packages mirror a folder and are not checked here.
     """
     _fail("kernel/wrapper module name mismatch(es):", kernel_module_problems())
+
+
+def test_private_helpers_follow_their_callers() -> None:
+    """
+    A private helper is defined below the public function that calls it (the stepdown rule).
+
+    ``.claude/CLAUDE.md`` section 11: a reader should never need to jump backward to a definition
+    they have not been introduced to yet. ``_HELPER_ORDER_ALLOWLIST`` carries the 50 sites that
+    predate this check, as an explicit debt list rather than a silent exemption -- it is also
+    checked for staleness, so an entry that gets fixed has to be removed rather than left to rot.
+    """
+    _fail("private helper(s) above their first caller:", helper_order_problems())

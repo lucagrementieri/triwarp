@@ -1,7 +1,7 @@
 """
 Static scan of the public API's shape: names, summaries, file layout and module boundaries.
 
-Seven conventions the package holds to, each one a defect class that was actually found rather than
+Eight conventions the package holds to, each one a defect class that was actually found rather than
 an aesthetic preference. They are checked by an ``ast`` scan of ``triwarp/`` (excluding
 ``kernels/``, ``__init__.py`` and private ``_*.py`` modules) plus a listing of ``tests/`` and
 ``benchmarks/``, and [`tests/test_api_conventions.py`](test_api_conventions.py) fails the default
@@ -24,6 +24,9 @@ test run on any violation:
 7. **A top-level kernel module is named for the public module it backs**, and vice versa
    (``.claude/CLAUDE.md`` section 4). This is what stops a wrapper module from being created while
    its kernels are left behind under the old name.
+8. **A private helper is defined below its first caller** (``.claude/CLAUDE.md`` section 11's
+   stepdown rule), so a reader never jumps backward to a definition they have not met. The 50 sites
+   that predate the check are an explicit, staleness-checked debt list, not an exemption.
 
 Why a static scan rather than importing ``triwarp``
 ---------------------------------------------------
@@ -160,6 +163,85 @@ _SHARED_KERNEL_MODULES = frozenset({"predicates", "scatter"})
 # Public modules that launch no kernel of their own and so have no kernel module.
 _MODULES_WITHOUT_KERNELS = frozenset({"constants", "homology", "io", "mesh", "typing"})
 
+# --- check 8 ------------------------------------------------------------------------------------
+
+# Private helpers that sit above their first caller today. CLAUDE.md section 11 says a helper must
+# never appear above the caller it serves, but the package drifted off that rule wholesale before
+# the check existed: these 50 sites across 15 modules are internally consistent in doing the
+# opposite, and reordering fifteen files at once is a diff nobody can review. So they are an
+# explicit debt list rather than a silent exemption -- **entries come out, they do not go in**.
+# Drain one whenever you are editing its module for another reason; a *new* helper must be placed
+# correctly, which is exactly what this check now enforces.
+_HELPER_ORDER_ALLOWLIST: dict[str, frozenset[str]] = {
+    "array": frozenset({"_sorted_copy"}),
+    "combine": frozenset({"_closest_loop_pair", "_longest_increasing_subsequence"}),
+    "creation": frozenset({"_icosphere_face_table"}),
+    "distance": frozenset(
+        {
+            "_chamfer",
+            "_distances_mesh_to_mesh",
+            "_distances_points_to_mesh",
+            "_distances_points_to_points",
+            "_empty_chamfer",
+            "_hausdorff",
+            "_launch_nn_term",
+            "_launch_surface_term",
+            "_maybe_taped",
+            "_reduce",
+            "_reduction_scale",
+            "_square",
+            "_validate_diff_reduction",
+            "_validate_point_reduction",
+            "_zero_loss",
+        }
+    ),
+    "holes": frozenset(
+        {
+            "_hole_loops",
+            "_mean_rim_edge_length",
+            "_patch_mask",
+            "_run_hole_dp",
+            "_traceback_triangles",
+            "_unpack_loops",
+        }
+    ),
+    "io": frozenset({"_import_meshio"}),
+    "ray": frozenset({"_validate_ray_inputs"}),
+    "reconstruction": frozenset(
+        {"_bpa_wave", "_lexicographic_triangulation", "_orient2d", "_repeated_oriented_triangles"}
+    ),
+    "reduce": frozenset(
+        {
+            "_launch_axis_scalar",
+            "_launch_global_bool_tiled",
+            "_launch_global_scalar_tiled",
+            "_validate_scalar_array",
+        }
+    ),
+    "registration": frozenset(
+        {
+            "_identity_mat44",
+            "_is_mesh_target",
+            "_resolve_initial",
+            "_robust_scale_from_residuals",
+            "_target_index",
+        }
+    ),
+    "remesh": frozenset({"_flip_region_faces"}),
+    "sample": frozenset({"_dart_throw_blue_noise"}),
+    "smoothing": frozenset(
+        {
+            "_apply_operator",
+            "_apply_volume_constraint",
+            "_boundary_verts_mask",
+            "_edge_weight_matrix",
+            "_mesh_volume",
+        }
+    ),
+    "texture": frozenset({"_check_uv_in_range"}),
+    "typing": frozenset({"_shape_2d", "_shape_3d"}),
+}
+
 
 @dataclass(frozen=True)
 class PublicFunction:
@@ -188,6 +270,10 @@ class PublicModule:
     functions: tuple[PublicFunction, ...]
     private_imports: tuple[tuple[str, int], ...]
     """``("owner._name", lineno)`` for every private name reached across a module boundary."""
+
+    early_helpers: tuple[tuple[str, int, int], ...]
+    """``(name, def_lineno, first_caller_lineno)`` for each private helper defined above its
+    first caller."""
 
 
 @dataclass
@@ -246,6 +332,38 @@ def _private_imports(tree: ast.Module, module: str) -> list[tuple[str, int]]:
     return sorted(found)
 
 
+def _early_helpers(tree: ast.Module) -> list[tuple[str, int, int]]:
+    """
+    Private module-level helpers whose ``def`` precedes their first reference in the same module.
+
+    A reference inside the helper's own body is skipped, so recursion and a self-referencing
+    closure do not count as callers. A helper with no caller at all is not reported here -- check 5
+    already covers the cross-module case, and a genuinely dead helper is a different defect.
+    """
+    definitions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name.startswith("_")
+        and not node.name.startswith("__")
+    }
+    first_use: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Name) or not isinstance(node.ctx, ast.Load):
+            continue
+        definition = definitions.get(node.id)
+        if definition is None:
+            continue
+        if definition.lineno <= node.lineno <= (definition.end_lineno or definition.lineno):
+            continue
+        first_use[node.id] = min(first_use.get(node.id, node.lineno), node.lineno)
+    return sorted(
+        (name, definition.lineno, first_use[name])
+        for name, definition in definitions.items()
+        if name in first_use and definition.lineno < first_use[name]
+    )
+
+
 @functools.cache
 def scan_package() -> PackageScan:
     """Read every public wrapper module under ``triwarp/``, skipping ``kernels/`` and ``_*.py``."""
@@ -284,6 +402,7 @@ def scan_package() -> PackageScan:
             summary=_summary(tree),
             functions=functions,
             private_imports=tuple(_private_imports(tree, module)),
+            early_helpers=tuple(_early_helpers(tree)),
         )
     return scan
 
@@ -403,3 +522,26 @@ def kernel_module_problems() -> list[str]:
         for stem in sorted(public - kernels - _MODULES_WITHOUT_KERNELS)
     ]
     return problems
+
+
+def helper_order_problems() -> list[str]:
+    """Check 8: a private helper defined above its first caller (the stepdown rule)."""
+    problems: list[str] = []
+    for module in scan_package().modules.values():
+        allowed = _HELPER_ORDER_ALLOWLIST.get(module.name, frozenset())
+        for name, def_line, use_line in module.early_helpers:
+            if name in allowed:
+                continue
+            problems.append(
+                f"{module.path}:{def_line}: {name!r} is defined above its first caller "
+                f"(line {use_line}) -- a private helper goes immediately after the public function "
+                "that calls it, or after its last caller when several do"
+            )
+    stale = [
+        f"{module.path}: {name!r} is in _HELPER_ORDER_ALLOWLIST but is no longer out of order -- "
+        "drop the entry, the debt list only shrinks"
+        for module in scan_package().modules.values()
+        for name in sorted(_HELPER_ORDER_ALLOWLIST.get(module.name, frozenset()))
+        if name not in {helper[0] for helper in module.early_helpers}
+    ]
+    return problems + stale
