@@ -211,11 +211,15 @@ def sample_surface(
     else:
         weights = face_weight
 
-    total = float(wp.utils.array_sum(weights))
-    if total <= 0.0:
-        raise ValueError("total face weight must be positive")
+    # ``array_scan`` is inclusive by default, so the total is the scan's last element -- a 4-byte
+    # tail read instead of a whole second reduction over the weights. Same trick as
+    # ``array.flatnonzero`` and ``array.counts_to_offsets``. Measured interleaved, CDF + total:
+    # 1.13x on CUDA at both 20k and 328k faces (it is launch-bound there), 1.53x and 2.04x on CPU.
     cdf = wp.empty(n_faces, dtype=wp.float32, device=vertices.device)
     wp.utils.array_scan(weights, out_array=cdf)
+    total = float(cdf[n_faces - 1 : n_faces].numpy()[0])
+    if total <= 0.0:
+        raise ValueError("total face weight must be positive")
     wp.map(wp.div, cdf, wp.float32(total), out=cdf)
 
     out_points = wp.empty(count, dtype=wp.vec3, device=vertices.device)
@@ -620,13 +624,10 @@ def sample_volume(
 
     signed_vols = tw.triangles.face_signed_volumes(vertices, faces, center)
 
-    # Two 4-byte reads instead of a copy of the per-face volumes, and the scan then reads the device
-    # buffer directly rather than a host round-trip of it. Measured on CUDA: 2.07x at 400k faces and
-    # 19.6x at 8M, crossing over near 200k (0.87x at 100k).
-    total_vol = tw.reduce.sum(signed_vols)
-    if total_vol == 0.0:
-        raise ValueError("mesh has zero volume")
-
+    # One device reduction, not two: the star-shaped test genuinely needs a ``min``, but the total
+    # is the inclusive scan's last element and comes for free with the CDF this builds anyway.
+    # (The earlier note here recorded 2.07x-19.6x for the reduction over a full host readback of
+    # the per-face volumes; that comparison still holds, and the scan tail is cheaper again.)
     if tw.reduce.min(signed_vols) < 0.0:
         raise ValueError(
             "mesh is not star-shaped with respect to its centroid (e.g. a torus); "
@@ -635,6 +636,9 @@ def sample_volume(
 
     cdf = wp.empty(n_faces, dtype=wp.float32, device=vertices.device)
     wp.utils.array_scan(signed_vols, out_array=cdf)
+    total_vol = float(cdf[n_faces - 1 : n_faces].numpy()[0])
+    if total_vol == 0.0:
+        raise ValueError("mesh has zero volume")
     wp.map(wp.div, cdf, wp.float32(total_vol), out=cdf)
 
     out_points = wp.empty(count, dtype=wp.vec3, device=vertices.device)

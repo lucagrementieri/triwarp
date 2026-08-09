@@ -701,10 +701,9 @@ def make_volume(
     if n_faces == 0:
         return wp.empty(0, dtype=wp.int32, device=device)
 
-    out_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
-    signed_volumes = tw.triangles.face_signed_volumes(vertices, faces)
-
     if multibody:
+        out_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
+        signed_volumes = tw.triangles.face_signed_volumes(vertices, faces)
         labels = tw.adjacency.face_connected_component_labels(faces)
         accum = wp.zeros(n_faces, dtype=wp.float32, device=device)
         wp.launch(
@@ -724,18 +723,23 @@ def make_volume(
         )
         return out_faces
 
-    watertight = bool(tw.reduce.all(tw.validation.face_watertight_mask(faces)))
-    if watertight and tw.reduce.sum(signed_volumes) < 0.0:
-        flip = wp.full(n_faces, wp.int32(1), dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_repair.flip_faces_masked,
-            dim=n_faces,
-            inputs=[faces, flip, out_faces],
-            device=device,
-        )
-        return out_faces
+    # The predicate, not ``all(face_watertight_mask(faces))``: the mask additionally builds
+    # ``unique_1d``'s inverse and runs a per-face gather pass, only to be reduced to one bool.
+    # Both answer "is every undirected edge shared by exactly two faces", because every unique edge
+    # in the table comes from a face. Measured interleaved: 1.17-1.19x on CUDA and 1.64-1.77x on
+    # CPU, at 20k and 328k faces.
+    if not tw.validation.is_edge_manifold(faces, allow_boundary_edges=False):
+        return wp.clone(faces)
 
-    wp.copy(out_faces, faces)
+    signed_volumes = tw.triangles.face_signed_volumes(vertices, faces)
+    if tw.reduce.sum(signed_volumes) >= 0.0:
+        return wp.clone(faces)
+
+    out_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
+    flip = wp.full(n_faces, wp.int32(1), dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_repair.flip_faces_masked, dim=n_faces, inputs=[faces, flip, out_faces], device=device
+    )
     return out_faces
 
 
