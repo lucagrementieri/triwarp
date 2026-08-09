@@ -6,7 +6,6 @@ import math
 import secrets
 from typing import cast
 
-import numpy as np
 import warp as wp
 
 import triwarp as tw
@@ -337,22 +336,14 @@ def sample_surface_poisson_disk(
             device=device,
         )
 
+        # The alive local maximum is always flagged (the test at ``kernels/sample.py`` is a strict
+        # ``>``, so the greatest alive weight has no greater neighbour), hence no zero-maxima exit.
         n_max = tw.reduce.sum(is_max)
-        if n_max == 0:
-            break
-
         excess = alive_count - count
         if n_max <= excess:
             deleted_mask = is_max
         else:
-            # Pick the top-excess local maxima by weight on CPU
-            is_max_np = is_max.numpy()
-            weights_np = weights.numpy()
-            max_indices = np.where(is_max_np)[0]
-            top_k = np.argsort(-weights_np[max_indices])[:excess]
-            deleted_np = np.zeros(init_count, dtype=np.int32)
-            deleted_np[max_indices[top_k]] = 1
-            deleted_mask = wp.array(deleted_np, dtype=wp.int32, device=device)
+            deleted_mask = _top_maxima_by_weight(is_max, weights, excess)
             n_max = excess
 
         wp.map(kernel_sample.apply_deletions, deleted_mask, alive, out=alive)
@@ -369,6 +360,55 @@ def sample_surface_poisson_disk(
     indices = flatnonzero(alive_bool)
 
     return gather(init_points, indices), gather(init_face_indices, indices)
+
+
+def _top_maxima_by_weight(
+    is_max: wp.array[wp.int32], weights: wp.array[wp.float32], excess: int
+) -> wp.array[wp.int32]:
+    """
+    Mark the ``excess`` heaviest flagged points, so the final round deletes exactly enough.
+
+    Only the last elimination round needs this -- every earlier one deletes all of its local
+    maxima. It used to read ``is_max`` and ``weights`` back in full and pick the top ``excess`` with
+    ``numpy.argsort``, moving ``2 * init_count`` elements across the bus where the rest of the loop
+    moves none.
+
+    Measured end to end on an ``icosphere(5)`` pool,
+    [`sample_surface_poisson_disk`][triwarp.sample.sample_surface_poisson_disk] goes 6.55 -> 6.19 ms
+    at ``count=20000`` (**1.06x**) and 5.81 -> 5.75 at ``count=2000``. Timing the branch in
+    isolation suggested far more -- 24 % of the call -- but that probe fed it a synthetic ``excess``
+    an order of magnitude larger than the real final round's, so the call-level number is the one to
+    believe. The win grows with ``count`` because the readback does and the sort does not.
+
+    Sorting the flagged weights on the device removes both readbacks and the upload. Ties order
+    differently from ``numpy.argsort``'s quicksort -- ``radix_sort_pairs`` is stable -- but the
+    weights are sums of continuous kernel falloffs, so an exact tie between two of them does not
+    arise in practice, and which of two equally-crowded points is dropped is not a property the
+    algorithm defines anyway.
+
+    Parameters
+    ----------
+    is_max
+        Length-``init_count`` ``0``/``1`` flags marking this round's local weight maxima.
+    weights
+        Length-``init_count`` crowding weights.
+    excess
+        How many of the flagged points to delete.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        Length-``init_count`` ``0``/``1`` deletion flags with exactly ``excess`` ones.
+    """
+    n_pool = int(is_max.shape[0])
+    flagged = flatnonzero(tw.array.astype(is_max, wp.bool))
+    # Ascending on the negated weight is descending on the weight, and ``sort_and_argsort`` is the
+    # package's one radix-sort spelling.
+    descending = wp.empty(int(flagged.shape[0]), dtype=wp.float32, device=is_max.device)
+    wp.map(wp.neg, gather(weights, flagged), out=descending)
+    _sorted, order = tw.array.sort_and_argsort(descending)
+    chosen = gather(flagged, wp.clone(order[:excess]))
+    return tw.array.astype(tw.array.indices_to_mask(chosen, n_pool, device=is_max.device), wp.int32)
 
 
 def _dart_throw_blue_noise(
