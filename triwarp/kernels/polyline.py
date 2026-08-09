@@ -8,6 +8,7 @@ from triwarp.kernels.array import (
     vector_angle_vec,
     wrap_index,
 )
+from triwarp.kernels.points import plane_basis
 from triwarp.kernels.predicates import orient2d
 
 
@@ -416,6 +417,58 @@ def is_ear_at(
 def project_to_plane_2d(point: wp.vec3, center: wp.vec3, u: wp.vec3, v: wp.vec3) -> wp.vec2:
     d = point - center
     return wp.vec2(wp.dot(d, u), wp.dot(d, v))
+
+
+@wp.kernel
+def accumulate_loop_frame(
+    polyline: wp.array[wp.vec3],
+    out_normal: wp.array[wp.vec3],
+    out_weighted_midpoint: wp.array[wp.vec3],
+    out_length: wp.array[wp.float32],
+) -> None:
+    # dim == n, over an *open* loop of n distinct vertices. One pass replaces the three separate
+    # reductions ``triangulate_polyline``'s prologue used to run, each of which ended in a host
+    # readback because the next one consumed its Python-scope result.
+    #
+    # Newell's normal is cyclic -- thread i takes the edge (i, (i + 1) % n), so the wrap-around
+    # edge is thread n - 1 and no closing vertex has to be appended first. The length-weighted
+    # centroid deliberately is *not* cyclic: it runs over the n - 1 open segments, which is what
+    # ``polyline_centroid`` (``closed=False``) computes and what this function has always used.
+    i = int(wp.tid())
+    n = polyline.shape[0]
+    start = polyline[i]
+    wp.atomic_add(out_normal, 0, wp.cross(start, polyline[wrap_index(i + 1, n)]))
+    if i + 1 < n:
+        end = polyline[i + 1]
+        midpoint, length = segment_midpoint_and_length(start, end)
+        wp.atomic_add(out_weighted_midpoint, 0, midpoint * length)
+        wp.atomic_add(out_length, 0, length)
+
+
+@wp.kernel
+def finalize_loop_frame(
+    normal: wp.array[wp.vec3],
+    weighted_midpoint: wp.array[wp.vec3],
+    total_length: wp.array[wp.float32],
+    out_frame: wp.array[wp.vec3],
+) -> None:
+    # Single thread: turn the three accumulators into the plane frame, on device. ``out_frame`` is
+    # ``[center, u, v]``, which ``project_polyline_to_plane`` reads directly -- so the frame never
+    # crosses to the host at all.
+    u, v = plane_basis(normal[0])
+    out_frame[0] = weighted_midpoint[0] / total_length[0]
+    out_frame[1] = u
+    out_frame[2] = v
+
+
+@wp.kernel
+def project_polyline_to_plane(
+    polyline: wp.array[wp.vec3], frame: wp.array[wp.vec3], out_points2d: wp.array[wp.vec2]
+) -> None:
+    # dim == n. The device-frame counterpart of mapping ``project_to_plane_2d`` over host-scope
+    # ``wp.vec3`` uniforms.
+    i = int(wp.tid())
+    out_points2d[i] = project_to_plane_2d(polyline[i], frame[0], frame[1], frame[2])
 
 
 @wp.kernel

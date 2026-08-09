@@ -221,3 +221,16 @@ def is_statistical_outlier(
     # strictly positive and strictly below the cloud threshold; everything else -- an empty
     # neighbourhood, a coincident one, or a far one -- is an outlier.
     return count == 0 or mean_distance <= 0.0 or mean_distance >= threshold
+
+
+@wp.func
+def plane_basis(normal: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
+    # Kernel-scope mirror of ``triwarp.points.plane_basis``, for callers that hold the normal in
+    # device memory and must not read it back to build the frame.
+    unit_normal = wp.normalize(normal)
+    axis = wp.vec3(1.0, 0.0, 0.0)
+    if wp.abs(unit_normal[0]) > 0.9:
+        axis = wp.vec3(0.0, 1.0, 0.0)
+    u = wp.normalize(wp.cross(axis, unit_normal))
+    v = wp.cross(unit_normal, u)
+    return u, v

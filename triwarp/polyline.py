@@ -234,7 +234,7 @@ def polyline_normal(polyline: wp.array[wp.vec3]) -> wp.vec3:
         device=device,
     )
     wp.map(wp.normalize, out_normal, out=out_normal)
-    return wp.vec3(*out_normal.numpy()[0].tolist())
+    return out_normal.list()[0]
 
 
 def distance_to_polyline(
@@ -257,15 +257,20 @@ def distance_to_polyline(
     Returns
     -------
     wp.array[wp.float32]
-        Length ``n`` minimum distances on ``points.device``.
+        Length ``n`` minimum distances on ``points.device``. Every entry is ``inf`` when
+        ``polyline`` is empty, there being no segment to measure against -- the same
+        ``inf``-on-miss convention
+        [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh] uses.
     """
     if closed:
         polyline = close_polyline(polyline)
     device = points.device
     n_points = int(points.shape[0])
     m = int(polyline.shape[0])
+    if m == 0:
+        return wp.full(n_points, float("inf"), dtype=wp.float32, device=device)
     out_distances = wp.empty(n_points, dtype=wp.float32, device=device)
-    if m == 0 or n_points == 0:
+    if n_points == 0:
         return out_distances
     if m == 1:
         wp.launch(
@@ -318,55 +323,7 @@ def upsample_polyline(
     """
     if closed:
         polyline = close_polyline(polyline)
-    device = polyline.device
-    n_segments = int(polyline.shape[0]) - 1
-    if n_segments < 1:
-        return polyline
-
-    steps = wp.empty(n_segments, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_polyline.segment_step_counts,
-        dim=n_segments,
-        inputs=[polyline, wp.float32(step_size), steps],
-        device=device,
-    )
-    offsets, total = tw.array.counts_to_offsets(steps)
-
-    out_points = wp.empty(total, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_polyline.upsample_gather,
-        dim=total,
-        inputs=[polyline, offsets, steps, out_points],
-        device=device,
-    )
-    return out_points
-
-
-def _smooth_upsample(
-    polyline: wp.array[wp.vec3], step_size: float, closed: bool
-) -> wp.array[wp.vec3]:
-    device = polyline.device
-    n_segments = int(polyline.shape[0]) - 1
-    if n_segments < 1:
-        return polyline
-
-    steps = wp.empty(n_segments, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_polyline.segment_step_counts,
-        dim=n_segments,
-        inputs=[polyline, wp.float32(step_size), steps],
-        device=device,
-    )
-    offsets, total = tw.array.counts_to_offsets(steps)
-
-    out_points = wp.empty(total, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_polyline.smooth_upsample_gather,
-        dim=total,
-        inputs=[polyline, offsets, steps, wp.int32(closed), out_points],
-        device=device,
-    )
-    return out_points
+    return _upsample(polyline, step_size, kernel_polyline.upsample_gather, [])
 
 
 def smooth_upsample_polyline(
@@ -414,8 +371,47 @@ def smooth_upsample_polyline(
     if closed:
         # Every segment including the seam becomes interior, so neighbour tangents wrap cyclically
         # and the duplicated closing point is dropped -- a clean cyclic ring.
-        return _smooth_upsample(close_polyline(polyline), step_size, closed=True)
-    return _smooth_upsample(polyline, step_size, closed=False)
+        polyline = close_polyline(polyline)
+    gather = kernel_polyline.smooth_upsample_gather
+    return _upsample(polyline, step_size, gather, [wp.int32(closed)])
+
+
+def _upsample(
+    polyline: wp.array[wp.vec3],
+    step_size: float,
+    gather_kernel: wp.Kernel,
+    extra_inputs: list[wp.int32],
+) -> wp.array[wp.vec3]:
+    """
+    Split every segment into ``max(floor(length / step_size), 1)`` pieces and gather the samples.
+
+    The shared body of [`upsample_polyline`][triwarp.polyline.upsample_polyline] and
+    [`smooth_upsample_polyline`][triwarp.polyline.smooth_upsample_polyline], which differ only in
+    the gather kernel that places each sample -- on the chord or on a fitted arc -- and in the
+    extra arguments that kernel takes. Both have already applied their own ``closed`` handling.
+    """
+    device = polyline.device
+    n_segments = int(polyline.shape[0]) - 1
+    if n_segments < 1:
+        return polyline
+
+    steps = wp.empty(n_segments, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_polyline.segment_step_counts,
+        dim=n_segments,
+        inputs=[polyline, wp.float32(step_size), steps],
+        device=device,
+    )
+    offsets, total = tw.array.counts_to_offsets(steps)
+
+    out_points = wp.empty(total, dtype=wp.vec3, device=device)
+    wp.launch(
+        gather_kernel,
+        dim=total,
+        inputs=[polyline, offsets, steps, *extra_inputs, out_points],
+        device=device,
+    )
+    return out_points
 
 
 def cumulative_arc_length(polyline: wp.array[wp.vec3]) -> wp.array[wp.float32]:
@@ -811,15 +807,17 @@ def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     Measured on `benchmarks/test_creation.py`'s ``triangulate_polygon`` group, back to back:
     **2.07x** at a 64-point star (4.53 -> 2.19 ms) and **1.53x** at 1 024 (6.89 -> 4.51).
 
-    **What is left is not the clip.** Attributed one stage per measurement at 64 points, where the
-    whole call is 2.19 ms: the captured round loop is 0.22 ms and the *prologue* is 1.05 ms, of
-    which ``open_polyline``'s [`is_closed`][triwarp.polyline.is_closed] is 0.24,
-    [`polyline_normal`][triwarp.polyline.polyline_normal] 0.35 and
-    [`polyline_centroid`][triwarp.polyline.polyline_centroid] 0.25 — three reductions that each end
-    in a host readback because each returns a Python-scope value the next one consumes. That
-    prologue is **flat in ``n``** (1.05 ms at 64 points and 1.04 at 1 024), so it is the whole of
-    this function's remaining fixed cost and the only lever left for small loops; fusing the three
-    into one kernel writing the frame to device memory would remove two of the four readbacks.
+    **The prologue is now fused.** It used to be the dominant fixed cost: three reductions
+    ([`polyline_normal`][triwarp.polyline.polyline_normal], its internal
+    [`close_polyline`][triwarp.polyline.close_polyline] closure test, and
+    [`polyline_centroid`][triwarp.polyline.polyline_centroid]) that each ended in a host readback
+    because each returned a Python-scope value the next one consumed. They are one accumulation
+    pass, one single-thread finalize and one projection, with the plane frame living in device
+    memory and never crossing to the host. Measured interleaved on an RTX 5090 (min of 40):
+    **1.06 -> 0.38 ms, 2.80x**, and — being fixed cost — the same 2.81x at 1 024 points. Only two
+    readbacks are left in the whole function, both structural: ``open_polyline``'s
+    [`is_closed`][triwarp.polyline.is_closed], which decides ``n`` and therefore every launch
+    dimension, and the reflex count that selects the convex fan fast path.
 
     When conditional graph nodes are unavailable (CPU, or a CUDA driver below 12.4)
     ``wp.capture_while`` executes the same loop directly with one pinned 4-byte readback per round,
@@ -838,10 +836,35 @@ def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     if n < 3:
         return twt.empty_int32_2d((0, 3), device=device)
 
-    u, v = tw.points.plane_basis(polyline_normal(polyline))
-    center = polyline_centroid(polyline)
+    # The plane frame is built and consumed entirely on device: one accumulation pass, one
+    # single-thread finalize, one projection. The three host-scope reductions this replaces
+    # (``polyline_normal``, its internal ``close_polyline`` closure test, and
+    # ``polyline_centroid``) each ended in a readback because the next one consumed its result,
+    # and that prologue was flat in ``n`` -- the whole of this function's fixed cost at small
+    # loops. ``frame`` is ``[center, u, v]``.
+    normal = wp.zeros(1, dtype=wp.vec3, device=device)
+    weighted_midpoint = wp.zeros(1, dtype=wp.vec3, device=device)
+    total_length = wp.zeros(1, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_polyline.accumulate_loop_frame,
+        dim=n,
+        inputs=[polyline, normal, weighted_midpoint, total_length],
+        device=device,
+    )
+    frame = wp.empty(3, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_polyline.finalize_loop_frame,
+        dim=1,
+        inputs=[normal, weighted_midpoint, total_length, frame],
+        device=device,
+    )
     points2d = wp.empty(n, dtype=wp.vec2, device=device)
-    wp.map(kernel_polyline.project_to_plane_2d, polyline, center, u, v, out=points2d)
+    wp.launch(
+        kernel_polyline.project_polyline_to_plane,
+        dim=n,
+        inputs=[polyline, frame, points2d],
+        device=device,
+    )
 
     # Orientation is fixed up on device (``orient_ccw`` reads the accumulated angle itself), so the
     # reflex count below is the only readback before the convex fast path returns.

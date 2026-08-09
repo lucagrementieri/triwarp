@@ -314,6 +314,17 @@ def test_distance_to_single_point_polyline(device: str) -> None:
     assert np.allclose(distances_wp.numpy(), expected, rtol=1e-4, atol=1e-4)
 
 
+def test_distance_to_empty_polyline_is_infinite(device: str) -> None:
+    """An empty curve is infinitely far, rather than whatever the allocator last held."""
+    rng = np.random.default_rng(42)
+    points_wp = _polyline_wp(rng.standard_normal((5, 3)), device)
+    empty_wp = wp.empty(0, dtype=wp.vec3, device=device)
+
+    distances_wp = tw.polyline.distance_to_polyline(points_wp, empty_wp)
+
+    assert np.array_equal(distances_wp.numpy(), np.full(5, np.inf, dtype=np.float32))
+
+
 # --- upsample (NumPy reference) ---
 
 

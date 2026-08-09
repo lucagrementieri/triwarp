@@ -35,7 +35,7 @@ from triwarp.kernels import reduce as kernel_reduce
 
 
 def point_plane_distance(
-    points: wp.array[wp.vec3], plane_normal: wp.vec3, plane_origin: wp.vec3 = None
+    points: wp.array[wp.vec3], plane_normal: wp.vec3, plane_origin: wp.vec3 | None = None
 ) -> wp.array[wp.float32]:
     """
     Minimum perpendicular distance of each point to a plane.
@@ -114,22 +114,9 @@ def gram_matrix(points: wp.array[wp.vec3]) -> wp.array[wp.mat33]:
         Shape ``(1,)`` device array holding the ``3x3`` Gram matrix on
         ``points.device``. All-zeros when ``points`` is empty.
     """
-    device = points.device
-    n = int(points.shape[0])
-    out = wp.zeros(1, dtype=wp.mat33, device=device)
-    if n == 0:
-        return out
-    n_tiles = (n + TILE_1D - 1) // TILE_1D
     # The uncentred Gram matrix is the scatter matrix around a zero center.
-    zero_center = wp.zeros(1, dtype=wp.vec3, device=device)
-    wp.launch_tiled(
-        kernel_points.centered_covariance,
-        dim=[n_tiles],
-        inputs=[points, zero_center, out],
-        block_dim=TILE_1D,
-        device=device,
-    )
-    return out
+    zero_center = wp.zeros(1, dtype=wp.vec3, device=points.device)
+    return centered_covariance(points, center=zero_center)
 
 
 def fit_line(points: wp.array[wp.vec3]) -> wp.vec3:
@@ -163,7 +150,7 @@ def fit_line(points: wp.array[wp.vec3]) -> wp.vec3:
     # Pass 2: SVD of the 3x3 matrix and axis extraction (single thread).
     out_axis = wp.empty(1, dtype=wp.vec3, device=device)
     wp.launch(kernel_points.finalize_fit_line, dim=1, inputs=[gram, out_axis], device=device)
-    return wp.vec3(*out_axis.numpy()[0].tolist())
+    return out_axis.list()[0]
 
 
 def centered_covariance(
@@ -197,15 +184,7 @@ def centered_covariance(
         return out
     n_tiles = (n + TILE_1D - 1) // TILE_1D
     if center is None:
-        center = wp.zeros(1, dtype=wp.vec3, device=device)
-        wp.launch_tiled(
-            kernel_reduce.sum_vec3_1d_tiled,
-            dim=[n_tiles],
-            inputs=[points, center],
-            block_dim=TILE_1D,
-            device=device,
-        )
-        wp.map(wp.div, center, wp.float32(n), out=center)
+        center = centroid(points)
     wp.launch_tiled(
         kernel_points.centered_covariance,
         dim=[n_tiles],
@@ -258,7 +237,7 @@ def fit_plane(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
         inputs=[center, cov, out_centroid, out_normal],
         device=device,
     )
-    return (wp.vec3(*out_centroid.numpy()[0].tolist()), wp.vec3(*out_normal.numpy()[0].tolist()))
+    return (out_centroid.list()[0], out_normal.list()[0])
 
 
 def plane_basis(normal: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
@@ -696,6 +675,4 @@ def radial_sort(
 
     # Ascending radix sort of the negated angles yields the descending-angle order.
     _sorted_keys, order = tw.array.sort_and_argsort(out_keys, fill_value=n)
-    out = wp.empty(n, dtype=wp.vec3, device=device)
-    wp.copy(out, points[order])
-    return out
+    return tw.array.gather(points, order)
