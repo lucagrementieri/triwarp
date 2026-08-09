@@ -96,6 +96,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.kernels import voxels as kernel_voxels
+from triwarp.kernels.algorithms import connected_components as kernel_components
 
 # Neighbourhood stencils, in the order ``scipy.ndimage.generate_binary_structure`` induces:
 # 6 = face-adjacent (rank 1), 18 = face + edge (rank 2), 26 = the full 3-cubed shell (rank 3).
@@ -902,8 +903,6 @@ def fill_holes(grid: wp.Volume) -> wp.Volume:
     dims = (int(occupancy.shape[0]), int(occupancy.shape[1]), int(occupancy.shape[2]))
     n_nodes = dims[0] * dims[1] * dims[2]
 
-    from triwarp.kernels.algorithms import connected_components as kernel_components
-
     parents = wp.empty(n_nodes, dtype=wp.int32, device=device)
     wp.launch(kernel_voxels.flood_init_parent, dim=dims, inputs=[occupancy, parents], device=device)
     wp.launch(kernel_voxels.flood_hook, dim=dims, inputs=[occupancy, parents], device=device)
@@ -1488,6 +1487,8 @@ def voxel_corners(grid: wp.Volume) -> tuple[twt.Array2dInt32, twt.Array2dInt32]:
     if n_voxels == 0:
         return twt.empty_int32_2d((0, 3), device=device), twt.empty_int32_2d((0, 8), device=device)
 
+    # Deferred: importing ``warp.fem`` costs ~0.15 s of ``import triwarp`` and only this path
+    # needs it.
     import warp.fem as fem
 
     corner_grid = fem.Nanogrid(grid).vertex_grid

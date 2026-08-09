@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.constants import TOLERANCE_ZERO_CONSTANT
+from triwarp.constants import TOLERANCE_ZERO_CONSTANT, TWO_PI
 
 
 @wp.kernel
@@ -50,3 +50,9 @@ def max_corner_inverse_edge_length_sq(
     if denom > TOLERANCE_ZERO_CONSTANT:
         return wp.float32(1.0) / denom
     return wp.float32(0.0)
+
+
+@wp.func
+def angle_defect(angle_sum: wp.float32) -> wp.float32:
+    """Angle defect at a vertex: a full turn minus the incident corner angles."""
+    return TWO_PI - angle_sum

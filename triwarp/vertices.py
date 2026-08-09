@@ -361,5 +361,7 @@ def vertex_defects(
         inputs=[face_angles, faces2d, angle_sum],
         device=faces.device,
     )
-    defect = tw.constants.TWO_PI - angle_sum
-    return defect
+    # In place over the accumulator: ``angle_sum`` is scratch, and the operator spelling
+    # ``TWO_PI - angle_sum`` would run the same wp.map into a second allocation.
+    wp.map(kernel_vertices.angle_defect, angle_sum, out=angle_sum)
+    return angle_sum

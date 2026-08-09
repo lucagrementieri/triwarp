@@ -63,12 +63,10 @@ def scatter_corner_values(
     out_values[corner_index[h]] = values[faces[h]]
 
 
-@wp.kernel
-def crease_edge_mask(
-    adjacency_angles: wp.array[wp.float32], threshold: wp.float32, out_mask: wp.array[wp.bool]
-) -> None:
-    k = int(wp.tid())
-    out_mask[k] = adjacency_angles[k] > threshold
+@wp.func
+def crease_edge_mask(adjacency_angle: wp.float32, threshold: wp.float32) -> wp.bool:
+    # Strictly greater, so a threshold of 0 selects every non-coplanar interior edge.
+    return adjacency_angle > threshold
 
 
 @wp.func

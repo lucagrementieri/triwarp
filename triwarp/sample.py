@@ -216,7 +216,7 @@ def sample_surface(
         raise ValueError("total face weight must be positive")
     cdf = wp.empty(n_faces, dtype=wp.float32, device=vertices.device)
     wp.utils.array_scan(weights, out_array=cdf)
-    cdf = cdf / total
+    wp.map(wp.div, cdf, wp.float32(total), out=cdf)
 
     out_points = wp.empty(count, dtype=wp.vec3, device=vertices.device)
     out_face_indices = wp.empty(count, dtype=wp.int32, device=vertices.device)
@@ -635,7 +635,7 @@ def sample_volume(
 
     cdf = wp.empty(n_faces, dtype=wp.float32, device=vertices.device)
     wp.utils.array_scan(signed_vols, out_array=cdf)
-    cdf = cdf / total_vol
+    wp.map(wp.div, cdf, wp.float32(total_vol), out=cdf)
 
     out_points = wp.empty(count, dtype=wp.vec3, device=vertices.device)
     wp.launch(

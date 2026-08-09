@@ -807,6 +807,8 @@ def _screened_poisson_adaptive(
     balance matches the dense backend's index-space calibration. The (un-oriented) iso-surface
     ``(vertices, faces)`` is returned; the caller orients it outward.
     """
+    # Deferred: importing ``warp.fem`` costs ~0.15 s of ``import triwarp``, and the kernel module
+    # below imports it at module scope, so both stay behind the one adaptive-Poisson path.
     import warp.fem as fem
 
     from triwarp.kernels.algorithms import poisson_fem as kernel_poisson_fem
@@ -951,6 +953,8 @@ def _extract_poisson_surface_fem(
     so welding independent slabs leaves non-manifold seams -- and depth 9-10 already oversamples the
     spacing-capped solve, so the simple capped extraction is used.
     """
+    # Deferred: importing ``warp.fem`` costs ~0.15 s of ``import triwarp``, and the kernel module
+    # below imports it at module scope, so both stay behind the one adaptive-Poisson path.
     import warp.fem as fem
 
     from triwarp.kernels.algorithms import poisson_fem as kernel_poisson_fem
