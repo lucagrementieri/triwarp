@@ -451,6 +451,14 @@ def solve_spd_columns(
         ``warp.optim.linear.cg``, with the residual taken over the worst column. Device arrays
         rather than host scalars under ``check_every=0``; see the warning above.
 
+    Warns
+    -----
+    UserWarning
+        When the solve exhausts ``maxiter`` without reaching ``tol``, on the same terms as
+        [`solve_spd`][triwarp.linalg.solve_spd]. A batched solve converges on its *worst* column,
+        so hitting the cap here means at least one column is unsolved. Only detectable when
+        ``check_every > 0``.
+
     Notes
     -----
     ``check_every`` is a pure performance knob — it cannot change the converged answer, only how far
@@ -492,19 +500,22 @@ def solve_spd_columns(
     [`spd_column_solver`][triwarp.linalg.spd_column_solver]
     [`replicated_operator`][triwarp.linalg.replicated_operator]
     """
-    require_cuda(rhs.device, "solve_spd_columns")
-    n_columns, n = int(rhs.shape[0]), int(rhs.shape[1])
-    operator = replicated_operator(matrix, n_columns)
-    preconditioner = replicated_operator(wpl.preconditioner(matrix, "diag"), n_columns)
-    return wpl.cg(
-        operator,
-        rhs.flatten(),
-        solution.flatten(),
+    result = _cg_columns(
+        matrix,
+        rhs,
+        solution,
         tol=tol,
-        maxiter=maxiter if maxiter is not None else CG_MAXITER_FACTOR * n,
-        M=preconditioner,
-        check_every=_supported_check_every(check_every),
+        maxiter=maxiter,
+        check_every=check_every,
+        run=True,
+        caller="solve_spd_columns",
     )
+    _warn_if_not_converged(
+        result,
+        maxiter if maxiter is not None else CG_MAXITER_FACTOR * int(rhs.shape[1]),
+        "solve_spd_columns",
+    )
+    return result
 
 
 def spd_column_solver(
@@ -565,7 +576,38 @@ def spd_column_solver(
     --------
     [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]
     """
-    require_cuda(rhs.device, "spd_column_solver")
+    return _cg_columns(
+        matrix,
+        rhs,
+        solution,
+        tol=tol,
+        maxiter=maxiter,
+        check_every=check_every,
+        run=False,
+        caller="spd_column_solver",
+    )
+
+
+def _cg_columns(
+    matrix: wps.BsrMatrix[wp.float64],
+    rhs: twt.Array2dFloat,
+    solution: twt.Array2dFloat,
+    *,
+    tol: float,
+    maxiter: int | None,
+    check_every: int,
+    run: bool,
+    caller: str,
+):
+    """
+    Batched conjugate gradient over the columns of ``rhs`` -- the shared body of the two solvers.
+
+    [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] and
+    [`spd_column_solver`][triwarp.linalg.spd_column_solver] build the same replicated operator and
+    the same replicated Jacobi preconditioner and differ only in ``run``: the first drives the
+    solve, the second hands back the un-run state for a caller to drive repeatedly.
+    """
+    require_cuda(rhs.device, caller)
     n_columns, n = int(rhs.shape[0]), int(rhs.shape[1])
     operator = replicated_operator(matrix, n_columns)
     preconditioner = replicated_operator(wpl.preconditioner(matrix, "diag"), n_columns)
@@ -577,7 +619,7 @@ def spd_column_solver(
         maxiter=maxiter if maxiter is not None else CG_MAXITER_FACTOR * n,
         M=preconditioner,
         check_every=_supported_check_every(check_every),
-        run=False,
+        run=run,
     )
 
 

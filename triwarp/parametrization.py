@@ -166,67 +166,6 @@ def map_vertices_to_circle(
     return out_uv
 
 
-def _solve_fixed_boundary(
-    laplacian: wps.BsrMatrix[wp.float64],
-    mass_diag: wp.array[wp.float64] | None,
-    k: int,
-    n_vertices: int,
-    boundary_indices: wp.array[wp.int32],
-    boundary_uv: wp.array[wp.vec2],
-    device: wp.DeviceLike,
-) -> wp.array[wp.vec2]:
-    """
-    Solve the fixed-boundary quadratic minimization shared by ``harmonic`` and ``tutte``.
-
-    Forms the positive-semi-definite operator ``Q = -L`` for ``k == 1`` and
-    ``Q = (-L) (M^-1 (-L))^(k-1)`` for ``k > 1`` (``M`` the diagonal mass, identity when
-    ``mass_diag is None``) via [`k_harmonic`][triwarp.energies.k_harmonic],
-    then solves the interior Dirichlet system ``Q_uu x_u = -Q_ub bc`` per UV column with conjugate
-    gradient, keeping the fixed vertices at ``boundary_uv``. ``laplacian`` must be float64:
-    ``k > 1`` squares its condition number.
-    """
-    q = tw.energies.k_harmonic(laplacian, mass_diag, k=k)
-
-    # A mesh with interior vertices and no fixed boundary is a singular Dirichlet system. Raised up
-    # front (CPU-safe): once every vertex is fixed (n_vertices > 0, n_boundary == 0 is impossible
-    # here because n_vertices > 0 implies interior vertices exist) this cannot be satisfied.
-    n_boundary = int(boundary_indices.shape[0])
-    if n_boundary == 0:
-        raise ValueError(
-            "harmonic / tutte require at least one fixed boundary vertex; the Dirichlet system is "
-            "otherwise singular."
-        )
-
-    # Fixed mask + prescribed positions scattered to a (2, n_vertices) buffer (row 0 = u, 1 = v).
-    fixed_mask = wp.zeros(n_vertices, dtype=wp.bool, device=device)
-    fixed_values = wp.zeros((2, n_vertices), dtype=wp.float64, device=device)
-    wp.launch(
-        kernel_parametrization.scatter_boundary_mask,
-        dim=n_boundary,
-        inputs=[boundary_indices, fixed_mask],
-        device=device,
-    )
-    wp.launch(
-        kernel_parametrization.scatter_fixed_uv,
-        dim=n_boundary,
-        inputs=[boundary_indices, boundary_uv, fixed_values],
-        device=device,
-    )
-
-    sol, free_map, _ = twl.min_quad_with_fixed(
-        q, fixed_mask, twt.as_array2d_float(fixed_values, dtype=wp.float64), tol=_CG_TOLERANCE
-    )
-
-    out_uv = wp.empty(n_vertices, dtype=wp.vec2, device=device)
-    wp.launch(
-        kernel_parametrization.scatter_solution,
-        dim=n_vertices,
-        inputs=[fixed_mask, free_map, sol, fixed_values, out_uv],
-        device=device,
-    )
-    return out_uv
-
-
 def harmonic(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -365,6 +304,55 @@ def tutte(
     )
 
 
+def _solve_fixed_boundary(
+    laplacian: wps.BsrMatrix[wp.float64],
+    mass_diag: wp.array[wp.float64] | None,
+    k: int,
+    n_vertices: int,
+    boundary_indices: wp.array[wp.int32],
+    boundary_uv: wp.array[wp.vec2],
+    device: wp.DeviceLike,
+) -> wp.array[wp.vec2]:
+    """
+    Solve the fixed-boundary quadratic minimization shared by ``harmonic`` and ``tutte``.
+
+    Forms the positive-semi-definite operator ``Q = -L`` for ``k == 1`` and
+    ``Q = (-L) (M^-1 (-L))^(k-1)`` for ``k > 1`` (``M`` the diagonal mass, identity when
+    ``mass_diag is None``) via [`k_harmonic`][triwarp.energies.k_harmonic],
+    then solves the interior Dirichlet system ``Q_uu x_u = -Q_ub bc`` per UV column with conjugate
+    gradient, keeping the fixed vertices at ``boundary_uv``. ``laplacian`` must be float64:
+    ``k > 1`` squares its condition number.
+    """
+    q = tw.energies.k_harmonic(laplacian, mass_diag, k=k)
+
+    # A mesh with interior vertices and no fixed boundary is a singular Dirichlet system. Raised up
+    # front (CPU-safe): once every vertex is fixed (n_vertices > 0, n_boundary == 0 is impossible
+    # here because n_vertices > 0 implies interior vertices exist) this cannot be satisfied.
+    n_boundary = int(boundary_indices.shape[0])
+    if n_boundary == 0:
+        raise ValueError(
+            "harmonic / tutte require at least one fixed boundary vertex; the Dirichlet system is "
+            "otherwise singular."
+        )
+
+    fixed_mask, fixed_values = _scatter_constraints(
+        n_vertices, boundary_indices, boundary_uv, device
+    )
+
+    sol, free_map, _ = twl.min_quad_with_fixed(
+        q, fixed_mask, twt.as_array2d_float(fixed_values, dtype=wp.float64), tol=_CG_TOLERANCE
+    )
+
+    out_uv = wp.empty(n_vertices, dtype=wp.vec2, device=device)
+    wp.launch(
+        kernel_parametrization.scatter_solution,
+        dim=n_vertices,
+        inputs=[fixed_mask, free_map, sol, fixed_values, out_uv],
+        device=device,
+    )
+    return out_uv
+
+
 def arap(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -491,22 +479,7 @@ def arap(
     # Partition vertices into pinned (fixed) and interior (free). ``fixed_values`` is the
     # (2, n_vertices) prescribed-UV buffer (row 0 = u, row 1 = v) shared with the assembly / scatter
     # kernels; ``interior_map`` compacts free vertices into the reduced system.
-    n_fixed = int(fixed_indices.shape[0])
-    fixed_mask = wp.zeros(n_vertices, dtype=wp.bool, device=device)
-    fixed_values = wp.zeros((2, n_vertices), dtype=wp.float64, device=device)
-    if n_fixed > 0:
-        wp.launch(
-            kernel_parametrization.scatter_boundary_mask,
-            dim=n_fixed,
-            inputs=[fixed_indices, fixed_mask],
-            device=device,
-        )
-        wp.launch(
-            kernel_parametrization.scatter_fixed_uv,
-            dim=n_fixed,
-            inputs=[fixed_indices, fixed_uv, fixed_values],
-            device=device,
-        )
+    fixed_mask, fixed_values = _scatter_constraints(n_vertices, fixed_indices, fixed_uv, device)
     fixed_values_2d = twt.as_array2d_float(fixed_values, dtype=wp.float64)
     interior_map, n_interior = twl.free_partition(fixed_mask)
 
@@ -524,7 +497,7 @@ def arap(
 
     # Interior vertices with nothing pinned leave the ARAP global system translation-invariant
     # (singular). Raised up front, mirroring harmonic / tutte.
-    if n_fixed == 0:
+    if int(fixed_indices.shape[0]) == 0:
         raise ValueError(
             "arap requires at least one fixed vertex when the mesh has interior vertices; the ARAP "
             "global system is otherwise singular (translation invariant)."
@@ -608,6 +581,37 @@ def arap(
             device=device,
         )
     return out_uv
+
+
+def _scatter_constraints(
+    n_vertices: int, indices: wp.array[wp.int32], uv: wp.array[wp.vec2], device: wp.DeviceLike
+) -> tuple[wp.array[wp.bool], wp.array[wp.float64]]:
+    """
+    Expand a list of pinned vertices into the dense mask and prescribed-UV buffers the solvers take.
+
+    ``fixed_mask`` marks the constrained vertices; ``fixed_values`` is the ``(2, n_vertices)``
+    prescribed-UV buffer (row 0 = u, row 1 = v) the assembly and scatter kernels read. Shared by
+    [`_solve_fixed_boundary`][triwarp.parametrization._solve_fixed_boundary] and
+    [`arap`][triwarp.parametrization.arap]; an empty ``indices`` yields an all-``False`` mask and
+    an all-zero value buffer, which each caller rejects on its own terms.
+    """
+    fixed_mask = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+    fixed_values = wp.zeros((2, n_vertices), dtype=wp.float64, device=device)
+    n_fixed = int(indices.shape[0])
+    if n_fixed > 0:
+        wp.launch(
+            kernel_parametrization.scatter_boundary_mask,
+            dim=n_fixed,
+            inputs=[indices, fixed_mask],
+            device=device,
+        )
+        wp.launch(
+            kernel_parametrization.scatter_fixed_uv,
+            dim=n_fixed,
+            inputs=[indices, uv, fixed_values],
+            device=device,
+        )
+    return fixed_mask, fixed_values
 
 
 def lscm(

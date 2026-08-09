@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Literal, cast, overload
+from collections.abc import Callable
+from typing import Any, Literal, cast, overload
 
 import warp as wp
 
@@ -288,24 +289,12 @@ def query_hashgrid_ball(
     single_query = isinstance(queries, wp.vec3)
     if single_query:
         queries = wp.array([queries], dtype=wp.vec3, device=device)
-    m = int(queries.shape[0])
 
     neighbor_indices_flat, neighbor_distances_flat, offsets = query_hashgrid_ball_with_offsets(
         points, queries, r, grid=grid, grid_bins=grid_bins, return_sorted=return_sorted
     )
-    neighbor_indices: list[wp.array[wp.int32]] = []
-    neighbor_distances: list[wp.array[wp.float32]] = []
-
-    offsets_list = offsets.list()
-    for k in range(m):
-        start = offsets_list[k]
-        end = offsets_list[k + 1] if k < m - 1 else neighbor_indices_flat.shape[0]
-        if end - start > 0:
-            neighbor_indices.append(wp.clone(neighbor_indices_flat[start:end]))
-            neighbor_distances.append(wp.clone(neighbor_distances_flat[start:end]))
-        else:
-            neighbor_indices.append(wp.empty(0, dtype=wp.int32, device=device))
-            neighbor_distances.append(wp.empty(0, dtype=wp.float32, device=device))
+    neighbor_indices = tw.array.split(neighbor_indices_flat, offsets, copy=True)
+    neighbor_distances = tw.array.split(neighbor_distances_flat, offsets, copy=True)
 
     if single_query:
         return neighbor_indices[0], neighbor_distances[0]
@@ -455,64 +444,19 @@ def query_hashgrid_ball_with_offsets(
     [`hashgrid_from_points`][triwarp.neighbors.hashgrid_from_points]
     [`scipy.spatial.KDTree.query_ball_point`][]
     """
-    device = points.device
-
-    if isinstance(queries, wp.vec3):
-        queries = wp.array([queries], dtype=wp.vec3, device=device)
-    m = int(queries.shape[0])
-
-    n: int = int(points.shape[0])
-    if n == 0 or m == 0:
-        return (
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=wp.float32, device=device),
-            wp.zeros(m + 1 if include_total else m, dtype=wp.int32, device=device),
-        )
-
-    if grid is None:
-        grid = hashgrid_from_points(points, r, grid_bins)
-
-    neighbor_counts = query_hashgrid_ball_count(points, queries, r, grid=grid)
-    # The total-terminated CSR form is the segment-bounds array ``segmented_sort_pairs``
-    # wants below; the length-``m`` form is a view of its prefix, so both come out of the one
-    # scan buffer.
-    segment_bounds, total_neighbors = tw.array.counts_to_offsets(
-        neighbor_counts, include_total=True
-    )
-    offsets = segment_bounds if include_total else segment_bounds[:m]
-    if total_neighbors == 0:
-        return (
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=wp.float32, device=device),
-            offsets,
-        )
-
-    flat_len = total_neighbors * (2 if return_sorted else 1)
-    neighbor_indices_flat = wp.empty(flat_len, dtype=wp.int32, device=device)
-    neighbor_distances_flat = wp.empty(flat_len, dtype=wp.float32, device=device)
-    wp.launch(
-        kernel_neighbors.query_hashgrid_ball_neighbors,
-        dim=m,
-        inputs=[
-            points,
-            queries,
-            grid.id,
-            wp.float32(r),
-            segment_bounds,
-            neighbor_indices_flat,
-            neighbor_distances_flat,
-        ],
-        device=device,
-    )
-
-    if return_sorted:
-        wp.utils.segmented_sort_pairs(
-            neighbor_distances_flat, neighbor_indices_flat, total_neighbors, segment_bounds
-        )
-    return (
-        wp.clone(neighbor_indices_flat[:total_neighbors]),
-        wp.clone(neighbor_distances_flat[:total_neighbors]),
-        offsets,
+    return _ball_with_offsets(
+        points,
+        queries,
+        r,
+        build_accelerator=lambda: (
+            grid if grid is not None else hashgrid_from_points(points, r, grid_bins)
+        ),
+        count_fn=lambda pts, qrs, radius, accelerator: query_hashgrid_ball_count(
+            pts, qrs, radius, grid=accelerator
+        ),
+        neighbors_kernel=kernel_neighbors.query_hashgrid_ball_neighbors,
+        include_total=include_total,
+        return_sorted=return_sorted,
     )
 
 
@@ -590,24 +534,12 @@ def query_bvh_ball(
     single_query = isinstance(queries, wp.vec3)
     if single_query:
         queries = wp.array([queries], dtype=wp.vec3, device=device)
-    m = int(queries.shape[0])
 
     neighbor_indices_flat, neighbor_distances_flat, offsets = query_bvh_ball_with_offsets(
         points, queries, r, bvh=bvh, leaf_size=leaf_size, return_sorted=return_sorted
     )
-    neighbor_indices: list[wp.array[wp.int32]] = []
-    neighbor_distances: list[wp.array[wp.float32]] = []
-
-    offsets_list = offsets.list()
-    for k in range(m):
-        start = offsets_list[k]
-        end = offsets_list[k + 1] if k < m - 1 else neighbor_indices_flat.shape[0]
-        if end - start > 0:
-            neighbor_indices.append(wp.clone(neighbor_indices_flat[start:end]))
-            neighbor_distances.append(wp.clone(neighbor_distances_flat[start:end]))
-        else:
-            neighbor_indices.append(wp.empty(0, dtype=wp.int32, device=device))
-            neighbor_distances.append(wp.empty(0, dtype=wp.float32, device=device))
+    neighbor_indices = tw.array.split(neighbor_indices_flat, offsets, copy=True)
+    neighbor_distances = tw.array.split(neighbor_distances_flat, offsets, copy=True)
 
     if single_query:
         return neighbor_indices[0], neighbor_distances[0]
@@ -726,24 +658,56 @@ def query_bvh_ball_with_offsets(
     [`bvh_from_points`][triwarp.neighbors.bvh_from_points]
     [`scipy.spatial.KDTree.query_ball_point`][]
     """
+    return _ball_with_offsets(
+        points,
+        queries,
+        r,
+        build_accelerator=lambda: bvh if bvh is not None else bvh_from_points(points, leaf_size),
+        count_fn=lambda pts, qrs, radius, accelerator: query_bvh_ball_count(
+            pts, qrs, radius, bvh=accelerator
+        ),
+        neighbors_kernel=kernel_neighbors.query_bvh_ball_neighbors,
+        include_total=include_total,
+        return_sorted=return_sorted,
+    )
+
+
+def _ball_with_offsets(
+    points: wp.array[wp.vec3],
+    queries: wp.array[wp.vec3] | wp.vec3,
+    r: float,
+    *,
+    build_accelerator: Callable[[], wp.HashGrid | wp.Bvh],
+    count_fn: Callable[[wp.array[wp.vec3], wp.array[wp.vec3], float, Any], wp.array[wp.int32]],
+    neighbors_kernel: wp.Kernel,
+    include_total: bool,
+    return_sorted: bool,
+) -> tuple[wp.array[wp.int32], wp.array[wp.float32], wp.array[wp.int32]]:
+    """
+    Count, scan, gather and optionally sort one ball query -- the body both accelerators share.
+
+    [`query_hashgrid_ball_with_offsets`][triwarp.neighbors.query_hashgrid_ball_with_offsets] and
+    [`query_bvh_ball_with_offsets`][triwarp.neighbors.query_bvh_ball_with_offsets] differ only in
+    which structure they build, which counting pass they run and which neighbour kernel they
+    launch; everything else -- the empty guards, the CSR scan, the ``2x`` sort scratch and the
+    trailing compaction -- is identical. The accelerator is built lazily so an empty query never
+    pays for one.
+    """
     device = points.device
 
     if isinstance(queries, wp.vec3):
         queries = wp.array([queries], dtype=wp.vec3, device=device)
     m = int(queries.shape[0])
 
-    n: int = int(points.shape[0])
-    if n == 0 or m == 0:
+    if int(points.shape[0]) == 0 or m == 0:
         return (
             wp.empty(0, dtype=wp.int32, device=device),
             wp.empty(0, dtype=wp.float32, device=device),
             wp.zeros(m + 1 if include_total else m, dtype=wp.int32, device=device),
         )
 
-    if bvh is None:
-        bvh = bvh_from_points(points, leaf_size)
-
-    neighbor_counts = query_bvh_ball_count(points, queries, r, bvh=bvh)
+    accelerator = build_accelerator()
+    neighbor_counts = count_fn(points, queries, r, accelerator)
     # The total-terminated CSR form is the segment-bounds array ``segmented_sort_pairs``
     # wants below; the length-``m`` form is a view of its prefix, so both come out of the one
     # scan buffer.
@@ -762,12 +726,12 @@ def query_bvh_ball_with_offsets(
     neighbor_indices_flat = wp.empty(flat_len, dtype=wp.int32, device=device)
     neighbor_distances_flat = wp.empty(flat_len, dtype=wp.float32, device=device)
     wp.launch(
-        kernel_neighbors.query_bvh_ball_neighbors,
+        neighbors_kernel,
         dim=m,
         inputs=[
             points,
             queries,
-            bvh.id,
+            accelerator.id,
             wp.float32(r),
             segment_bounds,
             neighbor_indices_flat,
@@ -1229,7 +1193,8 @@ def geodesic_ball(
     [`edges_unique`][triwarp.edges.edges_unique] +
     [`edges_to_csr`][triwarp.graph.edges_to_csr], then a single-pass BFS collects each ball into
     its per-source queue row (the queue prefix *is* the result) and a scan + gather compacts the
-    rows into the CSR neighbor buffer. Each source uses fixed-capacity scratch of 512 neighbors;
+    rows into the CSR neighbor buffer. Each source uses fixed-capacity scratch of
+    ``_PER_SOURCE_MAX_NEIGHBORS`` neighbors (``triwarp.kernels.algorithms.bfs``, currently 512);
     if a vertex collects more than that the surplus is dropped and a warning is emitted.
 
     !!! note
@@ -1342,7 +1307,7 @@ def geodesic_ball(
     if n_overflow > 0:
         warnings.warn(
             f"geodesic_ball: {n_overflow} neighborhood capacity breaches "
-            f"(fixed cap 512); surplus neighbors dropped.",
+            f"(fixed cap {kernel_bfs._PER_SOURCE_MAX_NEIGHBORS}); surplus neighbors dropped.",
             stacklevel=2,
         )
 
@@ -1354,15 +1319,8 @@ def geodesic_ball(
         return chunk_flats[0], offsets, reference_neighbors
 
     # Chunk order equals ascending source order, so concatenation lines up with the global scan.
-    total = sum(int(flat_chunk.shape[0]) for flat_chunk in chunk_flats)
-    neighbor_indices = wp.empty(total, dtype=wp.int32, device=device)
-    position = 0
-    for flat_chunk in chunk_flats:
-        length = int(flat_chunk.shape[0])
-        if length > 0:
-            wp.copy(neighbor_indices[position : position + length], flat_chunk)
-            position += length
-    return neighbor_indices, offsets, reference_neighbors
+    # Same per-segment ``wp.copy`` loop either way -- that is the packing floor -- one call for it.
+    return tw.array.concatenate(chunk_flats), offsets, reference_neighbors
 
 
 def _knn_cell_size(
