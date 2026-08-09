@@ -118,6 +118,18 @@ def test_split_empty_offsets(device: str) -> None:
     assert tw.array.split(flat_wp, wp.empty(0, dtype=wp.int32, device=device)) == []
 
 
+@pytest.mark.parametrize("copy", [False, True])
+def test_split_trailing_empty_segment(device: str, copy: bool) -> None:
+    """A segment that is empty *at the end* of the buffer splits (Warp rejects ``arr[n:n]``)."""
+    flat_wp = wp.array(np.arange(4, dtype=np.int32), dtype=wp.int32, device=device)
+    offsets_wp = wp.array(np.array([0, 4, 4], dtype=np.int32), dtype=wp.int32, device=device)
+
+    segments_wp = tw.array.split(flat_wp, offsets_wp, copy=copy)
+
+    assert [int(segment.shape[0]) for segment in segments_wp] == [4, 0, 0]
+    assert np.array_equal(segments_wp[0].numpy(), np.arange(4, dtype=np.int32))
+
+
 @pytest.mark.parametrize(
     ("dtype_wp", "dtype_np"),
     [(wp.float32, np.float32), (wp.float64, np.float64), (wp.vec3, np.float32)],

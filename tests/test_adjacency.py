@@ -373,3 +373,11 @@ def test_vertex_face_adjacency_empty(device: str) -> None:
     offsets_wp, payload_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=0)
     assert offsets_wp.shape == (1,)
     assert payload_wp.shape == (0,)
+
+
+def test_vertex_face_adjacency_zero_rows_with_faces(device: str) -> None:
+    """``n_vertices=0`` on a non-empty mesh returns zeros, not an unwritten buffer."""
+    faces_wp = wp.array(np.array([0, 1, 2], dtype=np.int32), dtype=wp.int32, device=device)
+    offsets_wp, payload_wp = tw.adjacency.vertex_face_adjacency(faces_wp, n_vertices=0)
+    assert offsets_wp.shape == (1,)
+    assert np.array_equal(payload_wp.numpy(), np.zeros(3, dtype=np.int32))

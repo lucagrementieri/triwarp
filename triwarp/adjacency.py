@@ -283,9 +283,12 @@ def vertex_face_adjacency(
     row_count = tw.vertices.n_vertices(faces) if n_vertices is None else int(n_vertices)
 
     offsets = wp.zeros(row_count + 1, dtype=wp.int32, device=device)
-    vertex_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
     if n_faces == 0 or row_count == 0:
-        return offsets, vertex_faces
+        # ``row_count == 0`` with faces present (reachable only via an explicit ``n_vertices=0``)
+        # would otherwise hand back an unwritten ``3 * n_faces`` buffer of allocator garbage.
+        return offsets, wp.zeros(3 * n_faces, dtype=wp.int32, device=device)
+
+    vertex_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
 
     counts = wp.zeros(row_count, dtype=wp.int32, device=device)
     wp.launch(

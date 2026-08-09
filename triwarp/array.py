@@ -345,7 +345,12 @@ def split(
         raise ValueError(
             f"offsets must start at 0 and be non-decreasing within [0, {n}], got {starts}"
         )
-    segments = [array[begin:end] for begin, end in itertools.pairwise(bounds)]
+    # Warp rejects a zero-length slice at the very end of a buffer (``arr[n:n]``) while accepting
+    # an interior one, so an empty trailing segment needs its own allocation.
+    segments = [
+        array[begin:end] if end > begin else wp.empty(0, dtype=array.dtype, device=array.device)
+        for begin, end in itertools.pairwise(bounds)
+    ]
     return [wp.clone(segment) for segment in segments] if copy else segments
 
 
@@ -968,6 +973,12 @@ def counts_to_offsets(
     implicit, and the length-``n + 1`` form that stores it (``halfedge.vertex_one_rings``,
     ``geodesic_walk.trace_from_vertex``, and every ``segmented_sort_pairs`` caller). Both come
     out of here, so no caller has to append the terminator afterwards.
+
+    **This is for callers that want ``total``**, which it reads back unconditionally -- about
+    0.1 ms of host synchronization. A caller that only needs the offsets and already knows its
+    buffer size should keep the open-coded ``wp.zeros(n + 1)`` plus a scan into ``[1:]``, as
+    ``halfedge.vertex_one_rings`` and ``adjacency.vertex_face_adjacency`` do: both size their
+    payload from ``3 * n_faces`` and would gain a synchronization they currently do not have.
 
     See Also
     --------
