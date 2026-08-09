@@ -770,9 +770,7 @@ def mass_matrix_entries(
         if dtype != wp.float32:
             # scatter_face_thirds shares one float dtype across areas/count/mass; promote the
             # float32 face areas so the scatter specializes to the requested precision.
-            areas_typed = wp.empty(n_faces, dtype=dtype, device=device)
-            wp.utils.array_cast(areas, areas_typed)
-            areas = areas_typed
+            areas = tw.array.astype(areas, dtype)
         wp.launch(
             kernel_scatter.scatter_face_thirds,
             dim=n_faces,

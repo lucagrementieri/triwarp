@@ -587,9 +587,7 @@ def index_sparse(
                 f"data must have the same size as indices, got {data.size} and {indices.size}"
             )
         if dtype is not None and data.dtype != dtype:
-            casted_data = wp.empty(data.shape, dtype=dtype)
-            wp.utils.array_cast(data, casted_data)
-            data = casted_data
+            data = astype(data, dtype)
 
     n_cols, n_repeats = indices.shape
     cols = init_repeat_index(n_cols * n_repeats, n_repeats, indices.device)
@@ -670,8 +668,8 @@ def isin(elements: twt.ArrayNd, test_elements: wp.array[wp.Int]) -> wp.array[wp.
     # them, and a widened span cannot overflow the type it is measured in (int8's span reaches 256).
     if wp.types.type_size_in_bytes(dtype) < 4:
         wide = sortable_dtype(dtype)
-        elements_flat = _cast_to_dtype(elements_flat, wide)
-        test_elements = _cast_to_dtype(test_elements, wide)
+        elements_flat = astype(elements_flat, wide)
+        test_elements = astype(test_elements, wide)
 
     lo_elements, hi_elements = tw.reduce.minmax(elements_flat)
     lo_test, hi_test = tw.reduce.minmax(test_elements)
@@ -847,6 +845,58 @@ def gather(
     out = wp.empty(out_shape, dtype=src.dtype, device=src.device)
     if k > 0:
         wp.copy(out, src[indices])
+    return out
+
+
+def astype(values: twt.ArrayNd, dtype: type) -> wp.array:
+    """
+    Element-wise dtype conversion, shape and rank preserved (``numpy.ndarray.astype``).
+
+    The Python-scope counterpart of ``wp.cast``, which exists only inside a kernel. Allocates a
+    buffer of ``values``' shape on ``values``' device and fills it with
+    ``warp.utils.array_cast`` -- the pair this replaces at twenty-odd call sites.
+
+    Parameters
+    ----------
+    values
+        Rank-1 or rank-2 Warp array of any scalar dtype ``array_cast`` accepts.
+    dtype
+        Target scalar dtype.
+
+    Returns
+    -------
+    wp.array
+        A new array of ``values``' shape on ``values``' device, with element type ``dtype``.
+
+    Raises
+    ------
+    ValueError
+        If ``values`` is rank-2 and not contiguous, since the rank-2 path flattens.
+
+    Notes
+    -----
+    ``warp.utils.array_cast``'s kernel is ``dest[i] = dest.dtype(src[i])``, which is a *scalar*
+    conversion -- handed a rank-2 array it fails to compile, because ``src[i]`` is a row. So rank-2
+    input is cast through paired ``flatten()`` views here rather than at each call site, which is
+    what several of them were doing by hand.
+
+    The output keeps ``values``' shape, so this is not a reinterpretation that changes rank: an
+    ``(n, 3)`` ``float32`` read as ``(n,)`` ``wp.vec3`` is a different operation and still calls
+    ``wp.utils.array_cast`` directly, as [`hash_rows`][triwarp.grouping.hash_rows] and
+    [`mean_vertex_normals`][triwarp.vertices.mean_vertex_normals] do.
+
+    See Also
+    --------
+    [`bitcast_to_int`][triwarp.array.bitcast_to_int]
+        Reinterpret the *bits* rather than convert the value.
+    """
+    out = wp.empty(values.shape, dtype=dtype, device=values.device)
+    if int(values.ndim) == 1:
+        wp.utils.array_cast(values, out)
+    else:
+        if not values.is_contiguous:
+            raise ValueError("astype requires a contiguous array for rank-2 input")
+        wp.utils.array_cast(values.flatten(), out.flatten())
     return out
 
 
@@ -1230,13 +1280,6 @@ def bitcast_from_int(
 # Private cross-cutting helpers (used by a single external caller today; promote to public
 # only with demonstrated cross-module demand).
 # ---------------------------------------------------------------------------
-
-
-def _cast_to_dtype(values: wp.array[DType], dtype: type) -> wp.array:
-    """Element-wise dtype conversion of a 1D array (``wp.cast`` has no Python-scope form)."""
-    out = wp.empty(int(values.shape[0]), dtype=dtype, device=values.device)
-    wp.utils.array_cast(values, out)
-    return out
 
 
 def _ensure_int_dtype(dtype: type) -> type[wp.Int]:

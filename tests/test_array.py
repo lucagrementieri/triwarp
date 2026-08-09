@@ -646,6 +646,48 @@ bitcast_test_data = (
 )
 
 
+def test_astype_matches_numpy(device: str) -> None:
+    """
+    Class A: ``astype`` equals ``numpy.ndarray.astype`` for every conversion the package uses.
+
+    Covers the rank-2 case as well, because the helper allocates from ``values.shape`` rather than
+    from ``shape[0]`` -- a rank-1-only implementation would silently truncate a table.
+    """
+    rng = np.random.default_rng(3)
+    values_np = (rng.standard_normal(64) * 100.0).astype(np.float32)
+    values_wp = wp.array(values_np, dtype=wp.float32, device=device)
+    assert np.array_equal(tw.array.astype(values_wp, wp.int32).numpy(), values_np.astype(np.int32))
+    assert np.allclose(tw.array.astype(values_wp, wp.float64).numpy(), values_np.astype(np.float64))
+
+    flags_np = rng.integers(0, 2, 64).astype(np.int32)
+    flags_wp = wp.array(flags_np, dtype=wp.int32, device=device)
+    assert np.array_equal(tw.array.astype(flags_wp, wp.bool).numpy(), flags_np.astype(bool))
+    bool_wp = wp.array(flags_np.astype(bool), dtype=wp.bool, device=device)
+    assert np.array_equal(tw.array.astype(bool_wp, wp.int32).numpy(), flags_np)
+
+    rows_np = rng.integers(0, 50, (16, 3)).astype(np.int32)
+    rows_wp = wp.array(rows_np, dtype=wp.int32, device=device)
+    rows_out = tw.array.astype(rows_wp, wp.float32)
+    assert rows_out.shape == (16, 3)
+    assert np.allclose(rows_out.numpy(), rows_np.astype(np.float32))
+
+
+def test_astype_uses_the_input_device(device: str) -> None:
+    """
+    The output lands on ``values``' device, not Warp's current one.
+
+    Needs two devices to say anything, so it skips without CUDA: the site this replaced in
+    ``array.index_sparse`` allocated with no ``device=`` at all and was correct only because the
+    current device happened to match.
+    """
+    if not wp.get_device(device).is_cuda:
+        pytest.skip("needs a second device to distinguish 'input' from 'current'")
+    values_wp = wp.array(np.arange(8, dtype=np.float32), dtype=wp.float32, device=device)
+    with wp.ScopedDevice("cpu"):
+        out = tw.array.astype(values_wp, wp.int32)
+    assert str(out.device) == str(values_wp.device)
+
+
 @pytest.mark.parametrize(
     "data", bitcast_test_data, ids=[a.dtype.__name__ for a in bitcast_test_data]
 )

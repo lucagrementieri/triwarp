@@ -365,8 +365,7 @@ def sample_surface_poisson_disk(
         alive_count -= n_max
 
     # 7. GPU gather: convert alive mask to bool, get indices, copy selected rows
-    alive_bool = wp.empty(init_count, dtype=wp.bool, device=device)
-    wp.utils.array_cast(alive, alive_bool)
+    alive_bool = tw.array.astype(alive, wp.bool)
     indices = flatnonzero(alive_bool)
 
     return gather(init_points, indices), gather(init_face_indices, indices)

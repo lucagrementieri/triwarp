@@ -703,8 +703,7 @@ def _cluster_positions(
             inputs=[labels, vertices, out, counts],
             device=device,
         )
-        counts_f32 = wp.empty(n_clusters, dtype=wp.float32, device=device)
-        wp.utils.array_cast(counts, counts_f32)
+        counts_f32 = tw.array.astype(counts, wp.float32)
         wp.map(wp.div, out, counts_f32, out=out)
         return out
 
@@ -1336,11 +1335,10 @@ def _flip_setup(
     if region is not None and int(region.shape[0]) != n_faces:
         raise ValueError(f"region must have length n_faces={n_faces}, got {int(region.shape[0])}")
 
-    region_flags = wp.empty(n_faces, dtype=wp.int32, device=device)
     if region is None:
-        region_flags.fill_(1)
+        region_flags = wp.full(n_faces, wp.int32(1), dtype=wp.int32, device=device)
     else:
-        wp.utils.array_cast(region, region_flags)
+        region_flags = tw.array.astype(region, wp.int32)
     return wp.clone(faces), tw.vertices.n_vertices(faces), region_flags
 
 
@@ -1802,8 +1800,7 @@ def subdivide_to_size(
 
         # Exclusive scan of the flags gives each long edge its new-vertex slot;
         # the inclusive total is the number of midpoints to add this pass.
-        flags = wp.empty(m, dtype=wp.int32, device=device)
-        wp.utils.array_cast(long_mask, flags)
+        flags = tw.array.astype(long_mask, wp.int32)
         offsets, n_long = tw.array.counts_to_offsets(flags)
 
         # Every edge is short enough: we are done.
@@ -1983,8 +1980,7 @@ def subdivide_region_to_size(
     max_edge_f = wp.float32(max_edge)
     current_vertices = vertices
     current_faces = faces
-    region_flags = wp.empty(n_faces, dtype=wp.int32, device=device)
-    wp.utils.array_cast(region, region_flags)
+    region_flags = tw.array.astype(region, wp.int32)
     splits_done = 0
 
     for i in range(max_iter + 1):
@@ -2007,8 +2003,7 @@ def subdivide_region_to_size(
         long_mask = wp.empty(m, dtype=wp.bool, device=device)
         wp.map(kernel_remesh.long_region_edge, lengths, max_edge_f, edge_in_region, out=long_mask)
 
-        flags = wp.empty(m, dtype=wp.int32, device=device)
-        wp.utils.array_cast(long_mask, flags)
+        flags = tw.array.astype(long_mask, wp.int32)
         offsets, n_long = tw.array.counts_to_offsets(flags)
 
         if n_long == 0:
@@ -2076,8 +2071,7 @@ def subdivide_region_to_size(
             current_vertices, current_faces, region_flags, max_angle_change, max_deviation, 50
         )
 
-    new_region = wp.empty(int(current_faces.shape[0]) // 3, dtype=wp.bool, device=device)
-    wp.utils.array_cast(region_flags, new_region)
+    new_region = tw.array.astype(region_flags, wp.bool)
     return current_vertices, current_faces, new_region
 
 

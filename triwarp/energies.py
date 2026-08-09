@@ -119,9 +119,7 @@ def k_harmonic(
         inverse_mass = wp.ones(n_rows, dtype=dtype, device=device)
     else:
         if mass.dtype != dtype:
-            mass_typed = wp.empty(n_rows, dtype=dtype, device=device)
-            wp.utils.array_cast(mass, mass_typed)
-            mass = mass_typed
+            mass = tw.array.astype(mass, dtype)
         inverse_mass = wp.empty(n_rows, dtype=dtype, device=device)
         wp.map(kernel_energies.reciprocal_or_zero, mass, out=inverse_mass)
 

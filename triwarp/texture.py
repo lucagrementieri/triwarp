@@ -310,9 +310,7 @@ def remap_discrete_attribute_from_uv(
     """
     twt.ensure_ndim(class_image, 2, dtype=wp.int32)
     device = uv.device
-    height, width = int(class_image.shape[0]), int(class_image.shape[1])
-    float_image = twt.empty_float32_2d((height, width), device=device)
-    wp.utils.array_cast(class_image.flatten(), float_image.flatten())
+    float_image = twt.as_array2d_float32(tw.array.astype(class_image, wp.float32))
 
     sampled = remap_attribute_from_uv(uv, float_image, order=0)
 

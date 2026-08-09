@@ -9,7 +9,7 @@ from typing import Literal, NamedTuple, cast, overload
 import warp as wp
 
 import triwarp.typing as twt
-from triwarp.array import _sorted_copy
+from triwarp.array import _sorted_copy, astype
 from triwarp.constants import TILE_1D, TILE_2D
 from triwarp.kernels import reduce as kernel_reduce
 
@@ -340,8 +340,7 @@ def mean(
     if axis is None:
         return float(total) / float(int(array.size))
     sums = cast(twt.Array1dScalar, total)
-    out = wp.empty(int(sums.shape[0]), dtype=wp.float32, device=array.device)
-    wp.utils.array_cast(sums, out)
+    out = astype(sums, wp.float32)
     wp.map(wp.div, out, wp.float32(array.shape[axis]), out=out)
     return cast(twt.Array1dFloat32, out)
 
@@ -736,9 +735,7 @@ def _reduce_scalar(
 
 
 def _bool_mask_as_int32(mask: wp.array[wp.bool]) -> wp.array[wp.int32]:
-    out = wp.empty(mask.shape, dtype=wp.int32, device=mask.device)
-    wp.utils.array_cast(mask.flatten(), out.flatten())
-    return out
+    return astype(mask, wp.int32)
 
 
 def _launch_global_bool_tiled(mask_i32: wp.array[wp.int32], spec: _BoolReduceSpec) -> bool:
@@ -786,8 +783,7 @@ def _reduce_bool(
                 block_dim=TILE_1D,
                 device=array.device,
             )
-        out = wp.empty(out_i32.shape[0], dtype=wp.bool, device=array.device)
-        wp.utils.array_cast(out_i32, out)
+        out = astype(out_i32, wp.bool)
         return out
 
     raise ValueError(f"{spec.name} requires a 1D or 2D array.")
