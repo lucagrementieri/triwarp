@@ -333,31 +333,14 @@ def icp(
     if n == 0 or int(target_vertices.shape[0]) == 0:
         return _identity_mat44(device), wp.clone(a), math.inf
 
-    initial_matrix = _resolve_initial(initial, device)
-    current = wp.empty(n, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_registration.apply_transform_mat44,
-        dim=n,
-        inputs=[a, initial_matrix, current],
-        device=device,
-    )
+    initial_matrix, current = _seed_transform(a, initial, device)
     total = initial_matrix
     transformed = wp.clone(current)
     cost = math.inf
 
-    mesh: wp.Mesh | None = None
-    query_max = wp.float32(0.0)
-    target_index: _TargetIndex | None = None
-    if is_mesh:
-        assert target_faces is not None
-        require_nonempty_mesh(target_faces, "icp")
-        # The mesh aliases the caller's buffers and is discarded here, so it needs no copy.
-        mesh = wp.Mesh(points=target_vertices, indices=target_faces)
-        query_max = tw.bounds.enclosing_diagonal(mesh.points, current)
-        if max_distance is not None:
-            query_max = max(query_max, max_distance)
-    else:
-        target_index = _target_index(target_vertices)
+    mesh, query_max, target_index = _resolve_icp_target(
+        target_vertices, target_faces, current, max_distance, "icp"
+    )
 
     # Correspondence and weight buffers are allocated once and refilled every iteration, and so is
     # the Procrustes workspace — the fit is latency-bound, so its ~10 per-call allocations would
@@ -558,31 +541,18 @@ def icp_point_to_plane(
     if n == 0 or int(target_vertices.shape[0]) == 0:
         return _identity_mat44(device), wp.clone(a), math.inf
 
-    initial_matrix = _resolve_initial(initial, device)
-    current = wp.empty(n, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_registration.apply_transform_mat44,
-        dim=n,
-        inputs=[a, initial_matrix, current],
-        device=device,
-    )
+    initial_matrix, current = _seed_transform(a, initial, device)
     total = initial_matrix
     transformed = wp.clone(current)
     cost = math.inf
 
+    mesh, query_max, target_index = _resolve_icp_target(
+        target_vertices, target_faces, current, max_distance, "icp_point_to_plane"
+    )
     face_normals: wp.array[wp.vec3] | None = None
-    mesh: wp.Mesh | None = None
-    query_max = wp.float32(0.0)
-    target_index: _TargetIndex | None = None
     if is_mesh:
         assert target_faces is not None
-        require_nonempty_mesh(target_faces, "icp_point_to_plane")
-        # The mesh aliases the caller's buffers and is discarded here, so it needs no copy.
-        mesh = wp.Mesh(points=target_vertices, indices=target_faces)
         face_normals, _ = tw.triangles.face_normals_and_areas(target_vertices, target_faces)
-        query_max = tw.bounds.enclosing_diagonal(mesh.points, current)
-        if max_distance is not None:
-            query_max = max(query_max, max_distance)
     else:
         target_index = _target_index(target_vertices)
 
@@ -694,3 +664,81 @@ def icp_point_to_plane(
         old_cost = cost
 
     return total, transformed, cost
+
+
+def _seed_transform(
+    a: wp.array[wp.vec3], initial: wp.array[wp.mat44] | wp.mat44 | None, device: wp.DeviceLike
+) -> tuple[wp.array[wp.mat44], wp.array[wp.vec3]]:
+    """
+    Normalize the initial transform and apply it, giving both ICP loops their starting state.
+
+    Parameters
+    ----------
+    a
+        ``(n,)`` source point cloud.
+    initial
+        Initial transform as a ``(1,)`` ``wp.mat44`` array, a scalar ``wp.mat44``, or ``None`` for
+        the identity.
+    device
+        Device to allocate on.
+
+    Returns
+    -------
+    tuple[wp.array[wp.mat44], wp.array[wp.vec3]]
+        ``(initial_matrix, current)`` -- the resolved transform and the image of ``a`` under it.
+    """
+    initial_matrix = _resolve_initial(initial, device)
+    current = wp.empty(int(a.shape[0]), dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_registration.apply_transform_mat44,
+        dim=int(a.shape[0]),
+        inputs=[a, initial_matrix, current],
+        device=device,
+    )
+    return initial_matrix, current
+
+
+def _resolve_icp_target(
+    target_vertices: wp.array[wp.vec3],
+    target_faces: wp.array[wp.int32] | None,
+    current: wp.array[wp.vec3],
+    max_distance: float | None,
+    caller: str,
+) -> tuple[wp.Mesh | None, wp.float32, _TargetIndex | None]:
+    """
+    Build the loop-invariant search state for whichever target kind was supplied.
+
+    A mesh target gets a ``wp.Mesh`` and a query radius; a point-cloud target gets the BVH,
+    bounding box and density estimate of [`_target_index`][triwarp.registration._target_index].
+    Exactly one of the two is non-``None``.
+
+    Parameters
+    ----------
+    target_vertices
+        ``(m,)`` target positions.
+    target_faces
+        Flat triangle index buffer, or ``None`` / empty for a point-cloud target.
+    current
+        The transformed source, used only to size the mesh query radius.
+    max_distance
+        Correspondence rejection distance; widens the query radius when larger than the box
+        diagonal.
+    caller
+        Calling function's name, for ``require_nonempty_mesh``'s error message.
+
+    Returns
+    -------
+    tuple[wp.Mesh | None, wp.float32, _TargetIndex | None]
+        ``(mesh, query_max, target_index)``.
+    """
+    if not _is_mesh_target(target_faces):
+        return None, wp.float32(0.0), _target_index(target_vertices)
+
+    assert target_faces is not None
+    require_nonempty_mesh(target_faces, caller)
+    # The mesh aliases the caller's buffers and is discarded here, so it needs no copy.
+    mesh = wp.Mesh(points=target_vertices, indices=target_faces)
+    query_max = tw.bounds.enclosing_diagonal(mesh.points, current)
+    if max_distance is not None:
+        query_max = max(query_max, max_distance)
+    return mesh, query_max, None
