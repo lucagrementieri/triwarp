@@ -276,7 +276,9 @@ def icp(
         Target vertex positions, shape ``(m,)``, dtype ``wp.vec3``. Used as the
         target point cloud when ``target_faces`` is ``None``.
     target_faces
-        Flat ``(f * 3,)`` triangle index buffer. When given (and non-empty),
+        Flat ``(f * 3,)`` triangle index buffer. When given, the internally built ``wp.Mesh``
+        aliases ``target_vertices`` and ``target_faces`` rather than copying them; do not mutate
+        them for the duration of the call. When given (and non-empty),
         correspondences are the closest points on the triangle surface; otherwise
         the target is the point cloud ``target_vertices``.
     initial
@@ -334,7 +336,8 @@ def icp(
     if is_mesh:
         assert target_faces is not None
         require_nonempty_mesh(target_faces, "icp")
-        mesh = wp.Mesh(points=wp.clone(target_vertices), indices=wp.clone(target_faces))
+        # The mesh aliases the caller's buffers and is discarded here, so it needs no copy.
+        mesh = wp.Mesh(points=target_vertices, indices=target_faces)
         query_max = tw.bounds.enclosing_diagonal(mesh.points, current)
         if max_distance is not None:
             query_max = max(query_max, max_distance)
@@ -369,6 +372,8 @@ def icp(
             index, distance = tw.neighbors.query_bvh_nearest(
                 target_vertices, current, 1, **target_index
             )
+            # Not ``tw.array.gather``: ``closest`` is allocated once outside this loop, and a
+            # gather would add one allocation per ICP iteration.
             wp.copy(closest, target_vertices[index])
             triangle_id = index
 
@@ -476,7 +481,9 @@ def icp_point_to_plane(
     target_faces
         Flat ``(f * 3,)`` triangle index buffer. When given, target normals are
         the closest triangles' face normals; otherwise the target is the point
-        cloud ``target_vertices`` and ``target_normals`` is required.
+        cloud ``target_vertices`` and ``target_normals`` is required. When given, the internally
+        built ``wp.Mesh`` aliases ``target_vertices`` and ``target_faces`` rather than copying
+        them; do not mutate them for the duration of the call.
     target_normals
         Per-vertex unit normals for a point-cloud target, shape ``(m,)``. Required
         (and only used) when ``target_faces`` is ``None``. Estimate them with
@@ -555,7 +562,8 @@ def icp_point_to_plane(
     if is_mesh:
         assert target_faces is not None
         require_nonempty_mesh(target_faces, "icp_point_to_plane")
-        mesh = wp.Mesh(points=wp.clone(target_vertices), indices=wp.clone(target_faces))
+        # The mesh aliases the caller's buffers and is discarded here, so it needs no copy.
+        mesh = wp.Mesh(points=target_vertices, indices=target_faces)
         face_normals, _ = tw.triangles.face_normals_and_areas(target_vertices, target_faces)
         query_max = tw.bounds.enclosing_diagonal(mesh.points, current)
         if max_distance is not None:
@@ -607,6 +615,8 @@ def icp_point_to_plane(
             index, distance = tw.neighbors.query_bvh_nearest(
                 target_vertices, current, 1, **target_index
             )
+            # Not ``tw.array.gather``: ``closest`` is allocated once outside this loop, and a
+            # gather would add one allocation per ICP iteration.
             wp.copy(closest, target_vertices[index])
             wp.launch(
                 kernel_array.gather_vec_skip_negative,

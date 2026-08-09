@@ -154,7 +154,9 @@ def load_mesh(path: str | Path, *, device: wp.DeviceLike = None) -> wp.Mesh:
     if "faces" not in data:
         raise ValueError(f"Mesh file {path!r} has no triangle faces; cannot build a wp.Mesh.")
     require_nonempty_mesh(data["faces"], "load_mesh")
-    return wp.Mesh(points=wp.clone(data["vertices"]), indices=wp.clone(data["faces"]))
+    # ``load_mesh_data`` allocated both buffers on the line above and nothing else holds
+    # them, so the mesh can own them directly.
+    return wp.Mesh(points=data["vertices"], indices=data["faces"])
 
 
 def mesh_from_numpy(

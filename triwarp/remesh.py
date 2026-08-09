@@ -107,7 +107,9 @@ def isotropic_remesh(
     vertices
         ``(n_vertices,)`` vertex positions on the target device.
     faces
-        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer. Under ``reproject``,
+        the reference ``wp.Mesh`` aliases ``vertices`` and ``faces`` rather than copying them;
+        do not mutate them for the duration of the call.
     target_length
         Desired uniform edge length. Defaults to ``1 %`` of the bounding-box diagonal.
     iterations
@@ -179,7 +181,9 @@ def isotropic_remesh(
     original_mesh = None
     if reproject:
         require_nonempty_mesh(faces, "isotropic_remesh")
-        original_mesh = wp.Mesh(points=wp.clone(vertices), indices=wp.clone(faces))
+        # The mesh aliases the caller's buffers and is discarded here, so it needs no copy: the
+        # loop below rebinds ``current_vertices`` / ``current_faces`` and never writes ``vertices``.
+        original_mesh = wp.Mesh(points=vertices, indices=faces)
 
     for _ in range(iterations):
         if split:
@@ -723,9 +727,7 @@ def _cluster_positions(
         inputs=[labels, vertices, origin, wp.float32(voxel_size), min_distance, representative],
         device=device,
     )
-    out = wp.empty(n_clusters, dtype=wp.vec3, device=device)
-    wp.copy(out, vertices[representative])
-    return out
+    return tw.array.gather(vertices, representative)
 
 
 def quadric_decimate(

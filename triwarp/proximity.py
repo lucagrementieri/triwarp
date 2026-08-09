@@ -78,6 +78,8 @@ def closest_point_on_mesh(
         ``(n,)`` mesh vertex positions as ``wp.vec3``.
     faces
         ``(f * 3,)`` flat triangle index array as ``wp.int32``.
+        The internally built ``wp.Mesh`` aliases these buffers rather than copying them;
+        do not mutate them for the duration of the call.
     points
         ``(m,)`` query positions in space as ``wp.vec3``.
     max_dist
@@ -122,7 +124,8 @@ def closest_point_on_mesh(
 
     if mesh is None:
         require_nonempty_mesh(faces, "closest_point_on_mesh")
-        mesh = wp.Mesh(points=wp.clone(vertices), indices=wp.clone(faces))
+        # The mesh aliases the caller's buffers and is discarded here, so it needs no copy.
+        mesh = wp.Mesh(points=vertices, indices=faces)
     if max_dist is None:
         max_dist = tw.bounds.enclosing_diagonal(mesh.points, points)
 
@@ -145,9 +148,7 @@ def normals_at_closest_faces(
     Return unit face normals at the closest mesh triangle for each query point.
 
     For each position in ``points``, runs an unsigned closest-point query on
-    ``mesh`` and returns the normal of the hit triangle. When no face lies
-    within ``max_dist``, the corresponding output is undefined (same as the
-    underlying ``wp.mesh_query_point_no_sign`` miss case).
+    ``mesh`` and returns the normal of the hit triangle.
 
     Parameters
     ----------
@@ -162,29 +163,29 @@ def normals_at_closest_faces(
     Returns
     -------
     wp.array[wp.vec3]
-        ``(m,)`` face normals at the closest triangle for each query.
+        ``(m,)`` face normals at the closest triangle for each query. A query with no face
+        within ``max_dist`` reports the first face's normal; use
+        [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh] directly, whose
+        ``triangle_id`` is ``-1`` there, when a miss has to be detected.
+
+    See Also
+    --------
+    [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]
     """
     device = points.device
     m = int(points.shape[0])
     if m == 0:
         return wp.empty(0, dtype=wp.vec3, device=device)
 
-    if max_dist is None:
-        max_dist = tw.bounds.enclosing_diagonal(mesh.points, points)
-
-    out_closest = wp.empty(m, dtype=wp.vec3, device=device)
-    out_dist = wp.empty(m, dtype=wp.float32, device=device)
-    out_face = wp.empty(m, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_proximity.closest_point_on_mesh,
-        dim=m,
-        inputs=[mesh.id, points, wp.float32(max_dist), out_closest, out_dist, out_face],
-        device=device,
+    _closest, _distance, out_face = closest_point_on_mesh(
+        mesh.points, mesh.indices, points, max_dist=max_dist, mesh=mesh
     )
+    # A miss leaves ``-1``, which would gather out of bounds; clamping to face 0 costs one map
+    # over ``m`` and keeps the read in range.
+    hit_face = wp.empty(m, dtype=wp.int32, device=device)
+    wp.map(wp.max, out_face, wp.int32(0), out=hit_face)
     all_face_normals, _ = face_normals_and_areas(mesh.points, mesh.indices)
-    normals = wp.empty(m, dtype=wp.vec3, device=device)
-    wp.copy(normals, all_face_normals[out_face])
-    return normals
+    return tw.array.gather(all_face_normals, hit_face)
 
 
 def signed_distance_on_mesh(
@@ -251,6 +252,8 @@ def signed_distance_on_mesh(
         ``(n,)`` mesh vertex positions as ``wp.vec3``.
     faces
         ``(f * 3,)`` flat triangle index array as ``wp.int32``.
+        The internally built ``wp.Mesh`` aliases these buffers rather than copying them;
+        do not mutate them for the duration of the call.
     points
         ``(m,)`` query positions in space as ``wp.vec3``.
     max_dist
@@ -320,10 +323,9 @@ def signed_distance_on_mesh(
         # The winding-number builtin silently degrades to ray parity unless the mesh carries the
         # per-node solid-angle expansion, so the flag is bound to sign_mode here rather than
         # exposed.
+        # The mesh aliases the caller's buffers and is discarded here, so it needs no copy.
         mesh = wp.Mesh(
-            points=wp.clone(vertices),
-            indices=wp.clone(faces),
-            support_winding_number=sign_mode == "winding",
+            points=vertices, indices=faces, support_winding_number=sign_mode == "winding"
         )
     if max_dist is None:
         max_dist = tw.bounds.enclosing_diagonal(mesh.points, points)
@@ -596,7 +598,8 @@ def containing_faces_2d(
     search_radius = _CONTAINMENT_SEARCH_SCALE * tw.bounds.enclosing_diagonal(lifted)
 
     require_nonempty_mesh(faces, "containing_faces_2d")
-    mesh = wp.Mesh(points=lifted, indices=wp.clone(faces))
+    # Both buffers are local to this call (``lifted`` is built above), so no copy is needed.
+    mesh = wp.Mesh(points=lifted, indices=faces)
     out_face = wp.empty(m, dtype=wp.int32, device=device)
     wp.launch(
         kernel_proximity.face_containing_point_2d,
