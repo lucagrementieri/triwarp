@@ -83,8 +83,9 @@ def mean_vertex_normals(
     faces2d = faces.reshape((-1, 3))
     wp.launch(
         kernel_scatter.scatter_sum_vec,
-        dim=face_normals.shape[0],
+        dim=int(face_normals.shape[0]),
         inputs=[face_normals, faces2d, normals],
+        device=faces.device,
     )
     vec_normals = wp.empty(n_vertices, dtype=wp.vec3, device=faces.device)
     wp.utils.array_cast(normals, vec_normals)
@@ -127,8 +128,9 @@ def weighted_vertex_normals(
     faces2d = faces.reshape((-1, 3))
     wp.launch(
         kernel_scatter.scatter_weighted_sum_vec,
-        dim=face_normals.shape[0],
+        dim=int(face_normals.shape[0]),
         inputs=[face_normals, faces2d, face_weights, normals],
+        device=faces.device,
     )
     vec_normals = wp.empty(n_vertices, dtype=wp.vec3, device=faces.device)
     wp.utils.array_cast(normals, vec_normals)
@@ -323,8 +325,9 @@ def vertex_defects(
     faces2d = faces.reshape((-1, 3))
     wp.launch(
         kernel_scatter.scatter_sum_scalar,
-        dim=face_angles.shape[0],
+        dim=int(face_angles.shape[0]),
         inputs=[face_angles, faces2d, angle_sum],
+        device=faces.device,
     )
     defect = tw.constants.TWO_PI - angle_sum
     return defect

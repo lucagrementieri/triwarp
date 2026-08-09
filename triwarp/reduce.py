@@ -634,12 +634,12 @@ def _launch_global_scalar_tiled(
     else:
         out = wp.full(1, spec.init_global(array.dtype), dtype=array.dtype, device=array.device)
 
-    if array.ndim == 1:
-        n = int(array.shape[0])
+    flat = _flattened_for_global(array)
+    if flat is not None:
         wp.launch_tiled(
             spec.tiled_1d,
-            dim=[kernel_reduce.blocks_1d(n)],
-            inputs=[array, out],
+            dim=[kernel_reduce.blocks_1d(int(flat.shape[0]))],
+            inputs=[flat, out],
             block_dim=TILE_1D,
             device=array.device,
         )
@@ -659,6 +659,43 @@ def _launch_global_scalar_tiled(
     if spec.global_output_slots == 2:
         return cast(tuple[int, int] | tuple[float, float], (out_np[0].item(), out_np[1].item()))
     return cast(float | int, out_np.item())
+
+
+def _flattened_for_global(array: twt.ScalarArray) -> twt.Array1dScalar | None:
+    """
+    Return a 1-D view when the 1-D kernel is the better way to reduce ``array``, else ``None``.
+
+    Rank-1 input is already the 1-D case. Rank-2 input is worth flattening when its trailing extent
+    is under ``TILE_2D``, because the rank-2 kernel tiles ``TILE_2D``-squares and a table that
+    narrow clips every tile — so its ``wp.tile_load`` branch never runs and all ``TILE_2D**2`` lanes
+    walk the same short block, the rank-2 form of the amplification ``_launch_axis_scalar``
+    documents. Flattening costs nothing on a contiguous buffer and hands the work to the 1-D kernel,
+    which also carries the ``TILES_PER_BLOCK_1D`` fold. Measured on ``minmax``: **5.95x** on a
+    ``(14M, 3)`` table and **6.18x** on ``(8M, 2)``, against 1.02x on ``(40k, 128)`` — where the
+    tile branch does fire, which is why the width test is there and not just a contiguity test.
+
+    The cost is at the small end: ``(36k, 3)`` measures **0.79x**, because 16 tiles per block leaves
+    too few blocks to fill the device. That is 13 µs of kernel time under the ~82 µs host floor
+    every scalar-returning reduction already pays, so it is invisible end to end.
+
+    ``wp.array.flatten()`` raises on a non-contiguous array rather than copying, so a strided view
+    keeps the rank-2 kernel — correctness first, and such a view is not the common case.
+
+    Parameters
+    ----------
+    array
+        Rank-1 or rank-2 scalar array being reduced with ``axis=None``.
+
+    Returns
+    -------
+    wp.array | None
+        A 1-D view to reduce with the 1-D kernel, or ``None`` to use the rank-2 kernel.
+    """
+    if array.ndim == 1:
+        return cast(twt.Array1dScalar, array)
+    if int(array.shape[1]) < TILE_2D and array.is_contiguous:
+        return cast(twt.Array1dScalar, array.flatten())
+    return None
 
 
 def _launch_global_vec3_minmax(array: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:

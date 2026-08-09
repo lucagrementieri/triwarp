@@ -25,7 +25,7 @@ _ISIN_MASK_SIZE_FACTOR = 8
 SORT_ROWS_INSERTION_MAX_COLS = 8
 
 
-def init_range(n: int, device: str, *, dtype: type[wp.Int] = wp.int32) -> wp.array:
+def init_range(n: int, device: wp.DeviceLike, *, dtype: type[wp.Int] = wp.int32) -> wp.array:
     """
     Fill ``out[i] = i`` for ``i`` in ``[0, n)`` (``numpy.arange``).
 
@@ -60,7 +60,7 @@ def init_range(n: int, device: str, *, dtype: type[wp.Int] = wp.int32) -> wp.arr
 
 
 def init_range_step(
-    count: int, step: int, device: str, *, dtype: type[wp.Int] = wp.int32
+    count: int, step: int, device: wp.DeviceLike, *, dtype: type[wp.Int] = wp.int32
 ) -> wp.array:
     """
     Fill ``out[i] = i * step`` (``numpy.arange(0, count * step, step)``).
@@ -476,8 +476,12 @@ def sort_and_argsort(
     Both results are **views** into the scratch buffers, kept alive by the returned arrays. Clone
     them if they must outlive the caller's frame alongside another sort.
 
-    Ties are broken arbitrarily -- the radix sort is not documented as stable -- so ``order`` is
-    only one of several valid permutations when ``keys`` has duplicates.
+    The sort is **stable**: equal keys keep their input order, so ``order`` is ascending within
+    each run of duplicate keys. ``warp.utils.radix_sort_pairs`` documents this ("the sort is
+    stable and operates in linear time"), it is inherent to its LSD radix passes, and it is
+    verified on both devices against ``numpy.argsort(kind="stable")``. Callers may rely on it --
+    [`split_batched`][triwarp.combine.split_batched] does, to keep faces ascending within each
+    component.
 
     See Also
     --------

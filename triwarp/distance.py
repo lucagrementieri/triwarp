@@ -22,13 +22,14 @@ Two families of geometry are supported and can be mixed:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Literal, cast, overload
 
 import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import items_per_slice, prefers_tiled_reduction
+from triwarp._device import prefers_tiled_reduction, slice_count
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import distance as kernel_distance
@@ -122,6 +123,64 @@ def _empty_chamfer(
     )
 
 
+_DistancePair = tuple[wp.array[wp.float32], wp.array[wp.float32] | None]
+
+# The three geometry dispatches below are each shared by a ``chamfer_*`` and a ``hausdorff_*``
+# entry point, which differ only in how they reduce the pair and what they return for degenerate
+# input. ``None`` means degenerate, leaving that choice to the caller.
+
+
+def _distances_points_to_points(
+    x: wp.array[wp.vec3], y: wp.array[wp.vec3], single_directional: bool
+) -> _DistancePair | None:
+    """Nearest-neighbour distances between two clouds, both directions unless directed."""
+    if int(x.shape[0]) == 0 or int(y.shape[0]) == 0:
+        return None
+    d_forward = tw.neighbors.query_hashgrid_nearest(y, x, k=1)[1]
+    d_backward = None
+    if not single_directional:
+        d_backward = tw.neighbors.query_hashgrid_nearest(x, y, k=1)[1]
+    return d_forward, d_backward
+
+
+def _distances_points_to_mesh(
+    points: wp.array[wp.vec3],
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    single_directional: bool,
+) -> _DistancePair | None:
+    """Point-to-surface distances forward, cloud nearest-neighbour distances back."""
+    if int(points.shape[0]) == 0 or int(vertices.shape[0]) == 0 or int(faces.shape[0]) == 0:
+        return None
+    d_forward = tw.proximity.closest_point_on_mesh(vertices, faces, points)[1]
+    d_backward = None
+    if not single_directional:
+        d_backward = tw.neighbors.query_hashgrid_nearest(points, vertices, k=1)[1]
+    return d_forward, d_backward
+
+
+def _distances_mesh_to_mesh(
+    vertices_a: wp.array[wp.vec3],
+    faces_a: wp.array[wp.int32],
+    vertices_b: wp.array[wp.vec3],
+    faces_b: wp.array[wp.int32],
+    single_directional: bool,
+) -> _DistancePair | None:
+    """Each mesh's vertices to the other's surface. Vertex-sampled, not a true surface metric."""
+    if (
+        int(vertices_a.shape[0]) == 0
+        or int(vertices_b.shape[0]) == 0
+        or int(faces_a.shape[0]) == 0
+        or int(faces_b.shape[0]) == 0
+    ):
+        return None
+    d_forward = tw.proximity.closest_point_on_mesh(vertices_b, faces_b, vertices_a)[1]
+    d_backward = None
+    if not single_directional:
+        d_backward = tw.proximity.closest_point_on_mesh(vertices_a, faces_a, vertices_b)[1]
+    return d_forward, d_backward
+
+
 # ---------------------------------------------------------------------------
 # Chamfer distance
 # ---------------------------------------------------------------------------
@@ -186,17 +245,10 @@ def chamfer_points_to_points(
     [`query_hashgrid_nearest`][triwarp.neighbors.query_hashgrid_nearest]
     """
     _validate_point_reduction(point_reduction)
-    device = x.device
-    n = int(x.shape[0])
-    m = int(y.shape[0])
-    if n == 0 or m == 0:
-        return _empty_chamfer(point_reduction, single_directional, device)
-
-    d_forward = tw.neighbors.query_hashgrid_nearest(y, x, k=1)[1]
-    d_backward = None
-    if not single_directional:
-        d_backward = tw.neighbors.query_hashgrid_nearest(x, y, k=1)[1]
-    return _chamfer(d_forward, d_backward, point_reduction, single_directional)
+    distances = _distances_points_to_points(x, y, single_directional)
+    if distances is None:
+        return _empty_chamfer(point_reduction, single_directional, x.device)
+    return _chamfer(*distances, point_reduction, single_directional)
 
 
 @overload
@@ -260,18 +312,10 @@ def chamfer_points_to_mesh(
     [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]
     """
     _validate_point_reduction(point_reduction)
-    device = points.device
-    n = int(points.shape[0])
-    v = int(vertices.shape[0])
-    n_faces = int(faces.shape[0]) // 3
-    if n == 0 or v == 0 or n_faces == 0:
-        return _empty_chamfer(point_reduction, single_directional, device)
-
-    d_forward = tw.proximity.closest_point_on_mesh(vertices, faces, points)[1]
-    d_backward = None
-    if not single_directional:
-        d_backward = tw.neighbors.query_hashgrid_nearest(points, vertices, k=1)[1]
-    return _chamfer(d_forward, d_backward, point_reduction, single_directional)
+    distances = _distances_points_to_mesh(points, vertices, faces, single_directional)
+    if distances is None:
+        return _empty_chamfer(point_reduction, single_directional, points.device)
+    return _chamfer(*distances, point_reduction, single_directional)
 
 
 @overload
@@ -335,19 +379,12 @@ def chamfer_mesh_to_mesh(
     [`hausdorff_mesh_to_mesh`][triwarp.distance.hausdorff_mesh_to_mesh]
     """
     _validate_point_reduction(point_reduction)
-    device = vertices_a.device
-    va = int(vertices_a.shape[0])
-    vb = int(vertices_b.shape[0])
-    n_faces_a = int(faces_a.shape[0]) // 3
-    n_faces_b = int(faces_b.shape[0]) // 3
-    if va == 0 or vb == 0 or n_faces_a == 0 or n_faces_b == 0:
-        return _empty_chamfer(point_reduction, single_directional, device)
-
-    d_forward = tw.proximity.closest_point_on_mesh(vertices_b, faces_b, vertices_a)[1]
-    d_backward = None
-    if not single_directional:
-        d_backward = tw.proximity.closest_point_on_mesh(vertices_a, faces_a, vertices_b)[1]
-    return _chamfer(d_forward, d_backward, point_reduction, single_directional)
+    distances = _distances_mesh_to_mesh(
+        vertices_a, faces_a, vertices_b, faces_b, single_directional
+    )
+    if distances is None:
+        return _empty_chamfer(point_reduction, single_directional, vertices_a.device)
+    return _chamfer(*distances, point_reduction, single_directional)
 
 
 # ---------------------------------------------------------------------------
@@ -389,15 +426,24 @@ def _reduction_scale(point_reduction: _DiffReduction, count: int) -> float:
     return (1.0 / count) if point_reduction == "mean" else 1.0
 
 
-def _loss_slices(count: int, device: wp.DeviceLike) -> int:
-    """Thread count for the lane-free chamfer reductions: one thread per strided slice."""
-    per_slice = items_per_slice(device)
-    return max(1, (count + per_slice - 1) // per_slice)
-
-
 def _zero_loss(device: wp.DeviceLike) -> twt.Array1dFloat32:
     zeros = wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True)
     return cast(twt.Array1dFloat32, zeros)
+
+
+def _maybe_taped(tape: wp.Tape | None, record: Callable[[], None]) -> None:
+    """
+    Run ``record``, inside ``tape`` when there is one.
+
+    The three ``chamfer_*_loss`` entry points each build their launches in a closure so the same
+    body can run recorded or not; this is the branch that decides which. Recording is opt-in
+    because a ``wp.Tape`` context is only wanted when the caller intends to backpropagate.
+    """
+    if tape is not None:
+        with tape:
+            record()
+    else:
+        record()
 
 
 def _launch_nn_term(
@@ -425,7 +471,7 @@ def _launch_nn_term(
             device=device,
         )
     else:
-        slices = _loss_slices(n, device)
+        slices = slice_count(n, device)
         wp.launch(
             kernel_distance.chamfer_nn_term_sliced,
             dim=slices,
@@ -458,7 +504,7 @@ def _launch_surface_term(
             device=device,
         )
     else:
-        slices = _loss_slices(n, device)
+        slices = slice_count(n, device)
         wp.launch(
             kernel_distance.chamfer_surface_term_sliced,
             dim=slices,
@@ -536,11 +582,7 @@ def chamfer_points_to_points_loss(
             assert nearest_yx is not None
             _launch_nn_term(y, x, nearest_yx, _reduction_scale(point_reduction, m), loss)
 
-    if tape is not None:
-        with tape:
-            _record()
-    else:
-        _record()
+    _maybe_taped(tape, _record)
     return loss
 
 
@@ -613,11 +655,7 @@ def chamfer_points_to_mesh_loss(
                 vertices, points, nearest_vp, _reduction_scale(point_reduction, v), loss
             )
 
-    if tape is not None:
-        with tape:
-            _record()
-    else:
-        _record()
+    _maybe_taped(tape, _record)
     return loss
 
 
@@ -695,11 +733,7 @@ def chamfer_mesh_to_mesh_loss(
                 loss,
             )
 
-    if tape is not None:
-        with tape:
-            _record()
-    else:
-        _record()
+    _maybe_taped(tape, _record)
     return loss
 
 
@@ -738,16 +772,10 @@ def hausdorff_points_to_points(
     [`hausdorff_mesh_to_mesh`][triwarp.distance.hausdorff_mesh_to_mesh]
     [`scipy.spatial.distance.directed_hausdorff`][]
     """
-    n = int(x.shape[0])
-    m = int(y.shape[0])
-    if n == 0 or m == 0:
+    distances = _distances_points_to_points(x, y, single_directional)
+    if distances is None:
         return 0.0
-
-    d_forward = tw.neighbors.query_hashgrid_nearest(y, x, k=1)[1]
-    d_backward = None
-    if not single_directional:
-        d_backward = tw.neighbors.query_hashgrid_nearest(x, y, k=1)[1]
-    return _hausdorff(d_forward, d_backward, single_directional)
+    return _hausdorff(*distances, single_directional)
 
 
 def hausdorff_points_to_mesh(
@@ -785,17 +813,10 @@ def hausdorff_points_to_mesh(
     [`hausdorff_points_to_points`][triwarp.distance.hausdorff_points_to_points]
     [`hausdorff_mesh_to_mesh`][triwarp.distance.hausdorff_mesh_to_mesh]
     """
-    n = int(points.shape[0])
-    v = int(vertices.shape[0])
-    n_faces = int(faces.shape[0]) // 3
-    if n == 0 or v == 0 or n_faces == 0:
+    distances = _distances_points_to_mesh(points, vertices, faces, single_directional)
+    if distances is None:
         return 0.0
-
-    d_forward = tw.proximity.closest_point_on_mesh(vertices, faces, points)[1]
-    d_backward = None
-    if not single_directional:
-        d_backward = tw.neighbors.query_hashgrid_nearest(points, vertices, k=1)[1]
-    return _hausdorff(d_forward, d_backward, single_directional)
+    return _hausdorff(*distances, single_directional)
 
 
 def hausdorff_mesh_to_mesh(
@@ -833,15 +854,9 @@ def hausdorff_mesh_to_mesh(
     [`chamfer_mesh_to_mesh`][triwarp.distance.chamfer_mesh_to_mesh]
     [`hausdorff_points_to_mesh`][triwarp.distance.hausdorff_points_to_mesh]
     """
-    va = int(vertices_a.shape[0])
-    vb = int(vertices_b.shape[0])
-    n_faces_a = int(faces_a.shape[0]) // 3
-    n_faces_b = int(faces_b.shape[0]) // 3
-    if va == 0 or vb == 0 or n_faces_a == 0 or n_faces_b == 0:
+    distances = _distances_mesh_to_mesh(
+        vertices_a, faces_a, vertices_b, faces_b, single_directional
+    )
+    if distances is None:
         return 0.0
-
-    d_forward = tw.proximity.closest_point_on_mesh(vertices_b, faces_b, vertices_a)[1]
-    d_backward = None
-    if not single_directional:
-        d_backward = tw.proximity.closest_point_on_mesh(vertices_a, faces_a, vertices_b)[1]
-    return _hausdorff(d_forward, d_backward, single_directional)
+    return _hausdorff(*distances, single_directional)

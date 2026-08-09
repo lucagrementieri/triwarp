@@ -63,8 +63,13 @@ def concatenate(
 
     if sum(vertex_counts) == 0:
         concatenated_vertices = wp.empty(0, dtype=wp.vec3, device=device)
+        vertex_offsets = wp.zeros(len(meshes_data), dtype=wp.int32, device=device)
     else:
-        concatenated_vertices, _ = tw.array.pack_1d_arrays(
+        # ``pack_1d_arrays`` already returns the exclusive scan of the segment sizes, on the
+        # device and of exactly this length -- the renumbering offsets, for free. Recomputing them
+        # with ``itertools.accumulate`` and uploading the result was a second copy of the same
+        # numbers.
+        concatenated_vertices, vertex_offsets = tw.array.pack_1d_arrays(
             [vertices for vertices, _ in meshes_data]
         )
 
@@ -75,9 +80,6 @@ def concatenate(
     concatenated_faces, piece_starts = tw.array.pack_1d_arrays([faces for _, faces in meshes_data])
     total_indices = int(concatenated_faces.shape[0])
     if total_indices > 0:
-        vertex_offsets = wp.array(
-            list(itertools.accumulate(vertex_counts[:-1], initial=0)), dtype=wp.int32, device=device
-        )
         wp.launch(
             kernel_combine.offset_packed_faces,
             dim=total_indices,
@@ -198,14 +200,13 @@ def split_batched(
     face_labels = tw.adjacency.face_connected_component_labels(faces)
 
     # One stable label sort replaces the per-component isin/flatnonzero full-array passes: the
-    # sort is stable, so faces stay ascending within each component and components ascend by
-    # label — the exact emission order of the previous per-label loop.
-    labels_buffer = wp.empty(2 * n_faces, dtype=wp.int32, device=device)
-    wp.copy(labels_buffer, face_labels, count=n_faces)
-    face_ids = tw.array.init_sort_pair_indices(n_faces, -1, device)
-    wp.utils.radix_sort_pairs(labels_buffer, face_ids, count=n_faces)
-    sorted_labels = wp.clone(labels_buffer[:n_faces])
-    sorted_face_ids = wp.clone(face_ids[:n_faces])
+    # sort is stable (see tw.array.sort_and_argsort's Notes), so faces stay ascending within each
+    # component and components ascend by label — the exact emission order of the previous
+    # per-label loop.
+    # Views into ``sort_and_argsort``'s scratch, deliberately not cloned: neither escapes this
+    # frame. ``sorted_labels`` feeds only the adjacent-element map below, and ``sorted_face_ids``
+    # only the submesh builders, which read it into fresh buffers.
+    sorted_labels, sorted_face_ids = tw.array.sort_and_argsort(face_labels)
 
     # Segment boundaries of the label-sorted array: position 0, plus every label change. The
     # change test is the adjacent-element map over two shifted views of the same buffer; the
@@ -271,18 +272,10 @@ def stitch(
     [`stitch_min_weight`][triwarp.combine.stitch_min_weight]
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     """
-    loops_a = [
-        loop for loop in tw.boundary.boundary_loops(vertices_a, faces_a) if int(loop.shape[0]) >= 3
-    ]
-    loops_b = [
-        loop for loop in tw.boundary.boundary_loops(vertices_b, faces_b) if int(loop.shape[0]) >= 3
-    ]
-    if len(loops_a) != 1 or len(loops_b) != 1:
-        raise ValueError(
-            "stitch requires each mesh to have exactly one boundary loop (>= 3 vertices); "
-            f"got {len(loops_a)} and {len(loops_b)}"
-        )
-    return stitch_loops(vertices_a, faces_a, loops_a[0], vertices_b, faces_b, loops_b[0])
+    loop_a, loop_b = _single_boundary_loops(
+        vertices_a, faces_a, vertices_b, faces_b, caller="stitch"
+    )
+    return stitch_loops(vertices_a, faces_a, loop_a, vertices_b, faces_b, loop_b)
 
 
 def stitch_min_weight(
@@ -334,19 +327,11 @@ def stitch_min_weight(
     -----
     The band is MeshLib's ``stitchHoles``, and its metrics are that function's.
     """
-    loops_a = [
-        loop for loop in tw.boundary.boundary_loops(vertices_a, faces_a) if int(loop.shape[0]) >= 3
-    ]
-    loops_b = [
-        loop for loop in tw.boundary.boundary_loops(vertices_b, faces_b) if int(loop.shape[0]) >= 3
-    ]
-    if len(loops_a) != 1 or len(loops_b) != 1:
-        raise ValueError(
-            "stitch_min_weight requires each mesh to have exactly one boundary loop (>=3 verts); "
-            f"got {len(loops_a)} and {len(loops_b)}"
-        )
+    loop_a, loop_b = _single_boundary_loops(
+        vertices_a, faces_a, vertices_b, faces_b, caller="stitch_min_weight"
+    )
     return stitch_loops_min_weight(
-        vertices_a, faces_a, loops_a[0], vertices_b, faces_b, loops_b[0], metric, up_dir
+        vertices_a, faces_a, loop_a, vertices_b, faces_b, loop_b, metric, up_dir
     )
 
 
@@ -434,23 +419,15 @@ def stitch_smooth(
     if edge_weights not in ("cotan", "unit"):
         raise ValueError(f"edge_weights must be 'cotan' or 'unit', got {edge_weights!r}")
 
-    loops_a = [
-        loop for loop in tw.boundary.boundary_loops(vertices_a, faces_a) if int(loop.shape[0]) >= 3
-    ]
-    loops_b = [
-        loop for loop in tw.boundary.boundary_loops(vertices_b, faces_b) if int(loop.shape[0]) >= 3
-    ]
-    if len(loops_a) != 1 or len(loops_b) != 1:
-        raise ValueError(
-            "stitch_smooth requires each mesh to have exactly one boundary loop (>=3 verts); "
-            f"got {len(loops_a)} and {len(loops_b)}"
-        )
+    loop_a, loop_b = _single_boundary_loops(
+        vertices_a, faces_a, vertices_b, faces_b, caller="stitch_smooth"
+    )
 
     device = faces_a.device
     n_faces_before = (int(faces_a.shape[0]) + int(faces_b.shape[0])) // 3
     n_vertices_before = int(vertices_a.shape[0]) + int(vertices_b.shape[0])
     combined_vertices, combined_faces = stitch_loops_min_weight(
-        vertices_a, faces_a, loops_a[0], vertices_b, faces_b, loops_b[0], metric, up_dir
+        vertices_a, faces_a, loop_a, vertices_b, faces_b, loop_b, metric, up_dir
     )
     n_faces_after = int(combined_faces.shape[0]) // 3
     patch_mask = tw.holes._patch_mask(n_faces_before, n_faces_after, device)
@@ -459,10 +436,13 @@ def stitch_smooth(
         result = (combined_vertices, combined_faces)
         return (*result, patch_mask) if return_patch else result
 
-    rim_loops = [
-        wp.array(loops_a[0].numpy(), dtype=wp.int32, device=device),
-        wp.array(loops_b[0].numpy() + int(vertices_a.shape[0]), dtype=wp.int32, device=device),
-    ]
+    # Independent copies, not views: ``boundary_loops`` returns slices of one shared packed buffer
+    # and ``_mean_rim_edge_length`` must not alias it. ``wp.clone`` says exactly that; the round
+    # trip through ``.numpy()`` these used to take said nothing and crossed the bus twice. The
+    # second loop's shift into the combined numbering is elementwise, so it maps on the device.
+    shifted_loop_b = wp.empty(int(loop_b.shape[0]), dtype=wp.int32, device=device)
+    wp.map(wp.add, loop_b, wp.int32(int(vertices_a.shape[0])), out=shifted_loop_b)
+    rim_loops = [wp.clone(loop_a), shifted_loop_b]
     target_edge = (
         max_edge
         if max_edge is not None
@@ -482,6 +462,35 @@ def stitch_smooth(
         edge_weights,
     )
     return (new_vertices, new_faces, out_patch) if return_patch else (new_vertices, new_faces)
+
+
+def _single_boundary_loops(
+    vertices_a: wp.array[wp.vec3],
+    faces_a: wp.array[wp.int32],
+    vertices_b: wp.array[wp.vec3],
+    faces_b: wp.array[wp.int32],
+    *,
+    caller: str,
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Return the one boundary loop of each mesh, or raise naming ``caller``.
+
+    The shared precondition of the whole ``stitch*`` family: each mesh must have exactly one hole
+    to zip to the other's. Loops shorter than three vertices are degenerate rather than holes and
+    are dropped before counting, so a mesh carrying one is rejected on its real loop count.
+    """
+    loops_a = [
+        loop for loop in tw.boundary.boundary_loops(vertices_a, faces_a) if int(loop.shape[0]) >= 3
+    ]
+    loops_b = [
+        loop for loop in tw.boundary.boundary_loops(vertices_b, faces_b) if int(loop.shape[0]) >= 3
+    ]
+    if len(loops_a) != 1 or len(loops_b) != 1:
+        raise ValueError(
+            f"{caller} requires each mesh to have exactly one boundary loop (>= 3 vertices); "
+            f"got {len(loops_a)} and {len(loops_b)}"
+        )
+    return loops_a[0], loops_b[0]
 
 
 def stitch_loops(
@@ -535,6 +544,9 @@ def stitch_loops(
 
     See Also
     --------
+    [`stitch_loops_min_weight`][triwarp.combine.stitch_loops_min_weight]
+        The more robust choice, and the one to reach for when seam quality matters: it minimizes a
+        triangulation metric over the whole rim pair instead of correcting a greedy correspondence.
     [`stitch`][triwarp.combine.stitch]
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     [`concatenate`][triwarp.combine.concatenate]
@@ -545,6 +557,14 @@ def stitch_loops(
     host over the length-``len(loop_a)`` association array; the O(N·M) perimeter matrix, the
     reductions, and the triangle emission run in Warp kernels, and the perimeter matrix itself is
     never copied off the device.
+
+    **This is the fast one, and that is the reason to keep it.** It is metric-free and makes one
+    O(N·M) pass, where
+    [`stitch_loops_min_weight`][triwarp.combine.stitch_loops_min_weight] fills the same size table
+    with ``N + M`` sequential launches along the anti-diagonals. Measured on two facing cylinder
+    rims (RTX 5090, min of 5), the DP costs **5.0x** at a 100-vertex rim, **7.7x** at 1 000 and
+    **8.9x** at 4 000; on CPU, 5.2x / 7.5x / 7.2x. The gap widens with rim size, so the DP is never
+    the cheaper option -- prefer it for the seam it produces, not for speed.
     """
     device = faces_a.device
     n = int(loop_a.shape[0])
@@ -695,8 +715,6 @@ def stitch_loops(
     return combined_vertices, tw.array.concatenate([combined_faces, bridge_a, bridge_b])
 
 
-# Stitch-metric name -> kernel selector (must match the METRIC_*_STITCH constants in
-# kernels/holes.py).
 def _longest_increasing_subsequence(numbers: np.ndarray) -> np.ndarray:
     """
     Longest strictly increasing subsequence of ``numbers`` (patience-sorting, O(N log N)).
@@ -741,6 +759,8 @@ def _non_increasing_indices(numbers: np.ndarray) -> np.ndarray:
     return np.flatnonzero(absence_mask)
 
 
+# Stitch-metric name -> kernel selector (must match the METRIC_*_STITCH constants in
+# kernels/holes.py).
 _STITCH_METRIC_IDS = {"complex_stitch": 0, "edge_length_stitch": 1, "vertical": 2}
 
 
@@ -852,6 +872,10 @@ def stitch_loops_min_weight(
     # Reverse loop A so the two rims wind oppositely (facing), then align both at the closest pair.
     # ``la`` / ``lb`` stay on the host for the sequential band traceback, but the closest-pair
     # search, rim gathers and rim-opposite lookups all run on device.
+    # Measured, and deliberately left alone: this preamble (two readbacks, the closest-pair gather,
+    # the host roll and two more uploads) is 5.0% of the call at a 100-vertex rim on CUDA and falls
+    # to 0.7% at 1 000 and 0.4% at 4 000 -- the anti-diagonal DP below dominates and grows faster.
+    # Folding the roll into ``cyclic_gather`` would buy a shrinking fraction of a noise floor.
     la = loop_a.numpy()[::-1].copy()
     lb = loop_b.numpy().copy()
     a_rim = tw.array.gather(vertices_a, wp.array(la, dtype=wp.int32, device=device))

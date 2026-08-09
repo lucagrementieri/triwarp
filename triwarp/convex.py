@@ -31,7 +31,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import items_per_slice
+from triwarp._device import slice_count
 from triwarp.constants import TOLERANCE_MERGE_CONSTANT
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import convex as kernel_convex
@@ -114,14 +114,9 @@ def face_adjacency_projections(
     if n_faces == 0:
         return wp.empty(0, dtype=wp.float32, device=device)
 
-    if (face_adjacency is None) != (face_adjacency_edges is None):
-        raise ValueError(
-            "face_adjacency and face_adjacency_edges must both be provided or both omitted"
-        )
-    if face_adjacency is None:
-        face_adjacency, face_adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
-    assert face_adjacency is not None
-    assert face_adjacency_edges is not None
+    face_adjacency, face_adjacency_edges = tw.adjacency.resolved_face_adjacency(
+        faces, face_adjacency, face_adjacency_edges
+    )
 
     if face_adjacency_unshared is None:
         face_adjacency_unshared = tw.adjacency.face_adjacency_unshared(
@@ -202,13 +197,9 @@ def face_adjacency_convex(
     if n_faces == 0:
         return wp.empty(0, dtype=wp.bool, device=device)
 
-    if (face_adjacency is None) != (face_adjacency_edges is None):
-        raise ValueError(
-            "face_adjacency and face_adjacency_edges must both be provided or both omitted"
-        )
-    if face_adjacency is None:
-        face_adjacency, face_adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
-    assert face_adjacency is not None
+    face_adjacency, face_adjacency_edges = tw.adjacency.resolved_face_adjacency(
+        faces, face_adjacency, face_adjacency_edges
+    )
 
     m = int(face_adjacency.shape[0])
     if m == 0:
@@ -517,8 +508,7 @@ def _support_extremes(
     device = points.device
     n_points = int(points.shape[0])
     n_dir = int(directions.shape[0])
-    per_slice = items_per_slice(device)
-    n_slices = max(1, (n_points + per_slice - 1) // per_slice)
+    n_slices = slice_count(n_points, device)
 
     best_max = wp.full(n_dir, value=-float("inf"), dtype=wp.float32, device=device)
     best_min = wp.full(n_dir, value=float("inf"), dtype=wp.float32, device=device)

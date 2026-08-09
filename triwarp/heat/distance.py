@@ -7,6 +7,7 @@ import warp.optim.linear as wpl
 import warp.sparse as wps
 
 import triwarp.linalg as twl
+import triwarp.reduce as twr
 from triwarp._device import require_cuda
 from triwarp.edges import mean_unique_edge_length
 from triwarp.kernels.heat import distance as kernel_heat_distance
@@ -292,6 +293,11 @@ def heat_geodesic(
 
     # Shift so the distance field is zero at the (nearest) source. For a correctly signed field
     # the global minimum sits at the source set, so subtracting it yields a nonnegative field.
-    offset = float(phi.numpy().min())
+    # Device reduction, not ``phi.numpy().min()``: ``phi`` is float64, so a readback moves 8 B per
+    # vertex across the bus to produce one scalar. Measured interleaved (RTX 5090, min of 30):
+    # CUDA 0.42x at 5k vertices, crossing over near 100k, 3.96x at 500k and 13.69x at 2M. CPU
+    # regresses 6-13x throughout -- Warp's CPU reduction against vectorized NumPy -- and that is
+    # the accepted price under CLAUDE.md section 13, which decides on the CUDA number.
+    offset = float(twr.min(phi))
     wp.map(wp.sub, phi, wp.float64(offset), out=phi)
     return phi

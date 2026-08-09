@@ -37,12 +37,6 @@ def edge_lengths(
 
 
 @wp.kernel
-def scatter_first_occurrence(inverse: wp.array[wp.int32], out_first: wp.array[wp.int32]) -> None:
-    i = int(wp.tid())
-    wp.atomic_min(out_first, inverse[i], i)
-
-
-@wp.kernel
 def count_edge_faces(inverse: wp.array[wp.int32], out_count: wp.array[wp.int32]) -> None:
     # Per unique edge: number of incident face-corners (2 interior, 1 boundary). ``inverse`` is the
     # corner -> unique-edge map from ``edges.edges_unique``.

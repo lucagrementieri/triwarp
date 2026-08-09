@@ -39,7 +39,6 @@ def faces_to_edges(
         Length-``3 * n_faces`` ``wp.int32`` buffer of consecutive vertex-index triples.
     sorted
         If ``True``, each output row has its smaller vertex index first (undirected edges).
-        When ``True`` and ``edges`` is already provided the rows are sorted in-place on a copy.
 
     Returns
     -------
@@ -131,8 +130,6 @@ def edges_unique(
     if edges_sorted is None:
         edges_sorted = faces_to_edges(faces, sorted=True)
 
-    n_edges = int(edges_sorted.shape[0])
-
     if n_vertices is None:
         n_vertices = tw.vertices.n_vertices(edges_sorted)
 
@@ -140,13 +137,7 @@ def edges_unique(
     unique_keys, inverse = tw.grouping.unique_1d(keys, return_inverse=True)
     n_unique = int(unique_keys.shape[0])
 
-    first_occ = wp.full(n_unique, n_edges, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_edges.scatter_first_occurrence,
-        dim=n_edges,
-        inputs=[inverse, first_occ],
-        device=device,
-    )
+    first_occ = tw.grouping.first_occurrence_indices(inverse, n_unique)
 
     unique_edges_out = tw.array.gather(edges_sorted, first_occ)
 
@@ -218,14 +209,7 @@ def edges_unique_length(
     if unique_edges is None:
         unique_edges, _ = edges_unique(faces, n_vertices=n_vertices)
 
-    m = int(unique_edges.shape[0])
-    device = faces.device
-    if m == 0:
-        return wp.empty(0, dtype=wp.float32, device=device)
-
-    out = wp.empty(m, dtype=wp.float32, device=device)
-    wp.launch(kernel_edges.edge_lengths, dim=m, inputs=[vertices, unique_edges, out], device=device)
-    return out
+    return _edge_lengths(vertices, unique_edges)
 
 
 def edges_length(
@@ -252,13 +236,26 @@ def edges_length(
     if edges_in is None:
         edges_in = faces_to_edges(faces)
 
-    n = int(edges_in.shape[0])
-    device = faces.device
-    if n == 0:
+    return _edge_lengths(vertices, edges_in)
+
+
+def _edge_lengths(vertices: wp.array[wp.vec3], edges: twt.Array2dInt32) -> wp.array[wp.float32]:
+    """
+    Euclidean length of every row of an ``(m, 2)`` edge table.
+
+    The shared body of [`edges_unique_length`][triwarp.edges.edges_unique_length] and
+    [`edges_length`][triwarp.edges.edges_length], which differ only in which edge table they
+    obtain first. Stays a kernel rather than a ``wp.map`` over gathered endpoints: the columns
+    of ``edges`` are strided views, and Warp's Python-scope gather ignores a view's stride
+    (CLAUDE.md section 4).
+    """
+    m = int(edges.shape[0])
+    device = vertices.device
+    if m == 0:
         return wp.empty(0, dtype=wp.float32, device=device)
 
-    out = wp.empty(n, dtype=wp.float32, device=device)
-    wp.launch(kernel_edges.edge_lengths, dim=n, inputs=[vertices, edges_in, out], device=device)
+    out = wp.empty(m, dtype=wp.float32, device=device)
+    wp.launch(kernel_edges.edge_lengths, dim=m, inputs=[vertices, edges, out], device=device)
     return out
 
 

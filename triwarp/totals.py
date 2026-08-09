@@ -30,7 +30,7 @@ import numpy as np
 import warp as wp
 
 import triwarp as tw
-from triwarp._device import items_per_slice, prefers_tiled_reduction
+from triwarp._device import prefers_tiled_reduction, slice_count
 from triwarp.constants import TILE_1D
 from triwarp.kernels import totals as kernel_totals
 
@@ -120,8 +120,7 @@ def surface_centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
             device=device,
         )
     else:
-        per_slice = items_per_slice(device)
-        n_slices = max(1, (f + per_slice - 1) // per_slice)
+        n_slices = slice_count(f, device)
         wp.launch(
             kernel_totals.centroid_sliced,
             dim=n_slices,

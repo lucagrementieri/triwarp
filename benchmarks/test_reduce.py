@@ -62,22 +62,38 @@ Only the ``sync`` term scales with n. So a scalar-returning reduction cannot win
 matter what the kernel does, which is why callers inside iterative loops are expected to keep values
 on device instead (see the ``check_every`` discussion in ``triwarp/linalg.py``).
 
-Two kernel defects were found while chasing that floor, both since fixed. Neither was *exposed* by
-the NumPy rows — triwarp was already ahead in both groups — but both were found by asking the
-question these rows invite, namely whether the tiling is earning its keep:
+Three kernel defects were found while chasing that floor, all since fixed. None was *exposed* by the
+NumPy rows — triwarp was already ahead in those groups — but all three were found by asking the
+question these rows invite, namely whether the tiling is earning its keep. Two are the same bug in
+different clothes:
 
 - **Tiling below one tile is pure loss.** The tiled axis kernels never reach their ``wp.tile_load``
   branch when the reduced extent is under ``TILE_1D``, so all 64 lanes of every block redundantly
   walked the same 3-element row — a 64-fold read amplification. One thread per output row is **49x**
-  faster on a ``(14M, 3)`` table, and the wrapper now dispatches on the reduced extent.
+  faster on a ``(14M, 3)`` table, and the wrapper now dispatches on the reduced extent. Note the
+  converse holds too: the same table on ``axis=0`` has 3 outputs, where serial is **89x slower**, so
+  the dispatch key is the reduced extent and not the axis.
+- **The same thing again, one rank up.** A rank-2 ``axis=None`` reduction tiles ``TILE_2D`` squares,
+  which an ``(n, 3)`` vertex table or ``(m, 2)`` edge table clips exactly as above. Flattening a
+  contiguous narrow table to the 1-D kernel is **5.95x** on ``(14M, 3)`` and **6.18x** on
+  ``(8M, 2)``, versus 1.02x on ``(40k, 128)`` where the tile branch does fire — which is why the
+  test is on the trailing extent, not just on contiguity.
 - **One atomic per tile does not scale.** The global 1-D reductions ran ~9x off the memory-bandwidth
   floor at 14M elements because one ``atomic_add`` per 64-element block put 219k blocks on a single
   accumulator address. Folding ``TILES_PER_BLOCK_1D`` tiles into a register first is **4.9x** faster
   and lands within 2x of bandwidth.
 
-Both numbers are kernel-time A/Bs, interleaved under one clock state with values verified each
-round; end to end the scalar-returning groups move much less, because ~82 µs of the call was never
-the kernel.
+Those are kernel-time A/Bs, interleaved under one clock state with values verified each round. End
+to end the picture is uneven and worth reading carefully: at ``lucy`` ``max_axis1`` gains **36.7x**,
+``minmax_global_2d`` **5.5x** and ``sum_scalar`` **2.9x**, but every scalar-returning group at
+``bunny``-scale moves by less than +/-10% -- which is *within* the cross-session drift band
+CLAUDE.md section 13 warns about, so those cells attribute nothing either way. That is the expected
+shape: ~82 us of such a call was never the kernel, so no kernel change can move it.
+
+One cross-check is worth keeping, because it is what says the rank-2 fix closed the gap rather than
+moved time around: subtract the host floor and ``minmax_global_2d`` at ``lucy`` runs 42.1M elements
+at 7.0 ns per thousand, against 7.3 for the rank-1 ``minmax_scalar`` on 14.0M. The two paths agree
+on throughput now; before the fix the rank-2 one was 3.7x worse per element.
 
 **pymeshlab** is the one exception and lands in the ``median`` group.
 ``get_scalar_statistics_per_vertex`` reduces a per-vertex scalar attribute to ``{min, max, avg, med,

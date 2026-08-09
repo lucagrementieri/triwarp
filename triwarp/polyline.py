@@ -446,11 +446,21 @@ def cumulative_arc_length(polyline: wp.array[wp.vec3]) -> wp.array[wp.float32]:
     """
     device = polyline.device
     n_segments = int(polyline.shape[0]) - 1
+    if n_segments <= 0:
+        # No segment to sum: a single vertex is at arc length 0, an empty polyline has no entry.
+        # The guard is required, not defensive -- ``polyline[:-1]`` below would be a zero-length
+        # slice, which Warp rejects outright (CLAUDE.md section 4).
+        return wp.zeros(max(int(polyline.shape[0]), 0), dtype=wp.float32, device=device)
+
     lengths = wp.empty(n_segments, dtype=wp.float32, device=device)
     wp.map(kernel_polyline.segment_length, polyline[:-1], polyline[1:], out=lengths)
-    inclusive = wp.empty(n_segments, dtype=wp.float32, device=device)
-    wp.utils.array_scan(lengths, out_array=inclusive, inclusive=True)
-    return tw.array.concatenate([wp.zeros(1, dtype=wp.float32, device=device), inclusive])
+    # The leading zero of the n + 1 buffer is the first cumulative length, and the inclusive scan
+    # fills the rest -- the same one-allocation idiom as ``array.counts_to_offsets``, in float32.
+    # Scanning into a separate buffer and concatenating a zero in front costs three allocations
+    # and two more copy launches for the identical answer.
+    cumulative = wp.zeros(n_segments + 1, dtype=wp.float32, device=device)
+    wp.utils.array_scan(lengths, out_array=cumulative[1:], inclusive=True)
+    return cumulative
 
 
 def downsample_polyline(

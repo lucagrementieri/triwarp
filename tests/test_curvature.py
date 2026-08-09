@@ -203,3 +203,39 @@ def test_discrete_mean_curvature(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> Non
         points_wp, vertices_wp, faces_wp, radius
     )
     assert np.allclose(mean_curvature_wp.numpy(), mean_curvature_tm, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(
+    not wp.is_cuda_available(),
+    reason="needs a second device to make the current device differ from the arrays' device",
+)
+def test_discrete_gaussian_curvature_ignores_the_current_device(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh],
+):
+    """
+    Class A: ``discrete_gaussian_curvature`` answers on its inputs' device, not Warp's current one.
+
+    Companion to ``test_vertices.py``'s scatter-wrapper case: this function's ``scatter_offset_sum``
+    launch forwarded no ``device=``, which the ordinary tests cannot see because they run with the
+    arrays' device already current.
+    """
+    mesh_tm, mesh_wp = hemisphere
+    radius = 0.5
+    points_tm = mesh_tm.vertices
+    face_angles_tm = mesh_tm.face_angles
+    gauss_curvature_tm = tm.curvature.discrete_gaussian_curvature_measure(
+        mesh_tm, points_tm, radius
+    )
+
+    points_wp = wp.array(points_tm, dtype=wp.vec3, device=mesh_wp.device)
+    vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
+    faces_wp = wp.array(mesh_wp.indices, dtype=wp.int32, device=mesh_wp.device)
+    face_angles_wp = wp.array(face_angles_tm, dtype=wp.float32, device=mesh_wp.device)
+
+    with wp.ScopedDevice("cpu"):
+        gauss_curvature_wp = tw.curvature.discrete_gaussian_curvature(
+            points_wp, vertices_wp, faces_wp, face_angles_wp, radius
+        )
+
+    assert str(gauss_curvature_wp.device) == str(mesh_wp.device)
+    assert np.allclose(gauss_curvature_wp.numpy(), gauss_curvature_tm, rtol=1e-5, atol=1e-5)

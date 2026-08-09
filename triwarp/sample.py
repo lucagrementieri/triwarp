@@ -11,7 +11,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.array import flatnonzero, gather, init_range, init_sort_pair_indices
+from triwarp.array import flatnonzero, gather, init_range
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import sample as kernel_sample
 from triwarp.kernels.algorithms import blue_noise as kernel_blue_noise
@@ -396,14 +396,10 @@ def _dart_throw_blue_noise(
 
     # Bucket the pool by cell: one radix sort gives both the per-cell membership lists and, through
     # the unique run lengths, the sentinel-terminated bounds that index them.
-    keys_buf = wp.empty(2 * n_pool, dtype=wp.int64, device=device)
-    wp.copy(keys_buf, cell_keys, count=n_pool)
-    perm = init_sort_pair_indices(n_pool, n_pool, device)
-    wp.utils.radix_sort_pairs(keys_buf, perm, count=n_pool)
-    bucket = wp.empty(n_pool, dtype=wp.int32, device=device)
-    wp.copy(bucket, perm, count=n_pool)
-    sorted_keys = wp.empty(n_pool, dtype=wp.int64, device=device)
-    wp.copy(sorted_keys, keys_buf, count=n_pool)
+    # ``sort_and_argsort`` returns views into its own scratch; both outlive this frame, so clone.
+    sorted_keys_view, perm = tw.array.sort_and_argsort(cell_keys, fill_value=n_pool)
+    sorted_keys = wp.clone(sorted_keys_view)
+    bucket = wp.clone(perm)
     unique_keys, counts = tw.grouping.unique_1d(sorted_keys, return_counts=True)
     n_cells = int(unique_keys.shape[0])
     cell_offsets, _ = tw.array.counts_to_offsets(counts, include_total=True)

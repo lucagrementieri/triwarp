@@ -29,8 +29,6 @@ that one solves a vector-heat system -- and geodesic *distance* by the heat meth
 
 from __future__ import annotations
 
-import itertools
-
 import warp as wp
 
 import triwarp as tw
@@ -238,11 +236,13 @@ def trace_polylines(
     [`polyline_length`][triwarp.polyline.polyline_length]
     [`boundary_loops`][triwarp.boundary.boundary_loops]
     """
-    bounds = offsets.numpy()
-    return [
-        wp.clone(points[int(begin) : int(end)]) if copy else points[int(begin) : int(end)]
-        for begin, end in itertools.pairwise(bounds)
-    ]
+    # ``offsets`` is the total-terminated n + 1 form, and ``split`` wants the length-n one, whose
+    # last segment already runs to the end of ``points``. The guard is required rather than
+    # defensive: a no-ray trace returns a length-1 offsets array, and Warp rejects the resulting
+    # zero-length slice outright ("Invalid indexing in slice: 0:0:1").
+    if int(offsets.shape[0]) <= 1:
+        return []
+    return tw.array.split(points, offsets[:-1], copy=copy)
 
 
 def _length_epsilon(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> float:
@@ -272,9 +272,8 @@ def _trace(
     no_points = wp.empty(0, dtype=wp.vec3, device=device)
     wp.launch(kernel, dim=n_rays, inputs=[*inputs, no_offsets, counts, no_points], device=device)
 
-    offsets = wp.zeros(n_rays + 1, dtype=wp.int32, device=device)
-    wp.utils.array_scan(counts, out_array=offsets[1:], inclusive=True)
-    total = int(offsets[n_rays : n_rays + 1].numpy()[0])
+    # Host readback: only the device knows the walk's total length, and it sizes the point buffer.
+    offsets, total = tw.array.counts_to_offsets(counts, include_total=True)
     points = wp.empty(total, dtype=wp.vec3, device=device)
     wp.launch(kernel, dim=n_rays, inputs=[*inputs, offsets, counts, points], device=device)
     return points, offsets

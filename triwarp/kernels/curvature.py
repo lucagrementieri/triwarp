@@ -149,7 +149,6 @@ def fit_principal_curvature(
     out_pd2: wp.array[wp.vec3],
     out_pv1: wp.array[wp.float32],
     out_pv2: wp.array[wp.float32],
-    out_valid: wp.array[wp.bool],
 ) -> None:
     """
     Fit a quadric surface in a local tangent frame per vertex.
@@ -174,7 +173,6 @@ def fit_principal_curvature(
         out_pd2[i] = zero3
         out_pv1[i] = wp.float32(0.0)
         out_pv2[i] = wp.float32(0.0)
-        out_valid[i] = False
         return
 
     vertex = vertices[i]
@@ -233,7 +231,6 @@ def fit_principal_curvature(
         out_pd2[i] = zero3
         out_pv1[i] = wp.float32(0.0)
         out_pv2[i] = wp.float32(0.0)
-        out_valid[i] = False
         return
 
     # Cast the float64 solution back to float32 for the rest of the kernel.
@@ -254,7 +251,6 @@ def fit_principal_curvature(
         out_pd2[i] = zero3
         out_pv1[i] = wp.float32(0.0)
         out_pv2[i] = wp.float32(0.0)
-        out_valid[i] = False
         return
 
     # Normal z-component in local frame
@@ -291,7 +287,6 @@ def fit_principal_curvature(
         out_pd2[i] = dir0
         out_pv1[i] = k1
         out_pv2[i] = k0
-    out_valid[i] = True
 
 
 @wp.func

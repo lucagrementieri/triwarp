@@ -26,7 +26,6 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp.grouping import hash_vector_rows, unique_1d, unique_faces, unique_rows
 from triwarp.kernels import array as kernel_array
-from triwarp.kernels import edges as kernel_edges
 from triwarp.kernels import repair as kernel_repair
 from triwarp.kernels import scatter as kernel_scatter
 
@@ -140,15 +139,9 @@ def remove_duplicated_vertices(
     [`hash_vector_rows`][triwarp.grouping.hash_vector_rows]
     """
     inverse = duplicate_vertex_inverse(vertices, epsilon)
-    n = int(inverse.shape[0])
-    n_unique = int(tw.reduce.max(inverse)) + 1
-    unique_indices = wp.full(n_unique, wp.int32(n), dtype=wp.int32, device=inverse.device)
-    wp.launch(
-        kernel_edges.scatter_first_occurrence,
-        dim=n,
-        inputs=[inverse, unique_indices],
-        device=inverse.device,
-    )
+    # No ``n_unique`` to pass: ``duplicate_vertex_inverse`` discards the unique array internally,
+    # so the class count genuinely is not available here and the reduction is the only way to it.
+    unique_indices = tw.grouping.first_occurrence_indices(inverse)
     unique_vertices = tw.array.gather(vertices, unique_indices)
     unique_faces = tw.array.remap_indices(faces, inverse)
     return unique_vertices, unique_indices, inverse, unique_faces
@@ -596,14 +589,7 @@ def collapse_small_triangles(
         labels = tw.graph.connected_component_labels_from_edges(pairs, node_count=n_vertices)
 
         unique_labels, inverse = unique_1d(labels, return_inverse=True)
-        n_unique = int(unique_labels.shape[0])
-        unique_indices = wp.full(n_unique, wp.int32(n_vertices), dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_edges.scatter_first_occurrence,
-            dim=n_vertices,
-            inputs=[inverse, unique_indices],
-            device=device,
-        )
+        unique_indices = tw.grouping.first_occurrence_indices(inverse, int(unique_labels.shape[0]))
         class_vertices = tw.array.gather(current_vertices, unique_indices)
         remapped_faces = tw.array.remap_indices(current_faces, inverse)
 

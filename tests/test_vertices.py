@@ -257,3 +257,47 @@ def test_vertex_defects(request: pytest.FixtureRequest, mesh_name: str):
 
     assert np.allclose(vertex_defects_wp.numpy(), vertex_defects_tm, rtol=1e-5, atol=1e-5)
     assert np.allclose(vertex_defects_wp.numpy(), vertex_defects_igl, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(
+    not wp.is_cuda_available(),
+    reason="needs a second device to make the current device differ from the arrays' device",
+)
+def test_scatter_wrappers_ignore_the_current_device(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: the three ``vertices`` scatter wrappers answer on their inputs' device, not Warp's.
+
+    Every other test runs with the arrays' device *as* the current device, so a ``wp.launch`` that
+    forgets to forward ``device=`` resolves to the right answer by accident and the suite stays
+    green. Pinning a different current device around the call is what makes the omission
+    observable -- it was a real defect in all three of these functions.
+    """
+    mesh_tm, mesh_wp = half_torus
+    n_vertices = mesh_tm.vertices.shape[0]
+
+    face_normals_wp = wp.array(mesh_tm.face_normals, dtype=wp.vec3, device=mesh_wp.device)
+    face_angles_wp = wp.array(mesh_tm.face_angles, dtype=wp.float32, device=mesh_wp.device)
+
+    mean_normals_tm = tm.geometry.mean_vertex_normals(
+        n_vertices, mesh_tm.faces, mesh_tm.face_normals
+    )
+    weighted_normals_tm = tm.geometry.weighted_vertex_normals(
+        n_vertices, mesh_tm.faces, mesh_tm.face_normals, mesh_tm.face_angles
+    )
+    defects_tm = tm.curvature.vertex_defects(mesh_tm)
+
+    with wp.ScopedDevice("cpu"):
+        mean_normals_wp = tw.vertices.mean_vertex_normals(
+            n_vertices, mesh_wp.indices, face_normals_wp
+        )
+        weighted_normals_wp = tw.vertices.weighted_vertex_normals(
+            n_vertices, mesh_wp.indices, face_normals_wp, face_angles_wp
+        )
+        defects_wp = tw.vertices.vertex_defects(n_vertices, mesh_wp.indices, face_angles_wp)
+
+    assert str(mean_normals_wp.device) == str(mesh_wp.device)
+    assert str(weighted_normals_wp.device) == str(mesh_wp.device)
+    assert str(defects_wp.device) == str(mesh_wp.device)
+    assert np.allclose(mean_normals_wp.numpy(), mean_normals_tm, rtol=1e-5, atol=1e-5)
+    assert np.allclose(weighted_normals_wp.numpy(), weighted_normals_tm, rtol=1e-5, atol=1e-5)
+    assert np.allclose(defects_wp.numpy(), defects_tm, rtol=1e-5, atol=1e-5)

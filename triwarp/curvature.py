@@ -64,6 +64,12 @@ def principal_curvature(
         ``(PD1, PD2, PV1, PV2)`` where ``PV1 >= PV2`` at every vertex. Vertices for which
         the quadric fit failed (fewer than 6 neighbors or degenerate system) have zero
         directions and zero curvature values.
+
+    Notes
+    -----
+    A failed fit is signalled by that all-zero output and nothing else -- there is no separate
+    validity mask. The two states it conflates are a failed fit and a genuinely flat vertex, which
+    is why the test is worth stating: ``PD1`` is zero only where the fit did not produce a frame.
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
@@ -94,7 +100,6 @@ def principal_curvature(
     pd2 = wp.zeros(n_vertices, dtype=wp.vec3, device=device)
     pv1 = wp.zeros(n_vertices, dtype=wp.float32, device=device)
     pv2 = wp.zeros(n_vertices, dtype=wp.float32, device=device)
-    valid = wp.zeros(n_vertices, dtype=wp.bool, device=device)
 
     wp.launch(
         kernel_curvature.fit_principal_curvature,
@@ -110,7 +115,6 @@ def principal_curvature(
             pd2,
             pv1,
             pv2,
-            valid,
         ],
         device=device,
     )
@@ -164,11 +168,12 @@ def discrete_gaussian_curvature(
         vertices, points, radius
     )
     defects = vertex_defects(vertices.shape[0], faces, face_angles)
-    gauss_curvature = wp.zeros(points.shape[0], dtype=wp.float32, device=points.device)
+    gauss_curvature = wp.zeros(int(points.shape[0]), dtype=wp.float32, device=points.device)
     wp.launch(
         kernel_scatter.scatter_offset_sum,
-        dim=nearest_indices.shape[0],
+        dim=int(nearest_indices.shape[0]),
         inputs=[defects, nearest_indices, nearest_offsets, gauss_curvature],
+        device=points.device,
     )
     return gauss_curvature
 
@@ -225,14 +230,9 @@ def discrete_mean_curvature(
     if n_faces == 0:
         return wp.zeros(n_points, dtype=wp.float32, device=device)
 
-    if (face_adjacency is None) != (face_adjacency_edges is None):
-        raise ValueError(
-            "face_adjacency and face_adjacency_edges must both be provided or both omitted"
-        )
-    if face_adjacency is None:
-        face_adjacency, face_adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
-    assert face_adjacency is not None
-    assert face_adjacency_edges is not None
+    face_adjacency, face_adjacency_edges = tw.adjacency.resolved_face_adjacency(
+        faces, face_adjacency, face_adjacency_edges
+    )
 
     m = int(face_adjacency.shape[0])
     if m == 0:

@@ -179,6 +179,14 @@ def _icosphere_face_table() -> np.ndarray:
 # Built once: the icosahedron's topology is a constant, so the only per-call cost is the upload.
 _ICOSPHERE_FACE_TABLE = _icosphere_face_table()
 
+# Measured, and deliberately NOT cached per device. The upload of these two tables is 0.141 ms of
+# icosphere's 0.317 ms on CUDA (0.038 of 0.193 on CPU), so a cache looks like an easy win -- but it
+# only ever pays here. ``box``, ``tetrahedron``, ``octahedron``, ``icosahedron`` and
+# ``dodecahedron`` *return* the buffer they upload (``_apply_transform`` may rewrite its winding in
+# place), so a cached table would have to be ``wp.clone``-d on read, which gives the upload
+# straight back. That leaves one caller to justify a module-level dict pinning device memory for
+# the life of the process, which is a bad trade for a library.
+
 
 # The remaining three Platonic solids, as MeshLab's ``create_tetrahedron`` /
 # ``create_octahedron`` / ``create_dodecahedron`` tables normalized onto the unit sphere (MeshLab
@@ -1880,7 +1888,7 @@ def random_soup(
             inputs=[wp.int32(resolved_seed), vertices],
             device=device,
         )
-    return vertices, tw.array.init_range(n, str(vertices.device))
+    return vertices, tw.array.init_range(n, vertices.device)
 
 
 # --- private helpers ---------------------------------------------------------------------
@@ -1945,9 +1953,7 @@ def _apply_transform(
 
 def _reverses_winding(transform: wp.mat44 | wp.array[wp.mat44]) -> bool:
     """Whether a transform mirrors, i.e. whether its rotation block has a negative determinant."""
-    # A wp.array argument costs one device-to-host synchronization: the winding fix is a host branch
-    # over a whole launch, so the matrix has to cross either way. A scalar wp.mat44 costs nothing.
-    matrix = transform.list()[0] if isinstance(transform, wp.array) else transform
+    matrix = _as_mat44(transform)
     rotation = wp.mat33(
         matrix[0][0],
         matrix[0][1],
@@ -1966,14 +1972,23 @@ def _transform_to_numpy(transform: wp.mat44 | wp.array[wp.mat44]) -> np.ndarray:
     """
     Read a transform parameter back as a host ``(4, 4)`` array.
 
-    Needed for the two decisions that cannot be made on the device: whether the transform reverses
-    face winding, and composing it with the ``mid_plane`` offset in
-    [`extrude_polygon`][triwarp.creation.extrude_polygon]. A ``wp.array`` argument costs one
-    device-to-host synchronization here.
+    Needed for composing the transform with the ``mid_plane`` offset in
+    [`extrude_polygon`][triwarp.creation.extrude_polygon], which is host matrix arithmetic.
     """
-    if isinstance(transform, wp.array):
-        return transform.numpy().reshape(4, 4).astype(np.float64)
-    return np.array(transform, dtype=np.float64).reshape(4, 4)
+    return np.array(_as_mat44(transform), dtype=np.float64).reshape(4, 4)
+
+
+def _as_mat44(transform: wp.mat44 | wp.array[wp.mat44]) -> wp.mat44:
+    """
+    Row-indexable host copy of a transform parameter.
+
+    The single place a transform crosses device to host. Both decisions that need it -- whether
+    the transform reverses face winding, and the ``mid_plane`` composition -- are host branches
+    over a whole launch, so the matrix has to cross either way; a scalar ``wp.mat44`` costs
+    nothing. ``list()[0]`` is the spelling CLAUDE.md section 4 names for a
+    ``wp.array[wp.mat44]``, and is cheaper than reading the buffer through ``.numpy()``.
+    """
+    return transform.list()[0] if isinstance(transform, wp.array) else transform
 
 
 def _upload_vertices(vertices_np: np.ndarray, device: wp.DeviceLike) -> wp.array[wp.vec3]:

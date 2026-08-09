@@ -124,6 +124,63 @@ def face_adjacency(
     return twt.as_array2d_int32(adjacency)
 
 
+def resolved_face_adjacency(
+    faces: wp.array[wp.int32],
+    face_adjacency: twt.Array2dInt32 | None = None,
+    face_adjacency_edges: twt.Array2dInt32 | None = None,
+) -> tuple[twt.Array2dInt32, twt.Array2dInt32]:
+    """
+    Return the face-adjacency pair, computed from ``faces`` only when the caller supplied none.
+
+    The precompute-or-derive step shared by every function that takes an optional
+    ``(face_adjacency, face_adjacency_edges)`` pair: the two are useless apart, so they must be
+    passed together or not at all, and a caller that already has them should not pay for a second
+    [`face_adjacency`][triwarp.adjacency.face_adjacency] pass.
+
+    Parameters
+    ----------
+    faces
+        Flat ``wp.int32`` triangle index buffer of length ``3 * n_faces``.
+    face_adjacency
+        Precomputed ``(m, 2)`` face pairs sharing an edge. Computed from ``faces`` when omitted,
+        in which case ``face_adjacency_edges`` must be omitted too.
+    face_adjacency_edges
+        Precomputed ``(m, 2)`` shared-edge endpoints, row-aligned with ``face_adjacency``.
+
+    Returns
+    -------
+    face_adjacency : twt.Array2dInt32
+        The supplied pairs, or the ones computed from ``faces``.
+    face_adjacency_edges : twt.Array2dInt32
+        The supplied shared edges, or the ones computed from ``faces``.
+
+    Raises
+    ------
+    ValueError
+        If exactly one of the two is provided.
+
+    See Also
+    --------
+    [`face_adjacency`][triwarp.adjacency.face_adjacency]
+        The function this calls when nothing was supplied.
+    """
+    _require_paired_adjacency(face_adjacency, face_adjacency_edges)
+    if face_adjacency is None:
+        return tw.adjacency.face_adjacency(faces, return_edges=True)
+    assert face_adjacency_edges is not None
+    return face_adjacency, face_adjacency_edges
+
+
+def _require_paired_adjacency(
+    face_adjacency: twt.Array2dInt32 | None, face_adjacency_edges: twt.Array2dInt32 | None
+) -> None:
+    """Raise unless ``face_adjacency`` and ``face_adjacency_edges`` are both given or both not."""
+    if (face_adjacency is None) != (face_adjacency_edges is None):
+        raise ValueError(
+            "face_adjacency and face_adjacency_edges must both be provided or both omitted"
+        )
+
+
 def _edge_groups(
     faces: wp.array[wp.int32], edges_sorted: twt.Array2dInt32 | None, n_vertices: int | None
 ) -> twt.Array2dInt32:
@@ -234,6 +291,9 @@ def vertex_face_adjacency(
     wp.launch(
         kernel_adjacency.count_vertex_faces, dim=n_faces, inputs=[faces, counts], device=device
     )
+    # Deliberately NOT tw.array.counts_to_offsets: that helper always reads the total back, and
+    # this function never needs it (it is 3 * n_faces, known on the host). Converting for
+    # symmetry would add a device synchronization where there is currently none.
     wp.utils.array_scan(counts, out_array=offsets[1:], inclusive=True)
     cursor = wp.zeros(row_count, dtype=wp.int32, device=device)
     wp.launch(
@@ -306,10 +366,10 @@ def face_adjacency_unshared(
     [`face_adjacency`][triwarp.adjacency.face_adjacency]
     [`trimesh.graph.face_adjacency_unshared`][]
     """
-    if (face_adjacency is None) != (face_adjacency_edges is None):
-        raise ValueError(
-            "face_adjacency and face_adjacency_edges must both be provided or both omitted"
-        )
+    # Not resolved_face_adjacency: the None branch below deliberately does *not* call
+    # face_adjacency, recovering both owning faces and the shared edge from the grouped edge
+    # indices instead. Only the pairing rule is shared.
+    _require_paired_adjacency(face_adjacency, face_adjacency_edges)
     if face_adjacency is None:
         # Both the owning faces and the shared edge are recoverable from the two grouped *edge*
         # indices, so the adjacency and edge tables this used to build (and gather through) are

@@ -150,10 +150,8 @@ def _diagonal_sandwich(
         inputs=[a.offsets, b.offsets, inverse_mass, counts],
         device=device,
     )
-    segment_offsets = wp.zeros(n_rows + 1, dtype=wp.int32, device=device)
-    wp.utils.array_scan(counts, out_array=segment_offsets[1:], inclusive=True)
     # Host readback: only the device knows the scan total, and it sizes the triplet buffers.
-    n_triplets = int(segment_offsets[n_rows : n_rows + 1].numpy()[0])
+    segment_offsets, n_triplets = tw.array.counts_to_offsets(counts, include_total=True)
 
     dtype = a.values.dtype
     rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
@@ -260,10 +258,8 @@ def hessian_energy(
         inputs=[vf_offsets, inverse_mass, counts],
         device=device,
     )
-    segment_offsets = wp.zeros(n_vertices + 1, dtype=wp.int32, device=device)
-    wp.utils.array_scan(counts, out_array=segment_offsets[1:], inclusive=True)
     # Host readback: only the device knows the scan total, and it sizes the triplet buffers.
-    n_triplets = int(segment_offsets[n_vertices : n_vertices + 1].numpy()[0])
+    segment_offsets, n_triplets = tw.array.counts_to_offsets(counts, include_total=True)
 
     rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
     cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
@@ -296,14 +292,7 @@ def _interior_inverse(
 ) -> wp.array[wp.float64]:
     """Invert a mass diagonal, first zeroing (in place) its boundary degrees of freedom."""
     device = mass.device
-    boundary = tw.boundary.boundary_vertex_indices(vertices, faces)
-    if int(boundary.shape[0]) > 0:
-        wp.launch(
-            kernel_energies.zero_at_indices,
-            dim=int(boundary.shape[0]),
-            inputs=[boundary, mass],
-            device=device,
-        )
+    _zero_at_boundary(vertices, faces, mass)
     inverse_mass = wp.empty(int(mass.shape[0]), dtype=wp.float64, device=device)
     wp.map(kernel_energies.reciprocal_or_zero, mass, out=inverse_mass)
     return inverse_mass
@@ -373,24 +362,11 @@ def curved_hessian_energy(
     # weighted by the actual angle sum -- igl::cr_vector_curvature_correction's kappa scaling.
     kappa = wp.empty(n_vertices, dtype=wp.float64, device=device)
     wp.map(kernel_energies.angle_defect_from_sum, angle_sums, out=kappa)
-    boundary = tw.boundary.boundary_vertex_indices(vertices, faces)
-    if int(boundary.shape[0]) > 0:
-        wp.launch(
-            kernel_energies.zero_at_indices,
-            dim=int(boundary.shape[0]),
-            inputs=[boundary, kappa],
-            device=device,
-        )
+    _zero_at_boundary(vertices, faces, kappa)
     scaled_kappa = wp.empty(n_vertices, dtype=wp.float64, device=device)
     wp.map(kernel_energies.divide_or_zero, kappa, angle_sums, out=scaled_kappa)
 
-    mass = wp.zeros(n_edges, dtype=wp.float64, device=device)
-    wp.launch(
-        kernel_energies.crouzeix_raviart_mass_diag,
-        dim=n_faces,
-        inputs=[vertices, faces, inverse, mass],
-        device=device,
-    )
+    mass = _cr_mass_diagonal(vertices, faces, inverse, n_edges, wp.float64)
     inverse_mass = wp.empty(n_edges, dtype=wp.float64, device=device)
     wp.map(kernel_energies.reciprocal_or_zero, mass, out=inverse_mass)
 
@@ -573,18 +549,35 @@ def crouzeix_raviart_massmatrix(
     """
     unique_edges, edge_map = _edge_numbering(vertices, faces, unique_edges, edge_map)
     n_edges = int(unique_edges.shape[0])
-    n_faces = int(faces.shape[0]) // 3
-    device = faces.device
 
-    mass = wp.zeros(n_edges, dtype=dtype, device=device)
+    return wps.bsr_diag(diag=_cr_mass_diagonal(vertices, faces, edge_map, n_edges, dtype))
+
+
+def _cr_mass_diagonal(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    edge_map: wp.array[wp.int32],
+    n_edges: int,
+    dtype: type,
+) -> wp.array[wp.Float]:
+    """
+    Lumped Crouzeix-Raviart mass, one entry per edge, as a dense diagonal.
+
+    Each face gives a third of its area to each of its three edges. Shared so that
+    [`crouzeix_raviart_massmatrix`][triwarp.energies.crouzeix_raviart_massmatrix] and
+    [`curved_hessian_energy`][triwarp.energies.curved_hessian_energy] cannot drift onto different
+    masses -- the latter's derivation assumes they are the same one.
+    """
+    n_faces = int(faces.shape[0]) // 3
+    mass = wp.zeros(n_edges, dtype=dtype, device=faces.device)
     if n_faces > 0:
         wp.launch(
             kernel_energies.crouzeix_raviart_mass_diag,
             dim=n_faces,
             inputs=[vertices, faces, edge_map, mass],
-            device=device,
+            device=faces.device,
         )
-    return wps.bsr_diag(diag=mass)
+    return mass
 
 
 def lscm_hessian(
@@ -629,7 +622,7 @@ def lscm_hessian(
     # The real compressed-CSR entry count is offsets[-1], not laplacian.nnz: bsr_from_triplets
     # reports nnz as the (over-allocated) triplet capacity, so sizing by nnz would leave an
     # uninitialized gap in the wp.empty buffers that bsr_from_triplets reads back as garbage.
-    n_entries = int(laplacian.offsets.numpy()[-1])
+    n_entries = int(laplacian.offsets[n : n + 1].numpy()[0])
     boundary = tw.boundary.oriented_boundary_edges(vertices, faces)
     n_be = int(boundary.shape[0])
 
@@ -705,14 +698,7 @@ def vector_area_matrix(
     boundary = tw.boundary.oriented_boundary_edges(vertices, faces)
     n_be = int(boundary.shape[0])
     if n_be == 0:
-        return wps.bsr_from_triplets(
-            2 * n,
-            2 * n,
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=wp.float64, device=device),
-            prune_numerical_zeros=False,
-        )
+        return _empty_square_operator(2 * n, wp.float64, device)
 
     rows = wp.empty(4 * n_be, dtype=wp.int32, device=device)
     cols = wp.empty(4 * n_be, dtype=wp.int32, device=device)
@@ -764,6 +750,28 @@ def _edge_numbering(
     if unique_edges is None or edge_map is None:
         unique_edges, edge_map = edges_unique(faces, n_vertices=int(vertices.shape[0]))
     return unique_edges, edge_map
+
+
+def _zero_at_boundary(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], values: wp.array[wp.float64]
+) -> None:
+    """
+    Zero ``values`` in place at every boundary vertex.
+
+    Both quantities these energies build on -- a mass diagonal and an angle defect -- are defined
+    only at interior vertices, so each is zeroed on the boundary before being inverted or scaled.
+    The guard is required rather than defensive: a closed mesh has no boundary vertices, and
+    launching over an empty index buffer is what the check avoids.
+    """
+    boundary = tw.boundary.boundary_vertex_indices(vertices, faces)
+    n_boundary = int(boundary.shape[0])
+    if n_boundary > 0:
+        wp.launch(
+            kernel_energies.zero_at_indices,
+            dim=n_boundary,
+            inputs=[boundary, values],
+            device=values.device,
+        )
 
 
 def _empty_square_operator(

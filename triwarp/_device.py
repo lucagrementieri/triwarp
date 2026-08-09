@@ -69,6 +69,35 @@ def items_per_slice(device: wp.DeviceLike) -> int:
     return ITEMS_PER_SLICE_CUDA if wp.get_device(device).is_cuda else ITEMS_PER_SLICE_CPU
 
 
+def slice_count(count: int, device: wp.DeviceLike) -> int:
+    """
+    Thread count for a lane-free strided-slice reduction over ``count`` elements.
+
+    The launch dimension that goes with [`items_per_slice`][triwarp._device.items_per_slice]: one
+    thread per strided slice, and at least one thread so an empty input still launches a well-formed
+    grid. Callers should not divide by ``items_per_slice`` themselves -- that spelling is what this
+    exists to hold in one place.
+
+    Parameters
+    ----------
+    count
+        Number of elements to reduce.
+    device
+        Warp device (or device string) the reduction will run on.
+
+    Returns
+    -------
+    int
+        ``ceil(count / items_per_slice(device))``, floored at 1.
+
+    See Also
+    --------
+    [`items_per_slice`][triwarp._device.items_per_slice]
+    """
+    per_slice = items_per_slice(device)
+    return max(1, (count + per_slice - 1) // per_slice)
+
+
 def require_cuda(device: wp.DeviceLike, name: str) -> None:
     """
     Raise unless ``device`` is a CUDA device.

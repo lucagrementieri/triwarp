@@ -94,21 +94,13 @@ def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[
     [`edges_to_csr`][triwarp.graph.edges_to_csr]
     [`face_connected_component_labels`][triwarp.adjacency.face_connected_component_labels]
     """
-    node_count = adjacency.nrow  # pyright: ignore[reportAttributeAccessIssue]
-    ncol = adjacency.ncol  # pyright: ignore[reportAttributeAccessIssue]
-    if ncol != node_count:
-        raise ValueError(f"adjacency must be square, got shape ({node_count}, {ncol})")
-    if adjacency.block_shape != (1, 1):
-        raise ValueError(f"adjacency must use 1x1 blocks, got block_shape {adjacency.block_shape}")
+    node_count, offsets, indices = _validate_square_csr(adjacency)
 
     device = adjacency.device
     if node_count <= 1:
         return wp.zeros(node_count, dtype=wp.int32, device=device)
     if adjacency.nnz == 0:
         return init_range(node_count, device)
-
-    offsets = adjacency.offsets  # pyright: ignore[reportAttributeAccessIssue]
-    indices = adjacency.columns  # pyright: ignore[reportAttributeAccessIssue]
 
     labels = wp.empty(node_count, dtype=wp.int32, device=device)
     parents = wp.empty(node_count, dtype=wp.int32, device=device)
@@ -184,27 +176,12 @@ def connected_component_labels_from_edges(
     [`face_connected_component_labels`][triwarp.adjacency.face_connected_component_labels]
     [`trimesh.graph.connected_component_labels`][]
     """
-    twt.ensure_ndim(edges, 2, dtype=wp.int32)
-    if int(edges.shape[1]) != 2:
-        raise ValueError(f"edges must have shape (m, 2), got {edges.shape}")
+    node_count = _validate_edge_list(edges, node_count, validate=validate)
 
-    device = edges.device
-    m = int(edges.shape[0])
-
-    if node_count is None:
-        node_count = tw.vertices.n_vertices(edges)
-    elif node_count < 0:
-        raise ValueError(f"node_count must be non-negative, got {node_count}")
-    elif m == 0:
-        return init_range(node_count, device)
-    elif validate:
-        # One 8-byte read of both bounds, not a copy of the whole edge buffer: measured on CUDA,
-        # 1.69x at 400k entries and 16.3x at 8M, crossing over near 200k.
-        lowest, highest = tw.reduce.minmax(edges)
-        if lowest < 0 or highest >= node_count:
-            raise ValueError(
-                f"edge indices must lie in [0, {node_count}), got min={lowest} max={highest}"
-            )
+    # With no edges every node is its own component, which ``init_range`` gives directly -- the
+    # CSR build and traversal below would reach the same answer the long way.
+    if int(edges.shape[0]) == 0:
+        return init_range(node_count, edges.device)
 
     adjacency = edges_to_csr(node_count, edges)
     return connected_component_labels(adjacency)
@@ -359,11 +336,10 @@ def successor_cycles(
     [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
     [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched]
     """
-    twt.ensure_ndim(edges, 2, dtype=wp.int32)
-    if int(edges.shape[1]) != 2:
-        raise ValueError(f"edges must have shape (m, 2), got {edges.shape}")
-    if node_count < 0:
-        raise ValueError(f"node_count must be non-negative, got {node_count}")
+    # ``validate=False``: the range check belongs to the ``connected_component_labels_from_edges``
+    # call below, which gets the same edges and the same flag. Checking here too would pay the
+    # reduction and its host sync twice.
+    node_count = _validate_edge_list(edges, node_count, validate=False)
 
     device = edges.device
     m = int(edges.shape[0])
@@ -532,18 +508,11 @@ def bfs(
         cannot take a device-side launch dimension, so the lever there is fusing the seven kernels
         into two or three.
     """
-    node_count = adjacency.nrow  # pyright: ignore[reportAttributeAccessIssue]
-    ncol = adjacency.ncol  # pyright: ignore[reportAttributeAccessIssue]
-    if ncol != node_count:
-        raise ValueError(f"adjacency must be square, got shape ({node_count}, {ncol})")
-    if adjacency.block_shape != (1, 1):
-        raise ValueError(f"adjacency must use 1x1 blocks, got block_shape {adjacency.block_shape}")
+    node_count, offsets, columns = _validate_square_csr(adjacency)
     if source < 0 or source >= node_count:
         raise ValueError(f"source must be in [0, {node_count}), got {source}")
 
     device = adjacency.device
-    offsets = adjacency.offsets  # pyright: ignore[reportAttributeAccessIssue]
-    columns = adjacency.columns  # pyright: ignore[reportAttributeAccessIssue]
 
     parents = wp.full(node_count, -1, dtype=wp.int32, device=device)
     distances = wp.full(node_count, -1, dtype=wp.int32, device=device)
@@ -702,24 +671,7 @@ def bfs_from_edges(
     [`bfs`][triwarp.graph.bfs]
     [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
     """
-    twt.ensure_ndim(edges, 2, dtype=wp.int32)
-    if int(edges.shape[1]) != 2:
-        raise ValueError(f"edges must have shape (m, 2), got {edges.shape}")
-
-    m = int(edges.shape[0])
-    if node_count is None:
-        node_count = tw.vertices.n_vertices(edges)
-    else:
-        if node_count < 0:
-            raise ValueError(f"node_count must be non-negative, got {node_count}")
-        if m > 0:
-            # One 8-byte read of both bounds; see the same check in
-            # ``connected_component_labels_from_edges`` for the measurement.
-            lowest, highest = tw.reduce.minmax(edges)
-            if lowest < 0 or highest >= node_count:
-                raise ValueError(
-                    f"edge indices must lie in [0, {node_count}), got min={lowest} max={highest}"
-                )
+    node_count = _validate_edge_list(edges, node_count, validate=True)
 
     adjacency = edges_to_csr(node_count, edges)
     return bfs(adjacency, source)
@@ -766,12 +718,9 @@ def bfs_multi_source(
     [`bfs`][triwarp.graph.bfs]
     [`geodesic_ball`][triwarp.neighbors.geodesic_ball]
     """
-    node_count = adjacency.nrow  # pyright: ignore[reportAttributeAccessIssue]
-    ncol = adjacency.ncol  # pyright: ignore[reportAttributeAccessIssue]
-    if ncol != node_count:
-        raise ValueError(f"adjacency must be square, got shape ({node_count}, {ncol})")
-    if adjacency.block_shape != (1, 1):
-        raise ValueError(f"adjacency must use 1x1 blocks, got block_shape {adjacency.block_shape}")
+    # This one traverses through ``bfs`` rather than the CSR buffers directly, so it wants only
+    # the validation and the node count.
+    node_count, _, _ = _validate_square_csr(adjacency)
 
     device = adjacency.device
     k = int(sources.shape[0])
@@ -822,9 +771,10 @@ def bfs_multi_source(
         inputs=[sources, labels, sorted_keys, wp.int64(n), segment_start, counts],
         device=device,
     )
-    offsets = wp.empty(k, dtype=wp.int32, device=device)
-    wp.utils.array_scan(counts, out_array=offsets, inclusive=False)
-    total = int(offsets[k - 1 :].numpy()[0]) + int(counts[k - 1 :].numpy()[0])
+    # Host readback: only the device knows the total, and it sizes the neighbour buffer. One scan
+    # and one 4-byte read give both -- reconstructing it as ``offsets[k - 1] + counts[k - 1]`` cost
+    # two separate readbacks, so two full device synchronizations, for the same number.
+    offsets, total = tw.array.counts_to_offsets(counts)
 
     neighbors = wp.empty(total, dtype=wp.int32, device=device)
     wp.launch(
@@ -834,3 +784,58 @@ def bfs_multi_source(
         device=device,
     )
     return neighbors, offsets
+
+
+# --- private helpers ---------------------------------------------------------------------
+
+
+def _validate_square_csr(
+    adjacency: wps.BsrMatrix[wp.Scalar],
+) -> tuple[int, wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Check a CSR adjacency is square with scalar blocks, and unpack what the traversals need.
+
+    The shared entry check of every function here that takes a prebuilt adjacency. The
+    ``pyright: ignore`` comments live here rather than at each call site: Warp's stub omits
+    ``BsrMatrix.offsets`` / ``.columns`` (see CLAUDE.md section 12).
+    """
+    node_count = adjacency.nrow  # pyright: ignore[reportAttributeAccessIssue]
+    ncol = adjacency.ncol  # pyright: ignore[reportAttributeAccessIssue]
+    if ncol != node_count:
+        raise ValueError(f"adjacency must be square, got shape ({node_count}, {ncol})")
+    if adjacency.block_shape != (1, 1):
+        raise ValueError(f"adjacency must use 1x1 blocks, got block_shape {adjacency.block_shape}")
+    offsets = adjacency.offsets  # pyright: ignore[reportAttributeAccessIssue]
+    columns = adjacency.columns  # pyright: ignore[reportAttributeAccessIssue]
+    return int(node_count), offsets, columns
+
+
+def _validate_edge_list(edges: twt.Array2dInt32, node_count: int | None, *, validate: bool) -> int:
+    """
+    Check an ``(m, 2)`` edge list and resolve its node count.
+
+    The shared entry check of every function here that takes an edge list instead of a prebuilt
+    adjacency. When ``node_count`` is ``None`` it is inferred from the edges; when it is supplied
+    it is checked for sign and, under ``validate``, the edge indices are checked to fall inside it.
+
+    ``validate=False`` skips only the range check, which is one
+    [`minmax`][triwarp.reduce.minmax] plus a host synchronization -- pass it from a caller that
+    forwards the same edges to another checked entry point, so the reduction is not paid twice.
+    """
+    twt.ensure_ndim(edges, 2, dtype=wp.int32)
+    if int(edges.shape[1]) != 2:
+        raise ValueError(f"edges must have shape (m, 2), got {edges.shape}")
+
+    if node_count is None:
+        return int(tw.vertices.n_vertices(edges))
+    if node_count < 0:
+        raise ValueError(f"node_count must be non-negative, got {node_count}")
+    if validate and int(edges.shape[0]) > 0:
+        # One 8-byte read of both bounds, not a copy of the whole edge buffer: measured on CUDA,
+        # 1.69x at 400k entries and 16.3x at 8M, crossing over near 200k.
+        lowest, highest = tw.reduce.minmax(edges)
+        if lowest < 0 or highest >= node_count:
+            raise ValueError(
+                f"edge indices must lie in [0, {node_count}), got min={lowest} max={highest}"
+            )
+    return node_count

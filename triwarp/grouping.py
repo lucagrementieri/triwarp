@@ -18,7 +18,6 @@ from triwarp.array import (
     sortable_dtype,
 )
 from triwarp.kernels import array as kernel_array
-from triwarp.kernels import edges as kernel_edges
 from triwarp.kernels import grouping as kernel_grouping
 
 Scalar = TypeVar("Scalar", bound=wp.Scalar)
@@ -189,7 +188,7 @@ def unique_1d(
     Raises
     ------
     ValueError
-        If ``data`` is not rank-1 or length is ``>= 2**31``.
+        If ``data`` is not rank-1 or length is ``> 2**30``.
     """
     if int(data.ndim) != 1:
         raise ValueError(f"unique_1d expects a rank-1 array, got ndim={data.ndim}")
@@ -342,16 +341,15 @@ def unique_rows(
     row_keys = hash_rows(data)
     keys_result = unique_1d(row_keys, return_inverse=True, return_counts=return_counts)
     if return_counts:
-        _, inverse, counts = keys_result
+        unique_keys, inverse, counts = keys_result
     else:
-        _, inverse = keys_result
+        unique_keys, inverse = keys_result
         counts = None
 
-    n_unique = int(tw.reduce.max(inverse)) + 1
-    first_idx = wp.full(n_unique, wp.int32(n), dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_edges.scatter_first_occurrence, dim=n, inputs=[inverse, first_idx], device=device
-    )
+    # The class count is the length of the unique-key array ``unique_1d`` just returned; recovering
+    # it as ``reduce.max(inverse) + 1`` would be a whole reduction launch and a host sync for a
+    # number already in hand.
+    first_idx = first_occurrence_indices(inverse, int(unique_keys.shape[0]))
 
     if not is_vec3:
         twt.ensure_ndim(data, 2)
@@ -413,16 +411,62 @@ def unique_faces(
         inputs=[faces2d, sorted_faces],
         device=device,
     )
-    _, inverse = unique_rows(sorted_faces, return_inverse=True)
-    n_unique = int(tw.reduce.max(inverse)) + 1
-    first = wp.full(n_unique, wp.int32(n_faces), dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_edges.scatter_first_occurrence, dim=n_faces, inputs=[inverse, first], device=device
-    )
+    unique_sorted_faces, inverse = unique_rows(sorted_faces, return_inverse=True)
+    # As in ``unique_rows``: the count is a shape, not something to reduce for.
+    first = first_occurrence_indices(inverse, int(unique_sorted_faces.shape[0]))
     unique_faces_out = gather(faces2d, first).reshape((-1,))
     if return_inverse:
         return unique_faces_out, inverse
     return unique_faces_out
+
+
+def first_occurrence_indices(
+    inverse: wp.array[wp.int32], n_unique: int | None = None
+) -> wp.array[wp.int32]:
+    """
+    Index of the first element of each equivalence class in an ``inverse`` map.
+
+    The representative-picking half of every deduplication in this package: given the
+    ``inverse`` that ``unique_1d`` / ``unique_rows`` return, produce for each class the smallest
+    input index belonging to it. Gathering any per-element payload by the result yields one
+    representative per class, taken from its **first** occurrence -- which is what makes
+    ``unique_faces`` keep the original winding and ``edges_unique`` keep the first-seen edge.
+
+    Parameters
+    ----------
+    inverse
+        Length-``n`` ``wp.int32`` map from each element to its class slot, as returned by
+        [`unique_1d`][triwarp.grouping.unique_1d] or
+        [`unique_rows`][triwarp.grouping.unique_rows].
+    n_unique
+        Number of classes (the output length). Defaults to ``int(reduce.max(inverse)) + 1``,
+        which costs a device reduction **and** a host synchronization; pass it whenever the
+        caller already knows it. It is almost always a ``.shape[0]`` the caller is holding --
+        the length of the unique array that came back beside ``inverse``.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        Length-``n_unique`` array whose entry ``c`` is ``min{i : inverse[i] == c}``. A class with
+        no member (only reachable when ``n_unique`` is passed too large) holds the sentinel ``n``.
+
+    See Also
+    --------
+    [`unique_rows`][triwarp.grouping.unique_rows]
+    [`unique_1d`][triwarp.grouping.unique_1d]
+    [`gather`][triwarp.array.gather]
+        The companion step: gather the payload by these indices to get the representatives.
+    """
+    device = inverse.device
+    n = int(inverse.shape[0])
+    if n_unique is None:
+        n_unique = int(tw.reduce.max(inverse)) + 1 if n > 0 else 0
+    first = wp.full(n_unique, wp.int32(n), dtype=wp.int32, device=device)
+    if n > 0 and n_unique > 0:
+        wp.launch(
+            kernel_grouping.scatter_first_occurrence, dim=n, inputs=[inverse, first], device=device
+        )
+    return first
 
 
 @overload
@@ -676,7 +720,10 @@ def _unique_hash(
     scan_pos = wp.empty(cap, dtype=wp.int32, device=device)
     wp.utils.array_scan(occ_mask, scan_pos, inclusive=True)
     wp.map(wp.sub, scan_pos, wp.int32(1), out=scan_pos)
-    n_unique = int(tw.reduce.max(scan_pos)) + 1
+    # ``scan_pos`` is an inclusive scan minus one, so its last element *is* ``n_unique - 1``: one
+    # 4-byte tail read sizes the output, where ``reduce.max`` would scan all ``cap`` (~2n) slots.
+    # The same idiom as ``array.flatnonzero`` and ``array.counts_to_offsets``.
+    n_unique = int(scan_pos[cap - 1 :].numpy()[0]) + 1
 
     # Phase 3: compact unique keys and their occurrence counts.
     keys_compact = wp.empty(n_unique, dtype=key_dtype, device=device)

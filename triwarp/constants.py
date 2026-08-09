@@ -45,6 +45,12 @@ TILE_2D = 8
 # 16 wins where the difference is visible: below ~1M the whole reduction sits under the ~82 us of
 # host-side launch + readback that ends any scalar-returning call, so the 5 us that 4 would save
 # there is unobservable, while the 30 us it gives up at 14M is not.
+#
+# The CPU device pays for it, and the ratio is recorded here rather than left to be rediscovered:
+# ``wp.launch_tiled`` runs one lane per block there, so folding 16 tiles means 16x fewer blocks and
+# correspondingly less parallelism -- measured **1.28x slower at 36k, 1.07x at 438k, 1.02x at 14M**.
+# Accepted on the CUDA number per CLAUDE.md section 13: the loss is bounded, shrinks with size, and
+# is at its worst exactly where the host floor already hides it.
 TILES_PER_BLOCK_1D = 16
 
 # Elements reduced per thread by the *lane-free* reductions -- those whose body must stay correct on

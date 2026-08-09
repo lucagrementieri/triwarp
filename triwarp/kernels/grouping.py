@@ -4,6 +4,14 @@ from triwarp.kernels import array as kernel_array
 
 
 @wp.kernel
+def scatter_first_occurrence(inverse: wp.array[wp.int32], out_first: wp.array[wp.int32]) -> None:
+    # Smallest index mapping to each class. ``out_first`` must be pre-filled with a sentinel at
+    # least ``inverse.shape[0]``, so a class with no member keeps it.
+    i = int(wp.tid())
+    wp.atomic_min(out_first, inverse[i], i)
+
+
+@wp.kernel
 def mark_group_starts(
     sorted_values: wp.array[wp.Int], n: wp.int32, length: wp.int32, out_is_start: wp.array[wp.bool]
 ) -> None:

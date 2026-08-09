@@ -169,6 +169,9 @@ def vertex_one_rings(
         device=device,
     )
     # Inclusive scan into offsets[1:] leaves the leading zero in place, giving the usual CSR bounds.
+    # Deliberately NOT tw.array.counts_to_offsets: that helper always reads the total back, and
+    # this function never needs it (it is n_halfedges, known on the host). Converting for symmetry
+    # would add a device synchronization where there is currently none.
     wp.utils.array_scan(counts, out_array=offsets[1:], inclusive=True)
 
     interior_start = wp.full(n_vertices, INT32_MAX, dtype=wp.int32, device=device)
