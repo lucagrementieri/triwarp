@@ -65,10 +65,9 @@ def _mesh_volume(positions: wp.array[wp.vec3d], faces: wp.array[wp.int32]) -> fl
     volumes = tw.triangles.face_signed_volumes(positions, faces)
     # Device-side tiled sum: only the 8-byte total crosses to the host, not the whole array.
     total = wp.zeros(1, dtype=wp.float64, device=device)
-    n_tiles = (n_faces + TILE_1D - 1) // TILE_1D
     wp.launch_tiled(
         kernel_reduce.sum1d_tiled,
-        dim=[n_tiles],
+        dim=[kernel_reduce.blocks_1d(n_faces)],
         inputs=[volumes, total],
         block_dim=TILE_1D,
         device=device,
@@ -510,7 +509,7 @@ def filter_mut_dif_laplacian(
     probe = wp.empty(n, dtype=wp.vec3d, device=device) if volume_constraint else None
     slope = 0.0
     inv_n = wp.float64(1.0 / n)
-    n_tiles = (n + TILE_1D - 1) // TILE_1D
+    n_blocks = kernel_reduce.blocks_1d(n)
     adil_kernel = wp.map(
         kernel_smoothing.mut_dif_adil, normals, positions, lv, out=adil, return_kernel=True
     )
@@ -524,7 +523,7 @@ def filter_mut_dif_laplacian(
         adil_sum.zero_()
         wp.launch_tiled(
             kernel_reduce.sum1d_tiled,
-            dim=[n_tiles],
+            dim=[n_blocks],
             inputs=[adil, adil_sum],
             block_dim=TILE_1D,
             device=device,

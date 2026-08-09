@@ -30,7 +30,8 @@ def min(
     tiled kernels (``wp.tile_load`` + ``wp.tile_min`` + ``wp.atomic_min``).
 
     With ``axis=0`` or ``axis=1`` on a rank-2 input, reduces along that axis to a
-    1D ``wp.array`` of the same dtype using one thread per output element.
+    1D ``wp.array`` of the same dtype — one plain thread per output element when the
+    reduced extent is narrower than a tile, a tiled block reduction per output otherwise.
 
     Parameters
     ----------
@@ -71,7 +72,8 @@ def max(
     tiled kernels (``wp.tile_load`` + ``wp.tile_max`` + ``wp.atomic_max``).
 
     With ``axis=0`` or ``axis=1`` on a rank-2 input, reduces along that axis to a
-    1D ``wp.array`` of the same dtype using one thread per output element.
+    1D ``wp.array`` of the same dtype — one plain thread per output element when the
+    reduced extent is narrower than a tile, a tiled block reduction per output otherwise.
 
     Parameters
     ----------
@@ -226,7 +228,8 @@ def sum(
     tiled kernels (``wp.tile_load`` + ``wp.tile_sum`` + ``wp.atomic_add``).
 
     With ``axis=0`` or ``axis=1`` on a rank-2 input, reduces along that axis to a
-    1D ``wp.array`` of the same dtype using one thread per output element.
+    1D ``wp.array`` of the same dtype — one plain thread per output element when the
+    reduced extent is narrower than a tile, a tiled block reduction per output otherwise.
 
     For ``wp.bool`` input, counts ``True`` values and returns ``int`` (global) or
     ``wp.int32`` (per-axis).
@@ -475,6 +478,8 @@ class _ScalarReduceSpec(NamedTuple):
     name: str
     axis_rows_tiled: Callable[..., None]
     axis_cols_tiled: Callable[..., None]
+    axis_rows_serial: Callable[..., None]
+    axis_cols_serial: Callable[..., None]
     tiled_1d: Callable[..., None]
     tiled_2d: Callable[..., None]
     init_global: Callable[[type], int | float]
@@ -486,6 +491,8 @@ class _BoolReduceSpec(NamedTuple):
     name: str
     axis_rows_tiled: Callable[..., None]
     axis_cols_tiled: Callable[..., None]
+    axis_rows_serial: Callable[..., None]
+    axis_cols_serial: Callable[..., None]
     tiled_1d: Callable[..., None]
     init_global: int
 
@@ -495,6 +502,8 @@ _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
         name="min",
         axis_rows_tiled=kernel_reduce.min_2d_rows_tiled,
         axis_cols_tiled=kernel_reduce.min_2d_cols_tiled,
+        axis_rows_serial=kernel_reduce.min_2d_rows_serial,
+        axis_cols_serial=kernel_reduce.min_2d_cols_serial,
         tiled_1d=kernel_reduce.min1d_tiled,
         tiled_2d=kernel_reduce.min2d_tiled,
         init_global=twt.dtype_max,
@@ -505,6 +514,8 @@ _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
         name="max",
         axis_rows_tiled=kernel_reduce.max_2d_rows_tiled,
         axis_cols_tiled=kernel_reduce.max_2d_cols_tiled,
+        axis_rows_serial=kernel_reduce.max_2d_rows_serial,
+        axis_cols_serial=kernel_reduce.max_2d_cols_serial,
         tiled_1d=kernel_reduce.max1d_tiled,
         tiled_2d=kernel_reduce.max2d_tiled,
         init_global=twt.dtype_min,
@@ -515,6 +526,8 @@ _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
         name="minmax",
         axis_rows_tiled=kernel_reduce.minmax_2d_rows_tiled,
         axis_cols_tiled=kernel_reduce.minmax_2d_cols_tiled,
+        axis_rows_serial=kernel_reduce.minmax_2d_rows_serial,
+        axis_cols_serial=kernel_reduce.minmax_2d_cols_serial,
         tiled_1d=kernel_reduce.minmax1d_tiled,
         tiled_2d=kernel_reduce.minmax2d_tiled,
         init_global=twt.dtype_max,
@@ -525,6 +538,8 @@ _SCALAR_REDUCE: dict[str, _ScalarReduceSpec] = {
         name="sum",
         axis_rows_tiled=kernel_reduce.sum_2d_rows_tiled,
         axis_cols_tiled=kernel_reduce.sum_2d_cols_tiled,
+        axis_rows_serial=kernel_reduce.sum_2d_rows_serial,
+        axis_cols_serial=kernel_reduce.sum_2d_cols_serial,
         tiled_1d=kernel_reduce.sum1d_tiled,
         tiled_2d=kernel_reduce.sum2d_tiled,
         init_global=twt.dtype_zero,
@@ -538,6 +553,8 @@ _BOOL_REDUCE: dict[str, _BoolReduceSpec] = {
         name="any",
         axis_rows_tiled=kernel_reduce.any_2d_rows_tiled,
         axis_cols_tiled=kernel_reduce.any_2d_cols_tiled,
+        axis_rows_serial=kernel_reduce.any_2d_rows_serial,
+        axis_cols_serial=kernel_reduce.any_2d_cols_serial,
         tiled_1d=kernel_reduce.any_1d_tiled,
         init_global=0,
     ),
@@ -545,6 +562,8 @@ _BOOL_REDUCE: dict[str, _BoolReduceSpec] = {
         name="all",
         axis_rows_tiled=kernel_reduce.all_2d_rows_tiled,
         axis_cols_tiled=kernel_reduce.all_2d_cols_tiled,
+        axis_rows_serial=kernel_reduce.all_2d_rows_serial,
+        axis_cols_serial=kernel_reduce.all_2d_cols_serial,
         tiled_1d=kernel_reduce.all_1d_tiled,
         init_global=1,
     ),
@@ -566,57 +585,40 @@ def _launch_axis_scalar(
     array: twt.Array2dScalar, axis: Literal[0, 1], spec: _ScalarReduceSpec
 ) -> twt.Array1dScalar | tuple[twt.Array1dScalar, twt.Array1dScalar]:
     n_rows, n_cols = int(array.shape[0]), int(array.shape[1])
-    n_col_tiles = (n_cols + TILE_1D - 1) // TILE_1D
-    n_row_tiles = (n_rows + TILE_1D - 1) // TILE_1D
+    n_out, reduced = (n_rows, n_cols) if axis == 1 else (n_cols, n_rows)
+
+    if reduced < TILE_1D:
+        # The tiled kernels never take their tile_load branch below TILE_1D: every lane of every
+        # block redundantly runs the serial remainder, a TILE_1D-fold read amplification (measured
+        # 49x on a (14M, 3) axis=1 max). One plain thread per output, direct write, no init fill.
+        serial = spec.axis_rows_serial if axis == 1 else spec.axis_cols_serial
+        if spec.dual_axis:
+            out_min = wp.empty(n_out, dtype=array.dtype, device=array.device)
+            out_max = wp.empty(n_out, dtype=array.dtype, device=array.device)
+            wp.launch(serial, dim=n_out, inputs=[array, out_min, out_max], device=array.device)
+            return cast(twt.Array1dScalar, out_min), cast(twt.Array1dScalar, out_max)
+        out = wp.empty(n_out, dtype=array.dtype, device=array.device)
+        wp.launch(serial, dim=n_out, inputs=[array, out], device=array.device)
+        return cast(twt.Array1dScalar, out)
+
+    tiled = spec.axis_rows_tiled if axis == 1 else spec.axis_cols_tiled
+    n_tiles = (reduced + TILE_1D - 1) // TILE_1D
     if spec.dual_axis:
-        if axis == 1:
-            out_min = wp.full(
-                n_rows, twt.dtype_max(array.dtype), dtype=array.dtype, device=array.device
-            )
-            out_max = wp.full(
-                n_rows, twt.dtype_min(array.dtype), dtype=array.dtype, device=array.device
-            )
-            wp.launch_tiled(
-                spec.axis_rows_tiled,
-                dim=[n_rows, n_col_tiles],
-                inputs=[array, out_min, out_max],
-                block_dim=TILE_1D,
-                device=array.device,
-            )
-        else:
-            out_min = wp.full(
-                n_cols, twt.dtype_max(array.dtype), dtype=array.dtype, device=array.device
-            )
-            out_max = wp.full(
-                n_cols, twt.dtype_min(array.dtype), dtype=array.dtype, device=array.device
-            )
-            wp.launch_tiled(
-                spec.axis_cols_tiled,
-                dim=[n_cols, n_row_tiles],
-                inputs=[array, out_min, out_max],
-                block_dim=TILE_1D,
-                device=array.device,
-            )
+        out_min = wp.full(n_out, twt.dtype_max(array.dtype), dtype=array.dtype, device=array.device)
+        out_max = wp.full(n_out, twt.dtype_min(array.dtype), dtype=array.dtype, device=array.device)
+        wp.launch_tiled(
+            tiled,
+            dim=[n_out, n_tiles],
+            inputs=[array, out_min, out_max],
+            block_dim=TILE_1D,
+            device=array.device,
+        )
         return cast(twt.Array1dScalar, out_min), cast(twt.Array1dScalar, out_max)
 
-    if axis == 1:
-        out = wp.full(n_rows, spec.init_global(array.dtype), dtype=array.dtype, device=array.device)
-        wp.launch_tiled(
-            spec.axis_rows_tiled,
-            dim=[n_rows, n_col_tiles],
-            inputs=[array, out],
-            block_dim=TILE_1D,
-            device=array.device,
-        )
-    else:
-        out = wp.full(n_cols, spec.init_global(array.dtype), dtype=array.dtype, device=array.device)
-        wp.launch_tiled(
-            spec.axis_cols_tiled,
-            dim=[n_cols, n_row_tiles],
-            inputs=[array, out],
-            block_dim=TILE_1D,
-            device=array.device,
-        )
+    out = wp.full(n_out, spec.init_global(array.dtype), dtype=array.dtype, device=array.device)
+    wp.launch_tiled(
+        tiled, dim=[n_out, n_tiles], inputs=[array, out], block_dim=TILE_1D, device=array.device
+    )
     return cast(twt.Array1dScalar, out)
 
 
@@ -634,10 +636,9 @@ def _launch_global_scalar_tiled(
 
     if array.ndim == 1:
         n = int(array.shape[0])
-        n_tiles = (n + TILE_1D - 1) // TILE_1D
         wp.launch_tiled(
             spec.tiled_1d,
-            dim=[n_tiles],
+            dim=[kernel_reduce.blocks_1d(n)],
             inputs=[array, out],
             block_dim=TILE_1D,
             device=array.device,
@@ -706,10 +707,9 @@ def _bool_mask_as_int32(mask: wp.array[wp.bool]) -> wp.array[wp.int32]:
 def _launch_global_bool_tiled(mask_i32: wp.array[wp.int32], spec: _BoolReduceSpec) -> bool:
     out = wp.full(1, spec.init_global, dtype=wp.int32, device=mask_i32.device)
     n = int(mask_i32.shape[0])
-    n_tiles = (n + TILE_1D - 1) // TILE_1D
     wp.launch_tiled(
         spec.tiled_1d,
-        dim=[n_tiles],
+        dim=[kernel_reduce.blocks_1d(n)],
         inputs=[mask_i32, out],
         block_dim=TILE_1D,
         device=mask_i32.device,
@@ -732,22 +732,19 @@ def _reduce_bool(
         n_rows, n_cols = int(array.shape[0]), int(array.shape[1])
         if axis is None:
             return _launch_global_bool_tiled(mask_i32.flatten(), spec)
-        n_col_tiles = (n_cols + TILE_1D - 1) // TILE_1D
-        n_row_tiles = (n_rows + TILE_1D - 1) // TILE_1D
-        if axis == 1:
-            out_i32 = wp.full(n_rows, spec.init_global, dtype=wp.int32, device=array.device)
-            wp.launch_tiled(
-                spec.axis_rows_tiled,
-                dim=[n_rows, n_col_tiles],
-                inputs=[mask_i32, out_i32],
-                block_dim=TILE_1D,
-                device=array.device,
-            )
+        n_out, reduced = (n_rows, n_cols) if axis == 1 else (n_cols, n_rows)
+        if reduced < TILE_1D:
+            # Same rule as _launch_axis_scalar: below TILE_1D the tiled form only amplifies reads.
+            serial = spec.axis_rows_serial if axis == 1 else spec.axis_cols_serial
+            out_i32 = wp.empty(n_out, dtype=wp.int32, device=array.device)
+            wp.launch(serial, dim=n_out, inputs=[mask_i32, out_i32], device=array.device)
         else:
-            out_i32 = wp.full(n_cols, spec.init_global, dtype=wp.int32, device=array.device)
+            tiled = spec.axis_rows_tiled if axis == 1 else spec.axis_cols_tiled
+            n_tiles = (reduced + TILE_1D - 1) // TILE_1D
+            out_i32 = wp.full(n_out, spec.init_global, dtype=wp.int32, device=array.device)
             wp.launch_tiled(
-                spec.axis_cols_tiled,
-                dim=[n_cols, n_row_tiles],
+                tiled,
+                dim=[n_out, n_tiles],
                 inputs=[mask_i32, out_i32],
                 block_dim=TILE_1D,
                 device=array.device,

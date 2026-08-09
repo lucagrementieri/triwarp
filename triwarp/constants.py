@@ -29,6 +29,24 @@ TWO_PI = wp.constant(2 * wp.PI)
 TILE_1D = 64
 TILE_2D = 8
 
+# Tiles folded per block by the *global* (``axis=None``) 1-D reductions in ``kernels/reduce.py``.
+# One block per tile means one ``atomic_add`` per 64 elements, and at scale that single accumulator
+# address is the bottleneck rather than bandwidth: 219k blocks contending on one slot cost 309 us to
+# sum 14M float32 (56 MB), against a ~31 us bandwidth floor on this card. Folding several tiles into
+# a register first divides the atomic traffic by this factor.
+#
+# Swept 1/4/16/64/256 at 36k, 438k, 1.09M and 14M elements, interleaved under one clock state:
+#
+# - 16 is 1.28x / 1.50x / 1.90x / **4.89x** over the one-tile form and never loses;
+# - 4 is better below ~1M (1.58x / 1.70x) but only 3.33x at 14M;
+# - 64 matches 16 at 14M and loses 1.4x below it; 256 loses everywhere (the tail block does too much
+#   serial work while the rest of the device idles).
+#
+# 16 wins where the difference is visible: below ~1M the whole reduction sits under the ~82 us of
+# host-side launch + readback that ends any scalar-returning call, so the 5 us that 4 would save
+# there is unobservable, while the 30 us it gives up at 14M is not.
+TILES_PER_BLOCK_1D = 16
+
 # Elements reduced per thread by the *lane-free* reductions -- those whose body must stay correct on
 # the CPU device, where ``wp.launch_tiled`` runs exactly one lane per block (Warp 1.15) and any
 # lane-parallel body silently reduces a single element per tile. Each thread walks a strided slice

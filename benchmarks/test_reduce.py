@@ -10,13 +10,16 @@ device instead (see the ``check_every`` discussion in ``triwarp/linalg.py``).
 
 Three shapes are timed:
 
-* **Tiled full-array reductions** (``sum``, ``mean``, ``minmax``) — a ``TILE_1D``-wide block
-  reduction into an atomic accumulator, then one readback. ``minmax`` produces both extrema in a
-  single pass, so timing it next to a bare ``min`` is what justifies its existence.
+* **Tiled full-array reductions** (``sum``, ``mean``, ``minmax``) — a block reduction into an atomic
+  accumulator, then one readback. ``minmax`` produces both extrema in a single pass, so timing it
+  next to a bare ``min`` is what justifies its existence.
 * **Axis reductions** (``sum(axis=0)``, ``max(axis=1)``) — no readback at all: the result stays on
   device as an array. These are the fair measure of the reduction kernel itself, uncontaminated by
   the host sync, and the row/column split shows the coalescing difference between reducing along
-  and across the contiguous axis.
+  and across the contiguous axis. Note the two are *not* the same kernel: ``max(axis=1)`` on an
+  ``(n, 3)`` table reduces a 3-wide extent and takes the one-thread-per-row serial path, while
+  ``sum(axis=0)`` reduces the long extent into 3 outputs and stays tiled. Timing both directions is
+  what pins that dispatch, and it is worth 49x in one direction and 89x in the other (see below).
 * **Sort-based** (``median``) — the outlier. It radix-sorts a *copy* of the values with
   ``warp.utils.radix_sort_pairs`` and reads the middle element, so it is an O(n log n) full sort
   where every other function here is a single O(n) pass, and it allocates. Expect a large constant
@@ -35,12 +38,46 @@ timed region holds only the reduction.
 
 References
 ----------
-``reduce`` is an array primitive, not a geometry operation — the same reason
-[`test_grouping.py`](test_grouping.py) is triwarp-only. NumPy would be the natural reference but is
-not a library *kind* in the harness registry (it is the substrate every CPU baseline is already
-built on), and timing a host reduction against a device one measures PCIe and thread count rather
-than anything a change to these kernels would move. trimesh, libigl and open3d expose no
-array-reduction API at all.
+``reduce`` is an array primitive, not a geometry operation, so the natural reference is **NumPy**
+itself: every group here also times the equivalent host reduction over an already-resident float32
+NumPy buffer holding the same values. Read those rows for what they are — the host-side floor, not
+a like-for-like kernel race. A device-side reduction that returns a Python scalar pays a flat
+launch + readback latency that NumPy never pays, so NumPy *should* win at small sizes and the
+question each row answers is *where the crossover sits* and whether the device side stays flat past
+it. trimesh, libigl and open3d expose no array-reduction API at all.
+
+What the comparison actually says, so nobody has to re-derive it from the table: **the split is by
+return type, not by size or by dtype.** The groups that hand back a device array or a ``wp.vec3``
+— both axis groups and both ``vec3`` groups — are ahead of NumPy at every mesh in the registry,
+though only narrowly at ``bunny_decimated`` (1.1-1.6x, and ``mean_vec3`` there is close enough that
+a single outlier round inverts its *mean* while its min and median stay ahead — read the min) and
+by 80-200x at ``lucy``. The groups that hand back a *Python scalar* (``sum_scalar``, ``min_scalar``,
+``minmax_scalar``, ``median``) lose to NumPy below roughly half a million elements and win above it:
+``min_scalar`` is 60x slower than NumPy on ``bunny_decimated`` and 11x faster on ``lucy``.
+
+That crossover is a host cost, and the split was measured rather than assumed: ~35 µs of launch
+marshalling, ~30 µs for the 4-byte readback and ~17 µs to allocate and fill the output buffer —
+**~82 µs before a single element is touched**, against NumPy's 1.6 µs for the whole 8k reduction.
+Only the ``sync`` term scales with n. So a scalar-returning reduction cannot win at small n no
+matter what the kernel does, which is why callers inside iterative loops are expected to keep values
+on device instead (see the ``check_every`` discussion in ``triwarp/linalg.py``).
+
+Two kernel defects were found while chasing that floor, both since fixed. Neither was *exposed* by
+the NumPy rows — triwarp was already ahead in both groups — but both were found by asking the
+question these rows invite, namely whether the tiling is earning its keep:
+
+- **Tiling below one tile is pure loss.** The tiled axis kernels never reach their ``wp.tile_load``
+  branch when the reduced extent is under ``TILE_1D``, so all 64 lanes of every block redundantly
+  walked the same 3-element row — a 64-fold read amplification. One thread per output row is **49x**
+  faster on a ``(14M, 3)`` table, and the wrapper now dispatches on the reduced extent.
+- **One atomic per tile does not scale.** The global 1-D reductions ran ~9x off the memory-bandwidth
+  floor at 14M elements because one ``atomic_add`` per 64-element block put 219k blocks on a single
+  accumulator address. Folding ``TILES_PER_BLOCK_1D`` tiles into a register first is **4.9x** faster
+  and lands within 2x of bandwidth.
+
+Both numbers are kernel-time A/Bs, interleaved under one clock state with values verified each
+round; end to end the scalar-returning groups move much less, because ~82 µs of the call was never
+the kernel.
 
 **pymeshlab** is the one exception and lands in the ``median`` group.
 ``get_scalar_statistics_per_vertex`` reduces a per-vertex scalar attribute to ``{min, max, avg, med,
@@ -55,8 +92,9 @@ from the vertices' ``z`` with ``compute_scalar_by_function_per_vertex(q='z')``, 
 - **It is read-only** (it returns a dict and touches nothing), so the MeshSet is shared and only the
   attribute seeding sits outside the timed callable.
 
-Everything else here stays a before/after self-comparison, which is what the tile-tail-clamp batch
-touching this module needs.
+The NumPy rows are the only ones that are *always* comparable: every group computes exactly the
+reduction its NumPy call computes, so each pair is a class-A parity claim in
+[`tests/test_reduce.py`](../tests/test_reduce.py) with no transform in between.
 """
 
 from __future__ import annotations
@@ -72,6 +110,26 @@ import triwarp.typing as twt
 
 _scalar_cache: dict[tuple[str, str], wp.array[wp.float32]] = {}
 _rows_cache: dict[tuple[str, str], twt.Array2dFloat32] = {}
+_scalar_np_cache: dict[str, np.ndarray] = {}
+_rows_np_cache: dict[str, np.ndarray] = {}
+
+
+def _scalars_np(bench_case: BenchCase) -> np.ndarray:
+    """``(n_vertices,)`` float32 host scalars — the same values ``_scalars_wp`` uploads."""
+    if bench_case.mesh_name not in _scalar_np_cache:
+        _scalar_np_cache[bench_case.mesh_name] = np.ascontiguousarray(
+            bench_case.vertices_np[:, 2], dtype=np.float32
+        )
+    return _scalar_np_cache[bench_case.mesh_name]
+
+
+def _rows_np(bench_case: BenchCase) -> np.ndarray:
+    """``(n_vertices, 3)`` float32 host table — the same values ``_rows_wp`` uploads."""
+    if bench_case.mesh_name not in _rows_np_cache:
+        _rows_np_cache[bench_case.mesh_name] = np.ascontiguousarray(
+            bench_case.vertices_np, dtype=np.float32
+        )
+    return _rows_np_cache[bench_case.mesh_name]
 
 
 def _scalars_wp(bench_case: BenchCase) -> wp.array[wp.float32]:
@@ -79,9 +137,7 @@ def _scalars_wp(bench_case: BenchCase) -> wp.array[wp.float32]:
     key = (bench_case.mesh_name, str(bench_case.device))
     if key not in _scalar_cache:
         _scalar_cache[key] = wp.array(
-            np.ascontiguousarray(bench_case.vertices_np[:, 2], dtype=np.float32),
-            dtype=wp.float32,
-            device=bench_case.device,
+            _scalars_np(bench_case), dtype=wp.float32, device=bench_case.device
         )
     return _scalar_cache[key]
 
@@ -91,71 +147,125 @@ def _rows_wp(bench_case: BenchCase) -> twt.Array2dFloat32:
     key = (bench_case.mesh_name, str(bench_case.device))
     if key not in _rows_cache:
         _rows_cache[key] = wp.array(
-            np.ascontiguousarray(bench_case.vertices_np, dtype=np.float32),
-            dtype=wp.float32,
-            device=bench_case.device,
+            _rows_np(bench_case), dtype=wp.float32, device=bench_case.device
         )
     return _rows_cache[key]
 
 
 @pytest.mark.benchmark(group="sum_scalar")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "numpy")
 def test_sum_scalar(bench_case: BenchCase) -> None:
     """Tiled float32 sum to a Python scalar: one block reduction plus the host readback."""
+    if bench_case.kind == "numpy":
+        values_np = _scalars_np(bench_case)
+        total_np = bench_case.run(lambda: float(values_np.sum()))
+        assert np.isfinite(total_np)
+        return
     values = _scalars_wp(bench_case)
     total = bench_case.run(lambda: tw.reduce.sum(values))
     assert np.isfinite(total)
 
 
 @pytest.mark.benchmark(group="sum_vec3")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "numpy")
 def test_sum_vec3(bench_case: BenchCase) -> None:
     """The ``wp.vec3`` accumulator path — what a centroid actually calls."""
+    if bench_case.kind == "numpy":
+        rows_np = _rows_np(bench_case)
+        total_np = bench_case.run(lambda: rows_np.sum(axis=0))
+        assert total_np.shape == (3,)
+        return
     vertices = bench_case.vertices_wp
     total = bench_case.run(lambda: tw.reduce.sum(vertices))
     assert len(total) == 3
 
 
 @pytest.mark.benchmark(group="mean_vec3")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "numpy")
 def test_mean_vec3(bench_case: BenchCase) -> None:
     """``sum`` plus a scalar divide: the delta over ``sum_vec3`` is the normalization."""
+    if bench_case.kind == "numpy":
+        rows_np = _rows_np(bench_case)
+        centroid_np = bench_case.run(lambda: rows_np.mean(axis=0))
+        assert centroid_np.shape == (3,)
+        return
     vertices = bench_case.vertices_wp
     centroid = bench_case.run(lambda: tw.reduce.mean(vertices))
     assert len(centroid) == 3
 
 
 @pytest.mark.benchmark(group="minmax_scalar")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "numpy")
 def test_minmax_scalar(bench_case: BenchCase) -> None:
     """Both extrema in one pass — compare against ``min_scalar`` for the single-pass saving."""
+    if bench_case.kind == "numpy":
+        values_np = _scalars_np(bench_case)
+        lo_np, hi_np = bench_case.run(lambda: (float(values_np.min()), float(values_np.max())))
+        assert lo_np <= hi_np
+        return
     values = _scalars_wp(bench_case)
     lo, hi = bench_case.run(lambda: tw.reduce.minmax(values))
     assert lo <= hi
 
 
 @pytest.mark.benchmark(group="min_scalar")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "numpy")
 def test_min_scalar(bench_case: BenchCase) -> None:
     """A single extremum, for reference against ``minmax_scalar``."""
+    if bench_case.kind == "numpy":
+        values_np = _scalars_np(bench_case)
+        lo_np = bench_case.run(lambda: float(values_np.min()))
+        assert np.isfinite(lo_np)
+        return
     values = _scalars_wp(bench_case)
     lo = bench_case.run(lambda: tw.reduce.min(values))
     assert np.isfinite(lo)
 
 
+@pytest.mark.benchmark(group="minmax_global_2d")
+@pytest.mark.benchlibs("triwarp", "numpy")
+def test_minmax_global_2d(bench_case: BenchCase) -> None:
+    """
+    A rank-2 table reduced to one scalar pair — the shape ``graph`` validates an edge list with.
+
+    Distinct from ``minmax_scalar`` (rank-1) because rank-2 ``axis=None`` dispatches to its own
+    ``TILE_2D``-square kernel, and distinct from the axis groups because it ends in a readback.
+    The narrow trailing extent is the point: a ``(m, 2)`` edge table or ``(n, 3)`` vertex table
+    clips the 8x8 tile to 8x2, so the tile branch is never taken.
+    """
+    if bench_case.kind == "numpy":
+        rows_np = _rows_np(bench_case)
+        lo_np, hi_np = bench_case.run(lambda: (float(rows_np.min()), float(rows_np.max())))
+        assert lo_np <= hi_np
+        return
+    rows = _rows_wp(bench_case)
+    lo, hi = bench_case.run(lambda: tw.reduce.minmax(rows))
+    assert lo <= hi
+
+
 @pytest.mark.benchmark(group="sum_axis0")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "numpy")
 def test_sum_axis0(bench_case: BenchCase) -> None:
     """Column sums of an ``(n, 3)`` table: device-resident result, no readback."""
+    if bench_case.kind == "numpy":
+        rows_np = _rows_np(bench_case)
+        sums_np = bench_case.run(lambda: rows_np.sum(axis=0))
+        assert sums_np.shape == (3,)
+        return
     rows = _rows_wp(bench_case)
     sums = bench_case.run(lambda: tw.reduce.sum(rows, axis=0))
     assert sums.shape[0] == 3
 
 
 @pytest.mark.benchmark(group="max_axis1")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "numpy")
 def test_max_axis1(bench_case: BenchCase) -> None:
     """Row maxima of the same table: reduces along the contiguous axis instead of across it."""
+    if bench_case.kind == "numpy":
+        rows_np = _rows_np(bench_case)
+        maxima_np = bench_case.run(lambda: rows_np.max(axis=1))
+        assert maxima_np.shape[0] == bench_case.n_vertices
+        return
     rows = _rows_wp(bench_case)
     maxima = bench_case.run(lambda: tw.reduce.max(rows, axis=1))
     assert maxima.shape[0] == bench_case.n_vertices
@@ -169,13 +279,18 @@ def _scalar_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
 
 
 @pytest.mark.benchmark(group="median")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "pymeshlab", "numpy")
 def test_median(bench_case: BenchCase) -> None:
     """Radix-sorts a copy and reads the middle: O(n log n) where the rest are one pass."""
     if bench_case.kind == "pymeshlab":  # one call: min, max, avg, med, stddev, variance
         meshset_pml = _scalar_meshset_pml(bench_case)
         statistics_pml = bench_case.run(meshset_pml.get_scalar_statistics_per_vertex)
         assert np.isfinite(statistics_pml["med"])
+        return
+    if bench_case.kind == "numpy":  # introselect partition, not a full sort
+        values_np = _scalars_np(bench_case)
+        middle_np = bench_case.run(lambda: float(np.median(values_np)))
+        assert np.isfinite(middle_np)
         return
     values = _scalars_wp(bench_case)
     middle = bench_case.run(lambda: tw.reduce.median(values))

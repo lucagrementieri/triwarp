@@ -8,7 +8,9 @@ import warp as wp
 import triwarp.reduce as tw_reduce
 
 
+@pytest.mark.parity("min_scalar", "numpy")
 def test_min_1d(device: str) -> None:
+    """Class A: direct comparison against ``numpy.min``."""
     rng = np.random.default_rng(42)
     n = 100
     values_np = rng.integers(-1000, 1000, (n,), dtype=np.int32)
@@ -63,7 +65,9 @@ def test_max_2d(device: str) -> None:
 
 
 @pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parity("max_axis1", "numpy")
 def test_max_2d_axis(device: str, axis: int) -> None:
+    """Class A: direct comparison against ``numpy.max(axis=...)`` over both axes."""
     rng = np.random.default_rng(42)
     values_np = rng.integers(-1000, 1000, (32, 10), dtype=np.int32)
     values_wp = wp.array(values_np, dtype=wp.int32, device=device)
@@ -72,7 +76,9 @@ def test_max_2d_axis(device: str, axis: int) -> None:
     assert np.array_equal(got_wp.numpy(), exp_np)
 
 
+@pytest.mark.parity("minmax_scalar", "numpy")
 def test_minmax_1d(device: str) -> None:
+    """Class A: both extrema against ``numpy.min`` / ``numpy.max``."""
     rng = np.random.default_rng(42)
     n = 100
     values_np = rng.integers(-1000, 1000, (n,), dtype=np.int32)
@@ -85,11 +91,18 @@ def test_minmax_1d(device: str) -> None:
     assert np.allclose(max_wp, max_np)
 
 
-def test_minmax_2d(device: str) -> None:
+@pytest.mark.parametrize("shape", [(200, 100), (5000, 2), (5000, 3), (3, 5000)])
+@pytest.mark.parity("minmax_global_2d", "numpy")
+def test_minmax_2d(device: str, shape: tuple[int, int]) -> None:
+    """
+    Class A: rank-2 ``axis=None`` extrema against ``numpy.min`` / ``numpy.max``.
+
+    Parametrized over narrow *and* wide trailing extents on purpose: ``(m, 2)`` is the edge-table
+    shape [`triwarp.graph.connected_components`][] validates, and it clips the ``TILE_2D`` square
+    so the tile branch never runs — a wide-only fixture would leave that path untested.
+    """
     rng = np.random.default_rng(42)
-    n = 200
-    m = 100
-    values_np = rng.standard_normal((n, m), dtype=np.float32)
+    values_np = rng.standard_normal(shape, dtype=np.float32)
     min_np = values_np.min()
     max_np = values_np.max()
     values_wp = wp.array(values_np, dtype=wp.float32, device=device)
@@ -277,7 +290,9 @@ def test_bool_reduce_partial_tiles_axis(device: str, shape: tuple[int, int], axi
     assert np.array_equal(tw_reduce.all(mask_wp, axis=axis).numpy(), np.all(mask_np, axis=axis))
 
 
+@pytest.mark.parity("sum_scalar", "numpy")
 def test_sum_1d(device: str) -> None:
+    """Class A: direct comparison against ``numpy.sum``."""
     rng = np.random.default_rng(42)
     n = 100
     values_np = rng.integers(-1000, 1000, (n,), dtype=np.int32)
@@ -300,7 +315,9 @@ def test_sum_2d(device: str) -> None:
 
 
 @pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parity("sum_axis0", "numpy")
 def test_sum_2d_axis(device: str, axis: int) -> None:
+    """Class A: direct comparison against ``numpy.sum(axis=...)`` over both axes."""
     rng = np.random.default_rng(42)
     values_np = rng.integers(-1000, 1000, (32, 10), dtype=np.int32)
     values_wp = wp.array(values_np, dtype=wp.int32, device=device)
@@ -452,7 +469,9 @@ def test_mean_1d_axis_raises(device: str) -> None:
         tw_reduce.mean(values_wp, axis=0)
 
 
+@pytest.mark.parity("mean_vec3", "numpy")
 def test_mean_vec3_1d(device: str) -> None:
+    """Class A: component-wise mean against ``numpy.mean(axis=0)``."""
     rng = np.random.default_rng(20)
     values_np = rng.standard_normal((300, 3)).astype(np.float32)
     values_wp = wp.array(values_np, dtype=wp.vec3, device=device)
@@ -481,7 +500,9 @@ def test_mean_vec3_empty_raises(device: str) -> None:
         tw_reduce.mean(values_wp)
 
 
+@pytest.mark.parity("sum_vec3", "numpy")
 def test_sum_vec3_1d(device: str) -> None:
+    """Class A: component-wise sum against ``numpy.sum(axis=0)``."""
     rng = np.random.default_rng(20)
     values_np = rng.standard_normal((300, 3)).astype(np.float32)
     values_wp = wp.array(values_np, dtype=wp.vec3, device=device)
@@ -522,7 +543,7 @@ def test_weighted_sum_vec3_1d(device: str) -> None:
 
 
 @pytest.mark.parametrize("n", [100, 101])
-@pytest.mark.parity("median", "pymeshlab")
+@pytest.mark.parity("median", "pymeshlab", "numpy")
 def test_scalar_statistics_match_pymeshlab(device: str, n: int) -> None:
     """
     Class B: ``get_scalar_statistics_per_vertex`` answers four of these reductions in one call.

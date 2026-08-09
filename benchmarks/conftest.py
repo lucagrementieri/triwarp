@@ -111,6 +111,11 @@ def skip_larger_than(bench_case: BenchCase, largest: str, reason: str = "") -> N
 # costs ~0.47 us/vertex (17 ms on ``bunny``). So the MeshSet is built inside the timed callable via
 # ``BenchCase.new_meshset_pml`` unless the filter is verified pure, and any row cheaper than the
 # build cost is reporting the build. See ``BenchCase.new_meshset_pml`` for the full rule.
+#
+# ``numpy`` is the narrowest baseline of all: it is only a reference for the *array primitives*
+# (``triwarp.reduce``), where a host reduction over an already-resident NumPy buffer is the honest
+# CPU floor. It is deliberately not a geometry reference — every other CPU baseline is already
+# built on NumPy, so timing it against a geometry wrapper would measure nothing new.
 LIBRARIES: list[LibrarySpec] = [
     {"id": "triwarp-cpu", "kind": "triwarp", "device": "cpu", "cpu_bound": True},
     {"id": "triwarp-cuda", "kind": "triwarp", "device": "cuda:0", "cpu_bound": False},
@@ -118,6 +123,7 @@ LIBRARIES: list[LibrarySpec] = [
     {"id": "igl", "kind": "igl", "device": None, "cpu_bound": True},
     {"id": "open3d", "kind": "open3d", "device": None, "cpu_bound": True},
     {"id": "scipy", "kind": "scipy", "device": None, "cpu_bound": True},
+    {"id": "numpy", "kind": "numpy", "device": None, "cpu_bound": True},
     {"id": "potpourri3d", "kind": "potpourri3d", "device": None, "cpu_bound": True},
     {"id": "pymeshlab", "kind": "pymeshlab", "device": None, "cpu_bound": True},
 ]
@@ -390,7 +396,7 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
         "benchlibs(*kinds): library kinds "
-        "(triwarp/trimesh/igl/open3d/scipy/potpourri3d/pymeshlab) a benchmark supports.",
+        "(triwarp/trimesh/igl/open3d/scipy/numpy/potpourri3d/pymeshlab) a benchmark supports.",
     )
     config.addinivalue_line(
         "markers",
@@ -475,7 +481,7 @@ class BenchLibrary:
 
     @property
     def kind(self) -> str:
-        """The library family: triwarp, trimesh, igl, open3d, scipy, potpourri3d or pymeshlab."""
+        """Library family: triwarp, trimesh, igl, open3d, scipy, numpy, potpourri3d or pymeshlab."""
         return self.library["kind"]
 
     @property
