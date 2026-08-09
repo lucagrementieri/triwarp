@@ -42,6 +42,9 @@ vertices are smoothed into the surrounding surface — a sharp-boundary umbrella
 followed by a cross-boundary least-squares solve
 ([`smooth_region`][triwarp.smoothing.smooth_region]), with an optional
 ``natural_smooth`` collar that blends the patch into the neighbouring surface.
+
+Every filler returns a buffer **independent of** ``faces``, including on the no-op path where
+there was no hole to fill, so a caller may write into the result without disturbing its input.
 """
 
 from __future__ import annotations
@@ -768,7 +771,11 @@ def _fill_packed_loops(
         # ``min_area`` pass is **not** this pass -- it is ``plane_normalized``'s own per-span kernel
         # doing more work (plane normals, dihedral terms) than ``min_area``'s. ``prev`` is read back
         # a few lines below regardless, so this adds no synchronisation point that was not there.
-        if int(retry.numpy().sum()) > 0:
+        # The test itself is a device reduction rather than a full readback of the ``n_loops``
+        # buffer (CLAUDE.md section 13) -- 4 bytes back instead of 36 KB on ``dragon``'s 8 978
+        # loops. That is a consistency fix, not a speed one: the readback it replaces is noise
+        # against a 150 ms call, and no benchmark move should be attributed to it.
+        if tw.reduce.max(retry) > 0:
             _run_hole_dp(
                 loops,
                 loop_pos,
@@ -833,8 +840,8 @@ def fill_small(
     -------
     wp.array[wp.int32]
         Flat face buffer of ``faces`` followed by the fill triangles for the small loops, on
-        ``faces.device``. Unchanged (a copy is not made; returns ``faces``) when there is no
-        boundary loop at or under ``max_perimeter``.
+        ``faces.device``. A copy of ``faces`` when there is no boundary loop at or under
+        ``max_perimeter``.
 
     See Also
     --------
@@ -843,13 +850,13 @@ def fill_small(
     """
     packed = _hole_loops(vertices, faces)
     if packed is None:
-        return faces
+        return wp.clone(faces)
 
     # One segmented-sum launch measures every rim, so the selection costs a single readback rather
     # than a copy of the whole vertex buffer plus one of each loop.
     small_np = _loop_perimeters(vertices, packed) <= max_perimeter
     if not small_np.any():
-        return faces
+        return wp.clone(faces)
     if not small_np.all():
         kept = zip(_unpack_loops(packed), small_np, strict=True)
         packed = _pack_loops([loop for loop, keep in kept if keep])
@@ -1015,7 +1022,7 @@ def fill_smooth(
         result = (wp.clone(vertices), wp.clone(faces))
         return (*result, empty) if return_patch else result
 
-    n_faces_before = int(faces.shape[0]) // 3
+    n_faces_before = n_faces
     n_vertices_before = int(vertices.shape[0])
     faces_filled = _fill_packed_loops(
         vertices, faces, packed, metric, resolve_multiple_edges, smooth_boundary

@@ -21,7 +21,7 @@ under a field.
 
 from __future__ import annotations
 
-from typing import TypeVar, cast
+from typing import TypeVar
 
 import warp as wp
 
@@ -37,7 +37,7 @@ DType = TypeVar("DType")
 
 def average_onto_faces(
     faces: wp.array[wp.int32], vertex_values: wp.array[wp.float32]
-) -> twt.Array1dFloat32:
+) -> wp.array[wp.float32]:
     """
     Move a scalar field defined on vertices to faces by averaging.
 
@@ -58,7 +58,7 @@ def average_onto_faces(
     n_faces = int(faces.shape[0]) // 3
     device = vertex_values.device
     if n_faces == 0:
-        return cast(twt.Array1dFloat32, wp.empty(0, dtype=wp.float32, device=device))
+        return wp.empty(0, dtype=wp.float32, device=device)
 
     out_face_values = wp.empty(n_faces, dtype=wp.float32, device=device)
     wp.launch(
@@ -67,7 +67,7 @@ def average_onto_faces(
         inputs=[faces, vertex_values, out_face_values],
         device=device,
     )
-    return cast(twt.Array1dFloat32, out_face_values)
+    return out_face_values
 
 
 def average_onto_vertices(
@@ -93,6 +93,13 @@ def average_onto_vertices(
     -------
     wp.array[wp.float32]
         Length ``n_vertices`` scalar field defined on vertices.
+
+    See Also
+    --------
+    [`average_from_edges_onto_vertices`][triwarp.interpolation.average_from_edges_onto_vertices]
+        The same scatter-sum-then-divide over edges instead of faces. The two disagree on a
+        **zero-valence** vertex on purpose, each mirroring its own igl function: this one divides
+        unguarded and yields ``nan``, that one guards and yields ``0``.
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
@@ -146,6 +153,13 @@ def average_from_edges_onto_vertices(
     -------
     wp.array[wp.float32]
         Length ``n_vertices`` scalar field defined on vertices.
+
+    See Also
+    --------
+    [`average_onto_vertices`][triwarp.interpolation.average_onto_vertices]
+        The same scatter-sum-then-divide over faces instead of edges. The two disagree on a
+        **zero-valence** vertex on purpose, each mirroring its own igl function: this one guards
+        the division and yields ``0``, that one divides unguarded and yields ``nan``.
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
