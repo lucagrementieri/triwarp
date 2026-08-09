@@ -39,7 +39,11 @@ keywords = [
 # ``triwarp.voxels`` is the package's first hard 1.16 dependency: it needs CPU
 # ``wp.Volume.allocate_by_voxels`` (CUDA-only through 1.15) and ``Volume.get_active_stats``, which
 # is the only occupancy read that is correct on a rebuildable grid.
-dependencies = ["warp-lang>=1.16"]
+#
+# ``numpy`` is core, not optional: 16 of the modules ``triwarp/__init__.py`` imports eagerly use it
+# for host-side metadata math. It adds nothing to an install, since ``warp-lang`` itself declares an
+# unconditional ``Requires-Dist: numpy`` and ``import warp`` loads it before triwarp gets a say.
+dependencies = ["warp-lang>=1.16", "numpy>=1.20"]
 
 [project.urls]
 Documentation = "https://lucagrementieri.github.io/triwarp/"
@@ -48,7 +52,7 @@ Issues = "https://github.com/lucagrementieri/triwarp/issues"
 Repository = "https://github.com/lucagrementieri/triwarp"
 
 [project.optional-dependencies]
-io = ["meshio>=5.0", "numpy>=1.20"]
+io = ["meshio>=5.0"]
 
 [dependency-groups]
 bench = ["pytest-benchmark>=5.1", { include-group = "test" }]

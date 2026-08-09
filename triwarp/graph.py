@@ -196,11 +196,12 @@ def connected_component_labels_from_edges(
     elif m == 0:
         return init_range(node_count, device)
     elif validate:
-        edges_np = edges.numpy()
-        if edges_np.min() < 0 or int(edges_np.max()) >= node_count:
+        # One 8-byte read of both bounds, not a copy of the whole edge buffer: measured on CUDA,
+        # 1.69x at 400k entries and 16.3x at 8M, crossing over near 200k.
+        lowest, highest = tw.reduce.minmax(edges)
+        if lowest < 0 or highest >= node_count:
             raise ValueError(
-                f"edge indices must lie in [0, {node_count}), "
-                f"got min={edges_np.min()} max={edges_np.max()}"
+                f"edge indices must lie in [0, {node_count}), got min={lowest} max={highest}"
             )
 
     adjacency = edges_to_csr(node_count, edges)
@@ -572,11 +573,12 @@ def bfs_from_edges(
         if node_count < 0:
             raise ValueError(f"node_count must be non-negative, got {node_count}")
         if m > 0:
-            edges_np = edges.numpy()
-            if edges_np.min() < 0 or int(edges_np.max()) >= node_count:
+            # One 8-byte read of both bounds; see the same check in
+            # ``connected_component_labels_from_edges`` for the measurement.
+            lowest, highest = tw.reduce.minmax(edges)
+            if lowest < 0 or highest >= node_count:
                 raise ValueError(
-                    f"edge indices must lie in [0, {node_count}), "
-                    f"got min={edges_np.min()} max={edges_np.max()}"
+                    f"edge indices must lie in [0, {node_count}), got min={lowest} max={highest}"
                 )
 
     adjacency = edges_to_csr(node_count, edges)
@@ -637,6 +639,10 @@ def bfs_multi_source(
         empty = wp.empty(0, dtype=wp.int32, device=device)
         return empty, wp.empty(0, dtype=wp.int32, device=device)
 
+    # Unlike the two edge-buffer range checks in this module, this one stays on the host:
+    # ``sources`` is ``k`` seeds, not a mesh-sized buffer (16-256 on the benchmark axis), so the
+    # copy is bytes and a ``tw.reduce.minmax`` launch costs more than it saves at every realistic
+    # ``k``. No gain on CUDA at any size is the reason, not the CPU cost.
     sources_np = sources.numpy()
     if sources_np.min() < 0 or int(sources_np.max()) >= node_count:
         raise ValueError(

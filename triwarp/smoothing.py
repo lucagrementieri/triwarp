@@ -30,7 +30,6 @@ from __future__ import annotations
 import math
 from typing import NamedTuple
 
-import numpy as np
 import warp as wp
 import warp.optim.linear as wpl
 import warp.sparse as wps
@@ -1096,9 +1095,10 @@ def refine_and_smooth_region(
 
     n = int(vertices.shape[0])
     # New (interior patch) vertices are the tail appended by subdivision, minus mesh-boundary verts.
-    new_verts_np = np.zeros(n, dtype=bool)
-    new_verts_np[n_vertices_before:] = True
-    new_verts = wp.array(new_verts_np, dtype=wp.bool, device=device)
+    new_verts = wp.zeros(n, dtype=wp.bool, device=device)
+    # Warp rejects a zero-length slice, and subdivision may have added no vertices at all.
+    if n > n_vertices_before:
+        new_verts[n_vertices_before:].fill_(True)
     bd_mask = _boundary_verts_mask(vertices, faces)
     free = wp.empty(n, dtype=wp.bool, device=device)
     wp.map(kernel_array.mask_and_not, new_verts, bd_mask, out=free)
@@ -1114,7 +1114,10 @@ def refine_and_smooth_region(
         incident = tw.selection.expand_vertex_mask(faces, incident, 5)
         incident = tw.selection.shrink_vertex_mask(faces, incident, 2)
         incident = tw.selection.exclude_fully_selected_components(faces, incident, n)
-        if bool(incident.numpy().any()):
+        # A 1-byte-per-vertex copy is cheap, so this is the latest crossover of the reduction
+        # family: measured on CUDA 0.65x at 400k vertices, 1.09x at 1M, 1.65x at 2M, 3.23x at 8M.
+        # Taken on the CUDA number per the GPU-first rule; the losing sizes are sub-0.1 ms.
+        if tw.reduce.any(incident):
             bd_mask = _boundary_verts_mask(vertices, faces)
             free2 = wp.empty(n, dtype=wp.bool, device=device)
             wp.map(kernel_array.mask_and_not, incident, bd_mask, out=free2)

@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import math
 import secrets
+from collections.abc import Sequence
 
 import numpy as np
 import warp as wp
@@ -286,7 +287,7 @@ _DODECAHEDRON_FACES = np.array(
 def box(
     extents: tuple[float, float, float] | None = None,
     transform: wp.mat44 | wp.array[wp.mat44] | None = None,
-    bounds: np.ndarray | None = None,
+    bounds: Sequence[Sequence[float]] | None = None,
     device: wp.DeviceLike = None,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
@@ -694,7 +695,7 @@ def uv_sphere(
         latitude, longitude = int(counts[0]), int(counts[1]) * 2
 
     radius_f = abs(float(radius))
-    theta = np.linspace(0.0, np.pi, num=latitude)
+    theta = np.linspace(0.0, math.pi, num=latitude)
     profile = np.column_stack((np.sin(theta), -np.cos(theta))) * radius_f
     # Snap the poles: sin(0) is exact but sin(pi) is not (see Notes).
     profile[0] = (0.0, -radius_f)
@@ -866,7 +867,7 @@ def capsule(
 
     height_f = abs(float(height))
     radius_f = abs(float(radius))
-    theta = np.linspace(-np.pi / 2.0, np.pi / 2.0, latitude)
+    theta = np.linspace(-math.pi / 2.0, math.pi / 2.0, latitude)
     profile = np.column_stack((np.cos(theta), np.sin(theta))) * radius_f
     half = len(profile) // 2
     profile[:half, 1] -= height_f / 2.0
@@ -882,7 +883,7 @@ def cylinder(
     radius: float,
     height: float | None = None,
     sections: int | None = None,
-    segment: np.ndarray | None = None,
+    segment: Sequence[Sequence[float]] | None = None,
     transform: wp.mat44 | wp.array[wp.mat44] | None = None,
     device: wp.DeviceLike = None,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
@@ -980,7 +981,7 @@ def annulus(
     height: float | None = None,
     sections: int | None = None,
     transform: wp.mat44 | wp.array[wp.mat44] | None = None,
-    segment: np.ndarray | None = None,
+    segment: Sequence[Sequence[float]] | None = None,
     device: wp.DeviceLike = None,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
@@ -1089,7 +1090,7 @@ def torus(
     [`trimesh.creation.torus`][]
     """
     minor_f = float(minor_radius)
-    phi = np.linspace(0.0, 2.0 * np.pi, int(minor_sections) + 1, endpoint=True)
+    phi = np.linspace(0.0, 2.0 * math.pi, int(minor_sections) + 1, endpoint=True)
     profile = np.column_stack((minor_f * np.cos(phi), minor_f * np.sin(phi)))
     profile += (float(major_radius), 0.0)
     profile[-1] = profile[0]
@@ -1621,8 +1622,11 @@ def sweep_polygon(
             f"for {stride} vertices"
         )
 
-    path_np = path.numpy().astype(np.float64)
-    closed = bool(np.linalg.norm(path_np[0] - path_np[-1]) < TOLERANCE_MERGE)
+    # Two 12-byte endpoint reads decide whether the path closes; the rest of it never leaves the
+    # device. Both slices are contiguous prefixes/suffixes, so the readbacks are exact.
+    first = path[:1].numpy()[0]
+    last = path[n_path - 1 :].numpy()[0]
+    closed = math.dist(first.tolist(), last.tolist()) < TOLERANCE_MERGE
     connect_closed = closed and connect
 
     normals = wp.empty(n_path, dtype=wp.vec3, device=device)
@@ -1747,17 +1751,11 @@ def truncated_prisms(
 
     out_vertices = wp.empty(6 * n_faces, dtype=wp.vec3, device=device)
     out_faces = wp.empty(24 * n_faces, dtype=wp.int32, device=device)
+    to_plane = wp.mat44(*transform_np.flatten().tolist())
     wp.launch(
         kernel_creation.truncated_prism_geometry,
         dim=n_faces,
-        inputs=[
-            vertices,
-            faces,
-            wp.mat44(*transform_np.flatten().tolist()),
-            wp.mat44(*np.linalg.inv(transform_np).flatten().tolist()),
-            out_vertices,
-            out_faces,
-        ],
+        inputs=[vertices, faces, to_plane, wp.inverse(to_plane), out_vertices, out_faces],
         device=device,
     )
     return out_vertices, out_faces
@@ -1888,7 +1886,7 @@ def random_soup(
 # --- private helpers ---------------------------------------------------------------------
 
 
-def _segment_to_cylinder(segment: np.ndarray) -> tuple[wp.mat44, float]:
+def _segment_to_cylinder(segment: Sequence[Sequence[float]]) -> tuple[wp.mat44, float]:
     """Convert a 3D line segment to the transform and height of a Z-extruded origin cylinder."""
     segment_np = np.asanyarray(segment, dtype=np.float64)
     if segment_np.shape != (2, 3):
@@ -1935,7 +1933,7 @@ def _apply_transform(
         inputs=[vertices, matrix, vertices],
         device=device,
     )
-    if float(np.linalg.det(_transform_to_numpy(transform)[:3, :3])) < 0.0:
+    if _reverses_winding(transform):
         wp.launch(
             kernel_creation.reverse_face_winding,
             dim=int(faces.shape[0]) // 3,
@@ -1943,6 +1941,25 @@ def _apply_transform(
             device=device,
         )
     return vertices, faces
+
+
+def _reverses_winding(transform: wp.mat44 | wp.array[wp.mat44]) -> bool:
+    """Whether a transform mirrors, i.e. whether its rotation block has a negative determinant."""
+    # A wp.array argument costs one device-to-host synchronization: the winding fix is a host branch
+    # over a whole launch, so the matrix has to cross either way. A scalar wp.mat44 costs nothing.
+    matrix = transform.list()[0] if isinstance(transform, wp.array) else transform
+    rotation = wp.mat33(
+        matrix[0][0],
+        matrix[0][1],
+        matrix[0][2],
+        matrix[1][0],
+        matrix[1][1],
+        matrix[1][2],
+        matrix[2][0],
+        matrix[2][1],
+        matrix[2][2],
+    )
+    return float(wp.determinant(rotation)) < 0.0
 
 
 def _transform_to_numpy(transform: wp.mat44 | wp.array[wp.mat44]) -> np.ndarray:

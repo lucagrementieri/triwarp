@@ -31,7 +31,6 @@ from __future__ import annotations
 
 from typing import Literal
 
-import numpy as np
 import warp as wp
 
 import triwarp as tw
@@ -115,8 +114,8 @@ def closest_point_on_mesh(
             wp.empty(0, dtype=wp.int32, device=device),
         )
     if n_faces == 0:
-        nan_closest_np = np.full((m, 3), np.nan, dtype=np.float32)
-        out_closest = wp.array(nan_closest_np, dtype=wp.vec3, device=device)
+        nan = float("nan")
+        out_closest = wp.full(m, wp.vec3(nan, nan, nan), dtype=wp.vec3, device=device)
         out_distance = wp.full(m, float("inf"), dtype=wp.float32, device=device)
         out_face = wp.full(m, -1, dtype=wp.int32, device=device)
         return out_closest, out_distance, out_face

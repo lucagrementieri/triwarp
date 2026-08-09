@@ -516,9 +516,11 @@ def cells(grid: wp.Volume, *, order: Literal["grid", "sorted"] = "grid") -> twt.
 
     # Shift only where a column actually goes negative, so a non-negative cell set keeps exactly
     # the keys ``grouping.hash_indices_rows`` would produce and therefore exactly its order.
+    # One readback of three integers per bound: the shift and the radix are host-side kernel
+    # arguments, so they have to cross either way.
     lower, upper = tw.reduce.minmax(rows, axis=0)
-    base = np.minimum(lower.numpy(), 0)
-    radix = int(upper.numpy().max() - base.min()) + 1
+    base = [min(int(x), 0) for x in lower.numpy().tolist()]
+    radix = max(int(x) for x in upper.numpy().tolist()) - min(base) + 1
     keys = wp.empty(n_voxels, dtype=wp.uint64, device=grid.device)
     wp.launch(
         kernel_voxels.pack_cell_keys,

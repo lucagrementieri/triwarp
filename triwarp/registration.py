@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 from typing import Literal, TypedDict, cast, overload
 
-import numpy as np
 import warp as wp
 
 import triwarp as tw
@@ -192,7 +191,10 @@ _ROBUST_KINDS: dict[str, int] = {"none": 0, "huber": 1, "tukey": 2}
 
 def _identity_mat44(device: wp.DeviceLike) -> wp.array[wp.mat44]:
     """Return a ``(1,)`` array holding the 4x4 identity transform."""
-    return wp.array(np.eye(4, dtype=np.float32)[None], dtype=wp.mat44, device=device)
+    identity = wp.mat44(
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0
+    )
+    return wp.array([identity], dtype=wp.mat44, device=device)
 
 
 def _resolve_initial(

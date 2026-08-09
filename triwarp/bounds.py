@@ -287,11 +287,10 @@ def oriented_bounding_box(
             f'objective must be "volume", "surface_area" or "diagonal", got {objective!r}'
         )
 
-    identity = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
     n = int(points.shape[0])
     if n == 0:
         return (
-            identity,
+            wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
             wp.vec3(math.inf, math.inf, math.inf),
             wp.vec3(-math.inf, -math.inf, -math.inf),
         )

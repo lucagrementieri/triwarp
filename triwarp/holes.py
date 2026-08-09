@@ -856,27 +856,52 @@ def fill_small(
     return _fill_packed_loops(vertices, faces, packed, "plane_normalized", True, True)
 
 
-def _mean_rim_edge_length(vertices: wp.array[wp.vec3], loops: list[wp.array[wp.int32]]) -> float:
-    """Mean edge length over the rims of the given loops (the derived subdivision target)."""
-    total = 0.0
-    count = 0
-    vertices_np = vertices.numpy()
-    for loop in loops:
-        loop_np = loop.numpy()
-        pos = vertices_np[loop_np]
-        seg = np.linalg.norm(pos - np.roll(pos, -1, axis=0), axis=1)
-        total += float(seg.sum())
-        count += int(seg.shape[0])
-    return total / count if count > 0 else 0.0
+def _mean_rim_edge_length(
+    vertices: wp.array[wp.vec3], loops: _PackedLoops | list[wp.array[wp.int32]]
+) -> float:
+    """
+    Mean edge length over the rims of the given loops (the derived subdivision target).
+
+    Every rim is closed, so its edge count is its vertex count and the mean is the total perimeter
+    over ``sum(sizes)`` -- which makes this one
+    [`_loop_perimeters`][triwarp.holes._loop_perimeters] launch plus its one readback, the same
+    measurement [`fill_small`][triwarp.holes.fill_small] already pays. A list is accepted because
+    [`triwarp.combine.stitch_smooth`][triwarp.combine.stitch_smooth] holds its two rims
+    individually; it is packed here rather than at that call site so the private surface stays one
+    name wide.
+
+    It used to read back the whole vertex buffer plus one array per loop and take the norms on the
+    host. Measured back-to-back, punching a hole every 97th face: on ``bunny`` 32.0 ms -> 0.13 ms
+    (253x) on CUDA and 8.3 -> 0.07 (111x) on CPU; on ``dragon``'s 8 978 loops, 427 ms -> 0.22 ms
+    (1 941x). End to end that is 1.13-1.30x of ``fill_smooth``, whose cubic DP dominates.
+
+    **The axis is the loop count, not the vertex buffer**, which the measurement said and the
+    obvious reading did not: on CPU the old form ran 0.09 ms flat from 8 k to 438 k vertices, so
+    ``vertices.numpy()`` there is a view and the "whole vertex buffer copy" it looked like never
+    existed -- what cost 427 ms on ``dragon`` was iterating 8 978 loops in Python, one ``.numpy()``
+    per loop. So this is deliberately **not** faster everywhere: at
+    [`stitch_smooth`][triwarp.combine.stitch_smooth]'s two rims it is a measured *loss* -- 0.26 ->
+    0.34 ms (0.77x) on CUDA and 0.09 -> 0.24 (0.38x) on CPU, since ``_pack_loops`` plus a launch
+    plus a readback cannot beat two host fancy-indexes. That is ~0.15 ms against the 100+ ms
+    refine-and-smooth pass its only caller runs immediately afterwards, so a loop-count threshold
+    would buy 0.15 % of one path at the cost of a per-device tuning constant, and is not worth it.
+    """
+    packed = loops if isinstance(loops, _PackedLoops) else _pack_loops(loops)
+    count = int(packed.sizes_np.sum())
+    if count == 0:
+        return 0.0
+    return float(_loop_perimeters(vertices, packed).sum()) / count
 
 
 def _patch_mask(
     n_faces_before: int, n_faces_after: int, device: wp.DeviceLike
 ) -> wp.array[wp.bool]:
     """Boolean face mask marking the trailing ``[n_faces_before, n_faces_after)`` fill faces."""
-    mask = np.zeros(n_faces_after, dtype=bool)
-    mask[n_faces_before:] = True
-    return wp.array(mask, dtype=wp.bool, device=device)
+    mask = wp.zeros(n_faces_after, dtype=wp.bool, device=device)
+    # Warp rejects a zero-length slice, and the "nothing was filled" caller passes an empty range.
+    if n_faces_after > n_faces_before:
+        mask[n_faces_before:].fill_(True)
+    return mask
 
 
 def fill_smooth(
@@ -1002,9 +1027,7 @@ def fill_smooth(
         result = (wp.clone(vertices), faces_filled)
         return (*result, patch_mask) if return_patch else result
 
-    target_edge = (
-        max_edge if max_edge is not None else _mean_rim_edge_length(vertices, _unpack_loops(packed))
-    )
+    target_edge = max_edge if max_edge is not None else _mean_rim_edge_length(vertices, packed)
     new_vertices, new_faces, out_patch = tw.smoothing.refine_and_smooth_region(
         vertices,
         faces_filled,

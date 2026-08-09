@@ -169,3 +169,28 @@ def test_fill_min_weight_chords(bench_case: BenchCase, resolve_multiple_edges: b
         rounds=_ROUNDS,
     )
     assert result.shape[0] >= faces.shape[0]
+
+
+@pytest.mark.benchmark(group="fill_smooth")
+@pytest.mark.benchaxis("loops_dp")
+@pytest.mark.benchlibs("triwarp")
+@pytest.mark.parametrize("triangulate_only", [True, False], ids=["dp_only", "refined"])
+def test_fill_smooth(bench_case: BenchCase, triangulate_only: bool) -> None:
+    """
+    What refinement and smoothing cost on top of the DP that produced the patch.
+
+    The ``dp_only`` row is ``fill_min_weight`` plus the patch mask, so the gap to ``refined`` is the
+    whole refine-and-smooth stage. Parametrizing rather than timing only the full call is what makes
+    that stage attributable: on the ``loops_dp`` axis the cubic DP dominates ``rim_short``, so a
+    single ``refined`` number cannot say whether a change moved the DP or the smoothing.
+
+    ``max_edge`` is deliberately left at ``None`` so the default target-edge derivation is inside
+    the timed callable -- it is the one part of this path whose cost scales with the *mesh* rather
+    than with the rims, and leaving it out would hide a regression there.
+    """
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    result = bench_case.run(
+        lambda: tw.holes.fill_smooth(vertices, faces, triangulate_only=triangulate_only),
+        rounds=_ROUNDS,
+    )
+    assert result[1].shape[0] >= faces.shape[0]

@@ -78,6 +78,47 @@ For element-wise dtype conversion of `wp.array` buffers at Python scope, allocat
 
 Inside kernels, keep using `wp.cast(expr, TargetType)` for scalar and vector conversions.
 
+### NumPy at Python scope is sanctioned; leaking it through the API is not
+
+`warp-lang` carries an unconditional `Requires-Dist: numpy` and `import warp` loads it eagerly, and
+`wp.array(list, dtype=...)` itself ends in `np.asarray` inside
+`warp._src.types.array._init_from_data`. So NumPy is present wherever triwarp runs, it is a declared
+core dependency in `pyproject.toml`, and deleting `import numpy as np` from a wrapper shrinks
+nothing — it only moves the same NumPy call into Warp, more slowly. **Do not open a "remove NumPy"
+pass**; 13 modules import it and that is correct. Host-side metadata math (offset scans, launch
+dims, per-loop sizes, small candidate tables) and host-*sequential* algorithms (patience sorting in
+`combine`, DP traceback in `holes`, `lexsort` Delaunay in `reconstruction`, `argsort` +
+`searchsorted` chain linking in `intersection`, the procedural mesh templates in `creation`) stay in
+NumPy: they are not device work, and porting them buys Python loops.
+
+Three things are still defects:
+
+- **A public signature or return that names `np.ndarray`**, which forces the dependency on the
+  *caller*. Return `wp.mat33d` / `wp.vec3` (`totals.moments` returns the inertia tensor as
+  `wp.mat33d` — `wp.mat33` would discard the `float64` digits the integrals exist to keep); annotate
+  inputs `Sequence[Sequence[float]]` when the body is a duck-typed `np.asanyarray`, which is
+  *widening*, since the old annotation was narrower than the implementation. The one sanctioned
+  exception is `triwarp/io.py`, where meshio hands back `np.ndarray` unconditionally and NumPy-in is
+  `mesh_from_numpy`'s entire purpose.
+- **NumPy standing in for a Warp Python-scope equivalent that exists.** `wp.full`,
+  `arr[k:].fill_()`, `wp.array([wp.mat44(...)])`, `wp.determinant`, `wp.inverse`, `wp.transpose` and
+  `wp.svd3` all work at Python scope (verified on 1.16) and need no host buffer; `arr.list()[0]`
+  gives a row-indexable `wp.mat44` from a `wp.array[wp.mat44]`. `math.pi` / `float("nan")` /
+  `float("inf")` beat `np.pi` / `np.nan` / `np.inf`. Two traps: **`wp.svd3` is not a substitute for
+  `np.linalg.svd` of a non-square matrix** — `creation._align_vectors` takes the SVD of a `(3, 1)`
+  for basis completion and its free rotation about the axis is a *gauge* the trimesh comparison
+  pins element-wise; and **Warp raises on a zero-length slice** (`RuntimeError: Invalid indexing in
+  slice: 20:20:1`), so a trailing-mask `fill_` needs an `if stop > start` guard where the NumPy
+  version silently no-opped.
+- **NumPy reducing a full `.numpy()` readback** — `.min()`, `.max()`, `.any()`, `.sum(axis=0)` — is a
+  §13 defect wearing NumPy's clothes: the whole array crossed the bus to produce one scalar. Use
+  `triwarp.reduce` (or `wp.utils.array_sum`, which reduces a `wp.vec3d` array componentwise and so
+  needs no kernel of its own), and check whether a kernel for it already exists before writing one —
+  `holes._mean_rim_edge_length` was reading back the entire vertex buffer while `_loop_perimeters`,
+  three hundred lines up in its own file, already computed the answer on the device. **Decide these
+  on the CUDA measurement and accept the CPU regression** (§13), but keep the host path where the
+  buffer never scales with the mesh, as `graph.bfs_multi_source`'s `k`-element source check does.
+
 ### Elementwise ops at Python scope (`wp.map`, Warp 1.15+ — prefer over trivial map kernels)
 
 Do **not** write a `@wp.kernel` whose body is only `out[i] = f(in[i], ...)`. Keep the op as a
@@ -670,6 +711,32 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
 - **Verify values, not just timing.** This is the §4 gather warning generalised: the *wrong*
   implementation is frequently the faster one, because it reads less. Every perf change must keep
   its parity / regression test green, which means a function about to be optimized needs one first.
+- **CUDA is the target; a CPU regression is an acceptable price for a GPU win.** triwarp exists to
+  run geometry on the GPU, so when the two devices disagree, **decide on the CUDA number.** Do not
+  reject a device-side change because Warp's CPU backend is slower at it — Warp's CPU reductions run
+  ~1 lane per block while NumPy's are vectorized C, so a host readback plus NumPy wins on CPU almost
+  every time and would veto nearly every reduction if it were allowed a vote. Still *measure* both
+  (the CPU path must stay correct, and the ratio belongs in the comment), and still decline a change
+  that wins nowhere. Worked example — the seven candidate sites in the "NumPy reducing a full
+  readback" sweep: on CPU, four lose 4-25x and only `moments` / `_mean_rim_edge_length` win outright,
+  so a CPU-decided sweep converts two. On CUDA **all seven** win once the array is big enough, with
+  crossovers spread over 100k-1M elements — so the CUDA-decided sweep converts seven and leaves five
+  fewer defects. The case to imitate when declining is the *eighth* site,
+  `graph.bfs_multi_source`: it keeps its host range check because `sources` is `k` seeds and never
+  grows with the mesh, so there is no GPU gain to be had at any size — **"no gain on CUDA" is the
+  reason to decline, not "slower on CPU."**
+- **A device reduction costs ~0.1–0.3 ms flat on CUDA; a readback costs bytes.** The crossover is
+  wherever the copy exceeds ~0.15 ms, which measured out at ~200k `int32`, ~200k `float32`,
+  ~1M `bool` and ~16k `vec3d` elements. Below it a reduction launch is pure overhead; above it the
+  readback grows without bound (`.numpy().sum(axis=0)` over `(n_faces,)` `vec3d` moves 72 B/face —
+  33.6 ms on `dragon`, against 0.19 ms for four `wp.utils.array_sum` calls). So size the array
+  before reaching for either, and prefer the reduction on any buffer that scales with the mesh.
+- **Interleave A and B in one loop, and read the `min`.** Timing all of A then all of B lets GPU
+  clock state decide the winner: the first pass of this same sweep produced non-monotonic ratios
+  (8.4x, 0.03x, 4.35x for one site across three sizes) and a recurring ~2.27 ms artifact, which
+  reversed into a clean monotonic trend once the variants were interleaved under one clock state
+  with the GPU pre-warmed. Report the `min` alongside the median: a one-off Warp kernel compile or a
+  scheduler hiccup inflates a median but cannot deflate a minimum.
 - **Cost model for wrappers.** Host-side Python is a real cost: ~11 µs per cached `wp.map` call,
   ~32 µs of launch marshalling per `wp.launch` (measured in `combine.concatenate`), ~0.1 ms per
   host readback, against 0.9–2.4 ms for a full extra device pass on a mid-size mesh. So: collapse
@@ -711,6 +778,9 @@ convention the package already holds to.
   - A documented validation must actually be performed, or the claim goes.
   - Annotations must cover every rank and dtype the docstring claims and the body supports (a
     docstring promising rank-2 support needs an annotation that admits rank 2).
+- **No public signature or return type may name `np.ndarray`**, outside `triwarp/io.py` where
+  meshio makes it unavoidable — a caller should not need NumPy to *consume* a triwarp answer. See
+  §4 for what to use instead, and for why internal host-side NumPy is fine.
 - **A guard must encode a real limitation.** When the implementation is naturally rank- or
   dtype-agnostic — a flatten/reshape, a generic `@wp.func` — drop the `ensure_ndim` cap and widen
   the annotation instead of validating a restriction that is not there.

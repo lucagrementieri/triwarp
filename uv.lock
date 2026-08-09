@@ -2562,13 +2562,13 @@ name = "triwarp"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "numpy" },
     { name = "warp-lang" },
 ]
 
 [package.optional-dependencies]
 io = [
     { name = "meshio" },
-    { name = "numpy" },
 ]
 
 [package.dev-dependencies]
@@ -2629,7 +2629,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "meshio", marker = "extra == 'io'", specifier = ">=5.0" },
-    { name = "numpy", marker = "extra == 'io'", specifier = ">=1.20" },
+    { name = "numpy", specifier = ">=1.20" },
     { name = "warp-lang", specifier = ">=1.16" },
 ]
 provides-extras = ["io"]

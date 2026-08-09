@@ -161,8 +161,12 @@ def test_moments(request: pytest.FixtureRequest, mesh_name: str):
         [center_wp.x, center_wp.y, center_wp.z], mesh_tm.center_mass, rtol=1e-4, atol=1e-5
     )
     scale = float(np.abs(np.asarray(inertia_igl)).max())
-    assert np.abs(inertia_wp - np.asarray(inertia_igl)).max() < 1e-5 * scale
-    assert np.abs(inertia_wp - mesh_tm.moment_inertia).max() < 1e-5 * scale
+    assert (
+        np.abs(np.asarray(inertia_wp).reshape(3, 3) - np.asarray(inertia_igl)).max() < 1e-5 * scale
+    )
+    assert (
+        np.abs(np.asarray(inertia_wp).reshape(3, 3) - mesh_tm.moment_inertia).max() < 1e-5 * scale
+    )
 
 
 def test_moments_center_of_mass_differs_from_the_surface_centroid(
@@ -216,7 +220,9 @@ def test_moments_translation_shifts_only_the_center(device: str):
         np.array([center_a.x, center_a.y, center_a.z]) + offset_np,
         atol=1e-5,
     )
-    assert np.abs(inertia_a - inertia_b).max() < 1e-4 * float(np.abs(inertia_a).max())
+    assert np.abs(np.asarray(inertia_a) - np.asarray(inertia_b)).max() < 1e-4 * float(
+        np.abs(np.asarray(inertia_a)).max()
+    )
 
 
 def test_moments_empty(device: str):
@@ -225,7 +231,7 @@ def test_moments_empty(device: str):
     volume, center, inertia = tw.totals.moments(vertices_wp, faces_wp)
     assert volume == 0.0
     assert np.isnan([center.x, center.y, center.z]).all()
-    assert np.array_equal(inertia, np.zeros((3, 3)))
+    assert np.array_equal(np.asarray(inertia).reshape(3, 3), np.zeros((3, 3)))
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
