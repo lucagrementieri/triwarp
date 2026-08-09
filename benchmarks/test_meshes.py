@@ -40,6 +40,7 @@ _TOPOLOGY: dict[str, tuple[int, bool, int, int]] = {
     "fan_hub": (1, True, 0, 40_960),
     "rim_long": (1, False, 2, 3),
     "holes_many": (1, False, 512, 6),
+    "holes_dense": (1, False, 8_192, 6),
     "rim_short": (1, False, 2, 3),
     "saddle_small": (1, False, 1, 6),
     "saddle": (1, False, 1, 6),

@@ -128,6 +128,12 @@ RIM_SHORT = 512
 N_PUNCHED_HOLES = 512
 _PUNCH_SEED = 0
 
+# Holes in ``holes_dense``: the same sphere as ``holes_many`` with 16x the loops, for the costs
+# whose axis is the loop count itself (per-loop host readbacks). 8 192 is near the ceiling the
+# vertex-disjoint greedy punch can reach on the 40 962-vertex sphere, and it matches the ~9k-loop
+# scale where the per-loop form of the rim measurement was measured at hundreds of milliseconds.
+N_DENSE_HOLES = 8_192
+
 # Grid resolutions for the saddle patches: ``k x k`` vertices give ``2 * (k - 1) ** 2`` faces.
 SADDLE_SMALL, SADDLE_MEDIUM = 68, 133
 
@@ -307,6 +313,7 @@ FEATURE_MESHES: list[MeshSpec] = [
     _mesh("fan_hub", "", 40_962, 81_920, "valence"),
     _mesh("rim_long", "", 131_072, 131_072, "loops"),
     _mesh("holes_many", "", 40_962, 81_408, "loops"),
+    _mesh("holes_dense", "", 40_962, 73_728, "loops_dense"),
     _mesh("rim_short", "", 1_024, 1_024, "loops_dp"),
     _mesh("saddle_small", "", 4_624, 8_978, "patch"),
     _mesh("saddle", "", 17_689, 34_848, "patch"),
@@ -328,6 +335,7 @@ BUILDERS: dict[str, Callable[[], _Arrays]] = {
     "fan_hub": lambda: _cone_fan(40_960),
     "rim_long": lambda: _open_cylinder(RIM_LONG),
     "holes_many": lambda: _punched_sphere(6, N_PUNCHED_HOLES),
+    "holes_dense": lambda: _punched_sphere(6, N_DENSE_HOLES),
     "rim_short": lambda: _open_cylinder(RIM_SHORT),
     "saddle_small": lambda: _saddle(SADDLE_SMALL),
     "saddle": lambda: _saddle(SADDLE_MEDIUM),
@@ -358,6 +366,9 @@ AXES: dict[str, tuple[str, ...]] = {
     "loops": ("sphere_med", "rim_long", "holes_many"),
     # The same contrast at a scale the O(B^3) hole-filling DP can actually run.
     "loops_dp": ("rim_short", "holes_many"),
+    # Loop count 512 -> 8 192 on the *same* 40 962-vertex sphere: the pure per-loop-cost axis,
+    # for work that scales with how many rims there are rather than with their length or the mesh.
+    "loops_dense": ("holes_many", "holes_dense"),
     # Worst aspect ratio 1.6 -> 4 719 at identical V, F and connectivity.
     "quality": ("saddle", "saddle_graded"),
     # Disk-topology solver inputs: flat and curved, small to medium.

@@ -36,6 +36,11 @@ the long rims and ~3.0x on the short ones, so it narrows the axis without invert
 ``fill_fan`` runs on the wider **loops** axis instead, because it has no DP and so can afford
 ``rim_long``'s 65 536-vertex rims -- it is the floor this module's cost is measured against.
 
+One cost the ``loops_dp`` pair cannot see is the default subdivision-target derivation inside
+``fill_smooth``: its axis is the raw loop *count*, and 512 loops is too few for it to register
+against the DP. ``fill_smooth_target_edge`` runs that one path on the **loops_dense** axis
+(512 -> 8 192 loops on the same vertex buffer) instead.
+
 References
 ----------
 **trimesh**'s ``repair.fill_holes`` is a much weaker algorithm (it fans triangles across small
@@ -192,5 +197,33 @@ def test_fill_smooth(bench_case: BenchCase, triangulate_only: bool) -> None:
     result = bench_case.run(
         lambda: tw.holes.fill_smooth(vertices, faces, triangulate_only=triangulate_only),
         rounds=_ROUNDS,
+    )
+    assert result[1].shape[0] >= faces.shape[0]
+
+
+@pytest.mark.benchmark(group="fill_smooth_target_edge")
+@pytest.mark.benchaxis("loops_dense")
+@pytest.mark.benchlibs("triwarp")
+@pytest.mark.parametrize("derive_target", [True, False], ids=["derived", "explicit"])
+def test_fill_smooth_target_edge(bench_case: BenchCase, derive_target: bool) -> None:
+    """
+    What deriving the default subdivision target costs as the loop count grows.
+
+    ``fill_smooth(max_edge=None)`` measures every rim to pick its target edge, and that
+    measurement's axis is the loop *count* -- not the rim length, and not the mesh size -- which
+    the ``loops_dp`` meshes cap at 512, too few to register against the DP. The ``loops_dense``
+    axis holds the vertex buffer fixed and multiplies the loop count by 16, and the gap between
+    the ``derived`` and ``explicit`` rows is exactly the derivation. Interleaved A/B at 8 192
+    loops on CUDA: within noise (100.3 against 101.7 ms min), against ~0.4 s of per-loop
+    ``.numpy()`` readbacks in the form it replaced -- the regression this group exists to catch,
+    and one that lands in the *min* (deterministic host cost), where this box's occasional 3x
+    clock-state excursions do not. ``explicit`` passes the mesh's mean edge length, which on a
+    punched sphere is the value the derivation returns anyway, so the refine stage does identical
+    work in both rows.
+    """
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    max_edge = None if derive_target else bench_case.mean_edge
+    result = bench_case.run(
+        lambda: tw.holes.fill_smooth(vertices, faces, max_edge=max_edge), rounds=_ROUNDS
     )
     assert result[1].shape[0] >= faces.shape[0]

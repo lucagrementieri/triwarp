@@ -354,6 +354,26 @@ def test_sample_volume_not_watertight(half_torus: tuple[tm.Trimesh, wp.Mesh]):
         tw.sample.sample_volume(mesh_wp.points, mesh_wp.indices, 100)
 
 
+def test_sample_volume_zero_volume(device: str):
+    # A doubled triangle (the same face with both windings) is edge-manifold with no boundary
+    # edges, so it passes the watertight gate, yet it encloses nothing: the surface centroid is
+    # coplanar with both faces, so every fanned tetrahedron has a signed volume of exactly 0.0.
+    vertices_wp = wp.array(
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]), dtype=wp.vec3, device=device
+    )
+    faces_wp = wp.array([0, 1, 2, 0, 2, 1], dtype=wp.int32, device=device)
+    with pytest.raises(ValueError, match="zero volume"):
+        tw.sample.sample_volume(vertices_wp, faces_wp, 100)
+
+
+def test_sample_volume_not_star_shaped(torus: tuple[tm.Trimesh, wp.Mesh]):
+    # Watertight with positive total volume, but fanning tetrahedra from the centroid (the hole
+    # of the torus) makes the inner half of the tube contribute negative signed volumes.
+    _, mesh_wp = torus
+    with pytest.raises(ValueError, match="star-shaped"):
+        tw.sample.sample_volume(mesh_wp.points, mesh_wp.indices, 100)
+
+
 def test_sample_fibonacci_sphere_unit(device: str):
     directions_wp = tw.sample.sample_fibonacci_sphere(1000, device=device)
     directions_np = directions_wp.numpy()
