@@ -490,6 +490,36 @@ def test_make_winding_consistent(bench_case: BenchCase) -> None:
         assert len(bench_case.run(fix_winding_tm).faces) == bench_case.n_faces
 
 
+@pytest.mark.benchmark(group="make_volume")
+@pytest.mark.benchlibs("triwarp", "trimesh")
+def test_make_volume(bench_case: BenchCase) -> None:
+    """
+    Orient the whole surface outward: one watertightness predicate, one reduction, one flip pass.
+
+    ``trimesh.repair.fix_inversion`` is the same operation and the same decision -- is the mesh
+    closed, and is its signed volume negative -- so the two are directly comparable. It mutates the
+    mesh in place and caches the volume on it, so the ``tm.Trimesh`` is rebuilt inside the timed
+    callable as the other trimesh rows here do.
+
+    The scan meshes are open, so both sides take the "not watertight, return unchanged" path and
+    what this row prices is the *test*, which is the point: the watertightness check dominates a
+    call that would otherwise be one reduction and one relabel.
+    """
+    if bench_case.kind == "triwarp":
+        vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+        oriented = bench_case.run(lambda: tw.repair.make_volume(vertices, faces))
+        assert int(oriented.shape[0]) == faces.shape[0]
+    else:  # trimesh mutates in place and caches the volume: rebuild inside the timed callable
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+
+        def fix_inversion_tm() -> tm.Trimesh:
+            mesh_tm = tm.Trimesh(vertices_np, faces_np, process=False)
+            tm.repair.fix_inversion(mesh_tm)
+            return mesh_tm
+
+        assert len(bench_case.run(fix_inversion_tm).faces) == bench_case.n_faces
+
+
 @pytest.mark.benchmark(group="bad_face_mask")
 @pytest.mark.benchaxis("quality")
 @pytest.mark.benchlibs("triwarp", "pymeshlab")

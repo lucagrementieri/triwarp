@@ -200,3 +200,32 @@ def test_sample_surface_blue_noise(bench_case: BenchCase, radius_scale: float) -
         mesh_o3d = bench_case.mesh_o3d
         cloud = bench_case.run(lambda: mesh_o3d.sample_points_poisson_disk(number_of_points=target))
         assert len(cloud.points) == target
+
+
+@pytest.mark.benchmark(group="sample_volume")
+@pytest.mark.benchmeshes("sphere_small", "sphere_med", "sphere_large")
+@pytest.mark.benchlibs("triwarp")
+@pytest.mark.parametrize("count", _UNIFORM_COUNTS, ids=["n10k", "n100k"])
+def test_sample_volume(bench_case: BenchCase, count: int) -> None:
+    """
+    Uniform sampling *inside* a closed mesh: the tetrahedron-fan CDF and one draw kernel.
+
+    triwarp-only, and deliberately so. ``trimesh.sample.volume_mesh`` is rejection sampling against
+    a ray-parity containment test, so it returns a *variable* number of points for a requested
+    count and its cost is set by the mesh's fill ratio rather than by the count; timing the two
+    against each other would compare an exact method with a stochastic one. The fan decomposition
+    here has zero rejection on a star-shaped mesh, which is the precondition the wrapper enforces.
+
+    Read this row as the fixed cost of the prologue against the per-sample cost: the fan is one
+    per-face kernel, two reductions and a scan, all flat in ``count``, so the slope across the two
+    counts is the sampling kernel alone, and the mesh axis moves only the prologue.
+
+    The meshes are named rather than taken from the scan sweep because the decomposition needs a
+    **closed, star-shaped** surface: the wrapper rejects a non-watertight mesh outright and refuses
+    any mesh whose fan from the centroid produces a negative tetrahedron, which rules out every
+    scan mesh (``bunny`` and ``dragon`` are open scans). The three spheres satisfy both by
+    construction and span 5k to 328k faces.
+    """
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    points = bench_case.run(lambda: tw.sample.sample_volume(vertices, faces, count, seed=_SEED))
+    assert points.shape == (count,)

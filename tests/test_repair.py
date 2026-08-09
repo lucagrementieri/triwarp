@@ -484,6 +484,7 @@ def test_make_winding_consistent_idempotent(icosahedron: tuple[tm.Trimesh, wp.Me
     assert np.array_equal(_faces_2d(repaired_wp), _faces_2d(mesh_wp.indices))
 
 
+@pytest.mark.parity("make_volume", "trimesh")
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
 def test_make_volume_repairs_inversion(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
