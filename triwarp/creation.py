@@ -49,7 +49,6 @@ Differences from `trimesh.creation` that apply module-wide:
 from __future__ import annotations
 
 import math
-import secrets
 from collections.abc import Sequence
 
 import numpy as np
@@ -1881,7 +1880,7 @@ def random_soup(
     n = 3 * max(int(face_count), 0)
     vertices = wp.empty(n, dtype=wp.vec3, device=device)
     if n > 0:
-        resolved_seed = secrets.randbelow(2**31) if seed is None else int(seed)
+        resolved_seed = tw.sample.resolve_seed(seed)
         wp.launch(
             kernel_creation.random_soup_vertices,
             dim=n,

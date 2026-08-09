@@ -199,7 +199,7 @@ def voxelize_mesh(
 
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
-    voxel_size, origin = _resolve_grid(vertices, voxel_size, origin, "voxelize_mesh")
+    voxel_size, origin = resolve_voxel_grid(vertices, voxel_size, origin, caller="voxelize_mesh")
     if n_faces == 0:
         return _empty_grid(voxel_size, origin, device)
 
@@ -292,7 +292,7 @@ def voxelize_points(
     [`cell_indices`][triwarp.voxels.cell_indices]
     """
     device = points.device
-    voxel_size, origin = _resolve_grid(points, voxel_size, origin, "voxelize_points")
+    voxel_size, origin = resolve_voxel_grid(points, voxel_size, origin, caller="voxelize_points")
     if int(points.shape[0]) == 0:
         return _empty_grid(voxel_size, origin, device)
     return from_cells(cell_indices(points, voxel_size, origin=origin), voxel_size, origin)
@@ -614,6 +614,72 @@ def grid_transform(grid: wp.Volume) -> tuple[float, wp.vec3]:
     [`cell_centers`][triwarp.voxels.cell_centers]
     """
     return _require_index_grid(grid)
+
+
+def resolve_voxel_grid(
+    points: wp.array[wp.vec3],
+    voxel_size: float | None = None,
+    origin: wp.vec3 | None = None,
+    *,
+    caller: str = "resolve_voxel_grid",
+) -> tuple[float, wp.vec3]:
+    """
+    Voxel size and grid origin for a point set, filling in either default from its bounding box.
+
+    The package's one definition of what an unspecified voxel grid means: a cell of ``1 %`` of the
+    bounding-box diagonal, anchored half a cell below the box. That anchor is Open3D's, and keeping
+    it in one place is what lets ``voxelize_points``,
+    [`voxel_down_sample`][triwarp.voxels.voxel_down_sample] and
+    [`cluster_decimate`][triwarp.remesh.cluster_decimate] agree cell for cell -- they used to say so
+    in two comments instead.
+
+    Public because [`cluster_decimate`][triwarp.remesh.cluster_decimate] lives in another module and
+    needs the same convention; it is pure host arithmetic over one
+    [`aabb_bounds`][triwarp.bounds.aabb_bounds].
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` positions the grid must cover. An empty set yields a unit diagonal.
+    voxel_size
+        Edge length of a cell. ``None`` takes ``1 %`` of the bounding-box diagonal.
+    origin
+        Lower corner of cell ``(0, 0, 0)``. ``None`` places it half a cell below the box.
+    caller
+        Name used in the error message, so a caller's own name appears rather than this one.
+
+    Returns
+    -------
+    tuple[float, wp.vec3]
+        ``(voxel_size, origin)``, both resolved.
+
+    Raises
+    ------
+    ValueError
+        If ``voxel_size`` is not positive.
+
+    See Also
+    --------
+    [`voxelize_points`][triwarp.voxels.voxelize_points]
+    [`cell_indices`][triwarp.voxels.cell_indices]
+    [`cluster_decimate`][triwarp.remesh.cluster_decimate]
+    """
+    if voxel_size is None or origin is None:
+        if int(points.shape[0]) == 0:
+            lower = wp.vec3(0.0, 0.0, 0.0)
+            diagonal = 1.0
+        else:
+            lower, upper = tw.bounds.aabb_bounds(points)
+            diagonal = float(wp.length(upper - lower))
+        if voxel_size is None:
+            voxel_size = 0.01 * diagonal
+        if origin is None:
+            # Half a cell of slack below the box: Open3D's anchor, and the one
+            # ``remesh.cluster_decimate`` uses, so all three agree cell for cell.
+            origin = wp.vec3(*(float(lower[axis]) - 0.5 * voxel_size for axis in range(3)))
+    if voxel_size <= 0.0:
+        raise ValueError(f"{caller} requires voxel_size > 0, got {voxel_size}")
+    return voxel_size, origin
 
 
 def cell_indices(
@@ -1545,28 +1611,6 @@ def _empty_grid(voxel_size: float, origin: wp.vec3, device: wp.DeviceLike) -> wp
         point_mask=wp.zeros(1, dtype=wp.int32, device=device),
         device=device,
     )
-
-
-def _resolve_grid(
-    points: wp.array[wp.vec3], voxel_size: float | None, origin: wp.vec3 | None, caller: str
-) -> tuple[float, wp.vec3]:
-    """Fill in the ``voxel_size`` / ``origin`` defaults from the input's bounding box."""
-    if voxel_size is None or origin is None:
-        if int(points.shape[0]) == 0:
-            lower = wp.vec3(0.0, 0.0, 0.0)
-            diagonal = 1.0
-        else:
-            lower, upper = tw.bounds.aabb_bounds(points)
-            diagonal = float(wp.length(upper - lower))
-        if voxel_size is None:
-            voxel_size = 0.01 * diagonal
-        if origin is None:
-            # Half a cell of slack below the box: Open3D's anchor, and the one
-            # ``remesh.cluster_decimate`` uses, so all three agree cell for cell.
-            origin = wp.vec3(*(float(lower[axis]) - 0.5 * voxel_size for axis in range(3)))
-    if voxel_size <= 0.0:
-        raise ValueError(f"{caller} requires voxel_size > 0, got {voxel_size}")
-    return voxel_size, origin
 
 
 def _point_slots(grid: wp.Volume, points: wp.array[wp.vec3]) -> wp.array[wp.int32]:

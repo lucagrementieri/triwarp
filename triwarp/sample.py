@@ -227,7 +227,7 @@ def sample_surface(
     wp.launch(
         kernel_sample.sample_surface,
         dim=count,
-        inputs=[vertices, faces, cdf, _get_seed(seed), out_points, out_face_indices],
+        inputs=[vertices, faces, cdf, resolve_seed(seed), out_points, out_face_indices],
         device=vertices.device,
     )
     return out_points, out_face_indices
@@ -571,7 +571,7 @@ def sample_surface_blue_noise(
     nx = max(1, int(30.0 * expected))
 
     init_points, init_face_indices = sample_surface(vertices, faces, nx, seed=seed)
-    return _dart_throw_blue_noise(init_points, init_face_indices, radius, _get_seed(seed))
+    return _dart_throw_blue_noise(init_points, init_face_indices, radius, resolve_seed(seed))
 
 
 def sample_volume(
@@ -645,25 +645,35 @@ def sample_volume(
     wp.launch(
         kernel_sample.sample_volume_tetrahedra,
         dim=count,
-        inputs=[vertices, faces, center, cdf, _get_seed(seed), out_points],
+        inputs=[vertices, faces, center, cdf, resolve_seed(seed), out_points],
         device=vertices.device,
     )
     return out_points
 
 
-def _get_seed(seed: int | None) -> int:
+def resolve_seed(seed: int | None) -> int:
     """
-    Resolve an optional RNG seed to a concrete non-negative ``int32``-range seed.
+    Concrete non-negative ``int32``-range RNG seed, drawn at random when none was given.
+
+    Every generator in the package takes ``seed: int | None`` and means the same thing by it, so
+    the draw lives here rather than at each entry point. Public because
+    [`random_soup`][triwarp.creation.random_soup] needs the identical convention from another
+    module.
 
     Parameters
     ----------
     seed
-        User-provided seed, or ``None`` to draw a cryptographically random seed.
+        User-provided seed, or ``None`` to draw a cryptographically random one.
 
     Returns
     -------
     int
         ``seed`` unchanged when provided, otherwise a random value in ``[0, 2**31)``.
+
+    See Also
+    --------
+    [`sample_surface`][triwarp.sample.sample_surface]
+    [`random_soup`][triwarp.creation.random_soup]
     """
     if seed is None:
         return secrets.randbelow(2**31)

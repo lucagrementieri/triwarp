@@ -652,15 +652,11 @@ def cluster_decimate(
     if n_vertices == 0 or n_faces == 0:
         return wp.clone(vertices), wp.clone(faces)
 
-    lo, hi = tw.bounds.aabb_bounds(vertices)
-    if voxel_size is None:
-        voxel_size = 0.01 * float(wp.length(hi - lo))
-    if voxel_size <= 0.0:
-        raise ValueError(f"cluster_decimate requires voxel_size > 0, got {voxel_size}")
-
-    # Half a cell of slack below the box, so no vertex sits exactly on a cell boundary (Open3D's
-    # anchor, and what makes the two libraries agree cell for cell).
-    origin = lo - wp.vec3(0.5 * voxel_size, 0.5 * voxel_size, 0.5 * voxel_size)
+    # One definition of "the default voxel grid for these points", shared with ``triwarp.voxels``
+    # so the two modules cannot drift on the cell size or on Open3D's half-cell anchor.
+    voxel_size, origin = tw.voxels.resolve_voxel_grid(
+        vertices, voxel_size, caller="cluster_decimate"
+    )
     cells = tw.voxels.cell_indices(vertices, voxel_size, origin=origin)
     _unique_cells, labels = tw.grouping.unique_rows(cells, return_inverse=True)
     n_clusters = int(tw.reduce.max(labels)) + 1
