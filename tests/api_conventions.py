@@ -235,7 +235,6 @@ _HELPER_ORDER_ALLOWLIST: dict[str, frozenset[str]] = {
             "_apply_volume_constraint",
             "_boundary_verts_mask",
             "_edge_weight_matrix",
-            "_mesh_volume",
         }
     ),
     "texture": frozenset({"_check_uv_in_range"}),

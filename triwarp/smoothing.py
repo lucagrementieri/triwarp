@@ -59,26 +59,10 @@ def _apply_operator(
     )
 
 
-def _mesh_volume(positions: wp.array[wp.vec3d], faces: wp.array[wp.int32]) -> float:
-    n_faces = int(faces.shape[0]) // 3
-    device = positions.device
-    volumes = tw.triangles.face_signed_volumes(positions, faces)
-    # Device-side tiled sum: only the 8-byte total crosses to the host, not the whole array.
-    total = wp.zeros(1, dtype=wp.float64, device=device)
-    wp.launch_tiled(
-        kernel_reduce.sum1d_tiled,
-        dim=[kernel_reduce.blocks_1d(n_faces)],
-        inputs=[volumes, total],
-        block_dim=TILE_1D,
-        device=device,
-    )
-    return float(total.numpy()[0])
-
-
 def _apply_volume_constraint(
     positions: wp.array[wp.vec3d], faces: wp.array[wp.int32], vol_ini: float
 ) -> None:
-    vol_new = _mesh_volume(positions, faces)
+    vol_new = tw.totals.volume(positions, faces)
     if vol_new != 0.0:
         factor = (vol_ini / vol_new) ** (1.0 / 3.0)
         wp.map(wp.mul, positions, wp.float64(factor), out=positions)
@@ -138,17 +122,11 @@ def filter_laplacian(
     device = vertices.device
     n = int(vertices.shape[0])
     if n == 0 or iterations == 0:
-        out = wp.empty(n, dtype=wp.vec3, device=device)
-        wp.copy(out, vertices)
-        return out
+        return wp.clone(vertices)
 
-    operator = (
-        laplacian_operator
-        if laplacian_operator is not None
-        else laplacian.laplacian(vertices, faces)
-    )
+    operator = _resolved_operator(vertices, faces, laplacian_operator)
     positions = _as_vec3d(vertices)
-    vol_ini = _mesh_volume(positions, faces) if volume_constraint else 0.0
+    vol_ini = tw.totals.volume(positions, faces) if volume_constraint else 0.0
 
     if implicit_time_integration:
         require_cuda(device, "filter_laplacian(implicit_time_integration=True)")
@@ -234,18 +212,11 @@ def filter_humphrey(
     device = vertices.device
     n = int(vertices.shape[0])
     if n == 0 or iterations == 0:
-        out = wp.empty(n, dtype=wp.vec3, device=device)
-        wp.copy(out, vertices)
-        return out
+        return wp.clone(vertices)
 
-    operator = (
-        laplacian_operator
-        if laplacian_operator is not None
-        else laplacian.laplacian(vertices, faces)
-    )
+    operator = _resolved_operator(vertices, faces, laplacian_operator)
     positions = _as_vec3d(vertices)
-    original = wp.empty(n, dtype=wp.vec3d, device=device)
-    wp.copy(original, positions)
+    original = wp.clone(positions)
 
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
     b = wp.empty(n, dtype=wp.vec3d, device=device)
@@ -322,15 +293,9 @@ def filter_taubin(
     device = vertices.device
     n = int(vertices.shape[0])
     if n == 0 or iterations == 0:
-        out = wp.empty(n, dtype=wp.vec3, device=device)
-        wp.copy(out, vertices)
-        return out
+        return wp.clone(vertices)
 
-    operator = (
-        laplacian_operator
-        if laplacian_operator is not None
-        else laplacian.laplacian(vertices, faces)
-    )
+    operator = _resolved_operator(vertices, faces, laplacian_operator)
     positions = _as_vec3d(vertices)
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
@@ -396,17 +361,11 @@ def filter_neighborhood_average(
     device = vertices.device
     n = int(vertices.shape[0])
     if n == 0 or iterations == 0:
-        out = wp.empty(n, dtype=wp.vec3, device=device)
-        wp.copy(out, vertices)
-        return out
+        return wp.clone(vertices)
 
     # Symmetric adjacency (undirected 1-ring) so boundary vertices average over all their
     # neighbors, matching Open3D's ``adjacency_list``; the directed default is asymmetric there.
-    operator = (
-        laplacian_operator
-        if laplacian_operator is not None
-        else laplacian.laplacian(vertices, faces, symmetric=True)
-    )
+    operator = _resolved_operator(vertices, faces, laplacian_operator, symmetric=True)
     positions = _as_vec3d(vertices)
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
     nxt = wp.empty(n, dtype=wp.vec3d, device=device)
@@ -484,22 +443,16 @@ def filter_mut_dif_laplacian(
     device = vertices.device
     n = int(vertices.shape[0])
     if n == 0 or iterations == 0:
-        out = wp.empty(n, dtype=wp.vec3, device=device)
-        wp.copy(out, vertices)
-        return out
+        return wp.clone(vertices)
 
-    operator = (
-        laplacian_operator
-        if laplacian_operator is not None
-        else laplacian.laplacian(vertices, faces)
-    )
+    operator = _resolved_operator(vertices, faces, laplacian_operator)
     positions = _as_vec3d(vertices)
 
     # Vertex normals and eps are computed once from the input mesh and reused every pass, matching
     # the trimesh reference (which reads normals off the un-mutated mesh inside its loop).
     face_normals, areas = face_normals_and_areas(vertices, faces)
     normals = mean_vertex_normals(n, faces, face_normals)
-    vol_ini = _mesh_volume(positions, faces) if volume_constraint else 0.0
+    vol_ini = tw.totals.volume(positions, faces) if volume_constraint else 0.0
     eps = 0.01 * float(tw.reduce.max(areas)) ** 0.5 if volume_constraint else 0.0
 
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
@@ -537,7 +490,7 @@ def filter_mut_dif_laplacian(
         )
         positions, nxt = nxt, positions
         if volume_constraint:
-            vol = _mesh_volume(positions, faces)
+            vol = tw.totals.volume(positions, faces)
             if index == 0:
                 wp.map(
                     kernel_smoothing.add_scaled_normal,
@@ -546,7 +499,7 @@ def filter_mut_dif_laplacian(
                     wp.float64(eps),
                     out=probe,
                 )
-                vol2 = _mesh_volume(probe, faces)
+                vol2 = tw.totals.volume(probe, faces)
                 slope = eps / (vol2 - vol) if vol2 != vol else 0.0
             wp.map(
                 kernel_smoothing.add_scaled_normal,
@@ -619,9 +572,7 @@ def filter_implicit_fairing(
     n = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
     if n == 0 or n_faces == 0 or iterations == 0:
-        out = wp.empty(n, dtype=wp.vec3, device=device)
-        wp.copy(out, vertices)
-        return out
+        return wp.clone(vertices)
 
     require_cuda(device, "filter_implicit_fairing")
     positions = _as_vec3d(vertices)
@@ -1206,16 +1157,11 @@ def filter_scalar_laplacian(
             f"values must have one entry per vertex, got {values.shape[0]} for {n} vertices"
         )
 
-    out = wp.empty(n, dtype=wp.float32, device=device)
-    wp.copy(out, values)
+    out = wp.clone(values)
     if n == 0 or iterations == 0:
         return out
 
-    operator = (
-        laplacian_operator
-        if laplacian_operator is not None
-        else laplacian.laplacian(vertices, faces, symmetric=True)
-    )
+    operator = _resolved_operator(vertices, faces, laplacian_operator, symmetric=True)
     average = wp.empty(n, dtype=wp.float32, device=device)
     nxt = wp.empty(n, dtype=wp.float32, device=device)
     coeff = wp.float32(lamb)
@@ -1302,8 +1248,7 @@ def saturate_scalar_gradient(
             f"values must have one entry per vertex, got {values.shape[0]} for {n} vertices"
         )
 
-    out = wp.empty(n, dtype=wp.float32, device=device)
-    wp.copy(out, values)
+    out = wp.clone(values)
     if n == 0 or int(faces.shape[0]) == 0:
         return out
 
@@ -1487,8 +1432,7 @@ def filter_two_step(
     device = vertices.device
     n = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
-    out = wp.empty(n, dtype=wp.vec3, device=device)
-    wp.copy(out, vertices)
+    out = wp.clone(vertices)
     if n == 0 or n_faces == 0 or iterations <= 0:
         return out
 
@@ -1593,6 +1537,42 @@ def filter_sharpen(
 # ---------------------------------------------------------------------------
 # Private cross-cutting helpers
 # ---------------------------------------------------------------------------
+
+
+def _resolved_operator(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    laplacian_operator: wps.BsrMatrix[wp.float32] | None,
+    *,
+    symmetric: bool = False,
+) -> wps.BsrMatrix[wp.float32]:
+    """
+    Return the caller's row-stochastic operator, or the uniform-weight default built here.
+
+    Every position filter here takes an optional prebuilt operator so a caller running several
+    passes pays for the assembly once; this is the one place that decides what ``None`` means.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    laplacian_operator
+        Prebuilt operator, or ``None`` to build the uniform-weight one.
+    symmetric
+        Build the undirected (symmetric) 1-ring operator instead of the directed default. Only
+        [`filter_neighborhood_average`][triwarp.smoothing.filter_neighborhood_average] wants this,
+        to match Open3D's ``adjacency_list`` at boundary vertices.
+
+    Returns
+    -------
+    warp.sparse.BsrMatrix
+        The operator to diffuse through.
+    """
+    if laplacian_operator is not None:
+        return laplacian_operator
+    return laplacian.laplacian(vertices, faces, symmetric=symmetric)
 
 
 def _as_vec3d(vertices: wp.array[wp.vec3]) -> wp.array[wp.vec3d]:

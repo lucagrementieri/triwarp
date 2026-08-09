@@ -35,7 +35,7 @@ from triwarp.constants import TILE_1D
 from triwarp.kernels import totals as kernel_totals
 
 
-def volume(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> float:
+def volume(vertices: wp.array[wp.vec3] | wp.array[wp.vec3d], faces: wp.array[wp.int32]) -> float:
     """
     Signed volume enclosed by the mesh.
 
@@ -48,14 +48,16 @@ def volume(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> float:
     Parameters
     ----------
     vertices
-        ``(n_vertices,)`` mesh vertex positions.
+        ``(n_vertices,)`` mesh vertex positions, ``wp.vec3`` or ``wp.vec3d``. The accumulation
+        follows: pass ``vec3d`` where the sum's low digits matter, as
+        [`filter_laplacian`][triwarp.smoothing.filter_laplacian]'s volume constraint does.
     faces
         Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
 
     Returns
     -------
     float
-        Signed volume in ``float32``. ``0.0`` for an empty mesh.
+        Signed volume, accumulated in ``vertices``' scalar type. ``0.0`` for an empty mesh.
 
     See Also
     --------
@@ -67,6 +69,8 @@ def volume(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> float:
         Make it mean something.
     [`moments`][triwarp.totals.moments]
         The same volume in float64, plus the centre of mass and inertia.
+    [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
+        The ``float64`` consumer: its volume constraint rescales the mesh to hold this fixed.
     [`trimesh.Trimesh.volume`][]
     """
     if int(faces.shape[0]) == 0:
