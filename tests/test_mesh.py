@@ -8,6 +8,7 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
+from triwarp.mesh import _TOPOLOGY_KEYS
 
 CLOSED_MESHES = ["icosahedron", "cave_cube"]
 OPEN_MESHES = ["hemisphere", "half_torus"]
@@ -295,6 +296,37 @@ def test_with_vertices_keeps_topology_drops_geometry(
     assert "face_normals" not in moved._cache
     assert "warp_mesh" not in moved._cache
     assert moved.faces is mesh.faces
+
+
+@pytest.mark.parametrize("key", sorted(_TOPOLOGY_KEYS))
+def test_with_vertices_carries_every_topology_key(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh], key: str
+) -> None:
+    """Each faces-only cached property survives ``with_vertices`` (the ``_TOPOLOGY_KEYS`` rule)."""
+    _mesh_tm, mesh_wp = icosahedron
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    before = getattr(mesh, key)
+    assert key in mesh._cache
+
+    translated_np = mesh.vertices.numpy() + np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    moved = mesh.with_vertices(wp.array(translated_np, dtype=wp.vec3, device=mesh.device))
+
+    assert key in moved._cache, f"{key} was recomputed instead of carried forward"
+    assert moved._cache[key] is before
+
+
+def test_face_adjacency_angles_is_not_a_topology_key(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """``face_adjacency_angles`` reads ``face_normals``, so ``with_vertices`` must drop it."""
+    _mesh_tm, mesh_wp = icosahedron
+    mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
+    _ = mesh.face_adjacency_angles
+
+    translated_np = mesh.vertices.numpy() + np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    moved = mesh.with_vertices(wp.array(translated_np, dtype=wp.vec3, device=mesh.device))
+
+    assert "face_adjacency_angles" not in moved._cache
 
 
 def test_with_vertices_wrong_count_raises(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:

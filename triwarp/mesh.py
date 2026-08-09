@@ -17,6 +17,8 @@ _R = TypeVar("_R")
 # functional update that keeps the same faces and the same vertex count (`with_vertices`)
 # can carry these forward instead of recomputing them. Every new cached property below must
 # be added to this set (if faces-only) or left out of it (if it also depends on `vertices`).
+# `face_adjacency_unshared` is faces-only and belongs here; its neighbour `face_adjacency_angles`
+# reads `face_normals` and is therefore correctly absent.
 _TOPOLOGY_KEYS: frozenset[str] = frozenset(
     {
         "edges",
@@ -249,9 +251,8 @@ class Trimesh:
         [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]
         [`trimesh.Trimesh.area_faces`][]
         """
-        normals, areas = tw.triangles.face_normals_and_areas(self._vertices, self._faces)
-        self._cache["face_normals"] = normals
-        return areas
+        _ = self.face_normals
+        return cast("wp.array[wp.float32]", self._cache["face_areas"])
 
     @_CachedProperty
     def area(self) -> float:
