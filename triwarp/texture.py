@@ -24,11 +24,13 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.constants import INT32_MAX
 from triwarp.kernels import texture as kernel_texture
 
 # Owner sentinel: larger than any face index, so wp.atomic_min lets the lowest-index covering
-# face win each pixel (matches constants.INT32_MAX_CONSTANT used in the kernels).
-_OWNER_SENTINEL = 2**31 - 1
+# face win each pixel. The kernels seed the same slot from ``INT32_MAX_CONSTANT``, so both sides
+# read the one constant rather than two copies of the literal.
+_OWNER_SENTINEL = INT32_MAX
 
 
 def _check_uv_in_range(uv: wp.array[wp.vec2]) -> None:

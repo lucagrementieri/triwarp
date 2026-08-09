@@ -16,6 +16,21 @@ from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import registration as kernel_registration
 
 
+# The ``return_cost=True`` overload comes first because it is the *default*: overload resolution
+# picks the first match, so listing ``Literal[False]`` first would type the bare
+# ``procrustes(a, b)`` call as returning the matrix alone, when it in fact returns the three-tuple.
+# The default cannot simply be dropped from the ``False`` overload -- ``return_cost`` follows
+# defaulted parameters, so a non-default there is a syntax error.
+@overload
+def procrustes(
+    a: wp.array[wp.vec3],
+    b: wp.array[wp.vec3],
+    weights: wp.array[wp.float32] | None = None,
+    reflection: bool = True,
+    translation: bool = True,
+    scale: bool = True,
+    return_cost: Literal[True] = True,
+) -> tuple[wp.array[wp.mat44], wp.array[wp.vec3], float]: ...
 @overload
 def procrustes(
     a: wp.array[wp.vec3],
@@ -34,8 +49,8 @@ def procrustes(
     reflection: bool = True,
     translation: bool = True,
     scale: bool = True,
-    return_cost: Literal[True] = True,
-) -> tuple[wp.array[wp.mat44], wp.array[wp.vec3], float]: ...
+    return_cost: bool = True,
+) -> tuple[wp.array[wp.mat44], wp.array[wp.vec3], float] | wp.array[wp.mat44]: ...
 def procrustes(
     a: wp.array[wp.vec3],
     b: wp.array[wp.vec3],

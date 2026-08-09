@@ -66,6 +66,31 @@ def test_procrustes_default(device: str) -> None:
     assert np.allclose(cost_tw, cost_tm, rtol=1e-4, atol=1e-4)
 
 
+def test_procrustes_return_cost_arity(device: str) -> None:
+    """
+    Class A: the bare call returns its documented three-tuple, ``return_cost=False`` one array.
+
+    The overloads used to declare ``return_cost: Literal[False] = False`` first, so a checker
+    resolved the bare ``procrustes(a, b)`` to the matrix-only signature while the implementation
+    returned the tuple. Nothing exercised the *bare* default, which is why it went unnoticed.
+    """
+    rng = np.random.default_rng(7)
+    a_np, b_np = _make_point_clouds(rng)
+    a_wp, b_wp = _to_wp(a_np, device), _to_wp(b_np, device)
+
+    defaulted = tw.registration.procrustes(a_wp, b_wp)
+    assert isinstance(defaulted, tuple)
+    assert len(defaulted) == 3
+    matrix_wp, transformed_wp, cost = defaulted
+    assert matrix_wp.shape[0] == 1
+    assert transformed_wp.shape[0] == a_np.shape[0]
+    assert np.isfinite(cost)
+
+    matrix_only = tw.registration.procrustes(a_wp, b_wp, return_cost=False)
+    assert isinstance(matrix_only, wp.array)
+    assert np.allclose(matrix_only.numpy(), matrix_wp.numpy(), rtol=1e-5, atol=1e-5)
+
+
 def test_procrustes_uniform_weights(device: str) -> None:
     rng = np.random.default_rng(1)
     a_np, b_np = _make_point_clouds(rng)

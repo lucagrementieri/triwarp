@@ -13,6 +13,7 @@ NanoVDB voxel ``i`` covering world ``[origin + i * s, origin + (i + 1) * s)``, s
 
 import warp as wp
 
+from triwarp.constants import INT32_MAX_CONSTANT
 from triwarp.kernels.algorithms.connected_components import ecl_hook_edge, find_representative
 from triwarp.kernels.array import binary_search_index
 from triwarp.kernels.intersection import triangle_aabb, triangle_aabb_overlap
@@ -70,7 +71,7 @@ def count_triangle_candidates(
     hi = voxel_cell(upper, origin, inverse_size)
     # int64 so a wildly under-sized voxel does not wrap the product into a plausible small count.
     span = wp.int64(hi[0] - lo[0] + 1) * wp.int64(hi[1] - lo[1] + 1) * wp.int64(hi[2] - lo[2] + 1)
-    out_counts[f] = wp.int32(wp.min(span, wp.int64(2147483647)))
+    out_counts[f] = wp.int32(wp.min(span, wp.int64(INT32_MAX_CONSTANT)))
     out_counts_f32[f] = wp.float32(span)
 
 

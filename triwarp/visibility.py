@@ -56,6 +56,11 @@ _WEIGHT_MODES: dict[str, wp.int32] = {
     "uniform": kernel_visibility.WEIGHT_UNIFORM,
 }
 
+# A lookup rather than a chain of comparisons, so an unrecognised name fails loudly in one place
+# instead of falling through to a branch. Same shape as ``_WEIGHT_MODES`` above and
+# ``triangles._QUALITY_METRICS``.
+_THICKNESS_METHODS = frozenset({"max_sphere", "ray"})
+
 RayWeight = Literal["cosine", "uniform"]
 """Weighting of a ray; see [`ambient_occlusion`][triwarp.visibility.ambient_occlusion]."""
 
@@ -219,14 +224,7 @@ def _occlusion_bundle(
     if m == 0:
         return out_occlusion
 
-    if normals is None:
-        normals = normals_at_closest_faces(mesh, points)
-    elif int(normals.shape[0]) != m:
-        raise ValueError(
-            f"normals must have one entry per point, got {normals.shape[0]} for {m} points"
-        )
-
-    diagonal = enclosing_diagonal(mesh.points, points)
+    normals, diagonal = _resolve_normals_and_radius(mesh, points, normals, name)
     directions = tw.sample.sample_fibonacci_hemisphere(n_rays, device=device)
     wp.launch(
         kernel_visibility.obscurance,
@@ -342,14 +340,7 @@ def shape_diameter(
     if m == 0:
         return wp.empty(0, dtype=wp.float32, device=device)
 
-    if normals is None:
-        normals = normals_at_closest_faces(mesh, points)
-    elif int(normals.shape[0]) != m:
-        raise ValueError(
-            f"normals must have one entry per point, got {normals.shape[0]} for {m} points"
-        )
-
-    diagonal = enclosing_diagonal(mesh.points, points)
+    normals, diagonal = _resolve_normals_and_radius(mesh, points, normals, "shape_diameter")
     directions = tw.sample.sample_fibonacci_cone(n_rays, cone_angle, device=device)
     # Distances are kept so the trimming pass can revisit them against a mean the first pass had not
     # finished computing; re-tracing instead would double the only expensive part of the kernel.
@@ -383,40 +374,65 @@ def thickness(
     method: Literal["max_sphere", "ray"] = "max_sphere",
 ) -> wp.array[wp.float32]:
     """
-    Thickness of the mesh at each point.
+    Local thickness of the volume at each point, by one inward ray or one tangent sphere.
+
+    A dispatcher over the module's other two inward measures, and the cheapest of the three: it
+    takes a single piece of evidence per point where
+    [`shape_diameter`][triwarp.visibility.shape_diameter] fires a whole cone and trims the outliers.
+    ``method="max_sphere"`` returns twice the radius of
+    [`max_tangent_sphere`][triwarp.visibility.max_tangent_sphere], which answers the question for a
+    *volume* rather than along a direction; ``method="ray"`` returns
+    [`longest_ray`][triwarp.ray.longest_ray] along ``-normals`` (or ``+normals`` with
+    ``exterior=True``), which is one ray and therefore reads whatever thin sliver of geometry it
+    happens to cross.
 
     Parameters
     ----------
     mesh
-        Warp mesh (BVH built by caller).
+        Triangle mesh with a built BVH (``wp.Mesh``).
     points
-        ``(m,)`` surface points as ``wp.vec3``.
+        ``(m,)`` surface positions to measure at.
     exterior
-        If ``True``, compute exterior thickness (reach). If ``False``, interior.
+        When ``True`` measure outward (the reach) instead of inward (the thickness).
     normals
-        ``(m,)`` unit surface normals. If ``None``, computed automatically.
+        ``(m,)`` **outward** unit normals. When ``None`` they are taken from the closest face of
+        ``mesh``; see [`ambient_occlusion`][triwarp.visibility.ambient_occlusion].
     method
-        ``"max_sphere"`` (default) or ``"ray"``.
+        ``"max_sphere"`` (default) or ``"ray"``; see the summary for the difference.
 
     Returns
     -------
     wp.array[wp.float32]
-        ``(m,)`` thickness values. ``inf`` for unbounded.
+        ``(m,)`` thickness values in the mesh's own length units on ``points.device``. ``inf``
+        where the measure is unbounded (no far side was found).
+
+    Raises
+    ------
+    ValueError
+        If ``method`` is neither ``"max_sphere"`` nor ``"ray"``, or if ``normals`` has a different
+        length from ``points``.
+
+    See Also
+    --------
+    [`max_tangent_sphere`][triwarp.visibility.max_tangent_sphere]
+    [`shape_diameter`][triwarp.visibility.shape_diameter]
+        The stable many-ray generalization of ``method="ray"``.
+    [`longest_ray`][triwarp.ray.longest_ray]
     """
+    if method not in _THICKNESS_METHODS:
+        raise ValueError(f"method must be one of {sorted(_THICKNESS_METHODS)}, got {method!r}")
+
     if method == "max_sphere":
         _centers, radii = max_tangent_sphere(mesh, points, inwards=not exterior, normals=normals)
-        return radii * wp.float32(2.0)
+        wp.map(wp.mul, radii, wp.float32(2.0), out=radii)
+        return radii
 
-    elif method == "ray":
-        if normals is None:
-            normals = normals_at_closest_faces(mesh, points)
-
-        ray_dirs = normals if exterior else -normals
-        max_t = enclosing_diagonal(mesh.points, points)
-        return tw.ray.longest_ray(mesh, points, ray_dirs, max_t=max_t)
-
-    else:
-        raise ValueError('Invalid method, use "max_sphere" or "ray"')
+    normals, max_t = _resolve_normals_and_radius(mesh, points, normals, "thickness")
+    ray_dirs = normals
+    if not exterior:
+        ray_dirs = wp.empty(int(points.shape[0]), dtype=wp.vec3, device=points.device)
+        wp.map(wp.neg, normals, out=ray_dirs)
+    return tw.ray.longest_ray(mesh, points, ray_dirs, max_t=max_t)
 
 
 def max_tangent_sphere(
@@ -459,6 +475,11 @@ def max_tangent_sphere(
     radii
         ``(m,)`` sphere radii as ``float32``. ``inf`` when the sphere is
         unbounded.
+
+    Raises
+    ------
+    ValueError
+        If ``normals`` has a different length from ``points``.
     """
     device = points.device
     m = int(points.shape[0])
@@ -468,12 +489,29 @@ def max_tangent_sphere(
             wp.empty(0, dtype=wp.float32, device=device),
         )
 
+    # One reduction of ``mesh.points``, not two: ``max_t`` needs the box enclosing the mesh *and*
+    # the queries, while the convergence threshold is a fraction of the mesh's own diagonal. Taking
+    # the mesh corners once and deriving both saves an ``aabb_bounds`` pass and its host sync.
+    mesh_lower, mesh_upper = tw.bounds.aabb_bounds(mesh.points)
+    query_lower, query_upper = tw.bounds.aabb_bounds(points)
+    union_lower, union_upper = tw.bounds.aabb_union(
+        mesh_lower, mesh_upper, query_lower, query_upper
+    )
+    max_t = float(wp.length(union_upper - union_lower))
+    mesh_diagonal = float(wp.length(mesh_upper - mesh_lower))
+
     if normals is None:
         normals = normals_at_closest_faces(mesh, points)
+    elif int(normals.shape[0]) != m:
+        raise ValueError(
+            f"normals must have one entry per point, got {normals.shape[0]} for {m} points"
+        )
 
-    ray_dirs: wp.array[wp.vec3] = -normals if inwards else normals
+    ray_dirs = normals
+    if inwards:
+        ray_dirs = wp.empty(m, dtype=wp.vec3, device=device)
+        wp.map(wp.neg, normals, out=ray_dirs)
 
-    max_t = enclosing_diagonal(mesh.points, points)
     distances = tw.ray.longest_ray(mesh, points, ray_dirs, max_t=max_t)
 
     n_verts = int(mesh.points.shape[0])
@@ -525,9 +563,7 @@ def max_tangent_sphere(
     centers = wp.empty(m, dtype=wp.vec3, device=device)
     wp.map(kernel_visibility.sphere_center, points, ray_dirs, radii, out=centers)
 
-    mesh_min, mesh_max = tw.bounds.aabb_bounds(mesh.points)
-    D = float(wp.length(mesh_max - mesh_min))  # noqa: N806
-    convergence_threshold = wp.float32(threshold * D)
+    convergence_threshold = wp.float32(threshold * mesh_diagonal)
 
     # All per-iteration buffers are preallocated once and ping-ponged (the step kernel writes
     # every lane, passing converged state through). The convergence count is checked every
@@ -573,3 +609,44 @@ def max_tangent_sphere(
         not_converged, new_nc = new_nc, not_converged
 
     return centers, radii
+
+
+def _resolve_normals_and_radius(
+    mesh: wp.Mesh, points: wp.array[wp.vec3], normals: wp.array[wp.vec3] | None, name: str
+) -> tuple[wp.array[wp.vec3], float]:
+    """
+    Per-point normals and the search radius every measure in this module needs.
+
+    ``normals`` defaults to the closest face's normal, which is right for points on the surface and
+    meaningless off it; the radius is the diagonal of the box enclosing both the mesh and the
+    queries, so no ray or sphere is cut short.
+
+    Parameters
+    ----------
+    mesh
+        Triangle mesh with a built BVH (``wp.Mesh``).
+    points
+        ``(m,)`` positions being measured at.
+    normals
+        ``(m,)`` outward unit normals, or ``None`` to take them from the closest face.
+    name
+        Calling function's name, used in the error message.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], float]
+        ``(normals, diagonal)``.
+
+    Raises
+    ------
+    ValueError
+        If ``normals`` has a different length from ``points``.
+    """
+    m = int(points.shape[0])
+    if normals is None:
+        normals = normals_at_closest_faces(mesh, points)
+    elif int(normals.shape[0]) != m:
+        raise ValueError(
+            f"{name}: normals must have one entry per point, got {normals.shape[0]} for {m} points"
+        )
+    return normals, enclosing_diagonal(mesh.points, points)
