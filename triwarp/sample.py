@@ -44,16 +44,7 @@ def sample_fibonacci_sphere(count: int, device: wp.DeviceLike = None) -> wp.arra
     --------
     [`sample_fibonacci_hemisphere`][triwarp.sample.sample_fibonacci_hemisphere]
     """
-    if count <= 0:
-        return wp.empty(0, dtype=wp.vec3, device=device)
-    out_directions = wp.empty(count, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_sample.fibonacci_lattice,
-        dim=count,
-        inputs=[count, wp.float32(2.0), out_directions],
-        device=device,
-    )
-    return out_directions
+    return _fibonacci_lattice(count, 2.0, device)
 
 
 def sample_fibonacci_hemisphere(count: int, device: wp.DeviceLike = None) -> wp.array[wp.vec3]:
@@ -85,16 +76,7 @@ def sample_fibonacci_hemisphere(count: int, device: wp.DeviceLike = None) -> wp.
     --------
     [`sample_fibonacci_sphere`][triwarp.sample.sample_fibonacci_sphere]
     """
-    if count <= 0:
-        return wp.empty(0, dtype=wp.vec3, device=device)
-    out_directions = wp.empty(count, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_sample.fibonacci_lattice,
-        dim=count,
-        inputs=[count, wp.float32(1.0), out_directions],
-        device=device,
-    )
-    return out_directions
+    return _fibonacci_lattice(count, 1.0, device)
 
 
 def sample_fibonacci_cone(
@@ -139,13 +121,39 @@ def sample_fibonacci_cone(
     """
     if not 0.0 < half_angle <= math.pi:
         raise ValueError(f"half_angle must be in (0, pi] radians, got {half_angle}")
+    return _fibonacci_lattice(count, 1.0 - math.cos(half_angle), device)
+
+
+def _fibonacci_lattice(count: int, z_span: float, device: wp.DeviceLike) -> wp.array[wp.vec3]:
+    """
+    Generate the Fibonacci lattice over a spherical band of height ``z_span``.
+
+    The three public generators differ only in this number, because a uniform ``z`` is a uniform
+    solid angle (Archimedes) whatever band it covers: ``2`` is the whole sphere, ``1`` the
+    hemisphere and ``1 - cos(half_angle)`` a cone, and the first two are exactly what the third
+    reduces to at ``half_angle`` of ``pi`` and ``pi / 2``.
+
+    Parameters
+    ----------
+    count
+        Number of directions to generate.
+    z_span
+        Height of the band in ``z``, in ``(0, 2]``.
+    device
+        Warp device for the result.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        ``(count,)`` unit vectors. Empty when ``count`` is 0.
+    """
     if count <= 0:
         return wp.empty(0, dtype=wp.vec3, device=device)
     out_directions = wp.empty(count, dtype=wp.vec3, device=device)
     wp.launch(
         kernel_sample.fibonacci_lattice,
         dim=count,
-        inputs=[count, wp.float32(1.0 - math.cos(half_angle)), out_directions],
+        inputs=[count, wp.float32(z_span), out_directions],
         device=device,
     )
     return out_directions

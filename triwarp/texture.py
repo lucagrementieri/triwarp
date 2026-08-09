@@ -79,14 +79,9 @@ def rasterize_attribute(
     [`remap_attribute_from_uv`][triwarp.texture.remap_attribute_from_uv]
     [`rasterize_discrete_attribute`][triwarp.texture.rasterize_discrete_attribute]
     """
-    if resolution <= 0:
-        raise ValueError("Resolution must be positive")
     twt.ensure_ndim(attribute, 2, dtype=wp.float32)
-    n_vertices = int(attribute.shape[0])
     n_channels = int(attribute.shape[1])
-    if int(uv.shape[0]) != n_vertices:
-        raise ValueError(f"uv and attribute row count mismatch: {int(uv.shape[0])} vs {n_vertices}")
-    _check_uv_in_range(uv)
+    _check_rasterize_inputs(uv, int(attribute.shape[0]), resolution)
 
     device = uv.device
     image = wp.zeros((resolution, resolution, n_channels), dtype=wp.float32, device=device)
@@ -94,13 +89,7 @@ def rasterize_attribute(
     if n_faces == 0:
         return twt.as_array3d_float32(image)
 
-    owner = wp.full((resolution, resolution), _OWNER_SENTINEL, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_texture.rasterize_owner,
-        dim=n_faces,
-        inputs=[uv, faces, resolution, owner],
-        device=device,
-    )
+    owner = _rasterize_owner(uv, faces, resolution)
     wp.launch(
         kernel_texture.rasterize_scatter,
         dim=n_faces,
@@ -144,15 +133,11 @@ def rasterize_discrete_attribute(
     [`remap_discrete_attribute_from_uv`][triwarp.texture.remap_discrete_attribute_from_uv]
     [`rasterize_attribute`][triwarp.texture.rasterize_attribute]
     """
-    if resolution <= 0:
-        raise ValueError("Resolution must be positive")
     twt.ensure_ndim(attribute, 1, dtype=wp.int32)
     n_vertices = int(attribute.shape[0])
-    if int(uv.shape[0]) != n_vertices:
-        raise ValueError(f"uv and attribute row count mismatch: {int(uv.shape[0])} vs {n_vertices}")
+    _check_rasterize_inputs(uv, n_vertices, resolution)
     if n_vertices > 0 and tw.reduce.min(cast(twt.Array1dInt32, attribute)) < 0:
         raise ValueError("Attribute values must be greater than or equal to 0")
-    _check_uv_in_range(uv)
 
     device = uv.device
     labels_image = wp.full((resolution, resolution), -1, dtype=wp.int32, device=device)
@@ -160,13 +145,7 @@ def rasterize_discrete_attribute(
     if n_faces == 0:
         return twt.as_array2d_int32(labels_image)
 
-    owner = wp.full((resolution, resolution), _OWNER_SENTINEL, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_texture.rasterize_owner,
-        dim=n_faces,
-        inputs=[uv, faces, resolution, owner],
-        device=device,
-    )
+    owner = _rasterize_owner(uv, faces, resolution)
     wp.launch(
         kernel_texture.rasterize_labels,
         dim=n_faces,
@@ -174,6 +153,67 @@ def rasterize_discrete_attribute(
         device=device,
     )
     return twt.as_array2d_int32(labels_image)
+
+
+def _check_rasterize_inputs(uv: wp.array[wp.vec2], n_vertices: int, resolution: int) -> None:
+    """
+    Validate the arguments both rasterizers share: resolution, row count and UV range.
+
+    Parameters
+    ----------
+    uv
+        ``(n_vertices,)`` per-vertex UV coordinates.
+    n_vertices
+        Row count of the attribute being rasterized.
+    resolution
+        Output image size in pixels.
+
+    Raises
+    ------
+    ValueError
+        If ``resolution`` is not positive, ``uv`` and the attribute disagree on their row count, or
+        any finite UV lies outside ``[0, 1]``.
+    """
+    if resolution <= 0:
+        raise ValueError("Resolution must be positive")
+    if int(uv.shape[0]) != n_vertices:
+        raise ValueError(f"uv and attribute row count mismatch: {int(uv.shape[0])} vs {n_vertices}")
+    _check_uv_in_range(uv)
+
+
+def _rasterize_owner(
+    uv: wp.array[wp.vec2], faces: wp.array[wp.int32], resolution: int
+) -> twt.Array2dInt32:
+    """
+    Resolve which face owns each pixel: the lowest-index triangle covering it.
+
+    Both rasterizers run this first so their scatter pass can write exactly one face's contribution
+    per pixel. Overlap is degenerate for a valid parameterization; where it happens the lowest face
+    index wins, which ``wp.atomic_min`` against the sentinel gives for free.
+
+    Parameters
+    ----------
+    uv
+        ``(n_vertices,)`` per-vertex UV coordinates.
+    faces
+        Flat length-``3 * n_faces`` ``wp.int32`` triangle index buffer, non-empty.
+    resolution
+        Output image size in pixels.
+
+    Returns
+    -------
+    twt.Array2dInt32
+        ``(resolution, resolution)`` owning face index, ``_OWNER_SENTINEL`` where uncovered.
+    """
+    device = uv.device
+    owner = wp.full((resolution, resolution), _OWNER_SENTINEL, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_texture.rasterize_owner,
+        dim=int(faces.shape[0]) // 3,
+        inputs=[uv, faces, resolution, owner],
+        device=device,
+    )
+    return twt.as_array2d_int32(owner)
 
 
 def remap_attribute_from_uv(

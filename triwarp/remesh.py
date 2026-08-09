@@ -1122,19 +1122,10 @@ def flip_to_delaunay(
     [`face_adjacency`][triwarp.adjacency.face_adjacency]
     """
     device = faces.device
-    n_faces = int(faces.shape[0]) // 3
-    out_faces = wp.clone(faces)
-    if n_faces == 0:
-        return out_faces
-    if region is not None and int(region.shape[0]) != n_faces:
-        raise ValueError(f"region must have length n_faces={n_faces}, got {int(region.shape[0])}")
-
-    n_vertices = tw.vertices.n_vertices(faces)
-    region_flags = wp.empty(n_faces, dtype=wp.int32, device=device)
-    if region is None:
-        region_flags.fill_(1)
-    else:
-        wp.utils.array_cast(region, region_flags)
+    setup = _flip_setup(faces, region)
+    if setup is None:
+        return wp.clone(faces)
+    out_faces, n_vertices, region_flags = setup
 
     mac = wp.float32(max_angle_change if max_angle_change is not None else float(2.0 * math.pi))
     mdsq = wp.float32(max_deviation * max_deviation if max_deviation is not None else 3.0e38)
@@ -1274,19 +1265,10 @@ def flip_by_objective(
         raise ValueError(f"planar_angle must be in [0, 180] degrees, got {planar_angle}")
 
     device = faces.device
-    n_faces = int(faces.shape[0]) // 3
-    out_faces = wp.clone(faces)
-    if n_faces == 0:
-        return out_faces
-    if region is not None and int(region.shape[0]) != n_faces:
-        raise ValueError(f"region must have length n_faces={n_faces}, got {int(region.shape[0])}")
-
-    n_vertices = tw.vertices.n_vertices(faces)
-    region_flags = wp.empty(n_faces, dtype=wp.int32, device=device)
-    if region is None:
-        region_flags.fill_(1)
-    else:
-        wp.utils.array_cast(region, region_flags)
+    setup = _flip_setup(faces, region)
+    if setup is None:
+        return wp.clone(faces)
+    out_faces, n_vertices, region_flags = setup
 
     objective_flag = {
         "planarity": kernel_remesh.OBJECTIVE_PLANARITY,
@@ -1322,6 +1304,49 @@ def flip_by_objective(
 
     _flip_interior_edges(out_faces, n_vertices, launch, max_iter)
     return out_faces
+
+
+def _flip_setup(
+    faces: wp.array[wp.int32], region: wp.array[wp.bool] | None
+) -> tuple[wp.array[wp.int32], int, wp.array[wp.int32]] | None:
+    """
+    Working face buffer, vertex count and per-face region flags shared by the two flip drivers.
+
+    Both [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay] and
+    [`flip_by_objective`][triwarp.remesh.flip_by_objective] flip in place on a clone of the input
+    and gate every candidate on the same ``int32`` region mask, which is all ones when the caller
+    named no region.
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    region
+        Optional length-``n_faces`` ``wp.bool`` mask restricting which faces may flip.
+
+    Returns
+    -------
+    tuple[wp.array[wp.int32], int, wp.array[wp.int32]] | None
+        ``(out_faces, n_vertices, region_flags)``, or ``None`` for an empty mesh.
+
+    Raises
+    ------
+    ValueError
+        If ``region`` is given and is not length ``n_faces``.
+    """
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return None
+    if region is not None and int(region.shape[0]) != n_faces:
+        raise ValueError(f"region must have length n_faces={n_faces}, got {int(region.shape[0])}")
+
+    region_flags = wp.empty(n_faces, dtype=wp.int32, device=device)
+    if region is None:
+        region_flags.fill_(1)
+    else:
+        wp.utils.array_cast(region, region_flags)
+    return wp.clone(faces), tw.vertices.n_vertices(faces), region_flags
 
 
 def intrinsic_delaunay(

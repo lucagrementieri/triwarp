@@ -79,18 +79,9 @@ def mean_vertex_normals(
         Length-``n_vertices`` device array of unit normals where the accumulated vector was
         non-zero; otherwise the corresponding entry is zero.
     """
-    normals = wp.zeros((n_vertices, 3), dtype=wp.float32, device=faces.device)
-    faces2d = faces.reshape((-1, 3))
-    wp.launch(
-        kernel_scatter.scatter_sum_vec,
-        dim=int(face_normals.shape[0]),
-        inputs=[face_normals, faces2d, normals],
-        device=faces.device,
+    return _accumulate_and_normalize(
+        n_vertices, faces, kernel_scatter.scatter_sum_vec, face_normals
     )
-    vec_normals = wp.empty(n_vertices, dtype=wp.vec3, device=faces.device)
-    wp.utils.array_cast(normals, vec_normals)
-    wp.map(wp.normalize, vec_normals, out=vec_normals)
-    return vec_normals
 
 
 def weighted_vertex_normals(
@@ -124,16 +115,57 @@ def weighted_vertex_normals(
         Length-``n_vertices`` device array of unit normals where the accumulated vector was
         non-zero; otherwise the corresponding entry is zero.
     """
-    normals = wp.zeros((n_vertices, 3), dtype=wp.float32, device=faces.device)
-    faces2d = faces.reshape((-1, 3))
-    wp.launch(
-        kernel_scatter.scatter_weighted_sum_vec,
-        dim=int(face_normals.shape[0]),
-        inputs=[face_normals, faces2d, face_weights, normals],
-        device=faces.device,
+    return _accumulate_and_normalize(
+        n_vertices, faces, kernel_scatter.scatter_weighted_sum_vec, face_normals, face_weights
     )
-    vec_normals = wp.empty(n_vertices, dtype=wp.vec3, device=faces.device)
-    wp.utils.array_cast(normals, vec_normals)
+
+
+def _accumulate_and_normalize(
+    n_vertices: int,
+    faces: wp.array[wp.int32],
+    scatter_kernel: wp.Kernel,
+    values: wp.array[wp.vec3],
+    *extra: wp.array,
+) -> wp.array[wp.vec3]:
+    """
+    Scatter per-face vectors onto their corners and unit-normalize the sums.
+
+    The shared body of the module's two primitives: the scatter kernel decides whether each face
+    contributes its vector once or scaled by a per-corner weight, and the other three public
+    functions reach this through one of them. Accumulation is ``float32`` in an ``(n_vertices, 3)``
+    buffer, which is what the scatter kernels write; the cast to ``wp.vec3`` is a reinterpretation
+    of the same bytes.
+
+    Parameters
+    ----------
+    n_vertices
+        Output length.
+    faces
+        Flat ``wp.int32`` triangle index buffer; reshaped to ``(f, 3)`` for the scatter.
+    scatter_kernel
+        ``kernels.scatter`` kernel taking ``(values, faces2d, *extra, out_sums)`` -- the face table
+        is the *second* argument in that family, not the last input.
+    values
+        ``(f,)`` per-face vectors to accumulate.
+    extra
+        Any further per-face arrays the kernel takes between the face table and the output, such as
+        ``scatter_weighted_sum_vec``'s per-corner weights.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        Length-``n_vertices`` unit normals; zero where the accumulated vector was zero.
+    """
+    device = faces.device
+    sums = wp.zeros((n_vertices, 3), dtype=wp.float32, device=device)
+    wp.launch(
+        scatter_kernel,
+        dim=int(values.shape[0]),
+        inputs=[values, faces.reshape((-1, 3)), *extra, sums],
+        device=device,
+    )
+    vec_normals = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+    wp.utils.array_cast(sums, vec_normals)
     wp.map(wp.normalize, vec_normals, out=vec_normals)
     return vec_normals
 
