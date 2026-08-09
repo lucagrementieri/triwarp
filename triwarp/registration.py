@@ -328,7 +328,6 @@ def icp(
     """
     device = a.device
     n = int(a.shape[0])
-    is_mesh = _is_mesh_target(target_faces)
 
     if n == 0 or int(target_vertices.shape[0]) == 0:
         return _identity_mat44(device), wp.clone(a), math.inf
@@ -355,25 +354,16 @@ def icp(
 
     old_cost = math.inf
     for _ in range(max_iterations):
-        if is_mesh:
-            assert mesh is not None
-            distance = distance_mesh
-            triangle_id = triangle_id_mesh
-            wp.launch(
-                kernel_proximity.closest_point_on_mesh,
-                dim=n,
-                inputs=[mesh.id, current, wp.float32(query_max), closest, distance, triangle_id],
-                device=device,
-            )
-        else:
-            assert target_index is not None
-            index, distance = tw.neighbors.query_bvh_nearest(
-                target_vertices, current, 1, **target_index
-            )
-            # Not ``tw.array.gather``: ``closest`` is allocated once outside this loop, and a
-            # gather would add one allocation per ICP iteration.
-            wp.copy(closest, target_vertices[index])
-            triangle_id = index
+        distance, triangle_id = _correspondences(
+            mesh,
+            target_vertices,
+            target_index,
+            current,
+            query_max,
+            closest,
+            distance_mesh,
+            triangle_id_mesh,
+        )
 
         if max_distance is not None and weights is not None:
             wp.map(
@@ -566,7 +556,7 @@ def icp_point_to_plane(
     # a caller-provided initial transform. The per-iteration cost read stays: it is the
     # stopping criterion (a 4-byte transfer).
     closest = wp.empty(n, dtype=wp.vec3, device=device)
-    distance = wp.empty(n, dtype=wp.float32, device=device)
+    distance_mesh = wp.empty(n, dtype=wp.float32, device=device)
     triangle_id_mesh = wp.empty(n, dtype=wp.int32, device=device)
     normals = wp.empty(n, dtype=wp.vec3, device=device)
     jtj = wp.zeros(1, dtype=wp.spatial_matrix, device=device)
@@ -578,38 +568,26 @@ def icp_point_to_plane(
 
     for iteration in range(max_iterations):
         # --- correspondence + target normals ---
-        if is_mesh:
-            assert mesh is not None
-            assert face_normals is not None
-            triangle_id = triangle_id_mesh
-            wp.launch(
-                kernel_proximity.closest_point_on_mesh,
-                dim=n,
-                inputs=[mesh.id, current, wp.float32(query_max), closest, distance, triangle_id],
-                device=device,
-            )
-            wp.launch(
-                kernel_array.gather_vec_skip_negative,
-                dim=n,
-                inputs=[face_normals, triangle_id, normals],
-                device=device,
-            )
-        else:
-            assert target_normals is not None
-            assert target_index is not None
-            index, distance = tw.neighbors.query_bvh_nearest(
-                target_vertices, current, 1, **target_index
-            )
-            # Not ``tw.array.gather``: ``closest`` is allocated once outside this loop, and a
-            # gather would add one allocation per ICP iteration.
-            wp.copy(closest, target_vertices[index])
-            wp.launch(
-                kernel_array.gather_vec_skip_negative,
-                dim=n,
-                inputs=[target_normals, index, normals],
-                device=device,
-            )
-            triangle_id = index
+        distance, triangle_id = _correspondences(
+            mesh,
+            target_vertices,
+            target_index,
+            current,
+            query_max,
+            closest,
+            distance_mesh,
+            triangle_id_mesh,
+        )
+        # One gather either way: for a mesh target ``triangle_id`` indexes the face normals, for a
+        # cloud it indexes the target's own per-vertex normals.
+        normal_source = face_normals if mesh is not None else target_normals
+        assert normal_source is not None
+        wp.launch(
+            kernel_array.gather_vec_skip_negative,
+            dim=n,
+            inputs=[normal_source, triangle_id, normals],
+            device=device,
+        )
 
         # --- resolve robust scale on the first iteration ---
         if kind != 0 and scale_value is None:
@@ -664,6 +642,71 @@ def icp_point_to_plane(
         old_cost = cost
 
     return total, transformed, cost
+
+
+def _correspondences(
+    mesh: wp.Mesh | None,
+    target_vertices: wp.array[wp.vec3],
+    target_index: _TargetIndex | None,
+    current: wp.array[wp.vec3],
+    query_max: wp.float32,
+    closest: wp.array[wp.vec3],
+    distance_mesh: wp.array[wp.float32],
+    triangle_id_mesh: wp.array[wp.int32],
+) -> tuple[wp.array[wp.float32], wp.array[wp.int32]]:
+    """
+    Match every source position against the target, writing the matched point into ``closest``.
+
+    Writes the matched point of every source position into ``closest``. A mesh target runs the BVH
+    closest-point kernel into the caller's preallocated buffers; a cloud target runs the k-NN query,
+    which returns its own, so the returned pair is the caller's buffers in the first case and fresh
+    views in the second -- both loops rebind rather than assuming.
+
+    Parameters
+    ----------
+    mesh
+        Mesh target, or ``None`` for a cloud target.
+    target_vertices
+        ``(m,)`` target positions.
+    target_index
+        Precomputed k-NN state; required when ``mesh`` is ``None``.
+    current
+        ``(n,)`` transformed source positions to match.
+    query_max
+        Search radius for the mesh closest-point query.
+    closest
+        ``(n,)`` output, written either way.
+    distance_mesh, triangle_id_mesh
+        Preallocated ``(n,)`` buffers the mesh branch writes into.
+
+    Returns
+    -------
+    tuple[wp.array[wp.float32], wp.array[wp.int32]]
+        ``(distance, correspondence_index)`` -- a face index for a mesh target, a vertex index for
+        a cloud one.
+    """
+    if mesh is not None:
+        wp.launch(
+            kernel_proximity.closest_point_on_mesh,
+            dim=int(current.shape[0]),
+            inputs=[
+                mesh.id,
+                current,
+                wp.float32(query_max),
+                closest,
+                distance_mesh,
+                triangle_id_mesh,
+            ],
+            device=current.device,
+        )
+        return distance_mesh, triangle_id_mesh
+
+    assert target_index is not None
+    index, distance = tw.neighbors.query_bvh_nearest(target_vertices, current, 1, **target_index)
+    # Not ``tw.array.gather``: ``closest`` is allocated once outside the ICP loop, and a gather
+    # would add one allocation per iteration.
+    wp.copy(closest, target_vertices[index])
+    return distance, index
 
 
 def _seed_transform(
