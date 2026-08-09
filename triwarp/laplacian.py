@@ -155,16 +155,16 @@ def cotmatrix_entries(
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
     if n_faces == 0:
-        return twt.empty_float_2d((0, 3), dtype=dtype, device=device)
+        return twt.empty_2d((0, 3), dtype, device=device)
 
-    out_cot = twt.empty_float_2d((n_faces, 3), dtype=dtype, device=device)
+    out_cot = twt.empty_2d((n_faces, 3), dtype, device=device)
     wp.launch(
         kernel_laplacian.cotmatrix_entries,
         dim=n_faces,
         inputs=[vertices, faces, out_cot],
         device=device,
     )
-    return twt.as_array2d_float(out_cot, dtype=dtype)
+    return twt.as_array2d(out_cot, dtype)
 
 
 def cotmatrix_entries_intrinsic(
@@ -199,16 +199,16 @@ def cotmatrix_entries_intrinsic(
     n_faces = int(edge_lengths.shape[0])
     device = edge_lengths.device
     if n_faces == 0:
-        return twt.empty_float_2d((0, 3), dtype=dtype, device=device)
+        return twt.empty_2d((0, 3), dtype, device=device)
 
-    out_cot = twt.empty_float_2d((n_faces, 3), dtype=dtype, device=device)
+    out_cot = twt.empty_2d((n_faces, 3), dtype, device=device)
     wp.launch(
         kernel_laplacian.cotmatrix_entries_intrinsic,
         dim=n_faces,
         inputs=[edge_lengths, out_cot],
         device=device,
     )
-    return twt.as_array2d_float(out_cot, dtype=dtype)
+    return twt.as_array2d(out_cot, dtype)
 
 
 def cotmatrix(
@@ -404,7 +404,7 @@ def mollify_intrinsic(
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
-        return twt.empty_float32_2d((0, 3), device=device), 0.0
+        return twt.empty_2d((0, 3), wp.float32, device=device), 0.0
 
     if edge_lengths is None:
         edge_lengths = face_edge_lengths(vertices, faces)
@@ -419,11 +419,11 @@ def mollify_intrinsic(
     )
     delta = float(reduce_max(slack))
     if delta <= 0.0:
-        return twt.as_array2d_float32(edge_lengths), 0.0
+        return twt.as_array2d(edge_lengths, wp.float32), 0.0
 
-    mollified = twt.empty_float32_2d((n_faces, 3), device=device)
+    mollified = twt.empty_2d((n_faces, 3), wp.float32, device=device)
     wp.map(kernel_laplacian.add_constant, edge_lengths, wp.float32(delta), out=mollified)
-    return twt.as_array2d_float32(mollified), delta
+    return twt.as_array2d(mollified, wp.float32), delta
 
 
 def connection_laplacian(

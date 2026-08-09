@@ -50,14 +50,14 @@ def faces_to_edges(
     [`trimesh.geometry.faces_to_edges`][]
     """
     n_faces = int(faces.shape[0]) // 3
-    edges = twt.empty_int32_2d((n_faces * 3, 2), device=faces.device)
+    edges = twt.empty_2d((n_faces * 3, 2), wp.int32, device=faces.device)
     wp.launch(
         kernel_edges.faces_to_edges,
         dim=n_faces,
         inputs=[faces, wp.bool(sorted), edges],
         device=faces.device,
     )
-    return twt.as_array2d_int32(edges)
+    return twt.as_array2d(edges, wp.int32)
 
 
 def edges_face(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
@@ -123,7 +123,7 @@ def edges_unique(
     device = faces.device
 
     if n_faces == 0:
-        empty_edges = twt.empty_int32_2d((0, 2), device=device)
+        empty_edges = twt.empty_2d((0, 2), wp.int32, device=device)
         empty_inv = wp.empty(0, dtype=wp.int32, device=device)
         return empty_edges, empty_inv
 
@@ -141,7 +141,7 @@ def edges_unique(
 
     unique_edges_out = tw.array.gather(edges_sorted, first_occ)
 
-    return twt.as_array2d_int32(unique_edges_out), inverse
+    return twt.as_array2d(unique_edges_out, wp.int32), inverse
 
 
 def edges_unique_inverse(
@@ -288,16 +288,16 @@ def face_edge_lengths(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) ->
     """
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
-    lengths = twt.empty_float32_2d((n_faces, 3), device=device)
+    lengths = twt.empty_2d((n_faces, 3), wp.float32, device=device)
     if n_faces == 0:
-        return twt.as_array2d_float32(lengths)
+        return twt.as_array2d(lengths, wp.float32)
     wp.launch(
         kernel_edges.face_edge_lengths,
         dim=n_faces,
         inputs=[vertices, faces, lengths],
         device=device,
     )
-    return twt.as_array2d_float32(lengths)
+    return twt.as_array2d(lengths, wp.float32)
 
 
 def mean_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> float:

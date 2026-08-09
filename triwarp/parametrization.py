@@ -340,7 +340,7 @@ def _solve_fixed_boundary(
     )
 
     sol, free_map, _ = twl.min_quad_with_fixed(
-        q, fixed_mask, twt.as_array2d_float(fixed_values, dtype=wp.float64), tol=_CG_TOLERANCE
+        q, fixed_mask, twt.as_array2d(fixed_values, wp.float64), tol=_CG_TOLERANCE
     )
 
     out_uv = wp.empty(n_vertices, dtype=wp.vec2, device=device)
@@ -480,7 +480,7 @@ def arap(
     # (2, n_vertices) prescribed-UV buffer (row 0 = u, row 1 = v) shared with the assembly / scatter
     # kernels; ``interior_map`` compacts free vertices into the reduced system.
     fixed_mask, fixed_values = _scatter_constraints(n_vertices, fixed_indices, fixed_uv, device)
-    fixed_values_2d = twt.as_array2d_float(fixed_values, dtype=wp.float64)
+    fixed_values_2d = twt.as_array2d(fixed_values, wp.float64)
     interior_map, n_interior = twl.free_partition(fixed_mask)
 
     out_uv = wp.empty(n_vertices, dtype=wp.vec2, device=device)
@@ -548,8 +548,8 @@ def arap(
     # the warm start is simply whatever ``sol`` already holds.
     solver = twl.spd_column_solver(
         q_uu,
-        twt.as_array2d_float(b, dtype=wp.float64),
-        twt.as_array2d_float(sol, dtype=wp.float64),
+        twt.as_array2d(b, wp.float64),
+        twt.as_array2d(sol, wp.float64),
         tol=tolerance,
         maxiter=10 * n_interior,
     )
@@ -701,7 +701,7 @@ def lscm(
         )
 
     sol, free_map, _ = twl.min_quad_with_fixed(
-        q, fixed_mask, twt.as_array2d_float(fixed_values, dtype=wp.float64), tol=_CG_TOLERANCE
+        q, fixed_mask, twt.as_array2d(fixed_values, wp.float64), tol=_CG_TOLERANCE
     )
 
     out_uv = wp.empty(n, dtype=wp.vec2, device=device)

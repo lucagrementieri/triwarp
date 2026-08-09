@@ -178,8 +178,8 @@ def tree_cotree(
     if len(dual_pairs) > 0:
         dual_adjacency = tw.graph.edges_to_csr(
             n_faces,
-            twt.as_array2d_int32(
-                wp.array(np.ascontiguousarray(dual_pairs), dtype=wp.int32, device=device)
+            twt.as_array2d(
+                wp.array(np.ascontiguousarray(dual_pairs), dtype=wp.int32, device=device), wp.int32
             ),
         )
         _, dual_parents, _ = tw.graph.bfs(dual_adjacency, 0)
@@ -193,7 +193,11 @@ def tree_cotree(
     generator_edges = wp.array(
         np.ascontiguousarray(edges_np[leftover].reshape(-1, 2)), dtype=wp.int32, device=device
     )
-    return (twt.as_array2d_int32(unique_edges), twt.as_array2d_int32(generator_edges), parents)
+    return (
+        twt.as_array2d(unique_edges, wp.int32),
+        twt.as_array2d(generator_edges, wp.int32),
+        parents,
+    )
 
 
 def _loop_through_tree(start: int, end: int, parents: np.ndarray) -> np.ndarray:

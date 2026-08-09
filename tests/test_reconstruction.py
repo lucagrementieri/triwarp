@@ -903,7 +903,8 @@ def test_marching_cubes_extracts_an_analytic_sphere(device: str) -> None:
     radius, resolution = 0.6, 32
     field_wp = wp.array(_sphere_field(resolution, radius), dtype=wp.float32, device=device)
     vertices_wp, faces_wp = tw.reconstruction.marching_cubes(
-        twt.as_array3d_float32(field_wp), bounds=(wp.vec3(-1.0, -1.0, -1.0), wp.vec3(1.0, 1.0, 1.0))
+        twt.as_array3d(field_wp, wp.float32),
+        bounds=(wp.vec3(-1.0, -1.0, -1.0), wp.vec3(1.0, 1.0, 1.0)),
     )
     assert int(faces_wp.shape[0]) > 0
     spacing = 2.0 / (resolution - 1)
@@ -915,7 +916,7 @@ def test_marching_cubes_index_space_by_default(device: str) -> None:
     """Without ``bounds`` the vertices are lattice indices, which is the documented convention."""
     resolution = 24
     field_wp = wp.array(_sphere_field(resolution, 0.6), dtype=wp.float32, device=device)
-    vertices_np = tw.reconstruction.marching_cubes(twt.as_array3d_float32(field_wp))[0].numpy()
+    vertices_np = tw.reconstruction.marching_cubes(twt.as_array3d(field_wp, wp.float32))[0].numpy()
     assert vertices_np.min() >= 0.0
     assert vertices_np.max() <= float(resolution - 1)
     # Centred field, so the extracted surface is centred on the lattice centre.
@@ -924,14 +925,14 @@ def test_marching_cubes_index_space_by_default(device: str) -> None:
 
 def test_marching_cubes_empty_when_the_field_never_crosses(device: str) -> None:
     field_wp = wp.array(np.full((8, 8, 8), 1.0, dtype=np.float32), dtype=wp.float32, device=device)
-    _vertices_wp, faces_wp = tw.reconstruction.marching_cubes(twt.as_array3d_float32(field_wp))
+    _vertices_wp, faces_wp = tw.reconstruction.marching_cubes(twt.as_array3d(field_wp, wp.float32))
     assert int(faces_wp.shape[0]) == 0
 
 
 def test_marching_cubes_invalid(device: str) -> None:
     thin_wp = wp.array(np.zeros((1, 8, 8), dtype=np.float32), dtype=wp.float32, device=device)
     with pytest.raises(ValueError, match="at least 2 wide"):
-        tw.reconstruction.marching_cubes(twt.as_array3d_float32(thin_wp))
+        tw.reconstruction.marching_cubes(twt.as_array3d(thin_wp, wp.float32))
 
 
 @pytest.mark.parametrize("offset", [0.0, 0.2, -0.2])

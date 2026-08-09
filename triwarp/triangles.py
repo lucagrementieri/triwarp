@@ -81,11 +81,11 @@ def face_angles(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> twt.A
     [`trimesh.triangles.angles`][]
     """
     f = faces.shape[0] // 3
-    out_angle = twt.empty_float32_2d((f, 3), device=vertices.device)
+    out_angle = twt.empty_2d((f, 3), wp.float32, device=vertices.device)
     wp.launch(
         kernel_triangles.angles, dim=f, inputs=[vertices, faces, out_angle], device=vertices.device
     )
-    return twt.as_array2d_float32(out_angle)
+    return twt.as_array2d(out_angle, wp.float32)
 
 
 _QUALITY_METRICS: dict[str, wp.int32] = {

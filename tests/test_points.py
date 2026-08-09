@@ -458,7 +458,7 @@ def test_statistical_outlier_mask_matches_open3d(device: str) -> None:
 
 
 def test_statistical_outlier_mask_empty(device: str) -> None:
-    neighbor_distance_wp = twt.empty_float32_2d((0, 8), device=device)
+    neighbor_distance_wp = twt.empty_2d((0, 8), wp.float32, device=device)
     assert tw.statistical_outlier_mask(neighbor_distance_wp).shape == (0,)
 
 

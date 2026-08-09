@@ -293,14 +293,14 @@ def test_connected_component_labels_matches_pymeshlab(
 
 def test_connected_component_labels_empty_edges(device: str) -> None:
     node_count = 10
-    edges_wp = twt.empty_int32_2d((0, 2), device=device)
+    edges_wp = twt.empty_2d((0, 2), wp.int32, device=device)
     labels_wp = tw.graph.connected_component_labels_from_edges(edges_wp, node_count=node_count)
     labels_exp = _scipy_component_labels(np.empty((0, 2), dtype=np.int32), node_count)
     assert np.array_equal(labels_wp.numpy(), labels_exp)
 
 
 def test_connected_component_labels_zero_nodes(device: str) -> None:
-    edges_wp = twt.empty_int32_2d((0, 2), device=device)
+    edges_wp = twt.empty_2d((0, 2), wp.int32, device=device)
     labels_wp = tw.graph.connected_component_labels_from_edges(edges_wp, node_count=0)
     assert labels_wp.shape == (0,)
 
@@ -496,7 +496,7 @@ def test_successor_cycles_malformed_input_stays_in_range(device: str) -> None:
 
 
 def test_successor_cycles_empty(device: str) -> None:
-    edges_wp = twt.empty_int32_2d((0, 2), device=device)
+    edges_wp = twt.empty_2d((0, 2), wp.int32, device=device)
     flat_wp, offsets_wp, sizes_wp = tw.graph.successor_cycles(edges_wp, 5)
     assert flat_wp.shape == (0,)
     assert offsets_wp.shape == (0,)
@@ -648,7 +648,7 @@ def test_bfs_disconnected(device: str) -> None:
 
 
 def test_bfs_single_node(device: str) -> None:
-    edges_wp = twt.empty_int32_2d((0, 2), device=device)
+    edges_wp = twt.empty_2d((0, 2), wp.int32, device=device)
     order_wp, parents_wp, distances_wp = tw.graph.bfs_from_edges(edges_wp, 0, node_count=1)
     assert np.array_equal(order_wp.numpy(), np.array([0], dtype=np.int32))
     assert np.array_equal(parents_wp.numpy(), np.array([-1], dtype=np.int32))
@@ -658,7 +658,7 @@ def test_bfs_single_node(device: str) -> None:
 def test_bfs_empty_graph(device: str) -> None:
     node_count = 8
     source = 3
-    edges_wp = twt.empty_int32_2d((0, 2), device=device)
+    edges_wp = twt.empty_2d((0, 2), wp.int32, device=device)
     order_wp, parents_wp, distances_wp = tw.graph.bfs_from_edges(
         edges_wp, source, node_count=node_count
     )

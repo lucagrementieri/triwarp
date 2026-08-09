@@ -458,8 +458,8 @@ def _dart_throw_blue_noise(
         inputs=[grid_coords, wp.int32(grid_w), unique_keys, point_cell],
         device=device,
     )
-    cell_neighbors = twt.empty_int32_2d(
-        (n_cells, kernel_blue_noise.DART_SHELL_CELLS), device=device
+    cell_neighbors = twt.empty_2d(
+        (n_cells, kernel_blue_noise.DART_SHELL_CELLS), wp.int32, device=device
     )
     wp.launch(
         kernel_blue_noise.dart_cell_neighbors,

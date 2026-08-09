@@ -84,19 +84,13 @@ __all__ = [
     "FloatArray",
     "IntArray",
     "ScalarArray",
-    "as_array2d_float",
-    "as_array2d_float32",
-    "as_array2d_int32",
-    "as_array3d_bool",
-    "as_array3d_float32",
+    "as_array2d",
+    "as_array3d",
     "dtype_max",
     "dtype_min",
     "dtype_zero",
-    "empty_bool_3d",
-    "empty_float32_2d",
-    "empty_float32_3d",
-    "empty_float_2d",
-    "empty_int32_2d",
+    "empty_2d",
+    "empty_3d",
     "ensure_ndim",
 ]
 
@@ -134,70 +128,31 @@ def ensure_ndim(arr: wp.array[T], ndim: int, *, dtype: type | None = None) -> wp
     return arr
 
 
-def as_array2d_int32(arr: wp.array[T]) -> Array2dInt32:
+@overload
+def as_array2d(arr: wp.array[T], dtype: type[wp.int32]) -> Array2dInt32: ...
+@overload
+def as_array2d(arr: wp.array[T], dtype: type[wp.float32]) -> Array2dFloat32: ...
+@overload
+def as_array2d(arr: wp.array[T], dtype: type[wp.float64]) -> Array2dFloat64: ...
+def as_array2d(arr: wp.array[T], dtype: type) -> Array2dInt32 | Array2dFloat:
     """
-    Validate and narrow a Warp array to [`Array2dInt32`][triwarp.typing.Array2dInt32].
+    Validate and narrow a Warp array to the rank-2 alias for ``dtype``.
 
-    Parameters
-    ----------
-    arr
-        Warp array expected to be rank-2 ``int32``.
-
-    Returns
-    -------
-    Array2dInt32
-        ``arr`` unchanged, narrowed to the checked alias.
-
-    Raises
-    ------
-    TypeError
-        If ``arr`` is not rank-2 ``int32``.
-    """
-    ensure_ndim(arr, 2, dtype=wp.int32)
-    return cast(Array2dInt32, arr)
-
-
-def as_array2d_float32(arr: wp.array[T]) -> Array2dFloat32:
-    """
-    Validate and narrow a Warp array to [`Array2dFloat32`][triwarp.typing.Array2dFloat32].
-
-    Parameters
-    ----------
-    arr
-        Warp array expected to be rank-2 ``float32``.
-
-    Returns
-    -------
-    Array2dFloat32
-        ``arr`` unchanged, narrowed to the checked alias.
-
-    Raises
-    ------
-    TypeError
-        If ``arr`` is not rank-2 ``float32``.
-    """
-    ensure_ndim(arr, 2, dtype=wp.float32)
-    return cast(Array2dFloat32, arr)
-
-
-def as_array2d_float(arr: wp.array[T], *, dtype: type = wp.float32) -> Array2dFloat:
-    """
-    Validate and narrow a Warp array to [`Array2dFloat`][triwarp.typing.Array2dFloat].
-
-    The dtype-parameterized analogue of
-    [`as_array2d_float32`][triwarp.typing.as_array2d_float32]: use it for functions whose
-    result precision is chosen at call time (``wp.float32`` or ``wp.float64``).
+    One function for what used to be ``as_array2d_int32`` / ``as_array2d_float32`` /
+    ``as_array2d_float``: the dtype selects the return alias through overloads, so a call site keeps
+    the narrow type it had -- ``as_array2d(x, wp.int32)`` is an
+    [`Array2dInt32`][triwarp.typing.Array2dInt32], not a union.
 
     Parameters
     ----------
     arr
         Warp array expected to be rank-2 with scalar type ``dtype``.
     dtype
-        Expected floating-point scalar type: ``wp.float32`` (default) or ``wp.float64``.
+        Expected scalar type: ``wp.int32``, ``wp.float32`` or ``wp.float64``.
 
     Returns
     -------
-    Array2dFloat
+    Array2dInt32 | Array2dFloat32 | Array2dFloat64
         ``arr`` unchanged, narrowed to the checked alias.
 
     Raises
@@ -206,53 +161,38 @@ def as_array2d_float(arr: wp.array[T], *, dtype: type = wp.float32) -> Array2dFl
         If ``arr`` is not rank-2 with scalar type ``dtype``.
     """
     ensure_ndim(arr, 2, dtype=dtype)
-    return cast(Array2dFloat, arr)
+    return cast(Array2dInt32 | Array2dFloat, arr)
 
 
-def as_array3d_float32(arr: wp.array[T]) -> Array3dFloat32:
+@overload
+def as_array3d(arr: wp.array[T], dtype: type[wp.float32]) -> Array3dFloat32: ...
+@overload
+def as_array3d(arr: wp.array[T], dtype: type[wp.bool]) -> Array3dBool: ...
+def as_array3d(arr: wp.array[T], dtype: type) -> Array3dFloat32 | Array3dBool:
     """
-    Validate and narrow a Warp array to [`Array3dFloat32`][triwarp.typing.Array3dFloat32].
+    Validate and narrow a Warp array to the rank-3 alias for ``dtype``.
+
+    The rank-3 counterpart of [`as_array2d`][triwarp.typing.as_array2d].
 
     Parameters
     ----------
     arr
-        Warp array expected to be rank-3 ``float32``.
+        Warp array expected to be rank-3 with scalar type ``dtype``.
+    dtype
+        Expected scalar type: ``wp.float32`` or ``wp.bool``.
 
     Returns
     -------
-    Array3dFloat32
+    Array3dFloat32 | Array3dBool
         ``arr`` unchanged, narrowed to the checked alias.
 
     Raises
     ------
     TypeError
-        If ``arr`` is not rank-3 ``float32``.
+        If ``arr`` is not rank-3 with scalar type ``dtype``.
     """
-    ensure_ndim(arr, 3, dtype=wp.float32)
-    return cast(Array3dFloat32, arr)
-
-
-def as_array3d_bool(arr: wp.array[T]) -> Array3dBool:
-    """
-    Validate and narrow a Warp array to [`Array3dBool`][triwarp.typing.Array3dBool].
-
-    Parameters
-    ----------
-    arr
-        Warp array expected to be rank-3 ``wp.bool``.
-
-    Returns
-    -------
-    Array3dBool
-        ``arr`` unchanged, narrowed to the checked alias.
-
-    Raises
-    ------
-    TypeError
-        If ``arr`` is not rank-3 ``wp.bool``.
-    """
-    ensure_ndim(arr, 3, dtype=wp.bool)
-    return cast(Array3dBool, arr)
+    ensure_ndim(arr, 3, dtype=dtype)
+    return cast(Array3dFloat32 | Array3dBool, arr)
 
 
 @overload
@@ -335,48 +275,6 @@ def _shape_2d(shape: tuple[int, int] | list[int]) -> tuple[int, int]:
     return (dims[0], dims[1])
 
 
-def empty_int32_2d(
-    shape: tuple[int, int] | list[int], *, device: wp.DeviceLike = None
-) -> Array2dInt32:
-    """
-    Allocate an uninitialized rank-2 ``int32`` Warp array.
-
-    Parameters
-    ----------
-    shape
-        ``(rows, cols)`` shape of the allocated array.
-    device
-        Target Warp device.
-
-    Returns
-    -------
-    Array2dInt32
-        Uninitialized ``(rows, cols)`` ``int32`` array on ``device``.
-    """
-    return cast(Array2dInt32, wp.empty(_shape_2d(shape), dtype=wp.int32, device=device))
-
-
-def empty_float32_2d(
-    shape: tuple[int, int] | list[int], *, device: wp.DeviceLike = None
-) -> Array2dFloat32:
-    """
-    Allocate an uninitialized rank-2 ``float32`` Warp array.
-
-    Parameters
-    ----------
-    shape
-        ``(rows, cols)`` shape of the allocated array.
-    device
-        Target Warp device.
-
-    Returns
-    -------
-    Array2dFloat32
-        Uninitialized ``(rows, cols)`` ``float32`` array on ``device``.
-    """
-    return cast(Array2dFloat32, wp.empty(_shape_2d(shape), dtype=wp.float32, device=device))
-
-
 def _shape_3d(shape: tuple[int, int, int] | list[int]) -> tuple[int, int, int]:
     dims = tuple(int(x) for x in shape)
     if len(dims) != 3:
@@ -384,69 +282,79 @@ def _shape_3d(shape: tuple[int, int, int] | list[int]) -> tuple[int, int, int]:
     return (dims[0], dims[1], dims[2])
 
 
-def empty_bool_3d(
-    shape: tuple[int, int, int] | list[int], *, device: wp.DeviceLike = None
-) -> Array3dBool:
+@overload
+def empty_2d(
+    shape: tuple[int, int] | list[int], dtype: type[wp.int32], *, device: wp.DeviceLike = None
+) -> Array2dInt32: ...
+@overload
+def empty_2d(
+    shape: tuple[int, int] | list[int], dtype: type[wp.float32], *, device: wp.DeviceLike = None
+) -> Array2dFloat32: ...
+@overload
+def empty_2d(
+    shape: tuple[int, int] | list[int], dtype: type[wp.float64], *, device: wp.DeviceLike = None
+) -> Array2dFloat64: ...
+def empty_2d(
+    shape: tuple[int, int] | list[int], dtype: type, *, device: wp.DeviceLike = None
+) -> Array2dInt32 | Array2dFloat:
     """
-    Allocate an uninitialized rank-3 ``wp.bool`` Warp array.
+    Allocate an uninitialized rank-2 Warp array of the given scalar type.
 
-    Parameters
-    ----------
-    shape
-        ``(nx, ny, nz)`` shape of the allocated array.
-    device
-        Target Warp device.
-
-    Returns
-    -------
-    Array3dBool
-        Uninitialized ``(nx, ny, nz)`` ``wp.bool`` array on ``device``.
-    """
-    return cast(Array3dBool, wp.empty(_shape_3d(shape), dtype=wp.bool, device=device))
-
-
-def empty_float32_3d(
-    shape: tuple[int, int, int] | list[int], *, device: wp.DeviceLike = None
-) -> Array3dFloat32:
-    """
-    Allocate an uninitialized rank-3 ``float32`` Warp array.
-
-    Parameters
-    ----------
-    shape
-        ``(nx, ny, nz)`` shape of the allocated array.
-    device
-        Target Warp device.
-
-    Returns
-    -------
-    Array3dFloat32
-        Uninitialized ``(nx, ny, nz)`` ``float32`` array on ``device``.
-    """
-    return cast(Array3dFloat32, wp.empty(_shape_3d(shape), dtype=wp.float32, device=device))
-
-
-def empty_float_2d(
-    shape: tuple[int, int] | list[int], *, dtype: type = wp.float32, device: wp.DeviceLike = None
-) -> Array2dFloat:
-    """
-    Allocate an uninitialized rank-2 floating-point Warp array of the given precision.
-
-    The dtype-parameterized analogue of
-    [`empty_float32_2d`][triwarp.typing.empty_float32_2d].
+    One function for what used to be ``empty_int32_2d`` / ``empty_float32_2d`` / ``empty_float_2d``.
+    The dtype selects the return alias through overloads, so a call site keeps the narrow type it
+    had rather than falling back to a union -- verified with ``reveal_type`` under this repo's
+    basedpyright config, which is the only place Warp's stubs resolve.
 
     Parameters
     ----------
     shape
         ``(rows, cols)`` shape of the allocated array.
     dtype
-        Floating-point scalar type: ``wp.float32`` (default) or ``wp.float64``.
+        Scalar type: ``wp.int32``, ``wp.float32`` or ``wp.float64``.
     device
         Target Warp device.
 
     Returns
     -------
-    Array2dFloat
+    Array2dInt32 | Array2dFloat32 | Array2dFloat64
         Uninitialized ``(rows, cols)`` array of scalar type ``dtype`` on ``device``.
     """
-    return cast(Array2dFloat, wp.empty(_shape_2d(shape), dtype=dtype, device=device))
+    return cast(Array2dInt32 | Array2dFloat, wp.empty(_shape_2d(shape), dtype=dtype, device=device))
+
+
+@overload
+def empty_3d(
+    shape: tuple[int, int, int] | list[int],
+    dtype: type[wp.float32],
+    *,
+    device: wp.DeviceLike = None,
+) -> Array3dFloat32: ...
+@overload
+def empty_3d(
+    shape: tuple[int, int, int] | list[int], dtype: type[wp.bool], *, device: wp.DeviceLike = None
+) -> Array3dBool: ...
+def empty_3d(
+    shape: tuple[int, int, int] | list[int], dtype: type, *, device: wp.DeviceLike = None
+) -> Array3dFloat32 | Array3dBool:
+    """
+    Allocate an uninitialized rank-3 Warp array of the given scalar type.
+
+    The rank-3 counterpart of [`empty_2d`][triwarp.typing.empty_2d].
+
+    Parameters
+    ----------
+    shape
+        ``(nx, ny, nz)`` shape of the allocated array.
+    dtype
+        Scalar type: ``wp.float32`` or ``wp.bool``.
+    device
+        Target Warp device.
+
+    Returns
+    -------
+    Array3dFloat32 | Array3dBool
+        Uninitialized ``(nx, ny, nz)`` array of scalar type ``dtype`` on ``device``.
+    """
+    return cast(
+        Array3dFloat32 | Array3dBool, wp.empty(_shape_3d(shape), dtype=dtype, device=device)
+    )

@@ -53,7 +53,7 @@ def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
     n = int(values.shape[0])
     device = values.device
     if n < length or length <= 0:
-        return twt.as_array2d_int32(twt.empty_int32_2d((0, max(length, 0)), device=device))
+        return twt.as_array2d(twt.empty_2d((0, max(length, 0)), wp.int32, device=device), wp.int32)
 
     sort_dtype = sortable_dtype(values.dtype)
     values_buffer = wp.empty(2 * n, dtype=sort_dtype, device=device)
@@ -77,15 +77,15 @@ def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
     starts = tw.array.flatnonzero(is_start)
     n_groups = int(starts.shape[0])
     if n_groups == 0:
-        return twt.as_array2d_int32(twt.empty_int32_2d((0, length), device=device))
-    groups = twt.empty_int32_2d((n_groups, length), device=device)
+        return twt.as_array2d(twt.empty_2d((0, length), wp.int32, device=device), wp.int32)
+    groups = twt.empty_2d((n_groups, length), wp.int32, device=device)
     wp.launch(
         kernel_grouping.emit_groups,
         dim=n_groups,
         inputs=[starts, indices_buffer, groups],
         device=device,
     )
-    return twt.as_array2d_int32(groups)
+    return twt.as_array2d(groups, wp.int32)
 
 
 def group_int_rows(
@@ -328,9 +328,9 @@ def unique_rows(
         if is_vec3:
             empty_unique = wp.empty(0, dtype=wp.vec3, device=device)
         elif data.dtype == wp.int32:
-            empty_unique = twt.empty_int32_2d((0, int(data.shape[1])), device=device)
+            empty_unique = twt.empty_2d((0, int(data.shape[1])), wp.int32, device=device)
         else:
-            empty_unique = twt.empty_float32_2d((0, int(data.shape[1])), device=device)
+            empty_unique = twt.empty_2d((0, int(data.shape[1])), wp.float32, device=device)
         empty_i32 = wp.empty(0, dtype=wp.int32, device=device)
         return _pack_unique_result(
             empty_unique,
@@ -404,7 +404,7 @@ def unique_faces(
         return empty_faces
 
     faces2d = faces.reshape((-1, 3))
-    sorted_faces = twt.empty_int32_2d((n_faces, 3), device=device)
+    sorted_faces = twt.empty_2d((n_faces, 3), wp.int32, device=device)
     wp.launch(
         kernel_grouping.sort_face_indices,
         dim=n_faces,
@@ -583,7 +583,7 @@ def hash_vector_rows(data: wp.array[wp.vec3], epsilon: float = 0.0) -> wp.array[
         # widest single extent rather than the whole diagonal, which matters because the row packing
         # is only injective while ``radix ** 3`` fits a ``uint64``.
         min_bound, max_bound = tw.bounds.aabb_bounds(data)
-        rounded = twt.empty_int32_2d((n, 3), device=data.device)
+        rounded = twt.empty_2d((n, 3), wp.int32, device=data.device)
         wp.launch(
             kernel_grouping.round_vec3_scaled,
             dim=n,

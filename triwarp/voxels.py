@@ -225,7 +225,7 @@ def voxelize_mesh(
     if total == 0:
         return _empty_grid(voxel_size, origin, device)
 
-    candidate_cells = twt.empty_int32_2d((total, 3), device=device)
+    candidate_cells = twt.empty_2d((total, 3), wp.int32, device=device)
     accepted = wp.empty(total, dtype=wp.int32, device=device)
     wp.launch(
         kernel_voxels.test_triangle_candidates,
@@ -510,8 +510,8 @@ def cells(grid: wp.Volume, *, order: Literal["grid", "sorted"] = "grid") -> twt.
     _require_index_grid(grid)
     n_voxels = _voxel_count(grid)
     if n_voxels == 0:
-        return twt.empty_int32_2d((0, 3), device=grid.device)
-    rows = twt.as_array2d_int32(grid.get_voxels()[:n_voxels])
+        return twt.empty_2d((0, 3), wp.int32, device=grid.device)
+    rows = twt.as_array2d(grid.get_voxels()[:n_voxels], wp.int32)
     if order == "grid":
         return rows
 
@@ -530,7 +530,7 @@ def cells(grid: wp.Volume, *, order: Literal["grid", "sorted"] = "grid") -> twt.
         device=grid.device,
     )
     _sorted_keys, permutation = tw.array.sort_and_argsort(keys)
-    return twt.as_array2d_int32(tw.array.gather(rows, permutation))
+    return twt.as_array2d(tw.array.gather(rows, permutation), wp.int32)
 
 
 def from_cells(cells: twt.Array2dInt32, voxel_size: float, origin: wp.vec3) -> wp.Volume:
@@ -719,7 +719,7 @@ def cell_indices(
     if voxel_size <= 0.0:
         raise ValueError(f"cell_indices requires voxel_size > 0, got {voxel_size}")
     n_points = int(points.shape[0])
-    out_cells = twt.empty_int32_2d((n_points, 3), device=points.device)
+    out_cells = twt.empty_2d((n_points, 3), wp.int32, device=points.device)
     if n_points == 0:
         return out_cells
     wp.launch(
@@ -982,7 +982,7 @@ def fill_holes(grid: wp.Volume) -> wp.Volume:
         inputs=[occupancy, labels, outside],
         device=device,
     )
-    filled = twt.empty_bool_3d(dims, device=device)
+    filled = twt.empty_3d(dims, wp.bool, device=device)
     wp.launch(
         kernel_voxels.fill_enclosed_cells,
         dim=dims,
@@ -1028,8 +1028,8 @@ def fill_orthographic(grid: wp.Volume) -> wp.Volume:
 
     occupancy, origin_cell = _to_dense_padded(grid, pad=0)
     dims = (int(occupancy.shape[0]), int(occupancy.shape[1]), int(occupancy.shape[2]))
-    filled = twt.empty_bool_3d(dims, device=device)
-    scratch = twt.empty_bool_3d(dims, device=device)
+    filled = twt.empty_3d(dims, wp.bool, device=device)
+    scratch = twt.empty_3d(dims, wp.bool, device=device)
     for axis in range(3):
         other = [dims[a] for a in range(3) if a != axis]
         target = filled if axis == 0 else scratch
@@ -1104,7 +1104,7 @@ def dilate(
             return _empty_grid(voxel_size, origin, device)
         stencil = _stencil(connectivity, device, include_self=True)
         n_offsets = int(stencil.shape[0])
-        candidates = twt.empty_int32_2d((n_voxels * n_offsets, 3), device=device)
+        candidates = twt.empty_2d((n_voxels * n_offsets, 3), wp.int32, device=device)
         wp.launch(
             kernel_voxels.neighborhood_candidates,
             dim=(n_voxels, n_offsets),
@@ -1270,7 +1270,7 @@ def to_dense(
     dims = (int(shape[0]), int(shape[1]), int(shape[2]))
     if len(dims) != 3 or min(dims) < 1:
         raise ValueError(f"shape must be three positive integers, got {shape!r}")
-    occupancy = twt.empty_bool_3d(dims, device=grid.device)
+    occupancy = twt.empty_3d(dims, wp.bool, device=grid.device)
     wp.launch(
         kernel_voxels.dense_occupancy,
         dim=dims,
@@ -1321,7 +1321,7 @@ def from_dense(
     [`to_dense`][triwarp.voxels.to_dense]
     [`from_cells`][triwarp.voxels.from_cells]
     """
-    occupancy = twt.as_array3d_bool(occupancy)
+    occupancy = twt.as_array3d(occupancy, wp.bool)
     if voxel_size <= 0.0:
         raise ValueError(f"from_dense requires voxel_size > 0, got {voxel_size}")
     device = occupancy.device
@@ -1330,7 +1330,7 @@ def from_dense(
     if n_cells == 0:
         return _empty_grid(voxel_size, origin, device)
 
-    candidates = twt.empty_int32_2d((n_cells, 3), device=device)
+    candidates = twt.empty_2d((n_cells, 3), wp.int32, device=device)
     mask = wp.empty(n_cells, dtype=wp.int32, device=device)
     wp.launch(
         kernel_voxels.occupied_cells,
@@ -1399,7 +1399,7 @@ def to_field(
     lower_cell, extent = _cell_bounds(grid)
     base = (lower_cell[0] - pad, lower_cell[1] - pad, lower_cell[2] - pad)
     dims = (extent[0] + 2 * pad, extent[1] + 2 * pad, extent[2] + 2 * pad)
-    field = twt.empty_float32_3d(dims, device=grid.device)
+    field = twt.empty_3d(dims, wp.float32, device=grid.device)
     wp.launch(
         kernel_voxels.dense_field,
         dim=dims,
@@ -1410,7 +1410,7 @@ def to_field(
     upper = wp.vec3(
         *(origin[axis] + (base[axis] + dims[axis] - 0.5) * voxel_size for axis in range(3))
     )
-    return twt.as_array3d_float32(field), (lower, upper)
+    return twt.as_array3d(field, wp.float32), (lower, upper)
 
 
 def to_boxes(
@@ -1551,7 +1551,9 @@ def voxel_corners(grid: wp.Volume) -> tuple[twt.Array2dInt32, twt.Array2dInt32]:
     voxels = cells(grid)
     n_voxels = int(voxels.shape[0])
     if n_voxels == 0:
-        return twt.empty_int32_2d((0, 3), device=device), twt.empty_int32_2d((0, 8), device=device)
+        return twt.empty_2d((0, 3), wp.int32, device=device), twt.empty_2d(
+            (0, 8), wp.int32, device=device
+        )
 
     # Deferred: importing ``warp.fem`` costs ~0.15 s of ``import triwarp`` and only this path
     # needs it.
@@ -1559,8 +1561,8 @@ def voxel_corners(grid: wp.Volume) -> tuple[twt.Array2dInt32, twt.Array2dInt32]:
 
     corner_grid = fem.Nanogrid(grid).vertex_grid
     n_corners = int(corner_grid.get_active_stats().voxel_count)
-    corner_cells = twt.as_array2d_int32(corner_grid.get_voxels()[:n_corners])
-    cell_corners = twt.empty_int32_2d((n_voxels, 8), device=device)
+    corner_cells = twt.as_array2d(corner_grid.get_voxels()[:n_corners], wp.int32)
+    cell_corners = twt.empty_2d((n_voxels, 8), wp.int32, device=device)
     wp.launch(
         kernel_voxels.cell_corner_indices,
         dim=n_voxels,
@@ -1712,8 +1714,8 @@ def _stencil(connectivity: int, device: wp.DeviceLike, *, include_self: bool) ->
         for k in (-1, 0, 1)
         if (abs(i) + abs(j) + abs(k) <= rank) and (include_self or (i, j, k) != (0, 0, 0))
     ]
-    stencil = twt.as_array2d_int32(
-        wp.array(np.array(offsets, dtype=np.int32), dtype=wp.int32, device=device)
+    stencil = twt.as_array2d(
+        wp.array(np.array(offsets, dtype=np.int32), dtype=wp.int32, device=device), wp.int32
     )
     _STENCIL_CACHE[key] = stencil
     return stencil
@@ -1724,7 +1726,7 @@ def _face_neighbors(device: wp.DeviceLike) -> twt.Array2dInt32:
     key = (str(device), 0, False)
     cached = _STENCIL_CACHE.get(key)
     if cached is None:
-        cached = twt.as_array2d_int32(wp.array(_FACE_NEIGHBORS, dtype=wp.int32, device=device))
+        cached = twt.as_array2d(wp.array(_FACE_NEIGHBORS, dtype=wp.int32, device=device), wp.int32)
         _STENCIL_CACHE[key] = cached
     return cached
 
@@ -1734,6 +1736,6 @@ def _face_corner_table(device: wp.DeviceLike) -> twt.Array2dInt32:
     key = (str(device), 1, False)
     cached = _STENCIL_CACHE.get(key)
     if cached is None:
-        cached = twt.as_array2d_int32(wp.array(_FACE_CORNERS, dtype=wp.int32, device=device))
+        cached = twt.as_array2d(wp.array(_FACE_CORNERS, dtype=wp.int32, device=device), wp.int32)
         _STENCIL_CACHE[key] = cached
     return cached

@@ -236,7 +236,7 @@ def marching_triangles(
     edge_ids = tw.edges.edges_unique_inverse(faces, n_vertices=n_vertices)
     valid = wp.empty(n_faces, dtype=wp.bool, device=device)
     segments = wp.empty((n_faces, 2), dtype=wp.vec3, device=device)
-    segment_edges = twt.empty_int32_2d((n_faces, 2), device=device)
+    segment_edges = twt.empty_2d((n_faces, 2), wp.int32, device=device)
     wp.launch(
         kernel_intersections.marching_triangles_segments,
         dim=n_faces,
@@ -250,7 +250,7 @@ def marching_triangles(
         return [], []
 
     hit_segments = tw.array.gather(segments, cut_faces)
-    hit_edges = twt.as_array2d_int32(tw.array.gather(segment_edges, cut_faces))
+    hit_edges = twt.as_array2d(tw.array.gather(segment_edges, cut_faces), wp.int32)
 
     chains, closed = _link_segments(hit_edges.numpy())
     if not chains:
@@ -389,7 +389,7 @@ def mesh_with_mesh(
     if n_pairs == 0:
         return wp.empty((0, 2), dtype=wp.vec3, device=device)
 
-    pairs = twt.empty_int32_2d((n_pairs, 2), device=device)
+    pairs = twt.empty_2d((n_pairs, 2), wp.int32, device=device)
     wp.launch(
         kernel_intersections.expand_query_target_pairs,
         dim=n_query,
@@ -410,7 +410,7 @@ def mesh_with_mesh(
     if n_hit == 0:
         return wp.empty((0, 2), dtype=wp.vec3, device=device)
 
-    hit_pairs = twt.as_array2d_int32(tw.array.gather(pairs, hit_pair_indices))
+    hit_pairs = twt.as_array2d(tw.array.gather(pairs, hit_pair_indices), wp.int32)
 
     segments = wp.empty((n_hit, 2), dtype=wp.vec3, device=device)
     wp.launch(
@@ -497,7 +497,7 @@ def slice_mesh_with_plane(
     )
 
     face_classes = wp.empty(n_faces, dtype=wp.int32, device=device)
-    face_signs = twt.empty_int32_2d((n_faces, 3), device=device)
+    face_signs = twt.empty_2d((n_faces, 3), wp.int32, device=device)
     wp.launch(
         kernel_intersections.classify_faces_for_slice,
         dim=n_faces,

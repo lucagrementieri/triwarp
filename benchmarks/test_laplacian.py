@@ -86,12 +86,13 @@ def _edge_lengths_wp(bench_case: BenchCase) -> twt.Array2dFloat32:
     """Upload the same table as a float32 ``(n_faces, 3)`` buffer on this case's device."""
     key = (bench_case.mesh_name, str(bench_case.device))
     if key not in _edge_lengths_wp_cache:
-        _edge_lengths_wp_cache[key] = twt.as_array2d_float32(
+        _edge_lengths_wp_cache[key] = twt.as_array2d(
             wp.array(
                 np.ascontiguousarray(_edge_lengths_np(bench_case), dtype=np.float32),
                 dtype=wp.float32,
                 device=bench_case.device,
-            )
+            ),
+            wp.float32,
         )
     return _edge_lengths_wp_cache[key]
 

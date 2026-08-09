@@ -185,7 +185,7 @@ def duplicate_vertex_inverse(vertices: wp.array[wp.vec3], epsilon: float) -> wp.
         row_keys = hash_vector_rows(vertices, epsilon=epsilon)
         _, inverse = unique_1d(row_keys, return_inverse=True)
     else:
-        rows = twt.empty_float32_2d((n, 3), device=device)
+        rows = twt.empty_2d((n, 3), wp.float32, device=device)
         wp.utils.array_cast(vertices, rows)
         _, inverse = unique_rows(rows, return_inverse=True)
     return inverse
@@ -483,7 +483,7 @@ def split_nonmanifold(
         device=device,
     )
 
-    links = twt.empty_int32_2d((2 * n_unique, 2), device=device)
+    links = twt.empty_2d((2 * n_unique, 2), wp.int32, device=device)
     wp.launch(
         kernel_repair.corner_merge_links,
         dim=n_unique,
@@ -571,7 +571,7 @@ def collapse_small_triangles(
         if n_current == 0:
             break
 
-        pairs = twt.empty_int32_2d((n_current, 2), device=device)
+        pairs = twt.empty_2d((n_current, 2), wp.int32, device=device)
         flag = wp.empty(n_current, dtype=wp.int32, device=device)
         wp.launch(
             kernel_repair.small_triangle_collapse_edges,

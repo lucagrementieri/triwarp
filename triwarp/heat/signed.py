@@ -205,9 +205,11 @@ def _curve_segments(
         if closed:
             pairs.append(np.array([[curve[-1], curve[0]]], dtype=curve.dtype))
     if not pairs:
-        return twt.empty_int32_2d((0, 2), device=curve_vertices.device)
+        return twt.empty_2d((0, 2), wp.int32, device=curve_vertices.device)
     segments = np.ascontiguousarray(np.concatenate(pairs), dtype=np.int32)
-    return twt.as_array2d_int32(wp.array(segments, dtype=wp.int32, device=curve_vertices.device))
+    return twt.as_array2d(
+        wp.array(segments, dtype=wp.int32, device=curve_vertices.device), wp.int32
+    )
 
 
 def _solve_poisson_zero_set(
@@ -232,7 +234,7 @@ def _solve_poisson_zero_set(
 
     zeros = wp.zeros((1, n_vertices), dtype=wp.float64, device=device)
     operator_uu, rhs = twl.assemble_interior_system(
-        operator, fixed_mask, free_map, twt.as_array2d_float(zeros, dtype=wp.float64), n_free
+        operator, fixed_mask, free_map, twt.as_array2d(zeros, wp.float64), n_free
     )
     # Flip sign with the operator: the Poisson right-hand side is -div for the -L convention.
     negated = wp.empty(n_vertices, dtype=wp.float64, device=device)
@@ -245,9 +247,7 @@ def _solve_poisson_zero_set(
     )
 
     solution = wp.zeros((1, n_free), dtype=wp.float64, device=device)
-    twl.solve_spd_columns(
-        operator_uu, rhs, twt.as_array2d_float(solution, dtype=wp.float64), tol=_CG_TOLERANCE
-    )
+    twl.solve_spd_columns(operator_uu, rhs, twt.as_array2d(solution, wp.float64), tol=_CG_TOLERANCE)
     field = wp.empty(n_vertices, dtype=wp.float64, device=device)
     wp.launch(
         kernel_heat_signed.gather_free_solution,

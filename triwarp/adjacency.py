@@ -91,9 +91,9 @@ def face_adjacency(
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
-        empty_array = twt.empty_int32_2d((0, 2), device=device)
+        empty_array = twt.empty_2d((0, 2), wp.int32, device=device)
         if return_edges:
-            return empty_array, twt.empty_int32_2d((0, 2), device=device)
+            return empty_array, twt.empty_2d((0, 2), wp.int32, device=device)
         return empty_array
 
     if return_edges and edges_sorted is None:
@@ -102,7 +102,7 @@ def face_adjacency(
 
     # Edge ``e`` belongs to face ``e // 3``, so the owning faces need no ``edges_face`` table, no
     # gather through it, and no row sort — one kernel does the division and orders the pair.
-    adjacency = twt.empty_int32_2d((int(edge_groups.shape[0]), 2), device=device)
+    adjacency = twt.empty_2d((int(edge_groups.shape[0]), 2), wp.int32, device=device)
     if int(edge_groups.shape[0]) > 0:
         wp.launch(
             kernel_adjacency.edge_pairs_to_face_pairs,
@@ -119,9 +119,9 @@ def face_adjacency(
             first_edge_index = wp.clone(edge_groups[:, 0])
             adjacency_edges = tw.array.gather(edges_sorted, first_edge_index)
         else:
-            adjacency_edges = twt.empty_int32_2d((0, 2), device=device)
-        return twt.as_array2d_int32(adjacency), twt.as_array2d_int32(adjacency_edges)
-    return twt.as_array2d_int32(adjacency)
+            adjacency_edges = twt.empty_2d((0, 2), wp.int32, device=device)
+        return twt.as_array2d(adjacency, wp.int32), twt.as_array2d(adjacency_edges, wp.int32)
+    return twt.as_array2d(adjacency, wp.int32)
 
 
 def resolved_face_adjacency(
@@ -212,7 +212,7 @@ def _edge_groups(
         inputs=[faces, wp.uint64(_hash_radix(faces, n_vertices)), edge_keys],
         device=faces.device,
     )
-    return twt.as_array2d_int32(tw.grouping.group(edge_keys, 2))
+    return twt.as_array2d(tw.grouping.group(edge_keys, 2), wp.int32)
 
 
 def _hash_radix(faces: wp.array[wp.int32], n_vertices: int | None) -> int:
@@ -381,10 +381,10 @@ def face_adjacency_unshared(
         edge_groups = (
             _edge_groups(faces, None, n_vertices)
             if n_faces > 0
-            else twt.empty_int32_2d((0, 2), device=faces.device)
+            else twt.empty_2d((0, 2), wp.int32, device=faces.device)
         )
         m = int(edge_groups.shape[0])
-        unshared = twt.empty_int32_2d((m, 2), device=faces.device)
+        unshared = twt.empty_2d((m, 2), wp.int32, device=faces.device)
         if m > 0:
             wp.launch(
                 kernel_adjacency.face_adjacency_unshared_from_edges,
@@ -392,7 +392,7 @@ def face_adjacency_unshared(
                 inputs=[faces, edge_groups, unshared],
                 device=faces.device,
             )
-        return twt.as_array2d_int32(unshared)
+        return twt.as_array2d(unshared, wp.int32)
     assert face_adjacency_edges is not None
     if face_adjacency.shape[0] != face_adjacency_edges.shape[0]:
         raise ValueError(
@@ -400,7 +400,7 @@ def face_adjacency_unshared(
             f"got {face_adjacency.shape[0]} and {face_adjacency_edges.shape[0]}"
         )
     m = int(face_adjacency.shape[0])
-    unshared = twt.empty_int32_2d((m, 2), device=faces.device)
+    unshared = twt.empty_2d((m, 2), wp.int32, device=faces.device)
     if m == 0:
         return unshared
     wp.launch(
@@ -409,7 +409,7 @@ def face_adjacency_unshared(
         inputs=[faces, face_adjacency, face_adjacency_edges, unshared],
         device=faces.device,
     )
-    return twt.as_array2d_int32(unshared)
+    return twt.as_array2d(unshared, wp.int32)
 
 
 def face_adjacency_angles(

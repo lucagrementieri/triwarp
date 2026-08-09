@@ -51,7 +51,7 @@ def region_boundary_edges(
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
-        return twt.empty_int32_2d((0, 2), device=device)
+        return twt.empty_2d((0, 2), wp.int32, device=device)
     if n_vertices is None:
         n_vertices = tw.vertices.n_vertices(faces)
     unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
@@ -67,7 +67,7 @@ def region_boundary_edges(
     flag = wp.empty(m, dtype=wp.bool, device=device)
     wp.map(kernel_selection.region_boundary_flag, count, region_count, out=flag)
     ids = tw.array.flatnonzero(flag)
-    return twt.as_array2d_int32(tw.array.gather(unique_edges, ids))
+    return twt.as_array2d(tw.array.gather(unique_edges, ids), wp.int32)
 
 
 def exclude_fully_selected_components(

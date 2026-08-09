@@ -283,7 +283,7 @@ def _vertex_manifold_flags(
     n_corners = int(faces.shape[0]) // 3 * 3
     m = int(face_adjacency.shape[0])
 
-    corner_edges = twt.empty_int32_2d((2 * m, 2), device=device)
+    corner_edges = twt.empty_2d((2 * m, 2), wp.int32, device=device)
     if m > 0:
         wp.launch(
             kernel_validation.build_corner_adjacency_edges,
@@ -467,7 +467,7 @@ def _intersecting_pairs(
     if n_pairs == 0:
         return None
 
-    pairs = twt.empty_int32_2d((n_pairs, 2), device=device)
+    pairs = twt.empty_2d((n_pairs, 2), wp.int32, device=device)
     wp.launch(
         kernel_intersections.expand_query_target_pairs,
         dim=n_faces,
@@ -636,11 +636,11 @@ def face_orientation_bits(
     m = int(adjacency.shape[0])
 
     if m == 0:
-        signed_edges = twt.empty_int32_2d((0, 2), device=device)
+        signed_edges = twt.empty_2d((0, 2), wp.int32, device=device)
         signs = wp.empty(0, dtype=wp.int32, device=device)
         return wp.zeros(n_faces, dtype=wp.int32, device=device), signed_edges, signs, m
 
-    signed_edges = twt.empty_int32_2d((m, 2), device=device)
+    signed_edges = twt.empty_2d((m, 2), wp.int32, device=device)
     signs = wp.empty(m, dtype=wp.int32, device=device)
     wp.launch(
         kernel_validation.build_signed_face_edges,

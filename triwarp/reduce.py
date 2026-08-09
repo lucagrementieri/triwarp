@@ -275,7 +275,7 @@ def sum(
         return out_vec.list()[0]
     if array.dtype == wp.bool:
         mask = cast(wp.array[wp.bool], array)
-        mask_i32 = _bool_mask_as_int32(mask)
+        mask_i32 = astype(mask, wp.int32)
         if mask.ndim == 2 and axis is None:
             mask_i32 = mask_i32.flatten()
         result = _reduce_scalar(cast(twt.ScalarArray, mask_i32), axis, _SCALAR_REDUCE["sum"])
@@ -734,10 +734,6 @@ def _reduce_scalar(
     return _launch_global_scalar_tiled(array, spec)
 
 
-def _bool_mask_as_int32(mask: wp.array[wp.bool]) -> wp.array[wp.int32]:
-    return astype(mask, wp.int32)
-
-
 def _launch_global_bool_tiled(mask_i32: wp.array[wp.int32], spec: _BoolReduceSpec) -> bool:
     out = wp.full(1, spec.init_global, dtype=wp.int32, device=mask_i32.device)
     n = int(mask_i32.shape[0])
@@ -758,11 +754,11 @@ def _reduce_bool(
         raise ValueError(f"{spec.name} requires a non-empty array.")
 
     if array.ndim == 1:
-        mask_i32 = _bool_mask_as_int32(array)
+        mask_i32 = astype(array, wp.int32)
         return _launch_global_bool_tiled(mask_i32, spec)
 
     if array.ndim == 2:
-        mask_i32 = _bool_mask_as_int32(array)
+        mask_i32 = astype(array, wp.int32)
         n_rows, n_cols = int(array.shape[0]), int(array.shape[1])
         if axis is None:
             return _launch_global_bool_tiled(mask_i32.flatten(), spec)

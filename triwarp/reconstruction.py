@@ -193,9 +193,9 @@ def _repeated_oriented_triangles(
     device = candidates.device
     n_candidates = int(candidates.shape[0])
     if n_candidates < repetitions:
-        return twt.empty_int32_2d((0, 3), device=device)
+        return twt.empty_2d((0, 3), wp.int32, device=device)
 
-    sorted_keys = twt.empty_int32_2d((n_candidates, 3), device=device)
+    sorted_keys = twt.empty_2d((n_candidates, 3), wp.int32, device=device)
     wp.launch(
         kernel_reconstruction.canonicalize_triangles,
         dim=n_candidates,
@@ -205,9 +205,9 @@ def _repeated_oriented_triangles(
     groups = tw.grouping.group_int_rows(sorted_keys, repetitions, max_value=n_points)
     n_groups = int(groups.shape[0])
     if n_groups == 0:
-        return twt.empty_int32_2d((0, 3), device=device)
+        return twt.empty_2d((0, 3), wp.int32, device=device)
 
-    return twt.as_array2d_int32(tw.array.gather(candidates, wp.clone(groups[:, 0])))
+    return twt.as_array2d(tw.array.gather(candidates, wp.clone(groups[:, 0])), wp.int32)
 
 
 def triangulate_point_cloud(
@@ -330,7 +330,7 @@ def triangulate_point_cloud(
     kept = tw.array.flatnonzero(out_valid.reshape(-1))
     if int(kept.shape[0]) == 0:
         return points, wp.empty(0, dtype=wp.int32, device=device)
-    candidates = twt.as_array2d_int32(tw.array.gather(out_tris.reshape((n * k, 3)), kept))
+    candidates = twt.as_array2d(tw.array.gather(out_tris.reshape((n * k, 3)), kept), wp.int32)
 
     # Repeated oriented triangles: t3 (3 reps) preferred, then t2 (2 reps).
     t3 = _repeated_oriented_triangles(candidates, n, 3)
@@ -1034,7 +1034,7 @@ def marching_cubes(
     [`resample_uniform`][triwarp.reconstruction.resample_uniform] runs
     [`triwarp.repair`][triwarp.repair] over it for exactly that reason.
     """
-    field = twt.as_array3d_float32(field)
+    field = twt.as_array3d(field, wp.float32)
     shape = tuple(int(dim) for dim in field.shape)
     if min(shape) < 2:
         raise ValueError(f"field must be at least 2 wide along every axis, got {shape}")
@@ -1150,8 +1150,8 @@ def resample_uniform(
     )
     field = tw.proximity.signed_distance_on_mesh(vertices, faces, points, sign_mode=sign_mode)
     out_vertices, out_faces = marching_cubes(
-        twt.as_array3d_float32(
-            field.reshape((int(resolution[0]), int(resolution[1]), int(resolution[2])))
+        twt.as_array3d(
+            field.reshape((int(resolution[0]), int(resolution[1]), int(resolution[2]))), wp.float32
         ),
         iso=offset,
         bounds=(grid_lower, grid_upper),

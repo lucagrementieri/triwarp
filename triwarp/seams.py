@@ -93,10 +93,10 @@ def crease_edges(
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
-        return twt.empty_int32_2d((0, 2), device=device)
+        return twt.empty_2d((0, 2), wp.int32, device=device)
 
     adjacency, adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
-    selected = twt.empty_int32_2d((0, 2), device=device)
+    selected = twt.empty_2d((0, 2), wp.int32, device=device)
     if int(adjacency.shape[0]) > 0:
         angles = tw.adjacency.face_adjacency_angles(vertices, faces, face_adjacency=adjacency)
         mask = wp.empty(int(angles.shape[0]), dtype=wp.bool, device=device)
@@ -104,13 +104,13 @@ def crease_edges(
         selected = tw.array.gather(adjacency_edges, tw.array.flatnonzero(mask))
 
     if not include_boundary:
-        return twt.as_array2d_int32(selected)
+        return twt.as_array2d(selected, wp.int32)
     boundary = tw.boundary.boundary_edges(vertices, faces)
     if int(boundary.shape[0]) == 0:
-        return twt.as_array2d_int32(selected)
+        return twt.as_array2d(selected, wp.int32)
     if int(selected.shape[0]) == 0:
-        return twt.as_array2d_int32(boundary)
-    return twt.as_array2d_int32(tw.array.concatenate([selected, boundary]))
+        return twt.as_array2d(boundary, wp.int32)
+    return twt.as_array2d(tw.array.concatenate([selected, boundary]), wp.int32)
 
 
 def cut_along_edges(
@@ -192,7 +192,7 @@ def cut_along_edges(
         keys = tw.grouping.hash_indices_rows(edges, max_index=n_vertices)
         marked_keys, _order = tw.array.sort_and_argsort(keys)
 
-    union_edges = twt.empty_int32_2d((n_halfedges, 2), device=device)
+    union_edges = twt.empty_2d((n_halfedges, 2), wp.int32, device=device)
     count = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(
         kernel_seams.corner_union_edges,
@@ -206,7 +206,7 @@ def cut_along_edges(
     # kernel just produced, so they are in range by construction and the check would only add a
     # sync.
     labels = tw.graph.connected_component_labels_from_edges(
-        twt.as_array2d_int32(graph_edges), node_count=n_halfedges, validate=False
+        twt.as_array2d(graph_edges, wp.int32), node_count=n_halfedges, validate=False
     )
     unique_labels, corner_index = tw.grouping.unique_1d(labels, return_inverse=True)
 
@@ -340,9 +340,9 @@ def uv_seam_edges(
     device = faces.device
     if n_faces == 0:
         return (
-            twt.empty_int32_2d((0, 4), device=device),
-            twt.empty_int32_2d((0, 2), device=device),
-            twt.empty_int32_2d((0, 4), device=device),
+            twt.empty_2d((0, 4), wp.int32, device=device),
+            twt.empty_2d((0, 2), wp.int32, device=device),
+            twt.empty_2d((0, 4), wp.int32, device=device),
         )
     if face_texcoords is None:
         face_texcoords = tw.array.init_range(3 * n_faces, device)
@@ -352,7 +352,7 @@ def uv_seam_edges(
     is_seam = wp.empty(n_halfedges, dtype=wp.bool, device=device)
     is_boundary = wp.empty(n_halfedges, dtype=wp.bool, device=device)
     is_foldover = wp.empty(n_halfedges, dtype=wp.bool, device=device)
-    quads = twt.empty_int32_2d((n_halfedges, 4), device=device)
+    quads = twt.empty_2d((n_halfedges, 4), wp.int32, device=device)
     wp.launch(
         kernel_seams.classify_uv_halfedges,
         dim=n_halfedges,
@@ -372,7 +372,7 @@ def uv_seam_edges(
     )
 
     boundary_halfedges = tw.array.flatnonzero(is_boundary)
-    boundaries = twt.empty_int32_2d((int(boundary_halfedges.shape[0]), 2), device=device)
+    boundaries = twt.empty_2d((int(boundary_halfedges.shape[0]), 2), wp.int32, device=device)
     if int(boundary_halfedges.shape[0]) > 0:
         wp.launch(
             kernel_seams.boundary_face_corners,
@@ -381,9 +381,9 @@ def uv_seam_edges(
             device=device,
         )
     return (
-        twt.as_array2d_int32(tw.array.gather(quads, tw.array.flatnonzero(is_seam))),
-        twt.as_array2d_int32(boundaries),
-        twt.as_array2d_int32(tw.array.gather(quads, tw.array.flatnonzero(is_foldover))),
+        twt.as_array2d(tw.array.gather(quads, tw.array.flatnonzero(is_seam)), wp.int32),
+        twt.as_array2d(boundaries, wp.int32),
+        twt.as_array2d(tw.array.gather(quads, tw.array.flatnonzero(is_foldover)), wp.int32),
     )
 
 
@@ -430,7 +430,7 @@ def seam_edge_vertices(
 
     device = faces.device
     n_rows = int(face_corners.shape[0])
-    edges = twt.empty_int32_2d((n_rows, 2), device=device)
+    edges = twt.empty_2d((n_rows, 2), wp.int32, device=device)
     if n_rows > 0:
         wp.launch(
             kernel_seams.face_corner_edge_vertices,
@@ -438,7 +438,7 @@ def seam_edge_vertices(
             inputs=[faces, face_corners, edges],
             device=device,
         )
-    return twt.as_array2d_int32(edges)
+    return twt.as_array2d(edges, wp.int32)
 
 
 def uv_seam_vertex_mask(

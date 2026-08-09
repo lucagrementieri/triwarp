@@ -75,12 +75,13 @@ def _cut_edges(bench_case: BenchCase, fraction: float) -> twt.Array2dInt32:
             bench_case.vertices_wp, bench_case.faces_wp, angle=0.0
         ).numpy()
         stride = max(1, round(1.0 / fraction))
-        _cut_cache[key] = twt.as_array2d_int32(
+        _cut_cache[key] = twt.as_array2d(
             wp.array(
                 np.ascontiguousarray(all_edges[::stride], dtype=np.int32),
                 dtype=wp.int32,
                 device=bench_case.device,
-            )
+            ),
+            wp.int32,
         )
     return _cut_cache[key]
 

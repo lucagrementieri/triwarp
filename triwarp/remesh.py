@@ -486,7 +486,7 @@ def _flip_interior_edges(
         sorted_keys, _order = tw.array.sort_and_argsort(keys)
 
         out_flip = wp.zeros(m, dtype=wp.bool, device=device)
-        out_quad = twt.empty_int32_2d((m, 4), device=device)
+        out_quad = twt.empty_2d((m, 4), wp.int32, device=device)
         launch_candidates(
             adjacency,
             adjacency_edges,
@@ -1406,7 +1406,7 @@ def intrinsic_delaunay(
         sorted_keys, _order = tw.array.sort_and_argsort(keys)
 
         flip = wp.zeros(n_interior, dtype=wp.bool, device=device)
-        quad = twt.empty_int32_2d((n_interior, 4), device=device)
+        quad = twt.empty_2d((n_interior, 4), wp.int32, device=device)
         new_length = wp.empty(n_interior, dtype=wp.float32, device=device)
         wp.launch(
             kernel_remesh.intrinsic_delaunay_candidates,
@@ -1815,7 +1815,7 @@ def subdivide_to_size(
         face_mid = tw.array.gather(midpoint_idx, inverse).reshape((n_faces, 3))
 
         # Emit up to four triangles per face into fixed slots, then compact.
-        out_faces = twt.empty_int32_2d((n_faces * 4, 3), device=device)
+        out_faces = twt.empty_2d((n_faces * 4, 3), wp.int32, device=device)
         out_valid = wp.empty(n_faces * 4, dtype=wp.bool, device=device)
         out_slot_index = wp.empty(n_faces * 4, dtype=wp.int32, device=device)
         wp.launch(
@@ -2023,7 +2023,7 @@ def subdivide_region_to_size(
         current_vertices, _ = tw.array.pack_1d_arrays([current_vertices, new_mid])
 
         face_mid = tw.array.gather(midpoint_idx, inverse).reshape((n_faces, 3))
-        out_faces = twt.empty_int32_2d((n_faces * 4, 3), device=device)
+        out_faces = twt.empty_2d((n_faces * 4, 3), wp.int32, device=device)
         out_valid = wp.empty(n_faces * 4, dtype=wp.bool, device=device)
         out_slot_index = wp.empty(n_faces * 4, dtype=wp.int32, device=device)
         wp.launch(

@@ -700,10 +700,8 @@ def _dirichlet_state(
         fixed_mask,
         free_map,
         n_free,
-        twt.as_array2d_float(pinned, dtype=wp.float64),
-        twt.as_array2d_float(
-            wp.zeros((3, n_free), dtype=wp.float64, device=device), dtype=wp.float64
-        ),
+        twt.as_array2d(pinned, wp.float64),
+        twt.as_array2d(wp.zeros((3, n_free), dtype=wp.float64, device=device), wp.float64),
     )
 
 
@@ -872,8 +870,8 @@ def smooth_region_fixed_rim(
     sol = wp.zeros((3, n_free), dtype=wp.float64, device=device)
     twl.solve_spd_columns(
         system,
-        twt.as_array2d_float(rhs, dtype=wp.float64),
-        twt.as_array2d_float(sol, dtype=wp.float64),
+        twt.as_array2d(rhs, wp.float64),
+        twt.as_array2d(sol, wp.float64),
         tol=twl.CG_TOLERANCE,
         maxiter=10 * n_free,
     )
@@ -986,8 +984,8 @@ def smooth_region(
     sol = wp.zeros((3, n_free), dtype=wp.float64, device=device)
     twl.solve_spd_columns(
         system,
-        twt.as_array2d_float(atb, dtype=wp.float64),
-        twt.as_array2d_float(sol, dtype=wp.float64),
+        twt.as_array2d(atb, wp.float64),
+        twt.as_array2d(sol, wp.float64),
         tol=twl.CG_TOLERANCE,
         maxiter=10 * n_free,
     )
@@ -1059,7 +1057,7 @@ def refine_and_smooth_region(
 
     if natural_smooth:
         edges_bd = tw.selection.region_boundary_edges(faces, patch_face_mask, n_vertices=n)
-        endpoints = wp.clone(twt.as_array2d_int32(edges_bd).reshape(-1))
+        endpoints = wp.clone(twt.as_array2d(edges_bd, wp.int32).reshape(-1))
         incident = tw.array.indices_to_mask(endpoints, n, device=device)
         incident = tw.selection.expand_vertex_mask(faces, incident, 5)
         incident = tw.selection.shrink_vertex_mask(faces, incident, 2)

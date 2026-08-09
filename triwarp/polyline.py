@@ -834,7 +834,7 @@ def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     device = polyline.device
     n = int(polyline.shape[0])
     if n < 3:
-        return twt.empty_int32_2d((0, 3), device=device)
+        return twt.empty_2d((0, 3), wp.int32, device=device)
 
     # The plane frame is built and consumed entirely on device: one accumulation pass, one
     # single-thread finalize, one projection. The three host-scope reductions this replaces
@@ -874,14 +874,14 @@ def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     )
     wp.launch(kernel_polyline.orient_ccw, dim=n, inputs=[points2d, total], device=device)
 
-    out_faces = twt.empty_int32_2d((n - 2, 3), device=device)
+    out_faces = twt.empty_2d((n - 2, 3), wp.int32, device=device)
     out_count = wp.zeros(1, dtype=wp.int32, device=device)
 
     reflex = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(kernel_polyline.count_reflex, dim=n, inputs=[points2d, reflex], device=device)
     if int(reflex.numpy()[0]) == 0:
         wp.launch(kernel_polyline.fan_triangulate, dim=n - 2, inputs=[out_faces], device=device)
-        return twt.as_array2d_int32(out_faces)
+        return twt.as_array2d(out_faces, wp.int32)
 
     left = wp.empty(n, dtype=wp.int32, device=device)
     right = wp.empty(n, dtype=wp.int32, device=device)
@@ -930,4 +930,4 @@ def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
         wp.capture_while(condition, clip_round)
 
     count = int(out_count.numpy()[0])
-    return twt.as_array2d_int32(out_faces[0:count])
+    return twt.as_array2d(out_faces[0:count], wp.int32)

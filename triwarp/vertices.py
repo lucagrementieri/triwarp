@@ -306,7 +306,7 @@ def sine_and_edge_length_weighted_vertex_normals(
             inputs=[vertices, faces, face_normals],
             device=vertices.device,
         )
-    face_weights = twt.empty_float32_2d((n_faces, 3), device=vertices.device)
+    face_weights = twt.empty_2d((n_faces, 3), wp.float32, device=vertices.device)
     wp.launch(
         kernel_vertices.max_vertex_normal_weights,
         dim=n_faces,

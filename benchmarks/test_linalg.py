@@ -127,11 +127,11 @@ def _fixed(bench_case: BenchCase, fraction: float) -> tuple:
         values_np = np.tile(bench_case.vertices_np[:, 2], (_N_RHS, 1))
         _fixed_cache[key] = (
             wp.array(mask_np, dtype=wp.bool, device=bench_case.device),
-            twt.as_array2d_float(
+            twt.as_array2d(
                 wp.array(
                     np.ascontiguousarray(values_np), dtype=wp.float64, device=bench_case.device
                 ),
-                dtype=wp.float64,
+                wp.float64,
             ),
         )
     return _fixed_cache[key]
@@ -203,8 +203,8 @@ def test_solve_spd_columns(bench_case: BenchCase, check_every: int) -> None:
     _skip_cpu(bench_case)
     operator, rhs = _operator(bench_case), _rhs(bench_case)
     solution = wp.zeros_like(rhs)
-    solution_2d = twt.as_array2d_float(solution, dtype=wp.float64)
-    rhs_2d = twt.as_array2d_float(rhs, dtype=wp.float64)
+    solution_2d = twt.as_array2d(solution, wp.float64)
+    rhs_2d = twt.as_array2d(rhs, wp.float64)
 
     def run() -> tuple:
         solution.zero_()
@@ -241,9 +241,7 @@ def test_spd_column_solver_amortized(bench_case: BenchCase, repeats: int) -> Non
     operator, rhs = _operator(bench_case), _rhs(bench_case)
     solution = wp.zeros_like(rhs)
     solver = tw.linalg.spd_column_solver(
-        operator,
-        twt.as_array2d_float(rhs, dtype=wp.float64),
-        twt.as_array2d_float(solution, dtype=wp.float64),
+        operator, twt.as_array2d(rhs, wp.float64), twt.as_array2d(solution, wp.float64)
     )
 
     def run() -> None:

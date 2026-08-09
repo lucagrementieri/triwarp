@@ -590,7 +590,7 @@ def stitch_loops(
     b_pos = tw.array.gather(vertices_b, loop_b)
 
     # perimeters[i, j] = |a_i - b_j| + |a_{i+1} - b_j| for A-edge i and B-vertex j.
-    perimeters = twt.empty_float32_2d((n, m), device=device)
+    perimeters = twt.empty_2d((n, m), wp.float32, device=device)
     wp.launch(
         kernel_combine.boundary_perimeters,
         dim=(n, m),
@@ -776,7 +776,7 @@ def _closest_loop_pair(a_pos: wp.array[wp.vec3], b_pos: wp.array[wp.vec3]) -> tu
     device = a_pos.device
     n_a = int(a_pos.shape[0])
     n_b = int(b_pos.shape[0])
-    dist_sq = twt.empty_float32_2d((n_a, n_b), device=device)
+    dist_sq = twt.empty_2d((n_a, n_b), wp.float32, device=device)
     wp.launch(
         kernel_combine.pair_sq_distances,
         dim=(n_a, n_b),
@@ -895,11 +895,12 @@ def stitch_loops_min_weight(
     b_opp, b_opp_valid = table_b.rim_opposite(_PackedLoops(lb_wp, np.array([n_b], dtype=np.int64)))
     up = wp.vec3(*(up_dir if up_dir is not None else (0.0, 0.0, 1.0)))
 
-    dp = twt.as_array2d_float32(
-        wp.full((n_a + 1, n_b + 1), _BAD_TRIANGULATION_METRIC, dtype=wp.float32, device=device)
+    dp = twt.as_array2d(
+        wp.full((n_a + 1, n_b + 1), _BAD_TRIANGULATION_METRIC, dtype=wp.float32, device=device),
+        wp.float32,
     )
     wp.launch(kernel_combine.set_dp_origin, dim=1, inputs=[dp], device=device)
-    came = twt.as_array2d_int32(wp.full((n_a + 1, n_b + 1), -1, dtype=wp.int32, device=device))
+    came = twt.as_array2d(wp.full((n_a + 1, n_b + 1), -1, dtype=wp.int32, device=device), wp.int32)
     for diag in range(1, n_a + n_b + 1):
         wp.launch(
             kernel_combine.stitch_dp_diag,

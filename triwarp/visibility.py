@@ -344,7 +344,7 @@ def shape_diameter(
     directions = tw.sample.sample_fibonacci_cone(n_rays, cone_angle, device=device)
     # Distances are kept so the trimming pass can revisit them against a mean the first pass had not
     # finished computing; re-tracing instead would double the only expensive part of the kernel.
-    scratch = twt.empty_float32_2d((m, n_rays), device=device)
+    scratch = twt.empty_2d((m, n_rays), wp.float32, device=device)
     out_diameter = wp.empty(m, dtype=wp.float32, device=device)
     wp.launch(
         kernel_visibility.shape_diameter,

@@ -152,7 +152,7 @@ def test_cut_along_edges_with_no_edges_is_the_identity(device: str) -> None:
     box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
     vertices_wp, faces_wp = _upload(box_tm, device)
     cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(
-        vertices_wp, faces_wp, twt.empty_int32_2d((0, 2), device=device)
+        vertices_wp, faces_wp, twt.empty_2d((0, 2), wp.int32, device=device)
     )
     assert int(cut_vertices_wp.shape[0]) == int(vertices_wp.shape[0])
     assert np.allclose(
@@ -195,7 +195,7 @@ def test_cut_along_edges_opens_a_boundary(device: str) -> None:
     )
 
     cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(
-        vertices_wp, faces_wp, twt.as_array2d_int32(ring_wp)
+        vertices_wp, faces_wp, twt.as_array2d(ring_wp, wp.int32)
     )
     # The four corners of that face each split in two; the other four are untouched.
     assert int(cut_vertices_wp.shape[0]) == int(vertices_wp.shape[0]) + 4
@@ -331,7 +331,7 @@ def test_cut_along_edges_invalid(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> Non
     _mesh_tm, mesh_wp = icosahedron
     with pytest.raises(ValueError, match=r"edges must have shape \(k, 2\)"):
         tw.seams.cut_along_edges(
-            mesh_wp.points, mesh_wp.indices, twt.empty_int32_2d((3, 3), device=mesh_wp.device)
+            mesh_wp.points, mesh_wp.indices, twt.empty_2d((3, 3), wp.int32, device=mesh_wp.device)
         )
 
 
@@ -339,7 +339,7 @@ def test_cut_along_edges_empty(device: str) -> None:
     vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
     out_vertices_wp, out_faces_wp = tw.seams.cut_along_edges(
-        vertices_wp, faces_wp, twt.empty_int32_2d((0, 2), device=device)
+        vertices_wp, faces_wp, twt.empty_2d((0, 2), wp.int32, device=device)
     )
     assert int(out_vertices_wp.shape[0]) == 0
     assert int(out_faces_wp.shape[0]) == 0

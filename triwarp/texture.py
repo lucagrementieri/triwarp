@@ -87,7 +87,7 @@ def rasterize_attribute(
     image = wp.zeros((resolution, resolution, n_channels), dtype=wp.float32, device=device)
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
-        return twt.as_array3d_float32(image)
+        return twt.as_array3d(image, wp.float32)
 
     owner = _rasterize_owner(uv, faces, resolution)
     wp.launch(
@@ -96,7 +96,7 @@ def rasterize_attribute(
         inputs=[uv, faces, attribute, n_channels, owner, image],
         device=device,
     )
-    return twt.as_array3d_float32(image)
+    return twt.as_array3d(image, wp.float32)
 
 
 def rasterize_discrete_attribute(
@@ -143,7 +143,7 @@ def rasterize_discrete_attribute(
     labels_image = wp.full((resolution, resolution), -1, dtype=wp.int32, device=device)
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
-        return twt.as_array2d_int32(labels_image)
+        return twt.as_array2d(labels_image, wp.int32)
 
     owner = _rasterize_owner(uv, faces, resolution)
     wp.launch(
@@ -152,7 +152,7 @@ def rasterize_discrete_attribute(
         inputs=[uv, faces, attribute, owner, labels_image],
         device=device,
     )
-    return twt.as_array2d_int32(labels_image)
+    return twt.as_array2d(labels_image, wp.int32)
 
 
 def _check_rasterize_inputs(uv: wp.array[wp.vec2], n_vertices: int, resolution: int) -> None:
@@ -213,7 +213,7 @@ def _rasterize_owner(
         inputs=[uv, faces, resolution, owner],
         device=device,
     )
-    return twt.as_array2d_int32(owner)
+    return twt.as_array2d(owner, wp.int32)
 
 
 def remap_attribute_from_uv(
@@ -266,7 +266,7 @@ def remap_attribute_from_uv(
 
     device = uv.device
     n_vertices = int(uv.shape[0])
-    out_values = twt.empty_float32_2d((n_vertices, n_channels), device=device)
+    out_values = twt.empty_2d((n_vertices, n_channels), wp.float32, device=device)
     if n_vertices > 0:
         mode = kernel_texture.SAMPLE_BILINEAR if order == 1 else kernel_texture.SAMPLE_NEAREST
         wp.launch(
@@ -275,7 +275,7 @@ def remap_attribute_from_uv(
             inputs=[uv, image3d, n_channels, mode, out_values],
             device=device,
         )
-    return twt.as_array2d_float32(out_values)
+    return twt.as_array2d(out_values, wp.float32)
 
 
 def remap_discrete_attribute_from_uv(
@@ -310,7 +310,7 @@ def remap_discrete_attribute_from_uv(
     """
     twt.ensure_ndim(class_image, 2, dtype=wp.int32)
     device = uv.device
-    float_image = twt.as_array2d_float32(tw.array.astype(class_image, wp.float32))
+    float_image = twt.as_array2d(tw.array.astype(class_image, wp.float32), wp.float32)
 
     sampled = remap_attribute_from_uv(uv, float_image, order=0)
 

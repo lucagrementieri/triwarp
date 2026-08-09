@@ -47,12 +47,12 @@ def boundary_edges(
     """
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
-        return twt.empty_int32_2d((0, 2), device=faces.device)
+        return twt.empty_2d((0, 2), wp.int32, device=faces.device)
 
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    return twt.as_array2d_int32(
-        tw.array.gather(edges_sorted, _boundary_rows(vertices, edges_sorted))
+    return twt.as_array2d(
+        tw.array.gather(edges_sorted, _boundary_rows(vertices, edges_sorted)), wp.int32
     )
 
 
@@ -89,13 +89,13 @@ def oriented_boundary_edges(
     """
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
-        return twt.empty_int32_2d((0, 2), device=faces.device)
+        return twt.empty_2d((0, 2), wp.int32, device=faces.device)
 
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
     if edges is None:
         edges = tw.edges.faces_to_edges(faces)
-    return twt.as_array2d_int32(tw.array.gather(edges, _boundary_rows(vertices, edges_sorted)))
+    return twt.as_array2d(tw.array.gather(edges, _boundary_rows(vertices, edges_sorted)), wp.int32)
 
 
 def boundary_loops(
@@ -232,7 +232,7 @@ def boundary_loops_batched(
 
     if edges is None:
         edges = tw.edges.faces_to_edges(faces)
-    directed = twt.as_array2d_int32(tw.array.gather(edges, rows))
+    directed = twt.as_array2d(tw.array.gather(edges, rows), wp.int32)
 
     # ``validate=False``: ``directed`` holds vertex indices this function just gathered out of
     # ``faces``, so the range check would only re-derive a bound the caller already guarantees —

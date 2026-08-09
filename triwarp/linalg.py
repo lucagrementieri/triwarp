@@ -168,18 +168,14 @@ def min_quad_with_fixed(
 
     solution = wp.zeros((n_rhs, n_free), dtype=wp.float64, device=device)
     if n_free == 0:
-        return twt.as_array2d_float(solution, dtype=wp.float64), free_map, n_free
+        return twt.as_array2d(solution, wp.float64), free_map, n_free
     require_cuda(device, "min_quad_with_fixed")
 
     q_uu, rhs = assemble_interior_system(q, fixed_mask, free_map, fixed_values, n_free)
     solve_spd_columns(
-        q_uu,
-        rhs,
-        twt.as_array2d_float(solution, dtype=wp.float64),
-        tol=tol,
-        check_every=check_every,
+        q_uu, rhs, twt.as_array2d(solution, wp.float64), tol=tol, check_every=check_every
     )
-    return twt.as_array2d_float(solution, dtype=wp.float64), free_map, n_free
+    return twt.as_array2d(solution, wp.float64), free_map, n_free
 
 
 def free_partition(fixed_mask: wp.array[wp.bool]) -> tuple[wp.array[wp.int32], int]:
@@ -298,7 +294,7 @@ def assemble_interior_system(
     q_uu.columns = columns
     q_uu.values = values
     q_uu.notify_nnz_changed(nnz=nnz_uu)
-    return q_uu, twt.as_array2d_float(rhs, dtype=wp.float64)
+    return q_uu, twt.as_array2d(rhs, wp.float64)
 
 
 def solve_spd(

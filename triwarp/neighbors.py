@@ -960,8 +960,8 @@ def query_bvh_nearest(
 
     if m == 0:
         return (
-            twt.empty_int32_2d((0, k), device=device),
-            twt.empty_float32_2d((0, k), device=device),
+            twt.empty_2d((0, k), wp.int32, device=device),
+            twt.empty_2d((0, k), wp.float32, device=device),
         )
     if n == 0:
         return _empty_nearest(m, k, single_query, device)
@@ -976,8 +976,8 @@ def query_bvh_nearest(
 
     # ``wp.empty``, not ``wp.full``: every row is written in full by the kernel, so pre-filling
     # here would be two wasted launches.
-    neighbor_indices = twt.empty_int32_2d((m, k), device=device)
-    neighbor_distances = twt.empty_float32_2d((m, k), device=device)
+    neighbor_indices = twt.empty_2d((m, k), wp.int32, device=device)
+    neighbor_distances = twt.empty_2d((m, k), wp.float32, device=device)
     wp.launch(
         kernel_neighbors.bvh_nearest_kernel(k),
         dim=m,
@@ -1127,8 +1127,8 @@ def query_hashgrid_nearest(
 
     if m == 0:
         return (
-            twt.empty_int32_2d((0, k), device=device),
-            twt.empty_float32_2d((0, k), device=device),
+            twt.empty_2d((0, k), wp.int32, device=device),
+            twt.empty_2d((0, k), wp.float32, device=device),
         )
     if n == 0:
         return _empty_nearest(m, k, single_query, device)
@@ -1145,8 +1145,8 @@ def query_hashgrid_nearest(
         cell_size = float(getattr(grid, "cell_width", initial_radius))
     widest = _knn_widest_grid_radius(cell_size, n)
 
-    neighbor_indices = twt.empty_int32_2d((m, k), device=device)
-    neighbor_distances = twt.empty_float32_2d((m, k), device=device)
+    neighbor_indices = twt.empty_2d((m, k), wp.int32, device=device)
+    neighbor_distances = twt.empty_2d((m, k), wp.float32, device=device)
     wp.launch(
         kernel_neighbors.hashgrid_nearest_kernel(k),
         dim=m,
@@ -1255,8 +1255,8 @@ def geodesic_ball(
     visited_pool = wp.empty(
         (chunk, kernel_bfs._VISITED_HASH_CAPACITY), dtype=wp.int32, device=device
     )
-    ext_dist_pool = twt.empty_float32_2d((chunk, kernel_bfs._EXTRAS_CAPACITY), device=device)
-    ext_idx_pool = twt.empty_int32_2d((chunk, kernel_bfs._EXTRAS_CAPACITY), device=device)
+    ext_dist_pool = twt.empty_2d((chunk, kernel_bfs._EXTRAS_CAPACITY), wp.float32, device=device)
+    ext_idx_pool = twt.empty_2d((chunk, kernel_bfs._EXTRAS_CAPACITY), wp.int32, device=device)
 
     overflow = wp.zeros(1, dtype=wp.int32, device=device)
     counts = wp.empty(n, dtype=wp.int32, device=device)
@@ -1369,7 +1369,9 @@ def _empty_nearest(
     neighbor_distances = wp.full((m, k), math.inf, dtype=wp.float32, device=device)
     if single_query:
         return neighbor_indices[0], neighbor_distances[0]
-    return twt.as_array2d_int32(neighbor_indices), twt.as_array2d_float32(neighbor_distances)
+    return twt.as_array2d(neighbor_indices, wp.int32), twt.as_array2d(
+        neighbor_distances, wp.float32
+    )
 
 
 def _shape_nearest(
@@ -1386,4 +1388,6 @@ def _shape_nearest(
         )
     if single_query:
         return neighbor_indices[0], neighbor_distances[0]
-    return twt.as_array2d_int32(neighbor_indices), twt.as_array2d_float32(neighbor_distances)
+    return twt.as_array2d(neighbor_indices, wp.int32), twt.as_array2d(
+        neighbor_distances, wp.float32
+    )

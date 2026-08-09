@@ -35,7 +35,7 @@ def _spd_system(device: str, n: int = 64, n_rhs: int = 3, seed: int = 11):
     )
     rhs_np = rng.standard_normal((n_rhs, n))
     rhs_wp = wp.array(np.ascontiguousarray(rhs_np), dtype=wp.float64, device=device)
-    return matrix_wp, twt.as_array2d_float(rhs_wp, dtype=wp.float64), dense_np, rhs_np
+    return matrix_wp, twt.as_array2d(rhs_wp, wp.float64), dense_np, rhs_np
 
 
 @pytest.mark.parity("min_quad_with_fixed", "pymeshlab")
@@ -66,9 +66,8 @@ def test_min_quad_with_fixed_matches_pymeshlab_harmonic_field(
     solution_wp, free_map_wp, n_free = tw.linalg.min_quad_with_fixed(
         operator_wp,
         wp.array(fixed_np, dtype=wp.bool, device=device),
-        twt.as_array2d_float(
-            wp.array(np.ascontiguousarray(values_np), dtype=wp.float64, device=device),
-            dtype=wp.float64,
+        twt.as_array2d(
+            wp.array(np.ascontiguousarray(values_np), dtype=wp.float64, device=device), wp.float64
         ),
     )
     assert n_free == n_vertices - 2
@@ -96,9 +95,7 @@ def test_solve_spd_columns_matches_numpy(device: str) -> None:
     _skip_on_cpu(device)
     matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device)
     solution_wp = wp.zeros_like(rhs_wp)
-    tw.linalg.solve_spd_columns(
-        matrix_wp, rhs_wp, twt.as_array2d_float(solution_wp, dtype=wp.float64)
-    )
+    tw.linalg.solve_spd_columns(matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64))
     solution_np = np.linalg.solve(dense_np, rhs_np.T).T
     assert np.allclose(solution_wp.numpy(), solution_np, rtol=1e-5, atol=1e-5)
 
@@ -112,10 +109,7 @@ def test_solve_spd_columns_check_every_is_solution_invariant(device: str, check_
     matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device)
     solution_wp = wp.zeros_like(rhs_wp)
     tw.linalg.solve_spd_columns(
-        matrix_wp,
-        rhs_wp,
-        twt.as_array2d_float(solution_wp, dtype=wp.float64),
-        check_every=check_every,
+        matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64), check_every=check_every
     )
     solution_np = np.linalg.solve(dense_np, rhs_np.T).T
     assert np.allclose(solution_wp.numpy(), solution_np, rtol=1e-5, atol=1e-5)
@@ -127,7 +121,7 @@ def test_spd_column_solver_check_every_reused_across_calls(device: str) -> None:
     matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device)
     solution_wp = wp.zeros_like(rhs_wp)
     solver = tw.linalg.spd_column_solver(
-        matrix_wp, rhs_wp, twt.as_array2d_float(solution_wp, dtype=wp.float64), check_every=0
+        matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64), check_every=0
     )
     solver()
     solver()
