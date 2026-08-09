@@ -176,9 +176,7 @@ def submesh_from_face_indices(
     unique_faces = tw.array.gather(faces.reshape((-1, 3)), unique_face_indices).reshape((-1,))
 
     unique_vertex_indices, remapped_faces = tw.grouping.unique_1d(unique_faces, return_inverse=True)
-    n_unique = int(unique_vertex_indices.shape[0])
-    sub_vertices = wp.empty(n_unique, dtype=wp.vec3, device=device)
-    wp.copy(sub_vertices, vertices[unique_vertex_indices])
+    sub_vertices = tw.array.gather(vertices, unique_vertex_indices)
 
     sub_faces = tw.array.gather(remapped_faces.reshape((-1, 3)), face_slots).reshape((-1,))
 

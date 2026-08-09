@@ -357,11 +357,7 @@ def sample_surface_poisson_disk(
     wp.utils.array_cast(alive, alive_bool)
     indices = flatnonzero(alive_bool)
 
-    selected_points = wp.empty(count, dtype=wp.vec3, device=device)
-    selected_face_indices = wp.empty(count, dtype=wp.int32, device=device)
-    wp.copy(selected_points, init_points[indices])
-    wp.copy(selected_face_indices, init_face_indices[indices])
-    return selected_points, selected_face_indices
+    return gather(init_points, indices), gather(init_face_indices, indices)
 
 
 def _dart_throw_blue_noise(

@@ -21,8 +21,6 @@ walk along real mesh edges that visits no vertex twice.
 
 from __future__ import annotations
 
-import itertools
-
 import numpy as np
 import warp as wp
 
@@ -87,11 +85,9 @@ def homology_generators(
     parents_np = parents.numpy()
     loops = [_loop_through_tree(int(a), int(b), parents_np) for a, b in generators]
     packed = wp.array(np.concatenate(loops), dtype=wp.int32, device=device)
-    bounds = np.cumsum([0] + [len(loop) for loop in loops])
-    return [
-        wp.clone(packed[int(begin) : int(end)]) if copy else packed[int(begin) : int(end)]
-        for begin, end in itertools.pairwise(bounds)
-    ]
+    starts_np = np.cumsum([0, *(len(loop) for loop in loops[:-1])], dtype=np.int32)
+    offsets = wp.array(starts_np, dtype=wp.int32, device=device)
+    return tw.array.split(packed, offsets, copy=copy)
 
 
 def tree_cotree(
@@ -164,9 +160,16 @@ def tree_cotree(
     )
 
     # Dual spanning tree over face adjacency, crossing only edges the primal tree left alone.
-    edge_key = {(int(a), int(b)): index for index, (a, b) in enumerate(edges_np)}
+    # Locating each shared edge's row in ``unique_edges`` is a sorted-key lookup, vectorised: the
+    # dict-of-tuples this replaces ran two Python loops with two ``int()`` calls per row, ~600k
+    # dict operations on a 100k-vertex genus-2 surface. Both row sets are already on the host, so
+    # the key is built here rather than through ``grouping.hash_indices_rows``, which would add two
+    # launches and two readbacks to reach the same integers.
     shared_np = shared_edges.numpy()
-    dual_edge_index = np.array([edge_key[(int(a), int(b))] for a, b in shared_np], dtype=np.int64)
+    edge_keys = edges_np[:, 0].astype(np.int64) * n_vertices + edges_np[:, 1]
+    shared_keys = shared_np[:, 0].astype(np.int64) * n_vertices + shared_np[:, 1]
+    order = np.argsort(edge_keys)
+    dual_edge_index = order[np.searchsorted(edge_keys[order], shared_keys)]
     crossable = ~in_primal_tree[dual_edge_index]
     dual_pairs = face_pairs.numpy()[crossable]
     dual_index = dual_edge_index[crossable]

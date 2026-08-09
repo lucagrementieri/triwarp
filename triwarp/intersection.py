@@ -16,8 +16,6 @@ geometry rather than the curve.
 
 from __future__ import annotations
 
-import itertools
-
 import numpy as np
 import warp as wp
 
@@ -150,15 +148,12 @@ def mesh_with_plane(
             return empty_segments, wp.empty(0, dtype=wp.int32, device=device)
         return empty_segments
 
-    lines = wp.empty((n_hit, 2), dtype=wp.vec3, device=device)
-    wp.copy(lines, segments[hit_faces])
-
+    lines = tw.array.gather(segments, hit_faces)
     if not return_faces:
         return lines
-
-    face_index = wp.empty(n_hit, dtype=wp.int32, device=device)
-    wp.copy(face_index, hit_faces)
-    return lines, face_index
+    # ``hit_faces`` is already a fresh dense buffer out of ``flatnonzero``; nothing else holds it,
+    # so it is returned directly rather than copied.
+    return lines, hit_faces
 
 
 def marching_triangles(
@@ -254,10 +249,8 @@ def marching_triangles(
     if n_segments == 0:
         return [], []
 
-    hit_segments = wp.empty((n_segments, 2), dtype=wp.vec3, device=device)
-    wp.copy(hit_segments, segments[cut_faces])
-    hit_edges = twt.empty_int32_2d((n_segments, 2), device=device)
-    wp.copy(hit_edges, segment_edges[cut_faces])
+    hit_segments = tw.array.gather(segments, cut_faces)
+    hit_edges = twt.as_array2d_int32(tw.array.gather(segment_edges, cut_faces))
 
     chains, closed = _link_segments(hit_edges.numpy())
     if not chains:
@@ -268,9 +261,9 @@ def marching_triangles(
     endpoints = hit_segments.reshape((2 * n_segments,))
     slots = wp.array(np.concatenate(chains), dtype=wp.int32, device=device)
     packed = tw.array.gather(endpoints, slots)
-    bounds = np.cumsum([0] + [len(chain) for chain in chains])
-    curves = [packed[int(begin) : int(end)] for begin, end in itertools.pairwise(bounds)]
-    return curves, closed
+    starts_np = np.cumsum([0, *(len(chain) for chain in chains[:-1])], dtype=np.int32)
+    offsets = wp.array(starts_np, dtype=wp.int32, device=device)
+    return tw.array.split(packed, offsets), closed
 
 
 def _link_segments(segment_edges: np.ndarray) -> tuple[list[np.ndarray], list[bool]]:
@@ -417,8 +410,7 @@ def mesh_with_mesh(
     if n_hit == 0:
         return wp.empty((0, 2), dtype=wp.vec3, device=device)
 
-    hit_pairs = twt.empty_int32_2d((n_hit, 2), device=device)
-    wp.copy(hit_pairs, pairs.reshape((-1, 2))[hit_pair_indices])
+    hit_pairs = twt.as_array2d_int32(tw.array.gather(pairs, hit_pair_indices))
 
     segments = wp.empty((n_hit, 2), dtype=wp.vec3, device=device)
     wp.launch(
@@ -441,9 +433,7 @@ def mesh_with_mesh(
     if n_keep == 0:
         return wp.empty((0, 2), dtype=wp.vec3, device=device)
 
-    lines = wp.empty((n_keep, 2), dtype=wp.vec3, device=device)
-    wp.copy(lines, segments[keep])
-    return lines
+    return tw.array.gather(segments, keep)
 
 
 def slice_mesh_with_plane(
@@ -540,6 +530,8 @@ def slice_mesh_with_plane(
     wp.copy(all_vertices[:n_vertices], vertices)
     all_faces = wp.empty(3 * (n_in + 2 * n_quad + n_tri), dtype=wp.int32, device=device)
     if n_in > 0:
+        # Not ``tw.array.gather``: the destination is a *slice* of a larger buffer, and ``gather``
+        # allocates its own.
         wp.copy(all_faces[: 3 * n_in].reshape((n_in, 3)), faces.reshape((-1, 3))[inside_idx])
 
     vertex_base, face_base = n_vertices, 3 * n_in

@@ -755,8 +755,7 @@ def _unique_hash(
     if return_counts:
         sort_perm = wp.empty(n_unique, dtype=wp.int32, device=device)
         wp.copy(sort_perm, perm_buf, count=n_unique)
-        unique_counts = wp.empty(n_unique, dtype=wp.int32, device=device)
-        wp.copy(unique_counts, cnts_compact[sort_perm])
+        unique_counts = gather(cnts_compact, sort_perm)
 
     unique_inverse = None
     if return_inverse:
