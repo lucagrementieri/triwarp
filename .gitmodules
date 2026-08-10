@@ -22,6 +22,10 @@
 	path = reference/pytorch3d
 	url = org-16943930@github.com:facebookresearch/pytorch3d.git
 	branch = main
+[submodule "reference/pyvista"]
+	path = reference/pyvista
+	url = git@github.com:pyvista/pyvista.git
+	branch = main
 [submodule "reference/trimesh"]
 	path = reference/trimesh
 	url = git@github.com:mikedh/trimesh.git
