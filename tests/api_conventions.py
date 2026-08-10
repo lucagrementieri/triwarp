@@ -249,25 +249,6 @@ _HELPER_ORDER_ALLOWLIST: dict[str, frozenset[str]] = {
     "array": frozenset({"_sorted_copy"}),
     "combine": frozenset({"_closest_loop_pair", "_longest_increasing_subsequence"}),
     "creation": frozenset({"_icosphere_face_table"}),
-    "distance": frozenset(
-        {
-            "_chamfer",
-            "_distances_mesh_to_mesh",
-            "_distances_points_to_mesh",
-            "_distances_points_to_points",
-            "_empty_chamfer",
-            "_hausdorff",
-            "_launch_nn_term",
-            "_launch_surface_term",
-            "_maybe_taped",
-            "_reduce",
-            "_reduction_scale",
-            "_square",
-            "_validate_diff_reduction",
-            "_validate_point_reduction",
-            "_zero_loss",
-        }
-    ),
     "holes": frozenset(
         {
             "_hole_loops",

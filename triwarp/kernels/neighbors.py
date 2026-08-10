@@ -1,3 +1,5 @@
+from typing import NamedTuple
+
 import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT
@@ -298,6 +300,16 @@ def knn_bvh_scan(
     return out_distances_row[k - 1]
 
 
+@wp.func
+def deepen_radius(worst: wp.float32, r: wp.float32, r_hard: wp.float32) -> wp.float32:
+    # Next search radius after an uncertified scan, shared by all four k-NN kernels. A full row
+    # (finite ``worst``) reaching past the cube certifies at exactly ``worst``, so jump there; an
+    # unfilled row has no bound to jump to and grows geometrically instead.
+    if worst < FLOAT32_INF_CONSTANT:
+        return wp.min(worst, r_hard)
+    return wp.min(r * RADIUS_GROWTH, r_hard)
+
+
 @wp.kernel
 def query_bvh_nearest_neighbors(
     points: wp.array[wp.vec3],
@@ -331,12 +343,7 @@ def query_bvh_nearest_neighbors(
             break  # every point outside the cube is farther than the k-th best: certified exact
         if r >= r_hard:
             break  # the scan was already complete, so the row is final
-        if worst < FLOAT32_INF_CONSTANT:
-            # The row is full but reaches past the cube. Re-scanning at exactly ``worst`` is
-            # guaranteed to certify, so this costs at most one more pass.
-            r = wp.min(worst, r_hard)
-        else:
-            r = wp.min(r * RADIUS_GROWTH, r_hard)
+        r = deepen_radius(worst, r, r_hard)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -349,10 +356,26 @@ def query_bvh_nearest_neighbors(
 # call. Holding the row in a ``wp.types.vector(length=K)`` value type puts it in registers, which
 # is why these kernels exist and why ``K`` has to be a compile-time constant.
 #
-# The insert is written out inline rather than factored into a ``@wp.func``: passing a vector to a
-# helper takes its address, which forces the row back into local memory and gives up the whole
-# point. A ``wp.zeros(shape=K)`` stack array has the same problem — measured a **2x loss** against
-# the global row, because nothing promotes it to registers.
+# A ``wp.zeros(shape=K)`` stack array does not work here — measured a **2x loss** against the global
+# row, because nothing promotes it to registers.
+#
+# Everything the row touches **once per query or per attempt** — the reset, the k-th read, the
+# output write — is factored into the generated ``@wp.func`` set below, which both factories share.
+# The
+# **per-candidate insert alone stays written out inline**, three times, and the split is measured
+# rather than assumed (Warp 1.16, RTX 5090, 200k points / 200k queries on CUDA, 20k / 20k on CPU,
+# variants interleaved in one loop, ``min`` of 9 reps, all bit-identical in indices and distances):
+#
+#   | insert spelling                            | k=1   | k=7   | k=32  | k=64   |
+#   |--------------------------------------------|-------|-------|-------|--------|
+#   | ``wp.ref`` helper, CUDA                    | 1.00x | 1.00x | 1.00x | 1.00x  |
+#   | ``wp.ref`` helper, **CPU**                 | 0.95x | 1.00x | 1.55x | 2.23x  |
+#   | by value, returning the pair, **CUDA**     | 1.01x | 0.99x | 5.13x | 10.24x |
+#   | by value, returning the pair, CPU          | 0.96x | 1.04x | 1.03x | 1.07x  |
+#
+# So the two spellings fail on opposite devices, and the once-per-attempt helpers (same ``wp.ref``
+# parameters, crossed 1x per attempt instead of 1x per candidate) are flat on **both**: 0.99-1.01x
+# CUDA, 0.97-1.00x CPU at every bucket. Do not "finish" this dedup by moving the insert too.
 #
 # The contract the copies must hold is the *distance* row, not the tie-break. Like the shipped
 # kernel's ``binary_search_index`` (``searchsorted(side="right")``), the carry below walks past
@@ -372,10 +395,68 @@ def query_bvh_nearest_neighbors(
 # ---------------------------------------------------------------------------------------------
 
 
-def _bvh_nearest_row_kernel(row_size: int, name: str):
-    """``K = row_size`` register-row variant of ``query_bvh_nearest_neighbors``."""
+class _RowHelpers(NamedTuple):
+    """One bucket's register-row vector types and the ``@wp.func``s that operate on a whole row."""
+
+    distances: type
+    indices: type
+    reset: wp.Function
+    kth: wp.Function
+    write: wp.Function
+
+
+def _row_helpers(row_size: int) -> _RowHelpers:
+    """Generate the ``K = row_size`` row helper set; ``K`` must be a compile-time constant."""
     vec_distances = wp.types.vector(length=row_size, dtype=wp.float32)
     vec_indices = wp.types.vector(length=row_size, dtype=wp.int32)
+
+    def _reset(row_distances: wp.ref[vec_distances], row_indices: wp.ref[vec_indices]) -> None:
+        # Every scan starts from an empty row: the insert does not deduplicate, so a re-scan over a
+        # wider radius would otherwise insert each already-found point a second time.
+        for slot in range(row_size):
+            row_indices[slot] = wp.int32(-1)
+            row_distances[slot] = FLOAT32_INF_CONSTANT
+
+    def _kth(row_distances: wp.ref[vec_distances], k: wp.int32) -> wp.float32:
+        # The k-th distance certifies the scan (``inf`` while the row is unfilled). Read through an
+        # unrolled compare rather than ``row_distances[k - 1]``: ``k`` is a runtime value and a
+        # runtime index into a vector spills it to local memory.
+        worst = FLOAT32_INF_CONSTANT
+        for slot in range(row_size):
+            if slot == k - 1:
+                worst = row_distances[slot]
+        return worst
+
+    def _write(
+        row_distances: wp.ref[vec_distances],
+        row_indices: wp.ref[vec_indices],
+        tid: wp.int32,
+        k: wp.int32,
+        out_indices: wp.array2d[wp.int32],
+        out_distances: wp.array2d[wp.float32],
+    ) -> None:
+        # Only the first ``k`` slots are the caller's answer; the bucket's tail is padding.
+        for slot in range(row_size):
+            if slot < k:
+                out_indices[tid, slot] = row_indices[slot]
+                out_distances[tid, slot] = row_distances[slot]
+
+    return _RowHelpers(
+        vec_distances,
+        vec_indices,
+        wp.func(_reset, name=f"knn_row_reset{row_size}"),
+        wp.func(_kth, name=f"knn_row_kth{row_size}"),
+        wp.func(_write, name=f"knn_row_write{row_size}"),
+    )
+
+
+# One set per bucket: ``wp.ref`` needs a concrete dtype, so the helpers cannot be generic in ``K``.
+_ROW_HELPERS = {row_size: _row_helpers(row_size) for row_size in KNN_ROW_BUCKETS}
+
+
+def _bvh_nearest_row_kernel(row_size: int, name: str):
+    """``K = row_size`` register-row variant of ``query_bvh_nearest_neighbors``."""
+    vec_distances, vec_indices, row_reset, row_kth, row_write = _ROW_HELPERS[row_size]
 
     def _kernel(
         points: wp.array[wp.vec3],
@@ -401,9 +482,7 @@ def _bvh_nearest_row_kernel(row_size: int, name: str):
         for attempt in range(MAX_SEARCH_ATTEMPTS):
             if attempt == MAX_SEARCH_ATTEMPTS - 1:
                 r = r_hard  # forced-complete final attempt: exact whatever the growth did
-            for slot in range(row_size):
-                row_indices[slot] = wp.int32(-1)
-                row_distances[slot] = FLOAT32_INF_CONSTANT
+            row_reset(row_distances, row_indices)
             query = wp.bvh_query_aabb(bvh_id, q - wp.vec3(r), q + wp.vec3(r), root=-1)
             point_index = wp.int32(0)
             while wp.bvh_query_next(query, point_index):
@@ -421,31 +500,20 @@ def _bvh_nearest_row_kernel(row_size: int, name: str):
                             row_indices[slot] = carry_index
                             carry_distance = held_distance
                             carry_index = held_index
-            # The k-th distance certifies the scan. Read through an unrolled compare rather than
-            # ``row_distances[k - 1]``: a runtime index into a vector spills it to local memory.
-            worst = FLOAT32_INF_CONSTANT
-            for slot in range(row_size):
-                if slot == k - 1:
-                    worst = row_distances[slot]
+            worst = row_kth(row_distances, k)
             if worst <= r:
                 break  # every point outside the cube is farther than the k-th best: exact
             if r >= r_hard:
                 break  # the scan was already complete, so the row is final
-            if worst < FLOAT32_INF_CONSTANT:
-                # The row is full but reaches past the cube. Re-scanning at exactly ``worst`` is
-                # guaranteed to certify, so this costs at most one more pass.
-                r = wp.min(worst, r_hard)
-            else:
-                r = wp.min(r * RADIUS_GROWTH, r_hard)
+            r = deepen_radius(worst, r, r_hard)
 
-        for slot in range(row_size):
-            if slot < k:
-                out_indices[tid, slot] = row_indices[slot]
-                out_distances[tid, slot] = row_distances[slot]
+        row_write(row_distances, row_indices, tid, k, out_indices, out_distances)
 
     _kernel.__name__ = name
     _kernel.__qualname__ = name
-    return wp.kernel(_kernel)
+    # ``enable_backward=False`` is mandatory, not a choice: the row helpers take ``wp.ref``
+    # parameters and a ``wp.ref`` helper has no adjoint, so the module fails to compile without it.
+    return wp.kernel(_kernel, enable_backward=False)
 
 
 _BVH_NEAREST_ROW_KERNELS = {
@@ -535,17 +603,13 @@ def query_hashgrid_nearest_neighbors(
             return  # certified exact
         if r >= r_hard:
             return  # the scan was already complete
-        if worst < FLOAT32_INF_CONSTANT:
-            r = wp.min(worst, r_hard)
-        else:
-            r = wp.min(r * RADIUS_GROWTH, r_hard)
+        r = deepen_radius(worst, r, r_hard)
     knn_linear_scan(points, q, k, max_radius, out_indices_row, out_distances_row)
 
 
 def _hashgrid_nearest_row_kernel(row_size: int, name: str):
     """``K = row_size`` register-row variant of ``query_hashgrid_nearest_neighbors``."""
-    vec_distances = wp.types.vector(length=row_size, dtype=wp.float32)
-    vec_indices = wp.types.vector(length=row_size, dtype=wp.int32)
+    vec_distances, vec_indices, row_reset, row_kth, row_write = _ROW_HELPERS[row_size]
 
     def _kernel(
         points: wp.array[wp.vec3],
@@ -573,9 +637,7 @@ def _hashgrid_nearest_row_kernel(row_size: int, name: str):
                 # Past ``widest`` a cell walk costs more than touching every point (and a NaN
                 # query lands here too, which is what bounds this loop). Finish exactly instead.
                 break
-            for slot in range(row_size):
-                row_indices[slot] = wp.int32(-1)
-                row_distances[slot] = FLOAT32_INF_CONSTANT
+            row_reset(row_distances, row_indices)
             query = wp.hash_grid_query(grid_id, q, r)
             point_index = wp.int32(-1)
             while wp.hash_grid_query_next(query, point_index):
@@ -593,27 +655,19 @@ def _hashgrid_nearest_row_kernel(row_size: int, name: str):
                             row_indices[slot] = carry_index
                             carry_distance = held_distance
                             carry_index = held_index
-            worst = FLOAT32_INF_CONSTANT  # unrolled k-th read, as in the BVH twin
-            for slot in range(row_size):
-                if slot == k - 1:
-                    worst = row_distances[slot]
+            worst = row_kth(row_distances, k)
             if worst <= r:
                 certified = 1  # certified exact
                 break
             if r >= r_hard:
                 certified = 1  # the scan was already complete
                 break
-            if worst < FLOAT32_INF_CONSTANT:
-                r = wp.min(worst, r_hard)
-            else:
-                r = wp.min(r * RADIUS_GROWTH, r_hard)
+            r = deepen_radius(worst, r, r_hard)
 
         if certified == 0:
             # Exact fallback once the radius outgrows the cell width or the attempt budget runs
             # out — the register twin of ``knn_linear_scan``.
-            for slot in range(row_size):
-                row_indices[slot] = wp.int32(-1)
-                row_distances[slot] = FLOAT32_INF_CONSTANT
+            row_reset(row_distances, row_indices)
             for point_index in range(points.shape[0]):
                 d = wp.length(points[point_index] - q)
                 if d <= max_radius and d < row_distances[row_size - 1]:
@@ -630,14 +684,11 @@ def _hashgrid_nearest_row_kernel(row_size: int, name: str):
                             carry_distance = held_distance
                             carry_index = held_index
 
-        for slot in range(row_size):
-            if slot < k:
-                out_indices[tid, slot] = row_indices[slot]
-                out_distances[tid, slot] = row_distances[slot]
+        row_write(row_distances, row_indices, tid, k, out_indices, out_distances)
 
     _kernel.__name__ = name
     _kernel.__qualname__ = name
-    return wp.kernel(_kernel)
+    return wp.kernel(_kernel, enable_backward=False)  # ``wp.ref`` helpers, as in the BVH twin
 
 
 _HASHGRID_NEAREST_ROW_KERNELS = {

@@ -42,143 +42,9 @@ _DiffReduction = Literal["mean", "sum"]
 # Per-point squared-distance result when ``point_reduction is None``.
 _UnreducedChamfer = twt.Array1dFloat32 | tuple[twt.Array1dFloat32, twt.Array1dFloat32]
 
-
-def _validate_point_reduction(point_reduction: _PointReduction | None) -> None:
-    if point_reduction is not None and point_reduction not in ("mean", "sum", "max"):
-        raise ValueError('point_reduction must be one of "mean", "sum", "max" or None')
-
-
-def _square(distances: wp.array[wp.float32]) -> twt.Array1dFloat32:
-    n = int(distances.shape[0])
-    squared = wp.empty(n, dtype=wp.float32, device=distances.device)
-    if n > 0:
-        wp.map(kernel_array.square_scalar, distances, out=squared)
-    return cast(twt.Array1dFloat32, squared)
-
-
-def _reduce(distances: twt.Array1dFloat32, point_reduction: _PointReduction) -> float:
-    if point_reduction == "mean":
-        return tw.reduce.mean(distances)
-    if point_reduction == "sum":
-        return tw.reduce.sum(distances)
-    return tw.reduce.max(distances)
-
-
-def _chamfer(
-    d_forward: wp.array[wp.float32],
-    d_backward: wp.array[wp.float32] | None,
-    point_reduction: _PointReduction | None,
-    single_directional: bool,
-) -> float | _UnreducedChamfer:
-    """
-    Combine forward/backward Euclidean distances into a Chamfer value.
-
-    Distances are squared element-wise (pytorch3d convention) before reduction.
-    """
-    sq_forward = _square(d_forward)
-    if point_reduction is None:
-        if single_directional:
-            return sq_forward
-        return sq_forward, _square(cast(wp.array[wp.float32], d_backward))
-
-    reduced_forward = _reduce(sq_forward, point_reduction)
-    if single_directional:
-        return reduced_forward
-
-    sq_backward = _square(cast(wp.array[wp.float32], d_backward))
-    reduced_backward = _reduce(sq_backward, point_reduction)
-    if point_reduction == "max":
-        return max(reduced_forward, reduced_backward)
-    return reduced_forward + reduced_backward
-
-
-def _hausdorff(
-    d_forward: wp.array[wp.float32],
-    d_backward: wp.array[wp.float32] | None,
-    single_directional: bool,
-) -> float:
-    """
-    Directed (or symmetric) Hausdorff distance from Euclidean distances.
-
-    ``max(d)`` over Euclidean per-element distances equals ``sqrt(max(d**2))``,
-    so this matches libigl's ``sqrt(max(dba, dab))`` without squaring.
-    """
-    directed_forward = tw.reduce.max(cast(twt.Array1dFloat32, d_forward))
-    if single_directional:
-        return directed_forward
-    directed_backward = tw.reduce.max(cast(twt.Array1dFloat32, d_backward))
-    return max(directed_forward, directed_backward)
-
-
-def _empty_chamfer(
-    point_reduction: _PointReduction | None, single_directional: bool, device: wp.DeviceLike
-) -> float | _UnreducedChamfer:
-    if point_reduction is not None:
-        return 0.0
-    if single_directional:
-        return cast(twt.Array1dFloat32, wp.empty(0, dtype=wp.float32, device=device))
-    return (
-        cast(twt.Array1dFloat32, wp.empty(0, dtype=wp.float32, device=device)),
-        cast(twt.Array1dFloat32, wp.empty(0, dtype=wp.float32, device=device)),
-    )
-
-
+# Forward/backward per-element distances from one of the three geometry dispatches; ``None`` in the
+# second slot is the single-directional case.
 _DistancePair = tuple[wp.array[wp.float32], wp.array[wp.float32] | None]
-
-# The three geometry dispatches below are each shared by a ``chamfer_*`` and a ``hausdorff_*``
-# entry point, which differ only in how they reduce the pair and what they return for degenerate
-# input. ``None`` means degenerate, leaving that choice to the caller.
-
-
-def _distances_points_to_points(
-    x: wp.array[wp.vec3], y: wp.array[wp.vec3], single_directional: bool
-) -> _DistancePair | None:
-    """Nearest-neighbour distances between two clouds, both directions unless directed."""
-    if int(x.shape[0]) == 0 or int(y.shape[0]) == 0:
-        return None
-    d_forward = tw.neighbors.query_hashgrid_nearest(y, x, k=1)[1]
-    d_backward = None
-    if not single_directional:
-        d_backward = tw.neighbors.query_hashgrid_nearest(x, y, k=1)[1]
-    return d_forward, d_backward
-
-
-def _distances_points_to_mesh(
-    points: wp.array[wp.vec3],
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    single_directional: bool,
-) -> _DistancePair | None:
-    """Point-to-surface distances forward, cloud nearest-neighbour distances back."""
-    if int(points.shape[0]) == 0 or int(vertices.shape[0]) == 0 or int(faces.shape[0]) == 0:
-        return None
-    d_forward = tw.proximity.closest_point_on_mesh(vertices, faces, points)[1]
-    d_backward = None
-    if not single_directional:
-        d_backward = tw.neighbors.query_hashgrid_nearest(points, vertices, k=1)[1]
-    return d_forward, d_backward
-
-
-def _distances_mesh_to_mesh(
-    vertices_a: wp.array[wp.vec3],
-    faces_a: wp.array[wp.int32],
-    vertices_b: wp.array[wp.vec3],
-    faces_b: wp.array[wp.int32],
-    single_directional: bool,
-) -> _DistancePair | None:
-    """Each mesh's vertices to the other's surface. Vertex-sampled, not a true surface metric."""
-    if (
-        int(vertices_a.shape[0]) == 0
-        or int(vertices_b.shape[0]) == 0
-        or int(faces_a.shape[0]) == 0
-        or int(faces_b.shape[0]) == 0
-    ):
-        return None
-    d_forward = tw.proximity.closest_point_on_mesh(vertices_b, faces_b, vertices_a)[1]
-    d_backward = None
-    if not single_directional:
-        d_backward = tw.proximity.closest_point_on_mesh(vertices_a, faces_a, vertices_b)[1]
-    return d_forward, d_backward
 
 
 # ---------------------------------------------------------------------------
@@ -412,105 +278,6 @@ def chamfer_mesh_to_mesh(
 #     grad_x = x.grad  # dloss/dx
 #
 # Passing ``tape=None`` still returns the loss value but records nothing (no gradient).
-
-
-def _validate_diff_reduction(point_reduction: _DiffReduction) -> None:
-    if point_reduction not in ("mean", "sum"):
-        raise ValueError(
-            'Differentiable Chamfer losses support point_reduction "mean" or "sum" only. '
-            'Use the non-differentiable chamfer_* functions for "max"/None.'
-        )
-
-
-def _reduction_scale(point_reduction: _DiffReduction, count: int) -> float:
-    return (1.0 / count) if point_reduction == "mean" else 1.0
-
-
-def _zero_loss(device: wp.DeviceLike) -> twt.Array1dFloat32:
-    zeros = wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True)
-    return cast(twt.Array1dFloat32, zeros)
-
-
-def _maybe_taped(tape: wp.Tape | None, record: Callable[[], None]) -> None:
-    """
-    Run ``record``, inside ``tape`` when there is one.
-
-    The three ``chamfer_*_loss`` entry points each build their launches in a closure so the same
-    body can run recorded or not; this is the branch that decides which. Recording is opt-in
-    because a ``wp.Tape`` context is only wanted when the caller intends to backpropagate.
-    """
-    if tape is not None:
-        with tape:
-            record()
-    else:
-        record()
-
-
-def _launch_nn_term(
-    x: wp.array[wp.vec3],
-    y: wp.array[wp.vec3],
-    nearest: wp.array[wp.int32],
-    scale: float,
-    loss: twt.Array1dFloat32,
-) -> None:
-    """
-    Accumulate the point-to-point Chamfer term for ``x`` into ``loss``.
-
-    Dispatches on the device: the block-reducing ``*_tiled`` kernel on CUDA, the portable
-    strided-slice one on CPU, where ``wp.launch_tiled`` runs a single lane per block (see
-    [`prefers_tiled_reduction`][triwarp._device.prefers_tiled_reduction]).
-    """
-    n = int(x.shape[0])
-    device = x.device
-    if prefers_tiled_reduction(device):
-        wp.launch_tiled(
-            kernel_distance.chamfer_nn_term_tiled,
-            dim=[(n + TILE_1D - 1) // TILE_1D],
-            inputs=[x, y, nearest, wp.float32(scale), loss],
-            block_dim=TILE_1D,
-            device=device,
-        )
-    else:
-        slices = slice_count(n, device)
-        wp.launch(
-            kernel_distance.chamfer_nn_term_sliced,
-            dim=slices,
-            inputs=[x, y, nearest, wp.float32(scale), wp.int32(slices), loss],
-            device=device,
-        )
-
-
-def _launch_surface_term(
-    points: wp.array[wp.vec3],
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    face_id: wp.array[wp.int32],
-    scale: float,
-    loss: twt.Array1dFloat32,
-) -> None:
-    """
-    Accumulate the point-to-surface Chamfer term for ``points`` into ``loss``.
-
-    Same device dispatch as [`_launch_nn_term`][triwarp.distance._launch_nn_term].
-    """
-    n = int(points.shape[0])
-    device = points.device
-    if prefers_tiled_reduction(device):
-        wp.launch_tiled(
-            kernel_distance.chamfer_surface_term_tiled,
-            dim=[(n + TILE_1D - 1) // TILE_1D],
-            inputs=[points, vertices, faces, face_id, wp.float32(scale), loss],
-            block_dim=TILE_1D,
-            device=device,
-        )
-    else:
-        slices = slice_count(n, device)
-        wp.launch(
-            kernel_distance.chamfer_surface_term_sliced,
-            dim=slices,
-            inputs=[points, vertices, faces, face_id, wp.float32(scale), wp.int32(slices), loss],
-            device=device,
-        )
 
 
 def chamfer_points_to_points_loss(
@@ -860,3 +627,249 @@ def hausdorff_mesh_to_mesh(
     if distances is None:
         return 0.0
     return _hausdorff(*distances, single_directional)
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+#
+# Every helper below is shared by two or three of the public entry points above -- the
+# validation guards and reductions by all three ``chamfer_*`` functions, the three geometry
+# dispatches by a ``chamfer_*`` and a ``hausdorff_*`` pair each, and the launch/tape machinery
+# by the ``*_loss`` family -- so section 11's stepdown rule puts them in one trailing block
+# rather than after any single caller.
+
+
+def _validate_point_reduction(point_reduction: _PointReduction | None) -> None:
+    if point_reduction is not None and point_reduction not in ("mean", "sum", "max"):
+        raise ValueError('point_reduction must be one of "mean", "sum", "max" or None')
+
+
+def _chamfer(
+    d_forward: wp.array[wp.float32],
+    d_backward: wp.array[wp.float32] | None,
+    point_reduction: _PointReduction | None,
+    single_directional: bool,
+) -> float | _UnreducedChamfer:
+    """
+    Combine forward/backward Euclidean distances into a Chamfer value.
+
+    Distances are squared element-wise (pytorch3d convention) before reduction.
+    """
+    sq_forward = _square(d_forward)
+    if point_reduction is None:
+        if single_directional:
+            return sq_forward
+        return sq_forward, _square(cast(wp.array[wp.float32], d_backward))
+
+    reduced_forward = _reduce(sq_forward, point_reduction)
+    if single_directional:
+        return reduced_forward
+
+    sq_backward = _square(cast(wp.array[wp.float32], d_backward))
+    reduced_backward = _reduce(sq_backward, point_reduction)
+    if point_reduction == "max":
+        return max(reduced_forward, reduced_backward)
+    return reduced_forward + reduced_backward
+
+
+def _square(distances: wp.array[wp.float32]) -> twt.Array1dFloat32:
+    n = int(distances.shape[0])
+    squared = wp.empty(n, dtype=wp.float32, device=distances.device)
+    if n > 0:
+        wp.map(kernel_array.square_scalar, distances, out=squared)
+    return cast(twt.Array1dFloat32, squared)
+
+
+def _reduce(distances: twt.Array1dFloat32, point_reduction: _PointReduction) -> float:
+    if point_reduction == "mean":
+        return tw.reduce.mean(distances)
+    if point_reduction == "sum":
+        return tw.reduce.sum(distances)
+    return tw.reduce.max(distances)
+
+
+def _hausdorff(
+    d_forward: wp.array[wp.float32],
+    d_backward: wp.array[wp.float32] | None,
+    single_directional: bool,
+) -> float:
+    """
+    Directed (or symmetric) Hausdorff distance from Euclidean distances.
+
+    ``max(d)`` over Euclidean per-element distances equals ``sqrt(max(d**2))``,
+    so this matches libigl's ``sqrt(max(dba, dab))`` without squaring.
+    """
+    directed_forward = tw.reduce.max(cast(twt.Array1dFloat32, d_forward))
+    if single_directional:
+        return directed_forward
+    directed_backward = tw.reduce.max(cast(twt.Array1dFloat32, d_backward))
+    return max(directed_forward, directed_backward)
+
+
+def _empty_chamfer(
+    point_reduction: _PointReduction | None, single_directional: bool, device: wp.DeviceLike
+) -> float | _UnreducedChamfer:
+    if point_reduction is not None:
+        return 0.0
+    if single_directional:
+        return cast(twt.Array1dFloat32, wp.empty(0, dtype=wp.float32, device=device))
+    return (
+        cast(twt.Array1dFloat32, wp.empty(0, dtype=wp.float32, device=device)),
+        cast(twt.Array1dFloat32, wp.empty(0, dtype=wp.float32, device=device)),
+    )
+
+
+# The three geometry dispatches below are each shared by a ``chamfer_*`` and a ``hausdorff_*``
+# entry point, which differ only in how they reduce the pair and what they return for degenerate
+# input. ``None`` means degenerate, leaving that choice to the caller.
+
+
+def _distances_points_to_points(
+    x: wp.array[wp.vec3], y: wp.array[wp.vec3], single_directional: bool
+) -> _DistancePair | None:
+    """Nearest-neighbour distances between two clouds, both directions unless directed."""
+    if int(x.shape[0]) == 0 or int(y.shape[0]) == 0:
+        return None
+    d_forward = tw.neighbors.query_hashgrid_nearest(y, x, k=1)[1]
+    d_backward = None
+    if not single_directional:
+        d_backward = tw.neighbors.query_hashgrid_nearest(x, y, k=1)[1]
+    return d_forward, d_backward
+
+
+def _distances_points_to_mesh(
+    points: wp.array[wp.vec3],
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    single_directional: bool,
+) -> _DistancePair | None:
+    """Point-to-surface distances forward, cloud nearest-neighbour distances back."""
+    if int(points.shape[0]) == 0 or int(vertices.shape[0]) == 0 or int(faces.shape[0]) == 0:
+        return None
+    d_forward = tw.proximity.closest_point_on_mesh(vertices, faces, points)[1]
+    d_backward = None
+    if not single_directional:
+        d_backward = tw.neighbors.query_hashgrid_nearest(points, vertices, k=1)[1]
+    return d_forward, d_backward
+
+
+def _distances_mesh_to_mesh(
+    vertices_a: wp.array[wp.vec3],
+    faces_a: wp.array[wp.int32],
+    vertices_b: wp.array[wp.vec3],
+    faces_b: wp.array[wp.int32],
+    single_directional: bool,
+) -> _DistancePair | None:
+    """Each mesh's vertices to the other's surface. Vertex-sampled, not a true surface metric."""
+    if (
+        int(vertices_a.shape[0]) == 0
+        or int(vertices_b.shape[0]) == 0
+        or int(faces_a.shape[0]) == 0
+        or int(faces_b.shape[0]) == 0
+    ):
+        return None
+    d_forward = tw.proximity.closest_point_on_mesh(vertices_b, faces_b, vertices_a)[1]
+    d_backward = None
+    if not single_directional:
+        d_backward = tw.proximity.closest_point_on_mesh(vertices_a, faces_a, vertices_b)[1]
+    return d_forward, d_backward
+
+
+def _validate_diff_reduction(point_reduction: _DiffReduction) -> None:
+    if point_reduction not in ("mean", "sum"):
+        raise ValueError(
+            'Differentiable Chamfer losses support point_reduction "mean" or "sum" only. '
+            'Use the non-differentiable chamfer_* functions for "max"/None.'
+        )
+
+
+def _reduction_scale(point_reduction: _DiffReduction, count: int) -> float:
+    return (1.0 / count) if point_reduction == "mean" else 1.0
+
+
+def _zero_loss(device: wp.DeviceLike) -> twt.Array1dFloat32:
+    zeros = wp.zeros(1, dtype=wp.float32, device=device, requires_grad=True)
+    return cast(twt.Array1dFloat32, zeros)
+
+
+def _maybe_taped(tape: wp.Tape | None, record: Callable[[], None]) -> None:
+    """
+    Run ``record``, inside ``tape`` when there is one.
+
+    The three ``chamfer_*_loss`` entry points each build their launches in a closure so the same
+    body can run recorded or not; this is the branch that decides which. Recording is opt-in
+    because a ``wp.Tape`` context is only wanted when the caller intends to backpropagate.
+    """
+    if tape is not None:
+        with tape:
+            record()
+    else:
+        record()
+
+
+def _launch_nn_term(
+    x: wp.array[wp.vec3],
+    y: wp.array[wp.vec3],
+    nearest: wp.array[wp.int32],
+    scale: float,
+    loss: twt.Array1dFloat32,
+) -> None:
+    """
+    Accumulate the point-to-point Chamfer term for ``x`` into ``loss``.
+
+    Dispatches on the device: the block-reducing ``*_tiled`` kernel on CUDA, the portable
+    strided-slice one on CPU, where ``wp.launch_tiled`` runs a single lane per block (see
+    [`prefers_tiled_reduction`][triwarp._device.prefers_tiled_reduction]).
+    """
+    n = int(x.shape[0])
+    device = x.device
+    if prefers_tiled_reduction(device):
+        wp.launch_tiled(
+            kernel_distance.chamfer_nn_term_tiled,
+            dim=[(n + TILE_1D - 1) // TILE_1D],
+            inputs=[x, y, nearest, wp.float32(scale), loss],
+            block_dim=TILE_1D,
+            device=device,
+        )
+    else:
+        slices = slice_count(n, device)
+        wp.launch(
+            kernel_distance.chamfer_nn_term_sliced,
+            dim=slices,
+            inputs=[x, y, nearest, wp.float32(scale), wp.int32(slices), loss],
+            device=device,
+        )
+
+
+def _launch_surface_term(
+    points: wp.array[wp.vec3],
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_id: wp.array[wp.int32],
+    scale: float,
+    loss: twt.Array1dFloat32,
+) -> None:
+    """
+    Accumulate the point-to-surface Chamfer term for ``points`` into ``loss``.
+
+    Same device dispatch as [`_launch_nn_term`][triwarp.distance._launch_nn_term].
+    """
+    n = int(points.shape[0])
+    device = points.device
+    if prefers_tiled_reduction(device):
+        wp.launch_tiled(
+            kernel_distance.chamfer_surface_term_tiled,
+            dim=[(n + TILE_1D - 1) // TILE_1D],
+            inputs=[points, vertices, faces, face_id, wp.float32(scale), loss],
+            block_dim=TILE_1D,
+            device=device,
+        )
+    else:
+        slices = slice_count(n, device)
+        wp.launch(
+            kernel_distance.chamfer_surface_term_sliced,
+            dim=slices,
+            inputs=[points, vertices, faces, face_id, wp.float32(scale), wp.int32(slices), loss],
+            device=device,
+        )
