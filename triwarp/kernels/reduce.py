@@ -458,18 +458,6 @@ def minmax_2d_cols_serial(
 
 
 @wp.func
-def sum1d_tile(values: wp.array[wp.Scalar], offset: int, remaining: int) -> wp.Scalar:
-    if remaining >= TILE_1D:
-        tile = wp.tile_load(values, shape=TILE_1D, offset=offset, storage="register")
-        return wp.tile_sum(tile)[0]
-
-    tile_sum = values[offset]
-    for k in range(1, remaining):
-        tile_sum += values[offset + k]
-    return tile_sum
-
-
-@wp.func
 def weighted_sum1d_tile(
     values: wp.array[wp.float32], weights: wp.array[wp.float32], offset: int, remaining: int
 ) -> wp.float32:

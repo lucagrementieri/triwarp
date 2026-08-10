@@ -257,9 +257,9 @@ def pair_sq_distances(
 
 
 @wp.kernel
-def set_dp_origin(dp: wp.array2d[wp.float32]) -> None:
+def set_dp_origin(out_dp: wp.array2d[wp.float32]) -> None:
     # Seed the stitch grid DP: the empty band consuming 0 edges of either loop costs nothing.
-    dp[0, 0] = 0.0
+    out_dp[0, 0] = 0.0
 
 
 @wp.kernel(enable_backward=False)
@@ -275,8 +275,8 @@ def stitch_dp_diag(
     n_a: wp.int32,
     n_b: wp.int32,
     diag: wp.int32,
-    dp: wp.array2d[wp.float32],
-    came: wp.array2d[wp.int32],
+    out_dp: wp.array2d[wp.float32],
+    out_came: wp.array2d[wp.int32],
 ) -> None:
     # One thread per cell (i, j) on anti-diagonal ``diag = i + j``; each reads only the previous
     # diagonal, so launching diag = 1, 2, ... in order are the DP barriers. dp[i, j] = min cost of
@@ -288,8 +288,8 @@ def stitch_dp_diag(
         return
     # Never let a full ring come from one loop before touching the other.
     if (i == n_a and j == 0) or (j == n_b and i == 0):
-        dp[i, j] = BAD_METRIC
-        came[i, j] = CAME_NONE
+        out_dp[i, j] = BAD_METRIC
+        out_came[i, j] = CAME_NONE
         return
 
     complex_edge = metric_id == METRIC_COMPLEX_STITCH
@@ -297,32 +297,32 @@ def stitch_dp_diag(
     best_came = CAME_NONE
 
     # Advance loop A: new triangle (a[i-1], b[j], a[i]) (MeshLib addALoop arg order).
-    if i >= 1 and dp[i - 1, j] < BAD_METRIC:
+    if i >= 1 and out_dp[i - 1, j] < BAD_METRIC:
         a_prev = a_pos[(i - 1) % n_a]
         a_cur = a_pos[i % n_a]
         b_cur = b_pos[j % n_b]
-        w = dp[i - 1, j] + stitch_triangle_metric(a_prev, b_cur, a_cur, up, metric_id)
+        w = out_dp[i - 1, j] + stitch_triangle_metric(a_prev, b_cur, a_cur, up, metric_id)
         if complex_edge:
-            if came[i - 1, j] != CAME_NONE:
-                c_op = stitch_prev_apex(a_pos, b_pos, came, n_a, n_b, i - 1, j)
+            if out_came[i - 1, j] != CAME_NONE:
+                c_op = stitch_prev_apex(a_pos, b_pos, out_came, n_a, n_b, i - 1, j)
                 w = w + stitch_edge_metric(a_prev, b_cur, c_op, a_cur)
             if a_opp_valid[(i - 1) % n_a] != 0:
                 w = w + stitch_edge_metric(a_cur, a_prev, a_opp[(i - 1) % n_a], b_cur)
         update_argmin(best, best_came, w, CAME_A)
 
     # Advance loop B: new triangle (a[i], b[j-1], b[j]).
-    if j >= 1 and dp[i, j - 1] < BAD_METRIC:
+    if j >= 1 and out_dp[i, j - 1] < BAD_METRIC:
         a_cur = a_pos[i % n_a]
         b_prev = b_pos[(j - 1) % n_b]
         b_cur = b_pos[j % n_b]
-        w = dp[i, j - 1] + stitch_triangle_metric(a_cur, b_prev, b_cur, up, metric_id)
+        w = out_dp[i, j - 1] + stitch_triangle_metric(a_cur, b_prev, b_cur, up, metric_id)
         if complex_edge:
-            if came[i, j - 1] != CAME_NONE:
-                c_op = stitch_prev_apex(a_pos, b_pos, came, n_a, n_b, i, j - 1)
+            if out_came[i, j - 1] != CAME_NONE:
+                c_op = stitch_prev_apex(a_pos, b_pos, out_came, n_a, n_b, i, j - 1)
                 w = w + stitch_edge_metric(a_cur, b_prev, c_op, b_cur)
             if b_opp_valid[j % n_b] != 0:
                 w = w + stitch_edge_metric(b_prev, b_cur, b_opp[j % n_b], a_cur)
         update_argmin(best, best_came, w, CAME_B)
 
-    dp[i, j] = best
-    came[i, j] = best_came
+    out_dp[i, j] = best
+    out_came[i, j] = best_came

@@ -391,7 +391,7 @@ def fill_dp_span(
     # the launch *count* is ``max_B - 1`` for the whole mesh instead of ``B - 1`` per loop.
     #
     # This is the **CPU** engine and the tie-break reference; CUDA runs
-    # :func:`fill_dp_span_tiled`, which must agree with it apex for apex (see
+    # ``fill_dp_span_tiled``, which must agree with it apex for apex (see
     # ``tests/test_holes.py::test_fill_dp_span_tiled_matches_serial``).
     ell, i = wp.tid()
     if active[ell] == 0:

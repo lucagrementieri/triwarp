@@ -99,7 +99,7 @@ def init_range_step(
         wp.launch(
             kernel_array.init_range_step,
             dim=count,
-            inputs=[out, _int_scalar(dtype, step)],
+            inputs=[_int_scalar(dtype, step), out],
             device=device,
         )
     return out
@@ -150,7 +150,7 @@ def init_sort_pair_indices(
         wp.launch(
             kernel_array.init_sort_pair_indices,
             dim=2 * n,
-            inputs=[out, _int_scalar(dtype, n), _int_scalar(dtype, fill_value)],
+            inputs=[_int_scalar(dtype, n), _int_scalar(dtype, fill_value), out],
             device=device,
         )
     return out
@@ -196,7 +196,7 @@ def init_repeat_index(
         wp.launch(
             kernel_array.init_repeat_index,
             dim=count,
-            inputs=[out, _int_scalar(dtype, repeats)],
+            inputs=[_int_scalar(dtype, repeats), out],
             device=device,
         )
     return out

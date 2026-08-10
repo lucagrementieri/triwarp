@@ -776,8 +776,8 @@ def collapse_candidates(
 
 @wp.kernel(enable_backward=False)
 def claim_collapses(
-    out_survivor: wp.array(dtype=wp.int32),
-    out_removed: wp.array(dtype=wp.int32),
+    survivor: wp.array(dtype=wp.int32),
+    removed: wp.array(dtype=wp.int32),
     offsets: wp.array(dtype=wp.int32),
     columns: wp.array(dtype=wp.int32),
     out_claim: wp.array(dtype=wp.int32),
@@ -785,11 +785,11 @@ def claim_collapses(
     # Lock the full closed 1-ring of both endpoints (min edge id wins), so committed
     # collapses have disjoint neighbourhoods and stay independent.
     k = int(wp.tid())
-    s = out_survivor[k]
+    s = survivor[k]
     if s < 0:
         return
     key = k
-    r = out_removed[k]
+    r = removed[k]
     wp.atomic_min(out_claim, s, key)
     wp.atomic_min(out_claim, r, key)
     for i in range(offsets[s], offsets[s + 1]):
@@ -800,9 +800,9 @@ def claim_collapses(
 
 @wp.kernel(enable_backward=False)
 def commit_collapses(
-    out_survivor: wp.array(dtype=wp.int32),
-    out_removed: wp.array(dtype=wp.int32),
-    out_pos: wp.array(dtype=wp.vec3),
+    survivor: wp.array(dtype=wp.int32),
+    removed: wp.array(dtype=wp.int32),
+    pos: wp.array(dtype=wp.vec3),
     offsets: wp.array(dtype=wp.int32),
     columns: wp.array(dtype=wp.int32),
     claim: wp.array(dtype=wp.int32),
@@ -811,11 +811,11 @@ def commit_collapses(
     out_count: wp.array(dtype=wp.int32),
 ) -> None:
     k = int(wp.tid())
-    s = out_survivor[k]
+    s = survivor[k]
     if s < 0:
         return
     key = k
-    r = out_removed[k]
+    r = removed[k]
     won = True
     if claim[s] != key or claim[r] != key:
         won = False
@@ -828,7 +828,7 @@ def commit_collapses(
     if not won:
         return
     out_remap[r] = s
-    out_positions[s] = out_pos[k]
+    out_positions[s] = pos[k]
     wp.atomic_add(out_count, 0, 1)
 
 

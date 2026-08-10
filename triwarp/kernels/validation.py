@@ -161,11 +161,11 @@ def verify_orientation(
     edges: wp.array2d[wp.int32],
     signs: wp.array[wp.int32],
     orient: wp.array[wp.int32],
-    conflict: wp.array[wp.int32],
+    out_conflict: wp.array[wp.int32],
 ) -> None:
     """Flag any face-adjacency edge whose endpoints violate the flip constraint."""
     r = int(wp.tid())
     f0 = edges[r, 0]
     f1 = edges[r, 1]
     if ((orient[f0] + orient[f1]) & wp.int32(1)) != signs[r]:
-        conflict[0] = wp.int32(1)
+        out_conflict[0] = wp.int32(1)

@@ -66,19 +66,6 @@ def update_argmax_lowest_index(
 
 
 @wp.func
-def update_argmax_vec3(
-    best_value: wp.ref[wp.float32],
-    best_payload: wp.ref[wp.vec3],
-    value: wp.float32,
-    payload: wp.vec3,
-):
-    # Running argmax carrying a ``vec3`` payload instead of an index.
-    if value > best_value:
-        best_value = value
-        best_payload = payload  # noqa: F841 — writes through the wp.ref parameter
-
-
-@wp.func
 def update_argmin_pair(
     best_value: wp.ref[wp.float32],
     first: wp.ref[wp.int32],
@@ -130,30 +117,30 @@ def divide_if_positive(value: wp.float32, divisor: wp.float32) -> wp.float32:
 
 
 @wp.kernel
-def init_range(out: wp.array[wp.Int]) -> None:
+def init_range(out_indices: wp.array[wp.Int]) -> None:
     i = int(wp.tid())
-    out[i] = i
+    out_indices[i] = i
 
 
 @wp.kernel
-def init_range_step(out: wp.array[wp.Int], step: wp.Int) -> None:
+def init_range_step(step: wp.Int, out_indices: wp.array[wp.Int]) -> None:
     i = int(wp.tid())
-    out[i] = i * step
+    out_indices[i] = i * step
 
 
 @wp.kernel
-def init_sort_pair_indices(out: wp.array[wp.Int], n: wp.Int, fill_value: wp.Int) -> None:
+def init_sort_pair_indices(n: wp.Int, fill_value: wp.Int, out_indices: wp.array[wp.Int]) -> None:
     i = int(wp.tid())
     if i < n:
-        out[i] = i
+        out_indices[i] = i
     else:
-        out[i] = fill_value
+        out_indices[i] = fill_value
 
 
 @wp.kernel
-def init_repeat_index(out: wp.array[wp.Int], repeats: wp.Int) -> None:
+def init_repeat_index(repeats: wp.Int, out_indices: wp.array[wp.Int]) -> None:
     i = int(wp.tid())
-    out[i] = i // repeats
+    out_indices[i] = i // repeats
 
 
 @wp.kernel

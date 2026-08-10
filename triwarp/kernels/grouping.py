@@ -136,12 +136,6 @@ def hash_find(key: wp.Int, slot_key: wp.array[wp.Int], mask: wp.int32) -> wp.int
     return h
 
 
-@wp.func
-def hash_contains(key: wp.Int, slot_key: wp.array[wp.Int], mask: wp.int32) -> bool:
-    """Whether ``key`` is in the table, without inserting it."""
-    return hash_find(key, slot_key, mask) >= 0
-
-
 @wp.kernel
 def hash_insert(
     data: wp.array[wp.Int],

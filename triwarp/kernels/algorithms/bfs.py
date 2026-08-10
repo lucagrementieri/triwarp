@@ -3,19 +3,19 @@ Breadth-first search over a CSR adjacency graph.
 
 Two traversal cores:
 
-- :func:`bfs_serial_drain` — one Warp thread walks the graph from whatever FIFO window it is
+- ``bfs_serial_drain`` — one Warp thread walks the graph from whatever FIFO window it is
   handed, using a dense ``dist`` array as the visited marker (``dist[node] == -1`` ⇒ unvisited).
-  Run at ``dim=1`` from a single seeded source (:func:`single_source_bfs_kernel`) it reproduces
+  Run at ``dim=1`` from a single seeded source (``single_source_bfs_kernel``) it reproduces
   ``scipy.sparse.csgraph.breadth_first_order`` order/parents/distances exactly when the CSR columns
-  are sorted ascending (as produced by :func:`triwarp.graph.edges_to_csr`); resumed from a window
-  the level-synchronous loop built (:func:`resume_bfs_kernel`) it continues that same order.
-- :func:`per_source_bfs_collect` — one thread per source over caller-provided global-memory
+  are sorted ascending (as produced by ``triwarp.graph.edges_to_csr``); resumed from a window
+  the level-synchronous loop built (``resume_bfs_kernel``) it continues that same order.
+- ``per_source_bfs_collect`` — one thread per source over caller-provided global-memory
   scratch rows (a FIFO queue whose emitted prefix is the discovery order, an open-addressing
   visited hash set, and a small nearest-fallback pool). With a finite ``radius`` it enqueues only
   neighbors within ``radius`` of the center (and backfills the nearest out-of-ball vertices up to
   ``min_count``) — the geodesic-ball query. Its nearest-fallback pool scans with the shared
   ``wp.ref`` argmin/argmax helpers, so any kernel calling it must be decorated
-  ``@wp.kernel(enable_backward=False)`` (see :mod:`triwarp.kernels.array`).
+  ``@wp.kernel(enable_backward=False)`` (see ``triwarp.kernels.array``).
 """
 
 import warp as wp
@@ -389,23 +389,23 @@ def bfs_scatter_claims(
     state: wp.array[wp.int32],
     claim_rank: wp.array[wp.int32],
     offsets_inclusive: wp.array[wp.int32],
-    order: wp.array[wp.int32],
+    out_order: wp.array[wp.int32],
     out_parent: wp.array[wp.int32],
     out_dist: wp.array[wp.int32],
 ) -> None:
     # Emits the level in exact scipy FIFO order without a sort: segments are rank-major (thread
     # r's segment starts at the exclusive-scan value offsets_inclusive[r - 1]) and each segment
     # fills in ascending CSR column order — (parent dequeue rank, ascending node id), exactly
-    # the order the former int64 claim-key radix sort produced. ``order`` is read as the current
-    # frontier and written with the next level's nodes. ``out_dist`` doubles as the visited
-    # marker read by the ownership guard: only the unique rank winner writes dist[v], so its
-    # racy read by non-owners cannot flip their guard (they fail claim_rank[v] == r).
+    # the order the former int64 claim-key radix sort produced. ``out_order`` is read as the
+    # current frontier and written with the next level's nodes. ``out_dist`` doubles as the
+    # visited marker read by the ownership guard: only the unique rank winner writes dist[v], so
+    # its racy read by non-owners cannot flip their guard (they fail claim_rank[v] == r).
     r = int(wp.tid())
     start = state[_STATE_START]
     tail = state[_STATE_TAIL]
     if r >= tail - start:
         return
-    u = order[start + r]
+    u = out_order[start + r]
     level = state[_STATE_LEVEL]
     slot = tail
     if r > 0:
@@ -413,7 +413,7 @@ def bfs_scatter_claims(
     for k in range(adj_offsets[u], adj_offsets[u + 1]):
         v = adj_columns[k]
         if out_dist[v] == wp.int32(-1) and claim_rank[v] == wp.int32(r):
-            order[slot] = v
+            out_order[slot] = v
             out_parent[v] = u
             out_dist[v] = level
             slot += wp.int32(1)
