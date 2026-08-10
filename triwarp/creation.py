@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from typing import NamedTuple
 
 import numpy as np
 import warp as wp
@@ -1901,6 +1902,119 @@ def random_soup(
 
 
 # --- private helpers ---------------------------------------------------------------------
+
+
+class _ParametricSpec(NamedTuple):
+    """
+    One analytic surface: its kernel id, its parameter rectangle and how the rectangle glues.
+
+    The gluing is what makes these surfaces interesting and it is *combinatorial* -- a fact about
+    the map, not about how close two evaluated points happen to land. Every flag was derived from
+    the map itself and checked against VTK's welded output; see
+    [`parametric_surface`][triwarp.creation.parametric_surface].
+    """
+
+    kind: int
+    u_range: tuple[float, float]
+    v_range: tuple[float, float]
+    u_wrap: bool = False
+    u_twist: bool = False
+    v_wrap: bool = False
+    v_twist: bool = False
+    pole_v_min: bool = False
+    pole_v_max: bool = False
+    pole_u_min: bool = False
+    pole_u_max: bool = False
+
+
+def _parametric_lattice(spec: _ParametricSpec, n_u: int, n_v: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build the vertex-index map and face buffer for one surface's ``(n_u, n_v)`` lattice.
+
+    Returns ``(vertex_index, faces)`` where ``vertex_index`` has shape ``(n_u, n_v)`` and holds the
+    dense output vertex id of each lattice sample -- several samples share an id wherever the
+    surface glues -- and ``faces`` is triwarp's flat triangle buffer.
+
+    Pure host-side index arithmetic, in the same spirit as [`grid`][triwarp.creation.grid]: no
+    position is consulted and no tolerance appears anywhere, so the topology is exact and
+    independent of resolution, dtype and device. Welding by *distance* instead would (a) make every
+    one of these meshes depend on
+    [`remove_duplicated_vertices`][triwarp.repair.remove_duplicated_vertices], which several of them
+    exist to test, and (b) glue the accidental self-intersections of an immersed surface -- which is
+    what VTK does, merging 40 lattice points of Catalan's minimal surface that the map does not
+    identify, because two sheets happen to cross there.
+    """
+    if spec.u_twist and spec.v_twist:
+        raise ValueError("a surface twisted in both directions is not supported")
+    i_lattice, j_lattice = np.meshgrid(np.arange(n_u), np.arange(n_v), indexing="ij")
+    i_canonical, j_canonical = i_lattice.copy(), j_lattice.copy()
+
+    # Wrapped boundary: the last row *is* the first row. A twist reverses the other index on the way
+    # across, which is precisely what makes Moebius, Klein, Boy, Roman and the cross-cap
+    # non-orientable -- the seam glues the strip to itself with a flip.
+    if spec.u_wrap:
+        seam = i_canonical == n_u - 1
+        if spec.u_twist:
+            j_canonical = np.where(seam, n_v - 1 - j_canonical, j_canonical)
+        i_canonical = np.where(seam, 0, i_canonical)
+    if spec.v_wrap:
+        seam = j_canonical == n_v - 1
+        if spec.v_twist:
+            i_canonical = np.where(seam, n_u - 1 - i_canonical, i_canonical)
+        j_canonical = np.where(seam, 0, j_canonical)
+        # A v-twist can send an index back onto the u seam, so re-canonicalise it.
+        if spec.u_wrap:
+            i_canonical = np.where(i_canonical == n_u - 1, 0, i_canonical)
+
+    # A pole is a boundary row the map collapses to a single point, so every sample on it is one
+    # vertex. ``v_min`` / ``v_max`` are rows spanning u, ``u_min`` / ``u_max`` columns spanning v.
+    # A *wrapped* boundary has already identified its two extreme rows, so a pole on either of them
+    # is one pole on the surviving row -- which is why Boy and the cross-cap keep 1 483 vertices
+    # rather than losing a second row's worth.
+    poles = []
+    if spec.v_wrap:
+        if spec.pole_v_min or spec.pole_v_max:
+            poles.append(j_canonical == 0)
+    else:
+        if spec.pole_v_min:
+            poles.append(j_canonical == 0)
+        if spec.pole_v_max:
+            poles.append(j_canonical == n_v - 1)
+    if spec.u_wrap:
+        if spec.pole_u_min or spec.pole_u_max:
+            poles.append(i_canonical == 0)
+    else:
+        if spec.pole_u_min:
+            poles.append(i_canonical == 0)
+        if spec.pole_u_max:
+            poles.append(i_canonical == n_u - 1)
+    for on_row in poles:
+        anchor_i, anchor_j = int(i_canonical[on_row][0]), int(j_canonical[on_row][0])
+        i_canonical = np.where(on_row, anchor_i, i_canonical)
+        j_canonical = np.where(on_row, anchor_j, j_canonical)
+
+    _unique, inverse = np.unique(i_canonical * n_v + j_canonical, return_inverse=True)
+    vertex_index = inverse.reshape((n_u, n_v)).astype(np.int32)
+
+    # One cell per lattice square -- wrapping reuses vertices rather than adding cells, so the count
+    # is ``(n_u - 1) * (n_v - 1)`` however the boundary glues. A cell touching a pole has two
+    # identical corners, so it contributes one triangle instead of two.
+    corner_a = vertex_index[:-1, :-1].ravel()
+    corner_b = vertex_index[1:, :-1].ravel()
+    corner_c = vertex_index[1:, 1:].ravel()
+    corner_d = vertex_index[:-1, 1:].ravel()
+    triangles = np.concatenate(
+        (
+            np.column_stack((corner_a, corner_b, corner_c)),
+            np.column_stack((corner_a, corner_c, corner_d)),
+        )
+    )
+    nondegenerate = (
+        (triangles[:, 0] != triangles[:, 1])
+        & (triangles[:, 1] != triangles[:, 2])
+        & (triangles[:, 2] != triangles[:, 0])
+    )
+    return vertex_index, np.ascontiguousarray(triangles[nondegenerate].reshape(-1), dtype=np.int32)
 
 
 def _segment_to_cylinder(segment: Sequence[Sequence[float]]) -> tuple[wp.mat44, float]:
