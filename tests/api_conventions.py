@@ -1,7 +1,7 @@
 """
 Static scan of the public API's shape: names, summaries, file layout and module boundaries.
 
-Twelve conventions the package holds to, each one a defect class that was actually found rather
+Thirteen conventions the package holds to, each one a defect class that was actually found rather
 than an aesthetic preference. They are checked by an ``ast`` scan of ``triwarp/`` (excluding
 ``kernels/``, ``__init__.py`` and private ``_*.py`` modules) plus a listing of ``tests/`` and
 ``benchmarks/``, and [`tests/test_api_conventions.py`](test_api_conventions.py) fails the default
@@ -48,6 +48,13 @@ test run on any violation:
     neither ``ast.parse`` nor any reviewer had noticed, because an example is documentation nobody
     executes. This one is the odd member of the family: the scan only *extracts* the blocks, and
     [`tests/test_api_conventions.py`](test_api_conventions.py) runs them against a mesh fixture.
+13. **A kernel output argument is named ``out_*`` and sits at the end of the signature**
+    (``.claude/CLAUDE.md`` section 3). Like check 9 this one scans ``kernels/``, which the others
+    exclude: the first full sweep of the kernel tree found eight genuine outputs wearing plain
+    names (four of them literally ``out``, the prefix without the name), three read-only inputs
+    wearing the prefix, and two argument classes the convention had no spelling for -- in-place
+    arguments and scratch / persistent-state buffers, now exempted in section 3 and carried here
+    as ``_KERNEL_OUTPUT_ALLOWLIST``.
 
 Why a static scan rather than importing ``triwarp``
 ---------------------------------------------------
@@ -305,6 +312,65 @@ _HELPER_ORDER_ALLOWLIST: dict[str, frozenset[str]] = {
     ),
     "texture": frozenset({"_check_uv_in_range"}),
     "typing": frozenset({"_shape_2d", "_shape_3d"}),
+}
+
+# --- check 13 -----------------------------------------------------------------------------------
+
+# Kernel-scope calls whose first argument is a buffer the kernel writes.
+_KERNEL_WRITE_CALLS = frozenset(
+    {
+        "atomic_add",
+        "atomic_sub",
+        "atomic_min",
+        "atomic_max",
+        "atomic_cas",
+        "atomic_exch",
+        "tile_store",
+        "tile_atomic_add",
+    }
+)
+
+# Kernel arguments that are written without the ``out_`` prefix, or that legitimately follow an
+# ``out_`` argument, keyed by ``(kernel module, kernel)``. Two exemption classes, both written into
+# ``.claude/CLAUDE.md`` section 3:
+#
+# - **In-place**: the argument is both the input and the result -- an ``out_`` prefix would misread
+#   as write-only. ``sort_rows_insertion(data)``, ``orient_ccw(points2d)``,
+#   ``offset_packed_faces(faces)``, the hole-filling DP tables (read at smaller spans, written at
+#   the current one) and ``accumulate_cost(acc)``, which reads the packed accumulator's weight-sum
+#   slot while atomically adding into its cost slot.
+# - **Scratch / persistent state**: caller-allocated working memory carried across launches --
+#   cursors, stacks, open-addressing tables, the ear-clipping ring, ``ball_pivoting``'s
+#   persistent front. Neither an input nor the answer, so the name says what the buffer holds
+#   (``cursor``, ``front_out``, ``new_src``) rather than wearing a prefix that promises a result.
+_KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
+    # in-place
+    ("array", "sort_rows_insertion"): frozenset({"data"}),
+    ("combine", "offset_packed_faces"): frozenset({"faces"}),
+    ("holes", "fill_dp_span"): frozenset({"dp", "prev"}),
+    ("holes", "fill_dp_span_tiled"): frozenset({"dp", "prev"}),
+    ("polyline", "orient_ccw"): frozenset({"points2d"}),
+    ("registration", "accumulate_cost"): frozenset({"acc"}),
+    # scratch / persistent state
+    ("adjacency", "scatter_vertex_faces"): frozenset({"cursor"}),
+    ("algorithms.ball_pivoting", "begin_wave"): frozenset({"counters"}),
+    ("algorithms.ball_pivoting", "collect_front_from_table"): frozenset({"counters"}),
+    ("algorithms.ball_pivoting", "commit_triangles"): frozenset({"counters", "point_used"}),
+    ("algorithms.ball_pivoting", "compact_front"): frozenset({"counters", "front_out"}),
+    ("algorithms.ball_pivoting", "end_wave"): frozenset({"counters"}),
+    ("algorithms.ball_pivoting", "pivot_front_edges"): frozenset(
+        {"counters", "edge_cand", "edge_state", "front_out"}
+    ),
+    ("algorithms.ball_pivoting", "rehash_edges"): frozenset(
+        {"new_cand", "new_count", "new_opp", "new_src", "new_state", "new_tgt"}
+    ),
+    ("energies", "scatter_edge_halfedges"): frozenset({"cursor"}),
+    ("grouping", "hash_insert"): frozenset({"slot_counts"}),
+    ("polyline", "clip_selected"): frozenset({"active", "left", "right"}),
+    ("polyline", "init_ring"): frozenset({"active", "left", "right"}),
+    ("polyline", "rdp_keep_mask"): frozenset({"stack"}),
+    ("sample", "subtract_deleted_contributions"): frozenset({"weights"}),
+    ("visibility", "shape_diameter"): frozenset({"scratch"}),
 }
 
 
@@ -863,3 +929,116 @@ def docstring_examples() -> list[DocstringExample]:
                 )
             )
     return examples
+
+
+# --- check 13 -----------------------------------------------------------------------------------
+
+
+def _is_kernel(node: ast.FunctionDef) -> bool:
+    """Whether ``node`` is decorated ``@wp.kernel`` or ``@wp.kernel(...)``."""
+    for decorator in node.decorator_list:
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if (
+            isinstance(target, ast.Attribute)
+            and target.attr == "kernel"
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "wp"
+        ):
+            return True
+    return False
+
+
+def _subscript_base(node: ast.expr) -> str | None:
+    """Resolve a (possibly nested) subscript target to its bare name, or ``None``."""
+    while isinstance(node, ast.Subscript):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _written_parameters(node: ast.FunctionDef) -> set[str]:
+    """
+    Parameters the kernel body writes *directly*.
+
+    A subscript store, or the first argument of a ``wp.atomic_*`` / ``wp.tile_store`` /
+    ``wp.tile_atomic_add`` call. A write that happens inside a called ``@wp.func`` (e.g. through a
+    ``wp.ref`` parameter) is invisible here, so this check can under-report but never
+    false-positive.
+    """
+    parameters = {arg.arg for arg in node.args.args}
+    written: set[str] = set()
+    for sub in ast.walk(node):
+        targets: list[ast.expr] = []
+        if isinstance(sub, ast.Assign):
+            targets = list(sub.targets)
+        elif isinstance(sub, ast.AugAssign):
+            targets = [sub.target]
+        for target in targets:
+            if isinstance(target, ast.Subscript):
+                base = _subscript_base(target)
+                if base in parameters:
+                    written.add(base)
+        if (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr in _KERNEL_WRITE_CALLS
+            and isinstance(sub.func.value, ast.Name)
+            and sub.func.value.id == "wp"
+            and sub.args
+            and isinstance(sub.args[0], ast.Name)
+            and sub.args[0].id in parameters
+        ):
+            written.add(sub.args[0].id)
+    return written
+
+
+def kernel_output_naming_problems() -> list[str]:
+    """
+    Check 13: a kernel output argument without the ``out_`` prefix, or not at the signature's end.
+
+    ``.claude/CLAUDE.md`` section 3's naming rule for ``triwarp/kernels/``, with its two written
+    exemptions (in-place arguments and scratch / persistent-state buffers) carried by
+    ``_KERNEL_OUTPUT_ALLOWLIST``. Both directions are checked: a *written* argument must wear the
+    prefix, and nothing without the prefix may follow the first argument that wears it.
+    """
+    problems: list[str] = []
+    seen: set[tuple[tuple[str, str], str]] = set()
+    for path in sorted(_KERNELS_DIR.rglob("*.py")):
+        module = ".".join(path.relative_to(_KERNELS_DIR).with_suffix("").parts)
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue  # test_package_scan_is_discoverable reports the parse failure
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef) or not _is_kernel(node):
+                continue
+            allowed = _KERNEL_OUTPUT_ALLOWLIST.get((module, node.name), frozenset())
+            site = f"{path.relative_to(_REPO_ROOT)}:{node.lineno}"
+            for name in sorted(_written_parameters(node)):
+                if name.startswith("out_"):
+                    continue
+                if name in allowed:
+                    seen.add(((module, node.name), name))
+                    continue
+                problems.append(
+                    f"{site} {node.name}: writes parameter '{name}', which is neither "
+                    "out_-prefixed nor an allowlisted in-place / scratch argument"
+                )
+            past_outputs = False
+            for arg in node.args.args:
+                if arg.arg.startswith("out_"):
+                    past_outputs = True
+                elif past_outputs:
+                    if arg.arg in allowed:
+                        seen.add(((module, node.name), arg.arg))
+                        continue
+                    problems.append(
+                        f"{site} {node.name}: input parameter '{arg.arg}' follows an out_ "
+                        "argument -- outputs go last"
+                    )
+    problems.extend(
+        f"_KERNEL_OUTPUT_ALLOWLIST entry {(*key, name)!r} matches nothing in kernels/ -- drop it"
+        for key, names in sorted(_KERNEL_OUTPUT_ALLOWLIST.items())
+        for name in sorted(names)
+        if (key, name) not in seen
+    )
+    return problems

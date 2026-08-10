@@ -1,7 +1,7 @@
 """
 The convention gate: the public API's names, summaries and file layout, checked statically.
 
-Twelve conventions, one test each so the failing test's *name* says which one was broken. The scan
+Thirteen conventions, one test each so the failing test's *name* says which one was broken. The scan
 and the reasoning behind each rule live in [`tests/api_conventions.py`](api_conventions.py); this
 file is only the pytest surface -- with one exception, the docstring-example test, whose whole
 point is that a static read cannot find what is wrong with an example.
@@ -28,6 +28,7 @@ from tests.api_conventions import (
     helper_order_problems,
     installed_warp_version,
     kernel_module_problems,
+    kernel_output_naming_problems,
     library_in_summary_problems,
     mask_return_problems,
     private_import_problems,
@@ -176,6 +177,19 @@ def test_allocations_name_their_device() -> None:
     ``array.index_sparse`` raised only under ``wp.ScopedDevice("cpu")`` with ``cuda:0`` inputs.
     """
     _fail("allocation(s) without device=:", allocation_device_problems())
+
+
+def test_kernel_outputs_are_named_and_placed() -> None:
+    """
+    A kernel argument the kernel writes is named ``out_*``, and every ``out_*`` argument is last.
+
+    ``.claude/CLAUDE.md`` section 3's rule, checked from both sides after the first full sweep of
+    ``kernels/`` found eight outputs wearing plain names (four literally ``out``) and three
+    read-only inputs wearing the prefix (``claim_collapses`` read a *prior* kernel's outputs under
+    their producer's names). In-place arguments and scratch / persistent-state buffers are exempt
+    by section 3 and listed in ``_KERNEL_OUTPUT_ALLOWLIST``, which is staleness-checked.
+    """
+    _fail("kernel output-naming violation(s):", kernel_output_naming_problems())
 
 
 def test_public_functions_document_what_they_raise() -> None:

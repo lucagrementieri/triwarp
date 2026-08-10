@@ -37,7 +37,7 @@ You are an expert in NVIDIA Warp (wp). Follow all rules below when writing kerne
 - Use `wp.launch(kernel=..., dim=..., inputs=[...], device=...)` for execution. Always forward the `device` from the input arrays.
 - Array slicing is supported inside kernels: `faces[f * 3 : (f + 1) * 3]` produces a sub-array view.
 - Use `wp.cast(expr, TargetType)` for explicit type conversions between Warp types.
-- Prepend output argument names with out_ and put them at the end of the kernel signature after all the input arguments.
+- Prepend output argument names with out_ and put them at the end of the kernel signature after all the input arguments. Two exemption classes, both carried as `_KERNEL_OUTPUT_ALLOWLIST` in `tests/api_conventions.py` (check 13): **in-place** arguments, where the same buffer is input and result (`sort_rows_insertion(data)`, the hole-filling DP tables) — an `out_` prefix would misread as write-only; and **scratch / persistent-state** buffers, caller-allocated working memory carried across launches (cursors, stacks, open-addressing tables, `ball_pivoting`'s front) — neither an input nor the answer, so name them for what they hold (`cursor`, `front_out`, `new_src`). A read-only input must never wear the `out_` prefix, even when the buffer was a *producer* kernel's output — parameter names describe the argument's role in *this* kernel.
 
 ---
 
@@ -610,7 +610,7 @@ Docstrings stay **NumPy-style** (`Parameters`/`Returns`/`Raises`/`See Also`), bu
 - RST admonitions (`.. note::`, etc.) don't exist in Markdown — use MkDocs Material's `!!! note` admonition syntax instead (requires the `admonition` / `pymdownx.details` extensions, already enabled in `mkdocs.yml`).
 - Module-level constants/type aliases without their own docstring are only linkable because `show_if_no_docstring: true` is set in `mkdocs.yml`; don't remove that option without re-checking `triwarp/constants.py` and `triwarp/typing.py` cross-refs still resolve.
 - Every public function should have a docstring — undocumented public functions still get a page entry (via `show_if_no_docstring`) but render with an empty description, which looks broken in the generated site.
-- After editing docstrings, sanity-check with `grep -nE ':(func|attr|meth|class|data|mod):\`' triwarp/*.py` — it should return nothing.
+- After editing docstrings, sanity-check with `grep -rnE ':(func|attr|meth|class|data|mod):\`' triwarp/` — it should return nothing. (`kernels/` counts too: nothing there renders, but a reader meets the broken role text all the same.)
 
 ---
 
