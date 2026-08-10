@@ -149,6 +149,7 @@ split-on-trailing-comma = false
 [tool.ruff.lint.flake8-import-conventions.aliases]
 numpy = "np"
 open3d = "o3d"
+pyvista = "pv"
 trimesh = "tm"
 warp = "wp"
 

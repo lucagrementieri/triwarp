@@ -170,10 +170,49 @@ def faces_igl(mesh: tm.Trimesh) -> np.ndarray:
 
 
 def trimesh_to_pyvista(mesh: tm.Trimesh) -> pv.PolyData:
-    faces_np = np.column_stack(
-        [np.full(mesh.faces.shape[0], 3, dtype=np.int32), mesh.faces.astype(np.int32)]
-    ).ravel()
-    return pv.PolyData(np.ascontiguousarray(mesh.vertices.astype(np.float64)), faces_np)
+    """
+    Wrap a ``tm.Trimesh`` as a ``pyvista.PolyData``, preserving float64 positions exactly.
+
+    Goes through ``PolyData.from_regular_faces`` rather than the padded ``[3, i, j, k]`` cell array
+    the ``PolyData(points, faces)`` constructor wants: building that padding costs 2.34 ms on a
+    40 962-vertex mesh against **0.184 ms** for the classmethod, and it is the floor under every
+    pyvista benchmark row.
+
+    pyvista round-trips float64 exactly (measured error ``0.0`` on ``[1/3, pi, e]``), so where a
+    comparison against triwarp shows a ~1e-7 residual the float32 floor is *triwarp's* ``wp.vec3``
+    vertex buffer, not the reference's storage.
+    """
+    return pv.PolyData.from_regular_faces(
+        np.ascontiguousarray(mesh.vertices, dtype=np.float64),
+        np.ascontiguousarray(mesh.faces, dtype=np.int32),
+    )
+
+
+def points_to_pyvista(points_np: np.ndarray) -> pv.PolyData:
+    """
+    Wrap an ``(n, 3)`` point array as a ``pyvista.PolyData`` cloud.
+
+    The bare constructor gives one vertex cell per point, which is what the cloud filters
+    (``select_interior_points``, ``compute_implicit_distance``, ``interpolate``, ``delaunay_2d``)
+    expect; passing a face array would make them read cell centres instead.
+    """
+    return pv.PolyData(np.ascontiguousarray(points_np, dtype=np.float64))
+
+
+def warp_to_trimesh(vertices_wp: wp.array, faces_wp: wp.array) -> tm.Trimesh:
+    """
+    Read a triwarp ``(vertices, flat faces)`` pair back into a ``tm.Trimesh``.
+
+    ``process=False`` is not optional: trimesh's default processing merges coincident vertices, and
+    the meshes that most need this conversion are the ones whose *identification* is the thing under
+    test -- a Moebius band's seam is a single shared index by construction, and a fixture that gets
+    re-welded on the way in is no longer the fixture that was built.
+    """
+    return tm.Trimesh(
+        vertices=vertices_wp.numpy().astype(np.float64),
+        faces=faces_wp.numpy().reshape(-1, 3).astype(np.int64),
+        process=False,
+    )
 
 
 def bsr_to_dense(matrix: object, n_vertices: int) -> np.ndarray:

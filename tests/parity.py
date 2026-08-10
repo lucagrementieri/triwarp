@@ -85,6 +85,7 @@ _LIBRARY_SUFFIXES: dict[str, frozenset[str]] = {
     "scipy": frozenset({"_np"}),
     "potpourri3d": frozenset({"_pp"}),
     "pymeshlab": frozenset({"_pml"}),
+    "pyvista": frozenset({"_pv"}),
 }
 
 # The second half of the anti-vacuity signal: a test may consult a reference without ever naming
@@ -120,6 +121,7 @@ _LIBRARY_ROOTS: dict[str, frozenset[str]] = {
     "pymeshlab": frozenset(
         {"ml", "trimesh_to_pymeshlab", "warp_to_pymeshlab", "points_to_pymeshlab"}
     ),
+    "pyvista": frozenset({"pv", "trimesh_to_pyvista", "points_to_pyvista"}),
 }
 
 

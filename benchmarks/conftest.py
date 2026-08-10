@@ -23,12 +23,13 @@ Flags
     Which ``triwarp`` targets to time. ``auto`` (default) uses cuda when CUDA is available,
     else falls back to cpu — ``triwarp-cpu`` is not timed alongside cuda by default. Pass
     ``cpu`` for cpu only or ``both`` to time both triwarp targets. The ``trimesh`` / ``igl`` /
-    ``open3d`` / ``scipy`` / ``potpourri3d`` / ``pymeshlab`` CPU baselines are always included.
+    ``open3d`` / ``scipy`` / ``potpourri3d`` / ``pymeshlab`` / ``pyvista`` CPU baselines are always
+    included.
 ``--size=<comma list | all>``
     Restrict meshes to these size categories (``small,medium,large,extralarge,huge``).
 ``--cpu-max-size=<category>``
     CPU-bound libraries (``triwarp-cpu``, ``trimesh``, ``igl``, ``open3d``, ``scipy``,
-    ``potpourri3d``, ``pymeshlab``) skip meshes
+    ``potpourri3d``, ``pymeshlab``, ``pyvista``) skip meshes
     larger than this unless the size was named explicitly in ``--size``. Default ``large`` — so
     ``happy_buddha`` and ``lucy`` run GPU-only by default while
     ``bunny_decimated``/``bunny``/``dragon`` run on CPU.
@@ -59,6 +60,7 @@ from meshes import (
 if TYPE_CHECKING:
     import open3d as o3d
     import pymeshlab as ml
+    import pyvista as pv
     from pytest_benchmark.fixture import BenchmarkFixture
 
 # Number of timed rounds and untimed warm-up rounds. The warm-up covers Warp kernel JIT
@@ -112,6 +114,18 @@ def skip_larger_than(bench_case: BenchCase, largest: str, reason: str = "") -> N
 # ``BenchCase.new_meshset_pml`` unless the filter is verified pure, and any row cheaper than the
 # build cost is reporting the build. See ``BenchCase.new_meshset_pml`` for the full rule.
 #
+# ``pyvista`` (VTK 9.6 through its Python wrapper) is CPU-only and single-threaded, and it wraps the
+# **same VTK as vedo** -- so a group carries one of the two, never both, or the ratio is comparing a
+# library against itself. Three measured facts shape its rows. Nothing is cached: repeat calls
+# recompute (``cell_quality`` 10.1 / 7.2 ms, ``decimate`` 210 / 201 ms back to back), so one
+# ``PolyData`` may be shared across the pure family and no row is accidentally timing a cache hit.
+# Almost everything returns a *new* object and leaves its input alone (``inplace=False`` is the
+# default) -- verified on twelve filters, with ``edge_mask`` the one exception, which writes
+# ``point_ind`` into the input. And the build is cheap, 0.057 us/vertex through
+# ``PolyData.from_regular_faces`` (~8x cheaper than pymeshlab's 0.47 us/vertex), so ``mesh_pv`` is a
+# shared cached property rather than a per-call rebuild and there is no "the row is reporting the
+# build" caveat above ~0.2 ms.
+#
 # ``numpy`` is the narrowest baseline of all: it is only a reference for the *array primitives*
 # (``triwarp.reduce``), where a host reduction over an already-resident NumPy buffer is the honest
 # CPU floor. It is deliberately not a geometry reference — every other CPU baseline is already
@@ -126,6 +140,7 @@ LIBRARIES: list[LibrarySpec] = [
     {"id": "numpy", "kind": "numpy", "device": None, "cpu_bound": True},
     {"id": "potpourri3d", "kind": "potpourri3d", "device": None, "cpu_bound": True},
     {"id": "pymeshlab", "kind": "pymeshlab", "device": None, "cpu_bound": True},
+    {"id": "pyvista", "kind": "pyvista", "device": None, "cpu_bound": True},
 ]
 LIBRARIES_BY_ID = {lib["id"]: lib for lib in LIBRARIES}
 
@@ -139,6 +154,7 @@ _wp_cache: dict[tuple[str, str, str], wp.array] = {}
 _mean_edge_cache: dict[str, float] = {}
 _o3d_cache: dict[str, o3d.geometry.TriangleMesh] = {}
 _pml_cache: dict[str, ml.MeshSet] = {}
+_pv_cache: dict[str, pv.PolyData] = {}
 
 
 def _load_numpy(name: str) -> tuple[np.ndarray, np.ndarray]:
@@ -236,6 +252,20 @@ def _new_meshset_pml(name: str) -> ml.MeshSet:
     return meshset
 
 
+def _new_mesh_pv(name: str) -> pv.PolyData:
+    """
+    Build a ``pyvista.PolyData`` from the shared NumPy source, float64 positions preserved.
+
+    Imported lazily (like ``meshio``, ``open3d`` and ``pymeshlab`` above) so the pyvista/VTK import
+    is only paid by runs that include a pyvista case. Goes through ``from_regular_faces`` rather
+    than the padded ``[3, i, j, k]`` cell array: 0.184 ms against 2.34 ms on a 40 962-vertex mesh.
+    """
+    import pyvista as pv
+
+    vertices, faces = _load_numpy(name)
+    return pv.PolyData.from_regular_faces(vertices, np.ascontiguousarray(faces, dtype=np.int32))
+
+
 def _vertices_wp(name: str, device: str) -> wp.array[wp.vec3]:
     """``wp.vec3`` (float32) vertex buffer on ``device``, cached per ``(name, device)``."""
     key = ("verts", name, device)
@@ -308,7 +338,8 @@ def _selected_libraries(config: pytest.Config) -> list[LibrarySpec]:
             continue
         if lib["id"] == "triwarp-cuda" and not (include_cuda and cuda_available):
             continue
-        # trimesh / igl / open3d / scipy / potpourri3d / pymeshlab baselines are always included.
+        # trimesh / igl / open3d / scipy / potpourri3d / pymeshlab / pyvista baselines are always
+        # included.
         selected.append(lib)
     return selected
 
@@ -576,6 +607,22 @@ class BenchCase(BenchLibrary):
         if self.mesh_name not in _o3d_cache:
             _o3d_cache[self.mesh_name] = _new_mesh_o3d(self.mesh_name)
         return _o3d_cache[self.mesh_name]
+
+    @property
+    def mesh_pv(self) -> pv.PolyData:
+        """
+        Shared ``pyvista.PolyData``, built once per mesh.
+
+        Safe to share, unlike ``meshset_pml``: pyvista caches nothing (a repeat ``cell_quality`` or
+        ``decimate`` call recomputes in full, measured 10.1 / 7.2 ms and 210 / 201 ms) and almost
+        every filter returns a *new* object rather than mutating -- ``inplace=False`` is the default
+        throughout, so never pass ``inplace=True`` in a row. Two exceptions to build inside the
+        timed callable instead: ``edge_mask``, which writes ``point_ind`` into its input, and any
+        filter a row calls with ``inplace=True``.
+        """
+        if self.mesh_name not in _pv_cache:
+            _pv_cache[self.mesh_name] = _new_mesh_pv(self.mesh_name)
+        return _pv_cache[self.mesh_name]
 
     def new_meshset_pml(self) -> ml.MeshSet:
         """
