@@ -269,7 +269,11 @@ def contains_points(
         generalized winding-number sign instead:
 
         ```python
-        inside = tw.proximity.signed_distance_on_mesh(v, f, pts, sign_mode="winding") < 0.0
+        from triwarp.kernels import array as kernel_array
+
+        signed = tw.proximity.signed_distance_on_mesh(v, f, pts, sign_mode="winding")
+        inside = wp.empty(signed.shape, dtype=wp.bool, device=signed.device)
+        wp.map(kernel_array.less, signed, wp.float32(0.0), out=inside)
         ```
 
         That mode is deliberately **not** offered here. It needs a ``wp.Mesh`` built with

@@ -406,8 +406,12 @@ def outlier_probability(
     ``propthreshold`` default is ``0.8``; threshold the result to reproduce a selection:
 
     ```python
+    from triwarp.kernels import array as kernel_array
+
     probability = tw.points.outlier_probability(neighbor_idx, neighbor_distance)
-    outliers = tw.array.flatnonzero(probability.numpy() > 0.8)
+    outlier_mask = wp.empty(probability.shape, dtype=wp.bool, device=probability.device)
+    wp.map(kernel_array.greater, probability, wp.float32(0.8), out=outlier_mask)
+    outliers = tw.array.flatnonzero(outlier_mask)
     ```
 
     Parameters

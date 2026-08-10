@@ -422,8 +422,10 @@ def face_adjacency_angles(
     Unsigned angle in radians between each pair of adjacent faces.
 
     For each row of ``face_adjacency``, the angle is computed from the two
-    corresponding face normals (unit vectors). For a signed angle, combine with
-    ``face_adjacency_convex`` once that attribute is available.
+    corresponding face normals (unit vectors). Pair it with
+    [`face_adjacency_convex`][triwarp.convex.face_adjacency_convex] for the sign: that function
+    reports which side of each shared edge the pair folds towards, which is exactly the sign this
+    unsigned magnitude is missing.
 
     Parameters
     ----------
@@ -450,6 +452,8 @@ def face_adjacency_angles(
     See Also
     --------
     [`face_adjacency`][triwarp.adjacency.face_adjacency]
+    [`face_adjacency_convex`][triwarp.convex.face_adjacency_convex]
+        The sign this magnitude omits: convex or concave, per adjacency row.
     [`vector_angle`][triwarp.points.vector_angle]
     [`trimesh.Trimesh.face_adjacency_angles`][]
     """

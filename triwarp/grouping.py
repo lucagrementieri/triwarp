@@ -545,6 +545,11 @@ def hash_vector_rows(data: wp.array[wp.vec3], epsilon: float = 0.0) -> wp.array[
     wp.array[wp.uint64]
         Length-``n`` array on ``data.device`` with one packed key per row.
 
+    Raises
+    ------
+    ValueError
+        If ``data`` is not a ``wp.array[wp.vec3]``.
+
     Notes
     -----
     Both schemes quantize, so both split a pair that straddles a cell boundary no matter how close

@@ -214,6 +214,12 @@ def resolve_duplicated_faces(
         Flat buffer of kept faces.
     kept_indices : wp.array[wp.int32]
         Original face indices into the input ``faces`` buffer.
+
+    Raises
+    ------
+    ValueError
+        If a duplicate group's signed count is not orientable, i.e. its positive and negative
+        copies differ by more than one.
     """
     n_faces = int(faces.shape[0]) // 3
     device = faces.device

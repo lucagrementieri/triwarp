@@ -225,6 +225,11 @@ def transfer_onto_vertices(
         Length-``n_target`` distance from each target vertex to the source surface — the transfer's
         own confidence measure, and ``inf`` for a miss.
 
+    Raises
+    ------
+    ValueError
+        If ``source_values`` does not have one entry per source vertex.
+
     See Also
     --------
     [`average_onto_vertices`][triwarp.interpolation.average_onto_vertices]

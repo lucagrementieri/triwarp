@@ -1,8 +1,8 @@
 """
 Static scan of the public API's shape: names, summaries, file layout and module boundaries.
 
-Eight conventions the package holds to, each one a defect class that was actually found rather than
-an aesthetic preference. They are checked by an ``ast`` scan of ``triwarp/`` (excluding
+Twelve conventions the package holds to, each one a defect class that was actually found rather
+than an aesthetic preference. They are checked by an ``ast`` scan of ``triwarp/`` (excluding
 ``kernels/``, ``__init__.py`` and private ``_*.py`` modules) plus a listing of ``tests/`` and
 ``benchmarks/``, and [`tests/test_api_conventions.py`](test_api_conventions.py) fails the default
 test run on any violation:
@@ -32,6 +32,22 @@ test run on any violation:
    workarounds citing Warp 1.13-1.15 for a year: ``reference/warp_api/warp_version.py`` catches a
    stale API *mirror*, and nothing caught a stale *justification*. Unlike checks 1-8 this one also
    scans ``kernels/``, where five of those twelve lived.
+10. **A Python-scope allocation names the device it allocates on.** ``wp.zeros`` / ``empty`` /
+    ``ones`` / ``full`` / ``array`` without ``device=`` land on Warp's *current* device, not on the
+    device of the arrays they are about to be used with. The suite never catches it, because a test
+    runs with its arrays' device as the current device and the omitted argument then resolves
+    correctly by accident; it surfaces only under ``wp.ScopedDevice``. Found twice now, in two
+    different call families, so it is mechanical from here.
+11. **A public function that raises documents a ``Raises`` block.** Only a *direct* ``raise`` in the
+    function's own body counts: 42 public functions delegate their validation to a helper that
+    raises, which is correct and is not scanned. The tell that this was drift rather than a policy
+    was that in five of the eleven sites the very next function in the same file documented its own
+    raise, and in one of them a *private* helper did while its public caller did not.
+12. **A fenced ``python`` docstring example runs.** Two of the package's four examples raised when
+    executed -- both by calling a Warp array where the code had written a NumPy expression -- and
+    neither ``ast.parse`` nor any reviewer had noticed, because an example is documentation nobody
+    executes. This one is the odd member of the family: the scan only *extracts* the blocks, and
+    [`tests/test_api_conventions.py`](test_api_conventions.py) runs them against a mesh fixture.
 
 Why a static scan rather than importing ``triwarp``
 ---------------------------------------------------
@@ -39,7 +55,9 @@ Importing would make the verdict depend on Warp's module cache and on which opti
 resolve, and would say nothing about files (checks 4 and 7) at all. A scan reads the tree as
 written, so its answer is the same in every environment and in every pytest invocation. Check 9
 needs the installed Warp version and takes it from ``importlib.metadata`` rather than
-``warp.config.version``, so even that one imports nothing.
+``warp.config.version``, so even that one imports nothing. Check 12 is the single exception and it
+is deliberate: an example's defect is a *runtime* one, so nothing short of running it finds it, and
+the extraction half stays here so the execution half has no parsing to do.
 """
 
 from __future__ import annotations
@@ -200,6 +218,26 @@ _WARP_VERSION_ALLOWLIST: dict[tuple[str, str], str] = {
     )
 }
 
+# --- check 10 -----------------------------------------------------------------------------------
+
+# The Python-scope allocators that take a ``device`` keyword. ``wp.clone`` and the ``*_like``
+# family inherit the source array's device and so cannot get this wrong.
+_ALLOCATORS = frozenset({"array", "empty", "full", "ones", "zeros"})
+
+# Allocations that deliberately fall back to Warp's current device, keyed by ``(module, call)``
+# with the call spelled exactly as ``ast.unparse`` renders it. The value is the reason, and the
+# docstring of the function it sits in has to say the same thing -- an undocumented fallback is
+# the defect, not the fallback itself.
+_ALLOCATION_DEVICE_ALLOWLIST: dict[tuple[str, str], str] = {
+    ("combine", "wp.empty(0, dtype=wp.vec3)"): (
+        "concatenate([]) has no input to take a device from, so the current device is the only "
+        "answer available; its Returns block says so"
+    ),
+    ("combine", "wp.empty(0, dtype=wp.int32)"): (
+        "the face half of the same empty return, for the same reason"
+    ),
+}
+
 _HELPER_ORDER_ALLOWLIST: dict[str, frozenset[str]] = {
     "array": frozenset({"_sorted_copy"}),
     "combine": frozenset({"_closest_loop_pair", "_longest_increasing_subsequence"}),
@@ -280,6 +318,12 @@ class PublicFunction:
     summary: str
     returns: str | None
     parameters: tuple[str, ...]
+    raises: tuple[tuple[int, str], ...]
+    """``(lineno, exception)`` for each ``raise`` in this function's own body, nested functions
+    excluded."""
+
+    documents_raises: bool
+    """Whether the docstring carries a numpydoc ``Raises`` section header."""
 
     @property
     def site(self) -> str:
@@ -333,6 +377,54 @@ def _dotted(node: ast.expr) -> tuple[str, ...]:
         return ()
     parts.append(current.id)
     return tuple(reversed(parts))
+
+
+def _direct_raises(node: ast.FunctionDef) -> list[tuple[int, str]]:
+    """
+    Every ``raise`` in this function's own body, with the exception it names.
+
+    A nested ``def``, ``lambda`` or ``class`` is not descended into -- its raises belong to *it*,
+    and a closure's failure mode is its caller's docstring only by coincidence. A bare ``raise``
+    re-raises something already in flight and names nothing, so it is skipped.
+    """
+    found: list[tuple[int, str]] = []
+    stack: list[ast.AST] = list(ast.iter_child_nodes(node))
+    while stack:
+        current = stack.pop()
+        if isinstance(current, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.Lambda):
+            continue
+        if isinstance(current, ast.Raise) and current.exc is not None:
+            exception = current.exc.func if isinstance(current.exc, ast.Call) else current.exc
+            found.append((current.lineno, ast.unparse(exception)))
+        stack.extend(ast.iter_child_nodes(current))
+    return sorted(found)
+
+
+_RAISES_SECTION = re.compile(r"^[ \t]*Raises[ \t]*\n[ \t]*-{5,}[ \t]*$", re.MULTILINE)
+
+
+def _documents_raises(node: ast.FunctionDef) -> bool:
+    """Whether the docstring has a numpydoc ``Raises`` header, underline and all."""
+    return _RAISES_SECTION.search(ast.get_docstring(node, clean=False) or "") is not None
+
+
+def _bare_allocations(tree: ast.Module) -> list[tuple[str, int]]:
+    """
+    Python-scope ``wp.<allocator>(...)`` calls that name no ``device``.
+
+    A ``**kwargs`` splat could be carrying one, so a call with one is not reported -- the check
+    would rather miss a forwarded device than fire on a call it cannot read.
+    """
+    found: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr not in _ALLOCATORS or _dotted(node.func)[:1] != ("wp",):
+            continue
+        if any(keyword.arg in ("device", None) for keyword in node.keywords):
+            continue
+        found.append((ast.unparse(node), node.lineno))
+    return sorted(found, key=lambda item: item[1])
 
 
 def _private_imports(tree: ast.Module, module: str) -> list[tuple[str, int]]:
@@ -419,6 +511,8 @@ def scan_package() -> PackageScan:
                     argument.arg
                     for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
                 ),
+                raises=tuple(_direct_raises(node)),
+                documents_raises=_documents_raises(node),
             )
             for node in tree.body
             if isinstance(node, ast.FunctionDef) and not node.name.startswith("_")
@@ -651,3 +745,121 @@ def warp_version_problems() -> list[str]:
         if key not in seen and int(key[1].split(".")[1]) < installed_minor
     )
     return problems
+
+
+def allocation_device_problems() -> list[str]:
+    """
+    Check 10: a Python-scope allocation that does not name the device it allocates on.
+
+    Walks the whole package rather than ``scan_package``'s public subset -- ``_device.py`` and
+    ``heat/`` allocate too, and a buffer landing on the wrong device is not a question about the
+    API's shape. ``kernels/`` is excluded because a kernel allocates nothing at Python scope.
+    """
+    problems: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
+        relative = path.relative_to(_PACKAGE_DIR)
+        if relative.parts[0] == "kernels":
+            continue
+        module = ".".join(relative.with_suffix("").parts).removesuffix(".__init__")
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue  # test_package_scan_is_discoverable reports the parse failure
+        for call, lineno in _bare_allocations(tree):
+            key = (module, call)
+            if key in _ALLOCATION_DEVICE_ALLOWLIST:
+                seen.add(key)
+                continue
+            problems.append(
+                f"triwarp/{relative.as_posix()}:{lineno}: {call} has no device= -- it lands on "
+                "Warp's *current* device, which is the input's only by accident under the test "
+                "suite; forward the device of the arrays it will be used with"
+            )
+    problems.extend(
+        f"_ALLOCATION_DEVICE_ALLOWLIST entry {key!r} matches nothing in triwarp/ -- drop it"
+        for key in sorted(_ALLOCATION_DEVICE_ALLOWLIST)
+        if key not in seen
+    )
+    return problems
+
+
+def undocumented_raise_problems() -> list[str]:
+    """
+    Check 11: a public function with a direct ``raise`` and no ``Raises`` block.
+
+    One direction only. The reverse -- a ``Raises`` block with no direct raise -- is the *correct*
+    shape for the 44 functions that delegate validation to a shared guard, and scanning it would
+    need an allowlist longer than the check.
+    """
+    return [
+        f"{function.site} {function.name}: raises "
+        f"{', '.join(sorted({exception for _, exception in function.raises}))} at line(s) "
+        f"{', '.join(str(lineno) for lineno, _ in function.raises)} but documents no Raises block"
+        for function in scan_package().functions
+        if function.raises and not function.documents_raises
+    ]
+
+
+# --- check 12 -----------------------------------------------------------------------------------
+
+_PYTHON_FENCE = re.compile(r"^(?P<indent>[ \t]*)```python[ \t]*$", re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class DocstringExample:
+    """One fenced ``python`` block lifted out of a docstring, dedented and ready to ``exec``."""
+
+    site: str
+    code: str
+
+    @property
+    def is_sketch(self) -> bool:
+        """
+        Whether the block is a deliberate outline: a bare ``...`` standing in for real code.
+
+        Read as an ``Ellipsis`` *statement* rather than by matching the text, so a trailing comment
+        (``...  # rewrite rhs in place``) still counts and a genuine ``...`` inside an expression
+        does not.
+        """
+        try:
+            tree = ast.parse(self.code)
+        except SyntaxError:
+            return False
+        return any(
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and node.value.value is Ellipsis
+            for node in ast.walk(tree)
+        )
+
+
+def docstring_examples() -> list[DocstringExample]:
+    """
+    Every fenced ``python`` block in ``triwarp/``, dedented to column zero.
+
+    Read off the raw source rather than off docstring nodes: a block's *line number* is what makes
+    a failure reportable, and ``ast`` gives the docstring's line, not the fence's. ``kernels/`` is
+    excluded -- it has no fenced blocks, and kernel-scope code could not be executed as written.
+    """
+    examples: list[DocstringExample] = []
+    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
+        relative = path.relative_to(_PACKAGE_DIR)
+        if relative.parts[0] == "kernels":
+            continue
+        source = path.read_text(encoding="utf-8")
+        lines = source.splitlines()
+        for match in _PYTHON_FENCE.finditer(source):
+            indent = match.group("indent")
+            fence = source.count("\n", 0, match.start())  # 0-based index of the ```python line
+            body: list[str] = []
+            for line in lines[fence + 1 :]:
+                if line.strip() == "```":
+                    break
+                body.append(line.removeprefix(indent))
+            examples.append(
+                DocstringExample(
+                    site=f"triwarp/{relative.as_posix()}:{fence + 1}", code="\n".join(body) + "\n"
+                )
+            )
+    return examples

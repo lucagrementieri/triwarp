@@ -577,10 +577,17 @@ def index_sparse(
     -------
     warp.sparse.BsrMatrix
         Sparse matrix with shape ``(n_rows, len(indices))`` and 1x1 blocks.
+
+    Raises
+    ------
+    ValueError
+        If ``data`` is given and its size differs from ``indices.size``.
     """
     prune_numerical_zeros = prune_numerical_zeros and data is not None
     if data is None:
-        data = wp.ones(indices.size, dtype=dtype if dtype is not None else wp.float32)
+        data = wp.ones(
+            indices.size, dtype=dtype if dtype is not None else wp.float32, device=indices.device
+        )
     else:
         if data.size != indices.size:
             raise ValueError(

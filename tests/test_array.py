@@ -271,6 +271,23 @@ def test_index_sparse_repeated_indices(device: str):
     assert np.array_equal(result_csr.todense(), result_np.todense())
 
 
+def test_index_sparse_uses_the_input_device(device: str) -> None:
+    """
+    The implicit ``wp.ones`` lands on ``indices``' device, not Warp's current one.
+
+    Needs two devices to say anything, so it skips without CUDA. Before the ``device=`` was
+    supplied, ``bsr_from_triplets`` rejected the mixed set with "Rows and columns must reside on
+    the destination matrix device, got cuda:0, cuda:0 and cpu" -- and every other test in this file
+    passed, because each one runs with its arrays' device already current.
+    """
+    if not wp.get_device(device).is_cuda:
+        pytest.skip("needs a second device to distinguish 'input' from 'current'")
+    indices_wp = wp.array(np.array([[0, 1, 2], [1, 2, 3]]), dtype=wp.int32, device=device)
+    with wp.ScopedDevice("cpu"):
+        matrix = tw.array.index_sparse(4, indices_wp)
+    assert str(matrix.values.device) == str(indices_wp.device)
+
+
 def test_isin_1d(device: str) -> None:
     rng = np.random.default_rng(42)
     elements_np = rng.integers(0, 20, size=50, dtype=np.int32)

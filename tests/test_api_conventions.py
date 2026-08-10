@@ -1,21 +1,29 @@
 """
 The convention gate: the public API's names, summaries and file layout, checked statically.
 
-Nine conventions, one test each so the failing test's *name* says which one was broken. The scan
+Twelve conventions, one test each so the failing test's *name* says which one was broken. The scan
 and the reasoning behind each rule live in [`tests/api_conventions.py`](api_conventions.py); this
-file is only the pytest surface.
+file is only the pytest surface -- with one exception, the docstring-example test, whose whole
+point is that a static read cannot find what is wrong with an example.
 
 Deliberately not parametrized over modules or functions: that would add hundreds of always-green
 items to every run, and a rule that stopped matching anything would silently lose its check instead
-of failing.
+of failing. The example test *is* parametrized, because there are four of them and the failure has
+to name which one.
 """
 
 from __future__ import annotations
 
 import pytest
+import trimesh as tm
+import warp as wp
 
+import triwarp as tw
 from tests.api_conventions import (
+    DocstringExample,
+    allocation_device_problems,
     coverage_location_problems,
+    docstring_examples,
     duplicate_name_problems,
     helper_order_problems,
     installed_warp_version,
@@ -24,6 +32,7 @@ from tests.api_conventions import (
     mask_return_problems,
     private_import_problems,
     scan_package,
+    undocumented_raise_problems,
     warp_suffix_problems,
     warp_version_problems,
 )
@@ -155,3 +164,85 @@ def test_warp_version_claims_are_not_stale() -> None:
     if installed_warp_version() is None:
         pytest.skip("warp-lang is not installed, so there is no version to compare against")
     _fail("stale Warp-version claim(s):", warp_version_problems())
+
+
+def test_allocations_name_their_device() -> None:
+    """
+    Every Python-scope ``wp.zeros``/``empty``/``ones``/``full``/``array`` names a ``device``.
+
+    Without it the buffer lands on Warp's *current* device rather than the device of the arrays it
+    is about to be used with, and the suite cannot see the difference: a test runs with its arrays'
+    device current, so the omitted argument resolves correctly by accident.
+    ``array.index_sparse`` raised only under ``wp.ScopedDevice("cpu")`` with ``cuda:0`` inputs.
+    """
+    _fail("allocation(s) without device=:", allocation_device_problems())
+
+
+def test_public_functions_document_what_they_raise() -> None:
+    """
+    A public function with a ``raise`` in its own body documents a ``Raises`` block.
+
+    ``.claude/CLAUDE.md`` section 14's "docstring, signature and body must agree", from the side
+    where the body says more than the docstring. Delegated validation is not scanned -- 42 public
+    functions correctly document a ``Raises`` their shared guard performs.
+    """
+    _fail("public function(s) raising without a Raises block:", undocumented_raise_problems())
+
+
+@pytest.fixture
+def example_namespace(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> dict[str, object]:
+    """
+    Bind every name the package's docstring examples use to a real object on the fixture's device.
+
+    Every free name an example needs lives here. A new example that reaches for a name this
+    namespace does not carry fails with a ``NameError``, which is the intended outcome: an example
+    the suite cannot run is exactly the state that let two broken ones survive.
+    """
+    _, mesh_wp = icosahedron
+    device = mesh_wp.device
+    vertices, faces = mesh_wp.points, mesh_wp.indices
+    queries = wp.array(
+        [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.5, 0.0]], dtype=wp.vec3, device=device
+    )
+    neighbor_idx, neighbor_distance = tw.neighbors.query_bvh_nearest(vertices, vertices, 4)
+    return {
+        "tw": tw,
+        "wp": wp,
+        "warp_mesh": mesh_wp,
+        "v": vertices,
+        "f": faces,
+        "pts": queries,
+        "origins": queries,
+        "directions": wp.array(
+            [[1.0, 0.0, 0.0]] * int(queries.shape[0]), dtype=wp.vec3, device=device
+        ),
+        "neighbor_idx": neighbor_idx,
+        "neighbor_distance": neighbor_distance,
+    }
+
+
+@pytest.mark.parametrize(
+    "example", [pytest.param(item, id=item.site) for item in docstring_examples()]
+)
+def test_docstring_examples_run(
+    example: DocstringExample, example_namespace: dict[str, object]
+) -> None:
+    """
+    Every fenced ``python`` block in a docstring executes against a real mesh.
+
+    An example is the one piece of documentation that can be checked by running it, and both
+    failures this test was written for were runtime ones invisible to ``ast.parse``:
+    ``points.outlier_probability`` fed a NumPy bool array to ``array.flatnonzero``, and
+    ``ray.contains_points`` compared a ``wp.array`` with ``0.0``, which Warp's Python-scope arrays
+    do not support. Blocks containing a bare ``...`` are deliberate outlines and are skipped.
+    """
+    if example.is_sketch:
+        pytest.skip(f"{example.site} is a deliberate sketch (bare ...), not runnable code")
+    try:
+        exec(compile(example.code, example.site, "exec"), dict(example_namespace))
+    except Exception as error:  # noqa: BLE001
+        pytest.fail(
+            f"{example.site}: the documented example raises "
+            f"{type(error).__name__}: {error}\n{example.code}",
+            pytrace=False,
+        )

@@ -60,6 +60,11 @@ def segments_with_plane(
         ``(n,)`` intersection points (undefined where ``valid`` is ``False``).
     valid
         ``(n,)`` mask indicating a valid intersection per segment.
+
+    Raises
+    ------
+    ValueError
+        If ``start_points`` and ``end_points`` do not have the same shape.
     """
     if start_points.shape != end_points.shape:
         raise ValueError("start_points and end_points must have the same shape")
@@ -352,6 +357,11 @@ def mesh_with_mesh(
     -------
     lines
         ``(m, 2)`` ``wp.vec3`` segment endpoints (logical shape ``(m, 2, 3)``).
+
+    Raises
+    ------
+    ValueError
+        If ``max_triangle_collisions`` is less than 1.
     """
     device = vertices_a.device
     n_faces_a = int(faces_a.shape[0]) // 3

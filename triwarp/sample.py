@@ -192,6 +192,12 @@ def sample_surface(
         ``(count,)`` sampled positions on the mesh surface.
     face_index
         ``(count,)`` triangle index for each sample.
+
+    Raises
+    ------
+    ValueError
+        If ``face_weight`` is given and its length is not the triangle count, or if the total
+        face weight is not positive.
     """
     n_faces = faces.shape[0] // 3
     if count == 0:

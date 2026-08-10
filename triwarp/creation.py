@@ -673,6 +673,11 @@ def uv_sphere(
     tuple[wp.array[wp.vec3], wp.array[wp.int32]]
         ``(vertices, faces)`` on ``device``.
 
+    Raises
+    ------
+    ValueError
+        If ``count`` is given and is not a ``(2,)`` integer pair.
+
     Notes
     -----
     The longitude count is doubled when ``count`` is given explicitly but not when it is left at
@@ -852,6 +857,11 @@ def capsule(
     -------
     tuple[wp.array[wp.vec3], wp.array[wp.int32]]
         ``(vertices, faces)`` on ``device``.
+
+    Raises
+    ------
+    ValueError
+        If ``count`` is given and is not a ``(2,)`` integer pair.
 
     Notes
     -----

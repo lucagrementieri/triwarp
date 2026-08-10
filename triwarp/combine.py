@@ -38,12 +38,12 @@ def concatenate(
     ----------
     meshes_data
         Sequence of ``(vertices, faces)`` pairs using triwarp's flat face layout.
-        An empty sequence yields empty arrays on ``cpu``.
 
     Returns
     -------
     tuple[wp.array[wp.vec3], wp.array[wp.int32]]
-        Combined vertices and reindexed faces on the shared device.
+        Combined vertices and reindexed faces on the shared device. An empty sequence carries no
+        device to share, so the empty result is allocated on Warp's **current** device.
 
     See Also
     --------

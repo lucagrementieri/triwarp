@@ -128,6 +128,11 @@ def rasterize_discrete_attribute(
         ``(resolution, resolution)`` ``int32`` class image with values in ``[-1, n_classes - 1]``
         (``-1`` marks uncovered pixels), on ``uv.device``.
 
+    Raises
+    ------
+    ValueError
+        If any entry of ``attribute`` is negative.
+
     See Also
     --------
     [`remap_discrete_attribute_from_uv`][triwarp.texture.remap_discrete_attribute_from_uv]
@@ -247,6 +252,11 @@ def remap_attribute_from_uv(
     Array2dFloat32
         ``(n_vertices, C)`` ``float32`` per-vertex values on ``uv.device`` (``C == 1`` for a
         2D input image). Non-finite-UV rows are ``NaN``.
+
+    Raises
+    ------
+    TypeError
+        If ``image`` is neither rank 2 nor rank 3.
 
     See Also
     --------

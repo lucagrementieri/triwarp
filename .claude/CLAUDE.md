@@ -759,16 +759,34 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
 ## 14. Evolving the Public API
 
 **`tests/test_api_conventions.py` is the mechanical half of this section**, and it fails the default
-`pytest` run. Nine static checks, eight of them over `triwarp/` (excluding `kernels/`): a summary
-line naming a reference library (§10); a `*_mask` producer that does not return `wp.array[wp.bool]`;
-a module summary advertising Warp; a module without a `tests/` **and** a `benchmarks/` file named for
-it; a private name reached across a module boundary; one public name exported by two modules; a
-top-level `kernels/<name>.py` without its `triwarp/<name>.py` or the reverse (§4); and a private
-helper defined above its first caller (§11). The ninth scans `kernels/` **as well**: a comment or
-docstring blaming a Warp version older than the installed `warp-lang`. Each check carries a written
-allowlist — read the reason before adding an entry, and prefer fixing the code. It does not replace
-review: it cannot tell whether a *new* name is a good one, only that it does not break a convention
-the package already holds to.
+`pytest` run. Twelve checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
+summary line naming a reference library (§10); a `*_mask` producer that does not return
+`wp.array[wp.bool]`; a module summary advertising Warp; a module without a `tests/` **and** a
+`benchmarks/` file named for it; a private name reached across a module boundary; one public name
+exported by two modules; a top-level `kernels/<name>.py` without its `triwarp/<name>.py` or the
+reverse (§4); and a private helper defined above its first caller (§11). The ninth scans `kernels/`
+**as well**: a comment or docstring blaming a Warp version older than the installed `warp-lang`.
+The last three are newer and each exists because the same defect was found twice:
+
+- **An allocation with no `device=`.** `wp.zeros` / `empty` / `ones` / `full` / `array` at Python
+  scope land on Warp's *current* device, and the suite cannot see the difference because a test
+  runs with its arrays' device already current — `array.index_sparse`'s `wp.ones` was wrong for
+  as long as it existed and every test passed. Scans all of `triwarp/` including `_*.py` modules,
+  since a misplaced buffer is not a question about the API's shape.
+- **A public function that raises with no `Raises` block.** Only a *direct* `raise` in the
+  function's own body counts; the 42 functions that delegate validation to a shared guard and
+  document its `Raises` are correct and are not scanned.
+- **A fenced ```python docstring example that does not run.** The one static check that is not
+  static: `tests/api_conventions.py` extracts the blocks and `tests/test_api_conventions.py`
+  `exec`s them against a mesh fixture, because both defects it was written for were *runtime*
+  ones (`wp.array` compared with a float, a NumPy bool array handed to `flatnonzero`) and
+  `ast.parse` sees nothing wrong with either. Blocks holding a bare `...` are deliberate outlines
+  and skip. A new example that needs a name the fixture does not bind fails with `NameError` —
+  extend `example_namespace`, do not weaken the test.
+
+Each check carries a written allowlist — read the reason before adding an entry, and prefer fixing
+the code. It does not replace review: it cannot tell whether a *new* name is a good one, only that
+it does not break a convention the package already holds to.
 
 **A Warp version claim is spelled `Warp 1.16`, with the word immediately before the number.** The
 staleness check reads that anchored form and nothing else, because this package writes measured
