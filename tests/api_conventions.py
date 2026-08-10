@@ -249,16 +249,6 @@ _HELPER_ORDER_ALLOWLIST: dict[str, frozenset[str]] = {
     "array": frozenset({"_sorted_copy"}),
     "combine": frozenset({"_closest_loop_pair", "_longest_increasing_subsequence"}),
     "creation": frozenset({"_icosphere_face_table"}),
-    "holes": frozenset(
-        {
-            "_hole_loops",
-            "_mean_rim_edge_length",
-            "_patch_mask",
-            "_run_hole_dp",
-            "_traceback_triangles",
-            "_unpack_loops",
-        }
-    ),
     "io": frozenset({"_import_meshio"}),
     "ray": frozenset({"_validate_ray_inputs"}),
     "reconstruction": frozenset(
