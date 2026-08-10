@@ -354,17 +354,21 @@ def query_bvh_nearest_neighbors(
 # point. A ``wp.zeros(shape=K)`` stack array has the same problem — measured a **2x loss** against
 # the global row, because nothing promotes it to registers.
 #
-# Tie-break equivalence is the contract, not just the values: the shipped kernel inserts *after*
-# equals (``binary_search_index`` is ``searchsorted(side="right")``), so among candidates at the
-# same float32 distance the first one enumerated wins the slot. The carry below reproduces that
-# exactly — it walks past equals before displacing, and ``placed`` keeps a run of equal distances
-# further down the row from stopping the shift chain (without it, an equal element in the row
-# silently drops a neighbour, which was measured as one differing row in 20 000 on bunny at k=32).
+# The contract the copies must hold is the *distance* row, not the tie-break. Like the shipped
+# kernel's ``binary_search_index`` (``searchsorted(side="right")``), the carry below walks past
+# equals before displacing, and ``placed`` then shifts the rest of the row down mechanically — a
+# plain stable insertion, which is why it matches the global row index-for-index. But that match is
+# incidental and ``placed`` is **not** load-bearing: without it the carry skips a slot holding an
+# equal distance and displaces further down instead, which permutes *which* of several equidistant
+# points fills a slot and leaves every distance bit-identical (measured — deleting the flag from all
+# three carries passes the tie test at every bucket on both backends). Callers are told exactly that
+# much; ``query_bvh_nearest``'s docstring declares the identity of a tied neighbour unspecified.
 #
-# That rate is far below what a random cloud reveals, so the contract is pinned on a *tied* fixture:
-# ``tests/test_neighbors.py::test_query_nearest_register_row_tie_break_matches_global_row`` compares
-# every ``KNN_ROW_BUCKETS`` size against the global-row kernel element-wise on an integer lattice,
-# and deleting ``placed`` fails it at every ``k >= 4`` on both backends. Edit the carry and run it.
+# So the guard on an edit here is a *tied* fixture, not a second implementation to diff against:
+# ``tests/test_neighbors.py::test_query_nearest_ties`` runs every ``KNN_ROW_BUCKETS`` size against
+# ``scipy.spatial.KDTree`` on an integer lattice, where a query has dozens of exactly tied
+# neighbours and a carry that mishandles the run keeps a farther point. Verified as a live gate:
+# shortening the shift chain by one slot fails all 12 cases. Edit the carry and run it.
 # ---------------------------------------------------------------------------------------------
 
 

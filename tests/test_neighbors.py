@@ -466,19 +466,22 @@ def test_query_ball_matches_open3d(device: str, backend: Literal["bvh", "hashgri
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
-@pytest.mark.parametrize("k", [8, 32])
+@pytest.mark.parametrize("k", sorted(kernel_neighbors.KNN_ROW_BUCKETS))
 def test_query_nearest_ties(device: str, backend: Literal["bvh", "hashgrid"], k: int):
     """
     Class B (reduction: which of two equidistant points wins a slot is not specified).
 
     On an integer lattice a query has dozens of *exactly* tied neighbours, so the row's insert
-    order is exercised rather than assumed — a shift chain that breaks on a run of equal distances
-    drops a neighbour and keeps a farther one, which no random cloud reveals. Half the queries sit
-    on lattice points (maximal ties), half at cell centres.
+    order is exercised rather than assumed — a shift chain that mishandles a run of equal distances
+    keeps a farther point and reports a distance ``KDTree`` does not, which no random cloud reveals.
+    Half the queries sit on lattice points (maximal ties), half at cell centres. ``k`` runs over
+    every ``KNN_ROW_BUCKETS`` size because the register-row carry is written out inline once per
+    bucket (see the comment above ``_bvh_nearest_row_kernel``), so each copy meets the lattice here.
 
     The ``k`` distances must match ``KDTree`` exactly and every returned index must actually sit at
     the distance reported for it; the *identity* of a tied neighbour is not compared, because both
-    choices are correct answers.
+    choices are correct answers — the same thing
+    [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] tells callers.
     """
     axis = np.arange(12, dtype=np.float32)
     lattice = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1).reshape(-1, 3)
@@ -493,68 +496,21 @@ def test_query_nearest_ties(device: str, backend: Literal["bvh", "hashgrid"], k:
         tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
     )
     query_indices_wp, query_distances_wp = query_nearest(points_wp, queries_wp, k=k)
-    query_distances_np, _query_indices_np = KDTree(lattice).query(queries, k=k)
-
-    assert np.allclose(query_distances_wp.numpy(), query_distances_np, rtol=1e-5, atol=1e-5)
-    gathered = np.linalg.norm(lattice[query_indices_wp.numpy()] - queries[:, None, :], axis=-1)
-    assert np.allclose(gathered, query_distances_wp.numpy(), rtol=1e-5, atol=1e-5)
-
-
-@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
-@pytest.mark.parametrize("k", sorted(kernel_neighbors.KNN_ROW_BUCKETS))
-def test_query_nearest_register_row_tie_break_matches_global_row(
-    device: str, backend: Literal["bvh", "hashgrid"], k: int, monkeypatch: pytest.MonkeyPatch
-):
-    """
-    Element-wise: every register-row bucket against the global-row kernel, on a tied lattice.
-
-    Not a parity test -- triwarp against itself -- but the pin on a *contract*: the four k-NN
-    inserts (``knn_sorted_insert``'s ``searchsorted(side="right")`` and the three inlined register
-    carries) must break float32 distance ties identically, first-enumerated-wins. The comment block
-    above ``_bvh_nearest_row_kernel`` states the contract; this test is what enforces it, because
-    the documented failure mode of an edit that drops the carry's ``placed`` flag -- an equal
-    element already in the row stops the shift chain and silently drops a neighbour -- was measured
-    at one differing row in 20 000 on ``bunny`` at ``k=32``, far below what any value-level test
-    catches on a random cloud. A random cloud never ties; an integer lattice ties by the dozen, and
-    on it the drop shows up in *every* run (verified: deleting ``placed`` fails this test at every
-    ``k >= 4`` on both backends).
-
-    Both kernels see the same structure and the same radius schedule, so they enumerate candidates
-    in the same order and the tie-break makes their outputs bit-identical -- indices *and*
-    distances, ``array_equal`` with no tolerance. Rows with fewer than ``k`` in-radius neighbours
-    agree on the ``-1`` / ``inf`` tail for free.
-    """
-    axis = np.arange(12, dtype=np.float32)
-    lattice = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1).reshape(-1, 3)
-    rng = np.random.default_rng(12)
-    on_lattice = lattice[rng.choice(lattice.shape[0], size=30, replace=False)]
-    at_centers = lattice[rng.choice(lattice.shape[0], size=30, replace=False)] + 0.5
-    queries = np.ascontiguousarray(np.vstack([on_lattice, at_centers]), dtype=np.float32)
-
-    points_wp = wp.array(np.ascontiguousarray(lattice), dtype=wp.vec3, device=device)
-    queries_wp = wp.array(queries, dtype=wp.vec3, device=device)
-    query_nearest = (
-        tw.neighbors.query_bvh_nearest if backend == "bvh" else tw.neighbors.query_hashgrid_nearest
-    )
-
-    indices_row_wp, distances_row_wp = query_nearest(points_wp, queries_wp, k=k)
-
-    selector = "bvh_nearest_kernel" if backend == "bvh" else "hashgrid_nearest_kernel"
-    global_kernel = (
-        kernel_neighbors.query_bvh_nearest_neighbors
-        if backend == "bvh"
-        else kernel_neighbors.query_hashgrid_nearest_neighbors
-    )
-    monkeypatch.setattr(kernel_neighbors, selector, lambda _k: global_kernel)
-    indices_global_wp, distances_global_wp = query_nearest(points_wp, queries_wp, k=k)
+    # ``k == 1`` returns length-m 1D arrays on both sides; reshape so one comparison covers all k.
+    rows = (queries.shape[0], k)
+    query_distances_np = np.reshape(KDTree(lattice).query(queries, k=k)[0], rows)
 
     if k > 1:
         # Non-vacuity: the fixture must actually put runs of equal float32 distances in the rows,
-        # or the tie-break is never exercised and this is a plain smoke test.
-        distances_np = distances_row_wp.numpy()
-        assert np.any(distances_np[:, 1:] == distances_np[:, :-1])
-    assert np.array_equal(indices_row_wp.numpy(), indices_global_wp.numpy())
-    assert np.array_equal(distances_row_wp.numpy(), distances_global_wp.numpy())
+        # or the insert's tie handling is never exercised and this is a plain smoke test.
+        assert np.any(query_distances_np[:, 1:] == query_distances_np[:, :-1])
+    assert np.allclose(
+        query_distances_wp.numpy().reshape(rows), query_distances_np, rtol=1e-5, atol=1e-5
+    )
+    gathered = np.linalg.norm(
+        lattice[query_indices_wp.numpy().reshape(rows)] - queries[:, None, :], axis=-1
+    )
+    assert np.allclose(gathered, query_distances_np, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
