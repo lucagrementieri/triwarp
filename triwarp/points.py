@@ -120,11 +120,11 @@ def gram_matrix(points: wp.array[wp.vec3]) -> wp.array[wp.mat33]:
 
 def fit_line(points: wp.array[wp.vec3]) -> wp.vec3:
     """
-    Singular-value-weighted major axis of a point set (``trimesh.points.major_axis``).
+    Major axis of a point set, weighted across all three singular directions.
 
     The result is ``normalize(S @ V)`` over the SVD of the **uncentered** point matrix -- a sum of
-    all three right singular vectors weighted by their singular values, which is what
-    [`trimesh.points.major_axis`][] computes. It is **not** the first principal axis, and the two
+    all three right singular vectors weighted by their singular values. It is **not** the first
+    principal axis, and the two
     part company as soon as the cloud is neither strongly elongated nor centred on the origin:
     measured against the leading eigenvector of the covariance, ``|dot|`` is 1.000 on a 1000:1
     needle but **0.939** on a 3:1:0.2 cloud and **0.812** once that cloud is offset from the origin.
@@ -142,6 +142,13 @@ def fit_line(points: wp.array[wp.vec3]) -> wp.vec3:
         Unit vector along the weighted major axis. The result is
         direction-only: its sign is governed by the SVD convention and is
         not meaningful.
+
+    Notes
+    -----
+    This is the quantity [`trimesh.points.major_axis`][] computes. Because the weighted sum mixes
+    all three singular vectors, its value depends on each one's sign, which no SVD fixes -- so the
+    two implementations agree to ``1.000`` where one singular value dominates and to ``0.992`` on a
+    moderate cloud.
 
     See Also
     --------
@@ -350,7 +357,7 @@ def principal_axes(points: wp.array[wp.vec3]) -> tuple[wp.mat33, wp.vec3, wp.vec
     Examples
     --------
     ```python
-    rotation, eigenvalues, centroid = tw.points.principal_axes(vertices_wp)
+    rotation, eigenvalues, centroid = tw.points.principal_axes(v)
     ```
 
     See Also
