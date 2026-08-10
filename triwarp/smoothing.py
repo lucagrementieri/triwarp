@@ -717,9 +717,7 @@ def _build_implicit_system(
 ) -> wps.BsrMatrix[wp.float64]:
     nnz = int(operator.nnz)
     n_triplets = nnz + n
-    rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
-    cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
-    vals = wp.empty(n_triplets, dtype=wp.float64, device=device)
+    rows, cols, vals = tw.array.triplet_buffers(n_triplets, wp.float64, device)
     wp.launch(
         kernel_smoothing.implicit_laplacian_triplets,
         dim=n,
@@ -764,9 +762,7 @@ def _edge_weight_matrix(
         wp.map(kernel_smoothing.clamp_cotan, weights, out=weights)
     else:
         raise ValueError(f"edge_weights must be 'unit' or 'cotan', got {edge_weights!r}")
-    rows = wp.empty(2 * m, dtype=wp.int32, device=device)
-    cols = wp.empty(2 * m, dtype=wp.int32, device=device)
-    vals = wp.empty(2 * m, dtype=wp.float64, device=device)
+    rows, cols, vals = tw.array.triplet_buffers(2 * m, wp.float64, device)
     wp.launch(
         kernel_smoothing.symmetric_weight_triplets,
         dim=m,

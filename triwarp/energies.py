@@ -152,9 +152,7 @@ def _diagonal_sandwich(
     segment_offsets, n_triplets = tw.array.counts_to_offsets(counts, include_total=True)
 
     dtype = a.values.dtype
-    rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
-    cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
-    vals = wp.empty(n_triplets, dtype=dtype, device=device)
+    rows, cols, vals = tw.array.triplet_buffers(n_triplets, dtype, device)
     if n_triplets > 0:
         wp.launch(
             kernel_energies.sandwich_row_triplets,
@@ -259,9 +257,7 @@ def hessian_energy(
     # Host readback: only the device knows the scan total, and it sizes the triplet buffers.
     segment_offsets, n_triplets = tw.array.counts_to_offsets(counts, include_total=True)
 
-    rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
-    cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
-    vals = wp.empty(n_triplets, dtype=dtype, device=device)
+    rows, cols, vals = tw.array.triplet_buffers(n_triplets, dtype, device)
     if n_triplets > 0:
         wp.launch(
             kernel_energies.hessian_energy_triplets,
@@ -387,9 +383,7 @@ def curved_hessian_energy(
     )
 
     n_triplets = 144 * n_faces
-    rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
-    cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
-    vals = wp.empty(n_triplets, dtype=dtype, device=device)
+    rows, cols, vals = tw.array.triplet_buffers(n_triplets, dtype, device)
     wp.launch(
         kernel_energies.curved_hessian_triplets,
         dim=n_faces,
@@ -484,9 +478,7 @@ def crouzeix_raviart_cotmatrix(
         cot_entries = cotmatrix_entries(vertices, faces, dtype=dtype)
 
     n_triplets = 12 * n_faces
-    rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
-    cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
-    vals = wp.empty(n_triplets, dtype=dtype, device=device)
+    rows, cols, vals = tw.array.triplet_buffers(n_triplets, dtype, device)
     wp.launch(
         kernel_energies.crouzeix_raviart_cotmatrix_triplets,
         dim=n_faces,
@@ -627,9 +619,7 @@ def lscm_hessian(
     # Combined triplet buffers: 2 per Laplacian entry (the two diagonal blocks) plus 4 per oriented
     # boundary edge (the vector-area cross-quadrant terms). Every slot is written, so wp.empty.
     total = 2 * n_entries + 4 * n_be
-    rows = wp.empty(total, dtype=wp.int32, device=device)
-    cols = wp.empty(total, dtype=wp.int32, device=device)
-    vals = wp.empty(total, dtype=wp.float64, device=device)
+    rows, cols, vals = tw.array.triplet_buffers(total, wp.float64, device)
     wp.launch(
         kernel_energies.neg_repdiag2_triplets,
         dim=n,
@@ -698,9 +688,7 @@ def vector_area_matrix(
     if n_be == 0:
         return _empty_square_operator(2 * n, wp.float64, device)
 
-    rows = wp.empty(4 * n_be, dtype=wp.int32, device=device)
-    cols = wp.empty(4 * n_be, dtype=wp.int32, device=device)
-    vals = wp.empty(4 * n_be, dtype=wp.float64, device=device)
+    rows, cols, vals = tw.array.triplet_buffers(4 * n_be, wp.float64, device)
     _vector_area_triplets(boundary, n, 1.0, rows, cols, vals)
     return wps.bsr_from_triplets(2 * n, 2 * n, rows, cols, vals, prune_numerical_zeros=False)
 

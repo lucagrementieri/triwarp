@@ -543,6 +543,50 @@ def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
     wp.copy(data, data_buffer, count=n)
 
 
+def triplet_buffers(
+    n_triplets: int, dtype: type, device: wp.DeviceLike
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array]:
+    """
+    Uninitialized ``(rows, cols, values)`` COO buffers for one ``bsr_from_triplets`` build.
+
+    Parameters
+    ----------
+    n_triplets
+        Length of each of the three buffers: the number of ``(row, col, value)`` entries the
+        writing kernel will emit, counting duplicates, since ``warp.sparse.bsr_from_triplets``
+        sums entries that land on the same position.
+    dtype
+        Element type of the value buffer. A scalar (``wp.float32`` / ``wp.float64``) for a
+        1x1-block matrix, or a matrix type (``wp.mat22d``) for a block matrix.
+    device
+        Warp device for all three buffers.
+
+    Returns
+    -------
+    rows, cols, values
+        Three length-``n_triplets`` arrays on ``device``. The index buffers are ``wp.int32``;
+        ``values`` takes ``dtype``. All three are **uninitialized** -- the caller's kernel is
+        expected to write every entry.
+
+    Notes
+    -----
+    ``wp.empty`` rather than ``wp.zeros`` deliberately: a triplet writer fills all three buffers,
+    so zeroing them first would be three wasted launches. A kernel that emits *fewer* than
+    ``n_triplets`` entries must therefore write an explicit structural zero (typically a
+    self-entry) rather than leave a slot untouched, which is also why every operator build in
+    this package passes ``prune_numerical_zeros=False`` -- see the note on
+    [`index_sparse`][triwarp.array.index_sparse], the one caller that prunes.
+
+    See Also
+    --------
+    [`index_sparse`][triwarp.array.index_sparse]
+    """
+    rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
+    cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
+    values = wp.empty(n_triplets, dtype=dtype, device=device)
+    return rows, cols, values
+
+
 def index_sparse(
     n_rows: int,
     indices: twt.Array2dInt32,

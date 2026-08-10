@@ -279,9 +279,7 @@ def cotmatrix(
         cot_entries = cotmatrix_entries(vertices, faces, dtype=dtype)
 
     n_triplets = 12 * n_faces
-    rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
-    cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
-    vals = wp.empty(n_triplets, dtype=dtype, device=device)
+    rows, cols, vals = tw.array.triplet_buffers(n_triplets, dtype, device)
     # One generic kernel handles both precisions: it casts the (float32 or float64) half-cotangent
     # weights to the matrix dtype, assembling a native float32/float64 matrix in a single build.
     wp.launch(
@@ -495,9 +493,7 @@ def connection_laplacian(
         transport_angles = halfedge_transport_angles(vertices, faces)
 
     n_triplets = 12 * n_faces
-    rows = wp.empty(n_triplets, dtype=wp.int32, device=device)
-    cols = wp.empty(n_triplets, dtype=wp.int32, device=device)
-    vals = wp.empty(n_triplets, dtype=wp.mat22d, device=device)
+    rows, cols, vals = tw.array.triplet_buffers(n_triplets, wp.mat22d, device)
     wp.launch(
         kernel_laplacian.connection_laplacian_triplets,
         dim=n_faces,
@@ -561,9 +557,7 @@ def laplacian_entries(
         # One directed triplet per triangle edge, matching trimesh's ``edges_to_coo(mesh.edges)``.
         edges = faces_to_edges(faces)
         m = int(edges.shape[0])
-        rows = wp.empty(m, dtype=wp.int32, device=device)
-        cols = wp.empty(m, dtype=wp.int32, device=device)
-        vals = wp.empty(m, dtype=dtype, device=device)
+        rows, cols, vals = tw.array.triplet_buffers(m, dtype, device)
         if m > 0:
             wp.launch(
                 kernel_laplacian.laplacian_triplets_directed,
@@ -576,9 +570,7 @@ def laplacian_entries(
     # (every neighbor counted once).
     unique_edges, _ = edges_unique(faces)
     m_unique = int(unique_edges.shape[0])
-    rows = wp.empty(2 * m_unique, dtype=wp.int32, device=device)
-    cols = wp.empty(2 * m_unique, dtype=wp.int32, device=device)
-    vals = wp.empty(2 * m_unique, dtype=dtype, device=device)
+    rows, cols, vals = tw.array.triplet_buffers(2 * m_unique, dtype, device)
     if m_unique > 0:
         wp.launch(
             kernel_laplacian.laplacian_triplets_symmetric,

@@ -6,6 +6,7 @@ import pytest
 import scipy.sparse
 import trimesh as tm
 import warp as wp
+import warp.sparse as wps
 
 import triwarp as tw
 
@@ -235,6 +236,39 @@ def test_sort_rows(device: str):
     data_wp = wp.array(data, dtype=wp.float32, device=device)
     tw.array.sort_rows(data_wp)
     assert np.array_equal(data_wp.numpy(), sorted_data_np)
+
+
+@pytest.mark.parametrize("dtype", [wp.float32, wp.float64, wp.mat22d])
+def test_triplet_buffers(dtype: type, device: str) -> None:
+    """Three same-length buffers on the requested device, int32 indices and ``dtype`` values."""
+    n_triplets = 12
+    rows_wp, cols_wp, values_wp = tw.array.triplet_buffers(n_triplets, dtype, device)
+
+    for buffer_wp in (rows_wp, cols_wp, values_wp):
+        assert buffer_wp.shape == (n_triplets,)
+        assert wp.get_device(str(buffer_wp.device)) == wp.get_device(device)
+    assert rows_wp.dtype == wp.int32
+    assert cols_wp.dtype == wp.int32
+    assert values_wp.dtype == dtype
+
+
+def test_triplet_buffers_feed_a_sparse_build(device: str) -> None:
+    """The buffers round-trip through ``bsr_from_triplets``: a 3x3 identity written by hand."""
+    rows_wp, cols_wp, values_wp = tw.array.triplet_buffers(3, wp.float64, device)
+    wp.copy(rows_wp, wp.array([0, 1, 2], dtype=wp.int32, device=device))
+    wp.copy(cols_wp, wp.array([0, 1, 2], dtype=wp.int32, device=device))
+    wp.copy(values_wp, wp.array([1.0, 1.0, 1.0], dtype=wp.float64, device=device))
+
+    matrix_wp = wps.bsr_from_triplets(3, 3, rows_wp, cols_wp, values_wp)
+    assert np.array_equal(matrix_wp.offsets.numpy()[:4], np.arange(4))
+    assert np.allclose(matrix_wp.values.numpy().reshape(-1), np.ones(3))
+
+
+def test_triplet_buffers_zero_length(device: str) -> None:
+    """A zero-entry build is a real case (an empty mesh), so the buffers must allocate empty."""
+    rows_wp, cols_wp, values_wp = tw.array.triplet_buffers(0, wp.float32, device)
+    for buffer_wp in (rows_wp, cols_wp, values_wp):
+        assert buffer_wp.shape == (0,)
 
 
 @pytest.mark.parametrize("data", [None, np.arange(1, 13, dtype=np.int32)])
