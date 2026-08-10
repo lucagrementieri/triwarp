@@ -37,26 +37,29 @@ RADIUS_GROWTH = wp.constant(wp.float32(2.0))
 # warm per-process load from 2.4 ms to ~5 ms.
 KNN_ROW_BUCKETS = (1, 4, 8, 16, 32, 64)
 
+# Which accelerator ``ball_count_in_radius`` / ``ball_collect`` traverse. The ball query is one
+# algorithm — same narrow-phase test, same emit protocol — over two broad phases whose query
+# objects are different types with different ``_next`` builtins, so the enumeration cannot be
+# abstracted behind a ``wp.Function`` parameter (CLAUDE.md section 4: ``wp.launch`` cannot pass one
+# as a kernel argument). An int selector can: the branch is warp-uniform, both traversals compile
+# into this one module, and measured on an RTX 5090 (bunny, 20 000 queries, radius 2x and 4x the
+# mean edge) the merged kernels are within noise of the two they replace on the BVH side and
+# 1.05-1.09x *faster* on the hash-grid side, where the counting pass no longer allocates a
+# throwaway per-thread distance slot. On CPU the same hash-grid counting pass gains 1.43-1.84x and
+# the BVH paths lose 1-5%.
+ACCEL_HASHGRID = wp.constant(wp.int32(0))
+ACCEL_BVH = wp.constant(wp.int32(1))
+
 
 @wp.func
-def bvh_aabb_collect(
-    bvh_id: wp.uint64,
-    q: wp.vec3,
-    half_extent: wp.float32,
-    write: wp.bool,
-    base: wp.int32,
-    out_indices: wp.array[wp.int32],
-) -> wp.int32:
-    # Count (``write=False``) or emit at ``base`` (``write=True``) the BVH hits around ``q``.
-    h = half_extent
-    lower = q - wp.vec3(h)  # wp.vec3(scalar) broadcasts the scalar to every component
-    upper = q + wp.vec3(h)
+def aabb_count_in_box(bvh_id: wp.uint64, q: wp.vec3, half_extent: wp.float32) -> wp.int32:
+    # Broad-phase hits of the cube around ``q``, with no narrow phase: every hit counts.
+    lower = q - wp.vec3(half_extent)  # wp.vec3(scalar) broadcasts the scalar to every component
+    upper = q + wp.vec3(half_extent)
     query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
     j = wp.int32(0)
     c = wp.int32(0)
     while wp.bvh_query_next(query, j):
-        if write:
-            out_indices[base + c] = j
         c = c + 1
     return c
 
@@ -69,10 +72,28 @@ def query_bvh_aabb_count(
     out_counts: wp.array[wp.int32],
 ) -> None:
     tid = wp.tid()
-    # ``out_counts`` doubles as the (never written) emit target of the counting pass.
-    out_counts[tid] = bvh_aabb_collect(
-        bvh_id, queries[tid], half_extent, wp.bool(False), wp.int32(0), out_counts
-    )
+    out_counts[tid] = aabb_count_in_box(bvh_id, queries[tid], half_extent)
+
+
+@wp.func
+def aabb_collect(
+    bvh_id: wp.uint64,
+    q: wp.vec3,
+    half_extent: wp.float32,
+    base: wp.int32,
+    out_indices: wp.array[wp.int32],
+) -> None:
+    # Emit the same hits ``aabb_count_in_box`` counted, contiguously from ``base``. Counting and
+    # emitting are separate passes rather than one ``write``-flagged function: the counting pass
+    # then needs no output array at all, and the emit loop carries no per-candidate branch.
+    lower = q - wp.vec3(half_extent)
+    upper = q + wp.vec3(half_extent)
+    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
+    j = wp.int32(0)
+    c = wp.int32(0)
+    while wp.bvh_query_next(query, j):
+        out_indices[base + c] = j
+        c = c + 1
 
 
 @wp.kernel
@@ -84,148 +105,97 @@ def query_bvh_aabb_neighbors(
     out_indices: wp.array[wp.int32],
 ) -> None:
     tid = wp.tid()
-    bvh_aabb_collect(bvh_id, queries[tid], half_extent, wp.bool(True), offsets[tid], out_indices)
+    aabb_collect(bvh_id, queries[tid], half_extent, offsets[tid], out_indices)
 
 
 @wp.func
-def hashgrid_ball_collect(
-    points: wp.array[wp.vec3],
-    grid_id: wp.uint64,
-    q: wp.vec3,
-    radius: wp.float32,
-    write: wp.bool,
-    base: wp.int32,
-    out_indices: wp.array[wp.int32],
-    out_distances: wp.array[wp.float32],
+def ball_count_in_radius(
+    points: wp.array[wp.vec3], accel: wp.int32, accel_id: wp.uint64, q: wp.vec3, radius: wp.float32
 ) -> wp.int32:
-    # Count (``write=False``) or emit at ``base`` (``write=True``) points within ``radius``.
-    query = wp.hash_grid_query(grid_id, q, radius)
-    j = wp.int32(0)
+    # Points within Euclidean ``radius`` of ``q``, over either accelerator (see ACCEL_* above).
+    #
+    # The two query objects are deliberately *differently named*: a Warp variable's type is fixed by
+    # its first assignment, so binding one ``query`` name to a hash-grid query in one branch and a
+    # BVH query in the other does not compile (verified — Warp raises at parse time). Do not "tidy"
+    # them into a single name.
     c = wp.int32(0)
-    while wp.hash_grid_query_next(query, j):
-        d = wp.length(points[j] - q)
-        if d <= radius:
-            if write:
-                out_indices[base + c] = j
-                out_distances[base + c] = d
-            c = c + 1
+    j = wp.int32(0)
+    if accel == ACCEL_HASHGRID:
+        query = wp.hash_grid_query(accel_id, q, radius)
+        while wp.hash_grid_query_next(query, j):
+            if wp.length(points[j] - q) <= radius:
+                c = c + 1
+    else:
+        # The cube ``[q ± radius]`` is the tightest axis-aligned box holding the ball, so the
+        # narrow-phase test below is what makes both branches return the same count.
+        query_aabb = wp.bvh_query_aabb(accel_id, q - wp.vec3(radius), q + wp.vec3(radius), root=-1)
+        while wp.bvh_query_next(query_aabb, j):
+            if wp.length(points[j] - q) <= radius:
+                c = c + 1
     return c
 
 
 @wp.kernel
-def query_hashgrid_ball_count(
+def query_ball_count(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3],
-    grid_id: wp.uint64,
+    accel: wp.int32,
+    accel_id: wp.uint64,
     radius: wp.float32,
     out_neighbor_counts: wp.array[wp.int32],
 ) -> None:
     tid = wp.tid()
-    dummy_dist = wp.zeros(shape=1, dtype=wp.float32)
-    out_neighbor_counts[tid] = hashgrid_ball_collect(
-        points,
-        grid_id,
-        queries[tid],
-        radius,
-        wp.bool(False),
-        wp.int32(0),
-        out_neighbor_counts,
-        dummy_dist,
-    )
+    out_neighbor_counts[tid] = ball_count_in_radius(points, accel, accel_id, queries[tid], radius)
+
+
+@wp.func
+def ball_collect(
+    points: wp.array[wp.vec3],
+    accel: wp.int32,
+    accel_id: wp.uint64,
+    q: wp.vec3,
+    radius: wp.float32,
+    base: wp.int32,
+    out_indices: wp.array[wp.int32],
+    out_distances: wp.array[wp.float32],
+) -> None:
+    # Emit the same neighbours ``ball_count_in_radius`` counted, contiguously from ``base``, with
+    # the distance the test already computed. Traversal order fixes the within-query order, which
+    # is why the wrapper's ``return_sorted`` is a separate segmented sort.
+    c = wp.int32(0)
+    j = wp.int32(0)
+    if accel == ACCEL_HASHGRID:
+        query = wp.hash_grid_query(accel_id, q, radius)
+        while wp.hash_grid_query_next(query, j):
+            d = wp.length(points[j] - q)
+            if d <= radius:
+                out_indices[base + c] = j
+                out_distances[base + c] = d
+                c = c + 1
+    else:
+        query_aabb = wp.bvh_query_aabb(accel_id, q - wp.vec3(radius), q + wp.vec3(radius), root=-1)
+        while wp.bvh_query_next(query_aabb, j):
+            d = wp.length(points[j] - q)
+            if d <= radius:
+                out_indices[base + c] = j
+                out_distances[base + c] = d
+                c = c + 1
 
 
 @wp.kernel
-def query_hashgrid_ball_neighbors(
+def query_ball_neighbors(
     points: wp.array[wp.vec3],
     queries: wp.array[wp.vec3],
-    grid_id: wp.uint64,
+    accel: wp.int32,
+    accel_id: wp.uint64,
     radius: wp.float32,
     offsets: wp.array[wp.int32],
     out_indices: wp.array[wp.int32],
     out_distances: wp.array[wp.float32],
 ) -> None:
     tid = wp.tid()
-    hashgrid_ball_collect(
-        points,
-        grid_id,
-        queries[tid],
-        radius,
-        wp.bool(True),
-        offsets[tid],
-        out_indices,
-        out_distances,
-    )
-
-
-@wp.func
-def bvh_ball_collect(
-    points: wp.array[wp.vec3],
-    bvh_id: wp.uint64,
-    q: wp.vec3,
-    radius: wp.float32,
-    write: wp.bool,
-    base: wp.int32,
-    out_indices: wp.array[wp.int32],
-    out_distances: wp.array[wp.float32],
-) -> wp.int32:
-    # Count (``write=False``) or emit at ``base`` (``write=True``) points within ``radius``.
-    lower = q - wp.vec3(radius)  # wp.vec3(scalar) broadcasts the scalar to every component
-    upper = q + wp.vec3(radius)
-    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    j = wp.int32(0)
-    c = wp.int32(0)
-    while wp.bvh_query_next(query, j):
-        d = wp.length(points[j] - q)
-        if d <= radius:
-            if write:
-                out_indices[base + c] = j
-                out_distances[base + c] = d
-            c = c + 1
-    return c
-
-
-@wp.kernel
-def query_bvh_ball_count(
-    points: wp.array[wp.vec3],
-    queries: wp.array[wp.vec3],
-    bvh_id: wp.uint64,
-    radius: wp.float32,
-    out_neighbor_counts: wp.array[wp.int32],
-) -> None:
-    tid = wp.tid()
-    dummy_dist = wp.zeros(shape=1, dtype=wp.float32)
-    out_neighbor_counts[tid] = bvh_ball_collect(
-        points,
-        bvh_id,
-        queries[tid],
-        radius,
-        wp.bool(False),
-        wp.int32(0),
-        out_neighbor_counts,
-        dummy_dist,
-    )
-
-
-@wp.kernel
-def query_bvh_ball_neighbors(
-    points: wp.array[wp.vec3],
-    queries: wp.array[wp.vec3],
-    bvh_id: wp.uint64,
-    radius: wp.float32,
-    offsets: wp.array[wp.int32],
-    out_indices: wp.array[wp.int32],
-    out_distances: wp.array[wp.float32],
-) -> None:
-    tid = wp.tid()
-    bvh_ball_collect(
-        points,
-        bvh_id,
-        queries[tid],
-        radius,
-        wp.bool(True),
-        offsets[tid],
-        out_indices,
-        out_distances,
+    ball_collect(
+        points, accel, accel_id, queries[tid], radius, offsets[tid], out_indices, out_distances
     )
 
 

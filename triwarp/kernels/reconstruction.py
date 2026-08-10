@@ -218,6 +218,14 @@ def build_local_triangulations(
     a = points[v]
     n_center = normals[v]
 
+    # Both rows stay ``wp.zeros`` rather than becoming ``wp.types.vector(length=MAX_NEIGHBOURS)``
+    # register rows: every access below is a *runtime* index (the gather cursor, the selection
+    # sort's ``mn``, the fan scan's ``i``), which spills a vector to local memory anyway, and
+    # ``edge_removal_weight`` / ``cycle_prev`` / ``cycle_next`` take them as ``wp.array``, so the
+    # vector form would additionally need ``wp.ref`` variants of all three. Measured on the clean
+    # case of the same class — ``algorithms/ball_pivoting.seed_triangles``, one 64-wide row with no
+    # helper passing — the register row is 0.994x (min) / 1.000x (median) end to end, i.e. no gain
+    # to trade that complexity for.
     nbr = wp.zeros(shape=MAX_NEIGHBOURS, dtype=wp.int32)
     ang = wp.zeros(shape=MAX_NEIGHBOURS, dtype=wp.float32)
 

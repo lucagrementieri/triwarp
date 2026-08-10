@@ -87,10 +87,9 @@ def centroid(points: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
     out = wp.zeros(1, dtype=wp.vec3, device=device)
     if n == 0:
         return out
-    n_tiles = (n + TILE_1D - 1) // TILE_1D
     wp.launch_tiled(
         kernel_reduce.sum_vec3_1d_tiled,
-        dim=[n_tiles],
+        dim=[kernel_reduce.blocks_1d(n)],
         inputs=[points, out],
         block_dim=TILE_1D,
         device=device,

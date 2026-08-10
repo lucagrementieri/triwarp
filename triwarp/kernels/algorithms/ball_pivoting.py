@@ -218,6 +218,13 @@ def seed_triangles(
     # Gather the local orphan neighbourhood into scratch so it can be scanned as a double loop.
     # Only the lowest-index orphan in each neighbourhood seeds, so seed fronts start well separated
     # and do not collide into overlapping sheets before they can glue.
+    #
+    # ``wp.zeros``, not the ``wp.types.vector(length=K)`` register row that ``neighbors.py``'s k-NN
+    # kernels hold their candidates in: measured, both spellings of this kernel end to end on bunny
+    # at radius 2x the mean edge, the register row is 0.994x (min) / 1.000x (median) — no gain. The
+    # k-NN row wins because every access to it is an unrolled compile-time slot; every access here
+    # is a runtime index (``nbr[count]``, ``nbr[i0]``, ``nbr[i1]``), and a runtime index into a
+    # vector spills it to local memory, which is where ``wp.zeros`` already puts it.
     nbr = wp.zeros(shape=MAX_SEED_NEIGHBORS, dtype=wp.int32)
     count = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
     query = wp.hash_grid_query(grid_id, points[p], 2.0 * radius)

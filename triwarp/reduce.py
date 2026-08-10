@@ -264,10 +264,9 @@ def sum(
         if n == 0:
             raise ValueError("sum requires a non-empty array.")
         out_vec = wp.zeros(1, dtype=wp.vec3, device=array.device)
-        n_tiles = (n + TILE_1D - 1) // TILE_1D
         wp.launch_tiled(
             kernel_reduce.sum_vec3_1d_tiled,
-            dim=[n_tiles],
+            dim=[kernel_reduce.blocks_1d(n)],
             inputs=[array, out_vec],
             block_dim=TILE_1D,
             device=array.device,
@@ -380,12 +379,12 @@ def weighted_sum(
     if n_values != n_weights:
         raise ValueError("weighted_sum requires values and weights of equal length.")
 
-    n_tiles = (n_values + TILE_1D - 1) // TILE_1D
+    n_blocks = kernel_reduce.blocks_1d(n_values)
     if values.dtype == wp.vec3:
         out_vec = wp.zeros(1, dtype=wp.vec3, device=values.device)
         wp.launch_tiled(
             kernel_reduce.weighted_sum_vec3_1d_tiled,
-            dim=[n_tiles],
+            dim=[n_blocks],
             inputs=[values, weights, out_vec],
             block_dim=TILE_1D,
             device=values.device,
@@ -395,7 +394,7 @@ def weighted_sum(
     out = wp.zeros(1, dtype=wp.float32, device=values.device)
     wp.launch_tiled(
         kernel_reduce.weighted_sum1d_tiled,
-        dim=[n_tiles],
+        dim=[n_blocks],
         inputs=[values, weights, out],
         block_dim=TILE_1D,
         device=values.device,

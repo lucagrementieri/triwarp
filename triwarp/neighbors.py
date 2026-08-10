@@ -359,9 +359,16 @@ def query_hashgrid_ball_count(
         grid = hashgrid_from_points(points, r, grid_bins)
 
     wp.launch(
-        kernel_neighbors.query_hashgrid_ball_count,
+        kernel_neighbors.query_ball_count,
         dim=m,
-        inputs=[points, queries, grid.id, wp.float32(r), neighbor_counts],
+        inputs=[
+            points,
+            queries,
+            kernel_neighbors.ACCEL_HASHGRID,
+            grid.id,
+            wp.float32(r),
+            neighbor_counts,
+        ],
         device=device,
     )
 
@@ -454,7 +461,7 @@ def query_hashgrid_ball_with_offsets(
         count_fn=lambda pts, qrs, radius, accelerator: query_hashgrid_ball_count(
             pts, qrs, radius, grid=accelerator
         ),
-        neighbors_kernel=kernel_neighbors.query_hashgrid_ball_neighbors,
+        accel=kernel_neighbors.ACCEL_HASHGRID,
         include_total=include_total,
         return_sorted=return_sorted,
     )
@@ -600,9 +607,16 @@ def query_bvh_ball_count(
         bvh = bvh_from_points(points, leaf_size)
 
     wp.launch(
-        kernel_neighbors.query_bvh_ball_count,
+        kernel_neighbors.query_ball_count,
         dim=m,
-        inputs=[points, queries, bvh.id, wp.float32(r), neighbor_counts],
+        inputs=[
+            points,
+            queries,
+            kernel_neighbors.ACCEL_BVH,
+            bvh.id,
+            wp.float32(r),
+            neighbor_counts,
+        ],
         device=device,
     )
 
@@ -666,7 +680,7 @@ def query_bvh_ball_with_offsets(
         count_fn=lambda pts, qrs, radius, accelerator: query_bvh_ball_count(
             pts, qrs, radius, bvh=accelerator
         ),
-        neighbors_kernel=kernel_neighbors.query_bvh_ball_neighbors,
+        accel=kernel_neighbors.ACCEL_BVH,
         include_total=include_total,
         return_sorted=return_sorted,
     )
@@ -679,7 +693,7 @@ def _ball_with_offsets(
     *,
     build_accelerator: Callable[[], wp.HashGrid | wp.Bvh],
     count_fn: Callable[[wp.array[wp.vec3], wp.array[wp.vec3], float, Any], wp.array[wp.int32]],
-    neighbors_kernel: wp.Kernel,
+    accel: wp.int32,
     include_total: bool,
     return_sorted: bool,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.float32], wp.array[wp.int32]]:
@@ -688,10 +702,10 @@ def _ball_with_offsets(
 
     [`query_hashgrid_ball_with_offsets`][triwarp.neighbors.query_hashgrid_ball_with_offsets] and
     [`query_bvh_ball_with_offsets`][triwarp.neighbors.query_bvh_ball_with_offsets] differ only in
-    which structure they build, which counting pass they run and which neighbour kernel they
-    launch; everything else -- the empty guards, the CSR scan, the ``2x`` sort scratch and the
-    trailing compaction -- is identical. The accelerator is built lazily so an empty query never
-    pays for one.
+    which structure they build, which counting pass they run and which traversal the one shared
+    neighbour kernel takes (``accel``, one of ``kernels.neighbors.ACCEL_*``); everything else --
+    the empty guards, the CSR scan, the ``2x`` sort scratch and the trailing compaction -- is
+    identical. The accelerator is built lazily so an empty query never pays for one.
     """
     device = points.device
 
@@ -726,11 +740,12 @@ def _ball_with_offsets(
     neighbor_indices_flat = wp.empty(flat_len, dtype=wp.int32, device=device)
     neighbor_distances_flat = wp.empty(flat_len, dtype=wp.float32, device=device)
     wp.launch(
-        neighbors_kernel,
+        kernel_neighbors.query_ball_neighbors,
         dim=m,
         inputs=[
             points,
             queries,
+            accel,
             accelerator.id,
             wp.float32(r),
             segment_bounds,
