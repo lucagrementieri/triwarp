@@ -482,26 +482,36 @@ def _resolve_flip_quad_guarded(
     k: wp.int32,
     f0: wp.int32,
     out_quad: wp.array2d[wp.int32],
-) -> wp.vec4i:
+) -> tuple[wp.int32, wp.int32, wp.int32, wp.int32]:
     # Shared flip-candidate preamble: reject missing apexes, inconsistent winding, b == d, and
-    # flips that would duplicate an existing edge. Returns (a, b, c, d) with a < 0 when not
-    # flippable; out_quad[k] is written only for valid quads (claim/commit read quad[k] only
-    # when the caller has set out_flip[k], which stays False for rejected/non-flipped edges).
-    invalid = wp.vec4i(-1, -1, -1, -1)
+    # flips that would duplicate an existing edge. Returns the unpacked ``(a, b, c, d)`` with
+    # a < 0 when not flippable, so every candidate kernel opens with the same two lines; out_quad[k]
+    # is written only for valid quads (claim/commit read quad[k] only when the caller has set
+    # out_flip[k], which stays False for rejected/non-flipped edges).
+    a = wp.int32(-1)
+    b = wp.int32(-1)
+    c = wp.int32(-1)
+    d = wp.int32(-1)
     d0 = unshared[k, 0]
     d1 = unshared[k, 1]
-    if d0 < 0 or d1 < 0:
-        return invalid
-    quad = _resolve_flip_quad(faces, f0, adjacency_edges[k, 0], adjacency_edges[k, 1], d0, d1)
-    if quad[0] < 0 or quad[1] == quad[3]:
-        return invalid
-    if binary_search_sorted_contains(sorted_edge_keys, pack_edge_key(quad[1], quad[3], key_base)):
-        return invalid
-    out_quad[k, 0] = quad[0]
-    out_quad[k, 1] = quad[1]
-    out_quad[k, 2] = quad[2]
-    out_quad[k, 3] = quad[3]
-    return quad
+    if d0 >= 0 and d1 >= 0:
+        quad = _resolve_flip_quad(faces, f0, adjacency_edges[k, 0], adjacency_edges[k, 1], d0, d1)
+        if (
+            quad[0] >= 0
+            and quad[1] != quad[3]
+            and not binary_search_sorted_contains(
+                sorted_edge_keys, pack_edge_key(quad[1], quad[3], key_base)
+            )
+        ):
+            a = quad[0]
+            b = quad[1]
+            c = quad[2]
+            d = quad[3]
+            out_quad[k, 0] = a
+            out_quad[k, 1] = b
+            out_quad[k, 2] = c
+            out_quad[k, 3] = d
+    return a, b, c, d
 
 
 @wp.kernel
@@ -526,13 +536,9 @@ def delone_flip_candidates(
     f1 = adjacency[k, 1]
     if region_flags[f0] == 0 or region_flags[f1] == 0:
         return
-    quad = _resolve_flip_quad_guarded(
+    a, b, c, d = _resolve_flip_quad_guarded(
         faces, adjacency_edges, unshared, sorted_edge_keys, key_base, wp.int32(k), f0, out_quad
     )
-    a = quad[0]
-    b = quad[1]
-    c = quad[2]
-    d = quad[3]
     if a < 0:
         return
     ap = to_vec3d(vertices[a])
@@ -567,13 +573,9 @@ def incircle_flip_candidates(
     k = int(wp.tid())
     out_flip[k] = wp.bool(False)
     f0 = adjacency[k, 0]
-    quad = _resolve_flip_quad_guarded(
+    a, b, c, d = _resolve_flip_quad_guarded(
         faces, adjacency_edges, unshared, sorted_edge_keys, key_base, wp.int32(k), f0, out_quad
     )
-    a = quad[0]
-    b = quad[1]
-    c = quad[2]
-    d = quad[3]
     if a < 0:
         return
     ap = to_vec2d(points[a])
@@ -881,13 +883,9 @@ def valence_flip_candidates(
     )
     if wp.acos(wp.dot(n0, n1)) > feature_angle:  # wp.acos auto-clamps to [-1, 1]
         return
-    quad = _resolve_flip_quad_guarded(
+    a, b, c, d = _resolve_flip_quad_guarded(
         faces, adjacency_edges, unshared, sorted_edge_keys, key_base, wp.int32(k), f0, out_quad
     )
-    a = quad[0]
-    b = quad[1]
-    c = quad[2]
-    d = quad[3]
     if a < 0:
         return
     ap = to_vec3d(vertices[a])
@@ -1048,14 +1046,11 @@ def intrinsic_delaunay_candidates(
     out_new_length[k] = 0.0
     f0 = adjacency[k, 0]
     f1 = adjacency[k, 1]
-    quad = _resolve_flip_quad_guarded(
+    first, _apex1, second, apex0 = _resolve_flip_quad_guarded(
         faces, adjacency_edges, unshared, sorted_edge_keys, key_base, k, f0, out_quad
     )
-    if quad[0] < wp.int32(0):
+    if first < wp.int32(0):
         return
-    first = quad[0]
-    second = quad[2]
-    apex0 = quad[3]
 
     corner_f0_first = local_corner(faces, f0, first)
     corner_f0_second = local_corner(faces, f0, second)
@@ -1249,13 +1244,9 @@ def objective_flip_candidates(
     f1 = adjacency[k, 1]
     if region_flags[f0] == 0 or region_flags[f1] == 0:
         return
-    quad = _resolve_flip_quad_guarded(
+    a, b, c, d = _resolve_flip_quad_guarded(
         faces, adjacency_edges, unshared, sorted_edge_keys, key_base, wp.int32(k), f0, out_quad
     )
-    a = quad[0]
-    b = quad[1]
-    c = quad[2]
-    d = quad[3]
     if a < 0:
         return
     ap = vertices[a]
