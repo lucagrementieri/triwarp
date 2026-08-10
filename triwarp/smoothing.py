@@ -118,6 +118,14 @@ def filter_laplacian(
     [`filter_implicit_fairing`][triwarp.smoothing.filter_implicit_fairing]
     [`trimesh.smoothing.filter_laplacian`][]
     """
+    # This six-line prologue opens five of the filters (here, ``filter_humphrey``,
+    # ``filter_taubin``, ``filter_neighborhood_average`` and ``filter_mut_dif_laplacian``) and a
+    # ``_smoothing_setup`` helper for it has been proposed twice and declined twice. The reason is
+    # not line count: the two halves have no common consumer. ``filter_implicit_fairing`` needs the
+    # guard and ``_as_vec3d`` but builds no operator, ``filter_neighborhood_average`` needs the
+    # operator built ``symmetric=True``, and a helper returning both would have to hand back an
+    # optional operator that three of the six callers immediately unwrap -- which reads worse than
+    # the six lines it replaces. Do not re-propose it without a shape that avoids the ``Optional``.
     device = vertices.device
     n = int(vertices.shape[0])
     if n == 0 or iterations == 0:

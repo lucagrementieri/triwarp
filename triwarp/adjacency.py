@@ -102,17 +102,18 @@ def face_adjacency(
 
     # Edge ``e`` belongs to face ``e // 3``, so the owning faces need no ``edges_face`` table, no
     # gather through it, and no row sort — one kernel does the division and orders the pair.
-    adjacency = twt.empty_2d((int(edge_groups.shape[0]), 2), wp.int32, device=device)
-    if int(edge_groups.shape[0]) > 0:
+    n_pairs = int(edge_groups.shape[0])
+    adjacency = twt.empty_2d((n_pairs, 2), wp.int32, device=device)
+    if n_pairs > 0:
         wp.launch(
             kernel_adjacency.edge_pairs_to_face_pairs,
-            dim=int(edge_groups.shape[0]),
+            dim=n_pairs,
             inputs=[edge_groups, adjacency],
             device=device,
         )
     if return_edges:
         assert edges_sorted is not None
-        if edge_groups.shape[0] > 0:
+        if n_pairs > 0:
             # ``edge_groups[:, 0]`` is a strided column view; Warp's fancy indexing reads the
             # underlying flat buffer and ignores the stride, so materialize a contiguous index
             # first. (Slicing an empty first axis also raises, hence the guard.)
@@ -233,9 +234,6 @@ def _hash_radix(faces: wp.array[wp.int32], n_vertices: int | None) -> int:
     if min_index < 0:
         raise ValueError(f"faces must be non-negative, got a minimum of {min_index}")
     return int(max_index) + 1
-
-
-_compute_face_adjacency = face_adjacency
 
 
 def vertex_face_adjacency(
@@ -463,7 +461,9 @@ def face_adjacency_angles(
         return wp.empty(0, dtype=wp.float32, device=device)
 
     if face_adjacency is None:
-        face_adjacency = _compute_face_adjacency(faces)
+        # Through the package namespace because the parameter shadows the module-level function,
+        # which is also how ``resolved_face_adjacency`` reaches it.
+        face_adjacency = tw.adjacency.face_adjacency(faces)
     if face_normals is None:
         face_normals, _ = tw.triangles.face_normals_and_areas(vertices, faces)
 
