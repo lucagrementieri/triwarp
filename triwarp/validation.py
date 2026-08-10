@@ -242,7 +242,9 @@ def vertex_manifold_mask(
     n_vertices = int(vertices.shape[0])
     if int(faces.shape[0]) // 3 == 0:
         return wp.zeros(n_vertices, dtype=wp.bool, device=faces.device)
-    adjacency, adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
+    adjacency, adjacency_edges = tw.adjacency.face_adjacency(
+        faces, return_edges=True, n_vertices=n_vertices
+    )
     return _vertex_manifold_flags(faces, n_vertices, adjacency, adjacency_edges)
 
 
@@ -823,10 +825,13 @@ def is_watertight(
     # passes, preserving the short-circuit) feeds the vertex-manifold test.
     if edges_sorted is None:
         edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    if not is_edge_manifold(faces, allow_boundary_edges=False, edges_sorted=edges_sorted):
+    n_vertices = int(vertices.shape[0])
+    if not is_edge_manifold(
+        faces, allow_boundary_edges=False, edges_sorted=edges_sorted, n_vertices=n_vertices
+    ):
         return False
     adjacency, adjacency_edges = tw.adjacency.face_adjacency(
-        faces, edges_sorted=edges_sorted, return_edges=True
+        faces, edges_sorted=edges_sorted, return_edges=True, n_vertices=n_vertices
     )
     if not is_vertex_manifold(
         faces, face_adjacency=adjacency, face_adjacency_edges=adjacency_edges

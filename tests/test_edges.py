@@ -236,6 +236,26 @@ def test_edges_unique_and_inverse_match_igl(request: pytest.FixtureRequest, mesh
     assert np.array_equal(resolved_wp, resolved_igl)
 
 
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+def test_edges_unique_radix_is_invariant_to_an_oversized_base(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A: the unique-edge table and its inverse are unchanged by any base above ``max(faces)``.
+
+    A caller holding ``vertices`` passes ``vertices.shape[0]`` to skip the inference readback, and
+    that count exceeds ``max(faces) + 1`` whenever the mesh carries unreferenced vertices.
+    """
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    tight = tw.vertices.n_vertices(mesh_wp.indices)
+    edges_tight_wp, inverse_tight_wp = tw.edges.edges_unique(mesh_wp.indices, n_vertices=tight)
+
+    for base in (tight + 1, tight + 1000):
+        edges_wp, inverse_wp = tw.edges.edges_unique(mesh_wp.indices, n_vertices=base)
+        assert np.array_equal(edges_wp.numpy(), edges_tight_wp.numpy())
+        assert np.array_equal(inverse_wp.numpy(), inverse_tight_wp.numpy())
+
+
 def test_edges_unique_empty(device: str) -> None:
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
     unique_wp, inverse_wp = tw.edges.edges_unique(faces_wp)

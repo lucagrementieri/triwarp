@@ -1335,7 +1335,7 @@ def filter_normals(
         return normals
 
     if face_adjacency is None:
-        face_adjacency = tw.adjacency.face_adjacency(faces)
+        face_adjacency = tw.adjacency.face_adjacency(faces, n_vertices=int(vertices.shape[0]))
     m = int(face_adjacency.shape[0])
     threshold_cos = wp.float32(math.cos(math.radians(threshold)))
 
@@ -1427,7 +1427,7 @@ def filter_two_step(
         return out
 
     # The topology is fixed, so the adjacency is built once for every pass of both halves.
-    adjacency = tw.adjacency.face_adjacency(faces)
+    adjacency = tw.adjacency.face_adjacency(faces, n_vertices=n)
     delta = wp.empty(n, dtype=wp.vec3, device=device)
     counts = wp.empty(n, dtype=wp.float32, device=device)
     for _ in range(iterations):

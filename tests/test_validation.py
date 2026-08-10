@@ -298,6 +298,36 @@ def test_is_edge_manifold_precomputed_shortcut(icosahedron: tuple[tm.Trimesh, wp
     ) == tw.validation.is_edge_manifold(mesh_wp.indices)
 
 
+@pytest.mark.parametrize("allow_boundary_edges", [True, False])
+def test_is_edge_manifold_radix_is_invariant_to_an_oversized_base(
+    request: pytest.FixtureRequest, allow_boundary_edges: bool
+) -> None:
+    """
+    Class A: the verdict is unchanged by any hash base above ``max(faces)``.
+
+    Parametrized over both meshes and both switch positions so each answer appears: the closed
+    icosahedron is edge-manifold either way, the open hemisphere only with boundary edges allowed.
+    Callers holding ``vertices`` pass ``vertices.shape[0]``, which exceeds ``max(faces) + 1``
+    whenever the mesh carries unreferenced vertices.
+    """
+    answers = set()
+    for mesh_name in ("icosahedron", "hemisphere"):
+        _, mesh_wp = request.getfixturevalue(mesh_name)
+        tight = tw.vertices.n_vertices(mesh_wp.indices)
+        baseline = tw.validation.is_edge_manifold(
+            mesh_wp.indices, allow_boundary_edges, n_vertices=tight
+        )
+        answers.add(baseline)
+        for base in (tight + 1, tight + 1000):
+            assert (
+                tw.validation.is_edge_manifold(
+                    mesh_wp.indices, allow_boundary_edges, n_vertices=base
+                )
+                == baseline
+            )
+    assert answers == ({True} if allow_boundary_edges else {True, False})
+
+
 def test_is_vertex_manifold_precomputed_shortcut(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _, mesh_wp = icosahedron
     adjacency, adjacency_edges = tw.adjacency.face_adjacency(mesh_wp.indices, return_edges=True)

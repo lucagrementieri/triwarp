@@ -249,6 +249,57 @@ def test_subdivide_to_size(bench_case: BenchCase, split_fraction: float) -> None
         assert result[1].shape[0] >= faces.shape[0]
 
 
+# Split budgets for the region refiner, as a fraction of the input face count. ``None`` runs to
+# convergence; the finite one makes ``max_splits`` bind, which is the only way the budget-truncation
+# branch is reached at all.
+_REGION_SPLIT_BUDGETS = [None, 0.25]
+
+
+def _region_half(bench_case: BenchCase) -> wp.array[wp.bool]:
+    """Face mask covering the half of the mesh below the median face-centroid ``x``."""
+    vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+    centroid_x = vertices_np[faces_np, 0].mean(axis=1)
+    return wp.array(
+        np.ascontiguousarray(centroid_x < np.median(centroid_x)),
+        dtype=wp.bool,
+        device=bench_case.device,
+    )
+
+
+@pytest.mark.benchmark(group="subdivide_region_to_size")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp")
+@pytest.mark.parametrize("split_budget", _REGION_SPLIT_BUDGETS)
+def test_subdivide_region_to_size(bench_case: BenchCase, split_budget: float | None) -> None:
+    """
+    The same adaptive split restricted to a face region, with and without a split budget.
+
+    The pair is the point rather than either row alone. ``max_splits=None`` refines the region to
+    convergence; a finite budget stops early *and* takes a branch the unbudgeted path never
+    reaches, ``_keep_longest_edges``, which ranks the pass's eligible edges and keeps the longest
+    ones that fit. Only the budgeted row prices that ranking, and it runs **once per call** rather
+    than once per pass: truncating a pass spends the whole remaining budget, so the next pass exits
+    at ``remaining <= 0``.
+
+    There is no reference row. trimesh's and MeshLab's refiners take an edge-length target over the
+    whole mesh with no region restriction and no split cap, so they would measure a different
+    operation; the region form exists because ``holes.fill_smooth`` needs it.
+    """
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    region = _region_half(bench_case)
+    max_edge = 0.35 * bench_case.mean_edge
+    max_splits = None if split_budget is None else int(split_budget * bench_case.n_faces)
+
+    _new_vertices, new_faces, new_region = bench_case.run(
+        lambda: tw.remesh.subdivide_region_to_size(
+            vertices, faces, region, max_edge, max_splits=max_splits
+        ),
+        rounds=_ROUNDS,
+    )
+    assert int(new_faces.shape[0]) >= int(faces.shape[0])
+    assert int(new_region.shape[0]) == int(new_faces.shape[0]) // 3
+
+
 @pytest.mark.benchmark(group="flip_to_delaunay")
 @pytest.mark.benchaxis("quality")
 @pytest.mark.benchlibs("triwarp")

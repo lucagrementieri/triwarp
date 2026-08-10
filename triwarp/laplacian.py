@@ -568,7 +568,7 @@ def laplacian_entries(
         return rows, cols, vals
     # Both directed pairs of each unique undirected edge, matching trimesh's ``vertex_neighbors``
     # (every neighbor counted once).
-    unique_edges, _ = edges_unique(faces)
+    unique_edges, _ = edges_unique(faces, n_vertices=int(vertices.shape[0]))
     m_unique = int(unique_edges.shape[0])
     rows, cols, vals = tw.array.triplet_buffers(2 * m_unique, dtype, device)
     if m_unique > 0:

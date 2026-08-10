@@ -129,6 +129,8 @@ def resolved_face_adjacency(
     faces: wp.array[wp.int32],
     face_adjacency: twt.Array2dInt32 | None = None,
     face_adjacency_edges: twt.Array2dInt32 | None = None,
+    *,
+    n_vertices: int | None = None,
 ) -> tuple[twt.Array2dInt32, twt.Array2dInt32]:
     """
     Return the face-adjacency pair, computed from ``faces`` only when the caller supplied none.
@@ -147,6 +149,10 @@ def resolved_face_adjacency(
         in which case ``face_adjacency_edges`` must be omitted too.
     face_adjacency_edges
         Precomputed ``(m, 2)`` shared-edge endpoints, row-aligned with ``face_adjacency``.
+    n_vertices
+        Optional vertex count forwarded to [`face_adjacency`][triwarp.adjacency.face_adjacency] as
+        its row-hashing radix, skipping the reduction and host readback that would otherwise infer
+        it. Ignored when the tables are supplied, since then nothing is computed.
 
     Returns
     -------
@@ -167,7 +173,7 @@ def resolved_face_adjacency(
     """
     _require_paired_adjacency(face_adjacency, face_adjacency_edges)
     if face_adjacency is None:
-        return tw.adjacency.face_adjacency(faces, return_edges=True)
+        return tw.adjacency.face_adjacency(faces, return_edges=True, n_vertices=n_vertices)
     assert face_adjacency_edges is not None
     return face_adjacency, face_adjacency_edges
 
@@ -462,8 +468,9 @@ def face_adjacency_angles(
 
     if face_adjacency is None:
         # Through the package namespace because the parameter shadows the module-level function,
-        # which is also how ``resolved_face_adjacency`` reaches it.
-        face_adjacency = tw.adjacency.face_adjacency(faces)
+        # which is also how ``resolved_face_adjacency`` reaches it. ``vertices`` already bounds the
+        # face indices, so the radix needs no inference.
+        face_adjacency = tw.adjacency.face_adjacency(faces, n_vertices=int(vertices.shape[0]))
     if face_normals is None:
         face_normals, _ = tw.triangles.face_normals_and_areas(vertices, faces)
 

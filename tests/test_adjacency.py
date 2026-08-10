@@ -48,11 +48,73 @@ def test_face_adjacency_n_vertices_matches_inferred(
     assert np.array_equal(inferred_wp.numpy(), supplied_wp.numpy())
 
 
+@pytest.mark.parametrize("mesh_name", _MESHES)
+def test_face_adjacency_radix_is_invariant_to_an_oversized_base(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A: the edge grouping is unchanged by any base above ``max(faces)``.
+
+    ``_edge_groups`` asserts the partition is invariant to a sufficiently large radix, which is what
+    lets a caller holding a vertex buffer with *unreferenced* vertices pass ``vertices.shape[0]``
+    rather than pay the ``reduce.minmax`` that infers ``max(faces) + 1``. Both spellings are
+    exercised: ``edges_sorted=None`` hashes off ``faces`` in one launch, supplying it hashes the
+    edge rows.
+    """
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    tight = tw.vertices.n_vertices(mesh_wp.indices)
+    edges_sorted = tw.edges.faces_to_edges(mesh_wp.indices, sorted=True)
+
+    baseline_wp = tw.adjacency.face_adjacency(mesh_wp.indices, n_vertices=tight)
+    for base in (tight + 1, tight + 1000):
+        assert np.array_equal(
+            tw.adjacency.face_adjacency(mesh_wp.indices, n_vertices=base).numpy(),
+            baseline_wp.numpy(),
+        )
+        assert np.array_equal(
+            tw.adjacency.face_adjacency(mesh_wp.indices, edges_sorted, n_vertices=base).numpy(),
+            baseline_wp.numpy(),
+        )
+
+
 def test_face_adjacency_empty(device: str) -> None:
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
     adjacency_wp, adjacency_edges_wp = tw.adjacency.face_adjacency(faces_wp, return_edges=True)
     assert adjacency_wp.shape == (0, 2)
     assert adjacency_edges_wp.shape == (0, 2)
+
+
+@pytest.mark.parametrize("mesh_name", _MESHES)
+def test_resolved_face_adjacency_derives_and_forwards(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A: the resolver derives what ``face_adjacency`` does, and ``n_vertices`` does not move it.
+
+    Both branches are covered -- deriving from ``faces`` with and without the radix, and passing the
+    tables straight through, where the radix is documented as ignored and must therefore be
+    accepted without changing anything.
+    """
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = int(mesh_wp.points.shape[0])
+    adjacency_wp, edges_wp = tw.adjacency.face_adjacency(mesh_wp.indices, return_edges=True)
+
+    derived_wp, derived_edges_wp = tw.adjacency.resolved_face_adjacency(mesh_wp.indices)
+    supplied_wp, supplied_edges_wp = tw.adjacency.resolved_face_adjacency(
+        mesh_wp.indices, n_vertices=n_vertices
+    )
+    passed_wp, passed_edges_wp = tw.adjacency.resolved_face_adjacency(
+        mesh_wp.indices, adjacency_wp, edges_wp, n_vertices=n_vertices
+    )
+
+    assert int(adjacency_wp.shape[0]) > 0
+    for got_wp, got_edges_wp in (
+        (derived_wp, derived_edges_wp),
+        (supplied_wp, supplied_edges_wp),
+        (passed_wp, passed_edges_wp),
+    ):
+        assert np.array_equal(got_wp.numpy(), adjacency_wp.numpy())
+        assert np.array_equal(got_edges_wp.numpy(), edges_wp.numpy())
 
 
 @pytest.mark.parametrize("mesh_name", _MESHES)

@@ -747,6 +747,55 @@ def test_subdivide_region_max_splits(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     assert nv.numpy().shape[0] - n_vertices_before <= 5
 
 
+def test_subdivide_region_max_splits_takes_the_longest_edges(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh],
+):
+    """
+    Class A: a bound budget spends itself on the longest eligible edges, not on an arbitrary five.
+
+    ``_keep_longest_edges`` ranks the pass's eligible edges on the device and keeps the longest that
+    fit. This pins the *selection rule* rather than the tie order, which neither the host nor the
+    device spelling defines. Non-vacuous by construction: the budget is a twentieth of the eligible
+    count, so the branch is reached and has to discard most of what it was given.
+    """
+    v, f, region = _filled_hemisphere(hemisphere)
+    vertices_np, faces_np, region_np = v.numpy(), f.numpy().reshape(-1, 3), region.numpy()
+    max_edge = 0.2 * _region_max_edge(vertices_np, faces_np, region_np)
+
+    edges_np = np.unique(np.sort(_undirected_edges(faces_np), axis=1), axis=0)
+    lengths_np = np.linalg.norm(vertices_np[edges_np[:, 0]] - vertices_np[edges_np[:, 1]], axis=1)
+    face_of_edge = np.repeat(np.arange(faces_np.shape[0]), 3)
+    region_edges = {
+        tuple(edge)
+        for edge in np.sort(_undirected_edges(faces_np), axis=1)[region_np[face_of_edge]]
+    }
+    eligible = np.array([tuple(edge) in region_edges for edge in edges_np], dtype=bool) & (
+        lengths_np > max_edge
+    )
+    budget = int(eligible.sum()) // 3
+    assert 2 <= budget < int(eligible.sum()), (
+        "the budget must bind and still leave a real choice, or the test is about nothing"
+    )
+
+    nv, _, _ = tw.remesh.subdivide_region_to_size(
+        v, f, region, max_edge=max_edge, max_splits=budget, delaunay=False
+    )
+    # One new vertex per split, appended after the originals, so the midpoints identify the edges.
+    midpoints_np = nv.numpy()[int(v.shape[0]) :]
+    assert midpoints_np.shape[0] == budget
+
+    edge_midpoints = 0.5 * (vertices_np[edges_np[:, 0]] + vertices_np[edges_np[:, 1]])
+    split = np.array(
+        [np.abs(edge_midpoints - point).sum(axis=1).argmin() for point in midpoints_np]
+    )
+    assert np.allclose(edge_midpoints[split], midpoints_np, rtol=1e-5, atol=1e-5)
+    # Every split edge was eligible, and none of them is shorter than an eligible edge left alone.
+    assert eligible[split].all()
+    left = eligible.copy()
+    left[split] = False
+    assert lengths_np[split].min() >= lengths_np[left].max() - 1e-6
+
+
 def test_subdivide_region_empty_region(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     v, f, region = _filled_hemisphere(hemisphere)
     empty = wp.zeros(int(region.shape[0]), dtype=wp.bool, device=region.device)

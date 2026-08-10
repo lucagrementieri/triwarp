@@ -231,7 +231,7 @@ def discrete_mean_curvature(
         return wp.zeros(n_points, dtype=wp.float32, device=device)
 
     face_adjacency, face_adjacency_edges = tw.adjacency.resolved_face_adjacency(
-        faces, face_adjacency, face_adjacency_edges
+        faces, face_adjacency, face_adjacency_edges, n_vertices=int(vertices.shape[0])
     )
 
     m = int(face_adjacency.shape[0])

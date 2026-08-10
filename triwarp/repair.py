@@ -734,7 +734,9 @@ def make_volume(
     # Both answer "is every undirected edge shared by exactly two faces", because every unique edge
     # in the table comes from a face. Measured interleaved: 1.17-1.19x on CUDA and 1.64-1.77x on
     # CPU, at 20k and 328k faces.
-    if not tw.validation.is_edge_manifold(faces, allow_boundary_edges=False):
+    if not tw.validation.is_edge_manifold(
+        faces, allow_boundary_edges=False, n_vertices=int(vertices.shape[0])
+    ):
         return wp.clone(faces)
 
     signed_volumes = tw.triangles.face_signed_volumes(vertices, faces)
@@ -863,7 +865,7 @@ def bad_face_mask(
     neighbor_sum = wp.zeros(n_faces, dtype=wp.vec3, device=device)
     max_angle = wp.zeros(n_faces, dtype=wp.float32, device=device)
     if max_normal_angle is not None or max_fold_angle is not None:
-        adjacency = tw.adjacency.face_adjacency(faces)
+        adjacency = tw.adjacency.face_adjacency(faces, n_vertices=int(vertices.shape[0]))
         if int(adjacency.shape[0]) > 0:
             angles = tw.adjacency.face_adjacency_angles(
                 vertices, faces, face_adjacency=adjacency, face_normals=face_normals

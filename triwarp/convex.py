@@ -115,7 +115,7 @@ def face_adjacency_projections(
         return wp.empty(0, dtype=wp.float32, device=device)
 
     face_adjacency, face_adjacency_edges = tw.adjacency.resolved_face_adjacency(
-        faces, face_adjacency, face_adjacency_edges
+        faces, face_adjacency, face_adjacency_edges, n_vertices=int(vertices.shape[0])
     )
 
     if face_adjacency_unshared is None:
@@ -198,7 +198,7 @@ def face_adjacency_convex(
         return wp.empty(0, dtype=wp.bool, device=device)
 
     face_adjacency, face_adjacency_edges = tw.adjacency.resolved_face_adjacency(
-        faces, face_adjacency, face_adjacency_edges
+        faces, face_adjacency, face_adjacency_edges, n_vertices=int(vertices.shape[0])
     )
 
     m = int(face_adjacency.shape[0])

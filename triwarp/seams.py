@@ -95,7 +95,9 @@ def crease_edges(
     if n_faces == 0:
         return twt.empty_2d((0, 2), wp.int32, device=device)
 
-    adjacency, adjacency_edges = tw.adjacency.face_adjacency(faces, return_edges=True)
+    adjacency, adjacency_edges = tw.adjacency.face_adjacency(
+        faces, return_edges=True, n_vertices=int(vertices.shape[0])
+    )
     selected = twt.empty_2d((0, 2), wp.int32, device=device)
     if int(adjacency.shape[0]) > 0:
         angles = tw.adjacency.face_adjacency_angles(vertices, faces, face_adjacency=adjacency)

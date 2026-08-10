@@ -660,7 +660,9 @@ def sample_volume(
     if count == 0:
         return wp.empty(0, dtype=wp.vec3, device=vertices.device)
 
-    if not tw.validation.is_edge_manifold(faces, allow_boundary_edges=False):
+    if not tw.validation.is_edge_manifold(
+        faces, allow_boundary_edges=False, n_vertices=int(vertices.shape[0])
+    ):
         raise ValueError(
             "mesh is not watertight; tetrahedral decomposition requires a closed surface"
         )

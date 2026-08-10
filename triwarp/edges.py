@@ -381,4 +381,4 @@ def mean_unique_edge_length(vertices: wp.array[wp.vec3], faces: wp.array[wp.int3
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return 0.0
-    return tw.reduce.mean(edges_unique_length(vertices, faces))
+    return tw.reduce.mean(edges_unique_length(vertices, faces, n_vertices=int(vertices.shape[0])))
