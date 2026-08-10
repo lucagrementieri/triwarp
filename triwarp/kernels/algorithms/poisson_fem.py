@@ -25,7 +25,7 @@ def world_to_index(p: wp.vec3, lower: wp.vec3, scale: wp.float32) -> wp.vec3:
 
 @wp.func
 def refinement_oracle(
-    xyz: wp.vec3, grid: wp.uint64, pts: wp.array(dtype=wp.vec3), r: wp.float32, falloff: wp.float32
+    xyz: wp.vec3, grid: wp.uint64, pts: wp.array[wp.vec3], r: wp.float32, falloff: wp.float32
 ):
     # NB: no return annotation — fem.ImplicitField builds its argument struct from this function's
     # annotations and rejects a "return" entry (matching warp's own refinement-field examples).
@@ -56,7 +56,7 @@ def screening_form(s: fem.Sample, u: fem.Field, v: fem.Field, screen: float):
 
 
 @fem.integrand
-def source_form(s: fem.Sample, v: fem.Field, normals: wp.array(dtype=wp.vec3)):
+def source_form(s: fem.Sample, v: fem.Field, normals: wp.array[wp.vec3]):
     # Right-hand side ``integral(V . grad(v))`` as point sources over a PicQuadrature; the
     # quadrature measures carry the per-sample weight, so ``normals`` are unit directions.
     return wp.dot(normals[s.qp_index], fem.grad(v, s))
@@ -67,8 +67,8 @@ def sample_field(
     s: fem.Sample,
     domain: fem.Domain,
     u: fem.Field,
-    positions: wp.array(dtype=wp.vec3),
-    out_values: wp.array(dtype=wp.float32),
+    positions: wp.array[wp.vec3],
+    out_values: wp.array[wp.float32],
 ):
     # Evaluate the solved field at arbitrary index-space positions via point location.
     i = s.qp_index
@@ -79,7 +79,7 @@ def sample_field(
 
 @wp.kernel(enable_backward=False)
 def lattice_positions(
-    step: wp.float32, res: wp.int32, hi: wp.float32, out_positions: wp.array(dtype=wp.vec3)
+    step: wp.float32, res: wp.int32, hi: wp.float32, out_positions: wp.array[wp.vec3]
 ) -> None:
     # Index-space positions of the dense ``res**3`` extraction lattice, row-major ``(i, j, k)``.
     # Coordinates are clamped a hair inside ``[0, hi]`` so the outermost lattice planes still land

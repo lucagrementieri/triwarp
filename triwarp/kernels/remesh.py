@@ -659,10 +659,10 @@ CORNER_VERTEX = wp.constant(wp.int32(2))
 
 @wp.kernel
 def scatter_feature_endpoint_counts(
-    adjacency_edges: wp.array2d(dtype=wp.int32),
-    angles: wp.array(dtype=wp.float32),
+    adjacency_edges: wp.array2d[wp.int32],
+    angles: wp.array[wp.float32],
     feature_angle: wp.float32,
-    out_count: wp.array(dtype=wp.int32),
+    out_count: wp.array[wp.int32],
 ) -> None:
     # Add 1 to both endpoints of every interior edge sharper than feature_angle.
     k = int(wp.tid())
@@ -685,7 +685,7 @@ def finalize_vertex_codes(feature_count: wp.int32) -> wp.int32:
 
 @wp.func
 def csr_common_neighbor_count(
-    offsets: wp.array(dtype=wp.int32), columns: wp.array(dtype=wp.int32), a: wp.int32, b: wp.int32
+    offsets: wp.array[wp.int32], columns: wp.array[wp.int32], a: wp.int32, b: wp.int32
 ) -> wp.int32:
     # Number of vertices adjacent to both a and b (two nested scans; degrees are tiny).
     count = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
@@ -699,18 +699,18 @@ def csr_common_neighbor_count(
 
 @wp.kernel(enable_backward=False)
 def collapse_candidates(
-    unique_edges: wp.array2d(dtype=wp.int32),
-    lengths: wp.array(dtype=wp.float32),
-    vertices: wp.array(dtype=wp.vec3),
-    codes: wp.array(dtype=wp.int32),
-    edge_face_count: wp.array(dtype=wp.int32),
-    offsets: wp.array(dtype=wp.int32),
-    columns: wp.array(dtype=wp.int32),
+    unique_edges: wp.array2d[wp.int32],
+    lengths: wp.array[wp.float32],
+    vertices: wp.array[wp.vec3],
+    codes: wp.array[wp.int32],
+    edge_face_count: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
     low: wp.float32,
     high: wp.float32,
-    out_survivor: wp.array(dtype=wp.int32),
-    out_removed: wp.array(dtype=wp.int32),
-    out_pos: wp.array(dtype=wp.vec3),
+    out_survivor: wp.array[wp.int32],
+    out_removed: wp.array[wp.int32],
+    out_pos: wp.array[wp.vec3],
 ) -> None:
     k = int(wp.tid())
     out_survivor[k] = -1
@@ -768,11 +768,11 @@ def collapse_candidates(
 
 @wp.kernel(enable_backward=False)
 def claim_collapses(
-    survivor: wp.array(dtype=wp.int32),
-    removed: wp.array(dtype=wp.int32),
-    offsets: wp.array(dtype=wp.int32),
-    columns: wp.array(dtype=wp.int32),
-    out_claim: wp.array(dtype=wp.int32),
+    survivor: wp.array[wp.int32],
+    removed: wp.array[wp.int32],
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    out_claim: wp.array[wp.int32],
 ) -> None:
     # Lock the full closed 1-ring of both endpoints (min edge id wins), so committed
     # collapses have disjoint neighbourhoods and stay independent.
@@ -792,15 +792,15 @@ def claim_collapses(
 
 @wp.kernel(enable_backward=False)
 def commit_collapses(
-    survivor: wp.array(dtype=wp.int32),
-    removed: wp.array(dtype=wp.int32),
-    pos: wp.array(dtype=wp.vec3),
-    offsets: wp.array(dtype=wp.int32),
-    columns: wp.array(dtype=wp.int32),
-    claim: wp.array(dtype=wp.int32),
-    out_remap: wp.array(dtype=wp.int32),
-    out_positions: wp.array(dtype=wp.vec3),
-    out_count: wp.array(dtype=wp.int32),
+    survivor: wp.array[wp.int32],
+    removed: wp.array[wp.int32],
+    pos: wp.array[wp.vec3],
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    claim: wp.array[wp.int32],
+    out_remap: wp.array[wp.int32],
+    out_positions: wp.array[wp.vec3],
+    out_count: wp.array[wp.int32],
 ) -> None:
     k = int(wp.tid())
     s = survivor[k]
@@ -916,10 +916,10 @@ def valence_flip_candidates(
 
 @wp.kernel
 def accumulate_one_ring(
-    unique_edges: wp.array2d(dtype=wp.int32),
-    vertices: wp.array(dtype=wp.vec3),
-    out_sum: wp.array(dtype=wp.vec3),
-    out_degree: wp.array(dtype=wp.int32),
+    unique_edges: wp.array2d[wp.int32],
+    vertices: wp.array[wp.vec3],
+    out_sum: wp.array[wp.vec3],
+    out_degree: wp.array[wp.int32],
 ) -> None:
     # Unweighted one-ring centroid. Note this is *not* the area-equalizing relaxation that
     # Botsch-Kobbelt specify: on a regular graded grid every vertex already sits at the plain

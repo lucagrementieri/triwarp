@@ -1,7 +1,7 @@
 """
 Static scan of the public API's shape: names, summaries, file layout and module boundaries.
 
-Thirteen conventions the package holds to, each one a defect class that was actually found rather
+Fourteen conventions the package holds to, each one a defect class that was actually found rather
 than an aesthetic preference. They are checked by an ``ast`` scan of ``triwarp/`` (excluding
 ``kernels/``, ``__init__.py`` and private ``_*.py`` modules) plus a listing of ``tests/`` and
 ``benchmarks/``, and [`tests/test_api_conventions.py`](test_api_conventions.py) fails the default
@@ -56,6 +56,12 @@ test run on any violation:
     wearing the prefix, and two argument classes the convention had no spelling for -- in-place
     arguments and scratch / persistent-state buffers, now exempted in section 3 and carried here
     as ``_KERNEL_OUTPUT_ALLOWLIST``.
+14. **An array annotation is subscript-style** -- ``wp.array[T]``, not the pre-1.12
+    ``wp.array(dtype=T)`` (``.claude/CLAUDE.md`` section 2). Both forms work, so the old one simply
+    accumulated: 176 annotations against 1 644, all of them in the three newest large kernel
+    modules, and one file carrying both. Restricted to *annotation* positions, which is what lets
+    it scan the whole package -- ``wp.array(dtype=T)`` is a legal allocation expression at Python
+    scope and only an annotation makes it the stale spelling.
 
 Why a static scan rather than importing ``triwarp``
 ---------------------------------------------------
@@ -989,4 +995,54 @@ def kernel_output_naming_problems() -> list[str]:
         for name in sorted(names)
         if (key, name) not in seen
     )
+    return problems
+
+
+# --- check 14 -----------------------------------------------------------------------------------
+
+
+def _annotations(tree: ast.Module) -> list[ast.expr]:
+    """Every annotation expression in a module: parameters, returns, and annotated assignments."""
+    found: list[ast.expr] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            arguments = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+            found.extend(arg.annotation for arg in arguments if arg.annotation is not None)
+            if node.returns is not None:
+                found.append(node.returns)
+        elif isinstance(node, ast.AnnAssign):
+            found.append(node.annotation)
+    return found
+
+
+def array_annotation_style_problems() -> list[str]:
+    """
+    Check 14: an array annotation spelled ``wp.array(dtype=T)`` rather than ``wp.array[T]``.
+
+    ``.claude/CLAUDE.md`` section 2's subscript style, restricted to *annotation* positions so the
+    scan can cover the whole package: at Python scope ``wp.array(dtype=T)`` is also a legal
+    allocation expression, and only in an annotation is it the pre-1.12 spelling.
+
+    Both forms work, which is why the old one survived in the three newest large kernel modules
+    (``algorithms/ball_pivoting.py``, ``reconstruction.py``, ``remesh.py``) long after the
+    convention settled -- 176 annotations against 1 644 in the current style, and ``remesh.py``
+    mixed the two inside one file, which is the state that leaves a reader unsure which is current.
+    """
+    problems: list[str] = []
+    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue  # test_package_scan_is_discoverable reports the parse failure
+        for annotation in _annotations(tree):
+            for node in ast.walk(annotation):
+                if not isinstance(node, ast.Call):
+                    continue
+                target = ".".join(_dotted(node.func))
+                if target.startswith(("wp.array", "warp.array")):
+                    problems.append(
+                        f"{path.relative_to(_REPO_ROOT)}:{node.lineno} annotation "
+                        f"'{ast.unparse(node)}' uses the pre-1.12 call style -- write it as "
+                        f"{target}[...] instead"
+                    )
     return problems

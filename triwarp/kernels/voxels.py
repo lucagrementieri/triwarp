@@ -16,7 +16,8 @@ import warp as wp
 from triwarp.constants import INT32_MAX_CONSTANT
 from triwarp.kernels.algorithms.connected_components import ecl_hook_edge, find_representative
 from triwarp.kernels.array import binary_search_index
-from triwarp.kernels.intersection import triangle_aabb, triangle_aabb_overlap
+from triwarp.kernels.intersection import triangle_aabb_overlap
+from triwarp.kernels.predicates import triangle_aabb
 
 # ---------------------------------------------------------------------------------------------
 # Voxelization

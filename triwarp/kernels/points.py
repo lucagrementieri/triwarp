@@ -2,7 +2,7 @@ import warp as wp
 
 from triwarp.constants import TILE_1D
 from triwarp.kernels.intersection import point_plane_dot
-from triwarp.kernels.reduce import outer_sum_tile
+from triwarp.kernels.reduce import outer_sum_chunk
 
 
 @wp.func
@@ -36,7 +36,7 @@ def centered_covariance(
     if remaining <= 0:
         return
 
-    m = outer_sum_tile(points, center[0], offset, remaining)
+    m = outer_sum_chunk(points, center[0], offset, remaining)
 
     if t == 0:
         wp.atomic_add(out_cov, 0, m)

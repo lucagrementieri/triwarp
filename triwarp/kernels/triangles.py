@@ -4,7 +4,7 @@ import warp as wp
 
 from triwarp.constants import PI, TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.array import to_vec3d
-from triwarp.kernels.predicates import triangle_aspect_ratio
+from triwarp.kernels.predicates import triangle_aspect_ratio, triangle_double_area
 
 # ``face_quality`` metric selectors. Passed as a warp-uniform kernel argument so all four share one
 # compiled module (a ``wp.Function`` cannot be a kernel argument -- see AGENTS.md section 4).
@@ -173,7 +173,7 @@ def triangle_quality(a: Any, b: Any, c: Any, metric: wp.int32) -> wp.Float:
         return triangle_area_max_side(a, b, c)
     if metric == QUALITY_MEAN_RATIO:
         return triangle_mean_ratio(a, b, c)
-    return type(a[0])(0.5) * wp.length(wp.cross(b - a, c - a))
+    return type(a[0])(0.5) * triangle_double_area(a, b, c)
 
 
 @wp.kernel

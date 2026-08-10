@@ -517,9 +517,13 @@ def weighted_sum1d_tiled(
 
 
 @wp.func
-def outer_sum_tile(
+def outer_sum_chunk(
     points: wp.array[wp.vec3], center: wp.vec3, offset: int, remaining: int
 ) -> wp.mat33:
+    # ``_chunk``, not ``_tile``: unlike its ``weighted_sum1d_tile`` / ``sum_vec3_tile`` siblings
+    # this walks the chunk with a plain loop and uses no tile primitive, so every lane of the
+    # block recomputes the same matrix and only lane 0's copy is accumulated. The name says so
+    # rather than promising a cooperative reduction that is not here.
     count = wp.min(remaining, TILE_1D)
     # M = sum_k outer(x_k, x_k) where x_k = points[k] - center
     m = wp.mat33(0.0)

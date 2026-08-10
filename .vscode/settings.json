@@ -14,4 +14,9 @@
     ],
     "python.testing.unittestEnabled": false,
     "python.testing.pytestEnabled": true,
+    "git.repositoryScanIgnoredFolders": [
+        "node_modules",
+        "reference"
+    ],
+    "git.autoRepositoryDetection": false,
 }

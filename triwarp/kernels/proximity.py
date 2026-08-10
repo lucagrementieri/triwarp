@@ -151,6 +151,35 @@ def contains_points_sign_parity(
     out_contains[tid] = query.result and query.sign < wp.float32(0.0)
 
 
+@wp.func
+def signed_distance_from_query(
+    mesh_id: wp.uint64,
+    p: wp.vec3,
+    result: wp.bool,
+    face: wp.int32,
+    u: wp.float32,
+    v: wp.float32,
+    sign: wp.float32,
+    max_dist: wp.float32,
+) -> wp.float32:
+    # Closest-point evaluation and signing shared by both signed-distance kernels: a miss reports
+    # the cutoff, a point inside the merge tolerance of the surface stays positive (the sign is not
+    # meaningful there), and everything else takes the sign the query returned.
+    #
+    # The query struct itself cannot be the parameter -- ``mesh_query_point_sign_parity`` and
+    # ``mesh_query_point_sign_winding_number`` return different types -- so the fields the tail
+    # reads are passed individually. The two *heads* stay separate kernels on purpose: their
+    # builtins take different parameters and the winding one carries a precondition its caller
+    # chose, which a runtime selector would hide.
+    if not result:
+        return max_dist
+    closest = wp.mesh_eval_position(mesh_id, face, u, v)
+    dist = wp.length(p - closest)
+    if dist <= TOLERANCE_MERGE_CONSTANT:
+        return dist
+    return sign * dist
+
+
 @wp.kernel
 def signed_distance_on_mesh(
     mesh_id: wp.uint64,
@@ -163,15 +192,9 @@ def signed_distance_on_mesh(
     tid = wp.tid()
     p = points[tid]
     query = wp.mesh_query_point_sign_parity(mesh_id, p, max_dist, n_sample, perturbation_scale)
-    if not query.result:
-        out_distance[tid] = max_dist
-        return
-    closest = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
-    dist = wp.length(p - closest)
-    if dist <= TOLERANCE_MERGE_CONSTANT:
-        out_distance[tid] = dist
-    else:
-        out_distance[tid] = query.sign * dist
+    out_distance[tid] = signed_distance_from_query(
+        mesh_id, p, query.result, query.face, query.u, query.v, query.sign, max_dist
+    )
 
 
 @wp.kernel
@@ -183,23 +206,18 @@ def signed_distance_on_mesh_winding(
     winding_threshold: wp.float32,
     out_distance: wp.array[wp.float32],
 ) -> None:
-    # Same closest-point / tolerance-band handling as ``signed_distance_on_mesh``; only the sign
-    # differs. ``mesh_id`` MUST come from a ``wp.Mesh`` built with ``support_winding_number=True``
-    # -- otherwise this builtin silently falls back to ray parity (warp/native/mesh.h:1348).
+    # Only the sign differs from ``signed_distance_on_mesh``; the closest-point and tolerance-band
+    # handling is the shared ``signed_distance_from_query``. ``mesh_id`` MUST come from a
+    # ``wp.Mesh`` built with ``support_winding_number=True`` -- otherwise this builtin silently
+    # falls back to ray parity (warp/native/mesh.h:1348).
     tid = wp.tid()
     p = points[tid]
     query = wp.mesh_query_point_sign_winding_number(
         mesh_id, p, max_dist, accuracy, winding_threshold
     )
-    if not query.result:
-        out_distance[tid] = max_dist
-        return
-    closest = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
-    dist = wp.length(p - closest)
-    if dist <= TOLERANCE_MERGE_CONSTANT:
-        out_distance[tid] = dist
-    else:
-        out_distance[tid] = query.sign * dist
+    out_distance[tid] = signed_distance_from_query(
+        mesh_id, p, query.result, query.face, query.u, query.v, query.sign, max_dist
+    )
 
 
 @wp.kernel

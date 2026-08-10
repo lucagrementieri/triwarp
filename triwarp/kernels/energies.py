@@ -4,6 +4,7 @@ import warp as wp
 
 from triwarp.kernels.array import to_vec3d
 from triwarp.kernels.halfedge import halfedge_destination
+from triwarp.kernels.predicates import triangle_double_area
 from triwarp.kernels.triangles import face_vertices_vec3d
 
 TWO_PI_F64 = wp.constant(wp.float64(2.0 * math.pi))
@@ -108,7 +109,7 @@ def voronoi_mass(
     l2_0 = wp.length_sq(v1 - v2)
     l2_1 = wp.length_sq(v2 - v0)
     l2_2 = wp.length_sq(v0 - v1)
-    dbl_area = wp.length(wp.cross(v1 - v0, v2 - v0))
+    dbl_area = triangle_double_area(v0, v1, v2)
     if dbl_area <= wp.float64(0.0):
         return
     l0 = wp.sqrt(l2_0)
@@ -310,7 +311,7 @@ def cr_gradient_rows(
         eij = wp.length_sq(vi - vj)
         ejk = wp.length_sq(vj - vk)
         eki = wp.length_sq(vk - vi)
-        dbl_area = wp.length(wp.cross(vj - vi, vk - vi))
+        dbl_area = triangle_double_area(vi, vj, vk)
         sqrt_eij = wp.sqrt(eij)
         if dbl_area <= wp.float64(0.0) or sqrt_eij <= wp.float64(0.0):
             continue
@@ -402,7 +403,7 @@ def curved_hessian_triplets(
     zero = wp.float64(0.0)
     base_out = f * 144
     v0, v1, v2 = face_vertices_vec3d(vertices, faces, wp.int32(f))
-    dbl_area = wp.length(wp.cross(v1 - v0, v2 - v0))
+    dbl_area = triangle_double_area(v0, v1, v2)
     if dbl_area <= zero:
         for empty in range(144):
             out_rows[base_out + empty] = 0
@@ -517,7 +518,7 @@ def crouzeix_raviart_mass_diag(
     # ``igl::cr_vector_mass``'s.
     f = int(wp.tid())
     v0, v1, v2 = face_vertices_vec3d(vertices, faces, wp.int32(f))
-    third = type(out_mass[0])(wp.length(wp.cross(v1 - v0, v2 - v0)) / wp.float64(6.0))
+    third = type(out_mass[0])(triangle_double_area(v0, v1, v2) / wp.float64(6.0))
     wp.atomic_add(out_mass, inverse[f * 3 + 0], third)
     wp.atomic_add(out_mass, inverse[f * 3 + 1], third)
     wp.atomic_add(out_mass, inverse[f * 3 + 2], third)

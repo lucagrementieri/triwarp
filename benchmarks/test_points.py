@@ -5,8 +5,8 @@ The point cloud is a registry mesh's own vertices — deterministic, and it scal
 functions here fall into two groups:
 
 * **Tiled reductions** — ``fit_line`` and ``fit_plane`` accumulate a 3x3 scatter matrix with
-  ``outer_sum_tile`` and finish with a single-thread ``wp.svd3``. Both end in a host readback of the
-  resulting axis / normal, so the numbers include one synchronisation by construction.
+  ``outer_sum_chunk`` and finish with a single-thread ``wp.svd3``. Both end in a host readback of
+  the resulting axis / normal, so the numbers include one synchronisation by construction.
 * **Element-wise maps and sorts** — ``point_plane_distance`` and ``vector_angle`` are one
   ``wp.map`` each (the cheapest thing in this module, so they are the most sensitive to launch
   overhead), and ``radial_sort`` is a key kernel plus a radix sort.

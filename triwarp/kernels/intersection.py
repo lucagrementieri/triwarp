@@ -3,6 +3,7 @@ import warp as wp
 from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import triangles as kernel_triangles
+from triwarp.kernels.predicates import triangle_aabb
 
 SLICE_SIGN_INSIDE = wp.constant(wp.int32(-1))
 SLICE_SIGN_OUTSIDE = wp.constant(wp.int32(1))
@@ -205,12 +206,6 @@ def intersection_line_coordinate(
     numerator = offset_minors[i]
     denominator = minors[i]
     return numerator / denominator
-
-
-@wp.func
-def triangle_aabb(v0: wp.vec3, v1: wp.vec3, v2: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
-    # wp.min / wp.max on vectors are element-wise.
-    return wp.min(v0, wp.min(v1, v2)), wp.max(v0, wp.max(v1, v2))
 
 
 @wp.func

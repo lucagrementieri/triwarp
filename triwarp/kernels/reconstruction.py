@@ -62,7 +62,7 @@ def tris_angle_profit(
 
 
 @wp.func
-def cycle_next(nbr: wp.array(dtype=wp.int32), m: wp.int32, i: wp.int32) -> wp.int32:
+def cycle_next(nbr: wp.array[wp.int32], m: wp.int32, i: wp.int32) -> wp.int32:
     j = i
     for _ in range(m):
         j = j + 1
@@ -74,7 +74,7 @@ def cycle_next(nbr: wp.array(dtype=wp.int32), m: wp.int32, i: wp.int32) -> wp.in
 
 
 @wp.func
-def cycle_prev(nbr: wp.array(dtype=wp.int32), m: wp.int32, i: wp.int32) -> wp.int32:
+def cycle_prev(nbr: wp.array[wp.int32], m: wp.int32, i: wp.int32) -> wp.int32:
     j = i
     for _ in range(m):
         j = j - 1
@@ -96,10 +96,10 @@ def edge_removal_weight(
     border: wp.int32,
     crit_angle: wp.float32,
     normalizer_sq: wp.float32,
-    nbr: wp.array(dtype=wp.int32),
-    ang: wp.array(dtype=wp.float32),
-    points: wp.array(dtype=wp.vec3),
-    normals: wp.array(dtype=wp.vec3),
+    nbr: wp.array[wp.int32],
+    ang: wp.array[wp.float32],
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
 ) -> wp.vec2:
     # Returns (weight, stable) with stable encoded as result[1] > 0.5.
     stable = wp.vec2(0.0, 1.0)
@@ -201,15 +201,15 @@ def edge_removal_weight(
 # --------------------------------------------------------------------------------------
 @wp.kernel(enable_backward=False)
 def build_local_triangulations(
-    points: wp.array(dtype=wp.vec3),
-    normals: wp.array(dtype=wp.vec3),
-    neighbor_idx: wp.array2d(dtype=wp.int32),
-    neighbor_dist: wp.array2d(dtype=wp.float32),
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    neighbor_idx: wp.array2d[wp.int32],
+    neighbor_dist: wp.array2d[wp.float32],
     radius: wp.float32,
     crit_angle: wp.float32,
     boundary_angle: wp.float32,
-    out_tris: wp.array3d(dtype=wp.int32),
-    out_valid: wp.array2d(dtype=wp.bool),
+    out_tris: wp.array3d[wp.int32],
+    out_valid: wp.array2d[wp.bool],
 ) -> None:
     v = int(wp.tid())
     k = neighbor_idx.shape[1]
@@ -351,9 +351,7 @@ def build_local_triangulations(
 # Canonical (sorted) triangle key + oriented copy, for repeated-triangle dedup
 # --------------------------------------------------------------------------------------
 @wp.kernel
-def canonicalize_triangles(
-    tris: wp.array2d(dtype=wp.int32), out_sorted: wp.array2d(dtype=wp.int32)
-) -> None:
+def canonicalize_triangles(tris: wp.array2d[wp.int32], out_sorted: wp.array2d[wp.int32]) -> None:
     t = int(wp.tid())
     # sort the three indices ascending (unoriented key)
     i, j, k = sort3(tris[t, 0], tris[t, 1], tris[t, 2])
@@ -385,7 +383,7 @@ def poisson_grid_index(i: wp.int32, j: wp.int32, k: wp.int32, res: wp.int32) -> 
 
 @wp.func
 def poisson_sample_grid(
-    field: wp.array(dtype=wp.float32), res: wp.int32, gx: wp.float32, gy: wp.float32, gz: wp.float32
+    field: wp.array[wp.float32], res: wp.int32, gx: wp.float32, gy: wp.float32, gz: wp.float32
 ) -> wp.float32:
     # Trilinear interpolation of ``field`` at grid coordinate (gx, gy, gz) in [0, res - 1].
     # Clamp the base cell so the (i0 + 1, j0 + 1, k0 + 1) corner reads stay in range.
@@ -414,16 +412,16 @@ def poisson_sample_grid(
 
 @wp.kernel(enable_backward=False)
 def splat_normals(
-    points: wp.array(dtype=wp.vec3),
-    normals: wp.array(dtype=wp.vec3),
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
     cube_lower: wp.vec3,
     inv_cell: wp.float32,
     res: wp.int32,
     confidence: wp.int32,
-    out_vx: wp.array(dtype=wp.float32),
-    out_vy: wp.array(dtype=wp.float32),
-    out_vz: wp.array(dtype=wp.float32),
-    out_w: wp.array(dtype=wp.float32),
+    out_vx: wp.array[wp.float32],
+    out_vy: wp.array[wp.float32],
+    out_vz: wp.array[wp.float32],
+    out_w: wp.array[wp.float32],
 ) -> None:
     s = int(wp.tid())
     n = normals[s]
@@ -459,10 +457,10 @@ def splat_normals(
 
 @wp.kernel(enable_backward=False)
 def normalize_vector_field(
-    weights: wp.array(dtype=wp.float32),
-    out_vx: wp.array(dtype=wp.float32),
-    out_vy: wp.array(dtype=wp.float32),
-    out_vz: wp.array(dtype=wp.float32),
+    weights: wp.array[wp.float32],
+    out_vx: wp.array[wp.float32],
+    out_vy: wp.array[wp.float32],
+    out_vz: wp.array[wp.float32],
 ) -> None:
     idx = int(wp.tid())
     inv = 1.0 / wp.max(weights[idx], POISSON_WEIGHT_EPS)
@@ -473,11 +471,11 @@ def normalize_vector_field(
 
 @wp.kernel(enable_backward=False)
 def negative_divergence(
-    vx: wp.array(dtype=wp.float32),
-    vy: wp.array(dtype=wp.float32),
-    vz: wp.array(dtype=wp.float32),
+    vx: wp.array[wp.float32],
+    vy: wp.array[wp.float32],
+    vz: wp.array[wp.float32],
     res: wp.int32,
-    out_b: wp.array(dtype=wp.float32),
+    out_b: wp.array[wp.float32],
 ) -> None:
     i, j, k = wp.tid()
     # Central differences in index space; one-sided at the grid boundary (denominator 1 there).
@@ -501,14 +499,14 @@ def negative_divergence(
 
 @wp.kernel(enable_backward=False)
 def screened_laplacian_matvec(
-    x: wp.array(dtype=wp.float32),
-    y: wp.array(dtype=wp.float32),
-    weights: wp.array(dtype=wp.float32),
+    x: wp.array[wp.float32],
+    y: wp.array[wp.float32],
+    weights: wp.array[wp.float32],
     screen: wp.float32,
     alpha: wp.float32,
     beta: wp.float32,
     res: wp.int32,
-    out_z: wp.array(dtype=wp.float32),
+    out_z: wp.array[wp.float32],
 ) -> None:
     # z = alpha * (A @ x) + beta * y, with A = L_N + screen * diag(W).
     i, j, k = wp.tid()
@@ -540,10 +538,10 @@ def screened_laplacian_matvec(
 
 @wp.kernel(enable_backward=False)
 def screened_inverse_diagonal(
-    weights: wp.array(dtype=wp.float32),
+    weights: wp.array[wp.float32],
     screen: wp.float32,
     res: wp.int32,
-    out_inv_diag: wp.array(dtype=wp.float32),
+    out_inv_diag: wp.array[wp.float32],
 ) -> None:
     i, j, k = wp.tid()
     idx = poisson_grid_index(i, j, k, res)
@@ -578,10 +576,7 @@ def diagonal_precond_axpby(
 
 @wp.kernel(enable_backward=False)
 def prolong_grid(
-    coarse: wp.array(dtype=wp.float32),
-    res_c: wp.int32,
-    res_f: wp.int32,
-    out_fine: wp.array(dtype=wp.float32),
+    coarse: wp.array[wp.float32], res_c: wp.int32, res_f: wp.int32, out_fine: wp.array[wp.float32]
 ) -> None:
     # Trilinear factor-2 prolongation: res_f - 1 == 2 * (res_c - 1), so fine node i sits at
     # coarse coordinate i / 2.
@@ -592,12 +587,12 @@ def prolong_grid(
 
 @wp.kernel(enable_backward=False)
 def sample_field_trilinear(
-    field: wp.array(dtype=wp.float32),
+    field: wp.array[wp.float32],
     res: wp.int32,
     cube_lower: wp.vec3,
     inv_cell: wp.float32,
-    points: wp.array(dtype=wp.vec3),
-    out_values: wp.array(dtype=wp.float32),
+    points: wp.array[wp.vec3],
+    out_values: wp.array[wp.float32],
 ) -> None:
     s = int(wp.tid())
     g = (points[s] - cube_lower) * inv_cell

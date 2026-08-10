@@ -137,7 +137,7 @@ def is_compatible(
 @wp.func
 def ball_is_empty(
     grid_id: wp.uint64,
-    points: wp.array(dtype=wp.vec3),
+    points: wp.array[wp.vec3],
     center: wp.vec3,
     radius: wp.float32,
     a: wp.int32,
@@ -156,7 +156,7 @@ def ball_is_empty(
 
 
 @wp.kernel(enable_backward=False)
-def begin_wave(counters: wp.array(dtype=wp.int32)) -> None:
+def begin_wave(counters: wp.array[wp.int32]) -> None:
     # Reset the per-wave counters and snapshot the face count the progress test compares against.
     # The vertex claim is *not* cleared here: ``propose_triangle`` clears the three vertices it is
     # about to contend for, which is the only part of an n-sized array a wave ever reads.
@@ -173,11 +173,11 @@ def propose_triangle(
     a: wp.int32,
     b: wp.int32,
     c: wp.int32,
-    counters: wp.array(dtype=wp.int32),
-    out_owner: wp.array(dtype=wp.int32),
-    out_a: wp.array(dtype=wp.int32),
-    out_b: wp.array(dtype=wp.int32),
-    out_c: wp.array(dtype=wp.int32),
+    counters: wp.array[wp.int32],
+    out_owner: wp.array[wp.int32],
+    out_a: wp.array[wp.int32],
+    out_b: wp.array[wp.int32],
+    out_c: wp.array[wp.int32],
 ) -> None:
     # Append a candidate triangle to this wave's proposal list. Both the seed and the pivot path
     # write here, so the claim and commit kernels have a single dense list to walk.
@@ -197,17 +197,17 @@ def propose_triangle(
 
 @wp.kernel(enable_backward=False)
 def seed_triangles(
-    points: wp.array(dtype=wp.vec3),
-    normals: wp.array(dtype=wp.vec3),
-    point_used: wp.array(dtype=wp.bool),
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    point_used: wp.array[wp.bool],
     grid_id: wp.uint64,
     radius: wp.float32,
     clustering: wp.float32,
-    counters: wp.array(dtype=wp.int32),
-    out_owner: wp.array(dtype=wp.int32),
-    out_a: wp.array(dtype=wp.int32),
-    out_b: wp.array(dtype=wp.int32),
-    out_c: wp.array(dtype=wp.int32),
+    counters: wp.array[wp.int32],
+    out_owner: wp.array[wp.int32],
+    out_a: wp.array[wp.int32],
+    out_b: wp.array[wp.int32],
+    out_c: wp.array[wp.int32],
 ) -> None:
     if counters[CNT_CONTINUE] == 0 or counters[CNT_SEEDING] == 0:
         return
@@ -254,7 +254,7 @@ def seed_triangles(
 
 @wp.func
 def point_is_available(
-    p: wp.int32, point_used: wp.array(dtype=wp.bool), boundary_degree: wp.array(dtype=wp.int32)
+    p: wp.int32, point_used: wp.array[wp.bool], boundary_degree: wp.array[wp.int32]
 ) -> bool:
     # Orphan, or still on the advancing front. A used point with no incident boundary edge is
     # fully interior and can never be pivoted onto again — which is what makes retirement sound.
@@ -266,8 +266,8 @@ def edge_is_interior(
     u: wp.int32,
     v: wp.int32,
     key_base: wp.uint64,
-    edge_key: wp.array(dtype=wp.uint64),
-    edge_count: wp.array(dtype=wp.int32),
+    edge_key: wp.array[wp.uint64],
+    edge_count: wp.array[wp.int32],
     edge_mask: wp.int32,
 ) -> bool:
     # Manifold guard: an edge already shared by two triangles may not gain a third. One hash probe,
@@ -278,7 +278,7 @@ def edge_is_interior(
 
 @wp.func
 def candidate_prefilter(
-    points: wp.array(dtype=wp.vec3),
+    points: wp.array[wp.vec3],
     p_src: wp.vec3,
     p_tgt: wp.vec3,
     src: wp.int32,
@@ -286,8 +286,8 @@ def candidate_prefilter(
     opp: wp.int32,
     c: wp.int32,
     min_cluster_sq: wp.float32,
-    point_used: wp.array(dtype=wp.bool),
-    boundary_degree: wp.array(dtype=wp.int32),
+    point_used: wp.array[wp.bool],
+    boundary_degree: wp.array[wp.int32],
 ) -> bool:
     # The cheap half of the candidate test: identity, availability and vcglib clustering. Compared
     # squared, since this runs once per point the grid hands back.
@@ -303,8 +303,8 @@ def candidate_prefilter(
 
 @wp.func
 def candidate_accepted(
-    points: wp.array(dtype=wp.vec3),
-    normals: wp.array(dtype=wp.vec3),
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
     p_src: wp.vec3,
     p_tgt: wp.vec3,
     tri_norm: wp.vec3,
@@ -316,8 +316,8 @@ def candidate_accepted(
     radius: wp.float32,
     crease_cos: wp.float32,
     key_base: wp.uint64,
-    edge_key: wp.array(dtype=wp.uint64),
-    edge_count: wp.array(dtype=wp.int32),
+    edge_key: wp.array[wp.uint64],
+    edge_count: wp.array[wp.int32],
     edge_mask: wp.int32,
 ) -> bool:
     # The expensive half: crease, manifoldness, normal compatibility and the empty-ball test, in
@@ -341,31 +341,31 @@ def candidate_accepted(
 
 @wp.kernel(enable_backward=False)
 def pivot_front_edges(
-    points: wp.array(dtype=wp.vec3),
-    normals: wp.array(dtype=wp.vec3),
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
     grid_id: wp.uint64,
     radius: wp.float32,
     clustering: wp.float32,
     crease_cos: wp.float32,
     key_base: wp.uint64,
-    edge_key: wp.array(dtype=wp.uint64),
-    edge_count: wp.array(dtype=wp.int32),
-    edge_src: wp.array(dtype=wp.int32),
-    edge_tgt: wp.array(dtype=wp.int32),
-    edge_opp: wp.array(dtype=wp.int32),
-    edge_state: wp.array(dtype=wp.int32),
-    edge_cand: wp.array(dtype=wp.int32),
+    edge_key: wp.array[wp.uint64],
+    edge_count: wp.array[wp.int32],
+    edge_src: wp.array[wp.int32],
+    edge_tgt: wp.array[wp.int32],
+    edge_opp: wp.array[wp.int32],
+    edge_state: wp.array[wp.int32],
+    edge_cand: wp.array[wp.int32],
     edge_mask: wp.int32,
-    point_used: wp.array(dtype=wp.bool),
-    boundary_degree: wp.array(dtype=wp.int32),
-    front_in: wp.array(dtype=wp.int32),
+    point_used: wp.array[wp.bool],
+    boundary_degree: wp.array[wp.int32],
+    front_in: wp.array[wp.int32],
     grid_stride: wp.int32,
-    counters: wp.array(dtype=wp.int32),
-    out_owner: wp.array(dtype=wp.int32),
-    front_out: wp.array(dtype=wp.int32),
-    out_a: wp.array(dtype=wp.int32),
-    out_b: wp.array(dtype=wp.int32),
-    out_c: wp.array(dtype=wp.int32),
+    counters: wp.array[wp.int32],
+    out_owner: wp.array[wp.int32],
+    front_out: wp.array[wp.int32],
+    out_a: wp.array[wp.int32],
+    out_b: wp.array[wp.int32],
+    out_c: wp.array[wp.int32],
 ) -> None:
     if counters[CNT_CONTINUE] == 0:
         return
@@ -487,12 +487,12 @@ def pivot_front_edges(
 
 @wp.kernel(enable_backward=False)
 def claim_triangle_vertices(
-    tri_a: wp.array(dtype=wp.int32),
-    tri_b: wp.array(dtype=wp.int32),
-    tri_c: wp.array(dtype=wp.int32),
+    tri_a: wp.array[wp.int32],
+    tri_b: wp.array[wp.int32],
+    tri_c: wp.array[wp.int32],
     grid_stride: wp.int32,
-    counters: wp.array(dtype=wp.int32),
-    out_owner: wp.array(dtype=wp.int32),
+    counters: wp.array[wp.int32],
+    out_owner: wp.array[wp.int32],
 ) -> None:
     # Priority claim (lowest index wins) on all three vertices of each proposed triangle.
     if counters[CNT_CONTINUE] == 0:
@@ -510,15 +510,15 @@ def register_face_edge(
     opp: wp.int32,
     key_base: wp.uint64,
     edge_mask: wp.int32,
-    edge_key: wp.array(dtype=wp.uint64),
-    edge_count: wp.array(dtype=wp.int32),
-    edge_src: wp.array(dtype=wp.int32),
-    edge_tgt: wp.array(dtype=wp.int32),
-    edge_opp: wp.array(dtype=wp.int32),
-    edge_cand: wp.array(dtype=wp.int32),
-    boundary_degree: wp.array(dtype=wp.int32),
-    counters: wp.array(dtype=wp.int32),
-    front_out: wp.array(dtype=wp.int32),
+    edge_key: wp.array[wp.uint64],
+    edge_count: wp.array[wp.int32],
+    edge_src: wp.array[wp.int32],
+    edge_tgt: wp.array[wp.int32],
+    edge_opp: wp.array[wp.int32],
+    edge_cand: wp.array[wp.int32],
+    boundary_degree: wp.array[wp.int32],
+    counters: wp.array[wp.int32],
+    front_out: wp.array[wp.int32],
 ) -> None:
     # Fold one edge of a just-committed triangle into the persistent state.
     #
@@ -543,25 +543,25 @@ def register_face_edge(
 
 @wp.kernel(enable_backward=False)
 def commit_triangles(
-    tri_a: wp.array(dtype=wp.int32),
-    tri_b: wp.array(dtype=wp.int32),
-    tri_c: wp.array(dtype=wp.int32),
-    owner: wp.array(dtype=wp.int32),
+    tri_a: wp.array[wp.int32],
+    tri_b: wp.array[wp.int32],
+    tri_c: wp.array[wp.int32],
+    owner: wp.array[wp.int32],
     max_faces: wp.int32,
     key_base: wp.uint64,
     edge_mask: wp.int32,
     grid_stride: wp.int32,
-    edge_key: wp.array(dtype=wp.uint64),
-    edge_count: wp.array(dtype=wp.int32),
-    edge_src: wp.array(dtype=wp.int32),
-    edge_tgt: wp.array(dtype=wp.int32),
-    edge_opp: wp.array(dtype=wp.int32),
-    edge_cand: wp.array(dtype=wp.int32),
-    point_used: wp.array(dtype=wp.bool),
-    boundary_degree: wp.array(dtype=wp.int32),
-    counters: wp.array(dtype=wp.int32),
-    front_out: wp.array(dtype=wp.int32),
-    out_faces: wp.array(dtype=wp.int32),
+    edge_key: wp.array[wp.uint64],
+    edge_count: wp.array[wp.int32],
+    edge_src: wp.array[wp.int32],
+    edge_tgt: wp.array[wp.int32],
+    edge_opp: wp.array[wp.int32],
+    edge_cand: wp.array[wp.int32],
+    point_used: wp.array[wp.bool],
+    boundary_degree: wp.array[wp.int32],
+    counters: wp.array[wp.int32],
+    front_out: wp.array[wp.int32],
+    out_faces: wp.array[wp.int32],
 ) -> None:
     # The single mutator of the persistent state: a proposal that owns all three of its vertices
     # this wave becomes a triangle, and the same thread folds it into the face buffer, the used
@@ -605,7 +605,7 @@ def commit_triangles(
 
 
 @wp.kernel(enable_backward=False)
-def end_wave(max_waves: wp.int32, counters: wp.array(dtype=wp.int32)) -> None:
+def end_wave(max_waves: wp.int32, counters: wp.array[wp.int32]) -> None:
     # Advance the device-resident wave state and decide whether the loop keeps going.
     #
     # A wave either pivots the current front or seeds orphans; seeding runs whenever the previous
@@ -633,12 +633,12 @@ def end_wave(max_waves: wp.int32, counters: wp.array(dtype=wp.int32)) -> None:
 
 @wp.kernel(enable_backward=False)
 def compact_front(
-    front_in: wp.array(dtype=wp.int32),
-    edge_count: wp.array(dtype=wp.int32),
-    edge_state: wp.array(dtype=wp.int32),
+    front_in: wp.array[wp.int32],
+    edge_count: wp.array[wp.int32],
+    edge_state: wp.array[wp.int32],
     grid_stride: wp.int32,
-    counters: wp.array(dtype=wp.int32),
-    front_out: wp.array(dtype=wp.int32),
+    counters: wp.array[wp.int32],
+    front_out: wp.array[wp.int32],
 ) -> None:
     # Drop closed and retired edges from the front. ``pivot_front_edges`` already does this as a
     # side effect, but a long run of seeding waves (which carry the front forward untouched) or a
@@ -651,21 +651,21 @@ def compact_front(
 
 @wp.kernel(enable_backward=False)
 def rehash_edges(
-    old_key: wp.array(dtype=wp.uint64),
-    old_count: wp.array(dtype=wp.int32),
-    old_src: wp.array(dtype=wp.int32),
-    old_tgt: wp.array(dtype=wp.int32),
-    old_opp: wp.array(dtype=wp.int32),
-    old_state: wp.array(dtype=wp.int32),
-    old_cand: wp.array(dtype=wp.int32),
+    old_key: wp.array[wp.uint64],
+    old_count: wp.array[wp.int32],
+    old_src: wp.array[wp.int32],
+    old_tgt: wp.array[wp.int32],
+    old_opp: wp.array[wp.int32],
+    old_state: wp.array[wp.int32],
+    old_cand: wp.array[wp.int32],
     new_mask: wp.int32,
-    new_key: wp.array(dtype=wp.uint64),
-    new_count: wp.array(dtype=wp.int32),
-    new_src: wp.array(dtype=wp.int32),
-    new_tgt: wp.array(dtype=wp.int32),
-    new_opp: wp.array(dtype=wp.int32),
-    new_state: wp.array(dtype=wp.int32),
-    new_cand: wp.array(dtype=wp.int32),
+    new_key: wp.array[wp.uint64],
+    new_count: wp.array[wp.int32],
+    new_src: wp.array[wp.int32],
+    new_tgt: wp.array[wp.int32],
+    new_opp: wp.array[wp.int32],
+    new_state: wp.array[wp.int32],
+    new_cand: wp.array[wp.int32],
 ) -> None:
     # Re-insert every occupied slot into a larger table when the triangle budget grows. Slot
     # indices change, so the caller rebuilds the front list from the new table afterwards.
@@ -685,11 +685,11 @@ def rehash_edges(
 
 @wp.kernel(enable_backward=False)
 def collect_front_from_table(
-    edge_key: wp.array(dtype=wp.uint64),
-    edge_count: wp.array(dtype=wp.int32),
-    edge_state: wp.array(dtype=wp.int32),
-    counters: wp.array(dtype=wp.int32),
-    out_front: wp.array(dtype=wp.int32),
+    edge_key: wp.array[wp.uint64],
+    edge_count: wp.array[wp.int32],
+    edge_state: wp.array[wp.int32],
+    counters: wp.array[wp.int32],
+    out_front: wp.array[wp.int32],
 ) -> None:
     # Rebuild the front list by scanning the edge table, after a rehash has moved every slot.
     h = int(wp.tid())

@@ -5,9 +5,10 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels.array import update_argmin
 from triwarp.kernels.array import wrap_index as _wrap
 from triwarp.kernels.predicates import (
-    circumcircle_diameter_sq,
+    circumcircle_diameter,
     dihedral_angle,
     triangle_aspect_ratio,
+    triangle_double_area,
 )
 
 # Big-but-finite penalty (MeshLib ``BadTriangulationMetric``): lets the DP keep a bad triangulation
@@ -105,19 +106,6 @@ def loop_centroids(
 
 
 @wp.func
-def circumcircle_diameter(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.float32:
-    # Diameter (not squared) of triangle ABC's circumcircle; +inf when degenerate, which the
-    # square root preserves.
-    return wp.sqrt(circumcircle_diameter_sq(a, b, c))
-
-
-@wp.func
-def triangle_double_area(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.float32:
-    # Twice the triangle area (MeshLib ``dblArea``); the min-area fallback metric.
-    return wp.length(wp.cross(b - a, c - a))
-
-
-@wp.func
 def min_triangle_angle_sin(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.float32:
     # sin of smallest angle = shortest edge / circumcircle diameter (MeshLib minTriangleAngleSin).
     ab = wp.length(b - a)
@@ -125,7 +113,7 @@ def min_triangle_angle_sin(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.float32:
     bc = wp.length(c - b)
     if ab <= 0.0 or ca <= 0.0 or bc <= 0.0:
         return 0.0
-    f = wp.length(wp.cross(b - a, c - a))
+    f = triangle_double_area(a, b, c)
     return f * wp.min(wp.vec3(ab, ca, bc)) / (ab * ca * bc)
 
 

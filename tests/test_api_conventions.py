@@ -1,7 +1,7 @@
 """
 The convention gate: the public API's names, summaries and file layout, checked statically.
 
-Thirteen conventions, one test each so the failing test's *name* says which one was broken. The scan
+Fourteen conventions, one test each so the failing test's *name* says which one was broken. The scan
 and the reasoning behind each rule live in [`tests/api_conventions.py`](api_conventions.py); this
 file is only the pytest surface -- with one exception, the docstring-example test, whose whole
 point is that a static read cannot find what is wrong with an example.
@@ -22,6 +22,7 @@ import triwarp as tw
 from tests.api_conventions import (
     DocstringExample,
     allocation_device_problems,
+    array_annotation_style_problems,
     coverage_location_problems,
     docstring_examples,
     duplicate_name_problems,
@@ -191,6 +192,19 @@ def test_kernel_outputs_are_named_and_placed() -> None:
     by section 3 and listed in ``_KERNEL_OUTPUT_ALLOWLIST``, which is staleness-checked.
     """
     _fail("kernel output-naming violation(s):", kernel_output_naming_problems())
+
+
+def test_array_annotations_are_subscript_style() -> None:
+    """
+    An array annotation reads ``wp.array[T]``, never the pre-1.12 ``wp.array(dtype=T)``.
+
+    ``.claude/CLAUDE.md`` section 2. Both spellings compile, so nothing but a check stops the old
+    one from coming back with the next large module: it survived in ``algorithms/ball_pivoting.py``
+    (98 of the 176), ``reconstruction.py`` and ``remesh.py`` long after the convention settled, and
+    ``remesh.py`` carried both styles at once -- which is the state that leaves a reader unsure
+    which one is current.
+    """
+    _fail("call-style array annotation(s):", array_annotation_style_problems())
 
 
 def test_public_functions_document_what_they_raise() -> None:

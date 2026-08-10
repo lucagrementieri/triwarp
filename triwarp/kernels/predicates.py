@@ -1,10 +1,16 @@
 """
-Precision-generic geometric predicates (ports of MeshLib ``MRTriMath.h`` / ``MRReducePath``).
+Precision-generic geometric predicates and the small triangle quantities they share.
 
-These were duplicated three times before this module existed: a ``float32`` set in
-``kernels/reconstruction.py``, a byte-equivalent ``float64`` set in ``kernels/remesh.py``, and a
-third partial copy in ``kernels/holes.py``. Each `@wp.func` here is generic over the scalar
-type, so one definition instantiates at whatever precision the calling kernel uses.
+Most are ports of MeshLib ``MRTriMath.h`` / ``MRReducePath``, and they were duplicated three times
+before this module existed: a ``float32`` set in ``kernels/reconstruction.py``, a byte-equivalent
+``float64`` set in ``kernels/remesh.py``, and a third partial copy in ``kernels/holes.py``. Each
+`@wp.func` here is generic over the scalar type, so one definition instantiates at whatever
+precision the calling kernel uses.
+
+The three later arrivals are the same defect one level out: ``triangle_aabb`` came from
+``kernels/intersection.py`` and ``triangle_double_area`` / ``circumcircle_diameter`` from
+``kernels/holes.py``, where a general triangle quantity had ended up inside a module that owns an
+*algorithm* and other modules were importing the algorithm to reach the geometry.
 
 Degenerate inputs return [`float_inf`][triwarp.kernels.predicates.float_inf] — an actual infinity,
 so callers detect the case with ``wp.isinf`` rather than by comparing against a magic large value.
@@ -44,6 +50,21 @@ def triangle_normal(a: Any, b: Any, c: Any):
 
 
 @wp.func
+def triangle_double_area(a: Any, b: Any, c: Any) -> wp.Float:
+    # Twice the area of triangle ABC (MeshLib ``dblArea``): the norm of the edge cross product.
+    # Kept undivided because most callers either compare it against zero or fold the half into a
+    # constant of their own.
+    return wp.length(wp.cross(b - a, c - a))
+
+
+@wp.func
+def triangle_aabb(a: Any, b: Any, c: Any):
+    # Lower and upper corners of triangle ABC's axis-aligned bounding box. ``wp.min`` / ``wp.max``
+    # on vectors are element-wise.
+    return wp.min(a, wp.min(b, c)), wp.max(a, wp.max(b, c))
+
+
+@wp.func
 def dihedral_angle(left_normal: Any, right_normal: Any, edge_vector: Any) -> wp.Float:
     # Signed angle between the two face normals about the shared edge (MeshLib ``dihedralAngle``).
     edge_direction = wp.normalize(edge_vector)
@@ -70,6 +91,13 @@ def circumcircle_diameter_sq(a: Any, b: Any, c: Any) -> wp.Float:
     if f <= zero:
         return float_inf(ab)
     return ab * ca * bc / f
+
+
+@wp.func
+def circumcircle_diameter(a: Any, b: Any, c: Any) -> wp.Float:
+    # Diameter (not squared) of triangle ABC's circumcircle; +inf when degenerate, which the
+    # square root preserves.
+    return wp.sqrt(circumcircle_diameter_sq(a, b, c))
 
 
 @wp.func

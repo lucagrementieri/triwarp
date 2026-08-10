@@ -44,7 +44,17 @@ You are an expert in NVIDIA Warp (wp). Follow all rules below when writing kerne
 ## 4. Python-Scope Wrappers
 
 - Every kernel lives in a `kernels/` sub-module. Import it with an alias: `from triwarp.kernels import triangles as kernel_triangles`.
-- **A top-level kernel module is named exactly for the public module it backs**: `triwarp/kernels/<module>.py` ↔ `triwarp/<module>.py`, one-to-one. The only admissible exceptions are the shared kernel-side libraries that back no single public module — `kernels/predicates.py` (geometric `@wp.func` predicates, imported by 12 *kernel* modules) and `kernels/scatter.py` (scatter/accumulate kernels, imported by 7 wrappers). Sub-packages (`kernels/algorithms/`, `kernels/heat/`) mirror a folder rather than a module and are exempt. Adding a kernel module with no public counterpart, or a public module whose kernels live under another name, is a defect — fix the name, do not document the exception.
+- **A top-level kernel module is named exactly for the public module it backs**: `triwarp/kernels/<module>.py` ↔ `triwarp/<module>.py`, one-to-one. The only admissible exceptions are the kernel-side libraries that back no single public module — `kernels/predicates.py` (geometric `@wp.func` predicates) and `kernels/scatter.py` (scatter/accumulate kernels). Sub-packages (`kernels/algorithms/`, `kernels/heat/`) mirror a folder rather than a module and are exempt. Adding a kernel module with no public counterpart, or a public module whose kernels live under another name, is a defect — fix the name, do not document the exception.
+- **Backing a public module and serving as a shared library are not exclusive**, and four modules do both jobs. Being imported across the tree is not a §4 violation and needs no exception; it is what these four are *for*:
+
+  | Module | Holds | Importers (measured) |
+  |---|---|---|
+  | `kernels/array.py` | index/sort/cast/search `@wp.func`s (`sort3`, `cross2`, `to_vec3d`, `binary_search_index`) | 25 kernel modules, 15 wrappers |
+  | `kernels/predicates.py` | precision-generic geometric predicates | 17 kernel modules |
+  | `kernels/triangles.py` | per-face corner/quality/gradient `@wp.func`s | 15 kernel modules, 2 wrappers |
+  | `kernels/scatter.py` | scatter/accumulate kernels | 11 wrappers |
+
+  What *is* a defect is placement: a general geometric predicate living in a module that owns an **algorithm**, so that unrelated modules import the algorithm to reach the geometry. `triangle_aabb` sat in `kernels/intersection.py` and `triangle_double_area` / `circumcircle_diameter` in `kernels/holes.py` for exactly that reason; all three are now in `predicates.py`, generic over the scalar type. When a helper is reached from a second module, ask which of the four it belongs in before adding the import.
 - Python-scope wrapper functions accept `wp.array[T]` for 1D buffers; use `twt.Array2dInt32`, `twt.Array2dFloat32`, etc. for rank-2 results (see §7).
 - For **2D** outputs, allocate with `twt.empty_int32_2d((rows, cols), device=...)` or `twt.empty_float32_2d(...)` instead of bare `wp.empty((rows, cols), ...)`.
 - For **1D** outputs, keep `wp.empty(n, dtype=..., device=input.device)` when all elements will be written by the kernel (avoid unnecessary zero-initialization).
@@ -834,7 +844,7 @@ survive the next upgrade unexamined, which is exactly the failure the check exis
   1. **Its kernels, if they are exclusively its.** A kernel referenced by only the moved function
      moves to the destination's `kernels/` module; a kernel shared with a function that stays put
      does **not** move, and the new kernel module imports it (kernel-to-kernel imports are normal —
-     `kernels/predicates.py` has 12 importers). Decide by measuring, not by reading: an AST scan of
+     `kernels/predicates.py` has 17 importers). Decide by measuring, not by reading: an AST scan of
      which wrappers reference each `kernel_<mod>.<name>` is the authority, because a kernel that
      *looks* single-purpose is often reached from a private helper in a third module.
   2. **Its tests**, into `tests/test_<destination>.py`, keeping the §11 source order.
