@@ -123,8 +123,8 @@ def oriented_box_extents(
     #
     # Strided slice rather than a contiguous chunk, and lane-free, for the same two reasons as
     # ``kernels/convex.hull_support_extremes``: consecutive threads read consecutive points so the
-    # loads coalesce, and ``wp.launch_tiled`` runs one lane per block on Warp 1.15's CPU device,
-    # which silently reduces a single point per tile.
+    # loads coalesce, and ``wp.launch_tiled`` runs one lane per block on the Warp CPU device through
+    # 1.16, so a ``wp.tile(...)`` of per-lane values reduces a single point per tile.
     k, j = wp.tid()
     n_points = int(points.shape[0])
     frame = axes[int(k)]

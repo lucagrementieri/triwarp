@@ -70,8 +70,8 @@ def k_harmonic(
     Each power is assembled by one triplet pass over matching CSR rows —
     ``(A M^-1 B)_ij = sum_t A_ti M_t^-1 B_tj`` with both operands symmetric — followed by a single
     ``bsr_from_triplets``. Deliberately **no** ``warp.sparse.bsr_mm``: the chained sparse triple
-    product is exactly the shape that reproduces its nondeterministic-output bug (Warp 1.15,
-    ``issue_report.md``).
+    product is exactly the shape that reproduces its nondeterministic-output bug (still present in
+    Warp 1.16.0, ``issue_report.md``).
 
     Parameters
     ----------

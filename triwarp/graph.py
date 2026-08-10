@@ -494,9 +494,14 @@ def bfs(
           correct round needs one of each plus a second barrier — ~600 ns of synchronization against
           the serial engine's 962 ns for the whole level. Over 20 480 levels that is a ~12 ms floor
           on the synchronization alone, so no barrier arrangement reaches even 2x.
-        - **The host is not available.** One CPU core does this in well under a millisecond, but
-          Warp 1.15's CPU backend corrupts the process heap on this stack, so a host fallback would
-          trade a slow row for a random crash.
+        - **The host is not the answer, though it is no longer unsafe.** One CPU core does this in
+          well under a millisecond. Until Warp 1.16 that was moot — the CPU backend corrupted the
+          process heap on this stack, so a host fallback traded a slow row for a random crash —
+          but the corruption is **fixed** as of 1.16.0 (the recorded ``filter_mut_dif_laplacian``
+          repro, which aborted ~60 % of the time on 1.15, ran clean in 12/12 subprocesses and in
+          5/5 long sessions interleaving Warp-CPU with igl and trimesh). What rules it out now is
+          the interface: a host walk means reading the whole CSR and the result back across the
+          bus, which is a different contract from the one this function has.
 
         The parallel engine is far worse on this shape (seven fixed-size launches per level,
         ~410 ms even under conditional-graph capture), which is why the handover exists at all.

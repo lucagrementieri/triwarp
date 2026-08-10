@@ -47,16 +47,17 @@ TILE_2D = 8
 # there is unobservable, while the 30 us it gives up at 14M is not.
 #
 # The CPU device pays for it, and the ratio is recorded here rather than left to be rediscovered:
-# ``wp.launch_tiled`` runs one lane per block there, so folding 16 tiles means 16x fewer blocks and
-# correspondingly less parallelism -- measured **1.28x slower at 36k, 1.07x at 438k, 1.02x at 14M**.
+# ``wp.launch_tiled`` runs one lane per block there (through 1.16), so folding 16 tiles means 16x
+# fewer blocks and correspondingly less parallelism -- measured **1.28x slower at 36k, 1.07x at
+# 438k, 1.02x at 14M**.
 # Accepted on the CUDA number per CLAUDE.md section 13: the loss is bounded, shrinks with size, and
 # is at its worst exactly where the host floor already hides it.
 TILES_PER_BLOCK_1D = 16
 
 # Elements reduced per thread by the *lane-free* reductions -- those whose body must stay correct on
-# the CPU device, where ``wp.launch_tiled`` runs exactly one lane per block (Warp 1.15) and any
-# lane-parallel body silently reduces a single element per tile. Each thread walks a strided slice
-# of its input and commits one atomic, so this trades launch width against atomic traffic.
+# the CPU device, where ``wp.launch_tiled`` runs exactly one lane per block (through Warp 1.16) and
+# any lane-parallel body silently reduces a single element per tile. Each thread walks a strided
+# slice of its input and commits one atomic, so this trades launch width against atomic traffic.
 #
 # The optimum splits by device, so there are two values and
 # [`items_per_slice`][triwarp._device.items_per_slice] picks between them; do not read either

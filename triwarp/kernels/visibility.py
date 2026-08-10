@@ -172,8 +172,8 @@ def support_argmax_tiled(
     # (query, vertex slice) strides over the vertices, reduces its own running best into a packed
     # (projection, index) key, and commits one atomic; the packed key's ordering makes atomic_max
     # the global argmax with the lowest index as tie-break. Lane-free on purpose -- the block-wide
-    # `wp.tile_max` this replaces reduced a single lane on Warp 1.15's CPU backend, where
-    # `wp.launch_tiled` runs one lane per block.
+    # `wp.tile_max(wp.tile(...))` this replaces reduced a single lane on the Warp CPU backend, where
+    # `wp.launch_tiled` runs one lane per block through 1.16.
     q, j = wp.tid()
     normal = normals[support_indices[int(q)]]
     best = wp.float32(-wp.inf)

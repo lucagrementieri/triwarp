@@ -35,9 +35,9 @@ def hull_support_extremes(
     # loads coalesce, and each thread contributes one atomic instead of one per point.
     #
     # A block-wide `wp.tile_max(wp.tile(...))` reduction would be the natural fit here and was what
-    # this kernel used, but `wp.launch_tiled` runs exactly ONE lane per block on Warp 1.15's CPU
-    # backend (`wp.tid()`'s lane index is always 0), so every lane-parallel formulation silently
-    # reduces over a single point per tile and returns a wrong extreme. This form is lane-free.
+    # this kernel used, but `wp.launch_tiled` runs exactly ONE lane per block on the Warp CPU
+    # backend through 1.16 (`wp.tid()`'s lane index is always 0), so a tile built from per-lane
+    # values holds one element there and returns a wrong extreme. This form is lane-free.
     local_max = float(-FLOAT32_INF_CONSTANT)
     local_min = float(FLOAT32_INF_CONSTANT)
     for i in range(int(j), n_p, int(n_slices)):
