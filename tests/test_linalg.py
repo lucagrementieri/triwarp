@@ -13,13 +13,6 @@ import triwarp.typing as twt
 from tests.conversions import trimesh_to_pymeshlab
 
 
-def _skip_on_cpu(device: str) -> None:
-    # Every solve here goes through ``warp.optim.linear.cg``, which returns NaN on the CPU device
-    # in Warp 1.14-1.15; ``triwarp.linalg`` raises NotImplementedError there.
-    if wp.get_device(device).is_cpu:
-        pytest.skip("warp.optim.linear.cg returns NaN on the CPU device in Warp 1.14-1.15.")
-
-
 def _spd_system(device: str, n: int = 64, n_rhs: int = 3, seed: int = 11):
     """Build an SPD operator with ``n_rhs`` right-hand sides, plus its NumPy form to solve."""
     rng = np.random.default_rng(seed)
@@ -50,7 +43,6 @@ def test_min_quad_with_fixed_matches_pymeshlab_harmonic_field(
     pins exactly two vertices and solves the same cotangent system directly, so pinning the same two
     to 0 and 1 makes the two answers the same field -- measured to 1.4e-8.
     """
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = icosahedron
     vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float64)
     n_vertices = vertices_np.shape[0]
@@ -92,7 +84,6 @@ def test_min_quad_with_fixed_matches_pymeshlab_harmonic_field(
 
 
 def test_solve_spd_columns_matches_numpy(device: str) -> None:
-    _skip_on_cpu(device)
     matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device)
     solution_wp = wp.zeros_like(rhs_wp)
     tw.linalg.solve_spd_columns(matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64))
@@ -105,7 +96,6 @@ def test_solve_spd_columns_check_every_is_solution_invariant(device: str, check_
     # ``check_every`` only changes how often the residual is tested (``0`` tests it on device via
     # ``wp.capture_while``), never the system being solved, so every setting converges to the same
     # answer. It is a performance knob only.
-    _skip_on_cpu(device)
     matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device)
     solution_wp = wp.zeros_like(rhs_wp)
     tw.linalg.solve_spd_columns(
@@ -117,7 +107,6 @@ def test_solve_spd_columns_check_every_is_solution_invariant(device: str, check_
 
 def test_spd_column_solver_check_every_reused_across_calls(device: str) -> None:
     # The hoisted functor keeps its ``check_every`` across calls and warm-starts from ``solution``.
-    _skip_on_cpu(device)
     matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device)
     solution_wp = wp.zeros_like(rhs_wp)
     solver = tw.linalg.spd_column_solver(

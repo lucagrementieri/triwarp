@@ -38,7 +38,6 @@ import triwarp as tw
 import triwarp.linalg as twl
 import triwarp.typing as twt
 from triwarp import laplacian
-from triwarp._device import require_cuda
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import laplacian as kernel_laplacian
@@ -129,7 +128,6 @@ def filter_laplacian(
     vol_ini = tw.totals.volume(positions, faces) if volume_constraint else 0.0
 
     if implicit_time_integration:
-        require_cuda(device, "filter_laplacian(implicit_time_integration=True)")
         system = _build_implicit_system(operator, lamb, n, device)
         precond = wpl.preconditioner(system, "diag")
         components = _empty_components(n, device)
@@ -574,7 +572,6 @@ def filter_implicit_fairing(
     if n == 0 or n_faces == 0 or iterations == 0:
         return wp.clone(vertices)
 
-    require_cuda(device, "filter_implicit_fairing")
     positions = _as_vec3d(vertices)
     components = _empty_components(n, device)
     rhs = _empty_components(n, device)
@@ -810,11 +807,6 @@ def smooth_region_fixed_rim(
     wp.array[wp.vec3]
         New vertex positions on ``vertices.device`` (a copy; fixed vertices unchanged).
 
-    Raises
-    ------
-    NotImplementedError
-        On a CPU device (``warp.optim.linear.cg`` produces NaN on CPU in Warp 1.14-1.15).
-
     See Also
     --------
     [`smooth_region`][triwarp.smoothing.smooth_region]
@@ -833,7 +825,6 @@ def smooth_region_fixed_rim(
     free_map, n_free = tw.array.mask_to_index_map(free_mask)
     if n_free == 0:
         return out
-    require_cuda(device, "smooth_region_fixed_rim")
 
     weight_matrix = _edge_weight_matrix(vertices, faces, "unit")
     nnz = int(weight_matrix.nnz)
@@ -936,7 +927,6 @@ def smooth_region(
     free_map, n_free = tw.array.mask_to_index_map(free_mask)
     if n_free == 0:
         return out
-    require_cuda(device, "smooth_region")
 
     row_mask = tw.selection.expand_vertex_mask(faces, free_mask, 1)
     row_map, n_rows = tw.array.mask_to_index_map(row_mask)

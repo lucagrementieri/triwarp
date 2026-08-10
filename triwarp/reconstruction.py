@@ -27,7 +27,6 @@ import warp.optim.linear as wpl
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import require_cuda
 from triwarp.kernels import reconstruction as kernel_reconstruction
 from triwarp.kernels import remesh as kernel_remesh
 from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
@@ -392,9 +391,7 @@ def screened_poisson(
 
     ``normals`` are **required** and must be globally consistently oriented (all pointing outward or
     all inward): the reconstruction encodes the surface orientation in the sign of the vector field,
-    and [`estimate_normals`][triwarp.points.estimate_normals] performs no global orientation. A
-    **CUDA device is required** (``warp.optim.linear.cg`` returns NaN on the CPU device in Warp
-    1.14-1.15).
+    and [`estimate_normals`][triwarp.points.estimate_normals] performs no global orientation.
 
     Parameters
     ----------
@@ -497,7 +494,6 @@ def screened_poisson(
         raise ValueError(f"screened_poisson method must be 'dense' or 'adaptive', got {method!r}.")
 
     device = points.device
-    require_cuda(device, "screened_poisson")
     n = int(points.shape[0])
     if n < 3:
         raise ValueError(f"screened_poisson requires at least 3 points, got {n}.")

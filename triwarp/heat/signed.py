@@ -34,7 +34,6 @@ import warp.sparse as wps
 import triwarp as tw
 import triwarp.linalg as twl
 import triwarp.typing as twt
-from triwarp._device import require_cuda
 from triwarp.kernels.heat import distance as kernel_heat_distance
 from triwarp.kernels.heat import signed as kernel_heat_signed
 
@@ -108,9 +107,6 @@ def heat_signed_distance(
     ------
     ValueError
         If ``level_set_constraint`` is not ``"zero_set"`` or ``"none"``.
-    NotImplementedError
-        On the CPU device: every stage is a conjugate-gradient solve, and ``warp.optim.linear.cg``
-        returns NaN on the CPU in Warp 1.14-1.15.
 
     See Also
     --------
@@ -128,7 +124,6 @@ def heat_signed_distance(
     n_faces = int(faces.shape[0]) // 3
     if n_vertices == 0 or n_faces == 0 or int(curve_vertices.shape[0]) == 0:
         return wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    require_cuda(device, "heat_signed_distance")
 
     if operators is None:
         operators = tw.heat.vector.vector_heat_operators(vertices, faces, t)

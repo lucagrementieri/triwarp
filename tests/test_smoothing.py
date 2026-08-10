@@ -18,11 +18,6 @@ import triwarp as tw
 from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab, trimesh_to_warp
 
 
-def _skip_without_cuda(mesh_wp: wp.Mesh) -> None:
-    if wp.get_device(mesh_wp.device).is_cpu:
-        pytest.skip("implicit smoothing requires a CUDA device (warp.optim.linear.cg)")
-
-
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 def test_filter_laplacian_explicit(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
@@ -305,7 +300,6 @@ def test_filter_mut_dif_laplacian_no_volume_constraint(
 
 def test_filter_laplacian_implicit(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     mesh_tm, mesh_wp = icosahedron
-    _skip_without_cuda(mesh_wp)
 
     smoothed_wp = tw.smoothing.filter_laplacian(
         mesh_wp.points,
@@ -328,7 +322,6 @@ def test_filter_implicit_fairing(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> Non
     # flow degrades boundary triangles and the conjugate-gradient solve diverges (igl's direct
     # solver tolerates it, Warp only offers CG), so the regression uses the watertight icosahedron.
     mesh_tm, mesh_wp = icosahedron
-    _skip_without_cuda(mesh_wp)
 
     lamb = 0.1
     iterations = 6
@@ -391,18 +384,35 @@ def test_filter_neighborhood_average_zero_iterations(
     assert np.array_equal(smoothed_wp.numpy(), mesh_wp.points.numpy())
 
 
-def test_cpu_implicit_raises() -> None:
-    vertices = wp.array(
-        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
-        dtype=wp.vec3,
-        device="cpu",
-    )
-    faces = wp.array([0, 1, 2], dtype=wp.int32, device="cpu")
+def test_implicit_filters_cpu_match_cuda(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class A: both implicit filters give the CUDA answer on CPU.
 
-    with pytest.raises(NotImplementedError):
-        tw.smoothing.filter_laplacian(vertices, faces, iterations=2, implicit_time_integration=True)
-    with pytest.raises(NotImplementedError):
-        tw.smoothing.filter_implicit_fairing(vertices, faces, iterations=2)
+    Pins the removal of the CUDA-only guard: ``warp.optim.linear.cg`` returned NaN on the Warp CPU
+    device through 1.15, so these two refused to run there at all. Fixed in 1.16.
+    """
+    if not wp.is_cuda_available():
+        pytest.skip("needs both devices to compare them")
+    mesh_tm, _ = icosahedron
+
+    for name, call in (
+        (
+            "filter_laplacian",
+            lambda v, f: tw.smoothing.filter_laplacian(
+                v, f, iterations=2, implicit_time_integration=True
+            ),
+        ),
+        (
+            "filter_implicit_fairing",
+            lambda v, f: tw.smoothing.filter_implicit_fairing(v, f, iterations=2),
+        ),
+    ):
+        positions = {}
+        for device in ("cpu", "cuda:0"):
+            mesh_wp = trimesh_to_warp(mesh_tm, device)
+            positions[device] = call(mesh_wp.points, mesh_wp.indices).numpy()
+        assert np.isfinite(positions["cpu"]).all(), name
+        assert np.allclose(positions["cpu"], positions["cuda:0"], rtol=1e-5, atol=1e-5), name
 
 
 def test_zero_iterations_returns_copy(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
@@ -511,7 +521,6 @@ def test_smooth_region_empty_region(device: str):
 def test_filter_implicit_fairing_pins_the_boundary(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """Boundary vertices are held exactly; the interior is the part that moves."""
     _, mesh_wp = hemisphere
-    _skip_without_cuda(mesh_wp)
     original_np = mesh_wp.points.numpy()
     boundary_np = tw.boundary.boundary_vertex_indices(mesh_wp.points, mesh_wp.indices).numpy()
     interior_np = np.setdiff1d(np.arange(len(original_np)), boundary_np)
@@ -537,7 +546,6 @@ def test_filter_implicit_fairing_pinned_stays_stable_on_an_open_mesh(
     times it is applied — so this asserts *no* non-convergence warning, not merely finiteness.
     """
     _, mesh_wp = hemisphere
-    _skip_without_cuda(mesh_wp)
     extent = float(np.abs(mesh_wp.points.numpy()).max())
 
     with warnings.catch_warnings():
@@ -561,7 +569,6 @@ def test_filter_implicit_fairing_pin_boundary_is_a_no_op_on_a_closed_mesh(
     atomics, so *any* two runs of this function differ in the last bits, flag or no flag.
     """
     _, mesh_wp = icosahedron
-    _skip_without_cuda(mesh_wp)
     assert int(tw.boundary.boundary_vertex_indices(mesh_wp.points, mesh_wp.indices).shape[0]) == 0
 
     pinned_np = tw.smoothing.filter_implicit_fairing(

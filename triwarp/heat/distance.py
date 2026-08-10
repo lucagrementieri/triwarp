@@ -8,7 +8,6 @@ import warp.sparse as wps
 
 import triwarp.linalg as twl
 import triwarp.reduce as twr
-from triwarp._device import require_cuda
 from triwarp.edges import mean_unique_edge_length
 from triwarp.kernels.heat import distance as kernel_heat_distance
 from triwarp.laplacian import (
@@ -210,14 +209,6 @@ def heat_geodesic(
     wp.array[wp.float64]
         ``(n_vertices,)`` geodesic distance field on ``vertices.device``.
 
-    Raises
-    ------
-    NotImplementedError
-        If a non-trivial solve is required on the CPU device. The two conjugate-gradient solves use
-        ``warp.optim.linear.cg``, which returns NaN on the CPU device in Warp 1.14-1.15; a CUDA
-        device is required. (Empty meshes or empty source sets return a zero field without solving
-        and are allowed on any device.)
-
     See Also
     --------
     [`heat_operators`][triwarp.heat.distance.heat_operators]
@@ -231,9 +222,6 @@ def heat_geodesic(
 
     if n_vertices == 0 or n_faces == 0 or int(sources.shape[0]) == 0:
         return wp.zeros(n_vertices, dtype=wp.float64, device=device)
-
-    # Both stages are conjugate-gradient solves, which Warp cannot run on the CPU.
-    require_cuda(device, "heat_geodesic")
 
     if operators is None:
         operators = heat_operators(vertices, faces, t, use_robust=use_robust)

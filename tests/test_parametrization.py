@@ -9,15 +9,6 @@ import warp as wp
 import triwarp as tw
 
 
-def _skip_on_cpu(device: str) -> None:
-    # harmonic / tutte solve the interior system with ``warp.optim.linear.cg``, which returns NaN on
-    # the CPU device in Warp 1.14-1.15. The solver raises NotImplementedError there, so skip.
-    if wp.get_device(device).is_cpu:
-        pytest.skip(
-            "harmonic / tutte require CUDA: warp.optim.linear.cg is NaN on CPU in Warp 1.14-1.15."
-        )
-
-
 def _mesh_numpy(mesh_tm) -> tuple[np.ndarray, np.ndarray]:
     """``(vertices float64 (n, 3), faces int64 (n_faces, 3))`` for the libigl references."""
     return np.asarray(mesh_tm.vertices, dtype=np.float64), np.asarray(mesh_tm.faces, dtype=np.int64)
@@ -150,7 +141,6 @@ def test_uniform_laplacian_matches_igl(device, hemisphere):
 @pytest.mark.parity("harmonic", "igl")
 @pytest.mark.parity("harmonic_conditioning", "igl")
 def test_harmonic_matches_igl(request, device, mesh_name):
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np, faces_np = _mesh_numpy(mesh_tm)
 
@@ -171,7 +161,6 @@ def test_harmonic_matches_igl(request, device, mesh_name):
 def test_biharmonic_matches_reference(request, device, mesh_name):
     # k=2 (biharmonic). igl.harmonic's default mass is Voronoi, but triwarp uses the barycentric
     # lumped mass, so compare against a barycentric-mass biharmonic solved directly in SciPy.
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np, faces_np = _mesh_numpy(mesh_tm)
     n_vertices = int(mesh_wp.points.shape[0])
@@ -207,7 +196,6 @@ def test_biharmonic_is_deterministic(device, hemisphere):
     # biharmonic operator must give the same result across repeated calls. The bug manifested as
     # ~1e22 / NaN corruption, so a tight tolerance (well above conjugate-gradient's ~1e-8 atomic
     # last-ULP jitter) reliably catches a regression.
-    _skip_on_cpu(device)
     _, mesh_wp = hemisphere
     boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
     boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)
@@ -223,7 +211,6 @@ def test_biharmonic_is_deterministic(device, hemisphere):
 
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
 def test_tutte_matches_igl_reference(request, device, mesh_name):
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     _, faces_np = _mesh_numpy(mesh_tm)
     n_vertices = int(mesh_wp.points.shape[0])
@@ -254,7 +241,6 @@ def test_tutte_matches_igl_reference(request, device, mesh_name):
 
 def test_tutte_disk_is_fold_free(device, hemisphere):
     # A disk-topology mesh with a convex (circle) boundary yields a bijective, fold-free Tutte map.
-    _skip_on_cpu(device)
     _, mesh_wp = hemisphere
     boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
     boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)
@@ -265,7 +251,6 @@ def test_tutte_disk_is_fold_free(device, hemisphere):
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
 @pytest.mark.parity("lscm", "igl")
 def test_lscm_matches_igl(request, device, mesh_name):
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np, faces_np = _mesh_numpy(mesh_tm)
 
@@ -286,7 +271,6 @@ def test_lscm_matches_igl(request, device, mesh_name):
 
 def test_lscm_closed_mesh_matches_igl(device, icosahedron):
     # Closed mesh: A = 0, Q = -repdiag(L, 2). igl.lscm accepts closed input.
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = icosahedron
     vertices_np, faces_np = _mesh_numpy(mesh_tm)
 
@@ -305,7 +289,6 @@ def test_lscm_closed_mesh_matches_igl(device, icosahedron):
 
 def test_lscm_is_fold_free(device, hemisphere):
     # LSCM of a disk-topology open surface with two pins is conformal and fold-free.
-    _skip_on_cpu(device)
     _, mesh_wp = hemisphere
     loop_np = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices).numpy()
     pins_wp = wp.array(
@@ -332,20 +315,29 @@ def test_lscm_too_few_pins_raises(device, hemisphere, n_pins):
         tw.parametrization.lscm(mesh_wp.points, mesh_wp.indices, pins_wp, pins_uv_wp)
 
 
-def test_lscm_cpu_solve_raises():
-    # Two-triangle quad with two pins forces a free-vertex solve: CPU cg is unsupported.
-    vertices = wp.array(
-        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]),
-        dtype=wp.vec3,
-        device="cpu",
-    )
-    faces = wp.array(np.array([0, 1, 2, 1, 3, 2], dtype=np.int32), dtype=wp.int32, device="cpu")
-    pins = wp.array(np.array([0, 3], dtype=np.int32), dtype=wp.int32, device="cpu")
-    pins_uv = wp.array(
-        np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32), dtype=wp.vec2, device="cpu"
-    )
-    with pytest.raises(NotImplementedError):
-        tw.parametrization.lscm(vertices, faces, pins, pins_uv)
+def test_lscm_cpu_matches_cuda():
+    """Class A: the CPU free-vertex solve is the CUDA one (two-triangle quad, two pins)."""
+    if not wp.is_cuda_available():
+        pytest.skip("needs both devices to compare them")
+
+    uv = {}
+    for device in ("cpu", "cuda:0"):
+        vertices = wp.array(
+            np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]),
+            dtype=wp.vec3,
+            device=device,
+        )
+        faces = wp.array(
+            np.array([0, 1, 2, 1, 3, 2], dtype=np.int32), dtype=wp.int32, device=device
+        )
+        pins = wp.array(np.array([0, 3], dtype=np.int32), dtype=wp.int32, device=device)
+        pins_uv = wp.array(
+            np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32), dtype=wp.vec2, device=device
+        )
+        uv[device] = tw.parametrization.lscm(vertices, faces, pins, pins_uv).numpy()
+
+    assert np.isfinite(uv["cpu"]).all()
+    assert np.allclose(uv["cpu"], uv["cuda:0"], rtol=1e-5, atol=1e-5)
 
 
 def test_lscm_empty_mesh(device):
@@ -357,22 +349,31 @@ def test_lscm_empty_mesh(device):
     assert uv_wp.numpy().size == 0
 
 
-def test_harmonic_cpu_solve_raises():
-    # Single triangle with one interior-free setup forcing a solve: CPU cg is unsupported.
-    vertices = wp.array(
-        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]),
-        dtype=wp.vec3,
-        device="cpu",
-    )
-    faces = wp.array(np.array([0, 1, 2, 1, 3, 2], dtype=np.int32), dtype=wp.int32, device="cpu")
-    boundary = wp.array(np.array([0, 1, 3], dtype=np.int32), dtype=wp.int32, device="cpu")
-    boundary_uv = wp.array(
-        np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float32),
-        dtype=wp.vec2,
-        device="cpu",
-    )
-    with pytest.raises(NotImplementedError):
-        tw.parametrization.harmonic(vertices, faces, boundary, boundary_uv)
+def test_harmonic_cpu_matches_cuda():
+    """Class A: the CPU interior solve is the CUDA one (two-triangle quad, three pinned corners)."""
+    if not wp.is_cuda_available():
+        pytest.skip("needs both devices to compare them")
+
+    uv = {}
+    for device in ("cpu", "cuda:0"):
+        vertices = wp.array(
+            np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]),
+            dtype=wp.vec3,
+            device=device,
+        )
+        faces = wp.array(
+            np.array([0, 1, 2, 1, 3, 2], dtype=np.int32), dtype=wp.int32, device=device
+        )
+        boundary = wp.array(np.array([0, 1, 3], dtype=np.int32), dtype=wp.int32, device=device)
+        boundary_uv = wp.array(
+            np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float32),
+            dtype=wp.vec2,
+            device=device,
+        )
+        uv[device] = tw.parametrization.harmonic(vertices, faces, boundary, boundary_uv).numpy()
+
+    assert np.isfinite(uv["cpu"]).all()
+    assert np.allclose(uv["cpu"], uv["cuda:0"], rtol=1e-5, atol=1e-5)
 
 
 def _arap_igl(vertices_np, faces_np, fixed_np, fixed_uv_np, uv_init_np, max_iterations):
@@ -388,7 +389,6 @@ def _arap_igl(vertices_np, faces_np, fixed_np, fixed_uv_np, uv_init_np, max_iter
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
 @pytest.mark.parity("arap", "igl")
 def test_arap_matches_igl(request, device, mesh_name):
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np, faces_np = _mesh_numpy(mesh_tm)
 
@@ -412,7 +412,6 @@ def test_arap_matches_igl(request, device, mesh_name):
 
 def test_arap_free_boundary_matches_igl(device, hemisphere):
     # Pin only two boundary vertices to their harmonic UV; the rest of the boundary is free.
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = hemisphere
     vertices_np, faces_np = _mesh_numpy(mesh_tm)
 
@@ -442,7 +441,6 @@ def test_arap_default_tolerance_tracks_a_tight_solve(device, hemisphere):
     # ``arap`` defaults its inner CG to 1e-7 rather than the 1e-8 the other solvers use: its global
     # solves are inner steps of a truncated outer iteration. Guard that the looser default still
     # tracks a tight solve two orders below it, far inside the 1e-4 gate the igl oracles use.
-    _skip_on_cpu(device)
     _, mesh_wp = hemisphere
     boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
     boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)
@@ -467,7 +465,6 @@ def test_arap_default_tolerance_tracks_a_tight_solve(device, hemisphere):
 
 def test_arap_fixed_vertices_pinned(device, hemisphere):
     # The pinned rows must equal the prescribed UV exactly (they are re-enforced every iteration).
-    _skip_on_cpu(device)
     _, mesh_wp = hemisphere
     boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
     boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)
@@ -482,7 +479,6 @@ def test_arap_fixed_vertices_pinned(device, hemisphere):
 
 
 def test_arap_disk_is_finite(device, hemisphere):
-    _skip_on_cpu(device)
     _, mesh_wp = hemisphere
     boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
     boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)
@@ -544,23 +540,32 @@ def test_arap_bad_tolerance_raises(device, hemisphere):
         )
 
 
-def test_arap_cpu_solve_raises():
-    # Two-triangle quad with three pinned corners forcing an interior solve: CPU cg is unsupported.
-    vertices = wp.array(
-        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]),
-        dtype=wp.vec3,
-        device="cpu",
-    )
-    faces = wp.array(np.array([0, 1, 2, 1, 3, 2], dtype=np.int32), dtype=wp.int32, device="cpu")
-    fixed = wp.array(np.array([0, 1, 3], dtype=np.int32), dtype=wp.int32, device="cpu")
-    fixed_uv = wp.array(
-        np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float32),
-        dtype=wp.vec2,
-        device="cpu",
-    )
-    uv_init = wp.zeros(4, dtype=wp.vec2, device="cpu")
-    with pytest.raises(NotImplementedError):
-        tw.parametrization.arap(vertices, faces, fixed, fixed_uv, uv_init)
+def test_arap_cpu_matches_cuda():
+    """Class A: the CPU local/global alternation is the CUDA one (quad, three pinned corners)."""
+    if not wp.is_cuda_available():
+        pytest.skip("needs both devices to compare them")
+
+    uv = {}
+    for device in ("cpu", "cuda:0"):
+        vertices = wp.array(
+            np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]]),
+            dtype=wp.vec3,
+            device=device,
+        )
+        faces = wp.array(
+            np.array([0, 1, 2, 1, 3, 2], dtype=np.int32), dtype=wp.int32, device=device
+        )
+        fixed = wp.array(np.array([0, 1, 3], dtype=np.int32), dtype=wp.int32, device=device)
+        fixed_uv = wp.array(
+            np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float32),
+            dtype=wp.vec2,
+            device=device,
+        )
+        uv_init = wp.zeros(4, dtype=wp.vec2, device=device)
+        uv[device] = tw.parametrization.arap(vertices, faces, fixed, fixed_uv, uv_init).numpy()
+
+    assert np.isfinite(uv["cpu"]).all()
+    assert np.allclose(uv["cpu"], uv["cuda:0"], rtol=1e-5, atol=1e-5)
 
 
 def test_arap_empty_mesh(device):

@@ -13,12 +13,6 @@ Two layers:
   operator against several right-hand-side columns in a *single* conjugate-gradient call, using
   ``warp.optim.linear``'s batched-``LinearOperator`` support.
 
-!!! note
-    Every solve here goes through ``warp.optim.linear.cg``, which returns NaN on the Warp CPU
-    backend (1.14-1.15), so each entry point that actually reaches a solve raises
-    ``NotImplementedError`` on a CPU device. A fully-constrained
-    [`min_quad_with_fixed`][triwarp.linalg.min_quad_with_fixed] does no solve and stays CPU-safe.
-
 **Why batch the columns.** A ``k``-column solve used to be a Python loop of ``k`` independent
 ``cg`` calls, so its cost was ``sum`` of the per-column iteration counts and every CG iteration
 launched ``k`` separate sets of reduction and AXPY kernels.
@@ -84,7 +78,6 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import require_cuda
 from triwarp.kernels import linalg as kernel_linalg
 
 # Relative residual tolerance used when a caller does not supply one.
@@ -171,7 +164,6 @@ def min_quad_with_fixed(
     solution = wp.zeros((n_rhs, n_free), dtype=wp.float64, device=device)
     if n_free == 0:
         return twt.as_array2d(solution, wp.float64), free_map, n_free
-    require_cuda(device, "min_quad_with_fixed")
 
     q_uu, rhs = assemble_interior_system(q, fixed_mask, free_map, fixed_values, n_free)
     solve_spd_columns(
@@ -367,17 +359,11 @@ def solve_spd(
         ``check_every > 0``; under ``check_every=0`` the counts stay on device and testing them
         would reintroduce the readback that setting exists to avoid.
 
-    Raises
-    ------
-    NotImplementedError
-        On a CPU device: ``warp.optim.linear.cg`` produces ``NaN`` there in Warp 1.14-1.15.
-
     See Also
     --------
     [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]
     [`spd_column_solver`][triwarp.linalg.spd_column_solver]
     """
-    require_cuda(rhs.device, name)
     n_rows = int(rhs.shape[0])
     iteration_cap = CG_MAXITER_FACTOR * n_rows if maxiter is None else maxiter
     result = wpl.cg(
@@ -605,7 +591,6 @@ def _cg_columns(
     the same replicated Jacobi preconditioner and differ only in ``run``: the first drives the
     solve, the second hands back the un-run state for a caller to drive repeatedly.
     """
-    require_cuda(rhs.device, caller)
     n_columns, n = int(rhs.shape[0]), int(rhs.shape[1])
     operator = replicated_operator(matrix, n_columns)
     preconditioner = replicated_operator(wpl.preconditioner(matrix, "diag"), n_columns)

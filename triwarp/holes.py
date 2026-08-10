@@ -1005,9 +1005,7 @@ def fill_smooth(
     -----
     The three-stage pipeline is MeshLib's ``fillHoleNicely``.
 
-    The subdivision and smoothing stages require a CUDA device (``warp.optim.linear.cg`` produces
-    NaN on CPU in Warp 1.14-1.15); ``triangulate_only=True`` stays CPU-capable. Winding is
-    consistent with the surrounding faces only for a consistently wound input.
+    Winding is consistent with the surrounding faces only for a consistently wound input.
     """
     if metric not in _METRIC_IDS:
         raise ValueError(f"metric must be one of {sorted(_METRIC_IDS)}, got {metric!r}")

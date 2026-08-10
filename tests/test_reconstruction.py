@@ -555,13 +555,23 @@ def test_poisson_too_few_points(device: str):
         tw.reconstruction.screened_poisson(points_wp, normals_wp, depth=4, full_depth=3)
 
 
-def test_poisson_cpu_raises(device: str):
-    if not wp.get_device(device).is_cpu:
-        pytest.skip("CPU-only guard test.")
+def test_poisson_cpu_matches_cuda():
+    """Class A: the CPU cascadic solve reconstructs the CUDA surface, vertex for vertex."""
+    if not wp.is_cuda_available():
+        pytest.skip("needs both devices to compare them")
     points_np, normals_np = _sphere_cloud(2)
-    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
-    with pytest.raises(NotImplementedError, match="CUDA"):
-        tw.reconstruction.screened_poisson(points_wp, normals_wp, depth=4, full_depth=3)
+
+    surfaces = {}
+    for device in ("cpu", "cuda:0"):
+        points_wp, normals_wp = _to_warp(points_np, normals_np, device)
+        vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
+            points_wp, normals_wp, depth=4, full_depth=3
+        )
+        surfaces[device] = (vertices_wp.numpy(), faces_wp.numpy())
+
+    assert surfaces["cpu"][1].size > 0
+    assert np.array_equal(surfaces["cpu"][1], surfaces["cuda:0"][1])
+    assert np.allclose(surfaces["cpu"][0], surfaces["cuda:0"][0], rtol=1e-5, atol=1e-5)
 
 
 # ======================================================================================

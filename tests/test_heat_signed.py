@@ -24,11 +24,6 @@ import warp as wp
 import triwarp as tw
 
 
-def _skip_on_cpu(device: str) -> None:
-    if wp.get_device(device).is_cpu:
-        pytest.skip("the signed heat method needs conjugate gradient, which Warp cannot run on CPU")
-
-
 def _one_ring_cycle(
     mesh_tm: tm.Trimesh, mesh_wp: wp.Mesh, which: int = 0
 ) -> tuple[int, np.ndarray]:
@@ -84,7 +79,6 @@ def _distance_pp(
 def test_heat_signed_distance_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     _, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)
     curve_wp = wp.array(curve_np, dtype=wp.int32, device=mesh_wp.device)
@@ -110,7 +104,6 @@ def test_heat_signed_distance_matches_potpourri3d(
 def test_signed_distance_magnitude_is_the_unsigned_distance(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     _, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)
     curve_wp = wp.array(curve_np, dtype=wp.int32, device=mesh_wp.device)
@@ -130,7 +123,6 @@ def test_signed_distance_magnitude_is_the_unsigned_distance(
 def test_signed_distance_is_positive_inside_the_curve(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     center, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)
     curve_wp = wp.array(curve_np, dtype=wp.int32, device=mesh_wp.device)
@@ -152,7 +144,6 @@ def test_signed_distance_is_positive_inside_the_curve(
 def test_reversing_the_curve_negates_the_field(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     _, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)
 
@@ -173,7 +164,6 @@ def test_reversing_the_curve_negates_the_field(
 def test_zero_set_constraint_pins_the_curve(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     _, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)
     curve_wp = wp.array(curve_np, dtype=wp.int32, device=mesh_wp.device)
@@ -196,7 +186,6 @@ def test_zero_set_constraint_pins_the_curve(
 
 
 def test_multiple_curves_via_offsets(icosahedron: tuple[tm.Trimesh, wp.Mesh], device: str) -> None:
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = icosahedron
     _, first = _one_ring_cycle(mesh_tm, mesh_wp, which=0)
     _, second = _one_ring_cycle(mesh_tm, mesh_wp, which=5)
@@ -223,7 +212,6 @@ def test_multiple_curves_via_offsets(icosahedron: tuple[tm.Trimesh, wp.Mesh], de
 def test_open_curve_still_changes_sign_across_itself(
     icosahedron: tuple[tm.Trimesh, wp.Mesh], device: str
 ) -> None:
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = icosahedron
     _, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)
     curve_np = curve_np[:3]
@@ -242,7 +230,6 @@ def test_open_curve_still_changes_sign_across_itself(
 def test_reused_operators_give_the_same_answer(
     half_torus: tuple[tm.Trimesh, wp.Mesh], device: str
 ) -> None:
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = half_torus
     _, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)
     curve_wp = wp.array(curve_np, dtype=wp.int32, device=mesh_wp.device)

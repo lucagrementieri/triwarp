@@ -26,7 +26,6 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.linalg as twl
-from triwarp._device import require_cuda
 from triwarp.heat.distance import HeatOperators, heat_geodesic, heat_operators
 from triwarp.kernels.heat import vector as kernel_heat_vector
 from triwarp.laplacian import connection_laplacian, mass_matrix_entries
@@ -148,13 +147,6 @@ def extend_scalar(
     wp.array[wp.float64]
         ``(n_vertices,)`` extended field on ``vertices.device``.
 
-    Raises
-    ------
-    NotImplementedError
-        On the CPU device: the diffusion is a conjugate-gradient solve, which
-        ``warp.optim.linear.cg``
-        cannot do on the CPU in Warp 1.14-1.15.
-
     See Also
     --------
     [`transport_tangent_vectors`][triwarp.heat.vector.transport_tangent_vectors]
@@ -165,7 +157,6 @@ def extend_scalar(
     n_sources = int(sources.shape[0])
     if n_vertices == 0 or int(faces.shape[0]) == 0 or n_sources == 0:
         return wp.zeros(n_vertices, dtype=wp.float64, device=device)
-    require_cuda(device, "extend_scalar")
 
     if operators is None:
         operators = heat_operators(vertices, faces, t)
@@ -250,7 +241,6 @@ def transport_tangent_vectors(
     n_sources = int(sources.shape[0])
     if n_vertices == 0 or int(faces.shape[0]) == 0 or n_sources == 0:
         return wp.zeros(n_vertices, dtype=wp.vec2, device=device)
-    require_cuda(device, "transport_tangent_vectors")
 
     if operators is None:
         operators = vector_heat_operators(vertices, faces, t)
@@ -336,7 +326,6 @@ def log_map(
     n_vertices = int(vertices.shape[0])
     if n_vertices == 0 or int(faces.shape[0]) == 0:
         return wp.zeros(n_vertices, dtype=wp.vec2, device=device)
-    require_cuda(device, "log_map")
 
     if operators is None:
         operators = vector_heat_operators(vertices, faces, t)

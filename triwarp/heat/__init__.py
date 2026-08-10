@@ -18,8 +18,8 @@ it diffuses and how it reads the result back:
   Poisson problem against that field to get a *signed* distance whose zero set is the curves
   (``potpourri3d.MeshSignedHeatSolver``).
 
-All three run in ``float64`` and require CUDA: the diffused field decays exponentially and
-underflows ``float32``, and ``warp.optim.linear.cg`` returns NaN on the CPU backend.
+All three run in ``float64``, because the diffused field decays exponentially and underflows
+``float32``. They run on either device.
 
 The operators these solvers assemble are **not** here — the cotangent and connection Laplacians live
 in [`triwarp.laplacian`][triwarp.laplacian], tangent frames in

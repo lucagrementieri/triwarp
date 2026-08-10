@@ -23,11 +23,6 @@ import triwarp as tw
 _MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
 
 
-def _skip_on_cpu(device: str) -> None:
-    if wp.get_device(device).is_cpu:
-        pytest.skip("the vector heat method needs conjugate gradient, which Warp cannot run on CPU")
-
-
 def _solver_pp(mesh_tm: object) -> pp3d.MeshVectorHeatSolver:
     return pp3d.MeshVectorHeatSolver(
         np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),  # type: ignore[attr-defined]
@@ -57,7 +52,6 @@ def _to_world(tangent: np.ndarray, basis_x: np.ndarray, basis_y: np.ndarray) -> 
 def test_extend_scalar_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = len(mesh_tm.vertices)
     sources_np = np.array([0, n_vertices // 3, 2 * n_vertices // 3], dtype=np.int32)
@@ -101,7 +95,6 @@ def test_extend_scalar_matches_potpourri3d(
 def test_extend_scalar_single_source_is_constant(
     icosahedron: tuple[object, wp.Mesh], device: str
 ) -> None:
-    _skip_on_cpu(device)
     _, mesh_wp = icosahedron
     extended = tw.heat.vector.extend_scalar(
         mesh_wp.points,
@@ -119,7 +112,6 @@ def test_extend_scalar_single_source_is_constant(
 
 
 def test_transport_on_a_flat_patch_is_constant(device: str) -> None:
-    _skip_on_cpu(device)
     # Parallel transport across a plane is the identity, so the transported field must be one
     # constant
     # world vector. Away from the rim, where the angle sum is exactly 2*pi and the intrinsic
@@ -177,7 +169,6 @@ def test_transport_on_a_flat_patch_is_constant(device: str) -> None:
 def test_transport_tangent_vectors_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     solver_pp = _solver_pp(mesh_tm)
     basis_x_pp, basis_y_pp, _ = (np.asarray(basis) for basis in solver_pp.get_tangent_frames())
@@ -217,7 +208,6 @@ def test_transport_tangent_vectors_matches_potpourri3d(
 def test_transport_preserves_source_magnitudes(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
-    _skip_on_cpu(device)
     _, mesh_wp = request.getfixturevalue(mesh_name)
     magnitude = 2.5
     transported = tw.heat.vector.transport_tangent_vectors(
@@ -235,7 +225,6 @@ def test_transport_preserves_source_magnitudes(
 def test_transport_does_not_cross_components(
     cave_cube: tuple[object, wp.Mesh], device: str
 ) -> None:
-    _skip_on_cpu(device)
     _, mesh_wp = cave_cube
     # ``cave_cube`` is a cube shell around a smaller cube shell: two components. Nothing can be
     # transported across the gap, so the cavity's vertices must come back at zero rather than with a
@@ -266,7 +255,6 @@ def test_transport_does_not_cross_components(
 def test_log_map_radius_is_the_geodesic_distance(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
-    _skip_on_cpu(device)
     _, mesh_wp = request.getfixturevalue(mesh_name)
     sources_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
     distance = tw.heat.distance.heat_geodesic(mesh_wp.points, mesh_wp.indices, sources_wp).numpy()
@@ -285,7 +273,6 @@ def test_log_map_radius_is_the_geodesic_distance(
 def test_log_map_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
-    _skip_on_cpu(device)
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     solver_pp = _solver_pp(mesh_tm)
     basis_x_pp, basis_y_pp, _ = (np.asarray(basis) for basis in solver_pp.get_tangent_frames())
@@ -313,7 +300,6 @@ def test_log_map_matches_potpourri3d(
 
 
 def test_log_map_is_zero_at_its_source(icosahedron: tuple[object, wp.Mesh], device: str) -> None:
-    _skip_on_cpu(device)
     _, mesh_wp = icosahedron
     logarithm = tw.heat.vector.log_map(mesh_wp.points, mesh_wp.indices, 3).numpy()
     assert np.allclose(logarithm[3], 0.0, rtol=1e-6, atol=1e-6)
@@ -328,7 +314,6 @@ def test_log_map_is_zero_at_its_source(icosahedron: tuple[object, wp.Mesh], devi
 def test_reused_operators_give_the_same_answer(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
-    _skip_on_cpu(device)
     _, mesh_wp = request.getfixturevalue(mesh_name)
     sources = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
     vectors = wp.array(
@@ -361,7 +346,6 @@ def test_reused_operators_give_the_same_answer(
 
 
 def test_operators_fix_the_diffusion_time(icosahedron: tuple[object, wp.Mesh], device: str) -> None:
-    _skip_on_cpu(device)
     _, mesh_wp = icosahedron
     sources = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
     vectors = wp.array(

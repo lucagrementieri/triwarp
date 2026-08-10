@@ -25,7 +25,6 @@ import warp.sparse as wps
 import triwarp as tw
 import triwarp.linalg as twl
 import triwarp.typing as twt
-from triwarp._device import require_cuda
 from triwarp.kernels import parametrization as kernel_parametrization
 from triwarp.laplacian import cotmatrix, cotmatrix_entries, mass_matrix_entries, uniform_laplacian
 
@@ -180,9 +179,7 @@ def harmonic(
     [`cotmatrix`][triwarp.laplacian.cotmatrix] subject to the boundary vertices being pinned to
     ``boundary_uv``. For ``k == 1`` this is the harmonic map (each interior UV is the
     cotangent-weighted average of its neighbors); ``k == 2`` is the biharmonic map, and so on. The
-    interior system is solved with conjugate gradient, so a **CUDA device is required** whenever
-    there are interior vertices to solve for (``warp.optim.linear.cg`` returns NaN on the CPU in
-    Warp 1.14-1.15).
+    interior system is solved with conjugate gradient.
 
     Parameters
     ----------
@@ -326,8 +323,8 @@ def _solve_fixed_boundary(
     q = tw.energies.k_harmonic(laplacian, mass_diag, k=k)
 
     # A mesh with interior vertices and no fixed boundary is a singular Dirichlet system. Raised up
-    # front (CPU-safe): once every vertex is fixed (n_vertices > 0, n_boundary == 0 is impossible
-    # here because n_vertices > 0 implies interior vertices exist) this cannot be satisfied.
+    # front: once every vertex is fixed (n_vertices > 0, n_boundary == 0 is impossible here because
+    # n_vertices > 0 implies interior vertices exist) this cannot be satisfied.
     n_boundary = int(boundary_indices.shape[0])
     if n_boundary == 0:
         raise ValueError(
@@ -370,9 +367,7 @@ def arap(
     step fits, per triangle, the closest rotation between the isometrically flattened rest triangle
     and its current UV image (closed-form 2D polar decomposition, reflections forbidden); the global
     step solves the cotangent-Laplacian Poisson system ``(-L)_uu U_u = (K R)_u - (-L)_ub bc`` for
-    each UV column with conjugate gradient. A **CUDA device is required** whenever there are
-    interior vertices to solve for (``warp.optim.linear.cg`` returns NaN on the CPU in Warp
-    1.14-1.15).
+    each UV column with conjugate gradient.
 
     A good ``uv_init`` matters: ARAP is non-convex, so feed a fold-free initial map such as
     [`harmonic`][triwarp.parametrization.harmonic] or [`tutte`][triwarp.parametrization.tutte], with
@@ -485,7 +480,7 @@ def arap(
 
     out_uv = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     if n_interior == 0:
-        # Every vertex pinned: the prescribed positions are the whole answer, no solve (CPU-safe).
+        # Every vertex pinned: the prescribed positions are the whole answer, no solve.
         empty_sol = wp.zeros((2, 0), dtype=wp.float64, device=device)
         wp.launch(
             kernel_parametrization.scatter_solution,
@@ -502,7 +497,6 @@ def arap(
             "arap requires at least one fixed vertex when the mesh has interior vertices; the ARAP "
             "global system is otherwise singular (translation invariant)."
         )
-    require_cuda(device, "arap")
 
     # Global-step operator: interior block of Q = -L and the constant boundary term -(-L)_ub bc.
     # ``future work``: libigl also supports rotation groups ``G`` (shared rotations across grouped
@@ -632,9 +626,8 @@ def lscm(
     the boundary vector-area term, so it needs only a few pins — typically **two** — to fix the
     remaining similarity-transform (rotation + scale + translation) degree of freedom.
 
-    The interior system is solved with conjugate gradient, so a **CUDA device is required** whenever
-    there are free vertices to solve for (``warp.optim.linear.cg`` returns NaN on the CPU in Warp
-    1.14-1.15). Closed meshes are valid input: the boundary vector-area matrix is then zero and the
+    The interior system is solved with conjugate gradient. Closed meshes are valid input: the
+    boundary vector-area matrix is then zero and the
     Hessian reduces to ``-repdiag(L, 2)``.
 
     Parameters

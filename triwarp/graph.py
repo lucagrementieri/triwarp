@@ -336,10 +336,12 @@ def successor_cycles(
     [`connected_component_labels_from_edges`][triwarp.graph.connected_component_labels_from_edges]
     [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched]
     """
-    # ``validate=False``: the range check belongs to the ``connected_component_labels_from_edges``
-    # call below, which gets the same edges and the same flag. Checking here too would pay the
-    # reduction and its host sync twice.
-    node_count = _validate_edge_list(edges, node_count, validate=False)
+    # The range check must run BEFORE ``scatter_successor`` below, not be deferred to the
+    # ``connected_component_labels_from_edges`` call: that kernel indexes ``next_node`` by the raw
+    # edge endpoints, so an out-of-range endpoint writes past a ``node_count``-element buffer. On
+    # the CPU device that is a host-heap overwrite, silent at the point of the write and surfacing
+    # later as a glibc abort somewhere unrelated.
+    node_count = _validate_edge_list(edges, node_count, validate=validate)
 
     device = edges.device
     m = int(edges.shape[0])
@@ -350,7 +352,8 @@ def successor_cycles(
     next_node = wp.full(node_count, -1, dtype=wp.int32, device=device)
     wp.launch(kernel_graph.scatter_successor, dim=m, inputs=[edges, next_node], device=device)
 
-    labels = connected_component_labels_from_edges(edges, node_count=node_count, validate=validate)
+    # Already range-checked above, so the downstream call skips the second reduction and host sync.
+    labels = connected_component_labels_from_edges(edges, node_count=node_count, validate=False)
 
     cycle_nodes = tw.grouping.unique_1d(edges.flatten())
     n_nodes = int(cycle_nodes.shape[0])
