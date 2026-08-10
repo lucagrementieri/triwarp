@@ -76,6 +76,7 @@ import numpy as np
 import open3d as o3d
 import pymeshlab as ml
 import pytest
+import pyvista as pv
 import trimesh as tm
 import warp as wp
 from conftest import BenchCase, skip_larger_than
@@ -187,6 +188,23 @@ def test_fit_line(bench_case: BenchCase) -> None:
         points_np = bench_case.vertices_np
         axis_tm = bench_case.run(lambda: tm.points.major_axis(points_np))
         assert axis_tm.shape == (3,)
+
+
+@pytest.mark.benchmark(group="principal_axes")
+@pytest.mark.benchlibs("triwarp", "pyvista")
+def test_principal_axes(bench_case: BenchCase) -> None:
+    """Principal frame: centroid reduction, centred scatter, then one 3x3 SVD."""
+    if bench_case.kind == "triwarp":
+        points = bench_case.vertices_wp
+        rotation, eigenvalues, centroid = bench_case.run(lambda: tw.points.principal_axes(points))
+        assert len(rotation) == 3
+        assert len(eigenvalues) == 3
+        assert len(centroid) == 3
+    else:
+        skip_larger_than(bench_case, "bunny_decimated", _HOST_CAP_REASON)
+        points_np = bench_case.vertices_np
+        axes_pv = bench_case.run(lambda: pv.principal_axes(points_np))
+        assert axes_pv.shape == (3, 3)
 
 
 @pytest.mark.benchmark(group="fit_plane")

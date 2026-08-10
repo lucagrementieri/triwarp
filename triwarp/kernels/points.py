@@ -78,6 +78,31 @@ ORIENT_CAMERA = wp.constant(wp.int32(2))  # point toward a camera location
 
 
 @wp.kernel
+def finalize_principal_axes(
+    center: wp.array[wp.vec3],
+    m: wp.array[wp.mat33],
+    out_rotation: wp.array[wp.mat33],
+    out_eigenvalues: wp.array[wp.vec3],
+    out_centroid: wp.array[wp.vec3],
+) -> None:
+    # ``wp.svd3`` returns singular values in descending order, so the columns of ``u`` are the
+    # principal axes from widest to narrowest. The rows of the result are those axes, which is the
+    # convention that makes ``rotation * p`` the coordinates of ``p`` in the principal frame.
+    u, sigma, _v = wp.svd3(m[0])
+    axis0 = wp.normalize(wp.vec3(u[0, 0], u[1, 0], u[2, 0]))
+    axis1 = wp.normalize(wp.vec3(u[0, 1], u[1, 1], u[2, 1]))
+    # Take the third axis from the cross product rather than from ``u``: that forces a proper
+    # rotation (determinant +1) whatever sign convention the SVD chose, so the frame is always
+    # right-handed and only the first two signs are free.
+    axis2 = wp.cross(axis0, axis1)
+    out_rotation[0] = wp.mat33(
+        axis0[0], axis0[1], axis0[2], axis1[0], axis1[1], axis1[2], axis2[0], axis2[1], axis2[2]
+    )
+    out_eigenvalues[0] = sigma
+    out_centroid[0] = center[0]
+
+
+@wp.kernel
 def estimate_point_normals(
     points: wp.array[wp.vec3],
     neighbor_idx: wp.array2d[wp.int32],

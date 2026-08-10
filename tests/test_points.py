@@ -2,6 +2,7 @@ import numpy as np
 import open3d as o3d
 import pymeshlab as ml
 import pytest
+import pyvista as pv
 import trimesh.geometry as tm_geometry
 import trimesh.points as tm
 import warp as wp
@@ -103,6 +104,110 @@ def test_centered_covariance_precomputed_center(device: str) -> None:
     scatter_np = centered_np.T @ centered_np
     cov_wp = tw.centered_covariance(points_wp, center=center_wp)
     assert np.allclose(cov_wp.numpy()[0], scatter_np, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parity("principal_axes", "pyvista")
+def test_principal_axes(device: str) -> None:
+    """Class A up to the free sign of the first two axes: rows, eigenvalues and centroid."""
+    rng = np.random.default_rng(7)
+    # A well-separated spectrum, so every axis is individually determined. Offset from the origin
+    # too, which is what separates a centred fit from fit_line's uncentred one.
+    points_np = (rng.standard_normal((500, 3)) @ np.diag([3.0, 1.0, 0.2])) + 5.0
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+
+    rotation_wp, eigenvalues_wp, centroid_wp = tw.principal_axes(points_wp)
+    rotation_np = np.array(rotation_wp).reshape(3, 3)
+
+    axes_pv = pv.principal_axes(points_np)
+    for row in range(3):
+        assert np.isclose(abs(float(np.dot(rotation_np[row], axes_pv[row]))), 1.0, atol=1e-5)
+
+    # A proper, orthonormal rotation -- the determinant is what pins the third row's sign.
+    assert np.allclose(rotation_np @ rotation_np.T, np.eye(3), atol=1e-5)
+    assert np.isclose(float(np.linalg.det(rotation_np)), 1.0, atol=1e-5)
+
+    # Eigenvalues are of the scatter matrix, so they carry no 1/n.
+    scatter_np = np.cov(points_np.T) * (points_np.shape[0] - 1)
+    assert np.allclose(
+        np.array(eigenvalues_wp), np.linalg.eigvalsh(scatter_np)[::-1], rtol=1e-5, atol=1e-5
+    )
+    assert np.allclose(np.array(centroid_wp), points_np.mean(axis=0), rtol=1e-5, atol=1e-5)
+
+
+def test_principal_axes_is_not_fit_line(device: str) -> None:
+    """
+    Pin the distinction the two functions exist to keep apart.
+
+    ``fit_line`` is ``trimesh.points.major_axis``: a *singular-value-weighted sum of all three*
+    right singular vectors of the uncentered matrix. ``principal_axes`` is the leading eigenvector
+    of the centred covariance. On an ordinary cloud these are different directions, which is why the
+    second was added rather than the first being changed.
+
+    Note what the weighted sum costs: because it mixes all three vectors, its value depends on each
+    one's *sign*, and no SVD fixes those. So ``fit_line`` reproduces its own oracle only where one
+    singular value dominates -- measured ``|dot|`` 1.000 on a 1000:1 needle against **0.992** on the
+    moderate cloud below. That is a property of the quantity, not a defect in either port.
+    """
+    rng = np.random.default_rng(3)
+    moderate_np = rng.standard_normal((500, 3)) @ np.diag([3.0, 1.0, 0.2])
+    moderate_wp = wp.array(moderate_np.astype(np.float32), dtype=wp.vec3, device=device)
+
+    leading_np = np.linalg.eigh(np.cov(moderate_np.T))[1][:, -1]
+    first_axis_np = np.array(tw.principal_axes(moderate_wp)[0]).reshape(3, 3)[0]
+
+    # principal_axes is the leading eigenvector ...
+    assert np.isclose(abs(float(np.dot(first_axis_np, leading_np))), 1.0, atol=1e-4)
+    # ... and the weighted major axis is a measurably different direction, on both sides.
+    assert abs(float(np.dot(tm.major_axis(moderate_np), leading_np))) < 0.99
+    assert abs(float(np.dot(np.array(tw.fit_line(moderate_wp)), leading_np))) < 0.99
+
+    # On a needle every definition coincides, which is why the difference went unnoticed.
+    needle_np = (rng.uniform(-10.0, 10.0, 200)[:, None] * np.array([0.3, 0.5, 0.8])) + (
+        0.01 * rng.standard_normal((200, 3))
+    )
+    needle_wp = wp.array(needle_np.astype(np.float32), dtype=wp.vec3, device=device)
+    needle_first_np = np.array(tw.principal_axes(needle_wp)[0]).reshape(3, 3)[0]
+    assert np.isclose(abs(float(np.dot(needle_first_np, tm.major_axis(needle_np)))), 1.0, atol=1e-3)
+    assert np.isclose(
+        abs(float(np.dot(np.array(tw.fit_line(needle_wp)), tm.major_axis(needle_np)))),
+        1.0,
+        atol=1e-3,
+    )
+
+
+def test_principal_axes_degenerate_spectrum(device: str) -> None:
+    """A near-equal eigenpair leaves its plane arbitrary; only the separated axis is comparable."""
+    rng = np.random.default_rng(5)
+    # 1000:1 needle: axes 2 and 3 both sit in the noise, so their split is not determined.
+    points_np = (rng.uniform(-10.0, 10.0, 200)[:, None] * np.array([0.3, 0.5, 0.8])) + (
+        0.01 * rng.standard_normal((200, 3))
+    )
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    rotation_np = np.array(tw.principal_axes(points_wp)[0]).reshape(3, 3)
+    axes_pv = pv.principal_axes(points_np)
+
+    assert np.isclose(abs(float(np.dot(rotation_np[0], axes_pv[0]))), 1.0, atol=1e-5)
+    # The degenerate pair still spans the same plane, even though the axes within it differ.
+    assert np.isclose(
+        abs(float(np.dot(rotation_np[0], np.cross(axes_pv[1], axes_pv[2])))), 1.0, atol=1e-4
+    )
+    assert np.allclose(rotation_np @ rotation_np.T, np.eye(3), atol=1e-5)
+
+
+def test_principal_axes_empty_and_single(device: str) -> None:
+    """An empty cloud gives the identity frame; a single point gives a frame at that point."""
+    empty_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    rotation_wp, eigenvalues_wp, centroid_wp = tw.principal_axes(empty_wp)
+    assert np.array_equal(np.array(rotation_wp).reshape(3, 3), np.eye(3))
+    assert np.array_equal(np.array(eigenvalues_wp), np.zeros(3))
+    assert np.array_equal(np.array(centroid_wp), np.zeros(3))
+
+    single_wp = wp.array(
+        np.array([[1.0, 2.0, 3.0]], dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    rotation_wp, _eigenvalues_wp, centroid_wp = tw.principal_axes(single_wp)
+    assert np.isclose(float(np.linalg.det(np.array(rotation_wp).reshape(3, 3))), 1.0, atol=1e-6)
+    assert np.allclose(np.array(centroid_wp), np.array([1.0, 2.0, 3.0]))
 
 
 @pytest.mark.parity("fit_plane", "trimesh", "pymeshlab")

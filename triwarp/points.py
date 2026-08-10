@@ -120,11 +120,16 @@ def gram_matrix(points: wp.array[wp.vec3]) -> wp.array[wp.mat33]:
 
 def fit_line(points: wp.array[wp.vec3]) -> wp.vec3:
     """
-    Approximate major axis of a point set via SVD.
+    Singular-value-weighted major axis of a point set (``trimesh.points.major_axis``).
 
-    The major axis is the dominant direction of the point distribution,
-    recovered from the singular value decomposition of the (uncentered)
-    point matrix.
+    The result is ``normalize(S @ V)`` over the SVD of the **uncentered** point matrix -- a sum of
+    all three right singular vectors weighted by their singular values, which is what
+    [`trimesh.points.major_axis`][] computes. It is **not** the first principal axis, and the two
+    part company as soon as the cloud is neither strongly elongated nor centred on the origin:
+    measured against the leading eigenvector of the covariance, ``|dot|`` is 1.000 on a 1000:1
+    needle but **0.939** on a 3:1:0.2 cloud and **0.812** once that cloud is offset from the origin.
+    For the principal frame, use
+    [`principal_axes`][triwarp.points.principal_axes].
 
     Parameters
     ----------
@@ -134,9 +139,17 @@ def fit_line(points: wp.array[wp.vec3]) -> wp.vec3:
     Returns
     -------
     wp.vec3
-        Unit vector along the approximate major axis. The result is
+        Unit vector along the weighted major axis. The result is
         direction-only: its sign is governed by the SVD convention and is
         not meaningful.
+
+    See Also
+    --------
+    [`principal_axes`][triwarp.points.principal_axes]
+        The first principal axis, and the full frame, of the *centred* cloud.
+    [`fit_plane`][triwarp.points.fit_plane]
+        The complementary weakest direction.
+    [`trimesh.points.major_axis`][]
     """
     device = points.device
     n = int(points.shape[0])
@@ -213,6 +226,13 @@ def fit_plane(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
         ``(centroid, normal)`` where ``centroid`` is a point on the plane
         and ``normal`` is its unit normal. The normal is sign-ambiguous: its
         orientation is governed by the SVD convention.
+
+    See Also
+    --------
+    [`principal_axes`][triwarp.points.principal_axes]
+        All three axes at once; this normal is its third row.
+    [`plane_basis`][triwarp.points.plane_basis]
+        Two in-plane axes completing this normal into a frame.
     """
     device = points.device
     n = int(points.shape[0])
@@ -293,6 +313,72 @@ def covariance(points: wp.array[wp.vec3], ddof: int = 1) -> wp.array[wp.mat33]:
     out = centered_covariance(points)
     wp.map(wp.div, out, wp.float32(n - ddof), out=out)
     return out
+
+
+def principal_axes(points: wp.array[wp.vec3]) -> tuple[wp.mat33, wp.vec3, wp.vec3]:
+    """
+    Principal frame of a point cloud: its three axes, spreads and centroid.
+
+    The eigenvectors of the centred covariance, ordered widest first, as the **rows** of a proper
+    rotation -- so ``rotation * (p - centroid)`` are the coordinates of ``p`` in the principal
+    frame, and ``wp.transpose(rotation)`` maps back. This is the fit
+    [`fit_line`][triwarp.points.fit_line] and [`fit_plane`][triwarp.points.fit_plane] each read one
+    direction of: the first row is the true major axis and the third is the plane normal.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` positions in space as ``wp.vec3``.
+
+    Returns
+    -------
+    rotation : wp.mat33
+        Principal axes as rows, in descending order of spread. A proper rotation: orthonormal with
+        determinant ``+1``, which fixes the third row's sign, so only the first two are ambiguous.
+    eigenvalues : wp.vec3
+        The three spreads, descending. These are the eigenvalues of the *scatter* matrix
+        [`centered_covariance`][triwarp.points.centered_covariance] returns, so they carry no
+        ``1 / n``; divide by ``n - 1`` for the sample variances along each axis.
+    centroid : wp.vec3
+        Mean position, the origin of the frame.
+
+    Notes
+    -----
+    Matches ``pyvista.principal_axes`` up to the sign of the first two axes, which no
+    eigendecomposition fixes.
+
+    Examples
+    --------
+    ```python
+    rotation, eigenvalues, centroid = tw.points.principal_axes(vertices_wp)
+    ```
+
+    See Also
+    --------
+    [`fit_line`][triwarp.points.fit_line]
+        A different estimator, and the reason this exists; see its docstring.
+    [`fit_plane`][triwarp.points.fit_plane]
+    [`covariance`][triwarp.points.covariance]
+    [`triwarp.bounds.oriented_bounding_box`][triwarp.bounds.oriented_bounding_box]
+        A searched box rather than a covariance fit, and tighter for it.
+    """
+    device = points.device
+    n = int(points.shape[0])
+    if n == 0:
+        return wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0), wp.vec3(), wp.vec3()
+
+    center = centroid(points)
+    scatter = centered_covariance(points, center=center)
+    out_rotation = wp.empty(1, dtype=wp.mat33, device=device)
+    out_eigenvalues = wp.empty(1, dtype=wp.vec3, device=device)
+    out_centroid = wp.empty(1, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_points.finalize_principal_axes,
+        dim=1,
+        inputs=[center, scatter, out_rotation, out_eigenvalues, out_centroid],
+        device=device,
+    )
+    return (out_rotation.list()[0], out_eigenvalues.list()[0], out_centroid.list()[0])
 
 
 def estimate_normals(
