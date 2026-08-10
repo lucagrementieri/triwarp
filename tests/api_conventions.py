@@ -27,12 +27,19 @@ test run on any violation:
 8. **A private helper is defined below its first caller** (``.claude/CLAUDE.md`` section 11's
    stepdown rule), so a reader never jumps backward to a definition they have not met. The 50 sites
    that predate the check are an explicit, staleness-checked debt list, not an exemption.
+9. **A Warp-version claim names a version at least as new as the installed ``warp-lang``.** This is
+   the one check that reads outside ``triwarp/``, and it exists because an upgrade left twelve
+   workarounds citing Warp 1.13-1.15 for a year: ``reference/warp_api/warp_version.py`` catches a
+   stale API *mirror*, and nothing caught a stale *justification*. Unlike checks 1-8 this one also
+   scans ``kernels/``, where five of those twelve lived.
 
 Why a static scan rather than importing ``triwarp``
 ---------------------------------------------------
 Importing would make the verdict depend on Warp's module cache and on which optional dependencies
 resolve, and would say nothing about files (checks 4 and 7) at all. A scan reads the tree as
-written, so its answer is the same in every environment and in every pytest invocation.
+written, so its answer is the same in every environment and in every pytest invocation. Check 9
+needs the installed Warp version and takes it from ``importlib.metadata`` rather than
+``warp.config.version``, so even that one imports nothing.
 """
 
 from __future__ import annotations
@@ -42,6 +49,8 @@ import functools
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as installed_version
 from pathlib import Path
 
 _TESTS_DIR = Path(__file__).resolve().parent
@@ -172,6 +181,25 @@ _MODULES_WITHOUT_KERNELS = frozenset({"constants", "homology", "io", "mesh", "ty
 # explicit debt list rather than a silent exemption -- **entries come out, they do not go in**.
 # Drain one whenever you are editing its module for another reason; a *new* helper must be placed
 # correctly, which is exactly what this check now enforces.
+# --- check 9 ------------------------------------------------------------------------------------
+
+# A Warp version claim, and the spelling is the convention: the word **Warp** immediately before
+# the number. Anything looser is unusable here -- this package writes measured ratios in the same
+# shape ("within 1.25x of best", "1.06 ms", "1.13x on CUDA at both sizes"), and a bare ``1.N`` token
+# matched 30 of them against 3 real claims when this check was first written. So a version claim
+# says "Warp 1.16", never "through 1.16" with the word three lines up.
+_WARP_VERSION_CLAIM = re.compile(r"\bWarp\s+1\.(\d+)(?:\.(\d+))?\b")
+
+# Version claims that deliberately record history rather than describe the installed Warp. Keyed by
+# ``(module, "1.x")``; the value is the reason, and it is where the re-verification goes -- so the
+# next upgrade reads a list of claims to re-run instead of a grep to invent.
+_WARP_VERSION_ALLOWLIST: dict[tuple[str, str], str] = {
+    ("graph", "1.15"): (
+        "deliberate history: names the version the CPU heap corruption was measured on so the "
+        "1.16 fix beside it has something to be a fix *of*"
+    )
+}
+
 _HELPER_ORDER_ALLOWLIST: dict[str, frozenset[str]] = {
     "array": frozenset({"_sorted_copy"}),
     "combine": frozenset({"_closest_loop_pair", "_longest_increasing_subsequence"}),
@@ -544,3 +572,82 @@ def helper_order_problems() -> list[str]:
         if name not in {helper[0] for helper in module.early_helpers}
     ]
     return problems + stale
+
+
+def installed_warp_version() -> str | None:
+    """Report the installed ``warp-lang`` version, or ``None`` when the distribution is absent."""
+    try:
+        return installed_version("warp-lang")
+    except PackageNotFoundError:
+        return None
+
+
+def _prose_blocks(source: str) -> list[tuple[int, str]]:
+    """
+    ``(lineno, text)`` for each run of consecutive comment lines and each string literal.
+
+    Newlines are preserved inside a block so a caller can recover the exact line from a match
+    offset. String literals cover every docstring without walking the tree, and a version claim
+    inside a non-docstring string is still a claim.
+    """
+    blocks: list[tuple[int, str]] = []
+    run_start, run_lines = 0, []
+    for lineno, line in enumerate(source.splitlines(), start=1):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            if not run_lines:
+                run_start = lineno
+            run_lines.append(stripped.lstrip("#"))
+            continue
+        if run_lines:
+            blocks.append((run_start, "\n".join(run_lines)))
+            run_lines = []
+    if run_lines:
+        blocks.append((run_start, "\n".join(run_lines)))
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return blocks
+    blocks.extend(
+        (node.lineno, node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    )
+    return blocks
+
+
+def warp_version_problems() -> list[str]:
+    """Check 9: a Warp-version claim naming a version older than the installed ``warp-lang``."""
+    installed = installed_warp_version()
+    if installed is None:  # nothing to compare against; the check abstains rather than guesses
+        return []
+    installed_minor = int(installed.split(".")[1])
+
+    problems: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
+        module = path.relative_to(_PACKAGE_DIR).with_suffix("").as_posix().replace("/", ".")
+        module = module.removesuffix(".__init__").lstrip(".")
+        for lineno, text in _prose_blocks(path.read_text()):
+            for match in _WARP_VERSION_CLAIM.finditer(text):
+                line = lineno + text.count("\n", 0, match.start())
+                minor = int(match.group(1))
+                if minor >= installed_minor:
+                    continue
+                key = (module, f"1.{minor}")
+                if key in _WARP_VERSION_ALLOWLIST:
+                    seen.add(key)
+                    continue
+                problems.append(
+                    f"{path.relative_to(_REPO_ROOT)}:{line}: names {match.group(0)}, "
+                    f"older than the installed warp-lang {installed} -- re-probe the claim against "
+                    "the installed version and re-stamp it, or add a _WARP_VERSION_ALLOWLIST entry "
+                    "recording why it deliberately names history"
+                )
+    problems.extend(
+        f"_WARP_VERSION_ALLOWLIST entry {key!r} matches nothing in triwarp/ -- drop it"
+        for key in sorted(_WARP_VERSION_ALLOWLIST)
+        if key not in seen and int(key[1].split(".")[1]) < installed_minor
+    )
+    return problems

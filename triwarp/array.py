@@ -1144,7 +1144,7 @@ def sortable_dtype(dtype: type[wp.Scalar]) -> type[wp.Scalar]:
     ordering: negative floats have descending bit patterns, and a ``uint64`` with its top bit set
     reads as a negative ``int64``. Warp sorts ``int32`` / ``int64`` / ``uint32`` / ``uint64`` /
     ``float32`` / ``float64`` keys directly, so the sort is done in this dtype instead of on the
-    reinterpreted bits. The set is unchanged through 1.16.0 (re-probed on both devices: every
+    reinterpreted bits. The set is unchanged through Warp 1.16.0 (re-probed on both devices: every
     narrower width -- ``int8`` / ``uint8`` / ``int16`` / ``uint16`` / ``float16`` -- still raises
     ``Unsupported keys and values data types``), so the widening table below still has a case for
     each of them.

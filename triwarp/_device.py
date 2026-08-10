@@ -13,10 +13,10 @@ def prefers_tiled_reduction(device: wp.DeviceLike) -> bool:
 
     Reductions that land in a single accumulator have two implementations in this package, and the
     choice is forced rather than stylistic. ``wp.launch_tiled`` runs exactly **one** lane per block
-    on the Warp CPU device -- ``wp.tid()``'s lane index is always 0 -- through 1.16, so a tile built
-    out of *per-lane* values, ``wp.tile(x)``, holds a single element there and any reduction over it
-    silently returns one element's worth of answer. Measured on 1.16.0: over 8 blocks of 64 ones,
-    ``wp.tile_sum(wp.tile(v))`` totals **8.0 on CPU** against 512.0 on CUDA.
+    on the Warp CPU device -- ``wp.tid()``'s lane index is always 0 -- through Warp 1.16, so a tile
+    built out of *per-lane* values, ``wp.tile(x)``, holds a single element there and any reduction
+    over it silently returns one element's worth of answer. Measured on Warp 1.16.0: over 8 blocks
+    of 64 ones, ``wp.tile_sum(wp.tile(v))`` totals **8.0 on CPU** against 512.0 on CUDA.
 
     The distinction matters, because it is *only* the lane-constructed tile that breaks.
     ``wp.tile_load`` reads its whole tile out of an array and is lane-independent, so it totals
@@ -117,7 +117,7 @@ def require_nonempty_mesh(faces: wp.array[wp.int32], name: str) -> None:
     "illegal memory access" errors. Every ``wp.Mesh(...)`` call site in this package must call
     this first instead of letting the native constructor run on an empty face buffer.
 
-    Re-verified on 1.16.0 in ten throwaway subprocesses, since the failure lands on a *later*
+    Re-verified on Warp 1.16.0 in ten throwaway subprocesses, since the failure lands on a *later*
     allocation and an in-process probe would poison the session: 10/10 aborted with
     ``Warp CUDA error 2: out of memory`` on the first 4 MiB allocation after the empty mesh, on a
     card with 32 GiB free.

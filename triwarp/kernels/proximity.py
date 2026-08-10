@@ -234,8 +234,8 @@ def winding_number_tiled(
 ) -> None:
     # One thread per (query, face slice): each walks a strided slice of the face list and commits
     # one atomic. Deliberately lane-free -- a block-wide `wp.tile_sum(wp.tile(...))` would be the
-    # natural reduction, but `wp.launch_tiled` runs exactly one lane per block on the Warp CPU
-    # backend through 1.16, so a per-lane tile holds one face and under-counts there.
+    # natural reduction, but `wp.launch_tiled` runs exactly one lane per block on the CPU
+    # backend through Warp 1.16, so a per-lane tile holds one face and under-counts there.
     q, j = wp.tid()
     p = query_points[int(q)]
     total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable

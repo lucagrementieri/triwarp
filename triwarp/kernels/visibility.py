@@ -173,7 +173,7 @@ def support_argmax_tiled(
     # (projection, index) key, and commits one atomic; the packed key's ordering makes atomic_max
     # the global argmax with the lowest index as tie-break. Lane-free on purpose -- the block-wide
     # `wp.tile_max(wp.tile(...))` this replaces reduced a single lane on the Warp CPU backend, where
-    # `wp.launch_tiled` runs one lane per block through 1.16.
+    # `wp.launch_tiled` runs one lane per block through Warp 1.16.
     q, j = wp.tid()
     normal = normals[support_indices[int(q)]]
     best = wp.float32(-wp.inf)

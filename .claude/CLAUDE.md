@@ -759,14 +759,23 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
 ## 14. Evolving the Public API
 
 **`tests/test_api_conventions.py` is the mechanical half of this section**, and it fails the default
-`pytest` run. Seven static checks over `triwarp/` (excluding `kernels/`): a summary line naming a
-reference library (§10); a `*_mask` producer that does not return `wp.array[wp.bool]`; a module
-summary advertising Warp; a module without a `tests/` **and** a `benchmarks/` file named for it; a
-private name reached across a module boundary; one public name exported by two modules; and a
-top-level `kernels/<name>.py` without its `triwarp/<name>.py` or the reverse (§4). Each check carries
-a written allowlist — read the reason before adding an entry, and prefer fixing the code. It does not
-replace review: it cannot tell whether a *new* name is a good one, only that it does not break a
-convention the package already holds to.
+`pytest` run. Nine static checks, eight of them over `triwarp/` (excluding `kernels/`): a summary
+line naming a reference library (§10); a `*_mask` producer that does not return `wp.array[wp.bool]`;
+a module summary advertising Warp; a module without a `tests/` **and** a `benchmarks/` file named for
+it; a private name reached across a module boundary; one public name exported by two modules; a
+top-level `kernels/<name>.py` without its `triwarp/<name>.py` or the reverse (§4); and a private
+helper defined above its first caller (§11). The ninth scans `kernels/` **as well**: a comment or
+docstring blaming a Warp version older than the installed `warp-lang`. Each check carries a written
+allowlist — read the reason before adding an entry, and prefer fixing the code. It does not replace
+review: it cannot tell whether a *new* name is a good one, only that it does not break a convention
+the package already holds to.
+
+**A Warp version claim is spelled `Warp 1.16`, with the word immediately before the number.** The
+staleness check reads that anchored form and nothing else, because this package writes measured
+ratios in the same shape (`within 1.25x of best`, `1.06 ms`, `1.13x on CUDA`) and a bare `1.N` token
+matched 30 of those against 3 real claims. So write "still present in Warp 1.16.0", never "still
+present in 1.16.0" with the word three lines up — the looser form is invisible to the check and will
+survive the next upgrade unexamined, which is exactly the failure the check exists to catch.
 
 - **Name a function after what it returns, in NumPy vocabulary — never after the Warp call it
   wraps.** `sort_pairs` named `warp.utils.radix_sort_pairs`'s key/value mechanism rather than its

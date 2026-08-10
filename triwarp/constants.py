@@ -47,8 +47,8 @@ TILE_2D = 8
 # there is unobservable, while the 30 us it gives up at 14M is not.
 #
 # The CPU device pays for it, and the ratio is recorded here rather than left to be rediscovered:
-# ``wp.launch_tiled`` runs one lane per block there (through 1.16), so folding 16 tiles means 16x
-# fewer blocks and correspondingly less parallelism -- measured **1.28x slower at 36k, 1.07x at
+# ``wp.launch_tiled`` runs one lane per block there (through Warp 1.16), so folding 16 tiles means
+# 16x fewer blocks and correspondingly less parallelism -- measured **1.28x slower at 36k, 1.07x at
 # 438k, 1.02x at 14M**.
 # Accepted on the CUDA number per CLAUDE.md section 13: the loss is bounded, shrinks with size, and
 # is at its worst exactly where the host floor already hides it.

@@ -36,7 +36,7 @@ preconditioner costing ``k`` mat-vecs per iteration cuts the iteration count by 
 ``sqrt(k)``, so total work scales as ``k / sqrt(k) = sqrt(k)`` — single-level preconditioning loses
 on this operator class, and only a multilevel method escapes it. IC(0) is the instructive case: its
 quality is real (2.1x to 4.2x fewer iterations under an exact apply), but Warp has no sparse
-triangular solve through 1.16 — ``warp.sparse`` exposes only ``bsr_from_triplets`` and
+triangular solve through Warp 1.16 — ``warp.sparse`` exposes only ``bsr_from_triplets`` and
 ``warp.optim.linear`` only the Krylov methods and a diagonal preconditioner — and no substitute for
 one keeps the win. Scored in mat-vec equivalents against
 Jacobi at ``tol=1e-8``, on ``-L`` with one degree of freedom pinned:

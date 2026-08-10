@@ -37,7 +37,7 @@ def update_argmin(
 ):
     # Running min-with-index update in place. Callers must be compiled with
     # ``enable_backward=False`` (``wp.ref`` helpers have no adjoint). Concrete ``float32``:
-    # ``wp.ref[wp.Scalar]`` generics do not instantiate through Warp 1.16 -- re-probed on 1.16.0,
+    # ``wp.ref[wp.Scalar]`` generics do not instantiate through Warp 1.16 -- re-probed there,
     # still a ``WarpCodegenError`` at kernel parse ("Couldn't find function overload") -- so float64
     # sites keep a hand-written loop; the index/tag stays ``int32``.
     if value < best_value:

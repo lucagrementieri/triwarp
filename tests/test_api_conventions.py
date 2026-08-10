@@ -1,7 +1,7 @@
 """
 The convention gate: the public API's names, summaries and file layout, checked statically.
 
-Seven conventions, one test each so the failing test's *name* says which one was broken. The scan
+Nine conventions, one test each so the failing test's *name* says which one was broken. The scan
 and the reasoning behind each rule live in [`tests/api_conventions.py`](api_conventions.py); this
 file is only the pytest surface.
 
@@ -18,12 +18,14 @@ from tests.api_conventions import (
     coverage_location_problems,
     duplicate_name_problems,
     helper_order_problems,
+    installed_warp_version,
     kernel_module_problems,
     library_in_summary_problems,
     mask_return_problems,
     private_import_problems,
     scan_package,
     warp_suffix_problems,
+    warp_version_problems,
 )
 
 
@@ -135,3 +137,21 @@ def test_private_helpers_follow_their_callers() -> None:
     checked for staleness, so an entry that gets fixed has to be removed rather than left to rot.
     """
     _fail("private helper(s) above their first caller:", helper_order_problems())
+
+
+def test_warp_version_claims_are_not_stale() -> None:
+    """
+    No comment or docstring blames a Warp version older than the installed ``warp-lang``.
+
+    The defect this exists for: the 1.16 upgrade re-stamped all five ``reference/warp_api/``
+    mirrors -- ``warp_version.py`` makes that checkable -- and left twelve *code* justifications
+    citing bugs in 1.13-1.15, none re-probed. Six of those bugs were still real and one was not,
+    and nothing in the tree could tell them apart. Unlike the other eight checks this one scans
+    ``kernels/`` too, since five of the twelve lived there.
+
+    ``_WARP_VERSION_ALLOWLIST`` is for a claim that deliberately records history, and the entry
+    carries the reason -- so the next upgrade inherits a list of claims to re-run.
+    """
+    if installed_warp_version() is None:
+        pytest.skip("warp-lang is not installed, so there is no version to compare against")
+    _fail("stale Warp-version claim(s):", warp_version_problems())

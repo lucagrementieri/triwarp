@@ -36,7 +36,7 @@ def hull_support_extremes(
     #
     # A block-wide `wp.tile_max(wp.tile(...))` reduction would be the natural fit here and was what
     # this kernel used, but `wp.launch_tiled` runs exactly ONE lane per block on the Warp CPU
-    # backend through 1.16 (`wp.tid()`'s lane index is always 0), so a tile built from per-lane
+    # backend through Warp 1.16 (`wp.tid()`'s lane index is always 0), so a tile of per-lane
     # values holds one element there and returns a wrong extreme. This form is lane-free.
     local_max = float(-FLOAT32_INF_CONSTANT)
     local_min = float(FLOAT32_INF_CONSTANT)

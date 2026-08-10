@@ -500,9 +500,10 @@ def bfs(
         - **The host is not the answer, though it is no longer unsafe.** One CPU core does this in
           well under a millisecond. Until Warp 1.16 that was moot — the CPU backend corrupted the
           process heap on this stack, so a host fallback traded a slow row for a random crash —
-          but the corruption is **fixed** as of 1.16.0 (the recorded ``filter_mut_dif_laplacian``
-          repro, which aborted ~60 % of the time on 1.15, ran clean in 12/12 subprocesses and in
-          5/5 long sessions interleaving Warp-CPU with igl and trimesh). What rules it out now is
+          but the corruption is **fixed** as of Warp 1.16.0 (the recorded
+          ``filter_mut_dif_laplacian`` repro, which aborted ~60 % of the time on Warp 1.15, ran
+          clean in 12/12 subprocesses and in 5/5 long sessions interleaving Warp-CPU with igl and
+          trimesh). What rules it out now is
           the interface: a host walk means reading the whole CSR and the result back across the
           bus, which is a different contract from the one this function has.
 
