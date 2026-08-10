@@ -360,6 +360,11 @@ def query_bvh_nearest_neighbors(
 # exactly — it walks past equals before displacing, and ``placed`` keeps a run of equal distances
 # further down the row from stopping the shift chain (without it, an equal element in the row
 # silently drops a neighbour, which was measured as one differing row in 20 000 on bunny at k=32).
+#
+# That rate is far below what a random cloud reveals, so the contract is pinned on a *tied* fixture:
+# ``tests/test_neighbors.py::test_query_nearest_register_row_tie_break_matches_global_row`` compares
+# every ``KNN_ROW_BUCKETS`` size against the global-row kernel element-wise on an integer lattice,
+# and deleting ``placed`` fails it at every ``k >= 4`` on both backends. Edit the carry and run it.
 # ---------------------------------------------------------------------------------------------
 
 
