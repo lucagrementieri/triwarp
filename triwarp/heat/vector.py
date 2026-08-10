@@ -40,6 +40,13 @@ _CG_TOLERANCE = 1e-8
 # maximum): see ``kernels/heat/vector.py`` for why nothing here can separate noise from signal.
 _RELATIVE_ZERO = 1e-12
 
+# Below this fraction of the direction field's maximum, a transported direction cannot be told from
+# the round-off the solve leaves where the transported copies cancel, measured at 8.7e-09 of the
+# maximum. A decade above that, and the *only* thing it drives is the mask
+# ``transport_tangent_vectors`` returns alongside its vectors -- no value is zeroed by it, so
+# flagging a marginal vertex costs the caller nothing.
+_RESOLVED_FRACTION = 1e-7
+
 
 # ``HeatOperators`` is imported directly rather than reached through ``tw.heat.distance``: this is
 # evaluated at module scope, and while ``triwarp.heat.__init__`` is still executing the ``heat``
@@ -200,7 +207,7 @@ def transport_tangent_vectors(
     vectors: wp.array[wp.vec2],
     t: float | None = None,
     operators: VectorHeatOperators | None = None,
-) -> wp.array[wp.vec2]:
+) -> tuple[wp.array[wp.vec2], wp.array[wp.bool]]:
     """
     Parallel-transport tangent vectors from a few source vertices to every vertex.
 
@@ -208,7 +215,22 @@ def transport_tangent_vectors(
     vectors (which preserves their *directions* well but smears their magnitudes), while a scalar
     extension of the source magnitudes supplies the length. The result at each vertex is the source
     vector carried along the shortest path to it — the field a "drag this arrow across the surface"
-    tool needs. Matches ``potpourri3d.MeshVectorHeatSolver.transport_tangent_vectors``.
+    tool needs. Matches ``potpourri3d.MeshVectorHeatSolver.transport_tangent_vectors``, which
+    returns the vectors alone.
+
+    The second return exists because the vectors are not self-describing: a zero is ambiguous and a
+    *non*-zero one is not always meaningful. A vertex is unresolved when the diffused direction that
+    reached it is shorter than ``1e-07`` of the field's maximum — a decade above the round-off left
+    where the transported copies cancel, measured at ``8.7e-09`` of the maximum. Below that line a
+    direction cannot be told from noise, and the mask says so rather than the value being altered:
+    no vector here is changed by it. Three situations it separates:
+
+    * **Nothing reached the vertex** — another connected component, or short-time diffusion
+      underflowing. Unresolved, and the vector is zero.
+    * **The cut locus** — several shortest paths arrive and their copies cancel. Unresolved, but the
+      vector may still have *full length*, pointing wherever the round-off landed. This is the case
+      that differs between CPU and CUDA, and the one a caller cannot otherwise detect.
+    * **An ordinary vertex.** Resolved.
 
     Parameters
     ----------
@@ -231,16 +253,18 @@ def transport_tangent_vectors(
 
     Returns
     -------
-    wp.array[wp.vec2]
+    transported : wp.array[wp.vec2]
         ``(n_vertices,)`` transported vectors, each in that vertex's own frame. No frames need to be
         passed in: the components come out in the canonical frames of
         [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames] by construction (see
         [`connection_laplacian`][triwarp.laplacian.connection_laplacian]). A **zero** vector means
-        the field vanished at that vertex: it is in another connected component from every source,
-        or short-time diffusion has underflowed before reaching it. The second is the common case on
-        a fine mesh, because the default ``t`` shrinks with the edge length — 39 461 of 40 962
-        vertices on a subdivision-6 icosphere, which is the method behaving as designed rather than
-        a failure. Pass a larger ``t`` to reach further.
+        the field vanished there: another connected component, or short-time diffusion underflowing
+        before it arrived. The second is the common case on a fine mesh, because the default ``t``
+        shrinks with the edge length — 39 461 of 40 962 vertices on a subdivision-6 icosphere, which
+        is the method behaving as designed rather than a failure. Pass a larger ``t`` to reach
+        further.
+    resolved : wp.array[wp.bool]
+        ``(n_vertices,)`` — ``True`` where the transported direction carries information.
 
     See Also
     --------
@@ -255,19 +279,19 @@ def transport_tangent_vectors(
         Where several shortest paths of equal length arrive, the copies they carry cancel, and what
         is left is round-off rather than a direction. This is not a pathological case: the corner of
         a cube shell diagonally opposite the source receives three copies 120 degrees apart whose
-        sum is *exactly* zero, for every source vector and every diffusion time. Which of the two
-        answers above comes back is then decided by the arithmetic — on CUDA enough round-off
-        survives (~1e-08 of the field maximum) to be scaled up to full length in an arbitrary
-        direction, while on CPU the same point can cancel to exactly zero and read as unreached.
-        Callers that need to know where this happens should look at
-        [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]: the cut locus is where its gradient
-        is discontinuous.
+        sum is *exactly* zero, for every source vector and every diffusion time. What comes back is
+        then decided by the arithmetic — on CUDA enough round-off survives to be scaled up to full
+        length in an arbitrary direction, while on CPU the same point can cancel to exactly zero and
+        read as unreached. ``resolved`` is ``False`` on both, and is the only way to tell.
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
     n_sources = int(sources.shape[0])
     if n_vertices == 0 or int(faces.shape[0]) == 0 or n_sources == 0:
-        return wp.zeros(n_vertices, dtype=wp.vec2, device=device)
+        return (
+            wp.zeros(n_vertices, dtype=wp.vec2, device=device),
+            wp.zeros(n_vertices, dtype=wp.bool, device=device),
+        )
 
     if operators is None:
         operators = vector_heat_operators(vertices, faces, t)
@@ -279,18 +303,32 @@ def transport_tangent_vectors(
     wp.map(wp.length, _as_vec2d(vectors), out=magnitudes)
     extended = extend_scalar(vertices, faces, sources, magnitudes, operators=scalar)
 
-    # "Has this direction vanished?" is asked relative to the field, because the field's length
-    # carries the mesh's scale. One host readback: ``reduce.max`` returns a Python scalar, ~0.1 ms
-    # against the three conjugate-gradient solves this function has already run.
+    # Both questions below are asked relative to the field, because the field's length carries the
+    # mesh's scale. One host readback: ``reduce.max`` returns a Python scalar, ~0.1 ms against the
+    # three conjugate-gradient solves this function has already run.
     lengths = wp.empty(n_vertices, dtype=wp.float64, device=device)
     wp.map(wp.length, direction, out=lengths)
-    floor = wp.float64(_RELATIVE_ZERO * tw.reduce.max(lengths))
+    maximum = tw.reduce.max(lengths)
 
     scaled = wp.empty(n_vertices, dtype=wp.vec2d, device=device)
-    wp.map(kernel_heat_vector.scale_to_magnitude, direction, extended, floor, out=scaled)
+    wp.map(
+        kernel_heat_vector.scale_to_magnitude,
+        direction,
+        extended,
+        wp.float64(_RELATIVE_ZERO * maximum),
+        out=scaled,
+    )
     transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     wp.map(kernel_heat_vector.to_vec2, scaled, out=transported)
-    return transported
+
+    resolved = wp.empty(n_vertices, dtype=wp.bool, device=device)
+    wp.map(
+        kernel_heat_vector.is_resolved,
+        lengths,
+        wp.float64(_RESOLVED_FRACTION * maximum),
+        out=resolved,
+    )
+    return transported, resolved
 
 
 def log_map(

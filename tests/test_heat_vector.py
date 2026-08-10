@@ -134,7 +134,7 @@ def test_transport_on_a_flat_patch_is_constant(device: str) -> None:
     vertices_wp = wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device=device)
     faces_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
 
-    transported = tw.heat.vector.transport_tangent_vectors(
+    transported, _ = tw.heat.vector.transport_tangent_vectors(
         vertices_wp,
         faces_wp,
         wp.array(np.array([size * size // 2], dtype=np.int32), dtype=wp.int32, device=device),
@@ -182,7 +182,7 @@ def test_transport_tangent_vectors_matches_potpourri3d(
         [float(basis_x[source] @ basis_x_pp[source]), float(basis_x[source] @ basis_y_pp[source])]
     ]
 
-    transported_wp = tw.heat.vector.transport_tangent_vectors(
+    transported_wp, _ = tw.heat.vector.transport_tangent_vectors(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(np.array([source], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device),
@@ -210,7 +210,7 @@ def test_transport_preserves_source_magnitudes(
 ) -> None:
     _, mesh_wp = request.getfixturevalue(mesh_name)
     magnitude = 2.5
-    transported = tw.heat.vector.transport_tangent_vectors(
+    transported, _ = tw.heat.vector.transport_tangent_vectors(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device),
@@ -229,7 +229,7 @@ def test_transport_does_not_cross_components(
     # ``cave_cube`` is a cube shell around a smaller cube shell: two components. Nothing can be
     # transported across the gap, so the cavity's vertices must come back at zero rather than with a
     # smeared value (potpourri3d returns NaN on this mesh; see the note above).
-    transported = tw.heat.vector.transport_tangent_vectors(
+    transported, _ = tw.heat.vector.transport_tangent_vectors(
         mesh_wp.points,
         mesh_wp.indices,
         wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device),
@@ -293,14 +293,14 @@ def test_transport_cancels_at_a_symmetric_cut_locus_point(
     antipode = int(np.argmin(np.linalg.norm(positions_np + positions_np[0], axis=1)))
 
     def _directions(points_np: np.ndarray) -> np.ndarray:
-        transported = tw.heat.vector.transport_tangent_vectors(
+        transported, _ = tw.heat.vector.transport_tangent_vectors(
             wp.array(points_np, dtype=wp.vec3, device=mesh_wp.device),
             mesh_wp.indices,
             sources_wp,
             vectors_wp,
-        ).numpy()
-        norm = np.linalg.norm(transported, axis=1, keepdims=True)
-        return transported / np.where(norm > 0.0, norm, 1.0)
+        )
+        norm = np.linalg.norm(transported.numpy(), axis=1, keepdims=True)
+        return transported.numpy() / np.where(norm > 0.0, norm, 1.0)
 
     jitter = np.random.default_rng(20260810).normal(scale=1e-3, size=positions_np.shape)
     moved = np.linalg.norm(_directions(positions_np) - _directions(positions_np + jitter), axis=1)
@@ -331,10 +331,10 @@ def test_transport_is_invariant_to_mesh_scale(
     vectors_wp = wp.array(
         np.array([[1.0, 0.0]], dtype=np.float32), dtype=wp.vec2, device=mesh_wp.device
     )
-    unit = tw.heat.vector.transport_tangent_vectors(
+    unit, _ = tw.heat.vector.transport_tangent_vectors(
         mesh_wp.points, mesh_wp.indices, sources_wp, vectors_wp
     )
-    rescaled = tw.heat.vector.transport_tangent_vectors(
+    rescaled, _ = tw.heat.vector.transport_tangent_vectors(
         wp.array(mesh_wp.points.numpy() * scale, dtype=wp.vec3, device=mesh_wp.device),
         mesh_wp.indices,
         sources_wp,
@@ -345,6 +345,65 @@ def test_transport_is_invariant_to_mesh_scale(
     # rescaled field cannot pass the comparison by matching zeros against zeros.
     assert np.allclose(np.linalg.norm(unit.numpy(), axis=1), 1.0, rtol=1e-4, atol=1e-4)
     assert np.allclose(rescaled.numpy(), unit.numpy(), rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize(
+    ("mesh_name", "n_resolved"), [("cave_cube", 7), ("icosahedron", 11), ("hemisphere", 97)]
+)
+def test_transport_validity_mask_flags_the_unresolvable(
+    request: pytest.FixtureRequest, mesh_name: str, n_resolved: int, device: str
+) -> None:
+    """
+    Class A against resolved counts measured on both devices.
+
+    The counts are the point of the mask: they are identical on CPU and CUDA (7 / 11 / 97) where
+    the *vectors* are not, because at a cancelling vertex CPU returns the zero vector and CUDA
+    returns a full-length one. ``hemisphere`` resolves every vertex, so the boolean assert is
+    parametrized over inputs producing both answers rather than only the interesting one.
+    """
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    sources_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
+    vectors_wp = wp.array(
+        np.array([[1.0, 0.0]], dtype=np.float32), dtype=wp.vec2, device=mesh_wp.device
+    )
+    transported, resolved = tw.heat.vector.transport_tangent_vectors(
+        mesh_wp.points, mesh_wp.indices, sources_wp, vectors_wp
+    )
+
+    assert resolved.numpy().sum() == n_resolved
+    # A vanished vector is never called resolved. The converse fails, which is the next test.
+    assert not ((np.linalg.norm(transported.numpy(), axis=1) == 0.0) & resolved.numpy()).any()
+
+
+def test_transport_validity_mask_separates_the_cut_locus_from_the_unreached(
+    cave_cube: tuple[object, wp.Mesh], device: str
+) -> None:
+    """
+    Class A: on ``cave_cube`` the mask is exactly "reachable, and not the antipodal corner".
+
+    Those are the two ways a direction fails to exist, and the vectors alone distinguish neither
+    from an ordinary answer: the cavity's eight vertices and the antipode all read zero on CPU,
+    while on CUDA the antipode reads *full length* in a direction that is pure round-off. The mask
+    is the same array on both.
+    """
+    _, mesh_wp = cave_cube
+    sources_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
+    vectors_wp = wp.array(
+        np.array([[1.0, 0.0]], dtype=np.float32), dtype=wp.vec2, device=mesh_wp.device
+    )
+    _, resolved = tw.heat.vector.transport_tangent_vectors(
+        mesh_wp.points, mesh_wp.indices, sources_wp, vectors_wp
+    )
+
+    positions_np = mesh_wp.points.numpy()
+    antipode = int(np.argmin(np.linalg.norm(positions_np + positions_np[0], axis=1)))
+    labels = tw.graph.connected_component_labels_from_edges(
+        tw.edges.edges_unique(mesh_wp.indices)[0], int(mesh_wp.points.shape[0])
+    ).numpy()
+    expected = (labels == labels[0]) & (np.arange(len(labels)) != antipode)
+
+    assert expected.sum() == 7
+    assert np.array_equal(resolved.numpy(), expected)
 
 
 # ---------------------------------------------------------------------------
@@ -430,10 +489,10 @@ def test_reused_operators_give_the_same_answer(
         (
             tw.heat.vector.transport_tangent_vectors(
                 mesh_wp.points, mesh_wp.indices, sources, vectors
-            ),
+            )[0],
             tw.heat.vector.transport_tangent_vectors(
                 mesh_wp.points, mesh_wp.indices, sources, vectors, operators=operators
-            ),
+            )[0],
         ),
         (
             tw.heat.vector.log_map(mesh_wp.points, mesh_wp.indices, 0),
@@ -457,10 +516,10 @@ def test_operators_fix_the_diffusion_time(icosahedron: tuple[object, wp.Mesh], d
     # ``t`` lives in the assembled system, so a bundle built with one ``t`` must win over the
     # argument rather than being silently re-derived. A wrong precedence here would not be subtle:
     # ``t`` differs by six orders of magnitude between the two.
-    with_bundle = tw.heat.vector.transport_tangent_vectors(
+    with_bundle, _ = tw.heat.vector.transport_tangent_vectors(
         mesh_wp.points, mesh_wp.indices, sources, vectors, t=1e-6, operators=slow
     )
-    direct = tw.heat.vector.transport_tangent_vectors(
+    direct, _ = tw.heat.vector.transport_tangent_vectors(
         mesh_wp.points, mesh_wp.indices, sources, vectors, t=1.0
     )
     span = float(np.abs(direct.numpy()).max())
@@ -496,7 +555,9 @@ def test_vector_heat_empty(device: str) -> None:
     assert tw.heat.vector.extend_scalar(
         vertices_wp, faces_wp, empty_int, wp.empty(0, dtype=wp.float64, device=device)
     ).shape == (0,)
-    assert tw.heat.vector.transport_tangent_vectors(
+    empty_transported, empty_resolved = tw.heat.vector.transport_tangent_vectors(
         vertices_wp, faces_wp, empty_int, wp.empty(0, dtype=wp.vec2, device=device)
-    ).shape == (0,)
+    )
+    assert empty_transported.shape == (0,)
+    assert empty_resolved.shape == (0,)
     assert tw.heat.vector.log_map(vertices_wp, faces_wp, 0).shape == (0,)

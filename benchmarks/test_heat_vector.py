@@ -104,13 +104,14 @@ def _run_transport(bench_case: BenchCase, *, amortized: bool) -> None:
             np.array([[1.0, 0.0]], dtype=np.float32), dtype=wp.vec2, device=bench_case.device
         )
         operators = tw.heat.vector.vector_heat_operators(vertices, faces) if amortized else None
-        transported = bench_case.run(
+        transported, resolved = bench_case.run(
             lambda: tw.heat.vector.transport_tangent_vectors(
                 vertices, faces, sources, vectors, operators=operators
             ),
             rounds=_ROUNDS,
         )
         assert transported.shape == (n_vertices,)
+        assert resolved.shape == (n_vertices,)
     elif amortized:
         # The reference's own split: construct the solver once, then time only its solve.
         solver = _solver_pp(bench_case)

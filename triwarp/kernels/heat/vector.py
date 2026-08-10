@@ -61,14 +61,28 @@ def scale_to_magnitude(direction: wp.vec2d, magnitude: wp.float64, floor: wp.flo
     # The floor separates a vanished direction from a represented one. It does *not* separate signal
     # from round-off and must not be raised in an attempt to: the smallest genuinely diffused value
     # on ``half_torus`` is 8.0e-10 of the maximum, *below* the 8.7e-09 of round-off left at a point
-    # where the transported copies cancel exactly. That round-off is the float32 frames' noise
-    # rather than the solve's, so it does not move when the conjugate-gradient tolerance is
-    # tightened from 1e-8 to 1e-14 (measured: 8.7e-09, then 1.0e-08 at every tighter tolerance).
-    # The two populations overlap and no magnitude cut tells them apart.
+    # where the transported copies cancel exactly. The two populations overlap, so no magnitude cut
+    # tells them apart -- that is what ``is_resolved`` below reports instead of acting on.
+    #
+    # That round-off is the float32 *transport angles*, not the solve and not the frames (which the
+    # connection Laplacian never reads). Three measurements: it does not move when the
+    # conjugate-gradient tolerance is tightened from 1e-8 to 1e-14; injecting angle noise moves it
+    # linearly, extrapolating back to ~2e-07 rad of effective error, which is float32 epsilon on an
+    # O(1) angle; and redoing the ring accumulation in float64 while still storing float32 leaves it
+    # at 9.9e-09, so it is the angles' storage precision rather than the accumulation order.
     length = wp.length(direction)
     if length <= floor:
         return wp.vec2d(wp.float64(0.0), wp.float64(0.0))
     return (magnitude / length) * direction
+
+
+@wp.func
+def is_resolved(length: wp.float64, floor: wp.float64) -> wp.bool:
+    # Companion to ``scale_to_magnitude``: same field, same relative comparison, higher floor.
+    # Where that one asks "did this vanish?" and must stay below every genuine value, this one asks
+    # "can this be told from round-off?" and must stay *above* it -- so a vertex can be reported
+    # unresolved while still carrying a full-length vector, which is exactly the cut-locus case.
+    return length > floor
 
 
 @wp.func
