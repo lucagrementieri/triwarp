@@ -516,19 +516,13 @@ def segment_nondegenerate(segments: wp.array2d[wp.vec3], out_valid: wp.array[wp.
 
 
 @wp.func
-def find_outside_corner(s0: wp.int32, s1: wp.int32, s2: wp.int32) -> wp.int32:
-    if s0 == SLICE_SIGN_OUTSIDE:
+def find_corner_with_sign(s0: wp.int32, s1: wp.int32, s2: wp.int32, sign: wp.int32) -> wp.int32:
+    # The corner carrying ``sign``, for the two cut cases where exactly one does. Corner 2 is the
+    # fallthrough rather than a third test: the caller has already established that one of the three
+    # matches.
+    if s0 == sign:
         return wp.int32(0)
-    if s1 == SLICE_SIGN_OUTSIDE:
-        return wp.int32(1)
-    return wp.int32(2)
-
-
-@wp.func
-def find_inside_corner(s0: wp.int32, s1: wp.int32, s2: wp.int32) -> wp.int32:
-    if s0 == SLICE_SIGN_INSIDE:
-        return wp.int32(0)
-    if s1 == SLICE_SIGN_INSIDE:
+    if s1 == sign:
         return wp.int32(1)
     return wp.int32(2)
 
@@ -693,7 +687,7 @@ def emit_quad_cut(
     s0 = face_signs[face_index, 0]
     s1 = face_signs[face_index, 1]
     s2 = face_signs[face_index, 2]
-    outside = find_outside_corner(s0, s1, s2)
+    outside = find_corner_with_sign(s0, s1, s2, SLICE_SIGN_OUTSIDE)
     inside_a = (outside + wp.int32(1)) % wp.int32(3)
     inside_b = (outside + wp.int32(2)) % wp.int32(3)
     v_a = faces[base + inside_a]
@@ -730,7 +724,7 @@ def emit_tri_cut(
     s0 = face_signs[face_index, 0]
     s1 = face_signs[face_index, 1]
     s2 = face_signs[face_index, 2]
-    inside = find_inside_corner(s0, s1, s2)
+    inside = find_corner_with_sign(s0, s1, s2, SLICE_SIGN_INSIDE)
     v_inside = faces[base + inside]
     edge_0 = inside
     edge_1 = (inside + wp.int32(2)) % wp.int32(3)

@@ -2,7 +2,7 @@ import warp as wp
 
 from triwarp.constants import PI, TOLERANCE_ZERO_CONSTANT, TWO_PI
 from triwarp.kernels.halfedge import halfedge_destination
-from triwarp.kernels.predicates import triangle_normal, unit_tangent
+from triwarp.kernels.predicates import project_out_normal, triangle_normal, unit_tangent
 from triwarp.kernels.tangent_space import corner_angle
 from triwarp.kernels.triangles import face_vertices
 
@@ -238,7 +238,7 @@ def trace_from_faces(
     # surface traces only what is tangential to it.
     direction = directions[r]
     normal = face_normal_of(vertices, faces, f)
-    arc_length = wp.length(direction - wp.dot(direction, normal) * normal)
+    arc_length = wp.length(project_out_normal(direction, normal))
     out_counts[r] = trace_walk(
         vertices,
         faces,
@@ -302,7 +302,7 @@ def trace_from_vertices(
     # incident face the walk starts in -- the vertex has one tangent space and the fan's faces each
     # tilt differently out of it.
     normal = vertex_normals[v]
-    arc_length = wp.length(direction - wp.dot(direction, normal) * normal)
+    arc_length = wp.length(project_out_normal(direction, normal))
     out_counts[r] = trace_walk(
         vertices,
         faces,

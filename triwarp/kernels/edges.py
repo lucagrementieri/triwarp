@@ -37,14 +37,6 @@ def edge_lengths(
 
 
 @wp.kernel
-def count_edge_faces(inverse: wp.array[wp.int32], out_count: wp.array[wp.int32]) -> None:
-    # Per unique edge: number of incident face-corners (2 interior, 1 boundary). ``inverse`` is the
-    # corner -> unique-edge map from ``edges.edges_unique``.
-    c = int(wp.tid())
-    wp.atomic_add(out_count, inverse[c], 1)
-
-
-@wp.kernel
 def face_edge_lengths(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_lengths: wp.array2d[wp.float32]
 ) -> None:

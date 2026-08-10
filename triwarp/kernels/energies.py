@@ -332,18 +332,9 @@ def cr_gradient_rows(
 
 
 @wp.func
-def select3_int(value0: wp.int32, value1: wp.int32, value2: wp.int32, index: wp.int32) -> wp.int32:
-    if index == 0:
-        return value0
-    if index == 1:
-        return value1
-    return value2
-
-
-@wp.func
-def select3_f64(
-    value0: wp.float64, value1: wp.float64, value2: wp.float64, index: wp.int32
-) -> wp.float64:
+def select3(value0: wp.Scalar, value1: wp.Scalar, value2: wp.Scalar, index: wp.int32) -> wp.Scalar:
+    # Index into three loose values. Generic over the scalar type, so the int32 edge ids and the
+    # float64 matrix entries of the curved-Hessian assembly share one definition.
     if index == 0:
         return value0
     if index == 1:
@@ -437,23 +428,23 @@ def curved_hessian_triplets(
     diag1, pp1, pq1 = curved_pair_terms(l2_1, l2_2, l2_0, dbl_area, oh1 * oh2, kv2, kv0, kv1)
     diag2, pp2, pq2 = curved_pair_terms(l2_2, l2_0, l2_1, dbl_area, oh2 * oh0, kv0, kv1, kv2)
     for alpha in range(3):
-        edge_a = select3_int(eid0, eid1, eid2, wp.int32(alpha))
+        edge_a = select3(eid0, eid1, eid2, wp.int32(alpha))
         mi_a = inv_mass[edge_a]
         for beta in range(3):
-            edge_b = select3_int(eid0, eid1, eid2, wp.int32(beta))
+            edge_b = select3(eid0, eid1, eid2, wp.int32(beta))
             mimi = mi_a * inv_mass[edge_b]
             b_pp = zero
             b_pq = zero
             b_qp = zero
             if alpha == beta:
-                b_pp = select3_f64(diag0, diag1, diag2, wp.int32(alpha))
+                b_pp = select3(diag0, diag1, diag2, wp.int32(alpha))
             elif beta == (alpha + 2) % 3:
-                b_pp = select3_f64(pp0, pp1, pp2, wp.int32(alpha))
-                b_pq = select3_f64(pq0, pq1, pq2, wp.int32(alpha))
+                b_pp = select3(pp0, pp1, pp2, wp.int32(alpha))
+                b_pq = select3(pq0, pq1, pq2, wp.int32(alpha))
                 b_qp = -b_pq
             else:
-                b_pp = select3_f64(pp0, pp1, pp2, wp.int32(beta))
-                b_qp = select3_f64(pq0, pq1, pq2, wp.int32(beta))
+                b_pp = select3(pp0, pp1, pp2, wp.int32(beta))
+                b_qp = select3(pq0, pq1, pq2, wp.int32(beta))
                 b_pq = -b_qp
             pair_out = base_out + (alpha * 3 + beta) * 16
             for u_slot in range(4):

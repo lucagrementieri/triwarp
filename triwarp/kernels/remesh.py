@@ -658,16 +658,6 @@ CORNER_VERTEX = wp.constant(wp.int32(2))
 
 
 @wp.kernel
-def scatter_edge_endpoint_counts(
-    edges: wp.array2d(dtype=wp.int32), out_count: wp.array(dtype=wp.int32)
-) -> None:
-    # Add 1 to the per-vertex counter for both endpoints of every listed edge.
-    e = int(wp.tid())
-    wp.atomic_add(out_count, edges[e, 0], 1)
-    wp.atomic_add(out_count, edges[e, 1], 1)
-
-
-@wp.kernel
 def scatter_feature_endpoint_counts(
     adjacency_edges: wp.array2d(dtype=wp.int32),
     angles: wp.array(dtype=wp.float32),
@@ -835,24 +825,15 @@ def commit_collapses(
 
 
 @wp.kernel
-def mark_distinct_faces(
-    faces: wp.array(dtype=wp.int32), out_valid: wp.array(dtype=wp.bool)
-) -> None:
-    # A face survives a collapse remap only if its three vertex indices are still distinct.
+def faces_with_distinct_indices(faces: wp.array[wp.int32], out_mask: wp.array[wp.bool]) -> None:
+    # A face survives a vertex remap only if its three corners are still three distinct vertices.
+    # Every decimation here ends in one: an edge collapse merges two of them, vertex clustering
+    # sends two into the same cell.
     f = int(wp.tid())
-    a = faces[f * 3 + 0]
-    b = faces[f * 3 + 1]
-    c = faces[f * 3 + 2]
-    out_valid[f] = a != b and b != c and a != c
-
-
-@wp.kernel
-def accumulate_vertex_valence(
-    unique_edges: wp.array2d(dtype=wp.int32), out_valence: wp.array(dtype=wp.int32)
-) -> None:
-    e = int(wp.tid())
-    wp.atomic_add(out_valence, unique_edges[e, 0], 1)
-    wp.atomic_add(out_valence, unique_edges[e, 1], 1)
+    i0 = faces[f * 3 + 0]
+    i1 = faces[f * 3 + 1]
+    i2 = faces[f * 3 + 2]
+    out_mask[f] = i0 != i1 and i1 != i2 and i0 != i2
 
 
 @wp.kernel
@@ -1008,7 +989,7 @@ def law_of_cosines_angle(adjacent_a: wp.float32, adjacent_b: wp.float32, opposit
     if denominator <= TOLERANCE_ZERO_CONSTANT:
         return wp.float32(0.0)
     cosine = (adjacent_a * adjacent_a + adjacent_b * adjacent_b - opposite * opposite) / denominator
-    return wp.acos(wp.clamp(cosine, -1.0, 1.0))
+    return wp.acos(cosine)  # wp.acos auto-clamps to [-1, 1]
 
 
 @wp.func
@@ -1196,16 +1177,6 @@ def cluster_pick_closest(
     )
     if wp.length_sq(vertices[v] - center) <= min_distance[labels[v]]:
         wp.atomic_min(out_representative, labels[v], v)
-
-
-@wp.kernel
-def faces_with_distinct_indices(faces: wp.array[wp.int32], out_mask: wp.array[wp.bool]) -> None:
-    # A face survives vertex clustering only if its three corners landed in three different cells.
-    f = int(wp.tid())
-    i0 = faces[f * 3 + 0]
-    i1 = faces[f * 3 + 1]
-    i2 = faces[f * 3 + 2]
-    out_mask[f] = i0 != i1 and i1 != i2 and i0 != i2
 
 
 # Objective for ``objective_flip_candidates``. A warp-uniform kernel argument rather than a

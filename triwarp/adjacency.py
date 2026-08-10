@@ -9,6 +9,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.kernels import adjacency as kernel_adjacency
+from triwarp.kernels import scatter as kernel_scatter
 
 
 @overload
@@ -295,8 +296,10 @@ def vertex_face_adjacency(
     vertex_faces = wp.empty(3 * n_faces, dtype=wp.int32, device=device)
 
     counts = wp.zeros(row_count, dtype=wp.int32, device=device)
+    # A flat face buffer *is* the corner -> vertex map, so one launch over all 3 * n_faces corners
+    # gives each vertex its incident-face count.
     wp.launch(
-        kernel_adjacency.count_vertex_faces, dim=n_faces, inputs=[faces, counts], device=device
+        kernel_scatter.count_occurrences, dim=3 * n_faces, inputs=[faces, counts], device=device
     )
     # Deliberately NOT tw.array.counts_to_offsets: that helper always reads the total back, and
     # this function never needs it (it is 3 * n_faces, known on the host). Converting for

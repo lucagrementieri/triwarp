@@ -180,16 +180,8 @@ def build_procrustes_matrix(
     # Shifted cross-moment identity, over the membership-masked subset:
     # H = sum_m outer(b - bc, a - ac)
     #   = M - outer(Sm_b, ac') - outer(bc', Sm_a) + N_m outer(bc', ac')
-    cov = wp.mat33(
-        acc[ACC_COV + 0],
-        acc[ACC_COV + 1],
-        acc[ACC_COV + 2],
-        acc[ACC_COV + 3],
-        acc[ACC_COV + 4],
-        acc[ACC_COV + 5],
-        acc[ACC_COV + 6],
-        acc[ACC_COV + 7],
-        acc[ACC_COV + 8],
+    cov = wp.matrix_from_rows(
+        acc_vec3(acc, ACC_COV + 0), acc_vec3(acc, ACC_COV + 3), acc_vec3(acc, ACC_COV + 6)
     )
     cov = (
         cov
@@ -202,10 +194,7 @@ def build_procrustes_matrix(
     inv_scales = wp.float32(1.0) / (bscale * ascale)
     target = cov * inv_scales
 
-    U = wp.mat33(wp.float32(0.0))  # noqa: N806
-    sigma = wp.vec3(wp.float32(0.0), wp.float32(0.0), wp.float32(0.0))
-    V = wp.mat33(wp.float32(0.0))  # noqa: N806
-    wp.svd3(target, U, sigma, V)
+    U, sigma, V = wp.svd3(target)  # noqa: N806
 
     Vt = wp.transpose(V)  # noqa: N806
 

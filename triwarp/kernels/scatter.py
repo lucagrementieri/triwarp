@@ -1,3 +1,5 @@
+from typing import Any
+
 import warp as wp
 
 from triwarp.kernels.array import binary_search_index
@@ -12,12 +14,33 @@ def atomic_add_vec3(out_sum: wp.array2d[wp.float32], row: wp.int32, v: wp.vec3) 
 
 
 @wp.kernel
-def scatter_add_scalar(
-    values: wp.array[wp.Scalar], indices: wp.array[wp.int32], out_sum: wp.array[wp.Scalar]
-) -> None:
-    # 1D indexed scalar accumulation: out_sum[indices[tid]] += values[tid].
+def scatter_add(values: wp.array[Any], indices: wp.array[wp.int32], out_sum: wp.array[Any]) -> None:
+    # 1D indexed accumulation: out_sum[indices[tid]] += values[tid]. ``Any`` rather than
+    # ``wp.Scalar`` because the latter does not instantiate for vectors, and the vector heat
+    # method seeds a ``wp.vec2d`` field through exactly this kernel. The widening gives up a
+    # compile-time dtype guard: Warp still rejects a mismatched ``values`` / ``out_sum`` pair, but
+    # the error arrives from codegen rather than from overload resolution and reads worse.
     tid = int(wp.tid())
     wp.atomic_add(out_sum, indices[tid], values[tid])
+
+
+@wp.kernel
+def count_occurrences(indices: wp.array[wp.int32], out_counts: wp.array[wp.int32]) -> None:
+    # Histogram of ``indices``: one atomic increment per entry. Launch over ``indices.shape[0]``.
+    # Sizing a CSR is what every caller wants it for -- incident faces per vertex (a flat face
+    # buffer *is* the corner -> vertex map), face-corners per unique edge, outgoing halfedges per
+    # vertex -- so the counts feed a scan and the caller allocates ``out_counts`` zeroed.
+    tid = int(wp.tid())
+    wp.atomic_add(out_counts, indices[tid], 1)
+
+
+@wp.kernel
+def count_occurrences_rows(indices: wp.array2d[wp.int32], out_counts: wp.array[wp.int32]) -> None:
+    # Row form of ``count_occurrences``: every column of every row increments its own counter.
+    # One thread per row, so an edge list ``(n, 2)`` gives each endpoint's degree in one launch.
+    row = int(wp.tid())
+    for j in range(indices.shape[1]):
+        wp.atomic_add(out_counts, indices[row, j], 1)
 
 
 @wp.kernel

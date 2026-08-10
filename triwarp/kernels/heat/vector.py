@@ -25,14 +25,6 @@ def seed_source_scalars(
     wp.atomic_add(out_weighted, v, values[s])
 
 
-@wp.kernel
-def seed_source_vectors(
-    sources: wp.array[wp.int32], vectors: wp.array[wp.vec2d], out_field: wp.array[wp.vec2d]
-) -> None:
-    s = int(wp.tid())
-    wp.atomic_add(out_field, sources[s], vectors[s])
-
-
 @wp.func
 def divide_positive(
     numerator: wp.float64, denominator: wp.float64, floor: wp.float64
@@ -83,16 +75,6 @@ def is_resolved(length: wp.float64, floor: wp.float64) -> wp.bool:
     # "can this be told from round-off?" and must stay *above* it -- so a vertex can be reported
     # unresolved while still carrying a full-length vector, which is exactly the cut-locus case.
     return length > floor
-
-
-@wp.func
-def to_vec2(v: wp.vec2d) -> wp.vec2:
-    return wp.vec2(wp.float32(v[0]), wp.float32(v[1]))
-
-
-@wp.func
-def to_vec2d(v: wp.vec2) -> wp.vec2d:
-    return wp.vec2d(wp.float64(v[0]), wp.float64(v[1]))
 
 
 @wp.func

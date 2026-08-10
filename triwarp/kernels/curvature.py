@@ -8,6 +8,7 @@ import warp as wp
 from warp.fem.linalg import householder_qr_decomposition, solve_triangular
 
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels.predicates import project_out_normal
 
 # Custom fixed-size float64 types for the 5x5 quadric-fit normal equations: the rest of the
 # kernel runs in float32, but the least-squares solve is done in float64 for conditioning.
@@ -25,7 +26,7 @@ def _build_reference_frame(
 ) -> tuple[wp.vec3, wp.vec3]:
     """Return (t1, t2) orthonormal tangent frame with t1 pointing toward first_neighbor."""
     diff = first_neighbor - vertex
-    t1 = diff - normal * wp.dot(diff, normal)
+    t1 = project_out_normal(diff, normal)
     if wp.length(t1) < wp.float32(1e-6):
         # fallback: arbitrary perpendicular to normal
         if wp.abs(normal[0]) < wp.float32(0.9):

@@ -20,6 +20,7 @@ import warp as wp
 import triwarp as tw
 from triwarp.constants import INT32_MAX
 from triwarp.kernels import halfedge as kernel_halfedge
+from triwarp.kernels import scatter as kernel_scatter
 
 
 def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> wp.array[wp.int32]:
@@ -161,12 +162,11 @@ def vertex_one_rings(
     if n_halfedges == 0 or n_vertices == 0:
         return offsets, ring_halfedges, is_boundary
 
+    # Every face contributes exactly one outgoing halfedge per corner, so a vertex's ring size is
+    # how often it appears in the flat face buffer -- no walk needed to size the CSR.
     counts = wp.zeros(n_vertices, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_halfedge.count_outgoing_halfedges,
-        dim=n_halfedges,
-        inputs=[faces, counts],
-        device=device,
+        kernel_scatter.count_occurrences, dim=n_halfedges, inputs=[faces, counts], device=device
     )
     # Inclusive scan into offsets[1:] leaves the leading zero in place, giving the usual CSR bounds.
     # Deliberately NOT tw.array.counts_to_offsets: that helper always reads the total back, and

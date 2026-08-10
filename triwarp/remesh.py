@@ -36,8 +36,8 @@ import triwarp.typing as twt
 from triwarp._device import require_nonempty_mesh
 from triwarp.constants import INT32_MAX, TOLERANCE_MOLLIFY
 from triwarp.kernels import array as kernel_array
-from triwarp.kernels import edges as kernel_edges
 from triwarp.kernels import remesh as kernel_remesh
+from triwarp.kernels import scatter as kernel_scatter
 from triwarp.laplacian import mollify_intrinsic
 
 # Callback that launches a predicate kernel filling ``out_flip``/``out_quad`` for one flip
@@ -225,13 +225,13 @@ def _classify(
     boundary = tw.boundary.boundary_edges(vertices, faces, edges_sorted=edges_sorted)
     if int(boundary.shape[0]) > 0:
         wp.launch(
-            kernel_remesh.scatter_edge_endpoint_counts,
+            kernel_scatter.count_occurrences_rows,
             dim=int(boundary.shape[0]),
             inputs=[boundary, feature_count],
             device=device,
         )
         wp.launch(
-            kernel_remesh.scatter_edge_endpoint_counts,
+            kernel_scatter.count_occurrences_rows,
             dim=int(boundary.shape[0]),
             inputs=[boundary, boundary_count],
             device=device,
@@ -282,7 +282,9 @@ def _collapse_pass(
 
         edge_face_count = wp.zeros(m, dtype=wp.int32, device=device)
         wp.launch(
-            kernel_edges.count_edge_faces,
+            # Face-corners per unique edge: 2 interior, 1 boundary. ``inverse`` is the
+            # corner -> unique-edge map from ``edges.edges_unique``.
+            kernel_scatter.count_occurrences,
             dim=int(inverse.shape[0]),
             inputs=[inverse, edge_face_count],
             device=device,
@@ -345,7 +347,10 @@ def _collapse_pass(
         remapped = tw.array.gather(remap, faces)
         valid = wp.empty(n_faces, dtype=wp.bool, device=device)
         wp.launch(
-            kernel_remesh.mark_distinct_faces, dim=n_faces, inputs=[remapped, valid], device=device
+            kernel_remesh.faces_with_distinct_indices,
+            dim=n_faces,
+            inputs=[remapped, valid],
+            device=device,
         )
         kept = tw.array.flatnonzero(valid)
         faces = tw.array.gather(remapped.reshape((n_faces, 3)), kept).reshape(-1)
@@ -367,7 +372,7 @@ def _valence_flip_pass(
         valence = wp.zeros(n_vertices, dtype=wp.int32, device=device)
         unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices)
         wp.launch(
-            kernel_remesh.accumulate_vertex_valence,
+            kernel_scatter.count_occurrences_rows,
             dim=int(unique_edges.shape[0]),
             inputs=[unique_edges, valence],
             device=device,
@@ -850,7 +855,9 @@ def quadric_decimate(
 
         edge_face_count = wp.zeros(m, dtype=wp.int32, device=device)
         wp.launch(
-            kernel_edges.count_edge_faces,
+            # Face-corners per unique edge: 2 interior, 1 boundary. ``inverse`` is the
+            # corner -> unique-edge map from ``edges.edges_unique``.
+            kernel_scatter.count_occurrences,
             dim=int(inverse.shape[0]),
             inputs=[inverse, edge_face_count],
             device=device,
@@ -1003,7 +1010,7 @@ def quadric_decimate(
         remapped = tw.array.gather(remap, current_faces)
         valid = wp.empty(n_current, dtype=wp.bool, device=device)
         wp.launch(
-            kernel_remesh.mark_distinct_faces,
+            kernel_remesh.faces_with_distinct_indices,
             dim=n_current,
             inputs=[remapped, valid],
             device=device,

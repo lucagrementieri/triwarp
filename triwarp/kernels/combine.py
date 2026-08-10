@@ -28,21 +28,6 @@ def offset_packed_faces(
     faces[i] = faces[i] + vertex_offsets[piece]
 
 
-@wp.func
-def searchsorted_right(edge: wp.array[wp.int32], n: wp.int32, value: wp.int32) -> wp.int32:
-    # Number of entries in the non-decreasing ``edge[0:n]`` that are ``<= value``
-    # (``numpy.searchsorted(..., side="right")``), via binary search.
-    lo = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
-    hi = int(n)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if edge[mid] <= value:
-            lo = mid + 1
-        else:
-            hi = mid
-    return lo
-
-
 @wp.kernel
 def cyclic_gather(
     src: wp.array[wp.int32],
@@ -176,7 +161,10 @@ def bridge_b_faces(
     out_faces: wp.array[wp.int32],
 ) -> None:
     j = int(wp.tid())
-    apex = roll_loop_a[searchsorted_right(edge, n_a, j) % n_a]
+    # ``edge`` is non-decreasing, so the upper bound over its first ``n_a`` entries is the count of
+    # entries at or below ``j`` -- the A-loop vertex this B-loop vertex fans to. A result of ``n_a``
+    # wraps to the first.
+    apex = roll_loop_a[kernel_array.binary_search_index(edge[:n_a], j) % n_a]
     # The B edge is reversed (``fliplr``) so the bridge winding matches mesh B's faces.
     out_faces[3 * j + 0] = roll_loop_b[_wrap(j + 1, m_b)]
     out_faces[3 * j + 1] = roll_loop_b[j]

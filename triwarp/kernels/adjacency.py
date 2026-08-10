@@ -1,34 +1,29 @@
 import warp as wp
 
 from triwarp.kernels import array as kernel_array
-
-
-@wp.func
-def sorted_edge_key(a: wp.int32, b: wp.int32, radix: wp.uint64) -> wp.uint64:
-    # Row hash of the undirected edge ``{a, b}``, byte-identical to what ``pack_indices`` produces
-    # for the sorted edge row ``[min, max]``: ``lo + hi * radix``. Matching it exactly keeps the
-    # radix sort's key order -- and so the adjacency row order -- the same as the composed path.
-    lo = wp.uint64(wp.uint32(wp.min(a, b)))
-    hi = wp.uint64(wp.uint32(wp.max(a, b)))
-    return lo + hi * radix
+from triwarp.kernels.grouping import pack_edge_key
 
 
 @wp.kernel
 def face_edge_keys(
-    faces: wp.array[wp.int32], radix: wp.uint64, out_keys: wp.array[wp.uint64]
+    faces: wp.array[wp.int32], base: wp.uint64, out_keys: wp.array[wp.uint64]
 ) -> None:
     # One launch in place of ``faces_to_edges`` + ``pack_indices``: the three undirected edge keys
     # of face ``tid`` straight from the face buffer, so the intermediate ``(3F, 2)`` edge rows are
     # never materialized. Edge ``3f + k`` belongs to face ``f``, which is what lets
     # ``edge_pairs_to_face_pairs`` recover the face index as ``e // 3``.
+    #
+    # ``pack_edge_key`` is byte-identical to what ``pack_indices`` produces for the sorted edge row
+    # ``[min, max]``, which is what keeps the radix sort's key order -- and so the adjacency row
+    # order -- the same as the composed path.
     tid = int(wp.tid())
     f = tid * 3
     i0 = faces[f + 0]
     i1 = faces[f + 1]
     i2 = faces[f + 2]
-    out_keys[f + 0] = sorted_edge_key(i0, i1, radix)
-    out_keys[f + 1] = sorted_edge_key(i1, i2, radix)
-    out_keys[f + 2] = sorted_edge_key(i2, i0, radix)
+    out_keys[f + 0] = pack_edge_key(i0, i1, base)
+    out_keys[f + 1] = pack_edge_key(i1, i2, base)
+    out_keys[f + 2] = pack_edge_key(i2, i0, base)
 
 
 @wp.kernel
@@ -134,13 +129,6 @@ def face_adjacency_angles(
     normal_a = face_normals[face_adjacency[tid, 0]]
     normal_b = face_normals[face_adjacency[tid, 1]]
     out_angles[tid] = kernel_array.vector_angle_vec(normal_a, normal_b)
-
-
-@wp.kernel
-def count_vertex_faces(faces: wp.array[wp.int32], out_counts: wp.array[wp.int32]) -> None:
-    f = int(wp.tid())
-    for k in range(3):
-        wp.atomic_add(out_counts, faces[f * 3 + k], 1)
 
 
 @wp.kernel

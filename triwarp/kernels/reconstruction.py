@@ -16,6 +16,7 @@ from triwarp.kernels.array import sort3, update_argmax
 from triwarp.kernels.predicates import (
     delone_metrics,
     is_unfold_quadrangle_convex,
+    project_out_normal,
     triangle_aspect_ratio,
 )
 
@@ -248,7 +249,7 @@ def build_local_triangulations(
     normalizer_sq = float(0.0)  # noqa: UP018 — mutable Warp dynamic variable
     for i in range(m):
         d = points[nbr[i]] - a
-        pv = d - wp.dot(n_center, d) * n_center
+        pv = project_out_normal(d, n_center)
         if normalizer_sq <= 0.0:
             base = pv
             normalizer_sq = wp.length_sq(pv)
@@ -259,7 +260,7 @@ def build_local_triangulations(
     # --- polar angle of each neighbour around the center in the tangent plane ---
     for i in range(m):
         d = points[nbr[i]] - a
-        pv = d - wp.dot(n_center, d) * n_center
+        pv = project_out_normal(d, n_center)
         if wp.length_sq(pv) > 0.0:
             vec = wp.normalize(pv)
         else:

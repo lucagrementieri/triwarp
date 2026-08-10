@@ -9,7 +9,7 @@ from triwarp.kernels.array import (
     wrap_index,
 )
 from triwarp.kernels.points import plane_basis
-from triwarp.kernels.predicates import orient2d
+from triwarp.kernels.predicates import orient2d, project_out_normal
 
 
 @wp.func
@@ -194,7 +194,7 @@ def arc_point(po: wp.vec3, pd: wp.vec3, no: wp.vec3, nd: wp.vec3, t: wp.float32)
     tangent = wp.normalize(b)
     # wp.sign is -1 below zero and +1 otherwise, matching the guard this replaces.
     bulge = wp.sign(wp.dot(b, nd - no)) * (no + nd)
-    m = bulge - wp.dot(bulge, tangent) * tangent  # bulge direction, orthogonalised against chord
+    m = project_out_normal(bulge, tangent)  # bulge direction, orthogonalised against the chord
     if wp.length_sq(m) < CURVATURE_EPS:
         return linear
     m = wp.normalize(m)

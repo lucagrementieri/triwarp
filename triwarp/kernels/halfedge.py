@@ -49,14 +49,6 @@ def pair_sorted_halfedges(
 
 
 @wp.kernel
-def count_outgoing_halfedges(faces: wp.array[wp.int32], out_counts: wp.array[wp.int32]) -> None:
-    # Every face contributes exactly one outgoing halfedge per corner, so the ring size of a vertex
-    # is its outgoing-halfedge count — no walk needed to size the CSR.
-    h = int(wp.tid())
-    wp.atomic_add(out_counts, faces[h], 1)
-
-
-@wp.kernel
 def ring_start_halfedges(
     faces: wp.array[wp.int32],
     twins: wp.array[wp.int32],

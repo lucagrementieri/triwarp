@@ -104,6 +104,11 @@ def to_vec2d(v: wp.vec2) -> wp.vec2d:
 
 
 @wp.func
+def to_vec2(v: wp.vec2d) -> wp.vec2:
+    return wp.vec2(wp.float32(v[0]), wp.float32(v[1]))
+
+
+@wp.func
 def square_scalar(value: wp.Scalar) -> wp.Scalar:
     return value * value
 

@@ -27,6 +27,8 @@ import warp.sparse as wps
 import triwarp as tw
 import triwarp.linalg as twl
 from triwarp.heat.distance import HeatOperators, heat_geodesic, heat_operators
+from triwarp.kernels import array as kernel_array
+from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels.heat import vector as kernel_heat_vector
 from triwarp.laplacian import connection_laplacian, mass_matrix_entries
 from triwarp.tangent_space import vertex_tangent_frames
@@ -319,7 +321,7 @@ def transport_tangent_vectors(
         out=scaled,
     )
     transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
-    wp.map(kernel_heat_vector.to_vec2, scaled, out=transported)
+    wp.map(kernel_array.to_vec2, scaled, out=transported)
 
     resolved = wp.empty(n_vertices, dtype=wp.bool, device=device)
     wp.map(
@@ -404,7 +406,7 @@ def log_map(
     reference = wp.array([[1.0, 0.0]], dtype=wp.vec2, device=device)
     transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     wp.map(
-        kernel_heat_vector.to_vec2,
+        kernel_array.to_vec2,
         _diffuse_from_sources(vector_system, sources, reference, n_vertices, device),
         out=transported,
     )
@@ -483,9 +485,9 @@ def _diffuse_from_sources(
     """Seed a tangent field at the source vertices, then diffuse it."""
     field = wp.zeros(n_vertices, dtype=wp.vec2d, device=device)
     wp.launch(
-        kernel_heat_vector.seed_source_vectors,
+        kernel_scatter.scatter_add,
         dim=int(sources.shape[0]),
-        inputs=[sources, _as_vec2d(vectors), field],
+        inputs=[_as_vec2d(vectors), sources, field],
         device=device,
     )
     return diffuse_tangent_field(system, field)
@@ -549,5 +551,5 @@ def _solve_scalar(
 def _as_vec2d(vectors: wp.array[wp.vec2]) -> wp.array[wp.vec2d]:
     """Widen a tangent field to float64, the precision the diffusion solves run in."""
     widened = wp.empty(int(vectors.shape[0]), dtype=wp.vec2d, device=vectors.device)
-    wp.map(kernel_heat_vector.to_vec2d, vectors, out=widened)
+    wp.map(kernel_array.to_vec2d, vectors, out=widened)
     return widened

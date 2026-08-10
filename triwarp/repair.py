@@ -713,7 +713,7 @@ def make_volume(
         labels = tw.adjacency.face_connected_component_labels(faces)
         accum = wp.zeros(n_faces, dtype=wp.float32, device=device)
         wp.launch(
-            kernel_scatter.scatter_add_scalar,
+            kernel_scatter.scatter_add,
             dim=n_faces,
             inputs=[signed_volumes, labels, accum],
             device=device,

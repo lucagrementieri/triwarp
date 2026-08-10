@@ -149,7 +149,7 @@ def tetrahedron_planes(
     ea = a - apex
     eb = b - apex
     ec = c - apex
-    m = wp.mat33(ea[0], eb[0], ec[0], ea[1], eb[1], ec[1], ea[2], eb[2], ec[2])
+    m = wp.matrix_from_cols(ea, eb, ec)
     if wp.abs(wp.determinant(m)) <= flatness * wp.length(ea) * wp.length(eb) * wp.length(ec):
         out_valid[t] = False
         return
