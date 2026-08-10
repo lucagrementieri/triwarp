@@ -24,6 +24,16 @@ def prefers_tiled_reduction(device: wp.DeviceLike) -> bool:
     unconditionally while ``kernels/totals.py`` and ``kernels/distance.py``, which build their tiles
     from a per-thread contribution, must branch here.
 
+    **This is a known platform limitation, not a bug awaiting a report.** ``wp.launch`` documents
+    ``block_dim`` as "always 1 for cpu devices" and ``launch_tiled`` forces it, so ``wp.tile(x)``
+    correctly forms a one-element tile there; Warp's tiles guide states the consequence outright.
+    Upstream tracks closing the gap in two open issues -- NVIDIA/warp#1480 (*CPU/GPU parity for all
+    tile code*, which names ``wp.tile(lane_value)`` followed by reductions or scans as an affected
+    pattern) and NVIDIA/warp#1638 (*Add efficient CPU block execution with fibers*, the request to
+    honour ``block_dim > 1`` on CPU). So do not re-probe this from scratch on the next upgrade and
+    do not file it: read those two issues, and expect the branch to become removable only once CPU
+    blocks run more than one logical thread.
+
     The portable form instead gives each thread a strided slice and one atomic, which is correct on
     both devices but gives up the block shuffle-reduce, and that costs real CUDA time once the input
     is large enough to exceed the launch overhead: measured 1.67x on the area-weighted centroid at

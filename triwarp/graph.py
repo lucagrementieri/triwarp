@@ -166,7 +166,10 @@ def connected_component_labels_from_edges(
         synchronization on a path that otherwise has none. Pass ``validate=False`` **only** when
         the caller produced ``edges`` itself and knows the bound holds — an adjacency list from
         [`face_adjacency`][triwarp.adjacency.face_adjacency], say. With an out-of-range index the
-        unchecked path reads out of bounds rather than raising.
+        unchecked path reads **and writes** out of bounds rather than raising: the scatter kernels
+        downstream index a ``node_count``-element buffer by the raw endpoint. On a CUDA device that
+        lands in device memory; on the **CPU** device a Warp array is host heap, so it overwrites
+        glibc's allocator metadata and aborts the process later, somewhere unrelated.
 
     See Also
     --------

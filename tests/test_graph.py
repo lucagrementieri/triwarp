@@ -479,6 +479,33 @@ def test_successor_cycles_validates_range(device: str) -> None:
         tw.graph.successor_cycles(edges_wp, 4)
 
 
+def test_successor_cycles_validates_before_launching(
+    device: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The range check must run before *any* kernel launch, not merely before returning.
+
+    ``scatter_successor`` indexes a ``node_count``-element buffer by the raw edge endpoint, so a
+    check that runs after it has already let an out-of-range endpoint write past the end — on the
+    CPU device that is a host-heap overwrite which aborts the process much later, somewhere
+    unrelated. Asserting only that ``ValueError`` is raised does not catch that: the exception is
+    raised either way. Counting launches is what pins the ordering.
+    """
+    launches = 0
+    real_launch = wp.launch
+
+    def counting_launch(*args: object, **kwargs: object) -> object:
+        nonlocal launches
+        launches += 1
+        return real_launch(*args, **kwargs)
+
+    monkeypatch.setattr(wp, "launch", counting_launch)
+    edges_wp = wp.array(np.array([[0, 9], [9, 0]], dtype=np.int32), dtype=wp.int32, device=device)
+    with pytest.raises(ValueError, match="edge indices must lie in"):
+        tw.graph.successor_cycles(edges_wp, 4)
+    assert launches == 0
+
+
 def test_successor_cycles_malformed_input_stays_in_range(device: str) -> None:
     """
     Two in-edges on one node (not a successor graph) must not return garbage.
