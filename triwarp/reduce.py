@@ -569,56 +569,41 @@ _BOOL_REDUCE: dict[str, _BoolReduceSpec] = {
 }
 
 
-def _validate_scalar_array(
-    array: twt.ScalarArray, spec: _ScalarReduceSpec, axis: Literal[0, 1] | None
-) -> None:
-    if int(array.size) == 0:
-        raise ValueError(f"{spec.name} requires a non-empty array.")
-    if array.ndim == 1 and axis is not None:
-        raise ValueError(f"{spec.name} requires axis=None for a 1D array.")
-    if array.ndim not in (1, 2):
-        raise ValueError(f"{spec.name} requires a 1D or 2D array.")
-
-
-def _launch_axis_scalar(
-    array: twt.Array2dScalar, axis: Literal[0, 1], spec: _ScalarReduceSpec
-) -> twt.Array1dScalar | tuple[twt.Array1dScalar, twt.Array1dScalar]:
-    n_rows, n_cols = int(array.shape[0]), int(array.shape[1])
-    n_out, reduced = (n_rows, n_cols) if axis == 1 else (n_cols, n_rows)
-
-    if reduced < TILE_1D:
-        # The tiled kernels never take their tile_load branch below TILE_1D: every lane of every
-        # block redundantly runs the serial remainder, a TILE_1D-fold read amplification (measured
-        # 49x on a (14M, 3) axis=1 max). One plain thread per output, direct write, no init fill.
-        serial = spec.axis_rows_serial if axis == 1 else spec.axis_cols_serial
-        if spec.dual_axis:
-            out_min = wp.empty(n_out, dtype=array.dtype, device=array.device)
-            out_max = wp.empty(n_out, dtype=array.dtype, device=array.device)
-            wp.launch(serial, dim=n_out, inputs=[array, out_min, out_max], device=array.device)
-            return cast(twt.Array1dScalar, out_min), cast(twt.Array1dScalar, out_max)
-        out = wp.empty(n_out, dtype=array.dtype, device=array.device)
-        wp.launch(serial, dim=n_out, inputs=[array, out], device=array.device)
-        return cast(twt.Array1dScalar, out)
-
-    tiled = spec.axis_rows_tiled if axis == 1 else spec.axis_cols_tiled
-    n_tiles = (reduced + TILE_1D - 1) // TILE_1D
-    if spec.dual_axis:
-        out_min = wp.full(n_out, twt.dtype_max(array.dtype), dtype=array.dtype, device=array.device)
-        out_max = wp.full(n_out, twt.dtype_min(array.dtype), dtype=array.dtype, device=array.device)
-        wp.launch_tiled(
-            tiled,
-            dim=[n_out, n_tiles],
-            inputs=[array, out_min, out_max],
-            block_dim=TILE_1D,
-            device=array.device,
-        )
-        return cast(twt.Array1dScalar, out_min), cast(twt.Array1dScalar, out_max)
-
-    out = wp.full(n_out, spec.init_global(array.dtype), dtype=array.dtype, device=array.device)
-    wp.launch_tiled(
-        tiled, dim=[n_out, n_tiles], inputs=[array, out], block_dim=TILE_1D, device=array.device
+def _launch_global_vec3_minmax(array: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
+    """Component-wise corner pair of a ``wp.vec3`` array: one launch, one buffer, one readback."""
+    n = int(array.shape[0])
+    if n == 0:
+        raise ValueError("minmax requires a non-empty array.")
+    if int(array.ndim) != 1:
+        raise ValueError("minmax requires a rank-1 wp.vec3 array.")
+    corners = wp.full(6, math.inf, dtype=wp.float32, device=array.device)
+    wp.launch(
+        kernel_reduce.minmax_vec3_chunked,
+        dim=(n + TILE_1D - 1) // TILE_1D,
+        inputs=[array, corners],
+        device=array.device,
     )
-    return cast(twt.Array1dScalar, out)
+    corners_np = corners.numpy()
+    # Slots 3..5 hold the *negated* upper corner; see the kernel.
+    return wp.vec3(*corners_np[:3].tolist()), wp.vec3(*(-corners_np[3:]).tolist())
+
+
+def _reduce_scalar(
+    array: twt.ScalarArray, axis: Literal[0, 1] | None, spec: _ScalarReduceSpec
+) -> (
+    float
+    | int
+    | twt.Array1dScalar
+    | tuple[twt.Array1dScalar, twt.Array1dScalar]
+    | tuple[float, float]
+    | tuple[int, int]
+):
+    _validate_scalar_array(array, spec, axis)
+
+    if array.ndim == 2 and axis is not None:
+        return _launch_axis_scalar(array, axis, spec)
+
+    return _launch_global_scalar_tiled(array, spec)
 
 
 def _launch_global_scalar_tiled(
@@ -697,54 +682,56 @@ def _flattened_for_global(array: twt.ScalarArray) -> twt.Array1dScalar | None:
     return None
 
 
-def _launch_global_vec3_minmax(array: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
-    """Component-wise corner pair of a ``wp.vec3`` array: one launch, one buffer, one readback."""
-    n = int(array.shape[0])
-    if n == 0:
-        raise ValueError("minmax requires a non-empty array.")
-    if int(array.ndim) != 1:
-        raise ValueError("minmax requires a rank-1 wp.vec3 array.")
-    corners = wp.full(6, math.inf, dtype=wp.float32, device=array.device)
-    wp.launch(
-        kernel_reduce.minmax_vec3_chunked,
-        dim=(n + TILE_1D - 1) // TILE_1D,
-        inputs=[array, corners],
-        device=array.device,
-    )
-    corners_np = corners.numpy()
-    # Slots 3..5 hold the *negated* upper corner; see the kernel.
-    return wp.vec3(*corners_np[:3].tolist()), wp.vec3(*(-corners_np[3:]).tolist())
+def _launch_axis_scalar(
+    array: twt.Array2dScalar, axis: Literal[0, 1], spec: _ScalarReduceSpec
+) -> twt.Array1dScalar | tuple[twt.Array1dScalar, twt.Array1dScalar]:
+    n_rows, n_cols = int(array.shape[0]), int(array.shape[1])
+    n_out, reduced = (n_rows, n_cols) if axis == 1 else (n_cols, n_rows)
 
+    if reduced < TILE_1D:
+        # The tiled kernels never take their tile_load branch below TILE_1D: every lane of every
+        # block redundantly runs the serial remainder, a TILE_1D-fold read amplification (measured
+        # 49x on a (14M, 3) axis=1 max). One plain thread per output, direct write, no init fill.
+        serial = spec.axis_rows_serial if axis == 1 else spec.axis_cols_serial
+        if spec.dual_axis:
+            out_min = wp.empty(n_out, dtype=array.dtype, device=array.device)
+            out_max = wp.empty(n_out, dtype=array.dtype, device=array.device)
+            wp.launch(serial, dim=n_out, inputs=[array, out_min, out_max], device=array.device)
+            return cast(twt.Array1dScalar, out_min), cast(twt.Array1dScalar, out_max)
+        out = wp.empty(n_out, dtype=array.dtype, device=array.device)
+        wp.launch(serial, dim=n_out, inputs=[array, out], device=array.device)
+        return cast(twt.Array1dScalar, out)
 
-def _reduce_scalar(
-    array: twt.ScalarArray, axis: Literal[0, 1] | None, spec: _ScalarReduceSpec
-) -> (
-    float
-    | int
-    | twt.Array1dScalar
-    | tuple[twt.Array1dScalar, twt.Array1dScalar]
-    | tuple[float, float]
-    | tuple[int, int]
-):
-    _validate_scalar_array(array, spec, axis)
+    tiled = spec.axis_rows_tiled if axis == 1 else spec.axis_cols_tiled
+    n_tiles = (reduced + TILE_1D - 1) // TILE_1D
+    if spec.dual_axis:
+        out_min = wp.full(n_out, twt.dtype_max(array.dtype), dtype=array.dtype, device=array.device)
+        out_max = wp.full(n_out, twt.dtype_min(array.dtype), dtype=array.dtype, device=array.device)
+        wp.launch_tiled(
+            tiled,
+            dim=[n_out, n_tiles],
+            inputs=[array, out_min, out_max],
+            block_dim=TILE_1D,
+            device=array.device,
+        )
+        return cast(twt.Array1dScalar, out_min), cast(twt.Array1dScalar, out_max)
 
-    if array.ndim == 2 and axis is not None:
-        return _launch_axis_scalar(array, axis, spec)
-
-    return _launch_global_scalar_tiled(array, spec)
-
-
-def _launch_global_bool_tiled(mask_i32: wp.array[wp.int32], spec: _BoolReduceSpec) -> bool:
-    out = wp.full(1, spec.init_global, dtype=wp.int32, device=mask_i32.device)
-    n = int(mask_i32.shape[0])
+    out = wp.full(n_out, spec.init_global(array.dtype), dtype=array.dtype, device=array.device)
     wp.launch_tiled(
-        spec.tiled_1d,
-        dim=[kernel_reduce.blocks_1d(n)],
-        inputs=[mask_i32, out],
-        block_dim=TILE_1D,
-        device=mask_i32.device,
+        tiled, dim=[n_out, n_tiles], inputs=[array, out], block_dim=TILE_1D, device=array.device
     )
-    return bool(out.numpy().item() != 0)
+    return cast(twt.Array1dScalar, out)
+
+
+def _validate_scalar_array(
+    array: twt.ScalarArray, spec: _ScalarReduceSpec, axis: Literal[0, 1] | None
+) -> None:
+    if int(array.size) == 0:
+        raise ValueError(f"{spec.name} requires a non-empty array.")
+    if array.ndim == 1 and axis is not None:
+        raise ValueError(f"{spec.name} requires axis=None for a 1D array.")
+    if array.ndim not in (1, 2):
+        raise ValueError(f"{spec.name} requires a 1D or 2D array.")
 
 
 def _reduce_bool(
@@ -783,3 +770,16 @@ def _reduce_bool(
         return out
 
     raise ValueError(f"{spec.name} requires a 1D or 2D array.")
+
+
+def _launch_global_bool_tiled(mask_i32: wp.array[wp.int32], spec: _BoolReduceSpec) -> bool:
+    out = wp.full(1, spec.init_global, dtype=wp.int32, device=mask_i32.device)
+    n = int(mask_i32.shape[0])
+    wp.launch_tiled(
+        spec.tiled_1d,
+        dim=[kernel_reduce.blocks_1d(n)],
+        inputs=[mask_i32, out],
+        block_dim=TILE_1D,
+        device=mask_i32.device,
+    )
+    return bool(out.numpy().item() != 0)

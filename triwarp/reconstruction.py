@@ -37,76 +37,6 @@ if TYPE_CHECKING:
     import warp.fem as fem
 
 
-def _orient2d(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
-    return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
-
-
-def _lexicographic_triangulation(points: np.ndarray) -> np.ndarray:
-    """
-    Sequential lexicographic incremental triangulation.
-
-    NumPy port of ``igl::lexicographic_triangulation``.
-
-    ``points`` is ``(n, 2)`` ``float64``. Returns an ``(n_faces, 3)`` ``int32`` array of CCW
-    triangles over the input point indices, or an empty ``(0, 3)`` array when the points are
-    collinear. The output is not yet Delaunay — the caller flips it to Delaunay on device.
-    """
-    n = points.shape[0]
-    order = np.lexsort((points[:, 1], points[:, 0]))
-    p0 = points[order[0]]
-    p1 = points[order[1]]
-    faces: list[tuple[int, int, int]] = []
-    boundary: list[int] = []
-    for i in range(2, n):
-        curr = points[order[i]]
-        ci = int(order[i])
-        if len(faces) == 0:
-            # Every point so far is collinear; the first off-line point fans the prefix.
-            orientation = _orient2d(p0, p1, curr)
-            if orientation != 0.0:
-                if orientation > 0.0:
-                    for j in range(i - 1):
-                        faces.append((int(order[j]), int(order[j + 1]), ci))
-                else:
-                    for j in range(i - 1):
-                        faces.append((int(order[j + 1]), int(order[j]), ci))
-                boundary = [int(order[j]) for j in range(i + 1)]
-                if orientation < 0.0:
-                    boundary.reverse()
-            continue
-
-        nb = len(boundary)
-        orientations = [
-            _orient2d(points[boundary[j]], points[boundary[(j + 1) % nb]], curr) for j in range(nb)
-        ]
-        for j in range(nb):
-            if orientations[j] < 0.0:
-                faces.append((boundary[(j + 1) % nb], boundary[j], ci))
-
-        # The visible edges form one contiguous arc; L starts it, R ends it (first kept vertex).
-        left = right = -1
-        for j in range(nb):
-            prev = (j - 1) % nb
-            if orientations[j] >= 0.0 and orientations[prev] < 0.0:
-                right = j
-            elif orientations[j] < 0.0 and orientations[prev] >= 0.0:
-                left = j
-        # Keep the non-visible arc R..L (forward), then insert curr between L and R.
-        kept: list[int] = []
-        k = right
-        while True:
-            kept.append(boundary[k])
-            if k == left:
-                break
-            k = (k + 1) % nb
-        kept.append(ci)
-        boundary = kept
-
-    if len(faces) == 0:
-        return np.empty((0, 3), dtype=np.int32)
-    return np.asarray(faces, dtype=np.int32)
-
-
 def delaunay_triangulation(points: wp.array[wp.vec2], max_iter: int = 1000) -> wp.array[wp.int32]:
     """
     Delaunay triangulation of a 2D point set.
@@ -179,34 +109,74 @@ def delaunay_triangulation(points: wp.array[wp.vec2], max_iter: int = 1000) -> w
     return faces
 
 
-def _repeated_oriented_triangles(
-    candidates: twt.Array2dInt32, n_points: int, repetitions: int
-) -> twt.Array2dInt32:
+def _lexicographic_triangulation(points: np.ndarray) -> np.ndarray:
     """
-    Keep one oriented representative per candidate triangle repeated exactly ``repetitions`` times.
+    Sequential lexicographic incremental triangulation.
 
-    Candidate triangles are grouped by their sorted (unoriented) vertex key; groups of the
-    requested size contribute their first oriented triangle. Mirrors MeshLib's
-    ``findRepeatedOrientedTriangles`` for the trusted-normal case.
+    NumPy port of ``igl::lexicographic_triangulation``.
+
+    ``points`` is ``(n, 2)`` ``float64``. Returns an ``(n_faces, 3)`` ``int32`` array of CCW
+    triangles over the input point indices, or an empty ``(0, 3)`` array when the points are
+    collinear. The output is not yet Delaunay — the caller flips it to Delaunay on device.
     """
-    device = candidates.device
-    n_candidates = int(candidates.shape[0])
-    if n_candidates < repetitions:
-        return twt.empty_2d((0, 3), wp.int32, device=device)
+    n = points.shape[0]
+    order = np.lexsort((points[:, 1], points[:, 0]))
+    p0 = points[order[0]]
+    p1 = points[order[1]]
+    faces: list[tuple[int, int, int]] = []
+    boundary: list[int] = []
+    for i in range(2, n):
+        curr = points[order[i]]
+        ci = int(order[i])
+        if len(faces) == 0:
+            # Every point so far is collinear; the first off-line point fans the prefix.
+            orientation = _orient2d(p0, p1, curr)
+            if orientation != 0.0:
+                if orientation > 0.0:
+                    for j in range(i - 1):
+                        faces.append((int(order[j]), int(order[j + 1]), ci))
+                else:
+                    for j in range(i - 1):
+                        faces.append((int(order[j + 1]), int(order[j]), ci))
+                boundary = [int(order[j]) for j in range(i + 1)]
+                if orientation < 0.0:
+                    boundary.reverse()
+            continue
 
-    sorted_keys = twt.empty_2d((n_candidates, 3), wp.int32, device=device)
-    wp.launch(
-        kernel_reconstruction.canonicalize_triangles,
-        dim=n_candidates,
-        inputs=[candidates, sorted_keys],
-        device=device,
-    )
-    groups = tw.grouping.group_int_rows(sorted_keys, repetitions, max_value=n_points)
-    n_groups = int(groups.shape[0])
-    if n_groups == 0:
-        return twt.empty_2d((0, 3), wp.int32, device=device)
+        nb = len(boundary)
+        orientations = [
+            _orient2d(points[boundary[j]], points[boundary[(j + 1) % nb]], curr) for j in range(nb)
+        ]
+        for j in range(nb):
+            if orientations[j] < 0.0:
+                faces.append((boundary[(j + 1) % nb], boundary[j], ci))
 
-    return twt.as_array2d(tw.array.gather(candidates, wp.clone(groups[:, 0])), wp.int32)
+        # The visible edges form one contiguous arc; L starts it, R ends it (first kept vertex).
+        left = right = -1
+        for j in range(nb):
+            prev = (j - 1) % nb
+            if orientations[j] >= 0.0 and orientations[prev] < 0.0:
+                right = j
+            elif orientations[j] < 0.0 and orientations[prev] >= 0.0:
+                left = j
+        # Keep the non-visible arc R..L (forward), then insert curr between L and R.
+        kept: list[int] = []
+        k = right
+        while True:
+            kept.append(boundary[k])
+            if k == left:
+                break
+            k = (k + 1) % nb
+        kept.append(ci)
+        boundary = kept
+
+    if len(faces) == 0:
+        return np.empty((0, 3), dtype=np.int32)
+    return np.asarray(faces, dtype=np.int32)
+
+
+def _orient2d(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
 
 
 def triangulate_point_cloud(
@@ -336,6 +306,36 @@ def triangulate_point_cloud(
     t2 = _repeated_oriented_triangles(candidates, n, 2)
 
     return _assemble_faces(points, t3, t2, crit_hole_length)
+
+
+def _repeated_oriented_triangles(
+    candidates: twt.Array2dInt32, n_points: int, repetitions: int
+) -> twt.Array2dInt32:
+    """
+    Keep one oriented representative per candidate triangle repeated exactly ``repetitions`` times.
+
+    Candidate triangles are grouped by their sorted (unoriented) vertex key; groups of the
+    requested size contribute their first oriented triangle. Mirrors MeshLib's
+    ``findRepeatedOrientedTriangles`` for the trusted-normal case.
+    """
+    device = candidates.device
+    n_candidates = int(candidates.shape[0])
+    if n_candidates < repetitions:
+        return twt.empty_2d((0, 3), wp.int32, device=device)
+
+    sorted_keys = twt.empty_2d((n_candidates, 3), wp.int32, device=device)
+    wp.launch(
+        kernel_reconstruction.canonicalize_triangles,
+        dim=n_candidates,
+        inputs=[candidates, sorted_keys],
+        device=device,
+    )
+    groups = tw.grouping.group_int_rows(sorted_keys, repetitions, max_value=n_points)
+    n_groups = int(groups.shape[0])
+    if n_groups == 0:
+        return twt.empty_2d((0, 3), wp.int32, device=device)
+
+    return twt.as_array2d(tw.array.gather(candidates, wp.clone(groups[:, 0])), wp.int32)
 
 
 def _assemble_faces(
@@ -1426,6 +1426,46 @@ class _BpaState:
 _BPA_MIN_GRID = 1 << 12
 
 
+# Waves queued between host synchronisations. The wave loop is device-driven — ``end_wave`` keeps
+# the seeding flag, the progress test and the continue flag in ``counters`` — so the host only ever
+# needs to look in order to *stop*, and it can queue a batch and let the device run ahead. A wave
+# that runs after the flag clears costs six no-op launches, which is far less than a sync.
+#
+# ``wp.capture_while`` would remove even that, and it was tried: on this workload the conditional
+# graph's per-iteration overhead (~0.25 ms/wave on ``bunny_decimated``) is larger than the sync it
+# replaces, because a batch already amortises the sync over eight waves.
+_BPA_WAVES_PER_BATCH = 8
+
+# Host round-trips beyond the batching are only taken to grow the budget (doubling, so
+# logarithmically many) or to compact a front that ``pivot_front_edges`` left sparse (which needs
+# the front to have grown 4x against its live count, so also rare).
+_BPA_MAX_BATCHES = 1 << 16
+
+
+def _bpa_run(state: _BpaState, max_waves: int) -> None:
+    """
+    Drive the wave loop until the front and the orphan set are both exhausted.
+
+    The host is woken once per batch, and only acts when the device asks it to — to grow the
+    triangle budget, to compact a sparse front, or to stop.
+    """
+    state.counters[kernel_bpa.CNT_CONTINUE : kernel_bpa.CNT_CONTINUE + 1].fill_(1)
+    for _ in range(_BPA_MAX_BATCHES):
+        for _ in range(_BPA_WAVES_PER_BATCH):
+            _bpa_wave(state, max_waves)
+            state.front_in, state.front_out = state.front_out, state.front_in
+        counters = state.counters.numpy()
+        if counters[kernel_bpa.CNT_CONTINUE]:
+            continue
+        if counters[kernel_bpa.CNT_DONE] or counters[kernel_bpa.CNT_WAVE] >= max_waves:
+            return
+        if counters[kernel_bpa.CNT_GROW]:
+            state.grow()
+        else:
+            state.compact()
+        state.counters[kernel_bpa.CNT_CONTINUE : kernel_bpa.CNT_CONTINUE + 1].fill_(1)
+
+
 def _bpa_wave(state: _BpaState, max_waves: int) -> None:
     """Queue one wave: seed or pivot, claim, commit, advance. No allocations, no readbacks."""
     device = state.device
@@ -1522,46 +1562,6 @@ def _bpa_wave(state: _BpaState, max_waves: int) -> None:
     wp.launch(
         kernel_bpa.end_wave, dim=1, inputs=[wp.int32(max_waves), state.counters], device=device
     )
-
-
-# Waves queued between host synchronisations. The wave loop is device-driven — ``end_wave`` keeps
-# the seeding flag, the progress test and the continue flag in ``counters`` — so the host only ever
-# needs to look in order to *stop*, and it can queue a batch and let the device run ahead. A wave
-# that runs after the flag clears costs six no-op launches, which is far less than a sync.
-#
-# ``wp.capture_while`` would remove even that, and it was tried: on this workload the conditional
-# graph's per-iteration overhead (~0.25 ms/wave on ``bunny_decimated``) is larger than the sync it
-# replaces, because a batch already amortises the sync over eight waves.
-_BPA_WAVES_PER_BATCH = 8
-
-# Host round-trips beyond the batching are only taken to grow the budget (doubling, so
-# logarithmically many) or to compact a front that ``pivot_front_edges`` left sparse (which needs
-# the front to have grown 4x against its live count, so also rare).
-_BPA_MAX_BATCHES = 1 << 16
-
-
-def _bpa_run(state: _BpaState, max_waves: int) -> None:
-    """
-    Drive the wave loop until the front and the orphan set are both exhausted.
-
-    The host is woken once per batch, and only acts when the device asks it to — to grow the
-    triangle budget, to compact a sparse front, or to stop.
-    """
-    state.counters[kernel_bpa.CNT_CONTINUE : kernel_bpa.CNT_CONTINUE + 1].fill_(1)
-    for _ in range(_BPA_MAX_BATCHES):
-        for _ in range(_BPA_WAVES_PER_BATCH):
-            _bpa_wave(state, max_waves)
-            state.front_in, state.front_out = state.front_out, state.front_in
-        counters = state.counters.numpy()
-        if counters[kernel_bpa.CNT_CONTINUE]:
-            continue
-        if counters[kernel_bpa.CNT_DONE] or counters[kernel_bpa.CNT_WAVE] >= max_waves:
-            return
-        if counters[kernel_bpa.CNT_GROW]:
-            state.grow()
-        else:
-            state.compact()
-        state.counters[kernel_bpa.CNT_CONTINUE : kernel_bpa.CNT_CONTINUE + 1].fill_(1)
 
 
 def _clean_reconstruction(

@@ -734,19 +734,6 @@ def isin(elements: twt.ArrayNd, test_elements: wp.array[wp.Int]) -> wp.array[wp.
     return out_flat if is_flat else out_flat.reshape(elements.shape)
 
 
-def _sorted_copy(values: wp.array[DType]) -> wp.array[DType]:
-    """
-    Ascending-sorted copy of a 1D scalar array.
-
-    ``sort_and_argsort`` returns a *view* into its own scratch and this outlives the caller's
-    frame, so the keys are cloned. The order payload is discarded, which is why the padding value
-    it seeds does not matter here.
-    """
-    if int(values.shape[0]) <= 1:
-        return values
-    return wp.clone(sort_and_argsort(values)[0])
-
-
 def _isin_lookup_mask(
     elements_flat: wp.array[wp.Scalar], test_elements: wp.array[wp.Scalar], span: int, offset: int
 ) -> wp.array[wp.bool]:
@@ -786,6 +773,19 @@ def _isin_lookup_sorted(
         device=device,
     )
     return out_wp
+
+
+def _sorted_copy(values: wp.array[DType]) -> wp.array[DType]:
+    """
+    Ascending-sorted copy of a 1D scalar array.
+
+    ``sort_and_argsort`` returns a *view* into its own scratch and this outlives the caller's
+    frame, so the keys are cloned. The order payload is discarded, which is why the padding value
+    it seeds does not matter here.
+    """
+    if int(values.shape[0]) <= 1:
+        return values
+    return wp.clone(sort_and_argsort(values)[0])
 
 
 def flatnonzero(values: wp.array[wp.bool] | wp.array[wp.Scalar]) -> wp.array[wp.int32]:

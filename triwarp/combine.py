@@ -715,6 +715,26 @@ def stitch_loops(
     return combined_vertices, tw.array.concatenate([combined_faces, bridge_a, bridge_b])
 
 
+def _non_increasing_indices(numbers: np.ndarray) -> np.ndarray:
+    """
+    Return the entry indices **not** in the longest non-decreasing subsequence of ``numbers``.
+
+    Repeated integers are perturbed by adding ``linspace(0, 1, count, endpoint=False)`` within
+    each equal-value group, so a run of equal values is treated as (weakly) increasing and kept.
+    Mirrors promesh's private helper (with a NumPy grouping in place of ``trimesh.grouping.group``
+    to avoid a runtime ``trimesh`` dependency).
+    """
+    different = numbers.astype(np.float64)
+    order = np.argsort(numbers, kind="stable")
+    sorted_values = numbers[order]
+    cut = np.flatnonzero(np.diff(sorted_values)) + 1
+    for group in np.split(order, cut):
+        different[group] += np.linspace(0.0, 1.0, num=len(group), endpoint=False)
+    subsequence = _longest_increasing_subsequence(different)
+    absence_mask = np.isin(different, subsequence, assume_unique=True, invert=True)
+    return np.flatnonzero(absence_mask)
+
+
 def _longest_increasing_subsequence(numbers: np.ndarray) -> np.ndarray:
     """
     Longest strictly increasing subsequence of ``numbers`` (patience-sorting, O(N log N)).
@@ -739,67 +759,9 @@ def _longest_increasing_subsequence(numbers: np.ndarray) -> np.ndarray:
     return subseq
 
 
-def _non_increasing_indices(numbers: np.ndarray) -> np.ndarray:
-    """
-    Return the entry indices **not** in the longest non-decreasing subsequence of ``numbers``.
-
-    Repeated integers are perturbed by adding ``linspace(0, 1, count, endpoint=False)`` within
-    each equal-value group, so a run of equal values is treated as (weakly) increasing and kept.
-    Mirrors promesh's private helper (with a NumPy grouping in place of ``trimesh.grouping.group``
-    to avoid a runtime ``trimesh`` dependency).
-    """
-    different = numbers.astype(np.float64)
-    order = np.argsort(numbers, kind="stable")
-    sorted_values = numbers[order]
-    cut = np.flatnonzero(np.diff(sorted_values)) + 1
-    for group in np.split(order, cut):
-        different[group] += np.linspace(0.0, 1.0, num=len(group), endpoint=False)
-    subsequence = _longest_increasing_subsequence(different)
-    absence_mask = np.isin(different, subsequence, assume_unique=True, invert=True)
-    return np.flatnonzero(absence_mask)
-
-
 # Stitch-metric name -> kernel selector (must match the METRIC_*_STITCH constants in
 # kernels/holes.py).
 _STITCH_METRIC_IDS = {"complex_stitch": 0, "edge_length_stitch": 1, "vertical": 2}
-
-
-def _closest_loop_pair(a_pos: wp.array[wp.vec3], b_pos: wp.array[wp.vec3]) -> tuple[int, int]:
-    """
-    Return the closest vertex pair ``(i, j)`` between the two rims (MeshLib's start pair).
-
-    The full ``(n_a, n_b)`` squared-distance matrix and its argmin run in Warp kernels (the same
-    ``row_argmin`` / ``global_argmin`` reduction the greedy zippering uses); only the two winning
-    indices come back to the host. Ties resolve to the smallest ``i`` then smallest ``j``, matching
-    ``numpy.argmin`` on the flattened matrix.
-    """
-    device = a_pos.device
-    n_a = int(a_pos.shape[0])
-    n_b = int(b_pos.shape[0])
-    dist_sq = twt.empty_2d((n_a, n_b), wp.float32, device=device)
-    wp.launch(
-        kernel_combine.pair_sq_distances,
-        dim=(n_a, n_b),
-        inputs=[a_pos, b_pos, dist_sq],
-        device=device,
-    )
-    col_min = wp.empty(n_a, dtype=wp.int32, device=device)
-    val_min = wp.empty(n_a, dtype=wp.float32, device=device)
-    wp.launch(
-        kernel_combine.row_argmin,
-        dim=n_a,
-        inputs=[dist_sq, wp.int32(n_b), col_min, val_min],
-        device=device,
-    )
-    pair = wp.empty(2, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_combine.global_argmin,
-        dim=1,
-        inputs=[col_min, val_min, wp.int32(n_a), pair],
-        device=device,
-    )
-    pair_np = pair.numpy()
-    return int(pair_np[0]), int(pair_np[1])
 
 
 def stitch_loops_min_weight(
@@ -930,6 +892,44 @@ def stitch_loops_min_weight(
     )
     band_faces = wp.array(band.reshape(-1), dtype=wp.int32, device=device)
     return combined_vertices, tw.array.concatenate([combined_faces, band_faces])
+
+
+def _closest_loop_pair(a_pos: wp.array[wp.vec3], b_pos: wp.array[wp.vec3]) -> tuple[int, int]:
+    """
+    Return the closest vertex pair ``(i, j)`` between the two rims (MeshLib's start pair).
+
+    The full ``(n_a, n_b)`` squared-distance matrix and its argmin run in Warp kernels (the same
+    ``row_argmin`` / ``global_argmin`` reduction the greedy zippering uses); only the two winning
+    indices come back to the host. Ties resolve to the smallest ``i`` then smallest ``j``, matching
+    ``numpy.argmin`` on the flattened matrix.
+    """
+    device = a_pos.device
+    n_a = int(a_pos.shape[0])
+    n_b = int(b_pos.shape[0])
+    dist_sq = twt.empty_2d((n_a, n_b), wp.float32, device=device)
+    wp.launch(
+        kernel_combine.pair_sq_distances,
+        dim=(n_a, n_b),
+        inputs=[a_pos, b_pos, dist_sq],
+        device=device,
+    )
+    col_min = wp.empty(n_a, dtype=wp.int32, device=device)
+    val_min = wp.empty(n_a, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_combine.row_argmin,
+        dim=n_a,
+        inputs=[dist_sq, wp.int32(n_b), col_min, val_min],
+        device=device,
+    )
+    pair = wp.empty(2, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_combine.global_argmin,
+        dim=1,
+        inputs=[col_min, val_min, wp.int32(n_a), pair],
+        device=device,
+    )
+    pair_np = pair.numpy()
+    return int(pair_np[0]), int(pair_np[1])
 
 
 def _stitch_band_triangles(

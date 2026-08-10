@@ -21,16 +21,6 @@ _COLOR_COLUMNS = ("red", "green", "blue")
 _COLOR_COLUMNS_RGBA = ("red", "green", "blue", "alpha")
 
 
-def _import_meshio():
-    try:
-        import meshio
-    except ImportError as exc:
-        raise ImportError(
-            "triwarp.io requires meshio. Install it with `pip install triwarp[io]`."
-        ) from exc
-    return meshio
-
-
 def load_mesh_data(path: str | Path, *, device: wp.DeviceLike = None) -> dict[str, wp.array[Any]]:
     """
     Load every mesh attribute ``meshio`` can read from a file into Warp arrays.
@@ -119,6 +109,16 @@ def load_mesh_data(path: str | Path, *, device: wp.DeviceLike = None) -> dict[st
         )
 
     return result
+
+
+def _import_meshio():
+    try:
+        import meshio
+    except ImportError as exc:
+        raise ImportError(
+            "triwarp.io requires meshio. Install it with `pip install triwarp[io]`."
+        ) from exc
+    return meshio
 
 
 def load_mesh(path: str | Path, *, device: wp.DeviceLike = None) -> wp.Mesh:

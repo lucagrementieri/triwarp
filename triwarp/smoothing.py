@@ -47,26 +47,6 @@ from triwarp.triangles import face_normals_and_areas
 from triwarp.vertices import mean_vertex_normals
 
 
-def _apply_operator(
-    operator: wps.BsrMatrix[wp.float32], v_in: wp.array[wp.vec3d], out_lv: wp.array[wp.vec3d]
-) -> None:
-    wp.launch(
-        kernel_laplacian.apply_operator,
-        dim=int(v_in.shape[0]),
-        inputs=[operator.offsets, operator.columns, operator.values, v_in, out_lv],
-        device=v_in.device,
-    )
-
-
-def _apply_volume_constraint(
-    positions: wp.array[wp.vec3d], faces: wp.array[wp.int32], vol_ini: float
-) -> None:
-    vol_new = tw.totals.volume(positions, faces)
-    if vol_new != 0.0:
-        factor = (vol_ini / vol_new) ** (1.0 / 3.0)
-        wp.map(wp.mul, positions, wp.float64(factor), out=positions)
-
-
 def filter_laplacian(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -171,6 +151,15 @@ def filter_laplacian(
                 _apply_volume_constraint(positions, faces, vol_ini)
 
     return _as_vec3(positions)
+
+
+def _apply_volume_constraint(
+    positions: wp.array[wp.vec3d], faces: wp.array[wp.int32], vol_ini: float
+) -> None:
+    vol_new = tw.totals.volume(positions, faces)
+    if vol_new != 0.0:
+        factor = (vol_ini / vol_new) ** (1.0 / 3.0)
+        wp.map(wp.mul, positions, wp.float64(factor), out=positions)
 
 
 def filter_humphrey(
@@ -518,6 +507,17 @@ def filter_mut_dif_laplacian(
     return _as_vec3(positions)
 
 
+def _apply_operator(
+    operator: wps.BsrMatrix[wp.float32], v_in: wp.array[wp.vec3d], out_lv: wp.array[wp.vec3d]
+) -> None:
+    wp.launch(
+        kernel_laplacian.apply_operator,
+        dim=int(v_in.shape[0]),
+        inputs=[operator.offsets, operator.columns, operator.values, v_in, out_lv],
+        device=v_in.device,
+    )
+
+
 def filter_implicit_fairing(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -744,42 +744,6 @@ def _build_implicit_system(
     return wps.bsr_from_triplets(n, n, rows, cols, vals, prune_numerical_zeros=False)
 
 
-# ---------------------------------------------------------------------------
-# Region smoothing solves (positionVertsSmoothly / positionVertsSmoothlySharpBd)
-# ---------------------------------------------------------------------------
-
-
-def _edge_weight_matrix(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], edge_weights: str
-) -> wps.BsrMatrix[wp.float64]:
-    """Symmetric ``(n, n)`` float64 edge-weight matrix (zero diagonal); unit or clamped cotan."""
-    device = vertices.device
-    n = int(vertices.shape[0])
-    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n)
-    m = int(unique_edges.shape[0])
-    weights = wp.zeros(m, dtype=wp.float32, device=device)
-    if edge_weights == "unit":
-        weights.fill_(1.0)
-    elif edge_weights == "cotan":
-        wp.launch(
-            kernel_smoothing.edge_cotan_add,
-            dim=int(faces.shape[0]) // 3,
-            inputs=[vertices, faces, inverse, weights],
-            device=device,
-        )
-        wp.map(kernel_smoothing.clamp_cotan, weights, out=weights)
-    else:
-        raise ValueError(f"edge_weights must be 'unit' or 'cotan', got {edge_weights!r}")
-    rows, cols, vals = tw.array.triplet_buffers(2 * m, wp.float64, device)
-    wp.launch(
-        kernel_smoothing.symmetric_weight_triplets,
-        dim=m,
-        inputs=[unique_edges, weights, rows, cols, vals],
-        device=device,
-    )
-    return wps.bsr_from_triplets(n, n, rows, cols, vals, prune_numerical_zeros=False)
-
-
 def smooth_region_fixed_rim(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -990,14 +954,40 @@ def smooth_region(
     return out
 
 
-def _boundary_verts_mask(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
-) -> wp.array[wp.bool]:
-    """Length-``n_vertices`` mask of mesh-boundary vertices (MeshLib ``findBdVerts``)."""
-    device = faces.device
+# ---------------------------------------------------------------------------
+# Region smoothing solves (positionVertsSmoothly / positionVertsSmoothlySharpBd)
+# ---------------------------------------------------------------------------
+
+
+def _edge_weight_matrix(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], edge_weights: str
+) -> wps.BsrMatrix[wp.float64]:
+    """Symmetric ``(n, n)`` float64 edge-weight matrix (zero diagonal); unit or clamped cotan."""
+    device = vertices.device
     n = int(vertices.shape[0])
-    boundary = tw.boundary.boundary_vertex_indices(vertices, faces)
-    return tw.array.indices_to_mask(boundary, n, device=device)
+    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n)
+    m = int(unique_edges.shape[0])
+    weights = wp.zeros(m, dtype=wp.float32, device=device)
+    if edge_weights == "unit":
+        weights.fill_(1.0)
+    elif edge_weights == "cotan":
+        wp.launch(
+            kernel_smoothing.edge_cotan_add,
+            dim=int(faces.shape[0]) // 3,
+            inputs=[vertices, faces, inverse, weights],
+            device=device,
+        )
+        wp.map(kernel_smoothing.clamp_cotan, weights, out=weights)
+    else:
+        raise ValueError(f"edge_weights must be 'unit' or 'cotan', got {edge_weights!r}")
+    rows, cols, vals = tw.array.triplet_buffers(2 * m, wp.float64, device)
+    wp.launch(
+        kernel_smoothing.symmetric_weight_triplets,
+        dim=m,
+        inputs=[unique_edges, weights, rows, cols, vals],
+        device=device,
+    )
+    return wps.bsr_from_triplets(n, n, rows, cols, vals, prune_numerical_zeros=False)
 
 
 def refine_and_smooth_region(
@@ -1065,6 +1055,16 @@ def refine_and_smooth_region(
             vertices = smooth_region(vertices, faces, free2, edge_weights)
 
     return vertices, faces, patch_face_mask
+
+
+def _boundary_verts_mask(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> wp.array[wp.bool]:
+    """Length-``n_vertices`` mask of mesh-boundary vertices (MeshLib ``findBdVerts``)."""
+    device = faces.device
+    n = int(vertices.shape[0])
+    boundary = tw.boundary.boundary_vertex_indices(vertices, faces)
+    return tw.array.indices_to_mask(boundary, n, device=device)
 
 
 def filter_scalar_laplacian(

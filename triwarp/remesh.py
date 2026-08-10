@@ -1842,46 +1842,6 @@ def subdivide_to_size(
     return current_vertices, current_faces
 
 
-def _flip_region_faces(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    region_flags: wp.array[wp.int32],
-    max_angle_change: float | None,
-    max_deviation: float | None,
-    max_iter: int,
-) -> int:
-    """Run the parallel Delone flip pass over the region, mutating ``faces`` in place."""
-    device = faces.device
-    n_vertices = int(vertices.shape[0])
-    mac = wp.float32(max_angle_change if max_angle_change is not None else float(2.0 * math.pi))
-    mdsq = wp.float32(max_deviation * max_deviation if max_deviation is not None else 3.0e38)
-    car = wp.float32(1000.0)
-
-    def launch(adjacency, adjacency_edges, unshared, sorted_keys, key_base, out_flip, out_quad):
-        wp.launch(
-            kernel_remesh.delone_flip_candidates,
-            dim=int(adjacency.shape[0]),
-            inputs=[
-                vertices,
-                faces,
-                adjacency,
-                adjacency_edges,
-                unshared,
-                region_flags,
-                sorted_keys,
-                key_base,
-                mac,
-                mdsq,
-                car,
-                out_flip,
-                out_quad,
-            ],
-            device=device,
-        )
-
-    return _flip_interior_edges(faces, n_vertices, launch, max_iter)
-
-
 def subdivide_region_to_size(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -2057,6 +2017,46 @@ def subdivide_region_to_size(
 
     new_region = tw.array.astype(region_flags, wp.bool)
     return current_vertices, current_faces, new_region
+
+
+def _flip_region_faces(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    region_flags: wp.array[wp.int32],
+    max_angle_change: float | None,
+    max_deviation: float | None,
+    max_iter: int,
+) -> int:
+    """Run the parallel Delone flip pass over the region, mutating ``faces`` in place."""
+    device = faces.device
+    n_vertices = int(vertices.shape[0])
+    mac = wp.float32(max_angle_change if max_angle_change is not None else float(2.0 * math.pi))
+    mdsq = wp.float32(max_deviation * max_deviation if max_deviation is not None else 3.0e38)
+    car = wp.float32(1000.0)
+
+    def launch(adjacency, adjacency_edges, unshared, sorted_keys, key_base, out_flip, out_quad):
+        wp.launch(
+            kernel_remesh.delone_flip_candidates,
+            dim=int(adjacency.shape[0]),
+            inputs=[
+                vertices,
+                faces,
+                adjacency,
+                adjacency_edges,
+                unshared,
+                region_flags,
+                sorted_keys,
+                key_base,
+                mac,
+                mdsq,
+                car,
+                out_flip,
+                out_quad,
+            ],
+            device=device,
+        )
+
+    return _flip_interior_edges(faces, n_vertices, launch, max_iter)
 
 
 def _keep_longest_edges(

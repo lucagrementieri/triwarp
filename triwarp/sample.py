@@ -417,6 +417,74 @@ def _top_maxima_by_weight(
     return tw.array.astype(tw.array.indices_to_mask(chosen, n_pool, device=is_max.device), wp.int32)
 
 
+def sample_surface_blue_noise(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], radius: float, seed: int | None = None
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Sample points on a triangle mesh surface with a blue-noise (Poisson-disk) distribution.
+
+    Draws a dense uniform surface pool — ``30x`` the expected output, the oversampling factor
+    ``igl::blue_noise`` uses — and reduces it to a **maximal** subset in which no two points are
+    within ``radius`` of each other, by randomized-priority parallel dart throwing. The result has
+    the distribution of sequential dart throwing over a uniformly random order of the pool; see
+    ``kernels/algorithms/blue_noise.py`` for why the parallelism costs nothing in distribution, and
+    for the measured spacing and coverage against MeshLab and Open3D.
+
+    Parameters
+    ----------
+    vertices
+        Vertex positions.
+    faces
+        Flat triangle indices ``(i0, i1, i2)`` per face.
+    radius
+        Minimum Poisson disk radius (Euclidean distance in 3D). Enforced exactly: the closest pair
+        in the output is never below it.
+    seed
+        RNG seed for the initial uniform sampling and the sampling order. If ``None``, a random seed
+        is chosen. With a seed the output is reproducible — every round of the loop is a
+        deterministic function of its input state.
+
+    Returns
+    -------
+    samples
+        ``(m,)`` sampled positions on the mesh surface. Count ``m`` is determined
+        implicitly by ``radius`` and mesh area.
+    face_index
+        ``(m,)`` triangle index for each sample.
+
+    Raises
+    ------
+    ValueError
+        If ``radius <= 0`` or if the mesh has no faces.
+
+    Notes
+    -----
+    The count is **derived**, never requested: it is what a maximal ``radius``-packing of the
+    surface comes to, so it lands near — not at — the hexagonal-packing estimate the radius is
+    usually chosen from. Ask for a *count* with
+    [`sample_surface_poisson_disk`][triwarp.sample.sample_surface_poisson_disk] instead.
+    """
+    device = vertices.device
+    n_faces = faces.shape[0] // 3
+
+    if radius <= 0.0:
+        raise ValueError(f"radius must be > 0, got {radius}")
+
+    if n_faces == 0:
+        return (
+            wp.empty(0, dtype=wp.vec3, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+        )
+
+    _, areas = face_normals_and_areas(vertices, faces)
+    surface_area = float(wp.utils.array_sum(areas))
+    expected = surface_area * (math.pi * math.sqrt(3.0) / 6.0) / (math.pi * radius * radius / 4.0)
+    nx = max(1, int(30.0 * expected))
+
+    init_points, init_face_indices = sample_surface(vertices, faces, nx, seed=seed)
+    return _dart_throw_blue_noise(init_points, init_face_indices, radius, resolve_seed(seed))
+
+
 def _dart_throw_blue_noise(
     pool_points: wp.array[wp.vec3], pool_faces: wp.array[wp.int32], radius: float, seed: int
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
@@ -549,74 +617,6 @@ def _dart_throw_blue_noise(
     if int(kept.shape[0]) == 0:
         return empty
     return gather(pool_points, kept), gather(pool_faces, kept)
-
-
-def sample_surface_blue_noise(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], radius: float, seed: int | None = None
-) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-    """
-    Sample points on a triangle mesh surface with a blue-noise (Poisson-disk) distribution.
-
-    Draws a dense uniform surface pool — ``30x`` the expected output, the oversampling factor
-    ``igl::blue_noise`` uses — and reduces it to a **maximal** subset in which no two points are
-    within ``radius`` of each other, by randomized-priority parallel dart throwing. The result has
-    the distribution of sequential dart throwing over a uniformly random order of the pool; see
-    ``kernels/algorithms/blue_noise.py`` for why the parallelism costs nothing in distribution, and
-    for the measured spacing and coverage against MeshLab and Open3D.
-
-    Parameters
-    ----------
-    vertices
-        Vertex positions.
-    faces
-        Flat triangle indices ``(i0, i1, i2)`` per face.
-    radius
-        Minimum Poisson disk radius (Euclidean distance in 3D). Enforced exactly: the closest pair
-        in the output is never below it.
-    seed
-        RNG seed for the initial uniform sampling and the sampling order. If ``None``, a random seed
-        is chosen. With a seed the output is reproducible — every round of the loop is a
-        deterministic function of its input state.
-
-    Returns
-    -------
-    samples
-        ``(m,)`` sampled positions on the mesh surface. Count ``m`` is determined
-        implicitly by ``radius`` and mesh area.
-    face_index
-        ``(m,)`` triangle index for each sample.
-
-    Raises
-    ------
-    ValueError
-        If ``radius <= 0`` or if the mesh has no faces.
-
-    Notes
-    -----
-    The count is **derived**, never requested: it is what a maximal ``radius``-packing of the
-    surface comes to, so it lands near — not at — the hexagonal-packing estimate the radius is
-    usually chosen from. Ask for a *count* with
-    [`sample_surface_poisson_disk`][triwarp.sample.sample_surface_poisson_disk] instead.
-    """
-    device = vertices.device
-    n_faces = faces.shape[0] // 3
-
-    if radius <= 0.0:
-        raise ValueError(f"radius must be > 0, got {radius}")
-
-    if n_faces == 0:
-        return (
-            wp.empty(0, dtype=wp.vec3, device=device),
-            wp.empty(0, dtype=wp.int32, device=device),
-        )
-
-    _, areas = face_normals_and_areas(vertices, faces)
-    surface_area = float(wp.utils.array_sum(areas))
-    expected = surface_area * (math.pi * math.sqrt(3.0) / 6.0) / (math.pi * radius * radius / 4.0)
-    nx = max(1, int(30.0 * expected))
-
-    init_points, init_face_indices = sample_surface(vertices, faces, nx, seed=seed)
-    return _dart_throw_blue_noise(init_points, init_face_indices, radius, resolve_seed(seed))
 
 
 def sample_volume(

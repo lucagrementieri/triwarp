@@ -33,17 +33,6 @@ from triwarp.kernels import texture as kernel_texture
 _OWNER_SENTINEL = INT32_MAX
 
 
-def _check_uv_in_range(uv: wp.array[wp.vec2]) -> None:
-    """Raise if any finite UV lies outside ``[0, 1]`` (non-finite UVs are ignored)."""
-    n_vertices = int(uv.shape[0])
-    if n_vertices == 0:
-        return
-    flag = wp.zeros(1, dtype=wp.int32, device=uv.device)
-    wp.launch(kernel_texture.check_uv_range, dim=n_vertices, inputs=[uv, flag], device=uv.device)
-    if int(flag.numpy()[0]) != 0:
-        raise ValueError("UV coordinates must be in the range [0, 1]")
-
-
 def rasterize_attribute(
     uv: wp.array[wp.vec2], faces: wp.array[wp.int32], attribute: twt.Array2dFloat32, resolution: int
 ) -> twt.Array3dFloat32:
@@ -286,6 +275,17 @@ def remap_attribute_from_uv(
             device=device,
         )
     return twt.as_array2d(out_values, wp.float32)
+
+
+def _check_uv_in_range(uv: wp.array[wp.vec2]) -> None:
+    """Raise if any finite UV lies outside ``[0, 1]`` (non-finite UVs are ignored)."""
+    n_vertices = int(uv.shape[0])
+    if n_vertices == 0:
+        return
+    flag = wp.zeros(1, dtype=wp.int32, device=uv.device)
+    wp.launch(kernel_texture.check_uv_range, dim=n_vertices, inputs=[uv, flag], device=uv.device)
+    if int(flag.numpy()[0]) != 0:
+        raise ValueError("UV coordinates must be in the range [0, 1]")
 
 
 def remap_discrete_attribute_from_uv(

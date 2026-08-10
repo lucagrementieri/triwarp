@@ -25,8 +25,9 @@ test run on any violation:
    (``.claude/CLAUDE.md`` section 4). This is what stops a wrapper module from being created while
    its kernels are left behind under the old name.
 8. **A private helper is defined below its first caller** (``.claude/CLAUDE.md`` section 11's
-   stepdown rule), so a reader never jumps backward to a definition they have not met. The 50 sites
-   that predate the check are an explicit, staleness-checked debt list, not an exemption.
+   stepdown rule), so a reader never jumps backward to a definition they have not met. The 49 sites
+   that predated the check were a staleness-checked debt list, now drained; the single remaining
+   entry is a permanent exemption, a helper called at module scope to build a constant.
 9. **A Warp-version claim names a version at least as new as the installed ``warp-lang``.** This is
    the one check that reads outside ``triwarp/``, and it exists because an upgrade left twelve
    workarounds citing Warp 1.13-1.15 for a year: ``reference/warp_api/warp_version.py`` catches a
@@ -200,12 +201,20 @@ _MODULES_WITHOUT_KERNELS = frozenset({"constants", "homology", "io", "mesh", "ty
 # --- check 8 ------------------------------------------------------------------------------------
 
 # Private helpers that sit above their first caller today. CLAUDE.md section 11 says a helper must
-# never appear above the caller it serves, but the package drifted off that rule wholesale before
-# the check existed: these 50 sites across 15 modules are internally consistent in doing the
-# opposite, and reordering fifteen files at once is a diff nobody can review. So they are an
-# explicit debt list rather than a silent exemption -- **entries come out, they do not go in**.
-# Drain one whenever you are editing its module for another reason; a *new* helper must be placed
-# correctly, which is exactly what this check now enforces.
+# never appear above the caller it serves, and the package had drifted off that rule wholesale
+# before the check existed -- 49 sites across 15 modules, carried here as an explicit debt list
+# rather than a silent exemption. That list has now been drained: one entry remains, and it is not
+# debt but a permanent structural exemption. **Entries come out, they do not go in** -- a new helper
+# must be placed correctly, which is what this check enforces.
+#
+# Two things the sweep learned, both of which the check itself caught:
+#
+# - Reordering has to consider *every* private helper in a module, not only the flagged ones.
+#   Moving a flagged helper below a callee it uses strands that callee: ``holes._loop_perimeters``
+#   was compliant before, because its caller sat above it, and became a fresh violation.
+# - A name can appear several times at module scope, since ``@overload`` stubs precede their
+#   implementation. Verifying a "pure move" by comparing functions keyed on name silently collapses
+#   those duplicates, so the check on the *reorder* has to compare the multiset.
 # --- check 9 ------------------------------------------------------------------------------------
 
 # A Warp version claim, and the spelling is the convention: the word **Warp** immediately before
@@ -246,43 +255,11 @@ _ALLOCATION_DEVICE_ALLOWLIST: dict[tuple[str, str], str] = {
 }
 
 _HELPER_ORDER_ALLOWLIST: dict[str, frozenset[str]] = {
-    "array": frozenset({"_sorted_copy"}),
-    "combine": frozenset({"_closest_loop_pair", "_longest_increasing_subsequence"}),
-    "creation": frozenset({"_icosphere_face_table"}),
-    "io": frozenset({"_import_meshio"}),
-    "ray": frozenset({"_validate_ray_inputs"}),
-    "reconstruction": frozenset(
-        {"_bpa_wave", "_lexicographic_triangulation", "_orient2d", "_repeated_oriented_triangles"}
-    ),
-    "reduce": frozenset(
-        {
-            "_launch_axis_scalar",
-            "_launch_global_bool_tiled",
-            "_launch_global_scalar_tiled",
-            "_validate_scalar_array",
-        }
-    ),
-    "registration": frozenset(
-        {
-            "_identity_mat44",
-            "_is_mesh_target",
-            "_resolve_initial",
-            "_robust_scale_from_residuals",
-            "_target_index",
-        }
-    ),
-    "remesh": frozenset({"_flip_region_faces"}),
-    "sample": frozenset({"_dart_throw_blue_noise"}),
-    "smoothing": frozenset(
-        {
-            "_apply_operator",
-            "_apply_volume_constraint",
-            "_boundary_verts_mask",
-            "_edge_weight_matrix",
-        }
-    ),
-    "texture": frozenset({"_check_uv_in_range"}),
-    "typing": frozenset({"_shape_2d", "_shape_3d"}),
+    # Not debt: ``_icosphere_face_table`` is called at *module* scope (line 179) to build the
+    # ``_ICOSPHERE_FACE_TABLE`` constant, so it has no function caller to sit below and moving it
+    # under its use is a NameError at import. This is the one permanent entry; the other 48 sites
+    # this list carried were reordered in the section 4.4 sweep.
+    "creation": frozenset({"_icosphere_face_table"})
 }
 
 # --- check 13 -----------------------------------------------------------------------------------

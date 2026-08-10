@@ -204,52 +204,12 @@ def _procrustes_into(
 _ROBUST_KINDS: dict[str, int] = {"none": 0, "huber": 1, "tukey": 2}
 
 
-def _identity_mat44(device: wp.DeviceLike) -> wp.array[wp.mat44]:
-    """Return a ``(1,)`` array holding the 4x4 identity transform."""
-    identity = wp.mat44(
-        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0
-    )
-    return wp.array([identity], dtype=wp.mat44, device=device)
-
-
-def _resolve_initial(
-    initial: wp.array[wp.mat44] | wp.mat44 | None, device: wp.DeviceLike
-) -> wp.array[wp.mat44]:
-    """Normalize ``initial`` to a ``(1,)`` ``wp.mat44`` device array."""
-    if initial is None:
-        return _identity_mat44(device)
-    if isinstance(initial, wp.array):
-        return wp.clone(initial)
-    return wp.array([initial], dtype=wp.mat44, device=device)
-
-
-def _is_mesh_target(target_faces: wp.array[wp.int32] | None) -> bool:
-    return target_faces is not None and int(target_faces.shape[0]) // 3 > 0
-
-
 class _TargetIndex(TypedDict):
     """Everything [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] can be told once."""
 
     bvh: wp.Bvh
     initial_radius: float
     bounds: tuple[wp.vec3, wp.vec3]
-
-
-def _target_index(target_vertices: wp.array[wp.vec3]) -> _TargetIndex:
-    """
-    Precompute the k-NN search state for a point-cloud target.
-
-    Only the *source* moves between ICP iterations, so the target's BVH, bounding box and density
-    estimate are all loop-invariant. Hoisting them turns each iteration's correspondence step into
-    a single launch with no host synchronisation at all — worth ~0.4 ms per iteration on a 36k
-    cloud, which is the dominant remaining cost once the search radius itself is sane.
-    """
-    bounds = tw.bounds.aabb_bounds(target_vertices)
-    return {
-        "bvh": tw.neighbors.bvh_from_points(target_vertices),
-        "initial_radius": tw.neighbors.knn_initial_radius(target_vertices, 1, bounds=bounds),
-        "bounds": bounds,
-    }
 
 
 def icp(
@@ -386,51 +346,6 @@ def icp(
         old_cost = cost
 
     return total, transformed, cost
-
-
-def _robust_scale_from_residuals(
-    current: wp.array[wp.vec3],
-    closest: wp.array[wp.vec3],
-    normals: wp.array[wp.vec3],
-    distance: wp.array[wp.float32],
-    triangle_id: wp.array[wp.int32],
-    max_distance: float,
-    kind: int,
-) -> float:
-    """Robust scale (Huber/Tukey) from the MAD of the current point-to-plane residuals."""
-    device = current.device
-    n = int(current.shape[0])
-    residual = wp.empty(n, dtype=wp.float32, device=device)
-    wp.map(kernel_registration.point_to_plane_residual, current, closest, normals, out=residual)
-    valid = wp.empty(n, dtype=wp.bool, device=device)
-    wp.map(
-        kernel_registration.residual_valid,
-        triangle_id,
-        distance,
-        wp.float32(max_distance),
-        out=valid,
-    )
-    valid_indices = tw.array.flatnonzero(valid)
-    k = int(valid_indices.shape[0])
-    if k == 0:
-        return 0.0
-    kept = tw.array.gather(residual, valid_indices)
-    # Median and MAD on device (sort-based); only the scalar results cross to the host.
-    median = tw.reduce.median(cast(twt.Array1dFloat32, kept))
-    deviation = wp.empty(k, dtype=wp.float32, device=device)
-    wp.map(kernel_registration.abs_deviation, kept, wp.float32(median), out=deviation)
-    mad = tw.reduce.median(cast(twt.Array1dFloat32, deviation))
-    sigma = float(1.4826 * mad)
-    if sigma <= 0.0:
-        # Standard-deviation fallback: sqrt(mean((r - mean)^2)).
-        mean = float(tw.reduce.mean(cast(twt.Array1dFloat32, kept)))
-        wp.map(kernel_registration.abs_deviation, kept, wp.float32(mean), out=deviation)
-        wp.map(kernel_array.square_scalar, deviation, out=deviation)
-        sigma = float(tw.reduce.mean(cast(twt.Array1dFloat32, deviation))) ** 0.5
-    if sigma <= 0.0:
-        return 0.0
-    # 95% asymptotic efficiency tuning constants.
-    return 1.345 * sigma if kind == 1 else 4.685 * sigma
 
 
 def icp_point_to_plane(
@@ -644,6 +559,59 @@ def icp_point_to_plane(
     return total, transformed, cost
 
 
+def _robust_scale_from_residuals(
+    current: wp.array[wp.vec3],
+    closest: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    distance: wp.array[wp.float32],
+    triangle_id: wp.array[wp.int32],
+    max_distance: float,
+    kind: int,
+) -> float:
+    """Robust scale (Huber/Tukey) from the MAD of the current point-to-plane residuals."""
+    device = current.device
+    n = int(current.shape[0])
+    residual = wp.empty(n, dtype=wp.float32, device=device)
+    wp.map(kernel_registration.point_to_plane_residual, current, closest, normals, out=residual)
+    valid = wp.empty(n, dtype=wp.bool, device=device)
+    wp.map(
+        kernel_registration.residual_valid,
+        triangle_id,
+        distance,
+        wp.float32(max_distance),
+        out=valid,
+    )
+    valid_indices = tw.array.flatnonzero(valid)
+    k = int(valid_indices.shape[0])
+    if k == 0:
+        return 0.0
+    kept = tw.array.gather(residual, valid_indices)
+    # Median and MAD on device (sort-based); only the scalar results cross to the host.
+    median = tw.reduce.median(cast(twt.Array1dFloat32, kept))
+    deviation = wp.empty(k, dtype=wp.float32, device=device)
+    wp.map(kernel_registration.abs_deviation, kept, wp.float32(median), out=deviation)
+    mad = tw.reduce.median(cast(twt.Array1dFloat32, deviation))
+    sigma = float(1.4826 * mad)
+    if sigma <= 0.0:
+        # Standard-deviation fallback: sqrt(mean((r - mean)^2)).
+        mean = float(tw.reduce.mean(cast(twt.Array1dFloat32, kept)))
+        wp.map(kernel_registration.abs_deviation, kept, wp.float32(mean), out=deviation)
+        wp.map(kernel_array.square_scalar, deviation, out=deviation)
+        sigma = float(tw.reduce.mean(cast(twt.Array1dFloat32, deviation))) ** 0.5
+    if sigma <= 0.0:
+        return 0.0
+    # 95% asymptotic efficiency tuning constants.
+    return 1.345 * sigma if kind == 1 else 4.685 * sigma
+
+
+def _identity_mat44(device: wp.DeviceLike) -> wp.array[wp.mat44]:
+    """Return a ``(1,)`` array holding the 4x4 identity transform."""
+    identity = wp.mat44(
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0
+    )
+    return wp.array([identity], dtype=wp.mat44, device=device)
+
+
 def _correspondences(
     mesh: wp.Mesh | None,
     target_vertices: wp.array[wp.vec3],
@@ -741,6 +709,17 @@ def _seed_transform(
     return initial_matrix, current
 
 
+def _resolve_initial(
+    initial: wp.array[wp.mat44] | wp.mat44 | None, device: wp.DeviceLike
+) -> wp.array[wp.mat44]:
+    """Normalize ``initial`` to a ``(1,)`` ``wp.mat44`` device array."""
+    if initial is None:
+        return _identity_mat44(device)
+    if isinstance(initial, wp.array):
+        return wp.clone(initial)
+    return wp.array([initial], dtype=wp.mat44, device=device)
+
+
 def _resolve_icp_target(
     target_vertices: wp.array[wp.vec3],
     target_faces: wp.array[wp.int32] | None,
@@ -785,3 +764,24 @@ def _resolve_icp_target(
     if max_distance is not None:
         query_max = max(query_max, max_distance)
     return mesh, query_max, None
+
+
+def _target_index(target_vertices: wp.array[wp.vec3]) -> _TargetIndex:
+    """
+    Precompute the k-NN search state for a point-cloud target.
+
+    Only the *source* moves between ICP iterations, so the target's BVH, bounding box and density
+    estimate are all loop-invariant. Hoisting them turns each iteration's correspondence step into
+    a single launch with no host synchronisation at all — worth ~0.4 ms per iteration on a 36k
+    cloud, which is the dominant remaining cost once the search radius itself is sane.
+    """
+    bounds = tw.bounds.aabb_bounds(target_vertices)
+    return {
+        "bvh": tw.neighbors.bvh_from_points(target_vertices),
+        "initial_radius": tw.neighbors.knn_initial_radius(target_vertices, 1, bounds=bounds),
+        "bounds": bounds,
+    }
+
+
+def _is_mesh_target(target_faces: wp.array[wp.int32] | None) -> bool:
+    return target_faces is not None and int(target_faces.shape[0]) // 3 > 0

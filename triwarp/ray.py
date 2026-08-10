@@ -11,13 +11,6 @@ from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import ray as kernel_ray
 
 
-def _validate_ray_inputs(
-    mesh: wp.Mesh, ray_origins: wp.array[wp.vec3], ray_directions: wp.array[wp.vec3]
-) -> None:
-    if ray_origins.shape != ray_directions.shape:
-        raise ValueError("Ray origin and direction don't match!")
-
-
 def intersects_location(
     mesh: wp.Mesh,
     ray_origins: wp.array[wp.vec3],
@@ -245,6 +238,13 @@ def longest_ray(
         out=out_distances,
     )
     return out_distances
+
+
+def _validate_ray_inputs(
+    mesh: wp.Mesh, ray_origins: wp.array[wp.vec3], ray_directions: wp.array[wp.vec3]
+) -> None:
+    if ray_origins.shape != ray_directions.shape:
+        raise ValueError("Ray origin and direction don't match!")
 
 
 def contains_points(

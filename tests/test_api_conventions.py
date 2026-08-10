@@ -142,9 +142,10 @@ def test_private_helpers_follow_their_callers() -> None:
     A private helper is defined below the public function that calls it (the stepdown rule).
 
     ``.claude/CLAUDE.md`` section 11: a reader should never need to jump backward to a definition
-    they have not been introduced to yet. ``_HELPER_ORDER_ALLOWLIST`` carries the 50 sites that
-    predate this check, as an explicit debt list rather than a silent exemption -- it is also
-    checked for staleness, so an entry that gets fixed has to be removed rather than left to rot.
+    they have not been introduced to yet. ``_HELPER_ORDER_ALLOWLIST`` carried the 49 sites that
+    predated this check as an explicit debt list rather than a silent exemption, and the staleness
+    half of it did its job: the list is now drained to a single permanent entry, a helper called at
+    module scope to build a constant, which has no caller to sit below.
     """
     _fail("private helper(s) above their first caller:", helper_order_problems())
 

@@ -268,20 +268,6 @@ def dtype_zero(dtype: type[wp.Scalar]) -> int | float:
     return 0.0
 
 
-def _shape_2d(shape: tuple[int, int] | list[int]) -> tuple[int, int]:
-    dims = tuple(int(x) for x in shape)
-    if len(dims) != 2:
-        raise ValueError(f"2D shape must have length 2, got {shape!r}")
-    return (dims[0], dims[1])
-
-
-def _shape_3d(shape: tuple[int, int, int] | list[int]) -> tuple[int, int, int]:
-    dims = tuple(int(x) for x in shape)
-    if len(dims) != 3:
-        raise ValueError(f"3D shape must have length 3, got {shape!r}")
-    return (dims[0], dims[1], dims[2])
-
-
 @overload
 def empty_2d(
     shape: tuple[int, int] | list[int], dtype: type[wp.int32], *, device: wp.DeviceLike = None
@@ -322,6 +308,13 @@ def empty_2d(
     return cast(Array2dInt32 | Array2dFloat, wp.empty(_shape_2d(shape), dtype=dtype, device=device))
 
 
+def _shape_2d(shape: tuple[int, int] | list[int]) -> tuple[int, int]:
+    dims = tuple(int(x) for x in shape)
+    if len(dims) != 2:
+        raise ValueError(f"2D shape must have length 2, got {shape!r}")
+    return (dims[0], dims[1])
+
+
 @overload
 def empty_3d(
     shape: tuple[int, int, int] | list[int],
@@ -358,3 +351,10 @@ def empty_3d(
     return cast(
         Array3dFloat32 | Array3dBool, wp.empty(_shape_3d(shape), dtype=dtype, device=device)
     )
+
+
+def _shape_3d(shape: tuple[int, int, int] | list[int]) -> tuple[int, int, int]:
+    dims = tuple(int(x) for x in shape)
+    if len(dims) != 3:
+        raise ValueError(f"3D shape must have length 3, got {shape!r}")
+    return (dims[0], dims[1], dims[2])
