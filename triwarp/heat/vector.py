@@ -14,7 +14,7 @@ Every function here returns tangent vectors as ``wp.vec2`` in each vertex's own 
 comparing 2D components against another library's is meaningless, since each library picks its own
 reference direction per vertex.
 
-All three solvers need conjugate gradient and are therefore CUDA-only, like
+All three solvers are built on conjugate gradient, like
 [`heat_geodesic`][triwarp.heat.distance.heat_geodesic].
 """
 
@@ -32,6 +32,13 @@ from triwarp.laplacian import connection_laplacian, mass_matrix_entries
 from triwarp.tangent_space import vertex_tangent_frames
 
 _CG_TOLERANCE = 1e-8
+
+# A diffused field is treated as having vanished below this fraction of its *own* maximum. Both
+# fields these solvers divide by -- the direction field and the source indicator -- carry the mesh's
+# scale as ~1/scale^2, so the cutoff has to be relative or the whole answer silently goes to zero on
+# a mesh measured in millimetres. It is deliberately far below the round-off floor (~1e-08 of the
+# maximum): see ``kernels/heat/vector.py`` for why nothing here can separate noise from signal.
+_RELATIVE_ZERO = 1e-12
 
 
 # ``HeatOperators`` is imported directly rather than reached through ``tw.heat.distance``: this is
@@ -175,8 +182,14 @@ def extend_scalar(
         heat_system, indicator, n_vertices, device, heat_preconditioner
     )
     diffused_values = _solve_scalar(heat_system, weighted, n_vertices, device, heat_preconditioner)
+    # The indicator decays away from the sources *and* carries the mesh's scale, so the "there is no
+    # source anywhere near here" cutoff is a fraction of its own maximum. One host readback, as in
+    # ``transport_tangent_vectors``.
+    floor = wp.float64(_RELATIVE_ZERO * tw.reduce.max(diffused_indicator))
     extended = wp.empty(n_vertices, dtype=wp.float64, device=device)
-    wp.map(kernel_heat_vector.divide_positive, diffused_values, diffused_indicator, out=extended)
+    wp.map(
+        kernel_heat_vector.divide_positive, diffused_values, diffused_indicator, floor, out=extended
+    )
     return extended
 
 
@@ -222,19 +235,33 @@ def transport_tangent_vectors(
         ``(n_vertices,)`` transported vectors, each in that vertex's own frame. No frames need to be
         passed in: the components come out in the canonical frames of
         [`vertex_tangent_frames`][triwarp.tangent_space.vertex_tangent_frames] by construction (see
-        [`connection_laplacian`][triwarp.laplacian.connection_laplacian]).
-
-    Raises
-    ------
-    NotImplementedError
-        On the CPU device (conjugate gradient; see
-        [`extend_scalar`][triwarp.heat.vector.extend_scalar]).
+        [`connection_laplacian`][triwarp.laplacian.connection_laplacian]). A **zero** vector means
+        the field vanished at that vertex: it is in another connected component from every source,
+        or short-time diffusion has underflowed before reaching it. The second is the common case on
+        a fine mesh, because the default ``t`` shrinks with the edge length — 39 461 of 40 962
+        vertices on a subdivision-6 icosphere, which is the method behaving as designed rather than
+        a failure. Pass a larger ``t`` to reach further.
 
     See Also
     --------
     [`log_map`][triwarp.heat.vector.log_map]
     [`connection_laplacian`][triwarp.laplacian.connection_laplacian]
     [`tangent_to_world`][triwarp.heat.vector.tangent_to_world]
+
+    Notes
+    -----
+    !!! note "The direction is undefined on the cut locus"
+
+        Where several shortest paths of equal length arrive, the copies they carry cancel, and what
+        is left is round-off rather than a direction. This is not a pathological case: the corner of
+        a cube shell diagonally opposite the source receives three copies 120 degrees apart whose
+        sum is *exactly* zero, for every source vector and every diffusion time. Which of the two
+        answers above comes back is then decided by the arithmetic — on CUDA enough round-off
+        survives (~1e-08 of the field maximum) to be scaled up to full length in an arbitrary
+        direction, while on CPU the same point can cancel to exactly zero and read as unreached.
+        Callers that need to know where this happens should look at
+        [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]: the cut locus is where its gradient
+        is discontinuous.
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
@@ -252,8 +279,15 @@ def transport_tangent_vectors(
     wp.map(wp.length, _as_vec2d(vectors), out=magnitudes)
     extended = extend_scalar(vertices, faces, sources, magnitudes, operators=scalar)
 
+    # "Has this direction vanished?" is asked relative to the field, because the field's length
+    # carries the mesh's scale. One host readback: ``reduce.max`` returns a Python scalar, ~0.1 ms
+    # against the three conjugate-gradient solves this function has already run.
+    lengths = wp.empty(n_vertices, dtype=wp.float64, device=device)
+    wp.map(wp.length, direction, out=lengths)
+    floor = wp.float64(_RELATIVE_ZERO * tw.reduce.max(lengths))
+
     scaled = wp.empty(n_vertices, dtype=wp.vec2d, device=device)
-    wp.map(kernel_heat_vector.scale_to_magnitude, direction, extended, out=scaled)
+    wp.map(kernel_heat_vector.scale_to_magnitude, direction, extended, floor, out=scaled)
     transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     wp.map(kernel_heat_vector.to_vec2, scaled, out=transported)
     return transported
@@ -310,12 +344,6 @@ def log_map(
         On the cut locus — the antipode of a closed surface, where geodesics from the source arrive
         from every side — there is no direction to report, and the entry keeps the correct magnitude
         with an arbitrary angle.
-
-    Raises
-    ------
-    NotImplementedError
-        On the CPU device (conjugate gradient; see
-        [`extend_scalar`][triwarp.heat.vector.extend_scalar]).
 
     See Also
     --------

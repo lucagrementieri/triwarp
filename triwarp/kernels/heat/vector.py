@@ -34,20 +34,39 @@ def seed_source_vectors(
 
 
 @wp.func
-def divide_positive(numerator: wp.float64, denominator: wp.float64) -> wp.float64:
+def divide_positive(
+    numerator: wp.float64, denominator: wp.float64, floor: wp.float64
+) -> wp.float64:
     # Away from every source the indicator decays to ~0; guard the ratio rather than emit inf.
-    if denominator <= wp.float64(TOLERANCE_ZERO_CONSTANT):
+    # ``floor`` is a fraction of the indicator field's own maximum, never an absolute value -- see
+    # ``scale_to_magnitude`` below for why an absolute one is a silent wrong answer on a large mesh.
+    if denominator <= floor:
         return wp.float64(0.0)
     return numerator / denominator
 
 
 @wp.func
-def scale_to_magnitude(direction: wp.vec2d, magnitude: wp.float64) -> wp.vec2d:
+def scale_to_magnitude(direction: wp.vec2d, magnitude: wp.float64, floor: wp.float64) -> wp.vec2d:
     # The vector heat method splits a transported vector into a direction (from the vector
     # diffusion) and a magnitude (from a scalar extension): short-time vector diffusion smears
     # magnitudes but preserves directions well.
+    #
+    # ``floor`` is a fraction of the direction field's own maximum, never an absolute length. The
+    # diffused field carries the mesh's scale as ~1/scale^2 -- measured max |direction| of 6.24e-01
+    # at unit scale against 6.24e-13 at 1e6 -- so an absolute cutoff turns into "return zero
+    # everywhere" on a large mesh: 91 of 162 vertices came back at zero magnitude on an
+    # ``icosphere(2)`` scaled by 1e5. Relative, the same field is identical to every digit printed
+    # at both scales.
+    #
+    # The floor separates a vanished direction from a represented one. It does *not* separate signal
+    # from round-off and must not be raised in an attempt to: the smallest genuinely diffused value
+    # on ``half_torus`` is 8.0e-10 of the maximum, *below* the 8.7e-09 of round-off left at a point
+    # where the transported copies cancel exactly. That round-off is the float32 frames' noise
+    # rather than the solve's, so it does not move when the conjugate-gradient tolerance is
+    # tightened from 1e-8 to 1e-14 (measured: 8.7e-09, then 1.0e-08 at every tighter tolerance).
+    # The two populations overlap and no magnitude cut tells them apart.
     length = wp.length(direction)
-    if length <= wp.float64(TOLERANCE_ZERO_CONSTANT):
+    if length <= floor:
         return wp.vec2d(wp.float64(0.0), wp.float64(0.0))
     return (magnitude / length) * direction
 

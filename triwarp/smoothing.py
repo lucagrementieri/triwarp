@@ -909,8 +909,6 @@ def smooth_region(
 
     Raises
     ------
-    NotImplementedError
-        On a CPU device.
     ValueError
         If ``edge_weights`` is not ``"cotan"`` or ``"unit"``.
 

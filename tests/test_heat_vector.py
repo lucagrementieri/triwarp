@@ -241,9 +241,110 @@ def test_transport_does_not_cross_components(
         tw.edges.edges_unique(mesh_wp.indices)[0], int(mesh_wp.points.shape[0])
     ).numpy()
     reachable = labels == labels[0]
+
+    # The outer shell's corner diagonally opposite the source is excluded, and not as a tolerance
+    # dodge: it is a point of the cut locus with three-fold symmetry about the body diagonal, so the
+    # three shortest paths deliver copies of the source vector 120 degrees apart whose sum is
+    # exactly zero. Measured on this fixture: exactly 0.0 at diffusion times 1e-3, 1e-2 and 1e-1 (so
+    # it is not short-time underflow), unchanged by rotating the source vector (so it is not a bad
+    # input direction), and restored in proportion to a symmetry-breaking jitter of the vertices
+    # (1.4e-04 at 1e-3, 1.2e-02 at 1e-1).
+    #
+    # What survives the cancellation is round-off, and the two devices round differently: CPU
+    # returns exactly zero and is scaled to zero, CUDA returns 8.7e-09 of the field maximum and is
+    # scaled to unit length. Neither is more correct, and no threshold can pick the round-off out --
+    # ``half_torus`` resolves genuine directions down to 8.0e-10 of its maximum, below this noise.
+    # ``test_transport_cancels_at_a_symmetric_cut_locus_point`` pins the cancellation itself.
+    positions_np = mesh_wp.points.numpy()
+    antipode = int(np.argmin(np.linalg.norm(positions_np + positions_np[0], axis=1)))
+    assert reachable[antipode]
+    resolvable = reachable & (np.arange(magnitude.shape[0]) != antipode)
+
     assert np.isfinite(magnitude).all()
-    assert np.allclose(magnitude[reachable], 1.0, rtol=1e-4, atol=1e-4)
+    # Seven of the outer shell's eight corners, so the comparison below is not vacuous.
+    assert resolvable.sum() == 7
+    assert np.allclose(magnitude[resolvable], 1.0, rtol=1e-4, atol=1e-4)
     assert np.allclose(magnitude[~reachable], 0.0, rtol=1e-6, atol=1e-6)
+
+
+def test_transport_cancels_at_a_symmetric_cut_locus_point(
+    cave_cube: tuple[object, wp.Mesh], device: str
+) -> None:
+    """
+    Class C: the transported direction at a symmetric cut-locus point is a cancellation.
+
+    There is nothing to compare the answer against — the quantity *is* the cancellation — so the
+    statistic is a stability one: how far the unit direction at the antipodal corner moves when the
+    symmetry causing the cancellation is broken by a vertex jitter, against how far every other
+    vertex of the same shell moves under the identical perturbation. It excludes "that corner is
+    merely the farthest from the source", which would move it no more than its neighbours move.
+
+    Margins, measured over five jitter seeds on both devices: the antipode moves 1.000 (CPU, where
+    the unperturbed answer is the zero vector) to 1.99 (CUDA), against a 0.25 threshold — 4x. Every
+    other vertex moves a median 0.0007-0.0034 and at most 0.0089, against a 0.02 threshold — 5.9x.
+    The two populations are 112x apart at their closest.
+    """
+    _, mesh_wp = cave_cube
+    sources_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
+    vectors_wp = wp.array(
+        np.array([[1.0, 0.0]], dtype=np.float32), dtype=wp.vec2, device=mesh_wp.device
+    )
+    positions_np = mesh_wp.points.numpy()
+    antipode = int(np.argmin(np.linalg.norm(positions_np + positions_np[0], axis=1)))
+
+    def _directions(points_np: np.ndarray) -> np.ndarray:
+        transported = tw.heat.vector.transport_tangent_vectors(
+            wp.array(points_np, dtype=wp.vec3, device=mesh_wp.device),
+            mesh_wp.indices,
+            sources_wp,
+            vectors_wp,
+        ).numpy()
+        norm = np.linalg.norm(transported, axis=1, keepdims=True)
+        return transported / np.where(norm > 0.0, norm, 1.0)
+
+    jitter = np.random.default_rng(20260810).normal(scale=1e-3, size=positions_np.shape)
+    moved = np.linalg.norm(_directions(positions_np) - _directions(positions_np + jitter), axis=1)
+    labels = tw.graph.connected_component_labels_from_edges(
+        tw.edges.edges_unique(mesh_wp.indices)[0], int(mesh_wp.points.shape[0])
+    ).numpy()
+    others = (labels == labels[0]) & (np.arange(moved.shape[0]) != antipode)
+
+    assert others.sum() == 7
+    assert np.median(moved[others]) < 0.02
+    assert moved[antipode] > 0.25
+
+
+@pytest.mark.parametrize("scale", [1e-3, 1e5])
+def test_transport_is_invariant_to_mesh_scale(
+    hemisphere: tuple[object, wp.Mesh], scale: float, device: str
+) -> None:
+    """
+    Class A: the same surface in different units transports to the same tangent field.
+
+    Both fields the solver divides by — the direction field and the source indicator — carry the
+    mesh's scale as ~1/scale^2, so the cutoff that decides "has this vanished?" has to be relative
+    to the field. Against an absolute cutoff the failure is a *silent* zero field rather than an
+    error: 43 of this fixture's 97 vertices came back at zero magnitude at scale 1e5, and 0 do now.
+    """
+    _, mesh_wp = hemisphere
+    sources_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
+    vectors_wp = wp.array(
+        np.array([[1.0, 0.0]], dtype=np.float32), dtype=wp.vec2, device=mesh_wp.device
+    )
+    unit = tw.heat.vector.transport_tangent_vectors(
+        mesh_wp.points, mesh_wp.indices, sources_wp, vectors_wp
+    )
+    rescaled = tw.heat.vector.transport_tangent_vectors(
+        wp.array(mesh_wp.points.numpy() * scale, dtype=wp.vec3, device=mesh_wp.device),
+        mesh_wp.indices,
+        sources_wp,
+        vectors_wp,
+    )
+
+    # Non-vacuous on both sides: every vertex of the unit-scale field is resolved, so a zeroed
+    # rescaled field cannot pass the comparison by matching zeros against zeros.
+    assert np.allclose(np.linalg.norm(unit.numpy(), axis=1), 1.0, rtol=1e-4, atol=1e-4)
+    assert np.allclose(rescaled.numpy(), unit.numpy(), rtol=1e-4, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------

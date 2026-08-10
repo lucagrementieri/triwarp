@@ -13,8 +13,8 @@ own shape, minimizing conformal rather than Dirichlet energy.
 [`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle] supplies the boundary
 condition the fixed-boundary three need, and
 [`flipped_faces`][triwarp.parametrization.flipped_faces] is the diagnostic that says whether a
-result is actually injective. Ports of the corresponding ``igl::`` routines; the solves are
-conjugate-gradient and therefore CUDA-only.
+result is actually injective. Ports of the corresponding ``igl::`` routines; every solve is
+conjugate-gradient.
 """
 
 from __future__ import annotations
@@ -207,8 +207,6 @@ def harmonic(
     ValueError
         If ``k < 1``, or if there are interior vertices but ``boundary_indices`` is empty (the
         Dirichlet system would be singular).
-    NotImplementedError
-        On a CPU device when an interior solve is required.
 
     See Also
     --------
@@ -253,7 +251,6 @@ def tutte(
     with a convex boundary is guaranteed bijective (fold-free), unlike the harmonic/conformal maps.
     For
     ``k > 1`` the mass matrix is the identity (matching libigl's ``speye`` graph-Laplacian variant).
-    Requires a **CUDA device** whenever there are interior vertices to solve for.
 
     Parameters
     ----------
@@ -280,8 +277,6 @@ def tutte(
     ------
     ValueError
         If ``k < 1``, or if there are interior vertices but ``boundary_indices`` is empty.
-    NotImplementedError
-        On a CPU device when an interior solve is required.
 
     See Also
     --------
@@ -411,8 +406,6 @@ def arap(
     ValueError
         If ``max_iterations < 1``, if ``tolerance <= 0``, or if there are interior vertices but
         ``fixed_indices`` is empty.
-    NotImplementedError
-        On a CPU device when an interior solve is required.
 
     See Also
     --------
@@ -653,8 +646,6 @@ def lscm(
     ------
     ValueError
         If fewer than two vertices are pinned (and the mesh has at least two vertices).
-    NotImplementedError
-        On a CPU device when a free-vertex solve is required.
 
     See Also
     --------

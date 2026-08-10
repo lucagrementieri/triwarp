@@ -18,8 +18,7 @@ Curves are given as **vertex paths** — the form
 [`boundary_loop`][triwarp.boundary.boundary_loop] all produce — packed into one flat buffer with CSR
 offsets. Curves at arbitrary barycentric points are not accepted yet.
 
-Like the rest of the heat-method family this is CUDA-only: every stage is a conjugate-gradient
-solve.
+Like the rest of the heat-method family, every stage is a conjugate-gradient solve.
 """
 
 from __future__ import annotations

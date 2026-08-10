@@ -444,8 +444,6 @@ def screened_poisson(
     ------
     ValueError
         If ``points`` has fewer than 3 points, or the depth/scale parameters are out of range.
-    NotImplementedError
-        On a CPU device (the conjugate-gradient solve requires CUDA).
 
     See Also
     --------
