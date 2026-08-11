@@ -73,9 +73,10 @@ def k_harmonic(
     originally made to dodge a suspected ``bsr_mm`` nondeterminism, which turned out to be this
     package's own defect: a triplet buffer sized by ``BsrMatrix.nnz`` — the *capacity* the matrix
     was built with, not its entry count — left an uninitialized gap that ``bsr_from_triplets`` read
-    back as garbage triplets. ``bsr_mm`` is sound. The triplet pass stays because it is what is
-    tested and measured here; swapping in ``bsr_mm`` is an unbenchmarked performance change, not a
-    correctness fix.
+    back as garbage triplets. ``bsr_mm`` is sound. The triplet pass stays on its own merits: it
+    measures ~2x faster than a chained ``bsr_mm`` on both devices up to ~40 000 vertices, though
+    ``bsr_mm`` overtakes it on CUDA above ~100 000 — the measured table is on the private
+    ``_diagonal_sandwich`` helper below.
 
     Parameters
     ----------
@@ -141,7 +142,28 @@ def _diagonal_sandwich(
 
     Row ``t`` of the product is the outer product of ``A``'s and ``B``'s rows ``t`` scaled by the
     diagonal weight, so the whole product is one count kernel, one scan, one emission kernel and a
-    single ``bsr_from_triplets`` — never ``bsr_mm``.
+    single ``bsr_from_triplets``.
+
+    **Why not ``bsr_mm``, and where that stops being true.**
+    ``bsr_mm(bsr_mm(a, bsr_diag(inverse_mass)), b)`` is a genuine drop-in — identical ``nnz`` and
+    values agreeing to 3.4e-16 relative at every size probed. It is a *size* trade, measured
+    back-to-back on an RTX 5090 as ``min`` of 8-12 interleaved reps (ratio is ``bsr_mm`` over this
+    path, so above 1 means ``bsr_mm`` loses):
+
+    | vertices | 2 562 | 10 242 | 40 962 | 163 842 | 655 362 |
+    |---|---|---|---|---|---|
+    | CUDA | 2.29x | 2.04x | 1.85x | **0.89x** | **0.67x** |
+    | CPU | 2.29x | 2.26x | 2.15x | 2.18x | — |
+
+    So the triplet pass wins ~2x across the range this package is normally used at and loses
+    11-33 % above ~100 000 vertices, while CPU never prefers ``bsr_mm`` at any measured size,
+    staying flat at ~2.2x over a 64x size range.
+
+    What ``bsr_mm`` avoids is the scratch, which is why it crosses over at all: this path
+    materializes **2.58x the output ``nnz``** as triplets, 514 MB at 655 362 vertices against a
+    149 MB result. A size-thresholded switch is viable — ``n_triplets`` is known from the scan
+    below *before* any buffer is allocated — but it would need a CUDA-only constant (§13) and no
+    in-repo caller runs meshes that large, so it is deliberately not done.
     """
     n_rows = int(a.nrow)
     device = inverse_mass.device
