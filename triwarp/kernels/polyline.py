@@ -1,15 +1,9 @@
 import warp as wp
 
 from triwarp.constants import TOLERANCE_MERGE_CONSTANT
-from triwarp.kernels.array import (
-    binary_search_index,
-    cross2,
-    update_argmax,
-    vector_angle_vec,
-    wrap_index,
-)
+from triwarp.kernels.array import binary_search_index, cross2, update_argmax, wrap_index
 from triwarp.kernels.points import plane_basis
-from triwarp.kernels.predicates import orient2d, project_out_normal
+from triwarp.kernels.predicates import orient2d, project_out_normal, vector_angle
 
 
 @wp.func
@@ -84,7 +78,8 @@ def cyclic_segment_angles(polyline: wp.array[wp.vec3], out_angles: wp.array[wp.f
     n_segments = polyline.shape[0] - 1
     s0 = segment_displacement(polyline, i)
     s1 = segment_displacement(polyline, (i + 1) % n_segments)
-    out_angles[i] = vector_angle_vec(wp.normalize(s0), wp.normalize(s1))
+    # ``vector_angle`` is scale-free, so the segments go in unnormalized.
+    out_angles[i] = vector_angle(s0, s1)
 
 
 @wp.kernel
@@ -188,7 +183,7 @@ def arc_point(po: wp.vec3, pd: wp.vec3, no: wp.vec3, nd: wp.vec3, t: wp.float32)
     # Zero end-normals are the collinear sentinel from endpoint_normals; unit normals have norm 1.
     if wp.length_sq(no) < 0.5 or wp.length_sq(nd) < 0.5:
         return linear
-    theta = vector_angle_vec(no, nd)
+    theta = vector_angle(no, nd)
     if theta < CURVATURE_EPS:
         return linear
     tangent = wp.normalize(b)

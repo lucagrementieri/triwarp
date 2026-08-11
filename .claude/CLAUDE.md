@@ -88,6 +88,44 @@ For element-wise dtype conversion of `wp.array` buffers at Python scope, allocat
 
 Inside kernels, keep using `wp.cast(expr, TargetType)` for scalar and vector conversions.
 
+### `BsrMatrix.nnz` is a stale capacity; `nnz_sync()` is the entry count
+
+**Never size a buffer, slice, or launch dim off `matrix.nnz`.** After `bsr_from_triplets` the `nnz`
+field still holds the *triplet count it was handed*, duplicates included — so for any
+duplicate-emitting build it is an upper bound, measured at 8400 against a true 4516 on the synthetic
+Laplacian of `downloads/issue_report.md` and **3.4x** (15 360 against 4 482) on
+`laplacian.cotmatrix`, which emits 12 triplets per face. Use **`matrix.nnz_sync()`** (one host
+readback, §13's ~0.1 ms) or read `offsets[nrow]`, which `energies.k_harmonic` already does.
+
+**And `nnz` is a *cache*, not a fixed field: `nnz_sync()` repairs it in place.** Measured on 1.16.0 —
+`int(m.nnz)` reads 15 360, then `m.nnz_sync()` returns 4 482, and `int(m.nnz)` now reads 4 482 too;
+nothing else syncs it (`bsr_mv`, `values.numpy()`, `offsets.numpy()` all leave it stale). So whether
+a `.nnz` read is correct depends on whether unrelated earlier code happened to sync that matrix,
+which makes the bug order-dependent and is a live trap **for the test as much as the code**: a guard
+that measures the capacity and then hands the *same* matrix to the function under test has already
+repaired it, and passes against the broken implementation. Build two operators — one to measure, one
+to hand over (see `test_filter_laplacian_implicit_duplicate_built_operator`).
+
+The failure is silent and it is not a Warp bug. Sizing a `triplet_buffers` allocation by `nnz` leaves
+the tail `[nnz_sync(), nnz)` unwritten, and since those buffers are `wp.empty` (§4, deliberately) the
+gap reaches the next `bsr_from_triplets` as **uninitialized triplets**. `bsr_from_triplets` drops an
+out-of-range row/column index silently — verified for both `999999` and `-7`, no exception and no
+CUDA fault — so most garbage vanishes and the answer looks right; the entries whose garbage index
+happens to land in `[0, nrow)` accumulate a garbage value into a **real** entry. Measured on
+`_build_implicit_system` with a `cotmatrix` operator and plausible indices left in the memory pool:
+`‖values‖ = 1.1e13` against the correct `84.3`, plus one spurious entry. This is what the
+long-standing "`bsr_mm` is nondeterministic on CUDA" claim in this package really was, in
+`downloads/issue_report.md` and in six code comments — **`bsr_mm` is sound**; do not reintroduce that
+explanation. A rebuild sliced to `nnz_sync()` is safe.
+
+Two corollaries. A matrix built by *duplicate-free* triplets (`laplacian.laplacian`,
+`smoothing._edge_weight_matrix`) has `nnz == nnz_sync()`, which is why the default paths never
+showed this — so a probe on the default operator proves nothing, and the check belongs on a
+`cotmatrix`-shaped input. And where a triplet writer legitimately leaves slots unwritten (a
+conditional emit, as in `dirichlet_system_triplets` / `laplacian_ls_triplets`), `wp.zeros` rather
+than `triplet_buffers` is correct and deliberate: a `(0, 0, 0.0)` triplet is a harmless structural
+zero.
+
 ### NumPy at Python scope is sanctioned; leaking it through the API is not
 
 `warp-lang` carries an unconditional `Requires-Dist: numpy` and `import warp` loads it eagerly, and
@@ -170,6 +208,45 @@ identical to a hand-written kernel; cached calls cost ~11 µs extra host-side Py
   `warp._src.context.builtin_functions["tile_max"]` and closure-capturing it — captured
   builtins emit inline at codegen and template on the tile dtype (see
   `triwarp/kernels/reduce.py`). Give each factory instantiation a unique kernel `name`.
+
+### A generic kernel registers its overloads at import (`wp.overload`)
+
+**A `@wp.kernel` generic over a dtype (`wp.Scalar`, `wp.Float`, `wp.Int`, `Any`) must have its
+concrete overloads registered at module import**, in a `_register_overloads()` called at the bottom
+of the file. Warp instantiates a generic kernel's overload *lazily*, on the first launch at each new
+dtype, and a module's hash covers the set of **instantiated** overloads — so that first launch
+changes the hash and recompiles **every kernel in the module**. Nothing fails; it only costs, which
+is why nothing but a check catches it.
+
+Measured on an RTX 5090, Warp 1.16, over one full-suite run before the registrations existed:
+`kernels.reduce` rebuilt across **66** distinct `(hash, block_dim)` module loads at ~14 s each,
+`laplacian` 16, `array` 13, `scatter` 11, `grouping`/`energies` 9 — 206 loads across
+`triwarp.kernels.*`, against 87 after, where 2 per module is the irreducible CPU/CUDA floor.
+`tests/test_reduce.py` alone went from 535 s to 1.4 s and the whole suite from 1 033 s to 29 s.
+Independent corroboration: 464 of the 1 269 directories in the Warp kernel cache were dead `reduce`
+hash links.
+
+- **The chain is order-dependent, which is what makes it a developer-loop tax rather than a
+  one-time cost.** A caller reaching the dtypes in a different order walks links that were never
+  compiled, so changing which tests you select re-pays it from scratch.
+- **Register what the wrapper's dispatch can reach, not every dtype the template admits** (§14, no
+  speculative generality): an unused overload is compile time paid on every rebuild. Derive the set
+  from the wrapper — a public `dtype=` keyword documented "float32 or float64", the key dtypes
+  `sortable_dtype` maps onto, a docstring naming its own admissible dtypes — and say so in a
+  comment. Where two generic arguments are independent (`laplacian.cotmatrix_triplets`' entry
+  precision and matrix precision), it is a genuine cross product, not a diagonal.
+- **Registration is not compilation.** `wp.overload` builds the overload's `Adjoint` and nothing
+  else, so this costs milliseconds of import and nothing on a process that never launches the
+  kernel. Do **not** `wp.load_module` / `wp.force_load` at import — that *would* compile eagerly.
+- **`block_dim` forks the hash independently of dtype and is normally left alone.** Its values are
+  fixed by the package's own launch code (a bounded two or three: a tiled launch's `block_dim`,
+  Warp's 256 default, and 1 on CPU), so it is not a chain that grows with call order. Collapsing
+  them is a perf change and needs §13's measurement — it was measured for `reduce` and declined.
+- `tests/test_api_conventions.py::test_generic_kernels_register_their_overloads` fails when a
+  generic kernel has **no** overload registered. Nothing checks that a registered dtype *set* is
+  complete, and nothing cheaply can — proving it means launching the whole dispatch, and the cost
+  of getting it wrong is a rebuild rather than a wrong answer. **A missing dtype is diagnosed from
+  the clock, not from a failing assert**; see §13.
 
 ### In-place `@wp.func` parameters (`wp.ref[T]`, Warp 1.15+)
 
@@ -588,7 +665,19 @@ Tests may use `import triwarp.typing as twt` for annotations (e.g. `expected: tw
 
 ## 8. Device Checks
 
-**Do not check that input arrays share the same device.** Warp raises a clear error automatically when mismatched devices are used in `wp.launch` or array operations, so manual `if arr.device != device: raise ValueError(...)` guards are redundant. Omit them entirely.
+**Do not check that input arrays share the same device.** Manual `if arr.device != device: raise ValueError(...)` guards are redundant — the harness rejects the mismatch for you (below), and §14 forbids a docstring documenting a `ValueError` for arrays "on different devices". Omit them entirely.
+
+**But do not believe that `wp.launch` raises on a device mismatch — it has not since Warp 1.14.** That release removed the unconditional same-device check (`NVIDIA/warp` GH-1461) so that hardware-coherent launches would be legal, and the default `wp.config.launch_array_access_mode` is `RELAXED`, which passes the pointers straight through and validates nothing. On this box the consequences are asymmetric and both are silent:
+
+- **CPU arrays, CUDA launch** (a launch that forgot `device=`, resolving to `cuda:0`): the GPU reads the host arrays over HMM (`is_cpu_memory_access_from_gpu_supported` is `True` here) and computes the **right answer** — then the launch is *asynchronous*, so when those host arrays are freed while the kernel is still running the heap is corrupted and the process aborts in `malloc` much later. Measured on a 97-line repro: 20/20 aborts when the arrays are freed without a sync, **0/20** when nothing is freed (`os._exit`), and **0/20** when `wp.synchronize()` precedes the free. The same pattern on `cuda:0` arrays is safe because CUDA frees are stream-ordered; host frees carry no ordering, and nothing at the call site distinguishes the two.
+- **CUDA arrays, CPU launch**: immediate `SIGSEGV`, no Python exception (GH-1693).
+
+Four consequences for triwarp:
+
+- **`tests/conftest.py` sets `LaunchArrayAccessMode.STRICT`**, the only mode that rejects a *genuine* cross-device argument; `CHECKED` validates addressability, which HMM genuinely provides, so it permits the launch and still corrupts (measured 2/30). The full suite passes under `STRICT` (2 113 tests), so no triwarp launch is intentionally cross-device — keep it that way.
+- **`STRICT` alone would not have caught the bug that motivated it, which is why check 15 exists.** It only fires when an argument is *not* on the launch device, so on a CUDA run — this box, and CI — an omitted `device=` resolves to `cuda:0`, which *is* the arrays' device, and nothing is rejected. The corruption then waits for a CPU run. `test_launches_name_their_device` scans every launch site statically and is the half that sees it; the two guards cover different halves and neither replaces the other.
+- **§3's "always forward the `device`" is a memory-safety rule, not a tidiness one.** All 476 `wp.launch` / `wp.launch_tiled` calls in `triwarp/` name a device; a new one that does not is the defect above.
+- **`.numpy()` is not a sync on a CPU array.** On a CUDA array it synchronizes; on a host array it is a zero-copy view, so "I read the result and it was correct" proves nothing about whether the kernel finished.
 
 ---
 
@@ -721,6 +810,27 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
 
 ## 13. Performance Work: Measure Before You Change
 
+- **Something suddenly slow is a Warp rebuild until proven otherwise — check that first.** Before
+  profiling anything, before believing a kernel got slower, before deleting a test for being slow:
+  a single-digit-second operation that now takes tens of seconds, or a test file whose cost appears
+  and disappears as you change *which* tests you select, is almost always a module recompile from
+  an unregistered generic-kernel overload (§4). Measured: `tests/test_reduce.py` took **1 561 s** on
+  a fresh selection and **1.30 s** repeating the identical one — same tests, same asserts, same
+  machine, 1 200x apart — and the whole suite ran 1 033 s where the tests themselves account for
+  ~29 s. Two confirmations, both cheap:
+  ```bash
+  # 1. The compile is single-threaded nvcc, so the GPU is idle while the clock runs.
+  nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader   # 0 % during the stall
+  # 2. Warp says so outright.
+  uv run python -c "import warp as wp; wp.config.verbose = True; ..." 2>&1 \
+      | grep -E "Module hash changed, recompiling|took .* ms  \(compiled\)"
+  ```
+  Any `Module hash changed, recompiling: <module>` line for a `triwarp.kernels.*` module is the
+  defect: add the dtype to that module's `_register_overloads`. A *second* line for the same module
+  in one run means the chain is still forking. This is the first thing to inspect because the
+  alternative reading — "this test is inherently slow, cap its input or delete it" — removes
+  coverage to work around a fixable compile, which is exactly the trade that hid the problem for as
+  long as it lasted.
 - **A benchmark lands before the optimization does.** Never restructure code for speed without a
   `benchmarks/test_<module>.py` group timing the *current* implementation first. A belief about
   where the cost sits ("two Python loops", "too many derived launches") is a hypothesis until that
@@ -779,14 +889,25 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
 ## 14. Evolving the Public API
 
 **`tests/test_api_conventions.py` is the mechanical half of this section**, and it fails the default
-`pytest` run. Twelve checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
+`pytest` run. Fifteen checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
 summary line naming a reference library (§10); a `*_mask` producer that does not return
 `wp.array[wp.bool]`; a module summary advertising Warp; a module without a `tests/` **and** a
 `benchmarks/` file named for it; a private name reached across a module boundary; one public name
 exported by two modules; a top-level `kernels/<name>.py` without its `triwarp/<name>.py` or the
 reverse (§4); and a private helper defined above its first caller (§11). The ninth scans `kernels/`
 **as well**: a comment or docstring blaming a Warp version older than the installed `warp-lang`.
-The last three are newer and each exists because the same defect was found twice:
+Two enforce an earlier section's convention on kernel code: §3's `out_` prefix and end-of-signature
+position for a written argument (its two exemption classes carried as `_KERNEL_OUTPUT_ALLOWLIST`),
+and §2's subscript-style array annotation — the latter scans the whole package, because only in an
+*annotation* position is `wp.array(dtype=T)` the stale spelling rather than a legal allocation.
+The last four are newer and each exists because the same defect was found twice:
+
+- **A `wp.launch` / `wp.launch_tiled` with no `device=`.** Check 15, and it is a memory-safety guard
+  rather than a style one — see §8 for the measured failure. It is also the *load-bearing* half of
+  that guard: `tests/conftest.py`'s `STRICT` mode only fires when an argument is genuinely off the
+  launch device, so on a **CUDA** run the omitted argument resolves to the arrays' own device and
+  nothing is rejected, which is precisely how the original defect passed CI and hurt only CPU users.
+  Only the scan sees it there.
 
 - **An allocation with no `device=`.** `wp.zeros` / `empty` / `ones` / `full` / `array` at Python
   scope land on Warp's *current* device, and the suite cannot see the difference because a test

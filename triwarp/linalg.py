@@ -23,12 +23,15 @@ iteration counts with one set of vector kernels per iteration. The sparse matrix
 replicated in memory — the ``matvec`` issues ``k`` ``bsr_mv`` calls against the single operator.
 
 **Determinism.** Build each operator natively at its final dtype in a *single*
-``warp.sparse.bsr_from_triplets`` and never recast or rebuild it: ``bsr_mm`` is only deterministic
-on single-build operators (see ``downloads/issue_report.md``). Nothing here recasts an operator. The
-one exception is deliberate and safe: ``Q_uu`` is assembled as a CSR *directly*, without any triplet
-build (see [`assemble_interior_system`][triwarp.linalg.assemble_interior_system]), and it only ever
-reaches ``bsr_mv`` and ``bsr_get_diag`` — the caller's ``Q``, which *is* multiplied, keeps the
-single-build rule.
+``warp.sparse.bsr_from_triplets`` and never recast or rebuild it. This rule was written when a
+rebuild appeared to make ``bsr_mm`` nondeterministic; the real cause was sizing the rebuild's
+triplet buffers by ``BsrMatrix.nnz``, which is the *capacity* the matrix was built with rather than
+its entry count (``nnz_sync()``), so the buffers' tail reached ``bsr_from_triplets`` uninitialized.
+A rebuild sliced to ``nnz_sync()`` is safe, and ``bsr_mm`` itself was never at fault. The rule
+survives on cost instead: a second build re-sorts and duplicate-accumulates an order the CSR has,
+20.7 ms in [`assemble_interior_system`][triwarp.linalg.assemble_interior_system]'s ``saddle`` case.
+Nothing here recasts an operator, and ``Q_uu`` is assembled as a CSR *directly*, without any triplet
+build, so it carries an exact ``nnz``.
 
 **Why Jacobi.** Every solve here preconditions with ``warp.optim.linear.preconditioner(A, "diag")``,
 and the alternatives were measured and rejected rather than overlooked. On a cotangent Laplacian a

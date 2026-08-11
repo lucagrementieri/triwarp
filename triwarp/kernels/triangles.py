@@ -107,6 +107,13 @@ def angles(
     w = wp.normalize(edges[2])
 
     # wp.acos auto-clamps its argument to [-1, 1], so no explicit wp.clamp is needed.
+    #
+    # The other corner-angle formulation in the tree is ``energies.internal_angles_and_sums``, which
+    # is the law of cosines on squared edge lengths in float64 and additionally accumulates the
+    # per-vertex angle sums its curvature correction needs. It is not this kernel at a wider dtype:
+    # there each angle is derived independently (so the three sum to pi only up to round-off) and a
+    # sliver reads 0 or pi through the acos clamp, where this one takes the third angle as
+    # ``PI - a0 - a1`` and zeroes all three of a degenerate face.
     out_angles[f, 0] = wp.acos(wp.dot(u, v))
     out_angles[f, 1] = wp.acos(wp.dot(-u, w))
     out_angles[f, 2] = PI - out_angles[f, 0] - out_angles[f, 1]
@@ -434,3 +441,21 @@ def face_gradients(
 ) -> None:
     f = int(wp.tid())
     out_gradients[f] = face_gradient(vertices, faces, normals, areas, values, wp.int32(f))
+
+
+# Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
+# CLAUDE.md section 4. One generic kernel, but measured at **5** module loads over the suite, and
+# this module backs 15 kernel modules and 2 wrappers, so each rebuild is widely felt.
+#
+# The vertex precision and the volume precision move together: ``face_signed_volumes`` reads a
+# ``wp.vec3`` cloud into ``wp.float32`` volumes or a ``wp.vec3d`` one into ``wp.float64``, never a
+# mixture, because the wrapper derives the output dtype from the vertex dtype.
+def _register_overloads() -> None:
+    """Instantiate every concrete overload of this module's generic kernels."""
+    for vector, scalar in ((wp.vec3, wp.float32), (wp.vec3d, wp.float64)):
+        wp.overload(
+            face_signed_volumes, [wp.array[vector], wp.array[wp.int32], vector, wp.array[scalar]]
+        )
+
+
+_register_overloads()

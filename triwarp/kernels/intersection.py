@@ -818,3 +818,29 @@ def marching_triangles_segments(
         out_segments[f, 1] = point_next
         out_edges[f, 0] = edge_prev
         out_edges[f, 1] = edge_next
+
+
+# Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
+# CLAUDE.md section 4. Measured at 2 overloads across **4** module loads, on a 15-kernel module.
+#
+# Only the scalar field being contoured is generic: ``marching_triangles`` accepts a ``wp.float32``
+# or ``wp.float64`` per-vertex field (the heat solvers produce the latter), while the geometry it
+# writes stays ``wp.vec3``.
+def _register_overloads() -> None:
+    """Instantiate every concrete overload of this module's generic kernels."""
+    for dtype in (wp.float32, wp.float64):
+        wp.overload(
+            marching_triangles_segments,
+            [
+                wp.array[wp.vec3],
+                wp.array[wp.int32],
+                wp.array[dtype],
+                wp.array[wp.int32],
+                wp.array[wp.bool],
+                wp.array2d[wp.vec3],
+                wp.array2d[wp.int32],
+            ],
+        )
+
+
+_register_overloads()

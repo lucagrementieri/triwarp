@@ -200,10 +200,11 @@ def cotmatrix_triplets(
     # are independent generic float types: the half-cotangent weights (typically float32, the
     # vertex precision) are cast to the requested matrix dtype, so a single ``bsr_from_triplets``
     # builds a float32 or float64 matrix natively. Building float64 values here (rather than
-    # recasting a float32 matrix) dodges a Warp ``bsr_mm`` bug (still present in Warp 1.16.0)
-    # triggered by a second ``bsr_from_triplets`` rebuild — see issue_report.md. Re-probed with that
-    # report's own script: 12 distinct ``nnz`` over 24 identical calls and three distinct norms,
-    # including its original 1273.69 garbage reading.
+    # recasting a float32 matrix) avoids a second ``bsr_from_triplets`` rebuild, which re-sorts an
+    # already-sorted CSR. This was previously described as dodging a Warp ``bsr_mm`` bug; that was
+    # wrong. The nondeterminism came from sizing a rebuild's triplet buffers by ``BsrMatrix.nnz``
+    # (the capacity the matrix was built with) instead of ``nnz_sync()`` (its entry count), leaving
+    # an uninitialized tail for ``bsr_from_triplets`` to read back as triplets.
     f = int(wp.tid())
     for e in range(3):
         c0 = (e + 1) % 3
@@ -295,3 +296,64 @@ def triangle_inequality_slack(
 @wp.func
 def add_constant(length: wp.float32, delta: wp.float32) -> wp.float32:
     return length + delta
+
+
+# Concrete overloads, registered at import -- see the long-form rationale in
+# ``triwarp/kernels/reduce.py`` and the rule in CLAUDE.md section 4. In short: these kernels are
+# generic, Warp instantiates an overload on the first launch at each new dtype, and a module's hash
+# covers the instantiated set -- so a lazily-created overload rebuilds the whole module. Measured
+# over the suite: 14 overloads created across **16** distinct module loads.
+#
+# ``triwarp.laplacian`` exposes the precision as a public ``dtype`` keyword documented as "may be
+# float32 or float64", so both are reachable for every kernel here.
+_MATRIX_DTYPES = (wp.float32, wp.float64)
+
+
+def _register_overloads() -> None:
+    """Instantiate every concrete overload of this module's generic kernels."""
+    for dtype in _MATRIX_DTYPES:
+        wp.overload(cotmatrix_entries, [wp.array[wp.vec3], wp.array[wp.int32], wp.array2d[dtype]])
+        wp.overload(cotmatrix_entries_intrinsic, [wp.array2d[wp.float32], wp.array2d[dtype]])
+        wp.overload(row_normalize, [wp.array[wp.int32], wp.array[dtype]])
+        for kernel in (laplacian_triplets_symmetric, laplacian_triplets_directed):
+            wp.overload(
+                kernel,
+                [
+                    wp.array2d[wp.int32],
+                    wp.array[wp.vec3],
+                    wp.int32,
+                    wp.array[wp.int32],
+                    wp.array[wp.int32],
+                    wp.array[dtype],
+                ],
+            )
+        # ``cot_entries`` and the matrix precision are *independent* templates: cotmatrix's
+        # docstring says the entries "may be float32 or float64 regardless of dtype: the assembly
+        # kernel casts them to the matrix precision", so this is a genuine 2x2, not a diagonal.
+        for entry_dtype in _MATRIX_DTYPES:
+            wp.overload(
+                cotmatrix_triplets,
+                [
+                    wp.array[wp.int32],
+                    wp.array2d[entry_dtype],
+                    wp.array[wp.int32],
+                    wp.array[wp.int32],
+                    wp.array[dtype],
+                ],
+            )
+        # The connection Laplacian's values are always ``wp.mat22d``; only its cotangent entries
+        # follow the caller, who may pass their own in place of the float64 default.
+        wp.overload(
+            connection_laplacian_triplets,
+            [
+                wp.array[wp.int32],
+                wp.array2d[dtype],
+                wp.array[wp.float32],
+                wp.array[wp.int32],
+                wp.array[wp.int32],
+                wp.array[wp.mat22d],
+            ],
+        )
+
+
+_register_overloads()

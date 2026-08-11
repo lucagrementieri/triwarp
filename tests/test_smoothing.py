@@ -360,6 +360,75 @@ def test_filter_laplacian_pluggable_operator(half_torus: tuple[tm.Trimesh, wp.Me
     assert np.allclose(smoothed_wp.numpy(), mesh_ref.vertices, rtol=1e-5, atol=1e-5)
 
 
+def test_filter_laplacian_implicit_duplicate_built_operator(
+    half_torus: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    A duplicate-built operator gives the same result as its compact form.
+
+    ``cotmatrix`` emits 12 triplets per face, so ``operator.nnz`` -- the triplet *capacity*
+    ``bsr_from_triplets`` was handed -- overshoots ``nnz_sync()`` by ~3.4x. The implicit system used
+    to size its ``wp.empty`` triplet buffers by ``nnz``, leaving that gap uninitialized for
+    ``bsr_from_triplets`` to read back as triplets: out-of-range garbage indices are dropped
+    silently, but any landing in ``[0, n)`` accumulate a junk value into a real entry. Measured
+    ``‖values‖ = 1.1e13`` against a correct 84.3, and every vertex ``NaN`` end to end. Rebuilt
+    sliced to ``nnz_sync()`` the same operator is compact, so the two must agree.
+    """
+    _, mesh_wp = half_torus
+    # Two independent builds of the same operator. ``nnz_sync()`` repairs the stale ``nnz`` cache
+    # *in place*, so measuring the capacity on one build would hand the filter a repaired matrix and
+    # the test would pass whatever the implementation does -- the operator under test has to be a
+    # build nothing has synced.
+    unsynced = tw.laplacian.cotmatrix(mesh_wp.points, mesh_wp.indices, dtype=wp.float32)
+    reference = tw.laplacian.cotmatrix(mesh_wp.points, mesh_wp.indices, dtype=wp.float32)
+    capacity = int(reference.nnz)
+    nnz = reference.nnz_sync()
+    # Guard the guard: without a real capacity gap this test compares a matrix with itself.
+    assert capacity > nnz
+    compact = wps.bsr_from_triplets(
+        int(reference.nrow),
+        int(reference.ncol),
+        reference.uncompress_rows()[:nnz],
+        reference.columns[:nnz],
+        reference.values[:nnz],
+        prune_numerical_zeros=False,
+    )
+
+    # Random garbage is almost always out of range, and ``bsr_from_triplets`` drops an out-of-range
+    # index silently -- which is exactly why the defect stayed invisible. Leaving plausible in-range
+    # indices in the memory pool makes the unwritten tail reachable, so the assertions below have
+    # something to catch.
+    n_vertices = int(mesh_wp.points.shape[0])
+    for _ in range(6):
+        _junk = (
+            wp.full(capacity + n_vertices, 7, dtype=wp.int32, device=mesh_wp.points.device),
+            wp.full(capacity + n_vertices, 11, dtype=wp.int32, device=mesh_wp.points.device),
+            wp.full(capacity + n_vertices, 1.0e9, dtype=wp.float64, device=mesh_wp.points.device),
+        )
+        del _junk
+    wp.synchronize()
+
+    smoothed_wp = tw.smoothing.filter_laplacian(
+        mesh_wp.points,
+        mesh_wp.indices,
+        iterations=2,
+        implicit_time_integration=True,
+        volume_constraint=False,
+        laplacian_operator=unsynced,
+    )
+    compact_wp = tw.smoothing.filter_laplacian(
+        mesh_wp.points,
+        mesh_wp.indices,
+        iterations=2,
+        implicit_time_integration=True,
+        volume_constraint=False,
+        laplacian_operator=compact,
+    )
+
+    assert np.all(np.isfinite(smoothed_wp.numpy()))
+    assert np.allclose(smoothed_wp.numpy(), compact_wp.numpy(), rtol=1e-6, atol=1e-6)
+
+
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 def test_filter_neighborhood_average(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)

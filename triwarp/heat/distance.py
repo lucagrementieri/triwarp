@@ -132,7 +132,7 @@ def heat_operators(
     else:
         cot_entries = cotmatrix_entries(vertices, faces)
     # ``cotmatrix`` casts the shared float32 half-cotangent weights to float64 and assembles the
-    # operator natively in a single build (see issue_report.md).
+    # operator natively in a single build, avoiding a recast rebuild (see cotmatrix's kernel note).
     laplacian = cotmatrix(vertices, faces, cot_entries=cot_entries, dtype=wp.float64)
 
     # Face normals / areas (float32) for the gradient; the lumped mass is built natively in float64

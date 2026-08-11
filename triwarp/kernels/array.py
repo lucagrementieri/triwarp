@@ -208,13 +208,6 @@ def isin_lookup_sorted(
 
 
 @wp.func
-def vector_angle_vec(a: wp.vec3, b: wp.vec3) -> wp.float32:
-    # wp.acos auto-clamps to [-1, 1] and returns a value in [0, pi], so neither an explicit
-    # wp.clamp on the dot product nor a wp.abs on the result is needed.
-    return wp.acos(wp.dot(a, b))
-
-
-@wp.func
 def mask_not(a: wp.bool) -> wp.bool:
     return not a
 
@@ -336,3 +329,33 @@ def map_sorted_inverse(
 ) -> None:
     i = int(wp.tid())
     out_inverse[i] = binary_search_index(sorted_unique, data[i]) - wp.int32(1)
+
+
+# Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
+# CLAUDE.md section 4. Measured over the suite: 12 overloads created across **13** module loads,
+# and this module is imported by 25 kernel modules and 15 wrappers, so its rebuilds are felt widely.
+#
+# The ``init_*`` kernels fill an index buffer and every caller in the package allocates that buffer
+# ``wp.int32``; ``wp.Int`` in their annotation is the template, not a menu. The two search kernels
+# take the caller's *key* dtype, whose surface is the one ``sortable_dtype`` maps onto.
+_INDEX_DTYPES = (wp.int32,)
+_KEY_DTYPES = (wp.int32, wp.int64, wp.uint32, wp.uint64)
+
+
+def _register_overloads() -> None:
+    """Instantiate every concrete overload of this module's generic kernels."""
+    for dtype in _INDEX_DTYPES:
+        wp.overload(init_range, [wp.array[dtype]])
+        wp.overload(init_range_step, [dtype, wp.array[dtype]])
+        wp.overload(init_repeat_index, [dtype, wp.array[dtype]])
+        wp.overload(init_sort_pair_indices, [dtype, dtype, wp.array[dtype]])
+    for dtype in _KEY_DTYPES:
+        wp.overload(isin_lookup_sorted, [wp.array[dtype], wp.array[dtype], wp.array[wp.bool]])
+        wp.overload(map_sorted_inverse, [wp.array[dtype], wp.array[dtype], wp.array[wp.int32]])
+    # ``sort_rows_insertion`` sorts a rank-2 table in place; ``unique_rows`` and the hashing paths
+    # that reach it build that table in the caller's dtype.
+    for dtype in (wp.int32, wp.float32, wp.float64):
+        wp.overload(sort_rows_insertion, [wp.array2d[dtype]])
+
+
+_register_overloads()

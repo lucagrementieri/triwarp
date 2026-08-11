@@ -29,6 +29,13 @@ def centered_covariance(
 ) -> None:
     # Scatter matrix C = sum_k outer(x_k - center, x_k - center). With a zero center this is
     # the uncentred Gram matrix G = sum_k outer(x_k, x_k).
+    #
+    # Stays in ``points`` rather than moving to ``reduce`` with the rest of the chunked-accumulate
+    # family: the reusable half -- the tile skeleton and ``outer_sum_chunk`` -- is already in
+    # ``reduce`` and imported from there, and what is left is a point-cloud statistic whose only
+    # callers are ``points``' own ``gram_matrix`` / ``fit_line`` / ``fit_plane``. ``triwarp.reduce``
+    # is axis-parametrized array reductions in NumPy's vocabulary; a mat33 of second moments is not
+    # one of those (§11, the machinery half outranks the subject half).
     i, t = wp.tid()
     n = points.shape[0]
     offset = i * TILE_1D

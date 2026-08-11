@@ -31,6 +31,7 @@ import triwarp.typing as twt
 from triwarp.constants import TILE_1D, TOLERANCE_ZERO
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import points as kernel_points
+from triwarp.kernels import predicates as kernel_predicates
 from triwarp.kernels import reduce as kernel_reduce
 
 
@@ -674,17 +675,20 @@ def _neighbor_distance_moments(
 
 def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3]) -> wp.array[wp.float32]:
     """
-    Unsigned angle in radians between pairs of unit vectors.
+    Unsigned angle in radians between pairs of vectors.
 
-    For each index ``i``, computes ``abs(arccos(clip(dot(a[i], b[i]), -1, 1)))``.
-    Matches [`trimesh.geometry.vector_angle`][] on stacked pairs.
+    For each index ``i``, computes ``atan2(norm(cross(a[i], b[i])), dot(a[i], b[i]))``, which lies
+    in ``[0, pi]``. Matches [`trimesh.geometry.vector_angle`][] on stacked pairs, and agrees with
+    its ``arccos(dot)`` to round-off on unit input while staying accurate for nearly parallel or
+    nearly antiparallel pairs, where ``arccos`` loses most of its digits. Being scale-free, it also
+    accepts unnormalized vectors, and pairs where either vector is zero read ``0.0``.
 
     Parameters
     ----------
     a
-        Length-``n`` unit vectors on the target device.
+        Length-``n`` vectors on the target device.
     b
-        Length-``n`` unit vectors on the same device as ``a``.
+        Length-``n`` vectors on the same device as ``a``.
 
     Returns
     -------
@@ -709,7 +713,7 @@ def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3]) -> wp.array[wp.floa
         return wp.empty(0, dtype=wp.float32, device=device)
 
     out_angles = wp.empty(n, dtype=wp.float32, device=device)
-    wp.map(kernel_array.vector_angle_vec, a, b, out=out_angles)
+    wp.map(kernel_predicates.vector_angle, a, b, out=out_angles)
     return out_angles
 
 

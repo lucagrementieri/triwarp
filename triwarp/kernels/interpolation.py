@@ -41,3 +41,29 @@ def transfer_onto_vertices(
     bary = point_barycentric_cramer(v0, v1, v2, closest[i])
     a0, a1, a2 = face_vertices(source_values, source_faces, f)
     out_values[i] = a0 * bary[0] + a1 * bary[1] + a2 * bary[2]
+
+
+# Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
+# CLAUDE.md section 4. Measured at 2 overloads across **3** module loads.
+#
+# The dtype set is the one ``transfer_onto_vertices``'s own docstring promises -- "any Warp dtype
+# closed under scaling and addition works: ``wp.float32`` for a scalar, ``wp.vec3`` for a normal or
+# a colour" -- so registering exactly those two keeps the code and the documentation agreeing.
+def _register_overloads() -> None:
+    """Instantiate every concrete overload of this module's generic kernels."""
+    for dtype in (wp.float32, wp.vec3):
+        wp.overload(
+            transfer_onto_vertices,
+            [
+                wp.array[wp.vec3],
+                wp.array[wp.int32],
+                wp.array[dtype],
+                wp.array[wp.vec3],
+                wp.array[wp.int32],
+                wp.array[dtype],
+                wp.array[wp.float32],
+            ],
+        )
+
+
+_register_overloads()

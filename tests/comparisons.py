@@ -13,6 +13,7 @@ The classes of comparison, and the bar each has to clear (see CLAUDE.md section 
   the transform is exact, so loosening the tolerance to accommodate it means the transform was
   wrong.
 - **C** a derived scalar or set distance, because no correspondence between the two answers exists.
+  [`symmetric_surface_distance`][tests.comparisons.symmetric_surface_distance],
   [`symmetric_chamfer`][tests.comparisons.symmetric_chamfer],
   [`hausdorff_two_sided`][tests.comparisons.hausdorff_two_sided] and
   [`fraction_within`][tests.comparisons.fraction_within] are the class-C machinery. A class-C assert
@@ -184,6 +185,13 @@ def symmetric_chamfer(mesh_a: tm.Trimesh, mesh_b: tm.Trimesh, n_samples: int = 4
 
     Blind to anything that preserves the surface: a winding flip, a vertex permutation, or a
     duplicated face all score zero. Pair it with a structural assert when those matter.
+
+    See Also
+    --------
+    [`symmetric_surface_distance`][tests.comparisons.symmetric_surface_distance]
+        The same claim measured against the other mesh's *surface* rather than against a second
+        point sample, which removes the noise floor entirely. Prefer it for a new comparison;
+        this one stays for the tests whose thresholds are calibrated against its floor.
     """
     rng = np.random.default_rng(0)
     sample_a, _ = tm.sample.sample_surface(mesh_a, n_samples, seed=int(rng.integers(1 << 30)))
@@ -191,6 +199,65 @@ def symmetric_chamfer(mesh_a: tm.Trimesh, mesh_b: tm.Trimesh, n_samples: int = 4
     a_to_b = cKDTree(sample_b).query(sample_a)[0].mean()
     b_to_a = cKDTree(sample_a).query(sample_b)[0].mean()
     return float(0.5 * (a_to_b + b_to_a))
+
+
+def symmetric_surface_distance(
+    mesh_a: tm.Trimesh, mesh_b: tm.Trimesh, n_samples: int = 2000
+) -> tuple[float, float]:
+    """
+    Mean and worst-case symmetric distance from each mesh's surface to the other's, no noise floor.
+
+    Same class-C claim as [`symmetric_chamfer`][tests.comparisons.symmetric_chamfer] -- "these two
+    describe the same surface", for two answers with no vertex correspondence -- but each sample is
+    measured against the other mesh's **surface** (``trimesh.proximity.closest_point``) instead of
+    against a second random sample of it. That one change removes the floor: the chamfer's two point
+    sets are drawn independently, so even for identical meshes the nearest *sample* sits a mean
+    spacing away, whereas the nearest *surface* is at distance zero.
+
+    !!! note "Why the chamfer's floor is what it is"
+        For two independent uniform samples at density ``n / area`` the mean nearest-neighbour
+        distance is ``0.5 * sqrt(area / n)`` -- on a unit sphere at ``n_samples=4000`` that predicts
+        0.0280 and ``symmetric_chamfer(m, m)`` measures 0.0279. The chamfer was reporting its own
+        sample spacing. Measured on the same pair of Poisson reconstructions: this function scores
+        **0.00000** for a mesh against itself and **0.0043** for the real disagreement, where the
+        chamfer scored 0.0279 and 0.0281 -- a signal of 0.0002 riding on a floor of 0.0279.
+
+    Returns both statistics from one sampling pass because they fail differently and each is blind
+    to the other's bug class: a **local** defect barely moves the mean (a dent over 677 of 32 552
+    vertices measured 0.0023 mean, *below* the 0.0043 two implementations honestly differ by) while
+    tripling the max to 0.0504; a **global** scale error moves both. Assert whichever the test's
+    claim is about, and say which in the docstring.
+
+    Costs ~100 ms per call at the default ``n_samples`` -- an exact surface query, not a tree
+    lookup -- so it is affordable per test but not inside a loop.
+
+    Parameters
+    ----------
+    mesh_a, mesh_b
+        Meshes to compare. Neither needs to be watertight: the query is unsigned.
+    n_samples
+        Area-uniform samples drawn per mesh. Fewer are needed than for the chamfer, there being no
+        pairing noise to average out.
+
+    Returns
+    -------
+    tuple[float, float]
+        ``(mean, max)`` of the two-sided sample-to-surface distance.
+
+    See Also
+    --------
+    [`symmetric_chamfer`][tests.comparisons.symmetric_chamfer]
+        The sample-to-sample form, and its noise floor.
+    [`hausdorff_two_sided`][tests.comparisons.hausdorff_two_sided]
+        Worst-case distance between two bare point sets, when there is no surface to query.
+    """
+    rng = np.random.default_rng(0)
+    sample_a, _ = tm.sample.sample_surface(mesh_a, n_samples, seed=int(rng.integers(1 << 30)))
+    sample_b, _ = tm.sample.sample_surface(mesh_b, n_samples, seed=int(rng.integers(1 << 30)))
+    a_to_b = tm.proximity.closest_point(mesh_b, sample_a)[1]
+    b_to_a = tm.proximity.closest_point(mesh_a, sample_b)[1]
+    mean = 0.5 * (float(a_to_b.mean()) + float(b_to_a.mean()))
+    return mean, float(max(a_to_b.max(), b_to_a.max()))
 
 
 def hausdorff_two_sided(points_a: np.ndarray, points_b: np.ndarray) -> float:
