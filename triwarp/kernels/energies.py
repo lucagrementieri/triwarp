@@ -581,3 +581,63 @@ def vector_area_triplets(
     out_rows[base + 3] = j + n_vertices
     out_cols[base + 3] = i
     out_vals[base + 3] = q
+
+
+# Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
+# CLAUDE.md section 4. Measured over the suite: 8 overloads created across **9** module loads.
+#
+# Every generic argument here is the assembled matrix's value precision, which ``triwarp.energies``
+# exposes as the same public ``dtype`` keyword ``triwarp.laplacian`` does. The float64 inputs the
+# curvature and Hessian kernels read (angles, kappa, inverse masses) are fixed at float64 by their
+# producers and are not part of the template.
+_MATRIX_DTYPES = (wp.float32, wp.float64)
+
+
+def _register_overloads() -> None:
+    """Instantiate every concrete overload of this module's generic kernels."""
+    i32 = wp.array[wp.int32]
+    for dtype in _MATRIX_DTYPES:
+        values = wp.array[dtype]
+        wp.overload(zero_at_indices, [i32, values])
+        wp.overload(crouzeix_raviart_mass_diag, [wp.array[wp.vec3], i32, i32, values])
+        wp.overload(crouzeix_raviart_cotmatrix_triplets, [i32, wp.array2d[dtype], i32, i32, values])
+        wp.overload(sandwich_row_counts, [i32, i32, values, i32])
+        wp.overload(
+            sandwich_row_triplets,
+            [i32, i32, values, i32, i32, values, values, i32, i32, i32, values],
+        )
+        wp.overload(
+            hessian_energy_triplets,
+            [
+                i32,
+                i32,
+                i32,
+                wp.array[wp.vec3d],
+                wp.array[wp.float64],
+                wp.array[wp.float64],
+                i32,
+                i32,
+                i32,
+                values,
+            ],
+        )
+        wp.overload(
+            curved_hessian_triplets,
+            [
+                wp.array[wp.vec3],
+                i32,
+                i32,
+                wp.array2d[wp.float64],
+                wp.array[wp.float64],
+                wp.array[wp.float64],
+                wp.array2d[wp.int32],
+                wp.array2d[wp.float64],
+                wp.array2d[wp.float64],
+                i32,
+                i32,
+                values,
+            ],
+        )
+
+
+_register_overloads()

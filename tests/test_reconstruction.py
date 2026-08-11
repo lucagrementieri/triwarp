@@ -20,7 +20,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from tests.comparisons import hausdorff_two_sided, symmetric_chamfer
+from tests.comparisons import hausdorff_two_sided, symmetric_chamfer, symmetric_surface_distance
 from tests.conversions import open3d_to_trimesh, points_to_open3d, points_to_pymeshlab
 from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
 
@@ -389,20 +389,6 @@ def _mesh_trimesh(vertices_wp, faces_wp) -> tm.Trimesh:
     )
 
 
-def _symmetric_chamfer(mesh_a: tm.Trimesh, mesh_b: tm.Trimesh, n_samples: int = 4000) -> float:
-    """Mean symmetric chamfer distance between two triangle meshes via surface sampling."""
-    from scipy.spatial import cKDTree
-
-    rng = np.random.default_rng(0)
-    sample_a, _ = tm.sample.sample_surface(mesh_a, n_samples, seed=int(rng.integers(1 << 30)))
-    sample_b, _ = tm.sample.sample_surface(mesh_b, n_samples, seed=int(rng.integers(1 << 30)))
-    tree_a = cKDTree(sample_a)
-    tree_b = cKDTree(sample_b)
-    a_to_b = tree_b.query(sample_a)[0].mean()
-    b_to_a = tree_a.query(sample_b)[0].mean()
-    return float(0.5 * (a_to_b + b_to_a))
-
-
 def _points_to_surface(points_np: np.ndarray, mesh: tm.Trimesh) -> float:
     """Mean distance from a point set to the nearest point on a mesh surface."""
     return float(np.abs(tm.proximity.signed_distance(mesh, points_np)).mean())
@@ -460,6 +446,26 @@ def test_poisson_torus_genus(device: str):
 
 @pytest.mark.parity("screened_poisson", "open3d")
 def test_poisson_matches_open3d_metric(device: str):
+    """
+    Class C: mean sample-to-surface distance, there being no vertex correspondence to compare.
+
+    The two solvers march different octrees and return different meshes -- 32 552 faces against
+    open3d's 7 976 on this cloud -- so no vertex, face or count agrees and only a surface metric
+    can state the claim. Excludes the bug class "the iso-surface is in the wrong place": a global
+    radius error, a sign flip on the indicator, a mislocated level set.
+
+    Measured agreement is **0.0043** and the threshold is 0.015, a **3.5x** margin. Mutation
+    probe, run against this assert: scaling triwarp's answer by 0.98 makes it read 0.0188 and the
+    assert fails, so a 2% radius error on a unit sphere is caught. A mesh against itself scores
+    exactly 0.0, which is the whole point of the metric -- see the warning below.
+
+    !!! warning "This assert used to be vacuous, and the reason generalises"
+        It was ``symmetric_chamfer(...) < 0.03``, which is sample-to-*sample* and therefore has a
+        noise floor of ``0.5 * sqrt(area / n_samples)`` = 0.028 on this fixture. The real
+        disagreement, 0.0043, was two hundredths below that floor: the pass margin was 1.08x and
+        a mesh compared with *itself* scored 0.0279. Any threshold within a few percent of a
+        sampling floor is testing the sampler.
+    """
     _skip_poisson_on_cpu(device)
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
@@ -468,9 +474,13 @@ def test_poisson_matches_open3d_metric(device: str):
         points_wp, normals_wp, depth=6, full_depth=4
     )
     mesh_tw = _mesh_trimesh(vertices_wp, faces_wp)
-    mesh_o3d = _open3d_poisson(points_np, normals_np, depth=6)
-    # Same iso-surface up to discretization: symmetric chamfer well under a grid cell.
-    assert _symmetric_chamfer(mesh_tw, mesh_o3d) < 0.03
+    # depth=5 on the reference side, not 6: on this 642-point cloud open3d returns the *same*
+    # 7 976 faces at both depths (measured) for 0.28 s instead of 0.85 s, so the extra octree
+    # level is cost without an answer. Only the reference drops -- triwarp stays at the depth=6
+    # its sibling tests above use, where it resolves 32 552 faces in 0.01 s either way.
+    mesh_o3d = _open3d_poisson(points_np, normals_np, depth=5)
+    mean_distance, _ = symmetric_surface_distance(mesh_tw, mesh_o3d)
+    assert mean_distance < 0.015
 
 
 def test_poisson_screening_improves_fit(device: str):
@@ -510,6 +520,16 @@ def test_poisson_finer_depth_reduces_error(device: str):
 
 @pytest.mark.parity("screened_poisson", "pymeshlab")
 def test_poisson_matches_pymeshlab_metric(device: str):
+    """
+    Class C: the [`test_poisson_matches_open3d_metric`][] comparison against the other reference.
+
+    Measured agreement is **0.0041** against the same 0.015 threshold, a **3.7x** margin, and the
+    same mutation probe reads 0.0189 here and fails; the noise-floor warning on that test applies
+    unchanged. Worth having
+    both: open3d and pymeshlab agree with each other to 0.0015, a quarter of either one's distance
+    to triwarp, so they are not independent enough for one to stand in for the other -- but that
+    also means a triwarp regression would have to move past *both* to stay unnoticed.
+    """
     _skip_poisson_on_cpu(device)
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
@@ -528,12 +548,17 @@ def test_poisson_matches_pymeshlab_metric(device: str):
             v_normals_matrix=np.ascontiguousarray(normals_np),
         )
     )
-    meshset_pml.generate_surface_reconstruction_screened_poisson(depth=6)
+    # depth=5, not 6, for the reason given on ``test_poisson_matches_open3d_metric``: MeshLab
+    # returns the same 7 976 faces at both depths on this cloud, in 0.24 s instead of 0.48 s.
+    # Do not go below 5 without re-measuring -- the axis is *not* monotonic in either time or
+    # resolution, and depth=4 drops to 2 024 faces.
+    meshset_pml.generate_surface_reconstruction_screened_poisson(depth=5)
     mesh_current = meshset_pml.current_mesh()
     mesh_pml = tm.Trimesh(
         vertices=mesh_current.vertex_matrix(), faces=mesh_current.face_matrix(), process=False
     )
-    assert _symmetric_chamfer(mesh_tw, mesh_pml) < 0.03
+    mean_distance, _ = symmetric_surface_distance(mesh_tw, mesh_pml)
+    assert mean_distance < 0.015
 
 
 def test_poisson_requires_normals_and_valid_params(device: str):
@@ -625,11 +650,13 @@ def test_poisson_adaptive_matches_dense(device: str):
     vertices_adaptive, faces_adaptive = tw.reconstruction.screened_poisson(
         points_wp, normals_wp, depth=6, full_depth=4, method="adaptive"
     )
-    # Same iso-surface on two different grids: symmetric chamfer well within a couple of voxels.
-    chamfer = _symmetric_chamfer(
+    # Same iso-surface on two different grids, so a surface metric rather than a correspondence.
+    # Its old ``symmetric_chamfer(...) < 0.05`` sat only 1.8x above that helper's 0.028 sampling
+    # floor, which is most of what it was measuring; sample-to-surface has no floor.
+    mean_distance, _ = symmetric_surface_distance(
         _mesh_trimesh(vertices_dense, faces_dense), _mesh_trimesh(vertices_adaptive, faces_adaptive)
     )
-    assert chamfer < 0.05
+    assert mean_distance < 0.02
 
 
 def test_poisson_adaptive_screening_improves_fit(device: str):

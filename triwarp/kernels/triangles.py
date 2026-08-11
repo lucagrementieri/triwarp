@@ -434,3 +434,21 @@ def face_gradients(
 ) -> None:
     f = int(wp.tid())
     out_gradients[f] = face_gradient(vertices, faces, normals, areas, values, wp.int32(f))
+
+
+# Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
+# CLAUDE.md section 4. One generic kernel, but measured at **5** module loads over the suite, and
+# this module backs 15 kernel modules and 2 wrappers, so each rebuild is widely felt.
+#
+# The vertex precision and the volume precision move together: ``face_signed_volumes`` reads a
+# ``wp.vec3`` cloud into ``wp.float32`` volumes or a ``wp.vec3d`` one into ``wp.float64``, never a
+# mixture, because the wrapper derives the output dtype from the vertex dtype.
+def _register_overloads() -> None:
+    """Instantiate every concrete overload of this module's generic kernels."""
+    for vector, scalar in ((wp.vec3, wp.float32), (wp.vec3d, wp.float64)):
+        wp.overload(
+            face_signed_volumes, [wp.array[vector], wp.array[wp.int32], vector, wp.array[scalar]]
+        )
+
+
+_register_overloads()

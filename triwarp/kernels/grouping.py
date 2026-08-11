@@ -269,3 +269,34 @@ def sort_face_indices(faces: wp.array2d[wp.int32], out_sorted: wp.array2d[wp.int
     out_sorted[tid, 0] = wp.int32(s0)
     out_sorted[tid, 1] = wp.int32(s1)
     out_sorted[tid, 2] = wp.int32(s2)
+
+
+# Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
+# CLAUDE.md section 4. Measured over the suite: 7 overloads created across **9** module loads.
+#
+# These three take the caller's *key* dtype. ``hash_indices_rows`` packs rows into ``wp.uint64``
+# hashes and ``unique``/``group_rows`` pass the caller's own integer buffer through, so the surface
+# is the same one ``triwarp.array``'s search kernels see.
+_KEY_DTYPES = (wp.int32, wp.int64, wp.uint32, wp.uint64)
+
+
+def _register_overloads() -> None:
+    """Instantiate every concrete overload of this module's generic kernels."""
+    for dtype in _KEY_DTYPES:
+        wp.overload(hash_insert, [wp.array[dtype], wp.array[dtype], wp.array[wp.int32], wp.int32])
+        wp.overload(mark_group_starts, [wp.array[dtype], wp.int32, wp.int32, wp.array[wp.bool]])
+        # ``slot_key`` and ``out_keys`` carry the key dtype; every count/offset buffer is int32.
+        wp.overload(
+            compact_from_table,
+            [
+                wp.array[dtype],
+                wp.array[wp.int32],
+                wp.array[wp.int32],
+                wp.array[wp.int32],
+                wp.array[dtype],
+                wp.array[wp.int32],
+            ],
+        )
+
+
+_register_overloads()

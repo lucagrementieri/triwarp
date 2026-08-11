@@ -610,3 +610,139 @@ def minmax_vec3_chunked(points: wp.array[wp.vec3], out_corners: wp.array[wp.floa
     for c in range(3):
         wp.atomic_min(out_corners, c, lower[c])
         wp.atomic_min(out_corners, 3 + c, -upper[c])
+
+
+# ---------------------------------------------------------------------------
+# Concrete overloads, registered at import.
+#
+# Every kernel above annotated ``wp.Scalar`` is *generic*, and Warp instantiates
+# an overload lazily -- on the first launch at each new dtype. A module's hash
+# covers the set of instantiated overloads, so that first launch changes the hash
+# and recompiles **every** kernel in this file. Measured on an RTX 5090, Warp
+# 1.16: 14.2 s per fork, 10.4 s of it nvcc, and reducing ``int32`` axis=0, then
+# ``int32`` axis=1, then ``float32`` axis=0 paid it three times over -- 40+
+# kernels rebuilt to gain one. Worse, the chain is *order-dependent*: a caller
+# reaching the dtypes in a different order walks links that were never compiled,
+# so the cost came back on every change of test selection (``tests/test_reduce.py``
+# alone: 1 561 s on a fresh selection against 1.30 s repeating it).
+#
+# Registering every (kernel, dtype) pair the wrapper's dispatch can reach gives
+# the module one hash for its whole lifetime: one compile ever, then one cached
+# load per process. Registration is not compilation -- ``wp.overload`` builds the
+# overload's ``Adjoint`` and nothing else -- so this costs milliseconds of import
+# and nothing at all on a process that never reduces anything. Measured over the
+# whole suite: 66 distinct ``(hash, block_dim)`` loads of this module before,
+# **3** after (the two block_dim variants plus CPU's), and ``pytest`` end to end
+# 1 033 s -> 190 s with ``tests/test_reduce.py`` itself 535 s -> 2.0 s.
+#
+# The trade is honest about one thing: the *single* compile is now bigger, since
+# the module holds ~110 concrete kernels rather than the ~40 a lazy fork built.
+# It measured 80 s of nvcc per block_dim variant, paid once and then cached
+# (a warm cached load is 59-75 ms). That is the cost of editing this file, not of
+# using it -- and against 66 forks of 14.2 s it is not close. If it ever does
+# become the bottleneck, the escape is ``plans/fast-test.md`` section 3.2: give
+# each generated kernel its own module with ``@wp.kernel(module="unique")``, the
+# way ``warp.sparse`` does, so a rebuild touches one kernel instead of all of
+# them.
+#
+# Two rules for keeping it that way:
+#
+# - **A new generic kernel in this file must be added to a group below, and a new
+#   dtype to the right tuple.** ``test_generic_kernels_register_their_overloads``
+#   catches the first; nothing catches the second, because a missing dtype does not
+#   fail, it just re-forks the chain on its first launch. The symptom is a test or
+#   a script that suddenly takes tens of seconds -- read it as a rebuild and come
+#   back here (CLAUDE.md section 13).
+# - **The dtype set is the one ``triwarp.reduce`` dispatches over**, not every
+#   dtype ``wp.Scalar`` admits (CLAUDE.md section 14, no speculative generality):
+#   an unused overload is compile time paid on every rebuild. The boolean
+#   reductions are ``wp.int32`` only because ``_reduce_bool`` converts the mask
+#   before launching, and ``wp.bool`` is not a ``wp.Scalar`` in any case.
+#
+# ``block_dim`` forks the hash independently of the dtypes and is deliberately
+# left forked. It is not the same pathology: the values in use are fixed by *this
+# package's* launch code -- ``TILE_1D`` for the ``wp.launch_tiled`` reductions and
+# Warp's 256 default for the plain ones, plus 1 on CPU, where Warp pins it -- so
+# they are a bounded set of two or three variants, not a chain whose length grows
+# with what a caller happens to reduce first. Collapsing them by passing
+# ``block_dim=TILE_1D`` at the plain-launch sites was measured and declined: it
+# costs 0.60x on ``max(axis=1)`` over a ``(4M, 3)`` table and 0.67x on
+# ``max(axis=0)`` over ``(3, 4M)``, buying only ``minmax_vec3_chunked`` at 100k
+# (1.63x, 14 us) and nothing at all by 14M (0.97x) -- an RTX 5090, min of 20
+# interleaved reps.
+# ---------------------------------------------------------------------------
+
+# A **global** reduction takes whatever scalar dtype the caller's buffer carries, and the package
+# itself hands it two families: geometry and solver values (``wp.float32``, ``wp.float64`` in the
+# heat and smoothing solvers) and *keys* --
+# [`isin`][triwarp.array.isin] and [`hash_indices_rows`][triwarp.grouping.hash_indices_rows] bound
+# an index range with ``reduce.minmax`` over the caller's key dtype, whose public surface is
+# ``wp.int32`` / ``wp.int64`` / ``wp.uint32`` / ``wp.uint64`` (``isin`` widens anything narrower
+# with ``sortable_dtype`` before reducing, so sub-32-bit dtypes never reach a kernel here).
+_GLOBAL_DTYPES = (wp.int32, wp.int64, wp.uint32, wp.uint64, wp.float32, wp.float64)
+
+# A **per-axis** reduction is only ever reached with an index or a geometry dtype: nothing in the
+# package reduces a table of 64-bit keys along an axis, and the six-dtype cross product over these
+# 24 kernels would be 72 more kernels to compile on every rebuild for no call site (CLAUDE.md
+# section 14). A caller who does reduce a ``wp.uint64`` table along an axis pays one fork, once.
+_AXIS_DTYPES = (wp.int32, wp.float32, wp.float64)
+
+# Grouped by signature shape, which is what ``wp.overload`` matches on; the operator each kernel
+# folds with does not enter into it.
+_GLOBAL_1D = (min1d_tiled, max1d_tiled, sum1d_tiled, minmax1d_tiled)
+_GLOBAL_2D = (min2d_tiled, max2d_tiled, sum2d_tiled, minmax2d_tiled)
+_AXIS_SINGLE_OUT = (
+    min_2d_rows_tiled,
+    min_2d_cols_tiled,
+    min_2d_rows_serial,
+    min_2d_cols_serial,
+    max_2d_rows_tiled,
+    max_2d_cols_tiled,
+    max_2d_rows_serial,
+    max_2d_cols_serial,
+    sum_2d_rows_tiled,
+    sum_2d_cols_tiled,
+    sum_2d_rows_serial,
+    sum_2d_cols_serial,
+)
+_AXIS_DUAL_OUT = (
+    minmax_2d_rows_tiled,
+    minmax_2d_cols_tiled,
+    minmax_2d_rows_serial,
+    minmax_2d_cols_serial,
+)
+# The boolean reductions reach these kernels only through ``_reduce_bool``, which casts the mask to
+# a 0/1 ``wp.int32`` first, so one dtype covers them -- and ``wp.bool`` is not a ``wp.Scalar``
+# anyway.
+_MASK_1D = (any_1d_tiled, all_1d_tiled)
+_MASK_2D = (
+    any_2d_rows_tiled,
+    any_2d_cols_tiled,
+    any_2d_rows_serial,
+    any_2d_cols_serial,
+    all_2d_rows_tiled,
+    all_2d_cols_tiled,
+    all_2d_rows_serial,
+    all_2d_cols_serial,
+)
+
+
+def _register_overloads() -> None:
+    """Instantiate every concrete overload of this module's generic kernels."""
+    for dtype in _GLOBAL_DTYPES:
+        for kernel in _GLOBAL_1D:
+            wp.overload(kernel, [wp.array[dtype], wp.array[dtype]])
+        for kernel in _GLOBAL_2D:
+            wp.overload(kernel, [wp.array2d[dtype], wp.array[dtype]])
+    for dtype in _AXIS_DTYPES:
+        for kernel in _AXIS_SINGLE_OUT:
+            wp.overload(kernel, [wp.array2d[dtype], wp.array[dtype]])
+        for kernel in _AXIS_DUAL_OUT:
+            wp.overload(kernel, [wp.array2d[dtype], wp.array[dtype], wp.array[dtype]])
+    for kernel in _MASK_1D:
+        wp.overload(kernel, [wp.array[wp.int32], wp.array[wp.int32]])
+    for kernel in _MASK_2D:
+        wp.overload(kernel, [wp.array2d[wp.int32], wp.array[wp.int32]])
+
+
+_register_overloads()

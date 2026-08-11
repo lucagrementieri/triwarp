@@ -187,3 +187,22 @@ def face_corner_edge_vertices(
     h = 3 * face_corners[i, 0] + face_corners[i, 1]
     out_edges[i, 0] = faces[h]
     out_edges[i, 1] = faces[halfedge_next(h)]
+
+
+# Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
+# CLAUDE.md section 4. One overload across **2** module loads: the smallest fork in the package, and
+# registered for the same reason the others are -- so that adding a second dtype later cannot
+# quietly reintroduce one.
+#
+# ``cut_mesh_from_seams`` scatters the corner *positions* it is splitting, so the value dtype is the
+# vertex dtype and nothing else reaches this kernel.
+def _register_overloads() -> None:
+    """Instantiate every concrete overload of this module's generic kernels."""
+    for dtype in (wp.vec3, wp.vec3d):
+        wp.overload(
+            scatter_corner_values,
+            [wp.array[wp.int32], wp.array[wp.int32], wp.array[dtype], wp.array[dtype]],
+        )
+
+
+_register_overloads()

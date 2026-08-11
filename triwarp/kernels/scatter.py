@@ -174,3 +174,31 @@ def mark_membership_mask(
     index = indices[tid]
     if index >= wp.int32(0) and index < n:
         out_mask[index] = wp.bool(True)
+
+
+# Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
+# CLAUDE.md section 4. Measured over the suite: 6 overloads created across **11** module loads --
+# nearly two rebuilds per overload, this module being reached from 11 wrappers at scattered moments.
+#
+# Each set is the dtypes its call sites actually build, not a menu: ``scatter_add`` accumulates a
+# ``wp.float32`` per-component volume in ``repair`` and a ``wp.vec2d`` tangent field in
+# ``heat.vector``, and the two mass/curvature scatters follow their wrapper's precision keyword.
+_VALUE_DTYPES = (wp.float32, wp.float64)
+
+
+def _register_overloads() -> None:
+    """Instantiate every concrete overload of this module's generic kernels."""
+    for dtype in (*_VALUE_DTYPES, wp.vec2d, wp.vec3):
+        wp.overload(scatter_add, [wp.array[dtype], wp.array[wp.int32], wp.array[dtype]])
+    for dtype in _VALUE_DTYPES:
+        wp.overload(
+            scatter_face_thirds, [wp.array[wp.int32], wp.array[dtype], dtype, wp.array[dtype]]
+        )
+        wp.overload(
+            scatter_offset_sum,
+            [wp.array[dtype], wp.array[wp.int32], wp.array[wp.int32], wp.array[dtype]],
+        )
+        wp.overload(scatter_sum_scalar, [wp.array2d[dtype], wp.array2d[wp.int32], wp.array[dtype]])
+
+
+_register_overloads()

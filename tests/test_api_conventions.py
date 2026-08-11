@@ -207,6 +207,59 @@ def test_array_annotations_are_subscript_style() -> None:
     _fail("call-style array annotation(s):", array_annotation_style_problems())
 
 
+def test_generic_kernels_register_their_overloads() -> None:
+    """
+    A ``@wp.kernel`` generic over a dtype has its concrete overloads registered at import.
+
+    ``.claude/CLAUDE.md`` section 4. Warp instantiates a generic kernel's overload lazily, on the
+    first launch at each new dtype, and a module's hash covers the *instantiated* set -- so a
+    lazily-created overload silently rebuilds every kernel in its module. Nothing fails when that
+    happens, which is why it needs a check: the whole defect is a cost. Measured before the
+    registrations went in, over one full-suite run: ``kernels.reduce`` rebuilt across 66 distinct
+    module loads, ``laplacian`` 16, ``array`` 13, ``scatter`` 11, and 464 of the 1 269 directories
+    in the Warp kernel cache were dead ``reduce`` hash links.
+
+    This asserts only that a generic kernel has *some* overload registered, which is what catches
+    the real-world defect -- a new generic kernel added with no ``_register_overloads`` entry. **It
+    cannot tell whether the registered dtype set is complete**, and no cheap check can: proving that
+    means launching the whole dispatch, and a missing dtype announces itself as a rebuild rather
+    than a wrong answer. So a suddenly slow test is the symptom to read, per ``.claude/CLAUDE.md``
+    section 13 -- the dtype belongs in the module's ``_register_overloads``.
+    """
+    unregistered = [
+        key
+        for module_name in _triwarp_kernel_modules()
+        for key, kernel in wp.get_module(module_name).kernels.items()
+        if kernel.is_generic and not kernel.overloads
+    ]
+    _fail("generic kernel(s) with no registered overload:", sorted(unregistered))
+
+
+def _triwarp_kernel_modules() -> list[str]:
+    """
+    Import every ``triwarp.kernels`` sub-module and return the Warp module names they registered.
+
+    Importing is the point, not a side effect: a kernel module Warp has never seen has no entry to
+    inspect, and the sub-packages (``kernels/algorithms/``, ``kernels/heat/``) are only reached by
+    the wrappers that use them, so a plain ``import triwarp`` leaves several unregistered.
+    """
+    import importlib
+    import pkgutil
+
+    import triwarp.kernels
+
+    for info in pkgutil.walk_packages(triwarp.kernels.__path__, "triwarp.kernels."):
+        importlib.import_module(info.name)
+    return [name for name in list(_warp_user_modules()) if name.startswith("triwarp.kernels")]
+
+
+def _warp_user_modules() -> dict:
+    """Warp's registry of user modules, which has no public accessor."""
+    from warp._src.context import user_modules
+
+    return user_modules
+
+
 def test_public_functions_document_what_they_raise() -> None:
     """
     A public function with a ``raise`` in its own body documents a ``Raises`` block.
