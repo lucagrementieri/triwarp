@@ -26,7 +26,8 @@ Two axes, matching the two ways a graph algorithm gets slow:
   (``tile_scan_exclusive`` alone is 353 ns against 962 ns for the whole level). Full measurements in
   the ``Notes`` of [`triwarp.graph.bfs`][triwarp.graph.bfs].
 
-* **diameter again, but weighted**, for ``dijkstra_envelope``. Same shape as ``bfs`` and for the
+* **diameter again, but weighted**, for ``shortest_path_envelope``. Same shape as ``bfs`` and
+  for the
   same reason -- one launch per relaxation pass, and the pass count is the diameter of the region
   that violates the bound -- but the work per pass sweeps the whole CSR rather than a frontier, so
   there is no serial-drain handover to make and no order to be exact about. Seeded from a single
@@ -35,7 +36,7 @@ Two axes, matching the two ways a graph algorithm gets slow:
 
 The vertex-adjacency CSR matrix is prebuilt (untimed, cached per mesh/device) so the timings
 isolate the graph algorithms from the edge sort that produces them -- including
-``dijkstra_envelope``'s length-weighted one, whose weights are ``edges_unique_length``.
+``shortest_path_envelope``'s length-weighted one, whose weights are ``edges_unique_length``.
 
 ``combine.split`` used to live here because it is the other component-count-driven function in the
 package. It now sits in [`test_combine.py`](test_combine.py) with the rest of ``triwarp.combine``,
@@ -52,7 +53,7 @@ Neither **trimesh** nor **open3d** appears: both functions take an abstract CSR 
 and open3d exposes no graph-traversal API over one -- its connectivity work is mesh-bound
 (``cluster_connected_triangles``), which is what ``split`` uses over in ``test_combine``.
 
-**pymeshlab** answers two groups. ``dijkstra_envelope``'s reference is
+**pymeshlab** answers two groups. ``shortest_path_envelope``'s reference is
 ``apply_scalar_saturation_per_vertex``, which is the same relaxation read as a Lipschitz cap on a
 per-vertex scalar (VCG ``UpdateQuality::VertexSaturate``); its ``gradientthr`` divides the edge
 length, so both sides receive the identical weights and the row is apples-to-apples. It needs the
@@ -260,9 +261,9 @@ def _spike_field_np(bench_case: BenchCase) -> np.ndarray:
     return values_np
 
 
-@pytest.mark.benchmark(group="dijkstra_envelope")
+@pytest.mark.benchmark(group="shortest_path_envelope")
 @pytest.mark.benchlibs("triwarp", "pymeshlab")
-def test_dijkstra_envelope(bench_case: BenchCase) -> None:
+def test_shortest_path_envelope(bench_case: BenchCase) -> None:
     """
     Weighted relaxation to the shortest-path envelope: pass count is the graph diameter.
 
@@ -293,5 +294,5 @@ def test_dijkstra_envelope(bench_case: BenchCase) -> None:
     values = wp.array(
         _spike_field_np(bench_case).astype(np.float32), dtype=wp.float32, device=bench_case.device
     )
-    envelope = bench_case.run(lambda: tw.graph.dijkstra_envelope(adjacency, values), rounds=3)
+    envelope = bench_case.run(lambda: tw.graph.shortest_path_envelope(adjacency, values), rounds=3)
     assert envelope.shape == (n_vertices,)

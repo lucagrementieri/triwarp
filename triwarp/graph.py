@@ -43,8 +43,9 @@ def edges_to_csr(
     weights
         Length-``m`` edge weights, one per undirected edge, written into both of its directed
         entries. Defaults to unit weights, which is what the unweighted traversals want; the
-        weighted relaxation in [`dijkstra_envelope`][triwarp.graph.dijkstra_envelope] measures paths
-        in whatever this carries — mesh edge lengths from
+        weighted relaxation in
+        [`shortest_path_envelope`][triwarp.graph.shortest_path_envelope] measures paths in whatever
+        this carries — mesh edge lengths from
         [`edges_unique_length`][triwarp.edges.edges_unique_length] for a geometric distance.
 
     Returns
@@ -62,7 +63,7 @@ def edges_to_csr(
     See Also
     --------
     [`bfs`][triwarp.graph.bfs]
-    [`dijkstra_envelope`][triwarp.graph.dijkstra_envelope]
+    [`shortest_path_envelope`][triwarp.graph.shortest_path_envelope]
     """
     device = edges.device
     m = int(edges.shape[0])
@@ -828,7 +829,7 @@ def bfs_multi_source(
     return neighbors, offsets
 
 
-def dijkstra_envelope(
+def shortest_path_envelope(
     adjacency: wps.BsrMatrix[wp.float32], values: wp.array[wp.float32], max_iterations: int = 0
 ) -> wp.array[wp.float32]:
     """
@@ -836,11 +837,12 @@ def dijkstra_envelope(
 
     Two readings of one relaxation, and both are worth knowing because they are the same call:
 
-    * **Dijkstra.** Seed ``values`` with ``0`` on the source nodes and a number larger than any
-      reachable distance elsewhere, and the result is the weighted multi-source shortest-path
-      distance to the nearest source — ``d`` being the sum of ``adjacency``'s values along the path.
-      Measured equal to [`scipy.sparse.csgraph.dijkstra`][] to 7.1e-07 (``float32`` against
-      ``float64``) on a subdivided icosphere, for one source and for three.
+    * **A shortest-path distance — Dijkstra's answer.** Seed ``values`` with ``0`` on the source
+      nodes and a number larger than any reachable distance elsewhere, and the result is the
+      weighted multi-source shortest-path distance to the nearest source, ``d`` being the sum of
+      ``adjacency``'s values along the path. Measured equal to
+      [`scipy.sparse.csgraph.dijkstra`][] to 7.1e-07 (``float32`` against ``float64``) on a
+      subdivided icosphere, for one source and for three.
     * **A Lipschitz cap.** Applied to an arbitrary field it enforces
       ``values[i] <= values[j] + w(i, j)`` on every edge by lowering values only, so every local
       minimum of the input survives untouched and only peaks that rise too steeply out of them are
@@ -891,16 +893,22 @@ def dijkstra_envelope(
     adjacency = tw.graph.edges_to_csr(n_vertices, edges, lengths)
     seed = wp.full(n_vertices, 1.0e6, dtype=wp.float32, device=v.device)
     wp.copy(seed[:1], wp.zeros(1, dtype=wp.float32, device=v.device))
-    print(float(tw.reduce.max(tw.graph.dijkstra_envelope(adjacency, seed))))
+    print(float(tw.reduce.max(tw.graph.shortest_path_envelope(adjacency, seed))))
     ```
 
     Notes
     -----
-    One kernel launch per pass, double-buffered, so a pass is a pure function of the previous
-    labels and the answer does not depend on thread interleaving. The pass count is data-dependent
-    and each pass ends in one ``int32`` readback (~0.1 ms against ~1 ms of launches per pass on a
-    scan mesh), which is the cheaper side of that trade — see the ``linalg`` note on
-    ``check_every``.
+    **The answer is Dijkstra's; the method is Bellman-Ford.** A priority queue is inherently
+    serial — it processes one node per pop — so this relaxes *every* node against its neighbours in
+    parallel and repeats until nothing improves. Shortest-path distances are unique, so the two
+    agree on the result; what differs is the cost model — ``O(diameter)`` launches over the whole
+    CSR here against ``O(E log V)`` sequential work there. The name is the result, per this
+    package's naming rule, not the algorithm.
+
+    One kernel launch per pass, double-buffered, so a pass is a pure function of the previous labels
+    and the answer does not depend on thread interleaving. The pass count is data-dependent and each
+    pass ends in one ``int32`` readback (~0.1 ms against ~1 ms of launches per pass on a scan mesh),
+    which is the cheaper side of that trade — see the ``linalg`` note on ``check_every``.
 
     For distance *across* a surface rather than along its edges — shorter, and what "geodesic"
     usually means — use [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]. The edge-graph
@@ -933,7 +941,7 @@ def dijkstra_envelope(
     for _ in range(max_iterations or node_count):
         changed.zero_()
         wp.launch(
-            kernel_graph.dijkstra_envelope_pass,
+            kernel_graph.shortest_path_envelope_pass,
             dim=node_count,
             inputs=[offsets, columns, weights, labels, relaxed, changed],
             device=device,

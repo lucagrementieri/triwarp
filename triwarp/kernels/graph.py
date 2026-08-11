@@ -27,7 +27,7 @@ def duplicate_edge_weights(weights: wp.array[wp.float32], out_values: wp.array[w
 
 
 @wp.kernel
-def dijkstra_envelope_pass(
+def shortest_path_envelope_pass(
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
     weights: wp.array[wp.float32],

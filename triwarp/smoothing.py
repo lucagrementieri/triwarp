@@ -22,7 +22,7 @@ whole idea backwards to *sharpen*.
 per-vertex **scalar** field rather than positions. Capping how fast such a field may vary along an
 edge — the other half of turning a raw scalar into a usable sizing field — is not a smoothing filter
 at all but a one-sided Lipschitz projection, and lives in
-[`dijkstra_envelope`][triwarp.graph.dijkstra_envelope].
+[`shortest_path_envelope`][triwarp.graph.shortest_path_envelope].
 """
 
 from __future__ import annotations
@@ -1145,7 +1145,7 @@ def filter_scalar_laplacian(
 
     See Also
     --------
-    [`dijkstra_envelope`][triwarp.graph.dijkstra_envelope]
+    [`shortest_path_envelope`][triwarp.graph.shortest_path_envelope]
     [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
     [`triwarp.laplacian.laplacian`][triwarp.laplacian.laplacian]
     """
