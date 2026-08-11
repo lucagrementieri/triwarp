@@ -173,10 +173,37 @@ def test_point_plane_distance(bench_case: BenchCase) -> None:
         assert distances_tm.shape == (n_points,)
 
 
+@pytest.mark.noparity(
+    "pyvista",
+    oracle="trimesh",
+    reason="D2 a different estimator with a measured disagreement: pv.fit_line_to_points returns "
+    "the first *principal* axis of the centred covariance, while fit_line is a faithful port of "
+    "trimesh.points.major_axis -- normalize(S @ V) over the SVD of the *uncentered* point matrix, "
+    "a singular-value-weighted sum of all three right singular vectors. Measured |dot| between the "
+    "two of 0.802 on an aspect-3:1:0.05 cloud offset from the origin, where pyvista agrees with "
+    "the leading eigenvector to 1.0000000 and triwarp does not; on a 1000:1 needle the two "
+    "definitions coincide to 3e-6, which is why the difference is easy to miss. The principal "
+    "frame is a *separate* triwarp function -- points.principal_axes, whose own group carries the "
+    "pyvista row -- so this is a naming coincidence rather than two implementations of one "
+    "quantity. trimesh is the oracle here, in tests/test_points.py::test_fit_line, and the "
+    "distinction is pinned in test_principal_axes_is_not_fit_line.",
+)
 @pytest.mark.benchmark(group="fit_line")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pyvista")
 def test_fit_line(bench_case: BenchCase) -> None:
-    """Major axis from the uncentred Gram matrix: tiled outer-product sum plus one ``svd3``."""
+    """
+    Major axis from the uncentred Gram matrix: tiled outer-product sum plus one ``svd3``.
+
+    pyvista's row computes a *different* axis -- see the exemption above -- and additionally returns
+    the fitted segment as a ``PolyData`` rather than a direction, so read it as the cost of "fit a
+    line to this cloud" in VTK rather than as the same arithmetic.
+    """
+    if bench_case.kind == "pyvista":
+        skip_larger_than(bench_case, "bunny_decimated", _HOST_CAP_REASON)
+        points_np = bench_case.vertices_np
+        line_pv = bench_case.run(lambda: pv.fit_line_to_points(points_np))
+        assert np.asarray(line_pv.points).shape[1] == 3
+        return
     if bench_case.kind == "triwarp":
         points = bench_case.vertices_wp
         axis = bench_case.run(lambda: tw.points.fit_line(points))
@@ -208,9 +235,24 @@ def test_principal_axes(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="fit_plane")
-@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab", "pyvista")
 def test_fit_plane(bench_case: BenchCase) -> None:
-    """Least-squares plane: centroid reduction, centred covariance, then the smallest-sigma axis."""
+    """
+    Least-squares plane: centroid reduction, centred covariance, then the smallest-sigma axis.
+
+    pyvista's ``fit_plane_to_points(return_meta=True)`` returns the normal, a centre and a whole
+    ``PolyData`` of the plane itself, so its row carries that geometry as well as the fit -- and its
+    centre is *not* the centroid, which is why only the normal is compared
+    (``tests/test_points.py``).
+    """
+    if bench_case.kind == "pyvista":
+        skip_larger_than(bench_case, "bunny_decimated", _HOST_CAP_REASON)
+        points_np = bench_case.vertices_np
+        _plane_pv, _centre_pv, normal_pv = bench_case.run(
+            lambda: pv.fit_plane_to_points(points_np, return_meta=True)
+        )
+        assert np.asarray(normal_pv).shape == (3,)
+        return
     if bench_case.kind == "pymeshlab":
         # ``compute_matrix_by_fitting_to_plane`` raises ``Cannot compute rotation: there is no
         # selection`` unless something is selected, so ``set_selection_all`` runs first (untimed --

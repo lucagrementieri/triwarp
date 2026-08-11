@@ -6,6 +6,7 @@ import numpy as np
 import open3d as o3d
 import pymeshlab as ml
 import pytest
+import pyvista as pv
 import trimesh as tm
 import trimesh.registration as tm_reg
 import warp as wp
@@ -491,6 +492,59 @@ def test_icp_mesh_matches_pymeshlab(device: str, angle: float) -> None:
     assert _rms(moved_pml, vertices_np) < 1e-4
     assert _rms(moved_wp, vertices_np) < 1e-4
     assert np.allclose(moved_wp, moved_pml, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("angle", [0.15, 0.30])
+@pytest.mark.parity("icp_mesh", "pyvista")
+def test_icp_mesh_matches_pyvista(device: str, angle: float) -> None:
+    """
+    Class C: both solvers recover the same rigid motion, compared through the aligned positions.
+
+    A derived scalar rather than an element-wise match on the *matrix*, because ICP's answer is a
+    transform and two implementations that converge to the same alignment can differ in the last
+    digits of the rotation while agreeing on where every point lands. So the assert is on the RMS
+    to the reference, on both sides, plus that the two aligned clouds agree with each other.
+
+    ``align(return_matrix=True)`` returns ``(aligned_mesh, 4x4 matrix)`` -- and unlike MeshLab it
+    *does* move the points, so the aligned mesh's ``points`` is the answer rather than a layer
+    transform. Measured mean residual **4.8e-04** recovering a 10-degree rotation of the notched
+    cube.
+
+    Same fixture and same reason as the pymeshlab test above: a rotationally symmetric shape makes
+    ICP's answer non-unique, so a notched cube is used and the starting RMS is asserted large before
+    the two results are compared to it.
+    """
+    mesh_tm = tm.boolean.difference(
+        [tm.creation.box(extents=[1.0, 1.0, 1.0]), tm.creation.box(extents=[0.4, 0.4, 2.0])]
+    ).subdivide()
+    mesh_tm = mesh_tm.subdivide()
+    vertices_np = mesh_tm.vertices.astype(np.float64)
+    faces_np = np.ascontiguousarray(mesh_tm.faces, dtype=np.int32)
+    rotation_np, translation_np = _rigid_transform(angle, [0.2, 0.7, 0.1], [0.05, -0.03, 0.04])
+    source_np = vertices_np @ rotation_np.T.astype(np.float64) + translation_np
+
+    source_pv = pv.PolyData.from_regular_faces(np.ascontiguousarray(source_np), faces_np)
+    target_pv = pv.PolyData.from_regular_faces(np.ascontiguousarray(vertices_np), faces_np)
+    aligned_pv, matrix_pv = source_pv.align(target_pv, return_matrix=True)
+    moved_pv = np.asarray(aligned_pv.points, dtype=np.float64)
+    assert np.isclose(np.linalg.det(np.asarray(matrix_pv)[:3, :3]), 1.0, atol=1e-4)
+
+    _matrix_wp, transformed_wp, _cost_wp = tw.registration.icp(
+        _to_wp(source_np, device),
+        _to_wp(vertices_np, device),
+        wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device),
+        max_iterations=100,
+        threshold=-np.inf,
+        reflection=False,
+        scale=False,
+    )
+    moved_wp = transformed_wp.numpy().astype(np.float64)
+
+    # Neither result is two failures agreeing: the input starts far from the reference.
+    assert _rms(source_np, vertices_np) > 0.1
+    assert _rms(moved_pv, vertices_np) < 1e-2
+    assert _rms(moved_wp, vertices_np) < 1e-2
+    assert _rms(moved_wp, moved_pv) < 1e-2
 
 
 def test_icp_point_to_plane_mesh(half_torus: tuple[tm.Trimesh, wp.Mesh], device: str) -> None:

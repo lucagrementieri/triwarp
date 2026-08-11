@@ -97,9 +97,10 @@ import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pyvista as pv
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase, skip_larger_than
+from conftest import BenchCase, BenchLibrary, skip_larger_than
 
 import triwarp as tw
 
@@ -198,6 +199,60 @@ def _cloud_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
     meshset_pml = _cloud_pml_cache[bench_case.mesh_name]
     meshset_pml.set_current_mesh(0)
     return meshset_pml
+
+
+# Point counts for the planar Delaunay sweep. It is a *sequential* incremental insertion followed
+# by a parallel flip loop, so the axis worth showing is the point count rather than any mesh size.
+_DELAUNAY_POINTS = [2_000, 20_000]
+
+_delaunay_np_cache: dict[int, np.ndarray] = {}
+
+
+def _delaunay_points_np(n_points: int) -> np.ndarray:
+    """``(n, 2)`` uniform planar cloud, cached per size -- the *input*, not part of the work."""
+    if n_points not in _delaunay_np_cache:
+        _delaunay_np_cache[n_points] = np.ascontiguousarray(
+            np.random.default_rng(0).random((n_points, 2)), dtype=np.float64
+        )
+    return _delaunay_np_cache[n_points]
+
+
+@pytest.mark.benchmark(group="delaunay_triangulation")
+@pytest.mark.benchlibs("triwarp", "scipy", "pyvista")
+@pytest.mark.parametrize("n_points", _DELAUNAY_POINTS)
+def test_delaunay_triangulation(bench_lib: BenchLibrary, n_points: int) -> None:
+    """
+    Planar Delaunay triangulation, on the point-count axis -- the module's one mesh-free group.
+
+    It takes ``bench_lib`` rather than ``bench_case`` for the reason ``test_creation.py``'s groups
+    do: there is no input mesh, so the work is sized by a plain ``parametrize`` (the same 2-D cloud
+    both references see, built once per size outside the timed region).
+
+    The three implementations answer the same question by different means: triwarp seeds a
+    sequential lexicographic incremental triangulation and then drives its **parallel** edge-flip
+    loop to the empty-circumcircle fixed point, scipy calls Qhull, and VTK runs
+    ``vtkDelaunay2D``'s serial insertion. The answers agree on the interior and differ only in hull
+    slivers -- pyvista's 374 triangles are a strict *subset* of triwarp's 384 on a 200-point cloud
+    (``tests/test_reconstruction.py``), so read the counts as well as the clock.
+    """
+    points_np = _delaunay_points_np(n_points)
+    if bench_lib.kind == "pyvista":
+        cloud_pv = pv.PolyData(np.column_stack([points_np, np.zeros(n_points)]).astype(np.float64))
+        triangulated_pv = bench_lib.run(cloud_pv.delaunay_2d)
+        assert triangulated_pv.n_faces > 0
+        return
+    if bench_lib.kind == "scipy":
+        from scipy.spatial import Delaunay
+
+        triangulated_sp = bench_lib.run(lambda: Delaunay(points_np))
+        assert triangulated_sp.simplices.shape[1] == 3
+        return
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec2, device=bench_lib.device
+    )
+    faces = bench_lib.run(lambda: tw.reconstruction.delaunay_triangulation(points_wp))
+    assert int(faces.shape[0]) % 3 == 0
+    assert int(faces.shape[0]) > 0
 
 
 @pytest.mark.benchmark(group="triangulate_point_cloud")

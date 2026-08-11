@@ -21,7 +21,12 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from tests.comparisons import hausdorff_two_sided, symmetric_chamfer, symmetric_surface_distance
-from tests.conversions import open3d_to_trimesh, points_to_open3d, points_to_pymeshlab
+from tests.conversions import (
+    open3d_to_trimesh,
+    points_to_open3d,
+    points_to_pymeshlab,
+    points_to_pyvista,
+)
 from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
 
 _meshlib = pytest.importorskip("meshlib")
@@ -263,7 +268,9 @@ def _incircle_violations(points_np: np.ndarray, faces_flat: np.ndarray) -> int:
     return violations
 
 
+@pytest.mark.parity("delaunay_triangulation", "scipy")
 def test_delaunay_matches_scipy_random(device: str):
+    """Class B: the same triangulation as Qhull's, compared as an undirected edge set."""
     from scipy.spatial import Delaunay
 
     rng = np.random.default_rng(42)
@@ -274,6 +281,41 @@ def test_delaunay_matches_scipy_random(device: str):
     faces_sp = Delaunay(points_np.astype(np.float64)).simplices
 
     assert _edge_set(faces_wp) == _edge_set(faces_sp.reshape(-1))
+
+
+@pytest.mark.parity("delaunay_triangulation", "pyvista")
+def test_delaunay_contains_the_pyvista_triangulation(device: str):
+    """
+    Class B: ``delaunay_2d``'s triangles are a strict **subset** of triwarp's; the gap is hull.
+
+    Both are Delaunay triangulations of the same cloud, so on the interior they agree face for face;
+    they differ on how much of the convex hull they keep. Measured on 200 uniform points: pyvista
+    returns **374** triangles, every one of them present in triwarp's **384**, so the 10 extra are
+    hull slivers ``vtkDelaunay2D`` drops. The comparison is therefore containment plus a bound on
+    the excess, not equality -- and stating it that way is the point, since an equality assert would
+    fail on a correct implementation.
+
+    The cloud is passed to VTK as ``(x, y, 0)``: ``delaunay_2d`` projects onto the best-fit plane,
+    so a genuinely planar input is what keeps its answer comparable to a 2-D triangulator's.
+    """
+    rng = np.random.default_rng(0)
+    points_np = rng.random((200, 2))
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec2, device=device)
+
+    triangulated_pv = points_to_pyvista(np.column_stack([points_np, np.zeros(len(points_np))]))
+    triangulated_pv = triangulated_pv.delaunay_2d()
+    assert triangulated_pv.is_all_triangles
+    faces_pv = {
+        tuple(row) for row in np.sort(np.asarray(triangulated_pv.regular_faces), axis=1).tolist()
+    }
+    assert len(faces_pv) > 300, "the reference triangulated the cloud before it is compared to"
+
+    faces_wp = tw.reconstruction.delaunay_triangulation(points_wp).numpy().reshape(-1, 3)
+    faces_tw = {tuple(row) for row in np.sort(faces_wp, axis=1).tolist()}
+
+    assert faces_pv <= faces_tw
+    # The excess is hull slivers only: a few triangles, not a different triangulation.
+    assert len(faces_tw - faces_pv) < 0.05 * len(faces_tw)
 
 
 def test_delaunay_no_violations(device: str):

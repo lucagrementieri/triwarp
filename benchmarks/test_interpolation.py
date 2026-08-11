@@ -139,7 +139,7 @@ def _edge_numbering(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarray, np.n
 
 @pytest.mark.benchmark(group="average_onto_faces")
 @pytest.mark.benchaxis("valence")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "pyvista")
 def test_average_onto_faces(bench_case: BenchCase) -> None:
     """
     Vertex-to-face mean: a ``3F`` **gather**, so the one direction valence cannot hurt.
@@ -148,7 +148,16 @@ def test_average_onto_faces(bench_case: BenchCase) -> None:
     three vertices per face and writes one value with no contention at all, so any spread here is
     noise and any spread *there* is the atomics. Without it the scatters' flatness has nothing to be
     flat against.
+
+    VTK spells it ``point_data_to_cell_data``; the field is seeded on the shared ``PolyData`` once,
+    outside the timed region, since what a gather costs depends on the indices and not the values.
     """
+    if bench_case.kind == "pyvista":
+        mesh_pv = bench_case.mesh_pv
+        mesh_pv.point_data["field"] = _vertex_field_np(bench_case).astype(np.float64)
+        transferred_pv = bench_case.run(mesh_pv.point_data_to_cell_data)
+        assert np.asarray(transferred_pv.cell_data["field"]).shape == (bench_case.n_faces,)
+        return
     if bench_case.kind == "triwarp":
         faces = bench_case.faces_wp
         values = _vertex_field_wp(bench_case)
@@ -163,10 +172,21 @@ def test_average_onto_faces(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="average_onto_vertices")
 @pytest.mark.benchaxis("valence")
-@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab", "pyvista")
 def test_average_onto_vertices(bench_case: BenchCase) -> None:
-    """The face-to-vertex scatter: the same contention as the normals rows, without the math."""
+    """
+    The face-to-vertex scatter: the same contention as the normals rows, without the math.
+
+    VTK's ``cell_data_to_point_data`` needs no weighting flag -- it is the unweighted incident-cell
+    mean, which is this function.
+    """
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pyvista":
+        mesh_pv = bench_case.mesh_pv
+        mesh_pv.cell_data["field"] = _face_field_np(bench_case).astype(np.float64)
+        transferred_pv = bench_case.run(mesh_pv.cell_data_to_point_data)
+        assert np.asarray(transferred_pv.point_data["field"]).shape == (n_vertices,)
+        return
     if bench_case.kind == "pymeshlab":
         # MeshLab transfers whatever is in the face scalar attribute, so it is seeded once (values
         # do not change what a scatter costs, only the indices do) and ``areaweight=False`` gives

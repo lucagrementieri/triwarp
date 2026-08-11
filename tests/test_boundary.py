@@ -11,7 +11,7 @@ import warp as wp
 
 import triwarp as tw
 from tests.comparisons import assert_cyclic_permutation_equal
-from tests.conversions import trimesh_to_pymeshlab
+from tests.conversions import pyvista_edges_to_indices, trimesh_to_pymeshlab, trimesh_to_pyvista
 
 # Open-surface fixtures that actually have a boundary (watertight solids do not).
 OPEN_MESHES = ["hemisphere", "half_torus"]
@@ -71,6 +71,37 @@ def test_boundary_vertex_indices(request: pytest.FixtureRequest, mesh_name: str)
     # And the edges themselves project onto the same vertex set.
     edges_wp = tw.boundary.boundary_edges(mesh_wp.points, mesh_wp.indices)
     assert np.array_equal(np.unique(edges_wp.numpy()), np.flatnonzero(selection_pml))
+
+
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+@pytest.mark.parity("boundary_edges", "pyvista")
+def test_boundary_edges_match_pyvista(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B: ``extract_feature_edges(boundary_edges=True)`` with the other three classes off.
+
+    The named transform is the index remap of VTK's renumbered output plus the row ordering, as in
+    ``tests/test_seams.py``. The flags matter more here than anywhere else in the suite, because
+    VTK's default turns on the *feature* edges too and the count would then include every crease.
+
+    **Do not map ``PolyData.n_open_edges`` to this quantity**: it is ``vtkFeatureEdges`` with
+    boundary **and non-manifold** edges on, so on three faces sharing one edge it reads 7 where
+    triwarp counts 6 boundary edges. Only ``is_manifold`` (``n_open_edges == 0``) maps cleanly, and
+    that is ``tests/test_validation.py``'s row.
+
+    Both fixtures are open, so the reference is non-empty by construction -- asserted anyway, since
+    running this on a closed mesh would compare two empty sets and pass.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    edges_pv = pyvista_edges_to_indices(
+        trimesh_to_pyvista(mesh_tm).extract_feature_edges(
+            boundary_edges=True, feature_edges=False, non_manifold_edges=False, manifold_edges=False
+        ),
+        mesh_tm.vertices,
+    )
+    assert len(edges_pv) > 0
+
+    boundary_edges_wp = tw.boundary.boundary_edges(mesh_wp.points, mesh_wp.indices)
+    assert np.array_equal(_lexsort_rows(boundary_edges_wp.numpy()), _lexsort_rows(edges_pv))
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)

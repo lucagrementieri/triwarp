@@ -304,7 +304,7 @@ def _scalar_field_wp(bench_case: BenchCase) -> wp.array[wp.float64]:
 
 
 @pytest.mark.benchmark(group="face_gradients")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "pyvista")
 @pytest.mark.parametrize("precomputed", [False, True], ids=["from_positions", "face_data"])
 def test_face_gradients(bench_case: BenchCase, precomputed: bool) -> None:
     """
@@ -321,7 +321,23 @@ def test_face_gradients(bench_case: BenchCase, precomputed: bool) -> None:
     triplets and triwarp's by reading the field, which is exactly the trade the two designs make --
     read it as "assemble once, apply many" against "apply directly", not as one side being faster at
     the same job. The values agree, through the matrix product, in ``tests/test_laplacian.py``.
+
+    **pyvista applies it and then averages onto the points**: ``compute_derivative`` returns a
+    per-*point* gradient for a point-data field (``preference='cell'`` does not move it), so its row
+    carries a cell-to-point pass triwarp's does not. It is the closest thing here to triwarp's
+    "apply directly" design, which is why it earns a row that igl's assembled operator cannot be
+    compared against directly.
     """
+    if bench_case.kind == "pyvista":
+        if precomputed:
+            pytest.skip("VTK recomputes the face geometry internally; nothing can be handed to it")
+        mesh_pv = bench_case.mesh_pv
+        mesh_pv.point_data["field"] = np.ascontiguousarray(bench_case.vertices_np[:, 2])
+        gradient_pv = bench_case.run(
+            lambda: mesh_pv.compute_derivative(scalars="field", gradient=True)
+        )
+        assert np.asarray(gradient_pv.point_data["gradient"]).shape == (bench_case.n_vertices, 3)
+        return
     if bench_case.kind == "igl":
         if precomputed:
             pytest.skip("igl assembles the operator; there is no face-data shortcut to pass it")

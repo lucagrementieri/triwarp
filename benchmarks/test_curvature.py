@@ -142,15 +142,34 @@ def _face_angles(bench_case: BenchCase) -> twt.Array2dFloat32:
     return _face_angles_cache[key]
 
 
+@pytest.mark.noparity(
+    "pyvista",
+    oracle="igl",
+    reason="D1 not an independent implementation: VTK's curvature('maximum') and ('minimum') are "
+    "pure algebra on its own Gauss and mean curvature -- measured *exactly* H +- sqrt(H^2 - K), "
+    "max abs "
+    "difference 0.0 in float64 on icosphere(3) -- so they estimate no principal curvature of their "
+    "own and inherit vtkCurvatures' 1-ring stencil. They also go complex where H^2 < K, which is "
+    "300 of 642 vertices on that same sphere, and VTK returns the clamped real part rather than "
+    "raising. igl.principal_curvature(useKring=False) is the quadric fit triwarp implements and is "
+    "the oracle, in tests/test_curvature.py::test_principal_curvature.",
+)
 @pytest.mark.benchmark(group="principal_curvature")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab", "pyvista")
 @pytest.mark.parametrize("radius", _QUADRIC_RADII)
 def test_principal_curvature(bench_case: BenchCase, radius: int) -> None:
     """Per-vertex quadric fit over a geodesic ball: the 5x5 solve in bulk, at two radii."""
     if bench_case.kind == "igl" and bench_case.mesh_name == "sphere_large":
         pytest.skip("igl.principal_curvature is ~2 s a call at this size; capped at sphere_med")
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pyvista":
+        if radius != min(_QUADRIC_RADII):
+            pytest.skip("VTK's curvature is a fixed 1-ring stencil: no radius axis")
+        mesh_pv = bench_case.mesh_pv
+        curvature_pv = bench_case.run(lambda: mesh_pv.curvature("maximum"), rounds=_HEAVY_ROUNDS)
+        assert np.asarray(curvature_pv).shape == (n_vertices,)
+        return
     if bench_case.kind == "pymeshlab":
         if radius != min(_QUADRIC_RADII):
             pytest.skip("MeshLab derives the fit neighborhood itself: no radius axis")

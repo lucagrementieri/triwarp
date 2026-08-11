@@ -9,7 +9,7 @@ import pytest
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import trimesh_to_pymeshlab, trimesh_to_warp
+from tests.conversions import trimesh_to_pymeshlab, trimesh_to_pyvista, trimesh_to_warp
 
 
 def _heat_geodesic_igl(
@@ -228,6 +228,59 @@ def test_heat_geodesic_matches_pymeshlab(
     error = np.abs(distance_wp.numpy() - distance_pml)
     assert error.mean() < 0.001 * diameter
     assert error.max() < 0.05 * diameter
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere", "half_torus", "torus"])
+@pytest.mark.parity("heat_geodesic", "pyvista")
+def test_heat_geodesic_is_bounded_by_the_graph_distance(
+    request: pytest.FixtureRequest, mesh_name: str, device: str
+) -> None:
+    """
+    Class C, a two-sided bound on a value with no correspondence to compare against.
+
+    VTK's ``geodesic_distance`` is ``vtkDijkstraGraphGeodesicPath`` -- the shortest path along mesh
+    *edges*, so it is an **upper** bound on the true geodesic (a path confined to edges cannot beat
+    one free to cross faces), while the straight-line distance is a **lower** bound on it. The heat
+    method returns a smoothed approximation of the quantity in between, which is why this is a bound
+    and not an ``allclose``: nothing here is the same number.
+
+    **Bug class excluded:** a field on the wrong *scale*. A wrong timestep, a missing mass lumping
+    or a lost square root all leave the field smooth, monotone and zero at the source -- so every
+    self-consistency test in this module still passes -- while moving its magnitude, and the upper
+    bound is sharp enough to see that. Measured ``heat / graph`` over 20 random targets per fixture:
+    max **0.866 / 0.983 / 0.934 / 0.969**, so a field inflated by more than ~2% on ``hemisphere``
+    fails it (a 1.5x scaling fails on all four).
+
+    The lower bound is checked only at the Euclidean-**farthest** vertex, and that restriction is
+    the finding rather than a convenience: at short range the heat method *undershoots* the
+    straight-line distance, measured 0.911 against 1.051 between adjacent-ish vertices of the
+    icosahedron and 0.728 against 0.829 on ``half_torus``. So "heat >= Euclidean" is false in
+    general and true where the two are far apart -- margins there are 36% / 53% / 0.5% / 30%, the
+    thin one being ``half_torus``, whose farthest pair is nearly straight-line reachable across its
+    opening.
+    """
+    if wp.get_device(device).is_cpu:
+        pytest.skip("heat_geodesic needs conjugate gradient, which Warp cannot run on CPU")
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = int(mesh_tm.vertices.shape[0])
+
+    mesh_pv = trimesh_to_pyvista(mesh_tm)
+    sources_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
+    heat_np = tw.heat.distance.heat_geodesic(
+        mesh_wp.points, mesh_wp.indices, sources_wp, use_robust=False
+    ).numpy()
+
+    rng = np.random.default_rng(3)
+    targets_np = rng.choice(np.arange(1, n_vertices), size=min(20, n_vertices - 1), replace=False)
+    for target in targets_np:
+        graph_pv = float(mesh_pv.geodesic_distance(0, int(target)))
+        assert graph_pv > 0.0  # the reference answered, so the bound is not vacuous
+        assert heat_np[int(target)] <= graph_pv
+
+    # The lower bound bites only at range -- see the docstring.
+    farthest = int(np.argmax(np.linalg.norm(mesh_tm.vertices - mesh_tm.vertices[0], axis=1)))
+    euclidean_np = float(np.linalg.norm(mesh_tm.vertices[farthest] - mesh_tm.vertices[0]))
+    assert euclidean_np <= heat_np[farthest] <= float(mesh_pv.geodesic_distance(0, farthest))
 
 
 # --- the heat method's robust path (potpourri3d use_robust=True reference) -------------

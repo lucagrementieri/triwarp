@@ -142,7 +142,7 @@ def test_face_adjacency_unshared(bench_case: BenchCase, tabled: bool) -> None:
 
 
 @pytest.mark.benchmark(group="face_connected_component_labels")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "pyvista")
 def test_face_connected_component_labels(bench_case: BenchCase) -> None:
     """
     Per-face component ids over the face-adjacency graph: the edge build plus a label propagation.
@@ -156,7 +156,16 @@ def test_face_connected_component_labels(bench_case: BenchCase) -> None:
     unpack wrongly -- and numbers components ``0..k-1`` in its own discovery order where triwarp
     labels each component by a representative face. The partition is identical; the names are not
     (``tests/test_adjacency.py``).
+
+    VTK's ``connectivity('all')`` is the same partition under a third numbering, and it returns a
+    whole new ``PolyData`` carrying the ``RegionId`` cell array rather than the labels alone -- so
+    its row prices the copy as well as the traversal.
     """
+    if bench_case.kind == "pyvista":
+        mesh_pv = bench_case.mesh_pv
+        labelled_pv = bench_case.run(lambda: mesh_pv.connectivity("all"))
+        assert np.asarray(labelled_pv.cell_data["RegionId"]).shape == (bench_case.n_faces,)
+        return
     if bench_case.kind == "triwarp":
         faces_wp = bench_case.faces_wp
         labels = bench_case.run(lambda: tw.adjacency.face_connected_component_labels(faces_wp))

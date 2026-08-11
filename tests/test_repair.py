@@ -12,7 +12,7 @@ import warp as wp
 
 import triwarp as tw
 from tests.comparisons import canonical_winding, lexsort_rows, same_partition
-from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab
+from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab, trimesh_to_pyvista
 
 
 def _to_wp_mesh(vertices_np: np.ndarray, faces_np: np.ndarray, device: str):
@@ -323,7 +323,7 @@ def _faces_2d(faces_wp: wp.array) -> np.ndarray:
 
 
 @pytest.mark.parametrize("epsilon", [0.0, 1e-6])
-@pytest.mark.parity("remove_duplicated_vertices", "open3d", "pymeshlab")
+@pytest.mark.parity("remove_duplicated_vertices", "open3d", "pymeshlab", "pyvista")
 def test_remove_duplicated_vertices_matches_open3d_and_pymeshlab(
     device: str, epsilon: float
 ) -> None:
@@ -334,7 +334,13 @@ def test_remove_duplicated_vertices_matches_open3d_and_pymeshlab(
     (``meshing_remove_duplicate_vertices`` for exact, ``meshing_merge_close_vertices`` for a
     tolerance) that line up with triwarp's two code paths one-for-one, and Open3D's
     ``remove_duplicated_vertices`` is the exact path. So unlike its siblings in this module this is
-    a straight comparison rather than a semantics negotiation.
+    a straight comparison rather than a semantics negotiation. VTK's ``clean`` is a fourth
+    implementation of the exact path and lands on the same 162 (measured 172 -> 162 on a mesh with
+    ten duplicated vertices, matching triwarp exactly).
+
+    **``validate_mesh`` is not the oracle here** and that was measured rather than assumed: its
+    ``coincident_points`` field reads *empty* on ten exactly duplicated vertices, so a comparison
+    against it would report no duplicates to remove. ``clean`` is the dedup reference.
 
     Class B on the *positions*: all three renumber the survivors differently, so the vertex sets are
     compared after a lexsort. Counting alone would be too weak -- a welder that merged the wrong
@@ -362,14 +368,23 @@ def test_remove_duplicated_vertices_matches_open3d_and_pymeshlab(
 
     soup_tm = tm.Trimesh(soup_np, faces_np, process=False)
     vertices_o3d = np.asarray(trimesh_to_open3d(soup_tm).remove_duplicated_vertices().vertices)
+    cleaned_pv = trimesh_to_pyvista(soup_tm).clean(
+        point_merging=True, tolerance=epsilon, absolute=True
+    )
+    vertices_pv = np.asarray(cleaned_pv.points)
 
     assert int(unique_wp.shape[0]) == len(mesh_tm.vertices)
     assert vertices_pml.shape[0] == len(mesh_tm.vertices)
     assert vertices_o3d.shape[0] == len(mesh_tm.vertices)
+    assert vertices_pv.shape[0] == len(mesh_tm.vertices)
 
     survivors_wp = lexsort_rows(np.round(unique_wp.numpy().astype(np.float64), 5))
     assert np.allclose(survivors_wp, lexsort_rows(np.round(vertices_pml, 5)), atol=1e-5)
     assert np.allclose(survivors_wp, lexsort_rows(np.round(vertices_o3d, 5)), atol=1e-5)
+    assert np.allclose(survivors_wp, lexsort_rows(np.round(vertices_pv, 5)), atol=1e-5)
+
+    # The trap this row is written against: validate_mesh does not see exact duplicates.
+    assert len(trimesh_to_pyvista(soup_tm).validate_mesh().coincident_points) == 0
 
 
 @pytest.mark.parity("make_winding_consistent", "pymeshlab")

@@ -137,7 +137,7 @@ def test_is_vertex_manifold(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="is_edge_manifold")
 @pytest.mark.benchaxis("valence")
-@pytest.mark.benchlibs("triwarp", "igl", "open3d")
+@pytest.mark.benchlibs("triwarp", "igl", "open3d", "pyvista")
 def test_is_edge_manifold(bench_case: BenchCase) -> None:
     """
     The cheaper manifoldness predicate: an edge sort and a per-edge count, no one-ring components.
@@ -152,7 +152,17 @@ def test_is_edge_manifold(bench_case: BenchCase) -> None:
     ``allow_boundary_edges`` switch (it always allows them), so only triwarp's default is timed.
     ``open3d.is_edge_manifold`` has the same switch with the same two semantics as triwarp's and is
     timed at the shared default.
+
+    **pyvista has no switch and answers the other setting**: ``PolyData.is_manifold`` is
+    ``n_open_edges == 0``, i.e. ``vtkFeatureEdges`` with boundary *and* non-manifold edges on, which
+    is triwarp's ``allow_boundary_edges=False``. It therefore does strictly more work than the row
+    above -- a full feature-edge extraction rather than a count -- and it is timed at the setting it
+    actually implements, which is the one asserted in ``tests/test_validation.py``.
     """
+    if bench_case.kind == "pyvista":
+        mesh_pv = bench_case.mesh_pv
+        assert bench_case.run(lambda: bool(mesh_pv.is_manifold)) in (True, False)
+        return
     if bench_case.kind == "triwarp":
         faces = bench_case.faces_wp
         assert bench_case.run(lambda: tw.validation.is_edge_manifold(faces)) in (True, False)

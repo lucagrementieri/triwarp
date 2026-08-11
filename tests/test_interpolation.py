@@ -8,12 +8,18 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import points_to_pyvista
+from tests.conversions import points_to_pyvista, trimesh_to_pyvista
 
 
-@pytest.mark.parity("average_onto_faces", "igl")
+@pytest.mark.parity("average_onto_faces", "igl", "pyvista")
 def test_average_onto_faces(half_torus: tuple[tm.Trimesh, wp.Mesh]):
-    """Class A: the vertex-to-face mean, element-wise against ``igl.average_onto_faces``."""
+    """
+    Class A on both: the vertex-to-face mean, element-wise, no transform.
+
+    VTK spells it ``point_data_to_cell_data``, which for a triangle *is* the corner mean (measured
+    1.3e-07 here); the array has to be seeded on the mesh and read back by name rather than passed,
+    which is where the answer lives rather than a transform of it.
+    """
     mesh_tm, mesh_wp = half_torus
     rng = np.random.default_rng(0)
 
@@ -21,12 +27,17 @@ def test_average_onto_faces(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     vertex_values_np = rng.uniform(size=mesh_tm.vertices.shape[0])
     face_values_igl = igl.average_onto_faces(faces_np, vertex_values_np)
 
+    mesh_pv = trimesh_to_pyvista(mesh_tm)
+    mesh_pv.point_data["field"] = np.ascontiguousarray(vertex_values_np)
+    face_values_pv = np.asarray(mesh_pv.point_data_to_cell_data().cell_data["field"])
+
     vertex_values_wp = wp.array(vertex_values_np, dtype=wp.float32, device=mesh_wp.device)
     face_values_wp = tw.interpolation.average_onto_faces(mesh_wp.indices, vertex_values_wp)
     assert np.allclose(face_values_wp.numpy(), face_values_igl, rtol=1e-5, atol=1e-5)
+    assert np.allclose(face_values_wp.numpy(), face_values_pv, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parity("average_onto_vertices", "pymeshlab", "igl")
+@pytest.mark.parity("average_onto_vertices", "pymeshlab", "igl", "pyvista")
 def test_average_onto_vertices(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     """
     Class A against libigl, class B against MeshLab's face-to-vertex scalar transfer.
@@ -36,6 +47,9 @@ def test_average_onto_vertices(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     ``f_scalar_array`` on the way in and reading ``vertex_scalar_array()`` on the way out.
     ``areaweight=False`` is load-bearing and is what the benchmark passes: its default weights each
     incident face by area, where this function takes the plain corner mean.
+
+    VTK's ``cell_data_to_point_data`` is class A as well (measured 8.7e-08) and needs no weighting
+    flag: it is the unweighted incident-cell mean.
     """
     mesh_tm, mesh_wp = half_torus
     rng = np.random.default_rng(1)
@@ -61,8 +75,13 @@ def test_average_onto_vertices(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     vertex_values_wp = tw.interpolation.average_onto_vertices(
         n_vertices, mesh_wp.indices, face_values_wp
     )
+    mesh_pv = trimesh_to_pyvista(mesh_tm)
+    mesh_pv.cell_data["field"] = np.ascontiguousarray(face_values_np)
+    vertex_values_pv = np.asarray(mesh_pv.cell_data_to_point_data().point_data["field"])
+
     assert np.allclose(vertex_values_wp.numpy(), vertex_values_igl, rtol=1e-5, atol=1e-5)
     assert np.allclose(vertex_values_wp.numpy(), vertex_values_pml, rtol=1e-5, atol=1e-5)
+    assert np.allclose(vertex_values_wp.numpy(), vertex_values_pv, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parity("average_from_edges_onto_vertices", "igl")

@@ -77,6 +77,7 @@ import numpy as np
 import open3d as o3d
 import pymeshlab as ml
 import pytest
+import pyvista as pv
 import trimesh as tm
 import warp as wp
 from conftest import BenchCase, skip_larger_than
@@ -325,10 +326,31 @@ def test_icp_convergence(bench_case: BenchCase, degrees: float) -> None:
 
 @pytest.mark.benchmark(group="icp_mesh")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "pymeshlab", "pyvista")
 def test_icp_mesh(bench_case: BenchCase) -> None:
-    """Point-to-point ICP against the triangle surface (closest-point-on-mesh correspondences)."""
+    """
+    Point-to-point ICP against the triangle surface (closest-point-on-mesh correspondences).
+
+    pyvista's ``align`` is ``vtkIterativeClosestPointTransform`` and is the third mesh-target ICP
+    here. Unlike MeshLab's it moves the points and returns ``(aligned_mesh, 4x4 matrix)``, so
+    nothing has to be rebuilt between rounds -- but it caps its own iteration count internally, so
+    read the row as "align these two meshes" rather than as a fixed iteration budget.
+    """
     skip_larger_than(bench_case, "happy_buddha", "per-iteration mesh queries scale with face count")
+    if bench_case.kind == "pyvista":
+        skip_larger_than(
+            bench_case, "bunny", "vtkIterativeClosestPointTransform is single-threaded"
+        )
+        target_pv = bench_case.mesh_pv
+        source_pv = pv.PolyData.from_regular_faces(
+            _source_mesh_np(bench_case), np.ascontiguousarray(bench_case.faces_np, dtype=np.int32)
+        )
+        aligned_pv, matrix_pv = bench_case.run(
+            lambda: source_pv.align(target_pv, return_matrix=True), rounds=_PML_ROUNDS
+        )
+        assert np.asarray(matrix_pv).shape == (4, 4)
+        assert aligned_pv.n_points == source_pv.n_points
+        return
     if bench_case.kind == "pymeshlab":
         # ``compute_matrix_by_icp_between_meshes`` correspondences run against the *reference mesh*
         # rather than a point cloud, which is what makes it the equivalent of ``icp`` here rather

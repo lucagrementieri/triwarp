@@ -11,7 +11,7 @@ import trimesh.smoothing as tms
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import bsr_to_csr, bsr_to_dense
+from tests.conversions import bsr_to_csr, bsr_to_dense, trimesh_to_pyvista
 
 _MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
 
@@ -449,6 +449,62 @@ def test_face_gradients_matches_igl(request: pytest.FixtureRequest, mesh_name: s
     assert np.allclose(
         np.einsum("ij,ij->i", gradients_wp.numpy(), edges_np), differences_np, atol=1e-5
     )
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("face_gradients", "pyvista")
+def test_face_gradients_matches_pyvista(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B (averaged onto vertices): VTK reports the same gradient, at the *points*.
+
+    ``compute_derivative`` returns a per-**point** gradient for a point-data field, and
+    ``preference='cell'`` does not move it (measured: the array stays ``(n_vertices, 3)``), so the
+    named transform is triwarp's answer averaged onto vertices with
+    ``interpolation.average_onto_vertices`` -- which turns out to be exactly what VTK computes,
+    element-wise to 1.8e-07 on ``icosphere(3)``.
+
+    The quantity is the **tangential** surface gradient on both sides, which is the thing most
+    likely to be misread as a bug: for ``f = x`` on the unit sphere the mean is ``2/3 e_x``, not
+    ``e_x``, because the ambient x-direction is only partly tangent to the surface. That value is
+    pinned below so the convention is asserted rather than described.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = mesh_tm.vertices.shape[0]
+    values_np = np.ascontiguousarray(mesh_tm.vertices[:, 2], dtype=np.float64)
+
+    mesh_pv = trimesh_to_pyvista(mesh_tm)
+    mesh_pv.point_data["field"] = values_np
+    gradients_pv = np.asarray(
+        mesh_pv.compute_derivative(scalars="field", gradient=True).point_data["gradient"]
+    )
+
+    values_wp = wp.array(values_np, dtype=wp.float64, device=mesh_wp.device)
+    gradients_np = tw.laplacian.face_gradients(mesh_wp.points, mesh_wp.indices, values_wp).numpy()
+    averaged_np = np.stack(
+        [
+            tw.interpolation.average_onto_vertices(
+                n_vertices,
+                mesh_wp.indices,
+                wp.array(
+                    np.ascontiguousarray(gradients_np[:, axis], dtype=np.float32),
+                    dtype=wp.float32,
+                    device=mesh_wp.device,
+                ),
+            ).numpy()
+            for axis in range(3)
+        ],
+        axis=1,
+    )
+    assert np.allclose(averaged_np, gradients_pv, rtol=1e-4, atol=1e-4)
+
+    # The gradient is *tangential*, on both sides: 2/3 e_x for f = x on a unit sphere.
+    sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    sphere_pv = trimesh_to_pyvista(sphere_tm)
+    sphere_pv.point_data["field"] = np.ascontiguousarray(sphere_tm.vertices[:, 0])
+    sphere_gradient_pv = np.asarray(
+        sphere_pv.compute_derivative(scalars="field", gradient=True).point_data["gradient"]
+    )
+    assert np.allclose(sphere_gradient_pv.mean(axis=0), [2.0 / 3.0, 0.0, 0.0], atol=1e-6)
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])

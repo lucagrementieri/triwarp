@@ -99,9 +99,19 @@ def _queries_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
 
 
 @pytest.mark.benchmark(group="aabb_bounds")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "igl")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "igl", "pyvista")
 def test_aabb_bounds(bench_case: BenchCase) -> None:
-    """A min/max reduce over the vertices, and the suite's clearest host-latency floor."""
+    """
+    A min/max reduce over the vertices, and the suite's clearest host-latency floor.
+
+    VTK caches nothing but returns the box interleaved per axis (``xmin, xmax, ymin, ...``), which
+    is a layout the test decodes and this row does not care about.
+    """
+    if bench_case.kind == "pyvista":
+        mesh_pv = bench_case.mesh_pv
+        bounds_pv = bench_case.run(lambda: np.asarray(mesh_pv.bounds))
+        assert bounds_pv.shape == (6,)
+        return
     if bench_case.kind == "triwarp":
         vertices = bench_case.vertices_wp
         lower, upper = bench_case.run(lambda: tw.bounds.aabb_bounds(vertices))
@@ -124,7 +134,7 @@ def test_aabb_bounds(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="enclosing_diagonal")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "pyvista")
 def test_enclosing_diagonal(bench_case: BenchCase) -> None:
     """
     The default search radius every mesh query derives, over the mesh *and* the query points.
@@ -139,6 +149,12 @@ def test_enclosing_diagonal(bench_case: BenchCase) -> None:
     which makes its row also price the ``vstack`` a caller would need, and that copy is the point:
     triwarp never materializes the union.
     """
+    if bench_case.kind == "pyvista":
+        # ``DataSet.length`` is the *single*-cloud diagonal -- VTK has no two-cloud form -- so this
+        # row is the one-box half of what the other two compute. Read it as a floor.
+        mesh_pv = bench_case.mesh_pv
+        assert bench_case.run(lambda: float(mesh_pv.length)) > 0.0
+        return
     if bench_case.kind == "triwarp":
         vertices, queries = bench_case.vertices_wp, _queries_wp(bench_case)
         diagonal = bench_case.run(lambda: tw.bounds.enclosing_diagonal(vertices, queries))
@@ -152,7 +168,7 @@ def test_enclosing_diagonal(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="oriented_bounding_box")
-@pytest.mark.benchlibs("triwarp", "igl", "trimesh", "open3d")
+@pytest.mark.benchlibs("triwarp", "igl", "trimesh", "open3d", "pyvista")
 def test_oriented_bounding_box(bench_case: BenchCase) -> None:
     """
     The sampled-plus-refined minimum-volume box: ``_ROTATIONS`` global frames, then eight rounds.
@@ -168,12 +184,23 @@ def test_oriented_bounding_box(bench_case: BenchCase) -> None:
     The CPU references run into hundreds of milliseconds on ``bunny`` and take ``rounds=3`` for it,
     the same allowance the other second-scale rows in the suite use.
 
+    **pyvista's row is PCA of the points**, a single fixed orientation rather than a search -- so it
+    is the floor of this group by construction and the only reference here that triwarp should beat
+    on *quality* as well (measured 0.84x its volume on a tilted half_torus).
+
     open3d times ``get_minimal_oriented_bounding_box`` -- its hull-based approximate minimizer,
     the same algorithm family as trimesh's row -- not ``get_oriented_bounding_box``, whose PCA box
     does not minimize anything (measured 12.9% above triwarp's volume on the tilted half_torus
     where the minimal box sits within 2%). Like both other references it is insensitive to
     ``_ROTATIONS`` by construction.
     """
+    if bench_case.kind == "pyvista":
+        # PCA of the points: one fixed orientation, so it is a floor and not a minimizer (measured
+        # up to 19% above triwarp's volume in tests/test_bounds.py).
+        mesh_pv = bench_case.mesh_pv
+        box_pv = bench_case.run(lambda: mesh_pv.oriented_bounding_box(as_composite=False), rounds=3)
+        assert box_pv.volume > 0.0
+        return
     if bench_case.kind == "open3d":
         import open3d as o3d
 

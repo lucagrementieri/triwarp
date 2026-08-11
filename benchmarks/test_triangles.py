@@ -16,6 +16,11 @@ a fair race.
 **pymeshlab** splits them the other way: ``compute_normal_per_face`` is normals only, so it belongs
 with the other partial references above. It is geometry-preserving, so it shares the MeshSet.
 
+**pyvista** (VTK 9.6) is the one reference that answers both halves, but in *two* filters --
+``compute_normals`` for the unit cell normal and ``compute_cell_sizes`` for the area -- so its row
+times both calls rather than half the work. It is the only reference here whose normals come back
+``float32``; the areas are ``float64``.
+
 ``face_quality`` runs on the **quality** axis rather than the scan sweep: it is the quantity that
 axis is *defined* by (``saddle`` and ``saddle_graded`` share connectivity and differ only in
 triangle shape), so measuring it there says whether reading the measure costs anything once the
@@ -54,10 +59,26 @@ def _barycentres_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
 
 
 @pytest.mark.benchmark(group="face_normals_and_areas")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "open3d", "potpourri3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "open3d", "potpourri3d", "pymeshlab", "pyvista")
 def test_face_normals_and_areas(bench_case: BenchCase) -> None:
     """One cross product per face: the operator prologue every solver in the library pays."""
     n_faces = bench_case.n_faces
+    if bench_case.kind == "pyvista":  # both halves, in two filters -- see the module docstring
+        mesh_pv = bench_case.mesh_pv
+        areas_pv = bench_case.run(
+            lambda: (
+                mesh_pv.compute_normals(
+                    cell_normals=True,
+                    point_normals=False,
+                    consistent_normals=False,
+                    auto_orient_normals=False,
+                    split_vertices=False,
+                ).cell_data["Normals"],
+                mesh_pv.compute_cell_sizes(length=False, area=True, volume=False).cell_data["Area"],
+            )
+        )[1]
+        assert np.asarray(areas_pv).shape == (n_faces,)
+        return
     if bench_case.kind == "pymeshlab":  # normals only; the area total is in get_geometric_measures
         meshset_pml = bench_case.meshset_pml
         bench_case.run(meshset_pml.compute_normal_per_face)
@@ -91,7 +112,7 @@ def test_face_normals_and_areas(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="face_angles")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pyvista")
 def test_face_angles(bench_case: BenchCase) -> None:
     """
     The three interior angles per face, and the group with the widest margin in the module.
@@ -103,7 +124,15 @@ def test_face_angles(bench_case: BenchCase) -> None:
     ``(i0, i1, i2)``, agreeing element-wise with no transform (verified in
     ``tests/test_triangles.py``). trimesh rebuilds its ``tm.Trimesh`` inside the callable because
     ``face_angles`` is a cached property; a shared mesh would time the cache lookup.
+
+    **pyvista does strictly less**: ``cell_quality`` gives the per-face *extremes* only, so its row
+    reads as a floor -- two reductions of the three angles rather than the three angles.
     """
+    if bench_case.kind == "pyvista":
+        mesh_pv = bench_case.mesh_pv
+        quality_pv = bench_case.run(lambda: mesh_pv.cell_quality(["min_angle", "max_angle"]))
+        assert np.asarray(quality_pv.cell_data["min_angle"]).shape == (bench_case.n_faces,)
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         angles = bench_case.run(lambda: tw.triangles.face_angles(vertices, faces))
@@ -122,11 +151,22 @@ def test_face_angles(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="face_quality")
 @pytest.mark.benchaxis("quality")
-@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab", "pyvista")
 def test_face_quality(bench_case: BenchCase) -> None:
-    """Per-face shape measure, on the axis it defines: bad triangles must not cost more."""
+    """
+    Per-face shape measure, on the axis it defines: bad triangles must not cost more.
+
+    pyvista's ``cell_quality`` is VTK's Verdict library, whose measure names invert against
+    triwarp's: its ``radius_ratio`` is triwarp's ``aspect_ratio`` (and triwarp's ``radius_ratio`` is
+    its reciprocal), which ``tests/test_triangles.py`` decodes in full. One measure is requested, so
+    the row prices the same single ratio per face the other three do.
+    """
     n_faces = bench_case.n_faces
-    if bench_case.kind == "pymeshlab":
+    if bench_case.kind == "pyvista":
+        mesh_pv = bench_case.mesh_pv
+        quality_pv = bench_case.run(lambda: mesh_pv.cell_quality("radius_ratio"))
+        assert np.asarray(quality_pv.cell_data["radius_ratio"]).shape == (n_faces,)
+    elif bench_case.kind == "pymeshlab":
         meshset_pml = bench_case.meshset_pml
         bench_case.run(
             lambda: meshset_pml.compute_scalar_by_aspect_ratio_per_face(
@@ -195,15 +235,22 @@ def test_points_to_barycentric(bench_case: BenchCase, method: str) -> None:
 
 
 @pytest.mark.benchmark(group="face_centroids")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "pyvista")
 def test_face_centroids(bench_case: BenchCase) -> None:
     """
     One barycentre per face: a ``3F`` gather and a divide, the module's cheapest kernel.
 
     It shares the scan sweep with ``face_normals_and_areas`` for a reason -- both are pure per-face
     arithmetic with no connectivity -- so the pair prices a cross product against a mean.
-    ``igl.barycenter`` computes the identical quantity.
+    ``igl.barycenter`` computes the identical quantity, and so does VTK's ``cell_centers`` -- which
+    additionally builds a whole ``PolyData`` of vertex cells around the answer, so read its row as
+    the cost of the container as much as of the mean.
     """
+    if bench_case.kind == "pyvista":
+        mesh_pv = bench_case.mesh_pv
+        centres_pv = bench_case.run(lambda: mesh_pv.cell_centers())
+        assert np.asarray(centres_pv.points).shape == (bench_case.n_faces, 3)
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         centroids = bench_case.run(lambda: tw.triangles.face_centroids(vertices, faces))

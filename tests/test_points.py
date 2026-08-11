@@ -248,6 +248,38 @@ def test_fit_plane(device: str) -> None:
     assert np.isclose(np.abs(np.dot(np.array(normal_wp), normal_pml)), 1.0, atol=1e-4)
 
 
+@pytest.mark.parity("fit_plane", "pyvista")
+def test_fit_plane_normal_matches_pyvista(device: str) -> None:
+    """
+    Class B, and the transform is a **projection**: only the normal is comparable.
+
+    ``pv.fit_plane_to_points(..., return_meta=True)`` returns ``(plane, centre, normal)`` and its
+    ``centre`` is *not* the centroid -- VTK re-centres the returned plane on the middle of the
+    fitted patch, measured ``[5.018, 4.734, 5.008]`` against the cloud's own ``[4.784, 4.949,
+    4.998]`` on the fixture below. So comparing the origin would fail for a correct implementation;
+    the normal is the shared quantity, up to sign, and it agrees to ``|dot| = 1.0000004``.
+
+    Both the centre and the normal come back **float32** even though pyvista stores points in
+    float64, which is why the tolerance here is ``1e-4`` rather than tighter.
+    """
+    rng = np.random.default_rng(7)
+    # Nearly planar and off the origin: the normal is well determined, and the centre pyvista
+    # returns is not the centroid.
+    points_np = (rng.standard_normal((500, 3)) @ np.diag([3.0, 1.0, 0.05])) + 5.0
+
+    _plane_pv, centre_pv, normal_pv = pv.fit_plane_to_points(points_np, return_meta=True)
+
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    centroid_wp, normal_wp = tw.fit_plane(points_wp)
+
+    assert np.isclose(
+        abs(float(np.dot(np.array(normal_wp), np.asarray(normal_pv)))), 1.0, atol=1e-4
+    )
+    # The origins are different quantities; asserting that keeps the projection above honest.
+    assert np.allclose(np.array(centroid_wp), points_np.mean(axis=0), rtol=1e-4, atol=1e-4)
+    assert not np.allclose(np.asarray(centre_pv), points_np.mean(axis=0), atol=1e-2)
+
+
 def test_covariance(device: str) -> None:
     rng = np.random.default_rng(13)
     points_np = rng.standard_normal((200, 3)).astype(np.float32)

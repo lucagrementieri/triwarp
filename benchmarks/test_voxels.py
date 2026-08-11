@@ -87,7 +87,7 @@ def _voxel_size(bench_case: BenchCase, divisor: int) -> float:
     "cell-for-cell in tests/test_voxels.py::test_voxelize_mesh_matches_open3d.",
 )
 @pytest.mark.benchmark(group="voxelize_mesh")
-@pytest.mark.benchlibs("triwarp", "open3d", "trimesh")
+@pytest.mark.benchlibs("triwarp", "open3d", "trimesh", "pyvista")
 @pytest.mark.parametrize("divisor", _CELL_DIVISORS)
 def test_voxelize_mesh(bench_case: BenchCase, divisor: int) -> None:
     """
@@ -101,10 +101,27 @@ def test_voxelize_mesh(bench_case: BenchCase, divisor: int) -> None:
     open3d gets the identical absolute cell width and the identical ``min_bound``, so both sides
     lay down the same lattice; ``create_from_triangle_mesh_within_bounds`` is used rather than
     ``create_from_triangle_mesh`` precisely so the bounds are the caller's on both sides.
+
+    **pyvista's row is the solid mask**, ``voxelize_binary_mask``, which is why it takes the same
+    ``dimensions`` the divisor implies rather than a cell width: it is sized by grid extent, not by
+    pitch. It fills the interior, so read it against triwarp's ``mode="solid"`` cost rather than the
+    surface row timed here -- the containment relation between the two answers is pinned in
+    ``tests/test_voxels.py``. Measured 502 ms at 64 cubed on an 82k-face mesh, so it is capped at
+    ``bunny``.
     """
     voxel_size = _voxel_size(bench_case, divisor)
     origin = bench_case.vertices_np.min(axis=0) - 0.5 * voxel_size
 
+    if bench_case.kind == "pyvista":
+        skip_larger_than(bench_case, "bunny", "voxelize_binary_mask is 502 ms at 64 cubed")
+        mesh_pv = bench_case.mesh_pv
+        extent_np = bench_case.vertices_np.max(axis=0) - bench_case.vertices_np.min(axis=0)
+        dimensions = tuple(int(max(2, round(float(extent) / voxel_size))) for extent in extent_np)
+        mask_pv = bench_case.run(
+            lambda: mesh_pv.voxelize_binary_mask(dimensions=dimensions), rounds=_HEAVY_ROUNDS
+        )
+        assert np.asarray(mask_pv.point_data["mask"]).any()
+        return
     if bench_case.kind == "open3d":
         import open3d as o3d
 

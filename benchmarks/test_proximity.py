@@ -75,6 +75,7 @@ import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pyvista as pv
 import warp as wp
 from conftest import BenchCase, BenchLibrary, skip_larger_than
 from scipy.spatial import Delaunay
@@ -121,7 +122,7 @@ def _mesh_wp(bench_case: BenchCase) -> wp.Mesh:
 
 
 @pytest.mark.benchmark(group="winding_number")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "pyvista")
 @pytest.mark.parametrize("n_queries", _N_QUERIES_SWEEP)
 def test_winding_number(bench_case: BenchCase, n_queries: int) -> None:
     """
@@ -130,12 +131,27 @@ def test_winding_number(bench_case: BenchCase, n_queries: int) -> None:
     The one genuinely ``O(queries x faces)`` function in the module, so both sizes are swept --
     the mesh by the registry and the query count here. A 10x step in queries that is not a 10x
     step in time would mean the launch is not saturating the device.
+
+    **pyvista answers the reduced question**: ``select_interior_points`` returns the inside/outside
+    *bool* rather than the winding number itself, which is what ``ray.contains_points`` returns and
+    what it is compared against (agreement 1.000 on 2 000 queries, ``tests/test_ray.py``). Read its
+    row as the cost of the predicate, not of the number -- and note it uses a BVH where this group's
+    two other rows deliberately do not.
     """
     skip_larger_than(bench_case, "happy_buddha", "O(queries x faces): lucy is untenable")
     if n_queries > _N_QUERIES:
         # 100k queries against dragon is 8.7e10 pair evaluations, and against happy_buddha 1.1e11.
         # The 10x query step is measurable on the medium meshes and the product is what it says.
         skip_larger_than(bench_case, "bunny", "the wide query sweep is only tenable up to bunny")
+    if bench_case.kind == "pyvista":
+        skip_larger_than(bench_case, "bunny", "vtkSelectEnclosedPoints casts rays serially")
+        mesh_pv = bench_case.mesh_pv
+        cloud_pv = pv.PolyData(
+            np.ascontiguousarray(_query_points_np(bench_case, n_queries), dtype=np.float64)
+        )
+        selected_pv = bench_case.run(lambda: cloud_pv.select_interior_points(mesh_pv), rounds=3)
+        assert np.asarray(selected_pv.point_data["selected_points"]).shape == (n_queries,)
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         points = _query_points_wp(bench_case, n_queries)
@@ -179,7 +195,7 @@ def _distance_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
 
 
 @pytest.mark.benchmark(group="signed_distance_on_mesh")
-@pytest.mark.benchlibs("triwarp", "igl", "open3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "igl", "open3d", "pymeshlab", "pyvista")
 @pytest.mark.parametrize("sign_mode", ["parity", "winding"])
 def test_signed_distance_on_mesh(
     bench_case: BenchCase, sign_mode: Literal["parity", "winding"]
@@ -205,6 +221,12 @@ def test_signed_distance_on_mesh(
     inside; probed to 1.8e-7 agreement on an icosphere before the row landed). The scene build sits
     inside the timed callable for the same no-hoisting reason triwarp's ``wp.Mesh`` build does.
 
+    **pyvista's row is an exact SDF and the closest match in the set**:
+    ``compute_implicit_distance`` (``vtkImplicitPolyDataDistance``) shares triwarp's sign convention
+    -- negative inside -- and agrees to 1.5e-07 with a correlation of 1.0000000 and identical signs
+    on 2 000 queries, which is why it is the parity oracle for this group. One row only: it has a
+    single sign rule.
+
     In-harness medians at 10 000 queries, igl rows run in isolation: **64 / 150 ms on
     ``bunny_decimated`` and 394 / 520 on ``bunny``** against triwarp's 6.3 / 6.6 and 4.3 / 4.0 — so
     10-100x, and note that **the mode ratio disagrees between the two sides**: igl's winding sign
@@ -212,6 +234,18 @@ def test_signed_distance_on_mesh(
     because the solid-angle walk rides the BVH traversal triwarp is already doing. Read igl's
     *medians* here, not its minima: the pseudonormal row spreads 225-399 ms on ``bunny``.
     """
+    if bench_case.kind == "pyvista":
+        if sign_mode != "parity":
+            pytest.skip("vtkImplicitPolyDataDistance has one sign rule, so it takes one row")
+        skip_larger_than(
+            bench_case, "bunny", "vtkImplicitPolyDataDistance is a serial per-query walk"
+        )
+        mesh_pv = bench_case.mesh_pv
+        cloud_pv = pv.PolyData(np.ascontiguousarray(_query_points_np(bench_case), dtype=np.float64))
+        distance_pv = bench_case.run(lambda: cloud_pv.compute_implicit_distance(mesh_pv), rounds=3)
+        assert np.asarray(distance_pv.point_data["implicit_distance"]).shape == (_N_QUERIES,)
+        return
+
     if bench_case.kind == "igl":
         skip_larger_than(bench_case, "bunny", "igl rebuilds a single-threaded AABB tree per call")
         vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np

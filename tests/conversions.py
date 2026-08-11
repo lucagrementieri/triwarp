@@ -9,6 +9,7 @@ import pyvista as pv
 import scipy.sparse as sp
 import trimesh as tm
 import warp as wp
+from scipy.spatial import cKDTree
 
 
 def trimesh_to_warp(mesh: tm.Trimesh, device: str) -> wp.Mesh:
@@ -206,6 +207,29 @@ def points_to_pyvista(points_np: np.ndarray) -> pv.PolyData:
     expect; passing a face array would make them read cell centres instead.
     """
     return pv.PolyData(np.ascontiguousarray(points_np, dtype=np.float64))
+
+
+def pyvista_edges_to_indices(edges_pv: pv.PolyData, vertices_np: np.ndarray) -> np.ndarray:
+    """
+    Read a pyvista edge extraction's line cells back as ``(n, 2)`` indices, min-first per row.
+
+    ``extract_feature_edges`` returns a **new** ``PolyData`` carrying only the points its lines
+    touch, renumbered -- so its ``lines`` array indexes that new set and not the mesh it came from.
+    Measured: on a unit box the extraction happens to keep all 8 points and still orders them
+    differently, so a comparison that skips this step fails on a mesh where the *counts* match,
+    which reads as a real disagreement. ``extract_all_edges`` does keep the numbering, but it goes
+    through the same path here so no caller has to remember which filter is which.
+
+    The mapping is by position and exact: VTK copies the coordinates through unchanged, so the
+    nearest-neighbour distance is ``0.0`` and the assert below is a bijection check rather than a
+    tolerance.
+    """
+    lines_np = np.asarray(edges_pv.lines).reshape(-1, 3)[:, 1:]
+    distances_np, indices_np = cKDTree(np.ascontiguousarray(vertices_np, dtype=np.float64)).query(
+        np.asarray(edges_pv.points)
+    )
+    assert float(np.max(distances_np, initial=0.0)) == 0.0
+    return np.sort(indices_np[lines_np], axis=1)
 
 
 def warp_to_trimesh(vertices_wp: wp.array, faces_wp: wp.array) -> tm.Trimesh:

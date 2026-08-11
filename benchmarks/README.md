@@ -330,8 +330,8 @@ Also: never construct a `wp.Mesh` with zero triangles on CUDA (it corrupts devic
 
 ## Reference coverage
 
-`trimesh`, `igl`, `open3d`, `scipy`, `potpourri3d` and `pymeshlab` are all registered in `LIBRARIES`
-and used for
+`trimesh`, `igl`, `open3d`, `scipy`, `potpourri3d`, `pymeshlab` and `pyvista` are all registered in
+`LIBRARIES` and used for
 **every** benchmarked function that has a genuine equivalent — the point is to have independent
 implementations to spot outliers against, not only to fill gaps. `open3d` is marked `cpu_bound`
 even though the installed wheel is a CUDA build: the legacy `open3d.pipelines` / `open3d.geometry`
@@ -340,6 +340,10 @@ radius searches (`spatial.KDTree`) and the graph traversals (`sparse.csgraph`), 
 trimesh itself delegates. `potpourri3d` is CPU-only (geometry-central) and is the **only** reference
 for the heat-method family, tangent spaces and isocontours. `pymeshlab` is CPU-only (MeshLab /
 VCGlib) and is the **broadest** — it reaches 26 modules, more than any other single reference.
+`pyvista` is CPU-only, single-threaded VTK 9.6 and is the newest; it reaches 22 groups across 20
+modules (see its section below). **A group carries `pyvista` or `vedo`, never both** — they wrap the
+same VTK, so two rows would double-count one implementation; where a group would take both, `vedo`
+gets `noparity(..., oracle="pyvista")`.
 
 #### Known coverage gaps
 
@@ -382,8 +386,8 @@ comparable:
 `reason` is mandatory and is checked for substance (≥ 40 chars, ≥ 6 words, no `"see above"`-class
 filler). `oracle=` names the library that *is* the oracle, and the gate then requires **that** pair to
 be covered — so an exemption is a checked claim rather than an escape hatch. Both markers take string
-literals only; a computed argument is invisible to the static scan and is rejected. Nineteen of the
-211 pairs are exempt; the category rubric (D1–D6) is in `.claude/CLAUDE.md` §6.
+literals only; a computed argument is invisible to the static scan and is rejected. Twenty-seven of the
+346 pairs are exempt; the category rubric (D1–D6) is in `.claude/CLAUDE.md` §6.
 
 **Exemptions are for results that cannot be compared, not comparisons that are awkward.** Three rows
 here were heading for exemptions on an 8%-of-displacement Laplacian disagreement until MeshLab's
@@ -723,6 +727,77 @@ The first two fail *silently* rather than raising:
 - **`get_volume` validates before it integrates**, and the validation is the full brute-force
   `IsWatertight` composition: 13.8 s on a watertight 82k-face sphere whose divergence integral is
   microseconds. Never put it inside a timed row that claims to measure volume.
+
+### pyvista
+
+VTK through pyvista 0.48 / VTK 9.6, and the registration cost nothing: `pyvista>=0.48` was already in
+the `test` dependency group. `PolyData`'s callable surface is **142 distinct filter names** across its
+three mixins; 22 of them map onto something triwarp already has, and those are the rows. Every one is
+single-threaded CPU VTK, so `pyvista` is `cpu_bound` and the heavy filters carry explicit caps.
+
+Two mechanics that differ from the other references:
+
+- **The `PolyData` is shared across rows** (`bench_case.mesh_pv`), which is safe because pyvista
+  caches nothing — a repeat `cell_quality` or `decimate` recomputes in full (measured 10.1 / 7.2 ms
+  and 210 / 201 ms) — and almost every filter returns a new object (`inplace=False` throughout).
+  That is the open3d situation rather than the pymeshlab one. Two exceptions build inside the timed
+  callable: `edge_mask`, which writes `point_ind` into its input, and any row that passes
+  `inplace=True` (none do).
+- **The build is cheap and goes through `from_regular_faces`**: 0.057 µs/vertex on 41k vertices,
+  ~8× cheaper than pymeshlab's 0.47 µs/vertex, so no row below ~0.2 ms is reporting its own build.
+  The padded `[3, i, j, k]` constructor is 13× slower (2.34 ms against 0.184 ms on 41k vertices) and
+  `tests.conversions.trimesh_to_pyvista` exists to keep every call on the fast path.
+
+| module | groups | VTK entry points |
+|---|---|---|
+| `test_triangles` | `face_quality`, `face_angles`, `face_centroids`, `face_normals_and_areas` | `cell_quality` (Verdict), `cell_centers`, `compute_normals` + `compute_cell_sizes` |
+| `test_vertices` | `mean_vertex_normals`, `vertex_defects` | `compute_normals` (point), `curvature('gaussian')` |
+| `test_laplacian` | `face_gradients` | `compute_derivative(gradient=True)` |
+| `test_curvature` | `principal_curvature` (exempt) | `curvature('maximum')` — algebra on VTK's own K and H |
+| `test_edges` / `test_seams` / `test_boundary` | `edges_unique`, `crease_edges`, `boundary_edges` | `extract_all_edges`, `extract_feature_edges` with one class on |
+| `test_validation` / `test_adjacency` | `is_edge_manifold`, `face_connected_component_labels` | `is_manifold`, `connectivity('all')` |
+| `test_interpolation` | `average_onto_vertices`, `average_onto_faces` | `cell_data_to_point_data`, `point_data_to_cell_data` |
+| `test_reduce` | `weighted_sum` (new group) | `integrate_data` |
+| `test_proximity` | `winding_number`, `signed_distance_on_mesh` | `select_interior_points`, `compute_implicit_distance` |
+| `test_heat_distance` | `heat_geodesic` | `geodesic_distance` (Dijkstra over edges — a bound, not the same quantity) |
+| `test_bounds` / `test_totals` | `aabb_bounds`, `enclosing_diagonal`, `oriented_bounding_box`, `moments` | `bounds`, `length`, `oriented_bounding_box` (PCA), `volume` |
+| `test_points` | `principal_axes`, `fit_plane`, `fit_line` (exempt) | `principal_axes`, `fit_plane_to_points`, `fit_line_to_points` |
+| `test_registration` | `icp_mesh` | `align(return_matrix=True)` |
+| `test_remesh` / `test_smoothing` | `quadric_decimate`, `filter_laplacian_integration` (exempt), `filter_taubin` (exempt) | `decimate`, `smooth`, `smooth_taubin` |
+| `test_repair` / `test_voxels` | `remove_duplicated_vertices`, `voxelize_mesh` | `clean`, `voxelize_binary_mask` |
+| `test_reconstruction` | `delaunay_triangulation` (new group) | `delaunay_2d` |
+| `test_intersection` / `test_interpolation` / `test_creation` | `clip_mesh_with_field`, `interpolate_from_points`, `parametric_surface`, `super_ellipsoid`, `super_toroid`, `random_hills` (exempt) | `clip_scalar`, `DataSet.interpolate`, the 21 `Parametric*` surfaces |
+
+**Where pyvista is the strongest reference in the set**, which is what the registration was for:
+`compute_implicit_distance` is an exact SDF sharing triwarp's sign convention (correlation
+1.0000000, max abs difference 1.29e-07, sign agreement 1.000 — vedo's `signed_distance` is a
+point-cloud estimator at 0.956 / 0.375 by comparison); `select_interior_points` agrees with
+`ray.contains_points` on 1.000 of 2 000 queries; and `decimate` is the **best** of the four
+decimation references on sphere deviation, ahead of triwarp by 1.14–1.53× (`tests/test_remesh.py`
+carries the numbers).
+
+**Costs measured on an 81 920-face mesh**, which is where the caps come from: `slice` 7.9 ms,
+`curvature('gaussian')` 8.4 ms, `cell_quality` 9.4 ms, `clean` 10.1 ms, `compute_normals` 20.3 ms,
+`extract_all_edges` 20.7 ms, `geodesic_distance` 32.5 ms, `smooth(20)` 39.6 ms,
+`select_interior_points` (2 000 queries) 124.9 ms, `decimate(0.5)` 159.3 ms,
+`voxelize_binary_mask(64³)` **502 ms**. The last three plus `vtkFeatureEdges`, `vtkDijkstra` and
+`vtkImplicitPolyDataDistance` are capped at `bunny`; the cheap rows run to `dragon`.
+
+**Five exemptions**, each with its measured disagreement in the `noparity` reason:
+`principal_curvature` (D1 — `curvature('maximum')` is exactly `H ± √(H² − K)` from VTK's own two
+curvatures, max abs difference 0.0, so it is algebra rather than an estimator), `fit_line` (D2 — it
+returns the first *principal* axis where `points.fit_line` is trimesh's σ-weighted major axis,
+|dot| 0.802 on an ordinary cloud), `filter_laplacian_integration` and `filter_taubin` (D2 —
+different algorithms, see `.claude/CLAUDE.md` §6), and `random_hills` (D5 — VTK draws its own
+amplitudes and variances from its own generator, so no seed pairs the two).
+
+Modules with **no** VTK equivalent: `heat/*` beyond the graph-distance bound, `tangent_space`,
+`homology`, `energies`, `parametrization` beyond `delaunay_2d`, `texture`, `linalg`, `array`,
+`grouping`, `geodesic_walk`, `convex`, `halfedge` and `visibility` (`silhouette` is absent from all
+142 filter names — it is vedo's, not pyvista's). Structurally out of scope: every `pyvista.core`
+dataset *type* that is not a surface (`ImageData`, `RectilinearGrid`, `StructuredGrid`,
+`UnstructuredGrid`, `MultiBlock`, `Table`), `delaunay_3d` and everything downstream, `streamlines`,
+and all of `pyvista.plotting`.
 
 ### potpourri3d
 

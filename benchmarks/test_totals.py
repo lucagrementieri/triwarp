@@ -83,7 +83,7 @@ def test_surface_centroid(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="moments")
-@pytest.mark.benchlibs("triwarp", "igl", "trimesh")
+@pytest.mark.benchlibs("triwarp", "igl", "trimesh", "pyvista")
 def test_moments(bench_case: BenchCase) -> None:
     """
     Volume, centre of mass and inertia tensor: ten ``float64`` sums over the faces.
@@ -96,6 +96,11 @@ def test_moments(bench_case: BenchCase) -> None:
     ``igl.moments`` returns the first moment un-normalised and the inertia already about the centre
     of mass; ``trimesh``'s ``mass_properties`` computes the same three from the same integrals on
     the host. Both are timed on the whole call, since neither exposes the integrals separately.
+
+    **pyvista answers the volume alone**, so its row does strictly less: ``PolyData.volume`` is the
+    same divergence integral over the faces with no centre of mass and no inertia tensor, one
+    readback rather than four. Unlike open3d's it does *not* validate first, which is what makes it
+    safe to time here at all.
 
     There is no open3d row, measured rather than assumed: ``get_volume`` validates before it
     integrates, and the validation is the same brute-force ``IsWatertight`` composition its
@@ -118,6 +123,10 @@ def test_moments(bench_case: BenchCase) -> None:
     the number was. A caller wanting only the volume should still call
     [`volume`][triwarp.totals.volume], which pays one crossing.
     """
+    if bench_case.kind == "pyvista":
+        mesh_pv = bench_case.mesh_pv
+        assert np.isfinite(bench_case.run(lambda: float(mesh_pv.volume)))
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         volume, _center, inertia = bench_case.run(lambda: tw.totals.moments(vertices, faces))

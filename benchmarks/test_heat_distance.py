@@ -162,6 +162,24 @@ def _run_case(bench_case: BenchCase, *, amortized: bool = False) -> None:
     docstring for why both are reported.
     """
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pyvista":
+        # VTK's geodesic is Dijkstra over mesh *edges*, so it answers a different (and exactly
+        # solvable) question -- an upper bound on the geodesic rather than the heat method's
+        # smoothed approximation of it, which tests/test_heat_distance.py asserts. It has nothing
+        # to amortize: the path search is the whole call.
+        if amortized:
+            pytest.skip("Dijkstra has no reusable factorization to hoist out of the timed region")
+        # ``skip_larger_than`` is a no-op on the synthetic feature meshes, so the cap is by name,
+        # as igl's is in the exact-geodesic row below.
+        if bench_case.mesh_name == "sphere_large":
+            pytest.skip("vtkDijkstra is a serial priority-queue walk: capped at sphere_med")
+        mesh_pv = bench_case.mesh_pv
+        target = n_vertices - 1
+        distance_pv = bench_case.run(
+            lambda: float(mesh_pv.geodesic_distance(0, target)), rounds=_ROUNDS
+        )
+        assert np.isfinite(distance_pv)
+        return
     if bench_case.kind == "pymeshlab":
         _run_case_pml(bench_case, amortized=amortized)
         return
@@ -210,10 +228,17 @@ def _run_case(bench_case: BenchCase, *, amortized: bool = False) -> None:
 
 @pytest.mark.benchmark(group="heat_geodesic")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "igl", "potpourri3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "igl", "potpourri3d", "pymeshlab", "pyvista")
 @pytest.mark.parametrize("setup", ["full", "amortized"])
 def test_heat_geodesic(bench_case: BenchCase, setup: str) -> None:
-    """Two float64 CG solves plus the gradient normalization, over the clean size sweep."""
+    """
+    Two float64 CG solves plus the gradient normalization, over the clean size sweep.
+
+    pyvista's row is the odd one out and is here as the bound rather than as a race: VTK computes
+    the exact shortest path along *edges* to **one** target where every other row returns the whole
+    field, so it does far less work and answers a different question. It is the class-C oracle for
+    this group (``tests/test_heat_distance.py``), which is why it is timed at all.
+    """
     _run_case(bench_case, amortized=setup == "amortized")
 
 

@@ -68,7 +68,7 @@ def test_boundary_loops(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="boundary_edges")
 @pytest.mark.benchaxis("loops")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pymeshlab", "pyvista")
 def test_boundary_edges(bench_case: BenchCase) -> None:
     """
     The unordered predecessor of ``boundary_loops``: the edge sort without the ranking.
@@ -83,6 +83,21 @@ def test_boundary_edges(bench_case: BenchCase) -> None:
     returns, which is strictly more than triwarp's two columns. It is the right row for this group
     and not for ``boundary_loops``, where ``igl.boundary_loop`` returns only the longest loop.
     """
+    if bench_case.kind == "pyvista":
+        # ``extract_feature_edges`` with only the boundary class on -- the same find-the-boundary
+        # pass, returning a line-cell PolyData. Its ``n_open_edges`` shortcut is *not* this
+        # quantity: it counts non-manifold edges too (see tests/test_boundary.py).
+        mesh_pv = bench_case.mesh_pv
+        edges_pv = bench_case.run(
+            lambda: mesh_pv.extract_feature_edges(
+                boundary_edges=True,
+                feature_edges=False,
+                non_manifold_edges=False,
+                manifold_edges=False,
+            )
+        )
+        assert edges_pv.n_cells >= 0
+        return
     if bench_case.kind == "igl":
         faces_np = bench_case.faces_np
         edges_igl, _face_igl, _corner_igl = bench_case.run(lambda: igl.boundary_facets(faces_np))

@@ -8,11 +8,12 @@ import igl
 import numpy as np
 import open3d as o3d
 import pytest
+import pyvista as pv
 import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import trimesh_to_open3d
+from tests.conversions import trimesh_to_open3d, trimesh_to_pyvista
 
 _MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
 
@@ -69,6 +70,38 @@ def test_aabb_bounds_matches_trimesh_open3d_and_igl(
     assert faces_igl.shape == (12, 3), "and the 12 triangles of its hull"
     bounds_igl = np.stack([corners_igl.min(axis=0), corners_igl.max(axis=0)])
     assert np.allclose(bounds_wp, bounds_igl, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parity("aabb_bounds", "pyvista")
+@pytest.mark.parity("enclosing_diagonal", "pyvista")
+def test_aabb_bounds_and_diagonal_match_pyvista(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A on both, from the same VTK pair: ``DataSet.bounds`` and ``DataSet.length``.
+
+    One named transform, and it is a layout rather than a value: pyvista returns the box
+    **interleaved per axis** as ``(xmin, xmax, ymin, ymax, zmin, zmax)`` where every other reference
+    in this module returns two corners, so it is reshaped to ``(3, 2)`` and transposed. Reading it
+    as two corners without that step gives a plausible-looking box that is wrong on any mesh whose
+    extents differ.
+
+    **``DataSet.center`` is not a centroid** and is deliberately not compared here: it is the bbox
+    midpoint, so it belongs to this quantity and not to ``totals.surface_centroid``.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh_pv = trimesh_to_pyvista(mesh_tm)
+
+    lower_wp, upper_wp = tw.bounds.aabb_bounds(mesh_wp.points)
+    bounds_pv = np.asarray(mesh_pv.bounds).reshape(3, 2).T
+    assert np.allclose(_bounds_np(lower_wp, upper_wp), bounds_pv, rtol=1e-5, atol=1e-5)
+
+    assert np.isclose(
+        tw.bounds.enclosing_diagonal(mesh_wp.points), float(mesh_pv.length), rtol=1e-5, atol=1e-5
+    )
+    # The bbox midpoint, which is what pyvista's ``center`` is -- not the surface centroid.
+    assert np.allclose(np.asarray(mesh_pv.center), bounds_pv.mean(axis=0), rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("mesh_name", _MESHES)
@@ -365,6 +398,47 @@ def test_oriented_bounding_box_agrees_with_trimesh_hull_search(
     assert np.isclose(
         volume_wp, _achieved_loss(points_np, _frame_np(rotation_wp), "volume"), rtol=1e-5
     )
+
+
+@pytest.mark.parametrize("mesh_name", _MESHES)
+@pytest.mark.parity("oriented_bounding_box", "pyvista")
+def test_oriented_bounding_box_beats_the_pyvista_pca_box(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class C, and the one reference in this module that triwarp's search should *dominate*.
+
+    VTK's ``oriented_bounding_box`` is PCA of the **points** (not of the hull, as open3d's
+    ``get_oriented_bounding_box`` is), so it minimizes nothing and there is no correspondence
+    between the two frames -- box volume is the derived scalar, as in the trimesh and open3d tests
+    above.
+
+    Unlike those two the relation is one-sided by construction: a search over ``SO(3)`` cannot lose
+    to a single fixed orientation by more than its own sampling error. Measured ``volume_wp /
+    volume_pv`` refined at 32 768 candidates: **1.00001 (icosahedron), 1.00015 (cave_cube), 0.9428
+    (hemisphere), 0.8353 (half_torus)** -- so triwarp is up to 17% tighter and never more than 0.02%
+    looser, and the ``1.02`` ceiling clears the worst reading by 130x on that side. The floor is a
+    sanity bound rather than a tight one: PCA is not arbitrarily bad on these shapes.
+
+    Bug class excluded: a search that does not search. Mutation probe -- the axis-aligned box
+    (``rotations=1, refine_iterations=0``, what a scored-nothing search returns) reads **1.65x to
+    5.37x** pyvista's volume on these same clouds, breaking the ceiling by 80x to 260x.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    points_np, points_wp = _tilted_cloud(mesh_tm, mesh_wp.device)
+
+    volume_pv = float(pv.PolyData(points_np).oriented_bounding_box(as_composite=False).volume)
+    assert volume_pv > 0.0, "the reference produced a box before it is compared to"
+
+    _rotation_wp, lower_wp, upper_wp = tw.bounds.oriented_bounding_box(points_wp, 32768)
+    volume_wp = float(np.prod(np.ptp(_bounds_np(lower_wp, upper_wp), axis=0)))
+    assert volume_pv * 0.75 <= volume_wp <= volume_pv * 1.02
+
+    # The axis-aligned box is what a search that scored nothing would return, and it fails.
+    _rotation_np, lower_np, upper_np = tw.bounds.oriented_bounding_box(
+        points_wp, 1, refine_iterations=0
+    )
+    assert float(np.prod(np.ptp(_bounds_np(lower_np, upper_np), axis=0))) > volume_pv * 1.02
 
 
 @pytest.mark.parametrize("mesh_name", _MESHES)

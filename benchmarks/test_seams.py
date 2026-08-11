@@ -87,9 +87,29 @@ def _cut_edges(bench_case: BenchCase, fraction: float) -> twt.Array2dInt32:
 
 
 @pytest.mark.benchmark(group="crease_edges")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "pymeshlab", "pyvista")
 def test_crease_edges(bench_case: BenchCase) -> None:
-    """Face adjacency plus a dihedral threshold: the cheap half of the seam workflow."""
+    """
+    Face adjacency plus a dihedral threshold: the cheap half of the seam workflow.
+
+    VTK's ``extract_feature_edges`` is the same threshold; the three other edge classes it can emit
+    are switched off so it does the same work, and it returns the edges as a line-cell ``PolyData``
+    rather than as a selection.
+    """
+    if bench_case.kind == "pyvista":
+        skip_larger_than(bench_case, "bunny", "vtkFeatureEdges is a single-threaded edge walk")
+        mesh_pv = bench_case.mesh_pv
+        creases_pv = bench_case.run(
+            lambda: mesh_pv.extract_feature_edges(
+                feature_angle=_CREASE_ANGLE,
+                feature_edges=True,
+                boundary_edges=False,
+                non_manifold_edges=False,
+                manifold_edges=False,
+            )
+        )
+        assert creases_pv.n_cells >= 0
+        return
     if bench_case.kind == "pymeshlab":
         skip_larger_than(bench_case, "bunny", "MeshLab's crease selection is a serial edge walk")
         meshset_pml = bench_case.meshset_pml  # selection-only, so the geometry survives

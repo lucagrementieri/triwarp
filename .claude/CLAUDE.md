@@ -470,6 +470,104 @@ APIs are CPU-only; only `open3d.t` has GPU kernels. Seven hazards, all measured:
   volume on a tilted half_torus); the comparable entry point is
   `get_minimal_oriented_bounding_box`, the hull-face search of trimesh's family.
 
+**pyvista** (VTK 9.6 through its own Python layer, mirrored under `reference/pyvista`) is the
+**VTK** reference and a hard test dependency like the three above — `import pyvista as pv`, never
+`pytest.importorskip`; reference variables take a **`_pv`** suffix. Build meshes with
+`tests.conversions.trimesh_to_pyvista` and clouds with `points_to_pyvista`; one `PolyData` serves
+many comparisons because pyvista caches nothing. `pyvista.core` needs no renderer and every
+comparison in the suite runs headless. Two things about the mirror: it is byte-identical to the
+installed wheel for `core/utilities/parametric_objects.py`, so those algorithms may be read from the
+submodule; but the parametric surfaces' **domains and periodicity are not in pyvista at all** — they
+live in VTK's `vtkParametric*` constructors as `JoinU` / `JoinV` / `TwistU` / `TwistV` and were read
+off the objects at runtime. And a `uv run` whose working directory is inside `reference/pyvista`
+resolves *that* project and builds a second virtualenv (it downloads its own VTK); always invoke
+probes from the repo root. Licence: pyvista is MIT and VTK is BSD-3, so there is no `copyleft/`
+subtree to avoid as there is in `reference/libigl`. Ten hazards, all measured:
+
+- **Float64 in, sometimes float32 out.** Point storage is exact (round-trip error `0.0` on
+  `[1/3, π, e]`) and `regular_faces` is a real `(n, 3)` `int64` array — that is why pyvista, not
+  vedo, is the VTK oracle. But `compute_normals`' `Normals`, `ray_trace`'s hit points,
+  `fit_plane_to_points(return_meta=True)`'s centre and normal and `texture_map_to_*`'s coordinates
+  come back **float32**, while `multi_ray_trace`, `principal_axes`, `curvature` and
+  `compute_implicit_distance` are float64. Check the dtype per row. Where a difference of large
+  numbers is taken (the angle defect), use `atol` and know the residual is **triwarp's** float32
+  vertex buffer: the same comparison measures 5.10e-05 against pyvista's float64 and 5.4e-05
+  against vedo's float32.
+- **Nothing is cached, and one filter of twelve mutates.** Repeat calls recompute (`cell_quality`
+  10.1 / 7.2 ms, `decimate` 210 / 201 ms), so a shared `PolyData` is right — unlike a
+  `pymeshlab.MeshSet`. The exception measured: **`edge_mask` writes `point_ind` into its input.**
+  Every filter with an `inplace` switch defaults to `False`; never pass `True`.
+- **An extraction renumbers its points.** `extract_feature_edges` returns a new `PolyData` carrying
+  only the points its lines touch, in its own order — on a unit box it keeps all 8 and still orders
+  them differently, so a comparison that skips the remap fails on a mesh whose *counts* match and
+  reads as a real disagreement. Go through `tests.conversions.pyvista_edges_to_indices`.
+  `extract_cells` / `extract_points` / `threshold` / `clip_box` return an `UnstructuredGrid` (index
+  maps in `vtkOriginalPointIds` / `vtkOriginalCellIds`); `split_bodies` / `bounding_box` /
+  `oriented_bounding_box` return a `MultiBlock` unless passed `as_composite=False`; and
+  `remove_points` / `collision` / `ray_trace` / `contour_banded` return **tuples**.
+- **`cell_quality` is 12 usable measures of 28 on triangles, with two naming inversions and one
+  constant.** pyvista's `radius_ratio` is triwarp's `aspect_ratio`; triwarp's `radius_ratio` is its
+  reciprocal; `shape` is triwarp's `mean_ratio` and `aspect_frobenius` is one over it; `condition`
+  duplicates `aspect_frobenius` exactly; `min_angle` / `max_angle` are in **degrees**;
+  `distortion` is a constant **1.0** on ordinary input, so a threshold test on it passes on
+  anything; and the 16 measures that do not apply come back as the `-1.0` null value rather than
+  raising. `tests/test_triangles.py` carries the decoding.
+- **`is_manifold` is `n_open_edges == 0`, and `n_open_edges` counts boundary *plus* non-manifold
+  edges.** So `is_manifold` maps to `is_edge_manifold(allow_boundary_edges=False)` and the *count*
+  does not map to `boundary_edges`: on three faces sharing one edge it reads **7** where triwarp
+  counts 6 boundary edges. Likewise **`DataSet.center` is the bounding-box centre**, not a
+  centroid, and `bounding_sphere` returns `(radius, center)` — radius first — and is a genuine
+  near-minimal sphere (`vtkCell::ComputeBoundingSphere`, square-rooted), not the sphere about the
+  AABB centre; the two coincide on any centrally symmetric mesh, which is how the wrong reading
+  survived three fixtures, and differ by 11.8% on a hemisphere.
+- **`curvature('maximum')` / `('minimum')` are algebra, not estimation** — measured *exactly*
+  `H ± √(H² − K)` from VTK's own Gauss and mean curvature, max abs difference **0.0** in float64,
+  and complex on the 300 of 642 icosphere vertices where `H² < K`. They are not an independent
+  principal-curvature implementation. `curvature('gaussian')`, by contrast, is exactly the angle
+  defect over the barycentric lumped area and is a genuine oracle.
+- **Surface operators return surface quantities.** `compute_derivative`'s gradient is the
+  *tangential* one — mean `2/3 · e_x` for `f = x` on the unit sphere, which triwarp's
+  `face_gradients` reproduces to 1.8e-07 after `average_onto_vertices` — and it stays on the
+  **points** for a point-data field even with `preference='cell'`. Correct for a 2-manifold; it
+  looks like a bug if read as 3-D.
+- **Both smoothers are different algorithms, not different tunings.** `smooth` moves each vertex
+  along its incident edge directions under VTK's own convergence test, so it diverges with the
+  iteration count against a fixed assembled operator (0.103 / 0.363 / 0.581 at 1 / 5 / 10 at
+  `relaxation_factor=1.0`); `smooth_taubin` is the windowed-sinc filter, parameterized by a
+  `pass_band` it maps to its own weights, and it warns *"An optimal offset for the smoothing filter
+  could not be found"* on ordinary input (0.835 at one iteration, then 6.5e-03 / 2.6e-02). Its
+  iteration count is in lambda-mu **pairs**, like MeshLab's. Both are D2 exemptions.
+- **Several answers are empty, constant or unchanged rather than wrong, so assert non-vacuity
+  first.** `clip_surface(pv.Sphere(radius=0.6))` returns **0 cells** on `icosphere(3)`;
+  `extract_values(0.010, scalars='area')` returns 0 cells (it matches values *exactly* — a range is
+  `ranges=`); `edge_mask(30)` is all-`False` on a smooth sphere (use a box);
+  `integrate_data` of a symmetric point field reads −1.2e-15; `validate_mesh().coincident_points`
+  is **empty** on ten exactly duplicated vertices (`clean` is the dedup oracle, and its
+  `zero_size` — not `degenerate_faces` — is where a zero-area triangle lands);
+  `lines_from_points` gives one two-point line cell per segment rather than one polyline, so
+  `compute_arc_length` restarts every segment and `decimate_polyline` is a no-op at every
+  reduction; `tube` / `ribbon` emit triangle **strips** (`n_faces == 0` — `.triangulate()` first);
+  and `extrude(capping=True)` leaves 16 open edges.
+- **Where the reference put the answer, and four deprecated names.** `align(return_matrix=True)`
+  returns `(aligned_mesh, 4×4 matrix)` and *does* move the points (unlike MeshLab, which writes a
+  layer transform); `geodesic` puts the ordered path in `vtkOriginalPointIds` and its Euclidean
+  length equals `geodesic_distance` to 1e-8; `sample` marks misses with `vtkValidPointMask` *and* a
+  `vtkGhostType` array; `voxelize_binary_mask` writes a **point** array named `mask` on a
+  cell-centred grid, so it is *solid* and its set is contained in triwarp's `mode="solid"` answer
+  rather than equal to it. Deprecated in 0.48.4: module-level `pv.voxelize` / `pv.voxelize_volume`
+  (a hard `DeprecationError`), `select_enclosed_points` (→ `select_interior_points`, and the array
+  name is now lowercase `selected_points`), `extract_geometry` (→ `extract_surface(algorithm=None)`)
+  and `n_faces_strict` (→ `n_faces`).
+
+Two more, for the parametric surfaces specifically: **they arrive open and `clean` defaults
+differently per surface** — `surface_from_para(clean=False)` is the underlying default and at that
+setting every one of the 21 has 156 or 236 boundary edges (a raw `ParametricMobius()` is a disk),
+while pyvista overrides it to `clean=True` on 9 of them, so `klein` arrives welded and `mobius` does
+not. **Always pass `clean=True` explicitly.** And **`klein` is not a Klein bottle** as VTK
+parameterizes it: it welds to two boundary loops and reads *orientable*, so only `figure8_klein` is
+the closed non-orientable χ = 0 surface. A comparison reaching for `klein` expecting
+non-orientability is testing nothing.
+
 ### Mesh fixtures (prefer over inline construction)
 
 Reuse shared mesh fixtures from `tests/conftest.py` instead of building meshes in each test. Fixtures return `(mesh_tm: tm.Trimesh, mesh_wp: wp.Mesh)` via `tests.conversions.trimesh_to_warp`.
@@ -548,13 +646,18 @@ local edge differently, `triwarp_opp == (igl_opp + 1) % 3`). So: assert the refe
 non-empty answer, or assert its expected count, before comparing to it — and treat "this function is
 already the oracle in tests/" as no evidence at all that the comparison is live.
 
-Reuse `tests/comparisons.py` (`lexsort_rows`, `canonical_winding`, `assert_same_up_to_sign`,
-`assert_cyclic_permutation_equal`, `fraction_within`, `symmetric_chamfer`, `hausdorff_two_sided`)
-and `tests/conversions.py` (`trimesh_to_open3d`, `points_to_open3d`, `open3d_to_trimesh`,
-`trimesh_to_open3d_t`, `trimesh_to_pymeshlab`, `warp_to_pymeshlab`, `points_to_pymeshlab`,
-`faces_igl`) rather than re-rolling either. `open3d` is a hard test dependency like `pymeshlab` and
-`igl` — import it plainly as `import open3d as o3d`, never through `pytest.importorskip`; see the
-open3d hazards block above.
+Reuse `tests/comparisons.py` (`lexsort_rows`, `assert_unordered_rows_equal`, `canonical_labels`,
+`same_partition`, `canonical_winding`, `assert_same_up_to_sign`, `assert_cyclic_permutation_equal`,
+`fraction_within`, `symmetric_chamfer`, `hausdorff_two_sided`) and `tests/conversions.py`
+(`trimesh_to_open3d`, `points_to_open3d`, `open3d_to_trimesh`, `trimesh_to_open3d_t`,
+`trimesh_to_pymeshlab`, `warp_to_pymeshlab`, `points_to_pymeshlab`, `trimesh_to_pyvista`,
+`points_to_pyvista`, `pyvista_edges_to_indices`, `warp_to_trimesh`, `faces_igl`) rather than
+re-rolling either. `canonical_labels` is the label-packing transform every component comparison
+needs — triwarp names a component after a representative element, igl and scipy number `0..k-1` in
+their own traversal orders and VTK's `RegionId` numbers them in a third, so only the *partition* is
+shared. `open3d` and `pyvista` are hard test dependencies like `pymeshlab` and `igl` — import them
+plainly as `import open3d as o3d` / `import pyvista as pv`, never through `pytest.importorskip`; see
+their hazard blocks above.
 
 Two measured gotchas worth not rediscovering: MeshLab's `face_normal_matrix()` after
 `compute_normal_per_face()` is the **unnormalised** cross product (magnitude exactly `2 * area`), so

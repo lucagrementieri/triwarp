@@ -87,6 +87,7 @@ import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pyvista as pv
 import trimesh as tm
 import warp as wp
 from conftest import BenchCase, skip_larger_than
@@ -407,10 +408,27 @@ def _soup(bench_case: BenchCase) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]
 
 @pytest.mark.benchmark(group="remove_duplicated_vertices")
 @pytest.mark.benchmeshes("sphere_med")
-@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab", "pyvista")
 @pytest.mark.parametrize("epsilon", _MERGE_EPSILONS, ids=["exact", "eps1e-6"])
 def test_remove_duplicated_vertices(bench_case: BenchCase, epsilon: float) -> None:
-    """Weld an unwelded soup: 245 760 positions down to 40 962, by two different bucketings."""
+    """
+    Weld an unwelded soup: 245 760 positions down to 40 962, by two different bucketings.
+
+    VTK's ``clean`` takes both paths through one call -- ``tolerance`` with ``absolute=True`` is the
+    epsilon form and ``0.0`` the exact one -- and it additionally drops degenerate cells and unused
+    points, so its row does a little more than the weld. The soup is rebuilt inside the timed
+    callable because ``clean`` returns a new mesh from an input this benchmark does not otherwise
+    hold as a ``PolyData``.
+    """
+    if bench_case.kind == "pyvista":
+        soup_np = np.ascontiguousarray(bench_case.vertices_np[bench_case.faces_np].reshape(-1, 3))
+        faces_np = np.ascontiguousarray(np.arange(soup_np.shape[0], dtype=np.int32).reshape(-1, 3))
+        soup_pv = pv.PolyData.from_regular_faces(soup_np, faces_np)
+        welded_pv = bench_case.run(
+            lambda: soup_pv.clean(point_merging=True, tolerance=epsilon, absolute=True)
+        )
+        assert 0 < welded_pv.n_points <= soup_np.shape[0]
+        return
     if bench_case.kind == "pymeshlab":
         # The one group whose epsilon sweep maps one-for-one: MeshLab has a filter per path.
         soup_np = np.ascontiguousarray(bench_case.vertices_np[bench_case.faces_np].reshape(-1, 3))

@@ -11,7 +11,12 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from tests.comparisons import lexsort_rows
-from tests.conversions import trimesh_to_pymeshlab, wedge_uv_to_pymeshlab
+from tests.conversions import (
+    pyvista_edges_to_indices,
+    trimesh_to_pymeshlab,
+    trimesh_to_pyvista,
+    wedge_uv_to_pymeshlab,
+)
 
 
 def _upload(mesh_tm: tm.Trimesh, device: str):
@@ -89,6 +94,41 @@ def test_crease_edges_matches_pymeshlab(hemisphere: tuple[tm.Trimesh, wp.Mesh]) 
 
     creases_np = tw.seams.crease_edges(mesh_wp.points, mesh_wp.indices, angle=angle).numpy()
     assert set(np.unique(creases_np).tolist()) == set(selected_pml.tolist())
+
+
+@pytest.mark.parity("crease_edges", "pyvista")
+def test_crease_edges_matches_pyvista(device: str) -> None:
+    """
+    Class B: ``extract_feature_edges`` is the same dihedral threshold, as line cells.
+
+    Two named transforms, both exact. VTK returns a **new** ``PolyData`` whose points are its own
+    renumbered subset, so its lines go through
+    [`tests.conversions.pyvista_edges_to_indices`][] first; and the three other edge classes
+    (``boundary_edges``, ``non_manifold_edges``, ``manifold_edges``) have to be switched **off**,
+    because VTK's default emits all four and triwarp's ``include_boundary=False`` emits only the
+    crease.
+
+    The fixture is a **box**, not a curved mesh: on a smooth sphere the reference finds nothing at
+    ``30`` degrees, so the comparison would be ``[] == []`` -- the ``test_ears`` failure. A box has
+    exactly 12 feature edges, which is asserted before the sets are compared.
+    """
+    mesh_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
+    vertices_wp, faces_wp = _upload(mesh_tm, device)
+
+    edges_pv = pyvista_edges_to_indices(
+        trimesh_to_pyvista(mesh_tm).extract_feature_edges(
+            feature_angle=30.0,
+            feature_edges=True,
+            boundary_edges=False,
+            non_manifold_edges=False,
+            manifold_edges=False,
+        ),
+        mesh_tm.vertices,
+    )
+    assert len(edges_pv) == 12  # non-vacuous, and the count a cube's creases must have
+
+    creases_wp = tw.seams.crease_edges(vertices_wp, faces_wp, angle=30.0)
+    assert np.array_equal(lexsort_rows(np.sort(creases_wp.numpy(), axis=1)), lexsort_rows(edges_pv))
 
 
 def test_crease_edges_include_boundary(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:

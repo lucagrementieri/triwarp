@@ -12,7 +12,7 @@ import warp as wp
 
 import triwarp as tw
 from tests.comparisons import assert_unordered_rows_equal, lexsort_rows
-from tests.conversions import trimesh_to_pymeshlab
+from tests.conversions import pyvista_edges_to_indices, trimesh_to_pymeshlab, trimesh_to_pyvista
 
 _MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
 
@@ -234,6 +234,29 @@ def test_edges_unique_and_inverse_match_igl(request: pytest.FixtureRequest, mesh
     resolved_wp = np.sort(unique_edges_np[inverse_wp.numpy()], axis=1)
     resolved_igl = np.sort(unique_edges_igl[inverse_igl][order_igl], axis=1)
     assert np.array_equal(resolved_wp, resolved_igl)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("edges_unique", "pyvista")
+def test_edges_unique_matches_pyvista(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B: ``extract_all_edges`` returns the same set as a line-cell ``PolyData``.
+
+    The named transform is only the ordering -- VTK is free to emit its line cells in any order, so
+    each row is sorted and the rows lexsorted, the same treatment igl's ``uE`` gets above. It is
+    genuinely the *unique* undirected set on VTK's side too, not the ``3 * n_faces`` directed one:
+    measured 30 = 30 on the icosahedron, 264 = 264 on the hemisphere, 18 = 18 on a box, with the
+    sets equal element for element in each case.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    edges_pv = pyvista_edges_to_indices(
+        trimesh_to_pyvista(mesh_tm).extract_all_edges(), mesh_tm.vertices
+    )
+
+    unique_edges_wp, _inverse_wp = tw.edges.edges_unique(mesh_wp.indices)
+
+    assert len(edges_pv) > 0  # non-vacuous: two empty sets would compare equal
+    assert_unordered_rows_equal(np.sort(unique_edges_wp.numpy(), axis=1), edges_pv)
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])

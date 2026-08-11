@@ -6,6 +6,7 @@ import pytest
 import warp as wp
 
 import triwarp.reduce as tw_reduce
+from tests.conversions import trimesh_to_pyvista
 
 
 @pytest.mark.parity("min_scalar", "numpy")
@@ -358,7 +359,9 @@ def test_sum_bool_2d_global(device: str) -> None:
         assert got == exp, f"sum global mismatch: got {got}, exp {exp}"
 
 
+@pytest.mark.parity("weighted_sum", "numpy")
 def test_weighted_sum_1d(device: str) -> None:
+    """Class A: ``sum(values * weights)`` against the NumPy expression the benchmark times."""
     rng = np.random.default_rng(42)
     n = 100
     values_np = rng.standard_normal(n, dtype=np.float32)
@@ -369,6 +372,39 @@ def test_weighted_sum_1d(device: str) -> None:
     weights_wp = wp.array(weights_np, dtype=wp.float32, device=device)
     got_wp = tw_reduce.weighted_sum(values_wp, weights_wp)
     assert np.allclose(got_wp, exp_np, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parity("weighted_sum", "pyvista")
+def test_weighted_sum_integrates_a_surface_field(half_torus) -> None:
+    """
+    Class A: ``sum(values * areas)`` is what VTK's ``integrate_data`` computes for a cell array.
+
+    The weights are the triangle areas, so the reduction *is* the surface integral of a piecewise
+    constant field, and VTK reports it as a one-cell grid carrying the integral under the same array
+    name. Measured 8 significant digits on this fixture; the float32 accumulator is the limit.
+
+    The field is deliberately **asymmetric** (the first corner's ``z``, plus an offset so it does
+    not change sign). ``integrate_data`` of a symmetric field on a symmetric fixture reads
+    ``-1.2e-15``
+    -- a comparison against that number passes for any implementation that returns roughly zero, so
+    it would be testing the fixture's symmetry rather than the reduction.
+    """
+    mesh_tm, mesh_wp = half_torus
+    mesh_pv = trimesh_to_pyvista(mesh_tm)
+    areas_np = np.asarray(
+        mesh_pv.compute_cell_sizes(length=False, area=True, volume=False).cell_data["Area"]
+    )
+    values_np = np.ascontiguousarray(mesh_tm.vertices[mesh_tm.faces[:, 0], 2] + 3.0)
+
+    mesh_pv.cell_data["field"] = values_np
+    integral_pv = float(np.asarray(mesh_pv.integrate_data().cell_data["field"])[0])
+    assert abs(integral_pv) > 1.0  # non-vacuous: a near-zero integral would pass trivially
+
+    total_wp = tw_reduce.weighted_sum(
+        wp.array(values_np.astype(np.float32), dtype=wp.float32, device=mesh_wp.device),
+        wp.array(areas_np.astype(np.float32), dtype=wp.float32, device=mesh_wp.device),
+    )
+    assert np.isclose(total_wp, integral_pv, rtol=1e-5, atol=1e-5)
 
 
 def test_weighted_sum_length_mismatch_raises(device: str) -> None:

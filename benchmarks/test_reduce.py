@@ -128,6 +128,9 @@ _scalar_cache: dict[tuple[str, str], wp.array[wp.float32]] = {}
 _rows_cache: dict[tuple[str, str], twt.Array2dFloat32] = {}
 _scalar_np_cache: dict[str, np.ndarray] = {}
 _rows_np_cache: dict[str, np.ndarray] = {}
+_face_cache: dict[tuple[str, str, str], wp.array[wp.float32]] = {}
+_face_value_np_cache: dict[str, np.ndarray] = {}
+_face_area_np_cache: dict[str, np.ndarray] = {}
 
 
 def _scalars_np(bench_case: BenchCase) -> np.ndarray:
@@ -146,6 +149,48 @@ def _rows_np(bench_case: BenchCase) -> np.ndarray:
             bench_case.vertices_np, dtype=np.float32
         )
     return _rows_np_cache[bench_case.mesh_name]
+
+
+def _face_values_np(bench_case: BenchCase) -> np.ndarray:
+    """``(n_faces,)`` float32 host scalars — the first corner's ``z``, one value per face."""
+    if bench_case.mesh_name not in _face_value_np_cache:
+        _face_value_np_cache[bench_case.mesh_name] = np.ascontiguousarray(
+            bench_case.vertices_np[bench_case.faces_np[:, 0], 2], dtype=np.float32
+        )
+    return _face_value_np_cache[bench_case.mesh_name]
+
+
+def _face_areas_np(bench_case: BenchCase) -> np.ndarray:
+    """``(n_faces,)`` float32 triangle areas — the integration weights, built once per mesh."""
+    if bench_case.mesh_name not in _face_area_np_cache:
+        triangles_np = bench_case.vertices_np[bench_case.faces_np]
+        crosses_np = np.cross(
+            triangles_np[:, 1] - triangles_np[:, 0], triangles_np[:, 2] - triangles_np[:, 0]
+        )
+        _face_area_np_cache[bench_case.mesh_name] = np.ascontiguousarray(
+            0.5 * np.linalg.norm(crosses_np, axis=1), dtype=np.float32
+        )
+    return _face_area_np_cache[bench_case.mesh_name]
+
+
+def _face_values_wp(bench_case: BenchCase) -> wp.array[wp.float32]:
+    """``(n_faces,)`` float32 per-face scalars on device — the same values as the host copy."""
+    key = ("values", bench_case.mesh_name, str(bench_case.device))
+    if key not in _face_cache:
+        _face_cache[key] = wp.array(
+            _face_values_np(bench_case), dtype=wp.float32, device=bench_case.device
+        )
+    return _face_cache[key]
+
+
+def _face_areas_wp(bench_case: BenchCase) -> wp.array[wp.float32]:
+    """``(n_faces,)`` float32 areas on device — an *input* to the weighted reduction."""
+    key = ("areas", bench_case.mesh_name, str(bench_case.device))
+    if key not in _face_cache:
+        _face_cache[key] = wp.array(
+            _face_areas_np(bench_case), dtype=wp.float32, device=bench_case.device
+        )
+    return _face_cache[key]
 
 
 def _scalars_wp(bench_case: BenchCase) -> wp.array[wp.float32]:
@@ -208,6 +253,38 @@ def test_mean_vec3(bench_case: BenchCase) -> None:
     vertices = bench_case.vertices_wp
     centroid = bench_case.run(lambda: tw.reduce.mean(vertices))
     assert len(centroid) == 3
+
+
+@pytest.mark.benchmark(group="weighted_sum")
+@pytest.mark.benchlibs("triwarp", "numpy", "pyvista")
+def test_weighted_sum(bench_case: BenchCase) -> None:
+    """
+    ``sum(values * weights)`` in one pass: the reduction every surface integral bottoms out in.
+
+    The weights here are the per-face areas and the values a per-face scalar, which is exactly what
+    VTK's ``integrate_data`` computes for a cell array -- measured equal to 8 significant digits
+    (``tests/test_reduce.py``). Both are *inputs*: the areas are built once per mesh outside the
+    timed region, on both sides, so the row measures the reduction and not a cross-product pass.
+
+    The pyvista row does more than the other two by construction -- ``integrate_data`` integrates
+    every array on the mesh and returns a one-cell ``UnstructuredGrid`` -- and it is the whole
+    reason this group exists rather than folding into ``sum_scalar``: nothing else in the reference
+    set exposes a weighted reduction at all.
+    """
+    if bench_case.kind == "pyvista":
+        mesh_pv = bench_case.mesh_pv
+        mesh_pv.cell_data["field"] = _face_values_np(bench_case).astype(np.float64)
+        integrated_pv = bench_case.run(mesh_pv.integrate_data)
+        assert np.isfinite(np.asarray(integrated_pv.cell_data["field"])[0])
+        return
+    if bench_case.kind == "numpy":
+        values_np, areas_np = _face_values_np(bench_case), _face_areas_np(bench_case)
+        total_np = bench_case.run(lambda: float((values_np * areas_np).sum()))
+        assert np.isfinite(total_np)
+        return
+    values, areas = _face_values_wp(bench_case), _face_areas_wp(bench_case)
+    total = bench_case.run(lambda: tw.reduce.weighted_sum(values, areas))
+    assert np.isfinite(total)
 
 
 @pytest.mark.benchmark(group="minmax_scalar")

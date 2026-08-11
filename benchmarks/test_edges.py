@@ -95,8 +95,15 @@ def test_edges_face(bench_case) -> None:
 
 
 @pytest.mark.benchmark(group="edges_unique")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pyvista")
 def test_edges_unique(bench_case) -> None:
+    if bench_case.kind == "pyvista":
+        # ``extract_all_edges`` returns the same unique undirected set, wrapped in a line-cell
+        # PolyData -- so its row carries the container build as well as the grouping.
+        mesh_pv = bench_case.mesh_pv
+        edges_pv = bench_case.run(mesh_pv.extract_all_edges)
+        assert edges_pv.n_cells > 0
+        return
     if bench_case.kind == "triwarp":
         faces, nv = bench_case.faces_wp, bench_case.n_vertices
         unique_edges, _ = bench_case.run(lambda: tw.edges.edges_unique(faces, n_vertices=nv))

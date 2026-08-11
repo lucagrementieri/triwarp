@@ -532,11 +532,24 @@ _QUADRIC_RATIOS = [0.5, 0.1]
 
 @pytest.mark.benchmark(group="quadric_decimate")
 @pytest.mark.benchaxis("quality")
-@pytest.mark.benchlibs("triwarp", "igl", "open3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "igl", "open3d", "pymeshlab", "pyvista")
 @pytest.mark.parametrize("target_ratio", _QUADRIC_RATIOS)
 def test_quadric_decimate(bench_case: BenchCase, target_ratio: float) -> None:
-    """Greedy quadric collapses to a face budget: batched independent sets against three queues."""
+    """
+    Greedy quadric collapses to a face budget: batched independent sets against four queues.
+
+    ``PolyData.decimate`` is ``vtkDecimatePro``, and it is the **best** of the four references on
+    output quality rather than merely another queue -- 1.14-1.53x less surface deviation than
+    triwarp at the same face count on ``icosphere(4)`` (``tests/test_remesh.py`` carries the
+    table). It takes a *reduction fraction* where the other four take a face count, so the ratio is
+    converted rather than the count passed.
+    """
     target_faces = max(4, int(target_ratio * bench_case.n_faces))
+    if bench_case.kind == "pyvista":
+        mesh_pv = bench_case.mesh_pv
+        decimated_pv = bench_case.run(lambda: mesh_pv.decimate(1.0 - target_ratio), rounds=_ROUNDS)
+        assert decimated_pv.n_faces > 0
+        return
     if bench_case.kind == "pymeshlab":
         # ``autoclean=True`` (the default) deletes unreferenced vertices, so this filter is not
         # idempotent even in geometry and the MeshSet has to be rebuilt inside the timed callable.

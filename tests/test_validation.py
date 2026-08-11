@@ -9,7 +9,7 @@ import warp as wp
 
 import triwarp as tw
 from tests.comparisons import canonical_winding
-from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab
+from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab, trimesh_to_pyvista
 
 CLOSED_MESHES = ["icosahedron", "cave_cube"]
 OPEN_MESHES = ["hemisphere", "half_torus"]
@@ -241,6 +241,52 @@ def test_is_edge_manifold_matches_open3d(
     assert manifold_wp == manifold_o3d
     if not allow_boundary_edges:
         assert manifold_o3d == (mesh_name in CLOSED_MESHES)
+
+
+@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parity("is_edge_manifold", "pyvista")
+def test_is_edge_manifold_matches_pyvista(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A at ``allow_boundary_edges=False``, which is the only setting VTK has.
+
+    ``PolyData.is_manifold`` is ``n_open_edges == 0``, and ``n_open_edges`` is ``vtkFeatureEdges``
+    with boundary **and** non-manifold edges on -- so it rejects a boundary edge exactly as
+    triwarp's ``False`` setting does and there is nothing to compare at ``True``. The fixtures span
+    closed and open meshes, so both answers appear rather than the assert riding on a constant.
+
+    The *count* does not map even though the predicate does: on three faces sharing one edge
+    ``n_open_edges`` reads 7 where triwarp counts 6 boundary edges plus 1 non-manifold edge, which
+    is why ``tests/test_boundary.py`` compares against ``extract_feature_edges`` instead. The fan
+    case below pins the predicate on that same input.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh_pv = trimesh_to_pyvista(mesh_tm)
+
+    manifold_wp = tw.validation.is_edge_manifold(mesh_wp.indices, allow_boundary_edges=False)
+    assert manifold_wp == bool(mesh_pv.is_manifold)
+    assert manifold_wp == (mesh_name in CLOSED_MESHES)
+    assert (mesh_pv.n_open_edges == 0) == manifold_wp
+
+
+def test_is_edge_manifold_nonmanifold_fan_matches_pyvista(device: str) -> None:
+    """
+    Three faces on one edge: both libraries say non-manifold, and the counts still disagree.
+
+    The second assert is the one worth keeping -- it pins ``n_open_edges == 7`` against triwarp's 6
+    boundary edges on the same mesh, so the "do not map the count" note in
+    ``test_is_edge_manifold_matches_pyvista`` is asserted rather than merely written down.
+    """
+    vertices_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    faces_np = np.array([[0, 1, 2], [0, 3, 1], [0, 1, 4]])
+    vertices_wp, faces_wp = _mesh_to_wp(vertices_np, faces_np, device)
+    mesh_pv = trimesh_to_pyvista(tm.Trimesh(vertices_np, faces_np, process=False))
+
+    assert tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=False) is False
+    assert bool(mesh_pv.is_manifold) is False
+    assert int(mesh_pv.n_open_edges) == 7
+    assert int(tw.boundary.boundary_edges(vertices_wp, faces_wp).shape[0]) == 6
 
 
 def test_is_edge_manifold_nonmanifold_fan_matches_open3d(device: str) -> None:

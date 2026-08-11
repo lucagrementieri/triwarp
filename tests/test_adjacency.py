@@ -5,10 +5,12 @@ from __future__ import annotations
 import igl
 import numpy as np
 import pytest
+import trimesh as tm
 import warp as wp
 
 import triwarp as tw
 from tests.comparisons import lexsort_rows, same_partition
+from tests.conversions import trimesh_to_pyvista
 
 _MESHES = ["icosahedron", "half_torus", "hemisphere"]
 
@@ -252,6 +254,46 @@ def test_face_connected_component_labels_matches_igl(
 
     assert n_doubled_igl == 2 * n_components_igl
     assert same_partition(labels_doubled_wp.numpy(), np.asarray(labels_doubled_igl).ravel())
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
+@pytest.mark.parity("face_connected_component_labels", "pyvista")
+def test_face_connected_component_labels_matches_pyvista(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B, the same relabelling as the igl row: VTK's ``RegionId`` names the components its way.
+
+    ``connectivity('all')`` writes a ``RegionId`` **cell** array numbered ``0..k-1``, and the
+    numbering is neither triwarp's representative-face id nor igl's traversal order -- measured on
+    two disjoint spheres it labels the *first* component ``1``, so even a pack-by-first-appearance
+    comparison fails and only the partition is shared. That is what
+    [`same_partition`][tests.comparisons.same_partition] compares; pyvista ships its own
+    ``pack_labels`` for the same reason.
+
+    The two-copy case is the non-vacuous half: on a single-component fixture any labelling at all
+    induces the same trivial partition.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_wp = mesh_wp.indices
+
+    labels_pv = np.asarray(trimesh_to_pyvista(mesh_tm).connectivity("all").cell_data["RegionId"])
+    labels_wp = tw.adjacency.face_connected_component_labels(faces_wp)
+    assert same_partition(labels_wp.numpy(), labels_pv)
+
+    doubled_tm = tm.util.concatenate([mesh_tm, mesh_tm.copy().apply_translation([10.0, 0.0, 0.0])])
+    doubled_wp = wp.array(
+        np.ascontiguousarray(doubled_tm.faces.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=faces_wp.device,
+    )
+    labels_doubled_pv = np.asarray(
+        trimesh_to_pyvista(doubled_tm).connectivity("all").cell_data["RegionId"]
+    )
+    labels_doubled_wp = tw.adjacency.face_connected_component_labels(doubled_wp)
+
+    assert np.unique(labels_doubled_pv).shape[0] == 2
+    assert same_partition(labels_doubled_wp.numpy(), labels_doubled_pv)
 
 
 def test_face_adjacency_unshared_duplicate_faces(device: str) -> None:

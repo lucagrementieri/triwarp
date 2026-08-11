@@ -34,7 +34,7 @@ import warp as wp
 
 import triwarp as tw
 from tests.comparisons import lexsort_rows
-from tests.conversions import trimesh_to_open3d
+from tests.conversions import trimesh_to_open3d, trimesh_to_pyvista
 
 # A translation with no round coordinate, so no vertex of any fixture lands on a cell plane.
 _OFFSET = np.array([0.137, -0.219, 0.331])
@@ -104,6 +104,54 @@ def test_voxelize_mesh_matches_open3d(sphere, device: str):
 
     assert cells_o3d.shape[0] > 0
     assert np.array_equal(lexsort_rows(tw.voxels.cells(grid).numpy()), lexsort_rows(cells_o3d))
+
+
+@pytest.mark.parity("voxelize_mesh", "pyvista")
+def test_voxelize_mesh_solid_contains_the_pyvista_mask(sphere, device: str):
+    """
+    Class B, and the named transform is the **sample convention**, which is the whole finding.
+
+    ``voxelize_binary_mask`` is *solid*, so it maps to ``mode="solid"`` and not to the default
+    surface mode -- measured 17 256 filled of 32 768 on a 32-cube against triwarp's 4 496 surface
+    cells. But it is not the same set even then: VTK writes a **point** mask, testing each lattice
+    *point* against the closed surface, while triwarp accepts a **cell** the closed triangle meets.
+    So VTK's set is contained in triwarp's and the difference is exactly the boundary shell, which
+    is what the asserts below state: **0** cells are pyvista-only, 2 480 are triwarp-only, and every
+    one of those 2 480 is in triwarp's own surface voxelization (of 4 760 surface cells).
+
+    Reading that containment as a disagreement is the trap; a comparison that expected equality
+    would fail by 12.7% of the cells on a correct implementation. The grid is also cell-centred on
+    VTK's side -- origin ``-0.96875`` at spacing ``0.0625`` for a unit sphere -- so triwarp's origin
+    is shifted by half a voxel to put the two lattices in register.
+    """
+    mesh_tm, vertices_wp, faces_wp = sphere
+    dimensions = (32, 32, 32)
+
+    mask_pv = trimesh_to_pyvista(mesh_tm).voxelize_binary_mask(dimensions=dimensions)
+    spacing_np = np.asarray(mask_pv.spacing)
+    origin_np = np.asarray(mask_pv.origin)
+    mask_np = np.asarray(mask_pv.point_data["mask"]).astype(bool).reshape(dimensions, order="F")
+    assert 0 < int(mask_np.sum()) < mask_np.size, "the reference filled some cells, not all"
+
+    origin_wp = wp.vec3(*(origin_np - 0.5 * spacing_np).tolist())
+    solid = tw.voxels.voxelize_mesh(
+        vertices_wp, faces_wp, float(spacing_np[0]), origin=origin_wp, mode="solid"
+    )
+    surface = tw.voxels.voxelize_mesh(vertices_wp, faces_wp, float(spacing_np[0]), origin=origin_wp)
+
+    def dense(grid: wp.Volume) -> np.ndarray:
+        cells_np = tw.voxels.cells(grid).numpy()
+        inside_np = np.all((cells_np >= 0) & (cells_np < np.array(dimensions)), axis=1)
+        occupied_np = np.zeros(dimensions, dtype=bool)
+        kept_np = cells_np[inside_np]
+        occupied_np[kept_np[:, 0], kept_np[:, 1], kept_np[:, 2]] = True
+        return occupied_np
+
+    solid_np, surface_np = dense(solid), dense(surface)
+    assert not (mask_np & ~solid_np).any(), "VTK's point mask must be contained in the solid set"
+    excess_np = solid_np & ~mask_np
+    assert excess_np.any(), "and the two conventions must actually differ, or the row is vacuous"
+    assert not (excess_np & ~surface_np).any(), "every extra cell is a boundary-shell cell"
 
 
 def test_voxelize_mesh_solid_is_sealed(sphere, device: str):

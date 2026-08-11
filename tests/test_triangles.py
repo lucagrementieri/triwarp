@@ -10,7 +10,7 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import faces_igl, trimesh_to_open3d, trimesh_to_pymeshlab
+from tests.conversions import faces_igl, trimesh_to_open3d, trimesh_to_pymeshlab, trimesh_to_pyvista
 
 
 @pytest.mark.parity("face_normals_and_areas", "trimesh")
@@ -89,6 +89,38 @@ def test_face_normals_matches_open3d(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     assert np.isclose(float(areas_wp.numpy().sum()), mesh_o3d.get_surface_area(), rtol=1e-5)
 
 
+@pytest.mark.parity("face_normals_and_areas", "pyvista")
+def test_face_normals_and_areas_match_pyvista(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A on both halves, from the one reference that answers both -- in two calls.
+
+    VTK splits the cross product across two filters: ``compute_normals`` gives the *unit* cell
+    normal (float32, per this module's dtype note) and ``compute_cell_sizes`` the area. The three
+    ``compute_normals`` flags matter and are passed explicitly: ``consistent_normals`` and
+    ``auto_orient_normals`` would let VTK re-wind the mesh before differentiating it, which would
+    compare triwarp's normals against a *different* orientation, and ``split_vertices`` would change
+    the point count. ``half_torus`` for the varying-area reason the partial-references test gives.
+    """
+    mesh_tm, mesh_wp = half_torus
+    normals_wp, areas_wp = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
+
+    mesh_pv = trimesh_to_pyvista(mesh_tm)
+    normals_pv = mesh_pv.compute_normals(
+        cell_normals=True,
+        point_normals=False,
+        consistent_normals=False,
+        auto_orient_normals=False,
+        split_vertices=False,
+    )
+    assert np.allclose(
+        normals_wp.numpy(), np.asarray(normals_pv.cell_data["Normals"]), rtol=1e-5, atol=1e-5
+    )
+    sizes_pv = mesh_pv.compute_cell_sizes(length=False, area=True, volume=False)
+    assert np.allclose(
+        areas_wp.numpy(), np.asarray(sizes_pv.cell_data["Area"]), rtol=1e-5, atol=1e-5
+    )
+
+
 def test_angles(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = half_torus
     angles_wp = tw.triangles.face_angles(mesh_wp.points, mesh_wp.indices)
@@ -118,6 +150,57 @@ def test_face_quality_against_pymeshlab(
     assert np.allclose(quality_wp.numpy(), quality_pml, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize(
+    ("metric", "measure", "reciprocal"),
+    [
+        ("area", "area", False),
+        ("aspect_ratio", "radius_ratio", False),
+        ("mean_ratio", "shape", False),
+        ("mean_ratio", "aspect_frobenius", True),
+    ],
+)
+@pytest.mark.parity("face_quality", "pyvista")
+def test_face_quality_against_the_verdict_measures(
+    half_torus: tuple[tm.Trimesh, wp.Mesh], metric: str, measure: str, reciprocal: bool
+):
+    """
+    Decode VTK's Verdict measure names onto triwarp's, three class A and one class B.
+
+    The mapping is the trap, not the arithmetic, and the two inversions in it will mislead anyone
+    reading pyvista's docs instead of this table:
+
+    - Verdict's ``radius_ratio`` is ``R / (2 r_in)``, which is triwarp's **aspect_ratio**;
+    - triwarp's own ``radius_ratio`` is its *reciprocal* (asserted below so the inversion is pinned
+      rather than described);
+    - ``shape`` is ``4 sqrt(3) A / (a^2 + b^2 + c^2)``, triwarp's **mean_ratio**;
+    - ``aspect_frobenius`` is one over that -- the class B row, one named reciprocal -- and
+      ``condition`` duplicates it exactly, so it gets no row of its own.
+
+    ``area_max_side`` has no Verdict counterpart at all, and Verdict's ``aspect_ratio``
+    (``max_edge / (2 sqrt(3) r_in)``) has no triwarp counterpart; neither is compared.
+
+    Anti-vacuity, which this comparison is unusually exposed to: of ``cell_quality``'s 28 measures
+    only 12 are defined on a triangle and the other 16 come back as the constant ``-1.0`` null
+    value, while ``distortion`` is a constant ``1.0`` on ordinary input. So the measure is asserted
+    to *vary* across faces before it is compared -- on ``half_torus`` it does, by construction.
+    """
+    mesh_tm, mesh_wp = half_torus
+    quality_pv = np.asarray(trimesh_to_pyvista(mesh_tm).cell_quality(measure).cell_data[measure])
+    # Neither a null (-1.0) nor a constant: both would pass an allclose against a broken port.
+    assert quality_pv.min() > 0.0
+    assert np.ptp(quality_pv) > 1e-3
+
+    quality_wp = tw.triangles.face_quality(mesh_wp.points, mesh_wp.indices, metric=metric)
+    expected_pv = 1.0 / quality_pv if reciprocal else quality_pv
+    assert np.allclose(quality_wp.numpy(), expected_pv, rtol=1e-5, atol=1e-5)
+
+    if measure == "radius_ratio":  # triwarp's like-named metric is the other way up
+        radius_ratio_wp = tw.triangles.face_quality(
+            mesh_wp.points, mesh_wp.indices, metric="radius_ratio"
+        )
+        assert np.allclose(radius_ratio_wp.numpy() * quality_pv, 1.0, rtol=1e-4, atol=1e-4)
+
+
 @pytest.mark.parity("face_angles", "trimesh", "igl")
 def test_face_angles(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     """
@@ -143,6 +226,31 @@ def test_face_angles(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     assert np.allclose(angles_wp.numpy(), angles_igl, rtol=1e-5, atol=1e-5)
     # The row is not merely a permutation: the angle in column j sits at vertex faces[f, j].
     assert np.allclose(angles_wp.numpy().sum(axis=1), np.pi, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parity("face_angles", "pyvista")
+def test_face_angles_extremes_against_pyvista(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class B: VTK gives the two *extremes* only, in **degrees**.
+
+    ``cell_quality('min_angle')`` and ``('max_angle')`` are the same corner angles this module
+    returns, reduced per face and converted -- so the named transform is ``np.degrees`` plus a
+    min/max along the row, and the comparison cannot see the third angle or which corner each
+    belongs to. That is what keeps the igl / trimesh row above the element-wise oracle.
+    """
+    mesh_tm, mesh_wp = half_torus
+    quality_pv = trimesh_to_pyvista(mesh_tm).cell_quality(["min_angle", "max_angle"])
+
+    angles_np = np.degrees(tw.triangles.face_angles(mesh_wp.points, mesh_wp.indices).numpy())
+
+    assert np.allclose(
+        angles_np.min(axis=1), np.asarray(quality_pv.cell_data["min_angle"]), rtol=1e-5, atol=1e-4
+    )
+    assert np.allclose(
+        angles_np.max(axis=1), np.asarray(quality_pv.cell_data["max_angle"]), rtol=1e-5, atol=1e-4
+    )
+    # Non-vacuous: on a mesh of congruent equilateral faces both columns would read 60 everywhere.
+    assert np.ptp(np.asarray(quality_pv.cell_data["min_angle"])) > 1.0
 
 
 @pytest.mark.parity("face_quality", "igl")
@@ -260,23 +368,29 @@ def test_closest_point(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
-@pytest.mark.parity("face_centroids", "igl")
+@pytest.mark.parity("face_centroids", "igl", "pyvista")
 def test_face_centroids(request: pytest.FixtureRequest, mesh_name: str):
     """
-    Class A: one barycentre per face, element-wise against ``igl.barycenter``.
+    Class A on both references: one barycentre per face, element-wise, no transform.
 
-    The assert that matters beyond the comparison is the second one: the barycentre must lie *in*
-    its own triangle, which the barycentric coordinates ``(1/3, 1/3, 1/3)`` state exactly. A
-    function that returned the mesh centroid broadcast, or the first corner, would match neither.
+    ``igl.barycenter`` and VTK's ``cell_centers`` both return the corner mean in face order — the
+    latter is a *parametric* centre in general, but on a triangle that is the barycentre, which is
+    why the row is class A rather than a documented approximation.
+
+    The assert that matters beyond the comparison is the last one: the barycentre must lie *in* its
+    own triangle, which the barycentric coordinates ``(1/3, 1/3, 1/3)`` state exactly. A function
+    that returned the mesh centroid broadcast, or the first corner, would match neither.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     centroids_igl = igl.barycenter(
         np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64), faces_igl(mesh_tm)
     )
+    centroids_pv = np.asarray(trimesh_to_pyvista(mesh_tm).cell_centers().points)
 
     centroids_wp = tw.triangles.face_centroids(mesh_wp.points, mesh_wp.indices)
 
     assert np.allclose(centroids_wp.numpy(), centroids_igl, rtol=1e-5, atol=1e-5)
+    assert np.allclose(centroids_wp.numpy(), centroids_pv, rtol=1e-5, atol=1e-5)
     barycentric_wp = tw.triangles.points_to_barycentric(
         mesh_wp.points, mesh_wp.indices, centroids_wp
     )

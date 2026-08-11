@@ -205,9 +205,24 @@ def test_filter_mut_dif_laplacian(bench_case: BenchCase, volume_constraint: bool
         assert result.vertices.shape == vertices.shape
 
 
+@pytest.mark.noparity(
+    "pyvista",
+    oracle="pymeshlab",
+    reason="D2 a different algorithm with a measured disagreement: vtkSmoothPolyDataFilter moves "
+    "each vertex along its incident edge directions under its own convergence test and feature "
+    "handling, not by applying a fixed assembled operator, so it diverges with the iteration count "
+    "rather than differing by a tolerance -- measured max coordinate deviation 0.103 / 0.363 / "
+    "0.581 at 1 / 5 / 10 iterations on an icosphere(2) at relaxation_factor=1.0 with boundary and "
+    "feature smoothing off, which is the closest parameterization to triwarp's lamb=1.0. Even the "
+    "single iteration is 1e4 past tolerance, so no mapping of relaxation_factor recovers it. "
+    "MeshLab's apply_coord_laplacian_smoothing is this group's oracle -- it applies the same fixed "
+    "uniform-weight umbrella -- in tests/test_smoothing.py::"
+    "test_filter_laplacian_matches_pymeshlab; trimesh covers the same operator under the "
+    "filter_laplacian group.",
+)
 @pytest.mark.benchmark(group="filter_laplacian_integration")
 @pytest.mark.benchaxis("quality")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "pymeshlab", "pyvista")
 @pytest.mark.parametrize("implicit", [False, True], ids=["explicit", "implicit"])
 def test_filter_laplacian_integration(bench_case: BenchCase, implicit: bool) -> None:
     """
@@ -222,6 +237,20 @@ def test_filter_laplacian_integration(bench_case: BenchCase, implicit: bool) -> 
     statement its harmonic-field row makes in [`test_linalg.py`](test_linalg.py) about where the
     conditioning cost actually lives.
     """
+    if bench_case.kind == "pyvista":
+        if implicit:
+            pytest.skip("vtkSmoothPolyDataFilter is explicit only: no backward-Euler variant")
+        mesh_pv = bench_case.mesh_pv
+        smoothed_pv = bench_case.run(
+            lambda: mesh_pv.smooth(
+                n_iter=_ITERATIONS,
+                relaxation_factor=1.0,
+                boundary_smoothing=False,
+                feature_smoothing=False,
+            )
+        )
+        assert smoothed_pv.n_points == bench_case.n_vertices
+        return
     if bench_case.kind == "pymeshlab":
         if implicit:
             pytest.skip("MeshLab has no implicit / backward-Euler Laplacian smoother")
@@ -263,8 +292,20 @@ def test_filter_laplacian_integration(bench_case: BenchCase, implicit: bool) -> 
     "is in lambda-mu PAIRS. trimesh is the oracle for this group, in "
     "tests/test_smoothing.py::test_filter_taubin.",
 )
+@pytest.mark.noparity(
+    "pyvista",
+    oracle="trimesh",
+    reason="D2 a different algorithm with a measured disagreement: smooth_taubin is VTK's "
+    "windowed-sinc filter (vtkWindowedSincPolyDataFilter), parameterized by a pass_band that it "
+    "maps to its own kernel weights rather than by lambda / nu, and it warns 'An optimal offset "
+    "for the smoothing filter could not be found' on ordinary input. Measured against triwarp at "
+    "pass_band=0.1: max coordinate deviation 0.835 at one iteration -- the whole displacement -- "
+    "then 6.5e-03 and 2.6e-02 at 2 and 5, so it is neither close nor consistently off by a "
+    "factor. Its iteration count is in lambda-mu PAIRS like MeshLab's. trimesh is the oracle for "
+    "this group, in tests/test_smoothing.py::test_filter_taubin.",
+)
 @pytest.mark.benchmark(group="filter_taubin")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab", "pyvista")
 def test_filter_taubin(bench_case: BenchCase) -> None:
     """
     The lambda-nu alternation: two SpMVs per iteration instead of one.
@@ -283,6 +324,13 @@ def test_filter_taubin(bench_case: BenchCase) -> None:
     exemption above).
     """
     skip_larger_than(bench_case, "dragon")
+    if bench_case.kind == "pyvista":
+        mesh_pv = bench_case.mesh_pv
+        smoothed_pv = bench_case.run(
+            lambda: mesh_pv.smooth_taubin(n_iter=_ITERATIONS // 2, pass_band=0.1)
+        )
+        assert smoothed_pv.n_points == bench_case.n_vertices
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         operator = _laplacian_operator(bench_case)

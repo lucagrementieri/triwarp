@@ -102,9 +102,29 @@ def test_n_vertices(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="mean_vertex_normals")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "pymeshlab", "pyvista")
 def test_mean_vertex_normals(bench_case: BenchCase) -> None:
-    """The unweighted scatter, on the scan sweep: the throughput baseline for the group below."""
+    """
+    The unweighted scatter, on the scan sweep: the throughput baseline for the group below.
+
+    VTK's ``compute_normals`` is the unweighted scheme too, but it computes the *face* normals in
+    the same pass where triwarp is handed them, so its row carries the cross products as well --
+    read the pair against ``face_normals_and_areas`` in
+    [`test_triangles.py`](test_triangles.py) to separate the two halves.
+    """
+    if bench_case.kind == "pyvista":
+        mesh_pv = bench_case.mesh_pv
+        normals_pv = bench_case.run(
+            lambda: mesh_pv.compute_normals(
+                cell_normals=False,
+                point_normals=True,
+                consistent_normals=False,
+                auto_orient_normals=False,
+                split_vertices=False,
+            )
+        )
+        assert np.asarray(normals_pv.point_data["Normals"]).shape == (bench_case.n_vertices, 3)
+        return
     if bench_case.kind == "pymeshlab":  # 'Simple Average' is exactly the unweighted scheme
         meshset_pml = bench_case.meshset_pml
         bench_case.run(lambda: meshset_pml.compute_normal_per_vertex(weightmode="Simple Average"))
@@ -163,7 +183,7 @@ def test_area_weighted_vertex_normals(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="vertex_defects")
 @pytest.mark.benchaxis("valence")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pyvista")
 def test_vertex_defects(bench_case: BenchCase) -> None:
     """
     The angle defect ``2π - Σθ``: the accumulation axis's cheapest member.
@@ -181,8 +201,17 @@ def test_vertex_defects(bench_case: BenchCase) -> None:
     rows rather than ``F.max() + 1`` and lines up with triwarp on a mesh with unreferenced
     vertices. That is why it can be a row here where ``igl.adjacency_matrix``-family functions need
     a padding transform.
+
+    **pyvista does more**: ``curvature('gaussian')`` is the defect divided by the barycentric lumped
+    area, so its row includes an area pass and a division. The transform is named and asserted in
+    ``tests/test_vertices.py``; here it means the row is not a floor but a ceiling.
     """
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pyvista":
+        mesh_pv = bench_case.mesh_pv
+        gaussian_pv = bench_case.run(lambda: mesh_pv.curvature("gaussian"))
+        assert np.asarray(gaussian_pv).shape == (n_vertices,)
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         defects = bench_case.run(
