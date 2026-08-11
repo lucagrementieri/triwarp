@@ -1,7 +1,7 @@
 import warp as wp
 
-from triwarp.kernels import array as kernel_array
 from triwarp.kernels.grouping import pack_edge_key
+from triwarp.kernels.predicates import vector_angle
 
 
 @wp.kernel
@@ -128,7 +128,7 @@ def face_adjacency_angles(
     tid = int(wp.tid())
     normal_a = face_normals[face_adjacency[tid, 0]]
     normal_b = face_normals[face_adjacency[tid, 1]]
-    out_angles[tid] = kernel_array.vector_angle_vec(normal_a, normal_b)
+    out_angles[tid] = vector_angle(normal_a, normal_b)
 
 
 @wp.kernel

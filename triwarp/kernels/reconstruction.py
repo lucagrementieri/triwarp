@@ -18,6 +18,7 @@ from triwarp.kernels.predicates import (
     is_unfold_quadrangle_convex,
     project_out_normal,
     triangle_aspect_ratio,
+    vector_angle,
 )
 
 # Compile-time upper bound on the per-point fan size (neighbours kept for one center).
@@ -43,12 +44,6 @@ def delone_flip_profit_sq(a: wp.vec3, b: wp.vec3, c: wp.vec3, d: wp.vec3) -> wp.
 
 
 @wp.func
-def vec_angle(a: wp.vec3, b: wp.vec3) -> wp.float32:
-    # MRVector3.h angle(a, b) = atan2(|cross|, dot); robust unsigned angle in [0, pi].
-    return wp.atan2(wp.length(wp.cross(a, b)), wp.dot(a, b))
-
-
-@wp.func
 def tris_angle_profit(
     a: wp.vec3, b: wp.vec3, c: wp.vec3, d: wp.vec3, crit_ang: wp.float32
 ) -> wp.float32:
@@ -58,7 +53,7 @@ def tris_angle_profit(
     ad = d - a
     dir_abc = wp.cross(ab, ac)
     dir_acd = wp.cross(ac, ad)
-    return vec_angle(dir_abc, dir_acd) - crit_ang
+    return vector_angle(dir_abc, dir_acd) - crit_ang
 
 
 @wp.func

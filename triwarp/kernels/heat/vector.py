@@ -113,6 +113,14 @@ def face_gradient_unit(
 ) -> None:
     # For a distance field this points away from the source: the radial direction the log map's
     # angle is measured against.
+    #
+    # Deliberately not merged with ``triangles.face_gradients`` behind a ``normalize`` flag. The
+    # arithmetic is already shared -- both kernels are one-line launch shims over a ``triangles``
+    # @wp.func, and ``face_unit_gradient`` is ``normalize(face_gradient(...))`` -- so a flag would
+    # save one shim while putting a mode argument on ``laplacian.face_gradients``' path that only
+    # this caller would ever set (§14, speculative generality: one caller per mode). The two also
+    # return different quantities: a gradient carries the field's rate of change, this carries only
+    # a direction.
     f = int(wp.tid())
     out_gradient[f] = face_unit_gradient(vertices, faces, normals, areas, values, wp.int32(f))
 

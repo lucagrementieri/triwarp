@@ -232,6 +232,10 @@ def internal_angles_and_sums(
     # Interior angle at each corner (law of cosines, float64) plus the per-vertex angle sum the
     # curvature correction normalizes by. ``wp.acos`` clamps its argument, so a sliver face yields
     # 0 / pi rather than NaN.
+    #
+    # ``triangles.angles`` is the same quantity in float32 from normalized edge vectors, and stays a
+    # separate kernel: it emits no angle sums, takes its third angle as ``PI - a0 - a1``, and zeroes
+    # all three angles of a degenerate face instead of letting the acos clamp report 0 / pi.
     f = int(wp.tid())
     v0, v1, v2 = face_vertices_vec3d(vertices, faces, wp.int32(f))
     l2_0 = wp.length_sq(v1 - v2)

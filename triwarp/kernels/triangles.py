@@ -107,6 +107,13 @@ def angles(
     w = wp.normalize(edges[2])
 
     # wp.acos auto-clamps its argument to [-1, 1], so no explicit wp.clamp is needed.
+    #
+    # The other corner-angle formulation in the tree is ``energies.internal_angles_and_sums``, which
+    # is the law of cosines on squared edge lengths in float64 and additionally accumulates the
+    # per-vertex angle sums its curvature correction needs. It is not this kernel at a wider dtype:
+    # there each angle is derived independently (so the three sum to pi only up to round-off) and a
+    # sliver reads 0 or pi through the acos clamp, where this one takes the third angle as
+    # ``PI - a0 - a1`` and zeroes all three of a degenerate face.
     out_angles[f, 0] = wp.acos(wp.dot(u, v))
     out_angles[f, 1] = wp.acos(wp.dot(-u, w))
     out_angles[f, 2] = PI - out_angles[f, 0] - out_angles[f, 1]

@@ -829,13 +829,17 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
 ## 14. Evolving the Public API
 
 **`tests/test_api_conventions.py` is the mechanical half of this section**, and it fails the default
-`pytest` run. Twelve checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
+`pytest` run. Fourteen checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
 summary line naming a reference library (§10); a `*_mask` producer that does not return
 `wp.array[wp.bool]`; a module summary advertising Warp; a module without a `tests/` **and** a
 `benchmarks/` file named for it; a private name reached across a module boundary; one public name
 exported by two modules; a top-level `kernels/<name>.py` without its `triwarp/<name>.py` or the
 reverse (§4); and a private helper defined above its first caller (§11). The ninth scans `kernels/`
 **as well**: a comment or docstring blaming a Warp version older than the installed `warp-lang`.
+Two enforce an earlier section's convention on kernel code: §3's `out_` prefix and end-of-signature
+position for a written argument (its two exemption classes carried as `_KERNEL_OUTPUT_ALLOWLIST`),
+and §2's subscript-style array annotation — the latter scans the whole package, because only in an
+*annotation* position is `wp.array(dtype=T)` the stale spelling rather than a legal allocation.
 The last three are newer and each exists because the same defect was found twice:
 
 - **An allocation with no `device=`.** `wp.zeros` / `empty` / `ones` / `full` / `array` at Python
