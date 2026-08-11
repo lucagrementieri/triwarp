@@ -836,3 +836,135 @@ def _mesh_vertex_edges(mesh_wp: wp.Mesh) -> tuple[wp.array, int]:
     n = int(mesh_wp.points.shape[0])
     unique_edges, _ = tw.edges.edges_unique(mesh_wp.indices, n_vertices=n)
     return unique_edges, n
+
+
+# ---------------------------------------------------------------------------
+# dijkstra_envelope
+# ---------------------------------------------------------------------------
+
+
+def _length_weighted_csr(mesh_wp: wp.Mesh, threshold: float = 1.0) -> object:
+    """
+    Build the mesh edge graph with Euclidean lengths as weights, divided by ``threshold``.
+
+    That division is MeshLab's ``gradientthr``: its cap is ``|p_i - p_j| / gradientthr``, and
+    ``dijkstra_envelope`` takes no threshold because the weights carry it.
+    """
+    edges, n_vertices = _mesh_vertex_edges(mesh_wp)
+    lengths = tw.edges.edges_unique_length(mesh_wp.points, mesh_wp.indices, edges)
+    if threshold != 1.0:
+        scaled = wp.empty(int(lengths.shape[0]), dtype=wp.float32, device=mesh_wp.device)
+        wp.map(wp.div, lengths, wp.float32(threshold), out=scaled)
+        lengths = scaled
+    return tw.graph.edges_to_csr(n_vertices, edges, lengths)
+
+
+def _spike_field(n_vertices: int, device: str) -> np.ndarray:
+    """Build a delta at vertex 0: the field with the steepest possible gradient."""
+    values_np = np.zeros(n_vertices, dtype=np.float64)
+    values_np[0] = 10.0
+    return values_np
+
+
+@pytest.mark.parametrize("threshold", [0.5, 1.0, 3.0])
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity("dijkstra_envelope", "pymeshlab")
+def test_dijkstra_envelope_matches_pymeshlab(
+    request: pytest.FixtureRequest, mesh_name: str, threshold: float
+) -> None:
+    """
+    Class A against ``apply_scalar_saturation_per_vertex``, the Lipschitz-cap reading.
+
+    The named transform is the weights: MeshLab's ``gradientthr`` divides the edge length, so the
+    adjacency carries ``length / threshold`` and the envelope needs no threshold of its own. The
+    sweep is over that parameter because it is the only one the reference has.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    values_np = _spike_field(mesh_tm.vertices.shape[0], str(mesh_wp.device))
+
+    meshset_pml = trimesh_to_pymeshlab(mesh_tm, values_np)
+    meshset_pml.apply_scalar_saturation_per_vertex(gradientthr=threshold)
+
+    values_wp = wp.array(values_np.astype(np.float32), dtype=wp.float32, device=mesh_wp.device)
+    saturated_wp = tw.graph.dijkstra_envelope(_length_weighted_csr(mesh_wp, threshold), values_wp)
+    # Anti-vacuity: the spike must have been lowered, or a no-op would pass. It is the *peak* that
+    # moves and not the field around it -- the zeros are already minimal and nothing is ever raised.
+    assert 0.0 < float(saturated_wp.numpy()[0]) < 10.0
+    assert np.allclose(
+        saturated_wp.numpy(), meshset_pml.current_mesh().vertex_scalar_array(), rtol=1e-4, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("n_sources", [1, 3])
+def test_dijkstra_envelope_is_the_edge_graph_distance(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh], n_sources: int
+) -> None:
+    """
+    Class A against ``scipy.sparse.csgraph.dijkstra``: seeded with zeros, this *is* the distance.
+
+    The envelope ``min_u (values[u] + d(u, v))`` reduces to the weighted multi-source shortest-path
+    distance when ``values`` is zero on the sources and large elsewhere — the reading the function
+    is named for, and why the package needs no second shortest-path implementation. Both sides take
+    the identical graph, so the only difference is float32 against float64: measured 7.1e-07.
+    """
+    mesh_tm, mesh_wp = icosahedron
+    n_vertices = mesh_tm.vertices.shape[0]
+    sources_np = np.arange(n_sources)
+
+    seeded_np = np.full(n_vertices, 1e6, dtype=np.float32)
+    seeded_np[sources_np] = 0.0
+    envelope_wp = tw.graph.dijkstra_envelope(
+        _length_weighted_csr(mesh_wp), wp.array(seeded_np, dtype=wp.float32, device=mesh_wp.device)
+    )
+
+    edges_np = mesh_tm.edges_unique
+    lengths_np = np.linalg.norm(
+        mesh_tm.vertices[edges_np[:, 0]] - mesh_tm.vertices[edges_np[:, 1]], axis=1
+    )
+    both_np = np.concatenate([edges_np, edges_np[:, ::-1]])
+    graph_sp = sp.coo_matrix(
+        (np.concatenate([lengths_np, lengths_np]), (both_np[:, 0], both_np[:, 1])),
+        shape=(n_vertices, n_vertices),
+    ).tocsr()
+    distance_sp = csgraph.dijkstra(graph_sp, indices=sources_np, min_only=True)
+
+    # Anti-vacuity: the field has to have propagated, not stayed at its 1e6 seed.
+    assert distance_sp.max() > 0.5
+    assert envelope_wp.numpy().max() < 1e5
+    assert np.allclose(envelope_wp.numpy(), distance_sp, rtol=1e-5, atol=1e-5)
+
+
+def test_dijkstra_envelope_respects_the_bound(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """After convergence no edge violates the cap, and nothing was raised."""
+    mesh_tm, mesh_wp = half_torus
+    threshold = 2.0
+    rng = np.random.default_rng(7)
+    values_np = rng.uniform(0.0, 5.0, size=mesh_tm.vertices.shape[0])
+    values_wp = wp.array(values_np.astype(np.float32), dtype=wp.float32, device=mesh_wp.device)
+
+    saturated_np = tw.graph.dijkstra_envelope(
+        _length_weighted_csr(mesh_wp, threshold), values_wp
+    ).numpy()
+    assert (saturated_np <= values_np.astype(np.float32) + 1e-5).all()
+
+    edges_np = mesh_tm.edges_unique
+    lengths_np = np.linalg.norm(
+        mesh_tm.vertices[edges_np[:, 0]] - mesh_tm.vertices[edges_np[:, 1]], axis=1
+    )
+    jumps_np = np.abs(saturated_np[edges_np[:, 0]] - saturated_np[edges_np[:, 1]])
+    assert (jumps_np <= lengths_np / threshold + 1e-4).all()
+    # Every minimum survives: the smallest value in the field is untouched.
+    assert np.isclose(saturated_np.min(), values_np.min(), rtol=1e-5, atol=1e-5)
+
+
+def test_dijkstra_envelope_invalid(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    mesh_tm, mesh_wp = icosahedron
+    adjacency = _length_weighted_csr(mesh_wp)
+    values_wp = wp.zeros(mesh_tm.vertices.shape[0], dtype=wp.float32, device=mesh_wp.device)
+    with pytest.raises(ValueError, match="max_iterations must be non-negative"):
+        tw.graph.dijkstra_envelope(adjacency, values_wp, max_iterations=-1)
+    with pytest.raises(ValueError, match="one entry per node"):
+        tw.graph.dijkstra_envelope(adjacency, values_wp[:3])
+    edges, n_vertices = _mesh_vertex_edges(mesh_wp)
+    with pytest.raises(ValueError, match="one entry per edge"):
+        tw.graph.edges_to_csr(n_vertices, edges, values_wp)

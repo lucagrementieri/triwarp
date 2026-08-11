@@ -18,11 +18,11 @@ face normals with a crease gate, [`filter_two_step`][triwarp.smoothing.filter_tw
 the vertices to them, and [`filter_sharpen`][triwarp.smoothing.filter_sharpen] runs the
 whole idea backwards to *sharpen*.
 
-The last two functions run the same operator over a per-vertex **scalar** field rather than
-positions: [`filter_scalar_laplacian`][triwarp.smoothing.filter_scalar_laplacian] diffuses it, and
-[`saturate_scalar_gradient`][triwarp.smoothing.saturate_scalar_gradient] caps how fast it may vary
-along an edge. The second is not a smoothing filter at all — it is a one-sided Lipschitz projection,
-which is what turns a raw scalar into a usable sizing or falloff field.
+[`filter_scalar_laplacian`][triwarp.smoothing.filter_scalar_laplacian] runs the same operator over a
+per-vertex **scalar** field rather than positions. Capping how fast such a field may vary along an
+edge — the other half of turning a raw scalar into a usable sizing field — is not a smoothing filter
+at all but a one-sided Lipschitz projection, and lives in
+[`dijkstra_envelope`][triwarp.graph.dijkstra_envelope].
 """
 
 from __future__ import annotations
@@ -1145,7 +1145,7 @@ def filter_scalar_laplacian(
 
     See Also
     --------
-    [`saturate_scalar_gradient`][triwarp.smoothing.saturate_scalar_gradient]
+    [`dijkstra_envelope`][triwarp.graph.dijkstra_envelope]
     [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
     [`triwarp.laplacian.laplacian`][triwarp.laplacian.laplacian]
     """
@@ -1176,120 +1176,6 @@ def filter_scalar_laplacian(
         )
         wp.launch(step, dim=n, inputs=[out, average, coeff], outputs=[nxt], device=device)
         out, nxt = nxt, out
-    return out
-
-
-def saturate_scalar_gradient(
-    values: wp.array[wp.float32],
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    threshold: float = 1.0,
-    max_iterations: int = 0,
-) -> wp.array[wp.float32]:
-    """
-    Cap how fast a per-vertex scalar may grow with distance, by lowering values only.
-
-    Enforces the one-sided Lipschitz bound ``q_i <= q_j + |p_i - p_j| / threshold`` on every edge,
-    which after convergence gives the *upper envelope*
-    ``q(v) = min_u (q_0(u) + d(u, v) / threshold)`` over shortest paths ``d`` through the edge
-    graph. Nothing is ever raised, so every local minimum of the input survives untouched and only
-    peaks that rise too steeply out of them are shaved down.
-
-    This is MeshLab's ``apply_scalar_saturation_per_vertex`` (VCG ``VertexSaturate``), and the
-    standard way to make a raw scalar usable as a **sizing field**: an adaptive remesher fed an
-    ungraded target-length field produces a band of bad triangles where the field jumps, and this is
-    the projection that removes the jump while respecting the field's small values.
-
-    !!! note "``threshold`` is a reciprocal slope"
-        The admissible change per unit distance is ``1 / threshold``, matching MeshLab. So a
-        *larger* ``threshold`` is a *stricter* cap — ``threshold=2`` allows half the variation
-        ``threshold=1`` does.
-
-    !!! note "This is also the package's weighted shortest path"
-        The envelope above *is* the multi-source distance transform of the edge graph, so seeding
-        ``values`` with ``0`` at the source vertices and a large number elsewhere returns the graph
-        distance to the nearest source at ``threshold=1`` — measured equal to
-        [`scipy.sparse.csgraph.dijkstra`][] to 7.1e-07 on a subdivided icosphere, and pinned by
-        ``tests/test_smoothing.py::test_saturate_scalar_gradient_is_the_edge_graph_distance``. That
-        is why there is no ``graph.dijkstra``: the relaxation is the same one, and the edge weights
-        are already the Euclidean lengths. For distance *on the surface* rather than along its
-        edges — which is shorter, and what "geodesic" normally means — use
-        [`heat_geodesic`][triwarp.heat.distance.heat_geodesic].
-
-    Parameters
-    ----------
-    values
-        Length-``n_vertices`` ``wp.float32`` field. Not modified.
-    vertices
-        ``(n_vertices,)`` mesh vertex positions; edge lengths are measured from these.
-    faces
-        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
-    threshold
-        Reciprocal of the maximum admissible slope; must be positive.
-    max_iterations
-        Cap on relaxation passes. Each pass propagates the bound one edge further, so the number
-        needed is the graph diameter of the region that violates it. ``0`` (the default) means
-        ``n_vertices``, which can never be exceeded.
-
-    Returns
-    -------
-    wp.array[wp.float32]
-        Length-``n_vertices`` saturated field on ``values.device``.
-
-    Raises
-    ------
-    ValueError
-        If ``threshold <= 0``, ``max_iterations < 0``, or ``values`` is not length ``n_vertices``.
-
-    See Also
-    --------
-    [`filter_scalar_laplacian`][triwarp.smoothing.filter_scalar_laplacian]
-    [`triwarp.remesh.isotropic_remesh`][triwarp.remesh.isotropic_remesh]
-    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
-    [`scipy.sparse.csgraph.dijkstra`][]
-    """
-    if threshold <= 0.0:
-        raise ValueError(f"threshold must be positive, got {threshold}")
-    if max_iterations < 0:
-        raise ValueError(f"max_iterations must be non-negative, got {max_iterations}")
-
-    device = values.device
-    n = int(vertices.shape[0])
-    if int(values.shape[0]) != n:
-        raise ValueError(
-            f"values must have one entry per vertex, got {values.shape[0]} for {n} vertices"
-        )
-
-    out = wp.clone(values)
-    if n == 0 or int(faces.shape[0]) == 0:
-        return out
-
-    adjacency = tw.graph.edges_to_csr(n, tw.edges.faces_to_edges(faces))
-    nxt = wp.empty(n, dtype=wp.float32, device=device)
-    changed = wp.zeros(1, dtype=wp.int32, device=device)
-    inverse_threshold = wp.float32(1.0 / threshold)
-    # The pass count is data-dependent (it is the diameter of the violating region), and the flag
-    # readback is ~0.1 ms against ~1 ms of launches per pass, so checking every pass is the cheaper
-    # side of that trade -- see the ``linalg`` note on ``check_every``.
-    for _ in range(max_iterations or n):
-        changed.zero_()
-        wp.launch(
-            kernel_smoothing.saturate_gradient_pass,
-            dim=n,
-            inputs=[
-                adjacency.offsets,
-                adjacency.columns,
-                vertices,
-                inverse_threshold,
-                out,
-                nxt,
-                changed,
-            ],
-            device=device,
-        )
-        out, nxt = nxt, out
-        if int(changed.numpy()[0]) == 0:
-            break
     return out
 
 

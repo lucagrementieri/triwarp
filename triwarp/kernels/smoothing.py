@@ -362,33 +362,6 @@ def apply_operator_scalar(
 
 
 @wp.kernel
-def saturate_gradient_pass(
-    offsets: wp.array[wp.int32],
-    columns: wp.array[wp.int32],
-    vertices: wp.array[wp.vec3],
-    inverse_threshold: wp.float32,
-    field: wp.array[wp.float32],
-    out_field: wp.array[wp.float32],
-    out_changed: wp.array[wp.int32],
-) -> None:
-    # One Bellman-Ford relaxation of the Lipschitz cap ``q_i <= q_j + |p_i - p_j| / threshold``
-    # (VCG ``UpdateQuality::VertexSaturate``). Values only ever go *down*, so the iteration is
-    # monotone and converges in at most (graph diameter) passes; ``out_changed`` is the host's
-    # early-exit signal.
-    i = int(wp.tid())
-    position = vertices[i]
-    best = field[i]
-    for k in range(offsets[i], offsets[i + 1]):
-        j = columns[k]
-        capped = field[j] + wp.length(vertices[j] - position) * inverse_threshold
-        if capped < best:
-            best = capped
-    out_field[i] = best
-    if best < field[i]:
-        out_changed[0] = 1
-
-
-@wp.kernel
 def accumulate_smoothed_normals(
     face_normals: wp.array[wp.vec3],
     face_areas: wp.array[wp.float32],

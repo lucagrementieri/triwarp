@@ -1,5 +1,5 @@
 """
-Benchmarks for ``triwarp.graph``: connected components and single/multi-source BFS.
+Benchmarks for ``triwarp.graph``: connected components, BFS, and the weighted envelope.
 
 Two axes, matching the two ways a graph algorithm gets slow:
 
@@ -26,8 +26,16 @@ Two axes, matching the two ways a graph algorithm gets slow:
   (``tile_scan_exclusive`` alone is 353 ns against 962 ns for the whole level). Full measurements in
   the ``Notes`` of [`triwarp.graph.bfs`][triwarp.graph.bfs].
 
+* **diameter again, but weighted**, for ``dijkstra_envelope``. Same shape as ``bfs`` and for the
+  same reason -- one launch per relaxation pass, and the pass count is the diameter of the region
+  that violates the bound -- but the work per pass sweeps the whole CSR rather than a frontier, so
+  there is no serial-drain handover to make and no order to be exact about. Seeded from a single
+  spike, the worst case on purpose: the cap has to cross the whole mesh, so read the row as an upper
+  bound rather than a typical one. Capped at ``bunny_decimated`` for that reason.
+
 The vertex-adjacency CSR matrix is prebuilt (untimed, cached per mesh/device) so the timings
-isolate the graph algorithms from the edge sort that produces them.
+isolate the graph algorithms from the edge sort that produces them -- including
+``dijkstra_envelope``'s length-weighted one, whose weights are ``edges_unique_length``.
 
 ``combine.split`` used to live here because it is the other component-count-driven function in the
 package. It now sits in [`test_combine.py`](test_combine.py) with the rest of ``triwarp.combine``,
@@ -44,7 +52,14 @@ Neither **trimesh** nor **open3d** appears: both functions take an abstract CSR 
 and open3d exposes no graph-traversal API over one -- its connectivity work is mesh-bound
 (``cluster_connected_triangles``), which is what ``split`` uses over in ``test_combine``.
 
-**pymeshlab** appears in ``connected_component_labels`` only, and with a caveat: it has no filter
+**pymeshlab** answers two groups. ``dijkstra_envelope``'s reference is
+``apply_scalar_saturation_per_vertex``, which is the same relaxation read as a Lipschitz cap on a
+per-vertex scalar (VCG ``UpdateQuality::VertexSaturate``); its ``gradientthr`` divides the edge
+length, so both sides receive the identical weights and the row is apples-to-apples. It needs the
+scalar attribute to exist on the MeshSet and mutates it, so that row rebuilds the set inside the
+timed callable.
+
+Its other appearance, ``connected_component_labels``, comes with a caveat: it has no filter
 that returns a label array. The closest thing that runs the component pass *without* also splitting
 or deleting anything is ``compute_selection_by_small_disconnected_components_per_face`` at
 ``nbfaceratio=0.0`` -- it labels every component and then thresholds against a fraction of the
@@ -56,11 +71,12 @@ appear in the ``bfs`` groups at all; the labelling is the only graph work MeshLa
 from __future__ import annotations
 
 import numpy as np
+import pymeshlab as ml
 import pytest
 import scipy.sparse as sp
 import warp as wp
 import warp.sparse as wps
-from conftest import BenchCase
+from conftest import BenchCase, skip_larger_than
 from scipy.sparse.csgraph import breadth_first_order
 
 import triwarp as tw
@@ -218,3 +234,64 @@ def test_bfs_multi_source(bench_case: BenchCase, n_sources: int) -> None:
     )
     assert offsets.shape == (n_sources,)
     assert neighbors.shape[0] >= n_sources
+
+
+_weighted_cache: dict[tuple[str, str], wps.BsrMatrix] = {}
+
+
+def _length_weighted_adjacency(bench_case: BenchCase) -> wps.BsrMatrix:
+    """Vertex adjacency weighted by Euclidean edge length -- an *input*, built once per case."""
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _weighted_cache:
+        unique_edges, _ = tw.edges.edges_unique(
+            bench_case.faces_wp, n_vertices=bench_case.n_vertices
+        )
+        lengths = tw.edges.edges_unique_length(
+            bench_case.vertices_wp, bench_case.faces_wp, unique_edges
+        )
+        _weighted_cache[key] = tw.graph.edges_to_csr(bench_case.n_vertices, unique_edges, lengths)
+    return _weighted_cache[key]
+
+
+def _spike_field_np(bench_case: BenchCase) -> np.ndarray:
+    """Build a delta at vertex 0, so every pass has work and the relaxation is diameter-deep."""
+    values_np = np.zeros(bench_case.n_vertices, dtype=np.float64)
+    values_np[0] = 10.0
+    return values_np
+
+
+@pytest.mark.benchmark(group="dijkstra_envelope")
+@pytest.mark.benchlibs("triwarp", "pymeshlab")
+def test_dijkstra_envelope(bench_case: BenchCase) -> None:
+    """
+    Weighted relaxation to the shortest-path envelope: pass count is the graph diameter.
+
+    Capped at ``bunny_decimated`` on both sides. The spike seed makes every pass matter, so the
+    triwarp row is ``diameter`` launches deep and the MeshLab row is a serial flood over the same
+    region -- neither says anything new at larger scale that the two smallest meshes do not. The
+    weighted adjacency is an input and is built outside the timed callable, like ``bfs``'s.
+    """
+    skip_larger_than(bench_case, "bunny_decimated", "a spike-seeded relaxation is diameter-deep")
+    n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pymeshlab":
+
+        def saturate_pml() -> int:
+            meshset_pml = ml.MeshSet()
+            meshset_pml.add_mesh(
+                ml.Mesh(
+                    bench_case.vertices_np,
+                    np.ascontiguousarray(bench_case.faces_np, dtype=np.int32),
+                    v_scalar_array=_spike_field_np(bench_case),
+                )
+            )
+            meshset_pml.apply_scalar_saturation_per_vertex(gradientthr=1.0)
+            return meshset_pml.current_mesh().vertex_number()
+
+        assert bench_case.run(saturate_pml) == n_vertices
+        return
+    adjacency = _length_weighted_adjacency(bench_case)
+    values = wp.array(
+        _spike_field_np(bench_case).astype(np.float32), dtype=wp.float32, device=bench_case.device
+    )
+    envelope = bench_case.run(lambda: tw.graph.dijkstra_envelope(adjacency, values), rounds=3)
+    assert envelope.shape == (n_vertices,)

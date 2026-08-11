@@ -21,19 +21,28 @@ def trimesh_to_warp(mesh: tm.Trimesh, device: str) -> wp.Mesh:
     return wp.Mesh(points=vertices, indices=faces)
 
 
-def trimesh_to_pymeshlab(mesh: tm.Trimesh) -> ml.MeshSet:
+def trimesh_to_pymeshlab(mesh: tm.Trimesh, scalars: np.ndarray | None = None) -> ml.MeshSet:
     """
     Wrap a ``tm.Trimesh`` in a fresh single-mesh ``pymeshlab.MeshSet``.
 
     MeshLab wants float64 positions; the ``(n_faces, 3)`` index array goes in as-is. The returned
     MeshSet is **not** reusable across filters: almost every one of them mutates ``current_mesh()``
     in place, so build a new one per comparison rather than threading one through a test.
+
+    ``scalars`` seeds the per-vertex scalar attribute, which the ``*_per_vertex`` scalar filters
+    read and write in place: they take no array argument, so a comparison against one has to put
+    its input here rather than pass it.
     """
     meshset = ml.MeshSet()
     meshset.add_mesh(
         ml.Mesh(
             np.ascontiguousarray(mesh.vertices, dtype=np.float64),
             np.ascontiguousarray(mesh.faces, dtype=np.int32),
+            **(
+                {}
+                if scalars is None
+                else {"v_scalar_array": np.ascontiguousarray(scalars, dtype=np.float64)}
+            ),
         )
     )
     return meshset

@@ -18,6 +18,40 @@ def edges_to_adjacency(
 
 
 @wp.kernel
+def duplicate_edge_weights(weights: wp.array[wp.float32], out_values: wp.array[wp.float32]) -> None:
+    # One weight per undirected edge becomes the two directed entries ``edges_to_adjacency`` emits,
+    # in its layout: entry ``2e`` is ``(a, b)`` and ``2e + 1`` is ``(b, a)``.
+    e = int(wp.tid())
+    out_values[e * 2] = weights[e]
+    out_values[e * 2 + 1] = weights[e]
+
+
+@wp.kernel
+def dijkstra_envelope_pass(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    weights: wp.array[wp.float32],
+    labels: wp.array[wp.float32],
+    out_labels: wp.array[wp.float32],
+    out_changed: wp.array[wp.int32],
+) -> None:
+    # One Bellman-Ford relaxation of ``q_i <= q_j + w(i, j)``, one thread per node, pulling from the
+    # neighbours' labels of the *previous* round -- so the pass is a pure function of ``labels`` and
+    # the result does not depend on how the threads interleave. Labels only ever go down, so the
+    # iteration is monotone and converges in at most (graph diameter) passes; ``out_changed`` is the
+    # host's early-exit signal. (VCG ``UpdateQuality::VertexSaturate`` is this loop.)
+    i = int(wp.tid())
+    best = labels[i]
+    for k in range(offsets[i], offsets[i + 1]):
+        relaxed = labels[columns[k]] + weights[k]
+        if relaxed < best:
+            best = relaxed
+    out_labels[i] = best
+    if best < labels[i]:
+        out_changed[0] = 1
+
+
+@wp.kernel
 def pack_label_node_keys(
     labels: wp.array[wp.int32], node_count: wp.int64, out_keys: wp.array[wp.int64]
 ) -> None:

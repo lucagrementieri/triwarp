@@ -76,16 +76,13 @@ diffusion from the fitting solve. Both have pymeshlab references at the same fou
 ``apply_coord_two_steps_smoothing`` rewrites the coordinates, so that row carries the MeshSet build
 like the other ``apply_coord_*`` rows.
 
-The last two groups leave positions alone and run over a per-vertex **scalar** field:
-``filter_scalar_laplacian`` against ``apply_scalar_smoothing_per_vertex`` and
-``saturate_scalar_gradient`` against ``apply_scalar_saturation_per_vertex``. Both are on the
-**scale** axis, and they are the two ends of a spectrum this module otherwise does not cover:
-diffusion is a fixed number of SpMV passes, while saturation is a Bellman-Ford relaxation whose pass
-count is the *graph diameter of the violating region*, so it is the one group here whose cost is
-genuinely data-dependent. Seeding it from a single spike is the worst case on purpose -- the cap has
-to propagate across the whole mesh -- so read that row as an upper bound rather than a typical one.
-Both filters need the scalar attribute to exist on the MeshSet, which means those rows rebuild it
-(they mutate the attribute, and saturation is not idempotent in it either).
+The last group leaves positions alone and runs over a per-vertex **scalar** field:
+``filter_scalar_laplacian`` against ``apply_scalar_smoothing_per_vertex``, on the **scale** axis and
+a fixed number of SpMV passes. Its old neighbour here, the Lipschitz projection of the same kind of
+field, moved to [`test_graph.py`](test_graph.py) as ``dijkstra_envelope`` with the function: it is a
+weighted graph relaxation whose pass count is data-dependent, a different cost shape, and it now
+sits next to ``bfs``. The filter needs the scalar attribute to exist on the MeshSet, so this row
+rebuilds it (the filter mutates the attribute in place).
 """
 
 from __future__ import annotations
@@ -471,39 +468,6 @@ def test_filter_scalar_laplacian(bench_case: BenchCase) -> None:
         )
     )
     assert smoothed.shape == (n_vertices,)
-
-
-@pytest.mark.benchmark(group="saturate_scalar_gradient")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
-def test_saturate_scalar_gradient(bench_case: BenchCase) -> None:
-    """
-    Lipschitz projection of a scalar field: a relaxation whose pass count is the graph diameter.
-
-    Capped at ``bunny_decimated`` on both sides. The spike seed makes every pass matter, so the
-    triwarp row is ``diameter`` launches deep and the MeshLab row is a serial flood over the same
-    region -- neither says anything new at larger scale that the two smallest meshes do not.
-    """
-    skip_larger_than(bench_case, "bunny_decimated", "a spike-seeded relaxation is diameter-deep")
-    n_vertices = bench_case.n_vertices
-    if bench_case.kind == "pymeshlab":
-
-        def saturate_pml() -> int:
-            meshset_pml = _new_scalar_meshset_pml(bench_case)
-            meshset_pml.apply_scalar_saturation_per_vertex(gradientthr=1.0)
-            return meshset_pml.current_mesh().vertex_number()
-
-        assert bench_case.run(saturate_pml) == n_vertices
-        return
-    values, vertices, faces = (
-        _scalar_field_wp(bench_case),
-        bench_case.vertices_wp,
-        bench_case.faces_wp,
-    )
-    saturated = bench_case.run(
-        lambda: tw.smoothing.saturate_scalar_gradient(values, vertices, faces, threshold=1.0),
-        rounds=3,
-    )
-    assert saturated.shape == (n_vertices,)
 
 
 # MeshLab's two-step defaults, used verbatim on both sides: 3 outer passes, a 60-degree crease

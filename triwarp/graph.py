@@ -26,7 +26,9 @@ from triwarp.kernels.algorithms import connected_components as kernel_connected_
 _BFS_ESCAPE_FRONTIER = 32
 
 
-def edges_to_csr(node_count: int, edges: twt.Array2dInt32) -> wps.BsrMatrix[wp.float32]:
+def edges_to_csr(
+    node_count: int, edges: twt.Array2dInt32, weights: wp.array[wp.float32] | None = None
+) -> wps.BsrMatrix[wp.float32]:
     """
     Undirected adjacency as a 1x1-block ``warp.sparse.BsrMatrix`` (CSR form).
 
@@ -38,22 +40,50 @@ def edges_to_csr(node_count: int, edges: twt.Array2dInt32) -> wps.BsrMatrix[wp.f
         Number of vertices ``0 .. node_count - 1``.
     edges
         ``(m, 2)`` ``wp.int32`` edge rows on the target device.
+    weights
+        Length-``m`` edge weights, one per undirected edge, written into both of its directed
+        entries. Defaults to unit weights, which is what the unweighted traversals want; the
+        weighted relaxation in [`dijkstra_envelope`][triwarp.graph.dijkstra_envelope] measures paths
+        in whatever this carries — mesh edge lengths from
+        [`edges_unique_length`][triwarp.edges.edges_unique_length] for a geometric distance.
 
     Returns
     -------
     warp.sparse.BsrMatrix
-        Square ``(node_count, node_count)`` adjacency with unit block values. Duplicate
-        directed pairs from repeated input edges are merged (values summed).
+        Square ``(node_count, node_count)`` adjacency. Duplicate directed pairs from repeated input
+        edges are merged (values **summed**), so a repeated weighted edge doubles its weight —
+        deduplicate with [`edges_unique`][triwarp.edges.edges_unique] first when that matters.
+
+    Raises
+    ------
+    ValueError
+        If ``weights`` is given and does not have one entry per edge row.
+
+    See Also
+    --------
+    [`bfs`][triwarp.graph.bfs]
+    [`dijkstra_envelope`][triwarp.graph.dijkstra_envelope]
     """
     device = edges.device
     m = int(edges.shape[0])
+    if weights is not None and int(weights.shape[0]) != m:
+        raise ValueError(
+            f"weights must have one entry per edge, got {weights.shape[0]} for {m} edges"
+        )
 
     n_entries = 2 * m
     rows = wp.empty(n_entries, dtype=wp.int32, device=device)
     cols = wp.empty(n_entries, dtype=wp.int32, device=device)
     if m > 0:
         wp.launch(kernel_graph.edges_to_adjacency, dim=m, inputs=[edges, rows, cols], device=device)
-    data = wp.ones(n_entries, dtype=wp.float32, device=device)
+    if weights is None:
+        data = wp.ones(n_entries, dtype=wp.float32, device=device)
+    else:
+        data = wp.empty(n_entries, dtype=wp.float32, device=device)
+        if m > 0:
+            wp.launch(
+                kernel_graph.duplicate_edge_weights, dim=m, inputs=[weights, data], device=device
+            )
     return wps.bsr_from_triplets(
         node_count, node_count, rows, cols, data, prune_numerical_zeros=False
     )
@@ -796,6 +826,122 @@ def bfs_multi_source(
         device=device,
     )
     return neighbors, offsets
+
+
+def dijkstra_envelope(
+    adjacency: wps.BsrMatrix[wp.float32], values: wp.array[wp.float32], max_iterations: int = 0
+) -> wp.array[wp.float32]:
+    """
+    Lower every node's value onto the shortest-path envelope ``min_u (values[u] + d(u, v))``.
+
+    Two readings of one relaxation, and both are worth knowing because they are the same call:
+
+    * **Dijkstra.** Seed ``values`` with ``0`` on the source nodes and a number larger than any
+      reachable distance elsewhere, and the result is the weighted multi-source shortest-path
+      distance to the nearest source — ``d`` being the sum of ``adjacency``'s values along the path.
+      Measured equal to [`scipy.sparse.csgraph.dijkstra`][] to 7.1e-07 (``float32`` against
+      ``float64``) on a subdivided icosphere, for one source and for three.
+    * **A Lipschitz cap.** Applied to an arbitrary field it enforces
+      ``values[i] <= values[j] + w(i, j)`` on every edge by lowering values only, so every local
+      minimum of the input survives untouched and only peaks that rise too steeply out of them are
+      shaved down. That is MeshLab's ``apply_scalar_saturation_per_vertex`` (VCG
+      ``UpdateQuality::VertexSaturate``) and the standard way to make a raw scalar usable as a
+      **sizing field**: an adaptive remesher fed an ungraded target-length field produces a band of
+      bad triangles where the field jumps, and this is the projection that removes the jump while
+      respecting the field's small values.
+
+    MeshLab's ``gradientthr`` is not a parameter here because it is a property of the *graph*: its
+    cap is ``|p_i - p_j| / gradientthr``, so dividing the edge lengths by it when building
+    ``adjacency`` reproduces it exactly, and the same weights then serve any other slope.
+
+    Parameters
+    ----------
+    adjacency
+        Square undirected adjacency in 1x1-block ``warp.sparse.BsrMatrix`` form whose **values are
+        the edge weights**, as [`edges_to_csr`][triwarp.graph.edges_to_csr] builds with its
+        ``weights`` argument. Negative weights are not admissible: the iteration would not
+        terminate at the envelope.
+    values
+        Length-``node_count`` ``wp.float32`` initial labels. Not modified.
+    max_iterations
+        Cap on relaxation passes. Each pass propagates one edge further, so the number needed is the
+        graph diameter of the region that violates the bound. ``0`` (the default) means
+        ``node_count``, which can never be exceeded.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        Length-``node_count`` envelope on ``values.device``.
+
+    Raises
+    ------
+    ValueError
+        If ``adjacency`` is not square with 1x1 blocks, if ``max_iterations`` is negative, or if
+        ``values`` is not length ``node_count``.
+
+    Examples
+    --------
+    Geodesic-ish distance from vertex 0 along the mesh's edges — the mesh recipe for both readings,
+    since the weights are what make the envelope geometric:
+
+    ```python
+    n_vertices = int(v.shape[0])
+    edges = tw.edges.edges_unique(f, n_vertices=n_vertices)[0]
+    lengths = tw.edges.edges_unique_length(v, f, edges)
+    adjacency = tw.graph.edges_to_csr(n_vertices, edges, lengths)
+    seed = wp.full(n_vertices, 1.0e6, dtype=wp.float32, device=v.device)
+    wp.copy(seed[:1], wp.zeros(1, dtype=wp.float32, device=v.device))
+    print(float(tw.reduce.max(tw.graph.dijkstra_envelope(adjacency, seed))))
+    ```
+
+    Notes
+    -----
+    One kernel launch per pass, double-buffered, so a pass is a pure function of the previous
+    labels and the answer does not depend on thread interleaving. The pass count is data-dependent
+    and each pass ends in one ``int32`` readback (~0.1 ms against ~1 ms of launches per pass on a
+    scan mesh), which is the cheaper side of that trade — see the ``linalg`` note on
+    ``check_every``.
+
+    For distance *across* a surface rather than along its edges — shorter, and what "geodesic"
+    usually means — use [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]. The edge-graph
+    distance is an upper bound on it.
+
+    See Also
+    --------
+    [`edges_to_csr`][triwarp.graph.edges_to_csr]
+    [`bfs`][triwarp.graph.bfs]
+    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
+    [`triwarp.remesh.isotropic_remesh`][triwarp.remesh.isotropic_remesh]
+    [`scipy.sparse.csgraph.dijkstra`][]
+    """
+    node_count, offsets, columns = _validate_square_csr(adjacency)
+    if max_iterations < 0:
+        raise ValueError(f"max_iterations must be non-negative, got {max_iterations}")
+    if int(values.shape[0]) != node_count:
+        raise ValueError(
+            f"values must have one entry per node, got {values.shape[0]} for {node_count} nodes"
+        )
+
+    device = values.device
+    labels = wp.clone(values)
+    if node_count == 0:
+        return labels
+
+    weights = adjacency.values  # pyright: ignore[reportAttributeAccessIssue]
+    relaxed = wp.empty(node_count, dtype=wp.float32, device=device)
+    changed = wp.zeros(1, dtype=wp.int32, device=device)
+    for _ in range(max_iterations or node_count):
+        changed.zero_()
+        wp.launch(
+            kernel_graph.dijkstra_envelope_pass,
+            dim=node_count,
+            inputs=[offsets, columns, weights, labels, relaxed, changed],
+            device=device,
+        )
+        labels, relaxed = relaxed, labels
+        if int(changed.numpy()[0]) == 0:
+            break
+    return labels
 
 
 # --- private helpers ---------------------------------------------------------------------
