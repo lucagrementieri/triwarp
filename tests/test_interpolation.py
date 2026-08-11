@@ -8,6 +8,7 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
+from tests.conversions import points_to_pyvista
 
 
 @pytest.mark.parity("average_onto_faces", "igl")
@@ -258,3 +259,183 @@ def test_transfer_onto_vertices_empty(device: str):
     )
     assert np.array_equal(transferred_wp.numpy(), np.zeros(3, dtype=np.float32))
     assert np.isinf(distance_wp.numpy()).all()
+
+
+def _scattered_cloud(
+    device: str, n_source: int = 500, n_query: int = 50
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build a random source cloud carrying ``x ** 2`` and random queries, as the reference does."""
+    rng = np.random.default_rng(0)
+    source_np = rng.uniform(-1.0, 1.0, size=(n_source, 3))
+    return source_np, source_np[:, 0] ** 2, rng.uniform(-1.0, 1.0, size=(n_query, 3))
+
+
+def _interpolate_pv(
+    source_np: np.ndarray,
+    values_np: np.ndarray,
+    query_np: np.ndarray,
+    radius: float,
+    sharpness: float,
+    n_points: int | None = None,
+) -> np.ndarray:
+    """``DataSet.interpolate``: ``vtkPointInterpolator`` with a ``vtkGaussianKernel``."""
+    source_pv = points_to_pyvista(source_np)
+    source_pv.point_data["v"] = np.ascontiguousarray(values_np)
+    interpolated_pv = points_to_pyvista(query_np).interpolate(
+        source_pv, radius=radius, sharpness=sharpness, n_points=n_points, null_value=0.0
+    )
+    return np.asarray(interpolated_pv.point_data["v"])
+
+
+def _interpolate_wp(
+    source_np: np.ndarray,
+    values_np: np.ndarray,
+    query_np: np.ndarray,
+    radius: float,
+    sharpness: float,
+    device: str,
+    k: int | None = None,
+) -> np.ndarray:
+    return tw.interpolation.interpolate_from_points(
+        wp.array(np.ascontiguousarray(source_np, dtype=np.float32), dtype=wp.vec3, device=device),
+        wp.array(
+            np.ascontiguousarray(values_np, dtype=np.float32), dtype=wp.float32, device=device
+        ),
+        wp.array(np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=device),
+        radius,
+        k=k,
+        sharpness=sharpness,
+    ).numpy()
+
+
+@pytest.mark.parametrize(("radius", "sharpness"), [(0.2, 1.0), (0.2, 2.0), (0.2, 8.0), (1.0, 2.0)])
+@pytest.mark.parity("interpolate_from_points", "pyvista")
+def test_interpolate_from_points_matches_pyvista(device: str, radius: float, sharpness: float):
+    """
+    Class A, element-wise, against ``DataSet.interpolate`` — the same Gaussian kernel.
+
+    The weight was **recovered** from the reference rather than read from its docs: on a two-source
+    probe VTK's answer matches ``exp(-(sharpness * d / radius) ** 2)`` to eight digits and nothing
+    else (a ``sharpness * (d / radius) ** 2`` form and a Shepard ``1 / d ** sharpness`` form are
+    both ruled out, at 0.30153478 against 0.39651675 and 0.13793103). ``sharpness`` is swept as the
+    live axis, and the sweep starts at 1.0 because VTK **clamps it up** to that — its own ``0.5``
+    behaves as ``1.0``.
+    """
+    source_np, values_np, query_np = _scattered_cloud(device)
+    interpolated_pv = _interpolate_pv(source_np, values_np, query_np, radius, sharpness)
+    interpolated_wp = _interpolate_wp(
+        source_np, values_np, query_np, radius, sharpness, device=device
+    )
+    # Anti-vacuity: a radius that reached nothing would make both sides the null value everywhere.
+    assert (interpolated_pv != 0.0).sum() > 0.8 * query_np.shape[0]
+    assert np.allclose(interpolated_wp, interpolated_pv, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("k", [4, 16])
+@pytest.mark.parity("interpolate_from_points", "pyvista")
+def test_interpolate_from_points_k_nearest_matches_pyvista(device: str, k: int):
+    """
+    Class A on the k-nearest footprint, against ``interpolate(n_points=k)``.
+
+    Measured: the reference still scales the weights by ``radius`` in this mode — the footprint is
+    the only thing ``n_points`` changes, so a row of the same ``k`` neighbours interpolates
+    differently at a different radius (0.30153478 / 0.44769209 / 0.48687801 at radius 1 / 2 / 4).
+    That is why ``radius`` stays required here.
+    """
+    source_np, values_np, query_np = _scattered_cloud(device)
+    interpolated_pv = _interpolate_pv(source_np, values_np, query_np, 1.0, 2.0, n_points=k)
+    interpolated_wp = _interpolate_wp(source_np, values_np, query_np, 1.0, 2.0, device=device, k=k)
+    assert (interpolated_pv != 0.0).all()
+    assert np.allclose(interpolated_wp, interpolated_pv, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parity("interpolate_from_points", "pyvista")
+def test_interpolate_from_points_is_exact_at_the_sources(device: str):
+    """
+    A query on a data point returns that point's value, on both sides — the interpolation property.
+
+    Class A, and it pins a convention rather than a formula: the Gaussian blend of the coincident
+    point's *neighbours* would not reproduce the datum (measured 5.39 against 7.0 on a two-source
+    probe), so VTK short-circuits a zero distance and triwarp copies that.
+    """
+    source_np, values_np, _ = _scattered_cloud(device)
+    coincident_np = source_np[:5]
+    interpolated_pv = _interpolate_pv(source_np, values_np, coincident_np, 0.2, 2.0)
+    interpolated_wp = _interpolate_wp(source_np, values_np, coincident_np, 0.2, 2.0, device=device)
+    assert np.allclose(interpolated_pv, values_np[:5], rtol=1e-6, atol=1e-6)
+    assert np.allclose(interpolated_wp, values_np[:5], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parity("interpolate_from_points", "pyvista")
+def test_interpolate_from_points_unreached_queries_get_the_null_value(device: str):
+    """Class A on the miss case: a radius reaching almost nothing leaves 47 of 50 queries null."""
+    source_np, values_np, query_np = _scattered_cloud(device)
+    interpolated_pv = _interpolate_pv(source_np, values_np, query_np, 0.05, 2.0)
+    interpolated_wp = _interpolate_wp(source_np, values_np, query_np, 0.05, 2.0, device=device)
+    assert (interpolated_pv == 0.0).sum() == 47
+    assert np.array_equal(interpolated_wp == 0.0, interpolated_pv == 0.0)
+    assert np.allclose(interpolated_wp, interpolated_pv, rtol=1e-5, atol=1e-5)
+
+    # The null value is the caller's, and it is what an unreached query gets.
+    far_np = np.array([[100.0, 100.0, 100.0]])
+    filled_wp = tw.interpolation.interpolate_from_points(
+        wp.array(np.ascontiguousarray(source_np, dtype=np.float32), dtype=wp.vec3, device=device),
+        wp.array(
+            np.ascontiguousarray(values_np, dtype=np.float32), dtype=wp.float32, device=device
+        ),
+        wp.array(np.ascontiguousarray(far_np, dtype=np.float32), dtype=wp.vec3, device=device),
+        0.2,
+        null_value=-7.0,
+    )
+    assert filled_wp.numpy()[0] == -7.0
+
+
+def test_interpolate_from_points_vec3_field(device: str):
+    """A ``wp.vec3`` field interpolates componentwise, which is the second registered overload."""
+    source_np, values_np, query_np = _scattered_cloud(device)
+    vectors_np = np.column_stack((values_np, 2.0 * values_np, -values_np))
+    interpolated_wp = tw.interpolation.interpolate_from_points(
+        wp.array(np.ascontiguousarray(source_np, dtype=np.float32), dtype=wp.vec3, device=device),
+        wp.array(np.ascontiguousarray(vectors_np, dtype=np.float32), dtype=wp.vec3, device=device),
+        wp.array(np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=device),
+        0.2,
+    ).numpy()
+    scalar_wp = _interpolate_wp(source_np, values_np, query_np, 0.2, 2.0, device=device)
+    assert np.allclose(interpolated_wp[:, 0], scalar_wp, rtol=1e-5, atol=1e-5)
+    assert np.allclose(interpolated_wp[:, 1], 2.0 * scalar_wp, rtol=1e-5, atol=1e-5)
+    assert np.allclose(interpolated_wp[:, 2], -scalar_wp, rtol=1e-5, atol=1e-5)
+
+
+def test_interpolate_from_points_invalid(device: str):
+    source_np, values_np, query_np = _scattered_cloud(device)
+    source_wp = wp.array(
+        np.ascontiguousarray(source_np, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    values_wp = wp.array(
+        np.ascontiguousarray(values_np, dtype=np.float32), dtype=wp.float32, device=device
+    )
+    query_wp = wp.array(
+        np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    with pytest.raises(ValueError, match="one entry per source point"):
+        tw.interpolation.interpolate_from_points(source_wp, values_wp[:10], query_wp, 0.2)
+    with pytest.raises(ValueError, match="radius must be positive"):
+        tw.interpolation.interpolate_from_points(source_wp, values_wp, query_wp, 0.0)
+    with pytest.raises(ValueError, match="k must be positive"):
+        tw.interpolation.interpolate_from_points(source_wp, values_wp, query_wp, 0.2, k=0)
+
+
+def test_interpolate_from_points_empty(device: str):
+    empty_points = wp.empty(0, dtype=wp.vec3, device=device)
+    empty_values = wp.empty(0, dtype=wp.float32, device=device)
+    query_wp = wp.array([[0.0, 0.0, 0.0]], dtype=wp.vec3, device=device)
+    interpolated_wp = tw.interpolation.interpolate_from_points(
+        empty_points, empty_values, query_wp, 0.5, null_value=3.0
+    )
+    assert interpolated_wp.numpy().tolist() == [3.0]
+    assert (
+        tw.interpolation.interpolate_from_points(
+            empty_points, empty_values, empty_points, 0.5
+        ).shape[0]
+        == 0
+    )

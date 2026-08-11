@@ -1,7 +1,7 @@
 """
-Benchmarks for ``triwarp.interpolation``: the three averaging scatters and the barycentric pull.
+Benchmarks for ``triwarp.interpolation``: averaging scatters, barycentric pull, cloud interpolation.
 
-Two axes, because the module holds two different kinds of function:
+Three axes, because the module holds three different kinds of function:
 
 * **valence** for the three ``average_*`` scatters. Each is ``3F`` atomic adds into ``V`` slots (or
   ``3F`` gathers into ``F`` for the face direction), so in principle a mesh with a few very
@@ -12,6 +12,12 @@ Two axes, because the module holds two different kinds of function:
 * **scale** for ``transfer_onto_vertices``, which is not a scatter at all: it is a closest-point
   query per target vertex plus a barycentric blend, so its cost is the BVH's and nothing this module
   owns.
+* **neighbourhood size** for ``interpolate_from_points``, whose kernel is one pass over the CSR a
+  ball query returns -- so the row is really the query's output size, and the radius is derived from
+  the mean edge length to hold the neighbour count fixed across meshes. Measured 0.73 / 2.35 ms on
+  ``bunny`` at 8 / 64 neighbours, against pyvista's 27 / 97 ms; and 18 ms on ``dragon`` at 64. The
+  64-neighbour case is capped at ``happy_buddha`` because the CSR is ``n_queries * neighborhood``
+  pairs and lucy would ask for 5.0 GB.
 
 ``average_onto_vertices`` and ``transfer_onto_vertices`` were previously timed in
 [`test_vertices.py`](test_vertices.py). They moved here with their group names unchanged, because
@@ -38,8 +44,14 @@ seeds the input attribute and reads the output one; the transfer needs **two** m
 writes into the second, so that row builds a fresh two-mesh MeshSet inside the timed callable --
 twice the ~0.47 µs/vertex build cost, which at ``bunny`` is 34 ms before any transfer happens.
 
-trimesh and open3d have no equivalent for any of the four: attribute averaging over a mesh's
-incidence structure is not something either exposes as a function.
+**pyvista**'s ``DataSet.interpolate`` is ``interpolate_from_points``'s reference: a
+``vtkPointInterpolator`` with a ``vtkGaussianKernel``, given the identical radius and sharpness, so
+the two compute the same weighted mean and differ only in the locator (a ``vtkStaticPointLocator``
+against triwarp's BVH). It is the module's only pyvista row -- VTK has no per-element averaging
+filter, so the three ``average_*`` groups keep libigl.
+
+trimesh and open3d have no equivalent for any of the four mesh-side functions: attribute averaging
+over a mesh's incidence structure is not something either exposes as a function.
 """
 
 from __future__ import annotations
@@ -48,6 +60,7 @@ import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pyvista as pv
 import warp as wp
 from conftest import BenchCase, skip_larger_than
 
@@ -58,6 +71,7 @@ _FIELD_SEED = 5
 _face_field_cache: dict[tuple[str, str], wp.array] = {}
 _vertex_field_cache: dict[tuple[str, str], wp.array] = {}
 _edge_field_cache: dict[tuple[str, str], tuple] = {}
+_edge_length_cache: dict[tuple[str, str], float] = {}
 
 
 def _face_field_np(bench_case: BenchCase) -> np.ndarray:
@@ -76,6 +90,17 @@ def _face_field_wp(bench_case: BenchCase) -> wp.array[wp.float32]:
             device=bench_case.device,
         )
     return _face_field_cache[key]
+
+
+def _mean_edge_length(bench_case: BenchCase) -> float:
+    """Mean undirected edge length, the scale every radius in this module is derived from."""
+    key = (bench_case.mesh_name, "edge-length")
+    if key not in _edge_length_cache:
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        corners_np = vertices_np[faces_np]
+        lengths_np = np.linalg.norm(corners_np - np.roll(corners_np, 1, axis=1), axis=2)
+        _edge_length_cache[key] = float(lengths_np.mean())
+    return _edge_length_cache[key]
 
 
 def _vertex_field_np(bench_case: BenchCase) -> np.ndarray:
@@ -240,3 +265,42 @@ def test_transfer_onto_vertices(bench_case: BenchCase) -> None:
         lambda: tw.interpolation.transfer_onto_vertices(vertices, faces, values, vertices)
     )
     assert transferred.shape == (n_vertices,)
+
+
+@pytest.mark.benchmark(group="interpolate_from_points")
+@pytest.mark.benchlibs("triwarp", "pyvista")
+@pytest.mark.parametrize("neighborhood", [8, 64])
+def test_interpolate_from_points(bench_case: BenchCase, neighborhood: int) -> None:
+    """
+    Scattered-cloud interpolation, on the axis that governs it: the neighbourhood size.
+
+    The mesh's own vertices are both the source cloud and the queries, so the row scales with the
+    mesh; the radius is set from the mean edge length so that a query sees roughly ``neighborhood``
+    sources on every mesh, which is what makes the two points comparable across the sweep rather
+    than measuring the cloud's density. The kernel's cost is one pass over the CSR the ball query
+    returns, so the sweep is really over that query's output size.
+
+    pyvista's ``DataSet.interpolate`` is ``vtkPointInterpolator`` with the identical Gaussian kernel
+    and the same radius, its locator being a ``vtkStaticPointLocator`` where triwarp uses a BVH.
+    """
+    radius = float(np.sqrt(neighborhood / np.pi)) * _mean_edge_length(bench_case)
+    if neighborhood > 8:
+        # The ball query materializes ``n_queries * neighborhood`` (index, distance) pairs before
+        # the kernel reduces them: 8 bytes each, so lucy at 64 asks for 5.0 GB and the allocation
+        # fails outright. The cap is on the *product*, not on the mesh.
+        skip_larger_than(bench_case, "happy_buddha", "a 64-neighbour CSR over lucy needs 5.0 GB")
+    if bench_case.kind == "pyvista":
+        skip_larger_than(bench_case, "bunny", "VTK's point interpolator is a serial locator walk")
+        source_pv = pv.PolyData(np.ascontiguousarray(bench_case.vertices_np, dtype=np.float64))
+        source_pv.point_data["v"] = _vertex_field_np(bench_case)
+        query_pv = pv.PolyData(np.ascontiguousarray(bench_case.vertices_np, dtype=np.float64))
+        interpolated_pv = bench_case.run(
+            lambda: query_pv.interpolate(source_pv, radius=radius, sharpness=2.0)
+        )
+        assert interpolated_pv.n_points == bench_case.n_vertices
+        return
+    points, values = bench_case.vertices_wp, _vertex_field_wp(bench_case)
+    interpolated_wp = bench_case.run(
+        lambda: tw.interpolation.interpolate_from_points(points, values, points, radius)
+    )
+    assert interpolated_wp.shape == (bench_case.n_vertices,)

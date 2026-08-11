@@ -16,7 +16,10 @@ These are unweighted means. For an area- or angle-weighted transfer of *normals*
 [`transfer_onto_vertices`][triwarp.interpolation.transfer_onto_vertices] moves a field between two
 *different* meshes instead of between one mesh's element types, by closest-point projection onto the
 source surface — the operation you need after a remesh or a decimation has changed the vertex set
-under a field.
+under a field. [`interpolate_from_points`][triwarp.interpolation.interpolate_from_points] drops the
+mesh requirement entirely: it interpolates a field known on a scattered *cloud*, which is the only
+function here whose source has no connectivity to average over, and so the only one that needs a
+kernel width rather than an incidence structure.
 """
 
 from __future__ import annotations
@@ -267,3 +270,130 @@ def transfer_onto_vertices(
         device=device,
     )
     return out_values, distance
+
+
+def interpolate_from_points(
+    source_points: wp.array[wp.vec3],
+    source_values: wp.array[DType],
+    query_points: wp.array[wp.vec3],
+    radius: float,
+    *,
+    k: int | None = None,
+    sharpness: float = 2.0,
+    null_value: float = 0.0,
+) -> wp.array[DType]:
+    """
+    Interpolate a field known on a scattered point cloud at arbitrary query points.
+
+    A Gaussian-weighted mean of each query's neighbours, weight
+    ``exp(-(sharpness * d / radius) ** 2)`` — the one transfer in this module that needs no mesh on
+    either side, since the source is a bare cloud. Use it to bring a measured or simulated field
+    onto a mesh's vertices, onto [`grid_points`][triwarp.voxels.grid_points], or onto any other
+    sample set; use
+    [`transfer_onto_vertices`][triwarp.interpolation.transfer_onto_vertices] instead when the source
+    *is* a mesh, since projecting onto its surface is exact for a piecewise-linear field where this
+    is a smoothing.
+
+    Parameters
+    ----------
+    source_points
+        ``(n_source,)`` positions the field is known at.
+    source_values
+        Length-``n_source`` field on those points. Any Warp dtype closed under scaling and addition
+        works: ``wp.float32`` for a scalar, ``wp.vec3`` for a vector.
+    query_points
+        ``(n_query,)`` positions to interpolate at.
+    radius
+        Length scale of the kernel, and — unless ``k`` is given — the footprint: only sources within
+        it contribute. **Required**, and absolute: it is in the coordinates' own units, so a cloud
+        rescaled by 100 needs a radius rescaled by 100. Derive it from the data rather than guessing
+        (e.g. [`mean_edge_length`][triwarp.edges.mean_edge_length] or
+        [`knn_initial_radius`][triwarp.neighbors.knn_initial_radius]).
+    k
+        When given, use the ``k`` nearest sources of each query as the footprint instead of every
+        source within ``radius``, at any distance. ``radius`` still sets the kernel's length scale.
+    sharpness
+        Falloff: a larger value reduces the influence of distant sources. At ``sharpness``,
+        a source at ``radius`` weighs ``exp(-sharpness ** 2)``.
+    null_value
+        Value written where a query has no neighbour at all (or where every weight underflowed to
+        zero). For a ``wp.vec3`` field it fills every component.
+
+    Returns
+    -------
+    wp.array[DType]
+        Length-``n_query`` interpolated field on ``query_points.device``, with ``source_values``'
+        dtype.
+
+    Raises
+    ------
+    ValueError
+        If ``source_values`` does not have one entry per source point, if ``radius`` is not
+        positive, or if ``k`` is given and is not positive.
+
+    Notes
+    -----
+    A query that coincides with a source takes that source's value exactly rather than blending its
+    neighbours, so the interpolant reproduces the data at the data. VTK's kernels do the same.
+
+    This is ``vtkPointInterpolator`` with a ``vtkGaussianKernel``, which pyvista exposes as
+    ``DataSet.interpolate`` — the weight was recovered from its output rather than read from the
+    docs, and agrees to eight digits. Two conventions of the reference are deliberately not copied:
+    it clamps ``sharpness`` up to ``1.0`` (so its own ``0.5`` behaves as ``1.0``), and it offers
+    ``mask_points`` / ``closest_point`` fallbacks for a query with no neighbour. The mask is
+    ``counts == 0`` from [`query_bvh_ball_count`][triwarp.neighbors.query_bvh_ball_count] and the
+    closest-point fallback is this function at ``k=1``, so neither needs a mode of its own.
+
+    See Also
+    --------
+    [`transfer_onto_vertices`][triwarp.interpolation.transfer_onto_vertices]
+    [`query_bvh_ball_with_offsets`][triwarp.neighbors.query_bvh_ball_with_offsets]
+    [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest]
+    """
+    device = query_points.device
+    n_source = int(source_points.shape[0])
+    n_query = int(query_points.shape[0])
+    if int(source_values.shape[0]) != n_source:
+        raise ValueError(
+            f"source_values must have one entry per source point, got "
+            f"{source_values.shape[0]} for {n_source} points"
+        )
+    if not float(radius) > 0.0:
+        raise ValueError(f"radius must be positive, got {radius}")
+    if k is not None and int(k) <= 0:
+        raise ValueError(f"k must be positive when given, got {k}")
+
+    out_values = wp.empty(n_query, dtype=source_values.dtype, device=device)
+    out_values.fill_(null_value)
+    if n_query == 0 or n_source == 0:
+        return out_values
+
+    if k is None:
+        indices, distances, offsets = tw.neighbors.query_bvh_ball_with_offsets(
+            source_points, query_points, float(radius), include_total=True
+        )
+    else:
+        # The padded rows carry index -1 at distance ``inf``, which the kernel skips, so a
+        # fixed-width row is a CSR whose offsets are a constant stride.
+        row_indices, row_distances = tw.neighbors.query_bvh_nearest(
+            source_points, query_points, int(k)
+        )
+        n_slots = n_query * int(k)
+        indices = row_indices.reshape((n_slots,))
+        distances = row_distances.reshape((n_slots,))
+        offsets = tw.array.init_range_step(n_query + 1, int(k), device)
+
+    wp.launch(
+        kernel_interpolation.interpolate_from_points,
+        dim=n_query,
+        inputs=[
+            source_values,
+            indices,
+            distances,
+            offsets,
+            wp.float32(float(sharpness) / float(radius)),
+            out_values,
+        ],
+        device=device,
+    )
+    return out_values
