@@ -7,6 +7,18 @@ import warp as wp
 
 from tests.conversions import trimesh_to_warp
 
+# Reject a launch whose array arguments do not live on the launch device. Warp's default is
+# RELAXED, which passes the pointers straight through: a launch that forgets ``device=`` lands on
+# the default CUDA device, reads the CPU arrays over HMM, returns the *right answer*, and then
+# corrupts the host heap when those arrays are freed while the kernel is still running (measured:
+# 20/20 aborts with a free and no sync, 0/20 with either). CHECKED does not catch it -- it
+# validates addressability, which HMM genuinely provides. STRICT is the only mode that rejects a
+# genuine cross-device argument, and no triwarp launch is intentionally cross-device. It is only
+# half the guard: on a CUDA run an omitted ``device=`` resolves to the arrays' own device, so there
+# is no mismatch to reject and only check 15's static scan sees it.
+if hasattr(wp.config, "launch_array_access_mode"):  # warp >= 1.14
+    wp.config.launch_array_access_mode = wp.config.LaunchArrayAccessMode.STRICT
+
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(

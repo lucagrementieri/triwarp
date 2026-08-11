@@ -723,7 +723,16 @@ def _empty_components(
 def _build_implicit_system(
     operator: wps.BsrMatrix[wp.float32], lamb: float, n: int, device: wp.DeviceLike
 ) -> wps.BsrMatrix[wp.float64]:
-    nnz = int(operator.nnz)
+    # ``nnz_sync()``, never ``operator.nnz``: after ``bsr_from_triplets`` the ``nnz`` field is a
+    # stale cache holding the triplet *capacity* it was handed, duplicates included, and only a
+    # ``nnz_sync()`` repairs it (no other operation does, so whether ``nnz`` reads correctly depends
+    # on unrelated earlier code). The uniform default is duplicate-free so the two agree there, but
+    # a caller-supplied ``cotmatrix`` (12 triplets per face) overshoots 3.4x on an ``icosphere(3)``,
+    # and that gap in these ``wp.empty`` buffers would reach ``bsr_from_triplets`` uninitialized.
+    # Out-of-range garbage indices are dropped silently, but any landing in ``[0, n)`` accumulate a
+    # garbage value into a real entry: measured ``‖values‖ = 1.1e13`` against the correct 84.3 with
+    # the pool holding plausible indices. One host readback per call, not per pass.
+    nnz = operator.nnz_sync()
     n_triplets = nnz + n
     rows, cols, vals = tw.array.triplet_buffers(n_triplets, wp.float64, device)
     wp.launch(
@@ -927,7 +936,7 @@ def smooth_region(
         device=device,
     )
     # M is (n_rows x n_free); build M and M^T from the same (swapped) triplets in a single build
-    # each (never rebuilt/recast — bsr_mm determinism), then A = M^T M is SPD.
+    # each (both single builds, so bsr_mm gets operands whose nnz is exact), then A = M^T M is SPD.
     m_matrix = wps.bsr_from_triplets(n_rows, n_free, rows, cols, vals, prune_numerical_zeros=False)
     mt_matrix = wps.bsr_from_triplets(
         n_free, n_rows, wp.clone(cols), wp.clone(rows), wp.clone(vals), prune_numerical_zeros=False

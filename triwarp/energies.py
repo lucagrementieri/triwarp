@@ -69,9 +69,13 @@ def k_harmonic(
 
     Each power is assembled by one triplet pass over matching CSR rows —
     ``(A M^-1 B)_ij = sum_t A_ti M_t^-1 B_tj`` with both operands symmetric — followed by a single
-    ``bsr_from_triplets``. Deliberately **no** ``warp.sparse.bsr_mm``: the chained sparse triple
-    product is exactly the shape that reproduces its nondeterministic-output bug (still present in
-    Warp 1.16.0, ``issue_report.md``).
+    ``bsr_from_triplets``, so the product is built without ``warp.sparse.bsr_mm``. That choice was
+    originally made to dodge a suspected ``bsr_mm`` nondeterminism, which turned out to be this
+    package's own defect: a triplet buffer sized by ``BsrMatrix.nnz`` — the *capacity* the matrix
+    was built with, not its entry count — left an uninitialized gap that ``bsr_from_triplets`` read
+    back as garbage triplets. ``bsr_mm`` is sound. The triplet pass stays because it is what is
+    tested and measured here; swapping in ``bsr_mm`` is an unbenchmarked performance change, not a
+    correctness fix.
 
     Parameters
     ----------
@@ -638,8 +642,7 @@ def lscm_hessian(
         # The ``-2 A`` term shares its triplet kernel with
         # [`vector_area_matrix`][triwarp.energies.vector_area_matrix] but writes into a slice
         # of the combined buffer: assembling ``A`` as its own matrix and adding it would need a
-        # second build plus a ``bsr_axpy``, which breaks the single-``bsr_from_triplets`` rule this
-        # operator relies on for deterministic ``bsr_mm``.
+        # second build plus a ``bsr_axpy``, where this one pass over exact-size buffers does.
         _vector_area_triplets(
             boundary, n, -2.0, rows[2 * n_entries :], cols[2 * n_entries :], vals[2 * n_entries :]
         )

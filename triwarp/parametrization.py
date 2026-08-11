@@ -460,7 +460,7 @@ def arap(
     n_faces = int(faces.shape[0]) // 3
 
     # Cotangents computed once and reused by both the Laplacian build and the rest-edge flattening;
-    # single native-float64 operator build for determinism (see issue_report.md / cotmatrix docs).
+    # single native-float64 operator build, so nothing is recast or rebuilt (see cotmatrix docs).
     cot_entries = cotmatrix_entries(vertices, faces, dtype=wp.float64)
     laplacian = cotmatrix(vertices, faces, cot_entries=cot_entries, dtype=wp.float64)
 

@@ -31,8 +31,9 @@ The operator family (``k_harmonic``, ``hessian_energy``, ``curved_hessian_energy
 scan sweep: ``igl::crouzeix_raviart_*`` and ``igl::orient_halfedges`` (inside
 ``curved_hessian_energy``) assume edge-manifold input — igl asserts it, triwarp documents it as
 undefined — and the scan meshes are not. Two structural notes on those rows: triwarp assembles
-``k_harmonic`` by a triplet pass per power instead of ``bsr_mm`` (whose chained triple
-product is nondeterministic — issue_report.md), and ``hessian_energy``'s per-vertex work is
+``k_harmonic`` by a triplet pass per power instead of ``bsr_mm`` (originally to avoid a suspected
+``bsr_mm`` bug that turned out to be a triplet-capacity defect of our own, and kept because the swap
+to ``bsr_mm`` is unmeasured), and ``hessian_energy``'s per-vertex work is
 quadratic in valence, which is harmless on the uniform-valence spheres but would dominate on
 ``fan_hub``. Measured (medians, 2026-08-05): every group's margin grows with size, from 1.7-13x at
 ``sphere_small`` to 35-86x at ``sphere_large`` — except ``crouzeix_raviart_massmatrix``, whose

@@ -16,6 +16,15 @@ Fields `nrow` / `ncol` / `nnz` / `offsets` / `row_counts` / `columns` / `values`
 `shape`, `dtype`, `device`, `scalar_type`, `scalar_values`, `block_shape`, `block_size`,
 `requires_grad`.
 - `nnz_sync()` — host-sync the block count after a topology change (a device readback).
+  **`nnz` is a stale upper bound, `nnz_sync()` is the count.** After `bsr_from_triplets` the `nnz`
+  field still holds the *triplet capacity* it was handed, duplicates included — measured 8400 against
+  a true 4516 on a duplicate-emitting Laplacian build, and 3.4x on `laplacian.cotmatrix`. Size any
+  buffer, slice or launch dim off `nnz_sync()` (or `offsets[nrow]`); sizing off `nnz` leaves a tail
+  that is never written, and `bsr_from_triplets` will read it back as triplets. Out-of-range garbage
+  indices are dropped silently, but garbage landing in range accumulates into a real entry.
+  `nnz_sync()` **repairs the `nnz` cache in place** (15 360 → 4 482 on the same object) and nothing
+  else does — `bsr_mv`, `values.numpy()` and `offsets.numpy()` all leave it stale — so a `.nnz` read
+  is correct or not depending on whether earlier code happened to sync that matrix.
 - `notify_nnz_changed(nnz=None, nnz_capacity=None)` — declare a new block count without a readback,
   for when the caller already knows it (used by `triwarp.linalg`).
 - `copy_nnz_async()` — **deprecated in 1.16**; use `notify_nnz_changed()` instead.
@@ -32,7 +41,7 @@ Fields `nrow` / `ncol` / `nnz` / `offsets` / `row_counts` / `columns` / `values`
 - `bsr_diag(block_value) -> BsrMatrix` — block-diagonal matrix from a block value or array.
 - `bsr_from_triplets(rows, cols, values, shape) -> BsrMatrix` — build from COO triplets.
 - `bsr_copy(A) -> BsrMatrix` — copy, optionally changing scalar type.
-- `bsr_compress(src, prune_numerical_zeros=True, inplace=False, topology=None) -> BsrMatrix` — (1.15) sort/coalesce active blocks and compact storage; `topology="padded"` keeps reserved row capacity. **Caution:** calling it on a matrix rebuilt from its own CSR via a second `bsr_from_triplets` makes the next `bsr_mm` crash with an illegal memory access — see `issue_report.md`.
+- `bsr_compress(src, prune_numerical_zeros=True, inplace=False, topology=None) -> BsrMatrix` — (1.15) sort/coalesce active blocks and compact storage; `topology="padded"` keeps reserved row capacity. **Caution:** calling it on a matrix rebuilt from its own CSR via a second `bsr_from_triplets` makes the next `bsr_mm` crash with an illegal memory access (first surfacing in `scan_device`, `warp/native/scan.cu:109`). Confirmed upstream as a CUDA bug, tracked as NVIDIA/warp#1769 — unrelated to the `nnz`-capacity trap above.
 
 ## Matrix Operations
 - `bsr_mv(A, x, y, alpha, beta)` — sparse matrix-vector product with scaling.

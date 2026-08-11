@@ -51,8 +51,9 @@ def sandwich_row_triplets(
 ) -> None:
     # ``(A diag(d) B)_ij = sum_t A_ti d_t B_tj``; with both operands symmetric ``A_ti`` is row
     # ``t``'s entry at column ``i``, so each row of the diagonal sandwich is the scaled outer
-    # product of the two matching CSR rows. This assembles the product without ``bsr_mm``, whose
-    # chained form is nondeterministic on CUDA — see issue_report.md.
+    # product of the two matching CSR rows, assembling the product without ``bsr_mm``. (The
+    # ``bsr_mm`` nondeterminism this originally avoided was a triplet-capacity defect of this
+    # package, not a Warp bug — see ``k_harmonic`` in ``triwarp/energies.py``.)
     t = int(wp.tid())
     weight = inv_mass[t]
     if weight <= type(inv_mass[0])(0.0):

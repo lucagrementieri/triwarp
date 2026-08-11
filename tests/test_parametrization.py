@@ -192,10 +192,11 @@ def test_biharmonic_matches_reference(request, device, mesh_name):
 
 
 def test_biharmonic_is_deterministic(device, hemisphere):
-    # Regression guard for the Warp bsr_mm nondeterminism (issue_report.md): the float64-native
-    # biharmonic operator must give the same result across repeated calls. The bug manifested as
-    # ~1e22 / NaN corruption, so a tight tolerance (well above conjugate-gradient's ~1e-8 atomic
-    # last-ULP jitter) reliably catches a regression.
+    # Regression guard for operator-assembly nondeterminism: the float64-native biharmonic operator
+    # must give the same result across repeated calls. The original defect sized a rebuild's triplet
+    # buffers by ``BsrMatrix.nnz`` (the capacity, not the entry count) and so fed the uninitialized
+    # tail to ``bsr_from_triplets``, manifesting as ~1e22 / NaN corruption; a tight tolerance (well
+    # above conjugate-gradient's ~1e-8 atomic last-ULP jitter) reliably catches a regression.
     _, mesh_wp = hemisphere
     boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
     boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)

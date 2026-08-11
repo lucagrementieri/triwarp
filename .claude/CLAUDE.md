@@ -88,6 +88,44 @@ For element-wise dtype conversion of `wp.array` buffers at Python scope, allocat
 
 Inside kernels, keep using `wp.cast(expr, TargetType)` for scalar and vector conversions.
 
+### `BsrMatrix.nnz` is a stale capacity; `nnz_sync()` is the entry count
+
+**Never size a buffer, slice, or launch dim off `matrix.nnz`.** After `bsr_from_triplets` the `nnz`
+field still holds the *triplet count it was handed*, duplicates included — so for any
+duplicate-emitting build it is an upper bound, measured at 8400 against a true 4516 on the synthetic
+Laplacian of `downloads/issue_report.md` and **3.4x** (15 360 against 4 482) on
+`laplacian.cotmatrix`, which emits 12 triplets per face. Use **`matrix.nnz_sync()`** (one host
+readback, §13's ~0.1 ms) or read `offsets[nrow]`, which `energies.k_harmonic` already does.
+
+**And `nnz` is a *cache*, not a fixed field: `nnz_sync()` repairs it in place.** Measured on 1.16.0 —
+`int(m.nnz)` reads 15 360, then `m.nnz_sync()` returns 4 482, and `int(m.nnz)` now reads 4 482 too;
+nothing else syncs it (`bsr_mv`, `values.numpy()`, `offsets.numpy()` all leave it stale). So whether
+a `.nnz` read is correct depends on whether unrelated earlier code happened to sync that matrix,
+which makes the bug order-dependent and is a live trap **for the test as much as the code**: a guard
+that measures the capacity and then hands the *same* matrix to the function under test has already
+repaired it, and passes against the broken implementation. Build two operators — one to measure, one
+to hand over (see `test_filter_laplacian_implicit_duplicate_built_operator`).
+
+The failure is silent and it is not a Warp bug. Sizing a `triplet_buffers` allocation by `nnz` leaves
+the tail `[nnz_sync(), nnz)` unwritten, and since those buffers are `wp.empty` (§4, deliberately) the
+gap reaches the next `bsr_from_triplets` as **uninitialized triplets**. `bsr_from_triplets` drops an
+out-of-range row/column index silently — verified for both `999999` and `-7`, no exception and no
+CUDA fault — so most garbage vanishes and the answer looks right; the entries whose garbage index
+happens to land in `[0, nrow)` accumulate a garbage value into a **real** entry. Measured on
+`_build_implicit_system` with a `cotmatrix` operator and plausible indices left in the memory pool:
+`‖values‖ = 1.1e13` against the correct `84.3`, plus one spurious entry. This is what the
+long-standing "`bsr_mm` is nondeterministic on CUDA" claim in this package really was, in
+`downloads/issue_report.md` and in six code comments — **`bsr_mm` is sound**; do not reintroduce that
+explanation. A rebuild sliced to `nnz_sync()` is safe.
+
+Two corollaries. A matrix built by *duplicate-free* triplets (`laplacian.laplacian`,
+`smoothing._edge_weight_matrix`) has `nnz == nnz_sync()`, which is why the default paths never
+showed this — so a probe on the default operator proves nothing, and the check belongs on a
+`cotmatrix`-shaped input. And where a triplet writer legitimately leaves slots unwritten (a
+conditional emit, as in `dirichlet_system_triplets` / `laplacian_ls_triplets`), `wp.zeros` rather
+than `triplet_buffers` is correct and deliberate: a `(0, 0, 0.0)` triplet is a harmless structural
+zero.
+
 ### NumPy at Python scope is sanctioned; leaking it through the API is not
 
 `warp-lang` carries an unconditional `Requires-Dist: numpy` and `import warp` loads it eagerly, and
@@ -617,7 +655,19 @@ Tests may use `import triwarp.typing as twt` for annotations (e.g. `expected: tw
 
 ## 8. Device Checks
 
-**Do not check that input arrays share the same device.** Warp raises a clear error automatically when mismatched devices are used in `wp.launch` or array operations, so manual `if arr.device != device: raise ValueError(...)` guards are redundant. Omit them entirely.
+**Do not check that input arrays share the same device.** Manual `if arr.device != device: raise ValueError(...)` guards are redundant — the harness rejects the mismatch for you (below), and §14 forbids a docstring documenting a `ValueError` for arrays "on different devices". Omit them entirely.
+
+**But do not believe that `wp.launch` raises on a device mismatch — it has not since Warp 1.14.** That release removed the unconditional same-device check (`NVIDIA/warp` GH-1461) so that hardware-coherent launches would be legal, and the default `wp.config.launch_array_access_mode` is `RELAXED`, which passes the pointers straight through and validates nothing. On this box the consequences are asymmetric and both are silent:
+
+- **CPU arrays, CUDA launch** (a launch that forgot `device=`, resolving to `cuda:0`): the GPU reads the host arrays over HMM (`is_cpu_memory_access_from_gpu_supported` is `True` here) and computes the **right answer** — then the launch is *asynchronous*, so when those host arrays are freed while the kernel is still running the heap is corrupted and the process aborts in `malloc` much later. Measured on a 97-line repro: 20/20 aborts when the arrays are freed without a sync, **0/20** when nothing is freed (`os._exit`), and **0/20** when `wp.synchronize()` precedes the free. The same pattern on `cuda:0` arrays is safe because CUDA frees are stream-ordered; host frees carry no ordering, and nothing at the call site distinguishes the two.
+- **CUDA arrays, CPU launch**: immediate `SIGSEGV`, no Python exception (GH-1693).
+
+Four consequences for triwarp:
+
+- **`tests/conftest.py` sets `LaunchArrayAccessMode.STRICT`**, the only mode that rejects a *genuine* cross-device argument; `CHECKED` validates addressability, which HMM genuinely provides, so it permits the launch and still corrupts (measured 2/30). The full suite passes under `STRICT` (2 113 tests), so no triwarp launch is intentionally cross-device — keep it that way.
+- **`STRICT` alone would not have caught the bug that motivated it, which is why check 15 exists.** It only fires when an argument is *not* on the launch device, so on a CUDA run — this box, and CI — an omitted `device=` resolves to `cuda:0`, which *is* the arrays' device, and nothing is rejected. The corruption then waits for a CPU run. `test_launches_name_their_device` scans every launch site statically and is the half that sees it; the two guards cover different halves and neither replaces the other.
+- **§3's "always forward the `device`" is a memory-safety rule, not a tidiness one.** All 476 `wp.launch` / `wp.launch_tiled` calls in `triwarp/` name a device; a new one that does not is the defect above.
+- **`.numpy()` is not a sync on a CPU array.** On a CUDA array it synchronizes; on a host array it is a zero-copy view, so "I read the result and it was correct" proves nothing about whether the kernel finished.
 
 ---
 
@@ -829,7 +879,7 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
 ## 14. Evolving the Public API
 
 **`tests/test_api_conventions.py` is the mechanical half of this section**, and it fails the default
-`pytest` run. Fourteen checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
+`pytest` run. Fifteen checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
 summary line naming a reference library (§10); a `*_mask` producer that does not return
 `wp.array[wp.bool]`; a module summary advertising Warp; a module without a `tests/` **and** a
 `benchmarks/` file named for it; a private name reached across a module boundary; one public name
@@ -840,7 +890,14 @@ Two enforce an earlier section's convention on kernel code: §3's `out_` prefix 
 position for a written argument (its two exemption classes carried as `_KERNEL_OUTPUT_ALLOWLIST`),
 and §2's subscript-style array annotation — the latter scans the whole package, because only in an
 *annotation* position is `wp.array(dtype=T)` the stale spelling rather than a legal allocation.
-The last three are newer and each exists because the same defect was found twice:
+The last four are newer and each exists because the same defect was found twice:
+
+- **A `wp.launch` / `wp.launch_tiled` with no `device=`.** Check 15, and it is a memory-safety guard
+  rather than a style one — see §8 for the measured failure. It is also the *load-bearing* half of
+  that guard: `tests/conftest.py`'s `STRICT` mode only fires when an argument is genuinely off the
+  launch device, so on a **CUDA** run the omitted argument resolves to the arrays' own device and
+  nothing is rejected, which is precisely how the original defect passed CI and hurt only CPU users.
+  Only the scan sees it there.
 
 - **An allocation with no `device=`.** `wp.zeros` / `empty` / `ones` / `full` / `array` at Python
   scope land on Warp's *current* device, and the suite cannot see the difference because a test

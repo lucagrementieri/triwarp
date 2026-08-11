@@ -268,6 +268,16 @@ _HELPER_ORDER_ALLOWLIST: dict[str, frozenset[str]] = {
     "creation": frozenset({"_icosphere_face_table"})
 }
 
+# --- check 15 -----------------------------------------------------------------------------------
+
+# The Python-scope launchers that take a ``device`` keyword.
+_LAUNCHERS = frozenset({"launch", "launch_tiled"})
+
+# Launches that deliberately fall back to Warp's current device, keyed by ``(module, kernel)``.
+# Empty on purpose: every one of the package's launches forwards a device, and a new entry needs a
+# reason a reader can check, because the failure mode is silent memory corruption on CPU runs.
+_LAUNCH_DEVICE_ALLOWLIST: dict[tuple[str, str], str] = {}
+
 # --- check 13 -----------------------------------------------------------------------------------
 
 # Kernel-scope calls whose first argument is a buffer the kernel writes.
@@ -1045,4 +1055,60 @@ def array_annotation_style_problems() -> list[str]:
                         f"'{ast.unparse(node)}' uses the pre-1.12 call style -- write it as "
                         f"{target}[...] instead"
                     )
+    return problems
+
+
+# --- check 15 -----------------------------------------------------------------------------------
+
+
+def launch_device_problems() -> list[str]:
+    """
+    Check 15: a ``wp.launch`` / ``wp.launch_tiled`` that does not name the device it launches on.
+
+    An omitted ``device=`` resolves to Warp's *current* device, which is ``cuda:0`` whenever CUDA is
+    present. When the arrays are on the CPU the launch is not rejected and not wrong: Warp permits
+    it by design on a system whose GPU can address host memory (``RELAXED`` and ``CHECKED`` both
+    pass it), and the kernel returns the correct answer. What it does not get is ordering, so the
+    host buffers are freed at scope exit while the kernel is still reading them, and the process
+    aborts later inside glibc -- measured on the reduced reproducer at 20/20 aborts with a free and
+    no synchronize against 0/20 with either. ``vertices.mean_vertex_normals`` shipped this way.
+
+    This is the static half of the guard and it is the half that carries the load. The runtime half
+    (``tests/conftest.py`` sets ``LaunchArrayAccessMode.STRICT``) only bites when the arrays are not
+    on the launch device, so on a CUDA run -- what CI and this box do -- the default device *is* the
+    arrays' device and the omission stays invisible. Only the scan sees it there.
+    """
+    problems: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
+        relative = path.relative_to(_PACKAGE_DIR)
+        module = ".".join(relative.with_suffix("").parts).removesuffix(".__init__")
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue  # test_package_scan_is_discoverable reports the parse failure
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr not in _LAUNCHERS or _dotted(node.func)[:1] != ("wp",):
+                continue
+            if any(keyword.arg in ("device", None) for keyword in node.keywords):
+                continue  # a **kwargs splat may be forwarding one; miss it rather than misfire
+            kernel = ast.unparse(node.args[0]) if node.args else node.func.attr
+            key = (module, kernel)
+            if key in _LAUNCH_DEVICE_ALLOWLIST:
+                seen.add(key)
+                continue
+            problems.append(
+                f"triwarp/{relative.as_posix()}:{node.lineno}: wp.{node.func.attr}({kernel}, ...) "
+                "has no device= -- it launches on Warp's *current* device, so with CPU arrays it "
+                "runs the kernel on cuda:0 over host pointers, returns the right answer, and "
+                "corrupts the host heap when those arrays are freed mid-kernel; forward the device "
+                "of the input arrays"
+            )
+    problems.extend(
+        f"_LAUNCH_DEVICE_ALLOWLIST entry {key!r} matches nothing in triwarp/ -- drop it"
+        for key in sorted(_LAUNCH_DEVICE_ALLOWLIST)
+        if key not in seen
+    )
     return problems

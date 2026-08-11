@@ -30,6 +30,7 @@ from tests.api_conventions import (
     installed_warp_version,
     kernel_module_problems,
     kernel_output_naming_problems,
+    launch_device_problems,
     library_in_summary_problems,
     mask_return_problems,
     private_import_problems,
@@ -38,6 +39,7 @@ from tests.api_conventions import (
     warp_suffix_problems,
     warp_version_problems,
 )
+from triwarp.kernels import array as kernel_array
 
 
 def _fail(headline: str, problems: list[str]) -> None:
@@ -179,6 +181,42 @@ def test_allocations_name_their_device() -> None:
     ``array.index_sparse`` raised only under ``wp.ScopedDevice("cpu")`` with ``cuda:0`` inputs.
     """
     _fail("allocation(s) without device=:", allocation_device_problems())
+
+
+def test_launches_name_their_device() -> None:
+    """
+    Every ``wp.launch`` / ``wp.launch_tiled`` names the ``device`` it launches on.
+
+    An omitted one resolves to Warp's current device -- ``cuda:0`` whenever CUDA is present -- so
+    with CPU arrays the kernel runs on the GPU over host pointers. Warp permits that by design
+    where the GPU can address host memory, and it returns the *correct answer*, which is why
+    ``vertices.mean_vertex_normals`` shipped it: the launch acquires no ordering, the host buffers
+    are freed at scope exit while the kernel still reads them, and the process aborts later inside
+    glibc (20/20 aborts with a free and no synchronize, 0/20 with either).
+
+    The ``STRICT`` launch mode set in ``tests/conftest.py`` is the runtime half of this guard, and
+    it cannot replace the scan: it only fires when the arrays are not on the launch device, so on a
+    CUDA run the default device is the arrays' device and the omission is invisible to it.
+    """
+    _fail("launch(es) without device=:", launch_device_problems())
+
+
+def test_strict_launch_mode_rejects_a_cross_device_launch() -> None:
+    """
+    The ``STRICT`` mode set in ``tests/conftest.py`` is in force and actually raises.
+
+    Setting a config flag proves nothing on its own: ``launch_array_access_mode`` is consulted per
+    launch, and a suite whose arrays all sit on the launch device would pass identically with the
+    flag unset. So this deliberately mismatches one launch and requires the exception. ``CHECKED``
+    would *not* raise here -- it validates addressability, which HMM provides -- which is why the
+    harness sets ``STRICT``.
+    """
+    assert wp.config.launch_array_access_mode == wp.config.LaunchArrayAccessMode.STRICT
+    if not wp.is_cuda_available():
+        pytest.skip("a cross-device launch needs a CUDA device to launch on")
+    indices = wp.empty(4, dtype=wp.int32, device="cpu")
+    with pytest.raises(RuntimeError, match="device"):
+        wp.launch(kernel_array.init_range, dim=4, inputs=[indices], device="cuda:0")
 
 
 def test_kernel_outputs_are_named_and_placed() -> None:
