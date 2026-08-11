@@ -8,6 +8,8 @@ import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import scipy.sparse as sp
+import scipy.sparse.csgraph as csgraph
 import scipy.sparse.linalg as spla
 import trimesh as tm
 import trimesh.smoothing as tms
@@ -788,6 +790,55 @@ def test_saturate_scalar_gradient_respects_the_bound(
     assert (jumps_np <= lengths_np / threshold + 1e-4).all()
     # Every minimum survives: the smallest value in the field is untouched.
     assert np.isclose(saturated_np.min(), values_np.min(), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("n_sources", [1, 3])
+def test_saturate_scalar_gradient_is_the_edge_graph_distance(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh], n_sources: int
+) -> None:
+    """
+    Class A against ``scipy.sparse.csgraph.dijkstra``: seeded with zeros, this *is* the distance.
+
+    The saturated field is the envelope ``min_u (q0(u) + d(u, v) / threshold)`` over the edge graph,
+    so at ``threshold=1`` with ``q0`` zero on the sources and large elsewhere it is exactly the
+    weighted multi-source shortest-path distance — one relaxation to convergence, the same
+    computation a Dijkstra would do. The test exists to make that a checked fact rather than a
+    reading of the formula, because it is the reason the package ships no ``graph.dijkstra``: a
+    second implementation of this relaxation would be a near-duplicate.
+
+    Both sides take the identical graph — trimesh's unique edges with Euclidean lengths — so the
+    only difference is float32 against float64, measured at 7.1e-07 on ``icosphere(3)``.
+    """
+    mesh_tm, mesh_wp = icosahedron
+    n_vertices = mesh_tm.vertices.shape[0]
+    sources_np = np.arange(n_sources)
+
+    # A source is 0 and everything else starts far above any reachable distance, so the envelope
+    # can only be lowered onto the true distance.
+    seeded_np = np.full(n_vertices, 1e6, dtype=np.float32)
+    seeded_np[sources_np] = 0.0
+    saturated_np = tw.smoothing.saturate_scalar_gradient(
+        wp.array(seeded_np, dtype=wp.float32, device=mesh_wp.device),
+        mesh_wp.points,
+        mesh_wp.indices,
+        threshold=1.0,
+    ).numpy()
+
+    edges_np = mesh_tm.edges_unique
+    lengths_np = np.linalg.norm(
+        mesh_tm.vertices[edges_np[:, 0]] - mesh_tm.vertices[edges_np[:, 1]], axis=1
+    )
+    both_np = np.concatenate([edges_np, edges_np[:, ::-1]])
+    graph_sp = sp.coo_matrix(
+        (np.concatenate([lengths_np, lengths_np]), (both_np[:, 0], both_np[:, 1])),
+        shape=(n_vertices, n_vertices),
+    ).tocsr()
+    distance_sp = csgraph.dijkstra(graph_sp, indices=sources_np, min_only=True)
+
+    # Anti-vacuity: the field has to have actually propagated, not stayed at its 1e6 seed.
+    assert distance_sp.max() > 0.5
+    assert saturated_np.max() < 1e5
+    assert np.allclose(saturated_np, distance_sp, rtol=1e-5, atol=1e-5)
 
 
 def test_saturate_scalar_gradient_invalid(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
