@@ -26,6 +26,18 @@ def tolerance_sign(value: wp.float32) -> wp.int32:
 
 
 @wp.func
+def sign_with_tolerance(value: wp.float32, tolerance: wp.float32) -> wp.int32:
+    # ``tolerance_sign`` with the dead zone exposed as an argument, for callers whose tolerance is
+    # scale-dependent rather than fixed at ``TOLERANCE_MERGE`` (a plane split's snap band scales
+    # with the model). Pass ``TOLERANCE_MERGE`` to recover ``tolerance_sign`` exactly.
+    if value < -tolerance:
+        return wp.int32(-1)
+    if value > tolerance:
+        return wp.int32(1)
+    return wp.int32(0)
+
+
+@wp.func
 def wrap_index(i: wp.int32, n: wp.int32) -> wp.int32:
     # Positive modulo: ``%`` follows C++11 semantics (sign of the dividend).
     return ((i % n) + n) % n

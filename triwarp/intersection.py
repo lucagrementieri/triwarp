@@ -22,6 +22,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_nonempty_mesh
+from triwarp.constants import TOLERANCE_MERGE
 from triwarp.kernels import intersection as kernel_intersections
 
 
@@ -131,10 +132,7 @@ def mesh_with_plane(
             return empty_segments, wp.empty(0, dtype=wp.int32, device=device)
         return empty_segments
 
-    vertex_dots = wp.empty(int(vertices.shape[0]), dtype=wp.float32, device=device)
-    wp.map(
-        kernel_intersections.point_plane_dot, vertices, plane_origin, plane_normal, out=vertex_dots
-    )
+    vertex_dots = _plane_dots(vertices, plane_origin, plane_normal)
 
     valid = wp.empty(n_faces, dtype=wp.bool, device=device)
     segments = wp.empty((n_faces, 2), dtype=wp.vec3, device=device)
@@ -513,11 +511,161 @@ def slice_mesh_with_plane(
     if int(faces.shape[0]) == 0:
         return wp.empty(0, dtype=wp.vec3, device=device), wp.empty(0, dtype=wp.int32, device=device)
 
-    vertex_dots = wp.empty(n_vertices, dtype=wp.float32, device=device)
-    wp.map(
-        kernel_intersections.point_plane_dot, vertices, plane_origin, plane_normal, out=vertex_dots
+    return _clip_with_vertex_field(
+        vertices,
+        faces,
+        _plane_dots(vertices, plane_origin, plane_normal),
+        plane_normal=plane_normal,
     )
-    return _clip_with_vertex_field(vertices, faces, vertex_dots, plane_normal=plane_normal)
+
+
+def split_mesh_with_plane(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    plane_normal: wp.vec3,
+    plane_origin: wp.vec3,
+    *,
+    tolerance: float = TOLERANCE_MERGE,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.bool]]:
+    """
+    Insert a plane's cross-section into the mesh as real edges, keeping both sides.
+
+    The third thing a plane can do to a mesh, next to
+    [`mesh_with_plane`][triwarp.intersection.mesh_with_plane], which returns the section curve and
+    leaves the mesh alone, and
+    [`slice_mesh_with_plane`][triwarp.intersection.slice_mesh_with_plane], which keeps one side and
+    discards the other: this keeps **everything** and refines the triangles the plane crosses so the
+    section becomes a set of mesh edges, then labels every output face by the side it fell on. It is
+    what to reach for to select a region by a plane and then remesh, decimate or smooth only that
+    region, since the complementary side is still there to be welded back to.
+
+    The result is **crack-free**: the crossing point of an edge is computed once per *edge*, so the
+    two triangles sharing it reference one vertex index and a watertight input stays watertight.
+    That is the difference from
+    [`slice_mesh_with_plane`][triwarp.intersection.slice_mesh_with_plane], whose per-face cut leaves
+    two coincident copies along the section.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` flat triangle index buffer.
+    plane_normal
+        Normal vector of the plane. Need not be unit length, but ``tolerance`` is a band on
+        ``dot(v - plane_origin, plane_normal)``, so a non-unit normal scales it.
+    plane_origin
+        Point on the plane.
+    tolerance
+        Half-width of the band around the plane within which a vertex counts as lying *on* it. Such
+        a vertex is used as the crossing itself rather than having a near-duplicate inserted beside
+        it, which is what keeps a plane through an existing vertex from producing slivers. Defaults
+        to [`TOLERANCE_MERGE`][triwarp.constants.TOLERANCE_MERGE]; scale it with the model when the
+        coordinates are large.
+
+    Returns
+    -------
+    new_vertices : wp.array[wp.vec3]
+        Original vertices followed by one crossing point per crossed edge.
+    new_faces : wp.array[wp.int32]
+        Length-``3 * m`` flat triangle index buffer for the refined mesh, both sides included.
+    above : wp.array[wp.bool]
+        ``(m,)`` per-face mask: ``True`` where the face is on the ``plane_normal`` side. This is the
+        side [`slice_mesh_with_plane`][triwarp.intersection.slice_mesh_with_plane] returns,
+        including its tie-break for a face lying *in* the plane (kept when its own normal opposes
+        ``plane_normal``), so
+        ``submesh_from_face_mask(*split_mesh_with_plane(...))`` and ``slice_mesh_with_plane`` agree.
+
+    Notes
+    -----
+    A plane crosses at most **two** of a triangle's three edges — two of three vertices always share
+    a side, so their edge is not crossed — which means every crossed face is refined by the 1-split
+    or 2-split case of [`subdivide_to_size`][triwarp.remesh.subdivide_to_size]'s crack-free
+    templates, reused unchanged. Those templates are indexed by *which* corners carry a new vertex
+    and never assume the new vertex is a midpoint, so the plane crossing drops straight in. The
+    2-split quad is cut along its shorter diagonal, as there; both of its diagonals lie wholly on
+    one side of the plane, so the choice cannot make a face straddle.
+
+    Faces are **not** reordered: an output face's position is the compaction order of the split
+    templates, not grouped by side. Pass ``above`` to
+    [`submesh_from_face_mask`][triwarp.selection.submesh_from_face_mask] (or its negation) to
+    materialize either half.
+
+    Equivalent to VTK's ``vtkClipPolyData`` with ``GenerateClippedOutput``, which pyvista exposes as
+    ``PolyData.clip(..., return_clipped=True)``, and to MeshLib's ``subdivideWithPlane``.
+
+    Examples
+    --------
+    Split at ``z = 0`` and confirm both halves are non-empty and together account for every face:
+
+    ```python
+    split_v, split_f, above = tw.intersection.split_mesh_with_plane(
+        v, f, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0)
+    )
+    n_above = int(tw.array.flatnonzero(above).shape[0])
+    print(0 < n_above < int(above.shape[0]))
+    ```
+
+    See Also
+    --------
+    [`slice_mesh_with_plane`][triwarp.intersection.slice_mesh_with_plane]
+    [`mesh_with_plane`][triwarp.intersection.mesh_with_plane]
+    [`triwarp.remesh.split_edges`][triwarp.remesh.split_edges]
+    [`triwarp.remesh.subdivide_to_size`][triwarp.remesh.subdivide_to_size]
+    [`triwarp.selection.submesh_from_face_mask`][triwarp.selection.submesh_from_face_mask]
+    """
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    if n_vertices == 0 or n_faces == 0:
+        return wp.clone(vertices), wp.clone(faces), wp.empty(n_faces, dtype=wp.bool, device=device)
+
+    vertex_dots = _plane_dots(vertices, plane_origin, plane_normal)
+
+    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    n_edges = int(unique_edges.shape[0])
+    crossed = wp.empty(n_edges, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_intersections.plane_crossed_edge_mask,
+        dim=n_edges,
+        inputs=[unique_edges, vertex_dots, wp.float32(tolerance), crossed],
+        device=device,
+    )
+    # ``split_edges`` scans the mask itself; this scan exists because the crossing points must be
+    # written at the slots that scan assigns, which is the ordering it documents for them.
+    offsets, n_crossed = tw.array.counts_to_offsets(tw.array.astype(crossed, wp.int32))
+
+    crossing_points = wp.empty(n_crossed, dtype=wp.vec3, device=device)
+    if n_crossed > 0:
+        wp.launch(
+            kernel_intersections.plane_edge_crossing_points,
+            dim=n_edges,
+            inputs=[vertices, unique_edges, crossed, offsets, vertex_dots, crossing_points],
+            device=device,
+        )
+    new_vertices, new_faces = tw.remesh.split_edges(
+        vertices, faces, crossed, crossing_points, unique_edges=unique_edges, inverse=inverse
+    )
+
+    n_out = int(new_faces.shape[0]) // 3
+    above = wp.empty(n_out, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_intersections.label_faces_by_plane_side,
+        dim=n_out,
+        inputs=[
+            new_vertices,
+            new_faces,
+            # The appended crossing points sit on the plane by construction, so their dots are zero
+            # to rounding; recomputing over the grown buffer is one map and avoids tracking which
+            # tail entries to zero.
+            _plane_dots(new_vertices, plane_origin, plane_normal),
+            plane_normal,
+            wp.float32(tolerance),
+            above,
+        ],
+        device=device,
+    )
+    return new_vertices, new_faces, above
 
 
 def clip_mesh_with_field(
@@ -636,6 +784,15 @@ def clip_mesh_with_field(
         )
         new_faces = tw.holes.fill_min_weight(new_vertices, new_faces)
     return new_vertices, new_faces
+
+
+def _plane_dots(
+    vertices: wp.array[wp.vec3], plane_origin: wp.vec3, plane_normal: wp.vec3
+) -> wp.array[wp.float32]:
+    """Signed plane distance of every vertex, the field all three plane entry points classify on."""
+    dots = wp.empty(int(vertices.shape[0]), dtype=wp.float32, device=vertices.device)
+    wp.map(kernel_intersections.point_plane_dot, vertices, plane_origin, plane_normal, out=dots)
+    return dots
 
 
 def _clip_with_vertex_field(

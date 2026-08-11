@@ -749,6 +749,82 @@ def emit_tri_cut(
     out_new_faces[tid, 2] = new_i1
 
 
+@wp.kernel
+def plane_crossed_edge_mask(
+    unique_edges: wp.array2d[wp.int32],
+    vertex_dots: wp.array[wp.float32],
+    tolerance: wp.float32,
+    out_crossed: wp.array[wp.bool],
+) -> None:
+    # An edge needs a new vertex only when the plane passes through its *interior*: an endpoint
+    # already in the plane (within ``tolerance``) serves as the crossing itself, so splitting there
+    # would emit a duplicate. Strict opposite signs is therefore the condition, and it is also why
+    # at most two of a triangle's three edges can ever be flagged -- two of three vertices always
+    # share a sign, so their edge is never crossed and ``emit_size_faces``' 3-split branch is
+    # unreachable from here.
+    e = int(wp.tid())
+    a = unique_edges[e, 0]
+    b = unique_edges[e, 1]
+    sign_a = kernel_array.sign_with_tolerance(vertex_dots[a], tolerance)
+    sign_b = kernel_array.sign_with_tolerance(vertex_dots[b], tolerance)
+    out_crossed[e] = sign_a * sign_b < wp.int32(0)
+
+
+@wp.kernel
+def plane_edge_crossing_points(
+    vertices: wp.array[wp.vec3],
+    unique_edges: wp.array2d[wp.int32],
+    crossed: wp.array[wp.bool],
+    offsets: wp.array[wp.int32],
+    vertex_dots: wp.array[wp.float32],
+    out_points: wp.array[wp.vec3],
+) -> None:
+    # ``remesh.fill_edge_midpoints`` with the plane crossing in place of the midpoint. One point per
+    # *unique edge* rather than per cut face, which is what makes the split crack-free where
+    # ``_clip_with_vertex_field`` is cracked: the two faces sharing the edge read one index.
+    e = int(wp.tid())
+    if crossed[e]:
+        out_points[offsets[e]] = canonical_edge_crossing(
+            vertices, vertex_dots, unique_edges[e, 0], unique_edges[e, 1]
+        )
+
+
+@wp.kernel
+def label_faces_by_plane_side(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    vertex_dots: wp.array[wp.float32],
+    plane_normal: wp.vec3,
+    tolerance: wp.float32,
+    out_above: wp.array[wp.bool],
+) -> None:
+    # After the split no face straddles the plane, so the *largest-magnitude* vertex dot decides the
+    # side for the whole face. Reading the extremum rather than a sum or a centroid keeps a sliver
+    # face -- two crossing vertices at dot 0 and one real vertex just off the plane -- on the side
+    # its real vertex is on, where a centroid would divide the offset by three and a sum would let
+    # two rounding-level zeros outvote it.
+    f = int(wp.tid())
+    extreme = wp.float32(0.0)
+    for corner in range(3):
+        value = vertex_dots[faces[f * 3 + corner]]
+        if wp.abs(value) > wp.abs(extreme):
+            extreme = value
+
+    side = kernel_array.sign_with_tolerance(extreme, tolerance)
+    if side != wp.int32(0):
+        out_above[f] = side > wp.int32(0)
+        return
+
+    # The face lies *in* the plane, so its vertices give no answer. Decide from its own normal, the
+    # same tie-break ``resolve_on_plane_faces`` applies, so that the ``above`` block of this split
+    # holds exactly the faces ``slice_mesh_with_plane`` keeps.
+    normal, area = kernel_triangles.face_normals_and_area(vertices, faces[f * 3 : (f + 1) * 3])
+    if area <= TOLERANCE_ZERO_CONSTANT:
+        out_above[f] = True
+    else:
+        out_above[f] = wp.dot(normal, plane_normal) < wp.float32(0.0)
+
+
 @wp.func
 def crossing_point(
     value_from: wp.Float, value_to: wp.Float, point_from: wp.vec3, point_to: wp.vec3

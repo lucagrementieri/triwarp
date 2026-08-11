@@ -42,6 +42,11 @@ crease edges above ``featuredeg=30`` degrees, which triwarp does not, and its ``
 default rejects any local operation deviating more than 1% of the bbox diagonal from the input. Both
 are on, because turning them off would measure a filter no MeshLab user runs.
 
+triwarp now has a counterpart to the second of those (``max_deviation``), and it is still **not**
+passed here — measured a no-op at MeshLab's own 1% default on both fixtures, byte-identical face
+counts, because these patches never drift that far. See this group's ``noparity`` reason for the
+numbers. Passing it would buy a per-iteration closest-point pass and no change in output.
+
 It also covers ``subdivide_to_size``: ``meshing_surface_subdivision_midpoint(threshold=...)``
 refines every edge longer than a length target, which is precisely that operation, and it lands on
 the identical output face count (4x at ``0.7 x mean_edge``, 16x at ``0.35 x``). It cannot cover the
@@ -249,6 +254,48 @@ def test_subdivide_to_size(bench_case: BenchCase, split_fraction: float) -> None
         assert result[1].shape[0] >= faces.shape[0]
 
 
+@pytest.mark.benchmark(group="split_edges")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp")
+@pytest.mark.parametrize("split_fraction", [0.25, 1.0], ids=["quarter", "all"])
+def test_split_edges(bench_case: BenchCase, split_fraction: float) -> None:
+    """
+    One crack-free split pass over a given edge mask: the primitive ``subdivide_to_size`` iterates.
+
+    Timed separately from that group because the two answer different questions.
+    ``subdivide_to_size`` measures the whole *loop* — how many passes a length target needs — and
+    hides the per-pass cost inside it; this measures one pass at a known mask density, so a
+    regression in the emission templates or in the ``edges_unique`` build shows up here undiluted.
+    The ``all`` case is the regular 1-to-4 subdivision and should track the ``subdivide`` group
+    closely (same output, one extra edge-table build); the gap between ``quarter`` and ``all`` is
+    how much of the pass is fixed edge-table cost rather than emission, and it should be *sublinear*
+    in the mask density because the sort runs over every edge either way.
+
+    The mask is built on the host once per case and excluded from the timing, since choosing which
+    edges to split is the caller's job and varies per use.
+    """
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    unique_edges, inverse = tw.edges.edges_unique(faces)
+    n_edges = int(unique_edges.shape[0])
+    if split_fraction >= 1.0:
+        mask = wp.full(n_edges, True, dtype=wp.bool, device=bench_case.device)
+    else:
+        rng = np.random.default_rng(20260811)
+        mask = wp.array(
+            np.ascontiguousarray(rng.random(n_edges) < split_fraction),
+            dtype=wp.bool,
+            device=bench_case.device,
+        )
+    new_vertices, new_faces = bench_case.run(
+        lambda: tw.remesh.split_edges(
+            vertices, faces, mask, unique_edges=unique_edges, inverse=inverse
+        ),
+        rounds=_ROUNDS,
+    )
+    assert int(new_faces.shape[0]) >= int(faces.shape[0])
+    assert int(new_vertices.shape[0]) >= int(vertices.shape[0])
+
+
 # Split budgets for the region refiner, as a fraction of the input face count. ``None`` runs to
 # convergence; the finite one makes ``max_splits`` bind, which is the only way the budget-truncation
 # branch is reached at all.
@@ -328,7 +375,15 @@ def test_flip_to_delaunay(bench_case: BenchCase) -> None:
     "aspect ratio of 352 against 1.87. That gap is the finding this row exists to report, not a "
     "tolerance to widen; the quality statistics themselves are asserted against the *input* in "
     "tests/test_remesh.py, in test_remesh_edge_concentration and "
-    "test_remesh_emits_no_degenerate_faces, rather than against MeshLab.",
+    "test_remesh_emits_no_degenerate_faces, rather than against MeshLab. Re-measured after "
+    "isotropic_remesh gained max_deviation, since an absent surface-distance gate used to be one "
+    "listed source of the gap and is no longer absent: passing MeshLab's own checksurfdist default "
+    "(1% of the bbox diagonal, 0.0288 here) changes nothing at all -- byte-identical face counts "
+    "on both fixtures and a 99th-percentile aspect ratio of 375.4 against 375.9 unbounded, because "
+    "on these patches the remesh never moves a vertex that far, so the bound does not bind. The "
+    "stopping rule is the whole of the remaining disagreement, and the parameter is deliberately "
+    "NOT passed in this row: it would add a closest-point pass per iteration to the timing while "
+    "provably changing no output.",
 )
 @pytest.mark.benchmark(group="isotropic_remesh")
 @pytest.mark.benchaxis("quality")

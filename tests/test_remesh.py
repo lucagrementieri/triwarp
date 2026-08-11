@@ -670,6 +670,232 @@ def test_subdivide_to_size_max_iter_exceeded(icosahedron: tuple[tm.Trimesh, wp.M
         tw.remesh.subdivide_to_size(mesh_wp.points, mesh_wp.indices, small_edge, max_iter=0)
 
 
+def test_subdivide_to_size_sizing_field(device: str) -> None:
+    """
+    A per-vertex sizing field refines each region to *its own* target, not to a global one.
+
+    The assert that separates this from the scalar call is per-edge rather than global: every edge
+    must be within the mean of its endpoints' targets, and the coarse half must retain edges longer
+    than the fine half's target — which a scalar call at the field's minimum could not do.
+    """
+    sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=2)
+    height = sphere_tm.vertices[:, 2]
+    fraction = (height - height.min()) / np.ptp(height)
+    field_np = (0.08 + 0.32 * fraction).astype(np.float32)
+    field_wp = wp.array(np.ascontiguousarray(field_np), dtype=wp.float32, device=device)
+
+    out_vertices, out_faces = tw.remesh.subdivide_to_size(
+        vertices_wp, faces_wp, field_wp, max_iter=12
+    )
+    points_np = out_vertices.numpy().astype(np.float64)
+    faces_np = out_faces.numpy().reshape(-1, 3)
+    assert faces_np.shape[0] > int(faces_wp.shape[0]) // 3  # anti-vacuity
+
+    # The field on the refined mesh: an inserted midpoint carries the mean of what it split, which
+    # is the value the nearest original vertex reports for a field this smooth.
+    pairs = np.unique(np.sort(_undirected_edges(faces_np), axis=1), axis=0)
+    lengths = np.linalg.norm(points_np[pairs[:, 0]] - points_np[pairs[:, 1]], axis=1)
+    midpoints = points_np[pairs].mean(axis=1)
+    targets = field_np[KDTree(sphere_tm.vertices).query(midpoints)[1]]
+    # Every edge respects its own local target, with slack for the nearest-vertex approximation of
+    # the field at the midpoint (the field varies by 0.32 across the sphere).
+    assert (lengths <= targets * 1.35).all()
+    # And the result is genuinely graded, not uniformly refined to the minimum.
+    low = lengths[midpoints[:, 2] < np.median(midpoints[:, 2])].mean()
+    high = lengths[midpoints[:, 2] >= np.median(midpoints[:, 2])].mean()
+    assert high / low > 1.5, (low, high)
+
+
+# ---------------------------------------------------------------------------
+# split_edges
+# ---------------------------------------------------------------------------
+
+
+def test_split_edges_every_edge_is_the_regular_subdivision(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Splitting every edge is the 1-to-4 subdivision, so it must equal ``subdivide``.
+
+    The strongest available check on the templates: the ``count == 3`` branch of the emission kernel
+    is only reachable this way, and ``subdivide`` is independently tested against trimesh and igl,
+    so agreeing with it exactly validates the primitive against those references transitively.
+    """
+    _mesh_tm, mesh_wp = icosahedron
+    unique_edges, inverse = tw.edges.edges_unique(mesh_wp.indices)
+    every_edge = wp.full(
+        int(unique_edges.shape[0]), True, dtype=wp.bool, device=mesh_wp.indices.device
+    )
+
+    split_v, split_f = tw.remesh.split_edges(
+        mesh_wp.points, mesh_wp.indices, every_edge, unique_edges=unique_edges, inverse=inverse
+    )
+    fine_v, fine_f = tw.remesh.subdivide(mesh_wp.points, mesh_wp.indices)
+
+    assert int(split_f.shape[0]) // 3 == 4 * (int(mesh_wp.indices.shape[0]) // 3)
+    assert np.array_equal(split_f.numpy(), fine_f.numpy())
+    assert np.allclose(split_v.numpy(), fine_v.numpy())
+
+
+def test_split_edges_honours_caller_supplied_positions(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    ``split_positions`` puts the new vertex where the caller asks, not at the midpoint.
+
+    This is the parameter ``split_mesh_with_plane`` depends on, so the test pins the *indexing*
+    contract too: positions are ordered by the exclusive scan of the mask, i.e. ascending
+    unique-edge index among the flagged edges.
+    """
+    _mesh_tm, mesh_wp = icosahedron
+    device = mesh_wp.indices.device
+    unique_edges, inverse = tw.edges.edges_unique(mesh_wp.indices)
+    edges_np = unique_edges.numpy()
+    points_np = mesh_wp.points.numpy().astype(np.float64)
+
+    # Flag three edges and place each new vertex at 1/4 along, which no midpoint could match.
+    chosen = np.array([1, 5, 9])
+    mask_np = np.zeros(edges_np.shape[0], dtype=bool)
+    mask_np[chosen] = True
+    quarter_np = 0.75 * points_np[edges_np[chosen, 0]] + 0.25 * points_np[edges_np[chosen, 1]]
+    mask_wp = wp.array(np.ascontiguousarray(mask_np), dtype=wp.bool, device=device)
+    positions_wp = wp.array(np.ascontiguousarray(quarter_np), dtype=wp.vec3, device=device)
+
+    split_v, split_f = tw.remesh.split_edges(
+        mesh_wp.points,
+        mesh_wp.indices,
+        mask_wp,
+        positions_wp,
+        unique_edges=unique_edges,
+        inverse=inverse,
+    )
+    inserted = split_v.numpy().astype(np.float64)[int(mesh_wp.points.shape[0]) :]
+    assert inserted.shape[0] == 3
+    # Ascending edge order, element-wise: the documented slot assignment.
+    assert np.allclose(inserted, quarter_np, atol=1e-6)
+    # Each flagged edge cut one face into two, and the faces are still valid.
+    assert int(split_f.shape[0]) // 3 > int(mesh_wp.indices.shape[0]) // 3
+    assert tw.validation.is_edge_manifold(split_f, allow_boundary_edges=False)
+
+
+def test_split_edges_is_crack_free_for_an_arbitrary_mask(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """A random subset of edges still leaves a closed, manifold, area-preserving mesh."""
+    mesh_tm, mesh_wp = icosahedron
+    device = mesh_wp.indices.device
+    unique_edges, inverse = tw.edges.edges_unique(mesh_wp.indices)
+    rng = np.random.default_rng(20260811)
+    mask_np = rng.random(int(unique_edges.shape[0])) < 0.5
+    mask_wp = wp.array(np.ascontiguousarray(mask_np), dtype=wp.bool, device=device)
+
+    split_v, split_f = tw.remesh.split_edges(
+        mesh_wp.points, mesh_wp.indices, mask_wp, unique_edges=unique_edges, inverse=inverse
+    )
+    assert int(mask_np.sum()) > 0  # anti-vacuity
+    assert int(split_v.shape[0]) == int(mesh_wp.points.shape[0]) + int(mask_np.sum())
+    assert tw.validation.is_edge_manifold(split_f, allow_boundary_edges=False)
+    assert np.isclose(
+        tm.Trimesh(
+            split_v.numpy().astype(np.float64), split_f.numpy().reshape(-1, 3), process=False
+        ).area,
+        mesh_tm.area,
+        rtol=1e-5,
+    )
+
+
+def test_split_edges_carries_a_per_face_index(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """``index`` rides through the split, and ``None`` reports provenance into the input faces."""
+    _mesh_tm, mesh_wp = icosahedron
+    device = mesh_wp.indices.device
+    n_faces = int(mesh_wp.indices.shape[0]) // 3
+    unique_edges, inverse = tw.edges.edges_unique(mesh_wp.indices)
+    mask_wp = wp.full(int(unique_edges.shape[0]), True, dtype=wp.bool, device=device)
+
+    _v, faces_wp, provenance = tw.remesh.split_edges(
+        mesh_wp.points,
+        mesh_wp.indices,
+        mask_wp,
+        unique_edges=unique_edges,
+        inverse=inverse,
+        return_index=True,
+    )
+    provenance_np = provenance.numpy()
+    assert provenance_np.shape[0] == int(faces_wp.shape[0]) // 3
+    assert provenance_np.min() >= 0
+    assert provenance_np.max() < n_faces
+    # A 1-to-4 split means every input face appears exactly four times.
+    assert np.array_equal(np.bincount(provenance_np, minlength=n_faces), np.full(n_faces, 4))
+
+    # An explicit index is carried rather than replaced: label faces by parity and check it
+    # survives.
+    labels_np = (np.arange(n_faces) % 2).astype(np.int32)
+    _v2, _f2, carried = tw.remesh.split_edges(
+        mesh_wp.points,
+        mesh_wp.indices,
+        mask_wp,
+        unique_edges=unique_edges,
+        inverse=inverse,
+        index=wp.array(labels_np, dtype=wp.int32, device=device),
+        return_index=True,
+    )
+    assert np.array_equal(carried.numpy(), labels_np[provenance_np])
+
+
+def test_split_edges_empty_mask_is_a_copy(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _mesh_tm, mesh_wp = icosahedron
+    unique_edges, inverse = tw.edges.edges_unique(mesh_wp.indices)
+    nothing = wp.zeros(int(unique_edges.shape[0]), dtype=wp.bool, device=mesh_wp.indices.device)
+
+    split_v, split_f, index = tw.remesh.split_edges(
+        mesh_wp.points,
+        mesh_wp.indices,
+        nothing,
+        unique_edges=unique_edges,
+        inverse=inverse,
+        return_index=True,
+    )
+    assert np.array_equal(split_f.numpy(), mesh_wp.indices.numpy())
+    assert np.allclose(split_v.numpy(), mesh_wp.points.numpy())
+    assert np.array_equal(index.numpy(), np.arange(int(mesh_wp.indices.shape[0]) // 3))
+
+
+def test_split_edges_validation(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    _mesh_tm, mesh_wp = icosahedron
+    device = mesh_wp.indices.device
+    unique_edges, inverse = tw.edges.edges_unique(mesh_wp.indices)
+    n_edges = int(unique_edges.shape[0])
+    n_faces = int(mesh_wp.indices.shape[0]) // 3
+    full_mask = wp.full(n_edges, True, dtype=wp.bool, device=device)
+
+    with pytest.raises(ValueError, match="one entry per unique edge"):
+        tw.remesh.split_edges(
+            mesh_wp.points,
+            mesh_wp.indices,
+            wp.full(n_edges + 1, True, dtype=wp.bool, device=device),
+            unique_edges=unique_edges,
+            inverse=inverse,
+        )
+    with pytest.raises(ValueError, match="one entry per flagged edge"):
+        tw.remesh.split_edges(
+            mesh_wp.points,
+            mesh_wp.indices,
+            full_mask,
+            wp.zeros(n_edges - 1, dtype=wp.vec3, device=device),
+            unique_edges=unique_edges,
+            inverse=inverse,
+        )
+    with pytest.raises(ValueError, match="one entry per face"):
+        tw.remesh.split_edges(
+            mesh_wp.points,
+            mesh_wp.indices,
+            full_mask,
+            unique_edges=unique_edges,
+            inverse=inverse,
+            index=wp.zeros(n_faces + 1, dtype=wp.int32, device=device),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Region-restricted subdivision + parallel Delaunay flips
 # ---------------------------------------------------------------------------
@@ -1190,10 +1416,132 @@ def test_remesh_flags_off(device: str) -> None:
     assert tw.validation.is_watertight(out_vertices, out_faces)
 
 
+def test_remesh_adaptive_sizing_field_grades_the_result(device: str) -> None:
+    """
+    A graded sizing field produces a graded mesh: achieved edge length tracks the requested one.
+
+    Asserted against the *input field* rather than against a reference, because the pymeshlab row
+    for this group is a documented D2 exemption (see its ``noparity`` reason) and MeshLab's
+    ``adaptive`` derives its own field from curvature rather than accepting one. The correlation is
+    what the feature claims; the low-z/high-z ratio is the same claim in a form that a uniform
+    remesher would fail outright, since it returns ~1.0 there.
+    """
+    sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=3)
+    target = 0.06
+    height = sphere_tm.vertices[:, 2]
+    fraction = (height - height.min()) / np.ptp(height)
+    # 0.3x the target at the bottom rising to 2.0x at the top.
+    field_np = ((0.3 + 1.7 * fraction) * target).astype(np.float32)
+    field_wp = wp.array(np.ascontiguousarray(field_np), dtype=wp.float32, device=device)
+
+    out_vertices, out_faces = tw.remesh.isotropic_remesh(
+        vertices_wp, faces_wp, target_length=field_wp, iterations=3
+    )
+    points_np = out_vertices.numpy().astype(np.float64)
+    faces_np = out_faces.numpy().reshape(-1, 3)
+    pairs = np.concatenate([faces_np[:, [0, 1]], faces_np[:, [1, 2]], faces_np[:, [2, 0]]])
+    achieved = np.linalg.norm(points_np[pairs[:, 0]] - points_np[pairs[:, 1]], axis=1)
+    midpoints = points_np[pairs].mean(axis=1)
+    requested = field_np[KDTree(sphere_tm.vertices).query(midpoints)[1]]
+
+    # Anti-vacuity: the remesh must have actually rebuilt the mesh.
+    assert faces_np.shape[0] > int(faces_wp.shape[0]) // 3
+    # Monotone association between requested and achieved length. Measured 0.92 Spearman; a uniform
+    # remesh of the same mesh scores ~0 here because ``achieved`` would not vary with ``requested``.
+    order_requested = np.argsort(np.argsort(requested))
+    order_achieved = np.argsort(np.argsort(achieved))
+    spearman = np.corrcoef(order_requested, order_achieved)[0, 1]
+    assert spearman > 0.8, spearman
+    # And the coarse half really is coarser. Measured ratio 2.60 against a field ratio of ~3.
+    low = achieved[midpoints[:, 2] < np.median(midpoints[:, 2])].mean()
+    high = achieved[midpoints[:, 2] >= np.median(midpoints[:, 2])].mean()
+    assert high / low > 1.8, (low, high)
+
+
+def test_remesh_constant_sizing_field_reproduces_the_scalar_target(device: str) -> None:
+    """
+    A constant field gives the scalar path's *topology exactly* and its positions to 1.2e-05.
+
+    The regression guard for the widening: if the array path diverged structurally from the scalar
+    one, the face buffers would differ. They do not — ``np.array_equal`` holds — and the residual
+    position gap is the float rounding of the threshold documented in ``isotropic_remesh``'s Notes
+    (``4/3 * t`` formed per vertex in ``float32`` against Python ``float64`` narrowed once). The
+    tolerance here is 4x the measured 1.2e-05 on a mesh of extent 2.0, not a free parameter.
+    """
+    sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=3)
+    target = 0.06
+    constant_wp = wp.array(
+        np.full(len(sphere_tm.vertices), target, dtype=np.float32), dtype=wp.float32, device=device
+    )
+
+    scalar_v, scalar_f = tw.remesh.isotropic_remesh(
+        vertices_wp, faces_wp, target_length=target, iterations=3
+    )
+    field_v, field_f = tw.remesh.isotropic_remesh(
+        vertices_wp, faces_wp, target_length=constant_wp, iterations=3
+    )
+
+    assert int(scalar_f.shape[0]) > int(faces_wp.shape[0])  # anti-vacuity
+    assert np.array_equal(field_f.numpy(), scalar_f.numpy())
+    assert np.abs(field_v.numpy() - scalar_v.numpy()).max() < 5e-5
+
+
+@pytest.mark.parametrize("divisor", [3.0, 10.0])
+def test_remesh_max_deviation_bounds_the_surface_distance(device: str, divisor: float) -> None:
+    """
+    ``max_deviation`` bounds the result's distance to the input, measured with the query it uses.
+
+    The bound is asserted against
+    [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh] — the same
+    ``wp.mesh_query_point_no_sign`` the clamp is built on, so this is the function's actual contract
+    and it holds to 1.4e-07. It is deliberately *not* asserted against trimesh: the two queries
+    disagree by up to 2.1e-05 in absolute terms, so a trimesh-side assert reads 1.37x the bound at a
+    bound of 1.07e-04 and would fail for a reason that is not a defect here (see the Notes on
+    ``isotropic_remesh`` and the ``reproject`` stage, which has always used the same query).
+
+    ``divisor`` is parametrized so one case binds moderately and one tightly; both must bind, which
+    the unbounded-deviation comparison asserts, or the test would pass on a no-op.
+    """
+    _sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=3)
+    common = {"target_length": 0.06, "iterations": 5, "reproject": False}
+
+    free_v, _free_f = tw.remesh.isotropic_remesh(vertices_wp, faces_wp, **common)
+    free_deviation = float(
+        tw.reduce.max(tw.proximity.closest_point_on_mesh(vertices_wp, faces_wp, free_v)[1])
+    )
+    bound = free_deviation / divisor
+
+    bounded_v, _bounded_f = tw.remesh.isotropic_remesh(
+        vertices_wp, faces_wp, max_deviation=bound, **common
+    )
+    deviation = float(
+        tw.reduce.max(tw.proximity.closest_point_on_mesh(vertices_wp, faces_wp, bounded_v)[1])
+    )
+
+    # The bound binds: without it the surface moves further than the bound allows.
+    assert free_deviation > bound * 1.5
+    assert deviation <= bound + 1e-6, (deviation, bound)
+
+
 def test_remesh_target_validation(device: str) -> None:
     _sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=1)
+    n_vertices = int(vertices_wp.shape[0])
     with pytest.raises(ValueError, match="target_length"):
         tw.remesh.isotropic_remesh(vertices_wp, faces_wp, target_length=-1.0)
+    with pytest.raises(ValueError, match="one target_length per vertex"):
+        tw.remesh.isotropic_remesh(
+            vertices_wp,
+            faces_wp,
+            target_length=wp.full(n_vertices + 1, 0.1, dtype=wp.float32, device=device),
+        )
+    with pytest.raises(ValueError, match="positive target_length everywhere"):
+        tw.remesh.isotropic_remesh(
+            vertices_wp,
+            faces_wp,
+            target_length=wp.zeros(n_vertices, dtype=wp.float32, device=device),
+        )
+    with pytest.raises(ValueError, match="max_deviation"):
+        tw.remesh.isotropic_remesh(vertices_wp, faces_wp, max_deviation=0.0)
 
 
 def test_remesh_empty_and_degenerate(device: str) -> None:

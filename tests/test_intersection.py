@@ -355,6 +355,209 @@ def test_slice_mesh_with_plane_on_plane(icosahedron: tuple[tm.Trimesh, wp.Mesh])
 
 
 # ---------------------------------------------------------------------------
+# split_mesh_with_plane
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parity("split_mesh_with_plane", "pyvista")
+def test_split_mesh_with_plane_matches_pyvista() -> None:
+    """
+    Class B against ``PolyData.clip(return_clipped=True)``, VTK's both-sides plane clip.
+
+    The named transform is the **side convention**: pyvista's ``clip`` keeps the side the normal
+    points *away* from, so its ``kept`` is triwarp's ``~above`` and its ``clipped`` is ``above``
+    (measured ``kept z in [-1, 0.1]`` against a plane at ``z = 0.1`` with normal ``+z``). Take the
+    names at face value and the two areas are swapped, which the per-side asserts below catch.
+
+    Compared as the *union's* geometry plus the label partition rather than cell-for-cell: VTK
+    numbers its output points in its own traversal order and splits the two-crossing quad on its own
+    diagonal, so there is no face correspondence to assert. What is asserted is stronger than a
+    total: each side's area separately, which pins the partition, and both point sets
+    bidirectionally (measured 5.4e-08).
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    mesh_wp = trimesh_to_warp(mesh_tm, "cpu")
+    height = 0.1
+
+    vertices_wp, faces_wp, above_wp = tw.intersection.split_mesh_with_plane(
+        mesh_wp.points, mesh_wp.indices, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, height)
+    )
+    kept_pv, clipped_pv = cast(
+        "tuple[pv.PolyData, pv.PolyData]",
+        trimesh_to_pyvista(mesh_tm).clip(
+            normal=(0.0, 0.0, 1.0), origin=(0.0, 0.0, height), return_clipped=True
+        ),
+    )
+
+    # Anti-vacuity: a plane that missed, or that kept one side only, would pass everything below.
+    above_np = above_wp.numpy()
+    assert 0 < int(above_np.sum()) < above_np.shape[0]
+    assert kept_pv.n_cells > 0
+    assert clipped_pv.n_cells > 0
+
+    faces_np = faces_wp.numpy().reshape(-1, 3)
+    points_np = vertices_wp.numpy().astype(np.float64)
+    assert faces_np.shape[0] == kept_pv.n_cells + clipped_pv.n_cells
+
+    # ``clipped`` is the +normal side, so it pairs with ``above``.
+    assert np.isclose(
+        tm.Trimesh(points_np, faces_np[above_np], process=False).area, clipped_pv.area, rtol=1e-5
+    )
+    assert np.isclose(
+        tm.Trimesh(points_np, faces_np[~above_np], process=False).area, kept_pv.area, rtol=1e-5
+    )
+
+    union_pv = np.vstack([np.asarray(kept_pv.points), np.asarray(clipped_pv.points)])
+    assert KDTree(union_pv).query(points_np)[0].max() < 1e-5
+    assert KDTree(points_np).query(union_pv)[0].max() < 1e-5
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "hemisphere", "half_torus"])
+def test_split_mesh_with_plane_refines_without_cracking(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    The invariants that need no reference: crack-free, on-plane, side-pure and area-preserving.
+
+    Every one of these would fail for a per-face cut like
+    [`slice_mesh_with_plane`][triwarp.intersection.slice_mesh_with_plane]'s, which is the point of
+    the function: a closed input stays closed, the Euler characteristic is unchanged (inserting a
+    curve of edges into a triangulation adds equal numbers of vertices, edges and faces), and no
+    output face straddles the plane, which is what makes the ``above`` label well defined.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    normal_np = np.array([0.3, -0.5, 1.0])
+    normal_np = normal_np / np.linalg.norm(normal_np)
+    origin_np = mesh_tm.vertices.mean(axis=0)
+    n_vertices_in = int(mesh_wp.points.shape[0])
+    closed_in = tw.validation.is_edge_manifold(mesh_wp.indices, allow_boundary_edges=False)
+
+    vertices_wp, faces_wp, above_wp = tw.intersection.split_mesh_with_plane(
+        mesh_wp.points, mesh_wp.indices, wp.vec3(*normal_np.tolist()), wp.vec3(*origin_np.tolist())
+    )
+    points_np = vertices_wp.numpy().astype(np.float64)
+    faces_np = faces_wp.numpy().reshape(-1, 3)
+    above_np = above_wp.numpy()
+
+    # Anti-vacuity: a plane through the centroid must actually cut.
+    assert points_np.shape[0] > n_vertices_in
+    assert 0 < int(above_np.sum()) < above_np.shape[0]
+
+    # Every inserted vertex lies on the plane.
+    inserted = points_np[n_vertices_in:]
+    assert np.abs((inserted - origin_np) @ normal_np).max() < 1e-5
+
+    # No face straddles, so the label is exact rather than a majority vote.
+    dots = (points_np[faces_np] - origin_np) @ normal_np
+    assert not ((dots > 1e-6).any(axis=1) & (dots < -1e-6).any(axis=1)).any()
+    assert (above_np == (dots.max(axis=1) > 1e-6)).all()
+
+    # Crack-free: manifoldness and area survive, and so does the Euler characteristic.
+    assert tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=not closed_in) is True
+    if closed_in:
+        assert tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=False) is True
+    assert np.isclose(tm.Trimesh(points_np, faces_np, process=False).area, mesh_tm.area, rtol=1e-5)
+    assert tw.totals.euler_characteristic(faces_wp) == tw.totals.euler_characteristic(
+        mesh_wp.indices
+    )
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+def test_split_mesh_with_plane_above_block_is_the_slice(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    The ``above`` submesh is exactly what ``slice_mesh_with_plane`` returns.
+
+    Not triwarp-compared-with-itself for its own sake: the two share no code path — the slice cuts
+    per face into three compacted classes, this splits per *edge* and labels afterwards — so
+    agreeing on face count and area to ``1e-6`` is a real cross-check of the label convention, which
+    is the one thing a caller has to get right. It also pins the documented promise that the two
+    agree, including the in-plane-face tie-break.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    normal = wp.vec3(0.0, 0.0, 1.0)
+    origin = wp.vec3(*mesh_tm.vertices.mean(axis=0).tolist())
+
+    split_v, split_f, above = tw.intersection.split_mesh_with_plane(
+        mesh_wp.points, mesh_wp.indices, normal, origin
+    )
+    above_v, above_f = tw.selection.submesh_from_face_mask(split_v, split_f, above)
+    slice_v, slice_f = tw.intersection.slice_mesh_with_plane(
+        mesh_wp.points, mesh_wp.indices, normal, origin
+    )
+
+    assert int(above_f.shape[0]) > 0
+    assert int(above_f.shape[0]) == int(slice_f.shape[0])
+    assert np.isclose(
+        tm.Trimesh(
+            above_v.numpy().astype(np.float64), above_f.numpy().reshape(-1, 3), process=False
+        ).area,
+        tm.Trimesh(
+            slice_v.numpy().astype(np.float64), slice_f.numpy().reshape(-1, 3), process=False
+        ).area,
+        rtol=1e-6,
+    )
+
+
+def test_split_mesh_with_plane_through_a_vertex_inserts_nothing_there(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    A vertex already on the plane is used as the crossing rather than duplicated beside it.
+
+    This is what the ``tolerance`` parameter buys, and the assert that bites is the *count*: without
+    the strict-opposite-signs test every edge incident to the on-plane vertex would also be
+    "crossed" at a point coinciding with it, giving a fan of zero-length edges and degenerate
+    faces. Checked by the count of inserted vertices and by the absence of a degenerate face.
+    """
+    mesh_tm, mesh_wp = icosahedron
+    apex = int(np.argmax(mesh_tm.vertices[:, 2]))
+    normal_np = np.array([0.0, 0.0, 1.0])
+    origin_np = mesh_tm.vertices[apex]
+    n_vertices_in = int(mesh_wp.points.shape[0])
+
+    vertices_wp, faces_wp, _ = tw.intersection.split_mesh_with_plane(
+        mesh_wp.points, mesh_wp.indices, wp.vec3(*normal_np.tolist()), wp.vec3(*origin_np.tolist())
+    )
+    points_np = vertices_wp.numpy().astype(np.float64)
+
+    # The apex is the unique highest vertex of an icosahedron, so a plane through it touches the
+    # surface at that point alone: nothing is crossed and nothing is inserted.
+    assert points_np.shape[0] == n_vertices_in
+    assert int(faces_wp.shape[0]) == int(mesh_wp.indices.shape[0])
+    # No zero-area face was introduced anywhere.
+    assert (
+        tm.Trimesh(points_np, faces_wp.numpy().reshape(-1, 3), process=False).area_faces.min() > 0
+    )
+
+
+def test_split_mesh_with_plane_misses_the_mesh(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """A plane clear of the mesh returns it unchanged with a constant label."""
+    mesh_tm, mesh_wp = icosahedron
+    vertices_wp, faces_wp, above_wp = tw.intersection.split_mesh_with_plane(
+        mesh_wp.points,
+        mesh_wp.indices,
+        wp.vec3(0.0, 0.0, 1.0),
+        wp.vec3(0.0, 0.0, float(mesh_tm.bounds[1][2]) + 1.0),
+    )
+    assert np.array_equal(faces_wp.numpy(), mesh_wp.indices.numpy())
+    assert np.allclose(vertices_wp.numpy(), mesh_wp.points.numpy())
+    assert not above_wp.numpy().any()
+
+
+def test_split_mesh_with_plane_empty(device: str) -> None:
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    out_vertices_wp, out_faces_wp, above_wp = tw.intersection.split_mesh_with_plane(
+        vertices_wp, faces_wp, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, 0.0)
+    )
+    assert out_vertices_wp.shape == (0,)
+    assert out_faces_wp.shape == (0,)
+    assert above_wp.shape == (0,)
+
+
+# ---------------------------------------------------------------------------
 # clip_mesh_with_field
 # ---------------------------------------------------------------------------
 

@@ -70,7 +70,7 @@ def isotropic_remesh(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     *,
-    target_length: float | None = None,
+    target_length: float | wp.array[wp.float32] | None = None,
     iterations: int = 10,
     feature_angle: float = 30.0,
     split: bool = True,
@@ -78,6 +78,7 @@ def isotropic_remesh(
     swap: bool = True,
     smooth: bool = True,
     reproject: bool = True,
+    max_deviation: float | None = None,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
     Isotropic explicit remeshing (Botsch-Kobbelt split / collapse / flip / smooth / reproject).
@@ -107,7 +108,15 @@ def isotropic_remesh(
         the reference ``wp.Mesh`` aliases ``vertices`` and ``faces`` rather than copying them;
         do not mutate them for the duration of the call.
     target_length
-        Desired uniform edge length. Defaults to ``1 %`` of the bounding-box diagonal.
+        Desired edge length. A **scalar** is the uniform target, defaulting to ``1 %`` of the
+        bounding-box diagonal. A ``(n_vertices,)`` ``wp.float32`` array is an **adaptive sizing
+        field** over the *input* vertices: every stage then reads its own local target, so the
+        result is fine where the field is small and coarse where it is large. This is the general
+        form of PyMeshLab's ``adaptive`` flag — rather than deriving the field from curvature
+        internally, the caller supplies it, which also covers a painted field, a distance-to-feature
+        field, or a field carried from another mesh. Build a curvature-driven one from
+        [`triwarp.curvature`][triwarp.curvature], or an interpolated one from
+        [`interpolate_from_points`][triwarp.interpolation.interpolate_from_points].
     iterations
         Number of full remeshing passes.
     feature_angle
@@ -115,6 +124,13 @@ def isotropic_remesh(
         (protected from flipping and collapsing across).
     split, collapse, swap, smooth, reproject
         Enable/disable each stage of the per-iteration pipeline.
+    max_deviation
+        Bound on how far the result may move off the input surface, in model units. At the end of
+        every iteration each vertex further than this from the input surface is pulled straight back
+        toward its own closest point until it is exactly this far, bounding the result's one-sided
+        Hausdorff distance to the input. ``None`` (the default) leaves fidelity to ``reproject``
+        alone, as before. This is PyMeshLab's ``checksurfdist`` / ``maxsurfdist`` pair as a single
+        optional bound. See the Notes for how tightly the bound actually holds.
 
     Returns
     -------
@@ -126,11 +142,13 @@ def isotropic_remesh(
     Raises
     ------
     ValueError
-        If ``target_length`` is non-positive.
+        If ``target_length`` is non-positive, a sizing field does not have one entry per vertex or
+        holds a non-positive value, or ``max_deviation`` is non-positive.
 
     See Also
     --------
     [`subdivide_to_size`][triwarp.remesh.subdivide_to_size]
+    [`split_edges`][triwarp.remesh.split_edges]
     [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay]
 
     Notes
@@ -140,39 +158,128 @@ def isotropic_remesh(
     normal-flip guard in this version, relying on the reprojection step to keep free vertices on the
     original surface.
 
-    Two limitations, stated because the parameters that used to advertise them are gone: there is
-    no explicit surface-deviation rejection gate (fidelity comes from the ``reproject`` step), and
-    the sizing is uniform rather than curvature-adaptive. PyMeshLab's filter exposes knobs for
-    both; accepting them here and ignoring them was worse than not accepting them.
+    An adaptive field is **re-sampled from the input surface** before each stage that reads it, with
+    [`transfer_onto_vertices`][triwarp.interpolation.transfer_onto_vertices], rather than
+    transported through the split / collapse operations. The field is a property of the input
+    geometry, so re-sampling keeps it exact under an arbitrary sequence of operations where
+    transport would accumulate error; the cost is one closest-point query per vertex per stage (two
+    per iteration with both ``split`` and ``collapse`` on). Inside a single stage the field *is*
+    transported, because there the correspondence is known exactly: a split midpoint takes the mean
+    of the endpoints it splits, and a collapse compacts the bands alongside the vertices.
+
+    A **constant** field is not quite the scalar path: measured on a remeshed ``icosphere(3)`` at 3
+    iterations the two agree on the face buffer *exactly* (``np.array_equal``) and on positions to
+    1.2e-05 on a mesh of extent 2.0. The gap is float rounding in the threshold alone — the array
+    path forms ``4/3 * t`` per vertex in ``float32`` where the scalar path forms it in Python
+    ``float64`` and narrows once — and the resampled constant itself is exact to 7.5e-09. Pass a
+    scalar when the target is uniform; it is also one closest-point query per stage cheaper.
+
+    ``max_deviation`` is a **positional bound applied per iteration**, not a per-operation rejection
+    test: an individual collapse or flip is never vetoed for moving the surface too far, it is the
+    accumulated vertex position that is corrected afterwards. A mesh whose *edges* must never sweep
+    past the bound mid-iteration needs the flip stage's own gate as well
+    ([`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay] takes one).
+
+    How tightly the bound holds is worth stating, because it is set by
+    ``wp.mesh_query_point_no_sign`` rather than by this function. Against that query — the one the
+    clamp is implemented with, and the one ``reproject`` has always used — the result is within the
+    bound to **1.4e-07**. Against an independent ``float64`` query
+    (``trimesh.proximity.closest_point``) on a remeshed ``icosphere(3)`` at 5 iterations with
+    ``reproject=False``, whose unconstrained deviation is
+    3.21e-03: a bound of 1.07e-03 measures 1.00x the bound, 3.21e-04 measures 1.01x, and 1.07e-04
+    measures **1.37x** — the two queries disagree by up to 2.1e-05 in absolute terms (mean 1.6e-08,
+    so it is a handful of vertices, and iterating the clamp does not converge further because Warp's
+    answer is a fixed point). The bound therefore controls deviation proportionally — those three
+    settings reduce it by 3.0x, 9.9x and 21.9x — but at a bound near Warp's own query accuracy it is
+    approximate rather than hard. Ask for a bound comfortably above 2e-05 in model units, or scale
+    the model up.
+
+    The remaining limitation, stated because the parameter that used to advertise it is gone:
+    PyMeshLab's ``selectedonly`` has no equivalent here, and a region-restricted refinement is
+    [`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size] rather than a mode of this
+    function.
     """
     n_faces = int(faces.shape[0]) // 3
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
     current_vertices = wp.clone(vertices)
     current_faces = wp.clone(faces)
     if n_faces == 0 or iterations <= 0:
         return current_vertices, current_faces
 
     diag = tw.bounds.enclosing_diagonal(vertices)
-    target = target_length if target_length is not None else 0.01 * diag
-    if target <= 0.0:
-        raise ValueError(f"isotropic_remesh requires target_length > 0, got {target}.")
-    low = wp.float32(4.0 / 5.0 * target)
-    high = wp.float32(4.0 / 3.0 * target)
+    sizing_input: wp.array[wp.float32] | None = None
+    if target_length is None or isinstance(target_length, int | float):
+        target = float(target_length) if target_length is not None else 0.01 * diag
+        if target <= 0.0:
+            raise ValueError(f"isotropic_remesh requires target_length > 0, got {target}.")
+    else:
+        field = target_length
+        if int(field.shape[0]) != n_vertices:
+            raise ValueError(
+                f"isotropic_remesh requires one target_length per vertex ({n_vertices}), "
+                f"got {int(field.shape[0])}."
+            )
+        # One readback, on a buffer the caller just built: a non-positive entry makes the split
+        # stage diverge (every edge over-long), so it is worth catching here rather than at
+        # ``max_iter``.
+        smallest = float(tw.reduce.min(field))
+        if smallest <= 0.0:
+            raise ValueError(
+                f"isotropic_remesh requires a positive target_length everywhere, got {smallest}."
+            )
+        target = float(tw.reduce.mean(field))
+        sizing_input = field
+    if max_deviation is not None and max_deviation <= 0.0:
+        raise ValueError(f"isotropic_remesh requires max_deviation > 0, got {max_deviation}.")
     feature = wp.float32(math.radians(feature_angle))
 
-    # Original surface, built once, for reprojecting free vertices (never a 0-triangle mesh).
+    # Original surface, built once, for reprojecting free vertices and for the deviation bound
+    # (never a 0-triangle mesh).
     original_mesh = None
-    if reproject:
+    if reproject or max_deviation is not None or sizing_input is not None:
         require_nonempty_mesh(faces, "isotropic_remesh")
         # The mesh aliases the caller's buffers and is discarded here, so it needs no copy: the
         # loop below rebinds ``current_vertices`` / ``current_faces`` and never writes ``vertices``.
         original_mesh = wp.Mesh(points=vertices, indices=faces)
+    query_radius = max(diag, 1.0)
+    clamp_kernel = None
+    if max_deviation is not None:
+        # Hoisted out of the loop: the generated kernel is cached, but the per-call Python is not.
+        clamp_kernel = wp.map(
+            kernel_remesh.clamp_to_surface_band,
+            current_vertices,
+            wp.uint64(0),
+            wp.float32(0.0),
+            wp.float32(0.0),
+            out=wp.empty_like(current_vertices),
+            return_kernel=True,
+        )
 
     for _ in range(iterations):
+        # The sizing field is re-sampled from the *input* surface immediately before each stage that
+        # reads it, because the stage before it changed the vertex set. Two closest-point passes per
+        # iteration is the price of keeping the field exact; see this function's Notes.
         if split:
+            _, high = _length_bands(
+                _sizing_at(current_vertices, vertices, faces, sizing_input, query_radius),
+                target,
+                int(current_vertices.shape[0]),
+                device,
+            )
             current_vertices, current_faces = subdivide_to_size(
-                current_vertices, current_faces, float(high), max_iter=20
+                current_vertices,
+                current_faces,
+                high if sizing_input is not None else 4.0 / 3.0 * target,
+                max_iter=20,
             )
         if collapse:
+            low, high = _length_bands(
+                _sizing_at(current_vertices, vertices, faces, sizing_input, query_radius),
+                target,
+                int(current_vertices.shape[0]),
+                device,
+            )
             current_vertices, current_faces = _collapse_pass(
                 current_vertices, current_faces, low, high, feature
             )
@@ -186,10 +293,65 @@ def isotropic_remesh(
                 current_vertices = _smooth_pass(current_vertices, current_faces, codes)
             if reproject and original_mesh is not None:
                 current_vertices = _reproject_pass(
-                    current_vertices, codes, original_mesh, max(diag, 1.0)
+                    current_vertices, codes, original_mesh, query_radius
                 )
+        if clamp_kernel is not None and original_mesh is not None:
+            bounded = wp.empty_like(current_vertices)
+            wp.launch(
+                clamp_kernel,
+                dim=int(current_vertices.shape[0]),
+                inputs=[
+                    current_vertices,
+                    wp.uint64(original_mesh.id),
+                    wp.float32(max_deviation),
+                    wp.float32(query_radius),
+                ],
+                outputs=[bounded],
+                device=device,
+            )
+            current_vertices = bounded
 
     return current_vertices, current_faces
+
+
+def _sizing_at(
+    positions: wp.array[wp.vec3],
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    sizing_input: wp.array[wp.float32] | None,
+    query_radius: float,
+) -> wp.array[wp.float32] | None:
+    """
+    Sample the input mesh's sizing field at ``positions``, via their closest points on that surface.
+
+    ``None`` in, ``None`` out, so the uniform-target path costs nothing and the caller needs no
+    branch of its own.
+    """
+    if sizing_input is None:
+        return None
+    return tw.interpolation.transfer_onto_vertices(
+        vertices, faces, sizing_input, positions, max_dist=query_radius
+    )[0]
+
+
+def _length_bands(
+    sizing: wp.array[wp.float32] | None, target: float, n_vertices: int, device: wp.DeviceLike
+) -> tuple[wp.array[wp.float32], wp.array[wp.float32]]:
+    """
+    Per-vertex collapse-below and split-above length bands, from a sizing field or a uniform target.
+
+    The Botsch-Kobbelt hysteresis (``4/5 t`` and ``4/3 t``) is applied per vertex so the uniform
+    case is literally the constant field, letting the collapse kernel keep a single code path.
+    """
+    if sizing is None:
+        low = wp.full(n_vertices, 4.0 / 5.0 * target, dtype=wp.float32, device=device)
+        high = wp.full(n_vertices, 4.0 / 3.0 * target, dtype=wp.float32, device=device)
+        return low, high
+    low = wp.empty(n_vertices, dtype=wp.float32, device=device)
+    high = wp.empty(n_vertices, dtype=wp.float32, device=device)
+    wp.map(wp.mul, sizing, wp.float32(4.0 / 5.0), out=low)
+    wp.map(wp.mul, sizing, wp.float32(4.0 / 3.0), out=high)
+    return low, high
 
 
 def _classify(
@@ -257,12 +419,18 @@ def _classify(
 def _collapse_pass(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
-    low: wp.float32,
-    high: wp.float32,
+    low: wp.array[wp.float32],
+    high: wp.array[wp.float32],
     feature: wp.float32,
     max_passes: int = 5,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
-    """Collapse short edges in parallel with 1-ring locking; returns compacted (vertices, faces)."""
+    """
+    Collapse short edges in parallel with 1-ring locking; returns compacted (vertices, faces).
+
+    ``low`` and ``high`` are the per-vertex length bands, so one path serves both a uniform target
+    and a sizing field. They are compacted alongside the vertices at the end of each pass rather
+    than re-sampled, which keeps the whole loop free of closest-point queries.
+    """
     device = vertices.device
     for _ in range(max_passes):
         n_vertices = int(vertices.shape[0])
@@ -354,7 +522,12 @@ def _collapse_pass(
         )
         kept = tw.array.flatnonzero(valid)
         faces = tw.array.gather(remapped.reshape((n_faces, 3)), kept).reshape(-1)
-        vertices, faces, _ = tw.repair.remove_unreferenced_vertices(positions, faces)
+        vertices, faces, _, surviving = tw.repair.remove_unreferenced_vertices(
+            positions, faces, return_inverse=True
+        )
+        # ``surviving`` is the new-to-old vertex map, so the bands follow the compaction exactly.
+        low = tw.array.gather(low, surviving)
+        high = tw.array.gather(high, surviving)
 
     return vertices, faces
 
@@ -1691,7 +1864,7 @@ def _split_faces_four(
 def subdivide_to_size(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
-    max_edge: float,
+    max_edge: float | wp.array[wp.float32],
     max_iter: int = 10,
     return_index: Literal[False] = False,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]: ...
@@ -1699,7 +1872,7 @@ def subdivide_to_size(
 def subdivide_to_size(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
-    max_edge: float,
+    max_edge: float | wp.array[wp.float32],
     max_iter: int = 10,
     *,
     return_index: Literal[True],
@@ -1707,7 +1880,7 @@ def subdivide_to_size(
 def subdivide_to_size(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
-    max_edge: float,
+    max_edge: float | wp.array[wp.float32],
     max_iter: int = 10,
     return_index: bool = False,
 ) -> (
@@ -1733,7 +1906,12 @@ def subdivide_to_size(
     faces
         Length-``3 * n_faces`` flat triangle index buffer.
     max_edge
-        Maximum length of any edge in the result.
+        Maximum length of any edge in the result. A **scalar** gives the uniform target; a
+        ``(n_vertices,)`` ``wp.float32`` array is a per-vertex **sizing field**, and an edge's own
+        target is then the mean of its two endpoints', so the refinement is fine where the field is
+        small and coarse where it is large. The field is *extended* to each inserted midpoint as the
+        mean of the endpoints it splits, so no resampling is needed between passes and a field that
+        satisfies the target cannot be driven past it by a later pass.
     max_iter
         Maximum number of subdivision passes. A ``ValueError`` is raised if the
         mesh still has an over-long edge after this many passes.
@@ -1762,7 +1940,8 @@ def subdivide_to_size(
     [`trimesh.remesh.subdivide_to_size`][]
     """
     device = vertices.device
-    max_edge_f = wp.float32(max_edge)
+    sizing = max_edge if isinstance(max_edge, wp.array) else None
+    max_edge_f = wp.float32(0.0) if sizing is not None else wp.float32(max_edge)
 
     current_vertices = vertices
     current_faces = faces
@@ -1775,7 +1954,6 @@ def subdivide_to_size(
         return current_vertices, current_faces
 
     for i in range(max_iter + 1):
-        n_faces = int(current_faces.shape[0]) // 3
         n_vertices = int(current_vertices.shape[0])
 
         unique_edges, inverse = tw.edges.edges_unique(current_faces, n_vertices=n_vertices)
@@ -1786,66 +1964,79 @@ def subdivide_to_size(
 
         # Flag the edges that are longer than the target length.
         long_mask = wp.empty(m, dtype=wp.bool, device=device)
-        wp.map(kernel_array.greater, lengths, max_edge_f, out=long_mask)
+        if sizing is None:
+            wp.map(kernel_array.greater, lengths, max_edge_f, out=long_mask)
+        else:
+            wp.launch(
+                kernel_remesh.mark_edges_over_sizing_field,
+                dim=m,
+                inputs=[unique_edges, lengths, sizing, long_mask],
+                device=device,
+            )
 
-        # Exclusive scan of the flags gives each long edge its new-vertex slot;
-        # the inclusive total is the number of midpoints to add this pass.
-        flags = tw.array.astype(long_mask, wp.int32)
-        offsets, n_long = tw.array.counts_to_offsets(flags)
+        # A sizing field must grow with the vertex buffer, and it is *extended* rather than
+        # re-sampled: a midpoint's target is the mean of the endpoints it splits, which is the same
+        # value the edge was tested against, so a run of passes cannot drift the field. Computed
+        # before the split because it reads the pre-split edge rows.
+        next_sizing = (
+            None if sizing is None else _extend_sizing_field(sizing, unique_edges, long_mask)
+        )
 
+        # ``index`` rides through the split rather than being gathered afterwards, and the "did
+        # anything split" test reads the resulting face count rather than reducing the mask: a face
+        # count strictly grows when a mask is non-empty and is unchanged when it is empty, so this
+        # is exact and costs nothing. Both points are why the refactor to ``split_edges`` left the
+        # launch count per pass identical to the inline version it replaced (CLAUDE.md section 13).
+        new_vertices, new_faces, new_index = split_edges(
+            current_vertices,
+            current_faces,
+            long_mask,
+            unique_edges=unique_edges,
+            inverse=inverse,
+            index=index,
+            return_index=True,
+        )
         # Every edge is short enough: we are done.
-        if n_long == 0:
+        if int(new_faces.shape[0]) == int(current_faces.shape[0]):
             break
         # Ran out of passes with over-long edges still present.
         if i >= max_iter:
             raise ValueError("max_iter exceeded!")
-
-        midpoint_idx = wp.empty(m, dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_remesh.build_midpoint_index,
-            dim=m,
-            inputs=[long_mask, offsets, wp.int32(n_vertices), midpoint_idx],
-            device=device,
+        current_vertices, current_faces, index, sizing = (
+            new_vertices,
+            new_faces,
+            new_index,
+            next_sizing,
         )
-
-        new_mid = wp.empty(n_long, dtype=wp.vec3, device=device)
-        wp.launch(
-            kernel_remesh.fill_edge_midpoints,
-            dim=m,
-            inputs=[current_vertices, unique_edges, long_mask, offsets, new_mid],
-            device=device,
-        )
-        # Append midpoints so the new indices resolve during face emission.
-        current_vertices, _ = tw.array.pack_1d_arrays([current_vertices, new_mid])
-
-        face_mid = tw.array.gather(midpoint_idx, inverse).reshape((n_faces, 3))
-
-        # Emit up to four triangles per face into fixed slots, then compact.
-        out_faces = twt.empty_2d((n_faces * 4, 3), wp.int32, device=device)
-        out_valid = wp.empty(n_faces * 4, dtype=wp.bool, device=device)
-        out_slot_index = wp.empty(n_faces * 4, dtype=wp.int32, device=device)
-        wp.launch(
-            kernel_remesh.emit_size_faces,
-            dim=n_faces,
-            inputs=[
-                current_faces,
-                face_mid,
-                current_vertices,
-                index,
-                out_faces,
-                out_valid,
-                out_slot_index,
-            ],
-            device=device,
-        )
-
-        kept = tw.array.flatnonzero(out_valid)
-        current_faces = tw.array.gather(out_faces, kept).reshape(-1)
-        index = tw.array.gather(out_slot_index, kept)
 
     if return_index:
         return current_vertices, current_faces, index
     return current_vertices, current_faces
+
+
+def _extend_sizing_field(
+    sizing: wp.array[wp.float32], unique_edges: twt.Array2dInt32, split_mask: wp.array[wp.bool]
+) -> wp.array[wp.float32]:
+    """
+    Append one sizing value per edge about to be split: the mean of the edge's two endpoints.
+
+    Called before the split rather than after, because it needs the *pre-split* edge rows, and the
+    value it writes is exactly the target the edge was just tested against — so a midpoint inherits
+    the size that justified inserting it and repeated passes converge instead of drifting.
+    """
+    device = sizing.device
+    offsets, n_split = tw.array.counts_to_offsets(tw.array.astype(split_mask, wp.int32))
+    if n_split == 0:
+        return sizing
+    appended = wp.empty(n_split, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_remesh.fill_edge_mean_sizing,
+        dim=int(unique_edges.shape[0]),
+        inputs=[sizing, unique_edges, split_mask, offsets, appended],
+        device=device,
+    )
+    extended, _ = tw.array.pack_1d_arrays([sizing, appended])
+    return extended
 
 
 def subdivide_region_to_size(
@@ -2023,6 +2214,201 @@ def subdivide_region_to_size(
 
     new_region = tw.array.astype(region_flags, wp.bool)
     return current_vertices, current_faces, new_region
+
+
+@overload
+def split_edges(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    split_mask: wp.array[wp.bool],
+    split_positions: wp.array[wp.vec3] | None = None,
+    *,
+    unique_edges: twt.Array2dInt32 | None = None,
+    inverse: wp.array[wp.int32] | None = None,
+    index: wp.array[wp.int32] | None = None,
+    return_index: Literal[False] = False,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]: ...
+@overload
+def split_edges(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    split_mask: wp.array[wp.bool],
+    split_positions: wp.array[wp.vec3] | None = None,
+    *,
+    unique_edges: twt.Array2dInt32 | None = None,
+    inverse: wp.array[wp.int32] | None = None,
+    index: wp.array[wp.int32] | None = None,
+    return_index: Literal[True],
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32]]: ...
+def split_edges(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    split_mask: wp.array[wp.bool],
+    split_positions: wp.array[wp.vec3] | None = None,
+    *,
+    unique_edges: twt.Array2dInt32 | None = None,
+    inverse: wp.array[wp.int32] | None = None,
+    index: wp.array[wp.int32] | None = None,
+    return_index: bool = False,
+) -> (
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+    | tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32]]
+):
+    """
+    Split a chosen set of edges in one crack-free pass, inserting one vertex per edge.
+
+    The primitive the whole ``subdivide_*`` family is built from, exposed because the *choice* of
+    edges and the *position* of the new vertex are the only things that differ between its members:
+    [`subdivide_to_size`][triwarp.remesh.subdivide_to_size] iterates this with a length test and
+    midpoints, and
+    [`triwarp.intersection.split_mesh_with_plane`][triwarp.intersection.split_mesh_with_plane] calls
+    it once with the edges a plane crosses and the crossing points. A caller with a different
+    criterion — a curvature threshold, a paint selection, an isovalue — needs no new machinery.
+
+    Crack-free means the new vertex of an edge is inserted **once** and both incident faces
+    reference it, so a watertight input stays watertight and no T-junction is introduced. Each face
+    is re-triangulated by how many of its three edges were split: 1 gives two triangles, 2 gives
+    three (the quad cut along its shorter diagonal), 3 gives the regular 1-to-4 split, and 0 passes
+    through unchanged.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions on the target device. Never mutated.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    split_mask
+        ``(n_edges,)`` ``wp.bool`` mask over the **unique undirected edges** in
+        [`edges_unique`][triwarp.edges.edges_unique] order, ``True`` for each edge to split.
+    split_positions
+        Where to put each new vertex, as a ``(n_split,)`` ``wp.vec3`` array indexed by the
+        **exclusive scan of** ``split_mask`` — that is, in ascending unique-edge order among the
+        flagged edges, which is where a kernel writing ``out[offsets[e]]`` naturally puts them.
+        ``None`` uses each edge's midpoint.
+    unique_edges, inverse
+        The [`edges_unique`][triwarp.edges.edges_unique] pair for ``faces``, when the caller has
+        already built it to compute ``split_mask``. Both must be given together; either being
+        ``None`` rebuilds them.
+    index
+        ``(n_faces,)`` ``wp.int32`` per-face values to carry through the split: each output face
+        receives the value of the input face it came from. ``None`` means the identity, so
+        ``return_index`` then reports provenance into ``faces``. Passing the *previous* pass's index
+        is how an iterated caller composes provenance without a gather per pass.
+    return_index
+        If ``True``, also return ``index`` resolved onto the output faces (provenance into ``faces``
+        when ``index`` is ``None``).
+
+    Returns
+    -------
+    new_vertices : wp.array[wp.vec3]
+        Original vertices followed by the ``n_split`` inserted ones, in ascending edge order.
+    new_faces : wp.array[wp.int32]
+        Flat ``3 * m`` triangle index buffer for the refined mesh.
+    index : wp.array[wp.int32]
+        Only when ``return_index`` is ``True``: length ``m``, the index into the **input** ``faces``
+        of the face each output face came from.
+
+    Raises
+    ------
+    ValueError
+        If ``split_mask`` does not have one entry per unique edge, ``split_positions`` does not have
+        one entry per flagged edge, or ``index`` does not have one entry per face.
+
+    See Also
+    --------
+    [`subdivide_to_size`][triwarp.remesh.subdivide_to_size]
+    [`subdivide`][triwarp.remesh.subdivide]
+    [`triwarp.intersection.split_mesh_with_plane`][triwarp.intersection.split_mesh_with_plane]
+    [`triwarp.edges.edges_unique`][triwarp.edges.edges_unique]
+
+    Examples
+    --------
+    Splitting *every* edge is the regular 1-to-4 subdivision, so the face count quadruples:
+
+    ```python
+    unique_edges, inverse = tw.edges.edges_unique(f)
+    every_edge = wp.full(int(unique_edges.shape[0]), True, dtype=wp.bool, device=f.device)
+    fine_v, fine_f = tw.remesh.split_edges(
+        v, f, every_edge, unique_edges=unique_edges, inverse=inverse
+    )
+    print(int(fine_f.shape[0]) // 3 == 4 * (int(f.shape[0]) // 3))
+    ```
+    """
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    # Bound in one expression rather than an ``if`` that reassigns the parameters, so the optional
+    # annotations narrow for the type checker without an ``assert``.
+    edges, corner_edge = (
+        (unique_edges, inverse)
+        if unique_edges is not None and inverse is not None
+        else tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    )
+    n_edges = int(edges.shape[0])
+    if int(split_mask.shape[0]) != n_edges:
+        raise ValueError(
+            f"split_mask must have one entry per unique edge ({n_edges}), "
+            f"got {int(split_mask.shape[0])}."
+        )
+
+    carried = index if index is not None else tw.array.init_range(n_faces, device)
+    if int(carried.shape[0]) != n_faces:
+        raise ValueError(
+            f"index must have one entry per face ({n_faces}), got {int(carried.shape[0])}."
+        )
+
+    # The exclusive scan both counts the split edges and assigns each one its new vertex slot, which
+    # is the indexing ``split_positions`` is documented against.
+    offsets, n_split = tw.array.counts_to_offsets(tw.array.astype(split_mask, wp.int32))
+    if n_split == 0 or n_faces == 0:
+        if return_index:
+            return wp.clone(vertices), wp.clone(faces), carried
+        return wp.clone(vertices), wp.clone(faces)
+
+    if split_positions is None:
+        new_points = wp.empty(n_split, dtype=wp.vec3, device=device)
+        wp.launch(
+            kernel_remesh.fill_edge_midpoints,
+            dim=n_edges,
+            inputs=[vertices, edges, split_mask, offsets, new_points],
+            device=device,
+        )
+    else:
+        if int(split_positions.shape[0]) != n_split:
+            raise ValueError(
+                f"split_positions must have one entry per flagged edge ({n_split}), "
+                f"got {int(split_positions.shape[0])}."
+            )
+        new_points = split_positions
+
+    # Appended before face emission so the new indices resolve against one buffer.
+    new_vertices, _ = tw.array.pack_1d_arrays([vertices, new_points])
+
+    new_index = wp.empty(n_edges, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_remesh.build_midpoint_index,
+        dim=n_edges,
+        inputs=[split_mask, offsets, wp.int32(n_vertices), new_index],
+        device=device,
+    )
+    face_new = tw.array.gather(new_index, corner_edge).reshape((n_faces, 3))
+
+    # Emit up to four triangles per face into fixed slots, then compact.
+    out_faces = twt.empty_2d((n_faces * 4, 3), wp.int32, device=device)
+    out_valid = wp.empty(n_faces * 4, dtype=wp.bool, device=device)
+    out_slot_index = wp.empty(n_faces * 4, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_remesh.emit_size_faces,
+        dim=n_faces,
+        inputs=[faces, face_new, new_vertices, carried, out_faces, out_valid, out_slot_index],
+        device=device,
+    )
+
+    kept = tw.array.flatnonzero(out_valid)
+    new_faces = tw.array.gather(out_faces, kept).reshape(-1)
+    if return_index:
+        return new_vertices, new_faces, tw.array.gather(out_slot_index, kept)
+    return new_vertices, new_faces
 
 
 def _flip_region_faces(

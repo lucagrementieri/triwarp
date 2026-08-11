@@ -160,6 +160,49 @@ def test_slice_mesh_with_plane(bench_case: BenchCase) -> None:
         assert sliced[1].shape[1] == 3
 
 
+@pytest.mark.benchmark(group="split_mesh_with_plane")
+@pytest.mark.benchlibs("triwarp", "pyvista")
+@pytest.mark.parity("split_mesh_with_plane", "pyvista")
+def test_split_mesh_with_plane(bench_case: BenchCase) -> None:
+    """
+    Keep **both** halves with the section inserted as shared edges, plus a per-face side label.
+
+    A different cost shape from ``slice_mesh_with_plane`` despite the same input, and the comparison
+    between the two rows is the point: the slice classifies faces and compacts three kept classes,
+    while this builds the *unique edge* table (a radix sort over ``3 * n_faces`` keys) so an edge's
+    crossing can be inserted once for both its faces. That sort is the extra cost of being
+    crack-free and is what this row measures — expect it above the slice's, growing with the face
+    count rather than with the number of crossed triangles.
+
+    pyvista's counterpart is ``clip(return_clipped=True)``, VTK's both-sides plane clip. Note its
+    ``kept`` output is the *low* side, i.e. triwarp's ``~above``; the values are compared in
+    ``tests/test_intersection.py``, this row only times them.
+    """
+    origin = _plane_origin(bench_case)
+    if bench_case.kind == "pyvista":
+        # Same cap and reason as the ``clip_mesh_with_field`` row: VTK's clip is single-threaded.
+        skip_larger_than(bench_case, "bunny", "VTK's clip is a single-threaded per-cell sweep")
+        mesh_pv = bench_case.mesh_pv
+        kept_pv, clipped_pv = bench_case.run(
+            lambda: mesh_pv.clip(
+                normal=tuple(_PLANE_NORMAL.tolist()),
+                origin=tuple(origin.tolist()),
+                return_clipped=True,
+            )
+        )
+        assert kept_pv.n_cells + clipped_pv.n_cells > 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    normal = wp.vec3(*_PLANE_NORMAL.tolist())
+    plane_origin = wp.vec3(*origin.tolist())
+    new_vertices, new_faces, above = bench_case.run(
+        lambda: tw.intersection.split_mesh_with_plane(vertices, faces, normal, plane_origin)
+    )
+    assert int(new_faces.shape[0]) % 3 == 0
+    assert int(above.shape[0]) == int(new_faces.shape[0]) // 3
+    assert new_vertices.shape[0] >= vertices.shape[0]
+
+
 def _plane_field(bench_case: BenchCase) -> tuple[wp.array[wp.float32], np.ndarray]:
     """Build the cutting plane's signed distance as a per-vertex field, for both sides of a row."""
     vertices_np = bench_case.vertices_np

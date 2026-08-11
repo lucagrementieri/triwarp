@@ -211,6 +211,38 @@ def fill_edge_midpoints(
         out_mid[offsets[e]] = edge_midpoint(vertices, unique_edges, wp.int32(e))
 
 
+@wp.kernel
+def fill_edge_mean_sizing(
+    sizing: wp.array[wp.float32],
+    unique_edges: wp.array2d[wp.int32],
+    split_mask: wp.array[wp.bool],
+    offsets: wp.array[wp.int32],
+    out_sizing: wp.array[wp.float32],
+) -> None:
+    # ``fill_edge_midpoints`` for the sizing field rather than the position: the value carried to a
+    # new midpoint is the endpoint mean ``mark_edges_over_sizing_field`` tested the edge with.
+    e = int(wp.tid())
+    if split_mask[e]:
+        out_sizing[offsets[e]] = wp.float32(0.5) * (
+            sizing[unique_edges[e, 0]] + sizing[unique_edges[e, 1]]
+        )
+
+
+@wp.kernel
+def mark_edges_over_sizing_field(
+    unique_edges: wp.array2d[wp.int32],
+    lengths: wp.array[wp.float32],
+    sizing: wp.array[wp.float32],
+    out_long: wp.array[wp.bool],
+) -> None:
+    # The scalar ``length > max_edge`` test against a per-vertex sizing field. An edge's own target
+    # is the mean of its endpoints', which is the standard reading of a vertex-sampled sizing
+    # function and keeps the test symmetric in the edge's orientation.
+    e = int(wp.tid())
+    target = wp.float32(0.5) * (sizing[unique_edges[e, 0]] + sizing[unique_edges[e, 1]])
+    out_long[e] = lengths[e] > target
+
+
 @wp.func
 def _write_tri(
     out_faces: wp.array2d[wp.int32],
@@ -706,18 +738,21 @@ def collapse_candidates(
     edge_face_count: wp.array[wp.int32],
     offsets: wp.array[wp.int32],
     columns: wp.array[wp.int32],
-    low: wp.float32,
-    high: wp.float32,
+    low: wp.array[wp.float32],
+    high: wp.array[wp.float32],
     out_survivor: wp.array[wp.int32],
     out_removed: wp.array[wp.int32],
     out_pos: wp.array[wp.vec3],
 ) -> None:
+    # ``low`` and ``high`` are per *vertex* rather than scalars so that one code path serves both
+    # the uniform target and an adaptive sizing field; the uniform case fills them with a constant.
+    # An edge's own band is the mean of its endpoints', matching ``mark_edges_over_sizing_field``.
     k = int(wp.tid())
     out_survivor[k] = -1
-    if lengths[k] >= low:
-        return
     u = unique_edges[k, 0]
     v = unique_edges[k, 1]
+    if lengths[k] >= wp.float32(0.5) * (low[u] + low[v]):
+        return
     cu = codes[u]
     cv = codes[v]
     is_boundary = edge_face_count[k] == 1
@@ -755,10 +790,12 @@ def collapse_candidates(
     if csr_common_neighbor_count(offsets, columns, u, v) != required:
         return
 
-    # Anti-oscillation: reject if the collapse would create an edge longer than the high band.
+    # Anti-oscillation: reject if the collapse would create an edge longer than the high band. The
+    # band is read at the far endpoint ``w``, so a collapse reaching into a finely-sized region is
+    # judged by that region's target rather than by the survivor's.
     for i in range(offsets[r], offsets[r + 1]):
         w = columns[i]
-        if w != s and wp.length(p - vertices[w]) > high:
+        if w != s and wp.length(p - vertices[w]) > high[w]:
             return
 
     out_survivor[k] = s
@@ -969,6 +1006,26 @@ def reproject_vertices(
     if query.result:
         return wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
     return vertex
+
+
+@wp.func
+def clamp_to_surface_band(
+    vertex: wp.vec3, mesh_id: wp.uint64, max_deviation: wp.float32, max_dist: wp.float32
+) -> wp.vec3:
+    # Pull a vertex back until it is within ``max_deviation`` of the original surface, along the
+    # line to its own closest point. Unlike ``reproject_vertices`` this applies to *every* vertex --
+    # a crease or corner is exactly the kind that drifts and that reprojection refuses to touch --
+    # and it moves the vertex only as far as the bound requires, so a vertex already inside the band
+    # is untouched and detail is not flattened onto the input surface.
+    query = wp.mesh_query_point_no_sign(mesh_id, vertex, max_dist)
+    if not query.result:
+        return vertex
+    closest = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
+    offset = vertex - closest
+    distance = wp.length(offset)
+    if distance <= max_deviation:
+        return vertex
+    return closest + offset * (max_deviation / distance)
 
 
 @wp.func
