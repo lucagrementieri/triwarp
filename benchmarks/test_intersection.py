@@ -3,10 +3,15 @@ Benchmarks for ``triwarp.intersection``.
 
 Four functions on two different cost shapes:
 
-* ``mesh_with_plane`` / ``slice_mesh_with_plane`` — one pass over the faces, a per-vertex plane dot,
-  then a compaction of the (few) faces the plane actually crosses. Memory-bound and dominated by
-  the full-mesh sweep, not by the segment count: a plane meets O(sqrt(n_faces)) triangles but every
-  face is still classified.
+* ``mesh_with_plane`` / ``slice_mesh_with_plane`` / ``clip_mesh_with_field`` — one pass over the
+  faces, a per-vertex scalar, then a compaction of the (few) faces the level set actually crosses.
+  Memory-bound and dominated by the full-mesh sweep, not by the segment count: a plane meets
+  O(sqrt(n_faces)) triangles but every face is still classified. The last two run the *same* engine
+  (the plane's signed distance is one such scalar), so their triwarp rows should track each other —
+  measured 794 vs 859 µs on ``bunny`` — and a divergence means the shared path changed under one of
+  them. ``clip_mesh_with_field``'s ``cap=True`` case is a different shape: the ``O(B^3)`` min-weight
+  fill of the section loop dominates the clip by 60x (55 ms against 0.86 ms on ``bunny``), so read
+  that case as a ``holes.fill_min_weight`` measurement on a long rim.
 * ``mesh_with_mesh`` — the only quadratic-ish one. A ``wp.Mesh`` BVH is built over the smaller mesh
   and every triangle of the other supplies an AABB query, so the cost tracks the number of
   *candidate* pairs (capped per query triangle by ``max_triangle_collisions``) rather than the face
@@ -43,11 +48,20 @@ operation, though -- an earlier version of this docstring claimed ``igl.ray_mesh
 only intersection entry point, which was wrong: ``igl.isolines(V, F, S, vals)`` is precisely what
 ``marching_triangles`` computes, and it is a row in both of that function's groups.
 
+**pyvista** (VTK 9.6) answers ``clip_mesh_with_field``'s uncapped case through
+``PolyData.clip_scalar``, over the identical per-vertex field so the two do the same work.
+``invert=False`` is passed explicitly: its default keeps the side *below* the value. Its capped
+counterpart ``clip_closed_surface`` cannot be timed here at all — it validates the mesh first and
+raises on any open edge, which every scan mesh has; the capped comparison therefore lives in
+``tests/test_intersection.py`` on a closed synthetic mesh, and the capped benchmark case is
+triwarp-only.
+
 Caps
 ----
 ``mesh_with_mesh`` is capped at ``bunny``: the broad phase allocates
 ``max_triangle_collisions`` candidate slots per query triangle, so the pair buffer alone is
-``16 * n_faces`` ints before the narrow phase filters it.
+``16 * n_faces`` ints before the narrow phase filters it. ``clip_mesh_with_field``'s pyvista row is
+capped there too, VTK's clip being a single-threaded per-cell sweep.
 
 Geometry
 --------
@@ -144,6 +158,61 @@ def test_slice_mesh_with_plane(bench_case: BenchCase) -> None:
             lambda: tm.intersections.slice_faces_plane(vertices_np, faces_np, _PLANE_NORMAL, origin)
         )
         assert sliced[1].shape[1] == 3
+
+
+def _plane_field(bench_case: BenchCase) -> tuple[wp.array[wp.float32], np.ndarray]:
+    """Build the cutting plane's signed distance as a per-vertex field, for both sides of a row."""
+    vertices_np = bench_case.vertices_np
+    field_np = (vertices_np - _plane_origin(bench_case)) @ _PLANE_NORMAL
+    return (
+        wp.array(
+            np.ascontiguousarray(field_np, dtype=np.float32),
+            dtype=wp.float32,
+            device=bench_case.device,
+        ),
+        field_np,
+    )
+
+
+@pytest.mark.benchmark(group="clip_mesh_with_field")
+@pytest.mark.benchlibs("triwarp", "pyvista")
+@pytest.mark.parametrize("cap", [False, True])
+def test_clip_mesh_with_field(bench_case: BenchCase, cap: bool) -> None:
+    """
+    The same classify-and-compact sweep as ``slice_mesh_with_plane``, driven by a per-vertex field.
+
+    Timed against the plane's own signed distance so the work is identical to that group's and the
+    two are directly comparable — the field costs one extra buffer read per vertex and saves the
+    per-edge dot products. ``cap=True`` adds the rim weld (a position hash over the result) plus the
+    ``O(B^3)`` min-weight fill of the section, which is why it is a separate case rather than a flag
+    folded into one row: on a scan mesh the section loop is long and the fill, not the clip, is what
+    is being measured.
+
+    pyvista's counterpart is ``clip_scalar`` (``invert=False`` — its default keeps the *low* side).
+    **The capped case has no reference row**: ``clip_closed_surface`` validates its input first and
+    raises ``ValueError: This surface appears to be non-manifold`` on every scan mesh, all of which
+    carry open edges, so there is nowhere for the row to move. It *is* compared, on a closed
+    synthetic mesh, in ``tests/test_intersection.py``.
+    """
+    if bench_case.kind == "pyvista":
+        if cap:
+            pytest.skip("clip_closed_surface rejects a non-manifold input; every scan mesh is one")
+        # VTK's clip is a single-threaded per-cell sweep, capped like the suite's other host-bound
+        # references.
+        skip_larger_than(bench_case, "bunny", "VTK's clip is a single-threaded per-cell sweep")
+        mesh_pv = bench_case.mesh_pv
+        mesh_pv.point_data["field"] = _plane_field(bench_case)[1]
+        clipped_pv = bench_case.run(
+            lambda: mesh_pv.clip_scalar(scalars="field", value=0.0, invert=False)
+        )
+        assert clipped_pv.n_faces > 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    field_wp = _plane_field(bench_case)[0]
+    _new_vertices, new_faces = bench_case.run(
+        lambda: tw.intersection.clip_mesh_with_field(vertices, faces, field_wp, cap=cap)
+    )
+    assert int(new_faces.shape[0]) % 3 == 0
 
 
 @pytest.mark.benchmark(group="mesh_with_mesh")

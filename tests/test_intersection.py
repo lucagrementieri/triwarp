@@ -354,6 +354,225 @@ def test_slice_mesh_with_plane_on_plane(icosahedron: tuple[tm.Trimesh, wp.Mesh])
     assert faces_wp_np.shape[0] == 0
 
 
+# ---------------------------------------------------------------------------
+# clip_mesh_with_field
+# ---------------------------------------------------------------------------
+
+
+def _height_field(mesh_tm: tm.Trimesh, device: str) -> wp.array[wp.float32]:
+    """Take the z coordinate as a per-vertex ``float32`` field: a horizontal plane's distance."""
+    return wp.array(
+        np.ascontiguousarray(mesh_tm.vertices[:, 2], dtype=np.float32),
+        dtype=wp.float32,
+        device=device,
+    )
+
+
+def test_clip_mesh_with_field_empty(device: str) -> None:
+    vertices_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    values_wp = wp.empty(0, dtype=wp.float32, device=device)
+    out_vertices_wp, out_faces_wp = tw.intersection.clip_mesh_with_field(
+        vertices_wp, faces_wp, values_wp
+    )
+    assert out_vertices_wp.shape == (0,)
+    assert out_faces_wp.shape == (0,)
+
+
+@pytest.mark.parity("clip_mesh_with_field", "pyvista")
+def test_clip_mesh_with_field_matches_pyvista_clip_scalar() -> None:
+    """
+    Class A on the kept surface, against ``PolyData.clip_scalar`` over the identical field.
+
+    VTK cuts the same triangles at the same crossings, so the face counts are equal and the
+    positions agree as point sets — measured 5.4e-08 on ``icosphere(3)``. The vertex *order* differs
+    because each side appends its crossing points in its own traversal order, hence the
+    nearest-neighbour comparison rather than an element-wise one.
+
+    ``invert=False`` is not optional and is the trap in this row: ``clip_scalar``'s **default keeps
+    the low side** (measured 798 faces below ``z = 0.1`` against 670 above), where triwarp keeps
+    ``values >= isovalue``. Take the default and the two answers are different regions of the same
+    mesh, which the face-count assert catches only because they happen to differ in size.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    mesh_wp = trimesh_to_warp(mesh_tm, "cpu")
+    isovalue = 0.1
+
+    clipped_v, clipped_f = tw.intersection.clip_mesh_with_field(
+        mesh_wp.points, mesh_wp.indices, _height_field(mesh_tm, "cpu"), isovalue
+    )
+    mesh_pv = trimesh_to_pyvista(mesh_tm)
+    mesh_pv.point_data["height"] = np.ascontiguousarray(mesh_tm.vertices[:, 2])
+    clipped_pv = cast(
+        pv.PolyData, mesh_pv.clip_scalar(scalars="height", value=isovalue, invert=False)
+    )
+
+    # Anti-vacuity: a clip that kept nothing, or everything, would pass the comparisons below.
+    assert 0 < clipped_pv.n_faces < len(mesh_tm.faces)
+    assert int(clipped_f.shape[0]) // 3 == clipped_pv.n_faces
+    points_np = clipped_v.numpy().astype(np.float64)
+    points_pv = np.asarray(clipped_pv.points)
+    assert KDTree(points_pv).query(points_np)[0].max() < 1e-5
+    assert KDTree(points_np).query(points_pv)[0].max() < 1e-5
+    assert np.isclose(
+        tm.Trimesh(points_np, clipped_f.numpy().reshape(-1, 3), process=False).area,
+        clipped_pv.area,
+        rtol=1e-5,
+    )
+    # Nothing below the isovalue survived.
+    assert points_np[:, 2].min() >= isovalue - 1e-5
+
+
+@pytest.mark.parity("clip_mesh_with_field", "pyvista")
+def test_clip_mesh_with_field_capped_matches_pyvista_clip_closed_surface() -> None:
+    """
+    Class A on the enclosed volume, against ``clip_closed_surface`` — VTK's capped plane clip.
+
+    The two cappers triangulate the section differently (a min-weight interval DP here, VTK's own
+    there), so the comparison is the *solid* rather than the triangles: measured the same 762 faces
+    and the same volume to seven digits on ``icosphere(3)`` at ``z = 0.1``. Watertightness is
+    asserted on both sides, which is the property the cap exists to restore and the one a cracked
+    section rim would break.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    mesh_wp = trimesh_to_warp(mesh_tm, "cpu")
+    isovalue = 0.1
+
+    capped_v, capped_f = tw.intersection.clip_mesh_with_field(
+        mesh_wp.points, mesh_wp.indices, _height_field(mesh_tm, "cpu"), isovalue, cap=True
+    )
+    capped_tm = tm.Trimesh(
+        capped_v.numpy().astype(np.float64), capped_f.numpy().reshape(-1, 3), process=False
+    )
+    mesh_pv = trimesh_to_pyvista(mesh_tm)
+    closed_pv = cast(
+        pv.PolyData,
+        mesh_pv.clip_closed_surface(normal=(0.0, 0.0, 1.0), origin=(0.0, 0.0, isovalue)),
+    )
+
+    assert closed_pv.n_open_edges == 0
+    assert capped_tm.is_watertight
+    assert tw.validation.is_edge_manifold(capped_f, allow_boundary_edges=False)
+    assert np.isclose(capped_tm.volume, closed_pv.volume, rtol=1e-5)
+    # The cap is not free: without it the same clip is open.
+    _, uncapped_f = tw.intersection.clip_mesh_with_field(
+        mesh_wp.points, mesh_wp.indices, _height_field(mesh_tm, "cpu"), isovalue
+    )
+    assert int(capped_f.shape[0]) > int(uncapped_f.shape[0])
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+def test_clip_mesh_with_field_reproduces_slice_mesh_with_plane(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    The plane clip *is* this function over the plane's signed distance, so the two must agree.
+
+    No reference: this pins the delegation itself. The one documented difference is the face lying
+    in the level set, which the plane resolves from its normal and the field cannot — so the plane
+    used here misses every vertex, keeping the two paths comparable face for face.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    plane_origin_np = 0.5 * (mesh_tm.bounds[0] + mesh_tm.bounds[1])
+    plane_normal_np = np.array([0.0, 0.0, 1.0])
+    field_wp = wp.array(
+        np.ascontiguousarray(
+            (mesh_tm.vertices - plane_origin_np) @ plane_normal_np, dtype=np.float32
+        ),
+        dtype=wp.float32,
+        device=mesh_wp.device,
+    )
+
+    sliced_v, sliced_f = tw.intersection.slice_mesh_with_plane(
+        mesh_wp.points,
+        mesh_wp.indices,
+        wp.vec3(*plane_normal_np.tolist()),
+        wp.vec3(*plane_origin_np.tolist()),
+    )
+    clipped_v, clipped_f = tw.intersection.clip_mesh_with_field(
+        mesh_wp.points, mesh_wp.indices, field_wp
+    )
+    assert int(sliced_f.shape[0]) > 0
+    assert np.array_equal(clipped_f.numpy(), sliced_f.numpy())
+    assert np.allclose(clipped_v.numpy(), sliced_v.numpy(), rtol=1e-5, atol=1e-5)
+
+
+def test_clip_mesh_with_field_section_is_the_marching_triangles_curve(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Round trip for the region/level-set pair: the clip's rim is the contour, edge for edge.
+
+    [`marching_triangles`][triwarp.intersection.marching_triangles] returns the level set and this
+    returns the region on one side of it, so the boundary of the region has to *be* the level set.
+    Compared as total length plus a two-sided point-set distance, because the clip's rim carries one
+    vertex per crossing where the contour carries one per segment endpoint.
+
+    The isovalue deliberately misses every vertex, asserted below. Four of the icosahedron's twelve
+    sit at exactly the centroid's height, and a contour through a vertex is where the two functions
+    legitimately differ: the contour reports a zero-length segment there (documented) while the clip
+    has a single rim vertex, so the counts stop matching for a reason that is not a bug.
+    """
+    mesh_tm, mesh_wp = icosahedron
+    isovalue = float(mesh_tm.centroid[2]) + 0.17
+    field_np = mesh_tm.vertices[:, 2]
+    assert np.abs(field_np - isovalue).min() > 1e-3, "the isovalue must miss every vertex"
+    field_wp = wp.array(
+        np.ascontiguousarray(field_np, dtype=np.float32), dtype=wp.float32, device=mesh_wp.device
+    )
+
+    curves, closed = tw.intersection.marching_triangles(
+        mesh_wp.points, mesh_wp.indices, field_wp, isovalue
+    )
+    assert len(curves) == 1
+    contour_np = curves[0].numpy().astype(np.float64)
+
+    clipped_v, clipped_f = tw.intersection.clip_mesh_with_field(
+        mesh_wp.points, mesh_wp.indices, field_wp, isovalue
+    )
+    welded_v, _unique, _inverse, welded_f = tw.repair.remove_duplicated_vertices(
+        clipped_v, clipped_f
+    )
+    rim_edges_np = tw.boundary.boundary_edges(welded_v, welded_f).numpy()
+    positions_np = welded_v.numpy().astype(np.float64)
+    rim_np = positions_np[np.unique(rim_edges_np)]
+    assert rim_np.shape[0] == contour_np.shape[0]
+    assert _hausdorff(rim_np, contour_np) < 1e-5
+
+    rim_segments_np = positions_np[rim_edges_np]
+    rim_length = float(np.linalg.norm(rim_segments_np[:, 1] - rim_segments_np[:, 0], axis=1).sum())
+    contour_length = _total_length([curve.numpy().astype(np.float64) for curve in curves], closed)
+    assert np.isclose(rim_length, contour_length, rtol=1e-4)
+
+
+def test_clip_mesh_with_field_accepts_a_float64_field(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """A ``float64`` field — what ``heat_geodesic`` returns — clips the same region as its cast."""
+    mesh_tm, mesh_wp = icosahedron
+    field_np = mesh_tm.vertices[:, 2] - mesh_tm.centroid[2]
+    isovalue = 0.05
+    clipped_64 = tw.intersection.clip_mesh_with_field(
+        mesh_wp.points,
+        mesh_wp.indices,
+        wp.array(np.ascontiguousarray(field_np), dtype=wp.float64, device=mesh_wp.device),
+        isovalue,
+    )
+    clipped_32 = tw.intersection.clip_mesh_with_field(
+        mesh_wp.points,
+        mesh_wp.indices,
+        wp.array(
+            np.ascontiguousarray(field_np, dtype=np.float32),
+            dtype=wp.float32,
+            device=mesh_wp.device,
+        ),
+        isovalue,
+    )
+    assert int(clipped_64[1].shape[0]) > 0
+    assert np.array_equal(clipped_64[1].numpy(), clipped_32[1].numpy())
+    assert np.allclose(clipped_64[0].numpy(), clipped_32[0].numpy(), rtol=1e-5, atol=1e-5)
+
+
 def _pyvista_intersection_segments(mesh1_pv: pv.PolyData, mesh2_pv: pv.PolyData) -> np.ndarray:
     intersection_pv = cast(
         pv.PolyData, mesh1_pv.intersection(mesh2_pv, split_first=False, split_second=False)[0]

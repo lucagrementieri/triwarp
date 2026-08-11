@@ -223,6 +223,7 @@ def marching_triangles(
 
     See Also
     --------
+    [`clip_mesh_with_field`][triwarp.intersection.clip_mesh_with_field]
     [`mesh_with_plane`][triwarp.intersection.mesh_with_plane]
     [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]
     [`polyline_length`][triwarp.polyline.polyline_length]
@@ -479,6 +480,12 @@ def slice_mesh_with_plane(
 
     Notes
     -----
+    The plane's signed distance is one per-vertex scalar field, so this is
+    [`clip_mesh_with_field`][triwarp.intersection.clip_mesh_with_field] over
+    ``dot(v - plane_origin, plane_normal)`` — the only thing the plane adds is the tie-break for a
+    face lying *in* the plane, whose side is decided from its own normal rather than from its
+    vertices.
+
     Every face falls into exactly one of three kept classes — wholly inside, cut into a quad, cut
     into a triangle — and the three are compacted by a *single* scan over one blocked flag buffer,
     so the call makes **one** host readback (the three class counts, 12 bytes) rather than one per
@@ -492,19 +499,161 @@ def slice_mesh_with_plane(
     ``lucy``. It is *flat* on ``bunny_decimated`` (1.20 -> 1.23 ms), the smallest mesh, because
     three readbacks or one, that row is at the ~340 µs wrapper floor — which is also why the cost
     here barely tracks the face count: the plane still meets only ``O(sqrt(n_faces))`` triangles.
+
+    See Also
+    --------
+    [`clip_mesh_with_field`][triwarp.intersection.clip_mesh_with_field]
+    [`mesh_with_plane`][triwarp.intersection.mesh_with_plane]
+    [`trimesh.intersections.slice_faces_plane`][]
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
-    n_faces = int(faces.shape[0]) // 3
     if n_vertices == 0:
         return vertices, faces
-    if n_faces == 0:
+    if int(faces.shape[0]) == 0:
         return wp.empty(0, dtype=wp.vec3, device=device), wp.empty(0, dtype=wp.int32, device=device)
 
     vertex_dots = wp.empty(n_vertices, dtype=wp.float32, device=device)
     wp.map(
         kernel_intersections.point_plane_dot, vertices, plane_origin, plane_normal, out=vertex_dots
     )
+    return _clip_with_vertex_field(vertices, faces, vertex_dots, plane_normal=plane_normal)
+
+
+def clip_mesh_with_field(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    values: wp.array[wp.float32] | wp.array[wp.float64],
+    isovalue: float = 0.0,
+    *,
+    cap: bool = False,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Keep the ``values >= isovalue`` region of the mesh, cutting faces the level set crosses.
+
+    The region counterpart of
+    [`marching_triangles`][triwarp.intersection.marching_triangles], which returns the level set
+    itself: this returns the surface on one side of it, with every crossed triangle re-triangulated
+    against the crossing points. The caller supplies the field, so one implementation covers
+    clipping by a plane, by another surface's signed distance
+    ([`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]), by a box, by geodesic
+    distance ([`heat_geodesic`][triwarp.heat.distance.heat_geodesic]) or by any per-vertex quantity
+    the caller can threshold.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` flat triangle index buffer.
+    values
+        ``(n_vertices,)`` scalar field, ``wp.float32`` or ``wp.float64``. A ``float64`` field is
+        shifted in ``float64`` and then compared in ``float32``, which is the vertex buffer's
+        precision.
+    isovalue
+        Level to clip at. A vertex whose value equals it counts as kept, matching
+        [`marching_triangles`][triwarp.intersection.marching_triangles].
+    cap
+        When ``True``, weld the section rim and seal **every** boundary loop of the result with
+        [`fill_min_weight`][triwarp.holes.fill_min_weight] — so a closed input gives a closed
+        output, and the returned vertices are the welded ones. On an input that already had a
+        boundary, that boundary is sealed too; clip first and cap yourself with
+        [`fill_loops`][triwarp.holes.fill_loops] if only the section should close.
+
+    Returns
+    -------
+    new_vertices
+        Vertices of the clipped region, with the crossing points appended.
+    new_faces
+        Length-``3 * m`` flat triangle index buffer for the clipped region.
+
+    Notes
+    -----
+    A face whose three values all equal ``isovalue`` is dropped: it lies *in* the level set, so
+    neither side claims it and the field gives no tie-break.
+    [`slice_mesh_with_plane`][triwarp.intersection.slice_mesh_with_plane] is the one caller that has
+    one, and keeps such a face when its normal opposes the plane's.
+
+    The uncapped result is **cracked along the section**, like
+    [`trimesh.intersections.slice_faces_plane`][]'s: each cut face writes its own copy of the
+    crossing points, so a rim edge carries two coincident vertices. Those copies are bitwise equal
+    by construction, which is what makes ``cap=True``'s weld exact rather than a tolerance choice.
+
+    Measured against ``clip_closed_surface`` on ``icosphere(3)`` at ``z = 0.1``: same 762 faces and
+    the same volume to seven digits (1.7651057), from a min-weight cap against VTK's own
+    triangulation of the section.
+
+    Equivalent to VTK's ``clip_scalar`` (uncapped) and ``clip_closed_surface`` (capped, over a
+    plane's signed distance), which pyvista exposes on ``PolyData``; VTK's default keeps
+    ``scalar >= value`` as this does.
+
+    Examples
+    --------
+    Keep the geodesic disk of radius 1 around vertex 0, sealed into a solid. The field is the
+    ``float64`` one [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] returns, and the region
+    wanted is the *near* side, so the field enters negated:
+
+    ```python
+    source = wp.array([0], dtype=wp.int32, device=v.device)
+    distance = tw.heat.distance.heat_geodesic(v, f, source)
+    negated = wp.empty_like(distance)
+    wp.map(wp.neg, distance, out=negated)
+    disk_v, disk_f = tw.intersection.clip_mesh_with_field(v, f, negated, -1.0, cap=True)
+    print(tw.validation.is_edge_manifold(disk_f, allow_boundary_edges=False))
+    ```
+
+    See Also
+    --------
+    [`marching_triangles`][triwarp.intersection.marching_triangles]
+    [`slice_mesh_with_plane`][triwarp.intersection.slice_mesh_with_plane]
+    [`fill_min_weight`][triwarp.holes.fill_min_weight]
+    """
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    if n_vertices == 0:
+        return vertices, faces
+    if int(faces.shape[0]) == 0:
+        return wp.empty(0, dtype=wp.vec3, device=device), wp.empty(0, dtype=wp.int32, device=device)
+
+    # Shifted in the field's own dtype (``wp.map`` preserves it, as in ``marching_triangles``), then
+    # narrowed once: the classifier and the crossing kernel work in the vertex buffer's precision.
+    shifted = wp.empty(int(values.shape[0]), dtype=values.dtype, device=device)
+    wp.map(wp.sub, values, values.dtype(isovalue), out=shifted)
+    if values.dtype is not wp.float32:
+        narrowed = wp.empty(int(values.shape[0]), dtype=wp.float32, device=device)
+        wp.utils.array_cast(shifted, narrowed)
+        shifted = narrowed
+
+    new_vertices, new_faces = _clip_with_vertex_field(vertices, faces, shifted)
+    if cap:
+        # The cut writes its crossing points per face, so a rim edge shared by two cut faces arrives
+        # as two coincident vertices and the section is a set of loose edges rather than a loop.
+        # They are *bitwise* equal by construction (the crossing is evaluated from the lower-
+        # numbered endpoint on both sides), so ``epsilon=0`` collapses exactly those and the filler
+        # then sees a real boundary loop.
+        new_vertices, _, _, new_faces = tw.repair.remove_duplicated_vertices(
+            new_vertices, new_faces
+        )
+        new_faces = tw.holes.fill_min_weight(new_vertices, new_faces)
+    return new_vertices, new_faces
+
+
+def _clip_with_vertex_field(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    vertex_dots: wp.array[wp.float32],
+    plane_normal: wp.vec3 | None = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Keep the ``vertex_dots >= 0`` region, the engine behind both public clippers.
+
+    ``plane_normal`` is the plane clip's tie-break for a face lying in the level set, and its
+    presence is the *only* difference between the two: a general field has no orientation to
+    compare, so such a face is left in the ``ON_PLANE`` class, which no kept block claims.
+    """
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
 
     face_classes = wp.empty(n_faces, dtype=wp.int32, device=device)
     face_signs = twt.empty_2d((n_faces, 3), wp.int32, device=device)
@@ -514,12 +663,13 @@ def slice_mesh_with_plane(
         inputs=[faces, vertex_dots, face_classes, face_signs],
         device=device,
     )
-    wp.launch(
-        kernel_intersections.resolve_on_plane_faces,
-        dim=n_faces,
-        inputs=[vertices, faces, plane_normal, face_classes],
-        device=device,
-    )
+    if plane_normal is not None:
+        wp.launch(
+            kernel_intersections.resolve_on_plane_faces,
+            dim=n_faces,
+            inputs=[vertices, faces, plane_normal, face_classes],
+            device=device,
+        )
     inside_idx, quad_idx, tri_idx = _slice_class_partition(face_classes, n_faces)
     n_in = int(inside_idx.shape[0])
     n_quad = int(quad_idx.shape[0])
@@ -553,9 +703,9 @@ def slice_mesh_with_plane(
             continue
         edge_points = wp.empty((n_cut, 3), dtype=wp.vec3, device=device)
         wp.launch(
-            kernel_intersections.edge_plane_intersections,
+            kernel_intersections.edge_level_crossings,
             dim=n_cut,
-            inputs=[vertices, faces, face_indices, plane_origin, plane_normal, edge_points],
+            inputs=[vertices, faces, face_indices, vertex_dots, edge_points],
             device=device,
         )
         n_emitted = faces_per_cut * n_cut

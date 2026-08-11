@@ -523,19 +523,19 @@ def find_corner_with_sign(s0: wp.int32, s1: wp.int32, s2: wp.int32, sign: wp.int
 
 
 @wp.func
-def edge_plane_intersection(
-    origin: wp.vec3, dest: wp.vec3, plane_origin: wp.vec3, plane_normal: wp.vec3
+def edge_level_crossing(
+    origin: wp.vec3, dest: wp.vec3, value_origin: wp.float32, value_dest: wp.float32
 ) -> wp.vec3:
-    direction = dest - origin
-    numerator = wp.dot(plane_origin - origin, plane_normal)
-    denominator = wp.dot(direction, plane_normal)
+    # Where the field crosses zero along one edge, from the two endpoint values. For a plane's
+    # signed distance this is ``edge_plane_intersection``'s algebra with the dot products already
+    # taken: ``dot(o - a, n) / dot(b - a, n)`` is ``va / (va - vb)``.
+    denominator = value_origin - value_dest
     if denominator == wp.float32(0.0):
         denominator = EDGE_DENOM_EPSILON
-    dist = numerator / denominator
-    return origin + direction * dist
+    return origin + (dest - origin) * (value_origin / denominator)
 
 
-# How a face meets the slicing plane. The three kept classes are numbered in the order the fused
+# How a face meets the level set. The three kept classes are numbered in the order the fused
 # compaction below lays them out, so a class is also its block index plus one. ``ON_PLANE`` is a
 # provisional answer that ``resolve_on_plane_faces`` turns into ``INSIDE`` or ``DROP``.
 SLICE_CLASS_DROP = wp.constant(wp.int32(0))
@@ -649,21 +649,36 @@ def scatter_slice_class(
         out_indices[inclusive[t] - 1] = t % n_faces
 
 
+@wp.func
+def canonical_edge_crossing(
+    vertices: wp.array[wp.vec3], values: wp.array[wp.float32], i: wp.int32, j: wp.int32
+) -> wp.vec3:
+    # Always interpolate from the lower-numbered endpoint, so the two faces sharing a cut edge
+    # evaluate the identical expression and land on **bitwise equal** points. That is what lets
+    # ``clip_mesh_with_field(cap=True)`` weld the section rim exactly rather than by tolerance.
+    a = wp.min(i, j)
+    b = wp.max(i, j)
+    return edge_level_crossing(vertices[a], vertices[b], values[a], values[b])
+
+
 @wp.kernel
-def edge_plane_intersections(
+def edge_level_crossings(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     face_indices: wp.array[wp.int32],
-    plane_origin: wp.vec3,
-    plane_normal: wp.vec3,
+    vertex_values: wp.array[wp.float32],
     out_points: wp.array2d[wp.vec3],
 ) -> None:
+    # The three edge crossings of one cut face, from the per-vertex field the classifier already
+    # signed -- so the plane case reuses the dot products rather than recomputing them per edge.
     tid = wp.tid()
     face_index = face_indices[tid]
-    v0, v1, v2 = kernel_triangles.face_vertices(vertices, faces, face_index)
-    out_points[tid, 0] = edge_plane_intersection(v0, v1, plane_origin, plane_normal)
-    out_points[tid, 1] = edge_plane_intersection(v1, v2, plane_origin, plane_normal)
-    out_points[tid, 2] = edge_plane_intersection(v2, v0, plane_origin, plane_normal)
+    i0 = faces[face_index * 3 + 0]
+    i1 = faces[face_index * 3 + 1]
+    i2 = faces[face_index * 3 + 2]
+    out_points[tid, 0] = canonical_edge_crossing(vertices, vertex_values, i0, i1)
+    out_points[tid, 1] = canonical_edge_crossing(vertices, vertex_values, i1, i2)
+    out_points[tid, 2] = canonical_edge_crossing(vertices, vertex_values, i2, i0)
 
 
 @wp.kernel
