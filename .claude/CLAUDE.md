@@ -402,6 +402,16 @@ Reuse shared mesh fixtures from `tests/conftest.py` instead of building meshes i
 | `icosahedron` | Default watertight solid; inside/outside, surface sampling, sign tests |
 | `cave_cube` | Hollow / non-convex shell (boolean difference) |
 | `hemisphere`, `half_torus` | Curved or open surfaces |
+| `boy_surface` | Closed, watertight and **non-orientable**, χ = 1 — the `False` branch of `is_orientable` / `face_orientation_bits`, and `make_winding_consistent`'s impossible one |
+| `mobius` | Non-orientable *with* a boundary: the same three predicates, one loop of 78 edges, χ = 0 |
+| `bohemian_dome` | Closed genus 1 that self-intersects — `homology_generators` / `tree_cotree` at genus 1, and `is_self_intersecting` on a *closed* input |
+
+The last three are built by `creation.parametric_surface` rather than by trimesh, and they are the
+only inputs in the suite that are non-orientable or that have an odd Euler characteristic. A boolean
+predicate asserted only on the first three fixtures is testing one branch; that is what these close.
+`creation.parametric_surface` builds thirteen more surfaces that are not fixtures yet — reach for
+one (and add the fixture) rather than hand-rolling a degenerate mesh, and see its docstring for
+which class each is.
 
 - **Do not** call `tm.creation.box()` or hand-roll `wp.Mesh(...)` in tests unless the case requires a bespoke degenerate mesh (e.g. empty faces, unreferenced vertices).
 - When a simple cube would suffice, prefer **`icosahedron`** or **`cave_cube`** for richer geometry.

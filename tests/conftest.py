@@ -5,7 +5,8 @@ import pytest
 import trimesh as tm
 import warp as wp
 
-from tests.conversions import trimesh_to_warp
+import triwarp as tw
+from tests.conversions import trimesh_to_warp, warp_to_trimesh
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -77,6 +78,36 @@ def hemisphere(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
     rotation[:3, 3] = np.array([-1.0, 0.0, 2.0])
     hemisphere.apply_transform(rotation)
     return hemisphere, trimesh_to_warp(hemisphere, device)
+
+
+@pytest.fixture
+def boy_surface(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
+    """
+    Boy's surface: closed, watertight and **non-orientable**, with Euler characteristic 1.
+
+    The only fixture of its class. Every other closed mesh in this file is orientable with an even
+    characteristic, so the ``False`` branch of ``is_orientable`` / ``face_orientation_bits`` and the
+    impossible branch of ``make_winding_consistent`` are unreachable without it.
+    """
+    vertices_wp, faces_wp = tw.creation.parametric_surface("boy", device=device)
+    mesh = warp_to_trimesh(vertices_wp, faces_wp)
+    return mesh, trimesh_to_warp(mesh, device)
+
+
+@pytest.fixture
+def mobius(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
+    """Moebius band: non-orientable *with* a boundary — one loop of 78 edges, and χ = 0."""
+    vertices_wp, faces_wp = tw.creation.parametric_surface("mobius", device=device)
+    mesh = warp_to_trimesh(vertices_wp, faces_wp)
+    return mesh, trimesh_to_warp(mesh, device)
+
+
+@pytest.fixture
+def bohemian_dome(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
+    """Build a closed genus-1 surface that intersects itself: watertight, orientable, χ = 0."""
+    vertices_wp, faces_wp = tw.creation.parametric_surface("bohemian_dome", device=device)
+    mesh = warp_to_trimesh(vertices_wp, faces_wp)
+    return mesh, trimesh_to_warp(mesh, device)
 
 
 @pytest.fixture

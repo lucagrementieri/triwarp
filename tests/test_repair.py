@@ -477,6 +477,33 @@ def test_make_winding_consistent_repairs_flipped(icosahedron: tuple[tm.Trimesh, 
     assert same or opposite
 
 
+def test_make_winding_consistent_on_a_non_orientable_mesh(
+    mobius: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    The impossible branch: a Moebius band admits no consistent winding, so the flip pass cannot win.
+
+    What it does instead is worth pinning, because the docstring's post-condition does not hold
+    here and a caller has to know what it gets: the flood-fill orients everything it reaches and the
+    contradiction is confined to a seam — measured 41 of 4 524 edges, under 1%, against 39 before
+    the pass, so this is *not* a repair that partially helps. It stays a pure per-face winding
+    operation either way.
+    """
+    mesh_tm, mesh_wp = mobius
+    assert tw.validation.is_orientable(mesh_wp.indices) is False
+
+    repaired_wp = tw.repair.make_winding_consistent(mesh_wp.indices)
+    assert tw.validation.is_winding_consistent(repaired_wp) is False
+
+    inconsistent_np = ~tw.validation.edge_winding_consistent_mask(repaired_wp).numpy()
+    assert 0 < inconsistent_np.sum() < 0.02 * inconsistent_np.shape[0]
+
+    before, after = mesh_wp.indices.numpy().reshape(-1, 3), _faces_2d(repaired_wp)
+    assert np.array_equal(after[:, 0], before[:, 0])
+    assert np.array_equal(np.sort(after, axis=1), np.sort(before, axis=1))
+    assert len(mesh_tm.faces) == after.shape[0]
+
+
 def test_make_winding_consistent_idempotent(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _, mesh_wp = icosahedron
     repaired_wp = tw.repair.make_winding_consistent(mesh_wp.indices)

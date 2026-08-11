@@ -66,6 +66,15 @@ Every ``create_*`` filter pushes a new mesh onto the MeshSet, so each row builds
 ``ml.MeshSet`` inside the timed callable. That construction is ~30 us empty, so unlike the
 mesh-driven modules the build is not a meaningful share of these rows.
 
+**pyvista** (VTK 9.6) is the reference for the four parametric-surface groups and for nothing else
+here -- ``pv.Sphere`` / ``Cube`` / ``Icosphere`` come in their own frames and scales, so the
+Platonic and revolution rows keep trimesh, open3d and MeshLab. ``pv.Parametric*`` is triwarp's
+source for those surfaces and evaluates the identical map, but it takes a different route to the
+mesh: a per-point C++ loop, then ``vtkCleanPolyData`` welding the raw lattice by *distance*, where
+triwarp identifies the seam combinatorially and never allocates the duplicates. ``clean=True`` is
+passed explicitly on every row because pyvista's own default differs per surface, and an unwelded
+surface is a different (and cheaper) thing to time.
+
 Measured medians
 ----------------
 RTX 5090 / Warp 1.15, ``--device=cuda``. ``sections`` are 32 / 512 / 4096 unless noted.
@@ -82,6 +91,23 @@ RTX 5090 / Warp 1.15, ``--device=cuda``. ``sections`` are 32 / 512 / 4096 unless
 | ``truncated_prisms`` (1k / 256k) | 70 / 164 µs | 180 µs / 112 ms | — |
 | ``random_soup`` (1k / 256k) | 92 / 90 µs | 1.2 / 310 ms | — |
 | ``sweep_polygon`` (64-gon, 4k path) | 2.1 ms | 13.6 ms | — |
+
+The parametric-surface groups, whose axis is instead ``u_res = v_res`` at 40 / 160 / 640 (RTX 5090 /
+Warp 1.16), against pyvista rather than trimesh:
+
+| case | triwarp-cuda | pyvista |
+|---|---|---|
+| ``parametric_surface`` (``boy``) | 0.43 / 2.0 / 54.3 ms | 2.5 / 20.4 / 1 271 ms |
+| ``parametric_surface`` (``dini``) | 0.33 / 1.7 / 44.4 ms | 2.4 / 16.5 / 1 003 ms |
+| ``super_ellipsoid`` (40 / 640) | 0.38 / 33.9 ms | 3.2 / 1 168 ms |
+| ``super_toroid`` (40 / 640) | 0.37 / 31.4 ms | 3.2 / 706 ms |
+| ``random_hills`` (40 / 640) | 0.42 / 44.3 ms | 3.7 / 1 104 ms |
+
+These are the one family in the module that is **not** flat in resolution, and the slope is
+host-side: at 640 (409k samples) ``_parametric_lattice``'s NumPy is 51 of the 55 ms, against 4 ms
+for the launch. That still leaves triwarp 7-23x ahead of VTK, which pays a per-point evaluation loop
+*and* a distance weld; the win would be far larger with the lattice on the device, and that is where
+this group should be read if it is ever optimized.
 
 The shape to read here is that **triwarp is flat in resolution** — every revolution primitive costs
 the same at 32 sections as at 4096, because the work is two kernel launches over one buffer each.
@@ -150,6 +176,7 @@ import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pyvista as pv
 import trimesh as tm
 import warp as wp
 from conftest import BenchLibrary
@@ -672,6 +699,109 @@ def test_truncated_prisms(bench_lib: BenchLibrary, face_count: int) -> None:
     else:
         mesh_tm = bench_lib.run(lambda: tm.creation.truncated_prisms(triangles_np))
         assert len(mesh_tm.faces) == 8 * face_count
+
+
+@pytest.mark.benchmark(group="parametric_surface")
+@pytest.mark.benchlibs("triwarp", "pyvista")
+@pytest.mark.parametrize("surface", ["boy", "dini"])
+@pytest.mark.parametrize("resolution", [40, 160, 640])
+def test_parametric_surface(bench_lib: BenchLibrary, surface: str, resolution: int) -> None:
+    """
+    Analytic surface evaluation on a ``resolution ** 2`` lattice, against VTK's own generator.
+
+    Two surfaces, one per cost class: ``boy`` is a twisted wrap with two collapsed pole rows, so its
+    lattice does the most identification work, and ``dini`` is a plain open patch that does none.
+    The axis is the resolution, quadratic in both.
+
+    **The triwarp side is host-bound above ~25k samples, and the module docstring's floor does not
+    apply here.** Measured on an RTX 5090: 51 of the 55 ms at ``resolution=640`` is
+    ``_parametric_lattice``'s NumPy — a ``meshgrid``, the canonicalising ``where`` chain and one
+    ``np.unique`` over ``resolution ** 2`` keys — against 4 ms for the launch that evaluates the
+    map. Read a change in this group as a change to the host prologue unless the sample count is
+    small. VTK evaluates its map in a per-point C++ loop and then *welds by distance*, which is the
+    part triwarp does combinatorially and for free.
+    """
+    if bench_lib.kind == "pyvista":
+        name = "ParametricBoy" if surface == "boy" else "ParametricDini"
+        mesh_pv = bench_lib.run(
+            lambda: getattr(pv, name)(u_res=resolution, v_res=resolution, clean=True)
+        )
+        assert mesh_pv.n_faces > 0
+        return
+    device = bench_lib.device
+    _, faces_wp = bench_lib.run(
+        lambda: tw.creation.parametric_surface(surface, resolution, resolution, device=device)  # type: ignore[arg-type]
+    )
+    assert int(faces_wp.shape[0]) // 3 > 0
+
+
+@pytest.mark.benchmark(group="super_ellipsoid")
+@pytest.mark.benchlibs("triwarp", "pyvista")
+@pytest.mark.parametrize("resolution", [40, 640])
+def test_super_ellipsoid(bench_lib: BenchLibrary, resolution: int) -> None:
+    """The superquadric sphere: the same lattice plus two signed powers per coordinate."""
+    if bench_lib.kind == "pyvista":
+        mesh_pv = bench_lib.run(
+            lambda: pv.ParametricSuperEllipsoid(u_res=resolution, v_res=resolution, clean=True)
+        )
+        assert mesh_pv.n_faces > 0
+        return
+    device = bench_lib.device
+    _, faces_wp = bench_lib.run(
+        lambda: tw.creation.super_ellipsoid(
+            u_resolution=resolution, v_resolution=resolution, device=device
+        )
+    )
+    assert int(faces_wp.shape[0]) // 3 > 0
+
+
+@pytest.mark.benchmark(group="super_toroid")
+@pytest.mark.benchlibs("triwarp", "pyvista")
+@pytest.mark.parametrize("resolution", [40, 640])
+def test_super_toroid(bench_lib: BenchLibrary, resolution: int) -> None:
+    """The superquadric torus: both directions wrap, so no cell is dropped at any resolution."""
+    if bench_lib.kind == "pyvista":
+        mesh_pv = bench_lib.run(
+            lambda: pv.ParametricSuperToroid(u_res=resolution, v_res=resolution, clean=True)
+        )
+        assert mesh_pv.n_faces > 0
+        return
+    device = bench_lib.device
+    _, faces_wp = bench_lib.run(
+        lambda: tw.creation.super_toroid(
+            u_resolution=resolution, v_resolution=resolution, device=device
+        )
+    )
+    assert int(faces_wp.shape[0]) // 3 > 0
+
+
+@pytest.mark.noparity(
+    "pyvista",
+    reason="D5 stochastic with no shared invariant: VTK draws each hill's amplitude and both "
+    "variances from its own generator and offsets them on a coarse internal grid, where "
+    "random_hills takes all three as parameters and draws only the centres, through NumPy's "
+    "stream rather than VTK's. So no seed pairs the two height fields and only the lattice, the "
+    "domain and the cost are comparable -- the first two are asserted in "
+    "tests/test_creation.py::test_random_hills without needing VTK.",
+)
+@pytest.mark.benchmark(group="random_hills")
+@pytest.mark.benchlibs("triwarp", "pyvista")
+@pytest.mark.parametrize("resolution", [40, 640])
+def test_random_hills(bench_lib: BenchLibrary, resolution: int) -> None:
+    """The height field: the plain grid lattice, plus a 30-term sum per vertex on the device."""
+    if bench_lib.kind == "pyvista":
+        mesh_pv = bench_lib.run(
+            lambda: pv.ParametricRandomHills(u_res=resolution, v_res=resolution, clean=True)
+        )
+        assert mesh_pv.n_faces > 0
+        return
+    device = bench_lib.device
+    _, faces_wp = bench_lib.run(
+        lambda: tw.creation.random_hills(
+            seed=0, u_resolution=resolution, v_resolution=resolution, device=device
+        )
+    )
+    assert int(faces_wp.shape[0]) // 3 > 0
 
 
 @pytest.mark.noparity(

@@ -1,6 +1,11 @@
+import math
+
 import warp as wp
 
 from triwarp.kernels.predicates import orient2d
+
+SQRT3 = wp.constant(wp.float32(math.sqrt(3.0)))
+PI_F = wp.constant(wp.float32(math.pi))
 
 # Below this magnitude a normal component is snapped to zero before the spherical conversion in
 # ``sweep_transforms``, matching trimesh's ``vector_to_spherical``. Without it a Z+ normal whose
@@ -493,3 +498,326 @@ def random_soup_vertices(seed: wp.int32, out_vertices: wp.array[wp.vec3]) -> Non
     i = int(wp.tid())
     state = wp.rand_init(seed, i)
     out_vertices[i] = wp.vec3(wp.randf(state) - 0.5, wp.randf(state) - 0.5, wp.randf(state) - 0.5)
+
+
+# --- parametric surfaces -----------------------------------------------------------------
+#
+# One @wp.func per analytic surface, each the map VTK's ``vtkParametric*::Evaluate`` computes and in
+# VTK's own frame (several are an x/y swap or a z flip away from the textbook form, which is folded
+# into the expressions here). Verified against ``Evaluate`` over the whole sampled lattice: the
+# largest disagreement is 2.5e-06 on a surface of scale 13.5, i.e. float32 rounding. The dispatch
+# below is a warp-uniform branch over an int kind, so the whole family compiles into one module --
+# ``wp.launch`` cannot take a ``wp.Function`` argument, and a kernel factory per surface would build
+# eighteen kernels for one ``Literal``.
+
+SURFACE_BOHEMIAN_DOME = wp.constant(wp.int32(0))
+SURFACE_BOUR = wp.constant(wp.int32(1))
+SURFACE_BOY = wp.constant(wp.int32(2))
+SURFACE_CATALAN_MINIMAL = wp.constant(wp.int32(3))
+SURFACE_CONIC_SPIRAL = wp.constant(wp.int32(4))
+SURFACE_CROSS_CAP = wp.constant(wp.int32(5))
+SURFACE_DINI = wp.constant(wp.int32(6))
+SURFACE_ENNEPER = wp.constant(wp.int32(7))
+SURFACE_FIGURE8_KLEIN = wp.constant(wp.int32(8))
+SURFACE_HENNEBERG = wp.constant(wp.int32(9))
+SURFACE_KLEIN = wp.constant(wp.int32(10))
+SURFACE_KUEN = wp.constant(wp.int32(11))
+SURFACE_MOBIUS = wp.constant(wp.int32(12))
+SURFACE_PLUCKER_CONOID = wp.constant(wp.int32(13))
+SURFACE_PSEUDOSPHERE = wp.constant(wp.int32(14))
+SURFACE_ROMAN = wp.constant(wp.int32(15))
+SURFACE_SUPER_ELLIPSOID = wp.constant(wp.int32(16))
+SURFACE_SUPER_TOROID = wp.constant(wp.int32(17))
+
+# ``vtkParametricKuen::DeltaV0``: the v it substitutes for the v = 0 row, where ``log(tan(v / 2))``
+# is -inf. Its default, and the value the surface "has the best appearance with".
+KUEN_DELTA_V0 = wp.constant(wp.float32(0.05))
+
+
+@wp.func
+def signed_power(value: wp.float32, exponent: wp.float32) -> wp.float32:
+    """``sign(value) * |value| ** exponent``, the superquadric shape function."""
+    return wp.sign(value) * wp.pow(wp.abs(value), exponent)
+
+
+@wp.func
+def surface_bohemian_dome(u: wp.float32, v: wp.float32) -> wp.vec3:
+    return wp.vec3(0.5 * wp.cos(u), 1.5 * wp.cos(v) + 0.5 * wp.sin(u), wp.sin(v))
+
+
+@wp.func
+def surface_bour(u: wp.float32, v: wp.float32) -> wp.vec3:
+    return wp.vec3(
+        u * wp.cos(v) - 0.5 * u * u * wp.cos(2.0 * v),
+        -u * wp.sin(v) - 0.5 * u * u * wp.sin(2.0 * v),
+        4.0 / 3.0 * wp.pow(u, 1.5) * wp.cos(1.5 * v),
+    )
+
+
+@wp.func
+def surface_boy(u: wp.float32, v: wp.float32) -> wp.vec3:
+    # VTK evaluates a *polynomial* Steiner-type immersion of the unit-sphere point, not the rational
+    # Apery form -- there is no denominator, and ``ZScale`` (0.125) scales only the third component.
+    a = wp.cos(u) * wp.sin(v)
+    b = wp.sin(u) * wp.sin(v)
+    c = wp.cos(v)
+    s = a + b + c
+    return wp.vec3(
+        0.5
+        * (
+            2.0 * a * a
+            - b * b
+            - c * c
+            + 2.0 * b * c * (b * b - c * c)
+            + c * a * (a * a - c * c)
+            + a * b * (b * b - a * a)
+        ),
+        0.5 * SQRT3 * (b * b - c * c + c * a * (c * c - a * a) + a * b * (b * b - a * a)),
+        0.125 * s * (s * s * s + 4.0 * (b - a) * (c - b) * (a - c)),
+    )
+
+
+@wp.func
+def surface_catalan_minimal(u: wp.float32, v: wp.float32) -> wp.vec3:
+    return wp.vec3(
+        u - wp.sin(u) * wp.cosh(v),
+        1.0 - wp.cos(u) * wp.cosh(v),
+        4.0 * wp.sin(0.5 * u) * wp.sinh(0.5 * v),
+    )
+
+
+@wp.func
+def surface_conic_spiral(u: wp.float32, v: wp.float32) -> wp.vec3:
+    taper = 1.0 - v / (2.0 * PI_F)
+    return wp.vec3(
+        0.2 * taper * wp.cos(2.0 * v) * (1.0 + wp.cos(u)) + 0.1 * wp.cos(2.0 * v),
+        0.2 * taper * wp.sin(2.0 * v) * (1.0 + wp.cos(u)) + 0.1 * wp.sin(2.0 * v),
+        v / (2.0 * PI_F) + 0.2 * taper * wp.sin(u),
+    )
+
+
+@wp.func
+def surface_cross_cap(u: wp.float32, v: wp.float32) -> wp.vec3:
+    cu, su = wp.cos(u), wp.sin(u)
+    cv, sv = wp.cos(v), wp.sin(v)
+    return wp.vec3(cu * wp.sin(2.0 * v), su * wp.sin(2.0 * v), cv * cv - cu * cu * sv * sv)
+
+
+@wp.func
+def surface_dini(u: wp.float32, v: wp.float32) -> wp.vec3:
+    return wp.vec3(
+        wp.cos(u) * wp.sin(v), wp.sin(u) * wp.sin(v), wp.cos(v) + wp.log(wp.tan(0.5 * v)) + 0.2 * u
+    )
+
+
+@wp.func
+def surface_enneper(u: wp.float32, v: wp.float32) -> wp.vec3:
+    return wp.vec3(u - u * u * u / 3.0 + u * v * v, v - v * v * v / 3.0 + v * u * u, u * u - v * v)
+
+
+@wp.func
+def surface_figure8_klein(u: wp.float32, v: wp.float32) -> wp.vec3:
+    half_u = 0.5 * u
+    radial = 1.0 + wp.cos(half_u) * wp.sin(v) - 0.5 * wp.sin(half_u) * wp.sin(2.0 * v)
+    return wp.vec3(
+        radial * wp.cos(u),
+        radial * wp.sin(u),
+        wp.sin(half_u) * wp.sin(v) + 0.5 * wp.cos(half_u) * wp.sin(2.0 * v),
+    )
+
+
+@wp.func
+def surface_henneberg(u: wp.float32, v: wp.float32) -> wp.vec3:
+    return wp.vec3(
+        2.0 * wp.sinh(u) * wp.cos(v) - 2.0 / 3.0 * wp.sinh(3.0 * u) * wp.cos(3.0 * v),
+        2.0 * wp.sinh(u) * wp.sin(v) + 2.0 / 3.0 * wp.sinh(3.0 * u) * wp.sin(3.0 * v),
+        2.0 * wp.cosh(2.0 * u) * wp.cos(2.0 * v),
+    )
+
+
+@wp.func
+def surface_klein(u: wp.float32, v: wp.float32) -> wp.vec3:
+    cu, su = wp.cos(u), wp.sin(u)
+    cv, sv = wp.cos(v), wp.sin(v)
+    cu2 = cu * cu
+    cu3 = cu2 * cu
+    cu4 = cu2 * cu2
+    cu5 = cu4 * cu
+    cu6 = cu4 * cu2
+    cu7 = cu6 * cu
+    return wp.vec3(
+        -2.0
+        / 15.0
+        * cu
+        * (3.0 * cv - 30.0 * su + 90.0 * cu4 * su - 60.0 * cu6 * su + 5.0 * cu * cv * su),
+        -1.0
+        / 15.0
+        * su
+        * (
+            3.0 * cv
+            - 3.0 * cu2 * cv
+            - 48.0 * cu4 * cv
+            + 48.0 * cu6 * cv
+            - 60.0 * su
+            + 5.0 * cu * cv * su
+            - 5.0 * cu3 * cv * su
+            - 80.0 * cu5 * cv * su
+            + 80.0 * cu7 * cv * su
+        ),
+        2.0 / 15.0 * (3.0 + 5.0 * cu * su) * sv,
+    )
+
+
+@wp.func
+def surface_kuen(u: wp.float32, v: wp.float32) -> wp.vec3:
+    # Both ends of the v domain are singular and VTK names a value at each: it substitutes
+    # ``DeltaV0`` for v = 0, and reports v = pi as the pole (0, 0, -1) rather than the +inf the
+    # limit of ``log(tan(v / 2))`` actually goes to. Both rows are sampled, so both are replicated
+    # here -- and the second guard doubles as the float32 one, since ``tan(v / 2)`` turns negative
+    # a single ulp past pi and ``log`` of it is NaN.
+    v_safe = float(v)
+    if v_safe <= 0.0:
+        v_safe = KUEN_DELTA_V0
+    sv = wp.sin(v_safe)
+    position = wp.vec3(0.0, 0.0, -1.0)
+    if sv > 0.0:
+        denominator = 1.0 + u * u * sv * sv
+        # VTK's frame swaps the first two components relative to the textbook form.
+        position = wp.vec3(
+            2.0 * (wp.sin(u) - u * wp.cos(u)) * sv / denominator,
+            2.0 * (wp.cos(u) + u * wp.sin(u)) * sv / denominator,
+            wp.log(wp.tan(0.5 * v_safe)) + 2.0 * wp.cos(v_safe) / denominator,
+        )
+    return position
+
+
+@wp.func
+def surface_mobius(u: wp.float32, v: wp.float32) -> wp.vec3:
+    # VTK does not halve v, and the half-angle roles are the opposite of the usual writing:
+    # the radius carries sin(u/2) and the height cos(u/2). First two components swapped.
+    radial = 1.0 - v * wp.sin(0.5 * u)
+    return wp.vec3(radial * wp.sin(u), radial * wp.cos(u), v * wp.cos(0.5 * u))
+
+
+@wp.func
+def surface_plucker_conoid(u: wp.float32, v: wp.float32) -> wp.vec3:
+    return wp.vec3(u * wp.sin(v), u * wp.cos(v), wp.sin(2.0 * v))
+
+
+@wp.func
+def surface_pseudosphere(u: wp.float32, v: wp.float32) -> wp.vec3:
+    sech = 1.0 / wp.cosh(u)
+    return wp.vec3(sech * wp.cos(v), sech * wp.sin(v), u - wp.tanh(u))
+
+
+@wp.func
+def surface_roman(u: wp.float32, v: wp.float32) -> wp.vec3:
+    cv = wp.cos(v)
+    s2v = wp.sin(2.0 * v)
+    return wp.vec3(0.5 * cv * cv * wp.sin(2.0 * u), 0.5 * wp.sin(u) * s2v, 0.5 * wp.cos(u) * s2v)
+
+
+@wp.func
+def surface_super_ellipsoid(
+    u: wp.float32, v: wp.float32, n1: wp.float32, n2: wp.float32
+) -> wp.vec3:
+    cv = signed_power(wp.cos(v), n1)
+    sv = signed_power(wp.sin(v), n1)
+    cu = signed_power(wp.cos(u), n2)
+    su = signed_power(wp.sin(u), n2)
+    # First two components swapped, matching VTK's frame.
+    return wp.vec3(cv * su, cv * cu, sv)
+
+
+@wp.func
+def surface_super_toroid(u: wp.float32, v: wp.float32, n1: wp.float32, n2: wp.float32) -> wp.vec3:
+    cu = signed_power(wp.cos(u), n2)
+    su = signed_power(wp.sin(u), n2)
+    cv = signed_power(wp.cos(v), n1)
+    sv = signed_power(wp.sin(v), n1)
+    return wp.vec3(su * (1.0 + 0.5 * cv), cu * (1.0 + 0.5 * cv), 0.5 * sv)
+
+
+@wp.func
+def parametric_position(
+    kind: wp.int32, u: wp.float32, v: wp.float32, n1: wp.float32, n2: wp.float32
+) -> wp.vec3:
+    """Evaluate surface ``kind`` at ``(u, v)``; ``n1`` / ``n2`` are for the superquadrics only."""
+    position = wp.vec3()
+    if kind == SURFACE_BOHEMIAN_DOME:
+        position = surface_bohemian_dome(u, v)
+    elif kind == SURFACE_BOUR:
+        position = surface_bour(u, v)
+    elif kind == SURFACE_BOY:
+        position = surface_boy(u, v)
+    elif kind == SURFACE_CATALAN_MINIMAL:
+        position = surface_catalan_minimal(u, v)
+    elif kind == SURFACE_CONIC_SPIRAL:
+        position = surface_conic_spiral(u, v)
+    elif kind == SURFACE_CROSS_CAP:
+        position = surface_cross_cap(u, v)
+    elif kind == SURFACE_DINI:
+        position = surface_dini(u, v)
+    elif kind == SURFACE_ENNEPER:
+        position = surface_enneper(u, v)
+    elif kind == SURFACE_FIGURE8_KLEIN:
+        position = surface_figure8_klein(u, v)
+    elif kind == SURFACE_HENNEBERG:
+        position = surface_henneberg(u, v)
+    elif kind == SURFACE_KLEIN:
+        position = surface_klein(u, v)
+    elif kind == SURFACE_KUEN:
+        position = surface_kuen(u, v)
+    elif kind == SURFACE_MOBIUS:
+        position = surface_mobius(u, v)
+    elif kind == SURFACE_PLUCKER_CONOID:
+        position = surface_plucker_conoid(u, v)
+    elif kind == SURFACE_PSEUDOSPHERE:
+        position = surface_pseudosphere(u, v)
+    elif kind == SURFACE_ROMAN:
+        position = surface_roman(u, v)
+    elif kind == SURFACE_SUPER_ELLIPSOID:
+        position = surface_super_ellipsoid(u, v, n1, n2)
+    elif kind == SURFACE_SUPER_TOROID:
+        position = surface_super_toroid(u, v, n1, n2)
+    return position
+
+
+@wp.kernel
+def parametric_surface_vertices(
+    kind: wp.int32,
+    n1: wp.float32,
+    n2: wp.float32,
+    sample_u: wp.array[wp.float32],
+    sample_v: wp.array[wp.float32],
+    out_vertices: wp.array[wp.vec3],
+) -> None:
+    # One thread per *output* vertex, carrying the one lattice sample chosen to represent it. Where
+    # the surface glues, several lattice samples map to the same vertex; evaluating only the
+    # canonical one keeps the result bit-exact run to run, which launching over the lattice and
+    # letting the identified samples race for the slot would not (a twisted seam and a collapsed
+    # pole row reach the same point through different expressions, so they agree only to rounding).
+    t = int(wp.tid())
+    out_vertices[t] = parametric_position(kind, sample_u[t], sample_v[t], n1, n2)
+
+
+@wp.kernel
+def random_hills_vertices(
+    amplitude: wp.float32,
+    x_variance: wp.float32,
+    y_variance: wp.float32,
+    hill_centers: wp.array[wp.vec2],
+    sample_u: wp.array[wp.float32],
+    sample_v: wp.array[wp.float32],
+    out_vertices: wp.array[wp.vec3],
+) -> None:
+    t = int(wp.tid())
+    x = sample_u[t]
+    y = sample_v[t]
+    height = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    for h in range(hill_centers.shape[0]):
+        offset = wp.vec2(x, y) - hill_centers[h]
+        height += wp.exp(
+            -0.5 * (offset[0] * offset[0] / x_variance + offset[1] * offset[1] / y_variance)
+        )
+    out_vertices[t] = wp.vec3(x, y, amplitude * height)

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import igl
 import numpy as np
 import open3d as o3d
 import pymeshlab as ml
 import pytest
+import pyvista as pv
 import shapely.geometry as sg
 import trimesh as tm
 import warp as wp
@@ -103,6 +106,91 @@ def _mat44(matrix_np: np.ndarray) -> wp.mat44:
 
 
 # A rectangle and a non-convex L, as counter-clockwise 2D rings.
+def _euler_characteristic(faces_np: np.ndarray) -> int:
+    """``V - E + F`` from an ``(n_faces, 3)`` face array, counting referenced vertices only."""
+    edges_np = np.sort(
+        np.concatenate([faces_np[:, [0, 1]], faces_np[:, [1, 2]], faces_np[:, [2, 0]]]), axis=1
+    )
+    return len(np.unique(faces_np)) - len(np.unique(edges_np, axis=0)) + int(faces_np.shape[0])
+
+
+def _open_edge_count(faces_np: np.ndarray) -> int:
+    """Count the undirected edges with exactly one incident face."""
+    edges_np = np.sort(
+        np.concatenate([faces_np[:, [0, 1]], faces_np[:, [1, 2]], faces_np[:, [2, 0]]]), axis=1
+    )
+    return int((np.unique(edges_np, axis=0, return_counts=True)[1] == 1).sum())
+
+
+def _face_frames(points_np: np.ndarray, faces_np: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-face centroid and unit normal, for matching two triangulations of the same surface."""
+    corners_np = points_np[faces_np]
+    normal_np = np.cross(corners_np[:, 1] - corners_np[:, 0], corners_np[:, 2] - corners_np[:, 0])
+    return corners_np.mean(axis=1), normal_np / np.maximum(
+        np.linalg.norm(normal_np, axis=1, keepdims=True), 1e-30
+    )
+
+
+def _build_parametric(
+    surface: str, resolution: int, device: str
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """Build one surface at ``resolution`` in both directions, whichever builder owns it."""
+    if surface == "super_ellipsoid":
+        return tw.creation.super_ellipsoid(
+            u_resolution=resolution, v_resolution=resolution, device=device
+        )
+    if surface == "super_toroid":
+        return tw.creation.super_toroid(
+            u_resolution=resolution, v_resolution=resolution, device=device
+        )
+    return tw.creation.parametric_surface(surface, resolution, resolution, device=device)  # type: ignore[arg-type]
+
+
+class _Topology(NamedTuple):
+    """The measured topology of one parametric surface at ``u_res = v_res = 40``."""
+
+    points: int
+    faces: int
+    open_edges: int
+    chi: int
+    loops: int
+    orientable: bool
+    watertight: bool
+    pole_cells: int
+    """Triangles the pole rows remove, in units of ``resolution - 1``."""
+
+
+# Every column measured against pyvista at ``clean=True`` and trimesh, and each row is a class of
+# input the rest of the suite has no other example of. ``klein`` is deliberately here despite its
+# name: as VTK parameterizes it, it welds to two boundary loops and is *orientable*, so only
+# ``figure8_klein`` is the closed non-orientable chi = 0 surface.
+_PARAMETRIC_TABLE: dict[str, _Topology] = {
+    "bohemian_dome": _Topology(1521, 3042, 0, 0, 0, True, True, 0),
+    "bour": _Topology(1522, 3003, 39, 1, 1, True, False, 1),
+    "boy": _Topology(1483, 2964, 0, 1, 0, False, True, 2),
+    "catalan_minimal": _Topology(1600, 3042, 156, 1, 1, True, False, 0),
+    "conic_spiral": _Topology(1522, 3003, 39, 1, 1, True, False, 1),
+    "cross_cap": _Topology(1483, 2964, 0, 1, 0, False, True, 2),
+    "dini": _Topology(1600, 3042, 156, 1, 1, True, False, 0),
+    "enneper": _Topology(1600, 3042, 156, 1, 1, True, False, 0),
+    "figure8_klein": _Topology(1521, 3042, 0, 0, 0, False, True, 0),
+    "henneberg": _Topology(1560, 3042, 78, 0, 1, False, False, 0),
+    "klein": _Topology(1560, 3042, 78, 0, 2, True, False, 0),
+    "kuen": _Topology(1561, 3003, 117, 1, 1, True, False, 1),
+    "mobius": _Topology(1560, 3042, 78, 0, 1, False, False, 0),
+    "plucker_conoid": _Topology(1560, 3042, 78, 0, 2, True, False, 0),
+    "pseudosphere": _Topology(1560, 3042, 78, 0, 2, True, False, 0),
+    "roman": _Topology(1521, 3042, 0, 0, 0, False, True, 0),
+    "super_ellipsoid": _Topology(1484, 2964, 0, 2, 0, True, True, 2),
+    "super_toroid": _Topology(1521, 3042, 0, 0, 0, True, True, 0),
+}
+
+_PARAMETRIC_PYVISTA = {
+    name: "Parametric" + "".join(part.capitalize() for part in name.split("_"))
+    for name in _PARAMETRIC_TABLE
+}
+_PARAMETRIC_PYVISTA["figure8_klein"] = "ParametricFigure8Klein"
+
 _SQUARE_RING = np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0]])
 _L_RING = np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0], [1.0, 2.0], [0.0, 2.0]])
 
@@ -1169,6 +1257,185 @@ def test_axis_transform(device: str) -> None:
     )
     assert np.allclose(vertices_wp.numpy(), expected_np, rtol=1e-5, atol=1e-5)
     assert int(faces_wp.shape[0]) > 0
+
+
+@pytest.mark.parametrize("surface", sorted(_PARAMETRIC_TABLE))
+@pytest.mark.parity("parametric_surface", "pyvista")
+@pytest.mark.parity("super_ellipsoid", "pyvista")
+@pytest.mark.parity("super_toroid", "pyvista")
+def test_parametric_surface_matches_pyvista(device: str, surface: str) -> None:
+    """
+    Class A on the topology, class B on the geometry, against ``pv.Parametric*(clean=True)``.
+
+    The counts and the Euler characteristic are integers and compare directly. The vertex *order*
+    differs — VTK welds its raw lattice by distance and drops whichever duplicate it meets second —
+    so the positions are compared as point **sets**, by a two-sided nearest-neighbour query rather
+    than by ``lexsort_rows``, which these surfaces' exact symmetric ties make unusable.
+
+    ``clean=True`` is passed explicitly on every surface: pyvista sets it on only 9 of the 21, so at
+    its own defaults twelve of these arrive as topological disks and every assertion below would
+    compare triwarp's closed answer against an accidentally open one.
+
+    The face normals are compared as well as the positions, which is what pins the winding: a point
+    set alone cannot tell the two orientations of a surface apart.
+    """
+    vertices_wp, faces_wp = _build_parametric(surface, 40, device)
+    vertices_np = vertices_wp.numpy().astype(np.float64)
+    faces_np = faces_wp.numpy().reshape(-1, 3)
+
+    reference_pv = getattr(pv, _PARAMETRIC_PYVISTA[surface])(u_res=40, v_res=40, clean=True)
+    points_pv = np.asarray(reference_pv.points)
+    # Anti-vacuity: a reference that returned nothing would pass every comparison below.
+    assert reference_pv.n_points > 1_000, "pyvista returned a degenerate surface"
+
+    expected = _PARAMETRIC_TABLE[surface]
+    if surface == "catalan_minimal":
+        # The one documented divergence: two sheets of the immersion cross, and VTK's distance weld
+        # merges 40 lattice points the parameterization does not identify -- dropping the 2
+        # triangles that thereby became degenerate. triwarp keeps the sheets apart.
+        assert (reference_pv.n_points, reference_pv.n_faces) == (1560, 3040)
+        assert cKDTree(vertices_np).query(points_pv)[0].max() < 1e-5
+    else:
+        assert (reference_pv.n_points, reference_pv.n_faces) == (expected.points, expected.faces)
+        assert _euler_characteristic(np.asarray(reference_pv.regular_faces)) == expected.chi
+        assert cKDTree(points_pv).query(vertices_np)[0].max() < 1e-5
+        assert cKDTree(vertices_np).query(points_pv)[0].max() < 1e-5
+    assert (len(vertices_np), len(faces_np)) == (expected.points, expected.faces)
+
+    centroid_np, normal_np = _face_frames(vertices_np, faces_np)
+    centroid_pv, normal_pv = _face_frames(points_pv, np.asarray(reference_pv.regular_faces))
+    distance_np, match_np = cKDTree(centroid_pv).query(centroid_np)
+    matched = distance_np < 1e-5
+    assert matched.mean() > 0.9, "face centroids do not correspond"
+    aligned_np = np.einsum("ij,ij->i", normal_np[matched], normal_pv[match_np[matched]])
+    # A handful of triangles are degenerate enough that their normal is float noise; every other
+    # one must agree in *direction*, not just in plane.
+    assert (aligned_np > 0.9).mean() > 0.999
+
+
+@pytest.mark.parametrize("surface", sorted(_PARAMETRIC_TABLE))
+def test_parametric_surface_topology(device: str, surface: str) -> None:
+    """
+    Each surface has the topology it exists to provide, with open3d reading orientability.
+
+    Class A: ``o3d.geometry.TriangleMesh.is_orientable`` is the oracle triwarp's own
+    [`is_orientable`][triwarp.validation.is_orientable] was written against, and the six
+    non-orientable surfaces here are the first inputs in the suite for which it answers ``False`` —
+    without them the comparison is one-sided and a predicate returning a constant would pass it.
+    """
+    vertices_wp, faces_wp = _build_parametric(surface, 40, device)
+    faces_np = faces_wp.numpy().reshape(-1, 3)
+    mesh_tm = _mesh(vertices_wp, faces_wp)
+    expected = _PARAMETRIC_TABLE[surface]
+
+    mesh_o3d = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(vertices_wp.numpy().astype(np.float64)),
+        o3d.utility.Vector3iVector(faces_np.astype(np.int32)),
+    )
+    assert mesh_o3d.is_orientable() == expected.orientable
+    assert bool(tw.validation.is_orientable(faces_wp)) == expected.orientable
+    # The sharpest statement about the index arithmetic: the seam-glued template winds consistently
+    # exactly where a consistent winding exists at all, with no repair pass.
+    assert bool(tw.validation.is_winding_consistent(faces_wp)) == expected.orientable
+    assert _euler_characteristic(faces_np) == expected.chi
+    assert _open_edge_count(faces_np) == expected.open_edges
+    assert mesh_tm.is_watertight == expected.watertight
+    assert len(mesh_tm.outline().entities if expected.open_edges else []) == expected.loops
+
+
+@pytest.mark.parametrize("surface", ["boy", "mobius", "dini", "super_toroid"])
+def test_parametric_surface_topology_is_resolution_independent(device: str, surface: str) -> None:
+    """
+    The identification is combinatorial, so the topology cannot move with the resolution.
+
+    This is the property a distance weld would not have, and it needs no reference: a tolerance
+    applied to a float32 vertex buffer glues a different set of points at 20, 40 and 80 samples.
+    """
+    invariants = set()
+    for resolution in (20, 40, 80):
+        vertices_wp, faces_wp = _build_parametric(surface, resolution, device)
+        faces_np = faces_wp.numpy().reshape(-1, 3)
+        assert len(faces_np) == 2 * (resolution - 1) ** 2 - _PARAMETRIC_TABLE[
+            surface
+        ].pole_cells * (resolution - 1)
+        assert int(vertices_wp.shape[0]) == int(faces_np.max()) + 1
+        invariants.add(
+            (
+                _euler_characteristic(faces_np),
+                bool(tw.validation.is_orientable(faces_wp)),
+                _open_edge_count(faces_np) // (resolution - 1),
+            )
+        )
+    assert len(invariants) == 1, f"topology moved with the resolution: {invariants}"
+
+
+def test_parametric_surface_invalid(device: str) -> None:
+    with pytest.raises(ValueError, match="unknown kind"):
+        tw.creation.parametric_surface("klein_bottle", device=device)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="at least 2"):
+        tw.creation.parametric_surface("mobius", 1, 40, device=device)
+    with pytest.raises(ValueError, match="at least 2"):
+        tw.creation.parametric_surface("mobius", 40, 1, device=device)
+
+
+def test_super_ellipsoid_unit_exponents_are_a_sphere(device: str) -> None:
+    """``n1 = n2 = 1`` is the ellipsoid, which is why no separate ``creation.ellipsoid`` exists."""
+    vertices_wp, faces_wp = tw.creation.super_ellipsoid(device=device)
+    assert np.allclose(np.linalg.norm(vertices_wp.numpy(), axis=1), 1.0, rtol=1e-5, atol=1e-5)
+    _assert_closed(vertices_wp, faces_wp)
+
+    scaled_wp, _ = tw.creation.super_ellipsoid(radii=(2.0, 1.0, 0.5), device=device)
+    axes_np = np.abs(scaled_wp.numpy()).max(axis=0)
+    assert np.allclose(axes_np, [2.0, 1.0, 0.5], rtol=1e-2, atol=1e-2)
+    # The squareness axis is live: at n1 = n2 = 0.4 the surface bulges out towards its box.
+    boxy_wp, _ = tw.creation.super_ellipsoid(n1=0.4, n2=0.4, device=device)
+    assert np.linalg.norm(boxy_wp.numpy(), axis=1).max() > 1.3
+
+
+def test_super_ellipsoid_invalid(device: str) -> None:
+    with pytest.raises(ValueError, match="radii must be"):
+        tw.creation.super_ellipsoid(radii=(1.0, 1.0), device=device)  # type: ignore[arg-type]
+
+
+def test_super_toroid_unit_exponents_are_a_torus(device: str) -> None:
+    """``n1 = n2 = 1`` is VTK's (1, 0.5) torus, the genus-1 counterpart of the sphere above."""
+    vertices_wp, faces_wp = tw.creation.super_toroid(device=device)
+    vertices_np = vertices_wp.numpy().astype(np.float64)
+    ring_np = np.linalg.norm(vertices_np[:, :2], axis=1) - 1.0
+    tube_np = np.hypot(ring_np, vertices_np[:, 2])
+    assert np.allclose(tube_np, 0.5, rtol=1e-5, atol=1e-5)
+    _assert_closed(vertices_wp, faces_wp)
+    assert tw.totals.euler_characteristic(faces_wp) == 0
+
+
+def test_random_hills(device: str) -> None:
+    vertices_wp, faces_wp = tw.creation.random_hills(seed=3, device=device)
+    vertices_np = vertices_wp.numpy().astype(np.float64)
+    assert int(vertices_wp.shape[0]) == 1_600
+    assert int(faces_wp.shape[0]) // 3 == 2 * 39 * 39
+    assert tw.totals.euler_characteristic(faces_wp) == 1
+    # The lattice is the plain grid over [-10, 10]^2, and only the height is random.
+    assert np.allclose(vertices_np[:, :2].min(axis=0), -10.0)
+    assert np.allclose(vertices_np[:, :2].max(axis=0), 10.0)
+    assert 0.0 < vertices_np[:, 2].max() <= 30 * 2.0
+
+    assert np.array_equal(
+        vertices_np, tw.creation.random_hills(seed=3, device=device)[0].numpy().astype(np.float64)
+    )
+    assert not np.array_equal(
+        vertices_np, tw.creation.random_hills(seed=4, device=device)[0].numpy().astype(np.float64)
+    )
+    # Amplitude scales the height field linearly, and no hills leaves it flat.
+    doubled_np = tw.creation.random_hills(amplitude=4.0, seed=3, device=device)[0].numpy()
+    assert np.allclose(doubled_np[:, 2], 2.0 * vertices_np[:, 2], rtol=1e-5, atol=1e-5)
+    assert not tw.creation.random_hills(n_hills=0, device=device)[0].numpy()[:, 2].any()
+
+
+def test_random_hills_invalid(device: str) -> None:
+    with pytest.raises(ValueError, match="variances must be positive"):
+        tw.creation.random_hills(x_variance=0.0, device=device)
+    with pytest.raises(ValueError, match="at least 2"):
+        tw.creation.random_hills(u_resolution=1, device=device)
 
 
 def test_random_soup(device: str) -> None:

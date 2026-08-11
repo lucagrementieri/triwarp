@@ -586,6 +586,23 @@ def test_is_orientable_mobius(device: str) -> None:
     assert tw.validation.is_vertex_manifold(faces_wp) is True
 
 
+def test_is_orientable_closed_non_orientable(boy_surface: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Boy's surface: **closed** and non-orientable, which the band above is not.
+
+    Every other ``False`` input in this file has a boundary, so the flood-fill always had an edge to
+    stop at; here it wraps all the way round and must still find the contradiction. That the mesh is
+    simultaneously watertight and non-orientable is the whole point of the fixture, so it is
+    asserted rather than assumed.
+    """
+    mesh_tm, mesh_wp = boy_surface
+    assert mesh_tm.is_watertight
+    assert tw.validation.is_edge_manifold(mesh_wp.indices, allow_boundary_edges=False) is True
+    assert tw.validation.is_orientable(mesh_wp.indices) is False
+    assert _orientable_np(mesh_tm.faces) is False
+    assert tw.validation.is_winding_consistent(mesh_wp.indices) is False
+
+
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 def test_face_orientation_mask_all_false_on_consistent(
     request: pytest.FixtureRequest, mesh_name: str

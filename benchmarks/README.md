@@ -1,8 +1,8 @@
 # triwarp benchmarks
 
 Performance benchmarks comparing `triwarp` against the CPU references **trimesh**, **libigl
-(`igl`)**, **open3d**, **scipy**, **potpourri3d** (geometry-central) and **pymeshlab**
-(MeshLab / VCGlib), built on
+(`igl`)**, **open3d**, **scipy**, **potpourri3d** (geometry-central), **pymeshlab**
+(MeshLab / VCGlib) and **pyvista** (VTK), built on
 [pytest-benchmark](https://pytest-benchmark.readthedocs.io).
 
 These are **not** collected by the normal test run (`pytest`'s `testpaths` is `tests/`); run them
@@ -201,7 +201,7 @@ set automatically. Pass your own `--benchmark-group-by=...` to override.
 
 | flag | default | meaning |
 |---|---|---|
-| `--device` | `auto` | `triwarp` target(s): `auto`/`cpu`/`cuda`/`both`. `auto` = cuda if available, else cpu. The CPU references (trimesh / igl / open3d / scipy / potpourri3d / pymeshlab) always run. |
+| `--device` | `auto` | `triwarp` target(s): `auto`/`cpu`/`cuda`/`both`. `auto` = cuda if available, else cpu. The CPU references (trimesh / igl / open3d / scipy / potpourri3d / pymeshlab / pyvista) always run. |
 | `--size` | `all` | comma-separated size categories for the **scan** sweep (`small,medium,large,extralarge,huge`). Naming a size also lifts the CPU cap for it. Has no effect on axis-driven groups. |
 | `--cpu-max-size` | `large` | CPU-bound libraries (every reference, plus `triwarp-cpu`) skip scan meshes larger than this unless the size is named in `--size`. |
 

@@ -259,6 +259,32 @@ def test_vertex_defects(request: pytest.FixtureRequest, mesh_name: str):
     assert np.allclose(vertex_defects_wp.numpy(), vertex_defects_igl, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize(
+    ("mesh_name", "chi"), [("icosahedron", 2), ("boy_surface", 1), ("bohemian_dome", 0)]
+)
+def test_vertex_defects_satisfy_gauss_bonnet(
+    request: pytest.FixtureRequest, mesh_name: str, chi: int
+) -> None:
+    """
+    The angle defects of a closed mesh sum to ``2π χ``, whatever the mesh's genus or orientability.
+
+    No reference: this is the discrete Gauss-Bonnet theorem, and it is a stronger statement about
+    the defects than a per-vertex comparison because it couples every vertex at once. The point of
+    running it on these three fixtures is the **odd** characteristic: Boy's surface is the only
+    input in the suite with χ = 1, so it is the only one that can catch a defect convention that is
+    right up to a factor of two, or a sign that is right only on an orientable mesh.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    assert mesh_tm.is_watertight
+    assert tw.totals.euler_characteristic(mesh_wp.indices) == chi
+
+    face_angles_wp = wp.array(mesh_tm.face_angles, dtype=wp.float32, device=mesh_wp.device)
+    defects_wp = tw.vertices.vertex_defects(
+        mesh_tm.vertices.shape[0], mesh_wp.indices, face_angles_wp
+    )
+    assert np.isclose(defects_wp.numpy().sum(), 2.0 * np.pi * chi, rtol=1e-4, atol=1e-3)
+
+
 @pytest.mark.skipif(
     not wp.is_cuda_available(),
     reason="needs a second device to make the current device differ from the arrays' device",

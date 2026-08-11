@@ -615,8 +615,10 @@ def make_winding_consistent(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
     [`face_orientation_mask`][triwarp.validation.face_orientation_mask] (one arbitrary seed
     face per connected component) and reverses the winding of every face whose orientation bit is
     set. The result satisfies
-    [`is_winding_consistent`][triwarp.validation.is_winding_consistent]; an already-consistent
-    mesh is returned unchanged. Mirrors ``trimesh.repair.fix_winding``.
+    [`is_winding_consistent`][triwarp.validation.is_winding_consistent] **whenever one exists**,
+    which is to say whenever the mesh is
+    [`is_orientable`][triwarp.validation.is_orientable]; an already-consistent mesh is returned
+    unchanged. Mirrors ``trimesh.repair.fix_winding``.
 
     Parameters
     ----------
@@ -639,6 +641,14 @@ def make_winding_consistent(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
     The reference winding within each connected component is arbitrary (the seed face keeps its
     orientation), matching ``trimesh.repair.fix_winding``'s BFS. Use
     [`make_volume`][triwarp.repair.make_volume] afterwards to also orient normals outward.
+
+    On a **non-orientable** mesh no consistent winding exists, so this cannot succeed and does not
+    fail either: the flood-fill orients everything it reaches and the contradiction is left on a
+    seam. Measured on a 3 042-triangle Moebius band
+    ([`parametric_surface`][triwarp.creation.parametric_surface]``("mobius")``), 41 of its 4 524
+    edges stay inconsistent, against 39 before the pass — so treat the result as unrepaired rather
+    than partly repaired, and test with
+    [`is_orientable`][triwarp.validation.is_orientable] first if that matters.
     """
     n_faces = int(faces.shape[0]) // 3
     device = faces.device

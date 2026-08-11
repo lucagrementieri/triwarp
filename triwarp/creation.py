@@ -17,6 +17,13 @@ constant tables, and [`icosphere`][triwarp.creation.icosphere] refines one of th
 [`sphere_cap`][triwarp.creation.sphere_cap] are the two *open* primitives — a flat patch and a
 curved one, each with exactly one boundary loop.
 
+[`parametric_surface`][triwarp.creation.parametric_surface] and its three named siblings
+([`super_ellipsoid`][triwarp.creation.super_ellipsoid],
+[`super_toroid`][triwarp.creation.super_toroid],
+[`random_hills`][triwarp.creation.random_hills]) sample an analytic map on an identified lattice,
+and are the only builders here that produce a **non-orientable** surface, an odd Euler
+characteristic, or a mesh whose scale is far from 1.
+
 Differences from `trimesh.creation` that apply module-wide:
 
 - No ``**kwargs`` passthrough, no ``metadata`` and no colors — triwarp has no visual layer, so
@@ -50,7 +57,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import numpy as np
 import warp as wp
@@ -1857,6 +1864,317 @@ def axis(
     return _apply_transform(*tw.combine.concatenate(parts), transform)
 
 
+ParametricSurfaceKind = Literal[
+    "bohemian_dome",
+    "bour",
+    "boy",
+    "catalan_minimal",
+    "conic_spiral",
+    "cross_cap",
+    "dini",
+    "enneper",
+    "figure8_klein",
+    "henneberg",
+    "klein",
+    "kuen",
+    "mobius",
+    "plucker_conoid",
+    "pseudosphere",
+    "roman",
+]
+"""Analytic surface selected by [`parametric_surface`][triwarp.creation.parametric_surface]."""
+
+
+def parametric_surface(
+    kind: ParametricSurfaceKind,
+    u_resolution: int = 40,
+    v_resolution: int = 40,
+    device: wp.DeviceLike = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Create one of sixteen classical analytic surfaces by sampling its parameterization.
+
+    These are the meshes with topology the rest of the module cannot produce: four are closed and
+    **non-orientable**, two are non-orientable with a boundary, one is closed of genus 1, and the
+    other nine are open patches, several with strongly graded triangles. Their Euler characteristics
+    are 0 and 1 and their bounding-box diagonals span 1.7 to 28.3, so they are the package's inputs
+    for
+    [`is_orientable`][triwarp.validation.is_orientable],
+    [`homology_generators`][triwarp.homology.homology_generators] and anything whose behaviour
+    should not depend on the scale of its input.
+
+    Parameters
+    ----------
+    kind
+        Which surface to build:
+
+        - non-orientable and closed — ``"boy"`` and ``"cross_cap"`` (the two immersions of the real
+          projective plane, both with Euler characteristic 1), ``"figure8_klein"`` (the Klein
+          bottle) and ``"roman"`` (Steiner's surface, with three double lines).
+        - non-orientable with a boundary — ``"mobius"`` and ``"henneberg"``.
+        - closed of genus 1 — ``"bohemian_dome"``, and see
+          [`super_toroid`][triwarp.creation.super_toroid].
+        - open, with two boundary loops — ``"klein"`` (which is *not* a Klein bottle as VTK
+          parameterizes it: it is orientable and has a boundary), ``"plucker_conoid"`` and
+          ``"pseudosphere"``.
+        - open, with one boundary loop — ``"bour"``, ``"catalan_minimal"``, ``"conic_spiral"``,
+          ``"dini"``, ``"enneper"`` and ``"kuen"``. ``"dini"`` and ``"enneper"`` are the strongly
+          graded ones.
+    u_resolution, v_resolution
+        Number of samples along each parameter direction, including both ends of the domain. At
+        least 2.
+    device
+        Warp device for the result. Defaults to the current device.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        ``(vertices, faces)`` on ``device``. The vertex count is below
+        ``u_resolution * v_resolution`` wherever the surface glues, and the face count is
+        ``2 * (u_resolution - 1) * (v_resolution - 1)`` less one triangle per pole-adjacent cell.
+
+    Raises
+    ------
+    ValueError
+        If ``kind`` is not one of the listed names, or either resolution is below 2.
+
+    Notes
+    -----
+    Ported from VTK's ``vtkParametric*`` classes, which pyvista exposes as ``pv.Parametric*``; the
+    maps are evaluated in VTK's own frame, so the two agree pointwise to float32.
+
+    The identification along a seam or at a pole is **combinatorial** — it is a fact about the map,
+    applied to the index buffer — where VTK welds its raw lattice by distance afterwards. Two
+    consequences worth knowing. The topology here is exact and identical at every resolution and on
+    every device, and it does not depend on
+    [`remove_duplicated_vertices`][triwarp.repair.remove_duplicated_vertices], which several of
+    these surfaces exist to test. And where an immersed surface merely *crosses* itself, the sheets
+    stay separate: on Catalan's minimal surface VTK merges 40 lattice points that the
+    parameterization does not identify, and drops the 2 triangles that thereby became degenerate.
+
+    Examples
+    --------
+    ```python
+    vertices, faces = tw.creation.parametric_surface("boy")
+    print(tw.totals.euler_characteristic(faces), tw.validation.is_orientable(faces))
+    ```
+
+    See Also
+    --------
+    [`super_ellipsoid`][triwarp.creation.super_ellipsoid]
+    [`super_toroid`][triwarp.creation.super_toroid]
+    [`random_hills`][triwarp.creation.random_hills]
+    [`grid`][triwarp.creation.grid]
+    """
+    if kind not in _PARAMETRIC_SPECS:
+        raise ValueError(f"unknown kind {kind!r}, expected one of {sorted(_PARAMETRIC_SPECS)}")
+    return _parametric_surface(_PARAMETRIC_SPECS[kind], u_resolution, v_resolution, device)
+
+
+def super_ellipsoid(
+    n1: float = 1.0,
+    n2: float = 1.0,
+    radii: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    u_resolution: int = 40,
+    v_resolution: int = 40,
+    device: wp.DeviceLike = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Create a superquadric ellipsoid: a closed genus-0 surface with a squareness axis.
+
+    ``n1 = n2 = 1`` is the ellipsoid — the unit sphere at the default ``radii`` — and lowering
+    either exponent flattens the surface towards a box, so a sweep of ``n1`` takes one connectivity
+    from smooth through creased to nearly sharp-edged. That axis is why this is a builder in its own
+    right rather than one entry of
+    [`parametric_surface`][triwarp.creation.parametric_surface]'s enum.
+
+    Parameters
+    ----------
+    n1
+        Squareness exponent along the v (latitude) direction. ``1`` is the ellipsoid; below ``1``
+        the surface creases at the equator, above ``1`` it pinches towards the poles.
+    n2
+        Squareness exponent along the u (longitude) direction, creasing the horizontal section the
+        same way.
+    radii
+        ``(3,)`` semi-axes, applied after the shape exponents.
+    u_resolution, v_resolution
+        Number of samples along each parameter direction, including both ends of the domain. At
+        least 2.
+    device
+        Warp device for the result. Defaults to the current device.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        ``(vertices, faces)`` on ``device``, closed and watertight: the u direction wraps and both
+        v extremes are poles.
+
+    Raises
+    ------
+    ValueError
+        If ``radii`` does not have shape ``(3,)``, or either resolution is below 2.
+
+    Notes
+    -----
+    VTK's ``vtkParametricSuperEllipsoid``, which pyvista exposes as ``pv.ParametricSuperEllipsoid``
+    and ``pv.Superquadric``. The exponents apply through a signed power ``sign(x) |x| ** n``, so the
+    surface stays symmetric about every coordinate plane.
+
+    See Also
+    --------
+    [`uv_sphere`][triwarp.creation.uv_sphere]
+    [`super_toroid`][triwarp.creation.super_toroid]
+    [`parametric_surface`][triwarp.creation.parametric_surface]
+    """
+    radii_np = np.asanyarray(radii, dtype=np.float64)
+    if radii_np.shape != (3,):
+        raise ValueError(f"radii must be (3,) float, got {radii_np.shape}")
+    vertices, faces = _parametric_surface(
+        _SUPER_ELLIPSOID_SPEC, u_resolution, v_resolution, device, n1=n1, n2=n2
+    )
+    if not np.array_equal(radii_np, np.ones(3)):
+        return _apply_transform(vertices, faces, wp.mat44(*np.diag([*radii_np, 1.0]).ravel()))
+    return vertices, faces
+
+
+def super_toroid(
+    n1: float = 1.0,
+    n2: float = 1.0,
+    u_resolution: int = 40,
+    v_resolution: int = 40,
+    device: wp.DeviceLike = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Create a superquadric torus: a closed genus-1 surface with a squareness axis.
+
+    The genus-1 counterpart of [`super_ellipsoid`][triwarp.creation.super_ellipsoid]. ``n1 = n2 =
+    1`` is the ordinary torus of major radius 1 and minor radius 0.5, and the exponents square off
+    the tube's cross-section (``n1``) and the ring (``n2``) independently.
+
+    Parameters
+    ----------
+    n1
+        Squareness exponent of the tube cross-section.
+    n2
+        Squareness exponent of the ring.
+    u_resolution, v_resolution
+        Number of samples along each parameter direction, including both ends of the domain. At
+        least 2.
+    device
+        Warp device for the result. Defaults to the current device.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        ``(vertices, faces)`` on ``device``, closed and watertight with Euler characteristic 0:
+        both parameter directions wrap.
+
+    Raises
+    ------
+    ValueError
+        If either resolution is below 2.
+
+    Notes
+    -----
+    VTK's ``vtkParametricSuperToroid``, which pyvista exposes as ``pv.ParametricSuperToroid``. The
+    radii are VTK's and are not exposed: [`torus`][triwarp.creation.torus] is the builder for that
+    axis, and this one exists for the exponents.
+
+    See Also
+    --------
+    [`torus`][triwarp.creation.torus]
+    [`super_ellipsoid`][triwarp.creation.super_ellipsoid]
+    [`parametric_surface`][triwarp.creation.parametric_surface]
+    """
+    return _parametric_surface(_SUPER_TOROID_SPEC, u_resolution, v_resolution, device, n1=n1, n2=n2)
+
+
+def random_hills(
+    n_hills: int = 30,
+    amplitude: float = 2.0,
+    x_variance: float = 2.5,
+    y_variance: float = 2.5,
+    seed: int | None = None,
+    u_resolution: int = 40,
+    v_resolution: int = 40,
+    device: wp.DeviceLike = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Create a smooth random height field over the square ``[-10, 10] ** 2``.
+
+    A sum of ``n_hills`` Gaussian bumps at seeded random centres, sampled on a regular lattice: an
+    open patch with one boundary loop, everywhere smooth, and with curvature that varies across it.
+    That makes it the module's input for smoothing, curvature and remeshing, where the Platonic
+    solids and the surfaces of revolution are too uniform to distinguish two implementations.
+
+    Parameters
+    ----------
+    n_hills
+        Number of Gaussian bumps summed into the height.
+    amplitude
+        Height of a single isolated bump. Overlapping bumps add.
+    x_variance, y_variance
+        Variances of each bump along X and Y, in the units of the ``[-10, 10]`` domain.
+    seed
+        RNG seed for the bump centres. A random one is drawn when omitted.
+    u_resolution, v_resolution
+        Number of samples along X and Y, including both ends of the domain. At least 2.
+    device
+        Warp device for the result. Defaults to the current device.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        ``(vertices, faces)`` on ``device`` with ``u_resolution * v_resolution`` vertices — nothing
+        is identified — and ``2 * (u_resolution - 1) * (v_resolution - 1)`` triangles.
+
+    Raises
+    ------
+    ValueError
+        If either resolution is below 2, or either variance is not positive.
+
+    Notes
+    -----
+    Named for VTK's ``vtkParametricRandomHills``, and it is the same idea over the same domain, but
+    the heights are not comparable: VTK draws each hill's amplitude and variance from its own
+    generator, where this takes them as parameters and draws only the centres. The seed goes
+    through [`resolve_seed`][triwarp.sample.resolve_seed], so a given seed reproduces a given mesh.
+
+    See Also
+    --------
+    [`grid`][triwarp.creation.grid]
+    [`random_soup`][triwarp.creation.random_soup]
+    [`parametric_surface`][triwarp.creation.parametric_surface]
+    """
+    if float(x_variance) <= 0.0 or float(y_variance) <= 0.0:
+        raise ValueError(f"variances must be positive, got {(x_variance, y_variance)}")
+    sample_u, sample_v, faces = _parametric_samples(_RANDOM_HILLS_SPEC, u_resolution, v_resolution)
+    generator = np.random.default_rng(tw.sample.resolve_seed(seed))
+    centers = generator.uniform(
+        low=(_RANDOM_HILLS_SPEC.u_range[0], _RANDOM_HILLS_SPEC.v_range[0]),
+        high=(_RANDOM_HILLS_SPEC.u_range[1], _RANDOM_HILLS_SPEC.v_range[1]),
+        size=(max(int(n_hills), 0), 2),
+    )
+
+    vertices = wp.empty(sample_u.shape[0], dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_creation.random_hills_vertices,
+        dim=int(vertices.shape[0]),
+        inputs=[
+            wp.float32(amplitude),
+            wp.float32(x_variance),
+            wp.float32(y_variance),
+            wp.array(centers, dtype=wp.vec2, device=device),
+            wp.array(sample_u, dtype=wp.float32, device=device),
+            wp.array(sample_v, dtype=wp.float32, device=device),
+            vertices,
+        ],
+        device=device,
+    )
+    return vertices, wp.array(faces, dtype=wp.int32, device=device)
+
+
 def random_soup(
     face_count: int = 100, seed: int | None = None, device: wp.DeviceLike = None
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
@@ -1914,7 +2232,7 @@ class _ParametricSpec(NamedTuple):
     [`parametric_surface`][triwarp.creation.parametric_surface].
     """
 
-    kind: int
+    kind: wp.int32
     u_range: tuple[float, float]
     v_range: tuple[float, float]
     u_wrap: bool = False
@@ -1927,13 +2245,163 @@ class _ParametricSpec(NamedTuple):
     pole_u_max: bool = False
 
 
+_PARAMETRIC_SPECS: dict[str, _ParametricSpec] = {
+    "bohemian_dome": _ParametricSpec(
+        kernel_creation.SURFACE_BOHEMIAN_DOME,
+        (-math.pi, math.pi),
+        (-math.pi, math.pi),
+        u_wrap=True,
+        v_wrap=True,
+    ),
+    "bour": _ParametricSpec(
+        kernel_creation.SURFACE_BOUR, (0.0, 1.0), (0.0, 4.0 * math.pi), v_wrap=True, pole_u_min=True
+    ),
+    "boy": _ParametricSpec(
+        kernel_creation.SURFACE_BOY,
+        (0.0, math.pi),
+        (0.0, math.pi),
+        u_wrap=True,
+        u_twist=True,
+        v_wrap=True,
+        pole_v_min=True,
+        pole_v_max=True,
+    ),
+    "catalan_minimal": _ParametricSpec(
+        kernel_creation.SURFACE_CATALAN_MINIMAL, (-4.0 * math.pi, 4.0 * math.pi), (-1.5, 1.5)
+    ),
+    "conic_spiral": _ParametricSpec(
+        kernel_creation.SURFACE_CONIC_SPIRAL,
+        (0.0, 2.0 * math.pi),
+        (0.0, 2.0 * math.pi),
+        u_wrap=True,
+        pole_v_max=True,
+    ),
+    "cross_cap": _ParametricSpec(
+        kernel_creation.SURFACE_CROSS_CAP,
+        (0.0, math.pi),
+        (0.0, math.pi),
+        u_wrap=True,
+        u_twist=True,
+        v_wrap=True,
+        pole_v_min=True,
+        pole_v_max=True,
+    ),
+    "dini": _ParametricSpec(kernel_creation.SURFACE_DINI, (0.0, 4.0 * math.pi), (0.001, 2.0)),
+    "enneper": _ParametricSpec(kernel_creation.SURFACE_ENNEPER, (-2.0, 2.0), (-2.0, 2.0)),
+    "figure8_klein": _ParametricSpec(
+        kernel_creation.SURFACE_FIGURE8_KLEIN,
+        (-math.pi, math.pi),
+        (-math.pi, math.pi),
+        u_wrap=True,
+        u_twist=True,
+        v_wrap=True,
+    ),
+    "henneberg": _ParametricSpec(
+        kernel_creation.SURFACE_HENNEBERG,
+        (-1.0, 1.0),
+        (-0.5 * math.pi, 0.5 * math.pi),
+        v_wrap=True,
+        v_twist=True,
+    ),
+    "klein": _ParametricSpec(
+        kernel_creation.SURFACE_KLEIN, (0.0, math.pi), (0.0, 2.0 * math.pi), v_wrap=True
+    ),
+    "kuen": _ParametricSpec(
+        kernel_creation.SURFACE_KUEN, (-4.5, 4.5), (0.0, math.pi), pole_v_max=True
+    ),
+    "mobius": _ParametricSpec(
+        kernel_creation.SURFACE_MOBIUS, (0.0, 2.0 * math.pi), (-1.0, 1.0), u_wrap=True, u_twist=True
+    ),
+    "plucker_conoid": _ParametricSpec(
+        kernel_creation.SURFACE_PLUCKER_CONOID, (0.0, 3.0), (0.0, 2.0 * math.pi), v_wrap=True
+    ),
+    "pseudosphere": _ParametricSpec(
+        kernel_creation.SURFACE_PSEUDOSPHERE, (-5.0, 5.0), (-math.pi, math.pi), v_wrap=True
+    ),
+    "roman": _ParametricSpec(
+        kernel_creation.SURFACE_ROMAN,
+        (0.0, math.pi),
+        (0.0, math.pi),
+        u_wrap=True,
+        u_twist=True,
+        v_wrap=True,
+    ),
+}
+
+# The two superquadrics and the height field, whose shape parameters earn them their own builders.
+_SUPER_ELLIPSOID_SPEC = _ParametricSpec(
+    kernel_creation.SURFACE_SUPER_ELLIPSOID,
+    (-math.pi, math.pi),
+    (-0.5 * math.pi, 0.5 * math.pi),
+    u_wrap=True,
+    pole_v_min=True,
+    pole_v_max=True,
+)
+_SUPER_TOROID_SPEC = _ParametricSpec(
+    kernel_creation.SURFACE_SUPER_TOROID,
+    (0.0, 2.0 * math.pi),
+    (0.0, 2.0 * math.pi),
+    u_wrap=True,
+    v_wrap=True,
+)
+# The height field has its own kernel -- it sums a table of bumps rather than evaluating a closed
+# form -- so its ``kind`` selects nothing and the lattice is a plain grid.
+_RANDOM_HILLS_SPEC = _ParametricSpec(wp.int32(-1), (-10.0, 10.0), (-10.0, 10.0))
+
+
+def _parametric_surface(
+    spec: _ParametricSpec,
+    u_resolution: int,
+    v_resolution: int,
+    device: wp.DeviceLike,
+    n1: float = 1.0,
+    n2: float = 1.0,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """Sample one analytic surface on its identified lattice, for the four public builders."""
+    sample_u, sample_v, faces = _parametric_samples(spec, u_resolution, v_resolution)
+    vertices = wp.empty(sample_u.shape[0], dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_creation.parametric_surface_vertices,
+        dim=int(vertices.shape[0]),
+        inputs=[
+            spec.kind,
+            wp.float32(n1),
+            wp.float32(n2),
+            wp.array(sample_u, dtype=wp.float32, device=device),
+            wp.array(sample_v, dtype=wp.float32, device=device),
+            vertices,
+        ],
+        device=device,
+    )
+    return vertices, wp.array(faces, dtype=wp.int32, device=device)
+
+
+def _parametric_samples(
+    spec: _ParametricSpec, u_resolution: int, v_resolution: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Per-output-vertex ``(u, v)`` parameter values and the face buffer, for one surface's lattice.
+
+    The parameter values are computed here rather than in the kernel so that both ends of the
+    domain are hit exactly: several of these maps are singular one ulp outside their rectangle.
+    """
+    n_u, n_v = int(u_resolution), int(v_resolution)
+    if n_u < 2 or n_v < 2:
+        raise ValueError(f"resolutions must be at least 2, got {(n_u, n_v)}")
+    sample_ij, faces = _parametric_lattice(spec, n_u, n_v)
+    sample_u = np.linspace(*spec.u_range, n_u)[sample_ij[:, 0]]
+    sample_v = np.linspace(*spec.v_range, n_v)[sample_ij[:, 1]]
+    return sample_u, sample_v, faces
+
+
 def _parametric_lattice(spec: _ParametricSpec, n_u: int, n_v: int) -> tuple[np.ndarray, np.ndarray]:
     """
-    Build the vertex-index map and face buffer for one surface's ``(n_u, n_v)`` lattice.
+    Choose one lattice sample per output vertex, and build the face buffer, for one surface.
 
-    Returns ``(vertex_index, faces)`` where ``vertex_index`` has shape ``(n_u, n_v)`` and holds the
-    dense output vertex id of each lattice sample -- several samples share an id wherever the
-    surface glues -- and ``faces`` is triwarp's flat triangle buffer.
+    Returns ``(sample_ij, faces)`` where ``sample_ij`` is the ``(n_vertices, 2)`` lattice index of
+    the sample representing each output vertex -- several samples land on one vertex wherever the
+    surface glues, and evaluating only the representative keeps the result bit-exact -- and
+    ``faces`` is triwarp's flat triangle buffer.
 
     Pure host-side index arithmetic, in the same spirit as [`grid`][triwarp.creation.grid]: no
     position is consulted and no tolerance appears anywhere, so the topology is exact and
@@ -1993,8 +2461,11 @@ def _parametric_lattice(spec: _ParametricSpec, n_u: int, n_v: int) -> tuple[np.n
         i_canonical = np.where(on_row, anchor_i, i_canonical)
         j_canonical = np.where(on_row, anchor_j, j_canonical)
 
-    _unique, inverse = np.unique(i_canonical * n_v + j_canonical, return_inverse=True)
+    _unique, first, inverse = np.unique(
+        i_canonical * n_v + j_canonical, return_index=True, return_inverse=True
+    )
     vertex_index = inverse.reshape((n_u, n_v)).astype(np.int32)
+    sample_ij = np.column_stack(np.unravel_index(first, (n_u, n_v)))
 
     # One cell per lattice square -- wrapping reuses vertices rather than adding cells, so the count
     # is ``(n_u - 1) * (n_v - 1)`` however the boundary glues. A cell touching a pole has two
@@ -2003,10 +2474,12 @@ def _parametric_lattice(spec: _ParametricSpec, n_u: int, n_v: int) -> tuple[np.n
     corner_b = vertex_index[1:, :-1].ravel()
     corner_c = vertex_index[1:, 1:].ravel()
     corner_d = vertex_index[:-1, 1:].ravel()
+    # Wound against the (u, v) frame, which is VTK's convention and puts the normals of the closed
+    # surfaces outward: measured opposed on every one of the 18 surfaces if wound with it.
     triangles = np.concatenate(
         (
-            np.column_stack((corner_a, corner_b, corner_c)),
-            np.column_stack((corner_a, corner_c, corner_d)),
+            np.column_stack((corner_a, corner_c, corner_b)),
+            np.column_stack((corner_a, corner_d, corner_c)),
         )
     )
     nondegenerate = (
@@ -2014,7 +2487,7 @@ def _parametric_lattice(spec: _ParametricSpec, n_u: int, n_v: int) -> tuple[np.n
         & (triangles[:, 1] != triangles[:, 2])
         & (triangles[:, 2] != triangles[:, 0])
     )
-    return vertex_index, np.ascontiguousarray(triangles[nondegenerate].reshape(-1), dtype=np.int32)
+    return sample_ij, np.ascontiguousarray(triangles[nondegenerate].reshape(-1), dtype=np.int32)
 
 
 def _segment_to_cylinder(segment: Sequence[Sequence[float]]) -> tuple[wp.mat44, float]:

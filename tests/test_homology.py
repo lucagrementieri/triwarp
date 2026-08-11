@@ -29,7 +29,10 @@ def _is_simple_edge_cycle(loop: np.ndarray, edges_tm: set[tuple[int, int]]) -> b
 
 
 @pytest.mark.parametrize(
-    ("mesh_name", "genus"), [("icosahedron", 0), ("torus", 1), ("genus_two", 2)]
+    ("mesh_name", "genus"),
+    # ``bohemian_dome`` is genus 1 like the torus but *self-intersecting*, so the generators are
+    # found on a surface whose embedding gives no hint of where they run.
+    [("icosahedron", 0), ("torus", 1), ("bohemian_dome", 1), ("genus_two", 2)],
 )
 def test_homology_generator_count_is_twice_the_genus(
     request: pytest.FixtureRequest, mesh_name: str, genus: int, device: str
