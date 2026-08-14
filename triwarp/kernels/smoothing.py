@@ -355,7 +355,7 @@ def apply_operator_scalar(
     if end == start:
         out_average[i] = field[i]
         return
-    total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    total = wp.float32(0.0)
     for k in range(start, end):
         total += values[k] * field[columns[k]]
     out_average[i] = total

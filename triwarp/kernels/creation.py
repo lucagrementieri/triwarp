@@ -814,7 +814,7 @@ def random_hills_vertices(
     t = int(wp.tid())
     x = sample_u[t]
     y = sample_v[t]
-    height = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    height = wp.float32(0.0)
     for h in range(hill_centers.shape[0]):
         offset = wp.vec2(x, y) - hill_centers[h]
         height += wp.exp(

@@ -68,7 +68,7 @@ def row_argmin(
     out_val: wp.array[wp.float32],
 ) -> None:
     i = int(wp.tid())
-    best_col = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
+    best_col = wp.int32(0)
     best_val = perimeters[i, 0]
     for j in range(1, m_b):
         update_argmin(best_val, best_col, perimeters[i, j], j)
@@ -84,7 +84,7 @@ def global_argmin(
     out_shift: wp.array[wp.int32],
 ) -> None:
     # Single-thread reduction: out_shift = (shift_a, shift_b).
-    best_row = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
+    best_row = wp.int32(0)
     best_val = val_min[0]
     for i in range(1, n_a):
         update_argmin(best_val, best_row, val_min[i], i)

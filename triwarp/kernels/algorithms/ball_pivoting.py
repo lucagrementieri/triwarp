@@ -226,7 +226,7 @@ def seed_triangles(
     # is a runtime index (``nbr[count]``, ``nbr[i0]``, ``nbr[i1]``), and a runtime index into a
     # vector spills it to local memory, which is where ``wp.zeros`` already puts it.
     nbr = wp.zeros(shape=MAX_SEED_NEIGHBORS, dtype=wp.int32)
-    count = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
+    count = wp.int32(0)
     query = wp.hash_grid_query(grid_id, points[p], 2.0 * radius)
     j = wp.int32(-1)
     while wp.hash_grid_query_next(query, j):

@@ -30,7 +30,3 @@
 	path = reference/trimesh
 	url = git@github.com:mikedh/trimesh.git
 	branch = main
-[submodule "reference/vedo"]
-	path = reference/vedo
-	url = git@github.com:marcomusy/vedo.git
-	branch = master

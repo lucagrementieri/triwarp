@@ -468,7 +468,7 @@ def bfs(
     Two engines, chosen by the *observed frontier width* rather than by any property of the graph
     known up front. The traversal starts level-synchronous and parallel, and hands over to a single
     serial thread as soon as its frontier is both narrow and no longer growing: a level costs the
-    same seven fixed-size launches whatever it carries, so once the frontier is a handful of nodes
+    same four fixed-size launches whatever it carries, so once the frontier is a handful of nodes
     the serial walk is cheaper per node than the launches are per level. On a graph that stays wide
     the handover never fires; on one whose frontier is narrow from the start (a path) it fires
     almost immediately. Order-exactness survives it by construction — the parallel path builds the
@@ -541,15 +541,32 @@ def bfs(
           the interface: a host walk means reading the whole CSR and the result back across the
           bus, which is a different contract from the one this function has.
 
-        The parallel engine is far worse on this shape (seven fixed-size launches per level,
+        The parallel engine is far worse on this shape (four fixed-size launches per level,
         ~410 ms even under conditional-graph capture), which is why the handover exists at all.
         Single-source BFS on a path graph has two-way parallelism, and one GPU thread
         pointer-chasing is ~30x slower than one CPU core doing the same, so **triwarp will not beat
-        scipy on this axis.** The
-        narrower ``sphere_med`` gap (2.2x) is a *different* problem: there the captured parallel
-        engine launches all seven kernels at ``dim=node_count`` for a 130-wide frontier, and Warp
-        cannot take a device-side launch dimension, so the lever there is fusing the seven kernels
-        into two or three.
+        scipy on this axis.**
+
+        !!! note "The narrower ``sphere_med`` gap is a launch-count floor, and it is now at it"
+            There the captured engine runs its level body for a ~130-wide frontier, and the cost is
+            per-*kernel* rather than per-node: measured **~2.8 us of device time per launch, flat
+            from ``dim=1024`` to ``dim=163842``**, so Warp's inability to take a device-side launch
+            dimension costs nothing and narrowing the grid is not the lever. Fusing is, and the body
+            has now been fused as far as the algorithm's barriers allow — **seven kernels to four**,
+            worth a measured **3.94 -> 3.53 ms** on ``sphere_med`` (1.15 -> 1.05x per level on
+            ``sphere_large``, 8.04 -> 7.09 ms).
+
+            The returns fell off sharply, which is the useful part of the result: the first two
+            kernels removed were nearly free ones (3.94 -> 3.67), and folding the claim count into
+            the block scan bought only another 0.13 ms because the fused kernel inherited the work
+            rather than the launch. So ~1.8 us of each surviving kernel's 4.6 us is real work and
+            the 2.8 us floor is the rest.
+
+            The remaining four are the minimum: ``expand_claim`` must finish its ``atomic_min``
+            ownership before the count can read it, the block scan must finish before its block sums
+            are cumulated, and the scatter must see the cumulated sums — three global barriers, four
+            kernels. **triwarp will not reach scipy on this row either**, and the residual is
+            dispatch, not algorithm.
     """
     node_count, offsets, columns = _validate_square_csr(adjacency)
     if source < 0 or source >= node_count:
@@ -586,16 +603,19 @@ def bfs(
     #
     # The loop also *stops early* once the frontier narrows (``_BFS_ESCAPE_FRONTIER``) and hands
     # its half-built FIFO to the serial kernel above, which is what keeps a long-diameter graph
-    # from paying seven fixed-size launches for a two-node frontier, tens of thousands of times.
+    # from paying four fixed-size launches for a two-node frontier, tens of thousands of times.
     scan_block = kernel_bfs.BFS_SCAN_BLOCK
     n_blocks = (node_count + scan_block - 1) // scan_block
     padded = n_blocks * scan_block
     claim_rank = wp.full(node_count, INT32_MAX, dtype=wp.int32, device=device)
-    counts = wp.empty(padded, dtype=wp.int32, device=device)
     offsets_scan = wp.empty(padded, dtype=wp.int32, device=device)
     block_sums = wp.empty(n_blocks, dtype=wp.int32, device=device)
-    # state = [frontier start, frontier end, level to emit, loop condition].
-    state = wp.array([0, 1, 1, 1], dtype=wp.int32, device=device)
+    # state = [frontier start, frontier end, level to emit, loop condition,
+    #          emit start, emit end, emit level] -- the last three are the window
+    # ``bfs_scatter_claims`` works on, snapshotted by ``bfs_scan_and_advance`` before it advances
+    # the live one. See ``kernels/algorithms/bfs.py`` for why the update runs before the scatter.
+    state = wp.zeros(kernel_bfs.BFS_STATE_SIZE, dtype=wp.int32, device=device)
+    state.assign([0, 1, 1, 1, 0, 1, 1])
     wp.launch(
         kernel_bfs.bfs_seed,
         dim=1,
@@ -610,26 +630,29 @@ def bfs(
             inputs=[offsets, columns, order_buffer, state, distances, claim_rank],
             device=device,
         )
-        wp.launch(
-            kernel_bfs.bfs_count_claims,
-            dim=node_count,
-            inputs=[offsets, columns, order_buffer, state, distances, claim_rank, counts],
-            device=device,
-        )
-        # Capture-safe fixed-buffer inclusive scan (wp.utils.array_scan allocates temp storage
-        # internally, which conditional graph bodies reject).
+        # Count and scan share a launch (see the kernel), and the scan is a capture-safe
+        # fixed-buffer one: wp.utils.array_scan allocates temp storage internally, which conditional
+        # graph bodies reject.
         wp.launch_tiled(
-            kernel_bfs.bfs_scan_blocks,
+            kernel_bfs.bfs_count_and_scan,
             dim=[n_blocks],
-            inputs=[counts, offsets_scan, block_sums],
+            inputs=[
+                offsets,
+                columns,
+                order_buffer,
+                state,
+                distances,
+                claim_rank,
+                offsets_scan,
+                block_sums,
+            ],
             block_dim=scan_block,
             device=device,
         )
-        wp.launch(kernel_bfs.bfs_scan_block_sums, dim=1, inputs=[state, block_sums], device=device)
         wp.launch(
-            kernel_bfs.bfs_add_block_offsets,
-            dim=node_count,
-            inputs=[block_sums, offsets_scan],
+            kernel_bfs.bfs_scan_and_advance,
+            dim=1,
+            inputs=[offsets_scan, wp.int32(_BFS_ESCAPE_FRONTIER), block_sums, state],
             device=device,
         )
         wp.launch(
@@ -641,26 +664,27 @@ def bfs(
                 state,
                 claim_rank,
                 offsets_scan,
+                block_sums,
                 order_buffer,
                 parents,
                 distances,
             ],
             device=device,
         )
-        wp.launch(
-            kernel_bfs.bfs_update_state,
-            dim=1,
-            inputs=[offsets_scan, wp.int32(_BFS_ESCAPE_FRONTIER), state],
-            device=device,
-        )
 
-    condition = state[3:4]
-    if wp.is_conditional_graph_supported():
-        with wp.ScopedCapture(device) as capture:
+    # CUDA only: ``bfs_count_and_scan`` builds its tile with ``wp.tile``, which fills lane 0 alone
+    # on Warp 1.16's CPU backend. On CPU the level loop is skipped entirely and the serial kernel
+    # below walks from the seed — the same kernel the escape path already hands off to, so the
+    # answer is identical rather than degraded, and one CPU core pointer-chasing is the faster
+    # engine there anyway.
+    if device.is_cuda:
+        condition = state[3:4]
+        if wp.is_conditional_graph_supported():
+            with wp.ScopedCapture(device) as capture:
+                wp.capture_while(condition, bfs_level_body)
+            wp.capture_launch(capture.graph)
+        else:
             wp.capture_while(condition, bfs_level_body)
-        wp.capture_launch(capture.graph)
-    else:
-        wp.capture_while(condition, bfs_level_body)
 
     # One readback of the FIFO window tells both things there are to know: an empty window means
     # the traversal ran out of frontier, a non-empty one means it escaped and the serial kernel

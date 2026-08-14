@@ -317,6 +317,14 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     ("registration", "accumulate_cost"): frozenset({"acc"}),
     # scratch / persistent state
     ("adjacency", "scatter_vertex_faces"): frozenset({"cursor"}),
+    # The hull sweep's working set: the boundary polygon it carries between insertions, the buffer
+    # it rebuilds that polygon into, and the per-boundary-edge orientations of one insertion.
+    # Caller-allocated because the sweep is one thread over an ``n``-sized problem, so none of the
+    # three can be a kernel local -- but none is an input or the answer either, so ``out_`` would
+    # misread.
+    ("reconstruction", "lexicographic_triangulation"): frozenset(
+        {"boundary", "boundary_next", "orientations"}
+    ),
     ("algorithms.ball_pivoting", "begin_wave"): frozenset({"counters"}),
     ("algorithms.ball_pivoting", "collect_front_from_table"): frozenset({"counters"}),
     ("algorithms.ball_pivoting", "commit_triangles"): frozenset({"counters", "point_used"}),

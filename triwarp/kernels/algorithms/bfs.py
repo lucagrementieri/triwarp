@@ -77,7 +77,7 @@ def bfs_extras_push_nearest(
         ext_dist[count] = distance
         ext_idx[count] = neighbor
         return count + 1
-    farthest = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
+    farthest = wp.int32(0)
     farthest_distance = ext_dist[0]
     for k in range(1, cap):
         update_argmax(farthest_distance, farthest, ext_dist[k], k)
@@ -92,7 +92,7 @@ def bfs_extras_pop_nearest(
     ext_dist: wp.array[wp.float32], ext_idx: wp.array[wp.int32], count: wp.int32
 ) -> tuple[wp.int32, wp.int32]:
     """Remove and return the nearest candidate (swap-remove); caller ensures ``count > 0``."""
-    best = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
+    best = wp.int32(0)
     best_distance = ext_dist[0]
     for k in range(1, count):
         update_argmin(best_distance, best, ext_dist[k], k)
@@ -283,7 +283,34 @@ _STATE_START = wp.constant(wp.int32(0))
 _STATE_TAIL = wp.constant(wp.int32(1))
 _STATE_LEVEL = wp.constant(wp.int32(2))
 _STATE_COND = wp.constant(wp.int32(3))
+# The window the *scatter* must use. ``bfs_scan_and_advance`` advances the live window and snapshots
+# the outgoing one here in the same launch, which is what lets the state update happen before the
+# scatter rather than in a seventh kernel after it. See that kernel for why the fusion is worth it.
+_STATE_EMIT_START = wp.constant(wp.int32(4))
+_STATE_EMIT_TAIL = wp.constant(wp.int32(5))
+_STATE_EMIT_LEVEL = wp.constant(wp.int32(6))
+BFS_STATE_SIZE = 7
 BFS_SCAN_BLOCK = 256
+
+
+@wp.func
+def bfs_segment_base(
+    rank: wp.int32, offsets_scan: wp.array[wp.int32], block_sums: wp.array[wp.int32]
+) -> wp.int32:
+    # Exclusive prefix of the per-rank claim counts at ``rank``, read straight off the two-level
+    # scan: the within-block inclusive scan at rank - 1, plus the cumulative total of every block
+    # before it. Folding this into the two readers is what removes ``bfs_add_block_offsets``, whose
+    # only job was to materialise the same sum into ``offsets_scan``.
+    #
+    # Only blocks strictly before rank's own are read, and those are entirely inside the frontier,
+    # so the stale counts past the frontier (see ``bfs_count_claims``) never enter the sum.
+    if rank <= wp.int32(0):
+        return wp.int32(0)
+    base = offsets_scan[rank - 1]
+    block = (rank - wp.int32(1)) / wp.int32(BFS_SCAN_BLOCK)
+    if block > wp.int32(0):
+        base += block_sums[block - 1]
+    return base
 
 
 @wp.kernel
@@ -312,74 +339,102 @@ def bfs_expand_claim(
 
 
 @wp.kernel
-def bfs_count_claims(
+def bfs_count_and_scan(
     adj_offsets: wp.array[wp.int32],
     adj_columns: wp.array[wp.int32],
     order: wp.array[wp.int32],
     state: wp.array[wp.int32],
     dist: wp.array[wp.int32],
     claim_rank: wp.array[wp.int32],
-    out_counts: wp.array[wp.int32],
+    out_scanned: wp.array[wp.int32],
+    out_block_sums: wp.array[wp.int32],
 ) -> None:
+    # Counts the claims each rank owns and scans them within the block, in one launch.
+    #
     # Thread r counts the neighbors it owns this level: still unvisited (stale-rank guard, see
-    # bfs_expand_claim) and won by rank r — the atomic_min winner is unique per node. Stale
-    # ``out_counts`` entries beyond the frontier size are harmless: an inclusive scan's prefix
-    # only depends on the prefix, and offsets past the frontier are never read.
-    r = int(wp.tid())
-    if r >= state[_STATE_TAIL] - state[_STATE_START]:
-        return
-    u = order[state[_STATE_START] + r]
-    count = wp.int32(0)
-    for k in range(adj_offsets[u], adj_offsets[u + 1]):
-        v = adj_columns[k]
-        if dist[v] == wp.int32(-1) and claim_rank[v] == wp.int32(r):
-            count += wp.int32(1)
-    out_counts[r] = count
-
-
-@wp.kernel
-def bfs_scan_blocks(
-    values: wp.array[wp.int32], out_scanned: wp.array[wp.int32], out_block_sums: wp.array[wp.int32]
-) -> None:
-    # Capture-safe scan, pass 1: per-block inclusive scan (arrays are padded to a multiple of
-    # BFS_SCAN_BLOCK; padding garbage never reaches a read prefix). Thread 0 exports the block
-    # total for pass 2.
+    # ``bfs_expand_claim``) and won by rank r — the ``atomic_min`` winner is unique per node. Ranks
+    # past the frontier contribute a real zero rather than the stale entry the separate counting
+    # kernel used to leave behind, which is strictly cleaner and changes nothing downstream: only
+    # the valid prefix is ever read.
+    #
+    # The count and the scan can share a launch because rank r's count depends on nothing outside
+    # r's own adjacency, so block i needs no value from any other block — unlike the three global
+    # barriers that force the rest of the level body apart (see ``bfs_scan_and_advance``). The tile
+    # is built from the per-thread count with ``wp.tile``, which is why this kernel is
+    # **CUDA-only**: on Warp 1.16's CPU backend ``wp.tile(scalar)`` fills lane 0 and leaves the
+    # rest zero (verified: a 256-wide inclusive scan of ``[4, 3, 2, 1, 1]`` returns
+    # ``[4, 0, 0, 0, 0]``). ``graph.bfs``
+    # therefore runs its serial engine on CPU rather than this one; it does not degrade silently.
     i, t = wp.tid()
-    offset = i * BFS_SCAN_BLOCK
-    tile = wp.tile_load(values, shape=BFS_SCAN_BLOCK, offset=offset, storage="register")
-    scanned = wp.tile_scan_inclusive(tile)
-    wp.tile_store(out_scanned, scanned, offset=offset)
+    rank = i * BFS_SCAN_BLOCK + t
+    count = wp.int32(0)
+    if rank < state[_STATE_TAIL] - state[_STATE_START]:
+        u = order[state[_STATE_START] + rank]
+        for k in range(adj_offsets[u], adj_offsets[u + 1]):
+            v = adj_columns[k]
+            if dist[v] == wp.int32(-1) and claim_rank[v] == wp.int32(rank):
+                count += wp.int32(1)
+    scanned = wp.tile_scan_inclusive(wp.tile(count))
+    wp.tile_store(out_scanned, scanned, offset=i * BFS_SCAN_BLOCK)
     if t == 0:
         out_block_sums[i] = scanned[BFS_SCAN_BLOCK - 1]
 
 
 @wp.kernel
-def bfs_scan_block_sums(state: wp.array[wp.int32], out_block_sums: wp.array[wp.int32]) -> None:
-    # Capture-safe scan, pass 2 (dim=1): serial inclusive scan of the block sums.
+def bfs_scan_and_advance(
+    offsets_scan: wp.array[wp.int32],
+    escape_frontier: wp.int32,
+    out_block_sums: wp.array[wp.int32],
+    out_state: wp.array[wp.int32],
+) -> None:
+    # dim=1. Three jobs that were three kernels, and the reason they can share one launch is that
+    # none of them touches the frontier's *nodes* — they only move indices around.
     #
-    # Only the blocks the *frontier* reaches are scanned. The grid dim of every kernel in the level
-    # body is baked in at capture time, so this one thread would otherwise walk all
-    # ``node_count / BFS_SCAN_BLOCK`` blocks on every level however narrow the frontier — one
-    # dependent global load each, which on a long path graph is the single dominant cost of the
-    # traversal (measured: 161 blocks, ~32 us a level, 20 481 levels). Blocks past the frontier are
-    # left unscanned; their offsets are never read, exactly as the stale ``counts`` past the
-    # frontier are not (see ``bfs_count_claims``).
+    # 1. Capture-safe scan, pass 2: serial inclusive scan of the block sums. Only the blocks the
+    #    *frontier* reaches are scanned. The grid dim of every kernel in the level body is baked in
+    #    at capture time, so this one thread would otherwise walk all
+    #    ``node_count / BFS_SCAN_BLOCK`` blocks on every level however narrow the frontier — one
+    #    dependent global load each, which on a long path graph is the single dominant cost of the
+    #    traversal (measured: 161 blocks, ~32 us a level, 20 481 levels). Blocks past the frontier
+    #    are left unscanned; their offsets are never read, exactly as the stale ``counts`` past the
+    #    frontier are not (see ``bfs_count_claims``).
+    # 2. Snapshot the outgoing window into the ``EMIT`` slots, so ``bfs_scatter_claims`` can run
+    #    *after* the state has already advanced.
+    # 3. Advance the frontier window to the segment the scatter is about to fill, bump the level,
+    #    and decide whether the level loop keeps going. It stops for one of two reasons, which the
+    #    caller tells apart by whether the window it leaves behind is empty. Either the level
+    #    emitted nothing and the traversal is done, or the frontier has gone **narrow and stopped
+    #    growing** — at which point a level costs the same fixed ``dim=node_count`` launches as a
+    #    wide one while doing almost no work, and one serial thread finishes the rest faster.
+    #    Requiring "not growing" as well as "narrow" is what keeps a *start* from escaping: every
+    #    traversal begins at a frontier of one, but on a blob that one immediately fans out.
+    #
+    # Why fuse at all: the level body's cost is per-*kernel* dispatch inside the replayed graph and
+    # not the work, measured at ~2.9-3.8 us per (level x kernel) and flat to 1.3x across a 64x range
+    # of node count. So the launch count is the lever, and this kernel plus
+    # ``bfs_segment_base`` and ``bfs_count_and_scan`` take the body from seven kernels to four.
     _ = int(wp.tid())
-    frontier = state[_STATE_TAIL] - state[_STATE_START]
+    frontier = out_state[_STATE_TAIL] - out_state[_STATE_START]
     n = wp.min((frontier + BFS_SCAN_BLOCK - 1) / BFS_SCAN_BLOCK, out_block_sums.shape[0])
     total = wp.int32(0)
     for k in range(n):
         total += out_block_sums[k]
         out_block_sums[k] = total
 
+    count = wp.int32(0)
+    if frontier > 0:
+        count = bfs_segment_base(frontier, offsets_scan, out_block_sums)
 
-@wp.kernel
-def bfs_add_block_offsets(block_sums: wp.array[wp.int32], out_scanned: wp.array[wp.int32]) -> None:
-    # Capture-safe scan, pass 3: add the preceding blocks' total to each element.
-    idx = int(wp.tid())
-    b = wp.int32(idx) / wp.int32(BFS_SCAN_BLOCK)
-    if b > wp.int32(0):
-        out_scanned[idx] += block_sums[b - 1]
+    out_state[_STATE_EMIT_START] = out_state[_STATE_START]
+    out_state[_STATE_EMIT_TAIL] = out_state[_STATE_TAIL]
+    out_state[_STATE_EMIT_LEVEL] = out_state[_STATE_LEVEL]
+
+    out_state[_STATE_START] = out_state[_STATE_TAIL]
+    out_state[_STATE_TAIL] = out_state[_STATE_TAIL] + count
+    out_state[_STATE_LEVEL] = out_state[_STATE_LEVEL] + wp.int32(1)
+    narrow = count < escape_frontier and count <= frontier
+    keep_going = count > wp.int32(0) and not narrow
+    out_state[_STATE_COND] = wp.where(keep_going, wp.int32(1), wp.int32(0))
 
 
 @wp.kernel
@@ -388,28 +443,30 @@ def bfs_scatter_claims(
     adj_columns: wp.array[wp.int32],
     state: wp.array[wp.int32],
     claim_rank: wp.array[wp.int32],
-    offsets_inclusive: wp.array[wp.int32],
+    offsets_scan: wp.array[wp.int32],
+    block_sums: wp.array[wp.int32],
     out_order: wp.array[wp.int32],
     out_parent: wp.array[wp.int32],
     out_dist: wp.array[wp.int32],
 ) -> None:
     # Emits the level in exact scipy FIFO order without a sort: segments are rank-major (thread
-    # r's segment starts at the exclusive-scan value offsets_inclusive[r - 1]) and each segment
+    # r's segment starts at the exclusive prefix ``bfs_segment_base(r, ...)``) and each segment
     # fills in ascending CSR column order — (parent dequeue rank, ascending node id), exactly
     # the order the former int64 claim-key radix sort produced. ``out_order`` is read as the
     # current frontier and written with the next level's nodes. ``out_dist`` doubles as the
     # visited marker read by the ownership guard: only the unique rank winner writes dist[v], so
     # its racy read by non-owners cannot flip their guard (they fail claim_rank[v] == r).
+    #
+    # The window comes from the ``EMIT`` slots, not the live ones: ``bfs_scan_and_advance`` has
+    # already moved the live window on, which is what let its state update fold into the scan.
     r = int(wp.tid())
-    start = state[_STATE_START]
-    tail = state[_STATE_TAIL]
+    start = state[_STATE_EMIT_START]
+    tail = state[_STATE_EMIT_TAIL]
     if r >= tail - start:
         return
     u = out_order[start + r]
-    level = state[_STATE_LEVEL]
-    slot = tail
-    if r > 0:
-        slot += offsets_inclusive[r - 1]
+    level = state[_STATE_EMIT_LEVEL]
+    slot = tail + bfs_segment_base(wp.int32(r), offsets_scan, block_sums)
     for k in range(adj_offsets[u], adj_offsets[u + 1]):
         v = adj_columns[k]
         if out_dist[v] == wp.int32(-1) and claim_rank[v] == wp.int32(r):
@@ -417,33 +474,6 @@ def bfs_scatter_claims(
             out_parent[v] = u
             out_dist[v] = level
             slot += wp.int32(1)
-
-
-@wp.kernel
-def bfs_update_state(
-    offsets_inclusive: wp.array[wp.int32], escape_frontier: wp.int32, out_state: wp.array[wp.int32]
-) -> None:
-    # dim=1, last op of each level: advance the frontier window to the freshly scattered
-    # segment, bump the level, and decide whether the level loop keeps going.
-    #
-    # It stops for one of two reasons, which the caller tells apart by whether the window it leaves
-    # behind is empty. Either the level emitted nothing and the traversal is done, or the frontier
-    # has gone **narrow and stopped growing** — at which point a level costs the same seven fixed
-    # ``dim=node_count`` launches as a wide one (CUDA graphs bake in the grid, so the kernels can
-    # only early-exit) while doing almost no work, and one serial thread finishes the rest faster.
-    # Requiring "not growing" as well as "narrow" is what keeps a *start* from escaping: every
-    # traversal begins at a frontier of one, but on a blob that one immediately fans out.
-    _ = int(wp.tid())
-    frontier_size = out_state[_STATE_TAIL] - out_state[_STATE_START]
-    count = wp.int32(0)
-    if frontier_size > 0:
-        count = offsets_inclusive[frontier_size - 1]
-    out_state[_STATE_START] = out_state[_STATE_TAIL]
-    out_state[_STATE_TAIL] = out_state[_STATE_TAIL] + count
-    out_state[_STATE_LEVEL] = out_state[_STATE_LEVEL] + wp.int32(1)
-    narrow = count < escape_frontier and count <= frontier_size
-    keep_going = count > wp.int32(0) and not narrow
-    out_state[_STATE_COND] = wp.where(keep_going, wp.int32(1), wp.int32(0))
 
 
 @wp.kernel

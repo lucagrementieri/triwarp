@@ -45,13 +45,13 @@ def obscurance(
     origin = points[i] + normal * offset
 
     n_rays = directions.shape[0]
-    total_weight = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
-    total_blocked = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    total_weight = wp.float32(0.0)
+    total_blocked = wp.float32(0.0)
     for r in range(n_rays):
         local = directions[r]
         # A hemisphere lattice has ``local[2] == dot(direction, normal)`` by construction, so the
         # cosine weight is already there and needs no dot product.
-        weight = float(1.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+        weight = wp.float32(1.0)
         if weight_mode == WEIGHT_COSINE:
             weight = local[2]
         total_weight += weight
@@ -99,9 +99,9 @@ def shape_diameter(
     origin = points[i] + axis * offset
 
     n_rays = directions.shape[0]
-    total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
-    total_sq = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
-    hits = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    total = wp.float32(0.0)
+    total_sq = wp.float32(0.0)
+    hits = wp.float32(0.0)
     for r in range(n_rays):
         local = directions[r]
         query = wp.mesh_query_ray(
@@ -121,8 +121,8 @@ def shape_diameter(
     mean = total / hits
     deviation = wp.sqrt(wp.max(0.0, total_sq / hits - mean * mean))
 
-    kept = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
-    weighted = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    kept = wp.float32(0.0)
+    weighted = wp.float32(0.0)
     for r in range(n_rays):
         distance = scratch[i, r]
         if not wp.isinf(distance) and wp.abs(distance - mean) <= trim * deviation:

@@ -256,7 +256,7 @@ def winding_number_tiled(
     # backend through Warp 1.16, so a per-lane tile holds one face and under-counts there.
     q, j = wp.tid()
     p = query_points[int(q)]
-    total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    total = wp.float32(0.0)
     for face_idx in range(int(j), int(n_faces), int(n_slices)):
         total = total + solid_angle_at_face(vertices, faces, face_idx, p)
     wp.atomic_add(out_winding, int(q), total)

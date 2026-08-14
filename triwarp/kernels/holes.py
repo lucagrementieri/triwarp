@@ -401,7 +401,7 @@ def fill_dp_span(
     c_pos = loop_pos[o + j]
     is_top = i == 0 and j == b - 1
     best_val = FLOAT32_INF_CONSTANT
-    best_k = int(-1)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
+    best_k = wp.int32(-1)
     for k in range(i + 1, j):
         val = apex_cost(
             loop_pos,
@@ -484,7 +484,7 @@ def fill_dp_span_tiled(
     c_pos = loop_pos[o + j]
     is_top = i == 0 and j == b - 1
     best_val = FLOAT32_INF_CONSTANT
-    best_k = int(-1)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
+    best_k = wp.int32(-1)
     for k in range(i + 1 + t, j, HOLE_DP_BLOCK):
         val = apex_cost(
             loop_pos,

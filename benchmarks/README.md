@@ -207,6 +207,22 @@ set automatically. Pass your own `--benchmark-group-by=...` to override.
 
 ## Notes
 
+- **The CUDA mempool release threshold is 0, and the sync inside the timed region interacts with
+  it.** Warp leaves `cudaMemPoolAttrReleaseThreshold` at 0, so the driver reclaims every free pool
+  block at each synchronization point — and this harness deliberately syncs *inside* every timed
+  callable (next bullet). A wrapper that allocates per call therefore re-faults its working set every
+  round. Measured interleaved in one process on `creation.uv_sphere`: **0.489 ms at threshold 0
+  against 0.363 ms at 8 GB (1.35x)**, and the threshold-0 number *drifts upward with pool history*
+  (0.489 / 0.508 / 0.598 after 0 / 512 MB / 4 GB of allocate-free churn) where the raised one stays
+  flat (0.363 / 0.393 / 0.372).
+
+  It is deliberately **not** set, for two reasons. It buys only sub-millisecond rows: on the rows
+  that matter it measures **1.01x** (`quadric_decimate[saddle_graded]`, 203.7 → 202.6 ms) and
+  **1.00x** (`heat_geodesic` amortized), because those allocate large buffers few times rather than
+  small buffers many times. And a library that raises a *process-global* CUDA pool policy is making a
+  memory-footprint decision on its caller's behalf. If you are chasing a sub-millisecond row, set
+  `wp.set_mempool_release_threshold(wp.get_device("cuda:0"), 8 << 30)` in your own process and
+  re-measure before concluding anything about the wrapper.
 - **GPU timing** is captured correctly: `wp.synchronize_device` runs inside the timed region and
   one warm-up round covers Warp kernel JIT compilation.
 - **`BenchCase.run(fn, rounds=...)`** lowers the repeat count from the default 10 for the groups

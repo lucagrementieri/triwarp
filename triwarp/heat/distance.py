@@ -109,6 +109,34 @@ def heat_operators(
     right-hand-side and solution buffers at construction, which would make these operators
     stateful and unsafe to share between two concurrent solves.
 
+    !!! note "Caching the solver state would not pay, and this is why"
+        The obvious next step — a persistent single-rhs solver mirroring
+        [`spd_column_solver`][triwarp.linalg.spd_column_solver], keeping the CG loop's captured
+        graph alive across calls — was priced and **declined**: there is no host-side per-iteration
+        cost for it to remove. Measured on the amortized path, both solves cold-started the way
+        ``heat_geodesic`` actually starts them:
+
+        | | ``sphere_small`` | ``sphere_med`` |
+        |---|---|---|
+        | amortized call | 5.65 ms | 11.66 ms |
+        | heat solve alone | 1.98 | 2.02 |
+        | Poisson solve alone | **3.30** | **9.28** |
+        | the two together | **93.5 %** | **97.0 %** |
+
+        and the whole call tracks the CG tolerance almost linearly (``sphere_med``: 12.65 / 10.21 /
+        5.16 / 2.44 ms at ``tol`` = 1e-10 / 1e-6 / 1e-3 / 1e-1). So the call is **iteration-bound,
+        and the Poisson half is the expensive one**. That the cost is *device*-side rather than host
+        follows from ``check_every=0``, which takes the host out of the loop entirely and measures a
+        1.9x **loss** warm. The only real lever is conditioning — a preconditioner stronger than
+        Jacobi on a cotangent operator — which is the same conclusion the constrained-solve family
+        reaches in [`harmonic`][triwarp.parametrization.harmonic].
+
+        Two traps for anyone re-measuring this. ``solve_spd`` **warm-starts from whatever the
+        solution buffer already holds**, so timing it in a loop over one buffer makes every rep
+        after the first converge in ~0 iterations and reports 0.52 ms instead of 3.30. And this
+        tuple's *third* field is the raw (singular) Laplacian, not the Poisson system — handing it
+        a right-hand side runs CG to its 25 620-iteration cap.
+
     See Also
     --------
     [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]

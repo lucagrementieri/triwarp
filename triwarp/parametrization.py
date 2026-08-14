@@ -220,6 +220,26 @@ def harmonic(
     Notes
     -----
     Matches ``igl::harmonic``, ``k`` included.
+
+    !!! note "An iterative solve against a direct factorization; it stays 1.2-2.2x behind"
+        Measured against ``igl`` on the benchmark's ``patch`` and ``quality`` axes: 254 ms against
+        128 at ``saddle`` with ``k=2``, 59 against 28 at ``saddle_small`` with ``k=2``, 83 against
+        38 for the conditioning row, and ``lscm`` 29 against 24. That gap is **CG iteration count**,
+        and it is not assembly: the assembly was rebuilt to emit CSR directly and won 2.4-9.8x on
+        the rows where assembly *was* the cost, while measuring **flat** on exactly these (254 vs
+        257 ms at ``k=2``) — the ``k=2`` biharmonic operator has ~5x the ``nnz`` and squares the
+        condition number, so the solve dominates and always did. Every factorizing reference is flat
+        along the triangle-quality axis for the same reason, which is the other side of the same
+        observation.
+
+        So this is a **deliberate trade, not an open defect**: triwarp pays 1.2-2.2x on the solve
+        and wins ~13x on setup, because it factors nothing. Closing it needs a preconditioner
+        stronger
+        than Jacobi (incomplete Cholesky, or an algebraic-multigrid V-cycle) — a substantial
+        subsystem that no in-repo caller has asked for, and not obviously a win at these sizes.
+        **Do not re-open this as an assembly problem; that has now measured flat three times.**
+        [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] reaches the same conclusion from its
+        own measurements.
     """
     if k < 1:
         raise ValueError(f"harmonic power k must be >= 1, got {k}.")

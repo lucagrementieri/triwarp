@@ -104,7 +104,11 @@ def test_subdivide_matches_open3d(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> No
     assert len(set(match_np.tolist())) == match_np.shape[0], "the centroid match is not a bijection"
 
 
-@pytest.mark.parity("subdivide", "igl")
+# No ``parity`` marker: ``igl.upsample`` is not a *benchmarked* reference for ``subdivide``, because
+# it corrupts the process heap on the scan meshes (the numbers are in
+# ``benchmarks/test_remesh.py::test_subdivide``). It is safe on this fixture -- 1 200 calls across
+# six processes are clean -- so the comparison itself is worth keeping, and the parity gate only
+# asks that every *benchmarked* pair be tested, not the reverse.
 def test_subdivide_matches_igl(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
     Class B: ``igl.upsample`` is the same 1:4 midpoint split under a different vertex order.

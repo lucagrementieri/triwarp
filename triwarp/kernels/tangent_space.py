@@ -29,20 +29,20 @@ def halfedge_tangent_angles(
     if end <= begin:
         return
 
-    total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    total = wp.float32(0.0)
     for j in range(begin, end):
         total += corner_angle(face_angles, ring_halfedges[j])
 
     # Initialized before the branch: a variable assigned only inside an ``if`` is readable
     # afterwards in Warp but uninitialized when the branch was not taken.
-    scale = float(0.0)  # noqa: UP018 — mutable Warp dynamic variable
+    scale = wp.float32(0.0)
     if total > TOLERANCE_ZERO_CONSTANT:
         if is_boundary[v]:
             scale = PI / total
         else:
             scale = TWO_PI / total
 
-    accumulated = float(0.0)  # noqa: UP018 — mutable Warp dynamic variable
+    accumulated = wp.float32(0.0)
     for j in range(begin, end):
         h = ring_halfedges[j]
         out_angles[h] = scale * accumulated

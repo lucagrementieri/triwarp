@@ -191,7 +191,7 @@ def fit_principal_curvature(
     # Count neighbors passing projection-plane filter, including self (self always passes,
     # dot=1).
     # Matches libigl's applyProjOnPlane which includes vv[self] because dot(n_i, n_i) = 1 > 0.
-    n_valid = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
+    n_valid = wp.int32(0)
     for k in range(n_nbr):
         j = int(neighbor_indices[start + k])
         if j == i:

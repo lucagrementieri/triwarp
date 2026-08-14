@@ -228,6 +228,18 @@ def test_delaunay_triangulation(bench_lib: BenchLibrary, n_points: int) -> None:
     do: there is no input mesh, so the work is sized by a plain ``parametrize`` (the same 2-D cloud
     both references see, built once per size outside the timed region).
 
+    !!! note "The seed is the whole story on this axis, and it is now compiled"
+        This group was the largest single loss in the suite -- **370 ms against scipy's 45.8 at
+        20 000 points, of which 337.8 ms (91.3 %) was the host-side seed**, a pure-Python sweep
+        doing ~460 000 ``_orient2d`` calls (n insertions x a ~23-vertex hull boundary) while the
+        device did 2.33 ms of work. Porting that sweep to a single-thread Warp **CPU** kernel took
+        the row to **36.2 ms**, a 1.27x win over scipy; at 2 000 points it went 46.0 -> 18.9 ms and
+        still loses 5.5x, because what remains is the flip loop's 368 launches at ~13.4 us of host
+        marshalling each. The CPU device is not a concession: the identical sweep measures 352 ms
+        in Python, 93 ms in one **CUDA** thread and 1.40 ms in one CPU thread, so a single GPU
+        thread is the wrong tool by a factor of 66. See
+        [`delaunay_triangulation`][triwarp.reconstruction.delaunay_triangulation].
+
     The three implementations answer the same question by different means: triwarp seeds a
     sequential lexicographic incremental triangulation and then drives its **parallel** edge-flip
     loop to the empty-circumcircle fixed point, scipy calls Qhull, and VTK runs

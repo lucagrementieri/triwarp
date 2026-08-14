@@ -720,7 +720,7 @@ def csr_common_neighbor_count(
     offsets: wp.array[wp.int32], columns: wp.array[wp.int32], a: wp.int32, b: wp.int32
 ) -> wp.int32:
     # Number of vertices adjacent to both a and b (two nested scans; degrees are tiny).
-    count = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
+    count = wp.int32(0)
     for i in range(offsets[a], offsets[a + 1]):
         w = columns[i]
         for j in range(offsets[b], offsets[b + 1]):

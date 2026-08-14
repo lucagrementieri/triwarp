@@ -104,7 +104,7 @@ def shell_bounds(
 
     # The radius is the length scale the interior margin is measured against, so that the margin is
     # a fraction of the construction's own size rather than of a tetrahedron's aspect ratio.
-    radius = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    radius = wp.float32(0.0)
     for i in range(n):
         radius = wp.max(radius, wp.length(shell_vertices[i] - center))
 

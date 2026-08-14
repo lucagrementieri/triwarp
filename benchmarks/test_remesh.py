@@ -128,24 +128,36 @@ _ROUNDS = 3
 
 
 @pytest.mark.benchmark(group="subdivide")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "open3d")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
 def test_subdivide(bench_case: BenchCase) -> None:
     """
     Exactly 4x the faces in one pass: the module's clean throughput baseline.
 
-    Four libraries, one algorithm -- ``igl.upsample`` is midpoint 1:4 subdivision with triwarp's
-    semantics exactly (new vertex per unique edge, original vertices untouched), so this is the
-    module's widest reference agreement. All three references differ from triwarp only in the output
-    *ordering*, which is what makes the parity comparison a centroid match rather than an array
-    compare (``tests/test_remesh.py``).
+    Both references differ from triwarp only in the output *ordering*, which is what makes the
+    parity comparison a centroid match rather than an array compare (``tests/test_remesh.py``).
+
+    !!! warning "``igl.upsample`` is memory-unsafe on the scan meshes and is deliberately absent"
+        It is midpoint 1:4 subdivision with triwarp's semantics exactly, so it *should* be the
+        widest reference agreement in the module -- but on a scan mesh it corrupts the process heap
+        and takes the whole pytest session down with a SIGSEGV, which loses every other row in this
+        module because ``--benchmark-json`` is only written at session end.
+
+        Measured, one selection per process, `-p no:randomly`: the igl rows crash **2 of 8** runs
+        with no other library in the selection at all, **8 of 8** with the trimesh / open3d /
+        triwarp rows present, and per mesh **7 of 8** on ``bunny_decimated``, **7 of 8** on
+        ``bunny`` and **0 of 8** on ``dragon``. So it is not an interaction with triwarp (an
+        earlier reading of this crash said it was), and it is not a size limit -- the *smallest*
+        mesh fails most and the largest never does. Compacting the unreferenced vertices away does
+        not help either (``bunny`` compacted crashes 3 of 3 where uncompacted survived), so there
+        is nothing to pass it that makes it safe.
+
+        This is the third memory-unsafe binding in this wheel, alongside ``igl.loop``'s
+        ``free(): invalid pointer`` and ``igl.in_element``'s ``malloc(): invalid size``; see the
+        libigl hazards in ``.claude/CLAUDE.md`` §6. It stays a *tested* reference on the small clean
+        ``icosahedron`` fixture, where 1 200 calls across six processes are clean --
+        ``tests/test_remesh.py::test_subdivide_matches_igl`` keeps the exact class-B comparison.
     """
     skip_larger_than(bench_case, "dragon", "a 1:4 subdivision above dragon exceeds memory")
-    if bench_case.kind == "igl":
-        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
-        vertices_igl, faces_igl = bench_case.run(lambda: igl.upsample(vertices_np, faces_np))
-        assert faces_igl.shape[0] == 4 * bench_case.n_faces
-        assert vertices_igl.shape[0] > bench_case.n_vertices
-        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         _new_vertices, new_faces = bench_case.run(lambda: tw.remesh.subdivide(vertices, faces))

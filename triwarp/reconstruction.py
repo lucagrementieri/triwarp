@@ -70,10 +70,18 @@ def delaunay_triangulation(points: wp.array[wp.vec2], max_iter: int = 1000) -> w
     [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay]
     [`triangulate_point_cloud`][triwarp.reconstruction.triangulate_point_cloud]
 
+    Raises
+    ------
+    ValueError
+        If fewer than 3 points are given, or if a degenerate input (duplicate or collinear points)
+        drives the seed past the ``2 * n`` triangle bound a triangulation obeys.
+
     Notes
     -----
-    The initial triangulation runs on the host (an inherently sequential hull sweep); only the
-    flips run on device. A float64 in-circle determinant is used rather than exact predicates, so
+    The seed triangulation is an inherently sequential hull sweep, so it runs single-threaded on the
+    **CPU** device and only the flips run on ``points.device``. That is a measured choice, not a
+    concession: on 20 000 points the same sweep costs 93 ms in one CUDA thread against 1.40 ms in
+    one CPU thread. A float64 in-circle determinant is used rather than exact predicates, so
     near-cocircular inputs may resolve either ambiguous diagonal.
     """
     device = points.device
@@ -81,7 +89,7 @@ def delaunay_triangulation(points: wp.array[wp.vec2], max_iter: int = 1000) -> w
     if n < 3:
         raise ValueError(f"delaunay_triangulation requires at least 3 points, got {n}")
 
-    faces_np = _lexicographic_triangulation(points.numpy().astype(np.float64))
+    faces_np = _lexicographic_triangulation(points)
     if faces_np.shape[0] == 0:
         return wp.empty(0, dtype=wp.int32, device=device)
 
@@ -109,74 +117,59 @@ def delaunay_triangulation(points: wp.array[wp.vec2], max_iter: int = 1000) -> w
     return faces
 
 
-def _lexicographic_triangulation(points: np.ndarray) -> np.ndarray:
+def _lexicographic_triangulation(points: wp.array[wp.vec2]) -> np.ndarray:
     """
-    Sequential lexicographic incremental triangulation.
+    Sequential lexicographic incremental triangulation (``igl::lexicographic_triangulation``).
 
-    NumPy port of ``igl::lexicographic_triangulation``.
+    Returns an ``(n_faces, 3)`` ``int32`` array of CCW triangles over the input point indices,
+    or an empty ``(0, 3)`` array when the points are collinear. The output is not yet Delaunay —
+    the caller flips it to Delaunay on device.
 
-    ``points`` is ``(n, 2)`` ``float64``. Returns an ``(n_faces, 3)`` ``int32`` array of CCW
-    triangles over the input point indices, or an empty ``(0, 3)`` array when the points are
-    collinear. The output is not yet Delaunay — the caller flips it to Delaunay on device.
+    The sweep itself runs in
+    [`lexicographic_triangulation`][triwarp.kernels.reconstruction.lexicographic_triangulation]
+    on the CPU device, single-threaded; see that kernel for why. Only the lex sort stays in
+    NumPy, where it is one vectorised call.
     """
-    n = points.shape[0]
-    order = np.lexsort((points[:, 1], points[:, 0]))
-    p0 = points[order[0]]
-    p1 = points[order[1]]
-    faces: list[tuple[int, int, int]] = []
-    boundary: list[int] = []
-    for i in range(2, n):
-        curr = points[order[i]]
-        ci = int(order[i])
-        if len(faces) == 0:
-            # Every point so far is collinear; the first off-line point fans the prefix.
-            orientation = _orient2d(p0, p1, curr)
-            if orientation != 0.0:
-                if orientation > 0.0:
-                    for j in range(i - 1):
-                        faces.append((int(order[j]), int(order[j + 1]), ci))
-                else:
-                    for j in range(i - 1):
-                        faces.append((int(order[j + 1]), int(order[j]), ci))
-                boundary = [int(order[j]) for j in range(i + 1)]
-                if orientation < 0.0:
-                    boundary.reverse()
-            continue
+    points_np = points.numpy().astype(np.float64)
+    n = points_np.shape[0]
+    order_np = np.lexsort((points_np[:, 1], points_np[:, 0])).astype(np.int32)
 
-        nb = len(boundary)
-        orientations = [
-            _orient2d(points[boundary[j]], points[boundary[(j + 1) % nb]], curr) for j in range(nb)
-        ]
-        for j in range(nb):
-            if orientations[j] < 0.0:
-                faces.append((boundary[(j + 1) % nb], boundary[j], ci))
+    # A triangulation of n points has 2n - 2 - h <= 2n - 5 triangles; 2n is the guard capacity.
+    max_faces = 2 * n
+    points_cpu = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec2d, device="cpu")
+    order_cpu = wp.array(order_np, dtype=wp.int32, device="cpu")
+    boundary = wp.empty(n + 1, dtype=wp.int32, device="cpu")
+    boundary_next = wp.empty(n + 1, dtype=wp.int32, device="cpu")
+    orientations = wp.empty(n, dtype=wp.float64, device="cpu")
+    faces_cpu = wp.empty(3 * max_faces, dtype=wp.int32, device="cpu")
+    counts = wp.zeros(2, dtype=wp.int32, device="cpu")
 
-        # The visible edges form one contiguous arc; L starts it, R ends it (first kept vertex).
-        left = right = -1
-        for j in range(nb):
-            prev = (j - 1) % nb
-            if orientations[j] >= 0.0 and orientations[prev] < 0.0:
-                right = j
-            elif orientations[j] < 0.0 and orientations[prev] >= 0.0:
-                left = j
-        # Keep the non-visible arc R..L (forward), then insert curr between L and R.
-        kept: list[int] = []
-        k = right
-        while True:
-            kept.append(boundary[k])
-            if k == left:
-                break
-            k = (k + 1) % nb
-        kept.append(ci)
-        boundary = kept
+    wp.launch(
+        kernel_reconstruction.lexicographic_triangulation,
+        dim=1,
+        inputs=[
+            points_cpu,
+            order_cpu,
+            wp.int32(max_faces),
+            boundary,
+            boundary_next,
+            orientations,
+            faces_cpu,
+            counts,
+        ],
+        device="cpu",
+    )
 
-    if len(faces) == 0:
+    written, wanted = (int(value) for value in counts.numpy())
+    if wanted > written:
+        raise ValueError(
+            f"delaunay_triangulation's seed wanted {wanted} triangles for {n} points but a "
+            f"triangulation admits at most {max_faces}; the input is degenerate (duplicate or "
+            "collinear points)."
+        )
+    if written == 0:
         return np.empty((0, 3), dtype=np.int32)
-    return np.asarray(faces, dtype=np.int32)
-
-
-def _orient2d(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
-    return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+    return faces_cpu.numpy()[: 3 * written].reshape(-1, 3)
 
 
 def triangulate_point_cloud(

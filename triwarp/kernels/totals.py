@@ -54,7 +54,7 @@ def centroid_sliced(
     # every-Nth-face centroid is still the true centroid.
     j = wp.tid()
     total = wp.vec3(0.0, 0.0, 0.0)
-    area_total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    area_total = wp.float32(0.0)
     for f in range(int(j), int(n_faces), int(n_slices)):
         triangle_face = faces[f * 3 : (f + 1) * 3]
         _, area = face_normals_and_area(vertices, triangle_face)

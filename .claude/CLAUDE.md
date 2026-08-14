@@ -323,7 +323,7 @@ constructed **inside** a timed callable. Five hazards, all measured:
   bounds-checks nothing. Never hand it a reduced `V` with the original `F`. The same class of crash
   hits `igl.principal_curvature` on a non-manifold vertex, and `igl.heat_geodesics_precompute` /
   `igl.harmonic` / `igl.lscm` refuse (raise) rather than crash on meshes they cannot factor.
-- **Two bound functions are memory-unsafe on ordinary input, so a "works" probe is not enough** —
+- **Three bound functions are memory-unsafe on ordinary input, so a "works" probe is not enough** —
   check *values*, and prefer a fixture class where the function is known safe. `igl.loop` aborts with
   `free(): invalid pointer` on a five-vertex mesh with three faces on one edge and SIGSEGVs (139) on
   `bunny_decimated`, whose 87 duplicated faces leave it non-edge-manifold; on `bunny` it silently
@@ -332,6 +332,17 @@ constructed **inside** a timed callable. Five hazards, all measured:
   two-triangle square it never reports element 0 for any query inside it, the same query returns a
   face in a 3-query batch and `-1` in a 7-query batch, and a 200-point Delaunay input aborts with
   `malloc(): invalid size`. Use `scipy.spatial.Delaunay.find_simplex` as the point-location oracle.
+  And **`igl.upsample` corrupts the process heap on the scan meshes**, which matters more than the
+  other two because the SIGSEGV lands *later*, in unrelated code, and `--benchmark-json` is written
+  at session end — so it silently destroyed every row of `benchmarks/test_remesh.py` for two
+  measurement rounds. Measured one selection per process: **2 of 8** runs crash with the igl rows
+  alone, **8 of 8** with other libraries co-resident, and per mesh **7 of 8** on `bunny_decimated`,
+  **7 of 8** on `bunny`, **0 of 8** on `dragon`. Two readings to *not* take from that: it is not an
+  interaction with triwarp (an earlier round concluded it was, from a single nondeterministic
+  failure), and it is not a size limit — the smallest mesh fails most and the largest never does.
+  Compacting the unreferenced vertices away makes it worse, not better. It is safe on `icosahedron`
+  (1 200 calls, six processes, clean), so it stays a tested reference there and is *not* a
+  benchmarked one.
 - **F-only functions size their output by `F.max() + 1`, not by `len(V)`.** `igl.adjacency_matrix`,
   `igl.vertex_components` and `igl.is_vertex_manifold` return `F.max() + 1` rows where
   `igl.cotmatrix` and `igl.gaussian_curvature` return `len(V)`. So on a mesh with unreferenced

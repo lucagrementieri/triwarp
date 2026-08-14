@@ -73,8 +73,8 @@ def interpolate_from_points(
 
     # A zero of the field's own dtype, which a generic kernel cannot spell any other way.
     accumulated = source_values[0] * wp.float32(0.0)
-    total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
-    coincident = int(-1)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
+    total = wp.float32(0.0)
+    coincident = wp.int32(-1)
     for slot in range(start, stop):
         index = neighbor_indices[slot]
         if index < 0:

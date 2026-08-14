@@ -46,7 +46,7 @@ def interior_row_counts(
     ri = free_map[i]
     start = offsets[i]
     end = offsets[i + 1]
-    kept = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
+    kept = wp.int32(0)
     for e in range(start, end):
         if not fixed_mask[columns[e]]:
             kept += 1

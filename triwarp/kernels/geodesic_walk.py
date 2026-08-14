@@ -170,7 +170,7 @@ def start_direction_at_vertex(
     if angle < wp.float32(0.0):
         angle += TWO_PI
 
-    total = float(0.0)  # noqa: UP018 — mutable Warp dynamic variable
+    total = wp.float32(0.0)
     for j in range(begin, end):
         total += corner_angle(face_angles, ring_halfedges[j])
     if total <= TOLERANCE_ZERO_CONSTANT:
@@ -184,9 +184,9 @@ def start_direction_at_vertex(
         return wp.int32(-1), wp.vec3(0.0, 0.0, 0.0)
 
     # Walk the ring until the accumulated (rescaled) angle passes the target.
-    accumulated = float(0.0)  # noqa: UP018 — mutable Warp dynamic variable
+    accumulated = wp.float32(0.0)
     chosen = ring_halfedges[end - 1]
-    offset_in_wedge = float(0.0)  # noqa: UP018 — mutable Warp dynamic variable
+    offset_in_wedge = wp.float32(0.0)
     for j in range(begin, end):
         h = ring_halfedges[j]
         wedge = scale * corner_angle(face_angles, h)

@@ -126,7 +126,7 @@ def estimate_point_normals(
     # Local neighbourhood mean over the valid entries of the table. A self-query table
     # contains the point itself once, so it is naturally included (matching Open3D KNN).
     mean = wp.vec3(0.0, 0.0, 0.0)
-    count = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    count = wp.float32(0.0)
     for i in range(k):
         nb = neighbor_idx[v, i]
         if nb >= 0:
@@ -180,9 +180,9 @@ def neighbor_distance_moments(
     # The mean feeds Open3D's statistical criterion and the RMS is the LoOP "standard distance".
     i = int(wp.tid())
     k = neighbor_distance.shape[1]
-    total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
-    total_sq = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
-    count = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
+    total = wp.float32(0.0)
+    total_sq = wp.float32(0.0)
+    count = wp.int32(0)
     for s in range(k):
         d = neighbor_distance[i, s]
         if not wp.isinf(d):
@@ -213,8 +213,8 @@ def local_outlier_factor(
     # alike); it only enters through the cloud-wide nplof the caller divides by.
     i = int(wp.tid())
     k = neighbor_idx.shape[1]
-    total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
-    count = int(0)  # noqa: UP018, RUF046 — int() declares a mutable Warp dynamic variable
+    total = wp.float32(0.0)
+    count = wp.int32(0)
     for s in range(k):
         j = neighbor_idx[i, s]
         if j >= 0:

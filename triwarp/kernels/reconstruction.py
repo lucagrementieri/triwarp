@@ -16,6 +16,7 @@ from triwarp.kernels.array import sort3, update_argmax
 from triwarp.kernels.predicates import (
     delone_metrics,
     is_unfold_quadrangle_convex,
+    orient2d,
     project_out_normal,
     triangle_aspect_ratio,
     vector_angle,
@@ -29,6 +30,128 @@ MAX_NEIGHBOURS = 64
 CRITICAL_ASPECT_RATIO = wp.constant(wp.float32(1e3))
 # MeshLib filterNeighbors: drop a neighbour whose oriented normal opposes the center normal.
 NORMAL_FILTER_DOT = wp.constant(wp.float32(-0.3))
+
+
+# --------------------------------------------------------------------------------------
+# Lexicographic incremental triangulation (the Delaunay seed)
+# --------------------------------------------------------------------------------------
+
+
+@wp.kernel(enable_backward=False)
+def lexicographic_triangulation(
+    points: wp.array[wp.vec2d],
+    order: wp.array[wp.int32],
+    max_faces: wp.int32,
+    boundary: wp.array[wp.int32],
+    boundary_next: wp.array[wp.int32],
+    orientations: wp.array[wp.float64],
+    out_faces: wp.array[wp.int32],
+    out_counts: wp.array[wp.int32],
+) -> None:
+    # One thread, deliberately: this is a hull sweep whose every step depends on the previous
+    # boundary, so there is nothing to parallelise. It is launched on the **CPU** device for the
+    # same reason -- measured on 20 000 points, the identical sweep costs 352 ms as the Python loop
+    # this replaces, 93 ms in a single CUDA thread, and 1.40 ms here. A single GPU thread is the
+    # wrong tool and the numbers say so by a factor of 66.
+    #
+    # ``out_counts`` carries [faces written, faces wanted]. They differ only when a degenerate input
+    # (duplicate or collinear points) drives the visible arc past the 2n bound a real triangulation
+    # obeys; the wrapper raises on that rather than letting the writes wrap.
+    if wp.tid() != 0:
+        return
+    n = order.shape[0]
+    zero = wp.float64(0.0)
+    n_faces = wp.int32(0)
+    n_boundary = wp.int32(0)
+
+    for i in range(2, n):
+        ci = order[i]
+        curr = points[ci]
+
+        if n_boundary == 0:
+            # Every point so far is collinear; the first off-line point fans the whole prefix.
+            side = orient2d(points[order[0]], points[order[1]], curr)
+            if side != zero:
+                for j in range(i - 1):
+                    if n_faces < max_faces:
+                        first = order[j]
+                        second = order[j + 1]
+                        if side < zero:
+                            first, second = second, first
+                        out_faces[3 * n_faces + 0] = first
+                        out_faces[3 * n_faces + 1] = second
+                        out_faces[3 * n_faces + 2] = ci
+                    n_faces += 1
+                for j in range(i + 1):
+                    # The prefix in lex order, plus ``curr``; reversed when ``curr`` is right of it,
+                    # so the boundary comes out counter-clockwise either way.
+                    if side > zero:
+                        boundary[j] = order[j]
+                    else:
+                        boundary[j] = order[i - j]
+                n_boundary = i + 1
+            continue
+
+        nb = n_boundary
+        for j in range(nb):
+            following = j + 1
+            if following == nb:
+                following = 0
+            orientations[j] = orient2d(points[boundary[j]], points[boundary[following]], curr)
+
+        # Every edge ``curr`` can see becomes a triangle, wound so the new face agrees with the
+        # boundary's orientation.
+        for j in range(nb):
+            if orientations[j] < zero:
+                following = j + 1
+                if following == nb:
+                    following = 0
+                if n_faces < max_faces:
+                    out_faces[3 * n_faces + 0] = boundary[following]
+                    out_faces[3 * n_faces + 1] = boundary[j]
+                    out_faces[3 * n_faces + 2] = ci
+                n_faces += 1
+
+        # The visible edges form one contiguous arc: ``left`` starts it, ``right`` ends it (the
+        # first kept vertex).
+        left = wp.int32(-1)
+        right = wp.int32(-1)
+        for j in range(nb):
+            previous = j - 1
+            if previous < 0:
+                previous = nb - 1
+            if orientations[j] >= zero and orientations[previous] < zero:
+                right = j
+            elif orientations[j] < zero and orientations[previous] >= zero:
+                left = j
+        # No visible edge at all means a degenerate insertion (a duplicate point, since a lex sweep
+        # always sees the hull from the new rightmost point otherwise). Both indices stay -1, which
+        # in the Python original wrapped to the last boundary entry and broke the walk immediately;
+        # mapping them to ``nb - 1`` reproduces that exactly rather than reading out of bounds.
+        if right < 0:
+            right = nb - 1
+        if left < 0:
+            left = nb - 1
+
+        # Keep the non-visible arc right..left going forward, then insert ``curr`` after it.
+        n_kept = wp.int32(0)
+        k = right
+        for _ in range(nb):
+            boundary_next[n_kept] = boundary[k]
+            n_kept += 1
+            if k == left:
+                break
+            k += 1
+            if k == nb:
+                k = 0
+        boundary_next[n_kept] = ci
+        n_kept += 1
+        for j in range(n_kept):
+            boundary[j] = boundary_next[j]
+        n_boundary = n_kept
+
+    out_counts[0] = wp.min(n_faces, max_faces)
+    out_counts[1] = n_faces
 
 
 # --------------------------------------------------------------------------------------
@@ -227,7 +350,7 @@ def build_local_triangulations(
     # --- gather + filter neighbours ---
     # int()/float() declare mutable Warp dynamic variables; bare literals are compile-time
     # constants that freeze the enclosing loop (out_valid stays all-False -> no faces).
-    m = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
+    m = wp.int32(0)
     for i in range(k):
         if m >= MAX_NEIGHBOURS:
             break
@@ -249,7 +372,7 @@ def build_local_triangulations(
 
     # --- tangent-plane basis (project neighbours onto plane through center) ---
     base = wp.vec3(0.0, 0.0, 0.0)
-    normalizer_sq = float(0.0)  # noqa: UP018 — mutable Warp dynamic variable
+    normalizer_sq = wp.float32(0.0)
     for i in range(m):
         d = points[nbr[i]] - a
         pv = project_out_normal(d, n_center)
@@ -288,7 +411,7 @@ def build_local_triangulations(
             nbr[mn] = tn
 
     # --- boundary detection: first angular gap wider than boundary_angle ---
-    border = int(-1)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
+    border = wp.int32(-1)
     for i in range(m):
         if i + 1 < m:
             diff = ang[i + 1] - ang[i]
@@ -302,7 +425,7 @@ def build_local_triangulations(
     current = m  # inherits m's dynamic-variable type (m is already mutable)
     for _step in range(m):
         best_w = float(-FLOAT32_INF_CONSTANT)  # float() keeps this a mutable Warp variable
-        best_pos = int(-1)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
+        best_pos = wp.int32(-1)
         for i in range(m):
             if nbr[i] < 0:
                 continue
@@ -326,7 +449,7 @@ def build_local_triangulations(
             break
 
     # --- emit fan triangles between consecutive surviving neighbours ---
-    slot = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
+    slot = wp.int32(0)
     for i in range(m):
         if nbr[i] < 0:
             continue
@@ -430,7 +553,7 @@ def splat_normals(
     n = normals[s]
     length = wp.length(n)
     # Confidence weighting scales the splat by the normal magnitude; otherwise unit weight.
-    weight = float(1.0)  # noqa: UP018 — mutable Warp dynamic variable
+    weight = wp.float32(1.0)
     if confidence != 0:
         weight = length
     n = wp.normalize(n)  # unit direction; magnitude carried by ``weight``
@@ -515,8 +638,8 @@ def screened_laplacian_matvec(
     i, j, k = wp.tid()
     idx = poisson_grid_index(i, j, k, res)
     xc = x[idx]
-    deg = float(0.0)  # noqa: UP018 — mutable Warp dynamic variable
-    acc = float(0.0)  # noqa: UP018 — mutable Warp dynamic variable
+    deg = wp.float32(0.0)
+    acc = wp.float32(0.0)
     if i + 1 < res:
         deg += 1.0
         acc += x[poisson_grid_index(i + 1, j, k, res)]
@@ -548,7 +671,7 @@ def screened_inverse_diagonal(
 ) -> None:
     i, j, k = wp.tid()
     idx = poisson_grid_index(i, j, k, res)
-    deg = float(0.0)  # noqa: UP018 — mutable Warp dynamic variable
+    deg = wp.float32(0.0)
     if i + 1 < res:
         deg += 1.0
     if i - 1 >= 0:

@@ -125,7 +125,7 @@ def chamfer_nn_term_sliced(
     which is why both exist.
     """
     j = wp.tid()
-    total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    total = wp.float32(0.0)
     for idx in range(int(j), x.shape[0], int(n_slices)):
         diff = x[idx] - y[nearest[idx]]
         total = total + scale * wp.length_sq(diff)
@@ -184,7 +184,7 @@ def chamfer_surface_term_sliced(
     reason.
     """
     j = wp.tid()
-    total = float(0.0)  # noqa: UP018 — float() declares a mutable Warp dynamic variable
+    total = wp.float32(0.0)
     for idx in range(int(j), points.shape[0], int(n_slices)):
         f = face_id[idx]
         if f >= 0:

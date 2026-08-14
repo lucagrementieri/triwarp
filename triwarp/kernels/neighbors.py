@@ -460,7 +460,7 @@ def _bvh_nearest_row_kernel(row_size: int, name: str):
                 if d <= max_radius and d < row_distances[row_size - 1]:
                     carry_distance = d
                     carry_index = point_index
-                    placed = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
+                    placed = wp.int32(0)
                     for slot in range(row_size):
                         if placed == 1 or carry_distance < row_distances[slot]:
                             placed = 1
@@ -601,7 +601,7 @@ def _hashgrid_nearest_row_kernel(row_size: int, name: str):
 
         r_hard = wp.min(max_radius, complete_radius(q, min_bound, max_bound))
         r = wp.min(initial_radius, r_hard)
-        certified = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
+        certified = wp.int32(0)
         for _attempt in range(MAX_SEARCH_ATTEMPTS):
             if not r <= widest:
                 # Past ``widest`` a cell walk costs more than touching every point (and a NaN
@@ -615,7 +615,7 @@ def _hashgrid_nearest_row_kernel(row_size: int, name: str):
                 if d <= max_radius and d < row_distances[row_size - 1]:
                     carry_distance = d
                     carry_index = point_index
-                    placed = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
+                    placed = wp.int32(0)
                     for slot in range(row_size):
                         if placed == 1 or carry_distance < row_distances[slot]:
                             placed = 1
@@ -643,7 +643,7 @@ def _hashgrid_nearest_row_kernel(row_size: int, name: str):
                 if d <= max_radius and d < row_distances[row_size - 1]:
                     carry_distance = d
                     carry_index = point_index
-                    placed = int(0)  # noqa: UP018, RUF046 — mutable Warp dynamic variable
+                    placed = wp.int32(0)
                     for slot in range(row_size):
                         if placed == 1 or carry_distance < row_distances[slot]:
                             placed = 1
