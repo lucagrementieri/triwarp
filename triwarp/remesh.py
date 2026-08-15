@@ -30,6 +30,7 @@ from collections.abc import Callable
 from typing import Literal, overload
 
 import warp as wp
+import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
@@ -978,6 +979,19 @@ def quadric_decimate(
     nothing new. Worth **1.3-1.8x**, and it *improves* the deviation above at two of three targets
     (the max-norm moves by ±20 % run to run on a tied fixture in any case; see below).
 
+    That round loop then runs **entirely on device**, as one ``wp.capture_while`` graph — see
+    ``_run_collapse_rounds``. It was 73 % of this function's 3 948 ``wp.launch`` calls while
+    committing ~65 collapses a round, so it was almost pure host marshalling; capturing it took
+    the 240 per-round readbacks with it. Measured against the four CPU references as a control in
+    the same run (they moved 0.91-1.07x, i.e. noise): **167 -> 147 ms at ``saddle`` 0.1, 209 -> 189
+    at ``saddle_graded`` 0.1**, and 1.06-1.07x at 0.5. That is **1.06-1.13x**, not the ~1.2x a
+    launch count alone predicted — the round loop's share of the *clock* was smaller than its share
+    of the launches, and what is left is the per-pass rebuild, 44 of them, each ~45 wrapper calls
+    whose cost is Python rather than either launches or kernels. Going further means committing
+    more per round (a less conservative lock, which changes the output) or fewer wrapper calls per
+    rebuild; it is **not** more rounds — the loop already stops on saturation at ~5.3 of its
+    8-round cap.
+
     Four consequences to plan around:
 
     - **The target is usually reached exactly, but is not guaranteed.** A pass is budgeted at half
@@ -1078,11 +1092,11 @@ def quadric_decimate(
         # why the obvious keys (edge index, or the cost itself) both collapse to one winner a pass
         # on a structured mesh.
         _sorted_cost, order = tw.array.sort_and_argsort(cost)
-        priority = wp.empty(m, dtype=wp.int32, device=device)
+        half = wp.array([max(1, m // 2)], dtype=wp.int32, device=device)
         wp.launch(
-            kernel_remesh.assign_collapse_priority,
+            kernel_remesh.drop_collapses_past_budget,
             dim=m,
-            inputs=[order, wp.int32(max(1, m // 2)), priority, survivor],
+            inputs=[order, half, survivor],
             device=device,
         )
 
@@ -1097,86 +1111,31 @@ def quadric_decimate(
         locked = wp.zeros(n_vertices, dtype=wp.int32, device=device)
         min_key = wp.empty(n_vertices, dtype=wp.int32, device=device)
         claim = wp.empty(n_vertices, dtype=wp.int32, device=device)
-        winner_cost = wp.empty(m, dtype=wp.float32, device=device)
         remap = tw.array.init_range(n_vertices, device)
         positions = wp.clone(current_vertices)
         count = wp.zeros(1, dtype=wp.int32, device=device)
-        committed = 0
-        for round_index in range(_QUADRIC_ROUNDS):
-            # An interior collapse removes two faces, so half the remaining surplus is what stops a
-            # pass from blowing past the target; the rounds share that one budget. The first round
-            # keeps the floor of one collapse the single-round loop had, which is what lets a pass
-            # with a surplus of a single face still finish the job.
-            budget = (n_current - target) // 2 - committed
-            if round_index > 0 and budget <= 0:
-                break
-            budget = max(1, budget)
-            if round_index > 0:
-                wp.launch(
-                    kernel_remesh.drop_locked_candidates,
-                    dim=m,
-                    inputs=[candidates, removed, csr.offsets, csr.columns, locked, survivor],
-                    device=device,
-                )
-            min_key.fill_(INT32_MAX)
-            wp.launch(
-                kernel_remesh.claim_collapse_key,
-                dim=m,
-                inputs=[survivor, removed, csr.offsets, csr.columns, min_key],
-                device=device,
-            )
-            claim.fill_(INT32_MAX)
-            wp.launch(
-                kernel_remesh.claim_collapse_index,
-                dim=m,
-                inputs=[survivor, removed, csr.offsets, csr.columns, min_key, claim],
-                device=device,
-            )
-            wp.launch(
-                kernel_remesh.mark_collapse_winners,
-                dim=m,
-                inputs=[
-                    survivor,
-                    removed,
-                    csr.offsets,
-                    csr.columns,
-                    min_key,
-                    claim,
-                    cost,
-                    survivor,
-                    winner_cost,
-                ],
-                device=device,
-            )
 
-            # The set is already independent, so dropping members of it keeps it independent.
-            _sorted_winner_cost, winner_order = tw.array.sort_and_argsort(winner_cost)
-            wp.launch(
-                kernel_remesh.assign_collapse_priority,
-                dim=m,
-                inputs=[winner_order, wp.int32(max(1, budget)), priority, survivor],
-                device=device,
-            )
-            wp.launch(
-                kernel_remesh.commit_selected_collapses,
-                dim=m,
-                inputs=[survivor, removed, target_pos, remap, positions, count],
-                device=device,
-            )
-            # ``count`` accumulates across rounds, so this one readback per round both drives the
-            # shared budget and answers "did this round commit anything" -- the same readback the
-            # single-round loop already paid, moved inside.
-            round_total = int(count.numpy()[0])
-            if round_total == committed:
-                break  # this round found nothing new; a further one against the same scoring cannot
-            committed = round_total
-            if round_index + 1 < _QUADRIC_ROUNDS:
-                wp.launch(
-                    kernel_remesh.lock_collapse_neighborhoods,
-                    dim=m,
-                    inputs=[survivor, removed, csr.offsets, csr.columns, locked],
-                    device=device,
-                )
+        _run_collapse_rounds(
+            device,
+            m,
+            csr,
+            candidates,
+            removed,
+            cost,
+            target_pos,
+            survivor,
+            locked,
+            min_key,
+            claim,
+            remap,
+            positions,
+            count,
+            (n_current - target) // 2,
+        )
+
+        # One readback per *pass* (not per round, as before): the outer loop needs to know whether
+        # this pass achieved anything at all before paying for another geometry rebuild.
+        committed = int(count.numpy()[0])
         if committed == 0:
             break  # nothing legal left to collapse; the target is unreachable from here
 
@@ -1195,6 +1154,147 @@ def quadric_decimate(
         )
 
     return current_vertices, current_faces
+
+
+def _run_collapse_rounds(
+    device: wp.Device,
+    m: int,
+    csr: wps.BsrMatrix[wp.Scalar],
+    candidates: wp.array[wp.int32],
+    removed: wp.array[wp.int32],
+    cost: wp.array[wp.float32],
+    target_pos: wp.array[wp.vec3],
+    survivor: wp.array[wp.int32],
+    locked: wp.array[wp.int32],
+    min_key: wp.array[wp.int32],
+    claim: wp.array[wp.int32],
+    remap: wp.array[wp.int32],
+    positions: wp.array[wp.vec3],
+    count: wp.array[wp.int32],
+    surplus: int,
+) -> None:
+    """
+    Commit independent sets of collapses against one scoring, until a round finds nothing new.
+
+    Everything the loop decides with lives in two small device arrays -- ``budget``, and
+    ``round_state`` = [round index, commits as of the previous round, loop condition] -- so the body
+    holds no host readback and the whole loop is a single ``wp.capture_while`` graph.
+
+    That is the point of the shape. A round is ~12 launches over an ``m`` that is tens of
+    thousands wide, and it commits only ~65 collapses (measured on ``saddle_graded`` at
+    ``target_ratio=0.1``: 45 passes x 5.3 rounds for 15 682 collapses), so the round loop was **73%
+    of this function's 3 948 launches** and the host marshalling — not the kernels, which are 11% of
+    the call — was the cost. Capturing costs about what issuing the same launches costs (measured
+    1.03-1.13x, so the break-even is ~1.1 replays), and this replays 5.3 times per capture.
+
+    Every round runs the identical body, which is what makes one captured graph enough:
+
+    - ``drop_locked_candidates`` runs on the first round too, where ``locked`` is all-zero and it
+      restores ``survivor`` from ``candidates`` unchanged.
+    - ``lock_collapse_neighborhoods`` runs on the last round too, where it only writes per-pass
+      scratch nobody reads again.
+    - the budget's floor of one applies while ``count`` is still zero rather than on "round 0".
+      Those differ only if a round commits nothing, and then the floor cannot manufacture a commit
+      anyway — the budget only ever *trims* an independent set that is already chosen.
+
+    A budget-exhausted pass therefore stops the same way a saturated one does: the budget goes to
+    zero, ``drop_collapses_past_budget`` retires everything, nothing commits, and
+    ``end_collapse_round`` sees no progress.
+    """
+    budget = wp.zeros(1, dtype=wp.int32, device=device)
+    round_state = wp.zeros(3, dtype=wp.int32, device=device)
+    round_state.assign([0, 0, 1])
+    # Sort scratch, allocated here rather than inside the body: ``radix_sort_pairs`` wants
+    # double-width key and payload buffers, and a captured graph replays the *same* pointers, so the
+    # scratch cannot be allocated per round.
+    sort_keys = wp.empty(2 * m, dtype=wp.float32, device=device)
+    sort_values = wp.empty(2 * m, dtype=wp.int32, device=device)
+
+    def round_body() -> None:
+        wp.launch(
+            kernel_remesh.begin_collapse_round,
+            dim=1,
+            inputs=[wp.int32(surplus), count, budget],
+            device=device,
+        )
+        wp.launch(
+            kernel_remesh.drop_locked_candidates,
+            dim=m,
+            inputs=[candidates, removed, csr.offsets, csr.columns, locked, survivor],
+            device=device,
+        )
+        min_key.fill_(INT32_MAX)
+        wp.launch(
+            kernel_remesh.claim_collapse_key,
+            dim=m,
+            inputs=[survivor, removed, csr.offsets, csr.columns, min_key],
+            device=device,
+        )
+        claim.fill_(INT32_MAX)
+        wp.launch(
+            kernel_remesh.claim_collapse_index,
+            dim=m,
+            inputs=[survivor, removed, csr.offsets, csr.columns, min_key, claim],
+            device=device,
+        )
+        # Writes the winners' costs straight into the sort's key buffer (+inf elsewhere, so every
+        # non-winner ranks last), which is why nothing is copied between here and the sort.
+        wp.launch(
+            kernel_remesh.mark_collapse_winners,
+            dim=m,
+            inputs=[
+                survivor,
+                removed,
+                csr.offsets,
+                csr.columns,
+                min_key,
+                claim,
+                cost,
+                survivor,
+                sort_keys,
+            ],
+            device=device,
+        )
+        # The set is already independent, so dropping members of it keeps it independent.
+        wp.launch(
+            kernel_array.init_sort_pair_indices,
+            dim=2 * m,
+            inputs=[wp.int32(m), wp.int32(-1), sort_values],
+            device=device,
+        )
+        wp.utils.radix_sort_pairs(sort_keys, sort_values, m)
+        wp.launch(
+            kernel_remesh.drop_collapses_past_budget,
+            dim=m,
+            inputs=[sort_values, budget, survivor],
+            device=device,
+        )
+        wp.launch(
+            kernel_remesh.commit_selected_collapses,
+            dim=m,
+            inputs=[survivor, removed, target_pos, remap, positions, count],
+            device=device,
+        )
+        wp.launch(
+            kernel_remesh.lock_collapse_neighborhoods,
+            dim=m,
+            inputs=[survivor, removed, csr.offsets, csr.columns, locked],
+            device=device,
+        )
+        wp.launch(
+            kernel_remesh.end_collapse_round,
+            dim=1,
+            inputs=[wp.int32(_QUADRIC_ROUNDS), count, round_state],
+            device=device,
+        )
+
+    condition = round_state[2:3]
+    if device.is_cuda and wp.is_conditional_graph_supported():
+        with wp.ScopedCapture(device) as capture:
+            wp.capture_while(condition, round_body)
+        wp.capture_launch(capture.graph)
+    else:
+        wp.capture_while(condition, round_body)
 
 
 def _resolve_decimation_target(

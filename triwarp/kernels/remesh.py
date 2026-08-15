@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.constants import INT32_MAX_CONSTANT, TOLERANCE_ZERO_CONSTANT
+from triwarp.constants import TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.array import binary_search_sorted_contains, to_vec2d, to_vec3, to_vec3d
 from triwarp.kernels.grouping import hash_slot, pack_edge_key
 from triwarp.kernels.predicates import (
@@ -1547,22 +1547,56 @@ def quadric_collapse_candidates(
 
 
 @wp.kernel
-def assign_collapse_priority(
-    order: wp.array[wp.int32],
-    budget: wp.int32,
-    out_priority: wp.array[wp.int32],
-    out_survivor: wp.array[wp.int32],
+def drop_collapses_past_budget(
+    order: wp.array[wp.int32], budget: wp.array[wp.int32], out_survivor: wp.array[wp.int32]
 ) -> None:
-    # Turn the cost ranking into the key the claim/commit pass locks with, and drop everything past
-    # the pass budget. Ranking by cost rather than by edge index is the whole difference between a
-    # quadric decimation and a shortest-edge one: the cheapest collapse must win a contested ring.
+    # Retire every candidate ranked past the budget, ``order`` being the ascending cost ranking.
+    # Ranking by cost rather than by edge index is the whole difference between a quadric decimation
+    # and a shortest-edge one: the cheapest collapse must win a contested ring.
+    #
+    # ``budget`` is a 1-element *device* array rather than a launch argument so the whole round loop
+    # can run inside one ``wp.capture_while`` graph; ``begin_collapse_round`` writes it. A budget of
+    # zero retires everything, which is how a pass that has exhausted its surplus stops committing
+    # without the host being told.
     i = int(wp.tid())
-    k = order[i]
-    if i < int(budget):
-        out_priority[k] = i
-        return
-    out_priority[k] = INT32_MAX_CONSTANT
-    out_survivor[k] = -1
+    if i >= budget[0]:
+        out_survivor[order[i]] = -1
+
+
+@wp.kernel
+def begin_collapse_round(
+    surplus: wp.int32, count: wp.array[wp.int32], out_budget: wp.array[wp.int32]
+) -> None:
+    # dim=1, first op of a round: how many collapses this round may still commit.
+    #
+    # ``surplus`` is ``(n_faces - target) // 2`` for the pass -- an interior collapse removes two
+    # faces -- and ``count`` accumulates the commits of every round so far, so the rounds share one
+    # budget. The floor of one while nothing has been committed yet is what lets a pass with a
+    # surplus of a single face still finish the job; it cannot manufacture a commit, because the
+    # budget only ever *trims* an independent set that is already chosen.
+    _ = int(wp.tid())
+    budget = surplus - count[0]
+    if count[0] == 0:
+        budget = wp.max(budget, wp.int32(1))
+    out_budget[0] = wp.max(budget, wp.int32(0))
+
+
+@wp.kernel
+def end_collapse_round(
+    max_rounds: wp.int32, count: wp.array[wp.int32], out_state: wp.array[wp.int32]
+) -> None:
+    # dim=1, last op of a round: decide whether another round against this same scoring is worth
+    # running. ``out_state`` is [round index, commits as of the previous round, loop condition].
+    #
+    # It stops when the round committed nothing -- a further round cannot, since the state it
+    # reads is then unchanged -- or at the round cap. A budget-exhausted pass stops through that
+    # same test: ``begin_collapse_round`` writes a zero budget, so nothing commits.
+    _ = int(wp.tid())
+    out_state[0] = out_state[0] + wp.int32(1)
+    progressed = count[0] > out_state[1]
+    out_state[1] = count[0]
+    keep_going = progressed and out_state[0] < max_rounds
+    out_state[2] = wp.where(keep_going, wp.int32(1), wp.int32(0))
 
 
 @wp.func
