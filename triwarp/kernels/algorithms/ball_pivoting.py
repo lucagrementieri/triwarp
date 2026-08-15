@@ -79,7 +79,13 @@ CNT_CONTINUE = wp.constant(7)  # the wave loop's condition
 CNT_DONE = wp.constant(8)  # the loop finished for good (as opposed to pausing to grow)
 CNT_WAVE = wp.constant(9)  # waves executed
 CNT_GROW = wp.constant(10)  # the triangle budget is exhausted; hand back to the host
-BPA_COUNTERS = 11
+CNT_OVERFLOW = wp.constant(11)  # a fixed-capacity scatter ran out of room this wave
+BPA_COUNTERS = 12
+
+# Lanes per front edge in the cooperative pivot search. One warp: the block-cooperative BVH walk
+# hands one candidate per lane per step, and 32 covers the ~88 candidates an edge enumerates in
+# three steps while keeping the tile reductions on Warp's single-warp fast path.
+BPA_PIVOT_BLOCK = 32
 
 EDGE_LIVE = wp.constant(0)
 EDGE_RETIRED = wp.constant(1)
@@ -169,10 +175,39 @@ def begin_wave(counters: wp.array[wp.int32]) -> None:
 
 
 @wp.func
+def push_front_edge(
+    slot: wp.int32, capacity: wp.int32, counters: wp.array[wp.int32], out_front: wp.array[wp.int32]
+) -> None:
+    # Append an edge to the outgoing front list, bounded by the list's allocated capacity.
+    #
+    # ``front_out`` is sized ``3 * max_faces + n``, exactly the worst case the commit budget
+    # admits, so there is no slack: any accounting slip would scatter past the end, and because
+    # the buffer comes from the memory pool such a write lands in *another live allocation*
+    # and corrupts it silently rather than faulting.
+    #
+    # Overflow is *recoverable*, which is why this drops rather than clamps: the front list is a
+    # cache of the edge hash table, not the source of truth, and ``_BpaState.grow`` rebuilds it from
+    # that table with ``collect_front_from_table``. So a dropped entry is restored by the same host
+    # round-trip that doubles the budget, and raising ``CNT_GROW`` is what asks for it.
+    #
+    # This is hardening, **not** a fix for the intermittent ``CUDA error 700`` that
+    # ``ball_pivoting`` still shows on a multi-cloud run: instrumenting ``CNT_OVERFLOW`` measured it
+    # at **0**, with the front peaking near 0.1 % of capacity, so these scatters were cleared as the
+    # cause. See ``plans/benchmark-improve.md`` C0 for what is still open.
+    position = wp.atomic_add(counters, CNT_NEXT_FRONT, 1)
+    if position < capacity:
+        out_front[position] = slot
+        return
+    counters[CNT_OVERFLOW] = 1
+    counters[CNT_GROW] = 1
+
+
+@wp.func
 def propose_triangle(
     a: wp.int32,
     b: wp.int32,
     c: wp.int32,
+    capacity: wp.int32,
     counters: wp.array[wp.int32],
     out_owner: wp.array[wp.int32],
     out_a: wp.array[wp.int32],
@@ -190,6 +225,11 @@ def propose_triangle(
     out_owner[b] = INT32_MAX_CONSTANT
     out_owner[c] = INT32_MAX_CONSTANT
     slot = wp.atomic_add(counters, CNT_PROPOSAL, 1)
+    if slot >= capacity:
+        # Dropping a proposal is safe and self-healing: the front edge that raised it stays live and
+        # is searched again next wave. Only the *write* would be unsafe.
+        counters[CNT_OVERFLOW] = 1
+        return
     out_a[slot] = a
     out_b[slot] = b
     out_c[slot] = c
@@ -203,6 +243,7 @@ def seed_triangles(
     grid_id: wp.uint64,
     radius: wp.float32,
     clustering: wp.float32,
+    front_capacity: wp.int32,
     counters: wp.array[wp.int32],
     out_owner: wp.array[wp.int32],
     out_a: wp.array[wp.int32],
@@ -255,7 +296,7 @@ def seed_triangles(
             ):
                 continue
             if ball_is_empty(grid_id, points, center, radius, p, a, b):
-                propose_triangle(p, a, b, counters, out_owner, out_a, out_b, out_c)
+                propose_triangle(p, a, b, front_capacity, counters, out_owner, out_a, out_b, out_c)
                 return
 
 
@@ -351,6 +392,7 @@ def pivot_front_edges(
     points: wp.array[wp.vec3],
     normals: wp.array[wp.vec3],
     grid_id: wp.uint64,
+    bvh_id: wp.uint64,
     radius: wp.float32,
     clustering: wp.float32,
     crease_cos: wp.float32,
@@ -367,6 +409,7 @@ def pivot_front_edges(
     boundary_degree: wp.array[wp.int32],
     front_in: wp.array[wp.int32],
     grid_stride: wp.int32,
+    front_capacity: wp.int32,
     counters: wp.array[wp.int32],
     out_owner: wp.array[wp.int32],
     front_out: wp.array[wp.int32],
@@ -374,21 +417,44 @@ def pivot_front_edges(
     out_b: wp.array[wp.int32],
     out_c: wp.array[wp.int32],
 ) -> None:
+    # **One block per front edge, one warp per block.** The pivot search is a neighbourhood walk per
+    # edge, and a wave has only a few hundred live edges (median 312 on ``bunny_decimated``), so
+    # thread-per-edge left the device idle: the wave cost was nearly flat in the front size,
+    # 0.425 ms at a front under 64 against 1.636 at 1024-4096. A warp an edge is what fills it.
+    #
+    # The candidate walk therefore runs on the **BVH**, not the hash grid: Warp's hash grid exposes
+    # only a sequential per-thread iterator with no per-cell entry point, so its walk cannot be
+    # split across lanes — and the walk is 70-73 % of a query's cost. ``tile_bvh_query_aabb``
+    # hands one candidate per lane per step instead. Measured on this query shape, 2.4-8.9x over
+    # the hash grid at the front sizes a wave actually has. (A *serial* BVH walk is 1.8x
+    # **slower** than the hash grid, so the win is the cooperation, not the tree.)
+    #
+    # The box the BVH returns is a different superset of the true candidate set than the grid's
+    # cells were — both are supersets, and ``candidate_prefilter`` plus ``compute_ball_center``'s
+    # ``inf`` do the actual rejecting, so the accepted set is unchanged.
+    #
+    # ``ball_is_empty`` inside ``candidate_accepted`` stays a per-lane serial hash-grid query: at
+    # that point every lane is testing a *different* candidate ball, so there is nothing for the
+    # block to cooperate on. It runs 32-way concurrently instead, which is where its speedup comes
+    # from.
     if counters[CNT_CONTINUE] == 0:
         return
+    block, lane = wp.tid()
+    seeding = counters[CNT_SEEDING] != 0
+    min_cluster_sq = (clustering * radius) * (clustering * radius)
     # Grid-stride over the front so the launch dimension is a fixed constant — a hard requirement
     # for capturing the wave loop as a CUDA graph, and it also keeps the cost proportional to the
     # front rather than to its high-water mark.
-    seeding = counters[CNT_SEEDING] != 0
-    min_cluster_sq = (clustering * radius) * (clustering * radius)
-    for i in range(int(wp.tid()), counters[CNT_FRONT], grid_stride):
+    for i in range(block, counters[CNT_FRONT], grid_stride):
         slot = front_in[i]
         # An edge leaves the front for good when a second face closes it or its search failed.
+        # Every lane reads the same state, so the whole block takes this branch together and the
+        # tile reductions below are always reached uniformly.
         if edge_count[slot] != 1 or edge_state[slot] != EDGE_LIVE:
             continue
-        position = wp.atomic_add(counters, CNT_NEXT_FRONT, 1)
-        front_out[position] = slot
-        wp.atomic_add(counters, CNT_LIVE, 1)
+        if lane == 0:
+            push_front_edge(slot, front_capacity, counters, front_out)
+            wp.atomic_add(counters, CNT_LIVE, 1)
         if seeding:
             continue  # a seeding wave only carries the front forward
 
@@ -401,8 +467,9 @@ def pivot_front_edges(
 
         # Re-validate the cached argmin first. It stays the argmin while it stays valid (the
         # candidate set only shrinks), and ~75-80% of front edges lose the vertex claim each wave
-        # and come back here unchanged, so this is the difference between three hash probes and a
-        # full neighbourhood search.
+        # and come back here unchanged, so this is the difference from a full neighbourhood search.
+        # Every lane evaluates it on identical data — the loads broadcast, so the redundancy is
+        # free — and only lane 0 acts on the result.
         cached = edge_cand[slot]
         if cached >= 0 and candidate_prefilter(
             points, p_src, p_tgt, src, tgt, opp, cached, min_cluster_sq, point_used, boundary_degree
@@ -411,85 +478,71 @@ def pivot_front_edges(
                 p_src, p_tgt, points[cached], normals[src] + normals[tgt] + normals[cached], radius
             )
             if cached_center[0] != wp.inf and candidate_accepted(
-                points,
-                normals,
-                p_src,
-                p_tgt,
-                tri_norm,
-                src,
-                tgt,
-                cached,
-                cached_center,
-                grid_id,
-                radius,
-                crease_cos,
-                key_base,
-                edge_key,
-                edge_count,
-                edge_mask,
-            ):
-                propose_triangle(src, tgt, cached, counters, out_owner, out_a, out_b, out_c)
+                points, normals, p_src, p_tgt, tri_norm, src, tgt, cached, cached_center,
+                grid_id, radius, crease_cos, key_base, edge_key, edge_count, edge_mask,
+            ):  # fmt: skip
+                if lane == 0:
+                    propose_triangle(
+                        src, tgt, cached, front_capacity, counters, out_owner, out_a, out_b, out_c
+                    )
                 continue
 
         center = compute_ball_center(
             p_src, p_tgt, points[opp], normals[src] + normals[tgt] + normals[opp], radius
         )
         if center[0] == wp.inf:
-            edge_state[slot] = EDGE_RETIRED
+            edge_state[slot] = EDGE_RETIRED  # every lane stores the same value
             continue
 
         mp = wp.lerp(p_src, p_tgt, 0.5)
         axis = wp.normalize(p_tgt - p_src)
         a_dir = wp.normalize(center - mp)
 
+        # Each lane keeps its own running best over the candidates it is handed. That weakens the
+        # "reject a non-improving candidate before the expensive tests" pruning — a lane cannot see
+        # the other lanes' minima — so more candidates reach ``candidate_accepted``. It is still the
+        # same answer: the global minimum over accepted candidates is the minimum of the per-lane
+        # minima, and the extra acceptance tests are paid for by their own 32-way concurrency.
         best_angle = TWO_PI
         best = wp.int32(-1)
-        query = wp.hash_grid_query(grid_id, mp, 2.0 * radius)
-        c = wp.int32(-1)
-        while wp.hash_grid_query_next(query, c):
-            if not candidate_prefilter(
+        reach = 2.0 * radius
+        query = wp.tile_bvh_query_aabb(bvh_id, mp - wp.vec3(reach), mp + wp.vec3(reach))
+        while wp.tile_query_valid(query):
+            c = wp.untile(wp.tile_bvh_query_next(query))
+            if c >= 0 and candidate_prefilter(
                 points, p_src, p_tgt, src, tgt, opp, c, min_cluster_sq, point_used, boundary_degree
             ):
-                continue
-            new_center = compute_ball_center(
-                p_src, p_tgt, points[c], normals[src] + normals[tgt] + normals[c], radius
-            )
-            if new_center[0] == wp.inf:
-                continue
-            b_dir = wp.normalize(new_center - mp)
-            angle = wp.acos(wp.dot(a_dir, b_dir))  # wp.acos auto-clamps to [-1, 1]
-            if wp.dot(wp.cross(a_dir, b_dir), axis) < 0.0:
-                angle = TWO_PI - angle
-            # Order matters: reject a non-improving candidate before the expensive tests.
-            if angle >= best_angle:
-                continue
-            if not candidate_accepted(
-                points,
-                normals,
-                p_src,
-                p_tgt,
-                tri_norm,
-                src,
-                tgt,
-                c,
-                new_center,
-                grid_id,
-                radius,
-                crease_cos,
-                key_base,
-                edge_key,
-                edge_count,
-                edge_mask,
-            ):
-                continue
-            best_angle = angle
-            best = c
+                new_center = compute_ball_center(
+                    p_src, p_tgt, points[c], normals[src] + normals[tgt] + normals[c], radius
+                )
+                if new_center[0] != wp.inf:
+                    b_dir = wp.normalize(new_center - mp)
+                    angle = wp.acos(wp.dot(a_dir, b_dir))  # wp.acos auto-clamps to [-1, 1]
+                    if wp.dot(wp.cross(a_dir, b_dir), axis) < 0.0:
+                        angle = TWO_PI - angle
+                    if angle < best_angle and candidate_accepted(
+                        points, normals, p_src, p_tgt, tri_norm, src, tgt, c, new_center,
+                        grid_id, radius, crease_cos, key_base, edge_key, edge_count, edge_mask,
+                    ):  # fmt: skip
+                        best_angle = angle
+                        best = c
 
-        edge_cand[slot] = best
-        if best < 0:
+        # Two-stage reduction, so the winner does not depend on which lane happened to see it:
+        # smallest angle, then smallest point index among the lanes attaining it. When no lane found
+        # anything every lane still holds ``(TWO_PI, -1)``, so the second stage returns -1.
+        block_angle = wp.tile_min(wp.tile(best_angle))[0]
+        mine = best
+        if best_angle != block_angle:
+            mine = INT32_MAX_CONSTANT
+        block_best = wp.tile_min(wp.tile(mine))[0]
+
+        edge_cand[slot] = block_best
+        if block_best < 0:
             edge_state[slot] = EDGE_RETIRED  # provably impossible; see the module docstring
-        else:
-            propose_triangle(src, tgt, best, counters, out_owner, out_a, out_b, out_c)
+        elif lane == 0:
+            propose_triangle(
+                src, tgt, block_best, front_capacity, counters, out_owner, out_a, out_b, out_c
+            )
 
 
 @wp.kernel(enable_backward=False)
@@ -524,6 +577,7 @@ def register_face_edge(
     edge_opp: wp.array[wp.int32],
     edge_cand: wp.array[wp.int32],
     boundary_degree: wp.array[wp.int32],
+    front_capacity: wp.int32,
     counters: wp.array[wp.int32],
     front_out: wp.array[wp.int32],
 ) -> None:
@@ -540,7 +594,7 @@ def register_face_edge(
         edge_tgt[slot] = v
         edge_opp[slot] = opp
         edge_cand[slot] = -1
-        front_out[wp.atomic_add(counters, CNT_NEXT_FRONT, 1)] = slot
+        push_front_edge(slot, front_capacity, counters, front_out)
         wp.atomic_add(boundary_degree, u, 1)
         wp.atomic_add(boundary_degree, v, 1)
     elif previous == 1:
@@ -566,6 +620,7 @@ def commit_triangles(
     edge_cand: wp.array[wp.int32],
     point_used: wp.array[wp.bool],
     boundary_degree: wp.array[wp.int32],
+    front_capacity: wp.int32,
     counters: wp.array[wp.int32],
     front_out: wp.array[wp.int32],
     out_faces: wp.array[wp.int32],
@@ -599,15 +654,15 @@ def commit_triangles(
         point_used[c] = True
         register_face_edge(
             a, b, c, key_base, edge_mask, edge_key, edge_count, edge_src, edge_tgt, edge_opp,
-            edge_cand, boundary_degree, counters, front_out,
+            edge_cand, boundary_degree, front_capacity, counters, front_out,
         )  # fmt: skip
         register_face_edge(
             b, c, a, key_base, edge_mask, edge_key, edge_count, edge_src, edge_tgt, edge_opp,
-            edge_cand, boundary_degree, counters, front_out,
+            edge_cand, boundary_degree, front_capacity, counters, front_out,
         )  # fmt: skip
         register_face_edge(
             c, a, b, key_base, edge_mask, edge_key, edge_count, edge_src, edge_tgt, edge_opp,
-            edge_cand, boundary_degree, counters, front_out,
+            edge_cand, boundary_degree, front_capacity, counters, front_out,
         )  # fmt: skip
 
 
@@ -644,6 +699,7 @@ def compact_front(
     edge_count: wp.array[wp.int32],
     edge_state: wp.array[wp.int32],
     grid_stride: wp.int32,
+    front_capacity: wp.int32,
     counters: wp.array[wp.int32],
     front_out: wp.array[wp.int32],
 ) -> None:
@@ -653,7 +709,7 @@ def compact_front(
     for i in range(int(wp.tid()), counters[CNT_FRONT], grid_stride):
         slot = front_in[i]
         if edge_count[slot] == 1 and edge_state[slot] == EDGE_LIVE:
-            front_out[wp.atomic_add(counters, CNT_NEXT_FRONT, 1)] = slot
+            push_front_edge(slot, front_capacity, counters, front_out)
 
 
 @wp.kernel(enable_backward=False)
@@ -695,6 +751,7 @@ def collect_front_from_table(
     edge_key: wp.array[wp.uint64],
     edge_count: wp.array[wp.int32],
     edge_state: wp.array[wp.int32],
+    front_capacity: wp.int32,
     counters: wp.array[wp.int32],
     out_front: wp.array[wp.int32],
 ) -> None:
@@ -703,4 +760,4 @@ def collect_front_from_table(
     if edge_key[h] == wp.uint64(0):
         return
     if edge_count[h] == 1 and edge_state[h] == EDGE_LIVE:
-        out_front[wp.atomic_add(counters, CNT_NEXT_FRONT, 1)] = h
+        push_front_edge(h, front_capacity, counters, out_front)

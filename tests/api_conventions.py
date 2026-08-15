@@ -326,9 +326,7 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
         {"boundary", "boundary_next", "orientations"}
     ),
     ("algorithms.ball_pivoting", "begin_wave"): frozenset({"counters"}),
-    ("algorithms.ball_pivoting", "collect_front_from_table"): frozenset({"counters"}),
     ("algorithms.ball_pivoting", "commit_triangles"): frozenset({"counters", "point_used"}),
-    ("algorithms.ball_pivoting", "compact_front"): frozenset({"counters", "front_out"}),
     ("algorithms.ball_pivoting", "end_wave"): frozenset({"counters"}),
     ("algorithms.ball_pivoting", "pivot_front_edges"): frozenset(
         {"counters", "edge_cand", "edge_state", "front_out"}

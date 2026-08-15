@@ -819,11 +819,12 @@ def test_ball_pivoting_grows_the_triangle_budget(device: str):
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
     grid = tw.neighbors.hashgrid_from_points(points_wp, 2.0 * 0.2)
+    bvh = tw.neighbors.bvh_from_points(points_wp)
 
     faces_per_budget = []
     for start_budget in (64, 4 * points_np.shape[0] + 16):
         state = tw.reconstruction._BpaState(
-            points_wp, normals_wp, grid, 0.2, 0.2, math.cos(math.pi / 2.0), start_budget
+            points_wp, normals_wp, grid, bvh, 0.2, 0.2, math.cos(math.pi / 2.0), start_budget
         )
         tw.reconstruction._bpa_run(state, 16 * points_np.shape[0])
         counters_np = state.counters.numpy()

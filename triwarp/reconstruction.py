@@ -1258,9 +1258,12 @@ def ball_pivoting(
     # radius made it enumerate ~8x the points it needed. Measured 12% end-to-end; going finer than
     # this loses more to cell-probe overhead than it saves in point tests.
     grid = tw.neighbors.hashgrid_from_points(points, radius)
+    # The pivot search walks this cooperatively (one warp an edge); the empty-ball test inside
+    # it stays on the hash grid, which is the better structure for a *serial* per-lane query.
+    bvh = tw.neighbors.bvh_from_points(points)
     crease_cos = math.cos(crease_angle) if crease_angle < math.pi else -1.0
 
-    state = _BpaState(points, normals, grid, radius, clustering, crease_cos, 4 * n + 16)
+    state = _BpaState(points, normals, grid, bvh, radius, clustering, crease_cos, 4 * n + 16)
     _bpa_run(state, max_waves if max_waves > 0 else 16 * n)
 
     count = int(state.counters.numpy()[kernel_bpa.CNT_FACE])
@@ -1283,6 +1286,7 @@ class _BpaState:
         points: wp.array[wp.vec3],
         normals: wp.array[wp.vec3],
         grid: wp.HashGrid,
+        bvh: wp.Bvh,
         radius: float,
         clustering: float,
         crease_cos: float,
@@ -1292,6 +1296,7 @@ class _BpaState:
         self.points = points
         self.normals = normals
         self.grid = grid
+        self.bvh = bvh
         self.radius = wp.float32(radius)
         self.clustering = wp.float32(clustering)
         self.crease_cos = wp.float32(crease_cos)
@@ -1332,6 +1337,7 @@ class _BpaState:
         # Grid-stride bounds: fixed launch dimensions, which a captured graph requires. Sized from
         # the cloud, not from the budget — the live front peaks well below the point count, and a
         # fixed 64k-wide launch spent most of a small mesh's wave scheduling no-op threads.
+        self.front_capacity = front_capacity
         self.front_grid = min(front_capacity, max(_BPA_MIN_GRID, self.n))
         self.claim_grid = self.front_grid
 
@@ -1382,7 +1388,13 @@ class _BpaState:
         wp.launch(
             kernel_bpa.collect_front_from_table,
             dim=int(self.edge_key.shape[0]),
-            inputs=[self.edge_key, self.edge_count, self.edge_state, self.counters],
+            inputs=[
+                self.edge_key,
+                self.edge_count,
+                self.edge_state,
+                wp.int32(self.front_capacity),
+                self.counters,
+            ],
             outputs=[self.front_in],
             device=self.device,
         )
@@ -1399,6 +1411,7 @@ class _BpaState:
                 self.edge_count,
                 self.edge_state,
                 self.front_grid,
+                wp.int32(self.front_capacity),
                 self.counters,
                 self.front_out,
             ],
@@ -1473,6 +1486,7 @@ def _bpa_wave(state: _BpaState, max_waves: int) -> None:
             state.grid.id,
             state.radius,
             state.clustering,
+            wp.int32(state.front_capacity),
             state.counters,
             state.owner,
             state.tri_a,
@@ -1481,13 +1495,15 @@ def _bpa_wave(state: _BpaState, max_waves: int) -> None:
         ],
         device=device,
     )
-    wp.launch(
+    wp.launch_tiled(
         kernel_bpa.pivot_front_edges,
-        dim=state.front_grid,
+        dim=[state.front_grid],
+        block_dim=kernel_bpa.BPA_PIVOT_BLOCK,
         inputs=[
             state.points,
             state.normals,
             state.grid.id,
+            state.bvh.id,
             state.radius,
             state.clustering,
             state.crease_cos,
@@ -1504,6 +1520,7 @@ def _bpa_wave(state: _BpaState, max_waves: int) -> None:
             state.boundary_degree,
             state.front_in,
             state.front_grid,
+            wp.int32(state.front_capacity),
             state.counters,
             state.owner,
             state.front_out,
@@ -1546,6 +1563,7 @@ def _bpa_wave(state: _BpaState, max_waves: int) -> None:
             state.edge_cand,
             state.point_used,
             state.boundary_degree,
+            wp.int32(state.front_capacity),
             state.counters,
             state.front_out,
             state.all_faces,

@@ -63,12 +63,33 @@ What the open3d comparison showed when it was added (medians, RTX 5090, ``depth=
   triangulate a neighbourhood in overlapping layers, which cleanup then tore back into open
   patches. The run-to-run spread collapsed with it (148 ms StdDev -> 3 ms).
 
-  What is left is ``pivot_front_edges`` (94% of kernel time) and it is *occupancy*-bound, not
-  throughput-bound: a wave has a few thousand live front edges, so a few thousand threads do
+  What is left is ``pivot_front_edges`` (90.8% of kernel time) and it is *occupancy*-bound, not
+  throughput-bound: a wave has a few hundred live front edges, so a few hundred threads do
   serial, dependent hash-grid work on a device with 350k thread slots. ``bunny_decimated`` is
-  still 1.19x behind open3d for exactly that reason — it is too small to fill the GPU — while
-  ``bunny``, four times larger, is 2.1x ahead. Going further means parallelising *within* an
-  edge's candidate search (a warp per edge), not shaving the wave loop.
+  still behind for exactly that reason — it is too small to fill the GPU — while ``bunny``,
+  four times larger, fares much better.
+
+  **A warp per edge was the next step, and it landed.** The wave cost used to be nearly flat in the
+  front size (0.425 ms at a front under 64 against 1.636 at 1024-4096 — a 250x range of work for
+  4.3x of cost), which is the signature of a device left idle: a wave has only a few hundred live
+  edges. The per-edge work is ~215 point tests (the outer query enumerates 87.6 candidates, 59.0
+  pass the prefilter, 8.93 run the acceptance test, each walking a second ball of 14.2 points).
+
+  What blocked the obvious fix was the *index*, not the kernel: Warp's hash grid exposes only a
+  sequential per-thread iterator with no per-cell entry point, so its walk — **70-73%** of a query's
+  cost — cannot be split across lanes. Warp's **BVH** can be, through ``tile_bvh_query_aabb``, and
+  that turned out to be 2.4-8.9x over the hash grid at the front sizes a wave actually has. (A
+  *serial* BVH walk is 1.8x **slower** than the hash grid, so the win is the cooperation, not the
+  tree; and a hand-rolled hashed cell grid would be a further 2.2-5.5x that this kernel's own
+  ceiling cannot spend.)
+
+  So ``pivot_front_edges`` now runs one block per front edge, one warp per block, walking the BVH
+  cooperatively, with the empty-ball test left as a per-lane serial hash-grid query — at that point
+  each lane is testing a different ball, so there is nothing to cooperate on, and it gets its
+  speedup from running 32-way concurrently instead. Measured back to back in one session:
+  **116.7 -> 25.9 ms on ``bunny_decimated`` and 203.4 -> 41.6 ms on ``bunny`` (4.5x / 4.9x)**,
+  taking the group from 3.78x behind pymeshlab to **1.34x ahead**, and from 1.54x behind to
+  **3.65x ahead**.
 
 Sizing notes measured on an RTX 5090 before the baseline was captured:
 
