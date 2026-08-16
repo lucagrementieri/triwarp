@@ -43,6 +43,48 @@ You are an expert in NVIDIA Warp (wp). Follow all rules below when writing kerne
   compile. Widening or narrowing a scalar is the **constructor**: `wp.float32(x)`, `wp.float64(i)`.
 - Prepend output argument names with out_ and put them at the end of the kernel signature after all the input arguments. Two exemption classes, both carried as `_KERNEL_OUTPUT_ALLOWLIST` in `tests/api_conventions.py` (check 13): **in-place** arguments, where the same buffer is input and result (`sort_rows_insertion(data)`, the hole-filling DP tables) — an `out_` prefix would misread as write-only; and **scratch / persistent-state** buffers, caller-allocated working memory carried across launches (cursors, stacks, open-addressing tables, `ball_pivoting`'s front) — neither an input nor the answer, so name them for what they hold (`cursor`, `front_out`, `new_src`). A read-only input must never wear the `out_` prefix, even when the buffer was a *producer* kernel's output — parameter names describe the argument's role in *this* kernel.
 
+### Fusing a kernel: extract the shared part as a `@wp.func` in the same commit
+
+Fusing two launches into one is a standard and welcome optimization here — it removes a launch, a
+round trip through global memory, and often an intermediate buffer. But a fused kernel is written by
+*copying* the prologue of the kernel it absorbs, and the copy is what survives. **A fusion is not
+done when it is faster; it is done when the code it duplicated has a name.**
+
+So whenever a kernel is fused, split, specialised, or given a second variant (tiled/serial,
+float32/float64, one accelerator/another), the same commit must:
+
+1. **Name the shared run.** Any consecutive statement run the new kernel shares with the one it came
+   from — a corner-index load, a window computation, an emit protocol, a guard sequence — becomes one
+   `@wp.func` that both call. `@wp.func` calls are inlined at codegen, so this costs nothing at
+   runtime; it is free structurally and the only reason not to do it is that nobody looked.
+2. **Put it where the *quantity* lives, not where the fusion happened.** A general geometric
+   predicate goes in `kernels/predicates.py`, a per-face quantity in `kernels/triangles.py`, an
+   index/sort/search helper in `kernels/array.py`, a scatter in `kernels/scatter.py` (§4 names these
+   four and why). A shared helper left in the algorithm module is how `triangle_aabb`,
+   `triangle_double_area` and `circumcircle_diameter` ended up being reached by unrelated modules
+   importing an algorithm to get at geometry.
+3. **Say in a comment what the two kernels still differ by**, so the next reader can tell a real
+   variant from a stale copy. Where the difference is a *parameter* rather than an algorithm, prefer
+   one kernel with a warp-uniform int selector (§4's `wp.Function`-as-argument restriction and the
+   `ACCEL_HASHGRID` / `ACCEL_BVH` pattern in `kernels/neighbors.py`); where it is genuinely two
+   algorithms, keep two kernels and have each name the other.
+
+**Merge on identity of meaning, not identity of tokens.** Two bodies that agree because they compute
+the same quantity are one function; two bodies that agree because a one-line kernel has only one
+shape are two functions and the duplicate scan's hit is noise. `remesh.compute_midpoints` and
+`triangles.face_centroids` normalise identically and must stay apart.
+
+Watch the signature while fusing, too: a fused kernel inherits the union of two argument lists, and
+**a `wp.launch` argument costs ~1.0 µs of host time, linearly, on both CUDA and CPU** (measured over
+2-28 arguments on an RTX 5090 and this box's CPU: 15 µs at 2 arguments, 41 µs at 28). §13's flat
+"~32 µs per launch" is the *mean* kernel's launch, not a constant. If the fused kernel is launched
+inside a Python loop and carries a dozen or more arguments, bundle the invariant tables into a
+`@wp.struct` built **once** in the wrapper — measured 43 → 18 µs per launch for a 25-argument kernel,
+a flat saving at every `dim`, with subscript-style field annotations (`a: wp.array[wp.int32]`) and
+2.6 µs per bundle construction. Two examples worth reading before writing a third: `holes._fill_dp`
+launches a 16-argument kernel once per span, and `reconstruction._bpa_wave` launches a 27-argument
+one per wave.
+
 ---
 
 ## 4. Python-Scope Wrappers
