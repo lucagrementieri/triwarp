@@ -189,9 +189,11 @@ def test_cut_along_edges_with_no_edges_is_the_identity(device: str) -> None:
     assert _face_component_count(cut_vertices_wp, cut_faces_wp) == 1
 
 
-def test_cut_along_edges_all_interior_edges_gives_a_triangle_soup(device: str) -> None:
+def test_cut_along_edges_all_interior_edges_gives_a_triangle_soup(
+    device: str, icosphere_coarse: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
     """Cutting everything leaves one vertex per corner: the definition of a soup."""
-    sphere_tm = tm.creation.icosphere(subdivisions=2)
+    sphere_tm, _sphere_tm_wp = icosphere_coarse
     vertices_wp, faces_wp = numpy_to_warp(sphere_tm.vertices, sphere_tm.faces, device)
     all_edges_wp = tw.seams.crease_edges(vertices_wp, faces_wp, angle=0.0)
     cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(vertices_wp, faces_wp, all_edges_wp)

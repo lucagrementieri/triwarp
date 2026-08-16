@@ -1046,14 +1046,16 @@ def test_marching_cubes_invalid(device: str) -> None:
 
 
 @pytest.mark.parametrize("offset", [0.0, 0.2, -0.2])
-def test_resample_uniform_offsets_a_sphere(device: str, offset: float) -> None:
+def test_resample_uniform_offsets_a_sphere(
+    device: str, offset: float, icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
     """
     Offset the one shape whose offset surface is known exactly: a sphere by ``d`` gives ``1 + d``.
 
     Both signs are covered because they are different code paths in spirit — a positive offset needs
     the lattice padded beyond the bounding box (or it clips) and a negative one does not.
     """
-    sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    sphere_tm, _sphere_tm_wp = icosphere
     vertices_wp, faces_wp = numpy_to_warp(sphere_tm.vertices, sphere_tm.faces, device)
     voxel_size = 0.05
 
@@ -1074,7 +1076,9 @@ def test_resample_uniform_offsets_a_sphere(device: str, offset: float) -> None:
     assert out_tm.volume > 0.0
 
 
-def test_resample_uniform_repairs_a_broken_mesh(device: str) -> None:
+def test_resample_uniform_repairs_a_broken_mesh(
+    device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
     """
     The bluntest repair there is: the topology comes from the grid, so the input's cannot leak.
 
@@ -1082,7 +1086,7 @@ def test_resample_uniform_repairs_a_broken_mesh(device: str) -> None:
     that each need their own function in [`triwarp.repair`][triwarp.repair] — and the resampled
     result is a clean watertight sphere regardless.
     """
-    sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    sphere_tm, _sphere_tm_wp = icosphere
     faces_np = np.asarray(sphere_tm.faces)
     broken_np = np.vstack([faces_np, faces_np[:20], faces_np[30:40][:, ::-1]])
     vertices_wp = wp.array(
@@ -1107,7 +1111,9 @@ def test_resample_uniform_repairs_a_broken_mesh(device: str) -> None:
 
 
 @pytest.mark.parity("resample_uniform", "pymeshlab")
-def test_resample_uniform_matches_pymeshlab(device: str) -> None:
+def test_resample_uniform_matches_pymeshlab(
+    device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
     """
     ``generate_resampled_uniform_mesh`` is the same algorithm at the same absolute cell size.
 
@@ -1120,7 +1126,7 @@ def test_resample_uniform_matches_pymeshlab(device: str) -> None:
     What must agree is the surface: both watertight, both enclosing the sphere's volume, and a
     two-sided Hausdorff distance between them of well under a cell.
     """
-    sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    sphere_tm, _sphere_tm_wp = icosphere
     voxel_size = 0.06
     meshset_pml = ml.MeshSet()
     meshset_pml.add_mesh(
@@ -1155,7 +1161,7 @@ def test_resample_uniform_matches_pymeshlab(device: str) -> None:
 
 
 @pytest.mark.parity("resample_uniform", "igl")
-def test_resample_uniform_matches_igl(device: str) -> None:
+def test_resample_uniform_matches_igl(device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
     Class C (no vertex correspondence): the two isosurfaces coincide to **0.06 of a voxel**.
 
@@ -1179,7 +1185,7 @@ def test_resample_uniform_matches_igl(device: str) -> None:
     measured agreement and fails on a shift of a third of a voxel. That is what makes it a test of
     the anchoring rather than of "both are roughly a sphere".
     """
-    sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    sphere_tm, _sphere_tm_wp = icosphere
     voxel_size = 0.06
     vertices_np = np.ascontiguousarray(sphere_tm.vertices, dtype=np.float64)
     faces_np = np.ascontiguousarray(sphere_tm.faces, dtype=np.int64)
@@ -1214,9 +1220,11 @@ def test_resample_uniform_matches_igl(device: str) -> None:
     assert np.abs(tm.proximity.signed_distance(out_tm, sample_igl)).max() < 0.25 * voxel_size
 
 
-def test_resample_uniform_coarser_is_smaller(device: str) -> None:
+def test_resample_uniform_coarser_is_smaller(
+    device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
     """A wider voxel can only produce fewer triangles, and still a closed surface."""
-    sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    sphere_tm, _sphere_tm_wp = icosphere
     vertices_wp, faces_wp = numpy_to_warp(sphere_tm.vertices, sphere_tm.faces, device)
     counts = []
     for voxel_size in (0.05, 0.1, 0.2):

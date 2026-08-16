@@ -314,7 +314,7 @@ def _faces_2d(faces_wp: wp.array) -> np.ndarray:
 @pytest.mark.parametrize("epsilon", [0.0, 1e-6])
 @pytest.mark.parity("remove_duplicated_vertices", "open3d", "pymeshlab", "pyvista")
 def test_remove_duplicated_vertices_matches_open3d_and_pymeshlab(
-    device: str, epsilon: float
+    device: str, epsilon: float, icosphere_coarse: tuple[tm.Trimesh, wp.Mesh]
 ) -> None:
     """
     Welding an unwelded soup, the one repair group whose ``epsilon`` sweep maps across all three.
@@ -337,7 +337,7 @@ def test_remove_duplicated_vertices_matches_open3d_and_pymeshlab(
     the headline. Measured: 960 soup positions collapse to exactly 162 on all three sides at both
     epsilon values, matching the icosphere's true vertex count.
     """
-    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    mesh_tm, _mesh_tm_wp = icosphere_coarse
     soup_np = np.ascontiguousarray(mesh_tm.vertices[mesh_tm.faces].reshape(-1, 3))
     faces_np = np.arange(soup_np.shape[0], dtype=np.int32).reshape(-1, 3)
 
@@ -377,7 +377,9 @@ def test_remove_duplicated_vertices_matches_open3d_and_pymeshlab(
 
 
 @pytest.mark.parity("make_winding_consistent", "pymeshlab")
-def test_make_winding_consistent_matches_pymeshlab(device: str) -> None:
+def test_make_winding_consistent_matches_pymeshlab(
+    device: str, icosphere_coarse: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
     """
     Orientation repair against MeshLab's, which reaches the identical winding on every face.
 
@@ -393,7 +395,7 @@ def test_make_winding_consistent_matches_pymeshlab(device: str) -> None:
     for face **without** needing the global-flip escape -- both anchor on the first face of the
     component -- so the test asserts the strict form and would catch a flip if one appeared.
     """
-    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    mesh_tm, _mesh_tm_wp = icosphere_coarse
     flipped_np = mesh_tm.faces.copy()
     flipped_np[::3] = flipped_np[::3][:, ::-1]
 
@@ -749,7 +751,10 @@ def _split_nonmanifold_wp(
 )
 @pytest.mark.parity("split_nonmanifold", "igl")
 def test_split_nonmanifold_matches_igl(
-    mesh_kind: str, device: str, icosahedron: tuple[tm.Trimesh, wp.Mesh]
+    mesh_kind: str,
+    device: str,
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:
     """
     Class B: the same vertex split as ``igl.split_nonmanifold``, up to which copy gets which index.
@@ -782,7 +787,7 @@ def test_split_nonmanifold_matches_igl(
         faces_np[-1] = faces_np[-1][::-1]
         expected_new = 15  # the flipped face is cut free of all three neighbours
     elif mesh_kind == "boundary":
-        sphere_tm = tm.creation.icosphere(subdivisions=2)
+        sphere_tm, _sphere_wp = icosphere_coarse
         hemisphere_tm = sphere_tm.slice_plane(
             plane_origin=np.zeros(3), plane_normal=np.array([0.0, 0.0, 1.0]), cap=False
         )
@@ -1269,9 +1274,11 @@ def test_remove_t_vertices_matches_pymeshlab(device: str, mesh_kind: str) -> Non
     assert (not np.array_equal(face_set(flipped_np), face_set(faces_np))) is expect_change
 
 
-def test_remove_t_vertices_leaves_a_clean_mesh_alone(device: str) -> None:
+def test_remove_t_vertices_leaves_a_clean_mesh_alone(
+    device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
     """No triangle of an icosphere is anywhere near the threshold, so nothing may move."""
-    sphere_tm = tm.creation.icosphere(subdivisions=3)
+    sphere_tm, _sphere_wp = icosphere
     vertices_wp, faces_wp = numpy_to_warp(
         np.asarray(sphere_tm.vertices), np.asarray(sphere_tm.faces), device
     )

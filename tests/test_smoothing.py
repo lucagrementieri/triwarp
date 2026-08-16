@@ -873,9 +873,11 @@ def test_filter_two_step_empty(device: str) -> None:
     assert tw.smoothing.filter_two_step(vertices_wp, faces_wp).shape == (0,)
 
 
-def test_filter_sharpen_amplifies_detail(device: str) -> None:
+def test_filter_sharpen_amplifies_detail(
+    device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
     """Sharpening inverts smoothing, so it must move the mesh *away* from its smooth self."""
-    sphere_tm = tm.creation.icosphere(subdivisions=3)
+    sphere_tm, _sphere_tm_wp = icosphere
     rng = np.random.default_rng(4)
     bumpy_np = np.asarray(sphere_tm.vertices) * (
         1.0 + rng.normal(scale=0.02, size=(sphere_tm.vertices.shape[0], 1))

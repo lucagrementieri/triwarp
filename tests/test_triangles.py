@@ -422,7 +422,9 @@ def test_face_signed_volumes(request: pytest.FixtureRequest, mesh_name: str):
         assert np.isclose(volumes_wp.numpy().sum(), mesh_tm.volume, rtol=1e-5, atol=1e-5)
 
 
-def test_face_signed_volumes_apex_shifts_each_face_but_not_the_sum(device: str):
+def test_face_signed_volumes_apex_shifts_each_face_but_not_the_sum(
+    device: str, icosphere_coarse: tuple[tm.Trimesh, wp.Mesh]
+):
     """
     Moving the apex changes every per-face volume and leaves the closed-mesh total alone.
 
@@ -431,7 +433,7 @@ def test_face_signed_volumes_apex_shifts_each_face_but_not_the_sum(device: str):
     a real parameter rather than a decoration, and it is the axis ``sample.sample_volume`` uses --
     it fans from the surface centroid precisely so that no entry comes out negative.
     """
-    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    mesh_tm, _mesh_tm_wp = icosphere_coarse
     vertices_wp = wp.array(
         np.ascontiguousarray(mesh_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
     )
@@ -450,9 +452,11 @@ def test_face_signed_volumes_apex_shifts_each_face_but_not_the_sum(device: str):
     assert np.isclose(at_origin_np.sum(), shifted_np.sum(), rtol=1e-4)
 
 
-def test_face_signed_volumes_follows_the_input_dtype(device: str):
+def test_face_signed_volumes_follows_the_input_dtype(
+    device: str, icosphere_coarse: tuple[tm.Trimesh, wp.Mesh]
+):
     """``vec3d`` in, ``float64`` out -- the axis ``smoothing``'s volume constraint needs."""
-    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    mesh_tm, _mesh_tm_wp = icosphere_coarse
     faces_wp = wp.array(
         np.ascontiguousarray(mesh_tm.faces.reshape(-1), dtype=np.int32),
         dtype=wp.int32,

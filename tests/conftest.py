@@ -47,6 +47,45 @@ def icosahedron(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
 
 
 @pytest.fixture
+def icosphere(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
+    """
+    Build a unit icosphere at ``subdivisions=3``: 642 vertices, 1 280 faces, closed and regular.
+
+    The workhorse curved fixture, and the one whose absence was structural: section 6 says not to
+    hand-roll a mesh when a fixture will do, but the only closed fixture was ``icosahedron`` at 12
+    vertices -- too coarse for anything that needs curvature -- so 47 tests across 21 files built
+    this by hand. ``subdivisions=3`` is where 26 of them clustered.
+
+    Untranslated, unlike ``icosahedron``: a test that wants the origin off the centroid should move
+    it itself, and several of the callers this replaced depend on the sphere being centred.
+
+    Function-scoped like every fixture here, so mutating ``mesh_tm.vertices`` in a test is safe --
+    see the note on session scoping in ``plans/better-tests.md`` for why it stays that way.
+
+    See Also
+    --------
+    ``icosphere_coarse``
+        The same sphere at ``subdivisions=2``, where another 13 of the call sites sat.
+    """
+    sphere = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    return sphere, trimesh_to_warp(sphere, device)
+
+
+@pytest.fixture
+def icosphere_coarse(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
+    """
+    Build the same sphere at ``subdivisions=2``: 162 vertices, 320 faces.
+
+    A quarter the faces of ``icosphere`` and still genuinely curved. Prefer it wherever the test's
+    claim does not need the resolution -- a reference call that costs 100 ms on 1 280 faces is the
+    difference between a fast suite and a slow one, and most of these comparisons are about
+    correctness rather than about mesh size.
+    """
+    sphere = tm.creation.icosphere(subdivisions=2, radius=1.0)
+    return sphere, trimesh_to_warp(sphere, device)
+
+
+@pytest.fixture
 def half_torus(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
     torus = tm.creation.torus(major_radius=1.0, minor_radius=0.5)
     half_torus = torus.slice_plane(plane_origin=np.zeros(3), plane_normal=np.array([1.0, 0.0, 0.0]))

@@ -34,7 +34,7 @@ import warp as wp
 
 import triwarp as tw
 from tests.comparisons import lexsort_rows
-from tests.conversions import trimesh_to_open3d, trimesh_to_pyvista
+from tests.conversions import numpy_to_warp, trimesh_to_open3d, trimesh_to_pyvista
 
 # A translation with no round coordinate, so no vertex of any fixture lands on a cell plane.
 _OFFSET = np.array([0.137, -0.219, 0.331])
@@ -46,17 +46,18 @@ _IGL_CORNER_ORDER = [1, 0, 2, 3, 5, 4, 6, 7]
 
 
 @pytest.fixture
-def sphere(device: str) -> tuple[tm.Trimesh, wp.array, wp.array]:
-    """Build a closed sphere at a non-round offset, as trimesh plus its Warp buffers."""
-    mesh_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+def sphere(
+    device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> tuple[tm.Trimesh, wp.array, wp.array]:
+    """
+    Move the shared ``icosphere`` to a non-round offset, as trimesh plus its Warp buffers.
+
+    The translation is the point of the local fixture: a voxel grid built around a sphere centred
+    on the origin can pass while every index is off by half a cell, because the offsets cancel.
+    """
+    mesh_tm, _mesh_wp = icosphere
     mesh_tm.apply_translation(_OFFSET)
-    return (
-        mesh_tm,
-        wp.array(
-            np.ascontiguousarray(mesh_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-        ),
-        wp.array(mesh_tm.faces.reshape(-1).astype(np.int32), dtype=wp.int32, device=device),
-    )
+    return (mesh_tm, *numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device))
 
 
 def _cloud(mesh_tm: tm.Trimesh, device: str, n: int = 20000) -> tuple[np.ndarray, wp.array]:

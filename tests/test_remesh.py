@@ -427,7 +427,9 @@ def test_subdivide_to_size_reference_regular(icosahedron: tuple[tm.Trimesh, wp.M
 
 @pytest.mark.parametrize("split_fraction", [0.7, 0.35])
 @pytest.mark.parity("subdivide_to_size", "pymeshlab")
-def test_subdivide_to_size_matches_pymeshlab(device: str, split_fraction: float) -> None:
+def test_subdivide_to_size_matches_pymeshlab(
+    device: str, split_fraction: float, icosphere_coarse: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
     """
     Class A: MeshLab's midpoint refinement produces the *identical* mesh, vertex for vertex.
 
@@ -446,8 +448,7 @@ def test_subdivide_to_size_matches_pymeshlab(device: str, split_fraction: float)
     Measured on ``icosphere(2)``: 642 vertices / 1 280 faces at 0.7x the mean edge, 2 562 / 5 120 at
     0.35x, identical on both sides.
     """
-    mesh_tm = tm.creation.icosphere(subdivisions=2)
-    mesh_wp = trimesh_to_warp(mesh_tm, device)
+    mesh_tm, mesh_wp = icosphere_coarse
     edges_np = mesh_tm.edges_unique
     mean_edge = float(
         np.linalg.norm(
@@ -2247,7 +2248,9 @@ def test_quadric_decimate_empty(device: str) -> None:
     assert int(out_faces_wp.shape[0]) == 0
 
 
-def test_quadric_decimate_captures_its_pass(device: str) -> None:
+def test_quadric_decimate_captures_its_pass(
+    device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
     """
     The decimation pass is replayed as a CUDA graph rather than reissued.
 
@@ -2259,8 +2262,7 @@ def test_quadric_decimate_captures_its_pass(device: str) -> None:
     """
     if not wp.get_device(device).is_cuda or not wp.is_conditional_graph_supported():
         pytest.skip("conditional CUDA graphs unavailable")
-    mesh_tm = tm.creation.icosphere(subdivisions=3)
-    mesh_wp = trimesh_to_warp(mesh_tm, device)
+    mesh_tm, mesh_wp = icosphere
     vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
 
     buffers = tw.remesh._DecimationBuffers(
@@ -2272,7 +2274,9 @@ def test_quadric_decimate_captures_its_pass(device: str) -> None:
     assert buffers._graph is not None
 
 
-def test_quadric_decimate_padding_never_reaches_the_output(device: str) -> None:
+def test_quadric_decimate_padding_never_reaches_the_output(
+    device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
     """
     The fixed-width pass keeps its padding to itself, at every pass and not just at the end.
 
@@ -2282,8 +2286,7 @@ def test_quadric_decimate_padding_never_reaches_the_output(device: str) -> None:
     vertex rather than as a wrong number -- which is exactly what this asserts, after each pass
     rather than only on the result.
     """
-    mesh_tm = tm.creation.icosphere(subdivisions=3)
-    mesh_wp = trimesh_to_warp(mesh_tm, device)
+    mesh_tm, mesh_wp = icosphere
     vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
     buffers = tw.remesh._DecimationBuffers(
         vertices_wp, faces_wp, len(mesh_tm.faces) // 8, wp.float32(np.radians(30.0))

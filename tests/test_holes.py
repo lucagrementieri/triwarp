@@ -857,8 +857,8 @@ def test_fill_smooth_statistics_vs_meshlib(device: str, hemisphere: tuple[tm.Tri
     assert np.isclose(volume_tw, volume_ml, rtol=0.05)
 
 
-def test_fill_smooth_natural_smooth(device: str):
-    sphere = tm.creation.icosphere(subdivisions=3, radius=1.0)
+def test_fill_smooth_natural_smooth(device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]):
+    sphere, _sphere_wp = icosphere
     hemi = sphere.slice_plane(
         plane_origin=np.zeros(3), plane_normal=np.array([0.0, 0.0, 1.0]), cap=False
     )

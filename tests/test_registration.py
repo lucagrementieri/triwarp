@@ -329,7 +329,9 @@ def test_icp_point_to_point_matches_open3d_and_trimesh(device: str) -> None:
 @pytest.mark.parametrize("robust_kernel", ["none", "tukey"])
 @pytest.mark.parity("icp_point_to_plane_cloud", "open3d")
 @pytest.mark.parity("icp_point_to_plane_tukey", "open3d")
-def test_icp_point_to_plane_matches_open3d(device: str, robust_kernel: str) -> None:
+def test_icp_point_to_plane_matches_open3d(
+    device: str, robust_kernel: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
     """
     Point-to-plane ICP against Open3D's, plain and under a Tukey loss.
 
@@ -345,7 +347,7 @@ def test_icp_point_to_plane_matches_open3d(device: str, robust_kernel: str) -> N
     solved slightly differently on the two sides, so they stop at marginally different iterates;
     both still land on the target to better than 1e-5 RMS, which the final assert pins.
     """
-    mesh_tm = tm.creation.icosphere(subdivisions=3)
+    mesh_tm, _mesh_tm_wp = icosphere
     target_np = np.asarray(mesh_tm.vertices, dtype=np.float32)
     normals_np = np.asarray(mesh_tm.vertex_normals, dtype=np.float32)
     rotation_np, translation_np = _rigid_transform(0.08, [0.1, 0.9, 0.2], [0.02, -0.01, 0.015])
