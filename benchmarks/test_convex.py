@@ -16,7 +16,7 @@ Two unrelated cost shapes share this module:
   is ``n_points * n_directions``, so this is the module's compute-bound case. ``convex_subset`` is
   the mask plus a ``flatnonzero`` and a gather, so its delta over the mask is the compaction cost.
   (This sweep used to be a ``TILE_1D``-wide ``wp.tile_max`` / ``wp.tile_min`` block reduction. It is
-  lane-free now because ``wp.launch_tiled`` runs exactly one lane per block on Warp 1.15's CPU
+  lane-free now because ``wp.launch_tiled`` runs exactly one lane per block on Warp 1.16's CPU
   backend, which made every tiled formulation silently wrong there; the replacement also measured
   1.0-2.7x *faster* on CUDA, the gap widening with ``n_points * n_directions``.)
 * **Conservative hull prefilter** (``convex_superset_mask``) — the same support sweep over an

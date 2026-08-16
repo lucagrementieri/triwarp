@@ -32,7 +32,14 @@ test run on any violation:
    the one check that reads outside ``triwarp/``, and it exists because an upgrade left twelve
    workarounds citing Warp 1.13-1.15 for a year: ``reference/warp_api/warp_version.py`` catches a
    stale API *mirror*, and nothing caught a stale *justification*. Unlike checks 1-8 this one also
-   scans ``kernels/``, where five of those twelve lived.
+   scans ``kernels/``, where five of those twelve lived -- and ``tests/`` and ``benchmarks/``, which
+   is where the rot ran deepest. It scanned neither until eleven ``warp.optim.linear.cg`` skips had
+   survived the 1.16 fix that made CPU ``cg`` converge, two of them naming versions 1.14-1.15 in
+   the anchored spelling this check is built to read. A skip is worse than a stale comment: the
+   comment
+   misinforms, the skip silently deletes coverage, and on a box with CUDA the deleted branch is the
+   one nobody runs. The check abstains on ``.md`` -- it reads Python prose blocks -- so a claim in
+   ``benchmarks/README.md`` still needs a human.
 10. **A Python-scope allocation names the device it allocates on.** ``wp.zeros`` / ``empty`` /
     ``ones`` / ``full`` / ``array`` without ``device=`` land on Warp's *current* device, not on the
     device of the arrays they are about to be used with. The suite never catches it, because a test
@@ -245,13 +252,32 @@ _WARP_VERSION_CLAIM = re.compile(r"\bWarp\s+1\.(\d+)(?:\.(\d+))?\b")
 
 # Version claims that deliberately record history rather than describe the installed Warp. Keyed by
 # ``(module, "1.x")``; the value is the reason, and it is where the re-verification goes -- so the
-# next upgrade reads a list of claims to re-run instead of a grep to invent.
+# next upgrade reads a list of claims to re-run instead of a grep to invent. Modules under
+# ``triwarp/`` are keyed by their dotted name, everything else by its path
+# (``tests.api_conventions``, ``benchmarks.test_creation``).
 _WARP_VERSION_ALLOWLIST: dict[tuple[str, str], str] = {
     ("graph", "1.15"): (
         "deliberate history: names the version the CPU heap corruption was measured on so the "
         "1.16 fix beside it has something to be a fix *of*"
-    )
+    ),
+    ("tests.api_conventions", "1.13"): (
+        "deliberate history: this check's own rationale, naming the range of versions the twelve "
+        "stale workarounds cited -- the thing it was written to stop"
+    ),
+    ("benchmarks.test_creation", "1.15"): (
+        "deliberate history: a measurement stamp on a recorded benchmark table, naming the Warp "
+        "the numbers below it were taken on. Re-stamping without re-measuring would be a lie"
+    ),
 }
+
+# Directories check 9 scans, and the prefix each one's allowlist key carries. ``triwarp/`` keeps the
+# bare dotted module name it has always used; the two suites are prefixed so a key stays unambiguous
+# when a test file and a package module share a stem.
+_WARP_VERSION_SCAN_ROOTS: tuple[tuple[Path, str], ...] = (
+    (_PACKAGE_DIR, ""),
+    (_TESTS_DIR, "tests."),
+    (_BENCHMARKS_DIR, "benchmarks."),
+)
 
 # --- check 10 -----------------------------------------------------------------------------------
 
@@ -776,27 +802,30 @@ def warp_version_problems() -> list[str]:
 
     problems: list[str] = []
     seen: set[tuple[str, str]] = set()
-    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
-        module = path.relative_to(_PACKAGE_DIR).with_suffix("").as_posix().replace("/", ".")
-        module = module.removesuffix(".__init__").lstrip(".")
-        for lineno, text in _prose_blocks(path.read_text()):
-            for match in _WARP_VERSION_CLAIM.finditer(text):
-                line = lineno + text.count("\n", 0, match.start())
-                minor = int(match.group(1))
-                if minor >= installed_minor:
-                    continue
-                key = (module, f"1.{minor}")
-                if key in _WARP_VERSION_ALLOWLIST:
-                    seen.add(key)
-                    continue
-                problems.append(
-                    f"{path.relative_to(_REPO_ROOT)}:{line}: names {match.group(0)}, "
-                    f"older than the installed warp-lang {installed} -- re-probe the claim against "
-                    "the installed version and re-stamp it, or add a _WARP_VERSION_ALLOWLIST entry "
-                    "recording why it deliberately names history"
-                )
+    for root, prefix in _WARP_VERSION_SCAN_ROOTS:
+        if not root.is_dir():  # neither suite ships in the wheel
+            continue
+        for path in sorted(root.rglob("*.py")):
+            module = path.relative_to(root).with_suffix("").as_posix().replace("/", ".")
+            module = prefix + module.removesuffix(".__init__").lstrip(".")
+            for lineno, text in _prose_blocks(path.read_text()):
+                for match in _WARP_VERSION_CLAIM.finditer(text):
+                    line = lineno + text.count("\n", 0, match.start())
+                    minor = int(match.group(1))
+                    if minor >= installed_minor:
+                        continue
+                    key = (module, f"1.{minor}")
+                    if key in _WARP_VERSION_ALLOWLIST:
+                        seen.add(key)
+                        continue
+                    problems.append(
+                        f"{path.relative_to(_REPO_ROOT)}:{line}: names {match.group(0)}, "
+                        f"older than the installed warp-lang {installed} -- re-probe the claim "
+                        "against the installed version and re-stamp it, or add a "
+                        "_WARP_VERSION_ALLOWLIST entry recording why it deliberately names history"
+                    )
     problems.extend(
-        f"_WARP_VERSION_ALLOWLIST entry {key!r} matches nothing in triwarp/ -- drop it"
+        f"_WARP_VERSION_ALLOWLIST entry {key!r} matches nothing in the scanned tree -- drop it"
         for key in sorted(_WARP_VERSION_ALLOWLIST)
         if key not in seen and int(key[1].split(".")[1]) < installed_minor
     )

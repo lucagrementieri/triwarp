@@ -262,8 +262,12 @@ set automatically. Pass your own `--benchmark-group-by=...` to override.
   of one group is not comparable to one from another without checking the `Name (time in ...)`
   header. Cross-group ratios quoted in this repo's docstrings come from direct measurement scripts
   for exactly that reason.
-- **`--device=cpu` runs should be one module per process.** Warp 1.15 CPU kernels can corrupt the
-  heap, which shows up as an unrelated crash later in the session:
+- **A `--device=cpu` crash in unrelated code used to mean "run one module per process".** It was
+  never the Warp CPU backend, which is what that advice claimed: the two causes were triwarp's own
+  out-of-bounds scatter in `successor_cycles` and a `wp.launch` missing `device=`, which ran a CUDA
+  kernel over host arrays and corrupted the heap when they were freed. Both are fixed and both now
+  have a standing guard — `tests/conftest.py`'s `STRICT` launch mode and `api_conventions` check 15
+  — so a one-module-per-process loop is a diagnostic, not a routine:
   ```bash
   for f in benchmarks/test_*.py; do uv run pytest "$f" --device=cpu -q; done
   ```

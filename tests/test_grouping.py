@@ -23,7 +23,7 @@ group_test_data = (
         4,
         wp.empty((0, 4), dtype=wp.int32),
     ),
-    # High-bit uint64 keys sort natively as unsigned (after low keys) in Warp 1.15.
+    # High-bit uint64 keys sort natively as unsigned (after low keys) in Warp 1.16.
     (wp.array([2**63 + 5, 1, 2**63 + 5, 1], dtype=wp.uint64), 2, wp.array([[1, 3], [0, 2]])),
 )
 
