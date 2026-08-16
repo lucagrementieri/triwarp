@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.kernels.array import to_vec3d
+from triwarp.kernels.triangles import corner_triple
 
 # ---------------------------------------------------------------------------
 # Region Dirichlet / least-squares smoothing (positionVertsSmoothly, MRLaplacian.cpp)
@@ -28,9 +29,7 @@ def edge_cotan_add(
     # Accumulate each face corner's cotangent into its opposite unique edge; the two incident faces
     # sum to the cotangent edge weight cot(alpha) + cot(beta).
     f = wp.int32(wp.tid())
-    v0 = faces[f * 3 + 0]
-    v1 = faces[f * 3 + 1]
-    v2 = faces[f * 3 + 2]
+    v0, v1, v2 = corner_triple(faces, f)
     p0 = vertices[v0]
     p1 = vertices[v1]
     p2 = vertices[v2]
@@ -404,9 +403,7 @@ def fit_vertices_to_normals(
     # Summed per vertex and divided by the incident-face count by the caller, which is the step size
     # that makes the iteration a contraction without a tuning constant.
     f = wp.int32(wp.tid())
-    i0 = faces[f * 3 + 0]
-    i1 = faces[f * 3 + 1]
-    i2 = faces[f * 3 + 2]
+    i0, i1, i2 = corner_triple(faces, f)
     normal = face_normals[f]
     centroid = (vertices[i0] + vertices[i1] + vertices[i2]) / 3.0
     for k in range(3):

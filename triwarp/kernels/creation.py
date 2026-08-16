@@ -3,6 +3,7 @@ import math
 import warp as wp
 
 from triwarp.kernels.predicates import orient2d
+from triwarp.kernels.triangles import corner_triple
 
 SQRT3 = wp.constant(wp.float32(math.sqrt(3.0)))
 PI_F = wp.constant(wp.float32(math.pi))
@@ -32,9 +33,7 @@ def reverse_face_winding(faces: wp.array[wp.int32], out_faces: wp.array[wp.int32
     # np.fliplr on an (n, 3) face block. All three indices are read before any is written, so
     # this is safe to run in place (out_faces is faces).
     f = wp.int32(wp.tid())
-    a = faces[f * 3 + 0]
-    b = faces[f * 3 + 1]
-    c = faces[f * 3 + 2]
+    a, b, c = corner_triple(faces, f)
     out_faces[f * 3 + 0] = c
     out_faces[f * 3 + 1] = b
     out_faces[f * 3 + 2] = a

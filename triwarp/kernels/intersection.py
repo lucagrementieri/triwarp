@@ -673,9 +673,7 @@ def edge_level_crossings(
     # signed -- so the plane case reuses the dot products rather than recomputing them per edge.
     tid = wp.tid()
     face_index = face_indices[tid]
-    i0 = faces[face_index * 3 + 0]
-    i1 = faces[face_index * 3 + 1]
-    i2 = faces[face_index * 3 + 2]
+    i0, i1, i2 = kernel_triangles.corner_triple(faces, face_index)
     out_points[tid, 0] = canonical_edge_crossing(vertices, vertex_values, i0, i1)
     out_points[tid, 1] = canonical_edge_crossing(vertices, vertex_values, i1, i2)
     out_points[tid, 2] = canonical_edge_crossing(vertices, vertex_values, i2, i0)
@@ -849,9 +847,7 @@ def marching_triangles_segments(
     # of exactly zero counts as positive, so every cut face has exactly one vertex alone in sign and
     # yields exactly one segment: the two edges incident to that vertex are the crossed ones.
     f = wp.int32(wp.tid())
-    i0 = faces[f * 3 + 0]
-    i1 = faces[f * 3 + 1]
-    i2 = faces[f * 3 + 2]
+    i0, i1, i2 = kernel_triangles.corner_triple(faces, f)
     d0 = values[i0]
     d1 = values[i1]
     d2 = values[i2]

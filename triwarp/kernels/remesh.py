@@ -15,7 +15,12 @@ from triwarp.kernels.predicates import (
     triangle_normal,
     vector_angle,
 )
-from triwarp.kernels.triangles import face_normals_and_area, face_vertices_vec3d, triangle_quality
+from triwarp.kernels.triangles import (
+    corner_triple,
+    face_normals_and_area,
+    face_vertices_vec3d,
+    triangle_quality,
+)
 from triwarp.kernels.voxels import voxel_cell
 
 # Delaunay / Delone edge-flip constants (ported from MRMeshDelone.cpp). The flip predicate
@@ -984,9 +989,7 @@ def faces_with_distinct_indices(faces: wp.array[wp.int32], out_mask: wp.array[wp
     # Every decimation here ends in one: an edge collapse merges two of them, vertex clustering
     # sends two into the same cell.
     f = wp.int32(wp.tid())
-    i0 = faces[f * 3 + 0]
-    i1 = faces[f * 3 + 1]
-    i2 = faces[f * 3 + 2]
+    i0, i1, i2 = corner_triple(faces, f)
     out_mask[f] = i0 != i1 and i1 != i2 and i0 != i2
 
 
@@ -1561,9 +1564,7 @@ def collapse_flips_normal(
     # geometry, and it is why the vertex-face CSR is built at all.
     for slot in range(vertex_face_offsets[moved], vertex_face_offsets[moved + 1]):
         f = vertex_faces[slot]
-        i0 = faces[f * 3 + 0]
-        i1 = faces[f * 3 + 1]
-        i2 = faces[f * 3 + 2]
+        i0, i1, i2 = corner_triple(faces, f)
         if i0 == partner or i1 == partner or i2 == partner:
             continue
         p0 = vertices[i0]

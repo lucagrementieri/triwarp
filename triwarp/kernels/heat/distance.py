@@ -10,7 +10,7 @@ linear solves need double precision.
 
 import warp as wp
 
-from triwarp.kernels.triangles import face_unit_gradient, face_vertices_vec3d
+from triwarp.kernels.triangles import corner_triple, face_unit_gradient, face_vertices_vec3d
 
 
 @wp.kernel
@@ -47,9 +47,7 @@ def integrated_divergence(
     # cot_entries[f, k] = 1/2 cot(angle at corner k); each vertex gets contributions from the two
     # edges of the triangle incident to it, weighted by the cotangent opposite those edges.
     f = wp.int32(wp.tid())
-    i0 = faces[f * 3 + 0]
-    i1 = faces[f * 3 + 1]
-    i2 = faces[f * 3 + 2]
+    i0, i1, i2 = corner_triple(faces, f)
     v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
     x = field[f]
     c0 = wp.float64(cot_entries[f, 0])

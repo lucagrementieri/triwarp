@@ -3,7 +3,7 @@ import warp as wp
 from triwarp import constants as twc
 from triwarp.kernels.array import cross2, to_vec2d
 from triwarp.kernels.laplacian import squared_edge_lengths
-from triwarp.kernels.triangles import face_vertices
+from triwarp.kernels.triangles import corner_triple, face_vertices
 
 # Below this (float64) squared edge length the isometric rest-triangle flattening is treated as
 # degenerate: its rest edges are zeroed so the ARAP local step contributes nothing for that face.
@@ -217,9 +217,7 @@ def arap_local_step(
     # zeroed before launch. Degenerate faces have zero rest edges, so S = 0, atan2(0, 0) = 0, and
     # the identity rotation scatters nothing.
     f = wp.int32(wp.tid())
-    i0 = faces[f * 3 + 0]
-    i1 = faces[f * 3 + 1]
-    i2 = faces[f * 3 + 2]
+    i0, i1, i2 = corner_triple(faces, f)
     uv0 = uv[i0]
     uv1 = uv[i1]
     uv2 = uv[i2]

@@ -2,7 +2,7 @@ import warp as wp
 
 from triwarp.kernels.array import update_argmax_lowest_index
 from triwarp.kernels.predicates import barycentric_2d
-from triwarp.kernels.triangles import face_vertices
+from triwarp.kernels.triangles import corner_triple, face_vertices
 
 # NaN payload for vertices whose UV is non-finite (never sampled) and out-of-bounds reads.
 NAN_F32 = wp.constant(wp.float32(float("nan")))
@@ -94,9 +94,7 @@ def rasterize_scatter(
 ) -> None:
     """Write the barycentric-interpolated attribute at every pixel this face owns."""
     f = wp.int32(wp.tid())
-    i0 = faces[f * 3 + 0]
-    i1 = faces[f * 3 + 1]
-    i2 = faces[f * 3 + 2]
+    i0, i1, i2 = corner_triple(faces, f)
     resolution = out_image.shape[0]
     q0, q1, q2 = _face_pixels(uv, faces, f, resolution)
     row_lo, row_hi, col_lo, col_hi = _pixel_bounds(q0, q1, q2, resolution)
@@ -130,9 +128,7 @@ def rasterize_labels(
     label value (matching ``numpy.argmax`` over one-hot columns).
     """
     f = wp.int32(wp.tid())
-    i0 = faces[f * 3 + 0]
-    i1 = faces[f * 3 + 1]
-    i2 = faces[f * 3 + 2]
+    i0, i1, i2 = corner_triple(faces, f)
     resolution = out_labels.shape[0]
     q0, q1, q2 = _face_pixels(uv, faces, f, resolution)
     row_lo, row_hi, col_lo, col_hi = _pixel_bounds(q0, q1, q2, resolution)

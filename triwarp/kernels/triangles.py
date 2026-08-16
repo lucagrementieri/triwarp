@@ -16,6 +16,22 @@ QUALITY_AREA = wp.constant(wp.int32(4))  # plain triangle area
 
 
 @wp.func
+def corner_triple(buffer: wp.array[Any], row: wp.int32):
+    """
+    Load the three entries of row ``row`` of a flat 3-stride buffer.
+
+    Generic over the element type, because what this names is the *row layout* and not the payload:
+    the corner indices of a face out of ``faces``, the unique-edge ids of its three corners out of
+    an ``inverse`` map, a per-corner scalar out of a ``(3F,)`` field. Where the three loaded values
+    are then used to gather from a per-vertex array,
+    [`face_vertices`][triwarp.kernels.triangles.face_vertices] does both steps in one call; this
+    is the half for callers that need the indices themselves as well.
+    """
+    base = row * wp.int32(3)
+    return buffer[base], buffer[base + wp.int32(1)], buffer[base + wp.int32(2)]
+
+
+@wp.func
 def face_vertices(vertices: wp.array[Any], faces: wp.array[wp.int32], face_index: wp.int32):
     """
     Load the three per-corner values of face ``face_index`` from a flat index buffer.
@@ -23,10 +39,7 @@ def face_vertices(vertices: wp.array[Any], faces: wp.array[wp.int32], face_index
     Generic over the value dtype: works for positions (``wp.vec3``/``wp.vec3d``/``wp.vec2``)
     as well as per-vertex scalar fields.
     """
-    base = face_index * wp.int32(3)
-    i0 = faces[base]
-    i1 = faces[base + wp.int32(1)]
-    i2 = faces[base + wp.int32(2)]
+    i0, i1, i2 = corner_triple(faces, face_index)
     return vertices[i0], vertices[i1], vertices[i2]
 
 
@@ -399,9 +412,7 @@ def face_gradient(
     # promoted rather than the result being widened after the fact.
     #
     # A degenerate face contributes nothing and returns the zero vector.
-    i0 = faces[f * 3 + 0]
-    i1 = faces[f * 3 + 1]
-    i2 = faces[f * 3 + 2]
+    i0, i1, i2 = corner_triple(faces, f)
     v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
     n = to_vec3d(normals[f])
     area = wp.float64(areas[f])
