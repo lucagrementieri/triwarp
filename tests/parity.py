@@ -12,7 +12,9 @@ This module reads both suites statically and pairs them up:
 - a benchmark declares what it times with ``@pytest.mark.benchmark(group=...)`` +
   ``@pytest.mark.benchlibs(...)``, and declares a reference whose *result* is not comparable with
   ``@pytest.mark.noparity("<library>", reason="...")``;
-- a correctness test declares what it proves with ``@pytest.mark.parity("<group>", "<library>")``.
+- a correctness test declares what it proves with ``@pytest.mark.parity("<group>", "<library>")``,
+  and declares a reference it tests but which is deliberately *not* timed with
+  ``@pytest.mark.parity("<group>", "<library>", benchmarked=False, reason="...")``.
 
 [`tests/test_parity.py`](test_parity.py) then fails the default test run on any benchmarked pair
 that is neither covered nor exempt. Run ``python -m tests.parity`` for the full matrix.
@@ -58,17 +60,19 @@ _BENCHMARKS_DIR = _REPO_ROOT / "benchmarks"
 _BENCHMARK_MARKERS = frozenset({"benchmark", "benchlibs", "noparity"})
 _TEST_MARKERS = frozenset({"parity"})
 
-# Keyword arguments accepted per marker; every value must be a plain string literal.
-_ALLOWED_KEYWORDS: dict[str, frozenset[str]] = {
-    "benchmark": frozenset({"group"}),
-    "benchlibs": frozenset(),
-    "noparity": frozenset({"reason", "oracle"}),
-    "parity": frozenset(),
+# Keyword arguments accepted per marker, and the literal type each takes. Every value must be a
+# plain literal of that type -- see ``_literal_args`` for why a computed one is an error.
+_ALLOWED_KEYWORDS: dict[str, dict[str, type]] = {
+    "benchmark": {"group": str},
+    "benchlibs": {},
+    "noparity": {"reason": str, "oracle": str},
+    "parity": {"benchmarked": bool, "reason": str},
 }
 
 # A ``noparity`` reason has to carry its own weight: the justifying prose already exists in the
 # benchmark module docstrings, so the path of least resistance is ``reason="see module docstring"``,
-# which tells the next reader nothing. The bar is mechanical or it will not hold.
+# which tells the next reader nothing. The bar is mechanical or it will not hold. A
+# ``benchmarked=False`` parity claim clears the same bar, for the same reason.
 _MIN_REASON_CHARS = 40
 _MIN_REASON_WORDS = 6
 _HOLLOW_REASON = re.compile(
@@ -162,6 +166,21 @@ class Claim:
     roots: frozenset[str]
     """Every dotted-call root used in the body, for the anti-vacuity check."""
 
+    benchmarked: bool = True
+    """
+    Whether the pair is expected to be timed in ``benchmarks/`` as well as tested here.
+
+    ``False`` declares *"tested here, and deliberately not benchmarked"* -- the case where a
+    reference is a legitimate correctness oracle at fixture size but too expensive to time at scan
+    size. It exempts the claim from
+    [`test_parity_markers_reference_known_pairs`](test_parity.py) and nothing else; the claim still
+    counts as coverage, still has to name a reference variable, and still fails if the benchmark row
+    comes *back*, which is what keeps the declaration from going stale in the other direction.
+    """
+
+    reason: str = ""
+    """The written justification required alongside ``benchmarked=False``, and empty otherwise."""
+
 
 @dataclass
 class BenchmarkScan:
@@ -234,14 +253,15 @@ def _marker_name(decorator: ast.expr, watched: frozenset[str]) -> str | None:
 
 def _literal_args(
     call: ast.Call, marker: str, where: str, errors: list[str]
-) -> tuple[list[str], dict[str, str]] | None:
+) -> tuple[list[str], dict[str, str | bool]] | None:
     """
-    Extract a marker's string-literal arguments, appending a message and failing on anything else.
+    Extract a marker's literal arguments, appending a message and failing on anything else.
 
-    Rejecting non-literals outright is what keeps a static scan honest: a computed marker argument
-    would be invisible here, so it is an error rather than a blind spot. Implicitly concatenated
-    string literals are folded into one ``ast.Constant`` by the parser and pass; f-strings
-    (``ast.JoinedStr``) and ``.format()`` calls do not.
+    Positional arguments are always non-empty strings; each keyword takes the literal type
+    ``_ALLOWED_KEYWORDS`` declares for it. Rejecting non-literals outright is what keeps a static
+    scan honest: a computed marker argument would be invisible here, so it is an error rather than a
+    blind spot. Implicitly concatenated string literals are folded into one ``ast.Constant`` by the
+    parser and pass; f-strings (``ast.JoinedStr``) and ``.format()`` calls do not.
     """
     args: list[str] = []
     for arg in call.args:
@@ -255,7 +275,7 @@ def _literal_args(
             return None
 
     allowed = _ALLOWED_KEYWORDS[marker]
-    keywords: dict[str, str] = {}
+    keywords: dict[str, str | bool] = {}
     for keyword in call.keywords:
         if keyword.arg is None:
             errors.append(f"{where}: pytest.mark.{marker} does not accept ** unpacking")
@@ -267,13 +287,18 @@ def _literal_args(
                 f"(accepts {expected})"
             )
             return None
-        if not isinstance(keyword.value, ast.Constant) or not isinstance(keyword.value.value, str):
+        wanted = allowed[keyword.arg]
+        literal = keyword.value.value if isinstance(keyword.value, ast.Constant) else None
+        # ``isinstance(True, str)`` and ``isinstance("x", bool)`` are both False, so the second test
+        # rejects a swapped literal in either direction without a per-type branch. The first is what
+        # tells a type checker the value is one of the two the table can name.
+        if not isinstance(literal, (str, bool)) or not isinstance(literal, wanted):
             errors.append(
-                f"{where}: pytest.mark.{marker} {keyword.arg}= must be a string literal, "
-                f"got {ast.unparse(keyword.value)!r}"
+                f"{where}: pytest.mark.{marker} {keyword.arg}= must be a {wanted.__name__} "
+                f"literal, got {ast.unparse(keyword.value)!r}"
             )
             return None
-        keywords[keyword.arg] = keyword.value.value
+        keywords[keyword.arg] = literal
     return args, keywords
 
 
@@ -371,7 +396,7 @@ def scan_benchmarks() -> BenchmarkScan:
                     if "group" not in keywords:
                         scan.errors.append(f"{where}: pytest.mark.benchmark needs group=")
                     else:
-                        group = keywords["group"]
+                        group = str(keywords["group"])
                 elif marker == "benchlibs":
                     if not args:
                         scan.errors.append(f"{where}: pytest.mark.benchlibs names no libraries")
@@ -383,8 +408,14 @@ def scan_benchmarks() -> BenchmarkScan:
                             f"(stack the decorator for several), got {len(args)}"
                         )
                         continue
+                    oracle = keywords.get("oracle")
                     exemptions.append(
-                        (args[0], keywords.get("reason", ""), keywords.get("oracle"), node.lineno)
+                        (
+                            args[0],
+                            str(keywords.get("reason", "")),
+                            None if oracle is None else str(oracle),
+                            node.lineno,
+                        )
                     )
 
             if group is None and libraries is None and not exemptions:
@@ -461,7 +492,23 @@ def scan_tests() -> TestScan:
                 extracted = _literal_args(decorator, marker, where, scan.errors)
                 if extracted is None:
                     continue
-                args, _ = extracted
+                args, keywords = extracted
+                benchmarked = bool(keywords.get("benchmarked", True))
+                reason = str(keywords.get("reason", ""))
+                if benchmarked and "benchmarked" in keywords:
+                    scan.errors.append(
+                        f"{where}: pytest.mark.parity benchmarked=True is the default and says "
+                        "nothing; omit it, or pass benchmarked=False to declare the pair "
+                        "deliberately untimed"
+                    )
+                    continue
+                if benchmarked and reason:
+                    scan.errors.append(
+                        f"{where}: pytest.mark.parity reason= only applies alongside "
+                        "benchmarked=False; a pair that is both tested and benchmarked needs no "
+                        "justification"
+                    )
+                    continue
                 if len(args) < 2:
                     scan.errors.append(
                         f"{where}: pytest.mark.parity needs a group and at least one library, "
@@ -483,7 +530,9 @@ def scan_tests() -> TestScan:
                     continue
                 site = Site(relative, node.lineno, node.name)
                 for library in libraries:
-                    scan.claims.append(Claim(group, library, site, names, roots))
+                    scan.claims.append(
+                        Claim(group, library, site, names, roots, benchmarked, reason)
+                    )
 
         scan.errors.extend(_unconsumed(tree, _TEST_MARKERS, consumed, relative))
     return scan
@@ -526,9 +575,15 @@ def _assigned_names(node: ast.FunctionDef) -> set[str]:
     return names
 
 
-def reason_problem(exemption: Exemption) -> str | None:
-    """Describe what is wrong with an exemption's ``reason``, or ``None`` when it passes."""
-    reason = " ".join(exemption.reason.split())
+def reason_problem(reason: str, library: str) -> str | None:
+    """
+    Describe what is wrong with a written ``reason=``, or ``None`` when it passes.
+
+    Shared by both markers that carry one -- a benchmark's ``noparity`` exemption and a test's
+    ``parity(..., benchmarked=False)`` declaration. They justify opposite omissions but the bar is
+    the same, and having one implementation is what keeps it that way.
+    """
+    reason = " ".join(reason.split())
     if not reason:
         return "reason= is required"
     if len(reason) < _MIN_REASON_CHARS:
@@ -537,7 +592,7 @@ def reason_problem(exemption: Exemption) -> str | None:
         return f"reason= is {len(reason.split())} words; at least {_MIN_REASON_WORDS} are needed"
     if _HOLLOW_REASON.match(reason):
         return f"reason= restates the situation instead of explaining it: {reason!r}"
-    if reason.lower() == exemption.library.lower():
+    if reason.lower() == library.lower():
         return "reason= is just the library name"
     return None
 
@@ -666,6 +721,15 @@ def _main() -> None:
         for (group, library), item in sorted(exempt.items()):
             oracle = f" [oracle: {item.oracle}]" if item.oracle else ""
             print(f"{group} / {library}{oracle}\n  {item.site}\n  {item.reason}")
+
+    untimed = sorted(
+        (claim for claim in tests.claims if not claim.benchmarked),
+        key=lambda claim: (claim.group, claim.library),
+    )
+    if untimed:
+        print("\n--- tested, deliberately not benchmarked ---")
+        for claim in untimed:
+            print(f"{claim.group} / {claim.library}\n  {claim.site}\n  {claim.reason}")
 
     missing = uncovered_pairs()
     if missing:

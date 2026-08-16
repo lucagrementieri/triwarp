@@ -492,7 +492,15 @@ def test_poisson_torus_genus(device: str):
     assert mesh_tw.euler_number == 0  # genus-1 torus: V - E + F = 0
 
 
-@pytest.mark.parity("screened_poisson", "open3d")
+@pytest.mark.parity(
+    "screened_poisson",
+    "open3d",
+    benchmarked=False,
+    reason="open3d wraps Kazhdan's CPU solver, which was 6 322 s across the open3d and pymeshlab "
+    "screened_poisson rows -- 73 % of the whole benchmark suite -- and [dragon-open3d-*] ran 93 "
+    "minutes without completing a round. Those rows were removed rather than capped; the "
+    "comparison lives here, at a size a correctness test can afford.",
+)
 def test_poisson_matches_open3d_metric(device: str):
     """
     Class C: mean sample-to-surface distance, there being no vertex correspondence to compare.
@@ -566,7 +574,15 @@ def test_poisson_finer_depth_reduces_error(device: str):
     assert error_fine <= error_coarse
 
 
-@pytest.mark.parity("screened_poisson", "pymeshlab")
+@pytest.mark.parity(
+    "screened_poisson",
+    "pymeshlab",
+    benchmarked=False,
+    reason="pymeshlab wraps the same Kazhdan CPU solver open3d does, and the two rows together "
+    "were 6 322 s -- 73 % of the whole benchmark suite -- for a reference triwarp already beats "
+    "15-25x. Removed from benchmarks/test_reconstruction.py rather than capped; the comparison "
+    "lives here instead.",
+)
 def test_poisson_matches_pymeshlab_metric(device: str):
     """
     Class C: the [`test_poisson_matches_open3d_metric`][] comparison against the other reference.

@@ -24,9 +24,11 @@ if hasattr(wp.config, "launch_array_access_mode"):  # warp >= 1.14
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
-        "parity(group, *libraries): this test asserts triwarp agrees with each named reference "
-        "library for the benchmark group of that name. The gate in tests/test_parity.py requires "
-        "one of these (or a noparity exemption in benchmarks/) for every benchmarked pair.",
+        "parity(group, *libraries, benchmarked=..., reason=...): this test asserts triwarp agrees "
+        "with each named reference library for the benchmark group of that name. The gate in "
+        "tests/test_parity.py requires one of these (or a noparity exemption in benchmarks/) for "
+        "every benchmarked pair. Pass benchmarked=False with a written reason= where the pair is "
+        "compared here but deliberately not timed.",
     )
 
 

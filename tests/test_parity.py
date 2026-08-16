@@ -70,10 +70,15 @@ def test_parity_markers_reference_known_pairs() -> None:
 
     A ``parity`` marker naming a group that does not exist, or a library that group does not
     benchmark, would otherwise sit in the tree looking like coverage while contributing none.
+
+    Claims declaring ``benchmarked=False`` are exempt here and checked by the two tests below
+    instead: they name a pair that is *known* not to be timed, and saying so is the point.
     """
     benchmarks = scan_benchmarks()
     problems: list[str] = []
     for claim in scan_tests().claims:
+        if not claim.benchmarked:
+            continue
         timed = benchmarks.libraries.get(claim.group)
         if timed is None:
             suggestions = difflib.get_close_matches(claim.group, benchmarks.libraries, n=3)
@@ -148,9 +153,47 @@ def test_exemption_reasons_are_substantive() -> None:
     problems = [
         f"{item.site}: noparity({item.library!r}) on {item.group!r}: {problem}"
         for item in scan_benchmarks().exemptions
-        if (problem := reason_problem(item)) is not None
+        if (problem := reason_problem(item.reason, item.library)) is not None
     ]
     _fail("exemption reason(s) too thin:", problems)
+
+
+def test_untimed_parity_reasons_are_substantive() -> None:
+    """
+    Hold a ``benchmarked=False`` declaration to the same written bar as a ``noparity`` exemption.
+
+    The two markers justify opposite omissions -- "timed but not comparable" against "compared but
+    not timed" -- and both are a human's assertion that the gap is deliberate. A declaration that
+    does not say *why* the pair is untimed is indistinguishable from one added to silence a red
+    gate, which is the failure this whole module exists to prevent.
+    """
+    problems = [
+        f"{claim.site}: parity({claim.group!r}, {claim.library!r}, benchmarked=False): {problem}"
+        for claim in scan_tests().claims
+        if not claim.benchmarked
+        and (problem := reason_problem(claim.reason, claim.library)) is not None
+    ]
+    _fail("untimed parity declaration(s) too thin:", problems)
+
+
+def test_untimed_parity_claims_are_really_untimed() -> None:
+    """
+    The staleness guard in the other direction: a declared-untimed pair that *is* timed.
+
+    ``benchmarked=False`` suppresses a real check, so it has to expire on its own. If somebody
+    restores the benchmark row -- open3d's screened Poisson becomes affordable, a ``benchlibs`` edit
+    adds the library back -- the declaration is now a false statement quietly exempting a pair that
+    no longer needs it, and only this test notices.
+    """
+    benchmarks = scan_benchmarks()
+    problems = [
+        f"{claim.site}: parity({claim.group!r}, {claim.library!r}, benchmarked=False), but "
+        f"{claim.group!r} does time {claim.library!r} now -- drop the declaration"
+        for claim in scan_tests().claims
+        if not claim.benchmarked
+        and claim.library in benchmarks.libraries.get(claim.group, frozenset())
+    ]
+    _fail("untimed parity declaration(s) contradicted by a benchmark:", problems)
 
 
 def test_parity_claims_read_a_reference_variable() -> None:
