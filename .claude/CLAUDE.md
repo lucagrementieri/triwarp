@@ -659,7 +659,8 @@ Reuse shared mesh fixtures from `tests/conftest.py` instead of building meshes i
 
 | Fixture | Use when |
 |---------|----------|
-| `icosahedron` | Default watertight solid; inside/outside, surface sampling, sign tests |
+| `icosahedron` | Default watertight solid, 12 vertices; inside/outside, surface sampling, sign tests |
+| `icosphere`, `icosphere_coarse` | Closed and *curved* — `subdivisions=3` (642 vertices) and `2` (162). Reach for these wherever `icosahedron` is too coarse, rather than calling `tm.creation.icosphere` |
 | `cave_cube` | Hollow / non-convex shell (boolean difference) |
 | `hemisphere`, `half_torus` | Curved or open surfaces |
 | `boy_surface` | Closed, watertight and **non-orientable**, χ = 1 — the `False` branch of `is_orientable` / `face_orientation_bits`, and `make_winding_consistent`'s impossible one |
@@ -741,7 +742,9 @@ Reuse `tests/comparisons.py` (`lexsort_rows`, `assert_unordered_rows_equal`, `un
 `trimesh_to_pyvista`, `points_to_pyvista`, `pyvista_edges_to_indices`, `faces_igl`, `mesh_igl`)
 rather than re-rolling either. **Check both modules before writing a private helper in a test
 file** — every one of the six consolidated in 2026-08 was written by someone who did not, and
-`undirected_edges` alone had been spelled three different ways across six files. `canonical_labels` is the label-packing transform every component comparison
+`undirected_edges` alone had been spelled three different ways across six files.
+
+`canonical_labels` is the label-packing transform every component comparison
 needs — triwarp names a component after a representative element, igl and scipy number `0..k-1` in
 their own traversal orders and VTK's `RegionId` numbers them in a third, so only the *partition* is
 shared. `open3d` and `pyvista` are hard test dependencies like `pymeshlab` and `igl` — import them
