@@ -754,6 +754,45 @@ def test_face_orientation_mask_long_path(device: str) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("mesh_name", "orientable"),
+    [("icosahedron", True), ("hemisphere", True), ("mobius", False), ("boy_surface", False)],
+)
+def test_face_orientation_bits_leave_edges_unsatisfied_only_when_non_orientable(
+    request: pytest.FixtureRequest, mesh_name: str, orientable: bool
+) -> None:
+    """
+    The Z2 potential is exact iff the mesh is orientable, which is the branch nothing else reached.
+
+    ``face_orientation_bits`` returns ``orient`` together with the signed face-adjacency graph
+    ``(signed_edges, signs)`` it was solved from, and the contract between them is
+    ``orient[u] ^ orient[v] == sign`` on every adjacency edge. On an orientable mesh that system is
+    consistent and the potential satisfies all of it; on a non-orientable one no potential exists,
+    so the solver necessarily leaves some edges **frustrated** -- and the count of those is what
+    ``is_orientable`` is really reading.
+
+    Both of its existing tests build a ``_triangle_ribbon`` and open by asserting
+    ``is_orientable is True``, so the whole ``False`` side of this primitive -- the engine under
+    ``is_orientable`` *and* under ``make_winding_consistent`` -- had never been executed. The two
+    non-orientable fixtures are the only inputs in the suite that can execute it.
+
+    Measured, and the separation is not marginal: 0 frustrated edges of 480 on ``icosphere`` and 30
+    of 30 on ``icosahedron``, against **41** of 4 524 on ``mobius`` and **42** of 4 446 on
+    ``boy_surface``. Asserting the direction rather than the count, since the count is a property of
+    the particular triangulation.
+    """
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    orient_wp, signed_edges_wp, signs_wp, m = tw.validation.face_orientation_bits(mesh_wp.indices)
+
+    assert m > 0, "a mesh with no face adjacency would make this vacuous"
+    orient_np = orient_wp.numpy()
+    edges_np = signed_edges_wp.numpy()
+    frustrated_np = (orient_np[edges_np[:, 0]] ^ orient_np[edges_np[:, 1]]) != signs_wp.numpy()
+
+    assert bool(tw.validation.is_orientable(mesh_wp.indices)) is orientable
+    assert (int(frustrated_np.sum()) == 0) is orientable
+
+
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 @pytest.mark.parity("is_watertight", "open3d")
 def test_is_watertight_matches_open3d(request: pytest.FixtureRequest, mesh_name: str) -> None:
@@ -805,6 +844,44 @@ def test_is_watertight_rejects_self_intersection_like_open3d(device: str) -> Non
     # The clause that does the work: it *is* edge-manifold and closed, which is all trimesh checks.
     assert tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=False)
     assert bool(tangled_tm.is_watertight) is True
+
+
+@pytest.mark.parametrize("mesh_name", ["bohemian_dome", "boy_surface"])
+@pytest.mark.parity("is_watertight", "open3d")
+def test_is_watertight_rejects_a_connected_surface_that_intersects_itself(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A against open3d, on the self-intersection case the two-box test cannot reach.
+
+    The test above builds its counterexample from **two** interpenetrating boxes, so a hypothetical
+    implementation that rejected any multi-component input would pass it for the wrong reason. These
+    two fixtures are single connected surfaces that pass through themselves -- a Bohemian dome and
+    Boy's surface -- and they are the only inputs in the suite of that class, which is what their
+    docstrings in ``tests/conftest.py`` say they are for.
+
+    Non-vacuous, and deliberately so: every precondition is asserted first, so the ``False`` can
+    only be coming from the self-intersection clause. Both are edge- and vertex-manifold with
+    **zero** boundary edges, so the manifold and closedness clauses are satisfied and only the third
+    can fail.
+
+    Sharpest as a disagreement: ``trimesh.is_watertight`` returns **True** for both, because its
+    definition is "every edge has exactly two faces" and stops there. triwarp follows Open3D, and
+    the assert pins the two of them together against trimesh rather than merely restating a
+    convention.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+
+    assert tw.validation.is_edge_manifold(mesh_wp.indices, allow_boundary_edges=False) is True
+    assert tw.validation.is_vertex_manifold(mesh_wp.indices) is True
+    assert int(tw.boundary.boundary_edges(mesh_wp.points, mesh_wp.indices).shape[0]) == 0
+    assert tw.validation.is_self_intersecting(mesh_wp) is True
+
+    assert tw.validation.is_watertight(mesh_wp.points, mesh_wp.indices) is False
+    assert trimesh_to_open3d(mesh_tm).is_watertight() is False
+    assert (
+        mesh_tm.is_watertight is True
+    )  # trimesh's weaker definition, and why open3d is the oracle
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
