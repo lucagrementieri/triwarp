@@ -22,6 +22,70 @@ def trimesh_to_warp(mesh: tm.Trimesh, device: str) -> wp.Mesh:
     return wp.Mesh(points=vertices, indices=faces)
 
 
+def numpy_to_warp(
+    vertices_np: np.ndarray, faces_np: np.ndarray, device: str
+) -> tuple[wp.array, wp.array]:
+    """
+    Upload a NumPy mesh as triwarp's ``(wp.array[wp.vec3], flat wp.array[wp.int32])`` pair.
+
+    The single most duplicated helper in this suite: six private copies across six modules and 54
+    call sites, differing only in where the ``float32`` cast sat. It is separate from
+    [`trimesh_to_warp`][tests.conversions.trimesh_to_warp], which returns a ``wp.Mesh`` (a BVH
+    build), because most tests want the raw buffers a triwarp wrapper takes and never touch a
+    ``wp.Mesh``.
+
+    Positions land as **float32**: that is what ``wp.vec3`` holds, and it is the reason a comparison
+    against a float64 reference bottoms out around 1e-7 rather than at machine epsilon.
+
+    Parameters
+    ----------
+    vertices_np
+        ``(n, 3)`` positions, any float dtype.
+    faces_np
+        Vertex indices, ``(n_faces, 3)`` or already flat -- reshaped to triwarp's flat buffer
+        either way.
+    device
+        Warp device for both arrays.
+
+    See Also
+    --------
+    [`warp_to_trimesh`][tests.conversions.warp_to_trimesh]
+        The inverse, for reading a triwarp result back out.
+    [`numpy_to_warp_uv`][tests.conversions.numpy_to_warp_uv]
+        The ``wp.vec2`` form, for the parametrization tests' 2-D vertex buffers.
+    """
+    return (
+        wp.array(np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device),
+        wp.array(
+            np.ascontiguousarray(np.asarray(faces_np).reshape(-1), dtype=np.int32),
+            dtype=wp.int32,
+            device=device,
+        ),
+    )
+
+
+def numpy_to_warp_uv(
+    uv_np: np.ndarray, faces_np: np.ndarray, device: str
+) -> tuple[wp.array, wp.array]:
+    """
+    Upload a 2-D vertex buffer and its faces as ``(wp.array[wp.vec2], flat wp.array[wp.int32])``.
+
+    The [`numpy_to_warp`][tests.conversions.numpy_to_warp] of the parametrization tests, whose
+    "vertices" are UV coordinates in the plane. Separate rather than a ``dtype=`` switch because the
+    two are never interchangeable at a call site: a function taking a UV atlas will not accept
+    positions, and a silently-wrong vector width is exactly the kind of mistake a shared helper
+    should make impossible.
+    """
+    return (
+        wp.array(np.ascontiguousarray(uv_np, dtype=np.float32), dtype=wp.vec2, device=device),
+        wp.array(
+            np.ascontiguousarray(np.asarray(faces_np).reshape(-1), dtype=np.int32),
+            dtype=wp.int32,
+            device=device,
+        ),
+    )
+
+
 def trimesh_to_pymeshlab(mesh: tm.Trimesh, scalars: np.ndarray | None = None) -> ml.MeshSet:
     """
     Wrap a ``tm.Trimesh`` in a fresh single-mesh ``pymeshlab.MeshSet``.
@@ -175,8 +239,30 @@ def faces_igl(mesh: tm.Trimesh) -> np.ndarray:
 
     libigl's Eigen templates are instantiated for 64-bit indices, so handing them trimesh's native
     dtype works by luck rather than contract; several functions crash on int32.
+
+    See Also
+    --------
+    [`mesh_igl`][tests.conversions.mesh_igl]
+        Both halves at once, for the majority of igl calls that take ``(V, F)``.
     """
     return mesh.faces.astype(np.int64)
+
+
+def mesh_igl(mesh: tm.Trimesh) -> tuple[np.ndarray, np.ndarray]:
+    """
+    ``(vertices float64 (n, 3), faces int64 (n_faces, 3))``: the libigl calling convention.
+
+    Most of the bound surface takes both arrays together, so the pair is the useful unit and
+    [`faces_igl`][tests.conversions.faces_igl] is the F-only special case (``igl.adjacency_matrix``,
+    ``igl.vertex_components``, ``igl.is_vertex_manifold``, which size their output by
+    ``F.max() + 1`` rather than by ``len(V)``).
+
+    !!! danger "Never pair these arrays with a *different* mesh's faces"
+        libigl bounds-checks nothing: ``igl.cotmatrix(V, F)`` with one index past the end of ``V``
+        is a SIGSEGV with no traceback, not an exception. Taking both halves from one mesh in one
+        call is the point of this helper.
+    """
+    return np.asarray(mesh.vertices, dtype=np.float64), np.asarray(mesh.faces, dtype=np.int64)
 
 
 def trimesh_to_pyvista(mesh: tm.Trimesh) -> pv.PolyData:

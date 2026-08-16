@@ -12,23 +12,12 @@ import warp as wp
 
 import triwarp as tw
 from tests.comparisons import canonical_winding, lexsort_rows, same_partition
-from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab, trimesh_to_pyvista
-
-
-def _to_wp_mesh(vertices_np: np.ndarray, faces_np: np.ndarray, device: str):
-    vertices_wp = wp.array(
-        np.ascontiguousarray(vertices_np.astype(np.float32)), dtype=wp.vec3, device=device
-    )
-    faces_wp = wp.array(
-        np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
-    )
-    return vertices_wp, faces_wp
-
-
-def _sort_rows(rows: np.ndarray) -> np.ndarray:
-    if rows.size == 0:
-        return rows
-    return rows[np.lexsort(rows.T[::-1])]
+from tests.conversions import (
+    numpy_to_warp,
+    trimesh_to_open3d,
+    trimesh_to_pymeshlab,
+    trimesh_to_pyvista,
+)
 
 
 def _resolve_duplicated_faces_ref(faces_np: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -99,7 +88,7 @@ def _assert_duplicate_vertices_match(
     # triwarp keeps float32 vertices where igl works in float64, so the surviving position sets are
     # compared with a tolerance rather than exactly (exact equality happens to hold for coordinates
     # that are exactly representable, but not for a mesh with irrational ones).
-    assert np.allclose(_sort_rows(sv_wp), _sort_rows(sv_igl), rtol=1e-5, atol=1e-5)
+    assert np.allclose(lexsort_rows(sv_wp), lexsort_rows(sv_igl), rtol=1e-5, atol=1e-5)
     for i, vertex in enumerate(vertices_np):
         assert np.allclose(sv_wp[svj_wp[i]], vertex, rtol=1e-5, atol=1e-5)
     if sf_wp is not None and faces_np is not None and sf_igl is not None:
@@ -144,7 +133,7 @@ def test_remove_unreferenced_extra_vertices(device: str):
     extra = rng.normal(size=(4, 3))
     vertices_full_np = np.vstack([vertices_np, extra])
 
-    vertices_wp, faces_wp = _to_wp_mesh(vertices_full_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_full_np, faces_np, device)
     nv_wp, nf_wp, remap_wp, inverse_wp = tw.repair.remove_unreferenced_vertices(
         vertices_wp, faces_wp, return_inverse=True
     )
@@ -176,7 +165,7 @@ def test_remove_unreferenced_matches_open3d(device: str):
     vertices_full_np = np.insert(referenced_np, [1, 3, 4, 4], rng.normal(size=(4, 3)), axis=0)
     faces_np = np.array([[0, 2, 4], [2, 5, 4]], dtype=np.int32)
 
-    vertices_wp, faces_wp = _to_wp_mesh(vertices_full_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_full_np, faces_np, device)
     nv_wp, nf_wp, _remap_wp = tw.repair.remove_unreferenced_vertices(vertices_wp, faces_wp)
 
     mesh_o3d = trimesh_to_open3d(tm.Trimesh(vertices_full_np, faces_np, process=False))
@@ -191,7 +180,7 @@ def test_remove_unreferenced_matches_open3d(device: str):
 def test_remove_unreferenced_sentinel(device: str):
     vertices_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
     faces_np = np.array([[0, 1, -1], [0, 2, 1]], dtype=np.int32)
-    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
 
     nv_wp, nf_wp, remap_wp = tw.repair.remove_unreferenced_vertices(vertices_wp, faces_wp)
 
@@ -242,7 +231,7 @@ def test_remove_duplicate_vertices_epsilon_negative_coordinates(
     faces_np = np.asarray(mesh_tm.faces, dtype=np.int32)
 
     epsilon = 1e-6
-    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     sv_wp, _, svj_wp, sf_wp = tw.repair.remove_duplicated_vertices(
         vertices_wp, faces_wp, epsilon=epsilon
     )
@@ -257,7 +246,7 @@ def test_remove_duplicate_vertices_faces(device: str):
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64
     )
     faces_np = np.array([[0, 1, 3], [2, 1, 3]], dtype=np.int32)
-    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
 
     sv_wp, _, svj_wp, sf_wp = tw.repair.remove_duplicated_vertices(vertices_wp, faces_wp, 0.0)
     _assert_duplicate_vertices_match(
@@ -449,7 +438,7 @@ def test_make_winding_consistent_matches_igl(icosahedron: tuple[tm.Trimesh, wp.M
     mesh_tm, mesh_wp = icosahedron
     faces_flipped = mesh_tm.faces.copy()
     faces_flipped[::2] = faces_flipped[::2][:, ::-1]
-    _, faces_wp = _to_wp_mesh(mesh_tm.vertices, faces_flipped, mesh_wp.device)
+    _, faces_wp = numpy_to_warp(mesh_tm.vertices, faces_flipped, mesh_wp.device)
 
     oriented_igl, components_igl = igl.bfs_orient(
         np.ascontiguousarray(faces_flipped, dtype=np.int64)
@@ -468,7 +457,7 @@ def test_make_winding_consistent_repairs_flipped(icosahedron: tuple[tm.Trimesh, 
     mesh_tm, mesh_wp = icosahedron
     faces_flipped = mesh_tm.faces.copy()
     faces_flipped[::2] = faces_flipped[::2][:, ::-1]  # reverse winding of half the faces
-    _, faces_wp = _to_wp_mesh(mesh_tm.vertices, faces_flipped, mesh_wp.device)
+    _, faces_wp = numpy_to_warp(mesh_tm.vertices, faces_flipped, mesh_wp.device)
 
     assert tw.validation.is_winding_consistent(faces_wp) is False
     repaired_wp = tw.repair.make_winding_consistent(faces_wp)
@@ -531,7 +520,7 @@ def test_make_winding_consistent_idempotent(icosahedron: tuple[tm.Trimesh, wp.Me
 def test_make_volume_repairs_inversion(request: pytest.FixtureRequest, mesh_name: str) -> None:
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     faces_inward = mesh_tm.faces[:, ::-1].copy()  # reverse every face -> inward normals
-    vertices_wp, faces_wp = _to_wp_mesh(mesh_tm.vertices, faces_inward, mesh_wp.device)
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, faces_inward, mesh_wp.device)
 
     assert tw.validation.is_volume(vertices_wp, faces_wp) is False
     repaired_wp = tw.repair.make_volume(vertices_wp, faces_wp)
@@ -557,7 +546,7 @@ def test_make_normals_outward(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     faces_bad = mesh_tm.faces.copy()
     faces_bad[::2] = faces_bad[::2][:, ::-1]  # inconsistent winding
     faces_bad = faces_bad[:, ::-1]  # then invert everything
-    vertices_wp, faces_wp = _to_wp_mesh(mesh_tm.vertices, faces_bad, mesh_wp.device)
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, faces_bad, mesh_wp.device)
 
     assert tw.validation.is_volume(vertices_wp, faces_wp) is False
     repaired_wp = tw.repair.make_normals_outward(vertices_wp, faces_wp)
@@ -582,7 +571,7 @@ def test_make_volume_multibody(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     # Body A: as-is (outward). Body B: translated and inverted (inward normals).
     vertices_two = np.vstack([vertices_np, vertices_np + np.array([10.0, 0.0, 0.0])])
     faces_two = np.vstack([faces_np, faces_np[:, ::-1] + n_vertices])
-    vertices_wp, faces_wp = _to_wp_mesh(vertices_two, faces_two, mesh_wp.device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_two, faces_two, mesh_wp.device)
 
     body_a = slice(0, 3 * n_faces)
     body_b = slice(3 * n_faces, 6 * n_faces)
@@ -934,7 +923,7 @@ def test_remove_degenerate_faces_matches_trimesh(device: str) -> None:
     faces_np = np.array([[0, 1, 2], [3, 4, 5], [6, 7, 8], [0, 1, 1], [2, 2, 2]], dtype=np.int32)
     vertices_np[8] = vertices_np[6]  # face [6, 7, 8] has two coincident vertices -> zero area
 
-    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     kept_vertices_wp, kept_faces_wp = tw.repair.remove_degenerate_faces(vertices_wp, faces_wp)
 
     mesh_tm = tm.Trimesh(vertices=vertices_np.astype(np.float64), faces=faces_np, process=False)
@@ -958,7 +947,7 @@ def test_remove_degenerate_faces_clean_mesh(icosahedron: tuple[tm.Trimesh, wp.Me
 
 def test_collapse_small_triangles_noop(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     mesh_tm, mesh_wp = icosahedron
-    vertices_wp, faces_wp = _to_wp_mesh(mesh_tm.vertices, mesh_tm.faces, mesh_wp.device)
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, mesh_wp.device)
     out_vertices_wp, out_faces_wp = tw.repair.collapse_small_triangles(
         vertices_wp, faces_wp, epsilon=1e-9
     )
@@ -975,7 +964,7 @@ def test_collapse_small_triangles_removes_sliver(icosahedron: tuple[tm.Trimesh, 
     vertices_np = np.vstack([vertices_np, near_edge]).astype(np.float32)
     faces_np = np.vstack([mesh_tm.faces, [0, 1, vertices_np.shape[0] - 1]]).astype(np.int32)
 
-    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, mesh_wp.device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, mesh_wp.device)
     epsilon = 1e-6
     out_vertices_wp, out_faces_wp = tw.repair.collapse_small_triangles(
         vertices_wp, faces_wp, epsilon=epsilon
@@ -1014,7 +1003,7 @@ def test_collapse_small_triangles_fan_chain(device: str) -> None:
     faces.append([big - 3, big - 2, big - 1])
     faces_np = np.asarray(faces, dtype=np.int32)
 
-    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     epsilon = 1e-3
     out_vertices_wp, out_faces_wp = tw.repair.collapse_small_triangles(
         vertices_wp, faces_wp, epsilon=epsilon
@@ -1100,7 +1089,7 @@ def _worst_aspect(vertices_wp, faces_wp) -> float:
 
 def test_bad_face_mask_flags_the_thin_face(device: str) -> None:
     vertices_np, faces_np = _t_vertex_patch()
-    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     bad_np = tw.repair.bad_face_mask(vertices_wp, faces_wp, min_quality=0.2).numpy()
     # The sliver (1, 4, 2) is the last face, and it is the only thin one.
     assert bad_np[-1]
@@ -1110,7 +1099,7 @@ def test_bad_face_mask_flags_the_thin_face(device: str) -> None:
 def test_bad_face_mask_flags_the_fold(device: str) -> None:
     """Only the *culprit* of a fold is flagged, not the good face on the other side of the edge."""
     vertices_np, faces_np = _folded_patch()
-    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     folded_np = tw.repair.bad_face_mask(
         vertices_wp, faces_wp, min_quality=None, max_fold_angle=160.0
     ).numpy()
@@ -1136,7 +1125,7 @@ def test_bad_face_mask_flags_the_misoriented_face(device: str) -> None:
     target = faces_np.shape[0] // 2
     faces_np[target] = faces_np[target][::-1]
 
-    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     bad_np = tw.repair.bad_face_mask(
         vertices_wp, faces_wp, min_quality=None, max_normal_angle=60.0
     ).numpy()
@@ -1167,7 +1156,7 @@ def test_bad_face_mask_empty(device: str) -> None:
 
 def test_remove_folded_faces_drops_the_fold(device: str) -> None:
     vertices_np, faces_np = _folded_patch()
-    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     kept_vertices_wp, kept_faces_wp = tw.repair.remove_folded_faces(vertices_wp, faces_wp)
     # Only the fold goes, so the flat quad it folded over survives intact.
     assert int(kept_faces_wp.shape[0]) // 3 == 2
@@ -1200,7 +1189,7 @@ def test_remove_folded_faces_matches_pymeshlab_on_which_faces_are_folded(device:
     )
     selected_pml = meshset_pml.current_mesh().face_selection_array()
 
-    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     folded_np = tw.repair.bad_face_mask(
         vertices_wp, faces_wp, min_quality=None, max_fold_angle=160.0
     ).numpy()
@@ -1227,7 +1216,7 @@ def test_remove_folded_faces_empty(device: str) -> None:
 def test_remove_t_vertices_flips_the_sliver(device: str) -> None:
     """The sliver goes, the face count and the vertices stay, and the patch stays manifold."""
     vertices_np, faces_np = _t_vertex_patch()
-    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     before = _worst_aspect(vertices_wp, faces_wp)
     assert before > 40.0  # the fixture really does carry a T-vertex sliver
 
@@ -1263,7 +1252,7 @@ def test_remove_t_vertices_matches_pymeshlab(device: str, mesh_kind: str) -> Non
         sphere_tm = tm.creation.icosphere(subdivisions=3)
         vertices_np, faces_np = np.asarray(sphere_tm.vertices), np.asarray(sphere_tm.faces)
         expect_change = False
-    vertices_wp, faces_wp = _to_wp_mesh(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
 
     meshset_pml = trimesh_to_pymeshlab(tm.Trimesh(vertices_np, faces_np, process=False))
     meshset_pml.meshing_remove_t_vertices(method="Edge Flip", threshold=40.0, repeat=True)
@@ -1283,7 +1272,7 @@ def test_remove_t_vertices_matches_pymeshlab(device: str, mesh_kind: str) -> Non
 def test_remove_t_vertices_leaves_a_clean_mesh_alone(device: str) -> None:
     """No triangle of an icosphere is anywhere near the threshold, so nothing may move."""
     sphere_tm = tm.creation.icosphere(subdivisions=3)
-    vertices_wp, faces_wp = _to_wp_mesh(
+    vertices_wp, faces_wp = numpy_to_warp(
         np.asarray(sphere_tm.vertices), np.asarray(sphere_tm.faces), device
     )
     flipped_wp = tw.repair.remove_t_vertices(vertices_wp, faces_wp)

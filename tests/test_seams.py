@@ -12,24 +12,12 @@ import triwarp as tw
 import triwarp.typing as twt
 from tests.comparisons import lexsort_rows
 from tests.conversions import (
+    numpy_to_warp,
     pyvista_edges_to_indices,
     trimesh_to_pymeshlab,
     trimesh_to_pyvista,
     wedge_uv_to_pymeshlab,
 )
-
-
-def _upload(mesh_tm: tm.Trimesh, device: str):
-    return (
-        wp.array(
-            np.ascontiguousarray(mesh_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-        ),
-        wp.array(
-            np.ascontiguousarray(mesh_tm.faces.reshape(-1), dtype=np.int32),
-            dtype=wp.int32,
-            device=device,
-        ),
-    )
 
 
 def _sorted_edge_set(edges_np: np.ndarray) -> set[tuple[int, int]]:
@@ -50,7 +38,7 @@ def _face_component_count(vertices_wp, faces_wp) -> int:
 def test_crease_edges_finds_a_cube_edges(device: str) -> None:
     """A unit cube has exactly 12 crease edges at 90 degrees, and its 6 face diagonals are flat."""
     box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    vertices_wp, faces_wp = _upload(box_tm, device)
+    vertices_wp, faces_wp = numpy_to_warp(box_tm.vertices, box_tm.faces, device)
     creases_np = tw.seams.crease_edges(vertices_wp, faces_wp, angle=30.0).numpy()
     assert creases_np.shape == (12, 2)
 
@@ -70,7 +58,7 @@ def test_crease_edges_thresholds(device: str) -> None:
     treating it as a synonym for the whole 18-edge set.
     """
     box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    vertices_wp, faces_wp = _upload(box_tm, device)
+    vertices_wp, faces_wp = numpy_to_warp(box_tm.vertices, box_tm.faces, device)
     assert int(tw.seams.crease_edges(vertices_wp, faces_wp, angle=0.0).shape[0]) == 12
     assert int(tw.seams.crease_edges(vertices_wp, faces_wp, angle=89.0).shape[0]) == 12
     assert int(tw.seams.crease_edges(vertices_wp, faces_wp, angle=91.0).shape[0]) == 0
@@ -113,7 +101,7 @@ def test_crease_edges_matches_pyvista(device: str) -> None:
     exactly 12 feature edges, which is asserted before the sets are compared.
     """
     mesh_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    vertices_wp, faces_wp = _upload(mesh_tm, device)
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
 
     edges_pv = pyvista_edges_to_indices(
         trimesh_to_pyvista(mesh_tm).extract_feature_edges(
@@ -166,7 +154,7 @@ def test_cut_along_edges_separates_the_faces_of_a_cube(device: str) -> None:
     and their winding are untouched.
     """
     box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    vertices_wp, faces_wp = _upload(box_tm, device)
+    vertices_wp, faces_wp = numpy_to_warp(box_tm.vertices, box_tm.faces, device)
     creases_wp = tw.seams.crease_edges(vertices_wp, faces_wp, angle=30.0)
 
     cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(vertices_wp, faces_wp, creases_wp)
@@ -179,7 +167,7 @@ def test_cut_along_edges_separates_the_faces_of_a_cube(device: str) -> None:
 def test_cut_along_edges_is_geometrically_a_noop(device: str) -> None:
     """Every output vertex sits exactly where its input did, so the surface is unchanged."""
     box_tm = tm.creation.box(extents=[1.0, 2.0, 3.0])
-    vertices_wp, faces_wp = _upload(box_tm, device)
+    vertices_wp, faces_wp = numpy_to_warp(box_tm.vertices, box_tm.faces, device)
     creases_wp = tw.seams.crease_edges(vertices_wp, faces_wp, angle=30.0)
     cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(vertices_wp, faces_wp, creases_wp)
 
@@ -190,7 +178,7 @@ def test_cut_along_edges_is_geometrically_a_noop(device: str) -> None:
 
 def test_cut_along_edges_with_no_edges_is_the_identity(device: str) -> None:
     box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    vertices_wp, faces_wp = _upload(box_tm, device)
+    vertices_wp, faces_wp = numpy_to_warp(box_tm.vertices, box_tm.faces, device)
     cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(
         vertices_wp, faces_wp, twt.empty_2d((0, 2), wp.int32, device=device)
     )
@@ -204,7 +192,7 @@ def test_cut_along_edges_with_no_edges_is_the_identity(device: str) -> None:
 def test_cut_along_edges_all_interior_edges_gives_a_triangle_soup(device: str) -> None:
     """Cutting everything leaves one vertex per corner: the definition of a soup."""
     sphere_tm = tm.creation.icosphere(subdivisions=2)
-    vertices_wp, faces_wp = _upload(sphere_tm, device)
+    vertices_wp, faces_wp = numpy_to_warp(sphere_tm.vertices, sphere_tm.faces, device)
     all_edges_wp = tw.seams.crease_edges(vertices_wp, faces_wp, angle=0.0)
     cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(vertices_wp, faces_wp, all_edges_wp)
     assert int(cut_vertices_wp.shape[0]) == int(faces_wp.shape[0])
@@ -222,7 +210,7 @@ def test_cut_along_edges_opens_a_boundary(device: str) -> None:
     fixture: each of its four corners then has *two* cut edges and splits in two.
     """
     box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    vertices_wp, faces_wp = _upload(box_tm, device)
+    vertices_wp, faces_wp = numpy_to_warp(box_tm.vertices, box_tm.faces, device)
     assert tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=False)
 
     creases_np = tw.seams.crease_edges(vertices_wp, faces_wp, angle=30.0).numpy()
@@ -247,7 +235,7 @@ def test_cut_along_edges_opens_a_boundary(device: str) -> None:
 def test_cut_along_edges_round_trips_through_a_weld(device: str) -> None:
     """Welding coincident positions undoes the cut exactly — the documented inverse."""
     box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    vertices_wp, faces_wp = _upload(box_tm, device)
+    vertices_wp, faces_wp = numpy_to_warp(box_tm.vertices, box_tm.faces, device)
     creases_wp = tw.seams.crease_edges(vertices_wp, faces_wp, angle=30.0)
     cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(vertices_wp, faces_wp, creases_wp)
 
@@ -283,7 +271,7 @@ def test_cut_along_edges_matches_pymeshlab_topology(device: str) -> None:
         )
     )
 
-    vertices_wp, faces_wp = _upload(box_tm, device)
+    vertices_wp, faces_wp = numpy_to_warp(box_tm.vertices, box_tm.faces, device)
     creases_wp = tw.seams.crease_edges(vertices_wp, faces_wp, angle=angle)
     cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(vertices_wp, faces_wp, creases_wp)
     cut_tm = tm.Trimesh(
@@ -321,7 +309,7 @@ def test_cut_along_edges_matches_igl(device: str) -> None:
     vertices_np = np.ascontiguousarray(box_tm.vertices, dtype=np.float64)
     faces_np = np.ascontiguousarray(box_tm.faces, dtype=np.int64)
 
-    vertices_wp, faces_wp = _upload(box_tm, device)
+    vertices_wp, faces_wp = numpy_to_warp(box_tm.vertices, box_tm.faces, device)
     creases_wp = tw.seams.crease_edges(vertices_wp, faces_wp, angle=30.0)
     cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(vertices_wp, faces_wp, creases_wp)
 

@@ -11,24 +11,22 @@ import warp as wp
 from scipy.spatial import KDTree
 
 import triwarp as tw
+from tests.comparisons import hausdorff_surface_two_sided, undirected_edges
 from tests.conversions import (
     bsr_to_dense,
     faces_igl,
+    numpy_to_warp,
     open3d_to_trimesh,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
     trimesh_to_pyvista,
     trimesh_to_warp,
+    warp_to_trimesh,
 )
 
 
-def _undirected_edges(faces_np: np.ndarray) -> np.ndarray:
-    """Sorted ``(n_faces * 3, 2)`` undirected edges of a ``(n_faces, 3)`` face array."""
-    return np.sort(faces_np[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
-
-
 def _max_edge_length(vertices_np: np.ndarray, faces_np: np.ndarray) -> float:
-    edges = vertices_np[_undirected_edges(faces_np)]
+    edges = vertices_np[undirected_edges(faces_np)]
     return float(np.linalg.norm(edges[:, 0] - edges[:, 1], axis=1).max())
 
 
@@ -559,12 +557,12 @@ def test_subdivide_to_size_crack_free(
     new_v_wp, new_f_wp = tw.remesh.subdivide_to_size(mesh_wp.points, mesh_wp.indices, max_edge)
     new_f_np = new_f_wp.numpy().reshape(-1, 3)
 
-    _, counts = np.unique(_undirected_edges(new_f_np), axis=0, return_counts=True)
+    _, counts = np.unique(undirected_edges(new_f_np), axis=0, return_counts=True)
     assert np.array_equal(counts, np.full(counts.shape, 2)), "T-junctions / cracks introduced"
 
     # Euler characteristic is preserved (no topology change).
     n_v = new_v_wp.numpy().shape[0]
-    n_e = np.unique(_undirected_edges(new_f_np), axis=0).shape[0]
+    n_e = np.unique(undirected_edges(new_f_np), axis=0).shape[0]
     n_f = new_f_np.shape[0]
     assert n_v - n_e + n_f == mesh_tm.euler_number
 
@@ -697,7 +695,7 @@ def test_subdivide_to_size_sizing_field(device: str) -> None:
 
     # The field on the refined mesh: an inserted midpoint carries the mean of what it split, which
     # is the value the nearest original vertex reports for a field this smooth.
-    pairs = np.unique(np.sort(_undirected_edges(faces_np), axis=1), axis=0)
+    pairs = np.unique(np.sort(undirected_edges(faces_np), axis=1), axis=0)
     lengths = np.linalg.norm(points_np[pairs[:, 0]] - points_np[pairs[:, 1]], axis=1)
     midpoints = points_np[pairs].mean(axis=1)
     targets = field_np[KDTree(sphere_tm.vertices).query(midpoints)[1]]
@@ -918,7 +916,7 @@ def _filled_hemisphere(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
 
 
 def _region_max_edge(vertices_np, faces_np, region_np):
-    edges = _undirected_edges(faces_np)
+    edges = undirected_edges(faces_np)
     face_of_edge = np.repeat(np.arange(faces_np.shape[0]), 3)
     lengths = np.linalg.norm(vertices_np[edges[:, 0]] - vertices_np[edges[:, 1]], axis=1)
     in_region = region_np[face_of_edge]
@@ -938,7 +936,7 @@ def test_subdivide_region_crack_free(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     max_edge = 0.3 * _region_max_edge(v.numpy(), f.numpy().reshape(-1, 3), region.numpy())
     _, nf, _ = tw.remesh.subdivide_region_to_size(v, f, region, max_edge=max_edge)
     faces_np = nf.numpy().reshape(-1, 3)
-    edges = _undirected_edges(faces_np)
+    edges = undirected_edges(faces_np)
     _, counts = np.unique(edges, axis=0, return_counts=True)
     # Filled hemisphere is closed: every undirected edge is shared by exactly two faces.
     assert np.array_equal(np.unique(counts), np.array([2]))
@@ -993,12 +991,11 @@ def test_subdivide_region_max_splits_takes_the_longest_edges(
     vertices_np, faces_np, region_np = v.numpy(), f.numpy().reshape(-1, 3), region.numpy()
     max_edge = 0.2 * _region_max_edge(vertices_np, faces_np, region_np)
 
-    edges_np = np.unique(np.sort(_undirected_edges(faces_np), axis=1), axis=0)
+    edges_np = np.unique(np.sort(undirected_edges(faces_np), axis=1), axis=0)
     lengths_np = np.linalg.norm(vertices_np[edges_np[:, 0]] - vertices_np[edges_np[:, 1]], axis=1)
     face_of_edge = np.repeat(np.arange(faces_np.shape[0]), 3)
     region_edges = {
-        tuple(edge)
-        for edge in np.sort(_undirected_edges(faces_np), axis=1)[region_np[face_of_edge]]
+        tuple(edge) for edge in np.sort(undirected_edges(faces_np), axis=1)[region_np[face_of_edge]]
     }
     eligible = np.array([tuple(edge) in region_edges for edge in edges_np], dtype=bool) & (
         lengths_np > max_edge
@@ -1090,7 +1087,7 @@ def test_flip_to_delaunay_reduces_violations(hemisphere: tuple[tm.Trimesh, wp.Me
     assert after <= before
     # Face count unchanged; mesh stays closed.
     assert int(flipped.shape[0]) == int(nf.shape[0])
-    edges = _undirected_edges(flipped.numpy().reshape(-1, 3))
+    edges = undirected_edges(flipped.numpy().reshape(-1, 3))
     _, counts = np.unique(edges, axis=0, return_counts=True)
     assert np.array_equal(np.unique(counts), np.array([2]))
 
@@ -1182,31 +1179,17 @@ def test_flip_topology_drops_non_manifold_edges_like_face_adjacency(device: str)
 # ======================================================================================
 
 
-def _mesh_arrays(mesh_wp: wp.Mesh) -> tuple[np.ndarray, np.ndarray]:
-    return mesh_wp.points.numpy().astype(np.float64), mesh_wp.indices.numpy().reshape(-1, 3)
-
-
 def _edge_lengths(vertices_np: np.ndarray, faces_np: np.ndarray) -> np.ndarray:
-    edges = vertices_np[np.unique(_undirected_edges(faces_np), axis=0)]
+    edges = vertices_np[np.unique(undirected_edges(faces_np), axis=0)]
     return np.linalg.norm(edges[:, 0] - edges[:, 1], axis=1)
 
 
 def _valences(faces_np: np.ndarray, n_vertices: int) -> np.ndarray:
-    edges = np.unique(_undirected_edges(faces_np), axis=0)
+    edges = np.unique(undirected_edges(faces_np), axis=0)
     valence = np.zeros(n_vertices, dtype=np.int64)
     np.add.at(valence, edges[:, 0], 1)
     np.add.at(valence, edges[:, 1], 1)
     return valence
-
-
-def _two_sided_hausdorff(va: np.ndarray, fa: np.ndarray, vb: np.ndarray, fb: np.ndarray) -> float:
-    mesh_a = tm.Trimesh(va, fa, process=False)
-    mesh_b = tm.Trimesh(vb, fb, process=False)
-    sample_a, _ = tm.sample.sample_surface(mesh_a, 5000, seed=0)
-    sample_b, _ = tm.sample.sample_surface(mesh_b, 5000, seed=1)
-    a_to_b = np.abs(tm.proximity.signed_distance(mesh_b, sample_a)).max()
-    b_to_a = np.abs(tm.proximity.signed_distance(mesh_a, sample_b)).max()
-    return float(max(a_to_b, b_to_a))
 
 
 def _meshlib_remesh_spread(vertices_np: np.ndarray, faces_np: np.ndarray, target: float) -> float:
@@ -1402,7 +1385,7 @@ def test_remesh_surface_distance_bounded(device: str) -> None:
     out_vertices, out_faces = tw.remesh.isotropic_remesh(
         vertices_wp, faces_wp, target_length=target, iterations=10
     )
-    hausdorff = _two_sided_hausdorff(
+    hausdorff = hausdorff_surface_two_sided(
         sphere.vertices,
         sphere.faces,
         out_vertices.numpy().astype(np.float64),
@@ -1449,7 +1432,7 @@ def test_remesh_boundary_preservation(hemisphere: tuple[tm.Trimesh, wp.Mesh]) ->
     _mesh_tm, mesh_wp = hemisphere
     vertices_wp = wp.clone(mesh_wp.points)
     faces_wp = wp.clone(mesh_wp.indices)
-    n_loops_before = len(tm.Trimesh(*_mesh_arrays(mesh_wp), process=False).outline().entities)
+    n_loops_before = len(warp_to_trimesh(mesh_wp.points, mesh_wp.indices).outline().entities)
     target = 0.5 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
 
     out_vertices, out_faces = tw.remesh.isotropic_remesh(
@@ -1746,7 +1729,7 @@ def test_cluster_decimate_stays_near_the_input_surface(device: str) -> None:
     decimated_vertices_wp, decimated_faces_wp = tw.remesh.cluster_decimate(
         vertices_wp, faces_wp, voxel_size=voxel_size
     )
-    deviation = _two_sided_hausdorff(
+    deviation = hausdorff_surface_two_sided(
         np.asarray(sphere_tm.vertices),
         np.asarray(sphere_tm.faces),
         decimated_vertices_wp.numpy().astype(np.float64),
@@ -1860,17 +1843,6 @@ def _saddle_grid(n: int = 16, step: float = 0.15) -> tuple[np.ndarray, np.ndarra
     return vertices, np.ascontiguousarray(faces, dtype=np.int32)
 
 
-def _upload(vertices_np: np.ndarray, faces_np: np.ndarray, device: str):
-    return (
-        wp.array(np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device),
-        wp.array(
-            np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32),
-            dtype=wp.int32,
-            device=device,
-        ),
-    )
-
-
 def _min_quality(vertices_wp, faces_wp, metric: str = "area_max_side") -> float:
     return float(tw.triangles.face_quality(vertices_wp, faces_wp, metric=metric).numpy().min())
 
@@ -1884,7 +1856,7 @@ def _total_bend(vertices_np: np.ndarray, faces_np: np.ndarray) -> float:
 def test_flip_by_objective_planarity_improves_the_worst_triangle(device: str) -> None:
     """Every quad of a flat sheared grid has a better diagonal, and the flip must take it."""
     vertices_np, faces_np = _sheared_grid()
-    vertices_wp, faces_wp = _upload(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     before = _min_quality(vertices_wp, faces_wp)
 
     flipped_wp = tw.remesh.flip_by_objective(vertices_wp, faces_wp, objective="planarity")
@@ -1917,8 +1889,8 @@ def test_flip_by_objective_planarity_at_least_matches_pymeshlab(device: str) -> 
     faces_pml = meshset_pml.current_mesh().face_matrix()
     assert faces_pml.shape[0] == faces_np.shape[0]
 
-    vertices_wp, faces_wp = _upload(vertices_np, faces_np, device)
-    _vertices_pml_wp, faces_pml_wp = _upload(vertices_np, faces_pml, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    _vertices_pml_wp, faces_pml_wp = numpy_to_warp(vertices_np, faces_pml, device)
     flipped_wp = tw.remesh.flip_by_objective(vertices_wp, faces_wp, objective="planarity")
     assert _min_quality(vertices_wp, flipped_wp) >= 0.9 * _min_quality(vertices_wp, faces_pml_wp)
 
@@ -1935,7 +1907,7 @@ def test_flip_by_objective_planarity_refuses_a_curved_quad(device: str) -> None:
 def test_flip_by_objective_curvature_flattens(device: str) -> None:
     """The curvature objective must lower the total absolute dihedral angle."""
     vertices_np, faces_np = _saddle_grid()
-    vertices_wp, faces_wp = _upload(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     before = _total_bend(vertices_np, faces_np)
 
     flipped_wp = tw.remesh.flip_by_objective(vertices_wp, faces_wp, objective="curvature")
@@ -1964,7 +1936,7 @@ def test_flip_by_objective_curvature_leaves_a_sphere_alone(device: str) -> None:
 def test_flip_by_objective_region_gated(device: str) -> None:
     """Faces outside the region keep their edges, so the flip count can only go down."""
     vertices_np, faces_np = _sheared_grid()
-    vertices_wp, faces_wp = _upload(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     n_faces = int(faces_wp.shape[0]) // 3
     region_np = np.zeros(n_faces, dtype=bool)
     region_np[: n_faces // 4] = True
@@ -2049,16 +2021,16 @@ def test_quadric_decimate_beats_igl_and_open3d_on_deviation(device: str, target_
     )
     assert int(decimated_faces_wp.shape[0]) // 3 == target_faces
 
-    deviation_wp = _two_sided_hausdorff(
+    deviation_wp = hausdorff_surface_two_sided(
         vertices_np,
         np.asarray(sphere_tm.faces),
         decimated_vertices_wp.numpy().astype(np.float64),
         decimated_faces_wp.numpy().reshape(-1, 3),
     )
-    deviation_igl = _two_sided_hausdorff(
+    deviation_igl = hausdorff_surface_two_sided(
         vertices_np, np.asarray(sphere_tm.faces), igl_tm.vertices, igl_tm.faces
     )
-    deviation_o3d = _two_sided_hausdorff(
+    deviation_o3d = hausdorff_surface_two_sided(
         vertices_np, np.asarray(sphere_tm.faces), o3d_tm.vertices, o3d_tm.faces
     )
     assert deviation_wp <= 1.2 * min(deviation_igl, deviation_o3d)
@@ -2104,7 +2076,9 @@ def test_quadric_decimate_keeps_the_features_of_a_cube(device: str) -> None:
     is invariant to *which* particular collapses happened.
     """
     box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0]).subdivide().subdivide().subdivide()
-    vertices_wp, faces_wp = _upload(np.asarray(box_tm.vertices), np.asarray(box_tm.faces), device)
+    vertices_wp, faces_wp = numpy_to_warp(
+        np.asarray(box_tm.vertices), np.asarray(box_tm.faces), device
+    )
     decimated_vertices_wp, decimated_faces_wp = tw.remesh.quadric_decimate(
         vertices_wp, faces_wp, target_ratio=0.1
     )
@@ -2146,13 +2120,13 @@ def test_quadric_decimate_reaches_pymeshlab_quality(device: str) -> None:
         vertices_wp, faces_wp, target_faces=target_faces
     )
     vertices_np = np.ascontiguousarray(sphere_tm.vertices, dtype=np.float64)
-    deviation_wp = _two_sided_hausdorff(
+    deviation_wp = hausdorff_surface_two_sided(
         vertices_np,
         np.asarray(sphere_tm.faces),
         decimated_vertices_wp.numpy().astype(np.float64),
         decimated_faces_wp.numpy().reshape(-1, 3),
     )
-    deviation_pml = _two_sided_hausdorff(
+    deviation_pml = hausdorff_surface_two_sided(
         vertices_np, np.asarray(sphere_tm.faces), pml_tm.vertices, pml_tm.faces
     )
     assert deviation_wp <= 1.2 * deviation_pml
@@ -2201,13 +2175,13 @@ def test_quadric_decimate_stays_within_the_pyvista_band(device: str, target_face
     )
     assert int(decimated_faces_wp.shape[0]) // 3 == target_faces
 
-    deviation_wp = _two_sided_hausdorff(
+    deviation_wp = hausdorff_surface_two_sided(
         vertices_np,
         faces_np,
         decimated_vertices_wp.numpy().astype(np.float64),
         decimated_faces_wp.numpy().reshape(-1, 3),
     )
-    deviation_pv = _two_sided_hausdorff(vertices_np, faces_np, pv_tm.vertices, pv_tm.faces)
+    deviation_pv = hausdorff_surface_two_sided(vertices_np, faces_np, pv_tm.vertices, pv_tm.faces)
     assert deviation_pv > 0.0
     assert deviation_wp <= 2.0 * deviation_pv
 
@@ -2216,7 +2190,7 @@ def test_quadric_decimate_stays_within_the_pyvista_band(device: str, target_face
         target_number_of_triangles=target_faces
     )
     o3d_tm = open3d_to_trimesh(mesh_o3d)
-    assert deviation_wp <= 1.2 * _two_sided_hausdorff(
+    assert deviation_wp <= 1.2 * hausdorff_surface_two_sided(
         vertices_np, faces_np, o3d_tm.vertices, o3d_tm.faces
     )
 

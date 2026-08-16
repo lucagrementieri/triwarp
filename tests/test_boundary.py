@@ -10,7 +10,7 @@ import trimesh.grouping as tm_grouping
 import warp as wp
 
 import triwarp as tw
-from tests.comparisons import assert_cyclic_permutation_equal
+from tests.comparisons import assert_cyclic_permutation_equal, lexsort_rows
 from tests.conversions import pyvista_edges_to_indices, trimesh_to_pymeshlab, trimesh_to_pyvista
 
 # Open-surface fixtures that actually have a boundary (watertight solids do not).
@@ -25,9 +25,7 @@ def test_boundary_edges(request: pytest.FixtureRequest, mesh_name: str) -> None:
     boundary_edges_tm = mesh_tm.edges_sorted[_boundary_indices_tm(mesh_tm)]
     boundary_edges_wp = tw.boundary.boundary_edges(mesh_wp.points, mesh_wp.indices)
 
-    assert np.array_equal(
-        _lexsort_rows(boundary_edges_wp.numpy()), _lexsort_rows(boundary_edges_tm)
-    )
+    assert np.array_equal(lexsort_rows(boundary_edges_wp.numpy()), lexsort_rows(boundary_edges_tm))
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
@@ -38,9 +36,7 @@ def test_oriented_boundary_edges(request: pytest.FixtureRequest, mesh_name: str)
     oriented_edges_wp = tw.boundary.oriented_boundary_edges(mesh_wp.points, mesh_wp.indices)
 
     # Directed edges: compare as a set without sorting within each row.
-    assert np.array_equal(
-        _lexsort_rows(oriented_edges_wp.numpy()), _lexsort_rows(oriented_edges_tm)
-    )
+    assert np.array_equal(lexsort_rows(oriented_edges_wp.numpy()), lexsort_rows(oriented_edges_tm))
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
@@ -101,7 +97,7 @@ def test_boundary_edges_match_pyvista(request: pytest.FixtureRequest, mesh_name:
     assert len(edges_pv) > 0
 
     boundary_edges_wp = tw.boundary.boundary_edges(mesh_wp.points, mesh_wp.indices)
-    assert np.array_equal(_lexsort_rows(boundary_edges_wp.numpy()), _lexsort_rows(edges_pv))
+    assert np.array_equal(lexsort_rows(boundary_edges_wp.numpy()), lexsort_rows(edges_pv))
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
@@ -127,7 +123,7 @@ def test_boundary_precomputed_edges(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> N
         mesh_wp.points, mesh_wp.indices, edges_sorted=edges_sorted_wp
     )
     assert np.array_equal(
-        _lexsort_rows(boundary_default.numpy()), _lexsort_rows(boundary_precomputed.numpy())
+        lexsort_rows(boundary_default.numpy()), lexsort_rows(boundary_precomputed.numpy())
     )
 
     oriented_default = tw.boundary.oriented_boundary_edges(mesh_wp.points, mesh_wp.indices)
@@ -135,7 +131,7 @@ def test_boundary_precomputed_edges(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> N
         mesh_wp.points, mesh_wp.indices, edges_sorted=edges_sorted_wp, edges=edges_wp
     )
     assert np.array_equal(
-        _lexsort_rows(oriented_default.numpy()), _lexsort_rows(oriented_precomputed.numpy())
+        lexsort_rows(oriented_default.numpy()), lexsort_rows(oriented_precomputed.numpy())
     )
 
     indices_default = tw.boundary.boundary_vertex_indices(mesh_wp.points, mesh_wp.indices)
@@ -319,9 +315,9 @@ def test_boundary_edges_match_igl(request: pytest.FixtureRequest, mesh_name: str
     oriented_wp = tw.boundary.oriented_boundary_edges(mesh_wp.points, mesh_wp.indices)
 
     assert np.array_equal(
-        _lexsort_rows(boundary_edges_wp.numpy()), _lexsort_rows(np.sort(edges_igl, axis=1))
+        lexsort_rows(boundary_edges_wp.numpy()), lexsort_rows(np.sort(edges_igl, axis=1))
     )
-    assert np.array_equal(_lexsort_rows(oriented_wp.numpy()), _lexsort_rows(edges_igl))
+    assert np.array_equal(lexsort_rows(oriented_wp.numpy()), lexsort_rows(edges_igl))
 
 
 @pytest.mark.parametrize(
@@ -382,7 +378,7 @@ def test_ears_match_igl(device: str, faces_np: np.ndarray, expected_ears: int) -
 
     pairs_igl = np.stack([ear_igl, (ear_opp_igl + 1) % 3], axis=1)
     pairs_wp = np.stack([ear_wp.numpy(), ear_opp_wp.numpy()], axis=1)
-    assert np.array_equal(_lexsort_rows(pairs_wp), _lexsort_rows(pairs_igl))
+    assert np.array_equal(lexsort_rows(pairs_wp), lexsort_rows(pairs_igl))
 
     oriented_boundary = tw.boundary.oriented_boundary_edges(vertices_wp, faces_wp)
     boundary_set = {tuple(row) for row in oriented_boundary.numpy()}
@@ -425,12 +421,6 @@ def test_ears_empty(device: str) -> None:
     ear_wp, ear_opp_wp = tw.boundary.ears(faces_wp)
     assert ear_wp.shape == (0,)
     assert ear_opp_wp.shape == (0,)
-
-
-def _lexsort_rows(rows: np.ndarray) -> np.ndarray:
-    """Sort ``(n, 2)`` rows lexicographically (rows kept intact) for set comparison."""
-    order = np.lexsort((rows[:, 1], rows[:, 0]))
-    return rows[order]
 
 
 def _boundary_indices_tm(mesh_tm: tm.Trimesh) -> np.ndarray:

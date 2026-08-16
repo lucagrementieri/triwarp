@@ -41,8 +41,15 @@ def lexsort_rows(rows_np: np.ndarray) -> np.ndarray:
     triwarp's parallel construction and a reference's serial one both produce the right set in
     different orders. Note this canonicalises the row *order*, not the entries within a row; sort
     those first (``np.sort(edges, axis=1)``) when the pair itself is undirected.
+
+    An empty input is returned unchanged. ``np.lexsort`` raises ``TypeError: need sequence of keys
+    with len > 0`` on anything with no *columns* -- a bare ``(0,)`` or a ``(3, 0)`` -- which is
+    reachable from any test whose mesh has no edges or no boundary, and is why two of the five
+    private copies this replaced carried the guard and three did not.
     """
     rows_np = np.asarray(rows_np)
+    if rows_np.size == 0:
+        return rows_np
     return rows_np[np.lexsort(rows_np.T[::-1])]
 
 
@@ -53,6 +60,64 @@ def assert_unordered_rows_equal(rows_a: np.ndarray, rows_b: np.ndarray) -> None:
         f"row counts differ: {sorted_a.shape} vs {sorted_b.shape}"
     )
     assert np.array_equal(sorted_a, sorted_b)
+
+
+def undirected_edges(faces_np: np.ndarray) -> np.ndarray:
+    """
+    Build the ``(n_faces * 3, 2)`` undirected edge list of a face array, each row min-first.
+
+    The single most re-derived line in this suite -- eight sites across six files spelled it three
+    different ways -- and the one that has to agree with itself, because every topological reference
+    quantity below is a reduction of it. Rows repeat: an interior edge appears twice and a boundary
+    edge once, which is the signal
+    [`edge_multiplicity`][tests.comparisons.edge_multiplicity] reads. Deduplicate with
+    ``np.unique(..., axis=0)`` when the *set* is what is wanted.
+
+    Parameters
+    ----------
+    faces_np
+        ``(n_faces, 3)`` vertex indices. A flat triwarp face buffer needs ``.reshape(-1, 3)`` first.
+    """
+    return np.sort(np.asarray(faces_np)[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+
+
+def edge_multiplicity(faces_np: np.ndarray) -> np.ndarray:
+    """
+    Incident-face count per distinct undirected edge, as a flat array of counts.
+
+    ``1`` is a boundary edge, ``2`` an interior one and ``>= 3`` a non-manifold one, so a single
+    ``np.unique`` answers every edge-topology question a reference comparison asks. The counts are
+    in ``np.unique``'s sorted-edge order, which is why this returns the counts alone -- anything
+    needing the edges beside them should call ``np.unique`` on
+    [`undirected_edges`][tests.comparisons.undirected_edges] directly.
+    """
+    return np.unique(undirected_edges(faces_np), axis=0, return_counts=True)[1]
+
+
+def euler_characteristic(faces_np: np.ndarray) -> int:
+    """
+    ``V - E + F`` of a face array, counting only the vertices some face references.
+
+    Ignoring unreferenced vertices is deliberate and is what makes this comparable with a
+    reference's answer: an isolated vertex is not part of the surface whose topology is under test,
+    and several libraries drop them silently on the way in (CLAUDE.md section 6 on igl's
+    ``F.max() + 1`` family). Pass the mesh's own vertex count instead of using this if the
+    unreferenced ones are the thing being measured.
+    """
+    faces_np = np.asarray(faces_np)
+    n_vertices = len(np.unique(faces_np))
+    n_edges = len(np.unique(undirected_edges(faces_np), axis=0))
+    return n_vertices - n_edges + int(faces_np.shape[0])
+
+
+def open_edge_count(faces_np: np.ndarray) -> int:
+    """
+    Count the undirected edges with exactly one incident face -- the boundary edges.
+
+    Note this is *not* pyvista's ``n_open_edges``, which counts boundary **plus** non-manifold edges
+    and reads 7 where this reads 6 on three faces sharing one edge (CLAUDE.md section 6).
+    """
+    return int((edge_multiplicity(faces_np) == 1).sum())
 
 
 def canonical_labels(labels_np: np.ndarray) -> np.ndarray:
@@ -248,6 +313,8 @@ def symmetric_surface_distance(
     --------
     [`symmetric_chamfer`][tests.comparisons.symmetric_chamfer]
         The sample-to-sample form, and its noise floor.
+    [`hausdorff_surface_two_sided`][tests.comparisons.hausdorff_surface_two_sided]
+        The worst-case-only form of this same claim, taking ``(vertices, faces)`` pairs.
     [`hausdorff_two_sided`][tests.comparisons.hausdorff_two_sided]
         Worst-case distance between two bare point sets, when there is no surface to query.
     """
@@ -267,7 +334,69 @@ def hausdorff_two_sided(points_a: np.ndarray, points_b: np.ndarray) -> float:
     Where [`symmetric_chamfer`][tests.comparisons.symmetric_chamfer] averages and so tolerates a few
     stray elements, this reports the single worst one. Use it when the claim is "no part of either
     answer is far from the other", e.g. comparing intersection curves or sliced boundaries.
+
+    Goes through a ``cKDTree`` rather than a dense ``(n, m)`` distance matrix. That is the same
+    answer at a fraction of the memory, and it is why the private copy it replaced in
+    ``tests/test_intersection.py`` is gone: two curve samples of a few thousand points each is an
+    eight-figure matrix for one scalar.
+
+    See Also
+    --------
+    [`hausdorff_surface_two_sided`][tests.comparisons.hausdorff_surface_two_sided]
+        The same worst-case statement between two *surfaces*, which needs no correspondence between
+        the meshes and no shared vertex count.
     """
     a = np.asarray(points_a, dtype=np.float64)
     b = np.asarray(points_b, dtype=np.float64)
     return float(max(cKDTree(b).query(a)[0].max(), cKDTree(a).query(b)[0].max()))
+
+
+def hausdorff_surface_two_sided(
+    vertices_a: np.ndarray,
+    faces_a: np.ndarray,
+    vertices_b: np.ndarray,
+    faces_b: np.ndarray,
+    n_samples: int = 5000,
+) -> float:
+    """
+    Worst-case two-sided distance between two mesh *surfaces*, via surface sampling.
+
+    The claim is "no part of either surface is far from the other" -- the statement a remeshing or
+    decimation test wants, where the output has a different vertex count, a different triangulation
+    and no correspondence at all with its input, so only a set distance can be asserted.
+
+    Distinct from [`hausdorff_two_sided`][tests.comparisons.hausdorff_two_sided] despite the name:
+    that one is point-set to point-set and this one measures each sample against the other mesh's
+    surface, so a coarse triangulation is not penalised for having few vertices. It is the
+    worst-case half of
+    [`symmetric_surface_distance`][tests.comparisons.symmetric_surface_distance], kept separate
+    because it queries through ``trimesh.proximity.signed_distance`` and the thresholds in
+    ``tests/test_remesh.py`` are calibrated against these exact numbers.
+
+    !!! warning "``signed_distance`` wants a closed mesh"
+        The sign comes from a containment test, so on an open surface the magnitude is still the
+        distance but the query is doing more work than it needs to. Prefer
+        [`symmetric_surface_distance`][tests.comparisons.symmetric_surface_distance] for a new
+        comparison on open input.
+
+    Parameters
+    ----------
+    vertices_a, faces_a, vertices_b, faces_b
+        The two meshes, as ``(n, 3)`` positions and ``(n_faces, 3)`` indices. Arrays rather than
+        ``tm.Trimesh`` because every caller holds a raw pair straight out of triwarp, igl, open3d or
+        pymeshlab, and building a mesh at each call site would be noise.
+    n_samples
+        Area-uniform samples drawn per mesh, at fixed seeds so the result is reproducible.
+
+    Returns
+    -------
+    float
+        The larger of the two one-sided worst-case distances.
+    """
+    mesh_a = tm.Trimesh(vertices_a, faces_a, process=False)
+    mesh_b = tm.Trimesh(vertices_b, faces_b, process=False)
+    sample_a, _ = tm.sample.sample_surface(mesh_a, n_samples, seed=0)
+    sample_b, _ = tm.sample.sample_surface(mesh_b, n_samples, seed=1)
+    a_to_b = np.abs(tm.proximity.signed_distance(mesh_b, sample_a)).max()
+    b_to_a = np.abs(tm.proximity.signed_distance(mesh_a, sample_b)).max()
+    return float(max(a_to_b, b_to_a))

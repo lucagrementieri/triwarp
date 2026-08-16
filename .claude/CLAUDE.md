@@ -360,15 +360,16 @@ All new geometry functions MUST have regression tests that compare against the `
   ```
 - Use the `device` fixture from `tests/conftest.py` (runs on `cuda:0` if available, else `cpu`). Every test function must accept `device` as a parameter.
 - Generate reproducible random data with `np.random.default_rng(seed)` (use a fixed integer seed per test).
-- Convert triangle-soup arrays `(n, 3, 3)` to an indexed mesh before passing to Warp:
+- **Upload a NumPy mesh with `conversions.numpy_to_warp(vertices_np, faces_np, device)`**, never a
+  local helper. This section used to *print the body* of one, and the result was six private copies
+  across six modules at 54 call sites, differing only in where the `float32` cast sat — printing an
+  implementation is an invitation to paste it. Its `wp.vec2` sibling is `numpy_to_warp_uv`, for the
+  parametrization tests' 2-D vertex buffers, and the inverse is `warp_to_trimesh`. Triangle-soup
+  arrays `(n, 3, 3)` become an indexed mesh first:
   ```python
-  def _triangle_soup_to_vertices_faces_wp(tri_np, device):
-      n = tri_np.shape[0]
-      vertices = tri_np.reshape(-1, 3).astype(np.float64)
-      faces = np.arange(n * 3, dtype=np.int32)
-      v_wp = wp.array(np.ascontiguousarray(vertices), dtype=wp.vec3, device=device)
-      f_wp = wp.array(faces, dtype=wp.int32, device=device)
-      return v_wp, f_wp
+  vertices_wp, faces_wp = numpy_to_warp(
+      tri_np.reshape(-1, 3), np.arange(tri_np.shape[0] * 3, dtype=np.int32), device
+  )
   ```
 - Call `.numpy()` on Warp output arrays before passing to NumPy comparison functions. Use it inline, and not defining a new variable.
 - Use `np.allclose(got, exp, rtol=1e-5, atol=1e-5)` for floating-point results.
@@ -730,13 +731,17 @@ local edge differently, `triwarp_opp == (igl_opp + 1) % 3`). So: assert the refe
 non-empty answer, or assert its expected count, before comparing to it — and treat "this function is
 already the oracle in tests/" as no evidence at all that the comparison is live.
 
-Reuse `tests/comparisons.py` (`lexsort_rows`, `assert_unordered_rows_equal`, `canonical_labels`,
+Reuse `tests/comparisons.py` (`lexsort_rows`, `assert_unordered_rows_equal`, `undirected_edges`,
+`edge_multiplicity`, `euler_characteristic`, `open_edge_count`, `canonical_labels`,
 `same_partition`, `canonical_winding`, `assert_same_up_to_sign`, `assert_cyclic_permutation_equal`,
-`fraction_within`, `symmetric_chamfer`, `hausdorff_two_sided`) and `tests/conversions.py`
-(`trimesh_to_open3d`, `points_to_open3d`, `open3d_to_trimesh`, `trimesh_to_open3d_t`,
-`trimesh_to_pymeshlab`, `warp_to_pymeshlab`, `points_to_pymeshlab`, `trimesh_to_pyvista`,
-`points_to_pyvista`, `pyvista_edges_to_indices`, `warp_to_trimesh`, `faces_igl`) rather than
-re-rolling either. `canonical_labels` is the label-packing transform every component comparison
+`fraction_within`, `symmetric_chamfer`, `symmetric_surface_distance`, `hausdorff_two_sided`,
+`hausdorff_surface_two_sided`) and `tests/conversions.py` (`numpy_to_warp`, `numpy_to_warp_uv`,
+`trimesh_to_warp`, `warp_to_trimesh`, `trimesh_to_open3d`, `points_to_open3d`, `open3d_to_trimesh`,
+`trimesh_to_open3d_t`, `trimesh_to_pymeshlab`, `warp_to_pymeshlab`, `points_to_pymeshlab`,
+`trimesh_to_pyvista`, `points_to_pyvista`, `pyvista_edges_to_indices`, `faces_igl`, `mesh_igl`)
+rather than re-rolling either. **Check both modules before writing a private helper in a test
+file** — every one of the six consolidated in 2026-08 was written by someone who did not, and
+`undirected_edges` alone had been spelled three different ways across six files. `canonical_labels` is the label-packing transform every component comparison
 needs — triwarp names a component after a representative element, igl and scipy number `0..k-1` in
 their own traversal orders and VTK's `RegionId` numbers them in a third, so only the *partition* is
 shared. `open3d` and `pyvista` are hard test dependencies like `pymeshlab` and `igl` — import them

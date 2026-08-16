@@ -21,14 +21,9 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import bsr_to_csr
+from tests.conversions import bsr_to_csr, mesh_igl
 
 _MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
-
-
-def _mesh_numpy(mesh_tm: tm.Trimesh) -> tuple[np.ndarray, np.ndarray]:
-    """``(vertices float64 (n, 3), faces int64 (n_faces, 3))`` for the libigl references."""
-    return np.asarray(mesh_tm.vertices, dtype=np.float64), np.asarray(mesh_tm.faces, dtype=np.int64)
 
 
 def _upload_bsr_float64(
@@ -302,7 +297,7 @@ def test_operator_family_empty_mesh(device: str) -> None:
 def test_lscm_hessian_matches_igl(request, device, mesh_name):
     # No CPU skip: this builds the Hessian only, no conjugate-gradient solve.
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    vertices_np, faces_np = _mesh_numpy(mesh_tm)
+    vertices_np, faces_np = mesh_igl(mesh_tm)
     n_vertices = int(mesh_wp.points.shape[0])
 
     # igl.lscm returns (V_uv, Q); its Q equals -repdiag(L, 2) - 2A exactly.
@@ -323,7 +318,7 @@ def test_lscm_hessian_matches_igl(request, device, mesh_name):
 def test_vector_area_matrix_matches_igl_derived(request, device, mesh_name):
     # The bindings do not expose vector_area_matrix; derive it from A = (-repdiag(L,2) - Q) / 2.
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    vertices_np, faces_np = _mesh_numpy(mesh_tm)
+    vertices_np, faces_np = mesh_igl(mesh_tm)
     n_vertices = int(mesh_wp.points.shape[0])
 
     pins_np = np.array([0, 1], dtype=np.int64)

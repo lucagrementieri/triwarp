@@ -89,19 +89,13 @@ def test_unique_1d_inverse_counts(device: str):
     assert np.array_equal(counts_wp.numpy(), counts_np)
 
 
-def _sort_rows_lex(rows: np.ndarray) -> np.ndarray:
-    if rows.size == 0:
-        return rows
-    return rows[np.lexsort(rows.T[::-1])]
-
-
 def test_unique_rows_int32(device: str):
     data_np = np.array([[1, 2, 3], [4, 5, 6], [1, 2, 3], [4, 5, 7]], dtype=np.int32)
     data_wp = wp.array(data_np, dtype=wp.int32, device=device)
     unique_wp, inverse_wp = tw.grouping.unique_rows(data_wp, return_inverse=True)
 
     unique_np = np.unique(data_np, axis=0)
-    assert np.array_equal(_sort_rows_lex(unique_wp.numpy()), _sort_rows_lex(unique_np))
+    assert np.array_equal(lexsort_rows(unique_wp.numpy()), lexsort_rows(unique_np))
     for i in range(data_np.shape[0]):
         assert np.array_equal(unique_wp.numpy()[inverse_wp.numpy()[i]], data_np[i])
 

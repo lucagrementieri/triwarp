@@ -23,11 +23,13 @@ import triwarp.typing as twt
 from tests.comparisons import (
     assert_unordered_rows_equal,
     canonical_winding,
+    edge_multiplicity,
     hausdorff_two_sided,
     symmetric_chamfer,
     symmetric_surface_distance,
 )
 from tests.conversions import (
+    numpy_to_warp,
     open3d_to_trimesh,
     points_to_open3d,
     points_to_pymeshlab,
@@ -736,11 +738,6 @@ def test_poisson_invalid_method(device: str):
 # ======================================================================================
 
 
-def _edge_multiplicity(faces_np: np.ndarray) -> np.ndarray:
-    edges = np.sort(faces_np[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
-    return np.unique(edges, axis=0, return_counts=True)[1]
-
-
 def test_ball_pivoting_interpolates_input(device: str):
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
@@ -764,7 +761,7 @@ def test_ball_pivoting_edge_manifold(device: str):
 
     _vertices, faces_wp = tw.reconstruction.ball_pivoting(points_wp, normals_wp)
     # The cleanup tail removes non-manifold faces, so no edge is shared by more than two faces.
-    assert _edge_multiplicity(faces_wp.numpy().reshape(-1, 3)).max() <= 2
+    assert edge_multiplicity(faces_wp.numpy().reshape(-1, 3)).max() <= 2
 
 
 def test_ball_pivoting_closes_a_dense_sphere(device: str):
@@ -785,7 +782,7 @@ def test_ball_pivoting_closes_a_dense_sphere(device: str):
 
     vertices_wp, faces_wp = tw.reconstruction.ball_pivoting(points_wp, normals_wp)
     faces_np = faces_wp.numpy().reshape(-1, 3)
-    multiplicity = _edge_multiplicity(faces_np)
+    multiplicity = edge_multiplicity(faces_np)
 
     assert int((multiplicity == 1).sum()) == 0  # watertight
     assert int(multiplicity.max()) == 2  # edge-manifold
@@ -1011,19 +1008,6 @@ def _sphere_field(resolution: int, radius: float) -> np.ndarray:
     return (np.sqrt(x_np**2 + y_np**2 + z_np**2) - radius).astype(np.float32)
 
 
-def _upload_mesh(mesh_tm: tm.Trimesh, device: str):
-    return (
-        wp.array(
-            np.ascontiguousarray(mesh_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-        ),
-        wp.array(
-            np.ascontiguousarray(mesh_tm.faces.reshape(-1), dtype=np.int32),
-            dtype=wp.int32,
-            device=device,
-        ),
-    )
-
-
 def test_marching_cubes_extracts_an_analytic_sphere(device: str) -> None:
     """Every extracted vertex must land on the sphere the field describes, to grid resolution."""
     radius, resolution = 0.6, 32
@@ -1070,7 +1054,7 @@ def test_resample_uniform_offsets_a_sphere(device: str, offset: float) -> None:
     the lattice padded beyond the bounding box (or it clips) and a negative one does not.
     """
     sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
-    vertices_wp, faces_wp = _upload_mesh(sphere_tm, device)
+    vertices_wp, faces_wp = numpy_to_warp(sphere_tm.vertices, sphere_tm.faces, device)
     voxel_size = 0.05
 
     out_vertices_wp, out_faces_wp = tw.reconstruction.resample_uniform(
@@ -1151,7 +1135,7 @@ def test_resample_uniform_matches_pymeshlab(device: str) -> None:
     mesh_pml = meshset_pml.current_mesh()
     pml_tm = tm.Trimesh(mesh_pml.vertex_matrix(), mesh_pml.face_matrix(), process=False)
 
-    vertices_wp, faces_wp = _upload_mesh(sphere_tm, device)
+    vertices_wp, faces_wp = numpy_to_warp(sphere_tm.vertices, sphere_tm.faces, device)
     out_vertices_wp, out_faces_wp = tw.reconstruction.resample_uniform(
         vertices_wp, faces_wp, voxel_size=voxel_size
     )
@@ -1210,7 +1194,7 @@ def test_resample_uniform_matches_igl(device: str) -> None:
     )[:2]
     mesh_igl = tm.Trimesh(vertices_igl, faces_igl, process=False)
 
-    vertices_wp, faces_wp = _upload_mesh(sphere_tm, device)
+    vertices_wp, faces_wp = numpy_to_warp(sphere_tm.vertices, sphere_tm.faces, device)
     out_vertices_wp, out_faces_wp = tw.reconstruction.resample_uniform(
         vertices_wp, faces_wp, voxel_size=voxel_size
     )
@@ -1233,7 +1217,7 @@ def test_resample_uniform_matches_igl(device: str) -> None:
 def test_resample_uniform_coarser_is_smaller(device: str) -> None:
     """A wider voxel can only produce fewer triangles, and still a closed surface."""
     sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
-    vertices_wp, faces_wp = _upload_mesh(sphere_tm, device)
+    vertices_wp, faces_wp = numpy_to_warp(sphere_tm.vertices, sphere_tm.faces, device)
     counts = []
     for voxel_size in (0.05, 0.1, 0.2):
         _out_vertices_wp, out_faces_wp = tw.reconstruction.resample_uniform(
@@ -1246,7 +1230,7 @@ def test_resample_uniform_coarser_is_smaller(device: str) -> None:
 
 def test_resample_uniform_invalid(device: str) -> None:
     sphere_tm = tm.creation.icosphere(subdivisions=1, radius=1.0)
-    vertices_wp, faces_wp = _upload_mesh(sphere_tm, device)
+    vertices_wp, faces_wp = numpy_to_warp(sphere_tm.vertices, sphere_tm.faces, device)
     with pytest.raises(ValueError, match="voxel_size > 0"):
         tw.reconstruction.resample_uniform(vertices_wp, faces_wp, voxel_size=0.0)
 

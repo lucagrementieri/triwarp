@@ -15,6 +15,7 @@ import warp as wp
 from scipy.spatial import KDTree
 
 import triwarp as tw
+from tests.comparisons import hausdorff_two_sided
 from tests.conversions import trimesh_to_pyvista, trimesh_to_warp
 from triwarp.constants import TOLERANCE_MERGE
 
@@ -740,7 +741,7 @@ def test_clip_mesh_with_field_section_is_the_marching_triangles_curve(
     positions_np = welded_v.numpy().astype(np.float64)
     rim_np = positions_np[np.unique(rim_edges_np)]
     assert rim_np.shape[0] == contour_np.shape[0]
-    assert _hausdorff(rim_np, contour_np) < 1e-5
+    assert hausdorff_two_sided(rim_np, contour_np) < 1e-5
 
     rim_segments_np = positions_np[rim_edges_np]
     rim_length = float(np.linalg.norm(rim_segments_np[:, 1] - rim_segments_np[:, 0], axis=1).sum())
@@ -881,11 +882,6 @@ def _total_length(curves: list[np.ndarray], closed: list[bool]) -> float:
     return total
 
 
-def _hausdorff(left: np.ndarray, right: np.ndarray) -> float:
-    distance = np.linalg.norm(left[:, None, :] - right[None, :, :], axis=2)
-    return float(max(distance.min(axis=1).max(), distance.min(axis=0).max()))
-
-
 # ---------------------------------------------------------------------------
 # marching_triangles
 # ---------------------------------------------------------------------------
@@ -922,7 +918,7 @@ def test_marching_triangles_matches_potpourri3d(
     # The level sets must coincide as point sets, not merely in total length.
     bounding_diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
     assert (
-        _hausdorff(
+        hausdorff_two_sided(
             np.concatenate([curve.numpy() for curve in curves_wp]), np.concatenate(curves_pp)
         )
         < 1e-6 * bounding_diagonal
@@ -983,7 +979,7 @@ def test_marching_triangles_matches_igl(
 
     bounding_diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
     assert (
-        _hausdorff(np.concatenate([curve.numpy() for curve in curves_wp]), points_igl)
+        hausdorff_two_sided(np.concatenate([curve.numpy() for curve in curves_wp]), points_igl)
         < 1e-5 * bounding_diagonal
     )
 

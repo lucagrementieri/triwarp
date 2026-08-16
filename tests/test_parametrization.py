@@ -7,11 +7,7 @@ import scipy.sparse
 import warp as wp
 
 import triwarp as tw
-
-
-def _mesh_numpy(mesh_tm) -> tuple[np.ndarray, np.ndarray]:
-    """``(vertices float64 (n, 3), faces int64 (n_faces, 3))`` for the libigl references."""
-    return np.asarray(mesh_tm.vertices, dtype=np.float64), np.asarray(mesh_tm.faces, dtype=np.int64)
+from tests.conversions import mesh_igl, numpy_to_warp_uv
 
 
 def _flipped_faces_np(vertices_np: np.ndarray, faces_np: np.ndarray) -> np.ndarray:
@@ -30,20 +26,10 @@ def _random_2d_mesh(rng: np.random.Generator, n_faces: int):
     return vertices_np, faces_np
 
 
-def _to_wp(vertices_np: np.ndarray, faces_np: np.ndarray, device: str):
-    vertices_wp = wp.array(
-        np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec2, device=device
-    )
-    faces_wp = wp.array(
-        np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device=device
-    )
-    return vertices_wp, faces_wp
-
-
 def test_flipped_faces_random_mixed(device):
     rng = np.random.default_rng(0)
     vertices_np, faces_np = _random_2d_mesh(rng, n_faces=64)
-    vertices_wp, faces_wp = _to_wp(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp_uv(vertices_np, faces_np, device)
 
     tri = vertices_np[faces_np]
     e0 = tri[:, 1] - tri[:, 0]
@@ -62,7 +48,7 @@ def test_flipped_faces_random_mixed(device):
 def test_flipped_faces_mask_index_consistency(device):
     rng = np.random.default_rng(1)
     vertices_np, faces_np = _random_2d_mesh(rng, n_faces=32)
-    vertices_wp, faces_wp = _to_wp(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp_uv(vertices_np, faces_np, device)
 
     mask_wp = tw.parametrization.flipped_faces_mask(vertices_wp, faces_wp)
     assert np.array_equal(
@@ -75,13 +61,13 @@ def test_flipped_faces_all_and_none(device):
     # A single CCW (positive-area) triangle: not flipped.
     ccw_np = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
     faces_np = np.array([[0, 1, 2]], dtype=np.int64)
-    vertices_wp, faces_wp = _to_wp(ccw_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp_uv(ccw_np, faces_np, device)
     assert tw.parametrization.flipped_faces(vertices_wp, faces_wp).numpy().size == 0
     assert not tw.parametrization.flipped_faces_mask(vertices_wp, faces_wp).numpy().any()
 
     # Reverse the winding of every triangle: all flipped.
     cw_faces_np = faces_np[:, ::-1].copy()
-    vertices_wp, cw_faces_wp = _to_wp(ccw_np, cw_faces_np, device)
+    vertices_wp, cw_faces_wp = numpy_to_warp_uv(ccw_np, cw_faces_np, device)
     assert np.array_equal(
         tw.parametrization.flipped_faces(vertices_wp, cw_faces_wp).numpy(),
         np.arange(cw_faces_np.shape[0], dtype=np.int64),
@@ -93,7 +79,7 @@ def test_flipped_faces_degenerate_not_flagged(device):
     # Collinear (zero-area) triangle: strict "< 0" means it is not flagged.
     collinear_np = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]], dtype=np.float64)
     faces_np = np.array([[0, 1, 2]], dtype=np.int64)
-    vertices_wp, faces_wp = _to_wp(collinear_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp_uv(collinear_np, faces_np, device)
     assert not tw.parametrization.flipped_faces_mask(vertices_wp, faces_wp).numpy().any()
     assert tw.parametrization.flipped_faces(vertices_wp, faces_wp).numpy().size == 0
 
@@ -109,7 +95,7 @@ def test_flipped_faces_empty_mesh(device):
 @pytest.mark.parity("map_vertices_to_circle", "igl")
 def test_map_vertices_to_circle_matches_igl(request, device, mesh_name):
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    vertices_np, _ = _mesh_numpy(mesh_tm)
+    vertices_np, _ = mesh_igl(mesh_tm)
 
     boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
     boundary_np = boundary_wp.numpy().astype(np.int64)
@@ -122,7 +108,7 @@ def test_map_vertices_to_circle_matches_igl(request, device, mesh_name):
 
 def test_uniform_laplacian_matches_igl(device, hemisphere):
     mesh_tm, mesh_wp = hemisphere
-    _, faces_np = _mesh_numpy(mesh_tm)
+    _, faces_np = mesh_igl(mesh_tm)
     n_vertices = int(mesh_wp.points.shape[0])
 
     operator_wp = tw.laplacian.uniform_laplacian(mesh_wp.points, mesh_wp.indices)
@@ -142,7 +128,7 @@ def test_uniform_laplacian_matches_igl(device, hemisphere):
 @pytest.mark.parity("harmonic_conditioning", "igl")
 def test_harmonic_matches_igl(request, device, mesh_name):
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    vertices_np, faces_np = _mesh_numpy(mesh_tm)
+    vertices_np, faces_np = mesh_igl(mesh_tm)
 
     boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
     boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)
@@ -162,7 +148,7 @@ def test_biharmonic_matches_reference(request, device, mesh_name):
     # k=2 (biharmonic). igl.harmonic's default mass is Voronoi, but triwarp uses the barycentric
     # lumped mass, so compare against a barycentric-mass biharmonic solved directly in SciPy.
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    vertices_np, faces_np = _mesh_numpy(mesh_tm)
+    vertices_np, faces_np = mesh_igl(mesh_tm)
     n_vertices = int(mesh_wp.points.shape[0])
 
     boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
@@ -213,7 +199,7 @@ def test_biharmonic_is_deterministic(device, hemisphere):
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
 def test_tutte_matches_igl_reference(request, device, mesh_name):
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    _, faces_np = _mesh_numpy(mesh_tm)
+    _, faces_np = mesh_igl(mesh_tm)
     n_vertices = int(mesh_wp.points.shape[0])
 
     boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
@@ -253,7 +239,7 @@ def test_tutte_disk_is_fold_free(device, hemisphere):
 @pytest.mark.parity("lscm", "igl")
 def test_lscm_matches_igl(request, device, mesh_name):
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    vertices_np, faces_np = _mesh_numpy(mesh_tm)
+    vertices_np, faces_np = mesh_igl(mesh_tm)
 
     # Pin two boundary vertices to (0, 0) and (1, 0), the libigl tutorial-502 convention.
     loop_np = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices).numpy()
@@ -273,7 +259,7 @@ def test_lscm_matches_igl(request, device, mesh_name):
 def test_lscm_closed_mesh_matches_igl(device, icosahedron):
     # Closed mesh: A = 0, Q = -repdiag(L, 2). igl.lscm accepts closed input.
     mesh_tm, mesh_wp = icosahedron
-    vertices_np, faces_np = _mesh_numpy(mesh_tm)
+    vertices_np, faces_np = mesh_igl(mesh_tm)
 
     pins_np = np.array([0, 7], dtype=np.int32)
     pins_uv_np = np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32)
@@ -391,7 +377,7 @@ def _arap_igl(vertices_np, faces_np, fixed_np, fixed_uv_np, uv_init_np, max_iter
 @pytest.mark.parity("arap", "igl")
 def test_arap_matches_igl(request, device, mesh_name):
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    vertices_np, faces_np = _mesh_numpy(mesh_tm)
+    vertices_np, faces_np = mesh_igl(mesh_tm)
 
     # Full boundary loop pinned to the unit circle; identical harmonic warm start fed to both sides.
     boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
@@ -414,7 +400,7 @@ def test_arap_matches_igl(request, device, mesh_name):
 def test_arap_free_boundary_matches_igl(device, hemisphere):
     # Pin only two boundary vertices to their harmonic UV; the rest of the boundary is free.
     mesh_tm, mesh_wp = hemisphere
-    vertices_np, faces_np = _mesh_numpy(mesh_tm)
+    vertices_np, faces_np = mesh_igl(mesh_tm)
 
     boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
     boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)

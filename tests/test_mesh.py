@@ -8,17 +8,12 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
+from tests.comparisons import lexsort_rows
 from triwarp.mesh import _TOPOLOGY_KEYS
 
 CLOSED_MESHES = ["icosahedron", "cave_cube"]
 OPEN_MESHES = ["hemisphere", "half_torus"]
 ALL_MESHES = CLOSED_MESHES + OPEN_MESHES
-
-
-def _lexsort_rows(rows: np.ndarray) -> np.ndarray:
-    """Sort ``(n, 2)`` rows lexicographically (rows kept intact) for set comparison."""
-    order = np.lexsort((rows[:, 1], rows[:, 0]))
-    return rows[order]
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +117,7 @@ def test_edges_unique_matches_trimesh(request: pytest.FixtureRequest, mesh_name:
 
     unique_wp = mesh.edges_unique.numpy()
     unique_tm = mesh_tm.edges_unique
-    assert np.array_equal(_lexsort_rows(unique_wp), _lexsort_rows(unique_tm))
+    assert np.array_equal(lexsort_rows(unique_wp), lexsort_rows(unique_tm))
 
     # unique_edges[inverse] must reconstruct edges_sorted, independent of row order.
     reconstructed = unique_wp[mesh.edges_unique_inverse.numpy()]
@@ -137,7 +132,7 @@ def test_face_adjacency_matches_trimesh(request: pytest.FixtureRequest, mesh_nam
 
     adjacency_wp = mesh.face_adjacency.numpy()
     adjacency_tm = tm.graph.face_adjacency(mesh=mesh_tm)
-    assert np.array_equal(_lexsort_rows(adjacency_wp), _lexsort_rows(np.sort(adjacency_tm, axis=1)))
+    assert np.array_equal(lexsort_rows(adjacency_wp), lexsort_rows(np.sort(adjacency_tm, axis=1)))
 
 
 # ---------------------------------------------------------------------------

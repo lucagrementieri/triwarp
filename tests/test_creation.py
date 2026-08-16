@@ -16,7 +16,7 @@ import warp as wp
 from scipy.spatial import cKDTree
 
 import triwarp as tw
-from tests.comparisons import hausdorff_two_sided
+from tests.comparisons import euler_characteristic, hausdorff_two_sided, open_edge_count
 from tests.conversions import open3d_to_trimesh
 
 
@@ -105,23 +105,6 @@ def _mat44(matrix_np: np.ndarray) -> wp.mat44:
     return wp.mat44(*matrix_np.flatten().tolist())
 
 
-# A rectangle and a non-convex L, as counter-clockwise 2D rings.
-def _euler_characteristic(faces_np: np.ndarray) -> int:
-    """``V - E + F`` from an ``(n_faces, 3)`` face array, counting referenced vertices only."""
-    edges_np = np.sort(
-        np.concatenate([faces_np[:, [0, 1]], faces_np[:, [1, 2]], faces_np[:, [2, 0]]]), axis=1
-    )
-    return len(np.unique(faces_np)) - len(np.unique(edges_np, axis=0)) + int(faces_np.shape[0])
-
-
-def _open_edge_count(faces_np: np.ndarray) -> int:
-    """Count the undirected edges with exactly one incident face."""
-    edges_np = np.sort(
-        np.concatenate([faces_np[:, [0, 1]], faces_np[:, [1, 2]], faces_np[:, [2, 0]]]), axis=1
-    )
-    return int((np.unique(edges_np, axis=0, return_counts=True)[1] == 1).sum())
-
-
 def _face_frames(points_np: np.ndarray, faces_np: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Per-face centroid and unit normal, for matching two triangulations of the same surface."""
     corners_np = points_np[faces_np]
@@ -191,6 +174,7 @@ _PARAMETRIC_PYVISTA = {
 }
 _PARAMETRIC_PYVISTA["figure8_klein"] = "ParametricFigure8Klein"
 
+# A rectangle and a non-convex L, as counter-clockwise 2D rings.
 _SQUARE_RING = np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0]])
 _L_RING = np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0], [1.0, 2.0], [0.0, 2.0]])
 
@@ -1297,7 +1281,7 @@ def test_parametric_surface_matches_pyvista(device: str, surface: str) -> None:
         assert cKDTree(vertices_np).query(points_pv)[0].max() < 1e-5
     else:
         assert (reference_pv.n_points, reference_pv.n_faces) == (expected.points, expected.faces)
-        assert _euler_characteristic(np.asarray(reference_pv.regular_faces)) == expected.chi
+        assert euler_characteristic(np.asarray(reference_pv.regular_faces)) == expected.chi
         assert cKDTree(points_pv).query(vertices_np)[0].max() < 1e-5
         assert cKDTree(vertices_np).query(points_pv)[0].max() < 1e-5
     assert (len(vertices_np), len(faces_np)) == (expected.points, expected.faces)
@@ -1337,8 +1321,8 @@ def test_parametric_surface_topology(device: str, surface: str) -> None:
     # The sharpest statement about the index arithmetic: the seam-glued template winds consistently
     # exactly where a consistent winding exists at all, with no repair pass.
     assert bool(tw.validation.is_winding_consistent(faces_wp)) == expected.orientable
-    assert _euler_characteristic(faces_np) == expected.chi
-    assert _open_edge_count(faces_np) == expected.open_edges
+    assert euler_characteristic(faces_np) == expected.chi
+    assert open_edge_count(faces_np) == expected.open_edges
     assert mesh_tm.is_watertight == expected.watertight
     assert len(mesh_tm.outline().entities if expected.open_edges else []) == expected.loops
 
@@ -1361,9 +1345,9 @@ def test_parametric_surface_topology_is_resolution_independent(device: str, surf
         assert int(vertices_wp.shape[0]) == int(faces_np.max()) + 1
         invariants.add(
             (
-                _euler_characteristic(faces_np),
+                euler_characteristic(faces_np),
                 bool(tw.validation.is_orientable(faces_wp)),
-                _open_edge_count(faces_np) // (resolution - 1),
+                open_edge_count(faces_np) // (resolution - 1),
             )
         )
     assert len(invariants) == 1, f"topology moved with the resolution: {invariants}"

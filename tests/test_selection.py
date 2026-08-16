@@ -8,6 +8,7 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
+from tests.comparisons import undirected_edges
 from tests.conversions import trimesh_to_pymeshlab
 
 
@@ -322,7 +323,7 @@ def _graph_distance(faces_np: np.ndarray, n: int, seed: np.ndarray) -> np.ndarra
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import dijkstra
 
-    edges = faces_np.reshape(-1, 3)[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2)
+    edges = undirected_edges(faces_np.reshape(-1, 3))
     rows = np.concatenate([edges[:, 0], edges[:, 1]])
     cols = np.concatenate([edges[:, 1], edges[:, 0]])
     graph = csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n))

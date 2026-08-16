@@ -8,8 +8,13 @@ import trimesh.repair as tm_repair
 import warp as wp
 
 import triwarp as tw
-from tests.comparisons import canonical_winding
-from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab, trimesh_to_pyvista
+from tests.comparisons import canonical_winding, undirected_edges
+from tests.conversions import (
+    numpy_to_warp,
+    trimesh_to_open3d,
+    trimesh_to_pymeshlab,
+    trimesh_to_pyvista,
+)
 
 CLOSED_MESHES = ["icosahedron", "cave_cube"]
 OPEN_MESHES = ["hemisphere", "half_torus"]
@@ -23,7 +28,7 @@ def _faces_igl(mesh_tm: tm.Trimesh) -> np.ndarray:
 
 def _edge_manifold_np(faces_np: np.ndarray, allow_boundary_edges: bool) -> bool:
     """NumPy reference: manifold edge-count check over undirected edges."""
-    edges = np.sort(faces_np[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+    edges = undirected_edges(faces_np)
     _, counts = np.unique(edges, axis=0, return_counts=True)
     if allow_boundary_edges:
         return bool((counts <= 2).all())
@@ -32,7 +37,7 @@ def _edge_manifold_np(faces_np: np.ndarray, allow_boundary_edges: bool) -> bool:
 
 def _edge_manifold_mask_np(faces_np: np.ndarray, allow_boundary_edges: bool) -> np.ndarray:
     """NumPy reference: per-face flag that all three edges are manifold."""
-    edges = np.sort(faces_np[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+    edges = undirected_edges(faces_np)
     _, inverse, counts = np.unique(edges, axis=0, return_inverse=True, return_counts=True)
     edge_ok = counts <= 2 if allow_boundary_edges else counts == 2
     return np.asarray(edge_ok[inverse.reshape(-1)].reshape(-1, 3).all(axis=1))
@@ -74,20 +79,6 @@ def _orientable_np(faces_np: np.ndarray) -> bool:
                 elif orient[nb] != expected:
                     return False
     return True
-
-
-def _mesh_to_wp(
-    vertices_np: np.ndarray, faces_np: np.ndarray, device: str
-) -> tuple[wp.array, wp.array]:
-    vertices_wp = wp.array(
-        np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device
-    )
-    faces_wp = wp.array(
-        np.ascontiguousarray(np.asarray(faces_np).reshape(-1), dtype=np.int32),
-        dtype=wp.int32,
-        device=device,
-    )
-    return vertices_wp, faces_wp
 
 
 def _mobius_strip(n: int) -> tuple[np.ndarray, np.ndarray]:
@@ -280,7 +271,7 @@ def test_is_edge_manifold_nonmanifold_fan_matches_pyvista(device: str) -> None:
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]]
     )
     faces_np = np.array([[0, 1, 2], [0, 3, 1], [0, 1, 4]])
-    vertices_wp, faces_wp = _mesh_to_wp(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     mesh_pv = trimesh_to_pyvista(tm.Trimesh(vertices_np, faces_np, process=False))
 
     assert tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=False) is False
@@ -295,7 +286,7 @@ def test_is_edge_manifold_nonmanifold_fan_matches_open3d(device: str) -> None:
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]]
     )
     faces_np = np.array([[0, 1, 2], [0, 3, 1], [0, 1, 4]])
-    _, faces_wp = _mesh_to_wp(vertices_np, faces_np, device)
+    _, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     mesh_o3d = trimesh_to_open3d(tm.Trimesh(vertices_np, faces_np, process=False))
     for allow_boundary_edges in (True, False):
         manifold_wp = tw.validation.is_edge_manifold(
@@ -416,7 +407,7 @@ def test_is_vertex_manifold_bowtie(device: str) -> None:
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]]
     )
     faces_np = np.array([[0, 1, 2], [0, 3, 4]])
-    _, faces_wp = _mesh_to_wp(vertices_np, faces_np, device)
+    _, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     manifold_wp = tw.validation.is_vertex_manifold(faces_wp)
     manifold_igl = bool(igl.is_vertex_manifold(faces_np.astype(np.int64)).all())
     assert manifold_wp == manifold_igl
@@ -457,7 +448,7 @@ def test_is_vertex_manifold_open3d_agreement_and_divergence(device: str) -> None
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]]
     )
     bow_f = np.array([[0, 1, 2], [0, 3, 4]])
-    _, bow_faces_wp = _mesh_to_wp(bow_v, bow_f, device)
+    _, bow_faces_wp = numpy_to_warp(bow_v, bow_f, device)
     bow_o3d = trimesh_to_open3d(tm.Trimesh(bow_v, bow_f, process=False)).is_vertex_manifold()
     assert bow_o3d is False
     assert tw.validation.is_vertex_manifold(bow_faces_wp) == bow_o3d
@@ -466,7 +457,7 @@ def test_is_vertex_manifold_open3d_agreement_and_divergence(device: str) -> None
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]]
     )
     fan_f = np.array([[0, 1, 2], [0, 3, 1], [0, 1, 4]])
-    _, fan_faces_wp = _mesh_to_wp(fan_v, fan_f, device)
+    _, fan_faces_wp = numpy_to_warp(fan_v, fan_f, device)
     assert trimesh_to_open3d(tm.Trimesh(fan_v, fan_f, process=False)).is_vertex_manifold() is True
     assert tw.validation.is_vertex_manifold(fan_faces_wp) is False
 
@@ -495,7 +486,7 @@ def test_vertex_manifold_mask_unreferenced(device: str) -> None:
         ]
     )
     faces_np = np.array([[0, 1, 2], [0, 3, 4]])
-    vertices_wp, faces_wp = _mesh_to_wp(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     mask_wp = tw.validation.vertex_manifold_mask(vertices_wp, faces_wp)
     expected = np.array([False, True, True, True, True, False])
     assert mask_wp.shape[0] == vertices_np.shape[0]
@@ -528,7 +519,7 @@ def test_is_self_intersecting_crossing(device: str) -> None:
         ]
     )
     faces_np = np.array([[0, 1, 2], [3, 4, 5]])
-    vertices_wp, faces_wp = _mesh_to_wp(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
     assert tw.validation.is_self_intersecting(mesh_wp) is True
 
@@ -545,7 +536,7 @@ def test_is_self_intersecting_separated(device: str) -> None:
         ]
     )
     faces_np = np.array([[0, 1, 2], [3, 4, 5]])
-    vertices_wp, faces_wp = _mesh_to_wp(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
     assert tw.validation.is_self_intersecting(mesh_wp) is False
 
@@ -573,7 +564,7 @@ def test_is_winding_consistent_flipped(icosahedron: tuple[tm.Trimesh, wp.Mesh]) 
     mesh_tm, mesh_wp = icosahedron
     faces_flipped = mesh_tm.faces.copy()
     faces_flipped[::2] = faces_flipped[::2][:, ::-1]  # reverse winding of half the faces
-    _, faces_wp = _mesh_to_wp(mesh_tm.vertices, faces_flipped, mesh_wp.device)
+    _, faces_wp = numpy_to_warp(mesh_tm.vertices, faces_flipped, mesh_wp.device)
     mesh_flipped_tm = tm.Trimesh(vertices=mesh_tm.vertices, faces=faces_flipped, process=False)
     winding_wp = tw.validation.is_winding_consistent(faces_wp)
     assert winding_wp == bool(mesh_flipped_tm.is_winding_consistent)
@@ -597,7 +588,7 @@ def test_edge_winding_consistent_mask_flags_flipped(
     mesh_tm, mesh_wp = icosahedron
     faces_flipped = mesh_tm.faces.copy()
     faces_flipped[::2] = faces_flipped[::2][:, ::-1]  # reverse winding of half the faces
-    _, faces_wp = _mesh_to_wp(mesh_tm.vertices, faces_flipped, mesh_wp.device)
+    _, faces_wp = numpy_to_warp(mesh_tm.vertices, faces_flipped, mesh_wp.device)
     mask_wp = tw.validation.edge_winding_consistent_mask(faces_wp)
     assert int(mask_wp.shape[0]) > 0
     assert bool(tw.reduce.all(mask_wp)) is False
@@ -624,7 +615,7 @@ def test_is_orientable_flip_invariance(icosahedron: tuple[tm.Trimesh, wp.Mesh]) 
 
 def test_is_orientable_mobius(device: str) -> None:
     vertices_np, faces_np = _mobius_strip(12)
-    _, faces_wp = _mesh_to_wp(vertices_np, faces_np, device)
+    _, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     assert tw.validation.is_orientable(faces_wp) is False
     assert _orientable_np(faces_np) is False
     # The Möbius strip is still edge- and vertex-manifold.
@@ -697,7 +688,7 @@ def test_face_orientation_mask_matches_igl(device: str) -> None:
     scrambled_np = rng.random(faces_np.shape[0]) < 0.5
     flipped_np = faces_np.copy()
     flipped_np[scrambled_np] = flipped_np[scrambled_np][:, ::-1]
-    _, faces_wp = _mesh_to_wp(vertices_np, flipped_np, device)
+    _, faces_wp = numpy_to_warp(vertices_np, flipped_np, device)
 
     oriented_igl, components_igl = igl.bfs_orient(np.ascontiguousarray(flipped_np, dtype=np.int64))
     unchanged_igl = (oriented_igl == flipped_np).all(axis=1)
@@ -736,7 +727,7 @@ def test_face_orientation_mask_long_path(device: str) -> None:
     scrambled_np = rng.random(faces_np.shape[0]) < 0.5
     flipped_np = faces_np.copy()
     flipped_np[scrambled_np] = flipped_np[scrambled_np][:, ::-1]
-    _, faces_wp = _mesh_to_wp(vertices_np, flipped_np, device)
+    _, faces_wp = numpy_to_warp(vertices_np, flipped_np, device)
 
     assert tw.validation.is_orientable(faces_wp) is True
     bits_wp, _signed_edges_wp, _signs_wp, _m = tw.validation.face_orientation_bits(faces_wp)
@@ -864,7 +855,7 @@ def test_is_volume(request: pytest.FixtureRequest, mesh_name: str) -> None:
 def test_is_volume_inward_normals(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     mesh_tm, mesh_wp = icosahedron
     faces_inward = mesh_tm.faces[:, ::-1].copy()  # reverse every face -> inward-facing normals
-    vertices_wp, faces_wp = _mesh_to_wp(mesh_tm.vertices, faces_inward, mesh_wp.device)
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, faces_inward, mesh_wp.device)
     mesh_inward_tm = tm.Trimesh(vertices=mesh_tm.vertices, faces=faces_inward, process=False)
     # Still watertight and winding-consistent, but the enclosed signed volume is negative.
     volume_wp = tw.validation.is_volume(vertices_wp, faces_wp)
@@ -892,7 +883,7 @@ def test_is_self_intersecting_fewer_than_two_faces(device: str) -> None:
     # single-triangle mesh instead of a fully empty one.
     vertices_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
     faces_np = np.array([[0, 1, 2]])
-    vertices_wp, faces_wp = _mesh_to_wp(vertices_np, faces_np, device)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
     mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
     assert tw.validation.is_self_intersecting(mesh_wp) is False
 

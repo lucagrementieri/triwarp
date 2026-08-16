@@ -8,6 +8,7 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
+from tests.comparisons import lexsort_rows
 from triwarp.combine import _non_increasing_indices
 
 
@@ -70,11 +71,6 @@ def _capsule_halves(device: str, n_a: int, n_b: int, phase: float = 0.0, offset:
     return bottom, top
 
 
-def _sorted_triangle_rows(faces_flat: np.ndarray) -> np.ndarray:
-    triangles = np.sort(faces_flat.reshape(-1, 3), axis=1)
-    return triangles[np.lexsort(triangles.T[::-1])]
-
-
 @pytest.mark.parametrize(
     ("n_a", "n_b", "phase", "offset"),
     [
@@ -111,7 +107,8 @@ def test_stitch_argument_order_invariant(device: str) -> None:
     # The larger loop is always A, so swapping the arguments yields the same mesh.
     assert np.array_equal(vertices_ab.numpy(), vertices_ba.numpy())
     assert np.array_equal(
-        _sorted_triangle_rows(faces_ab.numpy()), _sorted_triangle_rows(faces_ba.numpy())
+        lexsort_rows(np.sort(faces_ab.numpy().reshape(-1, 3), axis=1)),
+        lexsort_rows(np.sort(faces_ba.numpy().reshape(-1, 3), axis=1)),
     )
 
 
@@ -386,7 +383,10 @@ def test_stitch_loops_matches_numpy(
     _, faces_wp = tw.combine.stitch_loops(va, fa, loop_a, vb, fb, loop_b)
     faces_np = _stitch_loops_np(va_np, fa_np, loop_a.numpy(), vb_np, fb_np, loop_b.numpy())
 
-    assert np.array_equal(_sorted_triangle_rows(faces_wp.numpy()), _sorted_triangle_rows(faces_np))
+    assert np.array_equal(
+        lexsort_rows(np.sort(faces_wp.numpy().reshape(-1, 3), axis=1)),
+        lexsort_rows(np.sort(faces_np.reshape(-1, 3), axis=1)),
+    )
 
 
 def test_stitch_loops_rejects_small_loop(device: str) -> None:
