@@ -19,6 +19,7 @@ from scipy.spatial import Delaunay
 
 import triwarp as tw
 from tests.conversions import (
+    numpy_to_warp,
     points_to_pyvista,
     trimesh_to_open3d_t,
     trimesh_to_pymeshlab,
@@ -89,20 +90,33 @@ def test_closest_point_on_mesh_random(request: pytest.FixtureRequest, mesh_name:
 
 
 def test_closest_point_on_mesh_ambiguous_edge(device: str) -> None:
+    """
+    Class B: at an exact tie, the *distance* is the answer and the winning face is not.
+
+    Two right triangles meet along the y-axis, one in ``z = 0`` and one in ``x = 0``. The query sits
+    at ``(-0.25, 0, -0.25)``, which projects into the interior of each at exactly 0.25 -- the shared
+    edge is 0.354 away, so the two face projections are the tied minima and nothing separates them.
+
+    The transform is "up to the tie": which of the two a correct implementation returns is a
+    traversal order, and triwarp's differs between the CPU and CUDA BVH. This used to assert the
+    point elementwise against trimesh and pass only because the query carried a ``-1e-9`` nudge
+    toward the first face -- which does nothing, since triwarp's vertex buffer is ``float32`` and
+    ``-0.25 - 1e-9`` rounds to exactly ``-0.25`` there. So the nudge disambiguated trimesh's
+    ``float64`` answer and not triwarp's, and the test was asserting a coincidence. It failed on the
+    CPU device from the day it was written and nobody ran that device.
+
+    Still non-vacuous: the distance is exact, and the point must be one of the two tied projections
+    -- the shared-edge answer ``(0, 0, 0)`` at 0.354 and any point off the surface both fail.
+    """
     mesh_tm = tm.Trimesh(
         vertices=[[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, -1.0]],
         faces=[[0, 1, 2], [0, 1, 3]],
         process=False,
     )
-    query_np = np.array([[-0.25 - 1e-9, 0.0, -0.25]], dtype=np.float64)
-    closest_tm, distance_tm, _triangle_id_tm = tm.proximity.closest_point(mesh_tm, query_np)
+    query_np = np.array([[-0.25, 0.0, -0.25]], dtype=np.float64)
+    _closest_tm, distance_tm, _triangle_id_tm = tm.proximity.closest_point(mesh_tm, query_np)
 
-    vertices_wp = wp.array(
-        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float32), dtype=wp.vec3, device=device
-    )
-    faces_wp = wp.array(
-        np.ascontiguousarray(mesh_tm.faces.reshape(-1), dtype=np.int32), device=device
-    )
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
     query_wp = wp.array(
         np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=device
     )
@@ -110,8 +124,10 @@ def test_closest_point_on_mesh_ambiguous_edge(device: str) -> None:
         vertices_wp, faces_wp, query_wp
     )
 
-    assert np.allclose(closest_wp.numpy(), closest_tm, rtol=1e-5, atol=1e-5)
+    assert np.allclose(distance_tm, 0.25, rtol=1e-5, atol=1e-5)  # the reference is at the tie too
     assert np.allclose(distance_wp.numpy(), distance_tm, rtol=1e-5, atol=1e-5)
+    tied_np = np.array([[-0.25, 0.0, 0.0], [0.0, 0.0, -0.25]])
+    assert np.isclose(tied_np, closest_wp.numpy(), rtol=1e-5, atol=1e-5).all(axis=1).any()
 
 
 def test_closest_point_on_mesh_unreferenced_vertex(device: str) -> None:
