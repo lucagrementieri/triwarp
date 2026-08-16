@@ -20,7 +20,7 @@ def pack_group_vertex_keys(
     # last one starting at or before it — a binary search rather than a materialized per-position
     # label array. ``out_keys`` is ``wp.int64`` concretely, not ``wp.Int``: a generic packer cannot
     # construct the promoted value portably.
-    corner = int(wp.tid())
+    corner = wp.int32(wp.tid())
     position = corner // 3
     group = binary_search_index(group_offsets, position) - 1
     face = group_face_indices[position]
@@ -42,7 +42,7 @@ def vertex_of_key(key: wp.int64, radix: wp.int64) -> wp.int32:
 @wp.kernel
 def count_group_slots(slot_groups: wp.array[wp.int32], out_counts: wp.array[wp.int32]) -> None:
     # Vertices per group, as a histogram over the sorted unique slots.
-    wp.atomic_add(out_counts, slot_groups[int(wp.tid())], wp.int32(1))
+    wp.atomic_add(out_counts, slot_groups[wp.int32(wp.tid())], wp.int32(1))
 
 
 @wp.kernel
@@ -53,7 +53,7 @@ def local_vertex_index(
 ) -> None:
     # Rank of each global slot within its own group: the compacted, zero-based vertex index the
     # group's faces must refer to. A real kernel because the thread index *is* the datum.
-    slot = int(wp.tid())
+    slot = wp.int32(wp.tid())
     out_local[slot] = slot - vertex_offsets[slot_groups[slot]]
 
 
@@ -63,7 +63,7 @@ def dilate_vertex_mask(
 ) -> None:
     # One edge dilation round: a vertex joins the mask if either endpoint of an incident edge is
     # already in it. ``out_mask`` must be pre-seeded with ``in_mask`` (this only adds neighbors).
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     a = unique_edges[i, 0]
     b = unique_edges[i, 1]
     if in_mask[a]:
@@ -80,7 +80,7 @@ def edge_region_counts(
     out_region_count: wp.array[wp.int32],
 ) -> None:
     # Per unique edge: total incident-face count and how many of those faces are in the region.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     e = inverse[i]
     wp.atomic_add(out_count, e, wp.int32(1))
     if face_mask[i // 3]:
@@ -104,6 +104,6 @@ def keep_component_scatter(
     mask: wp.array[wp.bool], labels: wp.array[wp.int32], out_keep: wp.array[wp.int32]
 ) -> None:
     # A component is "kept" (not fully selected) if it has at least one unselected vertex.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     if not mask[v]:
         out_keep[labels[v]] = wp.int32(1)

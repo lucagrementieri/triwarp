@@ -229,8 +229,8 @@ def bfs_serial_drain(
     current = wp.int32(0)
     neighbor = wp.int32(0)
     k = wp.int32(0)
-    cursor = wp.int32(head)
-    end_of_queue = wp.int32(tail)
+    cursor = head
+    end_of_queue = tail
     while cursor < end_of_queue:
         current = out_order[cursor]
         cursor += wp.int32(1)
@@ -257,7 +257,7 @@ def single_source_bfs_kernel(
     out_count: wp.array[wp.int32],
 ) -> None:
     # Launched at dim=1: a single thread runs the whole serial traversal for exact-order match.
-    _ = int(wp.tid())
+    _ = wp.int32(wp.tid())
     out_dist[source] = wp.int32(0)
     out_order[0] = source
     out_count[0] = bfs_serial_drain(
@@ -268,7 +268,7 @@ def single_source_bfs_kernel(
 @wp.kernel
 def bfs_seed(source: wp.int32, out_order: wp.array[wp.int32], out_dist: wp.array[wp.int32]) -> None:
     # dim=1: place the source at order slot 0 with distance 0.
-    _ = int(wp.tid())
+    _ = wp.int32(wp.tid())
     out_order[0] = source
     out_dist[source] = wp.int32(0)
 
@@ -307,7 +307,7 @@ def bfs_segment_base(
     if rank <= wp.int32(0):
         return wp.int32(0)
     base = offsets_scan[rank - 1]
-    block = (rank - wp.int32(1)) / wp.int32(BFS_SCAN_BLOCK)
+    block = (rank - wp.int32(1)) // wp.int32(BFS_SCAN_BLOCK)
     if block > wp.int32(0):
         base += block_sums[block - 1]
     return base
@@ -328,14 +328,14 @@ def bfs_expand_claim(
     # INT32_MAX once and never reset: a node claimed at level L is always finalized at level L
     # (its dist is set by the scatter), so the ``dist[v] == -1`` guard in the count/scatter
     # kernels rejects any stale rank from an earlier level.
-    r = int(wp.tid())
+    r = wp.int32(wp.tid())
     if r >= state[_STATE_TAIL] - state[_STATE_START]:
         return
     u = order[state[_STATE_START] + r]
     for k in range(adj_offsets[u], adj_offsets[u + 1]):
         v = adj_columns[k]
         if dist[v] == wp.int32(-1):
-            wp.atomic_min(out_claim_rank, v, wp.int32(r))
+            wp.atomic_min(out_claim_rank, v, r)
 
 
 @wp.kernel
@@ -413,7 +413,7 @@ def bfs_scan_and_advance(
     # not the work, measured at ~2.9-3.8 us per (level x kernel) and flat to 1.3x across a 64x range
     # of node count. So the launch count is the lever, and this kernel plus
     # ``bfs_segment_base`` and ``bfs_count_and_scan`` take the body from seven kernels to four.
-    _ = int(wp.tid())
+    _ = wp.int32(wp.tid())
     frontier = out_state[_STATE_TAIL] - out_state[_STATE_START]
     n = wp.min((frontier + BFS_SCAN_BLOCK - 1) / BFS_SCAN_BLOCK, out_block_sums.shape[0])
     total = wp.int32(0)
@@ -459,17 +459,17 @@ def bfs_scatter_claims(
     #
     # The window comes from the ``EMIT`` slots, not the live ones: ``bfs_scan_and_advance`` has
     # already moved the live window on, which is what let its state update fold into the scan.
-    r = int(wp.tid())
+    r = wp.int32(wp.tid())
     start = state[_STATE_EMIT_START]
     tail = state[_STATE_EMIT_TAIL]
     if r >= tail - start:
         return
     u = out_order[start + r]
     level = state[_STATE_EMIT_LEVEL]
-    slot = tail + bfs_segment_base(wp.int32(r), offsets_scan, block_sums)
+    slot = tail + bfs_segment_base(r, offsets_scan, block_sums)
     for k in range(adj_offsets[u], adj_offsets[u + 1]):
         v = adj_columns[k]
-        if out_dist[v] == wp.int32(-1) and claim_rank[v] == wp.int32(r):
+        if out_dist[v] == wp.int32(-1) and claim_rank[v] == r:
             out_order[slot] = v
             out_parent[v] = u
             out_dist[v] = level
@@ -489,7 +489,7 @@ def resume_bfs_kernel(
     # dim=1: finish a traversal the level-synchronous loop handed over once its frontier went
     # narrow. ``state`` carries the FIFO window the parallel path left behind, so this is the same
     # serial BFS as above resumed mid-queue -- order-exact by construction, not by reconstruction.
-    _ = int(wp.tid())
+    _ = wp.int32(wp.tid())
     out_count[0] = bfs_serial_drain(
         state[_STATE_START],
         state[_STATE_TAIL],

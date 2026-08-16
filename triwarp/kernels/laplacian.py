@@ -70,8 +70,8 @@ def cotmatrix_entries(
 ) -> None:
     # ``out_cot`` is generic: the half-cotangent weights are computed in float32 (the vertex
     # precision) and cast to the requested output dtype (float32 or float64) at store time.
-    f = int(wp.tid())
-    v0, v1, v2 = face_vertices(vertices, faces, wp.int32(f))
+    f = wp.int32(wp.tid())
+    v0, v1, v2 = face_vertices(vertices, faces, f)
     l2_0, l2_1, l2_2 = squared_edge_lengths(v0, v1, v2)
     l0 = wp.sqrt(l2_0)
     l1 = wp.sqrt(l2_1)
@@ -87,7 +87,7 @@ def cotmatrix_entries(
 def cotmatrix_entries_intrinsic(
     edge_lengths: wp.array2d[wp.float32], out_cot: wp.array2d[wp.Float]
 ) -> None:
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     l0 = edge_lengths[f, 0]
     l1 = edge_lengths[f, 1]
     l2 = edge_lengths[f, 2]
@@ -117,7 +117,7 @@ def laplacian_triplets_directed(
 ) -> None:
     # One triplet per directed triangle edge, matching trimesh's ``mesh.edges`` adjacency.
     # ``out_vals`` is generic: the float32 edge weight is cast to the requested output dtype.
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     a = edges[e, 0]
     b = edges[e, 1]
     out_rows[e] = a
@@ -137,7 +137,7 @@ def laplacian_triplets_symmetric(
     # Emits both directed pairs (a, b) and (b, a) from each unique undirected edge so the
     # adjacency is symmetric, matching trimesh's ``vertex_neighbors``. Duplicate multiplicity
     # cancels under row-normalization. ``out_vals`` is generic (float32 or float64).
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     a = edges[e, 0]
     b = edges[e, 1]
     w = type(out_vals[e * 2])(edge_weight(a, b, vertices, equal_weight))
@@ -152,7 +152,7 @@ def laplacian_triplets_symmetric(
 
 @wp.kernel
 def row_normalize(offsets: wp.array[wp.int32], out_values: wp.array[wp.Float]) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     start = offsets[i]
     end = offsets[i + 1]
     # ``out_values[0]`` is always valid: the launcher only runs this kernel when nnz > 0. It is
@@ -173,7 +173,7 @@ def apply_operator(
     v_in: wp.array[wp.vec3d],
     out_lv: wp.array[wp.vec3d],
 ) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     start = offsets[i]
     end = offsets[i + 1]
     if end == start:
@@ -205,7 +205,7 @@ def cotmatrix_triplets(
     # wrong. The nondeterminism came from sizing a rebuild's triplet buffers by ``BsrMatrix.nnz``
     # (the capacity the matrix was built with) instead of ``nnz_sync()`` (its entry count), leaving
     # an uninitialized tail for ``bsr_from_triplets`` to read back as triplets.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     for e in range(3):
         c0 = (e + 1) % 3
         c1 = (e + 2) % 3
@@ -252,7 +252,7 @@ def connection_laplacian_triplets(
     #
     # Built positive semi-definite (positive diagonal), unlike ``cotmatrix``'s igl sign convention,
     # because every consumer here feeds it straight to a conjugate-gradient solve.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     identity = wp.mat22d(1.0, 0.0, 0.0, 1.0)
     for e in range(3):
         # Corner ``e``'s half-cotangent weights the opposite edge, which is halfedge ``e + 1``.
@@ -285,7 +285,7 @@ def triangle_inequality_slack(
     # ``epsilon``, expressed as the constant that would have to be added to all three of its edges.
     # Adding a constant lengthens the two short sides by ``2 * delta`` against the long side's
     # ``delta``, so half the shortfall is enough.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     a = edge_lengths[f, 0]
     b = edge_lengths[f, 1]
     c = edge_lengths[f, 2]

@@ -32,11 +32,11 @@ def pair_sorted_halfedges(
     # One thread per position in the hash-sorted halfedge list; only the first position of each run
     # of equal keys acts, so each undirected edge is resolved exactly once. Run length 1 is a
     # boundary edge (twin stays -1), 2 an interior edge, 3+ a non-manifold edge.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     key = sorted_keys[i]
     if i > 0 and sorted_keys[i - 1] == key:
         return
-    n = int(sorted_keys.shape[0])
+    n = sorted_keys.shape[0]
     if i + 1 >= n or sorted_keys[i + 1] != key:
         return
     if i + 2 < n and sorted_keys[i + 2] == key:
@@ -59,7 +59,7 @@ def ring_start_halfedges(
     # twin-less (boundary) ones alone. A boundary vertex must start its CCW walk at its boundary
     # halfedge — the clockwise-most edge of its fan — or the walk covers only part of the fan.
     # ``atomic_min`` makes both picks deterministic regardless of thread order.
-    h = int(wp.tid())
+    h = wp.int32(wp.tid())
     origin = faces[h]
     wp.atomic_min(out_interior_start, origin, h)
     if twins[h] == wp.int32(-1):
@@ -94,7 +94,7 @@ def write_one_rings(
     # steps from edge ``v->a`` to edge ``v->b`` within the CCW-oriented face ``(v, a, b)``. The walk
     # is bounded by the vertex's known ring size, so a pinched (vertex-non-manifold) vertex — where
     # the rotation closes early on one of its fans — is reported instead of silently truncated.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     start = starts[v]
     if start == wp.int32(-1):
         return

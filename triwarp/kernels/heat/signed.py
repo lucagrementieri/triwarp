@@ -17,7 +17,7 @@ def splat_curve_normals(
     # tangent direction perpendicular to it -- to the two vertices it connects, weighted by half the
     # segment's length. Diffusing normals rather than an indicator is what makes the result signed:
     # the field arrives at a point already knowing which side of the curve it is on.
-    s = int(wp.tid())
+    s = wp.int32(wp.tid())
     a = segments[s, 0]
     b = segments[s, 1]
     edge = vertices[b] - vertices[a]
@@ -73,7 +73,7 @@ def vertex_field_to_face_field(
     # Average the three corners' tangent vectors into one per-face vector, in world space, so the
     # existing cotangent divergence can integrate it. Each corner's 2D components mean nothing
     # outside its own frame, so they have to be expanded to 3D *before* averaging.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     normal = normals[f]
     total = wp.vec3(0.0, 0.0, 0.0)
     for k in range(3):
@@ -95,7 +95,7 @@ def scatter_free_rhs(
 ) -> None:
     # Compact a full-length right-hand side down to the unpinned degrees of freedom, in the layout
     # ``linalg.solve_spd_columns`` expects (one row per right-hand side).
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if fixed_mask[i]:
         return
     out_rhs[0, free_map[i]] = values[i]
@@ -110,7 +110,7 @@ def gather_free_solution(
 ) -> None:
     # Expand the reduced solution back over every vertex; the pinned ones keep the value they were
     # pinned to, which for a zero level set is zero.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if fixed_mask[i]:
         out_field[i] = wp.float64(0.0)
         return

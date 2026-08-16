@@ -7,7 +7,7 @@ from triwarp.kernels import array as kernel_array
 def edges_to_adjacency(
     edges: wp.array2d[wp.int32], out_rows: wp.array[wp.int32], out_cols: wp.array[wp.int32]
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     a = edges[tid, 0]
     b = edges[tid, 1]
     base = tid * 2
@@ -21,7 +21,7 @@ def edges_to_adjacency(
 def duplicate_edge_weights(weights: wp.array[wp.float32], out_values: wp.array[wp.float32]) -> None:
     # One weight per undirected edge becomes the two directed entries ``edges_to_adjacency`` emits,
     # in its layout: entry ``2e`` is ``(a, b)`` and ``2e + 1`` is ``(b, a)``.
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     out_values[e * 2] = weights[e]
     out_values[e * 2 + 1] = weights[e]
 
@@ -40,7 +40,7 @@ def shortest_path_envelope_pass(
     # the result does not depend on how the threads interleave. Labels only ever go down, so the
     # iteration is monotone and converges in at most (graph diameter) passes; ``out_changed`` is the
     # host's early-exit signal. (VCG ``UpdateQuality::VertexSaturate`` is this loop.)
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     best = labels[i]
     for k in range(offsets[i], offsets[i + 1]):
         relaxed = labels[columns[k]] + weights[k]
@@ -57,7 +57,7 @@ def pack_label_node_keys(
 ) -> None:
     # Composite sort key label * n + node: sorting groups nodes by component with node ids
     # ascending inside each component (keys are strictly increasing within a label).
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     out_keys[i] = wp.int64(labels[i]) * node_count + wp.int64(i)
 
 
@@ -72,7 +72,7 @@ def component_segment_bounds(
 ) -> None:
     # The label-L segment of the sorted key array is exactly
     # [lower_bound(L*n), lower_bound((L+1)*n)).
-    q = int(wp.tid())
+    q = wp.int32(wp.tid())
     label = wp.int64(labels[sources[q]])
     lo = kernel_array.binary_search_index_left(sorted_keys, label * node_count)
     hi = kernel_array.binary_search_index_left(sorted_keys, (label + wp.int64(1)) * node_count)
@@ -91,8 +91,8 @@ def emit_component_neighbors(
 ) -> None:
     # One thread per output slot: slot 0 of each source's range holds the source itself, the
     # rest list its component's nodes in ascending order (the source's own position skipped).
-    t = int(wp.tid())
-    q = kernel_array.binary_search_index(offsets, wp.int32(t)) - 1
+    t = wp.int32(wp.tid())
+    q = kernel_array.binary_search_index(offsets, t) - 1
     rel = t - offsets[q]
     source = sources[q]
     if rel == 0:
@@ -110,13 +110,13 @@ def emit_component_neighbors(
 def scatter_sorted_positions(
     sorted_nodes: wp.array[wp.int32], out_rank: wp.array[wp.int32]
 ) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     out_rank[sorted_nodes[i]] = i
 
 
 @wp.kernel
 def scatter_successor(directed_edges: wp.array2d[wp.int32], out_next: wp.array[wp.int32]) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     out_next[directed_edges[tid, 0]] = directed_edges[tid, 1]
 
 
@@ -127,7 +127,7 @@ def scatter_cycle_min_and_count(
     out_label_min: wp.array[wp.int32],
     out_label_count: wp.array[wp.int32],
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     v = cycle_nodes[tid]
     label = labels[v]
     wp.atomic_min(out_label_min, label, v)
@@ -147,7 +147,7 @@ def init_rank_arrays(
     # node index, label_min) so cycles become chains ending in a fixed point (successor ==
     # self, steps == 0). Broken chains (-1 sentinel where a node has no out-edge) also terminate
     # at a fixed point, so the whole ranking finishes in a fixed round count on any input.
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     v = cycle_nodes[tid]
     start = label_min[labels[v]]
     nxt = next_node[v]
@@ -170,7 +170,7 @@ def jump_rank(
     # Pointer doubling (Wyllie): after k rounds each node knows its 2^k-th successor and the
     # exact hop count to it; the fixed point at the cycle start contributes zero, so steps
     # converges to the hop distance to the start in ceil(log2(chain length)) rounds.
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     v = cycle_nodes[tid]
     s = successor_in[v]
     out_steps[v] = steps_in[v] + steps_in[s]
@@ -187,7 +187,7 @@ def finalize_rank_positions(
 ) -> None:
     # position = (cycle_length - hops to start) mod cycle_length; the positive modulo keeps
     # malformed chains (steps beyond cycle_length when in-edges collide) in range.
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     v = cycle_nodes[tid]
     cycle_length = label_count[labels[v]]
     out_position[tid] = kernel_array.wrap_index(cycle_length - steps[v], cycle_length)
@@ -201,5 +201,5 @@ def scatter_cycle_slot(
     offsets: wp.array[wp.int32],
     out_cycles: wp.array[wp.int32],
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     out_cycles[offsets[cycle_index[tid]] + position[tid]] = cycle_nodes[tid]

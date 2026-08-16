@@ -67,14 +67,14 @@ def accumulate_newell_normal(polyline: wp.array[wp.vec3], out_normal: wp.array[w
     # dim == n_points - 1: Newell's method sums cross products of consecutive vertices
     # (position vectors), cross(V_i, V_{i + 1}). Appending the closing vertex before launch
     # (as polyline_normal does) folds the wrap-around edge into this same sum.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     wp.atomic_add(out_normal, 0, wp.cross(polyline[i], polyline[i + 1]))
 
 
 @wp.kernel
 def cyclic_segment_angles(polyline: wp.array[wp.vec3], out_angles: wp.array[wp.float32]) -> None:
     # dim == n_points - 1: angle between segment i and the cyclically next segment.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     n_segments = polyline.shape[0] - 1
     s0 = segment_displacement(polyline, i)
     s1 = segment_displacement(polyline, (i + 1) % n_segments)
@@ -86,7 +86,7 @@ def cyclic_segment_angles(polyline: wp.array[wp.vec3], out_angles: wp.array[wp.f
 def distance_to_segments(
     points: wp.array[wp.vec3], polyline: wp.array[wp.vec3], out_distances: wp.array[wp.float32]
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     p = points[tid]
     n_segments = polyline.shape[0] - 1
     best = point_to_segment_distance(polyline[0], polyline[1], p)
@@ -99,7 +99,7 @@ def distance_to_segments(
 def distance_to_first_point(
     points: wp.array[wp.vec3], polyline: wp.array[wp.vec3], out_distances: wp.array[wp.float32]
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     out_distances[tid] = wp.length(points[tid] - polyline[0])
 
 
@@ -107,7 +107,7 @@ def distance_to_first_point(
 def segment_step_counts(
     polyline: wp.array[wp.vec3], step_size: wp.float32, out_steps: wp.array[wp.int32]
 ) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     length = wp.length(segment_displacement(polyline, i))
     out_steps[i] = wp.max(wp.int32(wp.floor(length / step_size)), wp.int32(1))
 
@@ -119,7 +119,7 @@ def upsample_gather(
     steps: wp.array[wp.int32],
     out_points: wp.array[wp.vec3],
 ) -> None:
-    j = int(wp.tid())
+    j = wp.int32(wp.tid())
     segment = binary_search_index(offsets, j) - 1
     k = j - offsets[segment]
     weight = wp.float32(k) / wp.float32(steps[segment])
@@ -208,7 +208,7 @@ def smooth_upsample_gather(
     closed: wp.int32,
     out_points: wp.array[wp.vec3],
 ) -> None:
-    j = int(wp.tid())
+    j = wp.int32(wp.tid())
     segment = binary_search_index(offsets, j) - 1
     k = j - offsets[segment]
     t = wp.float32(k) / wp.float32(steps[segment])
@@ -315,7 +315,7 @@ def rdp_keep_mask(
 
 @wp.kernel
 def broadcast_first_point(polyline: wp.array[wp.vec3], out_points: wp.array[wp.vec3]) -> None:
-    j = int(wp.tid())
+    j = wp.int32(wp.tid())
     out_points[j] = polyline[0]
 
 
@@ -328,7 +328,7 @@ def resample_interp(
 ) -> None:
     # Linear interpolation at evenly spaced arc lengths, mimicking numpy.interp:
     # constant (clamped) extrapolation at the endpoints.
-    j = int(wp.tid())
+    j = wp.int32(wp.tid())
     n = polyline.shape[0]
     total = cumulative_lengths[n - 1]
     x = wp.float32(0.0)
@@ -429,7 +429,7 @@ def accumulate_loop_frame(
     # edge is thread n - 1 and no closing vertex has to be appended first. The length-weighted
     # centroid deliberately is *not* cyclic: it runs over the n - 1 open segments, which is what
     # ``polyline_centroid`` (``closed=False``) computes and what this function has always used.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     n = polyline.shape[0]
     start = polyline[i]
     wp.atomic_add(out_normal, 0, wp.cross(start, polyline[wrap_index(i + 1, n)]))
@@ -462,14 +462,14 @@ def project_polyline_to_plane(
 ) -> None:
     # dim == n. The device-frame counterpart of mapping ``project_to_plane_2d`` over host-scope
     # ``wp.vec3`` uniforms.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     out_points2d[i] = project_to_plane_2d(polyline[i], frame[0], frame[1], frame[2])
 
 
 @wp.kernel
 def accumulate_turning_angle(points2d: wp.array[wp.vec2], out_total: wp.array[wp.float32]) -> None:
     # Cyclic signed exterior angle at each vertex; the sum's sign gives the loop orientation.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     n = points2d.shape[0]
     current = points2d[i]
     nxt = points2d[(i + 1) % n]
@@ -488,7 +488,7 @@ def orient_ccw(points2d: wp.array[wp.vec2], turning_angle: wp.array[wp.float32])
     # convex fast path that pair of readbacks was the entire cost of the call.
     if turning_angle[0] >= 0.0:
         return
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     p = points2d[i]
     points2d[i] = wp.vec2(p[0], -p[1])
 
@@ -496,7 +496,7 @@ def orient_ccw(points2d: wp.array[wp.vec2], turning_angle: wp.array[wp.float32])
 @wp.kernel
 def count_reflex(points2d: wp.array[wp.vec2], out_count: wp.array[wp.int32]) -> None:
     # Pre-clip the ring is trivial, so use direct cyclic neighbours. Convex polygon <=> 0 reflex.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     n = points2d.shape[0]
     prev = points2d[wrap_index(i - 1, n)]
     cur = points2d[i]
@@ -508,7 +508,7 @@ def count_reflex(points2d: wp.array[wp.vec2], out_count: wp.array[wp.int32]) -> 
 @wp.kernel
 def fan_triangulate(out_faces: wp.array2d[wp.int32]) -> None:
     # Convex fast-path: fan from vertex 0. dim == n - 2.
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     out_faces[k, 0] = wp.int32(0)
     out_faces[k, 1] = k + 1
     out_faces[k, 2] = k + 2
@@ -518,7 +518,7 @@ def fan_triangulate(out_faces: wp.array2d[wp.int32]) -> None:
 def init_ring(
     left: wp.array[wp.int32], right: wp.array[wp.int32], active: wp.array[wp.int32]
 ) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     n = left.shape[0]
     left[i] = wrap_index(i - 1, n)
     right[i] = (i + 1) % n
@@ -533,7 +533,7 @@ def compute_ears(
     active: wp.array[wp.int32],
     out_is_ear: wp.array[wp.int32],
 ) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     n = points2d.shape[0]
     if active[i] == 0:
         out_is_ear[i] = wp.int32(0)
@@ -583,7 +583,7 @@ def select_independent(
     # round and the clipper runs its full ``n``-round cap. Comparing by an effectively random key
     # instead makes this the textbook maximal-independent-set rule, which retires a constant
     # fraction of the ears per round.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     out_selected[i] = wp.int32(0)
     if is_ear[i] == 0:
         return
@@ -611,7 +611,7 @@ def clip_selected(
     out_faces: wp.array2d[wp.int32],
     out_count: wp.array[wp.int32],
 ) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if selected[i] == 0:
         return
     a = left[i]

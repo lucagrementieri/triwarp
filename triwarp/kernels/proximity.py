@@ -19,7 +19,7 @@ def mesh_aabb_collect(
     query = wp.mesh_query_aabb(mesh_id, lower, upper)
     face_idx = wp.int32(0)
     c = wp.int32(0)
-    max_hits_i = int(max_hits)
+    max_hits_i = max_hits
     while wp.mesh_query_aabb_next(query, face_idx) and c < max_hits_i:
         if write:
             out_indices[base + c] = face_idx
@@ -228,15 +228,15 @@ def winding_number(
     query_points: wp.array[wp.vec3],
     out_winding: wp.array[wp.float32],
 ) -> None:
-    q = int(wp.tid())
+    q = wp.int32(wp.tid())
     p = query_points[q]
     w = wp.float32(0.0)
-    n_f = int(n_faces)
+    n_f = n_faces
     for f in range(n_f):
         face_indices = faces[f * 3 : (f + 1) * 3]
-        i0 = int(face_indices[0])
-        i1 = int(face_indices[1])
-        i2 = int(face_indices[2])
+        i0 = wp.int32(face_indices[0])
+        i1 = wp.int32(face_indices[1])
+        i2 = wp.int32(face_indices[2])
         w = w + solid_angle(vertices[i0], vertices[i1], vertices[i2], p)
     out_winding[q] = w
 
@@ -255,11 +255,11 @@ def winding_number_tiled(
     # natural reduction, but `wp.launch_tiled` runs exactly one lane per block on the CPU
     # backend through Warp 1.16, so a per-lane tile holds one face and under-counts there.
     q, j = wp.tid()
-    p = query_points[int(q)]
+    p = query_points[q]
     total = wp.float32(0.0)
-    for face_idx in range(int(j), int(n_faces), int(n_slices)):
+    for face_idx in range(j, n_faces, n_slices):
         total = total + solid_angle_at_face(vertices, faces, face_idx, p)
-    wp.atomic_add(out_winding, int(q), total)
+    wp.atomic_add(out_winding, q, total)
 
 
 @wp.func
@@ -292,7 +292,7 @@ def face_containing_point_2d(
     # diagonal, against 0 / 14 / 59 exterior points falsely accepted at 1e-5 / 1e-4 / 1e-3). The
     # barycentric test is a sign test on the query's own coordinates, ~1000x sharper, so the radius
     # only has to be loose enough to find the candidate.
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     p = points[tid]
     out_face[tid] = wp.int32(-1)
     query = wp.mesh_query_point_no_sign(mesh_id, lift_vec2(p), search_radius)

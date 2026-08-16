@@ -31,7 +31,7 @@ def face_edge_keys(
     # One launch in place of ``faces_to_edges`` + ``pack_indices``, so the intermediate
     # ``(3F, 2)`` edge rows are never materialized. ``remesh.pass_edge_keys`` is the same kernel
     # over a fixed-capacity buffer, differing only in writing a sentinel key past the live faces.
-    write_face_edge_keys(faces, wp.int32(wp.tid()), base, out_keys)
+    write_face_edge_keys(faces, wp.tid(), base, out_keys)
 
 
 @wp.kernel
@@ -41,7 +41,7 @@ def edge_pairs_to_face_pairs(
     # Two edge indices sharing a key -> the ascending pair of faces owning them. Replaces a gather
     # through a materialized ``edges_face`` table plus an in-place row sort: the owning face of
     # edge ``e`` is just ``e // 3``, and ordering two values needs no sort kernel.
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     f0 = edge_groups[tid, 0] // 3
     f1 = edge_groups[tid, 1] // 3
     out_adjacency[tid, 0] = wp.min(f0, f1)
@@ -77,7 +77,7 @@ def face_adjacency_unshared(
     face_adjacency_edges: wp.array2d[wp.int32],
     out_unshared: wp.array2d[wp.int32],
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     f0 = face_adjacency[tid, 0] * 3
     f1 = face_adjacency[tid, 1] * 3
     e0 = face_adjacency_edges[tid, 0]
@@ -91,7 +91,7 @@ def edge_endpoints(faces: wp.array[wp.int32], edge_index: wp.int32) -> tuple[wp.
     # The sorted endpoints of edge ``3f + c``, recovered from the edge index alone. Corner ``c`` of
     # face ``f`` spans ``(v[c], v[(c + 1) % 3])``, matching ``kernels/edges.py:faces_to_edges``, so
     # this reproduces exactly the row ``faces_to_edges(sorted=True)`` would have written there.
-    face_base = (edge_index / 3) * 3
+    face_base = (edge_index // 3) * 3
     corner = edge_index % 3
     a = faces[face_base + corner]
     b = faces[face_base + (corner + 1) % 3]
@@ -105,12 +105,12 @@ def face_adjacency_unshared_from_edges(
     # Same answer as ``face_adjacency_unshared`` with no edge table and no adjacency table: the
     # shared edge and both owning faces all come out of the two edge indices. Column order follows
     # ``edge_pairs_to_face_pairs``, which emits the face pair ascending.
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     edge_0 = edge_groups[tid, 0]
     edge_1 = edge_groups[tid, 1]
     shared_a, shared_b = edge_endpoints(faces, edge_0)
-    face_0 = edge_0 / 3
-    face_1 = edge_1 / 3
+    face_0 = edge_0 // 3
+    face_1 = edge_1 // 3
     base_0 = face_0 * 3
     base_1 = face_1 * 3
     unshared_0 = unshared_vertex(
@@ -133,7 +133,7 @@ def face_adjacency_angles(
     face_adjacency: wp.array2d[wp.int32],
     out_angles: wp.array[wp.float32],
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     normal_a = face_normals[face_adjacency[tid, 0]]
     normal_b = face_normals[face_adjacency[tid, 1]]
     out_angles[tid] = vector_angle(normal_a, normal_b)
@@ -149,7 +149,7 @@ def scatter_vertex_faces(
     # Vertex-to-face CSR payload. Row order is thread-order and therefore arbitrary, which is what
     # the wrapper documents: a rotational order would need halfedge twins and would refuse a
     # vertex-non-manifold mesh, which the decimator that consumes this must not do.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     for k in range(3):
         v = faces[f * 3 + k]
         out_vertex_faces[offsets[v] + wp.atomic_add(cursor, v, 1)] = f

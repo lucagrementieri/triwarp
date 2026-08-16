@@ -53,7 +53,7 @@ def fan_faces(
     n_loops: wp.int32,
     out_faces: wp.array[wp.int32],
 ) -> None:
-    ell = int(wp.tid())
+    ell = wp.int32(wp.tid())
     o = loop_starts[ell]
     s = loop_size(loop_starts, total, n_loops, ell)
     # This loop contributes s - 2 fan triangles; earlier loops occupy o - 2 * ell of them.
@@ -74,7 +74,7 @@ def cone_faces(
     n_vertices: wp.int32,
     out_faces: wp.array[wp.int32],
 ) -> None:
-    ell = int(wp.tid())
+    ell = wp.int32(wp.tid())
     o = loop_starts[ell]
     s = loop_size(loop_starts, total, n_loops, ell)
     apex = n_vertices + ell
@@ -96,7 +96,7 @@ def loop_centroids(
     n_loops: wp.int32,
     out_centroids: wp.array[wp.vec3],
 ) -> None:
-    ell = int(wp.tid())
+    ell = wp.int32(wp.tid())
     o = loop_starts[ell]
     s = loop_size(loop_starts, total, n_loops, ell)
     acc = wp.vec3(0.0, 0.0, 0.0)
@@ -225,7 +225,7 @@ def loop_rim_metrics(
     # the ``char_area`` scale) and the Newell normal sum (segmented sum, the hole plane). The
     # per-loop equivalents are ``tw.reduce.max`` over a gathered rim and
     # ``tw.polyline.polyline_normal``, each of which costs a host synchronization per loop.
-    t = int(wp.tid())
+    t = wp.int32(wp.tid())
     ell = loop_id[t]
     o = loop_starts[ell]
     b = loop_sizes[ell]
@@ -246,7 +246,7 @@ def loop_perimeters(
 ) -> None:
     # Segmented ``polyline_length(closed=True)``: the arc length of every loop in one launch, so
     # ``preserve_largest_hole`` costs one readback instead of two per loop.
-    t = int(wp.tid())
+    t = wp.int32(wp.tid())
     ell = loop_id[t]
     o = loop_starts[ell]
     b = loop_sizes[ell]
@@ -525,7 +525,7 @@ def flag_bad_triangulations(
 ) -> None:
     # Per-loop min-area retry mask: the whole-loop interval is dp[0, B - 1]. Testing it on device
     # replaces copying every loop's ``B x B`` table to the host to read one scalar out of it.
-    ell = int(wp.tid())
+    ell = wp.int32(wp.tid())
     top = dp[dp_offsets[ell] + loop_sizes[ell] - 1]
     out_retry[ell] = wp.where(top >= BAD_METRIC, wp.int32(1), wp.int32(0))
 
@@ -533,7 +533,7 @@ def flag_bad_triangulations(
 @wp.kernel
 def edge_third_vertex(faces: wp.array[wp.int32], out_third: wp.array[wp.int32]) -> None:
     # Third vertex per faces_to_edges row: edge k of face f is (v_k, v_{k+1}), third is v_{k+2}.
-    r = int(wp.tid())
+    r = wp.int32(wp.tid())
     f = r // 3
     k = r % 3
     out_third[r] = faces[f * 3 + (k + 2) % 3]
@@ -556,7 +556,7 @@ def rim_opposite_from_table(
     # Per rim edge (loop[i], loop[i+1]) of every loop at once: probe the sorted packed-edge table;
     # a single hit means exactly one adjacent existing face, whose third vertex blends the fill
     # dihedral metrics into the surface (host dict semantics of the former _rim_opposite).
-    t = int(wp.tid())
+    t = wp.int32(wp.tid())
     ell = loop_id[t]
     o = loop_starts[ell]
     u = flat_loops[t]
@@ -582,8 +582,8 @@ def scatter_loop_positions(
     # loop — so the highest position still wins on a duplicated loop vertex (matching the
     # last-write-wins dict the host implementation built), and a pinch vertex shared by two loops
     # resolves to the later loop rather than needing the scratch cleared between loops.
-    t = int(wp.tid())
-    wp.atomic_max(out_flat_slot, flat_loops[t], wp.int32(t))
+    t = wp.int32(wp.tid())
+    wp.atomic_max(out_flat_slot, flat_loops[t], t)
 
 
 @wp.kernel
@@ -600,7 +600,7 @@ def mark_forbidden_chords(
     # (MeshLib MultipleEdgesResolveMode::Simple). Idempotent writes: no atomics needed. One pass
     # over the whole mesh marks the masks of *all* loops, because ``flat_slot`` distinguishes them:
     # an edge whose endpoints land in two different loops is not a chord of either.
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     tu = flat_slot[edges_sorted[e, 0]]
     tv = flat_slot[edges_sorted[e, 1]]
     if tu < 0 or tv < 0:

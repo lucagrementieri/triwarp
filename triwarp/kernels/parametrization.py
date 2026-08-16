@@ -14,8 +14,8 @@ EPSILON_ARAP_EDGE_SQ = wp.constant(wp.float64(1.0e-20))
 def flipped_faces_mask(
     vertices: wp.array[wp.vec2], faces: wp.array[wp.int32], out_mask: wp.array[wp.bool]
 ) -> None:
-    fi = int(wp.tid())
-    v0, v1, v2 = face_vertices(vertices, faces, wp.int32(fi))
+    fi = wp.int32(wp.tid())
+    v0, v1, v2 = face_vertices(vertices, faces, fi)
     e0 = v1 - v0
     e1 = v2 - v0
     # 2D signed area * 2 == det of libigl's homogeneous 3x3 matrix
@@ -27,7 +27,7 @@ def scatter_boundary_mask(
     boundary_indices: wp.array[wp.int32], out_mask: wp.array[wp.bool]
 ) -> None:
     # Mark every fixed (boundary) vertex; interior vertices keep the pre-set ``False``.
-    b = int(wp.tid())
+    b = wp.int32(wp.tid())
     out_mask[boundary_indices[b]] = True
 
 
@@ -40,7 +40,7 @@ def scatter_fixed_uv(
     # Scatter the prescribed boundary positions into a ``(2, n_vertices)`` buffer (row 0 = u,
     # row 1 = v) so the system-assembly kernel can look up ``bc[c, j]`` by right-hand-side column
     # ``c`` and original vertex index ``j``. float64 to match the float64 conjugate-gradient path.
-    b = int(wp.tid())
+    b = wp.int32(wp.tid())
     i = boundary_indices[b]
     uv = boundary_uv[b]
     out_fixed_values[0, i] = wp.float64(uv[0])
@@ -59,7 +59,7 @@ def scatter_solution(
     # (``fixed_values`` is ``(2, n_vertices)``), free vertices read the solved value at their
     # compact index (``sol`` is ``(2, n_free)``). Handles the all-fixed case (``n_free == 0``): the
     # free branch is then never taken, so the empty ``sol`` is never indexed.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if fixed_mask[i]:
         out_uv[i] = wp.vec2(wp.float32(fixed_values[0, i]), wp.float32(fixed_values[1, i]))
     else:
@@ -73,7 +73,7 @@ def boundary_edge_lengths(
 ) -> None:
     # Segment length between consecutive boundary vertices; ``out_len[0] = 0`` seeds the arc-length
     # prefix sum (matches ``igl::map_vertices_to_circle``).
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if i == 0:
         out_len[0] = wp.float32(0.0)
     else:
@@ -89,7 +89,7 @@ def circle_positions(
 ) -> None:
     # Arc-length parametrization onto the unit circle: ``frac = len[i] * 2pi / total`` with the
     # total perimeter closing over the wrap edge ``bnd[0] -> bnd[n-1]``.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     n = cumulative_length.shape[0]
     wrap = wp.length(vertices[boundary[0]] - vertices[boundary[n - 1]])
     total = cumulative_length[n - 1] + wrap
@@ -107,7 +107,7 @@ def scatter_pinned_stacked(
 ) -> None:
     # Fused mask + value scatter for LSCM's stacked ``[u; v]`` DOFs: pin ``i`` fixes DOF ``i`` (u)
     # and ``i + n`` (v). ``out_fixed_values`` is ``(1, 2n)`` (single right-hand-side column).
-    b = int(wp.tid())
+    b = wp.int32(wp.tid())
     i = pinned_indices[b]
     uv = pinned_uv[b]
     out_fixed_mask[i] = True
@@ -128,7 +128,7 @@ def scatter_solution_stacked(
     # holds v; each is either a pinned value (``fixed_values``) or a solved free value (``sol`` at
     # the compact free index). Locals are initialized before the branch per Warp's branch-scope
     # rule.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     n = out_uv.shape[0]
     u = wp.float64(0.0)
     v = wp.float64(0.0)
@@ -155,8 +155,8 @@ def arap_rest_edges(
     # e2:(0,1). Run once (dim = n_faces): folding the half-cotangent weight ``c_e`` in here removes
     # the cotangent lookup from the per-iteration local step. Computed in float64 (squared edge
     # lengths promoted from the float32 vertex precision) for a deterministic operator.
-    f = int(wp.tid())
-    v0, v1, v2 = face_vertices(vertices, faces, wp.int32(f))
+    f = wp.int32(wp.tid())
+    v0, v1, v2 = face_vertices(vertices, faces, f)
     l2_0f, l2_1f, l2_2f = squared_edge_lengths(v0, v1, v2)
     # l0 = |v1 - v2|, l1 = |v2 - v0|, l2 = |v0 - v1| (igl edge_lengths column order).
     l2_0 = wp.float64(l2_0f)
@@ -216,7 +216,7 @@ def arap_local_step(
     # ``out_rhs_x`` / ``out_rhs_y`` are the two rows of the (2, n_vertices) rotation RHS and must be
     # zeroed before launch. Degenerate faces have zero rest edges, so S = 0, atan2(0, 0) = 0, and
     # the identity rotation scatters nothing.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     i0 = faces[f * 3 + 0]
     i1 = faces[f * 3 + 1]
     i2 = faces[f * 3 + 2]
@@ -256,7 +256,7 @@ def arap_interior_rhs(
     # compact free index) plus the scattered rotation RHS at the original vertex index; boundary
     # rows carry no unknown and are skipped. ``rhs_const`` / ``out_b`` are (2, n_interior) (rows
     # u, v); ``rhs_rot_*`` are (n_vertices,).
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if fixed_mask[i]:
         return
     ri = free_map[i]
@@ -274,7 +274,7 @@ def gather_interior_uv(
     # Seed the conjugate-gradient warm start with the current interior UV (dim = n_vertices):
     # interior vertex ``i`` writes its UV into the two rows (u, v) of ``out_sol`` at the compact
     # free index; boundary vertices are skipped. ``out_sol`` is (2, n_interior).
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if fixed_mask[i]:
         return
     ri = free_map[i]

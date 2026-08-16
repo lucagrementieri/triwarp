@@ -23,7 +23,7 @@ def offset_packed_faces(
     # nothing here — the owning piece is found by an upper-bound search over its start offsets
     # (``piece_starts[0]`` is 0, so the search never returns 0). Pieces contributing no faces share
     # a start with their successor; the upper bound skips them, which is the right answer.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     piece = kernel_array.binary_search_index(piece_starts, i) - 1
     faces[i] = faces[i] + vertex_offsets[piece]
 
@@ -39,7 +39,7 @@ def cyclic_gather(
 ) -> None:
     # out[i] = src[wrap(index)] + value_offset with index = n-1-i (flip) or i+shift (roll);
     # covers loop reversal, cyclic rolls, and the roll-plus-vertex-offset variant in one kernel.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     j = i + shift
     if flip:
         j = n - 1 - i
@@ -67,7 +67,7 @@ def row_argmin(
     out_col: wp.array[wp.int32],
     out_val: wp.array[wp.float32],
 ) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     best_col = wp.int32(0)
     best_val = perimeters[i, 0]
     for j in range(1, m_b):
@@ -103,7 +103,7 @@ def rolled_edge_map(
 ) -> None:
     # Per-edge B vertex after rolling both loops so the global-min pair is first
     # (``argmin(roll(roll(perimeters, -shift_a, 0), -shift_b, 1), axis=1)``).
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     out_edge[i] = _wrap(col_min[_wrap(i + shift_a, n_a)] - shift_b, m_b)
 
 
@@ -145,7 +145,7 @@ def bridge_a_faces(
     n_a: wp.int32,
     out_faces: wp.array[wp.int32],
 ) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     out_faces[3 * i + 0] = roll_loop_a[i]
     out_faces[3 * i + 1] = roll_loop_a[_wrap(i + 1, n_a)]
     out_faces[3 * i + 2] = roll_loop_b[edge[i]]
@@ -160,7 +160,7 @@ def bridge_b_faces(
     m_b: wp.int32,
     out_faces: wp.array[wp.int32],
 ) -> None:
-    j = int(wp.tid())
+    j = wp.int32(wp.tid())
     # ``edge`` is non-decreasing, so the upper bound over its first ``n_a`` entries is the count of
     # entries at or below ``j`` -- the A-loop vertex this B-loop vertex fans to. A result of ``n_a``
     # wraps to the first.
@@ -270,7 +270,7 @@ def stitch_dp_diag(
     # diagonal, so launching diag = 1, 2, ... in order are the DP barriers. dp[i, j] = min cost of
     # the band consuming i edges of A and j edges of B from the aligned start (cell (0, 0)).
     i_lo = wp.max(0, diag - n_b)
-    i = i_lo + int(wp.tid())
+    i = i_lo + wp.int32(wp.tid())
     j = diag - i
     if i > n_a or j < 0 or j > n_b or (i == 0 and j == 0):
         return

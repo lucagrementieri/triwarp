@@ -135,19 +135,19 @@ def divide_if_positive(value: wp.float32, divisor: wp.float32) -> wp.float32:
 
 @wp.kernel
 def init_range(out_indices: wp.array[wp.Int]) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     out_indices[i] = i
 
 
 @wp.kernel
 def init_range_step(step: wp.Int, out_indices: wp.array[wp.Int]) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     out_indices[i] = i * step
 
 
 @wp.kernel
 def init_sort_pair_indices(n: wp.Int, fill_value: wp.Int, out_indices: wp.array[wp.Int]) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if i < n:
         out_indices[i] = i
     else:
@@ -156,7 +156,7 @@ def init_sort_pair_indices(n: wp.Int, fill_value: wp.Int, out_indices: wp.array[
 
 @wp.kernel
 def init_repeat_index(repeats: wp.Int, out_indices: wp.array[wp.Int]) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     out_indices[i] = i // repeats
 
 
@@ -164,7 +164,7 @@ def init_repeat_index(repeats: wp.Int, out_indices: wp.array[wp.Int]) -> None:
 def gather_1d_skip_negative(
     indices: wp.array[wp.int32], table: wp.array[wp.int32], out_gathered: wp.array[wp.int32]
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     index = indices[tid]
     if index < wp.int32(0):
         out_gathered[tid] = index
@@ -177,7 +177,7 @@ def sort_rows_insertion(data: wp.array2d[wp.Scalar]) -> None:
     # One thread per row, in-place insertion sort across the row. For the narrow rows this library
     # actually sorts (vertex pairs, triangle corners) that is 1-3 register comparisons, versus a
     # segmented radix sort whose fixed per-segment cost dominates completely at these widths.
-    row = int(wp.tid())
+    row = wp.int32(wp.tid())
     width = data.shape[1]
     for i in range(1, width):
         value = data[row, i]
@@ -194,7 +194,7 @@ def gather_vec_skip_negative(
 ) -> None:
     # Gather vectors by index, writing a zero vector wherever the index is negative
     # (missing-correspondence sentinel).
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     f = index[i]
     if f >= 0:
         out_gathered[i] = source[f]
@@ -215,7 +215,7 @@ def shifted_index(value: wp.Scalar, offset: wp.Scalar) -> wp.int32:
 def isin_lookup_sorted(
     elements: wp.array[wp.Scalar], sorted_test: wp.array[wp.Scalar], out_mask: wp.array[wp.bool]
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     out_mask[tid] = binary_search_sorted_contains(sorted_test, elements[tid])
 
 
@@ -339,7 +339,7 @@ def binary_search_sorted_contains(values: wp.array[wp.Scalar], value: wp.Scalar)
 def map_sorted_inverse(
     data: wp.array[wp.Scalar], sorted_unique: wp.array[wp.Scalar], out_inverse: wp.array[wp.int32]
 ) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     out_inverse[i] = binary_search_index(sorted_unique, data[i]) - wp.int32(1)
 
 

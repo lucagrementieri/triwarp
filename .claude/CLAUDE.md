@@ -33,7 +33,24 @@ You are an expert in NVIDIA Warp (wp). Follow all rules below when writing kerne
 ## 3. Kernel Execution Logic
 
 - Always use `tid = wp.tid()` (or `i, j = wp.tid()` for 2-D grids) to retrieve the thread index inside a kernel.
-- Cast `wp.tid()` to `int` explicitly when used as an array index: `f = int(wp.tid())`.
+- Cast `wp.tid()` explicitly when used as an array index: `f = wp.int32(wp.tid())`. **`wp.int32` /
+  `wp.float32` are the tree's only cast spelling** — never the bare `int(...)` / `float(...)`
+  builtins, which `tests/api_conventions.py` check 16 rejects inside a kernel or `@wp.func` body.
+  They are the same builtins under a different name (`int(x)` compiles only because Warp writes an
+  unconditional `#define int(x) cast_int(x)` into every module header), with one difference that
+  matters: **`float(...)` is a hard compile error inside a `wp.Float`-generic function** —
+  `total / float(count)` fails to parse with `Input types must be the same, got ['float64',
+  'float32']` rather than silently narrowing — so it silently forecloses ever making that function
+  generic. Where the enclosing function is or could be generic, the spelling is `type(x)(...)`, the
+  `kernels/predicates.py` convention.
+- **A cast to the type a value already has is noise; delete it.** No cast is load-bearing: a bare
+  `wp.tid()` passes unchanged to a `wp.int32` parameter, to a `wp.Scalar` generic and into a
+  kernel-scope slice (verified on Warp 1.16). So `wp.int32(offsets[i])` on a `wp.array[wp.int32]`,
+  `wp.int32(n_faces)` on a `wp.int32` argument, and `wp.int32(f)` three lines under
+  `f = wp.int32(wp.tid())` all say nothing. The tid cast is the one exception the tree keeps,
+  because it is the *declarative* one: it names the type of the index the whole kernel is written
+  against. A cast of a bare **literal** is also never redundant — `wp.int32(0)` is a mutable Warp
+  dynamic variable where `0` is a compile-time constant that freezes the enclosing loop.
 - Use `wp.launch(kernel=..., dim=..., inputs=[...], device=...)` for execution. Always forward the `device` from the input arrays.
 - Array slicing is supported inside kernels: `faces[f * 3 : (f + 1) * 3]` produces a sub-array view.
 - Use `wp.cast(expr, TargetType)` for explicit type conversions between Warp types — but **only
@@ -324,6 +341,7 @@ The following Python features are **not supported** inside `@wp.kernel` and `@wp
 - Python tuples for initialization — use explicit typed constructors: `wp.vec3(1.0, 2.0, 3.0)`, not `(1.0, 2.0, 3.0)`.
 - For small fixed-size collections use vector types (`wp.vec3`, etc.); for larger ones use `wp.zeros(shape=N, dtype=T)` (stack-allocated inside a kernel).
 - The `%` operator follows C++11 semantics (sign of result = sign of dividend), not Python semantics.
+- **`//` truncates toward zero like `/`, not toward −infinity like CPython's `//`, and on integers the two operators are the same operation.** Measured on Warp 1.16: `[-8, -7, -1, 0, 1, 7, 8] ÷ 3` gives `[-2, -2, 0, 0, 0, 2, 2]` for both spellings, where CPython's `//` gives `[-3, -3, -1, 0, 0, 2, 2]`. This is consistent with the `%` rule above (`-8 % 3 == -2`, and `-2 * 3 + (-2) == -8`). **Spell integer division `//`** — `/` on two `int32`s reads as real division and only truncates because the operands happen to be integers, so a reader has to recover the types before knowing what the line does. Every dividend in this package is a non-negative index, where the two conventions coincide; the hazard is *porting* a line with a negative dividend between host Python and kernel scope, which changes its answer silently.
 - `wp.asin()` / `wp.acos()` auto-clamp inputs to [-1, 1]; explicit `wp.clamp` before these calls is redundant but harmless.
 - Variable scope inside conditional blocks may differ from CPython: variables defined only inside an `if` branch are accessible afterward in Warp, but are uninitialized if the branch was not taken — always initialize variables before branching.
 

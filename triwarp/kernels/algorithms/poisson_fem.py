@@ -85,7 +85,7 @@ def lattice_positions(
     # Coordinates are clamped a hair inside ``[0, hi]`` so the outermost lattice planes still land
     # in a cell instead of returning a NULL lookup.
     i, j, k = wp.tid()
-    x = wp.clamp(float(i) * step, 1e-3, hi)
-    y = wp.clamp(float(j) * step, 1e-3, hi)
-    z = wp.clamp(float(k) * step, 1e-3, hi)
+    x = wp.clamp(wp.float32(i) * step, 1e-3, hi)
+    y = wp.clamp(wp.float32(j) * step, 1e-3, hi)
+    z = wp.clamp(wp.float32(k) * step, 1e-3, hi)
     out_positions[(i * res + j) * res + k] = wp.vec3(x, y, z)

@@ -19,7 +19,7 @@ def seed_source_scalars(
     out_weighted: wp.array[wp.float64],
 ) -> None:
     # Scalar extension needs two right-hand sides: where the sources are, and what they carry.
-    s = int(wp.tid())
+    s = wp.int32(wp.tid())
     v = sources[s]
     wp.atomic_add(out_indicator, v, wp.float64(1.0))
     wp.atomic_add(out_weighted, v, values[s])
@@ -91,7 +91,7 @@ def scatter_face_field_to_vertices(
 ) -> None:
     # Area-weighted average of a per-face vector field onto vertices, as a plain scatter-add: the
     # weights are the same for all three corners so no normalization is needed before projecting.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     area = face_areas[f]
     value = wp.vec3(
         wp.float32(field[f][0]) * area,
@@ -121,8 +121,8 @@ def face_gradient_unit(
     # this caller would ever set (§14, speculative generality: one caller per mode). The two also
     # return different quantities: a gradient carries the field's rate of change, this carries only
     # a direction.
-    f = int(wp.tid())
-    out_gradient[f] = face_unit_gradient(vertices, faces, normals, areas, values, wp.int32(f))
+    f = wp.int32(wp.tid())
+    out_gradient[f] = face_unit_gradient(vertices, faces, normals, areas, values, f)
 
 
 @wp.func
@@ -149,7 +149,7 @@ def log_map_from_angles(
     # ``radial`` points away from the source here. The angle between them is preserved by transport
     # along the connecting geodesic, so it *is* the angle at which that geodesic leaves the
     # source -- which with the distance gives the vertex's position in the source's tangent plane.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     reference = transported[v]
     outward = radial[v]
     r = wp.float32(distance[v])

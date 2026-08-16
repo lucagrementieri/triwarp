@@ -30,7 +30,7 @@ def scatter_duplicate_face_stats(
     # Per input face: orientation sign against its group representative (the first-occurring
     # face, gathered via ``inverse``) scattered into per-group stats. ``first_*`` slots hold the
     # smallest face index of each sign class (seeded with the n_faces sentinel).
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     ui = inverse[f]
     consistent = cyclic_match(
         faces[f * 3],
@@ -41,13 +41,13 @@ def scatter_duplicate_face_stats(
         unique_faces[ui * 3 + 2],
     )
     wp.atomic_add(out_member_count, ui, wp.int32(1))
-    wp.atomic_min(out_first_member, ui, wp.int32(f))
+    wp.atomic_min(out_first_member, ui, f)
     if consistent:
         wp.atomic_add(out_signed_count, ui, wp.int32(1))
-        wp.atomic_min(out_first_positive, ui, wp.int32(f))
+        wp.atomic_min(out_first_positive, ui, f)
     else:
         wp.atomic_add(out_signed_count, ui, wp.int32(-1))
-        wp.atomic_min(out_first_negative, ui, wp.int32(f))
+        wp.atomic_min(out_first_negative, ui, f)
 
 
 @wp.kernel
@@ -63,7 +63,7 @@ def resolve_duplicate_groups(
     # Keep-decision per duplicate group (igl::resolve_duplicated_faces): singletons stay; a net
     # +1/-1 orientation keeps the first member of the majority sign; a cancelling group drops;
     # anything else is non-orientable (the smallest offending group index is reported).
-    ui = int(wp.tid())
+    ui = wp.int32(wp.tid())
     count = signed_count[ui]
     if member_count[ui] == 1:
         out_keep[ui] = first_member[ui]
@@ -74,7 +74,7 @@ def resolve_duplicate_groups(
     else:
         out_keep[ui] = wp.int32(-1)
         if count != 0:
-            wp.atomic_min(out_error_group, 0, wp.int32(ui))
+            wp.atomic_min(out_error_group, 0, ui)
 
 
 @wp.kernel(enable_backward=False)
@@ -86,7 +86,7 @@ def small_triangle_collapse_edges(
     out_flag: wp.array[wp.int32],
 ) -> None:
     """Flag faces with double-area below ``min_dbl_area`` and emit their shortest edge (libigl)."""
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     face = faces[f * 3 : (f + 1) * 3]
     i0 = face[0]
     i1 = face[1]
@@ -116,7 +116,7 @@ def flip_faces_masked(
     faces: wp.array[wp.int32], flip: wp.array[wp.int32], out_faces: wp.array[wp.int32]
 ) -> None:
     """Copy ``faces`` to ``out_faces``, reversing winding (swap corners 1,2) where ``flip > 0``."""
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     base = f * wp.int32(3)
     i0 = faces[base]
     i1 = faces[base + wp.int32(1)]
@@ -147,7 +147,7 @@ def accumulate_neighbor_normals(
     # One pass over the adjacency pairs, scattering both per-face quantities the bad-face criteria
     # need: the sum of the neighbouring face normals (whose direction is the local consensus) and
     # the sharpest dihedral angle to any neighbour (which is what a fold looks like).
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     f0 = face_adjacency[k, 0]
     f1 = face_adjacency[k, 1]
     angle = adjacency_angles[k]
@@ -172,7 +172,7 @@ def bad_face_mask(
     # back onto its own ring. Each criterion is disabled by passing a cosine of -2 / a quality of
     # -1, which no real value can reach, so the three gates compose without a separate flag
     # argument.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     if quality[f] < min_quality:
         out_bad[f] = wp.bool(True)
         return
@@ -210,9 +210,9 @@ def halfedge_orientation_slots(
     # (a flipped neighbour), three or more of either (a non-manifold edge), or one alone (a
     # boundary) -- is not mergeable, so its corner slot is never read and the ``atomic_max`` only
     # keeps the write deterministic.
-    c = int(wp.tid())
+    c = wp.int32(wp.tid())
     e = edge_of_corner[c]
-    f = c / 3
+    f = c // 3
     j = c % 3
     if faces[c] < faces[f * 3 + (j + 1) % 3]:
         wp.atomic_add(out_forward_count, e, 1)
@@ -239,7 +239,7 @@ def corner_merge_links(
     # A non-mergeable edge emits two self-loops on node 0 rather than nothing, which keeps the
     # output a fixed ``(2 * n_edges, 2)`` buffer with no compaction pass; a self-loop merges
     # nothing.
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     out_links[e * 2 + 0, 0] = 0
     out_links[e * 2 + 0, 1] = 0
     out_links[e * 2 + 1, 0] = 0
@@ -251,8 +251,8 @@ def corner_merge_links(
     backward = backward_corner[e]
     # The forward half-edge runs (low, high) from its own corner; the backward one runs (high, low),
     # so its *next* slot holds the low endpoint.
-    forward_next = (forward / 3) * 3 + (forward + 1) % 3
-    backward_next = (backward / 3) * 3 + (backward + 1) % 3
+    forward_next = (forward // 3) * 3 + (forward + 1) % 3
+    backward_next = (backward // 3) * 3 + (backward + 1) % 3
     out_links[e * 2 + 0, 0] = forward  # low endpoint, forward face
     out_links[e * 2 + 0, 1] = backward_next  # low endpoint, backward face
     out_links[e * 2 + 1, 0] = forward_next  # high endpoint, forward face

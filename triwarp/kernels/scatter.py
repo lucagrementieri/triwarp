@@ -20,7 +20,7 @@ def scatter_add(values: wp.array[Any], indices: wp.array[wp.int32], out_sum: wp.
     # method seeds a ``wp.vec2d`` field through exactly this kernel. The widening gives up a
     # compile-time dtype guard: Warp still rejects a mismatched ``values`` / ``out_sum`` pair, but
     # the error arrives from codegen rather than from overload resolution and reads worse.
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     wp.atomic_add(out_sum, indices[tid], values[tid])
 
 
@@ -30,7 +30,7 @@ def count_occurrences(indices: wp.array[wp.int32], out_counts: wp.array[wp.int32
     # Sizing a CSR is what every caller wants it for -- incident faces per vertex (a flat face
     # buffer *is* the corner -> vertex map), face-corners per unique edge, outgoing halfedges per
     # vertex -- so the counts feed a scan and the caller allocates ``out_counts`` zeroed.
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     wp.atomic_add(out_counts, indices[tid], 1)
 
 
@@ -38,7 +38,7 @@ def count_occurrences(indices: wp.array[wp.int32], out_counts: wp.array[wp.int32
 def count_occurrences_rows(indices: wp.array2d[wp.int32], out_counts: wp.array[wp.int32]) -> None:
     # Row form of ``count_occurrences``: every column of every row increments its own counter.
     # One thread per row, so an edge list ``(n, 2)`` gives each endpoint's degree in one launch.
-    row = int(wp.tid())
+    row = wp.int32(wp.tid())
     for j in range(indices.shape[1]):
         wp.atomic_add(out_counts, indices[row, j], 1)
 
@@ -102,7 +102,7 @@ def scatter_face_thirds(
     # Barycentric (lumped) mass: each face donates ``areas[f] / count`` to each incident vertex.
     # ``areas``, ``count`` and ``out_mass`` share one float dtype so the kernel specialises to
     # float32 (Laplacian) or float64 (geodesic heat method) at launch time.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     third = areas[f] / count
     wp.atomic_add(out_mass, faces[f * 3 + 0], third)
     wp.atomic_add(out_mass, faces[f * 3 + 1], third)
@@ -116,7 +116,7 @@ def scatter_face_values_sum_and_valence(
     out_sum: wp.array[wp.float32],
     out_valence: wp.array[wp.float32],
 ) -> None:
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     value = face_values[f]
     for j in range(3):
         vertex_index = faces[f * 3 + j]
@@ -133,7 +133,7 @@ def scatter_edges_sum_and_valence(
     out_sum: wp.array[wp.float32],
     out_valence: wp.array[wp.float32],
 ) -> None:
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     for j in range(3):
         if edges_orientation[f, j] < 0:
             continue
@@ -149,8 +149,8 @@ def scatter_edges_sum_and_valence(
 
 @wp.kernel
 def scatter_index(index: wp.array[wp.int32], out_scattered: wp.array[wp.int32]) -> None:
-    tid = int(wp.tid())
-    out_scattered[index[tid]] = wp.int32(tid)
+    tid = wp.int32(wp.tid())
+    out_scattered[index[tid]] = tid
 
 
 @wp.kernel
@@ -160,9 +160,9 @@ def scatter_index_where(
     # ``flags`` is the 0/1 selection array and ``inclusive`` its inclusive prefix sum, so a set
     # position lands at ``inclusive[i] - 1`` (its exclusive-scan value). Reading the flags rather
     # than the original mask is what lets ``flatnonzero`` take non-boolean input from one kernel.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if flags[i] != wp.int32(0):
-        out_scattered[inclusive[i] - 1] = wp.int32(i)
+        out_scattered[inclusive[i] - 1] = i
 
 
 @wp.kernel
@@ -170,7 +170,7 @@ def mark_membership_mask(
     indices: wp.array[wp.int32], n: wp.int32, out_mask: wp.array[wp.bool]
 ) -> None:
     # Mark out_mask[indices[tid]] = True, skipping out-of-range indices (negative or >= n).
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     index = indices[tid]
     if index >= wp.int32(0) and index < n:
         out_mask[index] = wp.bool(True)

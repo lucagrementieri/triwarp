@@ -120,7 +120,7 @@ def estimate_point_normals(
 ) -> None:
     # Per-point normal = eigenvector of the smallest eigenvalue of the neighbourhood
     # covariance (same choice as MeshLib PointAccumulator and Open3D FastEigen3x3).
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     k = neighbor_idx.shape[1]
 
     # Local neighbourhood mean over the valid entries of the table. A self-query table
@@ -178,7 +178,7 @@ def neighbor_distance_moments(
     # zero count, which is how both callers detect it.
     #
     # The mean feeds Open3D's statistical criterion and the RMS is the LoOP "standard distance".
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     k = neighbor_distance.shape[1]
     total = wp.float32(0.0)
     total_sq = wp.float32(0.0)
@@ -194,7 +194,7 @@ def neighbor_distance_moments(
         out_mean[i] = 0.0
         out_rms[i] = 0.0
         return
-    inverse = 1.0 / float(count)
+    inverse = 1.0 / wp.float32(count)
     out_mean[i] = total * inverse
     out_rms[i] = wp.sqrt(total_sq * inverse)
 
@@ -211,7 +211,7 @@ def local_outlier_factor(
     #
     # The LoOP normalization factor lambda cancels here (it scales numerator and denominator
     # alike); it only enters through the cloud-wide nplof the caller divides by.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     k = neighbor_idx.shape[1]
     total = wp.float32(0.0)
     count = wp.int32(0)
@@ -223,7 +223,7 @@ def local_outlier_factor(
     if count == 0 or total <= 0.0:
         out_plof[i] = 0.0
         return
-    out_plof[i] = standard_distance[i] * float(count) / total - 1.0
+    out_plof[i] = standard_distance[i] * wp.float32(count) / total - 1.0
 
 
 @wp.func

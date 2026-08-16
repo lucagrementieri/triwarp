@@ -15,7 +15,7 @@ def fibonacci_lattice(
 ) -> None:
     # z descends uniformly through (1 - z_span, 1); the offset 0.5 centers the samples.
     # z_span = 2 covers the full sphere, z_span = 1 the positive-z hemisphere.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     count_f = wp.float32(count)
     z = 1.0 - z_span * (wp.float32(i) + 0.5) / count_f
     radius = wp.sqrt(wp.max(0.0, 1.0 - z * z))
@@ -34,9 +34,9 @@ def sample_surface(
 ) -> None:
     tid = wp.tid()
     state = wp.rand_init(seed, tid)
-    fi = int(wp.sample_cdf(state, cdf))
+    fi = wp.int32(wp.sample_cdf(state, cdf))
 
-    v0, v1, v2 = face_vertices(vertices, faces, wp.int32(fi))
+    v0, v1, v2 = face_vertices(vertices, faces, fi)
 
     uv = wp.sample_triangle(state)
     w = 1.0 - uv.x - uv.y
@@ -54,11 +54,11 @@ def sample_volume_tetrahedra(
     seed: int,
     out_points: wp.array[wp.vec3],
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     state = wp.rand_init(seed, tid)
-    fi = int(wp.sample_cdf(state, cdf))
+    fi = wp.int32(wp.sample_cdf(state, cdf))
 
-    v0, v1, v2 = face_vertices(vertices, faces, wp.int32(fi))
+    v0, v1, v2 = face_vertices(vertices, faces, fi)
 
     # Uniform sampling in the tetrahedron (center, v0, v1, v2) via order statistics of
     # 3 U(0,1) samples. Sorted values s1 ≤ s2 ≤ s3 give spacings
@@ -96,15 +96,15 @@ def compute_poisson_weights(
     alpha: wp.float32,
     out_weights: wp.array[wp.float32],
 ) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if alive[i] == 0:
         out_weights[i] = wp.float32(0.0)
         return
-    start = int(offsets[i])
-    end = int(offsets[i + 1])
+    start = offsets[i]
+    end = offsets[i + 1]
     w = wp.float32(0.0)
     for k in range(start, end):
-        j = int(nbr_indices[k])
+        j = nbr_indices[k]
         if j == i or alive[j] == 0:
             continue
         w += _poisson_edge_weight(nbr_dists[k], r_max, r_min, alpha)
@@ -119,16 +119,16 @@ def find_local_maxima(
     offsets: wp.array[wp.int32],
     out_is_max: wp.array[wp.int32],
 ) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if alive[i] == 0:
         out_is_max[i] = 0
         return
     wi = wp.max(weights[i], wp.float32(0.0))
-    start = int(offsets[i])
-    end = int(offsets[i + 1])
+    start = offsets[i]
+    end = offsets[i + 1]
     is_max = wp.int32(1)
     for k in range(start, end):
-        j = int(nbr_indices[k])
+        j = nbr_indices[k]
         if j == i or alive[j] == 0:
             continue
         if wp.max(weights[j], wp.float32(0.0)) > wi:
@@ -158,13 +158,13 @@ def subtract_deleted_contributions(
     alpha: wp.float32,
     weights: wp.array[wp.float32],
 ) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if deleted_mask[i] == 0:
         return
-    start = int(offsets[i])
-    end = int(offsets[i + 1])
+    start = offsets[i]
+    end = offsets[i + 1]
     for k in range(start, end):
-        j = int(nbr_indices[k])
+        j = nbr_indices[k]
         if j == i or alive[j] == 0:
             continue
         contribution = _poisson_edge_weight(nbr_dists[k], r_max, r_min, alpha)

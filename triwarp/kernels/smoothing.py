@@ -27,7 +27,7 @@ def edge_cotan_add(
 ) -> None:
     # Accumulate each face corner's cotangent into its opposite unique edge; the two incident faces
     # sum to the cotangent edge weight cot(alpha) + cot(beta).
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     v0 = faces[f * 3 + 0]
     v1 = faces[f * 3 + 1]
     v2 = faces[f * 3 + 2]
@@ -53,7 +53,7 @@ def symmetric_weight_triplets(
     out_cols: wp.array[wp.int32],
     out_vals: wp.array[wp.float64],
 ) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     a = unique_edges[i, 0]
     b = unique_edges[i, 1]
     w = wp.float64(weights[i])
@@ -83,7 +83,7 @@ def dirichlet_system_triplets(
 ) -> None:
     # positionVertsSmoothlySharpBd: SPD umbrella system A = D - W over free verts (weights in the
     # CSR ``W``), fixed 1-ring neighbors folded into the right-hand side, plus optional stabilizer.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     if not free_mask[v]:
         return
     ri = free_map[v]
@@ -133,7 +133,7 @@ def laplacian_ls_triplets(
     # ``p_v = sum_d (w_vd/sumW) p_d``; free neighbors stay in M, fixed ones move to the RHS.
     # The
     # normal equations (M^T M) x = M^T b are assembled by the caller.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     if not row_mask[v]:
         return
     start = offsets[v]
@@ -177,7 +177,7 @@ def scatter_free_solution(
     sol_z: wp.array[wp.float64],
     out_points: wp.array[wp.vec3],
 ) -> None:
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     if free_mask[v]:
         i = free_map[v]
         out_points[v] = wp.vec3(wp.float32(sol_x[i]), wp.float32(sol_y[i]), wp.float32(sol_z[i]))
@@ -194,7 +194,7 @@ def add_interior_mass_rhs(
     # Add the linear term ``b_u = (M V)_u`` into the reduced right-hand side, which arrives holding
     # only ``-A_ub x_b`` from ``linalg.assemble_interior_system`` (that helper eliminates the pinned
     # columns of a quadratic form, which has no linear term of its own).
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     if fixed_mask[v]:
         return
     i = free_map[v]
@@ -216,7 +216,7 @@ def scatter_free_positions(
 ) -> None:
     # Write the reduced solution back to the unpinned vertices only. Pinned ones are left holding
     # whatever they already have, which is their original position -- they never move.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     if fixed_mask[v]:
         return
     i = free_map[v]
@@ -283,7 +283,7 @@ def mut_dif_step_scaled(
     # ``mut_dif_step`` with the mean coefficient read from a device scalar (adil_sum[0] * inv_n),
     # so the smoothing loop never synchronises with the host. A real kernel rather than wp.map:
     # the length-1 ``adil_sum`` is a uniform argument, which wp.map cannot broadcast.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     mean_adil = adil_sum[0] * inv_n
     out_next[i] = mut_dif_step(positions[i], lv[i], adil[i], mean_adil, lamb)
 
@@ -318,7 +318,7 @@ def implicit_laplacian_triplets(
     # Triplets for AA = (1 + lambda) * I - lambda * L (backward-Euler system, Article 2), where
     # L is the row-stochastic averaging operator. Off-diagonals reuse L's CSR positions; one
     # diagonal triplet per row is appended after the nnz off-diagonals.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     start = offsets[i]
     end = offsets[i + 1]
     for k in range(start, end):
@@ -349,7 +349,7 @@ def apply_operator_scalar(
     # Scalar counterpart of ``kernels/laplacian.apply_operator``: one row of the row-stochastic
     # averaging operator against a per-vertex scalar. An isolated vertex (empty row) keeps its own
     # value, so it neither drifts to zero nor contaminates its (nonexistent) neighbours.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     start = offsets[i]
     end = offsets[i + 1]
     if end == start:
@@ -373,7 +373,7 @@ def accumulate_smoothed_normals(
     # neighbours pointing *within* ``threshold_cos`` of it. That gate is the whole point: across a
     # crease the two normals disagree by more than the threshold and simply do not average, so a
     # sharp edge survives an arbitrary number of passes while noise on a flat region diffuses away.
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     f0 = face_adjacency[k, 0]
     f1 = face_adjacency[k, 1]
     if wp.dot(face_normals[f0], face_normals[f1]) <= threshold_cos:
@@ -403,7 +403,7 @@ def fit_vertices_to_normals(
     #
     # Summed per vertex and divided by the incident-face count by the caller, which is the step size
     # that makes the iteration a contraction without a tuning constant.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     i0 = faces[f * 3 + 0]
     i1 = faces[f * 3 + 1]
     i2 = faces[f * 3 + 2]

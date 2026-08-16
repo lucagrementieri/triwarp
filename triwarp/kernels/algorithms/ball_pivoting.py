@@ -252,7 +252,7 @@ def seed_triangles(
 ) -> None:
     if counters[CNT_CONTINUE] == 0 or counters[CNT_SEEDING] == 0:
         return
-    p = int(wp.tid())
+    p = wp.int32(wp.tid())
     if point_used[p]:
         return
 
@@ -557,7 +557,7 @@ def claim_triangle_vertices(
     # Priority claim (lowest index wins) on all three vertices of each proposed triangle.
     if counters[CNT_CONTINUE] == 0:
         return
-    for t in range(int(wp.tid()), counters[CNT_PROPOSAL], grid_stride):
+    for t in range(wp.int32(wp.tid()), counters[CNT_PROPOSAL], grid_stride):
         wp.atomic_min(out_owner, tri_a[t], t)
         wp.atomic_min(out_owner, tri_b[t], t)
         wp.atomic_min(out_owner, tri_c[t], t)
@@ -630,7 +630,7 @@ def commit_triangles(
     # mask, the edge table, the boundary degrees and the outgoing front.
     if counters[CNT_CONTINUE] == 0:
         return
-    for t in range(int(wp.tid()), counters[CNT_PROPOSAL], grid_stride):
+    for t in range(wp.int32(wp.tid()), counters[CNT_PROPOSAL], grid_stride):
         a = tri_a[t]
         b = tri_b[t]
         c = tri_c[t]
@@ -706,7 +706,7 @@ def compact_front(
     # Drop closed and retired edges from the front. ``pivot_front_edges`` already does this as a
     # side effect, but a long run of seeding waves (which carry the front forward untouched) or a
     # burst of commits can still leave it sparse; the caller runs this when it does.
-    for i in range(int(wp.tid()), counters[CNT_FRONT], grid_stride):
+    for i in range(wp.int32(wp.tid()), counters[CNT_FRONT], grid_stride):
         slot = front_in[i]
         if edge_count[slot] == 1 and edge_state[slot] == EDGE_LIVE:
             push_front_edge(slot, front_capacity, counters, front_out)
@@ -732,7 +732,7 @@ def rehash_edges(
 ) -> None:
     # Re-insert every occupied slot into a larger table when the triangle budget grows. Slot
     # indices change, so the caller rebuilds the front list from the new table afterwards.
-    h = int(wp.tid())
+    h = wp.int32(wp.tid())
     stored = old_key[h]
     if stored == wp.uint64(0):
         return
@@ -756,7 +756,7 @@ def collect_front_from_table(
     out_front: wp.array[wp.int32],
 ) -> None:
     # Rebuild the front list by scanning the edge table, after a rehash has moved every slot.
-    h = int(wp.tid())
+    h = wp.int32(wp.tid())
     if edge_key[h] == wp.uint64(0):
         return
     if edge_count[h] == 1 and edge_state[h] == EDGE_LIVE:

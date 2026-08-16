@@ -93,7 +93,7 @@ def init_point_cells(
     out_point_cell: wp.array[wp.int32],
 ) -> None:
     # Compacted cell index of every pool point (its cell is occupied by construction).
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     out_point_cell[i] = lookup_cell(unique_keys, grid_cell_key(grid_coords[i], grid_w))
 
 
@@ -110,9 +110,9 @@ def dart_cell_neighbors(
     x = wp.int32(key % w64)
     y = wp.int32((key / w64) % w64)
     z = wp.int32(key / (w64 * w64))
-    dx = wp.int32(s) % _DART_SHELL_W - wp.int32(1)
-    dy = (wp.int32(s) / _DART_SHELL_W) % _DART_SHELL_W - wp.int32(1)
-    dz = wp.int32(s) / (_DART_SHELL_W * _DART_SHELL_W) - wp.int32(1)
+    dx = s % _DART_SHELL_W - wp.int32(1)
+    dy = (s / _DART_SHELL_W) % _DART_SHELL_W - wp.int32(1)
+    dz = s / (_DART_SHELL_W * _DART_SHELL_W) - wp.int32(1)
     out_cell_neighbors[c, s] = INVALID
     cx = x + dx
     cy = y + dy
@@ -132,7 +132,7 @@ def dart_cell_neighbors(
 def dart_priorities(seed: wp.int32, out_priority: wp.array[wp.uint32]) -> None:
     # The sampling order. Drawing it up front rather than per round is what makes the whole loop a
     # deterministic function of ``seed``: every round reads the same total order on the pool.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     out_priority[i] = wp.randu(wp.rand_init(seed, i))
 
 
@@ -154,7 +154,7 @@ def dart_select_minima(
     # of the two" argument that keeps two acceptances apart has no exception. The pass writes only
     # its own slot, and the only state it reads of others is "not yet covered" — which this pass
     # never sets — so it is race-free and its output depends only on the round's input state.
-    t = int(wp.tid())
+    t = wp.int32(wp.tid())
     i = alive[t]
     my_key = priority[i]
     p = pool_points[i]
@@ -192,7 +192,7 @@ def dart_cover_neighbors(
     #
     # As above, only the thread's own slot is written, and a slot going ``ALIVE -> COVERED`` cannot
     # change another thread's ``== ACCEPTED`` test.
-    t = int(wp.tid())
+    t = wp.int32(wp.tid())
     i = alive[t]
     if out_state[i] != DART_ALIVE:
         return
@@ -217,7 +217,7 @@ def dart_alive_flags(
 ) -> None:
     # 0/1 survivor flags over the *work list*, in the dtype ``wp.utils.array_scan`` wants, so the
     # exclusive scan of them is directly the compaction's write positions.
-    t = int(wp.tid())
+    t = wp.int32(wp.tid())
     out_flag[t] = wp.where(state[alive[t]] == DART_ALIVE, wp.int32(1), wp.int32(0))
 
 
@@ -231,7 +231,7 @@ def dart_compact_alive(
     # Next round's work list, from this round's: survivors keep their relative order, so the loop
     # walks a shrinking prefix instead of the whole pool. ``positions`` is the exclusive scan of the
     # survivor flags.
-    t = int(wp.tid())
+    t = wp.int32(wp.tid())
     i = alive[t]
     if state[i] == DART_ALIVE:
         out_next[positions[t]] = i

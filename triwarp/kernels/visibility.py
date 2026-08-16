@@ -38,7 +38,7 @@ def obscurance(
     # ``tau`` gives Iones et al.'s volumetric obscurance, where an occluder at distance ``t``
     # contributes ``exp(-tau t)`` so a distant wall barely darkens the point. Binary occlusion is
     # the ``tau -> 0`` limit of that, since a ray that escapes contributes nothing either way.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     normal = wp.normalize(normals[i])
     basis_x = any_perpendicular(normal)
     basis_y = wp.cross(normal, basis_x)
@@ -90,7 +90,7 @@ def shape_diameter(
     # average. The pass structure is dictated by that -- distances go into ``scratch`` first,
     # because the second pass must revisit them against a mean and deviation the first pass had not
     # finished computing yet, and re-casting the rays instead would double the only expensive part.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     normal = wp.normalize(normals[i])
     basis_x = any_perpendicular(normal)
     basis_y = wp.cross(normal, basis_x)
@@ -175,16 +175,16 @@ def support_argmax_tiled(
     # `wp.tile_max(wp.tile(...))` this replaces reduced a single lane on the Warp CPU backend, where
     # `wp.launch_tiled` runs one lane per block through Warp 1.16.
     q, j = wp.tid()
-    normal = normals[support_indices[int(q)]]
+    normal = normals[support_indices[q]]
     best = wp.float32(-wp.inf)
     best_index = wp.int32(0)
-    for idx in range(int(j), int(n_vertices), int(n_slices)):
+    for idx in range(j, n_vertices, n_slices):
         projection = wp.dot(mesh_vertices[idx], normal)
         if projection > best or (projection == best and idx < best_index):
             best = projection
             best_index = idx
     if not wp.isinf(best):
-        wp.atomic_max(out_packed, int(q), pack_support_candidate(best, best_index))
+        wp.atomic_max(out_packed, q, pack_support_candidate(best, best_index))
 
 
 @wp.kernel
@@ -199,7 +199,7 @@ def init_sphere_radii_support(
 ) -> None:
     # Tail pass over the deferred subset: decode the support point and derive the
     # tangent-sphere radius, scattering it back into the full arrays.
-    q = int(wp.tid())
+    q = wp.int32(wp.tid())
     tid = support_indices[q]
     packed = packed_support[q]
     if packed == wp.uint64(0):

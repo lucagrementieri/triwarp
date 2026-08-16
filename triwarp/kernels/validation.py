@@ -7,7 +7,7 @@ def edge_pair_winding_mask(
     edge_groups: wp.array2d[wp.int32],
     out_consistent: wp.array[wp.bool],
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     i0 = edge_groups[tid, 0]
     i1 = edge_groups[tid, 1]
     out_consistent[tid] = edges[i0, 1] == edges[i1, 0]
@@ -41,7 +41,7 @@ def mark_intersecting_faces(
     pairs: wp.array2d[wp.int32], valid: wp.array[wp.bool], out_mask: wp.array[wp.bool]
 ) -> None:
     """Flag both faces of each intersecting candidate pair (idempotent ``True`` writes)."""
-    p = int(wp.tid())
+    p = wp.int32(wp.tid())
     if valid[p]:
         out_mask[pairs[p, 0]] = True
         out_mask[pairs[p, 1]] = True
@@ -65,7 +65,7 @@ def face_edge_manifold_mask(
     ``inverse`` maps each directed edge ``3 * f + k`` (row-major face order from
     ``faces_to_edges``) to its unique-edge index; ``edge_manifold`` is the per-unique-edge flag.
     """
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     u0 = inverse[3 * f]
     u1 = inverse[3 * f + 1]
     u2 = inverse[3 * f + 2]
@@ -87,7 +87,7 @@ def build_corner_adjacency_edges(
     corners, so the connected components of the corner graph are exactly the
     edge-connected fans around each vertex.
     """
-    r = int(wp.tid())
+    r = wp.int32(wp.tid())
     f0 = adjacency[r, 0]
     f1 = adjacency[r, 1]
     a = adjacency_edges[r, 0]
@@ -110,7 +110,7 @@ def corner_vertex_reduce(
     out_referenced: wp.array[wp.bool],
 ) -> None:
     """Per-vertex minimum corner-component label and referenced flag."""
-    c = int(wp.tid())
+    c = wp.int32(wp.tid())
     v = faces[c]
     wp.atomic_min(out_min_label, v, labels[c])
     out_referenced[v] = True
@@ -124,7 +124,7 @@ def corner_vertex_check(
     out_mask: wp.array[wp.bool],
 ) -> None:
     """Clear a vertex flag when one of its corners is in a different fan."""
-    c = int(wp.tid())
+    c = wp.int32(wp.tid())
     v = faces[c]
     if labels[c] != min_label[v]:
         out_mask[v] = False
@@ -144,7 +144,7 @@ def build_signed_face_edges(
     ``sign == 0`` when the two faces already traverse the shared edge in opposite
     directions (compatible orientations), ``sign == 1`` when a flip is required.
     """
-    r = int(wp.tid())
+    r = wp.int32(wp.tid())
     f0 = adjacency[r, 0]
     f1 = adjacency[r, 1]
     a = adjacency_edges[r, 0]
@@ -164,7 +164,7 @@ def verify_orientation(
     out_conflict: wp.array[wp.int32],
 ) -> None:
     """Flag any face-adjacency edge whose endpoints violate the flip constraint."""
-    r = int(wp.tid())
+    r = wp.int32(wp.tid())
     f0 = edges[r, 0]
     f1 = edges[r, 1]
     if ((orient[f0] + orient[f1]) & wp.int32(1)) != signs[r]:

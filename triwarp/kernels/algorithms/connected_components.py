@@ -15,15 +15,15 @@ import warp as wp
 
 @wp.func
 def find_representative(parents: wp.array[wp.int32], v: wp.int32) -> wp.int32:
-    parent = wp.int32(parents[v])
+    parent = parents[v]
     if parent != v:
         child = v
-        grandparent = wp.int32(parents[parent])
+        grandparent = parents[parent]
         while parent > grandparent:
             parents[child] = grandparent
             child = parent
             parent = grandparent
-            grandparent = wp.int32(parents[parent])
+            grandparent = parents[parent]
     return parent
 
 
@@ -58,12 +58,12 @@ def ecl_hook_edge(parents: wp.array[wp.int32], rep_v: wp.int32, u: wp.int32) -> 
 def ecl_init_parent(
     offsets: wp.array[wp.int32], indices: wp.array[wp.int32], out_parents: wp.array[wp.int32]
 ) -> None:
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     out_parents[v] = v
     start = offsets[v]
     end = offsets[v + 1]
     for j in range(start, end):
-        u = wp.int32(indices[j])
+        u = indices[j]
         if u < v:
             out_parents[v] = u
             break
@@ -77,7 +77,7 @@ def ecl_hook(
     # hooked exactly once. Fine for bounded-degree mesh graphs (a reversed star — hub id n-1 —
     # would serialize on the hub thread, but mesh degrees are ~6). ``rep_v`` is hoisted across
     # the row, ECL-CC's ``vstat`` carry.
-    v = wp.int32(int(wp.tid()))
+    v = wp.int32(wp.int32(wp.tid()))
     start = offsets[v]
     end = offsets[v + 1]
     rep_v = find_representative(parents, v)
@@ -89,7 +89,7 @@ def ecl_hook(
 
 @wp.kernel
 def ecl_flatten(parents: wp.array[wp.int32], out_labels: wp.array[wp.int32]) -> None:
-    v = wp.int32(int(wp.tid()))
+    v = wp.int32(wp.int32(wp.tid()))
     out_labels[v] = find_representative(parents, v)
 
 
@@ -106,13 +106,13 @@ def find_representative_parity(words: wp.array[wp.int32], v: wp.int32) -> tuple[
     # ``find_representative``: ``grandparent`` stays an ancestor of ``child`` however the tree moves
     # under us, and on a consistent component the parity to a given ancestor is invariant, so the
     # written word is always valid — only possibly less compressed than it could be.
-    word = wp.int32(words[v])
+    word = words[v]
     parent = wp.int32(word >> 1)
     parity = wp.int32(word & 1)
     accumulated = wp.int32(0)
-    child = wp.int32(v)
+    child = v
     if parent != v:
-        grandword = wp.int32(words[parent])
+        grandword = words[parent]
         grandparent = wp.int32(grandword >> 1)
         grandparity = wp.int32(grandword & 1)
         while parent > grandparent:
@@ -121,7 +121,7 @@ def find_representative_parity(words: wp.array[wp.int32], v: wp.int32) -> tuple[
             child = parent
             parent = grandparent
             parity = grandparity
-            grandword = wp.int32(words[parent])
+            grandword = words[parent]
             grandparent = wp.int32(grandword >> 1)
             grandparity = wp.int32(grandword & 1)
     return parent, accumulated ^ parity
@@ -141,8 +141,8 @@ def ecl_hook_edge_parity(
     # A component with contradictory signs (a Mobius band, in the orientation application) simply
     # takes whichever branch reached its roots first: the potential does not exist, so no assignment
     # is correct and callers detect the contradiction afterwards by re-testing the edges.
-    root_v = wp.int32(rep_v)
-    par_v = wp.int32(parity_v)
+    root_v = rep_v
+    par_v = parity_v
     root_u = wp.int32(0)
     par_u = wp.int32(0)
     root_u, par_u = find_representative_parity(words, u)
@@ -173,7 +173,7 @@ def ecl_init_parent_parity(out_words: wp.array[wp.int32]) -> None:
     # Every node its own root at parity 0. The plain ``ecl_init_parent`` also pre-hooks each node
     # to its smallest neighbour, which needs the edge's sign and so would need a signed CSR; the
     # hook kernel below is edge-parallel and does the same work in one pass anyway.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     out_words[v] = v << 1
 
 
@@ -183,7 +183,7 @@ def ecl_hook_parity(
 ) -> None:
     # One thread per signed edge; each thread's retry loop only exits once its two endpoints share
     # a tree, so after this single launch the forest spans every edge — no host convergence loop.
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     a = edges[e, 0]
     b = edges[e, 1]
     if a == b:
@@ -198,7 +198,7 @@ def ecl_hook_parity(
 def ecl_flatten_parity(
     words: wp.array[wp.int32], out_labels: wp.array[wp.int32], out_parity: wp.array[wp.int32]
 ) -> None:
-    v = wp.int32(int(wp.tid()))
+    v = wp.int32(wp.int32(wp.tid()))
     root = wp.int32(0)
     parity = wp.int32(0)
     root, parity = find_representative_parity(words, v)

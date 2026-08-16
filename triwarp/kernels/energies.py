@@ -28,7 +28,7 @@ def sandwich_row_counts(
 ) -> None:
     # Triplets emitted by row ``t`` of the product ``A diag(inv_mass) B``: the full outer product
     # of the two CSR rows, or nothing when the diagonal weight is zero.
-    t = int(wp.tid())
+    t = wp.int32(wp.tid())
     if inv_mass[t] > type(inv_mass[0])(0.0):
         out_counts[t] = (a_offsets[t + 1] - a_offsets[t]) * (b_offsets[t + 1] - b_offsets[t])
     else:
@@ -54,11 +54,11 @@ def sandwich_row_triplets(
     # product of the two matching CSR rows, assembling the product without ``bsr_mm``. (The
     # ``bsr_mm`` nondeterminism this originally avoided was a triplet-capacity defect of this
     # package, not a Warp bug — see ``k_harmonic`` in ``triwarp/energies.py``.)
-    t = int(wp.tid())
+    t = wp.int32(wp.tid())
     weight = inv_mass[t]
     if weight <= type(inv_mass[0])(0.0):
         return
-    cursor = int(segment_offsets[t])
+    cursor = segment_offsets[t]
     for a in range(a_offsets[t], a_offsets[t + 1]):
         row = a_columns[a]
         left = a_values[a] * weight
@@ -79,8 +79,8 @@ def hessian_corner_gradients(
     # Gradient of each corner's hat function inside its face, ``n x e_c / (2 A)`` with ``e_c`` the
     # CCW edge opposite corner ``c``. A degenerate face gets zero gradients (it contributes
     # nothing to the energy) rather than a division by its zero area.
-    f = int(wp.tid())
-    v0, v1, v2 = face_vertices_vec3d(vertices, faces, wp.int32(f))
+    f = wp.int32(wp.tid())
+    v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
     normal = wp.cross(v1 - v0, v2 - v0)
     dbl_area = wp.length(normal)
     out_areas[f] = wp.float64(0.5) * dbl_area
@@ -105,8 +105,8 @@ def voronoi_mass(
     # The ``igl::massmatrix`` MASSMATRIX_TYPE_VORONOI lumping: true Voronoi quad areas on
     # non-obtuse triangles, the 1/2 : 1/4 : 1/4 split on obtuse ones (the obtuse corner gets the
     # half). A degenerate face contributes nothing (igl would emit NaN).
-    f = int(wp.tid())
-    v0, v1, v2 = face_vertices_vec3d(vertices, faces, wp.int32(f))
+    f = wp.int32(wp.tid())
+    v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
     l2_0 = wp.length_sq(v1 - v2)
     l2_1 = wp.length_sq(v2 - v0)
     l2_2 = wp.length_sq(v0 - v1)
@@ -151,7 +151,7 @@ def voronoi_mass(
 
 @wp.kernel
 def zero_at_indices(indices: wp.array[wp.int32], out_values: wp.array[wp.Float]) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     out_values[indices[i]] = type(out_values[0])(0.0)
 
 
@@ -161,7 +161,7 @@ def hessian_energy_counts(
 ) -> None:
     # Vertex ``k`` couples every ordered pair of its incident faces, 3 x 3 corners each; a killed
     # degree of freedom (boundary vertex) emits nothing.
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     if inv_mass[k] > wp.float64(0.0):
         degree = vf_offsets[k + 1] - vf_offsets[k]
         out_counts[k] = 9 * degree * degree
@@ -195,21 +195,21 @@ def hessian_energy_triplets(
     # Hessian: ``Q_ij = sum_k Minv_k sum_{f,g ni k} A_f A_g (g_fk . g_gk)(g_fi . g_gj)`` with
     # ``g_fc`` the hat-function gradient of corner ``c`` in face ``f``. One thread per vertex
     # ``k``; the per-thread work is quadratic in the vertex's valence.
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     weight = inv_mass[k]
     if weight <= wp.float64(0.0):
         return
     start = vf_offsets[k]
     end = vf_offsets[k + 1]
-    cursor = int(segment_offsets[k])
+    cursor = segment_offsets[k]
     for a in range(start, end):
         f = vertex_faces[a]
-        corner_f = face_corner_of_vertex(faces, f, wp.int32(k))
+        corner_f = face_corner_of_vertex(faces, f, k)
         gradient_fk = gradients[f * 3 + corner_f]
         left = weight * areas[f]
         for b in range(start, end):
             g = vertex_faces[b]
-            corner_g = face_corner_of_vertex(faces, g, wp.int32(k))
+            corner_g = face_corner_of_vertex(faces, g, k)
             pair = left * areas[g] * wp.dot(gradient_fk, gradients[g * 3 + corner_g])
             for ci in range(3):
                 row = faces[f * 3 + ci]
@@ -237,8 +237,8 @@ def internal_angles_and_sums(
     # ``triangles.angles`` is the same quantity in float32 from normalized edge vectors, and stays a
     # separate kernel: it emits no angle sums, takes its third angle as ``PI - a0 - a1``, and zeroes
     # all three angles of a degenerate face instead of letting the acos clamp report 0 / pi.
-    f = int(wp.tid())
-    v0, v1, v2 = face_vertices_vec3d(vertices, faces, wp.int32(f))
+    f = wp.int32(wp.tid())
+    v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
     l2_0 = wp.length_sq(v1 - v2)
     l2_1 = wp.length_sq(v2 - v0)
     l2_2 = wp.length_sq(v0 - v1)
@@ -276,7 +276,7 @@ def scatter_edge_halfedges(
     # Up to two halfedges per unique edge, in arbitrary order. On a non-edge-manifold edge the
     # third and later halfedges are dropped; the Crouzeix-Raviart discretization (like
     # ``igl::crouzeix_raviart_*``, which asserts edge-manifoldness) is undefined there.
-    h = int(wp.tid())
+    h = wp.int32(wp.tid())
     slot = wp.atomic_add(cursor, inverse[h], 1)
     if slot < 2:
         out_halfedges[inverse[h], slot] = h
@@ -297,7 +297,7 @@ def cr_gradient_rows(
     # edge's endpoints in slots 0/1, each incident face's apex in slot 2/3, ``-1`` when absent).
     # The edge's positive orientation is min-vertex-first, matching ``unique_edges``' sorted rows;
     # the assembled energy is invariant to that gauge choice.
-    u = int(wp.tid())
+    u = wp.int32(wp.tid())
     a = unique_edges[u, 0]
     out_vertex_slots[u, 0] = a
     out_vertex_slots[u, 1] = unique_edges[u, 1]
@@ -404,10 +404,10 @@ def curved_hessian_triplets(
     # ``L + K`` (both operators couple edges within a face only): 9 ordered edge-slot pairs, each a
     # 2x2 block over the parallel/perpendicular components, contracted against the two edges' CR
     # gradient rows (up to 4 vertices each) -> a fixed 144 triplets per face, zero-padded.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     zero = wp.float64(0.0)
     base_out = f * 144
-    v0, v1, v2 = face_vertices_vec3d(vertices, faces, wp.int32(f))
+    v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
     dbl_area = triangle_double_area(v0, v1, v2)
     if dbl_area <= zero:
         for empty in range(144):
@@ -491,7 +491,7 @@ def crouzeix_raviart_cotmatrix_triplets(
     # (``igl::crouzeix_raviart_cotmatrix``'s triangle table). Edge ids come from
     # ``edges_unique``'s inverse; triwarp halfedge slot ``s`` spans corners ``s -> s+1``, so the
     # edge opposite corner ``c`` is halfedge ``(c + 1) % 3``.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     for c in range(3):
         edge_1 = inverse[f * 3 + (c + 1) % 3]
         edge_2 = inverse[f * 3 + (c + 2) % 3]
@@ -521,8 +521,8 @@ def crouzeix_raviart_mass_diag(
     # Each face donates a third of its area to each of its three edges — both
     # ``igl::crouzeix_raviart_massmatrix``'s diagonal and (per parallel/perpendicular component)
     # ``igl::cr_vector_mass``'s.
-    f = int(wp.tid())
-    v0, v1, v2 = face_vertices_vec3d(vertices, faces, wp.int32(f))
+    f = wp.int32(wp.tid())
+    v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
     third = type(out_mass[0])(triangle_double_area(v0, v1, v2) / wp.float64(6.0))
     wp.atomic_add(out_mass, inverse[f * 3 + 0], third)
     wp.atomic_add(out_mass, inverse[f * 3 + 1], third)
@@ -542,7 +542,7 @@ def neg_repdiag2_triplets(
     # ``-repdiag(L, 2)``: the block-diagonal ``[[-L, 0], [0, -L]]`` (2n x 2n) of the LSCM Hessian.
     # One thread per CSR row ``i`` of ``L``; each entry ``e`` emits both diagonal-block copies into
     # slots ``2*e`` (upper block) and ``2*e + 1`` (lower block, shifted by ``n_vertices``).
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     start = offsets[i]
     end = offsets[i + 1]
     for e in range(start, end):
@@ -569,7 +569,7 @@ def vector_area_triplets(
     # cross-quadrant triplets ``(i+n, j, -q)``, ``(j, i+n, -q)``, ``(i, j+n, +q)``, ``(j+n, i, +q)``
     # with ``q = 0.25 * scale``. ``scale = 1`` builds ``A`` itself; ``scale = -2`` builds the
     # ``-2A`` term of the LSCM Hessian with the same kernel. Slot base ``4 * b``.
-    b = int(wp.tid())
+    b = wp.int32(wp.tid())
     i = boundary_edges[b, 0]
     j = boundary_edges[b, 1]
     q = wp.float64(0.25) * scale

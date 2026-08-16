@@ -156,15 +156,15 @@ def fit_principal_curvature(
 
     Extract principal curvature directions and magnitudes. Matches igl::principal_curvature.
     """
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     zero3 = wp.vec3(0.0, 0.0, 0.0)
 
-    start = int(offsets[i])
+    start = offsets[i]
     # offsets has length n_vertices (no sentinel); last vertex ends at neighbor_indices end
     if i + 1 < offsets.shape[0]:
-        end = int(offsets[i + 1])
+        end = offsets[i + 1]
     else:
-        end = int(neighbor_indices.shape[0])
+        end = neighbor_indices.shape[0]
     n_nbr = end - start
 
     if (
@@ -185,7 +185,7 @@ def fit_principal_curvature(
     # the principal values only agree with igl::principal_curvature when this exact reference
     # direction is used. When frame_independent is True the eigenvalues are surface invariants, so
     # the exact frame is irrelevant (any orthonormal tangent basis yields the same result).
-    ref = int(reference_neighbors[i])
+    ref = reference_neighbors[i]
     t1, t2 = _build_reference_frame(vertex, normal, vertices[ref])
 
     # Count neighbors passing projection-plane filter, including self (self always passes,
@@ -193,7 +193,7 @@ def fit_principal_curvature(
     # Matches libigl's applyProjOnPlane which includes vv[self] because dot(n_i, n_i) = 1 > 0.
     n_valid = wp.int32(0)
     for k in range(n_nbr):
-        j = int(neighbor_indices[start + k])
+        j = neighbor_indices[start + k]
         if j == i:
             n_valid = n_valid + 1  # self always passes
             continue
@@ -209,7 +209,7 @@ def fit_principal_curvature(
     atb = vec5d()
 
     for k in range(n_nbr):
-        j = int(neighbor_indices[start + k])
+        j = neighbor_indices[start + k]
         if j == i:
             continue  # self contributes (0,0,0) — skip to avoid frame degeneration
         nj = wp.normalize(vertex_normals[j])
@@ -322,7 +322,7 @@ def edge_aabb_from_endpoints(
     out_lower: wp.array[wp.vec3],
     out_upper: wp.array[wp.vec3],
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     v0 = vertices[face_adjacency_edges[tid, 0]]
     v1 = vertices[face_adjacency_edges[tid, 1]]
     out_lower[tid] = wp.min(v0, v1)  # wp.min / wp.max on vectors are element-wise
@@ -341,9 +341,9 @@ def accumulate_mean_curvature(
     radius: wp.float32,
     out_mean_curvature: wp.array[wp.float32],
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     edge_idx = candidate_edge_indices[tid]
-    query_idx = kernel_array.binary_search_index(offsets, wp.int32(tid)) - wp.int32(1)
+    query_idx = kernel_array.binary_search_index(offsets, tid) - wp.int32(1)
 
     e0 = face_adjacency_edges[edge_idx, 0]
     e1 = face_adjacency_edges[edge_idx, 1]

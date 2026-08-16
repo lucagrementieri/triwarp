@@ -8,7 +8,7 @@ def find_ears(
     out_ear_opp: wp.array[wp.int32],
     out_count: wp.array[wp.int32],
 ) -> None:
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     base = f * 3
     b0 = edge_boundary[base]
     b1 = edge_boundary[base + 1]
@@ -16,7 +16,7 @@ def find_ears(
     n = wp.int32(b0) + wp.int32(b1) + wp.int32(b2)
     if n == 2:
         slot = wp.atomic_add(out_count, 0, 1)
-        out_ear[slot] = wp.int32(f)
+        out_ear[slot] = f
         if not b0:
             out_ear_opp[slot] = wp.int32(0)
         elif not b1:

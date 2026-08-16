@@ -51,8 +51,8 @@ def compute_midpoints(
     unique_edges: wp.array2d[wp.int32],
     out_midpoints: wp.array[wp.vec3],
 ) -> None:
-    k = int(wp.tid())
-    out_midpoints[k] = edge_midpoint(vertices, unique_edges, wp.int32(k))
+    k = wp.int32(wp.tid())
+    out_midpoints[k] = edge_midpoint(vertices, unique_edges, k)
 
 
 @wp.func
@@ -69,7 +69,7 @@ def split_face_four(fv: wp.vec3i, mv: wp.vec3i) -> tuple[wp.vec3i, wp.vec3i, wp.
 def subdivide_faces(
     faces: wp.array[wp.int32], mid_idx: wp.array2d[wp.int32], out_faces: wp.array[wp.int32]
 ) -> None:
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     fv = wp.vec3i(faces[f * 3 + 0], faces[f * 3 + 1], faces[f * 3 + 2])
     mv = wp.vec3i(mid_idx[f, 0], mid_idx[f, 1], mid_idx[f, 2])
     t0, t1, t2, t3 = split_face_four(fv, mv)
@@ -99,7 +99,7 @@ def loop_edge_opposites(
     # Per unique edge: how many faces use it, and the sum of the vertices opposite it in each.
     # Corner ``j`` of face ``f`` spans ``(fv[j], fv[j + 1])`` and its opposite vertex is
     # ``fv[j + 2]``, so one pass over the faces gathers both halves of the Loop odd-vertex stencil.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     for j in range(3):
         e = edge_of_corner[f * 3 + j]
         wp.atomic_add(out_opposite_sum, e, vertices[faces[f * 3 + (j + 2) % 3]])
@@ -120,7 +120,7 @@ def loop_vertex_rings(
     # edges. Driven by the *unique* edge list rather than by the faces, so the valence is the number
     # of distinct neighbours on any input -- the count a per-face pass would have to deduplicate
     # (each neighbour appears twice around an interior vertex but once at a boundary).
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     v0 = unique_edges[e, 0]
     v1 = unique_edges[e, 1]
     p0 = vertices[v0]
@@ -145,7 +145,7 @@ def loop_odd_positions(
     out_positions: wp.array[wp.vec3],
 ) -> None:
     # Loop's odd (edge) vertices: 3/8 on each endpoint and 1/8 on each of the two opposite vertices.
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     endpoints = vertices[unique_edges[e, 0]] + vertices[unique_edges[e, 1]]
     if edge_face_count[e] == 2:
         out_positions[e] = LOOP_ODD_ENDPOINT * endpoints + LOOP_ODD_OPPOSITE * edge_opposite_sum[e]
@@ -167,7 +167,7 @@ def loop_even_positions(
     # Loop's even (original) vertices, relaxed towards their 1-ring. Warren's beta -- 3/16 at
     # valence 3 and 3/(8n) above it -- which is the variant ``igl::loop`` uses, not Loop's original
     # trigonometric weight.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     position = vertices[v]
     n = valence[v]
     out_positions[v] = position  # the fallbacks below leave the vertex where it is
@@ -193,7 +193,7 @@ def build_midpoint_index(
     vertex_offset: wp.int32,
     out_midpoint_idx: wp.array[wp.int32],
 ) -> None:
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     if long_mask[e]:
         out_midpoint_idx[e] = vertex_offset + offsets[e]
     else:
@@ -208,9 +208,9 @@ def fill_edge_midpoints(
     offsets: wp.array[wp.int32],
     out_mid: wp.array[wp.vec3],
 ) -> None:
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     if long_mask[e]:
-        out_mid[offsets[e]] = edge_midpoint(vertices, unique_edges, wp.int32(e))
+        out_mid[offsets[e]] = edge_midpoint(vertices, unique_edges, e)
 
 
 @wp.kernel
@@ -223,7 +223,7 @@ def fill_edge_mean_sizing(
 ) -> None:
     # ``fill_edge_midpoints`` for the sizing field rather than the position: the value carried to a
     # new midpoint is the endpoint mean ``mark_edges_over_sizing_field`` tested the edge with.
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     if split_mask[e]:
         out_sizing[offsets[e]] = wp.float32(0.5) * (
             sizing[unique_edges[e, 0]] + sizing[unique_edges[e, 1]]
@@ -240,7 +240,7 @@ def mark_edges_over_sizing_field(
     # The scalar ``length > max_edge`` test against a per-vertex sizing field. An edge's own target
     # is the mean of its endpoints', which is the standard reading of a vertex-sampled sizing
     # function and keeps the test symmetric in the edge's orientation.
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     target = wp.float32(0.5) * (sizing[unique_edges[e, 0]] + sizing[unique_edges[e, 1]])
     out_long[e] = lengths[e] > target
 
@@ -272,7 +272,7 @@ def emit_size_faces(
     out_valid: wp.array[wp.bool],
     out_slot_index: wp.array[wp.int32],
 ) -> None:
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     src = index_in[f]
 
     fv = wp.vec3i(faces[f * 3 + 0], faces[f * 3 + 1], faces[f * 3 + 2])
@@ -368,7 +368,7 @@ def mark_region_edges(
     # A unique edge is in/on the region boundary if at least one of its incident faces is in
     # the region (MeshLib isInnerOrBdEdge, subdivideBorder default). Benign write race: every
     # thread writing the same slot writes True.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if region_flags[i // 3] != 0:
         out_edge_in_region[inverse[i]] = wp.bool(True)
 
@@ -498,7 +498,7 @@ def mark_edge_pair_starts(
     # Differs from ``mark_unique_edge_starts`` below only in requiring the run to be exactly two:
     # that one takes every run whatever its length, because the decimation pass wants all unique
     # edges where a flip pass wants only the manifold-interior ones.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     start = wp.int32(0)
     if i + 2 <= n and sorted_run_start(sorted_keys, i):
         if sorted_keys[i] == sorted_keys[i + 1]:
@@ -527,15 +527,15 @@ def emit_flip_topology(
     # ``ranks`` is the inclusive scan of ``starts``, so ``ranks[i] - 1`` is the row a start writes
     # -- the same ascending-key row order the ``flatnonzero`` compaction inside
     # ``grouping.group`` produces, which is what keeps this byte-identical to the composed path.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if starts[i] == 0:
         return
     slot = ranks[i] - 1
     edge_0 = order[i]
     edge_1 = order[i + 1]
     shared_a, shared_b = edge_endpoints(faces, edge_0)
-    face_0 = edge_0 / 3
-    face_1 = edge_1 / 3
+    face_0 = edge_0 // 3
+    face_1 = edge_1 // 3
     base_0 = face_0 * 3
     base_1 = face_1 * 3
     unshared_0 = unshared_vertex(
@@ -636,14 +636,14 @@ def delone_flip_candidates(
     out_flip: wp.array[wp.bool],
     out_quad: wp.array2d[wp.int32],
 ) -> None:
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     out_flip[k] = wp.bool(False)
     f0 = adjacency[k, 0]
     f1 = adjacency[k, 1]
     if region_flags[f0] == 0 or region_flags[f1] == 0:
         return
     a, b, c, d = _resolve_flip_quad_guarded(
-        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, wp.int32(k), f0, out_quad
+        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, k, f0, out_quad
     )
     if a < 0:
         return
@@ -676,11 +676,11 @@ def incircle_flip_candidates(
     out_flip: wp.array[wp.bool],
     out_quad: wp.array2d[wp.int32],
 ) -> None:
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     out_flip[k] = wp.bool(False)
     f0 = adjacency[k, 0]
     a, b, c, d = _resolve_flip_quad_guarded(
-        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, wp.int32(k), f0, out_quad
+        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, k, f0, out_quad
     )
     if a < 0:
         return
@@ -705,7 +705,7 @@ def claim_flips(
     out_face_claim: wp.array[wp.int32],
     out_edge_claim: wp.array[wp.int32],
 ) -> None:
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     if not flip[k]:
         return
     wp.atomic_min(out_face_claim, adjacency[k, 0], k)
@@ -726,7 +726,7 @@ def commit_flips(
     out_faces: wp.array[wp.int32],
     out_count: wp.array[wp.int32],
 ) -> None:
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     if not flip[k]:
         return
     f0 = adjacency[k, 0]
@@ -777,7 +777,7 @@ def scatter_edge_incidence(
     #
     # Launch over ``inverse.shape[0]`` with both outputs zeroed: the count doubles as the write
     # cursor, which is why this replaces ``scatter.count_occurrences`` rather than following it.
-    c = int(wp.tid())
+    c = wp.int32(wp.tid())
     e = inverse[c]
     slot = wp.atomic_add(out_edge_face_count, e, 1)
     if slot < 2:
@@ -799,7 +799,7 @@ def scatter_feature_edge_counts(
     # faces meet at more than ``feature_angle``. One launch over the unique edges answers both
     # questions from the incidence table, where ``_classify`` used to re-group the same 3 * n_faces
     # rows twice (once as boundary edges, once as face adjacency) to ask them separately.
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     count = edge_face_count[e]
     boundary = count == 1
     feature = boundary
@@ -864,7 +864,7 @@ def collapse_candidates(
     # ``low`` and ``high`` are per *vertex* rather than scalars so that one code path serves both
     # the uniform target and an adaptive sizing field; the uniform case fills them with a constant.
     # An edge's own band is the mean of its endpoints', matching ``mark_edges_over_sizing_field``.
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     out_survivor[k] = -1
     u = unique_edges[k, 0]
     v = unique_edges[k, 1]
@@ -930,7 +930,7 @@ def claim_collapses(
 ) -> None:
     # Lock the full closed 1-ring of both endpoints (min edge id wins), so committed
     # collapses have disjoint neighbourhoods and stay independent.
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     s = survivor[k]
     if s < 0:
         return
@@ -956,7 +956,7 @@ def commit_collapses(
     out_positions: wp.array[wp.vec3],
     out_count: wp.array[wp.int32],
 ) -> None:
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     s = survivor[k]
     if s < 0:
         return
@@ -983,7 +983,7 @@ def faces_with_distinct_indices(faces: wp.array[wp.int32], out_mask: wp.array[wp
     # A face survives a vertex remap only if its three corners are still three distinct vertices.
     # Every decimation here ends in one: an edge collapse merges two of them, vertex clustering
     # sends two into the same cell.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     i0 = faces[f * 3 + 0]
     i1 = faces[f * 3 + 1]
     i2 = faces[f * 3 + 2]
@@ -1005,7 +1005,7 @@ def valence_flip_candidates(
     out_flip: wp.array[wp.bool],
     out_quad: wp.array2d[wp.int32],
 ) -> None:
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     out_flip[k] = wp.bool(False)
     f0 = adjacency[k, 0]
     f1 = adjacency[k, 1]
@@ -1019,7 +1019,7 @@ def valence_flip_candidates(
     if wp.acos(wp.dot(n0, n1)) > feature_angle:  # wp.acos auto-clamps to [-1, 1]
         return
     a, b, c, d = _resolve_flip_quad_guarded(
-        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, wp.int32(k), f0, out_quad
+        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, k, f0, out_quad
     )
     if a < 0:
         return
@@ -1082,7 +1082,7 @@ def accumulate_one_ring(
     # to 20, but also makes ``is_watertight`` fail on ``cave_cube`` through a self-intersection at
     # *every* step size down to lam=0.1, so it needs a fold guard first. See
     # ``tests/test_remesh.py::test_remesh_emits_no_degenerate_faces``.
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     u = unique_edges[e, 0]
     v = unique_edges[e, 1]
     wp.atomic_add(out_sum, u, vertices[v])
@@ -1105,7 +1105,7 @@ def tangential_smooth_step(
     p = vertex
     if code != FREE_VERTEX or degree == 0:
         return p
-    centroid = ring_sum / float(degree)
+    centroid = ring_sum / wp.float32(degree)
     delta = centroid - p
     tangential = project_out_normal(delta, normal)
     return p + lam * tangential
@@ -1196,7 +1196,7 @@ def intrinsic_delaunay_candidates(
     # Mark the interior edges that violate the local Delaunay condition, and measure what the
     # flipped edge would be -- both from edge lengths only, which is what makes the retriangulation
     # intrinsic: no vertex moves, so the *surface* is unchanged and only its triangulation improves.
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     out_flip[k] = False
     out_new_length[k] = 0.0
     f0 = adjacency[k, 0]
@@ -1263,7 +1263,7 @@ def update_flipped_lengths(
     # rows first. This must run *before* the connectivity rewrite, which is what still knows which
     # corner holds which vertex; a committed flip owns both its faces exclusively, so reading and
     # writing the same rows here is race-free.
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     if not flip[k]:
         return
     f0 = adjacency[k, 0]
@@ -1306,7 +1306,7 @@ def cluster_accumulate(
     out_sum: wp.array[wp.vec3],
     out_count: wp.array[wp.int32],
 ) -> None:
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     wp.atomic_add(out_sum, labels[v], vertices[v])
     wp.atomic_add(out_count, labels[v], 1)
 
@@ -1322,7 +1322,7 @@ def cluster_min_center_distance(
     # Pass 1 of the "closest to the cell centre" representative: the winning *distance* per cluster.
     # Split from the index pick so both passes use 32-bit atomics only; the two together are
     # deterministic because pass 2 breaks ties by lowest vertex index.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     cell = voxel_cell(vertices[v], origin, voxel_size_inverse(voxel_size))
     center = origin + wp.vec3(
         (wp.float32(cell[0]) + 0.5) * voxel_size,
@@ -1342,7 +1342,7 @@ def cluster_pick_closest(
     out_representative: wp.array[wp.int32],
 ) -> None:
     # Pass 2: whichever vertices tie for their cluster's winning distance, the lowest index wins.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     cell = voxel_cell(vertices[v], origin, voxel_size_inverse(voxel_size))
     center = origin + wp.vec3(
         (wp.float32(cell[0]) + 0.5) * voxel_size,
@@ -1383,14 +1383,14 @@ def objective_flip_candidates(
 ) -> None:
     # Quad convention (shared with ``delone_flip_candidates``): the current diagonal is a-c, with
     # faces (a, b, c) and (a, c, d); the flip replaces it with b-d, giving (a, b, d) and (d, b, c).
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     out_flip[k] = wp.bool(False)
     f0 = adjacency[k, 0]
     f1 = adjacency[k, 1]
     if region_flags[f0] == 0 or region_flags[f1] == 0:
         return
     a, b, c, d = _resolve_flip_quad_guarded(
-        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, wp.int32(k), f0, out_quad
+        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, k, f0, out_quad
     )
     if a < 0:
         return
@@ -1531,7 +1531,7 @@ def accumulate_face_quadrics(
 ) -> None:
     # Area-weighted plane quadric of each face, scattered onto its three corners. Area weighting is
     # Garland-Heckbert's: a large triangle constrains its vertices more than a sliver does.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
     cross = wp.cross(v1 - v0, v2 - v0)
     double_area = wp.length(cross)
@@ -1621,7 +1621,7 @@ def pass_edge_keys(
     # and a maximal sentinel for each padded one. Sentinels sort to the very end, so bounding the
     # grouping below by ``3 * n_faces`` excludes them exactly. That padding is the whole difference
     # between the two kernels; the keys themselves come from the shared ``write_face_edge_keys``.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     if f >= state[DECIMATION_FACES]:
         c = f * 3
         out_keys[c + 0] = EDGE_KEY_PAD
@@ -1639,7 +1639,7 @@ def mark_unique_edge_starts(
     # ``grouping.unique_1d`` answers with a hash table, over sorted keys instead, and emitting
     # ``int32`` so the scan that follows needs no cast. See ``mark_edge_pair_starts`` above for the
     # one condition the two differ by.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     start = wp.int32(0)
     if i < state[DECIMATION_FACES] * 3 and sorted_run_start(sorted_keys, i):
         start = wp.int32(1)
@@ -1668,7 +1668,7 @@ def emit_unique_edges(
     # A padded corner is sent to the dummy edge slot so ``scatter_edge_incidence`` can run over the
     # whole corner buffer, and the last live position publishes the live edge count -- the tail read
     # that sizes ``flatnonzero``'s output, left on the device.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     live = state[DECIMATION_FACES] * 3
     corner = order[i]
     if i >= live:
@@ -1694,7 +1694,7 @@ def pad_unique_edge_tail(
 ) -> None:
     # Point every padded edge row at the dummy vertex. Its code is frozen to CORNER_VERTEX, so
     # ``quadric_collapse_candidates`` rejects the row on its first test and never reads further.
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     if e >= state[DECIMATION_EDGES]:
         out_unique_edges[e, 0] = dummy_vertex
         out_unique_edges[e, 1] = dummy_vertex
@@ -1705,7 +1705,7 @@ def reset_collapse_rounds(out_state: wp.array[wp.int32]) -> None:
     # dim=1. ``[round index, commits as of the previous round, loop condition]`` at the start of a
     # pass. A kernel rather than ``array.assign``, because that is a host-to-device copy and the
     # pass this runs inside is captured as a graph.
-    _ = int(wp.tid())
+    _ = wp.int32(wp.tid())
     out_state[0] = 0
     out_state[1] = 0
     out_state[2] = 1
@@ -1723,7 +1723,7 @@ def edge_csr_triplets(
     # silently, which is what is wanted here -- pointing them all at the dummy instead makes tens of
     # thousands of triplets collide on **one** entry, and its accumulation atomic then serializes:
     # measured 4.25 ms of a 4.82 ms pass on ``saddle``, 88 % of it, against 0.03 ms once dropped.
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     a = e * 2
     if e >= state[DECIMATION_EDGES]:
         out_rows[a + 0] = -1
@@ -1742,7 +1742,7 @@ def edge_csr_triplets(
 @wp.kernel
 def freeze_dummy_vertex(dummy_vertex: wp.int32, out_codes: wp.array[wp.int32]) -> None:
     # dim=1. See ``pad_unique_edge_tail``.
-    _ = int(wp.tid())
+    _ = wp.int32(wp.tid())
     out_codes[dummy_vertex] = CORNER_VERTEX
 
 
@@ -1755,9 +1755,9 @@ def collapse_pass_budgets(
 ) -> None:
     # dim=1. The two per-pass budgets the host used to compute: the cheapest-half cut over the
     # live candidates, and the pass's face surplus (an interior collapse removes two faces).
-    _ = int(wp.tid())
-    out_half[0] = wp.max(wp.int32(1), state[DECIMATION_EDGES] / 2)
-    out_surplus[0] = (state[DECIMATION_FACES] - target_faces) / 2
+    _ = wp.int32(wp.tid())
+    out_half[0] = wp.max(wp.int32(1), state[DECIMATION_EDGES] // 2)
+    out_surplus[0] = (state[DECIMATION_FACES] - target_faces) // 2
 
 
 @wp.kernel
@@ -1772,7 +1772,7 @@ def compact_faces(
     # Move the surviving faces to the front of the face buffer and pad the rest with the dummy
     # triangle, publishing the new face count. Survivors move strictly left and are read from a
     # separate buffer, so the compaction and the padding cannot race.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     kept = ranks[ranks.shape[0] - 1]
     if f == 0:
         out_state[DECIMATION_FACES] = kept
@@ -1800,7 +1800,7 @@ def compact_vertices(
     # reading: ``ranks`` is the inclusive scan of the referenced mask, so ``ranks[v]-1`` is the new
     # index of vertex ``v`` and its last element is the surviving count. Reads and writes use
     # different buffers, so this may run over the whole capacity.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     kept = ranks[ranks.shape[0] - 1]
     if v == 0:
         out_state[DECIMATION_VERTICES] = kept
@@ -1818,7 +1818,7 @@ def apply_vertex_remap(
 ) -> None:
     # In place, one element per corner: a padded corner keeps pointing at the dummy vertex, whose
     # remap entry is -1 because no face references it.
-    c = int(wp.tid())
+    c = wp.int32(wp.tid())
     v = out_faces[c]
     if v != dummy_vertex:
         out_faces[c] = remap[v]
@@ -1844,7 +1844,7 @@ def quadric_collapse_candidates(
     # Garland-Heckbert candidate: the cost of collapsing this edge and where its survivor lands.
     # ``out_cost`` is left at +inf for a rejected edge, so the caller's cost sort puts every
     # rejection past every candidate and the budget cut never picks one up.
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     out_survivor[k] = -1
     out_cost[k] = wp.inf
     u = unique_edges[k, 0]
@@ -1911,7 +1911,7 @@ def drop_collapses_past_budget(
     # can run inside one ``wp.capture_while`` graph; ``begin_collapse_round`` writes it. A budget of
     # zero retires everything, which is how a pass that has exhausted its surplus stops committing
     # without the host being told.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if i >= budget[0]:
         out_survivor[order[i]] = -1
 
@@ -1930,7 +1930,7 @@ def begin_collapse_round(
     #
     # A **device** array rather than a launch argument, because the pass that computes it is itself
     # replayed as a graph and the face count it comes from never reaches the host.
-    _ = int(wp.tid())
+    _ = wp.int32(wp.tid())
     budget = surplus[0] - count[0]
     if count[0] == 0:
         budget = wp.max(budget, wp.int32(1))
@@ -1947,7 +1947,7 @@ def end_collapse_round(
     # It stops when the round committed nothing -- a further round cannot, since the state it
     # reads is then unchanged -- or at the round cap. A budget-exhausted pass stops through that
     # same test: ``begin_collapse_round`` writes a zero budget, so nothing commits.
-    _ = int(wp.tid())
+    _ = wp.int32(wp.tid())
     out_state[0] = out_state[0] + wp.int32(1)
     progressed = count[0] > out_state[1]
     out_state[1] = count[0]
@@ -1985,11 +1985,11 @@ def claim_collapse_key(
     out_min_key: wp.array[wp.int32],
 ) -> None:
     # Pass 1 of 3: the winning (smallest scrambled) key over the closed 1-rings of both endpoints.
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     s = survivor[k]
     if s < 0:
         return
-    key = scramble_index(wp.int32(k))
+    key = scramble_index(k)
     r = removed[k]
     wp.atomic_min(out_min_key, s, key)
     wp.atomic_min(out_min_key, r, key)
@@ -2033,12 +2033,12 @@ def claim_collapse_index(
     # Pass 2 of 3: two candidates whose scrambled keys collide would both believe they won, which
     # would break independence -- unlikely at 2^31 keys, but a corrupted mesh when it happens. Among
     # the key winners in a neighbourhood the lowest edge index takes it.
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     s = survivor[k]
     if s < 0:
         return
     r = removed[k]
-    if not wins_key_everywhere(offsets, columns, min_key, s, r, scramble_index(wp.int32(k))):
+    if not wins_key_everywhere(offsets, columns, min_key, s, r, scramble_index(k)):
         return
     wp.atomic_min(out_claim, s, k)
     wp.atomic_min(out_claim, r, k)
@@ -2063,14 +2063,14 @@ def mark_collapse_winners(
     # Pass 3 of 3: the win test, kept separate from the commit so the caller can apply its per-pass
     # budget *after* the independent set is known. Trimming members from an independent set keeps it
     # independent; trimming the candidate list beforehand would change which set is found.
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     out_cost[k] = wp.inf
     s = survivor[k]
     if s < 0:
         out_survivor[k] = -1
         return
     r = removed[k]
-    won = wins_key_everywhere(offsets, columns, min_key, s, r, scramble_index(wp.int32(k)))
+    won = wins_key_everywhere(offsets, columns, min_key, s, r, scramble_index(k))
     if claim[s] != k or claim[r] != k:
         won = False
     for i in range(offsets[s], offsets[s + 1]):
@@ -2097,7 +2097,7 @@ def commit_selected_collapses(
 ) -> None:
     # Apply an already-independent set: no claim test, because ``mark_collapse_winners`` established
     # independence and the budget cut only ever *removes* members from it.
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     s = survivor[k]
     if s < 0:
         return
@@ -2118,7 +2118,7 @@ def lock_collapse_neighborhoods(
     # independent-set round in the *same* pass can be told which candidates the commit invalidated
     # (see ``drop_locked_candidates``). Plain stores rather than atomics: every write is the same
     # value.
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     s = survivor[k]
     if s < 0:
         return
@@ -2148,7 +2148,7 @@ def drop_locked_candidates(
     # so its endpoints' quadrics, its cost, its target position, its link condition and its
     # normal-flip veto are all still the ones the scoring pass computed. Fail that test and the
     # candidate must wait for the next geometry rebuild.
-    k = int(wp.tid())
+    k = wp.int32(wp.tid())
     out_survivor[k] = -1
     s = candidates[k]
     if s < 0:

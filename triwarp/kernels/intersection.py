@@ -441,7 +441,7 @@ def face_aabb_bounds(
     out_upper: wp.array[wp.vec3],
 ) -> None:
     f = wp.tid()
-    v0, v1, v2 = kernel_triangles.face_vertices(vertices, faces, wp.int32(f))
+    v0, v1, v2 = kernel_triangles.face_vertices(vertices, faces, f)
     lower, upper = triangle_aabb(v0, v1, v2)
     out_lower[f] = lower
     out_upper[f] = upper
@@ -455,12 +455,12 @@ def expand_query_target_pairs(
     out_pairs: wp.array2d[wp.int32],
 ) -> None:
     q = wp.tid()
-    start = int(offsets[q])
-    count = int(hit_counts[q])
+    start = offsets[q]
+    count = hit_counts[q]
     i = wp.int32(0)
     w = start
     while i < count:
-        out_pairs[w, 0] = wp.int32(q)
+        out_pairs[w, 0] = q
         out_pairs[w, 1] = target_indices[w]
         w = w + 1
         i = i + 1
@@ -706,16 +706,16 @@ def emit_quad_cut(
     edge_b = outside
     new_v0 = edge_points[tid, edge_a]
     new_v1 = edge_points[tid, edge_b]
-    new_i0 = vertex_base + wp.int32(2) * wp.int32(tid)
+    new_i0 = vertex_base + wp.int32(2) * tid
     new_i1 = new_i0 + wp.int32(1)
-    out_new_verts[wp.int32(2) * wp.int32(tid)] = new_v0
-    out_new_verts[wp.int32(2) * wp.int32(tid) + wp.int32(1)] = new_v1
-    out_new_faces[wp.int32(2) * wp.int32(tid), 0] = v_a
-    out_new_faces[wp.int32(2) * wp.int32(tid), 1] = v_b
-    out_new_faces[wp.int32(2) * wp.int32(tid), 2] = new_i0
-    out_new_faces[wp.int32(2) * wp.int32(tid) + wp.int32(1), 0] = new_i0
-    out_new_faces[wp.int32(2) * wp.int32(tid) + wp.int32(1), 1] = new_i1
-    out_new_faces[wp.int32(2) * wp.int32(tid) + wp.int32(1), 2] = v_a
+    out_new_verts[wp.int32(2) * tid] = new_v0
+    out_new_verts[wp.int32(2) * tid + wp.int32(1)] = new_v1
+    out_new_faces[wp.int32(2) * tid, 0] = v_a
+    out_new_faces[wp.int32(2) * tid, 1] = v_b
+    out_new_faces[wp.int32(2) * tid, 2] = new_i0
+    out_new_faces[wp.int32(2) * tid + wp.int32(1), 0] = new_i0
+    out_new_faces[wp.int32(2) * tid + wp.int32(1), 1] = new_i1
+    out_new_faces[wp.int32(2) * tid + wp.int32(1), 2] = v_a
 
 
 @wp.kernel
@@ -740,10 +740,10 @@ def emit_tri_cut(
     edge_1 = (inside + wp.int32(2)) % wp.int32(3)
     new_v0 = edge_points[tid, edge_0]
     new_v1 = edge_points[tid, edge_1]
-    new_i0 = vertex_base + wp.int32(2) * wp.int32(tid)
+    new_i0 = vertex_base + wp.int32(2) * tid
     new_i1 = new_i0 + wp.int32(1)
-    out_new_verts[wp.int32(2) * wp.int32(tid)] = new_v0
-    out_new_verts[wp.int32(2) * wp.int32(tid) + wp.int32(1)] = new_v1
+    out_new_verts[wp.int32(2) * tid] = new_v0
+    out_new_verts[wp.int32(2) * tid + wp.int32(1)] = new_v1
     out_new_faces[tid, 0] = v_inside
     out_new_faces[tid, 1] = new_i0
     out_new_faces[tid, 2] = new_i1
@@ -762,7 +762,7 @@ def plane_crossed_edge_mask(
     # at most two of a triangle's three edges can ever be flagged -- two of three vertices always
     # share a sign, so their edge is never crossed and ``emit_size_faces``' 3-split branch is
     # unreachable from here.
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     a = unique_edges[e, 0]
     b = unique_edges[e, 1]
     sign_a = kernel_array.sign_with_tolerance(vertex_dots[a], tolerance)
@@ -782,7 +782,7 @@ def plane_edge_crossing_points(
     # ``remesh.fill_edge_midpoints`` with the plane crossing in place of the midpoint. One point per
     # *unique edge* rather than per cut face, which is what makes the split crack-free where
     # ``_clip_with_vertex_field`` is cracked: the two faces sharing the edge read one index.
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     if crossed[e]:
         out_points[offsets[e]] = canonical_edge_crossing(
             vertices, vertex_dots, unique_edges[e, 0], unique_edges[e, 1]
@@ -803,7 +803,7 @@ def label_faces_by_plane_side(
     # face -- two crossing vertices at dot 0 and one real vertex just off the plane -- on the side
     # its real vertex is on, where a centroid would divide the offset by three and a sum would let
     # two rounding-level zeros outvote it.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     extreme = wp.float32(0.0)
     for corner in range(3):
         value = vertex_dots[faces[f * 3 + corner]]
@@ -848,7 +848,7 @@ def marching_triangles_segments(
     # One thread per face. ``values`` is the field with the isovalue already subtracted, and a value
     # of exactly zero counts as positive, so every cut face has exactly one vertex alone in sign and
     # yields exactly one segment: the two edges incident to that vertex are the crossed ones.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     i0 = faces[f * 3 + 0]
     i1 = faces[f * 3 + 1]
     i2 = faces[f * 3 + 2]

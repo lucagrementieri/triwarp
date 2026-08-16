@@ -34,7 +34,7 @@ def corner_union_edges(
     # ``t: v -> u``, the corners at ``u`` are ``h`` and ``next(t)``, and the corners at ``v`` are
     # ``next(h)`` and ``t`` -- the twin runs the other way, so its *following* halfedge is the one
     # starting where ``h`` does.
-    h = int(wp.tid())
+    h = wp.int32(wp.tid())
     twin = twins[h]
     if twin < 0 or twin < h:
         return
@@ -59,7 +59,7 @@ def scatter_corner_values(
     # Position (or any per-vertex attribute) of each output copy, gathered through the corner it
     # came from. Every corner in a component writes the *same* value, so the race is benign by
     # construction and no atomics are needed.
-    h = int(wp.tid())
+    h = wp.int32(wp.tid())
     out_values[corner_index[h]] = values[faces[h]]
 
 
@@ -101,7 +101,7 @@ def classify_uv_halfedges(
     # smaller index, so each undirected edge is decided exactly once and the compacted output comes
     # out in ascending canonical-halfedge order. Every slot is written on every path, so the caller
     # may allocate the outputs with ``wp.empty``.
-    h = int(wp.tid())
+    h = wp.int32(wp.tid())
     twin = twins[h]
 
     out_is_seam[h] = False
@@ -129,9 +129,9 @@ def classify_uv_halfedges(
         forwards = twin
         backwards = h
 
-    out_quads[h, 0] = forwards / 3
+    out_quads[h, 0] = forwards // 3
     out_quads[h, 1] = forwards % 3
-    out_quads[h, 2] = backwards / 3
+    out_quads[h, 2] = backwards // 3
     out_quads[h, 3] = backwards % 3
 
     # ``backwards`` runs the other way, so the corner sitting on top of ``forwards``' tail is the
@@ -171,8 +171,8 @@ def boundary_face_corners(
 ) -> None:
     # Compacted boundary halfedge indices back into ``(face, corner)`` rows, under the
     # ``h = 3 * f + k`` convention.
-    i = int(wp.tid())
-    out_face_corners[i, 0] = halfedges[i] / 3
+    i = wp.int32(wp.tid())
+    out_face_corners[i, 0] = halfedges[i] // 3
     out_face_corners[i, 1] = halfedges[i] % 3
 
 
@@ -183,7 +183,7 @@ def face_corner_edge_vertices(
     # ``(face, corner)`` provenance back to the vertex pair it names. Columns 0 and 1 are the
     # forward side of a seam/foldover row and the whole of a boundary row, so one kernel serves all
     # three blocks.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     h = 3 * face_corners[i, 0] + face_corners[i, 1]
     out_edges[i, 0] = faces[h]
     out_edges[i, 1] = faces[halfedge_next(h)]

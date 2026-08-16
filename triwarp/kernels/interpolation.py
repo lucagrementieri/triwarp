@@ -11,8 +11,8 @@ def average_onto_faces(
     vertex_values: wp.array[wp.float32],
     out_face_values: wp.array[wp.float32],
 ) -> None:
-    f = int(wp.tid())
-    x0, x1, x2 = face_vertices(vertex_values, faces, wp.int32(f))
+    f = wp.int32(wp.tid())
+    x0, x1, x2 = face_vertices(vertex_values, faces, f)
     out_face_values[f] = (x0 + x1 + x2) / wp.float32(3.0)
 
 
@@ -32,7 +32,7 @@ def transfer_onto_vertices(
     # pre-filled (so a caller who narrowed the search still gets a deterministic buffer), and the
     # distance is promoted to ``inf``: ``wp.mesh_query_point_no_sign`` reports ``max_dist`` there,
     # which is indistinguishable from a genuine hit at exactly that range.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     f = face_id[i]
     if f < 0:
         out_distance[i] = wp.float32(wp.INF)
@@ -65,7 +65,7 @@ def interpolate_from_points(
     # Gaussian-weighted mean of one query's neighbours, over the CSR the neighbour queries return.
     # A query with no neighbours, or whose every weight underflowed, is left at the null value the
     # wrapper pre-filled -- so the miss case needs no per-dtype null argument here.
-    q = int(wp.tid())
+    q = wp.int32(wp.tid())
     start = offsets[q]
     stop = offsets[q + 1]
     if start >= stop:

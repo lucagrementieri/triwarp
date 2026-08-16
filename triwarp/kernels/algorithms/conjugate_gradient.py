@@ -105,7 +105,7 @@ def cg_absolute_tolerance(
 ) -> None:
     # Per-column squared stopping threshold, ``max(atol, tol * ||b_c||)^2``, matching
     # ``warp.optim.linear``'s convention so the two solvers stop on the same condition.
-    c = int(wp.tid())
+    c = wp.int32(wp.tid())
     relative = tol_sq * b_norm_sq[0, c]
     out_atol_sq[c] = wp.max(relative, atol_sq)
 
@@ -115,7 +115,7 @@ def cg_inverse_diagonal(diag: wp.array[wp.float64], out_inv_diag: wp.array[wp.fl
     # Jacobi preconditioner. A zero diagonal entry maps to 1 rather than to infinity, which is what
     # ``warp.optim.linear.preconditioner(m, "diag")`` does: such a row contributes nothing and must
     # not poison the whole vector with a NaN.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     value = diag[i]
     out_inv_diag[i] = wp.where(value != wp.float64(0.0), wp.float64(1.0) / value, wp.float64(1.0))
 
@@ -130,8 +130,8 @@ def cg_apply_inverse_diagonal(
     # ``z = M^-1 r`` for the *initial* residual only; inside the iteration this is fused into
     # ``cg_step_x_r_z``. One operator serves every column, so the diagonal is indexed within the
     # column rather than across the flat vector -- and is padded to ``stride`` alongside it.
-    i = int(wp.tid())
-    out_preconditioned[i] = inv_diag[i - (i / stride) * stride] * values[i]
+    i = wp.int32(wp.tid())
+    out_preconditioned[i] = inv_diag[i - (i // stride) * stride] * values[i]
 
 
 @wp.kernel
@@ -159,8 +159,8 @@ def cg_step_x_r_z(
     # is zero and stays zero here; ``inv_diag`` is padded to match. ``out_x`` is the **caller's**
     # buffer at pitch ``n``, which is why it is indexed separately and skipped in the pad -- copying
     # it into a padded buffer instead cost more than the padding saved on short solves.
-    i = int(wp.tid())
-    c = i / stride
+    i = wp.int32(wp.tid())
+    c = i // stride
     local = i - c * stride
     alpha = wp.float64(0.0)
     if r_norm_sq[0, c] > atol_sq[c]:
@@ -184,8 +184,8 @@ def cg_step_p(
 ) -> None:
     # ``p = z + beta p``, with ``beta = rz_new / rz_old``. ``dots[0]`` is r.r and ``dots[1]`` is
     # r.z, both written by the finalize that precedes this launch.
-    i = int(wp.tid())
-    c = i / stride
+    i = wp.int32(wp.tid())
+    c = i // stride
     beta = wp.float64(0.0)
     if dots[0, c] > atol_sq[c]:
         beta = dots[1, c] / rz_old[c]

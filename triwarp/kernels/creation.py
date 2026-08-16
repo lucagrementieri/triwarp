@@ -31,7 +31,7 @@ def lift_vec2(p: wp.vec2, z: wp.float32) -> wp.vec3:
 def reverse_face_winding(faces: wp.array[wp.int32], out_faces: wp.array[wp.int32]) -> None:
     # np.fliplr on an (n, 3) face block. All three indices are read before any is written, so
     # this is safe to run in place (out_faces is faces).
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     a = faces[f * 3 + 0]
     b = faces[f * 3 + 1]
     c = faces[f * 3 + 2]
@@ -62,7 +62,7 @@ def grid_vertices(
     y = origin_y + height * (wp.float64(j) / wp.float64(ny - 1))
     # ``wp.float32(...)``, not ``wp.cast``: the latter is a same-size bit reinterpretation and
     # fails to compile on a float64 source ("source and destination must have the same size").
-    out_vertices[int(i) * ny + int(j)] = wp.vec3(wp.float32(x), wp.float32(y), wp.float32(0.0))
+    out_vertices[i * ny + j] = wp.vec3(wp.float32(x), wp.float32(y), wp.float32(0.0))
 
 
 @wp.kernel
@@ -71,8 +71,8 @@ def grid_faces(ny: wp.int32, out_faces: wp.array[wp.int32]) -> None:
     # +Z. With X the slow axis a cell's corners are ``corner``, ``corner + ny`` (next X) and
     # ``+ 1`` (next Y), and cell ``(i, j)`` owns face slots ``2 * (i * (ny - 1) + j)`` and the next.
     i, j = wp.tid()
-    corner = int(i) * ny + int(j)
-    slot = (int(i) * (ny - 1) + int(j)) * 6
+    corner = i * ny + j
+    slot = (i * (ny - 1) + j) * 6
     out_faces[slot + 0] = corner
     out_faces[slot + 1] = corner + ny
     out_faces[slot + 2] = corner + ny + 1
@@ -112,7 +112,7 @@ def icosphere_vertex_index(
         # On a base edge. ``side`` is 0 for a->b (parameter j), 1 for b->c (k), 2 for c->a (i),
         # and the stored flag says whether that side runs against the edge's own direction.
         side = 0
-        t = int(j)
+        t = j
         if i == 0:
             side = 1
             t = k
@@ -152,14 +152,14 @@ def icosphere_generation(
         return
 
     step = n // level
-    i = int(bi) * step
-    j = int(bj) * step
+    i = bi * step
+    j = bj * step
     # The two parents are the ends of the previous level's edge this vertex bisects, which is the
     # pair of coordinates that came out odd.
-    i0 = int(i)
-    j0 = int(j)
-    i1 = int(i)
-    j1 = int(j)
+    i0 = wp.int32(i)
+    j0 = wp.int32(j)
+    i1 = wp.int32(i)
+    j1 = wp.int32(j)
     if (bi & 1) != 0 and (bj & 1) != 0:
         i0 = i + step
         j0 = j - step
@@ -192,7 +192,7 @@ def icosphere_faces(
     # downward ones, which is a bijection -- so every thread writes exactly one triangle and no
     # prefix-sum over rows is needed.
     f, i, j = wp.tid()
-    slot = (int(f) * n * n + int(i) * n + int(j)) * 3
+    slot = (f * n * n + i * n + j) * 3
     if i + j < n:
         out_faces[slot + 0] = icosphere_vertex_index(table, n, f, i + 1, j)
         out_faces[slot + 1] = icosphere_vertex_index(table, n, f, i, j + 1)
@@ -209,7 +209,7 @@ def icosphere_faces(
 def revolve_template_triangle(t: wp.int32, per: wp.int32) -> wp.vec3i:
     # trimesh's quad template [0, per, 1, 1, per, per + 1] tiled over profile segment i = t // 2
     # and offset by i: two triangles per segment, `per` being the vertex stride between slices.
-    i = t / 2
+    i = t // 2
     if t % 2 == 0:
         return wp.vec3i(i, i + per, i + 1)
     return wp.vec3i(i + 1, i + per, i + per + 1)
@@ -276,11 +276,11 @@ def revolve_faces(
     # offset and a profile point before being mapped to its final vertex slot.
     s, r = wp.tid()
     tri = revolve_template_triangle(keep[r], per)
-    base = (wp.int32(s) * n_keep + wp.int32(r)) * 3
+    base = (s * n_keep + r) * 3
     for k in range(3):
         g = tri[k]
         out_faces[base + k] = revolve_vertex_slot(
-            wp.int32(s) + g / per, g % per, n_slices, column, offsets, on_axis
+            s + g / per, g % per, n_slices, column, offsets, on_axis
         )
 
 
@@ -297,7 +297,7 @@ def revolve_cap_faces(
 ) -> None:
     # Place a profile triangulation on one end slice of a partial revolution. `reverse` reverses the
     # winding (trimesh's np.fliplr) so the far cap faces outward too.
-    t = int(wp.tid())
+    t = wp.int32(wp.tid())
     a = revolve_vertex_slot(slice_index, cap_faces[t * 3 + 0], n_slices, column, offsets, on_axis)
     b = revolve_vertex_slot(slice_index, cap_faces[t * 3 + 1], n_slices, column, offsets, on_axis)
     c = revolve_vertex_slot(slice_index, cap_faces[t * 3 + 2], n_slices, column, offsets, on_axis)
@@ -317,7 +317,7 @@ def offset_cap_faces(
 ) -> None:
     # Shift a cap triangulation onto one end of a revolved / swept / extruded mesh. `reverse`
     # reverses the winding (trimesh's np.fliplr) so that cap's normals point outward too.
-    t = int(wp.tid())
+    t = wp.int32(wp.tid())
     a = cap_faces[t * 3 + 0] + offset
     b = cap_faces[t * 3 + 1] + offset
     c = cap_faces[t * 3 + 2] + offset
@@ -338,7 +338,7 @@ def triangulation_signed_areas(
     # Twice the signed area of each 2D triangle: positive for counter-clockwise winding. The mean
     # sign decides whether `extrude_triangulation` has to flip the triangulation to agree with the
     # sign of the extrusion height.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     out_areas[f] = orient2d(
         vertices[faces[f * 3 + 0]], vertices[faces[f * 3 + 1]], vertices[faces[f * 3 + 2]]
     )
@@ -352,7 +352,7 @@ def extrude_wall_faces(
     # top cap (a + stride, b + stride). trimesh builds these from a 4-vertex soup per edge and
     # relies on its vertex merge to fuse them onto the caps; indexing the caps directly makes the
     # result watertight by construction, with no merge pass.
-    e = int(wp.tid())
+    e = wp.int32(wp.tid())
     a = boundary[e, 0]
     b = boundary[e, 1]
     out_faces[e * 6 + 0] = b + stride
@@ -376,7 +376,7 @@ def sweep_plane_normals(
     # One plane normal per path vertex: the end planes lie along their single adjacent segment,
     # interior planes bisect the two. trimesh unitizes the sum rather than halving it because
     # opposing segments can cancel.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     last = path.shape[0] - 1
     normal = wp.vec3(0.0, 0.0, 0.0)
     if i == 0:
@@ -408,7 +408,7 @@ def sweep_transforms(
     # The rotation taking Z+ onto normals[i], pre-rolled by angles[i], with path[i] as origin.
     # Unrolled by trimesh from inv(Rz(roll) @ Rx(phi) @ Rz(pi/2 - theta)), so it is the identity
     # for a Z+ normal and needs no matrix inverse at runtime.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     normal = normals[i]
     theta = wp.atan2(snap_spherical(normal[1]), snap_spherical(normal[0]))
     phi = wp.acos(snap_spherical(normal[2]))
@@ -459,10 +459,10 @@ def sweep_wall_faces(
     # index reaches n_vertices and it is a no-op.
     s, e = wp.tid()
     n_boundary = boundary.shape[0]
-    offset = wp.int32(s) * stride
+    offset = s * stride
     a = boundary[e, 0] + offset
     b = boundary[e, 1] + offset
-    base = (wp.int32(s) * n_boundary + wp.int32(e)) * 6
+    base = (s * n_boundary + e) * 6
     out_faces[base + 0] = a % n_vertices
     out_faces[base + 1] = b % n_vertices
     out_faces[base + 2] = (a + stride) % n_vertices
@@ -506,7 +506,7 @@ def truncated_prism_geometry(
     # One independent watertight prism per input triangle: the triangle itself, its projection onto
     # the truncation plane, and the six side triangles bridging them. Vertices 0-2 are the source
     # triangle and 3-5 its projection.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     v0 = vertices[faces[f * 3 + 0]]
     v1 = vertices[faces[f * 3 + 1]]
     v2 = vertices[faces[f * 3 + 2]]
@@ -536,7 +536,7 @@ def truncated_prism_geometry(
 
 @wp.kernel
 def random_soup_vertices(seed: wp.int32, out_vertices: wp.array[wp.vec3]) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     state = wp.rand_init(seed, i)
     out_vertices[i] = wp.vec3(wp.randf(state) - 0.5, wp.randf(state) - 0.5, wp.randf(state) - 0.5)
 
@@ -716,7 +716,7 @@ def surface_kuen(u: wp.float32, v: wp.float32) -> wp.vec3:
     # limit of ``log(tan(v / 2))`` actually goes to. Both rows are sampled, so both are replicated
     # here -- and the second guard doubles as the float32 one, since ``tan(v / 2)`` turns negative
     # a single ulp past pi and ``log`` of it is NaN.
-    v_safe = float(v)
+    v_safe = wp.float32(v)
     if v_safe <= 0.0:
         v_safe = KUEN_DELTA_V0
     sv = wp.sin(v_safe)
@@ -838,7 +838,7 @@ def parametric_surface_vertices(
     # canonical one keeps the result bit-exact run to run, which launching over the lattice and
     # letting the identified samples race for the slot would not (a twisted seam and a collapsed
     # pole row reach the same point through different expressions, so they agree only to rounding).
-    t = int(wp.tid())
+    t = wp.int32(wp.tid())
     out_vertices[t] = parametric_position(kind, sample_u[t], sample_v[t], n1, n2)
 
 
@@ -852,7 +852,7 @@ def random_hills_vertices(
     sample_v: wp.array[wp.float32],
     out_vertices: wp.array[wp.vec3],
 ) -> None:
-    t = int(wp.tid())
+    t = wp.int32(wp.tid())
     x = sample_u[t]
     y = sample_v[t]
     height = wp.float32(0.0)

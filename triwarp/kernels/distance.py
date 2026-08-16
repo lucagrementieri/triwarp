@@ -94,7 +94,7 @@ def chamfer_nn_term_tiled(
     one point per tile and the loss would come out roughly 64x too small.
     """
     i, t = wp.tid()
-    idx = i * TILE_1D + int(t)
+    idx = i * TILE_1D + t
     contrib = wp.float32(0.0)
     if idx < x.shape[0]:
         diff = x[idx] - y[nearest[idx]]
@@ -126,7 +126,7 @@ def chamfer_nn_term_sliced(
     """
     j = wp.tid()
     total = wp.float32(0.0)
-    for idx in range(int(j), x.shape[0], int(n_slices)):
+    for idx in range(j, x.shape[0], n_slices):
         diff = x[idx] - y[nearest[idx]]
         total = total + scale * wp.length_sq(diff)
     wp.atomic_add(out_loss, 0, total)
@@ -151,7 +151,7 @@ def chamfer_surface_term_tiled(
     and CPU-unsafe for the same reason.
     """
     i, t = wp.tid()
-    idx = i * TILE_1D + int(t)
+    idx = i * TILE_1D + t
     contrib = wp.float32(0.0)
     if idx < points.shape[0]:
         f = face_id[idx]
@@ -185,7 +185,7 @@ def chamfer_surface_term_sliced(
     """
     j = wp.tid()
     total = wp.float32(0.0)
-    for idx in range(int(j), points.shape[0], int(n_slices)):
+    for idx in range(j, points.shape[0], n_slices):
         f = face_id[idx]
         if f >= 0:
             a, b, c = face_vertices(vertices, faces, f)

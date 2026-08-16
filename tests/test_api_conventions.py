@@ -23,6 +23,7 @@ from tests.api_conventions import (
     DocstringExample,
     allocation_device_problems,
     array_annotation_style_problems,
+    builtin_cast_problems,
     coverage_location_problems,
     docstring_examples,
     duplicate_name_problems,
@@ -243,6 +244,24 @@ def test_array_annotations_are_subscript_style() -> None:
     which one is current.
     """
     _fail("call-style array annotation(s):", array_annotation_style_problems())
+
+
+def test_kernel_casts_use_the_warp_spelling() -> None:
+    """
+    A cast inside a kernel reads ``wp.int32(...)`` / ``wp.float32(...)``, never ``int`` / ``float``.
+
+    ``.claude/CLAUDE.md`` section 3. The two spellings are the same Warp builtins and generate
+    identical code, so nothing but a check keeps them from coexisting -- the tree carried 329
+    ``int(wp.tid())`` against 640 ``wp.int32(...)``, and 46 sites in 41 kernels cast a thread index
+    with one spelling and re-cast the same local with the other a few lines later.
+
+    The asymmetry that makes it a rule: ``float(...)`` is a *hard compile error* inside a
+    ``wp.Float``-generic function (``Input types must be the same, got ['float64', 'float32']``),
+    so a bare one quietly forecloses ever genericising its function. Python-scope ``int`` /
+    ``float`` are untouched -- ``wp.constant(wp.float32(float("nan")))`` at module scope is an
+    ordinary Python call.
+    """
+    _fail("bare int()/float() cast(s) in kernel scope:", builtin_cast_problems())
 
 
 def test_generic_kernels_register_their_overloads() -> None:

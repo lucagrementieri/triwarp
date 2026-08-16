@@ -593,7 +593,7 @@ def minmax_vec3_chunked(points: wp.array[wp.vec3], out_corners: wp.array[wp.floa
     #
     # One thread per ``TILE_1D`` points, so the atomics see a few hundred contenders per address
     # rather than one per point.
-    chunk = int(wp.tid())
+    chunk = wp.int32(wp.tid())
     offset = chunk * TILE_1D
     remaining = points.shape[0] - offset
     if remaining <= 0:

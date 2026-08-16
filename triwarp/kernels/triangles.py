@@ -44,8 +44,8 @@ def face_signed_volumes(
     vertices: wp.array[Any], faces: wp.array[wp.int32], center: Any, out_volumes: wp.array[wp.Float]
 ) -> None:
     # Signed volume of the tetrahedron (center, v0, v1, v2); the sum over faces is the mesh volume.
-    fi = int(wp.tid())
-    p0, p1, p2 = face_vertices(vertices, faces, wp.int32(fi))
+    fi = wp.int32(wp.tid())
+    p0, p1, p2 = face_vertices(vertices, faces, fi)
     d = wp.dot(p0 - center, wp.cross(p1 - center, p2 - center))
     out_volumes[fi] = d / type(d)(6.0)
 
@@ -191,7 +191,7 @@ def face_quality(
     out_quality: wp.array[wp.float32],
 ) -> None:
     f = wp.tid()
-    v0, v1, v2 = face_vertices(vertices, faces, wp.int32(f))
+    v0, v1, v2 = face_vertices(vertices, faces, f)
     out_quality[f] = triangle_quality(v0, v1, v2, metric)
 
 
@@ -262,7 +262,7 @@ def points_to_barycentric_cramer(
     out_barycentric: wp.array[wp.vec3],
 ) -> None:
     f = wp.tid()
-    v0, v1, v2 = face_vertices(vertices, faces, wp.int32(f))
+    v0, v1, v2 = face_vertices(vertices, faces, f)
     out_barycentric[f] = point_barycentric_cramer(v0, v1, v2, points[f])
 
 
@@ -378,8 +378,8 @@ def face_centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: wp.
 def face_centroids(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_centroids: wp.array[wp.vec3]
 ) -> None:
-    f = int(wp.tid())
-    out_centroids[f] = face_centroid(vertices, faces, wp.int32(f))
+    f = wp.int32(wp.tid())
+    out_centroids[f] = face_centroid(vertices, faces, f)
 
 
 @wp.func
@@ -439,8 +439,8 @@ def face_gradients(
     values: wp.array[wp.float64],
     out_gradients: wp.array[wp.vec3d],
 ) -> None:
-    f = int(wp.tid())
-    out_gradients[f] = face_gradient(vertices, faces, normals, areas, values, wp.int32(f))
+    f = wp.int32(wp.tid())
+    out_gradients[f] = face_gradient(vertices, faces, normals, areas, values, f)
 
 
 # Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in

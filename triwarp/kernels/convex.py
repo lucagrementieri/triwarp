@@ -12,7 +12,7 @@ def face_adjacency_projections(
     face_adjacency_unshared: wp.array2d[wp.int32],
     out_projections: wp.array[wp.float32],
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     normal = face_normals[face_adjacency[tid, 0]]
     origin = vertices[face_adjacency_edges[tid, 0]]
     vid_other = face_adjacency_unshared[tid, 1]
@@ -29,8 +29,8 @@ def hull_support_extremes(
     out_best_min: wp.array[wp.float32],
 ) -> None:
     k, j = wp.tid()
-    n_p = int(points.shape[0])
-    direction = directions[int(k)]
+    n_p = points.shape[0]
+    direction = directions[k]
     # Strided slice, NOT a contiguous chunk: consecutive threads read consecutive points, so the
     # loads coalesce, and each thread contributes one atomic instead of one per point.
     #
@@ -38,17 +38,17 @@ def hull_support_extremes(
     # this kernel used, but `wp.launch_tiled` runs exactly ONE lane per block on the Warp CPU
     # backend through Warp 1.16 (`wp.tid()`'s lane index is always 0), so a tile of per-lane
     # values holds one element there and returns a wrong extreme. This form is lane-free.
-    local_max = float(-FLOAT32_INF_CONSTANT)
-    local_min = float(FLOAT32_INF_CONSTANT)
-    for i in range(int(j), n_p, int(n_slices)):
+    local_max = wp.float32(-FLOAT32_INF_CONSTANT)
+    local_min = wp.float32(FLOAT32_INF_CONSTANT)
+    for i in range(j, n_p, n_slices):
         distance = wp.dot(direction, points[i])
         local_max = wp.max(local_max, distance)
         local_min = wp.min(local_min, distance)
 
     # A slice past the end of the cloud contributes nothing.
     if local_max > -FLOAT32_INF_CONSTANT:
-        wp.atomic_max(out_best_max, int(k), local_max)
-        wp.atomic_min(out_best_min, int(k), local_min)
+        wp.atomic_max(out_best_max, k, local_max)
+        wp.atomic_min(out_best_min, k, local_min)
 
 
 @wp.kernel
@@ -63,12 +63,12 @@ def mark_hull_support(
     k, i = wp.tid()
     # A hemisphere direction n covers both +n (max, supports the vertex farthest
     # along n) and -n (min, supports the vertex farthest along -n).
-    distance = wp.dot(directions[int(k)], points[int(i)])
+    distance = wp.dot(directions[k], points[i])
     # Slack scales with the per-direction support extent so the test is
     # scale-invariant and stays above the float32 dot-product noise floor.
-    slack = tolerance * (best_max[int(k)] - best_min[int(k)])
-    if distance >= best_max[int(k)] - slack or distance <= best_min[int(k)] + slack:
-        out_mask[int(i)] = True
+    slack = tolerance * (best_max[k] - best_min[k])
+    if distance >= best_max[k] - slack or distance <= best_min[k] + slack:
+        out_mask[i] = True
 
 
 @wp.kernel
@@ -81,11 +81,11 @@ def support_indices(
     out_support: wp.array[wp.int32],
 ) -> None:
     k, i = wp.tid()
-    slack = tolerance * (best_max[int(k)] - best_min[int(k)])
-    if wp.dot(directions[int(k)], points[int(i)]) >= best_max[int(k)] - slack:
+    slack = tolerance * (best_max[k] - best_min[k])
+    if wp.dot(directions[k], points[i]) >= best_max[k] - slack:
         # Lowest attaining index wins, so the shell is identical across launches even when
         # several points tie for the support along a direction.
-        wp.atomic_min(out_support, int(k), int(i))
+        wp.atomic_min(out_support, k, i)
 
 
 @wp.kernel
@@ -96,11 +96,11 @@ def shell_bounds(
 ) -> None:
     # One thread: the shell has a few hundred vertices at most, and reducing on device keeps the
     # support sweep and the tetrahedron build in one launch chain with no host readback between.
-    n = int(shell_vertices.shape[0])
+    n = shell_vertices.shape[0]
     total = wp.vec3(0.0, 0.0, 0.0)
     for i in range(n):
         total = total + shell_vertices[i]
-    center = total / float(n)
+    center = total / wp.float32(n)
 
     # The radius is the length scale the interior margin is measured against, so that the margin is
     # a fraction of the construction's own size rather than of a tetrahedron's aspect ratio.
@@ -135,7 +135,7 @@ def tetrahedron_planes(
     out_planes: wp.array2d[wp.vec4],
     out_valid: wp.array[wp.bool],
 ) -> None:
-    t = int(wp.tid())
+    t = wp.int32(wp.tid())
     apex = centroid[0]
     a = shell_vertices[shell_faces[t * 3 + 0]]
     b = shell_vertices[shell_faces[t * 3 + 1]]
@@ -175,13 +175,13 @@ def mark_hull_superset(
     margin: wp.float32,
     out_mask: wp.array[wp.bool],
 ) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     point = points[i]
     # Strict interior only, by a real distance. A point on a tetrahedron's boundary can still be a
     # hull vertex, and requiring it to clear every face by `slack` means float32 error in the plane
     # evaluation can only keep a point that could have been dropped -- never drop a hull vertex.
     slack = margin * radius[0]
-    n_tetra = int(valid.shape[0])
+    n_tetra = valid.shape[0]
     keep = wp.int32(1)
     for t in range(n_tetra):
         if valid[t]:

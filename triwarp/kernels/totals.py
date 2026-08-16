@@ -18,10 +18,10 @@ def centroid_tiled(
     # CPU MUST NOT use this: `wp.launch_tiled` runs one lane per block there, so the block reduction
     # would see one face per tile. See `centroid_sliced` and `_device.prefers_tiled_reduction`.
     i, t = wp.tid()
-    f = i * TILE_1D + int(t)
+    f = i * TILE_1D + t
     contrib = wp.vec3(0.0, 0.0, 0.0)
     area = wp.float32(0.0)
-    if f < int(n_faces):
+    if f < n_faces:
         triangle_face = faces[f * 3 : (f + 1) * 3]
         _, area = face_normals_and_area(vertices, triangle_face)
         contrib = (
@@ -55,7 +55,7 @@ def centroid_sliced(
     j = wp.tid()
     total = wp.vec3(0.0, 0.0, 0.0)
     area_total = wp.float32(0.0)
-    for f in range(int(j), int(n_faces), int(n_slices)):
+    for f in range(j, n_faces, n_slices):
         triangle_face = faces[f * 3 : (f + 1) * 3]
         _, area = face_normals_and_area(vertices, triangle_face)
         total = total + (
@@ -88,8 +88,8 @@ def moment_integrands(
     #   ∫x^2 dV  = det * (a.x^2 + b.x^2 + c.x^2 + a.x b.x + a.x c.x + b.x c.x) / 60
     #   ∫xy dV   = det * (2(a.x a.y + b.x b.y + c.x c.y)
     #                     + a.x b.y + b.x a.y + a.x c.y + c.x a.y + b.x c.y + c.x b.y) / 120
-    f = int(wp.tid())
-    a, b, c = face_vertices_vec3d(vertices, faces, wp.int32(f))
+    f = wp.int32(wp.tid())
+    a, b, c = face_vertices_vec3d(vertices, faces, f)
     det = wp.dot(a, wp.cross(b, c))
 
     out_volume[f] = det / wp.float64(6.0)

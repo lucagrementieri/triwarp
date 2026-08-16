@@ -23,7 +23,7 @@ def halfedge_tangent_angles(
     # angles into the total angle Theta_v, the second lays the halfedges out as polar coordinates in
     # the flattened tangent plane. Rescaling by 2*pi/Theta_v (pi/Theta_v at a boundary vertex, whose
     # fan spans a half-disk) is what makes the flattening consistent on a cone point.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     begin = ring_offsets[v]
     end = ring_offsets[v + 1]
     if end <= begin:
@@ -72,7 +72,7 @@ def vertex_tangent_frames(
     # The reference direction is the vertex's first ring halfedge projected into the tangent plane,
     # which is exactly the halfedge that ``halfedge_tangent_angles`` assigns polar angle 0 -- so the
     # two functions describe the same coordinate system.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     normal = normals[v]
     if wp.length(normal) <= TOLERANCE_ZERO_CONSTANT:
         # An unreferenced vertex has no tangent plane at all. Emit a fixed unit frame rather than
@@ -104,7 +104,7 @@ def face_tangent_frames(
     # just that edge normalized and ``basis_y`` closes the right-handed frame. A degenerate face has
     # no first edge to speak of; ``normalize`` returns zero there (Warp's ``kEps`` is 0) and the
     # cross product follows, so the frame degrades to zeros rather than to NaN.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     edge = vertices[faces[f * 3 + 1]] - vertices[faces[f * 3 + 0]]
     basis_x = wp.normalize(edge)
     out_basis_x[f] = basis_x
@@ -122,7 +122,7 @@ def wrap_angle(angle: wp.float32) -> wp.float32:
 def halfedge_transport_angles(
     twins: wp.array[wp.int32], tangent_angles: wp.array[wp.float32], out_rho: wp.array[wp.float32]
 ) -> None:
-    h = int(wp.tid())
+    h = wp.int32(wp.tid())
     twin = twins[h]
     if twin >= wp.int32(0):
         opposite = tangent_angles[twin]

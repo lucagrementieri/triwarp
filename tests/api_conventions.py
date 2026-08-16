@@ -1,7 +1,7 @@
 """
 Static scan of the public API's shape: names, summaries, file layout and module boundaries.
 
-Fourteen conventions the package holds to, each one a defect class that was actually found rather
+Sixteen conventions the package holds to, each one a defect class that was actually found rather
 than an aesthetic preference. They are checked by an ``ast`` scan of ``triwarp/`` (excluding
 ``kernels/``, ``__init__.py`` and private ``_*.py`` modules) plus a listing of ``tests/`` and
 ``benchmarks/``, and [`tests/test_api_conventions.py`](test_api_conventions.py) fails the default
@@ -62,6 +62,19 @@ test run on any violation:
     modules, and one file carrying both. Restricted to *annotation* positions, which is what lets
     it scan the whole package -- ``wp.array(dtype=T)`` is a legal allocation expression at Python
     scope and only an annotation makes it the stale spelling.
+15. **A ``wp.launch`` / ``wp.launch_tiled`` names the device it launches on.** The memory-safety
+    guard of the family: an omitted ``device=`` resolves to Warp's *current* device, and with CPU
+    arrays that runs the kernel on ``cuda:0`` over host pointers, returns the right answer, and
+    corrupts the heap when those arrays are freed mid-kernel. This is the half of the guard that
+    carries the load -- ``conftest.py``'s ``STRICT`` mode only bites when the arrays are *not* on
+    the launch device, so on a CUDA run the omission is invisible to it.
+16. **A cast inside a kernel is spelled ``wp.int32`` / ``wp.float32``, never bare ``int`` /
+    ``float``** (``.claude/CLAUDE.md`` section 3). They are the same builtins under a different
+    name, with one asymmetry that matters: ``float(...)`` is a *hard compile error* inside a
+    ``wp.Float``-generic function, so it silently forecloses genericising that function -- which
+    runs against section 14's "prefer dtype-generic ``@wp.func``s". The tree carried 329
+    ``int(wp.tid())`` alongside 640 ``wp.int32(...)``, and 46 sites in 41 kernels used *both* on
+    the same local. Like checks 9, 13 and 14 this one scans ``kernels/``.
 
 Why a static scan rather than importing ``triwarp``
 ---------------------------------------------------
@@ -1117,4 +1130,62 @@ def launch_device_problems() -> list[str]:
         for key in sorted(_LAUNCH_DEVICE_ALLOWLIST)
         if key not in seen
     )
+    return problems
+
+
+# --- check 16 -----------------------------------------------------------------------------------
+
+_BUILTIN_CASTS = frozenset({"int", "float"})
+
+
+def _kernel_scope_functions(tree: ast.Module) -> list[ast.FunctionDef]:
+    """Every ``@wp.kernel`` / ``@wp.func`` in a module, whose body is Warp's DSL and not Python."""
+    found: list[ast.FunctionDef] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        decorators = " ".join(ast.unparse(decorator) for decorator in node.decorator_list)
+        if "wp.kernel" in decorators or "wp.func" in decorators:
+            found.append(node)
+    return found
+
+
+def builtin_cast_problems() -> list[str]:
+    """
+    Check 16: a bare ``int(...)`` / ``float(...)`` inside a ``@wp.kernel`` or ``@wp.func`` body.
+
+    ``.claude/CLAUDE.md`` section 3: ``wp.int32`` / ``wp.float32`` is the tree's only cast spelling.
+    ``int`` and ``float`` are the same Warp builtins under a different name -- ``int(x)`` compiles
+    only because Warp writes an unconditional ``#define int(x) cast_int(x)`` into every generated
+    module header, ``wp::int(x)`` not being valid C++ -- and the generated code is identical.
+
+    The asymmetry that makes this a rule rather than a preference is ``float``: inside a
+    ``wp.Float``-generic function ``total / float(count)`` does not narrow silently, it *fails to
+    parse* (``Input types must be the same, got ['float64', 'float32']``). So every bare ``float()``
+    is an unannounced decision that its function will never be generic, against section 14's
+    "prefer dtype-generic ``@wp.func``s". Where the function is or could be generic the spelling is
+    ``type(x)(...)``, the ``kernels/predicates.py`` convention.
+
+    Scoped to kernel-scope bodies because at Python scope ``int(...)`` / ``float(...)`` are the
+    ordinary builtins and entirely correct -- ``wp.constant(wp.float32(float("nan")))`` at module
+    scope in ``kernels/texture.py`` is a Python call and is not a violation.
+    """
+    problems: list[str] = []
+    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue  # test_package_scan_is_discoverable reports the parse failure
+        for function in _kernel_scope_functions(tree):
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                    continue
+                if node.func.id not in _BUILTIN_CASTS:
+                    continue
+                replacement = "wp.int32" if node.func.id == "int" else "wp.float32"
+                problems.append(
+                    f"{path.relative_to(_REPO_ROOT)}:{node.lineno} {function.name} casts with "
+                    f"'{ast.unparse(node)}' -- write {replacement}(...) instead, or type(x)(...) "
+                    "if the enclosing function is or could be dtype-generic"
+                )
     return problems

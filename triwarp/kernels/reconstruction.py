@@ -329,7 +329,7 @@ def build_local_triangulations(
     out_tris: wp.array3d[wp.int32],
     out_valid: wp.array2d[wp.bool],
 ) -> None:
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     k = neighbor_idx.shape[1]
     cap = out_tris.shape[1]
 
@@ -348,8 +348,10 @@ def build_local_triangulations(
     ang = wp.zeros(shape=MAX_NEIGHBOURS, dtype=wp.float32)
 
     # --- gather + filter neighbours ---
-    # int()/float() declare mutable Warp dynamic variables; bare literals are compile-time
-    # constants that freeze the enclosing loop (out_valid stays all-False -> no faces).
+    # A constructor call -- wp.int32(...) / wp.float32(...) -- declares a mutable Warp dynamic
+    # variable; a bare literal is a compile-time constant that freezes the enclosing loop
+    # (out_valid stays all-False -> no faces). The constructor is what matters, not which spelling
+    # of it: the older int()/float() forms are the same builtins under a different name.
     m = wp.int32(0)
     for i in range(k):
         if m >= MAX_NEIGHBOURS:
@@ -424,7 +426,7 @@ def build_local_triangulations(
     # --- greedy fan optimisation (linear-scan replacement of the priority queue) ---
     current = m  # inherits m's dynamic-variable type (m is already mutable)
     for _step in range(m):
-        best_w = float(-FLOAT32_INF_CONSTANT)  # float() keeps this a mutable Warp variable
+        best_w = wp.float32(-FLOAT32_INF_CONSTANT)  # the constructor keeps this mutable
         best_pos = wp.int32(-1)
         for i in range(m):
             if nbr[i] < 0:
@@ -478,7 +480,7 @@ def build_local_triangulations(
 # --------------------------------------------------------------------------------------
 @wp.kernel
 def canonicalize_triangles(tris: wp.array2d[wp.int32], out_sorted: wp.array2d[wp.int32]) -> None:
-    t = int(wp.tid())
+    t = wp.int32(wp.tid())
     # sort the three indices ascending (unoriented key)
     i, j, k = sort3(tris[t, 0], tris[t, 1], tris[t, 2])
     out_sorted[t, 0] = i
@@ -513,12 +515,12 @@ def poisson_sample_grid(
 ) -> wp.float32:
     # Trilinear interpolation of ``field`` at grid coordinate (gx, gy, gz) in [0, res - 1].
     # Clamp the base cell so the (i0 + 1, j0 + 1, k0 + 1) corner reads stay in range.
-    i0 = wp.clamp(int(wp.floor(gx)), 0, res - 2)
-    j0 = wp.clamp(int(wp.floor(gy)), 0, res - 2)
-    k0 = wp.clamp(int(wp.floor(gz)), 0, res - 2)
-    fx = wp.clamp(gx - float(i0), 0.0, 1.0)
-    fy = wp.clamp(gy - float(j0), 0.0, 1.0)
-    fz = wp.clamp(gz - float(k0), 0.0, 1.0)
+    i0 = wp.clamp(wp.int32(wp.floor(gx)), 0, res - 2)
+    j0 = wp.clamp(wp.int32(wp.floor(gy)), 0, res - 2)
+    k0 = wp.clamp(wp.int32(wp.floor(gz)), 0, res - 2)
+    fx = wp.clamp(gx - wp.float32(i0), 0.0, 1.0)
+    fy = wp.clamp(gy - wp.float32(j0), 0.0, 1.0)
+    fz = wp.clamp(gz - wp.float32(k0), 0.0, 1.0)
     c000 = field[poisson_grid_index(i0, j0, k0, res)]
     c100 = field[poisson_grid_index(i0 + 1, j0, k0, res)]
     c010 = field[poisson_grid_index(i0, j0 + 1, k0, res)]
@@ -549,7 +551,7 @@ def splat_normals(
     out_vz: wp.array[wp.float32],
     out_w: wp.array[wp.float32],
 ) -> None:
-    s = int(wp.tid())
+    s = wp.int32(wp.tid())
     n = normals[s]
     length = wp.length(n)
     # Confidence weighting scales the splat by the normal magnitude; otherwise unit weight.
@@ -560,12 +562,12 @@ def splat_normals(
 
     g = (points[s] - cube_lower) * inv_cell
     # Clamp the base cell so the (i0 + 1, j0 + 1, k0 + 1) splat corner stays in range.
-    i0 = wp.clamp(int(wp.floor(g[0])), 0, res - 2)
-    j0 = wp.clamp(int(wp.floor(g[1])), 0, res - 2)
-    k0 = wp.clamp(int(wp.floor(g[2])), 0, res - 2)
-    fx = wp.clamp(g[0] - float(i0), 0.0, 1.0)
-    fy = wp.clamp(g[1] - float(j0), 0.0, 1.0)
-    fz = wp.clamp(g[2] - float(k0), 0.0, 1.0)
+    i0 = wp.clamp(wp.int32(wp.floor(g[0])), 0, res - 2)
+    j0 = wp.clamp(wp.int32(wp.floor(g[1])), 0, res - 2)
+    k0 = wp.clamp(wp.int32(wp.floor(g[2])), 0, res - 2)
+    fx = wp.clamp(g[0] - wp.float32(i0), 0.0, 1.0)
+    fy = wp.clamp(g[1] - wp.float32(j0), 0.0, 1.0)
+    fz = wp.clamp(g[2] - wp.float32(k0), 0.0, 1.0)
 
     for di in range(2):
         wx = wp.where(di == 0, 1.0 - fx, fx)
@@ -588,7 +590,7 @@ def normalize_vector_field(
     out_vy: wp.array[wp.float32],
     out_vz: wp.array[wp.float32],
 ) -> None:
-    idx = int(wp.tid())
+    idx = wp.int32(wp.tid())
     inv = 1.0 / wp.max(weights[idx], POISSON_WEIGHT_EPS)
     out_vx[idx] = out_vx[idx] * inv
     out_vy[idx] = out_vy[idx] * inv
@@ -611,15 +613,15 @@ def negative_divergence(
     jm = wp.max(j - 1, 0)
     kp = wp.min(k + 1, res - 1)
     km = wp.max(k - 1, 0)
-    dx = (vx[poisson_grid_index(ip, j, k, res)] - vx[poisson_grid_index(im, j, k, res)]) / float(
-        ip - im
-    )
-    dy = (vy[poisson_grid_index(i, jp, k, res)] - vy[poisson_grid_index(i, jm, k, res)]) / float(
-        jp - jm
-    )
-    dz = (vz[poisson_grid_index(i, j, kp, res)] - vz[poisson_grid_index(i, j, km, res)]) / float(
-        kp - km
-    )
+    dx = (
+        vx[poisson_grid_index(ip, j, k, res)] - vx[poisson_grid_index(im, j, k, res)]
+    ) / wp.float32(ip - im)
+    dy = (
+        vy[poisson_grid_index(i, jp, k, res)] - vy[poisson_grid_index(i, jm, k, res)]
+    ) / wp.float32(jp - jm)
+    dz = (
+        vz[poisson_grid_index(i, j, kp, res)] - vz[poisson_grid_index(i, j, km, res)]
+    ) / wp.float32(kp - km)
     out_b[poisson_grid_index(i, j, k, res)] = -(dx + dy + dz)
 
 
@@ -707,7 +709,9 @@ def prolong_grid(
     # Trilinear factor-2 prolongation: res_f - 1 == 2 * (res_c - 1), so fine node i sits at
     # coarse coordinate i / 2.
     i, j, k = wp.tid()
-    val = poisson_sample_grid(coarse, res_c, float(i) * 0.5, float(j) * 0.5, float(k) * 0.5)
+    val = poisson_sample_grid(
+        coarse, res_c, wp.float32(i) * 0.5, wp.float32(j) * 0.5, wp.float32(k) * 0.5
+    )
     out_fine[poisson_grid_index(i, j, k, res_f)] = val
 
 
@@ -720,7 +724,7 @@ def sample_field_trilinear(
     points: wp.array[wp.vec3],
     out_values: wp.array[wp.float32],
 ) -> None:
-    s = int(wp.tid())
+    s = wp.int32(wp.tid())
     g = (points[s] - cube_lower) * inv_cell
     out_values[s] = poisson_sample_grid(field, res, g[0], g[1], g[2])
 

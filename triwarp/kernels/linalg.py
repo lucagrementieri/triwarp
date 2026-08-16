@@ -43,7 +43,7 @@ def interior_row_counts(
     # ``(n_rhs, n_dofs)``, ``out_rhs`` is ``(n_rhs, n_free)``). Assembled in float64: the biharmonic
     # (k > 1) operator squares the Laplacian condition number, beyond float32 CG's reach; LSCM's
     # coupled u/v system is likewise ill-conditioned.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if fixed_mask[i]:
         return
     ri = free_map[i]
@@ -84,11 +84,11 @@ def interior_system_csr(
     # threads overlap. Column order is inherited from ``Q``'s row and ``free_map`` is monotone
     # non-decreasing, so the emitted row is column-sorted by construction -- which is the whole
     # reason this can skip a triplet sort.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     if fixed_mask[i]:
         return
     ri = free_map[i]
-    slot = int(out_offsets[ri])
+    slot = out_offsets[ri]
     for e in range(offsets[i], offsets[i + 1]):
         j = columns[e]
         if not fixed_mask[j]:

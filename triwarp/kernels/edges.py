@@ -18,7 +18,7 @@ def faces_to_edges(
     faces: wp.array[wp.int32], sort: wp.bool, out_edges: wp.array2d[wp.int32]
 ) -> None:
     # Three directed edges per face; ``sort`` puts the smaller vertex index first per row.
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     f = tid * 3
     i0 = faces[f + 0]
     i1 = faces[f + 1]
@@ -32,7 +32,7 @@ def faces_to_edges(
 def edge_lengths(
     vertices: wp.array[wp.vec3], edges: wp.array2d[wp.int32], out_lengths: wp.array[wp.float32]
 ) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     out_lengths[i] = wp.length(vertices[edges[i, 1]] - vertices[edges[i, 0]])
 
 
@@ -42,7 +42,7 @@ def face_edge_lengths(
 ) -> None:
     # Column ``e`` is the edge *opposite* corner ``e``, the igl intrinsic convention that
     # ``laplacian.cotmatrix_entries_intrinsic`` reads.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     v0 = vertices[faces[f * 3 + 0]]
     v1 = vertices[faces[f * 3 + 1]]
     v2 = vertices[faces[f * 3 + 2]]

@@ -223,7 +223,7 @@ def trace_from_faces(
 ) -> None:
     # One ray per thread. ``offsets`` is empty on the counting pass, which is how the two passes
     # share ``trace_walk``.
-    r = int(wp.tid())
+    r = wp.int32(wp.tid())
     f = start_faces[r]
     bary = start_bary[r]
     point = (
@@ -274,7 +274,7 @@ def trace_from_vertices(
     out_counts: wp.array[wp.int32],
     out_points: wp.array[wp.vec3],
 ) -> None:
-    r = int(wp.tid())
+    r = wp.int32(wp.tid())
     v = start_vertices[r]
     direction = directions[r]
     f, in_face = start_direction_at_vertex(

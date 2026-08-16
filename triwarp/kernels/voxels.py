@@ -43,7 +43,7 @@ def voxel_cell_indices(
     inverse_size: wp.float32,
     out_cells: wp.array2d[wp.int32],
 ) -> None:
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     cell = voxel_cell(points[v], origin, inverse_size)
     out_cells[v, 0] = cell[0]
     out_cells[v, 1] = cell[1]
@@ -63,7 +63,7 @@ def count_triangle_candidates(
     # cells, which is a strict superset of this one, and a cell outside the triangle's own AABB
     # cannot overlap the triangle -- so the *accepted* sets are identical and only the number of
     # rejected candidates differs.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     v0 = vertices[faces[f * 3 + 0]]
     v1 = vertices[faces[f * 3 + 1]]
     v2 = vertices[faces[f * 3 + 2]]
@@ -91,8 +91,8 @@ def test_triangle_candidates(
     # magnitude on any real mesh, so a thread-per-triangle launch is load-imbalanced by that same
     # factor. ``binary_search_index`` recovers the owning triangle from the flat work-item id
     # (``wp.lower_bound`` clamps to ``n - 1`` and would misattribute the last window).
-    item = int(wp.tid())
-    f = binary_search_index(offsets, wp.int32(item)) - 1
+    item = wp.int32(wp.tid())
+    f = binary_search_index(offsets, item) - 1
     v0 = vertices[faces[f * 3 + 0]]
     v1 = vertices[faces[f * 3 + 1]]
     v2 = vertices[faces[f * 3 + 2]]
@@ -102,11 +102,11 @@ def test_triangle_candidates(
     span_y = hi[1] - lo[1] + 1
     span_z = hi[2] - lo[2] + 1
 
-    local = wp.int32(item) - offsets[f]
+    local = item - offsets[f]
     plane = span_y * span_z
-    i = local / plane
+    i = local // plane
     rest = local - i * plane
-    j = rest / span_z
+    j = rest // span_z
     k = rest - j * span_z
     cell = wp.vec3i(lo[0] + i, lo[1] + j, lo[2] + k)
 
@@ -137,7 +137,7 @@ def cell_center_positions(
     voxel_size: wp.float32,
     out_centers: wp.array[wp.vec3],
 ) -> None:
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     out_centers[v] = wp.vec3(
         origin[0] + (wp.float32(voxels[v, 0]) + 0.5) * voxel_size,
         origin[1] + (wp.float32(voxels[v, 1]) + 0.5) * voxel_size,
@@ -149,7 +149,7 @@ def cell_center_positions(
 def lookup_cell_slots(
     volume: wp.uint64, cells: wp.array2d[wp.int32], out_slots: wp.array[wp.int32]
 ) -> None:
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     out_slots[v] = wp.volume_lookup_index(volume, cells[v, 0], cells[v, 1], cells[v, 2])
 
 
@@ -169,7 +169,7 @@ def point_cell(volume: wp.uint64, position: wp.vec3) -> wp.vec3i:
 def lookup_point_slots(
     volume: wp.uint64, points: wp.array[wp.vec3], out_slots: wp.array[wp.int32]
 ) -> None:
-    p = int(wp.tid())
+    p = wp.int32(wp.tid())
     cell = point_cell(volume, points[p])
     out_slots[p] = wp.volume_lookup_index(volume, cell[0], cell[1], cell[2])
 
@@ -186,7 +186,7 @@ def pack_cell_keys(
     # Column 0 is the least significant digit, matching ``kernels/grouping.pack_indices``: sorting
     # these keys reproduces ``grouping.unique_rows``'s row order exactly. ``base`` shifts negative
     # cells non-negative, which is order-preserving because it is a per-axis constant.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     key = wp.uint64(0)
     power = wp.uint64(1)
     for c in range(3):
@@ -219,7 +219,7 @@ def bucket_point_slots(
 ) -> None:
     # Points that fall outside the grid go into a sentinel bucket past the last voxel, so they sort
     # to the end and every real voxel's segment stays contiguous.
-    p = int(wp.tid())
+    p = wp.int32(wp.tid())
     bucket = slots[p]
     if bucket < 0:
         bucket = n_voxels
@@ -238,7 +238,7 @@ def segment_reduce_vec3(
 ) -> None:
     # One thread per voxel walking its segment in index order: the sum is bitwise reproducible,
     # which a float ``wp.atomic_add`` over the points would not be.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     start = offsets[v]
     count = counts[v]
     total = wp.vec3(0.0, 0.0, 0.0)
@@ -257,7 +257,7 @@ def pool_extremum_vec3(
     out_values: wp.array[wp.vec3],
 ) -> None:
     # Component-wise atomic min / max: order-independent for floats, so no sort is needed here.
-    p = int(wp.tid())
+    p = wp.int32(wp.tid())
     slot = slots[p]
     if slot < 0:
         return
@@ -269,7 +269,7 @@ def pool_extremum_vec3(
 
 @wp.kernel
 def zero_empty_voxels(counts: wp.array[wp.int32], out_values: wp.array[wp.vec3]) -> None:
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     if counts[v] == 0:
         out_values[v] = wp.vec3(0.0, 0.0, 0.0)
 
@@ -299,7 +299,7 @@ def neighborhood_complete(
 ) -> None:
     # 1 when every neighbour of the voxel is occupied (an interior voxel), 0 otherwise. Neighbours
     # of a voxel live in the same 8-cubed leaf most of the time, so the probes are cache-local.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     complete = wp.int32(1)
     for m in range(neighbors.shape[0]):
         i = voxels[v, 0] + neighbors[m, 0]
@@ -478,7 +478,7 @@ def cell_corner_indices(
     corner_volume: wp.uint64, voxels: wp.array2d[wp.int32], out_corners: wp.array2d[wp.int32]
 ) -> None:
     # Corner ``c`` of a cell is ``cell + (c >> 2, (c >> 1) & 1, c & 1)`` -- x-major binary counting.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     for c in range(8):
         i = voxels[v, 0] + (c >> 2)
         j = voxels[v, 1] + ((c >> 1) & 1)
@@ -495,7 +495,7 @@ def corner_positions(
 ) -> None:
     # Corner ``(i, j, k)`` is the *lower* corner of cell ``(i, j, k)``, so it sits at
     # ``origin + (i, j, k) * voxel_size`` with no half-voxel shift.
-    c = int(wp.tid())
+    c = wp.int32(wp.tid())
     out_positions[c] = wp.vec3(
         origin[0] + wp.float32(corners[c, 0]) * voxel_size,
         origin[1] + wp.float32(corners[c, 1]) * voxel_size,
@@ -511,7 +511,7 @@ def count_box_faces(
     cull_internal: wp.bool,
     out_counts: wp.array[wp.int32],
 ) -> None:
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     if not cull_internal:
         out_counts[v] = 6
         return
@@ -537,7 +537,7 @@ def emit_box_faces(
     out_faces: wp.array[wp.int32],
 ) -> None:
     # Two triangles per exposed cube face, wound so the normal points away from the voxel.
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     quad = offsets[v]
     for d in range(6):
         i = voxels[v, 0] + neighbors[d, 0]

@@ -24,7 +24,7 @@ def oriented_box_candidate_axes(n_rotations: wp.int32, out_axes: wp.array[wp.mat
     # The phase math runs in float64 and only the resulting quaternion is narrowed. The arguments
     # reach ``2 * pi * n_rotations`` (~6e4 radians at igl's default), where float32 argument
     # reduction has already lost four digits of the angle and the low-discrepancy property with it.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     n_spiral = n_rotations - 1
     if i >= n_spiral:
         out_axes[i] = wp.identity(n=3, dtype=wp.float32)
@@ -62,8 +62,8 @@ def oriented_box_refine_axes(
     # refinement loop used to pay per round. Same float64 phase math as
     # ``oriented_box_candidate_axes`` above; the last delta of every chain is the identity, which
     # re-scores the base and keeps each chain monotone.
-    i = int(wp.tid())
-    count = int(count_per_chain)
+    i = wp.int32(wp.tid())
+    count = count_per_chain
     chain = i // count
     p = i - chain * count
     base = chains[chain]
@@ -126,19 +126,19 @@ def oriented_box_extents(
     # loads coalesce, and ``wp.launch_tiled`` runs one lane per block on the CPU device through
     # Warp 1.16, so a ``wp.tile(...)`` of per-lane values reduces a single point per tile.
     k, j = wp.tid()
-    n_points = int(points.shape[0])
-    frame = axes[int(k)]
+    n_points = points.shape[0]
+    frame = axes[k]
 
     lower = wp.vec3(FLOAT32_INF_CONSTANT, FLOAT32_INF_CONSTANT, FLOAT32_INF_CONSTANT)
     upper = wp.vec3(-FLOAT32_INF_CONSTANT, -FLOAT32_INF_CONSTANT, -FLOAT32_INF_CONSTANT)
-    for i in range(int(j), n_points, int(n_slices)):
+    for i in range(j, n_points, n_slices):
         local = frame * points[i]
         lower = wp.min(lower, local)  # wp.min / wp.max on a vector are component-wise
         upper = wp.max(upper, local)
 
     # A slice past the end of the cloud contributes nothing.
     if upper[0] > -FLOAT32_INF_CONSTANT:
-        base = int(k) * 6
+        base = k * 6
         for c in range(3):
             wp.atomic_min(out_corners, base + c, lower[c])
             wp.atomic_min(out_corners, base + 3 + c, -upper[c])

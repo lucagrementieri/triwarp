@@ -230,7 +230,7 @@ def build_procrustes_matrix(
 def apply_transform_mat44(
     points: wp.array[wp.vec3], matrix: wp.array[wp.mat44], out_points: wp.array[wp.vec3]
 ) -> None:
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     # wp.transform_point(mat44, vec3) is exactly ``(M * vec4(p, 1)).xyz``.
     out_points[i] = wp.transform_point(matrix[0], points[i])
 
@@ -244,7 +244,7 @@ def accumulate_cost(
 ) -> None:
     # Weighted mean squared residual, into the packed accumulator's cost slot. A zero-length
     # ``weights`` means uniform.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     w = wp.float32(1.0)
     if weights.shape[0] > 0:
         w = weights[i]

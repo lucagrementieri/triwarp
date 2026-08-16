@@ -57,10 +57,10 @@ def _pixel_bounds(
     lower = wp.min(q0, wp.min(q1, q2))
     upper = wp.max(q0, wp.max(q1, q2))
 
-    col_lo = wp.clamp(int(wp.floor(lower[0])), wp.int32(0), resolution - 1)
-    col_hi = wp.clamp(int(wp.ceil(upper[0])), wp.int32(0), resolution - 1)
-    row_lo = wp.clamp(int(wp.floor(lower[1])), wp.int32(0), resolution - 1)
-    row_hi = wp.clamp(int(wp.ceil(upper[1])), wp.int32(0), resolution - 1)
+    col_lo = wp.clamp(wp.int32(wp.floor(lower[0])), wp.int32(0), resolution - 1)
+    col_hi = wp.clamp(wp.int32(wp.ceil(upper[0])), wp.int32(0), resolution - 1)
+    row_lo = wp.clamp(wp.int32(wp.floor(lower[1])), wp.int32(0), resolution - 1)
+    row_hi = wp.clamp(wp.int32(wp.ceil(upper[1])), wp.int32(0), resolution - 1)
     return row_lo, row_hi, col_lo, col_hi
 
 
@@ -72,8 +72,8 @@ def rasterize_owner(
     out_owner: wp.array2d[wp.int32],
 ) -> None:
     """Resolve per-pixel triangle ownership: the lowest face index covering each pixel wins."""
-    f = int(wp.tid())
-    q0, q1, q2 = _face_pixels(uv, faces, wp.int32(f), resolution)
+    f = wp.int32(wp.tid())
+    q0, q1, q2 = _face_pixels(uv, faces, f, resolution)
     row_lo, row_hi, col_lo, col_hi = _pixel_bounds(q0, q1, q2, resolution)
 
     for row in range(row_lo, row_hi + 1):
@@ -93,12 +93,12 @@ def rasterize_scatter(
     out_image: wp.array3d[wp.float32],
 ) -> None:
     """Write the barycentric-interpolated attribute at every pixel this face owns."""
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     i0 = faces[f * 3 + 0]
     i1 = faces[f * 3 + 1]
     i2 = faces[f * 3 + 2]
-    resolution = int(out_image.shape[0])
-    q0, q1, q2 = _face_pixels(uv, faces, wp.int32(f), resolution)
+    resolution = out_image.shape[0]
+    q0, q1, q2 = _face_pixels(uv, faces, f, resolution)
     row_lo, row_hi, col_lo, col_hi = _pixel_bounds(q0, q1, q2, resolution)
 
     for row in range(row_lo, row_hi + 1):
@@ -129,12 +129,12 @@ def rasterize_labels(
     the per-pixel argmax: label weights of shared vertices sum, and ties resolve to the lowest
     label value (matching ``numpy.argmax`` over one-hot columns).
     """
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     i0 = faces[f * 3 + 0]
     i1 = faces[f * 3 + 1]
     i2 = faces[f * 3 + 2]
-    resolution = int(out_labels.shape[0])
-    q0, q1, q2 = _face_pixels(uv, faces, wp.int32(f), resolution)
+    resolution = out_labels.shape[0]
+    q0, q1, q2 = _face_pixels(uv, faces, f, resolution)
     row_lo, row_hi, col_lo, col_hi = _pixel_bounds(q0, q1, q2, resolution)
 
     l0 = labels[i0]
@@ -160,7 +160,7 @@ def rasterize_labels(
 @wp.kernel
 def check_uv_range(uv: wp.array[wp.vec2], out_flag: wp.array[wp.int32]) -> None:
     """Set ``out_flag[0] = 1`` if any finite UV lies outside ``[0, 1]``."""
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     u = uv[v][0]
     w = uv[v][1]
     if wp.isfinite(u) and wp.isfinite(w):
@@ -181,11 +181,11 @@ def sample_texture(
     out_values: wp.array2d[wp.float32],
 ) -> None:
     """Sample the texture at each vertex UV (edge-clamped), nearest or bilinear per ``mode``."""
-    v = int(wp.tid())
+    v = wp.int32(wp.tid())
     u = uv[v][0]
     w = uv[v][1]
-    height = int(image.shape[0])
-    width = int(image.shape[1])
+    height = image.shape[0]
+    width = image.shape[1]
     if not wp.isfinite(u) or not wp.isfinite(w):
         for k in range(n_channels):
             out_values[v, k] = NAN_F32
@@ -193,13 +193,13 @@ def sample_texture(
     row = (1.0 - w) * wp.float32(height) - 0.5
     col = u * wp.float32(width) - 0.5
     if mode == SAMPLE_NEAREST:
-        r = wp.clamp(int(wp.floor(row + 0.5)), wp.int32(0), height - 1)
-        c = wp.clamp(int(wp.floor(col + 0.5)), wp.int32(0), width - 1)
+        r = wp.clamp(wp.int32(wp.floor(row + 0.5)), wp.int32(0), height - 1)
+        c = wp.clamp(wp.int32(wp.floor(col + 0.5)), wp.int32(0), width - 1)
         for k in range(n_channels):
             out_values[v, k] = image[r, c, k]
     else:
-        r0 = int(wp.floor(row))
-        c0 = int(wp.floor(col))
+        r0 = wp.int32(wp.floor(row))
+        c0 = wp.int32(wp.floor(col))
         fr = row - wp.float32(r0)
         fc = col - wp.float32(c0)
         r0c = wp.clamp(r0, wp.int32(0), height - 1)

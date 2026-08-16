@@ -7,7 +7,7 @@ from triwarp.kernels import array as kernel_array
 def scatter_first_occurrence(inverse: wp.array[wp.int32], out_first: wp.array[wp.int32]) -> None:
     # Smallest index mapping to each class. ``out_first`` must be pre-filled with a sentinel at
     # least ``inverse.shape[0]``, so a class with no member keeps it.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     wp.atomic_min(out_first, inverse[i], i)
 
 
@@ -30,15 +30,15 @@ def mark_group_starts(
 ) -> None:
     # Flag positions that start a run of exactly ``length`` equal values in the sorted buffer
     # (which may be over-allocated radix-sort scratch; only the first ``n`` entries are data).
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     is_start = True
-    if tid + int(length) > int(n):
+    if tid + length > n:
         is_start = False  # run would extend past the data
     elif not sorted_run_start(sorted_values, tid):
         is_start = False  # not the start of a run
-    elif sorted_values[tid] != sorted_values[tid + int(length) - 1]:
+    elif sorted_values[tid] != sorted_values[tid + length - 1]:
         is_start = False  # run shorter than ``length``
-    elif tid + int(length) < int(n) and sorted_values[tid] == sorted_values[tid + int(length)]:
+    elif tid + length < n and sorted_values[tid] == sorted_values[tid + length]:
         is_start = False  # run longer than ``length``
     out_is_start[tid] = is_start
 
@@ -47,7 +47,7 @@ def mark_group_starts(
 def emit_groups(
     starts: wp.array[wp.int32], indices: wp.array[wp.int32], out_groups: wp.array2d[wp.int32]
 ) -> None:
-    g = int(wp.tid())
+    g = wp.int32(wp.tid())
     start = starts[g]
     for j in range(out_groups.shape[1]):
         out_groups[g, j] = indices[start + j]
@@ -163,7 +163,7 @@ def hash_insert(
     # therefore allocate `mask + 2` slots, and occupancy comes from `slot_counts` (see
     # `mark_occupied`) so nothing downstream has to know which slot is which. `decode_key` turns the
     # reserved slot's untouched 0 straight back into -1, so compaction needs no special case.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     key = data[i]
     if encode_key(key) == empty_key(key):
         wp.atomic_add(slot_counts, mask + 1, wp.int32(1))
@@ -193,7 +193,7 @@ def compact_from_table(
     out_keys: wp.array[wp.Int],
     out_counts: wp.array[wp.int32],
 ) -> None:
-    h = int(wp.tid())
+    h = wp.int32(wp.tid())
     if occ_mask[h] == wp.int32(1):
         pos = scan_pos[h]
         out_keys[pos] = decode_key(slot_key[h])
@@ -241,7 +241,7 @@ def pack_edge_key(u: wp.int32, v: wp.int32, base: wp.uint64) -> wp.uint64:
 def pack_indices(
     indices: wp.array2d[wp.int32], max_index: wp.uint64, out_packed: wp.array[wp.uint64]
 ) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     indices_row = indices[tid]
     packed_value = wp.uint64(0)
     power = wp.uint64(1)
@@ -265,7 +265,7 @@ def round_vec3_scaled(
     # packing needs since it treats a row as digits in a positive radix. And the product stays the
     # size of the data's *extent* instead of its distance from zero: float32 carries about 7 digits,
     # so scaling a coordinate near 100 by 1e6 has already quantised away the low bits.
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     v = (vertices[tid] - origin) * inv_epsilon
     out_rounded[tid, 0] = wp.int32(wp.round(v[0]))
     out_rounded[tid, 1] = wp.int32(wp.round(v[1]))
@@ -274,7 +274,7 @@ def round_vec3_scaled(
 
 @wp.kernel
 def sort_face_indices(faces: wp.array2d[wp.int32], out_sorted: wp.array2d[wp.int32]) -> None:
-    tid = int(wp.tid())
+    tid = wp.int32(wp.tid())
     i0 = faces[tid, 0]
     i1 = faces[tid, 1]
     i2 = faces[tid, 2]

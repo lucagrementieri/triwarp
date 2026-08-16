@@ -16,7 +16,7 @@ from triwarp.kernels.triangles import face_unit_gradient, face_vertices_vec3d
 @wp.kernel
 def seed_source_indicator(sources: wp.array[wp.int32], out_u0: wp.array[wp.float64]) -> None:
     # Set the initial heat to 1 at each source vertex (out_u0 pre-zeroed by the caller).
-    t = int(wp.tid())
+    t = wp.int32(wp.tid())
     out_u0[sources[t]] = wp.float64(1.0)
 
 
@@ -31,8 +31,8 @@ def face_gradient_normalized(
 ) -> None:
     # X = -grad(u)/|grad(u)|: the unit field pointing *away* from the source, which is the direction
     # the Poisson stage integrates back into a distance.
-    f = int(wp.tid())
-    out_x[f] = -face_unit_gradient(vertices, faces, normals, areas, u, wp.int32(f))
+    f = wp.int32(wp.tid())
+    out_x[f] = -face_unit_gradient(vertices, faces, normals, areas, u, f)
 
 
 @wp.kernel
@@ -46,11 +46,11 @@ def integrated_divergence(
     # Cotangent integrated divergence of the per-face vector field, accumulated per vertex.
     # cot_entries[f, k] = 1/2 cot(angle at corner k); each vertex gets contributions from the two
     # edges of the triangle incident to it, weighted by the cotangent opposite those edges.
-    f = int(wp.tid())
+    f = wp.int32(wp.tid())
     i0 = faces[f * 3 + 0]
     i1 = faces[f * 3 + 1]
     i2 = faces[f * 3 + 2]
-    v0, v1, v2 = face_vertices_vec3d(vertices, faces, wp.int32(f))
+    v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
     x = field[f]
     c0 = wp.float64(cot_entries[f, 0])
     c1 = wp.float64(cot_entries[f, 1])

@@ -32,11 +32,11 @@ def first_hit_append(
     out_count: wp.array[wp.int32],
 ) -> None:
     # Single-pass compaction: each ray that hits atomically claims one output slot.
-    i = int(wp.tid())
+    i = wp.int32(wp.tid())
     face, location = first_hit(mesh_id, ray_origins[i], ray_directions[i], max_t)
     if face >= 0:
         slot = wp.atomic_add(out_count, 0, 1)
-        out_index_ray[slot] = wp.int32(i)
+        out_index_ray[slot] = i
         out_index_tri[slot] = face
         out_locations[slot] = location
 
