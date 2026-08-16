@@ -339,10 +339,17 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
         {"boundary", "boundary_next", "orientations"}
     ),
     ("algorithms.ball_pivoting", "begin_wave"): frozenset({"counters"}),
+    # ``edges`` is absent deliberately: this kernel mutates the table only through
+    # ``register_face_edge``, and check 13 does not follow writes into a called ``@wp.func``.
     ("algorithms.ball_pivoting", "commit_triangles"): frozenset({"counters", "point_used"}),
     ("algorithms.ball_pivoting", "end_wave"): frozenset({"counters"}),
+    # ``edges`` is the open-addressing edge table (``BpaEdgeTable``): persistent state carried
+    # across every wave, mutated in place by the pivot and commit kernels and read by both. It is
+    # the ``front_out`` case one level up -- neither an input nor the answer -- so it keeps the name
+    # of what it holds. Check 13 sees writes through its fields since ``_subscript_base`` resolves
+    # ``edges.count[slot] = 1`` to ``edges``.
     ("algorithms.ball_pivoting", "pivot_front_edges"): frozenset(
-        {"counters", "edge_cand", "edge_state", "front_out"}
+        {"counters", "edges", "front_out"}
     ),
     ("algorithms.ball_pivoting", "rehash_edges"): frozenset(
         {"new_cand", "new_count", "new_opp", "new_src", "new_state", "new_tgt"}
@@ -932,8 +939,15 @@ def _is_kernel(node: ast.FunctionDef) -> bool:
 
 
 def _subscript_base(node: ast.expr) -> str | None:
-    """Resolve a (possibly nested) subscript target to its bare name, or ``None``."""
-    while isinstance(node, ast.Subscript):
+    """
+    Resolve a (possibly nested) subscript target to its bare name, or ``None``.
+
+    A ``@wp.struct`` field counts as its struct: ``edges.count[slot] = 1`` resolves to ``edges``.
+    Without that, bundling a kernel's buffers into a struct would make every write through them
+    invisible to check 13 -- which is not hypothetical, it is what happened the first time
+    ``ball_pivoting``'s edge table was bundled.
+    """
+    while isinstance(node, (ast.Subscript, ast.Attribute)):
         node = node.value
     return node.id if isinstance(node, ast.Name) else None
 
@@ -943,9 +957,9 @@ def _written_parameters(node: ast.FunctionDef) -> set[str]:
     Parameters the kernel body writes *directly*.
 
     A subscript store, or the first argument of a ``wp.atomic_*`` / ``wp.tile_store`` /
-    ``wp.tile_atomic_add`` call. A write that happens inside a called ``@wp.func`` (e.g. through a
-    ``wp.ref`` parameter) is invisible here, so this check can under-report but never
-    false-positive.
+    ``wp.tile_atomic_add`` call, in either case through a ``@wp.struct`` field as well as directly.
+    A write that happens inside a called ``@wp.func`` (e.g. through a ``wp.ref`` parameter) is
+    invisible here, so this check can under-report but never false-positive.
     """
     parameters = {arg.arg for arg in node.args.args}
     written: set[str] = set()
@@ -967,10 +981,11 @@ def _written_parameters(node: ast.FunctionDef) -> set[str]:
             and isinstance(sub.func.value, ast.Name)
             and sub.func.value.id == "wp"
             and sub.args
-            and isinstance(sub.args[0], ast.Name)
-            and sub.args[0].id in parameters
+            and _subscript_base(sub.args[0]) in parameters
         ):
-            written.add(sub.args[0].id)
+            base = _subscript_base(sub.args[0])
+            assert base is not None
+            written.add(base)
     return written
 
 

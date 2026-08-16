@@ -1327,6 +1327,7 @@ class _BpaState:
         self.edge_opp = wp.empty(capacity, dtype=wp.int32, device=self.device)
         self.edge_state = wp.zeros(capacity, dtype=wp.int32, device=self.device)
         self.edge_cand = wp.empty(capacity, dtype=wp.int32, device=self.device)
+        self._bind_edge_table()
 
         front_capacity = 3 * max_faces + self.n
         self.front_in = wp.empty(front_capacity, dtype=wp.int32, device=self.device)
@@ -1340,6 +1341,24 @@ class _BpaState:
         self.front_capacity = front_capacity
         self.front_grid = min(front_capacity, max(_BPA_MIN_GRID, self.n))
         self.claim_grid = self.front_grid
+
+    def _bind_edge_table(self) -> None:
+        """Rebuild the ``BpaEdgeTable`` view of the edge arrays: once here, never per launch."""
+        # Nine of the wave kernels' arguments live in here, and a wp.launch argument costs ~1.0 us
+        # of host time. A run issues ~1400 launches, so binding these once is worth milliseconds --
+        # see BpaEdgeTable's docstring for the measurement. Call this after anything that
+        # *reallocates* an edge array, which is only ``grow``.
+        table = kernel_bpa.BpaEdgeTable()
+        table.key = self.edge_key
+        table.count = self.edge_count
+        table.src = self.edge_src
+        table.tgt = self.edge_tgt
+        table.opp = self.edge_opp
+        table.state = self.edge_state
+        table.cand = self.edge_cand
+        table.mask = self.edge_mask
+        table.key_base = self.key_base
+        self.edge_table = table
 
     def grow(self) -> None:
         """
@@ -1388,13 +1407,7 @@ class _BpaState:
         wp.launch(
             kernel_bpa.collect_front_from_table,
             dim=int(self.edge_key.shape[0]),
-            inputs=[
-                self.edge_key,
-                self.edge_count,
-                self.edge_state,
-                wp.int32(self.front_capacity),
-                self.counters,
-            ],
+            inputs=[wp.int32(self.front_capacity), self.counters, self.edge_table],
             outputs=[self.front_in],
             device=self.device,
         )
@@ -1408,11 +1421,10 @@ class _BpaState:
             dim=self.front_grid,
             inputs=[
                 self.front_in,
-                self.edge_count,
-                self.edge_state,
                 self.front_grid,
                 wp.int32(self.front_capacity),
                 self.counters,
+                self.edge_table,
                 self.front_out,
             ],
             device=self.device,
@@ -1507,21 +1519,13 @@ def _bpa_wave(state: _BpaState, max_waves: int) -> None:
             state.radius,
             state.clustering,
             state.crease_cos,
-            state.key_base,
-            state.edge_key,
-            state.edge_count,
-            state.edge_src,
-            state.edge_tgt,
-            state.edge_opp,
-            state.edge_state,
-            state.edge_cand,
-            state.edge_mask,
             state.point_used,
             state.boundary_degree,
             state.front_in,
             state.front_grid,
             wp.int32(state.front_capacity),
             state.counters,
+            state.edge_table,
             state.owner,
             state.front_out,
             state.tri_a,
@@ -1552,19 +1556,12 @@ def _bpa_wave(state: _BpaState, max_waves: int) -> None:
             state.tri_c,
             state.owner,
             wp.int32(state.max_faces),
-            state.key_base,
-            state.edge_mask,
             state.claim_grid,
-            state.edge_key,
-            state.edge_count,
-            state.edge_src,
-            state.edge_tgt,
-            state.edge_opp,
-            state.edge_cand,
             state.point_used,
             state.boundary_degree,
             wp.int32(state.front_capacity),
             state.counters,
+            state.edge_table,
             state.front_out,
             state.all_faces,
         ],
