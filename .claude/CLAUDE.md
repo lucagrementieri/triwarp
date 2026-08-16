@@ -1060,6 +1060,18 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
   per-item launches into one launch over a packed buffer, and single-pass the host-side metadata
   loops — but do not chase Python microseconds in a wrapper whose cost is really per-segment
   `wp.copy` launches. Measure which regime you are in before optimizing for either.
+- **That ~32 µs is the *mean* kernel's launch, not a constant: a launch costs ~1.0 µs per
+  argument.** Measured over kernels differing only in argument count, small `dim` so marshalling
+  dominates, interleaved, 400 reps — 15 µs at 2 arguments, 22 at 8, 31 at 16, 41 at 28, linear, and
+  **identical on CUDA and CPU**, so this one is not a device judgement call. The package's mean
+  kernel takes 5.1 arguments and only 18 of 440 take 12 or more, so this matters in exactly one
+  place: a wide kernel launched inside a Python loop. Bundle its invariant arrays into a
+  `@wp.struct` built **once** in the wrapper (construction is ~2.6 µs; rebuilding per launch gives
+  the saving back), which collapses them to a single argument — measured 1.17–1.93x on
+  `holes._fill_dp` and 1.34x on `reconstruction._bpa_wave`'s launch path, or ~1.08 µs per dropped
+  argument. Struct fields take the §2 subscript annotation (`a: wp.array[wp.int32]`). Do **not**
+  open a tree-wide bundling pass: bundling a 5-argument kernel trades ~3 µs for a struct the reader
+  has to open, and §14's "no speculative generality" applies to argument bundles too.
 - **Budget the host–device syncs.** Every `.numpy()` / `int(<device value>)` readback in a wrapper
   carries a comment naming why it is unavoidable. When the caller can supply the bound the readback
   infers, expose it as a keyword (`face_adjacency(n_vertices=...)`,
