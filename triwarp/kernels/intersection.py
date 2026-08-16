@@ -679,6 +679,29 @@ def edge_level_crossings(
     out_points[tid, 2] = canonical_edge_crossing(vertices, vertex_values, i2, i0)
 
 
+@wp.func
+def emit_cut_vertices(
+    edge_points: wp.array2d[wp.vec3],
+    cut: wp.int32,
+    edge_0: wp.int32,
+    edge_1: wp.int32,
+    vertex_base: wp.int32,
+    out_new_verts: wp.array[wp.vec3],
+) -> tuple[wp.int32, wp.int32]:
+    # Write the two new vertices cut face ``cut`` contributes, and return their indices in the
+    # *concatenated* buffer, where the new block starts at ``vertex_base``.
+    #
+    # Every cut face emits exactly two, whichever side is alone in sign: a quad cut splits into two
+    # triangles and a corner cut into one, but both are bounded by the same two edge crossings. So
+    # the slot is a function of the thread alone and neither kernel needs a counter -- which is the
+    # invariant this function exists to state, and the reason ``2 * cut`` is now computed once
+    # rather than seventeen times across the two callers.
+    slot = wp.int32(2) * cut
+    out_new_verts[slot] = edge_points[cut, edge_0]
+    out_new_verts[slot + wp.int32(1)] = edge_points[cut, edge_1]
+    return vertex_base + slot, vertex_base + slot + wp.int32(1)
+
+
 @wp.kernel
 def emit_quad_cut(
     faces: wp.array[wp.int32],
@@ -702,18 +725,15 @@ def emit_quad_cut(
     v_b = faces[base + inside_b]
     edge_a = (outside + wp.int32(2)) % wp.int32(3)
     edge_b = outside
-    new_v0 = edge_points[tid, edge_a]
-    new_v1 = edge_points[tid, edge_b]
-    new_i0 = vertex_base + wp.int32(2) * tid
-    new_i1 = new_i0 + wp.int32(1)
-    out_new_verts[wp.int32(2) * tid] = new_v0
-    out_new_verts[wp.int32(2) * tid + wp.int32(1)] = new_v1
-    out_new_faces[wp.int32(2) * tid, 0] = v_a
-    out_new_faces[wp.int32(2) * tid, 1] = v_b
-    out_new_faces[wp.int32(2) * tid, 2] = new_i0
-    out_new_faces[wp.int32(2) * tid + wp.int32(1), 0] = new_i0
-    out_new_faces[wp.int32(2) * tid + wp.int32(1), 1] = new_i1
-    out_new_faces[wp.int32(2) * tid + wp.int32(1), 2] = v_a
+    new_i0, new_i1 = emit_cut_vertices(edge_points, tid, edge_a, edge_b, vertex_base, out_new_verts)
+    # The quad becomes two triangles, in the same pair of rows the two vertices went into.
+    row = wp.int32(2) * tid
+    out_new_faces[row, 0] = v_a
+    out_new_faces[row, 1] = v_b
+    out_new_faces[row, 2] = new_i0
+    out_new_faces[row + wp.int32(1), 0] = new_i0
+    out_new_faces[row + wp.int32(1), 1] = new_i1
+    out_new_faces[row + wp.int32(1), 2] = v_a
 
 
 @wp.kernel
@@ -736,12 +756,8 @@ def emit_tri_cut(
     v_inside = faces[base + inside]
     edge_0 = inside
     edge_1 = (inside + wp.int32(2)) % wp.int32(3)
-    new_v0 = edge_points[tid, edge_0]
-    new_v1 = edge_points[tid, edge_1]
-    new_i0 = vertex_base + wp.int32(2) * tid
-    new_i1 = new_i0 + wp.int32(1)
-    out_new_verts[wp.int32(2) * tid] = new_v0
-    out_new_verts[wp.int32(2) * tid + wp.int32(1)] = new_v1
+    new_i0, new_i1 = emit_cut_vertices(edge_points, tid, edge_0, edge_1, vertex_base, out_new_verts)
+    # The corner stays one triangle, so this kernel writes one face row per cut, not two.
     out_new_faces[tid, 0] = v_inside
     out_new_faces[tid, 1] = new_i0
     out_new_faces[tid, 2] = new_i1

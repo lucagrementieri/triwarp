@@ -4,7 +4,7 @@ import warp as wp
 
 from triwarp.constants import PI, TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.array import to_vec3d
-from triwarp.kernels.predicates import triangle_aspect_ratio, triangle_double_area
+from triwarp.kernels.predicates import triangle_aspect_ratio, triangle_double_area, triangle_normal
 
 # ``face_quality`` metric selectors. Passed as a warp-uniform kernel argument so all four share one
 # compiled module (a ``wp.Function`` cannot be a kernel argument -- see AGENTS.md section 4).
@@ -41,6 +41,22 @@ def face_vertices(vertices: wp.array[Any], faces: wp.array[wp.int32], face_index
     """
     i0, i1, i2 = corner_triple(faces, face_index)
     return vertices[i0], vertices[i1], vertices[i2]
+
+
+@wp.func
+def face_normal(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], face_index: wp.int32):
+    """
+    Compute the unit normal of face ``face_index``; the zero vector when the face is degenerate.
+
+    The by-index form of [`triangle_normal`][triwarp.kernels.predicates.triangle_normal], which is
+    how most callers want it. Note this is *not*
+    [`face_normals_and_area`][triwarp.kernels.triangles.face_normals_and_area]'s normal: that one
+    leaves the cross product unnormalized below ``TOLERANCE_ZERO_CONSTANT`` and returns the area
+    alongside, where this one goes through ``wp.normalize`` (whose ``kEps`` is 0, so a degenerate
+    face gives exactly the zero vector). Use that one when the area is wanted too.
+    """
+    v0, v1, v2 = face_vertices(vertices, faces, face_index)
+    return triangle_normal(v0, v1, v2)
 
 
 @wp.func

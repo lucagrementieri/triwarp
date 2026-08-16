@@ -2,16 +2,9 @@ import warp as wp
 
 from triwarp.constants import PI, TOLERANCE_ZERO_CONSTANT, TWO_PI
 from triwarp.kernels.halfedge import halfedge_destination
-from triwarp.kernels.predicates import project_out_normal, triangle_normal, unit_tangent
+from triwarp.kernels.predicates import project_out_normal, unit_tangent
 from triwarp.kernels.tangent_space import corner_angle
-from triwarp.kernels.triangles import face_vertices
-
-
-@wp.func
-def face_normal_of(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: wp.int32) -> wp.vec3:
-    # Adapter: ``triangle_normal`` by face index rather than by three corners.
-    v0, v1, v2 = face_vertices(vertices, faces, f)
-    return triangle_normal(v0, v1, v2)
+from triwarp.kernels.triangles import face_normal
 
 
 @wp.func
@@ -89,7 +82,7 @@ def trace_walk(
     # the number of polyline points; writes them from ``write_begin`` when that is non-negative, so
     # the counting and writing passes share this one implementation.
     face = start_face
-    normal = face_normal_of(vertices, faces, face)
+    normal = face_normal(vertices, faces, face)
     point = start_point
     tangential, tangential_length = unit_tangent(start_direction, normal, TOLERANCE_ZERO_CONSTANT)
     remaining = arc_length
@@ -132,7 +125,7 @@ def trace_walk(
         a = vertices[faces[face * 3 + edge]]
         b = vertices[faces[face * 3 + (edge + 1) % 3]]
         next_face = twin // wp.int32(3)
-        next_normal = face_normal_of(vertices, faces, next_face)
+        next_normal = face_normal(vertices, faces, next_face)
         direction = unfold_direction(direction, b - a, normal, next_normal)
         face = next_face
         normal = next_normal
@@ -198,7 +191,7 @@ def start_direction_at_vertex(
 
     # Undo the rescale: rotate the chosen halfedge's direction by the true in-face angle.
     f = chosen // wp.int32(3)
-    normal = face_normal_of(vertices, faces, f)
+    normal = face_normal(vertices, faces, f)
     edge = vertices[halfedge_destination(faces, chosen)] - vertices[vertex]
     tangential, length = unit_tangent(edge, normal, TOLERANCE_ZERO_CONSTANT)
     if length <= TOLERANCE_ZERO_CONSTANT:
@@ -237,7 +230,7 @@ def trace_from_faces(
     # The trace length is the direction's component in the *face's* plane: a direction leaving the
     # surface traces only what is tangential to it.
     direction = directions[r]
-    normal = face_normal_of(vertices, faces, f)
+    normal = face_normal(vertices, faces, f)
     arc_length = wp.length(project_out_normal(direction, normal))
     out_counts[r] = trace_walk(
         vertices,

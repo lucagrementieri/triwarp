@@ -2,6 +2,7 @@ import warp as wp
 
 from triwarp.kernels.grouping import pack_edge_key
 from triwarp.kernels.predicates import vector_angle
+from triwarp.kernels.triangles import corner_triple
 
 
 @wp.func
@@ -98,26 +99,36 @@ def edge_endpoints(faces: wp.array[wp.int32], edge_index: wp.int32) -> tuple[wp.
     return wp.min(a, b), wp.max(a, b)
 
 
+@wp.func
+def edge_pair_topology(
+    faces: wp.array[wp.int32], edge_0: wp.int32, edge_1: wp.int32
+) -> tuple[wp.int32, wp.int32, wp.int32, wp.int32, wp.int32, wp.int32]:
+    # Everything a manifold edge's two grouped halfedge indices determine: the sorted endpoints of
+    # the edge they share, the two faces owning them, and each face's opposite apex. No edge table
+    # and no adjacency table is read -- a halfedge index already encodes its face as ``edge // 3``.
+    #
+    # Shared with ``remesh.emit_flip_topology``, which wants the identical six values and differs
+    # only in where it puts them: a scan-derived slot rather than a thread row, plus the adjacency
+    # pair itself. It lives here because the quantity is edge topology, not a remeshing step.
+    shared_a, shared_b = edge_endpoints(faces, edge_0)
+    face_0 = edge_0 // 3
+    face_1 = edge_1 // 3
+    i0, i1, i2 = corner_triple(faces, face_0)
+    j0, j1, j2 = corner_triple(faces, face_1)
+    unshared_0 = unshared_vertex(i0, i1, i2, shared_a, shared_b)
+    unshared_1 = unshared_vertex(j0, j1, j2, shared_a, shared_b)
+    return shared_a, shared_b, face_0, face_1, unshared_0, unshared_1
+
+
 @wp.kernel
 def face_adjacency_unshared_from_edges(
     faces: wp.array[wp.int32], edge_groups: wp.array2d[wp.int32], out_unshared: wp.array2d[wp.int32]
 ) -> None:
-    # Same answer as ``face_adjacency_unshared`` with no edge table and no adjacency table: the
-    # shared edge and both owning faces all come out of the two edge indices. Column order follows
-    # ``edge_pairs_to_face_pairs``, which emits the face pair ascending.
+    # Same answer as ``face_adjacency_unshared`` with no edge table and no adjacency table. Column
+    # order follows ``edge_pairs_to_face_pairs``, which emits the face pair ascending.
     tid = wp.int32(wp.tid())
-    edge_0 = edge_groups[tid, 0]
-    edge_1 = edge_groups[tid, 1]
-    shared_a, shared_b = edge_endpoints(faces, edge_0)
-    face_0 = edge_0 // 3
-    face_1 = edge_1 // 3
-    base_0 = face_0 * 3
-    base_1 = face_1 * 3
-    unshared_0 = unshared_vertex(
-        faces[base_0 + 0], faces[base_0 + 1], faces[base_0 + 2], shared_a, shared_b
-    )
-    unshared_1 = unshared_vertex(
-        faces[base_1 + 0], faces[base_1 + 1], faces[base_1 + 2], shared_a, shared_b
+    _shared_a, _shared_b, face_0, face_1, unshared_0, unshared_1 = edge_pair_topology(
+        faces, edge_groups[tid, 0], edge_groups[tid, 1]
     )
     if face_0 <= face_1:
         out_unshared[tid, 0] = unshared_0

@@ -57,7 +57,7 @@ import warp as wp
 
 from triwarp.constants import INT32_MAX_CONSTANT
 from triwarp.kernels.grouping import hash_find, hash_find_or_insert, pack_edge_key
-from triwarp.kernels.predicates import triangle_normal as face_normal
+from triwarp.kernels.predicates import triangle_normal
 
 # Per-thread neighbour scratch for the seed search (Open3D re-scans the KNN result twice).
 MAX_SEED_NEIGHBORS = 64
@@ -120,7 +120,7 @@ def compute_ball_center(
     height = radius * radius - circ_radius2
     if height < 0.0:
         return fail
-    tr_norm = face_normal(v1, v2, v3)
+    tr_norm = triangle_normal(v1, v2, v3)
     pt_norm = wp.normalize(normal_sum)
     if wp.dot(tr_norm, pt_norm) < 0.0:
         tr_norm = -tr_norm
@@ -132,7 +132,7 @@ def is_compatible(
     a: wp.vec3, b: wp.vec3, c: wp.vec3, na: wp.vec3, nb: wp.vec3, nc: wp.vec3
 ) -> bool:
     # The triangle normal must agree (within tolerance) with all three oriented point normals.
-    normal = face_normal(a, b, c)
+    normal = triangle_normal(a, b, c)
     if wp.dot(normal, na) < -1e-16:
         normal = -normal
     return (
@@ -375,7 +375,7 @@ def candidate_accepted(
     # ``tri_norm`` (the pivoting triangle's normal) is loop-invariant and passed in.
     if (
         crease_cos > -1.0
-        and wp.abs(wp.dot(tri_norm, face_normal(p_src, p_tgt, points[c]))) < crease_cos
+        and wp.abs(wp.dot(tri_norm, triangle_normal(p_src, p_tgt, points[c]))) < crease_cos
     ):
         return False
     if edge_is_interior(src, c, key_base, edge_key, edge_count, edge_mask):
@@ -463,7 +463,7 @@ def pivot_front_edges(
         opp = edge_opp[slot]
         p_src = points[src]
         p_tgt = points[tgt]
-        tri_norm = face_normal(p_src, p_tgt, points[opp])
+        tri_norm = triangle_normal(p_src, p_tgt, points[opp])
 
         # Re-validate the cached argmin first. It stays the argmin while it stays valid (the
         # candidate set only shrinks), and ~75-80% of front edges lose the vertex claim each wave

@@ -18,6 +18,7 @@ from triwarp.kernels.algorithms.connected_components import ecl_hook_edge, find_
 from triwarp.kernels.array import binary_search_index
 from triwarp.kernels.intersection import triangle_aabb_overlap
 from triwarp.kernels.predicates import triangle_aabb
+from triwarp.kernels.triangles import face_vertices
 
 # ---------------------------------------------------------------------------------------------
 # Voxelization
@@ -50,6 +51,26 @@ def voxel_cell_indices(
     out_cells[v, 2] = cell[2]
 
 
+@wp.func
+def triangle_voxel_window(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_index: wp.int32,
+    origin: wp.vec3,
+    inverse_size: wp.float32,
+) -> tuple[wp.vec3i, wp.vec3i]:
+    # Inclusive lower/upper cell of the exact AABB window of face ``face_index``. Shared by the
+    # count and test passes below, which MUST enumerate the same window: the second writes into the
+    # slots the first reserved, so a window that disagreed by one cell would write out of range.
+    #
+    # Open3D walks ``round((max - min) / vs) + 2`` cells, a strict superset of this one; a cell
+    # outside the triangle's own AABB cannot overlap the triangle, so the *accepted* sets are
+    # identical and only the number of rejected candidates differs.
+    v0, v1, v2 = face_vertices(vertices, faces, face_index)
+    lower, upper = triangle_aabb(v0, v1, v2)
+    return voxel_cell(lower, origin, inverse_size), voxel_cell(upper, origin, inverse_size)
+
+
 @wp.kernel
 def count_triangle_candidates(
     vertices: wp.array[wp.vec3],
@@ -59,17 +80,8 @@ def count_triangle_candidates(
     out_counts: wp.array[wp.int32],
     out_counts_f32: wp.array[wp.float32],
 ) -> None:
-    # The exact inclusive AABB window of the triangle. Open3D walks ``round((max-min)/vs) + 2``
-    # cells, which is a strict superset of this one, and a cell outside the triangle's own AABB
-    # cannot overlap the triangle -- so the *accepted* sets are identical and only the number of
-    # rejected candidates differs.
     f = wp.int32(wp.tid())
-    v0 = vertices[faces[f * 3 + 0]]
-    v1 = vertices[faces[f * 3 + 1]]
-    v2 = vertices[faces[f * 3 + 2]]
-    lower, upper = triangle_aabb(v0, v1, v2)
-    lo = voxel_cell(lower, origin, inverse_size)
-    hi = voxel_cell(upper, origin, inverse_size)
+    lo, hi = triangle_voxel_window(vertices, faces, f, origin, inverse_size)
     # int64 so a wildly under-sized voxel does not wrap the product into a plausible small count.
     span = wp.int64(hi[0] - lo[0] + 1) * wp.int64(hi[1] - lo[1] + 1) * wp.int64(hi[2] - lo[2] + 1)
     out_counts[f] = wp.int32(wp.min(span, wp.int64(INT32_MAX_CONSTANT)))
@@ -93,12 +105,7 @@ def test_triangle_candidates(
     # (``wp.lower_bound`` clamps to ``n - 1`` and would misattribute the last window).
     item = wp.int32(wp.tid())
     f = binary_search_index(offsets, item) - 1
-    v0 = vertices[faces[f * 3 + 0]]
-    v1 = vertices[faces[f * 3 + 1]]
-    v2 = vertices[faces[f * 3 + 2]]
-    lower, upper = triangle_aabb(v0, v1, v2)
-    lo = voxel_cell(lower, origin, inverse_size)
-    hi = voxel_cell(upper, origin, inverse_size)
+    lo, hi = triangle_voxel_window(vertices, faces, f, origin, inverse_size)
     span_y = hi[1] - lo[1] + 1
     span_z = hi[2] - lo[2] + 1
 
@@ -119,6 +126,7 @@ def test_triangle_candidates(
     out_cells[item, 0] = cell[0]
     out_cells[item, 1] = cell[1]
     out_cells[item, 2] = cell[2]
+    v0, v1, v2 = face_vertices(vertices, faces, f)
     if triangle_aabb_overlap(center, half, v0, v1, v2):
         out_mask[item] = 1
     else:

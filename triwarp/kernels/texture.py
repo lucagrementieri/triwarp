@@ -64,6 +64,20 @@ def _pixel_bounds(
     return row_lo, row_hi, col_lo, col_hi
 
 
+@wp.func
+def _face_pixel_window(
+    uv: wp.array[wp.vec2], faces: wp.array[wp.int32], f: wp.int32, resolution: wp.int32
+) -> tuple[wp.vec2, wp.vec2, wp.vec2, wp.int32, wp.int32, wp.int32, wp.int32]:
+    """Compute the face's three pixel-space corners and the raster window to scan for them."""
+    # The two always travel together -- all three rasterization kernels below open with this pair
+    # and then loop over exactly that window -- and pairing them here is what keeps the owner pass
+    # and the two write passes scanning the *same* pixels, which is what makes ``owner`` a valid
+    # per-pixel filter for both.
+    q0, q1, q2 = _face_pixels(uv, faces, f, resolution)
+    row_lo, row_hi, col_lo, col_hi = _pixel_bounds(q0, q1, q2, resolution)
+    return q0, q1, q2, row_lo, row_hi, col_lo, col_hi
+
+
 @wp.kernel
 def rasterize_owner(
     uv: wp.array[wp.vec2],
@@ -73,8 +87,7 @@ def rasterize_owner(
 ) -> None:
     """Resolve per-pixel triangle ownership: the lowest face index covering each pixel wins."""
     f = wp.int32(wp.tid())
-    q0, q1, q2 = _face_pixels(uv, faces, f, resolution)
-    row_lo, row_hi, col_lo, col_hi = _pixel_bounds(q0, q1, q2, resolution)
+    q0, q1, q2, row_lo, row_hi, col_lo, col_hi = _face_pixel_window(uv, faces, f, resolution)
 
     for row in range(row_lo, row_hi + 1):
         for col in range(col_lo, col_hi + 1):
@@ -96,8 +109,7 @@ def rasterize_scatter(
     f = wp.int32(wp.tid())
     i0, i1, i2 = corner_triple(faces, f)
     resolution = out_image.shape[0]
-    q0, q1, q2 = _face_pixels(uv, faces, f, resolution)
-    row_lo, row_hi, col_lo, col_hi = _pixel_bounds(q0, q1, q2, resolution)
+    q0, q1, q2, row_lo, row_hi, col_lo, col_hi = _face_pixel_window(uv, faces, f, resolution)
 
     for row in range(row_lo, row_hi + 1):
         for col in range(col_lo, col_hi + 1):
@@ -130,8 +142,7 @@ def rasterize_labels(
     f = wp.int32(wp.tid())
     i0, i1, i2 = corner_triple(faces, f)
     resolution = out_labels.shape[0]
-    q0, q1, q2 = _face_pixels(uv, faces, f, resolution)
-    row_lo, row_hi, col_lo, col_hi = _pixel_bounds(q0, q1, q2, resolution)
+    q0, q1, q2, row_lo, row_hi, col_lo, col_hi = _face_pixel_window(uv, faces, f, resolution)
 
     l0 = labels[i0]
     l1 = labels[i1]

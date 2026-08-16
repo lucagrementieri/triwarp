@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.constants import TOLERANCE_ZERO_CONSTANT
-from triwarp.kernels.adjacency import edge_endpoints, unshared_vertex, write_face_edge_keys
+from triwarp.kernels.adjacency import edge_endpoints, edge_pair_topology, write_face_edge_keys
 from triwarp.kernels.array import binary_search_sorted_contains, to_vec2d, to_vec3, to_vec3d
 from triwarp.kernels.grouping import hash_slot, pack_edge_key, sorted_run_start
 from triwarp.kernels.predicates import (
@@ -17,6 +17,7 @@ from triwarp.kernels.predicates import (
 )
 from triwarp.kernels.triangles import (
     corner_triple,
+    face_normal,
     face_normals_and_area,
     face_vertices_vec3d,
     triangle_quality,
@@ -536,18 +537,8 @@ def emit_flip_topology(
     if starts[i] == 0:
         return
     slot = ranks[i] - 1
-    edge_0 = order[i]
-    edge_1 = order[i + 1]
-    shared_a, shared_b = edge_endpoints(faces, edge_0)
-    face_0 = edge_0 // 3
-    face_1 = edge_1 // 3
-    base_0 = face_0 * 3
-    base_1 = face_1 * 3
-    unshared_0 = unshared_vertex(
-        faces[base_0 + 0], faces[base_0 + 1], faces[base_0 + 2], shared_a, shared_b
-    )
-    unshared_1 = unshared_vertex(
-        faces[base_1 + 0], faces[base_1 + 1], faces[base_1 + 2], shared_a, shared_b
+    shared_a, shared_b, face_0, face_1, unshared_0, unshared_1 = edge_pair_topology(
+        faces, order[i], order[i + 1]
     )
     out_adjacency_edges[slot, 0] = shared_a
     out_adjacency_edges[slot, 1] = shared_b
@@ -887,13 +878,10 @@ def collapse_candidates(
     if cu == CORNER_VERTEX and cv == CORNER_VERTEX:
         reject = True
     elif cu >= CREASE_VERTEX and cv >= CREASE_VERTEX:
-        # Two feature vertices: only collapse along a boundary edge (both plain creases).
-        if is_boundary and cu == CREASE_VERTEX and cv == CREASE_VERTEX:
-            s = u
-            r = v
-            p = wp.lerp(vertices[u], vertices[v], 0.5)
-        else:
-            reject = True
+        # Two feature vertices: collapse only along a boundary edge, and only when both are plain
+        # creases -- in which case the midpoint default above is already the answer, so this arm
+        # decides nothing but whether to reject.
+        reject = not (is_boundary and cu == CREASE_VERTEX and cv == CREASE_VERTEX)
     elif cu >= CREASE_VERTEX:
         s = u
         r = v
@@ -1013,12 +1001,8 @@ def valence_flip_candidates(
     f0 = adjacency[k, 0]
     f1 = adjacency[k, 1]
     # Never flip a feature edge (sharp dihedral between the two incident faces).
-    n0 = triangle_normal(
-        vertices[faces[f0 * 3 + 0]], vertices[faces[f0 * 3 + 1]], vertices[faces[f0 * 3 + 2]]
-    )
-    n1 = triangle_normal(
-        vertices[faces[f1 * 3 + 0]], vertices[faces[f1 * 3 + 1]], vertices[faces[f1 * 3 + 2]]
-    )
+    n0 = face_normal(vertices, faces, f0)
+    n1 = face_normal(vertices, faces, f1)
     if wp.acos(wp.dot(n0, n1)) > feature_angle:  # wp.acos auto-clamps to [-1, 1]
         return
     a, b, c, d = _resolve_flip_quad_guarded(
