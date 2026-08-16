@@ -21,6 +21,8 @@ INT32_MAX = 2**31 - 1
 INT32_MAX_CONSTANT = wp.constant(wp.int32(INT32_MAX))
 INT64_MAX = 2**63 - 1
 INT64_MAX_CONSTANT = wp.constant(wp.int64(INT64_MAX))
+UINT64_MAX = 2**64 - 1
+UINT64_MAX_CONSTANT = wp.constant(wp.uint64(UINT64_MAX))
 FLOAT32_INF_CONSTANT = wp.constant(wp.INF)
 
 PI = wp.constant(wp.PI)

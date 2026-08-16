@@ -1224,9 +1224,22 @@ def ball_pivoting(
 
     Notes
     -----
-    A single radius is used (the classic multi-radius schedule is a documented follow-up). Wave
-    order is non-deterministic, so the exact triangulation varies run to run, and the triangle
-    budget grows on demand rather than raising.
+    A single radius is used (the classic multi-radius schedule is a documented follow-up), and the
+    triangle budget grows on demand rather than raising.
+
+    The triangulation is **reproducible**: repeated runs on one device and build return the same
+    set of triangles, because a wave resolves competing proposals by a key packed from their own
+    vertices rather than by the order they reached an atomic counter. Two caveats on how far that
+    reaches, both measured rather than assumed:
+
+    * the face buffer's *row order* is not pinned — ``commit_triangles`` appends with a
+      ``wp.atomic_add`` — so compare reconstructions as a set of triangles, not buffer-to-buffer;
+    * neither is the *winding* of a component that the cleanup tail cannot orient by volume, since
+      [`make_winding_consistent`][triwarp.repair.make_winding_consistent] seeds each connected
+      component from an arbitrary face. Compare with the row entries sorted, or orient both sides
+      first.
+
+    Results are not comparable across devices, where floating-point contraction differs.
 
     The result is **interpolating and edge-manifold**, and on a densely, uniformly sampled closed
     surface it is watertight in practice: a subdivided icosphere reconstructs to exactly ``2 v - 4``
@@ -1308,7 +1321,10 @@ class _BpaState:
         self.counters[kernel_bpa.CNT_SEEDING : kernel_bpa.CNT_SEEDING + 1].fill_(1)
         self.point_used = wp.zeros(self.n, dtype=wp.bool, device=self.device)
         self.boundary_degree = wp.zeros(self.n, dtype=wp.int32, device=self.device)
-        self.owner = wp.empty(self.n, dtype=wp.int32, device=self.device)
+        # ``uint64`` because the per-wave vertex claim is a ``wp.atomic_min`` over a *packed vertex
+        # pair* rather than over a proposal index — see ``kernel_bpa.proposal_key``, which is what
+        # makes a run reproducible. Doubling one n-sized buffer is the whole memory cost.
+        self.owner = wp.empty(self.n, dtype=wp.uint64, device=self.device)
         self._allocate_budget(max_faces)
 
     def _allocate_budget(self, max_faces: int) -> None:
@@ -1542,6 +1558,7 @@ def _bpa_wave(state: _BpaState, max_waves: int) -> None:
             state.tri_b,
             state.tri_c,
             state.claim_grid,
+            wp.int32(state.front_capacity),
             state.counters,
             state.owner,
         ],

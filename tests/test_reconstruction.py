@@ -20,7 +20,13 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from tests.comparisons import hausdorff_two_sided, symmetric_chamfer, symmetric_surface_distance
+from tests.comparisons import (
+    assert_unordered_rows_equal,
+    canonical_winding,
+    hausdorff_two_sided,
+    symmetric_chamfer,
+    symmetric_surface_distance,
+)
 from tests.conversions import (
     open3d_to_trimesh,
     points_to_open3d,
@@ -807,6 +813,64 @@ def test_ball_pivoting_closes_a_dense_sphere(device: str):
 
     # And it interpolates: every input point is a vertex of the result.
     assert cKDTree(vertices_wp.numpy().astype(np.float64)).query(points_np)[0].max() < 1e-6
+
+
+def test_ball_pivoting_is_reproducible(device: str):
+    """
+    Two runs of one build on one cloud must reconstruct the same triangles.
+
+    A wave resolves competing proposals with ``wp.atomic_min`` over ``proposal_key`` — packed from
+    the proposal's own source edge — rather than over the ``wp.atomic_add`` slot it was handed, so
+    nothing about the answer depends on the order threads reach an atomic. A losing proposal is not
+    merely reordered: its front edge is retried a wave later against mutated state, so the
+    divergence used to compound into different geometry.
+
+    **The fixture is the load-bearing choice.** Every icosphere is reproducible even *without* the
+    fix — a uniformly sampled closed sphere reconstructs to its exact Euler triangulation, so wave
+    order has nothing left to decide — and asserting on one would be vacuous. Measured on this
+    torus, four runs of the pre-fix implementation give 2 980 / 3 036 / 3 042 / 3 089 faces and
+    four different meshes, against a constant 3 269 and one mesh after it.
+
+    Two assertions, covering different halves:
+
+    * the wave loop's own output, compared as a **wound** triangle set — same triangles and same
+      winding, which is the property the key buys. Not compared buffer-to-buffer: ``CNT_FACE`` is a
+      ``wp.atomic_add``, so the row order is deliberately still arrival-ordered;
+    * the public function, compared as an **unoriented** triangle set, because its cleanup tail
+      runs [`repair.make_winding_consistent`][triwarp.repair.make_winding_consistent], whose
+      arbitrary per-component seed face is still chosen nondeterministically (measured on this same
+      fixture). That is a separate defect in that module, and it is why the second assertion sorts
+      within the row rather than using ``canonical_winding``.
+    """
+    torus_tm = tm.creation.torus(
+        major_radius=1.0, minor_radius=0.35, major_sections=64, minor_sections=32
+    )
+    points_wp, normals_wp = _to_warp(torus_tm.vertices, torus_tm.vertex_normals, device)
+    n_points = int(points_wp.shape[0])
+    # The wrapper's own auto-radius, pinned here so the raw runs below see the identical parameter.
+    spacing = tw.neighbors.query_bvh_nearest(points_wp, points_wp, k=7)[1].numpy()[:, 1:]
+    radius = 1.5 * float(spacing[np.isfinite(spacing) & (spacing > 0.0)].mean())
+
+    grid = tw.neighbors.hashgrid_from_points(points_wp, radius)
+    bvh = tw.neighbors.bvh_from_points(points_wp)
+    raw_runs = []
+    for _ in range(2):
+        state = tw.reconstruction._BpaState(
+            points_wp, normals_wp, grid, bvh, radius, 0.2, -1.0, 4 * n_points + 16
+        )
+        tw.reconstruction._bpa_run(state, 16 * n_points)
+        n_faces = int(state.counters.numpy()[kernel_bpa.CNT_FACE])
+        raw_runs.append(state.all_faces.numpy()[: n_faces * 3].reshape(-1, 3))
+
+    assert raw_runs[0].shape[0] > 0
+    assert_unordered_rows_equal(canonical_winding(raw_runs[0]), canonical_winding(raw_runs[1]))
+
+    _vertices, first_wp = tw.reconstruction.ball_pivoting(points_wp, normals_wp, radius=radius)
+    _vertices, second_wp = tw.reconstruction.ball_pivoting(points_wp, normals_wp, radius=radius)
+    assert_unordered_rows_equal(
+        np.sort(first_wp.numpy().reshape(-1, 3), axis=1),
+        np.sort(second_wp.numpy().reshape(-1, 3), axis=1),
+    )
 
 
 def test_ball_pivoting_grows_the_triangle_budget(device: str):

@@ -187,11 +187,15 @@ per case, and traces one ray per call); `test_heat_signed` adds ~15 s, most of i
 `test_heat_distance`, now 74 s for the module with its `heat_geodesic` group carrying three libraries at two
 setup points each.
 
-Only the first of those is not measuring triwarp: **190 of `test_reconstruction`'s 199 timed
-seconds are open3d's CPU `create_from_point_cloud_poisson`** (7.5 s a call at depth 9 on `bunny`),
-against 9.0 s for every triwarp case in the module combined. It is the largest single reference cost
-in the suite and the reason that module doubled the 123 s recorded here previously; before trimming
-anything in it, read the per-library split rather than the module total.
+Only the first of those was not measuring triwarp, and it has since been **removed**: **190 of
+`test_reconstruction`'s 199 timed seconds were open3d's CPU `create_from_point_cloud_poisson`**
+(7.5 s a call at depth 9 on `bunny`), against 9.0 s for every triwarp case in the module combined,
+and across the whole suite the two CPU screened-Poisson references cost **6 322 s — 73 % of the
+run** — to re-establish a ratio triwarp had already won 15–25×. `screened_poisson` is now a
+**triwarp-only** group; the correctness comparison against open3d and pymeshlab lives in
+`tests/test_reconstruction.py`, where it runs at a size a test can afford. The module now costs
+~107 s. That episode is also the general lesson: before trimming anything in a slow module, read the
+per-library split rather than the module total.
 
 By default the harness prints **one comparison table per (function, mesh)** — each table lists the
 libraries and any parameter points side by side — via `--benchmark-group-by=group,param:mesh_name`,
@@ -442,7 +446,7 @@ The rest are second or third independent implementations:
 | `test_holes` | `meshing_close_holes` (ear clipping, so **1.7×** across `loops_dp` against triwarp's 37× — the price of *not* running a `B³` DP) |
 | `test_parametrization` | `compute_texcoord_parametrization_harmonic` / `..._least_squares_conformal_maps` — both wrap **libigl's own code**, so they price MeshLab's wrapper rather than a third algorithm |
 | `test_points` | `compute_normal_for_point_clouds(k=)`, `compute_matrix_by_fitting_to_plane` |
-| `test_reconstruction` | `generate_surface_reconstruction_ball_pivoting` (VCGlib's original BPA) and `..._screened_poisson` (Kazhdan's own code, the same one open3d wraps) |
+| `test_reconstruction` | `generate_surface_reconstruction_ball_pivoting` (VCGlib's original BPA). `..._screened_poisson` was timed here too and is **removed** — see the wall-clock note above |
 | `test_registration` | `compute_matrix_by_icp_between_meshes` — the only reference the mesh-target `icp` group has |
 | `test_remesh` | `meshing_surface_subdivision_midpoint(threshold=)` in `subdivide_to_size`, landing on the identical output face count |
 | `test_sample` | `generate_sampling_poisson_disk(radius=)` — the only blue-noise reference that takes a *radius*, so the radius sweep maps for the first time |
@@ -876,7 +880,7 @@ millisecond.
 |---|---|
 | `test_creation` | `create_box`, `create_sphere` (a UV sphere, so it pairs with `uv_sphere`), `create_cylinder`, `create_cone`, `create_torus`, `create_tetrahedron` / `create_octahedron` / `create_icosahedron` (no dodecahedron) |
 | `test_registration` | `TransformationEstimationPointToPoint.compute_transformation`, `registration_icp` (point-to-point, point-to-plane, `TukeyLoss`) |
-| `test_reconstruction` | `create_from_point_cloud_ball_pivoting`, `create_from_point_cloud_poisson` |
+| `test_reconstruction` | `create_from_point_cloud_ball_pivoting` (`create_from_point_cloud_poisson` was timed here and is **removed** — 73 % of the suite's wall clock) |
 | `test_remesh` | `subdivide_midpoint` (`subdivide` only) |
 | `test_smoothing` | `filter_smooth_laplacian` (`novol` only), `filter_smooth_taubin`, `filter_sharpen` — all three exempt (D2): the first two re-derive inverse-distance weights every pass, the third multiplies the residual by the vertex degree |
 | `test_sample` | `sample_points_poisson_disk` |

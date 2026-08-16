@@ -7,6 +7,21 @@ advancing front, every wave pivots a conflict-free independent set of front edge
 commits them through a two-phase vertex claim (``wp.atomic_min`` priority on all three vertices),
 so at least the globally-lowest-priority triangle always commits and the loop cannot livelock.
 
+The priority is ``proposal_key``, a packing of the proposal's own source edge, which is what makes
+a run **reproducible**: *which* triangles get committed no longer depends on the order threads
+reach an atomic, only the order they are written down in does (see below). See
+that function for why the key is unique within a wave, and ``commit_triangles`` for the one other
+place arrival order used to leak in (the triangle-budget check). Measured on an irregularly sampled
+torus, four runs of one build now commit the same 3 269 triangles with the same winding, where
+before they produced 2 980 / 3 036 / 3 042 / 3 089 faces.
+
+Two things this deliberately does *not* pin, so compare a run as a **set** of triangles rather than
+buffer to buffer. ``CNT_FACE`` is still a ``wp.atomic_add``, so the face buffer's row order remains
+arrival-ordered; determinizing it would mean sorting the whole buffer for a property no caller has
+asked for. And ``reconstruction.ball_pivoting``'s cleanup tail loses the winding again, because
+``repair.make_winding_consistent`` seeds each connected component from an arbitrary face — measured
+on the same fixture, and a defect in that module rather than this one.
+
 Persistent state
 ----------------
 Everything the algorithm needs lives in device buffers that survive the whole run, so a wave costs
@@ -55,7 +70,7 @@ when it merely lost the claim.
 
 import warp as wp
 
-from triwarp.constants import INT32_MAX_CONSTANT
+from triwarp.constants import INT32_MAX_CONSTANT, UINT64_MAX_CONSTANT
 from triwarp.kernels.grouping import hash_find, hash_find_or_insert, pack_edge_key
 from triwarp.kernels.predicates import dihedral_angle, triangle_normal
 
@@ -106,12 +121,12 @@ class BpaEdgeTable:
     only marshalling is timed: over 235 waves, **15.12 -> 11.32 ms (min), 1.34x**, which is
     **1.08 us per dropped argument** and agrees with the independent per-argument law.
 
-    It has to be measured that way. BPA's end-to-end time cannot attribute a change this size,
-    because the algorithm is **run-to-run nondeterministic**: three runs of one build on the same
-    cloud produced 44 179 / 44 243 / 44 208 faces with 1412 / 1412 / 1364 launches. The per-wave
-    claim is order-independent, but which triangles commit in which wave is not, so the wave count
-    and the final mesh both vary. Tests assert reconstruction quality rather than a face count for
-    this reason.
+    It had to be measured that way, because at the time BPA was **run-to-run nondeterministic**:
+    three runs of one build on the same cloud produced 44 179 / 44 243 / 44 208 faces with
+    1412 / 1412 / 1364 launches, so the end-to-end row was not timing the same reconstruction
+    twice. ``proposal_key`` has since removed that, and a run now commits the same triangle set
+    every time — but the isolated measurement is still the right one for a launch-path change,
+    since the end-to-end row is 300+ ms of pivot search around ~11 ms of marshalling.
 
     Bound once by ``_BpaState`` and rebound only when ``grow`` reallocates (``_bind_edge_table``
     is called from ``_allocate_budget``, which is the only place the arrays are replaced).
@@ -248,7 +263,7 @@ def propose_triangle(
     c: wp.int32,
     capacity: wp.int32,
     counters: wp.array[wp.int32],
-    out_owner: wp.array[wp.int32],
+    out_owner: wp.array[wp.uint64],
     out_a: wp.array[wp.int32],
     out_b: wp.array[wp.int32],
     out_c: wp.array[wp.int32],
@@ -259,10 +274,11 @@ def propose_triangle(
     # Releasing the three vertices for this wave's claim happens here rather than in a sweep over
     # all n: only a proposed vertex is ever read back, and two proposals sharing a vertex write the
     # same sentinel. That removes an n-wide launch from every wave, which on a small cloud was most
-    # of the wave.
-    out_owner[a] = INT32_MAX_CONSTANT
-    out_owner[b] = INT32_MAX_CONSTANT
-    out_owner[c] = INT32_MAX_CONSTANT
+    # of the wave. The sentinel is the largest ``uint64`` because the claim is a ``wp.atomic_min``
+    # over ``proposal_key``, which is unsigned and bounded by 2^63.
+    out_owner[a] = UINT64_MAX_CONSTANT
+    out_owner[b] = UINT64_MAX_CONSTANT
+    out_owner[c] = UINT64_MAX_CONSTANT
     slot = wp.atomic_add(counters, CNT_PROPOSAL, 1)
     if slot >= capacity:
         # Dropping a proposal is safe and self-healing: the front edge that raised it stays live and
@@ -284,7 +300,7 @@ def seed_triangles(
     clustering: wp.float32,
     front_capacity: wp.int32,
     counters: wp.array[wp.int32],
-    out_owner: wp.array[wp.int32],
+    out_owner: wp.array[wp.uint64],
     out_a: wp.array[wp.int32],
     out_b: wp.array[wp.int32],
     out_c: wp.array[wp.int32],
@@ -432,7 +448,7 @@ def pivot_front_edges(
     front_capacity: wp.int32,
     counters: wp.array[wp.int32],
     edges: BpaEdgeTable,
-    out_owner: wp.array[wp.int32],
+    out_owner: wp.array[wp.uint64],
     front_out: wp.array[wp.int32],
     out_a: wp.array[wp.int32],
     out_b: wp.array[wp.int32],
@@ -580,22 +596,58 @@ def pivot_front_edges(
             )
 
 
+@wp.func
+def proposal_key(a: wp.int32, b: wp.int32) -> wp.uint64:
+    # Priority of a proposed triangle, and the whole reason a run is reproducible: it is derived
+    # from the proposal's own vertices, not from the order it reached ``propose_triangle``. The
+    # slot that call hands out comes from a ``wp.atomic_add``, so it is the arrival order of a
+    # thousand-block launch; making it the claim priority made *which* triangle won a contested
+    # vertex a function of GPU scheduling, and the loser's front edge is retried a wave later
+    # against mutated state, so the difference compounded into a different mesh (measured 44 179 /
+    # 44 243 / 44 208 faces over three runs of one build) rather than a permuted one.
+    #
+    # ``a`` and ``b`` are the proposal's *source edge* -- the pivoting front edge ``(src, tgt)``,
+    # or a seeding point and its first partner -- and that pair is unique among one wave's
+    # proposals, which is what makes this a total order on them:
+    #
+    # * a pivot wave proposes at most once per live front edge, and a front edge *is* one slot of
+    #   a table keyed by the undirected pair, so no two share ``{src, tgt}``;
+    # * a seed wave proposes at most once per seeding point ``p``, and ``seed_triangles`` seeds
+    #   only a point that is the lowest-indexed unused point of its own neighbourhood, so ``p`` is
+    #   the smaller of its pair and distinct seeds give distinct pairs;
+    # * the two never share a wave -- ``pivot_front_edges`` proposes nothing while ``CNT_SEEDING``.
+    #
+    # A bit pack rather than ``pack_edge_key``'s ``lo + hi * base``, so that neither kernel
+    # computing it has to carry the point count as an argument and so it cannot overflow: point
+    # indices are ``int32``, so the key stays under 2^63 and well below the unclaimed sentinel.
+    # Spelled as a multiply because that is the same operation on ``uint64`` as a 32-bit shift and
+    # reads as the pack it is.
+    lo = wp.uint64(wp.uint32(wp.min(a, b)))
+    hi = wp.uint64(wp.uint32(wp.max(a, b)))
+    return hi * wp.uint64(4294967296) + lo
+
+
 @wp.kernel(enable_backward=False)
 def claim_triangle_vertices(
     tri_a: wp.array[wp.int32],
     tri_b: wp.array[wp.int32],
     tri_c: wp.array[wp.int32],
     grid_stride: wp.int32,
+    proposal_capacity: wp.int32,
     counters: wp.array[wp.int32],
-    out_owner: wp.array[wp.int32],
+    out_owner: wp.array[wp.uint64],
 ) -> None:
-    # Priority claim (lowest index wins) on all three vertices of each proposed triangle.
+    # Priority claim (lowest ``proposal_key`` wins) on all three vertices of each proposed triangle.
     if counters[CNT_CONTINUE] == 0:
         return
-    for t in range(wp.int32(wp.tid()), counters[CNT_PROPOSAL], grid_stride):
-        wp.atomic_min(out_owner, tri_a[t], t)
-        wp.atomic_min(out_owner, tri_b[t], t)
-        wp.atomic_min(out_owner, tri_c[t], t)
+    # ``propose_triangle`` increments the counter past the capacity before dropping, so the count
+    # is not a safe bound on the list it indexes.
+    proposals = wp.min(counters[CNT_PROPOSAL], proposal_capacity)
+    for t in range(wp.int32(wp.tid()), proposals, grid_stride):
+        key = proposal_key(tri_a[t], tri_b[t])
+        wp.atomic_min(out_owner, tri_a[t], key)
+        wp.atomic_min(out_owner, tri_b[t], key)
+        wp.atomic_min(out_owner, tri_c[t], key)
 
 
 @wp.func
@@ -635,7 +687,7 @@ def commit_triangles(
     tri_a: wp.array[wp.int32],
     tri_b: wp.array[wp.int32],
     tri_c: wp.array[wp.int32],
-    owner: wp.array[wp.int32],
+    owner: wp.array[wp.uint64],
     max_faces: wp.int32,
     grid_stride: wp.int32,
     point_used: wp.array[wp.bool],
@@ -651,21 +703,33 @@ def commit_triangles(
     # mask, the edge table, the boundary degrees and the outgoing front.
     if counters[CNT_CONTINUE] == 0:
         return
-    for t in range(wp.int32(wp.tid()), counters[CNT_PROPOSAL], grid_stride):
+    # See ``claim_triangle_vertices``: the proposal counter overshoots its list on overflow.
+    proposals = wp.min(counters[CNT_PROPOSAL], front_capacity)
+    # The triangle budget is tested for the *whole* wave rather than per triangle, because a
+    # partial commit would hand the last slots out in ``wp.atomic_add`` arrival order — the one
+    # thing this design does not let the answer depend on. Declining every proposal is also the
+    # cheaper recovery: nothing is mutated, so each front edge keeps its cached candidate and the
+    # same wave is re-proposed unchanged once the host has doubled the budget.
+    #
+    # ``CNT_PREV_FACE``, not ``CNT_FACE``: ``begin_wave`` snapshots it and no thread writes it, so
+    # every thread reads the same value. Reading ``CNT_FACE`` here would race the ``atomic_add``
+    # below and let a late thread decline a wave the early ones already committed to.
+    #
+    # It is conservative — most proposals lose the claim and never needed a slot — but the budget
+    # starts at ``4 n + 16`` against a run that commits about ``2 n``, so this is the growth tail
+    # and not the common path. Bounding the wave this way is also what lets the scatter below drop
+    # its own range check: committed triangles are at most ``proposals``.
+    if counters[CNT_PREV_FACE] + proposals > max_faces:
+        counters[CNT_GROW] = 1
+        return
+    for t in range(wp.int32(wp.tid()), proposals, grid_stride):
         a = tri_a[t]
         b = tri_b[t]
         c = tri_c[t]
-        if owner[a] != t or owner[b] != t or owner[c] != t:
-            continue
-        if counters[CNT_FACE] >= max_faces:
-            # Out of budget. Nothing is mutated, so the front edge keeps its cached candidate and
-            # is simply re-proposed after the caller grows the buffer — no triangle is lost.
-            counters[CNT_GROW] = 1
+        key = proposal_key(a, b)
+        if owner[a] != key or owner[b] != key or owner[c] != key:
             continue
         slot = wp.atomic_add(counters, CNT_FACE, 1)
-        if slot >= max_faces:
-            counters[CNT_GROW] = 1
-            continue
 
         out_faces[slot * 3 + 0] = a
         out_faces[slot * 3 + 1] = b
@@ -689,6 +753,15 @@ def end_wave(max_waves: wp.int32, counters: wp.array[wp.int32]) -> None:
         return
     counters[CNT_FRONT] = counters[CNT_NEXT_FRONT]
     counters[CNT_WAVE] = counters[CNT_WAVE] + 1
+    if counters[CNT_GROW] != 0:
+        # A wave that asked the host for room says nothing about progress, and must not be read as
+        # a stall: ``commit_triangles`` declines the whole wave when the triangle budget is short,
+        # and a front-list overflow is recovered by rebuilding the front from the edge table. Both
+        # re-run this wave's work. Testing progress here would flip a pivot wave to seeding, or —
+        # if this one was already seeding — raise ``CNT_DONE`` and end the run with a live front,
+        # since ``_bpa_run`` checks done before it checks grow.
+        counters[CNT_CONTINUE] = 0
+        return
     if counters[CNT_FACE] == counters[CNT_PREV_FACE]:
         if counters[CNT_SEEDING] != 0:
             counters[CNT_DONE] = 1
@@ -697,9 +770,9 @@ def end_wave(max_waves: wp.int32, counters: wp.array[wp.int32]) -> None:
             counters[CNT_SEEDING] = 1
     else:
         counters[CNT_SEEDING] = 0
-    # Hand control back to the host to grow the triangle budget, to compact a front that has
-    # accumulated too many retired entries, or because the wave cap was hit.
-    if counters[CNT_GROW] != 0 or counters[CNT_WAVE] >= max_waves:
+    # Hand control back to the host to compact a front that has accumulated too many retired
+    # entries, or because the wave cap was hit. (Growing the budget is the early return above.)
+    if counters[CNT_WAVE] >= max_waves:
         counters[CNT_CONTINUE] = 0
     elif counters[CNT_NEXT_FRONT] > 4 * counters[CNT_LIVE] + 1024:
         counters[CNT_CONTINUE] = 0

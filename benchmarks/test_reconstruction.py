@@ -5,32 +5,37 @@ The point cloud is a registry mesh's own vertices with area-weighted vertex norm
 (no sampling RNG), consistently oriented, and it scales with the mesh. Both are precomputed and
 cached: they are the *input*, not part of the operation being timed.
 
-**open3d** implements the same two published algorithms and is the reference for both:
-``create_from_point_cloud_ball_pivoting`` (Bernardini's BPA, given the identical radius) and
-``create_from_point_cloud_poisson`` (Kazhdan's screened Poisson, given the identical octree depth).
-Both take an oriented ``PointCloud``; open3d gets the same points and computes its own area-weighted
-vertex normals, which is the same quantity triwarp's
+**open3d** is the reference for ball pivoting:
+``create_from_point_cloud_ball_pivoting`` (Bernardini's BPA, given the identical radius). It takes
+an oriented ``PointCloud``; open3d gets the same points and computes its own area-weighted vertex
+normals, which is the same quantity triwarp's
 [`area_weighted_vertex_normals`][triwarp.vertices.area_weighted_vertex_normals] produces.
 
-**pymeshlab** is the third implementation of both, and the reason it is worth a row is that in each
-case it wraps *the same upstream code as one of the other two*:
+**pymeshlab** is the third BPA implementation, and the reason it is worth a row is that
 ``generate_surface_reconstruction_ball_pivoting`` is VCGlib's original BPA (Bernardini was
-co-authored out of that lab) and ``generate_surface_reconstruction_screened_poisson`` is Kazhdan's
-own implementation, which is also what open3d wraps. So the pymeshlab-versus-open3d gap on the
-Poisson row is two wrappers over one solver, and only triwarp's is a different program. Its BPA is
-given the identical absolute radius via ``PureValue`` (the ``0%`` default autoguesses one, which
-would compare two different parameters) with ``clustering=0`` to disable the merge-nearby-vertices
-step triwarp does not do. Both filters push their output as a new layer without touching the cloud,
-so the cloud MeshSet is cached; ``set_current_mesh(0)`` inside the callable restores the layer the
-previous round's push moved away from.
+co-authored out of that lab), so its row and open3d's price two wrappers over one lineage and only
+triwarp's is a different program. It is given the identical absolute radius via ``PureValue`` (the
+``0%`` default autoguesses one, which would compare two different parameters) with ``clustering=0``
+to disable the merge-nearby-vertices step triwarp does not do. The filter pushes its output as a new
+layer without touching the cloud, so the cloud MeshSet is cached; ``set_current_mesh(0)`` inside the
+callable restores the layer the previous round's push moved away from.
 
-**Its cloud is not quite the same cloud**, and that is forced rather than chosen. Screened Poisson
-rejects a point set carrying *any* null normal outright -- ``Failed to apply filter: Filter requires
-correct per vertex normals`` -- and every scan mesh has unreferenced vertices, whose area-weighted
-normal is exactly zero: **47 of bunny_decimated's 8 171 and 1 113 of bunny's 35 947**. So the
-pymeshlab cloud drops those points, leaving it 0.6% / 3.1% smaller than the one triwarp and open3d
-reconstruct from. The alternative, ``preclean=True``, moves the same cleaning *inside* the timed
-filter, which is worse: it puts a pass triwarp does not run into the measured region.
+**Screened Poisson is timed for triwarp alone.** Both CPU references wrap Kazhdan's own solver, and
+between them they cost **6 322 s -- 73 % of the whole benchmark suite** -- to re-measure a reference
+triwarp beats 15-25x, with ``[dragon-open3d-*]`` alone running 93 minutes without completing a
+round. The rows are **removed**, not capped, and the agreement they were the parity evidence for is
+checked in ``tests/test_reconstruction.py`` instead, at a size a correctness test can afford. What
+remains here is a triwarp-only regression row over ``method`` x ``depth``.
+
+**The pymeshlab cloud is not quite the same cloud**, and that is forced rather than chosen. It drops
+every point whose area-weighted normal is exactly zero -- the unreferenced vertices every scan mesh
+carries, **47 of bunny_decimated's 8 171 and 1 113 of bunny's 35 947** -- leaving it 0.6% / 3.1%
+smaller than the one triwarp and open3d reconstruct from. That was originally forced by the
+screened-Poisson filter, which rejects a cloud carrying any null normal outright (``Failed to apply
+filter: Filter requires correct per vertex normals``), and it is kept now that only the BPA row uses
+the cloud so the reference's input stays the documented one. The alternative, ``preclean=True``,
+moves the same cleaning *inside* the timed filter, which is worse: it puts a pass triwarp does not
+run into the measured region.
 
 ``generate_surface_reconstruction_vcg`` was tried as a *fourth* algorithm and **rejected**: it
 returns **zero faces** on this input at every voxel size probed (``PureValue`` 0.02 / 0.05 / 0.10),
@@ -48,7 +53,8 @@ What the open3d comparison showed when it was added (medians, RTX 5090, ``depth=
 ``radius = 1.5 * mean_edge``):
 
 - ``screened_poisson`` is a clear win — 134 ms (dense) against open3d's 2.0-2.3 s, so **15-25x
-  faster** on both meshes.
+  faster** on both meshes. That measurement is why the reference rows are gone: it is settled, and
+  re-establishing it cost 73 % of the suite's wall clock every run.
 - ``ball_pivoting`` used to be the outlier of this module at 580 ms / 1085 ms against open3d's
   100 ms / 445 ms. Rebuilding it around a **persistent front** — an edge hash table plus a
   compacted boundary-edge list, mutated in place by ``commit_triangles`` and never re-derived from
@@ -102,11 +108,12 @@ Sizing notes measured on an RTX 5090 before the baseline was captured:
   scale with the cloud. Both are timed at the default ``depth=8``.
 
 Everything is capped at ``bunny``, and the cap is load-bearing rather than tidy: point-cloud
-triangulation and ball pivoting are superlinear in the cloud size, and the CPU screened-Poisson
-references are worse than superlinear in practice -- ``test_screened_poisson[dragon-open3d-*]`` was
-measured running **93 minutes without completing a single round** before it was killed, which is
-more wall clock than the other 40 benchmark modules combined. See the comment on that cap. This is
-a deliberate coverage gap -- the optimizations these benchmarks gate are host-sync and
+triangulation and ball pivoting are superlinear in the cloud size. It was the CPU screened-Poisson
+references that made it non-negotiable -- ``test_screened_poisson[dragon-open3d-*]`` was measured
+running **93 minutes without completing a single round** before it was killed, more wall clock than
+the other 40 benchmark modules combined -- and those rows are now removed outright rather than
+capped. The cap stays for the algorithms that are still timed against a reference. This is a
+deliberate coverage gap -- the optimizations these benchmarks gate are host-sync and
 launch-overhead fixes, which show up at these sizes.
 """
 
@@ -134,9 +141,9 @@ _NUM_NEIGHBOURS = 18
 # Ball radius as a multiple of the mean edge length (a proxy for point spacing).
 _BPA_RADIUS_FRACTION = 1.5
 
-# Octree depths of ``triwarp.reconstruction.screened_poisson``, mirrored on the open3d side. This
-# is the module's dominant knob by a wide margin: ``dense`` mode is a ``2^depth`` cubed node grid,
-# so each step is ~8x the nodes and the point count is almost secondary.
+# Octree depths of ``triwarp.reconstruction.screened_poisson``. This is the module's dominant knob
+# by a wide margin: ``dense`` mode is a ``2^depth`` cubed node grid, so each step is ~8x the nodes
+# and the point count is almost secondary.
 _POISSON_DEPTHS = [7, 9]
 
 # A depth-9 dense solve and a ball-pivoting front are both seconds a call.
@@ -350,42 +357,23 @@ def test_ball_pivoting(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="screened_poisson")
-@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp")
 @pytest.mark.parametrize("depth", _POISSON_DEPTHS)
 @pytest.mark.parametrize("method", ["dense", "adaptive"])
 def test_screened_poisson(
     bench_case: BenchCase, method: Literal["dense", "adaptive"], depth: int
 ) -> None:
-    # Do not lift this cap. open3d's CPU ``create_from_point_cloud_poisson`` is 7.5 s per call at
-    # depth 9 on ``bunny``'s 35 947 points; ``dragon`` has 437 645, and the ``[dragon-open3d-*]``
-    # rows were measured running for **93 minutes without completing a single round** (GPU idle,
-    # 42 cores saturated) before being killed. That one parametrization is worth more wall clock
-    # than the other 40 benchmark modules combined, and what it measures is open3d, not triwarp.
+    # **triwarp-only, deliberately.** The open3d and pymeshlab rows were removed rather than capped:
+    # both wrap Kazhdan's CPU solver, and between them they were **6 322 s -- 73 % of the whole
+    # benchmark suite** -- while measuring a reference triwarp had already beaten 15-25x. open3d's
+    # ``create_from_point_cloud_poisson`` is 7.5 s per call at depth 9 on ``bunny``'s 35 947 points,
+    # and at ``dragon``'s 437 645 the rows ran **93 minutes without completing a single round** (GPU
+    # idle, 42 cores saturated) before being killed. The comparison itself is not lost: it lives in
+    # ``tests/test_reconstruction.py``, which still checks both references for agreement at a size a
+    # correctness test can afford. What is left here is a triwarp-only regression row.
     skip_larger_than(
         bench_case, "bunny", "screened Poisson above bunny dominates the suite (93 min at dragon)"
     )
-    if bench_case.kind == "pymeshlab":
-        if method != "dense":
-            pytest.skip("MeshLab has a single screened-Poisson path; timed once under 'dense'")
-        # Kazhdan's own code, the same implementation open3d wraps -- so its row prices MeshLab's
-        # wrapper against open3d's over an identical solver, and only triwarp's is a different one.
-        cloud_pml = _cloud_meshset_pml(bench_case)
-        bench_case.run(
-            lambda: cloud_pml.generate_surface_reconstruction_screened_poisson(depth=depth),
-            rounds=_HEAVY_ROUNDS,
-        )
-        return
-    if bench_case.kind == "open3d":
-        if method != "dense":
-            pytest.skip("open3d has a single screened-Poisson path; timed once under 'dense'")
-        import open3d as o3d
-
-        cloud = _cloud_o3d(bench_case)
-        mesh_poisson, _density = bench_case.run(
-            lambda: o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(cloud, depth=depth)
-        )
-        assert len(mesh_poisson.triangles) > 0
-        return
     _skip_cg_on_cpu(bench_case)
     points, normals = bench_case.vertices_wp, _normals(bench_case)
     _vertices, faces = bench_case.run(
