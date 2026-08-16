@@ -708,25 +708,25 @@ def _run_hole_dp(
         inputs=[loops.sizes, loops.dp_offsets, active, dp, prev],
         device=device,
     )
+    # Built once, outside the loop: every field is invariant across spans, and a wp.launch argument
+    # costs ~1 us of host time whatever it holds. Rebuilding it per span would cost ~2.6 us and give
+    # the saving straight back.
+    tables = kernel_holes.HoleFillTables()
+    tables.loop_pos = loop_pos
+    tables.loop_starts = loops.starts
+    tables.loop_sizes = loops.sizes
+    tables.dp_offsets = loops.dp_offsets
+    tables.active = active
+    tables.plane_normals = plane_normals
+    tables.forbidden = forbidden
+    tables.rim_opp_pos = rim_opp_pos
+    tables.rim_opp_valid = rim_opp_valid
+    tables.char_areas = char_areas
+    tables.metric_id = wp.int32(metric_id)
+    tables.combine_id = wp.int32(combine_id)
+    tables.smooth_bd = wp.int32(1 if smooth_boundary else 0)
     for span in range(2, loops.max_size):
-        inputs = [
-            loop_pos,
-            loops.starts,
-            loops.sizes,
-            loops.dp_offsets,
-            active,
-            plane_normals,
-            forbidden,
-            rim_opp_pos,
-            rim_opp_valid,
-            char_areas,
-            wp.int32(metric_id),
-            wp.int32(combine_id),
-            wp.int32(1 if smooth_boundary else 0),
-            wp.int32(span),
-            dp,
-            prev,
-        ]
+        inputs = [tables, wp.int32(span), dp, prev]
         dim = (loops.n_loops, loops.max_size - span)
         if tiled:
             wp.launch_tiled(

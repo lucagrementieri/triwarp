@@ -297,16 +297,52 @@ def init_dp_base(
 HOLE_DP_BLOCK = 32
 
 
+@wp.struct
+class HoleFillTables:
+    """
+    The hole-filling DP's invariant inputs, bundled so the per-span launches carry one argument.
+
+    ``holes._fill_dp`` launches ``fill_dp_span`` once per span -- ``max_B - 2`` times for the whole
+    mesh -- and every one of these thirteen values is the same on every launch. A ``wp.launch``
+    argument costs ~1.0 us of host time, linearly and on both devices (measured over 2-28
+    arguments: 15 us at 2, 41 us at 28), so a 16-argument kernel launched ~510 times on a
+    512-edge rim spent milliseconds marshalling constants. Only ``span`` and the two in-place DP
+    tables stay as arguments, because those are what a launch is actually about.
+
+    Measured on an RTX 5090, the two spellings of the span loop interleaved in one process over the
+    same tables (median/min): **1.56x/1.54x** at 2 loops x 512 (``rim_short``'s shape, 510
+    launches), **1.82x/1.85x** at 64 x 32 (``holes_many``'s, 30 launches), 1.85x/1.93x at 2 x 128
+    and 1.19x/1.17x at 1 x 1024. The saving works out at 9.5-11.9 us per launch against the 12 us
+    the twelve dropped arguments predict.
+
+    A cross-*session* before/after had read this as a 1.36x win on the long rims and an 8% *loss* on
+    the short ones; the loss was drift in the surrounding work, which is what interleaving in one
+    clock state is for.
+
+    Build it ONCE in the wrapper and reuse it: construction costs ~2.6 us, which would give most
+    of the saving back if it were done per launch.
+    """
+
+    loop_pos: wp.array[wp.vec3]
+    loop_starts: wp.array[wp.int32]
+    loop_sizes: wp.array[wp.int32]
+    dp_offsets: wp.array[wp.int32]
+    active: wp.array[wp.int32]
+    plane_normals: wp.array[wp.vec3]
+    forbidden: wp.array[wp.int32]
+    rim_opp_pos: wp.array[wp.vec3]
+    rim_opp_valid: wp.array[wp.int32]
+    char_areas: wp.array[wp.float32]
+    metric_id: wp.int32
+    combine_id: wp.int32
+    smooth_bd: wp.int32
+
+
 @wp.func
 def apex_cost(
-    loop_pos: wp.array[wp.vec3],
-    rim_opp_pos: wp.array[wp.vec3],
-    rim_opp_valid: wp.array[wp.int32],
+    tables: HoleFillTables,
     dp: wp.array[wp.float32],
     prev: wp.array[wp.int32],
-    metric_id: wp.int32,
-    combine_id: wp.int32,
-    smooth_bd: wp.int32,
     o: wp.int32,
     b: wp.int32,
     base: wp.int32,
@@ -322,54 +358,43 @@ def apex_cost(
     # Metric of triangulating the interval (i, j) with apex ``k``: the two sub-intervals' costs,
     # this triangle's term, and the per-edge (dihedral) terms for the interior chords (i, k) /
     # (k, j) taken at the neighbouring sub-interval's apex — or, for a rim edge, at the existing
-    # face's opposite vertex when ``smooth_bd`` is set.
-    k_pos = loop_pos[o + k]
-    tri = triangle_fill_metric(a_pos, k_pos, c_pos, plane_normal, char_area, metric_id)
-    val = combine_metric(dp[base + i * b + k], dp[base + k * b + j], combine_id)
-    val = combine_metric(val, tri, combine_id)
+    # face's opposite vertex when ``tables.smooth_bd`` is set.
+    k_pos = tables.loop_pos[o + k]
+    tri = triangle_fill_metric(a_pos, k_pos, c_pos, plane_normal, char_area, tables.metric_id)
+    val = combine_metric(dp[base + i * b + k], dp[base + k * b + j], tables.combine_id)
+    val = combine_metric(val, tri, tables.combine_id)
 
     if k > i + 1:
         if prev[base + i * b + k] >= 0:
-            e = fill_edge_term(a_pos, k_pos, loop_pos[o + prev[base + i * b + k]], c_pos, metric_id)
-            val = combine_metric(val, e, combine_id)
-    elif smooth_bd != 0 and rim_opp_valid[o + i] != 0:
-        e = fill_edge_term(a_pos, k_pos, rim_opp_pos[o + i], c_pos, metric_id)
-        val = combine_metric(val, e, combine_id)
+            e = fill_edge_term(
+                a_pos, k_pos, tables.loop_pos[o + prev[base + i * b + k]], c_pos, tables.metric_id
+            )
+            val = combine_metric(val, e, tables.combine_id)
+    elif tables.smooth_bd != 0 and tables.rim_opp_valid[o + i] != 0:
+        e = fill_edge_term(a_pos, k_pos, tables.rim_opp_pos[o + i], c_pos, tables.metric_id)
+        val = combine_metric(val, e, tables.combine_id)
 
     if j > k + 1:
         if prev[base + k * b + j] >= 0:
-            e = fill_edge_term(k_pos, c_pos, loop_pos[o + prev[base + k * b + j]], a_pos, metric_id)
-            val = combine_metric(val, e, combine_id)
-    elif smooth_bd != 0 and rim_opp_valid[o + k] != 0:
-        e = fill_edge_term(k_pos, c_pos, rim_opp_pos[o + k], a_pos, metric_id)
-        val = combine_metric(val, e, combine_id)
+            e = fill_edge_term(
+                k_pos, c_pos, tables.loop_pos[o + prev[base + k * b + j]], a_pos, tables.metric_id
+            )
+            val = combine_metric(val, e, tables.combine_id)
+    elif tables.smooth_bd != 0 and tables.rim_opp_valid[o + k] != 0:
+        e = fill_edge_term(k_pos, c_pos, tables.rim_opp_pos[o + k], a_pos, tables.metric_id)
+        val = combine_metric(val, e, tables.combine_id)
 
     # Closing rim edge (loop[b-1] -> loop[0]) is the base of the whole loop and has no parent, so
     # its boundary term is added here for the top interval only.
-    if is_top and smooth_bd != 0 and rim_opp_valid[o + b - 1] != 0:
-        e = fill_edge_term(a_pos, c_pos, rim_opp_pos[o + b - 1], k_pos, metric_id)
-        val = combine_metric(val, e, combine_id)
+    if is_top and tables.smooth_bd != 0 and tables.rim_opp_valid[o + b - 1] != 0:
+        e = fill_edge_term(a_pos, c_pos, tables.rim_opp_pos[o + b - 1], k_pos, tables.metric_id)
+        val = combine_metric(val, e, tables.combine_id)
     return val
 
 
 @wp.kernel(enable_backward=False)
 def fill_dp_span(
-    loop_pos: wp.array[wp.vec3],
-    loop_starts: wp.array[wp.int32],
-    loop_sizes: wp.array[wp.int32],
-    dp_offsets: wp.array[wp.int32],
-    active: wp.array[wp.int32],
-    plane_normals: wp.array[wp.vec3],
-    forbidden: wp.array[wp.int32],
-    rim_opp_pos: wp.array[wp.vec3],
-    rim_opp_valid: wp.array[wp.int32],
-    char_areas: wp.array[wp.float32],
-    metric_id: wp.int32,
-    combine_id: wp.int32,
-    smooth_bd: wp.int32,
-    span: wp.int32,
-    dp: wp.array[wp.float32],
-    prev: wp.array[wp.int32],
+    tables: HoleFillTables, span: wp.int32, dp: wp.array[wp.float32], prev: wp.array[wp.int32]
 ) -> None:
     # One thread per span-``span`` interval (i, j = i + span) of every loop at once; reads only
     # strictly smaller spans, so successive launches (span = 2, 3, ...) are the DP barriers.
@@ -382,47 +407,29 @@ def fill_dp_span(
     # ``fill_dp_span_tiled``, which must agree with it apex for apex (see
     # ``tests/test_holes.py::test_fill_dp_span_tiled_matches_serial``).
     ell, i = wp.tid()
-    if active[ell] == 0:
+    if tables.active[ell] == 0:
         return
-    b = loop_sizes[ell]
+    b = tables.loop_sizes[ell]
     if span >= b or i >= b - span:
         return
     j = i + span
-    base = dp_offsets[ell]
-    if forbidden[base + i * b + j] != 0:
+    base = tables.dp_offsets[ell]
+    if tables.forbidden[base + i * b + j] != 0:
         # Interior chord would duplicate an existing mesh edge (non-manifold) — leave it unfilled.
         dp[base + i * b + j] = BAD_METRIC
         prev[base + i * b + j] = -1
         return
-    o = loop_starts[ell]
-    plane_normal = plane_normals[ell]
-    char_area = char_areas[ell]
-    a_pos = loop_pos[o + i]
-    c_pos = loop_pos[o + j]
+    o = tables.loop_starts[ell]
+    plane_normal = tables.plane_normals[ell]
+    char_area = tables.char_areas[ell]
+    a_pos = tables.loop_pos[o + i]
+    c_pos = tables.loop_pos[o + j]
     is_top = i == 0 and j == b - 1
     best_val = FLOAT32_INF_CONSTANT
     best_k = wp.int32(-1)
     for k in range(i + 1, j):
         val = apex_cost(
-            loop_pos,
-            rim_opp_pos,
-            rim_opp_valid,
-            dp,
-            prev,
-            metric_id,
-            combine_id,
-            smooth_bd,
-            o,
-            b,
-            base,
-            i,
-            j,
-            k,
-            is_top,
-            a_pos,
-            c_pos,
-            plane_normal,
-            char_area,
+            tables, dp, prev, o, b, base, i, j, k, is_top, a_pos, c_pos, plane_normal, char_area
         )
         update_argmin(best_val, best_k, val, k)
     dp[base + i * b + j] = best_val
@@ -431,22 +438,7 @@ def fill_dp_span(
 
 @wp.kernel(enable_backward=False)
 def fill_dp_span_tiled(
-    loop_pos: wp.array[wp.vec3],
-    loop_starts: wp.array[wp.int32],
-    loop_sizes: wp.array[wp.int32],
-    dp_offsets: wp.array[wp.int32],
-    active: wp.array[wp.int32],
-    plane_normals: wp.array[wp.vec3],
-    forbidden: wp.array[wp.int32],
-    rim_opp_pos: wp.array[wp.vec3],
-    rim_opp_valid: wp.array[wp.int32],
-    char_areas: wp.array[wp.float32],
-    metric_id: wp.int32,
-    combine_id: wp.int32,
-    smooth_bd: wp.int32,
-    span: wp.int32,
-    dp: wp.array[wp.float32],
-    prev: wp.array[wp.int32],
+    tables: HoleFillTables, span: wp.int32, dp: wp.array[wp.float32], prev: wp.array[wp.int32]
 ) -> None:
     # One *block* per span-``span`` interval, its ``HOLE_DP_BLOCK`` lanes striding the apex loop.
     # Same DP, same launch count, ``HOLE_DP_BLOCK`` times the parallelism: the serial kernel above
@@ -465,47 +457,29 @@ def fill_dp_span_tiled(
     ell, i, t = wp.tid()
     # Every guard below is warp-uniform (it reads only ``ell``, ``i`` and ``span``), so the whole
     # block returns together and the tile reductions never run in divergent control flow.
-    if active[ell] == 0:
+    if tables.active[ell] == 0:
         return
-    b = loop_sizes[ell]
+    b = tables.loop_sizes[ell]
     if span >= b or i >= b - span:
         return
     j = i + span
-    base = dp_offsets[ell]
-    if forbidden[base + i * b + j] != 0:
+    base = tables.dp_offsets[ell]
+    if tables.forbidden[base + i * b + j] != 0:
         if t == 0:
             dp[base + i * b + j] = BAD_METRIC
             prev[base + i * b + j] = -1
         return
-    o = loop_starts[ell]
-    plane_normal = plane_normals[ell]
-    char_area = char_areas[ell]
-    a_pos = loop_pos[o + i]
-    c_pos = loop_pos[o + j]
+    o = tables.loop_starts[ell]
+    plane_normal = tables.plane_normals[ell]
+    char_area = tables.char_areas[ell]
+    a_pos = tables.loop_pos[o + i]
+    c_pos = tables.loop_pos[o + j]
     is_top = i == 0 and j == b - 1
     best_val = FLOAT32_INF_CONSTANT
     best_k = wp.int32(-1)
     for k in range(i + 1 + t, j, HOLE_DP_BLOCK):
         val = apex_cost(
-            loop_pos,
-            rim_opp_pos,
-            rim_opp_valid,
-            dp,
-            prev,
-            metric_id,
-            combine_id,
-            smooth_bd,
-            o,
-            b,
-            base,
-            i,
-            j,
-            k,
-            is_top,
-            a_pos,
-            c_pos,
-            plane_normal,
-            char_area,
+            tables, dp, prev, o, b, base, i, j, k, is_top, a_pos, c_pos, plane_normal, char_area
         )
         update_argmin(best_val, best_k, val, k)
     block_val = wp.tile_min(wp.tile(best_val))[0]
