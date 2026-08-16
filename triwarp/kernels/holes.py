@@ -406,6 +406,14 @@ def fill_dp_span(
     # This is the **CPU** engine and the tie-break reference; CUDA runs
     # ``fill_dp_span_tiled``, which must agree with it apex for apex (see
     # ``tests/test_holes.py::test_fill_dp_span_tiled_matches_serial``).
+    #
+    # The prologue it shares with the tiled kernel is deliberately not extracted. Three of its
+    # lines are early ``return``s and a ``@wp.func`` cannot return from its caller, so hoisting it
+    # would mean a validity flag plus restructured guards in both kernels -- more code at the call
+    # sites than it removes. What is left after the guards is five independent loads that read
+    # fine where they are; grouping them would name a bag, not a quantity. The genuinely shared
+    # arithmetic already moved: ``apex_cost`` went from 19 parameters to 14 when the tables became
+    # ``HoleFillTables``.
     ell, i = wp.tid()
     if tables.active[ell] == 0:
         return

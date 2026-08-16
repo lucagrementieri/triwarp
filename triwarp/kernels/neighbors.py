@@ -525,6 +525,18 @@ def knn_hashgrid_scan(
 ) -> wp.float32:
     # Hash-grid twin of ``knn_bvh_scan``; ``wp.hash_grid_query`` enumerates every cell overlapping
     # ``[q +/- r]``, so the same "k-th distance <= r certifies" argument applies.
+    #
+    # The two are NOT merged behind the ``ACCEL_*`` selector the ball queries use, and the reason
+    # is the one that separates section 2.1's case from section 2.5's: there the two accelerators
+    # ran the *same* algorithm and only the enumeration differed, so a warp-uniform int made them
+    # one kernel. Here the enclosing searches have genuinely diverged -- the grid path takes a
+    # ``widest`` bound and falls back to ``knn_linear_scan`` once the radius outgrows the cell
+    # width (a cell walk is cubic in the radius, so past that it costs more than touching every
+    # point), while the BVH path forces a final complete attempt instead. A merged kernel would
+    # carry a parameter that is ignored on one path and a fallback branch that belongs to the
+    # other. What the two genuinely share is already shared: ``knn_reset_row``,
+    # ``knn_sorted_insert``, ``complete_radius`` and ``deepen_radius``; what is left is three lines
+    # of traversal each, plus each one's own certification policy.
     knn_reset_row(k, out_indices_row, out_distances_row)
     query = wp.hash_grid_query(grid_id, q, r)
     point_index = wp.int32(-1)

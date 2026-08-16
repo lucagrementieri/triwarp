@@ -58,6 +58,17 @@ def interior_row_counts(
     out_counts[ri] = kept
     # The thread owns row ``ri`` of ``out_rhs`` exclusively, so a single register accumulator and
     # write suffice per right-hand-side column.
+    #
+    # The nest re-reads the row once per right-hand side, which looks like an ``n_rhs``-fold read
+    # amplification worth inverting (scan the row once into an ``n_rhs``-wide register vector).
+    # Measured before building it, and it is not: this kernel is launched **once** per
+    # ``min_quad_with_fixed``, one of 15 launches in a 1.6 ms solve, and ``n_rhs`` is **1** for the
+    # default call -- so the inner loop runs a single iteration and there is nothing to invert. The
+    # callers that pass more are ``lscm`` (2) and a vector-valued ``harmonic`` (3), where the whole
+    # pass is still one launch against a conjugate-gradient solve whose iteration count is what the
+    # benchmark's 12.6x spread between 50%- and 1%-pinned actually measures. A register vector would
+    # also need a compile-time ``MAX_RHS`` cap, which is a new documented limitation bought for
+    # nothing.
     for c in range(fixed_values.shape[0]):
         acc = wp.float64(0.0)
         for e in range(start, end):
