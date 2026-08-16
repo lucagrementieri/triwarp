@@ -56,6 +56,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import require_tiled_lanes
 from triwarp.kernels import holes as kernel_holes
 
 
@@ -695,13 +696,24 @@ def _run_hole_dp(
 
     ``tiled`` selects the per-span engine: a block per interval with its lanes striding the apex
     loop (CUDA default), or one thread per interval (CPU, and the tie-break reference). Both
-    produce byte-identical ``dp`` / ``prev``; ``tiled`` exists so a test can force either. It must
-    stay ``False`` on CPU, where ``wp.launch_tiled`` runs a single lane per block and the strided
-    apex loop would silently cover only every ``HOLE_DP_BLOCK``-th apex.
+    produce byte-identical ``dp`` / ``prev``; ``tiled`` exists so a test can force either.
+
+    Leaving it at ``None`` picks the engine the device can run. Passing ``tiled=True`` on a CPU
+    device **raises**: ``wp.launch_tiled`` runs a single lane per block there through Warp 1.16, so
+    the strided apex loop would cover only every ``HOLE_DP_BLOCK``-th apex and return a DP table
+    that is wrong rather than absent. Nothing downstream could tell -- the fill still has the right
+    triangle count and a plausible cost -- so this is a raise and not a warning.
+
+    Raises
+    ------
+    ValueError
+        If ``tiled`` is ``True`` and ``loops`` is on a CPU device.
     """
     device = loops.device
     if tiled is None:
         tiled = not wp.get_device(device).is_cpu
+    elif tiled:
+        require_tiled_lanes(device, "_run_hole_dp")
     wp.launch(
         kernel_holes.init_dp_base,
         dim=(loops.n_loops, loops.max_size),

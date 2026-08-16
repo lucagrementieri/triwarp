@@ -149,3 +149,52 @@ def require_nonempty_mesh(faces: wp.array[wp.int32], name: str) -> None:
             f"{name} cannot build a warp.Mesh with zero triangles: this silently corrupts CUDA "
             "state through Warp 1.16 (see the Warp issue tracker for wp.Mesh + empty BVH)."
         )
+
+
+def require_tiled_lanes(device: wp.DeviceLike, name: str) -> None:
+    """
+    Raise before launching a kernel that builds a tile out of *per-lane* values on the CPU device.
+
+    ``wp.launch_tiled`` runs exactly one lane per block on the Warp CPU backend through Warp 1.16,
+    so ``wp.tile(x)`` holds a single element there and any reduction or strided loop written across
+    the block silently covers one lane's worth of the work. It does not raise, does not warn, and
+    returns a plausible-looking answer -- measured on Warp 1.16.0, ``wp.tile_sum(wp.tile(v))`` over
+    8 blocks of 64 ones totals **8.0 on CPU** against 512.0 on CUDA.
+
+    Every such launch in this package sits behind a device branch that routes CPU to a lane-free
+    engine, so nothing reaches this in normal use. It exists for the paths that take an *explicit*
+    override -- ``holes._run_hole_dp(tiled=...)`` -- where a caller can ask for the tiled engine on
+    a device that cannot run it. Turning that into an exception is the whole point: a wrong DP table
+    is indistinguishable from a right one without a byte comparison against the serial reference,
+    which is exactly the bug class this guard removes.
+
+    !!! note "Not for the graceful fallbacks"
+        Several other device branches in this package pick a different *route to the same answer* --
+        ``graph``'s serial BFS, ``linalg``'s host-cadence CG, ``remesh``'s uncaptured decimation
+        pass. Those are correct on both devices and must not raise; only a branch whose CPU side
+        would be **wrong** belongs here.
+
+    Parameters
+    ----------
+    device
+        Warp device (or device string) the tiled kernel would be launched on.
+    name
+        Name of the calling function, used in the error message.
+
+    Raises
+    ------
+    ValueError
+        If ``device`` is a CPU device.
+
+    See Also
+    --------
+    [`prefers_tiled_reduction`][triwarp._device.prefers_tiled_reduction]
+        The branch predicate itself, and the measurements behind it.
+    """
+    if wp.get_device(device).is_cpu:
+        raise ValueError(
+            f"{name} cannot use the tiled engine on the CPU device: wp.launch_tiled runs one lane "
+            "per block there through Warp 1.16, so a tile built from per-lane values holds a "
+            "single element and the result is silently wrong rather than slow. Leave the tiled "
+            "selector at its default to get the lane-free engine, which computes the same answer."
+        )
