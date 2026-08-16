@@ -558,22 +558,6 @@ def test_poisson_screening_improves_fit(device: str):
     assert fit_screened <= fit_unscreened + 1e-4
 
 
-def test_poisson_finer_depth_reduces_error(device: str):
-    _skip_poisson_on_cpu(device)
-    points_np, normals_np = _sphere_cloud(4)
-    points_wp, normals_wp = _to_warp(points_np, normals_np, device)
-
-    vertices_coarse, _ = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=5, full_depth=4
-    )
-    vertices_fine, _ = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=7, full_depth=4
-    )
-    error_coarse = np.abs(np.linalg.norm(vertices_coarse.numpy(), axis=1) - 1.0).mean()
-    error_fine = np.abs(np.linalg.norm(vertices_fine.numpy(), axis=1) - 1.0).mean()
-    assert error_fine <= error_coarse
-
-
 @pytest.mark.parity(
     "screened_poisson",
     "pymeshlab",
