@@ -259,8 +259,6 @@ def test_heat_geodesic_is_bounded_by_the_graph_distance(
     thin one being ``half_torus``, whose farthest pair is nearly straight-line reachable across its
     opening.
     """
-    if wp.get_device(device).is_cpu:
-        pytest.skip("heat_geodesic needs conjugate gradient, which Warp cannot run on CPU")
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = int(mesh_tm.vertices.shape[0])
 
@@ -288,8 +286,6 @@ def test_heat_geodesic_is_bounded_by_the_graph_distance(
 def test_robust_heat_geodesic_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
-    if wp.get_device(device).is_cpu:
-        pytest.skip("heat_geodesic needs conjugate gradient, which Warp cannot run on CPU")
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     sources_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
 
@@ -314,8 +310,6 @@ def test_robust_heat_geodesic_matches_potpourri3d(
 def test_robust_heat_geodesic_survives_a_degenerate_triangle(
     device: str, sliver_patch: tuple
 ) -> None:
-    if wp.get_device(device).is_cpu:
-        pytest.skip("heat_geodesic needs conjugate gradient, which Warp cannot run on CPU")
     _, _, vertices_wp, faces_wp = sliver_patch
     sources_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
 

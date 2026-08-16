@@ -155,13 +155,6 @@ _cloud_o3d_cache: dict[str, o3d.geometry.PointCloud] = {}
 _cloud_pml_cache: dict[str, ml.MeshSet] = {}
 
 
-def _skip_cg_on_cpu(bench_case: BenchCase) -> None:
-    """Skip cases whose solver path needs CUDA (``warp.optim.linear.cg`` is NaN on CPU)."""
-    assert bench_case.device is not None
-    if wp.get_device(bench_case.device).is_cpu:
-        pytest.skip("warp.optim.linear.cg returns NaN on the CPU device in Warp 1.14-1.15")
-
-
 def _normals(bench_case: BenchCase) -> wp.array[wp.vec3]:
     """Area-weighted vertex normals for the point cloud, cached per ``(mesh, device)``."""
     key = (bench_case.mesh_name, str(bench_case.device))
@@ -374,7 +367,6 @@ def test_screened_poisson(
     skip_larger_than(
         bench_case, "bunny", "screened Poisson above bunny dominates the suite (93 min at dragon)"
     )
-    _skip_cg_on_cpu(bench_case)
     points, normals = bench_case.vertices_wp, _normals(bench_case)
     _vertices, faces = bench_case.run(
         lambda: tw.reconstruction.screened_poisson(points, normals, depth=depth, method=method),

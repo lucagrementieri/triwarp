@@ -247,11 +247,6 @@ def test_stitch_min_weight_rejects_unknown_metric(device: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _skip_cpu(device: str) -> None:
-    if wp.get_device(device).is_cpu:
-        pytest.skip("stitch_smooth subdivision/smoothing requires CUDA (warp.optim.linear.cg)")
-
-
 def _hemisphere_pair(device: str):
     """Two facing hemispheres (single boundary loop each) for stitch tests."""
     meshes = []
@@ -275,7 +270,6 @@ def _hemisphere_pair(device: str):
 
 
 def test_stitch_smooth_watertight(device: str):
-    _skip_cpu(device)
     (va, fa), (vb, fb) = _hemisphere_pair(device)
     n_v0 = int(va.shape[0]) + int(vb.shape[0])
 

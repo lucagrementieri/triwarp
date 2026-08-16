@@ -164,8 +164,6 @@ def test_solve_spd_warns_when_it_runs_out_of_iterations(device: str) -> None:
     Without this the returned array is the last iterate and looks exactly like a solution --
     which is how a diverging smoothing pass used to reach a caller silently.
     """
-    if wp.get_device(device).is_cpu:
-        pytest.skip("warp.optim.linear.cg produces NaN on the CPU device in Warp 1.14-1.15")
     # A 1-D Laplacian: SPD, but Jacobi-preconditioned CG needs O(n) iterations on it, so a budget
     # of two cannot converge. (A *diagonal* system would be solved exactly in one, and a singular
     # one makes the Jacobi preconditioner itself infinite, which CG bails out of instead.)
@@ -196,8 +194,6 @@ def test_solve_spd_warns_when_it_runs_out_of_iterations(device: str) -> None:
 
 def test_solve_spd_is_quiet_when_it_converges(device: str) -> None:
     """The warning is specific to non-convergence: a well-posed solve emits nothing."""
-    if wp.get_device(device).is_cpu:
-        pytest.skip("warp.optim.linear.cg produces NaN on the CPU device in Warp 1.14-1.15")
     n = 8
     indices = wp.array(np.arange(n, dtype=np.int32), dtype=wp.int32, device=device)
     values = wp.array(np.full(n, 2.0, dtype=np.float64), dtype=wp.float64, device=device)

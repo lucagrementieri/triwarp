@@ -790,11 +790,6 @@ def test_fill_min_weight_rejects_unknown_metric(hemisphere: tuple[tm.Trimesh, wp
 # ---------------------------------------------------------------------------
 
 
-def _skip_cpu(device: str) -> None:
-    if wp.get_device(device).is_cpu:
-        pytest.skip("fill_smooth subdivision/smoothing requires CUDA (warp.optim.linear.cg)")
-
-
 def _mesh_volume_area(vertices_np: np.ndarray, faces_np: np.ndarray) -> tuple[float, float]:
     mesh = tm.Trimesh(vertices_np, faces_np, process=False)
     return float(mesh.volume), float(mesh.area)
@@ -819,7 +814,6 @@ def _meshlib_fill_nicely_volume(
 
 
 def test_fill_smooth_invariants(device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]):
-    _skip_cpu(device)
     _, mesh_wp = hemisphere
     n_v0 = int(mesh_wp.points.shape[0])
 
@@ -849,7 +843,6 @@ def test_fill_smooth_triangulate_only(device: str, hemisphere: tuple[tm.Trimesh,
 
 
 def test_fill_smooth_statistics_vs_meshlib(device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]):
-    _skip_cpu(device)
     pytest.importorskip("meshlib.mrmeshpy")
     _, mesh_wp = hemisphere
     vertices_np = mesh_wp.points.numpy().astype(np.float64)
@@ -865,7 +858,6 @@ def test_fill_smooth_statistics_vs_meshlib(device: str, hemisphere: tuple[tm.Tri
 
 
 def test_fill_smooth_natural_smooth(device: str):
-    _skip_cpu(device)
     sphere = tm.creation.icosphere(subdivisions=3, radius=1.0)
     hemi = sphere.slice_plane(
         plane_origin=np.zeros(3), plane_normal=np.array([0.0, 0.0, 1.0]), cap=False

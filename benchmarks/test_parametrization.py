@@ -18,8 +18,10 @@ its circle map, and the harmonic warm start ARAP iterates from. What remains ins
 callable is what the function itself does -- operator assembly plus the CG solve -- because that is
 what the batched-CG work targets.
 
-``harmonic`` / ``lscm`` / ``arap`` solve with ``warp.optim.linear.cg``, which returns NaN on the
-Warp CPU backend (1.14-1.15), so the ``triwarp-cpu`` variant is skipped rather than timed.
+``harmonic`` / ``lscm`` / ``arap`` solve with ``warp.optim.linear.cg``, which returned NaN on the
+Warp CPU backend through 1.15 and made the ``triwarp-cpu`` variant unrunnable. It converges there
+now, so those rows are timed rather than skipped -- CPU CG is correct, not fast, and the ratio is
+the point.
 
 References
 ----------
@@ -91,14 +93,6 @@ _HARMONIC_ORDERS = [1, 2]
 
 _boundary_cache: dict[tuple[str, str], tuple[wp.array[wp.int32], wp.array[wp.vec2]]] = {}
 _warm_start_cache: dict[tuple[str, str], wp.array[wp.vec2]] = {}
-
-
-def _skip_cpu(bench_case: BenchCase) -> None:
-    """Skip triwarp-on-CPU cases: every solver here goes through ``warp.optim.linear.cg``."""
-    if bench_case.kind == "triwarp":
-        assert bench_case.device is not None
-        if wp.get_device(bench_case.device).is_cpu:
-            pytest.skip("warp.optim.linear.cg returns NaN on the CPU device in Warp 1.14-1.15")
 
 
 def _boundary(bench_case: BenchCase) -> tuple[wp.array[wp.int32], wp.array[wp.vec2]]:
@@ -179,7 +173,6 @@ def test_harmonic(bench_case: BenchCase, order: int) -> None:
     if bench_case.kind == "pymeshlab":
         _run_harmonic_pml(bench_case, order)
         return
-    _skip_cpu(bench_case)
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         loop, loop_uv = _boundary(bench_case)
@@ -219,7 +212,6 @@ def test_harmonic_conditioning(bench_case: BenchCase) -> None:
     if bench_case.kind == "pymeshlab":
         _run_harmonic_pml(bench_case, 1)
         return
-    _skip_cpu(bench_case)
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         loop, loop_uv = _boundary(bench_case)
@@ -238,7 +230,6 @@ def test_harmonic_conditioning(bench_case: BenchCase) -> None:
 @pytest.mark.parametrize("iterations", _ARAP_ITERATIONS)
 def test_arap(bench_case: BenchCase, iterations: int) -> None:
     """Local/global ARAP from a harmonic warm start: per-face SVD plus a CG solve per iteration."""
-    _skip_cpu(bench_case)
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         loop, loop_uv = _boundary(bench_case)
@@ -288,7 +279,6 @@ def test_lscm(bench_case: BenchCase) -> None:
             ).compute_texcoord_parametrization_least_squares_conformal_maps()
         )
         return
-    _skip_cpu(bench_case)
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         loop, _loop_uv = _boundary(bench_case)

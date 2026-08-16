@@ -515,8 +515,6 @@ def _sphere_region(subdivisions: int = 2, z_cut: float = 0.5):
 
 
 def test_smooth_region_fixed_rim_matches_meshlib(device: str):
-    if wp.get_device(device).is_cpu:
-        pytest.skip("region smoothing requires a CUDA device (warp.optim.linear.cg)")
     vertices_np, faces_np, free_np = _sphere_region()
     v_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
     f_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
@@ -536,8 +534,6 @@ def test_smooth_region_fixed_rim_matches_meshlib(device: str):
 
 @pytest.mark.parametrize("edge_weights", ["cotan", "unit"])
 def test_smooth_region_matches_meshlib(device: str, edge_weights: str):
-    if wp.get_device(device).is_cpu:
-        pytest.skip("region smoothing requires a CUDA device (warp.optim.linear.cg)")
     vertices_np, faces_np, free_np = _sphere_region()
     v_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
     f_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
@@ -555,8 +551,6 @@ def test_smooth_region_matches_meshlib(device: str, edge_weights: str):
 
 
 def test_smooth_region_fixed_rim_dirichlet_residual(device: str):
-    if wp.get_device(device).is_cpu:
-        pytest.skip("region smoothing requires a CUDA device (warp.optim.linear.cg)")
     vertices_np, faces_np, free_np = _sphere_region()
     v_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
     f_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)

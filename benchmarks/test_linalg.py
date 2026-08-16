@@ -30,9 +30,10 @@ Three knobs are swept on top of it, each isolating a different lever:
   is the amortization question: if ``x50`` lands near 50x ``once``, the preallocation is not earning
   its API surface.
 
-Everything runs in **float64** (the operator dtype these entry points require) and is
-**CUDA-only**: ``warp.optim.linear.cg`` returns NaN on the Warp CPU backend in 1.14-1.15 and
-``triwarp.linalg`` raises ``NotImplementedError`` there, so the ``triwarp-cpu`` variant is skipped.
+Everything runs in **float64**, the operator dtype these entry points require. This module used to
+be **CUDA-only** because ``warp.optim.linear.cg`` returned NaN on the Warp CPU backend through 1.15;
+it converges there now (measured 20 iterations to a 1.9e-08 residual against ``numpy.linalg.solve``
+on a 64x64 SPD system), so the ``triwarp-cpu`` variant is timed rather than skipped.
 
 References
 ----------
@@ -97,13 +98,6 @@ _SEED = 23
 _operator_cache: dict[tuple[str, str], wps.BsrMatrix] = {}
 _fixed_cache: dict[tuple[str, str, float], tuple] = {}
 _rhs_cache: dict[tuple[str, str], wp.array] = {}
-
-
-def _skip_cpu(bench_case: BenchCase) -> None:
-    """Skip triwarp-on-CPU: every solver here goes through ``warp.optim.linear.cg``."""
-    assert bench_case.device is not None
-    if wp.get_device(bench_case.device).is_cpu:
-        pytest.skip("warp.optim.linear.cg returns NaN on the CPU device in Warp 1.14-1.15")
 
 
 def _operator(bench_case: BenchCase) -> wps.BsrMatrix:
@@ -184,7 +178,6 @@ def test_min_quad_with_fixed(bench_case: BenchCase, fixed_fraction: float) -> No
         assert meshset_pml.current_mesh().vertex_scalar_array().shape[0] == bench_case.n_vertices
         return
 
-    _skip_cpu(bench_case)
     operator = _operator(bench_case)
     fixed_mask, fixed_values = _fixed(bench_case, fixed_fraction)
     solution, _free_map, n_free = bench_case.run(
@@ -200,7 +193,6 @@ def test_min_quad_with_fixed(bench_case: BenchCase, fixed_fraction: float) -> No
 @pytest.mark.parametrize("check_every", _CHECK_EVERY, ids=["every", "ondevice"])
 def test_solve_spd_columns(bench_case: BenchCase, check_every: int) -> None:
     """Residual-check cadence: host syncs traded against possibly-wasted iterations."""
-    _skip_cpu(bench_case)
     operator, rhs = _operator(bench_case), _rhs(bench_case)
     solution = wp.zeros_like(rhs)
     solution_2d = twt.as_array2d(solution, wp.float64)
@@ -237,7 +229,6 @@ def test_spd_column_solver_amortized(bench_case: BenchCase, repeats: int) -> Non
     while every other solver group got faster. See the ``check_every`` notes on
     ``triwarp.linalg.solve_spd_columns``.
     """
-    _skip_cpu(bench_case)
     operator, rhs = _operator(bench_case), _rhs(bench_case)
     solution = wp.zeros_like(rhs)
     solver = tw.linalg.spd_column_solver(

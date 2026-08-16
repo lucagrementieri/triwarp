@@ -169,10 +169,6 @@ def test_filter_mut_dif_laplacian(bench_case: BenchCase, volume_constraint: bool
         )
         assert len(smoothed.vertices) == bench_case.n_vertices
         return
-    if bench_case.kind == "triwarp" and bench_case.device == "cpu" and volume_constraint:
-        # Native abort inside the volume-constraint path on the CPU device (Warp 1.15);
-        # under investigation alongside the device-mean fix.
-        pytest.skip("volume-constraint path aborts on the CPU device")
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         operator = _laplacian_operator(bench_case)
@@ -261,9 +257,6 @@ def test_filter_laplacian_integration(bench_case: BenchCase, implicit: bool) -> 
             )
         )
         return
-    assert bench_case.device is not None
-    if implicit and wp.get_device(bench_case.device).is_cpu:
-        pytest.skip("the implicit branch solves with warp.optim.linear.cg, CUDA-only in Warp 1.15")
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     operator = _laplacian_operator(bench_case)
     result = bench_case.run(
@@ -443,9 +436,6 @@ def test_filter_implicit_fairing(bench_case: BenchCase) -> None:
     is not worth having. Finiteness in the free case is itself recent: the collapse used to drive
     ``cot_entries_from_l2``'s division by ``4 * dbl_area`` to ``inf`` and the result came back NaN.
     """
-    assert bench_case.device is not None
-    if wp.get_device(bench_case.device).is_cpu:
-        pytest.skip("implicit fairing solves with warp.optim.linear.cg, CUDA-only in Warp 1.15")
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     with warnings.catch_warnings():
         warnings.simplefilter("error", UserWarning)  # a non-converged pass fails the benchmark

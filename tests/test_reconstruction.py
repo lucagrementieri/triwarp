@@ -400,14 +400,8 @@ def test_delaunay_too_few(device: str):
 #
 # References: open3d ``create_from_point_cloud_poisson`` (``_o3d``) and PyMeshLab
 # ``generate_surface_reconstruction_screened_poisson`` (``_pml``). Both reconstruct a different
-# vertex set than triwarp, so every comparison is metric/topological, never vertex-for-vertex. The
-# solve goes through ``warp.optim.linear.cg`` (CUDA-only), so the CPU device is skipped.
+# vertex set than triwarp, so every comparison is metric/topological, never vertex-for-vertex.
 # ======================================================================================
-
-
-def _skip_poisson_on_cpu(device: str) -> None:
-    if wp.get_device(device).is_cpu:
-        pytest.skip("screened_poisson requires CUDA: warp.optim.linear.cg is NaN on CPU.")
 
 
 def _torus_cloud(n_major: int = 40, n_minor: int = 20, r_major: float = 1.0, r_minor: float = 0.35):
@@ -449,7 +443,6 @@ def _open3d_poisson(points_np: np.ndarray, normals_np: np.ndarray, depth: int) -
 
 
 def test_poisson_sphere_watertight_manifold(device: str):
-    _skip_poisson_on_cpu(device)
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
@@ -468,7 +461,6 @@ def test_poisson_sphere_watertight_manifold(device: str):
 
 
 def test_poisson_outward_orientation(device: str):
-    _skip_poisson_on_cpu(device)
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
@@ -480,7 +472,6 @@ def test_poisson_outward_orientation(device: str):
 
 
 def test_poisson_torus_genus(device: str):
-    _skip_poisson_on_cpu(device)
     points_np, normals_np = _torus_cloud()
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
@@ -522,7 +513,6 @@ def test_poisson_matches_open3d_metric(device: str):
         a mesh compared with *itself* scored 0.0279. Any threshold within a few percent of a
         sampling floor is testing the sampler.
     """
-    _skip_poisson_on_cpu(device)
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
@@ -540,7 +530,6 @@ def test_poisson_matches_open3d_metric(device: str):
 
 
 def test_poisson_screening_improves_fit(device: str):
-    _skip_poisson_on_cpu(device)
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
@@ -578,7 +567,6 @@ def test_poisson_matches_pymeshlab_metric(device: str):
     to triwarp, so they are not independent enough for one to stand in for the other -- but that
     also means a triwarp regression would have to move past *both* to stay unnoticed.
     """
-    _skip_poisson_on_cpu(device)
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
@@ -621,7 +609,6 @@ def test_poisson_requires_normals_and_valid_params(device: str):
 
 
 def test_poisson_too_few_points(device: str):
-    _skip_poisson_on_cpu(device)
     points_wp = wp.array(np.zeros((2, 3), dtype=np.float64), dtype=wp.vec3, device=device)
     normals_wp = wp.array(np.ones((2, 3), dtype=np.float64), dtype=wp.vec3, device=device)
     with pytest.raises(ValueError, match="at least 3 points"):
@@ -657,7 +644,6 @@ def test_poisson_cpu_matches_cuda():
 
 
 def test_poisson_adaptive_sphere_watertight_manifold(device: str):
-    _skip_poisson_on_cpu(device)
     points_np, normals_np = _sphere_cloud(4)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
@@ -676,7 +662,6 @@ def test_poisson_adaptive_sphere_watertight_manifold(device: str):
 
 
 def test_poisson_adaptive_torus_genus(device: str):
-    _skip_poisson_on_cpu(device)
     points_np, normals_np = _torus_cloud()
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
@@ -688,7 +673,6 @@ def test_poisson_adaptive_torus_genus(device: str):
 
 
 def test_poisson_adaptive_matches_dense(device: str):
-    _skip_poisson_on_cpu(device)
     points_np, normals_np = _sphere_cloud(4)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
@@ -708,7 +692,6 @@ def test_poisson_adaptive_matches_dense(device: str):
 
 
 def test_poisson_adaptive_screening_improves_fit(device: str):
-    _skip_poisson_on_cpu(device)
     points_np, normals_np = _sphere_cloud(4)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
@@ -726,7 +709,6 @@ def test_poisson_adaptive_screening_improves_fit(device: str):
 
 
 def test_poisson_adaptive_confidence_runs(device: str):
-    _skip_poisson_on_cpu(device)
     points_np, normals_np = _sphere_cloud(4)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
