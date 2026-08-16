@@ -12,8 +12,9 @@ from triwarp.kernels.predicates import (
     project_out_normal,
     triangle_aspect_ratio,
     triangle_normal,
+    vector_angle,
 )
-from triwarp.kernels.triangles import face_vertices_vec3d, triangle_quality
+from triwarp.kernels.triangles import face_normals_and_area, face_vertices_vec3d, triangle_quality
 from triwarp.kernels.voxels import voxel_cell
 
 # Delaunay / Delone edge-flip constants (ported from MRMeshDelone.cpp). The flip predicate
@@ -690,17 +691,60 @@ CORNER_VERTEX = wp.constant(wp.int32(2))
 
 
 @wp.kernel
-def scatter_feature_endpoint_counts(
-    adjacency_edges: wp.array2d[wp.int32],
-    angles: wp.array[wp.float32],
-    feature_angle: wp.float32,
-    out_count: wp.array[wp.int32],
+def scatter_edge_incidence(
+    inverse: wp.array[wp.int32],
+    out_edge_face_count: wp.array[wp.int32],
+    out_edge_faces: wp.array2d[wp.int32],
 ) -> None:
-    # Add 1 to both endpoints of every interior edge sharper than feature_angle.
-    k = int(wp.tid())
-    if angles[k] > feature_angle:
-        wp.atomic_add(out_count, adjacency_edges[k, 0], 1)
-        wp.atomic_add(out_count, adjacency_edges[k, 1], 1)
+    # Face-corners per unique edge *and* the faces themselves, in one pass over the corner ->
+    # unique-edge map ``inverse``: corner ``c`` belongs to face ``c // 3``, so no face table is
+    # needed. The count is 1 on a boundary edge and 2 on an interior one; a non-manifold edge
+    # counts higher and its faces past the second are dropped, which is what the exactly-2 row
+    # grouping behind ``adjacency.face_adjacency`` does with them too.
+    #
+    # Launch over ``inverse.shape[0]`` with both outputs zeroed: the count doubles as the write
+    # cursor, which is why this replaces ``scatter.count_occurrences`` rather than following it.
+    c = int(wp.tid())
+    e = inverse[c]
+    slot = wp.atomic_add(out_edge_face_count, e, 1)
+    if slot < 2:
+        out_edge_faces[e, slot] = c // 3
+
+
+@wp.kernel
+def scatter_feature_edge_counts(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    unique_edges: wp.array2d[wp.int32],
+    edge_face_count: wp.array[wp.int32],
+    edge_faces: wp.array2d[wp.int32],
+    feature_angle: wp.float32,
+    out_feature_count: wp.array[wp.int32],
+    out_boundary_vertex: wp.array[wp.bool],
+) -> None:
+    # Add 1 to both endpoints of every feature edge: a boundary edge, or an interior edge whose two
+    # faces meet at more than ``feature_angle``. One launch over the unique edges answers both
+    # questions from the incidence table, where ``_classify`` used to re-group the same 3 * n_faces
+    # rows twice (once as boundary edges, once as face adjacency) to ask them separately.
+    e = int(wp.tid())
+    count = edge_face_count[e]
+    boundary = count == 1
+    feature = boundary
+    if count == 2:
+        f0 = edge_faces[e, 0]
+        f1 = edge_faces[e, 1]
+        normal_a, _area_a = face_normals_and_area(vertices, faces[f0 * 3 : (f0 + 1) * 3])
+        normal_b, _area_b = face_normals_and_area(vertices, faces[f1 * 3 : (f1 + 1) * 3])
+        feature = vector_angle(normal_a, normal_b) > feature_angle
+    if feature:
+        v0 = unique_edges[e, 0]
+        v1 = unique_edges[e, 1]
+        wp.atomic_add(out_feature_count, v0, 1)
+        wp.atomic_add(out_feature_count, v1, 1)
+        if boundary:
+            # Every writer stores the same value, so the mask needs no atomic.
+            out_boundary_vertex[v0] = True
+            out_boundary_vertex[v1] = True
 
 
 @wp.func

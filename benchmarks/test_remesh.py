@@ -586,14 +586,19 @@ def test_flip_by_objective(bench_case: BenchCase, objective: str) -> None:
 # group.
 #
 # That shape is the whole cost: at 0.1 the call is **92 % host** (354 ms wall against 28.5 ms of
-# device time on ``saddle_graded``) across 69-93 geometry rebuilds of ~40 wrapper calls each. Two
-# things were priced against that. Hoisting the twelve per-pass allocations is worth **3.6 % at
-# most** and was not done: a memset that initializes a kernel input cannot be removed by moving
-# the allocation. Committing several independent sets per rebuild *is* the lever, and cuts the
-# rebuild count by roughly the round count: **1.3-1.8x**, measured back to back
-# (``saddle_graded`` at 0.1: 461 -> 253 ms; ``icosphere(4)`` to 2 048 faces: 158 -> 94). Note
-# that graph capture is **not** available behind either: the pass body contains a host readback
-# that decides the loop's exit, and two data-dependent output shapes.
+# device time on ``saddle_graded``) across 69-93 geometry rebuilds of ~40 wrapper calls each, and a
+# rebuild costs the same 4.2 ms whether it runs on 32 524 faces or 3 484 — so the count of wrapper
+# calls per rebuild is the lever, not the kernels and not the mesh. Three things were priced
+# against that. Hoisting the twelve per-pass allocations is worth **3.6 % at most** and was not
+# done: a memset that initializes a kernel input cannot be removed by moving the allocation.
+# Committing several independent sets per rebuild cuts the rebuild count by roughly the round
+# count: **1.3-1.8x**, measured back to back (``saddle_graded`` at 0.1: 461 -> 253 ms;
+# ``icosphere(4)`` to 2 048 faces: 158 -> 94). And grouping the pass's edges **once** — the
+# candidate scoring and the feature/boundary classification had been grouping the same
+# ``3 * n_faces`` rows three times between them — is another **1.31-1.36x** (``saddle`` at 0.1:
+# 148 -> 112 ms; ``saddle_graded``: 193 -> 142), which is ``_classify`` alone going 1 059 -> 100 us.
+# Note that graph capture is **not** available behind any of them: the pass body contains a host
+# readback that decides the loop's exit, and two data-dependent output shapes.
 _QUADRIC_RATIOS = [0.5, 0.1]
 
 

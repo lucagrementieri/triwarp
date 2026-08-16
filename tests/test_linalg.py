@@ -91,6 +91,45 @@ def test_solve_spd_columns_matches_numpy(device: str) -> None:
     assert np.allclose(solution_wp.numpy(), solution_np, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("n", [1, 2, 255, 256, 257, 511, 512, 513])
+def test_solve_spd_columns_across_the_reduction_tile_boundary(device: str, n: int) -> None:
+    """
+    Class A, against ``numpy.linalg.solve``.
+
+    The batched solver pads each column to a whole number of
+    ``kernels.algorithms.conjugate_gradient.CG_TILE`` entries so its dot has no ragged block, and
+    those pad lanes ride through the dot, the fused Jacobi apply and the ``x`` update -- the last
+    of which writes the caller's *unpadded* buffer and so must skip them. How much padding there
+    is, and therefore which of those three a mistake shows up in, is decided entirely by
+    ``n mod CG_TILE``: a value that passes at 256 proves nothing about 257. These straddle the
+    boundary in both directions.
+    """
+    matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device, n=n)
+    solution_wp = wp.zeros_like(rhs_wp)
+    tw.linalg.solve_spd_columns(matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64))
+    assert np.allclose(
+        solution_wp.numpy(), np.linalg.solve(dense_np, rhs_np.T).T, rtol=1e-5, atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("n_rhs", [1, 2, 5])
+def test_solve_spd_columns_agrees_across_column_counts(device: str, n_rhs: int) -> None:
+    """
+    Class A. One column takes ``warp.optim.linear.cg``; more than one takes triwarp's own solver.
+
+    The split is an implementation detail -- a single column has nothing to batch, so Warp already
+    reduces it with a tiled tree -- and this is what keeps the two paths answering the same
+    question. Without it the batched solver could drift from the reference and only the
+    multi-column callers would notice.
+    """
+    matrix_wp, rhs_wp, dense_np, rhs_np = _spd_system(device, n_rhs=n_rhs)
+    solution_wp = wp.zeros_like(rhs_wp)
+    tw.linalg.solve_spd_columns(matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64))
+    assert np.allclose(
+        solution_wp.numpy(), np.linalg.solve(dense_np, rhs_np.T).T, rtol=1e-5, atol=1e-5
+    )
+
+
 @pytest.mark.parametrize("check_every", [1, 25, 0])
 def test_solve_spd_columns_check_every_is_solution_invariant(device: str, check_every: int) -> None:
     # ``check_every`` only changes how often the residual is tested (``0`` tests it on device via

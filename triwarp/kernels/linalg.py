@@ -1,14 +1,17 @@
 """
 Kernels for the shared sparse linear-algebra layer (``triwarp/linalg.py``).
 
-Holds the reduced-system assembly used by every fixed-value quadratic solve
-(``harmonic`` / ``tutte`` / ``lscm`` / ``arap``). It is a **CSR-to-CSR** extraction in two passes --
-count the surviving entries per free row, then fill them -- rather than a COO emission handed to
+The **reduced-system assembly** used by every fixed-value quadratic solve (``harmonic`` / ``tutte``
+/ ``lscm`` / ``arap``). It is a **CSR-to-CSR** extraction in two passes -- count the surviving
+entries per free row, then fill them -- rather than a COO emission handed to
 ``warp.sparse.bsr_from_triplets``. The input rows come out of a CSR, so they are already row-major,
 already column-sorted and already duplicate-free, and ``free_map`` is monotone, so the extracted
 row is sorted by construction: the sort and duplicate-accumulation a triplet build performs are pure
 waste here. Measured on ``benchmarks/test_linalg.py``'s ``saddle`` case, that build was **20.7 ms in
 a single launch, 91 % of all device time** in ``min_quad_with_fixed``.
+
+The module's other half, the batched conjugate-gradient iteration that solves the system this
+assembles, lives in ``triwarp.kernels.algorithms.conjugate_gradient``.
 
 !!! note
     ``smoothing``'s ``dirichlet_system_triplets`` / ``laplacian_ls_triplets`` are deliberately

@@ -232,14 +232,20 @@ def harmonic(
         along the triangle-quality axis for the same reason, which is the other side of the same
         observation.
 
-        So this is a **deliberate trade, not an open defect**: triwarp pays 1.2-2.2x on the solve
-        and wins ~13x on setup, because it factors nothing. Closing it needs a preconditioner
-        stronger
+        So this is a **deliberate trade, not an open defect**: triwarp pays on the solve and wins
+        ~13x on setup, because it factors nothing. Closing the rest needs a preconditioner stronger
         than Jacobi (incomplete Cholesky, or an algebraic-multigrid V-cycle) — a substantial
         subsystem that no in-repo caller has asked for, and not obviously a win at these sizes.
         **Do not re-open this as an assembly problem; that has now measured flat three times.**
         [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] reaches the same conclusion from its
         own measurements.
+
+        The numbers above predate the batched conjugate gradient moving in-house: an *iteration* is
+        now **1.42-1.50x** cheaper on these systems, which took ``saddle`` ``k=2`` from 257 to 181
+        ms and the conditioning row from 73 to 49, without touching the iteration count. What that
+        did **not** change is the paragraph above it — the remaining gap is still iteration count
+        against a factorization, and still a preconditioner question. See "Whose conjugate
+        gradient" in [`triwarp.linalg`][triwarp.linalg].
     """
     if k < 1:
         raise ValueError(f"harmonic power k must be >= 1, got {k}.")

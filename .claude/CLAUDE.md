@@ -36,7 +36,11 @@ You are an expert in NVIDIA Warp (wp). Follow all rules below when writing kerne
 - Cast `wp.tid()` to `int` explicitly when used as an array index: `f = int(wp.tid())`.
 - Use `wp.launch(kernel=..., dim=..., inputs=[...], device=...)` for execution. Always forward the `device` from the input arrays.
 - Array slicing is supported inside kernels: `faces[f * 3 : (f + 1) * 3]` produces a sub-array view.
-- Use `wp.cast(expr, TargetType)` for explicit type conversions between Warp types.
+- Use `wp.cast(expr, TargetType)` for explicit type conversions between Warp types — but **only
+  between types of the same size**: it is a bit reinterpretation, and a width change fails at
+  *NVRTC* time with `static assertion failed with "source and destination must have the same size"`,
+  not at Python time. `wp.cast(cross(a, b), wp.vec3)` is fine; `wp.cast(x_f64, wp.float32)` does not
+  compile. Widening or narrowing a scalar is the **constructor**: `wp.float32(x)`, `wp.float64(i)`.
 - Prepend output argument names with out_ and put them at the end of the kernel signature after all the input arguments. Two exemption classes, both carried as `_KERNEL_OUTPUT_ALLOWLIST` in `tests/api_conventions.py` (check 13): **in-place** arguments, where the same buffer is input and result (`sort_rows_insertion(data)`, the hole-filling DP tables) — an `out_` prefix would misread as write-only; and **scratch / persistent-state** buffers, caller-allocated working memory carried across launches (cursors, stacks, open-addressing tables, `ball_pivoting`'s front) — neither an input nor the answer, so name them for what they hold (`cursor`, `front_out`, `new_src`). A read-only input must never wear the `out_` prefix, even when the buffer was a *producer* kernel's output — parameter names describe the argument's role in *this* kernel.
 
 ---
@@ -86,7 +90,8 @@ Do **not** add custom per-element gather kernels when `[]` plus `wp.copy` suffic
 
 For element-wise dtype conversion of `wp.array` buffers at Python scope, allocate the destination and call **`wp.utils.array_cast(src, dst)`** (same device, matching shape). Example: `wp.bool` → `wp.int32` `0`/`1` flags for `wp.utils.array_scan` in `flatnonzero` — do **not** add a `bool_to_int32` gather-style kernel.
 
-Inside kernels, keep using `wp.cast(expr, TargetType)` for scalar and vector conversions.
+Inside kernels, keep using `wp.cast(expr, TargetType)` for same-width scalar and vector
+conversions, and the constructor (`wp.float32(x)`) where the width changes — see §3.
 
 ### `BsrMatrix.nnz` is a stale capacity; `nnz_sync()` is the entry count
 
@@ -136,8 +141,16 @@ nothing — it only moves the same NumPy call into Warp, more slowly. **Do not o
 pass**; 13 modules import it and that is correct. Host-side metadata math (offset scans, launch
 dims, per-loop sizes, small candidate tables) and host-*sequential* algorithms (patience sorting in
 `combine`, DP traceback in `holes`, `lexsort` Delaunay in `reconstruction`, `argsort` +
-`searchsorted` chain linking in `intersection`, the procedural mesh templates in `creation`) stay in
-NumPy: they are not device work, and porting them buys Python loops.
+`searchsorted` chain linking in `intersection`, most of the procedural mesh templates in `creation`)
+stay in NumPy: they are not device work, and porting them buys Python loops.
+
+**The exception is a template that is a closed-form parallel *map* whose output scales with a
+resolution parameter** — no sequential dependence between elements, so a kernel buys no Python loop
+and the host build is pure assembly plus an upload. `creation.icosphere` and `creation.grid` are
+both in that class and both are kernels: `grid` was 78 % NumPy prologue at `count=512` and came out
+**33x faster and bit-identical** (6.77 → 0.205 ms; 112x at `(1024, 1024)`), because a `float64`
+kernel followed by the same `float32` store rounds the same way the host build did. Decide by
+whether the elements depend on each other, not by which module the function lives in.
 
 Three things are still defects:
 

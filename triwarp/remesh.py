@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from typing import Literal, overload
+from typing import Literal, NamedTuple, overload
 
 import warp as wp
 import warp.sparse as wps
@@ -55,6 +55,27 @@ _LaunchCandidates = Callable[
     ],
     None,
 ]
+
+
+class _EdgeIncidence(NamedTuple):
+    """
+    The unique undirected edges of one triangulation, and which faces meet along each of them.
+
+    Everything the collapse passes and ``_classify`` need about edge topology, grouped once:
+    ``unique_edges`` and ``inverse`` come straight from
+    [`edges_unique`][triwarp.edges.edges_unique], and one scatter over ``inverse`` fills both
+    ``face_count`` (1 on a boundary edge, 2 on an interior one) and ``faces``.
+    """
+
+    unique_edges: twt.Array2dInt32
+    """``(m, 2)`` unique undirected vertex pairs, each row min-first."""
+    inverse: wp.array[wp.int32]
+    """Length ``3 * n_faces`` corner -> unique-edge map; corner ``c`` belongs to face ``c // 3``."""
+    face_count: wp.array[wp.int32]
+    """Length ``m`` face-corners per unique edge."""
+    faces: twt.Array2dInt32
+    """``(m, 2)`` incident face indices, the second column unwritten where ``face_count`` is 1."""
+
 
 # Backstop on the independent-set rounds per geometry rebuild in ``quadric_decimate``.
 #
@@ -359,7 +380,7 @@ def _classify(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     feature: wp.float32,
-    edges_sorted: twt.Array2dInt32 | None = None,
+    incidence: _EdgeIncidence | None = None,
 ) -> tuple[wp.array[wp.int32], wp.array[wp.bool]]:
     """
     Per-vertex FREE / CREASE / CORNER codes plus a boundary-vertex mask.
@@ -368,9 +389,16 @@ def _classify(
     edge; a vertex with zero is FREE, exactly two is CREASE (a smooth feature/boundary line), and
     anything else (a feature endpoint or a junction) is a frozen CORNER.
 
-    ``edges_sorted`` may be passed when the caller already built it for the same ``faces``: this is
-    called up to seven times per ``isotropic_remesh`` iteration, and rebuilding the sorted edge rows
-    each time was a measurable share of the total.
+    Both questions are answered by **one launch** over ``incidence``, which the collapse passes have
+    already built for their own scoring and pass in. That matters because the answer used to come
+    from ``boundary.boundary_edges`` plus ``adjacency.face_adjacency``, each of which hashes, sorts
+    and groups the same ``3 * n_faces`` edge rows the incidence was grouped from -- two of those
+    three groupings were pure repetition, and they were 84 % of this function. Measured back to
+    back on ``saddle`` with the incidence supplied: **1 059 -> 100 us, 10.6x**, which is
+    ``quadric_decimate`` **1.31-1.36x** end to end (``saddle`` at ``target_ratio=0.1`` 148 -> 112
+    ms, ``saddle_graded`` 193 -> 142) because the pass runs 35-45 times. ``_classify`` is also
+    called up to seven times per ``isotropic_remesh`` iteration, which gains **1.27x** from the
+    same change even though those callers have no incidence to hand and build their own.
     """
     device = vertices.device
     n_vertices = int(vertices.shape[0])
@@ -380,41 +408,54 @@ def _classify(
     if n_faces == 0:
         return codes, boundary_vertex
 
+    if incidence is None:
+        incidence = _edge_incidence(faces, n_vertices)
+    m = int(incidence.unique_edges.shape[0])
+    if m == 0:
+        return codes, boundary_vertex
+
     feature_count = wp.zeros(n_vertices, dtype=wp.int32, device=device)
-    boundary_count = wp.zeros(n_vertices, dtype=wp.int32, device=device)
-
-    if edges_sorted is None:
-        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-    boundary = tw.boundary.boundary_edges(vertices, faces, edges_sorted=edges_sorted)
-    if int(boundary.shape[0]) > 0:
-        wp.launch(
-            kernel_scatter.count_occurrences_rows,
-            dim=int(boundary.shape[0]),
-            inputs=[boundary, feature_count],
-            device=device,
-        )
-        wp.launch(
-            kernel_scatter.count_occurrences_rows,
-            dim=int(boundary.shape[0]),
-            inputs=[boundary, boundary_count],
-            device=device,
-        )
-
-    adjacency, adjacency_edges = tw.adjacency.face_adjacency(
-        faces, edges_sorted, return_edges=True, n_vertices=n_vertices
+    wp.launch(
+        kernel_remesh.scatter_feature_edge_counts,
+        dim=m,
+        inputs=[
+            vertices,
+            faces,
+            incidence.unique_edges,
+            incidence.face_count,
+            incidence.faces,
+            feature,
+            feature_count,
+            boundary_vertex,
+        ],
+        device=device,
     )
-    if int(adjacency.shape[0]) > 0:
-        angles = tw.adjacency.face_adjacency_angles(vertices, faces, face_adjacency=adjacency)
+    wp.map(kernel_remesh.finalize_vertex_codes, feature_count, out=codes)
+    return codes, boundary_vertex
+
+
+def _edge_incidence(faces: wp.array[wp.int32], n_vertices: int) -> _EdgeIncidence:
+    """
+    Group a triangulation's edge rows once, into unique edges and their incident faces.
+
+    The face table costs one scatter over the corners on top of the ``edges_unique`` the collapse
+    passes run anyway -- and it replaces the ``scatter.count_occurrences`` launch they used to make
+    for the count alone, so it is very nearly free. It is what lets ``_classify`` skip a second and
+    third grouping of the same rows; see ``scatter_edge_incidence`` in ``kernels/remesh.py``.
+    """
+    device = faces.device
+    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    m = int(unique_edges.shape[0])
+    face_count = wp.zeros(m, dtype=wp.int32, device=device)
+    edge_faces = twt.empty_2d((m, 2), wp.int32, device=device)
+    if m > 0:
         wp.launch(
-            kernel_remesh.scatter_feature_endpoint_counts,
-            dim=int(adjacency.shape[0]),
-            inputs=[adjacency_edges, angles, feature, feature_count],
+            kernel_remesh.scatter_edge_incidence,
+            dim=int(inverse.shape[0]),
+            inputs=[inverse, face_count, edge_faces],
             device=device,
         )
-
-    wp.map(kernel_remesh.finalize_vertex_codes, feature_count, out=codes)
-    wp.map(kernel_array.greater, boundary_count, wp.int32(0), out=boundary_vertex)
-    return codes, boundary_vertex
+    return _EdgeIncidence(unique_edges, inverse, face_count, twt.as_array2d(edge_faces, wp.int32))
 
 
 def _collapse_pass(
@@ -439,26 +480,15 @@ def _collapse_pass(
         if n_faces == 0:
             break
 
-        # One sorted edge-row build per pass, shared by the unique-edge pass and ``_classify``.
-        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-        unique_edges, inverse = tw.edges.edges_unique(
-            faces, edges_sorted=edges_sorted, n_vertices=n_vertices
-        )
+        # One edge grouping per pass, shared by the candidate scoring and ``_classify``.
+        incidence = _edge_incidence(faces, n_vertices)
+        unique_edges = incidence.unique_edges
         m = int(unique_edges.shape[0])
         if m == 0:
             break
         lengths = tw.edges.edges_unique_length(vertices, faces, unique_edges=unique_edges)
 
-        edge_face_count = wp.zeros(m, dtype=wp.int32, device=device)
-        wp.launch(
-            # Face-corners per unique edge: 2 interior, 1 boundary. ``inverse`` is the
-            # corner -> unique-edge map from ``edges.edges_unique``.
-            kernel_scatter.count_occurrences,
-            dim=int(inverse.shape[0]),
-            inputs=[inverse, edge_face_count],
-            device=device,
-        )
-        codes, _boundary = _classify(vertices, faces, feature, edges_sorted=edges_sorted)
+        codes, _boundary = _classify(vertices, faces, feature, incidence)
         csr = tw.graph.edges_to_csr(n_vertices, unique_edges)
 
         survivor = wp.full(m, -1, dtype=wp.int32, device=device)
@@ -472,7 +502,7 @@ def _collapse_pass(
                 lengths,
                 vertices,
                 codes,
-                edge_face_count,
+                incidence.face_count,
                 csr.offsets,
                 csr.columns,
                 low,
@@ -987,9 +1017,17 @@ def quadric_decimate(
     at ``saddle_graded`` 0.1**, and 1.06-1.07x at 0.5. That is **1.06-1.13x**, not the ~1.2x a
     launch count alone predicted — the round loop's share of the *clock* was smaller than its share
     of the launches, and what is left is the per-pass rebuild, 44 of them, each ~45 wrapper calls
-    whose cost is Python rather than either launches or kernels. Going further means committing
-    more per round (a less conservative lock, which changes the output) or fewer wrapper calls per
-    rebuild; it is **not** more rounds — the loop already stops on saturation at ~5.3 of its
+    whose cost is Python rather than either launches or kernels.
+
+    **The per-pass cost does not depend on the mesh**: 4.35 ms at 32 524 faces against 4.15 at
+    3 484, a 1.05x range over a 9.3x range of size, so the wrapper calls per rebuild — not the
+    kernels, and not the pass count — are the lever. The largest single one was ``_classify``
+    re-deriving what the pass had already grouped, which is why the pass now groups its edges once,
+    into an ``_EdgeIncidence``, and hands it over: measured back to back, **148 -> 112 ms at
+    ``saddle`` 0.1, 193 -> 142 at ``saddle_graded`` 0.1, 47 -> 36 at ``saddle`` 0.5**, i.e.
+    **1.31-1.36x**. Going further means committing more per round (a less conservative lock, which
+    changes the output), or removing the pass's nine host readbacks so the whole outer loop can be
+    captured too; it is **not** more rounds — the loop already stops on saturation at ~5.3 of its
     8-round cap.
 
     Four consequences to plan around:
@@ -1032,26 +1070,14 @@ def quadric_decimate(
             break
         n_vertices = int(current_vertices.shape[0])
 
-        edges_sorted = tw.edges.faces_to_edges(current_faces, sorted=True)
-        unique_edges, inverse = tw.edges.edges_unique(
-            current_faces, edges_sorted=edges_sorted, n_vertices=n_vertices
-        )
+        # One edge grouping per pass, shared by the candidate scoring and ``_classify``.
+        incidence = _edge_incidence(current_faces, n_vertices)
+        unique_edges = incidence.unique_edges
         m = int(unique_edges.shape[0])
         if m == 0:
             break
 
-        edge_face_count = wp.zeros(m, dtype=wp.int32, device=device)
-        wp.launch(
-            # Face-corners per unique edge: 2 interior, 1 boundary. ``inverse`` is the
-            # corner -> unique-edge map from ``edges.edges_unique``.
-            kernel_scatter.count_occurrences,
-            dim=int(inverse.shape[0]),
-            inputs=[inverse, edge_face_count],
-            device=device,
-        )
-        codes, _boundary = _classify(
-            current_vertices, current_faces, feature, edges_sorted=edges_sorted
-        )
+        codes, _boundary = _classify(current_vertices, current_faces, feature, incidence)
         csr = tw.graph.edges_to_csr(n_vertices, unique_edges)
         quadrics = _vertex_quadrics(current_vertices, current_faces)
         face_offsets, vertex_faces = tw.adjacency.vertex_face_adjacency(
@@ -1071,7 +1097,7 @@ def quadric_decimate(
                 current_faces,
                 quadrics,
                 codes,
-                edge_face_count,
+                incidence.face_count,
                 csr.offsets,
                 csr.columns,
                 face_offsets,

@@ -348,12 +348,18 @@ def test_platonic_solids(
 @pytest.mark.parametrize("count", [32, 512])
 def test_grid(bench_lib: BenchLibrary, count: int) -> None:
     """
-    A ``count x count`` vertex lattice: one NumPy prologue against two per-vertex loops.
+    A ``count x count`` vertex lattice: two closed-form kernels against two per-vertex loops.
 
     ``igl.triangulated_grid(nx, ny)`` is the same lattice with the same diagonal, and returns **2D**
     ``(n, 2)`` vertices in the unit square -- so it carries no extents, no centring and no third
     coordinate, which is the class-B transform the parity test applies. That also makes it the
     cheapest of the three: it writes two floats per vertex where the others write three.
+
+    This group is what caught the host build: at 512 it was 78 % NumPy prologue, and the lattice
+    is a closed-form parallel map rather than the host-sequential assembly the other templates in
+    that module are. Building it on the device is bit-identical and **33x** at 512 (6.77 -> 0.205
+    ms), which inverts the row from a 1.84x loss against igl to a large win; ``count=32`` stays a
+    wrapper-floor row, gaining only 1.34x. See [`triwarp.creation.grid`][] for the full table.
     """
     n_faces = 2 * (count - 1) ** 2
     if bench_lib.kind == "igl":

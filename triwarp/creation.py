@@ -409,6 +409,30 @@ def grid(
     --------
     [`box`][triwarp.creation.box]
     [`extrude_triangulation`][triwarp.creation.extrude_triangulation]
+
+    Notes
+    -----
+    Both buffers are written **closed-form on the device**, one thread per vertex and one per quad
+    cell, rather than assembled on the host. The other procedural templates in this module stay in
+    NumPy because they are host-*sequential* and a port would only buy Python loops; this one is a
+    pure parallel map whose output scales with a resolution parameter into the millions, which is
+    the same argument that made [`icosphere`][triwarp.creation.icosphere] closed-form.
+
+    Measured back to back, interleaved in one process, against the host build it replaces:
+
+    | ``count`` | host | device | |
+    |---|---|---|---|
+    | ``(32, 32)`` | 0.227 ms | **0.169 ms** | 1.34x |
+    | ``(128, 128)`` | 0.585 ms | **0.182 ms** | 3.21x |
+    | ``(512, 512)`` | 6.77 ms | **0.205 ms** | 33.1x |
+    | ``(1024, 1024)`` | 46.1 ms | **0.413 ms** | 112x |
+
+    The device column being nearly flat to a million vertices is the point: what the host build
+    spent was the lattice assembly and the upload, not the geometry. Positions come out
+    **bit-identical** to the NumPy version — the kernel does the same arithmetic in ``float64``
+    before the ``float32`` store, and phrases each sample as ``extent * (k / (n - 1))`` so the far
+    edge lands on the extent exactly, which is what ``numpy.linspace`` needed its endpoint special
+    case for.
     """
     nx, ny = int(count[0]), int(count[1])
     if nx < 2 or ny < 2:
@@ -417,27 +441,29 @@ def grid(
     if width < 0.0 or height < 0.0:
         raise ValueError(f"extents must be non-negative, got {extents}")
 
-    x = np.linspace(0.0, width, nx)
-    y = np.linspace(0.0, height, ny)
-    if center:
-        x = x - 0.5 * width
-        y = y - 0.5 * height
-    grid_x, grid_y = np.meshgrid(x, y, indexing="ij")
-    vertices_np = np.column_stack(
-        (grid_x.ravel(), grid_y.ravel(), np.zeros(nx * ny, dtype=np.float64))
+    vertices = wp.empty(nx * ny, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_creation.grid_vertices,
+        dim=(nx, ny),
+        inputs=[
+            wp.int32(nx),
+            wp.int32(ny),
+            wp.float64(width),
+            wp.float64(height),
+            wp.float64(-0.5 * width if center else 0.0),
+            wp.float64(-0.5 * height if center else 0.0),
+        ],
+        outputs=[vertices],
+        device=device,
     )
-
-    # Row-major layout (X is the slow axis), so a cell's four corners are ``corner``,
-    # ``corner + ny`` (next X) and ``+ 1`` (next Y). The two triangles are wound
-    # counter-clockwise seen from +Z.
-    i, j = np.meshgrid(np.arange(nx - 1), np.arange(ny - 1), indexing="ij")
-    corner = (i * ny + j).ravel()
-    faces_np = np.empty((corner.shape[0], 2, 3), dtype=np.int32)
-    faces_np[:, 0] = np.column_stack((corner, corner + ny, corner + ny + 1))
-    faces_np[:, 1] = np.column_stack((corner, corner + ny + 1, corner + 1))
-
-    vertices = _upload_vertices(vertices_np, device)
-    faces = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
+    faces = wp.empty(6 * (nx - 1) * (ny - 1), dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_creation.grid_faces,
+        dim=(nx - 1, ny - 1),
+        inputs=[wp.int32(ny)],
+        outputs=[faces],
+        device=device,
+    )
     return _apply_transform(vertices, faces, transform)
 
 

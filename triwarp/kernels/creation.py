@@ -40,6 +40,47 @@ def reverse_face_winding(faces: wp.array[wp.int32], out_faces: wp.array[wp.int32
     out_faces[f * 3 + 2] = a
 
 
+@wp.kernel
+def grid_vertices(
+    nx: wp.int32,
+    ny: wp.int32,
+    width: wp.float64,
+    height: wp.float64,
+    origin_x: wp.float64,
+    origin_y: wp.float64,
+    out_vertices: wp.array[wp.vec3],
+) -> None:
+    # The (nx, ny) lattice of a flat patch in the z = 0 plane, row-major with X the slow axis, one
+    # thread per vertex.
+    #
+    # Written as ``extent * (k / (n - 1))`` rather than ``k * (extent / (n - 1))``: the fraction is
+    # exactly 1 at the last sample, so the far edge lands on the extent without the endpoint
+    # special case ``numpy.linspace`` needs. The arithmetic is float64 for the same reason the host
+    # build was -- the float32 store then rounds off an exact value rather than an accumulated one.
+    i, j = wp.tid()
+    x = origin_x + width * (wp.float64(i) / wp.float64(nx - 1))
+    y = origin_y + height * (wp.float64(j) / wp.float64(ny - 1))
+    # ``wp.float32(...)``, not ``wp.cast``: the latter is a same-size bit reinterpretation and
+    # fails to compile on a float64 source ("source and destination must have the same size").
+    out_vertices[int(i) * ny + int(j)] = wp.vec3(wp.float32(x), wp.float32(y), wp.float32(0.0))
+
+
+@wp.kernel
+def grid_faces(ny: wp.int32, out_faces: wp.array[wp.int32]) -> None:
+    # The two triangles of one quad cell, one thread per cell, wound counter-clockwise seen from
+    # +Z. With X the slow axis a cell's corners are ``corner``, ``corner + ny`` (next X) and
+    # ``+ 1`` (next Y), and cell ``(i, j)`` owns face slots ``2 * (i * (ny - 1) + j)`` and the next.
+    i, j = wp.tid()
+    corner = int(i) * ny + int(j)
+    slot = (int(i) * (ny - 1) + int(j)) * 6
+    out_faces[slot + 0] = corner
+    out_faces[slot + 1] = corner + ny
+    out_faces[slot + 2] = corner + ny + 1
+    out_faces[slot + 3] = corner
+    out_faces[slot + 4] = corner + ny + 1
+    out_faces[slot + 5] = corner + 1
+
+
 # Vertex and edge counts of the base icosahedron, which set the two block boundaries of the
 # icosphere's closed-form vertex numbering: the 12 corners, then 30 blocks of ``n - 1`` base-edge
 # points, then 20 blocks of face-interior points.
