@@ -56,7 +56,6 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import require_tiled_lanes
 from triwarp.kernels import holes as kernel_holes
 
 
@@ -695,25 +694,21 @@ def _run_hole_dp(
     ``max(B) - 1`` for the whole mesh rather than ``B - 1`` per hole.
 
     ``tiled`` selects the per-span engine: a block per interval with its lanes striding the apex
-    loop (CUDA default), or one thread per interval (CPU, and the tie-break reference). Both
-    produce byte-identical ``dp`` / ``prev``; ``tiled`` exists so a test can force either.
+    loop, or one thread per interval. Both produce byte-identical ``dp`` / ``prev`` on **both**
+    devices, so this is a pure cost knob and ``None`` picks whichever is faster on the device at
+    hand -- tiled on CUDA, where a block has lanes to spread the apex loop over; serial on CPU,
+    where it has one and the two engines do the same work. ``tiled`` exists so a test can force
+    either and compare them.
 
-    Leaving it at ``None`` picks the engine the device can run. Passing ``tiled=True`` on a CPU
-    device **raises**: ``wp.launch_tiled`` runs a single lane per block there through Warp 1.16, so
-    the strided apex loop would cover only every ``HOLE_DP_BLOCK``-th apex and return a DP table
-    that is wrong rather than absent. Nothing downstream could tell -- the fill still has the right
-    triangle count and a plausible cost -- so this is a raise and not a warning.
-
-    Raises
-    ------
-    ValueError
-        If ``tiled`` is ``True`` and ``loops`` is on a CPU device.
+    That portability rests on ``fill_dp_span_tiled`` striding by ``wp.block_dim()`` rather than by
+    the ``HOLE_DP_BLOCK`` it is launched with: the two agree on CUDA, and on CPU the former reads 1,
+    so the single lane covers every apex and the tile reductions after it degenerate to one-element
+    tiles holding that lane's own answer. With the constant it silently minimized over every 32nd
+    apex instead; see the kernel's comment for the measurement.
     """
     device = loops.device
     if tiled is None:
         tiled = not wp.get_device(device).is_cpu
-    elif tiled:
-        require_tiled_lanes(device, "_run_hole_dp")
     wp.launch(
         kernel_holes.init_dp_base,
         dim=(loops.n_loops, loops.max_size),

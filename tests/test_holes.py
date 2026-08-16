@@ -684,15 +684,14 @@ def test_fill_dp_span_tiled_matches_serial(
     triangulation. Measured on this very fixture set: inverting the tie-break to the largest ``k``
     changes 76 of 144 (fixture, metric, flag) cases and every other test in this file still passes.
     So byte-equality against the serial reference is the only thing that pins the tiled reduction,
-    and ``fill_dp_span`` stays in the module as that reference (it is also the CPU engine).
+    and ``fill_dp_span`` stays in the module as that reference (it is also the default CPU engine).
 
-    CUDA only, and the CPU device now says so out loud rather than being skipped here: forcing
-    ``tiled=True`` on CPU raises, which
-    ``test_run_hole_dp_refuses_the_tiled_engine_on_cpu`` below covers.
+    Runs on **both** devices. It used to skip on CPU, because the tiled kernel strided its apex loop
+    by the ``HOLE_DP_BLOCK`` constant while ``wp.launch_tiled`` gives the CPU one lane per block --
+    so lane 0 stepped by 32 and the DP minimized over every 32nd apex. Striding by
+    ``wp.block_dim()`` instead makes the single CPU lane cover every apex, and this comparison is
+    what verifies that: on CPU it is now a genuine tiled-vs-serial check rather than a skip.
     """
-    if wp.get_device(device).is_cpu:
-        pytest.skip("the tiled engine is CUDA-only and raises on CPU; see the test below")
-
     vertices_np, faces_np = _star_tube()
     vertices_wp = wp.array(
         np.ascontiguousarray(vertices_np, dtype=np.float64), dtype=wp.vec3, device=device
@@ -716,42 +715,6 @@ def test_fill_dp_span_tiled_matches_serial(
 
     assert fills[True].shape[0] > 3 * 3, "fixture produced no fill to compare"
     assert np.array_equal(fills[True], fills[False])
-
-
-def test_run_hole_dp_refuses_the_tiled_engine_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
-    """
-    Asking for the CUDA-only engine on CPU raises instead of returning a wrong DP table.
-
-    ``wp.launch_tiled`` runs one lane per block on the Warp CPU backend through Warp 1.16, so the
-    tiled per-span engine's strided apex loop would cover only every ``HOLE_DP_BLOCK``-th apex
-    there. The failure is entirely silent: the fill still comes back with the right triangle count,
-    a plausible cost and consistent winding, and only a byte comparison against the serial engine
-    -- ``test_fill_dp_span_tiled_matches_serial``, which cannot run on CPU -- would catch it.
-
-    ``_run_hole_dp`` picks the right engine on its own; this covers the *explicit* override, which
-    is the only way to reach the bad combination. The auto path is asserted here too, so the guard
-    cannot be satisfied by refusing the tiled engine everywhere.
-    """
-    vertices_np, faces_np = _star_tube()
-    vertices_wp = wp.array(
-        np.ascontiguousarray(vertices_np, dtype=np.float64), dtype=wp.vec3, device="cpu"
-    )
-    faces_wp = wp.array(
-        np.ascontiguousarray(faces_np.reshape(-1), dtype=np.int32), dtype=wp.int32, device="cpu"
-    )
-    n_orig = int(faces_wp.shape[0])
-
-    original = tw.holes._run_hole_dp
-    monkeypatch.setattr(
-        tw.holes, "_run_hole_dp", lambda *args, **kwargs: original(*args, **kwargs, tiled=True)
-    )
-    with pytest.raises(ValueError, match="cannot use the tiled engine on the CPU device"):
-        tw.holes.fill_min_weight(vertices_wp, faces_wp)
-
-    # The default path is unaffected and still fills, so the guard is not simply disabling CPU.
-    monkeypatch.undo()
-    fill_np = tw.holes.fill_min_weight(vertices_wp, faces_wp).numpy()[n_orig:]
-    assert fill_np.shape[0] > 3 * 3
 
 
 def test_fill_min_weight_optimal_vs_fan(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:

@@ -448,10 +448,25 @@ def fill_dp_span(
 def fill_dp_span_tiled(
     tables: HoleFillTables, span: wp.int32, dp: wp.array[wp.float32], prev: wp.array[wp.int32]
 ) -> None:
-    # One *block* per span-``span`` interval, its ``HOLE_DP_BLOCK`` lanes striding the apex loop.
-    # Same DP, same launch count, ``HOLE_DP_BLOCK`` times the parallelism: the serial kernel above
-    # puts at most ``n_loops * (max_B - span)`` threads on the machine, which for a single long
-    # boundary is a few hundred out of a few hundred thousand.
+    # One *block* per span-``span`` interval, its lanes striding the apex loop. Same DP, same launch
+    # count, ``block_dim`` times the parallelism: the serial kernel above puts at most
+    # ``n_loops * (max_B - span)`` threads on the machine, which for a single long boundary is a few
+    # hundred out of a few hundred thousand.
+    #
+    # **The stride is ``wp.block_dim()``, not ``HOLE_DP_BLOCK``, and that is what makes this kernel
+    # portable.** They are the same number on CUDA, where the launch passes ``HOLE_DP_BLOCK`` as
+    # ``block_dim``; they differ on the CPU device, where ``wp.launch_tiled`` runs exactly one lane
+    # per block through Warp 1.16 and ``wp.block_dim()`` reads 1. With the constant, lane 0 was the
+    # only lane running and it stepped by 32, so the DP minimized over every 32nd apex and returned
+    # a valid-looking, equal-count, *wrong* triangulation -- measured on ``_star_tube``, 42 of 44
+    # triangles differed from the serial engine. With the runtime value the single CPU lane strides
+    # by 1, covers every apex, and the two tile reductions below degenerate to one-element tiles
+    # that return that lane's own answer. Byte-identical to ``fill_dp_span`` on both devices.
+    #
+    # Measured on an RTX 5090, Warp 1.16, a 400-vertex loop, three alternating pairs: the runtime
+    # stride costs nothing (min 10.07 / 10.25 / 10.19 ms against 9.98 / 10.23 / 9.77 for the
+    # constant; medians 10.38 against 10.60). The loop body is an ``apex_cost`` call, so there was
+    # never much for a compile-time step to unroll.
     #
     # **The tie-break is the contract, not the cost.** ``update_argmin`` takes the *smallest* apex
     # ``k`` at equal cost, and that choice decides the emitted triangles, so a differently-tied
@@ -485,7 +500,7 @@ def fill_dp_span_tiled(
     is_top = i == 0 and j == b - 1
     best_val = FLOAT32_INF_CONSTANT
     best_k = wp.int32(-1)
-    for k in range(i + 1 + t, j, HOLE_DP_BLOCK):
+    for k in range(i + 1 + t, j, wp.block_dim()):
         val = apex_cost(
             tables, dp, prev, o, b, base, i, j, k, is_top, a_pos, c_pos, plane_normal, char_area
         )
