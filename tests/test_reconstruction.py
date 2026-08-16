@@ -406,6 +406,41 @@ def test_delaunay_too_few(device: str):
 # ======================================================================================
 
 
+def _poisson_depth(device: str) -> int:
+    """
+    Octree depth for the solving Poisson tests: 6 on CUDA, 5 on the CPU device.
+
+    Not a correctness difference -- CPU and CUDA reconstruct the same surface, which
+    [`test_poisson_cpu_matches_cuda`][] pins vertex for vertex -- but a cost one. The ``dense``
+    solve is over the ``2 ** depth`` cubed node grid **whatever the cloud size**, so it octuples per
+    level, and the CPU backend is not close to CUDA on it. Measured on Warp 1.16, 642-point cloud,
+    seconds per call:
+
+    | depth | CUDA | CPU |
+    |---|---|---|
+    | 4 | 0.37 | 1.19 |
+    | 5 | 0.01 | 11.91 |
+    | 6 | 0.01 | 99.43 |
+
+    At depth 6 the seven solving tests here were **20 minutes of a 23-minute** CPU-only run, with
+    the whole rest of the suite accounting for the other three. Dropping one level on CPU buys 8x
+    per solve. Depth 4 is not an option: 2 144 faces is too coarse to resolve the torus hole.
+
+    **Three tests opt out and keep a depth-6 literal**, each because its claim stops holding at 5,
+    which is why the level is a helper and not a blanket edit:
+
+    - ``test_poisson_sphere_watertight_manifold`` -- the depth-5 surface self-intersects, so it is
+      not watertight on *either* device, and the radius tolerances are sized to a depth-6 cell;
+    - ``test_poisson_matches_open3d_metric`` and ``..._pymeshlab_metric`` -- the class-C margin
+      falls from 3.4x / 3.7x to **2.64x / 2.44x**, under section 6's 3x floor.
+
+    Keep the *reference* libraries at whatever depth their own comment specifies -- open3d and
+    pymeshlab return identical output at 5 and 6 on this cloud and are pinned to 5 on both devices,
+    so the reference side does not move with this and no comparison is weakened on CPU only.
+    """
+    return 5 if wp.get_device(device).is_cpu else 6
+
+
 def _torus_cloud(n_major: int = 40, n_minor: int = 20, r_major: float = 1.0, r_minor: float = 0.35):
     u = np.linspace(0.0, 2.0 * np.pi, n_major, endpoint=False)
     v = np.linspace(0.0, 2.0 * np.pi, n_minor, endpoint=False)
@@ -445,6 +480,18 @@ def _open3d_poisson(points_np: np.ndarray, normals_np: np.ndarray, depth: int) -
 
 
 def test_poisson_sphere_watertight_manifold(device: str):
+    """
+    Watertightness needs depth 6, so this is the one solving test that does not drop to 5 on CPU.
+
+    Measured on this 642-point cloud, one reconstruction per process on **both** devices: depth 5
+    gives 7 976 faces that are edge-manifold with zero boundary edges but **self-intersecting**, so
+    ``is_watertight`` -- which follows Open3D and includes that clause -- is ``False``. Depth 6
+    closes it. The radius tolerances below are calibrated to a depth-6 cell (~0.034) as well, so
+    this test is pinned to 6 on both devices and pays the ~99 s that costs on CPU.
+
+    Not a device difference: CPU and CUDA agree at every depth, and the depth-5 answer is equally
+    non-watertight on both.
+    """
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
@@ -467,7 +514,7 @@ def test_poisson_outward_orientation(device: str):
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
     vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=6, full_depth=4
+        points_wp, normals_wp, depth=_poisson_depth(device), full_depth=4
     )
     # Outward normals => positive enclosed volume.
     assert _mesh_trimesh(vertices_wp, faces_wp).volume > 0.0
@@ -478,7 +525,7 @@ def test_poisson_torus_genus(device: str):
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
     vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=6, full_depth=4
+        points_wp, normals_wp, depth=_poisson_depth(device), full_depth=4
     )
     mesh_tw = _mesh_trimesh(vertices_wp, faces_wp)
     assert tw.validation.is_watertight(vertices_wp, faces_wp)
@@ -503,10 +550,17 @@ def test_poisson_matches_open3d_metric(device: str):
     can state the claim. Excludes the bug class "the iso-surface is in the wrong place": a global
     radius error, a sign flip on the indicator, a mislocated level set.
 
-    Measured agreement is **0.0043** and the threshold is 0.015, a **3.5x** margin. Mutation
-    probe, run against this assert: scaling triwarp's answer by 0.98 makes it read 0.0188 and the
+    Measured agreement is **0.0044** and the threshold is 0.015, a **3.4x** margin. Mutation
+    probe, run against this assert: scaling triwarp's answer by 0.98 makes it read 0.0190 and the
     assert fails, so a 2% radius error on a unit sphere is caught. A mesh against itself scores
     exactly 0.0, which is the whole point of the metric -- see the warning below.
+
+    **Pinned to depth 6 on both devices**, unlike the rest of this section, which drops to 5 on CPU
+    (see [`_poisson_depth`][]). Re-measured at depth 5: agreement widens to **0.0057**, a 2.64x
+    margin, under the 3x floor section 6 sets for a class-C threshold. The mutation probe still
+    fires there (0.0194), so it is the margin that fails the bar and not the sensitivity -- but a
+    threshold at 2.6x its measured value is a latent flake, and saving 155 s of CPU time is not
+    worth buying one.
 
     !!! warning "This assert used to be vacuous, and the reason generalises"
         It was ``symmetric_chamfer(...) < 0.03``, which is sample-to-*sample* and therefore has a
@@ -524,8 +578,8 @@ def test_poisson_matches_open3d_metric(device: str):
     mesh_tw = _mesh_trimesh(vertices_wp, faces_wp)
     # depth=5 on the reference side, not 6: on this 642-point cloud open3d returns the *same*
     # 7 976 faces at both depths (measured) for 0.28 s instead of 0.85 s, so the extra octree
-    # level is cost without an answer. Only the reference drops -- triwarp stays at the depth=6
-    # its sibling tests above use, where it resolves 32 552 faces in 0.01 s either way.
+    # level is cost without an answer. Only the reference drops -- triwarp stays at depth 6, pinned
+    # on both devices per the docstring, where it resolves 32 552 faces in 0.01 s either way.
     mesh_o3d = _open3d_poisson(points_np, normals_np, depth=5)
     mean_distance, _ = symmetric_surface_distance(mesh_tw, mesh_o3d)
     assert mean_distance < 0.015
@@ -536,10 +590,10 @@ def test_poisson_screening_improves_fit(device: str):
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
     vertices_screened, faces_screened = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=6, full_depth=4, point_weight=4.0
+        points_wp, normals_wp, depth=_poisson_depth(device), full_depth=4, point_weight=4.0
     )
     vertices_unscreened, faces_unscreened = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=6, full_depth=4, point_weight=0.0
+        points_wp, normals_wp, depth=_poisson_depth(device), full_depth=4, point_weight=0.0
     )
     fit_screened = _points_to_surface(points_np, _mesh_trimesh(vertices_screened, faces_screened))
     fit_unscreened = _points_to_surface(
@@ -564,7 +618,8 @@ def test_poisson_matches_pymeshlab_metric(device: str):
 
     Measured agreement is **0.0041** against the same 0.015 threshold, a **3.7x** margin, and the
     same mutation probe reads 0.0189 here and fails; the noise-floor warning on that test applies
-    unchanged. Worth having
+    unchanged. **Pinned to depth 6 on both devices** for the reason given there: at depth 5 the
+    agreement widens to **0.0062**, a 2.44x margin, below the 3x floor. Worth having
     both: open3d and pymeshlab agree with each other to 0.0015, a quarter of either one's distance
     to triwarp, so they are not independent enough for one to stand in for the other -- but that
     also means a triwarp regression would have to move past *both* to stay unnoticed.
@@ -650,7 +705,7 @@ def test_poisson_adaptive_sphere_watertight_manifold(device: str):
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
     vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=6, full_depth=4, method="adaptive"
+        points_wp, normals_wp, depth=_poisson_depth(device), full_depth=4, method="adaptive"
     )
     mesh_tw = _mesh_trimesh(vertices_wp, faces_wp)
 
@@ -668,7 +723,7 @@ def test_poisson_adaptive_torus_genus(device: str):
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
     vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=6, full_depth=4, method="adaptive"
+        points_wp, normals_wp, depth=_poisson_depth(device), full_depth=4, method="adaptive"
     )
     assert tw.validation.is_watertight(vertices_wp, faces_wp)
     assert _mesh_trimesh(vertices_wp, faces_wp).euler_number == 0  # genus-1 torus
@@ -679,10 +734,10 @@ def test_poisson_adaptive_matches_dense(device: str):
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
     vertices_dense, faces_dense = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=6, full_depth=4, method="dense"
+        points_wp, normals_wp, depth=_poisson_depth(device), full_depth=4, method="dense"
     )
     vertices_adaptive, faces_adaptive = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=6, full_depth=4, method="adaptive"
+        points_wp, normals_wp, depth=_poisson_depth(device), full_depth=4, method="adaptive"
     )
     # Same iso-surface on two different grids, so a surface metric rather than a correspondence.
     # Its old ``symmetric_chamfer(...) < 0.05`` sat only 1.8x above that helper's 0.028 sampling
@@ -698,10 +753,20 @@ def test_poisson_adaptive_screening_improves_fit(device: str):
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
     vertices_screened, faces_screened = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=6, full_depth=4, point_weight=4.0, method="adaptive"
+        points_wp,
+        normals_wp,
+        depth=_poisson_depth(device),
+        full_depth=4,
+        point_weight=4.0,
+        method="adaptive",
     )
     vertices_unscreened, faces_unscreened = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=6, full_depth=4, point_weight=0.0, method="adaptive"
+        points_wp,
+        normals_wp,
+        depth=_poisson_depth(device),
+        full_depth=4,
+        point_weight=0.0,
+        method="adaptive",
     )
     fit_screened = _points_to_surface(points_np, _mesh_trimesh(vertices_screened, faces_screened))
     fit_unscreened = _points_to_surface(
@@ -715,7 +780,12 @@ def test_poisson_adaptive_confidence_runs(device: str):
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 
     vertices_wp, faces_wp = tw.reconstruction.screened_poisson(
-        points_wp, normals_wp, depth=6, full_depth=4, confidence=True, method="adaptive"
+        points_wp,
+        normals_wp,
+        depth=_poisson_depth(device),
+        full_depth=4,
+        confidence=True,
+        method="adaptive",
     )
     assert tw.validation.is_watertight(vertices_wp, faces_wp)
     assert _mesh_trimesh(vertices_wp, faces_wp).euler_number == 2
