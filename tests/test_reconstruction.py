@@ -413,18 +413,21 @@ def _poisson_depth(device: str) -> int:
     Not a correctness difference -- CPU and CUDA reconstruct the same surface, which
     [`test_poisson_cpu_matches_cuda`][] pins vertex for vertex -- but a cost one. The ``dense``
     solve is over the ``2 ** depth`` cubed node grid **whatever the cloud size**, so it octuples per
-    level, and the CPU backend is not close to CUDA on it. Measured on Warp 1.16, 642-point cloud,
-    seconds per call:
+    level, and the CPU backend is not close to CUDA on it.
 
-    | depth | CUDA | CPU |
-    |---|---|---|
-    | 4 | 0.37 | 1.19 |
-    | 5 | 0.01 | 11.91 |
-    | 6 | 0.01 | 99.43 |
+    Measured on Warp 1.16, 642-point cloud, the two depths **interleaved in one process** and read
+    as the minimum of three (CLAUDE.md section 13): depth 5 takes **7.95 s** on CPU against depth
+    6's **68.09 s**, a **8.6x** saving per solve, matching the 8x the grid size predicts. Both are
+    ~0.01 s on CUDA.
 
-    At depth 6 the seven solving tests here were **20 minutes of a 23-minute** CPU-only run, with
-    the whole rest of the suite accounting for the other three. Dropping one level on CPU buys 8x
-    per solve. Depth 4 is not an option: 2 144 faces is too coarse to resolve the torus hole.
+    !!! warning "Quote the ratio, not the wall clock"
+        This box's CPU timings swing ~40 % with background load: the same depth-6 solve measured
+        68 s here, 99 s in a sequential sweep and 71-307 s inside different full-suite runs. The
+        *ratio* is stable because both sides move together, which is exactly why section 13 asks
+        for an interleaved A/B rather than two numbers taken apart. Do not re-derive a suite total
+        from these.
+
+    Depth 4 is not an option: 2 144 faces is too coarse to resolve the torus hole.
 
     **Three tests opt out and keep a depth-6 literal**, each because its claim stops holding at 5,
     which is why the level is a helper and not a blanket edit:
@@ -487,7 +490,7 @@ def test_poisson_sphere_watertight_manifold(device: str):
     gives 7 976 faces that are edge-manifold with zero boundary edges but **self-intersecting**, so
     ``is_watertight`` -- which follows Open3D and includes that clause -- is ``False``. Depth 6
     closes it. The radius tolerances below are calibrated to a depth-6 cell (~0.034) as well, so
-    this test is pinned to 6 on both devices and pays the ~99 s that costs on CPU.
+    this test is pinned to 6 on both devices and pays the ~68 s that costs on CPU.
 
     Not a device difference: CPU and CUDA agree at every depth, and the depth-5 answer is equally
     non-watertight on both.
