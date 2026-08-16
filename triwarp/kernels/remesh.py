@@ -1003,7 +1003,11 @@ def valence_flip_candidates(
     # Never flip a feature edge (sharp dihedral between the two incident faces).
     n0 = face_normal(vertices, faces, f0)
     n1 = face_normal(vertices, faces, f1)
-    if wp.acos(wp.dot(n0, n1)) > feature_angle:  # wp.acos auto-clamps to [-1, 1]
+    # ``vector_angle`` is the atan2 form; two coplanar faces across an edge is the common
+    # case here and is exactly where ``acos(dot)`` loses its digits, and this is a *branch*,
+    # so the lost digits change a flip decision rather than a printed number. The sibling
+    # feature test in ``classify_vertices`` above already reads this way.
+    if vector_angle(n0, n1) > feature_angle:
         return
     a, b, c, d = _resolve_flip_quad_guarded(
         faces, adjacency_edges, unshared, sorted_edge_keys, key_base, k, f0, out_quad

@@ -4,7 +4,12 @@ import warp as wp
 
 from triwarp.constants import PI, TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.array import to_vec3d
-from triwarp.kernels.predicates import triangle_aspect_ratio, triangle_double_area, triangle_normal
+from triwarp.kernels.predicates import (
+    triangle_aspect_ratio,
+    triangle_double_area,
+    triangle_normal,
+    vector_angle,
+)
 
 # ``face_quality`` metric selectors. Passed as a warp-uniform kernel argument so all four share one
 # compiled module (a ``wp.Function`` cannot be a kernel argument -- see AGENTS.md section 4).
@@ -131,11 +136,17 @@ def angles(
     f = wp.tid()
     edges = triangle_edges(vertices, faces[f * 3 : (f + 1) * 3])
 
-    u = wp.normalize(edges[0])
-    v = wp.normalize(edges[1])
-    w = wp.normalize(edges[2])
-
-    # wp.acos auto-clamps its argument to [-1, 1], so no explicit wp.clamp is needed.
+    # ``vector_angle`` is atan2(|a x b|, a . b) and is scale-free, so the edges go in unnormalized
+    # (three ``wp.normalize`` calls fewer) -- and a sliver, whose angles sit near 0 and pi, is
+    # precisely where the ``acos(a . b)`` this replaces amplified the round-off already in the dot
+    # product. Worst corner-angle error against a float64 reference on the same float32 vertex
+    # buffer: 2.0e-07 -> 1.3e-07 on an icosphere(3), 6.9e-07 -> 9.6e-08 on a 64-section cylinder,
+    # and **5.4e-06 -> 1.1e-07** at 256 sections, where the old form was closing on the 1e-5 the
+    # parity tests compare at. The gain grows with sliverness, which is the point.
+    #
+    # It also removes the spurious pi/2 that ``acos`` of a zeroed ``normalize`` returned for a
+    # zero-length edge; the degeneracy guard below now fires on the angle itself rather than on
+    # the third angle's residue. Both spellings end at (0, 0, 0) there, by different routes.
     #
     # The other corner-angle formulation in the tree is ``energies.internal_angles_and_sums``, which
     # is the law of cosines on squared edge lengths in float64 and additionally accumulates the
@@ -143,8 +154,8 @@ def angles(
     # there each angle is derived independently (so the three sum to pi only up to round-off) and a
     # sliver reads 0 or pi through the acos clamp, where this one takes the third angle as
     # ``PI - a0 - a1`` and zeroes all three of a degenerate face.
-    out_angles[f, 0] = wp.acos(wp.dot(u, v))
-    out_angles[f, 1] = wp.acos(wp.dot(-u, w))
+    out_angles[f, 0] = vector_angle(edges[0], edges[1])
+    out_angles[f, 1] = vector_angle(-edges[0], edges[2])
     out_angles[f, 2] = PI - out_angles[f, 0] - out_angles[f, 1]
 
     degen = (
