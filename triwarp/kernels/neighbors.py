@@ -118,6 +118,18 @@ def ball_count_in_radius(
     # its first assignment, so binding one ``query`` name to a hash-grid query in one branch and a
     # BVH query in the other does not compile (verified — Warp raises at parse time). Do not "tidy"
     # them into a single name.
+    #
+    # The ``wp.length`` here looks like a wasted square root -- this pass discards the distance, so
+    # ``wp.length_sq(d) <= radius * radius`` would seem strictly better. **It is not, on either
+    # count, and both were measured.** Speed: 0.997-1.003x on an RTX 5090 over hash grid and BVH at
+    # 200k and 1M points and at two radii, i.e. flat -- the square root is free against the memory
+    # traffic of the candidate walk (see the warp-memory-access-cost-model note: a cell probe is
+    # worth ~600 broadcast point tests). Values: the two are *not the same predicate* in float32,
+    # because ``sqrt`` and ``radius * radius`` round independently. Measured with both tests in one
+    # kernel over one candidate stream, 200k queries: **10 rows differ by one neighbour**, the same
+    # 10 on CPU and on CUDA, so it is inherent to the spelling and not an FMA artifact. Since the
+    # wrapper documents this query as inclusive at exactly ``radius``, the sqrt form is the one that
+    # means what the docstring says.
     c = wp.int32(0)
     j = wp.int32(0)
     if accel == ACCEL_HASHGRID:
