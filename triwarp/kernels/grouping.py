@@ -11,6 +11,19 @@ def scatter_first_occurrence(inverse: wp.array[wp.int32], out_first: wp.array[wp
     wp.atomic_min(out_first, inverse[i], i)
 
 
+@wp.func
+def sorted_run_start(sorted_values: wp.array[wp.Int], i: wp.int32) -> wp.bool:
+    # Does position ``i`` begin a run of equal values? The one test every run-length grouping in
+    # the package shares, and each of its three callers adds a different condition on top:
+    # ``mark_group_starts`` requires the run to be exactly ``length`` long, ``remesh``'s
+    # ``mark_edge_pair_starts`` specialises that to two, and its ``mark_unique_edge_starts`` wants
+    # every run whatever its length. Bounding the *data* is the caller's job too -- the buffer is
+    # usually over-allocated radix-sort scratch.
+    if i == 0:
+        return True
+    return sorted_values[i] != sorted_values[i - 1]
+
+
 @wp.kernel
 def mark_group_starts(
     sorted_values: wp.array[wp.Int], n: wp.int32, length: wp.int32, out_is_start: wp.array[wp.bool]
@@ -21,7 +34,7 @@ def mark_group_starts(
     is_start = True
     if tid + int(length) > int(n):
         is_start = False  # run would extend past the data
-    elif tid != 0 and sorted_values[tid] == sorted_values[tid - 1]:
+    elif not sorted_run_start(sorted_values, tid):
         is_start = False  # not the start of a run
     elif sorted_values[tid] != sorted_values[tid + int(length) - 1]:
         is_start = False  # run shorter than ``length``

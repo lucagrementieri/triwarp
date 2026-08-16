@@ -1115,6 +1115,64 @@ def test_flip_to_delaunay_empty(device: str):
     assert int(out.shape[0]) == 0
 
 
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere", "cave_cube"])
+def test_flip_topology_matches_the_composed_adjacency(
+    mesh_name: str, request: pytest.FixtureRequest
+) -> None:
+    """
+    ``_FlipTopology`` reproduces the wrapper chain it replaces, exactly.
+
+    The flip loop stopped composing [`face_adjacency`][triwarp.adjacency.face_adjacency],
+    [`face_adjacency_unshared`][triwarp.adjacency.face_adjacency_unshared] and a second
+    [`sort_and_argsort`][triwarp.array.sort_and_argsort] of the edge keys, and builds all three on
+    fixed buffers instead — a measured 1.5-2.6x. That is only sound while the two agree row for
+    row, including the row *order*, which the independent-set tie-break depends on. This is an
+    internal-consistency check, not a reference comparison, so it carries no parity marker.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces = mesh_wp.indices
+    n_vertices = len(mesh_tm.vertices)
+
+    topology = tw.remesh._FlipTopology(faces, n_vertices)
+    rows = topology.rebuild()
+
+    edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
+    adjacency_ref, adjacency_edges_ref = tw.adjacency.face_adjacency(
+        faces, edges_sorted, return_edges=True, n_vertices=n_vertices
+    )
+    unshared_ref = tw.adjacency.face_adjacency_unshared(faces, adjacency_ref, adjacency_edges_ref)
+    keys_ref, _order = tw.array.sort_and_argsort(
+        tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=False)
+    )
+
+    assert rows == int(adjacency_ref.shape[0]) > 0
+    assert np.array_equal(topology.adjacency.numpy(), adjacency_ref.numpy())
+    assert np.array_equal(topology.adjacency_edges.numpy(), adjacency_edges_ref.numpy())
+    assert np.array_equal(topology.unshared.numpy(), unshared_ref.numpy())
+    assert np.array_equal(topology.sorted_keys.numpy(), keys_ref.numpy())
+
+
+def test_flip_topology_drops_non_manifold_edges_like_face_adjacency(device: str) -> None:
+    """
+    An edge with three or more face corners is in neither table.
+
+    The run-length test that excludes it is the one branch the manifold fixtures cannot reach, and
+    ``face_adjacency`` keeps only edges shared by *exactly* two corners.
+    """
+    # A closed tetrahedron plus a fourth face on one of its edges: that edge has three corners.
+    faces_np = np.array([0, 1, 2, 0, 3, 1, 1, 3, 2, 2, 3, 0, 0, 1, 4], dtype=np.int32)
+    faces = wp.array(faces_np, dtype=wp.int32, device=device)
+
+    topology = tw.remesh._FlipTopology(faces, 5)
+    rows = topology.rebuild()
+
+    adjacency_ref = tw.adjacency.face_adjacency(faces, n_vertices=5)
+    assert rows == int(adjacency_ref.shape[0])
+    assert np.array_equal(topology.adjacency.numpy(), adjacency_ref.numpy())
+    # Edge (0, 1) carries three corners, so no row of the table mentions the pair it would form.
+    assert not (topology.adjacency_edges.numpy() == [0, 1]).all(axis=1).any()
+
+
 # ======================================================================================
 # Isotropic explicit remeshing (isotropic_remesh)
 #
@@ -2213,3 +2271,61 @@ def test_quadric_decimate_empty(device: str) -> None:
     )
     assert int(out_vertices_wp.shape[0]) == 0
     assert int(out_faces_wp.shape[0]) == 0
+
+
+def test_quadric_decimate_captures_its_pass(device: str) -> None:
+    """
+    The decimation pass is replayed as a CUDA graph rather than reissued.
+
+    The 2.6-4.5x that ``_DecimationBuffers`` is for rests entirely on this, and there is no other
+    signal when it stops happening: a host readback added anywhere in the pass body makes the
+    capture raise CUDA error 906, and a well-meant ``try``/``except`` or a widened fallback
+    condition around that would leave a correct function that is four times slower. This test is
+    the alarm. It is CUDA-only because the fallback path is the right answer everywhere else.
+    """
+    if not wp.get_device(device).is_cuda or not wp.is_conditional_graph_supported():
+        pytest.skip("conditional CUDA graphs unavailable")
+    mesh_tm = tm.creation.icosphere(subdivisions=3)
+    mesh_wp = trimesh_to_warp(mesh_tm, device)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+
+    buffers = tw.remesh._DecimationBuffers(
+        vertices_wp, faces_wp, len(mesh_tm.faces) // 4, wp.float32(np.radians(30.0))
+    )
+    assert buffers.run_pass()  # issued: this is the pass that measures the true edge count
+    assert buffers._graph is None
+    assert buffers.run_pass()  # captured, and replayed by every pass after
+    assert buffers._graph is not None
+
+
+def test_quadric_decimate_padding_never_reaches_the_output(device: str) -> None:
+    """
+    The fixed-width pass keeps its padding to itself, at every pass and not just at the end.
+
+    ``_DecimationBuffers`` runs every pass at a width the mesh has long since shrunk below, and
+    carries the slack as a dummy vertex and a dummy edge slot. Those sentinels are one index past
+    the live data on purpose, so a leak shows up as an out-of-range face index or an unreferenced
+    vertex rather than as a wrong number -- which is exactly what this asserts, after each pass
+    rather than only on the result.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=3)
+    mesh_wp = trimesh_to_warp(mesh_tm, device)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    buffers = tw.remesh._DecimationBuffers(
+        vertices_wp, faces_wp, len(mesh_tm.faces) // 8, wp.float32(np.radians(30.0))
+    )
+    passes = 0
+    while buffers.run_pass() and passes < 50:
+        passes += 1
+        n_faces, n_vertices, n_edges = (int(x) for x in buffers.state.numpy())
+        live_faces = buffers.faces.numpy()[: 3 * n_faces].reshape(-1, 3)
+        assert n_edges <= buffers.n_edges, "the edge capacity bound was violated"
+        assert live_faces.max() < n_vertices, "a face still points at the dummy vertex"
+        assert len(np.unique(live_faces)) == n_vertices, "unreferenced vertices left behind"
+        assert (buffers.faces.numpy()[3 * n_faces :] == buffers.n_vertices).all(), (
+            "the padded face slots are not the dummy triangle"
+        )
+    assert passes > 1, "the fixture must decimate over several passes for this to test anything"
+    out_vertices_wp, out_faces_wp = buffers.result()
+    assert int(out_faces_wp.shape[0]) // 3 <= len(mesh_tm.faces) // 8
+    assert out_faces_wp.numpy().max() < int(out_vertices_wp.shape[0])

@@ -4,26 +4,34 @@ from triwarp.kernels.grouping import pack_edge_key
 from triwarp.kernels.predicates import vector_angle
 
 
+@wp.func
+def write_face_edge_keys(
+    faces: wp.array[wp.int32], f: wp.int32, base: wp.uint64, out_keys: wp.array[wp.uint64]
+) -> None:
+    # The three undirected edge keys of face ``f``, written at ``3f .. 3f + 2``. Edge ``3f + k``
+    # belongs to face ``f``, which is what lets ``edge_pairs_to_face_pairs`` and
+    # ``edge_endpoints`` recover everything else from an edge index alone.
+    #
+    # ``pack_edge_key`` is byte-identical to what ``pack_indices`` produces for the sorted edge row
+    # ``[min, max]``, which is what keeps the radix sort's key order -- and so the adjacency row
+    # order -- the same as the composed ``faces_to_edges`` + ``pack_indices`` path.
+    c = f * 3
+    i0 = faces[c + 0]
+    i1 = faces[c + 1]
+    i2 = faces[c + 2]
+    out_keys[c + 0] = pack_edge_key(i0, i1, base)
+    out_keys[c + 1] = pack_edge_key(i1, i2, base)
+    out_keys[c + 2] = pack_edge_key(i2, i0, base)
+
+
 @wp.kernel
 def face_edge_keys(
     faces: wp.array[wp.int32], base: wp.uint64, out_keys: wp.array[wp.uint64]
 ) -> None:
-    # One launch in place of ``faces_to_edges`` + ``pack_indices``: the three undirected edge keys
-    # of face ``tid`` straight from the face buffer, so the intermediate ``(3F, 2)`` edge rows are
-    # never materialized. Edge ``3f + k`` belongs to face ``f``, which is what lets
-    # ``edge_pairs_to_face_pairs`` recover the face index as ``e // 3``.
-    #
-    # ``pack_edge_key`` is byte-identical to what ``pack_indices`` produces for the sorted edge row
-    # ``[min, max]``, which is what keeps the radix sort's key order -- and so the adjacency row
-    # order -- the same as the composed path.
-    tid = int(wp.tid())
-    f = tid * 3
-    i0 = faces[f + 0]
-    i1 = faces[f + 1]
-    i2 = faces[f + 2]
-    out_keys[f + 0] = pack_edge_key(i0, i1, base)
-    out_keys[f + 1] = pack_edge_key(i1, i2, base)
-    out_keys[f + 2] = pack_edge_key(i2, i0, base)
+    # One launch in place of ``faces_to_edges`` + ``pack_indices``, so the intermediate
+    # ``(3F, 2)`` edge rows are never materialized. ``remesh.pass_edge_keys`` is the same kernel
+    # over a fixed-capacity buffer, differing only in writing a sentinel key past the live faces.
+    write_face_edge_keys(faces, wp.int32(wp.tid()), base, out_keys)
 
 
 @wp.kernel

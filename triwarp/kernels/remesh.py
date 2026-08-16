@@ -1,8 +1,9 @@
 import warp as wp
 
 from triwarp.constants import TOLERANCE_ZERO_CONSTANT
+from triwarp.kernels.adjacency import edge_endpoints, unshared_vertex, write_face_edge_keys
 from triwarp.kernels.array import binary_search_sorted_contains, to_vec2d, to_vec3, to_vec3d
-from triwarp.kernels.grouping import hash_slot, pack_edge_key
+from triwarp.kernels.grouping import hash_slot, pack_edge_key, sorted_run_start
 from triwarp.kernels.predicates import (
     delone_metrics,
     dihedral_angle,
@@ -483,6 +484,78 @@ def _incircle_d(a: wp.vec2d, b: wp.vec2d, c: wp.vec2d, d: wp.vec2d) -> wp.float6
 # ---------------------------------------------------------------------------
 # Shared parallel edge-flip core
 # ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def mark_edge_pair_starts(
+    sorted_keys: wp.array[wp.uint64], n: wp.int32, out_starts: wp.array[wp.int32]
+) -> None:
+    # ``grouping.mark_group_starts`` specialized to ``length=2`` and emitting ``int32`` rather than
+    # ``wp.bool``: the flip loop feeds this straight to ``warp.utils.array_scan``, which has no
+    # bool overload, so a bool flag would only buy an ``array_cast``. Flags the position that
+    # starts a run of *exactly* two equal keys, i.e. an edge shared by exactly two face corners.
+    #
+    # Differs from ``mark_unique_edge_starts`` below only in requiring the run to be exactly two:
+    # that one takes every run whatever its length, because the decimation pass wants all unique
+    # edges where a flip pass wants only the manifold-interior ones.
+    i = int(wp.tid())
+    start = wp.int32(0)
+    if i + 2 <= n and sorted_run_start(sorted_keys, i):
+        if sorted_keys[i] == sorted_keys[i + 1]:
+            start = wp.int32(1)
+            if i + 2 < n:
+                if sorted_keys[i] == sorted_keys[i + 2]:
+                    start = wp.int32(0)  # run longer than two
+    out_starts[i] = start
+
+
+@wp.kernel
+def emit_flip_topology(
+    faces: wp.array[wp.int32],
+    order: wp.array[wp.int32],
+    starts: wp.array[wp.int32],
+    ranks: wp.array[wp.int32],
+    out_adjacency: wp.array2d[wp.int32],
+    out_adjacency_edges: wp.array2d[wp.int32],
+    out_unshared: wp.array2d[wp.int32],
+) -> None:
+    # The whole face-adjacency table a flip pass needs, in one launch over the ``3 * n_faces``
+    # sorted edge slots: ``adjacency.face_adjacency``'s pair table, its shared-edge endpoints and
+    # ``face_adjacency_unshared``'s opposite apexes. Everything comes out of the two grouped *edge*
+    # indices, so no edge table is materialized and nothing is gathered through one.
+    #
+    # ``ranks`` is the inclusive scan of ``starts``, so ``ranks[i] - 1`` is the row a start writes
+    # -- the same ascending-key row order the ``flatnonzero`` compaction inside
+    # ``grouping.group`` produces, which is what keeps this byte-identical to the composed path.
+    i = int(wp.tid())
+    if starts[i] == 0:
+        return
+    slot = ranks[i] - 1
+    edge_0 = order[i]
+    edge_1 = order[i + 1]
+    shared_a, shared_b = edge_endpoints(faces, edge_0)
+    face_0 = edge_0 / 3
+    face_1 = edge_1 / 3
+    base_0 = face_0 * 3
+    base_1 = face_1 * 3
+    unshared_0 = unshared_vertex(
+        faces[base_0 + 0], faces[base_0 + 1], faces[base_0 + 2], shared_a, shared_b
+    )
+    unshared_1 = unshared_vertex(
+        faces[base_1 + 0], faces[base_1 + 1], faces[base_1 + 2], shared_a, shared_b
+    )
+    out_adjacency_edges[slot, 0] = shared_a
+    out_adjacency_edges[slot, 1] = shared_b
+    if face_0 <= face_1:
+        out_adjacency[slot, 0] = face_0
+        out_adjacency[slot, 1] = face_1
+        out_unshared[slot, 0] = unshared_0
+        out_unshared[slot, 1] = unshared_1
+    else:
+        out_adjacency[slot, 0] = face_1
+        out_adjacency[slot, 1] = face_0
+        out_unshared[slot, 0] = unshared_1
+        out_unshared[slot, 1] = unshared_0
 
 
 @wp.func
@@ -1515,6 +1588,242 @@ def collapse_flips_normal(
     return False
 
 
+# ---------------------------------------------------------------------------
+# Readback-free decimation pass (see ``remesh._DecimationBuffers``)
+#
+# Every kernel below works on **fixed-capacity** buffers whose live prefix length lives in a device
+# array, so a whole pass can be issued once and replayed as a CUDA graph. Two conventions carry the
+# padding, and between them almost every kernel the pass reuses needs no guard of its own:
+#
+# - a **dummy vertex** at index ``n_vertices_capacity``, which every padded face corner and padded
+#   edge endpoint points at. It is referenced by no real edge, so per-vertex kernels may run over it
+#   freely; ``quadric_collapse_candidates`` is stopped on padded edges by freezing its code to
+#   ``CORNER_VERTEX``, which is that kernel's first rejection test.
+# - a **dummy edge slot** at index ``n_edges_capacity``, which every padded face corner's entry in
+#   ``inverse`` points at, so ``scatter_edge_incidence`` can run over the whole corner buffer.
+# ---------------------------------------------------------------------------
+
+DECIMATION_FACES = wp.constant(wp.int32(0))
+DECIMATION_VERTICES = wp.constant(wp.int32(1))
+DECIMATION_EDGES = wp.constant(wp.int32(2))
+
+EDGE_KEY_PAD = wp.constant(wp.uint64(0xFFFFFFFFFFFFFFFF))
+
+
+@wp.kernel
+def pass_edge_keys(
+    faces: wp.array[wp.int32],
+    state: wp.array[wp.int32],
+    base: wp.uint64,
+    out_keys: wp.array[wp.uint64],
+) -> None:
+    # ``adjacency.face_edge_keys`` over a fixed-capacity buffer: the same three keys per live face,
+    # and a maximal sentinel for each padded one. Sentinels sort to the very end, so bounding the
+    # grouping below by ``3 * n_faces`` excludes them exactly. That padding is the whole difference
+    # between the two kernels; the keys themselves come from the shared ``write_face_edge_keys``.
+    f = int(wp.tid())
+    if f >= state[DECIMATION_FACES]:
+        c = f * 3
+        out_keys[c + 0] = EDGE_KEY_PAD
+        out_keys[c + 1] = EDGE_KEY_PAD
+        out_keys[c + 2] = EDGE_KEY_PAD
+        return
+    write_face_edge_keys(faces, f, base, out_keys)
+
+
+@wp.kernel
+def mark_unique_edge_starts(
+    sorted_keys: wp.array[wp.uint64], state: wp.array[wp.int32], out_starts: wp.array[wp.int32]
+) -> None:
+    # Flag the first position of every run of equal keys among the live corners -- what
+    # ``grouping.unique_1d`` answers with a hash table, over sorted keys instead, and emitting
+    # ``int32`` so the scan that follows needs no cast. See ``mark_edge_pair_starts`` above for the
+    # one condition the two differ by.
+    i = int(wp.tid())
+    start = wp.int32(0)
+    if i < state[DECIMATION_FACES] * 3 and sorted_run_start(sorted_keys, i):
+        start = wp.int32(1)
+    out_starts[i] = start
+
+
+@wp.kernel
+def emit_unique_edges(
+    faces: wp.array[wp.int32],
+    order: wp.array[wp.int32],
+    starts: wp.array[wp.int32],
+    ranks: wp.array[wp.int32],
+    state: wp.array[wp.int32],
+    edge_capacity: wp.int32,
+    out_unique_edges: wp.array2d[wp.int32],
+    out_inverse: wp.array[wp.int32],
+    out_state: wp.array[wp.int32],
+) -> None:
+    # One launch for everything ``edges.edges_unique`` returns: the ascending unique edge rows and
+    # the corner -> unique-edge map. ``ranks`` is the inclusive scan of ``starts``, so its entry
+    # minus one
+    # is the unique index of the key at sorted position ``i`` -- the same ascending-key order
+    # ``unique_1d`` produces by sorting its compacted keys, which is what keeps the edge numbering
+    # (and therefore ``scramble_index``'s lock keys) identical to the composed path.
+    #
+    # A padded corner is sent to the dummy edge slot so ``scatter_edge_incidence`` can run over the
+    # whole corner buffer, and the last live position publishes the live edge count -- the tail read
+    # that sizes ``flatnonzero``'s output, left on the device.
+    i = int(wp.tid())
+    live = state[DECIMATION_FACES] * 3
+    corner = order[i]
+    if i >= live:
+        out_inverse[corner] = edge_capacity
+        return
+    e = ranks[i] - 1
+    out_inverse[corner] = e
+    if starts[i] != 0:
+        # The capacity is a bound the *previous* pass measured, and a collapse removes at least
+        # three undirected edges and adds none, so this cannot fire. Clamped anyway: getting the
+        # invariant wrong should cost a dropped edge, not an out-of-bounds write.
+        if e < edge_capacity:
+            a, b = edge_endpoints(faces, corner)
+            out_unique_edges[e, 0] = a
+            out_unique_edges[e, 1] = b
+    if i + 1 == live:
+        out_state[DECIMATION_EDGES] = wp.min(ranks[i], edge_capacity)
+
+
+@wp.kernel
+def pad_unique_edge_tail(
+    state: wp.array[wp.int32], dummy_vertex: wp.int32, out_unique_edges: wp.array2d[wp.int32]
+) -> None:
+    # Point every padded edge row at the dummy vertex. Its code is frozen to CORNER_VERTEX, so
+    # ``quadric_collapse_candidates`` rejects the row on its first test and never reads further.
+    e = int(wp.tid())
+    if e >= state[DECIMATION_EDGES]:
+        out_unique_edges[e, 0] = dummy_vertex
+        out_unique_edges[e, 1] = dummy_vertex
+
+
+@wp.kernel
+def reset_collapse_rounds(out_state: wp.array[wp.int32]) -> None:
+    # dim=1. ``[round index, commits as of the previous round, loop condition]`` at the start of a
+    # pass. A kernel rather than ``array.assign``, because that is a host-to-device copy and the
+    # pass this runs inside is captured as a graph.
+    _ = int(wp.tid())
+    out_state[0] = 0
+    out_state[1] = 0
+    out_state[2] = 1
+
+
+@wp.kernel
+def edge_csr_triplets(
+    unique_edges: wp.array2d[wp.int32],
+    state: wp.array[wp.int32],
+    out_rows: wp.array[wp.int32],
+    out_columns: wp.array[wp.int32],
+) -> None:
+    # ``graph.edges_to_csr``'s symmetric triplet expansion, with the padded rows sent out of range
+    # instead of to the dummy vertex. ``warp.sparse.bsr_from_triplets`` drops an out-of-range index
+    # silently, which is what is wanted here -- pointing them all at the dummy instead makes tens of
+    # thousands of triplets collide on **one** entry, and its accumulation atomic then serializes:
+    # measured 4.25 ms of a 4.82 ms pass on ``saddle``, 88 % of it, against 0.03 ms once dropped.
+    e = int(wp.tid())
+    a = e * 2
+    if e >= state[DECIMATION_EDGES]:
+        out_rows[a + 0] = -1
+        out_columns[a + 0] = -1
+        out_rows[a + 1] = -1
+        out_columns[a + 1] = -1
+        return
+    u = unique_edges[e, 0]
+    v = unique_edges[e, 1]
+    out_rows[a + 0] = u
+    out_columns[a + 0] = v
+    out_rows[a + 1] = v
+    out_columns[a + 1] = u
+
+
+@wp.kernel
+def freeze_dummy_vertex(dummy_vertex: wp.int32, out_codes: wp.array[wp.int32]) -> None:
+    # dim=1. See ``pad_unique_edge_tail``.
+    _ = int(wp.tid())
+    out_codes[dummy_vertex] = CORNER_VERTEX
+
+
+@wp.kernel
+def collapse_pass_budgets(
+    target_faces: wp.int32,
+    state: wp.array[wp.int32],
+    out_half: wp.array[wp.int32],
+    out_surplus: wp.array[wp.int32],
+) -> None:
+    # dim=1. The two per-pass budgets the host used to compute: the cheapest-half cut over the
+    # live candidates, and the pass's face surplus (an interior collapse removes two faces).
+    _ = int(wp.tid())
+    out_half[0] = wp.max(wp.int32(1), state[DECIMATION_EDGES] / 2)
+    out_surplus[0] = (state[DECIMATION_FACES] - target_faces) / 2
+
+
+@wp.kernel
+def compact_faces(
+    remapped: wp.array[wp.int32],
+    flags: wp.array[wp.int32],
+    ranks: wp.array[wp.int32],
+    dummy_vertex: wp.int32,
+    out_faces: wp.array[wp.int32],
+    out_state: wp.array[wp.int32],
+) -> None:
+    # Move the surviving faces to the front of the face buffer and pad the rest with the dummy
+    # triangle, publishing the new face count. Survivors move strictly left and are read from a
+    # separate buffer, so the compaction and the padding cannot race.
+    f = int(wp.tid())
+    kept = ranks[ranks.shape[0] - 1]
+    if f == 0:
+        out_state[DECIMATION_FACES] = kept
+    if flags[f] != 0:
+        slot = (ranks[f] - 1) * 3
+        out_faces[slot + 0] = remapped[f * 3 + 0]
+        out_faces[slot + 1] = remapped[f * 3 + 1]
+        out_faces[slot + 2] = remapped[f * 3 + 2]
+    if f >= kept:
+        out_faces[f * 3 + 0] = dummy_vertex
+        out_faces[f * 3 + 1] = dummy_vertex
+        out_faces[f * 3 + 2] = dummy_vertex
+
+
+@wp.kernel
+def compact_vertices(
+    positions: wp.array[wp.vec3],
+    flags: wp.array[wp.int32],
+    ranks: wp.array[wp.int32],
+    out_vertices: wp.array[wp.vec3],
+    out_remap: wp.array[wp.int32],
+    out_state: wp.array[wp.int32],
+) -> None:
+    # ``repair.remove_unreferenced_vertices`` with its host readback replaced by the scan it was
+    # reading: ``ranks`` is the inclusive scan of the referenced mask, so ``ranks[v]-1`` is the new
+    # index of vertex ``v`` and its last element is the surviving count. Reads and writes use
+    # different buffers, so this may run over the whole capacity.
+    v = int(wp.tid())
+    kept = ranks[ranks.shape[0] - 1]
+    if v == 0:
+        out_state[DECIMATION_VERTICES] = kept
+    if flags[v] != 0:
+        slot = ranks[v] - 1
+        out_remap[v] = slot
+        out_vertices[slot] = positions[v]
+    else:
+        out_remap[v] = -1
+
+
+@wp.kernel
+def apply_vertex_remap(
+    remap: wp.array[wp.int32], dummy_vertex: wp.int32, out_faces: wp.array[wp.int32]
+) -> None:
+    # In place, one element per corner: a padded corner keeps pointing at the dummy vertex, whose
+    # remap entry is -1 because no face references it.
+    c = int(wp.tid())
+    v = out_faces[c]
+    if v != dummy_vertex:
+        out_faces[c] = remap[v]
+
+
 @wp.kernel
 def quadric_collapse_candidates(
     unique_edges: wp.array2d[wp.int32],
@@ -1609,7 +1918,7 @@ def drop_collapses_past_budget(
 
 @wp.kernel
 def begin_collapse_round(
-    surplus: wp.int32, count: wp.array[wp.int32], out_budget: wp.array[wp.int32]
+    surplus: wp.array[wp.int32], count: wp.array[wp.int32], out_budget: wp.array[wp.int32]
 ) -> None:
     # dim=1, first op of a round: how many collapses this round may still commit.
     #
@@ -1618,8 +1927,11 @@ def begin_collapse_round(
     # budget. The floor of one while nothing has been committed yet is what lets a pass with a
     # surplus of a single face still finish the job; it cannot manufacture a commit, because the
     # budget only ever *trims* an independent set that is already chosen.
+    #
+    # A **device** array rather than a launch argument, because the pass that computes it is itself
+    # replayed as a graph and the face count it comes from never reaches the host.
     _ = int(wp.tid())
-    budget = surplus - count[0]
+    budget = surplus[0] - count[0]
     if count[0] == 0:
         budget = wp.max(budget, wp.int32(1))
     out_budget[0] = wp.max(budget, wp.int32(0))

@@ -249,16 +249,22 @@ def test_delaunay_triangulation(bench_lib: BenchLibrary, n_points: int) -> None:
     do: there is no input mesh, so the work is sized by a plain ``parametrize`` (the same 2-D cloud
     both references see, built once per size outside the timed region).
 
-    !!! note "The seed is the whole story on this axis, and it is now compiled"
-        This group was the largest single loss in the suite -- **370 ms against scipy's 45.8 at
-        20 000 points, of which 337.8 ms (91.3 %) was the host-side seed**, a pure-Python sweep
-        doing ~460 000 ``_orient2d`` calls (n insertions x a ~23-vertex hull boundary) while the
-        device did 2.33 ms of work. Porting that sweep to a single-thread Warp **CPU** kernel took
-        the row to **36.2 ms**, a 1.27x win over scipy; at 2 000 points it went 46.0 -> 18.9 ms and
-        still loses 5.5x, because what remains is the flip loop's 368 launches at ~13.4 us of host
-        marshalling each. The CPU device is not a concession: the identical sweep measures 352 ms
-        in Python, 93 ms in one **CUDA** thread and 1.40 ms in one CPU thread, so a single GPU
-        thread is the wrong tool by a factor of 66. See
+    !!! note "This row was the suite's largest loss, and both halves of it are now compiled"
+        **The seed.** 370 ms against scipy's 45.8 at 20 000 points, of which 337.8 ms (91.3 %) was
+        the host-side seed -- a pure-Python sweep doing ~460 000 ``_orient2d`` calls (n insertions
+        x a ~23-vertex hull boundary) while the device did 2.33 ms of work. Porting that sweep to a
+        single-thread Warp **CPU** kernel took the row to 36.2 ms. The CPU device is not a
+        concession: the identical sweep measures 352 ms in Python, 93 ms in one **CUDA** thread and
+        1.40 ms in one CPU thread, so a single GPU thread is the wrong tool by a factor of 66.
+
+        **The flip loop**, which then dominated the small row. Its cost was not the launch count
+        the first reading blamed: at 962 us of host time per pass, 442 went to
+        [`face_adjacency`][triwarp.adjacency.face_adjacency] and 186 to a *second* radix sort of
+        the same edge keys ``face_adjacency`` had already sorted internally, against ~1.2 ms of
+        device work for the whole 37-pass loop. Since a flip leaves the vertex, face and
+        interior-edge counts alone, that whole working set is invariant and is now built once into
+        fixed buffers by one sort and five launches. **36.1 -> 18.7 ms (1.93x)** at 20 000 points,
+        a 2.4x win over scipy, and **18.7 -> 7.2 ms (2.61x)** at 2 000. See
         [`delaunay_triangulation`][triwarp.reconstruction.delaunay_triangulation].
 
     The three implementations answer the same question by different means: triwarp seeds a

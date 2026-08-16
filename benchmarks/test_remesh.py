@@ -597,8 +597,12 @@ def test_flip_by_objective(bench_case: BenchCase, objective: str) -> None:
 # candidate scoring and the feature/boundary classification had been grouping the same
 # ``3 * n_faces`` rows three times between them — is another **1.31-1.36x** (``saddle`` at 0.1:
 # 148 -> 112 ms; ``saddle_graded``: 193 -> 142), which is ``_classify`` alone going 1 059 -> 100 us.
-# Note that graph capture is **not** available behind any of them: the pass body contains a host
-# readback that decides the loop's exit, and two data-dependent output shapes.
+#
+# What finally moved it was **capturing the pass**, which the note here used to call unavailable:
+# the pass body's host readbacks were replaced by the scans they were reading, every buffer was
+# fixed at a bound the mesh cannot exceed, and one graph is then replayed for every pass. A
+# further **2.6-4.5x** (``saddle`` at 0.1: 115 -> 37 ms), and it makes triwarp the fastest of the
+# five on all four cells where it was 3.1x behind pyvista. See ``remesh._DecimationBuffers``.
 _QUADRIC_RATIOS = [0.5, 0.1]
 
 

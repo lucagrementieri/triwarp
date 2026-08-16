@@ -36,6 +36,7 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_nonempty_mesh
 from triwarp.constants import INT32_MAX, TOLERANCE_MOLLIFY
+from triwarp.kernels import adjacency as kernel_adjacency
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import remesh as kernel_remesh
 from triwarp.kernels import scatter as kernel_scatter
@@ -674,70 +675,62 @@ def _flip_interior_edges(
     conflict-free subset (no two committed flips touch a shared face or create the same new
     edge). Returns the total number of flips performed. The winding rewrite matches MeshLib
     ``flipEdge`` and ``igl::flip_edge``.
+
+    The per-pass topology is built by ``_FlipTopology`` on fixed buffers rather than by composing
+    the public wrappers, which is a measured 1.5-2.6x on the whole call; see it for why.
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0 or max_iter <= 0:
+        return 0
+    topology = _FlipTopology(faces, n_vertices)
+    key_base = wp.uint64(n_vertices)
+    count = wp.zeros(1, dtype=wp.int32, device=device)
     total = 0
     for _ in range(max_iter):
-        edges_sorted = tw.edges.faces_to_edges(faces, sorted=True)
-        adjacency, adjacency_edges = tw.adjacency.face_adjacency(
-            faces, edges_sorted, return_edges=True, n_vertices=n_vertices
-        )
-        m = int(adjacency.shape[0])
+        m = topology.rebuild()
         if m == 0:
             break
-        unshared = tw.adjacency.face_adjacency_unshared(faces, adjacency, adjacency_edges)
-
-        # Sorted table of existing undirected-edge keys, for the "flip would duplicate an edge"
-        # guard. Keys match kernels.grouping.pack_indices (min + max * n_vertices).
-        keys = tw.grouping.hash_indices_rows(edges_sorted, max_index=n_vertices, validate=False)
-        sorted_keys, _order = tw.array.sort_and_argsort(keys)
-
-        out_flip = wp.zeros(m, dtype=wp.bool, device=device)
-        out_quad = twt.empty_2d((m, 4), wp.int32, device=device)
         launch_candidates(
-            adjacency,
-            adjacency_edges,
-            unshared,
-            sorted_keys,
-            wp.uint64(n_vertices),
-            out_flip,
-            out_quad,
+            topology.adjacency,
+            topology.adjacency_edges,
+            topology.unshared,
+            topology.sorted_keys,
+            key_base,
+            topology.flip,
+            topology.quad,
         )
 
         # Independent-set selection: a flip commits only if it wins both incident faces and the
         # hashed slot of its new edge (prevents two disjoint flips creating the same edge).
-        table = 1
-        while table < 4 * m + 1:
-            table <<= 1
-        face_claim = wp.full(n_faces, INT32_MAX, dtype=wp.int32, device=device)
-        edge_claim = wp.full(table, INT32_MAX, dtype=wp.int32, device=device)
+        topology.face_claim.fill_(INT32_MAX)
+        topology.edge_claim.fill_(INT32_MAX)
         wp.launch(
             kernel_remesh.claim_flips,
             dim=m,
             inputs=[
-                out_flip,
-                out_quad,
-                adjacency,
-                wp.int32(table - 1),
-                wp.uint64(n_vertices),
-                face_claim,
-                edge_claim,
+                topology.flip,
+                topology.quad,
+                topology.adjacency,
+                wp.int32(topology.edge_claim_mask),
+                key_base,
+                topology.face_claim,
+                topology.edge_claim,
             ],
             device=device,
         )
-        count = wp.zeros(1, dtype=wp.int32, device=device)
+        count.zero_()
         wp.launch(
             kernel_remesh.commit_flips,
             dim=m,
             inputs=[
-                out_flip,
-                out_quad,
-                adjacency,
-                face_claim,
-                edge_claim,
-                wp.int32(table - 1),
-                wp.uint64(n_vertices),
+                topology.flip,
+                topology.quad,
+                topology.adjacency,
+                topology.face_claim,
+                topology.edge_claim,
+                wp.int32(topology.edge_claim_mask),
+                key_base,
                 faces,
                 count,
             ],
@@ -748,6 +741,154 @@ def _flip_interior_edges(
         if n == 0:
             break
     return total
+
+
+class _FlipTopology:
+    """
+    Persistent per-pass working set of the parallel edge-flip loop.
+
+    The flip loop reruns the same topology build 20-40 times on a face buffer whose *shape* never
+    changes — a flip rewrites two triangles' corners and leaves the vertex, face and interior-edge
+    counts alone — so composing the public wrappers pays for a fresh allocation chain every pass.
+    Measured on ``delaunay_triangulation``: the composed form spent 442 us/pass in
+    [`face_adjacency`][triwarp.adjacency.face_adjacency] and another 186 in
+    [`sort_and_argsort`][triwarp.array.sort_and_argsort] out of 962 us of host time, against ~1.2 ms
+    of device work for the *whole* 37-pass loop.
+
+    Two things collapse here. Every buffer is allocated once and rewritten in place; and the pass
+    sorted its edge keys **twice** — once inside ``face_adjacency``'s row grouping and once again
+    for the "would this flip duplicate an existing edge" table the candidate predicates search —
+    where one radix sort produces both. What remains is one key launch, one sort, a run-length
+    mark, a scan and a single emit launch that writes the adjacency pairs, their shared-edge
+    endpoints and the opposite apexes together.
+
+    Measured back to back in one process, interleaved:
+    ``delaunay_triangulation`` **2.61x** at 2 000 points (18.70 -> 7.16 ms) and **1.93x** at 20 000
+    (36.14 -> 18.70), [`flip_to_delaunay`][triwarp.remesh.flip_to_delaunay] and
+    [`flip_by_objective`][triwarp.remesh.flip_by_objective] 1.50-1.61x,
+    [`isotropic_remesh`][triwarp.remesh.isotropic_remesh] 1.06x (its flip stage is a small share of
+    the iteration). CPU agrees: 1.98-2.08x, 1.51-1.73x, 1.06x. The one row that does not gain is
+    [`intrinsic_delaunay`][triwarp.remesh.intrinsic_delaunay], whose input is already near-Delaunay
+    so the loop exits in one or two passes and the fixed setup is the whole cost -- 1.00x on CUDA
+    and 0.92-0.98x on CPU.
+
+    Every intermediate is byte-identical to the composed path: the keys match
+    [`hash_indices_rows`][triwarp.grouping.hash_indices_rows] over
+    [`faces_to_edges`][triwarp.edges.faces_to_edges] rows (see
+    [`face_edge_keys`][triwarp.kernels.adjacency.face_edge_keys]), and the scan reproduces the
+    ascending-key row order [`group`][triwarp.grouping.group] gets from its ``flatnonzero``
+    compaction.
+
+    Attributes
+    ----------
+    sorted_keys : wp.array[wp.uint64]
+        Length ``3 * n_faces`` ascending undirected-edge keys of the current triangulation, which
+        the candidate predicates binary-search for the duplicate-edge guard.
+    adjacency : twt.Array2dInt32
+        ``(m, 2)`` ascending face pairs sharing an interior edge.
+    adjacency_edges : twt.Array2dInt32
+        ``(m, 2)`` sorted endpoints of each shared edge, row-aligned with ``adjacency``.
+    unshared : twt.Array2dInt32
+        ``(m, 2)`` apex of each incident face opposite the shared edge.
+    flip : wp.array[wp.bool]
+        Length ``m`` candidate mask. Every predicate kernel opens by writing all of it, so it is
+        deliberately not zeroed between passes.
+    quad : twt.Array2dInt32
+        ``(m, 4)`` flip quad ``(a, b, c, d)``, written only where ``flip`` is set.
+    face_claim : wp.array[wp.int32]
+        Length ``n_faces`` per-face winner of the independent-set round.
+    edge_claim : wp.array[wp.int32]
+        Open-addressed claim table over the new edges, one slot per hashed key.
+    edge_claim_mask : int
+        Power-of-two mask for ``edge_claim`` slots.
+    """
+
+    def __init__(self, faces: wp.array[wp.int32], n_vertices: int) -> None:
+        """Allocate the fixed working set for the ``faces`` buffer the loop will mutate in place."""
+        self._faces = faces
+        self._device = faces.device
+        self._n_faces = int(faces.shape[0]) // 3
+        self._n_corners = self._n_faces * 3
+        self._radix = wp.uint64(n_vertices)
+        n = self._n_corners
+        # ``radix_sort_pairs`` ping-pongs through the upper half of both buffers, so each is
+        # double width and only ``[:n]`` is data. The sorted keys are the duplicate-edge table.
+        self._keys = wp.empty(2 * n, dtype=wp.uint64, device=self._device)
+        self._order = wp.empty(2 * n, dtype=wp.int32, device=self._device)
+        self._starts = wp.empty(n, dtype=wp.int32, device=self._device)
+        self._ranks = wp.empty(n, dtype=wp.int32, device=self._device)
+        self._ranks_tail = self._ranks[n - 1 :]
+        self.sorted_keys = self._keys[:n]
+        self.face_claim = wp.empty(self._n_faces, dtype=wp.int32, device=self._device)
+        self._rows = -1
+        self._allocate_rows(0)
+
+    def rebuild(self) -> int:
+        """
+        Regroup the mutated face buffer into interior-edge rows, and return how many there are.
+
+        Every public attribute is rewritten; the returned row count is also the launch dimension
+        for the candidate, claim and commit kernels.
+        """
+        n = self._n_corners
+        wp.launch(
+            kernel_adjacency.face_edge_keys,
+            dim=self._n_faces,
+            inputs=[self._faces, self._radix, self._keys],
+            device=self._device,
+        )
+        wp.launch(
+            kernel_array.init_sort_pair_indices,
+            dim=2 * n,
+            inputs=[wp.int32(n), wp.int32(-1), self._order],
+            device=self._device,
+        )
+        wp.utils.radix_sort_pairs(self._keys, self._order, count=n)
+        wp.launch(
+            kernel_remesh.mark_edge_pair_starts,
+            dim=n,
+            inputs=[self._keys, wp.int32(n), self._starts],
+            device=self._device,
+        )
+        # Inclusive, so the row count is one 4-byte tail read and the emit kernel's row is
+        # ``ranks[i] - 1`` -- the contract ``array.flatnonzero`` uses for the same reason.
+        wp.utils.array_scan(self._starts, out_array=self._ranks, inclusive=True)
+        m = int(self._ranks_tail.numpy()[0])
+        if m == 0:
+            return 0
+        if m != self._rows:
+            # Never taken after the first pass on any mesh measured: the duplicate-edge guard in
+            # ``_resolve_flip_quad_guarded`` is what keeps the exactly-two-corner edge count fixed.
+            self._allocate_rows(m)
+        wp.launch(
+            kernel_remesh.emit_flip_topology,
+            dim=n,
+            inputs=[
+                self._faces,
+                self._order,
+                self._starts,
+                self._ranks,
+                self.adjacency,
+                self.adjacency_edges,
+                self.unshared,
+            ],
+            device=self._device,
+        )
+        return m
+
+    def _allocate_rows(self, m: int) -> None:
+        """(Re)allocate the ``m``-row tables and the hashed edge-claim table sized from them."""
+        self._rows = m
+        self.adjacency = twt.empty_2d((m, 2), wp.int32, device=self._device)
+        self.adjacency_edges = twt.empty_2d((m, 2), wp.int32, device=self._device)
+        self.unshared = twt.empty_2d((m, 2), wp.int32, device=self._device)
+        self.flip = wp.empty(m, dtype=wp.bool, device=self._device)
+        self.quad = twt.empty_2d((m, 4), wp.int32, device=self._device)
+        table = 1
+        while table < 4 * m + 1:
+            table <<= 1
+        self.edge_claim = wp.empty(table, dtype=wp.int32, device=self._device)
+        self.edge_claim_mask = table - 1
 
 
 def cluster_decimate(
@@ -1019,16 +1160,23 @@ def quadric_decimate(
     of the launches, and what is left is the per-pass rebuild, 44 of them, each ~45 wrapper calls
     whose cost is Python rather than either launches or kernels.
 
-    **The per-pass cost does not depend on the mesh**: 4.35 ms at 32 524 faces against 4.15 at
+    **The per-pass cost did not depend on the mesh**: 4.35 ms at 32 524 faces against 4.15 at
     3 484, a 1.05x range over a 9.3x range of size, so the wrapper calls per rebuild — not the
-    kernels, and not the pass count — are the lever. The largest single one was ``_classify``
-    re-deriving what the pass had already grouped, which is why the pass now groups its edges once,
+    kernels, and not the pass count — were the lever. The largest single one was ``_classify``
+    re-deriving what the pass had already grouped, which is why the pass groups its edges once,
     into an ``_EdgeIncidence``, and hands it over: measured back to back, **148 -> 112 ms at
     ``saddle`` 0.1, 193 -> 142 at ``saddle_graded`` 0.1, 47 -> 36 at ``saddle`` 0.5**, i.e.
-    **1.31-1.36x**. Going further means committing more per round (a less conservative lock, which
-    changes the output), or removing the pass's nine host readbacks so the whole outer loop can be
-    captured too; it is **not** more rounds — the loop already stops on saturation at ~5.3 of its
-    8-round cap.
+    **1.31-1.36x**.
+
+    The end of that road is ``_DecimationBuffers``, which removes the pass's host readbacks
+    entirely and replays the whole rebuild as one captured graph — a further **2.6-4.5x**
+    (``saddle`` at 0.1: 115 -> 37 ms, ``capsule``: 95 -> 21), and the point at which this function
+    became the fastest of the five implementations benchmarked rather than 3.1x behind
+    ``pyvista``. Read that class before changing anything here: the pass now runs at a **fixed
+    width** with its live sizes in a device array, which is what makes the replay legal.
+    What is *not* the lever, measured: more rounds (the loop saturates at ~5.3 of its 8-round cap),
+    and narrowing the fixed width (worth 1.01x on the device, since these kernels sit at the launch
+    floor — it is kept only because it is worth 1.3-1.7x on **CPU**, which has no graph to replay).
 
     Four consequences to plan around:
 
@@ -1057,44 +1205,206 @@ def quadric_decimate(
     n_faces = int(faces.shape[0]) // 3
     target = _resolve_decimation_target(target_faces, target_ratio, n_faces)
 
-    current_vertices = wp.clone(vertices)
-    current_faces = wp.clone(faces)
     if n_faces == 0 or target >= n_faces:
-        return current_vertices, current_faces
+        return wp.clone(vertices), wp.clone(faces)
 
-    device = faces.device
-    feature = wp.float32(math.radians(feature_angle))
+    buffers = _DecimationBuffers(vertices, faces, target, wp.float32(math.radians(feature_angle)))
     for _ in range(max_iter):
-        n_current = int(current_faces.shape[0]) // 3
-        if n_current <= target:
+        if not buffers.run_pass():
             break
-        n_vertices = int(current_vertices.shape[0])
+    return buffers.result()
 
-        # One edge grouping per pass, shared by the candidate scoring and ``_classify``.
-        incidence = _edge_incidence(current_faces, n_vertices)
-        unique_edges = incidence.unique_edges
-        m = int(unique_edges.shape[0])
-        if m == 0:
-            break
 
-        codes, _boundary = _classify(current_vertices, current_faces, feature, incidence)
-        csr = tw.graph.edges_to_csr(n_vertices, unique_edges)
-        quadrics = _vertex_quadrics(current_vertices, current_faces)
+class _DecimationBuffers:
+    """
+    The whole working set of [`quadric_decimate`][triwarp.remesh.quadric_decimate], allocated once.
+
+    A decimation pass is **flat in the mesh size** -- 3.13 ms at 32 258 faces and 2.82 ms at 3 227,
+    a 1.11x range over a 10x one -- because only 0.81 ms of it is device work and the rest is the
+    ~77 launches and ~40 wrapper calls that rebuild the geometry. Two measurements say what to do
+    about that. A wrapper chain issued costs 2.69x what the same chain costs replayed from a CUDA
+    graph, because a replay pays for no Python at all; and running every pass at the **pass-0
+    width** instead of the live one costs 1.01x, because the device time barely tracks the size.
+    So the pass is issued once against fixed-capacity buffers and replayed for every pass after.
+
+    The only thing that stopped that was the host readbacks -- ``edges_unique``, ``flatnonzero`` and
+    ``remove_unreferenced_vertices`` each read a count back to size their own output, and a
+    ``memcpy DtoH`` inside a capture is CUDA error 906. Each is replaced here by the scan it was
+    reading, with the count left in ``state`` on the device. Everything else the pass calls --
+    [`edges_to_csr`][triwarp.graph.edges_to_csr] (so ``warp.sparse.bsr_from_triplets``),
+    [`vertex_face_adjacency`][triwarp.adjacency.vertex_face_adjacency],
+    [`sort_and_argsort`][triwarp.array.sort_and_argsort], ``warp.utils.array_scan`` and the round
+    loop's own nested ``wp.capture_while`` -- was measured to capture and replay correctly on
+    Warp 1.16 and is used unchanged.
+
+    Padding is carried by two sentinels rather than by a guard in every kernel: a **dummy vertex**
+    at index ``n_vertices`` that every padded face corner and edge endpoint points at, and a
+    **dummy edge slot** at index ``n_edges`` that every padded corner's ``inverse`` entry points at.
+    See the kernel section in ``kernels/remesh.py`` for why that is enough.
+
+    Attributes
+    ----------
+    state : wp.array[wp.int32]
+        ``[n_faces, n_vertices, n_edges]``, the live prefix lengths. The one array the host reads,
+        once per pass, to decide whether to run another.
+    """
+
+    def __init__(
+        self,
+        vertices: wp.array[wp.vec3],
+        faces: wp.array[wp.int32],
+        target: int,
+        feature: wp.float32,
+    ) -> None:
+        """Allocate at the input's size, which bounds every later pass, and seed the live counts."""
+        device = faces.device
+        self._device: wp.Device = device
+        self._target = target
+        self._feature = feature
+        self._graph = None
+        self._passes = 0
+        self._retain: list = []
+        self.n_faces = int(faces.shape[0]) // 3
+        self.n_vertices = int(vertices.shape[0])
+        self.n_corners = 3 * self.n_faces
+        # An edge collapse removes at least three undirected edges and adds none, so the pass-0
+        # count bounds every later one. It is not known until the first grouping runs, so the
+        # capacity is the structural bound instead; the first pass then narrows nothing.
+        self.n_edges = self.n_corners
+
+        # The dummy vertex lives one past the capacity, so every per-vertex buffer is one longer.
+        v_cap = self.n_vertices + 1
+        self.vertices = wp.zeros(v_cap, dtype=wp.vec3, device=device)
+        wp.copy(self.vertices, vertices, count=self.n_vertices)
+        self.faces = wp.empty(self.n_corners, dtype=wp.int32, device=device)
+        wp.copy(self.faces, faces, count=self.n_corners)
+        self.state = wp.zeros(3, dtype=wp.int32, device=device)
+        self.state.assign([self.n_faces, self.n_vertices, 0])
+
+        n = self.n_corners
+        self._keys = wp.empty(2 * n, dtype=wp.uint64, device=device)
+        self._order = wp.empty(2 * n, dtype=wp.int32, device=device)
+        self._starts = wp.empty(n, dtype=wp.int32, device=device)
+        self._ranks = wp.empty(n, dtype=wp.int32, device=device)
+        self._inverse = wp.empty(n, dtype=wp.int32, device=device)
+        self._unique_edges = twt.empty_2d((self.n_edges, 2), wp.int32, device=device)
+        # One row longer than the edge capacity: the dummy slot every padded corner scatters into.
+        self._edge_face_count = wp.zeros(self.n_edges + 1, dtype=wp.int32, device=device)
+        self._edge_faces = twt.empty_2d((self.n_edges + 1, 2), wp.int32, device=device)
+        self._positions = wp.empty(v_cap, dtype=wp.vec3, device=device)
+        self._vertex_remap = wp.empty(v_cap, dtype=wp.int32, device=device)
+        self._face_flags = wp.empty(self.n_faces, dtype=wp.int32, device=device)
+        self._face_ranks = wp.empty(self.n_faces, dtype=wp.int32, device=device)
+        self._vertex_flags = wp.empty(self.n_vertices, dtype=wp.int32, device=device)
+        self._vertex_ranks = wp.empty(self.n_vertices, dtype=wp.int32, device=device)
+        self._csr_rows = wp.empty(2 * self.n_edges, dtype=wp.int32, device=device)
+        self._csr_columns = wp.empty(2 * self.n_edges, dtype=wp.int32, device=device)
+        self._csr_values = wp.ones(2 * self.n_edges, dtype=wp.float32, device=device)
+        self._half = wp.empty(1, dtype=wp.int32, device=device)
+        self._surplus = wp.empty(1, dtype=wp.int32, device=device)
+        self._count = wp.zeros(1, dtype=wp.int32, device=device)
+
+    def run_pass(self) -> bool:
+        """
+        Run one decimation pass, and report whether another is worth running.
+
+        The first pass is issued -- it is the one that measures the true edge count, which the
+        allocation could only bound structurally at ``3 * n_faces`` -- and the second is captured
+        at that narrower width and replayed by every pass after it. The one host readback per pass
+        is here rather than in the pass body, and covers both the "target reached" and the
+        "nothing legal left to collapse" exits.
+
+        Without a conditional-graph device there is nothing to replay, so the width is re-tightened
+        every pass instead and the pass is issued: that keeps the CPU path tracking the live mesh
+        rather than paying the pass-0 width forever.
+        """
+        counts = self.state.numpy()
+        if int(counts[0]) <= self._target or int(counts[1]) == 0:
+            return False
+        if self._graph is not None:
+            wp.capture_launch(self._graph)
+        else:
+            self._tighten_edges(int(counts[2]))
+            if self._passes > 0 and self._device.is_cuda and wp.is_conditional_graph_supported():
+                with wp.ScopedCapture(self._device) as capture:
+                    self._issue_pass()
+                self._graph = capture.graph
+                wp.capture_launch(self._graph)
+            else:
+                self._issue_pass()
+        self._passes += 1
+        return int(self._count.numpy()[0]) != 0
+
+    def _tighten_edges(self, edges: int) -> None:
+        """
+        Narrow the edge-indexed buffers to a bound the previous pass measured.
+
+        The allocation can only bound the unique-edge count by ``3 * n_faces``, which is 2x the
+        true value on a closed mesh -- and every per-edge kernel, the candidate cost sort and each
+        round's sort run at that width. A collapse removes at least three undirected edges and adds
+        none, so the previous pass's count bounds this one's.
+        """
+        if edges == 0 or edges >= self.n_edges:
+            return
+        device = self._device
+        self.n_edges = edges
+        self._unique_edges = twt.empty_2d((edges, 2), wp.int32, device=device)
+        # One row longer than the edge capacity: the dummy slot every padded corner scatters into.
+        self._edge_face_count = wp.zeros(edges + 1, dtype=wp.int32, device=device)
+        self._edge_faces = twt.empty_2d((edges + 1, 2), wp.int32, device=device)
+        self._csr_rows = wp.empty(2 * edges, dtype=wp.int32, device=device)
+        self._csr_columns = wp.empty(2 * edges, dtype=wp.int32, device=device)
+        self._csr_values = wp.ones(2 * edges, dtype=wp.float32, device=device)
+
+    def result(self) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+        """Copy the live prefixes out of the fixed buffers, which is the only place a size leaks."""
+        counts = self.state.numpy()
+        n_faces, n_vertices = int(counts[0]), int(counts[1])
+        vertices = wp.empty(n_vertices, dtype=wp.vec3, device=self._device)
+        faces = wp.empty(3 * n_faces, dtype=wp.int32, device=self._device)
+        if n_vertices > 0:
+            wp.copy(vertices, self.vertices, count=n_vertices)
+        if n_faces > 0:
+            wp.copy(faces, self.faces, count=3 * n_faces)
+        return vertices, faces
+
+    def _issue_pass(self) -> None:
+        """
+        Issue every launch of one pass, in order. Called once, when the graph is captured.
+
+        Every array this creates is kept in ``self._retain``. ``warp``'s ``Graph`` references the
+        *modules* a captured launch needs but **not its arrays**, so on the face of it an
+        intermediate dropped when this returns has its memory recycled and the replay then writes
+        into whatever took its place. That was probed and **could not be reproduced** -- dropping
+        the list and then churning the mempool with buffers of the intermediates' exact shapes and
+        dtypes still replays correctly, which matches CUDA's graph-memory model, where an
+        allocation made *during* capture becomes a memory node the graph owns. The list is kept
+        anyway because it costs a few object references and the guarantee is the driver's rather
+        than Warp's; do not remove it on the grounds that the probe was clean.
+        """
+        device = self._device
+        dummy = wp.int32(self.n_vertices)
+        incidence = self._group_edges()
+
+        codes, _boundary = _classify(self.vertices, self.faces, self._feature, incidence)
+        wp.launch(kernel_remesh.freeze_dummy_vertex, dim=1, inputs=[dummy, codes], device=device)
+        csr = self._edge_csr(incidence.unique_edges)
+        quadrics = _vertex_quadrics(self.vertices, self.faces)
         face_offsets, vertex_faces = tw.adjacency.vertex_face_adjacency(
-            current_faces, n_vertices=n_vertices
+            self.faces, n_vertices=self.n_vertices + 1
         )
 
-        survivor = wp.full(m, -1, dtype=wp.int32, device=device)
-        removed = wp.empty(m, dtype=wp.int32, device=device)
-        target_pos = wp.empty(m, dtype=wp.vec3, device=device)
-        cost = wp.empty(m, dtype=wp.float32, device=device)
+        survivor = wp.empty(self.n_edges, dtype=wp.int32, device=device)
+        removed = wp.empty(self.n_edges, dtype=wp.int32, device=device)
+        target_pos = wp.empty(self.n_edges, dtype=wp.vec3, device=device)
+        cost = wp.empty(self.n_edges, dtype=wp.float32, device=device)
         wp.launch(
             kernel_remesh.quadric_collapse_candidates,
-            dim=m,
+            dim=self.n_edges,
             inputs=[
-                unique_edges,
-                current_vertices,
-                current_faces,
+                incidence.unique_edges,
+                self.vertices,
+                self.faces,
                 quadrics,
                 codes,
                 incidence.face_count,
@@ -1118,11 +1428,16 @@ def quadric_decimate(
         # why the obvious keys (edge index, or the cost itself) both collapse to one winner a pass
         # on a structured mesh.
         _sorted_cost, order = tw.array.sort_and_argsort(cost)
-        half = wp.array([max(1, m // 2)], dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_remesh.collapse_pass_budgets,
+            dim=1,
+            inputs=[wp.int32(self._target), self.state, self._half, self._surplus],
+            device=device,
+        )
         wp.launch(
             kernel_remesh.drop_collapses_past_budget,
-            dim=m,
-            inputs=[order, half, survivor],
+            dim=self.n_edges,
+            inputs=[order, self._half, survivor],
             device=device,
         )
 
@@ -1134,16 +1449,16 @@ def quadric_decimate(
         # (``drop_locked_candidates`` states the disjointness argument that makes this exact rather
         # than approximate).
         candidates = wp.clone(survivor)
-        locked = wp.zeros(n_vertices, dtype=wp.int32, device=device)
-        min_key = wp.empty(n_vertices, dtype=wp.int32, device=device)
-        claim = wp.empty(n_vertices, dtype=wp.int32, device=device)
-        remap = tw.array.init_range(n_vertices, device)
-        positions = wp.clone(current_vertices)
-        count = wp.zeros(1, dtype=wp.int32, device=device)
+        locked = wp.zeros(self.n_vertices + 1, dtype=wp.int32, device=device)
+        min_key = wp.empty(self.n_vertices + 1, dtype=wp.int32, device=device)
+        claim = wp.empty(self.n_vertices + 1, dtype=wp.int32, device=device)
+        remap = tw.array.init_range(self.n_vertices + 1, device)
+        wp.copy(self._positions, self.vertices)
+        self._count.zero_()
 
-        _run_collapse_rounds(
+        round_scratch = _run_collapse_rounds(
             device,
-            m,
+            self.n_edges,
             csr,
             candidates,
             removed,
@@ -1154,32 +1469,181 @@ def quadric_decimate(
             min_key,
             claim,
             remap,
-            positions,
-            count,
-            (n_current - target) // 2,
+            self._positions,
+            self._count,
+            self._surplus,
+            capture=False,
+        )
+        compaction_scratch = self._compact(remap, dummy)
+        self._retain = [
+            incidence,
+            codes,
+            _boundary,
+            csr,
+            quadrics,
+            face_offsets,
+            vertex_faces,
+            survivor,
+            removed,
+            target_pos,
+            cost,
+            _sorted_cost,
+            order,
+            candidates,
+            locked,
+            min_key,
+            claim,
+            remap,
+            round_scratch,
+            compaction_scratch,
+        ]
+
+    def _group_edges(self) -> _EdgeIncidence:
+        """
+        Group the live face corners into unique edges, with no host readback.
+
+        The same answer as [`_edge_incidence`][triwarp.remesh._edge_incidence] -- and in the same
+        ascending-key edge order, which the lock keys depend on -- from one radix sort instead of
+        ``edges_unique``'s hash table, a compaction scan and a second sort. Padded corners carry a
+        maximal sentinel key so they sort past every real one.
+        """
+        device = self._device
+        n = self.n_corners
+        wp.launch(
+            kernel_remesh.pass_edge_keys,
+            dim=self.n_faces,
+            inputs=[self.faces, self.state, wp.uint64(self.n_vertices + 1), self._keys],
+            device=device,
+        )
+        wp.launch(
+            kernel_array.init_sort_pair_indices,
+            dim=2 * n,
+            inputs=[wp.int32(n), wp.int32(-1), self._order],
+            device=device,
+        )
+        wp.utils.radix_sort_pairs(self._keys, self._order, count=n)
+        wp.launch(
+            kernel_remesh.mark_unique_edge_starts,
+            dim=n,
+            inputs=[self._keys, self.state, self._starts],
+            device=device,
+        )
+        wp.utils.array_scan(self._starts, out_array=self._ranks, inclusive=True)
+        wp.launch(
+            kernel_remesh.emit_unique_edges,
+            dim=n,
+            inputs=[
+                self.faces,
+                self._order,
+                self._starts,
+                self._ranks,
+                self.state,
+                wp.int32(self.n_edges),
+                self._unique_edges,
+                self._inverse,
+                self.state,
+            ],
+            device=device,
+        )
+        wp.launch(
+            kernel_remesh.pad_unique_edge_tail,
+            dim=self.n_edges,
+            inputs=[self.state, wp.int32(self.n_vertices), self._unique_edges],
+            device=device,
+        )
+        self._edge_face_count.zero_()
+        wp.launch(
+            kernel_remesh.scatter_edge_incidence,
+            dim=n,
+            inputs=[self._inverse, self._edge_face_count, self._edge_faces],
+            device=device,
+        )
+        return _EdgeIncidence(
+            self._unique_edges, self._inverse, self._edge_face_count, self._edge_faces
         )
 
-        # One readback per *pass* (not per round, as before): the outer loop needs to know whether
-        # this pass achieved anything at all before paying for another geometry rebuild.
-        committed = int(count.numpy()[0])
-        if committed == 0:
-            break  # nothing legal left to collapse; the target is unreachable from here
+    def _edge_csr(self, unique_edges: twt.Array2dInt32) -> wps.BsrMatrix[wp.Scalar]:
+        """
+        Vertex-vertex adjacency CSR over the live edges.
 
-        remapped = tw.array.gather(remap, current_faces)
-        valid = wp.empty(n_current, dtype=wp.bool, device=device)
+        The matrix [`edges_to_csr`][triwarp.graph.edges_to_csr] builds, split out only to send the
+        padded rows out of range rather than to the dummy vertex; see
+        [`edge_csr_triplets`][triwarp.kernels.remesh.edge_csr_triplets] for why that matters.
+        """
+        wp.launch(
+            kernel_remesh.edge_csr_triplets,
+            dim=self.n_edges,
+            inputs=[unique_edges, self.state, self._csr_rows, self._csr_columns],
+            device=self._device,
+        )
+        return wps.bsr_from_triplets(
+            self.n_vertices + 1,
+            self.n_vertices + 1,
+            self._csr_rows,
+            self._csr_columns,
+            self._csr_values,
+            prune_numerical_zeros=False,
+        )
+
+    def _compact(self, remap: wp.array[wp.int32], dummy: wp.int32) -> list[wp.array]:
+        """
+        Rebuild the face and vertex buffers in place, publishing both new counts to ``state``.
+
+        The tail of ``quadric_decimate``'s pass with its three host readbacks removed: the face
+        compaction's ``flatnonzero`` and both of
+        [`remove_unreferenced_vertices`][triwarp.repair.remove_unreferenced_vertices]'s become the
+        inclusive scans they were reading.
+
+        Returns the arrays it allocated, for [`_issue_pass`][triwarp.remesh._DecimationBuffers]
+        to keep alive across the capture.
+        """
+        device = self._device
+        remapped = tw.array.gather(remap, self.faces)
+        valid = wp.empty(self.n_faces, dtype=wp.bool, device=device)
         wp.launch(
             kernel_remesh.faces_with_distinct_indices,
-            dim=n_current,
+            dim=self.n_faces,
             inputs=[remapped, valid],
             device=device,
         )
-        kept = tw.array.flatnonzero(valid)
-        current_faces = tw.array.gather(remapped.reshape((n_current, 3)), kept).reshape(-1)
-        current_vertices, current_faces, _remap = tw.repair.remove_unreferenced_vertices(
-            positions, current_faces
+        wp.utils.array_cast(valid, self._face_flags)
+        wp.utils.array_scan(self._face_flags, out_array=self._face_ranks, inclusive=True)
+        wp.launch(
+            kernel_remesh.compact_faces,
+            dim=self.n_faces,
+            inputs=[remapped, self._face_flags, self._face_ranks, dummy, self.faces, self.state],
+            device=device,
         )
 
-    return current_vertices, current_faces
+        referenced = wp.zeros(self.n_vertices + 1, dtype=wp.bool, device=device)
+        wp.launch(
+            kernel_scatter.mark_membership_mask,
+            dim=self.n_corners,
+            inputs=[self.faces, wp.int32(self.n_vertices + 1), referenced],
+            device=device,
+        )
+        wp.utils.array_cast(referenced[: self.n_vertices], self._vertex_flags)
+        wp.utils.array_scan(self._vertex_flags, out_array=self._vertex_ranks, inclusive=True)
+        wp.launch(
+            kernel_remesh.compact_vertices,
+            dim=self.n_vertices,
+            inputs=[
+                self._positions,
+                self._vertex_flags,
+                self._vertex_ranks,
+                self.vertices,
+                self._vertex_remap,
+                self.state,
+            ],
+            device=device,
+        )
+        wp.launch(
+            kernel_remesh.apply_vertex_remap,
+            dim=self.n_corners,
+            inputs=[self._vertex_remap, dummy, self.faces],
+            device=device,
+        )
+        return [remapped, valid, referenced]
 
 
 def _run_collapse_rounds(
@@ -1197,8 +1661,9 @@ def _run_collapse_rounds(
     remap: wp.array[wp.int32],
     positions: wp.array[wp.vec3],
     count: wp.array[wp.int32],
-    surplus: int,
-) -> None:
+    surplus: wp.array[wp.int32],
+    capture: bool = True,
+) -> list[wp.array]:
     """
     Commit independent sets of collapses against one scoring, until a round finds nothing new.
 
@@ -1226,10 +1691,17 @@ def _run_collapse_rounds(
     A budget-exhausted pass therefore stops the same way a saturated one does: the budget goes to
     zero, ``drop_collapses_past_budget`` retires everything, nothing commits, and
     ``end_collapse_round`` sees no progress.
+
+    Returns
+    -------
+    list of wp.array
+        This loop's own scratch, returned only so that a caller which is itself capturing
+        (``capture=False``) can keep it alive; see ``_DecimationBuffers._issue_pass`` for why that
+        is defensive rather than known to be required.
     """
     budget = wp.zeros(1, dtype=wp.int32, device=device)
     round_state = wp.zeros(3, dtype=wp.int32, device=device)
-    round_state.assign([0, 0, 1])
+    wp.launch(kernel_remesh.reset_collapse_rounds, dim=1, inputs=[round_state], device=device)
     # Sort scratch, allocated here rather than inside the body: ``radix_sort_pairs`` wants
     # double-width key and payload buffers, and a captured graph replays the *same* pointers, so the
     # scratch cannot be allocated per round.
@@ -1240,7 +1712,7 @@ def _run_collapse_rounds(
         wp.launch(
             kernel_remesh.begin_collapse_round,
             dim=1,
-            inputs=[wp.int32(surplus), count, budget],
+            inputs=[surplus, count, budget],
             device=device,
         )
         wp.launch(
@@ -1315,12 +1787,15 @@ def _run_collapse_rounds(
         )
 
     condition = round_state[2:3]
-    if device.is_cuda and wp.is_conditional_graph_supported():
-        with wp.ScopedCapture(device) as capture:
+    if capture and device.is_cuda and wp.is_conditional_graph_supported():
+        with wp.ScopedCapture(device) as capture_scope:
             wp.capture_while(condition, round_body)
-        wp.capture_launch(capture.graph)
+        wp.capture_launch(capture_scope.graph)
     else:
+        # ``capture=False`` when the caller is already capturing: a conditional graph nests, so the
+        # round loop becomes an inner ``while`` node of the pass graph rather than its own.
         wp.capture_while(condition, round_body)
+    return [budget, round_state, sort_keys, sort_values]
 
 
 def _resolve_decimation_target(
