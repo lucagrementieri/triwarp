@@ -508,6 +508,11 @@ def test_uv_seam_edges_matches_igl_port(request: pytest.FixtureRequest, mesh_nam
     igl's output order is an ``unordered_set`` walk and triwarp's is halfedge order, so both sides
     are lexsorted first -- exact on integer rows. Run with an explicit ``FTC`` so the *index*
     predicate, the one MeshLab cannot express, is the thing under test.
+
+    Each block is pinned to a per-fixture count first, because a block that is empty on both sides
+    compares equal and asserts nothing. Measured: 5 seams and 2 foldovers on either fixture, and 0
+    boundaries on ``icosahedron`` against 24 on ``hemisphere`` -- a closed mesh has no UV boundary
+    to report, so there the emptiness *is* the claim rather than a gap in the comparison.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     faces_np = np.ascontiguousarray(mesh_tm.faces, dtype=np.int32)
@@ -528,6 +533,8 @@ def test_uv_seam_edges_matches_igl_port(request: pytest.FixtureRequest, mesh_nam
     )
 
     assert seams_igl.shape[0] > 0
+    assert foldovers_igl.shape[0] > 0
+    assert (boundaries_igl.shape[0] == 0) == mesh_tm.is_watertight
     assert np.array_equal(lexsort_rows(seams_wp.numpy()), lexsort_rows(seams_igl))
     assert np.array_equal(lexsort_rows(boundaries_wp.numpy()), lexsort_rows(boundaries_igl))
     assert np.array_equal(lexsort_rows(foldovers_wp.numpy()), lexsort_rows(foldovers_igl))

@@ -20,6 +20,29 @@ def _assert_longest_ray_allclose(distances_wp_np: np.ndarray, distances_tm_np: n
         )
 
 
+def _upward_rays(mesh_tm: tm.Trimesh, n: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    ``n`` rays starting below the mesh and firing ``+z``, with origins inside its xy footprint.
+
+    Drawing the origins from the unit square instead put every one of them outside the x-extent of
+    both the ``icosahedron`` and ``hemisphere`` fixtures -- each translated by ``(-1, 0, 2)`` -- so
+    all three ``intersects_*`` comparisons below ran on 256 misses, asserted that two all-miss
+    answers agree, and duplicated their own ``_miss`` siblings. Measured after the fix: 208 of 256
+    rays hit the icosahedron and 197 the hemisphere. The ``_miss`` tests keep their own
+    construction, which misses for a robust reason -- firing ``+y`` from below never leaves the
+    plane ``z = min_z - 5`` -- rather than by an accident of where the fixture sits.
+    """
+    rng = np.random.default_rng(seed)
+    origins_np = np.column_stack(
+        (
+            rng.uniform(mesh_tm.bounds[0, :2], mesh_tm.bounds[1, :2], size=(n, 2)),
+            np.full(n, mesh_tm.bounds[0, 2] - 5.0),
+        )
+    ).astype(np.float32)
+    directions_np = np.tile([0.0, 0.0, 1.0], (n, 1)).astype(np.float32)
+    return origins_np, directions_np
+
+
 def test_contains_points(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = icosahedron
     rng = np.random.default_rng(7)
@@ -112,12 +135,9 @@ def test_contains_empty_points(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
 def test_intersects_first(request: pytest.FixtureRequest, mesh_name: str):
+    """Class A: the first-hit face index agrees with trimesh's ray engine, ray for ray."""
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    rng = np.random.default_rng(0)
-    n = 256
-    origins_np = rng.random((n, 3)).astype(np.float32)
-    directions_np = np.tile([0.0, 0.0, 1.0], (n, 1)).astype(np.float32)
-    origins_np[:, 2] = mesh_tm.bounds[0, 2] - 5.0
+    origins_np, directions_np = _upward_rays(mesh_tm, 256, seed=0)
 
     origins_wp = wp.array(
         np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
@@ -127,6 +147,8 @@ def test_intersects_first(request: pytest.FixtureRequest, mesh_name: str):
     )
     triangle_wp = tw.ray.intersects_first(mesh_wp, origins_wp, directions_wp).numpy()
     triangle_tm = mesh_tm.ray.intersects_first(origins_np, directions_np)
+    # Without this the test still passes on two all-miss answers; see _upward_rays.
+    assert (triangle_tm != -1).any()
     assert np.array_equal(triangle_wp, triangle_tm)
 
 
@@ -151,12 +173,9 @@ def test_intersects_first_miss(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
 def test_intersects_any(request: pytest.FixtureRequest, mesh_name: str):
+    """Class A: the per-ray hit mask agrees with trimesh's, and both answers carry hits."""
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    rng = np.random.default_rng(0)
-    n = 256
-    origins_np = rng.random((n, 3)).astype(np.float32)
-    directions_np = np.tile([0.0, 0.0, 1.0], (n, 1)).astype(np.float32)
-    origins_np[:, 2] = mesh_tm.bounds[0, 2] - 5.0
+    origins_np, directions_np = _upward_rays(mesh_tm, 256, seed=0)
 
     origins_wp = wp.array(
         np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
@@ -166,6 +185,8 @@ def test_intersects_any(request: pytest.FixtureRequest, mesh_name: str):
     )
     hit_wp = tw.ray.intersects_any(mesh_wp, origins_wp, directions_wp).numpy()
     hit_tm = mesh_tm.ray.intersects_any(origins_np, directions_np)
+    # An all-False mask matches an all-False mask; see _upward_rays.
+    assert hit_tm.any()
     assert np.array_equal(hit_wp, hit_tm)
 
 
@@ -190,12 +211,15 @@ def test_intersects_any_miss(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
 def test_intersects_location(request: pytest.FixtureRequest, mesh_name: str):
+    """
+    Class B (row order): the ``(ray, face)`` hit pairs equal trimesh's after a shared lexsort.
+
+    triwarp emits one row per hit in BVH order and trimesh in its own, so both sides are ordered
+    by ``(ray, face)`` first -- exact on integer rows. The hit *positions* are checked by
+    [`test_intersects_location_cave_cube`], which has an analytic answer to compare against.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    rng = np.random.default_rng(0)
-    n = 256
-    origins_np = rng.random((n, 3)).astype(np.float32)
-    directions_np = np.tile([0.0, 0.0, 1.0], (n, 1)).astype(np.float32)
-    origins_np[:, 2] = mesh_tm.bounds[0, 2] - 5.0
+    origins_np, directions_np = _upward_rays(mesh_tm, 256, seed=0)
 
     origins_wp = wp.array(
         np.ascontiguousarray(origins_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
@@ -209,6 +233,8 @@ def test_intersects_location(request: pytest.FixtureRequest, mesh_name: str):
     ray_wp_np = ray_wp.numpy()
     order_wp = np.lexsort((tri_wp_np, ray_wp_np))
     order_tm = np.lexsort((tri_tm, ray_tm))
+    # Two empty hit tables compare equal, which is what this test used to do; see _upward_rays.
+    assert tri_tm.size > 0
     assert np.array_equal(tri_wp_np[order_wp], tri_tm[order_tm])
     assert np.array_equal(ray_wp_np[order_wp], ray_tm[order_tm])
 

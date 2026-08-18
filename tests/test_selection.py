@@ -223,12 +223,9 @@ def test_submesh_from_face_mask(request: pytest.FixtureRequest, mesh_name: str) 
 
 @pytest.mark.parametrize("face_mode", ["all", "any"])
 def test_face_indices_from_vertex_indices(request: pytest.FixtureRequest, face_mode: str) -> None:
+    """Class A: both ``face_mode`` branches equal the numpy predicate, face index for face index."""
     mesh_tm, mesh_wp = request.getfixturevalue("icosahedron")
-    rng = np.random.default_rng(11)
-    n_vertices = mesh_tm.vertices.shape[0]
-    vertex_indices_np = rng.choice(n_vertices, size=max(1, n_vertices // 4), replace=False).astype(
-        np.int32
-    )
+    vertex_indices_np = _vertex_selection(mesh_tm, seed=11, fraction=4)
     vertex_indices = wp.array(vertex_indices_np, dtype=wp.int32, device=mesh_wp.points.device)
 
     face_indices_wp = tw.selection.face_indices_from_vertex_indices(
@@ -237,6 +234,8 @@ def test_face_indices_from_vertex_indices(request: pytest.FixtureRequest, face_m
     face_indices_ref_np = _face_indices_from_vertex_indices_np(
         mesh_tm.faces, vertex_indices_np, face_mode=face_mode
     )
+    # Two empty face lists compare equal, which is what the "all" branch used to do.
+    assert face_indices_ref_np.size > 0
     assert np.array_equal(face_indices_wp.numpy(), face_indices_ref_np)
 
 
@@ -260,6 +259,8 @@ def test_submesh_from_vertex_indices(request: pytest.FixtureRequest, face_mode: 
     face_indices_np = _face_indices_from_vertex_indices_np(
         mesh_tm.faces, vertex_indices_np, face_mode=face_mode
     )
+    # half_torus is dense enough that "all" selects 8 faces here; keep it that way.
+    assert face_indices_np.size > 0
     submesh_tm = tm.util.submesh(mesh_tm, [face_indices_np], repair=False, append=False)[0]
     got_vertices_wp, got_faces_wp = tw.selection.submesh_from_vertex_indices(
         mesh_wp.points, mesh_wp.indices, vertex_indices, face_mode=face_mode
@@ -270,11 +271,15 @@ def test_submesh_from_vertex_indices(request: pytest.FixtureRequest, face_mode: 
 
 @pytest.mark.parametrize("face_mode", ["all", "any"])
 def test_submesh_from_vertex_mask(request: pytest.FixtureRequest, face_mode: str) -> None:
+    """
+    The mask form and the index form of the same selection agree, in both ``face_mode`` branches.
+
+    Not a reference comparison -- it pins the two entry points to each other, so the oracle for the
+    selection rule itself is [`test_face_indices_from_vertex_indices`].
+    """
     mesh_tm, mesh_wp = request.getfixturevalue("hemisphere")
-    rng = np.random.default_rng(17)
-    n_vertices = mesh_tm.vertices.shape[0]
-    vertex_mask_np = np.zeros(n_vertices, dtype=bool)
-    selected = rng.choice(n_vertices, size=max(3, n_vertices // 5), replace=False)
+    selected = _vertex_selection(mesh_tm, seed=17, fraction=5)
+    vertex_mask_np = np.zeros(mesh_tm.vertices.shape[0], dtype=bool)
     vertex_mask_np[selected] = True
     vertex_mask = wp.array(vertex_mask_np, dtype=wp.bool, device=mesh_wp.points.device)
 
@@ -284,11 +289,30 @@ def test_submesh_from_vertex_mask(request: pytest.FixtureRequest, face_mode: str
     exp_vertices_wp, exp_faces_wp = tw.selection.submesh_from_vertex_indices(
         mesh_wp.points,
         mesh_wp.indices,
-        wp.array(selected.astype(np.int32), dtype=wp.int32, device=mesh_wp.points.device),
+        wp.array(selected, dtype=wp.int32, device=mesh_wp.points.device),
         face_mode=face_mode,
     )
+    # Two empty submeshes compare equal, which is what the "all" branch used to do.
+    assert exp_faces_wp.shape[0] > 0
     assert np.allclose(got_vertices_wp.numpy(), exp_vertices_wp.numpy())
     assert np.array_equal(got_faces_wp.numpy(), exp_faces_wp.numpy())
+
+
+def _vertex_selection(mesh_tm: tm.Trimesh, seed: int, fraction: int) -> np.ndarray:
+    """
+    Draw a random vertex selection that is guaranteed to contain at least one *whole* face.
+
+    ``face_mode="all"`` keeps a face only when all three of its corners are selected, which a
+    sparse random draw essentially never produces: at ``n // 4`` of the icosahedron's 12 vertices
+    and ``n // 5`` of the hemisphere's 97, the measured answer was **0 faces**, so both sides of
+    the comparison were empty and the ``all`` half of the parametrisation asserted nothing. Seeding
+    the draw with the corners of every fourth face fixes that without giving up the random part.
+    """
+    rng = np.random.default_rng(seed)
+    n_vertices = mesh_tm.vertices.shape[0]
+    random_np = rng.choice(n_vertices, size=max(3, n_vertices // fraction), replace=False)
+    whole_faces_np = mesh_tm.faces[:: max(1, mesh_tm.faces.shape[0] // 4)].reshape(-1)
+    return np.union1d(random_np, whole_faces_np).astype(np.int32)
 
 
 def _face_indices_from_vertex_indices_np(
