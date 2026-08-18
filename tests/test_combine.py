@@ -8,20 +8,8 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-from tests.comparisons import lexsort_rows
+from tests.comparisons import boundary_loop_sizes, lexsort_rows
 from triwarp.combine import _non_increasing_indices
-
-
-def _fillable_loops(vertices: wp.array, faces: wp.array) -> list[wp.array]:
-    return [loop for loop in tw.boundary.boundary_loops(vertices, faces) if int(loop.shape[0]) >= 3]
-
-
-def _loop_sizes_of(vertices: wp.array, faces: wp.array) -> list[int]:
-    return [int(loop.shape[0]) for loop in _fillable_loops(vertices, faces)]
-
-
-def _loop_sizes(mesh_wp: wp.Mesh) -> list[int]:
-    return _loop_sizes_of(mesh_wp.points, mesh_wp.indices)
 
 
 def _cone(
@@ -127,7 +115,7 @@ def test_stitch_requires_single_boundary_multi(half_torus: tuple[tm.Trimesh, wp.
     _, mesh_wp = half_torus
     _, _, va, fa = _cone_wp(device=str(mesh_wp.device), n=10, apex_z=-1.0, rim_z=0.0)
 
-    assert len(_loop_sizes(mesh_wp)) >= 2
+    assert len(boundary_loop_sizes(mesh_wp.indices.numpy().reshape(-1, 3))) >= 2
     with pytest.raises(ValueError, match="exactly one boundary loop"):
         tw.combine.stitch(mesh_wp.points, mesh_wp.indices, va, fa)
 
@@ -274,7 +262,7 @@ def test_stitch_smooth_watertight(device: str):
     verts_np = new_vertices.numpy()
     mesh_tm = tm.Trimesh(verts_np, new_faces.numpy().reshape(-1, 3), process=False)
 
-    assert len(_loop_sizes_of(new_vertices, new_faces)) == 0
+    assert boundary_loop_sizes(new_faces.numpy().reshape(-1, 3)) == []
     assert mesh_tm.is_watertight
     assert mesh_tm.is_winding_consistent
     # Original vertices are the concatenated prefix, unchanged.

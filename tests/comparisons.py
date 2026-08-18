@@ -120,6 +120,74 @@ def open_edge_count(faces_np: np.ndarray) -> int:
     return int((edge_multiplicity(faces_np) == 1).sum())
 
 
+def boundary_loop_sizes(faces_np: np.ndarray, min_size: int = 3) -> list[int]:
+    """
+    Vertex counts of the boundary loops, traced in numpy, largest first.
+
+    The host-side description of a mesh's holes that hole-filling assertions need: how many loops,
+    and how many vertices each spans, so a fill can be checked to have added ``size - 2`` faces per
+    loop. ``test_combine.py`` and ``test_holes.py`` each carried three private helpers that read the
+    same numbers off [`boundary_loops`][triwarp.boundary.boundary_loops] instead -- byte-identical
+    between the two files -- and the counts do not need a device round trip.
+
+    Boundary edges are the multiplicity-1 rows of
+    [`edge_multiplicity`][tests.comparisons.edge_multiplicity], and the loops are the connected
+    cycles they form.
+
+    Sizes come back sorted, so this is for *counts* and *multisets* of sizes only. A test pairing a
+    loop's size with another per-loop quantity needs them in one consistent order and should read
+    both off ``boundary_loops`` (see ``test_fill_fan_preserve_largest``, which indexes sizes by the
+    argmax of the perimeters).
+
+    Parameters
+    ----------
+    faces_np
+        ``(n_faces, 3)`` vertex indices. A flat triwarp face buffer needs ``.reshape(-1, 3)`` first.
+    min_size
+        Drop loops shorter than this. The default matches what the hole fillers call *fillable*: a
+        loop of one or two vertices spans no triangle.
+
+    Raises
+    ------
+    ValueError
+        If a boundary vertex has other than two incident boundary edges, which makes "the loop
+        through it" ambiguous. Tracing on regardless would return a plausible wrong number, so this
+        refuses rather than guessing.
+    """
+    edges_np = undirected_edges(faces_np)
+    unique_np, counts_np = np.unique(edges_np, axis=0, return_counts=True)
+    boundary_np = unique_np[counts_np == 1]
+    if boundary_np.size == 0:
+        return []
+
+    neighbours: dict[int, list[int]] = {}
+    for first, second in boundary_np.tolist():
+        neighbours.setdefault(first, []).append(second)
+        neighbours.setdefault(second, []).append(first)
+    ambiguous = sorted(vertex for vertex, ends in neighbours.items() if len(ends) != 2)
+    if ambiguous:
+        raise ValueError(
+            f"vertices {ambiguous[:8]} have other than two incident boundary edges, so their "
+            "boundary loop is not well defined"
+        )
+
+    sizes = []
+    unvisited = set(neighbours)
+    while unvisited:
+        start = min(unvisited)
+        vertex, previous, size = start, -1, 0
+        while True:
+            unvisited.discard(vertex)
+            size += 1
+            first, second = neighbours[vertex]
+            step = first if first != previous else second
+            vertex, previous = step, vertex
+            if vertex == start:
+                break
+        sizes.append(size)
+    return sorted((size for size in sizes if size >= min_size), reverse=True)
+
+
 def canonical_labels(labels_np: np.ndarray) -> np.ndarray:
     """
     Relabel a partition by first occurrence, so two labellings of it compare elementwise.

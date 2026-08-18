@@ -10,7 +10,7 @@ import trimesh.grouping as tm_grouping
 import warp as wp
 
 import triwarp as tw
-from tests.comparisons import assert_cyclic_permutation_equal, lexsort_rows
+from tests.comparisons import assert_cyclic_permutation_equal, boundary_loop_sizes, lexsort_rows
 from tests.conversions import pyvista_edges_to_indices, trimesh_to_pymeshlab, trimesh_to_pyvista
 
 # Open-surface fixtures that actually have a boundary (watertight solids do not).
@@ -207,6 +207,50 @@ def test_boundary_loops_matches_trimesh_outline(
         strict=True,
     ):
         assert_cyclic_permutation_equal(loop_wp, loop_tm)
+
+
+@pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus", "icosahedron"])
+def test_boundary_loop_sizes_helper_agrees_with_boundary_loops(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A: the numpy loop tracer in ``tests.comparisons`` reproduces ``boundary_loops``' sizes.
+
+    [`boundary_loop_sizes`][tests.comparisons.boundary_loop_sizes] is used as an *oracle* by the
+    hole-filling tests, so it needs one of its own -- a wrong tracer would silently weaken every
+    assert built on it. ``boundary_loops`` is the right thing to check it against here because it is
+    itself pinned element-wise against ``igl.boundary_loop_all`` and ``Trimesh.outline()`` two tests
+    up. Measured: 24 on ``hemisphere``, 32 and 32 on ``half_torus``, none on ``icosahedron``.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+
+    sizes_np = boundary_loop_sizes(np.asarray(mesh_tm.faces))
+
+    loops_wp = tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices)
+    expected = sorted(
+        (int(loop_wp.shape[0]) for loop_wp in loops_wp if int(loop_wp.shape[0]) >= 3), reverse=True
+    )
+    assert sizes_np == expected
+    assert (len(expected) == 0) == bool(mesh_tm.is_watertight)
+
+
+def test_boundary_loop_sizes_refuses_a_pinched_rim(device: str) -> None:
+    """
+    Two rims meeting at one vertex have no well-defined loop through it, and the helper says so.
+
+    Tracing on regardless would return a plausible wrong count rather than an error, which is the
+    failure mode an oracle can least afford. Built by opening two holes in an icosphere that share a
+    vertex -- reachable from ordinary face deletion, not a contrived mesh.
+    """
+    sphere_tm = tm.creation.icosphere(subdivisions=2, radius=1.0)
+    centers_np = sphere_tm.triangles_center
+    keep_np = np.ones(sphere_tm.faces.shape[0], dtype=bool)
+    keep_np[np.argsort(-centers_np[:, 2])[:6]] = False
+    keep_np[np.argsort(centers_np[:, 2])[:2]] = False
+    holed_tm = tm.Trimesh(sphere_tm.vertices, sphere_tm.faces[keep_np], process=False)
+
+    with pytest.raises(ValueError, match="two incident boundary edges"):
+        boundary_loop_sizes(np.asarray(holed_tm.faces))
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)

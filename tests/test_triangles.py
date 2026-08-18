@@ -314,7 +314,7 @@ def test_nondegenerate(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
 
 def test_barycentric_to_points(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = hemisphere
-    barycentric_np = np.random.rand(mesh_tm.triangles.shape[0], 3)
+    barycentric_np = np.random.default_rng(31).random((mesh_tm.triangles.shape[0], 3))
     points_tm = tm.triangles.barycentric_to_points(mesh_tm.triangles, barycentric_np)
 
     barycentric_wp = wp.array(barycentric_np, dtype=wp.vec3, device=mesh_wp.points.device)
@@ -339,7 +339,7 @@ def test_points_to_barycentric(hemisphere: tuple[tm.Trimesh, wp.Mesh], method: s
     """
     mesh_tm, mesh_wp = hemisphere
 
-    barycentric_np = np.random.rand(mesh_tm.triangles.shape[0], 3)
+    barycentric_np = np.random.default_rng(32).random((mesh_tm.triangles.shape[0], 3))
     points_np = tm.triangles.barycentric_to_points(mesh_tm.triangles, barycentric_np)
     barycentric_tm = tm.triangles.points_to_barycentric(mesh_tm.triangles, points_np, method=method)
     barycentric_igl = igl.barycentric_coordinates(
@@ -359,7 +359,7 @@ def test_points_to_barycentric(hemisphere: tuple[tm.Trimesh, wp.Mesh], method: s
 
 def test_closest_point(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = hemisphere
-    points_np = np.random.rand(mesh_tm.triangles.shape[0], 3)
+    points_np = np.random.default_rng(33).random((mesh_tm.triangles.shape[0], 3))
     closest_points_tm = tm.triangles.closest_point(mesh_tm.triangles, points_np)
 
     points_wp = wp.array(points_np, dtype=wp.vec3, device=mesh_wp.points.device)
