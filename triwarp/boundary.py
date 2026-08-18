@@ -326,7 +326,8 @@ def _unoriented_boundary_cycles(
     real boundary edge. Two references get it wrong in different ways and neither is worth
     matching -- ``igl.boundary_loop_all`` cuts that cycle into ``1 + 39 + 38`` open chains (each
     has exactly one consecutive pair that is *not* a boundary edge) and ``boundary_loop`` reports
-    the longest of them as 39; MeshLib's hole ring reads 156.
+    the longest of them as 39, while a half-edge hole ring walks the band's *double* cover and reads
+    156.
 
     The mirror filter and the re-pack run on the host, over a buffer bounded by the **boundary**
     rather than by the mesh, and only ever on a non-orientable surface.
