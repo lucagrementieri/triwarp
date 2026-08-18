@@ -11,9 +11,10 @@ import pytest
 import pyvista as pv
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.conversions import trimesh_to_open3d, trimesh_to_pyvista
+from tests.conversions import trimesh_to_meshlib, trimesh_to_open3d, trimesh_to_pyvista
 
 _MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
 
@@ -32,12 +33,12 @@ def _bounds_np(lower_wp: wp.vec3, upper_wp: wp.vec3) -> np.ndarray:
 
 
 @pytest.mark.parametrize("mesh_name", _MESHES)
-@pytest.mark.parity("aabb_bounds", "trimesh", "open3d", "igl")
+@pytest.mark.parity("aabb_bounds", "trimesh", "open3d", "igl", "meshlib")
 def test_aabb_bounds_matches_trimesh_open3d_and_igl(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     """
-    The axis-aligned bounding box against all three references: class A on two, class B on igl.
+    The axis-aligned bounding box against all four references: class A on three, class B on igl.
 
     Trivial to compute and trivial to get subtly wrong -- a reduction that seeds its accumulator at
     zero rather than at +/-inf returns a box clamped to the origin, which is correct for any mesh
@@ -51,6 +52,12 @@ def test_aabb_bounds_matches_trimesh_open3d_and_igl(
     ``2**3 = 8`` corner *vertices* plus the 12 triangles of the box hull, so the named transform is
     to reduce those 8 corners back to a min/max pair. That is a genuinely different output shape for
     the same answer, and reducing it is exact.
+
+    MeshLib's ``computeBoundingBox`` is class A and returns a ``Box3f`` -- ``.min`` / ``.max``, the
+    two corners directly. Its ``region`` argument is passed ``None`` for the whole mesh; note that
+    it takes the *topology* as well as the points, so on a mesh with unreferenced vertices it would
+    box only the referenced ones, where triwarp's takes the point buffer alone. Every fixture here
+    references every vertex, so the two coincide.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     lower_wp, upper_wp = tw.bounds.aabb_bounds(mesh_wp.points)
@@ -70,6 +77,11 @@ def test_aabb_bounds_matches_trimesh_open3d_and_igl(
     assert faces_igl.shape == (12, 3), "and the 12 triangles of its hull"
     bounds_igl = np.stack([corners_igl.min(axis=0), corners_igl.max(axis=0)])
     assert np.allclose(bounds_wp, bounds_igl, rtol=1e-5, atol=1e-5)
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    box_ml = mm.computeBoundingBox(mesh_ml.topology, mesh_ml.points, None)
+    bounds_ml = np.stack([[*box_ml.min], [*box_ml.max]])
+    assert np.allclose(bounds_wp, bounds_ml, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("mesh_name", _MESHES)

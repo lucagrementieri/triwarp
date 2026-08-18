@@ -40,6 +40,7 @@ import potpourri3d as pp3d
 import pytest
 import trimesh as tm
 from conftest import BenchCase, skip_larger_than
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -189,8 +190,24 @@ def test_edges_unique_inverse(bench_case) -> None:
 
 
 @pytest.mark.benchmark(group="edges_unique_length")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "meshlib")
 def test_edges_unique_length(bench_case) -> None:
+    """
+    One length per undirected edge, which on both sides is really a deduplication.
+
+    meshlib's ``edgeLengths`` reads its half-edge structure rather than sorting, so its row prices a
+    different route to the same answer -- and the structure is lazily built and cached on the
+    topology like the AABB tree, so the mesh is built inside the timed callable to keep that build
+    inside the measurement, matching the dedup the other two rows pay for.
+    """
+    if bench_case.kind == "meshlib":
+
+        def run_ml() -> int:
+            mesh_ml = bench_case.new_mesh_ml()
+            return mm.edgeLengths(mesh_ml.topology, mesh_ml.points).size()
+
+        assert bench_case.run(run_ml) > 0
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         nv = bench_case.n_vertices
@@ -263,7 +280,7 @@ def test_mean_edge_length(bench_case) -> None:
 
 
 @pytest.mark.benchmark(group="mean_unique_edge_length")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pymeshlab", "meshlib")
 def test_mean_unique_edge_length(bench_case) -> None:
     """
     The **unique** edge average, where the deduplication is most of the cost.
@@ -276,8 +293,18 @@ def test_mean_unique_edge_length(bench_case) -> None:
 
     The interesting comparison is the dedup: triwarp reaches the unique edges through a sort where
     the numpy row goes through ``np.unique(axis=0)``, which is why this group is several times the
-    cost of its per-face twin on both sides.
+    cost of its per-face twin on both sides. meshlib is a fifth row on the same number and a sixth
+    route to it -- its half-edge structure, built inside the timed callable for the reason the
+    ``edges_unique_length`` group above gives.
     """
+    if bench_case.kind == "meshlib":
+
+        def run_ml() -> float:
+            mesh_ml = bench_case.new_mesh_ml()
+            return mm.averageEdgeLength(mesh_ml.topology, mesh_ml.points)
+
+        assert bench_case.run(run_ml) > 0.0
+        return
     if bench_case.kind == "pymeshlab":
         # ``get_geometric_measures`` is read-only and returns ``avg_edge_length`` alongside the
         # area, volume, barycentre and inertia tensor -- one call for all of them, so this row is an

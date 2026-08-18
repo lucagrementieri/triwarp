@@ -8,9 +8,17 @@ import potpourri3d as pp3d
 import pytest
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.conversions import faces_igl, trimesh_to_open3d, trimesh_to_pymeshlab, trimesh_to_pyvista
+from tests.conversions import (
+    faces_igl,
+    trimesh_to_meshlib,
+    trimesh_to_open3d,
+    trimesh_to_pymeshlab,
+    trimesh_to_pyvista,
+)
 
 
 @pytest.mark.parity("face_normals_and_areas", "trimesh")
@@ -263,6 +271,72 @@ def test_face_angles_extremes_against_pyvista(half_torus: tuple[tm.Trimesh, wp.M
     )
     # Non-vacuous: on a mesh of congruent equilateral faces both columns would read 60 everywhere.
     assert np.ptp(np.asarray(quality_pv.cell_data["min_angle"])) > 1.0
+
+
+@pytest.mark.parity("face_normals_and_areas", "meshlib")
+@pytest.mark.parity(
+    "face_centroids",
+    "meshlib",
+    benchmarked=False,
+    reason="MeshLib's triCenter is per *face*, so a batched row would be a Python loop over the "
+    "face buffer and would time the loop rather than MeshLib -- 49-67x the batched cost where a "
+    "batched form exists at all (section 6). It is a sound correctness oracle at fixture size, "
+    "which is what this test uses it as. igl and pyvista carry the timed rows for this group.",
+)
+@pytest.mark.parity(
+    "face_quality",
+    "meshlib",
+    benchmarked=False,
+    reason="triangleAspectRatio is per *face*, same as triCenter above: batching it means a Python "
+    "loop, and that row would price the loop. It is the strongest correctness oracle this group "
+    "has -- exactly 0.0 difference against metric='aspect_ratio', where pyvista names the same "
+    "quantity radius_ratio and igl gives it only as a ratio of two other arrays -- so the "
+    "comparison belongs here and the timing stays with igl / pymeshlab / pyvista.",
+)
+def test_per_face_quantities_match_meshlib(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A for three per-face families at once, all element-wise in face order.
+
+    MeshLib is the fourth independent implementation of these, and it is the one that pins two
+    conventions the others leave open. Its ``computePerFaceNormals`` is **normalized** (|n| = 1 to
+    6e-08 measured), unlike pymeshlab's ``face_normal_matrix()``, which is the raw cross product at
+    magnitude ``2 * area``; and its ``triangleAspectRatio`` is exactly the measure
+    [`face_quality`][triwarp.triangles.face_quality] calls ``aspect_ratio`` -- **0.0** difference,
+    where pyvista names the same quantity ``radius_ratio`` and igl gives it only as a ratio of two
+    other arrays.
+
+    One named transform, the same one ``igl.doublearea`` needs: ``dblArea`` is twice the area.
+    Everything else is direct. Three of MeshLib's four entry points here are **per-face** rather
+    than batched, so they are looped on the reference side -- fine in a test at this size, and the
+    reason ``benchmarks/`` reads those rows as an upper bound (see section 6).
+
+    Testing the three together is deliberate: they come out of the same corner load, so a
+    fixture-level disagreement (a converter dropping a vertex, a face buffer reshaped wrong) shows
+    up in all three at once and is distinguishable from a real per-quantity bug.
+    """
+    mesh_tm, mesh_wp = half_torus
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    topology_ml, points_ml = mesh_ml.topology, mesh_ml.points
+    n_faces = int(mesh_wp.indices.shape[0]) // 3
+    assert topology_ml.numValidFaces() == n_faces > 0  # non-vacuity, and the converter's own check
+
+    normals_wp, areas_wp = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
+    normals_ml = mn.toNumpyArray(mm.computePerFaceNormals(mesh_ml))
+    assert np.allclose(np.linalg.norm(normals_ml, axis=1), 1.0, atol=1e-6)
+    assert np.allclose(normals_wp.numpy(), normals_ml, rtol=1e-5, atol=1e-5)
+
+    faces_ml = [mm.FaceId(f) for f in range(n_faces)]
+    areas_ml = np.array([mm.dblArea(topology_ml, points_ml, f) / 2.0 for f in faces_ml])
+    assert np.allclose(areas_wp.numpy(), areas_ml, rtol=1e-5, atol=1e-5)
+
+    centroids_ml = np.array([[*mm.triCenter(topology_ml, points_ml, f)] for f in faces_ml])
+    centroids_wp = tw.triangles.face_centroids(mesh_wp.points, mesh_wp.indices)
+    assert np.allclose(centroids_wp.numpy(), centroids_ml, rtol=1e-5, atol=1e-5)
+
+    aspect_ml = np.array([mm.triangleAspectRatio(topology_ml, points_ml, f) for f in faces_ml])
+    aspect_wp = tw.triangles.face_quality(mesh_wp.points, mesh_wp.indices, metric="aspect_ratio")
+    assert np.ptp(aspect_ml) > 0.1  # non-vacuity: a constant would pass any tolerance
+    assert np.allclose(aspect_wp.numpy(), aspect_ml, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parity("face_quality", "igl")

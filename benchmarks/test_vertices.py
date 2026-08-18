@@ -61,6 +61,8 @@ import pytest
 import trimesh as tm
 import warp as wp
 from conftest import BenchCase
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 import triwarp.typing as twt
@@ -152,10 +154,23 @@ def test_mean_vertex_normals(bench_case: BenchCase) -> None:
 )
 @pytest.mark.benchmark(group="area_weighted_vertex_normals")
 @pytest.mark.benchaxis("valence")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab", "meshlib")
 def test_area_weighted_vertex_normals(bench_case: BenchCase) -> None:
-    """Area-weighted scatter, uniform valence 6 against two 40 960-valence hubs."""
+    """
+    Area-weighted scatter, uniform valence 6 against two 40 960-valence hubs.
+
+    meshlib's ``computePerVertNormals`` is this weighting exactly -- 1.19e-07, and its
+    angle-weighted sibling ``computePerVertPseudoNormals`` is 6.8e-03 away, which is what
+    tests/test_vertices.py::test_vertex_normal_weightings_match_meshlib pins. It is also the only
+    **multi-threaded** row in this group, so read the ratio against ``triwarp-cuda`` and not against
+    ``triwarp-cpu``. Pure, so the mesh is built once outside the timed callable.
+    """
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        normals_ml = bench_case.run(lambda: mm.computePerVertNormals(mesh_ml))
+        assert normals_ml.size() == n_vertices
+        return
     if bench_case.kind == "pymeshlab":  # 'By Area' is triwarp's weighting exactly
         meshset_pml = bench_case.meshset_pml
         bench_case.run(lambda: meshset_pml.compute_normal_per_vertex(weightmode="By Area"))
@@ -183,7 +198,7 @@ def test_area_weighted_vertex_normals(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="vertex_defects")
 @pytest.mark.benchaxis("valence")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pyvista")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pyvista", "meshlib")
 def test_vertex_defects(bench_case: BenchCase) -> None:
     """
     The angle defect ``2π - Σθ``: the accumulation axis's cheapest member.
@@ -205,7 +220,17 @@ def test_vertex_defects(bench_case: BenchCase) -> None:
     **pyvista does more**: ``curvature('gaussian')`` is the defect divided by the barycentric lumped
     area, so its row includes an area pass and a division. The transform is named and asserted in
     ``tests/test_vertices.py``; here it means the row is not a floor but a ceiling.
+
+    meshlib's ``mn.getNumpyGaussianCurvature`` is the batched form and the one to use: its
+    per-vertex ``mm.discreteGaussianCurvature`` gives bit-identical values but needs a Python loop,
+    which measured 49-67x slower on 642 vertices and would time the loop rather than MeshLib.
     """
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        n_vertices = bench_case.n_vertices
+        defects_ml = bench_case.run(lambda: mn.getNumpyGaussianCurvature(mesh_ml))
+        assert defects_ml.shape == (n_vertices,)
+        return
     n_vertices = bench_case.n_vertices
     if bench_case.kind == "pyvista":
         mesh_pv = bench_case.mesh_pv

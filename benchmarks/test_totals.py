@@ -40,12 +40,13 @@ import numpy as np
 import pytest
 import trimesh as tm
 from conftest import BenchCase, skip_larger_than
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
 
 @pytest.mark.benchmark(group="surface_centroid")
-@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab", "meshlib")
 def test_surface_centroid(bench_case: BenchCase) -> None:
     """
     The area-weighted shell centroid: one pass over the faces plus two host readbacks.
@@ -55,7 +56,17 @@ def test_surface_centroid(bench_case: BenchCase) -> None:
     that one pays three for ten sums. Also the row that covers *both* reduction kernels:
     ``centroid_tiled`` on CUDA and ``centroid_sliced`` on CPU, picked by
     ``_device.prefers_tiled_reduction``, measured 1.67x apart at 327k faces.
+
+    meshlib's ``findCenterFromFaces`` is this exact quantity and nothing more -- unlike the
+    pymeshlab row above, which returns five measures at once. Note it has a sibling,
+    ``findCenterFromPoints``, which is the plain vertex mean and belongs to
+    [`points.centroid`][triwarp.points.centroid]; tests/test_totals.py holds the two apart.
     """
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        centre_ml = bench_case.run(lambda: mm.findCenterFromFaces(mesh_ml.topology, mesh_ml.points))
+        assert np.isfinite([*centre_ml]).all()
+        return
     if bench_case.kind == "pymeshlab":
         # ``get_geometric_measures``' ``barycenter`` is the vertex mean and ``shell_barycenter`` the
         # area-weighted centroid triwarp computes; the call returns both plus the area, volume and
@@ -83,7 +94,7 @@ def test_surface_centroid(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="moments")
-@pytest.mark.benchlibs("triwarp", "igl", "trimesh", "pyvista")
+@pytest.mark.benchlibs("triwarp", "igl", "trimesh", "pyvista", "meshlib")
 def test_moments(bench_case: BenchCase) -> None:
     """
     Volume, centre of mass and inertia tensor: ten ``float64`` sums over the faces.

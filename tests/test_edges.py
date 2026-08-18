@@ -9,10 +9,17 @@ import pytest
 import trimesh as tm
 import trimesh.grouping as tm_grouping
 import warp as wp
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.comparisons import assert_unordered_rows_equal, lexsort_rows
-from tests.conversions import pyvista_edges_to_indices, trimesh_to_pymeshlab, trimesh_to_pyvista
+from tests.conversions import (
+    meshlib_scalars_to_numpy,
+    pyvista_edges_to_indices,
+    trimesh_to_meshlib,
+    trimesh_to_pymeshlab,
+    trimesh_to_pyvista,
+)
 
 _MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
 
@@ -342,7 +349,7 @@ def test_edges_unique_inverse_standalone(request: pytest.FixtureRequest, mesh_na
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
-@pytest.mark.parity("edges_unique_length", "trimesh")
+@pytest.mark.parity("edges_unique_length", "trimesh", "meshlib")
 def test_edges_unique_length(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
     Class B: the unique edge lengths as a sorted multiset, since the row orders differ.
@@ -351,6 +358,12 @@ def test_edges_unique_length(request: pytest.FixtureRequest, mesh_name: str) -> 
     here: the pairing is pinned separately by [`test_edges_unique`] plus
     [`test_edges_unique_inverse`]. The reference lengths come from a ``float32`` copy of the
     vertices, so this is not measuring triwarp's precision against numpy's.
+
+    MeshLib's ``edgeLengths`` is the second reference and needs the same sort -- it indexes by
+    ``UndirectedEdgeId``, which is its own numbering. Its answer comes back as an
+    ``UndirectedEdgeScalars`` container, which ``np.asarray`` turns into a 0-d ``object`` array
+    rather than raising, so it goes through
+    [`tests.conversions.meshlib_scalars_to_numpy`][] (section 6).
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
@@ -365,8 +378,13 @@ def test_edges_unique_length(request: pytest.FixtureRequest, mesh_name: str) -> 
     lengths_wp = tw.edges.edges_unique_length(vertices_wp, mesh_wp.indices)
     lengths_wp_np = lengths_wp.numpy()
 
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    lengths_ml = meshlib_scalars_to_numpy(mm.edgeLengths(mesh_ml.topology, mesh_ml.points))
+
     # lengths are unordered — sort both for comparison
+    assert lengths_wp_np.shape == lengths_ml.shape  # non-vacuity, and MeshLib's own edge count
     assert np.allclose(np.sort(lengths_wp_np), np.sort(lengths_tm), rtol=1e-4, atol=1e-4)
+    assert np.allclose(np.sort(lengths_wp_np), np.sort(lengths_ml), rtol=1e-4, atol=1e-4)
 
 
 def test_edges_unique_length_precomputed(device: str) -> None:
@@ -462,7 +480,7 @@ def test_mean_edge_length(request: pytest.FixtureRequest, mesh_name: str) -> Non
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
-@pytest.mark.parity("mean_unique_edge_length", "igl", "pymeshlab", "trimesh")
+@pytest.mark.parity("mean_unique_edge_length", "igl", "pymeshlab", "trimesh", "meshlib")
 @pytest.mark.parity("mean_edge_length", "igl")
 @pytest.mark.parity("edges_length", "igl")
 def test_edge_length_averages_match_their_references(
@@ -486,6 +504,10 @@ def test_edge_length_averages_match_their_references(
 
     The per-face length *table* is class B: igl's ``(n_faces, 3)`` uses its opposite-edge corner
     convention against triwarp's flat face-order buffer, so rows are sorted before comparing.
+
+    MeshLib's ``averageEdgeLength`` is a fourth reference for the unique-edge average specifically,
+    and it settles *which* mean it computes -- undirected edges, once each -- which is the whole
+    distinction this test exists to hold. It has no counterpart for the per-face average.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
@@ -506,6 +528,8 @@ def test_edge_length_averages_match_their_references(
     assert np.isclose(unique_wp, float(igl.avg_edge_length(vertices_np, faces_np)), rtol=1e-4)
     measures_pml = trimesh_to_pymeshlab(mesh_tm).get_geometric_measures()
     assert np.isclose(unique_wp, float(measures_pml["avg_edge_length"]), rtol=1e-4)
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    assert np.isclose(unique_wp, mm.averageEdgeLength(mesh_ml.topology, mesh_ml.points), rtol=1e-4)
 
     # And the numpy dedup, which is the formula the trimesh benchmark row uses.
     edges_np = np.unique(np.sort(tm.geometry.faces_to_edges(mesh_tm.faces), axis=1), axis=0)

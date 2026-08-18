@@ -5,9 +5,17 @@ import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.conversions import faces_igl, trimesh_to_open3d, trimesh_to_pymeshlab, trimesh_to_pyvista
+from tests.conversions import (
+    faces_igl,
+    trimesh_to_meshlib,
+    trimesh_to_open3d,
+    trimesh_to_pymeshlab,
+    trimesh_to_pyvista,
+)
 
 
 @pytest.mark.parity("area_weighted_vertex_normals", "open3d", "pymeshlab")
@@ -181,6 +189,55 @@ def test_area_weighted_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     assert np.allclose(vertex_normals_wp.numpy(), vertex_normals_igl, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parity("area_weighted_vertex_normals", "meshlib")
+@pytest.mark.parity(
+    "angle_weighted_vertex_normals",
+    "meshlib",
+    benchmarked=False,
+    reason="angle_weighted_vertex_normals has no benchmark group of its own -- the vertices module "
+    "times mean_vertex_normals and area_weighted_vertex_normals, and a third row would price the "
+    "same scatter under a third weight. computePerVertPseudoNormals is nonetheless the only "
+    "reference in the suite that pins this weighting exactly (1.19e-07, against 6.8e-03 for the "
+    "area-weighted one), so the comparison belongs here.",
+)
+def test_vertex_normal_weightings_match_meshlib(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A, and the reason to have it: MeshLib pins *which* weighting each name means.
+
+    The pairing is not guessable from the names and was found by measuring all six combinations.
+    ``computePerVertNormals`` is the **area**-weighted sum and ``computePerVertPseudoNormals`` is
+    the **angle**-weighted one; each matches its triwarp partner to **1.19e-07** and sits
+    **6.8e-03** from the other's, which is four orders of magnitude of separation and far more than
+    any tolerance argument. ``mean_vertex_normals`` matches neither (4.5e-03 from the nearer), so
+    it keeps its own oracles and is asserted here only to be *different* -- without that, a
+    regression collapsing all three weightings to one would still pass the two positive asserts.
+
+    No other reference in the suite distinguishes these: igl exposes an area mode and trimesh an
+    angle-weighted one, but neither can say what the other's name would mean.
+    """
+    mesh_tm, mesh_wp = half_torus
+    n_vertices = mesh_tm.vertices.shape[0]
+    vertices_wp = wp.array(mesh_tm.vertices, dtype=wp.vec3, device=mesh_wp.device)
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    area_ml = mn.toNumpyArray(mm.computePerVertNormals(mesh_ml))
+    angle_ml = mn.toNumpyArray(mm.computePerVertPseudoNormals(mesh_ml))
+
+    area_wp = tw.vertices.area_weighted_vertex_normals(n_vertices, vertices_wp, mesh_wp.indices)
+    angle_wp = tw.vertices.angle_weighted_vertex_normals(n_vertices, vertices_wp, mesh_wp.indices)
+    face_normals_wp, _ = tw.triangles.face_normals_and_areas(vertices_wp, mesh_wp.indices)
+    mean_wp = tw.vertices.mean_vertex_normals(n_vertices, mesh_wp.indices, face_normals_wp)
+
+    assert area_ml.shape == (n_vertices, 3)  # non-vacuity: the converter kept every vertex
+    assert np.allclose(area_wp.numpy(), area_ml, rtol=1e-5, atol=1e-5)
+    assert np.allclose(angle_wp.numpy(), angle_ml, rtol=1e-5, atol=1e-5)
+
+    # The separation, without which the two asserts above would not pin a weighting at all.
+    assert not np.allclose(area_wp.numpy(), angle_ml, atol=1e-4)
+    assert not np.allclose(angle_wp.numpy(), area_ml, atol=1e-4)
+    assert not np.allclose(mean_wp.numpy(), area_ml, atol=1e-4)
+
+
 def test_area_weighted_vertex_normals_precomputed(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = half_torus
 
@@ -289,16 +346,23 @@ def test_sine_and_edge_length_weighted_vertex_normals(half_torus: tuple[tm.Trime
 
 
 @pytest.mark.parametrize("mesh_name", ["half_torus", "icosahedron"])
-@pytest.mark.parity("vertex_defects", "trimesh", "igl")
+@pytest.mark.parity("vertex_defects", "trimesh", "igl", "meshlib")
 def test_vertex_defects(request: pytest.FixtureRequest, mesh_name: str):
     """
-    Class A on both references, on an open fixture and a closed one.
+    Class A on all three references, on an open fixture and a closed one.
 
-    ``igl.gaussian_curvature`` is the *pointwise* angle defect ``2π - Σθ`` -- the same quantity
-    ``tm.curvature.vertex_defects`` returns and emphatically **not** the ball-integrated
-    Cohen-Steiner/Morvan measure ``curvature.discrete_gaussian_curvature`` computes, which is
-    exempted from parity against MeshLab for exactly that reason. Sharing a name with a different
-    measure is the whole hazard here, so the comparison is worth having twice over.
+    ``igl.gaussian_curvature`` and MeshLib's ``mn.getNumpyGaussianCurvature`` are both the
+    *pointwise* angle defect ``2π - Σθ`` -- the same quantity ``tm.curvature.vertex_defects``
+    returns and emphatically **not** the ball-integrated Cohen-Steiner/Morvan measure
+    ``curvature.discrete_gaussian_curvature`` computes, which is exempted from parity against
+    MeshLab for exactly that reason. Sharing a name with a different measure is the whole hazard
+    here, so the comparison is worth having three times over -- and MeshLib is the one to be
+    careful with, because it is the reference whose *name* says curvature while its value is the
+    defect.
+
+    MeshLib's batched ``mn.getNumpyGaussianCurvature`` is used rather than the per-vertex
+    ``mm.discreteGaussianCurvature``; the two are bit-identical (measured 0.0) and the batched form
+    is 49-67x faster, which is section 6's rule about its per-vertex entry points.
 
     Both fixtures are needed because the interesting disagreement would be at the **boundary**: a
     reference could reasonably use ``π - Σθ`` there. Measured, none of the three does --
@@ -316,8 +380,16 @@ def test_vertex_defects(request: pytest.FixtureRequest, mesh_name: str):
     face_angles_wp = wp.array(mesh_tm.face_angles, dtype=wp.float32, device=mesh_wp.device)
     vertex_defects_wp = tw.vertices.vertex_defects(n_vertices, mesh_wp.indices, face_angles_wp)
 
+    vertex_defects_ml = mn.getNumpyGaussianCurvature(trimesh_to_meshlib(mesh_tm))
+
+    # Non-vacuity: an implementation returning zeros passes any allclose against another one, and
+    # on a nearly-flat patch that is what the true answer looks like. Neither the spread nor the
+    # minimum is the check -- an icosahedron is regular so all 12 read pi/3, and half_torus has
+    # genuinely near-flat vertices at 4e-05 -- so the claim is that the answer is not all zero.
+    assert np.abs(vertex_defects_tm).max() > 1e-2
     assert np.allclose(vertex_defects_wp.numpy(), vertex_defects_tm, rtol=1e-5, atol=1e-5)
     assert np.allclose(vertex_defects_wp.numpy(), vertex_defects_igl, rtol=1e-5, atol=1e-5)
+    assert np.allclose(vertex_defects_wp.numpy(), vertex_defects_ml, rtol=1e-4, atol=1e-5)
 
 
 @pytest.mark.parametrize("mesh_name", ["half_torus", "icosahedron", "hemisphere"])

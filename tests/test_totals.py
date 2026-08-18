@@ -13,25 +13,42 @@ import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.conversions import faces_igl, trimesh_to_pymeshlab, trimesh_to_pyvista, trimesh_to_warp
+from tests.conversions import (
+    faces_igl,
+    trimesh_to_meshlib,
+    trimesh_to_pymeshlab,
+    trimesh_to_pyvista,
+    trimesh_to_warp,
+)
 
 CLOSED_MESHES = ["icosahedron", "cave_cube"]
 OPEN_MESHES = ["hemisphere", "half_torus"]
 ALL_MESHES = CLOSED_MESHES + OPEN_MESHES
 
 
+@pytest.mark.parity("moments", "meshlib")
 def test_volume(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     """
-    Class A: the divergence-theorem volume against ``Trimesh.volume``.
+    Class A: the divergence-theorem volume against ``Trimesh.volume`` and MeshLib's ``volume``.
 
     A closed mesh is required for the integral to mean anything, which is why the fixture is
     closed and the open-mesh behaviour is not asserted here.
+
+    The parity marker names the ``moments`` group rather than a group of its own, because that is
+    where the integral family is timed and MeshLib's ``volume`` sits in it exactly as pyvista's
+    ``PolyData.volume`` does -- the volume alone, no centre of mass and no inertia tensor. Its
+    ``region`` argument defaults to the whole mesh, which is the comparison; triwarp has no
+    per-region form, so nothing is left untested by passing ``None``.
     """
     mesh_tm, mesh_wp = icosahedron
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+
     volume_wp = tw.totals.volume(mesh_wp.points, mesh_wp.indices)
     assert np.isclose(volume_wp, mesh_tm.volume, rtol=1e-5, atol=1e-5)
+    assert np.isclose(volume_wp, mm.volume(mesh_ml.topology, mesh_ml.points), rtol=1e-5, atol=1e-5)
 
 
 def test_volume_inward_normals_negative(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
@@ -56,21 +73,38 @@ def test_volume_empty(device: str):
     assert tw.totals.volume(vertices, faces) == 0.0
 
 
-@pytest.mark.parity("surface_centroid", "trimesh")
+@pytest.mark.parity("surface_centroid", "trimesh", "meshlib")
 def test_surface_centroid(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     """
-    Class A: the area-weighted surface centroid against ``Trimesh.centroid``.
+    Class A: the area-weighted surface centroid against ``Trimesh.centroid`` and MeshLib's.
 
     An open fixture, because on a closed symmetric mesh the centroid sits at the origin and a
-    wrongly-weighted sum lands there too.
+    wrongly-weighted sum lands there too -- and this fixture is translated as well, so a function
+    returning the origin fails rather than passing by luck.
+
+    MeshLib carries **two** centres and picking the wrong one would still pass a symmetric fixture:
+    ``findCenterFromFaces`` is the area-weighted surface centroid triwarp computes, while
+    ``findCenterFromPoints`` is the plain vertex mean that [`centroid`][triwarp.points.centroid]
+    computes. The final assert holds them apart -- measured 2.63 apart on ``half_torus`` -- so a
+    future rebinding to the other one cannot pass quietly.
     """
     mesh_tm, mesh_wp = hemisphere
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
 
     centroid_tm = mesh_tm.centroid
+    centroid_ml = np.array([*mm.findCenterFromFaces(mesh_ml.topology, mesh_ml.points)])
 
     centroid_wp = tw.totals.surface_centroid(mesh_wp.points, mesh_wp.indices)
     centroid_wp = np.array([centroid_wp.x, centroid_wp.y, centroid_wp.z])
     assert np.allclose(centroid_wp, centroid_tm, rtol=1e-5, atol=1e-5)
+    assert np.allclose(centroid_wp, centroid_ml, rtol=1e-5, atol=1e-5)
+
+    # The vertex mean is a different point, and is triwarp's points.centroid rather than this.
+    vertex_mean_ml = np.array([*mm.findCenterFromPoints(mesh_ml.topology, mesh_ml.points)])
+    assert not np.allclose(centroid_wp, vertex_mean_ml, atol=1e-3)
+    assert np.allclose(
+        tw.points.centroid(mesh_wp.points).numpy()[0], vertex_mean_ml, rtol=1e-5, atol=1e-5
+    )
 
 
 @pytest.mark.parametrize("kernel_device", ["cpu", "cuda:0"])

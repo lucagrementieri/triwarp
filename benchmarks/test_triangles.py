@@ -39,6 +39,7 @@ import pytest
 import trimesh as tm
 import warp as wp
 from conftest import BenchCase
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -59,10 +60,26 @@ def _barycentres_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
 
 
 @pytest.mark.benchmark(group="face_normals_and_areas")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "open3d", "potpourri3d", "pymeshlab", "pyvista")
+@pytest.mark.benchlibs(
+    "triwarp", "trimesh", "igl", "open3d", "potpourri3d", "pymeshlab", "pyvista", "meshlib"
+)
 def test_face_normals_and_areas(bench_case: BenchCase) -> None:
-    """One cross product per face: the operator prologue every solver in the library pays."""
+    """
+    One cross product per face: the operator prologue every solver in the library pays.
+
+    The meshlib row is ``computePerFaceNormals`` alone -- normals, not areas -- for the same reason
+    pymeshlab's is: its area entry point ``dblArea`` is **per face**, so batching it would mean a
+    Python loop over the face buffer, and that row would time the loop rather than MeshLib (see
+    section 6). Both halves are still compared for correctness, in
+    tests/test_triangles.py::test_per_face_quantities_match_meshlib. Pure, so the mesh is built once
+    outside the timed callable.
+    """
     n_faces = bench_case.n_faces
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        normals_ml = bench_case.run(lambda: mm.computePerFaceNormals(mesh_ml))
+        assert normals_ml.size() == n_faces
+        return
     if bench_case.kind == "pyvista":  # both halves, in two filters -- see the module docstring
         mesh_pv = bench_case.mesh_pv
         areas_pv = bench_case.run(

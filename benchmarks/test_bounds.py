@@ -62,6 +62,7 @@ import pytest
 import trimesh as tm
 import warp as wp
 from conftest import BenchCase
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -99,14 +100,25 @@ def _queries_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
 
 
 @pytest.mark.benchmark(group="aabb_bounds")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "igl", "pyvista")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "igl", "pyvista", "meshlib")
 def test_aabb_bounds(bench_case: BenchCase) -> None:
     """
     A min/max reduce over the vertices, and the suite's clearest host-latency floor.
 
     VTK caches nothing but returns the box interleaved per axis (``xmin, xmax, ymin, ...``), which
     is a layout the test decodes and this row does not care about.
+
+    meshlib's ``computeBoundingBox`` returns the two corners directly and is the only row here that
+    is **multi-threaded**, which on a reduce this cheap mostly prices its own fork-join -- read it
+    against ``triwarp-cuda``, not ``triwarp-cpu``.
     """
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        box_ml = bench_case.run(
+            lambda: mm.computeBoundingBox(mesh_ml.topology, mesh_ml.points, None)
+        )
+        assert box_ml.min.x <= box_ml.max.x
+        return
     if bench_case.kind == "pyvista":
         mesh_pv = bench_case.mesh_pv
         bounds_pv = bench_case.run(lambda: np.asarray(mesh_pv.bounds))
