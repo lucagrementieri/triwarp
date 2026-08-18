@@ -117,8 +117,14 @@ def test_assemble_interior_system_matches_a_numpy_partition(device: str) -> None
     The CSR-to-CSR extraction is the one that replaced a ``bsr_from_triplets`` round trip, and the
     ``nnz`` assert is the quieter half of that change: ``bsr_from_triplets`` would have left the
     count at the *triplet* count (here ``q.nnz``, 144 against the true 81), so every downstream
-    ``bsr_mv`` was dimensioned for the unreduced matrix. Measured on this system, both blocks agree
-    with NumPy **exactly** -- the extraction copies entries rather than recomputing them.
+    ``bsr_mv`` was dimensioned for the unreduced matrix. The count here is exact.
+
+    ``Q_uu`` is compared with ``np.array_equal`` deliberately: the extraction *copies* entries
+    rather than recomputing them, so it is bit-exact on both devices (measured ``0.0`` on each). The
+    right-hand side accumulates the pinned-column contributions, and there the devices differ --
+    exact on CUDA, one ulp out on the CPU backend (8.9e-16 absolute, 1.1e-16 relative), because the
+    row scan sums them in a different order. Asserting equality on that half passed here and failed
+    the CPU gate.
     """
     matrix_wp, fixed_wp, fixed_values_wp, dense_np, values_np, fixed_np = _pinned_system(device)
     free_map_wp, n_free = tw.linalg.free_partition(fixed_wp)
@@ -131,8 +137,11 @@ def test_assemble_interior_system_matches_a_numpy_partition(device: str) -> None
     pinned_np = np.flatnonzero(fixed_np)
     assert q_uu.nnz_sync() == n_free * n_free
     assert np.array_equal(bsr_to_dense(q_uu, n_free), dense_np[np.ix_(free_np, free_np)])
-    assert np.array_equal(
-        rhs_wp.numpy(), -(dense_np[np.ix_(free_np, pinned_np)] @ values_np[:, pinned_np].T).T
+    assert np.allclose(
+        rhs_wp.numpy(),
+        -(dense_np[np.ix_(free_np, pinned_np)] @ values_np[:, pinned_np].T).T,
+        rtol=1e-14,
+        atol=1e-14,
     )
 
 
