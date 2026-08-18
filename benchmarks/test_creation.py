@@ -638,14 +638,24 @@ def test_torus(bench_lib: BenchLibrary, sections: int) -> None:
 
 
 @pytest.mark.benchmark(group="revolve")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "meshlib")
 @pytest.mark.parametrize("sections", _SECTIONS)
 def test_revolve(bench_lib: BenchLibrary, sections: int) -> None:
     # The shared engine, timed directly on a 64-point profile so the per-slice work dominates the
-    # fixed host prologue. No open3d counterpart.
+    # fixed host prologue. No open3d counterpart; meshlib's ``makeSolidOfRevolution`` is the third
+    # sweep and builds the identical mesh -- same counts, area and bounding box
+    # (``tests/test_creation.py``). Its profile is a ``std_vector_Vector2_float``, filled per point
+    # outside the timed callable like every other row's input.
     profile_np = np.column_stack(
         (1.0 + 0.25 * np.cos(np.linspace(0.0, np.pi, 64)), np.linspace(-1.0, 1.0, 64))
     )
+    if bench_lib.kind == "meshlib":
+        profile_ml = mm.std_vector_Vector2_float()
+        for point_np in profile_np:
+            profile_ml.append(mm.Vector2f(float(point_np[0]), float(point_np[1])))
+        mesh_ml = bench_lib.run(lambda: mm.makeSolidOfRevolution(profile_ml, sections))
+        assert mesh_ml.topology.numValidFaces() == 2 * 63 * sections
+        return
     if bench_lib.kind == "triwarp":
         device = bench_lib.device
         profile_wp = wp.array(

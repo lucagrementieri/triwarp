@@ -300,6 +300,40 @@ def test_primitives_match_meshlib(device: str) -> None:
             assert np.isclose(mesh_ref.bounds[0, 2], 0.0, atol=1e-5), name
 
 
+@pytest.mark.parity("revolve", "meshlib")
+def test_revolve_matches_meshlib(device: str) -> None:
+    """
+    Class A, exactly: ``makeSolidOfRevolution`` sweeps the same profile into the same mesh.
+
+    Same vertex count, face count, area and bounding box on a four-point profile at 16 sections --
+    49 vertices, 80 faces, area 5.0059, box ``[-0.5, -0.5, 0] .. [0.5, 0.5, 2]``. Both revolve about
+    ``+z`` with the profile in the ``(radius, height)`` plane and both close the seam, which is what
+    the vertex count pins: a sweep that duplicated the seam ring would give 52.
+
+    The reference is the only one in this module for ``revolve`` -- trimesh's ``revolve`` is
+    ``creation.revolve``'s own model but is not benchmarked here, and open3d and pyvista have no
+    solid-of-revolution generator -- so this is the pairing that says the sweep is right rather than
+    merely self-consistent.
+    """
+    profile_np = np.array([[0.5, 0.0], [0.5, 1.0], [0.3, 1.5], [0.0, 2.0]])
+    profile_wp = wp.array(
+        np.ascontiguousarray(profile_np, dtype=np.float32), dtype=wp.vec2, device=device
+    )
+    vertices_wp, faces_wp = tw.creation.revolve(profile_wp, sections=16)
+    mesh_wp = _mesh(vertices_wp, faces_wp)
+
+    profile_ml = mm.std_vector_Vector2_float()
+    for point_np in profile_np:
+        profile_ml.append(mm.Vector2f(float(point_np[0]), float(point_np[1])))
+    mesh_ref = meshlib_to_trimesh(mm.makeSolidOfRevolution(profile_ml, 16))
+
+    assert mesh_ref.faces.shape[0] > 0  # non-vacuity
+    assert int(vertices_wp.shape[0]) == mesh_ref.vertices.shape[0]
+    assert int(faces_wp.shape[0]) // 3 == mesh_ref.faces.shape[0]
+    assert np.isclose(mesh_wp.area, mesh_ref.area, rtol=1e-4)
+    assert np.allclose(mesh_wp.bounds, mesh_ref.bounds, atol=1e-5)
+
+
 @pytest.mark.parametrize("sections", [16, 32, 64])
 @pytest.mark.parity("uv_sphere", "open3d")
 def test_uv_sphere_matches_open3d(device: str, sections: int) -> None:
