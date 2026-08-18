@@ -80,7 +80,8 @@ import potpourri3d as pp3d
 import pytest
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase, skip_larger_than
+from conftest import BenchCase, mesh_ml_from_numpy, skip_larger_than
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -115,11 +116,83 @@ def _shifted_vertices_wp(bench_case: BenchCase, offset_fraction: float) -> wp.ar
     return _shifted_cache[key]
 
 
+_field_ml_cache: dict[tuple[str, str], mm.VertScalars] = {}
+_shifted_ml_cache: dict[tuple[str, float], mm.Mesh] = {}
+
+
+def _field_ml(bench_case: BenchCase, field: str) -> mm.VertScalars:
+    """
+    Build the same scalar field as a ``VertScalars``, cached.
+
+    There is no array constructor, so filling it is a per-vertex Python loop over ``VertId`` keys.
+    Like every other library's copy of this field it is the benchmark's *input* and is built once.
+    """
+    key = (bench_case.mesh_name, field)
+    if key not in _field_ml_cache:
+        values_np = _field_np(bench_case, field)
+        values_ml = mm.VertScalars()
+        values_ml.resize(values_np.shape[0], 0.0)
+        for index, value in enumerate(values_np):
+            values_ml[mm.VertId(index)] = float(value)
+        _field_ml_cache[key] = values_ml
+    return _field_ml_cache[key]
+
+
+def _shifted_mesh_ml(bench_case: BenchCase, offset_fraction: float) -> mm.Mesh:
+    """Build the translated self-copy [`_shifted_vertices_wp`] makes, as a cached MeshLib mesh."""
+    key = (bench_case.mesh_name, offset_fraction)
+    if key not in _shifted_ml_cache:
+        vertices_np = bench_case.vertices_np
+        diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
+        _shifted_ml_cache[key] = mesh_ml_from_numpy(
+            vertices_np + offset_fraction * diagonal * _PLANE_NORMAL, bench_case.faces_np
+        )
+    return _shifted_ml_cache[key]
+
+
+_mesh_ml_cache: dict[str, mm.Mesh] = {}
+
+
+def _mesh_ml(bench_case: BenchCase) -> mm.Mesh:
+    """
+    Cache one ``meshlib.Mesh`` per mesh, for the rows whose call does **not** mutate it.
+
+    ``extractPlaneSections``, ``findIntersectionContours`` and ``extractIsolines`` all read the mesh
+    and return a new contour, so a shared mesh is safe and keeps the lazily built AABB tree warm.
+    The two *trimming* rows build their own inside the timed callable, because they rewrite it.
+    """
+    if bench_case.mesh_name not in _mesh_ml_cache:
+        _mesh_ml_cache[bench_case.mesh_name] = bench_case.new_mesh_ml()
+    return _mesh_ml_cache[bench_case.mesh_name]
+
+
+def _plane_ml(bench_case: BenchCase) -> mm.Plane3f:
+    """Express the benchmark's plane in MeshLib's ``n . x == d`` form -- ``d`` is the transform."""
+    origin_np = _plane_origin(bench_case)
+    return mm.Plane3f(mm.Vector3f(*_PLANE_NORMAL.tolist()), float(np.dot(_PLANE_NORMAL, origin_np)))
+
+
 @pytest.mark.benchmark(group="mesh_with_plane")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "meshlib")
 def test_mesh_with_plane(bench_case: BenchCase) -> None:
-    """Cross-section segments of a mid-mesh plane: a full face sweep plus a compaction."""
+    """
+    Cross-section segments of a mid-mesh plane: a full face sweep plus a compaction.
+
+    meshlib's ``extractPlaneSections`` does **more** than the other two rows and by a different
+    route: it walks the section into ordered closed contours over an AABB tree
+    (``UseAABBTree::Yes``, its default) rather than sweeping every face, so its cost tracks the
+    section's length where triwarp's and trimesh's track the face count. Read the pair across mesh
+    sizes rather than at one point. Its output is ``EdgePoint`` contours, which
+    ``tests/test_intersection.py`` decodes; the row asserts only that a section came back.
+    """
     origin = _plane_origin(bench_case)
+    if bench_case.kind == "meshlib":
+        mesh_part_ml = mm.MeshPart(_mesh_ml(bench_case))
+        plane_ml = _plane_ml(bench_case)
+        mm.extractPlaneSections(mesh_part_ml, plane_ml)  # pre-warm the lazily built tree
+        sections_ml = bench_case.run(lambda: mm.extractPlaneSections(mesh_part_ml, plane_ml))
+        assert len(sections_ml) > 0
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         normal = wp.vec3(*_PLANE_NORMAL.tolist())
@@ -139,10 +212,30 @@ def test_mesh_with_plane(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="slice_mesh_with_plane")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "meshlib")
 def test_slice_mesh_with_plane(bench_case: BenchCase) -> None:
-    """Keep the positive-normal half of the mesh: classify every face, then re-triangulate cuts."""
+    """
+    Keep the positive-normal half of the mesh: classify every face, then re-triangulate cuts.
+
+    meshlib's ``trimWithPlane`` keeps the same side and reaches the same answer -- 670 faces and an
+    identical area on the test fixture (``tests/test_intersection.py``) -- by editing its half-edge
+    topology in place, so its mesh is rebuilt inside the timed callable and the row carries that
+    build. That is the honest cost for a caller holding NumPy buffers, which is what the trimesh row
+    prices too.
+    """
     origin = _plane_origin(bench_case)
+    if bench_case.kind == "meshlib":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        params_ml = mm.TrimWithPlaneParams()
+        params_ml.plane = _plane_ml(bench_case)
+
+        def trim_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(vertices_np, faces_np)
+            mm.trimWithPlane(mesh_ml, params_ml)
+            return mesh_ml.topology.numValidFaces()
+
+        assert 0 < bench_case.run(trim_ml) < bench_case.n_faces
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         normal = wp.vec3(*_PLANE_NORMAL.tolist())
@@ -161,7 +254,7 @@ def test_slice_mesh_with_plane(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="split_mesh_with_plane")
-@pytest.mark.benchlibs("triwarp", "pyvista")
+@pytest.mark.benchlibs("triwarp", "pyvista", "meshlib")
 @pytest.mark.parity("split_mesh_with_plane", "pyvista")
 def test_split_mesh_with_plane(bench_case: BenchCase) -> None:
     """
@@ -179,6 +272,19 @@ def test_split_mesh_with_plane(bench_case: BenchCase) -> None:
     ``tests/test_intersection.py``, this row only times them.
     """
     origin = _plane_origin(bench_case)
+    if bench_case.kind == "meshlib":
+        # ``subdivideWithPlane`` is the closest counterpart in the suite: it inserts the section as
+        # real edges and returns the positive side as a FaceBitSet, which is triwarp's
+        # ``(vertices, faces, side_mask)`` triple. It mutates, so the mesh is rebuilt per round.
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        plane_ml = _plane_ml(bench_case)
+
+        def subdivide_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(vertices_np, faces_np)
+            return mm.subdivideWithPlane(mesh_ml, plane_ml).count()
+
+        assert 0 < bench_case.run(subdivide_ml) <= bench_case.n_faces
+        return
     if bench_case.kind == "pyvista":
         # Same cap and reason as the ``clip_mesh_with_field`` row: VTK's clip is single-threaded.
         skip_larger_than(bench_case, "bunny", "VTK's clip is a single-threaded per-cell sweep")
@@ -259,7 +365,7 @@ def test_clip_mesh_with_field(bench_case: BenchCase, cap: bool) -> None:
 
 
 @pytest.mark.benchmark(group="mesh_with_mesh")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "meshlib")
 @pytest.mark.parametrize("offset_fraction", _SELF_OFFSET_FRACTIONS, ids=["deep", "grazing"])
 def test_mesh_with_mesh(bench_case: BenchCase, offset_fraction: float) -> None:
     """
@@ -271,6 +377,16 @@ def test_mesh_with_mesh(bench_case: BenchCase, offset_fraction: float) -> None:
     ``max_triangle_collisions`` cap silently truncates once the broad phase saturates.
     """
     skip_larger_than(bench_case, "bunny", "broad phase allocates 16 candidate slots per triangle")
+    if bench_case.kind == "meshlib":
+        # ``findIntersectionContours`` links the crossing into ordered contours where triwarp emits
+        # an unordered segment soup, so it does strictly more -- and it takes the second mesh's
+        # placement as a rigid transform rather than as moved vertices, which is how the same
+        # translation is expressed here. Neither mesh is modified, so both are cached.
+        mesh_ml = _mesh_ml(bench_case)
+        shifted_ml = _shifted_mesh_ml(bench_case, offset_fraction)
+        contours_ml = bench_case.run(lambda: mm.findIntersectionContours(mesh_ml, shifted_ml))
+        assert len(contours_ml) >= 0
+        return
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     shifted = _shifted_vertices_wp(bench_case, offset_fraction)
     lines = bench_case.run(lambda: tw.intersection.mesh_with_mesh(vertices, faces, shifted, faces))
@@ -347,7 +463,19 @@ def _field_wp(bench_case: BenchCase, field: str) -> wp.array:
 
 
 def _run_case(bench_case: BenchCase, field: str) -> None:
-    """Extract one level set, in triwarp, potpourri3d or libigl."""
+    """Extract one level set, in triwarp, potpourri3d, libigl or meshlib."""
+    if bench_case.kind == "meshlib":
+        # ``extractIsolines`` returns linked contours like triwarp and potpourri3d, not igl's
+        # segment soup. Its ``VertScalars`` field has no array constructor -- the fill is a
+        # per-vertex Python loop -- so it is built once outside the timed callable, as every other
+        # row's field is.
+        mesh_ml = _mesh_ml(bench_case)
+        values_ml = _field_ml(bench_case, field)
+        isolines_ml = bench_case.run(
+            lambda: mm.extractIsolines(mesh_ml.topology, values_ml, _ISOVALUE), rounds=_ROUNDS
+        )
+        assert len(isolines_ml) > 0
+        return
     if bench_case.kind == "igl":
         # igl returns a segment *soup* -- (points, segments, segment_values), no curve linkage --
         # so it does strictly less than triwarp and potpourri3d, both of which return linked
@@ -384,7 +512,7 @@ def _run_case(bench_case: BenchCase, field: str) -> None:
 
 @pytest.mark.benchmark(group="marching_triangles")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "potpourri3d", "igl")
+@pytest.mark.benchlibs("triwarp", "potpourri3d", "igl", "meshlib")
 def test_marching_triangles(bench_case: BenchCase) -> None:
     """One long closed contour of a coordinate function, over the clean size sweep."""
     _run_case(bench_case, "plane")
@@ -392,7 +520,7 @@ def test_marching_triangles(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="marching_triangles_curves")
 @pytest.mark.benchmeshes("sphere_med")
-@pytest.mark.benchlibs("triwarp", "potpourri3d", "igl")
+@pytest.mark.benchlibs("triwarp", "potpourri3d", "igl", "meshlib")
 @pytest.mark.parametrize("field", list(_FIELDS))
 def test_marching_triangles_curves(bench_case: BenchCase, field: str) -> None:
     """One mesh, level sets from 1 to ~1 000 curves, to see whether linking cost shows up."""

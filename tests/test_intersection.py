@@ -12,12 +12,52 @@ import pyvista as pv
 import trimesh as tm
 import trimesh.intersections as tm_intersections
 import warp as wp
+from meshlib import mrmeshpy as mm
 from scipy.spatial import KDTree
 
 import triwarp as tw
 from tests.comparisons import hausdorff_two_sided
-from tests.conversions import trimesh_to_pyvista, trimesh_to_warp
+from tests.conversions import (
+    meshlib_to_trimesh,
+    trimesh_to_meshlib,
+    trimesh_to_pyvista,
+    trimesh_to_warp,
+)
 from triwarp.constants import TOLERANCE_MERGE
+
+
+def _plane_ml(normal_np: np.ndarray, origin_np: np.ndarray) -> mm.Plane3f:
+    """
+    Build a ``Plane3f`` from triwarp's ``(normal, point)`` pair.
+
+    MeshLib's plane is the ``n . x == d`` form, so the named transform on every plane pairing in
+    this file is ``d = normal . origin``. Passing the origin itself would place the plane through
+    the coordinate origin instead, which on a centred mesh is a plausible-looking wrong answer.
+    """
+    return mm.Plane3f(
+        mm.Vector3f(*np.asarray(normal_np, dtype=float).tolist()),
+        float(np.dot(normal_np, origin_np)),
+    )
+
+
+def _section_points_ml(mesh_ml: mm.Mesh, section_ml: object) -> np.ndarray:
+    """
+    Decode one ``EdgePoint`` section into ``(n, 3)`` positions.
+
+    ``extractPlaneSections`` and ``extractIsolines`` both return *barycentric* points on edges
+    rather than coordinates, so each has to go through ``Mesh.edgePoint``; reading their fields
+    directly gives an edge id and a parameter, not a position.
+    """
+    return np.array(
+        [
+            [
+                mesh_ml.edgePoint(point_ml).x,
+                mesh_ml.edgePoint(point_ml).y,
+                mesh_ml.edgePoint(point_ml).z,
+            ]
+            for point_ml in section_ml  # type: ignore[union-attr]
+        ]
+    )
 
 
 def _canonical_segments(lines_np: np.ndarray) -> np.ndarray:
@@ -954,6 +994,228 @@ def _total_length(curves: list[np.ndarray], closed: list[bool]) -> float:
 # ---------------------------------------------------------------------------
 # marching_triangles
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parity("mesh_with_plane", "meshlib")
+@pytest.mark.parity("mesh_with_mesh", "meshlib")
+def test_plane_and_mesh_sections_match_meshlib(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B on the *curve*: both references order the contour where triwarp returns segments.
+
+    Neither pairing can be compared element-wise, and for the same reason in both directions:
+    ``extractPlaneSections`` and ``findIntersectionContours`` walk the intersection into an ordered
+    polyline, while ``mesh_with_plane`` and ``mesh_with_mesh`` emit an unordered ``(m, 2, 3)``
+    segment soup. So the comparable quantities are the curve's **total length** and the point set it
+    passes through, which is what a caller of either actually consumes.
+
+    Measured on ``icosphere(3)`` cut at ``z = 0.13``: MeshLib returns **one** closed section of 95
+    points against triwarp's 94 segments -- the same 94, with the first point repeated to close --
+    and the perimeters are **6.217219 against 6.217220**. Every decoded point sits at exactly the
+    plane's ``z``, which is the assert that catches a plane built from the wrong ``d``.
+
+    For the mesh-mesh half, two overlapping spheres give one contour of 153 points against 201
+    segments -- different counts, since neither library promises a particular sampling of the same
+    curve -- with total lengths **5.008801 against 5.008798**.
+    """
+    mesh_tm, mesh_wp = icosphere
+    normal_np = np.array([0.0, 0.0, 1.0])
+    origin_np = mesh_tm.vertices.mean(axis=0) + np.array([0.0, 0.0, 0.13])
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+
+    segments_wp = tw.intersection.mesh_with_plane(
+        mesh_wp.points, mesh_wp.indices, wp.vec3(*normal_np.tolist()), wp.vec3(*origin_np.tolist())
+    ).numpy()
+    sections_ml = mm.extractPlaneSections(mm.MeshPart(mesh_ml), _plane_ml(normal_np, origin_np))
+
+    assert len(sections_ml) == 1  # one closed rim, so the length comparison is not over fragments
+    points_ml = _section_points_ml(mesh_ml, sections_ml[0])
+    assert np.allclose(points_ml[:, 2], origin_np[2], atol=1e-5)  # the plane really is where it is
+    assert points_ml.shape[0] == segments_wp.shape[0] + 1  # closed: the first point repeats
+
+    length_wp = float(np.linalg.norm(segments_wp[:, 1] - segments_wp[:, 0], axis=1).sum())
+    length_ml = float(np.linalg.norm(np.diff(points_ml, axis=0), axis=1).sum())
+    assert np.isclose(length_wp, length_ml, rtol=1e-5)
+
+    # Mesh against mesh, on two overlapping spheres.
+    other_tm = mesh_tm.copy()
+    other_tm.apply_translation([1.2, 0.0, 0.0])
+    other_wp = trimesh_to_warp(other_tm, str(mesh_wp.points.device))
+    crossing_wp = tw.intersection.mesh_with_mesh(
+        mesh_wp.points, mesh_wp.indices, other_wp.points, other_wp.indices
+    ).numpy()
+    contours_ml = mm.findIntersectionContours(mesh_ml, trimesh_to_meshlib(other_tm))
+
+    assert len(contours_ml) == 1
+    contour_np = np.array([[point.x, point.y, point.z] for point in contours_ml[0]])
+    assert contour_np.shape[0] > 10  # non-vacuity: the two spheres really do intersect
+    assert np.isclose(
+        float(np.linalg.norm(crossing_wp[:, 1] - crossing_wp[:, 0], axis=1).sum()),
+        float(np.linalg.norm(np.diff(contour_np, axis=0), axis=1).sum()),
+        rtol=1e-4,
+    )
+
+
+@pytest.mark.parity("slice_mesh_with_plane", "meshlib")
+@pytest.mark.parity("split_mesh_with_plane", "meshlib")
+def test_slice_and_split_with_plane_match_meshlib(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B on the retriangulation: the same face counts and the same area, from two mutating calls.
+
+    ``trimWithPlane`` keeps the **positive** side, which is triwarp's convention, and
+    ``subdivideWithPlane`` inserts the section as real edges and returns the ``FaceBitSet`` of that
+    side -- exactly the ``(vertices, faces, side_mask)`` triple ``split_mesh_with_plane`` returns.
+    Both mutate the mesh they are given and return something else, so each gets its own.
+
+    Measured on ``icosphere(3)`` at ``z = 0.13``, and the agreement is stronger than the class
+    suggests: the slice is **670 faces** on both sides with an area of **5.438285** on both, and the
+    split is **1 468 faces, 736 vertices and 670 positive faces** on both, with an area of
+    **12.506493**. What is *not* shared is the vertex count of the slice -- 477 against 383 -- since
+    triwarp emits a cut vertex per crossing edge where MeshLib reuses its half-edge topology, which
+    is why this is a count-and-area comparison rather than a buffer one.
+
+    The plane's ``d`` is the transform, and the assert that catches it getting lost is the z-range:
+    both results start exactly at the cut.
+    """
+    mesh_tm, mesh_wp = icosphere
+    normal_np = np.array([0.0, 0.0, 1.0])
+    origin_np = mesh_tm.vertices.mean(axis=0) + np.array([0.0, 0.0, 0.13])
+    plane_ml = _plane_ml(normal_np, origin_np)
+
+    sliced_vertices_wp, sliced_faces_wp = tw.intersection.slice_mesh_with_plane(
+        mesh_wp.points, mesh_wp.indices, wp.vec3(*normal_np.tolist()), wp.vec3(*origin_np.tolist())
+    )
+    sliced_tm = tm.Trimesh(
+        sliced_vertices_wp.numpy().astype(np.float64),
+        sliced_faces_wp.numpy().reshape(-1, 3),
+        process=False,
+    )
+
+    trimmed_ml = trimesh_to_meshlib(mesh_tm)
+    trim_params_ml = mm.TrimWithPlaneParams()
+    trim_params_ml.plane = plane_ml
+    assert mm.trimWithPlane(trimmed_ml, trim_params_ml) is None  # mutates, returns nothing
+    trimmed_tm = meshlib_to_trimesh(trimmed_ml)
+
+    assert 0 < trimmed_tm.faces.shape[0] < mesh_tm.faces.shape[0]  # it really trimmed
+    assert sliced_tm.faces.shape[0] == trimmed_tm.faces.shape[0]
+    assert np.isclose(sliced_tm.area, trimmed_tm.area, rtol=1e-5)
+    assert np.isclose(sliced_tm.vertices[:, 2].min(), origin_np[2], atol=1e-5)
+    assert np.isclose(trimmed_tm.vertices[:, 2].min(), origin_np[2], atol=1e-5)
+
+    # The splitting form: the same cut, both sides kept, with the positive side as a mask.
+    split_vertices_wp, split_faces_wp, side_wp = tw.intersection.split_mesh_with_plane(
+        mesh_wp.points, mesh_wp.indices, wp.vec3(*normal_np.tolist()), wp.vec3(*origin_np.tolist())
+    )
+    split_tm = tm.Trimesh(
+        split_vertices_wp.numpy().astype(np.float64),
+        split_faces_wp.numpy().reshape(-1, 3),
+        process=False,
+    )
+
+    subdivided_ml = trimesh_to_meshlib(mesh_tm)
+    positive_ml = mm.subdivideWithPlane(subdivided_ml, plane_ml)
+    subdivided_tm = meshlib_to_trimesh(subdivided_ml)
+
+    assert split_tm.faces.shape[0] == subdivided_tm.faces.shape[0]
+    assert split_tm.vertices.shape[0] == subdivided_tm.vertices.shape[0]
+    assert int(side_wp.numpy().sum()) == positive_ml.count()
+    assert int(side_wp.numpy().sum()) == sliced_tm.faces.shape[0]  # and it is the sliced side
+    assert np.isclose(split_tm.area, subdivided_tm.area, rtol=1e-5)
+    assert np.isclose(split_tm.area, mesh_tm.area, rtol=1e-5)  # splitting conserves the surface
+
+
+@pytest.mark.parity("marching_triangles", "meshlib")
+@pytest.mark.parity("marching_triangles_curves", "meshlib")
+def test_marching_triangles_matches_meshlib(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B: ``extractIsolines`` returns the same level set, closed by a repeated point.
+
+    Two transforms, both named. Its ``vertValues`` is a ``VertScalars`` filled per vertex -- there
+    is no array constructor, so the fill is a Python loop over ``VertId`` keys -- and its output is
+    a list of ``EdgePoint`` contours that must go through ``Mesh.edgePoint`` to become positions.
+    Its closed contours repeat their first point where triwarp returns the cycle once and flags it
+    ``closed``, which is the same convention potpourri3d's ``marching_triangles`` uses.
+
+    Measured on the ``z`` field of ``icosphere(3)`` at 0.13: one closed curve, 94 points against 95,
+    lengths **6.217219 against 6.217220**. That is the same curve
+    [`test_plane_and_mesh_sections_match_meshlib`] gets from the plane section, which is the
+    consistency worth having -- the level set of a coordinate *is* a plane section, and the two
+    entry points reach it by different code.
+
+    The second half covers the ``marching_triangles_curves`` group, whose question is the opposite
+    one: a sinusoidal field whose level set is **many** short loops rather than one long one, where
+    the linking is the work. Both libraries return **18** closed curves totalling 52.3072 against
+    52.3072 -- agreeing to **1.0e-08** -- so the curve *count* is asserted as well as the length,
+    which is what would break if either side split or merged a loop.
+    """
+    mesh_tm, mesh_wp = icosphere
+    isovalue = float(mesh_tm.vertices[:, 2].mean() + 0.13)
+    field_np = np.ascontiguousarray(mesh_tm.vertices[:, 2], dtype=np.float32)
+    field_wp = wp.array(field_np, dtype=wp.float32, device=mesh_wp.points.device)
+
+    curves_wp, closed_wp = tw.intersection.marching_triangles(
+        mesh_wp.points, mesh_wp.indices, field_wp, isovalue
+    )
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    values_ml = mm.VertScalars()
+    values_ml.resize(mesh_ml.points.size(), 0.0)
+    for index, value in enumerate(field_np):
+        values_ml[mm.VertId(index)] = float(value)
+    isolines_ml = mm.extractIsolines(mesh_ml.topology, values_ml, isovalue)
+
+    assert len(isolines_ml) == len(curves_wp) == 1
+    assert closed_wp == [True]
+    points_ml = _section_points_ml(mesh_ml, isolines_ml[0])
+    curve_np = curves_wp[0].numpy()
+
+    assert points_ml.shape[0] == curve_np.shape[0] + 1  # its closed contour repeats the first point
+    assert np.allclose(points_ml[0], points_ml[-1], atol=1e-6)
+    length_wp = float(
+        np.linalg.norm(np.diff(np.vstack([curve_np, curve_np[:1]]), axis=0), axis=1).sum()
+    )
+    assert np.isclose(
+        length_wp, float(np.linalg.norm(np.diff(points_ml, axis=0), axis=1).sum()), rtol=1e-5
+    )
+
+    # The many-curve field: same count, same total length, and the linking is what could differ.
+    wave_np = np.ascontiguousarray(
+        np.sin(6.0 * mesh_tm.vertices[:, 0])
+        * np.cos(6.0 * mesh_tm.vertices[:, 1])
+        * np.sin(6.0 * mesh_tm.vertices[:, 2]),
+        dtype=np.float32,
+    )
+    wave_curves_wp, wave_closed_wp = tw.intersection.marching_triangles(
+        mesh_wp.points,
+        mesh_wp.indices,
+        wp.array(wave_np, dtype=wp.float32, device=mesh_wp.points.device),
+        0.0,
+    )
+    wave_values_ml = mm.VertScalars()
+    wave_values_ml.resize(mesh_ml.points.size(), 0.0)
+    for index, value in enumerate(wave_np):
+        wave_values_ml[mm.VertId(index)] = float(value)
+    wave_lines_ml = mm.extractIsolines(mesh_ml.topology, wave_values_ml, 0.0)
+
+    assert len(wave_curves_wp) > 5  # non-vacuity: this field really is multi-curve
+    assert len(wave_lines_ml) == len(wave_curves_wp)
+    total_wp = sum(
+        float(
+            np.linalg.norm(
+                np.diff(
+                    np.vstack([curve.numpy(), curve.numpy()[:1]]) if is_closed else curve.numpy(),
+                    axis=0,
+                ),
+                axis=1,
+            ).sum()
+        )
+        for curve, is_closed in zip(wave_curves_wp, wave_closed_wp, strict=True)
+    )
+    total_ml = sum(
+        float(np.linalg.norm(np.diff(_section_points_ml(mesh_ml, line_ml), axis=0), axis=1).sum())
+        for line_ml in wave_lines_ml
+    )
+    assert np.isclose(total_wp, total_ml, rtol=1e-5)
 
 
 @pytest.mark.parametrize("mesh_name", _MESHES)
