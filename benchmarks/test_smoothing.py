@@ -218,9 +218,24 @@ def test_filter_mut_dif_laplacian(bench_case: BenchCase, volume_constraint: bool
     "test_filter_laplacian_matches_pymeshlab; trimesh covers the same operator under the "
     "filter_laplacian group.",
 )
+@pytest.mark.noparity(
+    "meshlib",
+    oracle="pymeshlab",
+    reason="D2 a different algorithm with a measured disagreement: MeshLib's relax is not an "
+    "umbrella-Laplacian step at all. Measured on an icosphere(2) at one iteration, its "
+    "displacement is 0.33 +- 0.19 of triwarp's per vertex (range 0.008 to 0.54) and the two "
+    "displacement *directions* disagree -- mean cosine 0.45, minimum -1.0 -- so it is not a "
+    "rescaling of the same step and no value of its force parameter recovers one: the closest pair "
+    "over a 5x5 sweep of force against lamb still leaves a max coordinate difference of 4.5e-03. "
+    "The row is worth having as a cost comparison against a serial relaxation of the same shape; "
+    "MeshLab's apply_coord_laplacian_smoothing stays this group's oracle, in "
+    "tests/test_smoothing.py::test_filter_laplacian_matches_pymeshlab. Note relax IS the operator "
+    "behind smooth_region -- positionVertsSmoothly, a different function -- which is a class-A "
+    "pair in its own group.",
+)
 @pytest.mark.benchmark(group="filter_laplacian_integration")
 @pytest.mark.benchaxis("quality")
-@pytest.mark.benchlibs("triwarp", "pymeshlab", "pyvista")
+@pytest.mark.benchlibs("triwarp", "pymeshlab", "pyvista", "meshlib")
 @pytest.mark.parametrize("implicit", [False, True], ids=["explicit", "implicit"])
 def test_filter_laplacian_integration(bench_case: BenchCase, implicit: bool) -> None:
     """
@@ -235,6 +250,25 @@ def test_filter_laplacian_integration(bench_case: BenchCase, implicit: bool) -> 
     statement its harmonic-field row makes in [`test_linalg.py`](test_linalg.py) about where the
     conditioning cost actually lives.
     """
+    if bench_case.kind == "meshlib":
+        if implicit:
+            pytest.skip("relax is an explicit per-iteration pass: no backward-Euler variant")
+        # ``relax`` mutates the mesh and returns a status, so the mesh is rebuilt per round.
+        # ``force`` is left at its own default of 0.5: it is not triwarp's ``lamb`` under another
+        # name (see the exemption above), so there is no value that would make the rows compare
+        # outputs -- the row is a cost comparison at each library's own natural setting.
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        iterations = _ITERATIONS
+
+        def relax_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(vertices_np, faces_np)
+            params_ml = mm.MeshRelaxParams()
+            params_ml.iterations = iterations
+            mm.relax(mesh_ml, params_ml)
+            return mesh_ml.topology.numValidVerts()
+
+        assert bench_case.run(relax_ml) > 0
+        return
     if bench_case.kind == "pyvista":
         if implicit:
             pytest.skip("vtkSmoothPolyDataFilter is explicit only: no backward-Euler variant")

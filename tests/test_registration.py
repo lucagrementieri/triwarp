@@ -10,6 +10,7 @@ import pyvista as pv
 import trimesh as tm
 import trimesh.registration as tm_reg
 import warp as wp
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.conversions import points_to_open3d
@@ -72,6 +73,56 @@ def test_procrustes_default(device: str) -> None:
     assert np.allclose(matrix_tw, matrix_tm, rtol=1e-4, atol=1e-4)
     assert np.allclose(transformed_wp.numpy(), transformed_tm, rtol=1e-4, atol=1e-4)
     assert np.allclose(cost_tw, cost_tm, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parity("procrustes", "meshlib")
+def test_procrustes_matches_meshlib(device: str) -> None:
+    """
+    Class A on the rigid transform: ``PointToPointAligningTransform`` solves the same fit.
+
+    MeshLib accumulates correspondences one at a time -- ``add(p1, p2, weight)`` -- and
+    ``findBestRigidXf`` returns an ``AffineXf3d`` carrying a ``Matrix3d`` and a translation, so the
+    transform is unpacking that into a 4x4 rather than anything about the values. Both recover a
+    *known* rigid motion here, which is what makes the comparison a check on the solver and not a
+    restatement: the rotation and translation agree with the planted ones and with each other to
+    **1.1e-06**, triwarp's float32 floor.
+
+    ``scale=False`` and ``reflection=False`` are triwarp's settings for this pairing:
+    ``findBestRigidXf`` fits a rotation and translation only. Its sibling
+    ``findBestRigidScaleXf`` is the ``scale=True`` form and is not what this compares.
+    """
+    rng = np.random.default_rng(0)
+    source_np = rng.standard_normal((200, 3))
+    rotation_np = tm.transformations.rotation_matrix(0.4, [0.3, 0.5, 0.8])[:3, :3]
+    translation_np = np.array([1.0, -2.0, 0.5])
+    target_np = source_np @ rotation_np.T + translation_np
+
+    matrix_wp, _transformed_wp, cost_wp = tw.registration.procrustes(
+        _to_wp(source_np, device), _to_wp(target_np, device), reflection=False, scale=False
+    )
+    matrix_np = matrix_wp.numpy()[0]
+
+    aligner_ml = mm.PointToPointAligningTransform()
+    for source_point_np, target_point_np in zip(source_np, target_np, strict=True):
+        aligner_ml.add(
+            mm.Vector3d(*source_point_np.tolist()), mm.Vector3d(*target_point_np.tolist()), 1.0
+        )
+    transform_ml = aligner_ml.findBestRigidXf()
+    rotation_ml = np.array(
+        [
+            [transform_ml.A.x.x, transform_ml.A.x.y, transform_ml.A.x.z],
+            [transform_ml.A.y.x, transform_ml.A.y.y, transform_ml.A.y.z],
+            [transform_ml.A.z.x, transform_ml.A.z.y, transform_ml.A.z.z],
+        ]
+    )
+    translation_ml = np.array([transform_ml.b.x, transform_ml.b.y, transform_ml.b.z])
+
+    # Non-vacuity: the reference recovered the planted motion, so it is not returning the identity.
+    assert np.allclose(rotation_ml, rotation_np, rtol=1e-5, atol=1e-5)
+    assert np.allclose(translation_ml, translation_np, rtol=1e-5, atol=1e-5)
+    assert np.allclose(matrix_np[:3, :3], rotation_ml, rtol=1e-4, atol=1e-4)
+    assert np.allclose(matrix_np[:3, 3], translation_ml, rtol=1e-4, atol=1e-4)
+    assert cost_wp < 1e-8  # an exact correspondence set has a zero-residual fit
 
 
 def test_procrustes_return_cost_arity(device: str) -> None:

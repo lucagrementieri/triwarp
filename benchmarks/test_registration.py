@@ -81,6 +81,7 @@ import pyvista as pv
 import trimesh as tm
 import warp as wp
 from conftest import BenchCase, skip_larger_than
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -226,10 +227,37 @@ def _o3d_criteria() -> o3d.pipelines.registration.ICPConvergenceCriteria:
 
 
 @pytest.mark.benchmark(group="procrustes")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "meshlib")
 def test_procrustes(bench_case: BenchCase) -> None:
-    """Procrustes fit on exact correspondences: tiled reductions plus the SVD kernel."""
+    """
+    Procrustes fit on exact correspondences: tiled reductions plus the SVD kernel.
+
+    meshlib's ``PointToPointAligningTransform`` accumulates the correspondences **one pair at a
+    time** through ``add``, so its row is a Python loop over the pairs plus the solve, and the loop
+    is the honest cost of driving that API from Python -- there is no batched form. Read it as an
+    upper bound on the solver and against the other three rows' array interfaces rather than as a
+    like-for-like fit; the transform it returns agrees with triwarp's to 1e-06
+    (``tests/test_registration.py``).
+    """
     source_np, indices = _source_np(bench_case)
+    if bench_case.kind == "meshlib":
+        skip_larger_than(
+            bench_case, "bunny_decimated", "the accumulation is a per-pair Python loop"
+        )
+        target_np = np.ascontiguousarray(bench_case.vertices_np[indices])
+
+        def procrustes_ml() -> mm.AffineXf3d:
+            aligner_ml = mm.PointToPointAligningTransform()
+            for source_point_np, target_point_np in zip(source_np, target_np, strict=True):
+                aligner_ml.add(
+                    mm.Vector3d(*source_point_np.tolist()),
+                    mm.Vector3d(*target_point_np.tolist()),
+                    1.0,
+                )
+            return aligner_ml.findBestRigidXf()
+
+        assert abs(bench_case.run(procrustes_ml).A.x.length() - 1.0) < 1e-5
+        return
     if bench_case.kind == "triwarp":
         source = _source_wp(bench_case)
         target = wp.array(

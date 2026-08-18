@@ -53,6 +53,7 @@ import pytest
 import trimesh as tm
 import warp as wp
 from conftest import BenchCase, BenchLibrary, skip_larger_than
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -187,7 +188,7 @@ def test_voxelize_points(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="voxel_down_sample")
-@pytest.mark.benchlibs("triwarp", "open3d")
+@pytest.mark.benchlibs("triwarp", "open3d", "meshlib")
 @pytest.mark.parametrize("divisor", _CELL_DIVISORS)
 def test_voxel_down_sample(bench_case: BenchCase, divisor: int) -> None:
     """
@@ -199,6 +200,20 @@ def test_voxel_down_sample(bench_case: BenchCase, divisor: int) -> None:
     itself — one pass over the point count — does not move at all.
     """
     voxel_size = _voxel_size(bench_case, divisor)
+    if bench_case.kind == "meshlib":
+        # ``pointGridSampling`` stops one step short of the other two rows: it returns the *bitset*
+        # of one surviving point per occupied cell and never pools a position, so read it as a lower
+        # bound. The cloud is the input and is built outside; it must also outlive the
+        # ``PointCloudPart``, which does not own it.
+        from meshlib import mrmeshnumpy as mn
+
+        cloud_ml = mn.pointCloudFromPoints(
+            np.ascontiguousarray(bench_case.vertices_np, dtype=np.float64)
+        )
+        part_ml = mm.PointCloudPart(cloud_ml)
+        sampled_ml = bench_case.run(lambda: mm.pointGridSampling(part_ml, voxel_size))
+        assert 0 < sampled_ml.count() <= bench_case.n_vertices
+        return
     if bench_case.kind == "open3d":
         import open3d as o3d
 

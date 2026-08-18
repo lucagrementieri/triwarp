@@ -31,10 +31,16 @@ import pytest
 import scipy.ndimage as ndi
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.comparisons import lexsort_rows
-from tests.conversions import numpy_to_warp, trimesh_to_open3d, trimesh_to_pyvista
+from tests.conversions import (
+    numpy_to_warp,
+    points_to_meshlib,
+    trimesh_to_open3d,
+    trimesh_to_pyvista,
+)
 
 # A translation with no round coordinate, so no vertex of any fixture lands on a cell plane.
 _OFFSET = np.array([0.137, -0.219, 0.331])
@@ -233,6 +239,40 @@ def test_voxel_down_sample_matches_open3d(sphere, device: str):
     order_wp = np.lexsort(key_wp.T[::-1])
     assert np.array_equal(key_o3d[order_o3d], key_wp[order_wp])
     assert np.allclose(pooled_wp.numpy()[order_wp], pooled_o3d[order_o3d], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("voxel_size", [0.13, 0.26])
+@pytest.mark.parity("voxel_down_sample", "meshlib")
+def test_voxel_down_sample_matches_meshlib(sphere, device: str, voxel_size: float):
+    """
+    Class C (a count statistic): ``pointGridSampling`` *selects* a point, it does not pool one.
+
+    The difference is the operation, not the parameter: MeshLib returns a ``VertBitSet`` picking one
+    surviving input point per occupied cell, where ``voxel_down_sample`` returns the cell **mean**,
+    a position that need not be an input point at all. So the positions are not comparable and the
+    shared quantity is how many cells the cloud occupies.
+
+    Measured on the translated icosphere cloud, triwarp against MeshLib: 429 / 464 at a 5 % voxel
+    and 136 / 128 at 10 %. The residual is grid *anchoring* -- neither library documents where cell
+    zero starts -- so the bound is 1.3x, the same one ``cluster_decimate`` carries against
+    ``verticesGridSampling`` for the same reason.
+
+    **Mutation probe, measured:** the count falls ~3x per doubling of the voxel size on both sides,
+    so a factor-of-two error in the cell size lands far outside the 1.3x band that anchoring
+    accounts for. open3d carries the exact positional comparison for this group.
+    """
+    mesh_tm, _vertices_wp, _faces_wp = sphere
+    points_np, points_wp = _cloud(mesh_tm, device)
+
+    pooled_wp = tw.voxels.voxel_down_sample(points_wp, voxel_size)
+    cloud_ml = points_to_meshlib(points_np)
+    sampled_ml = mm.pointGridSampling(mm.PointCloudPart(cloud_ml), voxel_size)
+
+    n_cells_ml = sampled_ml.count()
+    n_cells_wp = int(pooled_wp.shape[0])
+    assert 0 < n_cells_ml < points_np.shape[0]  # non-vacuity: it really sampled down
+    assert 0 < n_cells_wp < points_np.shape[0]
+    assert 1.0 / 1.3 < n_cells_wp / n_cells_ml < 1.3
 
 
 def test_voxel_down_sample_pooling_modes(sphere, device: str):
@@ -508,6 +548,91 @@ def test_erode_matches_scipy(sphere, device: str, connectivity: int):
     )
     assert reference.any()
     assert np.array_equal(eroded, reference)
+
+
+def _voxel_mask_ml(occupancy_np: np.ndarray) -> tuple[mm.VoxelBitSet, mm.VolumeIndexer]:
+    """
+    Load a dense occupancy array into a ``VoxelBitSet`` plus the ``VolumeIndexer`` addressing it.
+
+    Both MeshLib morphology calls take the pair and **mutate the bitset in place**, returning
+    ``None``; the indexer is what turns an ``(x, y, z)`` cell into the ``VoxelId`` the bitset is
+    keyed by, and ``VoxelBitSet.set`` takes that ``VoxelId`` object rather than a plain ``int``.
+    """
+    dims_ml = mm.Vector3i(*(int(n) for n in occupancy_np.shape))
+    indexer_ml = mm.VolumeIndexer(dims_ml)
+    mask_ml = mm.VoxelBitSet()
+    mask_ml.resize(indexer_ml.size())
+    for cell_np in np.argwhere(occupancy_np):
+        mask_ml.set(indexer_ml.toVoxelId(mm.Vector3i(*(int(c) for c in cell_np))), True)
+    return mask_ml, indexer_ml
+
+
+def _dense_from_mask_ml(mask_ml: mm.VoxelBitSet, indexer_ml: mm.VolumeIndexer, shape) -> np.ndarray:
+    """Read a ``VoxelBitSet`` back as a dense bool array of ``shape``."""
+    occupancy_np = np.zeros(shape, dtype=bool)
+    for x in range(shape[0]):
+        for y in range(shape[1]):
+            for z in range(shape[2]):
+                occupancy_np[x, y, z] = mask_ml.test(indexer_ml.toVoxelId(mm.Vector3i(x, y, z)))
+    return occupancy_np
+
+
+@pytest.mark.parity(
+    "dilate",
+    "meshlib",
+    benchmarked=False,
+    reason="expandVoxelsMask takes a VoxelBitSet keyed by VoxelId objects and MeshLib binds no "
+    "array-to-bitset converter, so loading a grid into it is a per-cell Python loop -- a benchmark "
+    "row would time that loop, not the morphology, the same reason section 6 bars a per-vertex "
+    "loop from a row. scipy through trimesh carries the timed row for this group.",
+)
+@pytest.mark.parity(
+    "erode",
+    "meshlib",
+    benchmarked=False,
+    reason="the same per-cell Python bitset load as the dilate claim above, and erosion has no "
+    "benchmark group of its own: it is dilation's complement over the same candidate buffer and a "
+    "second row would price the same pass under another name. The scipy comparison in "
+    "test_erode_matches_scipy is the timed group's oracle.",
+)
+def test_dilate_and_erode_match_meshlib(sphere, device: str):
+    """
+    Class A on the occupancy: ``expandVoxelsMask`` / ``shrinkVoxelsMask`` are the 6-neighbour forms.
+
+    MeshLib exposes no connectivity switch -- its neighbourhood is the six face-adjacent voxels,
+    which is triwarp's *default* and not its 18- or 26-connected settings, so the comparison is
+    pinned at ``connectivity=6`` and the other two are excluded by construction rather than by
+    tolerance. Verified on a 2x2x2 block: 8 voxels dilate to 32 under both, where triwarp's
+    26-connected setting gives 64.
+
+    Two interface facts the helpers above encode: both calls **mutate the bitset and return
+    ``None``**, and the bitset is keyed by ``VoxelId`` objects from a ``VolumeIndexer`` rather than
+    by flat integers -- a call written against plain ints raises rather than misbehaving, which is
+    the one mercy in this API.
+
+    The dense box is padded by one cell on every side so a dilation has somewhere to go; both sides
+    see the identical box, so the comparison is element-wise over the whole array.
+    """
+    _mesh_tm, vertices_wp, faces_wp = sphere
+    solid = tw.voxels.voxelize_mesh(vertices_wp, faces_wp, 0.2, mode="solid")
+    lower, extent = _bounds_of(solid)
+    padded_lower = tuple(c - 1 for c in lower)
+    padded_shape = tuple(n + 2 for n in extent)
+    occupancy_np = _dense(solid, padded_lower, padded_shape)
+    assert occupancy_np.any()
+
+    dilated_np = _dense(tw.voxels.dilate(solid), padded_lower, padded_shape)
+    eroded_np = _dense(tw.voxels.erode(solid), padded_lower, padded_shape)
+
+    mask_ml, indexer_ml = _voxel_mask_ml(occupancy_np)
+    assert mask_ml.count() == int(occupancy_np.sum())  # non-vacuity: the load round-trips
+    assert mm.expandVoxelsMask(mask_ml, indexer_ml, 1) is None  # mutates, returns nothing
+    assert np.array_equal(_dense_from_mask_ml(mask_ml, indexer_ml, padded_shape), dilated_np)
+
+    mask_ml, indexer_ml = _voxel_mask_ml(occupancy_np)
+    mm.shrinkVoxelsMask(mask_ml, indexer_ml, 1)
+    assert np.array_equal(_dense_from_mask_ml(mask_ml, indexer_ml, padded_shape), eroded_np)
+    assert eroded_np.sum() < occupancy_np.sum() < dilated_np.sum()
 
 
 def test_surface_voxels_is_the_erosion_complement(sphere, device: str):
