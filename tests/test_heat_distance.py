@@ -6,11 +6,15 @@ import igl
 import numpy as np
 import potpourri3d as pp3d
 import pytest
+import trimesh as tm
 import warp as wp
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.conversions import (
     bsr_to_dense,
+    meshlib_scalars_to_numpy,
+    trimesh_to_meshlib,
     trimesh_to_pymeshlab,
     trimesh_to_pyvista,
     trimesh_to_warp,
@@ -161,6 +165,63 @@ def test_heat_geodesic_matches_igl(
     distance_wp = tw.heat.distance.heat_geodesic(mesh_wp.points, mesh_wp.indices, sources_wp)
 
     assert np.allclose(distance_wp.numpy(), distance_igl, rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.parity(
+    "heat_geodesic",
+    "meshlib",
+    benchmarked=False,
+    reason="computeSurfaceDistances is fast marching, not the heat method -- it advances a serial "
+    "front where triwarp solves two sparse systems -- so its row belongs in the "
+    "fast_marching_distance group beside potpourri3d, pymeshlab and igl's exact_geodesic, and that "
+    "is where it is timed. Putting it in heat_geodesic would price a different algorithm under "
+    "that group's name. The values are nonetheless comparable, which is what this test checks.",
+)
+def test_heat_geodesic_matches_meshlib(device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class C (a bound against the truth): two approximations of the same geodesic field.
+
+    ``computeSurfaceDistances`` is fast marching -- a serial front over the edge graph solving the
+    local Eikonal update -- where ``heat_geodesic`` is Crane et al.'s heat method. Neither is exact
+    on a triangulation, so comparing them to each other alone would be a claim about two errors. The
+    sphere is the fixture that fixes that: its geodesics are great-circle arcs, so the *exact*
+    answer is known and each method can be measured against it.
+
+    Measured from one source on ``icosphere(3)``, as the worst absolute deviation from the exact
+    arc length: triwarp **0.0515** and meshlib **0.0442**, i.e. 1.6 % and 1.4 % of the field's
+    range. The two agree with each other to **0.067** with a correlation of **0.99983** -- so they
+    differ from each other by about as much as each differs from the truth, which is the honest
+    statement about two first-order methods and is what the asserts encode.
+
+    Its ``startVertices`` is a ``VertBitSet`` over the vertex domain -- there is no index-list
+    overload for the single-source case -- and the result is a ``VertScalars``, read through
+    [`meshlib_scalars_to_numpy`][tests.conversions.meshlib_scalars_to_numpy] since ``np.asarray``
+    on one silently yields a 0-d object array.
+    """
+    mesh_tm, mesh_wp = icosphere
+    source = 0
+    centre_np = mesh_tm.vertices.mean(axis=0)
+    directions_np = mesh_tm.vertices - centre_np
+    directions_np /= np.linalg.norm(directions_np, axis=1, keepdims=True)
+    radius = float(np.linalg.norm(mesh_tm.vertices[source] - centre_np))
+    exact_np = radius * np.arccos(np.clip(directions_np @ directions_np[source], -1.0, 1.0))
+
+    distance_wp = tw.heat.distance.heat_geodesic(
+        mesh_wp.points, mesh_wp.indices, wp.array([source], dtype=wp.int32, device=device)
+    ).numpy()
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    starts_ml = mm.VertBitSet()
+    starts_ml.resize(mesh_ml.points.size(), False)
+    starts_ml.set(mm.VertId(source), True)
+    distance_ml = meshlib_scalars_to_numpy(mm.computeSurfaceDistances(mesh_ml, starts_ml))
+
+    assert distance_ml.shape == distance_wp.shape
+    assert distance_ml.max() > 0.9 * exact_np.max()  # non-vacuity: it really propagated
+    # Each within 5 % of the exact great-circle field, and closer to each other than that.
+    assert np.abs(distance_wp - exact_np).max() < 0.05 * exact_np.max()
+    assert np.abs(distance_ml - exact_np).max() < 0.05 * exact_np.max()
+    assert np.corrcoef(distance_wp, distance_ml)[0, 1] > 0.999
 
 
 def test_heat_geodesic_multi_source_matches_igl(

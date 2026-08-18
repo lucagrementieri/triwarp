@@ -99,6 +99,7 @@ import pymeshlab as ml
 import pytest
 import warp as wp
 from conftest import BenchCase
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -250,9 +251,19 @@ def test_heat_geodesic_conditioning(bench_case: BenchCase) -> None:
     _run_case(bench_case)
 
 
+_mesh_ml_cache: dict[str, mm.Mesh] = {}
+
+
+def _mesh_ml(bench_case: BenchCase) -> mm.Mesh:
+    """Cache one ``meshlib.Mesh`` per mesh: the distance call reads it and returns a field."""
+    if bench_case.mesh_name not in _mesh_ml_cache:
+        _mesh_ml_cache[bench_case.mesh_name] = bench_case.new_mesh_ml()
+    return _mesh_ml_cache[bench_case.mesh_name]
+
+
 @pytest.mark.benchmark(group="fast_marching_distance")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("potpourri3d", "pymeshlab", "igl")
+@pytest.mark.benchlibs("potpourri3d", "pymeshlab", "igl", "meshlib")
 def test_fast_marching_distance(bench_case: BenchCase) -> None:
     """
     The serial single-source geodesics, for scale against the heat solvers on the same meshes.
@@ -264,10 +275,14 @@ def test_fast_marching_distance(bench_case: BenchCase) -> None:
     ``parity`` pairs by construction (see ``tests/parity.py``): "triwarp agrees" is not a statement
     about a row triwarp does not have.
 
-    Three rows, three serial fronts: potpourri3d's fast marching solves the local Eikonal update per
+    Four rows, four serial fronts: potpourri3d's fast marching solves the local Eikonal update per
     triangle, MeshLab's ``compute_scalar_by_geodesic_distance_from_given_point_per_vertex`` advances
-    a Dijkstra-style front over the edge graph, and **libigl's ``exact_geodesic``** propagates the
-    MMP exact windows -- the only one of the three that is exact rather than first-order.
+    a Dijkstra-style front over the edge graph, **libigl's ``exact_geodesic``** propagates the MMP
+    exact windows -- the only one that is exact rather than first-order -- and **meshlib's
+    ``computeSurfaceDistances``** is a fourth Eikonal front, the only one of the four that is
+    multi-threaded. Its accuracy is measured against triwarp's heat method and against the exact
+    great-circle field in ``tests/test_heat_distance.py``: 1.4 % worst deviation against triwarp's
+    1.6 %, so this row is a like-for-like cost for a like-for-like answer.
 
     **igl is capped at ``sphere_small`` with ``rounds=1``, and the numbers say why.** Measured on
     icospheres at one source with every vertex as a target: **57 ms at 2 562 vertices, 839 ms at
@@ -279,6 +294,20 @@ def test_fast_marching_distance(bench_case: BenchCase) -> None:
     needs **all six** arguments. A four-argument call binds ``vt`` to ``FS`` and returns an *empty
     array* rather than raising, so the two face arrays are passed explicitly empty.
     """
+    if bench_case.kind == "meshlib":
+        # ``startVertices`` is a VertBitSet over the vertex domain -- there is no index-list
+        # overload -- and it is the input, so it is built outside the timed callable. The mesh is
+        # read-only here and cached; ``maxVertUpdates`` stays at its default of 3, which is the
+        # accuracy setting the correctness comparison was measured at.
+        mesh_ml = _mesh_ml(bench_case)
+        starts_ml = mm.VertBitSet()
+        starts_ml.resize(mesh_ml.points.size(), False)
+        starts_ml.set(mm.VertId(int(_SOURCES[0])), True)
+        distances_ml = bench_case.run(
+            lambda: mm.computeSurfaceDistances(mesh_ml, starts_ml), rounds=_ROUNDS
+        )
+        assert distances_ml.size() == bench_case.n_vertices
+        return
     if bench_case.kind == "igl":
         # ``skip_larger_than`` is a no-op on the synthetic feature meshes (they are not on the size
         # ladder), so the cap is by name.

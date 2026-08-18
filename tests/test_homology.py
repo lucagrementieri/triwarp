@@ -1,11 +1,13 @@
 """
 Structural tests for ``triwarp.homology``.
 
-This is the one module in the port with no reference implementation on either side: potpourri3d does
-not bind geometry-central's homology code, and neither trimesh nor libigl computes a homology basis.
-So the invariants stand in for an oracle, and between them they pin the result down tightly: the
-*number* of loops is forced by the Euler characteristic, and each loop has to be a simple closed
-walk along real mesh edges. A basis is not unique, so nothing checks *which* loops come back.
+**meshlib is the one reference that computes a basis**, through ``detectBasisTunnels``, and it is
+compared here for the only thing two bases can share: their *count*, forced by the Euler
+characteristic. potpourri3d does not bind geometry-central's homology code and neither trimesh nor
+libigl computes one, so for everything else the invariants stand in for an oracle -- each loop has
+to be a simple closed walk along real mesh edges, and non-contractible. A basis is not unique, so
+nothing checks *which* loops come back: measured on a torus, triwarp returns loops of 32 and 18
+edges where MeshLib returns 72 and 32, both valid.
 """
 
 from __future__ import annotations
@@ -16,8 +18,10 @@ import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from tests.conversions import trimesh_to_meshlib
 
 
 def _is_simple_edge_cycle(loop: np.ndarray, edges_tm: set[tuple[int, int]]) -> bool:
@@ -43,6 +47,52 @@ def test_homology_generator_count_is_twice_the_genus(
     # The genus the fixture is built for, and the genus the mesh actually has, must agree first.
     assert tw.totals.euler_characteristic(mesh_wp.indices) == 2 - 2 * genus
     assert len(loops) == 2 * genus
+
+
+@pytest.mark.parametrize(("mesh_name", "genus"), [("torus", 1), ("genus_two", 2)])
+@pytest.mark.parity(
+    "homology_generators",
+    "meshlib",
+    benchmarked=False,
+    reason="there is nothing in the benchmark registry to time this on: homology_generators "
+    "requires a *closed* surface and every scan mesh has boundary (bunny_decimated has 723 "
+    "boundary edges, and triwarp raises rather than guessing), while no feature mesh has positive "
+    "genus. detectBasisTunnels is a real reference and is compared here; the missing piece is a "
+    "closed genus-g benchmark mesh, not an oracle.",
+)
+def test_homology_generator_count_matches_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str, genus: int
+) -> None:
+    """
+    Class C (a count): a homology basis is not unique, so the loop *count* is all two share.
+
+    ``detectBasisTunnels`` returns a vector of ``EdgeId`` paths -- MeshLib's own basis of
+    non-contractible cycles -- and both libraries must find ``2 * genus`` of them. Which loops they
+    are is free: on the torus triwarp returns cycles of 32 and 18 edges where MeshLib returns 72 and
+    32, and both are correct bases of the same first homology group.
+
+    So the count is the comparison and the *structure* is what makes it non-vacuous: each of
+    MeshLib's paths is checked to be a genuine closed edge walk with no repeated vertex, which is
+    the same property [`test_homology_generators_are_simple_closed_edge_cycles`] asserts on
+    triwarp's side. A reference returning ``2 * genus`` arbitrary edge lists would pass a bare count
+    and fail this.
+
+    The decode is the ``EdgeId`` one this suite uses throughout: ``org`` gives each step's tail and
+    the last step's ``dest`` closes the loop.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    loops_wp = tw.homology.homology_generators(mesh_wp.points, mesh_wp.indices)
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    tunnels_ml = mm.detectBasisTunnels(mm.MeshPart(mesh_ml))
+
+    assert len(tunnels_ml) == 2 * genus
+    assert len(loops_wp) == len(tunnels_ml)
+    for tunnel_ml in tunnels_ml:
+        walk_np = [int(mesh_ml.topology.org(edge_ml)) for edge_ml in tunnel_ml]
+        assert len(walk_np) >= 3
+        assert len(set(walk_np)) == len(walk_np)  # simple: no vertex repeats
+        assert int(mesh_ml.topology.dest(tunnel_ml[-1])) == walk_np[0]  # and closed
 
 
 @pytest.mark.parametrize("mesh_name", ["torus", "genus_two"])
