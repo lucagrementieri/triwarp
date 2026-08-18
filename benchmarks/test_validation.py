@@ -95,6 +95,7 @@ import numpy as np
 import pytest
 import trimesh as tm
 from conftest import BenchCase
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -239,9 +240,21 @@ def _run_topology_pml(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="is_watertight")
 @pytest.mark.benchaxis("overlap")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab", "meshlib")
 def test_is_watertight(bench_case: BenchCase) -> None:
-    """Edge counts plus a self-intersection pass: driven by collision density, not size."""
+    """
+    Edge counts plus a self-intersection pass: driven by collision density, not size.
+
+    meshlib's ``MeshTopology.isClosed`` answers the *closedness* clause alone -- the same weaker
+    question trimesh's ``is_watertight`` answers -- and it answers it off state the topology already
+    holds, so this row is a lower bound on the group rather than an equivalent computation. The
+    mesh build is outside the timed callable for that reason: with it inside, the row would time the
+    converter.
+    """
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        assert bench_case.run(mesh_ml.topology.isClosed) in (True, False)
+        return
     if bench_case.kind == "pymeshlab":
         _run_topology_pml(bench_case)
         return
@@ -272,3 +285,33 @@ def test_is_volume(bench_case: BenchCase) -> None:
         vertices, faces = bench_case.vertices_np, bench_case.faces_np
         result = bench_case.run(lambda: tm.Trimesh(vertices, faces, process=False).is_volume)
     assert result in (True, False)
+
+
+@pytest.mark.benchmark(group="face_self_intersecting_mask")
+@pytest.mark.benchaxis("overlap")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_face_self_intersecting_mask(bench_case: BenchCase) -> None:
+    """
+    The per-face self-intersection flags, which ``is_watertight`` reduces to a single bool.
+
+    Timed separately from ``is_watertight`` because the two libraries compose the predicate
+    differently: triwarp's ``is_watertight`` runs the manifold checks *first* and this pass only if
+    they hold, and MeshLib's ``isClosed`` never runs it at all. So the composite group prices three
+    clauses on one side and one on the other, and only this group prices the clause they share.
+
+    meshlib's ``findSelfCollidingTrianglesBS`` returns the same per-face set (asserted face for face
+    in ``tests/test_validation.py``) from an AABB tree over the faces, multi-threaded -- read it
+    against ``triwarp-cuda``. ``touchIsIntersection=False`` is the setting that matches triwarp and
+    is passed explicitly; the tree is built lazily on first use, so the mesh is constructed outside
+    the timed callable and the row prices the query.
+    """
+    if bench_case.kind == "meshlib":
+        mesh_part_ml = mm.MeshPart(bench_case.new_mesh_ml())
+        colliding_ml = bench_case.run(
+            lambda: mm.findSelfCollidingTrianglesBS(mesh_part_ml, touchIsIntersection=False)
+        )
+        assert colliding_ml.size() <= bench_case.n_faces
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    mask = bench_case.run(lambda: tw.validation.face_self_intersecting_mask(vertices, faces))
+    assert int(mask.shape[0]) == bench_case.n_faces

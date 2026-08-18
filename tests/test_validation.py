@@ -6,11 +6,14 @@ import pytest
 import trimesh as tm
 import trimesh.repair as tm_repair
 import warp as wp
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.comparisons import canonical_winding, undirected_edges
 from tests.conversions import (
+    meshlib_bitset_to_numpy,
     numpy_to_warp,
+    trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
     trimesh_to_pyvista,
@@ -587,6 +590,100 @@ def test_face_self_intersecting_mask_matches_predicate(
     assert bool(tw.reduce.any(mask_wp)) == predicate
 
 
+@pytest.mark.parametrize("mesh_name", ["boy_surface", "icosahedron", "cave_cube"])
+@pytest.mark.parity("face_self_intersecting_mask", "meshlib")
+def test_face_self_intersecting_mask_matches_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B, face for face: MeshLib's ``findSelfCollidingTrianglesBS`` with the bitset padded.
+
+    The transform is the padding and nothing else. A MeshLib bitset built by *insertion* is only as
+    long as its highest set bit needs -- measured **608** entries for a 640-face mesh whose last
+    colliding face is 607, and an **empty** array on a clean mesh -- so it goes through
+    [`meshlib_bitset_to_numpy`][tests.conversions.meshlib_bitset_to_numpy], which states the face
+    domain. Read raw, the comparison fails by shape on exactly the meshes where it should pass.
+
+    ``touchIsIntersection=False`` is the setting that matches triwarp, which flags a pair only when
+    the separating-axis test finds a genuine crossing; at ``True`` MeshLib additionally flags
+    coplanar contact and reads **253** faces against triwarp's 177 on ``boy_surface``. That is the
+    convention knob, so it is passed explicitly rather than left at its default.
+
+    Non-vacuous in both directions: ``boy_surface`` is a closed surface that passes through itself,
+    where both sides flag 177 of 2 964 faces, and the two closed fixtures flag none. A comparison
+    run only on the clean meshes would be ``[] == []``.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_faces = mesh_tm.faces.shape[0]
+    mask_wp = tw.validation.face_self_intersecting_mask(mesh_wp.points, mesh_wp.indices)
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    colliding_ml = mm.findSelfCollidingTrianglesBS(mm.MeshPart(mesh_ml), touchIsIntersection=False)
+    mask_ml = meshlib_bitset_to_numpy(colliding_ml, n_faces)
+
+    assert mask_ml.sum() > 0 if mesh_name == "boy_surface" else mask_ml.sum() == 0
+    assert np.array_equal(mask_wp.numpy(), mask_ml)
+    assert tw.validation.is_self_intersecting(mesh_wp) is bool(mask_ml.any())
+
+
+def test_face_self_intersecting_mask_two_boxes_matches_meshlib(device: str) -> None:
+    """
+    Class B on the transversal case the fixtures cannot supply: two interpenetrating boxes.
+
+    Every closed fixture either self-intersects along a *tangency* curve (``bohemian_dome``, where
+    the two sides disagree -- see
+    [`test_face_self_intersecting_mask_tangential_contact_divergence`]) or not at all, so this is
+    the only input in the module where two triangles cross cleanly through each other's interior
+    and both libraries have to say so. Both flag the same 12 of 24 faces.
+    """
+    first_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
+    second_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
+    second_tm.apply_translation([0.5, 0.5, 0.5])
+    tangled_tm = tm.util.concatenate([first_tm, second_tm])
+    tangled_tm.merge_vertices()
+
+    vertices_wp, faces_wp = numpy_to_warp(tangled_tm.vertices, tangled_tm.faces, device)
+    mask_wp = tw.validation.face_self_intersecting_mask(vertices_wp, faces_wp)
+
+    mesh_ml = trimesh_to_meshlib(tangled_tm)
+    colliding_ml = mm.findSelfCollidingTrianglesBS(mm.MeshPart(mesh_ml), touchIsIntersection=False)
+    mask_ml = meshlib_bitset_to_numpy(colliding_ml, tangled_tm.faces.shape[0])
+
+    assert int(mask_ml.sum()) == 12  # non-vacuity: the reference found the crossing
+    assert np.array_equal(mask_wp.numpy(), mask_ml)
+
+
+def test_face_self_intersecting_mask_tangential_contact_divergence(
+    bohemian_dome: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Not a parity assert: the input class where triwarp and MeshLib disagree, pinned with numbers.
+
+    The Bohemian dome's two sheets meet along a curve they are *tangent* to rather than crossing
+    transversally, and there the two separating-axis implementations classify a band of triangles
+    differently: triwarp flags **205** of 3 042 faces, MeshLib **161**, with 45 flagged only by
+    triwarp and 1 only by MeshLib. Neither is a rounding artifact -- the disagreeing faces span the
+    full area range, none is degenerate, and the mesh has no duplicated vertices. Turning
+    ``touchIsIntersection`` on moves MeshLib to 165, not to 205, so it is not the touch convention
+    either.
+
+    Recorded rather than tolerated: the exact comparison lives on the transversal fixtures above,
+    and this bounds the tangential disagreement at **2 %** of the faces so that a regression which
+    stopped detecting the contact curve at all, or started flagging the whole mesh, would fail here.
+    """
+    mesh_tm, mesh_wp = bohemian_dome
+    n_faces = mesh_tm.faces.shape[0]
+    mask_wp = tw.validation.face_self_intersecting_mask(mesh_wp.points, mesh_wp.indices).numpy()
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    colliding_ml = mm.findSelfCollidingTrianglesBS(mm.MeshPart(mesh_ml), touchIsIntersection=False)
+    mask_ml = meshlib_bitset_to_numpy(colliding_ml, n_faces)
+
+    assert mask_wp.sum() > 0
+    assert mask_ml.sum() > 0
+    assert int((mask_wp != mask_ml).sum()) < 0.02 * n_faces
+
+
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 def test_is_winding_consistent(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
@@ -937,6 +1034,43 @@ def test_is_watertight_rejects_a_connected_surface_that_intersects_itself(
     assert (
         mesh_tm.is_watertight is True
     )  # trimesh's weaker definition, and why open3d is the oracle
+
+
+@pytest.mark.parametrize("mesh_name", ALL_MESHES)
+@pytest.mark.parity("is_watertight", "meshlib")
+def test_is_watertight_closedness_clause_matches_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B: ``MeshTopology.isClosed`` is the *closedness* clause of triwarp's definition.
+
+    The named transform is which clause is being compared. triwarp follows Open3D -- edge-manifold
+    without boundary, vertex-manifold, and no self-intersection -- where ``isClosed`` answers only
+    "every edge has two faces", trimesh's weaker definition. On these fixtures, none of which
+    self-intersects, the three definitions coincide and the comparison is exact in both directions.
+
+    Where they part is asserted here rather than left to the docstring, on the same two
+    interpenetrating boxes [`test_is_watertight_rejects_self_intersection_like_open3d`] uses:
+    ``isClosed`` reads **True** and triwarp reads ``False``. So MeshLib is the oracle for the
+    closedness clause and open3d stays the oracle for the composite predicate.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+
+    closed_ml = mesh_ml.topology.isClosed()
+    assert closed_ml == (mesh_name in CLOSED_MESHES)
+    assert tw.validation.is_watertight(mesh_wp.points, mesh_wp.indices) == closed_ml
+    assert tw.validation.is_edge_manifold(mesh_wp.indices, allow_boundary_edges=False) == closed_ml
+
+    first_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
+    second_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
+    second_tm.apply_translation([0.5, 0.5, 0.5])
+    tangled_tm = tm.util.concatenate([first_tm, second_tm])
+    tangled_tm.merge_vertices()
+    vertices_wp, faces_wp = numpy_to_warp(tangled_tm.vertices, tangled_tm.faces, mesh_wp.device)
+    # The clause MeshLib does not carry: closed, and still not watertight under Open3D's definition.
+    assert trimesh_to_meshlib(tangled_tm).topology.isClosed() is True
+    assert tw.validation.is_watertight(vertices_wp, faces_wp) is False
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)

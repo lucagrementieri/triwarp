@@ -90,7 +90,8 @@ import pytest
 import pyvista as pv
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase, skip_larger_than
+from conftest import BenchCase, mesh_ml_from_numpy, skip_larger_than
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -276,7 +277,7 @@ def test_remove_non_manifold_faces(bench_case: BenchCase, extra: int) -> None:
 
 @pytest.mark.benchmark(group="split_nonmanifold")
 @pytest.mark.benchmeshes("sphere_med")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "meshlib")
 @pytest.mark.parametrize("extra", _NON_MANIFOLD_COUNTS, ids=["clean", "nm1024"])
 def test_split_nonmanifold(bench_case: BenchCase, extra: int) -> None:
     """
@@ -303,6 +304,23 @@ def test_split_nonmanifold(bench_case: BenchCase, extra: int) -> None:
     manifold with every face kept; the rows are a cost comparison, and ``tests/test_repair.py``
     carries both the agreement and the divergence.
     """
+    if bench_case.kind == "meshlib":
+        # The build is inside the timed callable and that is not a converter tax: MeshLib's
+        # half-edge topology cannot represent a non-edge-manifold mesh at all, so
+        # ``meshFromFacesVerts`` does this group's split while *constructing* -- on the injected
+        # defect, which is edge-incidence, ``duplicateMultiHoleVertices`` then reports 0 and the
+        # only honest row is both calls together. The ``tests/test_repair.py`` pair shows the two
+        # routes reaching the same vertex count.
+        vertices_np = bench_case.vertices_np
+        faces_nm_np = _faces_with_non_manifold_np(bench_case, extra)
+
+        def split_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(vertices_np, faces_nm_np)
+            mm.duplicateMultiHoleVertices(mesh_ml)
+            return mesh_ml.topology.numValidVerts()
+
+        assert bench_case.run(split_ml, rounds=3) >= bench_case.n_vertices
+        return
     if bench_case.kind == "igl":
         faces_nm_np = np.ascontiguousarray(
             _faces_with_non_manifold_np(bench_case, extra), dtype=np.int64
@@ -321,7 +339,7 @@ def test_split_nonmanifold(bench_case: BenchCase, extra: int) -> None:
 
 
 @pytest.mark.benchmark(group="remove_unreferenced_vertices")
-@pytest.mark.benchlibs("triwarp", "igl", "open3d")
+@pytest.mark.benchlibs("triwarp", "igl", "open3d", "meshlib")
 @pytest.mark.parametrize("unreferenced", [0, 1], ids=["clean", "padded"])
 def test_remove_unreferenced_vertices(bench_case: BenchCase, unreferenced: int) -> None:
     """
@@ -350,6 +368,22 @@ def test_remove_unreferenced_vertices(bench_case: BenchCase, unreferenced: int) 
     vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
     if unreferenced:
         vertices_np = np.ascontiguousarray(np.vstack([vertices_np, vertices_np]))
+    if bench_case.kind == "meshlib":
+        # ``pack()`` renumbers in place, so the mesh is built inside the timed callable and this
+        # row prices the build with it. The ``padded`` id costs meshlib nothing extra either way:
+        # the duplicated block is *trailing*, and ``meshFromFacesVerts`` sizes its point buffer by
+        # ``F.max() + 1``, so those vertices never reach the mesh. What it does price is the case
+        # the other three rows cannot show -- bunny's 1 113 *interior* unreferenced vertices, which
+        # arrive as invalid entries and are what pack() compacts away.
+        def pack_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(vertices_np, faces_np)
+            mesh_ml.pack()
+            return mesh_ml.topology.numValidVerts()
+
+        # Not bounded above by the input count: on a non-edge-manifold mesh the builder splits
+        # vertices apart before pack() ever runs (8 360 from bunny_decimated's 8 171).
+        assert bench_case.run(pack_ml) > 0
+        return
     if bench_case.kind == "open3d":
         skip_larger_than(bench_case, "bunny", "the container rebuild dominates past bunny")
         import open3d as o3d
@@ -408,7 +442,7 @@ def _soup(bench_case: BenchCase) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]
 
 @pytest.mark.benchmark(group="remove_duplicated_vertices")
 @pytest.mark.benchmeshes("sphere_med")
-@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab", "pyvista")
+@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab", "pyvista", "meshlib")
 @pytest.mark.parametrize("epsilon", _MERGE_EPSILONS, ids=["exact", "eps1e-6"])
 def test_remove_duplicated_vertices(bench_case: BenchCase, epsilon: float) -> None:
     """
@@ -420,6 +454,20 @@ def test_remove_duplicated_vertices(bench_case: BenchCase, epsilon: float) -> No
     callable because ``clean`` returns a new mesh from an input this benchmark does not otherwise
     hold as a ``PolyData``.
     """
+    if bench_case.kind == "meshlib":
+        # ``uniteCloseVertices`` welds in place and returns the merge count, so the soup mesh is
+        # rebuilt inside the timed callable. ``uniteOnlyBd=False`` is the setting that matches
+        # triwarp; MeshLib's default of ``True`` would weld only boundary vertices. Its single
+        # parameter is a distance, so the exact id is that distance at zero rather than a second
+        # code path -- unlike pymeshlab and VTK, whose two ids are two different calls.
+        soup_np = np.ascontiguousarray(bench_case.vertices_np[bench_case.faces_np].reshape(-1, 3))
+        faces_np = np.ascontiguousarray(np.arange(soup_np.shape[0], dtype=np.int32).reshape(-1, 3))
+
+        def weld_ml() -> int:
+            return mm.uniteCloseVertices(mesh_ml_from_numpy(soup_np, faces_np), epsilon, False)
+
+        assert 0 <= bench_case.run(weld_ml) < soup_np.shape[0]
+        return
     if bench_case.kind == "pyvista":
         soup_np = np.ascontiguousarray(bench_case.vertices_np[bench_case.faces_np].reshape(-1, 3))
         faces_np = np.ascontiguousarray(np.arange(soup_np.shape[0], dtype=np.int32).reshape(-1, 3))
@@ -467,7 +515,7 @@ def test_remove_duplicated_vertices(bench_case: BenchCase, epsilon: float) -> No
 
 @pytest.mark.benchmark(group="make_winding_consistent")
 @pytest.mark.benchaxis("diameter")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pymeshlab", "meshlib")
 def test_make_winding_consistent(bench_case: BenchCase) -> None:
     """
     Flip mask from the parity union-find, then one relabel pass: flat across the axis.
@@ -482,6 +530,17 @@ def test_make_winding_consistent(bench_case: BenchCase) -> None:
     ``tests/test_validation.py``). Unlike the other two it does not mutate an input, so nothing is
     rebuilt inside the callable.
     """
+    if bench_case.kind == "meshlib":
+        # A fourth traversal, and the only one that also decides the *global* sign: it ray-casts to
+        # find which side is outside, so it does strictly more than the flip mask and is expected
+        # to cost more. It returns a bitset without touching the mesh, so one mesh serves every
+        # round -- but the ray casting builds an AABB tree lazily, so it is pre-warmed outside the
+        # timed callable and this row prices the traversal rather than the tree.
+        mesh_ml = bench_case.new_mesh_ml()
+        mm.findDisorientedFaces(mesh_ml)
+        disoriented_ml = bench_case.run(lambda: mm.findDisorientedFaces(mesh_ml))
+        assert disoriented_ml.size() <= bench_case.n_faces
+        return
     if bench_case.kind == "igl":
         faces_np = np.ascontiguousarray(bench_case.faces_np, dtype=np.int64)
         oriented_igl, _components_igl = bench_case.run(lambda: igl.bfs_orient(faces_np))
@@ -540,10 +599,28 @@ def test_make_volume(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="bad_face_mask")
 @pytest.mark.benchaxis("quality")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "pymeshlab", "meshlib")
 def test_bad_face_mask(bench_case: BenchCase) -> None:
-    """All three defect criteria at once: face quality, adjacency scatter, per-face gate."""
+    """
+    All three defect criteria at once: face quality, adjacency scatter, per-face gate.
+
+    meshlib's ``findOverlappingTris`` covers the **fold** criterion alone -- it is a proximity
+    search over the AABB tree for near-coincident triangles with near-antiparallel normals, where
+    the other two rows read the dihedral off the face adjacency -- so it is a lower bound on this
+    group and a different algorithm for the one clause it shares. ``maxNormalDot`` is the dihedral
+    threshold in dot-product form (``cos(radians(160))``); the equality of the two answers, and the
+    input class where they part, are in ``tests/test_repair.py``. The tree is lazily built, so the
+    mesh is constructed and pre-warmed outside the timed callable.
+    """
     n_faces = bench_case.n_faces
+    if bench_case.kind == "meshlib":
+        settings_ml = mm.FindOverlappingSettings()
+        settings_ml.maxNormalDot = float(np.cos(np.radians(160.0)))
+        mesh_part_ml = mm.MeshPart(bench_case.new_mesh_ml())
+        mm.findOverlappingTris(mesh_part_ml, settings_ml)
+        folded_ml = bench_case.run(lambda: mm.findOverlappingTris(mesh_part_ml, settings_ml))
+        assert folded_ml.size() <= n_faces
+        return
     if bench_case.kind == "pymeshlab":
         # Selection-only, so the geometry survives and the MeshSet is shared.
         meshset_pml = bench_case.meshset_pml
@@ -589,3 +666,78 @@ def test_remove_t_vertices(bench_case: BenchCase) -> None:
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     flipped = bench_case.run(lambda: tw.repair.remove_t_vertices(vertices, faces), rounds=3)
     assert int(flipped.shape[0]) == int(faces.shape[0])
+
+
+@pytest.mark.benchmark(group="remove_degenerate_faces")
+@pytest.mark.benchaxis("quality")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_remove_degenerate_faces(bench_case: BenchCase) -> None:
+    """
+    Find the zero-area triangles and compact them away: an altitude test, a scan and a gather.
+
+    On the ``quality`` axis rather than a defect sweep for the reason ``bad_face_mask`` is: a
+    degenerate face cannot be injected without changing what the other rows measure, and
+    ``saddle_graded``'s worst aspect ratio of 4 719 is the closest a registry mesh comes to one.
+    Both sides should be flat across the axis -- neither's cost depends on how many it finds -- and
+    a row that is not is the finding.
+
+    meshlib's ``findDegenerateFaces`` returns the same face set (asserted in
+    ``tests/test_repair.py``) and stops there, so it does strictly less than triwarp's row, which
+    also rebuilds the mesh without those faces. Its ``criticalAspectRatio`` is left at its
+    ``FLT_MAX`` default, the setting under which its criterion is triwarp's.
+    """
+    if bench_case.kind == "meshlib":
+        mesh_part_ml = mm.MeshPart(bench_case.new_mesh_ml())
+        degenerate_ml = bench_case.run(lambda: mm.findDegenerateFaces(mesh_part_ml))
+        assert degenerate_ml.size() <= bench_case.n_faces
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    kept_vertices, kept_faces = bench_case.run(
+        lambda: tw.repair.remove_degenerate_faces(vertices, faces)
+    )
+    assert int(kept_faces.shape[0]) <= int(faces.shape[0])
+    assert int(kept_vertices.shape[0]) <= bench_case.n_vertices
+
+
+@pytest.mark.benchmark(group="collapse_small_triangles")
+@pytest.mark.benchaxis("quality")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_collapse_small_triangles(bench_case: BenchCase) -> None:
+    """
+    Collapse the sub-threshold triangles to a fixpoint: the one repair group that iterates.
+
+    The ``quality`` axis is the axis this group is *about*: ``saddle`` has nothing under the
+    threshold and exits after one pass, while ``saddle_graded``'s fine end gives the loop rounds of
+    real work, so the pair separates the detection cost from the collapsing cost. Both rows use the
+    same threshold, expressed in each library's own parameter -- triwarp's ``epsilon`` is a relative
+    *area* against the squared bounding-box diagonal and MeshLib's ``tinyEdgeLength`` an absolute
+    *length* -- so this is a cost comparison at a matched scale rather than at a matched knob.
+
+    meshlib is the only bound reference for this function at all: libigl does not export
+    ``collapse_small_triangles`` despite shipping the header. ``resolveMeshDegenerations`` mutates
+    and invalidates the mesh's tree, so its mesh is rebuilt inside the timed callable and this row
+    carries the build. Both loop, so both take ``rounds=3``.
+    """
+    diagonal = float(
+        np.linalg.norm(bench_case.vertices_np.max(axis=0) - bench_case.vertices_np.min(axis=0))
+    )
+    epsilon = 1e-5
+    if bench_case.kind == "meshlib":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        settings_ml = mm.ResolveMeshDegenSettings()
+        settings_ml.tinyEdgeLength = 1e-2 * diagonal
+        settings_ml.maxDeviation = 1e-3 * diagonal
+
+        def resolve_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(vertices_np, faces_np)
+            mm.resolveMeshDegenerations(mesh_ml, settings_ml)
+            return mesh_ml.topology.numValidFaces()
+
+        assert 0 < bench_case.run(resolve_ml, rounds=3) <= bench_case.n_faces
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    kept_vertices, kept_faces = bench_case.run(
+        lambda: tw.repair.collapse_small_triangles(vertices, faces, epsilon), rounds=3
+    )
+    assert int(kept_faces.shape[0]) <= int(faces.shape[0])
+    assert int(kept_vertices.shape[0]) <= bench_case.n_vertices

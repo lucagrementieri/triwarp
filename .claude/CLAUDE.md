@@ -700,8 +700,15 @@ all measured:
   `VertCoords` / `FaceNormals` / `std_vector_Vector3_float` and raises a clear `TypeError`
   otherwise — that part is safe), and `np.asarray(vert_scalars)` produces `dtype=object, shape=()`
   rather than raising, so the failure surfaces several lines later in whatever NumPy call comes
-  next. Go through `conversions.meshlib_scalars_to_numpy`. Bitsets need no equivalent:
-  `mn.getNumpyBitSet` returns a correctly domain-sized `bool` array even when only bit 0 is set.
+  next. Go through `conversions.meshlib_scalars_to_numpy`.
+- **A returned bitset is only as long as its highest set bit, and which functions do that is not
+  guessable.** `mn.getNumpyBitSet` reads the bitset at *its own* length: one MeshLib sized against
+  the mesh comes back domain-sized (`getBoundaryVerts` gives 162 entries on a 162-vertex mesh with
+  one bit set), but one built by insertion does not — `findSelfCollidingTrianglesBS` returns **608**
+  entries on a 640-face pair of overlapping spheres (last colliding face 607) and an **empty** array
+  on a clean mesh. Neither raises, and both break an `np.array_equal` against a triwarp mask by
+  *shape* rather than by value, which reads as a converter bug. Go through
+  `conversions.meshlib_bitset_to_numpy(bitset, size)`, which states the domain and pads.
 - **`(*args, **kwargs)` in a signature is an overload set, and `inspect` / `help()` cannot see it.**
   This wheel's pybind11 docstrings are stripped: `inspect.signature` gives `(*args, **kwargs)` and
   `__doc__` carries no overload lines. **Read the real signatures by calling the function with one
@@ -897,7 +904,9 @@ Reuse `tests/comparisons.py` (`lexsort_rows`, `assert_unordered_rows_equal`, `un
 `hausdorff_surface_two_sided`) and `tests/conversions.py` (`numpy_to_warp`, `numpy_to_warp_uv`,
 `trimesh_to_warp`, `warp_to_trimesh`, `trimesh_to_open3d`, `points_to_open3d`, `open3d_to_trimesh`,
 `trimesh_to_open3d_t`, `trimesh_to_pymeshlab`, `warp_to_pymeshlab`, `points_to_pymeshlab`,
-`trimesh_to_pyvista`, `points_to_pyvista`, `pyvista_edges_to_indices`, `faces_igl`, `mesh_igl`)
+`trimesh_to_pyvista`, `points_to_pyvista`, `pyvista_edges_to_indices`, `numpy_to_meshlib`,
+`trimesh_to_meshlib`, `warp_to_meshlib`, `points_to_meshlib`, `meshlib_to_trimesh`,
+`meshlib_scalars_to_numpy`, `meshlib_bitset_to_numpy`, `faces_igl`, `mesh_igl`)
 rather than re-rolling either. **Check both modules before writing a private helper in a test
 file** — every one of the six consolidated in 2026-08 was written by someone who did not, and
 `undirected_edges` alone had been spelled three different ways across six files.

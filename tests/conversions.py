@@ -431,11 +431,34 @@ def meshlib_scalars_to_numpy(scalars_ml: object) -> np.ndarray:
     than raising, so a comparison written that way fails several lines later in whatever NumPy call
     comes next, with nothing pointing at the cause.
 
-    Iteration is the working route. Bitsets need no equivalent: ``mn.getNumpyBitSet`` already
-    returns a correctly domain-sized ``bool`` array (162 entries for a 162-vertex mesh) even when
-    only bit 0 is set.
+    Iteration is the working route. Bitsets have their own reader,
+    [`meshlib_bitset_to_numpy`][tests.conversions.meshlib_bitset_to_numpy], because their size is
+    *not* always the element domain.
     """
     return np.fromiter(iter(scalars_ml), np.float64, scalars_ml.size())  # type: ignore[attr-defined]
+
+
+def meshlib_bitset_to_numpy(bitset_ml: object, size: int) -> np.ndarray:
+    """
+    Read a MeshLib bitset as a ``bool`` array of exactly ``size`` entries.
+
+    ``mn.getNumpyBitSet`` returns the bitset at *its own* length, and whether that is the element
+    domain depends on which function produced it. A bitset MeshLib sized against the mesh comes
+    back domain-sized -- ``getBoundaryVerts`` on a 162-vertex mesh gives 162 entries even when one
+    bit is set -- but a bitset built by *insertion* is only as long as its highest set bit needs:
+    ``findSelfCollidingTrianglesBS`` on a 640-face pair of overlapping spheres returns **608**
+    entries (last colliding face 607) and an *empty* array on a clean mesh, where the comparison
+    wants 640 and 640.
+
+    Neither shape raises, and both break a ``np.array_equal`` against a triwarp mask by shape
+    rather than by value, so every bitset in this suite is read through here with the domain size
+    stated by the caller. A bitset *longer* than ``size`` is a genuine domain mismatch (the wrong
+    element type, or a converter that dropped elements) and raises.
+    """
+    flags_np = mn.getNumpyBitSet(bitset_ml)
+    if flags_np.shape[0] > size:
+        raise ValueError(f"bitset holds {flags_np.shape[0]} bits, more than the {size} elements")
+    return np.pad(flags_np, (0, size - flags_np.shape[0]))
 
 
 def warp_to_trimesh(vertices_wp: wp.array, faces_wp: wp.array) -> tm.Trimesh:

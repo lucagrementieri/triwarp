@@ -9,14 +9,27 @@ import pytest
 import trimesh as tm
 import trimesh.repair as tm_repair
 import warp as wp
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.comparisons import canonical_winding, lexsort_rows, same_partition, undirected_edges
+from tests.comparisons import (
+    canonical_winding,
+    hausdorff_surface_two_sided,
+    lexsort_rows,
+    same_partition,
+    undirected_edges,
+)
 from tests.conversions import (
+    meshlib_bitset_to_numpy,
+    meshlib_to_trimesh,
+    numpy_to_meshlib,
     numpy_to_warp,
+    trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
     trimesh_to_pyvista,
+    warp_to_trimesh,
 )
 
 
@@ -188,6 +201,54 @@ def test_remove_unreferenced_sentinel(device: str):
     assert np.array_equal(nf_wp.numpy().reshape(-1, 3), faces_np)
     expected_remap = np.array([0, 1, 2], dtype=np.int32)
     assert np.array_equal(remap_wp.numpy(), expected_remap)
+
+
+@pytest.mark.parity("remove_unreferenced_vertices", "meshlib")
+def test_remove_unreferenced_vertices_matches_meshlib_pack(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh], device: str
+) -> None:
+    """
+    Class A on both compacted buffers, and the clearest demonstration of MeshLib's ``pack()``.
+
+    MeshLib has no ``remove_unreferenced_vertices``: dropping a face leaves its now-orphaned vertex
+    in the point buffer as an *invalid* entry, and ``Mesh.pack()`` is what compacts the buffers and
+    renumbers. Reading before packing is silent and wrong -- measured here on a 42-vertex sphere
+    with one interior vertex orphaned: ``points.size()`` reads **42** and ``getNumpyVerts`` returns
+    42 rows while ``numValidVerts`` reads **41**, so a comparison that skipped the pack would report
+    a vertex triwarp had removed as a disagreement. After the pack both sides read 41 and 75 faces.
+
+    The orphaned vertex is chosen *interior* deliberately: the converter sizes its point buffer by
+    ``F.max() + 1``, so a **trailing** unreferenced vertex is dropped by
+    [`numpy_to_meshlib`][tests.conversions.numpy_to_meshlib] before MeshLib ever sees it and the
+    comparison would be vacuous. Positions are compared after a lexsort because the two compactions
+    renumber differently; the face *count* is exact on both sides.
+    """
+    mesh_tm, _mesh_wp = icosphere_coarse
+    orphan = 7
+    faces_np = mesh_tm.faces[~(mesh_tm.faces == orphan).any(axis=1)]
+    n_vertices = mesh_tm.vertices.shape[0]
+
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, faces_np, device)
+    kept_wp, kept_faces_wp, _remap_wp = tw.repair.remove_unreferenced_vertices(
+        vertices_wp, faces_wp
+    )
+
+    mesh_ml = numpy_to_meshlib(mesh_tm.vertices, faces_np)
+    # The state pack() exists for, asserted rather than described: the buffer still holds it.
+    assert mesh_ml.points.size() == n_vertices
+    assert mn.getNumpyVerts(mesh_ml).shape[0] == n_vertices
+    assert mesh_ml.topology.numValidVerts() == n_vertices - 1
+    packed_tm = meshlib_to_trimesh(mesh_ml)
+
+    assert packed_tm.vertices.shape[0] == n_vertices - 1  # the reference really compacted
+    assert int(kept_wp.shape[0]) == packed_tm.vertices.shape[0]
+    assert int(kept_faces_wp.shape[0]) // 3 == packed_tm.faces.shape[0]
+    assert np.allclose(
+        lexsort_rows(np.round(kept_wp.numpy().astype(np.float64), 5)),
+        lexsort_rows(np.round(packed_tm.vertices, 5)),
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 def test_remove_duplicate_vertices_exact(device: str):
@@ -460,6 +521,54 @@ def test_remove_duplicated_vertices_matches_open3d_and_pymeshlab(
     assert len(trimesh_to_pyvista(soup_tm).validate_mesh().coincident_points) == 0
 
 
+@pytest.mark.parametrize("epsilon", [0.0, 1e-6])
+@pytest.mark.parity("remove_duplicated_vertices", "meshlib")
+def test_remove_duplicated_vertices_matches_meshlib(
+    device: str, epsilon: float, icosphere_coarse: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Class B on the survivors: ``uniteCloseVertices`` welds in place and reports a *count*.
+
+    Two transforms, both named. The result is not returned -- the mesh is mutated and the return is
+    the number of vertices merged (798 here, from 960 soup positions down to the icosphere's 162) --
+    so it is read back through [`meshlib_to_trimesh`][tests.conversions.meshlib_to_trimesh], which
+    packs first; without the pack the buffer still holds the 960 slots. And the survivors are
+    renumbered differently on each side, so the positions are compared after a lexsort exactly as
+    the open3d / pymeshlab / pyvista comparison above does.
+
+    ``uniteOnlyBd=False`` is the setting that matches triwarp and is passed explicitly: MeshLib's
+    default is ``True``, which welds only vertices on a boundary and would leave an interior soup
+    untouched. On this input every position is a boundary vertex of its own triangle, so the default
+    happens to agree -- which is exactly why it is pinned rather than relied on.
+
+    The count is only the headline; a welder that merged the wrong pairs can still reach 162, so the
+    positions carry the claim. ``findCloseVertices`` is *not* the pairing: it flags **both** members
+    of a close pair (2 bits for 1 duplicate, measured), where triwarp's answer is the survivors.
+    """
+    mesh_tm, _mesh_wp = icosphere_coarse
+    soup_np = np.ascontiguousarray(mesh_tm.vertices[mesh_tm.faces].reshape(-1, 3))
+    faces_np = np.arange(soup_np.shape[0], dtype=np.int32).reshape(-1, 3)
+
+    vertices_wp, faces_wp = numpy_to_warp(soup_np, faces_np, device)
+    unique_wp, _indices_wp, _inverse_wp, _faces_wp = tw.repair.remove_duplicated_vertices(
+        vertices_wp, faces_wp, epsilon
+    )
+
+    mesh_ml = numpy_to_meshlib(soup_np, faces_np)
+    n_merged_ml = mm.uniteCloseVertices(mesh_ml, epsilon, False)
+    welded_tm = meshlib_to_trimesh(mesh_ml)
+
+    assert n_merged_ml == soup_np.shape[0] - mesh_tm.vertices.shape[0]  # 798 of 960
+    assert welded_tm.vertices.shape[0] == mesh_tm.vertices.shape[0]
+    assert int(unique_wp.shape[0]) == welded_tm.vertices.shape[0]
+    assert np.allclose(
+        lexsort_rows(np.round(unique_wp.numpy().astype(np.float64), 5)),
+        lexsort_rows(np.round(welded_tm.vertices, 5)),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
 @pytest.mark.parity("make_winding_consistent", "pymeshlab")
 def test_make_winding_consistent_matches_pymeshlab(
     device: str, icosphere_coarse: tuple[tm.Trimesh, wp.Mesh]
@@ -503,6 +612,60 @@ def test_make_winding_consistent_matches_pymeshlab(
         lexsort_rows(canonical_winding(faces_pml)),
     )
     assert tw.validation.is_winding_consistent(repaired_wp)
+
+
+@pytest.mark.parametrize("flip_seed_face", [False, True])
+@pytest.mark.parity("make_winding_consistent", "meshlib")
+def test_make_winding_consistent_matches_meshlib(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh], device: str, flip_seed_face: bool
+) -> None:
+    """
+    Class B: the same flip set up to a global flip, which is the gauge the two libraries fix apart.
+
+    ``findDisorientedFaces`` returns the faces MeshLib would reverse, so the comparison is between
+    two *sets of faces to flip* -- triwarp's is recovered by differencing its output buffer against
+    its input. They agree exactly, but only up to complementation, and the parametrization is what
+    makes that visible rather than lucky: triwarp's flood fill keeps the **seed face** (face 0) as
+    it found it, while MeshLib decides globally by ray casting and picks the *outward* orientation.
+    So with face 0 left alone the two sets are identical (40 of 320 faces, measured), and with face
+    0 among the flipped ones they are exact complements (3 flagged by MeshLib against 317 by
+    triwarp). Either way both windings are consistent, which is the property the function promises.
+
+    The bitset is padded to the face count through
+    [`meshlib_bitset_to_numpy`][tests.conversions.meshlib_bitset_to_numpy]: it comes back at the
+    length of its highest set bit, so an unpadded read fails by shape on exactly the meshes where
+    few faces are wrong.
+    """
+    mesh_tm, _mesh_wp = icosphere_coarse
+    rng = np.random.default_rng(3)
+    n_faces = mesh_tm.faces.shape[0]
+    flipped = rng.choice(np.arange(1, n_faces), size=39, replace=False)
+    flipped = np.concatenate([[0], flipped]) if flip_seed_face else flipped
+
+    faces_np = mesh_tm.faces.copy()
+    faces_np[flipped] = faces_np[flipped][:, ::-1]
+
+    _vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, faces_np, device)
+    fixed_np = tw.repair.make_winding_consistent(faces_wp).numpy().reshape(-1, 3)
+    flip_set_wp = ~(fixed_np == faces_np).all(axis=1)
+
+    mesh_ml = numpy_to_meshlib(mesh_tm.vertices, faces_np)
+    flip_set_ml = meshlib_bitset_to_numpy(mm.findDisorientedFaces(mesh_ml), n_faces)
+
+    assert flip_set_ml.sum() == len(flipped)  # non-vacuity: it found every seeded flip
+    if flip_seed_face:
+        assert np.array_equal(flip_set_wp, ~flip_set_ml)
+    else:
+        assert np.array_equal(flip_set_wp, flip_set_ml)
+
+    # Both repairs land on a consistent winding; they differ only in which global sign they pick.
+    faces_ml_np = faces_np.copy()
+    faces_ml_np[flip_set_ml] = faces_ml_np[flip_set_ml][:, ::-1]
+    _vertices_wp, faces_ml_wp = numpy_to_warp(mesh_tm.vertices, faces_ml_np, device)
+    assert tw.validation.is_winding_consistent(faces_ml_wp) is True
+    assert tw.validation.is_winding_consistent(
+        wp.array(fixed_np.reshape(-1), dtype=wp.int32, device=device)
+    )
 
 
 @pytest.mark.parity("make_winding_consistent", "igl")
@@ -1025,6 +1188,43 @@ def test_split_nonmanifold_matches_igl(
     assert np.array_equal(np.sort(source_igl), np.sort(source_np.astype(np.int64)))
 
 
+@pytest.mark.parametrize("mesh_kind", ["bowtie", "three_faces_on_one_edge"])
+@pytest.mark.parity("split_nonmanifold", "meshlib")
+def test_split_nonmanifold_matches_meshlib(mesh_kind: str, device: str) -> None:
+    """
+    Class B on the final vertex count: ``duplicateMultiHoleVertices`` mutates and returns a count.
+
+    The named transform is *where the split happens*, and it is not the same place on both sides.
+    MeshLib's half-edge builder cannot represent a non-edge-manifold topology at all, so
+    ``meshFromFacesVerts`` splits the offending vertices while **constructing** the mesh: the
+    three-faces-on-one-edge input arrives with 9 vertices from a 5-vertex array, and
+    ``duplicateMultiHoleVertices`` then reports **0**. On the bowtie, where the defect is a vertex
+    rather than an edge, the build is faithful and the call reports **1**. So the returned count is
+    not the comparable quantity -- the vertex total after both steps is, and it agrees exactly (6
+    and 9), as does the face count, which neither side may change.
+
+    That makes this the pair that pins triwarp's promise to keep every face: MeshLib reaches the
+    same manifold vertex set by two different routes and never drops a triangle either.
+    """
+    builders = {"bowtie": _bowtie_np, "three_faces_on_one_edge": _three_faces_on_one_edge_np}
+    vertices_np, faces_np = builders[mesh_kind]()
+
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    assert not tw.validation.is_vertex_manifold(faces_wp)  # non-vacuity: there is a defect to fix
+    split_wp, split_faces_wp, _source_wp = tw.repair.split_nonmanifold(vertices_wp, faces_wp)
+
+    mesh_ml = numpy_to_meshlib(vertices_np, faces_np)
+    n_duplicated_ml = mm.duplicateMultiHoleVertices(mesh_ml)
+    mesh_ml.pack()
+
+    expected_count = {"bowtie": 1, "three_faces_on_one_edge": 0}[mesh_kind]
+    assert n_duplicated_ml == expected_count
+    assert int(split_wp.shape[0]) == mesh_ml.topology.numValidVerts()
+    assert int(split_faces_wp.shape[0]) // 3 == mesh_ml.topology.numValidFaces()
+    assert int(split_faces_wp.shape[0]) // 3 == faces_np.shape[0]
+    assert tw.validation.is_vertex_manifold(split_faces_wp)
+
+
 @pytest.mark.parametrize(
     "mesh_kind", ["bowtie", "three_faces_on_one_edge", "flipped_face", "duplicated_face"]
 )
@@ -1150,6 +1350,54 @@ def test_remove_degenerate_faces_matches_trimesh(device: str) -> None:
     assert _triangle_set_close(kept_wp, kept_ref, atol=1e-5)
 
 
+@pytest.mark.parity("remove_degenerate_faces", "meshlib")
+def test_remove_degenerate_faces_matches_meshlib(device: str) -> None:
+    """
+    Class B (compare detection): ``findDegenerateFaces`` reports the faces this function drops.
+
+    MeshLib has no remover, so the transform is the same one the pymeshlab fold comparison makes --
+    compare the *mask* rather than the output mesh, then check the removal against it. Its
+    ``criticalAspectRatio`` selects additional near-degenerate slivers above the truly degenerate
+    ones; at its ``FLT_MAX`` default only the zero-area faces are reported, which is triwarp's
+    criterion, so the default is the setting compared here and is asserted to be insensitive over
+    three orders of magnitude on this input.
+
+    Non-vacuous by construction: one collinear triangle among two good ones, so both sides return a
+    mixed answer and neither an empty nor a full mask would pass.
+    """
+    vertices_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [2.0, 0.0, 0.0], [0.5, 0.0, 0.0]],
+        dtype=np.float64,
+    )
+    faces_np = np.array([[0, 1, 2], [1, 3, 2], [0, 4, 1]], dtype=np.int32)  # face 2 is collinear
+
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    keep_wp = tw.triangles.nondegenerate(vertices_wp, faces_wp)
+    kept_vertices_wp, kept_faces_wp = tw.repair.remove_degenerate_faces(vertices_wp, faces_wp)
+
+    mesh_ml = numpy_to_meshlib(vertices_np, faces_np)
+    degenerate_ml = meshlib_bitset_to_numpy(
+        mm.findDegenerateFaces(mm.MeshPart(mesh_ml)), faces_np.shape[0]
+    )
+
+    assert degenerate_ml.sum() == 1  # non-vacuity: the reference found exactly the collinear face
+    assert np.array_equal(~keep_wp.numpy(), degenerate_ml)
+    assert int(kept_faces_wp.shape[0]) // 3 == int((~degenerate_ml).sum())
+    assert int(kept_vertices_wp.shape[0]) == 4  # the collinear apex is now unreferenced
+
+    # The knob that is *not* in play: at any aspect ratio these three faces classify the same way.
+    for critical_aspect_ratio in (20.0, 1e3, 1e5):
+        assert np.array_equal(
+            meshlib_bitset_to_numpy(
+                mm.findDegenerateFaces(
+                    mm.MeshPart(mesh_ml), criticalAspectRatio=critical_aspect_ratio
+                ),
+                faces_np.shape[0],
+            ),
+            degenerate_ml,
+        )
+
+
 def test_remove_degenerate_faces_clean_mesh(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
     Not a library comparison: a clean mesh must lose no face and no vertex.
@@ -1244,6 +1492,70 @@ def test_collapse_small_triangles_fan_chain(device: str) -> None:
         out_vertices_wp.numpy().astype(np.float64), out_faces_wp.numpy().reshape(-1, 3)
     )
     assert _triangle_set_close(got, ref, atol=1e-3)
+
+
+@pytest.mark.parity("collapse_small_triangles", "meshlib")
+def test_collapse_small_triangles_matches_meshlib(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh], device: str
+) -> None:
+    """
+    Class C: MeshLib is the only bound reference for this function, and it collapses differently.
+
+    libigl does not bind ``collapse_small_triangles`` despite the C++ header existing, so
+    ``resolveMeshDegenerations`` -- an edge-collapse pass parameterized by ``tinyEdgeLength``
+    rather than by a relative area -- is the only implementation to compare against. There is no
+    correspondence between the two outputs: neither the vertex numbering nor which endpoint of a
+    collapsed edge survives is shared (triwarp keeps the component representative, MeshLib solves
+    for a position under ``maxDeviation``), so what is asserted is a statistic.
+
+    Three of them, on a 320-face sphere with 20 edges shrunk to a thousandth of their length:
+
+    - both reach exactly **286 faces and 145 vertices** from 320 and 162;
+    - neither output contains a single edge shorter than the critical length, where the input has
+      **17** -- MeshLib's own ``findShortEdges`` is the judge on both sides;
+    - the two surfaces stay within **0.0027** of each other, 7.8 % of the critical length.
+
+    Mutation probe and margin: running triwarp's pass an order of magnitude weaker
+    (``epsilon=1e-6``) leaves **316** faces and **15** short edges, so every threshold here is at
+    least 15 counts clear of the value a mis-scaled implementation produces, and the face-count
+    assert is exact rather than a bound.
+    """
+    mesh_tm, _mesh_wp = icosphere_coarse
+    rng = np.random.default_rng(0)
+    vertices_np = mesh_tm.vertices.copy()
+    edges_np = mesh_tm.edges_unique
+    for edge in edges_np[rng.choice(edges_np.shape[0], size=20, replace=False)]:
+        vertices_np[edge[1]] = vertices_np[edge[0]] + 1e-3 * (
+            vertices_np[edge[1]] - vertices_np[edge[0]]
+        )
+    diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
+    critical_length = 1e-2 * diagonal
+
+    def short_edges_ml(mesh: tm.Trimesh) -> int:
+        part = mm.MeshPart(trimesh_to_meshlib(mesh))
+        return mm.findShortEdges(part, critical_length).count()
+
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, mesh_tm.faces, device)
+    collapsed_tm = warp_to_trimesh(*tw.repair.collapse_small_triangles(vertices_wp, faces_wp, 1e-5))
+
+    mesh_ml = numpy_to_meshlib(vertices_np, mesh_tm.faces)
+    settings_ml = mm.ResolveMeshDegenSettings()
+    settings_ml.tinyEdgeLength = critical_length
+    settings_ml.maxDeviation = 0.1 * critical_length
+    assert mm.resolveMeshDegenerations(mesh_ml, settings_ml) is True
+    resolved_tm = meshlib_to_trimesh(mesh_ml)
+
+    assert short_edges_ml(tm.Trimesh(vertices_np, mesh_tm.faces, process=False)) == 17
+    assert collapsed_tm.faces.shape[0] == resolved_tm.faces.shape[0] == 286
+    assert collapsed_tm.vertices.shape[0] == resolved_tm.vertices.shape[0] == 145
+    assert short_edges_ml(collapsed_tm) == 0
+    assert short_edges_ml(resolved_tm) == 0
+    assert (
+        hausdorff_surface_two_sided(
+            collapsed_tm.vertices, collapsed_tm.faces, resolved_tm.vertices, resolved_tm.faces
+        )
+        < 0.1 * critical_length
+    )
 
 
 def test_collapse_small_triangles_empty(device: str) -> None:
@@ -1421,6 +1733,87 @@ def test_remove_folded_faces_matches_pymeshlab_on_which_faces_are_folded(device:
         vertices_wp, faces_wp, min_quality=None, max_fold_angle=160.0
     ).numpy()
     assert np.array_equal(folded_np.astype(bool), selected_pml.astype(bool))
+
+
+def _hinge_fan_np(angles_deg: tuple[float, ...]) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build one independent hinged triangle pair per requested dihedral angle, spaced 3 units apart.
+
+    Each pair shares one edge and nothing else, so the fold angle is prescribed exactly and no pair
+    can be confused with another -- which is what separates a dihedral criterion from a proximity
+    one (see [`test_remove_folded_faces_matches_meshlib`]).
+    """
+    vertices, faces = [], []
+    for index, angle in enumerate(angles_deg):
+        origin = np.array([3.0 * index, 0.0, 0.0])
+        tilt = np.radians(180.0 - angle)
+        base = len(vertices)
+        vertices += [
+            origin,
+            origin + np.array([0.0, 1.0, 0.0]),
+            origin + np.array([1.0, 0.0, 0.0]),
+            origin + np.array([np.cos(tilt), 0.0, np.sin(tilt)]),
+        ]
+        faces += [[base, base + 2, base + 1], [base, base + 1, base + 3]]
+    return np.array(vertices, dtype=np.float64), np.array(faces, dtype=np.int32)
+
+
+@pytest.mark.parametrize("threshold", [160.0, 120.0])
+@pytest.mark.parity("bad_face_mask", "meshlib")
+def test_remove_folded_faces_matches_meshlib(device: str, threshold: float) -> None:
+    """
+    Class B (compare detection): ``findOverlappingTris`` under the named angle-to-dot transform.
+
+    MeshLib parameterizes a fold by the **dot product** of the two normals where triwarp takes the
+    dihedral angle in degrees, so the transform is ``maxNormalDot = cos(radians(angle))``: its own
+    default of ``-0.99`` is 171.9 degrees, not triwarp's 160. Fed that, the two agree face for face
+    on a fan of seven independently hinged pairs spanning 10 to 175 degrees, at both thresholds.
+
+    ``findNotSmoothFaces`` is **not** the pairing, and that was measured: it reports **zero** faces
+    on this fan at every ``minAngle`` from 0.1 to 3.0 radians, so a comparison built on it would
+    pass vacuously against any implementation.
+
+    Two conventions the fan is shaped around. MeshLib is **inclusive at the threshold** where
+    triwarp is exclusive -- a pair at exactly 140 degrees is flagged by MeshLib and not by triwarp
+    at ``angle=140`` -- so no fixture angle sits on a threshold used here. And MeshLib's criterion
+    is *proximity plus antiparallel normals*, not adjacency: on the three-face
+    [`_folded_patch`] it flags all three faces because the folded apex triangle lies over both quad
+    halves, where triwarp flags only the one face whose dihedral exceeds the threshold. That
+    divergence is asserted below rather than avoided, since it is the reason the fan exists.
+    """
+    fan_angles = (10.0, 60.0, 100.0, 140.0, 150.0, 165.0, 175.0)
+    vertices_np, faces_np = _hinge_fan_np(fan_angles)
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+
+    folded_wp = tw.repair.bad_face_mask(
+        vertices_wp, faces_wp, min_quality=None, max_fold_angle=threshold
+    ).numpy()
+
+    settings_ml = mm.FindOverlappingSettings()
+    settings_ml.maxNormalDot = float(np.cos(np.radians(threshold)))
+    mesh_ml = numpy_to_meshlib(vertices_np, faces_np)
+    folded_ml = meshlib_bitset_to_numpy(
+        mm.findOverlappingTris(mm.MeshPart(mesh_ml), settings_ml), faces_np.shape[0]
+    )
+
+    n_folded = 2 * sum(angle > threshold for angle in fan_angles)
+    assert int(folded_ml.sum()) == n_folded  # non-vacuity: neither empty nor everything
+    assert np.array_equal(folded_wp, folded_ml)
+
+    # The divergence the fan avoids: proximity, not adjacency, so an apex over two faces flags both.
+    patch_vertices_np, patch_faces_np = _folded_patch()
+    patch_vertices_wp, patch_faces_wp = numpy_to_warp(patch_vertices_np, patch_faces_np, device)
+    patch_wp = tw.repair.bad_face_mask(
+        patch_vertices_wp, patch_faces_wp, min_quality=None, max_fold_angle=threshold
+    ).numpy()
+    patch_ml = meshlib_bitset_to_numpy(
+        mm.findOverlappingTris(
+            mm.MeshPart(numpy_to_meshlib(patch_vertices_np, patch_faces_np)), settings_ml
+        ),
+        patch_faces_np.shape[0],
+    )
+    assert int(patch_wp.sum()) == 1
+    assert int(patch_ml.sum()) == 3
 
 
 def test_remove_folded_faces_leaves_a_clean_mesh_alone(
