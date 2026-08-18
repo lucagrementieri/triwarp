@@ -552,6 +552,74 @@ def test_icp_point_to_plane_matches_open3d(
     assert _rms(moved_o3d, target_np) < 1e-4
 
 
+@pytest.mark.parity("icp_point_to_plane_cloud", "meshlib")
+def test_icp_point_to_plane_matches_meshlib(
+    device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Class A on the recovered transform: the same solver object, at its **default** method.
+
+    ``ICPMethod.PointToPlane`` is what ``ICPProperties`` starts at, so this pairing is the one that
+    needs no method override -- and the point-to-*point* pairing in
+    [`test_icp_point_to_point_matches_meshlib`] is the one that does. The default is asserted rather
+    than assumed, through ``getParams()``, so a future rebinding that changed it would fail here
+    instead of silently comparing two different solvers.
+
+    The other requirement is on the *input*: MeshLib reads the normals off the **reference** cloud,
+    so it is built through ``points_to_meshlib(points, normals)`` with the same per-vertex normals
+    triwarp is handed. Without them the constructor accepts the cloud and the linearized step has no
+    plane to project onto.
+
+    Measured on ``icosphere(3)`` misaligned by 0.08 rad: the transforms agree to **6.0e-06** and the
+    moved clouds to **7.4e-06** per point, against a starting RMS of 0.0706 -- so the 1e-4 bound
+    carries a 13x margin and both sides genuinely converged (final RMS 6.7e-06 and 1.0e-06).
+    """
+    mesh_tm, _mesh_wp = icosphere
+    target_np = np.ascontiguousarray(mesh_tm.vertices)
+    normals_np = np.ascontiguousarray(mesh_tm.vertex_normals)
+    rotation_np, translation_np = _rigid_transform(0.08, [0.1, 0.9, 0.2], [0.02, -0.01, 0.015])
+    source_np = np.ascontiguousarray(target_np @ rotation_np.T + translation_np)
+
+    matrix_wp, transformed_wp, _cost_wp = tw.registration.icp_point_to_plane(
+        _to_wp(source_np, device),
+        _to_wp(target_np, device),
+        target_normals=_to_wp(normals_np, device),
+        max_iterations=50,
+        threshold=-np.inf,
+    )
+    matrix_np = matrix_wp.numpy()[0]
+
+    icp_ml = mm.ICP(
+        mm.MeshOrPoints(points_to_meshlib(source_np)),
+        mm.MeshOrPoints(points_to_meshlib(target_np, normals_np)),  # normals live on the reference
+        mm.AffineXf3f(),
+        mm.AffineXf3f(),
+        0.02,
+    )
+    properties_ml = mm.ICPProperties()
+    properties_ml.iterLimit = 50
+    icp_ml.setParams(properties_ml)
+    assert icp_ml.getParams().method == mm.ICPMethod.PointToPlane  # its default, unchanged
+    transform_ml = icp_ml.calculateTransformation()
+    rotation_ml = np.array(
+        [
+            [transform_ml.A.x.x, transform_ml.A.x.y, transform_ml.A.x.z],
+            [transform_ml.A.y.x, transform_ml.A.y.y, transform_ml.A.y.z],
+            [transform_ml.A.z.x, transform_ml.A.z.y, transform_ml.A.z.z],
+        ]
+    )
+    translation_ml = np.array([transform_ml.b.x, transform_ml.b.y, transform_ml.b.z])
+    moved_ml = source_np @ rotation_ml.T + translation_ml
+
+    assert _rms(source_np, target_np) > 1e-2  # non-vacuity: the clouds start apart
+    assert np.allclose(matrix_np[:3, :3], rotation_ml, rtol=1e-4, atol=1e-4)
+    assert np.allclose(matrix_np[:3, 3], translation_ml, rtol=1e-4, atol=1e-4)
+    assert np.allclose(transformed_wp.numpy(), moved_ml, rtol=1e-4, atol=1e-4)
+    # Both converged, rather than agreeing on a transform that fits nothing.
+    assert _rms(transformed_wp.numpy(), target_np) < 1e-4
+    assert _rms(moved_ml, target_np) < 1e-4
+
+
 def test_icp_point_to_point_cloud(device: str) -> None:
     """
     Not a library comparison: ICP must recover a known rigid motion it was given exactly.

@@ -934,6 +934,76 @@ def test_filter_normals_are_unit_and_crease_gated(device: str) -> None:
     assert clean_np.shape[0] > 0
 
 
+@pytest.mark.parity("filter_normals", "meshlib")
+def test_filter_normals_matches_meshlib(device: str) -> None:
+    """
+    Class C (a recovery statistic): two normal denoisers, both recovering the same clean field.
+
+    ``denoiseNormals`` is a different formulation -- an L1/total-variation minimization over the
+    face graph, weighted per **undirected edge** and regularized by ``gamma`` -- where
+    ``filter_normals`` runs crease-gated diffusion passes. Neither parameter maps onto the other's,
+    so there is no correspondence and the comparison is what a denoiser is *for*: how close each
+    gets to the normals of the mesh before the noise was added.
+
+    Measured on ``icosphere(3)`` displaced by Gaussian noise at 2 % of the radius, as mean and worst
+    ``|dot|`` against the clean face normals:
+
+    | | mean | worst |
+    |---|---|---|
+    | noisy input | 0.9604 | **0.665** |
+    | triwarp, 20 passes | 0.99943 | 0.9942 |
+    | meshlib, ``gamma=20`` | 0.99867 | 0.9879 |
+    | triwarp against meshlib | 0.99856 | 0.9843 |
+
+    So both recover the field, and **they agree with each other more closely than either agrees
+    with the input** -- which is the claim, and the mutation probe is the input row itself: a
+    filter that did nothing would score 0.9604 / 0.665 and fail every assert below by a wide
+    margin.
+
+    Two interface facts. ``denoiseNormals`` mutates the ``FaceNormals`` it is handed and returns
+    nothing, so the field is recomputed with ``computePerFaceNormals`` first; and its ``v`` argument
+    is a per-**undirected-edge** weight array that must be sized to
+    ``topology.undirectedEdgeSize()`` -- there is no default, and a wrongly sized one is not
+    checked.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=3)
+    clean_vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
+    clean_normals_wp, _areas_wp = tw.triangles.face_normals_and_areas(clean_vertices_wp, faces_wp)
+    clean_normals_np = clean_normals_wp.numpy()
+
+    rng = np.random.default_rng(0)
+    noisy_np = mesh_tm.vertices + rng.normal(scale=0.02, size=mesh_tm.vertices.shape)
+    noisy_vertices_wp, _faces_wp = numpy_to_warp(noisy_np, mesh_tm.faces, device)
+    raw_normals_wp, _areas_wp = tw.triangles.face_normals_and_areas(noisy_vertices_wp, faces_wp)
+
+    smoothed_wp = tw.smoothing.filter_normals(
+        noisy_vertices_wp, faces_wp, iterations=20, threshold=60.0
+    )
+
+    mesh_ml = numpy_to_meshlib(noisy_np, mesh_tm.faces)
+    normals_ml = mm.computePerFaceNormals(mesh_ml)  # mutated in place by the call below
+    weights_ml = mm.UndirectedEdgeScalars()
+    weights_ml.resize(mesh_ml.topology.undirectedEdgeSize(), 1.0)
+    assert mm.denoiseNormals(mesh_ml, normals_ml, weights_ml, 20.0) is None
+    denoised_ml = mn.toNumpyArray(normals_ml)
+
+    def agreement(a_np: np.ndarray, b_np: np.ndarray) -> tuple[float, float]:
+        dots_np = np.abs(np.einsum("ij,ij->i", a_np, b_np))
+        return float(dots_np.mean()), float(dots_np.min())
+
+    raw_mean, raw_worst = agreement(raw_normals_wp.numpy(), clean_normals_np)
+    wp_mean, wp_worst = agreement(smoothed_wp.numpy(), clean_normals_np)
+    ml_mean, ml_worst = agreement(denoised_ml, clean_normals_np)
+    pair_mean, pair_worst = agreement(smoothed_wp.numpy(), denoised_ml)
+
+    assert raw_worst < 0.8  # non-vacuity: the input really is noisy
+    assert min(wp_worst, ml_worst) > 0.95  # both recovered the field
+    assert min(wp_mean, ml_mean) > raw_mean
+    # And they agree with each other better than either agrees with what they were given.
+    assert pair_mean > raw_mean
+    assert pair_worst > raw_worst
+
+
 def test_filter_normals_invalid(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _mesh_tm, mesh_wp = icosahedron
     with pytest.raises(ValueError, match=r"threshold must be in \[0, 180\]"):

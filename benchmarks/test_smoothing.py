@@ -564,10 +564,32 @@ _TWO_STEP_FIT_STEPS = 20
 )
 @pytest.mark.benchmark(group="filter_normals")
 @pytest.mark.benchaxis("quality")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "pymeshlab", "meshlib")
 def test_filter_normals(bench_case: BenchCase) -> None:
-    """The crease-gated normal diffusion alone: 20 scatter passes over the face adjacency."""
+    """
+    The crease-gated normal diffusion alone: 20 scatter passes over the face adjacency.
+
+    meshlib's ``denoiseNormals`` is a **different formulation** of the same job -- an L1
+    minimization over the face graph regularized by ``gamma``, against triwarp's gated diffusion --
+    so the two are not iteration-for-iteration comparable and neither parameter maps to the other.
+    What ``tests/test_smoothing.py`` establishes is that both recover the same clean normal field;
+    this row prices the two routes to it. Its per-edge weight array is the *input* and is built
+    outside the timed callable, but the normals it mutates have to be rebuilt per round -- it edits
+    them in place, so rounds 2..n would otherwise denoise an already-denoised field.
+    """
     n_faces = bench_case.n_faces
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        weights_ml = mm.UndirectedEdgeScalars()
+        weights_ml.resize(mesh_ml.topology.undirectedEdgeSize(), 1.0)
+
+        def denoise_ml() -> mm.FaceNormals:
+            normals_ml = mm.computePerFaceNormals(mesh_ml)
+            mm.denoiseNormals(mesh_ml, normals_ml, weights_ml, 20.0)
+            return normals_ml
+
+        assert bench_case.run(denoise_ml).size() == n_faces
+        return
     if bench_case.kind == "pymeshlab":
         # ``apply_normal_smoothing_per_face`` exposes no parameters at all -- no step count, no
         # threshold -- so its row is a *single* pass against triwarp's 20 and is a per-pass

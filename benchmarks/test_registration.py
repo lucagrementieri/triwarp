@@ -451,9 +451,46 @@ def test_icp_mesh(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="icp_point_to_plane_cloud")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "open3d")
+@pytest.mark.benchlibs("triwarp", "open3d", "meshlib")
 def test_icp_point_to_plane_cloud(bench_case: BenchCase) -> None:
-    """Gauss-Newton point-to-plane ICP against a point-cloud target, on shared vertex normals."""
+    """
+    Gauss-Newton point-to-plane ICP against a point-cloud target, on shared vertex normals.
+
+    meshlib runs at its **default** ``ICPMethod.PointToPlane`` here -- the one setting the
+    ``icp_point_cloud`` row above has to override -- so the only parameters set are ``iterLimit``
+    and the ``samplingVoxelSize`` that constructor overload subsamples by. Its reference cloud
+    carries the same vertex normals triwarp's row is given, since that is where it reads them from.
+    Stateful and tree-caching, so it is built inside the timed callable; the two clouds are the
+    input and are not.
+    """
+    if bench_case.kind == "meshlib":
+        skip_larger_than(bench_case, "bunny", "the sampling and tree build are CPU-side")
+        source_np = _source_np(bench_case)[0]
+        target_np = bench_case.vertices_np
+        normals_np = np.ascontiguousarray(_vertex_normals_wp(bench_case).numpy(), dtype=np.float64)
+        voxel_size = 0.01 * _diagonal(bench_case)
+
+        def icp_ml() -> mm.AffineXf3f:
+            from meshlib import mrmeshnumpy as mn
+
+            source_ml = mn.pointCloudFromPoints(np.ascontiguousarray(source_np, dtype=np.float64))
+            target_ml = mn.pointCloudFromPoints(
+                np.ascontiguousarray(target_np, dtype=np.float64), normals_np
+            )
+            icp = mm.ICP(
+                mm.MeshOrPoints(source_ml),
+                mm.MeshOrPoints(target_ml),
+                mm.AffineXf3f(),
+                mm.AffineXf3f(),
+                voxel_size,
+            )
+            properties_ml = mm.ICPProperties()
+            properties_ml.iterLimit = _ICP_ITERATIONS
+            icp.setParams(properties_ml)
+            return icp.calculateTransformation()
+
+        assert abs(bench_case.run(icp_ml).A.x.length() - 1.0) < 1e-4
+        return
     if bench_case.kind == "triwarp":
         source, target = _source_wp(bench_case), bench_case.vertices_wp
         normals = _vertex_normals_wp(bench_case)

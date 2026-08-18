@@ -31,11 +31,13 @@ import pytest
 import scipy.ndimage as ndi
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.comparisons import lexsort_rows
 from tests.conversions import (
+    numpy_to_meshlib,
     numpy_to_warp,
     points_to_meshlib,
     trimesh_to_open3d,
@@ -111,6 +113,74 @@ def test_voxelize_mesh_matches_open3d(sphere, device: str):
 
     assert cells_o3d.shape[0] > 0
     assert np.array_equal(lexsort_rows(tw.voxels.cells(grid).numpy()), lexsort_rows(cells_o3d))
+
+
+@pytest.mark.parity("voxelize_mesh", "meshlib")
+def test_voxelize_mesh_matches_meshlib(sphere, device: str):
+    """
+    Class C (two representations): MeshLib returns a **distance field**, not an occupancy set.
+
+    ``meshToVolume`` builds an OpenVDB narrow band -- unsigned distances in *voxel* units, clamped
+    at ``surfaceOffset`` -- so there is no cell set to compare with. What is comparable is the
+    geometry both encode, and the two directions of that are exact statements rather than
+    tolerances:
+
+    - a cell triwarp accepts contains a piece of the surface, so its **centre** is within half a
+      cell diagonal of it: ``distance <= sqrt(3)/2`` voxels;
+    - a grid node whose distance is under **half** a voxel has its closest surface point inside the
+      surrounding cell, so triwarp must have accepted that cell.
+
+    Measured on the translated ``icosphere(3)`` at a 0.1 voxel: all 1 898 accepted cells sample at
+    most **0.806** against the 0.866 bound, and all 1 226 nodes under 0.5 land inside an accepted
+    cell -- both at 100 %, in both directions.
+
+    Three facts about the grid, none of them documented and all of them load-bearing. The field is
+    read through ``vdbVolumeToSimpleVolume`` and ``mn.getNumpy3Darray``; its samples sit on grid
+    **nodes**, not cell centres; and its origin is ``bbox.min - surfaceOffset * voxel``, which is
+    also why ``dims`` comes out as the mesh's extent in cells plus ``2 * surfaceOffset``.
+
+    **Bug class excluded:** a grid anchored differently -- the failure mode every voxel comparison
+    in this module is written against. **Mutation probe, measured:** displacing the sample points by
+    half a voxel puts **19.3 %** of the cells outside the bound and takes the maximum from 0.806 to
+    1.661, so the assert bites at exactly the error it is for.
+    """
+    _mesh_tm, vertices_wp, faces_wp = sphere
+    voxel_size, surface_offset = 0.1, 3.0
+
+    grid = tw.voxels.voxelize_mesh(vertices_wp, faces_wp, voxel_size)
+    centres_np = tw.voxels.cell_centers(grid).numpy().astype(np.float64)
+
+    vertices_np = vertices_wp.numpy().astype(np.float64)
+    mesh_ml = numpy_to_meshlib(vertices_np, faces_wp.numpy().reshape(-1, 3))
+    params_ml = mm.MeshToVolumeParams()
+    params_ml.voxelSize = mm.Vector3f(voxel_size, voxel_size, voxel_size)
+    params_ml.surfaceOffset = surface_offset
+    field_np = mn.getNumpy3Darray(
+        mm.vdbVolumeToSimpleVolume(mm.meshToVolume(mm.MeshPart(mesh_ml), params_ml))
+    )
+    origin_np = vertices_np.min(axis=0) - surface_offset * voxel_size
+
+    # Non-vacuity: a narrow band around the surface, not a constant field.
+    assert field_np.min() < 0.1 < field_np.max()
+    assert centres_np.shape[0] > 100
+
+    # 1. Every accepted cell's centre is within half a cell diagonal of the surface.
+    sampled_np = ndi.map_coordinates(
+        field_np, ((centres_np - origin_np) / voxel_size).T, order=1, mode="nearest"
+    )
+    assert sampled_np.max() <= np.sqrt(3.0) / 2.0
+
+    # 2. Every node closer than half a voxel lies inside a cell triwarp accepted.
+    near_np = np.argwhere(field_np < 0.5)
+    assert near_np.shape[0] > 100
+    node_positions_np = origin_np + near_np * voxel_size
+    occupied_wp = tw.voxels.occupancy_at_points(
+        grid,
+        wp.array(
+            np.ascontiguousarray(node_positions_np, dtype=np.float32), dtype=wp.vec3, device=device
+        ),
+    )
+    assert occupied_wp.numpy().all()
 
 
 @pytest.mark.parity("voxelize_mesh", "pyvista")

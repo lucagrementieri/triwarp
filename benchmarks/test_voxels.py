@@ -88,7 +88,7 @@ def _voxel_size(bench_case: BenchCase, divisor: int) -> float:
     "cell-for-cell in tests/test_voxels.py::test_voxelize_mesh_matches_open3d.",
 )
 @pytest.mark.benchmark(group="voxelize_mesh")
-@pytest.mark.benchlibs("triwarp", "open3d", "trimesh", "pyvista")
+@pytest.mark.benchlibs("triwarp", "open3d", "trimesh", "pyvista", "meshlib")
 @pytest.mark.parametrize("divisor", _CELL_DIVISORS)
 def test_voxelize_mesh(bench_case: BenchCase, divisor: int) -> None:
     """
@@ -113,6 +113,23 @@ def test_voxelize_mesh(bench_case: BenchCase, divisor: int) -> None:
     voxel_size = _voxel_size(bench_case, divisor)
     origin = bench_case.vertices_np.min(axis=0) - 0.5 * voxel_size
 
+    if bench_case.kind == "meshlib":
+        # ``meshToVolume`` builds an OpenVDB **distance** band rather than an occupancy set, so its
+        # row does strictly more than the surface rows: it evaluates a signed distance within
+        # ``surfaceOffset`` voxels of the surface instead of accepting or rejecting each cell. The
+        # offset is left at its default of 3 voxels, which is the band width the geometry
+        # comparison in ``tests/test_voxels.py`` is measured at. It takes a ``MeshPart`` over a mesh
+        # it does not own, so the mesh is held in a name for the row's lifetime.
+        skip_larger_than(bench_case, "bunny", "the band is rasterized on the CPU")
+        mesh_ml = bench_case.new_mesh_ml()
+        part_ml = mm.MeshPart(mesh_ml)
+        params_ml = mm.MeshToVolumeParams()
+        params_ml.voxelSize = mm.Vector3f(voxel_size, voxel_size, voxel_size)
+        volume_ml = bench_case.run(
+            lambda: mm.meshToVolume(part_ml, params_ml), rounds=_HEAVY_ROUNDS
+        )
+        assert volume_ml.dims.x > 0
+        return
     if bench_case.kind == "pyvista":
         skip_larger_than(bench_case, "bunny", "voxelize_binary_mask is 502 ms at 64 cubed")
         mesh_pv = bench_case.mesh_pv

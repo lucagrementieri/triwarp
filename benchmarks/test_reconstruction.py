@@ -392,24 +392,72 @@ def test_ball_pivoting(bench_case: BenchCase) -> None:
         assert len(mesh_bpa.triangles) > 0
 
 
+@pytest.mark.noparity(
+    "meshlib",
+    reason="D2 a different algorithm with a measured disagreement: pointsToDistanceVolume is a "
+    "Gaussian-weighted distance field over a fixed lattice, marched by gridToMesh -- not Kazhdan's "
+    "screened Poisson, which solves for an indicator function. On an icosphere(4) cloud at a 2% "
+    "voxel it returns *two* components: an outer one within 0.095 of the cloud (1.4 voxels, so the "
+    "surface itself is recovered) and an inner shell of 2 652 faces at radius ~0.55 on a unit "
+    "sphere, up to 0.518 from the cloud, which the Poisson solvers do not produce. Its "
+    "parameterization is a lattice (origin, dimensions, voxelSize, sigma) rather than an octree "
+    "depth, so triwarp's depth cannot be mapped onto it either; the row is a cost comparison "
+    "against a *fast* implicit reconstructor at a matched cell size. open3d and pymeshlab wrap the "
+    "same Kazhdan solver triwarp implements and carry the correctness comparison in "
+    "tests/test_reconstruction.py, at a size a correctness test can afford.",
+)
 @pytest.mark.benchmark(group="screened_poisson")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "meshlib")
 @pytest.mark.parametrize("depth", _POISSON_DEPTHS)
 @pytest.mark.parametrize("method", ["dense", "adaptive"])
 def test_screened_poisson(
     bench_case: BenchCase, method: Literal["dense", "adaptive"], depth: int
 ) -> None:
-    # **triwarp-only, deliberately.** The open3d and pymeshlab rows were removed rather than capped:
+    # **The CPU Poisson rows were removed, deliberately.** The open3d and pymeshlab rows went rather
     # both wrap Kazhdan's CPU solver, and between them they were **6 322 s -- 73 % of the whole
     # benchmark suite** -- while measuring a reference triwarp had already beaten 15-25x. open3d's
     # ``create_from_point_cloud_poisson`` is 7.5 s per call at depth 9 on ``bunny``'s 35 947 points,
     # and at ``dragon``'s 437 645 the rows ran **93 minutes without completing a single round** (GPU
     # idle, 42 cores saturated) before being killed. The comparison itself is not lost: it lives in
     # ``tests/test_reconstruction.py``, which still checks both references for agreement at a size a
-    # correctness test can afford. What is left here is a triwarp-only regression row.
+    # correctness test can afford. What is left here is triwarp against meshlib, which is a
+    # *different* implicit reconstructor (see the exemption above) and, unlike the two Kazhdan
+    # wrappers, cheap enough to keep -- measured in tens of milliseconds where they were seconds.
     skip_larger_than(
         bench_case, "bunny", "screened Poisson above bunny dominates the suite (93 min at dragon)"
     )
+    if bench_case.kind == "meshlib":
+        if method == "adaptive":
+            pytest.skip("its lattice is uniform: there is no adaptive variant to match")
+        # The lattice is matched to triwarp's octree depth by cell *count* along the longest axis,
+        # ``2 ** depth``, which is the only parameter the two share. ``sigma`` is set from the
+        # cloud's own spacing rather than left at its default of 1.0, an absolute length that would
+        # mean something different on every mesh. The volume and the marching are timed together:
+        # neither half alone is a reconstruction.
+        cloud_ml = _cloud_ml(bench_case)
+        vertices_np = bench_case.vertices_np
+        lower_np = vertices_np.min(axis=0)
+        extent_np = vertices_np.max(axis=0) - lower_np
+        voxel = float(extent_np.max()) / (2**depth)
+        origin_np = lower_np - 3.0 * voxel
+        dimensions = np.ceil((extent_np + 6.0 * voxel) / voxel).astype(int) + 1
+
+        volume_params_ml = mm.PointsToDistanceVolumeParams()
+        volume_params_ml.voxelSize = mm.Vector3f(voxel, voxel, voxel)
+        volume_params_ml.sigma = 2.0 * bench_case.mean_edge
+        volume_params_ml.minWeight = 0.5
+        volume_params_ml.origin = mm.Vector3f(*origin_np.tolist())
+        volume_params_ml.dimensions = mm.Vector3i(*(int(n) for n in dimensions))
+        mesh_settings_ml = mm.GridToMeshSettings()
+        mesh_settings_ml.voxelSize = mm.Vector3f(voxel, voxel, voxel)
+
+        def reconstruct_ml() -> int:
+            volume_ml = mm.pointsToDistanceVolume(cloud_ml, volume_params_ml)
+            grid_ml = mm.simpleVolumeToDenseGrid(volume_ml)
+            return mm.gridToMesh(grid_ml, mesh_settings_ml).topology.numValidFaces()
+
+        assert bench_case.run(reconstruct_ml, rounds=_HEAVY_ROUNDS) > 0
+        return
     points, normals = bench_case.vertices_wp, _normals(bench_case)
     _vertices, faces = bench_case.run(
         lambda: tw.reconstruction.screened_poisson(points, normals, depth=depth, method=method),
