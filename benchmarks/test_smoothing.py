@@ -95,7 +95,9 @@ import pytest
 import trimesh as tm
 import warp as wp
 import warp.sparse as wps
-from conftest import BenchCase, skip_larger_than
+from conftest import BenchCase, mesh_ml_from_numpy, skip_larger_than
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -632,3 +634,106 @@ def test_filter_sharpen(bench_case: BenchCase) -> None:
         )
     )
     assert sharpened.shape == (n_vertices,)
+
+
+_REGION_FRACTION = 0.25  # free vertices as a fraction of the mesh, by a coordinate cut
+
+
+def _free_mask_np(bench_case: BenchCase) -> np.ndarray:
+    """
+    Cut a contiguous free region: the top quarter by z, so its rim is one closed curve.
+
+    A random mask would give the solver a shredded region with an enormous rim and would measure
+    something else -- the region *boundary* is what both libraries fold into the right-hand side, so
+    its length is the thing to hold fixed across rows.
+    """
+    z_np = bench_case.vertices_np[:, 2]
+    threshold = float(np.quantile(z_np, 1.0 - _REGION_FRACTION))
+    return np.ascontiguousarray(z_np > threshold)
+
+
+@pytest.mark.benchmark(group="smooth_region")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_smooth_region(bench_case: BenchCase) -> None:
+    """
+    Solve the umbrella-Laplacian Dirichlet system on a free region: a sparse solve, not a filter.
+
+    Read against the ``filter_*`` groups above, which apply a fixed number of explicit passes: this
+    one solves to a fixpoint, so its cost is a linear solve over the free set and is driven by
+    that set's size and shape rather than by an iteration count. The free region is the top quarter
+    of the mesh by z on both sides, so the two solve the same system.
+
+    meshlib's ``positionVertsSmoothly`` is that same system with the same unit edge weights
+    (``EdgeWeights.Unit``, ``VertexMass.Unit``), factorized where triwarp iterates -- the answers
+    agree to 1e-4 (``tests/test_smoothing.py``). It mutates the mesh in place and returns nothing,
+    so its mesh is rebuilt inside the timed callable and the row carries the build.
+    """
+    skip_larger_than(
+        bench_case,
+        "bunny",
+        "the Dirichlet solve over a quarter of the mesh runs into tens of seconds past bunny "
+        "(15.8 s on dragon, 24.9 s on happy_buddha for one triwarp round)",
+    )
+    n_vertices = bench_case.n_vertices
+    free_np = _free_mask_np(bench_case)
+    if bench_case.kind == "meshlib":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+
+        def smooth_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(vertices_np, faces_np)
+            mm.positionVertsSmoothly(
+                mesh_ml, mn.vertBitSetFromBools(free_np), mm.EdgeWeights.Unit, mm.VertexMass.Unit
+            )
+            return mesh_ml.topology.numValidVerts()
+
+        assert bench_case.run(smooth_ml, rounds=3) > 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    free_wp = wp.array(free_np, dtype=wp.bool, device=bench_case.device)
+    smoothed = bench_case.run(
+        lambda: tw.smoothing.smooth_region(vertices, faces, free_wp), rounds=3
+    )
+    assert smoothed.shape == (n_vertices,)
+
+
+@pytest.mark.benchmark(group="smooth_region_fixed_rim")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_smooth_region_fixed_rim(bench_case: BenchCase) -> None:
+    """
+    The same solve with the region rim pinned: the variant hole filling actually calls.
+
+    Read against ``smooth_region`` on the identical region -- the only difference is whether the rim
+    is a hard C0 constraint, which changes the system's size rather than its kind, so the two rows
+    should track each other closely. A large gap would mean one of the two is not solving what it
+    says.
+
+    meshlib's ``positionVertsSmoothlySharpBd`` is the matching variant and takes the region through
+    ``PositionVertsSmoothlyParams``; it agrees with triwarp to 1e-5 (``tests/test_smoothing.py``).
+    Same in-place mutation, so same rebuild inside the timed callable.
+    """
+    skip_larger_than(
+        bench_case,
+        "bunny",
+        "the Dirichlet solve over a quarter of the mesh runs into tens of seconds past bunny "
+        "(15.8 s on dragon, 24.9 s on happy_buddha for one triwarp round)",
+    )
+    n_vertices = bench_case.n_vertices
+    free_np = _free_mask_np(bench_case)
+    if bench_case.kind == "meshlib":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+
+        def smooth_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(vertices_np, faces_np)
+            params_ml = mm.PositionVertsSmoothlyParams()
+            params_ml.region = mn.vertBitSetFromBools(free_np)
+            mm.positionVertsSmoothlySharpBd(mesh_ml, params_ml)
+            return mesh_ml.topology.numValidVerts()
+
+        assert bench_case.run(smooth_ml, rounds=3) > 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    free_wp = wp.array(free_np, dtype=wp.bool, device=bench_case.device)
+    smoothed = bench_case.run(
+        lambda: tw.smoothing.smooth_region_fixed_rim(vertices, faces, free_wp), rounds=3
+    )
+    assert smoothed.shape == (n_vertices,)

@@ -546,12 +546,18 @@ def _sphere_region(subdivisions: int = 2, z_cut: float = 0.5):
     return vertices, faces, free
 
 
+@pytest.mark.parity("smooth_region_fixed_rim", "meshlib")
 def test_smooth_region_fixed_rim_matches_meshlib(device: str):
     """
-    Class C (a displacement bound): MeshLab's ``smoothRegion`` solves the same system serially.
+    Class A on the positions: ``positionVertsSmoothlySharpBd`` solves the same system, directly.
 
-    The rim is pinned on both sides and the free set is identical, so the two answers should be
-    close; they are not equal because meshlib factorizes where this iterates.
+    The rim is pinned on both sides and the free set is identical, so the two solve the same
+    Dirichlet problem and agree to ``1e-5`` element-wise even though meshlib factorizes where this
+    iterates -- a solve to a fixpoint has one answer, which is what makes this class A rather than a
+    displacement bound.
+
+    The fixed half is asserted exactly (``array_equal``, not ``allclose``): a solver that moved a
+    pinned vertex by a hair would still pass the tolerance on the free set.
     """
     vertices_np, faces_np, free_np = _sphere_region()
     v_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
@@ -571,12 +577,17 @@ def test_smooth_region_fixed_rim_matches_meshlib(device: str):
 
 
 @pytest.mark.parametrize("edge_weights", ["cotan", "unit"])
+@pytest.mark.parity("smooth_region", "meshlib")
 def test_smooth_region_matches_meshlib(device: str, edge_weights: str):
     """
-    Class C (a displacement bound): the free-rim variant, over both edge weightings.
+    Class A on the positions, over both edge weightings: ``positionVertsSmoothly``'s two modes.
 
-    Same reasoning as the fixed-rim test above. Both weightings are run because each builds a
-    different system, not a differently-scaled one.
+    Same reasoning as the fixed-rim test above, at ``1e-4``. Both weightings are run because each
+    builds a different system rather than a differently-scaled one, and because the pairing of
+    ``EdgeWeights.Cotan`` / ``EdgeWeights.Unit`` onto triwarp's ``edge_weights`` is a claim about
+    which discretization each name means -- the same kind of claim MeshLib settles for the vertex
+    normals. ``VertexMass.Unit`` is passed explicitly for that reason: the mass matrix is the third
+    axis, and triwarp has no counterpart to its area-weighted setting.
     """
     vertices_np, faces_np, free_np = _sphere_region()
     v_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)

@@ -43,11 +43,13 @@ reporting ``Mesh Saved 'plymcout.ply': 0 vertices, 0 faces``. It reconstructs fr
 layers through a temporary ``.vmi`` file and did not produce geometry from a single oriented cloud;
 a row that silently measures a no-op is worse than no row.
 
-``triangulate_point_cloud`` has no open3d or pymeshlab counterpart: it is a port of MeshLib's
-local-fan triangulation, and the nearest analogues (open3d's
-``create_from_point_cloud_alpha_shape``, MeshLab's ``generate_alpha_shape``) are a different
+``triangulate_point_cloud`` has **meshlib** and nothing else. Its nearest open3d and pymeshlab
+analogues (``create_from_point_cloud_alpha_shape``, ``generate_alpha_shape``) are a different
 algorithm solving the problem a different way, so timing them against each other would compare
-algorithm choices rather than implementations.
+algorithm choices rather than implementations -- where ``triangulatePointCloud`` is the same local
+fan optimization at the same ``numNeighbours``, and on a clean uniform cloud the two return the
+identical face set (``tests/test_reconstruction.py``). It takes an oriented ``PointCloud``, so its
+row gets the same points and the same precomputed normals every other row here does.
 
 What the open3d comparison showed when it was added (medians, RTX 5090, ``depth=8``,
 ``radius = 1.5 * mean_edge``):
@@ -129,6 +131,7 @@ import pyvista as pv
 import trimesh as tm
 import warp as wp
 from conftest import BenchCase, BenchLibrary, skip_larger_than
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -153,6 +156,7 @@ _POISSON_DEPTH = 8
 _normals_cache: dict[tuple[str, str], wp.array[wp.vec3]] = {}
 _cloud_o3d_cache: dict[str, o3d.geometry.PointCloud] = {}
 _cloud_pml_cache: dict[str, ml.MeshSet] = {}
+_cloud_ml_cache: dict[str, mm.PointCloud] = {}
 
 
 def _normals(bench_case: BenchCase) -> wp.array[wp.vec3]:
@@ -182,6 +186,30 @@ def _cloud_o3d(bench_case: BenchCase) -> o3d.geometry.PointCloud:
         cloud.normals = mesh_o3d.vertex_normals
         _cloud_o3d_cache[bench_case.mesh_name] = cloud
     return _cloud_o3d_cache[bench_case.mesh_name]
+
+
+def _cloud_ml(bench_case: BenchCase) -> mm.PointCloud:
+    """
+    Build the oriented cloud as a ``meshlib.PointCloud``, cached per mesh.
+
+    ``_normals`` goes through ``bench_case.vertices_wp``, which needs a Warp device a CPU-bound
+    case does not have -- the same reason the pymeshlab cloud takes its normals from trimesh, whose
+    ``vertex_normals`` are area-weighted like triwarp's. Unlike that cloud this one keeps *every*
+    point, null normals included: ``triangulatePointCloud`` accepts them where screened Poisson
+    rejects the cloud outright, so meshlib reconstructs from exactly the points triwarp does.
+    """
+    if bench_case.mesh_name not in _cloud_ml_cache:
+        from meshlib import mrmeshnumpy as mn
+
+        mesh_tm = tm.Trimesh(bench_case.vertices_np, bench_case.faces_np, process=False)
+        cloud_ml = mn.pointCloudFromPoints(
+            np.ascontiguousarray(bench_case.vertices_np, dtype=np.float64)
+        )
+        cloud_ml.normals = mn.fromNumpyArray(
+            np.ascontiguousarray(np.asarray(mesh_tm.vertex_normals), dtype=np.float64)
+        )
+        _cloud_ml_cache[bench_case.mesh_name] = cloud_ml
+    return _cloud_ml_cache[bench_case.mesh_name]
 
 
 def _cloud_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
@@ -295,9 +323,24 @@ def test_delaunay_triangulation(bench_lib: BenchLibrary, n_points: int) -> None:
 
 
 @pytest.mark.benchmark(group="triangulate_point_cloud")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "meshlib")
 def test_triangulate_point_cloud(bench_case: BenchCase) -> None:
+    """
+    Local fan triangulation of an oriented cloud, against the only library that has the same one.
+
+    ``numNeighbours`` is triwarp's ``num_neighbours``, passed the same value on both sides -- it is
+    the k-NN size the fan is optimized over and so the parameter that sets the work. meshlib builds
+    its own k-NN structure inside the call, as triwarp does, so nothing is hoisted out on either
+    side; the cloud and its normals are the input and are cached.
+    """
     skip_larger_than(bench_case, "bunny", "local triangulation above bunny dominates the suite")
+    if bench_case.kind == "meshlib":
+        cloud_ml = _cloud_ml(bench_case)
+        parameters_ml = mm.TriangulationParameters()
+        parameters_ml.numNeighbours = _NUM_NEIGHBOURS
+        mesh_ml = bench_case.run(lambda: mm.triangulatePointCloud(cloud_ml, parameters_ml))
+        assert mesh_ml.topology.numValidFaces() > 0
+        return
     points, normals = bench_case.vertices_wp, _normals(bench_case)
     _vertices, faces = bench_case.run(
         lambda: tw.reconstruction.triangulate_point_cloud(
@@ -381,7 +424,7 @@ _RESAMPLE_CELL_FRACTIONS = [0.02, 0.01]
 
 
 @pytest.mark.benchmark(group="resample_uniform")
-@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "igl", "pymeshlab", "meshlib")
 @pytest.mark.parametrize("cell_fraction", _RESAMPLE_CELL_FRACTIONS)
 def test_resample_uniform(bench_case: BenchCase, cell_fraction: float) -> None:
     """
@@ -426,6 +469,23 @@ def test_resample_uniform(bench_case: BenchCase, cell_fraction: float) -> None:
         )
         assert faces_igl.shape[0] > 0
         assert vertices_igl.shape[1] == 3
+        return
+    if bench_case.kind == "meshlib":
+        # ``rebuildMesh`` returns a *new* mesh but takes a ``MeshPart`` over the input and builds
+        # its own voxel grid inside, so the input mesh is built once outside the timed callable.
+        # Its ``voxelSize`` is the same absolute length the other three rows get. It is doing
+        # strictly more than the other three at its defaults -- ``preSubdivide`` and ``decimate``
+        # are both on -- which is a real difference in what the operation *is*, so read the row as
+        # "resample and clean up" rather than as the marching alone.
+        skip_larger_than(bench_case, "bunny", "the lattice is marched on the CPU")
+        mesh_ml = bench_case.new_mesh_ml()
+        settings_ml = mm.RebuildMeshSettings()
+        settings_ml.voxelSize = voxel_size
+
+        def resample_ml() -> int:
+            return mm.rebuildMesh(mm.MeshPart(mesh_ml), settings_ml).topology.numValidFaces()
+
+        assert bench_case.run(resample_ml, rounds=_HEAVY_ROUNDS) > 0
         return
     if bench_case.kind == "pymeshlab":
         # ``generate_*`` pushes a new mesh onto the set, so the MeshSet is rebuilt per round.
