@@ -8,6 +8,7 @@ from trimesh.path import segments as tm_segments
 from trimesh.path import traversal as tm_traversal
 
 import triwarp as tw
+from tests.conversions import meshlib_to_trimesh
 
 
 def _polyline_wp(pts_np: np.ndarray, device: str) -> wp.array:
@@ -749,6 +750,62 @@ def _assert_valid_triangulation(pts: np.ndarray, faces: np.ndarray) -> None:
     tri_areas = _triangle_areas(pts, faces)
     assert np.all(tri_areas > 1e-6)  # no degenerate triangles
     assert np.allclose(tri_areas.sum(), _polygon_area(pts), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parity("triangulate_polyline", "meshlib")
+def test_triangulate_polyline_matches_meshlib(device: str) -> None:
+    """
+    Class C (count and area): two ear-clippings of the same polygon, with different diagonals.
+
+    ``triangulateContours`` takes **2-D** closed contours -- ``std_vector_Vector2_float`` with the
+    first point repeated -- where ``triangulate_polyline`` takes an open 3-D loop, so the transform
+    is dropping z and closing the ring. Omitting the repeat is the silent failure mode: an open
+    square comes back as **one** triangle over three vertices rather than two over four.
+
+    The diagonals are free, so the outputs differ face for face -- on the L-shape triwarp returns
+    ``[[4,5,0],[0,1,2],[0,2,3],[4,0,3]]`` and MeshLib ``[[3,5,0],[5,3,4],[1,3,0],[3,1,2]]`` -- and
+    what a triangulation of a simple polygon must agree on is the *count* (``n - 2``) and the total
+    area. Measured exact on both an L-shape (4 triangles, area 3.00000) and a 10-vertex star
+    (8 triangles, area 1.32252).
+
+    Both shapes are **non-convex**, which is the point: a fan over vertex 0 triangulates any convex
+    polygon correctly and would pass a convex comparison while producing triangles outside an
+    L-shape. The area assert is what catches that, since a fan over a reflex vertex covers more or
+    less than the polygon.
+    """
+    for name, polygon_np in (
+        ("L", np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0], [1.0, 2.0], [0.0, 2.0]])),
+        (
+            "star",
+            np.array(
+                [
+                    [
+                        np.cos(angle) * (1.0 if index % 2 == 0 else 0.45),
+                        np.sin(angle) * (1.0 if index % 2 == 0 else 0.45),
+                    ]
+                    for index, angle in enumerate(np.linspace(0.0, 2.0 * np.pi, 11)[:-1])
+                ]
+            ),
+        ),
+    ):
+        points_np = np.column_stack([polygon_np, np.zeros(polygon_np.shape[0])])
+        faces_wp = tw.polyline.triangulate_polyline(_polyline_wp(points_np, device)).numpy()
+
+        contour_ml = mm.std_vector_Vector2_float()
+        for point_np in np.vstack([polygon_np, polygon_np[:1]]):  # closed: the repeat is required
+            contour_ml.append(mm.Vector2f(float(point_np[0]), float(point_np[1])))
+        contours_ml = mm.std_vector_std_vector_Vector2_float()
+        contours_ml.append(contour_ml)
+        mesh_ml = meshlib_to_trimesh(mm.triangulateContours(contours_ml))
+
+        assert mesh_ml.faces.shape[0] == polygon_np.shape[0] - 2, name
+        assert faces_wp.shape[0] == mesh_ml.faces.shape[0], name
+        area_wp = _triangle_areas(points_np, faces_wp).sum()
+        area_ml = _triangle_areas(
+            np.asarray(mesh_ml.vertices), np.asarray(mesh_ml.faces, dtype=np.int32)
+        ).sum()
+        assert np.isclose(area_wp, area_ml, rtol=1e-5), name
+        assert np.isclose(area_wp, _polygon_area(points_np), rtol=1e-5), name
 
 
 def test_triangulate_convex_is_fan(device: str) -> None:

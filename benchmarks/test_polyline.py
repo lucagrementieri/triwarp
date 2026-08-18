@@ -311,3 +311,60 @@ def test_distance_to_polyline(bench_case: BenchCase, n_queries: int) -> None:
     points = _query_points_wp(bench_case, n_queries)
     distance = bench_case.run(lambda: tw.polyline.distance_to_polyline(points, polyline))
     assert distance.shape[0] == n_queries
+
+
+# Vertex counts for the triangulation group. A simple polygon of ``n`` vertices always yields
+# ``n - 2`` triangles, so the count is the only axis and it is swept directly rather than through a
+# mesh: neither library's ear clipping is driven by anything else.
+_POLYGON_SIZES = [64, 1024]
+
+_polygon_np_cache: dict[int, np.ndarray] = {}
+
+
+def _polygon_np(n_vertices: int) -> np.ndarray:
+    """Build a non-convex star of ``n_vertices``, cached: a fan would trivialize a convex one."""
+    if n_vertices not in _polygon_np_cache:
+        angles_np = np.linspace(0.0, 2.0 * np.pi, n_vertices, endpoint=False)
+        radii_np = np.where(np.arange(n_vertices) % 2 == 0, 1.0, 0.45)
+        _polygon_np_cache[n_vertices] = np.column_stack(
+            [radii_np * np.cos(angles_np), radii_np * np.sin(angles_np)]
+        )
+    return _polygon_np_cache[n_vertices]
+
+
+@pytest.mark.benchmark(group="triangulate_polyline")
+@pytest.mark.benchmeshes("sphere_small")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.parametrize("n_vertices", _POLYGON_SIZES)
+def test_triangulate_polyline(bench_case: BenchCase, n_vertices: int) -> None:
+    """
+    Ear clipping a simple polygon: the one group here whose input is not the mesh's boundary.
+
+    ``benchmeshes("sphere_small")`` pins it to a single case because the mesh is irrelevant -- the
+    polygon is generated from ``n_vertices`` alone -- and the sweep is that count, which is the only
+    thing either implementation's cost depends on. A **star** rather than a convex ring: a fan over
+    vertex 0 triangulates any convex polygon in linear time and would make both rows measure
+    nothing.
+
+    meshlib's ``triangulateContours`` takes 2-D **closed** contours (the first point repeated) and
+    returns a whole ``Mesh``, so its row carries that construction where triwarp's returns an index
+    buffer -- it is doing more, and the two agree on the triangle count and total area
+    (``tests/test_polyline.py``). Both build their input contour outside the timed callable.
+    """
+    polygon_np = _polygon_np(n_vertices)
+    if bench_case.kind == "meshlib":
+        contour_ml = mm.std_vector_Vector2_float()
+        for point_np in np.vstack([polygon_np, polygon_np[:1]]):
+            contour_ml.append(mm.Vector2f(float(point_np[0]), float(point_np[1])))
+        contours_ml = mm.std_vector_std_vector_Vector2_float()
+        contours_ml.append(contour_ml)
+        mesh_ml = bench_case.run(lambda: mm.triangulateContours(contours_ml))
+        assert mesh_ml.topology.numValidFaces() == n_vertices - 2
+        return
+    points_wp = wp.array(
+        np.ascontiguousarray(np.column_stack([polygon_np, np.zeros(n_vertices)]), dtype=np.float32),
+        dtype=wp.vec3,
+        device=bench_case.device,
+    )
+    faces = bench_case.run(lambda: tw.polyline.triangulate_polyline(points_wp))
+    assert int(faces.shape[0]) == n_vertices - 2

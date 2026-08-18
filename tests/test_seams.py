@@ -14,6 +14,7 @@ import triwarp.typing as twt
 from tests.comparisons import lexsort_rows
 from tests.conversions import (
     meshlib_bitset_to_numpy,
+    meshlib_to_trimesh,
     numpy_to_warp,
     pyvista_edges_to_indices,
     trimesh_to_meshlib,
@@ -307,6 +308,86 @@ def test_cut_along_edges_round_trips_through_a_weld(unit_box: tuple[tm.Trimesh, 
     )
     assert int(welded_vertices_wp.shape[0]) == int(vertices_wp.shape[0])
     assert _face_component_count(welded_vertices_wp, welded_faces_wp) == 1
+
+
+def _ordered_loop_np(edges_np: np.ndarray) -> list[int]:
+    """
+    Walk an unordered set of undirected edge rows into one ordered vertex cycle.
+
+    MeshLib's ``cutAlongEdgeLoop`` takes an *ordered* ``EdgeId`` path where triwarp's
+    ``cut_along_edges`` takes unordered ``(v0, v1)`` rows, so this is the named transform the
+    comparison needs -- and it is what any caller of the two would have to write.
+    """
+    neighbours: dict[int, list[int]] = {}
+    for first, second in edges_np.tolist():
+        neighbours.setdefault(int(first), []).append(int(second))
+        neighbours.setdefault(int(second), []).append(int(first))
+    start = int(edges_np[0, 0])
+    walk = [start]
+    previous = None
+    while True:
+        candidates = [vertex for vertex in neighbours[walk[-1]] if vertex != previous]
+        if not candidates or candidates[0] == start:
+            break
+        previous, walk = walk[-1], [*walk, candidates[0]]
+    return walk
+
+
+@pytest.mark.parity(
+    "cut_along_edges",
+    "meshlib",
+    benchmarked=False,
+    reason="cutAlongEdgeLoop takes an ordered *closed loop* of EdgeIds where cut_along_edges takes "
+    "an arbitrary undirected edge set, and the benchmark group's input is exactly that -- 25 % or "
+    "100 % of the mesh's edges, which is not a loop and cannot be handed to it at all. Its sibling "
+    "cutMesh takes surface contours rather than an edge set, so neither form fits the timed input. "
+    "igl.cut_mesh does take the same edge set and carries the timed row; the comparison here is on "
+    "the one input shape both accept.",
+)
+def test_cut_along_edges_matches_meshlib(icosphere_coarse: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B on the split: the same vertex duplication, from an ordered loop instead of edge rows.
+
+    ``cutAlongEdgeLoop`` walks a closed ``EdgeId`` path and separates the two sides, which is
+    ``cut_along_edges``' operation on a loop -- the difference is entirely in how the loop is
+    *named*. Two transforms: the rows are ordered into a cycle by [`_ordered_loop_np`], and each
+    consecutive pair becomes an ``EdgeId`` through ``MeshTopology.findEdge``, which is the lookup
+    the rest of this suite's EdgeId plumbing rests on.
+
+    Measured on the equator of ``icosphere(2)``: a 22-edge loop takes both libraries from 162
+    vertices to **184** with the face count unchanged at 320 -- the same 22 duplications, since a
+    cut adds one copy per loop vertex and creates no geometry.
+
+    The face count is asserted precisely because it must *not* move: a cut that retriangulated, or
+    one that dropped the seam faces, would still plausibly raise the vertex count.
+    """
+    mesh_tm, mesh_wp = icosphere_coarse
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+
+    region_np = mesh_tm.vertices[:, 2] > 0.0
+    region_wp = wp.array(
+        np.ascontiguousarray(region_np[mesh_tm.faces].all(axis=1)),
+        dtype=wp.bool,
+        device=vertices_wp.device,
+    )
+    edges_wp = tw.selection.region_boundary_edges(faces_wp, region_wp)
+    edges_np = edges_wp.numpy()
+    assert edges_np.shape[0] > 5  # non-vacuity: there is a real seam to cut along
+
+    cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(vertices_wp, faces_wp, edges_wp)
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    loop_np = _ordered_loop_np(edges_np)
+    assert len(loop_np) == edges_np.shape[0]  # the rows really do form one cycle
+    loop_ml = mm.std_vector_Id_EdgeTag()
+    for tail, head in zip(loop_np, [*loop_np[1:], loop_np[0]], strict=True):
+        loop_ml.append(mesh_ml.topology.findEdge(mm.VertId(tail), mm.VertId(head)))
+    mm.cutAlongEdgeLoop(mesh_ml, loop_ml)
+    cut_tm = meshlib_to_trimesh(mesh_ml)
+
+    assert cut_tm.vertices.shape[0] == mesh_tm.vertices.shape[0] + edges_np.shape[0]
+    assert int(cut_vertices_wp.shape[0]) == cut_tm.vertices.shape[0]
+    assert int(cut_faces_wp.shape[0]) // 3 == cut_tm.faces.shape[0] == mesh_tm.faces.shape[0]
 
 
 @pytest.mark.parity("cut_along_edges", "pymeshlab")
