@@ -9,7 +9,124 @@ import pytest
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import trimesh_to_pymeshlab, trimesh_to_pyvista, trimesh_to_warp
+from tests.conversions import (
+    bsr_to_dense,
+    trimesh_to_pymeshlab,
+    trimesh_to_pyvista,
+    trimesh_to_warp,
+)
+
+# --- heat_operators -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mesh_name", ["icosphere_coarse", "hemisphere"])
+def test_heat_operators_are_the_matrices_its_docstring_names(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A: every member is checked against the function that defines it, and all agree exactly.
+
+    The whole point of this entry point is that its results depend on the mesh alone, so each one
+    has an independent definition to be held to: ``heat_system`` is ``M - t L`` for the documented
+    default ``t`` (the squared mean edge length), ``poisson_system`` is ``-L``, ``laplacian`` is the
+    ``float64`` cotangent matrix, and the face quantities are trimesh's. Measured on
+    ``icosphere_coarse``: all three matrix identities hold to **0.0**, the normals to 2.0e-07 and
+    the areas to 7.8e-09 (triwarp's float32 vertex buffer against trimesh's float64). On an open
+    mesh the ``M - t L`` residual is 5.6e-17 rather than zero -- ``bsr_axpy`` accumulates in a
+    different order than the numpy expression -- so that one comparison carries a tolerance.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = int(mesh_tm.vertices.shape[0])
+    n_faces = int(mesh_tm.faces.shape[0])
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+
+    (
+        heat_system,
+        _heat_preconditioner,
+        laplacian,
+        poisson_system,
+        _poisson_preconditioner,
+        cot_entries_wp,
+        face_normals_wp,
+        face_areas_wp,
+    ) = tw.heat.distance.heat_operators(vertices_wp, faces_wp)
+
+    laplacian_np = bsr_to_dense(laplacian, n_vertices)
+    cotmatrix_np = bsr_to_dense(
+        tw.laplacian.cotmatrix(vertices_wp, faces_wp, dtype=wp.float64), n_vertices
+    )
+    # The lumped diagonal ``heat_operators`` builds the system from, not the assembled
+    # ``mass_matrix`` -- its own See Also names ``mass_matrix_entries``, and on an open mesh the two
+    # differ by a float rounding (1.4e-17).
+    mass_np = np.diag(
+        tw.laplacian.mass_matrix_entries(vertices_wp, faces_wp, dtype=wp.float64).numpy()
+    )
+    diffusion_time = float(tw.edges.mean_unique_edge_length(vertices_wp, faces_wp)) ** 2
+
+    assert np.array_equal(laplacian_np, cotmatrix_np)
+    assert np.array_equal(bsr_to_dense(poisson_system, n_vertices), -laplacian_np)
+    assert np.allclose(
+        bsr_to_dense(heat_system, n_vertices),
+        mass_np - diffusion_time * laplacian_np,
+        rtol=1e-12,
+        atol=1e-15,
+    )
+    assert cot_entries_wp.shape == (n_faces, 3)
+    assert np.allclose(face_normals_wp.numpy(), mesh_tm.face_normals, rtol=1e-5, atol=1e-5)
+    assert np.allclose(face_areas_wp.numpy(), mesh_tm.area_faces, rtol=1e-5, atol=1e-5)
+
+
+def test_heat_operators_honour_an_explicit_diffusion_time(
+    icosphere_coarse: tuple[object, wp.Mesh],
+) -> None:
+    """``t`` reaches the assembled system rather than being recomputed from the edge lengths."""
+    mesh_tm, mesh_wp = icosphere_coarse
+    n_vertices = int(mesh_tm.vertices.shape[0])
+
+    heat_system, *_rest, _cot, _normals, _areas = tw.heat.distance.heat_operators(
+        mesh_wp.points, mesh_wp.indices, t=0.05
+    )
+
+    laplacian_np = bsr_to_dense(
+        tw.laplacian.cotmatrix(mesh_wp.points, mesh_wp.indices, dtype=wp.float64), n_vertices
+    )
+    mass_np = np.diag(
+        tw.laplacian.mass_matrix_entries(mesh_wp.points, mesh_wp.indices, dtype=wp.float64).numpy()
+    )
+    assert np.allclose(
+        bsr_to_dense(heat_system, n_vertices), mass_np - 0.05 * laplacian_np, rtol=1e-12, atol=1e-15
+    )
+
+
+@pytest.mark.parametrize("mesh_name", ["icosphere_coarse", "hemisphere"])
+def test_heat_geodesic_with_supplied_operators_matches_building_them_internally(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    The caching contract: passing the operators back gives the same distances, to 6.7e-16.
+
+    This is the reason the tuple is public -- a caller solving from many source sets on one mesh
+    builds it once -- so what has to be pinned is that the supplied path is not a *different*
+    computation. Not a reference comparison; the oracle for the distances themselves is
+    [`test_heat_geodesic_matches_igl`].
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    sources_wp = wp.array(
+        np.array([0, mesh_tm.vertices.shape[0] // 3], dtype=np.int32),
+        dtype=wp.int32,
+        device=mesh_wp.points.device,
+    )
+
+    operators = tw.heat.distance.heat_operators(mesh_wp.points, mesh_wp.indices)
+    supplied_np = tw.heat.distance.heat_geodesic(
+        mesh_wp.points, mesh_wp.indices, sources_wp, operators=operators
+    ).numpy()
+    internal_np = tw.heat.distance.heat_geodesic(
+        mesh_wp.points, mesh_wp.indices, sources_wp
+    ).numpy()
+
+    assert internal_np.max() > 0.0
+    assert np.allclose(supplied_np, internal_np, rtol=1e-12, atol=1e-12)
 
 
 def _heat_geodesic_igl(

@@ -11,7 +11,7 @@ import trimesh.repair as tm_repair
 import warp as wp
 
 import triwarp as tw
-from tests.comparisons import canonical_winding, lexsort_rows, same_partition
+from tests.comparisons import canonical_winding, lexsort_rows, same_partition, undirected_edges
 from tests.conversions import (
     numpy_to_warp,
     trimesh_to_open3d,
@@ -714,7 +714,7 @@ def _triangle_set_close(a: np.ndarray, b: np.ndarray, atol: float = 1e-4) -> boo
 
 
 # --------------------------------------------------------------------------------------
-# split_nonmanifold
+# non-manifold input builders, shared by remove_non_manifold_faces and split_nonmanifold
 # --------------------------------------------------------------------------------------
 
 
@@ -734,6 +734,110 @@ def _three_faces_on_one_edge_np() -> tuple[np.ndarray, np.ndarray]:
         dtype=np.float32,
     )
     return vertices_np, np.array([[0, 1, 2], [0, 1, 3], [0, 1, 4]], dtype=np.int32)
+
+
+# --------------------------------------------------------------------------------------
+# remove_non_manifold_faces
+# --------------------------------------------------------------------------------------
+
+
+def _remove_non_manifold_faces_np(
+    vertices_np: np.ndarray, faces_np: np.ndarray, max_iter: int = 3
+) -> tuple[np.ndarray, np.ndarray]:
+    """Drop faces carrying a >2-incident edge, iterating, then compact the vertices (numpy)."""
+    faces_np = faces_np.copy()
+    for _ in range(max_iter):
+        if faces_np.shape[0] == 0:
+            break
+        # ``undirected_edges`` already orders each row min-first, face-major, three per face.
+        edges_np = undirected_edges(faces_np)
+        _unique_np, inverse_np, counts_np = np.unique(
+            edges_np, axis=0, return_inverse=True, return_counts=True
+        )
+        bad_np = counts_np[inverse_np].reshape(-1, 3).max(axis=1) > 2
+        if not bad_np.any():
+            break
+        faces_np = faces_np[~bad_np]
+    used_np = np.unique(faces_np) if faces_np.size else np.zeros(0, dtype=np.int64)
+    remap_np = np.full(vertices_np.shape[0], -1, dtype=np.int64)
+    remap_np[used_np] = np.arange(used_np.size)
+    kept_np = remap_np[faces_np] if faces_np.size else faces_np.reshape(0, 3)
+    return vertices_np[used_np], kept_np
+
+
+def _cascading_non_manifold_np() -> tuple[np.ndarray, np.ndarray]:
+    """Build a three-face fan plus a face hanging off it, so one removal pass is not enough."""
+    vertices_np, faces_np = _three_faces_on_one_edge_np()
+    vertices_np = np.vstack((vertices_np, [[2.0, 0.0, 0.0]])).astype(np.float32)
+    return vertices_np, np.vstack((faces_np, [[1, 2, 5]])).astype(np.int32)
+
+
+def _icosahedron_plus_a_face_on_an_existing_edge_np() -> tuple[np.ndarray, np.ndarray]:
+    """Glue one extra face to an existing edge of a closed mesh: most of it must survive."""
+    mesh_tm = tm.creation.icosahedron()
+    vertices_np = np.vstack((mesh_tm.vertices, [[3.0, 3.0, 3.0]])).astype(np.float32)
+    edge_np = mesh_tm.faces[0][:2]
+    extra_np = [[edge_np[0], edge_np[1], mesh_tm.vertices.shape[0]]]
+    return vertices_np, np.vstack((mesh_tm.faces, extra_np)).astype(np.int32)
+
+
+@pytest.mark.parametrize(
+    ("mesh_kind", "n_surviving"),
+    [("three_faces_on_one_edge", 0), ("cascading", 1), ("icosahedron_plus_a_face", 18)],
+)
+def test_remove_non_manifold_faces_matches_a_numpy_oracle(
+    device: str, mesh_kind: str, n_surviving: int
+) -> None:
+    """
+    Class A: the surviving faces and compacted vertices equal the same iteration run in numpy.
+
+    The expected count is pinned per input because the interesting property is *which* faces go:
+    the three-face fan loses all three (every one of them carries the 3-incident edge), the
+    cascading input needs a second pass to reach the single survivor a one-pass implementation
+    would miss, and the icosahedron keeps 18 of its 21 faces -- the substantive case, since two
+    empty answers would compare equal.
+    """
+    builders = {
+        "three_faces_on_one_edge": _three_faces_on_one_edge_np,
+        "cascading": _cascading_non_manifold_np,
+        "icosahedron_plus_a_face": _icosahedron_plus_a_face_on_an_existing_edge_np,
+    }
+    vertices_np, faces_np = builders[mesh_kind]()
+    faces_wp = wp.array(np.ascontiguousarray(faces_np).ravel(), dtype=wp.int32, device=device)
+    assert not tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=True)
+
+    new_vertices_wp, new_faces_wp = tw.repair.remove_non_manifold_faces(
+        wp.array(np.ascontiguousarray(vertices_np), dtype=wp.vec3, device=device), faces_wp
+    )
+    new_faces_np = new_faces_wp.numpy().reshape(-1, 3)
+    expected_vertices_np, expected_faces_np = _remove_non_manifold_faces_np(vertices_np, faces_np)
+
+    assert new_faces_np.shape[0] == n_surviving
+    assert np.array_equal(new_faces_np, expected_faces_np)
+    assert np.allclose(new_vertices_wp.numpy(), expected_vertices_np, rtol=1e-5, atol=1e-5)
+    if n_surviving > 0:
+        assert tw.validation.is_edge_manifold(new_faces_wp, allow_boundary_edges=True)
+
+
+def test_remove_non_manifold_faces_leaves_an_edge_manifold_mesh_alone(
+    icosahedron: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """An already edge-manifold mesh is returned untouched -- the loop breaks on the first pass."""
+    mesh_tm, mesh_wp = icosahedron
+
+    new_vertices_wp, new_faces_wp = tw.repair.remove_non_manifold_faces(
+        mesh_wp.points, mesh_wp.indices
+    )
+
+    assert new_vertices_wp.shape[0] == mesh_tm.vertices.shape[0]
+    assert new_faces_wp.shape[0] == mesh_tm.faces.size
+    # Nothing was rebuilt: the early break hands back the caller's own buffers.
+    assert new_vertices_wp.ptr == mesh_wp.points.ptr
+
+
+# --------------------------------------------------------------------------------------
+# split_nonmanifold
+# --------------------------------------------------------------------------------------
 
 
 def _split_nonmanifold_wp(

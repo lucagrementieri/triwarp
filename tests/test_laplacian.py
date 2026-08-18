@@ -403,6 +403,145 @@ def test_mollify_intrinsic_restores_the_triangle_inequality(sliver_patch: tuple)
     assert np.allclose(mollified.numpy() - original, delta, rtol=5e-2, atol=1e-9)
 
 
+# --- connection_laplacian / laplacian_entries -------------------------------------------
+
+
+def _dense_blocks_2x2(matrix: object, n_vertices: int) -> np.ndarray:
+    """
+    Densify a ``(n, n)`` matrix of ``mat22d`` blocks into a plain ``(2n, 2n)`` array.
+
+    [`tests.conversions.bsr_to_dense`][] writes one scalar per entry and so cannot read a blocked
+    matrix; the row-offset walk is the same, and is still the only safe way in (``values`` is
+    allocated at the triplet count).
+    """
+    offsets = matrix.offsets.numpy()  # type: ignore[attr-defined]
+    columns = matrix.columns.numpy()  # type: ignore[attr-defined]
+    values = matrix.values.numpy()  # type: ignore[attr-defined]
+    dense = np.zeros((2 * n_vertices, 2 * n_vertices))
+    for row in range(n_vertices):
+        for slot in range(offsets[row], offsets[row + 1]):
+            column = columns[slot]
+            dense[2 * row : 2 * row + 2, 2 * column : 2 * column + 2] = values[slot]
+    return dense
+
+
+@pytest.mark.parametrize("mesh_name", ["icosphere_coarse", "half_torus", "hemisphere"])
+def test_connection_laplacian_with_zero_transport_is_the_cotangent_laplacian(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A: with every transport angle zeroed, each ``2 x 2`` block collapses to ``-w * I``.
+
+    The rotations are the *only* thing separating this operator from
+    [`cotmatrix`][triwarp.laplacian.cotmatrix] -- same weights, same sparsity -- so feeding it a
+    zero angle per halfedge has to reproduce that matrix exactly, in both diagonal components and
+    with nothing off-diagonal inside a block. Measured on ``icosphere_coarse``: the intra-block
+    off-diagonals are identically ``0.0``, the two diagonal components agree bit-for-bit, and each
+    equals ``-cotmatrix`` to 5.7e-07 (the sign flip is documented -- this operator is assembled
+    positive semi-definite for its CG consumers, against ``cotmatrix``'s igl convention).
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = int(mesh_tm.vertices.shape[0])
+    zero_angles_wp = wp.zeros(
+        int(mesh_wp.indices.shape[0]), dtype=wp.float32, device=mesh_wp.points.device
+    )
+
+    connection_np = _dense_blocks_2x2(
+        tw.laplacian.connection_laplacian(
+            mesh_wp.points, mesh_wp.indices, transport_angles=zero_angles_wp
+        ),
+        n_vertices,
+    )
+    cotmatrix_np = bsr_to_dense(tw.laplacian.cotmatrix(mesh_wp.points, mesh_wp.indices), n_vertices)
+
+    assert np.array_equal(connection_np[0::2, 1::2], np.zeros((n_vertices, n_vertices)))
+    assert np.array_equal(connection_np[1::2, 0::2], np.zeros((n_vertices, n_vertices)))
+    assert np.array_equal(connection_np[0::2, 0::2], connection_np[1::2, 1::2])
+    assert np.allclose(connection_np[0::2, 0::2], -cotmatrix_np, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosphere_coarse", "half_torus", "hemisphere"])
+def test_connection_laplacian_is_symmetric_psd_and_a_rotation_per_block(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    The three properties its docstring promises, and the one comparison the gauge permits.
+
+    A single ``2 x 2`` block is gauge-dependent -- it re-expresses a vector in the neighbour's
+    frame, and that frame is fixed by a convention no reference library shares -- so §6 rules out
+    an element-wise oracle here (see ``test_tangent_space.py``, where the holonomy around a face is
+    what can be compared). What is gauge-*invariant* is the block's spectral norm: the rotation is
+    orthogonal, so ``‖block‖`` must be the cotangent weight itself, whatever frame it maps between.
+    Measured on ``icosphere_coarse``: agreement with ``|cotmatrix|`` to 5.7e-07, exact symmetry, a
+    minimum diagonal of 3.43 and a minimum eigenvalue of 7.6e-02.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = int(mesh_tm.vertices.shape[0])
+    connection = tw.laplacian.connection_laplacian(mesh_wp.points, mesh_wp.indices)
+    cotmatrix = tw.laplacian.cotmatrix(mesh_wp.points, mesh_wp.indices)
+
+    # Same sparsity as the scalar operator: it is the same stencil with a rotation per entry.
+    assert np.array_equal(connection.offsets.numpy(), cotmatrix.offsets.numpy())
+    nnz = connection.nnz_sync()
+    assert nnz == cotmatrix.nnz_sync()
+    assert np.array_equal(
+        connection.columns.numpy()[:nnz], cotmatrix.columns.numpy()[: cotmatrix.nnz_sync()]
+    )
+
+    connection_np = _dense_blocks_2x2(connection, n_vertices)
+    assert np.array_equal(connection_np, connection_np.T)
+    assert np.diag(connection_np).min() > 0.0
+    assert np.linalg.eigvalsh(connection_np).min() > -1e-8
+
+    block_norms_np = np.linalg.norm(connection.values.numpy()[:nnz], ord=2, axis=(1, 2))
+    cotmatrix_np = bsr_to_dense(cotmatrix, n_vertices)
+    rows_np = np.repeat(
+        np.arange(n_vertices), np.diff(connection.offsets.numpy()[: n_vertices + 1])
+    )
+    weights_np = np.abs(cotmatrix_np[rows_np, connection.columns.numpy()[:nnz]])
+    assert np.allclose(block_norms_np, weights_np, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("equal_weight", [True, False])
+@pytest.mark.parametrize("symmetric", [True, False])
+def test_laplacian_entries_assemble_into_the_laplacian(
+    half_torus: tuple[tm.Trimesh, wp.Mesh], equal_weight: bool, symmetric: bool
+) -> None:
+    """
+    Class A: the unassembled triplets are the row-normalized entries ``laplacian`` builds from.
+
+    ``laplacian_entries`` is the umbrella analogue of ``cotmatrix_entries`` and its only in-repo
+    caller is ``laplacian`` itself, so the contract worth pinning is that the two agree: summing
+    the triplets per row and dividing by the row's total weight has to reproduce the assembled
+    operator, for each of the four ``(equal_weight, symmetric)`` combinations.
+    """
+    mesh_tm, mesh_wp = half_torus
+    n_vertices = int(mesh_tm.vertices.shape[0])
+    rows_wp, cols_wp, vals_wp = tw.laplacian.laplacian_entries(
+        mesh_wp.points, mesh_wp.indices, equal_weight=equal_weight, symmetric=symmetric
+    )
+    rows_np, cols_np, vals_np = rows_wp.numpy(), cols_wp.numpy(), vals_wp.numpy()
+    assert rows_np.size > 0
+    assert equal_weight == bool(np.array_equal(vals_np, np.ones_like(vals_np)))
+
+    weights_np = np.zeros((n_vertices, n_vertices))
+    np.add.at(weights_np, (rows_np, cols_np), vals_np)
+    totals_np = weights_np.sum(axis=1, keepdims=True)
+    expected_np = np.where(
+        totals_np > 0.0, weights_np / np.where(totals_np > 0.0, totals_np, 1.0), 0.0
+    )
+    # 3 072-3 136 non-zero entries here; an all-zero table would compare equal to an empty operator.
+    assert np.count_nonzero(expected_np) == rows_np.size
+
+    assembled_np = bsr_to_dense(
+        tw.laplacian.laplacian(
+            mesh_wp.points, mesh_wp.indices, equal_weight=equal_weight, symmetric=symmetric
+        ),
+        n_vertices,
+    )
+    assert np.allclose(assembled_np, expected_np, rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("face_gradients", "igl")
 def test_face_gradients_matches_igl(request: pytest.FixtureRequest, mesh_name: str) -> None:
