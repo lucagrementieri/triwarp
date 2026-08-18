@@ -291,9 +291,46 @@ def test_procrustes(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="icp_point_cloud")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "meshlib")
 def test_icp_point_cloud(bench_case: BenchCase) -> None:
-    """Point-to-point ICP against a point-cloud target: BVH versus cKDTree versus KDTreeFlann."""
+    """
+    Point-to-point ICP against a point-cloud target: BVH versus cKDTree versus KDTreeFlann.
+
+    meshlib is the fourth engine and the only multi-threaded one. Three of its settings are set
+    rather than accepted, and each changes what is being timed: ``ICPMethod.PointToPoint``, since
+    its default is point-to-plane and that is triwarp's other function; ``iterLimit`` matched to the
+    other rows' iteration count; and a small ``samplingVoxelSize``, because that constructor
+    overload *subsamples* both clouds and a coarse value would register fewer points than everyone
+    else. The solver object is stateful and caches its trees, so it is built inside the timed
+    callable exactly as trimesh's per-iteration cKDTree is -- the two clouds are the input and are
+    not.
+    """
+    if bench_case.kind == "meshlib":
+        skip_larger_than(bench_case, "bunny", "the sampling and tree build are CPU-side")
+        source_np = _source_np(bench_case)[0]
+        target_np = bench_case.vertices_np
+        voxel_size = 0.01 * _diagonal(bench_case)
+
+        def icp_ml() -> mm.AffineXf3f:
+            from meshlib import mrmeshnumpy as mn
+
+            source_ml = mn.pointCloudFromPoints(np.ascontiguousarray(source_np, dtype=np.float64))
+            target_ml = mn.pointCloudFromPoints(np.ascontiguousarray(target_np, dtype=np.float64))
+            icp = mm.ICP(
+                mm.MeshOrPoints(source_ml),
+                mm.MeshOrPoints(target_ml),
+                mm.AffineXf3f(),
+                mm.AffineXf3f(),
+                voxel_size,
+            )
+            properties_ml = mm.ICPProperties()
+            properties_ml.iterLimit = _ICP_ITERATIONS
+            properties_ml.method = mm.ICPMethod.PointToPoint
+            icp.setParams(properties_ml)
+            return icp.calculateTransformation()
+
+        assert abs(bench_case.run(icp_ml).A.x.length() - 1.0) < 1e-4
+        return
     if bench_case.kind == "triwarp":
         source, target = _source_wp(bench_case), bench_case.vertices_wp
         matrix, _transformed, _cost = bench_case.run(

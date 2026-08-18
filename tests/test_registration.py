@@ -13,7 +13,7 @@ import warp as wp
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.conversions import points_to_open3d
+from tests.conversions import points_to_meshlib, points_to_open3d
 
 
 def _make_point_clouds(rng: np.random.Generator, n: int = 200) -> tuple[np.ndarray, np.ndarray]:
@@ -418,6 +418,79 @@ def test_icp_point_to_point_matches_open3d_and_trimesh(device: str) -> None:
     assert np.allclose(transformed_wp.numpy(), moved_tm, rtol=1e-4, atol=1e-4)
     # All three land on the target itself, so none of the above is a comparison of two failures.
     assert _rms(transformed_wp.numpy(), target_np) < 1e-3
+
+
+@pytest.mark.parity("icp_point_cloud", "meshlib")
+def test_icp_point_to_point_matches_meshlib(device: str) -> None:
+    """
+    Class A on the recovered transform: MeshLib's ``ICP`` lands on the same one, to **7.4e-07**.
+
+    Compared the way the open3d and trimesh pairing above is -- by the transform, not by each
+    side's own cost, since two solvers reaching a low cost independently is not a comparison. Four
+    parameters have to be set for that to be a like-for-like run, and each is a real choice rather
+    than boilerplate:
+
+    - ``ICPMethod.PointToPoint``, because MeshLib's default is **point-to-plane**, which is
+      triwarp's *other* function;
+    - ``iterLimit``, matched to ``max_iterations``;
+    - a ``samplingVoxelSize`` small relative to the cloud, since the constructor overload taking one
+      *subsamples* both clouds and a coarse value would register two different point sets;
+    - ``MeshOrPoints`` wrappers, which is how the class accepts a cloud rather than a mesh.
+
+    The clouds are related by a small rigid motion (8 degrees) so the nearest-neighbour
+    correspondence is unique and both solvers are in the same basin -- without that, two ICPs may
+    legitimately reach different local minima and no comparison is meaningful. Both leave the same
+    residual (0.1607 on this fixture, which is the sphere's own rotational near-degeneracy, not a
+    failure), and that equality is asserted too: it is what says they converged to the same place
+    rather than agreeing on a transform by chance.
+    """
+    sphere_tm = tm.creation.icosphere(subdivisions=3)
+    target_np = np.ascontiguousarray(sphere_tm.vertices)
+    rotation_np, translation_np = _rigid_transform(
+        np.deg2rad(8.0), [0.2, 0.9, 0.3], [0.05, -0.03, 0.04]
+    )
+    source_np = np.ascontiguousarray(target_np @ rotation_np.T + translation_np)
+
+    matrix_wp, transformed_wp, _cost_wp = tw.registration.icp(
+        _to_wp(source_np, device),
+        _to_wp(target_np, device),
+        None,
+        max_iterations=30,
+        reflection=False,
+        scale=False,
+    )
+    matrix_np = matrix_wp.numpy()[0]
+
+    icp_ml = mm.ICP(
+        mm.MeshOrPoints(points_to_meshlib(source_np)),
+        mm.MeshOrPoints(points_to_meshlib(target_np)),
+        mm.AffineXf3f(),
+        mm.AffineXf3f(),
+        0.05,
+    )
+    properties_ml = mm.ICPProperties()
+    properties_ml.iterLimit = 30
+    properties_ml.method = mm.ICPMethod.PointToPoint  # its default is point-to-plane
+    icp_ml.setParams(properties_ml)
+    transform_ml = icp_ml.calculateTransformation()
+    rotation_ml = np.array(
+        [
+            [transform_ml.A.x.x, transform_ml.A.x.y, transform_ml.A.x.z],
+            [transform_ml.A.y.x, transform_ml.A.y.y, transform_ml.A.y.z],
+            [transform_ml.A.z.x, transform_ml.A.z.y, transform_ml.A.z.z],
+        ]
+    )
+    translation_ml = np.array([transform_ml.b.x, transform_ml.b.y, transform_ml.b.z])
+
+    # Non-vacuity: the reference actually moved the cloud, and by more than a rounding error.
+    assert np.abs(rotation_ml - np.eye(3)).max() > 1e-3
+    assert np.allclose(matrix_np[:3, :3], rotation_ml, rtol=1e-4, atol=1e-4)
+    assert np.allclose(matrix_np[:3, 3], translation_ml, rtol=1e-4, atol=1e-4)
+
+    # And they converged to the same place: the same residual, both below the starting offset.
+    moved_ml = source_np @ rotation_ml.T + translation_ml
+    assert np.isclose(_rms(transformed_wp.numpy(), target_np), _rms(moved_ml, target_np), rtol=1e-4)
+    assert _rms(transformed_wp.numpy(), target_np) < _rms(source_np, target_np)
 
 
 @pytest.mark.parametrize("robust_kernel", ["none", "tukey"])
