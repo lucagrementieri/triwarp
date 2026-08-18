@@ -152,6 +152,98 @@ def test_query_ball_batch(device: str, backend: Literal["bvh", "hashgrid"]):
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
+def test_query_ball_count_matches_scipy_and_the_list_form(
+    device: str, backend: Literal["bvh", "hashgrid"]
+) -> None:
+    """
+    Class A: the per-query counts equal ``KDTree.query_ball_point`` lengths, on both backends.
+
+    Also cross-checked against the ``with_offsets`` form of the same query, since the count is
+    exactly what that function's offsets differ by -- a count kernel that disagreed with the
+    gather it sizes is the failure worth catching. Measured counts on this cloud: 2, 3, 3, 10, 7,
+    so no query is empty and none holds the whole cloud.
+    """
+    rng = np.random.default_rng(1)
+    points_np = rng.random((200, 3), dtype=np.float32) * 3.0
+    queries_np = points_np[[10, 20, 30, 55, 120]].copy()
+    radius = 0.5
+
+    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    queries_wp = wp.array(np.ascontiguousarray(queries_np), dtype=wp.vec3, device=device)
+    query_ball_count = (
+        tw.neighbors.query_bvh_ball_count
+        if backend == "bvh"
+        else tw.neighbors.query_hashgrid_ball_count
+    )
+    query_ball_with_offsets = (
+        tw.neighbors.query_bvh_ball_with_offsets
+        if backend == "bvh"
+        else tw.neighbors.query_hashgrid_ball_with_offsets
+    )
+
+    counts_wp = query_ball_count(points_wp, queries_wp, radius)
+    counts_np = np.array(
+        [len(indices) for indices in KDTree(points_np).query_ball_point(queries_np, radius)],
+        dtype=np.int32,
+    )
+
+    assert counts_np.min() > 0
+    assert counts_np.max() < points_np.shape[0]
+    assert np.array_equal(counts_wp.numpy(), counts_np)
+
+    indices_wp, _distances_wp, offsets_wp = query_ball_with_offsets(
+        points_wp, queries_wp, radius, include_total=True
+    )
+    assert np.array_equal(np.diff(offsets_wp.numpy()), counts_np)
+    assert int(indices_wp.shape[0]) == int(counts_np.sum())
+
+
+def test_query_bvh_aabb_with_offsets_matches_a_brute_force_box_overlap(device: str) -> None:
+    """
+    Class A: the broad-phase hits are exactly the boxes overlapping the query cube.
+
+    ``bvh_from_bounds`` plus this query is the one pair in the module that indexes *bounds* rather
+    than points, and it has no narrow-phase filter -- so the oracle is the full ``lower <= q + h and
+    upper >= q - h`` test on all three axes, and the comparison is exact rather than a superset.
+
+    The offsets array is length ``m``, not ``m + 1``: the last query's slice runs to the flat
+    buffer's own length, which is what its Returns block means by *"``offsets[m]`` is understood as
+    ``candidate_indices_flat.shape[0]``"*. Reading it as sentinel-terminated raises ``IndexError``.
+    """
+    rng = np.random.default_rng(4)
+    lower_np = (rng.random((40, 3)) * 2.0).astype(np.float32)
+    upper_np = (lower_np + rng.random((40, 3)) * 0.3).astype(np.float32)
+    queries_np = (rng.random((6, 3)) * 2.0).astype(np.float32)
+    half_extent = 0.25
+
+    bvh = tw.neighbors.bvh_from_bounds(
+        wp.array(np.ascontiguousarray(lower_np), dtype=wp.vec3, device=device),
+        wp.array(np.ascontiguousarray(upper_np), dtype=wp.vec3, device=device),
+    )
+    indices_wp, offsets_wp = tw.neighbors.query_bvh_aabb_with_offsets(
+        bvh, wp.array(np.ascontiguousarray(queries_np), dtype=wp.vec3, device=device), half_extent
+    )
+    indices_np = indices_wp.numpy()
+    offsets_np = offsets_wp.numpy()
+
+    assert offsets_np.shape == (queries_np.shape[0],)
+    assert indices_np.size > 0
+    bounds_np = np.append(offsets_np, indices_np.size)
+    n_matched = 0
+    for query_index, query_np in enumerate(queries_np):
+        overlapping_np = np.flatnonzero(
+            np.all(
+                (lower_np <= query_np + half_extent) & (upper_np >= query_np - half_extent), axis=1
+            )
+        )
+        hits_np = indices_np[bounds_np[query_index] : bounds_np[query_index + 1]]
+        assert np.array_equal(np.sort(hits_np), overlapping_np)
+        n_matched += overlapping_np.size > 0
+    # Three of the six queries hit at least one box here; a run where none did would pass vacuously.
+    assert n_matched >= 3
+
+
+@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 def test_query_ball_empty(device: str, backend: Literal["bvh", "hashgrid"]):
     rng = np.random.default_rng(0)
     points = rng.random((10, 3), dtype=np.float32)
