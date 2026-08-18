@@ -200,6 +200,7 @@ def test_stitch_min_weight_watertight(device: str, n_a: int, n_b: int, metric: s
     assert filled_tm.is_watertight
 
 
+@pytest.mark.parity("stitch_min_weight", "meshlib")
 @pytest.mark.parametrize(("n_a", "n_b"), [(9, 13), (16, 11)])
 @pytest.mark.parametrize("metric", STITCH_COST_METRICS)
 def test_stitch_min_weight_matches_meshlib(device: str, n_a: int, n_b: int, metric: str) -> None:

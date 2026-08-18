@@ -280,20 +280,31 @@ def _new_mesh_pv(name: str) -> pv.PolyData:
     return pv.PolyData.from_regular_faces(vertices, np.ascontiguousarray(faces, dtype=np.int32))
 
 
-def _new_mesh_ml(name: str) -> mm.Mesh:
+def mesh_ml_from_numpy(vertices: np.ndarray, faces: np.ndarray) -> mm.Mesh:
     """
-    Build a fresh ``meshlib.mrmeshpy.Mesh`` from the shared NumPy source.
+    Build a ``meshlib.mrmeshpy.Mesh`` from a NumPy pair, **vertices first**.
+
+    The benchmark-side twin of ``tests.conversions.numpy_to_meshlib`` (the two suites do not import
+    each other), and it exists for the same reason: ``mn.meshFromFacesVerts`` takes *faces* first,
+    the reverse of every other builder here, and a swapped call raises nothing because the two
+    arrays differ in shape only when the counts differ. Keeping that swap in one place per suite is
+    the point. Use this for a row whose mesh is constructed rather than loaded; a row on a registry
+    mesh wants ``BenchCase.new_mesh_ml()`` instead.
 
     Imported lazily (like ``meshio``, ``open3d``, ``pymeshlab`` and ``pyvista`` above) so the
-    0.256 s meshlib import is only paid by runs that include a meshlib case. ``meshFromFacesVerts``
-    takes
-    **faces first** -- the reverse of every other builder here -- and accepts float64 positions and
-    int64 indices as the loader holds them.
+    0.256 s meshlib import is only paid by runs that include a meshlib case. Both dtypes are
+    permissive -- float64 positions and int64 indices go through as the loader holds them.
     """
     from meshlib import mrmeshnumpy as mn
 
-    vertices, faces = _load_numpy(name)
-    return mn.meshFromFacesVerts(faces, vertices)
+    return mn.meshFromFacesVerts(
+        np.ascontiguousarray(np.asarray(faces).reshape(-1, 3)), np.ascontiguousarray(vertices)
+    )
+
+
+def _new_mesh_ml(name: str) -> mm.Mesh:
+    """Build a fresh ``meshlib.mrmeshpy.Mesh`` from the shared NumPy source."""
+    return mesh_ml_from_numpy(*_load_numpy(name))
 
 
 def _vertices_wp(name: str, device: str) -> wp.array[wp.vec3]:

@@ -59,6 +59,8 @@ import pytest
 import trimesh as tm
 import warp as wp
 from conftest import BenchCase
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -233,3 +235,44 @@ def test_exclude_fully_selected_components(bench_case: BenchCase) -> None:
         )
     )
     assert kept.shape == mask.shape
+
+
+_FACE_REGION_FRACTION = 0.25
+
+
+def _seed_face_region(bench_case: BenchCase) -> np.ndarray:
+    """Mask a contiguous quarter of the face buffer as the region -- one seam, not a scatter."""
+    mask_np = np.zeros(bench_case.n_faces, dtype=bool)
+    mask_np[: int(bench_case.n_faces * _FACE_REGION_FRACTION)] = True
+    return mask_np
+
+
+@pytest.mark.benchmark(group="region_boundary_edges")
+@pytest.mark.benchmeshes("sphere_med")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_region_boundary_edges(bench_case: BenchCase) -> None:
+    """
+    The interior seam around a face region: one edge pass, independent of the region's size.
+
+    meshlib's ``findRegionBoundaryUndirectedEdgesInsideMesh`` is the function triwarp's is named
+    after and the only reference that has it -- pinned edge-for-edge in
+    tests/test_selection.py::test_region_boundary_edges. Its answer is an ``UndirectedEdgeBitSet``
+    rather than an ``(k, 2)`` array, so this row times the seam pass on both sides but not the
+    decoding, which is test-side. Pure, so the mesh is built once outside the timed callable.
+    """
+    region_np = _seed_face_region(bench_case)
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        region_ml = mn.faceBitSetFromBools(region_np)
+        bits_ml = bench_case.run(
+            lambda: mm.findRegionBoundaryUndirectedEdgesInsideMesh(mesh_ml.topology, region_ml)
+        )
+        assert bits_ml.count() > 0
+        return
+    faces = bench_case.faces_wp
+    region_wp = wp.array(region_np, dtype=wp.bool, device=bench_case.device)
+    n_vertices = bench_case.n_vertices
+    edges = bench_case.run(
+        lambda: tw.selection.region_boundary_edges(faces, region_wp, n_vertices=n_vertices)
+    )
+    assert int(edges.shape[0]) > 0

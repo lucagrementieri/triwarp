@@ -44,15 +44,38 @@ import numpy as np
 import pytest
 import trimesh as tm
 from conftest import BenchCase
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
 
 @pytest.mark.benchmark(group="boundary_loops")
 @pytest.mark.benchaxis("loops")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "meshlib")
 def test_boundary_loops(bench_case: BenchCase) -> None:
-    """Ranking plus batched extraction, across no boundary / two long rims / many short loops."""
+    """
+    Ranking plus batched extraction, across no boundary / two long rims / many short loops.
+
+    The four references return four different things and only triwarp returns every loop as an
+    ordered vertex list: ``igl.boundary_loop`` gives the longest loop alone, ``Trimesh.outline()``
+    gives a ``Path3D``, and meshlib gives one ``EdgeId`` per hole that the caller must walk. The
+    meshlib row therefore includes the ``getLeftRing`` walk, without which it would be timing
+    hole *detection* only and would not be the same quantity -- but the walk is a Python loop over
+    the ring, so read the row as an upper bound on MeshLib's own cost rather than as its floor.
+    The mesh is built inside the timed callable because the ring walk is the first thing to touch
+    the topology's edge structure, which is lazily built and cached like the AABB tree.
+    """
+    if bench_case.kind == "meshlib":
+
+        def run_ml() -> int:
+            mesh_ml = bench_case.new_mesh_ml()
+            total = 0
+            for edge_ml in mesh_ml.topology.findHoleRepresentiveEdges():
+                total += len(mesh_ml.topology.getLeftRing(edge_ml))
+            return total
+
+        bench_case.run(run_ml)
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         loops = bench_case.run(lambda: tw.boundary.boundary_loops(vertices, faces))
@@ -68,7 +91,7 @@ def test_boundary_loops(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="boundary_edges")
 @pytest.mark.benchaxis("loops")
-@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pymeshlab", "pyvista")
+@pytest.mark.benchlibs("triwarp", "trimesh", "igl", "pymeshlab", "pyvista", "meshlib")
 def test_boundary_edges(bench_case: BenchCase) -> None:
     """
     The unordered predecessor of ``boundary_loops``: the edge sort without the ranking.
@@ -83,6 +106,17 @@ def test_boundary_edges(bench_case: BenchCase) -> None:
     returns, which is strictly more than triwarp's two columns. It is the right row for this group
     and not for ``boundary_loops``, where ``igl.boundary_loop`` returns only the longest loop.
     """
+    if bench_case.kind == "meshlib":
+        # ``getBoundaryVerts`` stops one step earlier than triwarp too, marking the boundary
+        # *vertices* rather than returning the pairs -- the same relationship pymeshlab's row has,
+        # and pinned in tests/test_boundary.py::test_boundary_vertex_indices. Pure (it reads the
+        # topology and allocates a bitset), so the mesh is built once outside the timed callable;
+        # the build would otherwise dominate a sub-millisecond pass.
+        mesh_ml = bench_case.new_mesh_ml()
+        n_vertices = bench_case.n_vertices
+        verts_ml = bench_case.run(lambda: mm.getBoundaryVerts(mesh_ml.topology))
+        assert verts_ml.size() <= n_vertices
+        return
     if bench_case.kind == "pyvista":
         # ``extract_feature_edges`` with only the boundary class on -- the same find-the-boundary
         # pass, returning a line-cell PolyData. Its ``n_open_edges`` shortcut is *not* this

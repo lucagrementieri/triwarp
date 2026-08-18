@@ -12,9 +12,11 @@ from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from tests.comparisons import canonical_winding, lexsort_rows
 from tests.conversions import (
     numpy_to_meshlib,
     numpy_to_warp,
+    trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
 )
@@ -90,6 +92,55 @@ def test_fill_cone_watertight(request: pytest.FixtureRequest, mesh_name: str) ->
     faces_np = filled_faces.numpy()
     assert faces_np.min() >= 0
     assert faces_np.max() < int(new_vertices.shape[0])
+
+
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+@pytest.mark.parity("fill_cone", "meshlib")
+def test_fill_cone_matches_meshlib(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: ``fillHoleTrivially`` is the same cone -- same apex, same triangles, same winding.
+
+    MeshLib's name says "trivially" where triwarp's says "cone", but the operation is identical:
+    one new vertex at the rim's centroid and one triangle per boundary edge. It returns the apex's
+    ``VertId`` and writes the new faces into an optional ``FaceBitSet``, so both halves of the
+    answer are directly readable rather than inferred from a count.
+
+    Two conventions are named rather than assumed. The apex is compared at ``1e-6`` because
+    MeshLib stores float32 and reads back float64, the same floor triwarp's own buffer sets
+    (measured 1.19e-07 here). And the triangles are compared through
+    [`tests.comparisons.canonical_winding`][], which rotates each one onto its lowest index --
+    the two libraries pick different *starting corners* but the same orientation, and rotation
+    cannot hide a flip, so the winding stays under test.
+
+    MeshLib fills one hole per call, so a multi-rim fixture is looped on that side; ``half_torus``
+    exercises that with two rims, which is what makes the loop non-vacuous.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = int(mesh_wp.points.shape[0])
+    n_faces = int(mesh_wp.indices.shape[0])
+
+    new_vertices_wp, filled_faces_wp = tw.holes.fill_cone(mesh_wp.points, mesh_wp.indices)
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    new_faces_ml = mm.FaceBitSet()
+    apex_ids_ml = [
+        mm.fillHoleTrivially(mesh_ml, edge_ml, new_faces_ml).get()
+        for edge_ml in mesh_ml.topology.findHoleRepresentiveEdges()
+    ]
+    faces_ml = mn.getNumpyFaces(mesh_ml.topology)[np.flatnonzero(mn.getNumpyBitSet(new_faces_ml))]
+
+    # Non-vacuity, and the fixture check: a rim-less input would make every assert below trivial.
+    assert len(apex_ids_ml) == int(new_vertices_wp.shape[0]) - n_vertices > 0
+    assert np.allclose(
+        np.sort(mn.getNumpyVerts(mesh_ml)[apex_ids_ml], axis=0),
+        np.sort(new_vertices_wp.numpy()[n_vertices:], axis=0),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert np.array_equal(
+        lexsort_rows(canonical_winding(filled_faces_wp.numpy()[n_faces:])),
+        lexsort_rows(canonical_winding(faces_ml)),
+    )
 
 
 def test_fill_holes_centroid_position(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
@@ -924,6 +975,7 @@ def test_fill_smooth_triangulate_only(device: str, hemisphere: tuple[tm.Trimesh,
     assert np.array_equal(new_vertices.numpy(), mesh_wp.points.numpy())
 
 
+@pytest.mark.parity("fill_smooth", "meshlib")
 def test_fill_smooth_statistics_vs_meshlib(device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     """
     Class C (a derived scalar): the filled volume, because the two patches share no vertices.

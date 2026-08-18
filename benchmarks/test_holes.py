@@ -109,6 +109,39 @@ def test_fill_fan(bench_case: BenchCase) -> None:
     assert result.shape[0] >= faces.shape[0]
 
 
+@pytest.mark.benchmark(group="fill_cone")
+@pytest.mark.benchaxis("loops")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_fill_cone(bench_case: BenchCase) -> None:
+    """
+    One centroid vertex and one triangle per boundary edge -- ``fill_fan`` plus an apex.
+
+    Shares ``fill_fan``'s wide ``loops`` axis for the same reason: no DP, so it can afford
+    ``rim_long``'s 65 536-vertex rims. meshlib's ``fillHoleTrivially`` is the same operation
+    (pinned in tests/test_holes.py::test_fill_cone_matches_meshlib) but fills **one hole per
+    call**, so its row includes the Python loop over ``findHoleRepresentiveEdges`` -- which is the
+    honest cost of asking MeshLib for the same answer, and is why the ``holes_many`` point is the
+    one to read for per-loop overhead rather than the long-rim point. Rebuilt per round because it
+    mutates.
+    """
+    if bench_case.kind == "meshlib":
+
+        def run_ml() -> int:
+            mesh_ml = bench_case.new_mesh_ml()
+            for edge_ml in mesh_ml.topology.findHoleRepresentiveEdges():
+                mm.fillHoleTrivially(mesh_ml, edge_ml)
+            return mesh_ml.topology.numValidFaces()
+
+        assert bench_case.run(run_ml, rounds=_ROUNDS) >= bench_case.n_faces
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    new_vertices, new_faces = bench_case.run(
+        lambda: tw.holes.fill_cone(vertices, faces), rounds=_ROUNDS
+    )
+    assert new_faces.shape[0] >= faces.shape[0]
+    assert new_vertices.shape[0] >= vertices.shape[0]
+
+
 @pytest.mark.noparity(
     "trimesh",
     reason="D2 a weaker algorithm for the same task: tm.repair.fill_holes fans triangles across "
@@ -198,7 +231,7 @@ def test_fill_min_weight_chords(bench_case: BenchCase, resolve_multiple_edges: b
 
 @pytest.mark.benchmark(group="fill_smooth")
 @pytest.mark.benchaxis("loops_dp")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "meshlib")
 @pytest.mark.parametrize("triangulate_only", [True, False], ids=["dp_only", "refined"])
 def test_fill_smooth(bench_case: BenchCase, triangulate_only: bool) -> None:
     """
@@ -213,6 +246,26 @@ def test_fill_smooth(bench_case: BenchCase, triangulate_only: bool) -> None:
     the timed callable -- it is the one part of this path whose cost scales with the *mesh* rather
     than with the rims, and leaving it out would hide a regression there.
     """
+    if bench_case.kind == "meshlib":
+        if triangulate_only:
+            pytest.skip("fillHoleNicely has no triangulate-only mode; the refined row is the pair")
+
+        # ``fillHoleNicely`` is the same three stages triwarp's ``fill_smooth`` runs -- DP fill,
+        # subdivide the patch, smooth it -- and it is the oracle in
+        # tests/test_holes.py::test_fill_smooth_statistics_vs_meshlib, where the comparison is the
+        # enclosed volume because the two patches share no vertices. ``maxEdgeLen`` is left at its
+        # own default rather than fed from triwarp's derived target, so the two rows refine to
+        # different densities: read this as the cost of the *stage*, not as a like-for-like
+        # subdivision. Rebuilt per round because it mutates.
+        def run_ml() -> int:
+            mesh_ml = bench_case.new_mesh_ml()
+            settings_ml = mm.FillHoleNicelySettings()
+            for edge_ml in mesh_ml.topology.findHoleRepresentiveEdges():
+                mm.fillHoleNicely(mesh_ml, edge_ml, settings_ml)
+            return mesh_ml.topology.numValidFaces()
+
+        assert bench_case.run(run_ml, rounds=_ROUNDS) > 0
+        return
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     result = bench_case.run(
         lambda: tw.holes.fill_smooth(vertices, faces, triangulate_only=triangulate_only),

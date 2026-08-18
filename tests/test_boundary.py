@@ -8,10 +8,17 @@ import pytest
 import trimesh as tm
 import trimesh.grouping as tm_grouping
 import warp as wp
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.comparisons import assert_cyclic_permutation_equal, boundary_loop_sizes, lexsort_rows
-from tests.conversions import pyvista_edges_to_indices, trimesh_to_pymeshlab, trimesh_to_pyvista
+from tests.conversions import (
+    pyvista_edges_to_indices,
+    trimesh_to_meshlib,
+    trimesh_to_pymeshlab,
+    trimesh_to_pyvista,
+)
 
 # Open-surface fixtures that actually have a boundary (watertight solids do not).
 OPEN_MESHES = ["hemisphere", "half_torus"]
@@ -54,17 +61,26 @@ def test_oriented_boundary_edges(request: pytest.FixtureRequest, mesh_name: str)
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
-@pytest.mark.parity("boundary_edges", "pymeshlab")
+@pytest.mark.parity("boundary_edges", "pymeshlab", "meshlib")
 def test_boundary_vertex_indices(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
-    Class B: MeshLab marks the boundary *vertices* where triwarp returns the edge pairs.
+    Class B: two references mark the boundary *vertices* where triwarp returns the edge pairs.
 
-    ``compute_selection_from_mesh_border`` does the same find-the-boundary pass and stops one step
-    earlier, writing a per-vertex bool selection rather than the edges. Two named transforms make
-    them comparable: the reference is read off ``vertex_selection_array()`` (the filter returns
-    ``None``), and triwarp's edge pairs are projected down with ``np.unique`` -- which is exactly
-    what [`boundary_vertex_indices`][triwarp.boundary.boundary_vertex_indices] computes, so the
+    MeshLab's ``compute_selection_from_mesh_border`` and MeshLib's ``getBoundaryVerts`` both do the
+    same find-the-boundary pass and stop one step earlier, giving a per-vertex bool where triwarp
+    gives edges. Two named transforms make them comparable: each reference is read as a mask (off
+    ``vertex_selection_array()``, which the MeshLab filter returns nothing from, and off
+    ``mn.getNumpyBitSet``, which is already domain-sized), and triwarp's edge pairs are projected
+    down with ``np.unique`` -- which is exactly what
+    [`boundary_vertex_indices`][triwarp.boundary.boundary_vertex_indices] computes, so the
     projection is a function under test rather than test-side glue.
+
+    MeshLib is *not* also the oracle for the edges themselves. Its
+    ``findRegionBoundaryUndirectedEdgesInsideMesh`` looks like the counterpart and is not: the
+    "InsideMesh" is load-bearing, and handed an all-``True`` region it returns **zero** edges
+    because it excludes the mesh's own boundary by construction. It is the oracle for
+    [`region_boundary_edges`][triwarp.selection.region_boundary_edges] instead, where
+    tests/test_selection.py pins it.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
@@ -76,8 +92,13 @@ def test_boundary_vertex_indices(request: pytest.FixtureRequest, mesh_name: str)
     meshset_pml.compute_selection_from_mesh_border()
     selection_pml = np.asarray(meshset_pml.current_mesh().vertex_selection_array())
 
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    selection_ml = mn.getNumpyBitSet(mm.getBoundaryVerts(mesh_ml.topology))
+
+    assert vertex_indices_wp.shape[0] > 0  # non-vacuity: an empty rim would pass everything below
     assert np.array_equal(vertex_indices_wp.numpy(), vertex_indices_tm)
     assert np.array_equal(np.flatnonzero(selection_pml), vertex_indices_wp.numpy())
+    assert np.array_equal(np.flatnonzero(selection_ml), vertex_indices_wp.numpy())
     # And the edges themselves project onto the same vertex set.
     edges_wp = tw.boundary.boundary_edges(mesh_wp.points, mesh_wp.indices)
     assert np.array_equal(np.unique(edges_wp.numpy()), np.flatnonzero(selection_pml))
@@ -237,6 +258,84 @@ def test_boundary_loops_matches_trimesh_outline(
         strict=True,
     ):
         assert_cyclic_permutation_equal(loop_wp, loop_tm)
+
+
+def _meshlib_hole_rings(mesh_ml: mm.Mesh) -> list[list[tuple[int, int]]]:
+    """
+    Every MeshLib hole as an ordered list of ``(org, dest)`` vertex pairs.
+
+    This is the ``EdgeId`` -> ``(v0, v1)`` decoding the whole MeshLib boundary family runs on:
+    ``findHoleRepresentiveEdges`` names one ``EdgeId`` per hole, ``getLeftRing`` walks that hole
+    into an ordered ring of ``EdgeId``, and ``org`` / ``dest`` turn each one into the vertex pair.
+    The chaining property ``dest(e_i) == org(e_{i+1})`` is asserted by the caller rather than
+    assumed, because it is what makes the ring a *loop* rather than an unordered edge set.
+    """
+    rings_ml = []
+    for edge_ml in mesh_ml.topology.findHoleRepresentiveEdges():
+        ring_ml = mesh_ml.topology.getLeftRing(edge_ml)
+        rings_ml.append(
+            [(mesh_ml.topology.org(e).get(), mesh_ml.topology.dest(e).get()) for e in ring_ml]
+        )
+    return rings_ml
+
+
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+@pytest.mark.parity("boundary_loops", "meshlib")
+def test_boundary_loops_matches_meshlib(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B: the same loops after one named transform -- MeshLib walks each rim the *other* way.
+
+    MeshLib has no vertex-loop entry point at all; it names one ``EdgeId`` per hole and the caller
+    walks it. So the transform is the decoding in [`_meshlib_hole_rings`]: ring of ``EdgeId`` ->
+    ``org()`` per edge -> vertex loop. That decoding is what every other MeshLib boundary and
+    hole-filling comparison depends on, which is why this test asserts it in three separate pieces
+    instead of trusting it -- the ring chains (``dest(e_i) == org(e_{i+1})``), the undirected edge
+    sets agree, and the *directed* pairs are exactly triwarp's reversed.
+
+    That reversal is the transform, and it is pinned rather than canonicalised away:
+    ``getLeftRing`` walks the **hole**, whose left face is the missing one, where
+    [`oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges] follows the surface's own
+    face winding. The two therefore run opposite by construction on every rim, and asserting that
+    -- rather than comparing direction-agnostically the way
+    [`test_boundary_loops_matches_trimesh_outline`] must -- is what would catch MeshLib changing
+    the convention under us.
+
+    Not run on ``mobius``, though it is the suite's other open fixture: it is **non-orientable**,
+    so 39 of its interior edges are traversed the same direction by both incident faces and the
+    directed-boundary-edge view sees 117 edges where the surface has 78. Every library gives a
+    different answer there (triwarp one 78-entry loop over 40 distinct vertices, igl 39, MeshLib a
+    156-edge ring) and none of them is wrong about the same question. Ordered boundary loops are
+    not defined on a non-orientable input.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    loops_wp = tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices)
+    rings_ml = _meshlib_hole_rings(trimesh_to_meshlib(mesh_tm))
+
+    # Non-vacuity, and the fixture check section 6 asks for: a raw ``slice_plane`` surface reports
+    # 17 phantom rims to MeshLib where it has one, so the hole *count* is asserted before anything
+    # per-hole is compared. These fixtures merge their vertices, which is what makes them sound.
+    assert len(rings_ml) == len(loops_wp) > 0
+
+    for ring_ml in rings_ml:
+        # The ring is a loop: each edge's destination is the next edge's origin.
+        assert all(ring_ml[i][1] == ring_ml[(i + 1) % len(ring_ml)][0] for i in range(len(ring_ml)))
+
+    # Directed pairs: MeshLib's hole ring runs against the surface winding, edge for edge.
+    edges_wp = tw.boundary.oriented_boundary_edges(mesh_wp.points, mesh_wp.indices).numpy()
+    pairs_ml = np.array([pair for ring_ml in rings_ml for pair in ring_ml], dtype=np.int32)
+    assert np.array_equal(lexsort_rows(edges_wp), lexsort_rows(pairs_ml[:, ::-1]))
+
+    for loop_wp, ring_ml in zip(
+        sorted((loop.numpy() for loop in loops_wp), key=lambda loop: int(loop.min())),
+        sorted(rings_ml, key=lambda ring: min(org for org, _ in ring)),
+        strict=True,
+    ):
+        loop_ml = np.array([org for org, _ in ring_ml], dtype=np.int32)
+        # Reversed, then rotated onto triwarp's start vertex -- an exact cyclic match, not the
+        # direction-agnostic one, so the convention itself stays under test.
+        reversed_ml = loop_ml[::-1]
+        rotated_ml = np.roll(reversed_ml, -int(np.flatnonzero(reversed_ml == loop_wp[0])[0]))
+        assert np.array_equal(loop_wp, rotated_ml)
 
 
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus", "icosahedron"])

@@ -6,10 +6,12 @@ import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.comparisons import undirected_edges
-from tests.conversions import trimesh_to_pymeshlab
+from tests.conversions import numpy_to_meshlib, trimesh_to_pymeshlab
 
 
 def test_submesh_from_face_indices_empty(device: str) -> None:
@@ -465,8 +467,24 @@ def test_shrink_vertex_mask(device: str):
     assert np.array_equal(shrunk, expected)
 
 
+@pytest.mark.parity("region_boundary_edges", "meshlib")
 def test_region_boundary_edges(device: str):
-    _, faces_np = _grid_mesh(5)
+    """
+    Class A against the function this one ports, plus the hand-written rule it is meant to encode.
+
+    ``findRegionBoundaryUndirectedEdgesInsideMesh`` is the operation
+    [`region_boundary_edges`][triwarp.selection.region_boundary_edges] is named after, and the
+    "InsideMesh" half of that name is the whole content: it returns the edges separating the region
+    from the rest of the *interior*, excluding the mesh's own boundary. Handed an all-``True``
+    region it therefore returns **zero** edges, which is why it is not an oracle for
+    [`boundary_edges`][triwarp.boundary.boundary_edges] however much the name suggests otherwise.
+
+    The named transform is only the decoding: MeshLib answers with an ``UndirectedEdgeBitSet``, so
+    each set bit becomes an ``EdgeId`` and then an ``(org, dest)`` pair. The set-based oracle below
+    is kept alongside rather than replaced -- it states the rule in one line where the reference
+    only agrees with it, which is what catches the two of them sharing a misreading.
+    """
+    vertices_np, faces_np = _grid_mesh(5)
     n_faces = len(faces_np) // 3
     faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
     region = np.zeros(n_faces, dtype=bool)
@@ -485,7 +503,26 @@ def test_region_boundary_edges(device: str):
     expected = {
         e for e, fs in edge_faces.items() if len(fs) == 2 and (region[fs[0]] ^ region[fs[1]])
     }
+    assert len(expected) > 0  # non-vacuity: an empty seam would pass every assert below
     assert got_set == expected
+
+    mesh_ml = numpy_to_meshlib(vertices_np, faces_np)
+    bits_ml = mn.getNumpyBitSet(
+        mm.findRegionBoundaryUndirectedEdgesInsideMesh(
+            mesh_ml.topology, mn.faceBitSetFromBools(region)
+        )
+    )
+    edges_ml = {
+        tuple(sorted((mesh_ml.topology.org(edge).get(), mesh_ml.topology.dest(edge).get())))
+        for edge in (mm.EdgeId(mm.UndirectedEdgeId(int(i))) for i in np.flatnonzero(bits_ml))
+    }
+    assert edges_ml == expected
+
+    # The name's "InsideMesh" is the content: over the whole mesh it excludes the rim entirely.
+    all_faces_ml = mn.faceBitSetFromBools(np.ones(n_faces, dtype=bool))
+    assert (
+        mm.findRegionBoundaryUndirectedEdgesInsideMesh(mesh_ml.topology, all_faces_ml).count() == 0
+    )
 
 
 def test_exclude_fully_selected_components(device: str):
