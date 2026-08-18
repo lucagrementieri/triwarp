@@ -180,6 +180,7 @@ import pyvista as pv
 import trimesh as tm
 import warp as wp
 from conftest import BenchLibrary
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -252,7 +253,7 @@ def _new_cube_pml() -> ml.MeshSet:
 
 
 @pytest.mark.benchmark(group="box")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab", "meshlib")
 def test_box(bench_lib: BenchLibrary) -> None:
     """
     The suite's launch-overhead calibration probe.
@@ -271,6 +272,14 @@ def test_box(bench_lib: BenchLibrary) -> None:
     anything else has already imported and JITed. That is a property of first-touch cost, not of
     ``box``, and it applies to whichever group happens to run first in any module.
     """
+    if bench_lib.kind == "meshlib":
+        # ``makeCube`` takes a size and a **base corner**, not a centre, so a centred box needs
+        # ``base = -size / 2``; the same table and the same 12 triangles (tests/test_creation.py).
+        faces_ml = bench_lib.run(
+            lambda: mm.makeCube(mm.Vector3f(1.0, 2.0, 3.0), mm.Vector3f(-0.5, -1.0, -1.5))
+        )
+        assert faces_ml.topology.numValidFaces() == 12
+        return
     if bench_lib.kind == "pymeshlab":  # a cube, not a 1x2x3 box: one scale factor is all it takes
         assert _new_cube_pml().current_mesh().face_number() == 12
         bench_lib.run(_new_cube_pml)
@@ -476,9 +485,21 @@ def test_uv_sphere(bench_lib: BenchLibrary, sections: int) -> None:
 
 
 @pytest.mark.benchmark(group="cylinder")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "meshlib")
 @pytest.mark.parametrize("sections", _SECTIONS)
 def test_cylinder(bench_lib: BenchLibrary, sections: int) -> None:
+    """
+    A ring table plus two caps, at three resolutions.
+
+    meshlib's ``makeCylinder`` builds the same mesh -- same counts, volume and area
+    (``tests/test_creation.py``) -- **base-anchored** at ``z = 0`` where triwarp centres it, which
+    is a frame convention rather than a difference in the table. Its radius defaults to 0.1 rather
+    than 1, so the row passes it explicitly.
+    """
+    if bench_lib.kind == "meshlib":
+        mesh_ml = bench_lib.run(lambda: mm.makeCylinder(1.0, 2.0, sections))
+        assert mesh_ml.topology.numValidFaces() == 4 * sections
+        return
     if bench_lib.kind == "triwarp":
         device = bench_lib.device
         _, faces_wp = bench_lib.run(
@@ -499,9 +520,20 @@ def test_cylinder(bench_lib: BenchLibrary, sections: int) -> None:
 
 
 @pytest.mark.benchmark(group="cone")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab", "meshlib")
 @pytest.mark.parametrize("sections", _SECTIONS)
 def test_cone(bench_lib: BenchLibrary, sections: int) -> None:
+    """
+    A ring, an apex and one cap. meshlib's ``makeCone`` agrees exactly, frame included.
+
+    Unlike its cylinder, this one is base-anchored on *both* sides, so nothing has to be
+    reconciled -- same counts, volume, area and bounding box (``tests/test_creation.py``). Its
+    radius also defaults to 0.1 rather than 1 and is passed explicitly.
+    """
+    if bench_lib.kind == "meshlib":
+        mesh_ml = bench_lib.run(lambda: mm.makeCone(1.0, 2.0, sections))
+        assert mesh_ml.topology.numValidFaces() == 2 * sections
+        return
     if bench_lib.kind == "pymeshlab":
 
         def cone_pml() -> None:
@@ -564,9 +596,19 @@ def test_annulus(bench_lib: BenchLibrary, sections: int) -> None:
 
 
 @pytest.mark.benchmark(group="torus")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab", "meshlib")
 @pytest.mark.parametrize("sections", _SECTIONS)
 def test_torus(bench_lib: BenchLibrary, sections: int) -> None:
+    """
+    Two nested rings. meshlib's ``makeTorus`` matches exactly, counts and frame alike.
+
+    Its resolutions are positional -- ``(primaryRadius, secondaryRadius, primaryResolution,
+    secondaryResolution)`` -- so the minor resolution is passed as the 32 the other rows fix.
+    """
+    if bench_lib.kind == "meshlib":
+        mesh_ml = bench_lib.run(lambda: mm.makeTorus(1.0, 0.25, sections, 32))
+        assert mesh_ml.topology.numValidFaces() == 2 * 32 * sections
+        return
     if bench_lib.kind == "pymeshlab":
 
         def torus_pml() -> int:

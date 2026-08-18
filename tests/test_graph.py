@@ -144,6 +144,50 @@ def test_split_meshes(request: pytest.FixtureRequest) -> None:
         assert np.array_equal(faces_wp.numpy(), mesh_tm.faces.reshape(-1))
 
 
+@pytest.mark.parity("split", "meshlib")
+def test_split_matches_meshlib(request: pytest.FixtureRequest) -> None:
+    """
+    Class B on the partition: ``getAllComponents`` returns the components as face bitsets.
+
+    MeshLib splits in two steps where triwarp's ``split`` is one call -- ``getAllComponents`` labels
+    them and ``cloneRegion`` extracts each into its own object -- so the shared quantity is the
+    *partition*, and the extraction is compared through the face counts it would produce rather
+    than by building three ``ObjectMesh`` wrappers. ``FaceIncidence.PerEdge`` is triwarp's rule and
+    is passed explicitly, as it is for ``face_connected_component_labels``.
+
+    Measured on three disjoint fixtures: both return three components with face counts
+    ``{20, 80, 320}``, and every face lands in exactly one -- which is the assert that would catch a
+    labelling that dropped or double-counted a face, where the counts alone would not.
+    """
+    mesh_a_tm, mesh_a_wp = request.getfixturevalue("icosahedron")
+    mesh_b_tm, mesh_b_wp = request.getfixturevalue("hemisphere")
+    mesh_c_tm, mesh_c_wp = request.getfixturevalue("half_torus")
+    combined_tm = tm.util.concatenate([mesh_a_tm, mesh_b_tm, mesh_c_tm])
+
+    concat_vertices_wp, concat_faces_wp = tw.combine.concatenate(
+        [
+            (mesh_a_wp.points, mesh_a_wp.indices),
+            (mesh_b_wp.points, mesh_b_wp.indices),
+            (mesh_c_wp.points, mesh_c_wp.indices),
+        ]
+    )
+    parts_wp = tw.combine.split(concat_vertices_wp, concat_faces_wp)
+
+    components_ml = mm.getAllComponents(
+        mm.MeshPart(trimesh_to_meshlib(combined_tm)), mm.MeshComponents.FaceIncidence.PerEdge
+    )
+
+    expected = sorted(mesh.faces.shape[0] for mesh in (mesh_a_tm, mesh_b_tm, mesh_c_tm))
+    assert sorted(component_ml.count() for component_ml in components_ml) == expected
+    assert sorted(int(faces_wp.shape[0]) // 3 for _vertices_wp, faces_wp in parts_wp) == expected
+
+    # Every face in exactly one component, which a count comparison alone would not catch.
+    covered_np = np.zeros(combined_tm.faces.shape[0], dtype=int)
+    for component_ml in components_ml:
+        covered_np += meshlib_bitset_to_numpy(component_ml, combined_tm.faces.shape[0])
+    assert (covered_np == 1).all()
+
+
 @pytest.mark.parity("split", "open3d", "pymeshlab")
 def test_split_matches_open3d_and_pymeshlab(request: pytest.FixtureRequest) -> None:
     """

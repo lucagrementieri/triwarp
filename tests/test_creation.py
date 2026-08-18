@@ -13,11 +13,12 @@ import pyvista as pv
 import shapely.geometry as sg
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshpy as mm
 from scipy.spatial import cKDTree
 
 import triwarp as tw
 from tests.comparisons import euler_characteristic, hausdorff_two_sided, open_edge_count
-from tests.conversions import open3d_to_trimesh
+from tests.conversions import meshlib_to_trimesh, open3d_to_trimesh
 
 
 def _mesh(vertices_wp: wp.array[wp.vec3], faces_wp: wp.array[wp.int32]) -> tm.Trimesh:
@@ -228,6 +229,75 @@ def test_primitives_match_open3d(device: str) -> None:
         mesh_wp = _mesh(vertices_wp, faces_wp)
         assert np.isclose(mesh_wp.volume, mesh_ref.volume, rtol=1e-4), name
         assert np.isclose(mesh_wp.area, mesh_ref.area, rtol=1e-4), name
+
+
+@pytest.mark.parity("box", "meshlib")
+@pytest.mark.parity("cylinder", "meshlib")
+@pytest.mark.parity("cone", "meshlib")
+@pytest.mark.parity("torus", "meshlib")
+def test_primitives_match_meshlib(device: str) -> None:
+    """
+    Class A on the counts and class B on the invariants -- and the four agree **exactly**.
+
+    Stronger than the plan for this pairing predicted, which was a rigid-motion comparison after
+    scaling: measured on all four, the vertex and face counts, the enclosed volume, the surface
+    area *and* the bounding-box **extent** match to float32. The extent is asserted because volume
+    and area are both invariant under a rotation and would not notice a differently oriented cone.
+
+    Where the two do differ is *where the origin sits*, and only for one of the four: MeshLib's
+    ``makeCylinder`` is **base-anchored** (z from 0 to the length) where triwarp's is centred on
+    z = 0, while ``makeCone`` is base-anchored on **both** sides and the box and torus are centred
+    on both. That is a convention rather than a disagreement, so it is pinned per primitive below
+    rather than absorbed into a tolerance.
+
+    Two more parameter conventions have to be crossed, both silent if got wrong. ``makeCube`` takes
+    a ``size`` and a **base corner** rather than a centre, so a centred box needs
+    ``base = -size / 2``; and ``makeCylinder`` / ``makeCone`` default to a radius of **0.1**, not 1,
+    so a call that omits it builds something ten times too thin rather than failing.
+
+    ``uv_sphere`` is deliberately absent, for the reason it is absent from the open3d pairing above:
+    at the same nominal resolution the two tessellate differently -- 450 vertices and 896 faces
+    against MeshLib's 258 and 512 at ``16 x 16`` -- so its parameter does not map one-for-one and a
+    count comparison would be testing the mapping rather than the generator.
+    """
+    # Which primitives share an origin, and which only share a shape.
+    centred_on_both = {"box", "cone", "torus"}
+    for name, (vertices_wp, faces_wp), mesh_ml in (
+        (
+            "box",
+            tw.creation.box(extents=(1.0, 2.0, 3.0), device=device),
+            mm.makeCube(mm.Vector3f(1.0, 2.0, 3.0), mm.Vector3f(-0.5, -1.0, -1.5)),
+        ),
+        (
+            "cylinder",
+            tw.creation.cylinder(radius=0.5, height=2.0, sections=16, device=device),
+            mm.makeCylinder(0.5, 2.0, 16),
+        ),
+        (
+            "cone",
+            tw.creation.cone(radius=0.5, height=2.0, sections=32, device=device),
+            mm.makeCone(0.5, 2.0, 32),
+        ),
+        (
+            "torus",
+            tw.creation.torus(1.0, 0.3, major_sections=16, minor_sections=16, device=device),
+            mm.makeTorus(1.0, 0.3, 16, 16),
+        ),
+    ):
+        mesh_ref = meshlib_to_trimesh(mesh_ml)
+        mesh_wp = _mesh(vertices_wp, faces_wp)
+        assert mesh_ref.faces.shape[0] > 0, name  # non-vacuity: the reference built something
+        assert int(vertices_wp.shape[0]) == mesh_ref.vertices.shape[0], name
+        assert int(faces_wp.shape[0]) // 3 == mesh_ref.faces.shape[0], name
+        assert np.isclose(mesh_wp.volume, mesh_ref.volume, rtol=1e-4), name
+        assert np.isclose(mesh_wp.area, mesh_ref.area, rtol=1e-4), name
+        extent_wp = mesh_wp.bounds[1] - mesh_wp.bounds[0]
+        assert np.allclose(extent_wp, mesh_ref.bounds[1] - mesh_ref.bounds[0], atol=1e-5), name
+        if name in centred_on_both:
+            assert np.allclose(mesh_wp.bounds, mesh_ref.bounds, atol=1e-5), name
+        else:  # the cylinder, and the whole of the difference: MeshLib bases it at z = 0
+            assert np.isclose(mesh_wp.bounds[0, 2], -mesh_ref.bounds[1, 2] / 2.0, atol=1e-5), name
+            assert np.isclose(mesh_ref.bounds[0, 2], 0.0, atol=1e-5), name
 
 
 @pytest.mark.parametrize("sections", [16, 32, 64])

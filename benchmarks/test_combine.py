@@ -86,12 +86,39 @@ def _split_inputs(bench_case: BenchCase) -> tuple:
     return _split_cache[key]
 
 
+_mesh_ml_cache: dict[str, mm.Mesh] = {}
+
+
+def _mesh_ml(bench_case: BenchCase) -> mm.Mesh:
+    """Cache one ``meshlib.Mesh`` per mesh: the split row reads it and never mutates it."""
+    if bench_case.mesh_name not in _mesh_ml_cache:
+        _mesh_ml_cache[bench_case.mesh_name] = bench_case.new_mesh_ml()
+    return _mesh_ml_cache[bench_case.mesh_name]
+
+
 @pytest.mark.benchmark(group="split")
 @pytest.mark.benchaxis("components")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab", "meshlib")
 def test_split(bench_case: BenchCase) -> None:
-    """Label, sort, then one batched compaction of every component: 3.7x across the axis."""
+    """
+    Label, sort, then one batched compaction of every component: 3.7x across the axis.
+
+    meshlib's row stops at the labelling: ``getAllComponents`` returns one ``FaceBitSet`` per
+    component and ``cloneRegion`` -- which needs an ``ObjectMesh`` wrapper -- is what would extract
+    them, so this is a lower bound on the group rather than the same work. That makes it the useful
+    row to read against triwarp's across the components axis: the gap between them is the
+    compaction, which is the half this group was optimized for. ``FaceIncidence.PerEdge`` is
+    triwarp's rule; the mesh is read-only here, so one serves every round.
+    """
     expected = {"sphere_med": 1, "parts_64": 64, "parts_1024": 1024}[bench_case.mesh_name]
+    if bench_case.kind == "meshlib":
+        mesh_part_ml = mm.MeshPart(_mesh_ml(bench_case))
+        components_ml = bench_case.run(
+            lambda: mm.getAllComponents(mesh_part_ml, mm.MeshComponents.FaceIncidence.PerEdge),
+            rounds=_ROUNDS,
+        )
+        assert len(components_ml) == expected
+        return
     if bench_case.kind == "pymeshlab":
         # One filter, but it *pushes* one new mesh per component onto the MeshSet, so it mutates the
         # set and must be rebuilt per round. The mesh count is asserted on, which is the same
