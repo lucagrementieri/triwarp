@@ -17,9 +17,11 @@ import open3d as o3d
 import pytest
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshpy as mm
 from scipy.spatial import KDTree
 
 import triwarp as tw
+from tests.conversions import points_to_meshlib
 from triwarp.kernels import neighbors as kernel_neighbors
 
 
@@ -938,3 +940,180 @@ def test_geodesic_ball_neighborhoods_overflow_warns() -> None:
     # Clamped, not crashed: every per-vertex count fits within the fixed capacity.
     counts = np.diff(np.append(offsets_wp.numpy(), neighbor_indices_wp.shape[0]))
     assert counts.max() <= 512
+
+
+@pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
+@pytest.mark.parity(
+    "query_bvh_ball",
+    "meshlib",
+    benchmarked=False,
+    reason="findPointsInBall reports each neighbour through a Python callback, so a benchmark row "
+    "would time 20 000 queries' worth of callback dispatch rather than MeshLib's traversal -- the "
+    "same reason section 6 bars a per-vertex Python loop from a benchmark row. There is no batched "
+    "radius form: PointsProjector answers k=1 only (and does carry the query_bvh_nearest_k1 row), "
+    "and findNClosestPointsPerPoint takes a neighbour count rather than a radius. scipy and open3d "
+    "carry the timed rows for this group.",
+)
+def test_query_ball_matches_meshlib(device: str, backend: Literal["bvh", "hashgrid"]) -> None:
+    """
+    Class B: ``findPointsInBall`` reports its neighbours through a *callback*, one at a time.
+
+    Two transforms, both forced by the interface. The results arrive by callback rather than as an
+    array, so they are accumulated in Python and the answer is a *set* per query -- which is all
+    either contract promises for a radius query. And the callback's ``distSq`` is squared, so the
+    square root is the second transform, the same one the open3d comparison above makes.
+
+    ``Ball3f`` is likewise built from a centre and a **squared** radius (``radiusSq``), which is the
+    field a call written against a plain radius would silently get wrong by a square -- so the
+    counts are asserted to be non-trivial rather than merely equal.
+
+    Unlike open3d's ``KDTreeFlann``, MeshLib's ball search is **inclusive at exactly ``r``**, which
+    is triwarp's rule too: measured on three points placed at distance exactly 1.0 from the query,
+    both return all three. The random cloud here cannot show that, so it is pinned separately in
+    the second half of this test.
+    """
+    rng = np.random.default_rng(3)
+    points_np = rng.random((400, 3)) * 3.0
+    queries_np = rng.random((60, 3)) * 3.0
+    radius = 0.4
+
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    queries_wp = wp.array(
+        np.ascontiguousarray(queries_np, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    query_ball = (
+        tw.neighbors.query_bvh_ball if backend == "bvh" else tw.neighbors.query_hashgrid_ball
+    )
+    neighbours_wp, distances_wp = query_ball(points_wp, queries_wp, radius)
+
+    cloud_ml = points_to_meshlib(points_np)
+    total_found = 0
+    for query_index, query_np in enumerate(queries_np):
+        found_ml: list[tuple[int, float]] = []
+
+        def collect(result_ml: object, *_args: object, found=found_ml) -> mm.Processing:
+            found.append((int(result_ml.vId), float(result_ml.distSq)))  # type: ignore[attr-defined]
+            return mm.Processing.Continue
+
+        ball_ml = mm.Ball3f()
+        ball_ml.center = mm.Vector3f(*query_np.tolist())
+        ball_ml.radiusSq = radius * radius
+        mm.findPointsInBall(cloud_ml, ball_ml, collect)
+
+        indices_ml = np.array([index for index, _distance in found_ml], dtype=np.int32)
+        squared_ml = np.array([distance for _index, distance in found_ml])
+        order_ml = np.argsort(indices_ml)
+        order_wp = np.argsort(neighbours_wp[query_index].numpy())
+
+        assert set(neighbours_wp[query_index].numpy().tolist()) == set(indices_ml.tolist())
+        assert np.allclose(
+            distances_wp[query_index].numpy()[order_wp],
+            np.sqrt(squared_ml[order_ml]),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        total_found += indices_ml.size
+    assert total_found > queries_np.shape[0]  # non-vacuity: the balls are not empty
+
+    # The boundary rule, which the random cloud cannot reach: both are inclusive at exactly r.
+    tie_np = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.5, 0.0, 0.0]])
+    tie_wp = wp.array(np.ascontiguousarray(tie_np, dtype=np.float32), dtype=wp.vec3, device=device)
+    tie_indices_wp, _tie_distances_wp = query_ball(tie_wp, wp.vec3(0.0, 0.0, 0.0), 1.0)
+    tie_found: list[int] = []
+
+    def collect_tie(result_ml: object, *_args: object) -> mm.Processing:
+        tie_found.append(int(result_ml.vId))  # type: ignore[attr-defined]
+        return mm.Processing.Continue
+
+    tie_ball_ml = mm.Ball3f()
+    tie_ball_ml.center = mm.Vector3f(0.0, 0.0, 0.0)
+    tie_ball_ml.radiusSq = 1.0
+    mm.findPointsInBall(points_to_meshlib(tie_np), tie_ball_ml, collect_tie)
+    assert sorted(tie_found) == [0, 1, 2, 3]
+    assert sorted(tie_indices_wp.numpy().tolist()) == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize("k", [1, 7])
+@pytest.mark.parity("query_bvh_nearest_k1", "meshlib")
+@pytest.mark.parity(
+    "query_bvh_nearest_k7",
+    "meshlib",
+    benchmarked=False,
+    reason="findNClosestPointsPerPoint takes no query set -- it answers the cloud against itself, "
+    "so at the benchmark's 20 000 displaced queries against 35 947 vertices it would be timing a "
+    "different amount of work than every other row in the group. MeshLib's only batched form that "
+    "accepts a query cloud is PointsProjector, which is k=1 and carries the "
+    "query_bvh_nearest_k1 row; findFewClosestPoints is per query and would time a Python loop. "
+    "scipy, igl and open3d carry the timed rows at k=7 and k=64.",
+)
+def test_query_nearest_matches_meshlib(device: str, k: int) -> None:
+    """
+    Class B: ``findNClosestPointsPerPoint`` is self-excluding, unordered, and cloud-against-itself.
+
+    Three transforms, and each is a property of the reference rather than a formatting choice. It
+    takes only a ``PointCloud`` and a neighbour count -- there is no separate query set -- so the
+    comparison is the cloud against itself; it **excludes** each point from its own neighbour list,
+    so triwarp is asked for ``k + 1`` and its first column (the point itself, at distance 0) is
+    dropped; and its rows are *not* distance-ordered, so the two are compared as sets per row.
+
+    The flat ``Buffer_VertId`` is reshaped to ``(n_points, k)`` -- there is no shape on the returned
+    buffer, only ``n * k`` ids in row-major order, so a wrong ``k`` reshapes silently into a
+    plausible-looking answer. The self-column assert is what pins that: triwarp's own first column
+    must be the identity before anything is dropped.
+
+    This is the batched form deliberately. ``findFewClosestPoints`` is per query and a Python loop
+    over it would time the loop, which is the same reason section 6 prefers ``mrmeshnumpy``'s
+    batched curvature calls.
+    """
+    rng = np.random.default_rng(11)
+    points_np = rng.random((300, 3)) * 5.0
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+
+    neighbours_ml = np.array(
+        [
+            int(vertex_ml)
+            for vertex_ml in mm.findNClosestPointsPerPoint(points_to_meshlib(points_np), k)
+        ]
+    ).reshape(points_np.shape[0], k)
+
+    indices_wp, _distances_wp = tw.neighbors.query_bvh_nearest(points_wp, points_wp, k=k + 1)
+    indices_np = indices_wp.numpy().reshape(points_np.shape[0], k + 1)
+
+    assert np.array_equal(indices_np[:, 0], np.arange(points_np.shape[0]))  # the self column
+    assert neighbours_ml.shape == (points_np.shape[0], k)
+    for row_wp, row_ml in zip(indices_np[:, 1:], neighbours_ml, strict=True):
+        assert set(row_wp.tolist()) == set(row_ml.tolist())
+
+    if k != 1:
+        return
+    # The other batched form, and the only one that accepts a *query* cloud: exact at k=1, indices
+    # and distances alike, which is what the query_bvh_nearest_k1 benchmark row times. The cloud
+    # must be held in a name -- ``setPointCloud`` stores a raw pointer, so a temporary segfaults
+    # rather than raising, the same trap ``PointsToMeshProjector`` carries in test_proximity.py.
+    queries_np = rng.random((40, 3)) * 5.0
+    queries_wp = wp.array(
+        np.ascontiguousarray(queries_np, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    queries_ml = mm.std_vector_Vector3_float()
+    for query_np in queries_np:
+        queries_ml.append(mm.Vector3f(*query_np.tolist()))
+    cloud_ml = points_to_meshlib(points_np)  # must outlive the projector: it holds a raw pointer
+    projector_ml = mm.PointsProjector()
+    projector_ml.setPointCloud(cloud_ml)
+    projections_ml = mm.std_vector_PointsProjectionResult()
+    projector_ml.findProjections(projections_ml, queries_ml, mm.FindProjectionOnPointsSettings())
+
+    nearest_wp, distances_wp = tw.neighbors.query_bvh_nearest(points_wp, queries_wp, k=1)
+    assert np.array_equal(
+        nearest_wp.numpy(), np.array([int(result.vId) for result in projections_ml])
+    )
+    assert np.allclose(
+        distances_wp.numpy(),
+        np.sqrt([result.distSq for result in projections_ml]),
+        rtol=1e-5,
+        atol=1e-5,
+    )

@@ -15,18 +15,37 @@ import pytest
 import trimesh as tm
 import trimesh.proximity as tm_proximity
 import warp as wp
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 from scipy.spatial import Delaunay
 
 import triwarp as tw
 from tests.conversions import (
+    meshlib_scalars_to_numpy,
     numpy_to_warp,
     points_to_pyvista,
+    trimesh_to_meshlib,
     trimesh_to_open3d_t,
     trimesh_to_pymeshlab,
     trimesh_to_pyvista,
     trimesh_to_warp,
 )
 from triwarp.constants import TOLERANCE_MERGE
+
+
+def _queries_in_bounds_np(mesh_tm: tm.Trimesh, n: int, seed: int) -> np.ndarray:
+    """
+    Draw ``n`` queries from the mesh's own bounding box, grown 20 %.
+
+    A fixed cube of queries is not usable across fixtures: ``cave_cube`` is a unit box with a
+    0.1-wide cavity removed, so its *interior* is a thin shell and 200 points drawn from
+    ``[-2, 2]**3`` land outside it every time -- which turns a signed-distance or winding-number
+    comparison into a test of the exterior branch alone. Scaling to the fixture puts points on both
+    sides of the surface for every mesh in this module, which the non-vacuity asserts then state.
+    """
+    lower_np, upper_np = mesh_tm.bounds
+    margin_np = 0.2 * (upper_np - lower_np)
+    return np.random.default_rng(seed).uniform(lower_np - margin_np, upper_np + margin_np, (n, 3))
 
 
 def test_query_mesh_aabb_bounds_with_offsets(device: str) -> None:
@@ -95,6 +114,72 @@ def test_closest_point_on_mesh_random(request: pytest.FixtureRequest, mesh_name:
 
     assert np.allclose(closest_wp.numpy(), closest_tm, rtol=1e-5, atol=1e-5)
     assert np.allclose(distance_wp.numpy(), distance_tm, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+@pytest.mark.parity("closest_point_on_mesh", "meshlib")
+def test_closest_point_on_mesh_matches_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A on the distance, class C on the point, and the face index is a *tie-break gauge*.
+
+    ``findProjection`` returns a ``MeshProjectionResult`` carrying the squared distance, the
+    projected point and the ``FaceId`` it landed on -- so it is the only reference in this module
+    that reports all three. It is per query, so this loops on the MeshLib side and batches on
+    triwarp's; the benchmark rows do the same, which is why the row prices a Python loop and says
+    so.
+
+    The distances agree to **1.2e-07** and the points to **1.6e-04** on a unit-radius fixture, the
+    latter being Warp's own ``mesh_query_point_no_sign`` floor rather than a disagreement about
+    geometry (section 6 records the same magnitude against Open3D).
+
+    The face index is the interesting part and it is why this pair is worth having. It differs on
+    **39 %** of 200 random queries, and every one of those is a genuine tie: the two faces always
+    share at least one corner (57 of 78 share two, i.e. an edge) and the distances differ by at most
+    1.2e-07. So the assert is not "the same face" -- which would be wrong to demand -- but "any
+    disagreement is a tie", which is a real constraint a mis-indexed lookup would fail.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    rng = np.random.default_rng(42)
+    points_np = rng.random((200, 3), dtype=np.float64) * 4.0 - 2.0
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+
+    mesh_part_ml = mm.MeshPart(trimesh_to_meshlib(mesh_tm))
+    projections_ml = [
+        mm.findProjection(mm.Vector3f(*point_np.tolist()), mesh_part_ml) for point_np in points_np
+    ]
+    points_ml = np.array(
+        [
+            [result.proj.point.x, result.proj.point.y, result.proj.point.z]
+            for result in projections_ml
+        ]
+    )
+    distances_ml = np.sqrt(np.array([result.distSq for result in projections_ml]))
+    faces_ml = np.array([int(result.proj.face) for result in projections_ml], dtype=np.int32)
+
+    closest_wp, distances_wp, faces_wp = tw.proximity.closest_point_on_mesh(
+        mesh_wp.points, mesh_wp.indices, points_wp
+    )
+
+    assert np.allclose(distances_wp.numpy(), distances_ml, rtol=1e-5, atol=1e-5)
+    assert np.allclose(closest_wp.numpy(), points_ml, rtol=1e-4, atol=1e-4)
+
+    # Every face disagreement is a tie: the same distance, on a face sharing a corner or an edge.
+    disagree_np = faces_wp.numpy() != faces_ml
+    assert np.allclose(distances_wp.numpy()[disagree_np], distances_ml[disagree_np], atol=1e-5)
+    shared_np = np.array(
+        [
+            len(set(mesh_tm.faces[face_wp]) & set(mesh_tm.faces[face_ml]))
+            for face_wp, face_ml in zip(
+                faces_wp.numpy()[disagree_np], faces_ml[disagree_np], strict=True
+            )
+        ]
+    )
+    assert (faces_wp.numpy() == faces_ml).any()  # non-vacuity: the indices do line up in general
+    assert shared_np.size == 0 or shared_np.min() >= 1
 
 
 def test_closest_point_on_mesh_ambiguous_edge(device: str) -> None:
@@ -293,6 +378,50 @@ def test_signed_distance_on_mesh_matches_pymeshlab(
 
     assert np.array_equal(np.sign(signed_wp.numpy()), np.sign(signed_pml))
     assert np.allclose(signed_wp.numpy(), signed_pml, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+@pytest.mark.parity("signed_distance_on_mesh", "meshlib")
+def test_signed_distance_on_mesh_matches_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A, sign included: MeshLib shares triwarp's convention exactly, and trimesh's does not.
+
+    ``findSignedDistances(refMesh, testPoints)`` is the batched form and the one used here; the
+    per-query ``signedDistanceToMesh`` gives the identical numbers. Both are **negative inside**,
+    which is Warp's SDF convention and open3d's, against trimesh's opposite one -- so this pair
+    needs no negation and is asserted without one, which is what makes it a check on the sign rather
+    than a restatement of it.
+
+    Two options that had to be set rather than accepted. ``maxDistSq`` defaults to ``FLT_MAX`` but
+    ``nullOutsideMinMax`` is ``True``, so a query outside the band comes back as a null rather than
+    a distance; and ``signMode`` defaults to ``ProjectionNormal``, which is neither of triwarp's two
+    modes by construction. Measured on ``cave_cube``, all three of ``ProjectionNormal``,
+    ``WindingRule`` and ``HoleWindingRule`` agree with triwarp's parity mode to **0.0** on 300
+    queries spanning the cavity, so the default is used and the equality is asserted at full
+    precision; the fixture is what makes that non-trivial, since a convex mesh cannot separate a
+    projection-normal sign from a parity one.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    points_np = _queries_in_bounds_np(mesh_tm, 200, seed=42)
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+
+    cloud_ml = mn.pointCloudFromPoints(np.ascontiguousarray(points_np))
+    distances_ml = meshlib_scalars_to_numpy(
+        mm.findSignedDistances(trimesh_to_meshlib(mesh_tm), cloud_ml.points)
+    )
+    distances_wp = tw.proximity.signed_distance_on_mesh(
+        mesh_wp.points, mesh_wp.indices, points_wp
+    ).numpy()
+
+    assert (distances_ml < 0).any()  # non-vacuity: some query is inside, so the sign is exercised
+    assert (distances_ml > 0).any()
+    assert np.allclose(distances_wp, distances_ml, rtol=1e-5, atol=1e-5)
+    # The convention, stated as an assert: trimesh's sign is the other one.
+    assert np.allclose(distances_wp, -tm_proximity.signed_distance(mesh_tm, points_np), atol=1e-4)
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "torus"])
@@ -653,6 +782,54 @@ def test_winding_number_random(request: pytest.FixtureRequest, mesh_name: str, t
     )
     winding_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, query_wp, tiled=tiled)
     assert np.allclose(winding_wp.numpy(), winding_igl.ravel(), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
+@pytest.mark.parity("winding_number", "meshlib")
+def test_winding_number_matches_meshlib(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B: ``calcFastWindingNumber`` is a Barnes-Hut approximation, so ``beta`` is the transform.
+
+    triwarp sums the solid angle of every triangle exactly; MeshLib traverses the mesh's AABB tree
+    and replaces a distant subtree by its dipole approximation, with ``beta`` the accuracy parameter
+    that decides how distant is distant enough. So the two agree only in the limit, and the
+    comparison has to say where that limit is rather than pick a tolerance and hope.
+
+    Measured on 200 queries against ``icosphere(3)``, max absolute difference by ``beta``:
+
+    | ``beta`` | 2 (its own default) | 4 | 8 | 20 | 100 |
+    |---|---|---|---|---|---|
+    | max diff | 2.4e-02 | 5.0e-03 | 1.2e-03 | 1.1e-05 | 1.4e-06 |
+
+    ``beta=20`` is used here: two orders of magnitude inside the 1e-3 tolerance, and the default of
+    2 would fail it by 24x -- which is the point, since a comparison that passed at ``beta=2`` would
+    be tolerating the approximation rather than measuring the quantity.
+
+    ``calcDipoles`` must run first and takes the tree, not the mesh alone; its two-argument overload
+    is the one that *returns* the dipoles; the three-argument form fills a caller-owned buffer.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    query_np = _queries_in_bounds_np(mesh_tm, 200, seed=42)
+    query_wp = wp.array(
+        np.ascontiguousarray(query_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    tree_ml = mesh_ml.getAABBTree()
+    dipoles_ml = mm.calcDipoles(tree_ml, mesh_ml)
+    winding_ml = np.array(
+        [
+            mm.calcFastWindingNumber(
+                dipoles_ml, tree_ml, mesh_ml, mm.Vector3f(*point_np.tolist()), 20.0, mm.FaceId()
+            )
+            for point_np in query_np
+        ]
+    )
+    winding_wp = tw.proximity.winding_number(mesh_wp.points, mesh_wp.indices, query_wp).numpy()
+
+    assert (winding_ml > 0.5).any()  # non-vacuity: inside and outside are both represented
+    assert (winding_ml < 0.5).any()
+    assert np.allclose(winding_wp, winding_ml, rtol=1e-3, atol=1e-3)
 
 
 def test_winding_number_tiled_matches_exact(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:

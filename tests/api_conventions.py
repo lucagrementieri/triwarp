@@ -148,7 +148,6 @@ _MODULES_WITHOUT_BENCHMARKS = frozenset(
         "typing",  # annotations and rank/dtype guards; nothing with a runtime cost
         "homology",  # no reference library exposes a homology basis to time against
         "io",  # meshio round-trips, i.e. a benchmark of meshio
-        "ray",  # every ray query is timed through proximity's BVH groups
     }
 )
 

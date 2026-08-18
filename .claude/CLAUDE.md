@@ -724,6 +724,16 @@ all measured:
   (`PointCloudRelaxParams` vs `MeshRelaxParams`). One `getAllComponents` form returns a
   `(components, count)` **tuple** rather than the vector. Resolve the overload explicitly and assert
   the result's type or count before comparing, so a future rebinding cannot quietly pick the other.
+- **A projector stores a raw pointer to the mesh or cloud it was given, so a temporary segfaults.**
+  `PointsToMeshProjector.updateMeshData(build_a_mesh())` and
+  `PointsProjector.setPointCloud(build_a_cloud())` both return normally and then read freed memory
+  in `findProjections` — measured as a hard `SIGSEGV` (no exception, no traceback) at 10 000 queries
+  against `bunny_decimated` and at 40 queries against a 300-point cloud. Bind the mesh or cloud to a
+  name that outlives every query, which is Open3D's `from_legacy` hazard in a second library.
+  `MeshPart` has the same rule and cannot even be given a Python attribute to hold the reference —
+  the pybind11 object has no `__dict__`, so the owner has to be a variable or a cache.
+  `findProjections`'s `upDistLimitSq` is a second crash of the same shape: pass MeshLib's own
+  `FLT_MAX`, since `math.inf` segfaults rather than raising.
 - **The AABB tree is lazily built and cached on the `Mesh`, and the ratio depends on whether the
   query is the process's first.** On `icosphere(4)`, first-vs-second `findProjection` measures
   **68x** on the process's first mesh (2.03 ms → 0.030 ms) and settles at **17-20x** on later fresh

@@ -77,7 +77,9 @@ import pymeshlab as ml
 import pytest
 import pyvista as pv
 import warp as wp
-from conftest import BenchCase, BenchLibrary, skip_larger_than
+from conftest import BenchCase, BenchLibrary, mesh_ml_from_numpy, skip_larger_than
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 from scipy.spatial import Delaunay
 
 import triwarp as tw
@@ -92,6 +94,10 @@ _N_QUERIES_SWEEP = [10_000, 100_000]
 _query_cache: dict[tuple[str, str, int], wp.array] = {}
 _mesh_cache: dict[tuple[str, str], wp.Mesh] = {}
 _pml_distance_cache: dict[tuple[str, str], ml.MeshSet] = {}
+_ml_query_cache: dict[tuple[str, str, int], mm.std_vector_Vector3_float] = {}
+
+# MeshLib's own default distance limit. ``inf`` here is a hard crash, not an exception.
+_FLT_MAX = 3.4028234663852886e38
 
 
 def _query_points_np(bench_case: BenchCase, count: int = _N_QUERIES) -> np.ndarray:
@@ -114,6 +120,24 @@ def _query_points_wp(bench_case: BenchCase, count: int = _N_QUERIES) -> wp.array
     return _query_cache[key]
 
 
+def _query_points_ml(bench_case: BenchCase, count: int = _N_QUERIES) -> mm.std_vector_Vector3_float:
+    """
+    Build the query cloud as a MeshLib vector, cached per ``(mesh, count)``.
+
+    Every batched MeshLib query here takes ``std_vector_Vector3_float``, and filling it is a Python
+    loop over ``count`` ``Vector3f`` constructions -- 10 000 of them, which is comparable to the
+    query itself. It is the query's *input*, so it is cached outside the timed callable exactly as
+    the ``wp.array`` and ``o3d.core.Tensor`` clouds are.
+    """
+    key = (bench_case.mesh_name, "meshlib", count)
+    if key not in _ml_query_cache:
+        points_ml = mm.std_vector_Vector3_float()
+        for point_np in _query_points_np(bench_case, count):
+            points_ml.append(mm.Vector3f(*point_np.tolist()))
+        _ml_query_cache[key] = points_ml
+    return _ml_query_cache[key]
+
+
 def _mesh_wp(bench_case: BenchCase) -> wp.Mesh:
     key = (bench_case.mesh_name, str(bench_case.device))
     if key not in _mesh_cache:
@@ -122,7 +146,7 @@ def _mesh_wp(bench_case: BenchCase) -> wp.Mesh:
 
 
 @pytest.mark.benchmark(group="winding_number")
-@pytest.mark.benchlibs("triwarp", "igl", "pyvista")
+@pytest.mark.benchlibs("triwarp", "igl", "pyvista", "meshlib")
 @pytest.mark.parametrize("n_queries", _N_QUERIES_SWEEP)
 def test_winding_number(bench_case: BenchCase, n_queries: int) -> None:
     """
@@ -137,6 +161,15 @@ def test_winding_number(bench_case: BenchCase, n_queries: int) -> None:
     what it is compared against (agreement 1.000 on 2 000 queries, ``tests/test_ray.py``). Read its
     row as the cost of the predicate, not of the number -- and note it uses a BVH where this group's
     two other rows deliberately do not.
+
+    **meshlib answers a Barnes-Hut approximation of it**, and that is the whole reason its row is
+    interesting here: ``FastWindingNumber(mesh).calcFromVector`` walks the mesh's AABB tree and
+    replaces a distant subtree by a dipole, so unlike triwarp's and igl's rows it is *not*
+    ``O(queries x faces)`` and should not follow the product. ``beta=20`` is the accuracy at which
+    it agrees with the exact sum to 1e-05 (``tests/test_proximity.py``); its own default of 2 is 24x
+    looser, so a row at the default would be timing a coarser answer. The tree build is inside the
+    timed callable because ``FastWindingNumber`` is constructed per call, which is the same
+    no-hoisting situation igl's AABB tree and triwarp's ``wp.Mesh`` are in.
     """
     skip_larger_than(bench_case, "happy_buddha", "O(queries x faces): lucy is untenable")
     if n_queries > _N_QUERIES:
@@ -151,6 +184,19 @@ def test_winding_number(bench_case: BenchCase, n_queries: int) -> None:
         )
         selected_pv = bench_case.run(lambda: cloud_pv.select_interior_points(mesh_pv), rounds=3)
         assert np.asarray(selected_pv.point_data["selected_points"]).shape == (n_queries,)
+        return
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        points_ml = _query_points_ml(bench_case, n_queries)
+
+        def winding_ml() -> mm.std_vector_float:
+            result_ml = mm.std_vector_float()
+            mm.FastWindingNumber(mesh_ml).calcFromVector(
+                result_ml, points_ml, 20.0, mm.FaceId(), lambda _progress: True
+            )
+            return result_ml
+
+        assert len(bench_case.run(winding_ml)) == n_queries
         return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
@@ -194,8 +240,58 @@ def _distance_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
     return _pml_distance_cache[key]
 
 
+@pytest.mark.benchmark(group="closest_point_on_mesh")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_closest_point_on_mesh(bench_case: BenchCase) -> None:
+    """
+    The unsigned closest-point query, without the sign work the group below pays for.
+
+    Read against ``signed_distance_on_mesh``: both walk a BVH to the nearest triangle, and the
+    difference between the two groups is what signing costs -- five perturbed parity rays or a
+    winding traversal on triwarp's side, a projection-normal test on MeshLib's. That comparison is
+    the reason this group exists separately rather than being folded into the signed one.
+
+    meshlib's batched form is ``PointsToMeshProjector``: ``updateMeshData`` hands it the mesh and
+    ``findProjections`` fills a ``std_vector_MeshProjectionResult``. The per-query
+    ``findProjection`` free function gives identical distances (``tests/test_proximity.py``) but
+    would time a Python loop. The mesh is built and the AABB tree pre-warmed outside the timed
+    callable, so the row prices the traversal -- the ``new_mesh_ml`` rule for a query row.
+
+    Two ways to crash this call rather than get an exception, both measured. ``upDistLimitSq`` must
+    be ``FLT_MAX``, not ``inf`` -- an infinite limit segfaults inside ``findProjections``. And
+    **the projector keeps a raw pointer to the mesh it was given**, so
+    ``updateMeshData(build_a_mesh())`` on a temporary leaves it reading freed memory and crashes on
+    a cloud this size; the mesh has to be held in a name that outlives every query, which is
+    Open3D's ``from_legacy`` hazard in a second library.
+    """
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()  # must outlive the projector: it holds a raw pointer
+        points_ml = _query_points_ml(bench_case)
+        projector_ml = mm.PointsToMeshProjector()
+        projector_ml.updateMeshData(mesh_ml)
+
+        def project_ml() -> mm.std_vector_MeshProjectionResult:
+            result_ml = mm.std_vector_MeshProjectionResult()
+            projector_ml.findProjections(
+                result_ml, points_ml, mm.AffineXf3f(), mm.AffineXf3f(), _FLT_MAX, 0.0
+            )
+            return result_ml
+
+        project_ml()  # pre-warm: the mesh's AABB tree is built lazily on first use
+        assert len(bench_case.run(project_ml)) == _N_QUERIES
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    points = _query_points_wp(bench_case)
+    closest, distances, faces_hit = bench_case.run(
+        lambda: tw.proximity.closest_point_on_mesh(vertices, faces, points)
+    )
+    assert closest.shape == (_N_QUERIES,)
+    assert distances.shape == (_N_QUERIES,)
+    assert faces_hit.shape == (_N_QUERIES,)
+
+
 @pytest.mark.benchmark(group="signed_distance_on_mesh")
-@pytest.mark.benchlibs("triwarp", "igl", "open3d", "pymeshlab", "pyvista")
+@pytest.mark.benchlibs("triwarp", "igl", "open3d", "pymeshlab", "pyvista", "meshlib")
 @pytest.mark.parametrize("sign_mode", ["parity", "winding"])
 def test_signed_distance_on_mesh(
     bench_case: BenchCase, sign_mode: Literal["parity", "winding"]
@@ -277,6 +373,26 @@ def test_signed_distance_on_mesh(
             return scene.compute_signed_distance(queries_t)
 
         assert bench_case.run(signed_distance_o3d).shape == (_N_QUERIES,)
+        return
+
+    if bench_case.kind == "meshlib":
+        if sign_mode != "parity":
+            pytest.skip(
+                "MeshLib's default signMode is the projection normal: one row, like MeshLab"
+            )
+        # ``findSignedDistances`` is the batched form and takes a ``VertCoords``, so the cloud is
+        # uploaded as a PointCloud outside the timed callable, as every other row's cloud is. It
+        # builds the reference mesh's AABB tree on first use, and that build is inside -- the same
+        # no-hoisting position triwarp's per-call ``wp.Mesh`` is in.
+        mesh_np = (bench_case.vertices_np, bench_case.faces_np)
+        cloud_ml = mn.pointCloudFromPoints(
+            np.ascontiguousarray(_query_points_np(bench_case), dtype=np.float64)
+        )
+
+        def signed_distance_ml() -> mm.VertScalars:
+            return mm.findSignedDistances(mesh_ml_from_numpy(*mesh_np), cloud_ml.points)
+
+        assert bench_case.run(signed_distance_ml).size() == _N_QUERIES
         return
 
     if bench_case.kind == "pymeshlab":

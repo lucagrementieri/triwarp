@@ -102,6 +102,7 @@ import numpy as np
 import pytest
 import warp as wp
 from conftest import BenchCase, skip_larger_than
+from meshlib import mrmeshpy as mm
 from scipy.spatial import KDTree
 
 import triwarp as tw
@@ -122,6 +123,8 @@ _queries_np_cache: dict[str, np.ndarray] = {}
 _queries_wp_cache: dict[tuple[str, str], wp.array] = {}
 _bvh_cache: dict[tuple[str, str], wp.Bvh] = {}
 _kdtree_cache: dict[str, KDTree] = {}
+_cloud_ml_cache: dict[str, mm.PointCloud] = {}
+_queries_ml_cache: dict[str, mm.std_vector_Vector3_float] = {}
 
 
 def _queries_np(bench_case: BenchCase) -> np.ndarray:
@@ -147,6 +150,34 @@ def _queries_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
             device=bench_case.device,
         )
     return _queries_wp_cache[key]
+
+
+def _cloud_ml(bench_case: BenchCase) -> mm.PointCloud:
+    """
+    Wrap the mesh vertices in a ``PointCloud``, cached per mesh so the reference outlives its users.
+
+    ``PointsProjector.setPointCloud`` stores a **raw pointer**: handing it a temporary cloud leaves
+    it reading freed memory and segfaults on a cloud this size rather than raising, which is the
+    same rule ``PointsToMeshProjector`` follows in ``test_proximity.py``. The cache is that
+    reference, and it keeps the lazily built tree warm as well.
+    """
+    if bench_case.mesh_name not in _cloud_ml_cache:
+        from meshlib import mrmeshnumpy as mn
+
+        _cloud_ml_cache[bench_case.mesh_name] = mn.pointCloudFromPoints(
+            np.ascontiguousarray(bench_case.vertices_np, dtype=np.float64)
+        )
+    return _cloud_ml_cache[bench_case.mesh_name]
+
+
+def _queries_ml(bench_case: BenchCase) -> mm.std_vector_Vector3_float:
+    """Build the query cloud as a MeshLib vector, cached: the fill is a per-point Python loop."""
+    if bench_case.mesh_name not in _queries_ml_cache:
+        queries_ml = mm.std_vector_Vector3_float()
+        for query_np in _queries_np(bench_case):
+            queries_ml.append(mm.Vector3f(*query_np.tolist()))
+        _queries_ml_cache[bench_case.mesh_name] = queries_ml
+    return _queries_ml_cache[bench_case.mesh_name]
 
 
 def _bvh(bench_case: BenchCase) -> wp.Bvh:
@@ -200,10 +231,34 @@ def _run_o3d_nns_knn(bench_case: BenchCase, k: int) -> None:
 
 
 @pytest.mark.benchmark(group="query_bvh_nearest_k1")
-@pytest.mark.benchlibs("triwarp", "scipy", "igl", "open3d")
+@pytest.mark.benchlibs("triwarp", "scipy", "igl", "open3d", "meshlib")
 def test_query_bvh_nearest_k1(bench_case: BenchCase) -> None:
-    """``k=1`` BVH k-NN — the exact call ICP and the Chamfer family make."""
+    """
+    ``k=1`` BVH k-NN — the exact call ICP and the Chamfer family make.
+
+    meshlib's ``PointsProjector`` is the only batched form it has that takes a *query* cloud, and
+    it answers ``k=1`` only -- which is why meshlib appears in this group and not in the ``k7`` or
+    ``k64`` ones (``tests/test_neighbors.py`` records that as a ``benchmarked=False`` claim). It is
+    exact against triwarp on both indices and distances. The projector and its tree are built
+    outside the timed callable, so the row prices the queries; the point cloud is held in a name
+    because ``setPointCloud`` stores a raw pointer and a temporary segfaults.
+    """
     skip_larger_than(bench_case, "dragon")
+    if bench_case.kind == "meshlib":
+        cloud_ml = _cloud_ml(bench_case)  # cached: the projector does not own it
+        queries_ml = _queries_ml(bench_case)
+        projector_ml = mm.PointsProjector()
+        projector_ml.setPointCloud(cloud_ml)
+        settings_ml = mm.FindProjectionOnPointsSettings()
+
+        def nearest_ml() -> mm.std_vector_PointsProjectionResult:
+            results_ml = mm.std_vector_PointsProjectionResult()
+            projector_ml.findProjections(results_ml, queries_ml, settings_ml)
+            return results_ml
+
+        nearest_ml()  # pre-warm the lazily built tree
+        assert len(bench_case.run(nearest_ml)) == _queries_np(bench_case).shape[0]
+        return
     if bench_case.kind == "triwarp":
         points, queries = bench_case.vertices_wp, _queries_wp(bench_case)
         indices, _distances = bench_case.run(
