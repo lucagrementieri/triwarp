@@ -78,6 +78,7 @@ import scipy.sparse as sp
 import warp as wp
 import warp.sparse as wps
 from conftest import BenchCase, skip_larger_than
+from meshlib import mrmeshpy as mm
 from scipy.sparse.csgraph import breadth_first_order
 
 import triwarp as tw
@@ -119,10 +120,23 @@ def _scipy_graph(bench_case: BenchCase) -> sp.csr_matrix:
 
 @pytest.mark.benchmark(group="connected_component_labels")
 @pytest.mark.benchaxis("components")
-@pytest.mark.benchlibs("triwarp", "scipy", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "scipy", "pymeshlab", "meshlib")
 def test_connected_component_labels(bench_case: BenchCase) -> None:
-    """ECL-CC hook and flatten, over 1 / 64 / 1024 components at a fixed face count."""
+    """
+    ECL-CC hook and flatten, over 1 / 64 / 1024 components at a fixed face count.
+
+    meshlib's ``getAllComponentsVerts`` is the only reference here that returns the components
+    themselves -- one ``VertBitSet`` each, in its own traversal order -- rather than a label array
+    or a derived selection, so its cost includes materializing ``k`` bitsets and should be the row
+    that moves most across this axis. It reads the topology rather than an assembled adjacency, so
+    the mesh is built outside the timed callable exactly as triwarp's CSR is.
+    """
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        components_ml = bench_case.run(lambda: mm.getAllComponentsVerts(mesh_ml, None))
+        assert 0 < len(components_ml) <= n_vertices
+        return
     if bench_case.kind == "pymeshlab":
         # MeshLab has no filter that hands back a label array; the closest thing that *runs* the
         # component pass without also splitting the mesh is the small-component face selection,

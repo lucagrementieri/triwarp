@@ -11,7 +11,7 @@ from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.comparisons import undirected_edges
-from tests.conversions import numpy_to_meshlib, trimesh_to_pymeshlab
+from tests.conversions import meshlib_bitset_to_numpy, numpy_to_meshlib, trimesh_to_pymeshlab
 
 
 def test_submesh_from_face_indices_empty(device: str) -> None:
@@ -449,6 +449,61 @@ def test_expand_vertex_mask_matches_pymeshlab_dilatation(device: str):
             tw.selection.expand_vertex_mask(faces_wp, seed_wp, hops).numpy(),
             meshset_pml.current_mesh().vertex_selection_array(),
         )
+
+
+@pytest.mark.parametrize("hops", [1, 2, 3])
+@pytest.mark.parity("expand_vertex_mask", "meshlib")
+@pytest.mark.parity("shrink_vertex_mask", "meshlib")
+def test_expand_and_shrink_vertex_mask_match_meshlib(device: str, hops: int) -> None:
+    """
+    Class A on both, and the reference that makes ``shrink_vertex_mask`` comparable at all.
+
+    MeshLab's Erode Selection is a *face* operation and is a documented class-D exemption for the
+    erosion half (measured 51 / 39 / 25 surviving vertices where triwarp gives 19 / 7 / 1), which
+    left ``shrink_vertex_mask`` with a numpy oracle and no library to check it against. MeshLib's
+    ``shrink`` takes a ``VertBitSet`` and erodes it by one-ring layers, which is triwarp's operation
+    exactly: element-for-element agreement at every hop count here, in both directions.
+
+    Two things about the call, both of which fail silently if got wrong. ``expand`` and ``shrink``
+    are **overload sets** whose region form returns ``None`` and *mutates* the bitset in place --
+    the sibling overload taking a single ``VertId`` returns a new one instead, so a call written
+    against the wrong overload reads an unchanged mask rather than raising. And the region is
+    built with ``mn.vertBitSetFromBools`` and read back through
+    [`meshlib_bitset_to_numpy`][tests.conversions.meshlib_bitset_to_numpy], which pads it to the
+    vertex domain.
+
+    Non-vacuous in both directions: the seed grows 7 -> 19 -> 35 -> 55 vertices of 162 and the
+    eroded set falls 92 -> 73 -> 51 -> 31, so neither answer is the whole mesh or nothing.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    n_vertices = mesh_tm.vertices.shape[0]
+    faces_wp = wp.array(
+        np.ascontiguousarray(mesh_tm.faces.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=device,
+    )
+
+    seed_np = mesh_tm.vertices[:, 2] > 0.9
+    region_np = mesh_tm.vertices[:, 2] > -0.2
+    assert 0 < seed_np.sum() < region_np.sum() < n_vertices
+
+    for mask_np, grow in ((seed_np, True), (region_np, False)):
+        mask_wp = wp.array(np.ascontiguousarray(mask_np), dtype=wp.bool, device=device)
+        morphed_wp = (
+            tw.selection.expand_vertex_mask(faces_wp, mask_wp, hops)
+            if grow
+            else tw.selection.shrink_vertex_mask(faces_wp, mask_wp, hops)
+        )
+
+        mesh_ml = numpy_to_meshlib(mesh_tm.vertices, mesh_tm.faces)
+        region_ml = mn.vertBitSetFromBools(np.ascontiguousarray(mask_np))
+        # The in-place overload: it returns None and rewrites `region_ml`.
+        assert (mm.expand if grow else mm.shrink)(mesh_ml.topology, region_ml, hops) is None
+        morphed_ml = meshlib_bitset_to_numpy(region_ml, n_vertices)
+
+        assert 0 < morphed_ml.sum() < n_vertices
+        assert morphed_ml.sum() != mask_np.sum()  # the reference actually moved the boundary
+        assert np.array_equal(morphed_wp.numpy(), morphed_ml)
 
 
 def test_shrink_vertex_mask(device: str):

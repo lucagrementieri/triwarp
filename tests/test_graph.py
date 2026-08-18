@@ -8,12 +8,19 @@ import scipy.sparse as sp
 import scipy.sparse.csgraph as csgraph
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshpy as mm
 from scipy.spatial import cKDTree
 
 import triwarp as tw
 import triwarp.typing as twt
 from tests.comparisons import same_partition
-from tests.conversions import open3d_to_trimesh, trimesh_to_open3d, trimesh_to_pymeshlab
+from tests.conversions import (
+    meshlib_bitset_to_numpy,
+    open3d_to_trimesh,
+    trimesh_to_meshlib,
+    trimesh_to_open3d,
+    trimesh_to_pymeshlab,
+)
 
 
 @pytest.mark.parity("concatenate", "trimesh")
@@ -319,6 +326,54 @@ def test_connected_component_labels_matches_pymeshlab(
     threshold = face_ratio * size_np.max()
     sizes_by_face_np = size_np[np.searchsorted(_label, face_labels_np)]
     assert np.array_equal(sizes_by_face_np < threshold, selection_pml)
+
+
+@pytest.mark.parity("connected_component_labels", "meshlib")
+def test_connected_component_labels_matches_meshlib(request: pytest.FixtureRequest) -> None:
+    """
+    Class B (label packing): ``getAllComponentsVerts`` returns the components as *bitsets*.
+
+    The transform is the one every component comparison in this package makes plus a decode:
+    MeshLib hands back a vector of ``VertBitSet``, one per component in its own traversal order,
+    so each is expanded to a bool array over the vertex domain and its index becomes the label,
+    and only the *partition* is then shared -- triwarp names a component after a representative
+    vertex. Hence [`same_partition`][tests.comparisons.same_partition].
+
+    Stronger than the scipy pairing in one respect and weaker in another, which is why both stay:
+    the bitsets pin each component's *membership* directly rather than through a renumbering, but
+    MeshLib takes a mesh where scipy takes an edge list, so it cannot reach the random-graph inputs
+    at all.
+
+    Non-vacuous: three disjoint fixtures, so the answer is neither one component nor as many as
+    there are vertices, and the component *sizes* are asserted to be the fixtures' vertex counts
+    before the partition is compared.
+    """
+    mesh_a_tm, mesh_a_wp = request.getfixturevalue("icosahedron")
+    mesh_b_tm, _mesh_b_wp = request.getfixturevalue("hemisphere")
+    mesh_c_tm, _mesh_c_wp = request.getfixturevalue("half_torus")
+    combined_tm = tm.util.concatenate([mesh_a_tm, mesh_b_tm, mesh_c_tm])
+    n_vertices = combined_tm.vertices.shape[0]
+    faces_wp = wp.array(
+        np.ascontiguousarray(combined_tm.faces.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=mesh_a_wp.points.device,
+    )
+
+    components_ml = mm.getAllComponentsVerts(trimesh_to_meshlib(combined_tm), None)
+    labels_ml = np.full(n_vertices, -1, dtype=np.int64)
+    for label, component_ml in enumerate(components_ml):
+        labels_ml[meshlib_bitset_to_numpy(component_ml, n_vertices)] = label
+
+    unique_edges_wp, _inverse_wp = tw.edges.edges_unique(faces_wp, n_vertices=n_vertices)
+    labels_wp = tw.graph.connected_component_labels(
+        tw.graph.edges_to_csr(n_vertices, unique_edges_wp)
+    )
+
+    assert sorted(component_ml.count() for component_ml in components_ml) == sorted(
+        mesh.vertices.shape[0] for mesh in (mesh_a_tm, mesh_b_tm, mesh_c_tm)
+    )
+    assert (labels_ml >= 0).all()  # every vertex landed in a component
+    assert same_partition(labels_wp.numpy(), labels_ml)
 
 
 def test_connected_component_labels_empty_edges(device: str) -> None:

@@ -7,10 +7,16 @@ import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.comparisons import lexsort_rows, same_partition
-from tests.conversions import trimesh_to_pyvista
+from tests.conversions import (
+    meshlib_bitset_to_numpy,
+    numpy_to_meshlib,
+    trimesh_to_meshlib,
+    trimesh_to_pyvista,
+)
 
 _MESHES = ["icosahedron", "half_torus", "hemisphere"]
 
@@ -254,6 +260,76 @@ def test_face_connected_component_labels_matches_igl(
 
     assert n_doubled_igl == 2 * n_components_igl
     assert same_partition(labels_doubled_wp.numpy(), np.asarray(labels_doubled_igl).ravel())
+
+
+def _face_labels_ml(components_ml: object, n_faces: int) -> np.ndarray:
+    """Decode MeshLib's vector of ``FaceBitSet`` components into a per-face label array."""
+    labels_np = np.full(n_faces, -1, dtype=np.int64)
+    for label, component_ml in enumerate(components_ml):  # type: ignore[call-overload]
+        labels_np[meshlib_bitset_to_numpy(component_ml, n_faces)] = label
+    return labels_np
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
+@pytest.mark.parity("face_connected_component_labels", "meshlib")
+def test_face_connected_component_labels_matches_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B, and the pair that pins *which* incidence rule triwarp implements.
+
+    ``getAllComponents`` takes a ``FaceIncidence`` and the two settings are different operations,
+    not two tunings: ``PerEdge`` connects faces sharing an edge, which is triwarp's rule, and
+    ``PerVertex`` connects faces sharing a single vertex. On a bowtie -- two triangles meeting at
+    one vertex -- they read **2** components and **1**, and triwarp reads 2. No other reference in
+    this module exposes that choice, so this is the only test that can fail if the convention ever
+    drifts.
+
+    The decode is the usual one: a vector of ``FaceBitSet`` in MeshLib's own traversal order, each
+    padded to the face domain, its index taken as the label, compared as a *partition*. Note the
+    overload set -- a second form takes ``maxComponentCount`` and returns a ``(components, count)``
+    **tuple**, so the result's type is asserted by unpacking it as a plain sequence here.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_wp = mesh_wp.indices
+    n_faces = mesh_tm.faces.shape[0]
+
+    components_ml = mm.getAllComponents(
+        mm.MeshPart(trimesh_to_meshlib(mesh_tm)), mm.MeshComponents.FaceIncidence.PerEdge
+    )
+    labels_wp = tw.adjacency.face_connected_component_labels(faces_wp)
+    assert len(components_ml) == np.unique(labels_wp.numpy()).shape[0]
+    assert same_partition(labels_wp.numpy(), _face_labels_ml(components_ml, n_faces))
+
+    # Two disjoint copies, the case a constant labelling would pass.
+    doubled_tm = tm.util.concatenate([mesh_tm, mesh_tm.copy().apply_translation([10.0, 0.0, 0.0])])
+    doubled_wp = wp.array(
+        np.ascontiguousarray(doubled_tm.faces.reshape(-1), dtype=np.int32),
+        dtype=wp.int32,
+        device=faces_wp.device,
+    )
+    doubled_ml = mm.getAllComponents(
+        mm.MeshPart(trimesh_to_meshlib(doubled_tm)), mm.MeshComponents.FaceIncidence.PerEdge
+    )
+    assert len(doubled_ml) == 2 * len(components_ml)
+    assert same_partition(
+        tw.adjacency.face_connected_component_labels(doubled_wp).numpy(),
+        _face_labels_ml(doubled_ml, doubled_tm.faces.shape[0]),
+    )
+
+    # The convention, on the input that separates the two rules.
+    bowtie_vertices_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]]
+    )
+    bowtie_faces_np = np.array([[0, 1, 2], [0, 3, 4]], dtype=np.int32)
+    bowtie_ml = mm.MeshPart(numpy_to_meshlib(bowtie_vertices_np, bowtie_faces_np))
+    bowtie_wp = wp.array(
+        np.ascontiguousarray(bowtie_faces_np.reshape(-1)), dtype=wp.int32, device=faces_wp.device
+    )
+    per_edge_ml = mm.getAllComponents(bowtie_ml, mm.MeshComponents.FaceIncidence.PerEdge)
+    per_vertex_ml = mm.getAllComponents(bowtie_ml, mm.MeshComponents.FaceIncidence.PerVertex)
+    assert (len(per_edge_ml), len(per_vertex_ml)) == (2, 1)
+    assert np.unique(tw.adjacency.face_connected_component_labels(bowtie_wp).numpy()).shape[0] == 2
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])

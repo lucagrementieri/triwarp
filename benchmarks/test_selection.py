@@ -92,6 +92,15 @@ def _seed_mask(bench_case: BenchCase) -> wp.array[wp.bool]:
     return _mask_cache[key]
 
 
+def _seed_mask_np(bench_case: BenchCase) -> np.ndarray:
+    """Build the same 1% seed as [`_seed_mask`], as a host bool array for the meshlib rows."""
+    rng = np.random.default_rng(_SEED)
+    n = bench_case.n_vertices
+    mask_np = np.zeros(n, dtype=bool)
+    mask_np[rng.choice(n, size=max(1, int(n * _SEED_FRACTION)), replace=False)] = True
+    return mask_np
+
+
 def _unique_edges(bench_case: BenchCase) -> wp.array:
     """Build the unique edge table once: an *input*, so morphology never re-times the sort."""
     key = (bench_case.mesh_name, str(bench_case.device))
@@ -118,10 +127,29 @@ def _seeded_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
 
 @pytest.mark.benchmark(group="expand_vertex_mask")
 @pytest.mark.benchmeshes("sphere_med")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "pymeshlab", "meshlib")
 @pytest.mark.parametrize("hops", _HOPS)
 def test_expand_vertex_mask(bench_case: BenchCase, hops: int) -> None:
-    """One full edge pass per hop, regardless of selection size: the slope should be exactly 8."""
+    """
+    One full edge pass per hop, regardless of selection size: the slope should be exactly 8.
+
+    meshlib's ``expand`` takes the hop count itself and dilates a ``VertBitSet`` over the *same*
+    vertex neighbourhood, agreeing element for element (``tests/test_selection.py``), so unlike the
+    pymeshlab row it needs no face round trip. It mutates the bitset in place, so a fresh one is
+    built inside the timed callable from the shared seed -- the bitset build is a bit-pack of the
+    seed array and is the row's floor.
+    """
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        seed_np = np.ascontiguousarray(_seed_mask_np(bench_case))
+
+        def expand_ml() -> int:
+            region_ml = mn.vertBitSetFromBools(seed_np)
+            mm.expand(mesh_ml.topology, region_ml, hops)
+            return region_ml.count()
+
+        assert bench_case.run(expand_ml) > 0
+        return
     if bench_case.kind == "triwarp":
         faces, mask = bench_case.faces_wp, _seed_mask(bench_case)
         edges = _unique_edges(bench_case)
@@ -146,15 +174,37 @@ def test_expand_vertex_mask(bench_case: BenchCase, hops: int) -> None:
     "selection boundary, so reading the vertex selection back gives the vertices of the "
     "surviving faces, not an eroded vertex set. Measured on a 9x9 grid: 51 / 39 / 25 vertices "
     "after 1 / 2 / 3 erosions where shrink_vertex_mask gives 19 / 7 / 1. Dilation does map and is "
-    "covered; erosion is a different operation, and the scipy oracle in "
-    "tests/test_selection.py::test_shrink_vertex_mask is the one for this function.",
+    "covered; erosion is a different operation, and meshlib's shrink -- which erodes a VertBitSet "
+    "by one-ring layers and agrees element for element -- is the oracle for this function, in "
+    "tests/test_selection.py::test_expand_and_shrink_vertex_mask_match_meshlib.",
 )
 @pytest.mark.benchmark(group="shrink_vertex_mask")
 @pytest.mark.benchmeshes("sphere_med")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "pymeshlab", "meshlib")
 @pytest.mark.parametrize("hops", _HOPS)
 def test_shrink_vertex_mask(bench_case: BenchCase, hops: int) -> None:
-    """The erosion counterpart, on the same input: should match ``expand`` row for row."""
+    """
+    The erosion counterpart, on the same input: should match ``expand`` row for row.
+
+    meshlib is the reference the exemption above says this group lacked: ``shrink`` erodes a
+    ``VertBitSet`` by one-ring layers, which is triwarp's operation and not MeshLab's face-based
+    one, and the two agree element for element at every hop count. The mask is pre-grown outside
+    the timed callable on both sides, as the triwarp row does, so the rounds erode the same set.
+    """
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        seed_np = np.ascontiguousarray(_seed_mask_np(bench_case))
+        grown_ml = mn.vertBitSetFromBools(seed_np)
+        mm.expand(mesh_ml.topology, grown_ml, max(_HOPS))
+        grown_np = np.ascontiguousarray(mn.getNumpyBitSet(grown_ml))
+
+        def shrink_ml() -> int:
+            region_ml = mn.vertBitSetFromBools(grown_np)
+            mm.shrink(mesh_ml.topology, region_ml, hops)
+            return region_ml.count()
+
+        assert bench_case.run(shrink_ml) >= 0
+        return
     if bench_case.kind == "triwarp":
         faces = bench_case.faces_wp
         edges = _unique_edges(bench_case)

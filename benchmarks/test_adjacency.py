@@ -32,6 +32,7 @@ import numpy as np
 import pytest
 import trimesh as tm
 from conftest import BenchCase
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -142,7 +143,7 @@ def test_face_adjacency_unshared(bench_case: BenchCase, tabled: bool) -> None:
 
 
 @pytest.mark.benchmark(group="face_connected_component_labels")
-@pytest.mark.benchlibs("triwarp", "igl", "pyvista")
+@pytest.mark.benchlibs("triwarp", "igl", "pyvista", "meshlib")
 def test_face_connected_component_labels(bench_case: BenchCase) -> None:
     """
     Per-face component ids over the face-adjacency graph: the edge build plus a label propagation.
@@ -161,6 +162,17 @@ def test_face_connected_component_labels(bench_case: BenchCase) -> None:
     whole new ``PolyData`` carrying the ``RegionId`` cell array rather than the labels alone -- so
     its row prices the copy as well as the traversal.
     """
+    if bench_case.kind == "meshlib":
+        # ``FaceIncidence.PerEdge`` is triwarp's rule and is passed explicitly: the ``PerVertex``
+        # setting is a different operation, not a tuning (2 components against 1 on a bowtie). It
+        # returns the components as bitsets rather than a label array, so its cost includes
+        # materializing k of them.
+        mesh_part_ml = mm.MeshPart(bench_case.new_mesh_ml())
+        components_ml = bench_case.run(
+            lambda: mm.getAllComponents(mesh_part_ml, mm.MeshComponents.FaceIncidence.PerEdge)
+        )
+        assert 0 < len(components_ml) <= bench_case.n_faces
+        return
     if bench_case.kind == "pyvista":
         mesh_pv = bench_case.mesh_pv
         labelled_pv = bench_case.run(lambda: mesh_pv.connectivity("all"))
