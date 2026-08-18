@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 import igl
 import numpy as np
 import pytest
@@ -300,12 +302,10 @@ def test_boundary_loops_matches_meshlib(request: pytest.FixtureRequest, mesh_nam
     [`test_boundary_loops_matches_trimesh_outline`] must -- is what would catch MeshLib changing
     the convention under us.
 
-    Not run on ``mobius``, though it is the suite's other open fixture: it is **non-orientable**,
-    so 39 of its interior edges are traversed the same direction by both incident faces and the
-    directed-boundary-edge view sees 117 edges where the surface has 78. Every library gives a
-    different answer there (triwarp one 78-entry loop over 40 distinct vertices, igl 39, MeshLib a
-    156-edge ring) and none of them is wrong about the same question. Ordered boundary loops are
-    not defined on a non-orientable input.
+    Not run on ``mobius``, though it is the suite's other open fixture, and not because triwarp
+    cannot answer there -- [`test_boundary_loops_mobius_is_one_cycle`] shows it returns the correct
+    single 78-cycle. It is that **no reference agrees with the truth**: MeshLib's hole ring reads
+    156 and igl cuts the one cycle into three open chains. There is nothing to compare against.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     loops_wp = tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices)
@@ -336,6 +336,62 @@ def test_boundary_loops_matches_meshlib(request: pytest.FixtureRequest, mesh_nam
         reversed_ml = loop_ml[::-1]
         rotated_ml = np.roll(reversed_ml, -int(np.flatnonzero(reversed_ml == loop_wp[0])[0]))
         assert np.array_equal(loop_wp, rotated_ml)
+
+
+def test_boundary_loops_mobius_is_one_cycle(mobius: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: on a non-orientable surface no reference computes the right answer.
+
+    The ground truth is checked here rather than borrowed, and it is cheap to state: every one of
+    the Moebius band's 78 boundary vertices lies on exactly two boundary edges, so the boundary is
+    a disjoint union of cycles; walking it from any vertex covers all 78 and closes. One loop of
+    78, which is also what topology says -- a Moebius band has a single boundary circle, and this
+    fixture is a 39-column strip whose boundary wraps it twice.
+
+    Both references are wrong here, differently, which is why this is an invariant test:
+
+    - ``igl.boundary_loop_all`` returns ``1 + 39 + 38``. Each of those three has exactly one
+      consecutive pair that is **not** a boundary edge -- they are open chains closed artificially,
+      and one of them is a single vertex. ``igl.boundary_loop`` then reports the longest, 39.
+    - MeshLib's ``findHoleRepresentiveEdges`` + ``getLeftRing`` gives a 156-edge ring.
+
+    triwarp was wrong too until the undirected fallback landed: the directed boundary edges are not
+    a successor graph here (one seam vertex has out-degree 2), so ``succ[tail] = head`` dropped an
+    edge and the walk returned 78 entries over 40 distinct vertices. That is the regression this
+    pins -- the distinctness assert is the one that failed before, not the length.
+
+    The loop *direction* is deliberately not asserted: with no consistent winding there is no
+    direction to be right about, only a reproducible one.
+    """
+    mesh_tm, mesh_wp = mobius
+    assert not tw.validation.is_orientable(mesh_wp.indices)  # the fixture's whole point here
+
+    boundary_pairs = {
+        tuple(sorted(pair))
+        for pair in tw.boundary.boundary_edges(mesh_wp.points, mesh_wp.indices).numpy().tolist()
+    }
+    degree = Counter(vertex for pair in boundary_pairs for vertex in pair)
+    assert len(boundary_pairs) == 78
+    assert set(degree.values()) == {2}, "2-regular is what makes the single-cycle claim meaningful"
+
+    loops_wp = tw.boundary.boundary_loops(mesh_wp.points, mesh_wp.indices)
+    assert len(loops_wp) == 1
+    loop_np = loops_wp[0].numpy()
+
+    assert loop_np.shape[0] == 78
+    assert len(set(loop_np.tolist())) == 78  # the assert that failed before the fallback existed
+    assert set(loop_np.tolist()) == set(degree)
+    assert all(
+        tuple(sorted((int(loop_np[i]), int(loop_np[(i + 1) % 78])))) in boundary_pairs
+        for i in range(78)
+    ), "consecutive entries must be real boundary edges, and the last must close onto the first"
+
+    # igl is not merely ordered differently -- it reports three loops where there is one.
+    assert [len(loop) for loop in igl.boundary_loop_all(mesh_tm.faces.astype(np.int64))] == [
+        1,
+        39,
+        38,
+    ]
 
 
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus", "icosahedron"])

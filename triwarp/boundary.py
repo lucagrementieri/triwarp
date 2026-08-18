@@ -9,6 +9,9 @@ returns the original row indices of edges occurring exactly once.
 
 from __future__ import annotations
 
+import itertools
+
+import numpy as np
 import warp as wp
 
 import triwarp as tw
@@ -151,9 +154,15 @@ def boundary_loops(
 
     Notes
     -----
-    Assumes a manifold boundary: each boundary vertex has exactly one outgoing and one incoming
-    boundary edge. A vertex shared by more than one loop (non-manifold pinch point) keeps only
-    one outgoing successor edge (last write wins).
+    Assumes a **manifold** boundary: each boundary vertex lies on exactly two boundary edges. A
+    vertex shared by more than one loop (a non-manifold pinch point) keeps only one outgoing
+    successor edge, last write wins.
+
+    Orientability is *not* assumed. On a non-orientable surface the winding cannot orient the
+    boundary globally -- at the seam two boundary edges leave the same vertex -- so the loops are
+    recovered from the undirected edges instead, and their direction is then an arbitrary but
+    reproducible choice rather than the face winding's. Only the direction is arbitrary; the loops
+    themselves are exact. Costs one extra host readback to detect the case.
 
     See Also
     --------
@@ -234,10 +243,140 @@ def boundary_loops_batched(
         edges = tw.edges.faces_to_edges(faces)
     directed = twt.as_array2d(tw.array.gather(edges, rows), wp.int32)
 
+    n_vertices = int(vertices.shape[0])
+    if _needs_unoriented_boundary_walk(directed, n_vertices):
+        return _unoriented_boundary_cycles(
+            twt.as_array2d(tw.array.gather(edges_sorted, rows), wp.int32), n_vertices
+        )
     # ``validate=False``: ``directed`` holds vertex indices this function just gathered out of
     # ``faces``, so the range check would only re-derive a bound the caller already guarantees —
     # at the cost of a device synchronization.
-    return tw.graph.successor_cycles(directed, int(vertices.shape[0]), validate=False)
+    return tw.graph.successor_cycles(directed, n_vertices, validate=False)
+
+
+def _needs_unoriented_boundary_walk(directed: twt.Array2dInt32, n_vertices: int) -> bool:
+    """
+    Whether the directed boundary edges fail to be a successor graph *and* an undirected walk fixes.
+
+    They are one on every orientable surface, which is what lets
+    [`boundary_loops_batched`][triwarp.boundary.boundary_loops_batched] hand them straight to
+    [`successor_cycles`][triwarp.graph.successor_cycles]. Two different defects break that, and
+    they need different answers, so this returns ``True`` for only one of them:
+
+    - **A non-orientable seam.** The winding cannot be made consistent globally, so at the seam two
+      boundary edges leave the same vertex and ``succ[tail] = head`` drops one silently. Measured
+      on the Moebius fixture: exactly one vertex of 78 has out-degree 2, and the walk that follows
+      returns 78 entries over only 40 distinct vertices. The boundary is still 2-regular, so
+      [`_unoriented_boundary_cycles`][triwarp.boundary._unoriented_boundary_cycles] recovers it
+      exactly -- this is the case worth taking.
+    - **A pinch point**, where two loops meet at one vertex, which then has four boundary
+      incidences. No 2-regular walk exists, so the undirected fallback has nothing better to offer
+      -- it would have to drop neighbours too, just at a different place. The documented last-write-
+      wins behaviour stands, and this returns ``False``.
+
+    Conflating them is easy and was measured: an icosphere with every seventh face removed has
+    pinch points and *no* orientability problem, and a gate reading only out-degree sends it down
+    the fallback for 1.39x and no benefit.
+
+    One 8-byte host readback. Both flags come from one pass over the boundary and one over the
+    vertices, rather than two max-reductions, because at ~0.14 ms a reduction pair would be 5% of
+    this function on an open mesh.
+    """
+    device = directed.device
+    degrees = twt.empty_2d((n_vertices, 2), wp.int32, device=device)
+    degrees.zero_()
+    flags = wp.zeros(2, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_boundary.count_boundary_degrees,
+        dim=int(directed.shape[0]),
+        inputs=[directed, degrees],
+        device=device,
+    )
+    wp.launch(
+        kernel_boundary.flag_boundary_degree_defects,
+        dim=n_vertices,
+        inputs=[degrees, flags],
+        device=device,
+    )
+    has_seam, has_pinch = (int(flag) for flag in flags.numpy())
+    return bool(has_seam and not has_pinch)
+
+
+def _unoriented_boundary_cycles(
+    boundary_edges: twt.Array2dInt32, n_vertices: int
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Boundary cycles of a mesh whose winding cannot orient them: walk the undirected edges instead.
+
+    A manifold boundary is 2-regular whether or not the surface is orientable, so the cycles exist
+    even where a *consistent direction* for them does not. The walk runs on **darts**: dart
+    ``2 * v + s`` means "at vertex ``v``, arrived from neighbour slot ``s``", and its successor
+    leaves by the other slot. That is a genuine successor graph by construction -- every dart has
+    exactly one out-edge -- so [`successor_cycles`][triwarp.graph.successor_cycles] handles it
+    unchanged, at twice the node count.
+
+    Each undirected cycle therefore comes back **twice**, once per direction, over disjoint dart
+    sets. The two mirrors share their lowest vertex ``v`` but start at darts ``2v`` and ``2v + 1``,
+    so keeping the even-starting one picks exactly one per pair. With the neighbour slots sorted
+    ascending, that direction is "leave the lowest vertex toward its larger neighbour" -- an
+    arbitrary but *reproducible* choice, which is the honest answer when no winding defines one.
+
+    On the Moebius fixture this returns the single 78-vertex cycle the surface actually has: all 78
+    boundary vertices have boundary-degree 2, and the walk closes with every consecutive pair a
+    real boundary edge. Two references get it wrong in different ways and neither is worth
+    matching -- ``igl.boundary_loop_all`` cuts that cycle into ``1 + 39 + 38`` open chains (each
+    has exactly one consecutive pair that is *not* a boundary edge) and ``boundary_loop`` reports
+    the longest of them as 39; MeshLib's hole ring reads 156.
+
+    The mirror filter and the re-pack run on the host, over a buffer bounded by the **boundary**
+    rather than by the mesh, and only ever on a non-orientable surface.
+    """
+    device = boundary_edges.device
+    neighbors = twt.empty_2d((n_vertices, 2), wp.int32, device=device)
+    neighbors.fill_(-1)
+    slot_count = wp.zeros(n_vertices, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_boundary.scatter_boundary_neighbors,
+        dim=int(boundary_edges.shape[0]),
+        inputs=[boundary_edges, slot_count, neighbors],
+        device=device,
+    )
+    wp.launch(
+        kernel_boundary.sort_boundary_neighbor_slots,
+        dim=n_vertices,
+        inputs=[neighbors],
+        device=device,
+    )
+
+    boundary_vertices = tw.grouping.unique_1d(boundary_edges.flatten())
+    n_boundary = int(boundary_vertices.shape[0])
+    dart_edges = twt.empty_2d((2 * n_boundary, 2), wp.int32, device=device)
+    wp.launch(
+        kernel_boundary.build_dart_successors,
+        dim=(n_boundary, 2),
+        inputs=[boundary_vertices, neighbors, dart_edges],
+        device=device,
+    )
+
+    flat_darts, dart_offsets, _dart_sizes = tw.graph.successor_cycles(
+        dart_edges, 2 * n_vertices, validate=False
+    )
+    darts_np = flat_darts.numpy()
+    bounds_np = np.append(dart_offsets.numpy(), darts_np.shape[0])
+    loops_np = [
+        darts_np[start:stop] // 2
+        for start, stop in itertools.pairwise(bounds_np)
+        if darts_np[start] % 2 == 0
+    ]
+    if not loops_np:
+        return tuple(wp.empty(0, dtype=wp.int32, device=device) for _ in range(3))
+
+    sizes_np = np.array([loop.shape[0] for loop in loops_np], dtype=np.int32)
+    return (
+        wp.array(np.concatenate(loops_np), dtype=wp.int32, device=device),
+        wp.array(np.concatenate([[0], np.cumsum(sizes_np)[:-1]]), dtype=wp.int32, device=device),
+        wp.array(sizes_np, dtype=wp.int32, device=device),
+    )
 
 
 def boundary_loop(

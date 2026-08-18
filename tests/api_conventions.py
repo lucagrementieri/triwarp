@@ -349,6 +349,9 @@ _KERNEL_WRITE_CALLS = frozenset(
 _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     # in-place
     ("array", "sort_rows_insertion"): frozenset({"data"}),
+    # ``neighbors`` is sorted in place: this kernel only orders the two slots each vertex already
+    # holds, so it is both the input and the result and ``out_`` would read as write-only.
+    ("boundary", "sort_boundary_neighbor_slots"): frozenset({"neighbors"}),
     ("combine", "offset_packed_faces"): frozenset({"faces"}),
     ("holes", "fill_dp_span"): frozenset({"dp", "prev"}),
     ("holes", "fill_dp_span_tiled"): frozenset({"dp", "prev"}),
@@ -356,6 +359,10 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     ("registration", "accumulate_cost"): frozenset({"acc"}),
     # scratch / persistent state
     ("adjacency", "scatter_vertex_faces"): frozenset({"cursor"}),
+    # ``slot_count`` is the per-vertex atomic cursor picking which of the two neighbour slots each
+    # scattered edge lands in -- the ``scatter_vertex_faces`` case exactly, under a name that says
+    # what it holds. The answer is ``out_neighbors``.
+    ("boundary", "scatter_boundary_neighbors"): frozenset({"slot_count"}),
     # The hull sweep's working set: the boundary polygon it carries between insertions, the buffer
     # it rebuilds that polygon into, and the per-boundary-edge orientations of one insertion.
     # Caller-allocated because the sweep is one thread over an ``n``-sized problem, so none of the
