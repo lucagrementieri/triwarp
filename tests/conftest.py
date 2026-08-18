@@ -47,6 +47,20 @@ def icosahedron(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
 
 
 @pytest.fixture
+def unit_box(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
+    """
+    Build the unit cube: the sharp-featured convex solid, keyed to a right dihedral angle.
+
+    Neither ``icosahedron`` nor ``cave_cube`` substitutes here -- a cube's 12 creases sit at exactly
+    90 degrees with 6 flat face diagonals between them, which is what crease and seam tests are
+    written against, and ``cave_cube`` is non-convex. Left untranslated, since several callers read
+    coordinate signs to pick out one face.
+    """
+    box = tm.creation.box(extents=[1.0, 1.0, 1.0])
+    return box, trimesh_to_warp(box, device)
+
+
+@pytest.fixture
 def icosphere(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
     """
     Build a unit icosphere at ``subdivisions=3``: 642 vertices, 1 280 faces, closed and regular.

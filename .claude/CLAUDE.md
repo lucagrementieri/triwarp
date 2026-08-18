@@ -661,6 +661,7 @@ Reuse shared mesh fixtures from `tests/conftest.py` instead of building meshes i
 |---------|----------|
 | `icosahedron` | Default watertight solid, 12 vertices; inside/outside, surface sampling, sign tests |
 | `icosphere`, `icosphere_coarse` | Closed and *curved* — `subdivisions=3` (642 vertices) and `2` (162). Reach for these wherever `icosahedron` is too coarse, rather than calling `tm.creation.icosphere` |
+| `unit_box` | Sharp features: 12 creases at exactly 90° with 6 flat face diagonals, untranslated so a coordinate sign picks out one face. Crease / seam / dihedral-angle tests — `icosahedron` has no right angles and `cave_cube` is non-convex |
 | `cave_cube` | Hollow / non-convex shell (boolean difference) |
 | `hemisphere`, `half_torus` | Curved or open surfaces |
 | `boy_surface` | Closed, watertight and **non-orientable**, χ = 1 — the `False` branch of `is_orientable` / `face_orientation_bits`, and `make_winding_consistent`'s impossible one |
@@ -669,9 +670,9 @@ Reuse shared mesh fixtures from `tests/conftest.py` instead of building meshes i
 
 The last three are built by `creation.parametric_surface` rather than by trimesh, and they are the
 only inputs in the suite that are non-orientable or that have an odd Euler characteristic. A boolean
-predicate asserted only on the first three fixtures is testing one branch; that is what these close.
-`creation.parametric_surface` builds thirteen more surfaces that are not fixtures yet — reach for
-one (and add the fixture) rather than hand-rolling a degenerate mesh, and see its docstring for
+predicate asserted only on the orientable fixtures above is testing one branch; that is what these
+close. `creation.parametric_surface` builds thirteen more surfaces that are not fixtures yet — reach
+for one (and add the fixture) rather than hand-rolling a degenerate mesh, and see its docstring for
 which class each is.
 
 - **Do not** call `tm.creation.box()` or hand-roll `wp.Mesh(...)` in tests unless the case requires a bespoke degenerate mesh (e.g. empty faces, unreferenced vertices).

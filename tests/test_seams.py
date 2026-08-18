@@ -35,10 +35,10 @@ def _face_component_count(vertices_wp, faces_wp) -> int:
     )
 
 
-def test_crease_edges_finds_a_cube_edges(device: str) -> None:
+def test_crease_edges_finds_a_cube_edges(unit_box: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """A unit cube has exactly 12 crease edges at 90 degrees, and its 6 face diagonals are flat."""
-    box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    vertices_wp, faces_wp = numpy_to_warp(box_tm.vertices, box_tm.faces, device)
+    box_tm, box_wp = unit_box
+    vertices_wp, faces_wp = box_wp.points, box_wp.indices
     creases_np = tw.seams.crease_edges(vertices_wp, faces_wp, angle=30.0).numpy()
     assert creases_np.shape == (12, 2)
 
@@ -49,7 +49,7 @@ def test_crease_edges_finds_a_cube_edges(device: str) -> None:
     assert np.allclose(lengths_np, 1.0, rtol=1e-5)
 
 
-def test_crease_edges_thresholds(device: str) -> None:
+def test_crease_edges_thresholds(unit_box: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
     The comparison is strict, so ``0`` selects every *non-coplanar* interior edge.
 
@@ -57,8 +57,8 @@ def test_crease_edges_thresholds(device: str) -> None:
     — which is the useful reading of "all of them", and the reason the test pins ``0`` rather than
     treating it as a synonym for the whole 18-edge set.
     """
-    box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    vertices_wp, faces_wp = numpy_to_warp(box_tm.vertices, box_tm.faces, device)
+    _box_tm, box_wp = unit_box
+    vertices_wp, faces_wp = box_wp.points, box_wp.indices
     assert int(tw.seams.crease_edges(vertices_wp, faces_wp, angle=0.0).shape[0]) == 12
     assert int(tw.seams.crease_edges(vertices_wp, faces_wp, angle=89.0).shape[0]) == 12
     assert int(tw.seams.crease_edges(vertices_wp, faces_wp, angle=91.0).shape[0]) == 0
@@ -85,7 +85,7 @@ def test_crease_edges_matches_pymeshlab(hemisphere: tuple[tm.Trimesh, wp.Mesh]) 
 
 
 @pytest.mark.parity("crease_edges", "pyvista")
-def test_crease_edges_matches_pyvista(device: str) -> None:
+def test_crease_edges_matches_pyvista(unit_box: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
     Class B: ``extract_feature_edges`` is the same dihedral threshold, as line cells.
 
@@ -100,8 +100,8 @@ def test_crease_edges_matches_pyvista(device: str) -> None:
     ``30`` degrees, so the comparison would be ``[] == []`` -- the ``test_ears`` failure. A box has
     exactly 12 feature edges, which is asserted before the sets are compared.
     """
-    mesh_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
+    mesh_tm, mesh_wp = unit_box
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
 
     edges_pv = pyvista_edges_to_indices(
         trimesh_to_pyvista(mesh_tm).extract_feature_edges(
@@ -145,7 +145,9 @@ def test_crease_edges_empty(device: str) -> None:
     assert tw.seams.crease_edges(vertices_wp, faces_wp).shape == (0, 2)
 
 
-def test_cut_along_edges_separates_the_faces_of_a_cube(device: str) -> None:
+def test_cut_along_edges_separates_the_faces_of_a_cube(
+    unit_box: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
     """
     Cutting every crease of a cube leaves six disconnected quads, sharing no vertex.
 
@@ -153,8 +155,8 @@ def test_cut_along_edges_separates_the_faces_of_a_cube(device: str) -> None:
     and every crease through it is cut, so it becomes 3 vertices — 24 in all — while the 12 faces
     and their winding are untouched.
     """
-    box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    vertices_wp, faces_wp = numpy_to_warp(box_tm.vertices, box_tm.faces, device)
+    _box_tm, box_wp = unit_box
+    vertices_wp, faces_wp = box_wp.points, box_wp.indices
     creases_wp = tw.seams.crease_edges(vertices_wp, faces_wp, angle=30.0)
 
     cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(vertices_wp, faces_wp, creases_wp)
@@ -176,9 +178,11 @@ def test_cut_along_edges_is_geometrically_a_noop(device: str) -> None:
     assert np.allclose(after_np, before_np, rtol=1e-6, atol=1e-6)
 
 
-def test_cut_along_edges_with_no_edges_is_the_identity(device: str) -> None:
-    box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    vertices_wp, faces_wp = numpy_to_warp(box_tm.vertices, box_tm.faces, device)
+def test_cut_along_edges_with_no_edges_is_the_identity(
+    unit_box: tuple[tm.Trimesh, wp.Mesh], device: str
+) -> None:
+    _box_tm, box_wp = unit_box
+    vertices_wp, faces_wp = box_wp.points, box_wp.indices
     cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(
         vertices_wp, faces_wp, twt.empty_2d((0, 2), wp.int32, device=device)
     )
@@ -201,7 +205,9 @@ def test_cut_along_edges_all_interior_edges_gives_a_triangle_soup(
     assert _face_component_count(cut_vertices_wp, cut_faces_wp) == int(faces_wp.shape[0]) // 3
 
 
-def test_cut_along_edges_opens_a_boundary(device: str) -> None:
+def test_cut_along_edges_opens_a_boundary(
+    unit_box: tuple[tm.Trimesh, wp.Mesh], device: str
+) -> None:
     """
     A cut edge set becomes boundary, which is the point: a closed cube gains two boundary loops.
 
@@ -211,8 +217,8 @@ def test_cut_along_edges_opens_a_boundary(device: str) -> None:
     edges bounding one cube face are the smallest set that does close, which is why they are the
     fixture: each of its four corners then has *two* cut edges and splits in two.
     """
-    box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    vertices_wp, faces_wp = numpy_to_warp(box_tm.vertices, box_tm.faces, device)
+    box_tm, box_wp = unit_box
+    vertices_wp, faces_wp = box_wp.points, box_wp.indices
     assert tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=False)
 
     creases_np = tw.seams.crease_edges(vertices_wp, faces_wp, angle=30.0).numpy()
@@ -234,10 +240,10 @@ def test_cut_along_edges_opens_a_boundary(device: str) -> None:
     assert len(tw.boundary.boundary_loops(cut_vertices_wp, cut_faces_wp)) == 2
 
 
-def test_cut_along_edges_round_trips_through_a_weld(device: str) -> None:
+def test_cut_along_edges_round_trips_through_a_weld(unit_box: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """Welding coincident positions undoes the cut exactly — the documented inverse."""
-    box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
-    vertices_wp, faces_wp = numpy_to_warp(box_tm.vertices, box_tm.faces, device)
+    _box_tm, box_wp = unit_box
+    vertices_wp, faces_wp = box_wp.points, box_wp.indices
     creases_wp = tw.seams.crease_edges(vertices_wp, faces_wp, angle=30.0)
     cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(vertices_wp, faces_wp, creases_wp)
 
@@ -249,7 +255,9 @@ def test_cut_along_edges_round_trips_through_a_weld(device: str) -> None:
 
 
 @pytest.mark.parity("cut_along_edges", "pymeshlab")
-def test_cut_along_edges_matches_pymeshlab_topology(device: str) -> None:
+def test_cut_along_edges_matches_pymeshlab_topology(
+    unit_box: tuple[tm.Trimesh, wp.Mesh], device: str
+) -> None:
     """
     ``meshing_cut_along_crease_edges`` opens the same seams; only the vertex count differs.
 
@@ -260,7 +268,7 @@ def test_cut_along_edges_matches_pymeshlab_topology(device: str) -> None:
     re-welding only some of them. So the count is asserted as an inequality in triwarp's favour
     rather than as a match; the topology is asserted exactly.
     """
-    box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
+    box_tm, _box_wp = unit_box
     angle = 30.0
     meshset_pml = trimesh_to_pymeshlab(box_tm)
     meshset_pml.meshing_cut_along_crease_edges(angledeg=angle)
@@ -290,7 +298,7 @@ def test_cut_along_edges_matches_pymeshlab_topology(device: str) -> None:
 
 
 @pytest.mark.parity("cut_along_edges", "igl")
-def test_cut_along_edges_matches_igl(device: str) -> None:
+def test_cut_along_edges_matches_igl(unit_box: tuple[tm.Trimesh, wp.Mesh], device: str) -> None:
     """
     Class B (an edge set becomes a per-corner mask), and it **settles** the MeshLab disagreement.
 
@@ -307,7 +315,7 @@ def test_cut_along_edges_matches_igl(device: str) -> None:
     alternative is checked to be wrong rather than assumed: it yields 28 vertices, so a
     convention slip would fail this test rather than pass it.
     """
-    box_tm = tm.creation.box(extents=[1.0, 1.0, 1.0])
+    box_tm, _box_wp = unit_box
     vertices_np = np.ascontiguousarray(box_tm.vertices, dtype=np.float64)
     faces_np = np.ascontiguousarray(box_tm.faces, dtype=np.int64)
 
