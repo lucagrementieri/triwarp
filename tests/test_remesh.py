@@ -13,10 +13,11 @@ from meshlib import mrmeshpy as mm
 from scipy.spatial import KDTree
 
 import triwarp as tw
-from tests.comparisons import hausdorff_surface_two_sided, undirected_edges
+from tests.comparisons import hausdorff_surface_two_sided, lexsort_rows, undirected_edges
 from tests.conversions import (
     bsr_to_dense,
     faces_igl,
+    meshlib_to_trimesh,
     numpy_to_meshlib,
     numpy_to_warp,
     open3d_to_trimesh,
@@ -226,13 +227,24 @@ def test_remesh_emits_no_degenerate_faces(device: str) -> None:
         ), label
 
 
+@pytest.mark.parity("isotropic_remesh", "meshlib")
 def test_remesh_edge_concentration(device: str) -> None:
     """
-    Not a library comparison: the edge lengths must concentrate around the requested target.
+    Class C (a spread statistic): both remeshes hit the requested target, triwarp more tightly.
 
-    meshlib supplies the spread comparison in [`test_remesh_valence_variance_decreases`]'
-    neighbour ``_meshlib_remesh_spread``; what this asserts is the target itself, which no
-    reference shares because each picks its own stopping rule.
+    No correspondence exists -- the two run different stopping rules (a fixed ``iterations`` x five
+    parallel passes against a serial local-operation queue), so they return different meshes -- and
+    what is comparable is how well each concentrates its edge lengths around the *requested* target.
+    Measured on ``icosphere(3)`` at half the mean edge: triwarp's coefficient of variation is
+    **0.046** against meshlib's **0.220**, both mean lengths land within 2 % of the target, the face
+    counts are 5 000 against 5 284, and the two surfaces sit **0.0072** apart -- a tenth of the
+    target edge length.
+
+    **Bug class excluded:** a remesh that converges to the wrong length scale, or that reaches the
+    mean by mixing very long and very short edges. **Mutation probe, measured:** the *input* mesh
+    has a CV of 0.065 at twice the target length, so a pass that did nothing would fail the mean
+    band outright, and the ``1.5x`` bound against meshlib's spread is 4.8x above the measured ratio
+    (0.046 / 0.220 = 0.21).
     """
     sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=3)
     target = 0.5 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
@@ -248,6 +260,7 @@ def test_remesh_edge_concentration(device: str) -> None:
     in_band = np.mean((lengths >= 0.5 * target) & (lengths <= 1.6 * target))
     assert in_band >= 0.8
     spread_ml = _meshlib_remesh_spread(sphere.vertices, sphere.faces, target)
+    assert 0.0 < spread_ml < 1.0  # non-vacuity: the reference produced a real remesh
     assert lengths.std() / lengths.mean() <= 1.5 * spread_ml
 
 
@@ -514,6 +527,60 @@ def test_remesh_empty_and_degenerate(device: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parity("subdivide_to_size", "meshlib")
+def test_subdivide_to_size_matches_meshlib(device: str) -> None:
+    """
+    Class C (no correspondence): both split until every edge is under the same length cap.
+
+    ``subdivideMesh``'s ``maxEdgeLen`` is triwarp's ``max_edge`` and the two share the guarantee --
+    every surviving edge below the cap -- but not the route: MeshLib also *flips* edges as it goes
+    (its ``maxDeviationAfterFlip`` gate) where triwarp only splits, so the outputs differ in face
+    count. Measured on ``icosphere(2)`` at half the mean edge: 3 200 faces against 3 320, longest
+    edge 0.143 against 0.141 with a cap of 0.150, and the two surfaces **0.021** apart, which is
+    0.14 of the cap.
+
+    ``maxDeviationAfterFlip`` is raised from its default of 1.0 -- an absolute length, so on a
+    unit-scale mesh the default is effectively unbounded and on a millimetre-scale one it would
+    forbid every flip. Passing it explicitly is what keeps the comparison from depending on the
+    fixture's units.
+
+    **Bug class excluded:** a splitter that stops early and leaves edges above the cap, which is the
+    guarantee both sides make and is asserted on both outputs. **Mutation probe, measured:** the
+    *input* mesh's longest edge is 0.32, 2.1x the cap, so a pass that did nothing fails the cap
+    assert by more than a factor of two.
+    """
+    sphere_tm = tm.creation.icosphere(subdivisions=2)
+    vertices_wp, faces_wp = numpy_to_warp(sphere_tm.vertices, sphere_tm.faces, device)
+    max_edge = 0.5 * float(tw.edges.mean_edge_length(vertices_wp, faces_wp))
+
+    out_vertices_wp, out_faces_wp = tw.remesh.subdivide_to_size(vertices_wp, faces_wp, max_edge)
+    out_tm = tm.Trimesh(
+        out_vertices_wp.numpy().astype(np.float64),
+        out_faces_wp.numpy().reshape(-1, 3),
+        process=False,
+    )
+
+    mesh_ml = numpy_to_meshlib(sphere_tm.vertices, sphere_tm.faces)
+    settings_ml = mm.SubdivideSettings()
+    settings_ml.maxEdgeLen = max_edge
+    settings_ml.maxEdgeSplits = 10_000_000
+    settings_ml.maxDeviationAfterFlip = 1e30  # an absolute length; its default of 1.0 is unitful
+    n_splits_ml = mm.subdivideMesh(mesh_ml, settings_ml)
+    subdivided_tm = meshlib_to_trimesh(mesh_ml)
+
+    assert n_splits_ml > 0  # non-vacuity: the reference really subdivided
+    assert _edge_lengths(sphere_tm.vertices, sphere_tm.faces).max() > 2.0 * max_edge
+    for result_tm in (out_tm, subdivided_tm):
+        assert _edge_lengths(result_tm.vertices, result_tm.faces).max() <= max_edge
+    assert abs(out_tm.faces.shape[0] - subdivided_tm.faces.shape[0]) < 0.1 * out_tm.faces.shape[0]
+    assert (
+        hausdorff_surface_two_sided(
+            out_tm.vertices, out_tm.faces, subdivided_tm.vertices, subdivided_tm.faces
+        )
+        < 0.25 * max_edge
+    )
+
+
 @pytest.mark.parametrize("voxel_size", [0.1, 0.3])
 @pytest.mark.parametrize("contraction", ["average", "closest"])
 @pytest.mark.parity("cluster_decimate", "open3d")
@@ -545,6 +612,49 @@ def test_cluster_decimate_matches_open3d(device: str, voxel_size: float, contrac
             decimated_vertices_wp.numpy().astype(np.float64)
         )
         assert distance_np.max() < 1e-5
+
+
+@pytest.mark.parametrize("voxel_fraction", [0.02, 0.05, 0.1])
+@pytest.mark.parity("cluster_decimate", "meshlib")
+def test_cluster_decimate_matches_meshlib_cell_count(device: str, voxel_fraction: float) -> None:
+    """
+    Class C (a count statistic): ``verticesGridSampling`` picks one vertex per occupied cell.
+
+    Not the same operation, and the difference is named rather than tolerated: MeshLib *samples* --
+    it returns a ``VertBitSet`` selecting one surviving vertex per voxel and never builds a mesh --
+    where ``cluster_decimate`` contracts each cell's vertices to a representative and rebuilds the
+    faces. What the two share is the cell decomposition, so the comparable quantity is **how many
+    cells the surface occupies**, which is triwarp's output vertex count and MeshLib's bit count.
+
+    Measured on ``icosphere(4)`` at 2 %, 5 % and 10 % of the bounding-box diagonal: 2 310 / 541 /
+    151 against MeshLib's 2 394 / 548 / 128, i.e. ratios of **0.97 / 0.99 / 1.18**. The residual is
+    grid *anchoring* -- neither library documents where cell zero starts, and at a coarse voxel a
+    half-cell shift moves points across boundaries -- so the bound is 1.3x rather than exact.
+
+    **Bug class excluded:** a voxel size interpreted in the wrong units, or a grid whose cells are
+    the wrong size. **Mutation probe, measured:** the count falls **4.3x** between consecutive
+    fractions here (2 310 -> 541 -> 151), so a factor-of-two error in the cell size moves the ratio
+    far outside the 1.3x band while the anchoring residual stays inside it.
+    """
+    sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=4)
+    diagonal = float(
+        np.linalg.norm(sphere_tm.vertices.max(axis=0) - sphere_tm.vertices.min(axis=0))
+    )
+    voxel_size = voxel_fraction * diagonal
+
+    clustered_vertices_wp, clustered_faces_wp = tw.remesh.cluster_decimate(
+        vertices_wp, faces_wp, voxel_size=voxel_size
+    )
+    sampled_ml = mm.verticesGridSampling(
+        mm.MeshPart(numpy_to_meshlib(sphere_tm.vertices, sphere_tm.faces)), voxel_size
+    )
+
+    n_cells_ml = sampled_ml.count()
+    n_cells_wp = int(clustered_vertices_wp.shape[0])
+    assert 0 < n_cells_ml < sphere_tm.vertices.shape[0]  # non-vacuity: it really sampled down
+    assert 0 < n_cells_wp < sphere_tm.vertices.shape[0]
+    assert 1.0 / 1.3 < n_cells_wp / n_cells_ml < 1.3
+    assert int(clustered_faces_wp.shape[0]) > 0
 
 
 def test_cluster_decimate_stays_near_the_input_surface(device: str) -> None:
@@ -773,6 +883,63 @@ def test_quadric_decimate_reaches_pymeshlab_quality(device: str) -> None:
         vertices_np, np.asarray(sphere_tm.faces), pml_tm.vertices, pml_tm.faces
     )
     assert deviation_wp <= 1.2 * deviation_pml
+
+
+@pytest.mark.parametrize("target_faces", [2560, 1024])
+@pytest.mark.parity("quadric_decimate", "meshlib")
+def test_quadric_decimate_matches_meshlib_quality(device: str, target_faces: int) -> None:
+    """
+    Class C (a deviation bound): the same face count, reached by a different collapse order.
+
+    ``decimateMesh`` takes a **deleted**-face budget rather than a target, so the named transform is
+    ``maxDeletedFaces = n_faces - target_faces``; fed that, it lands on exactly the requested count
+    on both targets here, as triwarp does. ``packMesh=True`` is required to read the result at all
+    -- without it ``getNumpyFaces`` returns the pre-decimation buffer padded with degenerate
+    ``[0, 0, 0]`` rows, which is the hazard [`meshlib_to_trimesh`][tests.conversions.meshlib_to_trimesh]
+    exists for.
+
+    There is no correspondence between the outputs -- two greedy quadric solvers with different
+    tie-breaking pick different collapses -- so the comparison is the deviation from the *input*
+    surface, which is what a decimator is trying to minimize. Measured on ``icosphere(4)``:
+    triwarp is **1.30x** MeshLib's deviation at 2 560 faces and **1.04x** at 1 024, so the bound is
+    set at 1.5x.
+
+    **Bug class excluded:** a decimator that reaches the face count by collapsing the wrong edges,
+    which shows up as a deviation several times the reference's rather than a third above it.
+    **Mutation probe, measured:** the same comparison at ``target_faces=512`` (an eighth of the
+    input) gives deviations an order of magnitude larger on both sides, so a fixed absolute
+    threshold would not separate the two; the *ratio* is what stays near one.
+    """
+    sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=4)
+    vertices_np = np.ascontiguousarray(sphere_tm.vertices, dtype=np.float64)
+    faces_np = np.asarray(sphere_tm.faces)
+
+    decimated_vertices_wp, decimated_faces_wp = tw.remesh.quadric_decimate(
+        vertices_wp, faces_wp, target_faces=target_faces
+    )
+
+    mesh_ml = numpy_to_meshlib(sphere_tm.vertices, sphere_tm.faces)
+    settings_ml = mm.DecimateSettings()
+    settings_ml.maxDeletedFaces = faces_np.shape[0] - target_faces
+    settings_ml.packMesh = True
+    result_ml = mm.decimateMesh(mesh_ml, settings_ml)
+    decimated_tm = meshlib_to_trimesh(mesh_ml)
+
+    assert result_ml.facesDeleted > 0  # non-vacuity: the reference really decimated
+    assert decimated_tm.faces.shape[0] == target_faces
+    assert int(decimated_faces_wp.shape[0]) // 3 == target_faces
+
+    deviation_wp = hausdorff_surface_two_sided(
+        vertices_np,
+        faces_np,
+        decimated_vertices_wp.numpy().astype(np.float64),
+        decimated_faces_wp.numpy().reshape(-1, 3),
+    )
+    deviation_ml = hausdorff_surface_two_sided(
+        vertices_np, faces_np, decimated_tm.vertices, decimated_tm.faces
+    )
+    assert deviation_ml > 0.0
+    assert deviation_wp <= 1.5 * deviation_ml
 
 
 @pytest.mark.parametrize("target_faces", [2560, 1024, 512])
@@ -1005,6 +1172,66 @@ def test_flip_to_delaunay_reduces_violations(hemisphere: tuple[tm.Trimesh, wp.Me
     edges = undirected_edges(flipped.numpy().reshape(-1, 3))
     _, counts = np.unique(edges, axis=0, return_counts=True)
     assert np.array_equal(np.unique(counts), np.array([2]))
+
+
+@pytest.mark.parity("flip_to_delaunay", "meshlib")
+def test_flip_to_delaunay_matches_meshlib(device: str) -> None:
+    """
+    Class B: the same fixpoint, reached by a parallel pass instead of a serial queue.
+
+    ``makeDeloneEdgeFlips`` is the same empty-circumcircle criterion and the same operation, and on
+    a decisive input the two agree exactly: a planar kite whose long diagonal is the non-Delaunay
+    one, where both flip that one edge and return the identical pair of triangles.
+
+    On a mesh with hundreds of violations the *outputs* differ, and that is a property of the
+    algorithms rather than of the criterion -- triwarp commits a conflict-free independent set per
+    round where MeshLib works a queue, so which of two competing flips wins differs. What is
+    asserted there is the fixpoint, which is the actual claim either function makes: after triwarp's
+    pass, **MeshLib finds 0 further flips to make**, against **942** in the input. That is a
+    stronger statement than a face-set comparison and it is checked with the reference's own
+    criterion, not triwarp's.
+
+    The converse is not symmetric and is asserted as measured rather than papered over: triwarp
+    still changes **20 of 1 280** faces in MeshLib's output, so triwarp's test is the stricter of
+    the two on near-cocircular quads.
+    """
+    # A kite: the diagonal 0-2 (length 2.0) is longer than 1-3 (1.8), so it is the one to flip.
+    kite_vertices_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.9, 0.0], [2.0, 0.0, 0.0], [1.0, -0.9, 0.0]]
+    )
+    kite_faces_np = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    vertices_wp, faces_wp = numpy_to_warp(kite_vertices_np, kite_faces_np, device)
+    flipped_wp = tw.remesh.flip_to_delaunay(vertices_wp, wp.clone(faces_wp), max_iter=100)
+
+    mesh_ml = numpy_to_meshlib(kite_vertices_np, kite_faces_np)
+    assert mm.makeDeloneEdgeFlips(mesh_ml, mm.DeloneSettings(), 100) == 1  # it flipped the diagonal
+    flipped_ml = meshlib_to_trimesh(mesh_ml).faces
+
+    assert np.array_equal(
+        lexsort_rows(np.sort(flipped_wp.numpy().reshape(-1, 3), axis=1)),
+        lexsort_rows(np.sort(np.asarray(flipped_ml, dtype=np.int32), axis=1)),
+    )
+
+    # The fixpoint, on an input with hundreds of violations.
+    sphere_tm = tm.creation.icosphere(subdivisions=3)
+    jittered_np = sphere_tm.vertices + np.random.default_rng(1).normal(
+        scale=0.08, size=sphere_tm.vertices.shape
+    )
+    vertices_wp, faces_wp = numpy_to_warp(jittered_np, sphere_tm.faces, device)
+    delaunay_np = (
+        tw.remesh.flip_to_delaunay(vertices_wp, wp.clone(faces_wp), max_iter=100)
+        .numpy()
+        .reshape(-1, 3)
+    )
+
+    violations_before = mm.makeDeloneEdgeFlips(
+        numpy_to_meshlib(jittered_np, sphere_tm.faces), mm.DeloneSettings(), 100
+    )
+    violations_after = mm.makeDeloneEdgeFlips(
+        numpy_to_meshlib(jittered_np, delaunay_np), mm.DeloneSettings(), 100
+    )
+    assert violations_before > 100  # non-vacuity: the input really is far from Delaunay
+    assert violations_after == 0
 
 
 def test_flip_to_delaunay_region_gated(hemisphere: tuple[tm.Trimesh, wp.Mesh]):

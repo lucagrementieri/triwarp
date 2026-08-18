@@ -111,9 +111,32 @@ import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase, skip_larger_than
+from conftest import BenchCase, mesh_ml_from_numpy, skip_larger_than
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+
+# MeshLib expresses several gates as *absolute* lengths whose defaults assume a unit-scale mesh
+# (``SubdivideSettings.maxDeviationAfterFlip`` is 1.0). Passing this instead disables the gate
+# rather than letting the fixture's units decide whether it binds.
+_UNBOUNDED = 1e30
+
+_mesh_ml_cache: dict[str, mm.Mesh] = {}
+
+
+def _mesh_ml(bench_case: BenchCase) -> mm.Mesh:
+    """
+    Cache one ``meshlib.Mesh`` per mesh, for the *non*-mutating rows only.
+
+    Every other meshlib row in this file rebuilds inside its timed callable, because the operation
+    rewrites the mesh. ``verticesGridSampling`` is the exception -- it returns a bitset and leaves
+    the mesh alone -- so its row may share one, and sharing also keeps the lazily built AABB tree
+    warm across rounds.
+    """
+    if bench_case.mesh_name not in _mesh_ml_cache:
+        _mesh_ml_cache[bench_case.mesh_name] = bench_case.new_mesh_ml()
+    return _mesh_ml_cache[bench_case.mesh_name]
+
 
 # Iterations for the full remeshing pipeline. The default is 10; 3 keeps the case under a couple
 # of seconds while still exercising the split/collapse/flip/smooth/reproject loop several times.
@@ -233,11 +256,36 @@ def test_subdivide_loop(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="subdivide_to_size")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab", "meshlib")
 @pytest.mark.parametrize("split_fraction", _SPLIT_FRACTIONS)
 def test_subdivide_to_size(bench_case: BenchCase, split_fraction: float) -> None:
-    """Adaptive splitting to an edge-length target: quadratic in output, logarithmic in passes."""
+    """
+    Adaptive splitting to an edge-length target: quadratic in output, logarithmic in passes.
+
+    meshlib's ``subdivideMesh`` takes the same absolute ``maxEdgeLen`` and makes the same guarantee
+    -- every edge under the cap -- but it also *flips* as it splits, so it is doing more than the
+    other three rows and lands on a slightly different mesh (3 320 faces against triwarp's 3 200 on
+    a test-size sphere; ``tests/test_remesh.py``). ``maxEdgeSplits`` is raised from its default of
+    1 000, which would stop the reference long before the cap on any registry mesh, and
+    ``maxDeviationAfterFlip`` from its default of 1.0 -- an *absolute* length, so leaving it would
+    make the flip gate depend on the fixture's units. It mutates in place, so its mesh is rebuilt
+    inside the timed callable.
+    """
     max_edge = split_fraction * bench_case.mean_edge
+    if bench_case.kind == "meshlib":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+
+        def subdivide_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(vertices_np, faces_np)
+            settings_ml = mm.SubdivideSettings()
+            settings_ml.maxEdgeLen = max_edge
+            settings_ml.maxEdgeSplits = 10_000_000
+            settings_ml.maxDeviationAfterFlip = _UNBOUNDED
+            mm.subdivideMesh(mesh_ml, settings_ml)
+            return mesh_ml.topology.numValidFaces()
+
+        assert bench_case.run(subdivide_ml, rounds=_ROUNDS) >= bench_case.n_faces
+        return
     if bench_case.kind == "pymeshlab":
         if bench_case.mesh_name == "sphere_large":
             pytest.skip("MeshLab's midpoint refinement takes ~6 s at this size and target")
@@ -361,9 +409,28 @@ def test_subdivide_region_to_size(bench_case: BenchCase, split_budget: float | N
 
 @pytest.mark.benchmark(group="flip_to_delaunay")
 @pytest.mark.benchaxis("quality")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "meshlib")
 def test_flip_to_delaunay(bench_case: BenchCase) -> None:
-    """Flip rounds until convergence: driven by distance from Delaunay, not by size."""
+    """
+    Flip rounds until convergence: driven by distance from Delaunay, not by size.
+
+    meshlib's ``makeDeloneEdgeFlips`` is the same empty-circumcircle criterion reached by a serial
+    queue where triwarp commits a conflict-free independent set per round, so this pair is the
+    clearest parallel-against-serial contrast in the module -- and the two reach the *same*
+    fixpoint: after triwarp's pass MeshLib finds zero further flips to make
+    (``tests/test_remesh.py``). It mutates, so its mesh is rebuilt inside the timed callable, which
+    is the same thing the triwarp row's ``wp.clone`` is doing and for the same reason: without it,
+    rounds 2..n would start from an already-Delaunay mesh.
+    """
+    if bench_case.kind == "meshlib":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+
+        def flip_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(vertices_np, faces_np)
+            return mm.makeDeloneEdgeFlips(mesh_ml, mm.DeloneSettings(), 100)
+
+        assert bench_case.run(flip_ml, rounds=_ROUNDS) >= 0
+        return
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
 
     # ``flip_to_delaunay`` rewrites the winding in place, so each round needs a fresh buffer;
@@ -399,7 +466,7 @@ def test_flip_to_delaunay(bench_case: BenchCase) -> None:
 )
 @pytest.mark.benchmark(group="isotropic_remesh")
 @pytest.mark.benchaxis("quality")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "pymeshlab", "meshlib")
 def test_isotropic_remesh(bench_case: BenchCase) -> None:
     """
     Five stages x ``iterations``, on a nearly-converged mesh and a badly conditioned one.
@@ -447,6 +514,22 @@ def test_isotropic_remesh(bench_case: BenchCase) -> None:
       can land. Not shipped.
     """
     target = bench_case.mean_edge
+    if bench_case.kind == "meshlib":
+        # A third stopping rule: MeshLib runs its own local-operation queue to convergence, so like
+        # MeshLab's row it is not a fixed-iteration count and the comparison is what the outputs
+        # look like rather than what one round costs. ``projectOnOriginalMesh`` is left off, which
+        # is its default and matches triwarp: turning it on adds a closest-point pass per vertex.
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+
+        def remesh_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(vertices_np, faces_np)
+            settings_ml = mm.RemeshSettings()
+            settings_ml.targetEdgeLen = target
+            mm.remesh(mesh_ml, settings_ml)
+            return mesh_ml.topology.numValidFaces()
+
+        assert bench_case.run(remesh_ml, rounds=_ROUNDS) > 0
+        return
     if bench_case.kind == "pymeshlab":
         # ``PureValue`` so both sides get the identical absolute target rather than a percentage of
         # a bounding box the two meshes do not share.
@@ -514,7 +597,7 @@ _CLUSTER_FACTORS = [2.0, 6.0]
     "MeshLab cannot be a second oracle for a quantity open3d already fixes exactly.",
 )
 @pytest.mark.benchmark(group="cluster_decimate")
-@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab", "meshlib")
 @pytest.mark.parametrize("cell_factor", _CLUSTER_FACTORS)
 def test_cluster_decimate(bench_case: BenchCase, cell_factor: float) -> None:
     """
@@ -525,6 +608,14 @@ def test_cluster_decimate(bench_case: BenchCase, cell_factor: float) -> None:
     from this group is uninterpretable in either direction.
     """
     voxel_size = cell_factor * bench_case.mean_edge
+    if bench_case.kind == "meshlib":
+        # ``verticesGridSampling`` stops one step earlier than the other three rows: it returns the
+        # *bitset* of one surviving vertex per occupied cell and never rebuilds the faces, so read
+        # it as a lower bound on the group. It leaves the mesh alone, so one mesh serves the rounds.
+        mesh_part_ml = mm.MeshPart(_mesh_ml(bench_case))
+        sampled_ml = bench_case.run(lambda: mm.verticesGridSampling(mesh_part_ml, voxel_size))
+        assert 0 < sampled_ml.count() <= bench_case.n_vertices
+        return
     if bench_case.kind == "pymeshlab":
         # ``meshing_decimation_clustering`` rewrites the topology, so the MeshSet is rebuilt inside
         # the timed callable. Its ``threshold`` is a length, hence ``PureValue`` fed from the same
@@ -608,7 +699,7 @@ _QUADRIC_RATIOS = [0.5, 0.1]
 
 @pytest.mark.benchmark(group="quadric_decimate")
 @pytest.mark.benchaxis("quality")
-@pytest.mark.benchlibs("triwarp", "igl", "open3d", "pymeshlab", "pyvista")
+@pytest.mark.benchlibs("triwarp", "igl", "open3d", "pymeshlab", "pyvista", "meshlib")
 @pytest.mark.parametrize("target_ratio", _QUADRIC_RATIOS)
 def test_quadric_decimate(bench_case: BenchCase, target_ratio: float) -> None:
     """
@@ -621,6 +712,24 @@ def test_quadric_decimate(bench_case: BenchCase, target_ratio: float) -> None:
     converted rather than the count passed.
     """
     target_faces = max(4, int(target_ratio * bench_case.n_faces))
+    if bench_case.kind == "meshlib":
+        # ``decimateMesh`` takes a *deleted*-face budget, not a target, so the count is converted;
+        # it lands on the requested face count exactly (``tests/test_remesh.py``). ``packMesh=True``
+        # is inside the timed region on purpose -- without it the result cannot be read at all, so
+        # it is part of what the operation costs here. It mutates, hence the rebuild per round.
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        n_faces = bench_case.n_faces
+
+        def decimate_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(vertices_np, faces_np)
+            settings_ml = mm.DecimateSettings()
+            settings_ml.maxDeletedFaces = n_faces - target_faces
+            settings_ml.packMesh = True
+            mm.decimateMesh(mesh_ml, settings_ml)
+            return mesh_ml.topology.numValidFaces()
+
+        assert bench_case.run(decimate_ml, rounds=_ROUNDS) > 0
+        return
     if bench_case.kind == "pyvista":
         mesh_pv = bench_case.mesh_pv
         decimated_pv = bench_case.run(lambda: mesh_pv.decimate(1.0 - target_ratio), rounds=_ROUNDS)
