@@ -156,8 +156,27 @@ def _parts(bench_case: BenchCase, copies: int) -> list:
     return _parts_cache[key]
 
 
+_parts_ml_cache: dict[tuple[str, int], mm.std_vector_std_shared_ptr_Mesh] = {}
+
+
+def _parts_ml(bench_case: BenchCase, copies: int) -> mm.std_vector_std_shared_ptr_Mesh:
+    """Build the same pieces as a MeshLib mesh vector, cached: the input, not the operation."""
+    key = (bench_case.mesh_name, copies)
+    if key not in _parts_ml_cache:
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        n_faces = bench_case.n_faces
+        stride = max(1, n_faces // copies)
+        meshes_ml = mm.std_vector_std_shared_ptr_Mesh()
+        for lo in range(0, n_faces, stride):
+            block_np = faces_np[lo : min(lo + stride, n_faces)]
+            if block_np.shape[0]:
+                meshes_ml.append(mesh_ml_from_numpy(vertices_np, block_np))
+        _parts_ml_cache[key] = meshes_ml
+    return _parts_ml_cache[key]
+
+
 @pytest.mark.benchmark(group="concatenate")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "meshlib")
 @pytest.mark.benchmeshes("sphere_med")
 @pytest.mark.parametrize("copies", _CONCAT_COPIES)
 def test_concatenate(bench_case: BenchCase, copies: int) -> None:
@@ -171,6 +190,14 @@ def test_concatenate(bench_case: BenchCase, copies: int) -> None:
     packed buffer. The 25x that remains is two ``wp.copy`` calls per piece -- Warp has no gather
     across separate allocations, so the packing itself cannot be batched.
     """
+    if bench_case.kind == "meshlib":
+        # ``mergeMeshes`` takes a vector of *shared pointers* and returns a new mesh without
+        # touching its inputs, so unlike almost everything else in this library the pieces are
+        # cached: they are the input, and rebuilding them per round would time the converter.
+        pieces_ml = _parts_ml(bench_case, copies)
+        merged_ml = bench_case.run(lambda: mm.mergeMeshes(pieces_ml))
+        assert merged_ml.topology.numValidFaces() == bench_case.n_faces
+        return
     if bench_case.kind == "triwarp":
         pieces = _parts(bench_case, copies)
         vertices, faces = bench_case.run(lambda: tw.combine.concatenate(pieces))

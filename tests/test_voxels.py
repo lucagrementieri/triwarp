@@ -37,7 +37,9 @@ from meshlib import mrmeshpy as mm
 import triwarp as tw
 from tests.comparisons import lexsort_rows
 from tests.conversions import (
+    meshlib_bitset_to_numpy,
     numpy_to_meshlib,
+    numpy_to_meshlib_bitset,
     numpy_to_warp,
     points_to_meshlib,
     trimesh_to_open3d,
@@ -624,46 +626,40 @@ def _voxel_mask_ml(occupancy_np: np.ndarray) -> tuple[mm.VoxelBitSet, mm.VolumeI
     """
     Load a dense occupancy array into a ``VoxelBitSet`` plus the ``VolumeIndexer`` addressing it.
 
-    Both MeshLib morphology calls take the pair and **mutate the bitset in place**, returning
-    ``None``; the indexer is what turns an ``(x, y, z)`` cell into the ``VoxelId`` the bitset is
-    keyed by, and ``VoxelBitSet.set`` takes that ``VoxelId`` object rather than a plain ``int``.
+    Both MeshLab morphology calls take the pair and **mutate the bitset in place**, returning
+    ``None``; the indexer is what carries the dimensions, and it fixes the bit order --
+    ``VolumeIndexer::toPos`` decodes ``x + dims.x * y + dims.x * dims.y * z``, so ``x`` runs
+    fastest and the dense array flattens with ``order="F"``.
+
+    The load itself is one ``np.packbits`` through
+    [`numpy_to_meshlib_bitset`][tests.conversions.numpy_to_meshlib_bitset]; ``VoxelBitSet``'s
+    converting constructor then copies the bits and the size out of the untyped set.
     """
     dims_ml = mm.Vector3i(*(int(n) for n in occupancy_np.shape))
     indexer_ml = mm.VolumeIndexer(dims_ml)
-    mask_ml = mm.VoxelBitSet()
-    mask_ml.resize(indexer_ml.size())
-    for cell_np in np.argwhere(occupancy_np):
-        mask_ml.set(indexer_ml.toVoxelId(mm.Vector3i(*(int(c) for c in cell_np))), True)
+    mask_ml = mm.VoxelBitSet(numpy_to_meshlib_bitset(occupancy_np.ravel(order="F")))
     return mask_ml, indexer_ml
 
 
-def _dense_from_mask_ml(mask_ml: mm.VoxelBitSet, indexer_ml: mm.VolumeIndexer, shape) -> np.ndarray:
-    """Read a ``VoxelBitSet`` back as a dense bool array of ``shape``."""
-    occupancy_np = np.zeros(shape, dtype=bool)
-    for x in range(shape[0]):
-        for y in range(shape[1]):
-            for z in range(shape[2]):
-                occupancy_np[x, y, z] = mask_ml.test(indexer_ml.toVoxelId(mm.Vector3i(x, y, z)))
-    return occupancy_np
+def _dense_from_mask_ml(mask_ml: mm.VoxelBitSet, shape) -> np.ndarray:
+    """
+    Read a ``VoxelBitSet`` back as a dense bool array of ``shape``.
+
+    ``mn.getNumpyBitSet`` is declared over ``const MR::BitSet&`` and ``VoxelBitSet`` derives from
+    it, so pybind11 upcasts and the whole set comes back in one call, flat in ``VoxelId`` order --
+    the inverse of the ``order="F"`` flattening above, hence ``reshape(shape[::-1]).T``.
+    """
+    return meshlib_bitset_to_numpy(mask_ml, int(np.prod(shape))).reshape(shape[::-1]).T
 
 
-@pytest.mark.parity(
-    "dilate",
-    "meshlib",
-    benchmarked=False,
-    reason="expandVoxelsMask takes a VoxelBitSet keyed by VoxelId objects and MeshLib binds no "
-    "array-to-bitset converter, so loading a grid into it is a per-cell Python loop -- a benchmark "
-    "row would time that loop, not the morphology, the same reason section 6 bars a per-vertex "
-    "loop from a row. scipy through trimesh carries the timed row for this group.",
-)
+@pytest.mark.parity("dilate", "meshlib")
 @pytest.mark.parity(
     "erode",
     "meshlib",
     benchmarked=False,
-    reason="the same per-cell Python bitset load as the dilate claim above, and erosion has no "
-    "benchmark group of its own: it is dilation's complement over the same candidate buffer and a "
-    "second row would price the same pass under another name. The scipy comparison in "
-    "test_erode_matches_scipy is the timed group's oracle.",
+    reason="erosion has no benchmark group of its own: it is dilation's complement over the same "
+    "candidate buffer, and a second row would price the same pass under another name. The dilate "
+    "group carries the timed MeshLib row, and test_erode_matches_scipy is the scipy oracle.",
 )
 def test_dilate_and_erode_match_meshlib(sphere, device: str):
     """
@@ -676,9 +672,11 @@ def test_dilate_and_erode_match_meshlib(sphere, device: str):
     26-connected setting gives 64.
 
     Two interface facts the helpers above encode: both calls **mutate the bitset and return
-    ``None``**, and the bitset is keyed by ``VoxelId`` objects from a ``VolumeIndexer`` rather than
-    by flat integers -- a call written against plain ints raises rather than misbehaving, which is
-    the one mercy in this API.
+    ``None``**, and the bitset is addressed in ``VoxelId`` order (``x`` fastest) rather than in the
+    dense array's C order. Neither direction needs a per-cell Python loop -- ``BitSet.fromBlocks``
+    loads the packed ``uint64`` blocks and ``mn.getNumpyBitSet`` upcasts the ``VoxelBitSet`` back to
+    a flat bool array -- which is what lets ``benchmarks/test_voxels.py`` time the morphology itself
+    with the load hoisted into ``pedantic``'s untimed ``setup``.
 
     The dense box is padded by one cell on every side so a dilation has somewhere to go; both sides
     see the identical box, so the comparison is element-wise over the whole array.
@@ -697,11 +695,11 @@ def test_dilate_and_erode_match_meshlib(sphere, device: str):
     mask_ml, indexer_ml = _voxel_mask_ml(occupancy_np)
     assert mask_ml.count() == int(occupancy_np.sum())  # non-vacuity: the load round-trips
     assert mm.expandVoxelsMask(mask_ml, indexer_ml, 1) is None  # mutates, returns nothing
-    assert np.array_equal(_dense_from_mask_ml(mask_ml, indexer_ml, padded_shape), dilated_np)
+    assert np.array_equal(_dense_from_mask_ml(mask_ml, padded_shape), dilated_np)
 
     mask_ml, indexer_ml = _voxel_mask_ml(occupancy_np)
     mm.shrinkVoxelsMask(mask_ml, indexer_ml, 1)
-    assert np.array_equal(_dense_from_mask_ml(mask_ml, indexer_ml, padded_shape), eroded_np)
+    assert np.array_equal(_dense_from_mask_ml(mask_ml, padded_shape), eroded_np)
     assert eroded_np.sum() < occupancy_np.sum() < dilated_np.sum()
 
 

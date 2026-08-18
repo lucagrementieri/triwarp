@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import warp as wp
+from meshlib import mrmeshpy as mm
 from trimesh.path import segments as tm_segments
 from trimesh.path import traversal as tm_traversal
 
@@ -16,6 +17,28 @@ def _polyline_wp(pts_np: np.ndarray, device: str) -> wp.array:
 def _random_open_polyline(seed: int, n: int = 12) -> np.ndarray:
     rng = np.random.default_rng(seed)
     return rng.standard_normal((n, 3))
+
+
+def _polyline_ml(pts_np: np.ndarray) -> mm.Polyline3:
+    """
+    Wrap a NumPy polyline in a ``meshlib.Polyline3``.
+
+    Through the **constructor**, not ``addFromPoints``: that method's bound signature takes a raw
+    ``Vector3f*`` plus a count rather than a vector, so a natural call raises. The constructor's
+    single-contour overload is the usable route, and it produces ``n`` points with ``n - 1`` edges.
+    """
+    contour_ml = mm.std_vector_Vector3_float()
+    for point_np in np.asarray(pts_np, dtype=np.float64):
+        contour_ml.append(mm.Vector3f(*point_np.tolist()))
+    return mm.Polyline3(contour_ml)
+
+
+def _contour_ml(pts_np: np.ndarray) -> mm.std_vector_Vector3_float:
+    """Build the same points as the bare contour ``calcLength`` takes."""
+    contour_ml = mm.std_vector_Vector3_float()
+    for point_np in np.asarray(pts_np, dtype=np.float64):
+        contour_ml.append(mm.Vector3f(*point_np.tolist()))
+    return contour_ml
 
 
 def _closed_from(pts_np: np.ndarray) -> np.ndarray:
@@ -236,6 +259,34 @@ def test_polyline_length_closed_matches_trimesh(device: str) -> None:
     assert np.allclose(length_wp, length_tm, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parity("polyline_length", "meshlib")
+def test_polyline_length_matches_meshlib(device: str) -> None:
+    """
+    Class A, and **bit-identical**: ``calcLength`` sums the same segments in the same float32.
+
+    Both open and closed forms, the closed one through the same named transform the trimesh pairing
+    uses -- append the first point, since MeshLib's ``calcLength`` takes a bare contour and has no
+    closed flag either. Measured equal to the last digit (75.49140930175781 on this fixture), which
+    is stronger than the ``allclose`` the reference comparisons above settle for and is worth
+    asserting exactly: a summation-order change would show here first.
+
+    ``calcLength`` is an overload set over 2-D and 3-D, float and double contours; the ``Vector3f``
+    one is what a ``float32`` polyline maps onto, and picking the ``double`` overload instead would
+    silently compare a different accumulation.
+    """
+    pts_np = _random_open_polyline(2, n=50)
+
+    length_wp = tw.polyline.polyline_length(_polyline_wp(pts_np, device))
+    length_ml = mm.calcLength(_contour_ml(pts_np))
+    assert length_ml > 0.0  # non-vacuity
+    assert length_wp == length_ml
+
+    closed_wp = tw.polyline.polyline_length(_polyline_wp(pts_np, device), closed=True)
+    closed_ml = mm.calcLength(_contour_ml(_closed_from(pts_np)))
+    assert closed_ml > length_ml  # the closing segment is real
+    assert closed_wp == closed_ml
+
+
 # --- centroid / normal (NumPy reference) ---
 
 
@@ -309,6 +360,41 @@ def test_distance_to_polyline_matches_reference(device: str) -> None:
     points_wp = _polyline_wp(points_np, device)
     distances_wp = tw.polyline.distance_to_polyline(points_wp, _polyline_wp(pts_np, device))
     assert np.allclose(distances_wp.numpy(), _distance_np(points_np, pts_np), rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parity("distance_to_polyline", "meshlib")
+def test_distance_to_polyline_matches_meshlib(device: str) -> None:
+    """
+    Class A after one named transform: ``findProjectionOnPolyline`` reports a **squared** distance.
+
+    The same convention open3d's k-NN and MeshLib's own ``findProjection`` use, so the square root
+    is the whole of the transform; max difference **3.7e-07** over 50 queries against a 40-segment
+    polyline, which is the float32 floor.
+
+    It is a per-query call with no batched form, so this loops -- fine at test size, and the reason
+    the benchmark row for this group stays with the vectorized references.
+    """
+    rng = np.random.default_rng(40)
+    pts_np = _random_open_polyline(40, n=40)
+    points_np = rng.standard_normal((50, 3)) * 3.0 + pts_np.mean(axis=0)
+
+    distances_wp = tw.polyline.distance_to_polyline(
+        _polyline_wp(points_np, device), _polyline_wp(pts_np, device)
+    )
+
+    polyline_ml = _polyline_ml(pts_np)
+    assert polyline_ml.points.size() == pts_np.shape[0]  # the constructor kept every point
+    distances_ml = np.array(
+        [
+            np.sqrt(
+                mm.findProjectionOnPolyline(mm.Vector3f(*point_np.tolist()), polyline_ml).distSq
+            )
+            for point_np in points_np
+        ]
+    )
+
+    assert distances_ml.min() > 0.0  # non-vacuity: no query sits on the polyline
+    assert np.allclose(distances_wp.numpy(), distances_ml, rtol=1e-5, atol=1e-5)
 
 
 def test_distance_to_single_point_polyline(device: str) -> None:

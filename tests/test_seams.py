@@ -7,13 +7,16 @@ import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 import triwarp.typing as twt
 from tests.comparisons import lexsort_rows
 from tests.conversions import (
+    meshlib_bitset_to_numpy,
     numpy_to_warp,
     pyvista_edges_to_indices,
+    trimesh_to_meshlib,
     trimesh_to_pymeshlab,
     trimesh_to_pyvista,
     wedge_uv_to_pymeshlab,
@@ -82,6 +85,50 @@ def test_crease_edges_matches_pymeshlab(hemisphere: tuple[tm.Trimesh, wp.Mesh]) 
 
     creases_np = tw.seams.crease_edges(mesh_wp.points, mesh_wp.indices, angle=angle).numpy()
     assert set(np.unique(creases_np).tolist()) == set(selected_pml.tolist())
+
+
+@pytest.mark.parametrize("angle", [30.0, 60.0])
+@pytest.mark.parity("crease_edges", "meshlib")
+def test_crease_edges_matches_meshlib(unit_box: tuple[tm.Trimesh, wp.Mesh], angle: float) -> None:
+    """
+    Class B (undirected-edge decode): the same dihedral threshold, reported as a bitset.
+
+    ``findCreaseEdges`` returns an ``UndirectedEdgeBitSet``, so the two named transforms are its
+    **units** and its **indexing**. The angle is in *radians* -- there is no degree overload -- and
+    each set bit is an undirected edge id, which becomes a vertex pair through
+    ``EdgeId(2 * ue)`` and the topology's ``org`` / ``dest``. Both sides are then sorted within a
+    row and across rows, since neither orients an undirected edge.
+
+    Exact on both thresholds: 12 edges each on a unit box, the same 12 vertex pairs. The box is the
+    fixture for the reason the pyvista pairing above uses it -- a smooth sphere yields ``[] == []``
+    at 30 degrees and would test nothing -- and the count is asserted before the sets are compared.
+
+    Note the *sign* of the threshold is not shared vocabulary: MeshLab takes a signed pair
+    (``angledegneg`` / ``angledegpos``) and this takes ``angleFromPlanar``, one number measured from
+    flat, which is triwarp's ``angle``.
+    """
+    mesh_tm, mesh_wp = unit_box
+    creases_wp = tw.seams.crease_edges(mesh_wp.points, mesh_wp.indices, angle=angle)
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    crease_bits_ml = mm.findCreaseEdges(mesh_ml.topology, mesh_ml.points, float(np.radians(angle)))
+    edges_ml = np.array(
+        sorted(
+            sorted(
+                (
+                    int(mesh_ml.topology.org(mm.EdgeId(int(edge) * 2))),
+                    int(mesh_ml.topology.dest(mm.EdgeId(int(edge) * 2))),
+                )
+            )
+            for edge in np.flatnonzero(
+                meshlib_bitset_to_numpy(crease_bits_ml, mesh_ml.topology.undirectedEdgeSize())
+            )
+        )
+    )
+    edges_wp = np.array(sorted(sorted(row) for row in creases_wp.numpy().tolist()))
+
+    assert edges_ml.shape[0] == 12  # the box's creases, so neither side is empty
+    assert np.array_equal(edges_wp, edges_ml)
 
 
 @pytest.mark.parity("crease_edges", "pyvista")

@@ -562,7 +562,13 @@ class BenchLibrary:
         """Warp device for triwarp targets; ``None`` for CPU references."""
         return self.library["device"]
 
-    def run(self, fn: Callable[[], Any], *, rounds: int = _ROUNDS) -> Any:
+    def run(
+        self,
+        fn: Callable[..., Any],
+        *,
+        rounds: int = _ROUNDS,
+        setup: Callable[[], Any] | None = None,
+    ) -> Any:
         """
         Time ``fn`` with pytest-benchmark, synchronising inside the timed region on CUDA.
 
@@ -573,18 +579,36 @@ class BenchLibrary:
         hundreds of milliseconds (the hole-filling DP, ``split`` on a thousand components, an
         isotropic remesh, a Poisson reconstruction). Ten rounds of those alone would dominate the
         suite's wall clock, and their spread is wide enough that the extra samples buy nothing.
+
+        ``setup`` builds a **fresh input per round, outside the timed region**, and its return value
+        is passed to ``fn`` as the single positional argument. Most references that mutate their
+        input rebuild it *inside* the timed callable instead (``new_mesh_ml``, ``new_meshset_pml``),
+        which is right when the build is a small fraction of the call -- and honest, since a caller
+        pays it too. Use ``setup`` where it is not: the MeshLib dilation row loads its voxel bitset
+        in 0.30 ms against a 0.22 ms ``expandVoxelsMask`` on ``bunny``, so folding the load in would
+        report the load. ``pedantic`` runs ``setup`` before every round including the warmup, and
+        forbids it above ``iterations=1`` -- which is what every row here already uses.
         """
         device = self.device
         needs_sync = device is not None and device.startswith("cuda")
 
-        def target() -> Any:
-            result = fn()
+        def target(*args: Any) -> Any:
+            result = fn(*args)
             if needs_sync:
                 wp.synchronize_device(device)
             return result
 
+        if setup is None:
+            return self._benchmark.pedantic(
+                target, rounds=rounds, warmup_rounds=_WARMUP_ROUNDS, iterations=1
+            )
+
+        def make_arguments() -> tuple[tuple[Any, ...], dict[str, Any]]:
+            """Hand ``pedantic`` this round's freshly-built input as ``fn``'s only argument."""
+            return (setup(),), {}
+
         return self._benchmark.pedantic(
-            target, rounds=rounds, warmup_rounds=_WARMUP_ROUNDS, iterations=1
+            target, setup=make_arguments, rounds=rounds, warmup_rounds=_WARMUP_ROUNDS, iterations=1
         )
 
 

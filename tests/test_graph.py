@@ -16,6 +16,7 @@ import triwarp.typing as twt
 from tests.comparisons import same_partition
 from tests.conversions import (
     meshlib_bitset_to_numpy,
+    meshlib_to_trimesh,
     open3d_to_trimesh,
     trimesh_to_meshlib,
     trimesh_to_open3d,
@@ -46,6 +47,44 @@ def test_concatenate_meshes(request: pytest.FixtureRequest) -> None:
     )
     assert np.allclose(concat_vertices_wp.numpy(), concat_tm.vertices)
     assert np.array_equal(concat_faces_wp.numpy(), concat_tm.faces.reshape(-1))
+
+
+@pytest.mark.parity("concatenate", "meshlib")
+def test_concatenate_matches_meshlib(request: pytest.FixtureRequest) -> None:
+    """
+    Class A on both buffers: ``mergeMeshes`` offsets the same indices into the same order.
+
+    Its argument is a ``std_vector_std_shared_ptr_Mesh`` -- a vector of *shared pointers*, which
+    pybind11 fills from plain ``Mesh`` objects, so the meshes have to be built first and appended
+    rather than constructed inline. It returns a new mesh and mutates none of its inputs, which is
+    unusual enough in this library to be worth stating.
+
+    The comparison is element-wise rather than set-wise for the reason the trimesh pairing above
+    gives: the index *offsetting* is the whole operation, and a wrong offset still yields a
+    valid-looking mesh with the right counts. Both sides land on 50 vertices and 92 faces from an
+    icosphere and a box here, with identical positions and identical faces.
+
+    The fixtures are disjoint on purpose -- ``mergeMeshes`` does not weld, and neither does
+    ``concatenate``; overlapping inputs would compare two different de-duplication policies rather
+    than two concatenations.
+    """
+    mesh_a_tm, mesh_a_wp = request.getfixturevalue("icosahedron")
+    mesh_b_tm, mesh_b_wp = request.getfixturevalue("half_torus")
+
+    concat_vertices_wp, concat_faces_wp = tw.combine.concatenate(
+        [(mesh_a_wp.points, mesh_a_wp.indices), (mesh_b_wp.points, mesh_b_wp.indices)]
+    )
+
+    meshes_ml = mm.std_vector_std_shared_ptr_Mesh()
+    for mesh_tm in (mesh_a_tm, mesh_b_tm):
+        meshes_ml.append(trimesh_to_meshlib(mesh_tm))
+    merged_tm = meshlib_to_trimesh(mm.mergeMeshes(meshes_ml))
+
+    n_vertices = mesh_a_tm.vertices.shape[0] + mesh_b_tm.vertices.shape[0]
+    assert merged_tm.vertices.shape[0] == n_vertices  # non-vacuity: nothing was welded away
+    assert merged_tm.faces.shape[0] == mesh_a_tm.faces.shape[0] + mesh_b_tm.faces.shape[0]
+    assert np.allclose(concat_vertices_wp.numpy(), merged_tm.vertices, rtol=1e-5, atol=1e-5)
+    assert np.array_equal(concat_faces_wp.numpy().reshape(-1, 3), merged_tm.faces)
 
 
 def test_concatenate_single_mesh(request: pytest.FixtureRequest) -> None:

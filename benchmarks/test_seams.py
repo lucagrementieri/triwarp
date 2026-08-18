@@ -47,6 +47,7 @@ import pymeshlab as ml
 import pytest
 import warp as wp
 from conftest import BenchCase, skip_larger_than
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 import triwarp.typing as twt
@@ -87,7 +88,7 @@ def _cut_edges(bench_case: BenchCase, fraction: float) -> twt.Array2dInt32:
 
 
 @pytest.mark.benchmark(group="crease_edges")
-@pytest.mark.benchlibs("triwarp", "pymeshlab", "pyvista")
+@pytest.mark.benchlibs("triwarp", "pymeshlab", "pyvista", "meshlib")
 def test_crease_edges(bench_case: BenchCase) -> None:
     """
     Face adjacency plus a dihedral threshold: the cheap half of the seam workflow.
@@ -95,7 +96,22 @@ def test_crease_edges(bench_case: BenchCase) -> None:
     VTK's ``extract_feature_edges`` is the same threshold; the three other edge classes it can emit
     are switched off so it does the same work, and it returns the edges as a line-cell ``PolyData``
     rather than as a selection.
+
+    meshlib's ``findCreaseEdges`` is the closest of the three in output shape -- an
+    ``UndirectedEdgeBitSet``, one bit per edge, which is triwarp's answer without the pair decode --
+    and the tightest in result: the same 12 edges on a unit box at both thresholds tested
+    (``tests/test_seams.py``). Its angle is in **radians** and is measured from planar, so the
+    module's degree constant is converted rather than passed. It reads the topology and mutates
+    nothing, so one mesh serves every round.
     """
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        angle = float(np.radians(_CREASE_ANGLE))
+        creases_ml = bench_case.run(
+            lambda: mm.findCreaseEdges(mesh_ml.topology, mesh_ml.points, angle)
+        )
+        assert creases_ml.size() <= mesh_ml.topology.undirectedEdgeSize()
+        return
     if bench_case.kind == "pyvista":
         skip_larger_than(bench_case, "bunny", "vtkFeatureEdges is a single-threaded edge walk")
         mesh_pv = bench_case.mesh_pv

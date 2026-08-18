@@ -709,6 +709,23 @@ all measured:
   on a clean mesh. Neither raises, and both break an `np.array_equal` against a triwarp mask by
   *shape* rather than by value, which reads as a converter bug. Go through
   `conversions.meshlib_bitset_to_numpy(bitset, size)`, which states the domain and pads.
+- **Every bitset converts in bulk, in both directions — a per-bit Python loop is never the answer.**
+  A `TypedBitSet` (`FaceBitSet`, `VertBitSet`, `VoxelBitSet`) derives from `MR::BitSet`, and
+  `mn.getNumpyBitSet` is declared over the base, so pybind11 upcasts any of them into the readback
+  above. The *load* direction is `BitSet.fromBlocks`, which takes the packed `uint64` blocks — so
+  `np.packbits(flags, bitorder="little")` fills a whole set in one call, and
+  `conversions.numpy_to_meshlib_bitset` is that (wrap the result in the typed set:
+  `mm.VoxelBitSet(bitset)`). Measured against the per-cell `set()` loop it replaced: **258x** at
+  110 592 voxels (0.33 ms against 84.9 ms), and the readback **1 199x** (0.14 ms against 168 ms).
+  Three details: `bitorder="little"` is not NumPy's default and is not optional; `fromBlocks`
+  rejects a NumPy `uint64` array with `TypeError` (its argument is `std_vector_unsigned_long`, so
+  pass `.tolist()`) and rounds the size up to whole 64-bit blocks, so `resize` back to the domain;
+  and the element order is the container's, which for a `VoxelBitSet` addressed by a
+  `VolumeIndexer` is `x` fastest, i.e. `dense.ravel(order="F")`. Iteration also works —
+  `list(bitset)` yields one `VoxelId` per *set* bit, despite `MR_BIND_IGNORE_PY` on the C++
+  `begin`/`end` — but it is a convenience, not the fast path. **A "MeshLib binds no converter for
+  this" claim is a reason to probe the base class, not to write the loop**: one such claim in
+  `tests/test_voxels.py` cost a benchmark row that then read as unbenchmarkable.
 - **`(*args, **kwargs)` in a signature is an overload set, and `inspect` / `help()` cannot see it.**
   This wheel's pybind11 docstrings are stripped: `inspect.signature` gives `(*args, **kwargs)` and
   `__doc__` carries no overload lines. **Read the real signatures by calling the function with one
@@ -923,7 +940,8 @@ Reuse `tests/comparisons.py` (`lexsort_rows`, `assert_unordered_rows_equal`, `un
 `trimesh_to_open3d_t`, `trimesh_to_pymeshlab`, `warp_to_pymeshlab`, `points_to_pymeshlab`,
 `trimesh_to_pyvista`, `points_to_pyvista`, `pyvista_edges_to_indices`, `numpy_to_meshlib`,
 `trimesh_to_meshlib`, `warp_to_meshlib`, `points_to_meshlib`, `meshlib_to_trimesh`,
-`meshlib_scalars_to_numpy`, `meshlib_bitset_to_numpy`, `faces_igl`, `mesh_igl`)
+`numpy_to_meshlib_bitset`, `meshlib_scalars_to_numpy`, `meshlib_bitset_to_numpy`, `faces_igl`,
+`mesh_igl`)
 rather than re-rolling either. **Check both modules before writing a private helper in a test
 file** — every one of the six consolidated in 2026-08 was written by someone who did not, and
 `undirected_edges` alone had been spelled three different ways across six files.

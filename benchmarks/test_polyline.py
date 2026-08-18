@@ -65,7 +65,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import warp as wp
-from conftest import BenchCase
+from conftest import BenchCase, skip_larger_than
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -122,11 +123,103 @@ def _query_points_wp(bench_case: BenchCase, count: int) -> wp.array[wp.vec3]:
     return _query_cache[key]
 
 
+_polyline_np_cache: dict[str, np.ndarray] = {}
+_query_np_cache: dict[tuple[str, int], np.ndarray] = {}
+
+
+def _polyline_np(bench_case: BenchCase) -> np.ndarray:
+    """
+    Build the same polyline as a host array, for the CPU-bound rows.
+
+    ``_polyline_wp`` goes through ``bench_case.vertices_wp``, which needs a Warp device a
+    ``cpu_bound`` case does not have -- the situation ``test_points.py``'s pymeshlab cloud is in.
+    The extraction runs on the ``cpu`` device instead: it is the benchmark's *input*, so which
+    device derives it is immaterial, and the result is cached per mesh.
+    """
+    if bench_case.mesh_name not in _polyline_np_cache:
+        vertices = wp.array(
+            np.ascontiguousarray(bench_case.vertices_np, dtype=np.float32),
+            dtype=wp.vec3,
+            device="cpu",
+        )
+        faces = wp.array(
+            np.ascontiguousarray(bench_case.faces_np.reshape(-1), dtype=np.int32),
+            dtype=wp.int32,
+            device="cpu",
+        )
+        loops = tw.boundary.boundary_loops(vertices, faces)
+        if not loops:
+            pytest.skip(f"{bench_case.mesh_name} has no boundary loop to use as a polyline")
+        longest = max(loops, key=lambda loop: int(loop.shape[0]))
+        _polyline_np_cache[bench_case.mesh_name] = np.ascontiguousarray(
+            bench_case.vertices_np[longest.numpy()], dtype=np.float64
+        )
+    return _polyline_np_cache[bench_case.mesh_name]
+
+
+def _query_points_np(bench_case: BenchCase, count: int) -> np.ndarray:
+    """Draw the same query cloud as [`_query_points_wp`], on the host and at the same seed."""
+    key = (bench_case.mesh_name, count)
+    if key not in _query_np_cache:
+        polyline_np = _polyline_np(bench_case)
+        rng = np.random.default_rng(20260726)
+        _query_np_cache[key] = rng.uniform(
+            polyline_np.min(axis=0), polyline_np.max(axis=0), size=(count, 3)
+        )
+    return _query_np_cache[key]
+
+
+_contour_ml_cache: dict[tuple[str, str], mm.std_vector_Vector3_float] = {}
+_polyline_ml_cache: dict[tuple[str, str], mm.Polyline3] = {}
+
+
+def _contour_ml(bench_case: BenchCase) -> mm.std_vector_Vector3_float:
+    """
+    Build the benchmark's polyline as a MeshLib contour, cached.
+
+    Filling it is a per-point Python loop over ``Vector3f`` constructions -- comparable to the
+    reduction it feeds -- and it is the *input*, so it is built once per polyline like every other
+    library's copy in this file.
+    """
+    key = (bench_case.mesh_name, "contour")
+    if key not in _contour_ml_cache:
+        contour_ml = mm.std_vector_Vector3_float()
+        for point_np in _polyline_np(bench_case):
+            contour_ml.append(mm.Vector3f(*point_np.tolist()))
+        _contour_ml_cache[key] = contour_ml
+    return _contour_ml_cache[key]
+
+
+def _polyline_ml(bench_case: BenchCase) -> mm.Polyline3:
+    """
+    Build the same points as a ``Polyline3``, through the **constructor**.
+
+    ``addFromPoints`` binds a raw ``Vector3f*`` plus a count rather than a vector, so the
+    single-contour constructor is the usable route. Cached: it builds an AABB tree lazily on first
+    query, which the row below pre-warms rather than times.
+    """
+    key = (bench_case.mesh_name, "polyline")
+    if key not in _polyline_ml_cache:
+        _polyline_ml_cache[key] = mm.Polyline3(_contour_ml(bench_case))
+    return _polyline_ml_cache[key]
+
+
 @pytest.mark.benchmark(group="polyline_length")
 @pytest.mark.benchaxis("polyline")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "meshlib")
 def test_polyline_length(bench_case: BenchCase) -> None:
-    """Summed segment length: the cheapest whole-polyline reduction, launch-latency bound."""
+    """
+    Summed segment length: the cheapest whole-polyline reduction, launch-latency bound.
+
+    meshlib's ``calcLength`` sums the same segments and returns a **bit-identical** float32
+    (``tests/test_polyline.py``), so this pair is a pure host-against-device reading of the same
+    arithmetic -- and on a reduction this cheap triwarp's row is its launch latency, which is what
+    makes the comparison worth having. The contour is the input and is cached.
+    """
+    if bench_case.kind == "meshlib":
+        contour_ml = _contour_ml(bench_case)
+        assert bench_case.run(lambda: mm.calcLength(contour_ml)) > 0.0
+        return
     polyline = _polyline_wp(bench_case)
     length = bench_case.run(lambda: tw.polyline.polyline_length(polyline))
     assert length > 0.0
@@ -188,10 +281,32 @@ def test_simplify_polyline(bench_case: BenchCase, tolerance_fraction: float) -> 
 
 @pytest.mark.benchmark(group="distance_to_polyline")
 @pytest.mark.benchaxis("polyline")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "meshlib")
 @pytest.mark.parametrize("n_queries", _N_QUERIES)
 def test_distance_to_polyline(bench_case: BenchCase, n_queries: int) -> None:
-    """Brute-force point-to-segment distance: the one case whose cost is points x segments."""
+    """
+    Brute-force point-to-segment distance: the one case whose cost is points x segments.
+
+    That is the contrast meshlib's row is here for: ``findProjectionOnPolyline`` walks an **AABB
+    tree** over the segments, so its cost is ``points x log(segments)`` where triwarp's is the full
+    product -- read the gap across the ``polyline`` axis rather than at one point. It has no
+    batched form, so the row loops in Python and prices that loop along with the queries; the tree
+    is built lazily and is pre-warmed outside the timed callable.
+    """
+    if bench_case.kind == "meshlib":
+        skip_larger_than(bench_case, "bunny", "the query is a per-point Python loop")
+        polyline_ml = _polyline_ml(bench_case)
+        queries_np = _query_points_np(bench_case, n_queries)
+        mm.findProjectionOnPolyline(mm.Vector3f(*queries_np[0].tolist()), polyline_ml)  # pre-warm
+
+        def distances_ml() -> float:
+            return sum(
+                mm.findProjectionOnPolyline(mm.Vector3f(*point_np.tolist()), polyline_ml).distSq
+                for point_np in queries_np
+            )
+
+        assert bench_case.run(distances_ml) >= 0.0
+        return
     polyline = _polyline_wp(bench_case)
     points = _query_points_wp(bench_case, n_queries)
     distance = bench_case.run(lambda: tw.polyline.distance_to_polyline(points, polyline))

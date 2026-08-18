@@ -22,6 +22,14 @@ against dense ndimage" and their axis is the one that separates them: the dense 
 whole bounding box, the sparse side only for the occupied cells. ``voxel.ops.multibox`` builds
 ``12 n`` triangles on the host with no corner sharing.
 
+**meshlib** adds the second dense implementation of the dilation, and the only multi-threaded one:
+``expandVoxelsMask`` walks the same bounding box on every core, over a ``VoxelBitSet`` rather than a
+NumPy array. It shares trimesh's input verbatim, so the ``dilate`` group reads as one sparse GPU
+grid against two dense CPU passes over the identical occupancy. Its bitset **mutates**, so the row
+rebuilds it every round -- through ``pedantic``'s untimed ``setup`` rather than inside the timed
+callable, the one row in the suite that needs the distinction (0.30 ms to load against a 0.22 ms
+dilation on ``bunny``; ``BenchLibrary.run`` says why).
+
 **libigl** covers the two lattice functions, ``grid`` and ``unique_sparse_voxel_corners``. Both are
 single-core C++ over the same integer arithmetic, so they read as a bandwidth comparison.
 
@@ -291,8 +299,36 @@ def test_occupancy_at_points(bench_case: BenchCase, n_queries: int) -> None:
     assert int(mask.shape[0]) == n_queries
 
 
+def _voxel_mask_ml(occupancy_np: np.ndarray) -> mm.VoxelBitSet:
+    """
+    Load a dense occupancy array into a MeshLib ``VoxelBitSet``, in ``VoxelId`` order.
+
+    The benchmark-side twin of ``tests.conversions.numpy_to_meshlib_bitset`` (the two suites do not
+    import each other). ``BitSet.fromBlocks`` takes the packed ``uint64`` blocks through a
+    ``std_vector_unsigned_long``, which is why this is one ``np.packbits`` and not a per-cell
+    ``set()`` loop -- 0.30 ms rather than 85 ms on ``bunny``'s dense box. ``VolumeIndexer`` decodes
+    ``x + dims.x * y + dims.x * dims.y * z``, so ``x`` runs fastest and the array flattens with
+    ``order="F"``; ``fromBlocks`` rounds up to whole blocks, so the size is trimmed back after.
+
+    This is ``setup`` work, not timed work: ``expandVoxelsMask`` **mutates** the bitset, so every
+    round needs a fresh one, and at 0.30 ms against a 0.22 ms dilation, building it inside the timed
+    callable would report the load instead of the morphology.
+    """
+    packed_np = np.packbits(occupancy_np.ravel(order="F"), bitorder="little")
+    packed_np = np.pad(packed_np, (0, (-packed_np.size) % 8)).view(np.uint64)
+    bitset_ml = mm.BitSet.fromBlocks(mm.std_vector_unsigned_long(packed_np.tolist()))
+    bitset_ml.resize(occupancy_np.size)
+    return mm.VoxelBitSet(bitset_ml)
+
+
+def _expand_ml(mask_ml: mm.VoxelBitSet, indexer_ml: mm.VolumeIndexer) -> mm.VoxelBitSet:
+    """Dilate in place by one 6-neighbour shell; ``expandVoxelsMask`` itself returns ``None``."""
+    mm.expandVoxelsMask(mask_ml, indexer_ml, 1)
+    return mask_ml
+
+
 @pytest.mark.benchmark(group="dilate")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "meshlib")
 def test_dilate(bench_case: BenchCase) -> None:
     """
     Grow the set by one shell: a ``(k + 1) * n_voxels`` candidate buffer against dense ndimage.
@@ -301,17 +337,32 @@ def test_dilate(bench_case: BenchCase) -> None:
     ``connectivity=26``, 324 MB at a million voxels, and the reason 6 is the default. trimesh's
     reference is ``scipy.ndimage.binary_dilation`` over the *dense* bounding box, so the two sides
     scale with different quantities and the gap widens with sparsity.
+
+    The two CPU rows share one input — trimesh's dense voxelization at the same pitch — so they are
+    two dense implementations of the identical 6-neighbour dilation over the identical occupancy,
+    asserted equal cell-for-cell in ``tests/test_voxels.py``. MeshLib's is the multi-threaded one,
+    which is the whole reason it is here: it walks the same dense box on every core.
     """
     voxel_size = _voxel_size(bench_case, _MORPHOLOGY_DIVISOR)
-    if bench_case.kind == "trimesh":
-        skip_larger_than(bench_case, "bunny", "ndimage dilates the whole dense bounding box")
+    if bench_case.kind in ("trimesh", "meshlib"):
+        skip_larger_than(bench_case, "bunny", "both dilate the whole dense bounding box")
         mesh_tm = tm.Trimesh(bench_case.vertices_np, bench_case.faces_np, process=False)
         grid_tm = tm.voxel.creation.voxelize_subdivide(mesh_tm, pitch=voxel_size)
         encoding_tm = grid_tm.encoding
-        dilated_tm = bench_case.run(
-            lambda: tm.voxel.morphology.binary_dilation(encoding_tm), rounds=_HEAVY_ROUNDS
+        if bench_case.kind == "trimesh":
+            dilated_tm = bench_case.run(
+                lambda: tm.voxel.morphology.binary_dilation(encoding_tm), rounds=_HEAVY_ROUNDS
+            )
+            assert dilated_tm.sum > 0
+            return
+
+        occupancy_np = encoding_tm.dense
+        indexer_ml = mm.VolumeIndexer(mm.Vector3i(*(int(n) for n in occupancy_np.shape)))
+        dilated_ml = bench_case.run(
+            lambda mask_ml: _expand_ml(mask_ml, indexer_ml),
+            setup=lambda: _voxel_mask_ml(occupancy_np),
         )
-        assert dilated_tm.sum > 0
+        assert dilated_ml.count() > int(occupancy_np.sum())
         return
 
     grid = tw.voxels.voxelize_mesh(bench_case.vertices_wp, bench_case.faces_wp, voxel_size)
