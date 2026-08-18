@@ -61,7 +61,7 @@ def test_ambient_occlusion_finds_the_cavity(cave_cube: tuple[tm.Trimesh, wp.Mesh
 @pytest.mark.parity("ambient_occlusion", "pymeshlab")
 def test_ambient_occlusion_ranks_like_pymeshlab(torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
-    MeshLab's scalar is the unnormalized *complement*, so the two agree by rank, not by value.
+    Class C (rank correlation): MeshLab's scalar is the unnormalized *complement* of this one.
 
     ``compute_scalar_ambient_occlusion`` sums ``cos`` over the visible directions of its own
     whole-sphere set without dividing, so a fully exposed vertex reads ~``rays / 4`` rather than
@@ -183,6 +183,14 @@ def test_volumetric_obscurance_attenuates_distant_occluders(
 
 
 def test_volumetric_obscurance_ranks_like_pymeshlab(torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class C (rank correlation), and the sign of the correlation is the claim.
+
+    MeshLab reports *exposure* where triwarp reports *obscurance*, so agreement means a correlation
+    below **-0.8**, not above it -- an implementation that returned exposure would pass a
+    ``|corr| > 0.8`` bar and fails this one. The torus is the fixture because its hole obscures the
+    inner wall and leaves the outer wall exposed, giving the ranks something to disagree about.
+    """
     mesh_tm, mesh_wp = torus
     meshset_pml = trimesh_to_pymeshlab(mesh_tm)
     meshset_pml.compute_scalar_by_volumetric_obscurance(rays=256, tau=0.1)
@@ -415,6 +423,14 @@ def test_shape_diameter_empty(device: str) -> None:
 
 
 def test_thickness_max_sphere(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class A against ``trimesh.proximity.thickness``, including *which* points are infinite.
+
+    The ``isfinite`` mask is compared before the values, so a point where one library finds no
+    opposite surface and the other does is a failure rather than a skipped element. Measured 20 of
+    20 finite on this fixture, so the guarded ``allclose`` does run -- the guard is there for a
+    fixture where it would not, and is not silently making this test vacuous here.
+    """
     mesh_tm, mesh_wp = icosahedron
     points_np, face_ids = tm.sample.sample_surface(mesh_tm, 20, seed=7)
     normals_np = mesh_tm.face_normals[face_ids]
@@ -436,6 +452,12 @@ def test_thickness_max_sphere(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
 
 
 def test_thickness_ray(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class A on the ``method="ray"`` branch, at ``allclose``'s default tolerance.
+
+    A separate algorithm from ``max_sphere`` rather than a tuning of it, so it needs its own
+    comparison; 20 of 20 points finite here too.
+    """
     mesh_tm, mesh_wp = icosahedron
     points_np, face_ids = tm.sample.sample_surface(mesh_tm, 20, seed=13)
     normals_np = mesh_tm.face_normals[face_ids]
@@ -464,6 +486,15 @@ def test_thickness_ray(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
 
 
 def test_max_tangent_sphere(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class A on both returns, at ``1e-2`` -- the loosest tolerance in this file, and why.
+
+    The sphere's centre slides along the normal as its radius grows, so a small radius disagreement
+    displaces the centre by the same amount; both are compared rather than just the radius, since a
+    centre off the normal would be a different failure. The tolerance is set by
+    ``mesh_query_point``'s own accuracy (section 6 records it as up to 2.1e-5 absolute) amplified by
+    that sliding, not by a disagreement about the definition. 20 of 20 points finite.
+    """
     mesh_tm, mesh_wp = icosahedron
     points_np, face_ids = tm.sample.sample_surface(mesh_tm, 20, seed=42)
     normals_np = mesh_tm.face_normals[face_ids]

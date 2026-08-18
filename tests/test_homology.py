@@ -49,6 +49,14 @@ def test_homology_generator_count_is_twice_the_genus(
 def test_homology_generators_are_simple_closed_edge_cycles(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Not a library comparison: no reference computes a homology basis, so the claim is structural.
+
+    trimesh supplies only the mesh's own edge set, used to check each loop *is* a walk along real
+    edges -- closed, and visiting no vertex twice. The generator count is pinned separately by the
+    Euler characteristic; what this excludes is a "loop" jumping between unconnected vertices, and
+    it asserts the loop list is non-empty first so a function returning nothing cannot pass.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     edges_tm = {tuple(sorted(edge)) for edge in mesh_tm.edges_unique.tolist()}
     loops = tw.homology.homology_generators(mesh_wp.points, mesh_wp.indices)
@@ -88,6 +96,13 @@ def test_homology_generators_reject_a_boundary(
 
 
 def test_tree_cotree_partitions_the_edges(torus: tuple[tm.Trimesh, wp.Mesh], device: str) -> None:
+    """
+    Not a library comparison: the counting identity a tree-cotree decomposition must satisfy.
+
+    ``E = (V - 1) + (F - 1) + 2g`` is the whole point of the construction, and trimesh contributes
+    only ``V`` and ``F``. An implementation mislabelling one edge would break the identity, which no
+    reference implementation is needed to state.
+    """
     mesh_tm, mesh_wp = torus
     unique_edges, generator_edges, parents = tw.homology.tree_cotree(
         mesh_wp.points, mesh_wp.indices

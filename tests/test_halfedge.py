@@ -23,6 +23,14 @@ _MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
 def test_halfedge_twins_are_a_symmetric_pairing(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Not a library comparison: trimesh has no halfedge structure, so the oracle is the algebra.
+
+    Three properties that together pin the pairing without a reference implementation -- it is an
+    involution, no halfedge is its own twin, and twins run over the same undirected edge (that last
+    is where ``trimesh.geometry.faces_to_edges`` comes in, as a *definition* of the edge a halfedge
+    spans rather than as a second answer).
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     twins_wp = tw.halfedge.halfedge_twins(mesh_wp.indices, n_vertices=len(mesh_tm.vertices))
 
@@ -88,6 +96,13 @@ def test_halfedge_twins_empty(device: str) -> None:
 def test_vertex_one_ring_sizes_match_incident_face_counts(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Class A after a named transform (class B): ring sizes are the incident-face-corner counts.
+
+    One outgoing halfedge per incident corner, so ``np.bincount`` over the flat face buffer is the
+    reference -- exact, no tolerance. The second assert is what makes it a *partition*: every
+    halfedge appears in exactly one ring, which a size check alone would not catch.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = len(mesh_tm.vertices)
     offsets_wp, ring_wp, _ = tw.halfedge.vertex_one_rings(mesh_wp.indices, n_vertices=n_vertices)
@@ -102,6 +117,14 @@ def test_vertex_one_ring_sizes_match_incident_face_counts(
 def test_vertex_one_ring_neighbor_counts_match_trimesh(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Class B: ``Trimesh.vertex_neighbors`` counts, after adding one per boundary vertex.
+
+    The transform is the definitional difference between the two structures, not a fudge: a ring
+    holds one halfedge per incident *face*, which is one fewer than the neighbour count exactly when
+    the fan is open. Folding ``is_boundary`` into the comparison means it also tests that flag,
+    which is why it is asserted here as an addend rather than masked out.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = len(mesh_tm.vertices)
     offsets_wp, _, is_boundary_wp = tw.halfedge.vertex_one_rings(
@@ -119,6 +142,14 @@ def test_vertex_one_ring_neighbor_counts_match_trimesh(
 def test_vertex_one_rings_are_rotationally_ordered(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Not a library comparison: the *ordering* claim, which no reference exposes.
+
+    trimesh's ``vertex_neighbors`` is a set, so it can check the ring's membership but never that
+    consecutive entries rotate around the vertex. This asserts that directly -- successive faces
+    share an edge *through this vertex* -- and then that one more rotation closes an interior fan
+    and falls off an open one, which is the same predicate ``is_boundary`` reports.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = len(mesh_tm.vertices)
     offsets_wp, ring_wp, is_boundary_wp = tw.halfedge.vertex_one_rings(
@@ -149,6 +180,13 @@ def test_vertex_one_rings_are_rotationally_ordered(
 def test_vertex_one_rings_boundary_flags_match_trimesh(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Class B: trimesh's multiplicity-1 edge grouping, reduced to a per-vertex boolean.
+
+    ``group_rows(..., require_count=1)`` gives the boundary *edges*; the named transform is taking
+    the unique vertices they touch. Only the open fixtures, because the flag is uniformly ``False``
+    on a closed mesh and the comparison would hold for a constant.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = len(mesh_tm.vertices)
     _, _, is_boundary_wp = tw.halfedge.vertex_one_rings(mesh_wp.indices, n_vertices=n_vertices)

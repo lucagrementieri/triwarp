@@ -25,6 +25,12 @@ def test_submesh_from_face_indices_empty(device: str) -> None:
 
 @pytest.mark.parity("submesh_from_face_indices", "trimesh")
 def test_submesh_from_face_indices_single_face(request: pytest.FixtureRequest) -> None:
+    """
+    Class A: one face against ``trimesh.util.submesh``, positions and remapped indices.
+
+    ``repair=False, append=False`` on the reference side is not a transform but a *disabling* of
+    one: trimesh would otherwise weld and reorder, a different operation from this one.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue("icosahedron")
     face_indices = wp.array([0], dtype=wp.int32, device=mesh_wp.points.device)
     submesh_tm = tm.util.submesh(mesh_tm, [[0]], repair=False, append=False)[0]
@@ -38,6 +44,13 @@ def test_submesh_from_face_indices_single_face(request: pytest.FixtureRequest) -
 
 
 def test_submesh_from_face_indices_duplicated(request: pytest.FixtureRequest) -> None:
+    """
+    Class A with a repeated index list, where the *face* count is the interesting half.
+
+    A face named three times must appear three times -- the output length is asserted exactly --
+    while its vertices are shared, so the vertex count is bounded rather than fixed. trimesh agrees
+    on both, which is what makes this the test for ``unique_indices=False``.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue("icosahedron")
     face_indices_np = np.array([0, 0, 0, 5, 5, 12, 12], dtype=np.int32)
     face_indices = wp.array(face_indices_np, dtype=wp.int32, device=mesh_wp.points.device)
@@ -55,6 +68,12 @@ def test_submesh_from_face_indices_duplicated(request: pytest.FixtureRequest) ->
 def test_submesh_from_face_indices_random_faces(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
+    """
+    Class A over a third of the faces on three fixtures: the general case, no transform.
+
+    Both the vertex *order* and the index remapping are compared elementwise, so this pins the
+    first-occurrence compaction rule and not merely the resulting set.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     rng = np.random.default_rng(42)
     n_faces = mesh_tm.faces.shape[0]
@@ -197,6 +216,13 @@ def test_submeshes_from_face_groups_empty(device: str) -> None:
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
 def test_submesh_from_face_mask(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A against trimesh *and* against the index form, which are different claims.
+
+    The trimesh comparison says the submesh is right; the index-form comparison says the mask entry
+    point agrees with the one that already has an oracle. A mask built from a coin flip is forced to
+    select at least one face, so neither comparison can be satisfied by an empty answer.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     rng = np.random.default_rng(7)
     n_faces = mesh_tm.faces.shape[0]
@@ -248,6 +274,13 @@ def test_face_indices_from_vertex_indices_empty() -> None:
 
 @pytest.mark.parametrize("face_mode", ["all", "any"])
 def test_submesh_from_vertex_indices(request: pytest.FixtureRequest, face_mode: str) -> None:
+    """
+    Class B: trimesh's submesh of the faces a numpy predicate picks, over both ``face_mode`` values.
+
+    The named transform is on the reference side: trimesh has no vertex-driven submesh, so the face
+    set is derived here by ``_face_indices_from_vertex_indices_np`` and handed to it. That helper
+    is itself the oracle in [`test_face_indices_from_vertex_indices`], so it is not assumed correct.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue("half_torus")
     rng = np.random.default_rng(13)
     n_vertices = mesh_tm.vertices.shape[0]

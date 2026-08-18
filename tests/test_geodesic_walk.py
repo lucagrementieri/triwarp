@@ -52,6 +52,14 @@ def _path_length(points: np.ndarray) -> float:
 def test_trace_from_vertex_walks_the_requested_distance(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Not a library comparison: the traced arc length against the requested one, computed here.
+
+    The direction's *tangential* component sets the distance to walk, so the reference is arithmetic
+    rather than another implementation -- an equality on a closed mesh and an upper bound on an open
+    one, where a ray can stop at the rim. The cross-library check is
+    [`test_trace_from_vertex_matches_potpourri3d`].
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     start_np, directions_np = _rays(mesh_tm, 24, seed=0)
     frames_wp = tw.tangent_space.vertex_tangent_frames(mesh_wp.points, mesh_wp.indices)
@@ -85,6 +93,13 @@ def test_trace_from_vertex_walks_the_requested_distance(
 def test_trace_from_vertex_stays_on_the_surface(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Class C (a distance bound, not a correspondence): every traced point is on the surface.
+
+    trimesh supplies only the point-to-surface distance, so this asserts a property of triwarp's
+    answer rather than comparing two answers. The bug class it excludes is the one unfolding gets
+    wrong -- drifting off the surface at a triangle crossing -- which no arc-length check would see.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     start_np, directions_np = _rays(mesh_tm, 24, seed=1)
     points_wp, _ = tw.geodesic_walk.trace_from_vertex(
@@ -107,6 +122,15 @@ def test_trace_from_vertex_stays_on_the_surface(
 def test_trace_from_vertex_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Class A on the arc length, class C on the endpoint -- and the split is the point.
+
+    The traced *length* is the contract and matches geometry-central to ``1e-4``. The *endpoint*
+    cannot: the two libraries resolve a walk crossing exactly through a vertex differently, and the
+    path accumulates that choice at every crossing, so it is bounded by half a mean edge length
+    instead. Asserting the endpoint at ``allclose`` would be asserting a tie-break neither library
+    documents; asserting only the length would miss a path that wandered.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
     faces_np = np.ascontiguousarray(mesh_tm.faces, dtype=np.int32)
@@ -141,6 +165,12 @@ def test_trace_from_vertex_matches_potpourri3d(
 def test_trace_from_vertex_stops_at_the_boundary(
     hemisphere: tuple[object, wp.Mesh], device: str
 ) -> None:
+    """
+    Not a library comparison: rays fired off the rim must stop there, not wrap or leave.
+
+    trimesh again supplies only the surface-distance oracle. The step-cap assert is what separates
+    *stopping* from *running out of iterations* -- both give a short path, and only one is right.
+    """
     mesh_tm, mesh_wp = hemisphere
     # Aim from every boundary vertex along the outward direction with a long reach: each ray must
     # stop at the rim rather than wrap around or leave the surface.
@@ -179,6 +209,14 @@ def test_trace_from_vertex_stops_at_the_boundary(
 def test_trace_from_face_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Class A on the start point and the arc length, for the barycentric entry point.
+
+    Same split as [`test_trace_from_vertex_matches_potpourri3d`] and for the same reason -- the
+    endpoint depends on a vertex-crossing tie-break -- but the *start* is exactly specified by the
+    barycentric coordinates, so unlike the vertex form it is asserted at ``1e-4`` rather than
+    bounded. No ``parity`` marker: ``trace_from_face`` is not separately benchmarked.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
     faces_np = np.ascontiguousarray(mesh_tm.faces, dtype=np.int32)

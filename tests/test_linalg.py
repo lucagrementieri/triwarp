@@ -36,7 +36,7 @@ def test_min_quad_with_fixed_matches_pymeshlab_harmonic_field(
     device: str, icosahedron: tuple[tm.Trimesh, wp.Mesh]
 ) -> None:
     """
-    Dirichlet-constrained cotangent solve against MeshLab's Generate Scalar Harmonic Field.
+    Class A: Dirichlet-constrained cotangent solve against MeshLab's Scalar Harmonic Field.
 
     The only external check ``min_quad_with_fixed`` has: everywhere else it is validated indirectly,
     through ``parametrization.tutte`` against ``igl.min_quad_with_fixed``. MeshLab's harmonic field

@@ -79,6 +79,16 @@ def _distance_pp(
 def test_heat_signed_distance_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Class C (correlation plus a mean-error bound): the two fields have no correspondence to assert.
+
+    Both sides solve the same continuous problem but through different boundary handling at the
+    curve, so a vertex-wise ``allclose`` is not available at any tolerance -- what *is* shared is
+    the sign convention and the shape of the field. The bug class this excludes is the one that
+    matters here: a sign flip, a scale error, or a field ignoring the curve would each break a 0.9
+    correlation and a mean error under 5 % of the mesh diagonal. Measured margins are in the comment
+    below, and the correlation is the tighter constraint (0.996 and 0.940 against the 0.9 bar).
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     _, curve_np = _one_ring_cycle(mesh_tm, mesh_wp)
     curve_wp = wp.array(curve_np, dtype=wp.int32, device=mesh_wp.device)

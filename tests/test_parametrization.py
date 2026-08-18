@@ -94,6 +94,7 @@ def test_flipped_faces_empty_mesh(device):
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
 @pytest.mark.parity("map_vertices_to_circle", "igl")
 def test_map_vertices_to_circle_matches_igl(request, device, mesh_name):
+    """Class A: the arc-length circle map against ``igl.map_vertices_to_circle``, no transform."""
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np, _ = mesh_igl(mesh_tm)
 
@@ -107,6 +108,14 @@ def test_map_vertices_to_circle_matches_igl(request, device, mesh_name):
 
 
 def test_uniform_laplacian_matches_igl(device, hemisphere):
+    """
+    Class B: igl has no ``uniform_laplacian``, so the reference is assembled from its adjacency.
+
+    The named transform is ``A - diag(rowsum(A))`` over ``igl.adjacency_matrix``: the definition of
+    the umbrella operator, built on the reference side. Note igl's adjacency is sized by
+    ``F.max() + 1`` rather than ``len(V)`` (section 6), which is why this runs on ``hemisphere``,
+    where every vertex is referenced.
+    """
     mesh_tm, mesh_wp = hemisphere
     _, faces_np = mesh_igl(mesh_tm)
     n_vertices = int(mesh_wp.points.shape[0])
@@ -127,6 +136,13 @@ def test_uniform_laplacian_matches_igl(device, hemisphere):
 @pytest.mark.parity("harmonic", "igl")
 @pytest.mark.parity("harmonic_conditioning", "igl")
 def test_harmonic_matches_igl(request, device, mesh_name):
+    """
+    Class A: the same boundary constraints in, the same interior UVs out, at ``1e-4``.
+
+    Both sides receive the identical circle map, so nothing about the boundary is under test here --
+    the comparison isolates the interior solve. The tolerance is the CG stop, not a disagreement:
+    igl factorizes where triwarp iterates.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np, faces_np = mesh_igl(mesh_tm)
 
@@ -198,6 +214,14 @@ def test_biharmonic_is_deterministic(device, hemisphere):
 
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
 def test_tutte_matches_igl_reference(request, device, mesh_name):
+    """
+    Class B: igl has no ``tutte``, so the reference is its fixed-value minimizer on ``D - A``.
+
+    Two named transforms, both on the reference side: assemble the uniform Laplacian from
+    ``igl.adjacency_matrix`` and hand it to ``igl.min_quad_with_fixed`` under triwarp's own boundary
+    constraints. That isolates the interior solve, which is the only part not already covered by
+    [`test_uniform_laplacian_matches_igl`] and [`test_map_vertices_to_circle_matches_igl`].
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     _, faces_np = mesh_igl(mesh_tm)
     n_vertices = int(mesh_wp.points.shape[0])
@@ -238,6 +262,12 @@ def test_tutte_disk_is_fold_free(device, hemisphere):
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
 @pytest.mark.parity("lscm", "igl")
 def test_lscm_matches_igl(request, device, mesh_name):
+    """
+    Class A against ``igl.lscm`` with the same two pins, the libigl tutorial-502 convention.
+
+    LSCM is defined only up to the pins, so pinning both sides identically is what makes an
+    elementwise comparison meaningful at all -- with a free gauge there would be nothing to compare.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np, faces_np = mesh_igl(mesh_tm)
 
@@ -257,6 +287,13 @@ def test_lscm_matches_igl(request, device, mesh_name):
 
 
 def test_lscm_closed_mesh_matches_igl(device, icosahedron):
+    """
+    Class A on the degenerate closed-mesh branch, where the area term vanishes.
+
+    With no boundary, ``A = 0`` and the system reduces to ``-repdiag(L, 2)``; igl accepts that
+    input, so the branch has a real oracle rather than only an invariant. It is its own test
+    because the boundary fixtures never exercise it.
+    """
     # Closed mesh: A = 0, Q = -repdiag(L, 2). igl.lscm accepts closed input.
     mesh_tm, mesh_wp = icosahedron
     vertices_np, faces_np = mesh_igl(mesh_tm)
@@ -376,6 +413,13 @@ def _arap_igl(vertices_np, faces_np, fixed_np, fixed_uv_np, uv_init_np, max_iter
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
 @pytest.mark.parity("arap", "igl")
 def test_arap_matches_igl(request, device, mesh_name):
+    """
+    Class A at a fixed iteration count, with the *same warm start* fed to both sides.
+
+    ARAP is a local-global iteration, so its answer depends on where it started and how many rounds
+    it ran: both are pinned here (triwarp's own harmonic solve, 10 iterations), or the comparison
+    would be measuring two different points along two different trajectories.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np, faces_np = mesh_igl(mesh_tm)
 
@@ -398,6 +442,12 @@ def test_arap_matches_igl(request, device, mesh_name):
 
 
 def test_arap_free_boundary_matches_igl(device, hemisphere):
+    """
+    Class A on the free-boundary branch: only two vertices pinned, the rest of the rim moving.
+
+    The fully-pinned case above cannot see a bug in the boundary rows of the system, since there are
+    none to solve; this is the same comparison with 4 iterations and almost the whole rim free.
+    """
     # Pin only two boundary vertices to their harmonic UV; the rest of the boundary is free.
     mesh_tm, mesh_wp = hemisphere
     vertices_np, faces_np = mesh_igl(mesh_tm)

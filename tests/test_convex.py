@@ -178,7 +178,7 @@ def test_face_adjacency_convex_empty(device: str) -> None:
 @pytest.mark.parity("convex_subset_mask", "trimesh", "open3d", "pymeshlab")
 def test_convex_subset_mask_against_the_three_qhull_backends(device: str) -> None:
     """
-    Soundness and recall against exact qhull.
+    Class C (soundness plus a recall bound), against exact qhull.
 
     ``benchmarks/test_convex.py`` says of these three rows that "this is not a parity comparison":
     trimesh, Open3D and pymeshlab all run **qhull** and return the exact hull as a *mesh*, while
@@ -317,7 +317,7 @@ _MAX_KEPT_FRACTION = {"gaussian": 0.012, "ball": 0.11, "cube": 0.05}
 @pytest.mark.parity("convex_superset_mask", "scipy")
 def test_convex_superset_mask_contains_the_exact_hull(device: str, kind: str) -> None:
     """
-    Assert exact containment of the reference hull's vertex set (class B).
+    Class B: exact containment of the reference hull's vertex set.
 
     The one named transform is reading [`scipy.spatial.ConvexHull`][]'s hull vertex *indices* as a
     boolean mask.

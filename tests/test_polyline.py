@@ -212,6 +212,7 @@ def test_close_polyline_leaves_closed_unchanged(device: str) -> None:
 
 @pytest.mark.parametrize("seed", [10, 11])
 def test_polyline_length_matches_trimesh(device: str, seed: int) -> None:
+    """Class A: the summed segment length against ``trimesh.path.segments.length``."""
     pts_np = _random_open_polyline(seed)
     segs = np.stack([pts_np[:-1], pts_np[1:]], axis=1)
     length_tm = tm_segments.length(segs, summed=True)
@@ -220,6 +221,13 @@ def test_polyline_length_matches_trimesh(device: str, seed: int) -> None:
 
 
 def test_polyline_length_closed_matches_trimesh(device: str) -> None:
+    """
+    Class B: the same comparison with ``closed=True``, against an explicitly closed segment list.
+
+    trimesh has no closed-polyline form, so the named transform is on the *reference* side: append
+    the first point and take the open length. That is what ``closed=True`` is defined to mean, so
+    the transform is the definition rather than an accommodation.
+    """
     pts_np = _random_open_polyline(12)
     closed_np = _closed_from(pts_np)
     segs = np.stack([closed_np[:-1], closed_np[1:]], axis=1)
@@ -455,6 +463,14 @@ def test_resample_polyline_matches_numpy_interp(device: str, num_points: int) ->
 
 
 def test_resample_polyline_matches_trimesh(device: str) -> None:
+    """
+    Class A: arc-length resampling against ``trimesh.path.traversal.resample_path``.
+
+    Tolerance is ``1e-3`` rather than ``1e-5`` because triwarp interpolates in ``float32`` and
+    trimesh in ``float64`` over a cumulative arc length, so the error grows along the path;
+    [`test_resample_polyline_matches_numpy_interp`] is the tight version of the same claim against
+    an oracle in matching precision.
+    """
     pts_np = _random_open_polyline(71)
     num_points = 40
     resampled_tm = tm_traversal.resample_path(pts_np, count=num_points)

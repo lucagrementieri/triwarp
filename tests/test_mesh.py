@@ -69,6 +69,7 @@ def test_warp_mesh_raises_for_empty_mesh(device: str) -> None:
 
 
 def test_mesh_from_numpy_round_trip(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """Class A: the numpy arrays survive the upload unchanged, positions and indices alike."""
     mesh_tm, _mesh_wp = icosahedron
     mesh = tw.io.mesh_from_numpy(mesh_tm.vertices, mesh_tm.faces, device="cpu")
     assert np.allclose(mesh.vertices.numpy(), mesh_tm.vertices, rtol=1e-5, atol=1e-5)
@@ -83,6 +84,15 @@ def test_mesh_from_numpy_round_trip(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 @pytest.mark.parity("mesh_vertex_normals", "trimesh")
 def test_geometry_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A on all seven cached properties: same quantities, same order, no transform.
+
+    ``mesh.py`` mirrors ``trimesh.Trimesh``'s property names deliberately (the one allowlisted
+    exception to the summary-line rule in section 10), so this is the test that the names mean the
+    same thing and not merely that they exist. Run over every fixture, including the
+    non-orientable ones, since ``vertex_normals`` and ``vertex_defects`` are where a winding
+    assumption would show.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
 
@@ -102,6 +112,14 @@ def test_geometry_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 def test_edges_match_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A, and the row *order* is part of the claim -- ``array_equal``, not a lexsort.
+
+    ``edges`` / ``edges_sorted`` / ``edges_face`` are all indexed by the same halfedge position, so
+    a reordering would silently break the correspondence between them even while each stayed a
+    correct set. That is why this one is not canonicalized where
+    [`test_edges_unique_matches_trimesh`] is.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
 
@@ -112,6 +130,14 @@ def test_edges_match_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 def test_edges_unique_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B (row-set canonicalization): the unique edge *set* matches after a shared lexsort.
+
+    Here the order genuinely is not defined by either library -- triwarp's comes from a parallel
+    hash and trimesh's from a serial scan -- so both sides are sorted. The `inverse` is then checked
+    against triwarp's own ``edges_sorted`` rather than trimesh's, because it indexes into triwarp's
+    row order and that is the invariant the sort throws away.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
 
@@ -127,6 +153,12 @@ def test_edges_unique_matches_trimesh(request: pytest.FixtureRequest, mesh_name:
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 @pytest.mark.parity("mesh_face_adjacency", "trimesh")
 def test_face_adjacency_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B, two named transforms: sort within each pair, then lexsort the rows.
+
+    An adjacency pair is unordered and the list of pairs is unordered, and neither library defines
+    either -- so both have to be canonicalized before the sets can be compared elementwise.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
 
@@ -172,6 +204,13 @@ def test_boundary_loops_empty_for_closed_mesh(icosahedron: tuple[tm.Trimesh, wp.
 def test_euler_characteristic_matches_trimesh(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
+    """
+    Class A on an integer: ``V - E + F`` against ``Trimesh.euler_number``, exactly.
+
+    Non-vacuous across the fixture set by construction -- it is 2 on the closed orientable meshes,
+    0 on the tori and ``mobius``, and 1 on ``boy_surface`` -- so a function returning a constant
+    could not pass this parametrisation.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
     assert mesh.euler_characteristic == int(mesh_tm.euler_number)
@@ -181,6 +220,12 @@ def test_euler_characteristic_matches_trimesh(
 def test_is_winding_consistent_matches_trimesh(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
+    """
+    Class A on a boolean, and parametrized over inputs giving *both* answers.
+
+    Section 6 rules out asserting a predicate on one branch only; the non-orientable fixtures are
+    what make this live, since every closed orientable mesh in the suite answers ``True``.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
     assert mesh.is_winding_consistent == bool(mesh_tm.is_winding_consistent)
@@ -188,6 +233,11 @@ def test_is_winding_consistent_matches_trimesh(
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 def test_is_volume_matches_trimesh(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A on a boolean: the conjunction trimesh calls ``is_volume``, over both answers.
+
+    The open fixtures supply the ``False`` branch, so this is not a one-branch assert.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mesh = tw.Trimesh.from_warp_mesh(mesh_wp)
     assert mesh.is_volume == bool(mesh_tm.is_volume)

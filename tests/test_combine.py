@@ -178,6 +178,14 @@ def _meshlib_stitch_cost(
 @pytest.mark.parametrize(("n_a", "n_b"), [(9, 13), (16, 11), (8, 8)])
 @pytest.mark.parametrize("metric", STITCH_METRICS)
 def test_stitch_min_weight_watertight(device: str, n_a: int, n_b: int, metric: str) -> None:
+    """
+    Not a library comparison: the band's exact triangle count, with trimesh as the oracle.
+
+    Two rims of ``n_a`` and ``n_b`` vertices close with exactly ``n_a + n_b`` triangles and no new
+    vertices, whatever the metric chooses -- an arithmetic reference, not another implementation.
+    The metric's *choice* among those triangulations is what
+    [`test_stitch_min_weight_matches_meshlib`] compares.
+    """
     (_, _, va, fa), (_, _, vb, fb) = _capsule_halves(device, n_a, n_b)
 
     new_vertices, new_faces = tw.combine.stitch_min_weight(va, fa, vb, fb, metric=metric)
@@ -196,6 +204,14 @@ def test_stitch_min_weight_watertight(device: str, n_a: int, n_b: int, metric: s
 @pytest.mark.parametrize(("n_a", "n_b"), [(9, 13), (16, 11)])
 @pytest.mark.parametrize("metric", STITCH_COST_METRICS)
 def test_stitch_min_weight_matches_meshlib(device: str, n_a: int, n_b: int, metric: str) -> None:
+    """
+    Class C (a derived scalar): the band's *cost* matches MeshLib's optimum, not its triangles.
+
+    Both sides minimize the same objective over the same rims, and several triangulations can reach
+    the optimum -- so the comparable quantity is the cost, evaluated by one shared function on both
+    answers. What this excludes is triwarp settling for a worse triangulation; what it cannot see is
+    a different tie-break at equal cost, which is the point of comparing costs.
+    """
     (va_np, fa_np, va, fa), (vb_np, fb_np, vb, fb) = _capsule_halves(device, n_a, n_b)
 
     new_vertices, new_faces = tw.combine.stitch_min_weight(va, fa, vb, fb, metric=metric)
@@ -255,6 +271,12 @@ def _hemisphere_pair(device: str):
 
 
 def test_stitch_smooth_watertight(device: str):
+    """
+    Not a library comparison: the invariants ``stitch_smooth`` must hold, with trimesh as oracle.
+
+    Watertight, winding-consistent, no boundary loop left, and the two inputs' vertices unmoved in
+    the prefix -- that last is what separates *stitching* from *remeshing the whole thing*.
+    """
     (va, fa), (vb, fb) = _hemisphere_pair(device)
     n_v0 = int(va.shape[0]) + int(vb.shape[0])
 

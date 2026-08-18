@@ -53,6 +53,13 @@ def _to_world(tangent: np.ndarray, basis_x: np.ndarray, basis_y: np.ndarray) -> 
 def test_extend_scalar_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Class A: a scalar field carries no gauge, so this is the one vector-heat comparison that is.
+
+    Everything else in this module measures a *tangent* quantity, which agrees only up to a rotation
+    about the normal (section 6). ``extend_scalar`` returns numbers, so it is compared elementwise,
+    which makes it the test pinning the shared diffusion machinery all the others build on.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = len(mesh_tm.vertices)
     sources_np = np.array([0, n_vertices // 3, 2 * n_vertices // 3], dtype=np.int32)
@@ -170,6 +177,14 @@ def test_transport_on_a_flat_patch_is_constant(device: str) -> None:
 def test_transport_tangent_vectors_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Class B (gauge fix): both 2-D fields are pushed to 3-D world vectors before comparing.
+
+    A tangent component is meaningless across libraries -- each measures from its own reference
+    direction -- so the named transform expresses both answers in each library's *own* frames and
+    compares the resulting world vectors, which are gauge-invariant. Comparing the raw ``vec2``
+    components instead is exactly what section 6 forbids here.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     solver_pp = _solver_pp(mesh_tm)
     basis_x_pp, basis_y_pp, _ = (np.asarray(basis) for basis in solver_pp.get_tangent_frames())
@@ -434,6 +449,14 @@ def test_log_map_radius_is_the_geodesic_distance(
 def test_log_map_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Class B (gauge fix by an explicit rotation): both log maps live in the source's tangent plane.
+
+    Unlike the transport test, the gauge here is a single rotation for the whole field -- both maps
+    measure angles in *one* tangent plane, the source vertex's -- so the transform recovers that
+    angle from the two ``basis_x`` directions and rotates potpourri3d's answer by it. The fixture
+    choice is explained in the comment above: neither ``cave_cube`` nor ``icosahedron`` can serve.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     solver_pp = _solver_pp(mesh_tm)
     basis_x_pp, basis_y_pp, _ = (np.asarray(basis) for basis in solver_pp.get_tangent_frames())
