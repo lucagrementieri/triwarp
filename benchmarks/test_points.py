@@ -80,6 +80,7 @@ import pyvista as pv
 import trimesh as tm
 import warp as wp
 from conftest import BenchCase, skip_larger_than
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 import triwarp.typing as twt
@@ -217,10 +218,62 @@ def test_fit_line(bench_case: BenchCase) -> None:
         assert axis_tm.shape == (3,)
 
 
+_cloud_ml_cache: dict[str, mm.PointCloud] = {}
+_points_ml_cache: dict[str, mm.std_vector_Vector3_float] = {}
+
+
+def _cloud_ml(bench_case: BenchCase) -> mm.PointCloud:
+    """
+    Wrap the vertices in a ``meshlib.PointCloud``, cached per mesh.
+
+    Cached because it is the *input*, and because MeshLib's projector-style objects keep a raw
+    pointer to the cloud they are given -- a temporary is a segfault, not an exception (see
+    ``test_proximity.py``'s ``closest_point_on_mesh`` row).
+    """
+    if bench_case.mesh_name not in _cloud_ml_cache:
+        from meshlib import mrmeshnumpy as mn
+
+        _cloud_ml_cache[bench_case.mesh_name] = mn.pointCloudFromPoints(
+            np.ascontiguousarray(bench_case.vertices_np, dtype=np.float64)
+        )
+    return _cloud_ml_cache[bench_case.mesh_name]
+
+
+def _points_ml(bench_case: BenchCase) -> mm.std_vector_Vector3_float:
+    """Build the vertices as a MeshLib vector, cached: the fill is a per-point Python loop."""
+    if bench_case.mesh_name not in _points_ml_cache:
+        points_ml = mm.std_vector_Vector3_float()
+        for point_np in bench_case.vertices_np:
+            points_ml.append(mm.Vector3f(*point_np.tolist()))
+        _points_ml_cache[bench_case.mesh_name] = points_ml
+    return _points_ml_cache[bench_case.mesh_name]
+
+
 @pytest.mark.benchmark(group="principal_axes")
-@pytest.mark.benchlibs("triwarp", "pyvista")
+@pytest.mark.benchlibs("triwarp", "pyvista", "meshlib")
 def test_principal_axes(bench_case: BenchCase) -> None:
-    """Principal frame: centroid reduction, centred scatter, then one 3x3 SVD."""
+    """
+    Principal frame: centroid reduction, centred scatter, then one 3x3 SVD.
+
+    meshlib splits the same work across two calls -- ``accumulatePoints`` builds the scatter matrix
+    and ``getCenteredCovarianceEigen`` decomposes it -- and only the pair is comparable, so both are
+    inside the timed callable. The ``std_vector_Vector3_float`` the accumulator consumes is *not*:
+    filling it is a per-point Python loop, which is the input rather than the fit.
+    """
+    if bench_case.kind == "meshlib":
+        skip_larger_than(bench_case, "bunny_decimated", _HOST_CAP_REASON)
+        points_ml = _points_ml(bench_case)
+
+        def principal_axes_ml() -> mm.Vector3d:
+            accumulator_ml = mm.PointAccumulator()
+            mm.accumulatePoints(accumulator_ml, points_ml)
+            centroid_ml, eigenvectors_ml = mm.Vector3d(), mm.Matrix3d()
+            eigenvalues_ml = mm.Vector3d()
+            accumulator_ml.getCenteredCovarianceEigen(centroid_ml, eigenvectors_ml, eigenvalues_ml)
+            return eigenvalues_ml
+
+        assert bench_case.run(principal_axes_ml).z > 0.0
+        return
     if bench_case.kind == "triwarp":
         points = bench_case.vertices_wp
         rotation, eigenvalues, centroid = bench_case.run(lambda: tw.points.principal_axes(points))
@@ -235,7 +288,7 @@ def test_principal_axes(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="fit_plane")
-@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab", "pyvista")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pymeshlab", "pyvista", "meshlib")
 def test_fit_plane(bench_case: BenchCase) -> None:
     """
     Least-squares plane: centroid reduction, centred covariance, then the smallest-sigma axis.
@@ -245,6 +298,19 @@ def test_fit_plane(bench_case: BenchCase) -> None:
     centre is *not* the centroid, which is why only the normal is compared
     (``tests/test_points.py``).
     """
+    if bench_case.kind == "meshlib":
+        # The same accumulator as the principal_axes row, read through getBestPlanef instead: it is
+        # the cheaper half, since the plane needs no eigen-decomposition of its own.
+        skip_larger_than(bench_case, "bunny_decimated", _HOST_CAP_REASON)
+        points_ml = _points_ml(bench_case)
+
+        def fit_plane_ml() -> mm.Plane3f:
+            accumulator_ml = mm.PointAccumulator()
+            mm.accumulatePoints(accumulator_ml, points_ml)
+            return accumulator_ml.getBestPlanef()
+
+        assert abs(bench_case.run(fit_plane_ml).n.length() - 1.0) < 1e-5
+        return
     if bench_case.kind == "pyvista":
         skip_larger_than(bench_case, "bunny_decimated", _HOST_CAP_REASON)
         points_np = bench_case.vertices_np
@@ -360,11 +426,26 @@ def _cloud_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
 
 @pytest.mark.benchmark(group="estimate_normals_knn")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "open3d", "pymeshlab", "meshlib")
 def test_estimate_normals_knn(bench_case: BenchCase) -> None:
-    """Neighbour search plus PCA — what open3d's ``estimate_normals`` does in one call."""
+    """
+    Neighbour search plus PCA -- what open3d's ``estimate_normals`` does in one call.
+
+    meshlib's ``makeUnorientedNormals`` searches by **radius** where the other three take a
+    neighbour count, so its row is given the radius that holds ``_KNN`` points at this cloud's
+    density (2 mean spacings) rather than a count; the two see the same neighbourhood only where the
+    cloud is uniform, which is what the agreement in ``tests/test_points.py`` is measured on. It is
+    also the only row here that returns a *new* array rather than writing into the cloud, so nothing
+    is mutated and one cloud serves every round.
+    """
     if bench_case.mesh_name == "sphere_large":
         pytest.skip("open3d searches one point at a time; capped at sphere_med")
+    if bench_case.kind == "meshlib":
+        cloud_ml = _cloud_ml(bench_case)
+        radius = 2.0 * bench_case.mean_edge
+        normals_ml = bench_case.run(lambda: mm.makeUnorientedNormals(cloud_ml, radius))
+        assert normals_ml.size() == bench_case.n_vertices
+        return
     if bench_case.kind == "pymeshlab":
         # The same search-plus-PCA in one call, at the same ``k``; ``smoothiter=0`` keeps it to that
         # and leaves out the orientation propagation triwarp does not do either. A *point-cloud*

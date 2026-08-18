@@ -724,6 +724,13 @@ all measured:
   (`PointCloudRelaxParams` vs `MeshRelaxParams`). One `getAllComponents` form returns a
   `(components, count)` **tuple** rather than the vector. Resolve the overload explicitly and assert
   the result's type or count before comparing, so a future rebinding cannot quietly pick the other.
+- **`findOutliers`' default mask segfaults on a cloud with no normals.**
+  `FindOutliersParams.mask` defaults to `OutlierTypeMask.All`, which includes `AwayNormal`, and that
+  criterion dereferences the cloud's normals — measured as a `SIGSEGV` with no exception on a
+  415-point cloud built by `pointCloudFromPoints`. The other three modes (`SmallComponents`,
+  `WeaklyConnected`, `FarSurface`) run fine without normals. Set the mode explicitly, or supply
+  normals; and note the same rule as the other normal-consuming functions listed under
+  `points_to_meshlib`.
 - **A projector stores a raw pointer to the mesh or cloud it was given, so a temporary segfaults.**
   `PointsToMeshProjector.updateMeshData(build_a_mesh())` and
   `PointsProjector.setPointCloud(build_a_cloud())` both return normally and then read freed memory

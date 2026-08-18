@@ -6,12 +6,19 @@ import pyvista as pv
 import trimesh.geometry as tm_geometry
 import trimesh.points as tm
 import warp as wp
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 
 import triwarp.neighbors as tw_neighbors
 import triwarp.points as tw
 import triwarp.typing as twt
 from tests.comparisons import assert_same_up_to_sign
-from tests.conversions import points_to_open3d, points_to_pymeshlab
+from tests.conversions import (
+    meshlib_bitset_to_numpy,
+    points_to_meshlib,
+    points_to_open3d,
+    points_to_pymeshlab,
+)
 
 
 def _fibonacci_sphere(n: int) -> np.ndarray:
@@ -145,6 +152,103 @@ def test_principal_axes(device: str) -> None:
         np.array(eigenvalues_wp), np.linalg.eigvalsh(scatter_np)[::-1], rtol=1e-5, atol=1e-5
     )
     assert np.allclose(np.array(centroid_wp), points_np.mean(axis=0), rtol=1e-5, atol=1e-5)
+
+
+def _point_accumulator_ml(points_np: np.ndarray) -> mm.PointAccumulator:
+    """
+    Accumulate a NumPy cloud into a ``PointAccumulator``, the object behind both fitting oracles.
+
+    ``accumulatePoints`` takes a ``std_vector_Vector3_float``, so the fill is a per-point Python
+    loop -- fine at test size, and the reason neither of these pairs carries a benchmark row of its
+    own beyond the ones already there.
+    """
+    accumulator_ml = mm.PointAccumulator()
+    points_ml = mm.std_vector_Vector3_float()
+    for point_np in np.asarray(points_np, dtype=np.float64):
+        points_ml.append(mm.Vector3f(*point_np.tolist()))
+    mm.accumulatePoints(accumulator_ml, points_ml)
+    return accumulator_ml
+
+
+@pytest.mark.parity("fit_plane", "meshlib")
+def test_fit_plane_matches_meshlib(device: str) -> None:
+    """
+    Class B (sign gauge only): ``PointAccumulator.getBestPlanef`` is the same least-squares plane.
+
+    The transform is the *representation*: MeshLib returns a ``Plane3f`` -- a unit normal and an
+    offset ``d`` -- where triwarp returns a centroid and a normal, so the comparison is the normal
+    up to sign (both are the smallest-eigenvalue covariance eigenvector, whose direction neither
+    library fixes) plus the plane equation ``n . c == d`` evaluated at triwarp's centroid.
+
+    Measured on an anisotropic 500-point cloud: ``|dot| = 1.0000000`` to seven digits, which is
+    tighter than the trimesh and MeshLab pairings above and is why this is the one asserted at
+    ``1e-6``. The offset check is what makes it a plane comparison rather than a direction one --
+    a fit that found the right orientation through the wrong point would pass the dot alone.
+    """
+    rng = np.random.default_rng(3)
+    points_np = (rng.standard_normal((500, 3)) @ np.diag([3.0, 1.0, 0.2])) + np.array(
+        [2.0, -1.0, 0.5]
+    )
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    centroid_wp, normal_wp = tw.fit_plane(points_wp)
+
+    plane_ml = _point_accumulator_ml(points_np).getBestPlanef()
+    normal_ml = np.array([plane_ml.n.x, plane_ml.n.y, plane_ml.n.z], dtype=np.float64)
+
+    assert np.isclose(np.linalg.norm(normal_ml), 1.0, atol=1e-6)  # non-vacuity: a real plane
+    assert np.isclose(
+        abs(float(np.dot(np.array(centroid_wp), normal_ml)) - plane_ml.d), 0.0, atol=1e-4
+    )
+    assert np.isclose(abs(float(np.dot(np.array(normal_wp), normal_ml))), 1.0, atol=1e-6)
+
+
+@pytest.mark.parity("principal_axes", "meshlib")
+def test_principal_axes_matches_meshlib(device: str) -> None:
+    """
+    Class B: the same eigen-decomposition, reported in the **opposite** order.
+
+    ``getCenteredCovarianceEigen`` is an out-parameter call -- it takes a centroid, a ``Matrix3``
+    and an eigenvalue vector to fill and returns a ``bool`` -- and it orders its eigenvalues
+    **ascending** where triwarp orders them descending, so the named transform is a reversal plus
+    the per-axis sign every eigenvector comparison needs. Measured on a 500-point anisotropic cloud
+    the eigenvalues agree to 4 digits (4542.72 / 538.20 / 19.62 on both sides, reversed) and each
+    axis matches to ``|dot| = 1``.
+
+    Its eigenvalues are of the *scatter* matrix, carrying no ``1/n``, which is triwarp's convention
+    too -- so this pins that convention against a second library, where the pyvista pairing above
+    pins the axes alone.
+    """
+    rng = np.random.default_rng(4)
+    points_np = (rng.standard_normal((500, 3)) @ np.diag([3.0, 1.0, 0.2])) + np.array(
+        [2.0, -1.0, 0.5]
+    )
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    rotation_wp, eigenvalues_wp, centroid_wp = tw.principal_axes(points_wp)
+
+    centroid_ml = mm.Vector3d()
+    eigenvectors_ml = mm.Matrix3d()
+    eigenvalues_ml = mm.Vector3d()
+    assert _point_accumulator_ml(points_np).getCenteredCovarianceEigen(
+        centroid_ml, eigenvectors_ml, eigenvalues_ml
+    )
+
+    axes_ml = np.array(
+        [
+            [eigenvectors_ml.x.x, eigenvectors_ml.x.y, eigenvectors_ml.x.z],
+            [eigenvectors_ml.y.x, eigenvectors_ml.y.y, eigenvectors_ml.y.z],
+            [eigenvectors_ml.z.x, eigenvectors_ml.z.y, eigenvectors_ml.z.z],
+        ]
+    )[::-1]  # ascending -> descending
+    values_ml = np.array([eigenvalues_ml.x, eigenvalues_ml.y, eigenvalues_ml.z])[::-1]
+
+    assert values_ml[0] > values_ml[1] > values_ml[2] > 0.0  # non-vacuity: a separated spectrum
+    assert np.allclose(
+        np.array(centroid_wp), [centroid_ml.x, centroid_ml.y, centroid_ml.z], atol=1e-4
+    )
+    assert np.allclose(np.array(eigenvalues_wp), values_ml, rtol=1e-4, atol=1e-4)
+    rotation_np = np.array(rotation_wp).reshape(3, 3)
+    for row in range(3):
+        assert np.isclose(abs(float(np.dot(rotation_np[row], axes_ml[row]))), 1.0, atol=1e-4)
 
 
 def test_principal_axes_is_not_fit_line(device: str) -> None:
@@ -520,6 +624,43 @@ def test_estimate_normals_matches_open3d(device: str) -> None:
     assert_same_up_to_sign(normals_wp.numpy(), normals_pml, atol=1e-5)
 
 
+@pytest.mark.parity("estimate_normals_knn", "meshlib")
+def test_estimate_normals_matches_meshlib(device: str) -> None:
+    """
+    Class B (sign gauge): ``makeUnorientedNormals`` is the same PCA under a *radius* search.
+
+    The named transform is the neighbourhood: MeshLib searches by **radius** where triwarp is given
+    a k-nearest table, so the two see the same points only where the cloud is uniform -- which is
+    what the Fibonacci sphere is for. Measured there: minimum ``|dot|`` **0.99966** at a radius of
+    1.5 mean spacings and **0.99945** at 3.0, i.e. every one of 2 000 normals agrees, and the result
+    is insensitive to the radius over a factor of two.
+
+    ``makeOrientedNormals`` is the oriented sibling and fixes the sign by propagating over a
+    spanning structure; on a closed cloud it agrees with the outward radial direction on **100 %**
+    of points, which is the assert below. That is the half triwarp's ``orient_reference`` does with
+    a single reference vector instead, and the two are compared here for the first time.
+    """
+    knn = 30
+    points_np = _fibonacci_sphere(2000)
+    spacing = float(np.sqrt(4.0 * np.pi / points_np.shape[0]))
+
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    neighbor_idx_wp, _distances_wp = tw_neighbors.query_bvh_nearest(points_wp, points_wp, k=knn)
+    normals_wp = tw.estimate_normals(points_wp, neighbor_idx_wp).numpy()
+
+    cloud_ml = points_to_meshlib(points_np)
+    for radius_scale in (1.5, 3.0):
+        unoriented_ml = mm.makeUnorientedNormals(cloud_ml, radius_scale * spacing)
+        normals_ml = mn.toNumpyArray(unoriented_ml)
+        assert normals_ml.shape == points_np.shape  # non-vacuity: one normal per point
+        assert np.abs(np.einsum("ij,ij->i", normals_wp, normals_ml)).min() > 0.999
+
+    # The oriented form, against triwarp's outward reference: both point away from the centre.
+    oriented_ml = mm.makeOrientedNormals(cloud_ml, 2.0 * spacing)
+    outward_np = points_np / np.linalg.norm(points_np, axis=1, keepdims=True)
+    assert (np.einsum("ij,ij->i", mn.toNumpyArray(oriented_ml), outward_np) > 0.0).all()
+
+
 def test_estimate_normals_orientation(device: str) -> None:
     # Small negative slack: the kernel enforces the sign in float32, so a float64
     # recomputation can dip just below zero at a zero-crossing.
@@ -669,6 +810,64 @@ def test_statistical_outlier_mask_matches_open3d(device: str) -> None:
     _idx, neighbor_distance_wp = tw_neighbors.query_bvh_nearest(points_wp, points_wp, k=k)
     outlier_wp = tw.statistical_outlier_mask(neighbor_distance_wp, std_ratio=std_ratio)
     assert np.array_equal(outlier_wp.numpy().astype(bool), outlier_o3d)
+
+
+@pytest.mark.parity(
+    "statistical_outlier_mask",
+    "meshlib",
+    benchmarked=False,
+    reason="findOutliers is a different criterion, not a different tuning: its four modes are "
+    "connectivity- and normal-based (SmallComponents, WeaklyConnected, FarSurface, AwayNormal) "
+    "where statistical_outlier_mask is a z-score on the k-NN mean distance, and it takes a radius "
+    "where triwarp takes a neighbour count. Timing them against each other would price two "
+    "different questions -- measured on a planted cloud, SmallComponents flags 26 points to "
+    "triwarp's 13 while both contain all 15 planted outliers. open3d's remove_statistical_outlier "
+    "is the same z-score and carries the timed row; the comparison here is what MeshLib can still "
+    "say about the answer.",
+)
+def test_statistical_outlier_mask_matches_meshlib(device: str) -> None:
+    """
+    Class C (recall and containment): MeshLib's criterion is stricter, and strictly wider.
+
+    ``findOutliers`` with ``OutlierTypeMask.SmallComponents`` labels a point an outlier when its
+    connected component under a radius graph is small, which is a different question from a z-score
+    on the k-NN mean distance -- so there is no correspondence to compare and the statistic is what
+    each finds. On the planted cloud both find **all 15** seeded outliers, and triwarp's 13 flagged
+    points are a **subset** of MeshLib's 26: it is the more conservative of the two, with zero false
+    positives against MeshLib's 11.
+
+    **Bug class excluded:** a detector that flags the wrong points, or flags on the wrong scale --
+    containment is what a looser threshold cannot fake, since a mask that grew arbitrarily would
+    break the subset relation in the other direction. **Mutation probe, measured:** shuffling
+    triwarp's mask drops the element-wise agreement from 0.969 to 0.906 -- too thin a margin to
+    assert on, which is exactly why the assert is recall plus containment rather than agreement.
+
+    **The default mask is unusable and crashes**: ``FindOutliersParams.mask`` defaults to ``All``,
+    which includes ``AwayNormal``, and that criterion **segfaults** on a cloud carrying no normals
+    -- no exception, no traceback. The mode is always set explicitly here.
+    """
+    k, std_ratio = 20, 2.0
+    points_np = _cloud_with_outliers()
+    n_outliers = 15
+    planted_np = np.zeros(points_np.shape[0], dtype=bool)
+    planted_np[-n_outliers:] = True
+
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    _idx_wp, neighbor_distance_wp = tw_neighbors.query_bvh_nearest(points_wp, points_wp, k=k)
+    outlier_wp = tw.statistical_outlier_mask(neighbor_distance_wp, std_ratio=std_ratio).numpy()
+
+    cloud_ml = points_to_meshlib(points_np)
+    params_ml = mm.FindOutliersParams()
+    params_ml.radius = 1.0
+    params_ml.mask = mm.OutlierTypeMask.SmallComponents  # ``All`` segfaults without normals
+    outlier_ml = meshlib_bitset_to_numpy(mm.findOutliers(cloud_ml, params_ml), points_np.shape[0])
+
+    assert (
+        outlier_ml.sum() < 0.1 * points_np.shape[0]
+    )  # non-vacuity: not "everything is an outlier"
+    assert (outlier_ml & planted_np).sum() == n_outliers  # the reference found every planted one
+    assert (outlier_wp & planted_np).sum() >= n_outliers - 2
+    assert (outlier_wp & ~outlier_ml).sum() == 0  # triwarp's set is contained in MeshLib's
 
 
 def test_statistical_outlier_mask_empty(device: str) -> None:

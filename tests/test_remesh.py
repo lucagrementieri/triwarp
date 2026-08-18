@@ -895,8 +895,8 @@ def test_quadric_decimate_matches_meshlib_quality(device: str, target_faces: int
     ``maxDeletedFaces = n_faces - target_faces``; fed that, it lands on exactly the requested count
     on both targets here, as triwarp does. ``packMesh=True`` is required to read the result at all
     -- without it ``getNumpyFaces`` returns the pre-decimation buffer padded with degenerate
-    ``[0, 0, 0]`` rows, which is the hazard [`meshlib_to_trimesh`][tests.conversions.meshlib_to_trimesh]
-    exists for.
+    ``[0, 0, 0]`` rows, which is the hazard
+    [`meshlib_to_trimesh`][tests.conversions.meshlib_to_trimesh] exists for.
 
     There is no correspondence between the outputs -- two greedy quadric solvers with different
     tie-breaking pick different collapses -- so the comparison is the deviation from the *input*

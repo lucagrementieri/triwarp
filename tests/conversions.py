@@ -385,7 +385,9 @@ def points_to_meshlib(points_np: np.ndarray, normals_np: np.ndarray | None = Non
 
     Several oracles read the normals and quietly do something else without them --
     ``makeOrientedNormals``, ``triangulatePointCloud`` and ``findOutliers`` all consult
-    ``cloud.normals`` -- so pass them whenever the triwarp side had them.
+    ``cloud.normals`` -- so pass them whenever the triwarp side had them. ``findOutliers`` does
+    worse than quietly: at its default ``mask`` of ``All`` it **segfaults** on a cloud with no
+    normals, because that set includes the ``AwayNormal`` criterion.
     """
     if normals_np is None:
         return mn.pointCloudFromPoints(np.ascontiguousarray(points_np))
