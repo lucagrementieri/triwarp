@@ -533,7 +533,7 @@ def filter_implicit_fairing(
     cotangent stiffness matrix ([`cotmatrix`][triwarp.laplacian.cotmatrix]) and ``M`` the
     barycentric lumped mass matrix ([`mass_matrix`][triwarp.laplacian.mass_matrix]), both recomputed
     from the current geometry. This is the most accurate of the smoothing filters (curvature flow;
-    libigl tutorial 205, MeshLib ``Laplacian`` in cotangent mode) and is **CUDA only** (raises on
+    libigl tutorial 205) and is **CUDA only** (raises on
     CPU). The solve uses ``float64`` throughout.
 
     On a mesh with an open boundary the flow needs a boundary condition, which is what
@@ -762,9 +762,9 @@ def smooth_region_fixed_rim(
     """
     Reposition a free vertex region as the umbrella-Laplacian solution with a sharp fixed boundary.
 
-    Ports MeshLib ``positionVertsSmoothlySharpBd``: the free vertices (``free_mask``) are moved to
-    the solution of the graph-Laplacian Dirichlet system ``(D - W) x = b`` (unit edge weights),
-    where the fixed one-ring neighbours are folded into ``b``, so the region rim stays sharp
+    The free vertices (``free_mask``) are moved to the solution of the graph-Laplacian Dirichlet
+    system ``(D - W) x = b`` (unit edge weights), where the fixed one-ring neighbours are folded
+    into ``b``, so the region rim stays sharp
     (a hard C⁰ constraint). Fixed vertices keep their positions.
 
     Parameters
@@ -861,10 +861,9 @@ def smooth_region(
     """
     Reposition a free vertex region so the surface is smooth across the region boundary too.
 
-    Ports MeshLib ``positionVertsSmoothly`` (the ``Laplacian`` least-squares solve with
-    ``RememberShape::No``): every vertex in the region and its first fixed ring contributes the
-    umbrella equation ``p_v = Σ_d (w_vd / ΣW) p_d``; free vertices are unknowns and fixed
-    neighbours move to the right-hand side. The normal equations ``(MᵀM) x = Mᵀ b`` are solved per
+    Every vertex in the region and its first fixed ring contributes the umbrella equation
+    ``p_v = Σ_d (w_vd / ΣW) p_d``; free vertices are unknowns and fixed neighbours move to the
+    right-hand side. The normal equations ``(MᵀM) x = Mᵀ b`` are solved per
     coordinate, giving a patch that is smooth (C¹) *across* the region rim, unlike the sharp-rim
     [`smooth_region_fixed_rim`][triwarp.smoothing.smooth_region_fixed_rim].
 
@@ -1015,8 +1014,6 @@ def refine_and_smooth_region(
     """
     Subdivide the patch and smooth its new vertices.
 
-    Ports MeshLib ``subdivideFillingNicely`` + ``smoothFillingNicely``.
-
     Shared finisher of [`fill_smooth`][triwarp.holes.fill_smooth] and
     [`stitch_smooth`][triwarp.combine.stitch_smooth].
     """
@@ -1069,7 +1066,7 @@ def refine_and_smooth_region(
 def _boundary_verts_mask(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
 ) -> wp.array[wp.bool]:
-    """Length-``n_vertices`` mask of mesh-boundary vertices (MeshLib ``findBdVerts``)."""
+    """Length-``n_vertices`` mask of mesh-boundary vertices."""
     device = faces.device
     n = int(vertices.shape[0])
     boundary = tw.boundary.boundary_vertex_indices(vertices, faces)

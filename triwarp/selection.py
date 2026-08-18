@@ -19,8 +19,6 @@ def region_boundary_edges(
     """
     Interior edges on the boundary of a face region.
 
-    Ports MeshLib ``findRegionBoundaryUndirectedEdgesInsideMesh``.
-
     Returns the undirected edges that have exactly two incident faces, exactly one of which is in
     ``face_mask`` — i.e. the interior seam separating the region from the rest of the mesh (mesh
     boundary edges, with a single incident face, are excluded).
@@ -45,8 +43,9 @@ def region_boundary_edges(
 
     Notes
     -----
-    The same erosion as MeshLib's ``shrink``. MeshLab's Erode Selection is a *face*-based
-    operation and gives a different answer; see ``benchmarks/test_selection.py``.
+    Erosion here is vertex-based: a vertex survives when every 1-ring neighbour is also in the
+    mask. MeshLab's Erode Selection is a *face*-based operation and gives a different answer; see
+    ``benchmarks/test_selection.py``.
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
@@ -78,8 +77,6 @@ def exclude_fully_selected_components(
 ) -> wp.array[wp.bool]:
     """
     Drop selected vertices whose entire connected component is selected.
-
-    Ports MeshLib ``excludeFullySelectedComponents``.
 
     A vertex-connected component that is wholly inside ``mask`` would make a region-smoothing
     Dirichlet system singular (no fixed anchor), so those components are removed from the
@@ -452,7 +449,7 @@ def expand_vertex_mask(
 
     Notes
     -----
-    The same dilation as MeshLib's ``expand``.
+    Dilation is vertex-based: a vertex enters the mask when any 1-ring neighbour is in it.
 
     The per-round ``wp.clone`` is not worth removing. The kernel only *sets* bits, so each round
     must start from a copy of the previous mask; ping-ponging two preallocated buffers would keep
@@ -515,8 +512,9 @@ def shrink_vertex_mask(
 
     Notes
     -----
-    The same erosion as MeshLib's ``shrink``. MeshLab's Erode Selection is a *face*-based
-    operation and gives a different answer; see ``benchmarks/test_selection.py``.
+    Erosion here is vertex-based: a vertex survives when every 1-ring neighbour is also in the
+    mask. MeshLab's Erode Selection is a *face*-based operation and gives a different answer; see
+    ``benchmarks/test_selection.py``.
     """
     device = mask.device
     n = int(mask.shape[0])

@@ -11,8 +11,9 @@ from triwarp.kernels.predicates import (
     triangle_double_area,
 )
 
-# Big-but-finite penalty (MeshLib ``BadTriangulationMetric``): lets the DP keep a bad triangulation
-# rather than break entirely, while staying below ``float`` precision limits when summed.
+# Big-but-finite penalty for a triangulation the metric rejects: lets the DP keep a bad
+# triangulation rather than break entirely, while staying below ``float`` precision limits
+# when summed.
 BAD_METRIC = wp.constant(wp.float32(1e10))
 
 # Fill-metric selectors for ``triangle_fill_metric`` / ``fill_edge_term`` / ``fill_dp_span``.
@@ -107,7 +108,7 @@ def loop_centroids(
 
 @wp.func
 def min_triangle_angle_sin(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.float32:
-    # sin of smallest angle = shortest edge / circumcircle diameter (MeshLib minTriangleAngleSin).
+    # sin of the smallest angle = shortest edge / circumcircle diameter.
     ab = wp.length(b - a)
     ca = wp.length(a - c)
     bc = wp.length(c - b)
@@ -141,13 +142,13 @@ def triangle_fill_metric(
         aspect_ratio = triangle_aspect_ratio(a, b, c)
         if aspect_ratio > BAD_METRIC:
             return BAD_METRIC
-        # 1e2 == MeshLib's empirical ``TriangleAreaModifier``; char_area == 1 / maxEdgeLengthSq.
+        # 1e2 is the empirical area weight; char_area == 1 / maxEdgeLengthSq.
         return aspect_ratio + 100.0 * triangle_double_area(a, b, c) * char_area
     if metric_id == METRIC_PLANE:
         if wp.dot(plane_normal, wp.cross(b - a, c - a)) < 0.0:
             return BAD_METRIC
         return circumcircle_diameter(a, b, c)
-    # METRIC_PLANE_NORMALIZED (default, MeshLib getPlaneNormalizedFillMetric): penalize triangles
+    # METRIC_PLANE_NORMALIZED (the default): penalize triangles
     # flipped or tilted > 60 degrees off the hole plane, and thin slivers.
     face_norm = wp.cross(b - a, c - a)
     face_dbl_area_sq = wp.length_sq(face_norm)
@@ -167,7 +168,7 @@ def fill_edge_term(
     a: wp.vec3, b: wp.vec3, lft: wp.vec3, rgt: wp.vec3, metric_id: wp.int32
 ) -> wp.float32:
     # Per-edge term for edge a->b, with opposite apexes lft (left) and rgt (right); 0 for the
-    # triangle-only metrics. Ports the ``edgeMetric`` lambdas in MeshLib ``MRMeshMetrics.cpp``.
+    # triangle-only metrics.
     if metric_id == METRIC_EDGE_LENGTH:
         return wp.length(b - a)
     ab = b - a
@@ -203,7 +204,7 @@ def combine_metric(accumulated: wp.float32, term: wp.float32, combine_id: wp.int
 
 @wp.func
 def char_area_from_max(max_edge_sq: wp.float32) -> wp.float32:
-    # MeshLib's ``char_area`` scale for the complex-fill metric: 1 / maxEdgeLengthSq, or 1 for a
+    # Characteristic-area scale for the complex-fill metric: 1 / maxEdgeLengthSq, or 1 for a
     # fully degenerate rim.
     if max_edge_sq > 0.0:
         return 1.0 / max_edge_sq
@@ -594,7 +595,7 @@ def mark_forbidden_chords(
     out_mask: wp.array[wp.int32],
 ) -> None:
     # Chords (non-adjacent loop positions) that already exist as mesh edges are forbidden
-    # (MeshLib MultipleEdgesResolveMode::Simple). Idempotent writes: no atomics needed. One pass
+    # outright, rather than re-routed. Idempotent writes: no atomics needed. One pass
     # over the whole mesh marks the masks of *all* loops, because ``flat_slot`` distinguishes them:
     # an edge whose endpoints land in two different loops is not a chord of either.
     e = wp.int32(wp.tid())

@@ -343,8 +343,7 @@ def remove_non_manifold_faces(
 
     Each pass keeps only faces whose three edges are each used by at most two faces
     ([`edge_manifold_mask`][triwarp.validation.edge_manifold_mask]); dropping a face can make a
-    neighbour manifold, so it repeats up to ``max_iter`` times (matching MeshLib's bounded
-    hole-complicating-face removal loop).
+    neighbour manifold, so it repeats up to ``max_iter`` times.
 
     Parameters
     ----------

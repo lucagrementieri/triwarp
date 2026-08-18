@@ -1,9 +1,10 @@
 """
 Precision-generic geometric predicates and the small triangle quantities they share.
 
-Most are ports of MeshLib ``MRTriMath.h`` / ``MRReducePath``, and they were duplicated three times
-before this module existed: a ``float32`` set in ``kernels/reconstruction.py``, a byte-equivalent
-``float64`` set in ``kernels/remesh.py``, and a third partial copy in ``kernels/holes.py``. Each
+These are the standard triangle quantities -- double area, circumcircle and minimum-enclosing-
+circle diameters, aspect ratio, dihedral angle -- and they were duplicated three times before this
+module existed: a ``float32`` set in ``kernels/reconstruction.py``, a byte-equivalent ``float64``
+set in ``kernels/remesh.py``, and a third partial copy in ``kernels/holes.py``. Each
 `@wp.func` here is generic over the scalar type, so one definition instantiates at whatever
 precision the calling kernel uses.
 
@@ -51,7 +52,7 @@ def triangle_normal(a: Any, b: Any, c: Any):
 
 @wp.func
 def triangle_double_area(a: Any, b: Any, c: Any) -> wp.Float:
-    # Twice the area of triangle ABC (MeshLib ``dblArea``): the norm of the edge cross product.
+    # Twice the area of triangle ABC: the norm of the edge cross product.
     # Kept undivided because most callers either compare it against zero or fold the half into a
     # constant of their own.
     return wp.length(wp.cross(b - a, c - a))
@@ -66,8 +67,8 @@ def triangle_aabb(a: Any, b: Any, c: Any):
 
 @wp.func
 def vector_angle(a: Any, b: Any) -> wp.Float:
-    # Unsigned angle in [0, pi] between two vectors (MeshLib ``MRVector3.h`` ``angle``), as
-    # ``atan2(|a x b|, a . b)`` rather than ``acos(a . b)``.
+    # Unsigned angle in [0, pi] between two vectors, as ``atan2(|a x b|, a . b)`` rather than
+    # ``acos(a . b)``.
     #
     # The atan2 form is the accurate one and the reason this is the single spelling in the tree.
     # ``acos`` has an infinite derivative at +-1, so for nearly-parallel vectors -- the *common*
@@ -87,7 +88,7 @@ def vector_angle(a: Any, b: Any) -> wp.Float:
 
 @wp.func
 def dihedral_angle(left_normal: Any, right_normal: Any, edge_vector: Any) -> wp.Float:
-    # Signed angle between the two face normals about the shared edge (MeshLib ``dihedralAngle``).
+    # Signed angle between the two face normals about the shared edge.
     edge_direction = wp.normalize(edge_vector)
     sine = wp.dot(edge_direction, wp.cross(left_normal, right_normal))
     cosine = wp.dot(left_normal, right_normal)
@@ -96,7 +97,7 @@ def dihedral_angle(left_normal: Any, right_normal: Any, edge_vector: Any) -> wp.
 
 @wp.func
 def circumcircle_diameter_sq(a: Any, b: Any, c: Any) -> wp.Float:
-    # MRTriMath.h ``circumcircleDiameterSq``: squared diameter of triangle ABC's circumcircle.
+    # Squared diameter of triangle ABC's circumcircle.
     # A zero-length side collapses to the opposite side; zero area means no circumcircle at all.
     ab = wp.length_sq(b - a)
     ca = wp.length_sq(a - c)
@@ -134,8 +135,8 @@ def delone_metrics(a: Any, b: Any, c: Any, d: Any):
 
 @wp.func
 def mincircle_diameter_sq(a: Any, b: Any, c: Any) -> wp.Float:
-    # MRTriMath.h ``minCircleDiameterSq``: for an obtuse triangle the smallest enclosing circle is
-    # the one on the longest side, otherwise it is the circumcircle.
+    # Squared diameter of the smallest circle enclosing triangle ABC: for an obtuse triangle that
+    # is the circle on the longest side, otherwise it is the circumcircle.
     ab = wp.length_sq(b - a)
     ca = wp.length_sq(a - c)
     bc = wp.length_sq(c - b)
@@ -153,8 +154,8 @@ def mincircle_diameter_sq(a: Any, b: Any, c: Any) -> wp.Float:
 
 @wp.func
 def triangle_aspect_ratio(a: Any, b: Any, c: Any) -> wp.Float:
-    # MRTriMath.h ``triangleAspectRatio``: circum-radius over twice the in-radius. Grows without
-    # bound for slivers, so a degenerate triangle returns +inf.
+    # Circum-radius over twice the in-radius. Grows without bound for slivers, so a degenerate
+    # triangle returns +inf.
     bc = wp.length(c - b)
     ca = wp.length(a - c)
     ab = wp.length(b - a)
@@ -169,8 +170,8 @@ def triangle_aspect_ratio(a: Any, b: Any, c: Any) -> wp.Float:
 
 @wp.func
 def unfold_on_plane(b: Any, c: Any, d: Any, to_left: wp.bool):
-    # MRReducePath.cpp ``unfoldOnPlane``: place ``c`` in the plane relative to the already-placed
-    # 2D point ``d``, preserving the angle and length of the 3D pair (b, c).
+    # Place ``c`` in the plane relative to the already-placed 2D point ``d``, preserving the angle
+    # and length of the 3D pair (b, c).
     dot_bc = wp.dot(b, c)
     cross_bc = wp.length(wp.cross(b, c))
     dd = wp.length_sq(d)
@@ -187,7 +188,7 @@ def unfold_on_plane(b: Any, c: Any, d: Any, to_left: wp.bool):
 
 @wp.func
 def line_isect(b: Any, c: Any, d: Any) -> wp.Float:
-    # MRReducePath.cpp ``lineIsect``: parameter along segment 0->B where it meets line C-D.
+    # Parameter along segment 0->B where it meets line C-D.
     c1 = cross2(d, c)
     c2 = cross2(c - b, d - b)
     zero = type(c1)(0.0)
@@ -204,15 +205,16 @@ def line_isect(b: Any, c: Any, d: Any) -> wp.Float:
 
 @wp.func
 def is_unfold_quadrangle_convex(a: Any, b: Any, c: Any, d: Any) -> wp.bool:
-    # MRReducePath ``isUnfoldQuadrangleConvex``: unfold triangles ABC and ACD into a common plane;
-    # the quadrangle is convex exactly when the shortest B->D path crosses diagonal AC strictly
-    # between A and C. ``wp.vector`` seeds B's 2D image at the caller's precision, which is how this
-    # stays generic despite mapping vec3 -> vec2 / vec3d -> vec2d.
+    # Unfold triangles ABC and ACD into a common plane; the quadrangle is convex exactly when the
+    # shortest B->D path crosses diagonal AC strictly between A and C. ``wp.vector`` seeds B's 2D
+    # image at the caller's precision, which is how this stays generic despite mapping
+    # vec3 -> vec2 / vec3d -> vec2d.
     unfold_b = wp.vector(wp.length(b - a), type(a[0])(0.0))
     unfold_c = unfold_on_plane(b - a, c - a, unfold_b, wp.bool(True))
     unfold_d = unfold_on_plane(c - a, d - a, unfold_c, wp.bool(True))
     x = line_isect(unfold_c, unfold_b, unfold_d)
-    # MeshLib clamps ``x`` to [0, 1] first; that cannot change this strict test, so it is dropped.
+    # Clamping ``x`` to [0, 1] first is a common formulation and cannot change this strict test,
+    # so it is dropped.
     return x > type(x)(0.0) and x < type(x)(1.0)
 
 

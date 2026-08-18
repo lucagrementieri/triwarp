@@ -10,7 +10,7 @@ from triwarp.kernels.triangles import corner_triple
 
 @wp.func
 def _corner_cotan(p: wp.vec3, q: wp.vec3, o: wp.vec3) -> wp.float32:
-    # Cotangent of the angle at corner ``o`` in triangle ``(o, p, q)`` (MeshLib leftCotan).
+    # Cotangent of the angle at corner ``o`` in triangle ``(o, p, q)``.
     a = p - o
     b = q - o
     cr = wp.length(wp.cross(a, b))
@@ -40,7 +40,7 @@ def edge_cotan_add(
 
 @wp.func
 def clamp_cotan(w: wp.float32) -> wp.float32:
-    # MeshLib clamps the summed cotangent edge weight (degenerate edges give arbitrarily high cot).
+    # The summed cotangent edge weight is clamped: a degenerate edge gives arbitrarily high cot.
     return wp.clamp(w, wp.float32(-1.0), wp.float32(10.0))
 
 

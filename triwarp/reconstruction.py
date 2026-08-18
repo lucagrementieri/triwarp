@@ -186,17 +186,16 @@ def triangulate_point_cloud(
     """
     Reconstruct a triangle mesh from an (optionally oriented) point cloud.
 
-    GPU port of MeshLib's ``triangulatePointCloud``
-    (``reference/MeshLib/source/MRMesh/MRPointCloudTriangulation.cpp``). Each point independently
-    builds a local triangle fan over its nearest neighbours in the tangent plane, greedily
+    Local-triangulation reconstruction, on the GPU. Each point independently builds a local
+    triangle fan over its nearest neighbours in the tangent plane, greedily
     optimised toward a Delaunay-like fan (``build_local_triangulations``); triangles that recur in
     two or three of these local triangulations are kept and assembled into a triangle-soup mesh
     (vertices are the input points). Non-manifold and degenerate faces are dropped and small
     boundary holes are filled.
 
-    Unlike MeshLib, orientation relies on **trusted normals** (the parallel
-    ``findRepeatedOrientedTriangles`` path): supply ``normals`` for arbitrary geometry, or leave
-    them ``None`` to estimate them by PCA oriented outward from the cloud centroid (valid for
+    Orientation relies on **trusted normals** rather than on a sequential propagation pass, which
+    is what keeps the assembly parallel: supply ``normals`` for arbitrary geometry, or leave them
+    ``None`` to estimate them by PCA oriented outward from the cloud centroid (valid for
     star-shaped clouds only — see [`estimate_normals`][triwarp.points.estimate_normals]).
 
     Parameters
@@ -220,7 +219,7 @@ def triangulate_point_cloud(
         ``kernels.reconstruction.MAX_NEIGHBOURS`` (the compile-time scratch size).
     crit_hole_length
         Boundary loops with perimeter at most this value are filled. When negative, defaults to
-        ``0.1 *`` the point-cloud bounding-box diagonal (matching MeshLib).
+        ``0.1 *`` the point-cloud bounding-box diagonal.
 
     Returns
     -------
@@ -238,8 +237,8 @@ def triangulate_point_cloud(
 
     Notes
     -----
-    The per-point fan is bounded by ``max_neighbours``; MeshLib's automatic radius increase is not
-    reproduced, so very sparse or highly non-uniform clouds may leave extra boundary holes.
+    The per-point fan is bounded by ``max_neighbours`` and the search radius is never grown
+    automatically, so very sparse or highly non-uniform clouds may leave extra boundary holes.
 
     See Also
     --------
@@ -308,8 +307,8 @@ def _repeated_oriented_triangles(
     Keep one oriented representative per candidate triangle repeated exactly ``repetitions`` times.
 
     Candidate triangles are grouped by their sorted (unoriented) vertex key; groups of the
-    requested size contribute their first oriented triangle. Mirrors MeshLib's
-    ``findRepeatedOrientedTriangles`` for the trusted-normal case.
+    requested size contribute their first oriented triangle. This is the trusted-normal case: the
+    orientation is taken from the candidates rather than propagated.
     """
     device = candidates.device
     n_candidates = int(candidates.shape[0])
@@ -1600,12 +1599,11 @@ def _clean_reconstruction(
     Shared reconstruction cleanup: dedup, drop degenerate/non-manifold, orient, fill small holes.
 
     Duplicate faces go first, then degenerate ones (which also compacts the vertex set), then faces
-    on non-manifold edges so the result is edge-manifold (MeshLib's ``findHoleComplicatingFaces``
-    loop) — required before boundary extraction, since both hole filling and ``boundary_loops``
-    assume a manifold boundary. ``crit_hole_length`` follows the public convention: ``0`` skips hole
-    filling, a negative value means ``0.1 x`` the point-cloud bounding-box diagonal (MeshLib
-    ``makeMesh_`` tail). ``orient=False`` keeps the incoming winding for callers that already have a
-    trusted orientation.
+    on non-manifold edges so the result is edge-manifold — required before boundary extraction,
+    since both hole filling and ``boundary_loops`` assume a manifold boundary. ``crit_hole_length``
+    follows the public convention: ``0`` skips hole filling, a negative value means ``0.1 x`` the
+    point-cloud bounding-box diagonal. ``orient=False`` keeps the incoming winding for callers
+    that already have a trusted orientation.
     """
     if int(faces.shape[0]) == 0:
         return wp.clone(points), faces

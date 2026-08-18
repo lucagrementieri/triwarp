@@ -753,14 +753,23 @@ terminable, non-transferable licence for "non-commercial, evaluation or educatio
 a separate commercial licence required otherwise, and an explicit bar on modifying or transferring
 the Software. That is a stronger constraint than libigl's `copyleft/` subtree or pymeshlab's GPL,
 because it restricts *use* rather than distribution, and triwarp itself ships `MIT OR Apache-2.0`.
-Two rules follow. **No triwarp code may be derived from `reference/MeshLib`** — read it to
-understand an algorithm's *interface* and its parameters, never to port its body; where a triwarp
-function was written against a MeshLib operation, name the **operation**, not a source file — four
-comments predate this rule and still cite `MRMeshDelone.cpp` / `MRMeshMetrics.cpp` / `MRTriMath.h`
-(`kernels/remesh.py`, `kernels/reconstruction.py`), which reads as a claim about provenance that
-the licence makes worth not making loosely; reword them to the operation when next touched. And
-**keep it a test/benchmark dependency only**: it appears in `tests/` and `benchmarks/`, never in
-`triwarp/`, and nothing in the shipped package imports it today — verified, keep it that way.
+Two rules follow, and `triwarp/` currently satisfies both — **keep it that way**, because both are
+one careless docstring away from being false again.
+
+**Nothing under `triwarp/` may name MeshLib at all.** Not the library, not a function
+(`fillHole`, `positionVertsSmoothly`, `triangleAspectRatio`), not a source file (`MRMeshDelone.cpp`,
+`MRTriMath.h`, `MRMeshMetrics.cpp`). 89 such references were removed in one pass across 19 files;
+they had accumulated as ordinary attribution and collectively read as a claim that a package shipped
+under `MIT OR Apache-2.0` is derived from a proprietary one. Describe what the code **computes**, or
+name the algorithm in the literature's vocabulary — "the Liepa/Klincsek interval DP", "the Delone
+empty-circumcircle test", "circum-radius over twice the in-radius" — which is what a reader needed
+anyway and what §10 asks for independently. Read `reference/MeshLib` to understand an operation's
+*interface* and its parameters; never to port its body.
+
+**Keep it a test/benchmark dependency.** It belongs in `tests/` and `benchmarks/`, where naming it
+is correct and required — a comparison has to say what it compares against. Nothing in the shipped
+package imports it or mentions it; `grep -rni 'meshlib\|MRTriMath\|MRReducePath\|MRMesh' triwarp/`
+must stay empty.
 
 One more, for the fixtures rather than the API: **`trimesh.slice_plane`'s output is a poor MeshLib
 input.** A hemisphere built that way from `icosphere(2)` reports **17** `findHoleRepresentiveEdges`

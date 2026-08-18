@@ -1,12 +1,11 @@
 """
-Kernels for point-cloud surface reconstruction (ported from MeshLib).
+Kernels for point-cloud surface reconstruction.
 
 The heart is
 [`build_local_triangulations`][triwarp.kernels.reconstruction.build_local_triangulations], a
-per-point fan triangulation that mirrors MeshLib's
-``TriangulationHelpers::buildLocalTriangulation``
-(``reference/MeshLib/source/MRMesh/MRPointCloudTriangulationHelpers.cpp``). Every geometry helper
-below is a direct port of the corresponding ``MRTriMath.h`` / ``MRReducePath`` primitive.
+per-point fan triangulation: each point orders its neighbours by angle in the tangent plane and
+then improves the fan toward a Delaunay-like one. The geometry helpers below are the standard
+triangle predicates, shared with ``kernels/predicates.py``.
 """
 
 import warp as wp
@@ -26,9 +25,9 @@ from triwarp.kernels.predicates import (
 # Per-thread scratch arrays are sized to this; the runtime ``max_neighbours`` must not exceed it.
 MAX_NEIGHBOURS = 64
 
-# MeshLib: faces with aspect ratio above this are treated as degenerate and removed first.
+# Faces with aspect ratio above this are treated as degenerate and removed first.
 CRITICAL_ASPECT_RATIO = wp.constant(wp.float32(1e3))
-# MeshLib filterNeighbors: drop a neighbour whose oriented normal opposes the center normal.
+# Neighbour filter: drop a neighbour whose oriented normal opposes the center normal.
 NORMAL_FILTER_DOT = wp.constant(wp.float32(-0.3))
 
 
@@ -155,7 +154,7 @@ def lexicographic_triangulation(
 
 
 # --------------------------------------------------------------------------------------
-# Geometry primitives (ports of MRTriMath.h / MRReducePath)
+# Geometry primitives
 # --------------------------------------------------------------------------------------
 
 

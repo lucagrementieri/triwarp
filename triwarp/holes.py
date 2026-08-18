@@ -13,8 +13,8 @@ refinement**:
   and cones ``B`` triangles onto it (``igl::topological_hole_fill``,
   ``trimesh.repair.stitch(insert_vertices=True)``).
 - [`fill_min_weight`][triwarp.holes.fill_min_weight] instead computes the
-  **minimum-weight triangulation** of each loop (the Liepa/Klincsek interval DP ported from
-  MeshLib's ``fillHole``): the ``B - 2`` triangles over the existing loop vertices that minimize a
+  **minimum-weight triangulation** of each loop (the Liepa/Klincsek interval DP): the ``B - 2``
+  triangles over the existing loop vertices that minimize a
   geometric metric (plane-normalized circumcircle by default, with a min-area fallback), avoiding
   chords that would duplicate existing mesh edges. This is the robust, general-purpose filler for
   non-convex and non-planar holes; it adds no vertices.
@@ -33,8 +33,8 @@ module is the minimum-weight machinery: the same interval DP, the same rim bookk
 metric vocabulary, applied to a band between two rims rather than a cap over one.
 
 For a smooth, well-graded patch, [`fill_smooth`][triwarp.holes.fill_smooth] and
-[`combine.stitch_smooth`][triwarp.combine.stitch_smooth] run the full MeshLib ``fillHoleNicely`` /
-``stitchHolesNicely`` pipeline on top of the min-weight fill/stitch: the patch is refined to a
+[`combine.stitch_smooth`][triwarp.combine.stitch_smooth] run a three-stage pipeline on top of the
+min-weight fill/stitch: the patch is refined to a
 target edge length with Delaunay edge flips
 ([`subdivide_region_to_size`][triwarp.remesh.subdivide_region_to_size]) and its new interior
 vertices are smoothed into the surrounding surface — a sharp-boundary umbrella solve
@@ -365,9 +365,9 @@ def fill_min_weight(
     """
     Fill every boundary hole with a minimum-weight triangulation over its existing vertices.
 
-    Ports MeshLib's ``fillHole`` (the classic Liepa/Klincsek interval dynamic program): each
-    boundary loop of ``B`` vertices is sealed with the ``B - 2`` triangles that minimize a geometric
-    metric, reusing only existing vertices (the vertex buffer is unchanged). This is far more robust
+    The classic Liepa/Klincsek interval dynamic program: each boundary loop of ``B`` vertices is
+    sealed with the ``B - 2`` triangles that minimize a geometric metric, reusing only existing
+    vertices (the vertex buffer is unchanged). This is far more robust
     than [`fill_fan`][triwarp.holes.fill_fan] for non-convex or non-planar holes
     and, unlike [`fill_cone`][triwarp.holes.fill_cone], adds no vertices.
 
@@ -394,18 +394,15 @@ def fill_min_weight(
     faces
         Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
     metric
-        Which MeshLib fill metric to minimize (ported from ``MRMeshMetrics.cpp``):
+        Which fill metric to minimize:
 
         - ``"plane_normalized"`` (default) — circumcircle-diameter times aspect ratio, penalizing
-          triangles flipped or tilted more than 60 degrees off the hole plane
-          (``getPlaneNormalizedFillMetric``); falls back to ``"min_area"`` when the best
-          triangulation is still bad (non-planar/degenerate).
-        - ``"min_area"`` — summed triangle area; always yields a filling (``getMinAreaMetric``).
-        - ``"circumscribed"`` — summed circumcircle diameter (``getCircumscribedMetric``; MeshLib's
-          own ``fillHole`` default).
-        - ``"plane"`` — circumcircle diameter with a flipped-normal penalty
-          (``getPlaneFillMetric``).
-        - ``"min_tri_angle"`` — maximizes the minimal triangle angle (``getMinTriAngleMetric``).
+          triangles flipped or tilted more than 60 degrees off the hole plane; falls back to
+          ``"min_area"`` when the best triangulation is still bad (non-planar/degenerate).
+        - ``"min_area"`` — summed triangle area; always yields a filling.
+        - ``"circumscribed"`` — summed circumcircle diameter.
+        - ``"plane"`` — circumcircle diameter with a flipped-normal penalty.
+        - ``"min_tri_angle"`` — maximizes the minimal triangle angle.
         - ``"edge_length"`` — summed new-edge length (``getEdgeLengthFillMetric``).
         - ``"universal"`` — circumcircle diameter plus a dihedral-smoothing edge term; the smooth,
           general-purpose choice (``getUniversalMetric``).
@@ -417,13 +414,13 @@ def fill_min_weight(
         ``edge_length`` — blend into the surrounding surface via ``smooth_boundary``.
     resolve_multiple_edges
         When ``True`` (default), forbid the triangulation from creating a chord that duplicates an
-        existing mesh edge, avoiding non-manifold results on pinched holes (MeshLib's ``Simple``
-        multiple-edges mode).
+        existing mesh edge, avoiding non-manifold results on pinched holes. Such a chord is
+        forbidden outright rather than re-routed.
     preserve_largest_hole
         When ``True``, leave the single largest boundary loop (greatest perimeter) open and fill
         only the rest — the single-boundary disk a robust UV parametrization expects.
     smooth_boundary
-        When ``True`` (default, MeshLib ``smoothBd``), the dihedral edge metrics also score the hole
+        When ``True`` (default), the dihedral edge metrics also score the hole
         rim edges against the existing adjacent faces, so the patch blends smoothly into the surface
         instead of turning sharply at the boundary. No effect on the triangle-only metrics.
 
@@ -763,8 +760,7 @@ def fill_small(
     Intended open boundaries (large loops) are left untouched; spurious small holes are sealed by
     the shared min-weight interval DP ([`fill_loops`][triwarp.holes.fill_loops]). Used by
     [`triwarp.reconstruction.triangulate_point_cloud`][triwarp.reconstruction.triangulate_point_cloud]
-    to seal small gaps left by sparse or non-uniform point-cloud sampling (MeshLib ``makeMesh_``
-    tail).
+    to seal small gaps left by sparse or non-uniform point-cloud sampling.
 
     Parameters
     ----------
@@ -853,8 +849,7 @@ def fill_smooth(
         [`fill_min_weight`][triwarp.holes.fill_min_weight].
     max_edge
         Target maximum patch edge length. ``None`` (default) derives it from the mean rim edge
-        length of the holes being filled (MeshLib's ``maxEdgeLen = 0`` budget target has no
-        parallel analogue).
+        length of the holes being filled; a sequential budget target has no parallel analogue.
     max_edge_splits
         Soft cap on the number of edge splits during subdivision (``maxEdgeSplits``).
     max_angle_change_after_flip
@@ -863,7 +858,7 @@ def fill_smooth(
         When ``True`` (default), smooth the new patch vertices after subdivision.
     natural_smooth
         When ``True``, additionally grow a collar around the patch and smooth it so the patch
-        blends into the surrounding surface (MeshLib ``naturalSmooth``).
+        blends into the surrounding surface.
     edge_weights
         Laplacian edge weights for the cross-boundary smooth solve: ``"cotan"`` (default) or
         ``"unit"``.
@@ -873,7 +868,7 @@ def fill_smooth(
         When ``True`` (default), forbid fill chords that duplicate existing mesh edges.
     smooth_boundary
         When ``True`` (default), also run the cross-boundary smooth solve so the patch is C¹ across
-        its rim (MeshLib ``smoothBd``). Also tunes the fill metric's rim edge terms.
+        its rim. Also tunes the fill metric's rim edge terms.
     return_patch
         When ``True``, also return a length-``n_out_faces`` ``wp.bool`` mask of the patch faces.
 
@@ -899,7 +894,8 @@ def fill_smooth(
 
     Notes
     -----
-    The three-stage pipeline is MeshLib's ``fillHoleNicely``.
+    The three stages are: minimum-weight fill, refine the patch to the target edge length, then
+    smooth its new interior vertices into the surrounding surface.
 
     Winding is consistent with the surrounding faces only for a consistently wound input.
     """

@@ -673,8 +673,8 @@ def _flip_interior_edges(
     ``faces`` is mutated in place. Each iteration rebuilds face adjacency, lets
     ``launch_candidates`` mark flippable edges (predicate-specific), then commits a
     conflict-free subset (no two committed flips touch a shared face or create the same new
-    edge). Returns the total number of flips performed. The winding rewrite matches MeshLib
-    ``flipEdge`` and ``igl::flip_edge``.
+    edge). Returns the total number of flips performed. The winding rewrite matches
+    ``igl::flip_edge``.
 
     The per-pass topology is built by ``_FlipTopology`` on fixed buffers rather than by composing
     the public wrappers, which is a measured 1.5-2.6x on the whole call; see it for why.
@@ -1839,10 +1839,10 @@ def flip_to_delaunay(
     """
     Improve triangle quality by flipping interior edges toward the Delaunay criterion.
 
-    Ports MeshLib ``makeDeloneEdgeFlips``: for every interior edge whose two incident faces are
-    both in ``region``, the shared diagonal is flipped when doing so satisfies the local Delone
-    (empty-circumcircle) test — subject to an optional dihedral-angle-change gate and a
-    surface-deviation gate, so the flips never distort the surface. Rim edges (with a face
+    For every interior edge whose two incident faces are both in ``region``, the shared diagonal
+    is flipped when doing so satisfies the local Delone (empty-circumcircle) test — subject to an
+    optional dihedral-angle-change gate and a surface-deviation gate, so the flips never distort
+    the surface. Rim edges (with a face
     outside the region, or on the mesh boundary) are never flipped. Vertices, face count and
     region membership are unchanged; only the triangulation of the region is rewritten.
 
@@ -2654,8 +2654,9 @@ def subdivide_region_to_size(
     """
     Subdivide only a face region until its edges are at most ``max_edge`` long.
 
-    Ports MeshLib ``subdivideMesh`` restricted to a face region (as used by ``fillHoleNicely``'s
-    ``subdivideFillingNicely``): every edge with at least one incident region face and length
+    The region-restricted form of [`subdivide_to_size`][triwarp.remesh.subdivide_to_size], and the
+    refinement stage of the smooth-patch pipeline: every edge with at least one incident region
+    face and length
     greater than ``max_edge`` is bisected, the incident faces are re-triangulated crack-free
     (the [`subdivide_to_size`][triwarp.remesh.subdivide_to_size] 1/2/3-split templates, so faces
     outside the region that touch a split edge stay watertight), and — unless disabled — a
@@ -2664,9 +2665,9 @@ def subdivide_region_to_size(
     originals, so the caller derives the new-vertex set as the index range
     ``[len(vertices), len(new_vertices))``.
 
-    Unlike MeshLib's sequential longest-edge-first priority queue, splitting is done in parallel
-    passes; ``max_splits`` is honoured as a soft budget by keeping only the longest eligible
-    edges of the pass that would exceed it.
+    Where a sequential implementation would drive this from a longest-edge-first priority queue,
+    splitting is done in parallel passes; ``max_splits`` is honoured as a soft budget by keeping
+    only the longest eligible edges of the pass that would exceed it.
 
     Parameters
     ----------

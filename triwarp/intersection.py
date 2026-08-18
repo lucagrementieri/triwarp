@@ -592,7 +592,7 @@ def split_mesh_with_plane(
     materialize either half.
 
     Equivalent to VTK's ``vtkClipPolyData`` with ``GenerateClippedOutput``, which pyvista exposes as
-    ``PolyData.clip(..., return_clipped=True)``, and to MeshLib's ``subdivideWithPlane``.
+    ``PolyData.clip(..., return_clipped=True)``.
 
     Examples
     --------

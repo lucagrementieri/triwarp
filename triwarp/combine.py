@@ -325,7 +325,8 @@ def stitch_min_weight(
 
     Notes
     -----
-    The band is MeshLib's ``stitchHoles``, and its metrics are that function's.
+    The band is the minimum-weight two-loop stitch; see
+    [`stitch_min_weight`][triwarp.combine.stitch_min_weight] for the metrics.
     """
     loop_a, loop_b = _single_boundary_loops(
         vertices_a, faces_a, vertices_b, faces_b, caller="stitch_min_weight"
@@ -361,7 +362,7 @@ def stitch_smooth(
     Like [`stitch_min_weight`][triwarp.combine.stitch_min_weight] but the connecting band is then
     subdivided and smoothed by the same finisher as
     [`fill_smooth`][triwarp.holes.fill_smooth]. Each mesh must have exactly one
-    boundary loop. The cross-boundary smooth solve is always applied (MeshLib forces ``smoothBd``).
+    boundary loop. The cross-boundary smooth solve is always applied.
 
     Parameters
     ----------
@@ -412,7 +413,8 @@ def stitch_smooth(
 
     Notes
     -----
-    The three-stage pipeline is MeshLib's ``stitchHolesNicely``.
+    The three stages are: minimum-weight stitch, refine the band to the target edge length, then
+    smooth its new interior vertices into both surrounding surfaces.
     """
     if metric not in _STITCH_METRIC_IDS:
         raise ValueError(f"metric must be one of {sorted(_STITCH_METRIC_IDS)}, got {metric!r}")
@@ -777,10 +779,10 @@ def stitch_loops_min_weight(
     """
     Join two meshes with a **minimum-weight** cylindrical band between one boundary loop on each.
 
-    Ports MeshLib's ``stitchHoles``: the two rims are aligned at their closest vertex pair and
-    zippered by the band of ``len(loop_a) + len(loop_b)`` triangles that minimizes a stitch metric,
-    found by a grid dynamic program over the two loops (``dp[i, j]`` = best band consuming ``i``
-    A-edges and ``j`` B-edges; each anti-diagonal is one parallel kernel launch). Reuses only the
+    The two rims are aligned at their closest vertex pair and zippered by the band of
+    ``len(loop_a) + len(loop_b)`` triangles that minimizes a stitch metric, found by a grid dynamic
+    program over the two loops (``dp[i, j]`` = best band consuming ``i`` A-edges and ``j`` B-edges;
+    each anti-diagonal is one parallel kernel launch). Reuses only the
     loops' existing vertices. The metric-free greedy
     [`stitch_loops`][triwarp.combine.stitch_loops] remains available.
 
@@ -793,13 +795,13 @@ def stitch_loops_min_weight(
     loop_a, loop_b
         Ordered vertex-index loops (``>= 3`` vertices each) around the boundary to join on each.
     metric
-        Stitch metric to minimize (MeshLib ``MRMeshMetrics.cpp``):
+        Stitch metric to minimize:
 
         - ``"complex_stitch"`` (default) — triangle aspect ratio plus a dihedral-smoothness edge
-          term between adjacent band triangles and the surface (``getComplexStitchMetric``).
-        - ``"edge_length_stitch"`` — summed connection-edge length (``getEdgeLengthStitchMetric``).
-        - ``"vertical"`` — penalizes band area and normal deviation from ``up_dir``
-          (``getVerticalStitchMetric``); pass ``up_dir``.
+          term between adjacent band triangles and the surface.
+        - ``"edge_length_stitch"`` — summed connection-edge length.
+        - ``"vertical"`` — penalizes band area and normal deviation from ``up_dir``; pass
+          ``up_dir``.
     up_dir
         Up direction for the ``"vertical"`` metric (defaults to ``(0, 0, 1)``); ignored otherwise.
 
@@ -896,7 +898,7 @@ def stitch_loops_min_weight(
 
 def _closest_loop_pair(a_pos: wp.array[wp.vec3], b_pos: wp.array[wp.vec3]) -> tuple[int, int]:
     """
-    Return the closest vertex pair ``(i, j)`` between the two rims (MeshLib's start pair).
+    Return the closest vertex pair ``(i, j)`` between the two rims: the band's start pair.
 
     The full ``(n_a, n_b)`` squared-distance matrix and its argmin run in Warp kernels (the same
     ``row_argmin`` / ``global_argmin`` reduction the greedy zippering uses); only the two winning
@@ -953,6 +955,5 @@ def _stitch_band_triangles(
 
 
 # ---------------------------------------------------------------------------
-# "Nicely" pipeline: min-weight fill / stitch -> region subdivision -> region smoothing
-# (MeshLib fillHoleNicely / stitchHolesNicely, MRFillHoleNicely.cpp).
+# Smooth-patch pipeline: min-weight fill / stitch -> region subdivision -> region smoothing.
 # ---------------------------------------------------------------------------

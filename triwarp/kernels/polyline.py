@@ -134,9 +134,8 @@ def plane_normal(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.vec3:
     """
     Return the normal of the plane approximately containing segment vectors ``a``, ``b``, ``c``.
 
-    Port of ``getPlaneNormal`` from MeshLib ``MRPolylineSubdivide.cpp``: returns whichever of
-    ``b x (a + c)`` and ``b x (a - c)`` has the larger magnitude, staying well-defined when ``a``
-    and ``c`` are nearly parallel or anti-parallel.
+    Returns whichever of ``b x (a + c)`` and ``b x (a - c)`` has the larger magnitude, which stays
+    well-defined when ``a`` and ``c`` are nearly parallel or anti-parallel.
     """
     n1 = wp.cross(b, a + c)
     n2 = wp.cross(b, a - c)
@@ -150,9 +149,9 @@ def endpoint_normals(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> tuple[wp.vec3, wp.ve
     """
     In-plane unit normals at the two ends of segment ``b`` bracketed by neighbours ``a``, ``c``.
 
-    Mirrors MeshLib's ``no``/``nd``: rotate each segment 90 degrees within the fitted plane
-    (``plane_normal``) and average the edge normal with each neighbour's normal. Returns two
-    zero vectors when the segments are (nearly) collinear, signalling the caller to fall back to a
+    Rotate each segment 90 degrees within the fitted plane (``plane_normal``) and average the edge
+    normal with each neighbour's normal. Returns two zero vectors when the segments are (nearly)
+    collinear, signalling the caller to fall back to a
     straight chord.
     """
     normal = plane_normal(a, b, c)
@@ -170,8 +169,8 @@ def arc_point(po: wp.vec3, pd: wp.vec3, no: wp.vec3, nd: wp.vec3, t: wp.float32)
     Point at parameter ``t`` in ``[0, 1]`` along the circular arc from ``po`` to ``pd``.
 
     The arc is the one whose unit end-normals are ``no`` and ``nd``; its midpoint offset from the
-    chord equals MeshLib's ``(|chord| / 2) * tan(theta / 4)`` sagitta, generalised here to every
-    ``t`` for multi-point subdivision. Degenerate inputs (zero-length chord, collinear neighbours
+    chord is the ``(|chord| / 2) * tan(theta / 4)`` sagitta, generalised here to every ``t`` for
+    multi-point subdivision. Degenerate inputs (zero-length chord, collinear neighbours
     signalled by zero normals, straight/near-straight arc, or a cusp) collapse to the straight
     chord ``po + t * (pd - po)``, so ``t == 0`` always returns ``po`` exactly.
     """
@@ -216,7 +215,7 @@ def smooth_upsample_gather(
     po = polyline[segment]
     pd = polyline[segment + 1]
     # Locate the vertices bracketing this segment; interior segments fit a curvature arc, boundary
-    # segments of an open polyline (missing a neighbour) stay linear, matching MeshLib.
+    # segments of an open polyline (missing a neighbour) stay linear.
     has_neighbours = 0
     prev_index = 0
     next_index = 0

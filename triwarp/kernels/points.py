@@ -79,7 +79,7 @@ def finalize_fit_plane(
 
 
 # Orientation modes for estimate_point_normals (mirror Open3D's orient methods).
-ORIENT_CENTROID = wp.constant(wp.int32(0))  # outward from the cloud centroid (MeshLib default)
+ORIENT_CENTROID = wp.constant(wp.int32(0))  # outward from the cloud centroid (the default)
 ORIENT_DIRECTION = wp.constant(wp.int32(1))  # align with a fixed direction
 ORIENT_CAMERA = wp.constant(wp.int32(2))  # point toward a camera location
 
@@ -119,7 +119,7 @@ def estimate_point_normals(
     out_normals: wp.array[wp.vec3],
 ) -> None:
     # Per-point normal = eigenvector of the smallest eigenvalue of the neighbourhood
-    # covariance (same choice as MeshLib PointAccumulator and Open3D FastEigen3x3).
+    # covariance (the same choice Open3D's FastEigen3x3 makes).
     v = wp.int32(wp.tid())
     k = neighbor_idx.shape[1]
 

@@ -171,10 +171,10 @@ def bridge_b_faces(
     out_faces[3 * j + 2] = apex
 
 
-# --- Minimum-weight hole triangulation (Liepa interval DP, port of MRMeshFillHole.cpp) --------
+# --- Minimum-weight hole triangulation (the Liepa/Klincsek interval DP) -----------------------
 
 
-# --- Metric-based two-hole stitching (grid DP, port of MRMeshFillHole.cpp stitchHoles) ---------
+# --- Metric-based two-hole stitching (the same DP over a grid rather than an interval) ---------
 
 # Stitch-metric selectors for ``stitch_triangle_metric`` / ``stitch_edge_metric`` / stitch DP.
 METRIC_COMPLEX_STITCH = wp.constant(wp.int32(0))
@@ -191,7 +191,7 @@ CAME_B = wp.constant(wp.int32(1))  # reached (i, j) by advancing loop B: from (i
 def stitch_triangle_metric(
     a: wp.vec3, b: wp.vec3, c: wp.vec3, up: wp.vec3, metric_id: wp.int32
 ) -> wp.float32:
-    # Per-band-triangle term of each stitch metric (MeshLib arg order preserved).
+    # Per-band-triangle term of each stitch metric.
     if metric_id == METRIC_EDGE_LENGTH_STITCH:
         return wp.length(c - a)
     if metric_id == METRIC_VERTICAL_STITCH:
@@ -209,7 +209,7 @@ def stitch_triangle_metric(
 @wp.func
 def stitch_edge_metric(a: wp.vec3, b: wp.vec3, lft: wp.vec3, rgt: wp.vec3) -> wp.float32:
     # complex_stitch edge term: (1 - cos dihedral) * 1e4 between the two triangles sharing edge a-b
-    # (MeshLib getComplexStitchMetric edgeMetric). Normals are unit here (unlike the fill dihedral).
+    # Normals are unit here, unlike the fill dihedral.
     ab = b - a
     norm_l = wp.normalize(wp.cross(lft - a, ab))
     norm_r = wp.normalize(wp.cross(ab, rgt - a))
@@ -226,8 +226,8 @@ def stitch_prev_apex(
     i: wp.int32,
     j: wp.int32,
 ) -> wp.vec3:
-    # Apex of the band triangle already placed at cell (i, j) — the vertex advanced to reach it
-    # (MeshLib ``cOp``). Only called when came[i, j] is valid.
+    # Apex of the band triangle already placed at cell (i, j) -- the vertex advanced to reach it.
+    # Only called when came[i, j] is valid.
     if came[i, j] == CAME_A:
         return a_pos[(i - 1) % n_a]
     return b_pos[(j - 1) % n_b]
@@ -238,7 +238,7 @@ def pair_sq_distances(
     a_pos: wp.array[wp.vec3], b_pos: wp.array[wp.vec3], out_dist: wp.array2d[wp.float32]
 ) -> None:
     # Squared distance between every rim-A vertex ``i`` and rim-B vertex ``j``; the global argmin
-    # (reused ``row_argmin`` + ``global_argmin``) is MeshLib's aligned start pair for stitchHoles.
+    # (reused ``row_argmin`` + ``global_argmin``) is the aligned start pair the band grows from.
     i, j = wp.tid()
     d = a_pos[i] - b_pos[j]
     out_dist[i, j] = wp.length_sq(d)
@@ -284,7 +284,7 @@ def stitch_dp_diag(
     best = FLOAT32_INF_CONSTANT
     best_came = CAME_NONE
 
-    # Advance loop A: new triangle (a[i-1], b[j], a[i]) (MeshLib addALoop arg order).
+    # Advance loop A: new triangle (a[i-1], b[j], a[i]).
     if i >= 1 and out_dp[i - 1, j] < BAD_METRIC:
         a_prev = a_pos[(i - 1) % n_a]
         a_cur = a_pos[i % n_a]

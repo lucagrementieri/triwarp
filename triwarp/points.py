@@ -400,9 +400,9 @@ def estimate_normals(
     Estimate per-point normals by PCA over each point's neighbourhood.
 
     Each normal is the eigenvector of the smallest eigenvalue of the local
-    covariance matrix accumulated over the point's neighbours — the same choice
-    made by MeshLib (``PointAccumulator``) and Open3D (``FastEigen3x3``), so the
-    result matches both references up to sign. The neighbourhood is supplied by
+    covariance matrix accumulated over the point's neighbours — the standard
+    choice, which Open3D's ``FastEigen3x3`` also makes, so the result matches the
+    references up to sign. The neighbourhood is supplied by
     the caller as ``neighbor_idx``: build it with
     [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] using a plain
     ``k`` for a k-nearest (KNN) neighbourhood, or with ``max_radius`` set for a

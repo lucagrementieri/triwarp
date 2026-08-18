@@ -24,9 +24,9 @@ from triwarp.kernels.triangles import (
 )
 from triwarp.kernels.voxels import voxel_cell
 
-# Delaunay / Delone edge-flip constants (ported from MRMeshDelone.cpp). The flip predicate
-# runs in float64: MeshLib deliberately widens to double because circumcircle diameters of
-# near-degenerate triangles have too large a rounding error in float32 (infinite flip loops).
+# Delaunay / Delone edge-flip constants. The flip predicate runs in float64 deliberately:
+# circumcircle diameters of near-degenerate triangles have too large a rounding error in float32,
+# which sends the flip loop non-terminating.
 DELONE_CRITICAL_DOT = wp.constant(wp.float64(-0.9))
 DELONE_EPS = wp.constant(wp.float64(1e-7))
 NO_ANGLE_CHANGE_LIMIT = wp.constant(wp.float64(6.283185307179586))  # 2*pi (NoAngleChangeLimit)
@@ -372,7 +372,7 @@ def mark_region_edges(
     out_edge_in_region: wp.array[wp.bool],
 ) -> None:
     # A unique edge is in/on the region boundary if at least one of its incident faces is in
-    # the region (MeshLib isInnerOrBdEdge, subdivideBorder default). Benign write race: every
+    # the region -- region-border edges included. Benign write race: every
     # thread writing the same slot writes True.
     i = wp.int32(wp.tid())
     if region_flags[i // 3] != 0:
@@ -385,8 +385,8 @@ def long_region_edge(length: wp.float32, max_edge: wp.float32, in_region: wp.boo
 
 
 # ---------------------------------------------------------------------------
-# Float64 Delone edge-flip predicate (ported from MRMeshDelone.cpp / MRTriMath.h /
-# MRReducePath.cpp). Computed in double precision, matching MeshLib.
+# Float64 Delone edge-flip predicate. Computed in double precision for the reason the constants
+# above give.
 # ---------------------------------------------------------------------------
 
 

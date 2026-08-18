@@ -336,14 +336,12 @@ def smooth_upsample_polyline(
     ``max(floor(length / step_size), 1)`` pieces and the final endpoint is not emitted. Unlike it,
     the inserted points are placed on a circular arc fitted to the segment's endpoint tangents
     (estimated from the two bracketing neighbour vertices) rather than on the straight chord, so a
-    coarsely sampled curve is refined smoothly. This is a port of the ``useCurvature`` vertex
-    placement in MeshLib ``MRPolylineSubdivide.cpp``, generalised from the edge midpoint to every
-    interpolation parameter.
+    coarsely sampled curve is refined smoothly. Curvature-aware placement is usually stated for the
+    edge midpoint alone; here it is generalised to every interpolation parameter.
 
-    The first and last segments have no bracketing neighbour and are subdivided linearly (matching
-    MeshLib, which applies curvature only to interior edges); collinear neighbours likewise reduce
-    to the straight chord. Original vertices are preserved exactly, since each segment's first
-    sample coincides with its start vertex.
+    The first and last segments of an open polyline have no bracketing neighbour and are subdivided
+    linearly; collinear neighbours likewise reduce to the straight chord. Original vertices are
+    preserved exactly, since each segment's first sample coincides with its start vertex.
 
     Parameters
     ----------

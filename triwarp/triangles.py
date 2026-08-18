@@ -126,8 +126,7 @@ def face_quality(
 
         - ``"aspect_ratio"`` (default) — circumradius over twice the inradius. ``1`` for an
           equilateral triangle and unbounded above, so **smaller is better**; a degenerate
-          triangle reads ``+inf``. This is MeshLib's ``triangleAspectRatio`` and the measure the
-          remeshing gates use.
+          triangle reads ``+inf``. This is the measure the remeshing gates use.
         - ``"radius_ratio"`` — inradius over circumradius, rescaled so an equilateral triangle
           reads ``1``; ``0`` when degenerate. MeshLab's ``inradius/circumradius``.
         - ``"area_max_side"`` — twice the area over the longest side squared, ``sqrt(3)/2`` at
