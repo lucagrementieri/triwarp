@@ -54,3 +54,26 @@ def test_empty_2d_shape(device: str) -> None:
     arr: twt.Array2dInt32 = twt.empty_2d((0, 2), wp.int32, device=device)
     assert arr.shape == (0, 2)
     assert arr.ndim == 2
+
+
+def test_dtype_zero_splits_int_and_float_like_python(device: str) -> None:
+    """Integer types give a Python ``int`` and float ones a ``float``, not merely ``== 0``."""
+    for dtype_wp, _np_dtype in _INT_WP_TO_NUMPY:
+        zero = twt.dtype_zero(dtype_wp)
+        assert zero == 0
+        assert isinstance(zero, int)
+        assert not isinstance(zero, bool)
+    for dtype_wp in _FLOAT_DTYPES:
+        zero = twt.dtype_zero(dtype_wp)
+        assert zero == 0.0
+        assert isinstance(zero, float)
+
+
+@pytest.mark.parametrize("dtype_wp", [wp.float32, wp.bool])
+def test_empty_3d_shape(device: str, dtype_wp: type) -> None:
+    """The rank-3 allocator over both dtypes its overloads admit, on the caller's device."""
+    arr = twt.empty_3d((2, 3, 4), dtype_wp, device=device)
+    assert arr.shape == (2, 3, 4)
+    assert arr.ndim == 3
+    assert arr.dtype == dtype_wp
+    assert str(arr.device) == device

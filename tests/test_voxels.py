@@ -558,6 +558,79 @@ def test_fill_orthographic_matches_trimesh(sphere, device: str):
 
 
 # ---------------------------------------------------------------------------------------------
+# resolve_voxel_grid
+# ---------------------------------------------------------------------------------------------
+
+
+def test_resolve_voxel_grid_defaults_are_one_percent_and_a_half_cell_below(device: str) -> None:
+    """
+    Class A: the package's single definition of an unspecified voxel grid, against the arithmetic.
+
+    A cell of ``1 %`` of the bounding-box diagonal, anchored half a cell below the lower corner --
+    Open3D's anchor, and the reason ``voxelize_points``, ``voxel_down_sample`` and
+    ``cluster_decimate`` agree cell for cell. Both defaults resolve independently, so each is
+    checked with the other supplied: a rule applied only when *both* are ``None`` would pass a test
+    that always omits both.
+
+    ``atol`` rather than exact: ``origin`` is a ``wp.vec3``, so the returned corner is ``float32``
+    where the arithmetic here is ``float64`` (measured gap 7e-10).
+    """
+    points_np = np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]], dtype=np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    diagonal = float(np.linalg.norm(points_np[1] - points_np[0]))
+
+    voxel_size, origin = tw.voxels.resolve_voxel_grid(points_wp)
+
+    assert voxel_size == pytest.approx(0.01 * diagonal)
+    assert np.allclose(list(origin), -0.5 * voxel_size, rtol=0, atol=1e-7)
+
+    # Each default resolves on its own, not only when both are missing.
+    size_only, given_origin = tw.voxels.resolve_voxel_grid(points_wp, origin=wp.vec3(9.0, 9.0, 9.0))
+    assert size_only == pytest.approx(0.01 * diagonal)
+    assert list(given_origin) == [9.0, 9.0, 9.0]
+    given_size, origin_only = tw.voxels.resolve_voxel_grid(points_wp, 0.25)
+    assert given_size == 0.25
+    assert np.allclose(list(origin_only), -0.125, rtol=0, atol=1e-7)
+
+
+def test_resolve_voxel_grid_passes_both_arguments_through(device: str) -> None:
+    """With both supplied it reads no bounds at all, so it must return them unchanged."""
+    points_wp = wp.array(
+        np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]], dtype=np.float32), dtype=wp.vec3, device=device
+    )
+
+    voxel_size, origin = tw.voxels.resolve_voxel_grid(points_wp, 0.25, wp.vec3(1.0, 2.0, 3.0))
+
+    assert voxel_size == 0.25
+    assert list(origin) == [1.0, 2.0, 3.0]
+
+
+def test_resolve_voxel_grid_empty_input_takes_a_unit_diagonal(device: str) -> None:
+    """An empty set has no bounding box, so the documented fallback is a diagonal of one."""
+    voxel_size, origin = tw.voxels.resolve_voxel_grid(wp.empty(0, dtype=wp.vec3, device=device))
+
+    assert voxel_size == pytest.approx(0.01)
+    assert np.allclose(list(origin), -0.005, rtol=0, atol=1e-7)
+
+
+def test_resolve_voxel_grid_rejects_a_non_positive_size_and_names_its_caller(device: str) -> None:
+    """
+    The ``caller`` argument exists so the message names the public entry point, not this helper.
+
+    Both halves are asserted, because a message that silently ignored ``caller`` would still look
+    right at the one call site that does not pass it.
+    """
+    points_wp = wp.array(
+        np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]], dtype=np.float32), dtype=wp.vec3, device=device
+    )
+
+    with pytest.raises(ValueError, match="resolve_voxel_grid requires voxel_size > 0"):
+        tw.voxels.resolve_voxel_grid(points_wp, 0.0)
+    with pytest.raises(ValueError, match="cluster_decimate requires voxel_size > 0"):
+        tw.voxels.resolve_voxel_grid(points_wp, -1.0, caller="cluster_decimate")
+
+
+# ---------------------------------------------------------------------------------------------
 # Conversion and meshing
 # ---------------------------------------------------------------------------------------------
 

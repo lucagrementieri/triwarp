@@ -810,3 +810,97 @@ def test_trim_to_count_zero(device: str) -> None:
     )
     assert n_out == 0
     assert trimmed_wp.shape == (0,)
+
+
+_SCALAR_DTYPES = (
+    wp.int8,
+    wp.uint8,
+    wp.int16,
+    wp.uint16,
+    wp.int32,
+    wp.uint32,
+    wp.int64,
+    wp.uint64,
+    wp.float16,
+    wp.float32,
+    wp.float64,
+)
+
+
+def test_sortable_dtype_is_exactly_what_warp_can_radix_sort(device: str) -> None:
+    """
+    The widening table's *reason*, asserted rather than described: it names Warp's accepted set.
+
+    ``sortable_dtype`` exists because ``warp.utils.radix_sort_pairs`` refuses sub-32-bit keys, and
+    its docstring records having re-probed that on 1.16. This runs the probe instead of citing it:
+    every dtype the table maps to itself must sort, every dtype it widens must *not*, and the
+    widened target must sort. So a Warp release that grows the accepted set fails here -- which is
+    the only way anyone would notice that the table had become unnecessarily lossy.
+
+    Measured on Warp 1.16, both devices: ``int32`` / ``uint32`` / ``int64`` / ``uint64`` /
+    ``float32`` / ``float64`` are accepted, and ``int8`` / ``uint8`` / ``int16`` / ``uint16`` /
+    ``float16`` raise ``Unsupported keys and values data types``.
+    """
+
+    def sorts(dtype: type) -> bool:
+        keys_wp = wp.zeros(8, dtype=dtype, device=device)
+        values_wp = wp.zeros(8, dtype=wp.int32, device=device)
+        try:
+            wp.utils.radix_sort_pairs(keys_wp, values_wp, 4)
+        except RuntimeError:
+            return False
+        return True
+
+    accepted = {dtype for dtype in _SCALAR_DTYPES if sorts(dtype)}
+    assert accepted == {wp.int32, wp.uint32, wp.int64, wp.uint64, wp.float32, wp.float64}
+
+    for dtype in _SCALAR_DTYPES:
+        target = tw.array.sortable_dtype(dtype)
+        assert target in accepted, f"{dtype.__name__} widened to an unsortable {target.__name__}"
+        # A fixed point exactly on the accepted set: nothing sortable is widened, nothing else is
+        # left alone.
+        assert (target is dtype) == (dtype in accepted)
+        # Same kind and signedness, never narrower -- the order has to survive the widening.
+        assert wp.types.type_is_float(target) == wp.types.type_is_float(dtype)
+        assert target.__name__.startswith("u") == dtype.__name__.startswith("u")
+        assert wp.types.type_size_in_bytes(target) >= wp.types.type_size_in_bytes(dtype)
+
+
+@pytest.mark.parametrize("dtype_wp", [wp.int8, wp.uint16, wp.float16, wp.uint64])
+def test_sortable_dtype_preserves_the_order_of_the_original_values(
+    device: str, dtype_wp: type
+) -> None:
+    """
+    Class A: casting to the widened dtype and sorting there orders the values as numpy does.
+
+    Widening is only useful if it is order-preserving, and the two ways to get that wrong are the
+    two the docstring names: a float's sign bit makes negatives descend under a bit-order sort, and
+    a ``uint64`` with its top bit set reads as a negative ``int64``. Both are covered --
+    ``float16`` carries negatives and ``uint64`` carries values above ``2**63``.
+
+    The cast-then-sort shape is the caller's, not the helper's: ``sort_and_argsort`` requires an
+    already-sortable dtype and says so, and this mirrors what ``grouping.group`` and
+    ``grouping.unique_1d`` do with the answer.
+    """
+    if dtype_wp is wp.uint64:
+        values_np = np.array([2**63 + 5, 1, 2**64 - 1, 0, 2**63], dtype=np.uint64)
+    elif dtype_wp is wp.float16:
+        values_np = np.array([-2.5, 0.0, 1.5, -7.0, 3.0], dtype=np.float16)
+    elif dtype_wp is wp.int8:
+        values_np = np.array([-128, 0, 127, -1, 63], dtype=np.int8)
+    else:
+        values_np = np.array([65535, 0, 1, 32768, 7], dtype=np.uint16)
+    values_wp = wp.array(values_np, dtype=dtype_wp, device=device)
+
+    sort_dtype = tw.array.sortable_dtype(dtype_wp)
+    widened_wp = wp.empty(values_np.size, dtype=sort_dtype, device=device)
+    if sort_dtype is dtype_wp:
+        wp.copy(widened_wp, values_wp)
+    else:
+        wp.utils.array_cast(values_wp, widened_wp)
+
+    sorted_wp, order_wp = tw.array.sort_and_argsort(widened_wp)
+
+    # Compare against the *original* dtype's numpy order: the widening must not have changed it.
+    assert np.array_equal(order_wp.numpy(), np.argsort(values_np, kind="stable"))
+    assert np.array_equal(sorted_wp.numpy(), np.sort(values_np).astype(sorted_wp.numpy().dtype))

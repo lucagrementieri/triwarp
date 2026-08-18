@@ -442,3 +442,21 @@ def test_sample_fibonacci_cone_invalid(device: str) -> None:
     with pytest.raises(ValueError, match=r"half_angle must be in \(0, pi\]"):
         tw.sample.sample_fibonacci_cone(8, 4.0, device=device)
     assert tw.sample.sample_fibonacci_cone(0, 1.0, device=device).shape == (0,)
+
+
+def test_resolve_seed_passes_a_seed_through_and_draws_one_otherwise() -> None:
+    """
+    The one seed convention every generator in the package shares, including across modules.
+
+    ``None`` has to mean *draw one*, not *use zero* -- a silent zero would make every unseeded call
+    in the package return the same sample set. Two consecutive draws are asserted distinct, which is
+    what separates the two readings.
+    """
+    assert tw.sample.resolve_seed(1234) == 1234
+    assert tw.sample.resolve_seed(0) == 0
+
+    drawn = [tw.sample.resolve_seed(None) for _ in range(8)]
+    assert all(0 <= seed < 2**31 for seed in drawn)
+    assert all(isinstance(seed, int) for seed in drawn)
+    # Eight identical draws would be a fixed default wearing a random one's signature.
+    assert len(set(drawn)) > 1
