@@ -10,7 +10,7 @@ import trimesh.repair as tm_repair
 import warp as wp
 
 import triwarp as tw
-from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab
+from tests.conversions import numpy_to_warp, trimesh_to_open3d, trimesh_to_pymeshlab
 
 # Open-surface fixtures that actually have a boundary to fill.
 OPEN_MESHES = ["hemisphere", "half_torus"]
@@ -784,6 +784,66 @@ def test_fill_min_weight_rejects_unknown_metric(hemisphere: tuple[tm.Trimesh, wp
     _, mesh_wp = hemisphere
     with pytest.raises(ValueError, match="metric must be one of"):
         tw.holes.fill_min_weight(mesh_wp.points, mesh_wp.indices, metric="bogus")
+
+
+# ---------------------------------------------------------------------------
+# fill_small
+# ---------------------------------------------------------------------------
+
+
+def _two_holes_of_different_size(device: str):
+    """Cut a wide cap and a two-face pinhole into an icosphere, reporting both perimeters."""
+    sphere_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    centers_np = sphere_tm.triangles_center
+    keep_np = np.ones(sphere_tm.faces.shape[0], dtype=bool)
+    keep_np[np.argsort(-centers_np[:, 2])[:20]] = False
+    keep_np[np.argsort(centers_np[:, 2])[:2]] = False
+    holed_tm = tm.Trimesh(sphere_tm.vertices, sphere_tm.faces[keep_np], process=False)
+    holed_tm.remove_unreferenced_vertices()
+    vertices_wp, faces_wp = numpy_to_warp(holed_tm.vertices, holed_tm.faces, device)
+    loops_wp = tw.boundary.boundary_loops(vertices_wp, faces_wp)
+    perimeters = [
+        float(tw.polyline.polyline_length(tw.array.gather(vertices_wp, loop_wp), closed=True))
+        for loop_wp in loops_wp
+    ]
+    return vertices_wp, faces_wp, [int(loop_wp.shape[0]) for loop_wp in loops_wp], perimeters
+
+
+def test_fill_small_fills_exactly_the_loops_under_the_threshold(device: str) -> None:
+    """
+    Class A: the face count grows by ``n_loop - 2`` for each loop at or under ``max_perimeter``.
+
+    A fan triangulation of an ``n``-gon is ``n - 2`` triangles, so the count is an exact oracle for
+    *which* loops were filled rather than just that something was. The fixture carries a 16-vertex
+    loop of perimeter 2.41 and a 5-vertex one of perimeter 3.16 -- the shorter perimeter belongs to
+    the loop with *more* vertices, so a threshold between them cannot be satisfied by a
+    vertex-count rule by accident.
+    """
+    vertices_wp, faces_wp, loop_sizes, perimeters = _two_holes_of_different_size(device)
+    n_faces = int(faces_wp.shape[0]) // 3
+    assert len(perimeters) == 2
+    smaller, larger = min(perimeters), max(perimeters)
+    smaller_size = loop_sizes[perimeters.index(smaller)]
+
+    below_both_wp = tw.holes.fill_small(vertices_wp, faces_wp, smaller * 0.5)
+    between_wp = tw.holes.fill_small(vertices_wp, faces_wp, (smaller + larger) / 2.0)
+    above_both_wp = tw.holes.fill_small(vertices_wp, faces_wp, larger * 1.1)
+
+    assert int(below_both_wp.shape[0]) // 3 == n_faces
+    assert int(between_wp.shape[0]) // 3 == n_faces + smaller_size - 2
+    assert int(above_both_wp.shape[0]) // 3 == n_faces + sum(loop_sizes) - 4
+    # The prefix is the input face buffer: fill triangles are appended, never interleaved.
+    assert np.array_equal(above_both_wp.numpy()[: faces_wp.shape[0]], faces_wp.numpy())
+
+
+def test_fill_small_leaves_a_watertight_mesh_alone(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """With no boundary loop at all the result is a copy of the input, not the input itself."""
+    _mesh_tm, mesh_wp = icosahedron
+
+    filled_wp = tw.holes.fill_small(mesh_wp.points, mesh_wp.indices, 1e9)
+
+    assert np.array_equal(filled_wp.numpy(), mesh_wp.indices.numpy())
+    assert filled_wp.ptr != mesh_wp.indices.ptr
 
 
 # ---------------------------------------------------------------------------

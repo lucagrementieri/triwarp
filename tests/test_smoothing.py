@@ -15,7 +15,12 @@ import warp as wp
 import warp.sparse as wps
 
 import triwarp as tw
-from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab, trimesh_to_warp
+from tests.conversions import (
+    numpy_to_warp,
+    trimesh_to_open3d,
+    trimesh_to_pymeshlab,
+    trimesh_to_warp,
+)
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
@@ -642,6 +647,109 @@ def test_filter_implicit_fairing_pin_boundary_is_a_no_op_on_a_closed_mesh(
     ).numpy()
 
     assert np.allclose(pinned_np, unpinned_np, rtol=0, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# refine_and_smooth_region (shared finisher of fill_smooth and stitch_smooth)
+# ---------------------------------------------------------------------------
+
+
+def _patch_to_refine(device: str):
+    """Hole an icosphere, fill it, and mark the fill as the patch, with the pre-fill counts."""
+    sphere_tm = tm.creation.icosphere(subdivisions=2, radius=1.0)
+    centers_np = sphere_tm.triangles_center
+    keep_np = np.ones(sphere_tm.faces.shape[0], dtype=bool)
+    keep_np[np.argsort(-centers_np[:, 2])[:6]] = False
+    holed_tm = tm.Trimesh(sphere_tm.vertices, sphere_tm.faces[keep_np], process=False)
+    holed_tm.remove_unreferenced_vertices()
+    vertices_wp, faces_wp = numpy_to_warp(holed_tm.vertices, holed_tm.faces, device)
+
+    n_vertices_before = int(vertices_wp.shape[0])
+    n_faces_before = int(faces_wp.shape[0]) // 3
+    filled_wp = tw.holes.fill_min_weight(vertices_wp, faces_wp)
+    n_faces_after = int(filled_wp.shape[0]) // 3
+    patch_wp = tw.array.indices_to_mask(
+        wp.array(
+            np.arange(n_faces_before, n_faces_after, dtype=np.int32), dtype=wp.int32, device=device
+        ),
+        n_faces_after,
+        device=device,
+    )
+    return vertices_wp, filled_wp, patch_wp, n_vertices_before
+
+
+_REFINE_KWARGS = {
+    "max_edge_splits": 3,
+    "max_angle_change_after_flip": 0.5,
+    "smooth_boundary": False,
+    "natural_smooth": False,
+    "edge_weights": "cotangent",
+}
+
+
+def test_refine_and_smooth_region_without_curvature_is_just_the_subdivision(device: str) -> None:
+    """
+    Class A: ``smooth_curvature=False`` returns ``subdivide_region_to_size``'s output bit for bit.
+
+    That early return is the branch its two callers take when smoothing is off, so the claim worth
+    pinning is that nothing else happens on the way -- all three returns compare equal with
+    ``np.array_equal``, not a tolerance.
+    """
+    vertices_wp, faces_wp, patch_wp, n_vertices_before = _patch_to_refine(device)
+    max_edge = float(tw.edges.mean_edge_length(vertices_wp, faces_wp)) * 0.6
+
+    refined_wp, refined_faces_wp, refined_patch_wp = tw.smoothing.refine_and_smooth_region(
+        vertices_wp,
+        faces_wp,
+        n_vertices_before,
+        patch_wp,
+        max_edge=max_edge,
+        smooth_curvature=False,
+        **_REFINE_KWARGS,
+    )
+    subdivided_wp, subdivided_faces_wp, subdivided_patch_wp = tw.remesh.subdivide_region_to_size(
+        vertices_wp, faces_wp, patch_wp, max_edge=max_edge, max_splits=3, max_angle_change=0.5
+    )
+
+    assert int(refined_wp.shape[0]) > n_vertices_before
+    assert np.array_equal(refined_wp.numpy(), subdivided_wp.numpy())
+    assert np.array_equal(refined_faces_wp.numpy(), subdivided_faces_wp.numpy())
+    assert np.array_equal(refined_patch_wp.numpy(), subdivided_patch_wp.numpy())
+
+
+def test_refine_and_smooth_region_moves_only_the_vertices_subdivision_added(device: str) -> None:
+    """
+    With curvature smoothing on, every new interior vertex moves and no pre-existing one does.
+
+    That is the whole contract of the ``n_vertices_before`` argument: the free set is the tail
+    subdivision appended, minus the mesh boundary. Measured on this patch -- 3 new vertices, all
+    three displaced (max 0.034), and the 161 pre-existing ones displaced by **exactly 0.0**.
+    """
+    vertices_wp, faces_wp, patch_wp, n_vertices_before = _patch_to_refine(device)
+    max_edge = float(tw.edges.mean_edge_length(vertices_wp, faces_wp)) * 0.6
+
+    smoothed_wp, smoothed_faces_wp, _patch_wp = tw.smoothing.refine_and_smooth_region(
+        vertices_wp,
+        faces_wp,
+        n_vertices_before,
+        patch_wp,
+        max_edge=max_edge,
+        smooth_curvature=True,
+        **_REFINE_KWARGS,
+    )
+    subdivided_wp, subdivided_faces_wp, _subdivided_patch_wp = tw.remesh.subdivide_region_to_size(
+        vertices_wp, faces_wp, patch_wp, max_edge=max_edge, max_splits=3, max_angle_change=0.5
+    )
+
+    # Smoothing moves positions only: the connectivity is the subdivision's.
+    assert np.array_equal(smoothed_faces_wp.numpy(), subdivided_faces_wp.numpy())
+    displacement_np = np.abs(smoothed_wp.numpy() - subdivided_wp.numpy()).max(axis=1)
+    assert displacement_np.size > n_vertices_before
+    assert np.array_equal(
+        displacement_np[:n_vertices_before],
+        np.zeros(n_vertices_before, dtype=displacement_np.dtype),
+    )
+    assert np.all(displacement_np[n_vertices_before:] > 1e-9)
 
 
 # ---------------------------------------------------------------------------

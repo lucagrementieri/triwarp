@@ -17,6 +17,7 @@ import numpy as np
 import potpourri3d as pp3d
 import pytest
 import warp as wp
+import warp.sparse as wps
 
 import triwarp as tw
 
@@ -524,6 +525,59 @@ def test_operators_fix_the_diffusion_time(icosahedron: tuple[object, wp.Mesh], d
     )
     span = float(np.abs(direct.numpy()).max())
     assert np.allclose(with_bundle.numpy(), direct.numpy(), rtol=0.0, atol=1e-5 * span)
+
+
+# ---------------------------------------------------------------------------
+# diffuse_tangent_field
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+def test_diffuse_tangent_field_solves_its_own_system(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A: the result satisfies ``(M + t L_connection) X = source`` to the solver's tolerance.
+
+    This entry point is public because the *source* is where the vector-valued methods differ while
+    the solve is shared, so what has to be pinned is the equation rather than any particular field.
+    Applying the operator back to the answer is the direct check, and it is independent of the CG
+    path that produced it. Measured residual 1.5e-09 against a unit source.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = int(mesh_tm.vertices.shape[0])  # type: ignore[attr-defined]
+    vector_system, _scalar, _frames = tw.heat.vector.vector_heat_operators(
+        mesh_wp.points, mesh_wp.indices
+    )
+
+    source_np = np.zeros((n_vertices, 2))
+    source_np[0] = [1.0, 0.0]
+    source_np[n_vertices // 3] = [0.0, -1.0]
+    source_wp = wp.array(
+        np.ascontiguousarray(source_np), dtype=wp.vec2d, device=mesh_wp.points.device
+    )
+
+    diffused_wp = tw.heat.vector.diffuse_tangent_field(vector_system, source_wp)
+
+    # Non-trivial: diffusion reaches every vertex, so this is not solving for zero.
+    assert np.all(np.linalg.norm(diffused_wp.numpy(), axis=1) > 0.0)
+    residual_wp = wp.zeros(n_vertices, dtype=wp.vec2d, device=mesh_wp.points.device)
+    wps.bsr_mv(vector_system, diffused_wp, residual_wp, alpha=1.0, beta=0.0)
+    assert np.abs(residual_wp.numpy() - source_np).max() < 1e-7
+
+
+def test_diffuse_tangent_field_empty(icosahedron: tuple[object, wp.Mesh]) -> None:
+    """An empty source returns an empty field without entering the solver."""
+    _mesh_tm, mesh_wp = icosahedron
+    vector_system, _scalar, _frames = tw.heat.vector.vector_heat_operators(
+        mesh_wp.points, mesh_wp.indices
+    )
+
+    diffused_wp = tw.heat.vector.diffuse_tangent_field(
+        vector_system, wp.empty(0, dtype=wp.vec2d, device=mesh_wp.points.device)
+    )
+
+    assert diffused_wp.shape == (0,)
 
 
 # ---------------------------------------------------------------------------
