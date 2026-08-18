@@ -10,11 +10,17 @@ import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshpy as mm
 from scipy.spatial import cKDTree
 from scipy.spatial.distance import pdist
 
 import triwarp as tw
-from tests.conversions import trimesh_to_open3d, trimesh_to_pymeshlab
+from tests.conversions import (
+    meshlib_bitset_to_numpy,
+    points_to_meshlib,
+    trimesh_to_open3d,
+    trimesh_to_pymeshlab,
+)
 
 
 @pytest.mark.parity("sample_surface", "trimesh", "igl")
@@ -217,18 +223,22 @@ def _blue_noise_statistics(
     )
 
 
-@pytest.mark.parity("blue_noise", "open3d", "pymeshlab", "igl")
+@pytest.mark.parity("blue_noise", "open3d", "pymeshlab", "igl", "meshlib")
 def test_sample_surface_blue_noise_matches_open3d_pymeshlab_and_igl(
     icosahedron: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:
     """
-    Class C: four blue-noise samplers, four algorithms, no correspondence between the point sets.
+    Class C: five blue-noise samplers, five algorithms, no correspondence between the point sets.
 
     triwarp reduces a dense pool by randomized priority (flat background grid), Open3D's
     ``sample_points_poisson_disk`` runs Yuksel's sample *elimination* from a dense uniform cloud,
     MeshLab's ``generate_sampling_poisson_disk`` is Corsini's hierarchical dart throwing, and
     ``igl.blue_noise`` is Bridson active-list dart throwing -- which is what triwarp itself ran
-    until the algorithm was replaced, and whose ``30x`` pool oversampling triwarp still uses.
+    until the algorithm was replaced, and whose ``30x`` pool oversampling triwarp still uses; and
+    **meshlib's ``pointUniformSampling`` subsamples a point cloud** rather than a surface, so it is
+    the one reference here that has to be given triwarp's own dense pool as its input -- which makes
+    its row the cleanest algorithm-against-algorithm reading of the five, since the pool is
+    identical.
     Nothing about the individual samples is shared -- not their count, not their positions, not even
     their number given the same parameter -- so the comparison is on the properties all four claim.
     MeshLab and igl both accept a *radius* (``radius=PureValue(r)`` overrides ``samplenum``; igl's
@@ -247,9 +257,10 @@ def test_sample_surface_blue_noise_matches_open3d_pymeshlab_and_igl(
 
     | | closest pair / r | worst gap / r | faces hit |
     |---|---|---|---|
-    | triwarp | 1.000 | 1.103 | 20 / 20 |
-    | igl, same radius | 1.000 | **1.073** | 20 / 20 |
+    | triwarp | 1.000 | 1.064 | 20 / 20 |
+    | igl, same radius | 1.000 | 1.073 | 20 / 20 |
     | MeshLab, same radius | 1.000 | 1.112 | 20 / 20 |
+    | meshlib, same radius and pool | 1.000 | **0.982** | 20 / 20 |
     | Open3D, same count | 0.926 | 1.197 | 20 / 20 |
     | uniform Monte Carlo | **0.005** | 1.878 | 20 / 20 |
     | one patch | **0.005** | **17.781** | **4 / 20** |
@@ -294,21 +305,33 @@ def test_sample_surface_blue_noise_matches_open3d_pymeshlab_and_igl(
         radius,
     )[2]
 
+    # meshlib thins a *cloud*, so it gets the same dense pool the statistics are measured against.
+    cloud_ml = points_to_meshlib(np.ascontiguousarray(dense_np, dtype=np.float64))
+    settings_ml = mm.UniformSamplingSettings()
+    settings_ml.distance = radius
+    points_ml = dense_np[
+        meshlib_bitset_to_numpy(mm.pointUniformSampling(cloud_ml, settings_ml), dense_np.shape[0])
+    ]
+
     closest_wp, gap_wp, faces_wp = _blue_noise_statistics(
         mesh_tm, points_wp.numpy(), radius, dense_np
     )
     closest_pml, gap_pml, faces_pml = _blue_noise_statistics(mesh_tm, points_pml, radius, dense_np)
     closest_o3d, _gap_o3d, faces_o3d = _blue_noise_statistics(mesh_tm, points_o3d, radius, dense_np)
     closest_igl, gap_igl, faces_igl = _blue_noise_statistics(mesh_tm, points_igl, radius, dense_np)
+    closest_ml, gap_ml, faces_ml = _blue_noise_statistics(mesh_tm, points_ml, radius, dense_np)
 
-    # 1. The Poisson-disk property, on all four.
-    assert min(closest_wp, closest_pml, closest_o3d, closest_igl) >= 0.85
-    # 2. Space-filling, on the three that received the identical radius.
-    assert max(gap_wp, gap_pml, gap_igl) <= 1.4
-    # 3. Every face reached, on all four.
-    assert faces_wp == faces_pml == faces_o3d == faces_igl == mesh_tm.faces.shape[0]
+    # 1. The Poisson-disk property, on all five.
+    assert min(closest_wp, closest_pml, closest_o3d, closest_igl, closest_ml) >= 0.85
+    # 2. Space-filling, on the four that received the identical radius.
+    assert max(gap_wp, gap_pml, gap_igl, gap_ml) <= 1.4
+    # 3. Every face reached, on all five.
+    assert faces_wp == faces_pml == faces_o3d == faces_igl == faces_ml == mesh_tm.faces.shape[0]
     # 4. And the radius parametrization agrees: the same radius yields the same order of samples.
     assert 0.8 <= n_samples / points_pml.shape[0] <= 1.25
+    # meshlib keeps more of the pool at the same radius (measured 930 against 740, a ratio of
+    # 0.80), which is a maximal-set tie-breaking difference rather than a different radius.
+    assert 0.7 <= n_samples / points_ml.shape[0] <= 1.3
 
 
 def test_sample_surface_blue_noise_radius_invalid(icosahedron: tuple[tm.Trimesh, wp.Mesh]):

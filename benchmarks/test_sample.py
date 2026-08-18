@@ -61,15 +61,22 @@ from __future__ import annotations
 import math
 
 import igl
+import numpy as np
 import pymeshlab as ml
 import pytest
 import trimesh as tm
 from conftest import BenchCase, skip_larger_than
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
 _TARGET_SAMPLES = 2_000
 _SEED = 11
+
+# Pool oversampling for the one reference that thins a cloud instead of a surface. 30x is the factor
+# ``igl::blue_noise`` uses and the one triwarp's own sampler inherited, so every row selects from a
+# pool of the same density -- otherwise the row would be measuring how big a pool it was handed.
+_POOL_FACTOR = 30
 
 # Radius multipliers applied to the ~2k-sample baseline. Halving the radius multiplies the
 # background grid's cells by 8 and quadruples the samples that fit, so this is the module's dominant
@@ -148,7 +155,7 @@ def test_sample_surface(bench_case: BenchCase, count: int) -> None:
 
 
 @pytest.mark.benchmark(group="blue_noise")
-@pytest.mark.benchlibs("triwarp", "igl", "open3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "igl", "open3d", "pymeshlab", "meshlib")
 @pytest.mark.parametrize("radius_scale", _RADIUS_SCALES, ids=["r1", "rhalf"])
 def test_sample_surface_blue_noise(bench_case: BenchCase, radius_scale: float) -> None:
     """
@@ -164,6 +171,13 @@ def test_sample_surface_blue_noise(bench_case: BenchCase, radius_scale: float) -
     radius directly, so it and MeshLab both receive triwarp's own parameter. It is Bridson
     active-list dart throwing, which is what triwarp *was* before ``ae26e8f``: four schemes across
     four libraries on one parametrization.
+
+    **meshlib is the fifth, and the only one that thins a point cloud rather than a surface.** Its
+    row therefore gets the dense pool that every one of these algorithms builds internally,
+    supplied as its input and *not* timed -- which makes it the one row that prices the selection
+    alone, where the other four each carry their own pool construction. Read the gap between it
+    and triwarp as selection-against-selection, and the gap between triwarp and igl or MeshLab as
+    the whole pipeline. ``UniformSamplingSettings.distance`` is the radius, given the same value.
     """
     skip_larger_than(bench_case, "bunny")
     # Halving the radius quadruples the samples that fit (area / radius^2).
@@ -187,6 +201,23 @@ def test_sample_surface_blue_noise(bench_case: BenchCase, radius_scale: float) -
                 radius=ml.PureValue(radius)
             )
         )
+        return
+    if bench_case.kind == "meshlib":
+        # The pool is the input here, so it is built (and uploaded) outside the timed callable; the
+        # cloud must also outlive the call, which is MeshLib's rule for anything holding one.
+        from meshlib import mrmeshnumpy as mn
+
+        radius = radius_scale * _radius_for_mesh(bench_case)
+        pool_np, _face_index_np = tm.sample.sample_surface(
+            tm.Trimesh(bench_case.vertices_np, bench_case.faces_np, process=False),
+            _POOL_FACTOR * target,
+            seed=_SEED,
+        )
+        cloud_ml = mn.pointCloudFromPoints(np.ascontiguousarray(pool_np, dtype=np.float64))
+        settings_ml = mm.UniformSamplingSettings()
+        settings_ml.distance = radius
+        sampled_ml = bench_case.run(lambda: mm.pointUniformSampling(cloud_ml, settings_ml))
+        assert 0 < sampled_ml.count() <= pool_np.shape[0]
         return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
