@@ -119,9 +119,9 @@ one per wave.
 
   What *is* a defect is placement: a general geometric predicate living in a module that owns an **algorithm**, so that unrelated modules import the algorithm to reach the geometry. `triangle_aabb` sat in `kernels/intersection.py` and `triangle_double_area` / `circumcircle_diameter` in `kernels/holes.py` for exactly that reason; all three are now in `predicates.py`, generic over the scalar type. When a helper is reached from a second module, ask which of the four it belongs in before adding the import.
 - Python-scope wrapper functions accept `wp.array[T]` for 1D buffers; use `twt.Array2dInt32`, `twt.Array2dFloat32`, etc. for rank-2 results (see §7).
-- For **2D** outputs, allocate with `twt.empty_int32_2d((rows, cols), device=...)` or `twt.empty_float32_2d(...)` instead of bare `wp.empty((rows, cols), ...)`.
+- For **2D** outputs, allocate with `twt.empty_2d((rows, cols), wp.int32, device=...)` — the dtype is an argument, not part of the name — instead of bare `wp.empty((rows, cols), ...)`. `twt.empty_3d` is the rank-3 counterpart.
 - For **1D** outputs, keep `wp.empty(n, dtype=..., device=input.device)` when all elements will be written by the kernel (avoid unnecessary zero-initialization).
-- Return rank-2 buffers with `return twt.as_array2d_int32(arr)` (or `as_array2d_float32`) so callers get a checked, correctly typed value.
+- Return rank-2 buffers with `return twt.as_array2d(arr, wp.int32)` so callers get a checked, correctly typed value. The `dtype` argument selects the overload that narrows to `twt.Array2dInt32` / `Array2dFloat32` / `Array2dFloat64`.
 - Always forward `device=vertices.device` (or the relevant input's device) to `wp.launch` and allocation helpers.
 - Derive the face count as `f = faces.shape[0] // 3` from the flat face index array.
 
@@ -824,24 +824,24 @@ Kernels in `triwarp/kernels/` keep `wp.array2d[dtype]` unchanged.
 ### Empty 2D allocation
 
 ```python
-edges_wp = twt.empty_int32_2d((n_faces * 3, 2), device=faces_wp.device)
-angles_wp = twt.empty_float32_2d((f, 3), device=vertices_wp.device)
+edges_wp = twt.empty_2d((n_faces * 3, 2), wp.int32, device=faces_wp.device)
+angles_wp = twt.empty_2d((f, 3), wp.float32, device=vertices_wp.device)
 ```
 
 Empty mesh / no adjacency early return:
 
 ```python
 if n_faces == 0:
-    return twt.empty_int32_2d((0, 2), device=faces_wp.device)
+    return twt.empty_2d((0, 2), wp.int32, device=faces_wp.device)
 ```
 
 ### Returns and parameters
 
 ```python
 def faces_to_edges(faces_wp: wp.array[wp.int32], sorted: bool = False) -> twt.Array2dInt32:
-    out_wp = twt.empty_int32_2d((n_faces * 3, 2), device=faces_wp.device)
+    out_wp = twt.empty_2d((n_faces * 3, 2), wp.int32, device=faces_wp.device)
     wp.launch(kernel_graph.faces_to_edges, dim=n_faces, inputs=[faces_wp, out_wp], device=faces_wp.device)
-    return twt.as_array2d_int32(out_wp)
+    return twt.as_array2d(out_wp, wp.int32)
 ```
 
 Optional 2D arguments: `edges_sorted_wp: twt.Array2dInt32 | None = None`.
@@ -849,7 +849,7 @@ Optional 2D arguments: `edges_sorted_wp: twt.Array2dInt32 | None = None`.
 ### Runtime checks (not `isinstance`)
 
 - `twt.ensure_ndim(arr_wp, 2, dtype=wp.int32)` — validate rank and dtype on inputs.
-- `twt.as_array2d_int32(arr_wp)` / `twt.as_array2d_float32(arr_wp)` — check then narrow the return type for Pyright.
+- `twt.as_array2d(arr_wp, wp.int32)` — check then narrow the return type for Pyright. Overloaded on the `dtype` argument for `wp.int32` / `wp.float32` / `wp.float64`; `twt.as_array3d` covers `wp.float32` / `wp.bool` at rank 3.
 
 Do not use `isinstance(..., wp.array2d)`; use the helpers above.
 

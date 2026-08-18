@@ -157,6 +157,22 @@ def query_bvh_aabb_with_offsets(
         hit counts. Query ``k`` owns
         ``candidate_indices_flat[offsets[k] : offsets[k+1]]`` where ``offsets[m]``
         is understood as ``candidate_indices_flat.shape[0]``.
+
+    Notes
+    -----
+    That length is ``m``, **not** the ``m + 1`` sentinel-terminated form the ball queries offer
+    through their ``include_total`` keyword -- so unlike them, the last query's slice has to run to
+    the flat buffer's own length and reading ``offsets[m]`` raises ``IndexError``. The asymmetry is
+    deliberate rather than an oversight: this function's only in-repo consumer is a kernel that
+    recovers the owning query with ``kernels.array.binary_search_index`` and never addresses
+    ``offsets[m]``, so no call site needs the sentinel and section 14 rules out adding the keyword
+    for one that does not exist. A *Python-scope* caller iterating the queries does need it, and
+    ``np.append(offsets, indices.shape[0])`` is the one line that gets it.
+
+    See Also
+    --------
+    [`query_bvh_ball_with_offsets`][triwarp.neighbors.query_bvh_ball_with_offsets]
+        The same packing for a ball query, with the ``include_total`` option this lacks.
     """
     device = queries.device
     m = int(queries.shape[0])
