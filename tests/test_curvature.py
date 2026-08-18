@@ -13,7 +13,7 @@ from tests.conversions import trimesh_to_pymeshlab
 
 @pytest.mark.parity("principal_curvature", "igl")
 def test_principal_curvature(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    """Curvature values against libigl reference on an icosahedron (frame-dependent path)."""
+    """Class A: curvature values against libigl on an icosahedron, frame-dependent path."""
     mesh_tm, mesh_wp = icosahedron
 
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
@@ -32,7 +32,7 @@ def test_principal_curvature(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
 
 
 def test_principal_curvature_half_torus(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    """Curvature values and directions on a surface with spatially varying curvature."""
+    """Class B (directions up to sign): values and directions where curvature varies."""
     mesh_tm, mesh_wp = half_torus
 
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
@@ -69,7 +69,7 @@ def test_principal_curvature_half_torus(half_torus: tuple[tm.Trimesh, wp.Mesh]) 
 
 def test_principal_curvature_frame_independent(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
-    The default frame-independent Weingarten map stays similar to the libigl reference.
+    Class C (a fraction bound): the frame-independent map stays close to libigl in the bulk.
 
     ``frame_independent=True`` solves the true generalized eigenproblem (a surface invariant)
     rather than libigl's frame-dependent symmetrized operator. The two formulations share the
@@ -171,6 +171,14 @@ def test_principal_curvature_directions_match_pymeshlab(torus: tuple[tm.Trimesh,
 
 @pytest.mark.parity("discrete_gaussian_curvature", "trimesh")
 def test_discrete_gaussian_curvature(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: the Cohen-Steiner/Morvan ball measure against trimesh's, at the same radius.
+
+    Both sides are fed *trimesh's* face angles, so the comparison isolates the ball integration
+    rather than re-testing [`triangles.face_angles`], which has its own oracle. Only four query
+    points, which is enough because the measure is local and each one integrates an independent
+    1-ring.
+    """
     mesh_tm, mesh_wp = hemisphere
 
     face_angles_tm = mesh_tm.face_angles
@@ -192,6 +200,14 @@ def test_discrete_gaussian_curvature(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
 
 @pytest.mark.parity("discrete_mean_curvature", "trimesh")
 def test_discrete_mean_curvature(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class A: the ball mean-curvature measure against trimesh's, over every vertex.
+
+    The radius of 2.0 exceeds the icosahedron, so every query integrates the whole mesh --
+    which is the case that exercises the ball clipping rather than avoiding it.
+    ``benchmarks/test_curvature.py`` records why pymeshlab cannot be the oracle here (a
+    different operator, 0.982 correlation with a 7 % offset).
+    """
     mesh_tm, mesh_wp = icosahedron
     radius = 2.0
     points_tm = mesh_tm.vertices

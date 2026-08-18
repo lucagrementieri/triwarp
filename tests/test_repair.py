@@ -222,6 +222,13 @@ def test_remove_duplicate_vertices_epsilon(device: str):
 def test_remove_duplicate_vertices_epsilon_negative_coordinates(
     icosahedron: tuple[tm.Trimesh, wp.Mesh], device: str
 ) -> None:
+    """
+    Class B (partition): igl decides which vertices merge when the grid indices go negative.
+
+    The fixture is centred at ``(-1, 0, 2)``, so every duplicated vertex has a negative
+    coordinate -- the case the row packing cannot take directly and where a wrong offset
+    silently merges the wrong pairs.
+    """
     # Any mesh spanning the origin rounds to negative grid indices, which the row packing cannot
     # take directly. The fixture is centred at (-1, 0, 2), so every duplicated vertex below has at
     # least one negative coordinate; igl is the oracle for which ones merge.
@@ -533,6 +540,13 @@ def test_make_winding_consistent_matches_igl(icosahedron: tuple[tm.Trimesh, wp.M
 
 @pytest.mark.parity("make_winding_consistent", "trimesh")
 def test_make_winding_consistent_repairs_flipped(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: an inconsistently-wound mesh must come back consistent.
+
+    The input is asserted inconsistent first, so the repair cannot pass by doing nothing. igl
+    supplies the elementwise comparison in [`test_make_winding_consistent_matches_igl`]; the
+    impossible case is [`test_make_winding_consistent_on_a_non_orientable_mesh`].
+    """
     mesh_tm, mesh_wp = icosahedron
     faces_flipped = mesh_tm.faces.copy()
     faces_flipped[::2] = faces_flipped[::2][:, ::-1]  # reverse winding of half the faces
@@ -564,7 +578,7 @@ def test_make_winding_consistent_on_a_non_orientable_mesh(
     mobius: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:
     """
-    The impossible branch: a Moebius band admits no consistent winding, so the flip pass cannot win.
+    Not a library comparison: a Moebius band admits no consistent winding, so the pass cannot win.
 
     What it does instead is worth pinning, because the docstring's post-condition does not hold
     here and a caller has to know what it gets: the flood-fill orients everything it reaches and the
@@ -597,6 +611,13 @@ def test_make_winding_consistent_idempotent(icosahedron: tuple[tm.Trimesh, wp.Me
 @pytest.mark.parity("make_volume", "trimesh")
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
 def test_make_volume_repairs_inversion(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Not a library comparison: an inward-wound closed mesh must come back enclosing positive volume.
+
+    Reversing *every* face leaves the winding consistent, so this is the state
+    ``make_winding_consistent`` cannot fix and ``make_volume`` exists for. Asserted false
+    before and true after.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     faces_inward = mesh_tm.faces[:, ::-1].copy()  # reverse every face -> inward normals
     vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, faces_inward, mesh_wp.device)
@@ -621,6 +642,13 @@ def test_make_volume_leaves_valid_mesh(icosahedron: tuple[tm.Trimesh, wp.Mesh]) 
 
 
 def test_make_normals_outward(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: both defects at once -- inconsistent winding *and* global inversion.
+
+    The composition is the claim: fixing consistency alone can leave the mesh inverted, and
+    fixing orientation alone cannot run on inconsistent input, so only the pair together
+    produces a volume.
+    """
     mesh_tm, mesh_wp = icosahedron
     faces_bad = mesh_tm.faces.copy()
     faces_bad[::2] = faces_bad[::2][:, ::-1]  # inconsistent winding
@@ -899,7 +927,7 @@ def test_remove_non_manifold_faces_matches_a_numpy_oracle(
 def test_remove_non_manifold_faces_leaves_an_edge_manifold_mesh_alone(
     icosahedron: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:
-    """An already edge-manifold mesh is returned untouched -- the loop breaks on the first pass."""
+    """Not a library comparison: an edge-manifold mesh is returned untouched, buffers included."""
     mesh_tm, mesh_wp = icosahedron
 
     new_vertices_wp, new_faces_wp = tw.repair.remove_non_manifold_faces(
@@ -1052,7 +1080,7 @@ def test_split_nonmanifold_splits_a_duplicated_face_further_than_igl(
     device: str, icosahedron: tuple[tm.Trimesh, wp.Mesh]
 ) -> None:
     """
-    The one documented divergence from igl, pinned so it cannot drift unnoticed.
+    Class D exemption, pinned: the one documented divergence from igl, on a duplicated face.
 
     Where an edge carries one half-edge in one direction and several in the other -- what a
     duplicated face produces -- igl keeps one arbitrarily chosen pair joined while triwarp
@@ -1123,6 +1151,12 @@ def test_remove_degenerate_faces_matches_trimesh(device: str) -> None:
 
 
 def test_remove_degenerate_faces_clean_mesh(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: a clean mesh must lose no face and no vertex.
+
+    The no-op direction, which a threshold that is slightly too aggressive fails while still
+    passing every test that feeds it a genuinely degenerate face.
+    """
     mesh_tm, mesh_wp = icosahedron
     kept_vertices_wp, kept_faces_wp = tw.repair.remove_degenerate_faces(
         mesh_wp.points, mesh_wp.indices
@@ -1132,6 +1166,13 @@ def test_remove_degenerate_faces_clean_mesh(icosahedron: tuple[tm.Trimesh, wp.Me
 
 
 def test_collapse_small_triangles_noop(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: nothing is below the threshold, so the mesh comes back untouched.
+
+    ``collapse_small_triangles`` is unbound in the igl wheel (section 6), so there is no
+    reference for this function at all -- the numpy oracle in this file covers the collapsing
+    case.
+    """
     mesh_tm, mesh_wp = icosahedron
     vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, mesh_wp.device)
     out_vertices_wp, out_faces_wp = tw.repair.collapse_small_triangles(
@@ -1360,7 +1401,7 @@ def test_remove_folded_faces_drops_the_fold(device: str) -> None:
 @pytest.mark.parity("bad_face_mask", "pymeshlab")
 def test_remove_folded_faces_matches_pymeshlab_on_which_faces_are_folded(device: str) -> None:
     """
-    MeshLab flips the fold where this deletes it, so compare the *detection*, not the output.
+    Class B (compare detection): MeshLab flips the fold where this deletes it.
 
     ``compute_selection_bad_faces(select_folded_faces=True)`` is the same dihedral criterion at the
     same threshold, and it reports a selection rather than editing the mesh — which makes it the

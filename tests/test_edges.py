@@ -38,6 +38,13 @@ def _vertices_np_to_wp(vertices_np: np.ndarray, device: str) -> wp.array:
 
 @pytest.mark.parity("faces_to_edges", "trimesh")
 def test_edges(device: str) -> None:
+    """
+    Class A: the directed ``3F`` edge table against ``trimesh.geometry.faces_to_edges``, in order.
+
+    Row order is part of the claim -- face-major, three per face -- because ``edges_face`` and
+    ``edges_unique_inverse`` are indexed by the same position. [`test_edges_match_igl`] is the
+    class-B version against a reference that groups by corner instead.
+    """
     rng = np.random.default_rng(0)
     faces_np = rng.integers(0, 50, size=(20, 3), dtype=np.int32)
     edges_np = tm.geometry.faces_to_edges(faces_np)
@@ -73,6 +80,12 @@ def test_edges_match_igl(device: str) -> None:
 
 @pytest.mark.parity("faces_to_edges_sorted", "trimesh")
 def test_edges_sorted(device: str) -> None:
+    """
+    Class A: the ``sorted=True`` form against trimesh's table with each row sorted.
+
+    The sort on the reference side *is* the definition of the keyword, not an accommodation,
+    which is why this stays class A rather than B.
+    """
     rng = np.random.default_rng(1)
     faces_np = rng.integers(0, 50, size=(20, 3), dtype=np.int32)
     edges_np = np.sort(tm.geometry.faces_to_edges(faces_np), axis=1)
@@ -95,6 +108,13 @@ def test_edges_empty(device: str) -> None:
 
 @pytest.mark.parity("edges_face", "trimesh")
 def test_edges_face(device: str) -> None:
+    """
+    Not a library comparison: the face index of each edge row is arithmetic, not another answer.
+
+    ``edges_face`` is ``repeat(arange(n_faces), 3)`` by construction, and that identity is what
+    lets a caller map an edge row back to its face. trimesh holds the same array, but deriving
+    it there would be this same expression.
+    """
     rng = np.random.default_rng(3)
     n_faces = 24
     faces_np = rng.integers(0, 50, size=(n_faces, 3), dtype=np.int32)
@@ -120,6 +140,14 @@ def test_edges_face_empty(device: str) -> None:
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("edges_unique", "trimesh")
 def test_edges_unique(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B (row-set canonicalization): the unique undirected edge set, both sides lexsorted.
+
+    triwarp's order comes from a parallel hash and trimesh's from ``unique_rows``, so neither
+    is defined; the rows are already min-first on both sides. The inverse that pairs with this
+    set is checked by [`test_edges_unique_inverse`], which this sort would otherwise
+    invalidate.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     unique_idx_tm, _ = tm_grouping.unique_rows(np.sort(mesh_tm.edges, axis=1))
@@ -136,6 +164,14 @@ def test_edges_unique(request: pytest.FixtureRequest, mesh_name: str) -> None:
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("edges_unique_inverse", "trimesh")
 def test_edges_unique_inverse(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Triwarp against triwarp: ``unique_edges[inverse]`` must rebuild the sorted edge table.
+
+    The inverse indexes into triwarp's *own* row order, which no reference shares and which
+    [`test_edges_unique`] deliberately sorts away -- so the reconstruction is the only sound
+    oracle. ``faces_to_edges`` carries its own trimesh comparison above, so this is not
+    circular.
+    """
     _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     unique_edges_wp, inverse_wp = tw.edges.edges_unique(mesh_wp.indices)
@@ -308,6 +344,14 @@ def test_edges_unique_inverse_standalone(request: pytest.FixtureRequest, mesh_na
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("edges_unique_length", "trimesh")
 def test_edges_unique_length(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B: the unique edge lengths as a sorted multiset, since the row orders differ.
+
+    Sorting the lengths is weaker than pairing each with its edge, and that is the honest limit
+    here: the pairing is pinned separately by [`test_edges_unique`] plus
+    [`test_edges_unique_inverse`]. The reference lengths come from a ``float32`` copy of the
+    vertices, so this is not measuring triwarp's precision against numpy's.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     unique_idx_tm, _ = tm_grouping.unique_rows(np.sort(mesh_tm.edges, axis=1))
@@ -348,6 +392,13 @@ def test_edges_unique_length_precomputed(device: str) -> None:
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("edges_length", "trimesh")
 def test_edges_length(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B: per-edge lengths as a sorted multiset, matching the unique form's convention.
+
+    Row order is in fact shared with trimesh here -- both face-major -- so this could compare
+    elementwise; it sorts for consistency with the test above, and [`test_edges`] is what pins
+    the order itself.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     edges_np = mesh_tm.edges
@@ -383,7 +434,7 @@ def test_edges_length_empty(device: str) -> None:
 @pytest.mark.parity("mean_edge_length", "trimesh")
 def test_mean_edge_length(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
-    The **per-face** average: every face contributes all three of its edges.
+    Not a library comparison: the **per-face** average, where every face counts three edges.
 
     An interior edge is therefore counted twice and a boundary edge once. The closing block asserts
     this really is a different number from

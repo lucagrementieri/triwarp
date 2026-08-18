@@ -15,6 +15,12 @@ from tests.conversions import faces_igl, trimesh_to_open3d, trimesh_to_pymeshlab
 
 @pytest.mark.parity("face_normals_and_areas", "trimesh")
 def test_face_normals_and_areas(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: the unit normal and the area per face, both against trimesh.
+
+    The two come out of one cross product, so comparing both is what separates a normalization
+    bug from a winding one -- a flipped face has the right area and the wrong normal.
+    """
     mesh_tm, mesh_wp = icosahedron
     normal_wp, area_wp = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)
     assert np.allclose(normal_wp.numpy(), mesh_tm.face_normals, rtol=1e-5, atol=1e-5)
@@ -122,6 +128,12 @@ def test_face_normals_and_areas_match_pyvista(half_torus: tuple[tm.Trimesh, wp.M
 
 
 def test_angles(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: the three corner angles per face against ``Trimesh.face_angles``, in corner order.
+
+    Column order is part of the claim -- angle ``i`` is at corner ``i`` -- because the
+    cotangent Laplacian and the angle defect both index it that way.
+    """
     mesh_tm, mesh_wp = half_torus
     angles_wp = tw.triangles.face_angles(mesh_wp.points, mesh_wp.indices)
     assert np.allclose(angles_wp.numpy(), mesh_tm.face_angles, rtol=1e-5, atol=1e-5)
@@ -140,7 +152,7 @@ def test_angles(half_torus: tuple[tm.Trimesh, wp.Mesh]):
 def test_face_quality_against_pymeshlab(
     half_torus: tuple[tm.Trimesh, wp.Mesh], metric: str, filter_metric: str
 ):
-    """The four VCG shape measures, against the filter they were ported from."""
+    """Class B (per-measure naming): the four VCG measures, against the filter they came from."""
     mesh_tm, mesh_wp = half_torus
     meshset_pml = trimesh_to_pymeshlab(mesh_tm)
     meshset_pml.compute_scalar_by_aspect_ratio_per_face(metric=filter_metric)
@@ -255,7 +267,7 @@ def test_face_angles_extremes_against_pyvista(half_torus: tuple[tm.Trimesh, wp.M
 
 @pytest.mark.parity("face_quality", "igl")
 def test_face_quality_aspect_ratio_against_igl(half_torus: tuple[tm.Trimesh, wp.Mesh]):
-    """``aspect_ratio`` is circumradius over twice the inradius, which igl gives as two arrays."""
+    """Class B (a derived ratio): igl gives the circumradius and inradius as two arrays."""
     mesh_tm, mesh_wp = half_torus
     vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
     faces_np = np.ascontiguousarray(mesh_tm.faces, dtype=np.int64)
@@ -306,6 +318,12 @@ def test_face_quality_unknown_metric(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
 
 
 def test_nondegenerate(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A on a boolean mask, against ``trimesh.triangles.nondegenerate``.
+
+    All-``True`` on this fixture, which is why the degenerate branch is covered separately by
+    the zero-area tests in this file -- a mask that was always ``True`` would pass here alone.
+    """
     mesh_tm, mesh_wp = hemisphere
     nondegenerate_tm = tm.triangles.nondegenerate(mesh_tm.triangles)
     nondegenerate_wp = tw.triangles.nondegenerate(mesh_wp.points, mesh_wp.indices)
@@ -313,6 +331,12 @@ def test_nondegenerate(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
 
 
 def test_barycentric_to_points(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: barycentric-to-Cartesian against trimesh, on random unnormalized coordinates.
+
+    The coordinates are not normalized to sum to one, which is deliberate: both libraries treat
+    them as affine weights, and normalizing would hide a divide the other does not do.
+    """
     mesh_tm, mesh_wp = hemisphere
     barycentric_np = np.random.default_rng(31).random((mesh_tm.triangles.shape[0], 3))
     points_tm = tm.triangles.barycentric_to_points(mesh_tm.triangles, barycentric_np)
@@ -358,6 +382,13 @@ def test_points_to_barycentric(hemisphere: tuple[tm.Trimesh, wp.Mesh], method: s
 
 
 def test_closest_point(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: the per-triangle closest point against ``trimesh.triangles.closest_point``.
+
+    Unlike the whole-mesh query in ``test_proximity``, each query is matched to *its own*
+    triangle, so there is no tie between faces and the point itself is comparable rather than
+    only its distance.
+    """
     mesh_tm, mesh_wp = hemisphere
     points_np = np.random.default_rng(33).random((mesh_tm.triangles.shape[0], 3))
     closest_points_tm = tm.triangles.closest_point(mesh_tm.triangles, points_np)

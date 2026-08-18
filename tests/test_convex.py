@@ -14,6 +14,15 @@ from tests.conversions import points_to_open3d, points_to_pymeshlab
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 def test_face_adjacency_projections(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B (dict index): the projection is keyed by its adjacency *pair*, not by row position.
+
+    triwarp and trimesh both return one projection per adjacent face pair, but in different row
+    orders, and the value only means anything paired with its own row -- so both sides are
+    indexed into a dict by ``(face_a, face_b)`` before comparing. The key-set assert is what
+    makes that sound: it fails if the two disagree about *which* pairs are adjacent, which a
+    value comparison over a shared key subset would hide.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     adjacency_tm = mesh_tm.face_adjacency
     projections_tm = mesh_tm.face_adjacency_projections
@@ -47,6 +56,13 @@ def test_face_adjacency_projections(request: pytest.FixtureRequest, mesh_name: s
 def test_face_adjacency_projections_precomputed(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
+    """
+    Triwarp against triwarp: the precomputed-normals path must give the same projections.
+
+    The oracle for the values is [`test_face_adjacency_projections`] above, against trimesh;
+    this pins only that supplying ``face_adjacency_unshared`` and ``face_normals`` takes the
+    same route as deriving them.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     adjacency_wp, adjacency_edges_wp = tw.adjacency.face_adjacency(
         mesh_wp.indices, return_edges=True
@@ -99,6 +115,13 @@ def test_face_adjacency_projections_empty(device: str) -> None:
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("face_adjacency_convex", "trimesh")
 def test_face_adjacency_convex(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B (dict index): the per-pair convexity flag, keyed like the projections above.
+
+    Same transform and the same reason as [`test_face_adjacency_projections`]. Non-vacuous by
+    fixture choice rather than by an assert: ``icosahedron`` is convex at every edge and
+    ``half_torus`` is not, so the boolean is exercised both ways across the parametrisation.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     adjacency_tm = mesh_tm.face_adjacency
     convex_tm = mesh_tm.face_adjacency_convex
@@ -128,6 +151,11 @@ def test_face_adjacency_convex(request: pytest.FixtureRequest, mesh_name: str) -
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
 def test_face_adjacency_convex_precomputed(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Triwarp against triwarp: the precomputed path must give the same convexity flags.
+
+    Oracle is [`test_face_adjacency_convex`]; this pins the precomputed-argument route only.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     adjacency_wp, adjacency_edges_wp = tw.adjacency.face_adjacency(
         mesh_wp.indices, return_edges=True

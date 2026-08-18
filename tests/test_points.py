@@ -26,6 +26,12 @@ def _fibonacci_sphere(n: int) -> np.ndarray:
 
 @pytest.mark.parity("point_plane_distance", "trimesh")
 def test_point_plane_distance(device: str) -> None:
+    """
+    Class A: signed distances against ``trimesh.points.point_plane_distance``, sign included.
+
+    The normal is not unit length here, which is what makes the normalization part of the claim
+    rather than an assumption both sides happen to share.
+    """
     rng = np.random.default_rng(0)
     points_np = rng.standard_normal((50, 3))
     plane_normal_np = rng.standard_normal(3)
@@ -65,6 +71,13 @@ def test_gram_matrix_empty(device: str) -> None:
 
 @pytest.mark.parity("fit_line", "trimesh")
 def test_fit_line(device: str) -> None:
+    """
+    Class B (sign fix): the major axis against ``trimesh.points.major_axis``, up to direction.
+
+    An eigenvector is defined only up to sign, so the comparison goes through
+    [`tests.comparisons.assert_same_up_to_sign`][]. The cloud is elongated 1000:1 so the axis
+    itself is well determined -- on an isotropic cloud there would be nothing to compare.
+    """
     rng = np.random.default_rng(2)
     # points strongly elongated along a known direction so the major axis
     # is well-defined and robust to the SVD sign convention.
@@ -176,7 +189,7 @@ def test_principal_axes_is_not_fit_line(device: str) -> None:
 
 
 def test_principal_axes_degenerate_spectrum(device: str) -> None:
-    """A near-equal eigenpair leaves its plane arbitrary; only the separated axis is comparable."""
+    """Class C (one axis only): a near-equal eigenpair leaves its own plane arbitrary."""
     rng = np.random.default_rng(5)
     # 1000:1 needle: axes 2 and 3 both sit in the noise, so their split is not determined.
     points_np = (rng.uniform(-10.0, 10.0, 200)[:, None] * np.array([0.3, 0.5, 0.8])) + (
@@ -320,6 +333,12 @@ def test_covariance_too_few_points_raises(device: str) -> None:
 
 
 def test_fit_line_large(device: str) -> None:
+    """
+    Class B (sign fix): the same comparison at 5 000 points, past the tiled reduction's tile size.
+
+    ``5000 = 78 * 64 + 8`` exercises both the multi-tile path and its remainder branch, which
+    the 200-point test above does not reach at all.
+    """
     # n far larger than TILE_1D (64) to exercise the multi-tile reduction path
     # and the remainder branch (5000 = 78 * 64 + 8).
     rng = np.random.default_rng(5)
@@ -338,6 +357,12 @@ def test_fit_line_large(device: str) -> None:
 
 
 def test_fit_plane_large(device: str) -> None:
+    """
+    Class B (sign fix on the normal): ``trimesh.points.plane_fit`` at 5 000 points.
+
+    Same multi-tile motivation as the line fit above. The centroid needs no sign fix and is
+    compared directly, which is what separates a reduction bug from an eigenvector one.
+    """
     # n far larger than TILE_1D (64) to exercise the multi-tile reduction path.
     rng = np.random.default_rng(6)
     points_np = rng.standard_normal((5000, 3))
@@ -352,6 +377,13 @@ def test_fit_plane_large(device: str) -> None:
 
 
 def test_point_plane_distance_no_origin(device: str) -> None:
+    """
+    Class A: the default-origin overload, where the plane passes through the world origin.
+
+    A separate test because the default is a different code path, not a value the caller could
+    pass -- and an implementation defaulting to the *centroid* instead would pass the test
+    above and fail this one.
+    """
     rng = np.random.default_rng(1)
     points_np = rng.standard_normal((30, 3))
     plane_normal_np = rng.standard_normal(3)
@@ -366,6 +398,13 @@ def test_point_plane_distance_no_origin(device: str) -> None:
 
 @pytest.mark.parity("radial_sort", "trimesh")
 def test_radial_sort(device: str) -> None:
+    """
+    Class A: the angular order against a numpy ``arctan2`` argsort, index for index.
+
+    The angles are evenly spaced by construction, which is what makes an exact index comparison
+    sound: with random angles two neighbours can differ by less than ``float32`` resolves and
+    the orders diverge legitimately (section 6's note on ``lexsort`` and float ties).
+    """
     rng = np.random.default_rng(7)
     n = 256
     # evenly spaced angles so the radial order is unambiguous and float32 cannot
@@ -390,6 +429,12 @@ def test_radial_sort(device: str) -> None:
 
 
 def test_radial_sort_with_start(device: str) -> None:
+    """
+    Class A: the same order rotated to begin at a supplied start direction.
+
+    The input is permuted first, so a function ignoring ``start`` and returning the input order
+    cannot pass. The reference rotation is computed in numpy from the same start vector.
+    """
     rng = np.random.default_rng(8)
     n = 256
     theta_np = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
@@ -548,7 +593,7 @@ def test_outlier_probability_matches_scipy(device: str) -> None:
 
 @pytest.mark.parity("outlier_probability", "pymeshlab")
 def test_outlier_probability_ranks_the_planted_outliers(device: str) -> None:
-    """The 15 far points are the 15 highest-scoring, and pymeshlab's selection is a subset."""
+    """Class C (a ranking plus a subset): the 15 planted outliers must score highest."""
     k = 32
     n_inliers, n_outliers = 400, 15
     points_np = _cloud_with_outliers(n_inliers=n_inliers, n_outliers=n_outliers)
@@ -605,6 +650,13 @@ def test_outlier_probability_shape_mismatch(device: str) -> None:
 
 @pytest.mark.parity("statistical_outlier_mask", "open3d")
 def test_statistical_outlier_mask_matches_open3d(device: str) -> None:
+    """
+    Class B (mask inversion): Open3D returns the indices it *keeps*, so they are inverted.
+
+    Both sides use the same ``k`` and ``std_ratio`` and the same planted cloud, so the
+    comparison is exact on the mask -- the transform is only that Open3D reports the
+    complement.
+    """
     k, std_ratio = 20, 2.0
     points_np = _cloud_with_outliers()
 
@@ -626,6 +678,13 @@ def test_statistical_outlier_mask_empty(device: str) -> None:
 
 @pytest.mark.parity("vector_angle", "trimesh")
 def test_vector_angle(device: str) -> None:
+    """
+    Class B (input packing): ``trimesh.geometry.vector_angle`` wants the pairs as ``(n, 2, 3)``.
+
+    The named transform is the reshape on the reference side; the values are compared directly.
+    Unit vectors on both sides, so this is the angle formula alone rather than a normalization
+    test.
+    """
     rng = np.random.default_rng(42)
     n = 64
     vecs_a_np = rng.standard_normal((n, 3))

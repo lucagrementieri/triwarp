@@ -58,6 +58,14 @@ def test_vertex_tangent_frames_are_orthonormal(
 def test_vertex_tangent_frames_match_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Class B (gauge fix): only the normal is comparable directly; the tangents share a rotation.
+
+    Both libraries pick ``basis_x`` by their own convention, so the comparison is that the two
+    frames differ by a rotation *about the shared normal* -- one angle for the whole frame,
+    checked by reconstructing each side's ``basis_y`` from the other's. Comparing ``basis_x``
+    elementwise is what section 6 rules out.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     basis_x_wp, basis_y_wp, normal_wp = tw.tangent_space.vertex_tangent_frames(
         mesh_wp.points, mesh_wp.indices
@@ -148,6 +156,14 @@ def test_halfedge_tangent_angles_span_the_rescaled_disk(
 def test_halfedge_transport_angle_holonomy_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Class B (holonomy): a single transport angle is gauge-dependent; the loop product is not.
+
+    The reference rotations cancel around a closed loop, so the face holonomy is the only
+    comparable quantity -- extracted from potpourri3d's connection Laplacian by dividing out
+    its real cotangent weights. The comment above records why ``cave_cube`` and ``half_torus``
+    cannot be used at all.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     rho = tw.tangent_space.halfedge_transport_angles(mesh_wp.points, mesh_wp.indices).numpy()
 

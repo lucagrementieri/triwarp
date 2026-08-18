@@ -57,6 +57,13 @@ def _run_both(
 
 
 def test_procrustes_default(device: str) -> None:
+    """
+    Class A: the transform, the transformed cloud and the cost against ``trimesh.registration``.
+
+    All three returns are compared, not just the matrix: a transposed rotation still gives a
+    plausible matrix and a wrong cloud. The clouds are related by a known rigid motion, so the
+    optimum is unique and the comparison can be elementwise.
+    """
     rng = np.random.default_rng(0)
     a_np, b_np = _make_point_clouds(rng)
     matrix_tm, transformed_tm, cost_tm, matrix_tw, transformed_wp, cost_tw = _run_both(
@@ -93,6 +100,12 @@ def test_procrustes_return_cost_arity(device: str) -> None:
 
 
 def test_procrustes_uniform_weights(device: str) -> None:
+    """
+    Class A: an all-ones weight vector must reproduce the unweighted answer exactly.
+
+    The degenerate case of the weighted path, and the one that catches a normalization missing
+    from the weighted moments -- it would still converge, just to a different scale.
+    """
     rng = np.random.default_rng(1)
     a_np, b_np = _make_point_clouds(rng)
     n = a_np.shape[0]
@@ -106,6 +119,12 @@ def test_procrustes_uniform_weights(device: str) -> None:
 
 
 def test_procrustes_binary_weights(device: str) -> None:
+    """
+    Class A: zero weights must exclude their points, matching trimesh on the retained half.
+
+    Half the cloud is weighted out, so an implementation that ignores weights fits a different
+    optimum and fails. trimesh takes the same weights, so this stays elementwise.
+    """
     rng = np.random.default_rng(2)
     a_np, b_np = _make_point_clouds(rng)
     n = a_np.shape[0]
@@ -122,6 +141,12 @@ def test_procrustes_binary_weights(device: str) -> None:
 
 
 def test_procrustes_no_reflection(device: str) -> None:
+    """
+    Class A on the ``reflection=False`` branch, where the rotation is constrained to det = +1.
+
+    A separate test per flag because each changes the SVD post-processing rather than the
+    input; trimesh exposes the identical switch.
+    """
     rng = np.random.default_rng(3)
     a_np, b_np = _make_point_clouds(rng)
     matrix_tm, transformed_tm, cost_tm, matrix_tw, transformed_wp, cost_tw = _run_both(
@@ -133,6 +158,12 @@ def test_procrustes_no_reflection(device: str) -> None:
 
 
 def test_procrustes_no_translation(device: str) -> None:
+    """
+    Class A on the ``translation=False`` branch: the clouds are not centred first.
+
+    Same reasoning as the flag above -- and this is the branch where a mistakenly-subtracted
+    centroid would still produce a valid-looking rotation.
+    """
     rng = np.random.default_rng(4)
     a_np, b_np = _make_point_clouds(rng)
     matrix_tm, transformed_tm, cost_tm, matrix_tw, transformed_wp, cost_tw = _run_both(
@@ -144,6 +175,11 @@ def test_procrustes_no_translation(device: str) -> None:
 
 
 def test_procrustes_no_scale(device: str) -> None:
+    """
+    Class A on the ``scale=False`` branch, which fixes the scale factor at one.
+
+    Completes the three flags. Compared elementwise against trimesh's identical switch.
+    """
     rng = np.random.default_rng(5)
     a_np, b_np = _make_point_clouds(rng)
     matrix_tm, transformed_tm, cost_tm, matrix_tw, transformed_wp, cost_tw = _run_both(
@@ -156,7 +192,7 @@ def test_procrustes_no_scale(device: str) -> None:
 
 def test_procrustes_far_from_origin(device: str) -> None:
     """
-    Single-pass moments must survive a cloud far from the origin.
+    Class A: single-pass moments must survive a cloud far from the origin.
 
     The fused accumulation shifts by ``a[0]`` rather than by the origin precisely so the
     cancellation in the second-moment identity stays bounded by ``(diameter / spread) ** 2``
@@ -188,7 +224,7 @@ def test_procrustes_far_from_origin(device: str) -> None:
 
 
 def test_procrustes_fractional_weights(device: str) -> None:
-    """Non-binary weights: the masked covariance and the weighted moments must agree."""
+    """Class A: with non-binary weights, the masked covariance and weighted moments agree."""
     rng = np.random.default_rng(12)
     a_np, b_np = _make_point_clouds(rng)
     weights_np = rng.uniform(0.1, 3.0, size=a_np.shape[0])
@@ -202,6 +238,13 @@ def test_procrustes_fractional_weights(device: str) -> None:
 
 @pytest.mark.parity("procrustes", "trimesh")
 def test_procrustes_return_matrix_only(device: str) -> None:
+    """
+    Triwarp against triwarp: ``return_cost=False`` returns only the matrix it otherwise would.
+
+    A signature claim rather than a numerical one -- the matrix's oracle is
+    [`test_procrustes_default`] -- and what it catches is a return tuple that changed shape
+    silently.
+    """
     rng = np.random.default_rng(6)
     a_np, b_np = _make_point_clouds(rng)
     a_wp = _to_wp(a_np, device)
@@ -333,7 +376,7 @@ def test_icp_point_to_plane_matches_open3d(
     device: str, robust_kernel: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
 ) -> None:
     """
-    Point-to-plane ICP against Open3D's, plain and under a Tukey loss.
+    Class C (a fit-error bound): point-to-plane ICP against Open3D's, plain and robust.
 
     Both benchmark groups are the same solver at two robust-kernel settings, and Open3D exposes the
     matching pair -- ``TransformationEstimationPointToPlane()`` and the same wrapped in
@@ -386,6 +429,13 @@ def test_icp_point_to_plane_matches_open3d(
 
 
 def test_icp_point_to_point_cloud(device: str) -> None:
+    """
+    Not a library comparison: ICP must recover a known rigid motion it was given exactly.
+
+    The target is a transformed copy of the source, so the answer is known in closed form and
+    no reference is needed; [`test_icp_point_to_point_matches_open3d_and_trimesh`] is the
+    cross-library comparison. This is the test that would catch a converged-but-wrong fit.
+    """
     rng = np.random.default_rng(10)
     target_np = rng.standard_normal((300, 3)).astype(np.float32)
     rotation_np, translation_np = _rigid_transform(0.15, [0.2, 0.7, 0.1], [0.05, -0.03, 0.04])

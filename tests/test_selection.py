@@ -92,6 +92,12 @@ def test_submesh_from_face_indices_random_faces(
 def test_submesh_from_face_indices_all_faces(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
+    """
+    Class A: selecting every face must reproduce the input mesh, not merely an equivalent one.
+
+    The identity case, and the one that pins the compaction's *order*: any renumbering that is
+    not the identity here would still give a valid mesh with the same geometry.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_faces = mesh_tm.faces.shape[0]
     face_indices_np = np.arange(n_faces, dtype=np.int32)
@@ -110,7 +116,7 @@ def test_submesh_from_face_indices_all_faces(
 def test_submeshes_from_face_groups_matches_single(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
-    """Every group's slice must equal ``submesh_from_face_indices`` run on that group alone."""
+    """Triwarp against triwarp: each group's slice equals the single-group call on that group."""
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     device = mesh_wp.points.device
     rng = np.random.default_rng(11)
@@ -403,7 +409,7 @@ def test_expand_vertex_mask(device: str):
 @pytest.mark.parity("expand_vertex_mask", "pymeshlab")
 def test_expand_vertex_mask_matches_pymeshlab_dilatation(device: str):
     """
-    Mask growth against MeshLab's Dilate Selection, which is the only external check it has.
+    Class B (face-based morphology): MeshLab dilates a *face* selection, not a vertex one.
 
     Neither trimesh nor open3d nor libigl has selection morphology. MeshLab does, but it dilates the
     *face* set, so the composition that lines up with a vertex-mask hop is:

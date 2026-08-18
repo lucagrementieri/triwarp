@@ -72,6 +72,14 @@ def test_query_mesh_aabb_bounds_with_offsets(device: str) -> None:
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
 def test_closest_point_on_mesh_random(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A on the distance, class C on the point: ties make the closest *point* ambiguous.
+
+    200 random queries against ``trimesh.proximity.closest_point``. The distance is the well-
+    defined quantity and is compared directly; a query equidistant from two faces has two valid
+    closest points, and section 6 records the same divergence against Open3D at ~2e-4. Warp's
+    own ``mesh_query_point_no_sign`` is off by up to 2.1e-5, which sets the floor here.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     rng = np.random.default_rng(42)
     points_np = rng.random((200, 3), dtype=np.float64) * 4.0 - 2.0
@@ -131,6 +139,13 @@ def test_closest_point_on_mesh_ambiguous_edge(device: str) -> None:
 
 
 def test_closest_point_on_mesh_unreferenced_vertex(device: str) -> None:
+    """
+    Class A: an unreferenced vertex must not attract the query, on a one-face mesh.
+
+    The stray vertex sits closer to the query than the single face does, so an implementation
+    searching *vertices* rather than triangles returns it and fails -- which is exactly the bug
+    this exists for. trimesh ignores it too, so the comparison is elementwise.
+    """
     query_np = np.array([[-1.0, -1.0, -1.0]], dtype=np.float64)
     mesh_tm = tm.Trimesh(
         vertices=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [-0.5, -0.5, -0.5]],
@@ -406,7 +421,7 @@ def test_signed_distance_on_mesh_matches_pyvista(
 def test_signed_distance_on_mesh_winding_matches_trimesh(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
-    """On a watertight mesh the winding-number sign must agree with the trimesh reference."""
+    """Class B (sign only): winding parity against trimesh's on a watertight mesh."""
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     rng = np.random.default_rng(42)
     points_np = rng.random((200, 3), dtype=np.float64) * 4.0 - 2.0
@@ -619,6 +634,13 @@ def test_signed_distance_on_mesh_empty_faces(device: str) -> None:
 @pytest.mark.parametrize("tiled", [False, True])
 @pytest.mark.parity("winding_number", "igl")
 def test_winding_number_random(request: pytest.FixtureRequest, mesh_name: str, tiled: bool) -> None:
+    """
+    Class A: the generalized winding number against ``igl.winding_number``, both kernels.
+
+    Parametrized over ``tiled`` so the serial and block-cooperative sums are each held to the
+    same reference rather than to each other -- 200 queries spanning inside, outside and near-
+    surface.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     rng = np.random.default_rng(42)
     query_np = rng.random((200, 3), dtype=np.float64) * 4.0 - 2.0
@@ -648,7 +670,7 @@ def test_winding_number_tiled_matches_exact(icosahedron: tuple[tm.Trimesh, wp.Me
 @pytest.mark.parametrize("kernel_device", ["cpu", "cuda:0"])
 def test_winding_number_tiled_matches_igl_on_both_devices(kernel_device: str) -> None:
     """
-    Pin the tiled winding sum on the CPU device, where the ``device`` fixture never runs it.
+    Class A: the tiled winding sum on the CPU device the ``device`` fixture never reaches.
 
     ``wp.launch_tiled`` executes exactly one lane per block on Warp 1.16's CPU backend -- the lane
     index from ``wp.tid()`` is always 0 -- so the block-wide ``wp.tile_sum`` this reduction used to

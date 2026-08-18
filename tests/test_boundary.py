@@ -20,6 +20,13 @@ OPEN_MESHES = ["hemisphere", "half_torus"]
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
 @pytest.mark.parity("boundary_edges", "trimesh")
 def test_boundary_edges(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B (row-set canonicalization): trimesh's multiplicity-1 edge rows, both sides lexsorted.
+
+    Neither library defines the order in which boundary edges come back, so the sets are
+    compared rather than the sequences; the rows themselves are already min-first on both
+    sides, which is what makes the lexsort sufficient.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     boundary_edges_tm = mesh_tm.edges_sorted[_boundary_indices_tm(mesh_tm)]
@@ -30,6 +37,13 @@ def test_boundary_edges(request: pytest.FixtureRequest, mesh_name: str) -> None:
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
 def test_oriented_boundary_edges(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B, and the transform is *weaker* than the one above -- deliberately.
+
+    These edges are directed, so the rows must not be sorted within themselves: only the row
+    order is canonicalized. That is the whole difference from [`test_boundary_edges`], and it
+    is what makes this the test that would catch a reversed half-edge.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     oriented_edges_tm = mesh_tm.edges[_boundary_indices_tm(mesh_tm)]
@@ -102,6 +116,13 @@ def test_boundary_edges_match_pyvista(request: pytest.FixtureRequest, mesh_name:
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
 def test_boundary_vertices(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B: the *positions* of the boundary vertices, gathered on the reference side.
+
+    trimesh returns boundary *edges*, so the named transform is ``vertices[unique(edges)]`` --
+    which also fixes the order, since ``np.unique`` sorts and triwarp returns ascending indices
+    too.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     boundary_edges_tm = mesh_tm.edges_sorted[_boundary_indices_tm(mesh_tm)]
@@ -162,6 +183,15 @@ def test_boundary_empty(device: str) -> None:
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
 @pytest.mark.parity("boundary_loops", "igl")
 def test_boundary_loops(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A, and unusually strong for a loop comparison: same count, order and start vertex.
+
+    ``igl.boundary_loop_all`` happens to agree with triwarp on all three -- loops ranked by
+    length, each starting at its lowest vertex index and walked the same way round -- so no
+    canonicalization is needed at all. [`test_boundary_loops_matches_trimesh_outline`] is the
+    class-B version of the same claim, against a reference that fixes none of those
+    conventions.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     loops_igl = igl.boundary_loop_all(mesh_tm.faces.astype(np.int64))
@@ -313,6 +343,12 @@ def test_boundary_loops_non_manifold_terminates(device: str) -> None:
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
 def test_boundary_loop(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: the singular form against ``igl.boundary_loop``, which is igl's *longest* loop.
+
+    That projection is a real difference from ``boundary_loop_all`` and is why this is its own
+    test: on ``half_torus``, whose two rims are the same length, it also pins the tie-break.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     loop_igl = igl.boundary_loop(mesh_tm.faces.astype(np.int64))
@@ -436,7 +472,7 @@ def test_ears_match_igl(device: str, faces_np: np.ndarray, expected_ears: int) -
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
 def test_ears_none_on_smooth_boundary(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
-    Neither library finds an ear on either open fixture, which is why they cannot carry parity.
+    Class D exemption in test form: neither library finds an ear on either open fixture.
 
     A rim built by subdivision never leaves a triangle with two boundary edges, so this is the
     negative half of ``test_ears_match_igl`` and is kept separate from it rather than standing in

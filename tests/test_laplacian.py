@@ -171,6 +171,13 @@ def test_face_gradients_empty(device: str) -> None:
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("cotmatrix_entries", "igl")
 def test_cotmatrix_entries(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: the per-face half-cotangent table against ``igl.cotmatrix_entries``, column order too.
+
+    igl uses the same ``(n_faces, 3)`` opposite-corner convention, so no permutation is needed
+    -- which makes this the test that pins the column order every downstream assembly depends
+    on.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
     faces_np = np.array(mesh_tm.faces, dtype=np.int64)
@@ -189,6 +196,13 @@ def test_cotmatrix_entries(request: pytest.FixtureRequest, mesh_name: str) -> No
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("cotmatrix_entries_intrinsic", "igl")
 def test_cotmatrix_entries_intrinsic(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: the length-only overload, fed igl's own ``edge_lengths`` so only the formula differs.
+
+    Passing the reference's lengths in rather than triwarp's isolates the cotangent formula
+    from [`triwarp.edges`], which has its own oracle. igl overloads the same name on the
+    argument shape.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
     faces_np = np.array(mesh_tm.faces, dtype=np.int64)
@@ -204,6 +218,13 @@ def test_cotmatrix_entries_intrinsic(request: pytest.FixtureRequest, mesh_name: 
 
 
 def test_cotmatrix_entries_intrinsic_float64(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class A on the ``float64`` overload: the dtype must change without the values changing.
+
+    The dtype is asserted as well as the values, because a silent ``float32`` return would
+    still pass the ``1e-5`` comparison and lose precision only where it matters -- in a
+    downstream solve.
+    """
     mesh_tm, mesh_wp = icosahedron
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
     faces_np = np.array(mesh_tm.faces, dtype=np.int64)
@@ -227,6 +248,13 @@ def test_cotmatrix_entries_intrinsic_float64(icosahedron: tuple[tm.Trimesh, wp.M
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("cotmatrix", "igl")
 def test_cotmatrix(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: the assembled cotangent operator against ``igl.cotmatrix``, dense and elementwise.
+
+    Both are densified first, because the two builds order their CSR entries differently while
+    holding the same matrix. This is the igl sign convention (negative diagonal), which the
+    module's other operators deliberately do not share.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
     faces_np = np.array(mesh_tm.faces, dtype=np.int64)
@@ -280,6 +308,14 @@ def test_cotmatrix_and_mass_match_potpourri3d(
 
 
 def test_cotmatrix_null_space(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: the constant vector must be in the operator's null space.
+
+    Both sides are checked against the *property* rather than against each other -- igl at
+    1e-10 in float64 and triwarp at 1e-4 in float32 -- which is what makes the differing
+    thresholds honest rather than a hidden tolerance. Catches a row that does not sum to zero,
+    which a matrix comparison at 1e-5 can miss on a large-valued row.
+    """
     mesh_tm, mesh_wp = icosahedron
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
     faces_np = np.array(mesh_tm.faces, dtype=np.int64)
@@ -294,6 +330,12 @@ def test_cotmatrix_null_space(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
 
 
 def test_cotmatrix_empty_mesh(device: str) -> None:
+    """
+    Class A on the degenerate case: three vertices and no faces give an empty operator, sized 3x3.
+
+    The *shape* is the claim, not the values: igl sizes by ``len(V)`` and so must triwarp,
+    rather than returning a 0x0 matrix that would break a caller's dimensions.
+    """
     vertices_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
     faces_np = np.empty((0, 3), dtype=np.int64)
 
@@ -388,6 +430,13 @@ def test_cotmatrix_entries_are_zero_for_a_zero_area_face(device: str) -> None:
 def test_robust_laplacian_matches_igl_intrinsic_assembly(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Class A: the intrinsic assembly against ``igl.cotmatrix_intrinsic`` on identical lengths.
+
+    ``delta == 0.0`` is asserted first, which is what makes this a comparison of the *assembly*
+    alone: on a clean mesh mollification is the identity, so both sides see the same length
+    table and any difference is in how the entries are placed.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     lengths_wp, delta = tw.laplacian.mollify_intrinsic(mesh_wp.points, mesh_wp.indices)
     assert delta == 0.0  # these fixtures are clean, so the comparison is against the plain lengths
@@ -411,6 +460,13 @@ def test_robust_laplacian_matches_igl_intrinsic_assembly(
 def test_robust_laplacian_matches_igl_intrinsic_delaunay(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Class A against ``igl.intrinsic_delaunay_cotmatrix`` -- the strongest oracle in this module.
+
+    It pins the flip's new-edge-length formula and its winding bookkeeping at once, and it can
+    be elementwise because the intrinsic Delaunay triangulation is *unique*: the two
+    implementations need not perform the same flips in the same order to agree on the matrix.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     n_vertices = len(mesh_tm.vertices)
 
@@ -628,6 +684,14 @@ def test_laplacian_entries_assemble_into_the_laplacian(
 def test_laplacian_operator(
     request: pytest.FixtureRequest, mesh_name: str, equal_weight: bool
 ) -> None:
+    """
+    Class A: the row-normalized umbrella operator against ``trimesh.smoothing``, both weightings.
+
+    Both ``equal_weight`` branches are compared, which matters because the inverse-distance
+    branch also changes trimesh's default adjacency shape -- ``laplacian_entries``'
+    ``symmetric`` default tracks that, and
+    [`test_laplacian_entries_assemble_into_the_laplacian`] pins the tracking.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     operator_tm = tms.laplacian_calculation(mesh_tm, equal_weight=equal_weight).tocsr()
@@ -670,6 +734,13 @@ def test_laplacian_symmetric_flag(half_torus: tuple[tm.Trimesh, wp.Mesh]) -> Non
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("mass_matrix_entries", "igl")
 def test_mass_matrix(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B: ``mass_matrix_entries`` against the *diagonal* of ``igl.massmatrix``.
+
+    The named transform is taking igl's diagonal -- triwarp returns the lumped vector, not a
+    matrix. Despite the name this tests the entries; the assembled form is
+    [`test_mass_matrix_assembled_matches_igl`].
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
     faces_np = np.array(mesh_tm.faces, dtype=np.int64)

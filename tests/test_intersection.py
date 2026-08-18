@@ -57,6 +57,13 @@ def _segments_equal(
 
 @pytest.mark.parity("segments_with_plane", "trimesh")
 def test_segments_with_plane_axis_aligned(device: str) -> None:
+    """
+    Class A: crossing points and the validity mask against ``trimesh.intersections.plane_lines``.
+
+    Three hand-built segments cover the three cases the mask distinguishes: one crossing, one
+    entirely on the far side, one lying in the plane. Comparing the mask as well as the points
+    is what makes the last two testable at all, since they produce no point.
+    """
     plane_origin = np.array([0.0, 0.0, 0.0], dtype=np.float32)
     plane_normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
     endpoints_np = np.array(
@@ -89,6 +96,13 @@ def test_segments_with_plane_axis_aligned(device: str) -> None:
 
 
 def test_segments_with_plane_parallel(device: str) -> None:
+    """
+    Class A on the mask alone: a segment parallel to the plane has no crossing to compare.
+
+    Split out from the test above because the *point* is undefined here -- only the ``False``
+    in the validity mask is a claim, and asserting it beside real crossings would let a wrong
+    point hide.
+    """
     plane_origin = np.array([0.0, 0.0, 0.0], dtype=np.float32)
     plane_normal = np.array([0.0, 0.0, 1.0], dtype=np.float32)
     endpoints_np = np.array([[[0.0, 0.0, 1.0], [1.0, 0.0, 1.0]]], dtype=np.float32)
@@ -121,6 +135,14 @@ def test_mesh_with_plane_empty(device: str) -> None:
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("mesh_with_plane", "trimesh")
 def test_mesh_with_plane_axis_planes(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B (segment canonicalization): the cross-section as an unordered set of segments.
+
+    Neither library defines the segment order or which end of a segment comes first, so both
+    sides go through ``_segments_equal``, which sorts endpoints within a segment and then
+    segments within the set. Three axis planes through the centroid, so no plane misses the
+    mesh.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     bounds = mesh_tm.bounds
@@ -146,6 +168,13 @@ def test_mesh_with_plane_axis_planes(request: pytest.FixtureRequest, mesh_name: 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
 def test_mesh_with_plane_tilted_plane(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B: the same comparison on a plane aligned with no axis and no face.
+
+    An axis-aligned plane can pass through vertices and edges of a symmetric fixture, which
+    exercises the degenerate branches rather than the general one; an 11-degree tilt makes
+    every crossing a clean edge interior.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     axis = tm.unitize(np.array([1.0, 2.0, 0.3], dtype=np.float32))
@@ -167,6 +196,13 @@ def test_mesh_with_plane_tilted_plane(request: pytest.FixtureRequest, mesh_name:
 
 
 def test_mesh_with_plane_return_faces(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B: the ``return_faces`` half, where the face index must stay paired with its segment.
+
+    The segments are compared as a canonicalized set as above, and the face indices as a sorted
+    multiset -- pairing them elementwise is not possible once the segment order is
+    canonicalized, which is the honest limit of this comparison.
+    """
     mesh_tm, mesh_wp = icosahedron
     plane_normal = np.array([0.0, 0.0, 1.0])
     plane_origin = mesh_tm.centroid
@@ -235,6 +271,12 @@ def test_slice_mesh_with_plane_empty(device: str) -> None:
 
 @pytest.mark.parity("slice_mesh_with_plane", "trimesh")
 def test_slice_mesh_with_plane_box_corner() -> None:
+    """
+    Class B: a corner cut against ``slice_faces_plane``, compared as canonical winding rows.
+
+    The cut crosses three faces at once, which is the case where the retriangulation has a real
+    choice to make; a plane cutting one face at a time would not exercise it.
+    """
     mesh_tm = tm.creation.box()
     plane_origin_np = mesh_tm.bounds[1] - 0.05
     plane_normal_np = mesh_tm.bounds[1]
@@ -259,6 +301,13 @@ def test_slice_mesh_with_plane_box_corner() -> None:
 
 
 def test_slice_mesh_with_plane_box_top() -> None:
+    """
+    Class B: a face-parallel cut, where whole faces fall on one side rather than being split.
+
+    The complement of the corner case above: here the interesting behaviour is *keeping* faces
+    untouched, and a wrong side test would show up as a missing or duplicated face rather than
+    a bad triangulation.
+    """
     mesh_tm = tm.creation.box()
     plane_origin_np = mesh_tm.bounds[1] - 0.05
     plane_normal_np = np.array([0.0, 0.0, 1.0])
@@ -284,6 +333,13 @@ def test_slice_mesh_with_plane_box_top() -> None:
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
 def test_slice_mesh_with_plane_axis_planes(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B: three axis planes through the centroid on the curved and open fixtures.
+
+    The box tests above pin the retriangulation on flat faces with clean corners; these run the
+    same comparison where the cut meets many small faces and, on ``hemisphere``, an existing
+    boundary.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mid_np = 0.5 * (mesh_tm.bounds[0] + mesh_tm.bounds[1])
     planes = [
@@ -310,6 +366,12 @@ def test_slice_mesh_with_plane_axis_planes(request: pytest.FixtureRequest, mesh_
 
 
 def test_slice_mesh_with_plane_tilted_plane(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B: the tilted-plane cut, avoiding the vertex-and-edge coincidences an axis plane hits.
+
+    Same reasoning as [`test_mesh_with_plane_tilted_plane`]: the tilt is what makes this the
+    general case rather than the degenerate one.
+    """
     mesh_tm, mesh_wp = icosahedron
     axis_np = tm.unitize(np.array([1.0, 2.0, 0.3], dtype=np.float32))
     angle = np.radians(11)
@@ -334,6 +396,13 @@ def test_slice_mesh_with_plane_tilted_plane(icosahedron: tuple[tm.Trimesh, wp.Me
 
 
 def test_slice_mesh_with_plane_on_plane(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B: a plane exactly at the bounding box's top, so it touches the mesh without cutting it.
+
+    The boundary case between *cut* and *miss*, and the one where a strict-versus-inclusive
+    side test changes the answer. trimesh's convention is the reference, so this pins triwarp
+    to it rather than asserting a self-chosen one.
+    """
     mesh_tm, mesh_wp = icosahedron
     plane_origin_np = mesh_tm.bounds[1]
     plane_normal_np = np.array([0.0, 0.0, 1.0])
@@ -418,7 +487,7 @@ def test_split_mesh_with_plane_refines_without_cracking(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     """
-    The invariants that need no reference: crack-free, on-plane, side-pure and area-preserving.
+    Not a library comparison: crack-free, on-plane, side-pure and area-preserving invariants.
 
     Every one of these would fail for a per-face cut like
     [`slice_mesh_with_plane`][triwarp.intersection.slice_mesh_with_plane]'s, which is the point of
@@ -893,6 +962,14 @@ def _total_length(curves: list[np.ndarray], closed: list[bool]) -> float:
 def test_marching_triangles_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, axis: int, device: str
 ) -> None:
+    """
+    Class B (barycentric decoding): potpourri3d reports hits in its own element numbering.
+
+    Section 6 records the decode: ``(element_index, coords)`` pairs dispatched on
+    ``len(coords)`` through ``pp3d.edges``, and its closed curves repeat their first point
+    where triwarp's do not. Both transforms are on the reference side; the positions are then
+    compared directly.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
     faces_np = np.ascontiguousarray(mesh_tm.faces, dtype=np.int32)
@@ -986,6 +1063,13 @@ def test_marching_triangles_matches_igl(
 
 @pytest.mark.parity("marching_triangles_curves", "potpourri3d")
 def test_marching_triangles_many_components_matches_potpourri3d(device: str) -> None:
+    """
+    Class B, same decoding, on a field whose level set breaks into many small loops.
+
+    The single-contour test above exercises the per-face crossing arithmetic; this exercises
+    the segment *linking*, which is where a many-component field can drop or merge a loop while
+    every individual crossing stays right.
+    """
     # An oscillating field breaks the level set into many small loops, which is what exercises the
     # segment linking rather than the per-face crossing arithmetic.
     mesh_tm = tw.creation.icosphere(subdivisions=3)

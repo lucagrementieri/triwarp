@@ -56,6 +56,13 @@ def test_sample_surface(half_torus: tuple[tm.Trimesh, wp.Mesh]):
 
 
 def test_sample_surface_with_face_weights(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class C (a frequency comparison): two RNGs cannot produce the same samples.
+
+    What is comparable is the *distribution* of chosen faces, so the per-face frequency is
+    compared against trimesh's under the same weights -- a linear ramp, so an implementation
+    ignoring weights gives a flat histogram and fails clearly rather than marginally.
+    """
     mesh_tm, mesh_wp = icosahedron
     count = 10_000
 
@@ -321,6 +328,12 @@ def test_sample_surface_blue_noise_empty_faces(icosahedron: tuple[tm.Trimesh, wp
 
 
 def test_sample_volume_containment(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class C (containment): every sample must be inside, with trimesh as the inside/outside oracle.
+
+    Stochastic output with no correspondence, so containment is the strongest exact statement
+    available; the distribution is [`test_sample_volume_uniform`].
+    """
     mesh_tm, mesh_wp = icosahedron
     count = 5_000
     points_np = tw.sample.sample_volume(mesh_wp.points, mesh_wp.indices, count, seed=42).numpy()
@@ -329,6 +342,13 @@ def test_sample_volume_containment(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
 
 
 def test_sample_volume_uniform(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class C (a moment): the sample mean must approach the centre of mass.
+
+    The threshold is derived rather than chosen: at 20 000 samples the per-axis standard error
+    is ~0.003, so ``atol=0.05`` is ~16 sigma -- clear of noise and still tight enough to catch
+    a distribution biased toward one side of the solid.
+    """
     # With 20 000 samples the per-axis std-of-mean is ~0.003, so atol=0.05 is safe.
     mesh_tm, mesh_wp = icosahedron
     points_np = tw.sample.sample_volume(mesh_wp.points, mesh_wp.indices, 20_000, seed=0).numpy()

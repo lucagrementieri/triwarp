@@ -99,7 +99,7 @@ def test_n_vertices_matches_the_index_maximum(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     """
-    Vertex count inferred from the face buffer, against the numpy formula the benchmark times.
+    Class A: the count inferred from the face buffer, against the numpy formula.
 
     ``Trimesh`` has no uncached equivalent -- its vertex count comes from the array it was built
     with -- so the benchmark's "trimesh" row is the stand-in formula ``int(faces.max()) + 1``, and
@@ -114,6 +114,12 @@ def test_n_vertices_matches_the_index_maximum(
 
 
 def test_mean_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: the unweighted 1-ring mean against ``trimesh.geometry.mean_vertex_normals``.
+
+    Fed trimesh's own face normals, so the comparison isolates the accumulation and
+    normalization from [`triangles.face_normals_and_areas`], which has its own oracle.
+    """
     mesh_tm, mesh_wp = half_torus
 
     n_vertices = mesh_tm.vertices.shape[0]
@@ -128,6 +134,13 @@ def test_mean_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
 
 
 def test_weighted_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: the general weighted form against trimesh's, with both inputs supplied.
+
+    trimesh's ``weighted_vertex_normals`` takes the face normals *and* the corner angles, so
+    passing both in pins the weighting rule alone -- which is where the libraries in section 6
+    differ most.
+    """
     mesh_tm, mesh_wp = half_torus
 
     n_vertices = mesh_tm.vertices.shape[0]
@@ -146,6 +159,12 @@ def test_weighted_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
 
 
 def test_area_weighted_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: area weighting against ``igl.per_vertex_normals``' area-weighted mode.
+
+    igl is the reference here rather than trimesh, because trimesh has no area-weighted mode --
+    the angle-weighted one is [`test_angle_weighted_vertex_normals`].
+    """
     mesh_tm, mesh_wp = half_torus
 
     n_vertices = mesh_tm.vertices.shape[0]
@@ -187,6 +206,12 @@ def test_area_weighted_vertex_normals_precomputed(half_torus: tuple[tm.Trimesh, 
 
 
 def test_angle_weighted_vertex_normals(half_torus: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: angle weighting against trimesh's, which is the same rule under a different name.
+
+    Completes the three weightings the wrapper exposes; each is a different accumulation rather
+    than a scaling of one, so each needs its own comparison.
+    """
     mesh_tm, mesh_wp = half_torus
 
     n_vertices = mesh_tm.vertices.shape[0]
@@ -339,7 +364,7 @@ def test_vertex_defects_satisfy_gauss_bonnet(
     request: pytest.FixtureRequest, mesh_name: str, chi: int
 ) -> None:
     """
-    The angle defects of a closed mesh sum to ``2π χ``, whatever the mesh's genus or orientability.
+    Not a library comparison: the defects of a closed mesh sum to ``2π χ``, at any genus.
 
     No reference: this is the discrete Gauss-Bonnet theorem, and it is a stronger statement about
     the defects than a per-vertex comparison because it couples every vertex at once. The point of

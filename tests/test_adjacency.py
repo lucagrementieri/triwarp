@@ -367,7 +367,13 @@ def test_face_adjacency_angles(request: pytest.FixtureRequest, mesh_name: str) -
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
 def test_face_adjacency_angles_precomputed(request: pytest.FixtureRequest, mesh_name: str) -> None:
-    """Passing precomputed face normals must not change the angles."""
+    """
+    Triwarp against triwarp: passing precomputed face normals must not change the angles.
+
+    Not a reference comparison -- the oracle for the angles themselves is
+    [`test_face_adjacency_angles`], which compares them to trimesh. This pins only that the
+    precomputed path takes the same route as the deriving one.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     adjacency_wp = tw.adjacency.face_adjacency(mesh_wp.indices)
     face_normals_wp, _ = tw.triangles.face_normals_and_areas(mesh_wp.points, mesh_wp.indices)

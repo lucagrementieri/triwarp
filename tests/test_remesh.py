@@ -231,6 +231,13 @@ def test_remesh_emits_no_degenerate_faces(device: str) -> None:
 
 
 def test_remesh_edge_concentration(device: str) -> None:
+    """
+    Not a library comparison: the edge lengths must concentrate around the requested target.
+
+    meshlib supplies the spread comparison in [`test_remesh_valence_variance_decreases`]'
+    neighbour ``_meshlib_remesh_spread``; what this asserts is the target itself, which no
+    reference shares because each picks its own stopping rule.
+    """
     sphere, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=3)
     target = 0.5 * tw.edges.mean_edge_length(vertices_wp, faces_wp)
 
@@ -296,6 +303,12 @@ def test_remesh_surface_distance_bounded(device: str) -> None:
 
 
 def test_remesh_cave_cube_manifold(cave_cube: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: remeshing a non-convex shell must not tear or self-weld it.
+
+    trimesh supplies the manifoldness and genus checks. The fixture is the point: a cavity
+    gives the collapse pass two surfaces close enough to merge if it ignores connectivity.
+    """
     mesh_tm, mesh_wp = cave_cube
     vertices_wp = wp.clone(mesh_wp.points)
     faces_wp = wp.clone(mesh_wp.indices)
@@ -511,7 +524,7 @@ def test_remesh_empty_and_degenerate(device: str) -> None:
 @pytest.mark.parity("cluster_decimate", "open3d")
 def test_cluster_decimate_matches_open3d(device: str, voxel_size: float, contraction: str) -> None:
     """
-    Cell assignment is Open3D's, so the face count must match exactly, not approximately.
+    Class A: cell assignment is Open3D's, so the face count matches exactly, not approximately.
 
     Open3D's grid anchor is ``min_bound - voxel_size / 2``; this pins that choice, since an anchor
     at ``min_bound`` splits the vertices on the box face into two cells and the counts diverge.
@@ -627,7 +640,7 @@ def _inverted_face_count(vertices_np: np.ndarray, faces_np: np.ndarray) -> int:
 @pytest.mark.parity("quadric_decimate", "igl", "open3d")
 def test_quadric_decimate_beats_igl_and_open3d_on_deviation(device: str, target_faces: int) -> None:
     """
-    At the same face count this port must be no *worse* than the two serial references.
+    Class C (a deviation bound): at the same face count, no *worse* than two serial references.
 
     The plan for this port said to expect the batched-parallel formulation to pick a different
     sequence of collapses from a serial priority queue, and to compare by deviation rather than by
@@ -686,7 +699,7 @@ def test_quadric_decimate_emits_no_inverted_or_degenerate_faces(device: str) -> 
 
 
 def test_quadric_decimate_preserves_the_topology(device: str) -> None:
-    """A closed genus-0 surface stays closed and genus 0, and its volume barely moves."""
+    """Not a library comparison: a closed genus-0 surface stays so, and its volume barely moves."""
     sphere_tm, vertices_wp, faces_wp = _icosphere_wp(device, subdivisions=4)
     decimated_vertices_wp, decimated_faces_wp = tw.remesh.quadric_decimate(
         vertices_wp, faces_wp, target_ratio=0.2
@@ -703,7 +716,7 @@ def test_quadric_decimate_preserves_the_topology(device: str) -> None:
 
 def test_quadric_decimate_keeps_the_features_of_a_cube(device: str) -> None:
     """
-    A cube's twelve edges are its whole shape, and the metric has to spend its budget elsewhere.
+    Class C (a feature-distance bound): a cube's twelve edges are its whole shape.
 
     This is the property that distinguishes a quadric method from a length-driven one: the flat
     faces have zero quadric cost to collapse and the creases have a large one, so the sharp edges
@@ -732,7 +745,7 @@ def test_quadric_decimate_keeps_the_features_of_a_cube(device: str) -> None:
 @pytest.mark.parity("quadric_decimate", "pymeshlab")
 def test_quadric_decimate_reaches_pymeshlab_quality(device: str) -> None:
     """
-    ``meshing_decimation_quadric_edge_collapse`` is the same metric, driven serially.
+    Class C (a quality bound): MeshLab drives the same metric serially, so it sets the bar.
 
     Its ``autoclean`` default deletes unreferenced vertices, so the MeshSet is built fresh here (it
     is one of the two filters recorded as not idempotent even in geometry). Compared by deviation,
@@ -912,7 +925,7 @@ def test_quadric_decimate_padding_never_reaches_the_output(
     device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
 ) -> None:
     """
-    The fixed-width pass keeps its padding to itself, at every pass and not just at the end.
+    Not a library comparison: the fixed-width pass keeps its padding out of the output.
 
     ``_DecimationBuffers`` runs every pass at a width the mesh has long since shrunk below, and
     carries the slack as a dummy vertex and a dummy edge slot. Those sentinels are one index past
@@ -1161,7 +1174,7 @@ def test_flip_by_objective_planarity_improves_the_worst_triangle(device: str) ->
 @pytest.mark.parity("flip_by_objective", "pymeshlab")
 def test_flip_by_objective_planarity_at_least_matches_pymeshlab(device: str) -> None:
     """
-    MeshLab runs the same objective serially, so it is a bar on how many flips this port finds.
+    Class C (a planarity bound): MeshLab runs the same objective serially, so it sets the bar.
 
     ``meshing_edge_flip_by_planar_optimization`` takes the *same* planarity threshold and the *same*
     quality metric (``planartype='area/max side'``), and its greedy serial pass is free to take
@@ -1327,6 +1340,14 @@ def test_intrinsic_delaunay_metric_matches_igl(
 def test_intrinsic_delaunay_flips_a_grid_and_preserves_the_metric(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Not a library comparison: the flips are intrinsic, so counts and total area cannot change.
+
+    [`test_intrinsic_delaunay_metric_matches_igl`] is the igl comparison. What this adds is
+    that ``n_flips > 0`` on a grid -- so the invariants are not being satisfied by doing
+    nothing -- and that the surface is unchanged, which the matrix comparison alone would not
+    show.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     faces, lengths, n_flips = tw.remesh.intrinsic_delaunay(mesh_wp.points, mesh_wp.indices)
 
@@ -1344,6 +1365,13 @@ def test_intrinsic_delaunay_flips_a_grid_and_preserves_the_metric(
 
 @pytest.mark.parity("subdivide", "trimesh")
 def test_subdivide(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class A: one uniform 1-to-4 pass against ``trimesh.remesh.subdivide``, vertices and faces.
+
+    The reference is computed in ``float64`` and cast down, so the comparison is not measuring
+    triwarp's precision against numpy's. Both the new midpoints and the face renumbering are
+    compared, which is what pins the child-face ordering downstream code relies on.
+    """
     mesh_tm, mesh_wp = icosahedron
 
     vertices_np = mesh_tm.vertices.astype(np.float32)
@@ -1692,7 +1720,7 @@ _CLOSED_FIXTURES = ["icosahedron", "cave_cube"]
 
 @pytest.mark.parity("subdivide_to_size", "trimesh")
 def test_subdivide_to_size_reference_regular(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
-    """A single pass on a regular mesh (all faces 1->4) matches trimesh exactly."""
+    """Class A: a single pass on a regular mesh, where every face splits 1-to-4, matches trimesh."""
     mesh_tm, mesh_wp = icosahedron
     faces_np = mesh_tm.faces.astype(np.int32)
     max_edge = 0.6 * _max_edge_length(mesh_tm.vertices.astype(np.float32), faces_np)
@@ -1852,7 +1880,7 @@ def test_subdivide_to_size_noop(mesh_name: str, request: pytest.FixtureRequest) 
 def test_subdivide_to_size_crack_free(
     mesh_name: str, frac: float, request: pytest.FixtureRequest
 ) -> None:
-    """Closed input stays watertight: every undirected edge is shared by exactly 2 faces."""
+    """Not a library comparison: closed input stays watertight, every edge shared by two faces."""
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     max_edge = frac * tw.edges.mean_edge_length(mesh_wp.points, mesh_wp.indices)
 
@@ -2210,7 +2238,7 @@ def test_split_edges_honours_caller_supplied_positions(
 def test_split_edges_is_crack_free_for_an_arbitrary_mask(
     icosahedron: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:
-    """A random subset of edges still leaves a closed, manifold, area-preserving mesh."""
+    """Not a library comparison: an arbitrary edge subset still leaves a closed, manifold mesh."""
     mesh_tm, mesh_wp = icosahedron
     device = mesh_wp.indices.device
     unique_edges, inverse = tw.edges.edges_unique(mesh_wp.indices)

@@ -334,7 +334,7 @@ def test_shape_diameter_trimming_rejects_the_escaping_rays(device: str) -> None:
 @pytest.mark.parity("shape_diameter", "pymeshlab")
 def test_shape_diameter_agrees_with_pymeshlab_on_which_part_is_thinner(device: str) -> None:
     """
-    MeshLab's SDF differs from this one by roughly a constant factor, so compare *structure*.
+    Class C (rank structure): MeshLab's SDF differs from this one by roughly a constant factor.
 
     Its ``cone_amplitude`` parameter is a **no-op** in the 2025.07 build (byte-identical output at
     90 and 120 degrees) and its trimming is not the paper's, so neither a value comparison nor a

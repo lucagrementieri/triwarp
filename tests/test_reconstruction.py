@@ -863,7 +863,7 @@ def test_resample_uniform_offsets_a_sphere(
     device: str, offset: float, icosphere: tuple[tm.Trimesh, wp.Mesh]
 ) -> None:
     """
-    Offset the one shape whose offset surface is known exactly: a sphere by ``d`` gives ``1 + d``.
+    Class C (a radius bound): a sphere is the one shape whose offset surface is known exactly.
 
     Both signs are covered because they are different code paths in spirit — a positive offset needs
     the lattice padded beyond the bounding box (or it clips) and a negative one does not.
@@ -893,7 +893,7 @@ def test_resample_uniform_repairs_a_broken_mesh(
     device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
 ) -> None:
     """
-    The bluntest repair there is: the topology comes from the grid, so the input's cannot leak.
+    Not a library comparison: the topology comes from the grid, so the input's cannot leak.
 
     The input here has duplicated faces, an inverted one and a non-manifold edge — three defects
     that each need their own function in [`triwarp.repair`][triwarp.repair] — and the resampled
@@ -928,7 +928,7 @@ def test_resample_uniform_matches_pymeshlab(
     device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
 ) -> None:
     """
-    ``generate_resampled_uniform_mesh`` is the same algorithm at the same absolute cell size.
+    Class C (a surface distance): the same algorithm at the same absolute cell size.
 
     One parameter hazard, found by probing: its ``offset`` as a ``PercentageValue`` runs from full
     erosion at ``0%`` to full dilation at ``100%``, so **``PercentageValue(50)`` — its default — is
@@ -1036,7 +1036,7 @@ def test_resample_uniform_matches_igl(device: str, icosphere: tuple[tm.Trimesh, 
 def test_resample_uniform_coarser_is_smaller(
     device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
 ) -> None:
-    """A wider voxel can only produce fewer triangles, and still a closed surface."""
+    """Not a library comparison: a wider voxel gives fewer triangles, and still a closed surface."""
     sphere_tm, _sphere_tm_wp = icosphere
     vertices_wp, faces_wp = numpy_to_warp(sphere_tm.vertices, sphere_tm.faces, device)
     counts = []
@@ -1216,6 +1216,15 @@ def test_ball_pivoting_grows_the_triangle_budget(device: str):
 
 @pytest.mark.parity("ball_pivoting", "open3d")
 def test_ball_pivoting_face_count_near_open3d(device: str):
+    """
+    Class C (a face count within a band): the two BPA implementations pick different triangles.
+
+    Ball pivoting's output depends on its seed order and its pivot tie-breaks, so no
+    correspondence exists -- what must agree is roughly how much surface got covered, at the
+    *same* radius, which is derived from the cloud's own spacing and handed to both.
+    ``benchmarks/README`` records open3d as a loose face-count reference only, and this is that
+    comparison.
+    """
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
 

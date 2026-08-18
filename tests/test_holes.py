@@ -37,6 +37,13 @@ def _loop_sizes(mesh_wp: wp.Mesh) -> list[int]:
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
 def test_fill_fan_watertight(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Not a library comparison: the fan's exact triangle count, with trimesh as the closure oracle.
+
+    A fan over a ``B``-vertex loop is ``B - 2`` triangles and adds no vertices -- arithmetic,
+    not another implementation. The input is asserted *not* watertight first, so the sealing
+    claim cannot pass on a mesh that was already closed.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     assert not tw.validation.is_watertight(mesh_wp.points, mesh_wp.indices)
@@ -474,6 +481,13 @@ def test_fill_metric_scorer_matches_meshlib(hemisphere: tuple[tm.Trimesh, wp.Mes
 def test_fill_min_weight_watertight(
     request: pytest.FixtureRequest, mesh_name: str, metric: str
 ) -> None:
+    """
+    Not a library comparison: the same count identity, for every cost metric.
+
+    Whichever triangulation a metric picks, it must be ``B - 2`` triangles over the existing
+    vertices; *which* one it picks is compared against MeshLab's optimum by
+    [`test_fill_min_weight_matches_meshlib`].
+    """
     _, mesh_wp = request.getfixturevalue(mesh_name)
     loop_sizes = _loop_sizes(mesh_wp)
 
@@ -875,6 +889,14 @@ def _meshlib_fill_nicely_volume(
 
 
 def test_fill_smooth_invariants(device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Not a library comparison: what ``fill_smooth`` must hold whatever it chooses to add.
+
+    No boundary loop left, winding consistent, and the input's vertices unmoved in the prefix
+    -- that last separates *filling* from remeshing the whole surface. MeshLab supplies the
+    volume comparison in [`test_fill_smooth_statistics_vs_meshlib`]; it cannot supply these,
+    because it closes nothing at its own default (section 6).
+    """
     _, mesh_wp = hemisphere
     n_v0 = int(mesh_wp.points.shape[0])
 
@@ -904,6 +926,14 @@ def test_fill_smooth_triangulate_only(device: str, hemisphere: tuple[tm.Trimesh,
 
 
 def test_fill_smooth_statistics_vs_meshlib(device: str, hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class C (a derived scalar): the filled volume, because the two patches share no vertices.
+
+    MeshLab's ``fillHoleNicely`` subdivides and smooths on its own schedule, so no
+    correspondence exists between the two caps -- the enclosed volume is the strongest
+    comparable quantity, and it excludes a cap that bulges or collapses while still being
+    watertight.
+    """
     pytest.importorskip("meshlib.mrmeshpy")
     _, mesh_wp = hemisphere
     vertices_np = mesh_wp.points.numpy().astype(np.float64)
@@ -919,6 +949,13 @@ def test_fill_smooth_statistics_vs_meshlib(device: str, hemisphere: tuple[tm.Tri
 
 
 def test_fill_smooth_natural_smooth(device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Not a library comparison: ``natural_smooth`` must blend the patch into the rim it meets.
+
+    The claim is about the *rim*, which no reference exposes separately: with the flag on,
+    curvature continues across the boundary instead of creasing there. trimesh supplies only
+    the surface geometry the assertion is computed from.
+    """
     sphere, _sphere_wp = icosphere
     hemi = sphere.slice_plane(
         plane_origin=np.zeros(3), plane_normal=np.array([0.0, 0.0, 1.0]), cap=False

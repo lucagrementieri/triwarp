@@ -23,12 +23,24 @@ ALL_MESHES = CLOSED_MESHES + OPEN_MESHES
 
 
 def test_volume(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: the divergence-theorem volume against ``Trimesh.volume``.
+
+    A closed mesh is required for the integral to mean anything, which is why the fixture is
+    closed and the open-mesh behaviour is not asserted here.
+    """
     mesh_tm, mesh_wp = icosahedron
     volume_wp = tw.totals.volume(mesh_wp.points, mesh_wp.indices)
     assert np.isclose(volume_wp, mesh_tm.volume, rtol=1e-5, atol=1e-5)
 
 
 def test_volume_inward_normals_negative(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: reversing every face negates the volume, and trimesh agrees on the sign.
+
+    The *signed* result is the claim -- an implementation taking the absolute value would pass
+    [`test_volume`] and fail this, and ``validation.is_volume`` depends on the sign.
+    """
     mesh_tm, mesh_wp = icosahedron
     faces_np = mesh_tm.faces[:, ::-1].reshape(-1).astype(np.int32)
     faces_flipped_wp = wp.array(
@@ -46,6 +58,12 @@ def test_volume_empty(device: str):
 
 @pytest.mark.parity("surface_centroid", "trimesh")
 def test_surface_centroid(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: the area-weighted surface centroid against ``Trimesh.centroid``.
+
+    An open fixture, because on a closed symmetric mesh the centroid sits at the origin and a
+    wrongly-weighted sum lands there too.
+    """
     mesh_tm, mesh_wp = hemisphere
 
     centroid_tm = mesh_tm.centroid
@@ -58,7 +76,7 @@ def test_surface_centroid(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
 @pytest.mark.parametrize("kernel_device", ["cpu", "cuda:0"])
 def test_surface_centroid_matches_trimesh_on_a_skewed_mesh_on_both_devices(kernel_device: str):
     """
-    Pin the area-weighted centroid sum on **both** devices, on a deliberately asymmetric mesh.
+    Class A on both devices: the area-weighted centroid sum on an asymmetric mesh.
 
     Three things this guards. ``wp.launch_tiled`` runs exactly one lane per block on Warp 1.16's CPU
     backend, so the block-wide ``wp.tile_sum`` this reduction used to perform accumulated one face
@@ -258,6 +276,12 @@ def test_moments_empty(device: str):
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 def test_euler_characteristic(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A on an integer, against ``Trimesh.euler_number`` across the fixture set.
+
+    Non-vacuous by construction: the parametrisation spans chi = 2, 1 and 0, so a constant
+    answer cannot pass.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     euler_wp = tw.totals.euler_characteristic(mesh_wp.indices)
     assert euler_wp == int(mesh_tm.euler_number)

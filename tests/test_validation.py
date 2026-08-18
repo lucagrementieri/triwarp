@@ -114,7 +114,7 @@ def test_topological_measures_match_pymeshlab(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     """
-    Cross-check four independent predicates against MeshLab's one topology report.
+    Class B (one report, four predicates): MeshLab reports the topology in a single dict.
 
     ``get_topological_measures`` returns edge count, boundary-edge count, component count, genus and
     edge-manifoldness together, so a single call checks the whole family at once and -- unlike the
@@ -261,7 +261,7 @@ def test_is_edge_manifold_matches_pyvista(request: pytest.FixtureRequest, mesh_n
 
 def test_is_edge_manifold_nonmanifold_fan_matches_pyvista(device: str) -> None:
     """
-    Three faces on one edge: both libraries say non-manifold, and the counts still disagree.
+    Class B (count convention): three faces on one edge, where pyvista's count differs.
 
     The second assert is the one worth keeping -- it pins ``n_open_edges == 7`` against triwarp's 6
     boundary edges on the same mesh, so the "do not map the count" note in
@@ -281,7 +281,7 @@ def test_is_edge_manifold_nonmanifold_fan_matches_pyvista(device: str) -> None:
 
 
 def test_is_edge_manifold_nonmanifold_fan_matches_open3d(device: str) -> None:
-    """Three faces on one edge: non-manifold under both switches, for both libraries."""
+    """Class A: three faces on one edge is non-manifold under both switches, in both libraries."""
     vertices_np = np.array(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]]
     )
@@ -301,6 +301,13 @@ def test_is_edge_manifold_nonmanifold_fan_matches_open3d(device: str) -> None:
 def test_edge_manifold_mask(
     request: pytest.FixtureRequest, mesh_name: str, allow_boundary_edges: bool
 ) -> None:
+    """
+    Class A: the per-face mask against a numpy edge-multiplicity oracle, over both switches.
+
+    No library exposes a per-face edge-manifold mask, so the reference is written here from the
+    edge multiplicity table; the *predicate* it reduces to has real library oracles above.
+    Length is asserted too, since a short mask would compare equal on its prefix.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mask_wp = tw.validation.edge_manifold_mask(
         mesh_wp.indices, allow_boundary_edges=allow_boundary_edges
@@ -394,6 +401,14 @@ def test_is_watertight_is_volume_precomputed_shortcut(
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 @pytest.mark.parity("is_vertex_manifold", "igl")
 def test_is_vertex_manifold(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B (reduce igl's per-vertex mask): the predicate agrees, and reads ``True`` here.
+
+    The second assert is the one that makes this non-vacuous -- ``manifold_wp is True`` --
+    because a predicate that always returned ``False`` would still match a reference reduced
+    the same way if both were wrong. The ``False`` branch is
+    [`test_is_vertex_manifold_bowtie`].
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     manifold_wp = tw.validation.is_vertex_manifold(mesh_wp.indices)
     manifold_igl = bool(igl.is_vertex_manifold(_faces_igl(mesh_tm)).all())
@@ -402,6 +417,14 @@ def test_is_vertex_manifold(request: pytest.FixtureRequest, mesh_name: str) -> N
 
 
 def test_is_vertex_manifold_bowtie(device: str) -> None:
+    """
+    Class B: the ``False`` branch, on two triangles meeting at a single apex vertex.
+
+    A bowtie is edge-manifold but not vertex-manifold, so it separates the two predicates
+    rather than failing both -- and igl's fan definition agrees here where Open3D's
+    connectivity one does not (section 6, and
+    [`test_is_vertex_manifold_open3d_agreement_and_divergence`]).
+    """
     # Two triangles sharing only the apex vertex 0 -> non-manifold vertex.
     vertices_np = np.array(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]]
@@ -437,7 +460,7 @@ def test_is_vertex_manifold_matches_open3d(request: pytest.FixtureRequest, mesh_
 
 def test_is_vertex_manifold_open3d_agreement_and_divergence(device: str) -> None:
     """
-    The two sides of the class-B restriction, both pinned.
+    Class B, restriction pinned from both sides: Open3D tests connectivity, not a fan.
 
     On the edge-manifold bow-tie the libraries agree (both ``False``); on the edge-non-manifold
     three-face fan they deliberately diverge (Open3D ``True``, triwarp ``False``) because Open3D
@@ -464,6 +487,12 @@ def test_is_vertex_manifold_open3d_agreement_and_divergence(device: str) -> None
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 def test_vertex_manifold_mask(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: the per-vertex mask against ``igl.is_vertex_manifold``, which has the same shape.
+
+    Unlike the edge mask this needs no transform -- igl's answer *is* per-vertex. The final
+    assert pins the predicate as the mask's reduction, so the two cannot drift apart.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mask_wp = tw.validation.vertex_manifold_mask(mesh_wp.points, mesh_wp.indices)
     mask_igl = igl.is_vertex_manifold(_faces_igl(mesh_tm))
@@ -545,6 +574,12 @@ def test_is_self_intersecting_separated(device: str) -> None:
 def test_face_self_intersecting_mask_matches_predicate(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
+    """
+    Triwarp against triwarp: the mask's reduction must equal the predicate.
+
+    The predicate carries the reference comparison (trimesh and MeshLab); what only this can
+    check is that the per-face mask and the whole-mesh answer come from the same test.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mask_wp = tw.validation.face_self_intersecting_mask(mesh_wp.points, mesh_wp.indices)
     assert int(mask_wp.shape[0]) == mesh_tm.faces.shape[0]
@@ -554,6 +589,12 @@ def test_face_self_intersecting_mask_matches_predicate(
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 def test_is_winding_consistent(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A on a boolean: agrees with ``Trimesh.is_winding_consistent``, and reads ``True`` here.
+
+    The literal ``is True`` is what keeps this from passing on a constant-``False``
+    implementation; [`test_is_winding_consistent_flipped`] supplies the other branch.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     winding_wp = tw.validation.is_winding_consistent(mesh_wp.indices)
     assert winding_wp == bool(mesh_tm.is_winding_consistent)
@@ -561,6 +602,13 @@ def test_is_winding_consistent(request: pytest.FixtureRequest, mesh_name: str) -
 
 
 def test_is_winding_consistent_flipped(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class A: the ``False`` branch, half the faces reversed so the winding genuinely conflicts.
+
+    Reversing *every* face would leave the mesh consistent (just inward), which is the trap
+    this avoids by flipping alternate faces -- and is what [`test_is_volume_inward_normals`]
+    tests instead.
+    """
     mesh_tm, mesh_wp = icosahedron
     faces_flipped = mesh_tm.faces.copy()
     faces_flipped[::2] = faces_flipped[::2][:, ::-1]  # reverse winding of half the faces
@@ -625,7 +673,7 @@ def test_is_orientable_mobius(device: str) -> None:
 
 def test_is_orientable_closed_non_orientable(boy_surface: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
-    Boy's surface: **closed** and non-orientable, which the band above is not.
+    Class A on the ``False`` branch: Boy's surface is closed *and* non-orientable.
 
     Every other ``False`` input in this file has a boundary, so the flood-fill always had an edge to
     stop at; here it wraps all the way round and must still find the contradiction. That the mesh is
@@ -644,6 +692,13 @@ def test_is_orientable_closed_non_orientable(boy_surface: tuple[tm.Trimesh, wp.M
 def test_face_orientation_mask_all_false_on_consistent(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
+    """
+    Not a library comparison: on a consistently-wound mesh no face needs flipping.
+
+    An all-``False`` answer, which is only a claim because the fixtures are known consistent;
+    the non-trivial branch is exercised by the ``face_orientation_bits`` tests on the non-
+    orientable fixtures.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mask_wp = tw.validation.face_orientation_mask(mesh_wp.indices)
     assert int(mask_wp.shape[0]) == mesh_tm.faces.shape[0]
@@ -797,7 +852,7 @@ def test_face_orientation_bits_leave_edges_unsatisfied_only_when_non_orientable(
 @pytest.mark.parity("is_watertight", "open3d")
 def test_is_watertight_matches_open3d(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
-    The definitional claim: ``is_watertight`` follows Open3D's ``IsWatertight``, not trimesh's.
+    Class A, and a definitional claim: this follows Open3D's ``IsWatertight``, not trimesh's.
 
     Worth a test of its own because the docstring makes that claim explicitly and nothing checked
     it. The two definitions genuinely differ -- trimesh's ``is_watertight`` is edge-manifoldness
@@ -817,7 +872,7 @@ def test_is_watertight_matches_open3d(request: pytest.FixtureRequest, mesh_name:
 
 def test_is_watertight_rejects_self_intersection_like_open3d(device: str) -> None:
     """
-    The self-intersection clause, which is the half of Open3D's definition trimesh does not have.
+    Class A: the self-intersection clause, the half of Open3D's definition trimesh lacks.
 
     Two interpenetrating unit boxes are closed, edge-manifold and vertex-manifold, so every test
     above passes them and ``trimesh.is_watertight`` calls them watertight. Open3D does not, and
@@ -887,6 +942,13 @@ def test_is_watertight_rejects_a_connected_surface_that_intersects_itself(
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 @pytest.mark.parity("is_watertight", "trimesh")
 def test_is_watertight(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A on a boolean, against *both* the fixture class and trimesh, which is the point.
+
+    Open3D's definition adds a self-intersection clause trimesh lacks, so the two agree only on
+    non-self-intersecting input -- these fixtures. Where they diverge is pinned separately by
+    [`test_is_watertight_rejects_self_intersection_like_open3d`].
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     watertight_wp = tw.validation.is_watertight(mesh_wp.points, mesh_wp.indices)
     assert watertight_wp == (mesh_name in CLOSED_MESHES)
@@ -912,6 +974,12 @@ def test_face_watertight_mask_matches_reference(
 def test_face_watertight_mask_broken_faces_reference(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
+    """
+    Class B (complement, then sort): trimesh reports the *broken* faces, this the good ones.
+
+    Two named transforms -- invert the mask to indices, and sort both sides, since neither
+    library defines the order.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mask_wp = tw.validation.face_watertight_mask(mesh_wp.indices)
     # Faces breaking watertightness are the complement of the mask (trimesh's broken_faces).
@@ -923,6 +991,12 @@ def test_face_watertight_mask_broken_faces_reference(
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
 @pytest.mark.parity("is_volume", "trimesh")
 def test_is_volume(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A on a boolean: trimesh's conjunction, cross-checked against the fixture's own class.
+
+    Asserting both means a predicate agreeing with trimesh for the wrong reason still has to
+    agree with the fixture table, which is maintained independently.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     volume_wp = tw.validation.is_volume(mesh_wp.points, mesh_wp.indices)
     assert volume_wp == bool(mesh_tm.is_volume)
@@ -930,6 +1004,12 @@ def test_is_volume(request: pytest.FixtureRequest, mesh_name: str) -> None:
 
 
 def test_is_volume_inward_normals(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class A: reversing every face keeps it watertight and consistent, but flips the volume's sign.
+
+    This is the clause that distinguishes ``is_volume`` from ``is_watertight``, and the only
+    fixture state that isolates it -- the mesh passes every other check in the module.
+    """
     mesh_tm, mesh_wp = icosahedron
     faces_inward = mesh_tm.faces[:, ::-1].copy()  # reverse every face -> inward-facing normals
     vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, faces_inward, mesh_wp.device)

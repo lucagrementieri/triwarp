@@ -129,7 +129,7 @@ def bvh_from_bounds(
 
 
 def query_bvh_aabb_with_offsets(
-    bvh: wp.Bvh, queries: wp.array[wp.vec3], half_extent: float
+    bvh: wp.Bvh, queries: wp.array[wp.vec3], half_extent: float, *, include_total: bool = False
 ) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
     """
     Low-level BVH AABB query: primitive indices in one flat buffer plus offsets.
@@ -149,30 +149,30 @@ def query_bvh_aabb_with_offsets(
         ``(m, 3)`` query centers stored as ``wp.vec3``.
     half_extent
         Half side length of the axis-aligned query cube along each axis.
+    include_total
+        Return ``offsets`` in the length-``m + 1`` CSR form whose trailing element is the total hit
+        count, instead of the length-``m`` form. Same meaning as on the ball queries.
 
     Returns
     -------
     candidate_indices_flat, offsets
-        ``offsets`` has length ``m`` and is the exclusive prefix sum of per-query
-        hit counts. Query ``k`` owns
-        ``candidate_indices_flat[offsets[k] : offsets[k+1]]`` where ``offsets[m]``
-        is understood as ``candidate_indices_flat.shape[0]``.
+        ``offsets`` has length ``m`` (or ``m + 1`` with ``include_total``) and is the exclusive
+        prefix sum of per-query hit counts. Query ``k`` owns
+        ``candidate_indices_flat[offsets[k] : offsets[k+1]]``. In the length-``m`` form
+        ``offsets[m]`` is understood as ``candidate_indices_flat.shape[0]``, so a Python-scope
+        caller iterating the queries wants ``include_total=True`` rather than appending it.
 
     Notes
     -----
-    That length is ``m``, **not** the ``m + 1`` sentinel-terminated form the ball queries offer
-    through their ``include_total`` keyword -- so unlike them, the last query's slice has to run to
-    the flat buffer's own length and reading ``offsets[m]`` raises ``IndexError``. The asymmetry is
-    deliberate rather than an oversight: this function's only in-repo consumer is a kernel that
-    recovers the owning query with ``kernels.array.binary_search_index`` and never addresses
-    ``offsets[m]``, so no call site needs the sentinel and section 14 rules out adding the keyword
-    for one that does not exist. A *Python-scope* caller iterating the queries does need it, and
-    ``np.append(offsets, indices.shape[0])`` is the one line that gets it.
+    The default is the length-``m`` form because this function's only in-repo consumer is a kernel
+    that recovers the owning query with ``kernels.array.binary_search_index`` and never addresses
+    ``offsets[m]``. Both forms are views into one ``m + 1`` scan buffer
+    ([`counts_to_offsets`][triwarp.array.counts_to_offsets]), so the keyword costs no allocation.
 
     See Also
     --------
     [`query_bvh_ball_with_offsets`][triwarp.neighbors.query_bvh_ball_with_offsets]
-        The same packing for a ball query, with the ``include_total`` option this lacks.
+        The same packing and the same keyword, for a ball query with a narrow-phase filter.
     """
     device = queries.device
     m = int(queries.shape[0])
@@ -180,7 +180,7 @@ def query_bvh_aabb_with_offsets(
     if m == 0:
         return (
             wp.empty(0, dtype=wp.int32, device=device),
-            wp.empty(0, dtype=wp.int32, device=device),
+            wp.zeros(1 if include_total else 0, dtype=wp.int32, device=device),
         )
 
     hit_counts = wp.empty(m, dtype=wp.int32, device=device)
@@ -191,7 +191,9 @@ def query_bvh_aabb_with_offsets(
         device=device,
     )
 
-    offsets, total_hits = tw.array.counts_to_offsets(hit_counts)
+    # One ``m + 1`` scan buffer serves both forms: the length-``m`` one is a view of its prefix.
+    segment_bounds, total_hits = tw.array.counts_to_offsets(hit_counts, include_total=True)
+    offsets = segment_bounds if include_total else segment_bounds[:m]
     if total_hits == 0:
         return wp.empty(0, dtype=wp.int32, device=device), offsets
 
@@ -199,7 +201,13 @@ def query_bvh_aabb_with_offsets(
     wp.launch(
         kernel_neighbors.query_bvh_aabb_neighbors,
         dim=m,
-        inputs=[queries, bvh.id, wp.float32(half_extent), offsets, candidate_indices_flat],
+        inputs=[
+            queries,
+            bvh.id,
+            wp.float32(half_extent),
+            segment_bounds[:m],
+            candidate_indices_flat,
+        ],
         device=device,
     )
 

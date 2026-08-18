@@ -234,7 +234,7 @@ def test_primitives_match_open3d(device: str) -> None:
 @pytest.mark.parity("uv_sphere", "open3d")
 def test_uv_sphere_matches_open3d(device: str, sections: int) -> None:
     """
-    Pin the tessellation mapping between the two UV spheres, which is not the obvious one.
+    Class B (a named index mapping): the two UV spheres tessellate differently than expected.
 
     ``create_sphere(resolution=r)`` is neither ``count=(r, r)`` nor ``count=(32, r)``: measured
     exactly at r = 16, 32, 64, 128 and 256, it equals ``uv_sphere(count=(2 * r, r // 2))`` in both
@@ -371,6 +371,12 @@ def test_primitives_match_pymeshlab(device: str) -> None:
 
 @pytest.mark.parity("box", "trimesh")
 def test_box(device: str) -> None:
+    """
+    Class A: vertices and faces against ``trimesh.creation.box``, at two extents.
+
+    The default and a non-cube box, because the extent scaling is applied after the unit table
+    -- a transposed scale passes the first and fails the second.
+    """
     _assert_same_vertices_and_faces(*tw.creation.box(device=device), tm.creation.box())
     _assert_same_vertices_and_faces(
         *tw.creation.box(extents=(1.0, 2.0, 3.0), device=device),
@@ -465,7 +471,7 @@ def test_platonic_solids_match_pymeshlab(
     device: str, builder: str, filter_name: str, n_vertices: int, n_faces: int
 ) -> None:
     """
-    The three tables came from MeshLab, so they must still be it up to the unit-sphere scaling.
+    Class B (scale to unit circumradius): the three vertex tables came from MeshLab.
 
     trimesh has no tetrahedron / octahedron / dodecahedron, and libigl's only Platonic generator is
     ``igl.icosahedron`` (compared in
@@ -537,6 +543,13 @@ def test_platonic_solids_match_open3d(device: str, builder: str, creator_name: s
 
 @pytest.mark.parametrize("count", [(2, 2), (3, 7), (10, 10)])
 def test_grid(device: str, count: tuple[int, int]) -> None:
+    """
+    Not a library comparison: the lattice's counts, bounds and area, which are closed-form.
+
+    MeshLab supplies the elementwise comparison in [`test_grid_matches_pymeshlab`]. This is the
+    test that pins the *shape* of the answer -- a transposed ``count`` gives the same vertex
+    total and a different face total, which only the face formula catches.
+    """
     vertices_wp, faces_wp = tw.creation.grid(count=count, extents=(2.0, 3.0), device=device)
     assert int(vertices_wp.shape[0]) == count[0] * count[1]
     assert int(faces_wp.shape[0]) // 3 == 2 * (count[0] - 1) * (count[1] - 1)
@@ -600,7 +613,7 @@ def test_grid_matches_igl(device: str) -> None:
 
 @pytest.mark.parity("grid", "pymeshlab")
 def test_grid_matches_pymeshlab(device: str) -> None:
-    """MeshLab's ``create_grid`` is the same lattice, in its uncentered form."""
+    """Class B (recentre): MeshLab's ``create_grid`` is the same lattice, uncentered."""
     vertices_wp, faces_wp = tw.creation.grid(
         count=(10, 8), extents=(0.3, 0.5), center=False, device=device
     )
@@ -661,7 +674,7 @@ def test_sphere_cap(device: str, subdivisions: int) -> None:
 
 @pytest.mark.parity("sphere_cap", "pymeshlab")
 def test_sphere_cap_matches_pymeshlab_size(device: str) -> None:
-    """MeshLab's ``create_sphere_cap`` builds the same lattice; ``angle`` is its full aperture."""
+    """Class B (halve the angle): ``create_sphere_cap`` is the same lattice, by aperture."""
     vertices_wp, faces_wp = tw.creation.sphere_cap(
         angle=np.deg2rad(30.0), subdivisions=3, device=device
     )
@@ -732,6 +745,13 @@ def test_icosphere_radius(device: str) -> None:
 
 @pytest.mark.parity("uv_sphere", "trimesh")
 def test_uv_sphere(device: str) -> None:
+    """
+    Class A on the faces, plus a radius check the reference cannot supply.
+
+    Only the connectivity is compared against trimesh, because
+    [`test_uv_sphere_matches_open3d`] documents that the two libraries tessellate differently;
+    the radius assert is what pins the positions here.
+    """
     _assert_same_faces(*tw.creation.uv_sphere(device=device), tm.creation.uv_sphere())
     vertices_wp, _ = tw.creation.uv_sphere(radius=3.0, device=device)
     assert np.allclose(np.linalg.norm(vertices_wp.numpy(), axis=1), 3.0, rtol=1e-5, atol=1e-5)
@@ -754,6 +774,13 @@ def test_capsule(device: str) -> None:
 
 @pytest.mark.parity("cylinder", "trimesh")
 def test_cylinder(device: str) -> None:
+    """
+    Class A on the faces, with the *inscribed prism* volume as the closed-form check.
+
+    The volume reference is deliberately not ``pi r^2 h``: 32 sections truncate the circle, so
+    the exact answer is the inscribed prism's and a test against the smooth formula would need
+    a loose tolerance that hides real error.
+    """
     vertices_wp, faces_wp = tw.creation.cylinder(radius=1.0, height=2.0, device=device)
     _assert_same_faces(vertices_wp, faces_wp, tm.creation.cylinder(radius=1.0, height=2.0))
     # 32 sections truncate the circle, so the volume is the inscribed prism's, not pi * r^2 * h.
@@ -762,6 +789,12 @@ def test_cylinder(device: str) -> None:
 
 
 def test_cylinder_segment(device: str) -> None:
+    """
+    Class A on the faces and the bounds, for the arbitrary-axis form.
+
+    The segment is off-axis, so this is the branch where the frame construction matters; the
+    bounds comparison is what catches a rotation applied in the wrong order.
+    """
     segment_np = np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])
     vertices_wp, faces_wp = tw.creation.cylinder(radius=0.5, segment=segment_np, device=device)
     mesh_tm = tm.creation.cylinder(radius=0.5, segment=segment_np)
@@ -778,6 +811,13 @@ def test_cylinder_requires_height_or_segment(device: str) -> None:
 
 @pytest.mark.parity("cone", "trimesh")
 def test_cone(device: str) -> None:
+    """
+    Class A on the faces, plus the exact vertex count the fan collapse must produce.
+
+    34 = 32 rim + apex + base centre. The count is the claim: without the vertex collapse the
+    two fans each carry their own copy of the rim and the mesh is not closed, which the closure
+    assert then catches independently.
+    """
     vertices_wp, faces_wp = tw.creation.cone(radius=1.0, height=2.0, device=device)
     _assert_same_faces(vertices_wp, faces_wp, tm.creation.cone(radius=1.0, height=2.0))
     # 32 rim vertices plus the apex and the base center; the two fans need the vertex collapse.
@@ -787,6 +827,13 @@ def test_cone(device: str) -> None:
 
 @pytest.mark.parity("annulus", "trimesh")
 def test_annulus(device: str) -> None:
+    """
+    Class A on the faces, plus closure and Euler characteristic 0 -- a torus-like shell.
+
+    The profile's closing point has to collapse or the inner-wall seam stays open, and ``chi ==
+    0`` is what detects that: a mesh with the seam open is still watertight-looking by face
+    count.
+    """
     vertices_wp, faces_wp = tw.creation.annulus(0.5, 1.0, height=2.0, device=device)
     _assert_same_faces(vertices_wp, faces_wp, tm.creation.annulus(0.5, 1.0, height=2.0))
     # The closing point of the annulus profile has to collapse, or the inner-wall seam stays open.
@@ -808,6 +855,13 @@ def test_annulus_requires_height_or_segment(device: str) -> None:
 
 @pytest.mark.parity("torus", "trimesh")
 def test_torus(device: str) -> None:
+    """
+    Class A on the faces, with the analytic volume ``2 pi^2 R r^2`` to 2 %.
+
+    The 2 % band is the tessellation error at 32x32 sections, not slack: the polygonal torus
+    genuinely encloses less than the smooth one, and the face-count assert pins the resolution
+    the band assumes.
+    """
     vertices_wp, faces_wp = tw.creation.torus(1.0, 0.25, device=device)
     _assert_same_faces(vertices_wp, faces_wp, tm.creation.torus(1.0, 0.25))
     assert int(faces_wp.shape[0]) // 3 == 2 * 32 * 32
@@ -846,6 +900,12 @@ def test_primitives_are_deterministic(device: str, name: str) -> None:
 
 @pytest.mark.parity("revolve", "trimesh")
 def test_revolve_matches_trimesh(device: str) -> None:
+    """
+    Class A on the faces: the same profile revolved into the same connectivity.
+
+    The profile closes on itself, so this also pins the seam handling -- an implementation
+    duplicating the closing vertex gets a different face table, not merely different positions.
+    """
     profile_np = np.array([[0.25, 0.0], [1.0, 0.0], [1.0, 1.0], [0.25, 1.0], [0.25, 0.0]])
     _assert_same_faces(
         *tw.creation.revolve(_ring(profile_np, device), sections=24),
@@ -896,6 +956,13 @@ def test_revolve_absolute_tolerance_is_scale_dependent(device: str) -> None:
 @pytest.mark.parametrize("height", [0.5, -0.5])
 @pytest.mark.parity("extrude_polygon", "trimesh")
 def test_extrude_polygon(device: str, ring_name: str, height: float) -> None:
+    """
+    Class C (same solid, not the same triangles): trimesh triangulates the caps differently.
+
+    Both signs of ``height`` are run, and the comparison is on the enclosed volume and outward
+    orientation rather than the face table -- an L-shaped ring admits several valid cap
+    triangulations, so equality is not available.
+    """
     shapely = pytest.importorskip("shapely.geometry")
     ring_np = _SQUARE_RING if ring_name == "square" else _L_RING
     vertices_wp, faces_wp = tw.creation.extrude_polygon(_ring(ring_np, device), height)
@@ -1104,6 +1171,13 @@ _SWEEP_PATHS = {
 @pytest.mark.parametrize("path_name", sorted(_SWEEP_PATHS))
 @pytest.mark.parity("sweep_polygon", "trimesh")
 def test_sweep_polygon(device: str, path_name: str) -> None:
+    """
+    Class C (same solid): the swept volume, since the frame carried along the path is a gauge.
+
+    Two libraries can sweep the same profile with different twist about the path and produce
+    the same solid, so the volume and the closure are what compare; the profile is square,
+    which makes a twist difference invisible in the volume by construction.
+    """
     shapely = pytest.importorskip("shapely.geometry")
     ring_np = np.array([[-0.25, -0.25], [0.25, -0.25], [0.25, 0.25], [-0.25, 0.25]])
     path_np = _SWEEP_PATHS[path_name]
@@ -1176,6 +1250,13 @@ def _triangle_soup(device: str, seed: int = 7) -> tuple[np.ndarray, wp.array, wp
 
 @pytest.mark.parity("truncated_prisms", "trimesh")
 def test_truncated_prisms(device: str) -> None:
+    """
+    Class C (volume and body count): trimesh emits one prism per triangle in its own vertex order.
+
+    The counts are exact -- 6 vertices and 8 faces per input triangle -- and the volume is
+    compared to trimesh's; ``body_count == 5`` is what catches prisms welded together, which
+    the volume alone would not show.
+    """
     triangles_np, vertices_wp, faces_wp = _triangle_soup(device)
     prism_v, prism_f = tw.creation.truncated_prisms(vertices_wp, faces_wp)
     mesh_tm = tm.creation.truncated_prisms(triangles_np)
@@ -1186,6 +1267,12 @@ def test_truncated_prisms(device: str) -> None:
 
 
 def test_truncated_prisms_plane(device: str) -> None:
+    """
+    Class C (volume): the same construction truncated by an explicit plane rather than z = 0.
+
+    The plane argument changes only where the prisms stop, so the comparison is again the
+    enclosed volume against trimesh's, at the same plane.
+    """
     triangles_np, vertices_wp, faces_wp = _triangle_soup(device)
     origin_np, normal_np = np.array([0.0, 0.0, 0.5]), np.array([0.0, 0.0, 1.0])
     prism_v, prism_f = tw.creation.truncated_prisms(

@@ -143,6 +143,14 @@ def _heat_geodesic_igl(
 def test_heat_geodesic_matches_igl(
     request: pytest.FixtureRequest, device: str, mesh_name: str
 ) -> None:
+    """
+    Class A at 5e-2: the same method, but igl factorizes where triwarp runs conjugate gradient.
+
+    The tolerance is the discretization the two share plus each solver's own stopping point,
+    not a disagreement about the method -- both are Crane et al. on the identical
+    triangulation, which is why ``_heat_geodesic_igl`` is built with matching defaults rather
+    than igl's own.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)
     faces_np = np.array(mesh_tm.faces, dtype=np.int64)
@@ -158,6 +166,12 @@ def test_heat_geodesic_matches_igl(
 def test_heat_geodesic_multi_source_matches_igl(
     device: str, icosahedron: tuple[object, wp.Mesh]
 ) -> None:
+    """
+    Class A: the multi-source form, where the answer is the distance to the *nearest* source.
+
+    A separate test because a single-source implementation passes the one above while getting
+    the reduction over several sources wrong -- the field is not a sum but a minimum.
+    """
     mesh_tm, mesh_wp = icosahedron
     vertices_np = np.array(mesh_tm.vertices, dtype=np.float64)  # type: ignore[attr-defined]
     faces_np = np.array(mesh_tm.faces, dtype=np.int64)  # type: ignore[attr-defined]
@@ -403,6 +417,14 @@ def test_heat_geodesic_is_bounded_by_the_graph_distance(
 def test_robust_heat_geodesic_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
+    """
+    Class A on the ``use_robust=True`` path, against potpourri3d's identically-named flag.
+
+    The two flags are *not* the same operation and the module docstring says so: geometry-
+    central's includes an intrinsic Delaunay retriangulation that triwarp's deliberately omits.
+    On a clean mesh mollification changes nothing, so the comparison holds there -- which is
+    why the fixtures are clean ones and the degenerate case is a separate invariant test.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     sources_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=mesh_wp.device)
 

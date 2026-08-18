@@ -68,7 +68,7 @@ def test_crease_edges_thresholds(unit_box: tuple[tm.Trimesh, wp.Mesh]) -> None:
 @pytest.mark.parity("crease_edges", "pymeshlab")
 def test_crease_edges_matches_pymeshlab(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
-    ``compute_selection_crease_per_edge`` is the same dihedral threshold, reported as a selection.
+    Class B (selection to edge rows): the same dihedral threshold, reported as a selection.
 
     MeshLab selects *vertices* of crease edges rather than the edges themselves, so the comparison
     is on the vertex set the two edge lists span — which is the quantity a caller of either one
@@ -120,6 +120,14 @@ def test_crease_edges_matches_pyvista(unit_box: tuple[tm.Trimesh, wp.Mesh]) -> N
 
 
 def test_crease_edges_include_boundary(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Triwarp against triwarp: the flag adds exactly the boundary edges and nothing else.
+
+    Stated as a set identity against ``boundary.boundary_edges``, which carries its own
+    reference comparison. MeshLab's crease filter has no equivalent flag, so this branch has no
+    external oracle -- the boundary count is asserted non-zero first so the union cannot hold
+    trivially.
+    """
     mesh_tm, mesh_wp = hemisphere
     interior_np = tw.seams.crease_edges(mesh_wp.points, mesh_wp.indices, angle=40.0).numpy()
     with_boundary_np = tw.seams.crease_edges(
@@ -259,7 +267,7 @@ def test_cut_along_edges_matches_pymeshlab_topology(
     unit_box: tuple[tm.Trimesh, wp.Mesh], device: str
 ) -> None:
     """
-    ``meshing_cut_along_crease_edges`` opens the same seams; only the vertex count differs.
+    Class B (topology only): MeshLab opens the same seams, but re-welds some vertices.
 
     On a cube cut at every crease both sides produce 6 face-connected components, 12 faces and the
     same surface area — the whole content of the operation. **triwarp emits 24 vertices and MeshLab
@@ -667,7 +675,7 @@ def test_seam_edge_vertices_boundaries_match_oriented_boundary(
 
 def test_seam_edge_vertices_feeds_cut_along_edges(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     """
-    The detect -> convert -> cut loop: cutting an atlas' own seams opens it without breaking it.
+    Not a library comparison: the detect-convert-cut loop on an atlas' own seams.
 
     Seam pairs come out smaller-index-first (the forward halfedge is by definition the one running
     that way), and feeding them to the cut duplicates vertices along the ring while leaving the

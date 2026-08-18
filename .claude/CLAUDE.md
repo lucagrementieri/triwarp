@@ -703,6 +703,30 @@ group names a cross-suite API — renaming one breaks every `parity` marker that
 Both are stackable and take string **literals** only — a computed argument is invisible to a static
 scan, so the scanner rejects it. Run `uv run python -m tests.parity` for the full matrix.
 
+**Where a reference library computes the same quantity, one test must compare the two outputs.**
+That is the obligation the classes below describe, and it is not discharged by an invariant: a
+function can be watertight, symmetric, idempotent and manifold while computing the wrong answer.
+So if trimesh / igl / potpourri3d / pymeshlab / open3d / pyvista has the quantity — check, do not
+assume: §6's hazard blocks list what each one actually binds, and several names that *look* present
+are not — there is a class A/B/C comparison against it, and `tests/test_parity.py` enforces that for
+every *benchmarked* pair. Below that bar, `pytest.mark.parity` is the marker that records it.
+
+**Invariant checks are welcome and belong in the same test.** Watertightness, an involution, a
+counting identity, a round trip, a conservation law — these catch failure modes no reference
+comparison sees (a reference agreeing with you on a shared bug, or a quantity the reference computes
+in a different gauge). Assert them *alongside* the output comparison rather than in a test of their
+own, so one test carries the whole claim about the function and the parity marker sits on the test
+that does the comparing. Split them out only when the invariant needs an input the comparison cannot
+use — a fixture the reference rejects, or a degenerate case it crashes on.
+
+**Where no reference computes the quantity, an invariant-only test is the honest answer**, and its
+docstring says so in those words: *"Not a library comparison: <why none exists>"*, followed by what
+the invariant excludes. That is a fifth label beside A–D, not a class-D exemption — D is for a
+*benchmarked* pair whose results are genuinely incomparable and needs a `noparity` entry; this is
+for a quantity with no counterpart to benchmark. `halfedge_twins` (no reference has a halfedge
+structure), `homology.tree_cotree` (nothing computes a basis) and `geodesic_walk`'s arc-length checks
+are the shape of it.
+
 Classify every comparison, and say which class it is in the docstring:
 
 - **A** direct `np.allclose` / `np.array_equal`. The default.
@@ -720,9 +744,18 @@ Classify every comparison, and say which class it is in the docstring:
   in isolation; stochastic with no invariant; or input classes where triwarp is undefined.
   **Not** admissible: "awkward", "the tolerance would be loose", or any class-B situation.
 
+Write the label as **`Class A`** (capital, the word before the letter). A lowercase `class b` reads
+the same to a human and is invisible to a grep for the convention — 21 of them had accumulated
+before anyone looked.
+
 Never a parity assert: shape-only or `isfinite`-only (that is the *benchmark's* assert, and this
 gate exists to stop it migrating inward); triwarp compared with itself; a threshold a constant
 output would pass. A boolean assert must be parametrized over inputs producing both answers.
+
+**Triwarp-against-triwarp is not a parity assert but is still a legitimate test**, for one job:
+pinning two entry points to each other where only one has an oracle — a mask form against an index
+form, a precomputed path against the deriving one, a CPU run against a CUDA one. Say which of the
+two carries the oracle, so the pair does not read as a comparison against a reference.
 
 **Check the comparison is not vacuous on its fixture**, which the gate cannot do for you. A test
 comparing two *empty* answers passes, reads as coverage, and tests nothing — measured: `test_ears`

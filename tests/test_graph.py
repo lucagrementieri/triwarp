@@ -18,6 +18,13 @@ from tests.conversions import open3d_to_trimesh, trimesh_to_open3d, trimesh_to_p
 
 @pytest.mark.parity("concatenate", "trimesh")
 def test_concatenate_meshes(request: pytest.FixtureRequest) -> None:
+    """
+    Class A: three meshes packed against ``trimesh.util.concatenate``, positions and indices.
+
+    The index *offsetting* is the whole operation, so comparing elementwise rather than as a
+    set is the point: a wrong offset would still give a valid-looking mesh with the right
+    counts.
+    """
     mesh_a_tm, mesh_a_wp = request.getfixturevalue("icosahedron")
     mesh_b_tm, mesh_b_wp = request.getfixturevalue("hemisphere")
     mesh_c_tm, mesh_c_wp = request.getfixturevalue("half_torus")
@@ -35,6 +42,13 @@ def test_concatenate_meshes(request: pytest.FixtureRequest) -> None:
 
 
 def test_concatenate_single_mesh(request: pytest.FixtureRequest) -> None:
+    """
+    Class A: a one-element list must come back unchanged, not merely equivalent.
+
+    The single-mesh path returns the caller's own buffers rather than copying
+    (``test_concatenate_single_returns_input`` pins that), so this checks the values are the
+    input's and not a rebuild.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue("icosahedron")
     concat_vertices_wp, concat_faces_wp = tw.combine.concatenate(
         [(mesh_wp.points, mesh_wp.indices)]
@@ -51,6 +65,14 @@ def test_concatenate_empty() -> None:
 
 @pytest.mark.parity("split", "trimesh")
 def test_split_meshes(request: pytest.FixtureRequest) -> None:
+    """
+    Triwarp against triwarp: ``split`` inverts ``concatenate`` on three known components.
+
+    The component *count* is the reference-checkable part and is pinned separately by
+    [`test_split_matches_open3d_and_pymeshlab`]; what only a round trip can check is that each
+    component comes back with its own vertices renumbered consistently. ``concatenate`` has its
+    own trimesh oracle above, so the loop is not closed on an untested function.
+    """
     mesh_a_tm, mesh_a_wp = request.getfixturevalue("icosahedron")
     mesh_b_tm, mesh_b_wp = request.getfixturevalue("hemisphere")
     mesh_c_tm, mesh_c_wp = request.getfixturevalue("half_torus")
@@ -180,7 +202,7 @@ def test_split_batched_matches_split(request: pytest.FixtureRequest) -> None:
 
 
 def test_split_single_component(request: pytest.FixtureRequest) -> None:
-    """The ``k == 1`` fast path must return the same thing as the batched key packing."""
+    """Triwarp against triwarp: the ``k == 1`` fast path equals the batched key packing."""
     mesh_tm, mesh_wp = request.getfixturevalue("icosahedron")
     split_wp = tw.combine.split(mesh_wp.points, mesh_wp.indices)
     assert len(split_wp) == 1
@@ -228,6 +250,14 @@ def test_edges_to_csr_roundtrip(device: str) -> None:
 
 @pytest.mark.parity("connected_component_labels", "scipy")
 def test_connected_component_labels_random(device: str) -> None:
+    """
+    Class B (label packing): the *partition* matches scipy's, through ``same_partition``.
+
+    triwarp names a component after a representative node and scipy numbers them in traversal
+    order, so only the partition is shared -- comparing labels directly would fail on a correct
+    answer. 200 random edges over 64 nodes gives several components rather than one, which
+    [`test_connected_component_labels_path_graph`] deliberately does not.
+    """
     rng = np.random.default_rng(7)
     node_count = 64
     n_edges = 200
@@ -307,6 +337,13 @@ def test_connected_component_labels_zero_nodes(device: str) -> None:
 
 @pytest.mark.parity("connected_component_labels_depth", "scipy")
 def test_connected_component_labels_path_graph(device: str) -> None:
+    """
+    Class B: the same partition comparison on the worst case for a label-propagation sweep.
+
+    A 2 048-node path is the graph that needs the most propagation rounds -- a diameter equal
+    to its node count -- so it catches an implementation that stops iterating too early, which
+    a random graph of diameter ~4 cannot.
+    """
     n = 2048
     edges_np = np.stack([np.arange(n - 1, dtype=np.int32), np.arange(1, n, dtype=np.int32)], axis=1)
     edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
@@ -398,6 +435,14 @@ def test_connected_component_parity_signs_length_mismatch(device: str) -> None:
 
 
 def test_face_connected_component_labels(request: pytest.FixtureRequest) -> None:
+    """
+    Class B: the face-side partition against scipy over ``trimesh.face_adjacency``.
+
+    Two named transforms, both on the reference side: build the dual graph from trimesh's face
+    adjacency, then compare partitions rather than labels. Three concatenated fixtures make the
+    expected component count three, which is asserted so the comparison cannot pass on one
+    blob.
+    """
     mesh_a_tm, mesh_a_wp = request.getfixturevalue("icosahedron")
     mesh_b_tm, mesh_b_wp = request.getfixturevalue("hemisphere")
     mesh_c_tm, mesh_c_wp = request.getfixturevalue("half_torus")
@@ -532,6 +577,14 @@ def test_successor_cycles_empty(device: str) -> None:
 
 @pytest.mark.parity("bfs", "scipy")
 def test_bfs_random(device: str) -> None:
+    """
+    Class A on all three returns: visit order, parents and distances, against scipy's BFS.
+
+    The visit *order* is comparable only because both sides break ties by ascending node index
+    -- triwarp by construction, scipy through ``breadth_first_order`` on a sorted CSR -- so
+    this is the one place the ordering contract is pinned rather than sorted away. Run from
+    three sources, including both ends of the index range.
+    """
     rng = np.random.default_rng(7)
     node_count = 48
     pairs = rng.integers(0, node_count, size=(150, 2), dtype=np.int32)

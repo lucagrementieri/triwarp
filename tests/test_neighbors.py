@@ -87,6 +87,13 @@ def test_query_ball_empty_ball(device: str, backend: Literal["bvh", "hashgrid"])
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
 @pytest.mark.parity("query_bvh_ball", "scipy")
 def test_query_ball_batch(device: str, backend: Literal["bvh", "hashgrid"]):
+    """
+    Class B: per-query neighbour lists against ``KDTree.query_ball_point``, sorted by distance.
+
+    scipy returns each list unordered, so the named transform sorts it by distance to match
+    ``return_sorted=True``; the ``return_sorted=False`` call is then compared against triwarp's
+    own sorted answer, since only the *set* is defined there. Both backends, three queries.
+    """
     rng = np.random.default_rng(1)
     points = rng.random((50, 3), dtype=np.float32) * 3.0
     kdtree = KDTree(points)
@@ -198,7 +205,10 @@ def test_query_ball_count_matches_scipy_and_the_list_form(
     assert int(indices_wp.shape[0]) == int(counts_np.sum())
 
 
-def test_query_bvh_aabb_with_offsets_matches_a_brute_force_box_overlap(device: str) -> None:
+@pytest.mark.parametrize("include_total", [False, True])
+def test_query_bvh_aabb_with_offsets_matches_a_brute_force_box_overlap(
+    device: str, include_total: bool
+) -> None:
     """
     Class A: the broad-phase hits are exactly the boxes overlapping the query cube.
 
@@ -206,29 +216,41 @@ def test_query_bvh_aabb_with_offsets_matches_a_brute_force_box_overlap(device: s
     than points, and it has no narrow-phase filter -- so the oracle is the full ``lower <= q + h and
     upper >= q - h`` test on all three axes, and the comparison is exact rather than a superset.
 
-    The offsets array is length ``m``, not ``m + 1``: the last query's slice runs to the flat
-    buffer's own length, which is what its Returns block means by *"``offsets[m]`` is understood as
-    ``candidate_indices_flat.shape[0]``"*. Reading it as sentinel-terminated raises ``IndexError``.
+    Both offsets forms are covered, and the length-``m`` one is asserted to be the ``m + 1`` form's
+    prefix: they are two views of one scan buffer, so a divergence would mean the slicing is wrong
+    rather than the query. Measured 8 hits over 6 queries, 3 of which hit at least one box.
     """
     rng = np.random.default_rng(4)
     lower_np = (rng.random((40, 3)) * 2.0).astype(np.float32)
     upper_np = (lower_np + rng.random((40, 3)) * 0.3).astype(np.float32)
     queries_np = (rng.random((6, 3)) * 2.0).astype(np.float32)
     half_extent = 0.25
+    n_queries = queries_np.shape[0]
 
     bvh = tw.neighbors.bvh_from_bounds(
         wp.array(np.ascontiguousarray(lower_np), dtype=wp.vec3, device=device),
         wp.array(np.ascontiguousarray(upper_np), dtype=wp.vec3, device=device),
     )
+    queries_wp = wp.array(np.ascontiguousarray(queries_np), dtype=wp.vec3, device=device)
     indices_wp, offsets_wp = tw.neighbors.query_bvh_aabb_with_offsets(
-        bvh, wp.array(np.ascontiguousarray(queries_np), dtype=wp.vec3, device=device), half_extent
+        bvh, queries_wp, half_extent, include_total=include_total
     )
     indices_np = indices_wp.numpy()
     offsets_np = offsets_wp.numpy()
 
-    assert offsets_np.shape == (queries_np.shape[0],)
+    assert offsets_np.shape == (n_queries + 1 if include_total else n_queries,)
     assert indices_np.size > 0
-    bounds_np = np.append(offsets_np, indices_np.size)
+    if include_total:
+        # The trailing element is the flat length, so no caller has to know it separately.
+        assert int(offsets_np[-1]) == indices_np.size
+        bounds_np = offsets_np
+    else:
+        bounds_np = np.append(offsets_np, indices_np.size)
+        _indices_wp, total_offsets_wp = tw.neighbors.query_bvh_aabb_with_offsets(
+            bvh, queries_wp, half_extent, include_total=True
+        )
+        assert np.array_equal(offsets_np, total_offsets_wp.numpy()[:-1])
+
     n_matched = 0
     for query_index, query_np in enumerate(queries_np):
         overlapping_np = np.flatnonzero(
@@ -241,6 +263,39 @@ def test_query_bvh_aabb_with_offsets_matches_a_brute_force_box_overlap(device: s
         n_matched += overlapping_np.size > 0
     # Three of the six queries hit at least one box here; a run where none did would pass vacuously.
     assert n_matched >= 3
+
+
+@pytest.mark.parametrize("include_total", [False, True])
+def test_query_bvh_aabb_with_offsets_degenerate_inputs(device: str, include_total: bool) -> None:
+    """
+    An empty query set and a query that hits nothing, both honouring ``include_total``.
+
+    These are the two early returns, and each has to produce the *same* offsets shape the general
+    path does: a zero-hit query giving the length-``m`` form under ``include_total=True`` would
+    break a caller reading the trailing total. Measured ``[0]`` and ``[0, 0]``.
+    """
+    lower_np = np.zeros((4, 3), dtype=np.float32)
+    upper_np = np.full((4, 3), 0.1, dtype=np.float32)
+    bvh = tw.neighbors.bvh_from_bounds(
+        wp.array(lower_np, dtype=wp.vec3, device=device),
+        wp.array(upper_np, dtype=wp.vec3, device=device),
+    )
+
+    empty_indices_wp, empty_offsets_wp = tw.neighbors.query_bvh_aabb_with_offsets(
+        bvh, wp.empty(0, dtype=wp.vec3, device=device), 0.25, include_total=include_total
+    )
+    assert empty_indices_wp.shape == (0,)
+    assert empty_offsets_wp.shape == ((1,) if include_total else (0,))
+    assert np.array_equal(empty_offsets_wp.numpy(), np.zeros(1 if include_total else 0, np.int32))
+
+    far_wp = wp.array(
+        np.array([[99.0, 99.0, 99.0]], dtype=np.float32), dtype=wp.vec3, device=device
+    )
+    miss_indices_wp, miss_offsets_wp = tw.neighbors.query_bvh_aabb_with_offsets(
+        bvh, far_wp, 0.25, include_total=include_total
+    )
+    assert miss_indices_wp.shape == (0,)
+    assert np.array_equal(miss_offsets_wp.numpy(), np.zeros(2 if include_total else 1, np.int32))
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])
@@ -327,6 +382,14 @@ def test_knn_initial_radius_degenerate_clouds(device: str):
 def test_query_nearest_single(
     device: str, backend: Literal["bvh", "hashgrid"], k: int, max_radius: float
 ):
+    """
+    Class A: k-nearest indices and distances against ``KDTree.query``, over k and ``max_radius``.
+
+    Exact rather than set-compared because the clouds are random and tie-free, so the k-th
+    neighbour is unambiguous; [`test_query_nearest_ties`] handles the constructed case where it
+    is not. The ``max_radius`` axis is what pins the sentinel written for a query with fewer
+    than k neighbours in range.
+    """
     rng = np.random.default_rng(0)
     points = rng.random((50, 3), dtype=np.float32) * 4.0
     kdtree = KDTree(points)
@@ -358,6 +421,12 @@ def test_query_nearest_single(
 def test_query_nearest_batch(
     device: str, backend: Literal["bvh", "hashgrid"], k: int, max_radius: float
 ):
+    """
+    Class A: the batched form, with queries offset off the cloud so some fall short of k.
+
+    The ``+ 0.5`` displacement is deliberate -- querying *at* a data point makes the first
+    neighbour trivially itself at distance zero, which hides an off-by-one in the heap.
+    """
     rng = np.random.default_rng(0)
     points = rng.random((50, 3), dtype=np.float32) * 2.0
     kdtree = KDTree(points)
@@ -850,7 +919,7 @@ def test_geodesic_ball_neighborhoods(mesh_name: str, request: pytest.FixtureRequ
 
 
 def test_geodesic_ball_neighborhoods_overflow_warns() -> None:
-    """A neighborhood exceeding the fixed 512 cap clamps (does not crash) and warns."""
+    """Not a library comparison: a neighborhood past the 512 cap must clamp and warn, not crash."""
     # A subdivided icosphere has > 512 vertices; a radius covering the whole mesh makes every
     # vertex's geodesic ball the entire connected component, exceeding the fixed scratch capacity.
     mesh_tm = tm.creation.icosphere(subdivisions=4)

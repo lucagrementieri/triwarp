@@ -44,6 +44,12 @@ def _upward_rays(mesh_tm: tm.Trimesh, n: int, seed: int) -> tuple[np.ndarray, np
 
 
 def test_contains_points(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: inside/outside against ``Trimesh.contains``, over three deliberately-placed groups.
+
+    Points near the centre, just outside the bounds, and far away -- the third group is what
+    catches a ray that runs out of range rather than reporting a miss.
+    """
     mesh_tm, mesh_wp = icosahedron
     rng = np.random.default_rng(7)
 
@@ -116,6 +122,12 @@ def test_contains_points_matches_pyvista(request: pytest.FixtureRequest, mesh_na
 
 
 def test_contains_cavity(cave_cube: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A: the origin sits in ``cave_cube``'s hollow, so it must read *outside*.
+
+    The one case a bounding-box or convex test gets wrong, and the reason this fixture exists.
+    trimesh agrees, so the comparison is direct rather than an asserted constant.
+    """
     mesh_tm, mesh_wp = cave_cube
     origin_np = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
 
@@ -153,6 +165,13 @@ def test_intersects_first(request: pytest.FixtureRequest, mesh_name: str):
 
 
 def test_intersects_first_miss(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A on an all-miss answer, which is a claim here rather than a vacuous comparison.
+
+    Firing ``+y`` from below the mesh never leaves the plane ``z = min_z - 5``, so every ray
+    misses for a robust reason -- and the ``(triangle == -1).all()`` assert is what makes the
+    emptiness the assertion instead of an accident (see ``_upward_rays``).
+    """
     mesh_tm, mesh_wp = icosahedron
     n = 100
     origins_np = np.random.default_rng(1).random((n, 3)).astype(np.float32)
@@ -191,6 +210,11 @@ def test_intersects_any(request: pytest.FixtureRequest, mesh_name: str):
 
 
 def test_intersects_any_miss(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A on the mask form of the same all-miss claim.
+
+    As above: the miss is constructed, and ``not hit.any()`` states it explicitly.
+    """
     mesh_tm, mesh_wp = icosahedron
     n = 100
     origins_np = np.random.default_rng(1).random((n, 3)).astype(np.float32)
@@ -259,6 +283,14 @@ def test_intersects_location_miss(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
 
 
 def test_intersects_location_cave_cube(cave_cube: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class B (segment canonicalization): a 100x100 ray grid through the hollow fixture.
+
+    Every ray crosses at least four surfaces here -- outer wall, cavity, cavity, outer wall --
+    which is what makes this the multi-hit test; the single-hit path is
+    [`test_intersects_first`]. Row order is not defined by either library, so the hits are
+    compared as a canonicalized set.
+    """
     mesh_tm, mesh_wp = cave_cube
     origins_np = tm.util.grid_linspace(
         mesh_tm.bounds[:, :2] + np.reshape([-0.02, 0.02], (-1, 1)), 100

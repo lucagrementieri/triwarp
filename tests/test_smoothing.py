@@ -52,7 +52,7 @@ def test_filter_laplacian_volume_constraint(icosahedron: tuple[tm.Trimesh, wp.Me
 @pytest.mark.parity("filter_humphrey", "trimesh")
 def test_filter_humphrey(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
-    HC filtering against trimesh, which is the only oracle this filter has.
+    Class A: HC filtering against trimesh, the only oracle this filter has.
 
     **pymeshlab is not a second oracle here**, recorded so it is not re-tried:
     ``apply_coord_hc_laplacian_smoothing`` implements the same Vollmer et al. paper but exposes no
@@ -76,6 +76,13 @@ def test_filter_humphrey(request: pytest.FixtureRequest, mesh_name: str) -> None
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parity("filter_taubin", "trimesh")
 def test_filter_taubin(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: lambda-mu filtering against ``trimesh.smoothing``, at matching iteration counts.
+
+    trimesh counts half-steps where MeshLab counts lambda-mu pairs (section 6), so the
+    iteration argument is passed in trimesh's convention here and the pymeshlab comparison
+    doubles it separately.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
 
     smoothed_wp = tw.smoothing.filter_taubin(
@@ -271,6 +278,13 @@ def test_filter_sharpen_matches_pymeshlab(device: str, iterations: int) -> None:
 def test_filter_mut_dif_laplacian_volume_constraint(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
+    """
+    Class A against trimesh, on watertight fixtures only -- the constraint needs a volume.
+
+    The volume-preserving variant inflates along vertex normals, so an open mesh has nothing to
+    preserve; restricting the fixtures is what makes the comparison meaningful rather than a
+    looser tolerance.
+    """
     # Watertight meshes only: the volume constraint inflates along vertex normals, so mesh.volume
     # must be meaningful.
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
@@ -323,6 +337,13 @@ def test_filter_laplacian_implicit(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> N
 
 
 def test_filter_implicit_fairing(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class A against trimesh on a closed mesh, which is where the flow is defined.
+
+    On an open boundary the unconstrained flow degrades boundary triangles and the CG solve
+    diverges -- igl's direct solver tolerates that and Warp offers only CG, so the fixture
+    choice is a real limitation rather than a convenience.
+    """
     # Implicit curvature flow is defined for closed meshes; on open boundaries the unconstrained
     # flow degrades boundary triangles and the conjugate-gradient solve diverges (igl's direct
     # solver tolerates it, Warp only offers CG), so the regression uses the watertight icosahedron.
@@ -436,6 +457,13 @@ def test_filter_laplacian_implicit_duplicate_built_operator(
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 def test_filter_neighborhood_average(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: the plain 1-ring mean against a numpy reference over trimesh's adjacency.
+
+    The reference is written here rather than taken from a filter, because every library's
+    "Laplacian smoothing" weights its neighbours differently -- section 6 records MeshLab's two
+    undocumented umbrellas and Open3D's inverse-distance one.
+    """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     iterations = 5
 
@@ -520,6 +548,12 @@ def _sphere_region(subdivisions: int = 2, z_cut: float = 0.5):
 
 
 def test_smooth_region_fixed_rim_matches_meshlib(device: str):
+    """
+    Class C (a displacement bound): MeshLab's ``smoothRegion`` solves the same system serially.
+
+    The rim is pinned on both sides and the free set is identical, so the two answers should be
+    close; they are not equal because meshlib factorizes where this iterates.
+    """
     vertices_np, faces_np, free_np = _sphere_region()
     v_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
     f_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
@@ -539,6 +573,12 @@ def test_smooth_region_fixed_rim_matches_meshlib(device: str):
 
 @pytest.mark.parametrize("edge_weights", ["cotan", "unit"])
 def test_smooth_region_matches_meshlib(device: str, edge_weights: str):
+    """
+    Class C (a displacement bound): the free-rim variant, over both edge weightings.
+
+    Same reasoning as the fixed-rim test above. Both weightings are run because each builds a
+    different system, not a differently-scaled one.
+    """
     vertices_np, faces_np, free_np = _sphere_region()
     v_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
     f_wp = wp.array(faces_np.reshape(-1), dtype=wp.int32, device=device)
@@ -770,7 +810,7 @@ def test_filter_scalar_laplacian_matches_pymeshlab(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     """
-    One full-step pass is exactly MeshLab's ``apply_scalar_smoothing_per_vertex``.
+    Class A: one full-step pass is exactly MeshLab's ``apply_scalar_smoothing_per_vertex``.
 
     **Closed fixtures only**, and deliberately so: VCG's ``VertexQualityLaplacian`` smooths a
     *boundary* vertex along the boundary curve alone — averaging only its two boundary neighbours
@@ -931,7 +971,7 @@ def test_filter_two_step_denoises_without_rounding_the_creases(device: str) -> N
 @pytest.mark.parity("filter_two_step", "pymeshlab")
 def test_filter_two_step_matches_pymeshlab_on_crease_preservation(device: str) -> None:
     """
-    ``apply_coord_two_steps_smoothing`` is the same two-stage scheme at the same four parameters.
+    Class C (a crease measure): the same two-stage scheme at the same four parameters.
 
     The measure both must pass is crease preservation, and both do: 95th-percentile dihedral 87
     degrees for MeshLab against this port's 90, where plain Laplacian smoothing collapses to 25.

@@ -127,7 +127,7 @@ def _transfer_meshes(device: str) -> tuple[tm.Trimesh, tm.Trimesh]:
 
 @pytest.mark.parity("transfer_onto_vertices", "pymeshlab")
 def test_transfer_onto_vertices_matches_pymeshlab(device: str):
-    """``transfer_attributes_per_vertex`` with ``qualitytransfer`` is the same barycentric pull."""
+    """Class A: ``transfer_attributes_per_vertex`` is the same barycentric pull, same values."""
     source_tm, target_tm = _transfer_meshes(device)
     values_np = np.ascontiguousarray(source_tm.vertices[:, 0] + 2.0, dtype=np.float64)
 

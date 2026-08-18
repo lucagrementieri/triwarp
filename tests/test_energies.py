@@ -295,6 +295,13 @@ def test_operator_family_empty_mesh(device: str) -> None:
 
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
 def test_lscm_hessian_matches_igl(request, device, mesh_name):
+    """
+    Class B: igl exposes the Hessian only as ``igl.lscm``'s second return, so it comes from there.
+
+    The named transform is the extraction, not a value change: igl's ``Q`` is exactly
+    ``-repdiag(L, 2) - 2A``, the same matrix triwarp assembles, and both are densified before
+    comparing because the two builds order their CSR entries differently.
+    """
     # No CPU skip: this builds the Hessian only, no conjugate-gradient solve.
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np, faces_np = mesh_igl(mesh_tm)
@@ -316,6 +323,14 @@ def test_lscm_hessian_matches_igl(request, device, mesh_name):
 
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
 def test_vector_area_matrix_matches_igl_derived(request, device, mesh_name):
+    """
+    Class B: ``vector_area_matrix`` is unbound, so it is solved for from two functions that are.
+
+    ``A = (-repdiag(L, 2) - Q) / 2`` inverts the definition of the LSCM Hessian, giving an
+    independent reference out of ``igl.cotmatrix`` and ``igl.lscm`` -- both of which triwarp is
+    compared against separately, so the derivation does not smuggle in triwarp's own answer.
+    Section 6 lists this among the C++ functions with no Python binding.
+    """
     # The bindings do not expose vector_area_matrix; derive it from A = (-repdiag(L,2) - Q) / 2.
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     vertices_np, faces_np = mesh_igl(mesh_tm)
