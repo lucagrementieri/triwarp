@@ -514,6 +514,34 @@ def test_flatnonzero_indices_to_mask_round_trip(device: str, n: int) -> None:
     )
 
 
+@pytest.mark.parametrize("invert", [False, True])
+def test_mask_to_index_map_is_the_exclusive_scan_of_the_mask(device: str, invert: bool) -> None:
+    """
+    Class A: the map is ``cumsum(mask) - mask`` and the count is the mask's population.
+
+    It is the scatter-side counterpart of [`test_flatnonzero`] -- ``flatnonzero`` says *which*
+    elements are selected and this says *where each one lands* -- so the round trip between them is
+    asserted too: indexing the map by the selected positions has to give ``0 .. count - 1``.
+    """
+    mask_np = np.array([True, False, True, True, False, False, True], dtype=bool)
+    mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
+    selected_np = ~mask_np if invert else mask_np
+
+    index_map_wp, count = tw.array.mask_to_index_map(mask_wp, invert=invert)
+
+    assert count == int(selected_np.sum())
+    assert np.array_equal(index_map_wp.numpy(), np.cumsum(selected_np) - selected_np)
+    positions_np = np.flatnonzero(selected_np)
+    assert np.array_equal(index_map_wp.numpy()[positions_np], np.arange(count, dtype=np.int32))
+
+
+def test_mask_to_index_map_empty(device: str) -> None:
+    """An empty mask maps to an empty array and a zero count, without launching a scan."""
+    index_map_wp, count = tw.array.mask_to_index_map(wp.empty(0, dtype=wp.bool, device=device))
+    assert count == 0
+    assert index_map_wp.shape == (0,)
+
+
 @pytest.mark.parametrize("include_total", [False, True], ids=["plain", "total"])
 def test_counts_to_offsets(device: str, include_total: bool) -> None:
     """
@@ -746,3 +774,39 @@ def test_bitcast_int_reciprocity(device: str, data: wp.array[wp.Scalar]):
     as_int = tw.array.bitcast_to_int(data.to(device))
     recovered = tw.array.bitcast_from_int(as_int, data.dtype)
     assert np.array_equal(data.numpy(), recovered.numpy(), equal_nan=True)
+
+
+def test_trim_to_count_keeps_the_written_prefix_of_every_buffer(device: str) -> None:
+    """
+    Class A: the atomic-append pattern this finalizes, checked across dtype and rank together.
+
+    Both buffers are indexed by the same counter, so the contract is that they come back the *same*
+    length -- trimming them in separate calls is what this function exists to prevent. Trailing
+    dimensions are preserved, which is why a ``wp.vec3`` buffer is in the call.
+    """
+    n_written = 3
+    counter_wp = wp.array([n_written], dtype=wp.int32, device=device)
+    scalars_np = np.arange(10, dtype=np.int32)
+    vectors_np = np.arange(30, dtype=np.float32).reshape(10, 3)
+
+    n_out, (scalars_wp, vectors_wp) = tw.array.trim_to_count(
+        counter_wp,
+        wp.array(scalars_np, dtype=wp.int32, device=device),
+        wp.array(np.ascontiguousarray(vectors_np), dtype=wp.vec3, device=device),
+    )
+
+    assert n_out == n_written
+    assert np.array_equal(scalars_wp.numpy(), scalars_np[:n_written])
+    assert np.array_equal(vectors_wp.numpy(), vectors_np[:n_written])
+    # A fresh allocation, not a view: writing the source tail must not reach the trimmed copy.
+    assert scalars_wp.ptr != counter_wp.ptr
+
+
+def test_trim_to_count_zero(device: str) -> None:
+    """A counter of zero gives empty buffers rather than a zero-length copy of the whole tail."""
+    n_out, (trimmed_wp,) = tw.array.trim_to_count(
+        wp.zeros(1, dtype=wp.int32, device=device),
+        wp.array(np.arange(10, dtype=np.int32), dtype=wp.int32, device=device),
+    )
+    assert n_out == 0
+    assert trimmed_wp.shape == (0,)

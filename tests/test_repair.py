@@ -254,6 +254,83 @@ def test_remove_duplicate_vertices_faces(device: str):
     )
 
 
+@pytest.mark.parametrize("epsilon", [1e-3, 1e-2])
+def test_duplicate_vertex_inverse_matches_the_documented_quantization(
+    device: str, epsilon: float
+) -> None:
+    """
+    Class B (label packing): the equivalence classes are the ``epsilon`` grid cells, as documented.
+
+    ``hash_vector_rows`` snaps each coordinate to a multiple of ``epsilon`` measured from the data's
+    own minimum corner, so that is the numpy oracle. Only the *partition* is shared -- triwarp names
+    a class by its hash-table slot and ``np.unique`` numbers them in lexicographic order -- hence
+    [`same_partition`][tests.comparisons.same_partition]. Measured 34 classes on both sides at both
+    tolerances, out of 60 input positions, so the comparison is neither all-merged nor all-distinct.
+    """
+    rng = np.random.default_rng(9)
+    positions_np = rng.integers(0, 4, size=(60, 3)).astype(np.float32) * 0.25
+    # Jitter well inside one cell, so a correct implementation merges exactly the seeded collisions.
+    positions_np += rng.normal(scale=1e-5, size=positions_np.shape).astype(np.float32)
+    positions_wp = wp.array(np.ascontiguousarray(positions_np), dtype=wp.vec3, device=device)
+
+    inverse_np = tw.repair.duplicate_vertex_inverse(positions_wp, epsilon).numpy()
+
+    cells_np = np.rint((positions_np - positions_np.min(axis=0)) / epsilon).astype(np.int64)
+    _cells_np, expected_np = np.unique(cells_np, axis=0, return_inverse=True)
+    assert 1 < int(expected_np.max()) + 1 < positions_np.shape[0]
+    assert int(inverse_np.max()) + 1 == int(expected_np.max()) + 1
+    assert same_partition(inverse_np, expected_np)
+
+
+def test_duplicate_vertex_inverse_at_zero_epsilon_collapses_bitwise_equal_positions(
+    device: str,
+) -> None:
+    """
+    The ``epsilon == 0`` branch, on the input its docstring promises it handles reliably.
+
+    A relative bucket is not an equality test, and the Notes say so; what it *does* guarantee is
+    collapsing positions that are already bitwise equal, including across ``+0.0`` / ``-0.0``. Three
+    classes from five rows here, so neither the merge nor the separation is vacuous.
+    """
+    positions_np = np.array(
+        [[0.0, 0.0, 0.0], [-0.0, -0.0, -0.0], [1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [5.0, 5.0, 5.0]],
+        dtype=np.float32,
+    )
+    positions_wp = wp.array(np.ascontiguousarray(positions_np), dtype=wp.vec3, device=device)
+
+    inverse_np = tw.repair.duplicate_vertex_inverse(positions_wp, 0.0).numpy()
+
+    assert int(inverse_np.max()) + 1 == 3
+    assert inverse_np[0] == inverse_np[1]
+    assert inverse_np[2] == inverse_np[3]
+    assert len({int(inverse_np[0]), int(inverse_np[2]), int(inverse_np[4])}) == 3
+
+
+def test_duplicate_vertex_inverse_is_what_remove_duplicated_vertices_remaps_by(device: str) -> None:
+    """
+    The reason it is public: the same map ``remove_duplicated_vertices`` used, for other attributes.
+
+    A caller remapping per-vertex colors or UVs needs the map without the deduplicated buffers, so
+    what has to hold is that applying it to the faces reproduces that function's own remapped face
+    buffer, and that gathering the deduplicated positions by it returns the input to within
+    ``epsilon``.
+    """
+    epsilon = 1e-3
+    base_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    positions_np = np.vstack((base_np, base_np + 1e-6, base_np[[0]])).astype(np.float32)
+    faces_np = np.array([[0, 1, 2], [3, 4, 5], [6, 1, 2]], dtype=np.int32)
+    positions_wp, faces_wp = numpy_to_warp(positions_np, faces_np, device)
+
+    inverse_np = tw.repair.duplicate_vertex_inverse(positions_wp, epsilon).numpy()
+
+    unique_wp, _indices_wp, _inverse_wp, unique_faces_wp = tw.repair.remove_duplicated_vertices(
+        positions_wp, faces_wp, epsilon
+    )
+    assert int(unique_wp.shape[0]) == 3
+    assert np.array_equal(unique_faces_wp.numpy(), inverse_np[faces_np.reshape(-1)])
+    assert np.abs(unique_wp.numpy()[inverse_np] - positions_np).max() <= epsilon
+
+
 def test_resolve_duplicated_faces_cancelling(device: str):
     faces_np = np.array([[0, 1, 2], [0, 1, 2], [0, 2, 1], [0, 2, 1]], dtype=np.int32)
     faces_wp = wp.array(

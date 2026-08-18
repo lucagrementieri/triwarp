@@ -203,6 +203,79 @@ def test_unique_faces_empty(device: str):
     assert inverse_wp.shape[0] == 0
 
 
+def test_first_occurrence_indices_matches_numpy_return_index(device: str) -> None:
+    """
+    Class A: the representative of each class is ``np.unique(inverse, return_index=True)``.
+
+    This is the step that makes ``unique_faces`` keep the original winding and ``edges_unique`` keep
+    the first-seen edge, so *first* rather than *any* occurrence is the whole contract. The
+    ``n_unique=None`` path -- a device reduction plus a host sync -- is checked to agree with the
+    explicit one, and an oversized ``n_unique`` is checked to fill the documented ``n`` sentinel.
+    """
+    values_np = np.array([5, 3, 5, 1, 3, 3, 9], dtype=np.int32)
+    unique_wp, inverse_wp = tw.grouping.unique_1d(
+        wp.array(values_np, dtype=wp.int32, device=device), return_inverse=True
+    )
+    n_unique = int(unique_wp.shape[0])
+
+    first_wp = tw.grouping.first_occurrence_indices(inverse_wp, n_unique)
+
+    _classes_np, expected_np = np.unique(inverse_wp.numpy(), return_index=True)
+    assert expected_np.size == n_unique
+    assert np.array_equal(first_wp.numpy(), expected_np)
+    # Deriving n_unique from the inverse costs a reduction and a sync, and must give the same map.
+    assert np.array_equal(tw.grouping.first_occurrence_indices(inverse_wp).numpy(), expected_np)
+
+    padded_wp = tw.grouping.first_occurrence_indices(inverse_wp, n_unique + 2)
+    assert np.array_equal(padded_wp.numpy()[:n_unique], expected_np)
+    assert np.array_equal(padded_wp.numpy()[n_unique:], np.full(2, values_np.size, dtype=np.int32))
+
+
+def test_first_occurrence_indices_picks_representatives_of_duplicate_rows(device: str) -> None:
+    """Gathering by the result reproduces the unique array that came back beside the inverse."""
+    rows_np = np.array([[1, 2], [3, 4], [1, 2], [5, 6], [3, 4]], dtype=np.int32)
+    rows_wp = wp.array(np.ascontiguousarray(rows_np), dtype=wp.int32, device=device)
+    unique_wp, inverse_wp = tw.grouping.unique_rows(rows_wp, return_inverse=True)
+
+    first_wp = tw.grouping.first_occurrence_indices(inverse_wp, int(unique_wp.shape[0]))
+
+    assert int(unique_wp.shape[0]) == 3
+    assert np.array_equal(rows_np[first_wp.numpy()], unique_wp.numpy())
+
+
+@pytest.mark.parametrize("kind", ["vec3", "int32_rows", "float32_rows"])
+def test_hash_rows_dispatches_to_the_typed_hashers(device: str, kind: str) -> None:
+    """Class A: the dispatcher returns exactly what the function it forwards to returns."""
+    positions_np = np.array([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [0.0, 1.0, 2.0]], dtype=np.float32)
+    if kind == "vec3":
+        data_wp = wp.array(np.ascontiguousarray(positions_np), dtype=wp.vec3, device=device)
+        expected_wp = tw.grouping.hash_vector_rows(data_wp)
+    elif kind == "int32_rows":
+        rows_np = np.array([[1, 2], [3, 4], [1, 2]], dtype=np.int32)
+        data_wp = wp.array(np.ascontiguousarray(rows_np), dtype=wp.int32, device=device)
+        expected_wp = tw.grouping.hash_indices_rows(data_wp)
+    else:
+        data_wp = wp.array(np.ascontiguousarray(positions_np), dtype=wp.float32, device=device)
+        expected_wp = tw.grouping.hash_vector_rows(
+            wp.array(np.ascontiguousarray(positions_np), dtype=wp.vec3, device=device)
+        )
+
+    keys_np = tw.grouping.hash_rows(data_wp).numpy()
+
+    assert np.array_equal(keys_np, expected_wp.numpy())
+    # Equal rows must collide and unequal ones must not, or the dispatch proves nothing.
+    assert keys_np[0] == keys_np[2]
+    assert keys_np[0] != keys_np[1]
+
+
+def test_hash_rows_rejects_a_dtype_and_a_width_it_cannot_pack(device: str) -> None:
+    """The two documented ``ValueError`` paths: an unsupported dtype and a non-width-3 float32."""
+    with pytest.raises(ValueError, match="unsupported dtype"):
+        tw.grouping.hash_rows(wp.zeros((2, 3), dtype=wp.float64, device=device))
+    with pytest.raises(ValueError, match="width 3"):
+        tw.grouping.hash_rows(wp.zeros((2, 2), dtype=wp.float32, device=device))
+
+
 def test_hash_vector_rows(device: str) -> None:
     rng = np.random.default_rng(17)
     n = 256

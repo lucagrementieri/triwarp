@@ -280,6 +280,31 @@ def test_fit_plane_normal_matches_pyvista(device: str) -> None:
     assert not np.allclose(np.asarray(centre_pv), points_np.mean(axis=0), atol=1e-2)
 
 
+@pytest.mark.parametrize(
+    "normal",
+    [(0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (0.95, 0.1, 0.2), (0.3, 0.9, 0.1), (0.0, -2.0, 0.0)],
+)
+def test_plane_basis_is_right_handed_and_orthonormal(normal: tuple[float, float, float]) -> None:
+    """
+    All four properties its docstring promises, over both branches of the axis choice.
+
+    The implementation picks its seed axis by whether ``|n_x| > 0.9``, so the parametrisation spans
+    both: two normals take the ``x`` seed and three the ``y`` seed. A non-unit normal is included
+    because the signature says it need not be normalized. Measured residuals at most 3.7e-08.
+    """
+    u_wp, v_wp = tw.plane_basis(wp.vec3(*normal))
+
+    u_np = np.array(list(u_wp))
+    v_np = np.array(list(v_wp))
+    unit_np = np.asarray(normal) / np.linalg.norm(normal)
+
+    assert np.allclose(np.linalg.norm(u_np), 1.0, rtol=1e-6, atol=1e-6)
+    assert np.allclose(np.linalg.norm(v_np), 1.0, rtol=1e-6, atol=1e-6)
+    assert np.allclose([u_np @ v_np, u_np @ unit_np, v_np @ unit_np], 0.0, rtol=1e-6, atol=1e-6)
+    # Right-handed: (u, v, n) in that order, so u x v is the normal rather than its negation.
+    assert np.allclose(np.cross(u_np, v_np), unit_np, rtol=1e-6, atol=1e-6)
+
+
 def test_covariance(device: str) -> None:
     rng = np.random.default_rng(13)
     points_np = rng.standard_normal((200, 3)).astype(np.float32)
