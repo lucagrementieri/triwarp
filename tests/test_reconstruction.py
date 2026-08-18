@@ -20,6 +20,8 @@ import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 import triwarp.typing as twt
@@ -34,24 +36,19 @@ from tests.comparisons import (
 from tests.conversions import (
     numpy_to_warp,
     open3d_to_trimesh,
+    points_to_meshlib,
     points_to_open3d,
     points_to_pymeshlab,
     points_to_pyvista,
 )
 from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
 
-_meshlib = pytest.importorskip("meshlib")
-from meshlib import mrmeshnumpy as mn  # noqa: E402
-from meshlib import mrmeshpy as mm  # noqa: E402
-
 
 def _meshlib_triangulate(
     points_np: np.ndarray, normals_np: np.ndarray, num_neighbours: int
 ) -> tuple[np.ndarray, np.ndarray]:
     """Reconstruct a reference mesh via MeshLib, returning ``(vertices, faces)`` numpy arrays."""
-    cloud_mm = mn.pointCloudFromPoints(
-        np.ascontiguousarray(points_np), np.ascontiguousarray(normals_np)
-    )
+    cloud_mm = points_to_meshlib(points_np, normals_np)
     params_mm = mm.TriangulationParameters()
     params_mm.numNeighbours = num_neighbours
     mesh_mm = mm.triangulatePointCloud(cloud_mm, params_mm)

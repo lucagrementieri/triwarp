@@ -23,13 +23,13 @@ Flags
     Which ``triwarp`` targets to time. ``auto`` (default) uses cuda when CUDA is available,
     else falls back to cpu — ``triwarp-cpu`` is not timed alongside cuda by default. Pass
     ``cpu`` for cpu only or ``both`` to time both triwarp targets. The ``trimesh`` / ``igl`` /
-    ``open3d`` / ``scipy`` / ``potpourri3d`` / ``pymeshlab`` / ``pyvista`` CPU baselines are always
-    included.
+    ``open3d`` / ``scipy`` / ``potpourri3d`` / ``pymeshlab`` / ``pyvista`` / ``meshlib`` CPU
+    baselines are always included.
 ``--size=<comma list | all>``
     Restrict meshes to these size categories (``small,medium,large,extralarge,huge``).
 ``--cpu-max-size=<category>``
     CPU-bound libraries (``triwarp-cpu``, ``trimesh``, ``igl``, ``open3d``, ``scipy``,
-    ``potpourri3d``, ``pymeshlab``, ``pyvista``) skip meshes
+    ``potpourri3d``, ``pymeshlab``, ``pyvista``, ``meshlib``) skip meshes
     larger than this unless the size was named explicitly in ``--size``. Default ``large`` — so
     ``happy_buddha`` and ``lucy`` run GPU-only by default while
     ``bunny_decimated``/``bunny``/``dragon`` run on CPU.
@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     import open3d as o3d
     import pymeshlab as ml
     import pyvista as pv
+    from meshlib import mrmeshpy as mm
     from pytest_benchmark.fixture import BenchmarkFixture
 
 # Number of timed rounds and untimed warm-up rounds. The warm-up covers Warp kernel JIT
@@ -126,6 +127,18 @@ def skip_larger_than(bench_case: BenchCase, largest: str, reason: str = "") -> N
 # shared cached property rather than a per-call rebuild and there is no "the row is reporting the
 # build" caveat above ~0.2 ms.
 #
+# ``meshlib`` (pybind11 bindings over MeshLib's C++ core) is CPU-bound but, uniquely in this list,
+# **multi-threaded** -- 143 OS threads measured live during ``findSelfCollidingTrianglesBS`` +
+# ``computePerVertNormals`` on an 82k-face icosphere, where trimesh / igl / pymeshlab / pyvista are
+# all effectively single-threaded. So a ``triwarp-cuda`` vs ``meshlib`` ratio is a fair fight in a
+# way the other CPU ratios are not, and the other edge of the same knife is that a ``triwarp-cpu``
+# row loses to it on any parallel op regardless of algorithm; section 13's "decide on the CUDA
+# number" is what applies. ``meshlib.mrcudapy`` exists and is deliberately **not** used -- the plain
+# ``mrmeshpy`` free functions are the reference, and mixing in a CUDA module would make the row
+# incomparable with the other five. Almost every one of those free functions mutates its ``Mesh`` in
+# place, so the accessor is ``BenchCase.new_mesh_ml()`` (the ``new_meshset_pml`` shape) and there is
+# no cached property.
+#
 # ``numpy`` is the narrowest baseline of all: it is only a reference for the *array primitives*
 # (``triwarp.reduce``), where a host reduction over an already-resident NumPy buffer is the honest
 # CPU floor. It is deliberately not a geometry reference — every other CPU baseline is already
@@ -141,6 +154,7 @@ LIBRARIES: list[LibrarySpec] = [
     {"id": "potpourri3d", "kind": "potpourri3d", "device": None, "cpu_bound": True},
     {"id": "pymeshlab", "kind": "pymeshlab", "device": None, "cpu_bound": True},
     {"id": "pyvista", "kind": "pyvista", "device": None, "cpu_bound": True},
+    {"id": "meshlib", "kind": "meshlib", "device": None, "cpu_bound": True},
 ]
 LIBRARIES_BY_ID = {lib["id"]: lib for lib in LIBRARIES}
 
@@ -266,6 +280,22 @@ def _new_mesh_pv(name: str) -> pv.PolyData:
     return pv.PolyData.from_regular_faces(vertices, np.ascontiguousarray(faces, dtype=np.int32))
 
 
+def _new_mesh_ml(name: str) -> mm.Mesh:
+    """
+    Build a fresh ``meshlib.mrmeshpy.Mesh`` from the shared NumPy source.
+
+    Imported lazily (like ``meshio``, ``open3d``, ``pymeshlab`` and ``pyvista`` above) so the
+    0.256 s meshlib import is only paid by runs that include a meshlib case. ``meshFromFacesVerts``
+    takes
+    **faces first** -- the reverse of every other builder here -- and accepts float64 positions and
+    int64 indices as the loader holds them.
+    """
+    from meshlib import mrmeshnumpy as mn
+
+    vertices, faces = _load_numpy(name)
+    return mn.meshFromFacesVerts(faces, vertices)
+
+
 def _vertices_wp(name: str, device: str) -> wp.array[wp.vec3]:
     """``wp.vec3`` (float32) vertex buffer on ``device``, cached per ``(name, device)``."""
     key = ("verts", name, device)
@@ -338,8 +368,8 @@ def _selected_libraries(config: pytest.Config) -> list[LibrarySpec]:
             continue
         if lib["id"] == "triwarp-cuda" and not (include_cuda and cuda_available):
             continue
-        # trimesh / igl / open3d / scipy / potpourri3d / pymeshlab / pyvista baselines are always
-        # included.
+        # trimesh / igl / open3d / scipy / potpourri3d / pymeshlab / pyvista / meshlib baselines
+        # are always included.
         selected.append(lib)
     return selected
 
@@ -427,7 +457,8 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
         "benchlibs(*kinds): library kinds "
-        "(triwarp/trimesh/igl/open3d/scipy/numpy/potpourri3d/pymeshlab) a benchmark supports.",
+        "(triwarp/trimesh/igl/open3d/scipy/numpy/potpourri3d/pymeshlab/pyvista/meshlib) a "
+        "benchmark supports.",
     )
     config.addinivalue_line(
         "markers",
@@ -678,6 +709,29 @@ class BenchCase(BenchLibrary):
         if self.mesh_name not in _pml_cache:
             _pml_cache[self.mesh_name] = _new_meshset_pml(self.mesh_name)
         return _pml_cache[self.mesh_name]
+
+    def new_mesh_ml(self) -> mm.Mesh:
+        """
+        Build a **fresh** ``meshlib.mrmeshpy.Mesh``; call this *inside* the timed callable.
+
+        A method rather than a cached property, and for the ``new_meshset_pml`` reason: almost every
+        MeshLib free function mutates its ``Mesh`` in place and returns something else -- ``relax``,
+        ``fillHole``, ``decimateMesh``, ``remesh``, ``subdivideMesh``, ``fixMeshDegeneracies``,
+        ``denoiseNormals``, ``expand`` and ``shrink`` all return a status, a count, an ``EdgeId`` or
+        a bitset of *new* elements, never the mesh -- so a shared mesh would have rounds 2..n
+        measure a filter applied to its own output.
+
+        Two things a row using this must decide explicitly and state in its docstring:
+
+        - **The AABB tree is lazily built, cached on the ``Mesh``, and worth 131x.** Measured on a
+          40 962-vertex sphere: the first ``findProjection`` takes 2.741 ms and the second 21.0 us.
+          A query row should therefore build the mesh *outside* the timed callable and pre-warm it
+          with one throwaway query, so the row times the query rather than the tree -- which is
+          what triwarp's ``wp.Mesh``-in-hand rows already do with their BVH. A row that rebuilds per
+          round is timing the build.
+        - A mutating call **invalidates** that tree, so the two decisions are not independent.
+        """
+        return _new_mesh_ml(self.mesh_name)
 
 
 @pytest.fixture

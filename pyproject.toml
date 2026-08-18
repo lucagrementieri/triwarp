@@ -147,6 +147,8 @@ known-first-party = ["triwarp"]
 split-on-trailing-comma = false
 
 [tool.ruff.lint.flake8-import-conventions.aliases]
+"meshlib.mrmeshnumpy" = "mn"
+"meshlib.mrmeshpy" = "mm"
 numpy = "np"
 open3d = "o3d"
 pyvista = "pv"

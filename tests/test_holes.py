@@ -8,9 +8,16 @@ import pytest
 import trimesh as tm
 import trimesh.repair as tm_repair
 import warp as wp
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.conversions import numpy_to_warp, trimesh_to_open3d, trimesh_to_pymeshlab
+from tests.conversions import (
+    numpy_to_meshlib,
+    numpy_to_warp,
+    trimesh_to_open3d,
+    trimesh_to_pymeshlab,
+)
 
 # Open-surface fixtures that actually have a boundary to fill.
 OPEN_MESHES = ["hemisphere", "half_torus"]
@@ -387,33 +394,32 @@ def _meshlib_fill_triangles(vertices: wp.array, faces: wp.array, metric: str) ->
     sub-sampling), matching [`fill_min_weight`]'s full search. fillHole reuses existing
     vertices, so the new faces are those not present in the original triangle set.
     """
-    mr = pytest.importorskip("meshlib.mrmeshpy")
-    mn = pytest.importorskip("meshlib.mrmeshnumpy")
     make_metric = {
-        "plane_normalized": lambda m, e: mr.getPlaneNormalizedFillMetric(m, e),
-        "min_area": lambda m, e: mr.getMinAreaMetric(m),
-        "circumscribed": lambda m, e: mr.getCircumscribedMetric(m),
-        "plane": lambda m, e: mr.getPlaneFillMetric(m, e),
-        "min_tri_angle": lambda m, e: mr.getMinTriAngleMetric(m),
-        "edge_length": lambda m, e: mr.getEdgeLengthFillMetric(m),
-        "universal": lambda m, e: mr.getUniversalMetric(m),
-        "max_dihedral": lambda m, e: mr.getMaxDihedralAngleMetric(m),
-        "complex_fill": lambda m, e: mr.getComplexFillMetric(m, e),
+        "plane_normalized": lambda m, e: mm.getPlaneNormalizedFillMetric(m, e),
+        "min_area": lambda m, e: mm.getMinAreaMetric(m),
+        "circumscribed": lambda m, e: mm.getCircumscribedMetric(m),
+        "plane": lambda m, e: mm.getPlaneFillMetric(m, e),
+        "min_tri_angle": lambda m, e: mm.getMinTriAngleMetric(m),
+        "edge_length": lambda m, e: mm.getEdgeLengthFillMetric(m),
+        "universal": lambda m, e: mm.getUniversalMetric(m),
+        "max_dihedral": lambda m, e: mm.getMaxDihedralAngleMetric(m),
+        "complex_fill": lambda m, e: mm.getComplexFillMetric(m, e),
     }[metric]
     vertices_np = np.ascontiguousarray(vertices.numpy(), dtype=np.float32)
     faces_np = np.ascontiguousarray(faces.numpy().reshape(-1, 3), dtype=np.int32)
-    mesh = mn.meshFromFacesVerts(faces_np, vertices_np)
-    params = mr.FillHoleParams()
+    mesh = numpy_to_meshlib(vertices_np, faces_np)
+    params = mm.FillHoleParams()
     params.maxPolygonSubdivisions = 1000
     for edge in mesh.topology.findHoleRepresentiveEdges():
         params.metric = make_metric(mesh, edge)
-        mr.fillHole(mesh, edge, params)
+        mm.fillHole(mesh, edge, params)
     faces_out = mn.getNumpyFaces(mesh.topology)
     original = {tuple(sorted(int(x) for x in tri)) for tri in faces_np}
     fill = [tri for tri in faces_out if tuple(sorted(int(x) for x in tri)) not in original]
     return np.asarray(fill, dtype=np.int32).reshape(-1)
 
 
+@pytest.mark.parity("fill_min_weight", "meshlib")
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
 @pytest.mark.parametrize("metric", FILL_METRICS)
 def test_fill_min_weight_matches_meshlib(
@@ -444,19 +450,17 @@ def test_fill_metric_scorer_matches_meshlib(hemisphere: tuple[tm.Trimesh, wp.Mes
     (``calcCombinedFillMetric`` cannot score the edge-only metrics — it always calls
     ``triangleMetric``, which is empty for them).
     """
-    mr = pytest.importorskip("meshlib.mrmeshpy")
-    mn = pytest.importorskip("meshlib.mrmeshnumpy")
     _, mesh_wp = hemisphere
     faces_np = np.ascontiguousarray(mesh_wp.indices.numpy().reshape(-1, 3), dtype=np.int32)
     verts_np = np.ascontiguousarray(mesh_wp.points.numpy(), dtype=np.float32)
     make_metric = {
-        "plane_normalized": lambda m, e: mr.getPlaneNormalizedFillMetric(m, e),
-        "min_area": lambda m, e: mr.getMinAreaMetric(m),
-        "circumscribed": lambda m, e: mr.getCircumscribedMetric(m),
-        "plane": lambda m, e: mr.getPlaneFillMetric(m, e),
-        "min_tri_angle": lambda m, e: mr.getMinTriAngleMetric(m),
-        "universal": lambda m, e: mr.getUniversalMetric(m),
-        "complex_fill": lambda m, e: mr.getComplexFillMetric(m, e),
+        "plane_normalized": lambda m, e: mm.getPlaneNormalizedFillMetric(m, e),
+        "min_area": lambda m, e: mm.getMinAreaMetric(m),
+        "circumscribed": lambda m, e: mm.getCircumscribedMetric(m),
+        "plane": lambda m, e: mm.getPlaneFillMetric(m, e),
+        "min_tri_angle": lambda m, e: mm.getMinTriAngleMetric(m),
+        "universal": lambda m, e: mm.getUniversalMetric(m),
+        "complex_fill": lambda m, e: mm.getComplexFillMetric(m, e),
     }
     for metric, factory in make_metric.items():
         fill = (
@@ -464,14 +468,14 @@ def test_fill_metric_scorer_matches_meshlib(hemisphere: tuple[tm.Trimesh, wp.Mes
             .numpy()[faces_np.size :]
             .reshape(-1, 3)
         )
-        mesh_orig = mn.meshFromFacesVerts(faces_np, verts_np)
+        mesh_orig = numpy_to_meshlib(verts_np, faces_np)
         metric_obj = factory(mesh_orig, mesh_orig.topology.findHoleRepresentiveEdges()[0])
         full = np.vstack([faces_np, fill]).astype(np.int32)
-        mesh_full = mn.meshFromFacesVerts(np.ascontiguousarray(full, np.int32), verts_np)
+        mesh_full = numpy_to_meshlib(verts_np, full)
         region_bools = np.zeros(len(full), dtype=bool)
         region_bools[len(faces_np) :] = True
         region = mn.faceBitSetFromBools(region_bools)
-        mr_cost = mr.calcCombinedFillMetric(mesh_full, region, metric_obj)
+        mr_cost = mm.calcCombinedFillMetric(mesh_full, region, metric_obj)
         my_cost = _total_fill_metric(mesh_wp.points, mesh_wp.indices, fill.reshape(-1), metric)
         assert np.isclose(my_cost, mr_cost, rtol=2e-3, atol=1e-3), metric
 
@@ -873,12 +877,7 @@ def _mesh_volume_area(vertices_np: np.ndarray, faces_np: np.ndarray) -> tuple[fl
 def _meshlib_fill_nicely_volume(
     vertices_np: np.ndarray, faces_np: np.ndarray, max_edge: float
 ) -> float:
-    mm = pytest.importorskip("meshlib.mrmeshpy")
-    mn = pytest.importorskip("meshlib.mrmeshnumpy")
-    mesh = mn.meshFromFacesVerts(
-        np.ascontiguousarray(faces_np.astype(np.int32)),
-        np.ascontiguousarray(vertices_np.astype(np.float32)),
-    )
+    mesh = numpy_to_meshlib(vertices_np, faces_np)
     settings = mm.FillHoleNicelySettings()
     settings.subdivideSettings.maxEdgeLen = max_edge
     for edge in mesh.topology.findHoleRepresentiveEdges():
@@ -934,7 +933,6 @@ def test_fill_smooth_statistics_vs_meshlib(device: str, hemisphere: tuple[tm.Tri
     comparable quantity, and it excludes a cap that bulges or collapses while still being
     watertight.
     """
-    pytest.importorskip("meshlib.mrmeshpy")
     _, mesh_wp = hemisphere
     vertices_np = mesh_wp.points.numpy().astype(np.float64)
     faces_np = mesh_wp.indices.numpy().reshape(-1, 3)

@@ -653,6 +653,121 @@ parameterizes it: it welds to two boundary loops and reads *orientable*, so only
 the closed non-orientable χ = 0 surface. A comparison reaching for `klein` expecting
 non-orientability is testing nothing.
 
+**meshlib** (pybind11 over MeshLib's C++ core, mirrored under `reference/MeshLib`) is a hard test
+dependency like the four above — `from meshlib import mrmeshpy as mm` / `mrmeshnumpy as mn`, both
+aliases pinned in ruff's import conventions, never through `pytest.importorskip`; reference
+variables take an **`_ml`** suffix. Build meshes with `tests.conversions.trimesh_to_meshlib` /
+`numpy_to_meshlib` / `warp_to_meshlib`, clouds with `points_to_meshlib`, and read a result back with
+`meshlib_to_trimesh` — never hand-roll `mn.meshFromFacesVerts`, whose argument order is the trap
+below. It earns its seat on three counts the other five cannot cover: it is the **only
+multi-threaded** CPU reference (143 OS threads measured live during `findSelfCollidingTrianglesBS` +
+`computePerVertNormals`), so a `triwarp-cuda` vs `meshlib` ratio is a fair fight where the others
+are not — and the other edge of that knife is that a `triwarp-cpu` row loses to it on any parallel
+op regardless of algorithm, which is §13's "decide on the CUDA number" again. It is the only
+reference that binds a real minimum-weight Liepa/Klincsek `fillHole` with a 12-metric family and a
+two-loop `stitchHoles`, where trimesh fans and pymeshlab ear-clips. And it is the only oracle for
+`repair.collapse_small_triangles`, which libigl does not bind despite the C++ header existing.
+`meshlib.mrcudapy` exists and is deliberately **not** used: the plain `mrmeshpy` free functions are
+the reference, and a CUDA module would make the row incomparable with the other five. Nine hazards,
+all measured:
+
+- **Almost every free function mutates its `Mesh` in place and returns something else.** `relax`,
+  `fillHole`, `fillHoles`, `decimateMesh`, `remesh`, `subdivideMesh`, `fixMeshDegeneracies`,
+  `filterCreaseEdges`, `denoiseNormals`, `smoothRegionBoundary`, `expand` and `shrink` return a
+  status `bool`, a count, an `EdgeId` or a `FaceBitSet` of *new* faces — never the mesh. So **one
+  `mm.Mesh` serves one mutating call**: build a fresh one per comparison and per benchmark round,
+  the `new_meshset_pml` rule rather than the `mesh_o3d` one (`BenchCase.new_mesh_ml()` is a method,
+  not a cached property, for exactly this).
+- **`meshFromFacesVerts` takes faces *first*, and it sizes the vertex buffer by `F.max() + 1`.** The
+  argument order is the reverse of every other converter in `tests/conversions.py`, and a swapped
+  call raises nothing — the two arrays differ in shape only when the counts differ. That is why the
+  converters exist and why they all take vertices first. The sizing is igl's F-only hazard in a new
+  place and it behaves *differently* by position: on `icosphere(2)` a **trailing** unreferenced
+  vertex is dropped outright (163 in → `points.size()` 162, `getNumpyVerts` 162 rows) while an
+  **interior** one is kept in the buffer and excluded from `numValidVerts` (163 in → 163 back,
+  `numValidVerts` 162, value verbatim). So on `bunny`, whose 1 113 unreferenced vertices are
+  interior, the buffers line up and the *validity* mask does not; where the spares are trailing, the
+  indices shift. Never hand MeshLib a compacted `V` with the original `F`, and never assume
+  `getNumpyVerts(...).shape[0] == len(V)`.
+- **`pack()` is mandatory before reading topology back, and skipping it is silent.** Measured after
+  `decimateMesh(maxDeletedFaces=200)` on a 320-face mesh: `numValidFaces` is 120,
+  `topology.faceSize()` is 320, and **`getNumpyFaces` returns 319 rows** — `last_valid_face_id + 1`
+  — of which **199 are `[0, 0, 0]`**, degenerate triangles on vertex 0. `getNumpyVerts` still
+  returns all 162 positions while `numValidVerts` is 62. No exception, no warning; after `pack()`
+  the same reads give 120 and 62. `meshlib_to_trimesh` packs by default for this reason.
+- **`np.asarray` on a scalar container silently returns a 0-d `object` array.** `VertScalars`,
+  `FaceScalars` and `UndirectedEdgeScalars` are not accepted by `mn.toNumpyArray` (which binds only
+  `VertCoords` / `FaceNormals` / `std_vector_Vector3_float` and raises a clear `TypeError`
+  otherwise — that part is safe), and `np.asarray(vert_scalars)` produces `dtype=object, shape=()`
+  rather than raising, so the failure surfaces several lines later in whatever NumPy call comes
+  next. Go through `conversions.meshlib_scalars_to_numpy`. Bitsets need no equivalent:
+  `mn.getNumpyBitSet` returns a correctly domain-sized `bool` array even when only bit 0 is set.
+- **`(*args, **kwargs)` in a signature is an overload set, and `inspect` / `help()` cannot see it.**
+  This wheel's pybind11 docstrings are stripped: `inspect.signature` gives `(*args, **kwargs)` and
+  `__doc__` carries no overload lines. **Read the real signatures by calling the function with one
+  junk argument and reading the `TypeError`**, which pybind11 renders as a numbered list of every
+  overload — measured 4 for `expand`, 3 for `relax` and `getAllComponents`, 2 for `shrink` and
+  `stitchHoles`.
+- **Two overloads of one name can have opposite output conventions, and the wrong one binds
+  silently.** `expand(topology, region: FaceBitSet, hops)` returns `None` and **mutates `region`**
+  (measured: 1 face → 12), while `expand(topology, f: FaceId, hops)` **returns** a new `FaceBitSet`
+  (also 12); same for `shrink`. `stitchHoles(mesh, a, b, params)` takes two named hole edges and
+  `stitchHoles(mesh, params)` finds them itself — argument *count* is the only tell. `relax`'s first
+  overload takes a `PointCloud` and the second a `Mesh`, with different params types
+  (`PointCloudRelaxParams` vs `MeshRelaxParams`). One `getAllComponents` form returns a
+  `(components, count)` **tuple** rather than the vector. Resolve the overload explicitly and assert
+  the result's type or count before comparing, so a future rebinding cannot quietly pick the other.
+- **The AABB tree is lazily built and cached on the `Mesh`, and the ratio depends on whether the
+  query is the process's first.** On `icosphere(4)`, first-vs-second `findProjection` measures
+  **68x** on the process's first mesh (2.03 ms → 0.030 ms) and settles at **17-20x** on later fresh
+  meshes (0.28-0.30 ms → 0.014-0.017 ms), the difference being the thread pool spinning up inside
+  the first build. So every query row and every timed callable must state whether the build is
+  inside it — recommended: build outside and pre-warm with one throwaway query, so the row times the
+  *query*, matching what triwarp's `wp.Mesh`-in-hand rows already do with their BVH. This is also a
+  *correctness* trap next to the mutation hazard: a mutating call invalidates the tree, so a test
+  that queries, mutates and queries again is not measuring what it looks like.
+- **Per-vertex free functions are per-*vertex*, and `mrmeshnumpy` has the batched form.**
+  `discreteGaussianCurvature(topology, points, v)` and `sumAngles(...)` take one `VertId` per call; a
+  Python loop over 642 vertices measures **2.79 ms** against **0.046 ms** for
+  `mn.getNumpyGaussianCurvature(mesh)` — **49-67x**, bit-identical results, and the gap grows with
+  the mesh. Prefer `mn.getNumpyGaussianCurvature` / `getNumpyMeanCurvature` / `getNumpyCurvature`,
+  and never put a per-vertex Python loop in a benchmark row: it would time the loop, not MeshLib.
+- **`getNumpyVerts` is float64 but the storage is float32.** Round-trip error on `icosphere(2)` is
+  **2.58e-08**, so a MeshLib comparison bottoms out around 1e-7 for the same reason a triwarp one
+  does. `computePerFaceNormals` is **normalized** (measured |n| = 1.0 ± 1e-7) — note the contrast
+  with pymeshlab's `face_normal_matrix()`, which is the unnormalised cross product at magnitude
+  `2 * area`.
+
+Two of its pairings are worth knowing before writing a comparison, because neither is guessable from
+the names: `computePerVertNormals` matches `vertices.area_weighted_vertex_normals` to **1.19e-07**
+while `computePerVertPseudoNormals` matches `angle_weighted_vertex_normals` to **1.19e-07**, and
+each sits **6.8e-03** from the other's partner — so MeshLib pins a weighting convention no other
+reference distinguishes. And `mn.getNumpyGaussianCurvature` is the pointwise **angle defect**, which
+pairs with `vertices.vertex_defects` (9.5e-07 abs / 5.2e-05 rel on `icosphere(3)`) and **not** with
+`curvature.discrete_gaussian_curvature`, the Cohen-Steiner/Morvan *ball* measure — that pairing
+lands in the same D2 exemption pymeshlab already holds on that group.
+
+**Licensing: MeshLib is the one reference here that is not open source.** The wheel and
+`reference/MeshLib` are under AMV Consulting's *"NON-COMMERCIAL & education"* agreement — a
+terminable, non-transferable licence for "non-commercial, evaluation or educational purposes", with
+a separate commercial licence required otherwise, and an explicit bar on modifying or transferring
+the Software. That is a stronger constraint than libigl's `copyleft/` subtree or pymeshlab's GPL,
+because it restricts *use* rather than distribution, and triwarp itself ships `MIT OR Apache-2.0`.
+Two rules follow. **No triwarp code may be derived from `reference/MeshLib`** — read it to
+understand an algorithm's *interface* and its parameters, never to port its body; where a triwarp
+function was written against a MeshLib operation, name the **operation**, not a source file — four
+comments predate this rule and still cite `MRMeshDelone.cpp` / `MRMeshMetrics.cpp` / `MRTriMath.h`
+(`kernels/remesh.py`, `kernels/reconstruction.py`), which reads as a claim about provenance that
+the licence makes worth not making loosely; reword them to the operation when next touched. And
+**keep it a test/benchmark dependency only**: it appears in `tests/` and `benchmarks/`, never in
+`triwarp/`, and nothing in the shipped package imports it today — verified, keep it that way.
+
+One more, for the fixtures rather than the API: **`trimesh.slice_plane`'s output is a poor MeshLib
+input.** A hemisphere built that way from `icosphere(2)` reports **17** `findHoleRepresentiveEdges`
+where the surface has one rim; a properly built open mesh reports the correct count. Use the
+`tests/conftest.py` fixtures (`hemisphere`, `half_torus`), and **assert the hole count** before
+comparing a per-hole answer.
+
 ### Mesh fixtures (prefer over inline construction)
 
 Reuse shared mesh fixtures from `tests/conftest.py` instead of building meshes in each test. Fixtures return `(mesh_tm: tm.Trimesh, mesh_wp: wp.Mesh)` via `tests.conversions.trimesh_to_warp`.

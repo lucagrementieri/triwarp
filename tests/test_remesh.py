@@ -8,6 +8,8 @@ import pymeshlab as ml
 import pytest
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 from scipy.spatial import KDTree
 
 import triwarp as tw
@@ -15,6 +17,7 @@ from tests.comparisons import hausdorff_surface_two_sided, undirected_edges
 from tests.conversions import (
     bsr_to_dense,
     faces_igl,
+    numpy_to_meshlib,
     numpy_to_warp,
     open3d_to_trimesh,
     trimesh_to_open3d,
@@ -113,21 +116,14 @@ def _valences(faces_np: np.ndarray, n_vertices: int) -> np.ndarray:
 
 
 def _meshlib_remesh_spread(vertices_np: np.ndarray, faces_np: np.ndarray, target: float) -> float:
-    """Coefficient of variation (std / mean) of meshlib remesh at ``target`` (NaN if absent)."""
-    try:
-        from meshlib import mrmeshnumpy as _mn
-        from meshlib import mrmeshpy as _mm
-    except ImportError:
-        return float("nan")
-    mesh_ml = _mn.meshFromFacesVerts(
-        faces_np.astype(np.int32), np.ascontiguousarray(vertices_np, dtype=np.float64)
-    )
-    settings = _mm.RemeshSettings()
+    """Coefficient of variation (std / mean) of meshlib remesh at ``target``."""
+    mesh_ml = numpy_to_meshlib(vertices_np, faces_np)
+    settings = mm.RemeshSettings()
     settings.targetEdgeLen = float(target)
     settings.projectOnOriginalMesh = True
-    _mm.remesh(mesh_ml, settings)
-    vertices_ml = _mn.getNumpyVerts(mesh_ml)
-    faces_ml = _mn.getNumpyFaces(mesh_ml.topology)
+    mm.remesh(mesh_ml, settings)
+    vertices_ml = mn.getNumpyVerts(mesh_ml)
+    faces_ml = mn.getNumpyFaces(mesh_ml.topology)
     lengths_ml = _edge_lengths(vertices_ml, faces_ml)
     return float(lengths_ml.std() / lengths_ml.mean())
 
@@ -252,8 +248,7 @@ def test_remesh_edge_concentration(device: str) -> None:
     in_band = np.mean((lengths >= 0.5 * target) & (lengths <= 1.6 * target))
     assert in_band >= 0.8
     spread_ml = _meshlib_remesh_spread(sphere.vertices, sphere.faces, target)
-    if not np.isnan(spread_ml):
-        assert lengths.std() / lengths.mean() <= 1.5 * spread_ml
+    assert lengths.std() / lengths.mean() <= 1.5 * spread_ml
 
 
 def test_remesh_watertight_genus_preserved(device: str) -> None:

@@ -13,9 +13,12 @@ import trimesh as tm
 import trimesh.smoothing as tms
 import warp as wp
 import warp.sparse as wps
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.conversions import (
+    numpy_to_meshlib,
     numpy_to_warp,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
@@ -534,10 +537,6 @@ def test_empty_mesh(device: str) -> None:
 # Region smoothing solves vs MeshLib (positionVertsSmoothly / SharpBd)
 # ---------------------------------------------------------------------------
 
-_meshlib = pytest.importorskip("meshlib")
-from meshlib import mrmeshnumpy as _mn  # noqa: E402
-from meshlib import mrmeshpy as _mm  # noqa: E402
-
 
 def _sphere_region(subdivisions: int = 2, z_cut: float = 0.5):
     sph = tm.creation.icosphere(subdivisions=subdivisions, radius=1.0)
@@ -561,11 +560,11 @@ def test_smooth_region_fixed_rim_matches_meshlib(device: str):
 
     result_wp = tw.smoothing.smooth_region_fixed_rim(v_wp, f_wp, free_wp)
 
-    mesh_ml = _mn.meshFromFacesVerts(faces_np, vertices_np.astype(np.float32))
-    params_ml = _mm.PositionVertsSmoothlyParams()
-    params_ml.region = _mn.vertBitSetFromBools(free_np)
-    _mm.positionVertsSmoothlySharpBd(mesh_ml, params_ml)
-    verts_ml = _mn.getNumpyVerts(mesh_ml)
+    mesh_ml = numpy_to_meshlib(vertices_np, faces_np)
+    params_ml = mm.PositionVertsSmoothlyParams()
+    params_ml.region = mn.vertBitSetFromBools(free_np)
+    mm.positionVertsSmoothlySharpBd(mesh_ml, params_ml)
+    verts_ml = mn.getNumpyVerts(mesh_ml)
 
     assert np.allclose(result_wp.numpy(), verts_ml, rtol=1e-5, atol=1e-5)
     assert np.array_equal(result_wp.numpy()[~free_np], v_wp.numpy()[~free_np])
@@ -586,10 +585,10 @@ def test_smooth_region_matches_meshlib(device: str, edge_weights: str):
 
     result_wp = tw.smoothing.smooth_region(v_wp, f_wp, free_wp, edge_weights=edge_weights)
 
-    mesh_ml = _mn.meshFromFacesVerts(faces_np, vertices_np.astype(np.float32))
-    ew_ml = _mm.EdgeWeights.Cotan if edge_weights == "cotan" else _mm.EdgeWeights.Unit
-    _mm.positionVertsSmoothly(mesh_ml, _mn.vertBitSetFromBools(free_np), ew_ml, _mm.VertexMass.Unit)
-    verts_ml = _mn.getNumpyVerts(mesh_ml)
+    mesh_ml = numpy_to_meshlib(vertices_np, faces_np)
+    ew_ml = mm.EdgeWeights.Cotan if edge_weights == "cotan" else mm.EdgeWeights.Unit
+    mm.positionVertsSmoothly(mesh_ml, mn.vertBitSetFromBools(free_np), ew_ml, mm.VertexMass.Unit)
+    verts_ml = mn.getNumpyVerts(mesh_ml)
 
     assert np.allclose(result_wp.numpy(), verts_ml, rtol=1e-4, atol=1e-4)
     assert np.array_equal(result_wp.numpy()[~free_np], v_wp.numpy()[~free_np])

@@ -9,6 +9,8 @@ import pyvista as pv
 import scipy.sparse as sp
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 from scipy.spatial import cKDTree
 
 
@@ -316,6 +318,124 @@ def pyvista_edges_to_indices(edges_pv: pv.PolyData, vertices_np: np.ndarray) -> 
     )
     assert float(np.max(distances_np, initial=0.0)) == 0.0
     return np.sort(indices_np[lines_np], axis=1)
+
+
+def numpy_to_meshlib(vertices_np: np.ndarray, faces_np: np.ndarray) -> mm.Mesh:
+    """
+    Build a ``meshlib.mrmeshpy.Mesh`` from a NumPy ``(vertices, faces)`` pair.
+
+    **Vertices first**, like every other converter in this module -- which is the point of routing
+    through it, because ``mn.meshFromFacesVerts`` itself takes *faces* first. That swap is the one
+    thing to get wrong by hand: the two arrays differ in shape only when the counts differ, so a
+    reversed call on a mesh with as many faces as vertices builds silent nonsense rather than
+    raising. Both dtypes are permissive on this wheel -- int32 and int64 faces, float32 and float64
+    positions all accepted -- so the arrays go through as the caller holds them, and ``faces_np``
+    may be ``(n_faces, 3)`` or already flat.
+
+    The result is **not** reusable across calls: almost every MeshLib free function mutates its
+    ``Mesh`` in place and returns a status, a count or a bitset of new elements, so build a fresh
+    one per comparison -- the ``trimesh_to_pymeshlab`` rule rather than the ``trimesh_to_open3d``
+    one. A mutating call also invalidates the lazily-built AABB tree cached on the mesh.
+
+    !!! warning "The vertex buffer is sized by the faces, not by ``len(V)``"
+        A **trailing** unreferenced vertex is dropped outright (163 positions in, 162 back), while
+        an **interior** one is kept in the buffer and excluded from ``numValidVerts`` (163 in, 163
+        back, ``numValidVerts`` 162). So never assume ``getNumpyVerts(...).shape[0] == len(V)``, and
+        never hand MeshLib a compacted ``V`` with the original ``F``.
+
+    See Also
+    --------
+    [`meshlib_to_trimesh`][tests.conversions.meshlib_to_trimesh]
+        The inverse, which packs before reading the topology back.
+    [`trimesh_to_meshlib`][tests.conversions.trimesh_to_meshlib]
+        The same conversion from a ``tests/conftest.py`` fixture.
+    [`warp_to_meshlib`][tests.conversions.warp_to_meshlib]
+        The same conversion from a triwarp output.
+    """
+    return mn.meshFromFacesVerts(
+        np.ascontiguousarray(np.asarray(faces_np).reshape(-1, 3)), np.ascontiguousarray(vertices_np)
+    )
+
+
+def trimesh_to_meshlib(mesh: tm.Trimesh) -> mm.Mesh:
+    """
+    Wrap a ``tm.Trimesh`` in a ``meshlib.mrmeshpy.Mesh``.
+
+    Thin front end on [`numpy_to_meshlib`][tests.conversions.numpy_to_meshlib]; its argument-order,
+    freshness and vertex-buffer-sizing notes all apply here.
+    """
+    return numpy_to_meshlib(mesh.vertices, mesh.faces)
+
+
+def warp_to_meshlib(vertices_wp: wp.array, faces_wp: wp.array) -> mm.Mesh:
+    """
+    Read triwarp's ``(vertices, flat faces)`` pair into a ``meshlib.mrmeshpy.Mesh``.
+
+    Use this when the mesh under test is a triwarp *output* rather than one of the
+    ``tests/conftest.py`` fixtures (which already carry a ``tm.Trimesh`` for
+    [`trimesh_to_meshlib`][tests.conversions.trimesh_to_meshlib]). Same freshness rule as
+    [`numpy_to_meshlib`][tests.conversions.numpy_to_meshlib], which does the work.
+    """
+    return numpy_to_meshlib(vertices_wp.numpy(), faces_wp.numpy())
+
+
+def points_to_meshlib(points_np: np.ndarray, normals_np: np.ndarray | None = None) -> mm.PointCloud:
+    """
+    Wrap a bare point cloud, and optionally its normals, in a ``meshlib.mrmeshpy.PointCloud``.
+
+    Several oracles read the normals and quietly do something else without them --
+    ``makeOrientedNormals``, ``triangulatePointCloud`` and ``findOutliers`` all consult
+    ``cloud.normals`` -- so pass them whenever the triwarp side had them.
+    """
+    if normals_np is None:
+        return mn.pointCloudFromPoints(np.ascontiguousarray(points_np))
+    return mn.pointCloudFromPoints(
+        np.ascontiguousarray(points_np), np.ascontiguousarray(normals_np)
+    )
+
+
+def meshlib_to_trimesh(mesh_ml: mm.Mesh, *, pack: bool = True) -> tm.Trimesh:
+    """
+    Read a MeshLib mesh back into a ``tm.Trimesh``, packing the deleted elements away first.
+
+    ``pack()`` is **mandatory** after anything that deletes, and skipping it is silent. Measured
+    after ``decimateMesh(maxDeletedFaces=200)`` on a 320-face mesh: ``numValidFaces`` reads 120,
+    ``topology.faceSize()`` reads 320, and ``getNumpyFaces`` returns **319** rows --
+    ``last_valid_face_id + 1`` -- of which **199 are ``[0, 0, 0]``**, degenerate triangles on vertex
+    0. ``getNumpyVerts`` still returns all 162 positions while ``numValidVerts`` is 62. No
+    exception and no warning. After ``pack()`` the same reads give 120 faces and 62 vertices.
+
+    Pass ``pack=False`` only to observe that state deliberately; note it *mutates* ``mesh_ml``
+    either way, since packing renumbers in place.
+
+    ``process=False`` for the same reason
+    [`warp_to_trimesh`][tests.conversions.warp_to_trimesh] uses it: trimesh's default processing
+    welds coincident vertices, which would undo the identification the comparison is testing.
+    """
+    if pack:
+        mesh_ml.pack()
+    return tm.Trimesh(
+        vertices=mn.getNumpyVerts(mesh_ml).astype(np.float64),
+        faces=mn.getNumpyFaces(mesh_ml.topology).astype(np.int64),
+        process=False,
+    )
+
+
+def meshlib_scalars_to_numpy(scalars_ml: object) -> np.ndarray:
+    """
+    Read a MeshLib scalar container (``VertScalars`` / ``FaceScalars`` / ...) as a float64 array.
+
+    Neither of the two obvious routes works. ``mn.toNumpyArray`` binds only ``VertCoords`` /
+    ``FaceNormals`` / ``std_vector_Vector3_float`` and raises a clear ``TypeError`` for anything
+    else, which is safe; but ``np.asarray(vert_scalars)`` returns a **0-d ``object`` array** rather
+    than raising, so a comparison written that way fails several lines later in whatever NumPy call
+    comes next, with nothing pointing at the cause.
+
+    Iteration is the working route. Bitsets need no equivalent: ``mn.getNumpyBitSet`` already
+    returns a correctly domain-sized ``bool`` array (162 entries for a 162-vertex mesh) even when
+    only bit 0 is set.
+    """
+    return np.fromiter(iter(scalars_ml), np.float64, scalars_ml.size())  # type: ignore[attr-defined]
 
 
 def warp_to_trimesh(vertices_wp: wp.array, faces_wp: wp.array) -> tm.Trimesh:

@@ -6,9 +6,12 @@ import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.comparisons import boundary_loop_sizes, lexsort_rows
+from tests.conversions import numpy_to_meshlib
 from triwarp.combine import _non_increasing_indices
 
 
@@ -133,20 +136,18 @@ def _meshlib_stitch_band(
     va_np: np.ndarray, fa_np: np.ndarray, vb_np: np.ndarray, fb_np: np.ndarray, metric: str
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """MeshLib ``stitchHoles`` band for the same metric; returns ``(verts, orig_faces, band)``."""
-    mr = pytest.importorskip("meshlib.mrmeshpy")
-    mn = pytest.importorskip("meshlib.mrmeshnumpy")
     make_metric = {
-        "complex_stitch": lambda m: mr.getComplexStitchMetric(m),
-        "edge_length_stitch": lambda m: mr.getEdgeLengthStitchMetric(m),
-        "vertical": lambda m: mr.getVerticalStitchMetric(m, mr.Vector3f(0.0, 0.0, 1.0)),
+        "complex_stitch": lambda m: mm.getComplexStitchMetric(m),
+        "edge_length_stitch": lambda m: mm.getEdgeLengthStitchMetric(m),
+        "vertical": lambda m: mm.getVerticalStitchMetric(m, mm.Vector3f(0.0, 0.0, 1.0)),
     }[metric]
     verts = np.ascontiguousarray(np.vstack([va_np, vb_np]), dtype=np.float32)
     orig = np.ascontiguousarray(np.vstack([fa_np, fb_np + len(va_np)]), dtype=np.int32)
-    mesh = mn.meshFromFacesVerts(orig, verts)
+    mesh = numpy_to_meshlib(verts, orig)
     edges = mesh.topology.findHoleRepresentiveEdges()
-    params = mr.StitchHolesParams()
+    params = mm.StitchHolesParams()
     params.metric = make_metric(mesh)
-    mr.stitchHoles(mesh, edges[0], edges[1], params)
+    mm.stitchHoles(mesh, edges[0], edges[1], params)
     faces_out = mn.getNumpyFaces(mesh.topology)
     original = {tuple(sorted(int(x) for x in t)) for t in orig}
     band = np.array(
@@ -158,21 +159,19 @@ def _meshlib_stitch_band(
 def _meshlib_stitch_cost(
     verts: np.ndarray, orig: np.ndarray, band: np.ndarray, metric: str
 ) -> float:
-    mr = pytest.importorskip("meshlib.mrmeshpy")
-    mn = pytest.importorskip("meshlib.mrmeshnumpy")
     make_metric = {
-        "complex_stitch": lambda m: mr.getComplexStitchMetric(m),
-        "vertical": lambda m: mr.getVerticalStitchMetric(m, mr.Vector3f(0.0, 0.0, 1.0)),
+        "complex_stitch": lambda m: mm.getComplexStitchMetric(m),
+        "vertical": lambda m: mm.getVerticalStitchMetric(m, mm.Vector3f(0.0, 0.0, 1.0)),
     }[metric]
     verts = np.ascontiguousarray(verts, dtype=np.float32)
-    mesh_orig = mn.meshFromFacesVerts(np.ascontiguousarray(orig, np.int32), verts)
+    mesh_orig = numpy_to_meshlib(verts, orig)
     metric_obj = make_metric(mesh_orig)
     full = np.ascontiguousarray(np.vstack([orig, band]), dtype=np.int32)
-    mesh_full = mn.meshFromFacesVerts(full, verts)
+    mesh_full = numpy_to_meshlib(verts, full)
     region_bools = np.zeros(len(full), dtype=bool)
     region_bools[len(orig) :] = True
     region = mn.faceBitSetFromBools(region_bools)
-    return mr.calcCombinedFillMetric(mesh_full, region, metric_obj)
+    return mm.calcCombinedFillMetric(mesh_full, region, metric_obj)
 
 
 @pytest.mark.parametrize(("n_a", "n_b"), [(9, 13), (16, 11), (8, 8)])

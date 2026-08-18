@@ -75,6 +75,7 @@ from typing import TYPE_CHECKING
 import pytest
 import trimesh as tm
 from conftest import BenchCase
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -118,9 +119,28 @@ def test_fill_fan(bench_case: BenchCase) -> None:
 )
 @pytest.mark.benchmark(group="fill_min_weight")
 @pytest.mark.benchaxis("loops_dp")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "pymeshlab", "meshlib")
 def test_fill_min_weight(bench_case: BenchCase) -> None:
     """The ``B^3`` DP: few long loops against many short ones, at a comparable total boundary."""
+    if bench_case.kind == "meshlib":
+        # The only row here running the *same* algorithm -- a minimum-weight Liepa/Klincsek DP over
+        # the same ``plane_normalized`` metric, which is why it is the oracle in
+        # tests/test_holes.py::test_fill_min_weight_matches_meshlib and the other three references
+        # are timing context. Two settings are load-bearing: ``maxPolygonSubdivisions`` is raised
+        # so MeshLib runs the exhaustive search rather than sub-sampling a long rim (the same
+        # 1 000 the parity test passes), and the mesh is rebuilt inside the timed callable because
+        # ``fillHoles`` mutates it and rounds 2..n would find nothing left to fill.
+        def run_ml() -> int:
+            mesh_ml = bench_case.new_mesh_ml()
+            edges_ml = mesh_ml.topology.findHoleRepresentiveEdges()
+            params_ml = mm.FillHoleParams()
+            params_ml.maxPolygonSubdivisions = 1000
+            params_ml.metric = mm.getPlaneNormalizedFillMetric(mesh_ml, edges_ml[0])
+            mm.fillHoles(mesh_ml, edges_ml, params_ml)
+            return mesh_ml.topology.numValidFaces()
+
+        assert bench_case.run(run_ml, rounds=_ROUNDS) > bench_case.n_faces
+        return
     if bench_case.kind == "pymeshlab":
         # ``maxholesize`` is an *edge count* cap, and its default of 30 would silently close nothing
         # on ``rim_short``'s two 512-edge rims -- measured at 0.66 ms for zero holes closed. Lifting
