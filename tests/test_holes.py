@@ -72,6 +72,73 @@ def test_fill_fan_watertight(request: pytest.FixtureRequest, mesh_name: str) -> 
 
 
 @pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+@pytest.mark.parity(
+    "fill_fan",
+    "meshlib",
+    benchmarked=False,
+    reason="MeshLib has no fan fill. fillHoleTrivially adds an apex vertex, which makes it "
+    "fill_cone's operation and it is timed in that group -- a row here would price a cone under "
+    "the fan's name and buy an extra vertex per loop that the fan does not pay for.",
+)
+def test_fill_fan_covers_the_same_rim_as_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class C (two derived scalars): the same rim triangulated two ways covers the same surface.
+
+    MeshLib has no fan: ``fillHoleTrivially`` puts a new vertex at the rim's centroid and fans from
+    *that*, which is [`fill_cone`][triwarp.holes.fill_cone]'s operation and is compared to it
+    element-wise one test below. So the claim available for the fan is the one property two
+    different triangulations of one **planar** rim must share -- they cover the same region -- and
+    the comparable quantities are the added area and the enclosed volume.
+
+    That makes it a sharper test than it sounds, because the agreement is at the float32 floor and
+    nowhere near the tolerance: measured on a 97-vertex rim, the areas agree to better than
+    **1e-9 relative** and the volumes to **5.9e-09 relative** -- the residual being the converter's
+    float32 storage on MeshLib's side, since with both fed one identical float32 buffer the two
+    areas land 2e-15 apart -- while the face counts differ by exactly 2 per loop (``B - 2`` fan
+    triangles against ``B``) and the vertex counts by exactly 1. The mutation probe: dropping a
+    single fan triangle changes the area by 0.0104, **1.1e-03 relative**, which is 2e5 x the bound
+    asserted below.
+
+    What it excludes is a fan that skips a rim vertex, emits a triangle twice, or walks the loop in
+    an order that makes the cap self-overlap -- every one of which changes the covered area while
+    leaving the triangle count right. What it cannot see is *which* triangulation was chosen, which
+    is what the count assertions are for.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_vertices = int(mesh_wp.points.shape[0])
+    loop_sizes = _loop_sizes(mesh_wp)
+
+    fan_faces_wp = tw.holes.fill_fan(mesh_wp.points, mesh_wp.indices)
+    fan_tm = tm.Trimesh(mesh_wp.points.numpy(), fan_faces_wp.numpy().reshape(-1, 3), process=False)
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    apex_ids_ml = [
+        mm.fillHoleTrivially(mesh_ml, edge_ml).get()
+        for edge_ml in mesh_ml.topology.findHoleRepresentiveEdges()
+    ]
+    mesh_ml.pack()  # mandatory before reading topology back
+    cone_ref_tm = tm.Trimesh(
+        mn.getNumpyVerts(mesh_ml), mn.getNumpyFaces(mesh_ml.topology), process=False
+    )
+
+    # Non-vacuity: MeshLib filled every rim, and both closures are real surfaces.
+    assert len(apex_ids_ml) == len(loop_sizes) > 0
+    assert fan_tm.is_watertight
+    assert cone_ref_tm.is_watertight
+    assert fan_tm.area > 1.0
+
+    # One apex and two extra triangles per loop, on MeshLib's side only.
+    assert len(cone_ref_tm.vertices) == n_vertices + len(loop_sizes)
+    assert len(cone_ref_tm.faces) == len(fan_tm.faces) + 2 * len(loop_sizes)
+
+    # And with the rims planar, the two caps cover the same region.
+    assert np.isclose(fan_tm.area, cone_ref_tm.area, rtol=1e-7, atol=1e-9)
+    assert np.isclose(fan_tm.volume, cone_ref_tm.volume, rtol=1e-7, atol=1e-9)
+
+
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
 def test_fill_cone_watertight(request: pytest.FixtureRequest, mesh_name: str) -> None:
     _, mesh_wp = request.getfixturevalue(mesh_name)
 

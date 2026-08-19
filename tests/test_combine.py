@@ -103,6 +103,80 @@ def test_stitch_argument_order_invariant(device: str) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("n_a", "n_b", "phase", "offset"), [(16, 11, 0.3, 0.0), (17, 11, 0.9, 0.4)]
+)
+@pytest.mark.parity(
+    "stitch",
+    "meshlib",
+    benchmarked=False,
+    reason="MeshLib has no zipper. Its two-argument stitchHoles finds the holes itself and then "
+    "runs the same minimum-weight DP its three-argument form runs, which is already timed in the "
+    "stitch_min_weight group -- a row here would price that DP under the zipper's name and read as "
+    "the zipper being 100x slower than it is.",
+)
+def test_stitch_reaches_meshlibs_optimum(
+    device: str, n_a: int, n_b: int, phase: float, offset: float
+) -> None:
+    """
+    Class C (a derived scalar): the greedy zipper's band, scored by MeshLib's own metric.
+
+    ``stitch`` walks the two rims from the cheapest starting correspondence and never reconsiders,
+    where MeshLib's two-argument ``stitchHoles`` -- the overload that finds the holes itself, so
+    triwarp's loop *pairing* is compared too and not only its triangulation -- searches the whole
+    space. The zipper is therefore an upper bound on the optimum by construction, and the question
+    a comparison can answer is how loose a bound.
+
+    Measured over eight rim configurations: **the zipper reaches the optimum exactly (ratio 1.0000)
+    on seven of them**, and costs 18.9% more on the one whose top rim is shifted sideways, where the
+    rim-to-rim correspondence stops being monotone and greed is provably not enough. Those are the
+    two cases parametrized here, so the test covers both the tight branch and the loose one rather
+    than only the flattering half.
+
+    What it excludes is a zipper that emits a *valid but badly shaped* band -- a slipped
+    correspondence costs several times the optimum, not 19% -- and what it cannot see is a different
+    tie-break at equal cost, which is real: 4 of the 8 bands differ from MeshLib's triangle for
+    triangle at an identical score, so comparing triangles rather than cost would fail on a
+    symmetric rim. The cost helper is shared with the minimum-weight section below.
+    """
+    (va_np, fa_np, va, fa), (vb_np, fb_np, vb, fb) = _capsule_halves(
+        device, n_a, n_b, phase, offset
+    )
+
+    new_vertices, new_faces = tw.combine.stitch(va, fa, vb, fb)
+    n_orig = int(fa.shape[0]) + int(fb.shape[0])
+    band_tw = new_faces.numpy()[n_orig:].reshape(-1, 3)
+    # ``stitch`` puts the larger-boundary mesh first, so rebuild the prefix in the order it used.
+    fa_rows, fb_rows = fa_np.reshape(-1, 3), fb_np.reshape(-1, 3)
+    if n_a >= n_b:
+        orig_tw = np.vstack([fa_rows, fb_rows + len(va_np)]).astype(np.int32)
+    else:
+        orig_tw = np.vstack([fb_rows, fa_rows + len(vb_np)]).astype(np.int32)
+
+    verts_ml = np.ascontiguousarray(np.vstack([va_np, vb_np]), dtype=np.float32)
+    orig_ml = np.ascontiguousarray(np.vstack([fa_rows, fb_rows + len(va_np)]), dtype=np.int32)
+    mesh_ml = numpy_to_meshlib(verts_ml, orig_ml)
+    assert len(mesh_ml.topology.findHoleRepresentiveEdges()) == 2  # the auto-detect's input
+    assert mm.stitchHoles(mesh_ml, mm.StitchHolesParams())  # the two-argument overload, and it ran
+    faces_out_ml = mn.getNumpyFaces(mesh_ml.topology)
+    original = {tuple(sorted(int(x) for x in row)) for row in orig_ml}
+    band_ml = np.array(
+        [row for row in faces_out_ml if tuple(sorted(int(x) for x in row)) not in original],
+        dtype=np.int32,
+    )
+
+    # Both close the two rims with one triangle per rim edge and no new vertex.
+    assert len(band_tw) == len(band_ml) == n_a + n_b
+    assert int(new_vertices.shape[0]) == len(va_np) + len(vb_np)
+    assert tw.validation.is_watertight(new_vertices, new_faces)
+
+    cost_tw = _meshlib_stitch_cost(new_vertices.numpy(), orig_tw, band_tw, "complex_stitch")
+    cost_ml = _meshlib_stitch_cost(verts_ml, orig_ml, band_ml, "complex_stitch")
+    assert cost_ml > 0.0  # non-vacuity: a zero optimum would make any ratio pass
+    assert cost_tw >= cost_ml * (1.0 - 1e-6)  # the greedy band cannot beat the exhaustive one
+    assert cost_tw < 1.25 * cost_ml  # measured 1.0000 and 1.1889 on these two configurations
+
+
 def test_stitch_requires_single_boundary_watertight(
     icosahedron: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:
@@ -289,6 +363,74 @@ def test_stitch_smooth_watertight(device: str):
     assert mesh_tm.is_winding_consistent
     # Original vertices are the concatenated prefix, unchanged.
     assert np.allclose(verts_np[:n_v0], np.concatenate([va.numpy(), vb.numpy()]), atol=1e-6)
+
+
+@pytest.mark.parity(
+    "stitch_smooth",
+    "meshlib",
+    benchmarked=False,
+    reason="stitch_smooth has no benchmark group: the band it refines is the one "
+    "stitch_min_weight already times, plus fill_smooth's finisher, and a group here "
+    "would re-measure both under a third name. stitchHolesNicely is nonetheless the "
+    "only reference that performs the whole three-stage operation, which is why the "
+    "comparison lives here.",
+)
+def test_stitch_smooth_statistics_vs_meshlib(device: str):
+    """
+    Class C (a derived scalar): the enclosed volume, because the two bands share no vertices.
+
+    ``stitchHolesNicely`` is the same three stages in the same order -- minimum-weight band, refine
+    to a target edge length, smooth the new interior into both surrounding surfaces -- and it takes
+    the same knobs (``subdivideSettings.maxEdgeLen``, ``maxEdgeSplits``, ``smoothCurvature``), which
+    is what makes this comparable at all. But each side subdivides on its own schedule, so no vertex
+    correspondence exists and the volume is the strongest shared quantity, exactly as
+    [`test_fill_smooth_statistics_vs_meshlib`] argues for the single-hole case.
+
+    Measured on two facing hemispheres at ``max_edge=0.15``: volume within **1.9%** and area within
+    **1.2%**, with 2 384 faces against MeshLib's 2 368 -- so the refinement lands within 0.7% of the
+    same triangle budget from the same target length. At ``max_edge=0.3`` the volumes are 3.8%
+    apart, which is the refinement schedule diverging where there are fewer splits to average over,
+    and is why the finer target is the one asserted.
+
+    What the volume excludes is a band that bulges, collapses or pinches while still being
+    watertight; what it cannot see is a band that is smooth in the wrong place.
+    """
+    (va, fa), (vb, fb) = _hemisphere_pair(device)
+    max_edge = 0.15
+
+    new_vertices, new_faces = tw.combine.stitch_smooth(va, fa, vb, fb, max_edge=max_edge)
+    mesh_tw = tm.Trimesh(new_vertices.numpy(), new_faces.numpy().reshape(-1, 3), process=False)
+    assert mesh_tw.is_watertight
+
+    verts_ml = np.ascontiguousarray(np.vstack([va.numpy(), vb.numpy()]), dtype=np.float32)
+    orig_ml = np.ascontiguousarray(
+        np.vstack([fa.numpy().reshape(-1, 3), fb.numpy().reshape(-1, 3) + int(va.shape[0])]),
+        dtype=np.int32,
+    )
+    mesh_ml = numpy_to_meshlib(verts_ml, orig_ml)
+    holes_ml = mesh_ml.topology.findHoleRepresentiveEdges()
+    assert len(holes_ml) == 2
+    settings_ml = mm.StitchHolesNicelySettings()
+    settings_ml.triangulateParams.metric = mm.getComplexStitchMetric(mesh_ml)
+    settings_ml.subdivideSettings.maxEdgeLen = max_edge
+    settings_ml.subdivideSettings.maxEdgeSplits = 1000
+    settings_ml.smoothCurvature = True
+    patch_ml = mm.stitchHolesNicely(mesh_ml, holes_ml[0], holes_ml[1], settings_ml)
+    n_patch_ml = int(mn.getNumpyBitSet(patch_ml).sum())  # before pack(): the returned ids are stale
+    mesh_ml.pack()  # mandatory before reading topology back
+    mesh_ref = tm.Trimesh(
+        mn.getNumpyVerts(mesh_ml), mn.getNumpyFaces(mesh_ml.topology), process=False
+    )
+
+    # Non-vacuity: both sides really refined the band rather than returning the plain stitch, whose
+    # band is one triangle per rim edge -- an order of magnitude fewer faces than this.
+    n_input_faces = int(fa.shape[0]) // 3 + int(fb.shape[0]) // 3
+    assert n_patch_ml > 100
+    assert mesh_ref.is_watertight
+    assert len(mesh_ref.faces) > n_input_faces + 100
+    assert len(mesh_tw.faces) > n_input_faces + 100
+    assert np.isclose(mesh_tw.volume, mesh_ref.volume, rtol=0.05)
+    assert np.isclose(mesh_tw.area, mesh_ref.area, rtol=0.05)
 
 
 def test_stitch_smooth_requires_single_loop(device: str, icosahedron: tuple[tm.Trimesh, wp.Mesh]):

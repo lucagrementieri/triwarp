@@ -293,6 +293,16 @@ def test_face_angles_extremes_against_pyvista(half_torus: tuple[tm.Trimesh, wp.M
     "quantity radius_ratio and igl gives it only as a ratio of two other arrays -- so the "
     "comparison belongs here and the timing stays with igl / pymeshlab / pyvista.",
 )
+@pytest.mark.parity(
+    "face_angles",
+    "meshlib",
+    benchmarked=False,
+    reason="MeshLib has no per-face angle table: mm.angle is a two-vector primitive and sumAngles "
+    "is per *vertex*, so both are looped on the reference side and a row here would price the loop "
+    "rather than MeshLib -- the per-element rule from section 6. trimesh, igl and pyvista carry "
+    "the timed rows. What sumAngles adds is a second, independent route to the same numbers: the "
+    "per-vertex sum of the table, which is the quantity vertex_defects is built from.",
+)
 def test_per_face_quantities_match_meshlib(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     """
     Class A for three per-face families at once, all element-wise in face order.
@@ -310,9 +320,16 @@ def test_per_face_quantities_match_meshlib(half_torus: tuple[tm.Trimesh, wp.Mesh
     than batched, so they are looped on the reference side -- fine in a test at this size, and the
     reason ``benchmarks/`` reads those rows as an upper bound (see section 6).
 
-    Testing the three together is deliberate: they come out of the same corner load, so a
+    The fourth family is the corner angles, and MeshLib reaches them two ways: ``mm.angle(a, b)``
+    on the two corner vectors (class B -- the transform is building those vectors, and MeshLib's
+    ``atan2(|cross|, dot)`` form is a different formulation from an ``acos`` of the normalized dot,
+    which is what makes it worth comparing) and ``sumAngles`` per vertex, which must equal the
+    table's per-vertex sum (class A, and the quantity ``vertex_defects`` subtracts from 2pi).
+    Measured on ``half_torus``: **2.38e-07** on the corners and **1.07e-06** on the vertex sums.
+
+    Testing the four together is deliberate: they come out of the same corner load, so a
     fixture-level disagreement (a converter dropping a vertex, a face buffer reshaped wrong) shows
-    up in all three at once and is distinguishable from a real per-quantity bug.
+    up in all of them at once and is distinguishable from a real per-quantity bug.
     """
     mesh_tm, mesh_wp = half_torus
     mesh_ml = trimesh_to_meshlib(mesh_tm)
@@ -337,6 +354,38 @@ def test_per_face_quantities_match_meshlib(half_torus: tuple[tm.Trimesh, wp.Mesh
     aspect_wp = tw.triangles.face_quality(mesh_wp.points, mesh_wp.indices, metric="aspect_ratio")
     assert np.ptp(aspect_ml) > 0.1  # non-vacuity: a constant would pass any tolerance
     assert np.allclose(aspect_wp.numpy(), aspect_ml, rtol=1e-5, atol=1e-5)
+
+    faces_np = np.asarray(mesh_tm.faces)
+    vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float32)
+    corner_ml = np.array(
+        [
+            [
+                mm.angle(
+                    mm.Vector3f(*(vertices_np[row[(k + 1) % 3]] - vertices_np[row[k]]).tolist()),
+                    mm.Vector3f(*(vertices_np[row[(k + 2) % 3]] - vertices_np[row[k]]).tolist()),
+                )
+                for k in range(3)
+            ]
+            for row in faces_np
+        ]
+    )
+    angles_wp = tw.triangles.face_angles(mesh_wp.points, mesh_wp.indices)
+    assert np.ptp(corner_ml) > 0.5  # non-vacuity: equilateral faces would read 60 degrees flat
+    assert np.allclose(angles_wp.numpy(), corner_ml, rtol=1e-5, atol=1e-5)
+
+    # The same table read the other way: MeshLib's per-vertex angle sum.
+    sums_ml = np.array(
+        [
+            mm.sumAngles(topology_ml, points_ml, mm.VertId(v))
+            for v in range(int(mesh_wp.points.shape[0]))
+        ]
+    )
+    sums_wp = np.bincount(
+        faces_np.reshape(-1),
+        weights=angles_wp.numpy().reshape(-1),
+        minlength=int(mesh_wp.points.shape[0]),
+    )
+    assert np.allclose(sums_wp, sums_ml, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parity("face_quality", "igl")
@@ -470,6 +519,104 @@ def test_closest_point(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     points_wp = wp.array(points_np, dtype=wp.vec3, device=mesh_wp.points.device)
     closest_points_wp = tw.triangles.closest_point(mesh_wp.points, mesh_wp.indices, points_wp)
     assert np.allclose(closest_points_wp.numpy(), closest_points_tm, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parity(
+    "triangle_closest_point",
+    "meshlib",
+    benchmarked=False,
+    reason="the soup form of closest_point has no benchmark group: the whole-mesh query is what "
+    "costs anything and it is timed as closest_point_on_mesh, where scipy and open3d carry the "
+    "rows. MeshLib's closestPointInTriangle is a four-vector primitive anyway, so a row would time "
+    "a Python loop over the face buffer -- the per-element rule from section 6.",
+)
+@pytest.mark.parity(
+    "barycentric_to_points",
+    "meshlib",
+    benchmarked=False,
+    reason="barycentric_to_points has no benchmark group of its own: it is the inverse of "
+    "points_to_barycentric, which carries the group, and one interpolation under two names would "
+    "price the same pass twice. MeshLib's triPoint is per-point besides, so the row would time the "
+    "loop.",
+)
+def test_soup_quantities_match_meshlib(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+    """
+    Class A on the projection and class B on the interpolation, for the module's two soup ops.
+
+    ``closestPointInTriangle(p, a, b, c)`` is the same query triangle by triangle and needs no
+    transform -- measured **1.19e-07**, the float32 floor. It returns a ``(point, TriPointf)`` pair
+    and the point is the half compared here; its barycentric half is the *other* function's answer
+    and is checked through ``triPoint`` below rather than decoded twice.
+
+    ``triPoint`` needs one named transform, and it is not guessable: MeshLib addresses a point in a
+    face by an **edge**, with the weights running ``(1 - a - b, a, b)`` over
+    ``(org(e), dest(e), dest(next(e)))``. So the barycentric triple has to be permuted into
+    MeshLib's own corner order for the face's representative edge, which the loop does by looking up
+    each vertex id rather than assuming the rotation -- getting it wrong yields a point inside the
+    right triangle, which is exactly the failure a loose tolerance would hide. Measured
+    **1.19e-07** once the permutation is right.
+
+    The weights are normalized here, unlike [`test_barycentric_to_points`], because a
+    ``MeshTriPoint`` whose coordinates do not sum to one is outside the face and MeshLib is entitled
+    to a different answer; the affine-weights claim stays with the trimesh oracle.
+    """
+    mesh_tm, mesh_wp = hemisphere
+    faces_np = np.asarray(mesh_tm.faces)
+    vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float32)
+    n_faces = faces_np.shape[0]
+    rng = np.random.default_rng(34)
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    topology_ml, points_ml = mesh_ml.topology, mesh_ml.points
+    assert topology_ml.numValidFaces() == n_faces > 0  # non-vacuity, and the converter's own check
+
+    # closest_point: one query per triangle, deliberately off the surface so the projection bites.
+    queries_np = np.ascontiguousarray(
+        mesh_tm.triangles.mean(axis=1) + rng.standard_normal((n_faces, 3)) * 0.35, dtype=np.float32
+    )
+    queries_wp = wp.array(queries_np, dtype=wp.vec3, device=mesh_wp.points.device)
+    closest_wp = tw.triangles.closest_point(mesh_wp.points, mesh_wp.indices, queries_wp)
+    closest_ml = np.array(
+        [
+            [
+                *mm.closestPointInTriangle(
+                    mm.Vector3f(*queries_np[f].tolist()),
+                    mm.Vector3f(*vertices_np[faces_np[f, 0]].tolist()),
+                    mm.Vector3f(*vertices_np[faces_np[f, 1]].tolist()),
+                    mm.Vector3f(*vertices_np[faces_np[f, 2]].tolist()),
+                )[0]
+            ]
+            for f in range(n_faces)
+        ]
+    )
+    # Non-vacuity: the queries must really be off the triangles, or this compares two copies of p.
+    assert np.linalg.norm(closest_ml - queries_np, axis=1).max() > 0.1
+    assert np.allclose(closest_wp.numpy(), closest_ml, rtol=1e-5, atol=1e-5)
+
+    # barycentric_to_points: MeshLib's edge-relative convention, permuted per face.
+    barycentric_np = rng.random((n_faces, 3)) + 0.05
+    barycentric_np /= barycentric_np.sum(axis=1, keepdims=True)
+    barycentric_wp = wp.array(
+        np.ascontiguousarray(barycentric_np, dtype=np.float32),
+        dtype=wp.vec3,
+        device=mesh_wp.points.device,
+    )
+    points_wp = tw.triangles.barycentric_to_points(mesh_wp.points, mesh_wp.indices, barycentric_wp)
+    interpolated_ml = np.empty((n_faces, 3))
+    for f in range(n_faces):
+        edge_ml = topology_ml.edgeWithLeft(mm.FaceId(f))
+        corners_ml = [int(v) for v in topology_ml.getLeftTriVerts(edge_ml)]
+        weights = {int(v): float(w) for v, w in zip(faces_np[f], barycentric_np[f], strict=True)}
+        interpolated_ml[f] = [
+            *mm.triPoint(
+                topology_ml,
+                points_ml,
+                mm.MeshTriPoint(
+                    edge_ml, mm.TriPointf(weights[corners_ml[1]], weights[corners_ml[2]])
+                ),
+            )
+        ]
+    assert np.allclose(points_wp.numpy(), interpolated_ml, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])

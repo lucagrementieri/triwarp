@@ -441,6 +441,75 @@ def test_face_adjacency_angles(request: pytest.FixtureRequest, mesh_name: str) -
         assert np.isclose(angles_wp_lookup[key], angle_tm, rtol=1e-4, atol=5e-4)
 
 
+@pytest.mark.parametrize("mesh_name", ["cave_cube", "half_torus"])
+@pytest.mark.parity(
+    "face_adjacency_angles",
+    "meshlib",
+    benchmarked=False,
+    reason="dihedralAngle answers one undirected edge per call, so a batched row "
+    "would be a Python loop over the edge buffer and would price the loop rather "
+    "than MeshLib -- the per-element rule from section 6. trimesh carries the timed "
+    "row for this group. What MeshLib adds here is the sign, which no other "
+    "reference for this group reports.",
+)
+def test_face_adjacency_angles_matches_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B (an absolute value and an edge-to-pair mapping), and the sign is a second claim.
+
+    ``dihedralAngle`` is **signed** -- negative where the two faces form a concave surface -- where
+    triwarp splits the quantity in two: ``face_adjacency_angles`` is the unsigned magnitude and
+    [`face_adjacency_convex`][triwarp.convex.face_adjacency_convex] carries the side. So the named
+    transform is ``abs``, and the test then spends MeshLib's extra information on the *other* half
+    of the pair, which trimesh cannot check: positive must mean convex, edge for edge.
+
+    Measured on ``cave_cube``, whose 48 adjacency rows split 20 convex / 4 concave / 24 flat: the
+    magnitudes agree to **0.0** and the sign agrees with ``face_adjacency_convex`` on every row,
+    with the four concave rows at exactly -pi/2. The fixtures are chosen for that split --
+    ``icosahedron`` is convex, so its every row is positive and the sign claim would test one
+    branch.
+
+    The mapping is by face *pair* rather than by index: MeshLib keys the angle by undirected edge,
+    so the loop reads ``left(e)`` and ``right(e)`` and asserts every triwarp row was found, which is
+    what makes a missed pair a failure rather than a silently smaller comparison.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    adjacency_wp, adjacency_edges_wp = tw.adjacency.resolved_face_adjacency(
+        mesh_wp.indices, n_vertices=int(mesh_wp.points.shape[0])
+    )
+    angles_wp = tw.adjacency.face_adjacency_angles(
+        mesh_wp.points, mesh_wp.indices, face_adjacency=adjacency_wp
+    ).numpy()
+    convex_wp = tw.convex.face_adjacency_convex(
+        mesh_wp.points, mesh_wp.indices, adjacency_wp, adjacency_edges_wp
+    ).numpy()
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    topology_ml, points_ml = mesh_ml.topology, mesh_ml.points
+    signed_ml: dict[tuple[int, int], float] = {}
+    for undirected in range(topology_ml.undirectedEdgeSize()):
+        edge_ml = mm.EdgeId(2 * undirected)
+        left_ml, right_ml = topology_ml.left(edge_ml), topology_ml.right(edge_ml)
+        if not (left_ml.valid() and right_ml.valid()):
+            continue  # a boundary edge has one face and MeshLib reports 0 for it
+        pair = (int(left_ml), int(right_ml))
+        signed_ml[min(pair), max(pair)] = mm.dihedralAngle(
+            topology_ml, points_ml, mm.UndirectedEdgeId(undirected)
+        )
+
+    pairs_wp = [(min(map(int, row)), max(map(int, row))) for row in adjacency_wp.numpy()]
+    assert len(signed_ml) == len(pairs_wp) > 0  # non-vacuity, and the mapping is a bijection
+    dihedral_ml = np.array([signed_ml[pair] for pair in pairs_wp])
+
+    assert np.allclose(angles_wp, np.abs(dihedral_ml), rtol=1e-5, atol=1e-5)
+    # The sign, which is triwarp's other function: positive dihedral <-> a locally convex pair.
+    creased = angles_wp > 1e-6
+    assert np.array_equal(dihedral_ml > 1e-6, convex_wp & creased)
+    assert int((dihedral_ml < -1e-6).sum()) > 0  # both branches present, or the sign claim is one
+    assert int((dihedral_ml > 1e-6).sum()) > 0
+
+
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
 def test_face_adjacency_angles_precomputed(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """

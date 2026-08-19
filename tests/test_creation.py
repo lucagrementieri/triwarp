@@ -255,10 +255,10 @@ def test_primitives_match_meshlib(device: str) -> None:
     ``base = -size / 2``; and ``makeCylinder`` / ``makeCone`` default to a radius of **0.1**, not 1,
     so a call that omits it builds something ten times too thin rather than failing.
 
-    ``uv_sphere`` is deliberately absent, for the reason it is absent from the open3d pairing above:
-    at the same nominal resolution the two tessellate differently -- 450 vertices and 896 faces
-    against MeshLib's 258 and 512 at ``16 x 16`` -- so its parameter does not map one-for-one and a
-    count comparison would be testing the mapping rather than the generator.
+    ``uv_sphere`` has its own test below rather than a row here, because it needs a parameter
+    mapping first: at the same nominal resolution the two tessellate differently -- 450 vertices and
+    896 faces against MeshLib's 258 and 512 at ``16 x 16`` -- and deriving the mapping is what that
+    test is for.
     """
     # Which primitives share an origin, and which only share a shape.
     centred_on_both = {"box", "cone", "torus"}
@@ -298,6 +298,50 @@ def test_primitives_match_meshlib(device: str) -> None:
         else:  # the cylinder, and the whole of the difference: MeshLib bases it at z = 0
             assert np.isclose(mesh_wp.bounds[0, 2], -mesh_ref.bounds[1, 2] / 2.0, atol=1e-5), name
             assert np.isclose(mesh_ref.bounds[0, 2], 0.0, atol=1e-5), name
+
+
+@pytest.mark.parametrize("sections", [16, 32, 64])
+@pytest.mark.parity("uv_sphere", "meshlib")
+def test_uv_sphere_matches_meshlib(device: str, sections: int) -> None:
+    """
+    Class B (a named parameter mapping), and then the *same mesh* -- vertex for vertex.
+
+    ``makeUVSphere``'s ``verticalResolution`` counts interior latitude **rings** where
+    ``uv_sphere``'s ``count[0]`` counts profile points, poles included, and its
+    ``horisontalResolution`` is the section count where ``count[1]`` is *half* of it (the doubling
+    ``uv_sphere`` inherits from trimesh). So the mapping is
+    ``makeUVSphere(r, h, v) == uv_sphere(radius=r, count=(v + 2, h // 2))``, which the row here
+    inverts to hold ``sections`` fixed.
+
+    At that pairing the two agree far past a count check: measured at 16 / 32 / 64 sections, the
+    vertex and face counts are equal, the areas and volumes agree to **1.5e-08 relative**, and a
+    nearest-neighbour match between the two vertex sets is a **bijection** whose worst displacement
+    is **4.7e-07** -- the float32 floor, since MeshLib stores points in float32 too. The positions
+    are matched through a KD-tree rather than sorted, because the two emit their rings in different
+    orders and a ``lexsort`` on float coordinates is not reliable at ties (section 6).
+
+    Contrast the open3d pairing above, which needs a *different* mapping (``2 * r`` and ``r // 2``)
+    and is only equal in the counts -- its latitude rings sit elsewhere, so its volume differs by up
+    to 1.22%. Two references, two mappings, and only one of them is the same mesh; that is worth
+    pinning in both directions so neither mapping drifts onto the other.
+    """
+    vertices_wp, faces_wp = tw.creation.uv_sphere(
+        radius=1.0, count=(2 * sections, sections // 2), device=device
+    )
+    mesh_ref = meshlib_to_trimesh(mm.makeUVSphere(1.0, sections, 2 * sections - 2))
+
+    assert len(mesh_ref.faces) == 2 * sections * (2 * sections - 2) > 0  # non-vacuity
+    assert int(vertices_wp.shape[0]) == len(mesh_ref.vertices)
+    assert int(faces_wp.shape[0]) // 3 == len(mesh_ref.faces)
+
+    mesh_wp = _mesh(vertices_wp, faces_wp)
+    assert np.isclose(mesh_wp.area, mesh_ref.area, rtol=1e-6)
+    assert np.isclose(mesh_wp.volume, mesh_ref.volume, rtol=1e-6)
+
+    # The same vertex set, matched by proximity: a bijection, at the float32 floor.
+    distance_np, index_np = cKDTree(mesh_ref.vertices).query(mesh_wp.vertices, k=1)
+    assert len(set(index_np.tolist())) == len(index_np)
+    assert distance_np.max() < 1e-5
 
 
 @pytest.mark.parity("revolve", "meshlib")

@@ -20,6 +20,15 @@ Five functions, three shapes of work, and the split is what the rows are for.
   crossings: a ray through ``shells_8`` meets 16 of them against ``sphere_med``'s 2, and the sphere
   method's convergence depends on local thickness, which nested shells make small.
 
+- **Every vertex, one ray or one sphere.** ``thickness_at_vertices`` is the same dispatcher as
+  ``thickness`` run over the mesh's *own* vertices rather than a 10 000-point subsample, and it
+  exists for one reason: it is the only shape MeshLib can be timed in. Its
+  ``computeRayThicknessAtVertices`` takes no query set -- it answers at every vertex, in parallel
+  over all cores -- so a row against the subsampled group would price a different number of queries
+  (3.6x more on ``bunny``), the reason section 6 bars ``findNClosestPointsPerPoint`` from
+  ``query_bvh_nearest_k7``. Read it against ``thickness_interior`` for the per-query cost and
+  against MeshLib for the one fair CPU-versus-GPU comparison this module has.
+
 ``volumetric_obscurance`` has **no group**. It shares ``ambient_occlusion``'s kernel and differs
 only in a per-hit ``exp(-tau * t)`` factor, so a group over it would re-measure the same axis;
 MeshLab's
@@ -41,6 +50,7 @@ import numpy as np
 import pytest
 import warp as wp
 from conftest import BenchCase, skip_larger_than
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
@@ -156,6 +166,56 @@ def test_thickness_interior(bench_case: BenchCase, method: Literal["ray", "max_s
     points = _surface_points_wp(bench_case)
     result = bench_case.run(lambda: tw.visibility.thickness(mesh, points, method=method))
     assert result.shape == points.shape
+
+
+_mesh_ml_cache: dict[str, mm.Mesh] = {}
+
+
+def _mesh_ml(bench_case: BenchCase) -> mm.Mesh:
+    """
+    One ``meshlib.Mesh`` per mesh, pre-warmed: ``computeRayThicknessAtVertices`` does not mutate it.
+
+    Built and warmed *outside* the timed callable, as ``new_mesh_ml``'s docstring requires -- the
+    AABB tree is lazily built on first query and cached on the mesh, so a row that builds per round
+    would time the tree rather than the rays.
+    """
+    if bench_case.mesh_name not in _mesh_ml_cache:
+        mesh_ml = bench_case.new_mesh_ml()
+        mm.computeRayThicknessAtVertices(mesh_ml)  # pre-warm the AABB tree
+        _mesh_ml_cache[bench_case.mesh_name] = mesh_ml
+    return _mesh_ml_cache[bench_case.mesh_name]
+
+
+@pytest.mark.benchmark(group="thickness_at_vertices")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_thickness_at_vertices(bench_case: BenchCase) -> None:
+    """
+    Interior thickness at **every** vertex by one inward ray: the module's fair MeshLib row.
+
+    The same dispatcher as ``thickness_interior``'s ``method="ray"`` row, over the whole vertex
+    buffer instead of a 10 000-point subsample, because MeshLib's ``computeRayThicknessAtVertices``
+    takes no query set and would otherwise be timed on a different amount of work. Both sides cast
+    one ray per vertex along minus the vertex normal and return the distance to the first surface
+    they meet; ``tests/test_visibility.py::test_thickness_at_vertices_matches_meshlib`` pins that
+    they agree (5.96e-07) and that the normal convention is the angle-weighted one.
+
+    MeshLib is the only multi-threaded CPU reference in the suite (section 6), so this is a fair
+    fight rather than a GPU against one core -- and the ``triwarp-cpu`` row will lose to it for that
+    reason regardless of algorithm, which is section 13's "decide on the CUDA number".
+    """
+    if bench_case.kind == "meshlib":
+        mesh_ml = _mesh_ml(bench_case)
+        thickness_ml = bench_case.run(lambda: mm.computeRayThicknessAtVertices(mesh_ml))
+        assert thickness_ml is not None
+        return
+    mesh, points = _mesh_wp(bench_case), bench_case.vertices_wp
+    normals = tw.vertices.angle_weighted_vertex_normals(
+        bench_case.n_vertices, bench_case.vertices_wp, bench_case.faces_wp
+    )
+    thickness = bench_case.run(
+        lambda: tw.visibility.thickness(mesh, points, method="ray", normals=normals)
+    )
+    assert thickness.shape == (bench_case.n_vertices,)
 
 
 @pytest.mark.benchmark(group="max_tangent_sphere_reach")

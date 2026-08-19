@@ -8,9 +8,30 @@ import pytest
 import trimesh as tm
 import trimesh.proximity as tm_proximity
 import warp as wp
+from meshlib import mrmeshnumpy as mn
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.conversions import trimesh_to_pymeshlab, trimesh_to_warp
+from tests.conversions import (
+    meshlib_scalars_to_numpy,
+    numpy_to_warp,
+    trimesh_to_meshlib,
+    trimesh_to_pymeshlab,
+    trimesh_to_warp,
+)
+
+
+def _ellipsoid() -> tm.Trimesh:
+    """
+    Build a non-uniformly scaled ``icosphere(3)``: closed, curved, of *varying* thickness.
+
+    The thickness fixtures need a mesh whose answer is not a constant -- on a sphere every inward
+    ray reads ``2 * radius`` and a comparison would pass against any implementation that returned
+    the diameter. Scaled, the ray thickness spans 1.31 to 2.80.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=3, radius=1.0)
+    mesh_tm.apply_scale([1.0, 1.4, 0.7])
+    return mesh_tm
 
 
 def _vertex_normals_wp(mesh_wp: wp.Mesh) -> wp.array[wp.vec3]:
@@ -83,6 +104,95 @@ def test_ambient_occlusion_ranks_like_pymeshlab(torus: tuple[tm.Trimesh, wp.Mesh
     rank_pml = np.argsort(np.argsort(exposure_pml))
     rank_wp = np.argsort(np.argsort(occlusion_np))
     assert np.corrcoef(rank_pml, rank_wp)[0, 1] < -0.8
+
+
+@pytest.mark.parity(
+    "ambient_occlusion",
+    "meshlib",
+    benchmarked=False,
+    reason="computeSkyViewFactor takes one world-space patch set for *all* samples, so the two "
+    "quantities coincide only where every sample shares a hemisphere -- a terrain, which is what "
+    "this test builds. The benchmark group's input is a mesh's own vertices with a per-vertex "
+    "tangent frame, where a single patch set measures a different integral at every vertex but the "
+    "first. pymeshlab carries the timed row.",
+)
+def test_ambient_occlusion_matches_meshlib_sky_view_factor(device: str) -> None:
+    """
+    Class C (a quadrature statistic): the sky-view factor is one minus the occlusion.
+
+    MeshLib solves the terrain form of this integral -- how much of the sky each sample point can
+    see -- and it is the same quantity ``ambient_occlusion`` reports as the blocked share, so the
+    named part of the comparison is the complement ``svf = 1 - occlusion``. What keeps it class C
+    rather than class B is that the two integrate over *different direction sets*: triwarp rotates
+    its own Fibonacci lattice into each point's frame and MeshLib takes the patch list it is given,
+    so the residual is quadrature error and not a correspondence.
+
+    Two things the scene has to arrange, and both are why this is not simply a row on the group. The
+    patch set is **global**, so every sample must share one hemisphere: the samples sit just above a
+    flat plate, where the normal is exactly ``+z``. And ``sampleHalfSphere()`` is *not* a hemisphere
+    -- measured, its 145 directions span ``z`` from -1 to +1 and only 72 have ``z > 0`` -- so
+    feeding it directly makes the sky-view factor read half of what it should (0.52 against 0.98 at
+    the open corner). The patches are therefore an equal-area hemisphere lattice built here, with
+    equal radiation, which is what makes MeshLib's weighted mean an isotropic one.
+
+    Measured at 256 patches against 256 rays: **mean |difference| 0.0035, maximum 0.0195, Pearson
+    0.99985** over 441 samples spanning 0 to 0.98. The bound below is 3x the measured maximum. The
+    mutation probe: shuffling one side gives mean |difference| **0.235** (67x) and correlation
+    -0.02, so the agreement is a correspondence rather than two similar marginal distributions.
+    """
+    n_patches = 256
+    ground = tm.creation.box(extents=(8.0, 8.0, 0.2))
+    ground.apply_translation([0.0, 0.0, -0.1])
+    dome = tm.creation.icosphere(subdivisions=3, radius=1.2)
+    dome.apply_translation([0.0, 0.0, 0.3])
+    terrain_tm = tm.util.concatenate([ground, dome])
+
+    grid = np.stack(np.meshgrid(np.linspace(-3.0, 3.0, 21), np.linspace(-3.0, 3.0, 21)), axis=-1)
+    samples_np = np.ascontiguousarray(
+        np.column_stack([grid.reshape(-1, 2), np.full(grid.size // 2, 1e-3)]), dtype=np.float32
+    )
+
+    # Equal-area hemisphere lattice: z uniform in (0, 1], azimuth by the golden angle.
+    index = np.arange(n_patches) + 0.5
+    z_np = index / n_patches
+    radius_np = np.sqrt(np.maximum(0.0, 1.0 - z_np * z_np))
+    azimuth_np = index * np.pi * (3.0 - np.sqrt(5.0))
+    patches_np = np.column_stack(
+        [radius_np * np.cos(azimuth_np), radius_np * np.sin(azimuth_np), z_np]
+    )
+
+    mesh_ml = trimesh_to_meshlib(terrain_tm)
+    patches_ml = mm.std_vector_SkyPatch()
+    for direction in patches_np:
+        patch_ml = mm.SkyPatch()
+        patch_ml.dir = mm.Vector3f(*direction.tolist())
+        patch_ml.radiation = 1.0  # equal weight, so the weighted mean is an isotropic one
+        patches_ml.append(patch_ml)
+    valid_ml = mm.VertBitSet()
+    valid_ml.resize(len(samples_np), True)
+    sky_view_ml = meshlib_scalars_to_numpy(
+        mm.computeSkyViewFactor(mesh_ml, mn.fromNumpyArray(samples_np), valid_ml, patches_ml)
+    )
+
+    vertices_wp, faces_wp = numpy_to_warp(terrain_tm.vertices, terrain_tm.faces.reshape(-1), device)
+    mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
+    samples_wp = wp.array(samples_np, dtype=wp.vec3, device=device)
+    normals_wp = wp.array(
+        np.tile(np.array([[0.0, 0.0, 1.0]], dtype=np.float32), (len(samples_np), 1)),
+        dtype=wp.vec3,
+        device=device,
+    )
+    occlusion_np = tw.visibility.ambient_occlusion(
+        mesh_wp, samples_wp, normals=normals_wp, n_rays=n_patches, weight="uniform"
+    ).numpy()
+
+    # Non-vacuity: the dome must actually occlude some samples and leave others open.
+    assert sky_view_ml.min() < 0.2
+    assert sky_view_ml.max() > 0.9
+    difference = np.abs((1.0 - occlusion_np) - sky_view_ml)
+    assert difference.mean() < 0.02  # 5.7x the measured 0.0035
+    assert difference.max() < 0.06  # 3x the measured 0.0195
+    assert np.corrcoef(1.0 - occlusion_np, sky_view_ml)[0, 1] > 0.99
 
 
 def test_ambient_occlusion_converges_with_more_rays(torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
@@ -396,6 +506,60 @@ def test_shape_diameter_agrees_with_pymeshlab_on_which_part_is_thinner(device: s
         assert field_np[bar_np].mean() < 0.8 * field_np[ball_np].mean()
 
 
+@pytest.mark.parity(
+    "shape_diameter",
+    "meshlib",
+    benchmarked=False,
+    reason="computeRayThicknessAtVertices casts *one* ray where this group's rows cast 64 or 256, "
+    "so a row here would price two different amounts of work under one name. It is timed in the "
+    "thickness_at_vertices group instead, where it is the class-A pair for "
+    "thickness(method='ray'); pymeshlab carries the timed row here.",
+)
+def test_shape_diameter_collapses_onto_meshlibs_single_ray(device: str) -> None:
+    """
+    Class C (a relative-error statistic): the cone, closed down, is MeshLib's one ray.
+
+    MeshLib has no shape-diameter function -- ``computeRayThicknessAtVertices`` is a single inward
+    ray per vertex -- so the comparable claim is the limit
+    [`test_shape_diameter_reduces_to_thickness`] already checks against triwarp itself: as
+    ``cone_angle`` goes to zero the bundle collapses onto the inward normal. Running that limit
+    against an outside implementation is what makes it a reference comparison, and it pins the ray
+    *direction* and the trimming's neutrality at the same time.
+
+    Measured on the ellipsoid at ``cone_angle=0.05``: **6.6e-04** median relative difference,
+    Pearson **0.99998**, against values spanning 1.31 to 2.80. At the default 60-degree cone the two
+    are **uncorrelated** (Pearson -0.07, median relative difference 0.097) -- the trimmed cone mean
+    is a genuinely different measure of thickness, not a noisier one, and that number is the reason
+    this claim is stated at the narrow cone and the group keeps pymeshlab as its wide-cone oracle.
+
+    The mutation probe: shuffling triwarp's answer takes the median relative difference to **0.157**
+    (238x the measured agreement) and the correlation to -0.02.
+    """
+    mesh_tm = _ellipsoid()
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces.reshape(-1), device)
+    mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
+    n_vertices = int(vertices_wp.shape[0])
+    normals_wp = tw.vertices.angle_weighted_vertex_normals(n_vertices, vertices_wp, faces_wp)
+
+    thickness_ml = meshlib_scalars_to_numpy(
+        mm.computeRayThicknessAtVertices(trimesh_to_meshlib(mesh_tm))
+    )
+    finite = thickness_ml < 1e30
+    assert finite.all()  # non-vacuity: every vertex found an opposite surface
+    assert np.ptp(thickness_ml) > 1.0  # ... and the answer is not a constant
+
+    narrow_np = tw.visibility.shape_diameter(
+        mesh_wp, vertices_wp, normals=normals_wp, n_rays=64, cone_angle=0.05
+    ).numpy()
+    relative = np.abs(narrow_np - thickness_ml) / thickness_ml
+    assert np.median(relative) < 0.002  # 3x the measured 6.6e-04
+    assert np.corrcoef(narrow_np, thickness_ml)[0, 1] > 0.999
+
+    # The wide cone is a different measure, and saying so is half the claim.
+    wide_np = tw.visibility.shape_diameter(mesh_wp, vertices_wp, normals=normals_wp).numpy()
+    assert np.median(np.abs(wide_np - thickness_ml) / thickness_ml) > 0.05
+
+
 def test_shape_diameter_invalid(device: str) -> None:
     _sphere_tm, mesh_wp, normals_wp = _sphere_wp(device, 1.0, subdivisions=1)
     with pytest.raises(ValueError, match="n_rays >= 1"):
@@ -480,6 +644,55 @@ def test_thickness_ray(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
         assert np.allclose(thickness_wp[finite_tm], thickness_tm[finite_tm])
 
 
+@pytest.mark.parity("thickness_at_vertices", "meshlib")
+def test_thickness_at_vertices_matches_meshlib(device: str) -> None:
+    """
+    Class A, and it pins the normal convention: **angle-weighted**, not area-weighted.
+
+    ``computeRayThicknessAtVertices`` is the same measure as ``method="ray"`` -- the distance from
+    each vertex along minus its normal to the first surface the ray meets -- and it is the only
+    reference in the suite that answers it for a whole vertex buffer at once, which is why the
+    benchmark group runs at every vertex rather than on a subsample.
+
+    The pairing is exact only with the right normals, and that is the substance of this test rather
+    than an incidental detail. MeshLib's ``MeshPoint::set`` takes the direction from the
+    *pseudonormal*, which section 6 records as the match for
+    [`angle_weighted_vertex_normals`][triwarp.vertices.angle_weighted_vertex_normals] (1.19e-07).
+    Measured on the ellipsoid: **5.96e-07** absolute and 3.48e-07 relative with those normals,
+    against **0.031** -- five orders worse -- with the area-weighted ones. So the second assert is
+    what makes the first one a claim about the ray rather than about the tolerance.
+
+    MeshLib reports ``FLT_MAX`` where no opposite surface is found and triwarp reports ``inf``; the
+    fixture is closed, so all 642 vertices are finite here and the mask is asserted rather than
+    used to skip elements.
+    """
+    mesh_tm = _ellipsoid()
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces.reshape(-1), device)
+    mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
+    n_vertices = int(vertices_wp.shape[0])
+
+    thickness_ml = meshlib_scalars_to_numpy(
+        mm.computeRayThicknessAtVertices(trimesh_to_meshlib(mesh_tm))
+    )
+    assert thickness_ml.shape == (n_vertices,)
+    assert (thickness_ml < 1e30).all()  # every vertex found an opposite surface
+    assert np.ptp(thickness_ml) > 1.0  # non-vacuity: on a sphere every ray would read 2 * radius
+
+    angle_normals_wp = tw.vertices.angle_weighted_vertex_normals(n_vertices, vertices_wp, faces_wp)
+    thickness_wp = tw.visibility.thickness(
+        mesh_wp, vertices_wp, method="ray", normals=angle_normals_wp
+    ).numpy()
+    assert np.isfinite(thickness_wp).all()
+    assert np.allclose(thickness_wp, thickness_ml, rtol=1e-5, atol=1e-5)
+
+    # The other weighting is not the pairing, and the gap is five orders of magnitude.
+    area_normals_wp = tw.vertices.area_weighted_vertex_normals(n_vertices, vertices_wp, faces_wp)
+    thickness_area_np = tw.visibility.thickness(
+        mesh_wp, vertices_wp, method="ray", normals=area_normals_wp
+    ).numpy()
+    assert np.abs(thickness_area_np - thickness_ml).max() > 1e-3
+
+
 # ---------------------------------------------------------------------------
 # max_tangent_sphere (trimesh reference)
 # ---------------------------------------------------------------------------
@@ -516,6 +729,75 @@ def test_max_tangent_sphere(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
         assert np.allclose(
             centers_wp.numpy()[finite_tm], centers_tm[finite_tm], rtol=1e-2, atol=1e-2
         )
+
+
+@pytest.mark.parity(
+    "max_tangent_sphere_reach",
+    "meshlib",
+    benchmarked=False,
+    reason="that group times the *exterior* branch, and MeshLib has no exterior form: "
+    "InSphereSearchSettings.insideAndOutside returns the smaller of the inside and outside spheres "
+    "with a sign rather than the outside one. Its interior form also takes no query set -- it "
+    "answers at every vertex, where triwarp's iteration is ill-conditioned (measured 0.0018 radius "
+    "on a unit sphere, see test_max_tangent_sphere_agrees_across_devices) -- so it cannot be asked "
+    "about the interior points this test uses. trimesh carries the oracle for the values.",
+)
+def test_max_tangent_sphere_matches_meshlib(device: str) -> None:
+    """
+    Class C (a median relative difference): the same shrinking-sphere algorithm, from just inside.
+
+    Both implementations are Inui et al.'s shrinking sphere, so this is the closest thing to a
+    second implementation triwarp's iteration has -- and the reason it is class C rather than A is a
+    query-point difference neither side can remove. MeshLib excludes the faces incident to the
+    vertex it measures at (``MeshPoint::notIncidentFaces``); triwarp takes no such predicate, so at
+    a point exactly *on* the surface its sphere collapses -- 0.0018 on a unit sphere, the degeneracy
+    [`test_max_tangent_sphere_agrees_across_devices`] is written around. MeshLib in turn takes no
+    query set, so it cannot be asked at the offset points. The comparison therefore pulls triwarp's
+    queries a short way inside along the normal and compares the two fields.
+
+    Measured on the ellipsoid over 642 vertices spanning 0.52 to 1.40, the median relative
+    difference **tracks the offset one for one**: 0.201% at an offset of 0.2% of the smallest
+    bounding-box side, 0.503% at 0.5%, 1.006% at 1.0%, 2.008% at 2.0% (Pearson 0.979 down to 0.900
+    across that range). So what is left between the two implementations is the offset itself rather
+    than a disagreement -- which is the strongest form this claim can take, given that neither side
+    can be asked the other's question. Below ~0.2% the collapse takes over instead and the
+    difference jumps to 41% at 0.1% and 71% at 0.05%. The test runs at 0.5% and bounds the median at
+    3x it. The mutation probe: shuffling one side takes the median relative difference to **0.19**
+    (38x) and the correlation to 0.01.
+
+    ``maxRadius`` must be set: it defaults to **1**, which on a mesh of any other scale silently
+    caps every answer. Half the smallest bounding-box side is the article's own recommendation.
+    """
+    mesh_tm = _ellipsoid()
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces.reshape(-1), device)
+    mesh_wp = wp.Mesh(points=vertices_wp, indices=faces_wp)
+    n_vertices = int(vertices_wp.shape[0])
+    normals_wp = tw.vertices.angle_weighted_vertex_normals(n_vertices, vertices_wp, faces_wp)
+    extent_np = mesh_tm.bounds[1] - mesh_tm.bounds[0]
+
+    settings_ml = mm.InSphereSearchSettings()
+    settings_ml.maxRadius = float(0.5 * extent_np.min())  # the default is 1, whatever the scale
+    settings_ml.maxIters = 100  # triwarp's max_iter default, so neither side stops earlier
+    diameter_ml = meshlib_scalars_to_numpy(
+        mm.computeInSphereThicknessAtVertices(trimesh_to_meshlib(mesh_tm), settings_ml)
+    )
+    assert (diameter_ml < settings_ml.maxRadius * 2.0).all()  # nothing hit the cap
+    assert np.ptp(diameter_ml) > 0.5  # non-vacuity: a sphere would read one constant
+
+    offset = 0.005 * float(extent_np.min())  # 0.5% of the smallest side; see the docstring sweep
+    inside_np = np.ascontiguousarray(
+        mesh_tm.vertices - offset * normals_wp.numpy(), dtype=np.float32
+    )
+    inside_wp = wp.array(inside_np, dtype=wp.vec3, device=device)
+    _centers_wp, radii_wp = tw.visibility.max_tangent_sphere(
+        mesh_wp, inside_wp, inwards=True, normals=normals_wp
+    )
+    diameter_wp = 2.0 * radii_wp.numpy()
+    assert np.isfinite(diameter_wp).all()
+
+    relative = np.abs(diameter_wp - diameter_ml) / diameter_ml
+    assert np.median(relative) < 0.015  # 3x the measured 0.00503, which is the offset itself
+    assert np.corrcoef(diameter_wp, diameter_ml)[0, 1] > 0.93
 
 
 def test_max_tangent_sphere_empty(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:

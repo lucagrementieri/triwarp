@@ -9,9 +9,10 @@ import pytest
 import trimesh as tm
 import trimesh.smoothing as tms
 import warp as wp
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.conversions import bsr_to_csr, bsr_to_dense, trimesh_to_pyvista
+from tests.conversions import bsr_to_csr, bsr_to_dense, trimesh_to_meshlib, trimesh_to_pyvista
 
 _MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
 
@@ -125,6 +126,69 @@ def test_face_gradients_matches_pyvista(request: pytest.FixtureRequest, mesh_nam
     assert np.allclose(sphere_gradient_pv.mean(axis=0), [2.0 / 3.0, 0.0, 0.0], atol=1e-6)
 
 
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity(
+    "face_gradients",
+    "meshlib",
+    benchmarked=False,
+    reason="gradientInTri takes one triangle's three corners and three values, so "
+    "a batched row would be a Python loop over the face buffer and would time the "
+    "loop rather than MeshLib -- the same reason section 6 bars a per-element loop "
+    "from a benchmark row, and the same call shape as triCenter and "
+    "triangleAspectRatio in tests/test_triangles.py. It is nonetheless the only "
+    "reference in the suite that returns the gradient itself rather than the "
+    "operator, which is what makes it worth comparing here. igl and pyvista carry "
+    "the timed rows for this group.",
+)
+def test_face_gradients_matches_meshlib(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A: the *applied* gradient, face by face, against the only reference that returns it.
+
+    igl gives this operator as a sparse ``(3F, V)`` matrix and pyvista as a smoothed point field,
+    so both need a named transform before they can be compared (see the two tests above).
+    ``gradientInTri`` is the third form -- one triangle's three corners and three values in, one
+    vector out -- and needs none: it is the same quantity triwarp returns, in the same units, per
+    face.
+
+    Measured on a non-uniformly scaled ``icosphere(2)``: **4.09e-06** absolute, **2.49e-07**
+    relative, against gradient norms spanning 16.5 -- so the residual is the float32 vertex buffer
+    on both sides (MeshLib stores points in float32 too; section 6 records its own 2.58e-08
+    round-trip) rather than a disagreement about the formula.
+
+    The four-argument overload is the one to call: ``gradientInTri(b, c, vb, vc)`` assumes the value
+    at ``a`` is zero and returns a different vector, and nothing in the signature says so.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_np = np.asarray(mesh_tm.faces)
+    vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float32)
+    rng = np.random.default_rng(7)
+    field_np = rng.standard_normal(len(mesh_tm.vertices))
+
+    field_wp = wp.array(field_np, dtype=wp.float64, device=mesh_wp.device)
+    gradients_wp = tw.laplacian.face_gradients(mesh_wp.points, mesh_wp.indices, field_wp)
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    assert mesh_ml.topology.numValidFaces() == len(faces_np) > 0  # non-vacuity
+    gradients_ml = np.array(
+        [
+            [
+                *mm.gradientInTri(
+                    mm.Vector3f(*vertices_np[a].tolist()),
+                    mm.Vector3f(*vertices_np[b].tolist()),
+                    mm.Vector3f(*vertices_np[c].tolist()),
+                    float(field_np[a]),
+                    float(field_np[b]),
+                    float(field_np[c]),
+                )
+            ]
+            for a, b, c in faces_np
+        ]
+    )
+    # Non-vacuity: a constant field would make every row zero and pass any tolerance.
+    assert np.ptp(np.linalg.norm(gradients_ml, axis=1)) > 1.0
+    assert np.allclose(gradients_wp.numpy(), gradients_ml, rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
 def test_face_gradients_of_a_constant_field_is_zero(
     request: pytest.FixtureRequest, mesh_name: str
@@ -186,6 +250,65 @@ def test_cotmatrix_entries(request: pytest.FixtureRequest, mesh_name: str) -> No
     cot_entries_wp = tw.laplacian.cotmatrix_entries(mesh_wp.points, mesh_wp.indices)
 
     assert np.allclose(cot_entries_wp.numpy(), cot_entries_igl, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
+@pytest.mark.parity(
+    "cotmatrix_entries",
+    "meshlib",
+    benchmarked=False,
+    reason="leftCotan answers one directed edge per call, so a batched row would "
+    "be a Python loop over the edge buffer and would price the loop rather than "
+    "MeshLib's arithmetic -- the per-element rule from section 6. igl carries the "
+    "timed row for this group, and it is the same quantity.",
+)
+def test_cotmatrix_entries_matches_meshlib(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class B (a factor of two, and an edge-to-corner mapping): ``leftCotan`` per directed edge.
+
+    Two named transforms, both of which the loop below performs rather than assumes. MeshLib keys
+    the weight by the *directed edge* whose left face owns it, so the ``(face, corner)`` slot is
+    recovered from the edge's endpoints -- the corner is the face vertex that is neither
+    ``org(e)`` nor ``dest(e)``. And ``leftCotan`` is the plain cotangent where triwarp's table
+    holds **half** of it (igl's convention), so the comparison carries the factor 2.
+
+    Measured on the three fixtures: **2.38e-07** absolute, 1.35e-07 relative. The loop also asserts
+    it filled every slot, which is what makes the mapping a claim rather than a hope -- a mapping
+    that silently missed a corner would leave a zero there and still pass an ``allclose`` on a
+    nearly-flat mesh.
+
+    ``cotan(topology, points, ue)`` is *not* the pairing: it is the sum of the two ``leftCotan``
+    values across an undirected edge, i.e. the assembled off-diagonal, which is what
+    [`test_cotmatrix`] compares through igl's matrix.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_np = np.asarray(mesh_tm.faces)
+    entries_wp = tw.laplacian.cotmatrix_entries(mesh_wp.points, mesh_wp.indices).numpy()
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    topology_ml, points_ml = mesh_ml.topology, mesh_ml.points
+    cot_ml = np.zeros_like(entries_wp)
+    filled = np.zeros(entries_wp.shape, dtype=bool)
+    for undirected in range(topology_ml.undirectedEdgeSize()):
+        for edge_ml in (mm.EdgeId(2 * undirected), mm.EdgeId(2 * undirected + 1)):
+            face_ml = topology_ml.left(edge_ml)
+            if not face_ml.valid():
+                continue  # a boundary edge has no left face, so it owns no corner
+            org, dest = int(topology_ml.org(edge_ml)), int(topology_ml.dest(edge_ml))
+            row = faces_np[int(face_ml)]
+            corner = int(np.flatnonzero((row != org) & (row != dest))[0])
+            cot_ml[int(face_ml), corner] = mm.leftCotan(topology_ml, points_ml, edge_ml)
+            filled[int(face_ml), corner] = True
+
+    assert filled.all()  # the mapping reached every (face, corner) slot
+    # Non-vacuity: the table must carry real weights, and on the two irregular fixtures it must
+    # vary. The icosahedron is regular, so its 0.2887 is constant by construction and a spread
+    # check there would be testing the fixture rather than the function. Individual entries do sit
+    # near zero -- a right-angled corner has cotangent 0 -- so only the maximum is bounded away.
+    assert np.abs(entries_wp).max() > 0.1
+    if mesh_name != "icosahedron":
+        assert np.ptp(entries_wp) > 0.1
+    assert np.allclose(2.0 * entries_wp, cot_ml, rtol=1e-5, atol=1e-5)
 
 
 # -----------------------------------------------------------------------------------------

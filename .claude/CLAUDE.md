@@ -778,6 +778,24 @@ all measured:
   does. `computePerFaceNormals` is **normalized** (measured |n| = 1.0 ± 1e-7) — note the contrast
   with pymeshlab's `face_normal_matrix()`, which is the unnormalised cross product at magnitude
   `2 * area`.
+- **Four parameter conventions that read as a disagreement, and one function whose name lies.**
+  `sampleHalfSphere()` is **not** a half sphere: measured, its 145 directions span `z` from -1 to +1
+  and only 72 have `z > 0`, so feeding it to `computeSkyViewFactor` as a sky dome halves the answer
+  (0.52 where the open sky reads 0.98). `InSphereSearchSettings.maxRadius` defaults to **1**
+  whatever the mesh's scale, silently capping every thickness on anything larger — pass half the
+  smallest bounding-box side, the article's own recommendation. `makeUVSphere`'s
+  `verticalResolution` counts interior latitude **rings**, not profile points, so it pairs with
+  `creation.uv_sphere(count=(v + 2, h // 2))` — and at *that* mapping the two are the same mesh
+  vertex for vertex (bijection at 4.7e-07), where the same nominal resolution differs by 74 % in the
+  vertex count. And `leftCotan(e)` is the **plain** cotangent keyed by the directed edge whose left
+  face owns it, against `laplacian.cotmatrix_entries`' *half* cotangent keyed by `(face, corner)`;
+  `cotan(ue)` is the two summed, i.e. the assembled off-diagonal rather than the table.
+- **`computeRayThicknessAtVertices` takes the direction from the *pseudonormal*.** So it pairs with
+  `visibility.thickness(method="ray", normals=angle_weighted_vertex_normals(...))` to **5.96e-07**
+  and with the area-weighted normals to **0.031** — five orders worse, and the kind of gap that
+  reads as an algorithm bug. Same family as the two normal pairings below. Both thickness functions
+  and `computeInSphereThicknessAtVertices` also take **no query set** (they answer at every vertex),
+  which is what keeps them out of a benchmark group whose input is a subsample.
 
 Two of its pairings are worth knowing before writing a comparison, because neither is guessable from
 the names: `computePerVertNormals` matches `vertices.area_weighted_vertex_normals` to **1.19e-07**

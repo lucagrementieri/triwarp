@@ -453,7 +453,7 @@ def test_icosphere(bench_lib: BenchLibrary, subdivisions: int) -> None:
 
 
 @pytest.mark.benchmark(group="uv_sphere")
-@pytest.mark.benchlibs("triwarp", "trimesh", "open3d")
+@pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "meshlib")
 @pytest.mark.parametrize("sections", _SECTIONS)
 def test_uv_sphere(bench_lib: BenchLibrary, sections: int) -> None:
     """
@@ -469,8 +469,18 @@ def test_uv_sphere(bench_lib: BenchLibrary, sections: int) -> None:
 
     ``tests/test_creation.py::test_uv_sphere_matches_open3d`` pins the mapping so it cannot drift
     back.
+
+    meshlib's ``makeUVSphere`` needs a mapping of its own and a different one: its
+    ``verticalResolution`` counts interior latitude **rings**, not profile points, so the match is
+    ``makeUVSphere(1, sections, 2 * sections - 2)``. At that pairing it is the same mesh down to the
+    vertex -- same counts, a position bijection at 4.7e-07 -- which
+    ``tests/test_creation.py::test_uv_sphere_matches_meshlib`` pins for the same reason.
     """
     count = (2 * sections, sections // 2)
+    if bench_lib.kind == "meshlib":
+        mesh_ml = bench_lib.run(lambda: mm.makeUVSphere(1.0, sections, 2 * sections - 2))
+        assert mesh_ml.topology.numValidFaces() == 2 * sections * (2 * sections - 2)
+        return
     if bench_lib.kind == "triwarp":
         device = bench_lib.device
         _, faces_wp = bench_lib.run(lambda: tw.creation.uv_sphere(count=count, device=device))
