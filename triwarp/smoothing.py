@@ -806,8 +806,15 @@ def smooth_region_fixed_rim(
     weight_matrix = _edge_weight_matrix(vertices, faces, "unit")
     nnz = int(weight_matrix.nnz)
     size = nnz + n
-    out_rows = wp.zeros(size, dtype=wp.int32, device=device)
-    out_cols = wp.zeros(size, dtype=wp.int32, device=device)
+    # ``dirichlet_system_triplets`` emits conditionally, so most slots stay unwritten. Padding must
+    # be a *hole*, not a value: a ``(0, 0, 0.0)`` triplet is a harmless structural zero, but every
+    # one of them accumulates onto entry ``(0, 0)`` and ``bsr_from_triplets``' accumulation atomic
+    # serializes them. An out-of-range index is dropped instead -- ``n_free`` is one past the last
+    # row and column of the ``(n_free, n_free)`` system.
+    out_rows = wp.empty(size, dtype=wp.int32, device=device)
+    out_cols = wp.empty(size, dtype=wp.int32, device=device)
+    out_rows.fill_(n_free)
+    out_cols.fill_(n_free)
     out_vals = wp.zeros(size, dtype=wp.float64, device=device)
     # One contiguous (3, n_free) right-hand side: its rows are contiguous 1-D views, so the
     # assembly kernel writes them directly and the three columns solve in one batched CG.
@@ -907,8 +914,16 @@ def smooth_region(
     weight_matrix = _edge_weight_matrix(vertices, faces, edge_weights)
     nnz = int(weight_matrix.nnz)
     size = nnz + n
-    rows = wp.zeros(size, dtype=wp.int32, device=device)
-    cols = wp.zeros(size, dtype=wp.int32, device=device)
+    # ``laplacian_ls_triplets`` emits conditionally, so most slots stay unwritten. Padding must be a
+    # *hole*, not a value: a ``(0, 0, 0.0)`` triplet is a harmless structural zero, but every one of
+    # them accumulates onto entry ``(0, 0)`` and ``bsr_from_triplets``' accumulation atomic
+    # serializes them -- measured 14.3 ms against 0.45 ms (31.8x) for the ~185 000 unwritten slots
+    # of a 35 947-vertex mesh. Both arrays are filled one past their own extent, so the padding is
+    # out of range as the *row* index of ``M`` (``rows``) and of ``M^T`` (``cols``) alike.
+    rows = wp.empty(size, dtype=wp.int32, device=device)
+    cols = wp.empty(size, dtype=wp.int32, device=device)
+    rows.fill_(n_rows)
+    cols.fill_(n_free)
     vals = wp.zeros(size, dtype=wp.float64, device=device)
     rhs_x = wp.zeros(n_rows, dtype=wp.float64, device=device)
     rhs_y = wp.zeros(n_rows, dtype=wp.float64, device=device)
