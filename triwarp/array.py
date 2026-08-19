@@ -464,7 +464,7 @@ def sort_and_argsort(
     ----------
     keys
         Length-``n`` sort keys (any radix-sortable scalar dtype; see
-        [`sortable_dtype`][triwarp.array.sortable_dtype] for which those are).
+        [`sortable_dtype`][triwarp.typing.sortable_dtype] for which those are).
     fill_value
         Padding written into the upper half of the payload buffer, where the sort's scratch lives.
         Only matters to callers that read past ``n``.
@@ -492,7 +492,7 @@ def sort_and_argsort(
     --------
     [`sort_rows`][triwarp.array.sort_rows]
     [`sort_pair_indices`][triwarp.array.sort_pair_indices]
-    [`sortable_dtype`][triwarp.array.sortable_dtype]
+    [`sortable_dtype`][triwarp.typing.sortable_dtype]
     """
     device = keys.device
     n = int(keys.shape[0])
@@ -688,13 +688,13 @@ def isin(elements: twt.ArrayNd, test_elements: wp.array[wp.Int]) -> wp.array[wp.
     See Also
     --------
     [`indices_to_mask`][triwarp.array.indices_to_mask]
-    [`sortable_dtype`][triwarp.array.sortable_dtype]
+    [`sortable_dtype`][triwarp.typing.sortable_dtype]
     [`numpy.isin`][]
 
     Notes
     -----
     Dtypes narrower than four bytes are widened to ``int32`` / ``uint32`` (the
-    [`sortable_dtype`][triwarp.array.sortable_dtype] rule) before either strategy runs: Warp's
+    [`sortable_dtype`][triwarp.typing.sortable_dtype] rule) before either strategy runs: Warp's
     radix sort does not accept them, and neither does the tiled min/max reduction the span needs.
 
     Two host readbacks, one min/max reduction per input, which is what selects the strategy and
@@ -718,7 +718,7 @@ def isin(elements: twt.ArrayNd, test_elements: wp.array[wp.Int]) -> wp.array[wp.
     # Widen sub-32-bit dtypes once, up front: neither ``reduce.minmax`` nor the radix sort accepts
     # them, and a widened span cannot overflow the type it is measured in (int8's span reaches 256).
     if wp.types.type_size_in_bytes(dtype) < 4:
-        wide = sortable_dtype(dtype)
+        wide = twt.sortable_dtype(dtype)
         elements_flat = astype(elements_flat, wide)
         test_elements = astype(test_elements, wide)
 
@@ -1180,49 +1180,6 @@ def trim_to_count(
             wp.copy(out, buffer[:n_out])
         trimmed.append(out)
     return n_out, trimmed
-
-
-def sortable_dtype(dtype: type[wp.Scalar]) -> type[wp.Scalar]:
-    """
-    Same-width dtype that ``warp.utils.radix_sort_pairs`` accepts, preserving ``dtype``'s order.
-
-    The single widening rule for every radix sort in this package. Sorting a sub-32-bit dtype is
-    not supported by Warp, and sorting the reinterpreted *bits* of a float or an unsigned value
-    gets the order wrong, so callers ask here rather than widening ad hoc.
-
-    The hash table works in one common signed-integer key space (see
-    [`bitcast_to_int`][triwarp.array.bitcast_to_int]), which is fine for equality but wrong for
-    ordering: negative floats have descending bit patterns, and a ``uint64`` with its top bit set
-    reads as a negative ``int64``. Warp sorts ``int32`` / ``int64`` / ``uint32`` / ``uint64`` /
-    ``float32`` / ``float64`` keys directly, so the sort is done in this dtype instead of on the
-    reinterpreted bits. The set is unchanged through Warp 1.16.0 (re-probed on both devices: every
-    narrower width -- ``int8`` / ``uint8`` / ``int16`` / ``uint16`` / ``float16`` -- still raises
-    ``Unsupported keys and values data types``), so the widening table below still has a case for
-    each of them.
-
-    Parameters
-    ----------
-    dtype
-        Any Warp scalar dtype.
-
-    Returns
-    -------
-    type[wp.Scalar]
-        ``dtype`` itself when Warp can already sort it, otherwise the narrowest same-signedness,
-        same-kind dtype it can (``float32`` / ``float64``, ``uint32`` / ``uint64``, ``int32`` /
-        ``int64``), chosen by whether ``dtype`` is wider than four bytes.
-
-    See Also
-    --------
-    [`sort_and_argsort`][triwarp.array.sort_and_argsort]
-    [`bitcast_to_int`][triwarp.array.bitcast_to_int]
-    """
-    wide = wp.types.type_size_in_bytes(dtype) > 4
-    if wp.types.type_is_float(dtype):
-        return wp.float64 if wide else wp.float32
-    if dtype.__name__.lower().startswith("u"):
-        return wp.uint64 if wide else wp.uint32
-    return wp.int64 if wide else wp.int32
 
 
 def bitcast_to_int(

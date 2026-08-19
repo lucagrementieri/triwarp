@@ -92,6 +92,7 @@ __all__ = [
     "empty_2d",
     "empty_3d",
     "ensure_ndim",
+    "sortable_dtype",
 ]
 
 
@@ -266,6 +267,49 @@ def dtype_zero(dtype: type[wp.Scalar]) -> int | float:
     if wp.types.type_is_int(dtype):
         return 0
     return 0.0
+
+
+def sortable_dtype(dtype: type[wp.Scalar]) -> type[wp.Scalar]:
+    """
+    Same-width dtype that ``warp.utils.radix_sort_pairs`` accepts, preserving ``dtype``'s order.
+
+    The single widening rule for every radix sort in this package. Sorting a sub-32-bit dtype is
+    not supported by Warp, and sorting the reinterpreted *bits* of a float or an unsigned value
+    gets the order wrong, so callers ask here rather than widening ad hoc.
+
+    The hash table works in one common signed-integer key space (see
+    [`bitcast_to_int`][triwarp.array.bitcast_to_int]), which is fine for equality but wrong for
+    ordering: negative floats have descending bit patterns, and a ``uint64`` with its top bit set
+    reads as a negative ``int64``. Warp sorts ``int32`` / ``int64`` / ``uint32`` / ``uint64`` /
+    ``float32`` / ``float64`` keys directly, so the sort is done in this dtype instead of on the
+    reinterpreted bits. The set is unchanged through Warp 1.16.0 (re-probed on both devices: every
+    narrower width -- ``int8`` / ``uint8`` / ``int16`` / ``uint16`` / ``float16`` -- still raises
+    ``Unsupported keys and values data types``), so the widening table below still has a case for
+    each of them.
+
+    Parameters
+    ----------
+    dtype
+        Any Warp scalar dtype.
+
+    Returns
+    -------
+    type[wp.Scalar]
+        ``dtype`` itself when Warp can already sort it, otherwise the narrowest same-signedness,
+        same-kind dtype it can (``float32`` / ``float64``, ``uint32`` / ``uint64``, ``int32`` /
+        ``int64``), chosen by whether ``dtype`` is wider than four bytes.
+
+    See Also
+    --------
+    [`sort_and_argsort`][triwarp.array.sort_and_argsort]
+    [`bitcast_to_int`][triwarp.array.bitcast_to_int]
+    """
+    wide = wp.types.type_size_in_bytes(dtype) > 4
+    if wp.types.type_is_float(dtype):
+        return wp.float64 if wide else wp.float32
+    if dtype.__name__.lower().startswith("u"):
+        return wp.uint64 if wide else wp.uint32
+    return wp.int64 if wide else wp.int32
 
 
 @overload

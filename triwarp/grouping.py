@@ -9,14 +9,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.array import (
-    arange,
-    bitcast_from_int,
-    bitcast_to_int,
-    gather,
-    sort_pair_indices,
-    sortable_dtype,
-)
+from triwarp.array import arange, bitcast_from_int, bitcast_to_int, gather, sort_pair_indices
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import grouping as kernel_grouping
 
@@ -55,7 +48,7 @@ def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
     if n < length or length <= 0:
         return twt.as_array2d(twt.empty_2d((0, max(length, 0)), wp.int32, device=device), wp.int32)
 
-    sort_dtype = sortable_dtype(values.dtype)
+    sort_dtype = twt.sortable_dtype(values.dtype)
     values_buffer = wp.empty(2 * n, dtype=sort_dtype, device=device)
     if sort_dtype == values.dtype:
         wp.copy(values_buffer, values, count=n)
@@ -742,7 +735,7 @@ def _unique_hash(
 
     # Phase 4: sort only the n_unique keys (typically n_unique << n), in a dtype that orders them
     # the way the caller's dtype does rather than by their reinterpreted bit pattern.
-    sort_dtype = sortable_dtype(original_dtype)
+    sort_dtype = twt.sortable_dtype(original_dtype)
     keys_buf = bitcast_from_int(keys_compact, sort_dtype, count=2 * n_unique)
     perm_buf = arange(2 * n_unique, device)
     wp.utils.radix_sort_pairs(keys_buf, perm_buf, count=n_unique)
