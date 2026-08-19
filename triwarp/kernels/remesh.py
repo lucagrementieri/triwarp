@@ -760,27 +760,6 @@ CORNER_VERTEX = wp.constant(wp.int32(2))
 
 
 @wp.kernel
-def scatter_edge_incidence(
-    inverse: wp.array[wp.int32],
-    out_edge_face_count: wp.array[wp.int32],
-    out_edge_faces: wp.array2d[wp.int32],
-) -> None:
-    # Face-corners per unique edge *and* the faces themselves, in one pass over the corner ->
-    # unique-edge map ``inverse``: corner ``c`` belongs to face ``c // 3``, so no face table is
-    # needed. The count is 1 on a boundary edge and 2 on an interior one; a non-manifold edge
-    # counts higher and its faces past the second are dropped, which is what the exactly-2 row
-    # grouping behind ``adjacency.face_adjacency`` does with them too.
-    #
-    # Launch over ``inverse.shape[0]`` with both outputs zeroed: the count doubles as the write
-    # cursor, which is why this replaces ``scatter.count_occurrences`` rather than following it.
-    c = wp.int32(wp.tid())
-    e = inverse[c]
-    slot = wp.atomic_add(out_edge_face_count, e, 1)
-    if slot < 2:
-        out_edge_faces[e, slot] = c // 3
-
-
-@wp.kernel
 def scatter_feature_edge_counts(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],

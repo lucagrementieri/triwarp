@@ -442,7 +442,7 @@ def _edge_incidence(faces: wp.array[wp.int32], n_vertices: int) -> _EdgeIncidenc
     The face table costs one scatter over the corners on top of the ``edges_unique`` the collapse
     passes run anyway -- and it replaces the ``scatter.count_occurrences`` launch they used to make
     for the count alone, so it is very nearly free. It is what lets ``_classify`` skip a second and
-    third grouping of the same rows; see ``scatter_edge_incidence`` in ``kernels/remesh.py``.
+    third grouping of the same rows; see ``scatter_edge_incidence`` in ``kernels/scatter.py``.
     """
     device = faces.device
     unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
@@ -451,7 +451,7 @@ def _edge_incidence(faces: wp.array[wp.int32], n_vertices: int) -> _EdgeIncidenc
     edge_faces = twt.empty_2d((m, 2), wp.int32, device=device)
     if m > 0:
         wp.launch(
-            kernel_remesh.scatter_edge_incidence,
+            kernel_scatter.scatter_edge_incidence,
             dim=int(inverse.shape[0]),
             inputs=[inverse, face_count, edge_faces],
             device=device,
@@ -1553,7 +1553,7 @@ class _DecimationBuffers:
         )
         self._edge_face_count.zero_()
         wp.launch(
-            kernel_remesh.scatter_edge_incidence,
+            kernel_scatter.scatter_edge_incidence,
             dim=n,
             inputs=[self._inverse, self._edge_face_count, self._edge_faces],
             device=device,

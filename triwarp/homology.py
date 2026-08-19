@@ -26,6 +26,9 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import array as kernel_array
+from triwarp.kernels import homology as kernel_homology
+from triwarp.kernels import scatter as kernel_scatter
 
 
 def homology_generators(
@@ -40,8 +43,9 @@ def homology_generators(
     [`boundary_loops`][triwarp.boundary.boundary_loops]).
 
     The loops are a *basis*, not canonical: any generating set is as valid as any other, and this
-    one falls out of the spanning trees the traversals happen to build. They are also not geodesic;
-    shortening them is a separate problem (geometry-central's edge-flip machinery, not ported here).
+    one falls out of the spanning trees the construction happens to build. They are also not
+    geodesic; shortening them is a separate problem (geometry-central's edge-flip machinery, not
+    ported here).
 
     Parameters
     ----------
@@ -96,13 +100,21 @@ def tree_cotree(
     """
     Tree-cotree decomposition: the edges a primal and a dual spanning tree both leave alone.
 
-    Three traversals' worth of structure, and the building block behind
+    Three pieces of structure, and the building block behind
     [`homology_generators`][triwarp.homology.homology_generators]:
 
-    1. a breadth-first spanning tree of the **vertex** graph,
-    2. a breadth-first spanning tree of the **dual** (face-adjacency) graph, restricted to dual
-       edges whose primal edge is not already in the vertex tree,
+    1. a breadth-first spanning tree of the **vertex** graph, whose ``parents`` the loop tracing
+       walks,
+    2. a spanning **forest** of the **dual** (face-adjacency) graph, restricted to dual edges whose
+       primal edge is not already in the vertex tree,
     3. whatever edges belong to neither — exactly ``2 * g`` of them on a closed genus-``g`` surface.
+
+    The dual side is a forest rather than a traversal because only its edge *set* is read, never its
+    shape. That matters for cost as well as tidiness: the dual graph restricted to non-primal-tree
+    edges is already nearly a tree, so a breadth-first traversal of it runs its diameter -- measured
+    765-891 levels against the primal tree's 116-192, and ``graph.bfs`` costs
+    ``4 kernels x levels`` whatever the node count. A Boruvka forest needs ``O(log n_faces)`` rounds
+    instead, and the whole call measures **8.3-9.7x** faster for it.
 
     Parameters
     ----------
@@ -130,74 +142,136 @@ def tree_cotree(
     --------
     [`homology_generators`][triwarp.homology.homology_generators]
     [`bfs`][triwarp.graph.bfs]
-    [`face_adjacency`][triwarp.adjacency.face_adjacency]
+    [`edges_unique`][triwarp.edges.edges_unique]
     """
     device = faces.device
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
 
-    unique_edges, _ = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+    # One grouping of the edge rows answers everything: ``inverse`` maps each face corner to its
+    # unique edge, and one scatter over it fills both the per-edge face count and the two incident
+    # faces. That is the whole dual graph, indexed by unique edge -- which is why nothing here needs
+    # to locate a shared edge's row afterwards. The host ``argsort`` + ``searchsorted`` pair this
+    # replaces was doing exactly that lookup, at 7.1-10.4 ms of a 51-61 ms call, over an ``inverse``
+    # the same ``edges_unique`` call had already returned and thrown away.
+    unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
     n_edges = int(unique_edges.shape[0])
-    face_pairs, shared_edges = tw.adjacency.face_adjacency(
-        faces, return_edges=True, n_vertices=n_vertices
-    )
-    if int(face_pairs.shape[0]) * 2 != 3 * n_faces:
+    edge_face_count = wp.zeros(n_edges, dtype=wp.int32, device=device)
+    edge_faces = twt.empty_2d((n_edges, 2), wp.int32, device=device)
+    if n_edges > 0:
+        wp.launch(
+            kernel_scatter.scatter_edge_incidence,
+            dim=int(inverse.shape[0]),
+            inputs=[inverse, edge_face_count, edge_faces],
+            device=device,
+        )
+    interior = wp.empty(n_edges, dtype=wp.bool, device=device)
+    wp.map(kernel_array.equal, edge_face_count, wp.int32(2), out=interior)
+    # The one readback: the closed-surface guard, whose message quotes the boundary-edge count.
+    # ``face_count == 2`` is the same exactly-two-corners test the row grouping behind
+    # ``face_adjacency`` applied, so a non-manifold edge fails this guard exactly as it did before.
+    n_interior = tw.reduce.sum(interior)
+    if n_interior * 2 != 3 * n_faces:
         raise ValueError(
             "homology_generators requires a closed surface: this mesh has "
-            f"{3 * n_faces - 2 * int(face_pairs.shape[0])} boundary edge(s)."
+            f"{3 * n_faces - 2 * n_interior} boundary edge(s)."
         )
 
-    # Primal spanning tree over the vertex graph.
+    # Primal spanning tree over the vertex graph. This one stays a breadth-first traversal: the mesh
+    # graph's diameter is small (measured 116-192 levels) and ``parents`` is the rooted tree the
+    # loop tracing walks.
     adjacency = tw.graph.edges_to_csr(n_vertices, unique_edges)
     _, parents, _ = tw.graph.bfs(adjacency, 0)
 
-    # Which undirected edges the primal tree uses. Done on the host: the filter it feeds is a
-    # gather-and-compare over one int32 per edge, and the dual traversal needs it as a mask anyway.
-    edges_np = unique_edges.numpy()
-    parents_np = parents.numpy()
-    in_primal_tree = (parents_np[edges_np[:, 1]] == edges_np[:, 0]) | (
-        parents_np[edges_np[:, 0]] == edges_np[:, 1]
-    )
-
-    # Dual spanning tree over face adjacency, crossing only edges the primal tree left alone.
-    # Locating each shared edge's row in ``unique_edges`` is a sorted-key lookup, vectorised: the
-    # dict-of-tuples this replaces ran two Python loops with two ``int()`` calls per row, ~600k
-    # dict operations on a 100k-vertex genus-2 surface. Both row sets are already on the host, so
-    # the key is built here rather than through ``grouping.hash_indices_rows``, which would add two
-    # launches and two readbacks to reach the same integers.
-    shared_np = shared_edges.numpy()
-    edge_keys = edges_np[:, 0].astype(np.int64) * n_vertices + edges_np[:, 1]
-    shared_keys = shared_np[:, 0].astype(np.int64) * n_vertices + shared_np[:, 1]
-    order = np.argsort(edge_keys)
-    dual_edge_index = order[np.searchsorted(edge_keys[order], shared_keys)]
-    crossable = ~in_primal_tree[dual_edge_index]
-    dual_pairs = face_pairs.numpy()[crossable]
-    dual_index = dual_edge_index[crossable]
-
-    in_dual_tree = np.zeros(n_edges, dtype=bool)
-    if len(dual_pairs) > 0:
-        dual_adjacency = tw.graph.edges_to_csr(
-            n_faces,
-            twt.as_array2d(
-                wp.array(np.ascontiguousarray(dual_pairs), dtype=wp.int32, device=device), wp.int32
-            ),
+    in_primal_tree = wp.empty(n_edges, dtype=wp.bool, device=device)
+    candidate = wp.empty(n_edges, dtype=wp.bool, device=device)
+    if n_edges > 0:
+        wp.launch(
+            kernel_homology.primal_tree_edge_mask,
+            dim=n_edges,
+            inputs=[unique_edges, parents, in_primal_tree],
+            device=device,
         )
-        _, dual_parents, _ = tw.graph.bfs(dual_adjacency, 0)
-        dual_parents_np = dual_parents.numpy()
-        used = (dual_parents_np[dual_pairs[:, 1]] == dual_pairs[:, 0]) | (
-            dual_parents_np[dual_pairs[:, 0]] == dual_pairs[:, 1]
+        wp.launch(
+            kernel_homology.dual_candidate_mask,
+            dim=n_edges,
+            inputs=[edge_face_count, in_primal_tree, candidate],
+            device=device,
         )
-        in_dual_tree[dual_index[used]] = True
 
-    leftover = np.flatnonzero(~in_primal_tree & ~in_dual_tree)
-    generator_edges = wp.array(
-        np.ascontiguousarray(edges_np[leftover].reshape(-1, 2)), dtype=wp.int32, device=device
-    )
+    in_dual_tree = _dual_spanning_forest(candidate, edge_faces, n_faces)
+
+    leftover_mask = wp.empty(n_edges, dtype=wp.bool, device=device)
+    if n_edges > 0:
+        wp.launch(
+            kernel_homology.leftover_edge_mask,
+            dim=n_edges,
+            inputs=[candidate, in_dual_tree, leftover_mask],
+            device=device,
+        )
+    generator_edges = tw.array.gather(unique_edges, tw.array.flatnonzero(leftover_mask))
     return (
         twt.as_array2d(unique_edges, wp.int32),
         twt.as_array2d(generator_edges, wp.int32),
         parents,
     )
+
+
+def _dual_spanning_forest(
+    candidate: wp.array[wp.bool], edge_faces: twt.Array2dInt32, n_faces: int
+) -> wp.array[wp.bool]:
+    """
+    Build a spanning forest of the dual graph over the ``candidate`` edges, as a per-edge mask.
+
+    Boruvka: each round hands every component its lowest-indexed incident candidate edge, accepts
+    those edges and unions the components, so the component count at least halves per round and the
+    loop finishes in ``O(log n_faces)`` of them.
+
+    A **forest** is all [`tree_cotree`][triwarp.homology.tree_cotree] needs — it reads the dual tree
+    as a set, and the loop tracing walks the *primal* parents — so the dual side has no root and no
+    parent pointers, and its shape is free to choose. The breadth-first shape is the expensive one
+    here: the dual graph restricted to non-primal-tree edges is already nearly a tree, so its
+    diameter is enormous, and ``graph.bfs`` costs ``4 kernels x levels`` whatever the node count.
+    Measured **765-891 levels** for the traversal this replaces against 12-17 rounds here.
+    """
+    device = candidate.device
+    n_candidates = int(candidate.shape[0])
+    in_forest = wp.zeros(n_candidates, dtype=wp.bool, device=device)
+    if n_candidates == 0 or n_faces == 0:
+        return in_forest
+    labels = tw.array.arange(n_faces, device)
+    roots = wp.empty(n_faces, dtype=wp.int32, device=device)
+    proposal = wp.empty(n_faces, dtype=wp.int32, device=device)
+    merges = wp.zeros(1, dtype=wp.int32, device=device)
+    # The round count is a cap, not a schedule: the readback below exits as soon as a round merges
+    # nothing, which happens once every component is spanned. ``bit_length`` is ``ceil(log2)`` plus
+    # one, so the cap can only be reached by a logic error.
+    for _ in range(max(1, n_faces.bit_length()) + 1):
+        merges.zero_()
+        wp.launch(
+            kernel_homology.forest_snapshot_roots,
+            dim=n_faces,
+            inputs=[labels, roots],
+            device=device,
+        )
+        proposal.fill_(int(kernel_homology.FOREST_NO_PROPOSAL))
+        wp.launch(
+            kernel_homology.forest_propose,
+            dim=n_candidates,
+            inputs=[candidate, edge_faces, roots, proposal],
+            device=device,
+        )
+        wp.launch(
+            kernel_homology.forest_link,
+            dim=n_candidates,
+            inputs=[candidate, edge_faces, roots, proposal, labels, in_forest, merges],
+            device=device,
+        )
+        # One 4-byte readback per round. ~17 of those against the 765-891 kernel-bound levels the
+        # traversal needed is not a close trade, and there is no bound on the rounds without it.
+        if int(merges.numpy()[0]) == 0:
+            break
+    return in_forest
 
 
 def _loop_through_tree(start: int, end: int, parents: np.ndarray) -> np.ndarray:

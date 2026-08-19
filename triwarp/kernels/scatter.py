@@ -166,6 +166,31 @@ def scatter_index_where(
 
 
 @wp.kernel
+def scatter_edge_incidence(
+    inverse: wp.array[wp.int32],
+    out_edge_face_count: wp.array[wp.int32],
+    out_edge_faces: wp.array2d[wp.int32],
+) -> None:
+    # Face-corners per unique edge *and* the faces themselves, in one pass over the corner ->
+    # unique-edge map ``inverse``: corner ``c`` belongs to face ``c // 3``, so no face table is
+    # needed. The count is 1 on a boundary edge and 2 on an interior one; a non-manifold edge
+    # counts higher and its faces past the second are dropped, which is what the exactly-2 row
+    # grouping behind ``adjacency.face_adjacency`` does with them too.
+    #
+    # Launch over ``inverse.shape[0]`` with both outputs zeroed: the count doubles as the write
+    # cursor, which is why this replaces ``count_occurrences`` rather than following it.
+    #
+    # It lives here rather than in ``kernels/remesh.py``, where the decimation passes first needed
+    # it, because ``homology.tree_cotree`` groups the same rows for the same reason -- one grouping
+    # answering "how many faces meet along this edge, and which" for the whole package.
+    c = wp.int32(wp.tid())
+    e = inverse[c]
+    slot = wp.atomic_add(out_edge_face_count, e, 1)
+    if slot < 2:
+        out_edge_faces[e, slot] = c // 3
+
+
+@wp.kernel
 def mark_membership_mask(
     indices: wp.array[wp.int32], n: wp.int32, out_mask: wp.array[wp.bool]
 ) -> None:

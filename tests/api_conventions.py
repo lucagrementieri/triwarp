@@ -199,7 +199,7 @@ _DUPLICATE_NAME_ALLOWLIST: dict[str, frozenset[str]] = {
 _SHARED_KERNEL_MODULES = frozenset({"predicates", "scatter"})
 
 # Public modules that launch no kernel of their own and so have no kernel module.
-_MODULES_WITHOUT_KERNELS = frozenset({"constants", "homology", "io", "mesh", "typing"})
+_MODULES_WITHOUT_KERNELS = frozenset({"constants", "io", "mesh", "typing"})
 
 # --- check 8 ------------------------------------------------------------------------------------
 
