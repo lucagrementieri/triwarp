@@ -27,6 +27,7 @@ import warp.optim.linear as wpl
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import reconstruction as kernel_reconstruction
 from triwarp.kernels import remesh as kernel_remesh
 from triwarp.kernels.algorithms import ball_pivoting as kernel_bpa
@@ -586,10 +587,11 @@ def _extract_poisson_surface(
     in, the adaptive backend first samples its finite-element field onto a dense lattice
     ([`_extract_poisson_surface_fem`][triwarp.reconstruction._extract_poisson_surface_fem]). The
     result is un-oriented; [`screened_poisson`][triwarp.reconstruction.screened_poisson] orients it.
+
+    All this adds over [`marching_cubes`][triwarp.reconstruction.marching_cubes] is the reshape:
+    the solvers carry their lattice flat, because that is the shape the linear solve wants.
     """
-    return wp.MarchingCubes.extract_surface_marching_cubes(
-        field.reshape((res, res, res)), wp.float32(iso), cube_lower, cube_upper
-    )
+    return marching_cubes(field.reshape((res, res, res)), iso, bounds=(cube_lower, cube_upper))
 
 
 def _poisson_dense_solve(
@@ -827,10 +829,8 @@ def _screened_poisson_adaptive(
     # octree depth at ~two cells per mean nearest-neighbour distance (never below full_depth, never
     # above the requested depth). ``depth`` beyond this only refines the extraction lattice, which
     # merely samples the already-smooth field more densely.
-    _idx, dist = tw.neighbors.query_bvh_nearest(points, points, k=2)
-    nn = dist.numpy()[:, 1]
-    finite = nn[np.isfinite(nn) & (nn > 0.0)]
-    spacing = float(finite.mean()) if finite.size > 0 else cube_size / float(res_fine)
+    mean_spacing = _mean_positive_finite(tw.neighbors.nearest_neighbor_distance(points))
+    spacing = mean_spacing if mean_spacing is not None else cube_size / float(res_fine)
     grid_depth = int(np.floor(np.log2(max(2.0 * cube_size / spacing, 1.0))))
     grid_depth = max(full_depth, min(depth, grid_depth))
 
@@ -1258,10 +1258,11 @@ def ball_pivoting(
     # Nearest-neighbour table drives both the radius auto-guess and (if needed) normal estimation.
     neighbor_idx, neighbor_dist = tw.neighbors.query_bvh_nearest(points, points, k=7)
     if radius <= 0.0:
-        distances = neighbor_dist.numpy()[:, 1:]
-        finite = distances[np.isfinite(distances) & (distances > 0.0)]
-        spacing = float(finite.mean()) if finite.size > 0 else 1.0
-        radius = 1.5 * spacing
+        # The whole table, not columns ``1:``: the self-distance in slot 0 is exactly zero and the
+        # positive-finite filter drops it, so flattening costs nothing and keeps the reduction on
+        # the device -- a column slice would be strided and could not be flattened at all.
+        mean_spacing = _mean_positive_finite(neighbor_dist.flatten())
+        radius = 1.5 * (mean_spacing if mean_spacing is not None else 1.0)
     if normals is None:
         normals = tw.points.estimate_normals(points, neighbor_idx)
 
@@ -1455,6 +1456,38 @@ class _BpaState:
 
 
 # Floor on the launch width of the grid-strided wave kernels, for clouds too small to fill the
+def _mean_positive_finite(values: wp.array[wp.float32]) -> float | None:
+    """
+    Mean of the strictly positive finite entries of ``values``, or ``None`` if there are none.
+
+    The spacing estimator both auto-guessing call sites in this module share: a neighbour-distance
+    table carries a zero per self-match and an ``inf`` per unfilled slot, and neither belongs in a
+    mean spacing. Two device reductions plus two scalar readbacks rather than the full ``.numpy()``
+    the two sites used to take, because the buffer scales with the cloud.
+
+    Measured interleaved against that host readback, best of 21, on the flattened ``k=7`` table
+    both callers hand over. **CUDA**: 0.26x at 2 562 points, then 2.17x / 8.33x / 34.1x at 41k /
+    164k / 870k -- the readback grows without bound (13.5 ms on the largest) where the reduction is
+    flat at ~0.3 ms. **CPU**: a 5-10x *loss* at every size (0.10x / 0.15x / 0.17x / 0.21x), which
+    is Warp's CPU reductions running about one lane per block against vectorized NumPy. Section 13
+    decides on the CUDA number, and the CPU cost stays under 0.4 ms on any reconstruction input --
+    next to a Poisson solve or a wave loop that is not measurable.
+    """
+    device = values.device
+    n = int(values.shape[0])
+    if n == 0:
+        return None
+
+    counted = wp.empty(n, dtype=wp.bool, device=device)
+    wp.map(kernel_array.is_positive_finite, values, out=counted)
+    count = int(tw.reduce.sum(counted))
+    if count == 0:
+        return None
+    kept = wp.empty(n, dtype=wp.float32, device=device)
+    wp.map(kernel_array.value_if_positive_finite, values, out=kept)
+    return float(tw.reduce.sum(kept)) / float(count)
+
+
 # device on their own.
 _BPA_MIN_GRID = 1 << 12
 

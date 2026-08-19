@@ -17,6 +17,16 @@ No connectivity here -- everything takes a bare ``(n,)`` array of positions. Two
   normals are fitted. [`plane_basis`][triwarp.points.plane_basis] and
   [`radial_sort`][triwarp.points.radial_sort] then let a caller work in the tangent plane it
   defines.
+- **Cleanup and subsampling.** Four masks and one selector, all returning indices or
+  ``wp.array[wp.bool]`` rather than a copied cloud, so a caller pays for the gather only if it
+  wants one: [`finite_point_mask`][triwarp.points.finite_point_mask] and
+  [`duplicate_point_mask`][triwarp.points.duplicate_point_mask] are the two exact predicates,
+  [`radius_outlier_mask`][triwarp.points.radius_outlier_mask] and
+  [`statistical_outlier_mask`][triwarp.points.statistical_outlier_mask] the two density ones (an
+  absolute floor and a cloud-relative threshold), and
+  [`farthest_point_sample`][triwarp.points.farthest_point_sample] picks an exact count spread over
+  the cloud's support. Run the exact predicates first: they are cheap and they remove the inputs
+  the others are ill-defined on.
 
 Normals from [`estimate_normals`][triwarp.points.estimate_normals] are *unoriented* -- a plane fit
 cannot pick a side. See [`triwarp.repair`][triwarp.repair] for orientation propagation.
@@ -671,6 +681,305 @@ def _neighbor_distance_moments(
         device=device,
     )
     return out_mean, out_rms, out_count
+
+
+def radius_outlier_mask(
+    points: wp.array[wp.vec3], radius: float, min_neighbors: int, *, grid: wp.HashGrid | None = None
+) -> wp.array[wp.bool]:
+    """
+    Flag points with at most ``min_neighbors`` other points within ``radius``.
+
+    Open3D's ``remove_radius_outlier`` criterion, and the local counterpart of
+    [`statistical_outlier_mask`][triwarp.points.statistical_outlier_mask]: an *absolute* density
+    floor rather than a cloud-wide threshold on a per-point statistic. That makes it the right
+    choice where the density is known in advance (a scanner's nominal spacing) and the wrong one
+    where it varies across the cloud, which is the trade the two run in opposite directions.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` point positions as ``wp.array[wp.vec3]``.
+    radius
+        Search radius, inclusive at exactly ``radius``. Must be ``> 0``.
+    min_neighbors
+        A point survives when it has **strictly more** than this many neighbours, counting
+        *itself* — Open3D's ``nb_points`` rule exactly, so the same number gives the same answer.
+        Must be ``>= 1``.
+    grid
+        Optional pre-built hash grid over ``points``, from
+        [`hashgrid_from_points`][triwarp.neighbors.hashgrid_from_points]. Pass it to hoist the
+        build out of a sweep over several radii.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Length-``n`` mask on ``points.device``; ``True`` marks an **outlier** (the complement of
+        Open3D's *keep* mask), matching
+        [`statistical_outlier_mask`][triwarp.points.statistical_outlier_mask].
+
+    Raises
+    ------
+    ValueError
+        If ``radius <= 0`` or ``min_neighbors < 1``.
+
+    Notes
+    -----
+    The counts are exact, and the rule is the reference's — but Open3D's own
+    ``remove_radius_outlier`` shares one ``KDTreeFlann`` across an OpenMP loop and its radius search
+    is not thread-safe under that sharing, so it returns a *different answer run to run*: measured
+    three distinct keep sets (43 / 44 / 45 points) over eight repetitions of one 500-point cloud,
+    differing by one or two points each time. Querying the same tree serially reproduces this
+    function exactly on that cloud. Expect a comparison against the filter to disagree on a handful
+    of borderline points, and do not read that as a difference in the criterion.
+
+    Examples
+    --------
+    ```python
+    mask = tw.points.radius_outlier_mask(v, 1.0, 3)
+    outlier_indices = tw.array.flatnonzero(mask)
+    ```
+
+    See Also
+    --------
+    [`statistical_outlier_mask`][triwarp.points.statistical_outlier_mask]
+    [`outlier_probability`][triwarp.points.outlier_probability]
+    [`triwarp.neighbors.query_hashgrid_ball_count`][triwarp.neighbors.query_hashgrid_ball_count]
+    """
+    if radius <= 0.0:
+        raise ValueError(f"radius must be > 0, got {radius}")
+    if min_neighbors < 1:
+        raise ValueError(f"min_neighbors must be >= 1, got {min_neighbors}")
+
+    device = points.device
+    n = int(points.shape[0])
+    out_mask = wp.zeros(n, dtype=wp.bool, device=device)
+    if n == 0:
+        return out_mask
+
+    # A self-query counts the point itself once, at distance 0 -- which is what makes
+    # ``min_neighbors`` comparable with Open3D's ``nb_points`` without an off-by-one correction.
+    counts = tw.neighbors.query_hashgrid_ball_count(points, points, radius, grid=grid)
+    wp.map(kernel_array.less_equal, counts, wp.int32(min_neighbors), out=out_mask)
+    return out_mask
+
+
+def finite_point_mask(points: wp.array[wp.vec3]) -> wp.array[wp.bool]:
+    """
+    Flag points whose three coordinates are all finite.
+
+    Open3D's ``remove_non_finite_points`` predicate. A single ``NaN`` or infinity poisons every
+    reduction the point enters — a bounding box, a covariance, a BVH build — so this is the first
+    pass over a cloud read off a scanner, before any of the fits in this module.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` point positions as ``wp.array[wp.vec3]``.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Length-``n`` mask on ``points.device``. ``True`` marks a point to **keep**, which is the
+        opposite sense from the outlier and duplicate masks in this module — the name is the tell:
+        this one is named for what it selects.
+
+    Examples
+    --------
+    ```python
+    finite = tw.points.finite_point_mask(v)
+    cleaned = tw.array.gather(v, tw.array.flatnonzero(finite))
+    ```
+
+    See Also
+    --------
+    [`duplicate_point_mask`][triwarp.points.duplicate_point_mask]
+        The other exact-predicate cleanup pass; run this one first, since a ``NaN`` position is
+        never equal to itself under Open3D's rule.
+    [`triwarp.array.flatnonzero`][triwarp.array.flatnonzero]
+    """
+    device = points.device
+    n = int(points.shape[0])
+    out_mask = wp.empty(n, dtype=wp.bool, device=device)
+    if n == 0:
+        return out_mask
+
+    wp.map(kernel_points.is_finite_point, points, out=out_mask)
+    return out_mask
+
+
+def duplicate_point_mask(points: wp.array[wp.vec3]) -> wp.array[wp.bool]:
+    """
+    Flag every point that repeats an **exactly** equal position seen earlier in the cloud.
+
+    Open3D's ``remove_duplicated_points`` rule: bit-for-bit coordinate equality, keeping the
+    *first* occurrence of each distinct position. This is deliberately not
+    [`triwarp.grouping.unique_rows`][triwarp.grouping.unique_rows], whose ``wp.vec3`` key buckets
+    each coordinate to about ``2.4e-4`` relative and so merges positions that are merely close;
+    reach for that one when a *tolerance* is what you want, and for this one when equality is.
+
+    Two injective 64-bit key rounds do it: the ``x`` and ``y`` bit patterns pack side by side into
+    one ``int64``, that key's equivalence class packs against the ``z`` bits, and the second class
+    identifies the position exactly. Each half is exactly 32 bits, so neither round can collide.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` point positions as ``wp.array[wp.vec3]``.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Length-``n`` mask on ``points.device``; ``True`` marks a **duplicate**, i.e. every
+        occurrence but the first of each distinct position. Gathering by the complement keeps one
+        representative of each in first-occurrence order, as Open3D does.
+
+    Notes
+    -----
+    ``-0.0`` and ``+0.0`` merge, because IEEE-754 equality holds between them and the reference
+    compares with ``==``; the packing folds the two bit patterns together to reproduce that.
+    ``NaN`` is the one case that does **not** match the reference: ``NaN != NaN`` makes every
+    ``NaN`` row its own class for Open3D, where a bit pattern is a bit pattern here and identical
+    ``NaN`` rows merge. Run [`finite_point_mask`][triwarp.points.finite_point_mask] first and the
+    question does not arise. Positions are compared at ``float32``, so two points that differ only
+    below ``float32`` resolution are one position here and two for a ``float64`` reference.
+
+    Examples
+    --------
+    ```python
+    duplicates = tw.points.duplicate_point_mask(v)
+    n_distinct = int(v.shape[0]) - int(tw.reduce.sum(duplicates))
+    ```
+
+    See Also
+    --------
+    [`finite_point_mask`][triwarp.points.finite_point_mask]
+    [`triwarp.grouping.unique_rows`][triwarp.grouping.unique_rows]
+        The tolerance-bucketed sibling, and the right choice when exact equality is too strict.
+    [`triwarp.grouping.first_occurrence_indices`][triwarp.grouping.first_occurrence_indices]
+    """
+    device = points.device
+    n = int(points.shape[0])
+    out_mask = wp.empty(n, dtype=wp.bool, device=device)
+    if n == 0:
+        return out_mask
+
+    key_xy = wp.empty(n, dtype=wp.int64, device=device)
+    wp.map(kernel_points.pack_xy_bits, points, out=key_xy)
+    _unique_xy, class_xy = tw.grouping.unique_1d(key_xy, return_inverse=True)
+
+    key_xyz = wp.empty(n, dtype=wp.int64, device=device)
+    wp.map(kernel_points.pack_class_z_bits, class_xy, points, out=key_xyz)
+    unique_xyz, class_xyz = tw.grouping.unique_1d(key_xyz, return_inverse=True)
+
+    # The class count is the length of the unique-key array in hand, so the representative pass
+    # needs no reduction of its own.
+    first = tw.grouping.first_occurrence_indices(class_xyz, int(unique_xyz.shape[0]))
+    wp.map(kernel_array.mask_not, tw.array.indices_to_mask(first, n), out=out_mask)
+    return out_mask
+
+
+def farthest_point_sample(
+    points: wp.array[wp.vec3], count: int, *, start: int = 0
+) -> wp.array[wp.int32]:
+    """
+    Greedily pick ``count`` points, each as far as possible from those already picked.
+
+    Open3D's ``farthest_point_down_sample``: the classic maximin subsample, which spreads its
+    output over the cloud's *support* rather than its density — so unlike
+    [`triwarp.voxels.voxel_down_sample`][triwarp.voxels.voxel_down_sample] it returns an exact
+    count, and unlike a random subsample it cannot leave a hole. The greedy choice makes it
+    inherently sequential in ``count``: each iteration is one pass over the cloud, fused so that
+    the distance update and the global arg-max share a launch and nothing is read back to the host
+    in between.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` point positions as ``wp.array[wp.vec3]``.
+    count
+        Number of points to select; must satisfy ``0 <= count <= n``. Zero returns an empty array,
+        as Open3D's ``num_samples=0`` does.
+    start
+        Index of the first sample, Open3D's ``start_index``. Defaults to ``0``, which is its
+        default too.
+
+    Returns
+    -------
+    wp.array[wp.int32]
+        Length-``count`` indices into ``points``, on ``points.device``, in **selection order**:
+        entry 0 is ``start`` and each later entry is the point farthest from every earlier one.
+        Open3D returns the selected *points* instead, and its ``SelectByIndex`` emits them in
+        ascending index order, so the sequence here is strictly more information than the reference
+        gives back — the sets are the same.
+
+    Raises
+    ------
+    ValueError
+        If ``count`` is not in ``[0, n]``, or ``start`` is not a valid index into ``points``.
+
+    Notes
+    -----
+    Ties are broken towards the lower index, matching the reference's strict ``>`` arg-max, and that
+    is what makes the answer reproducible: the per-iteration arg-max is a single ``wp.atomic_max``
+    over a key that packs the squared distance against the complemented index, so the winner does
+    not depend on the order the atomics land in. Distances are compared in ``float32`` where Open3D
+    uses ``float64``, so a cloud with two points at nearly equal distance from the chosen set can
+    diverge from that reference at the point where the tie is resolved — and then, being greedy, for
+    the rest of the sequence.
+
+    Examples
+    --------
+    ```python
+    indices = tw.points.farthest_point_sample(v, 4)
+    spread = tw.array.gather(v, indices)
+    ```
+
+    See Also
+    --------
+    [`triwarp.sample.sample_surface_blue_noise`][triwarp.sample.sample_surface_blue_noise]
+        The same "well-spread points" goal from a *mesh*, by dart throwing rather than greedily.
+    [`triwarp.voxels.voxel_down_sample`][triwarp.voxels.voxel_down_sample]
+    [`triwarp.neighbors.nearest_neighbor_distance`][triwarp.neighbors.nearest_neighbor_distance]
+    """
+    device = points.device
+    n = int(points.shape[0])
+    if not 0 <= count <= n:
+        raise ValueError(f"count must be in [0, {n}], got {count}")
+
+    out_selected = wp.empty(count, dtype=wp.int32, device=device)
+    if count == 0:
+        return out_selected
+    if not 0 <= start < n:
+        raise ValueError(f"start must be in [0, {n}), got {start}")
+
+    wp.launch(
+        kernel_points.seed_farthest_point,
+        dim=1,
+        inputs=[wp.int32(start), out_selected],
+        device=device,
+    )
+    if count == 1:
+        return out_selected
+
+    min_distance_sq = wp.full(n, wp.float32(math.inf), dtype=wp.float32, device=device)
+    # One int64 accumulator, re-armed by ``commit_farthest_point`` so the loop is two launches per
+    # iteration rather than three -- and so the selected index never crosses to the host, which is
+    # what keeps a ``count``-long loop off the ~0.1 ms-per-readback budget.
+    best = wp.array([wp.int64(-1)], dtype=wp.int64, device=device)
+    for step in range(count - 1):
+        wp.launch(
+            kernel_points.advance_farthest_point,
+            dim=n,
+            inputs=[points, out_selected, wp.int32(step), min_distance_sq, best],
+            device=device,
+        )
+        wp.launch(
+            kernel_points.commit_farthest_point,
+            dim=1,
+            inputs=[best, wp.int32(step + 1), out_selected],
+            device=device,
+        )
+    return out_selected
 
 
 def vector_angle(a: wp.array[wp.vec3], b: wp.array[wp.vec3]) -> wp.array[wp.float32]:

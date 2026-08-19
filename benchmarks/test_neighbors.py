@@ -93,6 +93,14 @@ triwarp's ball counts exactly on a 36k random cloud. The index build (``knn_inde
 ``KDTree`` and triwarp's own build; the ball group passes a prebuilt index, like scipy's cached
 tree. Note ``fixed_radius_index(radius)`` bakes the radius into the structure, so each radius
 point pays its own build. trimesh has no k-NN entry point.
+
+``nearest_neighbor_distance`` is the one group here whose queries are the cloud *itself* rather than
+the fixed 20 000-point subsample, because that is how its only callers use it -- once over the whole
+input, before ``reconstruction`` can pick a ball radius or an octree depth. Its open3d counterpart,
+``compute_nearest_neighbor_distance``, builds a ``KDTreeFlann`` and then searches point by point in
+C++, so it is serial but not a Python loop. Medians on the ``scale`` axis (CUDA against one core):
+**0.391 / 0.606 / 1.20 ms** against **0.547 / 12.3 / 49.8 ms** at 2 562 / 40 962 / 163 842 points --
+1.4x, 20x, 41x, the ratio growing because triwarp's is nearly flat over that range.
 """
 
 from __future__ import annotations
@@ -123,6 +131,7 @@ _queries_np_cache: dict[str, np.ndarray] = {}
 _queries_wp_cache: dict[tuple[str, str], wp.array] = {}
 _bvh_cache: dict[tuple[str, str], wp.Bvh] = {}
 _kdtree_cache: dict[str, KDTree] = {}
+_pcd_o3d_cache: dict[str, object] = {}
 _cloud_ml_cache: dict[str, mm.PointCloud] = {}
 _queries_ml_cache: dict[str, mm.std_vector_Vector3_float] = {}
 
@@ -186,6 +195,17 @@ def _bvh(bench_case: BenchCase) -> wp.Bvh:
     if key not in _bvh_cache:
         _bvh_cache[key] = tw.neighbors.bvh_from_points(bench_case.vertices_wp)
     return _bvh_cache[key]
+
+
+def _pcd_o3d(bench_case: BenchCase):
+    """Open3D cloud over the same vertices, once per mesh: the pure query calls do not mutate it."""
+    import open3d as o3d
+
+    if bench_case.mesh_name not in _pcd_o3d_cache:
+        _pcd_o3d_cache[bench_case.mesh_name] = o3d.geometry.PointCloud(
+            o3d.utility.Vector3dVector(bench_case.vertices_np)
+        )
+    return _pcd_o3d_cache[bench_case.mesh_name]
 
 
 def _kdtree(bench_case: BenchCase) -> KDTree:
@@ -471,3 +491,29 @@ def test_query_geodesic_ball(bench_case: BenchCase) -> None:
     radius = 5.0 * float(tw.edges.mean_edge_length(vertices, faces))
     _, offsets, _ = bench_case.run(lambda: tw.neighbors.geodesic_ball(vertices, faces, radius))
     assert offsets.shape == (vertices.shape[0],)
+
+
+@pytest.mark.benchmark(group="nearest_neighbor_distance")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "open3d")
+def test_nearest_neighbor_distance(bench_case: BenchCase) -> None:
+    """
+    The cloud's own spacing: a ``k=2`` self-query, keeping the second column.
+
+    A *self*-query, so unlike every group above the query count is the cloud size rather than
+    ``_N_QUERIES`` -- which is the point, since this is what ``reconstruction`` calls once on the
+    whole input before it can pick a radius or an octree depth. Everything past the k-NN search is a
+    strided column copy, so the ratio against ``query_bvh_nearest_k1`` prices that tail.
+
+    open3d's ``compute_nearest_neighbor_distance`` builds a ``KDTreeFlann`` and then searches one
+    point at a time in C++ -- so it is serial, but not the Python-per-query loop the legacy tree
+    would be from this side, and it is the same quantity to 9e-09.
+    """
+    if bench_case.kind == "open3d":
+        cloud = _pcd_o3d(bench_case)
+        distance_o3d = bench_case.run(cloud.compute_nearest_neighbor_distance)
+        assert len(distance_o3d) == bench_case.n_vertices
+        return
+    points = bench_case.vertices_wp
+    distance = bench_case.run(lambda: tw.neighbors.nearest_neighbor_distance(points))
+    assert distance.shape == (bench_case.n_vertices,)

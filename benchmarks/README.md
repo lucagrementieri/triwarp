@@ -894,11 +894,11 @@ millisecond.
 | `test_validation` | `is_watertight`, `is_edge_manifold` (same `allow_boundary_edges` switch), `is_vertex_manifold` (connectivity-based: agrees with triwarp exactly on edge-manifold input, passes vertices on a non-manifold edge that the fan definition fails) |
 | `test_vertices` | `compute_vertex_normals` |
 | `test_bounds` | `get_axis_aligned_bounding_box` (`aabb_bounds`), `get_minimal_oriented_bounding_box` (hull-based, trimesh's algorithm family — not the PCA `get_oriented_bounding_box`, which minimizes nothing) |
-| `test_points` | `PointCloud.estimate_normals` (`KDTreeSearchParamKNN`) |
+| `test_points` | `PointCloud.estimate_normals` (`KDTreeSearchParamKNN`), `remove_statistical_outlier`, `remove_radius_outlier` (**nondeterministic** — a shared `KDTreeFlann` across an OpenMP loop; three keep sets over eight reps, so the correctness comparison queries that tree serially instead), `remove_duplicated_points`, `farthest_point_down_sample` (its `SelectByIndex` sorts, so only the selected *set* is comparable) |
 | `test_distance` | `PointCloud.compute_point_cloud_distance` (the non-differentiable Chamfer / Hausdorff cases) |
 | `test_convex` | `compute_convex_hull` (exact qhull vs the approximate support sweep) |
 | `test_voxels` | `VoxelGrid.create_from_triangle_mesh_within_bounds`, `create_from_point_cloud`, `PointCloud.voxel_down_sample`, `check_if_included` — the same four answers, from a `std::unordered_map<Eigen::Vector3i>` on one core |
-| `test_neighbors` | `o3d.core.nns.NearestNeighborSearch.knn_search` / `fixed_radius_search` — the batched tensor queries, **not** the legacy `KDTreeFlann` per-query Python loop (62 ms against 10 ms at 20k queries) |
+| `test_neighbors` | `o3d.core.nns.NearestNeighborSearch.knn_search` / `fixed_radius_search` — the batched tensor queries, **not** the legacy `KDTreeFlann` per-query Python loop (62 ms against 10 ms at 20k queries); plus `PointCloud.compute_nearest_neighbor_distance`, which is serial C++ rather than a Python loop |
 | `test_proximity` | `o3d.t.geometry.RaycastingScene.compute_signed_distance` (Embree; parity-ray sign, same convention as triwarp's `"parity"` mode to 1.8e-7) |
 | `test_triangles` | `compute_triangle_normals` (unit normals, unlike MeshLab's raw cross product) |
 
@@ -910,7 +910,10 @@ weights inline), `test_curvature` (no curvature estimation at all), `test_inters
 section), `test_texture` (stores UVs but has no bake or resample), `test_polyline` (`LineSet` is
 unordered segments with no length/resample/simplify), `test_heat_distance` (no geodesic distance),
 `test_selection` (no selection morphology), `test_mesh` (no caching container), `test_graph` (no
-traversal over an abstract CSR), plus the individual functions noted inline. Two rows were
+traversal over an abstract CSR), plus the individual functions noted inline. One function is *tested*
+against open3d and deliberately **not** benchmarked: `points.finite_point_mask` is a single `wp.map`
+over a three-component `isfinite`, so a group would report the ~11 us launch floor and nothing else,
+while `remove_non_finite_points` would be timing its copy of the surviving cloud. Two rows were
 *rejected on measurement* rather than absence and carry the numbers in their module docstrings:
 `test_totals`' `get_volume` validates before it integrates (13.8 s of `IsWatertight` for a
 microsecond integral — it would re-time the watertightness row under another name), and

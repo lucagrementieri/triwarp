@@ -42,9 +42,26 @@ LoOP score behind ``outlier_probability``, at the same ``knearest``.
 
 The outlier groups are timed the same way as ``estimate_normals_knn``: the neighbour table is an
 *input* of triwarp's functions and is built inside the timed callable, because both references build
-their own k-d tree per call and there would otherwise be nothing to compare. ``open3d`` covers only
-the statistical variant (``remove_statistical_outlier``), which additionally *copies* the surviving
-points into a new cloud -- triwarp returns a mask, so that row is an upper bound.
+their own k-d tree per call and there would otherwise be nothing to compare. ``open3d`` covers the
+statistical variant (``remove_statistical_outlier``) and the radius one (``remove_radius_outlier``),
+both of which additionally *copy* the surviving points into a new cloud -- triwarp returns a mask,
+so those rows are upper bounds.
+
+Three groups have no triwarp-side neighbour table to hoist, because they take the cloud directly:
+``radius_outlier_mask``, ``duplicate_point_mask`` and ``farthest_point_sample``. Medians on
+``sphere_med`` (40 962 points, RTX 5090, CUDA against open3d's one core):
+
+| group | triwarp | open3d | ratio |
+|---|---|---|---|
+| ``radius_outlier_mask`` at 2 / 4 mean edges | 0.233 / 0.361 ms | 14.6 / 19.2 ms | 63x / 53x |
+| ``duplicate_point_mask`` | 1.40 ms | 6.18 ms | 4.4x (15x on ``sphere_large``) |
+| ``farthest_point_sample`` at 64 / 1024 | 1.92 / 32.3 ms | 2.94 / 41.9 ms | 1.5x / 1.3x |
+
+The last row is the one to read carefully: the greedy loop is ``Theta(count)`` launches over the
+whole cloud, so at ``count = 1024`` its 32 ms is ~2 000 launches of marshalling and essentially no
+kernel time. That is why it barely beats a serial C++ loop, and why the count -- not the mesh -- is
+its axis. On ``sphere_small`` (2 562 points) every one of the three *loses*, by 4x to 10x, for the
+same reason in miniature: the launch floor does not shrink with the cloud.
 
 MeshLab has nothing for ``fit_line`` / ``major_axis``, ``point_plane_distance``, ``vector_angle`` or
 ``radial_sort``: those are array primitives rather than filters.
@@ -100,6 +117,20 @@ _KNN_SWEEP = [8, 64]
 # of this module's wall clock, so every host branch is capped at the smallest scan mesh -- the ratio
 # against triwarp is four orders of magnitude and needs no larger input to establish.
 _HOST_CAP_REASON = "host reference is a single-threaded pass; capped at bunny_decimated"
+
+# Radius sweep for ``radius_outlier_mask``, in mean edge lengths. The ball count is linear in how
+# many points each ball holds, so a 2x radius is ~8x the point tests -- the two points bracket where
+# the hash grid stops paying for the extra cells.
+_RADIUS_SCALES = [2.0, 4.0]
+
+# Density floor for the same group, held fixed so the sweep is the radius alone. Open3D's own
+# ``nb_points`` semantics: a point survives when it has strictly more than this many neighbours,
+# itself included.
+_MIN_NEIGHBORS = 6
+
+# Sample counts for ``farthest_point_sample``. The greedy loop is Theta(count) launches over the
+# whole cloud, so this axis is the launch count and the step between the two is 16x.
+_SAMPLE_COUNTS = [64, 1024]
 
 # Fixed plane / sort axis, deliberately not axis-aligned so no branch is skipped.
 _PLANE_NORMAL = np.array([0.3, -0.6, 0.74])
@@ -518,3 +549,92 @@ def test_statistical_outlier_mask(bench_case: BenchCase) -> None:
             lambda: cloud.remove_statistical_outlier(nb_neighbors=_KNN, std_ratio=2.0)
         )
         assert len(keep_indices) <= bench_case.n_vertices
+
+
+@pytest.mark.benchmark(group="radius_outlier_mask")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "open3d")
+@pytest.mark.parametrize("radius_scale", _RADIUS_SCALES)
+def test_radius_outlier_mask(bench_case: BenchCase, radius_scale: float) -> None:
+    """
+    A ball count plus one threshold map, swept over the radius rather than the mesh.
+
+    The radius is the whole cost model: the count is linear in how many points each ball holds, so a
+    2x radius is ~8x the point tests, and where the hash grid stops paying for itself is what the
+    two points bracket. Nothing after the count scales -- the threshold is one ``wp.map``.
+
+    open3d's ``remove_radius_outlier`` builds its own ``KDTreeFlann`` per call and *materializes*
+    the kept subset, so its row is an upper bound on the same question; it is also
+    **nondeterministic** (a shared tree across an OpenMP loop), which is why the comparison in
+    ``tests/test_points.py`` goes through that tree serially instead.
+    """
+    if bench_case.mesh_name == "sphere_large":
+        pytest.skip("open3d searches one point at a time; capped at sphere_med")
+    radius = radius_scale * bench_case.mean_edge
+    if bench_case.kind == "triwarp":
+        points = bench_case.vertices_wp
+        mask = bench_case.run(lambda: tw.points.radius_outlier_mask(points, radius, _MIN_NEIGHBORS))
+        assert mask.shape == (bench_case.n_vertices,)
+    else:
+        cloud = _pcd(bench_case)
+        _kept, keep_indices = bench_case.run(
+            lambda: cloud.remove_radius_outlier(nb_points=_MIN_NEIGHBORS, radius=radius)
+        )
+        assert len(keep_indices) <= bench_case.n_vertices
+
+
+@pytest.mark.benchmark(group="duplicate_point_mask")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "open3d")
+def test_duplicate_point_mask(bench_case: BenchCase) -> None:
+    """
+    Exact positional dedup: two ``unique_1d`` rounds over 64-bit keys, then a first-occurrence pass.
+
+    The most expensive of the module's four masks and the only one that is not a single map -- two
+    open-addressing hash builds and two sorts of the unique values, so it is the row to read for a
+    change to ``grouping``'s uniqueness machinery from the point-cloud side.
+
+    open3d's ``remove_duplicated_points`` answers the same question with an
+    ``unordered_map<Vector3d>`` on one core and copies the survivors out; the mask here is compared
+    against its survivor list in ``tests/test_points.py``. A registry mesh has *no* duplicated
+    vertices, so both sides do their full work and neither takes an early exit.
+    """
+    if bench_case.kind == "open3d":
+        # The dedup mutates nothing -- it returns a fresh cloud -- so one cached input cloud is
+        # valid for every round, unlike the ``remove_*`` methods that rewrite in place.
+        cloud = _pcd(bench_case)
+        deduplicated_o3d = bench_case.run(cloud.remove_duplicated_points)
+        assert len(deduplicated_o3d.points) <= bench_case.n_vertices
+        return
+    points = bench_case.vertices_wp
+    mask = bench_case.run(lambda: tw.points.duplicate_point_mask(points))
+    assert mask.shape == (bench_case.n_vertices,)
+
+
+@pytest.mark.benchmark(group="farthest_point_sample")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "open3d")
+@pytest.mark.parametrize("count", _SAMPLE_COUNTS)
+def test_farthest_point_sample(bench_case: BenchCase, count: int) -> None:
+    """
+    The greedy maximin subsample, swept over the sample count -- which is the launch count.
+
+    Inherently sequential in ``count``: each iteration folds one selected point into the running
+    distances and takes a global arg-max, so the work is ``Theta(count)`` launches over the whole
+    cloud however small the sample is. That makes this the one group in the module whose slope is
+    set by a *parameter* rather than by the mesh, and the two counts here are a 16x step in it.
+
+    open3d's ``FarthestPointDownSample`` runs the identical loop serially in C++ on one core, so
+    the comparison is device parallelism against a tighter inner loop; it also copies the selected
+    points out where triwarp returns indices.
+    """
+    if bench_case.mesh_name == "sphere_large":
+        pytest.skip("open3d's greedy loop is serial over the whole cloud; capped at sphere_med")
+    if bench_case.kind == "triwarp":
+        points = bench_case.vertices_wp
+        indices = bench_case.run(lambda: tw.points.farthest_point_sample(points, count))
+        assert indices.shape == (count,)
+    else:
+        cloud = _pcd(bench_case)
+        sampled_o3d = bench_case.run(lambda: cloud.farthest_point_down_sample(count))
+        assert len(sampled_o3d.points) == count

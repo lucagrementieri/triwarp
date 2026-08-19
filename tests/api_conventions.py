@@ -355,8 +355,16 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     ("holes", "fill_dp_span_tiled"): frozenset({"dp", "prev"}),
     ("polyline", "orient_ccw"): frozenset({"points2d"}),
     ("registration", "accumulate_cost"): frozenset({"acc"}),
+    # ``min_distance_sq`` is the farthest-point sampler's running distance-to-the-chosen-set, folded
+    # down one selection at a time and carried across every launch of the greedy loop: input and
+    # result in the same buffer. ``best`` is the loop's arg-max accumulator -- see below.
+    ("points", "advance_farthest_point"): frozenset({"min_distance_sq", "best"}),
     # scratch / persistent state
     ("adjacency", "scatter_vertex_faces"): frozenset({"cursor"}),
+    # One int64 slot holding the packed ``(distance, index)`` winner of the current greedy
+    # iteration. ``commit_farthest_point`` reads it into ``out_selected`` -- the actual answer --
+    # and re-arms it to the sentinel, so the buffer is the loop's state and not its output.
+    ("points", "commit_farthest_point"): frozenset({"best"}),
     # ``slot_count`` is the per-vertex atomic cursor picking which of the two neighbour slots each
     # scattered edge lands in -- the ``scatter_vertex_faces`` case exactly, under a name that says
     # what it holds. The answer is ``out_neighbors``.

@@ -4,6 +4,10 @@ Point-set acceleration structures (BVH/HashGrid) and raw neighbor queries.
 Also home to [`geodesic_ball`][triwarp.neighbors.geodesic_ball], the surface-aware counterpart to
 the spatial ball queries here: it returns the same CSR ``(indices, offsets)`` shape but walks the
 mesh edge graph, so it excludes vertices that are close in space yet across a fold of the surface.
+
+[`nearest_neighbor_distance`][triwarp.neighbors.nearest_neighbor_distance] is the one derived
+quantity rather than a raw query: the per-point distance to the closest other point, which is what a
+cloud's scale is normally estimated from.
 """
 
 from __future__ import annotations
@@ -1205,6 +1209,56 @@ def query_hashgrid_nearest(
         device=device,
     )
     return _shape_nearest(neighbor_indices, neighbor_distances, k, single_query)
+
+
+def nearest_neighbor_distance(points: wp.array[wp.vec3]) -> wp.array[wp.float32]:
+    """
+    Distance from each point to the closest *other* point of the same cloud.
+
+    The standard scale estimate for an unstructured cloud, and what a sampling-driven parameter is
+    normally derived from: the mean of this array is the cloud's mean spacing, which is how
+    [`ball_pivoting`][triwarp.reconstruction.ball_pivoting] guesses its ball radius and how
+    [`screened_poisson`][triwarp.reconstruction.screened_poisson] caps its octree depth. A
+    self-query for two neighbours, keeping the second — the first is the point itself, at distance
+    zero.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` point positions as ``wp.array[wp.vec3]``.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        Length-``n`` distances on ``points.device``. Zero where two points coincide exactly.
+
+    Notes
+    -----
+    A cloud of fewer than two points has no answer, and this reports ``inf`` for every entry —
+    the value [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] already uses for a slot it
+    could not fill. Open3D's ``compute_nearest_neighbor_distance`` reports ``0.0`` in that one
+    case; on any cloud of two or more points the two agree, because every point then has a nearest
+    neighbour. The distances are ``float32`` (``wp.length``), so they can differ from a
+    ``float64`` reference in the last digits.
+
+    See Also
+    --------
+    [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest]
+        The underlying query; call it directly to reuse a BVH across several queries of one cloud.
+    [`triwarp.points.farthest_point_sample`][triwarp.points.farthest_point_sample]
+    """
+    device = points.device
+    n = int(points.shape[0])
+    if n < 2:
+        return wp.full(n, wp.float32(math.inf), dtype=wp.float32, device=device)
+
+    _indices, distances = query_bvh_nearest(points, points, k=2)
+    # Column 1 of the ``(n, 2)`` table, which is a *strided* view -- so it is copied into a dense
+    # buffer rather than returned, both because callers expect a plain ``wp.array`` and because a
+    # strided array is the shape that silently corrupts a downstream Python-scope gather.
+    nearest = wp.empty(n, dtype=wp.float32, device=device)
+    wp.copy(nearest, distances[:, 1])
+    return nearest
 
 
 def geodesic_ball(

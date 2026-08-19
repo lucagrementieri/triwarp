@@ -256,6 +256,97 @@ def is_statistical_outlier(
 
 
 @wp.func
+def is_finite_point(point: wp.vec3) -> wp.bool:
+    # All three coordinates finite -- the row predicate behind ``finite_point_mask``. Any one NaN
+    # or infinity condemns the point, which is what a downstream tree build or covariance fit
+    # needs: a single non-finite coordinate poisons every reduction the point enters.
+    return wp.isfinite(point[0]) and wp.isfinite(point[1]) and wp.isfinite(point[2])
+
+
+@wp.func
+def zero_normalized_bits(value: wp.float32) -> wp.int32:
+    # The coordinate's ``float32`` bit pattern, with ``-0.0`` folded onto ``+0.0``. ``wp.cast`` is a
+    # bit reinterpretation, so it separates the two zeros -- and IEEE-754 equality does not, which
+    # is the rule an exact-equality dedup has to reproduce. Every other value is its own bits.
+    if value == 0.0:
+        return wp.int32(0)
+    return wp.cast(value, wp.int32)
+
+
+@wp.func
+def pack_xy_bits(point: wp.vec3) -> wp.int64:
+    # Round one of the exact position key: the x and y bit patterns side by side in one int64.
+    # Injective, because each half is exactly 32 bits wide -- which is the whole point, and the
+    # difference from ``kernels.grouping.pack_vec3``, whose key *buckets* all three coordinates
+    # into 21 bits apiece and so merges positions that merely agree to ~2.4e-4 relative.
+    x_bits = wp.uint64(wp.uint32(zero_normalized_bits(point[0])))
+    y_bits = wp.uint64(wp.uint32(zero_normalized_bits(point[1])))
+    return wp.int64((x_bits << wp.uint64(32)) | y_bits)
+
+
+@wp.func
+def pack_class_z_bits(class_id: wp.int32, point: wp.vec3) -> wp.int64:
+    # Round two: the (x, y) equivalence class from round one against the z bits. Injective for the
+    # same reason -- ``class_id`` is an index into the round-one unique array, so it is below the
+    # point count and fits the high 32 bits with room to spare.
+    class_bits = wp.uint64(wp.uint32(class_id))
+    z_bits = wp.uint64(wp.uint32(zero_normalized_bits(point[2])))
+    return wp.int64((class_bits << wp.uint64(32)) | z_bits)
+
+
+@wp.func
+def pack_farthest_key(distance_sq: wp.float32, index: wp.int32) -> wp.int64:
+    # One int64 whose ``wp.atomic_max`` is "largest distance, lowest index on a tie". The IEEE-754
+    # bits of a non-negative float increase monotonically with the value, so the high half orders
+    # by distance; the low half stores ``index`` complemented within int32 so that a *smaller*
+    # index compares *larger*. Both halves are non-negative, so the whole key is, which is what
+    # makes ``-1`` a sentinel below every real candidate.
+    distance_bits = wp.uint64(wp.uint32(wp.cast(distance_sq, wp.int32)))
+    rank = wp.uint64(wp.uint32(wp.int32(2147483647) - index))
+    return wp.int64((distance_bits << wp.uint64(32)) | rank)
+
+
+@wp.func
+def unpack_farthest_index(key: wp.int64) -> wp.int32:
+    return wp.int32(2147483647) - wp.int32(wp.uint32(wp.uint64(key) & wp.uint64(4294967295)))
+
+
+@wp.kernel
+def seed_farthest_point(start: wp.int32, out_selected: wp.array[wp.int32]) -> None:
+    out_selected[0] = start
+
+
+@wp.kernel
+def advance_farthest_point(
+    points: wp.array[wp.vec3],
+    selected: wp.array[wp.int32],
+    step: wp.int32,
+    min_distance_sq: wp.array[wp.float32],
+    best: wp.array[wp.int64],
+) -> None:
+    # One greedy iteration, fused: fold the point just selected into each point's running distance
+    # to the chosen set, then have the same thread contribute its own updated value to the global
+    # argmax. No cross-thread dependency to synchronize -- thread ``i`` reads and writes only
+    # ``min_distance_sq[i]`` -- which is what lets the update and the reduction share a launch.
+    i = wp.int32(wp.tid())
+    chosen = points[selected[step]]
+    distance_sq = wp.length_sq(points[i] - chosen)
+    if distance_sq < min_distance_sq[i]:
+        min_distance_sq[i] = distance_sq
+    wp.atomic_max(best, 0, pack_farthest_key(min_distance_sq[i], i))
+
+
+@wp.kernel
+def commit_farthest_point(
+    best: wp.array[wp.int64], step: wp.int32, out_selected: wp.array[wp.int32]
+) -> None:
+    # Decode the winning key into the next sample and re-arm the accumulator, so the loop needs no
+    # separate reset launch and no host readback between iterations.
+    out_selected[step] = unpack_farthest_index(best[0])
+    best[0] = wp.int64(-1)
+
+
+@wp.func
 def plane_basis(normal: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
     # Kernel-scope mirror of ``triwarp.points.plane_basis``, for callers that hold the normal in
     # device memory and must not read it back to build the frame.

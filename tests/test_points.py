@@ -9,6 +9,7 @@ import warp as wp
 from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 
+import triwarp.grouping as tw_grouping
 import triwarp.neighbors as tw_neighbors
 import triwarp.points as tw
 import triwarp.typing as twt
@@ -873,6 +874,243 @@ def test_statistical_outlier_mask_matches_meshlib(device: str) -> None:
 def test_statistical_outlier_mask_empty(device: str) -> None:
     neighbor_distance_wp = twt.empty_2d((0, 8), wp.float32, device=device)
     assert tw.statistical_outlier_mask(neighbor_distance_wp).shape == (0,)
+
+
+@pytest.mark.parity("radius_outlier_mask", "open3d")
+def test_radius_outlier_mask_matches_open3d(device: str) -> None:
+    """
+    Class B (reference entry point): Open3D's own rule, evaluated through its tree *serially*.
+
+    ``remove_radius_outlier`` is the obvious oracle and it is **nondeterministic**: it shares one
+    ``KDTreeFlann`` across an OpenMP loop whose radius search is not thread-safe under that sharing,
+    and eight repetitions of a 500-point cloud returned three distinct keep sets (43 / 44 / 45
+    points), differing by one or two points each. So the comparison goes through the same tree one
+    query at a time and applies the filter's own published rule -- ``count > nb_points``, self
+    counted -- which reproduces this function's mask **exactly** here. That is the named transform.
+
+    Parametrized over three thresholds so the mask is neither all-``True`` nor all-``False``, which
+    a constant answer would otherwise pass, and the counts themselves are cross-checked against the
+    same tree so a wrong count cannot cancel against a wrong comparison.
+    """
+    radius = 0.15
+    rng = np.random.default_rng(0)
+    points_np = rng.random((500, 3)).astype(np.float32).astype(np.float64)
+
+    cloud_o3d = points_to_open3d(points_np)
+    tree_o3d = o3d.geometry.KDTreeFlann(cloud_o3d)
+    count_o3d = np.array(
+        [tree_o3d.search_radius_vector_3d(cloud_o3d.points[i], radius)[0] for i in range(500)]
+    )
+
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    count_wp = tw_neighbors.query_hashgrid_ball_count(points_wp, points_wp, radius)
+    assert np.array_equal(count_wp.numpy(), count_o3d)
+
+    for min_neighbors in (3, 6, 12):
+        outlier_o3d = count_o3d <= min_neighbors
+        # non-vacuity: this threshold splits the cloud rather than condemning or sparing all of it
+        assert 0 < outlier_o3d.sum() < 500
+        outlier_wp = tw.radius_outlier_mask(points_wp, radius, min_neighbors)
+        assert np.array_equal(outlier_wp.numpy().astype(bool), outlier_o3d)
+
+
+def test_radius_outlier_mask_invalid_arguments(device: str) -> None:
+    points_wp = wp.array(np.zeros((4, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    with pytest.raises(ValueError, match="radius"):
+        tw.radius_outlier_mask(points_wp, 0.0, 2)
+    with pytest.raises(ValueError, match="min_neighbors"):
+        tw.radius_outlier_mask(points_wp, 1.0, 0)
+    empty_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    assert tw.radius_outlier_mask(empty_wp, 1.0, 2).shape == (0,)
+
+
+@pytest.mark.parity(
+    "finite_point_mask",
+    "open3d",
+    benchmarked=False,
+    reason="one wp.map over a three-component isfinite predicate, so a group would measure the "
+    "launch floor and nothing else -- ~11 us of host time whatever the cloud, which is the same "
+    "number every other trivial map in the package would report. open3d's remove_non_finite_points "
+    "additionally copies the surviving cloud out, so its side would be timing the copy. The "
+    "comparison is what open3d can still say about the answer, and it is exact.",
+)
+def test_finite_point_mask_matches_open3d(device: str) -> None:
+    """
+    Class B (mask against a kept subset): ``remove_non_finite_points`` returns the surviving cloud.
+
+    The transform is the only one available -- Open3D hands back points, not a mask -- so the kept
+    positions are compared against the rows this mask selects, in order. One ``NaN`` and both
+    infinities are planted, in each of the three coordinate slots, since a predicate testing only
+    ``point[0]`` would pass a single-column probe.
+    """
+    rng = np.random.default_rng(4)
+    points_np = rng.random((40, 3))
+    points_np[3, 1] = np.nan
+    points_np[7, 0] = np.inf
+    points_np[11, 2] = -np.inf
+    points_np[19, 2] = np.nan
+
+    kept_o3d = np.asarray(points_to_open3d(points_np).remove_non_finite_points().points)
+
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    finite_wp = tw.finite_point_mask(points_wp).numpy().astype(bool)
+
+    assert kept_o3d.shape[0] == 36  # non-vacuity: the reference dropped exactly the four planted
+    assert np.array_equal(np.flatnonzero(~finite_wp), np.array([3, 7, 11, 19]))
+    assert np.allclose(points_np[finite_wp], kept_o3d, rtol=1e-5, atol=1e-5)
+
+    empty_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    assert tw.finite_point_mask(empty_wp).shape == (0,)
+
+
+@pytest.mark.parity("duplicate_point_mask", "open3d")
+def test_duplicate_point_mask_matches_open3d(device: str) -> None:
+    """
+    Class B (mask against a kept subset): ``remove_duplicated_points``'s survivors, in order.
+
+    Open3D returns the deduplicated cloud, so the comparison is its rows against the rows the
+    complement of this mask selects — which also pins the *first-occurrence* rule, since keeping the
+    last occurrence instead would reorder the survivors. ``-0.0`` against ``+0.0`` is planted
+    deliberately: IEEE-754 equality holds between them, so the reference merges them and a raw
+    bit-pattern key would not.
+    """
+    rng = np.random.default_rng(0)
+    base_np = rng.random((20, 3)).astype(np.float32)
+    points_np = np.concatenate(
+        [
+            base_np,
+            base_np[:5],
+            base_np[10:15],
+            np.array([[-0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32),
+        ]
+    )
+
+    kept_o3d = np.asarray(
+        points_to_open3d(points_np).remove_duplicated_points().points, dtype=np.float32
+    )
+
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    duplicate_wp = tw.duplicate_point_mask(points_wp).numpy().astype(bool)
+
+    # non-vacuity: 10 repeats plus the second zero row, so both the mask and its complement matter
+    assert duplicate_wp.sum() == 11
+    assert kept_o3d.shape[0] == 21
+    assert np.array_equal(points_np[~duplicate_wp], kept_o3d)
+
+    empty_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    assert tw.duplicate_point_mask(empty_wp).shape == (0,)
+
+
+def test_duplicate_point_mask_separates_one_ulp(device: str) -> None:
+    """
+    Not a library comparison: the guard on the *load-bearing* trick, which no reference can see.
+
+    Open3D works in ``float64``, so a ``float32``-adjacent pair is two distinct positions to it
+    whatever this function does — the comparison above cannot tell an exact key from a bucketed one.
+    Two coordinates one ULP apart must land in different classes, which is what distinguishes the
+    bit-reinterpretation key from ``grouping.unique_rows``' relative bucket: that one merges
+    anything within ~2.4e-4 relative and would call all three rows here duplicates.
+    """
+    one = np.float32(1.0)
+    next_one = np.nextafter(one, np.float32(2.0))
+    assert one != next_one
+    points_np = np.array([[one, 0.0, 0.0], [next_one, 0.0, 0.0], [one, 0.0, 0.0]], dtype=np.float32)
+
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    duplicate_wp = tw.duplicate_point_mask(points_wp).numpy().astype(bool)
+
+    # row 1 is one ULP away and is its own position; row 2 repeats row 0 exactly
+    assert np.array_equal(duplicate_wp, np.array([False, False, True]))
+
+    _unique_bucketed = tw_grouping.unique_rows(points_wp)
+    assert int(_unique_bucketed.shape[0]) == 1  # the bucketed key merges all three
+
+
+@pytest.mark.parity("farthest_point_sample", "open3d")
+def test_farthest_point_sample_matches_open3d(device: str) -> None:
+    """
+    Class B (order discarded): the same *set* as ``farthest_point_down_sample``, at four counts.
+
+    Open3D returns the selected points through ``SelectByIndex``, which emits them in ascending
+    index order, so its sequence is not recoverable and only the set can be compared -- the
+    transform. The sequence is pinned separately below, against a transcription of its own loop.
+    """
+    rng = np.random.default_rng(0)
+    points_np = rng.random((500, 3)).astype(np.float32).astype(np.float64)
+    cloud_o3d = points_to_open3d(points_np)
+
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    for count in (1, 4, 32, 64):
+        selected_o3d = np.asarray(cloud_o3d.farthest_point_down_sample(count).points)
+        index_o3d = {
+            int(np.argmin(np.linalg.norm(points_np - point, axis=1))) for point in selected_o3d
+        }
+        assert len(index_o3d) == count  # non-vacuity: the reference really returned `count` points
+
+        index_wp = tw.farthest_point_sample(points_wp, count).numpy()
+        assert set(index_wp.tolist()) == index_o3d
+
+
+def _farthest_point_sequence(points_np: np.ndarray, count: int, start: int = 0) -> np.ndarray:
+    """
+    Open3D's ``FarthestPointDownSample`` loop transcribed, which is the only oracle for the order.
+
+    Strict ``>`` on the running maximum, so the lowest index wins a tie — the convention the packed
+    ``atomic_max`` key reproduces.
+    """
+    selected = []
+    distances = np.full(points_np.shape[0], np.inf)
+    farthest = start
+    for _ in range(count):
+        selected.append(farthest)
+        squared = ((points_np - points_np[farthest]) ** 2).sum(axis=1)
+        distances = np.minimum(distances, squared)
+        farthest = int(np.argmax(distances))  # numpy argmax already breaks ties towards low indices
+    return np.array(selected, dtype=np.int32)
+
+
+@pytest.mark.parametrize("start", [0, 137])
+def test_farthest_point_sample_sequence_and_coverage(device: str, start: int) -> None:
+    """
+    Class A against a transcription of the reference loop, plus the property no reference asserts.
+
+    Two claims the set comparison above cannot make. First the **order**: entry 0 is ``start`` and
+    each later entry is the arg-max, tie broken low — compared index for index against the NumPy
+    port. Second **coverage monotonicity**: the distance from the cloud to the selected set can only
+    shrink as the count grows, which is the defining property of the greedy choice and would break
+    under an arg-*min* or a stale distance buffer.
+    """
+    rng = np.random.default_rng(2)
+    points_np = rng.random((400, 3)).astype(np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+
+    index_wp = tw.farthest_point_sample(points_wp, 40, start=start).numpy()
+    assert np.array_equal(
+        index_wp, _farthest_point_sequence(points_np.astype(np.float64), 40, start)
+    )
+
+    radii = []
+    for count in (4, 10, 40):
+        chosen_np = points_np[tw.farthest_point_sample(points_wp, count, start=start).numpy()]
+        radii.append(
+            float(
+                np.linalg.norm(points_np[:, None, :] - chosen_np[None, :, :], axis=2)
+                .min(axis=1)
+                .max()
+            )
+        )
+    assert radii[0] >= radii[1] >= radii[2]
+
+
+def test_farthest_point_sample_invalid_arguments(device: str) -> None:
+    points_wp = wp.array(np.zeros((4, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    assert tw.farthest_point_sample(points_wp, 0).shape == (0,)
+    with pytest.raises(ValueError, match="count"):
+        tw.farthest_point_sample(points_wp, 5)
+    with pytest.raises(ValueError, match="count"):
+        tw.farthest_point_sample(points_wp, -1)
+    with pytest.raises(ValueError, match="start"):
+        tw.farthest_point_sample(points_wp, 2, start=4)
 
 
 @pytest.mark.parity("vector_angle", "trimesh")

@@ -517,7 +517,7 @@ ruff's import conventions), never through `pytest.importorskip`; reference varia
 unlike a MeshSet), clouds with `points_to_open3d`, and tensor-API meshes with
 `trimesh_to_open3d_t` — never chain off an unbound `from_legacy(...)` (see the freed-memory hazard
 below). The installed wheel is a CUDA build whose legacy `open3d.geometry` / `open3d.pipelines`
-APIs are CPU-only; only `open3d.t` has GPU kernels. Seven hazards, all measured:
+APIs are CPU-only; only `open3d.t` has GPU kernels. Nine hazards, all measured:
 
 - **Legacy `remove_*` / `orient_*` / `filter_*` methods mutate in place** (build inside the timed
   callable, the `test_repair.py` rule); the pure `compute_*` / `get_*` / `is_*` calls recompute
@@ -554,6 +554,24 @@ APIs are CPU-only; only `open3d.t` has GPU kernels. Seven hazards, all measured:
 - **`get_oriented_bounding_box` is PCA of the hull and minimizes nothing** (12.9% above triwarp's
   volume on a tilted half_torus); the comparable entry point is
   `get_minimal_oriented_bounding_box`, the hull-face search of trimesh's family.
+- **`remove_radius_outlier` is nondeterministic**, so it cannot be a class-A oracle. It shares one
+  `KDTreeFlann` across an `#pragma omp parallel for` whose radius search is not thread-safe under
+  that sharing: measured three distinct keep sets (43 / 44 / 45 points) over eight repetitions of one
+  500-point cloud, differing by one or two points each time. Its published rule —
+  `count > nb_points`, self counted — is sound, and evaluating it through the *same* tree one query
+  at a time reproduces `points.radius_outlier_mask` exactly on that cloud. So the comparison goes
+  through `search_radius_vector_3d` in a loop and the filter keeps only the benchmark row. No other
+  `remove_*` method shares the defect (`remove_statistical_outlier` reduces per point independently
+  and is stable), which is why this one had to be found rather than assumed.
+- **A down-sampler's output order is its own, not its algorithm's.** Every legacy selection routes
+  through `SelectByIndex`, which walks a *mask* over the input and therefore emits the survivors in
+  ascending index order — so `farthest_point_down_sample`'s greedy sequence is destroyed on the way
+  out and only the selected *set* can be compared (measured equal at counts 4 / 32 / 64). Where the
+  order is the claim, transcribe the C++ loop into the test: `FarthestPointDownSample` takes its
+  arg-max with a strict `>`, so the lowest index wins a tie. Two small conventions from the same
+  family: `num_samples=0` returns an empty cloud rather than raising, and
+  `compute_nearest_neighbor_distance` reports **`0.0`** for a cloud of fewer than two points where
+  the honest answer is `inf`.
 
 **pyvista** (VTK 9.6 through its own Python layer, mirrored under `reference/pyvista`) is the
 **VTK** reference and a hard test dependency like the three above — `import pyvista as pv`, never

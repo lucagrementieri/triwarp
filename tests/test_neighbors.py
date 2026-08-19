@@ -21,7 +21,7 @@ from meshlib import mrmeshpy as mm
 from scipy.spatial import KDTree
 
 import triwarp as tw
-from tests.conversions import points_to_meshlib
+from tests.conversions import points_to_meshlib, points_to_open3d
 from triwarp.kernels import neighbors as kernel_neighbors
 
 
@@ -832,6 +832,60 @@ def test_query_nearest_rejects_negative_initial_radius(
     )
     with pytest.raises(ValueError, match="initial_radius"):
         query_nearest(points_wp, points_wp, k=1, initial_radius=-1.0)
+
+
+@pytest.mark.parity("nearest_neighbor_distance", "open3d")
+def test_nearest_neighbor_distance_matches_open3d(device: str) -> None:
+    """
+    Class A: element for element against ``PointCloud.compute_nearest_neighbor_distance``.
+
+    The distance to the nearest *other* point, so the self-match in slot 0 of the k-NN table must be
+    skipped -- an implementation returning column 0 would report all zeros, which is what the
+    strictly-positive assert below excludes. It also pins the strided-column read: column 1 of an
+    ``(n, 2)`` table is a non-contiguous view, and the value comparison here is the check that the
+    copy out of it is the column and not the buffer's leading entries.
+
+    Also asserted, since no reference has an opinion on it: the mean of this array is a *scale*, so
+    scaling the cloud must scale it by the same factor (both ``reconstruction`` call sites divide a
+    length by it).
+    """
+    rng = np.random.default_rng(11)
+    points_np = rng.random((600, 3))
+
+    distance_o3d = np.asarray(points_to_open3d(points_np).compute_nearest_neighbor_distance())
+
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    distance_wp = tw.neighbors.nearest_neighbor_distance(points_wp)
+
+    assert distance_o3d.min() > 0.0  # non-vacuity: a random cloud has no coincident points
+    assert np.allclose(distance_wp.numpy(), distance_o3d, rtol=1e-5, atol=1e-5)
+
+    scaled_wp = wp.array((3.0 * points_np).astype(np.float32), dtype=wp.vec3, device=device)
+    scaled_distance_wp = tw.neighbors.nearest_neighbor_distance(scaled_wp)
+    assert np.allclose(scaled_distance_wp.numpy(), 3.0 * distance_wp.numpy(), rtol=1e-5, atol=1e-5)
+
+
+def test_nearest_neighbor_distance_coincident_and_degenerate(device: str) -> None:
+    """
+    Not a library comparison: the two cases Open3D answers differently, plus the exact-zero one.
+
+    Two coincident points are at distance zero from each other and both libraries say so, but a
+    cloud of fewer than two points has no answer at all -- Open3D reports ``0.0`` there and this
+    reports ``inf``, the value its own k-NN uses for a slot it could not fill. The divergence is
+    documented rather than papered over, so it is pinned here rather than in the parity test.
+    """
+    coincident_np = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [5.0, 0.0, 0.0]], dtype=np.float32)
+    coincident_wp = wp.array(coincident_np, dtype=wp.vec3, device=device)
+    distance_wp = tw.neighbors.nearest_neighbor_distance(coincident_wp).numpy()
+    assert np.array_equal(distance_wp, np.array([0.0, 0.0, 5.0], dtype=np.float32))
+
+    for n_points in (0, 1):
+        sparse_wp = wp.array(
+            np.zeros((n_points, 3), dtype=np.float32), dtype=wp.vec3, device=device
+        )
+        answer_wp = tw.neighbors.nearest_neighbor_distance(sparse_wp).numpy()
+        assert answer_wp.shape == (n_points,)
+        assert np.all(np.isinf(answer_wp))
 
 
 def _geodesic_ball_neighborhoods_oracle(

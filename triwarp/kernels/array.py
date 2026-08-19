@@ -261,6 +261,11 @@ def less(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
 
 
 @wp.func
+def less_equal(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
+    return a <= b
+
+
+@wp.func
 def equal(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
     return a == b
 
@@ -268,6 +273,21 @@ def equal(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
 @wp.func
 def not_equal(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
     return a != b
+
+
+@wp.func
+def is_positive_finite(value: wp.Float) -> wp.bool:
+    return value > type(value)(0) and wp.isfinite(value)
+
+
+@wp.func
+def value_if_positive_finite(value: wp.Float) -> wp.Float:
+    # The masked half of a "mean over the positive finite entries" reduction: the excluded entries
+    # contribute an exact zero to the sum, so one plain reduction over this and one over the
+    # companion mask give the numerator and the denominator without a compaction pass.
+    if value > type(value)(0) and wp.isfinite(value):
+        return value
+    return type(value)(0)
 
 
 @wp.func
