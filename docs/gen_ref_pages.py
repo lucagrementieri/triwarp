@@ -16,42 +16,45 @@ src = root / "triwarp"
 # at the bottom fails the build otherwise, so adding a new module without classifying it here
 # is caught immediately rather than silently falling back to a flat alphabetical list.
 SECTIONS: dict[str, list[str]] = {
-    "Primitives": ["creation"],
+    "Primitives & creation": ["creation"],
     "Mesh structure & topology": [
         "mesh",
         "vertices",
         "edges",
         "triangles",
-        "boundary",
-        "adjacency",
         "halfedge",
-        "tangent_space",
-        "homology",
-        "validation",
-        "totals",
+        "adjacency",
+        "boundary",
         "selection",
+        "validation",
+        "homology",
+        "tangent_space",
     ],
+    # ``visibility`` sits here rather than under a query heading: ``ambient_occlusion``,
+    # ``shape_diameter`` and ``thickness`` are per-point scalar shape descriptors of the same kind
+    # as ``curvature``'s, which is how pymeshlab files them (``compute_scalar_*``).
+    "Measures & shape descriptors": ["totals", "curvature", "bounds", "convex", "visibility"],
     "Mesh editing & repair": ["repair", "holes", "combine", "remesh", "smoothing", "seams"],
-    "Queries & measures": [
-        "proximity",
-        "neighbors",
-        "bounds",
+    "Spatial queries": ["proximity", "ray", "neighbors", "intersection", "distance"],
+    # ``voxels`` is shelved with ``points`` / ``sample`` rather than with the spatial queries:
+    # ``points.farthest_point_sample`` and ``voxels.voxel_down_sample`` are the two point-cloud
+    # down-samplers and a reader looking for one should meet the other. The *code* stays split --
+    # one returns indices and the other needs the whole grid machinery.
+    "Point clouds, voxels & reconstruction": [
+        "points",
+        "sample",
         "voxels",
-        "ray",
-        "distance",
-        "intersection",
-        "curvature",
-        "convex",
-        "visibility",
+        "reconstruction",
+        "registration",
     ],
     # ``energies`` immediately after ``laplacian``: the two halves of one subject, split because
     # 1 346 lines cannot carry both in one source order (which is the docs order). A reader
     # arriving from libigl looks for ``cotmatrix`` and ``crouzeix_raviart_*`` together, and the
     # adjacency plus the See Also in both directions is what replaces that.
-    "Operators & fields": ["laplacian", "energies", "linalg", "interpolation", "parametrization"],
+    "Operators & solvers": ["laplacian", "energies", "linalg", "interpolation", "parametrization"],
     # ``geodesic_walk`` first: a direct combinatorial walk is the simpler thing, and section 11
     # orders a section by expected frequency of use. It is listed here rather than under
-    # "Queries & measures" so the package's two geodesic entry points -- the walk and
+    # "Spatial queries" so the package's two geodesic entry points -- the walk and
     # ``heat.distance.heat_geodesic`` -- are shelved together; a module may appear in exactly one
     # section, so widening this one is the fix and moving ``heat_geodesic`` is not.
     "Geodesics & heat-method solvers": [
@@ -60,7 +63,6 @@ SECTIONS: dict[str, list[str]] = {
         "heat.vector",
         "heat.signed",
     ],
-    "Point clouds & registration": ["points", "sample", "reconstruction", "registration"],
     "Curves": ["polyline"],
     "Attributes & I/O": ["texture", "io"],
     "Arrays & infrastructure": ["array", "reduce", "grouping", "graph", "typing", "constants"],
