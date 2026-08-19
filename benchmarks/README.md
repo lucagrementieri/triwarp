@@ -921,7 +921,7 @@ microsecond integral — it would re-time the watertightness row under another n
 against the area law would transform the reference.
 
 Modules with no baseline from **any** reference are `test_texture`, `test_polyline`, `test_reduce`,
-`test_linalg` and `test_halfedge` (plus `stitch*` in `test_combine`, the morphology groups in
+`test_linalg` and `test_halfedge` (plus `stitch*` in `test_holes`, the morphology groups in
 `test_selection`, and the two transport groups in `test_tangent_space`);
 each docstring says which reference was considered and why it is not apples-to-apples. Those are
 before/after self-comparisons.

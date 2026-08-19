@@ -72,9 +72,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pytest
 import trimesh as tm
-from conftest import BenchCase
+import warp as wp
+from conftest import BenchCase, mesh_ml_from_numpy
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
@@ -300,3 +302,109 @@ def test_fill_smooth_target_edge(bench_case: BenchCase, derive_target: bool) -> 
         lambda: tw.holes.fill_smooth(vertices, faces, max_edge=max_edge), rounds=_ROUNDS
     )
     assert result[1].shape[0] >= faces.shape[0]
+
+
+# --- Stitching two rims: the same DP over a band rather than a cap -----------------------------
+
+_stitch_cache: dict[tuple[str, str], tuple] = {}
+_stitch_np_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+
+def _face_slice(bench_case: BenchCase, lo: int, hi: int) -> wp.array[wp.int32]:
+    """Contiguous face-index range as a device buffer (untimed setup, so numpy is fine)."""
+    return wp.array(np.arange(lo, hi, dtype=np.int32), dtype=wp.int32, device=bench_case.device)
+
+
+def _submesh(bench_case: BenchCase, lo: int, hi: int) -> tuple:
+    """Faces ``[lo, hi)`` of the case mesh as a compact standalone ``(vertices, faces)`` pair."""
+    return tw.selection.submesh_from_face_indices(
+        bench_case.vertices_wp,
+        bench_case.faces_wp,
+        _face_slice(bench_case, lo, hi),
+        unique_indices=True,
+    )
+
+
+def _stitch_halves(bench_case: BenchCase) -> tuple:
+    """
+    Cut the open tube into two rings, so each half has exactly one boundary loop to stitch.
+
+    ``_open_cylinder`` emits its lower band of triangles before its upper one, so the first and
+    second halves of the face buffer are exactly the two rings -- no adjacency query needed.
+    """
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _stitch_cache:
+        half = bench_case.n_faces // 2
+        _stitch_cache[key] = (
+            _submesh(bench_case, 0, half),
+            _submesh(bench_case, half, bench_case.n_faces),
+        )
+    return _stitch_cache[key]
+
+
+@pytest.mark.benchmark(group="stitch")
+@pytest.mark.benchmeshes("rim_short")
+@pytest.mark.benchlibs("triwarp")
+def test_stitch(bench_case: BenchCase) -> None:
+    """Greedy band between two rims: O(La + Lb), the cheap counterpart of the DP below."""
+    (va, fa), (vb, fb) = _stitch_halves(bench_case)
+    _vertices, faces = bench_case.run(lambda: tw.holes.stitch(va, fa, vb, fb))
+    assert int(faces.shape[0]) > 0
+
+
+def _stitch_pair_np(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build the same two rings as [`_stitch_halves`] as one NumPy mesh with two disjoint rims.
+
+    MeshLib's ``stitchHoles`` takes a *single* ``Mesh`` holding both holes, so the two halves are
+    compacted independently and index-offset into one buffer -- the same construction
+    ``tests/test_holes.py::_meshlib_stitch_band`` uses, which is what makes the benchmark and the
+    parity test measure the same thing.
+    """
+    if bench_case.mesh_name not in _stitch_np_cache:
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        half = bench_case.n_faces // 2
+        parts = []
+        for lo, hi in ((0, half), (half, bench_case.n_faces)):
+            used, inverse = np.unique(faces_np[lo:hi], return_inverse=True)
+            parts.append((vertices_np[used], inverse.reshape(-1, 3)))
+        (va_np, fa_np), (vb_np, fb_np) = parts
+        _stitch_np_cache[bench_case.mesh_name] = (
+            np.vstack([va_np, vb_np]),
+            np.vstack([fa_np, fb_np + len(va_np)]),
+        )
+    return _stitch_np_cache[bench_case.mesh_name]
+
+
+@pytest.mark.benchmark(group="stitch_min_weight")
+@pytest.mark.benchmeshes("rim_short")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_stitch_min_weight(bench_case: BenchCase) -> None:
+    """
+    Grid DP over the two rims: an La x Lb table filled by La + Lb sequential launches.
+
+    meshlib is the only reference in the package that has this operation at all -- ``stitchHoles``
+    is a real two-loop minimum-weight stitch where trimesh and pymeshlab have nothing, which is why
+    it is also the oracle in tests/test_holes.py::test_stitch_min_weight_matches_meshlib. The
+    four-argument overload is used deliberately (see section 6): the two-argument one finds the
+    rims itself, and timing that would fold hole detection into the DP.
+    """
+    if bench_case.kind == "meshlib":
+        vertices_np, faces_np = _stitch_pair_np(bench_case)
+
+        def run_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(vertices_np, faces_np)
+            edges_ml = mesh_ml.topology.findHoleRepresentiveEdges()
+            params_ml = mm.StitchHolesParams()
+            params_ml.metric = mm.getComplexStitchMetric(mesh_ml)
+            mm.stitchHoles(mesh_ml, edges_ml[0], edges_ml[1], params_ml)
+            return mesh_ml.topology.numValidFaces()
+
+        assert bench_case.run(run_ml, rounds=_ROUNDS) > len(faces_np)
+        return
+    (va, fa), (vb, fb) = _stitch_halves(bench_case)
+    up = wp.vec3(0.0, 0.0, 1.0)
+    _vertices, faces = bench_case.run(
+        lambda: tw.holes.stitch_min_weight(va, fa, vb, fb, up_dir=up), rounds=_ROUNDS
+    )
+    assert int(faces.shape[0]) > 0

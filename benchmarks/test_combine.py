@@ -71,8 +71,6 @@ _ROUNDS = 3
 
 _split_cache: dict[tuple[str, str], tuple] = {}
 _parts_cache: dict[tuple[str, str, int], list] = {}
-_stitch_cache: dict[tuple[str, str], tuple] = {}
-_stitch_np_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
 
 def _split_inputs(bench_case: BenchCase) -> tuple:
@@ -239,88 +237,3 @@ def test_concatenate(bench_case: BenchCase, copies: int) -> None:
         ]
         combined = bench_case.run(lambda: tm.util.concatenate(meshes_tm))
         assert len(combined.faces) == bench_case.n_faces
-
-
-def _stitch_halves(bench_case: BenchCase) -> tuple:
-    """
-    Cut the open tube into two rings, so each half has exactly one boundary loop to stitch.
-
-    ``_open_cylinder`` emits its lower band of triangles before its upper one, so the first and
-    second halves of the face buffer are exactly the two rings -- no adjacency query needed.
-    """
-    key = (bench_case.mesh_name, str(bench_case.device))
-    if key not in _stitch_cache:
-        half = bench_case.n_faces // 2
-        _stitch_cache[key] = (
-            _submesh(bench_case, 0, half),
-            _submesh(bench_case, half, bench_case.n_faces),
-        )
-    return _stitch_cache[key]
-
-
-@pytest.mark.benchmark(group="stitch")
-@pytest.mark.benchmeshes("rim_short")
-@pytest.mark.benchlibs("triwarp")
-def test_stitch(bench_case: BenchCase) -> None:
-    """Greedy band between two rims: O(La + Lb), the cheap counterpart of the DP below."""
-    (va, fa), (vb, fb) = _stitch_halves(bench_case)
-    _vertices, faces = bench_case.run(lambda: tw.combine.stitch(va, fa, vb, fb))
-    assert int(faces.shape[0]) > 0
-
-
-def _stitch_pair_np(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Build the same two rings as [`_stitch_halves`] as one NumPy mesh with two disjoint rims.
-
-    MeshLib's ``stitchHoles`` takes a *single* ``Mesh`` holding both holes, so the two halves are
-    compacted independently and index-offset into one buffer -- the same construction
-    ``tests/test_combine.py::_meshlib_stitch_band`` uses, which is what makes the benchmark and the
-    parity test measure the same thing.
-    """
-    if bench_case.mesh_name not in _stitch_np_cache:
-        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
-        half = bench_case.n_faces // 2
-        parts = []
-        for lo, hi in ((0, half), (half, bench_case.n_faces)):
-            used, inverse = np.unique(faces_np[lo:hi], return_inverse=True)
-            parts.append((vertices_np[used], inverse.reshape(-1, 3)))
-        (va_np, fa_np), (vb_np, fb_np) = parts
-        _stitch_np_cache[bench_case.mesh_name] = (
-            np.vstack([va_np, vb_np]),
-            np.vstack([fa_np, fb_np + len(va_np)]),
-        )
-    return _stitch_np_cache[bench_case.mesh_name]
-
-
-@pytest.mark.benchmark(group="stitch_min_weight")
-@pytest.mark.benchmeshes("rim_short")
-@pytest.mark.benchlibs("triwarp", "meshlib")
-def test_stitch_min_weight(bench_case: BenchCase) -> None:
-    """
-    Grid DP over the two rims: an La x Lb table filled by La + Lb sequential launches.
-
-    meshlib is the only reference in the package that has this operation at all -- ``stitchHoles``
-    is a real two-loop minimum-weight stitch where trimesh and pymeshlab have nothing, which is why
-    it is also the oracle in tests/test_combine.py::test_stitch_min_weight_matches_meshlib. The
-    four-argument overload is used deliberately (see section 6): the two-argument one finds the
-    rims itself, and timing that would fold hole detection into the DP.
-    """
-    if bench_case.kind == "meshlib":
-        vertices_np, faces_np = _stitch_pair_np(bench_case)
-
-        def run_ml() -> int:
-            mesh_ml = mesh_ml_from_numpy(vertices_np, faces_np)
-            edges_ml = mesh_ml.topology.findHoleRepresentiveEdges()
-            params_ml = mm.StitchHolesParams()
-            params_ml.metric = mm.getComplexStitchMetric(mesh_ml)
-            mm.stitchHoles(mesh_ml, edges_ml[0], edges_ml[1], params_ml)
-            return mesh_ml.topology.numValidFaces()
-
-        assert bench_case.run(run_ml, rounds=_ROUNDS) > len(faces_np)
-        return
-    (va, fa), (vb, fb) = _stitch_halves(bench_case)
-    up = wp.vec3(0.0, 0.0, 1.0)
-    _vertices, faces = bench_case.run(
-        lambda: tw.combine.stitch_min_weight(va, fa, vb, fb, up_dir=up), rounds=_ROUNDS
-    )
-    assert int(faces.shape[0]) > 0

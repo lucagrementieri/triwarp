@@ -1015,7 +1015,7 @@ def refine_and_smooth_region(
     Subdivide the patch and smooth its new vertices.
 
     Shared finisher of [`fill_smooth`][triwarp.holes.fill_smooth] and
-    [`stitch_smooth`][triwarp.combine.stitch_smooth].
+    [`stitch_smooth`][triwarp.holes.stitch_smooth].
     """
     device = faces.device
     vertices, faces, patch_face_mask = tw.remesh.subdivide_region_to_size(

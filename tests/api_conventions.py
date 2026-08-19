@@ -158,44 +158,23 @@ _MODULES_WITHOUT_BENCHMARKS = frozenset(
 # The defect the check exists for is a private *operation* with callers in two modules -- a function
 # that was written where it was first needed and should have been public
 # (``proximity._default_mesh_query_max_dist``, four importers, one of them aliasing it back to a
-# public-looking name). What survives below is the two things that are not that: a string-to-enum
-# lookup table shared by a wrapper and its dispatcher, and a dtype conversion that would be a public
-# name whose whole content is ``wp.array(..., dtype=...)``.
+# public-looking name). What survives below is the three things that are not that: a sorted copy
+# whose public form does extra work, a string-to-kernel-flag table shared so two modules cannot
+# disagree about one enum's spellings, and one pass a caller must skip.
+#
+# Six further entries used to sit here, all ``combine`` -> ``holes``, and none of them was ever an
+# exemption worth keeping: they existed because the minimum-weight interval DP that fills one hole
+# is the same DP that stitches two rims, and the two halves lived in different modules. Moving the
+# stitch family into ``holes`` deleted all six at once. A cluster of entries sharing one (importer,
+# owner) pair is that shape of defect -- read it as a misplaced family before writing the seventh.
 _PRIVATE_IMPORT_ALLOWLIST: dict[tuple[str, str], str] = {
     ("reduce", "array._sorted_copy"): (
         "reduce.median needs a sorted copy, and array.sort_and_argsort is the public form -- which "
         "also builds the permutation median throws away"
     ),
-    ("combine", "holes._PackedLoops"): (
-        "the flat-plus-sizes loop representation both dynamic programs consume. It is a data "
-        "type, not an operation -- publishing it would make an internal layout part of the API, "
-        "and every public entry point on both sides takes and returns plain arrays"
-    ),
-    ("combine", "holes._EdgeTable"): (
-        "the rim-opposite-vertex lookup the dihedral term of both metrics needs; shared for the "
-        "same reason as the metric table below, so the single-hole cap and the two-rim band cannot "
-        "disagree about what an edge's opposite vertex is"
-    ),
-    ("combine", "holes._BAD_TRIANGULATION_METRIC"): (
-        "the host-side twin of the kernels' BAD_METRIC sentinel, so the two DP tables are "
-        "initialised to the same unusable value; a second copy would be a second constant to keep "
-        "in step with the kernel's"
-    ),
-    ("combine", "holes._STITCH_METRIC_IDS"): (
-        "the metric-name-to-kernel-flag table, shared so the two entry points validate the same "
-        "spellings; a public copy would be a second source of truth for one enum"
-    ),
-    ("combine", "holes._patch_mask"): (
-        "marks which faces a fill added, by index range -- bookkeeping over another function's "
-        "return convention rather than a mesh operation"
-    ),
-    ("combine", "holes._mean_rim_edge_length"): (
-        "the default target edge length for a patch, derived from the rim it was fitted to; it is "
-        "one caller's default, not a measurement anyone would reach for"
-    ),
     ("remesh", "triangles._QUALITY_METRICS"): (
-        "the same string-to-kernel-flag table as the stitch one above, for face_quality's metric "
-        "argument, so remesh's objective names cannot drift from triangles.face_quality's"
+        "a string-to-kernel-flag table, for face_quality's metric argument, so remesh's objective "
+        "names cannot drift from triangles.face_quality's"
     ),
     ("reconstruction", "remesh._flip_interior_edges"): (
         "ball pivoting flips its own output's interior edges; every public remesh entry point "
