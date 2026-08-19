@@ -61,7 +61,7 @@ against the reference each function is tested for:
 | ``voxel_down_sample`` | 0.80 ms | 1.34 ms (open3d) |
 | ``occupancy_at_points``, 10^6 queries | 0.083 ms | 44.0 ms (open3d) |
 | ``dilate`` | 0.41 ms | 1.77 ms (trimesh / ndimage) |
-| ``fill_holes`` | 0.74 ms | 5.32 ms (trimesh / ndimage) |
+| ``fill_cavities`` | 0.74 ms | 5.32 ms (trimesh / ndimage) |
 | ``fill_orthographic`` | 1.13 ms | 4.73 ms (trimesh) |
 | ``to_boxes`` | 1.01 ms | 23.8 ms (trimesh ``multibox``) |
 | ``voxel_corners`` | 0.67 ms | 4.83 ms (igl) |
@@ -155,8 +155,8 @@ def voxelize_mesh(
         ``aabb(vertices).min - 0.5 * voxel_size``, Open3D's half-voxel pad.
     mode
         ``"surface"`` (default) keeps only the cells the surface passes through. ``"solid"`` fills
-        the enclosed interior afterwards with [`fill_holes`][triwarp.voxels.fill_holes], which is
-        correct for a closed input: an exact tri-box voxelization of a closed surface is
+        the enclosed interior afterwards with [`fill_cavities`][triwarp.voxels.fill_cavities], which
+        is correct for a closed input: an exact tri-box voxelization of a closed surface is
         **6-connected sealed**, so no face-adjacent path leaves the interior and the fill needs no
         containment query at all. On an open surface it fills whatever the shell happens to enclose.
     max_candidates
@@ -178,7 +178,7 @@ def voxelize_mesh(
     See Also
     --------
     [`voxelize_points`][triwarp.voxels.voxelize_points]
-    [`fill_holes`][triwarp.voxels.fill_holes]
+    [`fill_cavities`][triwarp.voxels.fill_cavities]
     [`triwarp.reconstruction.resample_uniform`][triwarp.reconstruction.resample_uniform]
 
     Notes
@@ -252,7 +252,7 @@ def voxelize_mesh(
         device=device,
     )
     if mode == "solid":
-        return fill_holes(grid)
+        return fill_cavities(grid)
     return grid
 
 
@@ -923,7 +923,7 @@ def grid_points(
     return lattice.reshape((dims[0] * dims[1] * dims[2],))
 
 
-def fill_holes(grid: wp.Volume) -> wp.Volume:
+def fill_cavities(grid: wp.Volume) -> wp.Volume:
     """
     Fill every enclosed cavity: an empty cell is kept empty only if it reaches the outside.
 
@@ -998,9 +998,9 @@ def fill_orthographic(grid: wp.Volume) -> wp.Volume:
 
     trimesh's ``ops.fill_orthographic``: along every line parallel to an axis, fill from the first
     occupied cell to the last, then keep only the cells all three axes agree on. Cheaper and blunter
-    than [`fill_holes`][triwarp.voxels.fill_holes] — it fills concavities that are open in only one
-    or two directions, and it cannot fill a cavity whose enclosing shell is not convex along all
-    three axes.
+    than [`fill_cavities`][triwarp.voxels.fill_cavities] — it fills concavities that are open in
+    only one or two directions, and it cannot fill a cavity whose enclosing shell is not convex
+    along all three axes.
 
     Parameters
     ----------
@@ -1019,7 +1019,7 @@ def fill_orthographic(grid: wp.Volume) -> wp.Volume:
 
     See Also
     --------
-    [`fill_holes`][triwarp.voxels.fill_holes]
+    [`fill_cavities`][triwarp.voxels.fill_cavities]
     """
     voxel_size, origin = _require_index_grid(grid)
     device = grid.device

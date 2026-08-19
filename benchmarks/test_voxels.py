@@ -17,7 +17,7 @@ References
 question. All four are asserted element-wise in ``tests/test_voxels.py``.
 
 **trimesh** covers the morphology and the box meshing. ``voxel.morphology.binary_dilation`` and
-``fill_holes`` are ``scipy.ndimage`` on a dense array, so those two rows are really "sparse grid
+``fill_cavities`` are ``scipy.ndimage`` on a dense array, so those two rows are really "sparse grid
 against dense ndimage" and their axis is the one that separates them: the dense side pays for the
 whole bounding box, the sparse side only for the occupied cells. ``voxel.ops.multibox`` builds
 ``12 n`` triangles on the host with no corner sharing.
@@ -44,7 +44,7 @@ What has no group, and why
 ``occupancy_at_cells``, ``erode``, ``surface_voxels``, ``to_dense``, ``from_dense`` and
 ``to_field`` are each one launch over the voxel set with no allocation of their
 own, so a row would time the ~340 µs wrapper floor rather than the operation. Most are measured
-anyway through a group that calls them: ``fill_holes`` and ``fill_orthographic`` both go through
+anyway through a group that calls them: ``fill_cavities`` and ``fill_orthographic`` both go through
 ``to_dense`` / ``from_dense``, ``surface_voxels`` runs the same probe kernel as ``erode``, and
 ``cells`` is on the critical path of every group below.
 
@@ -370,9 +370,9 @@ def test_dilate(bench_case: BenchCase) -> None:
     assert int(dilated.get_active_stats().voxel_count) > 0
 
 
-@pytest.mark.benchmark(group="fill_holes")
+@pytest.mark.benchmark(group="fill_cavities")
 @pytest.mark.benchlibs("triwarp", "trimesh")
-def test_fill_holes(bench_case: BenchCase) -> None:
+def test_fill_cavities(bench_case: BenchCase) -> None:
     """
     The one group whose cost is *not* the grid: it is the empty complement, which grows cubically.
 
@@ -394,7 +394,7 @@ def test_fill_holes(bench_case: BenchCase) -> None:
         return
 
     grid = tw.voxels.voxelize_mesh(bench_case.vertices_wp, bench_case.faces_wp, voxel_size)
-    filled = bench_case.run(lambda: tw.voxels.fill_holes(grid), rounds=_HEAVY_ROUNDS)
+    filled = bench_case.run(lambda: tw.voxels.fill_cavities(grid), rounds=_HEAVY_ROUNDS)
     assert int(filled.get_active_stats().voxel_count) > 0
 
 
@@ -404,7 +404,7 @@ def test_fill_orthographic(bench_case: BenchCase) -> None:
     """
     The cheap fill: three axis sweeps and an intersection, against three dense NumPy reductions.
 
-    Both sides work on the dense occupancy box, so unlike ``fill_holes`` this pair really is the
+    Both sides work on the dense occupancy box, so unlike ``fill_cavities`` this pair really is the
     same shape of work on the same data and reads as a straight parallel-versus-serial comparison.
     trimesh's version builds three ``cumsum``-style masks with NumPy, so it is the fastest of its
     morphology functions and the hardest of them to beat.

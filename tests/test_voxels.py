@@ -242,7 +242,7 @@ def test_voxelize_mesh_solid_is_sealed(sphere, device: str):
 
     # The padded shell of the solid's own bounding box must stay empty, and the interior must be
     # separated from it: filling again changes nothing.
-    refilled = tw.voxels.fill_holes(solid)
+    refilled = tw.voxels.fill_cavities(solid)
     lower, extent = _bounds_of(solid)
     assert np.array_equal(_dense(solid, lower, extent), _dense(refilled, lower, extent))
     assert tw.voxels.occupancy_at_points(
@@ -716,8 +716,8 @@ def test_surface_voxels_is_the_erosion_complement(sphere, device: str):
     assert np.array_equal(shell, occupancy_np & ~eroded)
 
 
-@pytest.mark.parity("fill_holes", "trimesh")
-def test_fill_holes_matches_scipy(cave_cube, device: str):
+@pytest.mark.parity("fill_cavities", "trimesh")
+def test_fill_cavities_matches_scipy(cave_cube, device: str):
     """
     Class A: dense occupancy against ``scipy.ndimage.binary_fill_holes``.
 
@@ -729,7 +729,7 @@ def test_fill_holes_matches_scipy(cave_cube, device: str):
     lower, extent = _bounds_of(grid)
     occupancy_np = _dense(grid, lower, extent)
 
-    filled = _dense(tw.voxels.fill_holes(grid), lower, extent)
+    filled = _dense(tw.voxels.fill_cavities(grid), lower, extent)
     reference = ndi.binary_fill_holes(occupancy_np)
     assert reference.sum() > occupancy_np.sum()
     assert np.array_equal(filled, reference)
@@ -1021,7 +1021,7 @@ def test_every_entry_point_survives_an_empty_input(device: str):
         assert int(tw.voxels.dilate(grid).get_active_stats().voxel_count) == 0
         assert int(tw.voxels.erode(grid).get_active_stats().voxel_count) == 0
         assert int(tw.voxels.surface_voxels(grid).get_active_stats().voxel_count) == 0
-        assert int(tw.voxels.fill_holes(grid).get_active_stats().voxel_count) == 0
+        assert int(tw.voxels.fill_cavities(grid).get_active_stats().voxel_count) == 0
         assert int(tw.voxels.fill_orthographic(grid).get_active_stats().voxel_count) == 0
         assert int(tw.voxels.pool_by_voxel(grid, no_points, no_points).shape[0]) == 0
         assert int(tw.voxels.voxel_corners(grid)[0].shape[0]) == 0
