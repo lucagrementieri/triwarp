@@ -680,7 +680,7 @@ def test_make_winding_consistent_matches_igl(icosahedron: tuple[tm.Trimesh, wp.M
     reversed triangle.
 
     ``bfs_orient``'s second return is the per-face **component id**, not a flip mask -- the trap
-    recorded in ``tests/test_validation.py::test_face_orientation_mask_matches_igl``. Here it is
+    recorded in ``tests/test_validation.py::test_face_flip_mask_matches_igl``. Here it is
     asserted to be single-valued, which is what makes "no global sign fix" a claim about the
     anchoring rather than a coincidence of this fixture.
     """

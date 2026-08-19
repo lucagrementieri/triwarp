@@ -786,7 +786,7 @@ def test_is_orientable_closed_non_orientable(boy_surface: tuple[tm.Trimesh, wp.M
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)
-def test_face_orientation_mask_all_false_on_consistent(
+def test_face_flip_mask_all_false_on_consistent(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     """
@@ -797,7 +797,7 @@ def test_face_orientation_mask_all_false_on_consistent(
     orientable fixtures.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    mask_wp = tw.validation.face_orientation_mask(mesh_wp.indices)
+    mask_wp = tw.validation.face_flip_mask(mesh_wp.indices)
     assert int(mask_wp.shape[0]) == mesh_tm.faces.shape[0]
     # Fixtures are consistently wound, so no face needs flipping.
     assert bool(tw.reduce.any(mask_wp)) is False
@@ -817,7 +817,7 @@ def _triangle_ribbon(n_quads: int) -> tuple[np.ndarray, np.ndarray]:
 
 
 @pytest.mark.parity("face_orientation_bits", "igl")
-def test_face_orientation_mask_matches_igl(device: str) -> None:
+def test_face_flip_mask_matches_igl(device: str) -> None:
     """
     Class B: igl's flip mask is *derived* from its reoriented face table, not returned.
 
@@ -848,7 +848,7 @@ def test_face_orientation_mask_matches_igl(device: str) -> None:
     assert bool((unchanged_igl | reversed_igl).all()), "a row is neither kept nor reversed"
     assert np.unique(components_igl).shape[0] == 1, "the ribbon is one component"
 
-    mask_wp = tw.validation.face_orientation_mask(faces_wp).numpy()
+    mask_wp = tw.validation.face_flip_mask(faces_wp).numpy()
     repaired_np = tw.repair.make_winding_consistent(faces_wp).numpy().reshape(-1, 3)
 
     assert np.array_equal(mask_wp, ~unchanged_igl)
@@ -856,7 +856,7 @@ def test_face_orientation_mask_matches_igl(device: str) -> None:
 
 
 @pytest.mark.parity("face_orientation_bits", "trimesh")
-def test_face_orientation_mask_long_path(device: str) -> None:
+def test_face_flip_mask_long_path(device: str) -> None:
     """
     A ribbon whose face-adjacency graph is a path of 8 192 nodes.
 
@@ -883,7 +883,7 @@ def test_face_orientation_mask_long_path(device: str) -> None:
 
     assert tw.validation.is_orientable(faces_wp) is True
     bits_wp, _signed_edges_wp, _signs_wp, _m = tw.validation.face_orientation_bits(faces_wp)
-    mask_np = tw.validation.face_orientation_mask(faces_wp).numpy()
+    mask_np = tw.validation.face_flip_mask(faces_wp).numpy()
     assert np.array_equal(mask_np, bits_wp.numpy().astype(bool))
     assert bool(mask_np[0]) is False
     assert np.array_equal(mask_np, scrambled_np != scrambled_np[0])
@@ -1185,7 +1185,7 @@ def test_new_masks_empty_mesh(device: str) -> None:
     assert tw.validation.edge_winding_consistent_mask(faces_wp).shape[0] == 0
     assert tw.validation.face_self_intersecting_mask(vertices_wp, faces_wp).shape[0] == 0
     assert tw.validation.face_watertight_mask(faces_wp).shape[0] == 0
-    assert tw.validation.face_orientation_mask(faces_wp).shape[0] == 0
+    assert tw.validation.face_flip_mask(faces_wp).shape[0] == 0
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)

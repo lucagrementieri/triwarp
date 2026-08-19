@@ -558,7 +558,7 @@ def edge_winding_consistent_mask(
     See Also
     --------
     [`is_winding_consistent`][triwarp.validation.is_winding_consistent]
-    [`face_orientation_mask`][triwarp.validation.face_orientation_mask]
+    [`face_flip_mask`][triwarp.validation.face_flip_mask]
     """
     n_faces = int(faces.shape[0]) // 3
     device = faces.device
@@ -593,14 +593,14 @@ def face_orientation_bits(
 
     ``orient[f]`` is ``0`` for a face that agrees with its connected component's seed and ``1`` for
     a face that must be flipped to agree — the flip mask consumed by
-    [`face_orientation_mask`][triwarp.validation.face_orientation_mask] and
+    [`face_flip_mask`][triwarp.validation.face_flip_mask] and
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]. ``m`` is the number of
     face-adjacency rows; when ``m == 0`` the returned ``signed_edges`` / ``signs`` are empty.
     Assumes ``n_faces > 0`` (callers guard).
 
     This is a lower-level primitive (the underlying orientation engine behind
     [`is_orientable`][triwarp.validation.is_orientable] and
-    [`face_orientation_mask`][triwarp.validation.face_orientation_mask]) exposed for callers that
+    [`face_flip_mask`][triwarp.validation.face_flip_mask]) exposed for callers that
     need the raw flip bits together with the propagation edges, such as
     [`triwarp.repair.make_winding_consistent`][triwarp.repair.make_winding_consistent].
 
@@ -630,7 +630,7 @@ def face_orientation_bits(
     See Also
     --------
     [`is_orientable`][triwarp.validation.is_orientable]
-    [`face_orientation_mask`][triwarp.validation.face_orientation_mask]
+    [`face_flip_mask`][triwarp.validation.face_flip_mask]
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
@@ -688,7 +688,7 @@ def is_orientable(faces: wp.array[wp.int32]) -> bool:
 
     See Also
     --------
-    [`face_orientation_mask`][triwarp.validation.face_orientation_mask]
+    [`face_flip_mask`][triwarp.validation.face_flip_mask]
     [`is_watertight`][triwarp.validation.is_watertight]
     [`is_winding_consistent`][triwarp.validation.is_winding_consistent]
 
@@ -718,7 +718,7 @@ def is_orientable(faces: wp.array[wp.int32]) -> bool:
     return conflict.numpy().item() == 0
 
 
-def face_orientation_mask(faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
+def face_flip_mask(faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
     """
     Per-face flag: whether a face must be flipped to make winding consistent within its patch.
 
@@ -744,11 +744,18 @@ def face_orientation_mask(faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
     [`is_orientable`][triwarp.validation.is_orientable]
     [`is_winding_consistent`][triwarp.validation.is_winding_consistent]
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
+    [`flipped_faces_mask`][triwarp.parametrization.flipped_faces_mask]
 
     Notes
     -----
     The reference orientation is arbitrary per connected component, so on a non-orientable patch the
     mask is still a best-effort flood-fill (matching ``trimesh.repair.fix_winding``).
+
+    This is a different flip from
+    [`flipped_faces_mask`][triwarp.parametrization.flipped_faces_mask], which is about the *UV
+    domain*: this mask flags a triangle whose index order must be reversed to agree with its patch,
+    a property of the 3D connectivity that ignores geometry entirely, while that one flags a
+    triangle whose UV image has negative signed area. Neither implies the other.
     """
     n_faces = int(faces.shape[0]) // 3
     device = faces.device

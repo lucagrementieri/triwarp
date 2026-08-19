@@ -10,7 +10,7 @@ import triwarp as tw
 from tests.conversions import mesh_igl, numpy_to_warp_uv
 
 
-def _flipped_faces_np(vertices_np: np.ndarray, faces_np: np.ndarray) -> np.ndarray:
+def _flipped_face_indices_np(vertices_np: np.ndarray, faces_np: np.ndarray) -> np.ndarray:
     """NumPy reference for libigl ``flipped_triangles``: 2D signed area strictly negative."""
     tri = vertices_np[faces_np]  # (n_faces, 3, 2)
     e0 = tri[:, 1] - tri[:, 0]
@@ -40,8 +40,8 @@ def test_flipped_faces_random_mixed(device):
         tw.parametrization.flipped_faces_mask(vertices_wp, faces_wp).numpy(), mask_np
     )
     assert np.array_equal(
-        tw.parametrization.flipped_faces(vertices_wp, faces_wp).numpy(),
-        _flipped_faces_np(vertices_np, faces_np),
+        tw.parametrization.flipped_face_indices(vertices_wp, faces_wp).numpy(),
+        _flipped_face_indices_np(vertices_np, faces_np),
     )
 
 
@@ -52,7 +52,7 @@ def test_flipped_faces_mask_index_consistency(device):
 
     mask_wp = tw.parametrization.flipped_faces_mask(vertices_wp, faces_wp)
     assert np.array_equal(
-        tw.parametrization.flipped_faces(vertices_wp, faces_wp).numpy(),
+        tw.parametrization.flipped_face_indices(vertices_wp, faces_wp).numpy(),
         np.flatnonzero(mask_wp.numpy()),
     )
 
@@ -62,14 +62,14 @@ def test_flipped_faces_all_and_none(device):
     ccw_np = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
     faces_np = np.array([[0, 1, 2]], dtype=np.int64)
     vertices_wp, faces_wp = numpy_to_warp_uv(ccw_np, faces_np, device)
-    assert tw.parametrization.flipped_faces(vertices_wp, faces_wp).numpy().size == 0
+    assert tw.parametrization.flipped_face_indices(vertices_wp, faces_wp).numpy().size == 0
     assert not tw.parametrization.flipped_faces_mask(vertices_wp, faces_wp).numpy().any()
 
     # Reverse the winding of every triangle: all flipped.
     cw_faces_np = faces_np[:, ::-1].copy()
     vertices_wp, cw_faces_wp = numpy_to_warp_uv(ccw_np, cw_faces_np, device)
     assert np.array_equal(
-        tw.parametrization.flipped_faces(vertices_wp, cw_faces_wp).numpy(),
+        tw.parametrization.flipped_face_indices(vertices_wp, cw_faces_wp).numpy(),
         np.arange(cw_faces_np.shape[0], dtype=np.int64),
     )
     assert tw.parametrization.flipped_faces_mask(vertices_wp, cw_faces_wp).numpy().all()
@@ -81,14 +81,14 @@ def test_flipped_faces_degenerate_not_flagged(device):
     faces_np = np.array([[0, 1, 2]], dtype=np.int64)
     vertices_wp, faces_wp = numpy_to_warp_uv(collinear_np, faces_np, device)
     assert not tw.parametrization.flipped_faces_mask(vertices_wp, faces_wp).numpy().any()
-    assert tw.parametrization.flipped_faces(vertices_wp, faces_wp).numpy().size == 0
+    assert tw.parametrization.flipped_face_indices(vertices_wp, faces_wp).numpy().size == 0
 
 
 def test_flipped_faces_empty_mesh(device):
     vertices_wp = wp.empty(0, dtype=wp.vec2, device=device)
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
     assert tw.parametrization.flipped_faces_mask(vertices_wp, faces_wp).numpy().size == 0
-    assert tw.parametrization.flipped_faces(vertices_wp, faces_wp).numpy().size == 0
+    assert tw.parametrization.flipped_face_indices(vertices_wp, faces_wp).numpy().size == 0
 
 
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
@@ -256,7 +256,7 @@ def test_tutte_disk_is_fold_free(device, hemisphere):
     boundary_wp = tw.boundary.boundary_loop(mesh_wp.points, mesh_wp.indices)
     boundary_uv_wp = tw.parametrization.map_vertices_to_circle(mesh_wp.points, boundary_wp)
     uv_wp = tw.parametrization.tutte(mesh_wp.points, mesh_wp.indices, boundary_wp, boundary_uv_wp)
-    assert tw.parametrization.flipped_faces(uv_wp, mesh_wp.indices).numpy().size == 0
+    assert tw.parametrization.flipped_face_indices(uv_wp, mesh_wp.indices).numpy().size == 0
 
 
 @pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
@@ -324,7 +324,7 @@ def test_lscm_is_fold_free(device, hemisphere):
         np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float32), dtype=wp.vec2, device=mesh_wp.device
     )
     uv_wp = tw.parametrization.lscm(mesh_wp.points, mesh_wp.indices, pins_wp, pins_uv_wp)
-    assert tw.parametrization.flipped_faces(uv_wp, mesh_wp.indices).numpy().size == 0
+    assert tw.parametrization.flipped_face_indices(uv_wp, mesh_wp.indices).numpy().size == 0
 
 
 @pytest.mark.parametrize("n_pins", [0, 1])

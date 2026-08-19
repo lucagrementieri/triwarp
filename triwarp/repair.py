@@ -611,7 +611,7 @@ def make_winding_consistent(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
     Flip faces so every shared edge is traversed in opposite directions by its two faces.
 
     Reuses the orientation flood-fill of
-    [`face_orientation_mask`][triwarp.validation.face_orientation_mask] (one arbitrary seed
+    [`face_flip_mask`][triwarp.validation.face_flip_mask] (one arbitrary seed
     face per connected component) and reverses the winding of every face whose orientation bit is
     set. The result satisfies
     [`is_winding_consistent`][triwarp.validation.is_winding_consistent] **whenever one exists**,
@@ -632,7 +632,7 @@ def make_winding_consistent(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
     See Also
     --------
     [`is_winding_consistent`][triwarp.validation.is_winding_consistent]
-    [`face_orientation_mask`][triwarp.validation.face_orientation_mask]
+    [`face_flip_mask`][triwarp.validation.face_flip_mask]
     [`make_normals_outward`][triwarp.repair.make_normals_outward]
 
     Notes

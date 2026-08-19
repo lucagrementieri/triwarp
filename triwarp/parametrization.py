@@ -12,9 +12,9 @@ own shape, minimizing conformal rather than Dirichlet energy.
 
 [`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle] supplies the boundary
 condition the fixed-boundary three need, and
-[`flipped_faces`][triwarp.parametrization.flipped_faces] is the diagnostic that says whether a
-result is actually injective. Ports of the corresponding ``igl::`` routines; every solve is
-conjugate-gradient.
+[`flipped_face_indices`][triwarp.parametrization.flipped_face_indices] is the diagnostic that
+says whether a result is actually injective. Ports of the corresponding ``igl::`` routines; every
+solve is conjugate-gradient.
 """
 
 from __future__ import annotations
@@ -40,7 +40,8 @@ def flipped_faces_mask(vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]) -
     orientation) in the 2D domain. Mirrors libigl's ``flipped_triangles`` per-triangle test
     (determinant of the homogeneous ``3 x 3`` vertex matrix ``< 0``). Degenerate (zero-area)
     triangles are **not** flagged, matching the strict ``< 0`` comparison.
-    [`flipped_faces`][triwarp.parametrization.flipped_faces] is the index form of this mask.
+    [`flipped_face_indices`][triwarp.parametrization.flipped_face_indices] is the index form of
+    this mask.
 
     Parameters
     ----------
@@ -56,13 +57,21 @@ def flipped_faces_mask(vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]) -
 
     See Also
     --------
-    [`flipped_faces`][triwarp.parametrization.flipped_faces]
+    [`flipped_face_indices`][triwarp.parametrization.flipped_face_indices]
+    [`face_flip_mask`][triwarp.validation.face_flip_mask]
 
     Notes
     -----
     Equivalent to the per-triangle predicate behind libigl ``flipped_triangles``: the 2D cross
     product ``(v1 - v0) x (v2 - v0)`` equals ``det([[x0, x1, x2], [y0, y1, y2], [1, 1, 1]])``, so a
     ``True`` entry corresponds exactly to a triangle libigl would list as flipped.
+
+    This is a different flip from
+    [`face_flip_mask`][triwarp.validation.face_flip_mask], which is about the *3D winding*: this
+    mask flags a triangle whose UV image has folded over, a property of the parametrization that
+    says nothing about the surface, while that one flags a triangle whose index order must be
+    reversed to agree with its patch. A mesh can be consistently wound and still have flipped UVs,
+    and vice versa.
     """
     device = vertices.device
     n_faces = int(faces.shape[0]) // 3
@@ -79,7 +88,9 @@ def flipped_faces_mask(vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]) -
     return out_mask
 
 
-def flipped_faces(vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
+def flipped_face_indices(
+    vertices: wp.array[wp.vec2], faces: wp.array[wp.int32]
+) -> wp.array[wp.int32]:
     """
     Return the indices of triangles inverted (negative 2D signed area) in the parametrization.
 
@@ -394,7 +405,8 @@ def arap(
     [`harmonic`][triwarp.parametrization.harmonic] or [`tutte`][triwarp.parametrization.tutte], with
     the boundary placed by
     [`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle]. Inspect the result
-    for inverted triangles with [`flipped_faces`][triwarp.parametrization.flipped_faces].
+    for inverted triangles with
+    [`flipped_face_indices`][triwarp.parametrization.flipped_face_indices].
 
     Parameters
     ----------
@@ -438,7 +450,7 @@ def arap(
     [`harmonic`][triwarp.parametrization.harmonic]
     [`tutte`][triwarp.parametrization.tutte]
     [`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle]
-    [`flipped_faces`][triwarp.parametrization.flipped_faces]
+    [`flipped_face_indices`][triwarp.parametrization.flipped_face_indices]
     [`cotmatrix_entries`][triwarp.laplacian.cotmatrix_entries]
 
     Notes
@@ -678,7 +690,7 @@ def lscm(
     [`lscm_hessian`][triwarp.energies.lscm_hessian]
     [`vector_area_matrix`][triwarp.energies.vector_area_matrix]
     [`harmonic`][triwarp.parametrization.harmonic]
-    [`flipped_faces`][triwarp.parametrization.flipped_faces]
+    [`flipped_face_indices`][triwarp.parametrization.flipped_face_indices]
 
     Notes
     -----
