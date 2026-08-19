@@ -7,9 +7,11 @@ advancing front, every wave pivots a conflict-free independent set of front edge
 commits them through a two-phase vertex claim (``wp.atomic_min`` priority on all three vertices),
 so at least the globally-lowest-priority triangle always commits and the loop cannot livelock.
 
-The priority is ``proposal_key``, a packing of the proposal's own source edge, which is what makes
-a run **reproducible**: *which* triangles get committed no longer depends on the order threads
-reach an atomic, only the order they are written down in does (see below). See
+The priority is ``proposal_key``, a packing of the proposal's own source edge with a salt drawn from
+the wave counter, which is what makes a run **reproducible**: *which* triangles get committed no
+longer depends on the order threads reach an atomic, only the order they are written down in does
+(see below). The salt is what keeps that from also being *slow* -- a key fixed for the whole run
+starves the same front edges wave after wave, which measured 2.2x the waves. See
 that function for why the key is unique within a wave, and ``commit_triangles`` for the one other
 place arrival order used to leak in (the triangle-budget check). Measured on an irregularly sampled
 torus, four runs of one build now commit the same 3 269 triangles with the same winding, where
@@ -597,7 +599,16 @@ def pivot_front_edges(
 
 
 @wp.func
-def proposal_key(a: wp.int32, b: wp.int32) -> wp.uint64:
+def wave_salt(wave: wp.int32) -> wp.int32:
+    # Per-wave permutation seed for ``proposal_key``. Knuth's multiplicative hash, so consecutive
+    # wave numbers give unrelated salts rather than salts differing in one bit, masked to 31 bits so
+    # xoring it into a non-negative point index cannot set the sign bit -- which is what keeps the
+    # packed key under 2^63 and clear of the unclaimed sentinel.
+    return wp.int32((wp.uint32(wave) * wp.uint32(2654435761)) & wp.uint32(0x7FFFFFFF))
+
+
+@wp.func
+def proposal_key(a: wp.int32, b: wp.int32, salt: wp.int32) -> wp.uint64:
     # Priority of a proposed triangle, and the whole reason a run is reproducible: it is derived
     # from the proposal's own vertices, not from the order it reached ``propose_triangle``. The
     # slot that call hands out comes from a ``wp.atomic_add``, so it is the arrival order of a
@@ -617,13 +628,28 @@ def proposal_key(a: wp.int32, b: wp.int32) -> wp.uint64:
     #   the smaller of its pair and distinct seeds give distinct pairs;
     # * the two never share a wave -- ``pivot_front_edges`` proposes nothing while ``CNT_SEEDING``.
     #
+    # ``salt`` rotates that order **per wave**, and it is what keeps the ordering from being global.
+    # An order fixed for the whole run starves a high-key front edge: it loses every contested
+    # vertex it ever enters, is retried, and loses again, so a wave commits a smaller independent
+    # set than a per-wave order gives. Measured over three trees in one session, worktree A/B on
+    # ``bunny_decimated`` / ``bunny``: the arrival-order predecessor ran 80 / 152 waves, a globally
+    # fixed key 208 / 304, and this salted key 96 / 176 -- 1.70x / 1.35x of wall clock recovered
+    # against the fixed key, at an unchanged face count. Salting gives none of that back to the
+    # scheduler: the salt is a function of ``CNT_WAVE``, device state the wave loop advances
+    # deterministically, so a run remains reproducible call to call.
+    #
+    # Xoring both halves preserves the injectivity the total order needs: ``{a, b}`` is recoverable
+    # from ``(min ^ salt, max ^ salt)``, so distinct source edges still give distinct keys within a
+    # wave. The salt is masked to 31 bits precisely so this cannot break the bound below.
+    #
     # A bit pack rather than ``pack_edge_key``'s ``lo + hi * base``, so that neither kernel
     # computing it has to carry the point count as an argument and so it cannot overflow: point
-    # indices are ``int32``, so the key stays under 2^63 and well below the unclaimed sentinel.
+    # indices are ``int32`` and the salt cannot set their sign bit, so the key stays under 2^63 and
+    # well below the unclaimed sentinel.
     # Spelled as a multiply because that is the same operation on ``uint64`` as a 32-bit shift and
     # reads as the pack it is.
-    lo = wp.uint64(wp.uint32(wp.min(a, b)))
-    hi = wp.uint64(wp.uint32(wp.max(a, b)))
+    lo = wp.uint64(wp.uint32(wp.min(a, b) ^ salt))
+    hi = wp.uint64(wp.uint32(wp.max(a, b) ^ salt))
     return hi * wp.uint64(4294967296) + lo
 
 
@@ -643,8 +669,11 @@ def claim_triangle_vertices(
     # ``propose_triangle`` increments the counter past the capacity before dropping, so the count
     # is not a safe bound on the list it indexes.
     proposals = wp.min(counters[CNT_PROPOSAL], proposal_capacity)
+    # Same wave index, and so the same salt, as ``commit_triangles`` reads: ``end_wave`` is what
+    # advances ``CNT_WAVE`` and it runs after both.
+    salt = wave_salt(counters[CNT_WAVE])
     for t in range(wp.int32(wp.tid()), proposals, grid_stride):
-        key = proposal_key(tri_a[t], tri_b[t])
+        key = proposal_key(tri_a[t], tri_b[t], salt)
         wp.atomic_min(out_owner, tri_a[t], key)
         wp.atomic_min(out_owner, tri_b[t], key)
         wp.atomic_min(out_owner, tri_c[t], key)
@@ -722,11 +751,12 @@ def commit_triangles(
     if counters[CNT_PREV_FACE] + proposals > max_faces:
         counters[CNT_GROW] = 1
         return
+    salt = wave_salt(counters[CNT_WAVE])
     for t in range(wp.int32(wp.tid()), proposals, grid_stride):
         a = tri_a[t]
         b = tri_b[t]
         c = tri_c[t]
-        key = proposal_key(a, b)
+        key = proposal_key(a, b, salt)
         if owner[a] != key or owner[b] != key or owner[c] != key:
             continue
         slot = wp.atomic_add(counters, CNT_FACE, 1)

@@ -1228,8 +1228,10 @@ def ball_pivoting(
 
     The triangulation is **reproducible**: repeated runs on one device and build return the same
     set of triangles, because a wave resolves competing proposals by a key packed from their own
-    vertices rather than by the order they reached an atomic counter. Two caveats on how far that
-    reaches, both measured rather than assumed:
+    vertices and the wave counter rather than by the order they reached an atomic counter — device
+    state the loop advances deterministically, so the ordering varies between waves (which keeps a
+    front edge from being starved by a globally fixed key) without varying between runs. Two caveats
+    on how far that reaches, both measured rather than assumed:
 
     * the face buffer's *row order* is not pinned — ``commit_triangles`` appends with a
       ``wp.atomic_add`` — so compare reconstructions as a set of triangles, not buffer-to-buffer;
