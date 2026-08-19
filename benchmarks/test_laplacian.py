@@ -21,7 +21,7 @@ triwarp implements). **trimesh** is the reference for the umbrella operator —
 ``trimesh.smoothing.laplacian_calculation`` builds exactly the row-normalized 1-ring averaging
 matrix ``laplacian`` returns, for both ``equal_weight`` settings.
 
-``uniform_laplacian`` has no reference: libigl builds ``A - diag(rowsum(A))`` inline inside
+``graph_laplacian`` has no reference: libigl builds ``A - diag(rowsum(A))`` inline inside
 ``igl::harmonic`` rather than exposing it, and reassembling it here out of ``igl.adjacency_matrix``
 plus scipy would time a hand-rolled composition rather than a library function. It is timed for
 triwarp alone.
@@ -161,9 +161,9 @@ def test_connection_laplacian(bench_case: BenchCase) -> None:
     assert matrix.nrow == bench_case.n_vertices
 
 
-@pytest.mark.benchmark(group="laplacian_uniform")
+@pytest.mark.benchmark(group="laplacian_equal_weight")
 @pytest.mark.benchlibs("triwarp", "trimesh")
-def test_laplacian_uniform(bench_case: BenchCase) -> None:
+def test_laplacian_equal_weight(bench_case: BenchCase) -> None:
     """Row-normalized 1-ring averaging operator with unit weights."""
     n_vertices = bench_case.n_vertices
     if bench_case.kind == "triwarp":
@@ -199,12 +199,12 @@ def test_laplacian_inverse_distance(bench_case: BenchCase) -> None:
         assert matrix_tm.shape == (n_vertices, n_vertices)
 
 
-@pytest.mark.benchmark(group="uniform_laplacian")
+@pytest.mark.benchmark(group="graph_laplacian")
 @pytest.mark.benchlibs("triwarp")
-def test_uniform_laplacian(bench_case: BenchCase) -> None:
+def test_graph_laplacian(bench_case: BenchCase) -> None:
     """Combinatorial graph Laplacian ``A - diag(deg)`` (no library exposes an equivalent)."""
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-    matrix = bench_case.run(lambda: tw.laplacian.uniform_laplacian(vertices, faces))
+    matrix = bench_case.run(lambda: tw.laplacian.graph_laplacian(vertices, faces))
     assert matrix.nrow == bench_case.n_vertices
 
 

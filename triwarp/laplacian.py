@@ -648,7 +648,7 @@ def laplacian(
     return operator
 
 
-def uniform_laplacian(
+def graph_laplacian(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], dtype: type = wp.float32
 ) -> wps.BsrMatrix[wp.float32]:
     """

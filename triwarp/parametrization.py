@@ -26,7 +26,7 @@ import triwarp as tw
 import triwarp.linalg as twl
 import triwarp.typing as twt
 from triwarp.kernels import parametrization as kernel_parametrization
-from triwarp.laplacian import cotmatrix, cotmatrix_entries, mass_matrix_entries, uniform_laplacian
+from triwarp.laplacian import cotmatrix, cotmatrix_entries, graph_laplacian, mass_matrix_entries
 
 _CG_TOLERANCE = 1e-8
 
@@ -271,7 +271,7 @@ def tutte(
     Tutte embedding with fixed boundary (uniform-Laplacian parametrization).
 
     Identical to [`harmonic`][triwarp.parametrization.harmonic] except the operator is the
-    combinatorial [`uniform_laplacian`][triwarp.laplacian.uniform_laplacian] instead of the
+    combinatorial [`graph_laplacian`][triwarp.laplacian.graph_laplacian] instead of the
     cotangent one — for ``k == 1`` that Laplacian is the *only* difference. Because the uniform
     Laplacian's free-free block is a diagonally dominant M-matrix, the Tutte embedding of a mesh
     with a convex boundary is guaranteed bijective (fold-free), unlike the harmonic/conformal maps.
@@ -307,7 +307,7 @@ def tutte(
     See Also
     --------
     [`harmonic`][triwarp.parametrization.harmonic]
-    [`uniform_laplacian`][triwarp.laplacian.uniform_laplacian]
+    [`graph_laplacian`][triwarp.laplacian.graph_laplacian]
     [`map_vertices_to_circle`][triwarp.parametrization.map_vertices_to_circle]
     """
     if k < 1:
@@ -316,7 +316,7 @@ def tutte(
     n_vertices = int(vertices.shape[0])
     if n_vertices == 0:
         return wp.empty(0, dtype=wp.vec2, device=device)
-    laplacian = uniform_laplacian(vertices, faces, dtype=wp.float64)
+    laplacian = graph_laplacian(vertices, faces, dtype=wp.float64)
     return _solve_fixed_boundary(
         laplacian, None, k, n_vertices, boundary_indices, boundary_uv, device
     )

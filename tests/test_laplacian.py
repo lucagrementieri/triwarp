@@ -796,13 +796,13 @@ def test_laplacian_entries_assemble_into_the_laplacian(
 
 
 # -----------------------------------------------------------------------------------------
-# laplacian / uniform_laplacian
+# laplacian / graph_laplacian
 # -----------------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus", "hemisphere"])
 @pytest.mark.parametrize("equal_weight", [True, False])
-@pytest.mark.parity("laplacian_uniform", "trimesh")
+@pytest.mark.parity("laplacian_equal_weight", "trimesh")
 @pytest.mark.parity("laplacian_inverse_distance", "trimesh")
 def test_laplacian_operator(
     request: pytest.FixtureRequest, mesh_name: str, equal_weight: bool
@@ -930,7 +930,7 @@ def test_operators_float64_match_float32(request: pytest.FixtureRequest, mesh_na
     builders = [
         tw.laplacian.cotmatrix,
         tw.laplacian.laplacian,
-        tw.laplacian.uniform_laplacian,
+        tw.laplacian.graph_laplacian,
         tw.laplacian.mass_matrix,
     ]
     for builder in builders:

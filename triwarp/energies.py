@@ -83,7 +83,7 @@ def k_harmonic(
     laplacian
         Square 1x1-block BSR Laplacian in igl's sign convention (negative diagonal, each row
         summing to zero), e.g. from [`cotmatrix`][triwarp.laplacian.cotmatrix] or
-        [`uniform_laplacian`][triwarp.laplacian.uniform_laplacian].
+        [`graph_laplacian`][triwarp.laplacian.graph_laplacian].
     mass
         Length-``n_vertices`` lumped mass diagonal, e.g. from
         [`mass_matrix_entries`][triwarp.laplacian.mass_matrix_entries]; cast to the Laplacian's

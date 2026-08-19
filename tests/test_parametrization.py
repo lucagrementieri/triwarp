@@ -107,9 +107,9 @@ def test_map_vertices_to_circle_matches_igl(request, device, mesh_name):
     assert np.allclose(circle_wp.numpy(), circle_igl, rtol=1e-5, atol=1e-5)
 
 
-def test_uniform_laplacian_matches_igl(device, hemisphere):
+def test_graph_laplacian_matches_igl(device, hemisphere):
     """
-    Class B: igl has no ``uniform_laplacian``, so the reference is assembled from its adjacency.
+    Class B: igl has no ``graph_laplacian``, so the reference is assembled from its adjacency.
 
     The named transform is ``A - diag(rowsum(A))`` over ``igl.adjacency_matrix``: the definition of
     the umbrella operator, built on the reference side. Note igl's adjacency is sized by
@@ -120,7 +120,7 @@ def test_uniform_laplacian_matches_igl(device, hemisphere):
     _, faces_np = mesh_igl(mesh_tm)
     n_vertices = int(mesh_wp.points.shape[0])
 
-    operator_wp = tw.laplacian.uniform_laplacian(mesh_wp.points, mesh_wp.indices)
+    operator_wp = tw.laplacian.graph_laplacian(mesh_wp.points, mesh_wp.indices)
     operator_dense = scipy.sparse.csr_matrix(
         (operator_wp.values.numpy(), operator_wp.columns.numpy(), operator_wp.offsets.numpy()),
         shape=(n_vertices, n_vertices),
@@ -220,7 +220,7 @@ def test_tutte_matches_igl_reference(request, device, mesh_name):
     Two named transforms, both on the reference side: assemble the uniform Laplacian from
     ``igl.adjacency_matrix`` and hand it to ``igl.min_quad_with_fixed`` under triwarp's own boundary
     constraints. That isolates the interior solve, which is the only part not already covered by
-    [`test_uniform_laplacian_matches_igl`] and [`test_map_vertices_to_circle_matches_igl`].
+    [`test_graph_laplacian_matches_igl`] and [`test_map_vertices_to_circle_matches_igl`].
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     _, faces_np = mesh_igl(mesh_tm)
