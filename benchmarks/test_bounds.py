@@ -6,13 +6,13 @@ a component-wise min/max over ``V`` has no topology and no parameters, so vertex
 story. ``oriented_bounding_box`` has a second axis of its own, the candidate count, and it is held
 *fixed* at ``_ROTATIONS`` here so the sweep still reads as a sweep; see that group's docstring.
 
-This module exists for one reason beyond coverage: ``aabb_bounds`` is on the hot path of *every*
+This module exists for one reason beyond coverage: ``aabb`` is on the hot path of *every*
 k-NN query (``neighbors.query_*`` calls it to size the hash grid), and it is the clearest example in
 the suite of a row that is **host-latency-bound at the small end and bandwidth-bound at the large
 end**. Below roughly ``10 ** 3`` vertices it reports the ~340 µs wrapper floor rather than the
 reduction (the same floor ``test_creation::test_box`` measures), so a NumPy ``min``/``max`` pair
 wins by orders of magnitude there and loses at ``lucy``. The row is here for the crossover; neither
-endpoint means anything on its own. That is also why ``bounds.aabb_bounds`` does not use the generic
+endpoint means anything on its own. That is also why ``bounds.aabb`` does not use the generic
 [`reduce.minmax`][triwarp.reduce.minmax] path -- it writes both corners into one six-element buffer
 so the host pays a single readback.
 
@@ -99,9 +99,9 @@ def _queries_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
     return _query_cache[key]
 
 
-@pytest.mark.benchmark(group="aabb_bounds")
+@pytest.mark.benchmark(group="aabb")
 @pytest.mark.benchlibs("triwarp", "trimesh", "open3d", "igl", "pyvista", "meshlib")
-def test_aabb_bounds(bench_case: BenchCase) -> None:
+def test_aabb(bench_case: BenchCase) -> None:
     """
     A min/max reduce over the vertices, and the suite's clearest host-latency floor.
 
@@ -126,7 +126,7 @@ def test_aabb_bounds(bench_case: BenchCase) -> None:
         return
     if bench_case.kind == "triwarp":
         vertices = bench_case.vertices_wp
-        lower, upper = bench_case.run(lambda: tw.bounds.aabb_bounds(vertices))
+        lower, upper = bench_case.run(lambda: tw.bounds.aabb(vertices))
         assert lower[0] <= upper[0]
     elif bench_case.kind == "trimesh":
         # what an uncached ``trimesh.Trimesh.bounds`` computes: numpy min/max per axis
@@ -151,7 +151,7 @@ def test_enclosing_diagonal(bench_case: BenchCase) -> None:
     """
     The default search radius every mesh query derives, over the mesh *and* the query points.
 
-    Two clouds rather than one, so against the ``aabb_bounds`` group above this is two box
+    Two clouds rather than one, so against the ``aabb`` group above this is two box
     reductions and therefore two host readbacks; the row answers whether the default costs twice
     the single-cloud reduction or whether the second readback disappears into the first launch's
     latency. Every ``max_dist=None`` call in ``proximity``, ``ray``,

@@ -246,7 +246,7 @@ set automatically. Pass your own `--benchmark-group-by=...` to override.
   each now says so in its own docstring rather than reading as a defect: the `creation` revolution
   primitives and Platonic tables (`creation`'s module docstring covers them collectively),
   `icosphere` since its connectivity became closed-form, `vertices.n_vertices`,
-  `proximity.aabb_bounds`, `points.point_plane_distance` and `remesh.cluster_decimate` at
+  `bounds.aabb`, `points.point_plane_distance` and `remesh.cluster_decimate` at
   `bunny_decimated`. **Every one of them inverts further along its own axis** — `cluster_decimate`
   wins 76x at `dragon`, `n_vertices` 259x at `lucy` — so a floor row is a statement about the input
   size, not about the code, and optimizing one would mean removing allocations from correct code for
@@ -784,7 +784,7 @@ Two mechanics that differ from the other references:
 | `test_reduce` | `weighted_sum` (new group) | `integrate_data` |
 | `test_proximity` | `winding_number`, `signed_distance_on_mesh` | `select_interior_points`, `compute_implicit_distance` |
 | `test_heat_distance` | `heat_geodesic` | `geodesic_distance` (Dijkstra over edges — a bound, not the same quantity) |
-| `test_bounds` / `test_totals` | `aabb_bounds`, `enclosing_diagonal`, `oriented_bounding_box`, `moments` | `bounds`, `length`, `oriented_bounding_box` (PCA), `volume` |
+| `test_bounds` / `test_totals` | `aabb`, `enclosing_diagonal`, `oriented_bounding_box`, `moments` | `bounds`, `length`, `oriented_bounding_box` (PCA), `volume` |
 | `test_points` | `principal_axes`, `fit_plane`, `fit_line` (exempt) | `principal_axes`, `fit_plane_to_points`, `fit_line_to_points` |
 | `test_registration` | `icp_mesh` | `align(return_matrix=True)` |
 | `test_remesh` / `test_smoothing` | `quadric_decimate`, `filter_laplacian_integration` (exempt), `filter_taubin` (exempt) | `decimate`, `smooth`, `smooth_taubin` |
@@ -893,7 +893,7 @@ millisecond.
 | `test_repair` | `remove_duplicated_triangles`, `remove_duplicated_vertices`, `remove_unreferenced_vertices` |
 | `test_validation` | `is_watertight`, `is_edge_manifold` (same `allow_boundary_edges` switch), `is_vertex_manifold` (connectivity-based: agrees with triwarp exactly on edge-manifold input, passes vertices on a non-manifold edge that the fan definition fails) |
 | `test_vertices` | `compute_vertex_normals` |
-| `test_bounds` | `get_axis_aligned_bounding_box` (`aabb_bounds`), `get_minimal_oriented_bounding_box` (hull-based, trimesh's algorithm family — not the PCA `get_oriented_bounding_box`, which minimizes nothing) |
+| `test_bounds` | `get_axis_aligned_bounding_box` (`aabb`), `get_minimal_oriented_bounding_box` (hull-based, trimesh's algorithm family — not the PCA `get_oriented_bounding_box`, which minimizes nothing) |
 | `test_points` | `PointCloud.estimate_normals` (`KDTreeSearchParamKNN`), `remove_statistical_outlier`, `remove_radius_outlier` (**nondeterministic** — a shared `KDTreeFlann` across an OpenMP loop; three keep sets over eight reps, so the correctness comparison queries that tree serially instead), `remove_duplicated_points`, `farthest_point_down_sample` (its `SelectByIndex` sorts, so only the selected *set* is comparable) |
 | `test_distance` | `PointCloud.compute_point_cloud_distance` (the non-differentiable Chamfer / Hausdorff cases) |
 | `test_convex` | `compute_convex_hull` (exact qhull vs the approximate support sweep) |

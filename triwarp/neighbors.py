@@ -820,7 +820,7 @@ def knn_initial_radius(
         Number of neighbors the search will ask for; must be ``>= 1``.
     bounds
         Optional ``(min_bound, max_bound)`` from
-        [`aabb_bounds`][triwarp.bounds.aabb_bounds]. Pass it to reuse a reduction you already ran;
+        [`aabb`][triwarp.bounds.aabb]. Pass it to reuse a reduction you already ran;
         otherwise it is computed here (one device reduction plus one readback).
 
     Returns
@@ -835,14 +835,14 @@ def knn_initial_radius(
     --------
     [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest]
     [`query_hashgrid_nearest`][triwarp.neighbors.query_hashgrid_nearest]
-    [`aabb_bounds`][triwarp.bounds.aabb_bounds]
+    [`aabb`][triwarp.bounds.aabb]
     """
     n = int(points.shape[0])
     if n == 0 or k >= n:
         return math.inf
 
     if bounds is None:
-        bounds = tw.bounds.aabb_bounds(points)
+        bounds = tw.bounds.aabb(points)
     min_bound, max_bound = bounds
     extents = sorted((float(max_bound[axis] - min_bound[axis]) for axis in range(3)), reverse=True)
     if extents[0] <= 0.0:
@@ -961,7 +961,7 @@ def query_bvh_nearest(
         extra reduction — pass it explicitly to hoist that out of a loop as well.
     bounds
         Optional ``(min_bound, max_bound)`` of ``points`` from
-        [`aabb_bounds`][triwarp.bounds.aabb_bounds]. Together with ``bvh`` and ``initial_radius``
+        [`aabb`][triwarp.bounds.aabb]. Together with ``bvh`` and ``initial_radius``
         this removes every per-call host synchronisation, which is what makes a fixed target cloud
         free to re-query in a loop (see [`icp`][triwarp.registration.icp]).
 
@@ -1010,7 +1010,7 @@ def query_bvh_nearest(
         return _empty_nearest(m, k, single_query, device)
 
     if bounds is None:
-        bounds = tw.bounds.aabb_bounds(points)
+        bounds = tw.bounds.aabb(points)
     min_bound, max_bound = bounds
     if initial_radius is None:
         initial_radius = knn_initial_radius(points, k, bounds=bounds)
@@ -1138,7 +1138,7 @@ def query_hashgrid_nearest(
         only, never the result.
     bounds
         Optional ``(min_bound, max_bound)`` of ``points`` from
-        [`aabb_bounds`][triwarp.bounds.aabb_bounds]; pass it alongside ``grid`` and
+        [`aabb`][triwarp.bounds.aabb]; pass it alongside ``grid`` and
         ``initial_radius`` to make a repeated query on a fixed cloud synchronisation-free.
 
     Returns
@@ -1177,7 +1177,7 @@ def query_hashgrid_nearest(
         return _empty_nearest(m, k, single_query, device)
 
     if bounds is None:
-        bounds = tw.bounds.aabb_bounds(points)
+        bounds = tw.bounds.aabb(points)
     min_bound, max_bound = bounds
     if initial_radius is None:
         initial_radius = knn_initial_radius(points, k, bounds=bounds)

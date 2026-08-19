@@ -775,7 +775,7 @@ def _target_index(target_vertices: wp.array[wp.vec3]) -> _TargetIndex:
     a single launch with no host synchronisation at all — worth ~0.4 ms per iteration on a 36k
     cloud, which is the dominant remaining cost once the search radius itself is sane.
     """
-    bounds = tw.bounds.aabb_bounds(target_vertices)
+    bounds = tw.bounds.aabb(target_vertices)
     return {
         "bvh": tw.neighbors.bvh_from_points(target_vertices),
         "initial_radius": tw.neighbors.knn_initial_radius(target_vertices, 1, bounds=bounds),

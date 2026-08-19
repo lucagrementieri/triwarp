@@ -152,7 +152,7 @@ def voxelize_mesh(
         mesh. **Cost is cubic in the reciprocal.**
     origin
         World position of the lower corner of cell ``(0, 0, 0)``. Defaults to
-        ``aabb_bounds(vertices).min - 0.5 * voxel_size``, Open3D's half-voxel pad.
+        ``aabb(vertices).min - 0.5 * voxel_size``, Open3D's half-voxel pad.
     mode
         ``"surface"`` (default) keeps only the cells the surface passes through. ``"solid"`` fills
         the enclosed interior afterwards with [`fill_holes`][triwarp.voxels.fill_holes], which is
@@ -273,7 +273,7 @@ def voxelize_points(
         Cell width. Defaults to ``1 %`` of the cloud's bounding-box diagonal.
     origin
         World position of the lower corner of cell ``(0, 0, 0)``. Defaults to
-        ``aabb_bounds(points).min - 0.5 * voxel_size``.
+        ``aabb(points).min - 0.5 * voxel_size``.
 
     Returns
     -------
@@ -323,7 +323,7 @@ def voxel_down_sample(
         Cell width. Defaults to ``1 %`` of the cloud's bounding-box diagonal.
     origin
         World position of the lower corner of cell ``(0, 0, 0)``. Defaults to
-        ``aabb_bounds(points).min - 0.5 * voxel_size``.
+        ``aabb(points).min - 0.5 * voxel_size``.
     pooling
         How each voxel reduces the points inside it: ``"mean"`` (default), ``"sum"``, ``"min"`` or
         ``"max"`` (both component-wise).
@@ -635,7 +635,7 @@ def resolve_voxel_grid(
 
     Public because [`cluster_decimate`][triwarp.remesh.cluster_decimate] lives in another module and
     needs the same convention; it is pure host arithmetic over one
-    [`aabb_bounds`][triwarp.bounds.aabb_bounds].
+    [`aabb`][triwarp.bounds.aabb].
 
     Parameters
     ----------
@@ -669,7 +669,7 @@ def resolve_voxel_grid(
             lower = wp.vec3(0.0, 0.0, 0.0)
             diagonal = 1.0
         else:
-            lower, upper = tw.bounds.aabb_bounds(points)
+            lower, upper = tw.bounds.aabb(points)
             diagonal = float(wp.length(upper - lower))
         if voxel_size is None:
             voxel_size = 0.01 * diagonal

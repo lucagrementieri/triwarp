@@ -587,7 +587,7 @@ def hash_vector_rows(data: wp.array[wp.vec3], epsilon: float = 0.0) -> wp.array[
         # bounds also supply the radix, and doing it per component keeps that radix as small as the
         # widest single extent rather than the whole diagonal, which matters because the row packing
         # is only injective while ``radix ** 3`` fits a ``uint64``.
-        min_bound, max_bound = tw.bounds.aabb_bounds(data)
+        min_bound, max_bound = tw.bounds.aabb(data)
         rounded = twt.empty_2d((n, 3), wp.int32, device=data.device)
         wp.launch(
             kernel_grouping.round_vec3_scaled,

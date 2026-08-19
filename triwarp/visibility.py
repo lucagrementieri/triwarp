@@ -491,9 +491,9 @@ def max_tangent_sphere(
 
     # One reduction of ``mesh.points``, not two: ``max_t`` needs the box enclosing the mesh *and*
     # the queries, while the convergence threshold is a fraction of the mesh's own diagonal. Taking
-    # the mesh corners once and deriving both saves an ``aabb_bounds`` pass and its host sync.
-    mesh_lower, mesh_upper = tw.bounds.aabb_bounds(mesh.points)
-    query_lower, query_upper = tw.bounds.aabb_bounds(points)
+    # the mesh corners once and deriving both saves an ``aabb`` pass and its host sync.
+    mesh_lower, mesh_upper = tw.bounds.aabb(mesh.points)
+    query_lower, query_upper = tw.bounds.aabb(points)
     union_lower, union_upper = tw.bounds.aabb_union(
         mesh_lower, mesh_upper, query_lower, query_upper
     )

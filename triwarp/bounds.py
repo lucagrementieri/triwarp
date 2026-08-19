@@ -45,7 +45,7 @@ ITEMS_PER_CANDIDATE_SLICE = 256
 CONVEX_PREFILTER_MIN_POINTS = 100_000
 
 
-def aabb_bounds(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
+def aabb(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     """
     Axis-aligned bounding box of ``points`` (component-wise min / max).
 
@@ -98,7 +98,7 @@ def aabb_union(
 
     See Also
     --------
-    [`aabb_bounds`][triwarp.bounds.aabb_bounds]
+    [`aabb`][triwarp.bounds.aabb]
     [`enclosing_diagonal`][triwarp.bounds.enclosing_diagonal]
     """
     # ``wp.min`` / ``wp.max`` are component-wise on vectors and work at Python scope.
@@ -131,12 +131,12 @@ def enclosing_diagonal(points: wp.array[wp.vec3], other: wp.array[wp.vec3] | Non
 
     See Also
     --------
-    [`aabb_bounds`][triwarp.bounds.aabb_bounds]
+    [`aabb`][triwarp.bounds.aabb]
     [`aabb_union`][triwarp.bounds.aabb_union]
     """
-    lower, upper = aabb_bounds(points)
+    lower, upper = aabb(points)
     if other is not None and int(other.shape[0]) > 0:
-        other_lower, other_upper = aabb_bounds(other)
+        other_lower, other_upper = aabb(other)
         lower, upper = aabb_union(lower, upper, other_lower, other_upper)
     return float(wp.length(upper - lower))
 
@@ -159,7 +159,7 @@ def oriented_bounding_box(
     ball of perturbed frames whose angular radius starts at the global grid's covering radius and
     halves per round, keeping each chain's best. Refinement is monotone (each chain re-scores its
     own base), so the answer is never worse than the global phase's and never worse than
-    [`aabb_bounds`][triwarp.bounds.aabb_bounds]; with ``refine_iterations=0`` and ``rotations=1``
+    [`aabb`][triwarp.bounds.aabb]; with ``refine_iterations=0`` and ``rotations=1``
     it reproduces the axis-aligned box exactly.
 
     Cost is ``rotations * len(points)`` point transforms for the global phase plus
@@ -207,7 +207,7 @@ def oriented_bounding_box(
         ``{transpose(rotation) * q : min_bound <= q <= max_bound}`` and its side lengths are
         ``max_bound - min_bound``. For ``n == 0`` these are ``(+inf, …)`` and ``(-inf, …)`` and
         ``rotation`` is the identity, matching
-        [`aabb_bounds`][triwarp.bounds.aabb_bounds].
+        [`aabb`][triwarp.bounds.aabb].
 
     Raises
     ------
@@ -245,7 +245,7 @@ def oriented_bounding_box(
 
     See Also
     --------
-    [`aabb_bounds`][triwarp.bounds.aabb_bounds]
+    [`aabb`][triwarp.bounds.aabb]
     [`trimesh.bounds.oriented_bounds`][]
     ``igl.oriented_bounding_box``
     """

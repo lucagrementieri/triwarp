@@ -129,7 +129,7 @@ def minmax(
     A rank-1 ``wp.vec3`` array reduces component-wise to a ``(wp.vec3, wp.vec3)`` corner
     pair — one chunked kernel into a single six-slot buffer (the upper corner negated so
     one ``inf`` fill seeds both ends) and one readback, which is what keeps
-    [`aabb_bounds`][triwarp.bounds.aabb_bounds] host-latency-bound and nothing more.
+    [`aabb`][triwarp.bounds.aabb] host-latency-bound and nothing more.
 
     With ``axis=0`` or ``axis=1`` on a rank-2 input, reduces along that axis to a
     pair of 1D ``wp.array`` buffers (min, max) of the same dtype.
@@ -158,7 +158,7 @@ def minmax(
 
     See Also
     --------
-    [`aabb_bounds`][triwarp.bounds.aabb_bounds]
+    [`aabb`][triwarp.bounds.aabb]
         The mesh-facing spelling of the ``wp.vec3`` reduction, with the empty-input
         ``(+inf, -inf)`` convention instead of a raise.
     """

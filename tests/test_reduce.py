@@ -113,7 +113,7 @@ def test_minmax_2d(device: str, shape: tuple[int, int]) -> None:
 
 
 def test_minmax_vec3(device: str) -> None:
-    """Component-wise corner pair of a ``wp.vec3`` array (the ``aabb_bounds`` reduction)."""
+    """Component-wise corner pair of a ``wp.vec3`` array (the ``aabb`` reduction)."""
     rng = np.random.default_rng(42)
     points_np = rng.standard_normal((500, 3)).astype(np.float32)
     points_wp = wp.array(points_np, dtype=wp.vec3, device=device)

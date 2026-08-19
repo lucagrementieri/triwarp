@@ -539,7 +539,7 @@ def screened_poisson(
 
 def _poisson_cube(points: wp.array[wp.vec3], scale: float) -> tuple[wp.vec3, wp.vec3, float]:
     """Return the padded cubic reconstruction domain (lower, upper, side) around the cloud AABB."""
-    lo, hi = tw.bounds.aabb_bounds(points)
+    lo, hi = tw.bounds.aabb(points)
     center = 0.5 * (lo + hi)
     max_extent = max(float(hi[0] - lo[0]), float(hi[1] - lo[1]), float(hi[2] - lo[2]))
     if max_extent <= 0.0:
@@ -1104,7 +1104,7 @@ def resample_uniform(
     if n_faces == 0:
         return wp.clone(vertices), wp.clone(faces)
 
-    lower, upper = tw.bounds.aabb_bounds(vertices)
+    lower, upper = tw.bounds.aabb(vertices)
     diagonal = float(wp.length(upper - lower))
     if voxel_size is None:
         voxel_size = 0.01 * diagonal

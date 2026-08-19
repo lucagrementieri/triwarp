@@ -886,7 +886,7 @@ def test_to_field_round_trips_through_marching_cubes(sphere, cave_cube, device: 
 def test_grid_points_round_trips_through_marching_cubes(icosahedron, device: str):
     """Not a library comparison: the ``bounds`` handoff, sampling an SDF and re-extracting."""
     mesh_tm, mesh_wp = icosahedron
-    lower, upper = tw.bounds.aabb_bounds(mesh_wp.points)
+    lower, upper = tw.bounds.aabb(mesh_wp.points)
     pad = 0.1 * float(wp.length(upper - lower))
     bounds = (
         wp.vec3(*(lower[axis] - pad for axis in range(3))),

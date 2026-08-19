@@ -33,8 +33,8 @@ def _bounds_np(lower_wp: wp.vec3, upper_wp: wp.vec3) -> np.ndarray:
 
 
 @pytest.mark.parametrize("mesh_name", _MESHES)
-@pytest.mark.parity("aabb_bounds", "trimesh", "open3d", "igl", "meshlib")
-def test_aabb_bounds_matches_trimesh_open3d_and_igl(
+@pytest.mark.parity("aabb", "trimesh", "open3d", "igl", "meshlib")
+def test_aabb_matches_trimesh_open3d_and_igl(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     """
@@ -60,7 +60,7 @@ def test_aabb_bounds_matches_trimesh_open3d_and_igl(
     references every vertex, so the two coincide.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    lower_wp, upper_wp = tw.bounds.aabb_bounds(mesh_wp.points)
+    lower_wp, upper_wp = tw.bounds.aabb(mesh_wp.points)
     bounds_wp = _bounds_np(lower_wp, upper_wp)
 
     bounds_np = np.vstack((mesh_tm.vertices.min(axis=0), mesh_tm.vertices.max(axis=0)))
@@ -85,11 +85,9 @@ def test_aabb_bounds_matches_trimesh_open3d_and_igl(
 
 
 @pytest.mark.parametrize("mesh_name", _MESHES)
-@pytest.mark.parity("aabb_bounds", "pyvista")
+@pytest.mark.parity("aabb", "pyvista")
 @pytest.mark.parity("enclosing_diagonal", "pyvista")
-def test_aabb_bounds_and_diagonal_match_pyvista(
-    request: pytest.FixtureRequest, mesh_name: str
-) -> None:
+def test_aabb_and_diagonal_match_pyvista(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
     Class A on both, from the same VTK pair: ``DataSet.bounds`` and ``DataSet.length``.
 
@@ -105,7 +103,7 @@ def test_aabb_bounds_and_diagonal_match_pyvista(
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mesh_pv = trimesh_to_pyvista(mesh_tm)
 
-    lower_wp, upper_wp = tw.bounds.aabb_bounds(mesh_wp.points)
+    lower_wp, upper_wp = tw.bounds.aabb(mesh_wp.points)
     bounds_pv = np.asarray(mesh_pv.bounds).reshape(3, 2).T
     assert np.allclose(_bounds_np(lower_wp, upper_wp), bounds_pv, rtol=1e-5, atol=1e-5)
 
@@ -144,12 +142,12 @@ def test_enclosing_diagonal_single_cloud_matches_igl(
     assert diagonal_wp > float(extents_np.max()) * (1.0 + 1e-3)
 
 
-def test_aabb_bounds_single_point(device: str) -> None:
+def test_aabb_single_point(device: str) -> None:
     """One point is a degenerate box: both corners land on it and the diagonal is zero."""
     points_wp = wp.array(
         np.array([[1.5, -2.5, 3.5]], dtype=np.float32), dtype=wp.vec3, device=device
     )
-    lower_wp, upper_wp = tw.bounds.aabb_bounds(points_wp)
+    lower_wp, upper_wp = tw.bounds.aabb(points_wp)
 
     assert np.allclose(_bounds_np(lower_wp, upper_wp), [[1.5, -2.5, 3.5]] * 2, rtol=1e-6)
     assert tw.bounds.enclosing_diagonal(points_wp) == 0.0
@@ -183,12 +181,12 @@ def test_aabb_union_matches_a_pooled_reduction(device: str) -> None:
     cloud_b = rng.normal(size=(300, 3)).astype(np.float32) - 2.0
 
     boxes = [
-        tw.bounds.aabb_bounds(wp.array(np.ascontiguousarray(cloud), dtype=wp.vec3, device=device))
+        tw.bounds.aabb(wp.array(np.ascontiguousarray(cloud), dtype=wp.vec3, device=device))
         for cloud in (cloud_a, cloud_b)
     ]
     union_min, union_max = tw.bounds.aabb_union(*boxes[0], *boxes[1])
 
-    pooled_min, pooled_max = tw.bounds.aabb_bounds(
+    pooled_min, pooled_max = tw.bounds.aabb(
         wp.array(np.ascontiguousarray(np.vstack([cloud_a, cloud_b])), dtype=wp.vec3, device=device)
     )
     assert np.allclose(_bounds_np(union_min, union_max), _bounds_np(pooled_min, pooled_max))
@@ -524,7 +522,7 @@ def test_oriented_bounding_box_single_rotation_is_the_aabb(
     icosahedron: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:
     """
-    ``rotations=1`` scores only the identity, so it must reproduce ``aabb_bounds`` exactly.
+    ``rotations=1`` scores only the identity, so it must reproduce ``aabb`` exactly.
 
     The identity is deliberately the *last* candidate rather than the first, which is what makes
     this an edge case worth pinning: an off-by-one in the spiral's ``n - 1`` split would drop it and
@@ -538,7 +536,7 @@ def test_oriented_bounding_box_single_rotation_is_the_aabb(
 
     assert np.array_equal(_frame_np(rotation_wp), np.eye(3))
     assert np.array_equal(
-        _bounds_np(lower_wp, upper_wp), _bounds_np(*tw.bounds.aabb_bounds(mesh_wp.points))
+        _bounds_np(lower_wp, upper_wp), _bounds_np(*tw.bounds.aabb(mesh_wp.points))
     )
 
 
@@ -576,7 +574,7 @@ def test_oriented_bounding_box_never_loses_to_the_aabb(
     assert volumes == sorted(volumes, reverse=True)
     assert volumes[-1] < volumes[0] * 0.95, "the tilted cloud's box is materially tighter"
     assert np.isclose(
-        volumes[0], float(np.prod(np.ptp(_bounds_np(*tw.bounds.aabb_bounds(points_wp)), axis=0)))
+        volumes[0], float(np.prod(np.ptp(_bounds_np(*tw.bounds.aabb(points_wp)), axis=0)))
     )
 
 
@@ -614,7 +612,7 @@ def test_oriented_bounding_box_refinement_is_monotone(
 
 
 def test_oriented_bounding_box_empty_cloud(device: str) -> None:
-    """An empty cloud gives the identity frame and the same inverted box ``aabb_bounds`` returns."""
+    """An empty cloud gives the identity frame and the same inverted box ``aabb`` returns."""
     empty_wp = wp.zeros(0, dtype=wp.vec3, device=device)
     rotation_wp, lower_wp, upper_wp = tw.bounds.oriented_bounding_box(empty_wp)
 

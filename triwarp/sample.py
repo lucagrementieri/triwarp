@@ -502,7 +502,7 @@ def _dart_throw_blue_noise(
         return empty
 
     # Background grid at cell size ``radius``, so a 3x3x3 neighbourhood covers the disk exactly.
-    bbox_min, _ = tw.bounds.aabb_bounds(pool_points)
+    bbox_min, _ = tw.bounds.aabb(pool_points)
     grid_coords = wp.empty(n_pool, dtype=wp.vec3i, device=device)
     wp.map(
         kernel_blue_noise.grid_coord,
