@@ -21,8 +21,8 @@ def prefers_tiled_reduction(device: wp.DeviceLike) -> bool:
     The distinction matters, because it is *only* the lane-constructed tile that breaks.
     ``wp.tile_load`` reads its whole tile out of an array and is lane-independent, so it totals
     512.0 on both devices -- which is why every factory in ``kernels/reduce.py`` may be tiled
-    unconditionally while ``kernels/totals.py`` and ``kernels/metrics.py``, which build their tiles
-    from a per-thread contribution, must branch here.
+    unconditionally while ``kernels/measures.py`` and ``kernels/metrics.py``, which build their
+    tiles from a per-thread contribution, must branch here.
 
     **This is a known platform limitation, not a bug awaiting a report.** ``wp.launch`` documents
     ``block_dim`` as "always 1 for cpu devices" and ``launch_tiled`` forces it, so ``wp.tile(x)``

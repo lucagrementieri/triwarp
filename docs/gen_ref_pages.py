@@ -33,7 +33,7 @@ SECTIONS: dict[str, list[str]] = {
     # ``visibility`` sits here rather than under a query heading: ``ambient_occlusion``,
     # ``shape_diameter`` and ``thickness`` are per-point scalar shape descriptors of the same kind
     # as ``curvature``'s, which is how pymeshlab files them (``compute_scalar_*``).
-    "Measures & shape descriptors": ["totals", "curvature", "bounds", "convex", "visibility"],
+    "Measures & shape descriptors": ["measures", "curvature", "bounds", "convex", "visibility"],
     "Mesh editing & repair": ["repair", "holes", "combine", "remesh", "smoothing", "seams"],
     "Spatial queries": ["proximity", "ray", "neighbors", "intersection", "metrics"],
     # ``voxels`` is shelved with ``points`` / ``sample`` rather than with the spatial queries:

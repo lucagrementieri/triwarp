@@ -1,5 +1,5 @@
 """
-Benchmarks for ``triwarp.totals``: the whole-mesh reductions, which are readback-bound.
+Benchmarks for ``triwarp.measures``: the whole-mesh reductions, which are readback-bound.
 
 Every group here ends in a host-side value, so each pays at least one device-to-host crossing on top
 of its device pass -- and at the sizes in the scan sweep that latency is a large share of the total.
@@ -60,7 +60,7 @@ def test_surface_centroid(bench_case: BenchCase) -> None:
     meshlib's ``findCenterFromFaces`` is this exact quantity and nothing more -- unlike the
     pymeshlab row above, which returns five measures at once. Note it has a sibling,
     ``findCenterFromPoints``, which is the plain vertex mean and belongs to
-    [`points.centroid`][triwarp.points.centroid]; tests/test_totals.py holds the two apart.
+    [`points.centroid`][triwarp.points.centroid]; tests/test_measures.py holds the two apart.
     """
     if bench_case.kind == "meshlib":
         mesh_ml = bench_case.new_mesh_ml()
@@ -78,7 +78,7 @@ def test_surface_centroid(bench_case: BenchCase) -> None:
         return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-        result = bench_case.run(lambda: tw.totals.surface_centroid(vertices, faces))
+        result = bench_case.run(lambda: tw.measures.surface_centroid(vertices, faces))
         assert np.isfinite(list(result)).all()
     else:  # numpy reference: the uncached formula behind ``trimesh.Trimesh.centroid``
         vertices, faces = bench_case.vertices_np, bench_case.faces_np
@@ -132,7 +132,7 @@ def test_moments(bench_case: BenchCase) -> None:
     The lesson the group is kept for: **a plausible cost model is not a measurement.** "Readback-
     bound" was true and still hid a bytes-moved bug for as long as nobody checked which of the two
     the number was. A caller wanting only the volume should still call
-    [`volume`][triwarp.totals.volume], which pays one crossing.
+    [`volume`][triwarp.measures.volume], which pays one crossing.
     """
     if bench_case.kind == "pyvista":
         mesh_pv = bench_case.mesh_pv
@@ -140,7 +140,7 @@ def test_moments(bench_case: BenchCase) -> None:
         return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-        volume, _center, inertia = bench_case.run(lambda: tw.totals.moments(vertices, faces))
+        volume, _center, inertia = bench_case.run(lambda: tw.measures.moments(vertices, faces))
         assert np.isfinite(volume)
         assert np.asarray(inertia).reshape(3, 3).shape == (3, 3)
         return

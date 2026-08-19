@@ -377,9 +377,9 @@ public and tested, only untimed.
 | function | reference that exists | why there is no group yet |
 |---|---|---|
 | `visibility.volumetric_obscurance` | `compute_scalar_by_volumetric_obscurance` | it shares `ambient_occlusion`'s kernel and differs only in a per-hit `exp(-tau * t)` factor, so a triwarp-only group would re-measure that group's axis. MeshLab's filter *is* a real second reference, so the row is worth adding — with `tau` as its axis, not `rays`. |
-| `totals.volume` | `get_geometric_measures["mesh_volume"]`, `trimesh.Trimesh.volume`, `igl.moments[0]` | untimed since before it moved out of `triangles.py`. Its device pass is now `triangles.face_signed_volumes` plus one `reduce.sum`, and the `moments` row already prices the same integrals at three readbacks against this one's — so the row would isolate the readback count, which is the axis this module is about. Worth adding. |
-| `totals.euler_characteristic` | `get_geometric_measures["genus"]`, `trimesh.Trimesh.euler_number` | untimed since before it moved out of `validation.py`. It is a `unique_1d` plus an `edges_unique`, so it prices the grouping machinery rather than anything of its own, which is the argument against — but it is also the only whole-mesh integer with no row at all. |
-| `triangles.face_signed_volumes` | none | deliberately none: it is the per-face primitive `totals.volume` reduces, and a group over it would measure the same launch twice. Time it through a `volume` row instead. |
+| `measures.volume` | `get_geometric_measures["mesh_volume"]`, `trimesh.Trimesh.volume`, `igl.moments[0]` | untimed since before it moved out of `triangles.py`. Its device pass is now `triangles.face_signed_volumes` plus one `reduce.sum`, and the `moments` row already prices the same integrals at three readbacks against this one's — so the row would isolate the readback count, which is the axis this module is about. Worth adding. |
+| `measures.euler_characteristic` | `get_geometric_measures["genus"]`, `trimesh.Trimesh.euler_number` | untimed since before it moved out of `validation.py`. It is a `unique_1d` plus an `edges_unique`, so it prices the grouping machinery rather than anything of its own, which is the argument against — but it is also the only whole-mesh integer with no row at all. |
+| `triangles.face_signed_volumes` | none | deliberately none: it is the per-face primitive `measures.volume` reduces, and a group over it would measure the same launch twice. Time it through a `volume` row instead. |
 | `energies.lscm_hessian`, `energies.vector_area_matrix` | none with a binding | libigl exposes neither on its own — `lscm_hessian` only as `igl.lscm`'s second return, and `vector_area_matrix` not at all (`tests/test_energies.py` derives it as `(-repdiag(L, 2) - Q) / 2`). Their cost is measured through the `lscm` group in `test_parametrization`, which is also the only way a caller reaches them. |
 
 ### The parity gate: a benchmarked reference must be a tested reference
@@ -456,7 +456,7 @@ The rest are second or third independent implementations:
 | `test_sample` | `generate_sampling_poisson_disk(radius=)` — the only blue-noise reference that takes a *radius*, so the radius sweep maps for the first time |
 | `test_smoothing` | `apply_coord_laplacian_smoothing_scale_dependent` (Desbrun's, = `filter_mut_dif_laplacian`) and `apply_coord_laplacian_smoothing` |
 | `test_triangles` | `compute_normal_per_face` |
-| `test_totals` | `get_geometric_measures` (`shell_barycenter` = `surface_centroid`) |
+| `test_measures` | `get_geometric_measures` (`shell_barycenter` = `surface_centroid`) |
 | `test_validation` | `get_topological_measures` + `compute_selection_by_self_intersections_per_face` — the same composition open3d does in **13.8 s** and MeshLab in 140.8 ms; plus `compute_selection_by_non_manifold_per_vertex` |
 | `test_vertices` | `compute_normal_per_vertex` at `weightmode='Simple Average'` and `'By Area'` — one filter covering both normal groups |
 
@@ -784,7 +784,7 @@ Two mechanics that differ from the other references:
 | `test_reduce` | `weighted_sum` (new group) | `integrate_data` |
 | `test_proximity` | `winding_number`, `signed_distance_on_mesh` | `select_interior_points`, `compute_implicit_distance` |
 | `test_heat_distance` | `heat_geodesic` | `geodesic_distance` (Dijkstra over edges — a bound, not the same quantity) |
-| `test_bounds` / `test_totals` | `aabb`, `enclosing_diagonal`, `oriented_bounding_box`, `moments` | `bounds`, `length`, `oriented_bounding_box` (PCA), `volume` |
+| `test_bounds` / `test_measures` | `aabb`, `enclosing_diagonal`, `oriented_bounding_box`, `moments` | `bounds`, `length`, `oriented_bounding_box` (PCA), `volume` |
 | `test_points` | `principal_axes`, `fit_plane`, `fit_line` (exempt) | `principal_axes`, `fit_plane_to_points`, `fit_line_to_points` |
 | `test_registration` | `icp_mesh` | `align(return_matrix=True)` |
 | `test_remesh` / `test_smoothing` | `quadric_decimate`, `filter_laplacian_integration` (exempt), `filter_taubin` (exempt) | `decimate`, `smooth`, `smooth_taubin` |
@@ -915,7 +915,7 @@ against open3d and deliberately **not** benchmarked: `points.finite_point_mask` 
 over a three-component `isfinite`, so a group would report the ~11 us launch floor and nothing else,
 while `remove_non_finite_points` would be timing its copy of the surviving cloud. Two rows were
 *rejected on measurement* rather than absence and carry the numbers in their module docstrings:
-`test_totals`' `get_volume` validates before it integrates (13.8 s of `IsWatertight` for a
+`test_measures`' `get_volume` validates before it integrates (13.8 s of `IsWatertight` for a
 microsecond integral — it would re-time the watertightness row under another name), and
 `test_sample`'s `sample_points_uniformly` returns a bare cloud with no face index, so asserting it
 against the area law would transform the reference.

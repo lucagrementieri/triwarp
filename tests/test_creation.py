@@ -986,7 +986,7 @@ def test_annulus(device: str) -> None:
     _assert_same_faces(vertices_wp, faces_wp, tm.creation.annulus(0.5, 1.0, height=2.0))
     # The closing point of the annulus profile has to collapse, or the inner-wall seam stays open.
     _assert_closed(vertices_wp, faces_wp)
-    assert tw.totals.euler_characteristic(faces_wp) == 0
+    assert tw.measures.euler_characteristic(faces_wp) == 0
 
 
 def test_annulus_zero_inner_radius_is_a_cylinder(device: str) -> None:
@@ -1624,7 +1624,7 @@ def test_super_toroid_unit_exponents_are_a_torus(device: str) -> None:
     tube_np = np.hypot(ring_np, vertices_np[:, 2])
     assert np.allclose(tube_np, 0.5, rtol=1e-5, atol=1e-5)
     _assert_closed(vertices_wp, faces_wp)
-    assert tw.totals.euler_characteristic(faces_wp) == 0
+    assert tw.measures.euler_characteristic(faces_wp) == 0
 
 
 def test_random_hills(device: str) -> None:
@@ -1632,7 +1632,7 @@ def test_random_hills(device: str) -> None:
     vertices_np = vertices_wp.numpy().astype(np.float64)
     assert int(vertices_wp.shape[0]) == 1_600
     assert int(faces_wp.shape[0]) // 3 == 2 * 39 * 39
-    assert tw.totals.euler_characteristic(faces_wp) == 1
+    assert tw.measures.euler_characteristic(faces_wp) == 1
     # The lattice is the plain grid over [-10, 10]^2, and only the height is random.
     assert np.allclose(vertices_np[:, :2].min(axis=0), -10.0)
     assert np.allclose(vertices_np[:, :2].max(axis=0), 10.0)

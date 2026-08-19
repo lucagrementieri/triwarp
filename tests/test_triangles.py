@@ -680,7 +680,7 @@ def test_face_signed_volumes_apex_shifts_each_face_but_not_the_sum(
     """
     Moving the apex changes every per-face volume and leaves the closed-mesh total alone.
 
-    Both halves are needed. The invariance of the sum is the property ``totals.volume`` relies on
+    Both halves are needed. The invariance of the sum is the property ``measures.volume`` relies on
     when it passes no apex at all; the *variance* of the individual entries is what makes ``apex``
     a real parameter rather than a decoration, and it is the axis ``sample.sample_volume`` uses --
     it fans from the surface centroid precisely so that no entry comes out negative.

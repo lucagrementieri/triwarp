@@ -1982,7 +1982,7 @@ def parametric_surface(
     --------
     ```python
     vertices, faces = tw.creation.parametric_surface("boy")
-    print(tw.totals.euler_characteristic(faces), tw.validation.is_orientable(faces))
+    print(tw.measures.euler_characteristic(faces), tw.validation.is_orientable(faces))
     ```
 
     See Also

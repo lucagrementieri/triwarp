@@ -214,7 +214,7 @@ whether the elements depend on each other, not by which module the function live
 Three things are still defects:
 
 - **A public signature or return that names `np.ndarray`**, which forces the dependency on the
-  *caller*. Return `wp.mat33d` / `wp.vec3` (`totals.moments` returns the inertia tensor as
+  *caller*. Return `wp.mat33d` / `wp.vec3` (`measures.moments` returns the inertia tensor as
   `wp.mat33d` — `wp.mat33` would discard the `float64` digits the integrals exist to keep); annotate
   inputs `Sequence[Sequence[float]]` when the body is a duck-typed `np.asanyarray`, which is
   *widening*, since the old annotation was narrower than the implementation. The one sanctioned

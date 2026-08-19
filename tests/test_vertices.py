@@ -446,7 +446,7 @@ def test_vertex_defects_satisfy_gauss_bonnet(
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     assert mesh_tm.is_watertight
-    assert tw.totals.euler_characteristic(mesh_wp.indices) == chi
+    assert tw.measures.euler_characteristic(mesh_wp.indices) == chi
 
     face_angles_wp = wp.array(mesh_tm.face_angles, dtype=wp.float32, device=mesh_wp.device)
     defects_wp = tw.vertices.vertex_defects(

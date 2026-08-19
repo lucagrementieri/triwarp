@@ -292,10 +292,10 @@ class Trimesh:
 
         See Also
         --------
-        [`triwarp.totals.surface_centroid`][]
+        [`triwarp.measures.surface_centroid`][]
         [`trimesh.Trimesh.centroid`][]
         """
-        return tw.totals.surface_centroid(self._vertices, self._faces)
+        return tw.measures.surface_centroid(self._vertices, self._faces)
 
     @_CachedProperty
     def vertex_normals(self) -> wp.array[wp.vec3]:
@@ -592,12 +592,12 @@ class Trimesh:
         Notes
         -----
         Triggers a device-to-host synchronization on first access. Equivalent to
-        [`euler_characteristic`][triwarp.totals.euler_characteristic], recomposed here to
+        [`euler_characteristic`][triwarp.measures.euler_characteristic], recomposed here to
         reuse the cached `edges_unique` count instead of recomputing it.
 
         See Also
         --------
-        [`triwarp.totals.euler_characteristic`][]
+        [`triwarp.measures.euler_characteristic`][]
         [`trimesh.Trimesh.euler_number`][]
         """
         if self.n_faces == 0:

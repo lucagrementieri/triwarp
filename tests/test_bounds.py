@@ -98,7 +98,7 @@ def test_aabb_and_diagonal_match_pyvista(request: pytest.FixtureRequest, mesh_na
     extents differ.
 
     **``DataSet.center`` is not a centroid** and is deliberately not compared here: it is the bbox
-    midpoint, so it belongs to this quantity and not to ``totals.surface_centroid``.
+    midpoint, so it belongs to this quantity and not to ``measures.surface_centroid``.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     mesh_pv = trimesh_to_pyvista(mesh_tm)

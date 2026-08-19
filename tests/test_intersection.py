@@ -567,7 +567,7 @@ def test_split_mesh_with_plane_refines_without_cracking(
     if closed_in:
         assert tw.validation.is_edge_manifold(faces_wp, allow_boundary_edges=False) is True
     assert np.isclose(tm.Trimesh(points_np, faces_np, process=False).area, mesh_tm.area, rtol=1e-5)
-    assert tw.totals.euler_characteristic(faces_wp) == tw.totals.euler_characteristic(
+    assert tw.measures.euler_characteristic(faces_wp) == tw.measures.euler_characteristic(
         mesh_wp.indices
     )
 

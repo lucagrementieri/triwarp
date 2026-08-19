@@ -113,7 +113,7 @@ def filter_laplacian(
 
     operator = _resolved_operator(vertices, faces, laplacian_operator)
     positions = _as_vec3d(vertices)
-    vol_ini = tw.totals.volume(positions, faces) if volume_constraint else 0.0
+    vol_ini = tw.measures.volume(positions, faces) if volume_constraint else 0.0
 
     if implicit_time_integration:
         system = _build_implicit_system(operator, lamb, n, device)
@@ -156,7 +156,7 @@ def filter_laplacian(
 def _apply_volume_constraint(
     positions: wp.array[wp.vec3d], faces: wp.array[wp.int32], vol_ini: float
 ) -> None:
-    vol_new = tw.totals.volume(positions, faces)
+    vol_new = tw.measures.volume(positions, faces)
     if vol_new != 0.0:
         factor = (vol_ini / vol_new) ** (1.0 / 3.0)
         wp.map(wp.mul, positions, wp.float64(factor), out=positions)
@@ -447,7 +447,7 @@ def filter_mut_dif_laplacian(
     # the trimesh reference (which reads normals off the un-mutated mesh inside its loop).
     face_normals, areas = face_normals_and_areas(vertices, faces)
     normals = mean_vertex_normals(n, faces, face_normals)
-    vol_ini = tw.totals.volume(positions, faces) if volume_constraint else 0.0
+    vol_ini = tw.measures.volume(positions, faces) if volume_constraint else 0.0
     eps = 0.01 * float(tw.reduce.max(areas)) ** 0.5 if volume_constraint else 0.0
 
     lv = wp.empty(n, dtype=wp.vec3d, device=device)
@@ -485,7 +485,7 @@ def filter_mut_dif_laplacian(
         )
         positions, nxt = nxt, positions
         if volume_constraint:
-            vol = tw.totals.volume(positions, faces)
+            vol = tw.measures.volume(positions, faces)
             if index == 0:
                 wp.map(
                     kernel_smoothing.add_scaled_normal,
@@ -494,7 +494,7 @@ def filter_mut_dif_laplacian(
                     wp.float64(eps),
                     out=probe,
                 )
-                vol2 = tw.totals.volume(probe, faces)
+                vol2 = tw.measures.volume(probe, faces)
                 slope = eps / (vol2 - vol) if vol2 != vol else 0.0
             wp.map(
                 kernel_smoothing.add_scaled_normal,

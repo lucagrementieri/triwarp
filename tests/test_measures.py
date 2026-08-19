@@ -1,5 +1,5 @@
 """
-Regression tests for ``triwarp.totals``: the whole-mesh reductions.
+Regression tests for ``triwarp.measures``: the whole-mesh reductions.
 
 Against ``trimesh``'s cached mass properties, ``igl.moments`` and pymeshlab's
 ``get_geometric_measures``, which answers six of these questions in one call. Mirrors the module's
@@ -46,7 +46,7 @@ def test_volume(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
     mesh_tm, mesh_wp = icosahedron
     mesh_ml = trimesh_to_meshlib(mesh_tm)
 
-    volume_wp = tw.totals.volume(mesh_wp.points, mesh_wp.indices)
+    volume_wp = tw.measures.volume(mesh_wp.points, mesh_wp.indices)
     assert np.isclose(volume_wp, mesh_tm.volume, rtol=1e-5, atol=1e-5)
     assert np.isclose(volume_wp, mm.volume(mesh_ml.topology, mesh_ml.points), rtol=1e-5, atol=1e-5)
 
@@ -63,14 +63,14 @@ def test_volume_inward_normals_negative(icosahedron: tuple[tm.Trimesh, wp.Mesh])
     faces_flipped_wp = wp.array(
         np.ascontiguousarray(faces_np), dtype=wp.int32, device=mesh_wp.device
     )
-    volume_wp = tw.totals.volume(mesh_wp.points, faces_flipped_wp)
+    volume_wp = tw.measures.volume(mesh_wp.points, faces_flipped_wp)
     assert np.isclose(volume_wp, -mesh_tm.volume, rtol=1e-5, atol=1e-5)
 
 
 def test_volume_empty(device: str):
     vertices = wp.zeros(1, dtype=wp.vec3, device=device)
     faces = wp.array([], dtype=wp.int32, device=device)
-    assert tw.totals.volume(vertices, faces) == 0.0
+    assert tw.measures.volume(vertices, faces) == 0.0
 
 
 @pytest.mark.parity("surface_centroid", "trimesh", "meshlib")
@@ -94,7 +94,7 @@ def test_surface_centroid(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     centroid_tm = mesh_tm.centroid
     centroid_ml = np.array([*mm.findCenterFromFaces(mesh_ml.topology, mesh_ml.points)])
 
-    centroid_wp = tw.totals.surface_centroid(mesh_wp.points, mesh_wp.indices)
+    centroid_wp = tw.measures.surface_centroid(mesh_wp.points, mesh_wp.indices)
     centroid_wp = np.array([centroid_wp.x, centroid_wp.y, centroid_wp.z])
     assert np.allclose(centroid_wp, centroid_tm, rtol=1e-5, atol=1e-5)
     assert np.allclose(centroid_wp, centroid_ml, rtol=1e-5, atol=1e-5)
@@ -129,7 +129,7 @@ def test_surface_centroid_matches_trimesh_on_a_skewed_mesh_on_both_devices(kerne
     mesh_tm.vertices[:, 2] += 0.4 * mesh_tm.vertices[:, 1] ** 3
     mesh_wp = trimesh_to_warp(mesh_tm, kernel_device)
 
-    centroid_wp = tw.totals.surface_centroid(mesh_wp.points, mesh_wp.indices)
+    centroid_wp = tw.measures.surface_centroid(mesh_wp.points, mesh_wp.indices)
     assert np.allclose(
         np.array([centroid_wp.x, centroid_wp.y, centroid_wp.z]),
         mesh_tm.centroid,
@@ -141,7 +141,7 @@ def test_surface_centroid_matches_trimesh_on_a_skewed_mesh_on_both_devices(kerne
 def test_surface_centroid_empty(device: str):
     vertices = wp.zeros(1, dtype=wp.vec3, device=device)
     faces = wp.array([], dtype=wp.int32, device=device)
-    centroid_wp = tw.totals.surface_centroid(vertices, faces)
+    centroid_wp = tw.measures.surface_centroid(vertices, faces)
     centroid_wp = np.array([centroid_wp.x, centroid_wp.y, centroid_wp.z])
     assert np.isnan(centroid_wp).all()
 
@@ -167,7 +167,7 @@ def test_surface_centroid_matches_pymeshlab_shell_barycenter(
     mesh_tm, mesh_wp = hemisphere
     measures_pml = trimesh_to_pymeshlab(mesh_tm).get_geometric_measures()
 
-    centroid_wp = tw.totals.surface_centroid(mesh_wp.points, mesh_wp.indices)
+    centroid_wp = tw.measures.surface_centroid(mesh_wp.points, mesh_wp.indices)
     centroid_np = np.array([centroid_wp.x, centroid_wp.y, centroid_wp.z])
 
     assert np.allclose(centroid_np, measures_pml["shell_barycenter"], rtol=1e-5, atol=1e-5)
@@ -199,7 +199,7 @@ def test_moments(request: pytest.FixtureRequest, mesh_name: str):
     vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
 
     volume_igl, first_moment_igl, inertia_igl = igl.moments(vertices_np, faces_igl(mesh_tm))
-    volume_wp, center_wp, inertia_wp = tw.totals.moments(mesh_wp.points, mesh_wp.indices)
+    volume_wp, center_wp, inertia_wp = tw.measures.moments(mesh_wp.points, mesh_wp.indices)
 
     assert np.isclose(volume_wp, volume_igl, rtol=1e-5)
     assert np.isclose(volume_wp, mesh_tm.volume, rtol=1e-5)
@@ -238,7 +238,7 @@ def test_volume_matches_pyvista(request: pytest.FixtureRequest, mesh_name: str):
     volume_pv = float(trimesh_to_pyvista(mesh_tm).volume)
     assert volume_pv > 0.0
 
-    assert np.isclose(tw.totals.volume(mesh_wp.points, mesh_wp.indices), volume_pv, rtol=1e-5)
+    assert np.isclose(tw.measures.volume(mesh_wp.points, mesh_wp.indices), volume_pv, rtol=1e-5)
     # Non-vacuous on cave_cube: the outer box alone is a measurably different number.
     assert np.isclose(volume_pv, mesh_tm.volume, rtol=1e-5)
 
@@ -255,8 +255,8 @@ def test_moments_center_of_mass_differs_from_the_surface_centroid(
     asserting they differ is what keeps ``moments`` from being a synonym.
     """
     _mesh_tm, mesh_wp = half_torus
-    surface_centroid = tw.totals.surface_centroid(mesh_wp.points, mesh_wp.indices)
-    _volume, center_of_mass, _inertia = tw.totals.moments(mesh_wp.points, mesh_wp.indices)
+    surface_centroid = tw.measures.surface_centroid(mesh_wp.points, mesh_wp.indices)
+    _volume, center_of_mass, _inertia = tw.measures.moments(mesh_wp.points, mesh_wp.indices)
     assert not np.allclose(
         [surface_centroid.x, surface_centroid.y, surface_centroid.z],
         [center_of_mass.x, center_of_mass.y, center_of_mass.z],
@@ -283,7 +283,7 @@ def test_moments_translation_shifts_only_the_center(device: str):
             dtype=wp.int32,
             device=device,
         )
-        return tw.totals.moments(vertices_wp, faces_wp)
+        return tw.measures.moments(vertices_wp, faces_wp)
 
     volume_a, center_a, inertia_a = moments_of(box_tm.vertices)
     volume_b, center_b, inertia_b = moments_of(box_tm.vertices + offset_np)
@@ -302,7 +302,7 @@ def test_moments_translation_shifts_only_the_center(device: str):
 def test_moments_empty(device: str):
     faces_wp = wp.array(np.array([], dtype=np.int32), dtype=wp.int32, device=device)
     vertices_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
-    volume, center, inertia = tw.totals.moments(vertices_wp, faces_wp)
+    volume, center, inertia = tw.measures.moments(vertices_wp, faces_wp)
     assert volume == 0.0
     assert np.isnan([center.x, center.y, center.z]).all()
     assert np.array_equal(np.asarray(inertia).reshape(3, 3), np.zeros((3, 3)))
@@ -317,10 +317,10 @@ def test_euler_characteristic(request: pytest.FixtureRequest, mesh_name: str) ->
     answer cannot pass.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
-    euler_wp = tw.totals.euler_characteristic(mesh_wp.indices)
+    euler_wp = tw.measures.euler_characteristic(mesh_wp.indices)
     assert euler_wp == int(mesh_tm.euler_number)
 
 
 def test_euler_characteristic_icosahedron(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
     _, mesh_wp = icosahedron
-    assert tw.totals.euler_characteristic(mesh_wp.indices) == 2
+    assert tw.measures.euler_characteristic(mesh_wp.indices) == 2

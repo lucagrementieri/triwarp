@@ -921,7 +921,7 @@ def is_volume(
     --------
     [`make_volume`][triwarp.repair.make_volume]
         Produce one: flip whatever fails this test.
-    [`volume`][triwarp.totals.volume]
+    [`volume`][triwarp.measures.volume]
         Measure one, once this returns ``True``.
     [`is_winding_consistent`][triwarp.validation.is_winding_consistent]
     [`is_watertight`][triwarp.validation.is_watertight]

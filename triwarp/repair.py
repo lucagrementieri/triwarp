@@ -696,7 +696,7 @@ def make_volume(
     --------
     [`is_volume`][triwarp.validation.is_volume]
         Test whether this succeeded.
-    [`volume`][triwarp.totals.volume]
+    [`volume`][triwarp.measures.volume]
         Measure the result.
     [`make_winding_consistent`][triwarp.repair.make_winding_consistent]
     [`make_normals_outward`][triwarp.repair.make_normals_outward]

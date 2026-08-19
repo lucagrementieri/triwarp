@@ -2,9 +2,9 @@
 Benchmarks for ``triwarp.triangles``: per-face arithmetic, one triangle at a time.
 
 Nothing here reads connectivity, so the scan sweep (pure ``N``) is the right axis throughout and
-every reference is doing the same cross products. The whole-mesh reductions these feed --
-the centroid, the volume and the moments -- moved to [`test_totals.py`](test_totals.py) with their
-module.
+every reference is doing the same cross products. The whole-mesh reductions these feed -- the
+centroid, the volume and the moments -- are timed in
+[`test_measures.py`](test_measures.py), beside the module that owns them.
 
 ``face_normals_and_areas`` returns both quantities from one cross product, which is what its
 consumers in the library want (the heat method, the gradient operators, area-weighted normals). The

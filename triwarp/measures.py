@@ -10,15 +10,15 @@ stay on the device.
 Three of the four are **mass properties of the enclosed solid**, and all three are only meaningful
 on a closed, consistently wound surface -- [`is_volume`][triwarp.validation.is_volume] is the check
 for that, and [`make_volume`][triwarp.repair.make_volume] the repair.
-[`volume`][triwarp.totals.volume] is the signed volume,
-[`moments`][triwarp.totals.moments] adds the centre of mass and the inertia tensor, and
-[`surface_centroid`][triwarp.totals.surface_centroid] is the one member that is a *normalized*
+[`volume`][triwarp.measures.volume] is the signed volume,
+[`moments`][triwarp.measures.moments] adds the centre of mass and the inertia tensor, and
+[`surface_centroid`][triwarp.measures.surface_centroid] is the one member that is a *normalized*
 total rather than a sum: the area-weighted mean of the per-face centroids. It is a property of the
 **shell**, so it differs from ``moments``' centre of mass on any solid whose mass is not distributed
 like its surface -- and it needs no watertightness, since a surface has a centroid whether or not it
 bounds anything.
 
-[`euler_characteristic`][triwarp.totals.euler_characteristic] is the odd one out: a topological
+[`euler_characteristic`][triwarp.measures.euler_characteristic] is the odd one out: a topological
 invariant rather than a measurement, counted off the index buffer with no geometry involved. It sits
 here because it is a whole-mesh integer, and it is what
 [`homology_generators`][triwarp.homology.homology_generators] derives the genus from.
@@ -32,7 +32,7 @@ import warp as wp
 import triwarp as tw
 from triwarp._device import prefers_tiled_reduction, slice_count
 from triwarp.constants import TILE_1D
-from triwarp.kernels import totals as kernel_totals
+from triwarp.kernels import measures as kernel_measures
 
 
 def volume(vertices: wp.array[wp.vec3] | wp.array[wp.vec3d], faces: wp.array[wp.int32]) -> float:
@@ -67,7 +67,7 @@ def volume(vertices: wp.array[wp.vec3] | wp.array[wp.vec3d], faces: wp.array[wp.
         Whether the sum means anything on this mesh.
     [`make_volume`][triwarp.repair.make_volume]
         Make it mean something.
-    [`moments`][triwarp.totals.moments]
+    [`moments`][triwarp.measures.moments]
         The same volume in float64, plus the centre of mass and inertia.
     [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
         The ``float64`` consumer: its volume constraint rescales the mesh to hold this fixed.
@@ -83,9 +83,9 @@ def surface_centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
     Area-weighted centroid of the mesh surface: the mean of the per-face centroids by area.
 
     A *normalized* total rather than a sum, and a property of the shell alone -- unlike
-    [`moments`][triwarp.totals.moments]' centre of mass it needs no watertightness and no consistent
-    winding, because a surface has a centroid whether or not it bounds a solid. The two differ on
-    any solid whose mass is not distributed like its surface.
+    [`moments`][triwarp.measures.moments]' centre of mass it needs no watertightness and no
+    consistent winding, because a surface has a centroid whether or not it bounds a solid. The two
+    differ on any solid whose mass is not distributed like its surface.
 
     Parameters
     ----------
@@ -101,7 +101,7 @@ def surface_centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
 
     See Also
     --------
-    [`moments`][triwarp.totals.moments]
+    [`moments`][triwarp.measures.moments]
         The centre of mass of the enclosed *solid*, which this is not.
     [`face_centroids`][triwarp.triangles.face_centroids]
         The per-face barycentres this averages.
@@ -117,7 +117,7 @@ def surface_centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
     out_total_area = wp.zeros(1, dtype=wp.float32, device=device)
     if prefers_tiled_reduction(device):
         wp.launch_tiled(
-            kernel_totals.centroid_tiled,
+            kernel_measures.centroid_tiled,
             dim=[(f + TILE_1D - 1) // TILE_1D],
             inputs=[vertices, faces, wp.int32(f), out_centroid, out_total_area],
             block_dim=TILE_1D,
@@ -126,7 +126,7 @@ def surface_centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
     else:
         n_slices = slice_count(f, device)
         wp.launch(
-            kernel_totals.centroid_sliced,
+            kernel_measures.centroid_sliced,
             dim=n_slices,
             inputs=[vertices, faces, wp.int32(f), wp.int32(n_slices), out_centroid, out_total_area],
             device=device,
@@ -150,7 +150,7 @@ def moments(
 
     Integrates over the enclosed solid at unit density by summing the contribution of every
     (origin, face) tetrahedron, so the result is only meaningful for a **closed, consistently
-    wound** surface -- the same precondition [`volume`][triwarp.totals.volume] carries, and
+    wound** surface -- the same precondition [`volume`][triwarp.measures.volume] carries, and
     [`is_volume`][triwarp.validation.is_volume] is the check for it.
 
     The integrals accumulate in ``float64`` even though the positions are ``float32``: the second
@@ -167,11 +167,11 @@ def moments(
     Returns
     -------
     volume : float
-        Signed volume, identical to [`volume`][triwarp.totals.volume] up to its ``float32``
+        Signed volume, identical to [`volume`][triwarp.measures.volume] up to its ``float32``
         accumulation.
     center_of_mass : wp.vec3
         Volume centroid, i.e. the first moment divided by the volume. This is **not**
-        [`surface_centroid`][triwarp.totals.surface_centroid], the area-weighted centre of the
+        [`surface_centroid`][triwarp.measures.surface_centroid], the area-weighted centre of the
         *surface*; the two differ on any solid whose mass is not distributed like its shell.
     inertia : wp.mat33d
         ``(3, 3)`` inertia tensor about the centre of mass, at unit density. ``float64``, like the
@@ -190,8 +190,8 @@ def moments(
 
     See Also
     --------
-    [`volume`][triwarp.totals.volume]
-    [`surface_centroid`][triwarp.totals.surface_centroid]
+    [`volume`][triwarp.measures.volume]
+    [`surface_centroid`][triwarp.measures.surface_centroid]
     [`is_volume`][triwarp.validation.is_volume]
     [`trimesh.Trimesh.moment_inertia`][]
     ``igl.moments``
@@ -206,7 +206,7 @@ def moments(
     squares = wp.empty(n_faces, dtype=wp.vec3d, device=device)
     products = wp.empty(n_faces, dtype=wp.vec3d, device=device)
     wp.launch(
-        kernel_totals.moment_integrands,
+        kernel_measures.moment_integrands,
         dim=n_faces,
         inputs=[vertices, faces, volumes, first, squares, products],
         device=device,

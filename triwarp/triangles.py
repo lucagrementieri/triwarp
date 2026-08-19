@@ -171,7 +171,7 @@ def face_centroids(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp
     """
     Barycentre of every face: the mean of its three corners.
 
-    Not to be confused with [`surface_centroid`][triwarp.totals.surface_centroid], which is the
+    Not to be confused with [`surface_centroid`][triwarp.measures.surface_centroid], which is the
     *mesh's* single area-weighted centre. This is one point per triangle and no weighting is
     involved.
 
@@ -189,8 +189,8 @@ def face_centroids(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp
 
     See Also
     --------
-    [`centroid`][triwarp.totals.surface_centroid]
-    [`moments`][triwarp.totals.moments]
+    [`centroid`][triwarp.measures.surface_centroid]
+    [`moments`][triwarp.measures.moments]
     ``igl.barycenter``
     """
     n_faces = int(faces.shape[0]) // 3
@@ -216,7 +216,7 @@ def face_signed_volumes(
 
     ``dot(v0 - apex, cross(v1 - apex, v2 - apex)) / 6``, so the sign follows the face's winding:
     positive where the face turns its front to the apex. Summed over a closed, consistently wound
-    surface this is the enclosed volume ([`volume`][triwarp.totals.volume]) and is independent of
+    surface this is the enclosed volume ([`volume`][triwarp.measures.volume]) and is independent of
     ``apex``; per face it is not, which is why the argument exists —
     [`sample_volume`][triwarp.sample.sample_volume] fans from the surface centroid so that every
     tetrahedron is positive on a star-shaped mesh, and uses the array as a cumulative distribution.
@@ -241,7 +241,7 @@ def face_signed_volumes(
 
     See Also
     --------
-    [`volume`][triwarp.totals.volume]
+    [`volume`][triwarp.measures.volume]
         The sum of these over the whole mesh.
     [`is_volume`][triwarp.validation.is_volume]
         Whether that sum is a meaningful volume at all.

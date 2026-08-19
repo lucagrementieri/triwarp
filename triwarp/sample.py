@@ -667,7 +667,7 @@ def sample_volume(
             "mesh is not watertight; tetrahedral decomposition requires a closed surface"
         )
 
-    center = tw.totals.surface_centroid(vertices, faces)
+    center = tw.measures.surface_centroid(vertices, faces)
 
     signed_vols = tw.triangles.face_signed_volumes(vertices, faces, center)
 
