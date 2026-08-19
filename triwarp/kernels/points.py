@@ -312,15 +312,20 @@ def unpack_farthest_index(key: wp.int64) -> wp.int32:
 
 
 @wp.kernel
-def seed_farthest_point(start: wp.int32, out_selected: wp.array[wp.int32]) -> None:
+def seed_farthest_point(
+    start: wp.int32, out_selected: wp.array[wp.int32], out_cursor: wp.array[wp.int32]
+) -> None:
+    # ``out_cursor`` is the loop's step counter, kept on the device so the iteration's two launches
+    # take the same arguments every time and the body can be captured once and replayed.
     out_selected[0] = start
+    out_cursor[0] = 0
 
 
 @wp.kernel
 def advance_farthest_point(
     points: wp.array[wp.vec3],
     selected: wp.array[wp.int32],
-    step: wp.int32,
+    cursor: wp.array[wp.int32],
     min_distance_sq: wp.array[wp.float32],
     best: wp.array[wp.int64],
 ) -> None:
@@ -328,8 +333,11 @@ def advance_farthest_point(
     # to the chosen set, then have the same thread contribute its own updated value to the global
     # argmax. No cross-thread dependency to synchronize -- thread ``i`` reads and writes only
     # ``min_distance_sq[i]`` -- which is what lets the update and the reduction share a launch.
+    #
+    # The step comes from ``cursor`` rather than from a kernel argument, so every iteration issues
+    # the identical launch and the wrapper can capture one iteration and replay it.
     i = wp.int32(wp.tid())
-    chosen = points[selected[step]]
+    chosen = points[selected[cursor[0]]]
     distance_sq = wp.length_sq(points[i] - chosen)
     if distance_sq < min_distance_sq[i]:
         min_distance_sq[i] = distance_sq
@@ -338,11 +346,13 @@ def advance_farthest_point(
 
 @wp.kernel
 def commit_farthest_point(
-    best: wp.array[wp.int64], step: wp.int32, out_selected: wp.array[wp.int32]
+    best: wp.array[wp.int64], out_selected: wp.array[wp.int32], out_cursor: wp.array[wp.int32]
 ) -> None:
-    # Decode the winning key into the next sample and re-arm the accumulator, so the loop needs no
-    # separate reset launch and no host readback between iterations.
+    # Decode the winning key into the next sample, advance the step and re-arm the accumulator, so
+    # the loop needs no separate reset launch, no host readback and no per-iteration argument.
+    step = out_cursor[0] + 1
     out_selected[step] = unpack_farthest_index(best[0])
+    out_cursor[0] = step
     best[0] = wp.int64(-1)
 
 

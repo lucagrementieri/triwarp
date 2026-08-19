@@ -952,10 +952,11 @@ def farthest_point_sample(
     if not 0 <= start < n:
         raise ValueError(f"start must be in [0, {n}), got {start}")
 
+    cursor = wp.empty(1, dtype=wp.int32, device=device)
     wp.launch(
         kernel_points.seed_farthest_point,
         dim=1,
-        inputs=[wp.int32(start), out_selected],
+        inputs=[wp.int32(start), out_selected, cursor],
         device=device,
     )
     if count == 1:
@@ -966,19 +967,39 @@ def farthest_point_sample(
     # iteration rather than three -- and so the selected index never crosses to the host, which is
     # what keeps a ``count``-long loop off the ~0.1 ms-per-readback budget.
     best = wp.array([wp.int64(-1)], dtype=wp.int64, device=device)
-    for step in range(count - 1):
+
+    def iteration() -> None:
         wp.launch(
             kernel_points.advance_farthest_point,
             dim=n,
-            inputs=[points, out_selected, wp.int32(step), min_distance_sq, best],
+            inputs=[points, out_selected, cursor, min_distance_sq, best],
             device=device,
         )
         wp.launch(
             kernel_points.commit_farthest_point,
             dim=1,
-            inputs=[best, wp.int32(step + 1), out_selected],
+            inputs=[best, out_selected, cursor],
             device=device,
         )
+
+    # The greedy sweep is inherently sequential -- ``count - 1`` rounds of two dependent launches --
+    # so its host cost is the whole story on a small cloud: measured 2 049 launches and **79 %
+    # host** for ``count=1024`` on 2 562 points, against 34 % on 40 962 points where the distance
+    # update is real work. With the step counter on the device every round issues the identical
+    # pair, so one round is captured and every round is a replay: ~1.17 us against ~13.4 us issued.
+    # Capturing costs about what issuing costs, so capturing the *whole* loop would buy nothing --
+    # the win is that one captured round is replayed ``count - 1`` times. Measured at
+    # ``count=1024``: 28.75 -> 4.34 ms (6.6x) on 2 562 points, and 28.85 -> 21.12 ms (1.37x) on
+    # 40 962, where the per-round device work is real and the host was never the limit.
+    if not wp.get_device(device).is_cuda:
+        for _ in range(count - 1):
+            iteration()
+        return out_selected
+    with wp.ScopedCapture(device) as capture:
+        iteration()
+    # Capture *records* the round without executing it, so all ``count - 1`` rounds are replays.
+    for _ in range(count - 1):
+        wp.capture_launch(capture.graph)
     return out_selected
 
 
