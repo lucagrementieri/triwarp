@@ -9,7 +9,7 @@ to give the distance a sign; and [`winding_number`][triwarp.proximity.winding_nu
 watertightness nor manifoldness, which is why it is the robust inside test on damaged input.
 [`containing_faces_2d`][triwarp.proximity.containing_faces_2d] is the planar case -- point location
 in a 2D triangulation -- and
-[`query_mesh_aabb_bounds_with_offsets`][triwarp.proximity.query_mesh_aabb_bounds_with_offsets] is
+[`query_mesh_aabb_with_offsets`][triwarp.proximity.query_mesh_aabb_with_offsets] is
 the low-level box query the others are built over.
 
 Everything here takes raw ``(vertices, faces)`` buffers. The queries phrased the other way round --
@@ -435,7 +435,7 @@ def winding_number(
     return out_winding
 
 
-def query_mesh_aabb_bounds_with_offsets(
+def query_mesh_aabb_with_offsets(
     mesh: wp.Mesh,
     query_lower: wp.array[wp.vec3],
     query_upper: wp.array[wp.vec3],
@@ -493,7 +493,7 @@ def query_mesh_aabb_bounds_with_offsets(
 
     hit_counts = wp.empty(m, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_proximity.query_mesh_aabb_bounds_count,
+        kernel_proximity.query_mesh_aabb_count,
         dim=m,
         inputs=[query_lower, query_upper, mesh.id, wp.int32(max_hits), hit_counts],
         device=device,
@@ -507,7 +507,7 @@ def query_mesh_aabb_bounds_with_offsets(
 
     candidate_indices_flat = wp.empty(total_hits, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_proximity.query_mesh_aabb_bounds_neighbors,
+        kernel_proximity.query_mesh_aabb_neighbors,
         dim=m,
         inputs=[
             query_lower,

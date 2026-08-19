@@ -28,7 +28,7 @@ def mesh_aabb_collect(
 
 
 @wp.kernel
-def query_mesh_aabb_bounds_count(
+def query_mesh_aabb_count(
     query_lower: wp.array[wp.vec3],
     query_upper: wp.array[wp.vec3],
     mesh_id: wp.uint64,
@@ -48,7 +48,7 @@ def query_mesh_aabb_bounds_count(
 
 
 @wp.kernel
-def query_mesh_aabb_bounds_neighbors(
+def query_mesh_aabb_neighbors(
     query_lower: wp.array[wp.vec3],
     query_upper: wp.array[wp.vec3],
     mesh_id: wp.uint64,

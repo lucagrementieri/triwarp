@@ -391,7 +391,7 @@ def mesh_with_mesh(
         device=device,
     )
 
-    target_indices, offsets, hit_counts = tw.proximity.query_mesh_aabb_bounds_with_offsets(
+    target_indices, offsets, hit_counts = tw.proximity.query_mesh_aabb_with_offsets(
         target_mesh, query_lower, query_upper, max_hits=max_triangle_collisions
     )
     n_pairs = int(target_indices.shape[0])

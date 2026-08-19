@@ -48,7 +48,7 @@ def _queries_in_bounds_np(mesh_tm: tm.Trimesh, n: int, seed: int) -> np.ndarray:
     return np.random.default_rng(seed).uniform(lower_np - margin_np, upper_np + margin_np, (n, 3))
 
 
-def test_query_mesh_aabb_bounds_with_offsets(device: str) -> None:
+def test_query_mesh_aabb_with_offsets(device: str) -> None:
     rng = np.random.default_rng(11)
     n_faces = 8
     vertices_np = rng.random((n_faces * 3, 3), dtype=np.float32)
@@ -70,7 +70,7 @@ def test_query_mesh_aabb_bounds_with_offsets(device: str) -> None:
     query_lower_wp = wp.array(np.ascontiguousarray(query_lower_np), dtype=wp.vec3, device=device)
     query_upper_wp = wp.array(np.ascontiguousarray(query_upper_np), dtype=wp.vec3, device=device)
 
-    indices_wp, offsets_wp, hit_counts_wp = tw.proximity.query_mesh_aabb_bounds_with_offsets(
+    indices_wp, offsets_wp, hit_counts_wp = tw.proximity.query_mesh_aabb_with_offsets(
         mesh, query_lower_wp, query_upper_wp, max_hits=16
     )
 
