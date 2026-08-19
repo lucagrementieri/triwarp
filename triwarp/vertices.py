@@ -23,6 +23,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import predicates as kernel_predicates
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels import vertices as kernel_vertices
 
@@ -363,5 +364,5 @@ def vertex_defects(
     )
     # In place over the accumulator: ``angle_sum`` is scratch, and the operator spelling
     # ``TWO_PI - angle_sum`` would run the same wp.map into a second allocation.
-    wp.map(kernel_vertices.angle_defect, angle_sum, out=angle_sum)
+    wp.map(kernel_predicates.angle_defect, angle_sum, out=angle_sum)
     return angle_sum

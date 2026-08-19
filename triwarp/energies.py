@@ -44,6 +44,7 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp.edges import edges_unique
 from triwarp.kernels import energies as kernel_energies
+from triwarp.kernels import predicates as kernel_predicates
 from triwarp.laplacian import cotmatrix, cotmatrix_entries
 
 
@@ -381,7 +382,7 @@ def curved_hessian_energy(
     # Angle defect, zeroed on the boundary (curvature is only corrected at interior vertices),
     # weighted by the actual angle sum -- igl::cr_vector_curvature_correction's kappa scaling.
     kappa = wp.empty(n_vertices, dtype=wp.float64, device=device)
-    wp.map(kernel_energies.angle_defect_from_sum, angle_sums, out=kappa)
+    wp.map(kernel_predicates.angle_defect, angle_sums, out=kappa)
     _zero_at_boundary(vertices, faces, kappa)
     scaled_kappa = wp.empty(n_vertices, dtype=wp.float64, device=device)
     wp.map(kernel_energies.divide_or_zero, kappa, angle_sums, out=scaled_kappa)

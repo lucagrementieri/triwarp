@@ -23,11 +23,16 @@ so callers detect the case with ``wp.isinf`` rather than by comparing against a 
     ``type(x)(...)`` so they instantiate at the caller's precision.
 """
 
+import math
 from typing import Any
 
 import warp as wp
 
 from triwarp.kernels.array import cross2
+
+# Full turn in ``float64``; ``type(x)(TWO_PI_F64)`` narrows it to the caller's precision, and at
+# ``float32`` that is bit-identical to ``2 * wp.PI`` (verified on both devices, Warp 1.16).
+TWO_PI_F64 = wp.constant(wp.float64(2.0 * math.pi))
 
 
 @wp.func
@@ -239,6 +244,12 @@ def unit_tangent(vector: Any, normal: Any, tolerance: Any):
     if length > tolerance:
         return tangential / length, length
     return tangential, length
+
+
+@wp.func
+def angle_defect(angle_sum: wp.Float) -> wp.Float:
+    """Angle defect at a vertex: a full turn minus the incident corner angles."""
+    return type(angle_sum)(TWO_PI_F64) - angle_sum
 
 
 @wp.func

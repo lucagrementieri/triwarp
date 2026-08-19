@@ -1,13 +1,9 @@
-import math
-
 import warp as wp
 
 from triwarp.kernels.array import to_vec3d
 from triwarp.kernels.halfedge import halfedge_destination
 from triwarp.kernels.predicates import triangle_double_area
 from triwarp.kernels.triangles import face_vertices_vec3d
-
-TWO_PI_F64 = wp.constant(wp.float64(2.0 * math.pi))
 
 
 @wp.func
@@ -255,11 +251,6 @@ def internal_angles_and_sums(
     wp.atomic_add(out_angle_sums, faces[f * 3 + 0], theta0)
     wp.atomic_add(out_angle_sums, faces[f * 3 + 1], theta1)
     wp.atomic_add(out_angle_sums, faces[f * 3 + 2], theta2)
-
-
-@wp.func
-def angle_defect_from_sum(angle_sum: wp.float64) -> wp.float64:
-    return TWO_PI_F64 - angle_sum
 
 
 @wp.func
