@@ -27,6 +27,30 @@ because within a class the kernels differ only in the per-segment expression:
 cost is the product of two sizes (query points x segments) rather than a function of the polyline
 alone.
 
+``triangulate_polygon`` is the remaining exception, and the module's worked example of a cost
+that is not where it looks. It delegates to ``polyline.triangulate_polyline``, a **parallel**
+multi-round ear clipper — every launch in the round loop is ``dim=n``, and a round clips a whole
+*independent set* of ears at once. What is serial is the **round count**: a round costs four
+``dim=n`` launches whatever it clips, so the only thing that matters is how many ears survive per
+round. Since the round loop moved onto the device (``wp.capture_while``, so no readback per round)
+that costs 14 µs a round at 64 points, and the group measures **2.2 / 4.5 ms** against 4.5 / 6.9
+before — 2.07x and 1.53x.
+
+Read the residual against its attribution rather than against the round loop, because the round loop
+is no longer the cost: at 64 points the clip itself is 0.22 ms of the 2.2, and **1.05 ms is the
+prologue** — ``open_polyline``'s ``is_closed`` (0.24), ``polyline_normal`` (0.35) and
+``polyline_centroid`` (0.25), three reductions that each end in a host readback because their result
+is a Python-scope ``wp.vec3``, plus the reflex-count readback. That share is *flat in n*, so it is
+the whole gap to trimesh's 0.12 ms at 64 points and none of it at 1 024.
+
+The round *count* is what this group caught first. ``select_independent`` used to rank competing
+ear candidates by their raw ring index, which on an alternating star lets ear ``i - 2`` suppress
+ear ``i`` for every ``i``, so exactly **one** ear was clipped per round and the loop ran to its
+``n`` cap: 6.1 ms at 64 points and **141 ms** at 1 024, growing as ``n^1.12`` (rounds proportional
+to ``n`` times a slowly growing per-round cost) rather than the ``O(L^2)`` a serial clipper would
+give. Ranking by a bijective hash of the ring index makes it the textbook maximal-independent-set
+rule, which retires a constant fraction per round: 16 and 30 rounds, the latter instead of 1 022.
+
 Axis: **polyline** -- longest boundary loop of 268, 528 and 65 536 vertices. Polylines come from
 **mesh boundary loops**, not from mesh geometry, and the axis is a loop-length sweep rather than a
 face-count one: nothing here reads a face. The scan meshes are excluded on the same grounds --
@@ -64,8 +88,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import trimesh as tm
 import warp as wp
-from conftest import BenchCase, skip_larger_than
+from conftest import BenchCase, BenchLibrary, skip_larger_than
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
@@ -368,3 +393,47 @@ def test_triangulate_polyline(bench_case: BenchCase, n_vertices: int) -> None:
     )
     faces = bench_case.run(lambda: tw.polyline.triangulate_polyline(points_wp))
     assert int(faces.shape[0]) == n_vertices - 2
+
+
+_STAR_RINGS = [64, 1024]
+
+
+def _star_np(n: int) -> np.ndarray:
+    """Non-convex star ring: alternating radii, so ear clipping cannot take the single-fan path."""
+    angle_np = 2.0 * np.pi * np.arange(n) / n
+    radius_np = np.where(np.arange(n) % 2 == 0, 1.0, 0.45)
+    return np.column_stack((radius_np * np.cos(angle_np), radius_np * np.sin(angle_np)))
+
+
+def _star_wp(n: int, device: str) -> wp.array[wp.vec2]:
+    return wp.array(
+        np.ascontiguousarray(_star_np(n), dtype=np.float32), dtype=wp.vec2, device=device
+    )
+
+
+@pytest.mark.benchmark(group="triangulate_polygon")
+@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.parametrize("ring_size", _STAR_RINGS)
+def test_triangulate_polygon(bench_lib: BenchLibrary, ring_size: int) -> None:
+    """
+    Ear clipping on a *non-convex* ring: the only group here that reaches the clipper at all.
+
+    ``creation.extrude_polygon`` hands the triangulator a convex ring, which takes the single-fan
+    fast path and never reaches the ear loop (its row is in [`test_creation.py`](test_creation.py)).
+    A star ring forces it. Each round is fully parallel (four ``dim=n`` launches) and the round loop
+    itself runs on device, so what this group measures is **how many rounds the independent-set rule
+    needs**: 16 and 30, against 62 and 1 022 before the ranking hash.
+
+    At ``ring_size=64`` that is no longer the dominant term -- the clip is 0.22 ms of a 2.2 ms call
+    and the flat plane-fitting prologue is 1.05 -- so read the small point as a floor row and the
+    large one as a rounds ratio. No open3d counterpart.
+    """
+    shapely = pytest.importorskip("shapely.geometry")
+    if bench_lib.kind == "triwarp":
+        ring_wp = _star_wp(ring_size, str(bench_lib.device))
+        _vertices, faces_wp = bench_lib.run(lambda: tw.polyline.triangulate_polygon(ring_wp))
+        assert int(faces_wp.shape[0]) // 3 == ring_size - 2
+    else:
+        polygon = shapely.Polygon(_star_np(ring_size))
+        _vertices, faces_tm = bench_lib.run(lambda: tm.creation.triangulate_polygon(polygon))
+        assert faces_tm.shape[0] > 0

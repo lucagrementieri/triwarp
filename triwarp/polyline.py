@@ -28,6 +28,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import creation as kernel_creation
 from triwarp.kernels import polyline as kernel_polyline
 
 
@@ -802,7 +803,7 @@ def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     — not of iterating it, so at one round the captured form is slower and it breaks even by round
     three.
 
-    Measured on `benchmarks/test_creation.py`'s ``triangulate_polygon`` group, back to back:
+    Measured on `benchmarks/test_polyline.py`'s ``triangulate_polygon`` group, back to back:
     **2.07x** at a 64-point star (4.53 -> 2.19 ms) and **1.53x** at 1 024 (6.89 -> 4.51).
 
     **The prologue is now fused.** It used to be the dominant fixed cost: three reductions
@@ -929,3 +930,55 @@ def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
 
     count = int(out_count.numpy()[0])
     return twt.as_array2d(out_faces[0:count], wp.int32)
+
+
+def triangulate_polygon(polygon: wp.array[wp.vec2]) -> tuple[wp.array[wp.vec2], wp.array[wp.int32]]:
+    """
+    Triangulate a simple 2D polygon by ear clipping, adding no new vertices.
+
+    Parameters
+    ----------
+    polygon
+        ``(n,)`` 2D ring vertices, in order. A repeated closing point is dropped.
+
+    Returns
+    -------
+    ring : wp.array[wp.vec2]
+        The input ring with any repeated closing point removed; the vertices ``faces`` indexes.
+    faces : wp.array[wp.int32]
+        Length-``3 * (n - 2)`` flat triangle index buffer into ``ring``.
+
+    Notes
+    -----
+    Differs from [`trimesh.creation.triangulate_polygon`][] in three ways, all of which follow from
+    replacing the CPU polygon libraries (``mapbox_earcut`` / ``manifold3d`` / ``triangle``) with
+    triwarp's own GPU ear clipper, [`triangulate_polyline`][triwarp.polyline.triangulate_polyline]:
+
+    - The input is a ``wp.vec2`` ring, not a ``shapely.geometry.Polygon``, and **interior rings
+      (holes) are not supported**.
+    - No Steiner points are ever inserted, which is trimesh's ``force_vertices=True`` contract
+      rather than its default.
+    - There is no ``engine`` selection, and ``faces`` is flat rather than ``(m, 3)``, matching the
+      face layout used throughout triwarp.
+
+    The ring must be a simple (non self-intersecting) polygon. A degenerate ring yields a partial
+    triangulation with fewer than ``n - 2`` triangles rather than raising.
+
+    See Also
+    --------
+    [`triangulate_polyline`][triwarp.polyline.triangulate_polyline]
+    [`extrude_polygon`][triwarp.creation.extrude_polygon]
+    [`trimesh.creation.triangulate_polygon`][]
+    """
+    twt.ensure_ndim(polygon, 1, dtype=wp.vec2)
+    device = polygon.device
+    n = int(polygon.shape[0])
+    if n < 3:
+        return polygon, wp.empty(0, dtype=wp.int32, device=device)
+
+    lifted = wp.empty(n, dtype=wp.vec3, device=device)
+    wp.map(kernel_creation.lift_vec2, polygon, wp.float32(0.0), out=lifted)
+    opened = open_polyline(lifted)
+    faces = triangulate_polyline(opened).reshape((-1,))
+    # open_polyline only ever drops a repeated final point, so the matching 2D ring is a prefix.
+    return polygon[: int(opened.shape[0])].contiguous(), faces

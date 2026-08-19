@@ -126,30 +126,6 @@ of [`triwarp.creation.icosphere`][]) makes it ``subdivisions + 2`` launches and 
 floor with everything else: **19-31x** faster, and it now beats trimesh at every level rather than
 losing 6x at level 3 (245 µs against 472, and 345 µs against 67.1 ms at level 7, a 195x win).
 
-``triangulate_polygon`` is the remaining exception, and the module's worked example of a cost
-that is not where it looks. It delegates to ``polyline.triangulate_polyline``, a **parallel**
-multi-round ear clipper — every launch in the round loop is ``dim=n``, and a round clips a whole
-*independent set* of ears at once. What is serial is the **round count**: a round costs four
-``dim=n`` launches whatever it clips, so the only thing that matters is how many ears survive per
-round. Since the round loop moved onto the device (``wp.capture_while``, so no readback per round)
-that costs 14 µs a round at 64 points, and the group measures **2.2 / 4.5 ms** against 4.5 / 6.9
-before — 2.07x and 1.53x.
-
-Read the residual against its attribution rather than against the round loop, because the round loop
-is no longer the cost: at 64 points the clip itself is 0.22 ms of the 2.2, and **1.05 ms is the
-prologue** — ``open_polyline``'s ``is_closed`` (0.24), ``polyline_normal`` (0.35) and
-``polyline_centroid`` (0.25), three reductions that each end in a host readback because their result
-is a Python-scope ``wp.vec3``, plus the reflex-count readback. That share is *flat in n*, so it is
-the whole gap to trimesh's 0.12 ms at 64 points and none of it at 1 024.
-
-The round *count* is what this group caught first. ``select_independent`` used to rank competing
-ear candidates by their raw ring index, which on an alternating star lets ear ``i - 2`` suppress
-ear ``i`` for every ``i``, so exactly **one** ear was clipped per round and the loop ran to its
-``n`` cap: 6.1 ms at 64 points and **141 ms** at 1 024, growing as ``n^1.12`` (rounds proportional
-to ``n`` times a slowly growing per-round cost) rather than the ``O(L^2)`` a serial clipper would
-give. Ranking by a bijective hash of the ring index makes it the textbook maximal-independent-set
-rule, which retires a constant fraction per round: 16 and 30 rounds, the latter instead of 1 022.
-
 ``extrude_polygon`` only ever exercises the *convex* fast path (a single fan), which is why the ear
 clipper is benchmarked directly on a non-convex star ring — the same reasoning that puts
 ``polyline.simplify_polyline`` in its own group in [`test_polyline.py`](test_polyline.py). It is
@@ -198,7 +174,6 @@ _SWEEP_PATH = 4096
 # Ring sizes for the ear-clipping triangulator. Kept modest because the *round count*, not the
 # per-round work, is what grows -- and because the two points are what showed the round count was
 # growing linearly rather than logarithmically in the ring size.
-_STAR_RINGS = [64, 1024]
 
 
 def _o3d_mesh(bench_lib: BenchLibrary) -> type[o3d.geometry.TriangleMesh]:
@@ -224,19 +199,6 @@ def _ring_wp(n: int, device: str) -> wp.array[wp.vec2]:
 def _ring_np(n: int) -> np.ndarray:
     angle_np = 2.0 * np.pi * np.arange(n) / n
     return np.column_stack((np.cos(angle_np), np.sin(angle_np)))
-
-
-def _star_np(n: int) -> np.ndarray:
-    """Non-convex star ring: alternating radii, so ear clipping cannot take the single-fan path."""
-    angle_np = 2.0 * np.pi * np.arange(n) / n
-    radius_np = np.where(np.arange(n) % 2 == 0, 1.0, 0.45)
-    return np.column_stack((radius_np * np.cos(angle_np), radius_np * np.sin(angle_np)))
-
-
-def _star_wp(n: int, device: str) -> wp.array[wp.vec2]:
-    return wp.array(
-        np.ascontiguousarray(_star_np(n), dtype=np.float32), dtype=wp.vec2, device=device
-    )
 
 
 def _helix_np(n: int) -> np.ndarray:
@@ -693,34 +655,6 @@ def test_extrude_polygon(bench_lib: BenchLibrary, ring_size: int) -> None:
         polygon = shapely.Polygon(_ring_np(ring_size))
         mesh_tm = bench_lib.run(lambda: tm.creation.extrude_polygon(polygon, 1.0))
         assert len(mesh_tm.faces) > 0
-
-
-@pytest.mark.benchmark(group="triangulate_polygon")
-@pytest.mark.benchlibs("triwarp", "trimesh")
-@pytest.mark.parametrize("ring_size", _STAR_RINGS)
-def test_triangulate_polygon(bench_lib: BenchLibrary, ring_size: int) -> None:
-    """
-    Ear clipping on a *non-convex* ring: the only group here that reaches the clipper at all.
-
-    ``extrude_polygon`` above hands the triangulator a convex ring, which takes the single-fan fast
-    path and never reaches the ear loop. A star ring forces it. Each round is fully parallel (four
-    ``dim=n`` launches) and the round loop itself runs on device, so what this group measures is
-    **how many rounds the independent-set rule needs**: 16 and 30, against 62 and 1 022 before the
-    ranking hash.
-
-    At ``ring_size=64`` that is no longer the dominant term -- the clip is 0.22 ms of a 2.2 ms call
-    and the flat plane-fitting prologue is 1.05 -- so read the small point as a floor row and the
-    large one as a rounds ratio. No open3d counterpart.
-    """
-    shapely = pytest.importorskip("shapely.geometry")
-    if bench_lib.kind == "triwarp":
-        ring_wp = _star_wp(ring_size, str(bench_lib.device))
-        _vertices, faces_wp = bench_lib.run(lambda: tw.creation.triangulate_polygon(ring_wp))
-        assert int(faces_wp.shape[0]) // 3 == ring_size - 2
-    else:
-        polygon = shapely.Polygon(_star_np(ring_size))
-        _vertices, faces_tm = bench_lib.run(lambda: tm.creation.triangulate_polygon(polygon))
-        assert faces_tm.shape[0] > 0
 
 
 @pytest.mark.benchmark(group="sweep_polygon")

@@ -34,7 +34,7 @@ Differences from `trimesh.creation` that apply module-wide:
   [`extrude_triangulation`][triwarp.creation.extrude_triangulation]. Results that trimesh builds
   with ``process=False`` keep their duplicates here too.
 - Polygon inputs are ``wp.vec2`` rings rather than ``shapely`` polygons; interior rings (holes)
-  are not supported. See [`triangulate_polygon`][triwarp.creation.triangulate_polygon].
+  are not supported. See [`triangulate_polygon`][triwarp.polyline.triangulate_polygon].
 
 !!! note "Every function here costs at least ~340 µs, and most of them cost exactly that"
 
@@ -1174,7 +1174,7 @@ def revolve(
         For a partial revolution, triangulate the two end faces so the result is a closed volume.
         Ignored for a full revolution, which needs no caps. Requires a simple (non
         self-intersecting) profile — see
-        [`triangulate_polygon`][triwarp.creation.triangulate_polygon].
+        [`triangulate_polygon`][triwarp.polyline.triangulate_polygon].
     sections
         Number of pie wedges around the revolution. Defaults to 32 per full revolution, scaled by
         ``angle``.
@@ -1506,7 +1506,7 @@ def extrude_polygon(
     """
     Extrude a simple 2D polygon along Z into a watertight prism.
 
-    Triangulates the ring with [`triangulate_polygon`][triwarp.creation.triangulate_polygon] and
+    Triangulates the ring with [`triangulate_polygon`][triwarp.polyline.triangulate_polygon] and
     hands the result to [`extrude_triangulation`][triwarp.creation.extrude_triangulation].
 
     Parameters
@@ -1529,12 +1529,12 @@ def extrude_polygon(
 
     See Also
     --------
-    [`triangulate_polygon`][triwarp.creation.triangulate_polygon]
+    [`triangulate_polygon`][triwarp.polyline.triangulate_polygon]
     [`extrude_triangulation`][triwarp.creation.extrude_triangulation]
     [`sweep_polygon`][triwarp.creation.sweep_polygon]
     [`trimesh.creation.extrude_polygon`][]
     """
-    ring, faces = triangulate_polygon(polygon)
+    ring, faces = tw.polyline.triangulate_polygon(polygon)
     if mid_plane:
         translation = np.eye(4)
         translation[2, 3] = abs(float(height)) / -2.0
@@ -1544,58 +1544,6 @@ def extrude_polygon(
             composed = _transform_to_numpy(transform).dot(translation)
             transform = wp.mat44(*composed.flatten().tolist())
     return extrude_triangulation(ring, faces, height, transform=transform)
-
-
-def triangulate_polygon(polygon: wp.array[wp.vec2]) -> tuple[wp.array[wp.vec2], wp.array[wp.int32]]:
-    """
-    Triangulate a simple 2D polygon by ear clipping, adding no new vertices.
-
-    Parameters
-    ----------
-    polygon
-        ``(n,)`` 2D ring vertices, in order. A repeated closing point is dropped.
-
-    Returns
-    -------
-    ring : wp.array[wp.vec2]
-        The input ring with any repeated closing point removed; the vertices ``faces`` indexes.
-    faces : wp.array[wp.int32]
-        Length-``3 * (n - 2)`` flat triangle index buffer into ``ring``.
-
-    Notes
-    -----
-    Differs from [`trimesh.creation.triangulate_polygon`][] in three ways, all of which follow from
-    replacing the CPU polygon libraries (``mapbox_earcut`` / ``manifold3d`` / ``triangle``) with
-    triwarp's own GPU ear clipper, [`triangulate_polyline`][triwarp.polyline.triangulate_polyline]:
-
-    - The input is a ``wp.vec2`` ring, not a ``shapely.geometry.Polygon``, and **interior rings
-      (holes) are not supported**.
-    - No Steiner points are ever inserted, which is trimesh's ``force_vertices=True`` contract
-      rather than its default.
-    - There is no ``engine`` selection, and ``faces`` is flat rather than ``(m, 3)``, matching the
-      face layout used throughout triwarp.
-
-    The ring must be a simple (non self-intersecting) polygon. A degenerate ring yields a partial
-    triangulation with fewer than ``n - 2`` triangles rather than raising.
-
-    See Also
-    --------
-    [`extrude_polygon`][triwarp.creation.extrude_polygon]
-    [`triangulate_polyline`][triwarp.polyline.triangulate_polyline]
-    [`trimesh.creation.triangulate_polygon`][]
-    """
-    twt.ensure_ndim(polygon, 1, dtype=wp.vec2)
-    device = polygon.device
-    n = int(polygon.shape[0])
-    if n < 3:
-        return polygon, wp.empty(0, dtype=wp.int32, device=device)
-
-    lifted = wp.empty(n, dtype=wp.vec3, device=device)
-    wp.map(kernel_creation.lift_vec2, polygon, wp.float32(0.0), out=lifted)
-    opened = tw.polyline.open_polyline(lifted)
-    faces = tw.polyline.triangulate_polyline(opened).reshape((-1,))
-    # open_polyline only ever drops a repeated final point, so the matching 2D ring is a prefix.
-    return polygon[: int(opened.shape[0])].contiguous(), faces
 
 
 def sweep_polygon(
@@ -1659,7 +1607,7 @@ def sweep_polygon(
             f"angles must have one entry per path point ({n_path}), got {angles.shape}"
         )
 
-    ring, cap_faces = triangulate_polygon(polygon)
+    ring, cap_faces = tw.polyline.triangulate_polygon(polygon)
     stride = int(ring.shape[0])
     # oriented_boundary_edges only uses the vertex count (as its row-hash base), and the ring's own
     # 3D positions are never needed here, so a zero buffer of the right length is enough.

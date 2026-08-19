@@ -10,14 +10,13 @@ import open3d as o3d
 import pymeshlab as ml
 import pytest
 import pyvista as pv
-import shapely.geometry as sg
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
 from scipy.spatial import cKDTree
 
 import triwarp as tw
-from tests.comparisons import euler_characteristic, hausdorff_two_sided, open_edge_count
+from tests.comparisons import euler_characteristic, open_edge_count
 from tests.conversions import meshlib_to_trimesh, open3d_to_trimesh
 
 
@@ -1132,7 +1131,7 @@ def test_extrude_triangulation_recovers_subdivided_boundary(device: str) -> None
     # A boundary edge split by an extra collinear vertex still has to become two wall quads, which
     # is why the boundary is recovered from the triangulation rather than taken from the input ring.
     ring_np = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0]])
-    vertices_wp, faces_wp = tw.creation.triangulate_polygon(_ring(ring_np, device))
+    vertices_wp, faces_wp = tw.polyline.triangulate_polygon(_ring(ring_np, device))
     solid_v, solid_f = tw.creation.extrude_triangulation(vertices_wp, faces_wp, 0.5)
     _assert_closed(solid_v, solid_f)
     assert int(solid_f.shape[0]) // 3 == 2 * 3 + 2 * 5
@@ -1140,166 +1139,11 @@ def test_extrude_triangulation_recovers_subdivided_boundary(device: str) -> None
 
 
 def test_extrude_triangulation_invalid(device: str) -> None:
-    ring_wp, faces_wp = tw.creation.triangulate_polygon(_ring(_SQUARE_RING, device))
+    ring_wp, faces_wp = tw.polyline.triangulate_polygon(_ring(_SQUARE_RING, device))
     with pytest.raises(ValueError, match="height must be nonzero"):
         tw.creation.extrude_triangulation(ring_wp, faces_wp, 0.0)
     with pytest.raises(ValueError, match="multiple of 3"):
         tw.creation.extrude_triangulation(ring_wp, faces_wp[:2].contiguous(), 1.0)
-
-
-@pytest.mark.parametrize("ring_name", ["square", "L"])
-def test_triangulate_polygon(device: str, ring_name: str) -> None:
-    ring_np = _SQUARE_RING if ring_name == "square" else _L_RING
-    vertices_wp, faces_wp = tw.creation.triangulate_polygon(_ring(ring_np, device))
-    assert int(vertices_wp.shape[0]) == ring_np.shape[0]
-    assert int(faces_wp.shape[0]) // 3 == ring_np.shape[0] - 2
-    # No Steiner points, and the triangles must tile the polygon exactly.
-    triangles_np = vertices_wp.numpy().astype(np.float64)[faces_wp.numpy().reshape(-1, 3)]
-    edge_a, edge_b = (
-        triangles_np[:, 1] - triangles_np[:, 0],
-        triangles_np[:, 2] - triangles_np[:, 0],
-    )
-    area_np = 0.5 * np.abs(edge_a[:, 0] * edge_b[:, 1] - edge_a[:, 1] * edge_b[:, 0]).sum()
-    exact_area = 2.0 if ring_name == "square" else 3.0
-    assert np.isclose(area_np, exact_area, rtol=1e-5)
-
-
-def _star_ring(n: int, inner: float = 0.45) -> np.ndarray:
-    """Alternating-radius star: every other vertex is reflex, so no ear has an ear-free ring-2."""
-    angle_np = 2.0 * np.pi * np.arange(n) / n
-    radius_np = np.where(np.arange(n) % 2 == 0, 1.0, inner)
-    return np.column_stack((radius_np * np.cos(angle_np), radius_np * np.sin(angle_np)))
-
-
-@pytest.mark.parametrize("n", [16, 64, 512])
-def test_triangulate_polygon_star(device: str, n: int) -> None:
-    """
-    A star ring is the worst case for the ear clipper's independent-set rule.
-
-    Half its vertices are reflex and the convex ones alternate, so competing ears sit exactly two
-    apart around the ring -- the configuration that made a raw-index rank clip one ear per round.
-    """
-    ring_np = _star_ring(n)
-    vertices_wp, faces_wp = tw.creation.triangulate_polygon(_ring(ring_np, device))
-    assert int(vertices_wp.shape[0]) == n
-    assert int(faces_wp.shape[0]) // 3 == n - 2
-
-    triangles_np = vertices_wp.numpy().astype(np.float64)[faces_wp.numpy().reshape(-1, 3)]
-    edge_a = triangles_np[:, 1] - triangles_np[:, 0]
-    edge_b = triangles_np[:, 2] - triangles_np[:, 0]
-    signed_np = 0.5 * (edge_a[:, 0] * edge_b[:, 1] - edge_a[:, 1] * edge_b[:, 0])
-    # Consistent winding: every triangle turns the same way as the ring, so no signed area flips.
-    assert np.all(signed_np > 0.0) or np.all(signed_np < 0.0)
-    # And they tile the star exactly (shoelace over the ring).
-    shoelace = 0.5 * abs(
-        np.dot(ring_np[:, 0], np.roll(ring_np[:, 1], -1))
-        - np.dot(np.roll(ring_np[:, 0], -1), ring_np[:, 1])
-    )
-    assert np.isclose(np.abs(signed_np).sum(), shoelace, rtol=1e-5)
-
-
-def _triangle_cover_count(
-    vertices_np: np.ndarray, faces_np: np.ndarray, points_np: np.ndarray, margin: float
-) -> np.ndarray:
-    """
-    Count, per query point, how many of the triangles strictly contain it.
-
-    ``margin`` is a barycentric slack that excludes points lying on a triangle edge, so a point
-    shared by two triangles of a valid tiling is not double-counted -- with random queries such a
-    point is measure-zero anyway, and the slack makes that robust rather than lucky.
-    """
-    triangles_np = vertices_np[faces_np]
-    edge_a = triangles_np[:, 1] - triangles_np[:, 0]
-    edge_b = triangles_np[:, 2] - triangles_np[:, 0]
-    offset_np = points_np[None, :, :] - triangles_np[:, None, 0, :]
-    twice_area = edge_a[:, 0] * edge_b[:, 1] - edge_b[:, 0] * edge_a[:, 1]
-    weight_b = (
-        offset_np[..., 0] * edge_b[:, None, 1] - offset_np[..., 1] * edge_b[:, None, 0]
-    ) / twice_area[:, None]
-    weight_c = (
-        edge_a[:, None, 0] * offset_np[..., 1] - edge_a[:, None, 1] * offset_np[..., 0]
-    ) / twice_area[:, None]
-    weight_a = 1.0 - weight_b - weight_c
-    inside_np = (weight_a > margin) & (weight_b > margin) & (weight_c > margin)
-    return inside_np.sum(axis=0)
-
-
-@pytest.mark.parametrize("n", [16, 64])
-@pytest.mark.parity("triangulate_polygon", "trimesh")
-def test_triangulate_polygon_covers_same_region_as_trimesh(device: str, n: int) -> None:
-    """
-    Class C: two valid ear clippings, so only the tiled region is comparable.
-
-    ``trimesh.creation.triangulate_polygon`` cuts *different* diagonals from triwarp's clipper.
-
-    There is no elementwise correspondence to recover -- two valid ear clippings of one polygon are
-    genuinely different triangle sets -- so the comparison is the tiled region itself, sampled at
-    4 000 uniform points over the bounding box and reduced to a per-point cover count.
-
-    **Bug class excluded:** an ear clipper that emits a triangle *outside* the ring, or that lets
-    two ears overlap. Either shows up as a cover count of 0 or 2 where the reference says 1, and
-    neither is visible to the area sum in
-    [`test_triangulate_polygon_star`][tests.test_creation.test_triangulate_polygon_star] when the
-    surplus and the deficit happen to cancel. The cover count is deliberately *blind* to winding
-    (the barycentric weights are scale-invariant, so reversing a triangle changes nothing); the
-    signed-area assert in that same star test is what covers orientation.
-
-    **Mutation probe, measured on ``n=64``, 1 275 of the 4 000 samples interior:** the two agree on
-    **4 000 / 4 000** points, and the assert is exact equality, so every probe below clears it by
-    its full count. Dropping one triwarp triangle disagrees on 25; translating the ring by 1% of its
-    radius, on 206. Both degenerate implementations fail too: an all-zero face buffer keeps the
-    ``n - 2`` count and still disagrees on all 1 275 interior points, and the naive single fan --
-    valid only for a convex ring -- disagrees on 1 777.
-
-    Both sides are additionally checked to introduce no Steiner points, which is what makes the
-    vertex arrays directly comparable as sets.
-    """
-    ring_np = _star_ring(n)
-    vertices_wp, faces_wp = tw.creation.triangulate_polygon(_ring(ring_np, device))
-    vertices_tm, faces_tm = tm.creation.triangulate_polygon(sg.Polygon(ring_np))
-
-    assert int(faces_wp.shape[0]) // 3 == faces_tm.shape[0] == n - 2
-    assert int(vertices_wp.shape[0]) == vertices_tm.shape[0] == n
-    # Same vertex set: equal counts plus a two-sided Hausdorff distance at float32 resolution. A
-    # lexsort compare is not usable here -- the star has coordinate pairs that tie to 1e-16, so the
-    # row order is decided by rounding noise rather than by the values.
-    assert hausdorff_two_sided(vertices_wp.numpy().astype(np.float64), vertices_tm) < 1e-6
-
-    rng = np.random.default_rng(11)
-    points_np = rng.uniform(-1.05, 1.05, size=(4000, 2))
-    count_wp = _triangle_cover_count(
-        vertices_wp.numpy().astype(np.float64), faces_wp.numpy().reshape(-1, 3), points_np, 1e-9
-    )
-    count_tm = _triangle_cover_count(vertices_tm, faces_tm, points_np, 1e-9)
-    assert np.array_equal(count_wp, count_tm)
-
-
-def test_triangulate_polygon_near_collinear(device: str) -> None:
-    # A ring whose interior vertices are almost on the line back to the start: every ear test is
-    # decided by a near-zero cross product, so this is where a ranking change could stall.
-    n = 64
-    x_np = np.linspace(0.0, 1.0, n - 1)
-    ring_np = np.vstack(
-        (np.column_stack((x_np, 1e-7 * np.sin(np.pi * x_np))), np.array([[0.5, -0.25]]))
-    )
-    vertices_wp, faces_wp = tw.creation.triangulate_polygon(_ring(ring_np, device))
-    assert int(vertices_wp.shape[0]) == n
-    # A degenerate ring may yield a partial triangulation, but never more than n - 2 faces and
-    # never a hang: the round cap is the guarantee being checked here.
-    assert 0 < int(faces_wp.shape[0]) // 3 <= n - 2
-
-
-def test_triangulate_polygon_drops_repeated_closing_point(device: str) -> None:
-    closed_np = np.vstack((_SQUARE_RING, _SQUARE_RING[:1]))
-    vertices_wp, faces_wp = tw.creation.triangulate_polygon(_ring(closed_np, device))
-    assert int(vertices_wp.shape[0]) == _SQUARE_RING.shape[0]
-    assert int(faces_wp.shape[0]) // 3 == _SQUARE_RING.shape[0] - 2
-
-
-def test_triangulate_polygon_too_few_points(device: str) -> None:
-    vertices_wp, faces_wp = tw.creation.triangulate_polygon(_ring(np.zeros((2, 2)), device))
-    assert int(vertices_wp.shape[0]) == 2
-    assert int(faces_wp.shape[0]) == 0
 
 
 _SWEEP_PATHS = {

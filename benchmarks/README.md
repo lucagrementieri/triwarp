@@ -55,7 +55,7 @@ four are kept in their modules as worked examples of what the axis rule is for:
   because each hole paid its own readbacks, chord pass and span launches. Batching the interval DP
   across loops took it to **4.2 ms**, and dropped the two-rim point to 157 ms by running both rims
   in the same launches.
-- **`creation.triangulate_polygon`** was **23×** across its resolution points (6.1 ms → 141 ms on a
+- **`polyline.triangulate_polygon`** was **23×** across its resolution points (6.1 ms → 141 ms on a
   1024-point star) and an 80× loss to trimesh. The ear clipper is parallel; what was linear in the
   ring size was its *round count*, because competing ears were ranked by raw ring index and a star
   ring makes that rank suppress all but one ear per round. Ranking by a hash of the index gives
