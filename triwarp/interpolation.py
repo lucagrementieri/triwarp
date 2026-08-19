@@ -381,7 +381,7 @@ def interpolate_from_points(
         n_slots = n_query * int(k)
         indices = row_indices.reshape((n_slots,))
         distances = row_distances.reshape((n_slots,))
-        offsets = tw.array.init_range_step(n_query + 1, int(k), device)
+        offsets = tw.array.arange_step(n_query + 1, int(k), device)
 
     wp.launch(
         kernel_interpolation.interpolate_from_points,

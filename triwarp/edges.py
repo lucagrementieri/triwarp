@@ -19,7 +19,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.array import init_repeat_index
+from triwarp.array import repeat_range
 from triwarp.kernels import edges as kernel_edges
 
 
@@ -82,7 +82,7 @@ def edges_face(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
     [`trimesh.Trimesh.edges_face`][]
     """
     n_faces = int(faces.shape[0]) // 3
-    return init_repeat_index(n_faces * 3, 3, faces.device)
+    return repeat_range(n_faces * 3, 3, faces.device)
 
 
 def edges_unique(

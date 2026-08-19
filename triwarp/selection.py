@@ -8,7 +8,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.array import init_range
+from triwarp.array import arange
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import selection as kernel_selection
 
@@ -166,7 +166,7 @@ def submesh_from_face_indices(
 
     if unique_indices:
         unique_face_indices = face_indices
-        face_slots = init_range(k, device)
+        face_slots = arange(k, device)
     else:
         unique_face_indices, face_slots = tw.grouping.unique_1d(face_indices, return_inverse=True)
 

@@ -10,11 +10,11 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.array import (
+    arange,
     bitcast_from_int,
     bitcast_to_int,
     gather,
-    init_range,
-    init_sort_pair_indices,
+    sort_pair_indices,
     sortable_dtype,
 )
 from triwarp.kernels import array as kernel_array
@@ -61,7 +61,7 @@ def group(values: wp.array[wp.Int], length: int) -> twt.Array2dInt32:
         wp.copy(values_buffer, values, count=n)
     else:
         wp.utils.array_cast(values, values_buffer, count=n)
-    indices_buffer = init_sort_pair_indices(n, -1, device)
+    indices_buffer = sort_pair_indices(n, -1, device)
     wp.utils.radix_sort_pairs(values_buffer, indices_buffer, count=n)
 
     # Scan + scatter compaction: mark run starts, compact them with flatnonzero, then emit one
@@ -744,7 +744,7 @@ def _unique_hash(
     # the way the caller's dtype does rather than by their reinterpreted bit pattern.
     sort_dtype = sortable_dtype(original_dtype)
     keys_buf = bitcast_from_int(keys_compact, sort_dtype, count=2 * n_unique)
-    perm_buf = init_range(2 * n_unique, device)
+    perm_buf = arange(2 * n_unique, device)
     wp.utils.radix_sort_pairs(keys_buf, perm_buf, count=n_unique)
 
     if sort_dtype == original_dtype:

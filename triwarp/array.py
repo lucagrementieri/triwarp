@@ -1,4 +1,4 @@
-"""NumPy-style structural and elementwise operations on Warp arrays (init, gather, sort, masks)."""
+"""NumPy-style structural and elementwise ops on Warp arrays (ranges, gather, sort, masks)."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ _ISIN_MASK_SIZE_FACTOR = 8
 SORT_ROWS_INSERTION_MAX_COLS = 8
 
 
-def init_range(n: int, device: wp.DeviceLike, *, dtype: type[wp.Int] = wp.int32) -> wp.array:
+def arange(n: int, device: wp.DeviceLike, *, dtype: type[wp.Int] = wp.int32) -> wp.array:
     """
     Fill ``out[i] = i`` for ``i`` in ``[0, n)`` (``numpy.arange``).
 
@@ -59,7 +59,7 @@ def init_range(n: int, device: wp.DeviceLike, *, dtype: type[wp.Int] = wp.int32)
     return out
 
 
-def init_range_step(
+def arange_step(
     count: int, step: int, device: wp.DeviceLike, *, dtype: type[wp.Int] = wp.int32
 ) -> wp.array:
     """
@@ -105,7 +105,7 @@ def init_range_step(
     return out
 
 
-def init_sort_pair_indices(
+def sort_pair_indices(
     n: int, fill_value: int, device: str, *, dtype: type[wp.Int] = wp.int32
 ) -> wp.array:
     """
@@ -156,7 +156,7 @@ def init_sort_pair_indices(
     return out
 
 
-def init_repeat_index(
+def repeat_range(
     count: int, repeats: int, device: str, *, dtype: type[wp.Int] = wp.int32
 ) -> wp.array:
     """
@@ -491,7 +491,7 @@ def sort_and_argsort(
     See Also
     --------
     [`sort_rows`][triwarp.array.sort_rows]
-    [`init_sort_pair_indices`][triwarp.array.init_sort_pair_indices]
+    [`sort_pair_indices`][triwarp.array.sort_pair_indices]
     [`sortable_dtype`][triwarp.array.sortable_dtype]
     """
     device = keys.device
@@ -500,7 +500,7 @@ def sort_and_argsort(
         return keys, wp.empty(0, dtype=wp.int32, device=device)
     keys_buffer = wp.empty(2 * n, dtype=keys.dtype, device=device)
     wp.copy(keys_buffer, keys, count=n)
-    order_buffer = init_sort_pair_indices(n, fill_value, device)
+    order_buffer = sort_pair_indices(n, fill_value, device)
     wp.utils.radix_sort_pairs(keys_buffer, order_buffer, count=n)
     return keys_buffer[:n], order_buffer[:n]
 
@@ -535,8 +535,8 @@ def sort_rows(data: twt.Array2dInt32 | twt.Array2dFloat32) -> None:
 
     data_buffer = wp.empty(n * 2, dtype=data.dtype, device=data.device)
     wp.copy(data_buffer, data, count=n)
-    indices_buffer = init_sort_pair_indices(n, -1, data.device)
-    segment_start_indices = init_range_step(n // n_cols + 1, n_cols, data.device)
+    indices_buffer = sort_pair_indices(n, -1, data.device)
+    segment_start_indices = arange_step(n // n_cols + 1, n_cols, data.device)
     wp.utils.segmented_sort_pairs(
         data_buffer, indices_buffer, n, segment_start_indices=segment_start_indices
     )
@@ -641,7 +641,7 @@ def index_sparse(
             data = astype(data, dtype)
 
     n_cols, n_repeats = indices.shape
-    cols = init_repeat_index(n_cols * n_repeats, n_repeats, indices.device)
+    cols = repeat_range(n_cols * n_repeats, n_repeats, indices.device)
     return wps.bsr_from_triplets(
         n_rows,
         indices.shape[0],

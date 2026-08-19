@@ -9,7 +9,7 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.array import init_range
+from triwarp.array import arange
 from triwarp.constants import INT32_MAX
 from triwarp.kernels import graph as kernel_graph
 from triwarp.kernels.algorithms import bfs as kernel_bfs
@@ -131,7 +131,7 @@ def connected_component_labels(adjacency: wps.BsrMatrix[wp.Scalar]) -> wp.array[
     if node_count <= 1:
         return wp.zeros(node_count, dtype=wp.int32, device=device)
     if adjacency.nnz == 0:
-        return init_range(node_count, device)
+        return arange(node_count, device)
 
     labels = wp.empty(node_count, dtype=wp.int32, device=device)
     parents = wp.empty(node_count, dtype=wp.int32, device=device)
@@ -212,10 +212,10 @@ def connected_component_labels_from_edges(
     """
     node_count = _validate_edge_list(edges, node_count, validate=validate)
 
-    # With no edges every node is its own component, which ``init_range`` gives directly -- the
+    # With no edges every node is its own component, which ``arange`` gives directly -- the
     # CSR build and traversal below would reach the same answer the long way.
     if int(edges.shape[0]) == 0:
-        return init_range(node_count, edges.device)
+        return arange(node_count, edges.device)
 
     adjacency = edges_to_csr(node_count, edges)
     return connected_component_labels(adjacency)
@@ -812,7 +812,7 @@ def bfs_multi_source(
     labels = connected_component_labels(adjacency)
     n = int(node_count)
     keys_buffer = wp.empty(2 * n, dtype=wp.int64, device=device)
-    node_ids = tw.array.init_sort_pair_indices(n, -1, device)
+    node_ids = tw.array.sort_pair_indices(n, -1, device)
     wp.launch(
         kernel_graph.pack_label_node_keys,
         dim=n,

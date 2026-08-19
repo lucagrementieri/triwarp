@@ -522,7 +522,7 @@ def _collapse_pass(
             inputs=[survivor, removed, csr.offsets, csr.columns, claim],
             device=device,
         )
-        remap = tw.array.init_range(n_vertices, device)
+        remap = tw.array.arange(n_vertices, device)
         positions = wp.clone(vertices)
         count = wp.zeros(1, dtype=wp.int32, device=device)
         wp.launch(
@@ -1452,7 +1452,7 @@ class _DecimationBuffers:
         locked = wp.zeros(self.n_vertices + 1, dtype=wp.int32, device=device)
         min_key = wp.empty(self.n_vertices + 1, dtype=wp.int32, device=device)
         claim = wp.empty(self.n_vertices + 1, dtype=wp.int32, device=device)
-        remap = tw.array.init_range(self.n_vertices + 1, device)
+        remap = tw.array.arange(self.n_vertices + 1, device)
         wp.copy(self._positions, self.vertices)
         self._count.zero_()
 
@@ -2547,7 +2547,7 @@ def subdivide_to_size(
     current_vertices = vertices
     current_faces = faces
     n_faces = int(faces.shape[0]) // 3
-    index = tw.array.init_range(n_faces, device)
+    index = tw.array.arange(n_faces, device)
 
     if n_faces == 0:
         if return_index:
@@ -2953,7 +2953,7 @@ def split_edges(
             f"got {int(split_mask.shape[0])}."
         )
 
-    carried = index if index is not None else tw.array.init_range(n_faces, device)
+    carried = index if index is not None else tw.array.arange(n_faces, device)
     if int(carried.shape[0]) != n_faces:
         raise ValueError(
             f"index must have one entry per face ({n_faces}), got {int(carried.shape[0])}."

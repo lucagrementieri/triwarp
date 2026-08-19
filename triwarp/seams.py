@@ -347,7 +347,7 @@ def uv_seam_edges(
             twt.empty_2d((0, 4), wp.int32, device=device),
         )
     if face_texcoords is None:
-        face_texcoords = tw.array.init_range(3 * n_faces, device)
+        face_texcoords = tw.array.arange(3 * n_faces, device)
 
     n_halfedges = 3 * n_faces
     twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)

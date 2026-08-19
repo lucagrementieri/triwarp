@@ -2242,7 +2242,7 @@ def random_soup(
             inputs=[wp.int32(resolved_seed), vertices],
             device=device,
         )
-    return vertices, tw.array.init_range(n, vertices.device)
+    return vertices, tw.array.arange(n, vertices.device)
 
 
 # --- private helpers ---------------------------------------------------------------------

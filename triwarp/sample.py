@@ -10,7 +10,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.array import flatnonzero, gather, init_range
+from triwarp.array import arange, flatnonzero, gather
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import sample as kernel_sample
 from triwarp.kernels.algorithms import blue_noise as kernel_blue_noise
@@ -553,7 +553,7 @@ def _dart_throw_blue_noise(
 
     # Work-list buffers sized for their final use once: the first round's list is the whole pool and
     # every later one is a prefix of it, so nothing here is reallocated per round.
-    alive = init_range(n_pool, device)
+    alive = arange(n_pool, device)
     next_alive = wp.empty(n_pool, dtype=wp.int32, device=device)
     survivor_flag = wp.empty(n_pool, dtype=wp.int32, device=device)
     positions = wp.empty(n_pool, dtype=wp.int32, device=device)
