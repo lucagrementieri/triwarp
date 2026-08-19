@@ -290,6 +290,38 @@ def _cone_fan(sections: int) -> _Arrays:
     return mesh.vertices, mesh.faces
 
 
+def _handles(holes_per_side: int, max_edge: float = 0.195, span: float = 16.0) -> _Arrays:
+    """
+    Punch ``holes_per_side ** 2`` tunnels through a closed slab: a surface of that genus.
+
+    The only mesh family here whose perturbed property is **topological genus**, which nothing else
+    in either registry has -- every scan mesh and every other feature mesh is genus 0, and
+    ``triwarp.homology`` needs a closed surface with handles or it has nothing to find.
+
+    Built in the order that makes the face count a smooth knob: subdivide the slab *first*, then cut
+    the holes. Cutting first and subdividing after quantizes the count in powers of four (measured
+    46 976 faces across an entire range of edge lengths, because the slab's six big faces subdivide
+    together), which makes matching the two ends of the axis impossible. This way both ends take the
+    identical ``max_edge`` and land within 5 % of each other and of the control's 81 920.
+
+    The hole radius scales with the spacing, so the two ends differ in genus and in nothing else a
+    homology basis can see: same footprint, same tessellation scale, same wall-to-slab proportion.
+    """
+    slab = tm.creation.box(extents=[span, span, 1.0])
+    vertices, faces = tm.remesh.subdivide_to_size(slab.vertices, slab.faces, max_edge=max_edge)
+    step = span / holes_per_side
+    tunnels = []
+    for i in range(holes_per_side):
+        for j in range(holes_per_side):
+            tunnel = tm.creation.cylinder(radius=0.3 * step, height=3.0, sections=16)
+            tunnel.apply_translation(
+                [-0.5 * span + step * (i + 0.5), -0.5 * span + step * (j + 0.5), 0.0]
+            )
+            tunnels.append(tunnel)
+    mesh = tm.boolean.difference([tm.Trimesh(vertices, faces, process=False), *tunnels])
+    return mesh.vertices, mesh.faces
+
+
 def _hemisphere(subdivisions: int) -> _Arrays:
     """Curved disk patch with a single rim, cut from an icosphere by an uncapped plane slice."""
     mesh = tm.creation.icosphere(subdivisions=subdivisions).slice_plane(
@@ -321,6 +353,8 @@ FEATURE_MESHES: list[MeshSpec] = [
     _mesh("hemisphere", "", 20_737, 41_088, "patch"),
     _mesh("shells_8", "", 20_496, 40_960, "depth"),
     _mesh("tangle_2", "", 20_484, 40_960, "overlap"),
+    _mesh("handles_1", "", 44_580, 89_160, "genus"),
+    _mesh("handles_64", "", 46_862, 93_976, "genus"),
 ]
 FEATURE_MESHES_BY_NAME = {mesh["name"]: mesh for mesh in FEATURE_MESHES}
 ALL_MESHES_BY_NAME = {**MESHES_BY_NAME, **FEATURE_MESHES_BY_NAME}
@@ -343,6 +377,8 @@ BUILDERS: dict[str, Callable[[], _Arrays]] = {
     "hemisphere": lambda: _hemisphere(6),
     "shells_8": lambda: _spheres(4, 8, "concentric"),
     "tangle_2": lambda: _spheres(5, 2, "overlap"),
+    "handles_1": lambda: _handles(1),
+    "handles_64": lambda: _handles(8),
 }
 
 
@@ -379,4 +415,7 @@ AXES: dict[str, tuple[str, ...]] = {
     "depth": ("sphere_med", "shells_8"),
     # Disjoint -> deeply interpenetrating, for collision density.
     "overlap": ("sphere_med", "tangle_2"),
+    # Genus 0 -> 1 -> 64 at ~90 000 faces: the number of handles, which is the only thing a
+    # homology basis is looking for and the only property no other mesh here varies.
+    "genus": ("sphere_med", "handles_1", "handles_64"),
 }

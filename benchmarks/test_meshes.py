@@ -48,6 +48,10 @@ _TOPOLOGY: dict[str, tuple[int, bool, int, int]] = {
     "hemisphere": (1, False, 1, 6),
     "shells_8": (8, True, 0, 6),
     "tangle_2": (2, True, 0, 6),
+    # The two genus meshes come out of a boolean, so their valence peaks are whatever the
+    # retriangulation around a tunnel produced -- recorded rather than designed, unlike the rest.
+    "handles_1": (1, True, 0, 16),
+    "handles_64": (1, True, 0, 14),
 }
 
 
@@ -111,6 +115,25 @@ def test_diameter_and_valence_axes_pin_vertex_count() -> None:
     assert len(_built("fan_hub").vertices) == control
     # fan_hub additionally matches on faces, so valence is the only difference at all.
     assert len(_built("fan_hub").faces) == len(_built("sphere_med").faces)
+
+
+def test_genus_axis_pins_the_face_count_and_varies_only_the_genus() -> None:
+    """
+    0 -> 1 -> 64 handles at ~90 000 faces, on one footprint at one tessellation scale.
+
+    The face counts cannot be pinned *exactly* -- a boolean decides how many triangles a tunnel
+    costs -- so what is asserted is that they stay within 15 % of each other, which is what keeps a
+    timing spread across this axis attributable to the handles rather than to size. The genus
+    itself comes from the Euler characteristic, and both ends must be closed for it to mean
+    anything.
+    """
+    handles_1, handles_64 = _built("handles_1"), _built("handles_64")
+    assert handles_1.is_watertight
+    assert handles_64.is_watertight
+    assert (2 - handles_1.euler_number) // 2 == 1
+    assert (2 - handles_64.euler_number) // 2 == 64
+    counts = [len(_built(name).faces) for name in AXES["genus"]]
+    assert max(counts) / min(counts) < 1.15, counts
 
 
 def test_quality_axis_pins_connectivity() -> None:

@@ -50,16 +50,7 @@ def test_homology_generator_count_is_twice_the_genus(
 
 
 @pytest.mark.parametrize(("mesh_name", "genus"), [("torus", 1), ("genus_two", 2)])
-@pytest.mark.parity(
-    "homology_generators",
-    "meshlib",
-    benchmarked=False,
-    reason="there is nothing in the benchmark registry to time this on: homology_generators "
-    "requires a *closed* surface and every scan mesh has boundary (bunny_decimated has 723 "
-    "boundary edges, and triwarp raises rather than guessing), while no feature mesh has positive "
-    "genus. detectBasisTunnels is a real reference and is compared here; the missing piece is a "
-    "closed genus-g benchmark mesh, not an oracle.",
-)
+@pytest.mark.parity("homology_generators", "meshlib")
 def test_homology_generator_count_matches_meshlib(
     request: pytest.FixtureRequest, mesh_name: str, genus: int
 ) -> None:

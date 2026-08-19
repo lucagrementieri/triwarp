@@ -146,11 +146,6 @@ _MODULES_WITHOUT_BENCHMARKS = frozenset(
     {
         "constants",  # no callables
         "typing",  # annotations and rank/dtype guards; nothing with a runtime cost
-        # meshlib's ``detectBasisTunnels`` *is* a reference basis and is compared in
-        # ``tests/test_homology.py``; what is missing is an input. ``homology_generators`` requires
-        # a closed surface, every scan mesh has boundary (bunny_decimated: 723 boundary edges) and
-        # no feature mesh has positive genus, so the group would have nothing to run on.
-        "homology",
         "io",  # meshio round-trips, i.e. a benchmark of meshio
     }
 )
