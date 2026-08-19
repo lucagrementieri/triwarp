@@ -877,11 +877,13 @@ def test_make_repairs_empty_mesh(device: str) -> None:
 # --- degenerate / small triangle removal ----------------------------------------------------
 
 
-_MERGE_TOL = 1e-8  # matches triwarp.constants.TOLERANCE_MERGE used by triangles.nondegenerate
+_MERGE_TOL = (
+    1e-8  # matches triwarp.constants.TOLERANCE_MERGE used by triangles.face_nondegenerate_mask
+)
 
 
 def _nondegenerate_ref(vertices_np: np.ndarray, faces_np: np.ndarray) -> np.ndarray:
-    """CPU mirror of ``triangles.nondegenerate`` (per-edge altitude vs the merge tolerance)."""
+    """CPU mirror of ``triangles.face_nondegenerate_mask`` (per-edge altitude vs the tolerance)."""
     if faces_np.shape[0] == 0:
         return np.empty(0, dtype=bool)
     v0 = vertices_np[faces_np[:, 0]]
@@ -1372,7 +1374,7 @@ def test_remove_degenerate_faces_matches_meshlib(device: str) -> None:
     faces_np = np.array([[0, 1, 2], [1, 3, 2], [0, 4, 1]], dtype=np.int32)  # face 2 is collinear
 
     vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
-    keep_wp = tw.triangles.nondegenerate(vertices_wp, faces_wp)
+    keep_wp = tw.triangles.face_nondegenerate_mask(vertices_wp, faces_wp)
     kept_vertices_wp, kept_faces_wp = tw.repair.remove_degenerate_faces(vertices_wp, faces_wp)
 
     mesh_ml = numpy_to_meshlib(vertices_np, faces_np)

@@ -236,7 +236,7 @@ def face_quality(
 
 
 @wp.kernel
-def nondegenerate(
+def face_nondegenerate_mask(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_nondegenerate: wp.array[wp.bool]
 ) -> None:
     f = wp.tid()

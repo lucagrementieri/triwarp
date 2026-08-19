@@ -333,11 +333,16 @@ class Trimesh:
         """
         Length-``n_faces`` mask; ``True`` where the triangle has non-zero area.
 
+        Named for ``trimesh.Trimesh.nondegenerate_faces`` rather than for the function it calls:
+        matching trimesh's property names is this facade's whole job, so the property keeps the
+        spelling a reader arrives with while the module-level function is
+        [`face_nondegenerate_mask`][triwarp.triangles.face_nondegenerate_mask].
+
         See Also
         --------
-        [`triwarp.triangles.nondegenerate`][]
+        [`face_nondegenerate_mask`][triwarp.triangles.face_nondegenerate_mask]
         """
-        return tw.triangles.nondegenerate(self._vertices, self._faces)
+        return tw.triangles.face_nondegenerate_mask(self._vertices, self._faces)
 
     @_CachedProperty
     def mean_edge_length(self) -> float:

@@ -299,9 +299,9 @@ def remove_degenerate_faces(
 
     Mirrors ``trimesh.Trimesh.nondegenerate_faces`` + ``update_faces``: a face is degenerate when
     two of its vertices coincide or its three vertices are collinear, detected by
-    [`nondegenerate`][triwarp.triangles.nondegenerate] (both triangle altitudes exceed the merge
-    tolerance). Surviving faces are unchanged; vertices left unreferenced after the drop are
-    removed by the reindexing in
+    [`face_nondegenerate_mask`][triwarp.triangles.face_nondegenerate_mask] (both triangle altitudes
+    exceed the merge tolerance). Surviving faces are unchanged; vertices left unreferenced after the
+    drop are removed by the reindexing in
     [`submesh_from_face_mask`][triwarp.selection.submesh_from_face_mask].
 
     Unlike [`collapse_small_triangles`][triwarp.repair.collapse_small_triangles], no vertices are
@@ -324,14 +324,14 @@ def remove_degenerate_faces(
     See Also
     --------
     [`collapse_small_triangles`][triwarp.repair.collapse_small_triangles]
-    [`nondegenerate`][triwarp.triangles.nondegenerate]
+    [`face_nondegenerate_mask`][triwarp.triangles.face_nondegenerate_mask]
     [`trimesh.triangles.nondegenerate`][]
     """
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
         return wp.clone(vertices), wp.clone(faces)
 
-    keep_mask = tw.triangles.nondegenerate(vertices, faces)
+    keep_mask = tw.triangles.face_nondegenerate_mask(vertices, faces)
     return tw.selection.submesh_from_face_mask(vertices, faces, keep_mask)
 
 
@@ -545,7 +545,7 @@ def collapse_small_triangles(
     See Also
     --------
     [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
-    [`nondegenerate`][triwarp.triangles.nondegenerate]
+    [`face_nondegenerate_mask`][triwarp.triangles.face_nondegenerate_mask]
 
     Notes
     -----
@@ -598,7 +598,7 @@ def collapse_small_triangles(
         class_vertices = tw.array.gather(current_vertices, unique_indices)
         remapped_faces = tw.array.remap_indices(current_faces, inverse)
 
-        keep_mask = tw.triangles.nondegenerate(class_vertices, remapped_faces)
+        keep_mask = tw.triangles.face_nondegenerate_mask(class_vertices, remapped_faces)
         current_vertices, current_faces = tw.selection.submesh_from_face_mask(
             class_vertices, remapped_faces, keep_mask
         )

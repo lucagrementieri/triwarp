@@ -440,7 +440,7 @@ def test_face_quality_unknown_metric(icosahedron: tuple[tm.Trimesh, wp.Mesh]):
         tw.triangles.face_quality(mesh_wp.points, mesh_wp.indices, metric="skewness")  # type: ignore[arg-type]
 
 
-def test_nondegenerate(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
+def test_face_nondegenerate_mask(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     """
     Class A on a boolean mask, against ``trimesh.triangles.nondegenerate``.
 
@@ -449,7 +449,7 @@ def test_nondegenerate(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     """
     mesh_tm, mesh_wp = hemisphere
     nondegenerate_tm = tm.triangles.nondegenerate(mesh_tm.triangles)
-    nondegenerate_wp = tw.triangles.nondegenerate(mesh_wp.points, mesh_wp.indices)
+    nondegenerate_wp = tw.triangles.face_nondegenerate_mask(mesh_wp.points, mesh_wp.indices)
     assert np.array_equal(nondegenerate_wp.numpy().astype(bool), nondegenerate_tm)
 
 

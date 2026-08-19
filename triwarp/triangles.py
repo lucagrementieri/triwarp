@@ -5,8 +5,9 @@ Quantities carried by one triangle at a time: its normal, area, angles, shape an
 [`face_angles`][triwarp.triangles.face_angles],
 [`face_centroids`][triwarp.triangles.face_centroids] and
 [`face_quality`][triwarp.triangles.face_quality] are the per-face fields the rest of the package
-reduces over; [`nondegenerate`][triwarp.triangles.nondegenerate] flags the faces those quantities
-are meaningless on. [`barycentric_to_points`][triwarp.triangles.barycentric_to_points],
+reduces over; [`face_nondegenerate_mask`][triwarp.triangles.face_nondegenerate_mask] flags the faces
+those quantities are meaningless on.
+[`barycentric_to_points`][triwarp.triangles.barycentric_to_points],
 [`points_to_barycentric`][triwarp.triangles.points_to_barycentric] and
 [`closest_point`][triwarp.triangles.closest_point] work one query point against one triangle, row
 by row, without a BVH -- for a query against the whole surface see
@@ -150,7 +151,7 @@ def face_quality(
     See Also
     --------
     [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]
-    [`nondegenerate`][triwarp.triangles.nondegenerate]
+    [`face_nondegenerate_mask`][triwarp.triangles.face_nondegenerate_mask]
     [`triwarp.remesh.isotropic_remesh`][triwarp.remesh.isotropic_remesh]
     """
     if metric not in _QUALITY_METRICS:
@@ -267,7 +268,9 @@ def face_signed_volumes(
     return volumes
 
 
-def nondegenerate(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.array[wp.bool]:
+def face_nondegenerate_mask(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> wp.array[wp.bool]:
     """
     Flag triangles with non-zero area.
 
@@ -291,7 +294,7 @@ def nondegenerate(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> wp.
     f = faces.shape[0] // 3
     out_nondegenerate = wp.empty(f, dtype=wp.bool, device=vertices.device)
     wp.launch(
-        kernel_triangles.nondegenerate,
+        kernel_triangles.face_nondegenerate_mask,
         dim=f,
         inputs=[vertices, faces, out_nondegenerate],
         device=vertices.device,
