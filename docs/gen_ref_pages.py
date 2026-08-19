@@ -35,7 +35,7 @@ SECTIONS: dict[str, list[str]] = {
     # as ``curvature``'s, which is how pymeshlab files them (``compute_scalar_*``).
     "Measures & shape descriptors": ["totals", "curvature", "bounds", "convex", "visibility"],
     "Mesh editing & repair": ["repair", "holes", "combine", "remesh", "smoothing", "seams"],
-    "Spatial queries": ["proximity", "ray", "neighbors", "intersection", "distance"],
+    "Spatial queries": ["proximity", "ray", "neighbors", "intersection", "metrics"],
     # ``voxels`` is shelved with ``points`` / ``sample`` rather than with the spatial queries:
     # ``points.farthest_point_sample`` and ``voxels.voxel_down_sample`` are the two point-cloud
     # down-samplers and a reader looking for one should meet the other. The *code* stays split --

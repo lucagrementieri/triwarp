@@ -1108,7 +1108,7 @@ def query_hashgrid_nearest(
     !!! note "Which backend to use"
         Measured on an RTX 5090, this one is ~1.6x faster than
         [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] when the queries sit on or near
-        the cloud, which is the usual case and why the distance metrics in ``triwarp.distance``
+        the cloud, which is the usual case and why the distance metrics in ``triwarp.metrics``
         use it. Prefer the BVH when the queries may be *far* from a *large* cloud: a BVH descent
         degrades gracefully with the search radius, whereas this backend hands off to the linear
         scan and pays ``O(n)`` per row (on ``dragon``'s 438k points, 3x slower).

@@ -1,7 +1,7 @@
 """
 Benchmarks for ``triwarp.neighbors``: the k-nearest-neighbour queries.
 
-This is the direct gate for the k-NN search radius. Twelve call sites in ``triwarp.distance``, the
+This is the direct gate for the k-NN search radius. Twelve call sites in ``triwarp.metrics``, the
 point-cloud ICP path in ``triwarp.registration`` and three sites in ``triwarp.reconstruction`` all
 bottom out in these two functions, but until this module existed none of them had a measurement
 that isolated the query kernel from the surrounding algorithm.

@@ -3,7 +3,7 @@ Differentiable kernels for Chamfer distance losses.
 
 The nearest-neighbor / closest-face assignment is a non-differentiable ``argmin``
 and is computed by the proximity primitives *outside* the autodiff tape (see
-[`triwarp.distance`][]). These kernels consume that fixed assignment and compute
+[`triwarp.metrics`][]). These kernels consume that fixed assignment and compute
 per-element squared distances as pure arithmetic of the input coordinates, so
 Warp's reverse-mode autodiff (``wp.Tape``) flows gradients back to the point
 positions (and, for the surface terms, the mesh vertices).
@@ -89,7 +89,7 @@ def chamfer_nn_term_tiled(
     adjoints, so the kernel stays differentiable under ``wp.Tape``.
 
     The CPU device MUST use
-    [`chamfer_nn_term_sliced`][triwarp.kernels.distance.chamfer_nn_term_sliced] instead:
+    [`chamfer_nn_term_sliced`][triwarp.kernels.metrics.chamfer_nn_term_sliced] instead:
     ``wp.launch_tiled`` runs exactly one lane per block there, so this block reduction would see
     one point per tile and the loss would come out roughly 64x too small.
     """
@@ -120,7 +120,7 @@ def chamfer_nn_term_sliced(
     accumulates locally and commits one ``wp.atomic_add``. Both the dynamic loop and the atomic
     carry adjoints, so the kernel stays differentiable under ``wp.Tape``. Lane-free, so it is
     correct on the CPU device where
-    [`chamfer_nn_term_tiled`][triwarp.kernels.distance.chamfer_nn_term_tiled] is not; it gives up
+    [`chamfer_nn_term_tiled`][triwarp.kernels.metrics.chamfer_nn_term_tiled] is not; it gives up
     the block shuffle-reduce and measures 1.57x slower on CUDA at 500k points (19.0 -> 29.7 us),
     which is why both exist.
     """
@@ -147,7 +147,7 @@ def chamfer_surface_term_tiled(
     ``face_id[i]`` is the (fixed, non-differentiable) index of the triangle of the mesh
     closest to ``points[i]``. Gradients flow to both ``points`` and ``vertices``. Points
     with ``face_id[i] < 0`` (no face within the search radius) contribute nothing. Same tiled
-    CUDA reduction as [`chamfer_nn_term_tiled`][triwarp.kernels.distance.chamfer_nn_term_tiled],
+    CUDA reduction as [`chamfer_nn_term_tiled`][triwarp.kernels.metrics.chamfer_nn_term_tiled],
     and CPU-unsafe for the same reason.
     """
     i, t = wp.tid()
@@ -180,7 +180,7 @@ def chamfer_surface_term_sliced(
     closest to ``points[i]``. Gradients flow to both ``points`` and ``vertices``. Points
     with ``face_id[i] < 0`` (no face within the search radius) contribute nothing. Same lane-free
     sliced reduction as
-    [`chamfer_nn_term_sliced`][triwarp.kernels.distance.chamfer_nn_term_sliced], for the same
+    [`chamfer_nn_term_sliced`][triwarp.kernels.metrics.chamfer_nn_term_sliced], for the same
     reason.
     """
     j = wp.tid()

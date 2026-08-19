@@ -32,7 +32,7 @@ import triwarp.typing as twt
 from triwarp._device import prefers_tiled_reduction, slice_count
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
-from triwarp.kernels import distance as kernel_distance
+from triwarp.kernels import metrics as kernel_metrics
 
 _PointReduction = Literal["mean", "sum", "max"]
 # Differentiable Chamfer losses support only additive point reductions ("max" has no
@@ -106,8 +106,8 @@ def chamfer_points_to_points(
 
     See Also
     --------
-    [`chamfer_points_to_mesh`][triwarp.distance.chamfer_points_to_mesh]
-    [`chamfer_mesh_to_mesh`][triwarp.distance.chamfer_mesh_to_mesh]
+    [`chamfer_points_to_mesh`][triwarp.metrics.chamfer_points_to_mesh]
+    [`chamfer_mesh_to_mesh`][triwarp.metrics.chamfer_mesh_to_mesh]
     [`query_hashgrid_nearest`][triwarp.neighbors.query_hashgrid_nearest]
     """
     _validate_point_reduction(point_reduction)
@@ -161,20 +161,20 @@ def chamfer_points_to_mesh(
         ``(f * 3,)`` flat triangle index array as ``wp.int32``.
     point_reduction
         ``"mean"`` (default), ``"sum"``, ``"max"``, or ``None``. See
-        [`chamfer_points_to_points`][triwarp.distance.chamfer_points_to_points].
+        [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points].
     single_directional
         If ``True``, only the ``points -> mesh surface`` term is computed.
 
     Returns
     -------
     float or wp.array[wp.float32] or tuple
-        Same layout as [`chamfer_points_to_points`][triwarp.distance.chamfer_points_to_points].
+        Same layout as [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points].
         The forward array has length ``n`` and the backward array length ``v``.
 
     See Also
     --------
-    [`chamfer_points_to_points`][triwarp.distance.chamfer_points_to_points]
-    [`chamfer_mesh_to_mesh`][triwarp.distance.chamfer_mesh_to_mesh]
+    [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points]
+    [`chamfer_mesh_to_mesh`][triwarp.metrics.chamfer_mesh_to_mesh]
     [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]
     """
     _validate_point_reduction(point_reduction)
@@ -228,21 +228,21 @@ def chamfer_mesh_to_mesh(
         Vertices ``(vb,)`` and flat faces ``(fb * 3,)`` of mesh ``B``.
     point_reduction
         ``"mean"`` (default), ``"sum"``, ``"max"``, or ``None``. See
-        [`chamfer_points_to_points`][triwarp.distance.chamfer_points_to_points].
+        [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points].
     single_directional
         If ``True``, only the ``A -> surface(B)`` term is computed.
 
     Returns
     -------
     float or wp.array[wp.float32] or tuple
-        Same layout as [`chamfer_points_to_points`][triwarp.distance.chamfer_points_to_points].
+        Same layout as [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points].
         The forward array has length ``va`` and the backward array length ``vb``.
 
     See Also
     --------
-    [`chamfer_points_to_points`][triwarp.distance.chamfer_points_to_points]
-    [`chamfer_points_to_mesh`][triwarp.distance.chamfer_points_to_mesh]
-    [`hausdorff_mesh_to_mesh`][triwarp.distance.hausdorff_mesh_to_mesh]
+    [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points]
+    [`chamfer_points_to_mesh`][triwarp.metrics.chamfer_points_to_mesh]
+    [`hausdorff_mesh_to_mesh`][triwarp.metrics.hausdorff_mesh_to_mesh]
     """
     _validate_point_reduction(point_reduction)
     distances = _distances_mesh_to_mesh(
@@ -265,7 +265,7 @@ def chamfer_mesh_to_mesh(
 # Autodiff strategy (mirrors pytorch3d): the nearest-neighbor / closest-face assignment
 # is a non-differentiable ``argmin`` and is computed *outside* the tape; the assignment
 # is then held constant while the per-element squared distance is recomputed by a
-# differentiable kernel (see [`triwarp.kernels.distance`]). Gradients flow to the point
+# differentiable kernel (see [`triwarp.kernels.metrics`]). Gradients flow to the point
 # positions (and, for the surface terms, the mesh ``vertices``).
 #
 # Usage::
@@ -273,7 +273,7 @@ def chamfer_mesh_to_mesh(
 #     x = wp.array(..., dtype=wp.vec3, requires_grad=True)
 #     y = wp.array(..., dtype=wp.vec3, requires_grad=True)
 #     tape = wp.Tape()
-#     loss = tw.distance.chamfer_points_to_points_loss(x, y, tape=tape)
+#     loss = tw.metrics.chamfer_points_to_points_loss(x, y, tape=tape)
 #     tape.backward(loss=loss)
 #     grad_x = x.grad  # dloss/dx
 #
@@ -292,7 +292,7 @@ def chamfer_points_to_points_loss(
     Differentiable Chamfer loss between two point clouds.
 
     Squared-distance analogue of
-    [`chamfer_points_to_points`][triwarp.distance.chamfer_points_to_points] that returns
+    [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points] that returns
     a length-1 ``wp.float32`` device array instead of a host ``float``, so the loss can be
     back-propagated to ``x`` and ``y`` through a caller-owned ``wp.Tape``.
 
@@ -313,7 +313,7 @@ def chamfer_points_to_points_loss(
     point_reduction
         ``"mean"`` (default) or ``"sum"``; reduces the per-point squared distances of each
         direction. ``"max"`` and ``None`` are not supported (see
-        [`chamfer_points_to_points`][triwarp.distance.chamfer_points_to_points]).
+        [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points]).
     single_directional
         If ``True``, only the ``x -> y`` term is accumulated.
 
@@ -325,9 +325,9 @@ def chamfer_points_to_points_loss(
 
     See Also
     --------
-    [`chamfer_points_to_points`][triwarp.distance.chamfer_points_to_points]
-    [`chamfer_points_to_mesh_loss`][triwarp.distance.chamfer_points_to_mesh_loss]
-    [`chamfer_mesh_to_mesh_loss`][triwarp.distance.chamfer_mesh_to_mesh_loss]
+    [`chamfer_points_to_points`][triwarp.metrics.chamfer_points_to_points]
+    [`chamfer_points_to_mesh_loss`][triwarp.metrics.chamfer_points_to_mesh_loss]
+    [`chamfer_mesh_to_mesh_loss`][triwarp.metrics.chamfer_mesh_to_mesh_loss]
     """
     _validate_diff_reduction(point_reduction)
     device = x.device
@@ -366,7 +366,7 @@ def chamfer_points_to_mesh_loss(
     Differentiable Chamfer loss between a point cloud and a triangle mesh.
 
     Squared-distance analogue of
-    [`chamfer_points_to_mesh`][triwarp.distance.chamfer_points_to_mesh]. The forward term
+    [`chamfer_points_to_mesh`][triwarp.metrics.chamfer_points_to_mesh]. The forward term
     is the exact point-to-surface squared distance (closest triangle held constant during
     backprop); the backward term is the squared distance from each mesh vertex to its
     nearest point in the cloud. Gradients flow to ``points`` **and** ``vertices``.
@@ -393,9 +393,9 @@ def chamfer_points_to_mesh_loss(
 
     See Also
     --------
-    [`chamfer_points_to_mesh`][triwarp.distance.chamfer_points_to_mesh]
-    [`chamfer_points_to_points_loss`][triwarp.distance.chamfer_points_to_points_loss]
-    [`chamfer_mesh_to_mesh_loss`][triwarp.distance.chamfer_mesh_to_mesh_loss]
+    [`chamfer_points_to_mesh`][triwarp.metrics.chamfer_points_to_mesh]
+    [`chamfer_points_to_points_loss`][triwarp.metrics.chamfer_points_to_points_loss]
+    [`chamfer_mesh_to_mesh_loss`][triwarp.metrics.chamfer_mesh_to_mesh_loss]
     """
     _validate_diff_reduction(point_reduction)
     device = points.device
@@ -440,7 +440,7 @@ def chamfer_mesh_to_mesh_loss(
     Differentiable Chamfer loss between two triangle meshes (vertex-to-surface).
 
     Squared-distance analogue of
-    [`chamfer_mesh_to_mesh`][triwarp.distance.chamfer_mesh_to_mesh]. The forward term is
+    [`chamfer_mesh_to_mesh`][triwarp.metrics.chamfer_mesh_to_mesh]. The forward term is
     the squared distance from each vertex of mesh ``A`` to the surface of mesh ``B`` (with
     the closest triangle held constant during backprop); the backward term is the reverse.
     Gradients flow to both meshes' vertices.
@@ -465,9 +465,9 @@ def chamfer_mesh_to_mesh_loss(
 
     See Also
     --------
-    [`chamfer_mesh_to_mesh`][triwarp.distance.chamfer_mesh_to_mesh]
-    [`chamfer_points_to_points_loss`][triwarp.distance.chamfer_points_to_points_loss]
-    [`chamfer_points_to_mesh_loss`][triwarp.distance.chamfer_points_to_mesh_loss]
+    [`chamfer_mesh_to_mesh`][triwarp.metrics.chamfer_mesh_to_mesh]
+    [`chamfer_points_to_points_loss`][triwarp.metrics.chamfer_points_to_points_loss]
+    [`chamfer_points_to_mesh_loss`][triwarp.metrics.chamfer_points_to_mesh_loss]
     """
     _validate_diff_reduction(point_reduction)
     device = vertices_a.device
@@ -535,8 +535,8 @@ def hausdorff_points_to_points(
 
     See Also
     --------
-    [`hausdorff_points_to_mesh`][triwarp.distance.hausdorff_points_to_mesh]
-    [`hausdorff_mesh_to_mesh`][triwarp.distance.hausdorff_mesh_to_mesh]
+    [`hausdorff_points_to_mesh`][triwarp.metrics.hausdorff_points_to_mesh]
+    [`hausdorff_mesh_to_mesh`][triwarp.metrics.hausdorff_mesh_to_mesh]
     [`scipy.spatial.distance.directed_hausdorff`][]
     """
     distances = _distances_points_to_points(x, y, single_directional)
@@ -577,8 +577,8 @@ def hausdorff_points_to_mesh(
 
     See Also
     --------
-    [`hausdorff_points_to_points`][triwarp.distance.hausdorff_points_to_points]
-    [`hausdorff_mesh_to_mesh`][triwarp.distance.hausdorff_mesh_to_mesh]
+    [`hausdorff_points_to_points`][triwarp.metrics.hausdorff_points_to_points]
+    [`hausdorff_mesh_to_mesh`][triwarp.metrics.hausdorff_mesh_to_mesh]
     """
     distances = _distances_points_to_mesh(points, vertices, faces, single_directional)
     if distances is None:
@@ -618,8 +618,8 @@ def hausdorff_mesh_to_mesh(
 
     See Also
     --------
-    [`chamfer_mesh_to_mesh`][triwarp.distance.chamfer_mesh_to_mesh]
-    [`hausdorff_points_to_mesh`][triwarp.distance.hausdorff_points_to_mesh]
+    [`chamfer_mesh_to_mesh`][triwarp.metrics.chamfer_mesh_to_mesh]
+    [`hausdorff_points_to_mesh`][triwarp.metrics.hausdorff_points_to_mesh]
     """
     distances = _distances_mesh_to_mesh(
         vertices_a, faces_a, vertices_b, faces_b, single_directional
@@ -826,7 +826,7 @@ def _launch_nn_term(
     device = x.device
     if prefers_tiled_reduction(device):
         wp.launch_tiled(
-            kernel_distance.chamfer_nn_term_tiled,
+            kernel_metrics.chamfer_nn_term_tiled,
             dim=[(n + TILE_1D - 1) // TILE_1D],
             inputs=[x, y, nearest, wp.float32(scale), loss],
             block_dim=TILE_1D,
@@ -835,7 +835,7 @@ def _launch_nn_term(
     else:
         slices = slice_count(n, device)
         wp.launch(
-            kernel_distance.chamfer_nn_term_sliced,
+            kernel_metrics.chamfer_nn_term_sliced,
             dim=slices,
             inputs=[x, y, nearest, wp.float32(scale), wp.int32(slices), loss],
             device=device,
@@ -853,13 +853,13 @@ def _launch_surface_term(
     """
     Accumulate the point-to-surface Chamfer term for ``points`` into ``loss``.
 
-    Same device dispatch as [`_launch_nn_term`][triwarp.distance._launch_nn_term].
+    Same device dispatch as [`_launch_nn_term`][triwarp.metrics._launch_nn_term].
     """
     n = int(points.shape[0])
     device = points.device
     if prefers_tiled_reduction(device):
         wp.launch_tiled(
-            kernel_distance.chamfer_surface_term_tiled,
+            kernel_metrics.chamfer_surface_term_tiled,
             dim=[(n + TILE_1D - 1) // TILE_1D],
             inputs=[points, vertices, faces, face_id, wp.float32(scale), loss],
             block_dim=TILE_1D,
@@ -868,7 +868,7 @@ def _launch_surface_term(
     else:
         slices = slice_count(n, device)
         wp.launch(
-            kernel_distance.chamfer_surface_term_sliced,
+            kernel_metrics.chamfer_surface_term_sliced,
             dim=slices,
             inputs=[points, vertices, faces, face_id, wp.float32(scale), wp.int32(slices), loss],
             device=device,

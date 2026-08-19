@@ -443,7 +443,7 @@ The rest are second or third independent implementations:
 | `test_convex` | `generate_convex_hull` (qhull a third time, so it prices the wrapper rather than the algorithm) |
 | `test_creation` | `create_cube`, `create_sphere` (an *icosphere*, so it pairs with `icosphere` where open3d's pairs with `uv_sphere`), `create_torus`, `create_annulus`, `create_cone` |
 | `test_curvature` | `compute_curvature_principal_directions_per_vertex(method='Quadric Fitting')` and `compute_scalar_by_discrete_curvature_per_vertex` — the only reference that survives the whole `scale` axis, where trimesh is capped at `sphere_small` |
-| `test_distance` | `get_hausdorff_distance` (one-directional, so both directions are timed) |
+| `test_metrics` | `get_hausdorff_distance` (one-directional, so both directions are timed) |
 | `test_edges` | `get_geometric_measures()['avg_edge_length']` |
 | `test_heat_distance` | `compute_scalar_by_heat_geodesic_distance_from_selection_per_vertex` — the fourth heat-method implementation, and the only one whose amortized path is just "call it twice"; plus `..._geodesic_distance_from_given_point_...` as a non-PDE alternative |
 | `test_graph` | `compute_selection_by_small_disconnected_components_per_face(nbfaceratio=0.0)` |
@@ -895,7 +895,7 @@ millisecond.
 | `test_vertices` | `compute_vertex_normals` |
 | `test_bounds` | `get_axis_aligned_bounding_box` (`aabb`), `get_minimal_oriented_bounding_box` (hull-based, trimesh's algorithm family — not the PCA `get_oriented_bounding_box`, which minimizes nothing) |
 | `test_points` | `PointCloud.estimate_normals` (`KDTreeSearchParamKNN`), `remove_statistical_outlier`, `remove_radius_outlier` (**nondeterministic** — a shared `KDTreeFlann` across an OpenMP loop; three keep sets over eight reps, so the correctness comparison queries that tree serially instead), `remove_duplicated_points`, `farthest_point_down_sample` (its `SelectByIndex` sorts, so only the selected *set* is comparable) |
-| `test_distance` | `PointCloud.compute_point_cloud_distance` (the non-differentiable Chamfer / Hausdorff cases) |
+| `test_metrics` | `PointCloud.compute_point_cloud_distance` (the non-differentiable Chamfer / Hausdorff cases) |
 | `test_convex` | `compute_convex_hull` (exact qhull vs the approximate support sweep) |
 | `test_voxels` | `VoxelGrid.create_from_triangle_mesh_within_bounds`, `create_from_point_cloud`, `PointCloud.voxel_down_sample`, `check_if_included` — the same four answers, from a `std::unordered_map<Eigen::Vector3i>` on one core |
 | `test_neighbors` | `o3d.core.nns.NearestNeighborSearch.knn_search` / `fixed_radius_search` — the batched tensor queries, **not** the legacy `KDTreeFlann` per-query Python loop (62 ms against 10 ms at 20k queries); plus `PointCloud.compute_nearest_neighbor_distance`, which is serial C++ rather than a Python loop |

@@ -329,7 +329,7 @@ array elements, struct fields) — use for multi-value updates like argmin/minma
 `@wp.kernel(enable_backward=False)` — the per-kernel flag specifically; a module-level
 `wp.set_module_options({"enable_backward": False})` is NOT consulted at kernel-parse time in
 Warp 1.15 and the module still fails to compile. Never use `wp.ref` in
-`triwarp/kernels/distance.py` — the chamfer kernels are differentiated via `wp.Tape`.
+`triwarp/kernels/metrics.py` — the chamfer kernels are differentiated via `wp.Tape`.
 
 ---
 
@@ -435,7 +435,7 @@ constructed **inside** a timed callable. Five hazards, all measured:
   existing and `triwarp.repair` carrying functions named after them (`AttributeError`). Generally: the
   C++ surface is ~493 headers and only 150 functions are bound, so confirm a name exists in the wheel
   before planning a comparison around it. A hand port of the C++ into a test file is a legitimate
-  *test* oracle (see `tests/test_distance.py`, `tests/test_polyline.py`, `tests/test_seams.py`) but
+  *test* oracle (see `tests/test_metrics.py`, `tests/test_polyline.py`, `tests/test_seams.py`) but
   never a benchmark row.
 
 **Licensing:** libigl's core is MPL2, but everything under `reference/libigl/include/igl/copyleft/`

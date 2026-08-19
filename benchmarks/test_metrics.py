@@ -1,5 +1,5 @@
 """
-Benchmarks for ``triwarp.distance``: the differentiable Chamfer loss and the plain metrics.
+Benchmarks for ``triwarp.metrics``: the differentiable Chamfer loss and the plain metrics.
 
 Cloud/mesh B is the same mesh translated by 5% of its bbox diagonal (untimed setup), so both
 directions of every symmetric metric do real work.
@@ -35,7 +35,7 @@ is not among the statistics it returns -- so it appears in the Hausdorff group a
 
 trimesh and libigl have no point-cloud Chamfer/Hausdorff entry point (``igl.hausdorff`` is
 mesh-to-mesh only and is already the documented reference for
-[`hausdorff_mesh_to_mesh`][triwarp.distance.hausdorff_mesh_to_mesh] in ``tests/``), so neither
+[`hausdorff_mesh_to_mesh`][triwarp.metrics.hausdorff_mesh_to_mesh] in ``tests/``), so neither
 appears here.
 """
 
@@ -120,9 +120,7 @@ def test_chamfer_mesh_to_mesh_loss(bench_case: BenchCase) -> None:
 
     def run() -> twt.Array1dFloat32:
         tape = wp.Tape()
-        loss = tw.distance.chamfer_mesh_to_mesh_loss(
-            vertices_a, faces, vertices_b, faces, tape=tape
-        )
+        loss = tw.metrics.chamfer_mesh_to_mesh_loss(vertices_a, faces, vertices_b, faces, tape=tape)
         tape.backward(loss=cast(wp.array, loss))
         tape.zero()
         return loss
@@ -146,7 +144,7 @@ def test_chamfer_points_to_points(bench_case: BenchCase, single_directional: boo
     if bench_case.kind == "triwarp":
         cloud_a, cloud_b = _clouds_wp(bench_case)
         chamfer = bench_case.run(
-            lambda: tw.distance.chamfer_points_to_points(
+            lambda: tw.metrics.chamfer_points_to_points(
                 cloud_a, cloud_b, single_directional=single_directional
             )
         )
@@ -211,7 +209,7 @@ def test_hausdorff_points_to_points(bench_case: BenchCase) -> None:
         return
     if bench_case.kind == "triwarp":
         cloud_a, cloud_b = _clouds_wp(bench_case)
-        hausdorff = bench_case.run(lambda: tw.distance.hausdorff_points_to_points(cloud_a, cloud_b))
+        hausdorff = bench_case.run(lambda: tw.metrics.hausdorff_points_to_points(cloud_a, cloud_b))
     else:
         cloud_a, cloud_b = _clouds_o3d(bench_case)
         hausdorff = bench_case.run(
@@ -236,7 +234,7 @@ def test_chamfer_points_to_mesh(bench_case: BenchCase) -> None:
 
     **libigl's row is the forward half only**, and is a *lower* bound rather than a race:
     ``igl.point_mesh_squared_distance`` is exactly the cloud-to-surface query -- it is already the
-    oracle for this group in ``tests/test_distance.py`` -- but it has no cloud-to-cloud counterpart,
+    oracle for this group in ``tests/test_metrics.py`` -- but it has no cloud-to-cloud counterpart,
     so the backward ``k=1`` search triwarp also performs has no igl equivalent to pair it with. Read
     the row as "what the expensive half costs on one core"; the same partial-reference convention as
     ``igl.doublearea`` in [`test_triangles.py`](test_triangles.py).
@@ -253,5 +251,5 @@ def test_chamfer_points_to_mesh(bench_case: BenchCase) -> None:
         return
     cloud = _clouds_wp(bench_case)[1]
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-    chamfer = bench_case.run(lambda: tw.distance.chamfer_points_to_mesh(cloud, vertices, faces))
+    chamfer = bench_case.run(lambda: tw.metrics.chamfer_points_to_mesh(cloud, vertices, faces))
     assert chamfer > 0.0
