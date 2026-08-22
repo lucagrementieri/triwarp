@@ -87,6 +87,7 @@ so this row rebuilds it (the filter mutates the attribute in place).
 
 from __future__ import annotations
 
+import math
 import warnings
 
 import numpy as np
@@ -95,11 +96,11 @@ import pytest
 import trimesh as tm
 import warp as wp
 import warp.sparse as wps
-from conftest import BenchCase, mesh_ml_from_numpy, skip_larger_than
 from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase, mesh_ml_from_numpy, skip_larger_than
 
 _ITERATIONS = 10
 
@@ -830,3 +831,45 @@ def test_inflate(bench_case: BenchCase) -> None:
     pressure = 0.1 * bench_case.mean_edge
     inflated = bench_case.run(lambda: tw.smoothing.inflate(vertices, faces, pressure), rounds=3)
     assert int(inflated.shape[0]) == bench_case.n_vertices
+
+
+@pytest.mark.benchmark(group="remove_spikes")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_remove_spikes(bench_case: BenchCase) -> None:
+    """
+    Detect and flatten needle vertices: per pass, the corner angles, a defect scatter and one map.
+
+    On a clean mesh this is a *detector* -- one pass finds nothing and the loop stops -- so the row
+    is really the cost of asking, which is what a caller pays unconditionally in a repair pipeline.
+    That makes it comparable with meshlib's ``removeSpikes`` on the same input, since that also
+    finds nothing to do; and it means the row is dominated by ``face_angles`` plus the scatter rather
+    than by any displacement.
+
+    meshlib mutates in place, so its mesh is rebuilt per round the way the other ``repair`` rows do.
+    Both sides are pinned against each other on a genuinely spiky mesh in
+    ``tests/test_smoothing.py``; no scan mesh in this registry has a spike, which is why that test
+    needs a generated fixture and this row does not.
+
+    First measurement, medians on an RTX 5090: **15.68 ms** on ``bunny`` against meshlib's 9.62
+    (1.63x behind) and **20.87 ms** on ``dragon`` against 60.73 (**2.9x ahead**), with
+    ``happy_buddha`` at 22.84 and ``lucy`` at 100.5. The crossover is between 70k and 871k faces,
+    which is where a per-vertex angle scatter starts beating a threaded serial pass -- and note
+    meshlib's row carries its mesh build while triwarp's carries none, so the small-mesh figure is
+    if anything generous to triwarp.
+    """
+    threshold = 0.5 * math.pi
+    if bench_case.kind == "meshlib":
+
+        def remove_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(bench_case.vertices_np, bench_case.faces_np)
+            mm.removeSpikes(mesh_ml, 10, threshold)
+            return mesh_ml.topology.numValidVerts()
+
+        assert bench_case.run(remove_ml, rounds=3) > 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    repaired, flattened = bench_case.run(
+        lambda: tw.smoothing.remove_spikes(vertices, faces, threshold), rounds=3
+    )
+    assert flattened >= 0
+    assert int(repaired.shape[0]) == bench_case.n_vertices

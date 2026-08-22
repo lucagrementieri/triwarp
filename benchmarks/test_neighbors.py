@@ -109,11 +109,11 @@ import igl
 import numpy as np
 import pytest
 import warp as wp
-from conftest import BenchCase, skip_larger_than
 from meshlib import mrmeshpy as mm
 from scipy.spatial import KDTree
 
 import triwarp as tw
+from conftest import BenchCase, skip_larger_than
 
 _SEED = 42
 _N_QUERIES = 20_000

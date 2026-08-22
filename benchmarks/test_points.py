@@ -96,11 +96,11 @@ import pytest
 import pyvista as pv
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase, skip_larger_than
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 import triwarp.typing as twt
+from conftest import BenchCase, skip_larger_than
 
 # Neighbour count for the PCA normal estimate (open3d's own default for KDTreeSearchParamKNN).
 _KNN = 30

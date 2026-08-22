@@ -38,9 +38,9 @@ import numpy as np
 import potpourri3d as pp3d
 import pytest
 import warp as wp
-from conftest import BenchCase, skip_larger_than
 
 import triwarp as tw
+from conftest import BenchCase, skip_larger_than
 
 # The reference traces one ray per Python call, so the largest ray count is slow on its side.
 _GENERATORS = {"sphere_med": 0, "handles_1": 2, "handles_64": 128}

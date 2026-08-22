@@ -59,10 +59,10 @@ temporary.
 from __future__ import annotations
 
 import pytest
-from conftest import BenchCase
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase
 
 _mesh_ml_cache: dict[str, mm.Mesh] = {}
 

@@ -85,10 +85,10 @@ import pytest
 import pyvista as pv
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase, mesh_ml_from_numpy, skip_larger_than
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase, mesh_ml_from_numpy, skip_larger_than
 
 # Off-axis so no cut is degenerate w.r.t. the (axis-aligned) scan-mesh geometry.
 _PLANE_NORMAL = np.array([0.3, 0.8, 0.5])

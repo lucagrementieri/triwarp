@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import warnings
 
 import igl
@@ -18,8 +19,11 @@ from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.conversions import (
+    meshlib_bitset_to_numpy,
+    meshlib_to_trimesh,
     numpy_to_meshlib,
     numpy_to_warp,
+    trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
     trimesh_to_warp,
@@ -1236,3 +1240,88 @@ def test_inflate_deflates_and_handles_edge_cases(device: str) -> None:
     assert tw.smoothing.inflate(empty_vertices_wp, empty_faces_wp, 0.1).shape == (0,)
     with pytest.raises(ValueError, match="iterations must be non-negative"):
         tw.smoothing.inflate(vertices_wp, faces_wp, 0.1, iterations=-1)
+
+
+@pytest.mark.parity("remove_spikes", "meshlib")
+@pytest.mark.parametrize("threshold_turns", [0.5, 0.75])
+def test_remove_spikes_matches_meshlib(
+    torus_spikes: tuple[tm.Trimesh, wp.Mesh], threshold_turns: float
+) -> None:
+    """
+    Class A twice: the same vertices are flagged, and the same number are moved.
+
+    ``findSpikeVertices(topology, points, minSumAngle)`` returns the mask this repair acts on, and
+    the two agree **element for element** on the spiky torus -- 5 flagged at ``pi`` and 12 at
+    ``1.5 * pi``, with the same vertex indices. Then ``removeSpikes`` moves exactly as many
+    vertices as this does, at the same thresholds, so the *extent* of the repair matches even though
+    the move itself need not: MeshLib's relaxation and a closed-1-ring average are different
+    displacements, and the test does not claim otherwise.
+
+    What it does claim, and this is the part no comparison gives, is that **no spike survives**: the
+    angle sums are recomputed afterwards and none is still below the threshold. A repair that moved
+    the right vertices to the wrong places would pass a count comparison and fail this.
+
+    Two thresholds because the answer must not be a constant: at ``0.5`` of a turn 5 vertices
+    qualify and at ``0.75`` twelve do, so a mask that ignored the parameter would fail one of them.
+    """
+    mesh_tm, mesh_wp = torus_spikes
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    n_vertices = int(vertices_wp.shape[0])
+    min_angle_sum = threshold_turns * 2.0 * math.pi
+
+    defects_np = tw.vertices.vertex_defects(
+        n_vertices, faces_wp, tw.triangles.face_angles(vertices_wp, faces_wp)
+    ).numpy()
+    spikes_np = (2.0 * np.pi - defects_np) < min_angle_sum
+    assert 0 < int(spikes_np.sum()) < n_vertices  # non-vacuity: some but not all
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    spikes_ml = meshlib_bitset_to_numpy(
+        mm.findSpikeVertices(mesh_ml.topology, mesh_ml.points, min_angle_sum), n_vertices
+    )
+    assert np.array_equal(spikes_np, spikes_ml)
+
+    repaired_wp, flattened = tw.smoothing.remove_spikes(vertices_wp, faces_wp, min_angle_sum)
+    moved_np = np.abs(repaired_wp.numpy() - vertices_wp.numpy()).max(axis=1) > 1e-7
+    assert flattened == int(spikes_np.sum())
+    assert int(moved_np.sum()) == int(spikes_np.sum())
+    assert not np.any(moved_np & ~spikes_np)  # nothing but the spikes moved
+
+    repaired_ml = trimesh_to_meshlib(mesh_tm)
+    mm.removeSpikes(repaired_ml, 10, min_angle_sum)
+    moved_ml = (
+        np.abs(
+            np.asarray(meshlib_to_trimesh(repaired_ml).vertices) - np.asarray(mesh_tm.vertices)
+        ).max(axis=1)
+        > 1e-7
+    )
+    assert int(moved_ml.sum()) == int(moved_np.sum())
+
+    # And the repair worked: recomputed on the new positions, nothing is a spike any more.
+    after_np = tw.vertices.vertex_defects(
+        n_vertices, faces_wp, tw.triangles.face_angles(repaired_wp, faces_wp)
+    ).numpy()
+    assert not np.any((2.0 * np.pi - after_np) < min_angle_sum)
+
+
+def test_remove_spikes_leaves_a_clean_mesh_alone(
+    icosphere: tuple[tm.Trimesh, wp.Mesh], device: str
+) -> None:
+    """
+    Not a library comparison: the do-nothing branch, which is the safety claim.
+
+    A sphere has no spike at any sensible threshold, so the buffers must come back **identical** --
+    not merely close. That is what rules out a repair that smooths everything a little, which a
+    displacement-magnitude assert on a spiky mesh would not catch.
+    """
+    _, mesh_wp = icosphere
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    repaired_wp, flattened = tw.smoothing.remove_spikes(vertices_wp, faces_wp, math.pi)
+    assert flattened == 0
+    assert np.array_equal(repaired_wp.numpy(), vertices_wp.numpy())
+
+    empty_vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    empty_faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    assert tw.smoothing.remove_spikes(empty_vertices_wp, empty_faces_wp, math.pi)[0].shape == (0,)
+    with pytest.raises(ValueError, match="max_iter must be non-negative"):
+        tw.smoothing.remove_spikes(vertices_wp, faces_wp, math.pi, max_iter=-1)

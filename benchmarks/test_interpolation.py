@@ -62,9 +62,9 @@ import pymeshlab as ml
 import pytest
 import pyvista as pv
 import warp as wp
-from conftest import BenchCase, skip_larger_than
 
 import triwarp as tw
+from conftest import BenchCase, skip_larger_than
 
 _FIELD_SEED = 5
 

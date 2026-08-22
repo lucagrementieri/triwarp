@@ -38,10 +38,10 @@ import potpourri3d as pp3d
 import pytest
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase
 
 _NON_EDGE_MANIFOLD = frozenset({"bunny_decimated", "lucy"})
 

@@ -433,3 +433,24 @@ def unsharp_step(
 def step_along_normal(position: wp.vec3, normal: wp.vec3, distance: wp.float32) -> wp.vec3:
     """Move a vertex along its own normal, which is one half of an inflation step."""
     return position + normal * distance
+
+
+@wp.func
+def is_spike_defect(defect: wp.float32, min_defect: wp.float32) -> wp.bool:
+    """
+    Test a spike through its angle *defect*, which is the quantity that already exists.
+
+    The condition is ``angle_sum < min_angle_sum``, and the defect is ``2 * pi - angle_sum``, so it
+    becomes ``defect > 2 * pi - min_angle_sum``. Phrased on the defect rather than the sum because
+    ``vertices.vertex_defects`` computes it, and re-deriving the sum would mean scattering the same
+    corner angles a second time.
+    """
+    return defect > min_defect
+
+
+@wp.func
+def select_position(smoothed: wp.vec3, original: wp.vec3, replace: wp.bool) -> wp.vec3:
+    """Take the smoothed position only where the mask says to, leaving the rest untouched."""
+    if replace:
+        return smoothed
+    return original

@@ -22,6 +22,7 @@ from tests.conversions import (
     trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
+    warp_to_trimesh,
 )
 from triwarp.holes import _non_increasing_indices
 
@@ -1865,3 +1866,91 @@ def test_non_increasing_indices() -> None:
 
     # A strictly sorted sequence needs no correction.
     assert _non_increasing_indices(np.arange(6, dtype=np.int64)).size == 0
+
+
+@pytest.mark.parity("extend_hole", "meshlib")
+@pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus"])
+def test_extend_hole_matches_meshlib(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A on the counts and on where the new rim lands, against ``extendAllHoles``.
+
+    Both add two triangles and one vertex per rim edge, so the face and vertex counts agree exactly
+    -- measured 238 to 330 faces and 143 to 189 vertices on a sliced ``icosphere(2)``, identical on
+    both sides. The *positions* are also checked rather than assumed: every appended vertex must lie
+    **in** the plane, which is the one thing an orthogonal projection guarantees and a bevel or an
+    offset would not.
+
+    Comparing positions element-wise would need the two libraries to enumerate the rim in the same
+    order, which they do not, so the geometry is compared through invariants that do not depend on
+    it: the plane residual, the surviving loop count, and edge-manifoldness.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    n_vertices = int(vertices_wp.shape[0])
+    n_faces = int(faces_wp.shape[0]) // 3
+    loops_wp = tw.boundary.boundary_loops(vertices_wp, faces_wp)
+    rim_total = sum(int(loop.shape[0]) for loop in loops_wp)
+    assert rim_total > 0  # non-vacuity: an open fixture
+
+    height = float(np.asarray(mesh_tm.vertices)[:, 2].max()) + 1.0
+    extended_vertices_wp, extended_faces_wp = tw.holes.extend_hole(
+        vertices_wp, faces_wp, wp.vec3(0.0, 0.0, height), wp.vec3(0.0, 0.0, 1.0)
+    )
+    assert int(extended_vertices_wp.shape[0]) == n_vertices + rim_total
+    assert int(extended_faces_wp.shape[0]) // 3 == n_faces + 2 * rim_total
+    appended_np = extended_vertices_wp.numpy()[n_vertices:]
+    assert np.allclose(appended_np[:, 2], height, atol=1e-5)
+    assert np.array_equal(extended_vertices_wp.numpy()[:n_vertices], vertices_wp.numpy())
+    assert tw.validation.is_edge_manifold(extended_faces_wp)
+    assert len(tw.boundary.boundary_loops(extended_vertices_wp, extended_faces_wp)) == len(loops_wp)
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    mm.extendAllHoles(mesh_ml, mm.Plane3f(mm.Vector3f(0.0, 0.0, 1.0), height))
+    extended_ml = meshlib_to_trimesh(mesh_ml)
+    assert len(extended_ml.faces) == int(extended_faces_wp.shape[0]) // 3
+    assert len(extended_ml.vertices) == int(extended_vertices_wp.shape[0])
+
+
+def test_extend_hole_then_fill_is_watertight(hemisphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: the composition this exists for, and the empty case.
+
+    Extending to a plane and then filling must give a **closed solid** -- that is the reason the
+    function is not itself a cap. Asserted on the result rather than on the extension, because a
+    bridge with a reversed quad would still be edge-manifold and would fail here.
+
+    The check is watertightness plus **winding consistency**, not the volume's sign: this fixture is
+    inward-wound, so its solid has a negative signed volume and a ``> 0`` assert would fail on a
+    perfectly correct bridge. Consistency is what the bridge is actually responsible for.
+
+    A closed input has no rim, so the call is the identity; and an explicit empty loop list is the
+    same case reached differently.
+    """
+    mesh_tm, mesh_wp = hemisphere
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    height = float(np.asarray(mesh_tm.vertices)[:, 2].max()) + 0.5
+    extended_vertices_wp, extended_faces_wp = tw.holes.extend_hole(
+        vertices_wp, faces_wp, wp.vec3(0.0, 0.0, height), wp.vec3(0.0, 0.0, 1.0)
+    )
+    capped_faces_wp = tw.holes.fill_min_weight(extended_vertices_wp, extended_faces_wp)
+    capped_tm = warp_to_trimesh(extended_vertices_wp, capped_faces_wp)
+    assert capped_tm.is_watertight
+    # Winding rather than the volume's *sign*: the fixture's own orientation decides that (this one
+    # comes out inward, so a positive-volume assert would fail on a correct bridge), while
+    # consistency is the property the bridge actually has to have.
+    assert capped_tm.is_winding_consistent
+    assert abs(capped_tm.volume) > 0.0
+
+    same_vertices_wp, same_faces_wp = tw.holes.extend_hole(
+        vertices_wp, faces_wp, wp.vec3(0.0, 0.0, height), wp.vec3(0.0, 0.0, 1.0), []
+    )
+    assert np.array_equal(same_faces_wp.numpy(), faces_wp.numpy())
+    assert np.array_equal(same_vertices_wp.numpy(), vertices_wp.numpy())
+    with pytest.raises(ValueError, match=r"rank-1 wp\.int32"):
+        tw.holes.extend_hole(
+            vertices_wp,
+            faces_wp,
+            wp.vec3(0.0, 0.0, height),
+            wp.vec3(0.0, 0.0, 1.0),
+            [wp.zeros(3, dtype=wp.float32, device=faces_wp.device)],
+        )

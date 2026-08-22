@@ -942,3 +942,49 @@ def mark_loops_with_chords(
         gap = -gap
     if gap != 1 and gap != size - 1:
         out_has_chord[loop] = True
+
+
+@wp.kernel
+def project_loop_to_plane(
+    vertices: wp.array[wp.vec3],
+    loop_vertices: wp.array[wp.int32],
+    plane_origin: wp.vec3,
+    plane_normal: wp.vec3,
+    out_positions: wp.array[wp.vec3],
+) -> None:
+    # Each rim vertex's orthogonal projection onto the plane. The *ring* of these is what the rim is
+    # bridged to, so the extension is exactly the ruled surface between the two.
+    i = wp.int32(wp.tid())
+    point = vertices[loop_vertices[i]]
+    out_positions[i] = point - plane_normal * wp.dot(point - plane_origin, plane_normal)
+
+
+@wp.kernel
+def bridge_loop_to_ring(
+    loop_vertices: wp.array[wp.int32],
+    loop_id: wp.array[wp.int32],
+    loop_starts: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    ring_base: wp.int32,
+    out_faces: wp.array2d[wp.int32],
+) -> None:
+    # Two triangles per rim edge, joining it to the corresponding edge of the projected ring. The
+    # rim runs with the surface on its left, so the quad ``(a, b, b', a')`` is wound the other way
+    # round to keep the extension's outward side the same as the mesh's.
+    t = wp.int32(wp.tid())
+    ell = loop_id[t]
+    begin = loop_starts[ell]
+    size = loop_sizes[ell]
+    next_slot = begin + _wrap(t - begin + 1, size)
+    a = loop_vertices[t]
+    b = loop_vertices[next_slot]
+    projected_a = ring_base + t
+    projected_b = ring_base + next_slot
+
+    row = wp.int32(2) * t
+    out_faces[row, 0] = a
+    out_faces[row, 1] = projected_b
+    out_faces[row, 2] = b
+    out_faces[row + wp.int32(1), 0] = a
+    out_faces[row + wp.int32(1), 1] = projected_a
+    out_faces[row + wp.int32(1), 2] = projected_b

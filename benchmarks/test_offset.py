@@ -31,10 +31,10 @@ import numpy as np
 import pymeshlab as ml
 import pytest
 import warp as wp
-from conftest import BenchCase, skip_larger_than
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase, skip_larger_than
 
 # Cell widths as a fraction of the bounding-box diagonal, and the offset distance as a multiple of
 # the cell. The pair is a slope check: 1/64 to 1/128 is 8x the samples, and an offset of four cells

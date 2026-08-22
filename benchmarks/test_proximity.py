@@ -78,13 +78,13 @@ import pytest
 import pyvista as pv
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase, BenchLibrary, mesh_ml_from_numpy, skip_larger_than
 from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 from scipy.spatial import Delaunay
 
 import triwarp as tw
 import triwarp.typing as twt
+from conftest import BenchCase, BenchLibrary, mesh_ml_from_numpy, skip_larger_than
 
 _QUERY_SEED = 42
 _N_QUERIES = 10_000

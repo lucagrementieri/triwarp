@@ -340,6 +340,28 @@ def torus_self_intersecting(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
 
 
 @pytest.fixture
+def torus_spikes(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
+    """
+    Build a torus whose tube radius alternates, leaving needle-like vertices on the wide rings.
+
+    512 faces, closed and edge-manifold, with the *only* genuinely spiky vertices in the suite: at a
+    1.5-pi angle-sum threshold twelve of its 256 vertices fail, and five at pi. Every clean fixture
+    has none, so a spike detector or a spike repair tested on one is asserting an empty answer --
+    which is the trap ``test_ears`` fell into (CLAUDE.md section 6).
+
+    The inner and outer tube radii are what make the needles: 0.1 against 0.5 means alternate rings
+    sit far apart radially while their neighbours along the tube are close, so the cone at a wide
+    ring's vertex closes up.
+    """
+    return _torus_fixture(
+        mm.makeTorusWithSpikes(
+            _TORUS_PRIMARY_RADIUS, 0.1, 0.5, _TORUS_RESOLUTION, _TORUS_RESOLUTION
+        ),
+        device,
+    )
+
+
+@pytest.fixture
 def torus_components(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
     """
     Build a torus broken into **eight** disconnected open pieces, 256 faces in total.

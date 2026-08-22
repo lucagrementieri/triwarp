@@ -76,10 +76,10 @@ import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase, mesh_ml_from_numpy
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase, mesh_ml_from_numpy
 
 if TYPE_CHECKING:
     import open3d as o3d
@@ -532,3 +532,48 @@ def test_fillable_loop_mask(bench_case: BenchCase) -> None:
         pytest.skip(f"{bench_case.mesh_name} is closed: there is no rim to judge")
     fillable = bench_case.run(lambda: tw.holes.fillable_loop_mask(vertices, faces, loops))
     assert int(fillable.shape[0]) == len(loops)
+
+
+@pytest.mark.benchmark(group="extend_hole")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_extend_hole(bench_case: BenchCase) -> None:
+    """
+    Project every rim to a plane and bridge to it: two launches over the rim, plus two copies.
+
+    The work is proportional to the *rim*, not the mesh -- but the two ``wp.copy`` calls that carry
+    the input through are proportional to the mesh, and on a scan mesh they dominate. So read this
+    against ``boundary_loops``, which produces the rims: the gap between them is the bridge itself
+    and it is small.
+
+    meshlib's ``extendAllHoles`` takes the plane directly and mutates, so its mesh is rebuilt per
+    round. The two agree exactly on the face and vertex counts and on the plane the new rim lands in
+    (``tests/test_holes.py``).
+
+    First measurement, medians on an RTX 5090: **0.254 ms** on ``bunny`` against meshlib's 8.54
+    (**33.6x ahead**), 0.256 against 8.79 on ``bunny_decimated``, and **2.34 ms** on ``dragon``
+    against 53.57 (**22.9x**). The largest margin in this module, and it is structural rather than
+    clever: the extension is two launches over the rim while meshlib inserts the faces into a
+    halfedge structure one at a time. ``lucy`` reads 962 ms, where the two whole-mesh copies
+    dominate everything the rim does.
+    """
+    height = float(bench_case.vertices_np[:, 2].max()) + 1.0
+    if bench_case.kind == "meshlib":
+
+        def extend_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(bench_case.vertices_np, bench_case.faces_np)
+            mm.extendAllHoles(mesh_ml, mm.Plane3f(mm.Vector3f(0.0, 0.0, 1.0), height))
+            return mesh_ml.topology.numValidFaces()
+
+        assert bench_case.run(extend_ml, rounds=3) > 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    loops = tw.boundary.boundary_loops(vertices, faces)
+    if not loops:
+        pytest.skip(f"{bench_case.mesh_name} is closed: there is no rim to extend")
+    origin = wp.vec3(0.0, 0.0, height)
+    normal = wp.vec3(0.0, 0.0, 1.0)
+    extended_vertices, extended_faces = bench_case.run(
+        lambda: tw.holes.extend_hole(vertices, faces, origin, normal, loops), rounds=3
+    )
+    assert int(extended_faces.shape[0]) > int(faces.shape[0])
+    assert int(extended_vertices.shape[0]) > bench_case.n_vertices

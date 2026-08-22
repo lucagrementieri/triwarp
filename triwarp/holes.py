@@ -1063,6 +1063,116 @@ def refill_region(
     return (new_vertices, new_faces, out_patch) if return_patch else (new_vertices, new_faces)
 
 
+def extend_hole(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    plane_origin: wp.vec3,
+    plane_normal: wp.vec3,
+    loops: Sequence[wp.array[wp.int32]] | None = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Extend every boundary rim out to a plane, adding the ruled surface between them.
+
+    Each rim vertex is projected orthogonally onto the plane, and the rim is bridged to that ring of
+    projections with two triangles per rim edge. The result is open again -- the new rim lies
+    *in* the plane -- which is what makes this the step before a flat cap rather than a cap itself:
+    the extended rim is planar, so
+    [`fill_min_weight`][triwarp.holes.fill_min_weight] closes it with a triangulation that has no
+    reason to fold.
+
+    The typical use is turning a scanned shell into a solid: extend its rims to a base plane, then
+    fill. Doing that in one step with a min-weight fill instead gives a curved cap over the original
+    rim, which is a different shape and usually not the wanted one.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    plane_origin
+        A point on the target plane.
+    plane_normal
+        The plane's normal. Need not be unit length in principle, but **is assumed to be** -- the
+        projection scales with it otherwise. Normalize it.
+    loops
+        Rims to extend. ``None`` extends every one, via
+        [`boundary_loops`][triwarp.boundary.boundary_loops]; pass a subset to extend only those.
+
+    Returns
+    -------
+    vertices : wp.array[wp.vec3]
+        The input positions, unchanged and in order, with one projected vertex appended per rim
+        vertex.
+    faces : wp.array[wp.int32]
+        The input faces with the bridge triangles appended -- two per rim edge.
+
+    Raises
+    ------
+    ValueError
+        If any loop is not a rank-1 ``wp.int32`` array.
+
+    !!! note "The rim may cross the plane"
+        Nothing here checks which side of the plane a rim vertex is on. A rim straddling it gets an
+        extension that folds through the plane, which is geometrically what "project each vertex"
+        means and is almost never wanted -- place the plane clear of the rim, and check with
+        [`bounds.aabb`][triwarp.bounds.aabb] if the input is not yours.
+
+    See Also
+    --------
+    [`fill_min_weight`][triwarp.holes.fill_min_weight]
+        Closes the planar rim this leaves.
+    [`stitch_loops`][triwarp.holes.stitch_loops]
+        Bridges two rims that both already exist, where this generates the second one.
+    [`boundary_loops`][triwarp.boundary.boundary_loops]
+    """
+    device = faces.device
+    if loops is None:
+        loops = tw.boundary.boundary_loops(vertices, faces)
+    loops = list(loops)
+    for loop in loops:
+        if len(loop.shape) != 1 or loop.dtype is not wp.int32:
+            raise ValueError("every loop must be a rank-1 wp.int32 array of vertex indices")
+    if not loops or all(int(loop.shape[0]) == 0 for loop in loops):
+        return wp.clone(vertices), wp.clone(faces)
+
+    packed, starts = tw.array.pack_1d_arrays(loops)
+    sizes_np = np.array([int(loop.shape[0]) for loop in loops], dtype=np.int32)
+    total = int(packed.shape[0])
+    loop_id = wp.array(
+        np.repeat(np.arange(len(loops), dtype=np.int32), sizes_np), dtype=wp.int32, device=device
+    )
+    sizes = wp.array(sizes_np, dtype=wp.int32, device=device)
+
+    n_vertices = int(vertices.shape[0])
+    extended_vertices = wp.empty(n_vertices + total, dtype=wp.vec3, device=device)
+    wp.copy(extended_vertices[:n_vertices], vertices)
+    wp.launch(
+        kernel_holes.project_loop_to_plane,
+        dim=total,
+        inputs=[vertices, packed, plane_origin, plane_normal, extended_vertices[n_vertices:]],
+        device=device,
+    )
+
+    n_faces = int(faces.shape[0]) // 3
+    extended_faces = wp.empty(3 * (n_faces + 2 * total), dtype=wp.int32, device=device)
+    wp.copy(extended_faces[: 3 * n_faces], faces)
+    wp.launch(
+        kernel_holes.bridge_loop_to_ring,
+        dim=total,
+        inputs=[
+            packed,
+            loop_id,
+            starts,
+            sizes,
+            wp.int32(n_vertices),
+            extended_faces[3 * n_faces :].reshape((2 * total, 3)),
+        ],
+        device=device,
+    )
+    return extended_vertices, extended_faces
+
+
 def fillable_loop_mask(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],

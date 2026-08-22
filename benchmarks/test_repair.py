@@ -90,10 +90,10 @@ import pytest
 import pyvista as pv
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase, mesh_ml_from_numpy, skip_larger_than
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase, mesh_ml_from_numpy, skip_larger_than
 
 _DUP_SEED = 7
 

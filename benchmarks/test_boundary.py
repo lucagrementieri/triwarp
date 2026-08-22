@@ -43,10 +43,10 @@ import igl
 import numpy as np
 import pytest
 import trimesh as tm
-from conftest import BenchCase
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase
 
 
 @pytest.mark.benchmark(group="boundary_loops")

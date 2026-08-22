@@ -352,6 +352,94 @@ def filter_humphrey(
     return _as_vec3(positions)
 
 
+def remove_spikes(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    min_angle_sum: float,
+    *,
+    max_iter: int = 10,
+) -> tuple[wp.array[wp.vec3], int]:
+    """
+    Pull needle-like vertices back onto the surface, leaving every other vertex untouched.
+
+    A *spike* is a vertex whose incident corner angles sum to less than ``min_angle_sum``. On a
+    flat surface that sum is ``2 * pi``; the sharper the cone, the smaller it gets, and a vertex on
+    a thin needle -- the classic scan and reconstruction artifact -- has a sum near zero. So the
+    threshold is read in radians against a full turn, and a value like ``0.5 * pi`` selects
+    genuinely degenerate cones while leaving ordinary sharp features alone.
+
+    Each pass replaces the flagged vertices by the average of their closed 1-rings and **nothing
+    else moves**: this is not a smoothing filter restricted to a region, it is a repair that touches
+    only the vertices that fail the test. Flattening a spike changes its neighbours' angle sums, so
+    the pass repeats -- a needle whose base is itself spiky needs more than one -- and stops as soon
+    as a pass finds none.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    min_angle_sum
+        Angle-sum threshold in radians. A vertex is a spike when its incident angles sum below it.
+        Compare against ``2 * pi``, the flat value.
+    max_iter
+        Cap on the number of passes.
+
+    Returns
+    -------
+    vertices : wp.array[wp.vec3]
+        Repaired positions on ``vertices.device``. Connectivity is untouched, so ``faces`` stays
+        valid.
+    flattened : int
+        How many vertex moves were made, summed over the passes -- so a vertex fixed twice counts
+        twice. Zero means nothing was flagged and the buffer is the input's.
+
+    Raises
+    ------
+    ValueError
+        If ``max_iter`` is negative.
+
+    See Also
+    --------
+    [`filter_neighborhood_average`][triwarp.smoothing.filter_neighborhood_average]
+        The unrestricted version of the move this makes, over every vertex.
+    [`vertex_defects`][triwarp.vertices.vertex_defects]
+        ``2 * pi`` minus the same angle sum, which is what the threshold is read against.
+    [`bad_face_mask`][triwarp.repair.bad_face_mask]
+        Flags the *faces* a spike produces, where this flags the vertex itself.
+    """
+    if max_iter < 0:
+        raise ValueError(f"max_iter must be non-negative, got {max_iter}")
+    device = faces.device
+    n_vertices = int(vertices.shape[0])
+    if n_vertices == 0 or int(faces.shape[0]) == 0 or max_iter == 0:
+        return wp.clone(vertices), 0
+
+    positions = wp.clone(vertices)
+    flattened = 0
+    spikes = wp.empty(n_vertices, dtype=wp.bool, device=device)
+    for _ in range(max_iter):
+        defects = tw.vertices.vertex_defects(
+            n_vertices, faces, tw.triangles.face_angles(positions, faces)
+        )
+        wp.map(
+            kernel_smoothing.is_spike_defect,
+            defects,
+            wp.float32(2.0 * math.pi - min_angle_sum),
+            out=spikes,
+        )
+        # One readback per pass, and it is the stopping test: whether any vertex is still a spike is
+        # a device-side fact that a Python loop cannot branch on otherwise.
+        n_spikes = int(tw.reduce.sum(tw.array.astype(spikes, wp.int32)))
+        if n_spikes == 0:
+            break
+        smoothed = filter_neighborhood_average(positions, faces, iterations=1)
+        wp.map(kernel_smoothing.select_position, smoothed, positions, spikes, out=positions)
+        flattened += n_spikes
+    return positions, flattened
+
+
 def filter_taubin(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
