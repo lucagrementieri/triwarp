@@ -2,32 +2,17 @@ import math
 
 import warp as wp
 
-from triwarp.kernels.array import sort3
 from triwarp.kernels.halfedge import halfedge_destination
-from triwarp.kernels.triangles import face_vertices
+from triwarp.kernels.predicates import doublearea_from_lengths, squared_edge_lengths
+from triwarp.kernels.triangles import face_vertices, row_triple
 
 TWO_PI_F64 = wp.constant(wp.float64(2.0 * math.pi))
 
 
-@wp.func
-def squared_edge_lengths(
-    v0: wp.vec3, v1: wp.vec3, v2: wp.vec3
-) -> tuple[wp.float32, wp.float32, wp.float32]:
-    l2_0 = wp.length_sq(v1 - v2)
-    l2_1 = wp.length_sq(v2 - v0)
-    l2_2 = wp.length_sq(v0 - v1)
-    return l2_0, l2_1, l2_2
-
-
-@wp.func
-def doublearea_from_lengths(l0: wp.float32, l1: wp.float32, l2: wp.float32) -> wp.float32:
-    # Kahan's numerically stable Heron form needs the sides sorted ascending.
-    l0, l1, l2 = sort3(l0, l1, l2)
-    arg = (l0 + (l1 + l2)) * (l2 - (l0 - l1)) * (l2 + (l0 - l1)) * (l0 + (l1 - l2))
-    dbl_area = wp.float32(0.5) * wp.sqrt(wp.max(arg, wp.float32(0.0)))
-    if wp.isnan(dbl_area):
-        return wp.float32(0.0)
-    return dbl_area
+# ``cot_entries_from_l2`` and ``cot_entries_from_edge_lengths`` stay here rather than joining
+# ``squared_edge_lengths`` / ``doublearea_from_lengths`` in ``kernels/predicates.py``: a cotangent
+# weight is not a general triangle quantity, it is this operator's own entry, and the zero-area
+# reasoning below is numerical defence *of the Laplacian* that belongs beside the thing it defends.
 
 
 @wp.func
@@ -88,9 +73,7 @@ def cotmatrix_entries_intrinsic(
     edge_lengths: wp.array2d[wp.float32], out_cot: wp.array2d[wp.Float]
 ) -> None:
     f = wp.int32(wp.tid())
-    l0 = edge_lengths[f, 0]
-    l1 = edge_lengths[f, 1]
-    l2 = edge_lengths[f, 2]
+    l0, l1, l2 = row_triple(edge_lengths, f)
     c0, c1, c2 = cot_entries_from_edge_lengths(l0, l1, l2)
     out_cot[f, 0] = type(out_cot[f, 0])(c0)
     out_cot[f, 1] = type(out_cot[f, 1])(c1)
@@ -286,9 +269,7 @@ def triangle_inequality_slack(
     # Adding a constant lengthens the two short sides by ``2 * delta`` against the long side's
     # ``delta``, so half the shortfall is enough.
     f = wp.int32(wp.tid())
-    a = edge_lengths[f, 0]
-    b = edge_lengths[f, 1]
-    c = edge_lengths[f, 2]
+    a, b, c = row_triple(edge_lengths, f)
     worst = wp.max(wp.max(epsilon - (a + b - c), epsilon - (b + c - a)), epsilon - (c + a - b))
     out_slack[f] = wp.max(worst, 0.0) * 0.5
 

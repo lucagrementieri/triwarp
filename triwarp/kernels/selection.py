@@ -30,7 +30,7 @@ def pack_group_vertex_keys(
 @wp.func
 def group_of_key(key: wp.int64, radix: wp.int64) -> wp.int32:
     """Group index packed into ``key`` by [`pack_group_vertex_keys`][]."""
-    return wp.int32(key / radix)
+    return wp.int32(key // radix)
 
 
 @wp.func

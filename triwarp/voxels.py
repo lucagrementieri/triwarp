@@ -755,7 +755,7 @@ def cell_centers(grid: wp.Volume) -> wp.array[wp.vec3]:
     [`cells`][triwarp.voxels.cells]
     [`to_boxes`][triwarp.voxels.to_boxes]
     """
-    voxel_size, origin = _require_index_grid(grid)
+    _require_index_grid(grid)
     voxels = cells(grid)
     n_voxels = int(voxels.shape[0])
     centers = wp.empty(n_voxels, dtype=wp.vec3, device=grid.device)
@@ -764,7 +764,7 @@ def cell_centers(grid: wp.Volume) -> wp.array[wp.vec3]:
     wp.launch(
         kernel_voxels.cell_center_positions,
         dim=n_voxels,
-        inputs=[voxels, origin, wp.float32(voxel_size), centers],
+        inputs=[grid.id, voxels, centers],
         device=grid.device,
     )
     return centers
@@ -1458,7 +1458,7 @@ def to_boxes(
     run [`triwarp.repair.remove_unreferenced_vertices`][triwarp.repair.remove_unreferenced_vertices]
     if that matters.
     """
-    voxel_size, origin = _require_index_grid(grid)
+    _require_index_grid(grid)
     device = grid.device
     corner_cells, cell_corners = voxel_corners(grid)
     n_corners = int(corner_cells.shape[0])
@@ -1469,7 +1469,7 @@ def to_boxes(
     wp.launch(
         kernel_voxels.corner_positions,
         dim=n_corners,
-        inputs=[corner_cells, origin, wp.float32(voxel_size), vertices],
+        inputs=[grid.id, corner_cells, vertices],
         device=device,
     )
 

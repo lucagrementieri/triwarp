@@ -2,7 +2,11 @@ import warp as wp
 
 from triwarp.kernels.array import to_vec3d
 from triwarp.kernels.halfedge import halfedge_destination
-from triwarp.kernels.predicates import triangle_double_area
+from triwarp.kernels.predicates import (
+    corner_cosines_from_l2,
+    squared_edge_lengths,
+    triangle_double_area,
+)
 from triwarp.kernels.triangles import face_vertices_vec3d
 
 
@@ -103,22 +107,14 @@ def voronoi_mass(
     # half). A degenerate face contributes nothing (igl would emit NaN).
     f = wp.int32(wp.tid())
     v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
-    l2_0 = wp.length_sq(v1 - v2)
-    l2_1 = wp.length_sq(v2 - v0)
-    l2_2 = wp.length_sq(v0 - v1)
+    l2_0, l2_1, l2_2 = squared_edge_lengths(v0, v1, v2)
     dbl_area = triangle_double_area(v0, v1, v2)
     if dbl_area <= wp.float64(0.0):
         return
-    l0 = wp.sqrt(l2_0)
-    l1 = wp.sqrt(l2_1)
-    l2 = wp.sqrt(l2_2)
-    two = wp.float64(2.0)
-    cos0 = (l2_2 + l2_1 - l2_0) / (two * l1 * l2)
-    cos1 = (l2_0 + l2_2 - l2_1) / (two * l2 * l0)
-    cos2 = (l2_1 + l2_0 - l2_2) / (two * l0 * l1)
-    bary0 = cos0 * l0
-    bary1 = cos1 * l1
-    bary2 = cos2 * l2
+    cos0, cos1, cos2 = corner_cosines_from_l2(l2_0, l2_1, l2_2)
+    bary0 = cos0 * wp.sqrt(l2_0)
+    bary1 = cos1 * wp.sqrt(l2_1)
+    bary2 = cos2 * wp.sqrt(l2_2)
     total = bary0 + bary1 + bary2
     half_dbl = wp.float64(0.5) * dbl_area
     partial0 = bary0 / total * half_dbl
@@ -235,16 +231,11 @@ def internal_angles_and_sums(
     # all three angles of a degenerate face instead of letting the acos clamp report 0 / pi.
     f = wp.int32(wp.tid())
     v0, v1, v2 = face_vertices_vec3d(vertices, faces, f)
-    l2_0 = wp.length_sq(v1 - v2)
-    l2_1 = wp.length_sq(v2 - v0)
-    l2_2 = wp.length_sq(v0 - v1)
-    l0 = wp.sqrt(l2_0)
-    l1 = wp.sqrt(l2_1)
-    l2 = wp.sqrt(l2_2)
-    two = wp.float64(2.0)
-    theta0 = wp.acos((l2_1 + l2_2 - l2_0) / (two * l1 * l2))
-    theta1 = wp.acos((l2_2 + l2_0 - l2_1) / (two * l2 * l0))
-    theta2 = wp.acos((l2_0 + l2_1 - l2_2) / (two * l0 * l1))
+    l2_0, l2_1, l2_2 = squared_edge_lengths(v0, v1, v2)
+    cos0, cos1, cos2 = corner_cosines_from_l2(l2_0, l2_1, l2_2)
+    theta0 = wp.acos(cos0)
+    theta1 = wp.acos(cos1)
+    theta2 = wp.acos(cos2)
     out_angles[f, 0] = theta0
     out_angles[f, 1] = theta1
     out_angles[f, 2] = theta2
@@ -407,9 +398,7 @@ def curved_hessian_triplets(
             out_vals[base_out + empty] = type(out_vals[0])(0.0)
         return
     # Squared edge lengths, column e opposite corner e (the igl intrinsic convention).
-    l2_0 = wp.length_sq(v1 - v2)
-    l2_1 = wp.length_sq(v2 - v0)
-    l2_2 = wp.length_sq(v0 - v1)
+    l2_0, l2_1, l2_2 = squared_edge_lengths(v0, v1, v2)
     # Curvature ingredients per corner c: scaledKappa(F(f,c)) * theta(f,c).
     kv0 = scaled_kappa[faces[f * 3 + 0]] * angles[f, 0]
     kv1 = scaled_kappa[faces[f * 3 + 1]] * angles[f, 1]

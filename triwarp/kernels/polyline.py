@@ -112,6 +112,19 @@ def segment_step_counts(
     out_steps[i] = wp.max(wp.int32(wp.floor(length / step_size)), wp.int32(1))
 
 
+@wp.func
+def segment_parameter(
+    offsets: wp.array[wp.int32], steps: wp.array[wp.int32], j: wp.int32
+) -> tuple[wp.int32, wp.float32]:
+    # Which segment output sample ``j`` belongs to, and its parameter in ``[0, 1)`` along that
+    # segment. ``offsets`` is the exclusive scan of ``steps``, so the containing segment is the last
+    # offset not past ``j`` -- ``binary_search_index`` returns the first strictly greater, hence the
+    # ``- 1``.
+    segment = binary_search_index(offsets, j) - 1
+    k = j - offsets[segment]
+    return segment, wp.float32(k) / wp.float32(steps[segment])
+
+
 @wp.kernel
 def upsample_gather(
     polyline: wp.array[wp.vec3],
@@ -120,9 +133,7 @@ def upsample_gather(
     out_points: wp.array[wp.vec3],
 ) -> None:
     j = wp.int32(wp.tid())
-    segment = binary_search_index(offsets, j) - 1
-    k = j - offsets[segment]
-    weight = wp.float32(k) / wp.float32(steps[segment])
+    segment, weight = segment_parameter(offsets, steps, j)
     out_points[j] = wp.lerp(polyline[segment], polyline[segment + 1], weight)
 
 
@@ -208,9 +219,7 @@ def smooth_upsample_gather(
     out_points: wp.array[wp.vec3],
 ) -> None:
     j = wp.int32(wp.tid())
-    segment = binary_search_index(offsets, j) - 1
-    k = j - offsets[segment]
-    t = wp.float32(k) / wp.float32(steps[segment])
+    segment, t = segment_parameter(offsets, steps, j)
     n = polyline.shape[0]
     po = polyline[segment]
     pd = polyline[segment + 1]

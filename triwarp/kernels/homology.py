@@ -71,6 +71,31 @@ def forest_snapshot_roots(labels: wp.array[wp.int32], out_roots: wp.array[wp.int
     out_roots[f] = find_representative(labels, f)
 
 
+@wp.func
+def boruvka_cross_edge(
+    candidate: wp.array[wp.bool],
+    edge_faces: wp.array2d[wp.int32],
+    roots: wp.array[wp.int32],
+    e: wp.int32,
+) -> tuple[wp.int32, wp.int32]:
+    # The two components edge ``e`` joins this Boruvka round, or ``(-1, -1)`` when it joins none --
+    # it is not a candidate, or both its faces already sit in one component. The sentinel form
+    # rather than an early return, because a ``@wp.func`` cannot return for its caller; this is the
+    # convention ``remesh._resolve_flip_quad_guarded`` already uses in this tree.
+    #
+    # Reading ``roots`` rather than ``labels`` is the whole point and is why the two round kernels
+    # must open identically: ``roots`` is the round's frozen snapshot, so both the proposal and the
+    # acceptance decide against the same partition and the round's outcome does not depend on
+    # thread order. See this module's docstring.
+    if not candidate[e]:
+        return wp.int32(-1), wp.int32(-1)
+    root_a = roots[edge_faces[e, 0]]
+    root_b = roots[edge_faces[e, 1]]
+    if root_a == root_b:
+        return wp.int32(-1), wp.int32(-1)
+    return root_a, root_b
+
+
 @wp.kernel
 def forest_propose(
     candidate: wp.array[wp.bool],
@@ -78,15 +103,10 @@ def forest_propose(
     roots: wp.array[wp.int32],
     out_proposal: wp.array[wp.int32],
 ) -> None:
-    # Offer each candidate edge to the components on both sides; the lowest edge index wins. Reading
-    # ``roots`` rather than ``labels`` is what keeps the round's decision independent of thread
-    # order -- see this module's docstring.
+    # Offer each candidate edge to the components on both sides; the lowest edge index wins.
     e = wp.int32(wp.tid())
-    if not candidate[e]:
-        return
-    root_a = roots[edge_faces[e, 0]]
-    root_b = roots[edge_faces[e, 1]]
-    if root_a == root_b:
+    root_a, root_b = boruvka_cross_edge(candidate, edge_faces, roots, e)
+    if root_a < 0:
         return
     wp.atomic_min(out_proposal, root_a, e)
     wp.atomic_min(out_proposal, root_b, e)
@@ -111,11 +131,8 @@ def forest_link(
     # already-compressed find. Its termination argument (parents monotonically non-increasing, so
     # ``max(root_a, root_b)`` strictly decreases) therefore applies unchanged.
     e = wp.int32(wp.tid())
-    if not candidate[e]:
-        return
-    root_a = roots[edge_faces[e, 0]]
-    root_b = roots[edge_faces[e, 1]]
-    if root_a == root_b:
+    root_a, root_b = boruvka_cross_edge(candidate, edge_faces, roots, e)
+    if root_a < 0:
         return
     if proposal[root_a] != e and proposal[root_b] != e:
         return

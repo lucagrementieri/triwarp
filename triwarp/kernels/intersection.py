@@ -594,7 +594,7 @@ def resolve_on_plane_faces(
     f = wp.tid()
     if out_classes[f] != SLICE_CLASS_ON_PLANE:
         return
-    normal, area = kernel_triangles.face_normals_and_area(vertices, faces[f * 3 : (f + 1) * 3])
+    normal, area = kernel_triangles.face_normals_and_area(vertices, faces, f)
     if area <= TOLERANCE_ZERO_CONSTANT:
         out_classes[f] = SLICE_CLASS_DROP
         return
@@ -715,9 +715,7 @@ def emit_quad_cut(
     tid = wp.tid()
     face_index = face_indices[tid]
     base = face_index * wp.int32(3)
-    s0 = face_signs[face_index, 0]
-    s1 = face_signs[face_index, 1]
-    s2 = face_signs[face_index, 2]
+    s0, s1, s2 = kernel_triangles.row_triple(face_signs, face_index)
     outside = find_corner_with_sign(s0, s1, s2, SLICE_SIGN_OUTSIDE)
     inside_a = (outside + wp.int32(1)) % wp.int32(3)
     inside_b = (outside + wp.int32(2)) % wp.int32(3)
@@ -749,9 +747,7 @@ def emit_tri_cut(
     tid = wp.tid()
     face_index = face_indices[tid]
     base = face_index * wp.int32(3)
-    s0 = face_signs[face_index, 0]
-    s1 = face_signs[face_index, 1]
-    s2 = face_signs[face_index, 2]
+    s0, s1, s2 = kernel_triangles.row_triple(face_signs, face_index)
     inside = find_corner_with_sign(s0, s1, s2, SLICE_SIGN_INSIDE)
     v_inside = faces[base + inside]
     edge_0 = inside
@@ -832,7 +828,7 @@ def label_faces_by_plane_side(
     # The face lies *in* the plane, so its vertices give no answer. Decide from its own normal, the
     # same tie-break ``resolve_on_plane_faces`` applies, so that the ``above`` block of this split
     # holds exactly the faces ``slice_mesh_with_plane`` keeps.
-    normal, area = kernel_triangles.face_normals_and_area(vertices, faces[f * 3 : (f + 1) * 3])
+    normal, area = kernel_triangles.face_normals_and_area(vertices, faces, f)
     if area <= TOLERANCE_ZERO_CONSTANT:
         out_above[f] = True
     else:

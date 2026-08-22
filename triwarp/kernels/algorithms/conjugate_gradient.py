@@ -121,17 +121,36 @@ def cg_inverse_diagonal(diag: wp.array[wp.float64], out_inv_diag: wp.array[wp.fl
 
 
 @wp.kernel
-def cg_apply_inverse_diagonal(
+def scaled_diagonal_apply(
+    n: wp.int32,
     stride: wp.int32,
     inv_diag: wp.array[wp.float64],
-    values: wp.array[wp.float64],
-    out_preconditioned: wp.array[wp.float64],
+    factor: wp.float64,
+    source: wp.array[wp.float64],
+    out_destination: wp.array[wp.float64],
 ) -> None:
-    # ``z = M^-1 r`` for the *initial* residual only; inside the iteration this is fused into
-    # ``cg_step_x_r_z``. One operator serves every column, so the diagonal is indexed within the
-    # column rather than across the flat vector -- and is padded to ``stride`` alongside it.
-    i = wp.int32(wp.tid())
-    out_preconditioned[i] = inv_diag[i - (i // stride) * stride] * values[i]
+    # ``out = factor * D^-1 * source``, over every column of one operator at once.
+    #
+    # Two callers, which is why this one kernel carries the two extra arguments rather than there
+    # being two. The conjugate gradient wants ``z = M^-1 r`` for the *initial* residual only (inside
+    # the iteration it is fused into ``cg_step_x_r_z``), at ``factor = 1`` and with no rows to skip.
+    # The multigrid cycle wants the power iteration's step and the first Jacobi sweep from a zero
+    # initial guess -- the sweep being a *write*, so the cycle never has to zero its working
+    # vectors. It was written twice, a week apart, in two files, one of which plugs into the other.
+    #
+    # ``stride`` is the column pitch and ``n`` the row count; one operator serves every column, so
+    # the diagonal is indexed *within* the column rather than across the flat vector. They differ
+    # only where the conjugate-gradient state pads each column out to a whole reduction tile, and
+    # the pad is skipped rather than written because that solver reduces over it and needs it zero.
+    # A caller with no padding passes ``n == stride``, which makes the guard unreachable.
+    #
+    # Lives here rather than in ``algorithms/multigrid.py`` because the cycle is a
+    # ``preconditioner=`` choice of *this* solver: the dependency runs multigrid -> CG, never back.
+    t = wp.int32(wp.tid())
+    row = t % stride
+    if row >= n:
+        return
+    out_destination[t] = factor * inv_diag[row] * source[t]
 
 
 @wp.func

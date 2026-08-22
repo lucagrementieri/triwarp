@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.kernels.array import update_argmin_pair
-from triwarp.kernels.triangles import triangle_cross
+from triwarp.kernels.triangles import corner_triple, triangle_cross
 
 
 @wp.func
@@ -87,11 +87,8 @@ def small_triangle_collapse_edges(
 ) -> None:
     """Flag faces with double-area below ``min_dbl_area`` and emit their shortest edge (libigl)."""
     f = wp.int32(wp.tid())
-    face = faces[f * 3 : (f + 1) * 3]
-    i0 = face[0]
-    i1 = face[1]
-    i2 = face[2]
-    dbl_area = wp.length(triangle_cross(vertices, face))
+    i0, i1, i2 = corner_triple(faces, f)
+    dbl_area = wp.length(triangle_cross(vertices, faces, f))
     if dbl_area < min_dbl_area:
         v0 = vertices[i0]
         v1 = vertices[i1]

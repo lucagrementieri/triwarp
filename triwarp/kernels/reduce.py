@@ -18,6 +18,21 @@ _tile_max = _warp_builtins["tile_max"]
 _tile_sum = _warp_builtins["tile_sum"]
 
 
+@wp.func
+def tile_chunk(n: wp.int32, chunk: wp.int32, width: wp.int32) -> tuple[wp.int32, wp.int32]:
+    # The ``(offset, remaining)`` of one chunk of a 1-D array: where chunk ``chunk`` of ``width``
+    # elements starts, and how many elements are left from there. ``remaining <= 0`` means the
+    # chunk is past the end and the block has nothing to do; a positive ``remaining`` below
+    # ``width`` is the ragged last chunk, which the caller clamps with ``wp.min(remaining, width)``.
+    #
+    # Named because the *contract* is what goes wrong here, not the arithmetic: ``width`` is
+    # ``TILE_1D`` for a one-tile-per-block kernel and ``TILES_PER_BLOCK_1D * TILE_1D`` for the
+    # folding ones in this module, and a launch that assumes the wrong one silently folds every
+    # element 16 times -- see ``blocks_1d``, which is the same hazard from the launch side.
+    offset = chunk * width
+    return offset, n - offset
+
+
 def blocks_1d(n: int) -> int:
     """
     Launch width for the 1-D global reduction kernels in this module.
@@ -73,8 +88,7 @@ def _reduce_1d_tiled(tile_reduce, atomic, scalar, name, dtype=wp.Scalar):
     def _k(values: wp.array[wp.Scalar], out: wp.array[wp.Scalar]) -> None:
         i, t = wp.tid()
         n = values.shape[0]
-        base = i * TILES_PER_BLOCK_1D * TILE_1D
-        remaining = n - base
+        base, remaining = tile_chunk(n, i, TILES_PER_BLOCK_1D * TILE_1D)
         if remaining <= 0:
             return
 
@@ -129,8 +143,7 @@ def _weighted_sum_1d_tiled(name, dtype):
     ) -> None:
         i, t = wp.tid()
         n = values.shape[0]
-        base = i * TILES_PER_BLOCK_1D * TILE_1D
-        remaining = n - base
+        base, remaining = tile_chunk(n, i, TILES_PER_BLOCK_1D * TILE_1D)
         if remaining <= 0:
             return
 
@@ -388,8 +401,7 @@ def minmax1d_tiled(values: wp.array[wp.Scalar], out_minmax: wp.array[wp.Scalar])
     # the block's first chunk; two atomics per block instead of two per tile.
     i, t = wp.tid()
     n = values.shape[0]
-    base = i * TILES_PER_BLOCK_1D * TILE_1D
-    remaining = n - base
+    base, remaining = tile_chunk(n, i, TILES_PER_BLOCK_1D * TILE_1D)
     if remaining <= 0:
         return
 
@@ -593,9 +605,7 @@ def minmax_vec3_chunked(points: wp.array[wp.vec3], out_corners: wp.array[wp.floa
     #
     # One thread per ``TILE_1D`` points, so the atomics see a few hundred contenders per address
     # rather than one per point.
-    chunk = wp.int32(wp.tid())
-    offset = chunk * TILE_1D
-    remaining = points.shape[0] - offset
+    offset, remaining = tile_chunk(points.shape[0], wp.int32(wp.tid()), TILE_1D)
     if remaining <= 0:
         return
     count = wp.min(remaining, TILE_1D)

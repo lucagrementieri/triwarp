@@ -66,14 +66,6 @@ def mis_key(state: wp.int32, priority: wp.uint32, index: wp.int32) -> wp.int64:
 
 
 @wp.kernel
-def mis_priorities(seed: wp.int32, out_priority: wp.array[wp.uint32]) -> None:
-    # Drawn once for the whole selection rather than per round, so the aggregation is a
-    # deterministic function of ``seed`` and of the operator -- the ``dart_priorities`` argument.
-    i = wp.int32(wp.tid())
-    out_priority[i] = wp.randu(wp.rand_init(seed, i))
-
-
-@wp.kernel
 def mis_seed_keys(
     state: wp.array[wp.int32], priority: wp.array[wp.uint32], out_key: wp.array[wp.int64]
 ) -> None:
@@ -261,7 +253,7 @@ def csr_matvec(
     # count, since the top level's vectors carry the conjugate-gradient state's tile padding.
     # ``accumulate`` is warp-uniform and folds the prolongation's correction into the same kernel.
     t = wp.int32(wp.tid())
-    column = t / n_rows
+    column = t // n_rows
     row = t % n_rows
     total = csr_row_dot(row, column * x_stride, offsets, columns, values, x)
     slot = column * y_stride + row
@@ -299,34 +291,14 @@ def random_signs(seed: wp.int32, out_x: wp.array[wp.float64]) -> None:
     # rather than uniform values, because then the norm is exactly ``sqrt(n)`` and the caller needs
     # one host readback for the whole estimate instead of two -- which at these sizes is most of
     # what the estimate costs.
+    #
+    # Deliberately *not* folded into ``array.random_priorities``, which has the same shape over
+    # ``wp.randu``: that one draws a total order on the elements, this one draws a start vector
+    # whose norm is known in closed form. Same tokens, different quantities.
     i = wp.int32(wp.tid())
     out_x[i] = wp.where(
         wp.randi(wp.rand_init(seed, i)) < wp.int32(0), wp.float64(-1.0), wp.float64(1.0)
     )
-
-
-@wp.kernel
-def scaled_diagonal_apply(
-    n: wp.int32,
-    stride: wp.int32,
-    inv_diag: wp.array[wp.float64],
-    factor: wp.float64,
-    source: wp.array[wp.float64],
-    out_destination: wp.array[wp.float64],
-) -> None:
-    # ``out = factor * D^-1 * source``, over every column of one level at once: the power
-    # iteration's step, and the first Jacobi sweep from a zero initial guess (which is a *write*, so
-    # the cycle never has to zero its working vectors).
-    #
-    # ``stride`` is the column pitch and ``n`` the level's row count. They differ only on the level
-    # the caller owns, where the conjugate-gradient state pads each column out to a whole reduction
-    # tile; the pad is skipped rather than written, because that solver reduces over it and relies
-    # on it staying zero.
-    t = wp.int32(wp.tid())
-    row = t % stride
-    if row >= n:
-        return
-    out_destination[t] = factor * inv_diag[row] * source[t]
 
 
 @wp.kernel
@@ -341,6 +313,12 @@ def jacobi_sweep(
 ) -> None:
     # One damped-Jacobi sweep, ``x += w D^-1 (b - A x)``, with ``A x`` already in hand. ``out_x`` is
     # both the input and the result, which is what the sweep means.
+    #
+    # ``row = t % stride`` then ``if row >= n: return`` is the padded-row guard this file's cycle
+    # kernels share; what the pad is and why it must stay unwritten is written out once, on
+    # ``algorithms/conjugate_gradient.scaled_diagonal_apply``, which owns the padding contract. Not
+    # factored into a ``@wp.func``: the caller still needs the flat ``t`` for its own indexing, so
+    # a helper returning ``-1`` for the pad renames the three lines rather than removing any.
     t = wp.int32(wp.tid())
     row = t % stride
     if row >= n:
@@ -376,7 +354,7 @@ def dense_solve(
     # count depends on the data -- it is a single launch inside the captured cycle. The *pseudo*
     # inverse because the coarse operator inherits the fine one's null space.
     t = wp.int32(wp.tid())
-    column = t / stride
+    column = t // stride
     row = t % stride
     if row >= n:
         return

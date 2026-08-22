@@ -161,6 +161,17 @@ def init_repeat_index(repeats: wp.Int, out_indices: wp.array[wp.Int]) -> None:
 
 
 @wp.kernel
+def random_priorities(seed: wp.int32, out_priority: wp.array[wp.uint32]) -> None:
+    # A total order on the elements, drawn once for the whole run rather than per round. Every
+    # multi-round selection that breaks ties by priority -- blue-noise dart throwing, the
+    # maximal-independent-set aggregation -- reads the same order in every round, which is what
+    # makes the loop a deterministic function of ``seed`` alone. Drawing per round would make the
+    # answer depend on how many rounds the input happened to need.
+    i = wp.int32(wp.tid())
+    out_priority[i] = wp.randu(wp.rand_init(seed, i))
+
+
+@wp.kernel
 def gather_1d_skip_negative(
     indices: wp.array[wp.int32], table: wp.array[wp.int32], out_gathered: wp.array[wp.int32]
 ) -> None:

@@ -1229,3 +1229,162 @@ def builtin_cast_problems() -> list[str]:
                     "if the enclosing function is or could be dtype-generic"
                 )
     return problems
+
+
+# --- check 17 -----------------------------------------------------------------------------------
+
+_INT_SCALARS = frozenset(
+    {
+        "wp.int8",
+        "wp.int16",
+        "wp.int32",
+        "wp.int64",
+        "wp.uint8",
+        "wp.uint16",
+        "wp.uint32",
+        "wp.uint64",
+        "wp.Int",
+    }
+)
+
+# Binary operators that keep an integer integral. ``Div`` is deliberately absent: its result is the
+# thing under test, so admitting it would let one unflagged division launder its operands into a
+# second.
+_INT_PRESERVING = (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod, ast.BitAnd, ast.BitOr)
+
+
+def _int_array_dtype(annotation: str) -> bool:
+    """Whether a ``wp.array[...]`` annotation names a concrete integer dtype."""
+    inside = annotation.partition("[")[2].rpartition("]")[0]
+    return inside.split(",")[0].strip() in _INT_SCALARS
+
+
+def _int_module_constants(tree: ast.Module) -> set[str]:
+    """Module-level ``wp.constant(wp.int32(...))`` names, which kernels read as plain integers."""
+    names: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        value = node.value
+        if not isinstance(target, ast.Name) or not isinstance(value, ast.Call):
+            continue
+        if _dotted(value.func) != ("wp", "constant") or not value.args:
+            continue
+        inner = value.args[0]
+        if isinstance(inner, ast.Call) and ".".join(_dotted(inner.func)) in _INT_SCALARS:
+            names.add(target.id)
+    return names
+
+
+def _int_typed_names(function: ast.FunctionDef, constants: set[str]) -> tuple[set[str], set[str]]:
+    """
+    Names inside a kernel-scope body that are integers *by declaration*, and integer arrays.
+
+    Declaration, not inference: a module-level integer ``wp.constant``, an annotated parameter, or
+    a local whose right-hand side is a ``wp.tid()``, an integer constructor, a ``.shape[...]``, or
+    an integer-preserving expression over names already known. Anything the scan cannot type this
+    way stays untyped, so a division involving it is never reported -- the check misses rather than
+    misfires.
+    """
+    scalars: set[str] = set(constants)
+    arrays: set[str] = set()
+    for argument in function.args.args:
+        if argument.annotation is None:
+            continue
+        annotation = ast.unparse(argument.annotation)
+        if annotation in _INT_SCALARS:
+            scalars.add(argument.arg)
+        elif annotation.startswith("wp.array") and _int_array_dtype(annotation):
+            arrays.add(argument.arg)
+    # Two passes so an assignment reached before its operands were typed still resolves; the
+    # dependency chains here are short and a third pass has never added a name.
+    for _ in range(2):
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if isinstance(target, ast.Tuple):
+                # ``i, j = wp.tid()``: every element of a multi-dimensional thread index is an int.
+                value = node.value
+                if isinstance(value, ast.Call) and _dotted(value.func) == ("wp", "tid"):
+                    scalars.update(
+                        element.id for element in target.elts if isinstance(element, ast.Name)
+                    )
+                continue
+            if isinstance(target, ast.Name) and _is_int_expression(node.value, scalars, arrays):
+                scalars.add(target.id)
+    return scalars, arrays
+
+
+def _is_int_expression(node: ast.expr, scalars: set[str], arrays: set[str]) -> bool:
+    """Whether ``node`` is an integer by declaration, given the names already typed."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, int) and not isinstance(node.value, bool)
+    if isinstance(node, ast.Name):
+        return node.id in scalars
+    if isinstance(node, ast.Call):
+        dotted = _dotted(node.func)
+        return ".".join(dotted) in _INT_SCALARS or dotted == ("wp", "tid")
+    if isinstance(node, ast.Subscript):
+        if isinstance(node.value, ast.Attribute) and node.value.attr == "shape":
+            return True
+        return isinstance(node.value, ast.Name) and node.value.id in arrays
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        return _is_int_expression(node.operand, scalars, arrays)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, _INT_PRESERVING):
+        return _is_int_expression(node.left, scalars, arrays) and _is_int_expression(
+            node.right, scalars, arrays
+        )
+    return False
+
+
+def integer_division_problems() -> list[str]:
+    """
+    Check 17: an integer ``/`` inside a ``@wp.kernel`` or ``@wp.func`` body.
+
+    ``.claude/CLAUDE.md`` section 5: on integers Warp's ``/`` and ``//`` are the *same* operation --
+    both truncate toward zero, unlike CPython's ``//``, which floors. So this is a legibility rule
+    and not a correctness one: ``/`` on two ``int32``s reads as real division and truncates only
+    because the operands happen to be integers, which means a reader has to recover both types
+    before they know what the line does. Every dividend in this package is a non-negative index,
+    where the two conventions coincide; the hazard the spelling creates is *porting* such a line
+    between host Python and kernel scope, where the answer changes silently for a negative
+    dividend.
+
+    Why a check rather than a one-off edit: the third pass converted eight sites and wrote the rule
+    into ``CLAUDE.md``, and the next module written after it reintroduced two
+    (``algorithms/multigrid.py``'s ``column = t / n_rows`` and ``column = t / stride``). That is
+    section 14's bar for a new check -- the same defect found twice -- and the same failure mode
+    check 16 exists to prevent for casts.
+
+    The scan is deliberately conservative, because the cost of a false positive is that the first
+    person it annoys disables it. An operand counts as an integer only *by declaration*: an
+    annotated ``wp.int*`` / ``wp.uint*`` / ``wp.Int`` parameter, an element of a ``wp.array`` whose
+    annotated dtype is one of those, an integer literal, a ``.shape[...]``, ``wp.tid()``, an
+    integer constructor, or an integer-preserving expression over those. A ``wp.Scalar``-generic
+    parameter, a float, and anything whose type comes from a call the scan cannot see are all left
+    untyped, so their divisions are never reported.
+    """
+    problems: list[str] = []
+    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue  # test_package_scan_is_discoverable reports the parse failure
+        constants = _int_module_constants(tree)
+        for function in _kernel_scope_functions(tree):
+            scalars, arrays = _int_typed_names(function, constants)
+            for node in ast.walk(function):
+                if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.Div):
+                    continue
+                if not _is_int_expression(node.left, scalars, arrays):
+                    continue
+                if not _is_int_expression(node.right, scalars, arrays):
+                    continue
+                problems.append(
+                    f"{path.relative_to(_REPO_ROOT)}:{node.lineno} {function.name} divides "
+                    f"integers with '/' in '{ast.unparse(node)}' -- write // instead, which is the "
+                    "same operation on integers and says so"
+                )
+    return problems

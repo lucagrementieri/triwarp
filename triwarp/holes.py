@@ -1573,25 +1573,32 @@ def stitch_loops_min_weight(
     )
     wp.launch(kernel_holes.set_dp_origin, dim=1, inputs=[dp], device=device)
     came = twt.as_array2d(wp.full((n_a + 1, n_b + 1), -1, dtype=wp.int32, device=device), wp.int32)
+    # Built once, outside the loop: the ten values below are the same on every one of the
+    # ``n_a + n_b`` launches, and a wp.launch argument costs ~1.0 us of host time linearly on both
+    # devices. Measured on an RTX 5090, the two spellings of this loop interleaved in one process
+    # over the same tables, 12 reps, gated on the emitted ``came`` traceback being identical:
+    # **1.88x/1.89x** at 100 x 100 (200 launches), **1.87x/1.89x** at 200 x 200 (400) and
+    # **1.90x/1.90x** at 512 x 512 (1 024). Flat in the rim size, as the model predicts -- the
+    # saving works out at ~16 us per launch for nine dropped arguments, i.e. ~1.8 us each against
+    # the ~1.0 us the linear model predicts -- the same over-delivery ``HoleFillTables`` measured
+    # (9.5-11.9 us against a 12 us prediction is the other direction; this kernel's arguments are
+    # six `wp.array` handles rather than scalars). Treat ~1.0 us/argument as the floor it is.
+    tables = kernel_holes.StitchTables()
+    tables.a_pos = a_pos
+    tables.b_pos = b_pos
+    tables.a_opp = a_opp
+    tables.a_opp_valid = a_opp_valid
+    tables.b_opp = b_opp
+    tables.b_opp_valid = b_opp_valid
+    tables.up = up
+    tables.metric_id = wp.int32(metric_id)
+    tables.n_a = wp.int32(n_a)
+    tables.n_b = wp.int32(n_b)
     for diag in range(1, n_a + n_b + 1):
         wp.launch(
             kernel_holes.stitch_dp_diag,
             dim=min(diag, n_a) - max(0, diag - n_b) + 1,
-            inputs=[
-                a_pos,
-                b_pos,
-                a_opp,
-                a_opp_valid,
-                b_opp,
-                b_opp_valid,
-                up,
-                wp.int32(metric_id),
-                wp.int32(n_a),
-                wp.int32(n_b),
-                wp.int32(diag),
-                dp,
-                came,
-            ],
+            inputs=[tables, wp.int32(diag), dp, came],
             device=device,
         )
     came_np = came.numpy()

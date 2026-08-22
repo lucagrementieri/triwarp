@@ -124,11 +124,11 @@ def dart_cell_neighbors(
     w64 = wp.int64(grid_w)
     key = unique_keys[c]
     x = wp.int32(key % w64)
-    y = wp.int32((key / w64) % w64)
-    z = wp.int32(key / (w64 * w64))
+    y = wp.int32((key // w64) % w64)
+    z = wp.int32(key // (w64 * w64))
     dx = s % _DART_SHELL_W - wp.int32(1)
-    dy = (s / _DART_SHELL_W) % _DART_SHELL_W - wp.int32(1)
-    dz = s / (_DART_SHELL_W * _DART_SHELL_W) - wp.int32(1)
+    dy = (s // _DART_SHELL_W) % _DART_SHELL_W - wp.int32(1)
+    dz = s // (_DART_SHELL_W * _DART_SHELL_W) - wp.int32(1)
     out_cell_neighbors[c, s] = INVALID
     cx = x + dx
     cy = y + dy
@@ -142,14 +142,6 @@ def dart_cell_neighbors(
     out_cell_neighbors[c, s] = lookup_cell(
         unique_keys, cell_key(w64, wp.int64(cx), wp.int64(cy), wp.int64(cz))
     )
-
-
-@wp.kernel
-def dart_priorities(seed: wp.int32, out_priority: wp.array[wp.uint32]) -> None:
-    # The sampling order. Drawing it up front rather than per round is what makes the whole loop a
-    # deterministic function of ``seed``: every round reads the same total order on the pool.
-    i = wp.int32(wp.tid())
-    out_priority[i] = wp.randu(wp.rand_init(seed, i))
 
 
 @wp.kernel

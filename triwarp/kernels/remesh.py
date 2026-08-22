@@ -1,3 +1,5 @@
+from typing import Any
+
 import warp as wp
 
 from triwarp.constants import TOLERANCE_ZERO_CONSTANT
@@ -8,6 +10,7 @@ from triwarp.kernels.predicates import (
     delone_metrics,
     dihedral_angle,
     is_unfold_quadrangle_convex,
+    law_of_cosines_angle,
     mincircle_diameter_sq,
     orient2d,
     project_out_normal,
@@ -616,6 +619,52 @@ def _resolve_flip_quad_guarded(
     return a, b, c, d
 
 
+@wp.func
+def _resolve_flip_quad_in_region(
+    faces: wp.array[wp.int32],
+    adjacency: wp.array2d[wp.int32],
+    adjacency_edges: wp.array2d[wp.int32],
+    unshared: wp.array2d[wp.int32],
+    region_flags: wp.array[wp.int32],
+    sorted_edge_keys: wp.array[wp.uint64],
+    key_base: wp.uint64,
+    k: wp.int32,
+    out_quad: wp.array2d[wp.int32],
+) -> tuple[wp.int32, wp.int32, wp.int32, wp.int32]:
+    # ``_resolve_flip_quad_guarded`` plus the region test, folded into its ``a < 0`` contract: an
+    # edge with either incident face outside the region is not flippable, for the same reason a
+    # missing apex is not.
+    #
+    # Region-restricted rather than universal, because two of the four candidate kernels genuinely
+    # have no region to restrict to. ``valence_flip_candidates`` is whole-mesh *by construction* --
+    # its only caller, ``remesh._valence_flip_pass``, is reached from ``isotropic_remesh`` and takes
+    # no ``region`` parameter, where ``delone`` and ``objective`` both go through ``_flip_setup`` --
+    # and ``incircle_flip_candidates`` triangulates a planar point set. That asymmetry reads as an
+    # oversight until someone opens the wrapper, which is why it is written down here.
+    f0 = adjacency[k, 0]
+    if region_flags[f0] == 0 or region_flags[adjacency[k, 1]] == 0:
+        return wp.int32(-1), wp.int32(-1), wp.int32(-1), wp.int32(-1)
+    return _resolve_flip_quad_guarded(
+        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, k, f0, out_quad
+    )
+
+
+@wp.func
+def flip_quad_positions_d(
+    vertices: wp.array[Any], a: wp.int32, b: wp.int32, c: wp.int32, d: wp.int32
+):
+    # The four corners of a flip quad, promoted to ``float64``. Every flip predicate in this module
+    # -- convexity, the Delone empty-circumcircle test, the segment distance -- runs in float64 on a
+    # float32 vertex buffer, because they are *branches*: a lost digit changes a flip decision
+    # rather than a printed number.
+    return (
+        to_vec3d(vertices[a]),
+        to_vec3d(vertices[b]),
+        to_vec3d(vertices[c]),
+        to_vec3d(vertices[d]),
+    )
+
+
 @wp.kernel
 def delone_flip_candidates(
     vertices: wp.array[wp.vec3],
@@ -634,19 +683,20 @@ def delone_flip_candidates(
 ) -> None:
     k = wp.int32(wp.tid())
     out_flip[k] = wp.bool(False)
-    f0 = adjacency[k, 0]
-    f1 = adjacency[k, 1]
-    if region_flags[f0] == 0 or region_flags[f1] == 0:
-        return
-    a, b, c, d = _resolve_flip_quad_guarded(
-        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, k, f0, out_quad
+    a, b, c, d = _resolve_flip_quad_in_region(
+        faces,
+        adjacency,
+        adjacency_edges,
+        unshared,
+        region_flags,
+        sorted_edge_keys,
+        key_base,
+        k,
+        out_quad,
     )
     if a < 0:
         return
-    ap = to_vec3d(vertices[a])
-    bp = to_vec3d(vertices[b])
-    cp = to_vec3d(vertices[c])
-    dp = to_vec3d(vertices[d])
+    ap, bp, cp, dp = flip_quad_positions_d(vertices, a, b, c, d)
     if max_deviation_sq < F32_LARGE:
         if _segments_dist_sq_d(ap, cp, bp, dp) > wp.float64(max_deviation_sq):
             return
@@ -758,6 +808,45 @@ FREE_VERTEX = wp.constant(wp.int32(0))
 CREASE_VERTEX = wp.constant(wp.int32(1))
 CORNER_VERTEX = wp.constant(wp.int32(2))
 
+# What ``collapse_survivor`` decided about where the merged vertex may go.
+COLLAPSE_REJECTED = wp.constant(wp.int32(0))  # the edge must not collapse at all
+COLLAPSE_PINNED = wp.constant(wp.int32(1))  # the survivor keeps its own position
+COLLAPSE_FREE = wp.constant(wp.int32(2))  # the caller places it -- midpoint, or a quadric optimum
+
+
+@wp.func
+def collapse_survivor(
+    codes: wp.array[wp.int32], u: wp.int32, v: wp.int32, is_boundary: wp.bool
+) -> tuple[wp.int32, wp.int32, wp.int32]:
+    # Which endpoint of edge ``(u, v)`` survives the collapse, which one is removed, and whether
+    # the survivor's position is pinned or free -- the feature rule alone, with no geometry in it.
+    #
+    # One rule, two decimators. ``collapse_candidates`` and ``quadric_collapse_candidates`` were
+    # each carrying their own copy, expressed through a ``reject`` flag in one and early returns in
+    # the other, and the second's comment claimed it "mirrors ``collapse_candidates``" -- a claim
+    # only a shared function can keep true. They were in fact equivalent; nothing but this stopped
+    # the next edit to either from silently diverging.
+    #
+    # The genuine difference between the two is what they do with ``COLLAPSE_FREE``: one takes the
+    # midpoint, the other minimizes the summed quadric. That is the only thing their comments
+    # should now claim to share.
+    cu = codes[u]
+    cv = codes[v]
+    if cu == CORNER_VERTEX and cv == CORNER_VERTEX:
+        # Two corners: the edge between two fixed points cannot shorten.
+        return u, v, COLLAPSE_REJECTED
+    if cu >= CREASE_VERTEX and cv >= CREASE_VERTEX:
+        # Two feature vertices: collapse only along a boundary edge, and only when both are plain
+        # creases. When that holds neither endpoint is preferred, so the placement stays free.
+        if not (is_boundary and cu == CREASE_VERTEX and cv == CREASE_VERTEX):
+            return u, v, COLLAPSE_REJECTED
+        return u, v, COLLAPSE_FREE
+    if cu >= CREASE_VERTEX:
+        return u, v, COLLAPSE_PINNED
+    if cv >= CREASE_VERTEX:
+        return v, u, COLLAPSE_PINNED
+    return u, v, COLLAPSE_FREE
+
 
 @wp.kernel
 def scatter_feature_edge_counts(
@@ -781,8 +870,8 @@ def scatter_feature_edge_counts(
     if count == 2:
         f0 = edge_faces[e, 0]
         f1 = edge_faces[e, 1]
-        normal_a, _area_a = face_normals_and_area(vertices, faces[f0 * 3 : (f0 + 1) * 3])
-        normal_b, _area_b = face_normals_and_area(vertices, faces[f1 * 3 : (f1 + 1) * 3])
+        normal_a, _area_a = face_normals_and_area(vertices, faces, f0)
+        normal_b, _area_b = face_normals_and_area(vertices, faces, f1)
         feature = vector_angle(normal_a, normal_b) > feature_angle
     if feature:
         v0 = unique_edges[e, 0]
@@ -845,32 +934,16 @@ def collapse_candidates(
     v = unique_edges[k, 1]
     if lengths[k] >= wp.float32(0.5) * (low[u] + low[v]):
         return
-    cu = codes[u]
-    cv = codes[v]
     is_boundary = edge_face_count[k] == 1
 
-    # Choose the surviving vertex and its target position (features/corners stay put).
-    s = u
-    r = v
-    p = wp.lerp(vertices[u], vertices[v], 0.5)
-    reject = False
-    if cu == CORNER_VERTEX and cv == CORNER_VERTEX:
-        reject = True
-    elif cu >= CREASE_VERTEX and cv >= CREASE_VERTEX:
-        # Two feature vertices: collapse only along a boundary edge, and only when both are plain
-        # creases -- in which case the midpoint default above is already the answer, so this arm
-        # decides nothing but whether to reject.
-        reject = not (is_boundary and cu == CREASE_VERTEX and cv == CREASE_VERTEX)
-    elif cu >= CREASE_VERTEX:
-        s = u
-        r = v
-        p = vertices[u]
-    elif cv >= CREASE_VERTEX:
-        s = v
-        r = u
-        p = vertices[v]
-    if reject:
+    # Choose the surviving vertex and its target position; this decimator places a free collapse at
+    # the edge midpoint, where ``quadric_collapse_candidates`` minimizes the summed quadric.
+    s, r, placement = collapse_survivor(codes, u, v, is_boundary)
+    if placement == COLLAPSE_REJECTED:
         return
+    p = wp.lerp(vertices[u], vertices[v], 0.5)
+    if placement == COLLAPSE_PINNED:
+        p = vertices[s]
 
     # Link condition: exactly 2 shared neighbours for an interior edge, 1 for a boundary edge.
     required = 2
@@ -993,10 +1066,7 @@ def valence_flip_candidates(
     )
     if a < 0:
         return
-    ap = to_vec3d(vertices[a])
-    bp = to_vec3d(vertices[b])
-    cp = to_vec3d(vertices[c])
-    dp = to_vec3d(vertices[d])
+    ap, bp, cp, dp = flip_quad_positions_d(vertices, a, b, c, d)
     if not is_unfold_quadrangle_convex(ap, bp, cp, dp):
         return
     # Shape guard. Convexity makes the flip *legal* but says nothing about the shape of what it
@@ -1123,17 +1193,6 @@ def local_corner(faces: wp.array[wp.int32], f: wp.int32, vertex: wp.int32) -> wp
         if faces[f * 3 + k] == vertex:
             return k
     return wp.int32(-1)
-
-
-@wp.func
-def law_of_cosines_angle(adjacent_a: wp.float32, adjacent_b: wp.float32, opposite: wp.float32):
-    # Angle between the two adjacent sides of a triangle, from its three side lengths alone. Every
-    # geometric quantity the intrinsic flip needs comes through here -- no vertex position does.
-    denominator = 2.0 * adjacent_a * adjacent_b
-    if denominator <= TOLERANCE_ZERO_CONSTANT:
-        return wp.float32(0.0)
-    cosine = (adjacent_a * adjacent_a + adjacent_b * adjacent_b - opposite * opposite) / denominator
-    return wp.acos(cosine)  # wp.acos auto-clamps to [-1, 1]
 
 
 @wp.func
@@ -1353,14 +1412,26 @@ def objective_flip_candidates(
 ) -> None:
     # Quad convention (shared with ``delone_flip_candidates``): the current diagonal is a-c, with
     # faces (a, b, c) and (a, c, d); the flip replaces it with b-d, giving (a, b, d) and (d, b, c).
+    #
+    # Fourteen arguments and **deliberately not bundled into a ``@wp.struct``**, unlike
+    # ``holes.stitch_dp_diag`` and ``holes.fill_dp_span``, which have the same width. Those launch
+    # once per DP cell-diagonal or span -- hundreds of times, with nothing else in the loop. This
+    # one launches once per *flip round*, and a round rebuilds the whole face adjacency around it:
+    # measured on a noisy icosphere(4), ``flip_to_delaunay`` converges in **2** rounds at 514 us
+    # each, so the nine bundleable arguments bound the saving at 18 us, **1.75 %** of the call. The
+    # width alone is not the criterion; the launch count around it is.
     k = wp.int32(wp.tid())
     out_flip[k] = wp.bool(False)
-    f0 = adjacency[k, 0]
-    f1 = adjacency[k, 1]
-    if region_flags[f0] == 0 or region_flags[f1] == 0:
-        return
-    a, b, c, d = _resolve_flip_quad_guarded(
-        faces, adjacency_edges, unshared, sorted_edge_keys, key_base, k, f0, out_quad
+    a, b, c, d = _resolve_flip_quad_in_region(
+        faces,
+        adjacency,
+        adjacency_edges,
+        unshared,
+        region_flags,
+        sorted_edge_keys,
+        key_base,
+        k,
+        out_quad,
     )
     if a < 0:
         return
@@ -1369,8 +1440,11 @@ def objective_flip_candidates(
     cp = vertices[c]
     dp = vertices[d]
 
-    # A non-convex quad has no valid flip: the new diagonal would fall outside it.
-    if not is_unfold_quadrangle_convex(to_vec3d(ap), to_vec3d(bp), to_vec3d(cp), to_vec3d(dp)):
+    # A non-convex quad has no valid flip: the new diagonal would fall outside it. The rest of this
+    # kernel stays in float32 -- only the convexity branch needs the promoted corners, which is what
+    # ``flip_quad_positions_d`` names.
+    apd, bpd, cpd, dpd = flip_quad_positions_d(vertices, a, b, c, d)
+    if not is_unfold_quadrangle_convex(apd, bpd, cpd, dpd):
         return
 
     if objective == OBJECTIVE_T_VERTEX:
@@ -1817,28 +1891,14 @@ def quadric_collapse_candidates(
     out_cost[k] = wp.inf
     u = unique_edges[k, 0]
     v = unique_edges[k, 1]
-    cu = codes[u]
-    cv = codes[v]
     is_boundary = edge_face_count[k] == 1
 
-    # Feature handling mirrors ``collapse_candidates``: a corner never moves, a crease only
-    # collapses along its own feature, and otherwise the quadric chooses the position freely.
-    s = u
-    r = v
-    free_position = wp.bool(True)
-    if cu == CORNER_VERTEX and cv == CORNER_VERTEX:
+    # The feature rule is ``collapse_survivor``, shared with ``collapse_candidates``. What differs
+    # is only the free placement: that one takes the midpoint, this one the quadric's minimizer.
+    s, r, placement = collapse_survivor(codes, u, v, is_boundary)
+    if placement == COLLAPSE_REJECTED:
         return
-    if cu >= CREASE_VERTEX and cv >= CREASE_VERTEX:
-        if not (is_boundary and cu == CREASE_VERTEX and cv == CREASE_VERTEX):
-            return
-    elif cu >= CREASE_VERTEX:
-        s = u
-        r = v
-        free_position = wp.bool(False)
-    elif cv >= CREASE_VERTEX:
-        s = v
-        r = u
-        free_position = wp.bool(False)
+    free_position = placement == COLLAPSE_FREE
 
     # Link condition: exactly 2 shared neighbours for an interior edge, 1 for a boundary edge.
     required = 2

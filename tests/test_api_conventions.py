@@ -14,6 +14,9 @@ to name which one.
 
 from __future__ import annotations
 
+import ast
+import textwrap
+
 import pytest
 import trimesh as tm
 import warp as wp
@@ -21,6 +24,10 @@ import warp as wp
 import triwarp as tw
 from tests.api_conventions import (
     DocstringExample,
+    _int_module_constants,
+    _int_typed_names,
+    _is_int_expression,
+    _kernel_scope_functions,
     allocation_device_problems,
     array_annotation_style_problems,
     builtin_cast_problems,
@@ -29,6 +36,7 @@ from tests.api_conventions import (
     duplicate_name_problems,
     helper_order_problems,
     installed_warp_version,
+    integer_division_problems,
     kernel_module_problems,
     kernel_output_naming_problems,
     launch_device_problems,
@@ -262,6 +270,69 @@ def test_kernel_casts_use_the_warp_spelling() -> None:
     ordinary Python call.
     """
     _fail("bare int()/float() cast(s) in kernel scope:", builtin_cast_problems())
+
+
+def test_kernel_integer_division_uses_the_floor_spelling() -> None:
+    """
+    An integer division inside a kernel reads ``//``, never ``/``.
+
+    ``.claude/CLAUDE.md`` section 5. On integers the two are the *same* operation in Warp -- both
+    truncate toward zero, where CPython's ``//`` floors -- so this is legibility, not correctness:
+    ``/`` on two ``int32``s reads as real division and a reader has to recover both operand types
+    before they know the line truncates.
+
+    A check rather than an edit because the defect recurred. The third pass converted eight sites
+    and wrote the rule into ``CLAUDE.md``; ``algorithms/multigrid.py``, written afterwards,
+    reintroduced two (``column = t / n_rows``, ``column = t / stride``), and the scan added for
+    this test turned up four more in ``algorithms/blue_noise.py`` that a textual pass had missed.
+    """
+    _fail("integer division(s) spelled '/' in kernel scope:", integer_division_problems())
+
+
+def test_integer_division_scan_ignores_float_operands() -> None:
+    """
+    Check 17 fires on declared integers only -- a float division is not a violation.
+
+    The failure mode a conservative scan is protecting against is being switched off by the first
+    person it annoys, so the negative cases are pinned here rather than left to the tree happening
+    not to contain them: float / float, float / int, a ``wp.Scalar``-generic parameter the scan
+    cannot type, and an element of a float array all stay silent, while the two-integer case in
+    the same fixture is reported.
+    """
+    source = textwrap.dedent(
+        """
+        import warp as wp
+
+        @wp.func
+        def divisions(
+            a: wp.float32,
+            b: wp.int32,
+            g: wp.Scalar,
+            values: wp.array[wp.float32],
+            counts: wp.array[wp.int32],
+        ) -> wp.float32:
+            i = wp.int32(wp.tid())
+            float_by_float = a / a
+            float_by_int = a / b
+            generic_by_int = g / b
+            element_by_int = values[i] / b
+            int_by_int = counts[i] / b
+            return float_by_float + float_by_int + generic_by_int + element_by_int + int_by_int
+        """
+    )
+    tree = ast.parse(source)
+    constants = _int_module_constants(tree)
+    (function,) = _kernel_scope_functions(tree)
+    scalars, arrays = _int_typed_names(function, constants)
+    flagged = [
+        ast.unparse(node)
+        for node in ast.walk(function)
+        if isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Div)
+        and _is_int_expression(node.left, scalars, arrays)
+        and _is_int_expression(node.right, scalars, arrays)
+    ]
+    assert flagged == ["counts[i] / b"]
 
 
 def test_generic_kernels_register_their_overloads() -> None:

@@ -545,10 +545,7 @@ def _dart_throw_blue_noise(
 
     priority = wp.empty(n_pool, dtype=wp.uint32, device=device)
     wp.launch(
-        kernel_blue_noise.dart_priorities,
-        dim=n_pool,
-        inputs=[wp.int32(seed), priority],
-        device=device,
+        kernel_array.random_priorities, dim=n_pool, inputs=[wp.int32(seed), priority], device=device
     )
     state = wp.zeros(n_pool, dtype=wp.int32, device=device)
 

@@ -51,6 +51,13 @@ You are an expert in NVIDIA Warp (wp). Follow all rules below when writing kerne
   because it is the *declarative* one: it names the type of the index the whole kernel is written
   against. A cast of a bare **literal** is also never redundant — `wp.int32(0)` is a mutable Warp
   dynamic variable where `0` is a compile-time constant that freezes the enclosing loop.
+- **A constructor of the type a value already has is the same noise, and the cast scan does not see
+  it.** `wp.vec3(*(vertices[face[1]] - vertices[face[0]]))` splats a `wp.vec3` and rebuilds it; the
+  difference of two `wp.vec3`s is already a `wp.vec3`. Check 16 classifies *casts*, so a
+  `wp.vecN(*(...))` / `wp.matNM(*(...))` splat-and-reconstruct survives it — three such sites
+  outlived the pass that deleted 184 redundant casts, in `triangles.triangle_edges`. When deleting
+  one class of no-op conversion, grep the constructor spelling too, and read the operand's type
+  rather than trusting the scan's silence.
 - Use `wp.launch(kernel=..., dim=..., inputs=[...], device=...)` for execution. Always forward the `device` from the input arrays.
 - Array slicing is supported inside kernels: `faces[f * 3 : (f + 1) * 3]` produces a sub-array view.
 - Use `wp.cast(expr, TargetType)` for explicit type conversions between Warp types — but **only
@@ -90,6 +97,57 @@ float32/float64, one accelerator/another), the same commit must:
 the same quantity are one function; two bodies that agree because a one-line kernel has only one
 shape are two functions and the duplicate scan's hit is noise. `remesh.compute_midpoints` and
 `triangles.face_centroids` normalise identically and must stay apart.
+
+**A comment that names the other copy is the finding, not the fix.** *"Feature handling mirrors
+`collapse_candidates`"*, *"the `dart_priorities` argument"*, *"every candidate kernel opens with the
+same two lines"* — each of those was written by an author who had already seen the duplication and
+answered it with prose. A cross-reference is a claim that **only a shared `@wp.func` can keep true**:
+the two bodies are equivalent on the day it is written and nothing stops the next edit to one of them
+from diverging silently. So when writing "same as X" / "mirrors X" / "as in X" about *code* rather
+than about a reason, extract instead; and when reading one, treat it as an unfactored duplicate that
+has been located for you. **Re-count the run from the code, not from the comment** — the "same two
+lines" above was seven statements, and the prose had been factored where the code had not.
+
+**A clean duplicate scan is not a clean file.** Every scan this package has used keys on α-renamed
+statement *text*, so two bodies expressing the same decision through different control flow — a
+`reject` flag against an early `return`, a position against a boolean — score as unrelated. The
+best find of the fourth `kernels/` pass was exactly that shape and came from reading a closed item,
+not from a scan: `remesh.collapse_candidates` and `quadric_collapse_candidates` hold one 4-way
+feature-collapse rule twice, one through a flag and one through returns. **A duplicated *decision
+rule* is a live correctness hazard where a duplicated arithmetic run is only noise**, so it
+outranks the longer runs a scan does find: extract it as a `@wp.func` returning the classification
+(a sentinel for "reject", the `_resolve_flip_quad_guarded` convention) and let each caller map the
+free branch onto its own answer.
+
+**Factor the family, not the pair — a helper pinned to one rank or one precision breeds the copies
+it was meant to prevent.** Two measured instances: `corner_triple` landed for flat 3-stride buffers
+and reached 16 callers while its rank-2 sibling (`arr[row, 0..2]`) stayed nameless at eight sites;
+and `laplacian.squared_edge_lengths`, hardcoded `wp.vec3` / `float32`, could not be reached by the
+three `float64` sites in `energies.py`, which open-coded it instead. So when extracting, write the
+generic form §14 asks for (`wp.Float` / `wp.Scalar` / `Any`, the `kernels/predicates.py` convention)
+and check for the *other* rank and the *other* precision before declaring the run named. This is
+also the recurring half of rule 2 above: a general per-triangle quantity left in an algorithm module
+is now a **three-time** defect — `triangle_aabb` in `intersection.py`, `triangle_double_area` and
+`circumcircle_diameter` in `holes.py`, `squared_edge_lengths` in `laplacian.py` — and the tell is a
+kernel module importing an *algorithm* to reach *geometry*.
+
+**One predicate, one spelling per module — this is a correctness rule, not a style one.**
+`wp.length(d) < r` and `wp.length_sq(d) < r * r` are **not the same predicate in float32**: measured,
+10 rows of 200k disagree at the boundary. So a module that tests the same rule both ways can accept a
+candidate in one kernel and reject it in another — `ball_pivoting` tested one clustering rule as
+`wp.length(...) < min_cluster` in `seed_triangles` and as `wp.length_sq(...) < min_cluster_sq` forty
+lines later. Pick one spelling per predicate and say which; expect the speed to be flat (`neighbors`
+measured 0.997-1.003x, and a hash-grid cell probe is worth ~600 point tests) and keep the number
+either way.
+
+**A green suite does not prove a `@wp.func` extraction was behaviour-neutral.** `@wp.func` calls
+inline at codegen, so an extraction that reorders an expression's evaluation changes `float32`
+results without moving any comparison asserted at `1e-5`. The evidence is **reading the diff**, not
+the suite. Two consequences for the gate: prefer to check the *decision* arrays a kernel writes over
+the positions it produces where positions drift on their own (`isotropic_remesh` moves ~3e-06 run to
+run from atomic ordering, so a byte comparison fails on an unchanged build), and where a reference's
+answer is a combinatorial object — a triangulation, a face buffer — gate on that rather than on a
+tolerance.
 
 Watch the signature while fusing, too: a fused kernel inherits the union of two argument lists, and
 **a `wp.launch` argument costs ~1.0 µs of host time, linearly, on both CUDA and CPU** (measured over
@@ -181,6 +239,22 @@ happens to land in `[0, nrow)` accumulate a garbage value into a **real** entry.
 long-standing "`bsr_mm` is nondeterministic on CUDA" claim in this package really was, in
 `downloads/issue_report.md` and in six code comments — **`bsr_mm` is sound**; do not reintroduce that
 explanation. A rebuild sliced to `nnz_sync()` is safe.
+
+**And this is now a pattern rather than one API's quirk: `wp.Volume.get_voxel_count()` is a
+capacity too.** It reports the grid's allocated voxel count, not its active one, so `triwarp.voxels`
+goes through `Volume.get_active_stats().voxel_count` and says so at both sites. Same shape as
+`nnz` — a field that reads like the answer, is an upper bound, and fails silently when it sizes a
+buffer. When a Warp object offers a count, check whether it is the count or the capacity before
+sizing anything with it.
+
+**And this is now a pattern rather than one API's quirk: a Warp object's `*_count` / `.nnz` field is
+a *capacity* until proven otherwise.** The second instance is `wp.volume_voxel_count`, which returns
+the grid's allocated capacity and not its active voxel count — `triwarp/voxels.py` rejects it in
+source at two sites and goes through `Volume.get_active_stats` instead. So before sizing a buffer,
+a slice or a launch `dim` off any such field, probe it against a construction whose true count you
+know (a duplicate-emitting triplet build, a sparse voxel set) and record the number where the
+rejection lives. The failure mode is the same both times: the wrong reading is an *upper* bound, so
+nothing raises and the tail is garbage.
 
 Two corollaries. A matrix built by *duplicate-free* triplets (`laplacian.laplacian`,
 `smoothing._edge_weight_matrix`) has `nnz == nnz_sync()`, which is why the default paths never
@@ -342,6 +416,10 @@ The following Python features are **not supported** inside `@wp.kernel` and `@wp
 - For small fixed-size collections use vector types (`wp.vec3`, etc.); for larger ones use `wp.zeros(shape=N, dtype=T)` (stack-allocated inside a kernel).
 - The `%` operator follows C++11 semantics (sign of result = sign of dividend), not Python semantics.
 - **`//` truncates toward zero like `/`, not toward −infinity like CPython's `//`, and on integers the two operators are the same operation.** Measured on Warp 1.16: `[-8, -7, -1, 0, 1, 7, 8] ÷ 3` gives `[-2, -2, 0, 0, 0, 2, 2]` for both spellings, where CPython's `//` gives `[-3, -3, -1, 0, 0, 2, 2]`. This is consistent with the `%` rule above (`-8 % 3 == -2`, and `-2 * 3 + (-2) == -8`). **Spell integer division `//`** — `/` on two `int32`s reads as real division and only truncates because the operands happen to be integers, so a reader has to recover the types before knowing what the line does. Every dividend in this package is a non-negative index, where the two conventions coincide; the hazard is *porting* a line with a negative dividend between host Python and kernel scope, which changes its answer silently.
+- **And spell the remainder `%`, not `i - (i // stride) * stride`.** The long form is the same
+  operation — every dividend here is a non-negative index — but it reads as though it is *avoiding*
+  `%` for a reason a reader then goes looking for. `conjugate_gradient` wrote it long-hand where the
+  sibling `multigrid` three files over wrote `t % stride`; there is no such reason.
 - `wp.asin()` / `wp.acos()` auto-clamp inputs to [-1, 1]; explicit `wp.clamp` before these calls is redundant but harmless.
 - Variable scope inside conditional blocks may differ from CPython: variables defined only inside an `if` branch are accessible afterward in Warp, but are uninitialized if the branch was not taken — always initialize variables before branching.
 
@@ -1220,6 +1298,38 @@ Authoritative Warp function lists are mirrored locally under `reference/warp_api
 
 BEFORE using an unfamiliar Warp builtin, sparse, or utils function, `grep` these files to confirm the exact name, signature, and scope rather than guessing. Each file stamps the Warp version it was transcribed from, and its source URL, at the top — fetch the URL for full argument details or examples when the one-line description is insufficient. Do not restate that version here; run `uv run reference/warp_api/warp_version.py` to compare every stamp against the installed `warp-lang` and see which files a Warp upgrade has left stale. `reference/warp_api/REGENERATE.md` records how to re-extract them.
 
+**A name in `dir(wp)` that is missing from those mirrors is usually hidden on purpose, not missed by
+the transcription.** `dir(wp)` exposes ~510 names against ~137 the package uses, and browsing the
+remainder for adoption candidates is how the `wp.dense_chol` / `dense_subs` / `dense_solve` family
+gets proposed as a replacement for a hand-written 6×6 Cholesky. Introspect before planning around one:
+
+```python
+from warp._src.context import builtin_functions
+f = builtin_functions["dense_chol"]      # a Function, the same handle §4's kernel factories capture
+print(f.hidden, f.doc, f.input_types)    # True  'WIP'  {n: int32, A: array(ndim=1, float32), ...}
+```
+
+`hidden: True` / `doc: "WIP"` is the answer, and the mirrors' silence was the same answer read one
+step earlier.
+
+**Then check the *quantity*, not the name — adopting a matching builtin is sometimes a regression.**
+Four measured rejections worth not re-deriving, each of which reads as a match by name:
+`wp.sample_unit_hemisphere_surface` would replace `visibility`'s low-discrepancy Fibonacci lattice
+(whose `local[2] == dot(direction, normal)` identity the kernel depends on) with a Monte-Carlo
+estimate at the same ray count — variance where there was none, and every occlusion parity test would
+need a tolerance instead of an equality; `wp.norm_huber` is the Huber *norm* where
+`registration.robust_weight` needs the IRLS *weight* `ρ'(r)/r`; `wp.volume_voxel_count` is a capacity
+(§4); and the `dense_*` family takes `wp.array[float32]` where the caller holds a
+`wp.spatial_matrix` in registers, which memory record `warp-per-thread-row-storage` measured as a 2x
+loss. Also check the signature's *storage class* and its precision: a builtin that only speaks
+`float32` cannot serve the `float64` half of a dispatch, so half the hand-written code stays either
+way. And where a builtin *does* fit, the argument is often single-source-of-truth rather than speed —
+`wp.volume_index_to_world` measured perf-neutral (1.08x at 200k voxels, 1.005x at 2M, both
+launch-dominated) against a hand-rolled half-voxel transform that agrees with it to 3.58e-07; adopt
+it for the convention, and if only half the sites can convert (the voxelizers run *before* a volume
+exists), **name the split in the module docstring** rather than leaving two silent conventions in one
+file.
+
 ---
 
 ## 10. Documentation (MkDocs + mkdocstrings)
@@ -1402,14 +1512,47 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
   argument.** Measured over kernels differing only in argument count, small `dim` so marshalling
   dominates, interleaved, 400 reps — 15 µs at 2 arguments, 22 at 8, 31 at 16, 41 at 28, linear, and
   **identical on CUDA and CPU**, so this one is not a device judgement call. The package's mean
-  kernel takes 5.1 arguments and only 18 of 440 take 12 or more, so this matters in exactly one
+  kernel takes 4.9 arguments and only 15 of 483 take 12 or more, so this matters in exactly one
   place: a wide kernel launched inside a Python loop. Bundle its invariant arrays into a
   `@wp.struct` built **once** in the wrapper (construction is ~2.6 µs; rebuilding per launch gives
   the saving back), which collapses them to a single argument — measured 1.17–1.93x on
-  `holes._fill_dp` and 1.34x on `reconstruction._bpa_wave`'s launch path, or ~1.08 µs per dropped
-  argument. Struct fields take the §2 subscript annotation (`a: wp.array[wp.int32]`). Do **not**
-  open a tree-wide bundling pass: bundling a 5-argument kernel trades ~3 µs for a struct the reader
-  has to open, and §14's "no speculative generality" applies to argument bundles too.
+  `holes._fill_dp`, **1.87–1.90x** on `holes._stitch_halves`' anti-diagonal loop (200 to 1 024
+  launches, flat in the rim size, gated on an identical traceback) and 1.34x on
+  `reconstruction._bpa_wave`'s launch path. ~1.0 µs per dropped argument is a **floor**, not a
+  fit: the stitch bundle returned ~1.8 µs each, its arguments being six `wp.array` handles rather
+  than scalars. Struct fields take the §2 subscript annotation (`a: wp.array[wp.int32]`). Do
+  **not** open a tree-wide bundling pass: bundling a 5-argument kernel trades ~3 µs for a struct
+  the reader has to open, and §14's "no speculative generality" applies to argument bundles too.
+- **Width alone does not qualify a kernel for a bundle — the launch count around it does.** The
+  three bundled kernels each launch hundreds of times with nothing else in the loop.
+  `remesh.objective_flip_candidates` is the same 14 arguments and is declined, because a flip
+  *round* rebuilds the whole face adjacency around its one launch: measured on a noisy
+  icosphere(4), `flip_to_delaunay` converges in **2** rounds at 514 µs each, so the nine
+  bundleable arguments bound the saving at 18 µs, **1.75 %** of the call. Before proposing a
+  bundle, count the launches per call and divide.
+- **Graph capture and argument bundling address different loops, and neither substitutes for the
+  other: capture pays on a launch sequence that repeats identically, a bundle on one that runs
+  once.** Recording a graph costs at least what issuing the launches costs, because capture
+  intercepts each one. Measured in one session, 14-argument kernel at `dim=64` so host cost
+  dominates, 30 reps, median/min at 400 launches: loose arguments 11.3/9.8 ms; the `@wp.struct`
+  bundle 6.0/4.6 ms (**1.88x**); capture-and-replay-**once** 13.5/10.4 ms (**0.84x — a loss**);
+  replay of an already-recorded sequence 2.6/0.5 ms (**4.29x**). That last row is where capture's
+  reputation comes from and it is unreachable without a *repeated* sequence. Two rules follow.
+  **Do not bundle a kernel whose launch is already captured** — a replayed launch costs ~1.17 µs
+  whatever its argument list (memory: `warp-cg-iteration-launch-floor`), so `remesh._issue_pass`'s
+  14-argument kernel and the multigrid V-cycle inside `wp.capture_while` gain nothing. And **do not
+  reach for capture on a once-through Python loop** — `holes._fill_dp`'s span loop and the stitch
+  DP's diagonal loop are each recorded and replayed exactly once, which is the 0.84x row. The
+  unexplored lever is the reverse: a *repeated* wrapper loop issuing an identical sequence that is
+  not yet captured is worth 4-45x, and `wp.capture_if` (a device-side conditional, unused here) is
+  the primitive for a stage that currently spends a host readback deciding.
+- **A decline is a result — write it at the site, with the number, and resolve every site the
+  finding named.** The exemplary case is `kernels/neighbors.py:122-132`, where the `wp.length_sq`
+  swap was measured, declined, and the reasoning (including that the two spellings are not the same
+  predicate) written into the source; the counter-case is the same finding's other two sites in
+  `ball_pivoting`, which were neither converted nor annotated and were therefore re-derived a pass
+  later. A finding that names five sites is closed when all five are converted **or** annotated —
+  a partially applied one reads as an open question and costs the next pass the whole re-derivation.
 - **Budget the host–device syncs.** Every `.numpy()` / `int(<device value>)` readback in a wrapper
   carries a comment naming why it is unavoidable. When the caller can supply the bound the readback
   infers, expose it as a keyword (`face_adjacency(n_vertices=...)`,
@@ -1426,18 +1569,20 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
 ## 14. Evolving the Public API
 
 **`tests/test_api_conventions.py` is the mechanical half of this section**, and it fails the default
-`pytest` run. Fifteen checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
+`pytest` run. Seventeen checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
 summary line naming a reference library (§10); a `*_mask` producer that does not return
 `wp.array[wp.bool]`; a module summary advertising Warp; a module without a `tests/` **and** a
 `benchmarks/` file named for it; a private name reached across a module boundary; one public name
 exported by two modules; a top-level `kernels/<name>.py` without its `triwarp/<name>.py` or the
 reverse (§4); and a private helper defined above its first caller (§11). The ninth scans `kernels/`
 **as well**: a comment or docstring blaming a Warp version older than the installed `warp-lang`.
-Two enforce an earlier section's convention on kernel code: §3's `out_` prefix and end-of-signature
-position for a written argument (its two exemption classes carried as `_KERNEL_OUTPUT_ALLOWLIST`),
-and §2's subscript-style array annotation — the latter scans the whole package, because only in an
-*annotation* position is `wp.array(dtype=T)` the stale spelling rather than a legal allocation.
-The last four are newer and each exists because the same defect was found twice:
+Four enforce an earlier section's convention on kernel code: §3's `out_` prefix and
+end-of-signature position for a written argument (its two exemption classes carried as
+`_KERNEL_OUTPUT_ALLOWLIST`); §2's subscript-style array annotation — this one scans the whole
+package, because only in an *annotation* position is `wp.array(dtype=T)` the stale spelling rather
+than a legal allocation; §3's cast spelling, **check 16**, no bare `int(...)` / `float(...)`; and
+§5's integer division, **check 17**, no `/` between two operands that are integers *by
+declaration*. The last five are newer and each exists because the same defect was found twice:
 
 - **A `wp.launch` / `wp.launch_tiled` with no `device=`.** Check 15, and it is a memory-safety guard
   rather than a style one — see §8 for the measured failure. It is also the *load-bearing* half of
@@ -1454,6 +1599,16 @@ The last four are newer and each exists because the same defect was found twice:
 - **A public function that raises with no `Raises` block.** Only a *direct* `raise` in the
   function's own body counts; the 42 functions that delegate validation to a shared guard and
   document its `Raises` are correct and are not scanned.
+- **An integer division spelled `/` inside a kernel.** Check 17, and it is legibility rather than
+  correctness — the two spellings are the *same* operation on integers in Warp. The third pass
+  converted eight sites and wrote the rule into §5; `algorithms/multigrid.py`, written afterwards,
+  reintroduced two, and the scan built for the check turned up four more in
+  `algorithms/blue_noise.py` that a textual pass had missed. The scan types an operand only **by
+  declaration** — an annotated `wp.int*` / `wp.uint*` / `wp.Int` parameter, an element of an array
+  whose annotated dtype is one of those, a module-level integer `wp.constant`, an integer literal,
+  a `.shape[...]`, `wp.tid()`, an integer constructor, or an integer-preserving expression over
+  those — because a scan that misfires on float division gets switched off by the first person it
+  annoys. `test_integer_division_scan_ignores_float_operands` pins the negative cases.
 - **A fenced ```python docstring example that does not run.** The one static check that is not
   static: `tests/api_conventions.py` extracts the blocks and `tests/test_api_conventions.py`
   `exec`s them against a mesh fixture, because both defects it was written for were *runtime*
@@ -1476,6 +1631,21 @@ survive the next upgrade unexamined, which is exactly the failure the check exis
 - **Name a function after what it returns, in NumPy vocabulary — never after the Warp call it
   wraps.** `sort_pairs` named `warp.utils.radix_sort_pairs`'s key/value mechanism rather than its
   result (a sort *and* an argsort), which is why it became `sort_and_argsort`.
+- **When a comment and the body disagree, decide which one is load-bearing before "fixing" it — the
+  usual answer is the comment.** `tangent_space.any_perpendicular`'s comment claims it crosses with
+  *"whichever coordinate axis the normal is least aligned with"* while the body compares only
+  `|n[0]|` against `|n[1]|` and never returns z. The body is **correct for its purpose** (it needs
+  any axis not parallel to the normal, and x or y always qualifies), and "correcting" it into a
+  three-way argmin would move the tangent frame at every z-dominant normal, under `visibility`'s
+  ray bundles and `tangent_space`'s frames. Fix the sentence, leave the branch, and say in the
+  commit which of the two you changed and why.
+- **A new Warp construct can silently switch off a static check that predates it.** Memory record
+  `wp-struct-hides-writes-from-check-13`: moving buffers into a `@wp.struct` removed them from check
+  13's view entirely, because the check resolved store targets to a bare `Name`. So after moving
+  writes behind a struct field, a `@wp.func` return, or any new spelling, **confirm the checks that
+  used to see those lines still see them** — a green suite after a refactor is equally consistent
+  with "still covered" and "no longer looked at". Extending the check is the fix; dropping the
+  construct is not.
 - **Docstring, signature, and body must agree.** Three specific gates:
   - A documented `Raises` must be reachable. In particular §8 forbids device-mismatch checks, so
     **no docstring may document a `ValueError` for arrays "on different devices"** — Warp raises

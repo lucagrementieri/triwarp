@@ -24,6 +24,24 @@ assembles, lives in ``triwarp.kernels.algorithms.conjugate_gradient``.
 import warp as wp
 
 
+@wp.func
+def free_row(fixed_mask: wp.array[wp.bool], free_map: wp.array[wp.int32], i: wp.int32) -> wp.int32:
+    # The compact row index degree of freedom ``i`` occupies in the reduced system, or ``-1`` when
+    # it is pinned and has no row at all. The sentinel rather than an early return, because a
+    # ``@wp.func`` cannot return for its caller.
+    #
+    # This does not shorten the three lines it replaces -- ``if ri < 0: return`` costs what
+    # ``if fixed_mask[i]: return`` cost. What it buys is that the free/fixed/compact-index
+    # convention is written down *once*, in the module that owns the elimination, instead of being
+    # re-inferred at seven sites across four modules: ``free_map`` is defined only where
+    # ``fixed_mask`` is False, it is monotone non-decreasing over the free indices (which is what
+    # lets ``interior_row_entries`` skip a triplet sort), and reading it at a pinned index gives a
+    # stale or out-of-range value rather than an error.
+    if fixed_mask[i]:
+        return wp.int32(-1)
+    return free_map[i]
+
+
 @wp.kernel
 def interior_row_counts(
     offsets: wp.array[wp.int32],
@@ -44,9 +62,9 @@ def interior_row_counts(
     # (k > 1) operator squares the Laplacian condition number, beyond float32 CG's reach; LSCM's
     # coupled u/v system is likewise ill-conditioned.
     i = wp.int32(wp.tid())
-    if fixed_mask[i]:
+    ri = free_row(fixed_mask, free_map, i)
+    if ri < 0:
         return
-    ri = free_map[i]
     start = offsets[i]
     end = offsets[i + 1]
     kept = wp.int32(0)
@@ -96,9 +114,9 @@ def interior_system_csr(
     # non-decreasing, so the emitted row is column-sorted by construction -- which is the whole
     # reason this can skip a triplet sort.
     i = wp.int32(wp.tid())
-    if fixed_mask[i]:
+    ri = free_row(fixed_mask, free_map, i)
+    if ri < 0:
         return
-    ri = free_map[i]
     slot = out_offsets[ri]
     for e in range(offsets[i], offsets[i + 1]):
         j = columns[e]

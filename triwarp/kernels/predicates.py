@@ -28,7 +28,8 @@ from typing import Any
 
 import warp as wp
 
-from triwarp.kernels.array import cross2
+from triwarp.constants import TOLERANCE_ZERO_CONSTANT
+from triwarp.kernels.array import cross2, sort3
 
 # Full turn in ``float64``; ``type(x)(TWO_PI_F64)`` narrows it to the caller's precision, and at
 # ``float32`` that is bit-identical to ``2 * wp.PI`` (verified on both devices, Warp 1.16).
@@ -61,6 +62,70 @@ def triangle_double_area(a: Any, b: Any, c: Any) -> wp.Float:
     # Kept undivided because most callers either compare it against zero or fold the half into a
     # constant of their own.
     return wp.length(wp.cross(b - a, c - a))
+
+
+@wp.func
+def doublearea_from_lengths(l0: wp.Float, l1: wp.Float, l2: wp.Float) -> wp.Float:
+    # Twice the area of a triangle from its three side lengths -- the *intrinsic* counterpart of
+    # ``triangle_double_area``, for callers holding an edge-length table rather than positions.
+    #
+    # Kahan's rearrangement of Heron's formula, which needs the sides sorted ascending; the naive
+    # form loses most of its digits on a needle triangle. The ``wp.max`` clamps a slightly negative
+    # product from round-off, and the ``isnan`` catches what the clamp does not.
+    l0, l1, l2 = sort3(l0, l1, l2)
+    arg = (l0 + (l1 + l2)) * (l2 - (l0 - l1)) * (l2 + (l0 - l1)) * (l0 + (l1 - l2))
+    dbl_area = type(l0)(0.5) * wp.sqrt(wp.max(arg, type(l0)(0.0)))
+    if wp.isnan(dbl_area):
+        return type(l0)(0.0)
+    return dbl_area
+
+
+@wp.func
+def squared_edge_lengths(a: Any, b: Any, c: Any) -> tuple[wp.Float, wp.Float, wp.Float]:
+    # Squared side lengths of triangle ABC, each *opposite* the corner of the same index -- the
+    # ``igl`` intrinsic convention, and the input every law-of-cosines form below expects.
+    return wp.length_sq(b - c), wp.length_sq(c - a), wp.length_sq(a - b)
+
+
+@wp.func
+def law_of_cosines_angle(
+    adjacent_a: wp.Float, adjacent_b: wp.Float, opposite: wp.Float
+) -> wp.Float:
+    # Angle between two adjacent sides of a triangle, from its three side lengths alone -- the
+    # single-corner form of ``corner_cosines_from_l2``, for the intrinsic algorithms that hold an
+    # edge-length table and never a vertex position.
+    #
+    # Not a call to ``corner_cosines_from_l2``: that one takes *squared* lengths, and it has no
+    # degenerate guard because its callers disagree about the policy. This one does have one, and
+    # returning 0 for a vanishing ``2ab`` is what ``remesh``'s intrinsic flip is written against.
+    denominator = type(adjacent_a)(2.0) * adjacent_a * adjacent_b
+    if denominator <= type(adjacent_a)(TOLERANCE_ZERO_CONSTANT):
+        return type(adjacent_a)(0.0)
+    cosine = (adjacent_a * adjacent_a + adjacent_b * adjacent_b - opposite * opposite) / denominator
+    return wp.acos(cosine)  # wp.acos auto-clamps to [-1, 1]
+
+
+@wp.func
+def corner_cosines_from_l2(
+    l2_0: wp.Float, l2_1: wp.Float, l2_2: wp.Float
+) -> tuple[wp.Float, wp.Float, wp.Float]:
+    # The three corner cosines of a triangle from its squared side lengths alone: the law of
+    # cosines, ``cos(C) = (a^2 + b^2 - c^2) / 2ab``, with ``l2_e`` opposite corner ``e``.
+    #
+    # **No degenerate guard, deliberately.** The callers' policies differ and both are considered:
+    # ``energies.internal_angles_and_sums`` wants the ``wp.acos`` of these and lets its clamp
+    # report 0 or pi for a sliver, where ``remesh.law_of_cosines_angle`` returns 0 for a vanishing
+    # denominator. Folding either policy in here would silently change the other caller's answer,
+    # so the division by zero stays visible at the call site that has to decide about it.
+    two = type(l2_0)(2.0)
+    l0 = wp.sqrt(l2_0)
+    l1 = wp.sqrt(l2_1)
+    l2 = wp.sqrt(l2_2)
+    return (
+        (l2_1 + l2_2 - l2_0) / (two * l1 * l2),
+        (l2_2 + l2_0 - l2_1) / (two * l2 * l0),
+        (l2_0 + l2_1 - l2_2) / (two * l0 * l1),
+    )
 
 
 @wp.func

@@ -51,8 +51,15 @@ def halfedge_tangent_angles(
 
 @wp.func
 def any_perpendicular(normal: wp.vec3) -> wp.vec3:
-    # Tangent direction for a vertex with no ring to take one from: cross with whichever coordinate
-    # axis the normal is least aligned with, so the cross product is never degenerate.
+    # Tangent direction for a vertex with no ring to take one from. Crosses the normal with x or
+    # y -- whichever of those two the normal is *less* aligned with -- so the cross product is never
+    # degenerate: at most one of x and y can be nearly parallel to a unit vector.
+    #
+    # This never returns z, and that is deliberate rather than an oversight in the comparison. The
+    # contract is "some unit vector perpendicular to ``normal``", not "the most numerically
+    # comfortable one", and a three-way argmin would satisfy the contract while returning a
+    # *different* tangent for every z-dominant normal -- rotating the frames that
+    # ``vertex_tangent_frames`` builds and the hemisphere bundles ``visibility`` builds on them.
     axis = wp.vec3(1.0, 0.0, 0.0)
     if wp.abs(normal[0]) > wp.abs(normal[1]):
         axis = wp.vec3(0.0, 1.0, 0.0)

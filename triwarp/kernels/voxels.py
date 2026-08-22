@@ -9,6 +9,18 @@ plain ``wp.array`` and no side table is ever built.
 The half-voxel convention is the wrapper's: a volume whose translation is ``origin + 0.5 * s`` has
 NanoVDB voxel ``i`` covering world ``[origin + i * s, origin + (i + 1) * s)``, so
 ``floor(world_to_index(p) + 0.5)`` is the cell containing ``p``.
+
+**Two halves of this module convert between cells and world positions differently, and the split is
+deliberate.** Every kernel *downstream* of a built grid -- ``point_cell``,
+``cell_center_positions``, ``corner_positions`` -- goes through ``wp.volume_world_to_index`` /
+``wp.volume_index_to_world``, so the convention above is read off the object that defines it
+instead of re-implemented. The
+*voxelization* kernels -- ``voxel_cell``, ``voxel_cell_indices``, ``triangle_voxel_window`` -- run
+before any volume exists: they produce the cells ``Volume.allocate_by_voxels`` then builds a grid
+from, so there is no volume id to pass and the ``(origin, voxel_size)`` scalar form is required
+rather than preferred. Measured perf-neutral either way (1.08x for the builtin at 200k voxels,
+1.005x at 2M -- both launch-dominated at ~28 us), so this is a single-source-of-truth split and not
+a speed one.
 """
 
 import warp as wp
@@ -140,16 +152,17 @@ def test_triangle_candidates(
 
 @wp.kernel
 def cell_center_positions(
-    voxels: wp.array2d[wp.int32],
-    origin: wp.vec3,
-    voxel_size: wp.float32,
-    out_centers: wp.array[wp.vec3],
+    volume: wp.uint64, voxels: wp.array2d[wp.int32], out_centers: wp.array[wp.vec3]
 ) -> None:
+    # NanoVDB centres voxel ``i`` *on* index-space coordinate ``i``, so the integer cell coordinate
+    # maps straight to the cell centre and the volume's own transform supplies the half-voxel shift
+    # the module docstring describes. Measured against the hand-rolled
+    # ``origin + (cell + 0.5) * voxel_size``: max abs difference 3.58e-07 over 3 929 voxels, i.e.
+    # float32 rounding and no convention disagreement.
     v = wp.int32(wp.tid())
-    out_centers[v] = wp.vec3(
-        origin[0] + (wp.float32(voxels[v, 0]) + 0.5) * voxel_size,
-        origin[1] + (wp.float32(voxels[v, 1]) + 0.5) * voxel_size,
-        origin[2] + (wp.float32(voxels[v, 2]) + 0.5) * voxel_size,
+    out_centers[v] = wp.volume_index_to_world(
+        volume,
+        wp.vec3(wp.float32(voxels[v, 0]), wp.float32(voxels[v, 1]), wp.float32(voxels[v, 2])),
     )
 
 
@@ -496,18 +509,20 @@ def cell_corner_indices(
 
 @wp.kernel
 def corner_positions(
-    corners: wp.array2d[wp.int32],
-    origin: wp.vec3,
-    voxel_size: wp.float32,
-    out_positions: wp.array[wp.vec3],
+    volume: wp.uint64, corners: wp.array2d[wp.int32], out_positions: wp.array[wp.vec3]
 ) -> None:
-    # Corner ``(i, j, k)`` is the *lower* corner of cell ``(i, j, k)``, so it sits at
-    # ``origin + (i, j, k) * voxel_size`` with no half-voxel shift.
+    # Corner ``(i, j, k)`` is the *lower* corner of cell ``(i, j, k)``. A cell is centred on its
+    # integer index-space coordinate, so its lower corner sits half a voxel below on every axis --
+    # which is a shift in *index* space, where it is the NanoVDB convention itself rather than a
+    # constant re-derived from the grid's translation.
     c = wp.int32(wp.tid())
-    out_positions[c] = wp.vec3(
-        origin[0] + wp.float32(corners[c, 0]) * voxel_size,
-        origin[1] + wp.float32(corners[c, 1]) * voxel_size,
-        origin[2] + wp.float32(corners[c, 2]) * voxel_size,
+    out_positions[c] = wp.volume_index_to_world(
+        volume,
+        wp.vec3(
+            wp.float32(corners[c, 0]) - 0.5,
+            wp.float32(corners[c, 1]) - 0.5,
+            wp.float32(corners[c, 2]) - 0.5,
+        ),
     )
 
 

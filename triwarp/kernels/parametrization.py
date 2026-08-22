@@ -2,8 +2,9 @@ import warp as wp
 
 from triwarp import constants as twc
 from triwarp.kernels.array import cross2, to_vec2d
-from triwarp.kernels.laplacian import squared_edge_lengths
-from triwarp.kernels.triangles import corner_triple, face_vertices
+from triwarp.kernels.linalg import free_row
+from triwarp.kernels.predicates import squared_edge_lengths
+from triwarp.kernels.triangles import corner_triple, face_vertices, row_triple
 
 # Below this (float64) squared edge length the isometric rest-triangle flattening is treated as
 # degenerate: its rest edges are zeroed so the ARAP local step contributes nothing for that face.
@@ -162,9 +163,7 @@ def arap_rest_edges(
     l2_0 = wp.float64(l2_0f)
     l2_1 = wp.float64(l2_1f)
     l2_2 = wp.float64(l2_2f)
-    c0 = cot_entries[f, 0]
-    c1 = cot_entries[f, 1]
-    c2 = cot_entries[f, 2]
+    c0, c1, c2 = row_triple(cot_entries, f)
     if l2_2 < EPSILON_ARAP_EDGE_SQ:
         # Degenerate base edge |v0 - v1|: emit zero rest edges (local step contributes nothing).
         out_rest_edges[f, 0] = wp.vec2d(wp.float64(0.0), wp.float64(0.0))
@@ -225,9 +224,7 @@ def arap_local_step(
     u0 = to_vec2d(uv1) - to_vec2d(uv2)
     u1 = to_vec2d(uv2) - to_vec2d(uv0)
     u2 = to_vec2d(uv0) - to_vec2d(uv1)
-    w0 = rest_edges[f, 0]
-    w1 = rest_edges[f, 1]
-    w2 = rest_edges[f, 2]
+    w0, w1, w2 = row_triple(rest_edges, f)
     # Covariance S = sum_e u_e (outer) w_e (rest edges already weight-folded with c_e).
     s = wp.outer(u0, w0) + wp.outer(u1, w1) + wp.outer(u2, w2)
     # Closest proper rotation (reflections forbidden), fit_rotations_planar closed form.
@@ -255,9 +252,9 @@ def arap_interior_rhs(
     # rows carry no unknown and are skipped. ``rhs_const`` / ``out_b`` are (2, n_interior) (rows
     # u, v); ``rhs_rot_*`` are (n_vertices,).
     i = wp.int32(wp.tid())
-    if fixed_mask[i]:
+    ri = free_row(fixed_mask, free_map, i)
+    if ri < 0:
         return
-    ri = free_map[i]
     out_b[0, ri] = rhs_const[0, ri] + rhs_rot_x[i]
     out_b[1, ri] = rhs_const[1, ri] + rhs_rot_y[i]
 
@@ -273,9 +270,9 @@ def gather_interior_uv(
     # interior vertex ``i`` writes its UV into the two rows (u, v) of ``out_sol`` at the compact
     # free index; boundary vertices are skipped. ``out_sol`` is (2, n_interior).
     i = wp.int32(wp.tid())
-    if fixed_mask[i]:
+    ri = free_row(fixed_mask, free_map, i)
+    if ri < 0:
         return
-    ri = free_map[i]
     p = uv[i]
     out_sol[0, ri] = wp.float64(p[0])
     out_sol[1, ri] = wp.float64(p[1])

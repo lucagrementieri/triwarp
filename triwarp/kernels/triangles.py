@@ -31,9 +31,26 @@ def corner_triple(buffer: wp.array[Any], row: wp.int32):
     are then used to gather from a per-vertex array,
     [`face_vertices`][triwarp.kernels.triangles.face_vertices] does both steps in one call; this
     is the half for callers that need the indices themselves as well.
+
+    [`row_triple`][triwarp.kernels.triangles.row_triple] is the rank-2 form, for the tables this
+    package stores as ``(n_faces, 3)`` rather than flat.
     """
     base = row * wp.int32(3)
     return buffer[base], buffer[base + wp.int32(1)], buffer[base + wp.int32(2)]
+
+
+@wp.func
+def row_triple(buffer: wp.array2d[Any], row: wp.int32):
+    """
+    Load the three entries of row ``row`` of a rank-2 buffer.
+
+    The rank-2 form of [`corner_triple`][triwarp.kernels.triangles.corner_triple], and generic for
+    the same reason: what both name is a *row layout* and not a payload -- a face's corner indices
+    out of an ``(n_faces, 3)`` table, its three edge lengths, its three half-cotangents, its three
+    plane signs. The two live together because a reader meeting one of the tree's two face layouts
+    should be shown the other.
+    """
+    return buffer[row, 0], buffer[row, 1], buffer[row, 2]
 
 
 @wp.func
@@ -85,30 +102,35 @@ def face_signed_volumes(
 
 
 @wp.func
-def triangle_cross(vertices: wp.array[wp.vec3], face: wp.array[wp.int32]) -> wp.vec3:
-    v0 = vertices[face[0]]
-    v1 = vertices[face[1]]
-    v2 = vertices[face[2]]
-    e0 = v1 - v0
-    e1 = v2 - v0
-    return wp.cast(wp.cross(e0, e1), wp.vec3)
+def triangle_cross(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], face_index: wp.int32
+) -> wp.vec3:
+    """Unnormalized normal of face ``face_index``: the cross product of its two first edges."""
+    v0, v1, v2 = face_vertices(vertices, faces, face_index)
+    return wp.cross(v1 - v0, v2 - v0)
 
 
 @wp.func
 def triangle_edges(
-    vertices: wp.array[wp.vec3], face: wp.array[wp.int32]
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], face_index: wp.int32
 ) -> tuple[wp.vec3, wp.vec3, wp.vec3]:
-    e0 = wp.vec3(*(vertices[face[1]] - vertices[face[0]]))
-    e1 = wp.vec3(*(vertices[face[2]] - vertices[face[0]]))
-    e2 = wp.vec3(*(vertices[face[2]] - vertices[face[1]]))
-    return e0, e1, e2
+    """Return the three edge vectors of face ``face_index``: ``(v1 - v0, v2 - v0, v2 - v1)``."""
+    v0, v1, v2 = face_vertices(vertices, faces, face_index)
+    return v1 - v0, v2 - v0, v2 - v1
 
 
 @wp.func
 def face_normals_and_area(
-    vertices: wp.array[wp.vec3], face: wp.array[wp.int32]
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], face_index: wp.int32
 ) -> tuple[wp.vec3, wp.float32]:
-    normal = triangle_cross(vertices, face)
+    """
+    Return the unit normal and the area of face ``face_index``, in one pass over its corners.
+
+    Leaves the cross product unnormalized below ``TOLERANCE_ZERO_CONSTANT`` rather than zeroing it,
+    which is what separates this from [`face_normal`][triwarp.kernels.triangles.face_normal]; that
+    one goes through ``wp.normalize`` and returns exactly the zero vector for a degenerate face.
+    """
+    normal = triangle_cross(vertices, faces, face_index)
     norm = wp.length(normal)
     if norm > TOLERANCE_ZERO_CONSTANT:
         normal = normal / norm
@@ -124,7 +146,7 @@ def face_normals_and_areas(
     out_areas: wp.array[wp.float32],
 ) -> None:
     f = wp.tid()
-    normal, area = face_normals_and_area(vertices, faces[f * 3 : (f + 1) * 3])
+    normal, area = face_normals_and_area(vertices, faces, f)
     out_normals[f] = normal
     out_areas[f] = area
 
@@ -134,7 +156,7 @@ def angles(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_angles: wp.array2d[wp.float32]
 ) -> None:
     f = wp.tid()
-    edges = triangle_edges(vertices, faces[f * 3 : (f + 1) * 3])
+    edges = triangle_edges(vertices, faces, f)
 
     # ``vector_angle`` is atan2(|a x b|, a . b) and is scale-free, so the edges go in unnormalized
     # (three ``wp.normalize`` calls fewer) -- and a sliver, whose angles sit near 0 and pi, is
@@ -240,9 +262,8 @@ def face_nondegenerate_mask(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_nondegenerate: wp.array[wp.bool]
 ) -> None:
     f = wp.tid()
-    triangle_face = faces[f * 3 : (f + 1) * 3]
-    e0, e1, _ = triangle_edges(vertices, triangle_face)
-    _, area = face_normals_and_area(vertices, triangle_face)
+    e0, e1, _ = triangle_edges(vertices, faces, f)
+    _, area = face_normals_and_area(vertices, faces, f)
     length_e0 = wp.length(e0)
     length_e1 = wp.length(e1)
     height_e0 = 2.0 * area / length_e0
@@ -263,15 +284,11 @@ def barycentric_to_points(
     out_points: wp.array[wp.vec3],
 ) -> None:
     f = wp.tid()
-    triangle_face = faces[f * 3 : (f + 1) * 3]
+    v0, v1, v2 = face_vertices(vertices, faces, f)
     face_barycentric = barycentric[f]
     s = face_barycentric[0] + face_barycentric[1] + face_barycentric[2]
     face_barycentric = face_barycentric / s
-    out_points[f] = (
-        vertices[triangle_face[0]] * face_barycentric[0]
-        + vertices[triangle_face[1]] * face_barycentric[1]
-        + vertices[triangle_face[2]] * face_barycentric[2]
-    )
+    out_points[f] = v0 * face_barycentric[0] + v1 * face_barycentric[1] + v2 * face_barycentric[2]
 
 
 @wp.func
@@ -314,9 +331,10 @@ def points_to_barycentric_cross(
     out_barycentric: wp.array[wp.vec3],
 ) -> None:
     f = wp.tid()
-    triangle_face = faces[f * 3 : (f + 1) * 3]
-    e0, e1, _ = triangle_edges(vertices, triangle_face)
-    w = points[f] - vertices[triangle_face[0]]
+    v0, v1, v2 = face_vertices(vertices, faces, f)
+    e0 = v1 - v0
+    e1 = v2 - v0
+    w = points[f] - v0
     n = wp.cross(e0, e1)
     inverse_denominator = 1.0 / wp.length_sq(n)
     out_barycentric[f][2] = wp.dot(wp.cross(e0, w), n) * inverse_denominator
@@ -332,25 +350,25 @@ def closest_point(
     out_closest: wp.array[wp.vec3],
 ) -> None:
     f = wp.tid()
-    triangle_face = faces[f * 3 : (f + 1) * 3]
-    ab, ac, bc = triangle_edges(vertices, triangle_face)
+    corner_a, corner_b, corner_c = face_vertices(vertices, faces, f)
+    ab, ac, bc = triangle_edges(vertices, faces, f)
 
     # check if P is in vertex region outside A
-    ap = points[f] - vertices[triangle_face[0]]
+    ap = points[f] - corner_a
     d1 = wp.dot(ab, ap)
     d2 = wp.dot(ac, ap)
     is_a = d1 < 0.0 and d2 < 0.0
     if is_a:
-        out_closest[f] = vertices[triangle_face[0]]
+        out_closest[f] = corner_a
         return
 
     # check if P in vertex region outside B
-    bp = points[f] - vertices[triangle_face[1]]
+    bp = points[f] - corner_b
     d3 = wp.dot(ab, bp)
     d4 = wp.dot(ac, bp)
     is_b = d3 > -TOLERANCE_ZERO_CONSTANT and d4 <= d3
     if is_b:
-        out_closest[f] = vertices[triangle_face[1]]
+        out_closest[f] = corner_b
         return
 
     # check if P in edge region of AB, if so return projection of P onto A
@@ -362,16 +380,16 @@ def closest_point(
     )
     if is_ab:
         v = d1 / (d1 - d3)
-        out_closest[f] = vertices[triangle_face[0]] + v * ab
+        out_closest[f] = corner_a + v * ab
         return
 
     # check if P in vertex region outside C
-    cp = points[f] - vertices[triangle_face[2]]
+    cp = points[f] - corner_c
     d5 = wp.dot(ab, cp)
     d6 = wp.dot(ac, cp)
     is_c = d6 > -TOLERANCE_ZERO_CONSTANT and d5 <= d6
     if is_c:
-        out_closest[f] = vertices[triangle_face[2]]
+        out_closest[f] = corner_c
         return
 
     # check if P in edge region of AC, if so return projection of P onto AC
@@ -383,7 +401,7 @@ def closest_point(
     )
     if is_ac:
         w = d2 / (d2 - d6)
-        out_closest[f] = vertices[triangle_face[0]] + w * ac
+        out_closest[f] = corner_a + w * ac
         return
 
     # check if P in edge region of BC, if so return projection of P onto BC
@@ -396,14 +414,14 @@ def closest_point(
     if is_bc:
         d43 = d4 - d3
         w = d43 / (d43 + (d5 - d6))
-        out_closest[f] = vertices[triangle_face[1]] + w * bc
+        out_closest[f] = corner_b + w * bc
         return
 
     # any remaining points must be inside face region
     denom = 1.0 / (va + vb + vc)
     v = vb * denom
     w = vc * denom
-    out_closest[f] = vertices[triangle_face[0]] + ab * v + ac * w
+    out_closest[f] = corner_a + ab * v + ac * w
 
 
 @wp.func

@@ -233,11 +233,8 @@ def winding_number(
     w = wp.float32(0.0)
     n_f = n_faces
     for f in range(n_f):
-        face_indices = faces[f * 3 : (f + 1) * 3]
-        i0 = wp.int32(face_indices[0])
-        i1 = wp.int32(face_indices[1])
-        i2 = wp.int32(face_indices[2])
-        w = w + solid_angle(vertices[i0], vertices[i1], vertices[i2], p)
+        v0, v1, v2 = kernel_triangles.face_vertices(vertices, faces, f)
+        w = w + solid_angle(v0, v1, v2, p)
     out_winding[q] = w
 
 

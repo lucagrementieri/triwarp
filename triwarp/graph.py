@@ -13,6 +13,7 @@ from triwarp._device import read_scalar
 from triwarp.array import arange
 from triwarp.constants import INT32_MAX
 from triwarp.kernels import graph as kernel_graph
+from triwarp.kernels import scatter as kernel_scatter
 from triwarp.kernels.algorithms import bfs as kernel_bfs
 from triwarp.kernels.algorithms import connected_components as kernel_connected_components
 
@@ -824,12 +825,7 @@ def bfs_multi_source(
     sorted_keys = wp.clone(keys_buffer[:n])
     sorted_nodes = wp.clone(node_ids[:n])
     node_rank = wp.empty(n, dtype=wp.int32, device=device)
-    wp.launch(
-        kernel_graph.scatter_sorted_positions,
-        dim=n,
-        inputs=[sorted_nodes, node_rank],
-        device=device,
-    )
+    wp.launch(kernel_scatter.scatter_index, dim=n, inputs=[sorted_nodes, node_rank], device=device)
 
     segment_start = wp.empty(k, dtype=wp.int32, device=device)
     counts = wp.empty(k, dtype=wp.int32, device=device)

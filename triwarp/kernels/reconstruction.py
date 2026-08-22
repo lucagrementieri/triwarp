@@ -343,6 +343,10 @@ def build_local_triangulations(
     # case of the same class — ``algorithms/ball_pivoting.seed_triangles``, one 64-wide row with no
     # helper passing — the register row is 0.994x (min) / 1.000x (median) end to end, i.e. no gain
     # to trade that complexity for.
+    #
+    # And ``wp.fixedarray`` is not a third option: its own docstring says it is "only used during
+    # codegen, and for type hints" -- it *is* the codegen type of a kernel-scope ``wp.zeros``, not a
+    # separate storage class. So the choice here is registers or the stack, and both are measured.
     nbr = wp.zeros(shape=MAX_NEIGHBOURS, dtype=wp.int32)
     ang = wp.zeros(shape=MAX_NEIGHBOURS, dtype=wp.float32)
 

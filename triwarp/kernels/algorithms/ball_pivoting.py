@@ -207,12 +207,27 @@ def ball_is_empty(
     c: wp.int32,
 ) -> bool:
     # True when no point other than the three defining ones lies strictly inside the ball.
+    #
+    # Compared squared, matching ``candidate_is_viable``'s clustering test. The two spellings are
+    # not the same predicate in float32 -- the ``neighbors`` narrow-phase measurement found 10 rows
+    # of 200k where they disagree at the boundary -- so a module that used both could accept a
+    # point as a candidate and reject the same distance as an occupancy, and the ball radius is one
+    # of the two distances BPA is entirely built out of.
+    #
+    # **The argument is consistency, not speed, and the speed was measured to say so.** Whole
+    # ``ball_pivoting`` call, icosphere(4) cloud (2 562 points) at ``1.5 * mean_edge``, both
+    # spellings alternated over six separate processes (``bpa-intermittent-illegal-access`` rules
+    # out looping reconstructions in one process), 15 reps each: median-of-medians 21.5 ms squared
+    # against 23.7 ms unsquared, but min-of-mins 19.7 against 17.0 -- the two orderings disagree, so
+    # this is flat inside the run-to-run spread, matching the 0.997-1.003x the ``neighbors``
+    # narrow-phase decline measured for the same swap. Face count 5 120 either way.
     threshold = radius - BALL_EPS * radius
+    threshold_sq = threshold * threshold
     query = wp.hash_grid_query(grid_id, center, radius)
     j = wp.int32(-1)
     while wp.hash_grid_query_next(query, j):
         if j != a and j != b and j != c:
-            if wp.length(center - points[j]) < threshold:
+            if wp.length_sq(center - points[j]) < threshold_sq:
                 return False
     return True
 
@@ -323,6 +338,10 @@ def seed_triangles(
     # k-NN row wins because every access to it is an unrolled compile-time slot; every access here
     # is a runtime index (``nbr[count]``, ``nbr[i0]``, ``nbr[i1]``), and a runtime index into a
     # vector spills it to local memory, which is where ``wp.zeros`` already puts it.
+    #
+    # And ``wp.fixedarray`` is not a third option: its own docstring says it is "only used during
+    # codegen, and for type hints" -- it *is* the codegen type of a kernel-scope ``wp.zeros``, not a
+    # separate storage class. So the choice here is registers or the stack, and both are measured.
     nbr = wp.zeros(shape=MAX_SEED_NEIGHBORS, dtype=wp.int32)
     count = wp.int32(0)
     query = wp.hash_grid_query(grid_id, points[p], 2.0 * radius)
@@ -336,12 +355,14 @@ def seed_triangles(
             nbr[count] = j
             count += 1
 
-    min_cluster = clustering * radius
+    # Squared, matching the same vcglib clustering rule as tested in ``candidate_is_viable``; see
+    # ``ball_is_empty`` for why one module must not spell one predicate two ways.
+    min_cluster_sq = clustering * radius * clustering * radius
     for i0 in range(count):
         a = nbr[i0]
         for i1 in range(i0 + 1, count):
             b = nbr[i1]
-            if wp.length(points[a] - points[b]) < min_cluster:
+            if wp.length_sq(points[a] - points[b]) < min_cluster_sq:
                 continue
             center = compute_ball_center(
                 points[p], points[a], points[b], normals[p] + normals[a] + normals[b], radius

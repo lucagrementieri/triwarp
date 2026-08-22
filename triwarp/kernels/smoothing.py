@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.kernels.array import to_vec3d
+from triwarp.kernels.linalg import free_row
 from triwarp.kernels.triangles import corner_triple
 
 # ---------------------------------------------------------------------------
@@ -194,9 +195,9 @@ def add_interior_mass_rhs(
     # only ``-A_ub x_b`` from ``linalg.assemble_interior_system`` (that helper eliminates the pinned
     # columns of a quadratic form, which has no linear term of its own).
     v = wp.int32(wp.tid())
-    if fixed_mask[v]:
+    i = free_row(fixed_mask, free_map, v)
+    if i < 0:
         return
-    i = free_map[v]
     m = mass[v]
     p = positions[v]
     out_rhs[0, i] = out_rhs[0, i] + m * p[0]
@@ -216,9 +217,9 @@ def scatter_free_positions(
     # Write the reduced solution back to the unpinned vertices only. Pinned ones are left holding
     # whatever they already have, which is their original position -- they never move.
     v = wp.int32(wp.tid())
-    if fixed_mask[v]:
+    i = free_row(fixed_mask, free_map, v)
+    if i < 0:
         return
-    i = free_map[v]
     out_positions[v] = wp.vec3d(sol_x[i], sol_y[i], sol_z[i])
 
 

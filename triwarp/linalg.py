@@ -121,6 +121,7 @@ import warp.sparse as wps
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import linalg as kernel_linalg
 from triwarp.kernels.algorithms import conjugate_gradient as kernel_cg
 from triwarp.kernels.algorithms import multigrid as kernel_mg
@@ -1041,9 +1042,16 @@ class _BatchedCg:
             )
         if self._cycle is None:
             wp.launch(
-                kernel_cg.cg_apply_inverse_diagonal,
+                kernel_cg.scaled_diagonal_apply,
                 dim=self._dofs,
-                inputs=[wp.int32(self._stride), self._inv_diag, self._r],
+                inputs=[
+                    # ``n == stride``: this state's vectors carry no rows the kernel must skip.
+                    wp.int32(self._stride),
+                    wp.int32(self._stride),
+                    self._inv_diag,
+                    wp.float64(1.0),
+                    self._r,
+                ],
                 outputs=[self._z],
                 device=self._device,
             )
@@ -1382,7 +1390,9 @@ def _multigrid_aggregate(
     offsets, columns = matrix.offsets, matrix.columns
 
     priority = wp.empty(n, dtype=wp.uint32, device=device)
-    wp.launch(kernel_mg.mis_priorities, dim=n, inputs=[wp.int32(seed), priority], device=device)
+    wp.launch(
+        kernel_array.random_priorities, dim=n, inputs=[wp.int32(seed), priority], device=device
+    )
     state = wp.full(n, int(kernel_mg.MG_UNDECIDED), dtype=wp.int32, device=device)
     next_state = wp.empty(n, dtype=wp.int32, device=device)
     key = wp.empty(n, dtype=wp.int64, device=device)
@@ -1738,7 +1748,7 @@ class _MultigridCycle:
         # The first sweep from a zero initial guess is a *write*, so nothing has to be zeroed and
         # that sweep costs no mat-vec.
         wp.launch(
-            kernel_mg.scaled_diagonal_apply,
+            kernel_cg.scaled_diagonal_apply,
             dim=level.dim,
             inputs=[
                 wp.int32(level.n),

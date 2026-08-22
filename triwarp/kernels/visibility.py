@@ -20,6 +20,30 @@ def bundle_direction(
     return basis_x * local[0] + basis_y * local[1] + normal * local[2]
 
 
+@wp.func
+def hemisphere_frame(
+    points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    i: wp.int32,
+    offset: wp.float32,
+    sign: wp.float32,
+) -> tuple[wp.vec3, wp.vec3, wp.vec3, wp.vec3]:
+    # The ray bundle's frame at point ``i``: ``(axis, basis_x, basis_y, origin)``, ready for
+    # ``bundle_direction``. ``sign`` is ``+1`` for an outward hemisphere (occlusion, which asks what
+    # the sky sees) and ``-1`` for an inward one (shape diameter, which asks how thick the solid
+    # is); it flips the axis and steps the origin to the matching side of the surface.
+    #
+    # The *tangent* pair is built from the outward normal at both signs, deliberately. Crossing with
+    # ``axis`` instead would flip ``basis_y``, mirroring the lattice about the ``x`` axis and
+    # sending every ray somewhere else -- a change the parity tests would see and no reader would
+    # have intended. Only the axis and the origin depend on ``sign``.
+    normal = wp.normalize(normals[i])
+    basis_x = any_perpendicular(normal)
+    basis_y = wp.cross(normal, basis_x)
+    axis = sign * normal
+    return axis, basis_x, basis_y, points[i] + axis * offset
+
+
 @wp.kernel
 def obscurance(
     mesh_id: wp.uint64,
@@ -39,10 +63,7 @@ def obscurance(
     # contributes ``exp(-tau t)`` so a distant wall barely darkens the point. Binary occlusion is
     # the ``tau -> 0`` limit of that, since a ray that escapes contributes nothing either way.
     i = wp.int32(wp.tid())
-    normal = wp.normalize(normals[i])
-    basis_x = any_perpendicular(normal)
-    basis_y = wp.cross(normal, basis_x)
-    origin = points[i] + normal * offset
+    axis, basis_x, basis_y, origin = hemisphere_frame(points, normals, i, offset, wp.float32(1.0))
 
     n_rays = directions.shape[0]
     total_weight = wp.float32(0.0)
@@ -56,7 +77,7 @@ def obscurance(
             weight = local[2]
         total_weight += weight
         query = wp.mesh_query_ray(
-            mesh_id, origin, bundle_direction(local, normal, basis_x, basis_y), max_t
+            mesh_id, origin, bundle_direction(local, axis, basis_x, basis_y), max_t
         )
         if query.result:
             if tau > 0.0:
@@ -91,12 +112,8 @@ def shape_diameter(
     # because the second pass must revisit them against a mean and deviation the first pass had not
     # finished computing yet, and re-casting the rays instead would double the only expensive part.
     i = wp.int32(wp.tid())
-    normal = wp.normalize(normals[i])
-    basis_x = any_perpendicular(normal)
-    basis_y = wp.cross(normal, basis_x)
     # Inward, so the bundle's axis is ``-normal`` and the origin steps *below* the surface.
-    axis = -normal
-    origin = points[i] + axis * offset
+    axis, basis_x, basis_y, origin = hemisphere_frame(points, normals, i, offset, wp.float32(-1.0))
 
     n_rays = directions.shape[0]
     total = wp.float32(0.0)

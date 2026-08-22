@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.constants import TILE_1D
-from triwarp.kernels.triangles import face_normals_and_area, face_vertices_vec3d
+from triwarp.kernels.triangles import face_normals_and_area, face_vertices, face_vertices_vec3d
 
 
 @wp.kernel
@@ -22,11 +22,9 @@ def centroid_tiled(
     contrib = wp.vec3(0.0, 0.0, 0.0)
     area = wp.float32(0.0)
     if f < n_faces:
-        triangle_face = faces[f * 3 : (f + 1) * 3]
-        _, area = face_normals_and_area(vertices, triangle_face)
-        contrib = (
-            vertices[triangle_face[0]] + vertices[triangle_face[1]] + vertices[triangle_face[2]]
-        ) * (area / 3.0)
+        v0, v1, v2 = face_vertices(vertices, faces, f)
+        _, area = face_normals_and_area(vertices, faces, f)
+        contrib = (v0 + v1 + v2) * (area / 3.0)
     sum_x = wp.tile_sum(wp.tile(contrib[0]))
     sum_y = wp.tile_sum(wp.tile(contrib[1]))
     sum_z = wp.tile_sum(wp.tile(contrib[2]))
@@ -56,11 +54,9 @@ def centroid_sliced(
     total = wp.vec3(0.0, 0.0, 0.0)
     area_total = wp.float32(0.0)
     for f in range(j, n_faces, n_slices):
-        triangle_face = faces[f * 3 : (f + 1) * 3]
-        _, area = face_normals_and_area(vertices, triangle_face)
-        total = total + (
-            vertices[triangle_face[0]] + vertices[triangle_face[1]] + vertices[triangle_face[2]]
-        ) * (area / 3.0)
+        v0, v1, v2 = face_vertices(vertices, faces, f)
+        _, area = face_normals_and_area(vertices, faces, f)
+        total = total + (v0 + v1 + v2) * (area / 3.0)
         area_total = area_total + area
     wp.atomic_add(out_weighted_centroid, 0, total[0])
     wp.atomic_add(out_weighted_centroid, 1, total[1])

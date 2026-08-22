@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels.triangles import row_triple
 
 
 @wp.kernel
@@ -281,9 +282,7 @@ def round_vec3_scaled(
 @wp.kernel
 def sort_face_indices(faces: wp.array2d[wp.int32], out_sorted: wp.array2d[wp.int32]) -> None:
     tid = wp.int32(wp.tid())
-    i0 = faces[tid, 0]
-    i1 = faces[tid, 1]
-    i2 = faces[tid, 2]
+    i0, i1, i2 = row_triple(faces, tid)
     s0, s1, s2 = kernel_array.sort3(i0, i1, i2)
     out_sorted[tid, 0] = wp.int32(s0)
     out_sorted[tid, 1] = wp.int32(s1)

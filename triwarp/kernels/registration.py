@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.constants import TILE_1D
+from triwarp.kernels.reduce import tile_chunk
 
 # ---------------------------------------------------------------------------
 # Packed Procrustes accumulator
@@ -89,8 +90,7 @@ def accumulate_procrustes_moments(
     # alternative is a ``wp.full(n, 1.0)`` allocation *and* fill on every iteration, for a value
     # the kernel can just assume.
     chunk, lane = wp.tid()
-    offset = chunk * TILE_1D
-    remaining = a.shape[0] - offset
+    offset, remaining = tile_chunk(a.shape[0], chunk, TILE_1D)
     if remaining <= 0:
         return
     count = wp.min(remaining, TILE_1D)
@@ -364,9 +364,7 @@ def accumulate_point_to_plane(
     out_cost: wp.array[wp.float32],
 ) -> None:
     i, t = wp.tid()
-    n = source.shape[0]
-    offset = i * TILE_1D
-    remaining = n - offset
+    offset, remaining = tile_chunk(source.shape[0], i, TILE_1D)
     if remaining <= 0:
         return
 
@@ -391,7 +389,25 @@ def accumulate_point_to_plane(
 
 @wp.func
 def solve_spd6(a: wp.spatial_matrix, b: wp.spatial_vector) -> wp.spatial_vector:
-    """Solve the SPD 6x6 system ``a x = b`` via Cholesky (``a = L L^T``)."""
+    """
+    Solve the SPD 6x6 system ``a x = b`` via Cholesky (``a = L L^T``).
+
+    Hand-written rather than routed through ``wp.dense_chol`` / ``wp.dense_subs`` /
+    ``wp.dense_solve``, which look like exactly this function and are not usable here. Three
+    independent reasons, any one sufficient: they are ``hidden=True`` with ``doc="WIP"``, which is
+    why they appear in none of the mirrors under ``reference/warp_api/`` even though those track the
+    installed Warp faithfully; they take ``wp.array[wp.float32]`` rather than a register value, so
+    adopting them means per-thread global scratch for ``A``, ``L``, ``b`` and ``x``, which is the
+    shape measured at a 2x loss against registers; and they are ``float32``-only, so ``linalg``'s
+    ``float64`` systems could not use them either.
+
+    The two zero ``wp.spatial_vector``s below are written out longhand although the
+    ``wp.spatial_matrix`` one line up is the broadcast ``wp.spatial_matrix(wp.float32(0.0))``. That
+    asymmetry is Warp's, not a style slip: a one-argument ``wp.spatial_vector(x)`` binds ``x`` to
+    the *templated* ``vec_t``'s ``dtype`` parameter and fails to parse -- *"Remove the extraneous
+    ``dtype`` parameter when calling the templated version of ``wp.vec_t()``"*, still true in Warp
+    1.16. There is no broadcast-fill spelling for it, so do not collapse these.
+    """
     lower = wp.spatial_matrix(wp.float32(0.0))
     for j in range(6):
         s = a[j, j]

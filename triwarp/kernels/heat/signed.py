@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.constants import TOLERANCE_ZERO_CONSTANT
+from triwarp.kernels.linalg import free_row
 from triwarp.kernels.predicates import unit_tangent
 
 
@@ -96,9 +97,10 @@ def scatter_free_rhs(
     # Compact a full-length right-hand side down to the unpinned degrees of freedom, in the layout
     # ``linalg.solve_spd_columns`` expects (one row per right-hand side).
     i = wp.int32(wp.tid())
-    if fixed_mask[i]:
+    ri = free_row(fixed_mask, free_map, i)
+    if ri < 0:
         return
-    out_rhs[0, free_map[i]] = values[i]
+    out_rhs[0, ri] = values[i]
 
 
 @wp.kernel

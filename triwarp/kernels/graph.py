@@ -107,14 +107,6 @@ def emit_component_neighbors(
 
 
 @wp.kernel
-def scatter_sorted_positions(
-    sorted_nodes: wp.array[wp.int32], out_rank: wp.array[wp.int32]
-) -> None:
-    i = wp.int32(wp.tid())
-    out_rank[sorted_nodes[i]] = i
-
-
-@wp.kernel
 def scatter_successor(directed_edges: wp.array2d[wp.int32], out_next: wp.array[wp.int32]) -> None:
     tid = wp.int32(wp.tid())
     out_next[directed_edges[tid, 0]] = directed_edges[tid, 1]

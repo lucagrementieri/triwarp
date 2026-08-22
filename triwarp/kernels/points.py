@@ -2,7 +2,7 @@ import warp as wp
 
 from triwarp.constants import TILE_1D
 from triwarp.kernels.intersection import point_plane_dot
-from triwarp.kernels.reduce import outer_sum_chunk
+from triwarp.kernels.reduce import outer_sum_chunk, tile_chunk
 
 
 @wp.func
@@ -37,9 +37,7 @@ def centered_covariance(
     # is axis-parametrized array reductions in NumPy's vocabulary; a mat33 of second moments is not
     # one of those (§11, the machinery half outranks the subject half).
     i, t = wp.tid()
-    n = points.shape[0]
-    offset = i * TILE_1D
-    remaining = n - offset
+    offset, remaining = tile_chunk(points.shape[0], i, TILE_1D)
     if remaining <= 0:
         return
 

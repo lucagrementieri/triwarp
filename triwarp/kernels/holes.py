@@ -843,18 +843,40 @@ def set_dp_origin(out_dp: wp.array2d[wp.float32]) -> None:
     out_dp[0, 0] = 0.0
 
 
+@wp.struct
+class StitchTables:
+    """
+    The stitch DP's invariant inputs, bundled so the per-diagonal launches carry one argument.
+
+    ``holes._stitch_halves`` launches ``stitch_dp_diag`` once per anti-diagonal --
+    ``n_a + n_b`` times, so 400 launches for two 200-vertex rims -- and every one of these ten
+    values is the same on every launch. Only ``diag`` and the two in-place DP tables vary. This is
+    ``HoleFillTables``' argument exactly, in the same file and on the same shape of loop; see that
+    struct's docstring for the measured per-argument cost model and for why the struct must be
+    built **once**, outside the loop.
+
+    The measurement for *this* kernel is recorded at its launch site in ``holes._stitch_halves``.
+
+    Not graph capture: recording a graph costs at least what issuing the launches costs, so capture
+    pays only on a sequence that is *replayed*, and this loop runs once per call. Measured at 400
+    launches, capture-and-replay-once is a 0.84x loss where a bundle is a 1.88x win.
+    """
+
+    a_pos: wp.array[wp.vec3]
+    b_pos: wp.array[wp.vec3]
+    a_opp: wp.array[wp.vec3]
+    a_opp_valid: wp.array[wp.int32]
+    b_opp: wp.array[wp.vec3]
+    b_opp_valid: wp.array[wp.int32]
+    up: wp.vec3
+    metric_id: wp.int32
+    n_a: wp.int32
+    n_b: wp.int32
+
+
 @wp.kernel(enable_backward=False)
 def stitch_dp_diag(
-    a_pos: wp.array[wp.vec3],
-    b_pos: wp.array[wp.vec3],
-    a_opp: wp.array[wp.vec3],
-    a_opp_valid: wp.array[wp.int32],
-    b_opp: wp.array[wp.vec3],
-    b_opp_valid: wp.array[wp.int32],
-    up: wp.vec3,
-    metric_id: wp.int32,
-    n_a: wp.int32,
-    n_b: wp.int32,
+    tables: StitchTables,
     diag: wp.int32,
     out_dp: wp.array2d[wp.float32],
     out_came: wp.array2d[wp.int32],
@@ -862,6 +884,12 @@ def stitch_dp_diag(
     # One thread per cell (i, j) on anti-diagonal ``diag = i + j``; each reads only the previous
     # diagonal, so launching diag = 1, 2, ... in order are the DP barriers. dp[i, j] = min cost of
     # the band consuming i edges of A and j edges of B from the aligned start (cell (0, 0)).
+    a_pos = tables.a_pos
+    b_pos = tables.b_pos
+    up = tables.up
+    metric_id = tables.metric_id
+    n_a = tables.n_a
+    n_b = tables.n_b
     i_lo = wp.max(0, diag - n_b)
     i = i_lo + wp.int32(wp.tid())
     j = diag - i
@@ -887,8 +915,8 @@ def stitch_dp_diag(
             if out_came[i - 1, j] != CAME_NONE:
                 c_op = stitch_prev_apex(a_pos, b_pos, out_came, n_a, n_b, i - 1, j)
                 w = w + stitch_edge_metric(a_prev, b_cur, c_op, a_cur)
-            if a_opp_valid[(i - 1) % n_a] != 0:
-                w = w + stitch_edge_metric(a_cur, a_prev, a_opp[(i - 1) % n_a], b_cur)
+            if tables.a_opp_valid[(i - 1) % n_a] != 0:
+                w = w + stitch_edge_metric(a_cur, a_prev, tables.a_opp[(i - 1) % n_a], b_cur)
         update_argmin(best, best_came, w, CAME_A)
 
     # Advance loop B: new triangle (a[i], b[j-1], b[j]).
@@ -901,8 +929,8 @@ def stitch_dp_diag(
             if out_came[i, j - 1] != CAME_NONE:
                 c_op = stitch_prev_apex(a_pos, b_pos, out_came, n_a, n_b, i, j - 1)
                 w = w + stitch_edge_metric(a_cur, b_prev, c_op, b_cur)
-            if b_opp_valid[j % n_b] != 0:
-                w = w + stitch_edge_metric(b_prev, b_cur, b_opp[j % n_b], a_cur)
+            if tables.b_opp_valid[j % n_b] != 0:
+                w = w + stitch_edge_metric(b_prev, b_cur, tables.b_opp[j % n_b], a_cur)
         update_argmin(best, best_came, w, CAME_B)
 
     out_dp[i, j] = best
