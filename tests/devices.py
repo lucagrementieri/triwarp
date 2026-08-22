@@ -1,0 +1,89 @@
+"""
+Run the suite on both devices, as two processes, because one process cannot do it cheaply.
+
+``uv run python -m tests.devices`` runs a CUDA pass and then a CPU pass, and the CPU pass is
+spawned with ``CUDA_VISIBLE_DEVICES=""``. That environment variable is the whole point of the
+runner: **Warp's CPU work is ~36x slower once CUDA has been initialised in the process**, so a
+single ``pytest --device=both`` pays that on every CPU parametrization. Measured on one
+``heat_signed_distance`` call -- same mesh, same code, only ``CUDA_VISIBLE_DEVICES`` differing --
+50.57 s with CUDA visible against **1.40 s** without, and the figure is unchanged by
+``warp.config.launch_array_access_mode`` (``RELAXED`` 50.34 s, ``CHECKED`` 49.77 s), so it is CUDA
+presence rather than CLAUDE.md section 8's launch guard. Whole-suite consequence: 717 s in one
+process, against ~37.6 s + ~155 s as two.
+
+Both-device coverage earns the second process. It is what caught the ``warp.fem`` ambient-device
+leak in ``reconstruction._screened_poisson_adaptive`` -- broken for CPU input on any box with a GPU,
+and invisible to both a CUDA-only run (devices matched) and a ``CUDA_VISIBLE_DEVICES=""`` run
+(``warp.fem`` then defaults to CPU) -- and the module-scope ``wp.array`` in ``test_grouping``.
+
+Usage
+-----
+``uv run python -m tests.devices``
+    CUDA pass, then a CUDA-hidden CPU pass with the ``slow_cpu`` tests skipped. The everyday
+    both-device check.
+``uv run python -m tests.devices --slow-cpu``
+    Same, but the CPU pass runs ``--device=both``, which in a CUDA-hidden process means "all of
+    CPU, skip nothing" -- the ``slow_cpu`` Poisson tests included.
+``uv run python -m tests.devices -- -x -k grouping``
+    Everything after ``--`` is forwarded to both pytest invocations.
+
+Exits non-zero if either pass does, and reports both outcomes rather than stopping at the first.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+
+
+def _run(label: str, device: str, hide_cuda: bool, extra: list[str]) -> tuple[str, int, float]:
+    """Run one pytest pass and return ``(label, returncode, seconds)``."""
+    env = dict(os.environ)
+    if hide_cuda:
+        env["CUDA_VISIBLE_DEVICES"] = ""
+    command = [sys.executable, "-m", "pytest", "tests/", f"--device={device}", *extra]
+    print(f"\n=== {label}: {' '.join(command)}", flush=True)
+    if hide_cuda:
+        print('    with CUDA_VISIBLE_DEVICES=""', flush=True)
+    started = time.perf_counter()
+    completed = subprocess.run(command, env=env, check=False)
+    return label, completed.returncode, time.perf_counter() - started
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run both device passes and summarize them."""
+    parser = argparse.ArgumentParser(prog="python -m tests.devices", description=__doc__)
+    parser.add_argument(
+        "--slow-cpu",
+        action="store_true",
+        help="run the slow_cpu tests in the CPU pass too (uses --device=both there)",
+    )
+    parser.add_argument(
+        "pytest_args", nargs="*", help="extra arguments forwarded to both pytest passes"
+    )
+    args = parser.parse_args(argv)
+
+    results = [
+        _run("cuda pass", "cuda", hide_cuda=False, extra=args.pytest_args),
+        # ``both`` in a CUDA-hidden process resolves to ["cpu"] and disables the slow_cpu skip, so
+        # it is how this runner says "all of CPU" without needing a second flag in conftest.
+        _run(
+            "cpu pass", "both" if args.slow_cpu else "cpu", hide_cuda=True, extra=args.pytest_args
+        ),
+    ]
+
+    print("\n=== summary")
+    for label, returncode, seconds in results:
+        print(
+            f"    {label:<10} {'ok' if returncode == 0 else f'FAILED ({returncode})'}  "
+            f"{seconds:7.1f} s"
+        )
+    print(f"    {'total':<10}    {sum(seconds for _, _, seconds in results):10.1f} s")
+    return max(returncode for _, returncode, _ in results)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -163,9 +163,44 @@ uv run pytest benchmarks/
 # One module, GPU only:
 uv run pytest benchmarks/test_combine.py --device=cuda
 
-# Quick CPU-only smoke on the medium scan meshes:
-uv run pytest benchmarks/test_edges.py --device=cpu --size=medium
+# Quick CPU-only smoke on the medium scan meshes -- but see the warning below: on a box with a
+# GPU this inflates the triwarp-cpu rows, and the harness says so.
+CUDA_VISIBLE_DEVICES="" uv run pytest benchmarks/test_edges.py --device=cpu --size=medium
+
+# Both triwarp targets, correctly: two processes, the CPU one with CUDA hidden.
+uv run python benchmarks/devices.py
 ```
+
+### Never time `triwarp-cpu` in a CUDA-initialised process
+
+**Warp's CPU work costs more once CUDA has been initialised in the process**, and the charge behaves
+like a per-launch one, so the factor scales with launch count rather than with work:
+
+| measured (`triwarp-cpu`) | CUDA visible | `CUDA_VISIBLE_DEVICES=""` | ratio |
+|---|---|---|---|
+| `marching_cubes` 64 / 128 | 41.67 / 351.78 ms | 34.64 / 338.34 ms | **1.20x / 1.04x** |
+| `edges_unique` [bunny_decimated] | 11.22 ms | 8.76 ms | 1.28x |
+| its three siblings | 11.9-12.4 ms | 8.5-8.8 ms | 1.40-1.41x |
+| `heat_signed_distance`, one call | 50.57 s | **1.40 s** | ~36x |
+| `tests/test_heat_signed.py --device=cpu` | 166.77 s | **8.53 s** | 19.6x |
+
+The spread is the point: **a launch-light row can be inside its own noise** (`marching_cubes`'s 1.04x
+sits under the 1.64x that `meshlib-128` itself moved between those two runs), while an iterative
+solver pays the whole factor. So the groups to distrust are the solver-heavy ones — heat, laplacian,
+linalg, smoothing, parametrization — not every `triwarp-cpu` row ever recorded.
+
+Unchanged by `warp.config.launch_array_access_mode` (`RELAXED` 50.34 s, `CHECKED` 49.77 s on the
+solver), so it is CUDA *presence* and not the launch guard. So a `triwarp-cpu` row taken this way is
+not a slow number, it is a **wrong** one — and it reads as triwarp losing to CPU references it
+actually beats. `--device=cpu` and `--device=both` on a GPU box both emit a `UserWarning` saying so.
+The default `--device=auto` is unaffected: it selects `triwarp-cpu` only when there is no CUDA
+device.
+
+`CUDA_VISIBLE_DEVICES` must be set before the process starts, so this can only be fixed by a second
+process — `benchmarks/devices.py` runs the CUDA pass (with every reference) and then a CUDA-hidden
+`-k triwarp-cpu` pass. The narrowing matters: the CPU references are included in *every* pass, so an
+unnarrowed second pass would time them twice and duplicate the rows. `tests/devices.py` is the same
+idea for the test suite.
 
 A full default run is **~18 minutes** on an RTX 5090 (measured: 1 097 s across all 33 modules, one
 process each, 999 cases plus 139 skipped). The four slowest modules are `test_reconstruction`
@@ -205,7 +240,7 @@ set automatically. Pass your own `--benchmark-group-by=...` to override.
 
 | flag | default | meaning |
 |---|---|---|
-| `--device` | `auto` | `triwarp` target(s): `auto`/`cpu`/`cuda`/`both`. `auto` = cuda if available, else cpu. The CPU references (trimesh / igl / open3d / scipy / potpourri3d / pymeshlab / pyvista) always run. |
+| `--device` | `auto` | `triwarp` target(s): `auto`/`cpu`/`cuda`/`both`. `auto` = cuda if available, else cpu. The CPU references (trimesh / igl / open3d / scipy / potpourri3d / pymeshlab / pyvista / meshlib) always run. **`cpu`/`both` on a GPU box inflate the `triwarp-cpu` rows and warn** — use `benchmarks/devices.py`. Registered in the repo-root `conftest.py`, shared with `tests/`. |
 | `--size` | `all` | comma-separated size categories for the **scan** sweep (`small,medium,large,extralarge,huge`). Naming a size also lifts the CPU cap for it. Has no effect on axis-driven groups. |
 | `--cpu-max-size` | `large` | CPU-bound libraries (every reference, plus `triwarp-cpu`) skip scan meshes larger than this unless the size is named in `--size`. |
 

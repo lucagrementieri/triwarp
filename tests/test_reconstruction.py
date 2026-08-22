@@ -548,6 +548,7 @@ def _open3d_poisson(points_np: np.ndarray, normals_np: np.ndarray, depth: int) -
     return open3d_to_trimesh(mesh_o3d)
 
 
+@pytest.mark.slow_cpu(71.9)
 def test_poisson_sphere_watertight_manifold(device: str):
     """
     Watertightness needs depth 6, so this is the one solving test that does not drop to 5 on CPU.
@@ -610,6 +611,7 @@ def test_poisson_torus_genus(device: str):
     "minutes without completing a round. Those rows were removed rather than capped; the "
     "comparison lives here, at a size a correctness test can afford.",
 )
+@pytest.mark.slow_cpu(114.9)
 def test_poisson_matches_open3d_metric(device: str):
     """
     Class C: mean sample-to-surface distance, there being no vertex correspondence to compare.
@@ -654,6 +656,7 @@ def test_poisson_matches_open3d_metric(device: str):
     assert mean_distance < 0.015
 
 
+@pytest.mark.slow_cpu(18.5)
 def test_poisson_screening_improves_fit(device: str):
     points_np, normals_np = _sphere_cloud(3)
     points_wp, normals_wp = _to_warp(points_np, normals_np, device)
@@ -681,6 +684,7 @@ def test_poisson_screening_improves_fit(device: str):
     "15-25x. Removed from benchmarks/test_reconstruction.py rather than capped; the comparison "
     "lives here instead.",
 )
+@pytest.mark.slow_cpu(72.4)
 def test_poisson_matches_pymeshlab_metric(device: str):
     """
     Class C: the [`test_poisson_matches_open3d_metric`][] comparison against the other reference.

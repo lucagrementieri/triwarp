@@ -38,6 +38,7 @@ Flags
 from __future__ import annotations
 
 import operator
+import warnings
 from collections import defaultdict
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypedDict
@@ -324,14 +325,11 @@ def _vertices_wp(name: str, device: str) -> wp.array[wp.vec3]:
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
+    # --device is registered by the repo-root conftest.py: argparse rejects a duplicate option
+    # string, and tests/conftest.py reads the same flag. See that file for why both suites' ``auto``
+    # selects one device. Registering it here too made ``pytest tests benchmarks`` die with
+    # ``conflicting option string: --device`` before collecting anything.
     group = parser.getgroup("triwarp-bench")
-    group.addoption(
-        "--device",
-        action="store",
-        default="auto",
-        choices=["auto", "cpu", "cuda", "both"],
-        help="triwarp target device(s) to benchmark (default: auto = cuda if available, else cpu).",
-    )
     group.addoption(
         "--size",
         action="store",
@@ -372,6 +370,35 @@ def _selected_libraries(config: pytest.Config) -> list[LibrarySpec]:
         include_cpu, include_cuda = False, True
     else:  # both
         include_cpu, include_cuda = True, True
+
+    if include_cpu and cuda_available:
+        # A ``triwarp-cpu`` row timed in a process where CUDA has been initialised is *inflated*, so
+        # it is not merely a slow row -- it is a wrong one, and it reads as triwarp losing to the
+        # CPU references. The cost behaves like a per-launch charge, so the factor scales with
+        # launch count rather than with work, and both ends are measured:
+        #
+        #   - launch-light rows barely notice: ``edges_unique`` on bunny_decimated 11.22 against
+        #     **8.76 ms** hidden (1.28x, siblings 1.40-1.41x), and ``marching_cubes`` only
+        #     **1.20x / 1.04x** at 64/128 -- under that row's own noise, where ``meshlib-128``
+        #     itself moved 7.61 to 12.48 ms between the two runs;
+        #   - an iterative solver pays all of it: ``heat_signed_distance`` 50.57 s against
+        #     **1.40 s** on one call, and ``tests/test_heat_signed.py --device=cpu`` 166.77 s
+        #     against **8.53 s** (19.6x).
+        #
+        # Unchanged by ``warp.config.launch_array_access_mode`` (``RELAXED`` 50.34 s, ``CHECKED``
+        # 49.77 s on the solver), so it is CUDA presence and not the launch guard. This is why the
+        # default ``auto`` picks ``triwarp-cpu`` only when there is no CUDA device. A *warning*
+        # rather than a refusal: a deliberate same-process CPU-vs-CUDA comparison is still a
+        # legitimate thing to ask for, as long as the asker knows the CPU side is not publishable.
+        warnings.warn(
+            "triwarp-cpu rows are being timed in a CUDA-initialised process, which inflates them "
+            "(measured 1.0-1.4x on launch-light ops, ~20x on an iterative solver) and makes them "
+            "incomparable with the CPU references. Run 'uv run python benchmarks/devices.py' "
+            "instead, which times the CPU target in a separate process with "
+            'CUDA_VISIBLE_DEVICES="".',
+            UserWarning,
+            stacklevel=2,
+        )
 
     selected = []
     for lib in LIBRARIES:

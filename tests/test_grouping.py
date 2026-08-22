@@ -7,34 +7,39 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
-import triwarp.typing as twt
 from tests.comparisons import lexsort_rows, same_partition
 from triwarp.kernels.grouping import VEC3_PACK_PRECISION, VEC3_PACK_SHIFT
 
+# Host data, uploaded per test onto the fixture's device -- not ``wp.array`` at module scope. A
+# module-level ``wp.array`` with no ``device=`` lands on Warp's *current* device, which is
+# ``cuda:0`` here, and re-wrapping it onto another device raises ``Item indexing is not supported on
+# wp.array objects`` from deep inside ``wp.array.__init__``. That was invisible while the ``device``
+# fixture returned one device: the allocation and the test always agreed. It is the defect
+# ``api_conventions`` check 14 exists for, in the one tree that check does not scan.
 group_test_data = (
-    (wp.array([1, 3, 2, 3, 4, 4, 7, 5, -1, 5, 5], dtype=wp.int32), 2, wp.array([[1, 3], [4, 5]])),
+    (np.array([1, 3, 2, 3, 4, 4, 7, 5, -1, 5, 5], dtype=np.int32), 2, [[1, 3], [4, 5]]),
     (
-        wp.array([0, 1, 2, 1, 5, 6, 1, 0, 0, 0, 6, 4, 6], dtype=wp.uint64),
+        np.array([0, 1, 2, 1, 5, 6, 1, 0, 0, 0, 6, 4, 6], dtype=np.uint64),
         3,
-        wp.array([[1, 3, 6], [5, 10, 12]]),
+        [[1, 3, 6], [5, 10, 12]],
     ),
-    (
-        wp.array([-1, 3, 2, -3, 4, 2, -1, 2, 2, 2], dtype=wp.int64),
-        4,
-        wp.empty((0, 4), dtype=wp.int32),
-    ),
+    (np.array([-1, 3, 2, -3, 4, 2, -1, 2, 2, 2], dtype=np.int64), 4, []),
     # High-bit uint64 keys sort natively as unsigned (after low keys) in Warp 1.16.
-    (wp.array([2**63 + 5, 1, 2**63 + 5, 1], dtype=wp.uint64), 2, wp.array([[1, 3], [0, 2]])),
+    (np.array([2**63 + 5, 1, 2**63 + 5, 1], dtype=np.uint64), 2, [[1, 3], [0, 2]]),
 )
 
 
-@pytest.mark.parametrize(("values", "length", "expected"), group_test_data)
+@pytest.mark.parametrize(("values_np", "length", "expected_rows"), group_test_data)
 def test_group(
-    device: str, values: wp.array[wp.Int], length: int, expected: twt.Array2dInt32
+    device: str, values_np: np.ndarray, length: int, expected_rows: list[list[int]]
 ) -> None:
-    values_wp = wp.array(values, dtype=values.dtype, device=device)
+    """Class A against a hand-written expectation, over the four key dtypes the radix sort takes."""
+    groups_np = np.array(expected_rows, dtype=np.int32).reshape(-1, length)
+
+    values_wp = wp.array(values_np, device=device)
     groups_wp = tw.grouping.group(values_wp, length)
-    assert np.array_equal(groups_wp.numpy(), expected.numpy())
+    assert values_wp.dtype.__name__ == values_np.dtype.name  # the dtype under test really landed
+    assert np.array_equal(groups_wp.numpy(), groups_np)
 
 
 def test_group_int_rows(device: str) -> None:

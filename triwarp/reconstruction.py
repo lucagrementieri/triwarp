@@ -802,121 +802,128 @@ def _screened_poisson_adaptive(
     from triwarp.kernels.algorithms import poisson_fem as kernel_poisson_fem
 
     device = points.device
-    n = int(points.shape[0])
+    # ``warp.fem`` launches its internal kernels on Warp's *ambient* device, not on the device of
+    # the arrays it is handed, so on a box with a CUDA device every ``fem`` call below would land
+    # on ``cuda:0`` while these buffers sit on the host -- a genuine cross-device launch that
+    # section 8's STRICT mode rejects (``PicQuadrature``'s ``finalize_cell_particle_data`` is the
+    # first to fire). triwarp's own allocations already carry ``device=``; this is the one place
+    # where a dependency picks the device for us, so the whole fem section runs under a scope.
+    with wp.ScopedDevice(device):
+        n = int(points.shape[0])
 
-    res_fine = 1 << depth
-    scale_to_index = float(res_fine) / cube_size
+        res_fine = 1 << depth
+        scale_to_index = float(res_fine) / cube_size
 
-    # Index-space sample positions, unit normals, and per-sample quadrature measures.
-    positions = wp.empty(n, dtype=wp.vec3, device=device)
-    wp.map(
-        kernel_poisson_fem.world_to_index,
-        points,
-        cube_lower,
-        wp.float32(scale_to_index),
-        out=positions,
-    )
-    unit_normals = wp.empty(n, dtype=wp.vec3, device=device)
-    wp.map(wp.normalize, normals, out=unit_normals)
-    if confidence:
-        measures = wp.empty(n, dtype=wp.float32, device=device)
-        wp.map(wp.length, normals, out=measures)
-    else:
-        measures = wp.full(n, wp.float32(1.0), device=device)
+        # Index-space sample positions, unit normals, and per-sample quadrature measures.
+        positions = wp.empty(n, dtype=wp.vec3, device=device)
+        wp.map(
+            kernel_poisson_fem.world_to_index,
+            points,
+            cube_lower,
+            wp.float32(scale_to_index),
+            out=positions,
+        )
+        unit_normals = wp.empty(n, dtype=wp.vec3, device=device)
+        wp.map(wp.normalize, normals, out=unit_normals)
+        if confidence:
+            measures = wp.empty(n, dtype=wp.float32, device=device)
+            wp.map(wp.length, normals, out=measures)
+        else:
+            measures = wp.full(n, wp.float32(1.0), device=device)
 
-    # Match the finest near-surface cell size to the sample spacing (PoissonRecon-style): a
-    # point-source weak form rings if cells are much finer than the sampling, so cap the effective
-    # octree depth at ~two cells per mean nearest-neighbour distance (never below full_depth, never
-    # above the requested depth). ``depth`` beyond this only refines the extraction lattice, which
-    # merely samples the already-smooth field more densely.
-    mean_spacing = _mean_positive_finite(tw.neighbors.nearest_neighbor_distance(points))
-    spacing = mean_spacing if mean_spacing is not None else cube_size / float(res_fine)
-    grid_depth = int(np.floor(np.log2(max(2.0 * cube_size / spacing, 1.0))))
-    grid_depth = max(full_depth, min(depth, grid_depth))
+        # Match the finest near-surface cell size to the sample spacing (PoissonRecon-style): a
+        # point-source weak form rings if cells are much finer than the sampling, so cap the
+        # effective octree depth at ~two cells per mean nearest-neighbour distance (never below
+        # full_depth, never above the requested depth). ``depth`` beyond this only refines the
+        # extraction lattice, which merely samples the already-smooth field more densely.
+        mean_spacing = _mean_positive_finite(tw.neighbors.nearest_neighbor_distance(points))
+        spacing = mean_spacing if mean_spacing is not None else cube_size / float(res_fine)
+        grid_depth = int(np.floor(np.log2(max(2.0 * cube_size / spacing, 1.0))))
+        grid_depth = max(full_depth, min(depth, grid_depth))
 
-    res_coarse = 1 << full_depth
-    level_count = grid_depth - full_depth + 1
-    coarse_voxel = float(1 << (depth - full_depth))
-    fine_voxel = float(1 << (depth - grid_depth))
-    spacing_idx = spacing * scale_to_index
-    band_r = max(2.0 * fine_voxel, 1.5 * spacing_idx)
-    falloff = max(coarse_voxel, 2.0 * spacing_idx)
+        res_coarse = 1 << full_depth
+        level_count = grid_depth - full_depth + 1
+        coarse_voxel = float(1 << (depth - full_depth))
+        fine_voxel = float(1 << (depth - grid_depth))
+        spacing_idx = spacing * scale_to_index
+        band_r = max(2.0 * fine_voxel, 1.5 * spacing_idx)
+        falloff = max(coarse_voxel, 2.0 * spacing_idx)
 
-    # Coarse dense base grid covering the whole cube in index space, then refine toward the samples.
-    ijk = np.stack(np.meshgrid(*(np.arange(res_coarse),) * 3, indexing="ij"), axis=-1).reshape(
-        -1, 3
-    )
-    # Translate by half a voxel so the voxel-centered grid spans exactly ``[0, 2**depth]`` per axis.
-    # Without it the domain is ``[-coarse_voxel/2, ...]`` and the outer lattice shell falls outside;
-    # failed lookups there would leave zeros that marching cubes reads as a spurious surface.
-    coarse_grid = wp.Volume.allocate_by_voxels(
-        wp.array(ijk.astype(np.int32), dtype=wp.vec3i, device=device),
-        voxel_size=coarse_voxel,
-        translation=(0.5 * coarse_voxel, 0.5 * coarse_voxel, 0.5 * coarse_voxel),
-        device=device,
-    )
-    hashgrid = tw.neighbors.hashgrid_from_points(positions, band_r + falloff)
-    refinement = fem.ImplicitField(
-        domain=fem.Cells(fem.Nanogrid(coarse_grid)),
-        func=kernel_poisson_fem.refinement_oracle,
-        values={
-            "grid": hashgrid.id,
-            "pts": positions,
-            "r": wp.float32(band_r),
-            "falloff": wp.float32(falloff),
-        },
-    )
-    geometry = fem.adaptive_nanogrid_from_field(
-        coarse_grid, level_count, refinement_field=refinement, grading="face"
-    )
+        # Coarse dense base grid covering the whole cube in index space, then refine to the samples.
+        ijk = np.stack(np.meshgrid(*(np.arange(res_coarse),) * 3, indexing="ij"), axis=-1).reshape(
+            -1, 3
+        )
+        # Translate by half a voxel so the voxel-centered grid spans exactly ``[0, 2**depth]`` per
+        # axis. Without it the domain is ``[-coarse_voxel/2, ...]`` and the outer lattice shell
+        # falls outside; failed lookups leave zeros marching cubes reads as a spurious surface.
+        coarse_grid = wp.Volume.allocate_by_voxels(
+            wp.array(ijk.astype(np.int32), dtype=wp.vec3i, device=device),
+            voxel_size=coarse_voxel,
+            translation=(0.5 * coarse_voxel, 0.5 * coarse_voxel, 0.5 * coarse_voxel),
+            device=device,
+        )
+        hashgrid = tw.neighbors.hashgrid_from_points(positions, band_r + falloff)
+        refinement = fem.ImplicitField(
+            domain=fem.Cells(fem.Nanogrid(coarse_grid)),
+            func=kernel_poisson_fem.refinement_oracle,
+            values={
+                "grid": hashgrid.id,
+                "pts": positions,
+                "r": wp.float32(band_r),
+                "falloff": wp.float32(falloff),
+            },
+        )
+        geometry = fem.adaptive_nanogrid_from_field(
+            coarse_grid, level_count, refinement_field=refinement, grading="face"
+        )
 
-    # Weak-form assembly: stiffness + screening = source.
-    space = fem.make_polynomial_space(geometry, degree=1, dtype=float)
-    domain = fem.Cells(geometry)
-    test = fem.make_test(space, domain=domain)
-    trial = fem.make_trial(space, domain=domain)
-    quadrature = fem.PicQuadrature(domain, positions, measures)
+        # Weak-form assembly: stiffness + screening = source.
+        space = fem.make_polynomial_space(geometry, degree=1, dtype=float)
+        domain = fem.Cells(geometry)
+        test = fem.make_test(space, domain=domain)
+        trial = fem.make_trial(space, domain=domain)
+        quadrature = fem.PicQuadrature(domain, positions, measures)
 
-    matrix = fem.integrate(kernel_poisson_fem.diffusion_form, fields={"u": trial, "v": test})
-    matrix += fem.integrate(
-        kernel_poisson_fem.screening_form,
-        quadrature=quadrature,
-        fields={"u": trial, "v": test},
-        values={"screen": wp.float32(screen)},
-    )
-    rhs = fem.integrate(
-        kernel_poisson_fem.source_form,
-        quadrature=quadrature,
-        fields={"v": test},
-        values={"normals": unit_normals},
-        output_dtype=float,
-    )
+        matrix = fem.integrate(kernel_poisson_fem.diffusion_form, fields={"u": trial, "v": test})
+        matrix += fem.integrate(
+            kernel_poisson_fem.screening_form,
+            quadrature=quadrature,
+            fields={"u": trial, "v": test},
+            values={"screen": wp.float32(screen)},
+        )
+        rhs = fem.integrate(
+            kernel_poisson_fem.source_form,
+            quadrature=quadrature,
+            fields={"v": test},
+            values={"normals": unit_normals},
+            output_dtype=float,
+        )
 
-    solution = wp.zeros_like(rhs)
-    wpl.cg(
-        matrix,
-        rhs,
-        solution,
-        tol=solver_tolerance,
-        maxiter=solver_iterations,
-        M=wpl.preconditioner(matrix, "diag"),
-    )
-    field = space.make_field()
-    field.dof_values = solution
+        solution = wp.zeros_like(rhs)
+        wpl.cg(
+            matrix,
+            rhs,
+            solution,
+            tol=solver_tolerance,
+            maxiter=solver_iterations,
+            M=wpl.preconditioner(matrix, "diag"),
+        )
+        field = space.make_field()
+        field.dof_values = solution
 
-    sampled = wp.zeros(n, dtype=wp.float32, device=device)
-    fem.interpolate(
-        kernel_poisson_fem.sample_field,
-        at=domain,
-        dim=n,
-        fields={"u": field},
-        values={"positions": positions, "out_values": sampled},
-    )
-    iso = _poisson_iso_value(sampled, normals, confidence)
+        sampled = wp.zeros(n, dtype=wp.float32, device=device)
+        fem.interpolate(
+            kernel_poisson_fem.sample_field,
+            at=domain,
+            dim=n,
+            fields={"u": field},
+            values={"positions": positions, "out_values": sampled},
+        )
+        iso = _poisson_iso_value(sampled, normals, confidence)
 
-    return _extract_poisson_surface_fem(
-        field, domain, iso, cube_lower, cube_upper, depth, res_fine, device
-    )
+        return _extract_poisson_surface_fem(
+            field, domain, iso, cube_lower, cube_upper, depth, res_fine, device
+        )
 
 
 def _extract_poisson_surface_fem(

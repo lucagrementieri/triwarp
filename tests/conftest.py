@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import CodeType
+
 import numpy as np
 import pytest
 import trimesh as tm
@@ -30,13 +32,132 @@ def pytest_configure(config: pytest.Config) -> None:
         "every benchmarked pair. Pass benchmarked=False with a written reason= where the pair is "
         "compared here but deliberately not timed.",
     )
+    # The cut is at 15 s, measured, and it is four tests. On a full CPU-only run of tests/ (432.6 s
+    # total) the whole ``screened_poisson`` family is 342.0 s -- 79 % -- and these four alone are
+    # 277.6 s (64 %). Each is one ~90 s depth-6 Poisson solve that costs under a second on CUDA, so
+    # skipping the ``cpu`` half of them leaves ~155 s of CPU work and loses no claim: the answers
+    # are device-independent, ``test_poisson_cpu_matches_cuda`` pins the two devices to each other
+    # at depth 4, and eleven more Poisson tests still run on CPU at depth 5 (``_poisson_depth``).
+    #
+    # Read the seconds in the marker as an order of magnitude, not a contract. The same four
+    # measured 259 s inside the full suite and 380 s as their own ``-k`` selection in one session --
+    # 1.47x apart, with the ranking inverted -- so this box's CPU timings swing far too much for a
+    # threshold to be re-derived by rerunning. What is stable is the shape: one depth-6 solve each.
+    config.addinivalue_line(
+        "markers",
+        "slow_cpu(seconds): this test costs the stated measured seconds on the CPU device, so its "
+        "``cpu`` parametrization is skipped unless --device=both. It still runs on CUDA, where the "
+        "same test costs under a second. Reserved for the handful of tests that dominate a CPU "
+        "run -- see the comment above for the measurements and why the cut sits where it does.",
+    )
+
+
+def _selected_devices(config: pytest.Config) -> list[str]:
+    """
+    Devices to parametrize the ``device`` fixture over, for **this process**.
+
+    ``auto`` picks one device, matching ``benchmarks/conftest.py``. Both-device coverage is worth
+    having -- it is what caught the ``warp.fem`` device leak in ``_screened_poisson_adaptive`` and
+    the module-scope ``wp.array`` in ``test_grouping`` -- but it must not be bought *inside one
+    process*, because **CPU work is ~36x slower once CUDA has been initialised**. Measured on one
+    ``heat_signed_distance`` call, same mesh, same code, only ``CUDA_VISIBLE_DEVICES`` differing:
+
+    ===============  =============  ==================
+    launch mode      CUDA visible   ``CUDA_VISIBLE_DEVICES=""``
+    ===============  =============  ==================
+    ``STRICT``       50.57 s        **1.40 s**
+    ``RELAXED``      50.34 s        **1.40 s**
+    ``CHECKED``      49.77 s        --
+    ===============  =============  ==================
+
+    So it is CUDA *presence*, not section 8's launch-access guard, and the guard is free to stay
+    ``STRICT``. In-process ``--device=both`` measured 717 s for the whole suite where the two
+    passes run separately cost ~37.6 s + ~155 s; ``uv run python -m tests.devices`` is the runner
+    that spawns them, and the CPU one sets ``CUDA_VISIBLE_DEVICES=""`` for exactly this reason.
+
+    ``both`` stays meaningful and is not the slow trap it sounds like: it means "every device this
+    process can see, and skip nothing". In a CUDA-hidden process that is precisely "all of CPU,
+    including the ``slow_cpu`` tests", which is how the runner asks for a full CPU pass.
+    """
+    mode = str(config.getoption("--device"))
+    if mode == "cuda":
+        if not wp.is_cuda_available():
+            raise pytest.UsageError("--device=cuda was requested but no CUDA device is available")
+        return ["cuda:0"]
+    if mode == "cpu":
+        return ["cpu"]
+    if mode == "auto":
+        return ["cuda:0"] if wp.is_cuda_available() else ["cpu"]
+    return ["cpu", "cuda:0"] if wp.is_cuda_available() else ["cpu"]
+
+
+def _calls_getfixturevalue(code: CodeType) -> bool:
+    """
+    Whether this code object, or any code object nested in it, names ``getfixturevalue``.
+
+    The recursion is the point. On Python 3.11 a comprehension compiles to its own code object, so
+    ``[request.getfixturevalue(n) for n in names]`` puts the name in the *comprehension's*
+    ``co_names`` and leaves the enclosing function's clean -- which is how a flat check silently
+    missed ``test_combine.py::test_split_batched_matches_split`` and let it run single-device.
+    (3.12 inlines comprehensions and would have hidden the bug the other way, on a future upgrade.)
+    """
+    if "getfixturevalue" in code.co_names:
+        return True
+    return any(
+        _calls_getfixturevalue(const) for const in code.co_consts if isinstance(const, CodeType)
+    )
+
+
+def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+    """
+    Parametrize ``device`` over the selected devices, so a test id names the device it ran on.
+
+    ``metafunc.parametrize`` only reaches a fixture in the test's *static* closure, and 206 tests
+    reach ``device`` only through ``request.getfixturevalue(mesh_name)`` -- a lookup by string that
+    pytest cannot see at collection time, so those tests would silently keep running on one device
+    (and, with no ``device`` fixture to fall back on, fail outright with ``fixture 'device' not
+    found``). Appending to ``metafunc.fixturenames`` puts it in the closure anyway, which is what
+    lets a mesh fixture resolved later pick up the parametrized value. Keyed off the *bytecode*
+    rather than off ``request`` being requested, because several tests take ``request`` for other
+    reasons and doubling those buys nothing.
+    """
+    if "device" not in metafunc.fixturenames and _calls_getfixturevalue(metafunc.function.__code__):
+        metafunc.fixturenames.append("device")
+    if "device" in metafunc.fixturenames:
+        metafunc.parametrize(
+            "device", _selected_devices(metafunc.config), ids=lambda name: name.replace(":", "")
+        )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Drop the ``cpu`` parametrization of the ``slow_cpu`` tests unless --device=both."""
+    if str(config.getoption("--device")) == "both":
+        return
+    for item in items:
+        marker = item.get_closest_marker("slow_cpu")
+        if marker is None:
+            continue
+        callspec = getattr(item, "callspec", None)
+        if callspec is None or callspec.params.get("device") != "cpu":
+            continue
+        seconds = marker.args[0] if marker.args else "many"
+        item.add_marker(
+            pytest.mark.skip(
+                reason=f"slow on CPU ({seconds} s measured); pass --device=both to run it"
+            )
+        )
 
 
 @pytest.fixture
-def device():
-    if wp.is_cuda_available():
-        return "cuda:0"
-    return "cpu"
+def device(request: pytest.FixtureRequest) -> str:
+    """
+    Fallback only: ``pytest_generate_tests`` parametrizes this name for every test that reaches it.
+
+    Kept so a path that hook does not anticipate degrades to a single device instead of erroring
+    with ``fixture 'device' not found``. If this body ever runs, some test is getting one device
+    where it should be getting both -- which is a gap, not a failure, so it must not raise.
+    """
+    return _selected_devices(request.config)[-1]
 
 
 @pytest.fixture

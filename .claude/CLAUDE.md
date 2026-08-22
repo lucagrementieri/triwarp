@@ -358,7 +358,35 @@ All new geometry functions MUST have regression tests that compare against the `
   import trimesh.<module> as tm
   import triwarp.<module> as tw
   ```
-- Use the `device` fixture from `tests/conftest.py` (runs on `cuda:0` if available, else `cpu`). Every test function must accept `device` as a parameter.
+- Use the `device` fixture from `tests/conftest.py`. Every test function must accept `device` as a
+  parameter. **It is parametrized, and `--device={auto,cpu,cuda,both}` selects for *this
+  process*** — `auto` picks one device (cuda if available), exactly like `benchmarks/conftest.py`,
+  and every test id carries a `[cpu]` / `[cuda0]` suffix. `both` means "every device this process
+  can see, skip nothing".
+- **Both-device coverage is a two-process job: `uv run python -m tests.devices`.** It runs a CUDA
+  pass, then a CPU pass with **`CUDA_VISIBLE_DEVICES=""`**, and that variable is the whole point:
+  **Warp's CPU work is ~36x slower once CUDA has been initialised in the process.** Measured on one
+  `heat_signed_distance` call, same mesh, same code, only the variable differing — 50.57 s against
+  **1.40 s** — and unchanged by `launch_array_access_mode` (`RELAXED` 50.34 s, `CHECKED` 49.77 s),
+  so it is CUDA *presence* and not §8's launch guard, which stays `STRICT` for free. Same tests at
+  the pytest level: `tests/test_heat_signed.py` is 166.77 s with CUDA visible and **8.53 s**
+  without. Whole suite: in-process `--device=both` measured **717 s** against ~37.6 s + ~155 s as
+  two passes. So never reach for `--device=both` on a GPU box to get CPU coverage — use the runner.
+- **Run the runner before calling a change done**, not just the default `pytest`. Both-device
+  coverage is what caught the `warp.fem` ambient-device leak in
+  `reconstruction._screened_poisson_adaptive` — broken for CPU input on any box with a GPU, and
+  invisible to a CUDA-only run (the devices matched) *and* to a `CUDA_VISIBLE_DEVICES=""` run
+  (`warp.fem` then defaults to CPU too). That defect class needs CUDA present *and* the arrays on
+  the host, which is a configuration neither single-device run reaches. `wp.ScopedDevice(device)` is
+  the fix when a dependency picks the device for us.
+- **A test that costs more than ~15 s on CPU wears `@pytest.mark.slow_cpu(<measured seconds>)`**,
+  which skips it when it would run on `cpu` unless `--device=both`. Four `screened_poisson` tests
+  carry it, and they were 277.6 s of a 432.6 s CPU-only run — one ~90 s depth-6 solve each, under a
+  second on CUDA. In a CUDA-hidden process `--device=both` therefore means "all of CPU, including
+  these", which is how the runner's `--slow-cpu` asks for a full CPU pass. Use the marker only where
+  the *device* is the cost and the claim is device-independent, and put the measured number in it so
+  the next reader can re-derive the cut; a test slow on both devices belongs on a smaller input
+  instead.
 - Generate reproducible random data with `np.random.default_rng(seed)` (use a fixed integer seed per test).
 - **Upload a NumPy mesh with `conversions.numpy_to_warp(vertices_np, faces_np, device)`**, never a
   local helper. This section used to *print the body* of one, and the result was six private copies
