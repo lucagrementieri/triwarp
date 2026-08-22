@@ -427,3 +427,9 @@ def unsharp_step(
     # MeshLab's ``apply_coord_unsharp_mask``: add back a multiple of the high-frequency detail the
     # smoothing pass removed. ``weight_original = 1`` keeps the surface in place and only sharpens.
     return weight_original * position + weight * (position - smoothed)
+
+
+@wp.func
+def step_along_normal(position: wp.vec3, normal: wp.vec3, distance: wp.float32) -> wp.vec3:
+    """Move a vertex along its own normal, which is one half of an inflation step."""
+    return position + normal * distance

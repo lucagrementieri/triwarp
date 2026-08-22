@@ -890,3 +890,52 @@ def test_eliminate_tunnels(bench_case: BenchCase) -> None:
     assert tw.measures.euler_characteristic(cut_faces) == (
         tw.measures.euler_characteristic(faces) + 2 * eliminated
     )
+
+
+@pytest.mark.benchmark(group="eliminate_degree3_vertices")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_eliminate_degree3_vertices(bench_case: BenchCase) -> None:
+    """
+    One pass over every vertex, plus a face compaction -- and usually nothing to remove.
+
+    The scan meshes carry few valence-3 interior vertices, so this group mostly times the *search*:
+    a ``vertex_one_rings`` build, a candidate map, an independence pass and one readback. That is
+    the honest thing to measure, because the search is what a caller pays unconditionally in a
+    repair pipeline while the removal is proportional to a defect that may not be there.
+
+    meshlib's row is ``findInnerVertsOfDegree(topology, 3)`` -- the candidate mask, not the removal,
+    since ``eliminateDegree3Vertices`` mutates in place and would need a fresh mesh per round while
+    finding nothing after the first. So it is the same *search* on both sides; where it is not a
+    like-for-like is that meshlib is handed a ``MeshTopology`` built outside its row and triwarp
+    builds a halfedge structure inside its own.
+
+    First measurement, medians on an RTX 5090:
+
+    | mesh | triwarp-cuda | meshlib (mask only) |
+    |---|---|---|
+    | ``bunny`` | 2.47 ms | 0.042 (58.7x) |
+    | ``dragon`` | 4.96 ms | 0.336 (14.8x) |
+    | ``happy_buddha`` | 6.64 ms | (capped) |
+
+    Attributed on a clean ``icosphere(6)`` at 81 920 faces, where nothing is removed: **0.84 ms for
+    one pass**, of which ``vertex_one_rings`` is 0.56 (67 %) and the vertex-count readback 0.09. So
+    the floor is the halfedge build, and a scan mesh's several milliseconds are that floor times the
+    number of passes -- removing one valence-3 vertex can expose another, so the loop runs until it
+    finds none. Moving the vertex compaction out of the loop was tried and is **flat** (2.47 against
+    2.36 ms, within noise at three passes); it is kept because it is strictly less work, not because
+    it showed up.
+    """
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        bits_ml = bench_case.run(lambda: mm.findInnerVertsOfDegree(mesh_ml.topology, 3))
+        assert bits_ml.size() >= 0
+        return
+    if bench_case.mesh_name in {"bunny_decimated", "lucy"}:
+        pytest.skip(f"{bench_case.mesh_name} is not edge-manifold, so it has no vertex fans")
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    out_vertices, out_faces, removed = bench_case.run(
+        lambda: tw.repair.eliminate_degree3_vertices(vertices, faces), rounds=3
+    )
+    assert removed >= 0
+    assert int(out_faces.shape[0]) <= int(faces.shape[0])
+    assert int(out_vertices.shape[0]) <= bench_case.n_vertices

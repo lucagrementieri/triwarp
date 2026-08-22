@@ -23,6 +23,7 @@ from tests.conversions import (
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
     trimesh_to_warp,
+    warp_to_trimesh,
 )
 
 
@@ -1148,3 +1149,90 @@ def test_filter_sharpen_empty(device: str) -> None:
     vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
     faces_wp = wp.empty(0, dtype=wp.int32, device=device)
     assert tw.smoothing.filter_sharpen(vertices_wp, faces_wp).shape == (0,)
+
+
+def test_inflate_grows_the_volume_along_the_normals(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: MeshLib's ``inflate`` is a different operation, measured.
+
+    It is the only reference that has one, and it cannot be compared. With **every** vertex selected
+    -- the whole-mesh inflation this function performs -- it collapses the sphere to the origin at
+    every pressure probed (1e-4, 1e-3, 1e-2, 0.05, 0.5: max radius 0.0000 each time), because its
+    implicit solve takes the unselected vertices as its Dirichlet condition, and selecting all of
+    them leaves the system with no anchor. Given a **region** it runs, but solves a different
+    problem: on a 223-vertex cap of ``icosphere(3)`` the volume goes 4.153 to 2.843 -- *below* the
+    input, since the implicit Laplacian flattens the cap onto its pinned rim before the pressure
+    pushes back -- and then rises with pressure (2.843 / 2.847 / 2.865 at 0.001 / 0.01 / 0.05). Only
+    the monotonicity is shared, and that is too weak to be a parity claim.
+
+    So the properties carry it, and each excludes something a volume alone would not:
+
+    * **volume monotone in the pressure**, which excludes a flow that smooths without inflating --
+      measured 4.153 unchanged at zero, 4.540 at 0.1 mean-edge and 6.328 at 0.5;
+    * **displacement normal-aligned**, mean cosine 0.959 and 0.998 at those pressures, ruling out
+      growing the volume by shearing;
+    * **watertight and free of self-intersections**, which is what a caller depends on;
+    * **pressure zero is the identity in volume**, which is the tightest of the four: any change
+      there would be the displacement leaking, since ``filter_laplacian``'s volume constraint is on.
+    """
+    mesh_tm, mesh_wp = icosphere
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    mean_edge = float(
+        np.linalg.norm(
+            mesh_tm.vertices[mesh_tm.edges[:, 0]] - mesh_tm.vertices[mesh_tm.edges[:, 1]], axis=1
+        ).mean()
+    )
+    normals_np = tw.vertices.area_weighted_vertex_normals(
+        int(vertices_wp.shape[0]), vertices_wp, faces_wp
+    ).numpy()
+
+    volumes = []
+    for scale in (0.0, 0.1, 0.5):
+        inflated_wp = tw.smoothing.inflate(vertices_wp, faces_wp, scale * mean_edge)
+        inflated_tm = warp_to_trimesh(inflated_wp, faces_wp)
+        volumes.append(float(inflated_tm.volume))
+        assert inflated_tm.is_watertight
+        assert not tw.validation.is_self_intersecting(wp.Mesh(inflated_wp, faces_wp))
+        if scale == 0.0:
+            assert np.isclose(volumes[-1], mesh_tm.volume, rtol=1e-3)
+            continue
+        displacement_np = inflated_wp.numpy() - vertices_wp.numpy()
+        alignment_np = (displacement_np * normals_np).sum(axis=1) / np.linalg.norm(
+            displacement_np, axis=1
+        )
+        assert alignment_np.mean() > 0.9
+    assert volumes[0] < volumes[1] < volumes[2]
+
+
+def test_inflate_deflates_and_handles_edge_cases(device: str) -> None:
+    """
+    Not a library comparison: the negative-pressure branch and the degenerate arguments.
+
+    A negative pressure must *shrink* the volume, which is the same code with the sign flipped and
+    is worth pinning because a normal-direction bug would show up as growth either way.
+    ``pre_smooth`` and ``gradual`` are asserted only to change the answer, not to change it in a
+    particular direction -- they are knobs on a flow, and a test claiming more would be inventing a
+    specification.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    vertices_wp, faces_wp = numpy_to_warp(
+        np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces).ravel().astype(np.int32), device
+    )
+    deflated_wp = tw.smoothing.inflate(vertices_wp, faces_wp, -0.05)
+    assert warp_to_trimesh(deflated_wp, faces_wp).volume < mesh_tm.volume
+
+    plain_np = tw.smoothing.inflate(vertices_wp, faces_wp, 0.05, pre_smooth=False).numpy()
+    smoothed_np = tw.smoothing.inflate(vertices_wp, faces_wp, 0.05, pre_smooth=True).numpy()
+    assert not np.allclose(plain_np, smoothed_np)
+    assert not np.allclose(
+        plain_np, tw.smoothing.inflate(vertices_wp, faces_wp, 0.05, gradual=False).numpy()
+    )
+
+    assert np.array_equal(
+        tw.smoothing.inflate(vertices_wp, faces_wp, 0.05, iterations=0).numpy(), vertices_wp.numpy()
+    )
+    empty_vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    empty_faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    assert tw.smoothing.inflate(empty_vertices_wp, empty_faces_wp, 0.1).shape == (0,)
+    with pytest.raises(ValueError, match="iterations must be non-negative"):
+        tw.smoothing.inflate(vertices_wp, faces_wp, 0.1, iterations=-1)

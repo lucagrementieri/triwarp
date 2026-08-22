@@ -1936,6 +1936,96 @@ def test_fix_self_intersections_leaves_a_clean_mesh_alone(
         tw.repair.fix_self_intersections(vertices_wp, faces_wp, max_iter=0)
 
 
+def _mesh_with_a_degree3_vertex() -> tm.Trimesh:
+    """Build an icosahedron with one face split at its centroid: one valence-3 vertex."""
+    mesh_tm = tm.creation.icosahedron()
+    vertices = [list(map(float, point)) for point in mesh_tm.vertices]
+    faces = mesh_tm.faces.tolist()
+    split = faces.pop(0)
+    centroid_np = np.mean([vertices[index] for index in split], axis=0)
+    vertices.append(list(map(float, centroid_np)))
+    centre = len(vertices) - 1
+    faces += [
+        [split[0], split[1], centre],
+        [split[1], split[2], centre],
+        [split[2], split[0], centre],
+    ]
+    return tm.Trimesh(np.array(vertices), np.array(faces), process=False)
+
+
+@pytest.mark.parity("eliminate_degree3_vertices", "meshlib")
+def test_eliminate_degree3_vertices_mask_matches_meshlib(device: str) -> None:
+    """
+    Class A on which vertices qualify, against ``findInnerVertsOfDegree(topology, 3)``.
+
+    That predicate is the clean half of MeshLib's answer: a bitset of the interior vertices of a
+    given valence, which is exactly the candidate set this removes. The removal itself is compared
+    only by its *effect* -- ``eliminateDegree3Vertices`` returns a count and mutates in place -- so
+    the count is asserted and the resulting mesh is checked by invariant.
+
+    The fixture is an icosahedron with one face split at its centroid: that centroid is the only
+    valence-3 interior vertex, and removing it must return the icosahedron. So the whole answer is
+    known in advance, which is what makes this stronger than a comparison on a scan mesh where
+    neither side's answer is independently known. Measured: MeshLib marks vertex 12 alone, and the
+    result is 12 vertices and 20 faces, watertight and edge-manifold.
+
+    The **control** matters as much: a plain icosahedron has no such vertex, so the mask is empty
+    and the function is a no-op returning its input buffers -- which rules out a pass that removes
+    something on any input.
+    """
+    for mesh_tm, expected_removed in (
+        (_mesh_with_a_degree3_vertex(), 1),
+        (tm.creation.icosahedron(), 0),
+    ):
+        vertices_wp, faces_wp = numpy_to_warp(
+            np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces).ravel().astype(np.int32), device
+        )
+        mesh_ml = trimesh_to_meshlib(mesh_tm)
+        degree3_np = meshlib_bitset_to_numpy(
+            mm.findInnerVertsOfDegree(mesh_ml.topology, 3), len(mesh_tm.vertices)
+        )
+        assert int(degree3_np.sum()) == expected_removed
+
+        out_vertices_wp, out_faces_wp, removed = tw.repair.eliminate_degree3_vertices(
+            vertices_wp, faces_wp
+        )
+        assert removed == expected_removed
+        assert int(out_vertices_wp.shape[0]) == len(mesh_tm.vertices) - expected_removed
+        assert int(out_faces_wp.shape[0]) // 3 == len(mesh_tm.faces) - 2 * expected_removed
+        assert tw.validation.is_edge_manifold(out_faces_wp)
+        assert warp_to_trimesh(out_vertices_wp, out_faces_wp).is_watertight
+
+
+def test_eliminate_degree3_vertices_is_idempotent_and_area_preserving(device: str) -> None:
+    """
+    Not a library comparison: the two properties that say the collapse was the right triangle.
+
+    Collapsing a valence-3 fan keeps the triangle its three neighbours span, so the **area is
+    unchanged** -- the three faces tile exactly that triangle. Getting the replacement's winding or
+    its vertices wrong changes the area, and nothing else in the output would show it. And a second
+    call must remove nothing, since the pass runs to a fixpoint.
+    """
+    mesh_tm = _mesh_with_a_degree3_vertex()
+    vertices_wp, faces_wp = numpy_to_warp(
+        np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces).ravel().astype(np.int32), device
+    )
+    out_vertices_wp, out_faces_wp, removed = tw.repair.eliminate_degree3_vertices(
+        vertices_wp, faces_wp
+    )
+    assert removed == 1  # non-vacuity
+    assert np.isclose(warp_to_trimesh(out_vertices_wp, out_faces_wp).area, mesh_tm.area, rtol=1e-6)
+
+    again_vertices_wp, again_faces_wp, again_removed = tw.repair.eliminate_degree3_vertices(
+        out_vertices_wp, out_faces_wp
+    )
+    assert again_removed == 0
+    assert np.array_equal(again_faces_wp.numpy(), out_faces_wp.numpy())
+    assert np.array_equal(again_vertices_wp.numpy(), out_vertices_wp.numpy())
+
+    with pytest.raises(ValueError, match="max_iter must be non-negative"):
+        tw.repair.eliminate_degree3_vertices(vertices_wp, faces_wp, max_iter=-1)
+
+
 def _genus(faces_wp: wp.array[wp.int32]) -> int:
     """Genus of a closed connected surface, from its Euler characteristic."""
     return (2 - tw.measures.euler_characteristic(faces_wp)) // 2

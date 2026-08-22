@@ -801,3 +801,32 @@ def test_smooth_region_fixed_rim(bench_case: BenchCase) -> None:
         lambda: tw.smoothing.smooth_region_fixed_rim(vertices, faces, free_wp), rounds=3
     )
     assert smoothed.shape == (n_vertices,)
+
+
+@pytest.mark.benchmark(group="inflate")
+@pytest.mark.benchlibs("triwarp")
+def test_inflate(bench_case: BenchCase) -> None:
+    """
+    The balloon flow: per pass, a vertex-normal build, one displacement map and one Laplacian pass.
+
+    Read against ``filter_laplacian`` at the same iteration count -- the difference between the two
+    groups is what the normals and the displacement cost, and it should be roughly the normal build,
+    since the displacement is one ``wp.map`` with the kernel hoisted out of the loop.
+
+    triwarp-only, and not by omission. MeshLib's ``inflate`` is the only reference that has one and
+    it cannot be timed here: with every vertex selected -- the operation this performs -- it
+    collapses the mesh to a point at every pressure probed, because its implicit solve takes the
+    *unselected* vertices as its boundary condition. Given a region it works but solves a different
+    problem, dropping the volume below the input before pressure raises it again. Measured numbers
+    are in ``tests/test_smoothing.py``.
+
+    First measurement, medians on an RTX 5090 at the default 3 passes: **4.59 ms**
+    (``bunny_decimated``), **5.16** (``bunny``), **5.51** (``dragon``), **5.72**
+    (``happy_buddha``), **127.1** (``lucy``). Flat from 40k to 1.09M faces, so the three passes are
+    launch-bound rather than data-bound at this scale -- and ``lucy``'s 25x jump at a comparable
+    face count is the same unexplained outlier ``split_faces_along_field`` records on that mesh.
+    """
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    pressure = 0.1 * bench_case.mean_edge
+    inflated = bench_case.run(lambda: tw.smoothing.inflate(vertices, faces, pressure), rounds=3)
+    assert int(inflated.shape[0]) == bench_case.n_vertices

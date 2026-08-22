@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.kernels.array import update_argmin_pair
+from triwarp.kernels.halfedge import halfedge_destination
 from triwarp.kernels.triangles import corner_triple, triangle_cross
 
 
@@ -254,3 +255,55 @@ def corner_merge_links(
     out_links[e * 2 + 0, 1] = backward_next  # low endpoint, backward face
     out_links[e * 2 + 1, 0] = forward_next  # high endpoint, forward face
     out_links[e * 2 + 1, 1] = backward  # high endpoint, backward face
+
+
+@wp.func
+def is_interior_degree3(ring_start: wp.int32, ring_end: wp.int32, on_boundary: wp.bool) -> wp.bool:
+    # An interior vertex with exactly three incident faces. Its ring size *is* the face count, so a
+    # boundary vertex with three faces has four neighbours and is excluded by the flag rather than
+    # by the count.
+    return not on_boundary and ring_end - ring_start == 3
+
+
+@wp.kernel
+def select_independent_degree3(
+    faces: wp.array[wp.int32],
+    ring_offsets: wp.array[wp.int32],
+    ring_halfedges: wp.array[wp.int32],
+    candidate: wp.array[wp.bool],
+    out_selected: wp.array[wp.bool],
+) -> None:
+    # Two adjacent candidates share faces, so only one of them can be removed in a pass. The lowest
+    # index wins, which makes the choice deterministic and independent of launch order -- the same
+    # rule the Delaunay flip pass uses to resolve competing edges.
+    v = wp.int32(wp.tid())
+    if not candidate[v]:
+        return
+    for slot in range(ring_offsets[v], ring_offsets[v + 1]):
+        neighbour = halfedge_destination(faces, ring_halfedges[slot])
+        if candidate[neighbour] and neighbour < v:
+            return
+    out_selected[v] = True
+
+
+@wp.kernel
+def emit_degree3_replacement(
+    faces: wp.array[wp.int32],
+    ring_offsets: wp.array[wp.int32],
+    ring_halfedges: wp.array[wp.int32],
+    selected: wp.array[wp.bool],
+    cursor: wp.array[wp.int32],
+    out_dropped: wp.array[wp.bool],
+    out_new_faces: wp.array2d[wp.int32],
+) -> None:
+    # The three faces around a selected vertex become one: its link is a triangle already, since the
+    # ring is counter-clockwise and has exactly three entries. Winding follows the ring, so the
+    # replacement points the same way the fan did.
+    v = wp.int32(wp.tid())
+    if not selected[v]:
+        return
+    begin = ring_offsets[v]
+    slot = wp.atomic_add(cursor, 0, 1)
+    for k in range(3):
+        out_dropped[ring_halfedges[begin + k] // 3] = True
+        out_new_faces[slot, k] = halfedge_destination(faces, ring_halfedges[begin + k])

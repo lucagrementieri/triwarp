@@ -162,6 +162,114 @@ def _apply_volume_constraint(
         wp.map(wp.mul, positions, wp.float64(factor), out=positions)
 
 
+def inflate(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    pressure: float,
+    *,
+    iterations: int = 3,
+    pre_smooth: bool = True,
+    gradual: bool = True,
+    lamb: float = 0.5,
+) -> wp.array[wp.vec3]:
+    """
+    Inflate a surface under uniform pressure: normal displacement alternating with smoothing.
+
+    The "balloon" flow. Each pass moves every vertex along its own
+    [`area_weighted_vertex_normals`][triwarp.vertices.area_weighted_vertex_normals] and then relaxes
+    with one Laplacian pass, which is what keeps the triangles from shearing as the surface grows.
+    Uses of it: puffing a thin shell out to a printable thickness, opening a collapsed scan, and
+    supplying a starting surface a fitting loop can shrink back onto data.
+
+    ``pressure`` is an absolute distance per pass, in the mesh's own units, so scale it off
+    something intrinsic -- a fraction of the mean edge length is the usual choice. With ``gradual``
+    pass ``k`` of ``n`` uses ``pressure * (k + 1) / n`` rather than the full amount, which is
+    gentler on a mesh with fine triangles: the early passes let the relaxation redistribute
+    before the later ones push hard.
+
+    !!! note "Not MeshLib's solver"
+        ``inflate`` there displaces and then solves an *implicit* Laplacian system, where this
+        runs one explicit pass -- so the two produce different surfaces from the same ``pressure``,
+        and the tests compare the properties an inflation must have (volume grows, the displacement
+        is normal-aligned) rather than positions. Pass the result through
+        [`filter_implicit_fairing`][triwarp.smoothing.filter_implicit_fairing] if you want that
+        formulation; it is CUDA-only, which is why it is not the default here.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    pressure
+        Distance to move along the normal per pass. Negative deflates.
+    iterations
+        Number of displace-and-relax passes.
+    pre_smooth
+        Run one relaxation pass *before* the first displacement. Worth it on a noisy input, where
+        the normals are what the noise corrupts and displacing along them amplifies it.
+    gradual
+        Ramp the pressure linearly across the passes instead of applying it in full each time.
+    lamb
+        Relaxation strength of each Laplacian pass, as
+        [`filter_laplacian`][triwarp.smoothing.filter_laplacian] takes it.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        Inflated positions on ``vertices.device``. The connectivity is untouched, so ``faces``
+        remains valid.
+
+    Raises
+    ------
+    ValueError
+        If ``iterations`` is negative.
+
+    See Also
+    --------
+    [`offset_mesh`][triwarp.offset.offset_mesh]
+        The *exact* outward offset, through a signed distance field -- it changes the connectivity
+        and cannot self-intersect, where this keeps the mesh and can.
+    [`filter_laplacian`][triwarp.smoothing.filter_laplacian]
+        The relaxation half of each pass.
+    [`thicken_mesh`][triwarp.offset.thicken_mesh]
+        Turns a surface into a solid shell, which is the other way to give it thickness.
+    """
+    if iterations < 0:
+        raise ValueError(f"iterations must be non-negative, got {iterations}")
+    device = faces.device
+    n_vertices = int(vertices.shape[0])
+    if n_vertices == 0 or int(faces.shape[0]) == 0 or iterations == 0:
+        return wp.clone(vertices)
+
+    positions = wp.clone(vertices)
+    if pre_smooth:
+        positions = filter_laplacian(positions, faces, lamb, iterations=1)
+    # Hoisted once: the displacement is the same map every pass, and section 4 records that a
+    # per-iteration wrapper loop should not re-derive it.
+    step_kernel = wp.map(
+        kernel_smoothing.step_along_normal,
+        positions,
+        positions,
+        wp.float32(0.0),
+        out=positions,
+        return_kernel=True,
+    )
+    for step in range(iterations):
+        amount = pressure * (step + 1) / iterations if gradual else pressure
+        normals = tw.vertices.area_weighted_vertex_normals(n_vertices, positions, faces)
+        displaced = wp.empty(n_vertices, dtype=wp.vec3, device=device)
+        wp.launch(
+            step_kernel,
+            dim=n_vertices,
+            inputs=[positions, normals, wp.float32(amount)],
+            outputs=[displaced],
+            device=device,
+        )
+        positions = filter_laplacian(displaced, faces, lamb, iterations=1)
+    return positions
+
+
 def filter_humphrey(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],

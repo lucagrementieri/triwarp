@@ -377,6 +377,7 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     ),
     ("energies", "scatter_edge_halfedges"): frozenset({"cursor"}),
     ("selection", "open_dual_edges_and_seeds"): frozenset({"cursor"}),
+    ("repair", "emit_degree3_replacement"): frozenset({"cursor"}),
     ("grouping", "hash_insert"): frozenset({"slot_counts"}),
     # ``values`` is the matrix whose rows this scales -- input and result in the same buffer, since
     # the prolongation smoother's ``-w D^-1 (A P0)`` is a row scaling of a product that has just

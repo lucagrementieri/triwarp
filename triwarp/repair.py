@@ -31,6 +31,7 @@ from triwarp.grouping import hash_vector_rows, unique_1d, unique_faces, unique_r
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import repair as kernel_repair
 from triwarp.kernels import scatter as kernel_scatter
+from triwarp.kernels import selection as kernel_selection
 
 # Lattice resolution for ``fix_self_intersections(method="voxel")``, in samples across the mesh's
 # bounding-box diagonal. 128 is the same order as ``offset.offset_mesh``'s automatic floor and costs
@@ -612,6 +613,120 @@ def collapse_small_triangles(
         )
 
     return current_vertices, current_faces
+
+
+def eliminate_degree3_vertices(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], *, max_iter: int = 8
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], int]:
+    """
+    Remove interior vertices with exactly three incident faces, collapsing each fan to one triangle.
+
+    A valence-3 interior vertex carries no information the surface needs: its three faces tile the
+    triangle formed by its three neighbours, so deleting it and keeping that triangle changes the
+    connectivity and nothing else. They are a standard residue of subdivision, of decimation and of
+    hole filling, and they make every downstream valence statistic worse.
+
+    Adjacent candidates share faces, so a pass removes a maximal **independent** set -- the
+    lowest-indexed of any two neighbouring candidates wins, deterministically -- and the loop
+    repeats until none is left or ``max_iter`` passes have run. Removing one vertex can create
+    another, which is why the count is a return value rather than a promise.
+
+    !!! note "The other half of a double-face pass already exists"
+        A pair of triangles on the same three vertices is
+        [`resolve_duplicated_faces`][triwarp.repair.resolve_duplicated_faces]' job, and this
+        function deliberately does not repeat it. The two together are what a "remove double faces"
+        pass means elsewhere; they are kept apart because they have different orientation rules and
+        different answers on a non-orientable mesh.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer. Must be edge-manifold, since the
+        fan around a vertex is what this reasons about.
+    max_iter
+        Cap on the number of passes. Each pass removes an independent set, so a chain of adjacent
+        candidates needs one pass per link; the default covers any chain this has been measured on.
+
+    Returns
+    -------
+    vertices : wp.array[wp.vec3]
+        Positions of the result, with the removed vertices compacted away. No position moves.
+    faces : wp.array[wp.int32]
+        Flat triangle index buffer, three faces shorter per removed vertex plus one longer.
+    removed : int
+        How many vertices were eliminated. Zero means the input had none and the buffers are it.
+
+    Raises
+    ------
+    ValueError
+        If ``max_iter`` is negative, or propagated from
+        [`halfedge_twins`][triwarp.halfedge.halfedge_twins] when the mesh is not edge-manifold.
+
+    See Also
+    --------
+    [`resolve_duplicated_faces`][triwarp.repair.resolve_duplicated_faces]
+        The other half: triangles repeated on the same three vertices.
+    [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces]
+        Removes faces by *geometry*; this one removes a vertex by its connectivity alone.
+    [`vertex_one_rings`][triwarp.halfedge.vertex_one_rings]
+        The fan this walks.
+    """
+    if max_iter < 0:
+        raise ValueError(f"max_iter must be non-negative, got {max_iter}")
+    device = faces.device
+    removed = 0
+    for _ in range(max_iter):
+        n_faces = int(faces.shape[0]) // 3
+        if n_faces == 0:
+            break
+        n_vertices = int(vertices.shape[0])
+        ring_offsets, ring_halfedges, is_boundary = tw.halfedge.vertex_one_rings(
+            faces, n_vertices=n_vertices
+        )
+        candidate = wp.empty(n_vertices, dtype=wp.bool, device=device)
+        wp.map(
+            kernel_repair.is_interior_degree3,
+            ring_offsets[:-1],
+            ring_offsets[1:],
+            is_boundary,
+            out=candidate,
+        )
+        selected = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+        wp.launch(
+            kernel_repair.select_independent_degree3,
+            dim=n_vertices,
+            inputs=[faces, ring_offsets, ring_halfedges, candidate, selected],
+            device=device,
+        )
+        # One readback per pass, and it is the loop's own termination test: the pass count is what
+        # bounds it, and there is no device-side way to stop a Python loop.
+        n_selected = int(tw.reduce.sum(tw.array.astype(selected, wp.int32)))
+        if n_selected == 0:
+            break
+
+        cursor = wp.zeros(1, dtype=wp.int32, device=device)
+        dropped = wp.zeros(n_faces, dtype=wp.bool, device=device)
+        new_faces = twt.empty_2d((n_selected, 3), wp.int32, device=device)
+        wp.launch(
+            kernel_repair.emit_degree3_replacement,
+            dim=n_vertices,
+            inputs=[faces, ring_offsets, ring_halfedges, selected, cursor, dropped, new_faces],
+            device=device,
+        )
+        keep = wp.empty(n_faces, dtype=wp.bool, device=device)
+        wp.map(kernel_selection.logical_not, dropped, out=keep)
+        kept = tw.array.gather(faces.reshape((n_faces, 3)), tw.array.flatnonzero(keep))
+        faces = tw.array.concatenate([kept.reshape(-1), new_faces.reshape(3 * n_selected)])
+        removed += n_selected
+    if removed == 0:
+        return vertices, faces, 0
+    # Compacted **once**, after the loop rather than inside it. A dead vertex has an empty ring and
+    # so is never a candidate, which is what makes deferring safe; doing it per pass added a full
+    # vertex-and-face pass to every iteration for no change in the answer.
+    vertices, faces, _index = remove_unreferenced_vertices(vertices, faces)
+    return vertices, faces, removed
 
 
 def make_winding_consistent(faces: wp.array[wp.int32]) -> wp.array[wp.int32]:
