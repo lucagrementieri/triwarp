@@ -9,6 +9,7 @@ from __future__ import annotations
 import heapq
 import math
 from collections import deque
+from collections.abc import Callable
 from typing import Literal
 
 import igl
@@ -298,6 +299,176 @@ def test_query_bvh_aabb_with_offsets_degenerate_inputs(device: str, include_tota
     )
     assert miss_indices_wp.shape == (0,)
     assert np.array_equal(miss_offsets_wp.numpy(), np.zeros(2 if include_total else 1, np.int32))
+
+
+@pytest.mark.parity("query_bvh_box", "open3d")
+def test_query_bvh_box_matches_exact_containment(device: str) -> None:
+    """
+    Class A: on a point BVH the hits are exactly the points inside each query box.
+
+    A degenerate leaf bound intersects the query box iff the point is in it, so there is no
+    broad-phase superset here and the comparison is an equality against two independent exact
+    answers: NumPy's ``lower <= p <= upper`` and open3d's
+    ``AxisAlignedBoundingBox.get_point_indices_within_bounding_box``. Both share Warp's
+    **inclusive** convention, which is the one thing a caller can get wrong here -- measured on Warp
+    1.16 and open3d 0.19, a point exactly on a face is inside the box for both -- so the last case
+    below constructs one point on the lower face and one on the upper face rather than trusting
+    random data to land there.
+
+    Also pins the two offsets forms against each other, as the uniform-cube sibling's test does.
+    """
+    rng = np.random.default_rng(11)
+    points_np = rng.random((400, 3)).astype(np.float32)
+    centers_np = rng.random((12, 3)).astype(np.float32)
+    lower_np = np.ascontiguousarray(centers_np - 0.12, dtype=np.float32)
+    upper_np = np.ascontiguousarray(centers_np + 0.18, dtype=np.float32)
+    n_queries = centers_np.shape[0]
+
+    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    bvh = tw.neighbors.bvh_from_points(points_wp)
+    indices_wp, offsets_wp = tw.neighbors.query_bvh_box(
+        bvh,
+        wp.array(lower_np, dtype=wp.vec3, device=device),
+        wp.array(upper_np, dtype=wp.vec3, device=device),
+        include_total=True,
+    )
+    indices_np = indices_wp.numpy()
+    offsets_np = offsets_wp.numpy()
+    assert offsets_np.shape == (n_queries + 1,)
+    assert int(offsets_np[-1]) == indices_np.size
+
+    cloud_o3d = points_to_open3d(points_np.astype(np.float64))
+    n_nonempty = 0
+    for query_index in range(n_queries):
+        box_lower_np, box_upper_np = lower_np[query_index], upper_np[query_index]
+        inside_np = np.flatnonzero(
+            np.all((points_np >= box_lower_np) & (points_np <= box_upper_np), axis=1)
+        )
+        hits_np = np.sort(indices_np[offsets_np[query_index] : offsets_np[query_index + 1]])
+        assert np.array_equal(hits_np, inside_np)
+
+        box_o3d = o3d.geometry.AxisAlignedBoundingBox(
+            box_lower_np.astype(np.float64), box_upper_np.astype(np.float64)
+        )
+        assert np.array_equal(
+            np.sort(np.asarray(box_o3d.get_point_indices_within_bounding_box(cloud_o3d.points))),
+            inside_np,
+        )
+
+        n_nonempty += inside_np.size > 0
+    # 9 of the 12 boxes hold at least one point here; a run where none did would pass vacuously.
+    assert n_nonempty >= 9
+
+    # The length-``m`` form is the same scan buffer's prefix, not a separately computed answer.
+    _short_indices_wp, short_offsets_wp = tw.neighbors.query_bvh_box(
+        bvh,
+        wp.array(lower_np, dtype=wp.vec3, device=device),
+        wp.array(upper_np, dtype=wp.vec3, device=device),
+    )
+    assert np.array_equal(short_offsets_wp.numpy(), offsets_np[:-1])
+
+    # Inclusive on both faces, and an inverted box selects nothing.
+    face_np = np.array([[0.0, 0.5, 0.5], [1.0, 0.5, 0.5], [0.5, 0.5, 0.5]], dtype=np.float32)
+    face_bvh = tw.neighbors.bvh_from_points(wp.array(face_np, dtype=wp.vec3, device=device))
+    face_indices_wp, face_offsets_wp = tw.neighbors.query_bvh_box(
+        face_bvh,
+        wp.array(np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], np.float32), wp.vec3, device=device),
+        wp.array(np.array([[1.0, 1.0, 1.0], [0.0, 0.0, 0.0]], np.float32), wp.vec3, device=device),
+        include_total=True,
+    )
+    assert np.array_equal(np.sort(face_indices_wp.numpy()), np.array([0, 1, 2]))
+    assert np.array_equal(face_offsets_wp.numpy(), np.array([0, 3, 3]))
+
+
+@pytest.mark.parity(
+    "query_bvh_box",
+    "meshlib",
+    benchmarked=False,
+    reason="findPointsInBox reports every hit through a Python callback, so a timed row would "
+    "price the interpreter rather than the search; it is exact as a correctness oracle, and open3d "
+    "carries the timed row for this group instead.",
+)
+def test_query_bvh_box_matches_meshlib(device: str) -> None:
+    """
+    Class A: the same hit set as ``findPointsInBox``, which is the third exact box query.
+
+    Separate from the open3d comparison because meshlib's is the one that cannot be benchmarked --
+    it reports each hit through a ``func_void_from_Id_VertTag_Vector3_float`` callback, so a timed
+    row would measure the interpreter. As a correctness oracle it is exact, and it agrees on the
+    inclusive-face convention: the second box below has a point on each of its faces.
+    """
+    rng = np.random.default_rng(17)
+    points_np = rng.random((200, 3)).astype(np.float32)
+    lower_np = np.array([[0.2, 0.2, 0.2], [0.0, 0.0, 0.0]], dtype=np.float32)
+    upper_np = np.array([[0.6, 0.7, 0.55], [1.0, 1.0, 1.0]], dtype=np.float32)
+
+    bvh = tw.neighbors.bvh_from_points(
+        wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    )
+    indices_wp, offsets_wp = tw.neighbors.query_bvh_box(
+        bvh,
+        wp.array(lower_np, dtype=wp.vec3, device=device),
+        wp.array(upper_np, dtype=wp.vec3, device=device),
+        include_total=True,
+    )
+    indices_np, offsets_np = indices_wp.numpy(), offsets_wp.numpy()
+
+    def collect_into(sink: list[int]) -> Callable[[int, object], None]:
+        """Each hit arrives as ``(VertId, Vector3f)``, so the sink cannot be ``list.append``."""
+        return lambda vertex_id, _position: sink.append(int(vertex_id))
+
+    cloud_ml = points_to_meshlib(points_np)
+    for query_index in range(lower_np.shape[0]):
+        hits_ml: list[int] = []
+        mm.findPointsInBox(
+            cloud_ml,
+            mm.Box3f(
+                mm.Vector3f(*lower_np[query_index].tolist()),
+                mm.Vector3f(*upper_np[query_index].tolist()),
+            ),
+            collect_into(hits_ml),
+        )
+        hits_wp = indices_np[offsets_np[query_index] : offsets_np[query_index + 1]]
+        assert np.array_equal(np.sort(np.asarray(hits_ml, dtype=np.int32)), np.sort(hits_wp))
+    # The second box holds the whole cloud, so neither side's answer is empty.
+    assert int(offsets_np[-1]) - int(offsets_np[-2]) == points_np.shape[0]
+
+
+def test_query_bvh_box_degenerate_inputs(device: str) -> None:
+    """
+    An empty query set, a query that hits nothing, and mismatched corner lengths.
+
+    Not a library comparison: these are this wrapper's own early returns and its one guard. The
+    offsets shape has to match the general path in both early returns, since a caller reading the
+    trailing total would otherwise index past the end.
+    """
+    points_wp = wp.array(
+        np.zeros((4, 3), dtype=np.float32) + np.array([0.0, 0.0, 0.0]), dtype=wp.vec3, device=device
+    )
+    bvh = tw.neighbors.bvh_from_points(points_wp)
+    empty_wp = wp.empty(0, dtype=wp.vec3, device=device)
+
+    for include_total in (False, True):
+        indices_wp, offsets_wp = tw.neighbors.query_bvh_box(
+            bvh, empty_wp, empty_wp, include_total=include_total
+        )
+        assert indices_wp.shape == (0,)
+        assert offsets_wp.shape == ((1,) if include_total else (0,))
+
+        far_lower_wp = wp.array(np.full((1, 3), 99.0, np.float32), dtype=wp.vec3, device=device)
+        far_upper_wp = wp.array(np.full((1, 3), 100.0, np.float32), dtype=wp.vec3, device=device)
+        miss_indices_wp, miss_offsets_wp = tw.neighbors.query_bvh_box(
+            bvh, far_lower_wp, far_upper_wp, include_total=include_total
+        )
+        assert miss_indices_wp.shape == (0,)
+        assert np.array_equal(
+            miss_offsets_wp.numpy(), np.zeros(2 if include_total else 1, np.int32)
+        )
+
+    with pytest.raises(ValueError, match="same length"):
+        tw.neighbors.query_bvh_box(
+            bvh, wp.array(np.zeros((2, 3), np.float32), wp.vec3, device=device), empty_wp
+        )
 
 
 @pytest.mark.parametrize("backend", ["bvh", "hashgrid"])

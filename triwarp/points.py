@@ -78,6 +78,66 @@ def point_plane_distance(
     return out_distances
 
 
+def half_space_mask(
+    points: wp.array[wp.vec3], plane_normal: wp.vec3, plane_origin: wp.vec3 | None = None
+) -> wp.array[wp.bool]:
+    """
+    Flag the points strictly on the normal's side of a plane.
+
+    The unbounded selection primitive: one plane cuts space in two and this is the half the normal
+    points into. Composes into a convex region by intersecting several masks, which is what makes it
+    worth having next to the box query — a slab, a wedge or a frustum is a handful of these, and
+    none of them needs a spatial index because every point is tested independently.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` positions in space as ``wp.vec3``.
+    plane_normal
+        Plane normal as ``wp.vec3``, pointing into the selected half. Need not be unit length: only
+        the sign of the projection is read.
+    plane_origin
+        Point on the plane as ``wp.vec3``. When ``None``, the origin ``(0, 0, 0)`` is used.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Length-``n`` mask on ``points.device``. ``True`` marks a point to **keep**, the same sense
+        as [`finite_point_mask`][triwarp.points.finite_point_mask].
+
+    Examples
+    --------
+    ```python
+    upper = tw.points.half_space_mask(v, wp.vec3(0.0, 0.0, 1.0))
+    kept = tw.array.gather(v, tw.array.flatnonzero(upper))
+    ```
+
+    Notes
+    -----
+    The test is **strict**, so a point exactly on the plane is excluded and the two masks for
+    opposite normals are disjoint rather than overlapping. That is the convention MeshLib's
+    ``findHalfSpacePoints`` uses (measured: with the plane ``z = 1``, a point at ``z = 1`` is in
+    neither half), and it makes the pair of masks a partition of the points off the plane.
+
+    See Also
+    --------
+    [`point_plane_distance`][triwarp.points.point_plane_distance]
+        The signed distance this thresholds, when the magnitude is wanted too.
+    [`triwarp.neighbors.query_bvh_box`][triwarp.neighbors.query_bvh_box]
+        The bounded counterpart: selection by a box, through a BVH.
+    [`triwarp.array.flatnonzero`][triwarp.array.flatnonzero]
+    """
+    if plane_origin is None:
+        plane_origin = wp.vec3(0.0, 0.0, 0.0)
+    n = int(points.shape[0])
+    out_mask = wp.empty(n, dtype=wp.bool, device=points.device)
+    if n == 0:
+        return out_mask
+
+    wp.map(kernel_points.is_in_half_space, points, plane_normal, plane_origin, out=out_mask)
+    return out_mask
+
+
 def centroid(points: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
     """
     Mean position ``sum(points) / n`` as a ``(1,)`` device ``wp.vec3`` array.

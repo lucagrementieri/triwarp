@@ -16,6 +16,15 @@ def point_plane_distance(
 
 
 @wp.func
+def is_in_half_space(point: wp.vec3, plane_normal: wp.vec3, plane_origin: wp.vec3) -> wp.bool:
+    # Strictly on the normal's side, so a point exactly on the plane is excluded. Only the sign of
+    # the dot matters, which is why this reads the unnormalized primitive rather than
+    # ``point_plane_distance``: a non-unit normal cannot change the answer and the division cannot
+    # change the sign, but it can turn a large dot into an infinity.
+    return point_plane_dot(point, plane_origin, plane_normal) > 0.0
+
+
+@wp.func
 def radial_sort_key(point: wp.vec3, origin: wp.vec3, axis0: wp.vec3, axis1: wp.vec3) -> wp.float32:
     v = point - origin
     # Negated angle: an ascending radix sort of these keys reproduces trimesh's

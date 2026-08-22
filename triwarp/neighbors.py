@@ -176,6 +176,8 @@ def query_bvh_aabb_with_offsets(
 
     See Also
     --------
+    [`query_bvh_box`][triwarp.neighbors.query_bvh_box]
+        The same query with a **per-query** box instead of one cube size for every query.
     [`query_bvh_ball_with_offsets`][triwarp.neighbors.query_bvh_ball_with_offsets]
         The same packing and the same keyword, for a ball query with a narrow-phase filter.
     """
@@ -213,6 +215,99 @@ def query_bvh_aabb_with_offsets(
             segment_bounds[:m],
             candidate_indices_flat,
         ],
+        device=device,
+    )
+
+    return candidate_indices_flat, offsets
+
+
+def query_bvh_box(
+    bvh: wp.Bvh,
+    query_lower: wp.array[wp.vec3],
+    query_upper: wp.array[wp.vec3],
+    *,
+    include_total: bool = False,
+) -> tuple[wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Primitives overlapping one axis-aligned box **per query**, in the same CSR packing.
+
+    The box counterpart of the ball queries, and the per-query generalization of
+    [`query_bvh_aabb_with_offsets`][triwarp.neighbors.query_bvh_aabb_with_offsets]: each query
+    carries its own ``(lower, upper)`` corners rather than sharing one cube size. On a BVH built by
+    [`bvh_from_points`][triwarp.neighbors.bvh_from_points], whose leaf bounds are degenerate, a hit
+    means the point is **inside** the box, so the answer is exact and no narrow phase is needed; on
+    one built by [`bvh_from_bounds`][triwarp.neighbors.bvh_from_bounds] it is box-versus-box
+    overlap, like every other broad phase here.
+
+    Parameters
+    ----------
+    bvh
+        Pre-built BVH over points or bounds.
+    query_lower, query_upper
+        ``(m,)`` ``wp.vec3`` corners of the query boxes, one pair per query.
+    include_total
+        Return ``offsets`` in the length-``m + 1`` CSR form whose trailing element is the total hit
+        count, instead of the length-``m`` form. Same meaning as on the ball queries.
+
+    Returns
+    -------
+    candidate_indices_flat, offsets
+        Query ``k`` owns ``candidate_indices_flat[offsets[k] : offsets[k + 1]]``, with ``offsets``
+        the exclusive prefix sum of per-query hit counts.
+
+    Raises
+    ------
+    ValueError
+        If ``query_lower`` and ``query_upper`` do not have the same length.
+
+    Notes
+    -----
+    The test is **inclusive** on every face: a point exactly on a box face is inside it (measured on
+    Warp 1.16, both the lower and the upper face). A box with any ``upper < lower`` component
+    matches nothing, and that is not checked -- the check would cost a host readback per call
+    (CLAUDE.md section 13) to reject a caller error whose answer is already empty.
+
+    There is no list-returning sibling, so the name carries no ``_with_offsets`` suffix: this
+    query's consumers are kernels that recover the owning query from ``offsets``, and a Python list
+    of per-query arrays would add ``O(m)`` host slicing to a query whose whole point is that it is
+    batched.
+
+    See Also
+    --------
+    [`query_bvh_aabb_with_offsets`][triwarp.neighbors.query_bvh_aabb_with_offsets]
+        One cube size for every query, which needs no corner buffers at all.
+    [`triwarp.points.half_space_mask`][triwarp.points.half_space_mask]
+        The unbounded counterpart: selection by one plane rather than by a box.
+    """
+    device = query_lower.device
+    m = int(query_lower.shape[0])
+    if int(query_upper.shape[0]) != m:
+        raise ValueError("query_lower and query_upper must have the same length")
+
+    if m == 0:
+        return (
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.zeros(1 if include_total else 0, dtype=wp.int32, device=device),
+        )
+
+    hit_counts = wp.empty(m, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_neighbors.query_bvh_box_count,
+        dim=m,
+        inputs=[query_lower, query_upper, bvh.id, hit_counts],
+        device=device,
+    )
+
+    segment_bounds, total_hits = tw.array.counts_to_offsets(hit_counts, include_total=True)
+    offsets = segment_bounds if include_total else segment_bounds[:m]
+    if total_hits == 0:
+        return wp.empty(0, dtype=wp.int32, device=device), offsets
+
+    candidate_indices_flat = wp.empty(total_hits, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_neighbors.query_bvh_box_neighbors,
+        dim=m,
+        inputs=[query_lower, query_upper, bvh.id, segment_bounds[:m], candidate_indices_flat],
         device=device,
     )
 

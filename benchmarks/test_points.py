@@ -280,6 +280,42 @@ def _points_ml(bench_case: BenchCase) -> mm.std_vector_Vector3_float:
     return _points_ml_cache[bench_case.mesh_name]
 
 
+@pytest.mark.benchmark(group="half_space_mask")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_half_space_mask(bench_case: BenchCase) -> None:
+    """
+    Select every point on one side of a plane: the same ``wp.map`` shape as the distance row.
+
+    Read next to ``point_plane_distance``, which is the same pass writing a ``float32`` instead of a
+    ``bool`` -- so the pair prices the output width and nothing else, and both sit on this module's
+    wrapper floor rather than on any real arithmetic.
+
+    meshlib's ``findHalfSpacePoints`` is the one query in family H that needs no callback: it takes
+    the whole cloud and returns a ``VertBitSet``, so this row compares two batched calls rather than
+    pricing an interpreter loop. Its plane is ``dot(n, x) = d`` where triwarp takes a normal and a
+    point on the plane, and the packed bitset is a 64x narrower write than a ``wp.bool`` array --
+    both worth knowing before reading the ratio.
+
+    First measurement: at ``bunny_decimated`` meshlib is **23.8 us** against triwarp-cuda's
+    **69.7 us**, i.e. the GPU row is 2.9x *behind* -- which is this module's wrapper floor rather
+    than the map, exactly as ``point_plane_distance`` warns. At ``dragon`` triwarp-cuda is 66 us for
+    a cloud 60x larger, so the floor is the whole story below ~10^5 points and the axis is the only
+    honest way to read either row.
+    """
+    n_points = bench_case.n_vertices
+    if bench_case.kind == "meshlib":
+        skip_larger_than(bench_case, "bunny_decimated", _HOST_CAP_REASON)
+        cloud_ml = _cloud_ml(bench_case)  # held in a name, per the helper's docstring
+        plane_ml = mm.Plane3f(mm.Vector3f(*_PLANE_NORMAL.tolist()), 0.0)
+        mask_ml = bench_case.run(lambda: mm.findHalfSpacePoints(cloud_ml, plane_ml))
+        assert mask_ml.size() <= n_points
+        return
+    points = bench_case.vertices_wp
+    normal = wp.vec3(*_PLANE_NORMAL.tolist())
+    mask = bench_case.run(lambda: tw.points.half_space_mask(points, normal))
+    assert mask.shape == (n_points,)
+
+
 @pytest.mark.benchmark(group="principal_axes")
 @pytest.mark.benchlibs("triwarp", "pyvista", "meshlib")
 def test_principal_axes(bench_case: BenchCase) -> None:

@@ -56,6 +56,81 @@ def test_point_plane_distance(device: str) -> None:
     assert np.allclose(distances_wp.numpy(), distances_tm, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parity("half_space_mask", "meshlib")
+def test_half_space_mask_matches_meshlib(device: str) -> None:
+    """
+    Class A: the same half-space selection as ``findHalfSpacePoints``, boundary convention included.
+
+    meshlib's plane is ``dot(n, x) = d`` and triwarp's is a normal plus a point on it, so the
+    transform is ``d = dot(n, origin)`` -- an argument mapping, not a value one, which is why this
+    is Class A rather than B. The normal is deliberately **not** unit length: only the sign of the
+    projection can matter, and a comparison at unit scale would not show that.
+
+    The **strict** boundary is the part worth pinning, since it is the one convention two
+    implementations can silently disagree on. Measured against the wheel: with the plane ``z = 1``,
+    a point at exactly ``z = 1`` is in neither half for either library. The invariant that follows
+    is asserted directly -- the masks for opposite normals are disjoint and together cover every
+    point off the plane.
+    """
+    rng = np.random.default_rng(3)
+    points_np = rng.standard_normal((300, 3)).astype(np.float32)
+    plane_normal_np = np.array([0.4, -1.7, 0.9], dtype=np.float64)
+    plane_origin_np = np.array([0.1, 0.2, -0.3], dtype=np.float64)
+
+    plane_ml = mm.Plane3f(
+        mm.Vector3f(*plane_normal_np.tolist()), float(plane_normal_np @ plane_origin_np)
+    )
+    mask_ml = meshlib_bitset_to_numpy(
+        mm.findHalfSpacePoints(points_to_meshlib(points_np), plane_ml), points_np.shape[0]
+    )
+
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    normal_wp = wp.vec3(*plane_normal_np.tolist())
+    origin_wp = wp.vec3(*plane_origin_np.tolist())
+    mask_wp = tw.half_space_mask(points_wp, normal_wp, origin_wp)
+
+    assert np.array_equal(mask_wp.numpy(), mask_ml)
+    assert 0 < int(mask_ml.sum()) < points_np.shape[0]  # both answers present, so not vacuous
+
+    # Opposite normals partition the points off the plane, which the strict test is what makes true.
+    opposite_wp = tw.half_space_mask(points_wp, wp.vec3(*(-plane_normal_np).tolist()), origin_wp)
+    assert not np.any(mask_wp.numpy() & opposite_wp.numpy())
+    assert np.all(mask_wp.numpy() | opposite_wp.numpy())
+
+    # A point exactly on the plane is in neither half, for both libraries and both normals.
+    on_plane_np = np.ascontiguousarray(plane_origin_np[None, :], dtype=np.float32)
+    on_plane_wp = wp.array(on_plane_np, dtype=wp.vec3, device=device)
+    assert not bool(tw.half_space_mask(on_plane_wp, normal_wp, origin_wp).numpy()[0])
+    assert not bool(
+        tw.half_space_mask(on_plane_wp, wp.vec3(*(-plane_normal_np).tolist()), origin_wp).numpy()[0]
+    )
+    assert not bool(
+        meshlib_bitset_to_numpy(
+            mm.findHalfSpacePoints(points_to_meshlib(on_plane_np), plane_ml), 1
+        )[0]
+    )
+
+
+def test_half_space_mask_defaults_to_the_origin(device: str) -> None:
+    """
+    Not a library comparison: the ``plane_origin=None`` default and the empty input.
+
+    ``None`` means the world origin, matching
+    [`point_plane_distance`][triwarp.points.point_plane_distance], so the mask is then the sign of
+    ``dot(n, p)`` alone.
+    """
+    points_np = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0], [0.0, 0.0, 0.0]], dtype=np.float32)
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    assert np.array_equal(
+        tw.half_space_mask(points_wp, wp.vec3(0.0, 0.0, 1.0)).numpy(),
+        np.array([True, False, False]),
+    )
+
+    empty_wp = tw.half_space_mask(wp.empty(0, dtype=wp.vec3, device=device), wp.vec3(1.0, 0.0, 0.0))
+    assert empty_wp.shape == (0,)
+    assert empty_wp.dtype == wp.bool
+
+
 def test_centroid(device: str) -> None:
     rng = np.random.default_rng(14)
     points_np = rng.standard_normal((128, 3)).astype(np.float32)

@@ -127,6 +127,12 @@ _GRID_BINS = [32, 256]
 # two points are roughly 8x apart in work.
 _RADIUS_SCALES = [2.0, 4.0]
 
+# Query boxes for ``query_bvh_box``, far fewer than ``_N_QUERIES``. open3d's
+# ``AxisAlignedBoundingBox`` carries no index and no batch form, so its row is one Python call and
+# one full linear scan *per box*: at 20 000 boxes over bunny that is 7e8 point tests a round. 256
+# keeps the reference inside a second while still being a realistic "many query regions" shape.
+_N_BOXES = 256
+
 _queries_np_cache: dict[str, np.ndarray] = {}
 _queries_wp_cache: dict[tuple[str, str], wp.array] = {}
 _bvh_cache: dict[tuple[str, str], wp.Bvh] = {}
@@ -449,6 +455,62 @@ def test_query_bvh_ball(bench_case: BenchCase, radius_scale: float) -> None:
         tree, queries_np = _kdtree(bench_case), _queries_np(bench_case)
         found = bench_case.run(lambda: tree.query_ball_point(queries_np, radius))
         assert len(found) == queries_np.shape[0]
+
+
+@pytest.mark.benchmark(group="query_bvh_box")
+@pytest.mark.benchlibs("triwarp", "open3d")
+def test_query_bvh_box(bench_case: BenchCase) -> None:
+    """
+    Per-query axis-aligned box over a prebuilt BVH -- an indexed batch against an unindexed scan.
+
+    The box analogue of ``query_bvh_ball``, and unlike that group the reference is not another tree:
+    open3d's ``AxisAlignedBoundingBox.get_point_indices_within_bounding_box`` walks every point, so
+    the row prices *index versus no index* as much as it prices the traversal, and the loop over
+    ``_N_BOXES`` is on open3d's side of the line. That is the honest comparison available -- neither
+    ``o3d.core.nns`` nor scipy's ``KDTree`` has a box query at all -- and it is why the box count is
+    256 rather than the module's usual 20 000.
+
+    The boxes are asymmetric about their centres (``-2`` to ``+3`` mean edges), so a caller cannot
+    read this as the cube query with a different name: the corners are per query and the two sides
+    of each axis differ.
+
+    First measurement, medians on an RTX 5090 at 256 boxes: triwarp-cuda **1.51 ms** against
+    open3d's **23.3 ms** on ``bunny`` (15.4x) and **1.51** against **7.87** on ``bunny_decimated``
+    (5.2x). The two triwarp numbers being identical while open3d's move with the point count is the
+    whole content of the row -- the BVH descent does not see the cloud size at this box count, and
+    the scan does.
+    """
+    skip_larger_than(bench_case, "bunny", "the open3d row is O(boxes x points) with no index")
+    centers_np = _queries_np(bench_case)[:_N_BOXES]
+    edge = bench_case.mean_edge
+    lower_np = np.ascontiguousarray(centers_np - 2.0 * edge)
+    upper_np = np.ascontiguousarray(centers_np + 3.0 * edge)
+
+    if bench_case.kind == "open3d":
+        import open3d as o3d
+
+        cloud_points = _pcd_o3d(bench_case).points
+        boxes_o3d = [
+            o3d.geometry.AxisAlignedBoundingBox(lower_np[i], upper_np[i])
+            for i in range(centers_np.shape[0])
+        ]
+
+        def box_query_o3d() -> int:
+            return sum(
+                len(box.get_point_indices_within_bounding_box(cloud_points)) for box in boxes_o3d
+            )
+
+        assert bench_case.run(box_query_o3d) >= 0
+        return
+
+    bvh = _bvh(bench_case)
+    lower_wp = wp.array(lower_np.astype(np.float32), dtype=wp.vec3, device=bench_case.device)
+    upper_wp = wp.array(upper_np.astype(np.float32), dtype=wp.vec3, device=bench_case.device)
+    indices, offsets = bench_case.run(
+        lambda: tw.neighbors.query_bvh_box(bvh, lower_wp, upper_wp, include_total=True)
+    )
+    assert offsets.shape == (centers_np.shape[0] + 1,)
+    assert indices.shape[0] >= 0
 
 
 @pytest.mark.benchmark(group="query_hashgrid_ball")

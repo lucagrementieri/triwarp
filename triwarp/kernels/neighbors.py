@@ -52,16 +52,22 @@ ACCEL_BVH = wp.constant(wp.int32(1))
 
 
 @wp.func
-def aabb_count_in_box(bvh_id: wp.uint64, q: wp.vec3, half_extent: wp.float32) -> wp.int32:
-    # Broad-phase hits of the cube around ``q``, with no narrow phase: every hit counts.
-    lower = q - wp.vec3(half_extent)  # wp.vec3(scalar) broadcasts the scalar to every component
-    upper = q + wp.vec3(half_extent)
+def aabb_count_in_bounds(bvh_id: wp.uint64, lower: wp.vec3, upper: wp.vec3) -> wp.int32:
+    # Broad-phase hits of the box, with no narrow phase: every hit counts. The traversal is shared
+    # by the uniform-cube form below and the per-query-corner one further down -- the two differ
+    # only in where the corners come from, so only the box construction is duplicated.
     query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
     j = wp.int32(0)
     c = wp.int32(0)
     while wp.bvh_query_next(query, j):
         c = c + 1
     return c
+
+
+@wp.func
+def aabb_count_in_box(bvh_id: wp.uint64, q: wp.vec3, half_extent: wp.float32) -> wp.int32:
+    # wp.vec3(scalar) broadcasts the scalar to every component.
+    return aabb_count_in_bounds(bvh_id, q - wp.vec3(half_extent), q + wp.vec3(half_extent))
 
 
 @wp.kernel
@@ -76,6 +82,25 @@ def query_bvh_aabb_count(
 
 
 @wp.func
+def aabb_collect_in_bounds(
+    bvh_id: wp.uint64,
+    lower: wp.vec3,
+    upper: wp.vec3,
+    base: wp.int32,
+    out_indices: wp.array[wp.int32],
+) -> None:
+    # Emit the same hits ``aabb_count_in_bounds`` counted, contiguously from ``base``. Counting and
+    # emitting are separate passes rather than one ``write``-flagged function: the counting pass
+    # then needs no output array at all, and the emit loop carries no per-candidate branch.
+    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
+    j = wp.int32(0)
+    c = wp.int32(0)
+    while wp.bvh_query_next(query, j):
+        out_indices[base + c] = j
+        c = c + 1
+
+
+@wp.func
 def aabb_collect(
     bvh_id: wp.uint64,
     q: wp.vec3,
@@ -83,17 +108,9 @@ def aabb_collect(
     base: wp.int32,
     out_indices: wp.array[wp.int32],
 ) -> None:
-    # Emit the same hits ``aabb_count_in_box`` counted, contiguously from ``base``. Counting and
-    # emitting are separate passes rather than one ``write``-flagged function: the counting pass
-    # then needs no output array at all, and the emit loop carries no per-candidate branch.
-    lower = q - wp.vec3(half_extent)
-    upper = q + wp.vec3(half_extent)
-    query = wp.bvh_query_aabb(bvh_id, lower, upper, root=-1)
-    j = wp.int32(0)
-    c = wp.int32(0)
-    while wp.bvh_query_next(query, j):
-        out_indices[base + c] = j
-        c = c + 1
+    aabb_collect_in_bounds(
+        bvh_id, q - wp.vec3(half_extent), q + wp.vec3(half_extent), base, out_indices
+    )
 
 
 @wp.kernel
@@ -106,6 +123,32 @@ def query_bvh_aabb_neighbors(
 ) -> None:
     tid = wp.tid()
     aabb_collect(bvh_id, queries[tid], half_extent, offsets[tid], out_indices)
+
+
+# The per-query-box pair. Same traversal as the two kernels above, and the only difference is that
+# the corners are read per query instead of derived from one warp-uniform half extent -- so a caller
+# with a single cube size keeps the cheaper pair and pays for no corner buffers.
+@wp.kernel
+def query_bvh_box_count(
+    query_lower: wp.array[wp.vec3],
+    query_upper: wp.array[wp.vec3],
+    bvh_id: wp.uint64,
+    out_counts: wp.array[wp.int32],
+) -> None:
+    tid = wp.tid()
+    out_counts[tid] = aabb_count_in_bounds(bvh_id, query_lower[tid], query_upper[tid])
+
+
+@wp.kernel
+def query_bvh_box_neighbors(
+    query_lower: wp.array[wp.vec3],
+    query_upper: wp.array[wp.vec3],
+    bvh_id: wp.uint64,
+    offsets: wp.array[wp.int32],
+    out_indices: wp.array[wp.int32],
+) -> None:
+    tid = wp.tid()
+    aabb_collect_in_bounds(bvh_id, query_lower[tid], query_upper[tid], offsets[tid], out_indices)
 
 
 @wp.func
