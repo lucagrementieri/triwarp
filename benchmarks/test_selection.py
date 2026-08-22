@@ -429,3 +429,81 @@ def test_region_boundary_edges(bench_case: BenchCase) -> None:
         lambda: tw.selection.region_boundary_edges(faces, region_wp, n_vertices=n_vertices)
     )
     assert int(edges.shape[0]) > 0
+
+
+@pytest.mark.benchmark(group="faces_left_of_contour")
+@pytest.mark.benchmeshes("sphere_med")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_faces_left_of_contour(bench_case: BenchCase) -> None:
+    """
+    The reverse of the group above: a seam back into the region it bounds.
+
+    A flood fill on the dual graph blocked by the contour, so the cost is a face-adjacency pass plus
+    a connected-component labelling -- both independent of the contour's length, which is why the
+    contour is built once outside the timed callable on both sides.
+
+    meshlib's ``fillContourLeft`` is the reference and agrees with this **exactly**, mask for mask
+    and with the same convention for which side is "left"
+    (tests/test_selection.py::test_faces_left_of_contour_matches_meshlib). Its input is a vector of
+    directed ``EdgeId`` rather than an ``(k, 2)`` array; that vector is assembled outside the timed
+    callable too, since it is a Python loop over ``findEdge`` and would otherwise be the row.
+
+    First measurement, medians on an RTX 5090 at ``sphere_med`` (81 920 faces, a 320-edge contour):
+    **1.11 ms** against meshlib's **0.085**, so 13.1x behind. Two things about that number.
+
+    It is **not** a like-for-like: meshlib is handed a ``MeshTopology`` built outside its row and
+    floods from the seeds with a serial BFS, while triwarp builds the halfedge structure inside its
+    row and labels *every* component before gathering. Attributed at this size --
+    ``halfedge_twins`` 0.31 ms, the fused seed-and-block pass 0.33, and
+    ``connected_component_labels_from_edges`` **0.40**, which is 55 % of the call with ``twins``
+    supplied (0.73 ms). The labelling is the algorithm, and the way to beat it would be a
+    device-side frontier BFS, which this package has measured before as a 2.2x loss.
+
+    The first implementation was 1.49 ms and went through ``face_adjacency`` plus a separate key
+    sort over every halfedge plus a mask-compact over every dual edge. Folding the dual graph, the
+    blocking test and the seeding into one pass over ``twins`` was **1.34x** -- less than the 1.77x
+    the stage timings projected, which is the usual direction for a projection built by subtraction.
+    """
+    region_np = _seed_face_region(bench_case)
+    n_faces = bench_case.n_faces
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        contour_ml = mm.std_vector_Id_EdgeTag()
+        for start, end in _oriented_seam_np(bench_case, region_np).tolist():
+            contour_ml.append(mesh_ml.topology.findEdge(mm.VertId(int(start)), mm.VertId(int(end))))
+        assert len(contour_ml) > 0
+        bits_ml = bench_case.run(lambda: mm.fillContourLeft(mesh_ml.topology, contour_ml))
+        assert 0 < bits_ml.count() < n_faces
+        return
+    faces = bench_case.faces_wp
+    n_vertices = bench_case.n_vertices
+    contour = tw.selection.region_boundary_edges(
+        faces,
+        wp.array(region_np, dtype=wp.bool, device=bench_case.device),
+        n_vertices=n_vertices,
+        oriented=True,
+    )
+    left = bench_case.run(
+        lambda: tw.selection.faces_left_of_contour(faces, contour, n_vertices=n_vertices)
+    )
+    assert 0 < int(left.numpy().sum()) < n_faces
+
+
+def _oriented_seam_np(bench_case: BenchCase, region_np: np.ndarray) -> np.ndarray:
+    """The region's oriented seam as host rows, for a reference that wants vertex pairs."""
+    faces = _faces_for_reference(bench_case)
+    return tw.selection.region_boundary_edges(
+        faces,
+        wp.array(region_np, dtype=wp.bool, device=faces.device),
+        n_vertices=bench_case.n_vertices,
+        oriented=True,
+    ).numpy()
+
+
+def _faces_for_reference(bench_case: BenchCase) -> wp.array:
+    """A host face buffer: a reference case has no device, so ``faces_wp`` is unavailable."""
+    return wp.array(
+        np.ascontiguousarray(bench_case.faces_np.ravel(), dtype=np.int32),
+        dtype=wp.int32,
+        device="cpu",
+    )

@@ -1,6 +1,7 @@
 import warp as wp
 
-from triwarp.kernels.array import binary_search_index
+from triwarp.kernels.array import binary_search_index, binary_search_sorted_contains
+from triwarp.kernels.halfedge import halfedge_destination
 
 
 @wp.kernel
@@ -73,6 +74,30 @@ def dilate_vertex_mask(
 
 
 @wp.kernel
+def mark_region_halfedges(
+    inverse: wp.array[wp.int32],
+    face_mask: wp.array[wp.bool],
+    out_region_halfedge: wp.array[wp.int32],
+) -> None:
+    # One halfedge per unique edge that belongs to a *region* face. A seam edge has exactly one such
+    # face by definition, so no race decides anything there; edges with two or none are not seam
+    # edges and whatever lands is discarded.
+    h = wp.int32(wp.tid())
+    if face_mask[h // 3]:
+        out_region_halfedge[inverse[h]] = h
+
+
+@wp.kernel
+def oriented_edges_from_halfedges(
+    faces: wp.array[wp.int32], halfedges: wp.array[wp.int32], out_edges: wp.array2d[wp.int32]
+) -> None:
+    # A halfedge read as a directed vertex pair, which puts its own face on the left.
+    i = wp.int32(wp.tid())
+    out_edges[i, 0] = faces[halfedges[i]]
+    out_edges[i, 1] = halfedge_destination(faces, halfedges[i])
+
+
+@wp.kernel
 def edge_region_counts(
     inverse: wp.array[wp.int32],
     face_mask: wp.array[wp.bool],
@@ -115,3 +140,51 @@ def keep_component_scatter(
     v = wp.int32(wp.tid())
     if not mask[v]:
         out_keep[labels[v]] = wp.int32(1)
+
+
+@wp.kernel
+def open_dual_edges_and_seeds(
+    faces: wp.array[wp.int32],
+    twins: wp.array[wp.int32],
+    contour_keys_sorted: wp.array[wp.uint64],
+    base: wp.uint64,
+    cursor: wp.array[wp.int32],
+    out_dual_edges: wp.array2d[wp.int32],
+    out_seeds: wp.array[wp.bool],
+) -> None:
+    # One pass over halfedges answers both halves of the fill at once. A halfedge running *along*
+    # the contour in its own direction puts its face on the left, since a face's corners run
+    # counter-clockwise -- so the contour's orientation is the only thing deciding which side is
+    # "left". And an edge on the contour in *either* direction is blocked, so it emits no dual edge.
+    #
+    # Doing it this way rather than through `face_adjacency` is deliberate: the dual graph, the
+    # blocking test and the seeding all come from `twins`, which is one hash-and-group pass instead
+    # of that plus a second key sort over every halfedge and a mask-compact over every dual edge.
+    h = wp.int32(wp.tid())
+    tail = faces[h]
+    tip = halfedge_destination(faces, h)
+    forward = wp.uint64(wp.uint32(tail)) + wp.uint64(wp.uint32(tip)) * base
+    along_contour = binary_search_sorted_contains(contour_keys_sorted, forward)
+    if along_contour:
+        out_seeds[h // 3] = True
+
+    twin = twins[h]
+    if twin <= h:
+        return  # boundary halfedge, or the far half of an edge the lower half already emitted
+    backward = wp.uint64(wp.uint32(tip)) + wp.uint64(wp.uint32(tail)) * base
+    if along_contour or binary_search_sorted_contains(contour_keys_sorted, backward):
+        return
+    slot = wp.atomic_add(cursor, 0, 1)
+    out_dual_edges[slot, 0] = h // 3
+    out_dual_edges[slot, 1] = twin // 3
+
+
+@wp.kernel
+def mark_labels_of_seeds(
+    labels: wp.array[wp.int32], seeds: wp.array[wp.bool], out_label_seeded: wp.array[wp.bool]
+) -> None:
+    # One flag per component label, so the per-face answer becomes a gather. Labels name a
+    # representative element, so the flag array is face-indexed rather than 0..k-1.
+    f = wp.int32(wp.tid())
+    if seeds[f]:
+        out_label_seeded[labels[f]] = True

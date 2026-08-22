@@ -33,6 +33,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import grouping as kernel_grouping
 from triwarp.kernels import seams as kernel_seams
 
 # Whether the seam predicate compares coordinates rather than texcoord indices. A lookup rather than
@@ -195,7 +196,7 @@ def cut_along_edges(
     if n_edges > 0:
         keys = wp.empty(n_edges, dtype=wp.uint64, device=device)
         wp.launch(
-            kernel_seams.pack_undirected_edge_keys,
+            kernel_grouping.pack_undirected_edge_keys,
             dim=n_edges,
             inputs=[edges, wp.uint64(n_vertices), keys],
             device=device,

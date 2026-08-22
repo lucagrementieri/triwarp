@@ -11,6 +11,7 @@ from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+import triwarp.typing as twt
 from tests.comparisons import undirected_edges
 from tests.conversions import (
     meshlib_bitset_to_numpy,
@@ -793,6 +794,149 @@ def test_region_boundary_edges_matches_pyvista(device: str) -> None:
         assert len(edges_pv) > 0, name
         assert (edges_pv & rim != set()) is touches_rim, name  # the transform is exercised once
         assert edges_pv - rim == edges_wp, name
+
+
+def _meshlib_contour(topology_ml: mm.MeshTopology, contour_np: np.ndarray) -> object:
+    """Directed vertex pairs as MeshLib's ``EdgeId`` vector, as ``fillContourLeft`` takes it."""
+    contour_ml = mm.std_vector_Id_EdgeTag()
+    for start, end in contour_np.tolist():
+        contour_ml.append(topology_ml.findEdge(mm.VertId(int(start)), mm.VertId(int(end))))
+    return contour_ml
+
+
+@pytest.mark.parity("faces_left_of_contour", "meshlib")
+@pytest.mark.parametrize("mesh_name", ["icosphere_coarse", "torus", "unit_box"])
+def test_faces_left_of_contour_matches_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A: identical masks, and identical *left* conventions, with no transform at all.
+
+    ``fillContourLeft`` takes a vector of directed ``EdgeId`` and returns the ``FaceBitSet`` on the
+    left of that walk. The convention agreement is the part worth pinning: a winding disagreement
+    would show up as the exact complement, which is why the reversed contour is checked in the same
+    test -- MeshLib's answer for the reversed rows is triwarp's complement, not its own answer, so
+    the two libraries agree about which side "left" is rather than merely partitioning the mesh the
+    same way.
+
+    Also asserted: the two sides are disjoint and cover the mesh. A contour built by
+    [`region_boundary_edges`][triwarp.selection.region_boundary_edges] with ``oriented=True``
+    separates by construction, so anything else would be a fill leaking across the cut.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_wp = mesh_wp.indices
+    device = faces_wp.device
+    n_faces = int(faces_wp.shape[0]) // 3
+
+    centroids_np = tw.triangles.face_centroids(mesh_wp.points, faces_wp).numpy()
+    region_np = centroids_np[:, 2] > centroids_np[:, 2].mean()
+    assert 0 < int(region_np.sum()) < n_faces  # non-vacuity: both sides have faces
+    region_wp = wp.array(region_np, dtype=wp.bool, device=device)
+    contour_wp = tw.selection.region_boundary_edges(faces_wp, region_wp, oriented=True)
+    assert int(contour_wp.shape[0]) > 0  # and the seam between them is not empty
+
+    topology_ml = trimesh_to_meshlib(mesh_tm).topology
+    contour_np = contour_wp.numpy()
+    left_ml = meshlib_bitset_to_numpy(
+        mm.fillContourLeft(topology_ml, _meshlib_contour(topology_ml, contour_np)), n_faces
+    )
+    left_wp = tw.selection.faces_left_of_contour(faces_wp, contour_wp)
+    assert np.array_equal(left_wp.numpy(), left_ml)
+
+    reversed_wp = twt.as_array2d(
+        wp.array(np.ascontiguousarray(contour_np[:, ::-1]), dtype=wp.int32, device=device), wp.int32
+    )
+    right_ml = meshlib_bitset_to_numpy(
+        mm.fillContourLeft(topology_ml, _meshlib_contour(topology_ml, contour_np[:, ::-1])), n_faces
+    )
+    right_wp = tw.selection.faces_left_of_contour(faces_wp, reversed_wp)
+    assert np.array_equal(right_wp.numpy(), right_ml)
+    assert np.array_equal(right_ml, ~left_ml)
+    assert not np.any(left_wp.numpy() & right_wp.numpy())
+    assert np.all(left_wp.numpy() | right_wp.numpy())
+
+
+@pytest.mark.parametrize("mesh_name", ["icosphere_coarse", "unit_box", "hemisphere"])
+def test_region_boundary_edges_oriented_round_trips_through_the_fill(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Not a library comparison: this pins two triwarp entry points to each other as an inverse pair.
+
+    ``region_boundary_edges(oriented=True)`` and ``faces_left_of_contour`` are dual, so the round
+    trip must be the identity on the mask -- **exactly**, not approximately, since both sides
+    are combinatorial. The oracle for the pair lives on the fill side
+    (``test_faces_left_of_contour_matches_meshlib``); this test exists because the *orientation* is
+    the part no reference pins, and because getting it wrong is invisible.
+
+    That last point is the reason for the second half. With the default unoriented rows, each row's
+    direction is whichever way makes it ascending, so seeds land on **both** sides and the fill
+    returns the whole mesh -- a plausible-looking answer that no assertion on the fill alone would
+    catch. It is asserted here so the documented ``oriented=`` requirement has a test behind it.
+    """
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    faces_wp = mesh_wp.indices
+    device = faces_wp.device
+    n_faces = int(faces_wp.shape[0]) // 3
+
+    centroids_np = tw.triangles.face_centroids(mesh_wp.points, faces_wp).numpy()
+    region_np = centroids_np[:, 2] > centroids_np[:, 2].mean()
+    region_wp = wp.array(region_np, dtype=wp.bool, device=device)
+
+    oriented_wp = tw.selection.region_boundary_edges(faces_wp, region_wp, oriented=True)
+    assert np.array_equal(
+        tw.selection.faces_left_of_contour(faces_wp, oriented_wp).numpy(), region_np
+    )
+    # The oriented rows are the same undirected set as the default ones, only directed.
+    unoriented_wp = tw.selection.region_boundary_edges(faces_wp, region_wp)
+    assert np.array_equal(
+        np.sort(oriented_wp.numpy(), axis=1), np.sort(unoriented_wp.numpy(), axis=1)
+    )
+    assert int(tw.selection.faces_left_of_contour(faces_wp, unoriented_wp).numpy().sum()) == n_faces
+
+
+def test_faces_left_of_contour_edge_cases(torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: the three degenerate contours, each with a different right answer.
+
+    An **empty** contour blocks nothing and seeds nothing, so the answer is all-``False`` rather
+    than all-``True`` -- the fill is seeded by the contour, and no contour means no seed. A contour
+    of rows that are **not mesh edges** is the same case reached differently. And a
+    **non-separating** contour -- a homology generator on a torus, which by definition does not
+    bound -- returns the *whole* mesh, because the flood fill genuinely reaches everywhere. That
+    is the honest answer, and the docstring says to check the count when a contour means to close.
+    """
+    _, mesh_wp = torus
+    faces_wp = mesh_wp.indices
+    device = faces_wp.device
+    n_faces = int(faces_wp.shape[0]) // 3
+
+    empty_wp = twt.empty_2d((0, 2), wp.int32, device=device)
+    assert not np.any(tw.selection.faces_left_of_contour(faces_wp, empty_wp).numpy())
+
+    absent_wp = twt.as_array2d(
+        wp.array(np.array([[0, 0], [1, 1]], dtype=np.int32), dtype=wp.int32, device=device),
+        wp.int32,
+    )
+    assert not np.any(tw.selection.faces_left_of_contour(faces_wp, absent_wp).numpy())
+
+    loops_wp = tw.homology.homology_generators(mesh_wp.points, faces_wp)
+    assert len(loops_wp) == 2  # non-vacuity: genus 1, so a non-bounding cycle exists
+    loop_np = loops_wp[0].numpy()
+    cycle_wp = twt.as_array2d(
+        wp.array(
+            np.stack([loop_np, np.roll(loop_np, -1)], axis=1).astype(np.int32),
+            dtype=wp.int32,
+            device=device,
+        ),
+        wp.int32,
+    )
+    assert int(tw.selection.faces_left_of_contour(faces_wp, cycle_wp).numpy().sum()) == n_faces
+
+    with pytest.raises(ValueError, match=r"shape \(k, 2\)"):
+        tw.selection.faces_left_of_contour(
+            faces_wp, twt.as_array2d(wp.zeros((2, 3), dtype=wp.int32, device=device), wp.int32)
+        )
 
 
 def test_exclude_fully_selected_components(device: str):

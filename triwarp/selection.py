@@ -10,17 +10,23 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.array import arange
+from triwarp.halfedge import halfedge_twins
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels import grouping as kernel_grouping
 from triwarp.kernels import selection as kernel_selection
 
 
 def region_boundary_edges(
-    faces: wp.array[wp.int32], face_mask: wp.array[wp.bool], n_vertices: int | None = None
+    faces: wp.array[wp.int32],
+    face_mask: wp.array[wp.bool],
+    n_vertices: int | None = None,
+    *,
+    oriented: bool = False,
 ) -> twt.Array2dInt32:
     """
     Interior edges on the boundary of a face region.
 
-    Returns the undirected edges that have exactly two incident faces, exactly one of which is in
+    Returns the edges that have exactly two incident faces, exactly one of which is in
     ``face_mask`` — i.e. the interior seam separating the region from the rest of the mesh (mesh
     boundary edges, with a single incident face, are excluded).
 
@@ -32,14 +38,22 @@ def region_boundary_edges(
         Length-``n_faces`` ``wp.bool`` region mask.
     n_vertices
         Optional vertex count; inferred from ``faces`` when ``None``.
+    oriented
+        Return each row as the **directed** pair belonging to its region face, instead of the
+        ascending pair. That puts the region on the left of the contour, which is the orientation
+        [`faces_left_of_contour`][triwarp.selection.faces_left_of_contour] reads — the two are
+        inverse and round-trip exactly. The default ascending form carries no orientation at all,
+        so feeding it to that function seeds *both* sides and returns the whole mesh.
 
     Returns
     -------
     twt.Array2dInt32
-        ``(k, 2)`` sorted vertex pairs on ``faces.device``.
+        ``(k, 2)`` vertex pairs on ``faces.device``, sorted ascending per row unless ``oriented``.
 
     See Also
     --------
+    [`faces_left_of_contour`][triwarp.selection.faces_left_of_contour]
+        The inverse: turns this seam back into the region it bounds, given ``oriented=True``.
     [`expand_vertex_mask`][triwarp.selection.expand_vertex_mask]
 
     Notes
@@ -67,7 +81,145 @@ def region_boundary_edges(
     flag = wp.empty(m, dtype=wp.bool, device=device)
     wp.map(kernel_selection.region_boundary_flag, count, region_count, out=flag)
     ids = tw.array.flatnonzero(flag)
-    return twt.as_array2d(tw.array.gather(unique_edges, ids), wp.int32)
+    if not oriented:
+        return twt.as_array2d(tw.array.gather(unique_edges, ids), wp.int32)
+
+    region_halfedge = wp.full(m, -1, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_selection.mark_region_halfedges,
+        dim=3 * n_faces,
+        inputs=[inverse, face_mask, region_halfedge],
+        device=device,
+    )
+    oriented_edges = twt.empty_2d((int(ids.shape[0]), 2), wp.int32, device=device)
+    wp.launch(
+        kernel_selection.oriented_edges_from_halfedges,
+        dim=int(ids.shape[0]),
+        inputs=[faces, tw.array.gather(region_halfedge, ids), oriented_edges],
+        device=device,
+    )
+    return twt.as_array2d(oriented_edges, wp.int32)
+
+
+def faces_left_of_contour(
+    faces: wp.array[wp.int32],
+    contour_edges: twt.Array2dInt32,
+    *,
+    n_vertices: int | None = None,
+    twins: wp.array[wp.int32] | None = None,
+) -> wp.array[wp.bool]:
+    """
+    Flood-fill the faces on the left of a directed contour of mesh edges.
+
+    The dual of [`region_boundary_edges`][triwarp.selection.region_boundary_edges]: that one turns a
+    face region into the seam around it, this one turns a seam back into a region. Which of the two
+    sides comes back is decided **only** by the contour's direction: the seeds are the faces that
+    own the halfedges ``a -> b``, and a face's corners run counter-clockwise, so reversing the rows
+    returns the complement. Nothing else about the contour matters, and a closed contour on a closed
+    mesh therefore partitions it exactly.
+
+    The fill is a connected-component labelling of the face-adjacency graph with the contour's dual
+    edges removed, so a contour that does *not* separate the mesh returns everything reachable --
+    which is the whole surface. That is the honest answer rather than a failure, but it means the
+    result is worth checking against the input's face count when the contour is meant to close.
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    contour_edges
+        ``(k, 2)`` ``wp.int32`` **directed** vertex pairs, each an edge of the mesh. Consecutive
+        rows need not be connected: the fill only cares about which edges are blocked and which
+        halfedges seed it, so several disjoint contours can be passed at once. A row that is not a
+        mesh edge blocks nothing and seeds nothing.
+    n_vertices
+        Total vertex count, used as the key radix. When ``None`` it is inferred with
+        [`n_vertices`][triwarp.vertices.n_vertices], which costs a host readback.
+    twins
+        Optional precomputed [`halfedge_twins`][triwarp.halfedge.halfedge_twins]. Building it is the
+        single largest cost here, so pass it when several contours are filled on one mesh.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Length-``n_faces`` mask, ``True`` for the faces on the left of the contour, on
+        ``faces.device``. All-``False`` only when no contour row is a mesh edge whose left face
+        exists.
+
+    Raises
+    ------
+    ValueError
+        If ``contour_edges`` is not a rank-2 ``wp.int32`` array with two columns.
+
+    Examples
+    --------
+    ```python
+    seam = tw.selection.region_boundary_edges(f, face_mask, oriented=True)
+    left = tw.selection.faces_left_of_contour(f, seam)
+    assert np.array_equal(left.numpy(), face_mask.numpy())
+    ```
+
+    See Also
+    --------
+    [`region_boundary_edges`][triwarp.selection.region_boundary_edges]
+        The dual: the seam around a region, which this turns back into a region.
+    [`cut_along_edges`][triwarp.seams.cut_along_edges]
+        Splits the mesh along the same kind of edge set instead of labelling its sides.
+    [`submesh_from_face_mask`][triwarp.selection.submesh_from_face_mask]
+        Turns the returned mask into a mesh.
+    """
+    twt.ensure_ndim(contour_edges, 2, dtype=wp.int32)
+    if int(contour_edges.shape[1]) != 2:
+        raise ValueError(f"contour_edges must have shape (k, 2), got {contour_edges.shape}")
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    left = wp.zeros(n_faces, dtype=wp.bool, device=device)
+    n_contour = int(contour_edges.shape[0])
+    if n_faces == 0 or n_contour == 0:
+        return left
+    if n_vertices is None:
+        n_vertices = tw.vertices.n_vertices(faces)
+    if twins is None:
+        twins = halfedge_twins(faces, n_vertices=n_vertices)
+    base = wp.uint64(n_vertices)
+
+    # Directed contour keys, sorted, and small: the kernel probes this once or twice per halfedge,
+    # so a `k`-entry binary search replaces sorting a key per halfedge to look 320 of them up.
+    contour_keys = wp.empty(n_contour, dtype=wp.uint64, device=device)
+    wp.launch(
+        kernel_grouping.pack_directed_index_keys,
+        dim=n_contour,
+        inputs=[contour_edges, base, contour_keys],
+        device=device,
+    )
+    contour_keys = tw.array.sort_and_argsort(contour_keys)[0]
+
+    seeds = wp.zeros(n_faces, dtype=wp.bool, device=device)
+    cursor = wp.zeros(1, dtype=wp.int32, device=device)
+    # An interior edge emits its dual edge once, from whichever half has the lower index, so this
+    # bound is exact rather than generous.
+    dual_edges = twt.empty_2d((3 * n_faces // 2 + 1, 2), wp.int32, device=device)
+    wp.launch(
+        kernel_selection.open_dual_edges_and_seeds,
+        dim=3 * n_faces,
+        inputs=[faces, twins, contour_keys, base, cursor, dual_edges, seeds],
+        device=device,
+    )
+    _n_open, (open_edges,) = tw.array.trim_to_count(cursor, dual_edges)
+
+    labels = tw.graph.connected_component_labels_from_edges(
+        twt.as_array2d(open_edges, wp.int32), node_count=n_faces, validate=False
+    )
+    label_seeded = wp.zeros(n_faces, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_selection.mark_labels_of_seeds,
+        dim=n_faces,
+        inputs=[labels, seeds, label_seeded],
+        device=device,
+    )
+    # A label names a representative face, so the per-face answer is a gather of the per-label flag.
+    wp.copy(left, label_seeded[labels])
+    return left
 
 
 def exclude_fully_selected_components(

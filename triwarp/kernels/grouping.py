@@ -245,6 +245,28 @@ def pack_edge_key(u: wp.int32, v: wp.int32, base: wp.uint64) -> wp.uint64:
 
 
 @wp.kernel
+def pack_directed_index_keys(
+    indices: wp.array2d[wp.int32], base: wp.uint64, out_keys: wp.array[wp.uint64]
+) -> None:
+    # ``pack_indices`` for exactly two columns, taking the radix directly instead of inferring it.
+    # Row order is preserved, so ``(a, b)`` and ``(b, a)`` get different keys -- which is the point
+    # wherever a directed edge has to be told from its twin.
+    i = wp.int32(wp.tid())
+    out_keys[i] = wp.uint64(wp.uint32(indices[i, 0])) + wp.uint64(wp.uint32(indices[i, 1])) * base
+
+
+@wp.kernel
+def pack_undirected_edge_keys(
+    edges: wp.array2d[wp.int32], base: wp.uint64, out_keys: wp.array[wp.uint64]
+) -> None:
+    # Deliberately not ``pack_indices``: that packs a row in the order it is given, and these keys
+    # are compared against ``pack_edge_key``, which sorts. A caller's reversed row would hash to
+    # something no halfedge can produce, so the edge would be silently missed.
+    i = wp.int32(wp.tid())
+    out_keys[i] = pack_edge_key(edges[i, 0], edges[i, 1], base)
+
+
+@wp.kernel
 def pack_indices(
     indices: wp.array2d[wp.int32], max_index: wp.uint64, out_packed: wp.array[wp.uint64]
 ) -> None:

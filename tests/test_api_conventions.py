@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import textwrap
 
+import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
@@ -415,9 +416,17 @@ def example_namespace(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> dict[str, obje
         [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 0.5, 0.0]], dtype=wp.vec3, device=device
     )
     neighbor_idx, neighbor_distance = tw.neighbors.query_bvh_nearest(vertices, vertices, 4)
+    # Thresholded against its own mean, not against zero: the fixture is translated to z + 2, so
+    # ``> 0.0`` selects every face and leaves a region with no seam around it.
+    centroids_np = tw.triangles.face_centroids(vertices, faces).numpy()
+    face_mask = wp.array(
+        centroids_np[:, 2] > centroids_np[:, 2].mean(), dtype=wp.bool, device=device
+    )
     return {
         "tw": tw,
         "wp": wp,
+        "np": np,
+        "face_mask": face_mask,
         "warp_mesh": mesh_wp,
         "v": vertices,
         "f": faces,
