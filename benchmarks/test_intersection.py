@@ -346,6 +346,64 @@ def _plane_field(bench_case: BenchCase) -> tuple[wp.array[wp.float32], np.ndarra
     )
 
 
+@pytest.mark.benchmark(group="split_faces_along_field")
+@pytest.mark.benchlibs("triwarp", "pyvista")
+def test_split_faces_along_field(bench_case: BenchCase) -> None:
+    """
+    The both-sides cut: same classify-and-compact sweep, but every face is kept and relabelled.
+
+    Read against ``clip_mesh_with_field`` below, on the identical field, because the extra work is
+    exactly what this group exists to price: four face classes instead of three, an ``edges_unique``
+    pass to give each crossed *edge* one shared crossing vertex (which is what makes the result
+    watertight where the clip's per-face crossings are not), and two emit kernels instead of two
+    that between them write three times as many triangles.
+
+    pyvista's counterpart is the same filter with ``both=True``, which returns a ``(below, above)``
+    tuple; it is the same VTK sweep as the clip's row plus the second half's output, and it is
+    capped at ``bunny`` for the same reason -- a single-threaded per-cell sweep.
+
+    First measurement, medians on an RTX 5090, with the uncapped ``clip_mesh_with_field`` row from
+    the same session:
+
+    | mesh | split | clip | split / clip | pyvista |
+    |---|---|---|---|---|
+    | ``bunny_decimated`` | **1.69 ms** | 0.80 | 2.1x | 6.68 (4.0x behind) |
+    | ``bunny`` | **1.57 ms** | 0.76 | 2.1x | 24.54 (15.7x behind) |
+    | ``dragon`` | **3.86 ms** | 1.27 | 3.0x | (capped) |
+    | ``happy_buddha`` | **4.04 ms** | 1.14 | 3.6x | (capped) |
+    | ``lucy`` | **80.71 ms** | 6.85 | **11.8x** | (capped) |
+
+    The 2-3x over the clip is understood and is the price of keeping both sides: the clip's work
+    scales with the *cut* (a plane meets ``O(sqrt(n_faces))`` triangles) while the split adds an
+    ``edges_unique`` pass over the whole mesh to give each crossed edge one shared crossing vertex.
+    Measured on icospheres at 82k / 328k / 1.31M faces, that pass is 0.86 / 1.50 / 2.69 ms -- 49 to
+    60 % of the split -- and the ratio runs 2.39 / 2.37 / 3.56.
+
+    **``lucy``'s 11.8x is not explained by that** and is left as a finding rather than a guess: the
+    synthetic sweep says ~3.6x at four times ``lucy``'s scale, so size is not the answer and the
+    cause is something about that mesh. Restricting the edge pass to the crossed faces is the
+    obvious fix for the general 2-3x either way, since the pairing only needs the halfedges the
+    level set actually meets.
+    """
+    if bench_case.kind == "pyvista":
+        skip_larger_than(bench_case, "bunny", "VTK's clip is a single-threaded per-cell sweep")
+        mesh_pv = bench_case.mesh_pv
+        mesh_pv.point_data["field"] = _plane_field(bench_case)[1]
+        below_pv, above_pv = bench_case.run(
+            lambda: mesh_pv.clip_scalar(scalars="field", value=0.0, both=True)
+        )
+        assert below_pv.n_faces > 0
+        assert above_pv.n_faces > 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    field_wp = _plane_field(bench_case)[0]
+    _new_vertices, new_faces, positive = bench_case.run(
+        lambda: tw.intersection.split_faces_along_field(vertices, faces, field_wp)
+    )
+    assert int(new_faces.shape[0]) % 3 == 0
+    assert 0 < int(positive.numpy().sum()) < int(new_faces.shape[0]) // 3
+
+
 @pytest.mark.benchmark(group="clip_mesh_with_field")
 @pytest.mark.benchlibs("triwarp", "pyvista")
 @pytest.mark.parametrize("cap", [False, True])

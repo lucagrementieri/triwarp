@@ -673,30 +673,40 @@ def resolve_on_plane_faces(
 
 @wp.kernel
 def slice_class_flags(
-    classes: wp.array[wp.int32], n_faces: wp.int32, out_flags: wp.array[wp.int32]
+    classes: wp.array[wp.int32],
+    n_faces: wp.int32,
+    n_classes: wp.int32,
+    out_flags: wp.array[wp.int32],
 ) -> None:
     # Selection flags for all three kept classes at once, as three ``n_faces``-long blocks of one
     # buffer. Scanning that buffer once compacts the three classes into one index array with the
     # blocks contiguous, so the whole partition costs one scan and one host readback rather than
     # three of each. Every thread writes all three of its slots, which is what keeps the buffer
-    # from needing a memset first.
+    # from needing a memset first. ``n_classes`` is an argument rather than a module constant so
+    # that the both-sides split, which keeps four classes where the clip keeps three, shares it.
     f = wp.tid()
     face_class = classes[f]
-    for block in range(SLICE_CLASSES):
-        flag = 0
+    for block in range(n_classes):
+        # ``wp.int32(0)``, not ``0``: the loop bound is now an argument rather than a module
+        # constant, so the loop is dynamic and a bare literal is a constant Warp refuses to
+        # mutate inside one.
+        flag = wp.int32(0)
         if face_class == block + 1:
-            flag = 1
+            flag = wp.int32(1)
         out_flags[block * n_faces + f] = flag
 
 
 @wp.kernel
 def slice_class_counts(
-    inclusive: wp.array[wp.int32], n_faces: wp.int32, out_counts: wp.array[wp.int32]
+    inclusive: wp.array[wp.int32],
+    n_faces: wp.int32,
+    n_classes: wp.int32,
+    out_counts: wp.array[wp.int32],
 ) -> None:
     # Per-class counts from the block ends of the inclusive scan: block ``b``'s own count is its
-    # running total minus the previous block's. One launch so the host reads 12 bytes once.
-    previous = 0
-    for block in range(SLICE_CLASSES):
+    # running total minus the previous block's. One launch so the host reads a few bytes once.
+    previous = wp.int32(0)  # dynamic loop below: a bare literal would be a constant (see above)
+    for block in range(n_classes):
         total = inclusive[(block + 1) * n_faces - 1]
         out_counts[block] = total - previous
         previous = total
@@ -824,6 +834,175 @@ def emit_tri_cut(
     out_new_faces[tid, 0] = v_inside
     out_new_faces[tid, 1] = new_i0
     out_new_faces[tid, 2] = new_i1
+
+
+# Face classes for the both-sides split. Numbered from 1 contiguously because
+# ``slice_class_flags`` maps class ``c`` to block ``c - 1``; class 0 is "not selected", which this
+# taxonomy never needs since a split keeps every face.
+SPLIT_CLASS_POSITIVE = wp.constant(wp.int32(1))
+SPLIT_CLASS_NEGATIVE = wp.constant(wp.int32(2))
+SPLIT_CLASS_CUT_EDGES = wp.constant(wp.int32(3))
+SPLIT_CLASS_CUT_CORNER = wp.constant(wp.int32(4))
+SPLIT_CLASSES = 4
+
+
+@wp.kernel
+def classify_faces_for_split(
+    faces: wp.array[wp.int32],
+    vertex_dots: wp.array[wp.float32],
+    out_classes: wp.array[wp.int32],
+    out_signs: wp.array2d[wp.int32],
+) -> None:
+    # Four classes rather than the clip's three, because a split keeps both sides and so has to
+    # tell the two *uncut* sides apart -- and because a face with one corner exactly on the level
+    # set splits into two triangles, not three. Signs follow ``classify_faces_for_slice``:
+    # ``SLICE_SIGN_INSIDE`` (-1) is the ``>= isovalue`` side, so a zero value counts as positive.
+    f = wp.tid()
+    i0, i1, i2 = kernel_triangles.corner_triple(faces, f)
+    s0 = -kernel_array.tolerance_sign(vertex_dots[i0])
+    s1 = -kernel_array.tolerance_sign(vertex_dots[i1])
+    s2 = -kernel_array.tolerance_sign(vertex_dots[i2])
+    out_signs[f, 0] = s0
+    out_signs[f, 1] = s1
+    out_signs[f, 2] = s2
+
+    signs_sum = s0 + s1 + s2
+    signs_asum = wp.abs(s0) + wp.abs(s1) + wp.abs(s2)
+    if signs_sum == -signs_asum:
+        # Every corner on the positive side, or all three exactly on the level set -- which counts
+        # as positive, so the face is kept whole rather than cut along itself.
+        out_classes[f] = SPLIT_CLASS_POSITIVE
+    elif signs_sum == signs_asum:
+        out_classes[f] = SPLIT_CLASS_NEGATIVE
+    elif signs_asum == wp.int32(3):
+        out_classes[f] = SPLIT_CLASS_CUT_EDGES
+    else:
+        # One corner exactly on the level set and the other two on opposite sides: a single edge
+        # crossing, joined to that corner.
+        out_classes[f] = SPLIT_CLASS_CUT_CORNER
+
+
+@wp.func
+def split_lone_corner(s0: wp.int32, s1: wp.int32, s2: wp.int32) -> wp.int32:
+    # The corner alone in sign, which is the apex of the one-triangle side of an edge-to-edge cut.
+    if s1 == s2:
+        return wp.int32(0)
+    if s0 == s2:
+        return wp.int32(1)
+    return wp.int32(2)
+
+
+@wp.kernel
+def level_set_edge_vertices(
+    vertices: wp.array[wp.vec3],
+    unique_edges: wp.array2d[wp.int32],
+    crossed_edge_indices: wp.array[wp.int32],
+    vertex_dots: wp.array[wp.float32],
+    out_points: wp.array[wp.vec3],
+) -> None:
+    # One crossing point per crossed *edge*, not per crossed face-corner. That is what makes the
+    # split watertight: both faces sharing the edge address the same new vertex, where a per-face
+    # crossing would leave two coincident copies and a seam of loose edges (which is exactly why
+    # ``clip_mesh_with_field(cap=True)`` has to weld before it can fill).
+    i = wp.int32(wp.tid())
+    e = crossed_edge_indices[i]
+    out_points[i] = canonical_edge_crossing(
+        vertices, vertex_dots, unique_edges[e, 0], unique_edges[e, 1]
+    )
+
+
+@wp.func
+def split_edge_vertex(
+    halfedge_edges: wp.array[wp.int32],
+    edge_vertex_rank: wp.array[wp.int32],
+    vertex_base: wp.int32,
+    halfedge: wp.int32,
+) -> wp.int32:
+    # The new vertex index sitting on a face's edge ``k``, which is halfedge ``3 * f + k``.
+    return vertex_base + edge_vertex_rank[halfedge_edges[halfedge]]
+
+
+@wp.kernel
+def emit_split_cut_edges(
+    faces: wp.array[wp.int32],
+    face_indices: wp.array[wp.int32],
+    face_signs: wp.array2d[wp.int32],
+    halfedge_edges: wp.array[wp.int32],
+    edge_vertex_rank: wp.array[wp.int32],
+    vertex_base: wp.int32,
+    out_new_faces: wp.array2d[wp.int32],
+    out_positive: wp.array[wp.bool],
+) -> None:
+    # The generic cut: the level set enters through one edge and leaves through another, so the face
+    # becomes a corner triangle plus a quad -- three triangles sharing the two crossing vertices.
+    # Windings match ``emit_tri_cut`` and ``emit_quad_cut``, which emit these same triangles one
+    # side at a time; the difference is that both sides are kept here.
+    tid = wp.int32(wp.tid())
+    face_index = face_indices[tid]
+    base = face_index * wp.int32(3)
+    s0, s1, s2 = kernel_triangles.row_triple(face_signs, face_index)
+    lone = split_lone_corner(s0, s1, s2)
+    next_corner = (lone + wp.int32(1)) % wp.int32(3)
+    last_corner = (lone + wp.int32(2)) % wp.int32(3)
+    # ``p0`` on the edge leaving the lone corner, ``p1`` on the edge arriving at it.
+    p0 = split_edge_vertex(halfedge_edges, edge_vertex_rank, vertex_base, base + lone)
+    p1 = split_edge_vertex(halfedge_edges, edge_vertex_rank, vertex_base, base + last_corner)
+    v_next = faces[base + next_corner]
+    v_last = faces[base + last_corner]
+
+    row = wp.int32(3) * tid
+    out_new_faces[row, 0] = faces[base + lone]
+    out_new_faces[row, 1] = p0
+    out_new_faces[row, 2] = p1
+    out_new_faces[row + wp.int32(1), 0] = v_next
+    out_new_faces[row + wp.int32(1), 1] = v_last
+    out_new_faces[row + wp.int32(1), 2] = p1
+    out_new_faces[row + wp.int32(2), 0] = p1
+    out_new_faces[row + wp.int32(2), 1] = p0
+    out_new_faces[row + wp.int32(2), 2] = v_next
+
+    lone_is_positive = face_signs[face_index, lone] == SLICE_SIGN_INSIDE
+    out_positive[row] = lone_is_positive
+    out_positive[row + wp.int32(1)] = not lone_is_positive
+    out_positive[row + wp.int32(2)] = not lone_is_positive
+
+
+@wp.kernel
+def emit_split_cut_corner(
+    faces: wp.array[wp.int32],
+    face_indices: wp.array[wp.int32],
+    face_signs: wp.array2d[wp.int32],
+    halfedge_edges: wp.array[wp.int32],
+    edge_vertex_rank: wp.array[wp.int32],
+    vertex_base: wp.int32,
+    out_new_faces: wp.array2d[wp.int32],
+    out_positive: wp.array[wp.bool],
+) -> None:
+    # One corner sits exactly on the level set, so the cut runs from it to the single crossing on
+    # the opposite edge: two triangles, no quad. Emitting three the other kernel's way would put a
+    # zero-area sliver in the output, which is the only reason this class exists separately.
+    tid = wp.int32(wp.tid())
+    face_index = face_indices[tid]
+    base = face_index * wp.int32(3)
+    _s0, s1, s2 = kernel_triangles.row_triple(face_signs, face_index)
+    on_level = wp.int32(0)  # corner 0 by elimination: exactly one of the three is zero here
+    if s1 == wp.int32(0):
+        on_level = wp.int32(1)
+    elif s2 == wp.int32(0):
+        on_level = wp.int32(2)
+    next_corner = (on_level + wp.int32(1)) % wp.int32(3)
+    last_corner = (on_level + wp.int32(2)) % wp.int32(3)
+    crossing = split_edge_vertex(halfedge_edges, edge_vertex_rank, vertex_base, base + next_corner)
+
+    row = wp.int32(2) * tid
+    out_new_faces[row, 0] = faces[base + on_level]
+    out_new_faces[row, 1] = faces[base + next_corner]
+    out_new_faces[row, 2] = crossing
+    out_new_faces[row + wp.int32(1), 0] = faces[base + on_level]
+    out_new_faces[row + wp.int32(1), 1] = crossing
+    out_new_faces[row + wp.int32(1), 2] = faces[base + last_corner]
+    out_positive[row] = face_signs[face_index, next_corner] == SLICE_SIGN_INSIDE
+    out_positive[row + wp.int32(1)] = face_signs[face_index, last_corner] == SLICE_SIGN_INSIDE
 
 
 @wp.kernel
@@ -1010,3 +1189,9 @@ def _register_overloads() -> None:
 
 
 _register_overloads()
+
+
+@wp.func
+def is_positive_split_class(face_class: wp.int32) -> wp.bool:
+    """Side label for an *uncut* face, so the no-crossing path needs no second classifier."""
+    return face_class == SPLIT_CLASS_POSITIVE

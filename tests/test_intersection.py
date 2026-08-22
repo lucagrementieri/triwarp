@@ -23,6 +23,7 @@ from tests.conversions import (
     trimesh_to_meshlib,
     trimesh_to_pyvista,
     trimesh_to_warp,
+    warp_to_trimesh,
 )
 from triwarp.constants import TOLERANCE_MERGE
 
@@ -922,6 +923,197 @@ def _intersection_curves_match(
     ref_distances_np = KDTree(got_pts_np).query(ref_pts_np, distance_upper_bound=ref_atol)[0]
     got_distances_np = KDTree(ref_pts_np).query(got_pts_np, distance_upper_bound=got_atol)[0]
     return bool(np.all(np.isfinite(ref_distances_np)) and np.all(np.isfinite(got_distances_np)))
+
+
+_SPLIT_MESHES = ["icosphere", "unit_box", "torus"]
+
+
+def _off_vertex_isovalue(mesh_tm: tm.Trimesh) -> float:
+    """
+    Pick a height strictly between two vertex heights, so no corner lies *on* the level set.
+
+    A quantile of the data is often a data point, and an isovalue that coincides with a vertex is a
+    different case with a different answer: triwarp splits such a face into two triangles where VTK
+    emits three, so the parity row would fail on a convention rather than on a defect.
+
+    The midpoint of the **largest gap** rather than of an arbitrary neighbouring pair, because
+    ``np.unique`` on a float64 height column separates values that differ at 1e-17 -- on the
+    ``torus`` fixture a ring's heights are equal to within that, so a midpoint taken there lands
+    back on a vertex and cuts nothing.
+    """
+    heights_np = np.unique(np.asarray(mesh_tm.vertices[:, 2], dtype=np.float64))
+    widest = int(np.argmax(np.diff(heights_np)))
+    return float(0.5 * (heights_np[widest] + heights_np[widest + 1]))
+
+
+def _split_sides(
+    mesh_wp: wp.Mesh, field_wp: wp.array[wp.float32], isovalue: float
+) -> tuple[tm.Trimesh, tm.Trimesh, tm.Trimesh]:
+    """Split along the level set and return the whole result and its two sides, as trimeshes."""
+    vertices_wp, faces_wp, positive_wp = tw.intersection.split_faces_along_field(
+        mesh_wp.points, mesh_wp.indices, field_wp, isovalue
+    )
+    positive_np = positive_wp.numpy()
+    negative_wp = wp.array(~positive_np, dtype=wp.bool, device=faces_wp.device)
+    return (
+        warp_to_trimesh(vertices_wp, faces_wp),
+        warp_to_trimesh(*tw.selection.submesh_from_face_mask(vertices_wp, faces_wp, positive_wp)),
+        warp_to_trimesh(*tw.selection.submesh_from_face_mask(vertices_wp, faces_wp, negative_wp)),
+    )
+
+
+@pytest.mark.parity("split_faces_along_field", "pyvista")
+@pytest.mark.parametrize("mesh_name", _SPLIT_MESHES)
+def test_split_faces_along_field_matches_pyvista_clip_scalar_both(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class B: equal after one named transform -- VTK returns its two halves *low side first*.
+
+    ``clip_scalar(both=True)`` is the two-sided form of the filter the clip is already pinned
+    against, and it returns a **tuple** ``(below, above)`` where this function's mask marks the
+    ``>= isovalue`` side. So block 1 pairs with the mask and block 0 with its negation; taking the
+    tuple in order compares each side against the other one, which on a symmetric mesh would still
+    pass on area. Both orders are asserted here for that reason.
+
+    At that pairing it is exact: face counts equal and areas equal to six decimals on all three
+    fixtures. Areas rather than positions, because each side appends its crossing points in its own
+    order -- the same reason the clip's own row uses a nearest-neighbour compare.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    isovalue = _off_vertex_isovalue(mesh_tm)
+    # The row's precondition: no corner sits on the level set, so every cut is edge-to-edge.
+    assert np.abs(np.asarray(mesh_tm.vertices[:, 2]) - isovalue).min() > 1e-4
+    _whole_tm, positive_tm, negative_tm = _split_sides(
+        mesh_wp, _height_field(mesh_tm, str(mesh_wp.device)), isovalue
+    )
+
+    mesh_pv = trimesh_to_pyvista(mesh_tm)
+    mesh_pv.point_data["height"] = np.ascontiguousarray(mesh_tm.vertices[:, 2])
+    below_pv, above_pv = mesh_pv.clip_scalar(scalars="height", value=isovalue, both=True)
+
+    # Non-vacuity: an isovalue outside the field's range would leave one side empty and every
+    # comparison below trivially true. Note a clipped side can carry *more* cells than the whole
+    # input, since cutting a face emits two or three, so the input's count is not an upper bound.
+    assert above_pv.n_cells > 0
+    assert below_pv.n_cells > 0
+    assert len(positive_tm.faces) > 0
+    assert len(negative_tm.faces) > 0
+
+    assert len(positive_tm.faces) == above_pv.n_cells
+    assert len(negative_tm.faces) == below_pv.n_cells
+    assert np.isclose(positive_tm.area, above_pv.area, rtol=1e-5)
+    assert np.isclose(negative_tm.area, below_pv.area, rtol=1e-5)
+    # And the transform is load-bearing wherever the two sides differ in size, so the swapped
+    # pairing fails rather than passing by accident. ``unit_box`` is exactly the case where it
+    # cannot bite -- its widest height gap is the midplane, which halves it symmetrically into two
+    # areas of 3.0 -- which is why the other two fixtures are in this row.
+    if not np.isclose(positive_tm.area, negative_tm.area, rtol=1e-5):
+        assert not np.isclose(positive_tm.area, below_pv.area, rtol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", _SPLIT_MESHES)
+def test_split_faces_along_field_partitions_the_surface(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Not a library comparison: these are the properties that make the result *one* mesh.
+
+    A reference agreeing on both sides' areas -- which the row above checks -- says nothing about
+    whether they are joined. Four things say that, and none of them is visible in an area: the
+    output is still **watertight** and edge-manifold, which needs the crossing vertices to be shared
+    by the faces on both sides of every cut edge rather than duplicated per face; the total area is
+    unchanged, so nothing was dropped or double-counted; the two sides' areas **sum** to it, so the
+    mask is a partition and not two overlapping selections; and every input vertex is still at its
+    own position and its own index, which is what lets a caller carry per-vertex data across.
+
+    The per-face crossing is the failure this excludes, and it is the natural implementation: it
+    gives the right areas, the right face counts and a **non**-watertight result, which is why
+    ``clip_mesh_with_field(cap=True)`` has to weld before it can fill.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    isovalue = _off_vertex_isovalue(mesh_tm)
+    field_wp = _height_field(mesh_tm, str(mesh_wp.device))
+    vertices_wp, faces_wp, _positive_wp = tw.intersection.split_faces_along_field(
+        mesh_wp.points, mesh_wp.indices, field_wp, isovalue
+    )
+    whole_tm, positive_tm, negative_tm = _split_sides(mesh_wp, field_wp, isovalue)
+
+    assert int(faces_wp.shape[0]) // 3 > len(mesh_tm.faces)  # non-vacuity: faces were cut
+    assert tw.validation.is_edge_manifold(faces_wp)
+    assert whole_tm.is_watertight == mesh_tm.is_watertight
+    assert np.isclose(whole_tm.area, mesh_tm.area, rtol=1e-5)
+    assert np.isclose(positive_tm.area + negative_tm.area, mesh_tm.area, rtol=1e-5)
+    n_vertices = int(mesh_wp.points.shape[0])
+    assert int(vertices_wp.shape[0]) > n_vertices
+    assert np.array_equal(vertices_wp.numpy()[:n_vertices], mesh_wp.points.numpy())
+
+
+def test_split_faces_along_field_positive_side_is_the_clip(
+    icosphere: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Not a parity assert: this pins the split to ``clip_mesh_with_field``, which carries the oracle.
+
+    The clip is compared against ``clip_scalar`` and ``clip_closed_surface`` in this file; the split
+    reuses its classifier and its windings but keeps both sides. So the positive side must be the
+    clip's answer **exactly** -- same face count, same area -- and any divergence is the split's,
+    since the clip's is the tested one.
+    """
+    mesh_tm, mesh_wp = icosphere
+    isovalue = 0.1
+    field_wp = _height_field(mesh_tm, str(mesh_wp.device))
+    _whole_tm, positive_tm, _negative_tm = _split_sides(mesh_wp, field_wp, isovalue)
+    clipped_tm = warp_to_trimesh(
+        *tw.intersection.clip_mesh_with_field(mesh_wp.points, mesh_wp.indices, field_wp, isovalue)
+    )
+    assert 0 < len(clipped_tm.faces) < len(mesh_tm.faces)  # non-vacuity
+    assert len(positive_tm.faces) == len(clipped_tm.faces)
+    assert np.isclose(positive_tm.area, clipped_tm.area, rtol=1e-6)
+
+
+def test_split_faces_along_field_degenerate_level_sets(
+    torus: tuple[tm.Trimesh, wp.Mesh], icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Not a library comparison: the three level sets that cut nothing, each for a different reason.
+
+    A level set that already **lies on mesh edges** cuts no face -- the ``torus`` fixture's vertex
+    rings sit at exactly ``z = 0``, so the surface comes back byte-identical and only the labels are
+    new. An isovalue **outside the field's range** puts every face on one side. And a field with a
+    vertex *exactly* at the isovalue exercises the two-triangle class: a face with one corner on the
+    level set splits along the segment from that corner to the single opposite crossing, so it emits
+    two triangles rather than three, and emitting three would leave a zero-area sliver.
+    """
+    torus_tm, torus_wp = torus
+    field_wp = _height_field(torus_tm, str(torus_wp.device))
+    assert np.count_nonzero(np.abs(torus_tm.vertices[:, 2]) < 1e-9) > 0  # the rings really are at 0
+    vertices_wp, faces_wp, positive_wp = tw.intersection.split_faces_along_field(
+        torus_wp.points, torus_wp.indices, field_wp, 0.0
+    )
+    assert np.array_equal(faces_wp.numpy(), torus_wp.indices.numpy())
+    assert np.array_equal(vertices_wp.numpy(), torus_wp.points.numpy())
+    assert 0 < int(positive_wp.numpy().sum()) < int(faces_wp.shape[0]) // 3
+
+    sphere_tm, sphere_wp = icosphere
+    sphere_field_wp = _height_field(sphere_tm, str(sphere_wp.device))
+    for isovalue in (float(sphere_tm.vertices[:, 2].max()) + 1.0, -10.0):
+        _v, out_faces_wp, out_positive_wp = tw.intersection.split_faces_along_field(
+            sphere_wp.points, sphere_wp.indices, sphere_field_wp, isovalue
+        )
+        assert np.array_equal(out_faces_wp.numpy(), sphere_wp.indices.numpy())
+        assert len(np.unique(out_positive_wp.numpy())) == 1
+
+    # A vertex exactly on the level set: its incident faces take the two-triangle class, so the
+    # face count grows by less than two per crossed face and no output triangle is degenerate.
+    on_vertex = float(sphere_tm.vertices[17, 2])
+    corner_v_wp, corner_f_wp, _ = tw.intersection.split_faces_along_field(
+        sphere_wp.points, sphere_wp.indices, sphere_field_wp, on_vertex
+    )
+    _normals_wp, areas_wp = tw.triangles.face_normals_and_areas(corner_v_wp, corner_f_wp)
+    areas_np = areas_wp.numpy()
+    assert areas_np.min() > 0.0
+    assert np.isclose(areas_np.sum(), sphere_tm.area, rtol=1e-5)
 
 
 def test_mesh_with_mesh_empty(
