@@ -457,9 +457,30 @@ def test_mesh_collision_pairs(bench_case: BenchCase, offset_fraction: float) -> 
     sphere-versus-box pair. pyvista's ``collision`` is a *contact* count rather than a crossing set
     -- CLAUDE.md section 6 records it reporting 2 600 hits for a 320-cell mesh against its own copy
     -- so its row is a cost comparison only, and the noparity entry says so.
+
+    First measurement, medians on an RTX 5090, ``bunny`` against a shifted copy of itself, and the
+    two offsets disagree about who wins:
+
+    | | triwarp-cuda | meshlib | |
+    |---|---|---|---|
+    | `deep` | **0.96 ms** | 4.28 ms | 4.5x |
+    | `grazing` | 0.44 | **0.014** | 31x behind |
+
+    That is the fixed-width broad phase showing through. triwarp allocates 16 candidate slots per
+    query triangle whatever the geometry, so its cost barely moves between the two offsets (0.44 to
+    0.96 ms); MeshLib descends two trees and exits almost immediately when there is nothing to find
+    (0.014 ms), then pays for the pairs when there is (4.28). So the ratio here is a question about
+    *early exit*, not about the narrow phase -- and the ``grazing`` row is the one to watch if that
+    ever changes.
     """
     skip_larger_than(bench_case, "bunny", "broad phase allocates 16 candidate slots per triangle")
     if bench_case.kind == "pyvista":
+        # VTK's OBB collision does not survive ``bunny`` here: measured 45-140 ms at 1-5k faces and
+        # no return inside a 40-minute cap on two 70k-face copies overlapping deeply, which is the
+        # quadratic blow-up an OBB tree hits when most boxes overlap. Capped where it still answers.
+        skip_larger_than(
+            bench_case, "bunny_decimated", "VTK's OBB collision does not return on 70k x 70k"
+        )
         mesh_pv, shifted_pv = bench_case.mesh_pv, _shifted_mesh_pv(bench_case, offset_fraction)
         collision_pv, n_contacts = bench_case.run(lambda: mesh_pv.collision(shifted_pv))
         assert collision_pv.n_cells >= 0
