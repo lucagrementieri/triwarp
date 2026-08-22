@@ -18,6 +18,7 @@ import trimesh as tm
 import warp as wp
 
 import triwarp as tw
+import triwarp.typing as twt
 
 _MESHES = ["icosahedron", "cave_cube", "hemisphere", "half_torus"]
 
@@ -501,3 +502,136 @@ def test_descend_field_guards_and_empty(icosphere: tuple[tm.Trimesh, wp.Mesh]) -
     assert points_wp.shape == (0,)
     assert offsets_wp.shape == (1,)
     assert tw.geodesic_walk.trace_polylines(points_wp, offsets_wp) == []
+
+
+def _cycle_length(vertices_np: np.ndarray, loop_np: np.ndarray) -> float:
+    """Length of a closed vertex-index cycle, whose last entry joins back to its first."""
+    points_np = vertices_np[loop_np]
+    return float(
+        np.linalg.norm(np.diff(np.vstack([points_np, points_np[:1]]), axis=0), axis=1).sum()
+    )
+
+
+@pytest.mark.parity("shorten_loop", "potpourri3d")
+def test_shorten_loop_preserves_the_homotopy_class(torus: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B: equal after a named transform -- flow both loops to the geodesic in their class.
+
+    ``EdgeFlipGeodesicSolver.find_geodesic_loop`` shortens a loop *within its homotopy class*, so
+    the length it converges to is a property of the class and not of the curve handed to it. Running
+    it from the input loop and from the shortened one must therefore give the same number, and that
+    is the whole correctness claim: shortening is allowed to move the curve anywhere in its class
+    and nowhere else. Measured **bit-identical** on both generators of the fixture (relative
+    difference 0.0), and the same on a 24x12 torus and on a genus-2 union.
+
+    A length comparison alone could not carry this. A sweep that leaked out of its class would
+    usually get *shorter*, so it would look like a better result; the invariant is what says no.
+
+    The gap that remains is real and is not tested as an equality: this stays on the edge graph
+    where the reference crosses face interiors, and the ratio to the geodesic length is between
+    **1.066x** and **1.578x** across the three meshes above -- widest where the mesh is a regular
+    grid whose rows are not geodesics, because a one-ring move cannot step the loop off a row
+    without lengthening the edge path first.
+    """
+    mesh_tm, mesh_wp = torus
+    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
+    loops_wp = tw.homology.homology_generators(mesh_wp.points, mesh_wp.indices)
+    assert len(loops_wp) == 2  # non-vacuity: genus 1, so there are two generators to shorten
+
+    shortened_wp, sweeps = tw.geodesic_walk.shorten_loop(mesh_wp.points, mesh_wp.indices, loops_wp)
+    assert 0 < sweeps < 100  # it converged rather than being cut off by the cap
+
+    solver_pp = pp3d.EdgeFlipGeodesicSolver(
+        vertices_np, np.ascontiguousarray(mesh_tm.faces, dtype=np.int32)
+    )
+
+    def geodesic_length(loop_wp: wp.array[wp.int32]) -> float:
+        points_pp = solver_pp.find_geodesic_loop(loop_wp.numpy().astype(np.int64))
+        return float(np.linalg.norm(np.diff(points_pp, axis=0), axis=1).sum())
+
+    improved = 0
+    for loop_wp, shortened_loop_wp in zip(loops_wp, shortened_wp, strict=True):
+        before = _cycle_length(vertices_np, loop_wp.numpy())
+        after = _cycle_length(vertices_np, shortened_loop_wp.numpy())
+        assert after <= before + 1e-6
+        improved += after < before - 1e-6
+
+        exact_before = geodesic_length(loop_wp)
+        exact_after = geodesic_length(shortened_loop_wp)
+        assert exact_before > 0.0  # a contractible loop would have collapsed to a point here
+        assert np.allclose(exact_after, exact_before, rtol=1e-5, atol=1e-5)
+        assert after >= exact_after - 1e-6  # the class's geodesic bounds any curve the sweeps reach
+    assert improved >= 1  # and the sweeps did something: 1.411x on this fixture's major generator
+
+
+def test_shorten_loop_returns_valid_non_separating_cycles(
+    torus: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Not a library comparison: no reference shortens a loop along mesh edges.
+
+    Two invariants instead, neither visible in a length. The output must still be a **closed walk
+    along mesh edges** -- consecutive entries adjacent, and the last adjacent to the first -- which
+    is what a wrongly reconstructed link arc would break. And it must still be **non-separating**:
+    cutting a genus-1 surface along a simple non-separating cycle leaves one component with two
+    boundary loops, where a contractible cycle would cut a disk off and leave two components. A
+    length check cannot see the difference, because a loop collapsing onto a disk gets shorter.
+    """
+    _, mesh_wp = torus
+    device = mesh_wp.indices.device
+    loops_wp = tw.homology.homology_generators(mesh_wp.points, mesh_wp.indices)
+    shortened_wp, _ = tw.geodesic_walk.shorten_loop(mesh_wp.points, mesh_wp.indices, loops_wp)
+
+    edges_np = {
+        tuple(sorted(edge)) for edge in tw.edges.faces_to_edges(mesh_wp.indices).numpy().tolist()
+    }
+    for shortened_loop_wp in shortened_wp:
+        loop_np = shortened_loop_wp.numpy()
+        assert loop_np.shape[0] >= 3
+        assert np.unique(loop_np).shape[0] == loop_np.shape[0]  # simple, so the cut below applies
+        rolled_np = np.roll(loop_np, -1)
+        assert all(
+            tuple(sorted((int(a), int(b)))) in edges_np
+            for a, b in zip(loop_np, rolled_np, strict=True)
+        )
+
+        loop_edges_wp = wp.array(
+            np.stack([loop_np, rolled_np], axis=1).astype(np.int32), dtype=wp.int32, device=device
+        )
+        cut_vertices_wp, cut_faces_wp = tw.seams.cut_along_edges(
+            mesh_wp.points, mesh_wp.indices, twt.as_array2d(loop_edges_wp, wp.int32)
+        )
+        labels_np = tw.adjacency.face_connected_component_labels(cut_faces_wp).numpy()
+        assert np.unique(labels_np).shape[0] == 1
+        assert len(tw.boundary.boundary_loops(cut_vertices_wp, cut_faces_wp)) == 2
+
+
+def test_shorten_loop_is_idempotent_and_handles_edge_cases(
+    torus: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Not a library comparison: a fixed point of a monotone local rule has no external oracle.
+
+    A second call must change nothing -- the first one ran to convergence, so every position already
+    fails its acceptance test -- which pins that the stopping rule and the acceptance rule agree. A
+    loop too short to have a triple, and an empty list, come back untouched.
+    """
+    _, mesh_wp = torus
+    loops_wp = tw.homology.homology_generators(mesh_wp.points, mesh_wp.indices)
+    once_wp, _ = tw.geodesic_walk.shorten_loop(mesh_wp.points, mesh_wp.indices, loops_wp)
+    twice_wp, sweeps = tw.geodesic_walk.shorten_loop(mesh_wp.points, mesh_wp.indices, once_wp)
+    assert sweeps == 2  # one sweep per parity, both finding nothing to do
+    for first_wp, second_wp in zip(once_wp, twice_wp, strict=True):
+        assert np.array_equal(first_wp.numpy(), second_wp.numpy())
+
+    assert tw.geodesic_walk.shorten_loop(mesh_wp.points, mesh_wp.indices, []) == ([], 0)
+    stub_wp = wp.array([0, 1], dtype=wp.int32, device=mesh_wp.indices.device)
+    kept_wp, _ = tw.geodesic_walk.shorten_loop(mesh_wp.points, mesh_wp.indices, [stub_wp])
+    assert np.array_equal(kept_wp[0].numpy(), [0, 1])
+
+    with pytest.raises(ValueError, match=r"rank-1 wp\.int32"):
+        tw.geodesic_walk.shorten_loop(
+            mesh_wp.points,
+            mesh_wp.indices,
+            [wp.array([0.0, 1.0], dtype=wp.float32, device=mesh_wp.indices.device)],
+        )

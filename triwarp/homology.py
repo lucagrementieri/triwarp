@@ -44,9 +44,9 @@ def homology_generators(
     [`boundary_loops`][triwarp.boundary.boundary_loops]).
 
     The loops are a *basis*, not canonical: any generating set is as valid as any other, and this
-    one falls out of the spanning trees the construction happens to build. They are also not
-    geodesic; shortening them is a separate problem (geometry-central's edge-flip machinery, not
-    ported here).
+    one falls out of the spanning trees the construction happens to build. They are also as long
+    and as jagged as those trees, which is what
+    [`shorten_loop`][triwarp.geodesic_walk.shorten_loop] is for.
 
     Parameters
     ----------
@@ -72,6 +72,8 @@ def homology_generators(
 
     See Also
     --------
+    [`shorten_loop`][triwarp.geodesic_walk.shorten_loop]
+        Shortens these loops within their homotopy class, keeping them on mesh edges.
     [`tree_cotree`][triwarp.homology.tree_cotree]
     [`euler_characteristic`][triwarp.measures.euler_characteristic]
     [`boundary_loops`][triwarp.boundary.boundary_loops]

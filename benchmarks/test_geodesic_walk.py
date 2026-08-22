@@ -23,7 +23,12 @@ convention for reference setup. triwarp's row likewise includes its own ``halfed
 one-ring prologue.
 
 **trimesh**, **libigl**, **open3d** and **scipy** have nothing comparable: tracing a straightest
-geodesic needs an unfolding walk across edges, and none of them exposes one.
+geodesic needs an unfolding walk across edges, and none of them exposes one. ``igl`` does join
+the ``geodesic_path`` group through ``exact_geodesic``, whose *distance* bounds any path length.
+
+``shorten_loop`` runs on a third axis, **genus**, against potpourri3d's
+``EdgeFlipGeodesicSolver.find_geodesic_loop``. It is the only axis in either registry with a
+genus, and it is shared with ``benchmarks/test_homology.py``, which produces this group's input.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ from conftest import BenchCase, skip_larger_than
 import triwarp as tw
 
 # The reference traces one ray per Python call, so the largest ray count is slow on its side.
+_GENERATORS = {"sphere_med": 0, "handles_1": 2, "handles_64": 128}
 _ROUNDS = 3
 _RAY_COUNTS = [1, 64, 4096]
 
@@ -218,3 +224,67 @@ def test_geodesic_path(bench_case: BenchCase, n_paths: int) -> None:
         lambda: tw.geodesic_walk.geodesic_path(vertices, faces, source, targets), rounds=_ROUNDS
     )
     assert offsets.shape == (n_paths + 1,)
+
+
+@pytest.mark.benchmark(group="shorten_loop")
+@pytest.mark.benchaxis("genus")
+@pytest.mark.benchlibs("triwarp", "potpourri3d")
+def test_shorten_loop(bench_case: BenchCase) -> None:
+    """
+    Shortening a homology basis, on the one axis in either registry that has a genus.
+
+    The loops come from [`test_homology_generators`]'s own call and are built **outside** the timed
+    callable on both sides, so this group times the shortening and not the basis -- which matters,
+    because that basis costs 50-65 ms and would swamp it (see ``benchmarks/test_homology.py``).
+
+    potpourri3d's ``find_geodesic_loop`` is the reference and answers **one loop per call**, so its
+    row is linear in the genus by construction; the solver build is inside its callable, matching
+    this suite's convention for reference setup, and triwarp's row likewise carries its own
+    ``halfedge_twins`` and one-ring prologue. The two do not compute the same curve -- this one
+    stays on mesh edges, that one flips its way into face interiors -- so read the row against
+    ``tests/test_geodesic_walk.py``'s measured 1.066-1.578x length gap, not as a like-for-like.
+
+    First measurement, medians on an RTX 5090 at ~90 000 faces:
+
+    | mesh | generators | triwarp-cuda | potpourri3d |
+    |---|---|---|---|
+    | ``handles_1`` | 2 | **1.90 ms** | 95.6 (50.3x) |
+    | ``handles_64`` | 128 | **9.50 ms** | 212.5 (22.4x) |
+
+    Both columns are dominated by their fixed cost at genus 1 and by the loops at genus 64, and the
+    *marginal* numbers are the ones worth keeping: 126 extra loops cost triwarp 7.6 ms (0.060 ms
+    each) and potpourri3d 116.9 ms (0.928 ms each), a **15x** per-loop gap on top of a build that is
+    ~94 ms against ~1.8. This is the first row in this family where triwarp is ahead --
+    ``homology_generators``, which produces the input, is 6.9-10.9x *behind* meshlib -- so the two
+    groups together say the basis is the module's bottleneck and shortening it is not.
+    """
+    if _GENERATORS[bench_case.mesh_name] == 0:
+        pytest.skip(f"{bench_case.mesh_name} is genus 0: there is no loop to shorten")
+
+    if bench_case.kind == "potpourri3d":
+        vertices_np = np.ascontiguousarray(bench_case.vertices_np, dtype=np.float64)
+        faces_np = np.ascontiguousarray(bench_case.faces_np, dtype=np.int32)
+        # The basis is triwarp's either way, and a reference case has no device -- so build it on
+        # the host, outside the timed callable, and hand both sides the same loops.
+        loops_np = [
+            loop.numpy().astype(np.int64)
+            for loop in tw.homology.homology_generators(
+                wp.array(vertices_np.astype(np.float32), dtype=wp.vec3, device="cpu"),
+                wp.array(faces_np.ravel().astype(np.int32), dtype=wp.int32, device="cpu"),
+            )
+        ]
+
+        def shorten_pp() -> int:
+            solver = pp3d.EdgeFlipGeodesicSolver(vertices_np, faces_np)
+            return sum(len(solver.find_geodesic_loop(loop_np)) for loop_np in loops_np)
+
+        assert bench_case.run(shorten_pp, rounds=_ROUNDS) > 0
+        return
+
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    loops = tw.homology.homology_generators(vertices, faces)
+    shortened, sweeps = bench_case.run(
+        lambda: tw.geodesic_walk.shorten_loop(vertices, faces, loops), rounds=_ROUNDS
+    )
+    assert len(shortened) == len(loops)
+    assert sweeps > 0

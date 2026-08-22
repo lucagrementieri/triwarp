@@ -188,10 +188,18 @@ def cut_along_edges(
     twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
 
     # Marked edges as a sorted key set, so the kernel tests membership with a binary search rather
-    # than a per-halfedge scan. Keys match ``pack_edge_key``, which is what the kernel builds.
+    # than a per-halfedge scan. Keys come from ``pack_edge_key``, the same builder the kernel uses,
+    # which is what makes a row given in either order match.
     marked_keys = wp.empty(0, dtype=wp.uint64, device=device)
-    if int(edges.shape[0]) > 0:
-        keys = tw.grouping.hash_indices_rows(edges, max_index=n_vertices)
+    n_edges = int(edges.shape[0])
+    if n_edges > 0:
+        keys = wp.empty(n_edges, dtype=wp.uint64, device=device)
+        wp.launch(
+            kernel_seams.pack_undirected_edge_keys,
+            dim=n_edges,
+            inputs=[edges, wp.uint64(n_vertices), keys],
+            device=device,
+        )
         marked_keys, _order = tw.array.sort_and_argsort(keys)
 
     union_edges = twt.empty_2d((n_halfedges, 2), wp.int32, device=device)

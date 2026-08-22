@@ -591,3 +591,190 @@ def trace_from_vertices(
         write_begin,
         out_points,
     )
+
+
+@wp.func
+def ring_slot_of(
+    faces: wp.array[wp.int32],
+    ring_offsets: wp.array[wp.int32],
+    ring_halfedges: wp.array[wp.int32],
+    v: wp.int32,
+    target: wp.int32,
+) -> wp.int32:
+    # Which slot of ``v``'s one-ring points at ``target``, or -1 when the two are not adjacent.
+    for s in range(ring_offsets[v], ring_offsets[v + 1]):
+        if halfedge_destination(faces, ring_halfedges[s]) == target:
+            return s
+    return wp.int32(-1)
+
+
+@wp.func
+def ring_arc_length(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    ring_offsets: wp.array[wp.int32],
+    ring_halfedges: wp.array[wp.int32],
+    v: wp.int32,
+    slot_from: wp.int32,
+    slot_to: wp.int32,
+    step: wp.int32,
+) -> tuple[wp.float32, wp.int32]:
+    # Length of the walk around ``v``'s *link* from one ring slot to another, plus how many link
+    # vertices it passes strictly between them. The link of an interior manifold vertex is a closed
+    # cycle, so the two directions give the two ways round; ``step`` picks one.
+    begin = ring_offsets[v]
+    n = ring_offsets[v + 1] - begin
+    total = wp.float32(0.0)
+    interior = wp.int32(0)
+    previous = halfedge_destination(faces, ring_halfedges[slot_from])
+    s = slot_from
+    for _ in range(n):
+        s = begin + (s - begin + step + n) % n
+        current = halfedge_destination(faces, ring_halfedges[s])
+        total += wp.length(vertices[current] - vertices[previous])
+        previous = current
+        if s == slot_to:
+            break
+        interior += 1
+    return total, interior
+
+
+@wp.kernel
+def shorten_loop_counts(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    ring_offsets: wp.array[wp.int32],
+    ring_halfedges: wp.array[wp.int32],
+    is_boundary: wp.array[wp.bool],
+    loop_vertices: wp.array[wp.int32],
+    position_loop: wp.array[wp.int32],
+    loop_offsets: wp.array[wp.int32],
+    parity: wp.int32,
+    tolerance: wp.float32,
+    out_counts: wp.array[wp.int32],
+    out_arc_slot: wp.array[wp.int32],
+    out_arc_step: wp.array[wp.int32],
+    out_changed: wp.array[wp.int32],
+) -> None:
+    # One thread per loop position. A position is *active* when its parity matches this sweep's, so
+    # no two neighbours are ever rewritten at once and each replacement sees an unmodified triple.
+    t = wp.int32(wp.tid())
+    begin = loop_offsets[position_loop[t]]
+    n = loop_offsets[position_loop[t] + 1] - begin
+    p = t - begin
+    out_counts[t] = wp.int32(1)
+    out_arc_slot[t] = wp.int32(-1)
+    out_arc_step[t] = wp.int32(0)
+    if n < 3 or p % 2 != parity:
+        return
+    # An odd-length cycle makes positions 0 and n - 1 neighbours *and* both even, so the even sweep
+    # gives up the last one rather than letting two adjacent threads rewrite one triple.
+    if n % 2 == 1 and p == n - 1:
+        return
+    b = loop_vertices[t]
+    if is_boundary[b]:
+        return  # the link of a boundary vertex is a path, not a cycle: there is no way round
+
+    a = loop_vertices[begin + (p - 1 + n) % n]
+    c = loop_vertices[begin + (p + 1) % n]
+    if a == c:
+        # The loop doubles back through b. Dropping b leaves the duplicate that the compaction pass
+        # removes, and both together contract the spur.
+        out_counts[t] = wp.int32(0)
+        wp.atomic_add(out_changed, 0, 1)
+        return
+    slot_a = ring_slot_of(faces, ring_offsets, ring_halfedges, b, a)
+    slot_c = ring_slot_of(faces, ring_offsets, ring_halfedges, b, c)
+    if slot_a < 0 or slot_c < 0:
+        return
+
+    through = wp.length(vertices[b] - vertices[a]) + wp.length(vertices[c] - vertices[b])
+    forward, forward_interior = ring_arc_length(
+        vertices, faces, ring_offsets, ring_halfedges, b, slot_a, slot_c, 1
+    )
+    backward, backward_interior = ring_arc_length(
+        vertices, faces, ring_offsets, ring_halfedges, b, slot_a, slot_c, -1
+    )
+    best = forward
+    step = wp.int32(1)
+    interior = forward_interior
+    if backward < best:
+        best = backward
+        step = wp.int32(-1)
+        interior = backward_interior
+    if best < through - tolerance:
+        out_counts[t] = interior
+        out_arc_slot[t] = slot_a
+        out_arc_step[t] = step
+        wp.atomic_add(out_changed, 0, 1)
+
+
+@wp.kernel
+def shorten_loop_write(
+    faces: wp.array[wp.int32],
+    ring_offsets: wp.array[wp.int32],
+    ring_halfedges: wp.array[wp.int32],
+    loop_vertices: wp.array[wp.int32],
+    counts: wp.array[wp.int32],
+    arc_slot: wp.array[wp.int32],
+    arc_step: wp.array[wp.int32],
+    positions: wp.array[wp.int32],
+    out_loop_vertices: wp.array[wp.int32],
+) -> None:
+    t = wp.int32(wp.tid())
+    count = counts[t]
+    if count == 0:
+        return  # b dropped: either the loop doubled back through it, or a -- c is itself an edge
+    if arc_slot[t] < 0:
+        out_loop_vertices[positions[t]] = loop_vertices[t]
+        return
+    begin = ring_offsets[loop_vertices[t]]
+    n = ring_offsets[loop_vertices[t] + 1] - begin
+    s = arc_slot[t]
+    for k in range(count):
+        s = begin + (s - begin + arc_step[t] + n) % n
+        out_loop_vertices[positions[t] + k] = halfedge_destination(faces, ring_halfedges[s])
+
+
+@wp.kernel
+def loop_position_labels(
+    loop_offsets: wp.array[wp.int32], out_position_loop: wp.array[wp.int32]
+) -> None:
+    # One thread per loop, writing its own label across its span -- the loops are few and short, so
+    # this beats a binary search per position and needs no readback of the offsets.
+    loop = wp.int32(wp.tid())
+    for t in range(loop_offsets[loop], loop_offsets[loop + 1]):
+        out_position_loop[t] = loop
+
+
+@wp.kernel
+def distinct_from_predecessor(
+    loop_vertices: wp.array[wp.int32],
+    position_loop: wp.array[wp.int32],
+    loop_offsets: wp.array[wp.int32],
+    out_counts: wp.array[wp.int32],
+) -> None:
+    # Marks the survivors of a run of repeats, cyclically within each loop: a position is kept
+    # unless it repeats its predecessor. The first position of a loop is always kept, so a run that
+    # wraps the seam keeps its head.
+    t = wp.int32(wp.tid())
+    begin = loop_offsets[position_loop[t]]
+    n = loop_offsets[position_loop[t] + 1] - begin
+    p = t - begin
+    if p == 0 or loop_vertices[t] != loop_vertices[begin + (p - 1 + n) % n]:
+        out_counts[t] = wp.int32(1)
+    else:
+        out_counts[t] = wp.int32(0)
+
+
+@wp.kernel
+def compact_kept(
+    values: wp.array[wp.int32],
+    counts: wp.array[wp.int32],
+    positions: wp.array[wp.int32],
+    out_kept: wp.array[wp.int32],
+) -> None:
+    # Stream compaction against a 0/1 count and its exclusive scan: a scatter, so it stays a kernel.
+    t = wp.int32(wp.tid())
+    if counts[t] != 0:
+        out_kept[positions[t]] = values[t]

@@ -901,3 +901,33 @@ def test_uv_seam_edges_empty_mesh(device: str) -> None:
         )
         == 0
     )
+
+
+def test_cut_along_edges_accepts_a_row_in_either_order(device: str) -> None:
+    """
+    Not a library comparison: this pins the documented row-order contract against itself.
+
+    ``edges`` is documented as taking a row "in either order", and the halfedge side sorts its own
+    key, so a reversed row must cut the same edge. It did not: the wrapper packed the row as given,
+    producing a key no halfedge can build, and the edge was **silently skipped** -- the call
+    returned the input mesh unchanged rather than raising. Reversing every row and comparing the two
+    results is what makes that failure visible.
+    """
+    mesh_tm = tm.creation.box()
+    vertices_wp, faces_wp = numpy_to_warp(
+        np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces).ravel().astype(np.int32), device
+    )
+    creases_wp = tw.seams.crease_edges(vertices_wp, faces_wp, angle=0.5)
+    reversed_np = np.ascontiguousarray(creases_wp.numpy()[:, ::-1])
+    reversed_wp = twt.as_array2d(wp.array(reversed_np, dtype=wp.int32, device=device), wp.int32)
+
+    ascending_vertices_wp, ascending_faces_wp = tw.seams.cut_along_edges(
+        vertices_wp, faces_wp, creases_wp
+    )
+    descending_vertices_wp, descending_faces_wp = tw.seams.cut_along_edges(
+        vertices_wp, faces_wp, reversed_wp
+    )
+    # Non-vacuity: the cut has to do something, or both sides agree on having done nothing.
+    assert int(ascending_vertices_wp.shape[0]) > int(vertices_wp.shape[0])
+    assert np.array_equal(ascending_faces_wp.numpy(), descending_faces_wp.numpy())
+    assert np.allclose(ascending_vertices_wp.numpy(), descending_vertices_wp.numpy())

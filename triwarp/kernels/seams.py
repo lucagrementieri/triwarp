@@ -206,3 +206,14 @@ def _register_overloads() -> None:
 
 
 _register_overloads()
+
+
+@wp.kernel
+def pack_undirected_edge_keys(
+    edges: wp.array2d[wp.int32], base: wp.uint64, out_keys: wp.array[wp.uint64]
+) -> None:
+    # Deliberately not `grouping.hash_indices_rows`: that packs a row in the order it is given, and
+    # this key set is compared against `pack_edge_key`, which sorts. A caller's reversed row would
+    # hash to something no halfedge can produce, so the cut would silently skip that edge.
+    i = wp.int32(wp.tid())
+    out_keys[i] = pack_edge_key(edges[i, 0], edges[i, 1], base)
