@@ -18,6 +18,7 @@ from scipy.spatial import KDTree
 import triwarp as tw
 from tests.comparisons import hausdorff_two_sided
 from tests.conversions import (
+    meshlib_bitset_to_numpy,
     meshlib_to_trimesh,
     trimesh_to_meshlib,
     trimesh_to_pyvista,
@@ -933,6 +934,138 @@ def test_mesh_with_mesh_empty(
         ico_wp.points, ico_wp.indices, cave_wp.points, cave_wp.indices
     )
     assert lines_wp.shape == (0, 2)
+
+
+@pytest.mark.parity("mesh_collision_pairs", "meshlib")
+def test_mesh_collision_pairs_matches_meshlib(
+    device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Class A: the same colliding faces as ``findCollidingTriangleBitsets``, both masks.
+
+    A sphere against a small box pushed into its side, which is also the configuration that
+    exercises the **query/target swap**: the broad phase queries the larger mesh's faces against
+    the smaller one's BVH, so the pair columns come out in face-count order and have to be put back
+    into the caller's. Both argument orders are tested for that reason -- measured (26, 8) faces
+    one way and (8, 26) the other, matching MeshLib element for element in both.
+
+    A pair list is also checked against the masks it reduces to, since the two entry points share a
+    helper and could disagree only by the reduction.
+    """
+    mesh_tm, _ = icosphere
+    box_tm = tm.creation.box(extents=[0.5, 0.5, 0.5])
+    box_tm.apply_translation([0.9, 0.0, 0.0])
+
+    sphere_wp = trimesh_to_warp(mesh_tm, device)
+    box_wp = trimesh_to_warp(box_tm, device)
+    colliding_ml = mm.findCollidingTriangleBitsets(
+        mm.MeshPart(trimesh_to_meshlib(mesh_tm)), mm.MeshPart(trimesh_to_meshlib(box_tm))
+    )
+    sphere_ml = meshlib_bitset_to_numpy(colliding_ml[0], mesh_tm.faces.shape[0])
+    box_ml = meshlib_bitset_to_numpy(colliding_ml[1], box_tm.faces.shape[0])
+    assert int(sphere_ml.sum()) > 0  # non-vacuity: the reference found the collision
+
+    sphere_mask_wp, box_mask_wp = tw.intersection.collision_masks(
+        sphere_wp.points, sphere_wp.indices, box_wp.points, box_wp.indices
+    )
+    assert np.array_equal(sphere_mask_wp.numpy(), sphere_ml)
+    assert np.array_equal(box_mask_wp.numpy(), box_ml)
+
+    # The reversed argument order, where the swap fires the other way.
+    box_first_wp, sphere_second_wp = tw.intersection.collision_masks(
+        box_wp.points, box_wp.indices, sphere_wp.points, sphere_wp.indices
+    )
+    assert np.array_equal(box_first_wp.numpy(), box_ml)
+    assert np.array_equal(sphere_second_wp.numpy(), sphere_ml)
+
+    # The pairs reduce to those masks, and every index is in range for its own mesh.
+    pairs_np = tw.intersection.mesh_collision_pairs(
+        sphere_wp.points, sphere_wp.indices, box_wp.points, box_wp.indices
+    ).numpy()
+    assert pairs_np.shape[0] > 0
+    assert pairs_np[:, 0].max() < mesh_tm.faces.shape[0]
+    assert pairs_np[:, 1].max() < box_tm.faces.shape[0]
+    assert set(pairs_np[:, 0].tolist()) == set(np.flatnonzero(sphere_ml).tolist())
+    assert set(pairs_np[:, 1].tolist()) == set(np.flatnonzero(box_ml).tolist())
+
+
+def test_mesh_collision_pairs_beats_meshlib_on_axis_aligned_boxes(device: str) -> None:
+    """
+    Not a parity assert: the input class where the two disagree, arbitrated rather than tolerated.
+
+    Two unit boxes offset by ``(0.5, 0.5, 0.5)`` interpenetrate at a corner, and every crossing
+    there is between axis-aligned triangles whose edges are parallel -- the configuration a
+    separating-axis narrow phase gets wrong and an interval test does not. An exact ``float64``
+    Moller test over all 144 face pairs says **(6, 6)**; triwarp reports (6, 6) and MeshLib says
+    **(5, 4)**, missing one face on the first mesh and two on the second.
+
+    So this is recorded as a place triwarp is *more* accurate, which is worth pinning for two
+    reasons: the equality above must not be generalized into "the two always agree", and a future
+    change that made triwarp match MeshLib here would be a regression rather than a fix.
+    """
+    first_tm = tm.creation.box()
+    second_tm = tm.creation.box()
+    second_tm.apply_translation([0.5, 0.5, 0.5])
+    first_wp = trimesh_to_warp(first_tm, device)
+    second_wp = trimesh_to_warp(second_tm, device)
+
+    first_mask_wp, second_mask_wp = tw.intersection.collision_masks(
+        first_wp.points, first_wp.indices, second_wp.points, second_wp.indices
+    )
+    assert int(first_mask_wp.numpy().sum()) == 6
+    assert int(second_mask_wp.numpy().sum()) == 6
+
+    colliding_ml = mm.findCollidingTriangleBitsets(
+        mm.MeshPart(trimesh_to_meshlib(first_tm)), mm.MeshPart(trimesh_to_meshlib(second_tm))
+    )
+    first_ml = meshlib_bitset_to_numpy(colliding_ml[0], first_tm.faces.shape[0])
+    # MeshLib finds a strict subset here, which is the divergence being pinned.
+    assert int(first_ml.sum()) < 6
+    assert np.all(first_mask_wp.numpy()[first_ml])
+
+
+def test_mesh_collision_pairs_degenerate(device: str) -> None:
+    """
+    Not a library comparison: separated meshes, an empty mesh, and the candidate-cap guard.
+
+    Two boxes three units apart must report no collision at all -- the case a broad phase that
+    forgot its narrow phase would fail -- and an empty face buffer must give empty answers rather
+    than raising, since ``collision_masks`` still owes a mask per mesh.
+    """
+    first_tm = tm.creation.box()
+    far_tm = tm.creation.box()
+    far_tm.apply_translation([3.0, 0.0, 0.0])
+    first_wp = trimesh_to_warp(first_tm, device)
+    far_wp = trimesh_to_warp(far_tm, device)
+
+    pairs_wp = tw.intersection.mesh_collision_pairs(
+        first_wp.points, first_wp.indices, far_wp.points, far_wp.indices
+    )
+    assert pairs_wp.shape == (0, 2)
+    first_mask_wp, far_mask_wp = tw.intersection.collision_masks(
+        first_wp.points, first_wp.indices, far_wp.points, far_wp.indices
+    )
+    assert not bool(first_mask_wp.numpy().any())
+    assert not bool(far_mask_wp.numpy().any())
+
+    empty_faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    empty_pairs_wp = tw.intersection.mesh_collision_pairs(
+        first_wp.points, first_wp.indices, first_wp.points, empty_faces_wp
+    )
+    assert empty_pairs_wp.shape == (0, 2)
+    _mask_wp, empty_mask_wp = tw.intersection.collision_masks(
+        first_wp.points, first_wp.indices, first_wp.points, empty_faces_wp
+    )
+    assert empty_mask_wp.shape == (0,)
+
+    with pytest.raises(ValueError, match="max_triangle_collisions"):
+        tw.intersection.mesh_collision_pairs(
+            first_wp.points,
+            first_wp.indices,
+            far_wp.points,
+            far_wp.indices,
+            max_triangle_collisions=0,
+        )
 
 
 @pytest.mark.parity("mesh_with_mesh", "pyvista")

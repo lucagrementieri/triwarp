@@ -19,6 +19,7 @@ behind.
 from __future__ import annotations
 
 import math
+from typing import Literal
 
 import warp as wp
 
@@ -29,6 +30,11 @@ from triwarp.grouping import hash_vector_rows, unique_1d, unique_faces, unique_r
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import repair as kernel_repair
 from triwarp.kernels import scatter as kernel_scatter
+
+# Lattice resolution for ``fix_self_intersections(method="voxel")``, in samples across the mesh's
+# bounding-box diagonal. 128 is the same order as ``offset.offset_mesh``'s automatic floor and costs
+# a 128 ** 3 field (8 MB); a caller who needs the surface resolved finer passes ``voxel_size``.
+_VOXEL_REBUILD_RESOLUTION = 128
 
 
 def remove_unreferenced_vertices(
@@ -962,6 +968,184 @@ def remove_folded_faces(
     keep = wp.empty(n_faces, dtype=wp.bool, device=faces.device)
     wp.map(kernel_array.mask_not, folded, out=keep)
     return tw.selection.submesh_from_face_mask(vertices, faces, keep)
+
+
+def fix_self_intersections(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    method: Literal["local", "voxel"] = "local",
+    max_expand: int = 1,
+    max_iter: int = 3,
+    voxel_size: float | None = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Remove a mesh's self-intersections, either locally or by rebuilding it.
+
+    triwarp could *detect* a self-intersection
+    ([`triwarp.validation.face_self_intersecting_mask`][triwarp.validation.face_self_intersecting_mask])
+    and not repair one. This is the repair, in the two forms that exist:
+
+    - ``"local"`` cuts the trouble out and rebuilds it. The intersecting faces are dilated by
+      ``max_expand`` rings, that region is deleted, and the rims it opens are refilled by the
+      minimum-weight patch -- so the surface away from the intersection is **untouched**. Iterated,
+      because a patch can intersect something itself.
+    - ``"voxel"`` rebuilds the whole surface as the zero level set of its own signed distance field.
+      A level set cannot self-intersect, so this always terminates and resamples everything --
+      including the parts that were fine. Read the qualification in the Notes: the level set is
+      clean, its *triangulation* can still carry an artifact at an ambiguous marching-cubes cell.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    method
+        ``"local"`` (default) to cut and refill, ``"voxel"`` to rebuild through a distance field.
+    max_expand
+        Rings of faces added around each intersecting face before deleting, in the ``"local"``
+        method. Larger takes more surface with it and is likelier to succeed in one pass.
+    max_iter
+        Cap on cut-and-refill passes. The loop also stops as soon as nothing intersects.
+    voxel_size
+        Lattice spacing for the ``"voxel"`` method. ``None`` uses 1/128 of the bounding-box
+        diagonal.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        ``(vertices, faces)`` on ``vertices.device``. A clean input is returned as a copy.
+
+    Raises
+    ------
+    ValueError
+        If ``method`` is not ``"local"`` or ``"voxel"``, ``max_expand`` is negative, or ``max_iter``
+        is less than 1.
+
+    Examples
+    --------
+    ```python
+    clean_v, clean_f = tw.repair.fix_self_intersections(v, f)
+    ```
+
+    Notes
+    -----
+    **Success is not guaranteed by either method, and neither is asserted.** For ``"local"``: a
+    region whose rim cannot be triangulated without crossing something, or one that grows to swallow
+    the mesh, leaves intersections behind; the loop stops at ``max_iter`` and returns what it has.
+    For ``"voxel"``: the level set is clean, but Warp's ``MarchingCubes`` can emit a touching or
+    non-manifold pair at an ambiguous cell, and that is resolution-dependent -- measured on a
+    16x16 self-intersecting torus, **0** intersecting faces at a 1 % lattice and **2 of 26 688** at
+    1/128. So check with
+    [`triwarp.validation.is_self_intersecting`][triwarp.validation.is_self_intersecting] when it
+    matters. Stating this is better than a loop that cannot terminate, and better than a promise the
+    extraction does not keep.
+
+    **What the ``"local"`` method is for, measured.** It clears a *shallow* self-intersection
+    outright -- a torus whose tube passes through itself goes from 66 intersecting faces to **0** at
+    either dilation budget -- and only reduces a *deep* one: two icospheres overlapping by a third
+    of their diameter, concatenated into one mesh, go from 152 faces to 34 and from 296 to 121. That
+    is the method's shape rather than a tuning failure. Cutting out a lens-shaped overlap leaves a
+    rim whose minimum-weight patch runs back through the other shell, so the pass converges only
+    where the damage is a band. Reach for ``"voxel"`` when two closed pieces genuinely
+    interpenetrate: a level set has no notion of two shells.
+
+    The two methods differ in what they preserve, not in quality. ``"local"`` keeps the input's
+    triangulation everywhere it did not cut, so a per-vertex attribute survives outside the patch;
+    ``"voxel"`` keeps nothing but the shape, and its accuracy is the lattice's.
+
+    See Also
+    --------
+    [`triwarp.validation.face_self_intersecting_mask`][triwarp.validation.face_self_intersecting_mask]
+        The detector, and what to check the result with.
+    [`triwarp.holes.refill_region`][triwarp.holes.refill_region]
+        The cut-and-refill step each ``"local"`` pass runs.
+    [`triwarp.offset.offset_mesh`][triwarp.offset.offset_mesh]
+        The same level-set machinery at a non-zero distance.
+    """
+    if method not in ("local", "voxel"):
+        raise ValueError(f"method must be 'local' or 'voxel', got {method!r}")
+    if max_expand < 0:
+        raise ValueError("max_expand must be non-negative")
+    if max_iter < 1:
+        raise ValueError("max_iter must be at least 1")
+
+    if int(faces.shape[0]) == 0:
+        return wp.clone(vertices), wp.clone(faces)
+
+    if method == "voxel":
+        spacing = voxel_size
+        if spacing is None:
+            spacing = float(tw.bounds.enclosing_diagonal(vertices)) / _VOXEL_REBUILD_RESOLUTION
+        field, box = tw.proximity.signed_distance_grid(
+            vertices, faces, spacing, pad=2, sign_mode="winding"
+        )
+        return tw.reconstruction.marching_cubes(field, 0.0, bounds=box)
+
+    current_vertices, current_faces = wp.clone(vertices), wp.clone(faces)
+    for _ in range(max_iter):
+        bad_mask = tw.validation.face_self_intersecting_mask(current_vertices, current_faces)
+        if not bool(bad_mask.numpy().any()):  # one readback per pass, and it decides the loop
+            break
+        region = _dilate_face_mask(current_faces, bad_mask, max_expand)
+        if bool(region.numpy().all()):
+            break  # the region swallowed the mesh: refilling it would delete everything
+        current_vertices, current_faces = tw.holes.refill_region(
+            current_vertices, current_faces, region
+        )
+        if int(current_faces.shape[0]) == 0:
+            break
+    return current_vertices, current_faces
+
+
+def _dilate_face_mask(
+    faces: wp.array[wp.int32], face_mask: wp.array[wp.bool], hops: int
+) -> wp.array[wp.bool]:
+    """
+    Grow a face selection by ``hops`` rings, through the vertices it touches.
+
+    Face adjacency is not needed for this and is not built: a face ring is the faces incident on
+    the selection's vertex ring, so the growth happens on the *vertex* mask -- where
+    [`triwarp.selection.expand_vertex_mask`][triwarp.selection.expand_vertex_mask] already does
+    it -- and is mapped back with ``face_mode="any"``.
+
+    Parameters
+    ----------
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    face_mask
+        Length-``n_faces`` selection to grow.
+    hops
+        Rings to add. Zero returns the selection's own faces, which is *not* the input mask: it is
+        every face sharing a vertex with it, since a cut has to leave a rim rather than a slit.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        Length-``n_faces`` grown selection on ``faces.device``.
+    """
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    n_vertices = int(faces.numpy().max()) + 1 if n_faces > 0 else 0
+
+    selected_corners = tw.array.gather(
+        faces.reshape((-1, 3)), tw.array.flatnonzero(face_mask)
+    ).reshape((-1,))
+    vertex_mask = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_scatter.mark_membership_mask,
+        dim=int(selected_corners.shape[0]),
+        inputs=[selected_corners, wp.int32(n_vertices), vertex_mask],
+        device=device,
+    )
+    if hops > 0:
+        vertex_mask = tw.selection.expand_vertex_mask(faces, vertex_mask, hops)
+
+    grown_faces = tw.selection.face_indices_from_vertex_indices(
+        faces, tw.array.flatnonzero(vertex_mask), face_mode="any"
+    )
+    return tw.array.indices_to_mask(grown_faces, n_faces, device=device)
 
 
 def remove_t_vertices(

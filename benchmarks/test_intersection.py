@@ -431,6 +431,56 @@ def test_mesh_with_mesh(bench_case: BenchCase, offset_fraction: float) -> None:
     assert lines.shape[1] == 2
 
 
+@pytest.mark.noparity(
+    "pyvista",
+    oracle="meshlib",
+    reason="D2 a different quantity with a measured disagreement: PolyData.collision counts contact "
+    "pairs from VTK's OBB tree rather than the set of crossing triangles, and it reports 2 600 hits "
+    "for a 320-cell mesh against its own copy where 0 triangles cross. Its row is a cost "
+    "comparison; meshlib's findCollidingTriangleBitsets is the oracle, in "
+    "tests/test_intersection.py::test_mesh_collision_pairs_matches_meshlib.",
+)
+@pytest.mark.benchmark(group="mesh_collision_pairs")
+@pytest.mark.benchlibs("triwarp", "meshlib", "pyvista")
+@pytest.mark.parametrize("offset_fraction", _SELF_OFFSET_FRACTIONS, ids=["deep", "grazing"])
+def test_mesh_collision_pairs(bench_case: BenchCase, offset_fraction: float) -> None:
+    """
+    The same broad and narrow phase as ``mesh_with_mesh``, stopping before the segments.
+
+    Read the two groups against each other: they share ``_colliding_face_pairs`` verbatim, so the
+    gap is exactly what computing an intersection *segment* per crossing pair costs, plus the
+    degenerate-segment filter. That is the reason this exists as its own group rather than being
+    assumed cheaper.
+
+    meshlib's ``findCollidingTriangleBitsets`` answers the same question and returns the two masks;
+    it is the oracle in ``tests/test_intersection.py``, where the two agree face for face on a
+    sphere-versus-box pair. pyvista's ``collision`` is a *contact* count rather than a crossing set
+    -- CLAUDE.md section 6 records it reporting 2 600 hits for a 320-cell mesh against its own copy
+    -- so its row is a cost comparison only, and the noparity entry says so.
+    """
+    skip_larger_than(bench_case, "bunny", "broad phase allocates 16 candidate slots per triangle")
+    if bench_case.kind == "pyvista":
+        mesh_pv, shifted_pv = bench_case.mesh_pv, _shifted_mesh_pv(bench_case, offset_fraction)
+        collision_pv, n_contacts = bench_case.run(lambda: mesh_pv.collision(shifted_pv))
+        assert collision_pv.n_cells >= 0
+        assert n_contacts >= 0
+        return
+    if bench_case.kind == "meshlib":
+        mesh_ml = _mesh_ml(bench_case)
+        shifted_ml = _shifted_mesh_ml(bench_case, offset_fraction)
+        masks_ml = bench_case.run(
+            lambda: mm.findCollidingTriangleBitsets(mm.MeshPart(mesh_ml), mm.MeshPart(shifted_ml))
+        )
+        assert len(masks_ml) == 2
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    shifted = _shifted_vertices_wp(bench_case, offset_fraction)
+    pairs = bench_case.run(
+        lambda: tw.intersection.mesh_collision_pairs(vertices, faces, shifted, faces)
+    )
+    assert pairs.shape[1] == 2
+
+
 @pytest.mark.benchmark(group="segments_with_plane")
 @pytest.mark.benchlibs("triwarp", "trimesh")
 def test_segments_with_plane(bench_case: BenchCase) -> None:

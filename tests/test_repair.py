@@ -1835,6 +1835,107 @@ def test_remove_folded_faces_empty(device: str) -> None:
     assert int(out_faces_wp.shape[0]) == 0
 
 
+@pytest.mark.parametrize("max_expand", [1, 2])
+def test_fix_self_intersections_local_clears_them(
+    torus_self_intersecting: tuple[tm.Trimesh, wp.Mesh], max_expand: int
+) -> None:
+    """
+    Not a library comparison: the function's own contract, on the fixture that violates it.
+
+    No reference does this operation the way this does -- MeshLib's ``localFixSelfIntersections``
+    subdivides and relaxes rather than cutting and refilling, and on this very input it leaves
+    **281** intersecting faces where this leaves **0** (the benchmark carries that as a measured
+    exemption). So the claim is the contract rather than an agreement: the intersecting faces are
+    gone, the result is watertight, and the surface did not run away from the input.
+
+    The last of those is the one that stops a trivial pass: deleting the whole mesh also has no
+    self-intersections. It is bounded with a two-sided surface Hausdorff against the input, which
+    must stay within a fraction of the bounding-box diagonal -- the repair cuts a band out and
+    refills it, so it moves the surface locally and nowhere else.
+
+    Both dilation budgets are run because they take different amounts of surface with them (measured
+    1 036 faces at ``max_expand=1`` and 588 at 2, from 512) and both must land clean.
+    """
+    mesh_tm, mesh_wp = torus_self_intersecting
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    before_np = tw.validation.face_self_intersecting_mask(vertices_wp, faces_wp).numpy()
+    assert int(before_np.sum()) > 0  # non-vacuity: the fixture really does intersect itself
+
+    fixed_vertices_wp, fixed_faces_wp = tw.repair.fix_self_intersections(
+        vertices_wp, faces_wp, max_expand=max_expand
+    )
+    assert int(fixed_faces_wp.shape[0]) > 0
+    after_np = tw.validation.face_self_intersecting_mask(fixed_vertices_wp, fixed_faces_wp).numpy()
+    assert int(after_np.sum()) == 0
+    assert tw.validation.is_watertight(fixed_vertices_wp, fixed_faces_wp)
+
+    diagonal = float(np.linalg.norm(mesh_tm.vertices.max(axis=0) - mesh_tm.vertices.min(axis=0)))
+    deviation = hausdorff_surface_two_sided(
+        np.asarray(mesh_tm.vertices, dtype=np.float64),
+        np.asarray(mesh_tm.faces),
+        fixed_vertices_wp.numpy().astype(np.float64),
+        fixed_faces_wp.numpy().reshape(-1, 3),
+    )
+    assert deviation < 0.35 * diagonal  # it patched a band, it did not rebuild the object
+
+
+def test_fix_self_intersections_voxel_rebuilds(
+    torus_self_intersecting: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Not a library comparison: the level-set method, and the qualification its docstring carries.
+
+    A level set cannot self-intersect, so this always terminates -- but the *triangulation* of one
+    can still carry a touching pair at an ambiguous marching-cubes cell, and that is
+    resolution-dependent: measured on this fixture, **0** intersecting faces at a 1 % lattice and
+    **2 of 26 688** at 1/128. The assertion is therefore "almost none, and far fewer than the input
+    had" rather than zero, which is what the function promises.
+
+    Also asserts the rebuild is a rebuild: the face count grows by more than an order of magnitude,
+    because every part of the surface is resampled and not just the damaged band.
+    """
+    mesh_tm, mesh_wp = torus_self_intersecting
+    n_faces = mesh_tm.faces.shape[0]
+    before_np = tw.validation.face_self_intersecting_mask(mesh_wp.points, mesh_wp.indices).numpy()
+
+    rebuilt_vertices_wp, rebuilt_faces_wp = tw.repair.fix_self_intersections(
+        mesh_wp.points, mesh_wp.indices, method="voxel"
+    )
+    assert int(rebuilt_faces_wp.shape[0]) // 3 > 10 * n_faces  # everything was resampled
+
+    after_np = tw.validation.face_self_intersecting_mask(
+        rebuilt_vertices_wp, rebuilt_faces_wp
+    ).numpy()
+    assert int(after_np.sum()) < 0.001 * int(rebuilt_faces_wp.shape[0]) // 3
+    assert int(after_np.sum()) < int(before_np.sum())
+
+
+def test_fix_self_intersections_leaves_a_clean_mesh_alone(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Not a library comparison: a clean input is returned unchanged, and the three value guards.
+
+    The identity case matters more than it looks: the local method's loop reads its own detector to
+    decide whether to run at all, so a mesh with nothing wrong must come back with the same faces
+    rather than through one round of cut-and-refill.
+    """
+    _, mesh_wp = icosphere_coarse
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    assert not tw.validation.is_self_intersecting(mesh_wp)
+
+    same_vertices_wp, same_faces_wp = tw.repair.fix_self_intersections(vertices_wp, faces_wp)
+    assert np.array_equal(same_faces_wp.numpy(), faces_wp.numpy())
+    assert np.allclose(same_vertices_wp.numpy(), vertices_wp.numpy())
+
+    with pytest.raises(ValueError, match="method must be"):
+        tw.repair.fix_self_intersections(vertices_wp, faces_wp, method="nonsense")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="max_expand"):
+        tw.repair.fix_self_intersections(vertices_wp, faces_wp, max_expand=-1)
+    with pytest.raises(ValueError, match="max_iter"):
+        tw.repair.fix_self_intersections(vertices_wp, faces_wp, max_iter=0)
+
+
 def test_remove_t_vertices_flips_the_sliver(device: str) -> None:
     """The sliver goes, the face count and the vertices stay, and the patch stays manifold."""
     vertices_np, faces_np = _t_vertex_patch()

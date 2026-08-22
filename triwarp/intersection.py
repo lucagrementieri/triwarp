@@ -409,63 +409,13 @@ def mesh_with_mesh(
         If ``max_triangle_collisions`` is less than 1.
     """
     device = vertices_a.device
-    n_faces_a = int(faces_a.shape[0]) // 3
-    n_faces_b = int(faces_b.shape[0]) // 3
-    if n_faces_a == 0 or n_faces_b == 0:
+    crossing = _colliding_face_pairs(
+        vertices_a, faces_a, vertices_b, faces_b, max_triangle_collisions, "mesh_with_mesh"
+    )
+    if crossing is None:
         return wp.empty((0, 2), dtype=wp.vec3, device=device)
-    if max_triangle_collisions < 1:
-        raise ValueError("max_triangle_collisions must be >= 1")
-
-    if n_faces_a <= n_faces_b:
-        target_vertices, target_faces = vertices_a, faces_a
-        query_vertices, query_faces = vertices_b, faces_b
-    else:
-        target_vertices, target_faces = vertices_b, faces_b
-        query_vertices, query_faces = vertices_a, faces_a
-
-    n_query = int(query_faces.shape[0]) // 3
-
-    require_nonempty_mesh(target_faces, "mesh_with_mesh")
-    target_mesh = wp.Mesh(points=target_vertices, indices=target_faces)
-
-    query_lower = wp.empty(n_query, dtype=wp.vec3, device=device)
-    query_upper = wp.empty(n_query, dtype=wp.vec3, device=device)
-    wp.launch(
-        kernel_intersections.face_aabb_bounds,
-        dim=n_query,
-        inputs=[query_vertices, query_faces, query_lower, query_upper],
-        device=device,
-    )
-
-    target_indices, offsets, hit_counts = tw.proximity.query_mesh_aabb_with_offsets(
-        target_mesh, query_lower, query_upper, max_hits=max_triangle_collisions
-    )
-    n_pairs = int(target_indices.shape[0])
-    if n_pairs == 0:
-        return wp.empty((0, 2), dtype=wp.vec3, device=device)
-
-    pairs = twt.empty_2d((n_pairs, 2), wp.int32, device=device)
-    wp.launch(
-        kernel_intersections.expand_query_target_pairs,
-        dim=n_query,
-        inputs=[offsets, hit_counts, target_indices, pairs],
-        device=device,
-    )
-
-    valid = wp.empty(n_pairs, dtype=wp.bool, device=device)
-    wp.launch(
-        kernel_intersections.filter_intersecting_pairs,
-        dim=n_pairs,
-        inputs=[query_vertices, query_faces, target_vertices, target_faces, pairs, valid],
-        device=device,
-    )
-
-    hit_pair_indices = tw.array.flatnonzero(valid)
-    n_hit = int(hit_pair_indices.shape[0])
-    if n_hit == 0:
-        return wp.empty((0, 2), dtype=wp.vec3, device=device)
-
-    hit_pairs = twt.as_array2d(tw.array.gather(pairs, hit_pair_indices), wp.int32)
+    hit_pairs, query_vertices, query_faces, target_vertices, target_faces, _swapped = crossing
+    n_hit = int(hit_pairs.shape[0])
 
     segments = wp.empty((n_hit, 2), dtype=wp.vec3, device=device)
     wp.launch(
@@ -489,6 +439,252 @@ def mesh_with_mesh(
         return wp.empty((0, 2), dtype=wp.vec3, device=device)
 
     return tw.array.gather(segments, keep)
+
+
+def _colliding_face_pairs(
+    vertices_a: wp.array[wp.vec3],
+    faces_a: wp.array[wp.int32],
+    vertices_b: wp.array[wp.vec3],
+    faces_b: wp.array[wp.int32],
+    max_triangle_collisions: int,
+    caller: str,
+) -> (
+    tuple[
+        twt.Array2dInt32,
+        wp.array[wp.vec3],
+        wp.array[wp.int32],
+        wp.array[wp.vec3],
+        wp.array[wp.int32],
+        bool,
+    ]
+    | None
+):
+    """
+    Broad phase plus narrow phase for two meshes: the crossing face pairs, or ``None`` if none.
+
+    Shared by [`mesh_with_mesh`][triwarp.intersection.mesh_with_mesh], which goes on to compute a
+    segment per pair, and [`mesh_collision_pairs`][triwarp.intersection.mesh_collision_pairs], which
+    returns the pairs themselves. It exists because the two would otherwise carry the same fifty
+    lines twice, and because those lines contain the one thing a caller must not get wrong: the pair
+    columns are ``(query, target)``, and which input is the query depends on the **face counts**.
+
+    Parameters
+    ----------
+    vertices_a, faces_a, vertices_b, faces_b
+        The two meshes.
+    max_triangle_collisions
+        Broad-phase candidate cap per query triangle.
+    caller
+        Name to report in the empty-mesh guard's message.
+
+    Returns
+    -------
+    tuple | None
+        ``(pairs, query_vertices, query_faces, target_vertices, target_faces, swapped)``, where
+        ``pairs`` is ``(n_hit, 2)`` in ``(query, target)`` order and ``swapped`` says whether the
+        query is mesh **b** -- i.e. whether the columns are the caller's ``(a, b)`` order reversed.
+        ``None`` when either mesh is empty or nothing crosses.
+
+    Raises
+    ------
+    ValueError
+        If ``max_triangle_collisions`` is less than 1.
+    """
+    device = vertices_a.device
+    n_faces_a = int(faces_a.shape[0]) // 3
+    n_faces_b = int(faces_b.shape[0]) // 3
+    if n_faces_a == 0 or n_faces_b == 0:
+        return None
+    if max_triangle_collisions < 1:
+        raise ValueError("max_triangle_collisions must be >= 1")
+
+    # The smaller mesh supplies the BVH, so the larger one's faces are the queries.
+    swapped = n_faces_a <= n_faces_b
+    if swapped:
+        target_vertices, target_faces = vertices_a, faces_a
+        query_vertices, query_faces = vertices_b, faces_b
+    else:
+        target_vertices, target_faces = vertices_b, faces_b
+        query_vertices, query_faces = vertices_a, faces_a
+
+    n_query = int(query_faces.shape[0]) // 3
+    require_nonempty_mesh(target_faces, caller)
+    target_mesh = wp.Mesh(points=target_vertices, indices=target_faces)
+
+    query_lower = wp.empty(n_query, dtype=wp.vec3, device=device)
+    query_upper = wp.empty(n_query, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_intersections.face_aabb_bounds,
+        dim=n_query,
+        inputs=[query_vertices, query_faces, query_lower, query_upper],
+        device=device,
+    )
+
+    target_indices, offsets, hit_counts = tw.proximity.query_mesh_aabb_with_offsets(
+        target_mesh, query_lower, query_upper, max_hits=max_triangle_collisions
+    )
+    n_pairs = int(target_indices.shape[0])
+    if n_pairs == 0:
+        return None
+
+    pairs = twt.empty_2d((n_pairs, 2), wp.int32, device=device)
+    wp.launch(
+        kernel_intersections.expand_query_target_pairs,
+        dim=n_query,
+        inputs=[offsets, hit_counts, target_indices, pairs],
+        device=device,
+    )
+
+    valid = wp.empty(n_pairs, dtype=wp.bool, device=device)
+    wp.launch(
+        kernel_intersections.filter_intersecting_pairs,
+        dim=n_pairs,
+        inputs=[query_vertices, query_faces, target_vertices, target_faces, pairs, valid],
+        device=device,
+    )
+
+    hit_pair_indices = tw.array.flatnonzero(valid)
+    if int(hit_pair_indices.shape[0]) == 0:
+        return None
+    hit_pairs = twt.as_array2d(tw.array.gather(pairs, hit_pair_indices), wp.int32)
+    return hit_pairs, query_vertices, query_faces, target_vertices, target_faces, swapped
+
+
+def mesh_collision_pairs(
+    vertices_a: wp.array[wp.vec3],
+    faces_a: wp.array[wp.int32],
+    vertices_b: wp.array[wp.vec3],
+    faces_b: wp.array[wp.int32],
+    *,
+    max_triangle_collisions: int = 16,
+) -> twt.Array2dInt32:
+    """
+    Which faces of two meshes cross each other, as index pairs.
+
+    The **collision** question, as against
+    [`mesh_with_mesh`][triwarp.intersection.mesh_with_mesh]'s intersection *curve*: this answers
+    "do these two touch, and where" without computing the geometry of the contact, which is what a
+    contact resolver, a fit check or an assembly validator wants.
+    [`triwarp.validation.face_self_intersecting_mask`][triwarp.validation.face_self_intersecting_mask]
+    is the same question asked of one mesh against itself.
+
+    Parameters
+    ----------
+    vertices_a, faces_a
+        First mesh: ``(n_vertices_a,)`` positions and a length-``3 * n_faces_a`` index buffer.
+    vertices_b, faces_b
+        Second mesh, in the same form.
+    max_triangle_collisions
+        Broad-phase candidate cap per query triangle. A pair beyond the cap is **dropped**, so raise
+        it on meshes whose triangles pile into overlapping boxes; the answer is a subset, never a
+        superset.
+
+    Returns
+    -------
+    twt.Array2dInt32
+        ``(n_pairs, 2)`` face-index pairs, column 0 into ``faces_a`` and column 1 into ``faces_b``.
+        Empty ``(0, 2)`` when the meshes do not cross. Pairs that merely touch or are coplanar are
+        **not** collisions -- the same convention
+        [`triwarp.validation.is_self_intersecting`][triwarp.validation.is_self_intersecting] uses.
+
+    Raises
+    ------
+    ValueError
+        If ``max_triangle_collisions`` is less than 1.
+
+    Examples
+    --------
+    ```python
+    pairs = tw.intersection.mesh_collision_pairs(v, f, v, f)
+    ```
+
+    See Also
+    --------
+    [`collision_masks`][triwarp.intersection.collision_masks]
+        The same answer as one boolean mask per mesh, which is the form a repair pass wants.
+    [`mesh_with_mesh`][triwarp.intersection.mesh_with_mesh]
+        The intersection curve, when the contact geometry is wanted and not just its existence.
+    [`triwarp.proximity.closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]
+        What to reach for when the meshes do *not* touch and the clearance is the question.
+    """
+    device = vertices_a.device
+    crossing = _colliding_face_pairs(
+        vertices_a, faces_a, vertices_b, faces_b, max_triangle_collisions, "mesh_collision_pairs"
+    )
+    if crossing is None:
+        return twt.empty_2d((0, 2), wp.int32, device=device)
+    hit_pairs, _qv, _qf, _tv, _tf, swapped = crossing
+    if not swapped:
+        return hit_pairs
+
+    ordered = twt.empty_2d((int(hit_pairs.shape[0]), 2), wp.int32, device=device)
+    wp.launch(
+        kernel_intersections.swap_pair_columns,
+        dim=int(hit_pairs.shape[0]),
+        inputs=[hit_pairs, ordered],
+        device=device,
+    )
+    return ordered
+
+
+def collision_masks(
+    vertices_a: wp.array[wp.vec3],
+    faces_a: wp.array[wp.int32],
+    vertices_b: wp.array[wp.vec3],
+    faces_b: wp.array[wp.int32],
+    *,
+    max_triangle_collisions: int = 16,
+) -> tuple[wp.array[wp.bool], wp.array[wp.bool]]:
+    """
+    Which faces of each mesh are involved in a collision with the other, as one mask per mesh.
+
+    [`mesh_collision_pairs`][triwarp.intersection.mesh_collision_pairs] reduced to the two questions
+    a repair or a selection actually asks -- *which of my faces are in trouble* -- and the form
+    MeshLib's ``findCollidingTriangleBitsets`` returns. It exists as its own entry point because
+    deriving it from the pairs means scattering a **column** of a rank-2 array, and a column is a
+    strided view that Warp's Python-scope gather silently misreads (CLAUDE.md section 4).
+
+    Parameters
+    ----------
+    vertices_a, faces_a, vertices_b, faces_b
+        The two meshes, as in [`mesh_collision_pairs`][triwarp.intersection.mesh_collision_pairs].
+    max_triangle_collisions
+        Broad-phase candidate cap per query triangle.
+
+    Returns
+    -------
+    tuple[wp.array[wp.bool], wp.array[wp.bool]]
+        Length-``n_faces_a`` and length-``n_faces_b`` masks on ``vertices_a.device``, ``True`` for a
+        face that crosses some face of the other mesh.
+
+    Raises
+    ------
+    ValueError
+        If ``max_triangle_collisions`` is less than 1.
+
+    See Also
+    --------
+    [`mesh_collision_pairs`][triwarp.intersection.mesh_collision_pairs]
+        The pair list this reduces, when *which* faces meet matters.
+    """
+    device = vertices_a.device
+    n_faces_a = int(faces_a.shape[0]) // 3
+    n_faces_b = int(faces_b.shape[0]) // 3
+    mask_a = wp.zeros(n_faces_a, dtype=wp.bool, device=device)
+    mask_b = wp.zeros(n_faces_b, dtype=wp.bool, device=device)
+
+    pairs = mesh_collision_pairs(
+        vertices_a, faces_a, vertices_b, faces_b, max_triangle_collisions=max_triangle_collisions
+    )
+    n_pairs = int(pairs.shape[0])
+    if n_pairs > 0:
+        wp.launch(
+            kernel_intersections.mark_pair_masks,
+            dim=n_pairs,
+            inputs=[pairs, mask_a, mask_b],
+            device=device,
+        )
+    return mask_a, mask_b
 
 
 def slice_mesh_with_plane(

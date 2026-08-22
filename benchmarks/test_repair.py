@@ -699,6 +699,106 @@ def test_remove_degenerate_faces(bench_case: BenchCase) -> None:
     assert int(kept_vertices.shape[0]) <= bench_case.n_vertices
 
 
+_tangled_cache: dict[tuple[str, str], tuple] = {}
+
+
+def _tangled(bench_case: BenchCase) -> tuple:
+    """
+    One mesh that genuinely self-intersects: the mesh concatenated with a shifted copy of itself.
+
+    The registry has no self-intersecting mesh, and a repair benchmark needs damage to repair. Two
+    copies overlapping by a third of the diagonal, welded into a single face buffer, is the standard
+    way to make one -- the same construction ``test_intersection.py`` uses for its two-mesh rows,
+    except merged so the intersection is a *self*-intersection.
+
+    Cached: it is the input, and building it is a concatenate plus a translation.
+    """
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _tangled_cache:
+        vertices_np = bench_case.vertices_np
+        diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
+        shifted_np = np.ascontiguousarray(
+            vertices_np + np.array([0.35 * diagonal, 0.0, 0.0]), dtype=np.float32
+        )
+        vertices_wp, faces_wp = bench_case.vertices_wp, bench_case.faces_wp
+        shifted_wp = wp.array(shifted_np, dtype=wp.vec3, device=bench_case.device)
+        _tangled_cache[key] = tw.combine.concatenate(
+            [(vertices_wp, faces_wp), (shifted_wp, faces_wp)]
+        )
+    return _tangled_cache[key]
+
+
+@pytest.mark.noparity(
+    "meshlib",
+    reason="D2 a different algorithm with a measured disagreement: localFixSelfIntersections "
+    "subdivides the affected region and relaxes it, where fix_self_intersections cuts the region "
+    "out and refills the rim. On the shared 16x16 self-intersecting torus MeshLib's leaves 281 "
+    "intersecting faces and triwarp's leaves 0, so the outputs are not comparable and neither is a "
+    "reference for the other. No library does the cut-and-refill repair, so the correctness claim "
+    "is the contract itself, in tests/test_repair.py::test_fix_self_intersections_local_clears_them.",
+)
+@pytest.mark.benchmark(group="fix_self_intersections")
+@pytest.mark.benchmeshes("sphere_med")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.parametrize("method", ["local", "voxel"])
+def test_fix_self_intersections(bench_case: BenchCase, method: str) -> None:
+    """
+    Repair a genuine self-intersection, by cutting-and-refilling or by rebuilding.
+
+    The two methods are different costs of different kinds and the parametrize is what keeps them
+    attributable. ``local`` is a detect-dilate-delete-refill loop whose cost is the *damage*: the
+    detector runs on the whole mesh but the DP runs on the rims, so it tracks the intersecting band
+    rather than the face count. ``voxel`` is a signed distance field plus a marching pass, so its
+    cost is the *lattice* and it does not care what was wrong.
+
+    The input is one mesh overlapping a shifted copy of itself -- a deep interpenetration, which is
+    the case the local method only *reduces* rather than clears (152 intersecting faces to 34 on a
+    small instance; the function's docstring measures this). The row therefore asserts progress and a
+    non-empty answer, not convergence: asserting zero would be asserting something the method does
+    not promise on this input class.
+
+    meshlib's two fixers are timed beside it for scale, and the noparity entry says why they are not
+    a reference: its local one subdivides and relaxes instead of cutting, and on the shared torus
+    fixture the two answers differ by 281 faces to 0.
+
+    First measurement, medians on an RTX 5090 at ``sphere_med`` doubled to 163 840 faces:
+
+    | | triwarp-cuda | meshlib |
+    |---|---|---|
+    | `voxel` | **18.7 ms** | 117.4 (6.3x) |
+    | `local` | 196.3 | **46.0** (4.3x behind) |
+
+    The split is the point. The voxel path is a device field plus a marching pass and wins by the
+    margin the ``offset`` groups show; the local path is a host-side loop of detect, dilate, delete,
+    DP, refine -- five wrapper chains per pass, three passes -- and loses to a single C++ traversal.
+    Anything spent here belongs in the refill chain, not in the detector.
+    """
+    if bench_case.kind == "meshlib":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
+        tangled_np = np.vstack([vertices_np, vertices_np + np.array([0.35 * diagonal, 0.0, 0.0])])
+        tangled_faces_np = np.vstack([faces_np, faces_np + vertices_np.shape[0]])
+        voxel = diagonal / 128.0
+
+        def fix_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(tangled_np, tangled_faces_np)
+            if method == "voxel":
+                mm.fixSelfIntersections(mesh_ml, voxel)
+            else:
+                mm.localFixSelfIntersections(mesh_ml, mm.SelfIntersections.Settings())
+            return mesh_ml.topology.numValidFaces()
+
+        assert bench_case.run(fix_ml, rounds=3) > 0
+        return
+
+    vertices, faces = _tangled(bench_case)
+    fixed_vertices, fixed_faces = bench_case.run(
+        lambda: tw.repair.fix_self_intersections(vertices, faces, method=method), rounds=3
+    )
+    assert int(fixed_faces.shape[0]) > 0
+    assert int(fixed_vertices.shape[0]) > 0
+
+
 @pytest.mark.benchmark(group="collapse_small_triangles")
 @pytest.mark.benchaxis("quality")
 @pytest.mark.benchlibs("triwarp", "meshlib")

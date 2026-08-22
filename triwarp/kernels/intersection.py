@@ -507,6 +507,29 @@ def filter_intersecting_pairs(
 
 
 @wp.kernel
+def swap_pair_columns(pairs: wp.array2d[wp.int32], out_pairs: wp.array2d[wp.int32]) -> None:
+    # Put a colliding pair back in the caller's (a, b) order. The broad phase queries the *larger*
+    # mesh's faces against the smaller one's BVH, so which input is the query depends on the face
+    # counts and the pair columns come out in that order rather than the caller's.
+    i = wp.int32(wp.tid())
+    out_pairs[i, 0] = pairs[i, 1]
+    out_pairs[i, 1] = pairs[i, 0]
+
+
+@wp.kernel
+def mark_pair_masks(
+    pairs: wp.array2d[wp.int32], out_mask_a: wp.array[wp.bool], out_mask_b: wp.array[wp.bool]
+) -> None:
+    # One mask per mesh from the pair list. Written as a kernel rather than two
+    # ``scatter.mark_membership_mask`` calls over ``pairs[:, k]`` because such a column is a
+    # *strided* view, and Warp's Python-scope gather reads an index buffer as if contiguous
+    # (CLAUDE.md section 4) -- it would silently mark the wrong faces.
+    i = wp.int32(wp.tid())
+    out_mask_a[pairs[i, 0]] = True
+    out_mask_b[pairs[i, 1]] = True
+
+
+@wp.kernel
 def triangle_pair_segments(
     query_vertices: wp.array[wp.vec3],
     query_faces: wp.array[wp.int32],
