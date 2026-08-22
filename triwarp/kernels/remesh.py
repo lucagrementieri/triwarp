@@ -1975,6 +1975,41 @@ def compact_vertices(
 
 
 @wp.kernel
+def compose_vertex_index(
+    collapse_remap: wp.array[wp.int32],
+    compaction_remap: wp.array[wp.int32],
+    index: wp.array[wp.int32],
+) -> None:
+    # Carry ``quadric_decimate``'s per-input-vertex provenance across one pass, in place: an input
+    # vertex sits at some live slot, the pass's collapse sends that slot to its survivor, and the
+    # compaction renumbers the survivor. Composing the two here rather than returning either one is
+    # what keeps the map a single array of the *input* length -- fixed width, so the pass stays
+    # capturable -- instead of a chain of per-pass maps the caller would have to fold itself.
+    #
+    # ``index`` is genuinely in place: it is both the pass's input and its result, so an ``out_``
+    # prefix would read as write-only (CLAUDE.md section 3's first exemption class).
+    i = wp.int32(wp.tid())
+    current = index[i]
+    if current >= 0:
+        index[i] = compaction_remap[collapse_remap[current]]
+
+
+@wp.kernel
+def compact_face_provenance(
+    source: wp.array[wp.int32],
+    flags: wp.array[wp.int32],
+    ranks: wp.array[wp.int32],
+    out_source: wp.array[wp.int32],
+) -> None:
+    # The companion of ``compact_faces`` for its provenance column: a face that survives carries its
+    # source-face id to the same slot the face itself moved to. Reads and writes are separate
+    # buffers for the same reason ``compact_faces`` reads ``remapped``.
+    f = wp.int32(wp.tid())
+    if flags[f] != 0:
+        out_source[ranks[f] - 1] = source[f]
+
+
+@wp.kernel
 def apply_vertex_remap(
     remap: wp.array[wp.int32], dummy_vertex: wp.int32, out_faces: wp.array[wp.int32]
 ) -> None:

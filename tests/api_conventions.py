@@ -333,6 +333,9 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     ("holes", "fill_dp_span"): frozenset({"dp", "prev"}),
     ("holes", "fill_dp_span_tiled"): frozenset({"dp", "prev"}),
     ("polyline", "orient_ccw"): frozenset({"points2d"}),
+    # ``quadric_decimate``'s provenance column, folded one pass at a time: the array is the previous
+    # pass's answer *and* this pass's, so it is in place and ``out_`` would read as write-only.
+    ("remesh", "compose_vertex_index"): frozenset({"index"}),
     ("registration", "accumulate_cost"): frozenset({"acc"}),
     # ``min_distance_sq`` is the farthest-point sampler's running distance-to-the-chosen-set, folded
     # down one selection at a time and carried across every launch of the greedy loop: input and

@@ -1113,9 +1113,105 @@ def test_quadric_decimate_padding_never_reaches_the_output(
             "the padded face slots are not the dummy triangle"
         )
     assert passes > 1, "the fixture must decimate over several passes for this to test anything"
-    out_vertices_wp, out_faces_wp = buffers.result()
+    out_vertices_wp, out_faces_wp, _face_source_wp = buffers.result()
     assert int(out_faces_wp.shape[0]) // 3 <= len(mesh_tm.faces) // 8
     assert out_faces_wp.numpy().max() < int(out_vertices_wp.shape[0])
+
+
+@pytest.mark.parametrize("target_ratio", [0.5, 0.1])
+def test_quadric_decimate_provenance_maps_are_consistent(
+    device: str, icosphere: tuple[tm.Trimesh, wp.Mesh], target_ratio: float
+) -> None:
+    """
+    Not a library comparison: no reference returns a decimation's provenance, so this is invariants.
+
+    The claim is that the two maps *describe the mesh that was returned*, which is a much stronger
+    statement than either map being well-formed, and it is checked the only way that is exact:
+    mapping each output face's **source** face through ``vertex_index`` must reproduce that output
+    face's own three indices. A collapse renumbers a surviving face's corners and never rebuilds it,
+    so the two triples agree as sets -- measured 3 of 3 shared vertices on every output face at both
+    ratios. A map that drifted by one pass would still be surjective and still be in range; it would
+    fail this.
+
+    Three more, each excluding a different failure: ``vertex_index`` is **onto** the output vertices
+    (nothing survives unreferenced by it), ``face_index`` is **injective** (a collapse deletes faces
+    and creates none, so no two output faces can share a source), and the positions and faces are
+    identical to the plain two-value call, i.e. asking for the maps does not change the answer.
+
+    The lower ratio matters: it takes several passes, so it exercises the composition across the
+    captured graph replay rather than just the first issued pass.
+    """
+    mesh_tm, _ = icosphere
+    vertices_wp, faces_wp = numpy_to_warp(
+        np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces, dtype=np.int32).reshape(-1), device
+    )
+    n_input_vertices = int(vertices_wp.shape[0])
+    faces_np = np.asarray(mesh_tm.faces)
+
+    out_vertices_wp, out_faces_wp, vertex_index_wp, face_index_wp = tw.remesh.quadric_decimate(
+        vertices_wp, faces_wp, target_ratio=target_ratio, return_index=True
+    )
+    n_out_vertices = int(out_vertices_wp.shape[0])
+    n_out_faces = int(out_faces_wp.shape[0]) // 3
+    assert n_out_faces < faces_np.shape[0]  # something was actually decimated
+
+    vertex_index_np = vertex_index_wp.numpy()
+    face_index_np = face_index_wp.numpy()
+    assert vertex_index_np.shape == (n_input_vertices,)
+    assert face_index_np.shape == (n_out_faces,)
+    assert vertex_index_np.max() < n_out_vertices
+    assert set(vertex_index_np[vertex_index_np >= 0].tolist()) == set(range(n_out_vertices))
+    assert len(set(face_index_np.tolist())) == n_out_faces
+    assert face_index_np.min() >= 0
+    assert face_index_np.max() < faces_np.shape[0]
+
+    # The load-bearing check: the source face, renumbered through the vertex map, is the output.
+    out_faces_np = out_faces_wp.numpy().reshape(-1, 3)
+    mapped_np = vertex_index_np[faces_np[face_index_np]]
+    assert np.array_equal(np.sort(mapped_np, axis=1), np.sort(out_faces_np, axis=1))
+
+    plain_vertices_wp, plain_faces_wp = tw.remesh.quadric_decimate(
+        vertices_wp, faces_wp, target_ratio=target_ratio
+    )
+    assert np.array_equal(plain_faces_wp.numpy(), out_faces_wp.numpy())
+    assert np.allclose(plain_vertices_wp.numpy(), out_vertices_wp.numpy(), rtol=1e-6, atol=1e-6)
+
+
+def test_quadric_decimate_provenance_on_degenerate_inputs(device: str) -> None:
+    """
+    Not a library comparison: the ``-1`` entry, and the no-op path's identity maps.
+
+    An input vertex no face references cannot land anywhere, so it reports ``-1`` rather than a
+    plausible index -- the one case where ``vertex_index`` is not total, which is why the docstring
+    says so. And a target at or above the input count returns copies, where both maps must be the
+    identity: a caller carrying an attribute through a decimation that did nothing should get its
+    attribute back, not an exception.
+    """
+    vertices_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [9.0, 9.0, 9.0]], dtype=np.float32
+    )
+    faces_np = np.array([0, 1, 2], dtype=np.int32)
+    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+
+    kept_vertices_wp, kept_faces_wp, vertex_index_wp, face_index_wp = tw.remesh.quadric_decimate(
+        vertices_wp, faces_wp, target_faces=8, return_index=True
+    )
+    assert np.array_equal(kept_vertices_wp.numpy(), vertices_np)
+    assert np.array_equal(kept_faces_wp.numpy(), faces_np)
+    assert np.array_equal(vertex_index_wp.numpy(), np.arange(4))
+    assert np.array_equal(face_index_wp.numpy(), np.arange(1))
+
+    # A mesh with an unreferenced vertex, decimated for real: vertex 3 has nowhere to go.
+    grid_tm = tm.creation.box()
+    grid_vertices_np = np.vstack([np.asarray(grid_tm.vertices), [[9.0, 9.0, 9.0]]])
+    grid_vertices_wp, grid_faces_wp = numpy_to_warp(
+        grid_vertices_np, np.asarray(grid_tm.faces, dtype=np.int32).reshape(-1), device
+    )
+    _vertices_wp, _faces_wp, grid_index_wp, _face_wp = tw.remesh.quadric_decimate(
+        grid_vertices_wp, grid_faces_wp, target_faces=8, return_index=True
+    )
+    assert int(grid_index_wp.numpy()[-1]) == -1  # the unreferenced vertex
 
 
 # ---------------------------------------------------------------------------

@@ -1057,6 +1057,28 @@ def _cluster_positions(
     return tw.array.gather(vertices, representative)
 
 
+@overload
+def quadric_decimate(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    target_faces: int | None = ...,
+    target_ratio: float | None = ...,
+    feature_angle: float = ...,
+    max_iter: int = ...,
+    return_index: Literal[False] = False,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]: ...
+@overload
+def quadric_decimate(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    target_faces: int | None = ...,
+    target_ratio: float | None = ...,
+    feature_angle: float = ...,
+    max_iter: int = ...,
+    return_index: Literal[True],
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]: ...
 def quadric_decimate(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
@@ -1065,7 +1087,11 @@ def quadric_decimate(
     target_ratio: float | None = None,
     feature_angle: float = 30.0,
     max_iter: int = 100,
-) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    return_index: bool = False,
+) -> (
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+    | tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32]]
+):
     """
     Simplify to a target face count by quadric-error edge collapses (Garland-Heckbert).
 
@@ -1103,6 +1129,9 @@ def quadric_decimate(
         Cap on collapse passes. Each pass commits a conflict-free independent set, so a large
         reduction needs many; the loop also stops early once the target is met or a pass commits
         nothing.
+    return_index
+        If ``True``, also return the two provenance maps below, which is how a per-vertex or
+        per-face attribute survives the decimation.
 
     Returns
     -------
@@ -1111,6 +1140,17 @@ def quadric_decimate(
     faces : wp.array[wp.int32]
         Flat ``3 * n_faces`` triangle index buffer. The count is ``<= target_faces`` but not
         necessarily equal to it — see Notes.
+    vertex_index : wp.array[wp.int32]
+        Only when ``return_index`` is ``True``: length ``n_input_vertices``, the **output** vertex
+        each input vertex ended up in, or ``-1`` for an input vertex that survives in no output face
+        (one that was already unreferenced). Many-to-one, since that is what a collapse is, so it is
+        the direction a scatter or a segmented reduction wants.
+    face_index : wp.array[wp.int32]
+        Only when ``return_index`` is ``True``: length ``n_output_faces``, the **input** face each
+        output face came from -- the same output-to-input direction
+        [`split_edges`][triwarp.remesh.split_edges] uses, so a per-face attribute follows through
+        ``tw.array.gather``. A collapse only deletes faces and never creates one, so every output
+        face has exactly one source.
 
     Raises
     ------
@@ -1178,6 +1218,14 @@ def quadric_decimate(
     and narrowing the fixed width (worth 1.01x on the device, since these kernels sit at the launch
     floor — it is kept only because it is worth 1.3-1.7x on **CPU**, which has no graph to replay).
 
+    **``return_index`` costs nothing when it is off and next to nothing when it is on.** The two
+    provenance maps are folded per pass by two launches and one copy against the pass's ~77, and the
+    branch that adds them is evaluated when the pass is *issued*, so the captured graph a CUDA run
+    replays does not even contain it. Measured interleaved on ``icosphere(5)``, medians of 7:
+    **1.00-1.07x on CUDA** (36.6 -> 39.0 ms at 0.1, 18.19 -> 18.20 at 0.5) and within noise on CPU,
+    where the two directions disagreed (0.92x and 1.06x) -- i.e. unmeasurable against this
+    function's own run-to-run spread.
+
     Four consequences to plan around:
 
     - **The target is usually reached exactly, but is not guaranteed.** A pass is budgeted at half
@@ -1206,13 +1254,27 @@ def quadric_decimate(
     target = _resolve_decimation_target(target_faces, target_ratio, n_faces)
 
     if n_faces == 0 or target >= n_faces:
-        return wp.clone(vertices), wp.clone(faces)
+        kept_vertices, kept_faces = wp.clone(vertices), wp.clone(faces)
+        if not return_index:
+            return kept_vertices, kept_faces
+        device = faces.device
+        return (
+            kept_vertices,
+            kept_faces,
+            tw.array.arange(int(vertices.shape[0]), device),
+            tw.array.arange(n_faces, device),
+        )
 
-    buffers = _DecimationBuffers(vertices, faces, target, wp.float32(math.radians(feature_angle)))
+    buffers = _DecimationBuffers(
+        vertices, faces, target, wp.float32(math.radians(feature_angle)), track_index=return_index
+    )
     for _ in range(max_iter):
         if not buffers.run_pass():
             break
-    return buffers.result()
+    out_vertices, out_faces, face_source = buffers.result()
+    if not return_index:
+        return out_vertices, out_faces
+    return out_vertices, out_faces, buffers.vertex_index, face_source
 
 
 class _DecimationBuffers:
@@ -1255,12 +1317,15 @@ class _DecimationBuffers:
         faces: wp.array[wp.int32],
         target: int,
         feature: wp.float32,
+        *,
+        track_index: bool = False,
     ) -> None:
         """Allocate at the input's size, which bounds every later pass, and seed the live counts."""
         device = faces.device
         self._device: wp.Device = device
         self._target = target
         self._feature = feature
+        self._track_index = track_index
         self._graph = None
         self._passes = 0
         self._retain: list = []
@@ -1303,6 +1368,27 @@ class _DecimationBuffers:
         self._half = wp.empty(1, dtype=wp.int32, device=device)
         self._surplus = wp.empty(1, dtype=wp.int32, device=device)
         self._count = wp.zeros(1, dtype=wp.int32, device=device)
+
+        # Provenance, only when a caller asked for it: one entry per *input* vertex composed pass by
+        # pass (``compose_vertex_index``), and a column beside the face buffer compacted with it
+        # (``compact_face_provenance``). Both are fixed width -- the vertex map by construction, the
+        # face column because the face buffer is -- so tracking them does not stop the pass being
+        # captured; the scratch exists because the compaction cannot read and write one buffer.
+        self.vertex_index = (
+            tw.array.arange(self.n_vertices, device)
+            if track_index
+            else wp.empty(0, dtype=wp.int32, device=device)
+        )
+        self.face_source = (
+            tw.array.arange(self.n_faces, device)
+            if track_index
+            else wp.empty(0, dtype=wp.int32, device=device)
+        )
+        self._face_source_scratch = (
+            wp.empty(self.n_faces, dtype=wp.int32, device=device)
+            if track_index
+            else wp.empty(0, dtype=wp.int32, device=device)
+        )
 
     def run_pass(self) -> bool:
         """
@@ -1356,7 +1442,7 @@ class _DecimationBuffers:
         self._csr_columns = wp.empty(2 * edges, dtype=wp.int32, device=device)
         self._csr_values = wp.ones(2 * edges, dtype=wp.float32, device=device)
 
-    def result(self) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    def result(self) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32]]:
         """Copy the live prefixes out of the fixed buffers, which is the only place a size leaks."""
         counts = self.state.numpy()
         n_faces, n_vertices = int(counts[0]), int(counts[1])
@@ -1366,7 +1452,12 @@ class _DecimationBuffers:
             wp.copy(vertices, self.vertices, count=n_vertices)
         if n_faces > 0:
             wp.copy(faces, self.faces, count=3 * n_faces)
-        return vertices, faces
+        face_source = wp.empty(0, dtype=wp.int32, device=self._device)
+        if self._track_index:
+            face_source = wp.empty(n_faces, dtype=wp.int32, device=self._device)
+            if n_faces > 0:
+                wp.copy(face_source, self.face_source, count=n_faces)
+        return vertices, faces, face_source
 
     def _issue_pass(self) -> None:
         """
@@ -1643,6 +1734,27 @@ class _DecimationBuffers:
             inputs=[self._vertex_remap, dummy, self.faces],
             device=device,
         )
+        if self._track_index:
+            # Both maps fold *this* pass into the running answer, so they run after the two
+            # compactions that produced ``_face_ranks`` and ``_vertex_remap``.
+            wp.copy(self._face_source_scratch, self.face_source)
+            wp.launch(
+                kernel_remesh.compact_face_provenance,
+                dim=self.n_faces,
+                inputs=[
+                    self._face_source_scratch,
+                    self._face_flags,
+                    self._face_ranks,
+                    self.face_source,
+                ],
+                device=device,
+            )
+            wp.launch(
+                kernel_remesh.compose_vertex_index,
+                dim=self.n_vertices,
+                inputs=[remap, self._vertex_remap, self.vertex_index],
+                device=device,
+            )
         return [remapped, valid, referenced]
 
 
