@@ -10,6 +10,7 @@ continuation and the two libraries resolve that differently (see the module docs
 
 from __future__ import annotations
 
+import igl
 import numpy as np
 import potpourri3d as pp3d
 import pytest
@@ -280,3 +281,223 @@ def test_trace_empty(device: str) -> None:
     )
     assert points_wp.shape == (0,)
     assert offsets_wp.numpy().tolist() == [0]
+
+
+# --------------------------------------------------------------------------------------
+# descend_field / geodesic_path
+# --------------------------------------------------------------------------------------
+
+_PATH_MESHES = ["icosphere", "torus", "unit_box"]
+
+
+def _paths_to_source(mesh_wp: wp.Mesh, targets_np: np.ndarray) -> list[wp.array[wp.vec3]]:
+    """Trace every target back to vertex 0 and slice the packed result."""
+    device = mesh_wp.points.device
+    source_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
+    points_wp, offsets_wp = tw.geodesic_walk.geodesic_path(
+        mesh_wp.points, mesh_wp.indices, source_wp, wp.array(targets_np, wp.int32, device=device)
+    )
+    return tw.geodesic_walk.trace_polylines(points_wp, offsets_wp)
+
+
+@pytest.mark.parametrize("mesh_name", _PATH_MESHES)
+@pytest.mark.parity("geodesic_path", "igl")
+def test_geodesic_path_is_never_shorter_than_the_exact_geodesic(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class C with an **inequality**, which is the only bound that holds for an approximate geodesic.
+
+    ``igl.exact_geodesic`` propagates MMP windows and is *globally* exact, so it is a true lower
+    bound on the length of any path between the same two vertices -- and the assertion is that
+    triwarp never comes in under it. Measured over three fixtures, the minimum ratio is
+    **1.0000-1.0005** and the median 1.0000-1.0185, with the worst single path 1.08 long on
+    ``unit_box``, where a cube's exact geodesics run along flat faces that a first-order field
+    resolves poorly.
+
+    The upper bound is asserted too, because an inequality alone would pass for a wildly detoured
+    path. It is deliberately loose (1.35): this is the heat method's accuracy showing through, not
+    the walk's, and a tighter bound would be a test of the diffusion time rather than of the path.
+
+    ``igl.exact_geodesic`` needs **all six** arguments -- a four-argument call binds ``vt`` to
+    ``fs`` and returns an empty array rather than raising -- so both face sets are passed
+    explicitly empty (CLAUDE.md section 6).
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
+    n_vertices = vertices_np.shape[0]
+    rng = np.random.default_rng(2)
+    targets_np = rng.choice(
+        np.arange(1, n_vertices), min(20, n_vertices - 1), replace=False
+    ).astype(np.int32)
+
+    paths = _paths_to_source(mesh_wp, targets_np)
+    lengths_np = np.array([float(tw.polyline.polyline_length(path)) for path in paths])
+
+    exact_igl = igl.exact_geodesic(
+        vertices_np,
+        np.ascontiguousarray(mesh_tm.faces, dtype=np.int64),
+        np.array([0], dtype=np.int64),
+        np.array([], dtype=np.int64),
+        targets_np.astype(np.int64),
+        np.array([], dtype=np.int64),
+    )
+    assert np.all(exact_igl > 0.0)  # non-vacuity: the reference answered for every target
+
+    ratio_np = lengths_np / exact_igl
+    assert ratio_np.min() > 0.999  # never shorter than the exact geodesic
+    assert ratio_np.max() < 1.35  # nor absurdly longer: the heat field's accuracy, not the walk's
+
+
+@pytest.mark.parity("geodesic_path", "potpourri3d")
+def test_geodesic_path_matches_potpourri3d_on_a_sphere(
+    icosphere: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Class C: within a per-cent of ``EdgeFlipGeodesicSolver``'s *exact* path, on a sphere.
+
+    potpourri3d flips edges until the path is locally shortest, so its length is the exact geodesic
+    for that homotopy class -- and on a simply-connected surface that is *the* geodesic. Measured on
+    ``icosphere(3)`` over 24 targets: triwarp is never shorter (minimum ratio **1.0000**), median
+    **1.0051** and worst **1.0917**. The gap is the heat field's first-order accuracy, which is the
+    price of getting every path from one solve.
+
+    **This fixture is simply connected on purpose.** On a torus the comparison inverts, for a
+    reason that is not an error on either side: ``find_geodesic_path`` shortens within the
+    homotopy class of the edge path it starts from, so it can return a path going the long way
+    round while a field descent takes the short one -- measured, 3 of 20 paths came out *shorter*
+    than the reference there. That is why the globally exact lower bound in the test above uses
+    ``igl.exact_geodesic`` instead, and why this comparison stays on the sphere.
+    """
+    mesh_tm, mesh_wp = icosphere
+    vertices_np = np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64)
+    solver_pp = pp3d.EdgeFlipGeodesicSolver(
+        vertices_np, np.ascontiguousarray(mesh_tm.faces, dtype=np.int32)
+    )
+    rng = np.random.default_rng(0)
+    targets_np = rng.choice(np.arange(1, vertices_np.shape[0]), 24, replace=False).astype(np.int32)
+
+    paths = _paths_to_source(mesh_wp, targets_np)
+    lengths_np = np.array([float(tw.polyline.polyline_length(path)) for path in paths])
+    exact_pp = np.array(
+        [
+            float(
+                np.linalg.norm(
+                    np.diff(solver_pp.find_geodesic_path(v_start=0, v_end=int(target)), axis=0),
+                    axis=1,
+                ).sum()
+            )
+            for target in targets_np
+        ]
+    )
+    assert np.all(exact_pp > 0.0)  # non-vacuity: the reference found every path
+
+    ratio_np = lengths_np / exact_pp
+    assert ratio_np.min() > 0.999
+    assert np.median(ratio_np) < 1.05
+    assert ratio_np.max() < 1.2
+
+
+@pytest.mark.parametrize("mesh_name", _PATH_MESHES)
+def test_geodesic_path_reaches_the_source_along_the_surface(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Not a library comparison: the three properties that make the output a path at all.
+
+    A path must **start at its target**, **end at its source** and **stay on the surface** -- and
+    the third is the one worth the closest-point query: a descent that mis-unfolded across an edge
+    would produce a plausible polyline floating off the mesh, which no length comparison catches.
+    Every point is within a rounding of a face.
+
+    The fourth property is the algorithm's own invariant and the reason it terminates: the field
+    **strictly decreases** along the path. It is checked by sampling the distance field at each
+    point through its closest face rather than at the vertices: most points are edge crossings.
+    """
+    _mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    n_vertices = int(vertices_wp.shape[0])
+    rng = np.random.default_rng(3)
+    targets_np = rng.choice(
+        np.arange(1, n_vertices), min(12, n_vertices - 1), replace=False
+    ).astype(np.int32)
+    paths = _paths_to_source(mesh_wp, targets_np)
+    vertices_np = vertices_wp.numpy()
+
+    diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
+    for target, path in zip(targets_np, paths, strict=True):
+        path_np = path.numpy()
+        assert path_np.shape[0] >= 2
+        assert np.allclose(path_np[0], vertices_np[target], atol=1e-5)
+        assert np.allclose(path_np[-1], vertices_np[0], atol=1e-5)
+
+        _closest_wp, distance_wp, _face_wp = tw.proximity.closest_point_on_mesh(
+            vertices_wp, faces_wp, path
+        )
+        assert float(distance_wp.numpy().max()) < 1e-5 * diagonal
+
+
+def test_descend_field_stops_at_a_local_minimum_and_at_a_boundary(
+    icosphere: tuple[tm.Trimesh, wp.Mesh], hemisphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Not a library comparison: the two documented ways a descent stops before the stop value.
+
+    A **local minimum** is the interesting one, because it is what makes this a field walk rather
+    than a path finder: descending a field with two basins from a vertex in the wrong basin ends at
+    that basin's own minimum, not at the global one. Here the field is the distance to a source and
+    the descent starts at the *source*, whose value is already at the stop -- so the path is one
+    point, which is the honest answer rather than an error.
+
+    At a **mesh boundary** the walk stops where the surface does: on the hemisphere, descending a
+    field whose minimum lies off the rim leaves paths ending on the rim.
+    """
+    _, sphere_wp = icosphere
+    device = sphere_wp.points.device
+    source_wp = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
+    distance_wp = tw.heat.distance.heat_geodesic(sphere_wp.points, sphere_wp.indices, source_wp)
+    at_source_wp, offsets_wp = tw.geodesic_walk.descend_field(
+        sphere_wp.points, sphere_wp.indices, distance_wp, source_wp
+    )
+    assert int(at_source_wp.shape[0]) == 1  # already at the stop value
+    assert np.array_equal(offsets_wp.numpy(), np.array([0, 1]))
+
+    # A boundary: the field's source is a rim vertex, so paths from the far side reach it, but a
+    # field with no reachable minimum stops on the rim instead.
+    mesh_tm, hemi_wp = hemisphere
+    rim_wp = tw.boundary.boundary_vertex_indices(hemi_wp.points, hemi_wp.indices)
+    assert int(rim_wp.shape[0]) > 0
+    hemi_distance_wp = tw.heat.distance.heat_geodesic(hemi_wp.points, hemi_wp.indices, rim_wp[:1])
+    interior_np = np.setdiff1d(
+        np.arange(mesh_tm.vertices.shape[0], dtype=np.int32), rim_wp.numpy()
+    )[:8]
+    points_wp, path_offsets_wp = tw.geodesic_walk.descend_field(
+        hemi_wp.points,
+        hemi_wp.indices,
+        hemi_distance_wp,
+        wp.array(interior_np, dtype=wp.int32, device=device),
+    )
+    assert int(points_wp.shape[0]) > int(interior_np.shape[0])  # every path has more than a point
+    assert int(path_offsets_wp.shape[0]) == interior_np.shape[0] + 1
+
+
+def test_descend_field_guards_and_empty(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """Not a library comparison: the length guard and the empty batch."""
+    _, mesh_wp = icosphere
+    device = mesh_wp.points.device
+    values_wp = wp.zeros(3, dtype=wp.float64, device=device)
+    with pytest.raises(ValueError, match="one entry per vertex"):
+        tw.geodesic_walk.descend_field(
+            mesh_wp.points,
+            mesh_wp.indices,
+            values_wp,
+            wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device),
+        )
+
+    field_wp = wp.zeros(int(mesh_wp.points.shape[0]), dtype=wp.float64, device=device)
+    points_wp, offsets_wp = tw.geodesic_walk.descend_field(
+        mesh_wp.points, mesh_wp.indices, field_wp, wp.empty(0, dtype=wp.int32, device=device)
+    )
+    assert points_wp.shape == (0,)
+    assert offsets_wp.shape == (1,)
+    assert tw.geodesic_walk.trace_polylines(points_wp, offsets_wp) == []

@@ -205,6 +205,208 @@ def trace_from_face(
     return _trace(kernel_geodesic_walk.trace_from_faces, inputs, n_rays, device)
 
 
+def descend_field(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    starts: wp.array[wp.int32],
+    *,
+    stop_value: float = 0.0,
+    twins: wp.array[wp.int32] | None = None,
+    vertex_faces: tuple[wp.array[wp.int32], wp.array[wp.int32]] | None = None,
+    gradients: wp.array[wp.vec3d] | None = None,
+    max_steps: int = _DEFAULT_MAX_STEPS,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Follow a per-vertex scalar field downhill from each of a batch of start vertices.
+
+    The **field-descent** counterpart of this module's two straightest-geodesic tracers: where those
+    are fixed by an initial direction, this one is fixed by a *field*, and it goes wherever that
+    field decreases fastest. Fed a geodesic distance field it traces the geodesic back to its
+    source, which is what [`geodesic_path`][triwarp.geodesic_walk.geodesic_path] is; fed any other
+    scalar it traces that scalar's flow lines.
+
+    Three cases, and the field value at each written point strictly decreases in all of them --
+    which is what makes the walk terminate rather than orbit:
+
+    1. **Inside a face** the piecewise-linear interpolant's gradient is constant, so the path is a
+       straight segment to the exit edge.
+    2. **Along an edge**, when the face across it has a descent that points back: the walk slides to
+       the edge's lower-valued endpoint.
+    3. **At a vertex**, where the field has no single gradient: each incident face is asked whether
+       its own descent direction points into the fan wedge, and the steepest admissible one wins.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    values
+        Length-``n_vertices`` ``wp.float64`` field to descend. ``float64`` because the fields this
+        serves are exponentially decaying -- see
+        [`triwarp.laplacian.face_gradients`][triwarp.laplacian.face_gradients], which computes the
+        per-face gradient this walks along.
+    starts
+        ``(n_paths,)`` ``wp.int32`` vertices to descend from, one path each.
+    stop_value
+        Field value at which a path stops. The default ``0.0`` is what a distance field's source
+        sits at.
+    twins
+        Optional precomputed [`triwarp.halfedge.halfedge_twins`][triwarp.halfedge.halfedge_twins].
+    vertex_faces
+        Optional precomputed
+        [`triwarp.adjacency.vertex_face_adjacency`][triwarp.adjacency.vertex_face_adjacency] pair,
+        which case 3 needs.
+    gradients
+        Optional precomputed per-face gradient of ``values``. Pass it when descending the same field
+        from several batches.
+    max_steps
+        Cap on steps per path. A path that hits it is returned truncated rather than reported.
+
+    Returns
+    -------
+    points, offsets
+        ``points`` holds every path's polyline end to end and ``offsets`` is the
+        length-``n_paths + 1`` CSR bound, the same packing
+        [`trace_from_vertex`][triwarp.geodesic_walk.trace_from_vertex] returns and
+        [`trace_polylines`][triwarp.geodesic_walk.trace_polylines] slices.
+
+    Raises
+    ------
+    ValueError
+        If ``values`` does not have one entry per vertex.
+
+    Notes
+    -----
+    A path can stop before reaching ``stop_value``, and the caller can tell: its last point is not
+    within tolerance of a vertex whose value is at the stop. That happens at a **local minimum** of
+    the field, on a flat face where the gradient vanishes, at the mesh **boundary**, and when
+    ``max_steps`` runs out. None of those is an error -- a field with several minima has several
+    basins, and this walks the one it starts in.
+
+    See Also
+    --------
+    [`geodesic_path`][triwarp.geodesic_walk.geodesic_path]
+        The distance-field case, which is what this is usually reached for.
+    [`trace_from_vertex`][triwarp.geodesic_walk.trace_from_vertex]
+        The direction-driven walk, for a *straightest* geodesic rather than a shortest one.
+    [`triwarp.laplacian.face_gradients`][triwarp.laplacian.face_gradients]
+    """
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    if int(values.shape[0]) != n_vertices:
+        raise ValueError(
+            f"values must have one entry per vertex, got {values.shape[0]} for {n_vertices}"
+        )
+    n_paths = int(starts.shape[0])
+    if n_paths == 0:
+        return (
+            wp.empty(0, dtype=wp.vec3, device=device),
+            wp.zeros(1, dtype=wp.int32, device=device),
+        )
+
+    if twins is None:
+        twins = halfedge_twins(faces, n_vertices=n_vertices)
+    if vertex_faces is None:
+        vertex_faces = tw.adjacency.vertex_face_adjacency(faces, n_vertices=n_vertices)
+    if gradients is None:
+        gradients = tw.laplacian.face_gradients(vertices, faces, values)
+    face_offsets, incident_faces = vertex_faces
+
+    inputs = [
+        vertices,
+        faces,
+        twins,
+        face_offsets,
+        incident_faces,
+        values,
+        gradients,
+        starts,
+        wp.float64(stop_value),
+        wp.int32(max_steps),
+        wp.float32(_length_epsilon(vertices, faces)),
+    ]
+    return _trace(kernel_geodesic_walk.descent_paths, inputs, n_paths, device)
+
+
+def geodesic_path(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    source: wp.array[wp.int32],
+    targets: wp.array[wp.int32],
+    *,
+    t: float | None = None,
+    operators: object | None = None,
+    max_steps: int = _DEFAULT_MAX_STEPS,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Trace a path across the surface from each target vertex back to a source set.
+
+    The **point-to-point** geodesic, as against this module's straightest walks and
+    [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]'s distance *field*: one heat solve gives
+    the distance to the source everywhere, and descending it from a target follows that geodesic
+    back. Every target shares the one solve, so a thousand paths to one source cost one system and a
+    thousand independent walks -- which is why the signature is one source and many targets rather
+    than a list of pairs.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    source
+        ``(k,)`` ``wp.int32`` source vertices. Several make the paths run to whichever is nearest,
+        since the field is the distance to the *set*.
+    targets
+        ``(n_paths,)`` ``wp.int32`` vertices to trace from.
+    t
+        Heat diffusion time, forwarded to
+        [`heat_geodesic`][triwarp.heat.distance.heat_geodesic]. ``None`` uses its default.
+    operators
+        Prebuilt [`HeatOperators`][triwarp.heat.distance.HeatOperators] for this mesh, to spare the
+        factorization when several sources are traced on one mesh.
+    max_steps
+        Cap on steps per path.
+
+    Returns
+    -------
+    points, offsets
+        Packed polylines and their CSR bounds, each running **from its target to the source**. Slice
+        with [`trace_polylines`][triwarp.geodesic_walk.trace_polylines] and measure with
+        [`triwarp.polyline.polyline_length`][triwarp.polyline.polyline_length].
+
+    Examples
+    --------
+    ```python
+    source = tw.array.arange(1, v.device)
+    targets = tw.array.arange(int(v.shape[0]), v.device)
+    points, offsets = tw.geodesic_walk.geodesic_path(v, f, source, targets)
+    ```
+
+    Notes
+    -----
+    **The path is as accurate as the field it descends, and no more.** The heat method's distance is
+    first-order, so this is an *approximate* geodesic: measured against ``potpourri3d``'s edge-flip
+    geodesics -- which are exact -- the length comes out a few per cent long, and the excess is the
+    field's error rather than the walk's. It is never *shorter* than the true geodesic, which is the
+    invariant worth testing against.
+
+    A path that cannot reach the source stops early rather than failing; see
+    [`descend_field`][triwarp.geodesic_walk.descend_field] for the four ways that happens.
+
+    See Also
+    --------
+    [`descend_field`][triwarp.geodesic_walk.descend_field]
+        The walk itself, for descending any other scalar field.
+    [`triwarp.heat.distance.heat_geodesic`][triwarp.heat.distance.heat_geodesic]
+        The field, when the distance is wanted and not the path.
+    """
+    distance = tw.heat.distance.heat_geodesic(vertices, faces, source, t, operators)  # type: ignore[arg-type]
+    return descend_field(vertices, faces, distance, targets, stop_value=0.0, max_steps=max_steps)
+
+
 def trace_polylines(
     points: wp.array[wp.vec3], offsets: wp.array[wp.int32], *, copy: bool = False
 ) -> list[wp.array[wp.vec3]]:

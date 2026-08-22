@@ -134,6 +134,288 @@ def trace_walk(
 
 
 @wp.func
+def face_value_at(
+    faces: wp.array[wp.int32], values: wp.array[wp.float64], f: wp.int32, weight: wp.vec3
+) -> wp.float64:
+    # The field, interpolated at a barycentric point of one face.
+    return (
+        wp.float64(weight[0]) * values[faces[f * 3]]
+        + wp.float64(weight[1]) * values[faces[f * 3 + 1]]
+        + wp.float64(weight[2]) * values[faces[f * 3 + 2]]
+    )
+
+
+@wp.func
+def descend_at_vertex(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_offsets: wp.array[wp.int32],
+    vertex_faces: wp.array[wp.int32],
+    gradients: wp.array[wp.vec3d],
+    v: wp.int32,
+) -> wp.int32:
+    # Which of ``v``'s incident faces the descent continues into, or -1 if none does.
+    #
+    # This is the case a pure in-face walk cannot handle and the reason a descent path is a state
+    # machine rather than a loop: at a vertex the field has no single gradient, so the walk has to
+    # ask each face of the fan whether *its* constant descent direction points inward from ``v``.
+    # The test is that direction against both edges of the fan wedge at ``v``; the steepest
+    # admissible face wins, which is what makes the choice deterministic rather than fan-order
+    # dependent.
+    best_face = wp.int32(-1)
+    best_slope = wp.float64(0.0)
+    for slot in range(face_offsets[v], face_offsets[v + 1]):
+        f = vertex_faces[slot]
+        corner = wp.int32(-1)
+        for k in range(3):
+            if faces[f * 3 + k] == v:
+                corner = k
+        if corner < 0:
+            continue
+        gradient = gradients[f]
+        slope = wp.length(gradient)
+        if slope <= wp.float64(0.0):
+            continue
+        direction = -wp.vec3(
+            wp.float32(gradient[0]), wp.float32(gradient[1]), wp.float32(gradient[2])
+        ) / wp.float32(slope)
+        normal_of = face_normal(vertices, faces, f)
+        # Is the direction inside the fan wedge at ``v``? The wedge is spanned by the two incident
+        # edges, and the test is the orientation-agnostic "same side of each": ``d`` is inside when
+        # it turns the same way from the first edge as the second does, and the same way from the
+        # second as the first does. A weaker test -- rejecting only a direction negative against
+        # *both* edges -- lets through a face whose descent leaves through the vertex itself, and
+        # then the walk finds no exit edge and stops after one point. Measured: that mistake left 38
+        # of 40 paths one point long.
+        first = vertices[faces[f * 3 + (corner + 1) % 3]] - vertices[v]
+        second = vertices[faces[f * 3 + (corner + 2) % 3]] - vertices[v]
+        wedge = wp.dot(wp.cross(first, second), normal_of)
+        if wedge == 0.0:
+            continue  # a degenerate corner spans no wedge
+        if wp.dot(wp.cross(first, direction), normal_of) * wedge < 0.0:
+            continue
+        if wp.dot(wp.cross(direction, second), normal_of) * wedge < 0.0:
+            continue
+        if best_face == wp.int32(-1) or slope > best_slope:
+            best_face = f
+            best_slope = slope
+    return best_face
+
+
+@wp.func
+def descend_to_neighbour(
+    faces: wp.array[wp.int32],
+    face_offsets: wp.array[wp.int32],
+    vertex_faces: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    v: wp.int32,
+) -> wp.int32:
+    # The lowest-valued vertex of ``v``'s 1-ring, or -1 when ``v`` is already the lowest.
+    #
+    # The fallback for a vertex no face's descent leads out of, which is the discrete form of
+    # "descend along an edge": the ring is read off the incident faces rather than from an ordered
+    # one-ring, because the order is irrelevant here and the face CSR exists on meshes where a
+    # rotational order does not.
+    best = wp.int32(-1)
+    best_value = values[v]
+    for slot in range(face_offsets[v], face_offsets[v + 1]):
+        f = vertex_faces[slot]
+        for k in range(3):
+            other = faces[f * 3 + k]
+            if other != v and values[other] < best_value:
+                best = other
+                best_value = values[other]
+    return best
+
+
+@wp.func
+def descent_walk(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    twins: wp.array[wp.int32],
+    face_offsets: wp.array[wp.int32],
+    vertex_faces: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    gradients: wp.array[wp.vec3d],
+    start_vertex: wp.int32,
+    stop_value: wp.float64,
+    max_steps: wp.int32,
+    length_epsilon: wp.float32,
+    write_begin: wp.int32,
+    out_points: wp.array[wp.vec3],
+) -> wp.int32:
+    # Follow the steepest descent of a per-vertex field from ``start_vertex`` until the field drops
+    # to ``stop_value``. With a geodesic distance field to a source, that traces the geodesic *back*
+    # to the source -- the path a caller reads in either direction.
+    #
+    # A two-state machine: **at a vertex** (``face < 0``) or **inside a face**. Every branch either
+    # writes a point whose field value is strictly lower than the last, or stops -- which is what
+    # makes the walk terminate rather than orbit, and it is the reason the vertex state exists at
+    # all. The field has no single gradient at a vertex, and the two cases a purely in-face walk
+    # cannot express are exactly the ones that arise there: a descent that runs *along* an edge, and
+    # one that leaves through a corner.
+    count = wp.int32(0)
+    vertex = start_vertex
+    point = vertices[vertex]
+    if write_begin >= wp.int32(0):
+        out_points[write_begin] = point
+    count += wp.int32(1)
+
+    face = wp.int32(-1)
+    entry_edge = wp.int32(-1)
+    for _step in range(max_steps):
+        if face < wp.int32(0):
+            # --- at a vertex -------------------------------------------------------------------
+            if values[vertex] <= stop_value:
+                break
+            chosen = descend_at_vertex(
+                vertices, faces, face_offsets, vertex_faces, gradients, vertex
+            )
+            if chosen >= wp.int32(0):
+                face = chosen
+                point = vertices[vertex]
+                entry_edge = wp.int32(-1)
+                continue
+            # No face's descent leads out of this vertex: step along an edge instead.
+            neighbour = descend_to_neighbour(faces, face_offsets, vertex_faces, values, vertex)
+            if neighbour < wp.int32(0):
+                break  # a local minimum of the field
+            vertex = neighbour
+            point = vertices[vertex]
+            if write_begin >= wp.int32(0):
+                out_points[write_begin + count] = point
+            count += wp.int32(1)
+            continue
+
+        # --- inside a face -------------------------------------------------------------------
+        gradient = gradients[face]
+        slope = wp.length(gradient)
+        normal = face_normal(vertices, faces, face)
+        edge = wp.int32(-1)
+        distance = wp.float32(0.0)
+        direction = wp.vec3(0.0, 0.0, 0.0)
+        if slope > wp.float64(0.0):
+            descent = -wp.vec3(
+                wp.float32(gradient[0]), wp.float32(gradient[1]), wp.float32(gradient[2])
+            ) / wp.float32(slope)
+            direction, tangential_length = unit_tangent(descent, normal, TOLERANCE_ZERO_CONSTANT)
+            if tangential_length > TOLERANCE_ZERO_CONSTANT:
+                edge, distance = exit_edge(
+                    vertices, faces, face, normal, point, direction, entry_edge, length_epsilon
+                )
+        if edge < wp.int32(0):
+            # A flat face, or a descent grazing a corner: fall back to this face's lowest corner.
+            lowest = faces[face * 3]
+            for k in range(1, 3):
+                if values[faces[face * 3 + k]] < values[lowest]:
+                    lowest = faces[face * 3 + k]
+            if values[lowest] >= values[vertex] and face >= wp.int32(0):
+                break  # no progress available here
+            vertex = lowest
+            point = vertices[vertex]
+            if write_begin >= wp.int32(0):
+                out_points[write_begin + count] = point
+            count += wp.int32(1)
+            face = wp.int32(-1)
+            continue
+
+        point = point + distance * direction
+        if write_begin >= wp.int32(0):
+            out_points[write_begin + count] = point
+        count += wp.int32(1)
+
+        start = faces[face * 3 + edge]
+        end = faces[face * 3 + (edge + 1) % 3]
+        if values[start] <= stop_value or values[end] <= stop_value:
+            # The stop value sits on a corner of the edge just reached: finish *at* that vertex
+            # rather than on the edge, so a distance field's path closes exactly on its source.
+            reached = start
+            if values[end] < values[start]:
+                reached = end
+            if write_begin >= wp.int32(0):
+                out_points[write_begin + count] = vertices[reached]
+            count += wp.int32(1)
+            break
+
+        twin = twins[face * 3 + edge]
+        if twin == wp.int32(-1):
+            break  # the descent ran into the mesh boundary
+        next_face = twin // wp.int32(3)
+        next_gradient = gradients[next_face]
+        enters = wp.bool(False)
+        if wp.length(next_gradient) > wp.float64(0.0):
+            # Does the next face's descent point *into* it? Tested against the edge's true inward
+            # normal in that face's plane -- a cheaper test against "the direction of the opposite
+            # corner" is wrong on an obtuse triangle, which is what left paths stopping early.
+            next_normal = face_normal(vertices, faces, next_face)
+            inward = wp.cross(next_normal, vertices[end] - vertices[start])
+            opposite = faces[next_face * 3 + (twin % wp.int32(3) + 2) % 3]
+            if wp.dot(inward, vertices[opposite] - vertices[start]) < 0.0:
+                inward = -inward
+            next_descent = -wp.vec3(
+                wp.float32(next_gradient[0]),
+                wp.float32(next_gradient[1]),
+                wp.float32(next_gradient[2]),
+            )
+            enters = wp.dot(next_descent, inward) > 0.0
+        if enters:
+            face = next_face
+            entry_edge = twin % wp.int32(3)
+            continue
+
+        # The descent runs along this edge: slide to its lower-valued endpoint.
+        vertex = start
+        if values[end] < values[start]:
+            vertex = end
+        point = vertices[vertex]
+        if write_begin >= wp.int32(0):
+            out_points[write_begin + count] = point
+        count += wp.int32(1)
+        face = wp.int32(-1)
+    return count
+
+
+@wp.kernel
+def descent_paths(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    twins: wp.array[wp.int32],
+    face_offsets: wp.array[wp.int32],
+    vertex_faces: wp.array[wp.int32],
+    values: wp.array[wp.float64],
+    gradients: wp.array[wp.vec3d],
+    starts: wp.array[wp.int32],
+    stop_value: wp.float64,
+    max_steps: wp.int32,
+    length_epsilon: wp.float32,
+    offsets: wp.array[wp.int32],
+    out_counts: wp.array[wp.int32],
+    out_points: wp.array[wp.vec3],
+) -> None:
+    # One path per thread. ``offsets`` is empty on the counting pass, which is how the two passes
+    # share ``descent_walk`` -- the same convention ``trace_from_faces`` uses.
+    r = wp.int32(wp.tid())
+    write_begin = wp.int32(-1)
+    if offsets.shape[0] > 0:
+        write_begin = offsets[r]
+    out_counts[r] = descent_walk(
+        vertices,
+        faces,
+        twins,
+        face_offsets,
+        vertex_faces,
+        values,
+        gradients,
+        starts[r],
+        stop_value,
+        max_steps,
+        length_epsilon,
+        write_begin,
+        out_points,
+    )
+
+
+@wp.func
 def start_direction_at_vertex(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
