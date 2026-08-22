@@ -605,9 +605,9 @@ def test_face_self_intersecting_mask_matches_meshlib(
     domain. Read raw, the comparison fails by shape on exactly the meshes where it should pass.
 
     ``touchIsIntersection=False`` is the setting that matches triwarp, which flags a pair only when
-    the separating-axis test finds a genuine crossing; at ``True`` MeshLib additionally flags
-    coplanar contact and reads **253** faces against triwarp's 177 on ``boy_surface``. That is the
-    convention knob, so it is passed explicitly rather than left at its default.
+    Moller's interval test finds a genuine crossing; at ``True`` MeshLib additionally flags coplanar
+    contact and reads **253** faces against triwarp's 177 on ``boy_surface``. That is the convention
+    knob, so it is passed explicitly rather than left at its default.
 
     Non-vacuous in both directions: ``boy_surface`` is a closed surface that passes through itself,
     where both sides flag 177 of 2 964 faces, and the two closed fixtures flag none. A comparison
@@ -653,6 +653,43 @@ def test_face_self_intersecting_mask_two_boxes_matches_meshlib(device: str) -> N
     assert np.array_equal(mask_wp.numpy(), mask_ml)
 
 
+@pytest.mark.parity("face_self_intersecting_mask", "meshlib")
+def test_face_self_intersecting_mask_on_an_interpenetrating_torus(
+    torus_self_intersecting: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Class B, and the regression test for a narrow phase that used to over-report by 2x here.
+
+    A 16x16 torus whose tube is wider than its hole, so its inner wall passes through itself in a
+    band -- and, being a regular grid, it is full of **parallel edges**. That is what makes it the
+    input this belongs on: the previous 11-axis separating-axis narrow phase projected onto
+    edge-edge cross products that *vanish* for parallel edges, read the collapsed interval as an
+    overlap, and flagged **128** faces where an exact ``float64`` Moller test and MeshLib both find
+    **64** -- the same 64, face for face. Moller's interval test now flags 62, missing 4 of the
+    exact answer and adding 2, all of them on the tangency where the two walls meet and float32
+    cannot decide.
+
+    So the assert is a *count band* plus a subset relation rather than an equality: triwarp's answer
+    must sit within a few faces of MeshLib's and must not exceed it by more than a handful, which
+    the old 2x over-report would fail by a wide margin. The band is the honest form here, and
+    ``test_face_self_intersecting_mask_matches_meshlib`` above keeps the exact comparison on the
+    fixtures where both are decidable.
+    """
+    mesh_tm, mesh_wp = torus_self_intersecting
+    n_faces = mesh_tm.faces.shape[0]
+    mask_wp = tw.validation.face_self_intersecting_mask(mesh_wp.points, mesh_wp.indices).numpy()
+
+    colliding_ml = mm.findSelfCollidingTrianglesBS(
+        mm.MeshPart(trimesh_to_meshlib(mesh_tm)), touchIsIntersection=False
+    )
+    mask_ml = meshlib_bitset_to_numpy(colliding_ml, n_faces)
+
+    assert int(mask_ml.sum()) == 64  # non-vacuity, and the number the old code doubled
+    assert abs(int(mask_wp.sum()) - 64) <= 8
+    assert int((mask_wp & ~mask_ml).sum()) <= 8  # no wholesale over-reporting
+    assert tw.validation.is_self_intersecting(mesh_wp) is True
+
+
 def test_face_self_intersecting_mask_tangential_contact_divergence(
     bohemian_dome: tuple[tm.Trimesh, wp.Mesh],
 ) -> None:
@@ -660,16 +697,19 @@ def test_face_self_intersecting_mask_tangential_contact_divergence(
     Not a parity assert: the input class where triwarp and MeshLib disagree, pinned with numbers.
 
     The Bohemian dome's two sheets meet along a curve they are *tangent* to rather than crossing
-    transversally, and there the two separating-axis implementations classify a band of triangles
-    differently: triwarp flags **205** of 3 042 faces, MeshLib **161**, with 45 flagged only by
-    triwarp and 1 only by MeshLib. Neither is a rounding artifact -- the disagreeing faces span the
-    full area range, none is degenerate, and the mesh has no duplicated vertices. Turning
-    ``touchIsIntersection`` on moves MeshLib to 165, not to 205, so it is not the touch convention
-    either.
+    transversally, so which triangles count as crossing is decided in the last bits of ``float32``.
+    triwarp flags **160** of 3 042 faces and MeshLib **161**, disagreeing on **3**.
 
-    Recorded rather than tolerated: the exact comparison lives on the transversal fixtures above,
-    and this bounds the tangential disagreement at **2 %** of the faces so that a regression which
-    stopped detecting the contact curve at all, or started flagging the whole mesh, would fail here.
+    An earlier version of this test recorded 205 against 161 and called it two separating-axis
+    implementations classifying a band differently. That reading was wrong and the numbers said so
+    once arbitrated: an exact ``float64`` Moller test agreed with MeshLib on 42 of the 45 faces only
+    triwarp flagged, i.e. they were **false positives** from projecting onto a degenerate SAT axis
+    (parallel edges give a zero cross product, and the old code read the collapsed interval as an
+    overlap). The narrow phase is Moller's interval test now, and the residual 3 faces are genuine
+    float32 tangency -- the arbiter sides with triwarp on 2 of them and MeshLib on 1.
+
+    The bound is **0.5 %** of the faces rather than the 2 % that disagreement needed, which is what
+    makes this a regression test: reintroducing the degenerate-axis bug would take it back over 1 %.
     """
     mesh_tm, mesh_wp = bohemian_dome
     n_faces = mesh_tm.faces.shape[0]
@@ -681,7 +721,7 @@ def test_face_self_intersecting_mask_tangential_contact_divergence(
 
     assert mask_wp.sum() > 0
     assert mask_ml.sum() > 0
-    assert int((mask_wp != mask_ml).sum()) < 0.02 * n_faces
+    assert int((mask_wp != mask_ml).sum()) < 0.005 * n_faces
 
 
 @pytest.mark.parametrize("mesh_name", ALL_MESHES)

@@ -184,6 +184,42 @@ def test_split_matches_meshlib(request: pytest.FixtureRequest) -> None:
     assert (covered_np == 1).all()
 
 
+@pytest.mark.parity("split", "meshlib")
+def test_split_finds_all_eight_components_of_one_generated_mesh(
+    torus_components: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Class B on the partition, on a mesh that arrived as **one buffer** with eight components in it.
+
+    Every other ``split`` test builds its input with ``concatenate``, so the components were
+    separate buffers a moment earlier and their faces are already contiguous and index-disjoint.
+    This fixture is one generated mesh whose eight open pieces interleave in neither respect, which
+    is the input a labelling that leaned on contiguity would get wrong -- and there are eight, where
+    the concatenated tests use three.
+
+    Compared against ``getAllComponents`` on face counts and against trimesh's own ``split``, plus
+    the covering assert: every face in exactly one component.
+    """
+    mesh_tm, mesh_wp = torus_components
+    n_faces = mesh_tm.faces.shape[0]
+    parts_wp = tw.combine.split(mesh_wp.points, mesh_wp.indices)
+
+    components_ml = mm.getAllComponents(
+        mm.MeshPart(trimesh_to_meshlib(mesh_tm)), mm.MeshComponents.FaceIncidence.PerEdge
+    )
+    counts_ml = sorted(component_ml.count() for component_ml in components_ml)
+    counts_tm = sorted(part_tm.faces.shape[0] for part_tm in mesh_tm.split(only_watertight=False))
+
+    assert len(counts_ml) == 8  # non-vacuity: the reference really sees eight pieces
+    assert counts_ml == counts_tm
+    assert sorted(int(faces_wp.shape[0]) // 3 for _vertices_wp, faces_wp in parts_wp) == counts_ml
+
+    covered_np = np.zeros(n_faces, dtype=int)
+    for component_ml in components_ml:
+        covered_np += meshlib_bitset_to_numpy(component_ml, n_faces)
+    assert (covered_np == 1).all()
+
+
 @pytest.mark.parity("split", "open3d", "pymeshlab")
 def test_split_matches_open3d_and_pymeshlab(request: pytest.FixtureRequest) -> None:
     """

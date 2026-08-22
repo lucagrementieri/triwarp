@@ -386,9 +386,8 @@ def mesh_with_mesh(
 
     Broad phase builds a ``wp.Mesh`` over the mesh with fewer faces and queries
     triangle AABBs via ``wp.mesh_query_aabb``; each triangle of the other mesh
-    supplies the query box. Narrow phase
-    applies separating-axis triangle tests and clips the intersection line to both
-    triangles. Coplanar overlapping faces produce no segments.
+    supplies the query box. Narrow phase runs Moller's interval test and clips the intersection
+    line to both triangles. Coplanar overlapping faces produce no segments.
 
     Parameters
     ----------

@@ -6,9 +6,10 @@ import numpy as np
 import pytest
 import trimesh as tm
 import warp as wp
+from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from tests.conversions import trimesh_to_warp, warp_to_trimesh
+from tests.conversions import meshlib_to_trimesh, trimesh_to_warp, warp_to_trimesh
 
 # Reject a launch whose array arguments do not live on the launch device. Warp's default is
 # RELAXED, which passes the pointers straight through: a launch that forgets ``device=`` lands on
@@ -296,6 +297,64 @@ def bohemian_dome(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
     vertices_wp, faces_wp = tw.creation.parametric_surface("bohemian_dome", device=device)
     mesh = warp_to_trimesh(vertices_wp, faces_wp)
     return mesh, trimesh_to_warp(mesh, device)
+
+
+# Two pathological tori, built by ``meshlib``'s own generators rather than by hand: a closed surface
+# that passes through itself, and one that is eight disconnected pieces. The only fixtures here that
+# are *deliberately broken*, and fixed low resolutions, so each is a constant. The same family also
+# generates a spiked torus and an undercut one (``makeTorusWithSpikes`` / ``makeTorusWithUndercut``)
+# which are not fixtures yet because nothing consumes them; add them with their first caller.
+#
+# This is the one place in ``tests/`` where a fixture's geometry comes from MeshLib. That is
+# deliberate and it is allowed -- a test dependency is what MeshLib is licensed for, and nothing
+# under ``triwarp/`` names it -- but it goes through ``meshlib_to_trimesh``, which packs the mesh:
+# reading ``getNumpyFaces`` off an unpacked one returns rows of ``[0, 0, 0]`` (CLAUDE.md section 6).
+_TORUS_PRIMARY_RADIUS = 1.0
+_TORUS_RESOLUTION = 16
+
+
+def _torus_fixture(mesh_ml: mm.Mesh, device: str) -> tuple[tm.Trimesh, wp.Mesh]:
+    """Pack a generated MeshLib torus and hand it over in both of the suite's usual forms."""
+    mesh = meshlib_to_trimesh(mesh_ml)
+    return mesh, trimesh_to_warp(mesh, device)
+
+
+@pytest.fixture
+def torus_self_intersecting(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
+    """
+    Build a genus-1 torus whose tube is wider than its hole, so the surface passes through itself.
+
+    512 faces, edge-manifold and consistently wound, and **not** a repairable mesh: the inner wall
+    crosses the outer one, which is the input ``face_self_intersecting_mask`` and any
+    self-intersection repair need and which no clean fixture can provide.
+    [`bohemian_dome`][tests.conftest.bohemian_dome] is the other self-intersecting closed surface
+    here; that one intersects along a curve by construction, where this one interpenetrates in a
+    band.
+    """
+    return _torus_fixture(
+        mm.makeTorusWithSelfIntersections(
+            _TORUS_PRIMARY_RADIUS, 0.5, _TORUS_RESOLUTION, _TORUS_RESOLUTION
+        ),
+        device,
+    )
+
+
+@pytest.fixture
+def torus_components(device: str) -> tuple[tm.Trimesh, wp.Mesh]:
+    """
+    Build a torus broken into **eight** disconnected open pieces, 256 faces in total.
+
+    The multi-component input for ``combine.split``, the component labellings in
+    [`triwarp.graph`][triwarp.graph] and anything that has to survive a mesh which is not one
+    surface. Every piece has a boundary, so it is also the fixture where a per-component *and*
+    per-loop answer both have several instances to be wrong about.
+    """
+    return _torus_fixture(
+        mm.makeTorusWithComponents(
+            _TORUS_PRIMARY_RADIUS, 0.1, _TORUS_RESOLUTION, _TORUS_RESOLUTION
+        ),
+        device,
+    )
 
 
 @pytest.fixture

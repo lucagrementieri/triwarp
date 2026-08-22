@@ -1,6 +1,10 @@
 import warp as wp
 
-from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
+from triwarp.constants import (
+    FLOAT32_INF_CONSTANT,
+    TOLERANCE_MERGE_CONSTANT,
+    TOLERANCE_ZERO_CONSTANT,
+)
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import triangles as kernel_triangles
 from triwarp.kernels.predicates import triangle_aabb
@@ -233,15 +237,6 @@ def axis_interval_projection(axis: wp.vec3, v0: wp.vec3, v1: wp.vec3, v2: wp.vec
 
 
 @wp.func
-def overlaps_along_axis(
-    axis: wp.vec3, a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3
-) -> wp.bool:
-    interval_a = axis_interval_projection(axis, a0, a1, a2)
-    interval_b = axis_interval_projection(axis, b0, b1, b2)
-    return interval_a[0] <= interval_b[1] and interval_a[1] >= interval_b[0]
-
-
-@wp.func
 def unit_axis(axis: wp.int32) -> wp.vec3:
     if axis == 0:
         return wp.vec3(1.0, 0.0, 0.0)
@@ -317,57 +312,84 @@ def triangle_aabb_overlap(
 
 
 @wp.func
-def triangles_intersect_sat(
+def plane_crossing_span(distance: wp.vec3, coordinate: wp.vec3) -> tuple[wp.bool, wp.vec2]:
+    # Where a triangle meets the other triangle's plane, as an interval along the two planes'
+    # intersection line. ``distance`` holds its three vertices' signed distances to that plane and
+    # ``coordinate`` their positions along the line's direction; each edge whose endpoints straddle
+    # the plane contributes one crossing, interpolated at the same ratio.
+    #
+    # A vertex exactly *on* the plane contributes itself, which only matters for a configuration the
+    # caller has already excluded -- it early-outs unless the distances genuinely straddle -- so it
+    # is here for the one live case: a vertex on the plane with the other two on opposite sides,
+    # which is a real crossing.
+    lo = FLOAT32_INF_CONSTANT
+    hi = -FLOAT32_INF_CONSTANT
+    for i in range(3):
+        j = (i + 1) % 3
+        first = distance[i]
+        second = distance[j]
+        if first == 0.0:
+            lo = wp.min(lo, coordinate[i])
+            hi = wp.max(hi, coordinate[i])
+        if first * second < 0.0:
+            weight = first / (first - second)
+            crossing = coordinate[i] + weight * (coordinate[j] - coordinate[i])
+            lo = wp.min(lo, crossing)
+            hi = wp.max(hi, crossing)
+    return lo <= hi, wp.vec2(lo, hi)
+
+
+@wp.func
+def triangles_intersect(
     a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3
 ) -> wp.bool:
-    edge0 = a1 - a0
-    edge1 = a2 - a0
-    edge2 = a2 - a1
-    normal = wp.cross(edge0, edge1)
-
-    other_edge0 = b1 - b0
-    other_edge1 = b2 - b0
-    other_edge2 = b2 - b1
-    other_normal = wp.cross(other_edge0, other_edge1)
-
-    if vec3_equal(normal, other_normal):
+    # Do two triangles cross transversally? Moller's interval test: each triangle is cut by the
+    # other's plane into an interval along the planes' intersection line, and they intersect exactly
+    # when those two intervals overlap. Coplanar and merely touching configurations are **not**
+    # intersections here, which is MeshLib's ``touchIsIntersection=False`` convention and the one
+    # ``validation.face_self_intersecting_mask`` documents.
+    #
+    # This replaced an 11-axis separating-axis test, and the reason is exactness rather than speed.
+    # SAT over two triangles is only exact while every axis is non-degenerate, and an edge-edge
+    # cross product **vanishes for parallel edges** -- which a regular grid is full of. The old code
+    # projected onto the zero axis anyway, where every interval collapses to ``[0, 0]`` and the test
+    # reads "overlapping", so a pair separated only along such an axis was reported as intersecting.
+    # Measured against an exact float64 arbiter: **64 false positives of 128 flagged faces** on a
+    # 16x16 self-intersecting torus (where MeshLib and the arbiter agree exactly on 64), and **42 of
+    # the 45** faces the old code flagged on ``bohemian_dome`` that MeshLib did not. Both were
+    # previously recorded as a "tangential contact divergence"; most of it was this.
+    #
+    # It is **0.86x** the SAT's speed, measured interleaved on an RTX 5090 over three
+    # self-intersecting parametric surfaces (35.9 / 35.6 / 35.7 us against 31.0 / 30.6 / 30.7 at
+    # 46-54k candidate pairs), and that is the right trade: both sit on the launch floor -- 5 us at
+    # 50 000 pairs -- and the faster one was answering a different question. The cost is the
+    # data-dependent edge loop in ``plane_crossing_span``, where SAT is straight-line arithmetic.
+    normal_a = wp.cross(a1 - a0, a2 - a0)
+    distance_b = wp.vec3(
+        wp.dot(normal_a, b0 - a0), wp.dot(normal_a, b1 - a0), wp.dot(normal_a, b2 - a0)
+    )
+    # Entirely in one closed half-space of A's plane: separated, coplanar, or touching at most.
+    if wp.min(distance_b) >= 0.0 or wp.max(distance_b) <= 0.0:
         return False
 
-    axis0 = normal
-    axis1 = other_normal
-    axis2 = wp.cross(edge0, other_edge0)
-    axis3 = wp.cross(edge0, other_edge1)
-    axis4 = wp.cross(edge0, other_edge2)
-    axis5 = wp.cross(edge1, other_edge0)
-    axis6 = wp.cross(edge1, other_edge1)
-    axis7 = wp.cross(edge1, other_edge2)
-    axis8 = wp.cross(edge2, other_edge0)
-    axis9 = wp.cross(edge2, other_edge1)
-    axis10 = wp.cross(edge2, other_edge2)
+    normal_b = wp.cross(b1 - b0, b2 - b0)
+    distance_a = wp.vec3(
+        wp.dot(normal_b, a0 - b0), wp.dot(normal_b, a1 - b0), wp.dot(normal_b, a2 - b0)
+    )
+    if wp.min(distance_a) >= 0.0 or wp.max(distance_a) <= 0.0:
+        return False
 
-    if not overlaps_along_axis(axis0, a0, a1, a2, b0, b1, b2):
+    # Both straddle, so the planes are neither parallel nor coincident and this cannot vanish.
+    direction = wp.cross(normal_a, normal_b)
+    valid_a, span_a = plane_crossing_span(
+        distance_a, wp.vec3(wp.dot(direction, a0), wp.dot(direction, a1), wp.dot(direction, a2))
+    )
+    valid_b, span_b = plane_crossing_span(
+        distance_b, wp.vec3(wp.dot(direction, b0), wp.dot(direction, b1), wp.dot(direction, b2))
+    )
+    if not valid_a or not valid_b:
         return False
-    if not overlaps_along_axis(axis1, a0, a1, a2, b0, b1, b2):
-        return False
-    if not overlaps_along_axis(axis2, a0, a1, a2, b0, b1, b2):
-        return False
-    if not overlaps_along_axis(axis3, a0, a1, a2, b0, b1, b2):
-        return False
-    if not overlaps_along_axis(axis4, a0, a1, a2, b0, b1, b2):
-        return False
-    if not overlaps_along_axis(axis5, a0, a1, a2, b0, b1, b2):
-        return False
-    if not overlaps_along_axis(axis6, a0, a1, a2, b0, b1, b2):
-        return False
-    if not overlaps_along_axis(axis7, a0, a1, a2, b0, b1, b2):
-        return False
-    if not overlaps_along_axis(axis8, a0, a1, a2, b0, b1, b2):
-        return False
-    if not overlaps_along_axis(axis9, a0, a1, a2, b0, b1, b2):
-        return False
-    if not overlaps_along_axis(axis10, a0, a1, a2, b0, b1, b2):
-        return False
-    return True
+    return span_a[0] <= span_b[1] and span_b[0] <= span_a[1]
 
 
 @wp.func
@@ -481,7 +503,7 @@ def filter_intersecting_pairs(
     if triangles_share_vertex(qa, qb, qc, ta, tb, tc):
         out_valid[tid] = False
         return
-    out_valid[tid] = triangles_intersect_sat(qa, qb, qc, ta, tb, tc)
+    out_valid[tid] = triangles_intersect(qa, qb, qc, ta, tb, tc)
 
 
 @wp.kernel

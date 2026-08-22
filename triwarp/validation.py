@@ -318,9 +318,10 @@ def is_self_intersecting(mesh: wp.Mesh, *, max_triangle_collisions: int = 32) ->
     Whether any two non-adjacent triangles of the mesh intersect.
 
     Broad phase queries each triangle's AABB against ``mesh``'s BVH for candidate overlaps;
-    narrow phase runs a separating-axis triangle test on each candidate pair, skipping pairs
-    that share a vertex. Mirrors Open3D's ``IsSelfIntersecting`` (AABB pre-test followed by a
-    triangle-triangle test on non-neighbouring faces).
+    narrow phase runs Moller's interval test on each candidate pair, skipping pairs that share a
+    vertex. Mirrors Open3D's ``IsSelfIntersecting`` (AABB pre-test followed by a triangle-triangle
+    test on non-neighbouring faces). Coplanar and merely touching pairs are **not** intersections
+    -- MeshLib's ``touchIsIntersection=False`` convention.
 
     Parameters
     ----------
@@ -366,10 +367,19 @@ def face_self_intersecting_mask(
     Per-face flag: whether each triangle intersects some non-adjacent triangle.
 
     Broad phase builds a ``warp.Mesh`` and queries each triangle's AABB for candidate overlaps;
-    narrow phase runs a separating-axis triangle test on each candidate pair (skipping pairs that
-    share a vertex), and both faces of every intersecting pair are flagged.
+    narrow phase runs Moller's interval test on each candidate pair (skipping pairs that share a
+    vertex), and both faces of every intersecting pair are flagged.
     [`is_self_intersecting`][triwarp.validation.is_self_intersecting] is ``True`` iff any entry
     of this mask is ``True``.
+
+    A pair that is coplanar, or that touches without crossing, is not an intersection. Where the
+    contact is *tangential* the answer is decided in the last bits of ``float32`` and can differ
+    from a ``float64`` reference by a few faces: measured against MeshLib's
+    ``findSelfCollidingTrianglesBS(touchIsIntersection=False)`` on the six self-intersecting
+    parametric surfaces, **exact agreement on ``boy`` (177 faces) and ``klein`` (203)**, 3 faces
+    apart on ``bohemian_dome`` and 2 on ``cross_cap``, and further apart only on the two whose
+    self-intersection is a singular *curve* (16 on ``figure8_klein``, 60 on ``roman``, where
+    MeshLib's own touch setting moves it by 282). Compare counts, not sets, on that class.
 
     Parameters
     ----------
@@ -426,8 +436,8 @@ def _intersecting_pairs(
     """
     Candidate face pairs and their triangle-triangle verdicts, shared by the predicate and the mask.
 
-    Broad phase queries each triangle's AABB against ``mesh``'s BVH; narrow phase runs a
-    separating-axis test on every candidate pair, skipping pairs that share a vertex.
+    Broad phase queries each triangle's AABB against ``mesh``'s BVH; narrow phase runs Moller's
+    interval test on every candidate pair, skipping pairs that share a vertex.
 
     Parameters
     ----------
