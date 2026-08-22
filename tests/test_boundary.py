@@ -658,5 +658,125 @@ def test_ears_empty(device: str) -> None:
     assert ear_opp_wp.shape == (0,)
 
 
+@pytest.mark.parity("loop_perimeters", "meshlib")
+@pytest.mark.parity("loop_directed_areas", "meshlib")
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+def test_loop_perimeters_and_directed_areas_match_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A on the perimeter and Class B on the area vector, whose **sign** is the transform.
+
+    MeshLib answers per hole through a representative edge: ``holePerimeter`` is a scalar and
+    ``holeDirArea`` a ``Vector3d`` whose norm is the spanned area and whose direction is the loop's
+    normal. The perimeter agrees to 1e-6 with no transform at all.
+
+    The directed area comes back **negated**, and that is a convention rather than an error: the two
+    libraries walk a rim in opposite directions, so the same loop's winding -- and so the sign of
+    every cross product summed around it -- is opposite. Measured on the sliced hemisphere,
+    ``[0, 0, -2.9461]`` against ``[0, 0, +2.9461]``. The **norms** are compared without any
+    transform, which is the part that carries the magnitude, and the negation is asserted separately
+    so a genuine direction disagreement could not hide inside it.
+
+    The two libraries enumerate holes in their own orders, so the scalar comparisons go through
+    **sorted** lists -- the second named transform, and the reason ``half_torus`` (two rims) is
+    usable here at all. The signed vector needs an actual pairing, so it is asserted only where
+    there is a single rim, and the branch is asserted to be reached.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    loops_wp = tw.boundary.boundary_loops(vertices_wp, faces_wp)
+    assert len(loops_wp) > 0  # non-vacuity: an open fixture, so there is a rim to measure
+
+    perimeters_np = tw.boundary.loop_perimeters(vertices_wp, loops_wp).numpy()
+    areas_np = tw.boundary.loop_directed_areas(vertices_wp, loops_wp).numpy()
+    assert perimeters_np.min() > 0.0
+    assert np.linalg.norm(areas_np, axis=1).min() > 0.0
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    holes_ml = mesh_ml.topology.findHoleRepresentiveEdges()
+    assert len(holes_ml) == len(loops_wp)
+    perimeters_ml = np.array(
+        [mm.holePerimeter(mesh_ml.topology, mesh_ml.points, e) for e in holes_ml]
+    )
+    areas_ml = np.array(
+        [
+            [
+                mm.holeDirArea(mesh_ml.topology, mesh_ml.points, e).x,
+                mm.holeDirArea(mesh_ml.topology, mesh_ml.points, e).y,
+                mm.holeDirArea(mesh_ml.topology, mesh_ml.points, e).z,
+            ]
+            for e in holes_ml
+        ]
+    )
+
+    assert np.allclose(np.sort(perimeters_np), np.sort(perimeters_ml), rtol=1e-5)
+    assert np.allclose(
+        np.sort(np.linalg.norm(areas_np, axis=1)),
+        np.sort(np.linalg.norm(areas_ml, axis=1)),
+        rtol=1e-5,
+    )
+    if len(loops_wp) == 1:
+        assert np.allclose(areas_np[0], -areas_ml[0], rtol=1e-5, atol=1e-5)
+    else:
+        assert mesh_name == "half_torus"  # the only multi-rim fixture here, and it stays that way
+
+
+@pytest.mark.parametrize("mesh_name", OPEN_MESHES)
+def test_loop_measures_agree_with_the_single_loop_forms(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Not a parity assert: it pins the batched measures to ``triwarp.polyline``, which has an oracle.
+
+    ``loop_perimeters`` is a segmented ``polyline_length(closed=True)`` and must equal it loop for
+    loop; ``loop_directed_areas`` must point along ``polyline_normal``, which is the same quantity
+    normalized. Both single-loop functions are compared against references elsewhere, so a
+    divergence here is the batching's.
+
+    Also asserted: the directed area is **origin-independent** -- translating the mesh cannot change
+    it, because the cross products of a closed ring cancel the shift. That is the property that lets
+    the kernel skip a centroid pass, and it is invisible in any comparison against a reference that
+    also happens to be centred.
+    """
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    loops_wp = tw.boundary.boundary_loops(vertices_wp, faces_wp)
+    perimeters_np = tw.boundary.loop_perimeters(vertices_wp, loops_wp).numpy()
+    areas_np = tw.boundary.loop_directed_areas(vertices_wp, loops_wp).numpy()
+
+    for index, loop_wp in enumerate(loops_wp):
+        points_wp = tw.array.gather(vertices_wp, loop_wp)
+        assert np.isclose(
+            perimeters_np[index], tw.polyline.polyline_length(points_wp, closed=True), rtol=1e-5
+        )
+        normal_wp = tw.polyline.polyline_normal(points_wp)
+        direction_np = areas_np[index] / np.linalg.norm(areas_np[index])
+        assert np.allclose(direction_np, np.array(list(normal_wp)), rtol=1e-4, atol=1e-4)
+
+    shifted_wp = wp.array(
+        vertices_wp.numpy() + np.array([3.0, -7.0, 11.0], dtype=np.float32),
+        dtype=wp.vec3,
+        device=vertices_wp.device,
+    )
+    assert np.allclose(
+        tw.boundary.loop_directed_areas(shifted_wp, loops_wp).numpy(),
+        areas_np,
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+
+def test_loop_measures_empty(device: str) -> None:
+    """Not a library comparison: no loops, and a loop of zero length, both measure to nothing."""
+    vertices_wp = wp.zeros(4, dtype=wp.vec3, device=device)
+    assert tw.boundary.loop_perimeters(vertices_wp, []).shape == (0,)
+    assert tw.boundary.loop_directed_areas(vertices_wp, []).shape == (0,)
+    empty_loop_wp = wp.empty(0, dtype=wp.int32, device=device)
+    assert tw.boundary.loop_perimeters(vertices_wp, [empty_loop_wp]).shape == (0,)
+    with pytest.raises(ValueError, match=r"rank-1 wp\.int32"):
+        tw.boundary.loop_perimeters(vertices_wp, [wp.zeros(3, dtype=wp.float32, device=device)])
+
+
 def _boundary_indices_tm(mesh_tm: tm.Trimesh) -> np.ndarray:
     return tm_grouping.group_rows(mesh_tm.edges_sorted, require_count=1)

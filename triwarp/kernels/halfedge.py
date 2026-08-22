@@ -4,6 +4,13 @@ from triwarp.constants import INT32_MAX_CONSTANT
 
 
 @wp.func
+def halfedge_next(h: wp.int32) -> wp.int32:
+    # Next halfedge inside the same face, under the ``h = 3 * f + k`` convention of
+    # ``triwarp.halfedge``: index arithmetic, no structure to look up.
+    return h - h % 3 + (h + 1) % 3
+
+
+@wp.func
 def halfedge_prev(h: wp.int32) -> wp.int32:
     # Halfedge ``3*f + k`` runs ``faces[3f+k] -> faces[3f+(k+1)%3]``, so the face-local cycle is
     # pure index arithmetic: no stored ``prev`` pointer.

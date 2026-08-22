@@ -2,15 +2,8 @@ from typing import Any
 
 import warp as wp
 
-from triwarp.kernels.array import binary_search_sorted_contains, cross2
-from triwarp.kernels.grouping import pack_edge_key
-
-
-@wp.func
-def halfedge_next(h: wp.int32) -> wp.int32:
-    # Next halfedge inside the same face, under the ``h = 3 * f + k`` convention of
-    # ``triwarp.halfedge``: index arithmetic, no structure to look up.
-    return h - h % 3 + (h + 1) % 3
+from triwarp.kernels.array import binary_search_sorted_contains, cross2, pack_edge_key
+from triwarp.kernels.halfedge import halfedge_next
 
 
 @wp.kernel

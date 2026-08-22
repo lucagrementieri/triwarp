@@ -489,3 +489,46 @@ def test_stitch_min_weight(bench_case: BenchCase) -> None:
         lambda: tw.holes.stitch_min_weight(va, fa, vb, fb, up_dir=up), rounds=_ROUNDS
     )
     assert int(faces.shape[0]) > 0
+
+
+@pytest.mark.benchmark(group="fillable_loop_mask")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_fillable_loop_mask(bench_case: BenchCase) -> None:
+    """
+    Which rims a min-weight fill can close: one edge pass, plus one readback of the rims.
+
+    The chord test is a sweep over every unique edge, so the cost tracks the *mesh* rather than the
+    boundary; the pinch test rides on one readback of the loops, which tracks the boundary. Read
+    against ``fill_min_weight`` -- the point of the mask is that it is a small fraction of the fill
+    it predicts, so a caller can afford to ask first.
+
+    meshlib's half of the answer is ``findRepeatedVertsOnHoleBd``, the pinch condition, which is the
+    only one of its three fillability predicates this ports (the other two are recorded as not
+    matching in ``tests/test_holes.py``). So the row is a **partial** comparison on the reference
+    side and does strictly less work -- read it as a floor, not as a like-for-like.
+
+    First measurement, medians on an RTX 5090:
+
+    | mesh | triwarp-cuda | meshlib (pinch only) |
+    |---|---|---|
+    | ``bunny_decimated`` | 1.09 ms | 0.10 (10.7x) |
+    | ``bunny`` | 1.17 ms | 0.20 (5.8x) |
+    | ``dragon`` | 7.14 ms | 0.87 (8.2x) |
+    | ``lucy`` | 102.1 ms | (capped) |
+
+    The first version read each rim back separately and measured **14.09 ms** on ``dragon``; the
+    rims are concatenated on the device now and read in one transfer, which was **1.97x**. What is
+    left is the chord sweep, which is a pass over every unique edge and so tracks the mesh -- there
+    is no smaller correct version of that test, and it is the half meshlib does not do at all.
+    """
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        bits_ml = bench_case.run(lambda: mm.findRepeatedVertsOnHoleBd(mesh_ml.topology))
+        assert bits_ml.size() >= 0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    loops = tw.boundary.boundary_loops(vertices, faces)
+    if not loops:
+        pytest.skip(f"{bench_case.mesh_name} is closed: there is no rim to judge")
+    fillable = bench_case.run(lambda: tw.holes.fillable_loop_mask(vertices, faces, loops))
+    assert int(fillable.shape[0]) == len(loops)

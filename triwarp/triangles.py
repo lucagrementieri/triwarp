@@ -18,7 +18,9 @@ from typing import Literal
 
 import warp as wp
 
+import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import grouping as kernel_grouping
 from triwarp.kernels import triangles as kernel_triangles
 
 
@@ -96,6 +98,150 @@ _QUALITY_METRICS: dict[str, wp.int32] = {
     "mean_ratio": kernel_triangles.QUALITY_MEAN_RATIO,
     "area": kernel_triangles.QUALITY_AREA,
 }
+
+
+CornerNormalWeighting = Literal["angle", "area"]
+"""Per-corner weight selected by [`corner_normals`][triwarp.triangles.corner_normals]."""
+
+
+def corner_normals(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    crease_edges: twt.Array2dInt32 | None = None,
+    *,
+    weighting: CornerNormalWeighting = "angle",
+    twins: wp.array[wp.int32] | None = None,
+    n_vertices: int | None = None,
+) -> twt.Array2dVec3:
+    """
+    Per-corner normals: one normal for each ``(face, corner)``, averaged over its smooth group.
+
+    The third weighting triwarp lacked. A *face* normal is flat, a *vertex* normal is smooth
+    everywhere, and neither can render a crease: a cube needs three different normals at each of its
+    corners, one per incident face group. This gives each corner the angle-weighted average of the
+    faces reachable from its own by rotating about its vertex **without crossing a crease edge**,
+    which is what an OBJ export or a hard-edge renderer needs.
+
+    Two exact identities fall out of that definition and are worth knowing, because they are also
+    how it is tested:
+
+    * with **no** creases, every corner of a vertex gets that vertex's normal under the matching
+      weighting -- [`angle_weighted_vertex_normals`][triwarp.vertices.angle_weighted_vertex_normals]
+      or [`area_weighted_vertex_normals`][triwarp.vertices.area_weighted_vertex_normals];
+    * with **every** edge a crease, every corner gets its own face's normal, whatever the weighting.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    crease_edges
+        ``(k, 2)`` ``wp.int32`` vertex pairs to treat as hard edges, in either order per row --
+        typically [`crease_edges`][triwarp.seams.crease_edges]. ``None`` means no creases, which is
+        the fully smooth case above and costs one comparison per rotation step rather than a branch.
+    weighting
+        Per-corner weight for the average, named as in
+        [`triwarp.vertices`][triwarp.vertices]' four vertex-normal functions: ``"angle"`` is the
+        corner angle (Thuerrner & Wuethrich) and ``"area"`` is the face's own area, constant across
+        its three corners. Both are offered because the two reference implementations disagree --
+        MeshLib's ``computePerCornerNormals`` is the **area** one.
+    twins
+        Optional precomputed [`halfedge_twins`][triwarp.halfedge.halfedge_twins].
+    n_vertices
+        Total vertex count. When ``None`` it is inferred with
+        [`n_vertices`][triwarp.vertices.n_vertices], which costs a host readback.
+
+    Returns
+    -------
+    twt.Array2dVec3
+        ``(n_faces, 3)`` unit normals on ``faces.device``; entry ``(f, k)`` belongs to corner
+        ``k`` of face ``f``. A corner whose weighted sum cancels to zero comes back as the zero
+        vector, matching [`weighted_vertex_normals`][triwarp.vertices.weighted_vertex_normals].
+
+    Raises
+    ------
+    ValueError
+        If ``crease_edges`` is given and is not a rank-2 ``wp.int32`` array with two columns, or
+        ``weighting`` is not one of the two names above. Also propagated from
+        [`halfedge_twins`][triwarp.halfedge.halfedge_twins] when the mesh is **not edge-manifold**:
+        rotating about a vertex is what this computes, and an edge with three faces has no rotation.
+        Pass ``twins`` yourself if you have already resolved that.
+
+    Examples
+    --------
+    ```python
+    creases = tw.seams.crease_edges(v, f, angle=0.5)
+    normals = tw.triangles.corner_normals(v, f, creases)
+    assert normals.shape == (f.shape[0] // 3, 3)
+    ```
+
+    See Also
+    --------
+    [`face_normals_and_areas`][triwarp.triangles.face_normals_and_areas]
+        The flat weighting: one normal per face.
+    [`angle_weighted_vertex_normals`][triwarp.vertices.angle_weighted_vertex_normals]
+        The smooth weighting this reduces to when there are no creases.
+    [`crease_edges`][triwarp.seams.crease_edges]
+        Produces the hard-edge set.
+    """
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    if n_faces == 0:
+        return twt.as_array2d(twt.empty_2d((0, 3), wp.vec3, device=device), wp.vec3)
+    if n_vertices is None:
+        n_vertices = tw.vertices.n_vertices(faces)
+    if twins is None:
+        twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
+
+    crease_keys = wp.empty(0, dtype=wp.uint64, device=device)
+    if crease_edges is not None:
+        twt.ensure_ndim(crease_edges, 2, dtype=wp.int32)
+        if int(crease_edges.shape[1]) != 2:
+            raise ValueError(f"crease_edges must have shape (k, 2), got {crease_edges.shape}")
+        n_creases = int(crease_edges.shape[0])
+        if n_creases > 0:
+            keys = wp.empty(n_creases, dtype=wp.uint64, device=device)
+            wp.launch(
+                kernel_grouping.pack_undirected_edge_keys,
+                dim=n_creases,
+                inputs=[crease_edges, wp.uint64(n_vertices), keys],
+                device=device,
+            )
+            crease_keys = tw.array.sort_and_argsort(keys)[0]
+
+    normals_per_face, areas = face_normals_and_areas(vertices, faces)
+    if weighting == "angle":
+        # ``(n_faces, 3)`` reshaped flat is already corner-indexed: row ``f`` column ``k`` is
+        # corner ``3f + k``, the same index the kernel's thread carries.
+        corner_weights = face_angles(vertices, faces).reshape(3 * n_faces)
+    elif weighting == "area":
+        # One area per face broadcast to its three corners -- a gather rather than a kernel, since
+        # ``repeat_range`` already builds ``i // 3``.
+        corner_weights = tw.array.gather(
+            areas, tw.array.repeat_range(3 * n_faces, 3, device=device)
+        )
+    else:
+        raise ValueError(f"weighting must be 'angle' or 'area', got {weighting!r}")
+
+    normals = twt.empty_2d((n_faces, 3), wp.vec3, device=device)
+    wp.launch(
+        kernel_triangles.corner_normals,
+        dim=3 * n_faces,
+        inputs=[
+            vertices,
+            faces,
+            twins,
+            normals_per_face,
+            corner_weights,
+            crease_keys,
+            wp.uint64(n_vertices),
+            normals,
+        ],
+        device=device,
+    )
+    return twt.as_array2d(normals, wp.vec3)
+
 
 FaceQualityMetric = Literal["aspect_ratio", "radius_ratio", "area_max_side", "mean_ratio", "area"]
 """Shape-quality measure selected by [`face_quality`][triwarp.triangles.face_quality]."""

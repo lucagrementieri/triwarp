@@ -591,3 +591,43 @@ def bsr_to_csr(matrix: object) -> sp.csr_matrix:
         ),
         shape=(nrow, ncol),
     )
+
+
+def meshlib_corner_normals_to_numpy(corner_normals_ml: object, n_faces: int) -> np.ndarray:
+    """
+    Read ``computePerCornerNormals``' result into an ``(n_faces, 3, 3)`` array.
+
+    Its return type is ``Vector_std_array_Vector3f_3_FaceId``, which has no ``len()`` and is not
+    accepted by ``mrmeshnumpy``'s readers -- it is indexed by ``FaceId`` and yields a fixed
+    three-element array of ``Vector3f`` per face. So the readback is a double loop and there is no
+    bulk path; keep the meshes small where this is the oracle.
+    """
+    return np.array(
+        [
+            [
+                (row[k].x, row[k].y, row[k].z)
+                for k, row in ((k, corner_normals_ml[mm.FaceId(face)]) for k in range(3))
+            ]
+            for face in range(n_faces)
+        ],
+        dtype=np.float64,
+    )
+
+
+def numpy_to_meshlib_undirected_edges(
+    topology_ml: mm.MeshTopology, edges_np: np.ndarray
+) -> mm.UndirectedEdgeBitSet:
+    """
+    Vertex-index pairs as MeshLib's ``UndirectedEdgeBitSet``, which its crease arguments take.
+
+    ``findEdge`` resolves a directed ``EdgeId``, and ``.undirected()`` drops the direction, so a row
+    given in either order sets the same bit. The set has to be ``resize``d to the topology's edge
+    count first: an unsized one silently accepts nothing.
+    """
+    bits_ml = mm.UndirectedEdgeBitSet()
+    bits_ml.resize(topology_ml.undirectedEdgeSize())
+    for start, end in np.asarray(edges_np).tolist():
+        bits_ml.set(
+            topology_ml.findEdge(mm.VertId(int(start)), mm.VertId(int(end))).undirected(), True
+        )
+    return bits_ml

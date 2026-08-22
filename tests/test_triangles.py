@@ -12,8 +12,12 @@ from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+import triwarp.typing as twt
 from tests.conversions import (
     faces_igl,
+    meshlib_corner_normals_to_numpy,
+    numpy_to_meshlib_undirected_edges,
+    numpy_to_warp,
     trimesh_to_meshlib,
     trimesh_to_open3d,
     trimesh_to_pymeshlab,
@@ -82,6 +86,118 @@ def test_face_normals_and_areas_against_the_partial_references(
     assert np.allclose(
         normals_wp.numpy(), crosses_pml / magnitudes_pml[:, None], rtol=1e-5, atol=1e-5
     )
+
+
+@pytest.mark.parity("corner_normals", "meshlib")
+@pytest.mark.parametrize("mesh_name", ["unit_box", "icosphere_coarse", "cave_cube"])
+@pytest.mark.parametrize("crease_angle", [None, 0.5])
+def test_corner_normals_matches_meshlib(
+    request: pytest.FixtureRequest, mesh_name: str, crease_angle: float | None
+) -> None:
+    """
+    Class A against ``computePerCornerNormals``, at the **area** weighting and with creases.
+
+    The weighting is the finding this row exists to pin. MeshLib's per-corner normals are
+    area-weighted, not angle-weighted -- measured, they agree with ``weighting="area"`` to 1.2e-07
+    and sit **0.244** from ``weighting="angle"`` on ``unit_box`` and 0.521 on a cylinder. Which is
+    the same split MeshLib already forces on the *vertex* normals (``computePerVertNormals`` pairs
+    with area weighting, ``computePerVertPseudoNormals`` with angle), so it is a convention this
+    reference distinguishes and the others do not.
+
+    Both crease cases are run because they exercise different code: with ``None`` every rotation
+    about a vertex completes and the answer collapses to the vertex normal, while at 0.5 rad the
+    walk stops at hard edges and the per-corner answer is the point of the function. Measured 0.0 on
+    ``unit_box`` with its 12 creases and 6e-08 on a cylinder with 96 of 192.
+
+    The fixtures are **closed and undistorted** deliberately. On ``half_torus``, whose conftest
+    fixture scales its vertices by ``exp(-y)``, the same comparison reads **1.8e-05** -- a float32
+    floor rather than a disagreement, because at 0.5 rad that mesh has 1 099 creases and a
+    normalized sum of a thousand near-cancelling weights amplifies the two libraries' 2.6e-08
+    storage difference. Loosening the tolerance to admit it would weaken the row everywhere else.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    n_faces = int(faces_wp.shape[0]) // 3
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+
+    creases_wp = None
+    creases_ml = mm.UndirectedEdgeBitSet()
+    if crease_angle is not None:
+        creases_wp = tw.seams.crease_edges(vertices_wp, faces_wp, angle=crease_angle)
+        # Non-vacuity: at this angle the fixture must actually have hard edges, or the case below
+        # is the no-crease one again under a different name.
+        assert int(creases_wp.shape[0]) > 0
+        creases_ml = numpy_to_meshlib_undirected_edges(mesh_ml.topology, creases_wp.numpy())
+
+    normals_ml = meshlib_corner_normals_to_numpy(
+        mm.computePerCornerNormals(mesh_ml, creases_ml), n_faces
+    )
+    normals_wp = tw.triangles.corner_normals(vertices_wp, faces_wp, creases_wp, weighting="area")
+    assert normals_wp.shape == (n_faces, 3)
+    assert np.allclose(normals_wp.numpy(), normals_ml, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mesh_name", ["unit_box", "icosphere_coarse", "hemisphere"])
+@pytest.mark.parametrize("weighting", ["angle", "area"])
+def test_corner_normals_degenerate_crease_sets_are_exact(
+    request: pytest.FixtureRequest, mesh_name: str, weighting: str
+) -> None:
+    """
+    Not a library comparison: the two crease sets whose answer is another triwarp function, exactly.
+
+    These are the strongest available checks on the rotation walk, because both sides are computed
+    by different code and must agree to float32 and not to a tolerance:
+
+    * **no creases** -- every rotation completes, so each corner gets its *vertex's* normal under
+      the same weighting, compared against ``triwarp.vertices``' own function;
+    * **every edge a crease** -- no rotation moves at all, so each corner gets its own *face's*
+      normal, whatever the weighting.
+
+    ``hemisphere`` is in the list on purpose: a boundary vertex's fan is a path rather than a
+    cycle, so the walk has to terminate on the rim in both directions and still cover the whole
+    fan. Getting that wrong shows up here and nowhere else.
+    """
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    n_vertices = int(vertices_wp.shape[0])
+    faces_np = faces_wp.numpy().reshape(-1, 3)
+
+    smooth_np = tw.triangles.corner_normals(vertices_wp, faces_wp, weighting=weighting).numpy()
+    vertex_normals_wp = (
+        tw.vertices.angle_weighted_vertex_normals(n_vertices, vertices_wp, faces_wp)
+        if weighting == "angle"
+        else tw.vertices.area_weighted_vertex_normals(n_vertices, vertices_wp, faces_wp)
+    )
+    assert np.allclose(smooth_np, vertex_normals_wp.numpy()[faces_np], rtol=1e-5, atol=1e-5)
+
+    every_edge_wp = tw.edges.faces_to_edges(faces_wp, sorted=True)
+    hard_np = tw.triangles.corner_normals(
+        vertices_wp, faces_wp, every_edge_wp, weighting=weighting
+    ).numpy()
+    face_normals_np = tw.triangles.face_normals_and_areas(vertices_wp, faces_wp)[0].numpy()
+    assert np.allclose(hard_np, face_normals_np[:, None, :], rtol=1e-5, atol=1e-5)
+    # And the two extremes must differ, or neither comparison above is testing the walk.
+    assert not np.allclose(smooth_np, hard_np, rtol=1e-3, atol=1e-3)
+
+
+def test_corner_normals_edge_cases(device: str) -> None:
+    """Not a library comparison: an empty mesh, and the two argument errors."""
+    empty_vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    empty_faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    assert tw.triangles.corner_normals(empty_vertices_wp, empty_faces_wp).shape == (0, 3)
+
+    mesh_tm = tm.creation.box()
+    vertices_wp, faces_wp = numpy_to_warp(
+        np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces).ravel().astype(np.int32), device
+    )
+    with pytest.raises(ValueError, match=r"shape \(k, 2\)"):
+        tw.triangles.corner_normals(
+            vertices_wp,
+            faces_wp,
+            twt.as_array2d(wp.zeros((2, 3), dtype=wp.int32, device=device), wp.int32),
+        )
+    with pytest.raises(ValueError, match="weighting must be"):
+        tw.triangles.corner_normals(vertices_wp, faces_wp, weighting="sine")  # type: ignore[arg-type]
 
 
 @pytest.mark.parity("face_normals_and_areas", "open3d")

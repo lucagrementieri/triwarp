@@ -178,3 +178,72 @@ def test_ears(bench_case: BenchCase) -> None:
     faces_np = bench_case.faces_np
     ears_igl, opposite_igl = bench_case.run(lambda: igl.ears(faces_np))
     assert ears_igl.shape == opposite_igl.shape
+
+
+@pytest.mark.benchmark(group="loop_perimeters")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_loop_perimeters(bench_case: BenchCase) -> None:
+    """
+    Both loop measures at once: one segmented launch over every rim of the mesh.
+
+    The cost is the *packing* plus one launch, not the loops themselves -- which is the claim, since
+    meshlib answers one hole per call and the scan meshes carry many. Its ``holePerimeter`` takes a
+    representative edge, so its row is a Python loop over ``findHoleRepresentiveEdges`` and grows
+    with the hole count where triwarp's does not; that is the shape of the comparison rather than a
+    handicap, since there is no batched entry point to call instead.
+
+    The loops are produced **outside** the timed callable on both sides: ``boundary_loops`` has its
+    own group and would otherwise dominate this one.
+    """
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        holes_ml = mesh_ml.topology.findHoleRepresentiveEdges()
+        if not len(holes_ml):
+            pytest.skip(f"{bench_case.mesh_name} is closed: there is no rim to measure")
+
+        def measure_ml() -> float:
+            return sum(
+                mm.holePerimeter(mesh_ml.topology, mesh_ml.points, edge) for edge in holes_ml
+            )
+
+        assert bench_case.run(measure_ml) > 0.0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    loops = tw.boundary.boundary_loops(vertices, faces)
+    if not loops:
+        pytest.skip(f"{bench_case.mesh_name} is closed: there is no rim to measure")
+    perimeters = bench_case.run(lambda: tw.boundary.loop_perimeters(vertices, loops))
+    assert int(perimeters.shape[0]) == len(loops)
+
+
+@pytest.mark.benchmark(group="loop_directed_areas")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_loop_directed_areas(bench_case: BenchCase) -> None:
+    """
+    The vector measure of the same loops, read against the scalar one above.
+
+    Same packing, same launch shape, one cross product per segment instead of one length -- so the
+    gap between the two groups is what the extra arithmetic costs and nothing else. meshlib's
+    ``holeDirArea`` is again per hole.
+    """
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        holes_ml = mesh_ml.topology.findHoleRepresentiveEdges()
+        if not len(holes_ml):
+            pytest.skip(f"{bench_case.mesh_name} is closed: there is no rim to measure")
+
+        def areas_ml() -> int:
+            return sum(
+                1
+                for edge in holes_ml
+                if mm.holeDirArea(mesh_ml.topology, mesh_ml.points, edge) is not None
+            )
+
+        assert bench_case.run(areas_ml) == len(holes_ml)
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    loops = tw.boundary.boundary_loops(vertices, faces)
+    if not loops:
+        pytest.skip(f"{bench_case.mesh_name} is closed: there is no rim to measure")
+    areas = bench_case.run(lambda: tw.boundary.loop_directed_areas(vertices, loops))
+    assert int(areas.shape[0]) == len(loops)

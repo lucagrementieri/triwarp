@@ -4,8 +4,14 @@ import warp as wp
 
 from triwarp.constants import TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.adjacency import edge_endpoints, edge_pair_topology, write_face_edge_keys
-from triwarp.kernels.array import binary_search_sorted_contains, to_vec2d, to_vec3, to_vec3d
-from triwarp.kernels.grouping import hash_slot, pack_edge_key, sorted_run_start
+from triwarp.kernels.array import (
+    binary_search_sorted_contains,
+    pack_edge_key,
+    to_vec2d,
+    to_vec3,
+    to_vec3d,
+)
+from triwarp.kernels.grouping import hash_slot, sorted_run_start
 from triwarp.kernels.predicates import (
     delone_metrics,
     dihedral_angle,

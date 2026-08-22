@@ -43,6 +43,8 @@ from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 
+_NON_EDGE_MANIFOLD = frozenset({"bunny_decimated", "lucy"})
+
 _barycentre_cache: dict[tuple[str, str], wp.array] = {}
 
 
@@ -276,3 +278,62 @@ def test_face_centroids(bench_case: BenchCase) -> None:
     vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
     centroids_igl = bench_case.run(lambda: igl.barycenter(vertices_np, faces_np))
     assert centroids_igl.shape == (bench_case.n_faces, 3)
+
+
+@pytest.mark.benchmark(group="corner_normals")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.parametrize("creased", [False, True])
+def test_corner_normals(bench_case: BenchCase, creased: bool) -> None:
+    """
+    Per-corner normals: one rotation about each corner's vertex, stopping at creases.
+
+    Read against ``vertex_normals`` -- this does the same accumulation but per *corner* rather than
+    per vertex, so it walks each vertex's fan once per incident face instead of once, and the cost
+    ratio between the two groups is that redundancy. It is the price of a crease-aware answer.
+
+    Both crease cases are timed because they are different work: with no creases every rotation
+    completes and the walk is the full valence, while a creased mesh cuts it short. The crease set
+    is built **outside** the timed callable on both sides, since ``crease_edges`` has its own group.
+
+    meshlib's ``computePerCornerNormals`` is the only reference and uses the **area** weighting, so
+    that is what triwarp is asked for here -- pinned in ``tests/test_triangles.py``. Note the row
+    times the computation only: its ``Vector_std_array_Vector3f_3_FaceId`` result has no bulk
+    readback (indexing it is a double Python loop), which is a test-side cost, not a timed one.
+
+    First measurement, medians on an RTX 5090, smooth / creased:
+
+    | mesh | faces | triwarp-cuda | meshlib |
+    |---|---|---|---|
+    | ``bunny`` | 69 630 | 0.62 / 0.79 ms | **0.35 / 0.35** (1.8-2.2x ahead) |
+    | ``happy_buddha`` | 1 087 716 | **1.27 / 1.51 ms** | (capped) |
+    | ``dragon`` | 871 414 | **1.16 / 1.12 ms** | 5.15 / 5.48 (4.5-4.9x behind) |
+
+    The crossover is the point: meshlib wins at 70k faces and loses by 4.5x at 871k, because its
+    row is a single-threaded per-corner walk while triwarp's is ~0.6 ms of fixed wrapper cost
+    (``halfedge_twins``, the face normals and the angles) plus a walk that barely shows. Below the
+    crossover this group is measuring the prologue, not the walk -- which is also why the creased
+    and smooth columns are within noise of each other on the large meshes.
+    """
+    if bench_case.mesh_name in _NON_EDGE_MANIFOLD:
+        # Rotating about a vertex needs an edge-manifold mesh. Two scan meshes are not:
+        # ``bunny_decimated``'s 87 duplicated faces (CLAUDE.md section 6) leave 150 edges with three
+        # or more faces, and ``lucy`` has 28. Neither is a size limit -- ``dragon`` is larger.
+        pytest.skip(f"{bench_case.mesh_name} is not edge-manifold, so there is no fan to rotate")
+    crease_angle = 0.5
+    if bench_case.kind == "meshlib":
+        mesh_ml = bench_case.new_mesh_ml()
+        creases_ml = mm.UndirectedEdgeBitSet()
+        if creased:
+            creases_ml = mm.UndirectedEdgeBitSet()
+            creases_ml.resize(mesh_ml.topology.undirectedEdgeSize())
+            for edge in range(mesh_ml.topology.undirectedEdgeSize()):
+                creases_ml.set(mm.UndirectedEdgeId(edge), edge % 2 == 0)
+        normals_ml = bench_case.run(lambda: mm.computePerCornerNormals(mesh_ml, creases_ml))
+        assert normals_ml is not None
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    creases = tw.seams.crease_edges(vertices, faces, angle=crease_angle) if creased else None
+    normals = bench_case.run(
+        lambda: tw.triangles.corner_normals(vertices, faces, creases, weighting="area")
+    )
+    assert normals.shape == (bench_case.n_faces, 3)

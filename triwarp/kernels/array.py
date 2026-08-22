@@ -402,3 +402,11 @@ def _register_overloads() -> None:
 
 
 _register_overloads()
+
+
+@wp.func
+def pack_edge_key(u: wp.int32, v: wp.int32, base: wp.uint64) -> wp.uint64:
+    """Key of undirected edge (u, v); matches ``pack_indices`` for a sorted 2-index row."""
+    lo = wp.uint64(wp.uint32(wp.min(u, v)))
+    hi = wp.uint64(wp.uint32(wp.max(u, v)))
+    return lo + hi * base

@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.kernels.grouping import pack_edge_key
+from triwarp.kernels.array import pack_edge_key
 from triwarp.kernels.predicates import vector_angle
 from triwarp.kernels.triangles import corner_triple
 

@@ -1,5 +1,7 @@
 import warp as wp
 
+from triwarp.kernels.array import wrap_index
+
 
 @wp.kernel
 def find_ears(
@@ -108,3 +110,45 @@ def flag_boundary_degree_defects(
         out_flags[0] = 1
     if degrees[v, 1] > 2:
         out_flags[1] = 1
+
+
+@wp.kernel
+def loop_perimeters(
+    flat_loops: wp.array[wp.int32],
+    loop_id: wp.array[wp.int32],
+    loop_starts: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    vertices: wp.array[wp.vec3],
+    out_perimeter: wp.array[wp.float32],
+) -> None:
+    # Segmented ``polyline_length(closed=True)``: the arc length of every loop in one launch, so
+    # ``preserve_largest_hole`` costs one readback instead of two per loop.
+    t = wp.int32(wp.tid())
+    ell = loop_id[t]
+    o = loop_starts[ell]
+    b = loop_sizes[ell]
+    a = vertices[flat_loops[t]]
+    c = vertices[flat_loops[o + wrap_index(t - o + 1, b)]]
+    wp.atomic_add(out_perimeter, ell, wp.length(c - a))
+
+
+@wp.kernel
+def loop_directed_areas(
+    flat_loops: wp.array[wp.int32],
+    loop_id: wp.array[wp.int32],
+    loop_starts: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    vertices: wp.array[wp.vec3],
+    out_directed_area: wp.array[wp.vec3],
+) -> None:
+    # Half the sum of ``p_i x p_{i+1}`` around the loop: the directed area vector, whose norm is the
+    # area of the planar polygon spanning the loop and whose direction is that polygon's normal.
+    # Origin-independent because the cross products of a *closed* ring cancel the shift, so no
+    # centroid pass is needed -- and accumulated per segment in one launch, like the perimeter.
+    t = wp.int32(wp.tid())
+    ell = loop_id[t]
+    o = loop_starts[ell]
+    b = loop_sizes[ell]
+    a = vertices[flat_loops[t]]
+    c = vertices[flat_loops[o + wrap_index(t - o + 1, b)]]
+    wp.atomic_add(out_directed_area, ell, wp.float32(0.5) * wp.cross(a, c))

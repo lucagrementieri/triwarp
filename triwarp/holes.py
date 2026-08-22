@@ -51,12 +51,14 @@ there was no hole to fill, so a caller may write into the result without disturb
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import numpy as np
 import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import boundary as kernel_boundary
 from triwarp.kernels import holes as kernel_holes
 
 
@@ -1061,6 +1063,123 @@ def refill_region(
     return (new_vertices, new_faces, out_patch) if return_patch else (new_vertices, new_faces)
 
 
+def fillable_loop_mask(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    loops: Sequence[wp.array[wp.int32]] | None = None,
+) -> wp.array[wp.bool]:
+    """
+    Which boundary loops a min-weight fill can close without producing an invalid mesh.
+
+    [`fill_min_weight`][triwarp.holes.fill_min_weight] triangulates a rim over its **own** vertices,
+    which fails in two combinatorial ways that have nothing to do with the metric. This names them
+    per loop, so the policy is the caller's rather than a flag's:
+
+    * **A repeated vertex.** A rim that visits one vertex twice is pinched there, and any
+      triangulation of it folds through that pinch.
+    * **A chord.** Two loop vertices that are *not* neighbours along the rim but are already joined
+      by a mesh edge. The fill may propose that pair as a fill edge, and the mesh already has one,
+      so that edge ends up with three faces. This is what
+      ``fill_min_weight(resolve_multiple_edges=True)`` repairs *after* the fact, and a ``True`` here
+      is exactly the case where that repair has nothing to do.
+
+    !!! note "Conservative on the chord, and not MeshLib's predicate"
+        The chord test is **sufficient, not necessary**: a chord-free loop cannot produce a
+        duplicated edge whatever the dynamic program chooses, but a loop *with* a chord may still
+        fill cleanly if the program happens to avoid it. A four-vertex rim with one diagonal already
+        present is the smallest example -- there are two triangulations and only one of them
+        collides. So read ``False`` as "check the result", not as "cannot be filled".
+
+        It is also **not** a port of MeshLib's ``findHoleComplicatingFaces``, which measures
+        something else: on that same square it flags **no** face. And MeshLib's third predicate,
+        ``isLoopOuter``, is deliberately absent -- which boundary of an open surface is the "outer"
+        one is a property of an embedding, not of the mesh, so there is nothing intrinsic to
+        compute. The practical form of that question, *which rim is the big one*, is already
+        answered by ``fill_min_weight(preserve_largest_hole=True)`` and by
+        [`loop_perimeters`][triwarp.boundary.loop_perimeters].
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
+    loops
+        The boundary loops to test. When ``None`` they are computed with
+        [`boundary_loops`][triwarp.boundary.boundary_loops]; pass them when you already have them,
+        since the returned mask is indexed by their order and a caller almost always needs both.
+
+    Returns
+    -------
+    wp.array[wp.bool]
+        One entry per loop, ``True`` where the loop is simple and chord-free, on ``faces.device``.
+        ``True`` is a guarantee; ``False`` is a warning, per the note above.
+
+    Raises
+    ------
+    ValueError
+        If any loop is not a rank-1 ``wp.int32`` array.
+
+    See Also
+    --------
+    [`fill_min_weight`][triwarp.holes.fill_min_weight]
+        The fill this predicts the safety of.
+    [`boundary_loops`][triwarp.boundary.boundary_loops]
+        Produces the loops, in the order this mask indexes.
+    [`loop_perimeters`][triwarp.boundary.loop_perimeters]
+        Ranks the same loops by size, which is the other question a caller asks about a rim.
+    """
+    device = faces.device
+    if loops is None:
+        loops = tw.boundary.boundary_loops(vertices, faces)
+    loops = list(loops)
+    for loop in loops:
+        if len(loop.shape) != 1 or loop.dtype is not wp.int32:
+            raise ValueError("every loop must be a rank-1 wp.int32 array of vertex indices")
+    if not loops:
+        return wp.empty(0, dtype=wp.bool, device=device)
+
+    n_vertices = tw.vertices.n_vertices(faces)
+    # **One** readback for all the loops, not one each: they are concatenated on the device first,
+    # and the sizes are already on the host. A scan mesh carries dozens of rims, so the per-loop
+    # spelling cost a sync apiece and was measured at 16x behind the reference before this.
+    #
+    # A readback at all because the position table cannot be built on the device: a pinched loop
+    # wants two entries for one vertex, and the pinch is what disqualifies it. Its size is bounded
+    # by the *boundary* rather than by the mesh.
+    sizes = [int(loop.shape[0]) for loop in loops]
+    flat_np = tw.array.concatenate(list(loops)).numpy()
+    bounds = np.cumsum([0, *sizes])
+    loops_np = [flat_np[bounds[index] : bounds[index + 1]] for index in range(len(sizes))]
+    fillable_np = np.ones(len(loops_np), dtype=bool)
+    loop_of_vertex_np = np.full(n_vertices, -1, dtype=np.int32)
+    position_np = np.zeros(n_vertices, dtype=np.int32)
+    for index, loop_np in enumerate(loops_np):
+        if np.unique(loop_np).shape[0] != loop_np.shape[0]:
+            fillable_np[index] = False
+            continue  # a pinched loop is disqualified already, and would corrupt the table below
+        loop_of_vertex_np[loop_np] = index
+        position_np[loop_np] = np.arange(loop_np.shape[0], dtype=np.int32)
+
+    if fillable_np.any():
+        unique_edges, _inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
+        has_chord = wp.zeros(len(loops_np), dtype=wp.bool, device=device)
+        wp.launch(
+            kernel_holes.mark_loops_with_chords,
+            dim=int(unique_edges.shape[0]),
+            inputs=[
+                unique_edges,
+                wp.array(loop_of_vertex_np, dtype=wp.int32, device=device),
+                wp.array(position_np, dtype=wp.int32, device=device),
+                wp.array(np.array(sizes, dtype=np.int32), dtype=wp.int32, device=device),
+                has_chord,
+            ],
+            device=device,
+        )
+        fillable_np &= ~has_chord.numpy()
+    return wp.array(fillable_np, dtype=wp.bool, device=device)
+
+
 def stitch(
     vertices_a: wp.array[wp.vec3],
     faces_a: wp.array[wp.int32],
@@ -1896,7 +2015,7 @@ def _loop_perimeters(vertices: wp.array[wp.vec3], loops: _PackedLoops) -> np.nda
     """Measure the closed arc length of every packed loop (one launch, one readback)."""
     perimeter = wp.zeros(loops.n_loops, dtype=wp.float32, device=loops.device)
     wp.launch(
-        kernel_holes.loop_perimeters,
+        kernel_boundary.loop_perimeters,
         dim=loops.total,
         inputs=[loops.flat_loops, loops.loop_id, loops.starts, loops.sizes, vertices, perimeter],
         device=loops.device,

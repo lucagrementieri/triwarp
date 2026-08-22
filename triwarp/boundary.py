@@ -10,6 +10,7 @@ returns the original row indices of edges occurring exactly once.
 from __future__ import annotations
 
 import itertools
+from collections.abc import Sequence
 
 import numpy as np
 import warp as wp
@@ -378,6 +379,143 @@ def _unoriented_boundary_cycles(
         wp.array(np.concatenate([[0], np.cumsum(sizes_np)[:-1]]), dtype=wp.int32, device=device),
         wp.array(sizes_np, dtype=wp.int32, device=device),
     )
+
+
+def loop_perimeters(
+    vertices: wp.array[wp.vec3], loops: Sequence[wp.array[wp.int32]]
+) -> wp.array[wp.float32]:
+    """
+    Perimeter of every closed loop, in one launch.
+
+    Takes what [`boundary_loops`][triwarp.boundary.boundary_loops] returns -- a list of vertex-index
+    cycles whose last entry joins back to the first -- and measures them all together, so the cost
+    is one launch and one packing pass rather than one call per loop. Equivalent to
+    [`polyline_length`][triwarp.polyline.polyline_length] with ``closed=True`` on each loop's
+    gathered positions, and the segmented form is why the fill's ``preserve_largest_hole`` can rank
+    every rim for the price of one readback.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    loops
+        Closed vertex-index cycles. An empty sequence gives an empty result; a loop of fewer than
+        two entries measures ``0``.
+
+    Returns
+    -------
+    wp.array[wp.float32]
+        One perimeter per loop, in the order given, on ``vertices.device``.
+
+    Raises
+    ------
+    ValueError
+        If any loop is not a rank-1 ``wp.int32`` array.
+
+    See Also
+    --------
+    [`loop_directed_areas`][triwarp.boundary.loop_directed_areas]
+        The vector measure of the same loops: norm is the spanned area, direction is its normal.
+    [`boundary_loops`][triwarp.boundary.boundary_loops]
+        Produces the loops.
+    [`polyline_length`][triwarp.polyline.polyline_length]
+        The single-loop form, over positions rather than indices.
+    """
+    packed = _pack_loop_segments(vertices, loops, caller="loop_perimeters")
+    if packed is None:
+        return wp.empty(0, dtype=wp.float32, device=vertices.device)
+    flat_loops, loop_id, starts, sizes, n_loops = packed
+    perimeters = wp.zeros(n_loops, dtype=wp.float32, device=vertices.device)
+    wp.launch(
+        kernel_boundary.loop_perimeters,
+        dim=int(flat_loops.shape[0]),
+        inputs=[flat_loops, loop_id, starts, sizes, vertices, perimeters],
+        device=vertices.device,
+    )
+    return perimeters
+
+
+def loop_directed_areas(
+    vertices: wp.array[wp.vec3], loops: Sequence[wp.array[wp.int32]]
+) -> wp.array[wp.vec3]:
+    """
+    Directed area vector of every loop, in one launch.
+
+    Half the sum of ``p_i x p_{i+1}`` around each cycle. Its **norm** is the area of the planar
+    polygon the loop spans and its **direction** is that polygon's normal, oriented by the loop's
+    own winding -- so it answers "how big is this hole" and "which way does it face" at once, and
+    the sign flips if the loop is reversed. A vector rather than a scalar for that reason: the area
+    alone loses the orientation, which is what tells an outer boundary from an inner one.
+
+    Origin-independent, because the cross products of a closed ring cancel any shift of the origin,
+    so no centroid pass is needed. Exact for a planar loop; for a non-planar one it is the area of
+    the loop's projection onto the plane normal to the result, which is the standard convention.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    loops
+        Closed vertex-index cycles, as [`boundary_loops`][triwarp.boundary.boundary_loops] returns.
+
+    Returns
+    -------
+    wp.array[wp.vec3]
+        One directed area per loop, in the order given, on ``vertices.device``.
+
+    Raises
+    ------
+    ValueError
+        If any loop is not a rank-1 ``wp.int32`` array.
+
+    See Also
+    --------
+    [`loop_perimeters`][triwarp.boundary.loop_perimeters]
+        The scalar measure of the same loops.
+    [`polyline_normal`][triwarp.polyline.polyline_normal]
+        The single-loop direction, normalized and over positions.
+    """
+    packed = _pack_loop_segments(vertices, loops, caller="loop_directed_areas")
+    if packed is None:
+        return wp.empty(0, dtype=wp.vec3, device=vertices.device)
+    flat_loops, loop_id, starts, sizes, n_loops = packed
+    directed_areas = wp.zeros(n_loops, dtype=wp.vec3, device=vertices.device)
+    wp.launch(
+        kernel_boundary.loop_directed_areas,
+        dim=int(flat_loops.shape[0]),
+        inputs=[flat_loops, loop_id, starts, sizes, vertices, directed_areas],
+        device=vertices.device,
+    )
+    return directed_areas
+
+
+def _pack_loop_segments(
+    vertices: wp.array[wp.vec3], loops: Sequence[wp.array[wp.int32]], *, caller: str
+) -> (
+    tuple[wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32], wp.array[wp.int32], int]
+    | None
+):
+    """
+    Pack a list of cycles into the four arrays a segmented per-loop kernel needs.
+
+    ``loop_id`` inverts ``starts`` so a ``dim=total`` launch finds its own loop without a search,
+    which is what lets both measures above run in one launch over every loop at once. ``None`` when
+    there is nothing to measure.
+    """
+    device = vertices.device
+    loops = list(loops)
+    for loop in loops:
+        if len(loop.shape) != 1 or loop.dtype is not wp.int32:
+            raise ValueError(f"{caller}: every loop must be a rank-1 wp.int32 array")
+    if not loops or all(int(loop.shape[0]) == 0 for loop in loops):
+        return None
+    flat_loops, starts = tw.array.pack_1d_arrays(loops)
+    sizes_np = np.array([int(loop.shape[0]) for loop in loops], dtype=np.int32)
+    loop_id = wp.array(
+        np.repeat(np.arange(len(loops), dtype=np.int32), sizes_np), dtype=wp.int32, device=device
+    )
+    sizes = wp.array(sizes_np, dtype=wp.int32, device=device)
+    return flat_loops, loop_id, starts, sizes, len(loops)
 
 
 def boundary_loop(

@@ -239,26 +239,6 @@ def loop_rim_metrics(
 
 
 @wp.kernel
-def loop_perimeters(
-    flat_loops: wp.array[wp.int32],
-    loop_id: wp.array[wp.int32],
-    loop_starts: wp.array[wp.int32],
-    loop_sizes: wp.array[wp.int32],
-    vertices: wp.array[wp.vec3],
-    out_perimeter: wp.array[wp.float32],
-) -> None:
-    # Segmented ``polyline_length(closed=True)``: the arc length of every loop in one launch, so
-    # ``preserve_largest_hole`` costs one readback instead of two per loop.
-    t = wp.int32(wp.tid())
-    ell = loop_id[t]
-    o = loop_starts[ell]
-    b = loop_sizes[ell]
-    a = vertices[flat_loops[t]]
-    c = vertices[flat_loops[o + _wrap(t - o + 1, b)]]
-    wp.atomic_add(out_perimeter, ell, wp.length(c - a))
-
-
-@wp.kernel
 def init_dp_base(
     loop_sizes: wp.array[wp.int32],
     dp_offsets: wp.array[wp.int32],
@@ -935,3 +915,30 @@ def stitch_dp_diag(
 
     out_dp[i, j] = best
     out_came[i, j] = best_came
+
+
+@wp.kernel
+def mark_loops_with_chords(
+    unique_edges: wp.array2d[wp.int32],
+    loop_of_vertex: wp.array[wp.int32],
+    position_in_loop: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    out_has_chord: wp.array[wp.bool],
+) -> None:
+    # A *chord* is a mesh edge joining two vertices of one boundary loop that are not neighbours
+    # along it. A min-weight fill triangulates over the loop's own vertices, so it can propose that
+    # chord as a fill edge -- and the mesh already has one, which makes the result non-manifold.
+    # That is the hazard ``fill_min_weight(resolve_multiple_edges=True)`` works around after the
+    # fact; naming it per loop lets a caller decide before filling.
+    e = wp.int32(wp.tid())
+    a = unique_edges[e, 0]
+    b = unique_edges[e, 1]
+    loop = loop_of_vertex[a]
+    if loop < 0 or loop_of_vertex[b] != loop:
+        return
+    size = loop_sizes[loop]
+    gap = position_in_loop[a] - position_in_loop[b]
+    if gap < 0:
+        gap = -gap
+    if gap != 1 and gap != size - 1:
+        out_has_chord[loop] = True

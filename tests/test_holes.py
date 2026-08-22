@@ -14,6 +14,7 @@ from meshlib import mrmeshpy as mm
 import triwarp as tw
 from tests.comparisons import boundary_loop_sizes, canonical_winding, lexsort_rows
 from tests.conversions import (
+    meshlib_bitset_to_numpy,
     meshlib_to_trimesh,
     numpy_to_meshlib,
     numpy_to_meshlib_bitset,
@@ -538,6 +539,109 @@ def _meshlib_fill_triangles(vertices: wp.array, faces: wp.array, metric: str) ->
     original = {tuple(sorted(int(x) for x in tri)) for tri in faces_np}
     fill = [tri for tri in faces_out if tuple(sorted(int(x) for x in tri)) not in original]
     return np.asarray(fill, dtype=np.int32).reshape(-1)
+
+
+@pytest.mark.parity("fillable_loop_mask", "meshlib")
+def test_fillable_loop_mask_pinch_matches_meshlib(device: str) -> None:
+    """
+    Class B: equal after reducing MeshLib's per-*vertex* answer to a per-*loop* one.
+
+    ``findRepeatedVertsOnHoleBd`` marks the vertices a boundary walk visits twice, which is the
+    pinch condition seen from the other end: a loop is pinched exactly when it contains one of
+    them. So the transform is "unfillable if the loop meets the marked set", and the two agree.
+
+    The fixture is the smallest mesh with a pinched rim -- two triangles meeting at one vertex and
+    nowhere else -- because on a clean mesh both answers are empty and the comparison would be
+    vacuous. Measured: MeshLib marks vertex 0 alone, and triwarp's single loop
+    ``[0, 0, 0, 1, 2]`` comes back ``False``; the clean control comes back ``True`` with an empty
+    marked set, which is what rules out a mask that is simply always ``False``.
+    """
+    pinched_np = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]]
+    )
+    pinched_faces_np = np.array([0, 1, 2, 0, 3, 4], dtype=np.int32)
+    clean_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]])
+    clean_faces_np = np.array([0, 1, 2], dtype=np.int32)
+
+    for vertices_np, faces_np, expected in (
+        (pinched_np, pinched_faces_np, False),
+        (clean_np, clean_faces_np, True),
+    ):
+        vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+        loops_wp = tw.boundary.boundary_loops(vertices_wp, faces_wp)
+        assert len(loops_wp) == 1  # non-vacuity: there is a rim to judge
+        fillable_np = tw.holes.fillable_loop_mask(vertices_wp, faces_wp, loops_wp).numpy()
+
+        mesh_ml = numpy_to_meshlib(vertices_np, faces_np.reshape(-1, 3))
+        repeated_np = meshlib_bitset_to_numpy(
+            mm.findRepeatedVertsOnHoleBd(mesh_ml.topology), len(vertices_np)
+        )
+        assert repeated_np.any() == (not expected)
+        loop_np = loops_wp[0].numpy()
+        assert bool(fillable_np[0]) is expected
+        assert (not repeated_np[loop_np].any()) is expected
+
+
+def test_fillable_loop_mask_chord_is_conservative(device: str) -> None:
+    """
+    Not a library comparison: MeshLib's ``findHoleComplicatingFaces`` measures something else.
+
+    The chord condition is triwarp's own, and the reference is recorded as *not* matching it: on a
+    square split by one diagonal, ``findHoleComplicatingFaces`` flags **no** face while this mask
+    returns ``False``, because the rim's two opposite corners are already joined by that diagonal.
+    So there is nothing to compare and the test states the behaviour instead.
+
+    Both directions matter. A hexagonal fan has no chord and comes back ``True``, which is what
+    stops the mask being trivially ``False``; the square comes back ``False``. And the docstring's
+    conservatism claim is checked rather than asserted away: the square *does* fill cleanly, because
+    the dynamic program picks the other diagonal -- so ``False`` means "check the result", and a
+    test that treated it as "cannot be filled" would be wrong.
+    """
+    square_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]])
+    square_faces_np = np.array([0, 1, 2, 0, 2, 3], dtype=np.int32)
+    vertices_wp, faces_wp = numpy_to_warp(square_np, square_faces_np, device)
+    assert not tw.holes.fillable_loop_mask(vertices_wp, faces_wp).numpy()[0]
+    mesh_ml = numpy_to_meshlib(square_np, square_faces_np.reshape(-1, 3))
+    assert mm.findHoleComplicatingFaces(mesh_ml).count() == 0  # the recorded divergence
+
+    sides = 6
+    fan_np = np.vstack(
+        [[0.0, 0.0, 0.0]]
+        + [
+            [float(np.cos(2 * np.pi * k / sides)), float(np.sin(2 * np.pi * k / sides)), 0.0]
+            for k in range(sides)
+        ]
+    )
+    fan_faces_np = np.array(
+        [index for k in range(sides) for index in (0, 1 + k, 1 + (k + 1) % sides)], dtype=np.int32
+    )
+    fan_vertices_wp, fan_faces_wp = numpy_to_warp(fan_np, fan_faces_np, device)
+    assert tw.holes.fillable_loop_mask(fan_vertices_wp, fan_faces_wp).numpy()[0]
+
+
+@pytest.mark.parametrize("mesh_name", ["hemisphere", "half_torus", "icosphere_coarse"])
+def test_fillable_loop_mask_on_the_fixtures(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Not a library comparison: the mask must agree with what the fill actually does.
+
+    Every rim of these fixtures is simple and chord-free, so the mask is all-``True`` -- and the
+    claim that ``True`` carries is checkable: ``fill_min_weight(resolve_multiple_edges=False)``,
+    which is the unprotected path, must leave an edge-manifold mesh. That is the guarantee, and
+    running the fill with the protection *off* is the only way to test it.
+
+    ``icosphere_coarse`` is the closed case, where there are no loops and the mask is empty.
+    """
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    loops_wp = tw.boundary.boundary_loops(vertices_wp, faces_wp)
+    fillable_np = tw.holes.fillable_loop_mask(vertices_wp, faces_wp, loops_wp).numpy()
+    assert fillable_np.shape == (len(loops_wp),)
+    if not len(loops_wp):
+        return  # the closed fixture: nothing to fill, and nothing to claim
+    assert fillable_np.all()
+    filled_wp = tw.holes.fill_min_weight(vertices_wp, faces_wp, resolve_multiple_edges=False)
+    assert int(filled_wp.shape[0]) > int(faces_wp.shape[0])
+    assert tw.validation.is_edge_manifold(filled_wp)
 
 
 @pytest.mark.parity("fill_min_weight", "meshlib")

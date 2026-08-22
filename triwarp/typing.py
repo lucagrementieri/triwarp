@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     Array2dInt32: TypeAlias = wp.array[wp.int32, Literal[2]]
     Array2dFloat32: TypeAlias = wp.array[wp.float32, Literal[2]]
     Array2dFloat64: TypeAlias = wp.array[wp.float64, Literal[2]]
+    Array2dVec3: TypeAlias = wp.array[wp.vec3, Literal[2]]
     Array3dFloat32: TypeAlias = wp.array[wp.float32, Literal[3]]
     Array3dBool: TypeAlias = wp.array[wp.bool, Literal[3]]
 
@@ -50,6 +51,7 @@ else:
     Array2dInt32 = wp.array
     Array2dFloat32 = wp.array
     Array2dFloat64 = wp.array
+    Array2dVec3 = wp.array
     Array3dFloat32 = wp.array
     Array3dBool = wp.array
     Array1dInt = wp.array
@@ -135,7 +137,9 @@ def as_array2d(arr: wp.array[T], dtype: type[wp.int32]) -> Array2dInt32: ...
 def as_array2d(arr: wp.array[T], dtype: type[wp.float32]) -> Array2dFloat32: ...
 @overload
 def as_array2d(arr: wp.array[T], dtype: type[wp.float64]) -> Array2dFloat64: ...
-def as_array2d(arr: wp.array[T], dtype: type) -> Array2dInt32 | Array2dFloat:
+@overload
+def as_array2d(arr: wp.array[T], dtype: type[wp.vec3]) -> Array2dVec3: ...
+def as_array2d(arr: wp.array[T], dtype: type) -> Array2dInt32 | Array2dFloat | Array2dVec3:
     """
     Validate and narrow a Warp array to the rank-2 alias for ``dtype``.
 
@@ -324,9 +328,13 @@ def empty_2d(
 def empty_2d(
     shape: tuple[int, int] | list[int], dtype: type[wp.float64], *, device: wp.DeviceLike = None
 ) -> Array2dFloat64: ...
+@overload
+def empty_2d(
+    shape: tuple[int, int] | list[int], dtype: type[wp.vec3], *, device: wp.DeviceLike = None
+) -> Array2dVec3: ...
 def empty_2d(
     shape: tuple[int, int] | list[int], dtype: type, *, device: wp.DeviceLike = None
-) -> Array2dInt32 | Array2dFloat:
+) -> Array2dInt32 | Array2dFloat | Array2dVec3:
     """
     Allocate an uninitialized rank-2 Warp array of the given scalar type.
 

@@ -3,7 +3,8 @@ from typing import Any
 import warp as wp
 
 from triwarp.constants import PI, TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
-from triwarp.kernels.array import to_vec3d
+from triwarp.kernels.array import binary_search_sorted_contains, pack_edge_key, to_vec3d
+from triwarp.kernels.halfedge import halfedge_next, halfedge_prev
 from triwarp.kernels.predicates import (
     triangle_aspect_ratio,
     triangle_double_area,
@@ -515,3 +516,74 @@ def _register_overloads() -> None:
 
 
 _register_overloads()
+
+
+@wp.func
+def is_crease_edge(
+    faces: wp.array[wp.int32],
+    crease_keys_sorted: wp.array[wp.uint64],
+    base: wp.uint64,
+    halfedge: wp.int32,
+) -> bool:
+    # Whether the undirected edge a halfedge lies on is in the crease set. An empty set answers
+    # ``False`` for every edge without a special case: ``binary_search_sorted_contains`` short-
+    # circuits before reading, so the no-crease path costs one compare per rotation step.
+    return binary_search_sorted_contains(
+        crease_keys_sorted, pack_edge_key(faces[halfedge], faces[halfedge_next(halfedge)], base)
+    )
+
+
+@wp.kernel
+def corner_normals(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    twins: wp.array[wp.int32],
+    face_normals: wp.array[wp.vec3],
+    corner_weights: wp.array[wp.float32],
+    crease_keys_sorted: wp.array[wp.uint64],
+    base: wp.uint64,
+    out_corner_normals: wp.array2d[wp.vec3],
+) -> None:
+    # One thread per corner, which is one thread per halfedge: corner ``k`` of face ``f`` sits at
+    # ``faces[3f + k]``, and halfedge ``3f + k`` is the one leaving that vertex inside that face.
+    #
+    # The corner's normal averages the *smooth group* around its vertex -- the faces reachable by
+    # rotating about it without crossing a crease -- weighted by corner angle, then normalized. So
+    # with no creases every corner of a vertex gets that vertex's angle-weighted normal, and with
+    # every edge a crease each corner gets its own face's normal. Those two are exact identities and
+    # are what the test pins.
+    corner = wp.int32(wp.tid())
+    face = corner // 3
+    total = face_normals[face] * corner_weights[corner]
+
+    # Counter-clockwise about the vertex: ``h -> twins[prev(h)]``, the rotation
+    # ``halfedge.vertex_one_rings`` walks. The edge crossed is the one ``prev(h)`` lies on.
+    halfedge = corner
+    for _ in range(twins.shape[0]):
+        crossing = halfedge_prev(halfedge)
+        if is_crease_edge(faces, crease_keys_sorted, base, crossing):
+            break
+        halfedge = twins[crossing]
+        if halfedge < 0 or halfedge == corner:
+            break  # a boundary edge ends the fan; returning to the start means it closed
+        total += face_normals[halfedge // 3] * corner_weights[halfedge]
+
+    # Clockwise, the inverse rotation ``h -> next(twins[h])``, crossing ``h``'s own edge. Skipped
+    # entirely when the fan already closed, since every face is then already counted.
+    if halfedge != corner:
+        halfedge = corner
+        for _ in range(twins.shape[0]):
+            if is_crease_edge(faces, crease_keys_sorted, base, halfedge):
+                break
+            twin = twins[halfedge]
+            if twin < 0:
+                break
+            halfedge = halfedge_next(twin)
+            if halfedge == corner:
+                break
+            total += face_normals[halfedge // 3] * corner_weights[halfedge]
+
+    length = wp.length(total)
+    if length > TOLERANCE_ZERO_CONSTANT:
+        total = total / length
+    out_corner_normals[face, corner - face * 3] = total

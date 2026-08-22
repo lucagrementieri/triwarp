@@ -73,7 +73,8 @@ when it merely lost the claim.
 import warp as wp
 
 from triwarp.constants import INT32_MAX_CONSTANT, UINT64_MAX_CONSTANT
-from triwarp.kernels.grouping import hash_find, hash_find_or_insert, pack_edge_key
+from triwarp.kernels.array import pack_edge_key
+from triwarp.kernels.grouping import hash_find, hash_find_or_insert
 from triwarp.kernels.predicates import dihedral_angle, triangle_normal
 
 # Per-thread neighbour scratch for the seed search (Open3D re-scans the KNN result twice).
