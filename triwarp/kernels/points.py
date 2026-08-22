@@ -1,6 +1,7 @@
 import warp as wp
 
 from triwarp.constants import TILE_1D
+from triwarp.kernels.array import pack_farthest_key, pack_nearest_key
 from triwarp.kernels.intersection import point_plane_dot
 from triwarp.kernels.reduce import outer_sum_chunk, tile_chunk
 
@@ -302,31 +303,8 @@ def pack_class_z_bits(class_id: wp.int32, point: wp.vec3) -> wp.int64:
 
 
 @wp.func
-def pack_farthest_key(distance_sq: wp.float32, index: wp.int32) -> wp.int64:
-    # One int64 whose ``wp.atomic_max`` is "largest distance, lowest index on a tie". The IEEE-754
-    # bits of a non-negative float increase monotonically with the value, so the high half orders
-    # by distance; the low half stores ``index`` complemented within int32 so that a *smaller*
-    # index compares *larger*. Both halves are non-negative, so the whole key is, which is what
-    # makes ``-1`` a sentinel below every real candidate.
-    distance_bits = wp.uint64(wp.uint32(wp.cast(distance_sq, wp.int32)))
-    rank = wp.uint64(wp.uint32(wp.int32(2147483647) - index))
-    return wp.int64((distance_bits << wp.uint64(32)) | rank)
-
-
-@wp.func
 def unpack_farthest_index(key: wp.int64) -> wp.int32:
     return wp.int32(2147483647) - wp.int32(wp.uint32(wp.uint64(key) & wp.uint64(4294967295)))
-
-
-@wp.func
-def pack_nearest_key(distance: wp.float32, index: wp.int32) -> wp.int64:
-    # The ``min``-ordered twin of ``pack_farthest_key``: one int64 whose minimum is "smallest
-    # distance, lowest index on a tie". Same monotone IEEE-754 high half (valid because a distance
-    # is non-negative), but the index is stored plainly rather than complemented, because a
-    # *smaller* index must now compare *smaller*. The key stays non-negative, so it needs no
-    # sentinel.
-    distance_bits = wp.uint64(wp.uint32(wp.cast(distance, wp.int32)))
-    return wp.int64((distance_bits << wp.uint64(32)) | wp.uint64(wp.uint32(index)))
 
 
 @wp.kernel

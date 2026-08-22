@@ -379,6 +379,9 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     ("selection", "open_dual_edges_and_seeds"): frozenset({"cursor"}),
     ("repair", "emit_degree3_replacement"): frozenset({"cursor"}),
     ("repair", "emit_straighten_faces"): frozenset({"cursor"}),
+    # A running minimum other threads publish and read: neither an input nor the answer, and the
+    # per-face results are the ``out_`` arguments beside it.
+    ("proximity", "face_to_mesh_distance"): frozenset({"global_best_sq"}),
     ("grouping", "hash_insert"): frozenset({"slot_counts"}),
     # ``values`` is the matrix whose rows this scales -- input and result in the same buffer, since
     # the prolongation smoother's ``-w D^-1 (A P0)`` is a row scaling of a product that has just

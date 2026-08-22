@@ -1,13 +1,9 @@
 import warp as wp
 
-from triwarp.constants import (
-    FLOAT64_INF_CONSTANT,
-    TOLERANCE_MERGE_CONSTANT,
-    TOLERANCE_ZERO_CONSTANT,
-)
+from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import triangles as kernel_triangles
-from triwarp.kernels.predicates import triangle_aabb
+from triwarp.kernels.predicates import triangles_intersect
 
 SLICE_SIGN_INSIDE = wp.constant(wp.int32(-1))
 SLICE_SIGN_OUTSIDE = wp.constant(wp.int32(1))
@@ -312,109 +308,6 @@ def triangle_aabb_overlap(
 
 
 @wp.func
-def plane_crossing_span(distance: wp.vec3d, coordinate: wp.vec3d) -> tuple[wp.bool, wp.vec2d]:
-    # Where a triangle meets the other triangle's plane, as an interval along the two planes'
-    # intersection line. ``distance`` holds its three vertices' signed distances to that plane and
-    # ``coordinate`` their positions along the line's direction; each edge whose endpoints straddle
-    # the plane contributes one crossing, interpolated at the same ratio.
-    #
-    # A vertex exactly *on* the plane contributes itself, which only matters for a configuration the
-    # caller has already excluded -- it early-outs unless the distances genuinely straddle -- so it
-    # is here for the one live case: a vertex on the plane with the other two on opposite sides,
-    # which is a real crossing.
-    lo = FLOAT64_INF_CONSTANT
-    hi = -FLOAT64_INF_CONSTANT
-    zero = wp.float64(0.0)
-    for i in range(3):
-        j = (i + 1) % 3
-        first = distance[i]
-        second = distance[j]
-        if first == zero:
-            lo = wp.min(lo, coordinate[i])
-            hi = wp.max(hi, coordinate[i])
-        if first * second < zero:
-            weight = first / (first - second)
-            crossing = coordinate[i] + weight * (coordinate[j] - coordinate[i])
-            lo = wp.min(lo, crossing)
-            hi = wp.max(hi, crossing)
-    return lo <= hi, wp.vec2d(lo, hi)
-
-
-@wp.func
-def triangles_intersect(
-    a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3
-) -> wp.bool:
-    # Do two triangles cross transversally? Moller's interval test: each triangle is cut by the
-    # other's plane into an interval along the planes' intersection line, and they intersect exactly
-    # when those two intervals overlap. Coplanar and merely touching configurations are **not**
-    # intersections here, which is MeshLib's ``touchIsIntersection=False`` convention and the one
-    # ``validation.face_self_intersecting_mask`` documents.
-    #
-    # This replaced an 11-axis separating-axis test, and the reason is exactness rather than speed.
-    # SAT over two triangles is only exact while every axis is non-degenerate, and an edge-edge
-    # cross product **vanishes for parallel edges** -- which a regular grid is full of. The old code
-    # projected onto the zero axis anyway, where every interval collapses to ``[0, 0]`` and the test
-    # reads "overlapping", so a pair separated only along such an axis was reported as intersecting.
-    # Measured against an exact float64 arbiter: **64 false positives of 128 flagged faces** on a
-    # 16x16 self-intersecting torus (where MeshLib and the arbiter agree exactly on 64), and **42 of
-    # the 45** faces the old code flagged on ``bohemian_dome`` that MeshLib did not. Both were
-    # previously recorded as a "tangential contact divergence"; most of it was this.
-    #
-    # It is **0.86x** the SAT's speed, measured interleaved on an RTX 5090 over three
-    # self-intersecting parametric surfaces (35.9 / 35.6 / 35.7 us against 31.0 / 30.6 / 30.7 at
-    # 46-54k candidate pairs), and that is the right trade: both sit on the launch floor -- 5 us at
-    # 50 000 pairs -- and the faster one was answering a different question. The cost is the
-    # data-dependent edge loop in ``plane_crossing_span``, where SAT is straight-line arithmetic.
-    # **The arithmetic is float64 on float32 inputs**, and that is the load-bearing choice here.
-    # Widening a float32 is lossless, so this is the same geometry; what the extra precision buys is
-    # the *decisions* -- the sign of a plane distance, and the comparison of two intervals. Audited
-    # pair by pair over the 13 011 broad-phase candidates of the Roman surface: the float32 kernel
-    # agreed with this same algorithm in float64 on 97.6 % of them, while a float32 *reference* with
-    # a different association order agreed with that kernel on 99.6 %. Those two numbers together
-    # are what say the residual was arithmetic and not logic.
-    #
-    # It costs **2.1x on this kernel** (48 against 22 us at ~52k candidate pairs, measured
-    # interleaved on three self-intersecting surfaces) and **~4 % end to end**, because the narrow
-    # phase is only 6-8 % of ``face_self_intersecting_mask``'s wall clock -- the BVH build, the
-    # broad phase and the scan are the rest. That is the trade, and its docstring records what the
-    # accuracy buys.
-    da0 = kernel_array.to_vec3d(a0)
-    da1 = kernel_array.to_vec3d(a1)
-    da2 = kernel_array.to_vec3d(a2)
-    db0 = kernel_array.to_vec3d(b0)
-    db1 = kernel_array.to_vec3d(b1)
-    db2 = kernel_array.to_vec3d(b2)
-    zero = wp.float64(0.0)
-
-    normal_a = wp.cross(da1 - da0, da2 - da0)
-    distance_b = wp.vec3d(
-        wp.dot(normal_a, db0 - da0), wp.dot(normal_a, db1 - da0), wp.dot(normal_a, db2 - da0)
-    )
-    # Entirely in one closed half-space of A's plane: separated, coplanar, or touching at most.
-    if wp.min(distance_b) >= zero or wp.max(distance_b) <= zero:
-        return False
-
-    normal_b = wp.cross(db1 - db0, db2 - db0)
-    distance_a = wp.vec3d(
-        wp.dot(normal_b, da0 - db0), wp.dot(normal_b, da1 - db0), wp.dot(normal_b, da2 - db0)
-    )
-    if wp.min(distance_a) >= zero or wp.max(distance_a) <= zero:
-        return False
-
-    # Both straddle, so the planes are neither parallel nor coincident and this cannot vanish.
-    direction = wp.cross(normal_a, normal_b)
-    valid_a, span_a = plane_crossing_span(
-        distance_a, wp.vec3d(wp.dot(direction, da0), wp.dot(direction, da1), wp.dot(direction, da2))
-    )
-    valid_b, span_b = plane_crossing_span(
-        distance_b, wp.vec3d(wp.dot(direction, db0), wp.dot(direction, db1), wp.dot(direction, db2))
-    )
-    if not valid_a or not valid_b:
-        return False
-    return span_a[0] <= span_b[1] and span_b[0] <= span_a[1]
-
-
-@wp.func
 def triangle_intersection_segment(
     a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3
 ) -> tuple[wp.bool, wp.vec3, wp.vec3]:
@@ -475,20 +368,6 @@ def triangle_intersection_segment(
     p0 = line_origin + interval[0] * line_direction
     p1 = line_origin + interval[1] * line_direction
     return True, p0, p1
-
-
-@wp.kernel
-def face_aabb_bounds(
-    vertices: wp.array[wp.vec3],
-    faces: wp.array[wp.int32],
-    out_lower: wp.array[wp.vec3],
-    out_upper: wp.array[wp.vec3],
-) -> None:
-    f = wp.tid()
-    v0, v1, v2 = kernel_triangles.face_vertices(vertices, faces, f)
-    lower, upper = triangle_aabb(v0, v1, v2)
-    out_lower[f] = lower
-    out_upper[f] = upper
 
 
 @wp.kernel

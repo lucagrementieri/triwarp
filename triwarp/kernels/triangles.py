@@ -6,6 +6,7 @@ from triwarp.constants import PI, TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONST
 from triwarp.kernels.array import binary_search_sorted_contains, pack_edge_key, to_vec3d
 from triwarp.kernels.halfedge import halfedge_next, halfedge_prev
 from triwarp.kernels.predicates import (
+    triangle_aabb,
     triangle_aspect_ratio,
     triangle_double_area,
     triangle_normal,
@@ -587,3 +588,17 @@ def corner_normals(
     if length > TOLERANCE_ZERO_CONSTANT:
         total = total / length
     out_corner_normals[face, corner - face * 3] = total
+
+
+@wp.kernel
+def face_aabb_bounds(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    out_lower: wp.array[wp.vec3],
+    out_upper: wp.array[wp.vec3],
+) -> None:
+    f = wp.tid()
+    v0, v1, v2 = face_vertices(vertices, faces, f)
+    lower, upper = triangle_aabb(v0, v1, v2)
+    out_lower[f] = lower
+    out_upper[f] = upper

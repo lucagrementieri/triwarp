@@ -38,6 +38,7 @@ import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_nonempty_mesh
 from triwarp.kernels import proximity as kernel_proximity
+from triwarp.kernels import triangles as kernel_triangles
 from triwarp.triangles import face_normals_and_areas
 
 # Elements per thread for the two *per-query* lane-free reductions here (solid-angle sum, packed
@@ -283,6 +284,133 @@ def closest_point_on_edges(
         device=device,
     )
     return out_closest, out_distance, out_edge
+
+
+def mesh_to_mesh_distance(
+    vertices_a: wp.array[wp.vec3],
+    faces_a: wp.array[wp.int32],
+    vertices_b: wp.array[wp.vec3],
+    faces_b: wp.array[wp.int32],
+    *,
+    upper_bound: float | None = None,
+) -> tuple[float, int, int]:
+    """
+    Smallest distance between two triangle meshes, with the pair of faces that achieves it.
+
+    The clearance between two parts, and zero when they touch or overlap. Unlike a vertex-to-mesh
+    query this is the true minimum over the *surfaces*: two boxes edge to edge realise their
+    clearance between edge interiors, and every vertex of each is further from the other than
+    that.
+
+    Two phases. An upper bound comes first -- the smallest distance from a vertex of ``A`` to ``B``,
+    which is a real distance between the surfaces and therefore an upper bound on their minimum.
+    Then every face of ``A`` queries a BVH over ``B``'s faces with its own bounding box grown by
+    that bound, and each candidate pair gets the exact triangle-triangle distance. The bound is what
+    makes the broad phase sound rather than heuristic: the true minimum is at most the bound, so the
+    pair achieving it has boxes within that distance and cannot be culled.
+
+    Parameters
+    ----------
+    vertices_a, faces_a
+        First mesh: ``(n_vertices,)`` positions and a length-``3 * n_faces`` index buffer.
+    vertices_b, faces_b
+        Second mesh, same layout.
+    upper_bound
+        A distance known to be at least the answer, which prunes the broad phase. Supply one when
+        you have it -- from a previous frame, or from a bounding-volume gap -- and the vertex query
+        that would otherwise derive it is skipped. **Too small a bound gives a wrong answer**, not a
+        slow one: it culls the pair that would have won. ``None`` derives a sound bound.
+
+    Returns
+    -------
+    distance : float
+        The minimum distance. ``0.0`` exactly when some pair of faces crosses.
+    face_a : int
+        The face of the first mesh achieving it, or ``-1`` if either mesh is empty.
+    face_b : int
+        The face of the second mesh achieving it, or ``-1``.
+
+    Raises
+    ------
+    ValueError
+        If ``upper_bound`` is negative.
+
+    !!! note "Witness faces are ambiguous under ties"
+        Two parallel plates have a continuum of closest pairs and any of them is a correct answer;
+        the tie-break here is the lowest ``face_a``, then whichever ``face_b`` that face's own scan
+        reached first. Compare *distances* against another implementation, and faces only where the
+        configuration is generic.
+
+    See Also
+    --------
+    [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]
+        Point-to-mesh, which is the query this derives its bound from.
+    [`mesh_with_mesh`][triwarp.intersection.mesh_with_mesh]
+        The zero-distance case in detail: every intersecting pair and the segments they cross on.
+    [`face_self_intersecting_mask`][triwarp.validation.face_self_intersecting_mask]
+        The one-mesh analogue of that.
+    """
+    if upper_bound is not None and upper_bound < 0.0:
+        raise ValueError(f"upper_bound must be non-negative, got {upper_bound}")
+    device = faces_a.device
+    n_faces_a = int(faces_a.shape[0]) // 3
+    n_faces_b = int(faces_b.shape[0]) // 3
+    if n_faces_a == 0 or n_faces_b == 0:
+        return math.inf, -1, -1
+
+    if upper_bound is None:
+        # A vertex-to-surface distance is a distance between the surfaces, so its minimum bounds the
+        # answer from above. One readback, and it is what lets the broad phase cull at all.
+        _points, distances, _faces = closest_point_on_mesh(vertices_b, faces_b, vertices_a)
+        upper_bound = float(tw.reduce.min(distances))
+
+    lower = wp.empty(n_faces_b, dtype=wp.vec3, device=device)
+    upper = wp.empty(n_faces_b, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_triangles.face_aabb_bounds,
+        dim=n_faces_b,
+        inputs=[vertices_b, faces_b, lower, upper],
+        device=device,
+    )
+    bvh = tw.neighbors.bvh_from_bounds(lower, upper)
+    distance_sq = wp.empty(n_faces_a, dtype=wp.float32, device=device)
+    witness = wp.empty(n_faces_a, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_proximity.face_to_mesh_distance,
+        dim=n_faces_a,
+        inputs=[
+            vertices_a,
+            faces_a,
+            vertices_b,
+            faces_b,
+            lower,
+            upper,
+            bvh.id,
+            wp.float32(upper_bound),
+            # Seeded at infinity, **not** at ``upper_bound ** 2``: when the bound *is* the answer
+            # -- two spheres whose closest points are vertices -- seeding it there prunes the very
+            # pair that achieves it and the result comes back ``inf``.
+            wp.full(1, math.inf, dtype=wp.float32, device=device),
+            distance_sq,
+            witness,
+        ],
+        device=device,
+    )
+    keys = wp.empty(n_faces_a, dtype=wp.int64, device=device)
+    wp.launch(
+        kernel_proximity.face_distance_keys,
+        dim=n_faces_a,
+        inputs=[distance_sq, keys],
+        device=device,
+    )
+    # The key's low 32 bits are the winning face, so one reduction and one 8-byte read give both the
+    # distance and the argmin -- no second pass over the candidates.
+    best_face_a = int(tw.reduce.min(keys)) & 0xFFFFFFFF
+    return (
+        math.sqrt(float(distance_sq.numpy()[best_face_a])),
+        best_face_a,
+        int(witness.numpy()[best_face_a]),
+    )
 
 
 def normals_at_closest_faces(

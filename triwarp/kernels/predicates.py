@@ -28,7 +28,13 @@ from typing import Any
 
 import warp as wp
 
-from triwarp.constants import TOLERANCE_ZERO_CONSTANT
+from triwarp.constants import (
+    FLOAT64_INF_CONSTANT,
+    TOLERANCE_MERGE_CONSTANT,
+    TOLERANCE_ZERO_CONSTANT,
+    TOLERANCE_ZERO_F64,
+)
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels.array import cross2, sort3
 
 # Full turn in ``float64``; ``type(x)(TWO_PI_F64)`` narrows it to the caller's precision, and at
@@ -341,3 +347,252 @@ def barycentric_2d(q0: wp.vec2, q1: wp.vec2, q2: wp.vec2, p: wp.vec2) -> wp.vec3
     b2 = (d00 * d21 - d01 * d20) * inverse_denominator
     b0 = 1.0 - b1 - b2
     return wp.vec3(b0, b1, b2)
+
+
+@wp.func
+def plane_crossing_span(distance: wp.vec3d, coordinate: wp.vec3d) -> tuple[wp.bool, wp.vec2d]:
+    # Where a triangle meets the other triangle's plane, as an interval along the two planes'
+    # intersection line. ``distance`` holds its three vertices' signed distances to that plane and
+    # ``coordinate`` their positions along the line's direction; each edge whose endpoints straddle
+    # the plane contributes one crossing, interpolated at the same ratio.
+    #
+    # A vertex exactly *on* the plane contributes itself, which only matters for a configuration the
+    # caller has already excluded -- it early-outs unless the distances genuinely straddle -- so it
+    # is here for the one live case: a vertex on the plane with the other two on opposite sides,
+    # which is a real crossing.
+    lo = FLOAT64_INF_CONSTANT
+    hi = -FLOAT64_INF_CONSTANT
+    zero = wp.float64(0.0)
+    for i in range(3):
+        j = (i + 1) % 3
+        first = distance[i]
+        second = distance[j]
+        if first == zero:
+            lo = wp.min(lo, coordinate[i])
+            hi = wp.max(hi, coordinate[i])
+        if first * second < zero:
+            weight = first / (first - second)
+            crossing = coordinate[i] + weight * (coordinate[j] - coordinate[i])
+            lo = wp.min(lo, crossing)
+            hi = wp.max(hi, crossing)
+    return lo <= hi, wp.vec2d(lo, hi)
+
+
+@wp.func
+def triangles_intersect(
+    a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3
+) -> wp.bool:
+    # Do two triangles cross transversally? Moller's interval test: each triangle is cut by the
+    # other's plane into an interval along the planes' intersection line, and they intersect exactly
+    # when those two intervals overlap. Coplanar and merely touching configurations are **not**
+    # intersections here, which is MeshLib's ``touchIsIntersection=False`` convention and the one
+    # ``validation.face_self_intersecting_mask`` documents.
+    #
+    # This replaced an 11-axis separating-axis test, and the reason is exactness rather than speed.
+    # SAT over two triangles is only exact while every axis is non-degenerate, and an edge-edge
+    # cross product **vanishes for parallel edges** -- which a regular grid is full of. The old code
+    # projected onto the zero axis anyway, where every interval collapses to ``[0, 0]`` and the test
+    # reads "overlapping", so a pair separated only along such an axis was reported as intersecting.
+    # Measured against an exact float64 arbiter: **64 false positives of 128 flagged faces** on a
+    # 16x16 self-intersecting torus (where MeshLib and the arbiter agree exactly on 64), and **42 of
+    # the 45** faces the old code flagged on ``bohemian_dome`` that MeshLib did not. Both were
+    # previously recorded as a "tangential contact divergence"; most of it was this.
+    #
+    # It is **0.86x** the SAT's speed, measured interleaved on an RTX 5090 over three
+    # self-intersecting parametric surfaces (35.9 / 35.6 / 35.7 us against 31.0 / 30.6 / 30.7 at
+    # 46-54k candidate pairs), and that is the right trade: both sit on the launch floor -- 5 us at
+    # 50 000 pairs -- and the faster one was answering a different question. The cost is the
+    # data-dependent edge loop in ``plane_crossing_span``, where SAT is straight-line arithmetic.
+    # **The arithmetic is float64 on float32 inputs**, and that is the load-bearing choice here.
+    # Widening a float32 is lossless, so this is the same geometry; what the extra precision buys is
+    # the *decisions* -- the sign of a plane distance, and the comparison of two intervals. Audited
+    # pair by pair over the 13 011 broad-phase candidates of the Roman surface: the float32 kernel
+    # agreed with this same algorithm in float64 on 97.6 % of them, while a float32 *reference* with
+    # a different association order agreed with that kernel on 99.6 %. Those two numbers together
+    # are what say the residual was arithmetic and not logic.
+    #
+    # It costs **2.1x on this kernel** (48 against 22 us at ~52k candidate pairs, measured
+    # interleaved on three self-intersecting surfaces) and **~4 % end to end**, because the narrow
+    # phase is only 6-8 % of ``face_self_intersecting_mask``'s wall clock -- the BVH build, the
+    # broad phase and the scan are the rest. That is the trade, and its docstring records what the
+    # accuracy buys.
+    da0 = kernel_array.to_vec3d(a0)
+    da1 = kernel_array.to_vec3d(a1)
+    da2 = kernel_array.to_vec3d(a2)
+    db0 = kernel_array.to_vec3d(b0)
+    db1 = kernel_array.to_vec3d(b1)
+    db2 = kernel_array.to_vec3d(b2)
+    zero = wp.float64(0.0)
+
+    normal_a = wp.cross(da1 - da0, da2 - da0)
+    distance_b = wp.vec3d(
+        wp.dot(normal_a, db0 - da0), wp.dot(normal_a, db1 - da0), wp.dot(normal_a, db2 - da0)
+    )
+    # Entirely in one closed half-space of A's plane: separated, coplanar, or touching at most.
+    if wp.min(distance_b) >= zero or wp.max(distance_b) <= zero:
+        return False
+
+    normal_b = wp.cross(db1 - db0, db2 - db0)
+    distance_a = wp.vec3d(
+        wp.dot(normal_b, da0 - db0), wp.dot(normal_b, da1 - db0), wp.dot(normal_b, da2 - db0)
+    )
+    if wp.min(distance_a) >= zero or wp.max(distance_a) <= zero:
+        return False
+
+    # Both straddle, so the planes are neither parallel nor coincident and this cannot vanish.
+    direction = wp.cross(normal_a, normal_b)
+    valid_a, span_a = plane_crossing_span(
+        distance_a, wp.vec3d(wp.dot(direction, da0), wp.dot(direction, da1), wp.dot(direction, da2))
+    )
+    valid_b, span_b = plane_crossing_span(
+        distance_b, wp.vec3d(wp.dot(direction, db0), wp.dot(direction, db1), wp.dot(direction, db2))
+    )
+    if not valid_a or not valid_b:
+        return False
+    return span_a[0] <= span_b[1] and span_b[0] <= span_a[1]
+
+
+@wp.func
+def segment_coordinate(a: wp.vec3, b: wp.vec3, p: wp.vec3) -> wp.float32:
+    """Clamped projection parameter of ``p`` onto segment ``a -> b`` in ``[0, 1]``."""
+    ab = b - a
+    length_sq = wp.max(wp.length_sq(ab), TOLERANCE_MERGE_CONSTANT)
+    return wp.clamp(wp.dot(p - a, ab) / length_sq, 0.0, 1.0)
+
+
+@wp.func
+def closest_point_on_segment(a: wp.vec3, b: wp.vec3, p: wp.vec3) -> wp.vec3:
+    """Point on segment ``a -> b`` closest to ``p``."""
+    return wp.lerp(a, b, segment_coordinate(a, b, p))
+
+
+@wp.func
+def point_to_segment_distance(a: wp.vec3, b: wp.vec3, p: wp.vec3) -> wp.float32:
+    """Euclidean distance from ``p`` to the closest point on segment ``a -> b``."""
+    return wp.length(p - closest_point_on_segment(a, b, p))
+
+
+@wp.func
+def segment_segment_distance_sq(
+    p0: wp.vec3d, p1: wp.vec3d, q0: wp.vec3d, q1: wp.vec3d
+) -> wp.float64:
+    # Squared distance between two closed segments (Ericson, *Real-Time Collision Detection*). The
+    # clamped two-parameter solve rather than the closest-point pair, because every caller here
+    # wants the magnitude and the pair costs two more lerps.
+    zero = wp.float64(0.0)
+    one = wp.float64(1.0)
+    d0 = p1 - p0
+    d1 = q1 - q0
+    r = p0 - q0
+    a = wp.dot(d0, d0)
+    e = wp.dot(d1, d1)
+    f = wp.dot(d1, r)
+    s = zero
+    t = zero
+    if a <= TOLERANCE_ZERO_F64 and e <= TOLERANCE_ZERO_F64:
+        return wp.length_sq(r)  # both degenerate to points
+    if a <= TOLERANCE_ZERO_F64:
+        t = wp.clamp(f / e, zero, one)
+    else:
+        c = wp.dot(d0, r)
+        if e <= TOLERANCE_ZERO_F64:
+            s = wp.clamp(-c / a, zero, one)
+        else:
+            b = wp.dot(d0, d1)
+            denominator = a * e - b * b
+            if denominator > TOLERANCE_ZERO_F64:
+                s = wp.clamp((b * f - c * e) / denominator, zero, one)
+            t = (b * s + f) / e
+            # Clamping ``t`` moves the optimum, so ``s`` is re-solved against the clamped value --
+            # skipping this is the classic parallel-segment error.
+            if t < zero:
+                t = zero
+                s = wp.clamp(-c / a, zero, one)
+            elif t > one:
+                t = one
+                s = wp.clamp((b - c) / a, zero, one)
+    return wp.length_sq((p0 + d0 * s) - (q0 + d1 * t))
+
+
+@wp.func
+def point_triangle_distance_sq(p: wp.vec3d, a: wp.vec3d, b: wp.vec3d, c: wp.vec3d) -> wp.float64:
+    # Squared distance from a point to a closed triangle, by the seven-region barycentric test. A
+    # degenerate triangle falls through to its edges, which is why the vertex and edge regions are
+    # tested before the interior one rather than after.
+    zero = wp.float64(0.0)
+    ab = b - a
+    ac = c - a
+    ap = p - a
+    d1 = wp.dot(ab, ap)
+    d2 = wp.dot(ac, ap)
+    if d1 <= zero and d2 <= zero:
+        return wp.length_sq(ap)
+
+    bp = p - b
+    d3 = wp.dot(ab, bp)
+    d4 = wp.dot(ac, bp)
+    if d3 >= zero and d4 <= d3:
+        return wp.length_sq(bp)
+
+    cp = p - c
+    d5 = wp.dot(ab, cp)
+    d6 = wp.dot(ac, cp)
+    if d6 >= zero and d5 <= d6:
+        return wp.length_sq(cp)
+
+    vc = d1 * d4 - d3 * d2
+    if vc <= zero and d1 >= zero and d3 <= zero:
+        return wp.length_sq(ap - ab * (d1 / (d1 - d3)))
+    vb = d5 * d2 - d1 * d6
+    if vb <= zero and d2 >= zero and d6 <= zero:
+        return wp.length_sq(ap - ac * (d2 / (d2 - d6)))
+    va = d3 * d6 - d5 * d4
+    if va <= zero and (d4 - d3) >= zero and (d5 - d6) >= zero:
+        return wp.length_sq(bp - (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6))))
+
+    denominator = va + vb + vc
+    if denominator <= TOLERANCE_ZERO_F64:
+        return wp.length_sq(ap)  # degenerate: the edge cases above already covered it
+    return wp.length_sq(ap - ab * (vb / denominator) - ac * (vc / denominator))
+
+
+@wp.func
+def triangle_triangle_distance_sq(
+    a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, b0: wp.vec3, b1: wp.vec3, b2: wp.vec3
+) -> wp.float32:
+    # Squared distance between two closed triangles: zero when they cross, otherwise the smallest of
+    # nine edge-edge distances and six point-triangle distances. Those fifteen are exhaustive for
+    # *disjoint* triangles and all strictly positive for *crossing* ones, which is why the
+    # intersection test is not an optimization -- without it a pair that genuinely meets reports the
+    # distance between their boundaries instead of zero.
+    #
+    # ``float64`` inside on ``float32`` input, the same choice ``triangles_intersect`` documents and
+    # for the same reason: widening is lossless, and what the precision buys is the *decisions* --
+    # here the region tests and the clamped parameter solves, each of which is a comparison of
+    # differences of products.
+    if triangles_intersect(a0, a1, a2, b0, b1, b2):
+        return wp.float32(0.0)
+    p0 = kernel_array.to_vec3d(a0)
+    p1 = kernel_array.to_vec3d(a1)
+    p2 = kernel_array.to_vec3d(a2)
+    q0 = kernel_array.to_vec3d(b0)
+    q1 = kernel_array.to_vec3d(b1)
+    q2 = kernel_array.to_vec3d(b2)
+
+    best = segment_segment_distance_sq(p0, p1, q0, q1)
+    best = wp.min(best, segment_segment_distance_sq(p0, p1, q1, q2))
+    best = wp.min(best, segment_segment_distance_sq(p0, p1, q2, q0))
+    best = wp.min(best, segment_segment_distance_sq(p1, p2, q0, q1))
+    best = wp.min(best, segment_segment_distance_sq(p1, p2, q1, q2))
+    best = wp.min(best, segment_segment_distance_sq(p1, p2, q2, q0))
+    best = wp.min(best, segment_segment_distance_sq(p2, p0, q0, q1))
+    best = wp.min(best, segment_segment_distance_sq(p2, p0, q1, q2))
+    best = wp.min(best, segment_segment_distance_sq(p2, p0, q2, q0))
+
+    best = wp.min(best, point_triangle_distance_sq(p0, q0, q1, q2))
+    best = wp.min(best, point_triangle_distance_sq(p1, q0, q1, q2))
+    best = wp.min(best, point_triangle_distance_sq(p2, q0, q1, q2))
+    best = wp.min(best, point_triangle_distance_sq(q0, p0, p1, p2))
+    best = wp.min(best, point_triangle_distance_sq(q1, p0, p1, p2))
+    best = wp.min(best, point_triangle_distance_sq(q2, p0, p1, p2))
+    return wp.float32(best)

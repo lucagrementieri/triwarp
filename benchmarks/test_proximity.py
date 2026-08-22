@@ -635,3 +635,90 @@ def test_containing_faces_2d(bench_lib: BenchLibrary, rows: int) -> None:
     )
     # Exact on this lattice, which is why the fixture is a lattice; see the docstring.
     assert np.array_equal(located_wp.numpy(), triangulation_sp.find_simplex(queries_np))
+
+
+_CLEARANCE_OFFSETS = [1.2, 2.0]
+_clearance_cache: dict[tuple[str, str, float], wp.array[wp.vec3]] = {}
+
+
+def _separated_vertices_wp(bench_case: BenchCase, offset: float) -> wp.array[wp.vec3]:
+    """A translated self-copy, far enough away to be disjoint -- the second mesh of the pair."""
+    key = (bench_case.mesh_name, str(bench_case.device), offset)
+    if key not in _clearance_cache:
+        vertices_np = bench_case.vertices_np
+        extent = vertices_np.max(axis=0) - vertices_np.min(axis=0)
+        shift_np = np.array([offset * float(extent[0]), 0.0, 0.0])
+        _clearance_cache[key] = wp.array(
+            np.ascontiguousarray(vertices_np + shift_np, dtype=np.float32),
+            dtype=wp.vec3,
+            device=bench_case.device,
+        )
+    return _clearance_cache[key]
+
+
+@pytest.mark.benchmark(group="mesh_to_mesh_distance")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.parametrize("offset", _CLEARANCE_OFFSETS, ids=["near", "far"])
+def test_mesh_to_mesh_distance(bench_case: BenchCase, offset: float) -> None:
+    """
+    Clearance between a mesh and a translated copy of itself, at two separations.
+
+    The **separation is the axis**, and the direction it runs in was a surprise worth recording.
+    The bound derived from the vertex query grows with the gap, so each face's query box grows with
+    it -- which predicts that a distant pair is the expensive one. Measured, it is the **cheap** one:
+    8.78 ms against 12.89 on ``bunny``, and 5.32 against 11.46 on ``dragon``. Once the running
+    minimum prunes by box-to-box gap, a large true clearance means almost every candidate is
+    rejected on that lower bound immediately, while a tight clearance leaves many pairs genuinely
+    close and each one has to be measured.
+
+    meshlib's ``findDistance`` is a BVH-versus-BVH descent with a running bound, which prunes with
+    information this two-phase form only has once the second phase starts; and it is multi-threaded.
+    So this is the row where a sequential-pruning algorithm is expected to compete well against a
+    wavefront, which the plan predicted up front (§13's CUDA-decided judgement: record the ratio and
+    keep it). Both rows build their own acceleration structure inside the callable.
+
+    First measurement, medians on an RTX 5090, near / far:
+
+    | mesh | faces | triwarp-cuda | meshlib |
+    |---|---|---|---|
+    | ``bunny_decimated`` | 39 993 | 7.71 / 4.46 ms | **0.36 / 0.37** (21.7x / 12.0x) |
+    | ``bunny`` | 69 630 | 12.89 / 8.78 ms | **1.13 / 1.46** (11.4x / 6.0x) |
+    | ``dragon`` | 871 414 | 11.46 / 5.32 ms | (capped) |
+    | ``happy_buddha`` | 1 087 716 | 7.90 / 7.25 ms | (capped) |
+    | ``lucy`` | | 882.8 / 795.9 ms | (capped) |
+
+    Two things that table says. It is **nearly flat in the face count** -- 40k costs more than 871k --
+    so the cost is the candidate count, not the mesh; ``bunny_decimated`` is the slowest per face
+    because its 87 duplicated faces manufacture near-zero-gap candidates that no bound can prune.
+    And the two prunes inside the kernel are what make the numbers reportable at all: without them
+    the same rows read 144.6 / 252.3 ms on ``bunny``, so they are worth **11.2x** near and **29.1x**
+    far.
+    """
+    if bench_case.kind == "meshlib":
+        skip_larger_than(bench_case, "bunny", "findDistance is a serial descent per pair")
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        extent = vertices_np.max(axis=0) - vertices_np.min(axis=0)
+        shifted_np = vertices_np + np.array([offset * float(extent[0]), 0.0, 0.0])
+        first_ml = mesh_ml_from_numpy(vertices_np, faces_np)
+        second_ml = mesh_ml_from_numpy(shifted_np, faces_np)
+
+        def distance_ml() -> float:
+            return float(
+                mm.findDistance(
+                    mm.MeshPart(first_ml),
+                    mm.MeshPart(second_ml),
+                    None,
+                    float(np.finfo(np.float32).max),
+                ).distSq
+            )
+
+        assert bench_case.run(distance_ml, rounds=3) > 0.0
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    shifted = _separated_vertices_wp(bench_case, offset)
+    distance, face_a, face_b = bench_case.run(
+        lambda: tw.proximity.mesh_to_mesh_distance(vertices, faces, shifted, faces), rounds=3
+    )
+    assert distance > 0.0
+    assert face_a >= 0
+    assert face_b >= 0

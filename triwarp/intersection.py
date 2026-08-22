@@ -26,6 +26,7 @@ import triwarp.typing as twt
 from triwarp._device import require_nonempty_mesh
 from triwarp.constants import TOLERANCE_MERGE
 from triwarp.kernels import intersection as kernel_intersections
+from triwarp.kernels import triangles as kernel_triangles
 
 
 def segments_with_plane(
@@ -514,7 +515,7 @@ def _colliding_face_pairs(
     query_lower = wp.empty(n_query, dtype=wp.vec3, device=device)
     query_upper = wp.empty(n_query, dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_intersections.face_aabb_bounds,
+        kernel_triangles.face_aabb_bounds,
         dim=n_query,
         inputs=[query_vertices, query_faces, query_lower, query_upper],
         device=device,

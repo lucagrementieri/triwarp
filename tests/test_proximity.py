@@ -7,6 +7,8 @@ Mesh AABB queries against a brute-force reference; closest-on-mesh tests compare
 
 from __future__ import annotations
 
+import math
+
 import igl
 import numpy as np
 import open3d as o3d
@@ -352,6 +354,166 @@ def _closest_on_edges_np(
     distance_np = np.linalg.norm(queries_np[:, None, :] - projection_np, axis=-1)
     nearest_np = distance_np.argmin(1)
     return distance_np, nearest_np, projection_np[np.arange(queries_np.shape[0]), nearest_np]
+
+
+def _crossed_bars(angle_degrees: float, gap: float = 1.0) -> tuple[tm.Trimesh, tm.Trimesh]:
+    """Two thin bars crossing at a height, whose closest points are interior to skew edges."""
+    lower_tm = tm.creation.box(extents=[4.0, 0.2, 0.2])
+    upper_tm = tm.creation.box(extents=[4.0, 0.2, 0.2])
+    upper_tm.apply_transform(
+        tm.transformations.rotation_matrix(np.radians(angle_degrees), [0.0, 0.0, 1.0])
+    )
+    upper_tm.apply_translation([0.0, 0.0, gap])
+    return lower_tm, upper_tm
+
+
+@pytest.mark.parity("mesh_to_mesh_distance", "meshlib")
+@pytest.mark.parametrize("angle_degrees", [20.0, 45.0, 60.0])
+def test_mesh_to_mesh_distance_matches_meshlib_where_no_vertex_wins(
+    device: str, angle_degrees: float
+) -> None:
+    """
+    Class A on the distance, on the configuration that separates this from a vertex query.
+
+    Two thin bars crossing above one another: their closest points lie in the **interiors** of two
+    skew edges, so no vertex of either mesh achieves the minimum. Measured at a 1.0 gap and 0.2
+    thickness, the true distance is **0.800000** while the smallest vertex-to-surface distance is
+    0.938 at 20 degrees, 1.479 at 45 and 1.773 at 60 -- up to **2.2x** too large. A closest-point
+    query over vertices would return those numbers, so this fixture is what says the triangle-to-
+    triangle leaf test is doing its job rather than being an expensive way to reach the same answer.
+
+    ``findDistance`` agrees to all eight decimals printed on every one of the three angles. The
+    non-vacuity assert is the vertex bound itself: the test fails if the fixture ever stops being
+    vertex-free, which is the only way these asserts could become trivial.
+    """
+    lower_tm, upper_tm = _crossed_bars(angle_degrees)
+    lower_vertices_wp, lower_faces_wp = numpy_to_warp(
+        np.asarray(lower_tm.vertices), np.asarray(lower_tm.faces).ravel().astype(np.int32), device
+    )
+    upper_vertices_wp, upper_faces_wp = numpy_to_warp(
+        np.asarray(upper_tm.vertices), np.asarray(upper_tm.faces).ravel().astype(np.int32), device
+    )
+    distance, face_a, face_b = tw.proximity.mesh_to_mesh_distance(
+        lower_vertices_wp, lower_faces_wp, upper_vertices_wp, upper_faces_wp
+    )
+
+    vertex_bound = min(
+        float(
+            tw.reduce.min(
+                tw.proximity.closest_point_on_mesh(
+                    upper_vertices_wp, upper_faces_wp, lower_vertices_wp
+                )[1]
+            )
+        ),
+        float(
+            tw.reduce.min(
+                tw.proximity.closest_point_on_mesh(
+                    lower_vertices_wp, lower_faces_wp, upper_vertices_wp
+                )[1]
+            )
+        ),
+    )
+    assert vertex_bound > distance + 1e-4  # non-vacuity: no vertex achieves the minimum
+
+    result_ml = mm.findDistance(
+        mm.MeshPart(trimesh_to_meshlib(lower_tm)),
+        mm.MeshPart(trimesh_to_meshlib(upper_tm)),
+        None,
+        float(np.finfo(np.float32).max),
+    )
+    assert np.isclose(distance, float(np.sqrt(result_ml.distSq)), rtol=1e-5, atol=1e-6)
+    assert 0 <= face_a < len(lower_tm.faces)
+    assert 0 <= face_b < len(upper_tm.faces)
+
+
+@pytest.mark.parity("mesh_to_mesh_distance", "meshlib")
+def test_mesh_to_mesh_distance_gap_overlap_and_contact(device: str) -> None:
+    """
+    Class A on three regimes, one of which is the exact zero.
+
+    Separated, overlapping and corner-to-corner, because they take different paths: a positive
+    distance comes from the fifteen sub-distances, a zero comes from the intersection test
+    short-circuiting them, and a corner contact is the case where the two disagree if either is
+    wrong about closed versus open triangles. ``findDistance`` matches on all three -- measured
+    1.00000000 for two spheres three apart, 0.00000000 for overlapping ones and 0.28284270 for two
+    unit boxes offset by ``(1.2, 1.2)``, which is ``0.2 * sqrt(2)`` exactly.
+
+    That last number is why the corner case is here: it is a value only a correct closest-feature
+    search produces, where a bounding-box answer would give 0.2 and a centroid answer something else
+    entirely.
+    """
+    sphere_tm = tm.creation.icosphere(subdivisions=2)
+    cases = []
+    far_tm = tm.creation.icosphere(subdivisions=2)
+    far_tm.apply_translation([3.0, 0.0, 0.0])
+    cases.append((sphere_tm, far_tm, 1.0))
+    overlapping_tm = tm.creation.icosphere(subdivisions=2)
+    overlapping_tm.apply_translation([1.5, 0.0, 0.0])
+    cases.append((sphere_tm, overlapping_tm, 0.0))
+    box_tm = tm.creation.box()
+    corner_tm = tm.creation.box()
+    corner_tm.apply_translation([1.2, 1.2, 0.0])
+    cases.append((box_tm, corner_tm, 0.2 * np.sqrt(2.0)))
+
+    for a_tm, b_tm, expected in cases:
+        a_vertices_wp, a_faces_wp = numpy_to_warp(
+            np.asarray(a_tm.vertices), np.asarray(a_tm.faces).ravel().astype(np.int32), device
+        )
+        b_vertices_wp, b_faces_wp = numpy_to_warp(
+            np.asarray(b_tm.vertices), np.asarray(b_tm.faces).ravel().astype(np.int32), device
+        )
+        distance, _face_a, _face_b = tw.proximity.mesh_to_mesh_distance(
+            a_vertices_wp, a_faces_wp, b_vertices_wp, b_faces_wp
+        )
+        result_ml = mm.findDistance(
+            mm.MeshPart(trimesh_to_meshlib(a_tm)),
+            mm.MeshPart(trimesh_to_meshlib(b_tm)),
+            None,
+            float(np.finfo(np.float32).max),
+        )
+        assert np.isclose(distance, expected, rtol=1e-5, atol=1e-6)
+        assert np.isclose(distance, float(np.sqrt(result_ml.distSq)), rtol=1e-5, atol=1e-6)
+
+
+def test_mesh_to_mesh_distance_upper_bound_and_edge_cases(device: str) -> None:
+    """
+    Not a library comparison: what ``upper_bound`` does, including when it is wrong.
+
+    A sound bound must not change the answer, and a **too-small** one is documented to give a wrong
+    answer rather than a slow one -- so that is asserted, because a silent contract is worse than a
+    loud one and a reader deserves to see the failure mode demonstrated. An empty mesh returns
+    ``inf`` with no witness.
+    """
+    lower_tm, upper_tm = _crossed_bars(45.0)
+    lower_vertices_wp, lower_faces_wp = numpy_to_warp(
+        np.asarray(lower_tm.vertices), np.asarray(lower_tm.faces).ravel().astype(np.int32), device
+    )
+    upper_vertices_wp, upper_faces_wp = numpy_to_warp(
+        np.asarray(upper_tm.vertices), np.asarray(upper_tm.faces).ravel().astype(np.int32), device
+    )
+    exact, _face_a, _face_b = tw.proximity.mesh_to_mesh_distance(
+        lower_vertices_wp, lower_faces_wp, upper_vertices_wp, upper_faces_wp
+    )
+    generous, _a, _b = tw.proximity.mesh_to_mesh_distance(
+        lower_vertices_wp, lower_faces_wp, upper_vertices_wp, upper_faces_wp, upper_bound=10.0
+    )
+    assert np.isclose(generous, exact, rtol=1e-6)
+
+    # Documented: a bound below the true distance culls the winning pair.
+    starved, _a, _b = tw.proximity.mesh_to_mesh_distance(
+        lower_vertices_wp, lower_faces_wp, upper_vertices_wp, upper_faces_wp, upper_bound=0.0
+    )
+    assert starved > exact
+
+    empty_vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    empty_faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    assert tw.proximity.mesh_to_mesh_distance(
+        lower_vertices_wp, lower_faces_wp, empty_vertices_wp, empty_faces_wp
+    ) == (math.inf, -1, -1)
+    with pytest.raises(ValueError, match="upper_bound must be non-negative"):
+        tw.proximity.mesh_to_mesh_distance(
+            lower_vertices_wp, lower_faces_wp, upper_vertices_wp, upper_faces_wp, upper_bound=-1.0
+        )
 
 
 @pytest.mark.parity("closest_point_on_edges", "pyvista")

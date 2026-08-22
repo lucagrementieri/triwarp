@@ -14,6 +14,8 @@ TOLERANCE_MOLLIFY = 1e-5
 TOLERANCE_MERGE_CONSTANT = wp.constant(wp.float32(TOLERANCE_MERGE))
 TOLERANCE_PLANAR_CONSTANT = wp.constant(wp.float32(TOLERANCE_PLANAR))
 TOLERANCE_ZERO_CONSTANT = wp.constant(wp.float32(TOLERANCE_ZERO))
+TOLERANCE_ZERO_F64 = wp.constant(wp.float64(TOLERANCE_ZERO))
+"""``TOLERANCE_ZERO`` at ``float64``, for the predicates that widen before deciding."""
 
 # Largest representable values, usable as "sorts last" sentinels inside kernels (computing them
 # here in Python scope avoids the literals Warp cannot evaluate at kernel scope).

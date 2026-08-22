@@ -2,9 +2,14 @@ import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT, TOLERANCE_MERGE_CONSTANT, TWO_PI
 from triwarp.kernels import triangles as kernel_triangles
+from triwarp.kernels.array import pack_nearest_key
 from triwarp.kernels.neighbors import MAX_SEARCH_ATTEMPTS, complete_radius, deepen_radius
-from triwarp.kernels.polyline import closest_point_on_segment
-from triwarp.kernels.predicates import barycentric_2d
+from triwarp.kernels.predicates import (
+    barycentric_2d,
+    closest_point_on_segment,
+    triangle_aabb,
+    triangle_triangle_distance_sq,
+)
 
 
 @wp.func
@@ -387,3 +392,74 @@ def face_containing_point_2d(
     )
     if wp.min(barycentric[0], wp.min(barycentric[1], barycentric[2])) >= -barycentric_epsilon:
         out_face[tid] = face
+
+
+@wp.func
+def aabb_distance_sq(
+    a_lower: wp.vec3, a_upper: wp.vec3, b_lower: wp.vec3, b_upper: wp.vec3
+) -> wp.float32:
+    # Squared distance between two axis-aligned boxes: per axis, the gap between them or zero when
+    # they overlap. A lower bound on the distance between anything inside them, which is what makes
+    # it a sound prune.
+    gap = wp.max(wp.max(a_lower - b_upper, b_lower - a_upper), wp.vec3(0.0, 0.0, 0.0))
+    return wp.length_sq(gap)
+
+
+@wp.kernel
+def face_to_mesh_distance(
+    query_vertices: wp.array[wp.vec3],
+    query_faces: wp.array[wp.int32],
+    target_vertices: wp.array[wp.vec3],
+    target_faces: wp.array[wp.int32],
+    target_lower: wp.array[wp.vec3],
+    target_upper: wp.array[wp.vec3],
+    target_bvh: wp.uint64,
+    upper_bound: wp.float32,
+    global_best_sq: wp.array[wp.float32],
+    out_distance_sq: wp.array[wp.float32],
+    out_witness: wp.array[wp.int32],
+) -> None:
+    # One thread per face of the query mesh: expand its own AABB by ``upper_bound`` and test every
+    # target face whose AABB it then meets. That bound is what makes the broad phase sound -- the
+    # true minimum is at most ``upper_bound``, so the pair achieving it has AABBs within that
+    # distance and cannot be missed.
+    #
+    # Two prunes stand between a candidate and the fifteen-case leaf test, and both matter because
+    # for *well-separated* meshes the bound is roughly the answer, so every face's grown box meets a
+    # large part of the other mesh. The first is local and exact: a box-to-box gap is a lower bound
+    # on the triangle distance, so a candidate whose boxes are already farther than this thread's
+    # best cannot win. The second reads a **global** running minimum other threads have published --
+    # which makes the amount of work nondeterministic but not the answer, since it only ever skips
+    # pairs that cannot beat a distance already achieved.
+    f = wp.int32(wp.tid())
+    a0, a1, a2 = kernel_triangles.face_vertices(query_vertices, query_faces, f)
+    lower, upper = triangle_aabb(a0, a1, a2)
+    margin = wp.vec3(upper_bound, upper_bound, upper_bound)
+
+    best = FLOAT32_INF_CONSTANT
+    witness = wp.int32(-1)
+    query = wp.bvh_query_aabb(target_bvh, lower - margin, upper + margin)
+    candidate = wp.int32(0)
+    while wp.bvh_query_next(query, candidate):
+        limit = wp.min(best, global_best_sq[0])
+        if (
+            aabb_distance_sq(lower, upper, target_lower[candidate], target_upper[candidate])
+            >= limit
+        ):
+            continue
+        b0, b1, b2 = kernel_triangles.face_vertices(target_vertices, target_faces, candidate)
+        distance_sq = triangle_triangle_distance_sq(a0, a1, a2, b0, b1, b2)
+        if distance_sq < best:
+            best = distance_sq
+            witness = candidate
+            wp.atomic_min(global_best_sq, 0, best)
+    out_distance_sq[f] = best
+    out_witness[f] = witness
+
+
+@wp.kernel
+def face_distance_keys(distance_sq: wp.array[wp.float32], out_keys: wp.array[wp.int64]) -> None:
+    # One sortable ``(distance, face)`` key per query face, so a single integer ``min`` over them is
+    # an argmin: which face carries the smallest distance, lowest index on a tie.
+    f = wp.int32(wp.tid())
+    out_keys[f] = pack_nearest_key(distance_sq[f], f)

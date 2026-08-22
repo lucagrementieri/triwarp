@@ -11,6 +11,7 @@ import triwarp.typing as twt
 from triwarp._device import require_nonempty_mesh
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import intersection as kernel_intersections
+from triwarp.kernels import triangles as kernel_triangles
 from triwarp.kernels import validation as kernel_validation
 
 
@@ -486,7 +487,7 @@ def _intersecting_pairs(
     lower = wp.empty(n_faces, dtype=wp.vec3, device=device)
     upper = wp.empty(n_faces, dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_intersections.face_aabb_bounds,
+        kernel_triangles.face_aabb_bounds,
         dim=n_faces,
         inputs=[vertices, faces, lower, upper],
         device=device,

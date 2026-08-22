@@ -1,35 +1,20 @@
 import warp as wp
 
-from triwarp.constants import TOLERANCE_MERGE_CONSTANT
 from triwarp.kernels.array import binary_search_index, cross2, update_argmax, wrap_index
 from triwarp.kernels.points import plane_basis
-from triwarp.kernels.predicates import orient2d, project_out_normal, vector_angle
+from triwarp.kernels.predicates import (
+    closest_point_on_segment,
+    orient2d,
+    point_to_segment_distance,
+    project_out_normal,
+    vector_angle,
+)
 
 
 @wp.func
 def segment_displacement(polyline: wp.array[wp.vec3], i: wp.int32) -> wp.vec3:
     """Displacement vector ``polyline[i + 1] - polyline[i]`` of segment ``i``."""
     return polyline[i + 1] - polyline[i]
-
-
-@wp.func
-def segment_coordinate(a: wp.vec3, b: wp.vec3, p: wp.vec3) -> wp.float32:
-    """Clamped projection parameter of ``p`` onto segment ``a -> b`` in ``[0, 1]``."""
-    ab = b - a
-    length_sq = wp.max(wp.length_sq(ab), TOLERANCE_MERGE_CONSTANT)
-    return wp.clamp(wp.dot(p - a, ab) / length_sq, 0.0, 1.0)
-
-
-@wp.func
-def closest_point_on_segment(a: wp.vec3, b: wp.vec3, p: wp.vec3) -> wp.vec3:
-    """Point on segment ``a -> b`` closest to ``p``."""
-    return wp.lerp(a, b, segment_coordinate(a, b, p))
-
-
-@wp.func
-def point_to_segment_distance(a: wp.vec3, b: wp.vec3, p: wp.vec3) -> wp.float32:
-    """Euclidean distance from ``p`` to the closest point on segment ``a -> b``."""
-    return wp.length(p - closest_point_on_segment(a, b, p))
 
 
 @wp.func

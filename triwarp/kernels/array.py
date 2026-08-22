@@ -410,3 +410,26 @@ def pack_edge_key(u: wp.int32, v: wp.int32, base: wp.uint64) -> wp.uint64:
     lo = wp.uint64(wp.uint32(wp.min(u, v)))
     hi = wp.uint64(wp.uint32(wp.max(u, v)))
     return lo + hi * base
+
+
+@wp.func
+def pack_farthest_key(distance_sq: wp.float32, index: wp.int32) -> wp.int64:
+    # One int64 whose ``wp.atomic_max`` is "largest distance, lowest index on a tie". The IEEE-754
+    # bits of a non-negative float increase monotonically with the value, so the high half orders
+    # by distance; the low half stores ``index`` complemented within int32 so that a *smaller*
+    # index compares *larger*. Both halves are non-negative, so the whole key is, which is what
+    # makes ``-1`` a sentinel below every real candidate.
+    distance_bits = wp.uint64(wp.uint32(wp.cast(distance_sq, wp.int32)))
+    rank = wp.uint64(wp.uint32(wp.int32(2147483647) - index))
+    return wp.int64((distance_bits << wp.uint64(32)) | rank)
+
+
+@wp.func
+def pack_nearest_key(distance: wp.float32, index: wp.int32) -> wp.int64:
+    # The ``min``-ordered twin of ``pack_farthest_key``: one int64 whose minimum is "smallest
+    # distance, lowest index on a tie". Same monotone IEEE-754 high half (valid because a distance
+    # is non-negative), but the index is stored plainly rather than complemented, because a
+    # *smaller* index must now compare *smaller*. The key stays non-negative, so it needs no
+    # sentinel.
+    distance_bits = wp.uint64(wp.uint32(wp.cast(distance, wp.int32)))
+    return wp.int64((distance_bits << wp.uint64(32)) | wp.uint64(wp.uint32(index)))
