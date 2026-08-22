@@ -841,3 +841,52 @@ def test_collapse_small_triangles(bench_case: BenchCase) -> None:
     )
     assert int(kept_faces.shape[0]) <= int(faces.shape[0])
     assert int(kept_vertices.shape[0]) <= bench_case.n_vertices
+
+
+@pytest.mark.benchmark(group="eliminate_tunnels")
+@pytest.mark.benchaxis("genus")
+@pytest.mark.benchlibs("triwarp")
+def test_eliminate_tunnels(bench_case: BenchCase) -> None:
+    """
+    Removing every thin handle: homology basis, shorten, cut, fill -- the whole chain in one call.
+
+    On the ``genus`` axis, the only one in either registry with a handle to remove, so the row is
+    read against ``benchmarks/test_homology.py`` and ``test_geodesic_walk.py::test_shorten_loop``:
+    those two time the first and second stages of this call.
+
+    First measurement, medians on an RTX 5090, with the two upstream groups from the same session:
+
+    | mesh | eliminated | ``eliminate_tunnels`` | basis | shorten | cut + fill |
+    |---|---|---|---|---|---|
+    | ``handles_1`` | 1 | **14.9 ms** | 5.8 | 1.7 | 7.4 |
+    | ``handles_64`` | 1 | **90.8 ms** | 12.1 | 9.1 | 69.6 |
+
+    So the **cut and fill dominate**, and increasingly: half the call at genus 1 and more than three
+    quarters at genus 64, where the basis and the shortening together are 21 of 91 ms. That is worth
+    stating because the obvious reading of the chain is the reverse -- the basis is the expensive
+    thing in its own group and the shortening is the new code -- and neither is where the time goes.
+    Note both rows eliminate **one** tunnel: the loops kept per call are vertex-disjoint, so
+    ``handles_64``'s 128 overlapping generators still yield one, and its extra cost is the larger
+    basis and the longer loops rather than more cutting.
+
+    triwarp-only, and not by omission. MeshLib is the only library that binds the operation and its
+    ``eliminateTunnels`` is a **no-op** on every input probed -- unchanged face count and Euler
+    characteristic at ``maxTunnelLength`` 4.0 and 1e9, ``maxIters`` 1 to 100, all three
+    ``TunnelLoopType`` values, ``buildCoLoops`` off, and through the ``FillHoleNicelySettings``
+    overload -- while its own ``detectTunnelFaces`` fires on the same mesh. A row that changes
+    nothing is not a comparison, so it is left out rather than timed; see
+    ``tests/test_repair.py::test_eliminate_tunnels_drops_the_genus_by_the_count_it_reports``.
+    """
+    if bench_case.mesh_name == "sphere_med":
+        pytest.skip("sphere_med is genus 0: there is no tunnel to eliminate")
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    # Every handle in these fixtures is a real one, so an unbounded length eliminates a maximal
+    # disjoint family and times the whole chain rather than the length test.
+    cut_vertices, cut_faces, eliminated = bench_case.run(
+        lambda: tw.repair.eliminate_tunnels(vertices, faces, 1e9), rounds=3
+    )
+    assert eliminated >= 1
+    assert int(cut_vertices.shape[0]) >= bench_case.n_vertices
+    assert tw.measures.euler_characteristic(cut_faces) == (
+        tw.measures.euler_characteristic(faces) + 2 * eliminated
+    )

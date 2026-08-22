@@ -1936,6 +1936,109 @@ def test_fix_self_intersections_leaves_a_clean_mesh_alone(
         tw.repair.fix_self_intersections(vertices_wp, faces_wp, max_iter=0)
 
 
+def _genus(faces_wp: wp.array[wp.int32]) -> int:
+    """Genus of a closed connected surface, from its Euler characteristic."""
+    return (2 - tw.measures.euler_characteristic(faces_wp)) // 2
+
+
+@pytest.mark.parametrize("mesh_name", ["torus", "genus_two"])
+def test_eliminate_tunnels_drops_the_genus_by_the_count_it_reports(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Not a library comparison: MeshLib's ``eliminateTunnels`` is a **no-op** on every input probed.
+
+    It is the only reference that binds this operation, and it changes nothing -- measured on a
+    2 048-face torus and a genus-2 union, at ``maxTunnelLength`` of 4.0 and of 1e9, at ``maxIters``
+    1 / 2 / 5 / 100, at all three ``TunnelLoopType`` values, with ``buildCoLoops`` off, and through
+    the ``FillHoleNicelySettings`` overload: identical face count and identical Euler characteristic
+    every time. Its detector *does* fire on the same mesh (``detectTunnelFaces`` returns 128 faces,
+    ``detectBasisTunnels`` two loops), so this is the "a reference's zero is not always off" case,
+    not a wiring mistake. There is nothing to compare a value against.
+
+    The invariant carries the whole claim instead, and it is exact rather than approximate: cutting
+    a surface along a non-separating cycle and sealing the two rims drops the genus by **one**, so
+    ``euler_characteristic`` must rise by exactly ``2 * eliminated``. That is what makes the return
+    value a measurement. Three more properties come with it -- the result stays connected,
+    watertight and edge-manifold -- and together they exclude the failure this function's shape
+    invites: a cut along loops that cross, which shatters the surface into pieces while every
+    individual step still looks correct (measured, before the disjointness rule: four spheres from
+    a genus-2 union, and ``euler_characteristic`` 8).
+    """
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    genus_before = _genus(faces_wp)
+    assert genus_before >= 1  # non-vacuity: there has to be a tunnel to eliminate
+
+    cut_vertices_wp, cut_faces_wp, eliminated = tw.repair.eliminate_tunnels(
+        vertices_wp, faces_wp, 1e9
+    )
+    assert eliminated >= 1
+    assert tw.measures.euler_characteristic(cut_faces_wp) == (
+        tw.measures.euler_characteristic(faces_wp) + 2 * eliminated
+    )
+    assert _genus(cut_faces_wp) == genus_before - eliminated
+    assert tw.validation.is_edge_manifold(cut_faces_wp)
+    assert len(tw.boundary.boundary_loops(cut_vertices_wp, cut_faces_wp)) == 0
+    labels_np = tw.adjacency.face_connected_component_labels(cut_faces_wp).numpy()
+    assert np.unique(labels_np).shape[0] == 1
+    # Every output position is an input position: the rims are filled over their own vertices.
+    assert int(cut_vertices_wp.shape[0]) >= int(vertices_wp.shape[0])
+
+
+def test_eliminate_tunnels_iterates_to_a_sphere(genus_two: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: see above. This pins the documented "call it again" contract.
+
+    One call takes at most one loop per vertex-disjoint family, so a basis whose loops all overlap
+    needs another round. The docstring tells callers to loop until ``eliminated`` is ``0``, and this
+    is that loop: a genus-2 union reaches genus 0 in **two** rounds and the third reports nothing,
+    which is both the termination proof and the reason the count is not just the genus.
+    """
+    _, mesh_wp = genus_two
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    rounds = 0
+    while True:
+        vertices_wp, faces_wp, eliminated = tw.repair.eliminate_tunnels(vertices_wp, faces_wp, 1e9)
+        if eliminated == 0:
+            break
+        rounds += 1
+        assert rounds <= 4  # it must terminate, and two rounds is what this fixture takes
+    assert rounds == 2
+    assert _genus(faces_wp) == 0
+    assert tw.validation.is_edge_manifold(faces_wp)
+
+
+def test_eliminate_tunnels_leaves_a_long_tunnel_and_a_sphere_alone(
+    torus: tuple[tm.Trimesh, wp.Mesh], icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Not a library comparison: see above. The two do-nothing branches, which are the safety claim.
+
+    ``max_length`` below the tunnel's own girth must leave the mesh **identical**, not merely
+    equivalent -- that is what makes the function safe to run on a mesh whose genus is intended. And
+    a genus-0 input has no basis at all, so it returns before cutting anything.
+    """
+    _, torus_wp = torus
+    kept_vertices_wp, kept_faces_wp, eliminated = tw.repair.eliminate_tunnels(
+        torus_wp.points, torus_wp.indices, 0.5
+    )
+    assert eliminated == 0
+    assert np.array_equal(kept_faces_wp.numpy(), torus_wp.indices.numpy())
+    assert np.array_equal(kept_vertices_wp.numpy(), torus_wp.points.numpy())
+
+    _, sphere_wp = icosphere
+    assert _genus(sphere_wp.indices) == 0
+    _, sphere_faces_wp, sphere_eliminated = tw.repair.eliminate_tunnels(
+        sphere_wp.points, sphere_wp.indices, 1e9
+    )
+    assert sphere_eliminated == 0
+    assert np.array_equal(sphere_faces_wp.numpy(), sphere_wp.indices.numpy())
+
+    with pytest.raises(ValueError, match="max_length must be non-negative"):
+        tw.repair.eliminate_tunnels(torus_wp.points, torus_wp.indices, -1.0)
+
+
 def test_remove_t_vertices_flips_the_sliver(device: str) -> None:
     """The sliver goes, the face count and the vertices stay, and the patch stays manifold."""
     vertices_np, faces_np = _t_vertex_patch()

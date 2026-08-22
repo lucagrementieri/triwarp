@@ -21,6 +21,7 @@ from __future__ import annotations
 import math
 from typing import Literal
 
+import numpy as np
 import warp as wp
 
 import triwarp as tw
@@ -1146,6 +1147,151 @@ def _dilate_face_mask(
         faces, tw.array.flatnonzero(vertex_mask), face_mode="any"
     )
     return tw.array.indices_to_mask(grown_faces, n_faces, device=device)
+
+
+def eliminate_tunnels(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    max_length: float,
+    *,
+    metric: str = "plane_normalized",
+    max_iter: int = 100,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], int]:
+    """
+    Remove thin handles by cutting along their short tunnel loops and sealing the two rims.
+
+    A handle is a genus the surface did not need: a scanning artifact where two sheets fused, or a
+    reconstruction that bridged across a gap. Its signature is a **short non-contractible loop** --
+    short being the whole test, since every genus of the intended shape has loops the size of the
+    shape. So: take a homology basis, shorten each loop within its class
+    ([`shorten_loop`][triwarp.geodesic_walk.shorten_loop]), keep the ones that come in under
+    ``max_length``, cut along those and fill the boundary loops the cut opens. Cutting a surface
+    along a non-separating cycle and sealing the two rims it creates drops the genus by exactly one,
+    so ``2 * eliminated`` is the rise in
+    [`euler_characteristic`][triwarp.measures.euler_characteristic] -- verified rather than
+    reported, and the invariant to assert if you extend this.
+
+    Nothing is removed when no loop is short enough, and the input is returned unchanged -- so this
+    is safe to run on a mesh whose genus is intended, provided ``max_length`` is below the scale of
+    its real handles.
+
+    !!! note "One disjoint pass per call"
+        The loops kept are pairwise **vertex-disjoint**, shortest first. Cutting along two loops
+        that cross is not the same operation as cutting along each in turn -- the shared vertex is
+        split by both cuts at once -- and without the restriction the genus stops dropping one per
+        loop: measured on a genus-2 union, two overlapping basis loops dropped it by one, and
+        cutting the whole basis shattered the surface into four spheres. The cost is that one call
+        eliminates at most one tunnel per disjoint family, so a mesh whose basis loops all overlap
+        needs to be run again. Call it in a loop until ``eliminated`` is ``0``; on that genus-2
+        union that is two rounds to reach a sphere, and the third round is the one that stops.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer. Must be a closed, connected,
+        edge-manifold surface, which is what the homology basis needs.
+    max_length
+        Loops at or under this length are eliminated. It is an absolute length in the mesh's own
+        units, so scale it off something intrinsic -- the mean edge length times the number of
+        triangles a real handle would take to go round.
+    metric
+        Triangulation metric for the two rims, as
+        [`fill_min_weight`][triwarp.holes.fill_min_weight] takes it.
+    max_iter
+        Sweep cap handed to [`shorten_loop`][triwarp.geodesic_walk.shorten_loop]. Shortening is what
+        makes the length test meaningful: a tree-cotree loop around a thin handle can be many times
+        the handle's own girth, so an unshortened basis under-reports every tunnel.
+
+    Returns
+    -------
+    vertices : wp.array[wp.vec3]
+        Positions of the result. Longer than the input's wherever the cut split a vertex; the
+        existing positions are unchanged and no new position is invented, since the rims are filled
+        over their own vertices.
+    faces : wp.array[wp.int32]
+        Flat ``3 * n_faces`` triangle index buffer, the cut mesh plus the fill triangles.
+    eliminated : int
+        How many loops were cut. Zero means nothing was short enough, and the buffers are the
+        input's.
+
+    Raises
+    ------
+    ValueError
+        If ``max_length`` is negative, or the mesh has a boundary (a surface with boundary has a
+        different homology basis, so "tunnel" is not defined by this test).
+
+    See Also
+    --------
+    [`shorten_loop`][triwarp.geodesic_walk.shorten_loop]
+        Makes the length test meaningful, and is where the loops come from.
+    [`homology_generators`][triwarp.homology.homology_generators]
+    [`fix_self_intersections`][triwarp.repair.fix_self_intersections]
+        The other topological repair here: that one removes crossings, this one removes genus.
+    """
+    if max_length < 0.0:
+        raise ValueError(f"max_length must be non-negative, got {max_length}")
+    device = faces.device
+    loops = tw.homology.homology_generators(vertices, faces)
+    if not loops:
+        return vertices, faces, 0
+
+    shortened, _sweeps = tw.geodesic_walk.shorten_loop(vertices, faces, loops, max_iter=max_iter)
+    # One readback per loop, and the loops are the only thing being measured: a basis has 2 * genus
+    # of them and each is a handful of indices, so this never scales with the mesh.
+    short = sorted(
+        ((_cycle_length(vertices, loop), loop) for loop in shortened), key=lambda pair: pair[0]
+    )
+    selected = _disjoint_loops([loop for length, loop in short if length <= max_length])
+    if not selected:
+        return vertices, faces, 0
+
+    cut_edges = wp.array(
+        np.concatenate([_cycle_edges(loop) for loop in selected]), dtype=wp.int32, device=device
+    )
+    cut_vertices, cut_faces = tw.seams.cut_along_edges(
+        vertices, faces, twt.as_array2d(cut_edges, wp.int32)
+    )
+    return (
+        cut_vertices,
+        tw.holes.fill_min_weight(cut_vertices, cut_faces, metric=metric),
+        len(selected),
+    )
+
+
+def _disjoint_loops(loops: list[wp.array[wp.int32]]) -> list[wp.array[wp.int32]]:
+    """
+    Greedily keep the loops that share no vertex, taking them shortest first.
+
+    Cutting along two loops that *cross* is not the same operation as cutting along each in turn:
+    the shared vertex is split by both cuts at once, and the genus stops dropping by one per loop.
+    Measured on a genus-2 union, two overlapping basis loops dropped the genus by one rather than
+    two, and cutting the whole basis shattered the surface into four spheres. Keeping the selection
+    pairwise disjoint is what makes ``eliminated`` mean what it says.
+    """
+    claimed: set[int] = set()
+    kept: list[wp.array[wp.int32]] = []
+    for loop in loops:
+        loop_indices = {int(index) for index in loop.numpy()}
+        if loop_indices & claimed:
+            continue
+        claimed |= loop_indices
+        kept.append(loop)
+    return kept
+
+
+def _cycle_length(vertices: wp.array[wp.vec3], loop: wp.array[wp.int32]) -> float:
+    """Length of a closed vertex-index cycle, gathered onto its positions."""
+    points = wp.empty(int(loop.shape[0]), dtype=wp.vec3, device=vertices.device)
+    wp.copy(points, vertices[loop])
+    return tw.polyline.polyline_length(points, closed=True)
+
+
+def _cycle_edges(loop: wp.array[wp.int32]) -> np.ndarray:
+    """Pack a closed cycle's edges as ascending ``(k, 2)`` rows, which is what a cut keys on."""
+    loop_np = loop.numpy()
+    return np.sort(np.stack([loop_np, np.roll(loop_np, -1)], axis=1), axis=1).astype(np.int32)
 
 
 def remove_t_vertices(

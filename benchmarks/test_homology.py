@@ -16,27 +16,38 @@ Measured medians (RTX 5090, ``--device=cuda``)
 ----------------------------------------------
 | mesh | genus | ``homology_generators`` | ``tree_cotree`` | meshlib |
 |---|---|---|---|---|
-| ``sphere_med`` | 0 | 51.8 ms | 51.1 ms | 7.6 ms |
-| ``handles_1`` | 1 | 50.4 ms | 50.0 ms | 5.5 ms |
-| ``handles_64`` | 64 | 65.1 ms | 58.9 ms | 6.0 ms |
+| ``sphere_med`` | 0 | **5.96 ms** | 5.84 ms | 7.38 ms |
+| ``handles_1`` | 1 | **5.76 ms** | 5.27 ms | 5.52 ms |
+| ``handles_64`` | 64 | **12.07 ms** | 5.98 ms | 5.99 ms |
 
-Two things that table says, and the second was not what the axis was built to look for.
+**This table replaces one that read 51.8 / 50.4 / 65.1 ms in the triwarp column, and both of that
+table's findings have gone with it.** The re-measurement is trustworthy because meshlib's column is
+unchanged within noise (7.38 / 5.52 / 5.99 against 7.6 / 5.5 / 6.0), which is what says the two
+sessions are comparable and the 8.7x is triwarp's own. What earned it is *not* attributed here --
+nothing in this module changed, so it came from something shared, and a guess in a benchmark
+docstring is worse than the gap.
 
-**The decomposition is the whole cost**, not the tracing: at genus 1 the trees are 50.0 ms of the
-50.4 ms total, and even at genus 64 they are 58.9 of 65.1. So 128 loop traces cost about 6 ms while
-the two spanning trees cost fifty, and any work on this module belongs there.
+**The decomposition is no longer the whole cost.** At genus 1 the trees are 5.27 ms of 5.76, but at
+genus 64 they are 5.98 of 12.07 -- so 128 loop traces cost 6.1 ms against 0.49 ms for two, and half
+the work at high genus is now tracing. That is the reverse of the old reading, and it is the same
+6 ms of tracing as before: the trees fell around it.
 
-**And the trees are not flat in the genus** -- 51.1 -> 50.0 -> 58.9 ms -- which they should be,
-since neither BFS knows how many edges will be left over. A 15 % rise from genus 1 to genus 64 at
-an unchanged face count is the finding this group exists to surface; ``handles_64``'s extra 5 % of
-faces accounts for part of it and not for all of it. meshlib, by contrast, is flat to within noise
-(7.6 / 5.5 / 6.0 ms) and **6.9-10.9x faster**, so this is the module's largest standing gap.
+**And the trees are flat in the genus after all** -- 5.84 / 5.27 / 5.98 ms -- which is what they
+should be, since neither BFS knows how many edges will be left over. The old table's 15 % rise was
+an artifact of whatever made the trees fifty milliseconds; there is no finding there to chase.
+
+triwarp is now **1.24x faster** than meshlib at genus 0, level with it at genus 1 (1.04x) and
+**2.01x behind** at genus 64 -- where the gap is the per-loop tracing, not the decomposition. The
+previous claim that this was the module's largest standing gap no longer holds.
 
 References
 ----------
 **meshlib** is the only library in the suite that computes a homology basis. potpourri3d does not
 bind geometry-central's homology code and neither trimesh nor libigl has one, which is why
-``tests/test_homology.py`` otherwise stands on invariants. ``detectBasisTunnels`` returns a vector
+``tests/test_homology.py`` otherwise stands on invariants. Its ``eliminateTunnels`` -- the consumer
+of this basis, benchmarked as ``eliminate_tunnels`` in ``benchmarks/test_repair.py`` -- is a no-op on
+every input probed, so that group has no meshlib row even though this one does.
+``detectBasisTunnels`` returns a vector
 of ``EdgeId`` paths -- the same 2 * genus loops, though not the same ones, since a basis is not
 unique (measured on a torus: 32 and 18 edges against MeshLib's 72 and 32).
 
@@ -71,8 +82,9 @@ def test_homology_generators(bench_case: BenchCase) -> None:
     The full basis: spanning tree, cotree, then one loop trace per generator.
 
     Read against [`test_tree_cotree`] below, which stops before the tracing: the gap between the two
-    groups is what the loops cost, and it is **small** -- 0.4 ms at genus 1 and 6.2 ms at genus 64,
-    against fifty for the trees themselves (see the module docstring).
+    groups is what the loops cost -- 0.49 ms at genus 1 and **6.1 ms** at genus 64, against 5.3-6.0
+    for the trees themselves. So at high genus the tracing is half the call, which is the opposite
+    of what this group used to say; see the module docstring for why the older numbers are gone.
     """
     expected = {"sphere_med": 0, "handles_1": 2, "handles_64": 128}[bench_case.mesh_name]
     if bench_case.kind == "meshlib":
@@ -94,11 +106,13 @@ def test_tree_cotree(bench_case: BenchCase) -> None:
 
     triwarp-only by construction, not by omission: MeshLib exposes the finished basis and no
     intermediate, so there is nothing to compare a spanning tree against. It is here to attribute
-    ``homology_generators``' cost, and it does -- 50.0 of 50.4 ms at genus 1.
+    ``homology_generators``' cost, and it does -- 5.27 of 5.76 ms at genus 1, but only 5.98 of 12.07
+    at genus 64.
 
-    It was expected to be *flat* along this axis, since neither BFS knows how many edges will be
-    left over, and it is not: 51.1 / 50.0 / 58.9 ms at genus 0 / 1 / 64. Whatever that 15 % is, it
-    is visible only here, which is the reason to keep the group separate from the one above.
+    It is **flat** along this axis -- 5.84 / 5.27 / 5.98 ms at genus 0 / 1 / 64 -- which is what it
+    should be, since neither BFS knows how many edges will be left over. An earlier reading of this
+    same group was ten times larger and *not* flat, and the separate group is what makes the
+    difference visible: the non-flatness was in the trees, and it went away with the ten times.
     """
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
     edges, generators, parents = bench_case.run(lambda: tw.homology.tree_cotree(vertices, faces))
