@@ -34,6 +34,7 @@ from typing import Literal
 import warp as wp
 
 import triwarp as tw
+import triwarp.typing as twt
 from triwarp._device import require_nonempty_mesh
 from triwarp.kernels import proximity as kernel_proximity
 from triwarp.triangles import face_normals_and_areas
@@ -44,6 +45,13 @@ from triwarp.triangles import face_normals_and_areas
 # measured on 20k faces x 5000 queries, 128 runs 0.49 ms against 3.7 ms at 8 and 13.8 ms at 4. The
 # optimum is flat over 128-256 and degrades again past 512, so this is not a sensitive knob.
 ITEMS_PER_QUERY_SLICE = 128
+
+# First search radius for [`closest_point_on_edges`][triwarp.proximity.closest_point_on_edges], as a
+# fraction of the ``max_dist`` its deepening loop is capped at. The loop doubles from here and jumps
+# straight to the certified radius as soon as it holds any candidate, so this only decides how many
+# empty scans a query far from every edge pays; too *large* a start is the expensive mistake, since
+# the first scan then enumerates the whole edge set.
+_EDGE_INITIAL_RADIUS_SCALE = 0.01
 
 # Ray-origin offset *below* the surface along the inward normal, as a fraction of the query AABB
 # diagonal: without it the cone's own starting triangle is the nearest hit for every ray.
@@ -139,6 +147,141 @@ def closest_point_on_mesh(
         device=device,
     )
     return out_closest, out_distance, out_face
+
+
+def closest_point_on_edges(
+    vertices: wp.array[wp.vec3],
+    edges: twt.Array2dInt32,
+    queries: wp.array[wp.vec3],
+    *,
+    max_dist: float | None = None,
+    bvh: wp.Bvh | None = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.float32], wp.array[wp.int32]]:
+    """
+    For each query point, find the closest point on any edge of an edge set.
+
+    The **wireframe** counterpart of
+    [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]: same return triple, same
+    ``max_dist`` semantics, but the geometry is a set of segments rather than a surface. That is the
+    query a crease set, a seam, a boundary rim or a feature curve wants -- all four are already
+    produced as an edge array by [`triwarp.seams`][triwarp.seams],
+    [`triwarp.boundary`][triwarp.boundary] and [`triwarp.edges`][triwarp.edges], and none of them
+    could be measured against before.
+
+    Parameters
+    ----------
+    vertices
+        ``(n,)`` positions the edges index, as ``wp.vec3``.
+    edges
+        ``(n_edges, 2)`` ``wp.int32`` vertex-index pairs. Order within a pair is irrelevant, and
+        edges may share vertices or repeat.
+    queries
+        ``(m,)`` query positions in space as ``wp.vec3``.
+    max_dist
+        Maximum search distance per query; an edge farther than this is ignored and the query
+        reports a miss. When ``None``, derived from the box enclosing ``vertices`` and ``queries``,
+        which no real query can exceed.
+    bvh
+        A ``wp.Bvh`` already built over this edge set's per-edge boxes, to spare the bounds pass and
+        the build. Purely an optimization -- and, as with
+        [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]'s ``mesh``, it is not
+        checked against ``vertices`` / ``edges``: a BVH over a *different* edge set silently answers
+        for the boxes it holds while the distances are computed from these vertices.
+
+    Returns
+    -------
+    closest
+        ``(m,)`` closest point on the edge set for each query, as ``wp.vec3``.
+    distance
+        ``(m,)`` unsigned distance from each query to that point.
+    edge_id
+        ``(m,)`` row of ``edges`` the closest point lies on, or ``-1`` when no edge lies within
+        ``max_dist``.
+
+    Raises
+    ------
+    ValueError
+        If ``edges`` is not a rank-2 ``wp.int32`` array with two columns.
+
+    Notes
+    -----
+    A miss reports the query point itself and ``max_dist``, alongside the ``-1`` id -- the same
+    convention [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh] uses, so the two
+    are interchangeable in a caller that only reads the id.
+
+    The traversal is iterative deepening over a per-edge-box BVH and is **exact**, not a broad-phase
+    approximation: a scan of the cube of half-extent ``r`` about a query enumerates every edge whose
+    closest point lies within ``r``, so a best distance under ``r`` certifies the answer. The
+    tempting shortcut -- one degenerate ``(a, b, b)`` triangle per edge, queried with
+    ``wp.mesh_query_point_no_sign`` -- does **not** work: Warp's mesh BVH rejects a zero-area
+    triangle, measured as 64 misses out of 64 queries on both devices (Warp 1.16).
+
+    See Also
+    --------
+    [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]
+        The surface form. On a closed mesh its answer is never farther than this one's.
+    [`triwarp.polyline.distance_to_polyline`][triwarp.polyline.distance_to_polyline]
+        The same computation for an *ordered* chain, where the segments are consecutive vertices and
+        no index structure is built.
+    """
+    device = vertices.device
+    twt.ensure_ndim(edges, 2, dtype=wp.int32)
+    if int(edges.shape[1]) != 2:
+        raise ValueError("edges must have two columns")
+    m = int(queries.shape[0])
+    n_edges = int(edges.shape[0])
+
+    if m == 0:
+        return (
+            wp.empty(0, dtype=wp.vec3, device=device),
+            wp.empty(0, dtype=wp.float32, device=device),
+            wp.empty(0, dtype=wp.int32, device=device),
+        )
+    if n_edges == 0:
+        return (
+            wp.clone(queries),
+            wp.full(m, float("inf"), dtype=wp.float32, device=device),
+            wp.full(m, -1, dtype=wp.int32, device=device),
+        )
+
+    if bvh is None:
+        lower = wp.empty(n_edges, dtype=wp.vec3, device=device)
+        upper = wp.empty(n_edges, dtype=wp.vec3, device=device)
+        wp.launch(
+            kernel_proximity.edge_bounds,
+            dim=n_edges,
+            inputs=[vertices, edges, lower, upper],
+            device=device,
+        )
+        bvh = tw.neighbors.bvh_from_bounds(lower, upper)
+    if max_dist is None:
+        max_dist = tw.bounds.enclosing_diagonal(vertices, queries)
+    # The scene box bounds each query's *complete* search radius, so a query outside the geometry
+    # still terminates exactly rather than growing to ``max_dist``.
+    min_bound, max_bound = tw.bounds.aabb(vertices)
+
+    out_closest = wp.empty(m, dtype=wp.vec3, device=device)
+    out_distance = wp.empty(m, dtype=wp.float32, device=device)
+    out_edge = wp.empty(m, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_proximity.closest_point_on_edges,
+        dim=m,
+        inputs=[
+            vertices,
+            edges,
+            queries,
+            bvh.id,
+            wp.float32(max_dist),
+            wp.float32(_EDGE_INITIAL_RADIUS_SCALE * max_dist),
+            min_bound,
+            max_bound,
+            out_closest,
+            out_distance,
+            out_edge,
+        ],
+        device=device,
+    )
+    return out_closest, out_distance, out_edge
 
 
 def normals_at_closest_faces(

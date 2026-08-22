@@ -1,7 +1,9 @@
 import warp as wp
 
-from triwarp.constants import TOLERANCE_MERGE_CONSTANT, TWO_PI
+from triwarp.constants import FLOAT32_INF_CONSTANT, TOLERANCE_MERGE_CONSTANT, TWO_PI
 from triwarp.kernels import triangles as kernel_triangles
+from triwarp.kernels.neighbors import MAX_SEARCH_ATTEMPTS, complete_radius, deepen_radius
+from triwarp.kernels.polyline import closest_point_on_segment
 from triwarp.kernels.predicates import barycentric_2d
 
 
@@ -89,6 +91,86 @@ def closest_point_on_mesh(
         out_closest[tid] = p
         out_distance[tid] = max_dist
         out_face[tid] = wp.int32(-1)
+
+
+@wp.kernel
+def closest_point_on_edges(
+    vertices: wp.array[wp.vec3],
+    edges: wp.array2d[wp.int32],
+    queries: wp.array[wp.vec3],
+    bvh_id: wp.uint64,
+    max_dist: wp.float32,
+    initial_radius: wp.float32,
+    min_bound: wp.vec3,
+    max_bound: wp.vec3,
+    out_closest: wp.array[wp.vec3],
+    out_distance: wp.array[wp.float32],
+    out_edge: wp.array[wp.int32],
+) -> None:
+    # The wireframe counterpart of ``closest_point_on_mesh``, and the reason it is a hand-written
+    # traversal rather than a ``wp.mesh_query_point_no_sign`` over degenerate triangles: Warp's mesh
+    # BVH **rejects** a zero-area triangle outright. Measured on Warp 1.16, 200 segments as
+    # ``(a, b, b)`` triangles and 64 queries: ``result`` is false for 64 of 64 on both devices, so
+    # that shortcut answers nothing at all rather than answering approximately.
+    #
+    # Iterative deepening, sharing ``complete_radius`` / ``deepen_radius`` with the k-NN kernels
+    # next door: a scan of the cube ``[q +/- r]`` enumerates every edge whose *closest point* is
+    # within ``r`` (that point is then inside the cube, so the edge's AABB overlaps it), which is
+    # what makes ``best <= r`` a proof of exactness rather than a heuristic. One
+    # ``wp.bvh_query_aabb`` call site, for the shared-stack reason the k-NN kernel records.
+    tid = wp.tid()
+    q = queries[tid]
+
+    r_hard = wp.min(max_dist, complete_radius(q, min_bound, max_bound))
+    r = wp.min(initial_radius, r_hard)
+    best_distance = FLOAT32_INF_CONSTANT
+    best_edge = wp.int32(-1)
+    best_point = q
+    for attempt in range(MAX_SEARCH_ATTEMPTS):
+        if attempt == MAX_SEARCH_ATTEMPTS - 1:
+            r = r_hard  # forced-complete final attempt: exact whatever the growth did
+        query = wp.bvh_query_aabb(bvh_id, q - wp.vec3(r), q + wp.vec3(r), root=-1)
+        edge_index = wp.int32(0)
+        while wp.bvh_query_next(query, edge_index):
+            candidate = closest_point_on_segment(
+                vertices[edges[edge_index, 0]], vertices[edges[edge_index, 1]], q
+            )
+            d = wp.length(candidate - q)
+            # Acceptance is ``d <= max_dist``; ``r`` bounds only the enumeration.
+            if d < best_distance and d <= max_dist:
+                best_distance = d
+                best_edge = edge_index
+                best_point = candidate
+        if best_distance <= r:
+            break  # every edge outside the cube is farther than the best: certified exact
+        if r >= r_hard:
+            break  # the scan was already complete, so the answer is final
+        r = deepen_radius(best_distance, r, r_hard)
+
+    if best_edge < 0:
+        # Miss convention copied from ``closest_point_on_mesh`` above, so the two agree.
+        out_closest[tid] = q
+        out_distance[tid] = max_dist
+        out_edge[tid] = wp.int32(-1)
+    else:
+        out_closest[tid] = best_point
+        out_distance[tid] = best_distance
+        out_edge[tid] = best_edge
+
+
+@wp.kernel
+def edge_bounds(
+    vertices: wp.array[wp.vec3],
+    edges: wp.array2d[wp.int32],
+    out_lower: wp.array[wp.vec3],
+    out_upper: wp.array[wp.vec3],
+) -> None:
+    # Per-edge AABB, the input a segment BVH is built from.
+    e = wp.int32(wp.tid())
+    a = vertices[edges[e, 0]]
+    b = vertices[edges[e, 1]]
+    out_lower[e] = wp.min(a, b)
+    out_upper[e] = wp.max(a, b)
 
 
 @wp.func

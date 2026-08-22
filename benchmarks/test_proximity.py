@@ -76,6 +76,7 @@ import numpy as np
 import pymeshlab as ml
 import pytest
 import pyvista as pv
+import trimesh as tm
 import warp as wp
 from conftest import BenchCase, BenchLibrary, mesh_ml_from_numpy, skip_larger_than
 from meshlib import mrmeshnumpy as mn
@@ -83,6 +84,7 @@ from meshlib import mrmeshpy as mm
 from scipy.spatial import Delaunay
 
 import triwarp as tw
+import triwarp.typing as twt
 
 _QUERY_SEED = 42
 _N_QUERIES = 10_000
@@ -318,6 +320,101 @@ def test_closest_point_on_mesh(bench_case: BenchCase) -> None:
     assert closest.shape == (_N_QUERIES,)
     assert distances.shape == (_N_QUERIES,)
     assert faces_hit.shape == (_N_QUERIES,)
+
+
+_crease_np_cache: dict[str, np.ndarray] = {}
+_crease_wp_cache: dict[tuple[str, str], twt.Array2dInt32] = {}
+
+
+def _crease_edges_np(bench_case: BenchCase) -> np.ndarray:
+    """
+    The mesh's sharp edges at 30 degrees, built on the host once per mesh.
+
+    Built with trimesh rather than with ``tw.seams.crease_edges`` so that **both** rows of the edge
+    query get the identical edge set: ``vertices_wp`` is triwarp-only, so a triwarp-built set could
+    not be handed to the pyvista row, and timing each side against its own crease set would fold a
+    different input into a query comparison.
+    """
+    if bench_case.mesh_name not in _crease_np_cache:
+        mesh_tm = tm.Trimesh(
+            vertices=bench_case.vertices_np, faces=bench_case.faces_np, process=False
+        )
+        sharp_tm = np.degrees(mesh_tm.face_adjacency_angles) >= 30.0
+        _crease_np_cache[bench_case.mesh_name] = np.ascontiguousarray(
+            mesh_tm.face_adjacency_edges[sharp_tm], dtype=np.int32
+        )
+    return _crease_np_cache[bench_case.mesh_name]
+
+
+def _crease_edges_wp(bench_case: BenchCase) -> twt.Array2dInt32:
+    """The same edge set on the case's device, cached: it is an input, not part of the measurement."""
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _crease_wp_cache:
+        _crease_wp_cache[key] = twt.as_array2d(
+            wp.array(_crease_edges_np(bench_case), dtype=wp.int32, device=bench_case.device),
+            wp.int32,
+        )
+    return _crease_wp_cache[key]
+
+
+@pytest.mark.benchmark(group="closest_point_on_edges")
+@pytest.mark.benchlibs("triwarp", "pyvista")
+def test_closest_point_on_edges(bench_case: BenchCase) -> None:
+    """
+    The **wireframe** closest-point query: the same queries against the mesh's crease edges.
+
+    Read against ``closest_point_on_mesh``, which answers the same queries against the surface. The
+    two are different structures over the same geometry -- a BVH of per-edge boxes against Warp's
+    triangle mesh BVH -- and the edge set is far smaller than the face set, so the ratio prices
+    triwarp's hand-written deepening traversal against Warp's built-in one on an easier input.
+
+    The crease set is built outside the timed callable and on the host, so both rows get the
+    identical edge set (see ``_crease_edges_np``); it is the *input* here, and triwarp's own
+    ``crease_edges`` is timed in ``test_seams.py``. Its size is a mesh property rather than a knob,
+    which is why this group takes no axis of its own.
+
+    pyvista is the only batched reference. VTK's ``find_closest_cell`` on a one-line-cell-per-edge
+    ``PolyData`` is exact for this query (probed: 0.0 distance error, every cell id matching a
+    brute-force argmin), and its locator is pre-warmed rather than timed, as in the surface group.
+    MeshLib's ``findProjectionOnMeshEdges`` is the other exact reference and is deliberately absent:
+    it answers one query per call, so a row would time a Python loop over 10 000 queries rather than
+    the traversal (``tests/test_proximity.py`` carries it as a ``benchmarked=False`` claim).
+
+    First measurement, medians on an RTX 5090 at 10 000 queries: triwarp-cuda **2.94 ms** on
+    ``bunny`` against pyvista's **68.3** (23x), and 12.1 / 32.2 / 89.9 ms at ``dragon`` /
+    ``happy_buddha`` / ``lucy`` -- the slope is the crease *count*, not the face count. The number to
+    read it against is ``closest_point_on_mesh``'s **2.21 ms** on the same queries and the same mesh:
+    this query is **1.33x slower over a set ~30x smaller**, so the hand-written deepening loop is
+    losing to Warp's built-in mesh traversal rather than to the geometry. A query far from every
+    crease pays several empty scans before the radius reaches anything, which is where that gap
+    lives and what a future ``initial_radius`` estimate (the k-NN path already has one) would close.
+    """
+    edges_np = _crease_edges_np(bench_case)
+    n_edges = int(edges_np.shape[0])
+    if n_edges == 0:
+        pytest.skip("no crease edges on this mesh at 30 degrees")
+
+    if bench_case.kind == "pyvista":
+        skip_larger_than(bench_case, "bunny", "VTK's locator is single-threaded")
+        cells_np = np.hstack([np.full((n_edges, 1), 2), edges_np]).astype(np.int64).ravel()
+        wireframe_pv = pv.PolyData(bench_case.vertices_np, lines=cells_np)
+        queries_np = np.ascontiguousarray(_query_points_np(bench_case), dtype=np.float64)
+        wireframe_pv.find_closest_cell(queries_np[:1], return_closest_point=True)  # pre-warm
+        _cells_pv, closest_pv = bench_case.run(
+            lambda: wireframe_pv.find_closest_cell(queries_np, return_closest_point=True)
+        )
+        assert np.asarray(closest_pv).shape == (_N_QUERIES, 3)
+        return
+
+    vertices = bench_case.vertices_wp
+    edges = _crease_edges_wp(bench_case)
+    queries = _query_points_wp(bench_case)
+    closest, distances, edge_ids = bench_case.run(
+        lambda: tw.proximity.closest_point_on_edges(vertices, edges, queries)
+    )
+    assert closest.shape == (_N_QUERIES,)
+    assert distances.shape == (_N_QUERIES,)
+    assert edge_ids.shape == (_N_QUERIES,)
 
 
 @pytest.mark.benchmark(group="signed_distance_on_mesh")

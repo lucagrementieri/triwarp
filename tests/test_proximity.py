@@ -21,6 +21,7 @@ from meshlib import mrmeshpy as mm
 from scipy.spatial import Delaunay
 
 import triwarp as tw
+import triwarp.typing as twt
 from tests.conversions import (
     meshlib_scalars_to_numpy,
     numpy_to_warp,
@@ -333,6 +334,217 @@ def test_closest_point_on_mesh_empty_faces(device: str) -> None:
     assert np.all(np.isnan(closest_wp.numpy()))
     assert np.all(np.isinf(distance_wp.numpy()))
     assert np.all(triangle_id_wp.numpy() == -1)
+
+
+def _closest_on_edges_np(
+    vertices_np: np.ndarray, edges_np: np.ndarray, queries_np: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Exhaustive point-to-segment distance over every edge: the oracle both references match."""
+    a_np, b_np = vertices_np[edges_np[:, 0]], vertices_np[edges_np[:, 1]]
+    direction_np = b_np - a_np
+    coordinate_np = np.clip(
+        ((queries_np[:, None, :] - a_np[None]) * direction_np[None]).sum(-1)
+        / (direction_np * direction_np).sum(-1)[None],
+        0.0,
+        1.0,
+    )
+    projection_np = a_np[None] + coordinate_np[..., None] * direction_np[None]
+    distance_np = np.linalg.norm(queries_np[:, None, :] - projection_np, axis=-1)
+    nearest_np = distance_np.argmin(1)
+    return distance_np, nearest_np, projection_np[np.arange(queries_np.shape[0]), nearest_np]
+
+
+@pytest.mark.parity("closest_point_on_edges", "pyvista")
+def test_closest_point_on_edges_matches_pyvista(
+    device: str, unit_box: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Class A: distances and closest points against VTK's wireframe query, plus a brute-force argmin.
+
+    The edge set is ``unit_box``'s 12 creases -- a real edge set rather than random segments,
+    because the interesting queries are the ones whose answer is a shared *vertex* of two edges,
+    which is where a wireframe query differs from a surface one. VTK's ``find_closest_cell`` on a
+    one-cell-per-edge ``PolyData`` is exact here (probed at 0.0 distance error).
+
+    The **edge id is compared only where the minimum is unique.** On any edge set sharing vertices,
+    several edges achieve the minimum for a query near a shared vertex: measured on a random
+    400-edge set, 144 of 500 queries had 2-5 tied edges and every disagreement was a tie to 4.5e-08.
+    So the id claim is that the returned edge *achieves* the minimum, which is tie-robust, plus an
+    equality on the queries whose argmin is unique.
+    """
+    mesh_tm, _ = unit_box
+    vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float64)
+    edges_wp = tw.seams.crease_edges(
+        *numpy_to_warp(vertices_np, np.asarray(mesh_tm.faces, dtype=np.int32).reshape(-1), device)
+    )
+    edges_np = edges_wp.numpy()
+    assert edges_np.shape[0] == 12  # the box's creases, and non-empty before anything is compared
+
+    rng = np.random.default_rng(21)
+    queries_np = (rng.random((200, 3)) * 1.6 - 0.3).astype(np.float32)
+    queries_wp = wp.array(np.ascontiguousarray(queries_np), dtype=wp.vec3, device=device)
+    vertices_wp = wp.array(
+        np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device
+    )
+
+    closest_wp, distance_wp, edge_id_wp = tw.proximity.closest_point_on_edges(
+        vertices_wp, edges_wp, queries_wp
+    )
+    all_distance_np, nearest_np, closest_np = _closest_on_edges_np(
+        vertices_np.astype(np.float32), edges_np, queries_np
+    )
+    minimum_np = all_distance_np[np.arange(queries_np.shape[0]), nearest_np]
+
+    assert np.allclose(distance_wp.numpy(), minimum_np, rtol=1e-5, atol=1e-5)
+    assert np.allclose(closest_wp.numpy(), closest_np, rtol=1e-5, atol=1e-5)
+
+    # The returned edge achieves the minimum, whether or not it is the argmin NumPy picked.
+    edge_id_np = edge_id_wp.numpy()
+    assert np.all(edge_id_np >= 0)
+    achieved_np = all_distance_np[np.arange(queries_np.shape[0]), edge_id_np]
+    assert np.allclose(achieved_np, minimum_np, rtol=1e-5, atol=1e-5)
+    unique_np = (np.abs(all_distance_np - minimum_np[:, None]) < 1e-6).sum(1) == 1
+    assert unique_np.sum() > 100  # most queries have a unique nearest edge, so this is not vacuous
+    assert np.array_equal(edge_id_np[unique_np], nearest_np[unique_np])
+
+    # VTK: one line cell per edge, so the cell id is the edge id.
+    cells_np = np.hstack([np.full((edges_np.shape[0], 1), 2), edges_np]).astype(np.int64).ravel()
+    wireframe_pv = pv.PolyData(vertices_np, lines=cells_np)
+    assert wireframe_pv.n_cells == edges_np.shape[0]
+    cell_pv, point_pv = wireframe_pv.find_closest_cell(
+        queries_np.astype(np.float64), return_closest_point=True
+    )
+    assert np.allclose(
+        np.linalg.norm(np.asarray(point_pv) - queries_np, axis=1), minimum_np, rtol=1e-5, atol=1e-5
+    )
+    assert np.allclose(
+        all_distance_np[np.arange(queries_np.shape[0]), np.asarray(cell_pv)],
+        minimum_np,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parity(
+    "closest_point_on_edges",
+    "meshlib",
+    benchmarked=False,
+    reason="findProjectionOnMeshEdges answers one query per call, so a batched row would time a "
+    "Python loop over the query set rather than the traversal; pyvista's find_closest_cell is "
+    "batched and carries the timed row for this group.",
+)
+def test_closest_point_on_edges_matches_meshlib(
+    device: str, unit_box: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Class B: the same distances as ``findProjectionOnMeshEdges`` after a square root.
+
+    Separate from the VTK comparison because this is the reference that cannot be benchmarked -- one
+    query per call -- and because its input is a *mesh plus an edge subset* rather than a standalone
+    wireframe: ``AABBTreePolyline3(mesh, UndirectedEdgeBitSet)`` is how a crease set is expressed
+    there, so the set has to be translated edge by edge through ``topology.findEdge``. The result's
+    ``distSq`` is squared, which is the named transform.
+
+    ``upDistLimitSq`` is passed as float32's max rather than ``inf``: an infinite limit segfaults
+    inside MeshLib's projection code (CLAUDE.md section 6), which is a crash rather than an
+    exception.
+    """
+    mesh_tm, _ = unit_box
+    vertices_np = np.asarray(mesh_tm.vertices, dtype=np.float64)
+    edges_wp = tw.seams.crease_edges(
+        *numpy_to_warp(vertices_np, np.asarray(mesh_tm.faces, dtype=np.int32).reshape(-1), device)
+    )
+    edges_np = edges_wp.numpy()
+    assert edges_np.shape[0] == 12
+
+    rng = np.random.default_rng(22)
+    queries_np = (rng.random((64, 3)) * 1.6 - 0.3).astype(np.float32)
+    _all_distance_np, nearest_np, _closest_np = _closest_on_edges_np(
+        vertices_np.astype(np.float32), edges_np, queries_np
+    )
+    minimum_np = _all_distance_np[np.arange(queries_np.shape[0]), nearest_np]
+
+    _closest_wp, distance_wp, _edge_wp = tw.proximity.closest_point_on_edges(
+        wp.array(np.ascontiguousarray(vertices_np, dtype=np.float32), dtype=wp.vec3, device=device),
+        edges_wp,
+        wp.array(np.ascontiguousarray(queries_np), dtype=wp.vec3, device=device),
+    )
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    crease_ml = mm.UndirectedEdgeBitSet()
+    crease_ml.resize(mesh_ml.topology.undirectedEdgeSize())
+    for edge_np in edges_np:
+        edge_id_ml = mesh_ml.topology.findEdge(
+            mm.VertId(int(edge_np[0])), mm.VertId(int(edge_np[1]))
+        )
+        assert edge_id_ml.valid()
+        crease_ml.set(edge_id_ml.undirected())
+    tree_ml = mm.AABBTreePolyline3(mesh_ml, crease_ml)
+    distance_ml = np.array(
+        [
+            float(
+                np.sqrt(
+                    mm.findProjectionOnMeshEdges(
+                        mm.Vector3f(*query_np.tolist()),
+                        mesh_ml,
+                        tree_ml,
+                        float(np.finfo(np.float32).max),
+                    ).distSq
+                )
+            )
+            for query_np in queries_np
+        ]
+    )
+    assert np.allclose(distance_ml, minimum_np, rtol=1e-5, atol=1e-5)
+    assert np.allclose(distance_wp.numpy(), distance_ml, rtol=1e-5, atol=1e-5)
+
+
+def test_closest_point_on_edges_max_dist_and_degenerate(device: str) -> None:
+    """
+    Not a library comparison: the ``max_dist`` cutoff, the empty inputs and the column guard.
+
+    A miss reports the query itself with ``max_dist`` and ``-1``, matching
+    ``closest_point_on_mesh``'s kernel-level convention -- pinned here because a caller reading only
+    the distance would otherwise see a plausible number for a query that found nothing.
+    """
+    vertices_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 5.0, 0.0]], dtype=np.float32)
+    edges_np = np.array([[0, 1], [0, 2]], dtype=np.int32)
+    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    edges_wp = twt.as_array2d(wp.array(edges_np, dtype=wp.int32, device=device), wp.int32)
+    # The second query is 0.9 from the y-axis edge and 3.0 from the x-axis one, so a 0.5 cutoff
+    # rejects both. (At x = 0.5 it would sit at *exactly* 0.5 and be accepted -- the test is
+    # inclusive, like every other distance bound here.)
+    queries_np = np.array([[0.5, 0.1, 0.0], [0.9, 3.0, 0.0]], dtype=np.float32)
+    queries_wp = wp.array(queries_np, dtype=wp.vec3, device=device)
+
+    closest_wp, distance_wp, edge_id_wp = tw.proximity.closest_point_on_edges(
+        vertices_wp, edges_wp, queries_wp, max_dist=0.5
+    )
+    assert np.array_equal(edge_id_wp.numpy(), np.array([0, -1]))
+    assert np.isclose(distance_wp.numpy()[0], 0.1, rtol=1e-5, atol=1e-5)
+    assert distance_wp.numpy()[1] == np.float32(0.5)  # the cutoff itself, on a miss
+    assert np.allclose(closest_wp.numpy()[1], queries_np[1])  # and the query point itself
+
+    empty_closest_wp, empty_distance_wp, empty_edge_wp = tw.proximity.closest_point_on_edges(
+        vertices_wp, edges_wp, wp.empty(0, dtype=wp.vec3, device=device)
+    )
+    assert empty_closest_wp.shape == (0,)
+    assert empty_distance_wp.shape == (0,)
+    assert empty_edge_wp.shape == (0,)
+
+    no_edges_wp = twt.as_array2d(wp.empty((0, 2), dtype=wp.int32, device=device), wp.int32)
+    _closest_wp, distance_wp, edge_id_wp = tw.proximity.closest_point_on_edges(
+        vertices_wp, no_edges_wp, queries_wp
+    )
+    assert np.all(np.isinf(distance_wp.numpy()))
+    assert np.all(edge_id_wp.numpy() == -1)
+
+    with pytest.raises(ValueError, match="two columns"):
+        tw.proximity.closest_point_on_edges(
+            vertices_wp,
+            twt.as_array2d(wp.zeros((2, 3), dtype=wp.int32, device=device), wp.int32),
+            queries_wp,
+        )
 
 
 def test_normals_at_closest_faces(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
