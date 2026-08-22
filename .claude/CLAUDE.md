@@ -739,7 +739,10 @@ all measured:
   status `bool`, a count, an `EdgeId` or a `FaceBitSet` of *new* faces — never the mesh. So **one
   `mm.Mesh` serves one mutating call**: build a fresh one per comparison and per benchmark round,
   the `new_meshset_pml` rule rather than the `mesh_o3d` one (`BenchCase.new_mesh_ml()` is a method,
-  not a cached property, for exactly this).
+  not a cached property, for exactly this). The exceptions are worth knowing per function rather
+  than assumed: `marchingCubes` reads its `SimpleVolume` and returns a fresh `Mesh`, verified by two
+  calls on one volume returning the identical face count with `dims` intact, so *its* input is
+  cacheable.
 - **`meshFromFacesVerts` takes faces *first*, and it sizes the vertex buffer by `F.max() + 1`.** The
   argument order is the reverse of every other converter in `tests/conversions.py`, and a swapped
   call raises nothing — the two arrays differ in shape only when the counts differ. That is why the
@@ -762,7 +765,11 @@ all measured:
   `VertCoords` / `FaceNormals` / `std_vector_Vector3_float` and raises a clear `TypeError`
   otherwise — that part is safe), and `np.asarray(vert_scalars)` produces `dtype=object, shape=()`
   rather than raising, so the failure surfaces several lines later in whatever NumPy call comes
-  next. Go through `conversions.meshlib_scalars_to_numpy`.
+  next. Go through `conversions.meshlib_scalars_to_numpy` — and for a container of **ids** rather
+  than numbers (`Buffer_VertId` from `findNClosestPointsPerPoint`, `VertMap` from
+  `findSmallestCloseVertices`) through `conversions.meshlib_indices_to_numpy`, which exists because
+  the scalar reader *raises* on them: a `VertId` implements `__index__` but not `__float__`, so
+  `np.fromiter(..., np.float64)` fails with `float() argument must be a string or a real number`.
 - **A returned bitset is only as long as its highest set bit, and which functions do that is not
   guessable.** `mn.getNumpyBitSet` reads the bitset at *its own* length: one MeshLib sized against
   the mesh comes back domain-sized (`getBoundaryVerts` gives 162 entries on a 162-vertex mesh with
@@ -828,7 +835,12 @@ all measured:
   inside it — recommended: build outside and pre-warm with one throwaway query, so the row times the
   *query*, matching what triwarp's `wp.Mesh`-in-hand rows already do with their BVH. This is also a
   *correctness* trap next to the mutation hazard: a mutating call invalidates the tree, so a test
-  that queries, mutates and queries again is not measuring what it looks like.
+  that queries, mutates and queries again is not measuring what it looks like. **A `PointCloud`
+  caches its point tree the same way**, which silently changes what a *self*-query row measures:
+  `findNClosestPointsPerPoint` on a 160 000-point cloud runs 10.2 ms with the tree rebuilt and
+  3.8 ms reusing it, against triwarp and open3d, both of which build their structure inside every
+  call. `cloud.invalidateCaches()` in the benchmark's `setup` is the lever — dropping and rebuilding
+  the *cloud* instead adds the point allocation and with it an 11-54 ms spread.
 - **Per-vertex free functions are per-*vertex*, and `mrmeshnumpy` has the batched form.**
   `discreteGaussianCurvature(topology, points, v)` and `sumAngles(...)` take one `VertId` per call; a
   Python loop over 642 vertices measures **2.79 ms** against **0.046 ms** for
@@ -851,7 +863,15 @@ all measured:
   vertex for vertex (bijection at 4.7e-07), where the same nominal resolution differs by 74 % in the
   vertex count. And `leftCotan(e)` is the **plain** cotangent keyed by the directed edge whose left
   face owns it, against `laplacian.cotmatrix_entries`' *half* cotangent keyed by `(face, corner)`;
-  `cotan(ue)` is the two summed, i.e. the assembled off-diagonal rather than the table.
+  `cotan(ue)` is the two summed, i.e. the assembled off-diagonal rather than the table. Two more
+  found the same way: `MarchingCubesParams.origin` addresses the voxel **centre**, so a lattice
+  whose sample `[0, 0, 0]` sits at `lower` is marched with `origin = lower - voxel / 2` and the
+  un-shifted call is a rigid half-diagonal off (0.0369 against 1.2e-07, measured); and
+  `findNClosestPointsPerPoint` returns a **heap, not a sorted list** — the ids are exactly scipy's
+  `k` nearest (set equality 1.0000 at `k=3`) but only 90.8 % of rows are in distance order and the
+  *nearest* is the **last** entry, which at `numNei=2` holds in 100 % of rows only because a
+  two-element heap is ordered by construction. Ask for `numNei=1` when one neighbour is the
+  question.
 - **`computeRayThicknessAtVertices` takes the direction from the *pseudonormal*.** So it pairs with
   `visibility.thickness(method="ray", normals=angle_weighted_vertex_normals(...))` to **5.96e-07**
   and with the area-weighted normals to **0.031** — five orders worse, and the kind of gap that

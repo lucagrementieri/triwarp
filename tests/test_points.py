@@ -16,6 +16,7 @@ import triwarp.typing as twt
 from tests.comparisons import assert_same_up_to_sign
 from tests.conversions import (
     meshlib_bitset_to_numpy,
+    meshlib_indices_to_numpy,
     points_to_meshlib,
     points_to_open3d,
     points_to_pymeshlab,
@@ -999,6 +1000,48 @@ def test_duplicate_point_mask_matches_open3d(device: str) -> None:
 
     empty_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
     assert tw.duplicate_point_mask(empty_wp).shape == (0,)
+
+
+@pytest.mark.parity("duplicate_point_mask", "meshlib")
+def test_duplicate_point_mask_matches_meshlib(device: str) -> None:
+    """
+    Class B (a representative map against a mask): ``map != index`` is exactly this mask.
+
+    ``findSmallestCloseVertices(cloud, 0.0)`` sends every point to the **smallest-indexed** point
+    within ``closeDist``, itself when it is the first of its class -- so the two conventions line
+    up without a choice being made: the entries it moves are precisely the repeats this flags, and
+    the first-occurrence rule is the same one. Element for element on the fixture the open3d pair
+    above uses, ``-0.0`` row included, which the reference merges with ``+0.0`` because their
+    distance is zero.
+
+    ``closeDist=0.0`` is an exact-equality request rather than a degenerate tolerance -- MeshLib's
+    test is inclusive at the radius, so a zero radius matches coincident points and nothing else,
+    which is what makes it the *same* question ``remove_duplicated_points`` answers rather than
+    ``grouping.unique_rows``' bucketed one. ``findCloseVertices`` is the same search returning a
+    bitset, but that one flags **both** members of a coincident pair (40 against 20 on a planted
+    cloud) and so is not this mask.
+    """
+    rng = np.random.default_rng(0)
+    base_np = rng.random((20, 3)).astype(np.float32)
+    points_np = np.concatenate(
+        [
+            base_np,
+            base_np[:5],
+            base_np[10:15],
+            np.array([[-0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32),
+        ]
+    )
+
+    representative_ml = meshlib_indices_to_numpy(
+        mm.findSmallestCloseVertices(points_to_meshlib(points_np), 0.0)
+    )
+    duplicate_ml = representative_ml != np.arange(points_np.shape[0])
+
+    points_wp = wp.array(points_np, dtype=wp.vec3, device=device)
+    duplicate_wp = tw.duplicate_point_mask(points_wp).numpy().astype(bool)
+
+    assert duplicate_ml.sum() == 11  # non-vacuity: the mask and its complement both matter
+    assert np.array_equal(duplicate_wp, duplicate_ml)
 
 
 def test_duplicate_point_mask_separates_one_ulp(device: str) -> None:

@@ -495,7 +495,7 @@ def test_query_geodesic_ball(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="nearest_neighbor_distance")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "open3d")
+@pytest.mark.benchlibs("triwarp", "open3d", "meshlib")
 def test_nearest_neighbor_distance(bench_case: BenchCase) -> None:
     """
     The cloud's own spacing: a ``k=2`` self-query, keeping the second column.
@@ -508,7 +508,34 @@ def test_nearest_neighbor_distance(bench_case: BenchCase) -> None:
     open3d's ``compute_nearest_neighbor_distance`` builds a ``KDTreeFlann`` and then searches one
     point at a time in C++ -- so it is serial, but not the Python-per-query loop the legacy tree
     would be from this side, and it is the same quantity to 9e-09.
+
+    meshlib's ``findNClosestPointsPerPoint(cloud, 1)`` is the batched, multi-threaded form of the
+    same self-query and returns the neighbour *index*; the distance is one subtraction away and is
+    not timed on either side. **Its point tree is cached on the cloud and the row drops it per
+    round**, which is worth 2.7x and is what makes the three rows comparable: triwarp builds a BVH
+    and open3d a ``KDTreeFlann`` inside their own calls, where meshlib measured 10.2 ms with the
+    tree rebuilt against 3.8 ms reusing it on a 160 000-point cloud. ``invalidateCaches`` is the
+    lever rather than a fresh ``PointCloud`` per round, because rebuilding the cloud itself adds
+    the 160 000-point allocation and with it a 11-54 ms spread that swamps what is being measured.
+    First measurement, medians on an RTX 5090: at ``sphere_large`` triwarp-cuda **1.24 ms** against
+    meshlib's **8.18** and open3d's **48.6**, so the multi-threaded reference is 6.6x behind and
+    the serial one 39x. At ``sphere_small`` all three land inside 0.42-0.57 ms -- the cloud is too
+    small to fill the GPU or to pay for a thread pool, which is where a ratio here stops meaning
+    anything.
     """
+    if bench_case.kind == "meshlib":
+        cloud_ml = _cloud_ml(bench_case)  # held in a name: the tree is a raw pointer into it
+
+        def uncached_cloud_ml() -> mm.PointCloud:
+            """Drop the lazily built tree so the timed call pays for building one."""
+            cloud_ml.invalidateCaches()
+            return cloud_ml
+
+        neighbours_ml = bench_case.run(
+            lambda cloud: mm.findNClosestPointsPerPoint(cloud, 1), setup=uncached_cloud_ml
+        )
+        assert neighbours_ml.size() == bench_case.n_vertices
+        return
     if bench_case.kind == "open3d":
         cloud = _pcd_o3d(bench_case)
         distance_o3d = bench_case.run(cloud.compute_nearest_neighbor_distance)

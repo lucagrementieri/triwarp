@@ -21,7 +21,7 @@ from meshlib import mrmeshpy as mm
 from scipy.spatial import KDTree
 
 import triwarp as tw
-from tests.conversions import points_to_meshlib, points_to_open3d
+from tests.conversions import meshlib_indices_to_numpy, points_to_meshlib, points_to_open3d
 from triwarp.kernels import neighbors as kernel_neighbors
 
 
@@ -863,6 +863,40 @@ def test_nearest_neighbor_distance_matches_open3d(device: str) -> None:
     scaled_wp = wp.array((3.0 * points_np).astype(np.float32), dtype=wp.vec3, device=device)
     scaled_distance_wp = tw.neighbors.nearest_neighbor_distance(scaled_wp)
     assert np.allclose(scaled_distance_wp.numpy(), 3.0 * distance_wp.numpy(), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parity("nearest_neighbor_distance", "meshlib")
+def test_nearest_neighbor_distance_matches_meshlib(device: str) -> None:
+    """
+    Class B (an index where triwarp returns a length): the same neighbour, exactly.
+
+    ``findNClosestPointsPerPoint(cloud, 1)`` returns the *index* of each point's closest **other**
+    point -- self is excluded, so the ``k=2``-and-drop-column-0 transform triwarp's own
+    implementation needs has no counterpart here -- and the distance is then taken from the index.
+    Against a ``float64`` scipy oracle the reference's own indices reproduce its distances to
+    **0.0**, so the only error in the comparison is triwarp's ``float32`` arithmetic.
+
+    **``numNei`` above 1 is a heap, not a sorted list**, which is why the pair is written at 1.
+    Measured on this cloud: the ``k`` returned ids are exactly scipy's ``k`` nearest (set equality
+    1.0000 at ``k=3``) but only **90.8 %** of the rows come back in decreasing-distance order, and
+    the *nearest* is the last entry rather than the first. At ``numNei=2`` the last entry is the
+    nearest in 100 % of rows -- a two-element heap is ordered by construction -- so a pair written
+    at 2 would pass while resting on an accident of the heap size.
+    """
+    rng = np.random.default_rng(11)
+    points_np = rng.random((600, 3))
+
+    cloud_ml = points_to_meshlib(points_np)
+    nearest_ml = meshlib_indices_to_numpy(mm.findNClosestPointsPerPoint(cloud_ml, 1))
+    assert nearest_ml.shape == (points_np.shape[0],)
+    assert np.all(nearest_ml != np.arange(points_np.shape[0]))  # the closest *other* point
+    distance_ml = np.linalg.norm(points_np[nearest_ml] - points_np, axis=1)
+
+    points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
+    distance_wp = tw.neighbors.nearest_neighbor_distance(points_wp)
+
+    assert distance_ml.min() > 0.0  # non-vacuity: a random cloud has no coincident points
+    assert np.allclose(distance_wp.numpy(), distance_ml, rtol=1e-5, atol=1e-5)
 
 
 def test_nearest_neighbor_distance_coincident_and_degenerate(device: str) -> None:

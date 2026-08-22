@@ -585,7 +585,7 @@ def test_radius_outlier_mask(bench_case: BenchCase, radius_scale: float) -> None
 
 @pytest.mark.benchmark(group="duplicate_point_mask")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp", "open3d")
+@pytest.mark.benchlibs("triwarp", "open3d", "meshlib")
 def test_duplicate_point_mask(bench_case: BenchCase) -> None:
     """
     Exact positional dedup: two ``unique_1d`` rounds over 64-bit keys, then a first-occurrence pass.
@@ -597,8 +597,34 @@ def test_duplicate_point_mask(bench_case: BenchCase) -> None:
     open3d's ``remove_duplicated_points`` answers the same question with an
     ``unordered_map<Vector3d>`` on one core and copies the survivors out; the mask here is compared
     against its survivor list in ``tests/test_points.py``. A registry mesh has *no* duplicated
-    vertices, so both sides do their full work and neither takes an early exit.
+    vertices, so all three rows do their full work and none takes an early exit.
+
+    meshlib's ``findSmallestCloseVertices(cloud, 0.0)`` is the third implementation and the only
+    multi-threaded one: it returns each point's smallest-indexed coincident neighbour, which is
+    this mask under ``map != index`` (``tests/test_points.py``). It goes through the cloud's point
+    tree rather than a hash, so unlike the other two rows its cost is a *search* -- which is why
+    the tree is dropped per round the way the ``nearest_neighbor_distance`` row drops it, rather
+    than being reused across rounds and pricing the query alone.
+
+    First measurement, medians on an RTX 5090: at ``sphere_large`` triwarp-cuda **2.57 ms** against
+    meshlib's **7.43** and open3d's **30.0**, but at ``sphere_small`` triwarp is **1.47 ms** where
+    both references are under 0.33 -- the two hash builds and two sorts have a fixed cost the
+    reference searches do not, so this group's ratio *inverts* below a few thousand points. That is
+    the shape to watch here rather than the large-cloud number.
     """
+    if bench_case.kind == "meshlib":
+        cloud_ml = _cloud_ml(bench_case)  # held in a name: MeshLib's trees point into it
+
+        def uncached_cloud_ml() -> mm.PointCloud:
+            """Drop the lazily built point tree, which the search below would otherwise reuse."""
+            cloud_ml.invalidateCaches()
+            return cloud_ml
+
+        representative_ml = bench_case.run(
+            lambda cloud: mm.findSmallestCloseVertices(cloud, 0.0), setup=uncached_cloud_ml
+        )
+        assert representative_ml.size() == bench_case.n_vertices
+        return
     if bench_case.kind == "open3d":
         # The dedup mutates nothing -- it returns a fresh cloud -- so one cached input cloud is
         # valid for every round, unlike the ``remove_*`` methods that rewrite in place.

@@ -496,6 +496,23 @@ def meshlib_scalars_to_numpy(scalars_ml: object) -> np.ndarray:
     return np.fromiter(iter(scalars_ml), np.float64, scalars_ml.size())  # type: ignore[attr-defined]
 
 
+def meshlib_indices_to_numpy(indices_ml: object) -> np.ndarray:
+    """
+    Read a MeshLib index container (``Buffer_VertId`` / ``VertMap`` / ...) as an int64 array.
+
+    The sibling of [`meshlib_scalars_to_numpy`][tests.conversions.meshlib_scalars_to_numpy] for the
+    containers whose element is an *id* rather than a number, and it needs its own body because the
+    scalar reader raises on them: a ``VertId`` implements ``__index__`` but not ``__float__``, so
+    ``np.fromiter(..., np.float64)`` fails with ``float() argument must be a string or a real
+    number``. ``np.asarray`` is the usual silent trap -- a 0-d ``object`` array -- and
+    ``mn.toNumpyArray`` rejects the type outright.
+
+    An invalid id comes back as ``-1``, which is what ``VertId()`` holds by default, so the result
+    is signed rather than unsigned on purpose.
+    """
+    return np.fromiter((int(index_ml) for index_ml in indices_ml), np.int64, indices_ml.size())  # type: ignore[attr-defined]
+
+
 def meshlib_bitset_to_numpy(bitset_ml: object, size: int) -> np.ndarray:
     """
     Read a MeshLib bitset as a ``bool`` array of exactly ``size`` entries.
