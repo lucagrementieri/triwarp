@@ -21,6 +21,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import read_scalar
 from triwarp.kernels import neighbors as kernel_neighbors
 from triwarp.kernels.algorithms import bfs as kernel_bfs
 
@@ -1385,7 +1386,7 @@ def geodesic_ball(
         wp.map(
             wp.add, local_offsets[m - 1 : m], counts[start + m - 1 : start + m], out=chunk_total_buf
         )
-        chunk_total = int(chunk_total_buf.numpy()[0])
+        chunk_total = int(read_scalar(chunk_total_buf, 0))
         flat_chunk = wp.empty(chunk_total, dtype=wp.int32, device=device)
         if chunk_total > 0:
             wp.launch(
@@ -1396,7 +1397,7 @@ def geodesic_ball(
             )
         chunk_flats.append(flat_chunk)
 
-    n_overflow = int(overflow.numpy()[0])
+    n_overflow = int(read_scalar(overflow, 0))
     if n_overflow > 0:
         warnings.warn(
             f"geodesic_ball: {n_overflow} neighborhood capacity breaches "

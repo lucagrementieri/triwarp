@@ -26,12 +26,16 @@ References
 ``triangles`` / ``face_normals`` are cached properties that would make rounds 2..n measure only the
 plane arithmetic. ``slice_faces_plane`` and ``plane_lines`` take raw arrays and need no rebuild.
 
-**mesh_with_mesh has no CPU reference here.** trimesh's mesh-mesh intersection is not in
-``trimesh.intersections`` at all — it routes through the optional ``python-fcl`` collision backend,
-which reports *whether* pairs collide rather than returning the intersection curve, and is not a
-declared dependency. open3d's boolean operations require the (also optional) ``open3d.t`` tensor
-backend with a coupled remesh, so neither is an apples-to-apples baseline for "return the
-intersection segments". triwarp is timed alone; the before/after delta is what this case is for.
+**mesh_with_mesh has no *trimesh* or *open3d* reference.** trimesh's mesh-mesh intersection is not
+in ``trimesh.intersections`` at all — it routes through the optional ``python-fcl`` collision
+backend, which reports *whether* pairs collide rather than returning the intersection curve, and is
+not a declared dependency. open3d's boolean operations require the (also optional) ``open3d.t``
+tensor backend with a coupled remesh, so neither is an apples-to-apples baseline for "return the
+intersection segments". The two that are: **meshlib**'s ``findIntersectionContours``, which links
+the crossing into ordered contours, and **pyvista**'s ``intersection``
+(``vtkIntersectionPolyDataFilter``), which returns the same unordered segment soup triwarp does and
+therefore pins the value as well as the cost (36 = 36 segments and a bit-identical curve length in
+``tests/test_intersection.py``).
 
 **pymeshlab** has the right filter and cannot run it here. ``generate_polyline_from_planar_section``
 does exactly what ``mesh_with_plane`` does and more (it *orders* the segments into a polyline), and
@@ -78,6 +82,7 @@ import igl
 import numpy as np
 import potpourri3d as pp3d
 import pytest
+import pyvista as pv
 import trimesh as tm
 import warp as wp
 from conftest import BenchCase, mesh_ml_from_numpy, skip_larger_than
@@ -148,6 +153,24 @@ def _shifted_mesh_ml(bench_case: BenchCase, offset_fraction: float) -> mm.Mesh:
             vertices_np + offset_fraction * diagonal * _PLANE_NORMAL, bench_case.faces_np
         )
     return _shifted_ml_cache[key]
+
+
+_shifted_pv_cache: dict[tuple[str, float], pv.PolyData] = {}
+
+
+def _shifted_mesh_pv(bench_case: BenchCase, offset_fraction: float) -> pv.PolyData:
+    """Build the translated self-copy [`_shifted_vertices_wp`] makes, as a cached ``PolyData``."""
+    key = (bench_case.mesh_name, offset_fraction)
+    if key not in _shifted_pv_cache:
+        vertices_np = bench_case.vertices_np
+        diagonal = float(np.linalg.norm(vertices_np.max(axis=0) - vertices_np.min(axis=0)))
+        _shifted_pv_cache[key] = pv.PolyData.from_regular_faces(
+            np.ascontiguousarray(
+                vertices_np + offset_fraction * diagonal * _PLANE_NORMAL, dtype=np.float64
+            ),
+            np.ascontiguousarray(bench_case.faces_np, dtype=np.int32),
+        )
+    return _shifted_pv_cache[key]
 
 
 _mesh_ml_cache: dict[str, mm.Mesh] = {}
@@ -365,7 +388,7 @@ def test_clip_mesh_with_field(bench_case: BenchCase, cap: bool) -> None:
 
 
 @pytest.mark.benchmark(group="mesh_with_mesh")
-@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.benchlibs("triwarp", "meshlib", "pyvista")
 @pytest.mark.parametrize("offset_fraction", _SELF_OFFSET_FRACTIONS, ids=["deep", "grazing"])
 def test_mesh_with_mesh(bench_case: BenchCase, offset_fraction: float) -> None:
     """
@@ -375,8 +398,23 @@ def test_mesh_with_mesh(bench_case: BenchCase, offset_fraction: float) -> None:
     rather than the face count. The ``deep`` row shares most of its volume with the original and
     the ``grazing`` row barely touches it; the gap is the collision density, and the fixed
     ``max_triangle_collisions`` cap silently truncates once the broad phase saturates.
+
+    pyvista's ``intersection`` returns the same *unordered* segment soup triwarp does, which is what
+    makes it the value reference for this group as well as a cost one. Note what its ``grazing`` row
+    measures: at 0.60 of the diagonal the two copies do not touch at all, so VTK does its broad
+    phase, logs ``No Intersection between objects`` and returns **0** line cells -- 333 ms against
+    577 for the ``deep`` case on ``bunny``, i.e. most of the cost is the traversal rather than the
+    crossing. Only the ``deep`` case can assert a non-empty answer, and only it does.
     """
     skip_larger_than(bench_case, "bunny", "broad phase allocates 16 candidate slots per triangle")
+    if bench_case.kind == "pyvista":
+        mesh_pv, shifted_pv = bench_case.mesh_pv, _shifted_mesh_pv(bench_case, offset_fraction)
+        intersection_pv, _first_pv, _second_pv = bench_case.run(
+            lambda: mesh_pv.intersection(shifted_pv, split_first=False, split_second=False)
+        )
+        if offset_fraction == min(_SELF_OFFSET_FRACTIONS):
+            assert intersection_pv.n_cells > 0  # the deep case really does cross
+        return
     if bench_case.kind == "meshlib":
         # ``findIntersectionContours`` links the crossing into ordered contours where triwarp emits
         # an unordered segment soup, so it does strictly more -- and it takes the second mesh's

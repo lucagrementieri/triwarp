@@ -1,6 +1,8 @@
-"""Private device-capability guards shared across Python wrapper modules."""
+"""Private device-capability guards and host-readback helpers shared across wrapper modules."""
 
 from __future__ import annotations
+
+from typing import Any
 
 import warp as wp
 
@@ -149,3 +151,62 @@ def require_nonempty_mesh(faces: wp.array[wp.int32], name: str) -> None:
             f"{name} cannot build a warp.Mesh with zero triangles: this silently corrupts CUDA "
             "state through Warp 1.16 (see the Warp issue tracker for wp.Mesh + empty BVH)."
         )
+
+
+# One scratch buffer per dtype for ``read_scalar`` below, allocated on first use and reused for the
+# life of the process. A single element each, so the whole table is a few dozen bytes.
+_SCALAR_SCRATCH: dict[type, wp.array] = {}
+
+
+def read_scalar(arr: wp.array[Any], index: int = -1) -> Any:
+    """
+    One element of ``arr``, read back to the host as a Python scalar.
+
+    The spelling matters more than it looks. ``int(arr[n - 1 :].numpy()[0])`` -- what this package
+    used everywhere -- builds a one-element Warp view, then a *fresh* host array for it, then
+    synchronizes; measured **29.5 us** per call at 200 calls between two synchronization points,
+    which is the regime a wrapper runs in. Copying into a scratch buffer allocated once costs
+    **15.7**, and on a host array, where ``.numpy()`` is already a zero-copy view of the whole
+    buffer, indexing that view directly costs **1.7** against the slice spelling's 6.6. So the
+    device branch is not a portability concession: each side's fast path is the other's slow one.
+
+    !!! warning "The scratch must not be pinned"
+        A pinned host destination makes ``cudaMemcpyAsync`` genuinely asynchronous, and Warp issues
+        the copy without an event or a synchronization, so the read races the producing kernel:
+        measured **20 of 20** reads wrong behind a 140 ms kernel, silently returning the *previous*
+        round's value. Pageable memory is documented to return only once a device-to-host copy has
+        completed, and measures 0 of 20 wrong on the same probe. Adding the missing
+        ``wp.synchronize_device`` to a pinned buffer gives back the whole difference (14.7 us
+        against 15.7), so pinning buys nothing here even done correctly.
+
+    Parameters
+    ----------
+    arr
+        Warp array to read from. Any scalar dtype; one scratch buffer per dtype is cached.
+    index
+        Element to read, negative from the end as in Python. Defaults to the last element, which
+        is what an inclusive scan's total lives in.
+
+    Returns
+    -------
+    Any
+        The element, as the Python scalar ``numpy`` gives for that dtype (``int`` for the integer
+        dtypes, ``float`` for the floating ones). Callers wrap it in ``int(...)`` / ``float(...)``
+        where a definite type is wanted.
+
+    Notes
+    -----
+    Not reentrant: the scratch is shared, so two concurrent readbacks of the same dtype from
+    different threads would clobber each other. Nothing in this package reads back off-thread.
+    """
+    n = int(arr.shape[0])
+    slot = index if index >= 0 else n + index
+    device = arr.device
+    if device is None or not device.is_cuda:
+        return arr.numpy()[slot]
+    scratch = _SCALAR_SCRATCH.get(arr.dtype)
+    if scratch is None:
+        scratch = wp.empty(1, dtype=arr.dtype, device="cpu")
+        _SCALAR_SCRATCH[arr.dtype] = scratch
+    wp.copy(scratch, arr[slot : slot + 1])
+    return scratch.numpy()[0]

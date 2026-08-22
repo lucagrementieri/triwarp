@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unittest.mock
 import warnings
 
 import numpy as np
@@ -27,6 +28,45 @@ def _spd_system(device: str, n: int = 64, n_rhs: int = 3, seed: int = 11):
         wp.array(np.ascontiguousarray(dense_np.ravel()), dtype=wp.float64, device=device),
     )
     rhs_np = rng.standard_normal((n_rhs, n))
+    rhs_wp = wp.array(np.ascontiguousarray(rhs_np), dtype=wp.float64, device=device)
+    return matrix_wp, twt.as_array2d(rhs_wp, wp.float64), dense_np, rhs_np
+
+
+def _grid_laplacian_system(device: str, k: int = 24, n_rhs: int = 3, shift: float = 1e-3, seed=5):
+    """
+    Build a ``k x k`` five-point Laplacian plus a small shift: sparse, SPD, and it coarsens.
+
+    Assembled here rather than assembled from a mesh so the operator's definiteness and sparsity are
+    the test's own, not a cotangent-sign convention's. ``k = 24`` puts it above
+    ``linalg``'s dense-coarse-solve threshold, so the hierarchy really has a level.
+    """
+    index = np.arange(k * k).reshape(k, k)
+    rows = [index.ravel()]
+    columns = [index.ravel()]
+    values = [np.full(k * k, 4.0 + shift)]
+    for a, b in (
+        (index[:-1, :], index[1:, :]),
+        (index[1:, :], index[:-1, :]),
+        (index[:, :-1], index[:, 1:]),
+        (index[:, 1:], index[:, :-1]),
+    ):
+        rows.append(a.ravel())
+        columns.append(b.ravel())
+        values.append(np.full(a.size, -1.0))
+    rows_np = np.concatenate(rows).astype(np.int32)
+    columns_np = np.concatenate(columns).astype(np.int32)
+    values_np = np.concatenate(values)
+    matrix_wp = wps.bsr_from_triplets(
+        k * k,
+        k * k,
+        wp.array(rows_np, dtype=wp.int32, device=device),
+        wp.array(columns_np, dtype=wp.int32, device=device),
+        wp.array(np.ascontiguousarray(values_np), dtype=wp.float64, device=device),
+    )
+    dense_np = np.zeros((k * k, k * k))
+    np.add.at(dense_np, (rows_np, columns_np), values_np)
+    rng = np.random.default_rng(seed)
+    rhs_np = rng.standard_normal((n_rhs, k * k))
     rhs_wp = wp.array(np.ascontiguousarray(rhs_np), dtype=wp.float64, device=device)
     return matrix_wp, twt.as_array2d(rhs_wp, wp.float64), dense_np, rhs_np
 
@@ -270,6 +310,168 @@ def test_solve_spd_is_quiet_when_it_converges(device: str) -> None:
 
 
 # --- replicated_operator ------------------------------------------------------------------
+
+
+def test_multigrid_preconditioner_solves_the_same_system(device: str) -> None:
+    """
+    Class A, against ``numpy.linalg.solve``: the V-cycle changes the path, not the answer.
+
+    A preconditioner cannot change a converged solution, only how many iterations reach it -- so the
+    thing to check is that the multigrid path really does converge to the reference rather than
+    stalling somewhere plausible. The Jacobi arm is the one carrying an external oracle (every other
+    solver test in this file), and this pins the new path to the same reference.
+    """
+    matrix_wp, rhs_wp, dense_np, rhs_np = _grid_laplacian_system(device)
+    reference_np = np.linalg.solve(dense_np, rhs_np.T).T
+    for mode in ("diag", "multigrid"):
+        solution_wp = wp.zeros_like(rhs_wp)
+        tw.linalg.solve_spd_columns(
+            matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64), preconditioner=mode
+        )
+        assert np.allclose(solution_wp.numpy(), reference_np, rtol=1e-5, atol=1e-5), mode
+
+
+def test_multigrid_preconditioner_is_symmetric(device: str) -> None:
+    """
+    Not a library comparison: no reference here builds a multigrid preconditioner.
+
+    The invariant is the one conjugate gradient actually depends on. ``cg`` is only a valid
+    iteration when its preconditioner is symmetric positive definite, and a V-cycle is symmetric
+    only if its pre- and post-smoothing are balanced -- drop the post-smoothing to save a mat-vec
+    and the solver silently stops being conjugate gradient. So ``<M r1, r2> == <r1, M r2>``, which
+    this checks, is what licenses the whole approach; the positive part shows up as convergence in
+    the test above. This excludes an unbalanced cycle and a restrictor that is not the
+    prolongator's transpose; it does not exclude a hierarchy that is merely a bad one.
+    """
+    matrix_wp, _rhs, dense_np, _rhs_np = _grid_laplacian_system(device)
+    n = dense_np.shape[0]
+    operator = tw.linalg.multigrid_preconditioner(matrix_wp)
+    rng = np.random.default_rng(3)
+    left_np, right_np = rng.standard_normal((2, n))
+    left = wp.array(np.ascontiguousarray(left_np), dtype=wp.float64, device=device)
+    right = wp.array(np.ascontiguousarray(right_np), dtype=wp.float64, device=device)
+    applied_left = wp.zeros(n, dtype=wp.float64, device=device)
+    applied_right = wp.zeros(n, dtype=wp.float64, device=device)
+    operator.matvec(left, applied_left, applied_left, 1.0, 0.0)
+    operator.matvec(right, applied_right, applied_right, 1.0, 0.0)
+    cross_a = float(applied_left.numpy() @ right_np)
+    cross_b = float(left_np @ applied_right.numpy())
+    assert np.isclose(cross_a, cross_b, rtol=1e-9, atol=1e-12), (cross_a, cross_b)
+    # Non-vacuity: an operator that returned zero, or the identity, would pass the line above.
+    assert abs(cross_a) > 1e-6
+    assert not np.allclose(applied_left.numpy(), left_np)
+
+
+def test_multigrid_preconditioner_needs_fewer_iterations(device: str) -> None:
+    """
+    Not a library comparison: this is the *reason* the mode exists, stated as an assertion.
+
+    triwarp against triwarp -- the Jacobi arm is the reference implementation and carries the
+    oracle. Without this the mode could silently degrade to something that still converges (the
+    test above would pass) while costing a hierarchy for nothing. The margin is deliberately loose:
+    the measured factor on this operator is far above 2x, and the assertion is only meant to catch
+    a hierarchy that has stopped working.
+    """
+    matrix_wp, rhs_wp, _dense, _rhs_np = _grid_laplacian_system(device)
+    counts = {}
+    for mode in ("diag", "multigrid"):
+        solution_wp = wp.zeros_like(rhs_wp)
+        counts[mode] = tw.linalg.solve_spd_columns(
+            matrix_wp,
+            rhs_wp,
+            twt.as_array2d(solution_wp, wp.float64),
+            check_every=1,
+            preconditioner=mode,
+        )[0]
+    assert counts["multigrid"] * 2 < counts["diag"], counts
+
+
+def test_multigrid_preconditioner_auto_matches_the_forced_modes(device: str) -> None:
+    """
+    Class A, against ``numpy.linalg.solve``, for the third mode.
+
+    ``"auto"`` is a *policy* over the other two, so what has to hold is that whichever branch it
+    takes still ends in a converged solve at the caller's own cap -- the bug it is written against
+    is returning the probe's unconverged iterate. This operator converges inside the probe, so it
+    exercises the branch that never builds a hierarchy; the escalating branch is what
+    ``smoothing.smooth_region`` runs on every ill-conditioned region and what its own tests cover.
+    """
+    matrix_wp, rhs_wp, dense_np, rhs_np = _grid_laplacian_system(device)
+    solution_wp = wp.zeros_like(rhs_wp)
+    tw.linalg.solve_spd_columns(
+        matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64), preconditioner="auto"
+    )
+    assert np.allclose(
+        solution_wp.numpy(), np.linalg.solve(dense_np, rhs_np.T).T, rtol=1e-5, atol=1e-5
+    )
+
+
+def test_multigrid_preconditioner_auto_converges_past_the_probe(device: str) -> None:
+    """
+    Not a library comparison: this pins ``"auto"``'s escalating branch, which is the risky one.
+
+    A cap of one iteration forces the probe to end unconverged, so the escalation runs -- and the
+    assertion is that the *answer* is the converged one rather than the probe's iterate. That was a
+    real defect in the first version of this mode: it returned the capped probe when it decided not
+    to escalate, so an ill-conditioned system came back silently wrong by 1.3 in absolute terms.
+    """
+    matrix_wp, rhs_wp, dense_np, rhs_np = _grid_laplacian_system(device)
+    solution_wp = wp.zeros_like(rhs_wp)
+    with unittest.mock.patch.object(tw.linalg, "CG_PROBE_ITERATIONS", 1):
+        tw.linalg.solve_spd_columns(
+            matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64), preconditioner="auto"
+        )
+    assert np.allclose(
+        solution_wp.numpy(), np.linalg.solve(dense_np, rhs_np.T).T, rtol=1e-5, atol=1e-5
+    )
+
+
+def test_spd_column_solver_rejects_the_auto_preconditioner(device: str) -> None:
+    # A hoisted state is built to be driven many times, and the probe decides on the first solve --
+    # so "auto" has no meaning there and says so rather than quietly picking one of the two.
+    matrix_wp, rhs_wp, _dense, _rhs_np = _grid_laplacian_system(device, k=8)
+    solution_wp = wp.zeros_like(rhs_wp)
+    with pytest.raises(ValueError, match="auto"):
+        tw.linalg.spd_column_solver(
+            matrix_wp, rhs_wp, twt.as_array2d(solution_wp, wp.float64), preconditioner="auto"
+        )
+
+
+def test_multigrid_preconditioner_falls_back_when_the_operator_does_not_coarsen(
+    device: str,
+) -> None:
+    """
+    Not a library comparison: a fallback has no counterpart to compare against.
+
+    A diagonal operator has no off-diagonal graph, so every row is its own aggregate and coarsening
+    stalls at the first level. Above the dense-factorization cap there is then no usable hierarchy,
+    and the documented behaviour is to hand back a Jacobi preconditioner rather than a cycle whose
+    coarse solve is a guess -- which for a diagonal operator is the *exact* inverse, so the solve
+    converges in one iteration. That is what makes this case checkable at all.
+    """
+    n = 1024
+    rng = np.random.default_rng(7)
+    diagonal_np = rng.uniform(1.0, 4.0, size=n)
+    index_np = np.arange(n, dtype=np.int32)
+    matrix_wp = wps.bsr_from_triplets(
+        n,
+        n,
+        wp.array(index_np, dtype=wp.int32, device=device),
+        wp.array(index_np, dtype=wp.int32, device=device),
+        wp.array(np.ascontiguousarray(diagonal_np), dtype=wp.float64, device=device),
+    )
+    rhs_np = rng.standard_normal((2, n))
+    rhs_wp = wp.array(np.ascontiguousarray(rhs_np), dtype=wp.float64, device=device)
+    solution_wp = wp.zeros_like(rhs_wp)
+    iterations = tw.linalg.solve_spd_columns(
+        matrix_wp,
+        twt.as_array2d(rhs_wp, wp.float64),
+        twt.as_array2d(solution_wp, wp.float64),
+        check_every=1,
+        preconditioner="multigrid",
+    )[0]
+    assert iterations == 1, iterations
+    assert np.allclose(solution_wp.numpy(), rhs_np / diagonal_np, rtol=1e-8, atol=1e-10)
 
 
 @pytest.mark.parametrize("n_columns", [1, 3])

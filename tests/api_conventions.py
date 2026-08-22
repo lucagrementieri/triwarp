@@ -374,6 +374,10 @@ _KERNEL_OUTPUT_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
     ),
     ("energies", "scatter_edge_halfedges"): frozenset({"cursor"}),
     ("grouping", "hash_insert"): frozenset({"slot_counts"}),
+    # ``values`` is the matrix whose rows this scales -- input and result in the same buffer, since
+    # the prolongation smoother's ``-w D^-1 (A P0)`` is a row scaling of a product that has just
+    # been built and is not needed unscaled.
+    ("algorithms.multigrid", "scale_rows"): frozenset({"values"}),
     ("polyline", "clip_selected"): frozenset({"active", "left", "right"}),
     ("polyline", "init_ring"): frozenset({"active", "left", "right"}),
     ("polyline", "rdp_keep_mask"): frozenset({"stack"}),

@@ -26,6 +26,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import read_scalar
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import homology as kernel_homology
 from triwarp.kernels import scatter as kernel_scatter
@@ -269,7 +270,7 @@ def _dual_spanning_forest(
         )
         # One 4-byte readback per round. ~17 of those against the 765-891 kernel-bound levels the
         # traversal needed is not a close trade, and there is no bound on the rounds without it.
-        if int(merges.numpy()[0]) == 0:
+        if int(read_scalar(merges, 0)) == 0:
             break
     return in_forest
 

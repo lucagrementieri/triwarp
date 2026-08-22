@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import pyvista as pv
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshnumpy as mn
@@ -11,7 +12,12 @@ from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.comparisons import undirected_edges
-from tests.conversions import meshlib_bitset_to_numpy, numpy_to_meshlib, trimesh_to_pymeshlab
+from tests.conversions import (
+    meshlib_bitset_to_numpy,
+    numpy_to_meshlib,
+    pyvista_edges_to_indices,
+    trimesh_to_pymeshlab,
+)
 
 
 def test_submesh_from_face_indices_empty(device: str) -> None:
@@ -578,6 +584,85 @@ def test_region_boundary_edges(device: str):
     assert (
         mm.findRegionBoundaryUndirectedEdgesInsideMesh(mesh_ml.topology, all_faces_ml).count() == 0
     )
+
+
+@pytest.mark.parity("region_boundary_edges", "pyvista")
+def test_region_boundary_edges_matches_pyvista(device: str) -> None:
+    """
+    Class B: VTK reaches the same seam by construction, minus the mesh's own boundary.
+
+    pyvista has no seam filter. The route is ``extract_cells(region).extract_surface()`` followed by
+    that surface's ``extract_feature_edges(boundary_edges=True)`` -- and the sub-surface's boundary
+    is the seam **plus** whatever part of the mesh rim the region contains, where
+    ``region_boundary_edges`` keeps only the interior half ("InsideMesh", as the MeshLib pairing
+    above spells out). So the named transform is subtracting
+    [`boundary_edges`][triwarp.boundary.boundary_edges], and at that it is exact. On this 6x6 grid:
+    an interior region gives **12 = 12** edges with nothing on the rim, and the corner region gives
+    4 against pyvista's 8, where the 4 extra are exactly the rim edges it contains. The same pair on
+    a curved patch cut out of ``icosphere(3)`` reads 48 = 48 and 26 against 54 (28 on the rim), and
+    on the closed sphere 44 = 44.
+
+    Both regions are asserted here because only the second exercises the transform and only the
+    first shows the two agree without it -- and the pair is what rules out the subtraction hiding a
+    real disagreement.
+
+    The remap is not optional: ``extract_feature_edges`` returns a new ``PolyData`` carrying only
+    the points its lines touch, renumbered, so
+    [`pyvista_edges_to_indices`][tests.conversions.pyvista_edges_to_indices] keys them back by
+    position. And the fixture must not come from ``trimesh.slice_plane``: on a hemisphere built that
+    way the same comparison leaves 21 edges unexplained by the transform, all of it the fragmented
+    rim that converter is known for.
+    """
+    vertices_np, faces_np = _grid_mesh(6)
+    n_faces = len(faces_np) // 3
+    vertices_wp = wp.array(vertices_np, dtype=wp.vec3, device=device)
+    faces_wp = wp.array(faces_np, dtype=wp.int32, device=device)
+    mesh_pv = pv.PolyData.from_regular_faces(
+        vertices_np, np.ascontiguousarray(faces_np.reshape(-1, 3), dtype=np.int32)
+    )
+    rim = {
+        tuple(sorted(int(x) for x in edge))
+        for edge in tw.boundary.boundary_edges(vertices_wp, faces_wp).numpy()
+    }
+    assert len(rim) == 20  # the 6x6 grid's own boundary, which pyvista's route picks up
+
+    centroids_np = vertices_np[faces_np.reshape(-1, 3)].mean(axis=1)
+    interior_np = (np.abs(centroids_np[:, 0] - 2.5) < 1.2) & (
+        np.abs(centroids_np[:, 1] - 2.5) < 1.2
+    )
+    corner_np = np.zeros(n_faces, dtype=bool)
+    corner_np[:6] = True  # a contiguous block against the grid's rim
+
+    for name, region_np, touches_rim in (
+        ("interior", interior_np, False),
+        ("corner", corner_np, True),
+    ):
+        region_wp = wp.array(region_np, dtype=wp.bool, device=device)
+        edges_wp = {
+            tuple(sorted(int(x) for x in edge))
+            for edge in tw.selection.region_boundary_edges(faces_wp, region_wp).numpy()
+        }
+
+        surface_pv = mesh_pv.extract_cells(np.flatnonzero(region_np)).extract_surface(
+            algorithm="dataset_surface"
+        )
+        edges_pv = {
+            tuple(sorted(int(x) for x in edge))
+            for edge in pyvista_edges_to_indices(
+                surface_pv.extract_feature_edges(
+                    boundary_edges=True,
+                    feature_edges=False,
+                    non_manifold_edges=False,
+                    manifold_edges=False,
+                ),
+                vertices_np,
+            )
+        }
+
+        assert len(edges_wp) > 0, name  # non-vacuity on both sides
+        assert len(edges_pv) > 0, name
+        assert (edges_pv & rim != set()) is touches_rim, name  # the transform is exercised once
+        assert edges_pv - rim == edges_wp, name
 
 
 def test_exclude_fully_selected_components(device: str):

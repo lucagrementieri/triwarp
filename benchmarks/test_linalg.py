@@ -209,6 +209,31 @@ def test_solve_spd_columns(bench_case: BenchCase, check_every: int) -> None:
     assert solution.shape[0] == _N_RHS
 
 
+@pytest.mark.benchmark(group="multigrid_preconditioner")
+@pytest.mark.benchaxis("quality")
+@pytest.mark.benchlibs("triwarp")
+def test_multigrid_preconditioner(bench_case: BenchCase) -> None:
+    """
+    Hierarchy *setup* only: the cost that decides whether a call site should ask for the V-cycle.
+
+    The solve-side win is not timed here -- it lands in the ``smooth_region`` group, the one
+    operator class in the package where it pays (2.46x end to end on ``bunny``). What this row
+    measures is the other half of that trade, and why the switch is per call site and not a default:
+    building the hierarchy is one aggregation, one power iteration, a ``bsr_transposed`` and three
+    ``bsr_mm`` per level, and at these sizes every one of those is a *fixed* per-call cost rather
+    than a function of the operator. Measured 12-17 ms, which is why
+    ``smoothing.smooth_region_fixed_rim`` (0.48-0.53x) and ``parametrization.harmonic`` at ``k=1``
+    (0.43-1.13x) decline it: their whole solve is shorter than this row.
+
+    Read against the ``solve_spd_columns`` group above, whose two rows are the *same* operator's
+    solve. A setup that grew with the mesh rather than sitting near-flat would change the decision
+    at every call site, so the shape of this row across the quality axis is the thing to watch.
+    """
+    operator = _operator(bench_case)
+    preconditioner = bench_case.run(lambda: tw.linalg.multigrid_preconditioner(operator))
+    assert preconditioner.shape[0] == int(operator.nrow)
+
+
 @pytest.mark.benchmark(group="spd_column_solver_amortized")
 @pytest.mark.benchaxis("quality")
 @pytest.mark.benchlibs("triwarp")

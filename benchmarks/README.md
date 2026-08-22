@@ -364,7 +364,7 @@ radius searches (`spatial.KDTree`) and the graph traversals (`sparse.csgraph`), 
 trimesh itself delegates. `potpourri3d` is CPU-only (geometry-central) and is the **only** reference
 for the heat-method family, tangent spaces and isocontours. `pymeshlab` is CPU-only (MeshLab /
 VCGlib) and is the **broadest** — it reaches 26 modules, more than any other single reference.
-`pyvista` is CPU-only, single-threaded VTK 9.6 and is the newest; it reaches 22 groups across 20
+`pyvista` is CPU-only, single-threaded VTK 9.6 and is the newest; it reaches 47 groups across 26
 modules (see its section below). **A group carries `pyvista` or `vedo`, never both** — they wrap the
 same VTK, so two rows would double-count one implementation; where a group would take both, `vedo`
 gets `noparity(..., oracle="pyvista")`.
@@ -756,8 +756,16 @@ The first two fail *silently* rather than raising:
 
 VTK through pyvista 0.48 / VTK 9.6, and the registration cost nothing: `pyvista>=0.48` was already in
 the `test` dependency group. `PolyData`'s callable surface is **142 distinct filter names** across its
-three mixins; 22 of them map onto something triwarp already has, and those are the rows. Every one is
-single-threaded CPU VTK, so `pyvista` is `cpu_bound` and the heavy filters carry explicit caps.
+three mixins; 28 of them map onto something triwarp already has, and those 28 carry **47 group rows**
+across 26 modules (one filter often answers several groups — `cell_quality` alone covers
+`face_quality` and `face_angles`, and `find_closest_cell` answers both `closest_point_on_mesh` and
+`distance_to_polyline`). Every one is single-threaded CPU VTK, so `pyvista` is `cpu_bound` and the
+heavy filters carry explicit caps.
+
+The seven newest rows were added for a different reason from the forty that preceded them, and it is
+worth saying which: each is a group whose *only* other reference is `meshlib` or `scipy`, and MeshLib
+is the one reference here under a non-commercial licence. They take the count of groups that depend
+on MeshLib alone from 22 to 16.
 
 Two mechanics that differ from the other references:
 
@@ -790,6 +798,10 @@ Two mechanics that differ from the other references:
 | `test_remesh` / `test_smoothing` | `quadric_decimate`, `filter_laplacian_integration` (exempt), `filter_taubin` (exempt) | `decimate`, `smooth`, `smooth_taubin` |
 | `test_repair` / `test_voxels` | `remove_duplicated_vertices`, `voxelize_mesh` | `clean`, `voxelize_binary_mask` |
 | `test_reconstruction` | `delaunay_triangulation` (new group) | `delaunay_2d` |
+| `test_polyline` | `polyline_length`, `distance_to_polyline`, `triangulate_polyline` | `compute_arc_length`, `find_closest_cell`, `triangulate_contours` — all three on a **single-cell** polyline |
+| `test_proximity` | `closest_point_on_mesh`, `containing_faces_2d` | `find_closest_cell`, `find_containing_cell` (`vtkStaticCellLocator`, batched) |
+| `test_selection` | `region_boundary_edges` | `extract_cells` + `extract_feature_edges(boundary_edges=True)` — a superset, minus the mesh rim |
+| `test_intersection` | `mesh_with_mesh` | `intersection` (`vtkIntersectionPolyDataFilter`) |
 | `test_intersection` / `test_interpolation` / `test_creation` | `clip_mesh_with_field`, `interpolate_from_points`, `parametric_surface`, `super_ellipsoid`, `super_toroid`, `random_hills` (exempt) | `clip_scalar`, `DataSet.interpolate`, the 21 `Parametric*` surfaces |
 
 **Where pyvista is the strongest reference in the set**, which is what the registration was for:
@@ -798,7 +810,20 @@ Two mechanics that differ from the other references:
 point-cloud estimator at 0.956 / 0.375 by comparison); `select_interior_points` agrees with
 `ray.contains_points` on 1.000 of 2 000 queries; and `decimate` is the **best** of the four
 decimation references on sphere deviation, ahead of triwarp by 1.14–1.53× (`tests/test_remesh.py`
-carries the numbers).
+carries the numbers). Three more from the 2026-08-21 pass: `find_closest_cell` agrees with
+`igl.point_mesh_squared_distance` to **4.4e-16** on both distance and point, making it the most
+accurate closest-point reference registered; `find_containing_cell` is the **only** working
+point-location oracle besides scipy (`igl.in_element` returns batch-size-dependent answers and
+aborts on a 200-point Delaunay); and `intersection` returns the unordered segment soup
+`mesh_with_mesh` returns, so it pins that curve's *value* where MeshLib's contour linker can only
+bound it (36 = 36 segments, bit-identical total length).
+
+**Three caps and one skip come from that pass**, all measured per call: `find_closest_cell` at
+10 000 queries is 160 / 376 / 906 ms on `bunny_decimated` / `bunny` / `dragon` (capped at `bunny`);
+`intersection` is 134 / 577 ms on the same two (the group's own `bunny` cap covers it); and the
+polyline locator collapses on a long single cell — 24.8 ms at 4 096 queries against a 268-segment
+loop, **4 963.9 ms** against `rim_long`'s 65 536-segment one and 104 s at 65 536 queries, so
+`rim_long` is skipped for `pyvista` in `distance_to_polyline` by name.
 
 **Costs measured on an 81 920-face mesh**, which is where the caps come from: `slice` 7.9 ms,
 `curvature('gaussian')` 8.4 ms, `cell_quality` 9.4 ms, `clean` 10.1 ms, `compute_normals` 20.3 ms,
@@ -814,6 +839,18 @@ returns the first *principal* axis where `points.fit_line` is trimesh's σ-weigh
 |dot| 0.802 on an ordinary cloud), `filter_laplacian_integration` and `filter_taubin` (D2 —
 different algorithms, see `.claude/CLAUDE.md` §6), and `random_hills` (D5 — VTK draws its own
 amplitudes and variances from its own generator, so no seed pairs the two).
+
+**Four filters that look like references and are not**, measured 2026-08-21 so no row is written
+against them: `multi_ray_trace` is **trimesh + embree**, not VTK (it imports trimesh and calls
+`intersects_location`), so a `pyvista` row on the `intersects_*` groups would be a trimesh row under
+another name — VTK's own `ray_trace` is independent and exact (face agreement 1.0000, hit point
+2.80e-07) but costs 398.6 µs *per ray*, so it stays a test oracle; `validate_mesh().intersecting_faces`
+is an **intra-cell** check and reads 0 on two interpenetrating spheres where triwarp flags 92 faces
+(`inverted_faces` likewise reads 0 on ten reversed faces, and the degeneracy field that fires is
+`zero_size`); `collision` is a two-mesh filter and reports 2 600 hits for a 320-cell mesh against its
+own copy, so it cannot see a self-intersection; and `sample()` validates only 476 of 2 562 probes
+against `transfer_onto_vertices` (7.20e-08 where valid), with `snap_to_closest_point=True` snapping
+to the nearest source *vertex* and making it worse (0.256).
 
 Modules with **no** VTK equivalent: `heat/*` beyond the graph-distance bound, `tangent_space`,
 `homology`, `energies`, `parametrization` beyond `delaunay_2d`, `texture`, `linalg`, `array`,

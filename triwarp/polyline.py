@@ -28,6 +28,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import read_scalar
 from triwarp.kernels import creation as kernel_creation
 from triwarp.kernels import polyline as kernel_polyline
 
@@ -878,7 +879,7 @@ def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
 
     reflex = wp.zeros(1, dtype=wp.int32, device=device)
     wp.launch(kernel_polyline.count_reflex, dim=n, inputs=[points2d, reflex], device=device)
-    if int(reflex.numpy()[0]) == 0:
+    if int(read_scalar(reflex, 0)) == 0:
         wp.launch(kernel_polyline.fan_triangulate, dim=n - 2, inputs=[out_faces], device=device)
         return twt.as_array2d(out_faces, wp.int32)
 
@@ -928,7 +929,7 @@ def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     else:
         wp.capture_while(condition, clip_round)
 
-    count = int(out_count.numpy()[0])
+    count = int(read_scalar(out_count, 0))
     return twt.as_array2d(out_faces[0:count], wp.int32)
 
 

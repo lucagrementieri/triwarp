@@ -18,6 +18,7 @@ from __future__ import annotations
 import warp as wp
 
 import triwarp as tw
+from triwarp._device import read_scalar
 from triwarp.constants import INT32_MAX
 from triwarp.kernels import halfedge as kernel_halfedge
 from triwarp.kernels import scatter as kernel_scatter
@@ -87,7 +88,7 @@ def halfedge_twins(faces: wp.array[wp.int32], n_vertices: int | None = None) -> 
         inputs=[sorted_keys, order, twins, nonmanifold],
         device=device,
     )
-    n_nonmanifold = int(nonmanifold.numpy()[0])
+    n_nonmanifold = int(read_scalar(nonmanifold, 0))
     if n_nonmanifold > 0:
         raise ValueError(
             f"halfedge_twins requires an edge-manifold mesh: {n_nonmanifold} edge(s) are shared by "
@@ -193,7 +194,7 @@ def vertex_one_rings(
         inputs=[starts, twins, offsets, ring_halfedges, incomplete],
         device=device,
     )
-    n_incomplete = int(incomplete.numpy()[0])
+    n_incomplete = int(read_scalar(incomplete, 0))
     if n_incomplete > 0:
         raise ValueError(
             f"vertex_one_rings requires a vertex-manifold mesh: {n_incomplete} vertex/vertices "

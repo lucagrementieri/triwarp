@@ -30,7 +30,7 @@ import numpy as np
 import warp as wp
 
 import triwarp as tw
-from triwarp._device import prefers_tiled_reduction, slice_count
+from triwarp._device import prefers_tiled_reduction, read_scalar, slice_count
 from triwarp.constants import TILE_1D
 from triwarp.kernels import measures as kernel_measures
 
@@ -134,7 +134,7 @@ def surface_centroid(vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]) -> 
     # Two unavoidable readbacks: the return type is a host-side wp.vec3, so the sums have to
     # cross to the host to be divided.
     weighted = out_centroid.numpy()
-    total_area = float(out_total_area.numpy()[0])
+    total_area = float(read_scalar(out_total_area, 0))
     return wp.vec3(
         float(weighted[0]) / total_area,
         float(weighted[1]) / total_area,

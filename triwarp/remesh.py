@@ -34,7 +34,7 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import require_nonempty_mesh
+from triwarp._device import read_scalar, require_nonempty_mesh
 from triwarp.constants import INT32_MAX, TOLERANCE_MOLLIFY
 from triwarp.kernels import adjacency as kernel_adjacency
 from triwarp.kernels import array as kernel_array
@@ -541,7 +541,7 @@ def _collapse_pass(
             ],
             device=device,
         )
-        if int(count.numpy()[0]) == 0:
+        if int(read_scalar(count, 0)) == 0:
             break
 
         remapped = tw.array.gather(remap, faces)
@@ -736,7 +736,7 @@ def _flip_interior_edges(
             ],
             device=device,
         )
-        n = int(count.numpy()[0])
+        n = int(read_scalar(count, 0))
         total += n
         if n == 0:
             break
@@ -853,7 +853,7 @@ class _FlipTopology:
         # Inclusive, so the row count is one 4-byte tail read and the emit kernel's row is
         # ``ranks[i] - 1`` -- the contract ``array.flatnonzero`` uses for the same reason.
         wp.utils.array_scan(self._starts, out_array=self._ranks, inclusive=True)
-        m = int(self._ranks_tail.numpy()[0])
+        m = int(read_scalar(self._ranks_tail, 0))
         if m == 0:
             return 0
         if m != self._rows:
@@ -1333,7 +1333,7 @@ class _DecimationBuffers:
             else:
                 self._issue_pass()
         self._passes += 1
-        return int(self._count.numpy()[0]) != 0
+        return int(read_scalar(self._count, 0)) != 0
 
     def _tighten_edges(self, edges: int) -> None:
         """
@@ -2263,7 +2263,7 @@ def intrinsic_delaunay(
             ],
             device=device,
         )
-        committed = int(count.numpy()[0])
+        committed = int(read_scalar(count, 0))
         total += committed
         if committed == 0:
             break

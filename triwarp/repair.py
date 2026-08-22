@@ -24,6 +24,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import read_scalar
 from triwarp.grouping import hash_vector_rows, unique_1d, unique_faces, unique_rows
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import repair as kernel_repair
@@ -270,9 +271,9 @@ def resolve_duplicated_faces(
         ],
         device=device,
     )
-    first_error = int(error_group.numpy()[0])
+    first_error = int(read_scalar(error_group, 0))
     if first_error < num_unique:
-        count = int(signed_count[first_error : first_error + 1].numpy()[0])
+        count = int(read_scalar(signed_count, first_error))
         raise ValueError(
             f"resolve_duplicated_faces: non-orientable duplicate face group {first_error} "
             f"with signed count {count}"

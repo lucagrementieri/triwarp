@@ -10,6 +10,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import read_scalar
 from triwarp.array import arange, flatnonzero, gather
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import sample as kernel_sample
@@ -222,7 +223,7 @@ def sample_surface(
     # 1.13x on CUDA at both 20k and 328k faces (it is launch-bound there), 1.53x and 2.04x on CPU.
     cdf = wp.empty(n_faces, dtype=wp.float32, device=vertices.device)
     wp.utils.array_scan(weights, out_array=cdf)
-    total = float(cdf[n_faces - 1 : n_faces].numpy()[0])
+    total = float(read_scalar(cdf))
     if total <= 0.0:
         raise ValueError("total face weight must be positive")
     wp.map(wp.div, cdf, wp.float32(total), out=cdf)
@@ -551,6 +552,12 @@ def _dart_throw_blue_noise(
     )
     state = wp.zeros(n_pool, dtype=wp.int32, device=device)
 
+    # Per-cell summaries that let each round's two sweeps skip a shell cell whole; see the kernel
+    # module for what each one summarises and why the accepted set is unchanged. Both are refilled
+    # per round rather than accumulated, so a cell stops pruning the moment it stops being empty.
+    cell_min_priority = wp.empty(n_cells, dtype=wp.uint32, device=device)
+    cell_accepted = wp.empty(n_cells, dtype=wp.bool, device=device)
+
     # Work-list buffers sized for their final use once: the first round's list is the whole pool and
     # every later one is a prefix of it, so nothing here is reallocated per round.
     alive = arange(n_pool, device)
@@ -562,6 +569,15 @@ def _dart_throw_blue_noise(
 
     while alive_count > 0:
         view = alive[:alive_count]
+        # Two fills rather than a reset kernel: a memset is ~3.1 us against ~9.7 for a launch.
+        cell_min_priority.fill_(kernel_blue_noise.DART_NO_PRIORITY)
+        cell_accepted.fill_(False)
+        wp.launch(
+            kernel_blue_noise.dart_cell_min_priority,
+            dim=alive_count,
+            inputs=[priority, point_cell, view, cell_min_priority],
+            device=device,
+        )
         wp.launch(
             kernel_blue_noise.dart_select_minima,
             dim=alive_count,
@@ -573,15 +589,27 @@ def _dart_throw_blue_noise(
                 bucket,
                 cell_offsets,
                 view,
+                cell_min_priority,
                 rr,
                 state,
+                cell_accepted,
             ],
             device=device,
         )
         wp.launch(
             kernel_blue_noise.dart_cover_neighbors,
             dim=alive_count,
-            inputs=[pool_points, point_cell, cell_neighbors, bucket, cell_offsets, view, rr, state],
+            inputs=[
+                pool_points,
+                point_cell,
+                cell_neighbors,
+                bucket,
+                cell_offsets,
+                view,
+                cell_accepted,
+                rr,
+                state,
+            ],
             device=device,
         )
         # Survivors of this round, compacted in place. ``array_scan`` is exclusive, so the total
@@ -598,8 +626,8 @@ def _dart_throw_blue_noise(
         )
         # Two 4-byte reads per round size the next generation: the exclusive scan's last entry
         # plus that element's own flag. The compaction launch needs the count as a slice bound.
-        total = int(positions[alive_count - 1 : alive_count].numpy()[0]) + int(
-            survivor_flag[alive_count - 1 : alive_count].numpy()[0]
+        total = int(read_scalar(positions[:alive_count])) + int(
+            read_scalar(survivor_flag[:alive_count])
         )
         if total > 0:
             wp.launch(
@@ -683,7 +711,7 @@ def sample_volume(
 
     cdf = wp.empty(n_faces, dtype=wp.float32, device=vertices.device)
     wp.utils.array_scan(signed_vols, out_array=cdf)
-    total_vol = float(cdf[n_faces - 1 : n_faces].numpy()[0])
+    total_vol = float(read_scalar(cdf))
     if total_vol == 0.0:
         raise ValueError("mesh has zero volume")
     wp.map(wp.div, cdf, wp.float32(total_vol), out=cdf)

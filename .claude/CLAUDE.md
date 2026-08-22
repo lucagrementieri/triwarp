@@ -585,7 +585,7 @@ live in VTK's `vtkParametric*` constructors as `JoinU` / `JoinV` / `TwistU` / `T
 off the objects at runtime. And a `uv run` whose working directory is inside `reference/pyvista`
 resolves *that* project and builds a second virtualenv (it downloads its own VTK); always invoke
 probes from the repo root. Licence: pyvista is MIT and VTK is BSD-3, so there is no `copyleft/`
-subtree to avoid as there is in `reference/libigl`. Ten hazards, all measured:
+subtree to avoid as there is in `reference/libigl`. Fifteen hazards, all measured:
 
 - **Float64 in, sometimes float32 out.** Point storage is exact (round-trip error `0.0` on
   `[1/3, π, e]`) and `regular_faces` is a real `(n, 3)` `int64` array — that is why pyvista, not
@@ -661,6 +661,50 @@ subtree to avoid as there is in `reference/libigl`. Ten hazards, all measured:
   (a hard `DeprecationError`), `select_enclosed_points` (→ `select_interior_points`, and the array
   name is now lowercase `selected_points`), `extract_geometry` (→ `extract_surface(algorithm=None)`)
   and `n_faces_strict` (→ `n_faces`).
+- **`multi_ray_trace` is trimesh + embree, not VTK.** It imports `trimesh`, checks
+  `trimesh.ray.has_embree` and calls `tmesh.ray.intersects_location` — measured identical to
+  trimesh's own call (first-hit faces 1.0000 over 2 000 rays, 7.3 against 8.9 ms), so a `pyvista`
+  row for the `intersects_*` groups would be a **trimesh row under another name**, the
+  one-VTK-two-wrappers double count in a new pair. VTK's own `ray_trace` *is* independent (face
+  agreement 1.0000, hit point 2.80e-07 against triwarp) but takes one ray per call at
+  **398.6 µs/ray** — 89x embree — so it is a test oracle and never a benchmark row.
+- **`validate_mesh()`'s cell fields are per *cell*, not per mesh.** `intersecting_faces` is "two
+  faces of a **3D cell**", so on a triangle mesh it is identically empty: 0 on two interpenetrating
+  icospheres where `face_self_intersecting_mask` flags **92**, and 0 on `bohemian_dome` where it
+  flags 205. `inverted_faces` likewise reads 0 on a mesh with ten reversed faces. The degeneracy
+  field that does fire is **`zero_size`** (`degenerate_faces` stays empty even for a repeated vertex
+  id), and `clean()` **keeps** those faces — 82 of 82 cells at the default, at `tolerance=0.0` and at
+  `absolute=False` — so there is a detector here and no filter. A degeneracy comparison also needs a
+  *scale-aware* input: a float64-exactly-collinear face (area 1.25e-17) survives triwarp's float32
+  altitude test on both devices, so pyvista flags two where `remove_degenerate_faces` drops one.
+  Relatedly, `collision` is a **two-mesh** filter and cannot see a self-intersection either: it
+  reports 2 600 hits for a 320-cell mesh against its own copy (56 for two genuinely offset spheres).
+- **`compute_implicit_distance` needs polygons.** On a line-set `PolyData` VTK logs
+  *"No polygons to evaluate function!"* once per query and returns a field **3.35** off the truth
+  rather than raising. Polyline distance goes through `find_closest_cell` on a **single-cell**
+  polyline instead (2.49e-07 against `polyline.distance_to_polyline`) — and that single cell is the
+  whole trick: `pv.lines_from_points` makes one cell per segment, which is what makes
+  `compute_arc_length` read 0.0638 for a polyline of length 12.7049. Its locator collapses on a long
+  cell, though: 24.8 ms at 4 096 queries against 268 segments, **104 s** at 65 536 queries against
+  65 536 segments.
+- **`find_containing_cell` is the point-location oracle that works**, batched, `-1` outside, and
+  measured **1.0000** against `scipy.spatial.Delaunay.find_simplex` on 10 000 queries with the batch
+  and the per-point loop byte-identical. Worth stating because the libigl block above records
+  `igl.in_element` as unusable for the identical question, so generalizing from it skips a good
+  reference. `find_closest_cell` is likewise the most accurate closest-point reference registered
+  (4.4e-16 against `igl.point_mesh_squared_distance` on distance *and* point) — but its **cell id is
+  not comparable**: it disagrees with igl on 28 % of exterior queries, every one a point lying on a
+  shared edge to ~1e-16, because for a query far outside a convex mesh the nearest point is a vertex
+  (the vertex normal fans exhaust 4π). Compare the distance, and the point at Warp's own 2.2e-04
+  `mesh_query_point_no_sign` floor.
+- **Two filters answer a *different* question than their name suggests.** `sample()` interpolates
+  only where the query lands **inside** a source cell — 476 of 2 562 target points valid against
+  `interpolation.transfer_onto_vertices`, agreeing to 7.20e-08 on those — and
+  `snap_to_closest_point=True` snaps to the nearest source **vertex**, not the nearest point on the
+  surface, which makes it *worse* (0.256). And `delaunay_2d(edge_source=loop)` does not clip to the
+  loop: on a 40-point star it returns 63 cells covering area **4.465** against the polygon's 3.264.
+  The polygon-fill oracle is `triangulate_contours`, which adds zero Steiner points and matches
+  `polyline.triangulate_polyline`'s `n - 2` count and area to nine digits.
 
 Two more, for the parametric surfaces specifically: **they arrive open and `clean` defaults
 differently per surface** — `surface_from_para(clean=False)` is the underlying default and at that

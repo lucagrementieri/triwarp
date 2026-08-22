@@ -162,9 +162,11 @@ def test_sample_surface_blue_noise(bench_case: BenchCase, radius_scale: float) -
     Maximal Poisson-disk selection from a dense pool, on a background grid sized by the radius.
 
     Halving the radius is 8x the cells and 4x the output, so the pair should show a large,
-    superlinear step -- and it is now a *mild* one (44 -> 54 ms on ``bunny_decimated``), because the
-    round count no longer grows with it. open3d is parametrized by *count* rather than radius, so
-    its two rows are matched to the sample count each radius implies rather than to the radius.
+    superlinear step -- and it is now a *flat* one (24.6 -> 25.1 ms on ``bunny_decimated``), because
+    the round count no longer grows with it and the per-cell summaries that prune each round's shell
+    sweep prune hardest exactly where the cells are most numerous (2.30x at half the radius on
+    ``bunny`` against 1.71x at the full one). open3d is parametrized by *count* rather than radius,
+    so its two rows are matched to the sample count each radius implies rather than to the radius.
 
     **libigl is the reference this port was written from** -- ``sample_surface_blue_noise`` still
     sizes its pool at the ``30x`` oversampling factor ``igl::blue_noise`` uses -- and it takes the

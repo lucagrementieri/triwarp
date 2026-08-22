@@ -9,6 +9,7 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import read_scalar
 from triwarp.array import arange
 from triwarp.constants import INT32_MAX
 from triwarp.kernels import graph as kernel_graph
@@ -588,7 +589,7 @@ def bfs(
             inputs=[wp.int32(source), offsets, columns, order_buffer, parents, distances, reached],
             device=device,
         )
-        return wp.clone(order_buffer[: int(reached.numpy()[0])]), parents, distances
+        return wp.clone(order_buffer[: int(read_scalar(reached, 0))]), parents, distances
 
     # Level-synchronous frontier BFS that reproduces scipy's FIFO discovery order exactly,
     # sort-free: unvisited neighbors are claimed with the parent dequeue rank via atomic_min
@@ -698,7 +699,7 @@ def bfs(
             inputs=[state, offsets, columns, order_buffer, parents, distances, reached],
             device=device,
         )
-        tail = int(reached.numpy()[0])
+        tail = int(read_scalar(reached, 0))
     return wp.clone(order_buffer[:tail]), parents, distances
 
 
@@ -971,7 +972,7 @@ def shortest_path_envelope(
             device=device,
         )
         labels, relaxed = relaxed, labels
-        if int(changed.numpy()[0]) == 0:
+        if int(read_scalar(changed, 0)) == 0:
             break
     return labels
 

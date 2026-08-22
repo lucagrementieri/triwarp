@@ -33,6 +33,16 @@ Background grid cells are ``r`` on a side, so a ``3x3x3`` neighbourhood contains
 ``r`` and both sweeps are 27 cells. Bridson's, by contrast, had to enumerate a ``9x9x9`` shell per
 active parent per round to find its ``[r, 2r]`` annulus — 729 cells against 27, which together with
 the round count is the whole difference.
+
+**Most of those 27 cells cannot affect the answer, and one word per cell says which.** Each sweep
+vetoes a candidate on a single property of the points in a neighbouring cell — an acceptance for the
+covering sweep, a smaller priority for the selection sweep — so a per-cell summary of that property
+decides the whole cell without loading a point from it. Two summaries are rebuilt per round, at a
+cost of two fills and one atomic pass over the work list; they remove work whose outcome was already
+determined, so the accepted set is identical by construction rather than by tolerance. Measured at
+the radii ``benchmarks/test_sample.py`` scores: the covering summary alone is **1.51x / 2.06x**, the
+selection summary alone 1.06-1.08x, and the two together **1.70x / 1.72x / 2.33x**, with a
+byte-identical ``state`` array in all four combinations.
 """
 
 import warp as wp
@@ -53,6 +63,12 @@ _DART_SHELL_W = wp.constant(wp.int32(DART_SHELL_W))
 DART_ALIVE = wp.constant(wp.int32(0))
 DART_ACCEPTED = wp.constant(wp.int32(1))
 DART_COVERED = wp.constant(wp.int32(2))
+
+# Empty-cell sentinel for the per-cell priority summary below. A drawn priority can legitimately
+# *equal* it, which costs nothing: a thread only skips a cell whose summary is *strictly* greater
+# than its own key, so a cell holding a real ``0xffffffff`` is never wrongly skipped -- the only
+# thread that could skip it holds a smaller key, and a larger-priority point can never veto it.
+DART_NO_PRIORITY = wp.constant(wp.uint32(0xFFFFFFFF))
 
 
 @wp.func
@@ -137,6 +153,27 @@ def dart_priorities(seed: wp.int32, out_priority: wp.array[wp.uint32]) -> None:
 
 
 @wp.kernel
+def dart_cell_min_priority(
+    priority: wp.array[wp.uint32],
+    point_cell: wp.array[wp.int32],
+    alive: wp.array[wp.int32],
+    out_cell_min_priority: wp.array[wp.uint32],
+) -> None:
+    # Per-cell summary for the selection sweep: the smallest priority any *alive* point in the cell
+    # holds. ``dart_select_minima`` vetoes a candidate only from a strictly smaller priority, so a
+    # cell whose minimum already loses to the candidate's key cannot contribute and is skipped
+    # whole -- which is most of the 27, most rounds.
+    #
+    # Summarising the alive list rather than every not-COVERED point leaves the points ACCEPTED in
+    # an *earlier* round out, and that is safe: such a point covered its own ``r``-ball in the round
+    # it was accepted, so no point still alive now is within ``r`` of it and none of them could have
+    # been vetoed by it anyway.
+    t = wp.int32(wp.tid())
+    i = alive[t]
+    wp.atomic_min(out_cell_min_priority, point_cell[i], priority[i])
+
+
+@wp.kernel
 def dart_select_minima(
     pool_points: wp.array[wp.vec3],
     priority: wp.array[wp.uint32],
@@ -145,8 +182,10 @@ def dart_select_minima(
     bucket: wp.array[wp.int32],
     cell_offsets: wp.array[wp.int32],
     alive: wp.array[wp.int32],
+    cell_min_priority: wp.array[wp.uint32],
     rr: wp.float32,
     out_state: wp.array[wp.int32],
+    out_cell_accepted: wp.array[wp.bool],
 ) -> None:
     # Accept every alive point that no *smaller-priority* point still in play sits within ``r`` of.
     #
@@ -163,6 +202,10 @@ def dart_select_minima(
         c = cell_neighbors[row, s]
         if c < wp.int32(0):
             continue
+        # Nothing in this cell can veto the candidate. The candidate's own cell never trips this,
+        # since its own key is one of the minimands.
+        if cell_min_priority[c] > my_key:
+            continue
         for k in range(cell_offsets[c], cell_offsets[c + 1]):
             j = bucket[k]
             if j == i or out_state[j] == DART_COVERED:
@@ -173,6 +216,9 @@ def dart_select_minima(
             if wp.length_sq(pool_points[j] - p) < rr:
                 return
     out_state[i] = DART_ACCEPTED
+    # Summary for the covering sweep that follows: this cell now holds a point accepted *this*
+    # round. Every writer stores the same value, so the unsynchronized store is benign.
+    out_cell_accepted[row] = True
 
 
 @wp.kernel
@@ -183,6 +229,7 @@ def dart_cover_neighbors(
     bucket: wp.array[wp.int32],
     cell_offsets: wp.array[wp.int32],
     alive: wp.array[wp.int32],
+    cell_accepted: wp.array[wp.bool],
     rr: wp.float32,
     out_state: wp.array[wp.int32],
 ) -> None:
@@ -201,6 +248,11 @@ def dart_cover_neighbors(
     for s in range(DART_SHELL_CELLS):
         c = cell_neighbors[row, s]
         if c < wp.int32(0):
+            continue
+        # Cells with nothing accepted this round are skipped whole. Restricting the sweep to *this*
+        # round's acceptances loses nothing: a point accepted earlier covered its ``r``-ball in that
+        # same round, and this thread was already alive then, so it would not still be alive now.
+        if not cell_accepted[c]:
             continue
         for k in range(cell_offsets[c], cell_offsets[c + 1]):
             j = bucket[k]

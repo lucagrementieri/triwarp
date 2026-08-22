@@ -297,6 +297,28 @@ def points_to_pyvista(points_np: np.ndarray) -> pv.PolyData:
     return pv.PolyData(np.ascontiguousarray(points_np, dtype=np.float64))
 
 
+def polyline_to_pyvista(polyline_np: np.ndarray, *, closed: bool = False) -> pv.PolyData:
+    """
+    Wrap an ordered ``(n, 3)`` point array as a ``pyvista.PolyData`` holding **one** line cell.
+
+    The single cell is the whole point: ``pv.lines_from_points`` builds one two-point cell per
+    segment instead, and every polyline filter then restarts at each of them --
+    ``compute_arc_length`` reports **0.0638** for a 200-point helix whose length is 12.7049, and
+    ``decimate_polyline`` is a no-op at every reduction. ``find_closest_cell`` on this form is the
+    point-to-*segment* distance (measured 2.49e-07 against
+    [`distance_to_polyline`][triwarp.polyline.distance_to_polyline]), where on the per-segment form
+    it is the same answer at 199x the cell count.
+
+    ``closed=True`` repeats the first index at the end, which is what ``triangulate_contours``
+    needs to read the line as a polygon boundary; the point buffer itself is not duplicated.
+    """
+    points_np = np.ascontiguousarray(polyline_np, dtype=np.float64)
+    indices_np = np.arange(points_np.shape[0])
+    if closed:
+        indices_np = np.append(indices_np, 0)
+    return pv.PolyData(points_np, lines=np.hstack([[indices_np.size], indices_np]).astype(np.int64))
+
+
 def pyvista_edges_to_indices(edges_pv: pv.PolyData, vertices_np: np.ndarray) -> np.ndarray:
     """
     Read a pyvista edge extraction's line cells back as ``(n, 2)`` indices, min-first per row.

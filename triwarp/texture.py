@@ -24,6 +24,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import read_scalar
 from triwarp.constants import INT32_MAX
 from triwarp.kernels import texture as kernel_texture
 
@@ -284,7 +285,7 @@ def _check_uv_in_range(uv: wp.array[wp.vec2]) -> None:
         return
     flag = wp.zeros(1, dtype=wp.int32, device=uv.device)
     wp.launch(kernel_texture.check_uv_range, dim=n_vertices, inputs=[uv, flag], device=uv.device)
-    if int(flag.numpy()[0]) != 0:
+    if int(read_scalar(flag, 0)) != 0:
         raise ValueError("UV coordinates must be in the range [0, 1]")
 
 

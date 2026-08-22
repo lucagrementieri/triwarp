@@ -896,6 +896,12 @@ def _pyvista_intersection_segments(mesh1_pv: pv.PolyData, mesh2_pv: pv.PolyData)
     return intersection_pv.points[pairs_np]
 
 
+def _segment_total_length(segments_np: np.ndarray) -> float:
+    """Total length of a segment soup -- the one scalar an unordered curve comparison can share."""
+    segments_np = segments_np.reshape(-1, 2, 3)
+    return float(np.sum(np.linalg.norm(segments_np[:, 1] - segments_np[:, 0], axis=1)))
+
+
 def _intersection_curves_match(
     got_segments_np: np.ndarray,
     ref_segments_np: np.ndarray,
@@ -929,9 +935,24 @@ def test_mesh_with_mesh_empty(
     assert lines_wp.shape == (0, 2)
 
 
+@pytest.mark.parity("mesh_with_mesh", "pyvista")
 def test_mesh_with_mesh_icosahedron_cave_cube(
     icosahedron: tuple[tm.Trimesh, wp.Mesh], cave_cube: tuple[tm.Trimesh, wp.Mesh]
 ) -> None:
+    """
+    Class B: the same crossing curve as ``vtkIntersectionPolyDataFilter``, as an unordered set.
+
+    Both sides emit a segment soup over the same crossing, so the transform is only that neither
+    ordering is meaningful -- matched by two-sided nearest-neighbour containment plus the two
+    quantities an ordering cannot affect: the segment **count** and the **total curve length**.
+    Measured on this pairing: 36 = 36 segments, length 4.195738316 against 4.195736885 (relative
+    3.4e-07) and a segment-midpoint Hausdorff of 5.96e-08 both ways. On two ``icosphere(3)``s offset
+    by 0.6 the same three numbers read 170 = 170, a **bit-identical** 5.984692574 and 2.77e-07.
+
+    MeshLib's ``findIntersectionContours`` covers the same group and does strictly more (it links
+    the crossing into ordered contours); VTK's filter returns the soup triwarp returns, which is why
+    this is class B where that pairing is class C.
+    """
     ico_tm, ico_wp = icosahedron
     cave_tm, _ = cave_cube
     cave_at_ico_tm = cave_tm.copy()
@@ -944,9 +965,12 @@ def test_mesh_with_mesh_icosahedron_cave_cube(
     lines_wp = tw.intersection.mesh_with_mesh(
         ico_wp.points, ico_wp.indices, cave_wp.points, cave_wp.indices
     )
+    segments_np = lines_wp.numpy().reshape(-1, 2, 3)
 
-    assert lines_wp.shape[0] > 0
-    assert _intersection_curves_match(lines_wp.numpy(), ref_segments_np)
+    assert ref_segments_np.shape[0] > 0  # non-vacuity: VTK found the crossing
+    assert segments_np.shape[0] == ref_segments_np.shape[0]
+    assert _intersection_curves_match(segments_np, ref_segments_np)
+    assert np.isclose(_segment_total_length(segments_np), _segment_total_length(ref_segments_np))
 
 
 # --- marching_triangles: isocontours of a scalar field (potpourri3d reference) ---------

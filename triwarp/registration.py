@@ -9,7 +9,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp._device import require_nonempty_mesh
+from triwarp._device import read_scalar, require_nonempty_mesh
 from triwarp.constants import TILE_1D
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import proximity as kernel_proximity
@@ -551,7 +551,7 @@ def icp_point_to_plane(
         transformed = current
         wp.map(wp.mul, step, total, out=total)
 
-        cost = float(cost_acc.numpy()[0])
+        cost = float(read_scalar(cost_acc, 0))
         if iteration > 0 and old_cost - cost < threshold:
             break
         old_cost = cost

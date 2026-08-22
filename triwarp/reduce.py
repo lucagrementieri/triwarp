@@ -9,6 +9,7 @@ from typing import Literal, NamedTuple, cast, overload
 import warp as wp
 
 import triwarp.typing as twt
+from triwarp._device import read_scalar
 from triwarp.array import _sorted_copy, astype
 from triwarp.constants import TILE_1D, TILE_2D
 from triwarp.kernels import reduce as kernel_reduce
@@ -467,7 +468,7 @@ def median(array: twt.Array1dScalar) -> float:
 
     sorted_values = cast(twt.Array1dScalar, _sorted_copy(cast(twt.Array1dScalar, array)))
     if n % 2 == 1:
-        return float(sorted_values[n // 2 : n // 2 + 1].numpy()[0])
+        return float(read_scalar(sorted_values, n // 2))
     middle = sorted_values[n // 2 - 1 : n // 2 + 1].numpy()
     return (float(middle[0]) + float(middle[1])) / 2.0
 

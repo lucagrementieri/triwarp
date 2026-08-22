@@ -961,12 +961,27 @@ def smooth_region(
     for column, component in enumerate((rhs_x, rhs_y, rhs_z)):
         wps.bsr_mv(mt_matrix, component, atb[column], alpha=1.0, beta=0.0)
     sol = wp.zeros((3, n_free), dtype=wp.float64, device=device)
+    # The normal equations are the worst-conditioned system this package solves -- Jacobi-
+    # preconditioned conjugate gradient takes 6 541 iterations on ``bunny``'s benchmarked free
+    # region -- and the solve is 99 % of the call, so a multigrid hierarchy is worth its setup
+    # there: the *solve* alone measures 2.46x, and 2.55x on the CPU device.
+    #
+    # ``"auto"`` rather than ``"multigrid"`` because *this same function* is also called on hole
+    # patches by ``refine_and_smooth_region``, whose systems are small and well conditioned. Asking
+    # for the hierarchy unconditionally took ``holes.fill_smooth`` to **0.21x** on ``holes_many``:
+    # every patch paid a 15 ms setup to save nothing. Neither a size threshold nor an extrapolation
+    # of the probe's convergence rate separates the two cases -- see
+    # ``linalg.CG_PROBE_ITERATIONS`` for both attempts and their numbers -- so the escalation is
+    # capped instead, which costs the upside and cannot regress. End to end, against forcing Jacobi:
+    # **1.47x** on ``bunny``'s benchmarked region and 2.59x on three quarters of it, 0.98-1.01x on
+    # every system the hierarchy would not have helped, and ``fill_smooth`` unchanged at 0.98x.
     twl.solve_spd_columns(
         system,
         twt.as_array2d(atb, wp.float64),
         twt.as_array2d(sol, wp.float64),
         tol=twl.CG_TOLERANCE,
         maxiter=10 * n_free,
+        preconditioner="auto",
     )
     wp.launch(
         kernel_smoothing.scatter_free_solution,

@@ -71,9 +71,34 @@ off-diagonals and ``-L`` is not the M-matrix that IC(0) existence requires; and 
 [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] and
 [`heat_signed_distance`][triwarp.heat.signed.heat_signed_distance] solve a ``-L`` with a genuine
 constant null space, where IC(0) hits a zero pivot on the last row of every connected component.
-If this is revisited, the direction is smoothed-aggregation multigrid — the only option that breaks
-the ``O(sqrt(n))`` iteration growth — and ``bsr_mm``, ``bsr_transposed`` and ``bsr_mv`` are all
-available to build it.
+**And the multilevel option is now here**, as
+[`multigrid_preconditioner`][triwarp.linalg.multigrid_preconditioner]: smoothed aggregation, the one
+scheme that breaks the ``O(sqrt(n))`` growth rather than paying it down by a constant. On the
+least-squares operator [`smooth_region`][triwarp.smoothing.smooth_region] builds -- the
+worst-conditioned system this package solves, 6 541 Jacobi iterations at 8 987 unknowns, and 99 % of
+a 224 ms call -- the *solve* measures **2.46x on ``bunny``** and 2.55x on the CPU device, at a
+**12.5x** reduction in iterations.
+
+It is not the default, and the reason is the *setup*, not the cycle. Building the hierarchy is one
+aggregation, one power iteration, a ``bsr_transposed`` and three ``bsr_mm`` per level, and at these
+sizes almost every one of those is Warp's fixed per-call cost rather than work: **12-17 ms**, near
+flat in the operator. So the V-cycle wins exactly where the solve it replaces is longer than that,
+and everywhere else it loses by the setup: ``smooth_region_fixed_rim``, whose graph-Laplacian
+Dirichlet system converges in a tenth the iterations, runs **0.48-0.53x**, and ``harmonic`` at
+``k=1`` runs **0.43-1.13x**. Cutting that setup is the lever that would make it unconditional, and
+the term to cut is ``bsr_mm``'s ~0.84 ms per call.
+
+**Nothing cheap predicts which side of that line a system falls on**, which is why the third mode is
+a capped probe and not a heuristic; see
+[`CG_PROBE_ITERATIONS`][triwarp.linalg.CG_PROBE_ITERATIONS] for the two predictors that were built
+and refuted (size, and extrapolating the probe's own convergence rate).
+
+One lead is left open. ``harmonic`` at ``k=2`` is a **2.25x** win on the uniform saddle and a
+**0.23x** loss on the graded one, at identical connectivity -- so anisotropy, not size, is what
+defeats the hierarchy there. The aggregation keeps *every* off-diagonal (``theta = 0``), which on a
+graded patch means aggregating across the weak direction; a strength-of-connection threshold
+``|A_ij| >= theta sqrt(A_ii A_jj)`` is the textbook fix and is the next thing to measure if that row
+matters.
 
 The *target* was sound even though the tool is not: on an RTX 5090
 [`heat_geodesic`][triwarp.heat.distance.heat_geodesic] with cached operators measures 8.1, 12.6 and
@@ -88,14 +113,17 @@ from __future__ import annotations
 import math
 import warnings
 
+import numpy as np
 import warp as wp
 import warp.optim.linear as wpl
 import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import read_scalar
 from triwarp.kernels import linalg as kernel_linalg
 from triwarp.kernels.algorithms import conjugate_gradient as kernel_cg
+from triwarp.kernels.algorithms import multigrid as kernel_mg
 
 # Relative residual tolerance used when a caller does not supply one.
 CG_TOLERANCE = 1e-10
@@ -114,6 +142,25 @@ CG_CHECK_EVERY = 0
 # cannot test the residual on device and would otherwise run every solve to ``maxiter``. Warp's own
 # default, and what this module shipped before the device-side check became the default.
 CG_CHECK_EVERY_FALLBACK = 10
+
+# Jacobi iterations ``preconditioner="auto"`` runs before it escalates to a multigrid hierarchy.
+#
+# It is a *cap*, not a predictor, and that is a measured retreat rather than a first choice. Nothing
+# cheap tells the two cases apart. Size does not: at ~2 000 free unknowns ``smooth_region`` on
+# ``bunny_decimated`` takes 1 784 Jacobi iterations and a V-cycle wins 1.88x, while the same
+# free-set size on an ``icosphere`` takes 521 and loses 0.69x. Extrapolating the probe's own
+# convergence rate does not either -- tried at probe lengths 200, 400 and 600, the estimated
+# remaining count of the *losing* systems (2 993 / 4 307 / 6 481) interleaves with the winning
+# ones' (2 410 / 4 336 / 5 795) at every length, because what decides the ratio is the V-cycle's own
+# iteration count and that is not knowable without building the hierarchy.
+#
+# So the rule is the conservative one: a system that converges inside the cap never pays for a
+# hierarchy and runs at exactly Jacobi's speed. 2 000 sits above every system measured here that a
+# hierarchy would *not* have helped (521, 1 558) and below every one it would (1 784, 6 447, 6 541,
+# 24 092). What that costs is the upside on the systems just past the cap -- the escalated solve
+# warm-starts from the probe's iterate, so those iterations are not wasted, but they are not free
+# either. Lower it only against a re-measurement of the whole table.
+CG_PROBE_ITERATIONS = 2000
 
 
 def min_quad_with_fixed(
@@ -404,6 +451,7 @@ def solve_spd_columns(
     tol: float = CG_TOLERANCE,
     maxiter: int | None = None,
     check_every: int = CG_CHECK_EVERY,
+    preconditioner: str = "diag",
 ) -> tuple[int, float, float]:
     """
     Solve one symmetric positive-definite operator against several right-hand-side columns.
@@ -444,6 +492,15 @@ def solve_spd_columns(
         How many iterations run between residual tests. ``0`` (the default) tests every iteration
         on device; see Notes for the measurements and the warning above for what it does to the
         return type.
+    preconditioner
+        ``"diag"`` (the default) for the Jacobi preconditioner, ``"multigrid"`` for the
+        smoothed-aggregation V-cycle [`multigrid_preconditioner`]
+        [triwarp.linalg.multigrid_preconditioner] builds, or ``"auto"`` to run Jacobi under
+        [`CG_PROBE_ITERATIONS`][triwarp.linalg.CG_PROBE_ITERATIONS] and escalate to the V-cycle only
+        if that has not converged. The V-cycle costs a setup pass and pays for itself only where the
+        solve dominates the call, so ``"auto"`` is the setting for a caller whose systems vary --
+        it cannot regress a solve that was already short, and gives up the upside on one that is
+        only just long enough. See that function's Notes and ``CG_PROBE_ITERATIONS``.
 
     Returns
     -------
@@ -515,6 +572,7 @@ def solve_spd_columns(
         tol=tol,
         maxiter=maxiter,
         check_every=check_every,
+        preconditioner=preconditioner,
         run=True,
         caller="solve_spd_columns",
     )
@@ -534,6 +592,7 @@ def spd_column_solver(
     tol: float = CG_TOLERANCE,
     maxiter: int | None = None,
     check_every: int = CG_CHECK_EVERY,
+    preconditioner: str = "diag",
 ) -> wpl.LinearSolverState:
     """
     Pre-allocated batched conjugate-gradient state, for repeated solves of one operator.
@@ -562,6 +621,12 @@ def spd_column_solver(
         Iterations between residual tests; see
         [`solve_spd_columns`][triwarp.linalg.solve_spd_columns] for the measured tradeoff and for
         what the default ``0`` does to the values each call returns.
+    preconditioner
+        ``"diag"`` or ``"multigrid"``, as in
+        [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]. Built once here and reused by every
+        call against this state, which is the shape the V-cycle's setup cost wants. ``"auto"`` is
+        **not** accepted: its probe decides on the first solve, and a hoisted state exists to be
+        driven many times.
 
     Returns
     -------
@@ -591,6 +656,7 @@ def spd_column_solver(
         tol=tol,
         maxiter=maxiter,
         check_every=check_every,
+        preconditioner=preconditioner,
         run=False,
         caller="spd_column_solver",
     )
@@ -604,6 +670,7 @@ def _cg_columns(
     tol: float,
     maxiter: int | None,
     check_every: int,
+    preconditioner: str,
     run: bool,
     caller: str,
 ):
@@ -617,6 +684,22 @@ def _cg_columns(
     """
     n_columns, n = int(rhs.shape[0]), int(rhs.shape[1])
     iteration_cap = maxiter if maxiter is not None else CG_MAXITER_FACTOR * n
+    if preconditioner == "auto":
+        if not run:
+            raise ValueError(
+                f'{caller} cannot take preconditioner="auto": the probe decides on the *first* '
+                'solve, and a hoisted state is built to be driven many times. Pass "diag" or '
+                '"multigrid".'
+            )
+        return _cg_columns_auto(
+            matrix,
+            rhs,
+            solution,
+            tol=tol,
+            cap=iteration_cap,
+            check_every=check_every,
+            caller=caller,
+        )
     if n_columns > 1:
         # ``_BatchedCg`` exists only for this branch; a single column already reaches
         # ``warp.optim.linear``'s fast reduction, because there is nothing to batch. See that
@@ -628,20 +711,102 @@ def _cg_columns(
             tol=tol,
             maxiter=iteration_cap,
             check_every=_supported_check_every(check_every),
+            preconditioner=preconditioner,
         )
         return state() if run else state
     operator = replicated_operator(matrix, n_columns)
-    preconditioner = replicated_operator(wpl.preconditioner(matrix, "diag"), n_columns)
+    if preconditioner == "multigrid":
+        apply_inverse = multigrid_preconditioner(matrix, n_columns)
+    else:
+        apply_inverse = replicated_operator(wpl.preconditioner(matrix, "diag"), n_columns)
     return wpl.cg(
         operator,
         rhs.flatten(),
         solution.flatten(),
         tol=tol,
         maxiter=iteration_cap,
-        M=preconditioner,
+        M=apply_inverse,
         check_every=_supported_check_every(check_every),
         run=run,
     )
+
+
+def _cg_columns_auto(
+    matrix: wps.BsrMatrix[wp.float64],
+    rhs: twt.Array2dFloat,
+    solution: twt.Array2dFloat,
+    *,
+    tol: float,
+    cap: int,
+    check_every: int,
+    caller: str,
+):
+    """
+    Run Jacobi under ``CG_PROBE_ITERATIONS``, then escalate if it has not converged.
+
+    A system that finishes inside the probe pays nothing at all for the option -- the probe *is* the
+    solve. One that does not is the ill-conditioned kind
+    [`multigrid_preconditioner`][triwarp.linalg.multigrid_preconditioner] is for, and the escalated
+    solve warm-starts from the iterate the probe left in ``solution``, so its iterations carry over;
+    the continuation does restart the Krylov space, which costs a few more.
+
+    See [`CG_PROBE_ITERATIONS`][triwarp.linalg.CG_PROBE_ITERATIONS] for why this is a cap rather
+    than the rate prediction it started out as.
+    """
+    if cap <= CG_PROBE_ITERATIONS:
+        return _cg_columns(
+            matrix,
+            rhs,
+            solution,
+            tol=tol,
+            maxiter=cap,
+            check_every=check_every,
+            preconditioner="diag",
+            run=True,
+            caller=caller,
+        )
+    probe = _cg_columns(
+        matrix,
+        rhs,
+        solution,
+        tol=tol,
+        maxiter=CG_PROBE_ITERATIONS,
+        check_every=check_every,
+        preconditioner="diag",
+        run=True,
+        caller=caller,
+    )
+    residual, tolerance = _cg_residual_and_tolerance(probe)
+    if residual <= tolerance:
+        return probe
+    return _cg_columns(
+        matrix,
+        rhs,
+        solution,
+        tol=tol,
+        maxiter=cap,
+        check_every=check_every,
+        preconditioner="multigrid",
+        run=True,
+        caller=caller,
+    )
+
+
+def _cg_residual_and_tolerance(result: tuple) -> tuple[float, float]:
+    """
+    Unwrap a conjugate-gradient result's worst-column residual norm and tolerance as host floats.
+
+    ``check_every=0`` returns 1-element *device* arrays holding the **squared** residual norm and
+    squared absolute tolerance, one entry per column, and a positive cadence returns their square
+    roots as host scalars already reduced over the columns -- so the unwrapping differs and the
+    quantity does not. Two 8-byte readbacks in the device case, once per solve.
+    """
+    _iterations, residual, tolerance = result
+    if not isinstance(residual, wp.array):
+        return float(residual), float(tolerance)
+    residual_np, tolerance_np = residual.numpy(), tolerance.numpy()
+    worst = int(np.argmax(residual_np / np.maximum(tolerance_np, 1e-300)))
+    return math.sqrt(float(residual_np[worst])), math.sqrt(float(tolerance_np[worst]))
 
 
 class _BatchedCg:
@@ -699,6 +864,7 @@ class _BatchedCg:
         tol: float,
         maxiter: int,
         check_every: int,
+        preconditioner: str = "diag",
     ) -> None:
         device = matrix.device
         self._device = device
@@ -739,6 +905,18 @@ class _BatchedCg:
         # [iterations, loop condition]; the second element is what ``wp.capture_while`` watches.
         self._state = wp.zeros(2, dtype=wp.int32, device=device)
 
+        # A multigrid V-cycle cannot be fused into a register the way the Jacobi apply is, so it
+        # runs as its own launches over the same padded vectors and the x/r update drops its ``z``
+        # write -- one extra launch per iteration, which is the whole cost of un-fusing. The
+        # hierarchy is batched over the columns at *this* solver's pitch, so the cycle's elementwise
+        # passes stay one launch each rather than one per column.
+        self._cycle = None
+        if preconditioner == "multigrid":
+            hierarchy = _multigrid_hierarchy(matrix, 0)
+            if hierarchy is not None:
+                self._cycle = _MultigridCycle(
+                    *hierarchy, n_columns=self._n_columns, stride=self._stride
+                )
         # 1 in the pad, so the fused Jacobi apply there is a no-op on an already-zero residual.
         self._inv_diag = wp.full(self._stride, 1.0, dtype=wp.float64, device=device)
         wp.launch(
@@ -801,23 +979,31 @@ class _BatchedCg:
             )
         # ``carry=True`` performs ``rz_old = rz_new`` here; see ``cg_dot_finalize``.
         self._dot(self._p, self._ap, self._ap, 1, self._p_dot_ap, carry=True)
-        wp.launch(
-            kernel_cg.cg_step_x_r_z,
-            dim=self._dofs,
-            inputs=[
-                wp.int32(self._stride),
-                wp.int32(self._n),
-                self._rz_old,
-                self._p_dot_ap,
-                self._dots,
-                self._atol_sq,
-                self._inv_diag,
-                self._p,
-                self._ap,
-            ],
-            outputs=[self._solution_flat, self._r, self._z],
-            device=self._device,
-        )
+        step = [
+            wp.int32(self._stride),
+            wp.int32(self._n),
+            self._rz_old,
+            self._p_dot_ap,
+            self._dots,
+            self._atol_sq,
+        ]
+        if self._cycle is None:
+            wp.launch(
+                kernel_cg.cg_step_x_r_z,
+                dim=self._dofs,
+                inputs=[*step, self._inv_diag, self._p, self._ap],
+                outputs=[self._solution_flat, self._r, self._z],
+                device=self._device,
+            )
+        else:
+            wp.launch(
+                kernel_cg.cg_step_x_r,
+                dim=self._dofs,
+                inputs=[*step, self._p, self._ap],
+                outputs=[self._solution_flat, self._r],
+                device=self._device,
+            )
+            self._cycle.apply(self._r, self._z)
         self._dot(self._r, self._r, self._z, 2, self._dots)
         wp.launch(
             kernel_cg.cg_step_p,
@@ -853,13 +1039,16 @@ class _BatchedCg:
             wps.bsr_mv(
                 self._matrix, self._solution[column], self._r_blocks[column], alpha=-1.0, beta=1.0
             )
-        wp.launch(
-            kernel_cg.cg_apply_inverse_diagonal,
-            dim=self._dofs,
-            inputs=[wp.int32(self._stride), self._inv_diag, self._r],
-            outputs=[self._z],
-            device=self._device,
-        )
+        if self._cycle is None:
+            wp.launch(
+                kernel_cg.cg_apply_inverse_diagonal,
+                dim=self._dofs,
+                inputs=[wp.int32(self._stride), self._inv_diag, self._r],
+                outputs=[self._z],
+                device=self._device,
+            )
+        else:
+            self._cycle.apply(self._r, self._z)
         self._dot(self._r, self._r, self._z, 2, self._dots)
         wp.copy(self._p, self._z)
         wp.copy(self._rz_old, self._dots[1])
@@ -882,7 +1071,7 @@ class _BatchedCg:
         if check_every > 0:
             self._run_with_host_checks(check_every)
             return (
-                int(self._state.numpy()[0]),
+                int(read_scalar(self._state, 0)),
                 math.sqrt(float(self._dots.numpy()[0].max())),
                 math.sqrt(float(self._atol_sq.numpy().max())),
             )
@@ -980,6 +1169,620 @@ def replicated_operator(
     return wpl.LinearOperator(
         (total, total), base.dtype, base.device, matvec, batch_offsets=offsets
     )
+
+
+def multigrid_preconditioner(
+    matrix: wps.BsrMatrix[wp.float64], n_columns: int = 1, *, seed: int = 0
+) -> wpl.LinearOperator:
+    """
+    Smoothed-aggregation multigrid preconditioner for a symmetric positive-semi-definite operator.
+
+    A single-level preconditioner cannot break conjugate gradient's growth in the mesh size -- see
+    "Why Jacobi" in the [`triwarp.linalg`][triwarp.linalg] module documentation for the four that
+    were measured and rejected -- because cutting the iteration count by ``sqrt(k)`` at ``k``
+    mat-vecs per apply leaves the total work growing. A multigrid V-cycle attacks the low-frequency
+    error the smoother cannot see, so the count stops growing with ``n``: on the least-squares
+    operator [`smooth_region`][triwarp.smoothing.smooth_region] builds, Jacobi-preconditioned
+    conjugate gradient takes 1 753 iterations at 2 043 unknowns and 6 521 at 8 987, and this takes
+    **288 and 554** -- 6.1x and 11.8x fewer, and the *growth* falls from 3.7x to 1.9x over the same
+    4.4x in size.
+
+    The returned operator acts on length-``n_columns * n`` vectors laid out as ``n_columns``
+    contiguous blocks, exactly as [`replicated_operator`][triwarp.linalg.replicated_operator] does,
+    so it drops into ``M=`` beside a Jacobi preconditioner without any other change.
+
+    Parameters
+    ----------
+    matrix
+        ``(n, n)`` symmetric positive-(semi-)definite operator, ``float64``. Zero diagonal entries
+        are allowed: such a row is identically zero for a semi-definite operator, and the whole
+        chain -- smoother, coarse solve and all -- leaves those unknowns at zero.
+    n_columns
+        Number of independent right-hand-side columns the operator will be applied to.
+    seed
+        Seeds the aggregation's randomized priorities and the power iteration's start vector, so a
+        hierarchy is a deterministic function of the operator and this number.
+
+    Returns
+    -------
+    ``warp.optim.linear.LinearOperator``
+        The V-cycle, of shape ``(n_columns * n, n_columns * n)``. A **Jacobi** preconditioner
+        instead when the operator does not coarsen -- see Notes.
+
+    Raises
+    ------
+    ValueError
+        If the returned operator's ``matvec`` is called with ``alpha != 1`` or ``beta != 0``. A
+        preconditioner apply is always ``z = M x``, and the general form would cost a pass that no
+        caller needs.
+
+    Notes
+    -----
+    Setup is not free and it is not amortized over anything: building the hierarchy costs one
+    aggregation, one power iteration, two ``bsr_mm`` and one ``bsr_transposed`` per level. **Ask for
+    this where the solve dominates the call**, and pass the same operator's preconditioner into a
+    loop rather than rebuilding it -- [`solve_spd`][triwarp.linalg.solve_spd]'s ``preconditioner``
+    parameter exists for exactly that.
+
+    Coarsening stops at 128 rows, or earlier if a level fails to shrink; the coarsest operator is
+    then inverted densely on the host, which is exact and is a single launch inside the cycle where
+    an iterative coarse solve would be a data-dependent loop. When coarsening stalls while the level
+    is still too large to factor, there is no usable hierarchy and this hands back
+    ``warp.optim.linear.preconditioner(matrix, "diag")`` rather than a cycle whose coarse solve is a
+    guess -- so a caller never has to branch on the operator's shape.
+
+    See Also
+    --------
+    [`solve_spd`][triwarp.linalg.solve_spd]
+    [`solve_spd_columns`][triwarp.linalg.solve_spd_columns]
+    [`replicated_operator`][triwarp.linalg.replicated_operator]
+    """
+    base = wpl.aslinearoperator(matrix)
+    n = int(matrix.nrow)
+    hierarchy = _multigrid_hierarchy(matrix, seed)
+    if hierarchy is None:
+        return replicated_operator(wpl.preconditioner(matrix, "diag"), n_columns)
+    levels, coarse_inverse = hierarchy
+    cycle = _MultigridCycle(levels, coarse_inverse, n_columns=n_columns, stride=n)
+
+    def matvec(x: wp.array, y: wp.array, z: wp.array, alpha: float, beta: float) -> None:
+        if alpha != 1.0 or beta != 0.0:
+            raise ValueError(
+                "multigrid_preconditioner's operator only implements z = M x "
+                f"(got alpha={alpha}, beta={beta})"
+            )
+        cycle.apply(x, z)
+
+    total = n_columns * n
+    return wpl.LinearOperator((total, total), base.dtype, base.device, matvec)
+
+
+# ---------------------------------------------------------------------------
+# Smoothed-aggregation multigrid preconditioner
+# ---------------------------------------------------------------------------
+
+# Rows below which a level is solved exactly instead of coarsened further. The coarse solve is a
+# dense pseudo-inverse factored on the host, so this is also the size of that factorization.
+_MULTIGRID_MAX_COARSE = 128
+
+# Hard cap on the hierarchy depth, and on the dense coarse solve. Coarsening stops early whenever a
+# level fails to shrink by ``1 - _MULTIGRID_MIN_COARSENING``, which is what happens once a level is
+# mostly isolated rows -- the least-squares operators here carry them (297 of 8 987 on ``bunny``).
+_MULTIGRID_MAX_LEVELS = 12
+_MULTIGRID_MIN_COARSENING = 0.9
+_MULTIGRID_MAX_DENSE = 512
+
+# Damped-Jacobi sweeps per level per half-cycle, and the damping as a multiple of ``1 / rho`` where
+# ``rho`` is the spectral radius of ``D^-1 A``. 4/3 is the classical smoothed-aggregation choice and
+# is used both for the smoother and for the prolongation smoother.
+#
+# Two sweeps, measured on ``smooth_region``'s batched three-column solve at 8 987 unknowns: 1 / 2 /
+# 3 / 4 sweeps take 735 / 524 / 445 / 400 iterations and 104.0 / 90.8 / 90.6 / 93.1 ms, so the curve
+# is flat from 2 to 3 and turns at 4. One is the cheapest cycle and not the cheapest solve.
+_MULTIGRID_SWEEPS = 2
+_MULTIGRID_JACOBI_FACTOR = 4.0 / 3.0
+
+# Power iterations for that spectral radius, and the round cap for the aggregation's independent
+# set. The power iteration is unnormalized -- ``rho`` is recovered from the growth over all the
+# steps -- so it costs one mat-vec and one elementwise pass per step, and two inner products.
+# Eight rather than fifteen: the extra seven steps move the iteration count by under 1 % and cost
+# 1.5-2 ms of setup, which at these sizes is 2 % of the whole solve.
+_MULTIGRID_POWER_STEPS = 8
+_MULTIGRID_MIS_ROUNDS = 32
+
+
+class _MultigridLevel:
+    """One level of the hierarchy: its operator, its smoother, and its link to the next."""
+
+    __slots__ = (
+        "ax",
+        "b",
+        "dim",
+        "inverse_diagonal",
+        "matvec_dim",
+        "n",
+        "omega",
+        "operator",
+        "prolong_dim",
+        "prolongator",
+        "r",
+        "restrict_dim",
+        "restrictor",
+        "stride",
+        "x",
+    )
+
+    def __init__(self, operator: wps.BsrMatrix[wp.float64]) -> None:
+        self.operator = operator
+        self.n = int(operator.nrow)
+        self.prolongator = None
+        self.restrictor = None
+        self.inverse_diagonal = None
+        self.omega = 0.0
+
+
+def _multigrid_hierarchy(
+    matrix: wps.BsrMatrix[wp.float64], seed: int
+) -> tuple[list[_MultigridLevel], wp.array] | None:
+    """
+    Coarsen ``matrix`` until a level is small enough to invert densely.
+
+    ``None`` when no usable hierarchy exists -- the coarsening stalled above the dense cap -- which
+    is the one case [`multigrid_preconditioner`][triwarp.linalg.multigrid_preconditioner] hands back
+    a Jacobi preconditioner instead.
+    """
+    levels: list[_MultigridLevel] = []
+    operator = matrix
+    while True:
+        level = _MultigridLevel(operator)
+        levels.append(level)
+        if level.n <= _MULTIGRID_MAX_COARSE or len(levels) >= _MULTIGRID_MAX_LEVELS:
+            break
+        label, n_aggregates = _multigrid_aggregate(operator, seed)
+        if n_aggregates >= _MULTIGRID_MIN_COARSENING * level.n:
+            break
+        diagonal = wp.empty(level.n, dtype=wp.float64, device=operator.device)
+        wp.launch(
+            kernel_cg.cg_inverse_diagonal,
+            dim=level.n,
+            inputs=[wps.bsr_get_diag(operator)],
+            outputs=[diagonal],
+            device=operator.device,
+        )
+        level.inverse_diagonal = diagonal
+        level.omega = _MULTIGRID_JACOBI_FACTOR / _multigrid_spectral_radius(
+            operator, diagonal, seed
+        )
+        level.prolongator = _multigrid_prolongator(
+            operator, label, n_aggregates, diagonal, level.omega
+        )
+        level.restrictor = wps.bsr_transposed(level.prolongator)
+        operator = _multigrid_prune(
+            wps.bsr_mm(level.restrictor, wps.bsr_mm(operator, level.prolongator))
+        )
+    coarse_inverse = _multigrid_dense_inverse(levels[-1].operator)
+    if coarse_inverse is None:
+        return None
+    return levels, coarse_inverse
+
+
+def _multigrid_aggregate(
+    matrix: wps.BsrMatrix[wp.float64], seed: int
+) -> tuple[wp.array[wp.int32], int]:
+    """
+    Aggregate label per row, from a distance-2 maximal independent set on the off-diagonal graph.
+
+    The selection is the randomized-priority pattern ``sample.dart_select_minima`` runs, lifted to
+    distance 2 by propagating the packed ``(state, priority, index)`` maximum over one-hop
+    neighbours *twice* per round -- so no squared graph is built. Roots then spread their label two
+    hops, which tiles the graph because the MIS keeps them at least three hops apart.
+    """
+    device = matrix.device
+    n = int(matrix.nrow)
+    offsets, columns = matrix.offsets, matrix.columns
+
+    priority = wp.empty(n, dtype=wp.uint32, device=device)
+    wp.launch(kernel_mg.mis_priorities, dim=n, inputs=[wp.int32(seed), priority], device=device)
+    state = wp.full(n, int(kernel_mg.MG_UNDECIDED), dtype=wp.int32, device=device)
+    next_state = wp.empty(n, dtype=wp.int32, device=device)
+    key = wp.empty(n, dtype=wp.int64, device=device)
+    next_key = wp.empty(n, dtype=wp.int64, device=device)
+    undecided = wp.zeros(1, dtype=wp.int32, device=device)
+    for _ in range(_MULTIGRID_MIS_ROUNDS):
+        wp.launch(kernel_mg.mis_seed_keys, dim=n, inputs=[state, priority, key], device=device)
+        for _ in range(2):
+            wp.launch(
+                kernel_mg.mis_propagate,
+                dim=n,
+                inputs=[key, offsets, columns, next_key],
+                device=device,
+            )
+            key, next_key = next_key, key
+        undecided.zero_()
+        wp.launch(
+            kernel_mg.mis_decide,
+            dim=n,
+            inputs=[key, priority, state, next_state, undecided],
+            device=device,
+        )
+        state, next_state = next_state, state
+        # One 4-byte read per round, and there are a handful of rounds: the loop cannot be a
+        # device-side one because the *number of aggregates* sizes every buffer downstream.
+        if int(read_scalar(undecided, 0)) == 0:
+            break
+
+    flags = wp.empty(n, dtype=wp.int32, device=device)
+    wp.launch(kernel_mg.mis_root_flags, dim=n, inputs=[state, flags], device=device)
+    scan_pos = wp.empty(n, dtype=wp.int32, device=device)
+    wp.utils.array_scan(flags, scan_pos, inclusive=True)
+    n_aggregates = int(read_scalar(scan_pos))
+
+    label = wp.empty(n, dtype=wp.int32, device=device)
+    next_label = wp.empty(n, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_mg.seed_aggregate_labels, dim=n, inputs=[state, scan_pos, label], device=device
+    )
+    for _ in range(2):
+        wp.launch(
+            kernel_mg.spread_aggregate_labels,
+            dim=n,
+            inputs=[label, offsets, columns, next_label],
+            device=device,
+        )
+        label, next_label = next_label, label
+    return label, n_aggregates
+
+
+def _multigrid_spectral_radius(
+    matrix: wps.BsrMatrix[wp.float64], inverse_diagonal: wp.array[wp.float64], seed: int
+) -> float:
+    """
+    Spectral radius of ``D^-1 A`` by unnormalized power iteration, for the damping factor.
+
+    Normalizing every step would cost a host readback per step; leaving the iterate to grow and
+    taking the geometric mean of the growth over all the steps costs **one**, because the start
+    vector is a sign vector whose squared norm is exactly ``n``. ``rho`` is around 3 here, so eight
+    steps grow the vector by about ``3 ** 8`` and ``float64`` has room to spare. The estimate
+    approaches ``rho`` from below, which is the safe side: it makes the damping *smaller* than the
+    stability limit rather than larger.
+
+    Everything about the arithmetic here is chosen against the launch count, because the hierarchy
+    build is launch-bound and this used to be a fifth of it. A step is one fused ``power_step``
+    launch rather than a ``bsr_mv`` plus an elementwise scale -- an uncaptured ``bsr_mv`` costs
+    ~0.1 ms whatever its nnz -- and the two buffers are ping-ponged rather than updated in place,
+    which is what allows the single kernel. Measured over two levels of ``bunny``'s hierarchy:
+    **2.57 ms with ``bsr_mv`` and two inner products, 0.91 ms fused, 0.76 ms once the start vector
+    made its own norm free.** What is left is mostly the single remaining host sync.
+    """
+    device = matrix.device
+    n = int(matrix.nrow)
+    x = wp.empty(n, dtype=wp.float64, device=device)
+    y = wp.empty(n, dtype=wp.float64, device=device)
+    wp.launch(kernel_mg.random_signs, dim=n, inputs=[wp.int32(seed), x], device=device)
+    # Exact, not measured: every entry of a sign vector is +-1.
+    start = float(n)
+    for _ in range(_MULTIGRID_POWER_STEPS):
+        wp.launch(
+            kernel_mg.power_step,
+            dim=n,
+            inputs=[inverse_diagonal, matrix.offsets, matrix.columns, matrix.values, x, y],
+            device=device,
+        )
+        x, y = y, x
+    # The one readback, and the whole point of the loop: how much the iterate grew over ``K`` steps
+    # of ``D^-1 A`` is ``rho ** K`` to the accuracy this needs.
+    end = float(wp.utils.array_inner(x, x))
+    if not (start > 0.0 and end > 0.0 and math.isfinite(end)):
+        return 1.0
+    return math.sqrt(end / start) ** (1.0 / _MULTIGRID_POWER_STEPS)
+
+
+def _multigrid_prolongator(
+    matrix: wps.BsrMatrix[wp.float64],
+    label: wp.array[wp.int32],
+    n_aggregates: int,
+    inverse_diagonal: wp.array[wp.float64],
+    omega: float,
+) -> wps.BsrMatrix[wp.float64]:
+    """Smoothed prolongator ``(I - omega D^-1 A) P0`` for the piecewise-constant ``P0``."""
+    device = matrix.device
+    n = int(matrix.nrow)
+    sizes = wp.zeros(n_aggregates, dtype=wp.int32, device=device)
+    wp.launch(kernel_mg.aggregate_sizes, dim=n, inputs=[label, sizes], device=device)
+    rows = wp.empty(n, dtype=wp.int32, device=device)
+    columns = wp.empty(n, dtype=wp.int32, device=device)
+    values = wp.empty(n, dtype=wp.float64, device=device)
+    wp.launch(
+        kernel_mg.tentative_prolongator_triplets,
+        dim=n,
+        inputs=[label, sizes, rows, columns, values],
+        device=device,
+    )
+    # Exactly one triplet per row and no duplicates, so this build's ``nnz`` is exact.
+    tentative = wps.bsr_from_triplets(
+        n, n_aggregates, rows, columns, values, prune_numerical_zeros=False
+    )
+    smoothed = wps.bsr_mm(matrix, tentative)
+    # Row-scale by ``-omega D^-1`` in place: one pass over the product's values, where a ``bsr_mm``
+    # against a diagonal matrix would be a second sparse product.
+    wp.launch(
+        kernel_mg.scale_rows,
+        dim=n,
+        inputs=[smoothed.offsets, inverse_diagonal, wp.float64(-omega), smoothed.values],
+        device=device,
+    )
+    return _multigrid_prune(wps.bsr_axpy(smoothed, tentative, alpha=1.0, beta=1.0))
+
+
+def _multigrid_prune(matrix: wps.BsrMatrix[wp.float64]) -> wps.BsrMatrix[wp.float64]:
+    """
+    Drop a matrix's explicitly-zero entries, by rebuilding it from its own CSR.
+
+    ``bsr_mm`` returns a structural **superset** of the product -- measured 9 590 entries for one
+    whose true pattern is 5 578, the extra ones exactly zero -- and here those zeros are not
+    cosmetic. An explicit zero at ``(i, c)`` makes coarse column ``c`` see fine row ``i``, so the
+    Galerkin product inherits every aggregate reachable from it: **191 181 entries for the 587-row
+    coarse operator against a true 4 084**, a 47x pattern blowup out of a 1.7x one. Pruning is part
+    of the algorithm, not tidying, and it is what holds operator complexity at 1.02.
+
+    The extra entries are **interspersed in column order, not trailing capacity**, which is worth
+    pinning because the two have different causes and only one is a filed bug. Measured over the 639
+    rows that carry a zero: **0** of them have their zeros only at the row's end, the columns stay
+    strictly increasing within every row, and the padding is a variable per-row gap fill (mean 1.96
+    extra entries, max 22). So the product's *pattern* is wider than the true one rather than
+    its *count* over-reporting reserved space.
+
+    It has to be a rebuild rather than ``bsr_compress``, which is the API for exactly this and
+    **hard-faults**: compressing a ``bsr_mm`` result makes the *next* ``bsr_mm`` die with
+    ``CUDA error 700: an illegal memory access`` inside ``wp_free_device_async`` on Warp 1.16.0,
+    which is the signature ``reference/warp_api/sparse.md`` already records as NVIDIA/warp#1769.
+
+    !!! note "Re-probe both halves on the Warp 1.17 upgrade"
+        NVIDIA/warp#1769 (*CUDA ``bsr_compress(inplace=True)`` treats trailing capacity as active*)
+        is **closed upstream with milestone 1.17.0**, unreleased as of Warp 1.16.0. Two separate
+        things to check when it lands, because the fix addresses one of them at most:
+
+        - **The fault.** If ``bsr_compress`` survives a following ``bsr_mm``, this function may
+          collapse to one call. Note the issue is filed against ``inplace=True`` while the crash
+          here came from the *default* ``inplace=False``, so confirm the exact call before trusting
+          it -- and measure, because a rebuild is only 0.46 ms and ``bsr_compress`` was never timed
+          cleanly (it faulted downstream of every attempt).
+        - **The superset**, which is what makes a prune necessary at all and is a *different*
+          behaviour -- see the paragraph above. Nothing in that issue describes it.
+
+        The ceiling on the first is small: ``_multigrid_prune`` is **1.78 ms of the hierarchy's
+        15.42 ms** on ``bunny``. The setup's dominant terms are six ``bsr_mm`` calls (4.92 ms) and
+        the aggregation's launches (3.53), and 1.17 touches neither.
+    """
+    device = matrix.device
+    n_rows = int(matrix.nrow)
+    nnz = int(matrix.nnz_sync())
+    if nnz == 0:
+        return matrix
+    rows = wp.empty(nnz, dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_mg.expand_row_indices, dim=n_rows, inputs=[matrix.offsets, rows], device=device
+    )
+    return wps.bsr_from_triplets(
+        n_rows,
+        int(matrix.ncol),
+        rows,
+        matrix.columns[:nnz],
+        matrix.values[:nnz],
+        prune_numerical_zeros=True,
+    )
+
+
+def _multigrid_dense_inverse(matrix: wps.BsrMatrix[wp.float64]) -> wp.array | None:
+    """
+    Pseudo-inverse of the coarsest operator as a dense ``(n, n)`` device array, or ``None``.
+
+    ``None`` when the level is too large to factor, which is what makes the caller fall back to the
+    Jacobi preconditioner rather than ship a cycle whose coarse solve is a guess. Rows whose
+    diagonal is zero are dropped before the factorization and left as zero in the result: a positive
+    semi-definite operator with ``A_ii == 0`` has an identically zero row and column, so those
+    unknowns are already solved, and skipping them is what keeps the factorization small when
+    coarsening stalls on isolated rows.
+    """
+    n = int(matrix.nrow)
+    nnz = int(matrix.nnz_sync())
+    offsets = matrix.offsets.numpy()[: n + 1]
+    columns = matrix.columns.numpy()[:nnz]
+    values = matrix.values.numpy()[:nnz].astype(np.float64).reshape(nnz)
+    dense = np.zeros((n, n), dtype=np.float64)
+    # A triplet build coalesces duplicates, so the CSR has one entry per position and a plain
+    # scatter is exact -- ``np.add.at`` would be the same answer several times slower.
+    dense[np.repeat(np.arange(n), np.diff(offsets)), columns] = values
+    active = np.flatnonzero(dense.diagonal() != 0.0)
+    if active.size > _MULTIGRID_MAX_DENSE:
+        return None
+    inverse = np.zeros((n, n), dtype=np.float64)
+    if active.size:
+        # ``hermitian=True`` factors through ``eigh`` rather than a general SVD, which the operator
+        # being symmetric makes exact and which is where most of this function's time was: measured
+        # 14.8 -> 4.9 ms on a 587-row level.
+        block = np.linalg.pinv(dense[np.ix_(active, active)], rcond=1e-12, hermitian=True)
+        inverse[np.ix_(active, active)] = block
+    return wp.array(inverse, dtype=wp.float64, device=matrix.device)
+
+
+class _MultigridCycle:
+    """
+    One V-cycle of a smoothed-aggregation hierarchy, over ``n_columns`` blocks of a flat vector.
+
+    Batched over the columns: *every* pass, the sparse mat-vecs included, is one launch over the
+    whole flat vector. That is not a tidiness choice -- a cycle at these sizes is launch-bound, and
+    ``warp.sparse.bsr_mv`` takes one vector, so routing three right-hand sides through it costs
+    three launches per mat-vec. Measured on ``smooth_region``'s operator with three columns, both
+    captured: **34 launches and 189 us per cycle through ``bsr_mv``, 15 and 85 through
+    ``kernels/algorithms/multigrid.csr_matvec``**, same answer.
+
+    The vectors of the *top* level are the caller's own, at the caller's column pitch, so the cycle
+    adds no copy at its boundary; every level below allocates its own at pitch ``n``. Every buffer
+    is built here and the top level's is bound by ``apply``, so ``apply`` issues launches and
+    nothing else -- which is what lets the whole preconditioned iteration be captured as one graph.
+    """
+
+    def __init__(
+        self,
+        levels: list[_MultigridLevel],
+        coarse_inverse: wp.array[wp.float64],
+        *,
+        n_columns: int,
+        stride: int,
+        sweeps: int = _MULTIGRID_SWEEPS,
+    ) -> None:
+        self._levels = levels
+        self._coarse_inverse = coarse_inverse
+        self._device = levels[0].operator.device
+        self._n_columns = n_columns
+        self._sweeps = max(1, int(sweeps))
+
+        for depth, level in enumerate(levels):
+            top = depth == 0
+            level.stride = stride if top else level.n
+            level.dim = n_columns * level.stride
+            level.matvec_dim = n_columns * level.n
+            level.ax = wp.zeros(level.dim, dtype=wp.float64, device=self._device)
+            level.r = wp.zeros(level.dim, dtype=wp.float64, device=self._device)
+            if top:
+                continue
+            level.b = wp.zeros(level.dim, dtype=wp.float64, device=self._device)
+            level.x = wp.zeros(level.dim, dtype=wp.float64, device=self._device)
+        for depth, level in enumerate(levels[:-1]):
+            child = levels[depth + 1]
+            level.restrict_dim = n_columns * child.n
+            level.prolong_dim = n_columns * level.n
+
+    @property
+    def grid(self) -> list[int]:
+        """Rows per level, coarsest last -- the hierarchy's shape."""
+        return [level.n for level in self._levels]
+
+    def apply(self, source: wp.array[wp.float64], destination: wp.array[wp.float64]) -> None:
+        """One V-cycle: ``destination = M^-1 source``, both at the caller's column pitch."""
+        top = self._levels[0]
+        top.b, top.x = source, destination
+        self._cycle(0)
+
+    def _matvec(
+        self,
+        matrix: wps.BsrMatrix[wp.float64],
+        dim: int,
+        n_rows: int,
+        x_stride: int,
+        y_stride: int,
+        x: wp.array[wp.float64],
+        y: wp.array[wp.float64],
+        accumulate: bool = False,
+    ) -> None:
+        wp.launch(
+            kernel_mg.csr_matvec,
+            dim=dim,
+            inputs=[
+                wp.int32(n_rows),
+                wp.int32(x_stride),
+                wp.int32(y_stride),
+                wp.int32(1 if accumulate else 0),
+                matrix.offsets,
+                matrix.columns,
+                matrix.values,
+                x,
+                y,
+            ],
+            device=self._device,
+        )
+
+    def _smooth(self, level: _MultigridLevel, sweeps: int) -> None:
+        for _ in range(sweeps):
+            self._matvec(
+                level.operator,
+                level.matvec_dim,
+                level.n,
+                level.stride,
+                level.stride,
+                level.x,
+                level.ax,
+            )
+            wp.launch(
+                kernel_mg.jacobi_sweep,
+                dim=level.dim,
+                inputs=[
+                    wp.int32(level.n),
+                    wp.int32(level.stride),
+                    level.inverse_diagonal,
+                    wp.float64(level.omega),
+                    level.b,
+                    level.ax,
+                    level.x,
+                ],
+                device=self._device,
+            )
+
+    def _cycle(self, depth: int) -> None:
+        level = self._levels[depth]
+        if level.prolongator is None:
+            wp.launch(
+                kernel_mg.dense_solve,
+                dim=level.dim,
+                inputs=[
+                    wp.int32(level.n),
+                    wp.int32(level.stride),
+                    self._coarse_inverse,
+                    level.b,
+                    level.x,
+                ],
+                device=self._device,
+            )
+            return
+        # The first sweep from a zero initial guess is a *write*, so nothing has to be zeroed and
+        # that sweep costs no mat-vec.
+        wp.launch(
+            kernel_mg.scaled_diagonal_apply,
+            dim=level.dim,
+            inputs=[
+                wp.int32(level.n),
+                wp.int32(level.stride),
+                level.inverse_diagonal,
+                wp.float64(level.omega),
+                level.b,
+                level.x,
+            ],
+            device=self._device,
+        )
+        self._smooth(level, self._sweeps - 1)
+        self._matvec(
+            level.operator, level.matvec_dim, level.n, level.stride, level.stride, level.x, level.ax
+        )
+        wp.launch(
+            kernel_mg.residual,
+            dim=level.dim,
+            inputs=[wp.int32(level.n), wp.int32(level.stride), level.b, level.ax, level.r],
+            device=self._device,
+        )
+        child = self._levels[depth + 1]
+        self._matvec(
+            level.restrictor,
+            level.restrict_dim,
+            child.n,
+            level.stride,
+            child.stride,
+            level.r,
+            child.b,
+        )
+        self._cycle(depth + 1)
+        # Prolong and correct in one launch: ``accumulate`` adds into the fine iterate.
+        self._matvec(
+            level.prolongator,
+            level.prolong_dim,
+            level.n,
+            child.stride,
+            level.stride,
+            child.x,
+            level.x,
+            accumulate=True,
+        )
+        self._smooth(level, self._sweeps)
 
 
 def _warn_if_not_converged(result: tuple[int, float, float], iteration_cap: int, name: str) -> None:

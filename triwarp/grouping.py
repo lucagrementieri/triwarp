@@ -9,7 +9,8 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
-from triwarp.array import arange, bitcast_from_int, bitcast_to_int, gather, sort_pair_indices
+from triwarp._device import read_scalar
+from triwarp.array import bitcast_from_int, bitcast_to_int, gather, sort_pair_indices
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import grouping as kernel_grouping
 
@@ -203,9 +204,12 @@ def unique_1d(
     log2_capacity = max(3, math.ceil(math.log2(n) + 1))
     mask = wp.int32((1 << log2_capacity) - 1)
 
-    return _unique_hash(
-        data, bitcast_to_int(data, n), data.dtype, n, mask, return_inverse, return_counts
-    )
+    # ``_unique_hash`` only ever *reads* the integer key array, so when the input already is one of
+    # the two key dtypes the bit reinterpretation is the identity and the buffer can be shared --
+    # skipping a full-length copy and its allocation, measured 17.9 us of a 313 us
+    # ``unique_1d(100k)``. Every other dtype still needs the real conversion.
+    data_int = data if data.dtype in (wp.int32, wp.int64) else bitcast_to_int(data, n)
+    return _unique_hash(data, data_int, data.dtype, n, mask, return_inverse, return_counts)
 
 
 @overload
@@ -702,34 +706,36 @@ def _unique_hash(
     key_dtype = data_int.dtype
     device = data_int.device
 
-    # Phase 1: parallel insert into open-addressing hash table (slot_key 0 = empty).
+    # Phase 1: parallel insert into open-addressing hash table (slot_key 0 = empty). ``occupied``
+    # is stamped by the insert itself rather than derived from ``slot_counts`` in a second pass --
+    # see the comment on ``hash_insert`` -- so it is zero-filled rather than ``wp.empty``.
     slot_key = wp.zeros(cap, dtype=key_dtype, device=device)
     slot_counts = wp.zeros(cap, dtype=wp.int32, device=device)
+    occupied = wp.zeros(cap, dtype=wp.int32, device=device)
     wp.launch(
         kernel_grouping.hash_insert,
         dim=n,
-        inputs=[data_int, slot_key, slot_counts, mask],
+        inputs=[data_int, slot_key, slot_counts, mask, occupied],
         device=device,
     )
 
-    # Phase 2: mark occupied slots, prefix-scan to get compact positions.
-    occ_mask = wp.empty(cap, dtype=wp.int32, device=device)
-    wp.map(kernel_grouping.mark_occupied, slot_counts, out=occ_mask)
+    # Phase 2: prefix-scan the occupancy to get compact positions.
     scan_pos = wp.empty(cap, dtype=wp.int32, device=device)
-    wp.utils.array_scan(occ_mask, scan_pos, inclusive=True)
-    wp.map(wp.sub, scan_pos, wp.int32(1), out=scan_pos)
-    # ``scan_pos`` is an inclusive scan minus one, so its last element *is* ``n_unique - 1``: one
-    # 4-byte tail read sizes the output, where ``reduce.max`` would scan all ``cap`` (~2n) slots.
-    # The same idiom as ``array.flatnonzero`` and ``array.counts_to_offsets``.
-    n_unique = int(scan_pos[cap - 1 :].numpy()[0]) + 1
+    wp.utils.array_scan(occupied, scan_pos, inclusive=True)
+    # An inclusive scan of 0/1 flags ends at the number set, so one 4-byte tail read sizes the
+    # output where ``reduce.max`` would scan all ``cap`` (~2n) slots. The same idiom as
+    # ``array.flatnonzero`` and ``array.counts_to_offsets``.
+    n_unique = int(read_scalar(scan_pos))
 
-    # Phase 3: compact unique keys and their occurrence counts.
+    # Phase 3: compact unique keys, their occurrence counts, and the identity permutation the sort
+    # below pairs with them -- all three in one pass over the table.
     keys_compact = wp.empty(n_unique, dtype=key_dtype, device=device)
     cnts_compact = wp.empty(n_unique, dtype=wp.int32, device=device)
+    perm_buf = wp.empty(2 * n_unique, dtype=wp.int32, device=device)
     wp.launch(
         kernel_grouping.compact_from_table,
         dim=cap,
-        inputs=[slot_key, slot_counts, occ_mask, scan_pos, keys_compact, cnts_compact],
+        inputs=[slot_key, slot_counts, occupied, scan_pos, keys_compact, cnts_compact, perm_buf],
         device=device,
     )
 
@@ -737,7 +743,6 @@ def _unique_hash(
     # the way the caller's dtype does rather than by their reinterpreted bit pattern.
     sort_dtype = twt.sortable_dtype(original_dtype)
     keys_buf = bitcast_from_int(keys_compact, sort_dtype, count=2 * n_unique)
-    perm_buf = arange(2 * n_unique, device)
     wp.utils.radix_sort_pairs(keys_buf, perm_buf, count=n_unique)
 
     if sort_dtype == original_dtype:

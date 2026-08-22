@@ -12,6 +12,7 @@ import numpy as np
 import open3d as o3d
 import pymeshlab as ml
 import pytest
+import pyvista as pv
 import trimesh as tm
 import trimesh.proximity as tm_proximity
 import warp as wp
@@ -180,6 +181,56 @@ def test_closest_point_on_mesh_matches_meshlib(
     )
     assert (faces_wp.numpy() == faces_ml).any()  # non-vacuity: the indices do line up in general
     assert shared_np.size == 0 or shared_np.min() >= 1
+
+
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+@pytest.mark.parity("closest_point_on_mesh", "pyvista")
+def test_closest_point_on_mesh_matches_pyvista(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Class A on the distance and the point; the cell index is **not** comparable.
+
+    ``find_closest_cell(..., return_closest_point=True)`` walks a ``vtkStaticCellLocator`` and is
+    exact in float64 -- against ``igl.point_mesh_squared_distance`` on these same queries it agrees
+    to **4.4e-16** (icosahedron) and **8.9e-16** (hemisphere) on both the distance and the point --
+    so it is the most accurate closest-point reference in this module. Against triwarp: distances to
+    1.8e-07 / 2.7e-07 and points to 1.6e-07 / 9.0e-07, the ``float32`` floor. The point residual is
+    fixture-dependent and reaches **2.2e-04** on a subdivided icosphere with queries drawn from a
+    wider box, which is Warp's own ``mesh_query_point_no_sign`` limit and the same magnitude the
+    MeshLib and Open3D pairings record -- so a comparison on another fixture must not tighten this
+    tolerance without re-measuring.
+
+    **The cell index is a tie and cannot be asserted, unlike the MeshLib pairing's "any
+    disagreement is a tie" form.** igl and pyvista agree on the geometry to 1e-16 and still disagree
+    on the cell for 37% / 42% of these queries, and on ``icosphere(3)`` every disagreeing query's
+    closest point has a minimum barycentric coordinate of ~1e-16: it lies exactly on a shared edge.
+    That is structural rather than a fixture accident -- for a query far outside a convex mesh the
+    nearest point is a *vertex*, since the vertex normal fans exhaust the sphere of directions
+    (their angular defects sum to 4 pi) -- so the tie fraction grows with the query radius. This
+    test therefore asserts the distance and the point, and leaves the index to the MeshLib pair,
+    whose ``findProjection`` reports the face on triwarp's own soup numbering.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    rng = np.random.default_rng(42)
+    points_np = rng.random((200, 3), dtype=np.float64) * 4.0 - 2.0
+    points_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec3, device=mesh_wp.device
+    )
+
+    _cells_pv, closest_pv = trimesh_to_pyvista(mesh_tm).find_closest_cell(
+        points_np, return_closest_point=True
+    )
+    closest_pv = np.asarray(closest_pv)
+    distances_pv = np.linalg.norm(points_np - closest_pv, axis=1)
+
+    closest_wp, distances_wp, _faces_wp = tw.proximity.closest_point_on_mesh(
+        mesh_wp.points, mesh_wp.indices, points_wp
+    )
+
+    assert distances_pv.min() > 0.0  # non-vacuity: no query sits on the surface
+    assert np.allclose(distances_wp.numpy(), distances_pv, rtol=1e-5, atol=1e-5)
+    assert np.allclose(closest_wp.numpy(), closest_pv, rtol=1e-5, atol=1e-5)
 
 
 def test_closest_point_on_mesh_ambiguous_edge(device: str) -> None:
@@ -968,6 +1019,48 @@ def test_containing_faces_2d_matches_scipy(device: str) -> None:
     assert (faces_sp >= 0).sum() > 20_000, "the reference places most queries inside"
     assert (faces_sp < 0).sum() > 5_000, "and a substantial minority outside"
     assert np.array_equal(faces_wp_np, faces_sp)
+
+
+@pytest.mark.parity("containing_faces_2d", "pyvista")
+def test_containing_faces_2d_matches_pyvista(device: str) -> None:
+    """
+    Class A: ``find_containing_cell`` returns the same triangle index, ``-1`` outside included.
+
+    The transform is only the embedding -- VTK locates in 3-D, so the lattice and the queries get a
+    zero ``z`` -- and the numbering is shared because both sides are handed scipy's own
+    ``simplices``. Measured **1.0000** agreement over 10 000 queries on the lattice, with the
+    batched call and a per-point loop giving byte-identical answers and no false ``-1``.
+
+    Worth stating explicitly because the neighbouring reference is the opposite: section 6 records
+    ``igl.in_element`` as *unusable* for this question -- it never reports element 0 for a query
+    inside it, returns different answers for the same query depending on the batch size, and aborts
+    with ``malloc(): invalid size`` on a 200-point Delaunay. VTK's locator has none of those
+    defects, so a reader generalizing from libigl would skip a reference that works.
+    """
+    points_np = _triangular_lattice_np()
+    triangulation_sp = Delaunay(points_np)
+    faces_np = np.ascontiguousarray(triangulation_sp.simplices, dtype=np.int32)
+    rng = np.random.default_rng(11)
+    queries_np = rng.random((10_000, 2)) * np.array([34.0, 26.0]) - 2.0
+
+    vertices_wp = wp.array(
+        np.ascontiguousarray(points_np, dtype=np.float32), dtype=wp.vec2, device=device
+    )
+    faces_wp = wp.array(faces_np.ravel(), dtype=wp.int32, device=device)
+    queries_wp = wp.array(
+        np.ascontiguousarray(queries_np, dtype=np.float32), dtype=wp.vec2, device=device
+    )
+    located_wp = tw.proximity.containing_faces_2d(vertices_wp, faces_wp, queries_wp).numpy()
+
+    mesh_pv = pv.PolyData.from_regular_faces(
+        np.column_stack([points_np, np.zeros(points_np.shape[0])]), faces_np
+    )
+    queries_3d_np = np.column_stack([queries_np, np.zeros(queries_np.shape[0])])
+    located_pv = np.asarray(mesh_pv.find_containing_cell(queries_3d_np))
+
+    assert (located_pv >= 0).sum() > 5_000, "the reference places most queries inside"
+    assert (located_pv < 0).sum() > 1_000, "and a substantial minority outside"
+    assert np.array_equal(located_wp, located_pv)
 
 
 def test_containing_faces_2d_locates_every_triangle_from_its_centroid(device: str) -> None:

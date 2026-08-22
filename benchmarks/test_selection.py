@@ -56,6 +56,7 @@ from __future__ import annotations
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pyvista as pv
 import trimesh as tm
 import warp as wp
 from conftest import BenchCase
@@ -299,7 +300,7 @@ def _seed_face_region(bench_case: BenchCase) -> np.ndarray:
 
 @pytest.mark.benchmark(group="region_boundary_edges")
 @pytest.mark.benchmeshes("sphere_med")
-@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.benchlibs("triwarp", "meshlib", "pyvista")
 def test_region_boundary_edges(bench_case: BenchCase) -> None:
     """
     The interior seam around a face region: one edge pass, independent of the region's size.
@@ -309,8 +310,31 @@ def test_region_boundary_edges(bench_case: BenchCase) -> None:
     tests/test_selection.py::test_region_boundary_edges. Its answer is an ``UndirectedEdgeBitSet``
     rather than an ``(k, 2)`` array, so this row times the seam pass on both sides but not the
     decoding, which is test-side. Pure, so the mesh is built once outside the timed callable.
+
+    pyvista has no seam filter and reaches the same edges by **construction**: extract the region as
+    a sub-surface, then take that surface's boundary edges. So its row is doing strictly more -- a
+    cell extraction and a surface pass before the edge walk, 6.8 ms here -- and its answer is a
+    superset, since a region touching the mesh's own rim contributes those edges too. The transform
+    is subtracting them, and at that it is exact (``tests/test_selection.py``).
     """
     region_np = _seed_face_region(bench_case)
+    if bench_case.kind == "pyvista":
+        mesh_pv = bench_case.mesh_pv
+        region_pv = np.flatnonzero(region_np)
+
+        def region_edges_pv() -> pv.PolyData:
+            surface_pv = mesh_pv.extract_cells(region_pv).extract_surface(
+                algorithm="dataset_surface"
+            )
+            return surface_pv.extract_feature_edges(
+                boundary_edges=True,
+                feature_edges=False,
+                non_manifold_edges=False,
+                manifold_edges=False,
+            )
+
+        assert bench_case.run(region_edges_pv).n_cells > 0
+        return
     if bench_case.kind == "meshlib":
         mesh_ml = bench_case.new_mesh_ml()
         region_ml = mn.faceBitSetFromBools(region_np)

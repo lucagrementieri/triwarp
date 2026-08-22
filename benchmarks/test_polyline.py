@@ -88,6 +88,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import pyvista as pv
 import trimesh as tm
 import warp as wp
 from conftest import BenchCase, BenchLibrary, skip_larger_than
@@ -229,9 +230,31 @@ def _polyline_ml(bench_case: BenchCase) -> mm.Polyline3:
     return _polyline_ml_cache[key]
 
 
+_polyline_pv_cache: dict[str, pv.PolyData] = {}
+
+
+def _polyline_pv(bench_case: BenchCase) -> pv.PolyData:
+    """
+    Build the benchmark's polyline as a ``PolyData`` holding **one** line cell, cached.
+
+    The single cell is not a detail: ``pv.lines_from_points`` gives one two-point cell per segment
+    and every polyline filter then restarts at each of them -- ``compute_arc_length`` reports 0.0638
+    for a 200-point helix whose length is 12.7049, so a row built that way would time the right
+    filter on the wrong input. Cached like the MeshLib ``Polyline3`` beside it, and for the same
+    second reason: ``find_closest_cell`` builds a cell locator lazily on first use, which the row
+    below pre-warms rather than times.
+    """
+    if bench_case.mesh_name not in _polyline_pv_cache:
+        points_np = _polyline_np(bench_case)
+        _polyline_pv_cache[bench_case.mesh_name] = pv.PolyData(
+            points_np, lines=np.hstack([[points_np.shape[0]], np.arange(points_np.shape[0])])
+        )
+    return _polyline_pv_cache[bench_case.mesh_name]
+
+
 @pytest.mark.benchmark(group="polyline_length")
 @pytest.mark.benchaxis("polyline")
-@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.benchlibs("triwarp", "meshlib", "pyvista")
 def test_polyline_length(bench_case: BenchCase) -> None:
     """
     Summed segment length: the cheapest whole-polyline reduction, launch-latency bound.
@@ -240,7 +263,17 @@ def test_polyline_length(bench_case: BenchCase) -> None:
     (``tests/test_polyline.py``), so this pair is a pure host-against-device reading of the same
     arithmetic -- and on a reduction this cheap triwarp's row is its launch latency, which is what
     makes the comparison worth having. The contour is the input and is cached.
+
+    pyvista's ``compute_arc_length`` **does more**: it writes the *cumulative* length at every
+    point and the total is its last entry, where both other rows return the scalar directly. So read
+    its row as a per-point pass rather than as a reduction -- and it is still cheap, 0.21 / 0.21 /
+    0.88 ms across the axis, because VTK walks one line cell.
     """
+    if bench_case.kind == "pyvista":
+        line_pv = _polyline_pv(bench_case)
+        arc_pv = bench_case.run(line_pv.compute_arc_length)
+        assert float(np.asarray(arc_pv["arc_length"]).max()) > 0.0
+        return
     if bench_case.kind == "meshlib":
         contour_ml = _contour_ml(bench_case)
         assert bench_case.run(lambda: mm.calcLength(contour_ml)) > 0.0
@@ -306,7 +339,7 @@ def test_simplify_polyline(bench_case: BenchCase, tolerance_fraction: float) -> 
 
 @pytest.mark.benchmark(group="distance_to_polyline")
 @pytest.mark.benchaxis("polyline")
-@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.benchlibs("triwarp", "meshlib", "pyvista")
 @pytest.mark.parametrize("n_queries", _N_QUERIES)
 def test_distance_to_polyline(bench_case: BenchCase, n_queries: int) -> None:
     """
@@ -317,7 +350,29 @@ def test_distance_to_polyline(bench_case: BenchCase, n_queries: int) -> None:
     product -- read the gap across the ``polyline`` axis rather than at one point. It has no
     batched form, so the row loops in Python and prices that loop along with the queries; the tree
     is built lazily and is pre-warmed outside the timed callable.
+
+    pyvista's ``find_closest_cell`` is the same query through a ``vtkStaticCellLocator`` and,
+    unlike MeshLib's, it is **batched** -- so its row is the honest tree-walk comparison and the
+    MeshLib one is a Python loop next to it. It reports the closest *point*, not the distance, so
+    the row's output is one array wider than what it is timed against; the distance is a host
+    subtraction and is left out deliberately.
+
+    **rim_long is skipped for pyvista**, measured: its locator degrades on a 65 536-segment single
+    cell to 4 963.9 ms at 4 096 queries and **104 125 ms** at 65 536, against 24.8 / 382.7 ms on the
+    268-segment loop. That is the shape of the axis this group exists to show, and one row of it
+    would cost more than the rest of the module put together.
     """
+    if bench_case.kind == "pyvista":
+        if bench_case.mesh_name == "rim_long":
+            pytest.skip("VTK's line locator is 104 s at this loop length; capped at saddle")
+        line_pv = _polyline_pv(bench_case)
+        queries_np = _query_points_np(bench_case, n_queries)
+        line_pv.find_closest_cell(queries_np[:1], return_closest_point=True)  # pre-warm
+        _cells_pv, closest_pv = bench_case.run(
+            lambda: line_pv.find_closest_cell(queries_np, return_closest_point=True)
+        )
+        assert np.asarray(closest_pv).shape == (n_queries, 3)
+        return
     if bench_case.kind == "meshlib":
         skip_larger_than(bench_case, "bunny", "the query is a per-point Python loop")
         polyline_ml = _polyline_ml(bench_case)
@@ -359,7 +414,7 @@ def _polygon_np(n_vertices: int) -> np.ndarray:
 
 @pytest.mark.benchmark(group="triangulate_polyline")
 @pytest.mark.benchmeshes("sphere_small")
-@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.benchlibs("triwarp", "meshlib", "pyvista")
 @pytest.mark.parametrize("n_vertices", _POLYGON_SIZES)
 def test_triangulate_polyline(bench_case: BenchCase, n_vertices: int) -> None:
     """
@@ -375,8 +430,22 @@ def test_triangulate_polyline(bench_case: BenchCase, n_vertices: int) -> None:
     returns a whole ``Mesh``, so its row carries that construction where triwarp's returns an index
     buffer -- it is doing more, and the two agree on the triangle count and total area
     (``tests/test_polyline.py``). Both build their input contour outside the timed callable.
+
+    pyvista's ``triangulate_contours`` is VTK's ear clipper over the same closed loop, and it too
+    returns a whole ``PolyData`` -- but of the loop's **own** points: it introduces zero Steiner
+    points, so the count is ``n - 2`` on all three sides. Its line cell must carry the repeated
+    first index, the same closing convention MeshLib's contour needs.
     """
     polygon_np = _polygon_np(n_vertices)
+    if bench_case.kind == "pyvista":
+        indices_np = np.append(np.arange(n_vertices), 0)  # closed: the repeat is required
+        loop_pv = pv.PolyData(
+            np.column_stack([polygon_np, np.zeros(n_vertices)]),
+            lines=np.hstack([[indices_np.size], indices_np]),
+        )
+        filled_pv = bench_case.run(loop_pv.triangulate_contours)
+        assert filled_pv.n_cells == n_vertices - 2
+        return
     if bench_case.kind == "meshlib":
         contour_ml = mm.std_vector_Vector2_float()
         for point_np in np.vstack([polygon_np, polygon_np[:1]]):

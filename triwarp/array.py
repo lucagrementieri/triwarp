@@ -11,6 +11,7 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import read_scalar
 from triwarp.kernels import array as kernel_array
 from triwarp.kernels import scatter as kernel_scatter
 
@@ -839,7 +840,7 @@ def flatnonzero(values: wp.array[wp.bool] | wp.array[wp.Scalar]) -> wp.array[wp.
     # (the scatter kernel derives each exclusive position as inclusive[i] - 1).
     inclusive = wp.empty(n, dtype=wp.int32, device=device)
     wp.utils.array_scan(flags, out_array=inclusive, inclusive=True)
-    n_out = int(inclusive[n - 1 :].numpy()[0])
+    n_out = int(read_scalar(inclusive))
 
     if n_out == 0:
         return wp.empty(0, dtype=wp.int32, device=device)
@@ -1094,7 +1095,7 @@ def counts_to_offsets(
     # rest, so ``buffer[n]`` is the total and ``buffer[:n]`` the exclusive offsets.
     buffer = wp.zeros(n + 1, dtype=wp.int32, device=device)
     wp.utils.array_scan(counts, out_array=buffer[1:], inclusive=True)
-    return buffer if include_total else buffer[:n], int(buffer[n:].numpy()[0])
+    return buffer if include_total else buffer[:n], int(read_scalar(buffer))
 
 
 def remap_indices(indices: wp.array[wp.int32], remap: wp.array[wp.int32]) -> wp.array[wp.int32]:
@@ -1171,7 +1172,7 @@ def trim_to_count(
         One contiguous ``(n_out, *buffer.shape[1:])`` copy per input buffer, in order, each on
         its buffer's device.
     """
-    n_out = int(counter[:1].numpy()[0])
+    n_out = int(read_scalar(counter, 0))
     trimmed = []
     for buffer in buffers:
         out_shape = (n_out, *(int(dim) for dim in buffer.shape[1:]))

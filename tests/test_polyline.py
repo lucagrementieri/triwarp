@@ -11,7 +11,7 @@ from trimesh.path import traversal as tm_traversal
 
 import triwarp as tw
 from tests.comparisons import hausdorff_two_sided
-from tests.conversions import meshlib_to_trimesh
+from tests.conversions import meshlib_to_trimesh, polyline_to_pyvista
 
 
 def _polyline_wp(pts_np: np.ndarray, device: str) -> wp.array:
@@ -291,6 +291,42 @@ def test_polyline_length_matches_meshlib(device: str) -> None:
     assert closed_wp == closed_ml
 
 
+@pytest.mark.parity("polyline_length", "pyvista")
+def test_polyline_length_matches_pyvista(device: str) -> None:
+    """
+    Class A: VTK's ``compute_arc_length`` accumulates the same segments, to 7.35e-08 relative.
+
+    The residual is triwarp's ``float32`` buffer against pyvista's exact float64 point storage, and
+    it is the same floor every pyvista row in the suite bottoms out at.
+
+    **The input has to be one line cell.** ``polyline_to_pyvista`` builds it that way because
+    ``pv.lines_from_points`` gives one two-point cell per segment and ``compute_arc_length``
+    restarts at every one of them -- measured max **0.0638** against a true 12.7049 on a 200-point
+    helix, which reads as a factor-of-200 disagreement rather than as the wrong input. The field is
+    *cumulative* per point, so the length is its last/maximum entry; ``compute_cell_sizes``'
+    ``Length`` sums to the identical value and either is admissible.
+
+    The closed form goes through the same named transform the trimesh and meshlib pairings use --
+    append the first point, since VTK has no closed flag either.
+    """
+    pts_np = _random_open_polyline(2, n=50)
+
+    length_wp = tw.polyline.polyline_length(_polyline_wp(pts_np, device))
+    arc_pv = np.asarray(polyline_to_pyvista(pts_np).compute_arc_length()["arc_length"])
+    length_pv = float(arc_pv.max())
+    assert length_pv > 0.0  # non-vacuity
+    assert np.allclose(length_wp, length_pv, rtol=1e-5, atol=1e-5)
+
+    closed_wp = tw.polyline.polyline_length(_polyline_wp(pts_np, device), closed=True)
+    closed_pv = float(
+        np.asarray(
+            polyline_to_pyvista(_closed_from(pts_np)).compute_arc_length()["arc_length"]
+        ).max()
+    )
+    assert closed_pv > length_pv  # the closing segment is real
+    assert np.allclose(closed_wp, closed_pv, rtol=1e-5, atol=1e-5)
+
+
 # --- centroid / normal (NumPy reference) ---
 
 
@@ -399,6 +435,39 @@ def test_distance_to_polyline_matches_meshlib(device: str) -> None:
 
     assert distances_ml.min() > 0.0  # non-vacuity: no query sits on the polyline
     assert np.allclose(distances_wp.numpy(), distances_ml, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parity("distance_to_polyline", "pyvista")
+def test_distance_to_polyline_matches_pyvista(device: str) -> None:
+    """
+    Class A: ``find_closest_cell`` on a one-cell polyline is the point-to-*segment* distance.
+
+    Max abs difference **2.49e-07** over 1 500 queries against a 200-point helix, median 3.72e-08,
+    correlation 1.000000000 -- the float32 floor again. Unlike MeshLib's
+    ``findProjectionOnPolyline`` this form is batched, which is why the benchmark row for this group
+    can carry it.
+
+    Two wrong routes, both measured. The distance must be recomputed from the returned closest
+    *point*: ``find_closest_cell`` reports the cell, not the length. And
+    ``compute_implicit_distance`` -- the exact SDF that serves ``signed_distance_on_mesh`` -- needs
+    **polygons**: on a line set VTK logs ``No polygons to evaluate function!`` once per query and
+    returns a field **3.35** away from the truth rather than raising.
+    """
+    rng = np.random.default_rng(40)
+    pts_np = _random_open_polyline(40, n=40)
+    points_np = rng.standard_normal((50, 3)) * 3.0 + pts_np.mean(axis=0)
+
+    distances_wp = tw.polyline.distance_to_polyline(
+        _polyline_wp(points_np, device), _polyline_wp(pts_np, device)
+    )
+
+    line_pv = polyline_to_pyvista(pts_np)
+    assert line_pv.n_cells == 1  # one cell, or every filter restarts per segment
+    _cells_pv, closest_pv = line_pv.find_closest_cell(points_np, return_closest_point=True)
+    distances_pv = np.linalg.norm(points_np - np.asarray(closest_pv), axis=1)
+
+    assert distances_pv.min() > 0.0  # non-vacuity: no query sits on the polyline
+    assert np.allclose(distances_wp.numpy(), distances_pv, rtol=1e-5, atol=1e-5)
 
 
 def test_distance_to_single_point_polyline(device: str) -> None:
@@ -808,6 +877,41 @@ def test_triangulate_polyline_matches_meshlib(device: str) -> None:
             np.asarray(mesh_ml.vertices), np.asarray(mesh_ml.faces, dtype=np.int32)
         ).sum()
         assert np.isclose(area_wp, area_ml, rtol=1e-5), name
+        assert np.isclose(area_wp, _polygon_area(points_np), rtol=1e-5), name
+
+
+@pytest.mark.parity("triangulate_polyline", "pyvista")
+def test_triangulate_polyline_matches_pyvista(device: str) -> None:
+    """
+    Class C (count and area): VTK's ``triangulate_contours`` ear-clips the same polygon.
+
+    Same standard as the MeshLib pairing above and for the same reason -- the diagonals of a simple
+    polygon's triangulation are free, so only ``n - 2`` and the total area are shared. Measured
+    exact on the L-shape (4 triangles, 3.00000) and the 10-vertex star (8, 1.32252), and on a
+    40-point star the areas agree to nine digits (3.264193743 against a 3.264193743 shoelace).
+
+    Two things about the input, both measured. The line cell must be **closed** -- the first index
+    repeated, which is what ``polyline_to_pyvista(closed=True)`` does -- and it introduces **zero**
+    Steiner points, so the filled polygon reuses the loop's own vertices exactly as triwarp does.
+    And ``delaunay_2d(edge_source=loop)`` is *not* the alternative route: it ignores the loop as a
+    boundary and triangulates the convex hull, measured 63 cells covering area **4.465** against
+    the star's 3.264.
+    """
+    for name, polygon_np in (
+        ("L", np.array([[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0], [1.0, 2.0], [0.0, 2.0]])),
+        ("star", _star(5)[:, :2]),
+    ):
+        points_np = np.column_stack([polygon_np, np.zeros(polygon_np.shape[0])])
+        faces_wp = tw.polyline.triangulate_polyline(_polyline_wp(points_np, device)).numpy()
+
+        filled_pv = polyline_to_pyvista(points_np, closed=True).triangulate_contours()
+        assert filled_pv.is_all_triangles, name
+        assert filled_pv.n_points == polygon_np.shape[0], name  # no Steiner points
+        assert filled_pv.n_cells == polygon_np.shape[0] - 2, name  # non-vacuity
+        assert faces_wp.shape[0] == filled_pv.n_cells, name
+
+        area_wp = _triangle_areas(points_np, faces_wp).sum()
+        assert np.isclose(area_wp, float(filled_pv.area), rtol=1e-5), name
         assert np.isclose(area_wp, _polygon_area(points_np), rtol=1e-5), name
 
 

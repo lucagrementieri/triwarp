@@ -42,6 +42,7 @@ import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp._device import read_scalar
 from triwarp.edges import edges_unique
 from triwarp.kernels import energies as kernel_energies
 from triwarp.kernels import predicates as kernel_predicates
@@ -639,7 +640,7 @@ def lscm_hessian(
     # The real compressed-CSR entry count is offsets[-1], not laplacian.nnz: bsr_from_triplets
     # reports nnz as the (over-allocated) triplet capacity, so sizing by nnz would leave an
     # uninitialized gap in the wp.empty buffers that bsr_from_triplets reads back as garbage.
-    n_entries = int(laplacian.offsets[n : n + 1].numpy()[0])
+    n_entries = int(read_scalar(laplacian.offsets, n))
     boundary = tw.boundary.oriented_boundary_edges(vertices, faces)
     n_be = int(boundary.shape[0])
 

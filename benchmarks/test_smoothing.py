@@ -723,6 +723,14 @@ def test_smooth_region(bench_case: BenchCase) -> None:
     (``EdgeWeights.Unit``, ``VertexMass.Unit``), factorized where triwarp iterates -- the answers
     agree to 1e-4 (``tests/test_smoothing.py``). It mutates the mesh in place and returns nothing,
     so its mesh is rebuilt inside the timed callable and the row carries the build.
+
+    **The two rows land on opposite sides of a solver switch**, which is the thing to know before
+    reading a change in either. ``smooth_region`` asks for ``preconditioner="auto"``: Jacobi under a
+    2 000-iteration cap, escalating to a multigrid V-cycle only if that has not converged. ``bunny``
+    needs 6 541 Jacobi iterations, so it escalates and the row measures **159.7 ms against 225.7
+    before the hierarchy existed**; ``bunny_decimated`` needs 1 784, converges inside the cap and is
+    unchanged. So a change on one row and not the other is more likely to be the cap than the solver
+    -- see ``linalg.CG_PROBE_ITERATIONS``.
     """
     skip_larger_than(
         bench_case,

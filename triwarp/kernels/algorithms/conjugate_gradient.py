@@ -134,6 +134,43 @@ def cg_apply_inverse_diagonal(
     out_preconditioned[i] = inv_diag[i - (i // stride) * stride] * values[i]
 
 
+@wp.func
+def cg_advance_x_r(
+    i: wp.int32,
+    c: wp.int32,
+    local: wp.int32,
+    n: wp.int32,
+    rz_old: wp.array[wp.float64],
+    p_dot_ap: wp.array2d[wp.float64],
+    r_norm_sq: wp.array2d[wp.float64],
+    atol_sq: wp.array[wp.float64],
+    p: wp.array[wp.float64],
+    ap: wp.array[wp.float64],
+    out_x: wp.array[wp.float64],
+    out_r: wp.array[wp.float64],
+) -> wp.float64:
+    # ``x += alpha p`` and ``r -= alpha Ap`` for one entry, returning the new residual so the caller
+    # can precondition it in the same pass when the preconditioner is elementwise.
+    #
+    # A column already inside its tolerance takes ``alpha = 0`` and therefore stops moving, which is
+    # how the batched loop lets a converged column idle while its neighbours finish rather than
+    # dividing by a ``p.Ap`` that has gone to zero.
+    #
+    # ``p``, ``ap`` and ``r`` are the solver's own, at column pitch ``stride``, and their pad is
+    # zero and stays zero here. ``out_x`` is the **caller's** buffer at pitch ``n``, which is why it
+    # is indexed separately and skipped in the pad -- copying it into a padded buffer instead cost
+    # more than the padding saved on short solves.
+    alpha = wp.float64(0.0)
+    if r_norm_sq[0, c] > atol_sq[c]:
+        alpha = rz_old[c] / p_dot_ap[0, c]
+    if local < n:
+        slot = c * n + local
+        out_x[slot] = out_x[slot] + alpha * p[i]
+    residual = out_r[i] - alpha * ap[i]
+    out_r[i] = residual
+    return residual
+
+
 @wp.kernel
 def cg_step_x_r_z(
     stride: wp.int32,
@@ -149,28 +186,40 @@ def cg_step_x_r_z(
     out_r: wp.array[wp.float64],
     out_z: wp.array[wp.float64],
 ) -> None:
-    # ``x += alpha p``; ``r -= alpha Ap``; ``z = M^-1 r``, with the Jacobi apply fused in.
-    #
-    # A column already inside its tolerance takes ``alpha = 0`` and therefore stops moving, which is
-    # how the batched loop lets a converged column idle while its neighbours finish rather than
-    # dividing by a ``p.Ap`` that has gone to zero.
-    #
-    # ``p``, ``ap``, ``r`` and ``z`` are the solver's own, at column pitch ``stride``, and their pad
-    # is zero and stays zero here; ``inv_diag`` is padded to match. ``out_x`` is the **caller's**
-    # buffer at pitch ``n``, which is why it is indexed separately and skipped in the pad -- copying
-    # it into a padded buffer instead cost more than the padding saved on short solves.
+    # ``x += alpha p``; ``r -= alpha Ap``; ``z = M^-1 r``, with the **Jacobi** apply fused in --
+    # ``inv_diag`` is padded to ``stride`` alongside the vectors. The only difference from
+    # ``cg_step_x_r`` below is that fusion, which is available exactly when the preconditioner is an
+    # elementwise multiply of the residual this pass has just written.
     i = wp.int32(wp.tid())
     c = i // stride
     local = i - c * stride
-    alpha = wp.float64(0.0)
-    if r_norm_sq[0, c] > atol_sq[c]:
-        alpha = rz_old[c] / p_dot_ap[0, c]
-    if local < n:
-        slot = c * n + local
-        out_x[slot] = out_x[slot] + alpha * p[i]
-    residual = out_r[i] - alpha * ap[i]
-    out_r[i] = residual
+    residual = cg_advance_x_r(
+        i, c, local, n, rz_old, p_dot_ap, r_norm_sq, atol_sq, p, ap, out_x, out_r
+    )
     out_z[i] = inv_diag[local] * residual
+
+
+@wp.kernel
+def cg_step_x_r(
+    stride: wp.int32,
+    n: wp.int32,
+    rz_old: wp.array[wp.float64],
+    p_dot_ap: wp.array2d[wp.float64],
+    r_norm_sq: wp.array2d[wp.float64],
+    atol_sq: wp.array[wp.float64],
+    p: wp.array[wp.float64],
+    ap: wp.array[wp.float64],
+    out_x: wp.array[wp.float64],
+    out_r: wp.array[wp.float64],
+) -> None:
+    # The same x/r update with **no** preconditioner apply, for a preconditioner that is not an
+    # elementwise multiply -- a multigrid V-cycle, which is its own sequence of launches and reads
+    # the ``r`` this pass leaves behind. One extra launch per iteration against ``cg_step_x_r_z``,
+    # and that is the whole cost of un-fusing.
+    i = wp.int32(wp.tid())
+    c = i // stride
+    local = i - c * stride
+    cg_advance_x_r(i, c, local, n, rz_old, p_dot_ap, r_norm_sq, atol_sq, p, ap, out_x, out_r)
 
 
 @wp.kernel

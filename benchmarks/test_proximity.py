@@ -162,6 +162,14 @@ def test_winding_number(bench_case: BenchCase, n_queries: int) -> None:
     row as the cost of the predicate, not of the number -- and note it uses a BVH where this group's
     two other rows deliberately do not.
 
+    Its ``check_surface=False`` is **required, not a shortcut**: the filter validates first and
+    raises ``RuntimeError: Surface is not closed`` on every scan mesh in the registry --
+    ``bunny_decimated`` has 273 open edges and ``bunny`` 223 -- so with the check on there is no
+    mesh here the row can run at all. Disabling it times the ray casting itself (156 / 296 ms per
+    10 000 queries on those two), which is the comparable work; the *answer* on an open surface is
+    undefined by VTK's own documentation, which is why the value comparison lives in
+    ``tests/test_ray.py`` on a closed fixture and this row asserts only the shape.
+
     **meshlib answers a Barnes-Hut approximation of it**, and that is the whole reason its row is
     interesting here: ``FastWindingNumber(mesh).calcFromVector`` walks the mesh's AABB tree and
     replaces a distant subtree by a dipole, so unlike triwarp's and igl's rows it is *not*
@@ -182,7 +190,9 @@ def test_winding_number(bench_case: BenchCase, n_queries: int) -> None:
         cloud_pv = pv.PolyData(
             np.ascontiguousarray(_query_points_np(bench_case, n_queries), dtype=np.float64)
         )
-        selected_pv = bench_case.run(lambda: cloud_pv.select_interior_points(mesh_pv), rounds=3)
+        selected_pv = bench_case.run(
+            lambda: cloud_pv.select_interior_points(mesh_pv, check_surface=False), rounds=3
+        )
         assert np.asarray(selected_pv.point_data["selected_points"]).shape == (n_queries,)
         return
     if bench_case.kind == "meshlib":
@@ -241,7 +251,7 @@ def _distance_meshset_pml(bench_case: BenchCase) -> ml.MeshSet:
 
 
 @pytest.mark.benchmark(group="closest_point_on_mesh")
-@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.benchlibs("triwarp", "meshlib", "pyvista")
 def test_closest_point_on_mesh(bench_case: BenchCase) -> None:
     """
     The unsigned closest-point query, without the sign work the group below pays for.
@@ -263,7 +273,27 @@ def test_closest_point_on_mesh(bench_case: BenchCase) -> None:
     ``updateMeshData(build_a_mesh())`` on a temporary leaves it reading freed memory and crashes on
     a cloud this size; the mesh has to be held in a name that outlives every query, which is
     Open3D's ``from_legacy`` hazard in a second library.
+
+    pyvista's ``find_closest_cell`` is the third batched form of the same query, through a
+    ``vtkStaticCellLocator``. It is the most *accurate* reference in the group -- against
+    ``igl.point_mesh_squared_distance`` it agrees to 4.4e-16 on both the distance and the point --
+    but it returns the closest **point** and the cell, never the distance, so its row is that much
+    wider than what it is timed against and the subtraction stays out of the timed callable. Its
+    locator is built lazily and cached on the ``PolyData``, so it is pre-warmed here rather than
+    timed, the same rule MeshLib's AABB tree gets above.
     """
+    if bench_case.kind == "pyvista":
+        # 160 / 376 / 906 ms per 10 000-query call on bunny_decimated / bunny / dragon: VTK's
+        # locator is single-threaded, so this is capped where the suite's other host rows are.
+        skip_larger_than(bench_case, "bunny", "VTK's locator is single-threaded (906 ms at dragon)")
+        mesh_pv = bench_case.mesh_pv
+        queries_np = _query_points_np(bench_case)
+        mesh_pv.find_closest_cell(queries_np[:1], return_closest_point=True)  # pre-warm
+        _cells_pv, closest_pv = bench_case.run(
+            lambda: mesh_pv.find_closest_cell(queries_np, return_closest_point=True)
+        )
+        assert np.asarray(closest_pv).shape == (_N_QUERIES, 3)
+        return
     if bench_case.kind == "meshlib":
         mesh_ml = bench_case.new_mesh_ml()  # must outlive the projector: it holds a raw pointer
         points_ml = _query_points_ml(bench_case)
@@ -446,7 +476,7 @@ def _triangular_lattice_2d(rows: int) -> tuple[np.ndarray, Delaunay, np.ndarray]
 
 
 @pytest.mark.benchmark(group="containing_faces_2d")
-@pytest.mark.benchlibs("triwarp", "scipy")
+@pytest.mark.benchlibs("triwarp", "scipy", "pyvista")
 @pytest.mark.parametrize("rows", _LATTICE_ROWS, ids=["lattice26", "lattice80", "lattice240"])
 def test_containing_faces_2d(bench_lib: BenchLibrary, rows: int) -> None:
     """
@@ -465,8 +495,26 @@ def test_containing_faces_2d(bench_lib: BenchLibrary, rows: int) -> None:
     timed region, while triwarp's row includes building its BVH on every call -- there is no
     prebuilt-index entry point on this side. Read the row as a floor on triwarp's margin, not as
     a like-for-like split; scipy is doing strictly less work per call.
+
+    pyvista's ``find_containing_cell`` is in scipy's position rather than triwarp's: its locator is
+    built lazily on the ``PolyData`` and pre-warmed here, so it too is timed with its index in hand.
+    It locates in **3-D** -- the lattice and the queries get a zero ``z`` -- and it is the only
+    reference in the suite that answers this question correctly: ``igl.in_element`` returns
+    batch-size-dependent answers and aborts on a 200-point Delaunay (section 6), which is why the
+    row exists at all.
     """
     points_np, triangulation_sp, queries_np = _triangular_lattice_2d(rows)
+    if bench_lib.kind == "pyvista":
+        mesh_pv = pv.PolyData.from_regular_faces(
+            np.column_stack([points_np, np.zeros(points_np.shape[0])]),
+            np.ascontiguousarray(triangulation_sp.simplices, dtype=np.int32),
+        )
+        queries_3d_np = np.column_stack([queries_np, np.zeros(queries_np.shape[0])])
+        mesh_pv.find_containing_cell(queries_3d_np[:1])  # pre-warm the cell locator
+        located_pv = np.asarray(bench_lib.run(lambda: mesh_pv.find_containing_cell(queries_3d_np)))
+        assert located_pv.shape == (_N_QUERIES,)
+        assert (located_pv >= 0).any()
+        return
     if bench_lib.kind == "scipy":
         located_sp = bench_lib.run(lambda: triangulation_sp.find_simplex(queries_np))
         assert located_sp.shape == (_N_QUERIES,)

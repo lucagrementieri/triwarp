@@ -155,49 +155,55 @@ def hash_insert(
     slot_key: wp.array[wp.Int],
     slot_counts: wp.array[wp.int32],
     mask: wp.int32,
+    out_occupied: wp.array[wp.int32],
 ) -> None:
     # `encode_key` reserves 0 as the empty-slot sentinel, so exactly one key -- the one that encodes
     # to 0, i.e. -1 -- can never be published in the table: its CAS would look like an untouched
     # slot. Since no bijection on the full integer range can avoid mapping *something* onto the
     # sentinel, that key gets a dedicated slot one past the end of the table instead. Callers must
-    # therefore allocate `mask + 2` slots, and occupancy comes from `slot_counts` (see
-    # `mark_occupied`) so nothing downstream has to know which slot is which. `decode_key` turns the
-    # reserved slot's untouched 0 straight back into -1, so compaction needs no special case.
+    # therefore allocate `mask + 2` slots, and occupancy is stamped here rather than read back off
+    # `slot_key`, whose reserved slot keeps an untouched 0 and would otherwise look empty --
+    # `decode_key` turns that 0 straight back into -1, so compaction needs no special case either.
+    #
+    # `out_occupied` is a zero-filled 0/1 array, the dtype `wp.utils.array_scan` wants, so the scan
+    # of it gives the compaction's write positions directly. Every thread landing in a slot stores
+    # the same 1, which is why the unsynchronized store is benign; writing it here rather than in a
+    # second pass over the whole `mask + 2` table saves that pass -- measured 30 us of a 313 us
+    # `unique_1d(100k)`, where the table is 2.6x the input.
     i = wp.int32(wp.tid())
     key = data[i]
-    if encode_key(key) == empty_key(key):
-        wp.atomic_add(slot_counts, mask + 1, wp.int32(1))
-    else:
-        wp.atomic_add(slot_counts, hash_find_or_insert(key, slot_key, mask), wp.int32(1))
-
-
-@wp.func
-def mark_occupied(slot_counts: wp.int32) -> wp.int32:
-    # Occupancy is read from the counts rather than from `slot_key`, because a slot claimed by
-    # `hash_insert` always has its count incremented, whereas the reserved sentinel slot keeps a
-    # `slot_key` of 0 and would otherwise look empty.
-    #
-    # Returns 0 as well as 1: the kernel this replaced only ever wrote the 1s and leaned on a
-    # zero-filled destination, so writing every slot lets the caller allocate with ``wp.empty``.
-    if slot_counts > wp.int32(0):
-        return wp.int32(1)
-    return wp.int32(0)
+    slot = mask + 1
+    if encode_key(key) != empty_key(key):
+        slot = hash_find_or_insert(key, slot_key, mask)
+    wp.atomic_add(slot_counts, slot, wp.int32(1))
+    out_occupied[slot] = wp.int32(1)
 
 
 @wp.kernel
 def compact_from_table(
     slot_key: wp.array[wp.Int],
     slot_counts: wp.array[wp.int32],
-    occ_mask: wp.array[wp.int32],
+    occupied: wp.array[wp.int32],
     scan_pos: wp.array[wp.int32],
     out_keys: wp.array[wp.Int],
     out_counts: wp.array[wp.int32],
+    out_perm: wp.array[wp.int32],
 ) -> None:
+    # ``scan_pos`` is the *inclusive* scan of ``occupied``, so an occupied slot's compact position
+    # is one less. Taking the -1 here rather than in a pass over the whole table is the other half
+    # of the saving described in ``hash_insert``, and it leaves the scan's last element reading
+    # ``n_unique`` outright.
+    #
+    # ``out_perm`` is the identity permutation the radix sort pairs with the keys. Writing it here
+    # replaces an ``arange`` launch of its own, measured at 30 us -- as much as the sort it feeds.
+    # Only the leading ``n_unique`` entries are written; the rest of the buffer is the sort's
+    # double-buffer scratch, which it fills before reading.
     h = wp.int32(wp.tid())
-    if occ_mask[h] == wp.int32(1):
-        pos = scan_pos[h]
+    if occupied[h] == wp.int32(1):
+        pos = scan_pos[h] - wp.int32(1)
         out_keys[pos] = decode_key(slot_key[h])
         out_counts[pos] = slot_counts[h]
+        out_perm[pos] = pos
 
 
 @wp.func
@@ -296,7 +302,10 @@ _KEY_DTYPES = (wp.int32, wp.int64, wp.uint32, wp.uint64)
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
     for dtype in _KEY_DTYPES:
-        wp.overload(hash_insert, [wp.array[dtype], wp.array[dtype], wp.array[wp.int32], wp.int32])
+        wp.overload(
+            hash_insert,
+            [wp.array[dtype], wp.array[dtype], wp.array[wp.int32], wp.int32, wp.array[wp.int32]],
+        )
         wp.overload(mark_group_starts, [wp.array[dtype], wp.int32, wp.int32, wp.array[wp.bool]])
         # ``slot_key`` and ``out_keys`` carry the key dtype; every count/offset buffer is int32.
         wp.overload(
@@ -307,6 +316,7 @@ def _register_overloads() -> None:
                 wp.array[wp.int32],
                 wp.array[wp.int32],
                 wp.array[dtype],
+                wp.array[wp.int32],
                 wp.array[wp.int32],
             ],
         )
