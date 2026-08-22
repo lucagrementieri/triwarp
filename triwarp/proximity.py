@@ -29,6 +29,7 @@ Point-set acceleration structures (``wp.Bvh`` / ``wp.HashGrid``) and raw neighbo
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 import warp as wp
@@ -502,6 +503,127 @@ def signed_distance_on_mesh(
         device=device,
     )
     return out_distance
+
+
+def signed_distance_grid(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    voxel_size: float | None = None,
+    *,
+    bounds: tuple[wp.vec3, wp.vec3] | None = None,
+    pad: int = 2,
+    sign_mode: Literal["parity", "winding"] = "parity",
+    mesh: wp.Mesh | None = None,
+) -> tuple[twt.Array3dFloat32, tuple[wp.vec3, wp.vec3]]:
+    """
+    Sample the signed distance to a mesh on a regular lattice, as a field and the box it spans.
+
+    The bridge from a surface to a **level set**, and the missing half of the implicit round trip:
+    [`triwarp.voxels.to_field`][triwarp.voxels.to_field] already gives
+    [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes] an
+    *occupancy* lattice, but occupancy is ``0`` or ``1`` and thresholding it at anything other than
+    ``0.5`` does not move the surface anywhere. A distance field does, which is what makes
+    ``marching_cubes(*signed_distance_grid(...), iso=d)`` an offset surface at distance ``d`` --
+    see [`triwarp.offset.offset_mesh`][triwarp.offset.offset_mesh], the named entry point for it.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    voxel_size
+        Lattice spacing, isotropic. ``None`` takes
+        [`triwarp.voxels.resolve_voxel_grid`][triwarp.voxels.resolve_voxel_grid]'s default of 1 % of
+        the bounding-box diagonal, which is this package's one definition of an unspecified grid.
+    bounds
+        ``(lower, upper)`` box to sample, **before** padding. ``None`` uses the mesh's own
+        axis-aligned box, which is what an offset wants -- an inward offset needs no more, and an
+        outward one needs ``pad`` to cover it.
+    pad
+        Cells of margin added on every side, so the lattice extends ``pad * voxel_size`` beyond the
+        box. Two is enough for the surface itself to be enclosed; an **outward offset of ``d``
+        needs ``pad >= d / voxel_size + 1``** or its level set is clipped by the lattice boundary.
+    sign_mode
+        How the sign is decided, forwarded to
+        [`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]: ``"parity"`` counts
+        ray crossings, ``"winding"`` sums solid angles and is the one that survives a mesh with open
+        rims.
+    mesh
+        A ``wp.Mesh`` already built over ``vertices`` and ``faces``, to spare the build. Forwarded
+        as-is, so ``signed_distance_on_mesh``'s rule applies unchanged: it is usable with
+        ``sign_mode="parity"`` only, since the winding sign needs a mesh built with
+        ``support_winding_number=True`` and that cannot be verified after construction.
+
+    Returns
+    -------
+    field : twt.Array3dFloat32
+        ``(nx, ny, nz)`` signed distances, negative inside. Exactly the first argument
+        [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes] takes.
+    bounds : tuple[wp.vec3, wp.vec3]
+        The ``(lower, upper)`` corners the lattice actually spans, padded and snapped so the spacing
+        is exactly ``voxel_size`` on every axis. Pass it straight through as that function's
+        ``bounds``.
+
+    Raises
+    ------
+    ValueError
+        If ``voxel_size`` is not positive, ``pad`` is negative, or ``faces`` is empty.
+
+    Examples
+    --------
+    ```python
+    field, box = tw.proximity.signed_distance_grid(v, f, voxel_size=0.05, pad=4)
+    shell_v, shell_f = tw.reconstruction.marching_cubes(field, 0.1, bounds=box)
+    ```
+
+    Notes
+    -----
+    **The whole lattice is sampled, so size it deliberately**: the field costs
+    ``4 * nx * ny * nz`` bytes and one closest-point query per sample, which is 16.7 M queries and
+    67 MB at ``256 ** 3``. There is no narrow band, and that is deliberate rather than missing --
+    ``signed_distance_on_mesh`` reports ``+max_dist`` for a query that finds no face within the
+    limit, so a banded field would carry a **positive** value deep inside the solid and silently
+    invert the level set. Reduce the resolution instead.
+
+    The lattice is a *corner* lattice: ``field[0, 0, 0]`` sits exactly on the returned ``lower``.
+    That is [`triwarp.voxels.grid_points`][triwarp.voxels.grid_points]'s convention and
+    ``marching_cubes``'s, and it is **not** the voxel-centre convention the rest of
+    [`triwarp.voxels`][triwarp.voxels] uses.
+
+    See Also
+    --------
+    [`signed_distance_on_mesh`][triwarp.proximity.signed_distance_on_mesh]
+        The per-query form this samples, and where the sign conventions are documented.
+    [`triwarp.offset.offset_mesh`][triwarp.offset.offset_mesh]
+        What to call instead when the answer wanted is the offset surface rather than the field.
+    [`triwarp.voxels.to_field`][triwarp.voxels.to_field]
+        The occupancy lattice, when a binary inside test is all that is needed.
+    """
+    if pad < 0:
+        raise ValueError("pad must be non-negative")
+    if int(faces.shape[0]) == 0:
+        raise ValueError("signed_distance_grid needs at least one face")
+    device = vertices.device
+    spacing, _origin = tw.voxels.resolve_voxel_grid(
+        vertices, voxel_size, None, caller="signed_distance_grid"
+    )
+
+    lower, upper = bounds if bounds is not None else tw.bounds.aabb(vertices)
+    margin = float(pad) * spacing
+    lower = wp.vec3(lower[0] - margin, lower[1] - margin, lower[2] - margin)
+    # One sample per spacing, and at least the two marching cubes needs to have a cell at all.
+    shape = tuple(
+        max(2, math.floor((float(upper[axis]) + margin - float(lower[axis])) / spacing) + 1)
+        for axis in range(3)
+    )
+    snapped_upper = wp.vec3(
+        *(float(lower[axis]) + (shape[axis] - 1) * spacing for axis in range(3))
+    )
+
+    samples = tw.voxels.grid_points(shape, bounds=(lower, snapped_upper), device=device)
+    distances = signed_distance_on_mesh(vertices, faces, samples, sign_mode=sign_mode, mesh=mesh)
+    return twt.as_array3d(distances.reshape(shape), wp.float32), (lower, snapped_upper)
 
 
 def winding_number(

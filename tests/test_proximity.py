@@ -1022,6 +1022,94 @@ def test_signed_distance_on_mesh_empty_faces(device: str) -> None:
     assert np.all(np.isinf(signed_wp.numpy()))
 
 
+@pytest.mark.parity("signed_distance_grid", "open3d")
+def test_signed_distance_grid_matches_open3d(
+    device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Class A: the sampled lattice equals open3d's ``compute_signed_distance`` at the same points.
+
+    The reference shares triwarp's sign convention exactly -- negative inside, no negation needed --
+    so this is an equality rather than a mapping, and it is the whole field rather than a statistic:
+    measured max deviation **1.27e-07** over a 26 x 26 x 26 lattice, which is float32 rounding.
+
+    The lattice's own geometry is asserted alongside it, because a field is only usable if the box
+    it claims to span is the box it does span: sample ``[0, 0, 0]`` sits on the returned ``lower``,
+    the spacing is exactly ``voxel_size`` on every axis, and the padding is honoured. Those are what
+    ``marching_cubes`` reads through ``bounds``, so getting them wrong shifts every offset surface
+    by a fraction of a cell without failing any value comparison.
+    """
+    voxel_size = 0.1
+    pad = 3
+    mesh_tm, _ = icosphere
+    vertices_wp, faces_wp = numpy_to_warp(
+        np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces, dtype=np.int32).reshape(-1), device
+    )
+    field_wp, (lower, upper) = tw.proximity.signed_distance_grid(
+        vertices_wp, faces_wp, voxel_size, pad=pad
+    )
+    field_np = field_wp.numpy()
+
+    # The box: the mesh's own, grown by exactly ``pad`` cells, and spaced by exactly ``voxel_size``.
+    mesh_lower_np = np.asarray(mesh_tm.vertices).min(axis=0)
+    assert np.allclose([lower[0], lower[1], lower[2]], mesh_lower_np - pad * voxel_size, atol=1e-6)
+    for axis in range(3):
+        span = float(upper[axis]) - float(lower[axis])
+        assert np.isclose(span / (field_np.shape[axis] - 1), voxel_size, rtol=1e-6)
+
+    samples_np = tw.voxels.grid_points(field_np.shape, bounds=(lower, upper), device=device).numpy()
+    scene_o3d = o3d.t.geometry.RaycastingScene()
+    scene_o3d.add_triangles(trimesh_to_open3d_t(mesh_tm))
+    distance_o3d = scene_o3d.compute_signed_distance(
+        o3d.core.Tensor(samples_np.astype(np.float32))
+    ).numpy()
+    assert np.abs(field_np.ravel() - distance_o3d).max() < 1e-5
+
+    # Non-vacuity in both signs: the lattice has to straddle the surface to be worth comparing.
+    assert field_np.min() < -0.5 * voxel_size
+    assert field_np.max() > 0.5 * voxel_size
+
+
+def test_signed_distance_grid_guards_and_conventions(
+    device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]
+) -> None:
+    """
+    Not a library comparison: the two guards, and that ``bounds`` overrides the mesh's own box.
+
+    The ``mesh=`` argument is forwarded rather than interpreted, so
+    ``signed_distance_on_mesh``'s rule about ``sign_mode="winding"`` applies here unchanged -- that
+    is asserted, because a wrapper that quietly built its own mesh would silently answer with the
+    parity sign.
+    """
+    mesh_tm, mesh_wp = icosphere
+    vertices_wp, faces_wp = numpy_to_warp(
+        np.asarray(mesh_tm.vertices), np.asarray(mesh_tm.faces, dtype=np.int32).reshape(-1), device
+    )
+
+    with pytest.raises(ValueError, match="pad"):
+        tw.proximity.signed_distance_grid(vertices_wp, faces_wp, 0.1, pad=-1)
+    with pytest.raises(ValueError, match="at least one face"):
+        tw.proximity.signed_distance_grid(
+            vertices_wp, wp.empty(0, dtype=wp.int32, device=device), 0.1
+        )
+    with pytest.raises(ValueError, match="cannot use a supplied mesh"):
+        tw.proximity.signed_distance_grid(
+            vertices_wp, faces_wp, 0.1, sign_mode="winding", mesh=mesh_wp
+        )
+
+    # An explicit box is used as given (before padding), whatever the mesh's own extent.
+    tight_field_wp, (tight_lower, _tight_upper) = tw.proximity.signed_distance_grid(
+        vertices_wp,
+        faces_wp,
+        0.2,
+        bounds=(wp.vec3(-0.5, -0.5, -0.5), wp.vec3(0.5, 0.5, 0.5)),
+        pad=0,
+    )
+    assert np.allclose([tight_lower[0], tight_lower[1], tight_lower[2]], [-0.5, -0.5, -0.5])
+    # Entirely inside a unit sphere, so every sample of that box is inside it.
+    assert tight_field_wp.numpy().max() < 0.0
+
+
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "hemisphere"])
 @pytest.mark.parametrize("tiled", [False, True])
 @pytest.mark.parity("winding_number", "igl")

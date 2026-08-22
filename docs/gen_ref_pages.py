@@ -34,7 +34,18 @@ SECTIONS: dict[str, list[str]] = {
     # ``shape_diameter`` and ``thickness`` are per-point scalar shape descriptors of the same kind
     # as ``curvature``'s, which is how pymeshlab files them (``compute_scalar_*``).
     "Measures & shape descriptors": ["measures", "curvature", "bounds", "convex", "visibility"],
-    "Mesh editing & repair": ["repair", "holes", "combine", "remesh", "smoothing", "seams"],
+    # ``offset`` last in the editing section: it is the one member whose output topology is not the
+    # input's -- a level-set offset resamples the surface rather than moving it -- so a reader
+    # meets the vertex-preserving edits first.
+    "Mesh editing & repair": [
+        "repair",
+        "holes",
+        "combine",
+        "remesh",
+        "smoothing",
+        "seams",
+        "offset",
+    ],
     "Spatial queries": ["proximity", "ray", "neighbors", "intersection", "metrics"],
     # ``voxels`` is shelved with ``points`` / ``sample`` rather than with the spatial queries:
     # ``points.farthest_point_sample`` and ``voxels.voxel_down_sample`` are the two point-cloud

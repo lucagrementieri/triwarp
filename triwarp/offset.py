@@ -1,0 +1,282 @@
+"""
+Grow, shrink and thicken a surface: the operations whose answer is a *different* surface.
+
+[`offset_mesh`][triwarp.offset.offset_mesh] moves a closed surface a fixed distance along its own
+normal direction, in the only way that stays well defined where the surface curves back on itself:
+through the signed distance field, whose level set at ``d`` is exactly the set of points at distance
+``d``. That is why an offset lives here rather than in [`triwarp.remesh`][triwarp.remesh] -- it is
+not a vertex displacement, and its output topology is not the input's. A sphere offset inward past
+its radius vanishes; a thin plate offset outward merges into one shell. Both are correct, and no
+per-vertex method produces either.
+
+[`thicken_mesh`][triwarp.offset.thicken_mesh] is the *topology-preserving* counterpart, for the
+common case where an open surface has to become a solid of known thickness and the input's own
+triangulation should survive: it extrudes along the vertex normals and closes the rim, so the output
+is the input plus a copy plus a band. It can self-intersect where the thickness exceeds the local
+radius of curvature, and it does not guard against that --
+[`triwarp.validation.face_self_intersecting_mask`][triwarp.validation.face_self_intersecting_mask]
+names the condition exactly, and repairing it is a separate operation.
+
+For the field itself, see
+[`triwarp.proximity.signed_distance_grid`][triwarp.proximity.signed_distance_grid]; for the binary
+occupancy lattice, [`triwarp.voxels`][triwarp.voxels].
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Literal
+
+import warp as wp
+
+import triwarp as tw
+from triwarp.kernels import offset as kernel_offset
+
+# Bounds on the automatic ``voxel_size``, both expressed as samples across the mesh's bounding-box
+# diagonal, and both load-bearing rather than defensive.
+#
+# The **cap** stops a small offset distance on a large mesh from asking for a lattice nobody can
+# allocate: a distance field costs 4 bytes a sample, so 256 per axis is 67 MB.
+#
+# The **floor** is the one that was measured. Tying the spacing to the offset distance alone
+# resolves the *band* the level set sits in but not necessarily what is left of the object: an
+# inward offset of 0.9 on a unit sphere leaves a sphere of radius 0.1, which at a spacing of 0.9/3
+# is smaller than one cell -- so marching cubes found nothing and the call returned **empty** for a
+# level set that exists. At least 64 samples across the mesh fixes it, for a 64 ** 3 lattice.
+_MAX_AUTO_RESOLUTION = 256
+_MIN_AUTO_RESOLUTION = 64
+
+# Samples across the offset distance in the automatic ``voxel_size``. Three is the smallest number
+# that puts a lattice cell strictly inside the offset band, which is what marching cubes needs to
+# find the level set at all.
+_SAMPLES_PER_DISTANCE = 3
+
+
+def offset_mesh(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    distance: float,
+    voxel_size: float | None = None,
+    *,
+    sign_mode: Literal["parity", "winding"] = "winding",
+    bounds: tuple[wp.vec3, wp.vec3] | None = None,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Offset a surface by a signed distance, through the level set of its distance field.
+
+    Positive grows the solid, negative shrinks it. The result is the exact set of points at distance
+    ``distance`` from the input, sampled at ``voxel_size`` -- so it handles the cases a per-vertex
+    displacement cannot: a shrink that makes a thin feature disappear, a growth that merges two
+    nearby sheets into one, and any offset of a surface with concave regions, where neighbouring
+    vertices moving along their own normals would cross.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer. Should describe a closed
+        surface; an open one still offsets, but only ``sign_mode="winding"`` gives it a meaningful
+        inside.
+    distance
+        Signed offset. Positive is outward.
+    voxel_size
+        Lattice spacing for the distance field. ``None`` derives it from ``distance`` --
+        ``|distance| / 3``, so three samples span the band the level set has to be found in --
+        clamped to between 64 and 256 samples across the mesh's bounding-box diagonal. The lower
+        bound matters: a *large* inward offset leaves a small object, and a spacing set by the
+        distance alone can be coarser than what is left of it.
+    sign_mode
+        Forwarded to
+        [`triwarp.proximity.signed_distance_grid`][triwarp.proximity.signed_distance_grid]. Defaults
+        to ``"winding"`` rather than ``"parity"``: an offset of a mesh with a few open rims is a
+        common ask, and parity is the mode that goes wrong on one.
+    bounds
+        ``(lower, upper)`` box to sample before padding. ``None`` uses the mesh's own box, which the
+        padding then extends to cover the offset.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        ``(vertices, faces)`` of the offset surface on ``vertices.device``. **Empty** when the level
+        set does not exist -- an inward offset larger than the object's own half-thickness has no
+        points at that distance, which is the right answer rather than an error.
+
+    Raises
+    ------
+    ValueError
+        If ``distance`` is zero, ``voxel_size`` is not positive, or ``faces`` is empty.
+
+    Examples
+    --------
+    ```python
+    grown_v, grown_f = tw.offset.offset_mesh(v, f, 0.1)
+    ```
+
+    Notes
+    -----
+    **The defaults are the whole value of this function over composing the two calls it makes.** The
+    field has to extend past the level set being extracted or that level set is clipped by the
+    lattice boundary, so the padding is ``ceil(distance / voxel_size) + 2`` cells for an outward
+    offset; and the spacing has to resolve the band, which is what ties it to ``distance`` rather
+    than to the mesh. Getting either wrong yields a *plausible* surface with a hole in it, which is
+    why they are computed here rather than left to the caller.
+
+    The output is a resampled surface: its triangulation is the marching-cubes lattice's, not the
+    input's, and its vertex count is set by ``voxel_size`` rather than by the input's. Where the
+    input's own triangulation must survive, the operation wanted is
+    [`thicken_mesh`][triwarp.offset.thicken_mesh], not this.
+
+    Accuracy is the lattice's, improved by marching cubes' linear interpolation across a cell.
+
+    See Also
+    --------
+    [`thicken_mesh`][triwarp.offset.thicken_mesh]
+        The topology-preserving shell, when the input triangulation should survive.
+    [`triwarp.proximity.signed_distance_grid`][triwarp.proximity.signed_distance_grid]
+        The field this extracts a level set from, when the field itself is wanted.
+    [`triwarp.reconstruction.marching_cubes`][triwarp.reconstruction.marching_cubes]
+        The extraction, and where the triangulation's own caveats live.
+    """
+    if distance == 0.0:
+        raise ValueError("distance must be non-zero; an offset of zero is a resampling")
+    if voxel_size is not None and voxel_size <= 0.0:
+        raise ValueError("voxel_size must be positive")
+    if int(faces.shape[0]) == 0:
+        raise ValueError("offset_mesh needs at least one face")
+
+    spacing = voxel_size
+    if spacing is None:
+        diagonal = float(tw.bounds.enclosing_diagonal(vertices))
+        # The band sets the spacing, and the two resolution bounds keep it usable: fine enough to
+        # resolve what survives the offset, coarse enough to allocate. See the constants.
+        spacing = min(
+            max(abs(distance) / _SAMPLES_PER_DISTANCE, diagonal / _MAX_AUTO_RESOLUTION),
+            diagonal / _MIN_AUTO_RESOLUTION,
+        )
+    # Only an outward offset leaves the input's box; an inward one needs just the two cells the
+    # field itself wants so that the surface is enclosed.
+    pad = 2 + (math.ceil(distance / spacing) if distance > 0.0 else 0)
+
+    field, box = tw.proximity.signed_distance_grid(
+        vertices, faces, spacing, bounds=bounds, pad=pad, sign_mode=sign_mode
+    )
+    return tw.reconstruction.marching_cubes(field, distance, bounds=box)
+
+
+def thicken_mesh(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    thickness: float,
+    *,
+    outside: float = 0.0,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Turn a surface into a solid shell of given thickness, keeping the input's triangulation.
+
+    The counterpart of [`offset_mesh`][triwarp.offset.offset_mesh] for the case where the answer
+    should still be *this* mesh: every vertex is displaced along its own angle-weighted normal, a
+    reversed copy of the surface becomes the shell's other side, and the two are joined along every
+    boundary edge by a quad band. So the output is the input's connectivity twice over plus the band
+    -- ``2 * n_faces + 2 * n_boundary_edges`` triangles -- and a per-vertex attribute follows
+    through by duplication, which no resampled offset allows.
+
+    On a **closed** surface there is no boundary to band, so the result is two nested shells: a
+    solid with a cavity, which is what thickening a closed surface means.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer, consistently wound. The
+        winding is what decides which side is "outside", so an inconsistent input gives a shell
+        turned inside out in places -- run
+        [`triwarp.repair.make_winding_consistent`][triwarp.repair.make_winding_consistent] first.
+    thickness
+        Distance the shell extends **inward**, opposite the vertex normals. Must be positive.
+    outside
+        Distance the shell also extends outward, so the input surface ends up ``outside`` in from
+        the outer face. Zero (the default) leaves the input surface as the outer face exactly.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+        ``(vertices, faces)`` on ``vertices.device``: ``2 * n_vertices`` positions -- the outward
+        layer first, then the inward one, so input vertex ``v`` is at ``v`` and at
+        ``v + n_vertices`` -- and ``2 * n_faces + 2 * n_boundary_edges`` triangles.
+
+    Raises
+    ------
+    ValueError
+        If ``thickness`` is not positive, ``outside`` is negative, or ``faces`` is empty.
+
+    Examples
+    --------
+    ```python
+    shell_v, shell_f = tw.offset.thicken_mesh(v, f, 0.05)
+    ```
+
+    Notes
+    -----
+    **It can self-intersect, and it does not check.** Displacing along vertex normals folds the
+    surface wherever ``thickness`` exceeds the local radius of curvature -- the inward layer of a
+    tube thickened past its own radius passes through itself -- and no per-vertex method avoids
+    that.
+    The condition is exactly
+    [`triwarp.validation.face_self_intersecting_mask`][triwarp.validation.face_self_intersecting_mask],
+    so it is detectable in one call; where it happens, the operation wanted is a level-set
+    [`offset_mesh`][triwarp.offset.offset_mesh], which cannot self-intersect by construction. Not
+    guarding is deliberate: the guard would be a whole-mesh intersection test on every call, and the
+    caller who needs it can run the one that names the faces.
+
+    The normals are **angle-weighted** (the pseudonormal), which is the weighting that makes the
+    displacement independent of how the incident triangles happen to be subdivided;
+    [`triwarp.vertices`][triwarp.vertices] documents the four choices.
+
+    See Also
+    --------
+    [`offset_mesh`][triwarp.offset.offset_mesh]
+        The resampling offset, for a shell that must not self-intersect.
+    [`triwarp.vertices.angle_weighted_vertex_normals`][triwarp.vertices.angle_weighted_vertex_normals]
+        The displacement direction.
+    [`triwarp.boundary.oriented_boundary_edges`][triwarp.boundary.oriented_boundary_edges]
+        Where the band's orientation comes from.
+    """
+    if thickness <= 0.0:
+        raise ValueError("thickness must be positive")
+    if outside < 0.0:
+        raise ValueError("outside must be non-negative")
+    if int(faces.shape[0]) == 0:
+        raise ValueError("thicken_mesh needs at least one face")
+
+    device = vertices.device
+    n_vertices = int(vertices.shape[0])
+    n_faces = int(faces.shape[0]) // 3
+    normals = tw.vertices.angle_weighted_vertex_normals(n_vertices, vertices, faces)
+    rim = tw.boundary.oriented_boundary_edges(vertices, faces)
+    n_rim = int(rim.shape[0])
+
+    out_vertices = wp.empty(2 * n_vertices, dtype=wp.vec3, device=device)
+    wp.launch(
+        kernel_offset.shell_vertices,
+        dim=n_vertices,
+        inputs=[vertices, normals, wp.float32(outside), wp.float32(thickness), out_vertices],
+        device=device,
+    )
+
+    out_faces = wp.empty(3 * (2 * n_faces + 2 * n_rim), dtype=wp.int32, device=device)
+    wp.launch(
+        kernel_offset.shell_faces,
+        dim=n_faces,
+        inputs=[faces, wp.int32(n_vertices), out_faces],
+        device=device,
+    )
+    if n_rim > 0:
+        wp.launch(
+            kernel_offset.shell_band_faces,
+            dim=n_rim,
+            inputs=[rim, wp.int32(n_vertices), wp.int32(6 * n_faces), out_faces],
+            device=device,
+        )
+    return out_vertices, out_faces
