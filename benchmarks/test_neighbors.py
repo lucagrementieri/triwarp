@@ -127,6 +127,11 @@ _GRID_BINS = [32, 256]
 # two points are roughly 8x apart in work.
 _RADIUS_SCALES = [2.0, 4.0]
 
+# Weight spreads for ``query_weighted_nearest``, in mean edge lengths. The weighted query has to
+# search out to ``answer + max_weight`` before it can certify, so this -- not the point count -- is
+# what drives its deepening rounds.
+_WEIGHT_SPREADS = [0.5, 4.0]
+
 # Query boxes for ``query_bvh_box``, far fewer than ``_N_QUERIES``. open3d's
 # ``AxisAlignedBoundingBox`` carries no index and no batch form, so its row is one Python call and
 # one full linear scan *per box*: at 20 000 boxes over bunny that is 7e8 point tests a round. 256
@@ -372,6 +377,57 @@ def test_query_hashgrid_nearest_k7(bench_case: BenchCase) -> None:
         assert indices.shape == (queries.shape[0], 7)
     else:
         _run_scipy(bench_case, 7)
+
+
+@pytest.mark.benchmark(group="query_weighted_nearest")
+@pytest.mark.benchlibs("triwarp")
+@pytest.mark.parametrize("weight_spread", _WEIGHT_SPREADS)
+def test_query_weighted_nearest(bench_case: BenchCase, weight_spread: float) -> None:
+    """
+    Additively weighted nearest site, and the axis is the **weight spread** rather than the mesh.
+
+    That axis is the whole cost model. Certification needs the search radius to exceed the answer's
+    distance by ``max_weight``, so a wide weight distribution forces more deepening rounds than a
+    narrow one over the identical geometry: the two points here are 0.5 and 4 mean edges of spread,
+    and everything else is held fixed. Read the ratio between them, not the absolute numbers.
+
+    **No reference row.** MeshLib's ``findClosestWeightedPoint`` is the only additively weighted
+    query in any installed library, and it reads each site's weight through a Python callback *and*
+    answers one query per call, so a row would price the interpreter twice over; the correctness
+    comparison lives in ``tests/test_neighbors.py`` as a ``benchmarked=False`` claim. Read this
+    group against ``query_bvh_nearest_k1`` instead, which is the same traversal with the weight
+    term dropped.
+
+    First measurement, medians on an RTX 5090 at 20 000 queries, 0.5 / 4.0 spread: **0.57 / 1.92 ms**
+    on ``bunny``, **0.44 / 1.64** on ``bunny_decimated``, **1.52 / 2.90** on ``dragon`` -- so an 8x
+    weight spread costs 1.9-3.7x, and the axis is doing what it was chosen for. Read each mesh's row
+    in isolation: measured back to back, ``bunny_decimated`` reported a 4.8 ms median for the 0.5
+    row when it followed another case in the same process against 0.44 ms alone.
+
+    That dragon number was **258 ms** before a float32 stall in the deepening loop was fixed (see
+    ``kernels/neighbors.query_weighted_nearest_neighbors``): 0.1% of queries never certified, burned
+    the whole 16-attempt budget and then scanned all 437k points. This group is what found it, which
+    is the argument for the benchmark landing with the function rather than after it.
+    """
+    skip_larger_than(bench_case, "dragon")
+    points, queries = bench_case.vertices_wp, _queries_wp(bench_case)
+    rng = np.random.default_rng(_SEED)
+    weights = wp.array(
+        (rng.random(bench_case.n_vertices) * weight_spread * bench_case.mean_edge).astype(
+            np.float32
+        ),
+        dtype=wp.float32,
+        device=bench_case.device,
+    )
+    bvh = _bvh(bench_case)
+    max_weight = float(weight_spread * bench_case.mean_edge)
+    indices, distances = bench_case.run(
+        lambda: tw.neighbors.query_weighted_nearest(
+            points, weights, queries, max_weight=max_weight, bvh=bvh
+        )
+    )
+    assert indices.shape == (queries.shape[0],)
+    assert distances.shape == (queries.shape[0],)
 
 
 @pytest.mark.benchmark(group="bvh_from_points")

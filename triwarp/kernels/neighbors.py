@@ -745,6 +745,65 @@ def hashgrid_nearest_kernel(k: int) -> wp.Kernel:
 
 
 @wp.kernel
+def query_weighted_nearest_neighbors(
+    points: wp.array[wp.vec3],
+    weights: wp.array[wp.float32],
+    queries: wp.array[wp.vec3],
+    bvh_id: wp.uint64,
+    max_weight: wp.float32,
+    initial_radius: wp.float32,
+    min_bound: wp.vec3,
+    max_bound: wp.vec3,
+    out_indices: wp.array[wp.int32],
+    out_distances: wp.array[wp.float32],
+) -> None:
+    # Nearest site under the *weighted* distance ``|p - q| - w(p)``, i.e. the Apollonius / power
+    # nearest neighbour. One site, so no candidate row and no register bucket: the whole k-NN row
+    # machinery above collapses to two scalars here.
+    #
+    # ``max_weight`` is what makes the search prunable, and it is the only thing that does. A site
+    # outside the cube of half-extent ``r`` has ``|p - q| > r``, so its score exceeds
+    # ``r - max_weight``; a best score at or below that bound is therefore certified, and the
+    # deepening target is ``best + max_weight`` -- which is always past the current ``r``, since
+    # failing the test means ``best + max_weight > r``. That is exactly ``deepen_radius``'s contract
+    # with the bound shifted, so the helper is shared with the k-NN kernels rather than re-derived.
+    #
+    # The test is spelled ``best + max_weight <= r`` and **not** the algebraically identical
+    # ``best <= r - max_weight``, because the deepening step sets ``r`` to ``best + max_weight``: in
+    # float32 the subtracted form can then fail against the very radius it just asked for, when
+    # ``best`` is large next to ``max_weight`` and the addition rounds. Measured on a 437k-point
+    # cloud with the queries 6.6 spacings off the surface: the subtracted form stalled at a fixed
+    # radius for the full 16-attempt budget on 0.1% of queries, each of which then paid the
+    # forced-complete final scan -- 437 757 candidates against a mean of 651. Computing the same
+    # expression on both sides makes the loop exact, and it is what keeps the worst case bounded.
+    tid = wp.tid()
+    q = queries[tid]
+
+    r_hard = complete_radius(q, min_bound, max_bound)
+    r = wp.min(initial_radius, r_hard)
+    best = FLOAT32_INF_CONSTANT
+    best_index = wp.int32(-1)
+    for attempt in range(MAX_SEARCH_ATTEMPTS):
+        if attempt == MAX_SEARCH_ATTEMPTS - 1:
+            r = r_hard  # forced-complete final attempt: exact whatever the growth did
+        query = wp.bvh_query_aabb(bvh_id, q - wp.vec3(r), q + wp.vec3(r), root=-1)
+        point_index = wp.int32(0)
+        while wp.bvh_query_next(query, point_index):
+            score = wp.length(points[point_index] - q) - weights[point_index]
+            if score < best:
+                best = score
+                best_index = point_index
+        if best + max_weight <= r:
+            break  # every site outside the cube scores worse than this: certified exact
+        if r >= r_hard:
+            break  # the scan was already complete, so the answer is final
+        r = deepen_radius(best + max_weight, r, r_hard)
+
+    out_indices[tid] = best_index
+    out_distances[tid] = best
+
+
+@wp.kernel
 def geodesic_ball_reference_neighbors(
     adj_offsets: wp.array[wp.int32],
     adj_columns: wp.array[wp.int32],

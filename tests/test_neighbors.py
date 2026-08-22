@@ -1005,6 +1005,109 @@ def test_query_nearest_rejects_negative_initial_radius(
         query_nearest(points_wp, points_wp, k=1, initial_radius=-1.0)
 
 
+@pytest.mark.parity(
+    "query_weighted_nearest",
+    "meshlib",
+    benchmarked=False,
+    reason="findClosestWeightedPoint reads every site's weight through a Python callback and "
+    "answers one query per call, so a timed row would price the interpreter twice over; no other "
+    "installed reference has an additively weighted query at all.",
+)
+def test_query_weighted_nearest_matches_meshlib(device: str) -> None:
+    """
+    Class A: the winner and its weighted distance, against MeshLib and brute force.
+
+    Three answers again, one of them exhaustive: the ``O(n*m)`` score matrix settles the truth and
+    MeshLib confirms the convention, which is the part worth confirming. Probed on the wheel, its
+    ``dist`` is exactly ``min(|p - q| - w(p))`` and its ``vId`` the argmin, so triwarp's return
+    needs no transform. Its ``pointWeight`` is a per-vertex Python callback and ``maxWeight``
+    defaults to **0.0**, which would silently prune the true winner on any positive weight set; both
+    are set explicitly here.
+
+    Non-vacuity is the real risk in this test, and it is measured rather than asserted loosely: with
+    weights drawn over 0.4 on a unit cube, **81%** of queries have a different winner than the
+    unweighted query, so the comparison could not pass by accident on a weight-blind implementation.
+    That fraction is asserted.
+    """
+    rng = np.random.default_rng(7)
+    points_np = rng.random((2000, 3)).astype(np.float32)
+    weights_np = (rng.random(2000) * 0.4).astype(np.float32)
+    queries_np = (rng.random((200, 3)) * 1.2 - 0.1).astype(np.float32)
+
+    score_np = np.linalg.norm(queries_np[:, None, :] - points_np[None], axis=-1) - weights_np[None]
+    nearest_np, weighted_np = score_np.argmin(1), score_np.min(1)
+    plain_np = np.linalg.norm(queries_np[:, None, :] - points_np[None], axis=-1).argmin(1)
+    assert (nearest_np != plain_np).mean() > 0.5  # the weights decide most queries, so not vacuous
+
+    index_wp, distance_wp = tw.neighbors.query_weighted_nearest(
+        wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device),
+        wp.array(weights_np, dtype=wp.float32, device=device),
+        wp.array(np.ascontiguousarray(queries_np), dtype=wp.vec3, device=device),
+    )
+    assert np.array_equal(index_wp.numpy(), nearest_np)
+    assert np.allclose(distance_wp.numpy(), weighted_np, rtol=1e-5, atol=1e-5)
+
+    tree_ml = mm.AABBTreePoints(points_to_meshlib(points_np))
+    params_ml = mm.DistanceFromWeightedPointsComputeParams()
+    params_ml.pointWeight = lambda vertex_id: float(weights_np[int(vertex_id)])
+    params_ml.maxWeight = float(weights_np.max())
+    params_ml.minWeight = float(weights_np.min())
+    for query_index in range(0, queries_np.shape[0], 8):  # every 8th: one Python call per query
+        result_ml = mm.findClosestWeightedPoint(
+            mm.Vector3f(*queries_np[query_index].tolist()), tree_ml, params_ml
+        )
+        assert int(result_ml.vId) == int(nearest_np[query_index])
+        assert np.isclose(result_ml.dist, weighted_np[query_index], rtol=1e-5, atol=1e-5)
+
+
+def test_query_weighted_nearest_conventions(device: str) -> None:
+    """
+    Not a library comparison: the ``w = 0`` identity, negative distances, and the two empty inputs.
+
+    Two claims that make the function's contract legible. At zero weights it *is*
+    [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] -- pinned as a
+    triwarp-against-triwarp check, where the oracle lives on the unweighted side (scipy, in the k-NN
+    tests above). And a query inside a site's radius reports a **negative** weighted distance, which
+    is the sign a caller reads to mean "covered".
+    """
+    rng = np.random.default_rng(8)
+    points_np = rng.random((300, 3)).astype(np.float32)
+    queries_np = rng.random((50, 3)).astype(np.float32)
+    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    queries_wp = wp.array(np.ascontiguousarray(queries_np), dtype=wp.vec3, device=device)
+
+    zero_wp = wp.zeros(300, dtype=wp.float32, device=device)
+    index_wp, distance_wp = tw.neighbors.query_weighted_nearest(points_wp, zero_wp, queries_wp)
+    plain_index_wp, plain_distance_wp = tw.neighbors.query_bvh_nearest(points_wp, queries_wp, k=1)
+    assert np.array_equal(index_wp.numpy(), plain_index_wp.numpy())
+    assert np.allclose(distance_wp.numpy(), plain_distance_wp.numpy(), rtol=1e-6, atol=1e-6)
+
+    covered_wp = wp.full(300, wp.float32(2.0), dtype=wp.float32, device=device)
+    _covered_index_wp, covered_distance_wp = tw.neighbors.query_weighted_nearest(
+        points_wp, covered_wp, queries_wp
+    )
+    assert np.all(covered_distance_wp.numpy() < 0.0)  # every query is inside every site's radius
+
+    empty_index_wp, empty_distance_wp = tw.neighbors.query_weighted_nearest(
+        points_wp, zero_wp, wp.empty(0, dtype=wp.vec3, device=device)
+    )
+    assert empty_index_wp.shape == (0,)
+    assert empty_distance_wp.shape == (0,)
+
+    no_sites_index_wp, no_sites_distance_wp = tw.neighbors.query_weighted_nearest(
+        wp.empty(0, dtype=wp.vec3, device=device),
+        wp.empty(0, dtype=wp.float32, device=device),
+        queries_wp,
+    )
+    assert np.all(no_sites_index_wp.numpy() == -1)
+    assert np.all(np.isinf(no_sites_distance_wp.numpy()))
+
+    with pytest.raises(ValueError, match="one entry per point"):
+        tw.neighbors.query_weighted_nearest(
+            points_wp, wp.zeros(2, dtype=wp.float32, device=device), queries_wp
+        )
+
+
 @pytest.mark.parity("nearest_neighbor_distance", "open3d")
 def test_nearest_neighbor_distance_matches_open3d(device: str) -> None:
     """

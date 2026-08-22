@@ -1309,6 +1309,123 @@ def query_hashgrid_nearest(
     return _shape_nearest(neighbor_indices, neighbor_distances, k, single_query)
 
 
+def query_weighted_nearest(
+    points: wp.array[wp.vec3],
+    weights: wp.array[wp.float32],
+    queries: wp.array[wp.vec3],
+    *,
+    max_weight: float | None = None,
+    bvh: wp.Bvh | None = None,
+    leaf_size: int = 4,
+) -> tuple[wp.array[wp.int32], wp.array[wp.float32]]:
+    """
+    Nearest site under the weighted distance ``|p - q| - w(p)``.
+
+    Each site carries a radius, and the winner is the one whose *surface* is closest rather than
+    whose centre is -- the additively weighted (Apollonius) nearest-neighbour query, which is what
+    picks the influencing site when the sites have different scales: a sphere set, a level-of-detail
+    cluster, a set of samples with per-sample confidence. Plain
+    [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest] is the ``w = 0`` case, and the two
+    genuinely differ -- on a random 40-site cloud, 1 query in 6 had a different winner.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` site positions as ``wp.vec3``.
+    weights
+        ``(n,)`` per-site weights, subtracted from the distance. Larger wins ties of distance; may
+        be negative, which pushes a site away.
+    queries
+        ``(m,)`` query positions as ``wp.vec3``.
+    max_weight
+        An **upper bound** on ``weights``, which is what makes the search prunable. ``None`` reduces
+        ``weights`` on the device and reads the maximum back (one readback, ~0.1 ms), so pass it
+        when the bound is already known -- a radius cap, or a previous call's reduction.
+    bvh
+        A ``wp.Bvh`` already built over ``points``, to spare the build.
+    leaf_size
+        Maximum primitives per BVH leaf when one is built here.
+
+    Returns
+    -------
+    index, weighted_distance
+        ``(m,)`` winning site per query and its ``|p - q| - w(p)``, which is **negative** wherever a
+        query lies inside a site's radius. A query with no site at all (an empty cloud) reports
+        ``-1`` and ``inf``.
+
+    Raises
+    ------
+    ValueError
+        If ``weights`` does not have one entry per point.
+
+    Notes
+    -----
+    ``max_weight`` is trusted, not checked: a bound *smaller* than some weight can silently prune
+    the true winner, and verifying it would cost the very reduction the parameter exists to avoid.
+    The default is therefore the safe one.
+
+    Exactness is the same argument the k-NN queries use, with the weight folded in: a site outside
+    the cube of half-extent ``r`` is farther than ``r``, so it scores worse than ``r - max_weight``,
+    and a best score at or below that bound cannot be beaten. Unlike a plain nearest query this
+    means the search radius must exceed the answer's distance *by the weight range*, so a wide
+    weight distribution costs more scans than a narrow one.
+
+    See Also
+    --------
+    [`query_bvh_nearest`][triwarp.neighbors.query_bvh_nearest]
+        The unweighted query, and the ``k > 1`` form. This one answers ``k = 1`` only, because no
+        caller has needed more.
+    """
+    device = points.device
+    n = int(points.shape[0])
+    m = int(queries.shape[0])
+    if int(weights.shape[0]) != n:
+        raise ValueError("weights must have one entry per point")
+
+    if m == 0:
+        return (
+            wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.float32, device=device),
+        )
+    if n == 0:
+        return (
+            wp.full(m, -1, dtype=wp.int32, device=device),
+            wp.full(m, float("inf"), dtype=wp.float32, device=device),
+        )
+
+    if bvh is None:
+        bvh = bvh_from_points(points, leaf_size=leaf_size)
+    if max_weight is None:
+        max_weight = float(cast(float, tw.reduce.max(weights)))
+    min_bound, max_bound = tw.bounds.aabb(points)
+    # First radius: the mean spacing's own estimate plus the weight bound, since a query cannot be
+    # certified below it however close its winner is.
+    initial_radius = knn_initial_radius(points, 1, bounds=(min_bound, max_bound)) + max(
+        max_weight, 0.0
+    )
+
+    out_indices = wp.empty(m, dtype=wp.int32, device=device)
+    out_distances = wp.empty(m, dtype=wp.float32, device=device)
+    wp.launch(
+        kernel_neighbors.query_weighted_nearest_neighbors,
+        dim=m,
+        inputs=[
+            points,
+            weights,
+            queries,
+            bvh.id,
+            wp.float32(max_weight),
+            wp.float32(initial_radius),
+            min_bound,
+            max_bound,
+            out_indices,
+            out_distances,
+        ],
+        device=device,
+    )
+    return out_indices, out_distances
+
+
 def nearest_neighbor_distance(points: wp.array[wp.vec3]) -> wp.array[wp.float32]:
     """
     Distance from each point to the closest *other* point of the same cloud.
