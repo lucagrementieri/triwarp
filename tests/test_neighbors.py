@@ -1093,6 +1093,66 @@ def test_nearest_neighbor_distance_coincident_and_degenerate(device: str) -> Non
         assert np.all(np.isinf(answer_wp))
 
 
+@pytest.mark.parity("closest_pair", "meshlib")
+def test_closest_pair_matches_meshlib(device: str) -> None:
+    """
+    Class A: the same pair and the same distance as ``findTwoClosestPoints``, plus brute force.
+
+    Three answers compared, two of them independent implementations and one exhaustive: the
+    ``O(n^2)`` NumPy distance matrix settles what the answer *is*, so the meshlib row proves the
+    reference agrees rather than defining the truth. The cloud is random and therefore tie-free,
+    which is what makes the *pair* comparable at all -- ties are a real possibility on a lattice and
+    the two libraries need not break them the same way.
+
+    Also asserts the pair is the argmin of
+    [`nearest_neighbor_distance`][triwarp.neighbors.nearest_neighbor_distance], the per-point form
+    of the same query: that is the invariant tying the two entry points together, and it is what
+    would break if the int64 key packing lost a bit.
+    """
+    rng = np.random.default_rng(5)
+    points_np = rng.random((500, 3)).astype(np.float32)
+
+    distance_np = np.linalg.norm(points_np[:, None, :] - points_np[None, :, :], axis=2)
+    np.fill_diagonal(distance_np, np.inf)
+    index_a_np, index_b_np = np.unravel_index(np.argmin(distance_np), distance_np.shape)
+
+    points_wp = wp.array(np.ascontiguousarray(points_np), dtype=wp.vec3, device=device)
+    index_a_wp, index_b_wp, distance_wp = tw.neighbors.closest_pair(points_wp)
+    assert {index_a_wp, index_b_wp} == {int(index_a_np), int(index_b_np)}
+    assert np.isclose(distance_wp, distance_np[index_a_np, index_b_np], rtol=1e-5, atol=1e-5)
+
+    pair_ml = mm.findTwoClosestPoints(points_to_meshlib(points_np))
+    assert {int(pair_ml[0]), int(pair_ml[1])} == {index_a_wp, index_b_wp}
+
+    per_point_wp = tw.neighbors.nearest_neighbor_distance(points_wp).numpy()
+    assert int(np.argmin(per_point_wp)) == index_a_wp
+    assert np.isclose(float(per_point_wp.min()), distance_wp, rtol=1e-6, atol=1e-6)
+
+
+def test_closest_pair_ties_and_degenerate(device: str) -> None:
+    """
+    Not a library comparison: the tie rule and the ``n < 2`` guard.
+
+    Exact duplicates make the distance zero at *two* indices, so the answer is a convention rather
+    than a measurement: the ``int64`` key stores the index in its low half, so a ``min`` reduction
+    defers to the smaller index. Pinned because a caller deduplicating a cloud reads ``index_a`` as
+    "the first offender" and a change here would silently move it.
+    """
+    duplicated_np = np.array(
+        [[0.0, 0.0, 0.0], [9.0, 0.0, 0.0], [0.0, 0.0, 0.0], [4.0, 4.0, 4.0]], dtype=np.float32
+    )
+    duplicated_wp = wp.array(duplicated_np, dtype=wp.vec3, device=device)
+    index_a_wp, index_b_wp, distance_wp = tw.neighbors.closest_pair(duplicated_wp)
+    assert (index_a_wp, index_b_wp) == (0, 2)
+    assert distance_wp == 0.0
+
+    for n_points in (0, 1):
+        with pytest.raises(ValueError, match="at least two points"):
+            tw.neighbors.closest_pair(
+                wp.array(np.zeros((n_points, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+            )
+
+
 def _geodesic_ball_neighborhoods_oracle(
     vertices_np: np.ndarray, faces_np: np.ndarray, radius: float, min_count: int = 6
 ) -> tuple[list[list[int]], np.ndarray]:

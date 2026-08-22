@@ -318,6 +318,27 @@ def unpack_farthest_index(key: wp.int64) -> wp.int32:
     return wp.int32(2147483647) - wp.int32(wp.uint32(wp.uint64(key) & wp.uint64(4294967295)))
 
 
+@wp.func
+def pack_nearest_key(distance: wp.float32, index: wp.int32) -> wp.int64:
+    # The ``min``-ordered twin of ``pack_farthest_key``: one int64 whose minimum is "smallest
+    # distance, lowest index on a tie". Same monotone IEEE-754 high half (valid because a distance
+    # is non-negative), but the index is stored plainly rather than complemented, because a
+    # *smaller* index must now compare *smaller*. The key stays non-negative, so it needs no
+    # sentinel.
+    distance_bits = wp.uint64(wp.uint32(wp.cast(distance, wp.int32)))
+    return wp.int64((distance_bits << wp.uint64(32)) | wp.uint64(wp.uint32(index)))
+
+
+@wp.kernel
+def nearest_pair_keys(
+    nearest_distances: wp.array2d[wp.float32], out_keys: wp.array[wp.int64]
+) -> None:
+    # One key per point, over column 1 of a ``k=2`` self-query table: column 0 is the point itself.
+    # The thread index is the payload, which is what keeps this a kernel rather than a ``wp.map``.
+    i = wp.int32(wp.tid())
+    out_keys[i] = pack_nearest_key(nearest_distances[i, 1], i)
+
+
 @wp.kernel
 def seed_farthest_point(
     start: wp.int32, out_selected: wp.array[wp.int32], out_cursor: wp.array[wp.int32]

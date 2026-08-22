@@ -555,6 +555,46 @@ def test_query_geodesic_ball(bench_case: BenchCase) -> None:
     assert offsets.shape == (vertices.shape[0],)
 
 
+@pytest.mark.benchmark(group="closest_pair")
+@pytest.mark.benchaxis("scale")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_closest_pair(bench_case: BenchCase) -> None:
+    """
+    The cloud's *minimum* spacing: the same ``k=2`` self-query, reduced to one pair.
+
+    Read next to ``nearest_neighbor_distance``, which is the same query returning the whole column:
+    the difference between the two rows is one ``int64`` key pass, one device reduction and two
+    single-element readbacks, so the pair prices what reducing on the device costs against handing
+    the array back.
+
+    meshlib's ``findTwoClosestPoints`` is the same answer and is batched and callback-free. Its point
+    tree is cached on the cloud, so the row drops it per round exactly as the
+    ``nearest_neighbor_distance`` row does -- otherwise the second round onward would time a query
+    against a warm tree while triwarp rebuilds its BVH inside every call.
+
+    First measurement, medians on an RTX 5090: triwarp-cuda **1.34 ms** against meshlib's **8.44**
+    at ``sphere_large``, **0.74** against **5.37** at ``sphere_med`` and **0.54** against **6.01** at
+    ``sphere_small`` -- so unlike most reductions in this suite the GPU row wins at every size, and
+    the reason is that the query dominates rather than the reduce. Read meshlib's *medians*: dropping
+    the cached tree per round leaves it with a 2-20 ms spread where triwarp's is under 5%.
+    """
+    if bench_case.kind == "meshlib":
+        cloud_ml = _cloud_ml(bench_case)  # held in a name: the tree is a raw pointer into it
+
+        def uncached_cloud_ml() -> mm.PointCloud:
+            cloud_ml.invalidateCaches()
+            return cloud_ml
+
+        pair_ml = bench_case.run(mm.findTwoClosestPoints, setup=uncached_cloud_ml)
+        assert len(pair_ml) == 2
+        return
+    points = bench_case.vertices_wp
+    index_a, index_b, distance = bench_case.run(lambda: tw.neighbors.closest_pair(points))
+    assert 0 <= index_a < bench_case.n_vertices
+    assert 0 <= index_b < bench_case.n_vertices
+    assert distance >= 0.0
+
+
 @pytest.mark.benchmark(group="nearest_neighbor_distance")
 @pytest.mark.benchaxis("scale")
 @pytest.mark.benchlibs("triwarp", "open3d", "meshlib")

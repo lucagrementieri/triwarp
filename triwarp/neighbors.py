@@ -17,12 +17,14 @@ import warnings
 from collections.abc import Callable
 from typing import Any, Literal, cast, overload
 
+import numpy as np
 import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import read_scalar
 from triwarp.kernels import neighbors as kernel_neighbors
+from triwarp.kernels import points as kernel_points
 from triwarp.kernels.algorithms import bfs as kernel_bfs
 
 # An axis counts towards a point cloud's effective dimension when its extent is at least this
@@ -1355,6 +1357,71 @@ def nearest_neighbor_distance(points: wp.array[wp.vec3]) -> wp.array[wp.float32]
     nearest = wp.empty(n, dtype=wp.float32, device=device)
     wp.copy(nearest, distances[:, 1])
     return nearest
+
+
+def closest_pair(points: wp.array[wp.vec3]) -> tuple[int, int, float]:
+    """
+    Find the two closest points of a cloud, and the distance between them.
+
+    The global minimum of
+    [`nearest_neighbor_distance`][triwarp.neighbors.nearest_neighbor_distance], with the partner
+    recovered -- so it is the same ``k=2`` self-query, reduced instead of returned.
+    Answers "does this cloud contain a near-duplicate, and where" in one call, which is the question
+    a tolerance for
+    [`triwarp.points.duplicate_point_mask`][triwarp.points.duplicate_point_mask] is normally chosen
+    from.
+
+    Parameters
+    ----------
+    points
+        ``(n,)`` point positions as ``wp.array[wp.vec3]``, ``n >= 2``.
+
+    Returns
+    -------
+    index_a, index_b, distance
+        The two point indices — ``index_a < n``, ``index_b`` its nearest neighbour — and their
+        Euclidean distance, all as Python scalars.
+
+    Raises
+    ------
+    ValueError
+        If ``points`` holds fewer than two points, which have no pair.
+
+    Notes
+    -----
+    Ties are broken toward the **lowest** ``index_a``: the reduction is a ``min`` over one ``int64``
+    per point holding the distance in the high half and the index in the low, so a shorter distance
+    wins and an equal distance defers to the smaller index. Exact duplicates therefore report the
+    first duplicated point at distance ``0.0``.
+
+    Two host readbacks, both unavoidable and both single-element: the reduction's result, and
+    ``index_b`` from the query table. Everything up to them stays on the device, so this does not
+    move the ``(n, 2)`` table across the bus.
+
+    See Also
+    --------
+    [`nearest_neighbor_distance`][triwarp.neighbors.nearest_neighbor_distance]
+        The per-point form, when every distance is wanted rather than the smallest.
+    [`triwarp.points.duplicate_point_mask`][triwarp.points.duplicate_point_mask]
+        Exact coincidence rather than proximity, and a mask rather than one pair.
+    """
+    n = int(points.shape[0])
+    if n < 2:
+        raise ValueError("closest_pair needs at least two points")
+
+    indices, distances = query_bvh_nearest(points, points, k=2)
+    keys = wp.empty(n, dtype=wp.int64, device=points.device)
+    wp.launch(
+        kernel_points.nearest_pair_keys, dim=n, inputs=[distances, keys], device=points.device
+    )
+
+    key = int(cast(int, tw.reduce.min(keys)))
+    index_a = key & 0xFFFFFFFF
+    # The high half is the distance's own float32 bits, so it decodes on the host for free rather
+    # than costing a third readback.
+    distance = float(np.array([key >> 32], dtype=np.uint32).view(np.float32)[0])
+    index_b = int(read_scalar(indices.flatten(), 2 * index_a + 1))
+    return index_a, index_b, distance
 
 
 def geodesic_ball(
