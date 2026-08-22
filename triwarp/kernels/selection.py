@@ -94,6 +94,14 @@ def region_boundary_flag(count: wp.int32, region_count: wp.int32) -> wp.bool:
 
 
 @wp.func
+def logical_not(flag: wp.bool) -> wp.bool:
+    # Mask complement, for a caller that has the region to *delete* and needs the one to keep. Warp
+    # exposes no ``logical_not`` builtin (``invert`` is the bitwise complement, which is wrong for a
+    # ``wp.bool``), so this is the one-line ``@wp.func`` ``wp.map`` needs.
+    return not flag
+
+
+@wp.func
 def keep_selected(selected: wp.bool, keep_flag: wp.int32) -> wp.bool:
     # Stay selected only if the vertex was selected and its component is not fully selected.
     return selected and keep_flag != 0

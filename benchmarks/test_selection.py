@@ -272,6 +272,85 @@ def test_submesh_from_face_indices(bench_case: BenchCase, unique_indices: bool) 
         assert len(parts[0].faces) == indices_np.shape[0]
 
 
+_region_cache: dict[tuple[str, str], tuple] = {}
+
+
+def _cap_region(bench_case: BenchCase) -> tuple:
+    """
+    A **contiguous** face region -- the cap above the mesh's 80th height percentile.
+
+    Contiguity is the point: a scattered mask opens one rim per face and turns a region deletion into
+    a hole-filling benchmark. One cap opens one rim, which is the shape a real region edit has.
+    """
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _region_cache:
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        height_np = vertices_np[faces_np].mean(axis=1)[:, 2]
+        mask_np = height_np > np.quantile(height_np, 0.8)
+        _region_cache[key] = (wp.array(mask_np, dtype=wp.bool, device=bench_case.device), mask_np)
+    return _region_cache[key]
+
+
+def _face_mask_ml(mask_np: np.ndarray) -> mm.FaceBitSet:
+    """
+    Load a dense face mask into a MeshLib ``FaceBitSet``, through the packed blocks.
+
+    The benchmark-side twin of ``tests.conversions.numpy_to_meshlib_bitset`` (the two suites do not
+    import each other), and the same reason it is one ``np.packbits`` rather than a per-face
+    ``set()`` loop: ``BitSet.fromBlocks`` takes ``uint64`` blocks, ``bitorder="little"`` is not
+    NumPy's default and is not optional, and ``fromBlocks`` rounds up to whole blocks so the size is
+    trimmed back after. It is ``setup`` work either way -- the region is an input.
+    """
+    packed_np = np.packbits(mask_np, bitorder="little")
+    packed_np = np.pad(packed_np, (0, (-packed_np.size) % 8)).view(np.uint64)
+    bitset_ml = mm.BitSet.fromBlocks(mm.std_vector_unsigned_long(packed_np.tolist()))
+    bitset_ml.resize(int(mask_np.size))
+    return mm.FaceBitSet(bitset_ml)
+
+
+@pytest.mark.benchmark(group="delete_region_keep_boundary")
+@pytest.mark.benchmeshes("sphere_med")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_delete_region_keep_boundary(bench_case: BenchCase) -> None:
+    """
+    Delete a contiguous face region and trace the rims it opened.
+
+    Read against ``submesh_from_face_indices`` above: the extraction is the same gather-and-remap,
+    and the difference between the two rows is the rim work -- one boundary-loop trace plus the
+    host-side classification that decides which loops are *new*. That classification is the reason
+    this is not simply the submesh call, and the reason it is worth its own row.
+
+    meshlib's ``delRegionKeepBd`` is the same operation and returns the rims as edge lists;
+    ``tests/test_selection.py`` pins the two to the same survivor count and the same loop lengths.
+    It mutates its mesh, so the row gets a fresh one per round.
+
+    First measurement, medians on an RTX 5090 at ``sphere_med``: triwarp-cuda **3.3 ms** against
+    meshlib's **0.40** -- **8.4x behind**, and attributed rather than left open. Of a 4.85 ms call,
+    ``boundary_loops`` on the survivor is **3.1 ms**, the submesh extraction 0.9, the input's rim
+    pass 0.46 and the host-side loop classification **0.04**. So the composition is not the problem
+    and neither is the host code: the loop trace is, and it is a function of its own with its own
+    group. Read this row's ratio as a statement about ``boundary_loops``. Note also a 1.7x
+    run-to-run spread measured on unchanged code here, so read medians across sessions with care.
+    """
+    if bench_case.kind == "meshlib":
+        _mask_wp, mask_np = _cap_region(bench_case)
+        region_ml = _face_mask_ml(mask_np)
+
+        loops_ml = bench_case.run(
+            lambda mesh: mm.delRegionKeepBd(mesh, region_ml, False), setup=bench_case.new_mesh_ml
+        )
+        assert len(loops_ml) >= 1
+        return
+
+    mask_wp, _mask_np = _cap_region(bench_case)
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    _kept_vertices, kept_faces, loops = bench_case.run(
+        lambda: tw.selection.delete_region_keep_boundary(vertices, faces, mask_wp)
+    )
+    assert int(kept_faces.shape[0]) > 0
+    assert len(loops) >= 1
+
+
 @pytest.mark.benchmark(group="exclude_fully_selected_components")
 @pytest.mark.benchaxis("components")
 @pytest.mark.benchlibs("triwarp")

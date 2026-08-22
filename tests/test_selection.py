@@ -15,7 +15,9 @@ from tests.comparisons import undirected_edges
 from tests.conversions import (
     meshlib_bitset_to_numpy,
     numpy_to_meshlib,
+    numpy_to_meshlib_bitset,
     pyvista_edges_to_indices,
+    trimesh_to_meshlib,
     trimesh_to_pymeshlab,
 )
 
@@ -226,6 +228,134 @@ def test_submeshes_from_face_groups_empty(device: str) -> None:
     assert vertices_all_wp.shape == (0,)
     assert vertex_offsets_wp.shape == (0,)
     assert faces_all_wp.shape == (0,)
+
+
+@pytest.mark.parametrize("mesh_name", ["icosphere", "half_torus"])
+def test_submesh_return_index_carries_an_attribute(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Not a library comparison: the vertex map is what it says, and it makes an attribute portable.
+
+    The map's whole purpose is that a per-vertex field survives the extraction, so the test is that
+    round trip rather than a property of the indices: gathering the *positions* through it must
+    reproduce the submesh's own vertex buffer, which is the strongest available check because the
+    extraction computes those positions by a different route.
+
+    Two structural claims beside it: the map is strictly ascending (it is the sorted unique
+    referenced set, which is what lets a caller treat it as a sorted lookup), and both entry points
+    agree -- ``submesh_from_face_mask`` is a thin wrapper and its map must be the index form's.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    rng = np.random.default_rng(11)
+    n_faces = mesh_tm.faces.shape[0]
+    face_mask_np = rng.random(n_faces) > 0.4
+    face_mask_np[rng.integers(0, n_faces)] = True
+    device = mesh_wp.points.device
+    face_mask_wp = wp.array(face_mask_np, dtype=wp.bool, device=device)
+
+    sub_vertices_wp, sub_faces_wp, vertex_index_wp = tw.selection.submesh_from_face_mask(
+        mesh_wp.points, mesh_wp.indices, face_mask_wp, return_index=True
+    )
+    vertex_index_np = vertex_index_wp.numpy()
+    assert vertex_index_np.shape == (int(sub_vertices_wp.shape[0]),)
+    assert np.all(np.diff(vertex_index_np) > 0)  # ascending, so it is a sorted lookup
+
+    # The round trip: an attribute gathered through the map is the submesh's own answer.
+    carried_wp = tw.array.gather(mesh_wp.points, vertex_index_wp)
+    assert np.allclose(carried_wp.numpy(), sub_vertices_wp.numpy())
+
+    _index_vertices_wp, _index_faces_wp, index_map_wp = tw.selection.submesh_from_face_indices(
+        mesh_wp.points,
+        mesh_wp.indices,
+        tw.array.flatnonzero(face_mask_wp),
+        unique_indices=True,
+        return_index=True,
+    )
+    assert np.array_equal(index_map_wp.numpy(), vertex_index_np)
+    assert int(sub_faces_wp.shape[0]) > 0
+
+
+@pytest.mark.parity("delete_region_keep_boundary", "meshlib")
+def test_delete_region_keep_boundary_matches_meshlib(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class B: the same survivors and the same opened rim as ``delRegionKeepBd``.
+
+    The region is a cap -- every face whose centroid is above ``z = 0.8`` -- because a *contiguous*
+    region opens exactly one rim, which is what makes the loop comparison a statement rather than a
+    coincidence. Measured: both sides keep **1 148** of 1 280 faces and report **one** loop of
+    **36** vertices.
+
+    MeshLib returns the rims as directed-edge lists and triwarp as vertex cycles, so the transform
+    is reading a length off each; the loop *count* and its length are the shared quantity, and the
+    survivors are compared as a face count. ``delRegionKeepBd`` mutates its mesh, so it gets a fresh
+    one, and ``keepLoneHoles=False`` is passed explicitly since it is the parameter that decides
+    whether a rim bounding nothing is reported.
+    """
+    mesh_tm, mesh_wp = icosphere
+    n_faces = mesh_tm.faces.shape[0]
+    region_np = np.asarray(mesh_tm.triangles_center)[:, 2] > 0.8
+    assert 0 < int(region_np.sum()) < n_faces  # the region is neither empty nor everything
+
+    region_wp = wp.array(region_np, dtype=wp.bool, device=mesh_wp.points.device)
+    kept_vertices_wp, kept_faces_wp, new_loops = tw.selection.delete_region_keep_boundary(
+        mesh_wp.points, mesh_wp.indices, region_wp
+    )
+
+    mesh_ml = trimesh_to_meshlib(mesh_tm)
+    region_ml = mm.FaceBitSet(numpy_to_meshlib_bitset(region_np))
+    region_ml.resize(n_faces)
+    loops_ml = mm.delRegionKeepBd(mesh_ml, region_ml, False)
+
+    assert int(kept_faces_wp.shape[0]) // 3 == mesh_ml.topology.numValidFaces()
+    assert len(new_loops) == len(loops_ml)
+    assert sorted(int(loop.shape[0]) for loop in new_loops) == sorted(
+        len(loop_ml) for loop_ml in loops_ml
+    )
+    # The rim is a real cycle in the kept mesh, which the loop lengths alone would not say.
+    kept_boundary_np = tw.boundary.boundary_edges(kept_vertices_wp, kept_faces_wp).numpy()
+    assert kept_boundary_np.shape[0] == sum(int(loop.shape[0]) for loop in new_loops)
+
+
+def test_delete_region_keep_boundary_reports_only_new_rims(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Not a library comparison: an input that already has a rim, which is where "new" earns its name.
+
+    On a closed mesh every loop of the survivor is new and the distinction is invisible. Here the
+    hemisphere arrives with one rim, and two regions are deleted: one **away** from that rim, which
+    must report exactly one new loop, and one **touching** it, which must report the *extended* loop
+    rather than nothing -- deleting a face on an existing rim grows that rim, and a caller filling
+    only "new" loops would otherwise leave the extension open. That is the "every edge was already a
+    boundary edge" rule the docstring states, and the case that rules out the naive "any edge".
+    """
+    mesh_tm, mesh_wp = hemisphere
+    n_faces = mesh_tm.faces.shape[0]
+    device = mesh_wp.points.device
+    rim_vertices_np = tw.boundary.boundary_vertex_indices(mesh_wp.points, mesh_wp.indices).numpy()
+    assert rim_vertices_np.size > 0  # the fixture has a rim to be confused by
+
+    faces_np = mesh_tm.faces
+    touches_rim_np = np.isin(faces_np, rim_vertices_np).any(axis=1)
+
+    # A region away from the rim: one new loop, and the original rim is not reported.
+    interior_np = np.zeros(n_faces, dtype=bool)
+    interior_np[np.flatnonzero(~touches_rim_np)[:6]] = True
+    _kept_vertices_wp, kept_faces_wp, interior_loops = tw.selection.delete_region_keep_boundary(
+        mesh_wp.points, mesh_wp.indices, wp.array(interior_np, dtype=wp.bool, device=device)
+    )
+    assert int(kept_faces_wp.shape[0]) // 3 == n_faces - int(interior_np.sum())
+    assert len(interior_loops) == 1
+
+    # A region on the rim: the loop it grows is reported, not skipped.
+    edge_np = np.zeros(n_faces, dtype=bool)
+    edge_np[np.flatnonzero(touches_rim_np)[:4]] = True
+    _edge_vertices_wp, _edge_faces_wp, edge_loops = tw.selection.delete_region_keep_boundary(
+        mesh_wp.points, mesh_wp.indices, wp.array(edge_np, dtype=wp.bool, device=device)
+    )
+    assert len(edge_loops) == 1
+    assert int(edge_loops[0].shape[0]) > rim_vertices_np.size  # the rim grew rather than vanished
 
 
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])

@@ -276,6 +276,87 @@ def test_fill_smooth(bench_case: BenchCase, triangulate_only: bool) -> None:
     assert result[1].shape[0] >= faces.shape[0]
 
 
+def _face_mask_ml(mask_np: np.ndarray) -> mm.FaceBitSet:
+    """
+    Load a dense face mask into a ``FaceBitSet`` through the packed blocks, not a per-face loop.
+
+    The benchmark-side twin of ``tests.conversions.numpy_to_meshlib_bitset``: ``BitSet.fromBlocks``
+    takes ``uint64`` blocks, ``bitorder="little"`` is not NumPy's default and is not optional, and
+    ``fromBlocks`` rounds up to whole blocks so the size is trimmed back after.
+    """
+    packed_np = np.packbits(mask_np, bitorder="little")
+    packed_np = np.pad(packed_np, (0, (-packed_np.size) % 8)).view(np.uint64)
+    bitset_ml = mm.BitSet.fromBlocks(mm.std_vector_unsigned_long(packed_np.tolist()))
+    bitset_ml.resize(int(mask_np.size))
+    return mm.FaceBitSet(bitset_ml)
+
+
+_region_cache: dict[tuple[str, str], tuple] = {}
+
+
+def _cap_region(bench_case: BenchCase) -> tuple:
+    """
+    A contiguous face region -- the cap above the mesh's 80th height percentile.
+
+    Contiguity is what makes this a region edit rather than a hole-filling benchmark: a scattered
+    mask opens one rim per face, and the DP is cubic in the rim length, so the two shapes are not
+    the same measurement at all.
+    """
+    key = (bench_case.mesh_name, str(bench_case.device))
+    if key not in _region_cache:
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        height_np = vertices_np[faces_np].mean(axis=1)[:, 2]
+        mask_np = height_np > np.quantile(height_np, 0.8)
+        _region_cache[key] = (wp.array(mask_np, dtype=wp.bool, device=bench_case.device), mask_np)
+    return _region_cache[key]
+
+
+@pytest.mark.benchmark(group="refill_region")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.parametrize("triangulate_only", [True, False], ids=["dp_only", "refined"])
+def test_refill_region(bench_case: BenchCase, triangulate_only: bool) -> None:
+    """
+    Delete a contiguous region and rebuild it: the deletion, the DP, and optionally the refinement.
+
+    Read against ``fill_smooth`` above, whose two rows are the same two stages over the mesh's
+    *existing* holes: the difference is the region extraction and the rim classification, which is
+    ``delete_region_keep_boundary``'s own group in ``test_selection.py``. Parametrized the same way
+    for the same reason -- a single refined number cannot say whether a change moved the DP or the
+    smoothing.
+
+    meshlib's ``patchMesh`` is exactly this call and ``tests/test_holes.py`` pins the two to the same
+    vertex count, face count and volume in ``triangulateOnly`` mode. It mutates, so it gets a fresh
+    mesh per round, and its region bitset is built in ``setup`` -- it is the input.
+
+    First measurement, medians on an RTX 5090, ``bunny`` with a fifth of its faces deleted:
+    triwarp-cuda **22.0 ms** against meshlib's **18.6** for ``dp_only`` (1.19x behind) and **58.4**
+    against **30.9** refined (1.9x). Both sides are dominated by the rim DP and the refinement here,
+    which is why this row is close where ``delete_region_keep_boundary``'s is 8x -- that group
+    isolates the extraction, and the extraction is the part triwarp does slowly.
+    """
+    if bench_case.kind == "meshlib":
+        _mask_wp, mask_np = _cap_region(bench_case)
+        settings_ml = mm.FillHoleNicelySettings()
+        settings_ml.triangulateOnly = triangulate_only
+
+        def run_ml() -> int:
+            mesh_ml = bench_case.new_mesh_ml()
+            region_ml = _face_mask_ml(mask_np)
+            mm.patchMesh(mesh_ml, region_ml, settings_ml)
+            return mesh_ml.topology.numValidFaces()
+
+        assert bench_case.run(run_ml, rounds=_ROUNDS) > 0
+        return
+
+    mask_wp, _mask_np = _cap_region(bench_case)
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    _out_vertices, out_faces = bench_case.run(
+        lambda: tw.holes.refill_region(vertices, faces, mask_wp, triangulate_only=triangulate_only),
+        rounds=_ROUNDS,
+    )
+    assert int(out_faces.shape[0]) > 0
+
+
 @pytest.mark.benchmark(group="fill_smooth_target_edge")
 @pytest.mark.benchaxis("loops_dense")
 @pytest.mark.benchlibs("triwarp")

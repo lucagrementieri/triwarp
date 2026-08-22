@@ -942,6 +942,125 @@ def fill_smooth(
     return (new_vertices, new_faces, out_patch) if return_patch else (new_vertices, new_faces)
 
 
+def refill_region(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_mask: wp.array[wp.bool],
+    metric: str = "plane_normalized",
+    *,
+    triangulate_only: bool = False,
+    max_edge: float | None = None,
+    smooth_curvature: bool = True,
+    return_patch: bool = False,
+) -> (
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+    | tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.bool]]
+):
+    """
+    Replace a face region with a fresh patch: delete it, then fill the hole nicely.
+
+    [`fill_smooth`][triwarp.holes.fill_smooth] applied to a region rather than to the mesh's own
+    holes -- the operation for *rebuilding* a piece of surface that is wrong rather than missing: a
+    self-intersecting band, a noisy patch, a set of faces a user painted. The region is removed, the
+    rims that opens are triangulated by the same minimum-weight DP, and the patch is refined and
+    smoothed to match its surroundings.
+
+    Only the rims the deletion **opened** are filled. An input that already had a boundary keeps it,
+    which is what makes this usable on an open mesh at all --
+    [`triwarp.selection.delete_region_keep_boundary`][triwarp.selection.delete_region_keep_boundary]
+    is where that distinction is drawn.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions on the target device.
+    faces
+        Length-``3 * n_faces`` flat triangle index buffer.
+    face_mask
+        Length-``n_faces`` ``wp.bool`` array, ``True`` for each face to **replace**.
+    metric
+        Minimum-weight fill metric, as in [`fill_min_weight`][triwarp.holes.fill_min_weight].
+    triangulate_only
+        Stop after the minimum-weight triangulation, skipping the refinement and smoothing. The
+        patch is then ``n - 2`` triangles per rim of ``n`` vertices and adds no new vertices.
+    max_edge
+        Target edge length for the refinement. ``None`` uses the mean rim edge length, so the
+        patch arrives at roughly the surrounding mesh's resolution.
+    smooth_curvature
+        Minimize curvature rather than area when smoothing the patch, as in
+        [`fill_smooth`][triwarp.holes.fill_smooth].
+    return_patch
+        Also return the per-face mask of the new patch, for a caller that wants to keep working on
+        it.
+
+    Returns
+    -------
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]] | tuple[..., wp.array[wp.bool]]
+        ``(vertices, faces)`` of the rebuilt mesh, plus the patch mask when ``return_patch`` is
+        ``True``. When the mask selects nothing, or selects faces whose removal opens no new rim,
+        the surviving mesh is returned with an all-``False`` patch.
+
+    Raises
+    ------
+    ValueError
+        If ``metric`` is not one of the supported metric names, or ``face_mask`` does not have one
+        entry per face.
+
+    Examples
+    --------
+    ```python
+    bad = tw.validation.face_self_intersecting_mask(v, f)
+    patched_v, patched_f = tw.holes.refill_region(v, f, bad)
+    ```
+
+    See Also
+    --------
+    [`fill_smooth`][triwarp.holes.fill_smooth]
+        The same pipeline over the mesh's existing holes, when nothing needs deleting first.
+    [`triwarp.selection.delete_region_keep_boundary`][triwarp.selection.delete_region_keep_boundary]
+        The first half, when the rims are wanted rather than filled.
+    [`triwarp.repair.remove_folded_faces`][triwarp.repair.remove_folded_faces]
+        One of several ways to produce the mask this takes.
+    """
+    if metric not in _METRIC_IDS:
+        raise ValueError(f"metric must be one of {sorted(_METRIC_IDS)}, got {metric!r}")
+
+    kept_vertices, kept_faces, new_loops = tw.selection.delete_region_keep_boundary(
+        vertices, faces, face_mask
+    )
+    device = faces.device
+    n_kept_faces = int(kept_faces.shape[0]) // 3
+    if not new_loops:
+        empty = _patch_mask(n_kept_faces, n_kept_faces, device)
+        result = (kept_vertices, kept_faces)
+        return (*result, empty) if return_patch else result
+
+    packed = _pack_loops(new_loops)
+    faces_filled = _fill_packed_loops(kept_vertices, kept_faces, packed, metric, True, True)
+    patch_mask = _patch_mask(n_kept_faces, int(faces_filled.shape[0]) // 3, device)
+    if triangulate_only:
+        result = (kept_vertices, faces_filled)
+        return (*result, patch_mask) if return_patch else result
+
+    target_edge = max_edge
+    if target_edge is None:
+        target_edge = _mean_rim_edge_length(kept_vertices, packed)
+    new_vertices, new_faces, out_patch = tw.smoothing.refine_and_smooth_region(
+        kept_vertices,
+        faces_filled,
+        int(kept_vertices.shape[0]),
+        patch_mask,
+        target_edge,
+        1000,
+        math.radians(30.0),
+        smooth_curvature,
+        True,
+        False,
+        "cotan",
+    )
+    return (new_vertices, new_faces, out_patch) if return_patch else (new_vertices, new_faces)
+
+
 def stitch(
     vertices_a: wp.array[wp.vec3],
     faces_a: wp.array[wp.int32],

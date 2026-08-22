@@ -320,8 +320,8 @@ def test_thicken_mesh_self_intersects_past_the_curvature_radius(
     Not a library comparison: the documented failure mode, asserted rather than left as prose.
 
     Displacing along vertex normals folds the surface wherever the thickness exceeds the local
-    radius of curvature, and this function deliberately does not guard against it -- the guard would be a
-    whole-mesh intersection test on every call. So the contract is that the condition is
+    radius of curvature, and this function deliberately does not guard against it: the guard would
+    be a whole-mesh intersection test on every call. So the contract is that the condition is
     *detectable*, and that is what is checked: ``half_torus``'s tube has minor radius 0.5 before
     its graded scaling, and thickening it by 0.6 makes the inward layer pass through the tube's own
     axis and out the other side. ``face_self_intersecting_mask`` flags **130** faces there and

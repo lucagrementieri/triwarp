@@ -14,7 +14,9 @@ from meshlib import mrmeshpy as mm
 import triwarp as tw
 from tests.comparisons import boundary_loop_sizes, canonical_winding, lexsort_rows
 from tests.conversions import (
+    meshlib_to_trimesh,
     numpy_to_meshlib,
+    numpy_to_meshlib_bitset,
     numpy_to_warp,
     trimesh_to_meshlib,
     trimesh_to_open3d,
@@ -1064,6 +1066,105 @@ def test_fill_smooth_statistics_vs_meshlib(device: str, hemisphere: tuple[tm.Tri
     volume_tw, _ = _mesh_volume_area(new_vertices.numpy(), new_faces.numpy().reshape(-1, 3))
     volume_ml = _meshlib_fill_nicely_volume(vertices_np, faces_np, max_edge)
     assert np.isclose(volume_tw, volume_ml, rtol=0.05)
+
+
+@pytest.mark.parity("refill_region", "meshlib")
+def test_refill_region_matches_meshlib(icosphere: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Class A on the triangulation, Class C on the refinement: the same patch as ``patchMesh``.
+
+    MeshLib's ``patchMesh`` is this operation -- delete a face region, fill the hole nicely -- and
+    in ``triangulateOnly`` mode the two agree **exactly**: measured 593 vertices, 1 182 faces and an
+    enclosed volume of 4.0771 against 4.0770 on a subdivision-3 icosphere with a cap of 132 faces
+    removed. That is as strong as this comparison can be, because the minimum-weight DP has one
+    answer and both implementations find it.
+
+    With refinement on, the two diverge by *density* rather than by shape -- each subdivides on its
+    own schedule (766 vertices here against MeshLib's 644) -- so that half is the enclosed volume,
+    which both bring back close to the original 4.1527: 4.1539 and 4.1372. The refined patch being
+    *nearer* the original than the flat one (4.0771) is what matters, and is asserted.
+
+    ``patchMesh`` mutates its mesh, so each mode gets a fresh one.
+    """
+    mesh_tm, mesh_wp = icosphere
+    n_faces = mesh_tm.faces.shape[0]
+    region_np = np.asarray(mesh_tm.triangles_center)[:, 2] > 0.8
+    assert 0 < int(region_np.sum()) < n_faces
+    region_wp = wp.array(region_np, dtype=wp.bool, device=mesh_wp.points.device)
+    volume_before = float(tw.measures.volume(mesh_wp.points, mesh_wp.indices))
+
+    flat_vertices_wp, flat_faces_wp = tw.holes.refill_region(
+        mesh_wp.points, mesh_wp.indices, region_wp, triangulate_only=True
+    )
+    mesh_flat_ml = trimesh_to_meshlib(mesh_tm)
+    region_flat_ml = mm.FaceBitSet(numpy_to_meshlib_bitset(region_np))
+    region_flat_ml.resize(n_faces)
+    flat_settings_ml = mm.FillHoleNicelySettings()
+    flat_settings_ml.triangulateOnly = True
+    patch_flat_ml = mm.patchMesh(mesh_flat_ml, region_flat_ml, flat_settings_ml)
+    flat_ml = meshlib_to_trimesh(mesh_flat_ml)
+
+    assert patch_flat_ml.count() > 0  # non-vacuity: the reference filled something
+    assert int(flat_vertices_wp.shape[0]) == flat_ml.vertices.shape[0]
+    assert int(flat_faces_wp.shape[0]) // 3 == flat_ml.faces.shape[0]
+    assert np.isclose(
+        float(tw.measures.volume(flat_vertices_wp, flat_faces_wp)),
+        flat_ml.volume,
+        rtol=1e-4,
+        atol=1e-6,
+    )
+    assert tw.validation.is_watertight(flat_vertices_wp, flat_faces_wp)
+
+    refined_vertices_wp, refined_faces_wp = tw.holes.refill_region(
+        mesh_wp.points, mesh_wp.indices, region_wp
+    )
+    mesh_refined_ml = trimesh_to_meshlib(mesh_tm)
+    region_refined_ml = mm.FaceBitSet(numpy_to_meshlib_bitset(region_np))
+    region_refined_ml.resize(n_faces)
+    mm.patchMesh(mesh_refined_ml, region_refined_ml, mm.FillHoleNicelySettings())
+    refined_ml = meshlib_to_trimesh(mesh_refined_ml)
+
+    volume_flat = float(tw.measures.volume(flat_vertices_wp, flat_faces_wp))
+    volume_refined = float(tw.measures.volume(refined_vertices_wp, refined_faces_wp))
+    assert np.isclose(volume_refined, refined_ml.volume, rtol=0.02)
+    # The refinement is worth having: it recovers curvature the flat cap loses.
+    assert abs(volume_refined - volume_before) < abs(volume_flat - volume_before)
+    assert tw.validation.is_watertight(refined_vertices_wp, refined_faces_wp)
+
+
+def test_refill_region_leaves_an_untouched_mesh_alone(
+    hemisphere: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Not a library comparison: an empty region, and one whose removal opens no *new* rim.
+
+    Both must return the surviving mesh with an all-``False`` patch rather than filling something.
+    The second case is the one worth pinning: deleting a face that lies on the hemisphere's existing
+    rim extends that rim, and the extension *is* reported as a loop -- so this asserts the opposite
+    case, an empty mask, where nothing is deleted and nothing may be filled. A version that filled
+    the input's own rim here would look like a working hole-filler and be the wrong function.
+    """
+    mesh_tm, mesh_wp = hemisphere
+    n_faces = mesh_tm.faces.shape[0]
+    empty_wp = wp.zeros(n_faces, dtype=wp.bool, device=mesh_wp.points.device)
+
+    vertices_wp, faces_wp, patch_wp = tw.holes.refill_region(
+        mesh_wp.points, mesh_wp.indices, empty_wp, return_patch=True
+    )
+    assert int(faces_wp.shape[0]) // 3 == n_faces
+    assert not bool(patch_wp.numpy().any())
+    assert np.allclose(vertices_wp.numpy(), mesh_wp.points.numpy())
+    # Still open: the rim it arrived with is untouched.
+    assert int(tw.boundary.boundary_edges(vertices_wp, faces_wp).shape[0]) > 0
+
+    with pytest.raises(ValueError, match="metric must be one of"):
+        tw.holes.refill_region(mesh_wp.points, mesh_wp.indices, empty_wp, metric="nonsense")
+    with pytest.raises(ValueError, match="one entry per face"):
+        tw.holes.refill_region(
+            mesh_wp.points,
+            mesh_wp.indices,
+            wp.zeros(3, dtype=wp.bool, device=mesh_wp.points.device),
+        )
 
 
 def test_fill_smooth_natural_smooth(device: str, icosphere: tuple[tm.Trimesh, wp.Mesh]):
