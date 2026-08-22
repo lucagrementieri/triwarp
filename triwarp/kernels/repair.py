@@ -2,6 +2,7 @@ import warp as wp
 
 from triwarp.kernels.array import update_argmin_pair
 from triwarp.kernels.halfedge import halfedge_destination
+from triwarp.kernels.predicates import triangle_aspect_ratio, triangle_normal
 from triwarp.kernels.triangles import corner_triple, triangle_cross
 
 
@@ -307,3 +308,88 @@ def emit_degree3_replacement(
     for k in range(3):
         out_dropped[ring_halfedges[begin + k] // 3] = True
         out_new_faces[slot, k] = halfedge_destination(faces, ring_halfedges[begin + k])
+
+
+@wp.kernel
+def collect_rim_links(
+    faces: wp.array[wp.int32],
+    twins: wp.array[wp.int32],
+    out_rim_next: wp.array[wp.int32],
+    out_rim_prev: wp.array[wp.int32],
+    out_rim_face: wp.array[wp.int32],
+) -> None:
+    # The rim as a per-vertex linked list, from the halfedges that have no twin. A boundary vertex
+    # of an edge-manifold mesh has exactly one outgoing boundary halfedge, so nothing races: each
+    # slot is written once. ``rim_face`` is the face owning the *outgoing* one, which is the face
+    # whose normal a new triangle at that vertex has to agree with.
+    h = wp.int32(wp.tid())
+    if twins[h] >= 0:
+        return
+    tail = faces[h]
+    tip = halfedge_destination(faces, h)
+    out_rim_next[tail] = tip
+    out_rim_prev[tip] = tail
+    out_rim_face[tail] = h // 3
+
+
+@wp.kernel
+def straighten_candidate_mask(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    face_normals: wp.array[wp.vec3],
+    rim_next: wp.array[wp.int32],
+    rim_prev: wp.array[wp.int32],
+    rim_face: wp.array[wp.int32],
+    min_normal_dot: wp.float32,
+    max_aspect_ratio: wp.float32,
+    out_candidate: wp.array[wp.bool],
+) -> None:
+    # A rim vertex whose notch can be closed by one triangle. The rim runs ``prev -> v -> next``
+    # with the surface on its left, so a face attached outside it must carry the halfedges
+    # ``v -> prev`` and ``next -> v`` -- which is the triangle ``(next, v, prev)``, and that winding
+    # is what makes the result consistently oriented rather than merely watertight.
+    #
+    # Two gates, both from the caller: the new triangle's normal must agree with the two rim faces
+    # it will border (which is what stops a *convex* corner being folded over), and its aspect ratio
+    # must be finite enough to be worth adding.
+    v = wp.int32(wp.tid())
+    previous = rim_prev[v]
+    following = rim_next[v]
+    if previous < 0 or following < 0 or previous == following:
+        return
+    normal = triangle_normal(vertices[following], vertices[v], vertices[previous])
+    if wp.length(normal) == 0.0:
+        return
+    if wp.dot(normal, face_normals[rim_face[previous]]) < min_normal_dot:
+        return
+    if wp.dot(normal, face_normals[rim_face[v]]) < min_normal_dot:
+        return
+    ratio = triangle_aspect_ratio(vertices[following], vertices[v], vertices[previous])
+    if ratio > max_aspect_ratio:
+        return
+    out_candidate[v] = True
+
+
+@wp.kernel
+def emit_straighten_faces(
+    faces: wp.array[wp.int32],
+    rim_next: wp.array[wp.int32],
+    rim_prev: wp.array[wp.int32],
+    candidate: wp.array[wp.bool],
+    cursor: wp.array[wp.int32],
+    out_new_faces: wp.array2d[wp.int32],
+) -> None:
+    # One new face per accepted notch, and only where no rim neighbour with a lower index also
+    # qualifies -- two adjacent notches share a rim edge, so filling both in one pass would attach
+    # two faces to it.
+    v = wp.int32(wp.tid())
+    if not candidate[v]:
+        return
+    previous = rim_prev[v]
+    following = rim_next[v]
+    if (candidate[previous] and previous < v) or (candidate[following] and following < v):
+        return
+    slot = wp.atomic_add(cursor, 0, 1)
+    out_new_faces[slot, 0] = following
+    out_new_faces[slot, 1] = v
+    out_new_faces[slot, 2] = previous

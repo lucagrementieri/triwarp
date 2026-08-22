@@ -939,3 +939,45 @@ def test_eliminate_degree3_vertices(bench_case: BenchCase) -> None:
     assert removed >= 0
     assert int(out_faces.shape[0]) <= int(faces.shape[0])
     assert int(out_vertices.shape[0]) <= bench_case.n_vertices
+
+
+@pytest.mark.benchmark(group="straighten_boundary")
+@pytest.mark.benchlibs("triwarp", "meshlib")
+def test_straighten_boundary(bench_case: BenchCase) -> None:
+    """
+    Closing rim notches: per pass, a halfedge build, a rim walk and one candidate test per vertex.
+
+    The cost is dominated by the halfedge build and the per-*vertex* candidate launch, so it tracks
+    the mesh rather than the rim -- which is the honest thing to say about it, since a rim is
+    ``O(sqrt(n_vertices))`` and the work is not. A rim-indexed candidate pass would fix that and is
+    the obvious follow-up; it is not done because the pass count is one by default.
+
+    meshlib's ``straightenBoundary`` is per **rim** and in place, so its row loops over
+    ``findHoleRepresentiveEdges`` on a fresh mesh per round, and its topology build is inside the
+    timed callable the way ours is. Both take the same two gates by the same definitions and agree
+    exactly on a ragged planar rim (``tests/test_repair.py``).
+
+    First measurement, medians on an RTX 5090: **0.70 ms** on ``bunny`` against meshlib's 9.20
+    (13.1x ahead) and **1.19 ms** on ``dragon`` against 56.05 (**47.3x**). Both rows carry their own
+    structure build, so the ratio is the parallel candidate test against a serial rim walk, and it
+    widens with the mesh exactly as that predicts. ``happy_buddha`` reads 1.39 ms.
+    """
+    if bench_case.kind == "meshlib":
+
+        def straighten_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(bench_case.vertices_np, bench_case.faces_np)
+            holes_ml = mesh_ml.topology.findHoleRepresentiveEdges()
+            for edge in holes_ml:
+                mm.straightenBoundary(mesh_ml, edge, 0.9, 10.0)
+            return len(holes_ml)
+
+        assert bench_case.run(straighten_ml, rounds=3) >= 0
+        return
+    if bench_case.mesh_name in {"bunny_decimated", "lucy"}:
+        pytest.skip(f"{bench_case.mesh_name} is not edge-manifold, so the rim cannot be walked")
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    straightened, added = bench_case.run(
+        lambda: tw.repair.straighten_boundary(vertices, faces), rounds=3
+    )
+    assert added >= 0
+    assert int(straightened.shape[0]) >= int(faces.shape[0])

@@ -615,6 +615,129 @@ def collapse_small_triangles(
     return current_vertices, current_faces
 
 
+def straighten_boundary(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    min_normal_dot: float = 0.9,
+    max_aspect_ratio: float = 10.0,
+    iterations: int = 1,
+) -> tuple[wp.array[wp.int32], int]:
+    """
+    Close concave notches in the mesh's rim, one triangle at a time.
+
+    A rim that came out of a clip, a decimation or a scan is *ragged*: it zig-zags by one triangle
+    even where the surface is smooth. Each pass adds the single triangle that spans a rim vertex's
+    two neighbours, wherever that triangle faces the same way as the surface it joins and is not a
+    sliver. No vertex moves and none is added -- the mesh only gains faces, so the interior is
+    untouched and every existing index stays valid.
+
+    Two gates, and both matter. ``min_normal_dot`` is what distinguishes a notch from a corner: a
+    *convex* rim corner would be closed by a triangle facing away from the surface, and filling it
+    folds the mesh over. ``max_aspect_ratio`` stops the pass trading a ragged rim for a fan of
+    slivers. Neither has a natural default, which is why both are keywords rather than constants.
+
+    Adjacent notches share a rim edge, so one pass closes a maximal independent set of them --
+    lowest index wins, deterministically -- and ``iterations`` passes go round again on what is
+    left. A pass that closes nothing ends the loop early.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions. Read only; nothing moves.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` triangle index buffer. Must be edge-manifold, since the
+        rim is found through the halfedge twins.
+    min_normal_dot
+        Minimum cosine between the new triangle's normal and each of the two rim faces it will
+        border. ``1.0`` accepts only a perfectly flat notch; ``0.0`` accepts any notch that is not
+        folded back on the surface.
+    max_aspect_ratio
+        Largest circum-radius over twice the in-radius the new triangle may have, as
+        [`face_quality`][triwarp.triangles.face_quality] measures it.
+    iterations
+        Number of independent-set passes.
+
+    Returns
+    -------
+    faces : wp.array[wp.int32]
+        Flat triangle index buffer with the new triangles appended. The vertex buffer is unchanged
+        and is not returned.
+    added : int
+        How many triangles were added. Zero means no notch passed both gates, and the buffer is the
+        input's.
+
+    Raises
+    ------
+    ValueError
+        If ``iterations`` is negative, or propagated from
+        [`halfedge_twins`][triwarp.halfedge.halfedge_twins] when the mesh is not edge-manifold.
+
+    See Also
+    --------
+    [`fill_min_weight`][triwarp.holes.fill_min_weight]
+        Closes a rim *completely*; this only tidies its shape and leaves it open.
+    [`ears`][triwarp.boundary.ears]
+        Finds the faces with two rim edges, which is the dual situation -- an ear sticks out where a
+        notch cuts in.
+    [`boundary_loops`][triwarp.boundary.boundary_loops]
+    """
+    if iterations < 0:
+        raise ValueError(f"iterations must be non-negative, got {iterations}")
+    device = faces.device
+    n_vertices = int(vertices.shape[0])
+    if n_vertices == 0 or int(faces.shape[0]) == 0 or iterations == 0:
+        return faces, 0
+
+    added = 0
+    for _ in range(iterations):
+        n_faces = int(faces.shape[0]) // 3
+        n_halfedges = 3 * n_faces
+        twins = tw.halfedge.halfedge_twins(faces, n_vertices=n_vertices)
+        rim_next = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
+        rim_prev = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
+        rim_face = wp.full(n_vertices, -1, dtype=wp.int32, device=device)
+        wp.launch(
+            kernel_repair.collect_rim_links,
+            dim=n_halfedges,
+            inputs=[faces, twins, rim_next, rim_prev, rim_face],
+            device=device,
+        )
+        candidate = wp.zeros(n_vertices, dtype=wp.bool, device=device)
+        wp.launch(
+            kernel_repair.straighten_candidate_mask,
+            dim=n_vertices,
+            inputs=[
+                vertices,
+                faces,
+                tw.triangles.face_normals_and_areas(vertices, faces)[0],
+                rim_next,
+                rim_prev,
+                rim_face,
+                wp.float32(min_normal_dot),
+                wp.float32(max_aspect_ratio),
+                candidate,
+            ],
+            device=device,
+        )
+        cursor = wp.zeros(1, dtype=wp.int32, device=device)
+        new_faces = twt.empty_2d((n_vertices, 3), wp.int32, device=device)
+        wp.launch(
+            kernel_repair.emit_straighten_faces,
+            dim=n_vertices,
+            inputs=[faces, rim_next, rim_prev, candidate, cursor, new_faces],
+            device=device,
+        )
+        # One readback per pass, and it is the loop's own stopping test: how many notches the pass
+        # actually closed is a device-side fact and a Python loop cannot branch on it otherwise.
+        n_added, (accepted,) = tw.array.trim_to_count(cursor, new_faces)
+        if n_added == 0:
+            break
+        faces = tw.array.concatenate([faces, accepted.reshape(3 * n_added)])
+        added += n_added
+    return faces, added
+
+
 def eliminate_degree3_vertices(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], *, max_iter: int = 8
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], int]:

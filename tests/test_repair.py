@@ -14,6 +14,7 @@ from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from tests.comparisons import (
+    assert_unordered_rows_equal,
     canonical_winding,
     hausdorff_surface_two_sided,
     lexsort_rows,
@@ -1934,6 +1935,120 @@ def test_fix_self_intersections_leaves_a_clean_mesh_alone(
         tw.repair.fix_self_intersections(vertices_wp, faces_wp, max_expand=-1)
     with pytest.raises(ValueError, match="max_iter"):
         tw.repair.fix_self_intersections(vertices_wp, faces_wp, max_iter=0)
+
+
+def _ragged_grid(device: str) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wp.array[wp.int32]]:
+    """
+    Build a flat grid with every third rim face removed, plus the intact grid for comparison.
+
+    Planar on purpose. The notches of a *curved* rim are slivers nearly perpendicular to the faces
+    they join -- on a sliced ``icosphere(3)`` rim, 21 candidates exist and every one fails both the
+    default ``max_aspect_ratio`` and any ``min_normal_dot`` above 0.5 -- so a curved fixture tests
+    the gates rejecting rather than the straightening working. On a plane the notch triangle is
+    exactly coplanar with its neighbours and well shaped, and the correct answer is the grid itself.
+    """
+    vertices_wp, faces_wp = tw.creation.grid(count=(8, 8), device=device)
+    n_faces = int(faces_wp.shape[0]) // 3
+    rim = set(tw.boundary.boundary_loops(vertices_wp, faces_wp)[0].numpy().tolist())
+    faces_np = faces_wp.numpy().reshape(-1, 3)
+    keep_np = np.ones(n_faces, dtype=bool)
+    rim_faces = [
+        index
+        for index in range(n_faces)
+        if sum(1 for corner in faces_np[index] if int(corner) in rim) >= 2
+    ]
+    for index in rim_faces[::3]:
+        keep_np[index] = False
+    ragged_vertices_wp, ragged_faces_wp = tw.selection.submesh_from_face_mask(
+        vertices_wp, faces_wp, wp.array(keep_np, dtype=wp.bool, device=device)
+    )
+    return ragged_vertices_wp, ragged_faces_wp, faces_wp
+
+
+@pytest.mark.parity("straighten_boundary", "meshlib")
+def test_straighten_boundary_matches_meshlib(device: str) -> None:
+    """
+    Class A on the triangles added, at matched thresholds -- the plan expected Class C.
+
+    ``straightenBoundary(mesh, bd, minNeiNormalsDot, maxTriAspectRatio)`` takes the same two gates
+    by the same definitions, and on a ragged planar rim the two agree exactly: both add **10**
+    triangles at ``(0.9, 10.0)``, taking 88 faces to 98. The face *sets* are compared too, as
+    unordered rows, so agreeing on the count alone could not hide a different choice of notch.
+
+    The reason the agreement can be exact here and not on a curved rim is the fixture: see
+    ``_ragged_grid``. And the answer is independently known -- 98 faces is the intact grid -- which
+    is what makes this stronger than two implementations agreeing with each other.
+    """
+    ragged_vertices_wp, ragged_faces_wp, grid_faces_wp = _ragged_grid(device)
+    n_ragged = int(ragged_faces_wp.shape[0]) // 3
+    assert n_ragged < int(grid_faces_wp.shape[0]) // 3  # non-vacuity: faces really were removed
+
+    straightened_wp, added = tw.repair.straighten_boundary(
+        ragged_vertices_wp, ragged_faces_wp, min_normal_dot=0.9, max_aspect_ratio=10.0, iterations=6
+    )
+    assert added > 0
+
+    mesh_ml = numpy_to_meshlib(
+        ragged_vertices_wp.numpy().astype(np.float64), ragged_faces_wp.numpy().reshape(-1, 3)
+    )
+    holes_ml = mesh_ml.topology.findHoleRepresentiveEdges()
+    assert len(holes_ml) == 1  # one rim, so the per-rim call covers the whole boundary
+    mm.straightenBoundary(mesh_ml, holes_ml[0], 0.9, 10.0)
+    faces_ml = np.asarray(meshlib_to_trimesh(mesh_ml).faces)
+
+    assert added == len(faces_ml) - n_ragged
+    assert_unordered_rows_equal(
+        canonical_winding(straightened_wp.numpy().reshape(-1, 3)), canonical_winding(faces_ml)
+    )
+
+
+def test_straighten_boundary_restores_the_grid(device: str) -> None:
+    """
+    Not a library comparison: the answer is known, so the invariant is an equality.
+
+    Straightening a grid whose rim faces were removed must give the **grid back** -- same face
+    count, same face set, and a rim perimeter of exactly 4.0 for the unit square, down from
+    6.0203. That is stronger than "the perimeter decreased", and it pins the winding of the added
+    triangles as well as their choice: a reversed one would leave the mesh non-manifold.
+
+    The gates are also asserted to *bind*. On this fixture the notches are coplanar, so
+    ``min_normal_dot`` up to 0.99 accepts all ten; at ``max_aspect_ratio`` below the notch
+    triangles' own ratio none is accepted, and the mesh comes back untouched. A test that only ran
+    the permissive case would not distinguish the gates from constants.
+    """
+    ragged_vertices_wp, ragged_faces_wp, grid_faces_wp = _ragged_grid(device)
+    loops_before = tw.boundary.boundary_loops(ragged_vertices_wp, ragged_faces_wp)
+    perimeter_before = float(
+        tw.boundary.loop_perimeters(ragged_vertices_wp, loops_before).numpy().sum()
+    )
+    assert perimeter_before > 4.0 + 1e-3  # non-vacuity: the rim really is ragged
+
+    straightened_wp, added = tw.repair.straighten_boundary(
+        ragged_vertices_wp, ragged_faces_wp, min_normal_dot=0.99, iterations=6
+    )
+    assert added == int(grid_faces_wp.shape[0]) // 3 - int(ragged_faces_wp.shape[0]) // 3
+    assert tw.validation.is_edge_manifold(straightened_wp)
+    loops_after = tw.boundary.boundary_loops(ragged_vertices_wp, straightened_wp)
+    assert len(loops_after) == 1
+    assert np.isclose(
+        float(tw.boundary.loop_perimeters(ragged_vertices_wp, loops_after).numpy().sum()),
+        4.0,
+        rtol=1e-6,
+    )
+    assert_unordered_rows_equal(
+        canonical_winding(straightened_wp.numpy().reshape(-1, 3)),
+        canonical_winding(grid_faces_wp.numpy().reshape(-1, 3)),
+    )
+
+    # The aspect-ratio gate binds: below the notch triangles' own ratio, nothing is accepted.
+    rejected_wp, rejected = tw.repair.straighten_boundary(
+        ragged_vertices_wp, ragged_faces_wp, max_aspect_ratio=1.0, iterations=6
+    )
+    assert rejected == 0
+    assert np.array_equal(rejected_wp.numpy(), ragged_faces_wp.numpy())
+
+    with pytest.raises(ValueError, match="iterations must be non-negative"):
+        tw.repair.straighten_boundary(ragged_vertices_wp, ragged_faces_wp, iterations=-1)
 
 
 def _mesh_with_a_degree3_vertex() -> tm.Trimesh:
