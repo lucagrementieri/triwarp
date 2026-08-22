@@ -24,6 +24,10 @@ INT64_MAX_CONSTANT = wp.constant(wp.int64(INT64_MAX))
 UINT64_MAX = 2**64 - 1
 UINT64_MAX_CONSTANT = wp.constant(wp.uint64(UINT64_MAX))
 FLOAT32_INF_CONSTANT = wp.constant(wp.INF)
+# The float64 twin, for a kernel that widens float32 geometry to make its *decisions* in double --
+# ``kernels/intersection.triangles_intersect`` is the one that does. ``wp.INF`` is a float32
+# constant, and mixing it into float64 arithmetic does not parse.
+FLOAT64_INF_CONSTANT = wp.constant(wp.float64(float("inf")))
 
 PI = wp.constant(wp.PI)
 TWO_PI = wp.constant(2 * wp.PI)

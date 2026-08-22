@@ -662,18 +662,18 @@ def test_face_self_intersecting_mask_on_an_interpenetrating_torus(
 
     A 16x16 torus whose tube is wider than its hole, so its inner wall passes through itself in a
     band -- and, being a regular grid, it is full of **parallel edges**. That is what makes it the
-    input this belongs on: the previous 11-axis separating-axis narrow phase projected onto
-    edge-edge cross products that *vanish* for parallel edges, read the collapsed interval as an
-    overlap, and flagged **128** faces where an exact ``float64`` Moller test and MeshLib both find
-    **64** -- the same 64, face for face. Moller's interval test now flags 62, missing 4 of the
-    exact answer and adding 2, all of them on the tangency where the two walls meet and float32
-    cannot decide.
+    input this belongs on, and it has caught two separate defects.
 
-    So the assert is a *count band* plus a subset relation rather than an equality: triwarp's answer
-    must sit within a few faces of MeshLib's and must not exceed it by more than a handful, which
-    the old 2x over-report would fail by a wide margin. The band is the honest form here, and
-    ``test_face_self_intersecting_mask_matches_meshlib`` above keeps the exact comparison on the
-    fixtures where both are decidable.
+    The first: an 11-axis separating-axis narrow phase projects onto edge-edge cross products that
+    *vanish* for parallel edges, read the collapsed interval as an overlap, and flagged **128**
+    faces where an exact ``float64`` Moller test and MeshLib both find **64** -- the same 64, face
+    for face. The second: Moller's interval test in ``float32`` then flagged **62**, missing 4 and
+    adding 2 on the tangency where the two walls meet. Running the same test in
+    ``float64`` -- the vertices are float32 either way, so only the *decisions* change -- lands on
+    **64** exactly.
+
+    So the assert is an equality now, in both directions, which is the strongest form available and
+    the one a return to either defect would fail.
     """
     mesh_tm, mesh_wp = torus_self_intersecting
     n_faces = mesh_tm.faces.shape[0]
@@ -685,8 +685,7 @@ def test_face_self_intersecting_mask_on_an_interpenetrating_torus(
     mask_ml = meshlib_bitset_to_numpy(colliding_ml, n_faces)
 
     assert int(mask_ml.sum()) == 64  # non-vacuity, and the number the old code doubled
-    assert abs(int(mask_wp.sum()) - 64) <= 8
-    assert int((mask_wp & ~mask_ml).sum()) <= 8  # no wholesale over-reporting
+    assert np.array_equal(mask_wp, mask_ml)
     assert tw.validation.is_self_intersecting(mesh_wp) is True
 
 
@@ -697,19 +696,20 @@ def test_face_self_intersecting_mask_tangential_contact_divergence(
     Not a parity assert: the input class where triwarp and MeshLib disagree, pinned with numbers.
 
     The Bohemian dome's two sheets meet along a curve they are *tangent* to rather than crossing
-    transversally, so which triangles count as crossing is decided in the last bits of ``float32``.
-    triwarp flags **160** of 3 042 faces and MeshLib **161**, disagreeing on **3**.
+    transversally, so which triangles count is decided at the tolerance. Both sides now find
+    **161** of 3 042 faces and disagree about **2** of them -- and against an exact ``float64``
+    arbiter it is *MeshLib* that has one false positive and one false negative there, while triwarp
+    matches exactly.
 
-    An earlier version of this test recorded 205 against 161 and called it two separating-axis
-    implementations classifying a band differently. That reading was wrong and the numbers said so
-    once arbitrated: an exact ``float64`` Moller test agreed with MeshLib on 42 of the 45 faces only
-    triwarp flagged, i.e. they were **false positives** from projecting onto a degenerate SAT axis
-    (parallel edges give a zero cross product, and the old code read the collapsed interval as an
-    overlap). The narrow phase is Moller's interval test now, and the residual 3 faces are genuine
-    float32 tangency -- the arbiter sides with triwarp on 2 of them and MeshLib on 1.
+    Two earlier readings of this test were wrong, which is why the history is kept. It first said
+    205 against 161 and called it two separating-axis implementations classifying a band
+    differently; arbitration showed 42 of those 45 extra faces were **false positives** from a
+    degenerate SAT axis. It then recorded 160 against 161 and called the remaining gap genuine
+    float32 tangency; running the same interval test in ``float64`` closed it. What is left is a
+    2-face disagreement that no longer favours the reference.
 
-    The bound is **0.5 %** of the faces rather than the 2 % that disagreement needed, which is what
-    makes this a regression test: reintroducing the degenerate-axis bug would take it back over 1 %.
+    The bound stays at **0.5 %** of the faces, which is what makes this a regression test: either
+    defect would take it back over 1 %.
     """
     mesh_tm, mesh_wp = bohemian_dome
     n_faces = mesh_tm.faces.shape[0]

@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.constants import (
-    FLOAT32_INF_CONSTANT,
+    FLOAT64_INF_CONSTANT,
     TOLERANCE_MERGE_CONSTANT,
     TOLERANCE_ZERO_CONSTANT,
 )
@@ -312,7 +312,7 @@ def triangle_aabb_overlap(
 
 
 @wp.func
-def plane_crossing_span(distance: wp.vec3, coordinate: wp.vec3) -> tuple[wp.bool, wp.vec2]:
+def plane_crossing_span(distance: wp.vec3d, coordinate: wp.vec3d) -> tuple[wp.bool, wp.vec2d]:
     # Where a triangle meets the other triangle's plane, as an interval along the two planes'
     # intersection line. ``distance`` holds its three vertices' signed distances to that plane and
     # ``coordinate`` their positions along the line's direction; each edge whose endpoints straddle
@@ -322,21 +322,22 @@ def plane_crossing_span(distance: wp.vec3, coordinate: wp.vec3) -> tuple[wp.bool
     # caller has already excluded -- it early-outs unless the distances genuinely straddle -- so it
     # is here for the one live case: a vertex on the plane with the other two on opposite sides,
     # which is a real crossing.
-    lo = FLOAT32_INF_CONSTANT
-    hi = -FLOAT32_INF_CONSTANT
+    lo = FLOAT64_INF_CONSTANT
+    hi = -FLOAT64_INF_CONSTANT
+    zero = wp.float64(0.0)
     for i in range(3):
         j = (i + 1) % 3
         first = distance[i]
         second = distance[j]
-        if first == 0.0:
+        if first == zero:
             lo = wp.min(lo, coordinate[i])
             hi = wp.max(hi, coordinate[i])
-        if first * second < 0.0:
+        if first * second < zero:
             weight = first / (first - second)
             crossing = coordinate[i] + weight * (coordinate[j] - coordinate[i])
             lo = wp.min(lo, crossing)
             hi = wp.max(hi, crossing)
-    return lo <= hi, wp.vec2(lo, hi)
+    return lo <= hi, wp.vec2d(lo, hi)
 
 
 @wp.func
@@ -364,28 +365,49 @@ def triangles_intersect(
     # 46-54k candidate pairs), and that is the right trade: both sit on the launch floor -- 5 us at
     # 50 000 pairs -- and the faster one was answering a different question. The cost is the
     # data-dependent edge loop in ``plane_crossing_span``, where SAT is straight-line arithmetic.
-    normal_a = wp.cross(a1 - a0, a2 - a0)
-    distance_b = wp.vec3(
-        wp.dot(normal_a, b0 - a0), wp.dot(normal_a, b1 - a0), wp.dot(normal_a, b2 - a0)
+    # **The arithmetic is float64 on float32 inputs**, and that is the load-bearing choice here.
+    # Widening a float32 is lossless, so this is the same geometry; what the extra precision buys is
+    # the *decisions* -- the sign of a plane distance, and the comparison of two intervals. Audited
+    # pair by pair over the 13 011 broad-phase candidates of the Roman surface: the float32 kernel
+    # agreed with this same algorithm in float64 on 97.6 % of them, while a float32 *reference* with
+    # a different association order agreed with that kernel on 99.6 %. Those two numbers together
+    # are what say the residual was arithmetic and not logic.
+    #
+    # It costs **2.1x on this kernel** (48 against 22 us at ~52k candidate pairs, measured
+    # interleaved on three self-intersecting surfaces) and **~4 % end to end**, because the narrow
+    # phase is only 6-8 % of ``face_self_intersecting_mask``'s wall clock -- the BVH build, the
+    # broad phase and the scan are the rest. That is the trade, and its docstring records what the
+    # accuracy buys.
+    da0 = kernel_array.to_vec3d(a0)
+    da1 = kernel_array.to_vec3d(a1)
+    da2 = kernel_array.to_vec3d(a2)
+    db0 = kernel_array.to_vec3d(b0)
+    db1 = kernel_array.to_vec3d(b1)
+    db2 = kernel_array.to_vec3d(b2)
+    zero = wp.float64(0.0)
+
+    normal_a = wp.cross(da1 - da0, da2 - da0)
+    distance_b = wp.vec3d(
+        wp.dot(normal_a, db0 - da0), wp.dot(normal_a, db1 - da0), wp.dot(normal_a, db2 - da0)
     )
     # Entirely in one closed half-space of A's plane: separated, coplanar, or touching at most.
-    if wp.min(distance_b) >= 0.0 or wp.max(distance_b) <= 0.0:
+    if wp.min(distance_b) >= zero or wp.max(distance_b) <= zero:
         return False
 
-    normal_b = wp.cross(b1 - b0, b2 - b0)
-    distance_a = wp.vec3(
-        wp.dot(normal_b, a0 - b0), wp.dot(normal_b, a1 - b0), wp.dot(normal_b, a2 - b0)
+    normal_b = wp.cross(db1 - db0, db2 - db0)
+    distance_a = wp.vec3d(
+        wp.dot(normal_b, da0 - db0), wp.dot(normal_b, da1 - db0), wp.dot(normal_b, da2 - db0)
     )
-    if wp.min(distance_a) >= 0.0 or wp.max(distance_a) <= 0.0:
+    if wp.min(distance_a) >= zero or wp.max(distance_a) <= zero:
         return False
 
     # Both straddle, so the planes are neither parallel nor coincident and this cannot vanish.
     direction = wp.cross(normal_a, normal_b)
     valid_a, span_a = plane_crossing_span(
-        distance_a, wp.vec3(wp.dot(direction, a0), wp.dot(direction, a1), wp.dot(direction, a2))
+        distance_a, wp.vec3d(wp.dot(direction, da0), wp.dot(direction, da1), wp.dot(direction, da2))
     )
     valid_b, span_b = plane_crossing_span(
-        distance_b, wp.vec3(wp.dot(direction, b0), wp.dot(direction, b1), wp.dot(direction, b2))
+        distance_b, wp.vec3d(wp.dot(direction, db0), wp.dot(direction, db1), wp.dot(direction, db2))
     )
     if not valid_a or not valid_b:
         return False

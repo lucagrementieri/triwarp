@@ -372,14 +372,34 @@ def face_self_intersecting_mask(
     [`is_self_intersecting`][triwarp.validation.is_self_intersecting] is ``True`` iff any entry
     of this mask is ``True``.
 
-    A pair that is coplanar, or that touches without crossing, is not an intersection. Where the
-    contact is *tangential* the answer is decided in the last bits of ``float32`` and can differ
-    from a ``float64`` reference by a few faces: measured against MeshLib's
-    ``findSelfCollidingTrianglesBS(touchIsIntersection=False)`` on the six self-intersecting
-    parametric surfaces, **exact agreement on ``boy`` (177 faces) and ``klein`` (203)**, 3 faces
-    apart on ``bohemian_dome`` and 2 on ``cross_cap``, and further apart only on the two whose
-    self-intersection is a singular *curve* (16 on ``figure8_klein``, 60 on ``roman``, where
-    MeshLib's own touch setting moves it by 282). Compare counts, not sets, on that class.
+    A pair that is coplanar, or that touches without crossing, is not an intersection.
+
+    **The narrow phase runs in ``float64`` on the ``float32`` vertices**, and the reason is worth
+    knowing rather than taking as caution: widening is lossless, so the geometry is unchanged, and
+    what the precision buys is the decisions -- the sign of a plane distance and the overlap of two
+    intervals. Audited face for face against an independent ``float64`` Moller implementation over
+    the six self-intersecting parametric surfaces plus a self-intersecting torus, at a
+    scale-relative tolerance of ``1e-9``:
+
+    | input | reference | this | MeshLib |
+    |---|---|---|---|
+    | ``boy`` | 177 | **177** | 177 |
+    | ``klein`` | 203 | **203** | 203 |
+    | ``bohemian_dome`` | 161 | **161** | 161, 1 wrong either way |
+    | ``figure8_klein`` | 174 | **174** | 190, 16 wrong |
+    | ``torus`` (16x16) | 64 | **64** | 64 |
+    | ``cross_cap`` | 73 | 74 | 74 |
+    | ``roman`` | 154 | 158 | 158 |
+
+    Exact on five of seven, and identical to MeshLib on the other two -- where both differ from the
+    reference by 4 faces or fewer, all of them a vertex lying *on* the other triangle's plane, which
+    is a tolerance choice rather than a fact. In ``float32`` the same audit read 20 false positives
+    and 88 false negatives on ``roman`` alone, 2 and 4 on the torus, and 1 false negative on the
+    dome. The cost is ~4 % of this call (the narrow phase is 6-8 % of it and doubles).
+
+    Where a comparison against another library is wanted on the singular-curve class (``roman``,
+    ``cross_cap``), compare **counts, not sets**: which faces sit exactly on a tangency is the part
+    no two implementations agree on.
 
     Parameters
     ----------
