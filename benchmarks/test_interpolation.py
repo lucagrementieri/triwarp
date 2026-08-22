@@ -287,6 +287,46 @@ def test_transfer_onto_vertices(bench_case: BenchCase) -> None:
     assert transferred.shape == (n_vertices,)
 
 
+@pytest.mark.benchmark(group="transfer_through_operator")
+@pytest.mark.benchlibs("triwarp")
+def test_transfer_through_operator(bench_case: BenchCase) -> None:
+    """
+    Carry a per-vertex field through one Loop pass, using the pass's own interpolation operator.
+
+    Two numbers worth having next to each other, and the group times only the second: assembling the
+    operator (``subdivide_loop(return_operator=True)``, done in ``setup`` so it is *not* timed) and
+    applying it to a field. Read the timed number against ``transfer_onto_vertices`` above, which
+    answers the same question -- "the field, on the subdivided mesh" -- through a closest-point
+    projection instead, and is both lossy and far more expensive because it walks a BVH per vertex.
+
+    **No reference row.** No installed library returns a subdivision's interpolation matrix at all,
+    which is the gap the operator closes; ``tests/test_remesh.py`` therefore carries an
+    invariant-only claim (the operator reproduces the pass's own positions) rather than a library
+    comparison, and this group contributes no parity pair by construction.
+
+    First measurement, medians on an RTX 5090: **118 us** on ``bunny`` and **120** on
+    ``bunny_decimated`` -- flat, because the row is one CSR pass and the field is small next to the
+    launch floor. ``transfer_onto_vertices`` on the same ``bunny`` field is **814 us**, so the
+    operator is ~7x cheaper *and* exact where the projection is lossy; the projection's advantage is
+    that it needs no operator, which is the trade the two docstrings state.
+    """
+    skip_larger_than(bench_case, "bunny", "one Loop pass quadruples the face count")
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    values = _vertex_field_wp(bench_case)
+
+    def build() -> object:
+        _new_vertices, _new_faces, operator = tw.remesh.subdivide_loop(
+            vertices, faces, return_operator=True
+        )
+        return operator
+
+    n_out = int(build().nrow)  # type: ignore[attr-defined]
+    transferred = bench_case.run(
+        lambda operator: tw.interpolation.transfer_through_operator(values, operator), setup=build
+    )
+    assert transferred.shape == (n_out,)
+
+
 @pytest.mark.benchmark(group="interpolate_from_points")
 @pytest.mark.benchlibs("triwarp", "pyvista")
 @pytest.mark.parametrize("neighborhood", [8, 64])

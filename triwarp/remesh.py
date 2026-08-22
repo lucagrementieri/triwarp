@@ -2319,9 +2319,23 @@ def subdivide(
     return new_vertices, _split_faces_four(faces, inverse, n_vertices)
 
 
+@overload
 def subdivide_loop(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
-) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    return_operator: Literal[False] = False,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]: ...
+@overload
+def subdivide_loop(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], *, return_operator: Literal[True]
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32], wps.BsrMatrix[wp.float32]]: ...
+def subdivide_loop(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], *, return_operator: bool = False
+) -> (
+    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
+    | tuple[wp.array[wp.vec3], wp.array[wp.int32], wps.BsrMatrix[wp.float32]]
+):
     """
     Subdivide a mesh with one pass of Loop subdivision.
 
@@ -2350,17 +2364,41 @@ def subdivide_loop(
         ``(n_vertices,)`` mesh vertex positions on the target device.
     faces
         Length-``3 * n_faces`` flat triangle index buffer.
+    return_operator
+        If ``True``, also return the sparse interpolation operator ``P`` this pass applies, so that
+        ``new_vertices == P @ vertices`` and **any** per-vertex attribute can be carried through the
+        subdivision by the same matrix (see
+        [`triwarp.interpolation.transfer_through_operator`][triwarp.interpolation.transfer_through_operator]).
 
     Returns
     -------
-    tuple[wp.array[wp.vec3], wp.array[wp.int32]]
-        ``(new_vertices, new_faces)`` on ``vertices.device``. ``new_vertices`` holds the
-        ``n_vertices`` relocated originals first and then one vertex per unique edge, so its leading
-        ``n_vertices`` rows are the input vertex set *displaced* -- unlike ``subdivide``, where that
-        prefix is unchanged.
+    new_vertices : wp.array[wp.vec3]
+        Positions on ``vertices.device``: the ``n_vertices`` relocated originals first and then one
+        vertex per unique edge, so the leading ``n_vertices`` rows are the input vertex set
+        *displaced* -- unlike ``subdivide``, where that prefix is unchanged.
+    new_faces : wp.array[wp.int32]
+        Flat ``3 * 4 * n_faces`` triangle index buffer.
+    operator : warp.sparse.BsrMatrix
+        Only when ``return_operator`` is ``True``: the ``(n_vertices + n_edges, n_vertices)``
+        ``float32`` matrix of Loop weights, one row per output vertex in the same layout as
+        ``new_vertices``. Every row sums to 1.
 
     Notes
     -----
+    **Why an operator rather than an index map.** Every other topology edit here reports provenance
+    as one ``int32`` per output element, because each output comes from exactly one input. A Loop
+    vertex does not: an odd vertex is an affine combination of four inputs and an even vertex of its
+    whole 1-ring, so no index map can express it, and an attribute cannot otherwise be carried
+    through this function at all. The operator is the honest form, it is the standard prolongation
+    object (``kernels/algorithms/multigrid.py`` builds one for a different purpose), and it costs
+    nothing unless asked for.
+
+    The operator is assembled from the same three grids and through the same two weight functions
+    (``kernels/remesh.loop_odd_weights`` / ``loop_even_weights``) that the position kernels use, so
+    the two cannot drift onto different surfaces. It is *not* used to compute the positions -- those
+    stay two direct kernels, since a ``bsr_from_triplets`` build plus a ``bsr_mv`` would make every
+    caller pay for the matrix.
+
     Four launches over three grids -- faces, unique edges, vertices -- plus the shared topology.
     Neither stencil needs an ordered 1-ring: the valence and the ring sum come from an atomic pass
     over the *unique* edges, which is the deduplicated neighbour count ``igl::loop`` reads off a
@@ -2380,6 +2418,9 @@ def subdivide_loop(
     n_vertices = int(vertices.shape[0])
     n_faces = int(faces.shape[0]) // 3
     if n_faces == 0:
+        if return_operator:
+            # No faces means no edges and no relocation, so the pass is the identity.
+            return vertices, faces, wps.bsr_identity(n_vertices, wp.float32, device=device)
         return vertices, faces
 
     unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
@@ -2432,7 +2473,81 @@ def subdivide_loop(
         outputs=[new_vertices[n_vertices:]],
         device=device,
     )
-    return new_vertices, _split_faces_four(faces, inverse, n_vertices)
+    new_faces = _split_faces_four(faces, inverse, n_vertices)
+    if not return_operator:
+        return new_vertices, new_faces
+    return (
+        new_vertices,
+        new_faces,
+        _loop_operator(
+            faces, unique_edges, inverse, edge_face_count, valence, boundary_count, n_vertices
+        ),
+    )
+
+
+def _loop_operator(
+    faces: wp.array[wp.int32],
+    unique_edges: twt.Array2dInt32,
+    inverse: wp.array[wp.int32],
+    edge_face_count: wp.array[wp.int32],
+    valence: wp.array[wp.int32],
+    boundary_count: wp.array[wp.int32],
+    n_vertices: int,
+) -> wps.BsrMatrix[wp.float32]:
+    """
+    Assemble one Loop pass as a sparse interpolation matrix, from the pass's own intermediates.
+
+    Three launches over the three grids the positions come from -- vertices, unique edges, faces --
+    writing into one triplet buffer. ``bsr_from_triplets`` sums coincident entries, which is what
+    lets the odd rows' 3/8 endpoints (edge grid) and 1/8 wings (face grid) be emitted independently.
+    """
+    device = faces.device
+    n_faces = int(faces.shape[0]) // 3
+    n_unique = int(unique_edges.shape[0])
+    edge_base = n_vertices
+    face_base = edge_base + 4 * n_unique
+    rows, cols, values = tw.array.triplet_buffers(face_base + 3 * n_faces, wp.float32, device)
+
+    wp.launch(
+        kernel_remesh.loop_even_self_triplets,
+        dim=n_vertices,
+        inputs=[valence, boundary_count, rows, cols, values],
+        device=device,
+    )
+    wp.launch(
+        kernel_remesh.loop_edge_triplets,
+        dim=n_unique,
+        inputs=[
+            unique_edges,
+            edge_face_count,
+            valence,
+            boundary_count,
+            wp.int32(n_vertices),
+            wp.int32(edge_base),
+            rows,
+            cols,
+            values,
+        ],
+        device=device,
+    )
+    wp.launch(
+        kernel_remesh.loop_opposite_triplets,
+        dim=n_faces,
+        inputs=[
+            faces,
+            inverse,
+            edge_face_count,
+            wp.int32(n_vertices),
+            wp.int32(face_base),
+            rows,
+            cols,
+            values,
+        ],
+        device=device,
+    )
+    return wps.bsr_from_triplets(
+        n_vertices + n_unique, n_vertices, rows, cols, values, prune_numerical_zeros=False
+    )
 
 
 def _split_faces_four(

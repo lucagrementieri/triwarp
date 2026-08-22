@@ -15,6 +15,7 @@ from scipy.spatial import KDTree
 import triwarp as tw
 from tests.comparisons import hausdorff_surface_two_sided, lexsort_rows, undirected_edges
 from tests.conversions import (
+    bsr_to_csr,
     bsr_to_dense,
     faces_igl,
     meshlib_to_trimesh,
@@ -1930,6 +1931,137 @@ def test_subdivide_loop_empty(device: str) -> None:
     vertices_new_wp, faces_new_wp = tw.remesh.subdivide_loop(vertices_wp, faces_wp)
     assert int(vertices_new_wp.shape[0]) == 0
     assert int(faces_new_wp.shape[0]) == 0
+
+
+@pytest.mark.parametrize("mesh_name", _LOOP_FIXTURES)
+def test_subdivide_loop_operator_reproduces_its_own_positions(
+    mesh_name: str, request: pytest.FixtureRequest
+) -> None:
+    """
+    Not a library comparison: the operator *is* the pass, so applying it to the vertices is exact.
+
+    No reference library returns Loop's interpolation matrix, so there is nothing to compare against
+    -- and nothing is needed, because the claim is an identity rather than an agreement:
+    ``P @ vertices`` must be the vertex buffer the same call returned. That is the strongest
+    available check on the weights, since it fails if any single stencil is emitted with a different
+    weight than the position kernel used, and it is why the operator is assembled through the same
+    two shared ``@wp.func`` weight helpers rather than by a second transcription of the rules.
+
+    Three further invariants, each excluding a different way to be wrong: every row sums to **1**
+    (an affine combination, so a rigid motion of the input moves the output rigidly), the shape is
+    ``(n_out, n_in)`` with ``n_out`` the returned vertex count, and the default two-value call
+    returns the identical positions -- the operator costs nothing when it is not asked for.
+
+    The tolerance is ``1e-6`` rather than exact: a row sum accumulates in column order where the
+    kernel sums the 1-ring first, and in float32 those differ in the last bits. Measured
+    max deviation 1.2e-07 over these four fixtures.
+    """
+    _, mesh_wp = request.getfixturevalue(mesh_name)
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    n_vertices = int(vertices_wp.shape[0])
+
+    moved_wp, subdivided_faces_wp, operator = tw.remesh.subdivide_loop(
+        vertices_wp, faces_wp, return_operator=True
+    )
+    assert int(operator.nrow) == int(moved_wp.shape[0])
+    assert int(operator.ncol) == n_vertices
+
+    operator_np = bsr_to_csr(operator)
+    assert np.allclose(np.asarray(operator_np.sum(axis=1)).ravel(), 1.0, rtol=1e-6, atol=1e-6)
+    assert np.allclose(operator_np @ vertices_wp.numpy(), moved_wp.numpy(), rtol=1e-6, atol=1e-6)
+
+    plain_vertices_wp, plain_faces_wp = tw.remesh.subdivide_loop(vertices_wp, faces_wp)
+    assert np.array_equal(plain_faces_wp.numpy(), subdivided_faces_wp.numpy())
+    # Positions from two separate calls, not compared byte for byte: the ring sums are accumulated
+    # with atomics, so their float32 order varies run to run on CUDA.
+    assert np.allclose(plain_vertices_wp.numpy(), moved_wp.numpy(), rtol=1e-6, atol=1e-6)
+
+
+def test_subdivide_loop_operator_carries_a_field(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh],
+) -> None:
+    """
+    Not a library comparison: what the operator is *for* -- a field surviving the subdivision.
+
+    Two properties of an affine interpolation operator, both of which a wrong operator fails: a
+    constant field stays constant everywhere (rows summing to 1), and a field that is linear in the
+    vertex positions stays linear, because the operator reproduces those positions exactly. The
+    second is the one that catches weights placed on the wrong *columns*: a permuted operator still
+    has unit row sums.
+
+    Covers the three dtypes the transfer registers, since each is a separately compiled overload:
+    ``wp.float32``, ``wp.vec2`` (a UV) and ``wp.vec3`` (a colour or a normal).
+    """
+    _, mesh_wp = icosphere_coarse
+    vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
+    n_vertices = int(vertices_wp.shape[0])
+    device = vertices_wp.device
+
+    moved_wp, _faces_wp, operator = tw.remesh.subdivide_loop(
+        vertices_wp, faces_wp, return_operator=True
+    )
+    n_out = int(moved_wp.shape[0])
+
+    constant_wp = wp.full(n_vertices, wp.float32(2.5), dtype=wp.float32, device=device)
+    carried_wp = tw.interpolation.transfer_through_operator(constant_wp, operator)
+    assert carried_wp.shape == (n_out,)
+    assert np.allclose(carried_wp.numpy(), 2.5, rtol=1e-6, atol=1e-6)
+
+    # A linear field: f(v) = dot(v, direction). Linear in the positions, so the transferred field
+    # must equal the same function of the *moved* positions.
+    direction_np = np.array([0.3, -0.7, 0.2], dtype=np.float32)
+    linear_np = mesh_wp.points.numpy() @ direction_np
+    linear_wp = wp.array(linear_np, dtype=wp.float32, device=device)
+    carried_linear_np = tw.interpolation.transfer_through_operator(linear_wp, operator).numpy()
+    assert np.allclose(carried_linear_np, moved_wp.numpy() @ direction_np, rtol=1e-5, atol=1e-5)
+
+    # vec3: transferring the positions themselves is the operator's own identity.
+    carried_positions_wp = tw.interpolation.transfer_through_operator(vertices_wp, operator)
+    assert np.allclose(carried_positions_wp.numpy(), moved_wp.numpy(), rtol=1e-6, atol=1e-6)
+
+    # vec2: a UV pair whose components sum to one stays a partition, since the rows are affine.
+    uv_np = np.ascontiguousarray(
+        np.stack([np.linspace(0.0, 1.0, n_vertices), np.linspace(1.0, 0.0, n_vertices)], axis=1),
+        dtype=np.float32,
+    )
+    carried_uv_np = tw.interpolation.transfer_through_operator(
+        wp.array(uv_np, dtype=wp.vec2, device=device), operator
+    ).numpy()
+    assert carried_uv_np.shape == (n_out, 2)
+    assert np.allclose(carried_uv_np.sum(axis=1), 1.0, rtol=1e-6, atol=1e-6)
+
+
+def test_transfer_through_operator_guards_and_empty_inputs(device: str) -> None:
+    """
+    Not a library comparison: the column-count guard, and the two degenerate shapes.
+
+    An empty face buffer makes the pass the identity, which is asserted here rather than left
+    implicit: a caller subdividing a point set should get its field back unchanged rather than an
+    exception or an empty answer.
+    """
+    vertices_wp = wp.array(
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        dtype=wp.vec3,
+        device=device,
+    )
+    faces_wp = wp.empty(0, dtype=wp.int32, device=device)
+    _vertices_wp, _faces_wp, identity = tw.remesh.subdivide_loop(
+        vertices_wp, faces_wp, return_operator=True
+    )
+    assert int(identity.nrow) == 3
+    assert int(identity.ncol) == 3
+    field_wp = wp.array(
+        np.array([1.0, 2.0, 3.0], dtype=np.float32), dtype=wp.float32, device=device
+    )
+    assert np.allclose(
+        tw.interpolation.transfer_through_operator(field_wp, identity).numpy(),
+        np.array([1.0, 2.0, 3.0]),
+    )
+
+    with pytest.raises(ValueError, match="columns"):
+        tw.interpolation.transfer_through_operator(
+            wp.zeros(2, dtype=wp.float32, device=device), identity
+        )
 
 
 # --------------------------------------------------------------------------------------

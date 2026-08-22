@@ -27,6 +27,7 @@ from __future__ import annotations
 from typing import TypeVar
 
 import warp as wp
+import warp.sparse as wps
 
 import triwarp as tw
 import triwarp.typing as twt
@@ -270,6 +271,97 @@ def transfer_onto_vertices(
         device=device,
     )
     return out_values, distance
+
+
+def transfer_through_operator(
+    values: wp.array[DType], operator: wps.BsrMatrix[wp.float32]
+) -> wp.array[DType]:
+    """
+    Carry a per-vertex field through a topology edit, using the edit's own interpolation operator.
+
+    The companion of [`triwarp.remesh.subdivide_loop`][triwarp.remesh.subdivide_loop]'s
+    ``return_operator``: that pass moves *and* creates vertices, so an output vertex is an affine
+    combination of several input ones and no index map can express the correspondence. The operator
+    can, and applying it to a field is the same product that produced the new positions:
+    ``transfer_through_operator(vertices, P)`` reproduces the subdivided vertex buffer, which is
+    what makes this exact rather than a resampling.
+
+    Prefer this over
+    [`transfer_onto_vertices`][triwarp.interpolation.transfer_onto_vertices] whenever the operator
+    is available: that one projects onto the source surface and is therefore lossy by construction,
+    where this one applies the very weights the edit used.
+
+    Parameters
+    ----------
+    values
+        Length-``n_source`` field on the input vertices. Any **float32-based** Warp dtype closed
+        under scaling and addition: ``wp.float32`` for a scalar, ``wp.vec2`` for a UV, ``wp.vec3``
+        for a normal or a colour. Not ``wp.float64`` -- see Notes.
+    operator
+        ``(n_out, n_source)`` ``float32`` interpolation matrix, as returned by
+        ``subdivide_loop(..., return_operator=True)``.
+
+    Returns
+    -------
+    wp.array[DType]
+        Length-``n_out`` transferred field on ``values.device``, of the same dtype as ``values``.
+
+    Raises
+    ------
+    ValueError
+        If the operator's column count does not match ``values``.
+
+    Examples
+    --------
+    ```python
+    field = tw.vertices.area_weighted_vertex_normals(int(v.shape[0]), v, f)  # per-vertex field
+    fine_v, fine_f, prolongation = tw.remesh.subdivide_loop(v, f, return_operator=True)
+    fine_field = tw.interpolation.transfer_through_operator(field, prolongation)
+    ```
+
+    Notes
+    -----
+    An output row the operator leaves empty gets the dtype's zero rather than uninitialized memory,
+    so a partial operator is safe to apply.
+
+    ``warp.sparse.bsr_mv`` would serve for a ``float32`` field and nothing else -- its vector dtype
+    has to match the matrix's 1x1 block -- so this goes through a small CSR kernel instead, which is
+    what makes the ``wp.vec2`` and ``wp.vec3`` cases (a UV, a colour) reachable at all.
+
+    The field's scalar must be ``float32`` because the operator's weights are: Warp requires both
+    operands of a product to share a scalar type, so a ``wp.float64`` field does not compile against
+    a float32 operator. Cast it with ``wp.utils.array_cast`` if that is what you hold. The
+    restriction is honest rather than incidental -- these operators are assembled from float32
+    vertex data, so carrying a float64 field through one would advertise precision the weights do
+    not have.
+
+    See Also
+    --------
+    [`triwarp.remesh.subdivide_loop`][triwarp.remesh.subdivide_loop]
+        The one edit in this package that publishes such an operator.
+    [`transfer_onto_vertices`][triwarp.interpolation.transfer_onto_vertices]
+        The lossy alternative, for when the two meshes are related only by geometry.
+    [`triwarp.array.gather`][triwarp.array.gather]
+        What to use instead where the edit *can* report an index map -- ``split_edges`` and
+        ``subdivide_to_size`` both do, and a gather through their ``index`` is the whole transfer.
+    """
+    device = values.device
+    n_source = int(values.shape[0])
+    n_out = int(operator.nrow)
+    if int(operator.ncol) != n_source:
+        raise ValueError(f"operator has {operator.ncol} columns but values has {n_source} entries")
+
+    out_values = wp.zeros(n_out, dtype=values.dtype, device=device)
+    if n_out == 0 or n_source == 0:
+        return out_values
+
+    wp.launch(
+        kernel_interpolation.apply_transfer_operator,
+        dim=n_out,
+        inputs=[operator.offsets, operator.columns, operator.values, values, out_values],
+        device=device,
+    )
+    return out_values
 
 
 def interpolate_from_points(

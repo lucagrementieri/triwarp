@@ -44,6 +44,13 @@ LOOP_BOUNDARY_NEIGHBOR = wp.constant(wp.float32(1.0 / 8.0))
 LOOP_BETA_VALENCE_3 = wp.constant(wp.float32(3.0 / 16.0))
 LOOP_BETA_NUMERATOR = wp.constant(wp.float32(3.0 / 8.0))
 
+# Which of Loop's three even-vertex rules applies, as returned by ``loop_even_weights``. The mode is
+# what a caller needs beyond the two weights, because the neighbour weight lands on a *different*
+# neighbour set in each case: none, the boundary neighbours only, or the whole 1-ring.
+LOOP_EVEN_KEEP = wp.constant(wp.int32(0))
+LOOP_EVEN_BOUNDARY = wp.constant(wp.int32(1))
+LOOP_EVEN_INTERIOR = wp.constant(wp.int32(2))
+
 
 @wp.func
 def edge_midpoint(
@@ -145,6 +152,43 @@ def loop_vertex_rings(
         wp.atomic_add(out_boundary_sum, v1, p0)
 
 
+@wp.func
+def loop_odd_weights(edge_face_count: wp.int32) -> tuple[wp.float32, wp.float32]:
+    # Loop's odd (edge) stencil as weights: 3/8 on each endpoint and 1/8 on each opposite vertex for
+    # an interior edge, the midpoint rule otherwise. A boundary edge (one face) or a non-manifold
+    # one (three or more) has no well-defined pair of opposite vertices, so both fall back together.
+    #
+    # Shared by the position kernel and the interpolation-operator triplet kernels: the rule is one
+    # decision and lives in one place, since a copy that drifted would put the operator and the
+    # positions ``subdivide_loop`` returns onto different surfaces.
+    if edge_face_count == 2:
+        return LOOP_ODD_ENDPOINT, LOOP_ODD_OPPOSITE
+    return wp.float32(0.5), wp.float32(0.0)
+
+
+@wp.func
+def loop_even_weights(
+    valence: wp.int32, boundary_count: wp.int32
+) -> tuple[wp.float32, wp.float32, wp.int32]:
+    # Loop's even (original) stencil as (self weight, neighbour weight, mode); see the LOOP_EVEN_*
+    # constants for the mode. Warren's beta -- 3/16 at valence 3 and 3/(8n) above it -- which is the
+    # variant ``igl::loop`` uses, not Loop's original trigonometric weight. Shared for the same
+    # reason as ``loop_odd_weights``.
+    if boundary_count == 2:
+        # Boundary vertex: 3/4 of itself, 1/8 of each neighbour *along the boundary*. Its interior
+        # neighbours do not enter, which is what keeps a shared boundary curve identical on both
+        # sides of a seam.
+        return LOOP_BOUNDARY_SELF, LOOP_BOUNDARY_NEIGHBOR, LOOP_EVEN_BOUNDARY
+    if boundary_count == 0 and valence > 0:
+        beta = LOOP_BETA_VALENCE_3
+        if valence != 3:
+            beta = LOOP_BETA_NUMERATOR / wp.float32(valence)
+        return wp.float32(1.0) - wp.float32(valence) * beta, beta, LOOP_EVEN_INTERIOR
+    # Anything else keeps its position: an isolated vertex with no edges, or a non-manifold boundary
+    # vertex where one or three-plus boundary edges meet and neither stencil is defined.
+    return wp.float32(1.0), wp.float32(0.0), LOOP_EVEN_KEEP
+
+
 @wp.kernel
 def loop_odd_positions(
     vertices: wp.array[wp.vec3],
@@ -156,12 +200,8 @@ def loop_odd_positions(
     # Loop's odd (edge) vertices: 3/8 on each endpoint and 1/8 on each of the two opposite vertices.
     e = wp.int32(wp.tid())
     endpoints = vertices[unique_edges[e, 0]] + vertices[unique_edges[e, 1]]
-    if edge_face_count[e] == 2:
-        out_positions[e] = LOOP_ODD_ENDPOINT * endpoints + LOOP_ODD_OPPOSITE * edge_opposite_sum[e]
-    else:
-        # A boundary edge (one face) or a non-manifold one (three or more): the interior stencil
-        # needs exactly two opposite vertices, so both take the midpoint rule instead.
-        out_positions[e] = wp.float32(0.5) * endpoints
+    endpoint_weight, opposite_weight = loop_odd_weights(edge_face_count[e])
+    out_positions[e] = endpoint_weight * endpoints + opposite_weight * edge_opposite_sum[e]
 
 
 @wp.kernel
@@ -173,26 +213,106 @@ def loop_even_positions(
     boundary_sum: wp.array[wp.vec3],
     out_positions: wp.array[wp.vec3],
 ) -> None:
-    # Loop's even (original) vertices, relaxed towards their 1-ring. Warren's beta -- 3/16 at
-    # valence 3 and 3/(8n) above it -- which is the variant ``igl::loop`` uses, not Loop's original
-    # trigonometric weight.
+    # Loop's even (original) vertices, relaxed towards their 1-ring; the rule is
+    # ``loop_even_weights``, and the mode says which neighbour sum the weight multiplies.
     v = wp.int32(wp.tid())
-    position = vertices[v]
-    n = valence[v]
-    out_positions[v] = position  # the fallbacks below leave the vertex where it is
-    if boundary_count[v] == 2:
-        # Boundary vertex: 3/4 of itself, 1/8 of each neighbour along the boundary. Its interior
-        # neighbours do not enter, which is what keeps a shared boundary curve identical on both
-        # sides of a seam.
-        out_positions[v] = LOOP_BOUNDARY_SELF * position + LOOP_BOUNDARY_NEIGHBOR * boundary_sum[v]
-    elif boundary_count[v] == 0 and n > 0:
-        beta = LOOP_BETA_VALENCE_3
-        if n != 3:
-            beta = LOOP_BETA_NUMERATOR / wp.float32(n)
-        out_positions[v] = (wp.float32(1.0) - wp.float32(n) * beta) * position + beta * ring_sum[v]
-    # Anything else keeps the position written above: an isolated vertex with no edges, or a
-    # non-manifold boundary vertex where one or three-plus boundary edges meet and neither stencil
-    # is defined.
+    self_weight, neighbor_weight, mode = loop_even_weights(valence[v], boundary_count[v])
+    neighbor = ring_sum[v]
+    if mode == LOOP_EVEN_BOUNDARY:
+        neighbor = boundary_sum[v]
+    out_positions[v] = self_weight * vertices[v] + neighbor_weight * neighbor
+
+
+# The interpolation operator ``subdivide_loop(return_operator=True)`` assembles, emitted as triplets
+# from the same three grids the positions come from and through the same two weight functions. Row
+# ``v`` is the relocated original vertex ``v``; row ``n_vertices + e`` is the odd vertex on unique
+# edge ``e``. Every slot is written -- a zero weight where a rule does not apply -- because
+# ``triplet_buffers`` hands back uninitialized memory (CLAUDE.md section 4).
+@wp.kernel
+def loop_even_self_triplets(
+    valence: wp.array[wp.int32],
+    boundary_count: wp.array[wp.int32],
+    out_rows: wp.array[wp.int32],
+    out_cols: wp.array[wp.int32],
+    out_values: wp.array[wp.float32],
+) -> None:
+    v = wp.int32(wp.tid())
+    self_weight, _neighbor_weight, _mode = loop_even_weights(valence[v], boundary_count[v])
+    out_rows[v] = v
+    out_cols[v] = v
+    out_values[v] = self_weight
+
+
+@wp.kernel
+def loop_edge_triplets(
+    unique_edges: wp.array2d[wp.int32],
+    edge_face_count: wp.array[wp.int32],
+    valence: wp.array[wp.int32],
+    boundary_count: wp.array[wp.int32],
+    n_vertices: wp.int32,
+    base: wp.int32,
+    out_rows: wp.array[wp.int32],
+    out_cols: wp.array[wp.int32],
+    out_values: wp.array[wp.float32],
+) -> None:
+    # Four triplets per unique edge: each endpoint's contribution to the odd row, and each
+    # endpoint's contribution to the *other* endpoint's even row. Whether that second pair carries
+    # any weight depends on the receiving vertex's mode -- the whole 1-ring for an interior vertex,
+    # only the boundary neighbours for a boundary one -- which is the one place the operator has to
+    # know what the accumulating ``loop_vertex_rings`` pass knows.
+    e = wp.int32(wp.tid())
+    v0 = unique_edges[e, 0]
+    v1 = unique_edges[e, 1]
+    is_boundary_edge = edge_face_count[e] == 1
+    slot = base + 4 * e
+
+    endpoint_weight, _opposite_weight = loop_odd_weights(edge_face_count[e])
+    odd_row = n_vertices + e
+    out_rows[slot] = odd_row
+    out_cols[slot] = v0
+    out_values[slot] = endpoint_weight
+    out_rows[slot + 1] = odd_row
+    out_cols[slot + 1] = v1
+    out_values[slot + 1] = endpoint_weight
+
+    for side in range(2):
+        receiver = v0
+        donor = v1
+        if side == 1:
+            receiver = v1
+            donor = v0
+        _self_weight, neighbor_weight, mode = loop_even_weights(
+            valence[receiver], boundary_count[receiver]
+        )
+        weight = wp.float32(0.0)
+        if mode == LOOP_EVEN_INTERIOR or (mode == LOOP_EVEN_BOUNDARY and is_boundary_edge):
+            weight = neighbor_weight
+        out_rows[slot + 2 + side] = receiver
+        out_cols[slot + 2 + side] = donor
+        out_values[slot + 2 + side] = weight
+
+
+@wp.kernel
+def loop_opposite_triplets(
+    faces: wp.array[wp.int32],
+    edge_of_corner: wp.array[wp.int32],
+    edge_face_count: wp.array[wp.int32],
+    n_vertices: wp.int32,
+    base: wp.int32,
+    out_rows: wp.array[wp.int32],
+    out_cols: wp.array[wp.int32],
+    out_values: wp.array[wp.float32],
+) -> None:
+    # The 1/8 wings of the odd stencil, over the same (face, corner) grid ``loop_edge_opposites``
+    # sums them on: corner ``j`` spans ``(fv[j], fv[j+1])`` and its opposite vertex is ``fv[j+2]``.
+    f = wp.int32(wp.tid())
+    for j in range(3):
+        e = edge_of_corner[f * 3 + j]
+        _endpoint_weight, opposite_weight = loop_odd_weights(edge_face_count[e])
+        slot = base + 3 * f + j
+        out_rows[slot] = n_vertices + e
+        out_cols[slot] = faces[f * 3 + (j + 2) % 3]
+        out_values[slot] = opposite_weight
 
 
 @wp.kernel

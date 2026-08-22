@@ -43,6 +43,38 @@ def transfer_onto_vertices(
     out_values[i] = a0 * bary[0] + a1 * bary[1] + a2 * bary[2]
 
 
+@wp.kernel
+def apply_transfer_operator(
+    offsets: wp.array[wp.int32],
+    columns: wp.array[wp.int32],
+    weights: wp.array[wp.float32],
+    source_values: wp.array[Any],
+    out_values: wp.array[Any],
+) -> None:
+    # One CSR row per output element: the field's value there is the weighted sum of the source
+    # values the row references. Written rather than delegated to ``warp.sparse.bsr_mv``, which
+    # requires the vector's dtype to match the matrix's 1x1 ``float32`` block, so it can move a
+    # scalar field and nothing else -- where an attribute is as often a ``wp.vec3`` colour or a
+    # ``wp.vec2`` UV, and those are exactly what a topology edit drops today.
+    #
+    # The accumulator is seeded as ``source_values[0] - source_values[0]``, which is how a generic
+    # ``Any`` kernel spells "the additive identity of this dtype": there is no ``dtype(0)``
+    # constructor to reach for, and ``x * wp.float32(0.0)`` would not parse for a dtype whose scalar
+    # is not float32 (Warp requires both operands' scalars to match). It also gives an empty row --
+    # an output element no source reaches -- the right answer rather than uninitialized memory.
+    #
+    # The weights being ``float32`` is what bounds the dtype set: the product below needs the
+    # field's own scalar to be float32 too, so ``wp.float32`` / ``wp.vec2`` / ``wp.vec3`` work and a
+    # ``float64`` field does not. That is not a gap -- these operators are assembled from float32
+    # vertex data, so a float64 field carried through one would advertise precision the weights do
+    # not have.
+    row = wp.int32(wp.tid())
+    total = source_values[0] - source_values[0]
+    for k in range(offsets[row], offsets[row + 1]):
+        total = total + source_values[columns[k]] * weights[k]
+    out_values[row] = total
+
+
 @wp.func
 def gaussian_kernel_weight(distance: wp.float32, inverse_scale: wp.float32) -> wp.float32:
     # ``exp(-(sharpness * d / radius) ** 2)``, VTK's ``vtkGaussianKernel``, with the caller having
@@ -100,9 +132,22 @@ def interpolate_from_points(
 # The dtype set is the one ``transfer_onto_vertices``'s own docstring promises -- "any Warp dtype
 # closed under scaling and addition works: ``wp.float32`` for a scalar, ``wp.vec3`` for a normal or
 # a colour" -- so registering exactly those two keeps the code and the documentation agreeing.
-# ``interpolate_from_points`` documents the same pair.
+# ``interpolate_from_points`` documents the same pair. ``apply_transfer_operator`` adds ``wp.vec2``,
+# since it is the one that carries a *stored attribute* through a topology edit and a UV pair is one
+# of the things such an attribute is. It cannot add ``wp.float64``: its weights are float32.
 def _register_overloads() -> None:
     """Instantiate every concrete overload of this module's generic kernels."""
+    for dtype in (wp.float32, wp.vec2, wp.vec3):
+        wp.overload(
+            apply_transfer_operator,
+            [
+                wp.array[wp.int32],
+                wp.array[wp.int32],
+                wp.array[wp.float32],
+                wp.array[dtype],
+                wp.array[dtype],
+            ],
+        )
     for dtype in (wp.float32, wp.vec3):
         wp.overload(
             transfer_onto_vertices,
