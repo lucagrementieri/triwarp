@@ -41,10 +41,26 @@ atlas, and the overlap additionally exercises the contention path that a real at
 
 References
 ----------
-**No CPU baseline is registered.** Neither trimesh, libigl nor open3d has a UV-space attribute
-rasterizer or sampler: trimesh's ``visual.texture`` only stores and looks up existing image
-textures, libigl has no rasterization module in its Python bindings, and open3d's legacy geometry
-exposes UVs as mesh data without any bake or resample operation.
+**No CPU baseline is registered yet, and the reason is scope rather than absence.** Neither
+trimesh, libigl nor open3d has a UV-space attribute rasterizer or sampler: trimesh's
+``visual.texture`` only
+stores and looks up existing image textures, libigl has no rasterization module in its Python
+bindings, and open3d's legacy geometry exposes UVs as mesh data without any bake or resample
+operation.
+
+**pymeshlab does have both directions**, though, and an earlier version of this section did not say
+so. Forward: ``transfer_attributes_to_texture_per_vertex`` bakes a per-vertex attribute into a
+texture image, with ``compute_texmap_from_color`` and ``generate_sampling_texel`` beside it.
+Inverse:
+``compute_color_from_texture_per_vertex`` and ``transfer_texture_to_color_per_vertex``
+sample an image back onto the vertices. So all five groups here have a counterpart.
+
+Two things keep them from being rows in this file today, and both are about the comparison rather
+than the library. Its parameter surface is large -- the bake takes a texture size, a sampling
+density and an interpolation mode that do not map one-to-one onto ``resolution`` and ``order`` --
+and its
+output is an *image* rather than an array, so a fair row has to decide what "the same work" means
+before it can be timed. That is its own piece of work; what is not true is that nothing does this.
 
 The references the *correctness* tests use are not benchmarkable baselines either. The forward
 rasterizers are checked against a **moderngl (OpenGL)** reference, which times GPU driver and

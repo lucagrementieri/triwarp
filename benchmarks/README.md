@@ -992,11 +992,35 @@ microsecond integral — it would re-time the watertightness row under another n
 `test_sample`'s `sample_points_uniformly` returns a bare cloud with no face index, so asserting it
 against the area law would transform the reference.
 
-Modules with no baseline from **any** reference are `test_texture`, `test_polyline`, `test_reduce`,
-`test_linalg` and `test_halfedge` (plus `stitch*` in `test_holes`, the morphology groups in
-`test_selection`, and the two transport groups in `test_tangent_space`);
-each docstring says which reference was considered and why it is not apples-to-apples. Those are
-before/after self-comparisons.
+Modules with no baseline from **any** reference are `test_texture` and `test_halfedge` (plus
+`stitch*` in `test_holes` and the two transport groups in `test_tangent_space`); each docstring says
+which reference was considered and why it is not apples-to-apples. Those are before/after
+self-comparisons.
+
+Four modules were on that list and no longer are, so a reader who remembers it should re-read the
+docstrings rather than the list:
+
+- **`test_reduce`** carries `numpy` on all ten of its groups and always did — it was on the list by
+  mistake.
+- **`test_array`** likewise now carries `numpy` on six, on the argument `test_reduce` had already
+  made at length: a device primitive returning a Python value pays a launch and a readback NumPy
+  never pays, so the question each row answers is *where the crossover sits*, and the split is by
+  **return type** rather than by size.
+- **`test_linalg`** carries `pymeshlab` on `min_quad_with_fixed` and now `igl`, which binds
+  `min_quad_with_fixed` itself.
+- **`test_polyline`** carries `meshlib` and `pyvista` across six of its nine groups. MeshLib's
+  `Polyline3` is a complete polyline library and VTK reaches the same operations through a
+  single-cell `PolyData`; `polyline_radius` and `polyline_angles` are the two genuine declines and
+  say so at the group.
+
+**`test_texture` is the one that is still open on the evidence rather than settled.** Neither
+trimesh, libigl nor open3d has a UV-space rasterizer or sampler, which is what the module docstring
+says — but **pymeshlab does, in both directions**: `transfer_attributes_to_texture_per_vertex`,
+`compute_texmap_from_color` and `generate_sampling_texel` bake, and
+`compute_color_from_texture_per_vertex` and `transfer_texture_to_color_per_vertex` sample back. That
+is five groups with no oracle against a library that answers all five. The parameter surface is large
+and the output is an image rather than an array, so it is scoped as its own piece of work rather than
+five rows bolted on; what is *not* true is that no library does it.
 
 Where the reference is not algorithmically identical, the module docstring says so — `test_repair`
 (open3d's dedup is orientation-sensitive), `test_sample` (count- vs radius-parametrized),
