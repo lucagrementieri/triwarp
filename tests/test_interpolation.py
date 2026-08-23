@@ -4,6 +4,7 @@ import igl
 import numpy as np
 import pymeshlab as ml
 import pytest
+import pyvista as pv
 import trimesh as tm
 import warp as wp
 
@@ -125,9 +126,20 @@ def _transfer_meshes(device: str) -> tuple[tm.Trimesh, tm.Trimesh]:
     return tm.creation.icosphere(subdivisions=3), tm.creation.icosphere(subdivisions=2)
 
 
-@pytest.mark.parity("transfer_onto_vertices", "pymeshlab")
+@pytest.mark.parity("transfer_onto_vertices", "pymeshlab", "pyvista")
 def test_transfer_onto_vertices_matches_pymeshlab(device: str):
-    """Class A: ``transfer_attributes_per_vertex`` is the same barycentric pull, same values."""
+    """
+    Class A: ``transfer_attributes_per_vertex`` is the same barycentric pull, same values.
+
+    pyvista's ``sample`` is the third implementation, through a VTK cell locator, and it agrees to
+    **5.96e-08** on a coincident target -- which is the input class where all three do the same work
+    and is why the comparison runs there. Two of its conventions decide how it is read: it
+    interpolates only where the query lands *inside* a source cell and marks the rest in
+    ``vtkValidPointMask`` rather than extrapolating, so the comparison is on the valid set and the
+    mask's own count is asserted; and it must not be given
+    ``snap_to_closest_point``, which snaps to the nearest source *vertex* rather than the nearest
+    point on the surface and is measurably worse.
+    """
     source_tm, target_tm = _transfer_meshes(device)
     values_np = np.ascontiguousarray(source_tm.vertices[:, 0] + 2.0, dtype=np.float64)
 
@@ -168,6 +180,27 @@ def test_transfer_onto_vertices_matches_pymeshlab(device: str):
     )
     assert np.allclose(transferred_wp.numpy(), transferred_pml, rtol=1e-4, atol=1e-4)
     assert np.isfinite(distance_wp.numpy()).all()
+
+    # pyvista, on the coincident target where all three transfer the same field.
+    source_pv = pv.PolyData(
+        np.ascontiguousarray(source_tm.vertices),
+        faces=np.hstack(
+            [np.full((source_tm.faces.shape[0], 1), 3), np.ascontiguousarray(source_tm.faces)]
+        ).ravel(),
+    )
+    source_pv.point_data["field"] = values_np
+    sampled_pv = pv.PolyData(np.ascontiguousarray(source_tm.vertices)).sample(source_pv)
+    valid_pv = np.asarray(sampled_pv.point_data["vtkValidPointMask"]).astype(bool)
+    self_wp, _self_distance = tw.interpolation.transfer_onto_vertices(
+        source_vertices_wp, source_faces_wp, values_wp, source_vertices_wp
+    )
+    assert valid_pv.all()  # a coincident target is inside a source cell everywhere
+    assert np.allclose(
+        self_wp.numpy()[valid_pv],
+        np.asarray(sampled_pv.point_data["field"])[valid_pv],
+        rtol=1e-4,
+        atol=1e-4,
+    )
 
 
 def test_transfer_onto_vertices_reproduces_a_linear_field(device: str):

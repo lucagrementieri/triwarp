@@ -224,7 +224,7 @@ def _pcd(bench_case: BenchCase) -> o3d.geometry.PointCloud:
 
 
 @pytest.mark.benchmark(group="point_plane_distance")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pyvista")
 def test_point_plane_distance(bench_case: BenchCase) -> None:
     """
     Signed point-to-plane distance of every point: a single ``wp.map`` over the cloud.
@@ -234,8 +234,28 @@ def test_point_plane_distance(bench_case: BenchCase) -> None:
     ``test_creation::test_box``), and being a ~50 µs GPU row it also has the widest run-to-run
     spread in the suite -- measured at 46x on unchanged code across two processes. Only read it as
     part of its axis.
+
+    pyvista's ``compute_implicit_distance`` evaluates VTK's plane implicit function over the cloud,
+    which is the same signed dot product -- measured 1.27e-07 from the exact float64 answer
+    against triwarp's 2.11e-07, i.e. both at their own storage precision
+    (``tests/test_points.py``). It needs
+    a ``pv.Plane`` **large enough to span the cloud**: the implicit function is unbounded but the
+    plane object carries an extent, and it is also the reason this row builds the plane outside the
+    timed callable -- it is the query's parameter, not its input.
     """
     n_points = bench_case.n_vertices
+    if bench_case.kind == "pyvista":
+        skip_larger_than(bench_case, "bunny_decimated", _HOST_CAP_REASON)
+        cloud_pv = pv.PolyData(bench_case.vertices_np)
+        extent = 4.0 * float(
+            np.linalg.norm(bench_case.vertices_np.max(axis=0) - bench_case.vertices_np.min(axis=0))
+        )
+        plane_pv = pv.Plane(
+            center=(0.0, 0.0, 0.0), direction=_PLANE_NORMAL.tolist(), i_size=extent, j_size=extent
+        )
+        distances_pv = bench_case.run(lambda: cloud_pv.compute_implicit_distance(plane_pv))
+        assert distances_pv.point_data["implicit_distance"].shape[0] == n_points
+        return
     if bench_case.kind == "triwarp":
         points = bench_case.vertices_wp
         normal = wp.vec3(*_PLANE_NORMAL.tolist())
@@ -326,7 +346,7 @@ def _points_ml(bench_case: BenchCase) -> mm.std_vector_Vector3_float:
 
 
 @pytest.mark.benchmark(group="half_space_mask")
-@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.benchlibs("triwarp", "meshlib", "pyvista")
 def test_half_space_mask(bench_case: BenchCase) -> None:
     """
     Select every point on one side of a plane: the same ``wp.map`` shape as the distance row.
@@ -346,8 +366,29 @@ def test_half_space_mask(bench_case: BenchCase) -> None:
     than the map, exactly as ``point_plane_distance`` warns. At ``dragon`` triwarp-cuda is 66 us for
     a cloud 60x larger, so the floor is the whole story below ~10^5 points and the axis is the only
     honest way to read either row.
+
+    pyvista reaches the mask through the same ``compute_implicit_distance`` the
+    ``point_plane_distance`` row times, plus one host threshold -- so read the two pyvista rows as
+    that threshold's cost, which is the same thing this pair measures on triwarp's side. The
+    threshold is inside the timed callable for that reason.
     """
     n_points = bench_case.n_vertices
+    if bench_case.kind == "pyvista":
+        skip_larger_than(bench_case, "bunny_decimated", _HOST_CAP_REASON)
+        cloud_pv = pv.PolyData(bench_case.vertices_np)
+        extent = 4.0 * float(
+            np.linalg.norm(bench_case.vertices_np.max(axis=0) - bench_case.vertices_np.min(axis=0))
+        )
+        plane_pv = pv.Plane(
+            center=(0.0, 0.0, 0.0), direction=_PLANE_NORMAL.tolist(), i_size=extent, j_size=extent
+        )
+        mask_pv = bench_case.run(
+            lambda: (
+                np.asarray(cloud_pv.compute_implicit_distance(plane_pv)["implicit_distance"]) > 0.0
+            )
+        )
+        assert mask_pv.shape[0] == n_points
+        return
     if bench_case.kind == "meshlib":
         skip_larger_than(bench_case, "bunny_decimated", _HOST_CAP_REASON)
         cloud_ml = _cloud_ml(bench_case)  # held in a name, per the helper's docstring

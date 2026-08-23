@@ -28,6 +28,7 @@ import igl
 import numpy as np
 import open3d as o3d
 import pytest
+import pyvista as pv
 import scipy.ndimage as ndi
 import trimesh as tm
 import warp as wp
@@ -542,12 +543,18 @@ def test_occupancy_at_points_matches_open3d(sphere, device: str):
     assert np.array_equal(tw.voxels.occupancy_at_points(grid, queries_wp).numpy(), inside_o3d)
 
 
-@pytest.mark.parity("grid_points", "igl")
+@pytest.mark.parity("grid_points", "igl", "pyvista")
 def test_grid_points_matches_igl(device: str):
     """
-    Class B: ``igl.grid`` emits the same lattice over the unit cube.
+    Class B: ``igl.grid`` and VTK's ``ImageData`` emit the same lattice over the unit cube.
 
-    Compared as sets, because igl's flattening order is its own.
+    Compared as sets against igl, because its flattening order is its own.
+
+    pyvista's is knowable, so it is compared **exactly** through the permutation rather than as a
+    set: ``ImageData(...).points`` runs **x fastest** where triwarp runs z fastest, so reading
+    pyvista's buffer in Fortran order and flattening in C order is triwarp's buffer element for
+    element. That is a stronger claim than a set comparison and it is what pins the ordering both
+    ways -- a set comparison passes for any permutation, including a transposed one.
     """
     shape = (4, 5, 6)
     lattice_wp = tw.voxels.grid_points(
@@ -559,6 +566,19 @@ def test_grid_points_matches_igl(device: str):
     assert np.allclose(
         lexsort_rows(np.round(lattice_igl, 9)), lexsort_rows(np.round(lattice_wp, 9)), atol=1e-6
     )
+    # pyvista: x fastest, so its Fortran reading is triwarp's C reading, element for element.
+    lattice_pv = np.asarray(
+        pv.ImageData(
+            dimensions=shape,
+            origin=(0.0, 0.0, 0.0),
+            spacing=tuple(1.0 / max(n - 1, 1) for n in shape),
+        ).points
+    )
+    assert lattice_pv.shape == lattice_wp.shape
+    assert np.allclose(
+        lattice_pv.reshape(*shape, 3, order="F").reshape(-1, 3), lattice_wp, atol=1e-6
+    )
+
     # C order, z fastest, and the two corners land on ``bounds``.
     assert np.allclose(lattice_wp[0], [0.0, 0.0, 0.0])
     assert np.allclose(lattice_wp[-1], [1.0, 1.0, 1.0])

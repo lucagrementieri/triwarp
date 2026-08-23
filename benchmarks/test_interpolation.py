@@ -253,10 +253,28 @@ def test_average_from_edges_onto_vertices(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="transfer_onto_vertices")
-@pytest.mark.benchlibs("triwarp", "pymeshlab")
+@pytest.mark.benchlibs("triwarp", "pymeshlab", "pyvista")
 def test_transfer_onto_vertices(bench_case: BenchCase) -> None:
-    """Closest-point plus barycentric blend, transferring a field from a mesh onto itself."""
+    """
+    Closest-point plus barycentric blend, transferring a field from a mesh onto itself.
+
+    pyvista's ``sample`` interpolates a source field onto a target's points through a cell locator,
+    which is this operation -- and on a target that coincides with the source it is exact: measured
+    642 of 642 points valid and 5.96e-08 from triwarp's answer (``tests/test_interpolation.py``).
+    Two things it does that this group's other rows do not: it marks misses in
+    ``vtkValidPointMask`` rather than extrapolating, and it interpolates only where the query lands
+    *inside* a source cell, so on a target offset from the surface its valid fraction falls sharply.
+    The self-transfer here is the input class where the three rows measure the same work.
+    """
     n_vertices = bench_case.n_vertices
+    if bench_case.kind == "pyvista":
+        skip_larger_than(bench_case, "bunny", "VTK's probe filter is a serial cell-locator walk")
+        source_pv = bench_case.mesh_pv.copy()
+        source_pv.point_data["field"] = _vertex_field_np(bench_case).astype(np.float64)
+        target_pv = pv.PolyData(bench_case.vertices_np)
+        sampled_pv = bench_case.run(lambda: target_pv.sample(source_pv))
+        assert sampled_pv.point_data["field"].shape[0] == n_vertices
+        return
     if bench_case.kind == "pymeshlab":
         skip_larger_than(bench_case, "bunny", "MeshLab's transfer is a serial closest-point walk")
         vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np

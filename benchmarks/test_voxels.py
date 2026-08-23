@@ -58,6 +58,7 @@ from __future__ import annotations
 import igl
 import numpy as np
 import pytest
+import pyvista as pv
 import trimesh as tm
 import warp as wp
 from meshlib import mrmeshpy as mm
@@ -491,7 +492,7 @@ _LATTICE_RESOLUTIONS = [64, 256]
 
 
 @pytest.mark.benchmark(group="grid_points")
-@pytest.mark.benchlibs("triwarp", "igl")
+@pytest.mark.benchlibs("triwarp", "igl", "pyvista")
 @pytest.mark.parametrize("resolution", _LATTICE_RESOLUTIONS)
 def test_grid_points(bench_lib: BenchLibrary, resolution: int) -> None:
     """
@@ -500,8 +501,27 @@ def test_grid_points(bench_lib: BenchLibrary, resolution: int) -> None:
     One of the few mesh-free groups in the suite (``bench_lib`` rather than ``bench_case``): the
     axis is resolution, and there is no input to speak of. ``igl.grid`` fills the same
     ``resolution ** 3`` by 3 array with a triple loop.
+
+    pyvista's ``ImageData(...).points`` is VTK's lattice generation and nothing else, which is the
+    honest caveat and also the point: it is a *constructor*, so the row measures the same allocate-
+    and-fill this group exists to price. Its ordering is **x fastest** where triwarp's is z fastest,
+    so the two differ by a permutation and not by a value (``tests/test_voxels.py`` names it).
     """
     shape = (resolution, resolution, resolution)
+    if bench_lib.kind == "pyvista":
+        if resolution > 128:
+            pytest.skip("VTK materializes 16.7 M points through a Python property")
+        spacing = 1.0 / max(resolution - 1, 1)
+        lattice_pv = bench_lib.run(
+            lambda: np.asarray(
+                pv.ImageData(
+                    dimensions=shape, origin=(0.0, 0.0, 0.0), spacing=(spacing,) * 3
+                ).points
+            ),
+            rounds=_HEAVY_ROUNDS,
+        )
+        assert lattice_pv.shape[0] == resolution**3
+        return
     if bench_lib.kind == "igl":
         if resolution > 128:
             pytest.skip("igl fills 16.7 M rows with a serial triple loop")
