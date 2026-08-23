@@ -918,15 +918,23 @@ def test_grid_points_round_trips_through_marching_cubes(icosahedron, device: str
     assert abs(surface.volume - mesh_tm.volume) / mesh_tm.volume < 0.05
 
 
-@pytest.mark.parity("to_boxes", "trimesh")
+@pytest.mark.parity("to_boxes", "trimesh", "pyvista")
 def test_to_boxes_matches_trimesh_multibox(sphere, device: str):
     """
-    Class B: ``cull_internal=False`` against ``trimesh.voxel.ops.multibox``.
+    Class B: ``cull_internal=False`` against ``trimesh.voxel.ops.multibox`` and VTK's glyph filter.
 
     Not the triangle centroids: the two split each cube face into triangles along different
     diagonals, so those differ by a third of a cell while the *surface* is identical. And not
     ``lexsort`` on the corner positions either — that is the measured false negative on float rows
     with ties; a ``cKDTree`` bijection is used instead.
+
+    pyvista's ``glyph(geom=pv.Cube(), scale=False, orient=False)`` is VTK's template instancing and
+    belongs with ``multibox`` on the unwelded side -- **exactly 12 triangles per centre** after
+    ``.triangulate()``, which is the same ``12 n`` and is asserted as an equality rather than a
+    bound. Two of its arguments are load-bearing: left at their defaults ``scale`` and ``orient``
+    read a scalar and a vector array off the cloud and would size and rotate each cube, and without
+    ``.triangulate()`` the output is quads, so the face count is not comparable with either other
+    side.
     """
     from scipy.spatial import cKDTree
 
@@ -947,6 +955,18 @@ def test_to_boxes_matches_trimesh_multibox(sphere, device: str):
     corners_wp = np.unique(boxes_wp.vertices[boxes_wp.faces.reshape(-1)], axis=0)
     corners_tm = boxes_tm.vertices[boxes_tm.faces.reshape(-1)]
     assert cKDTree(corners_wp).query(corners_tm)[0].max() < 1e-5
+
+    # pyvista instances the same template cube, and its corners land on the same lattice.
+    centers_np = tw.voxels.cell_centers(grid).numpy()
+    cube_pv = pv.Cube(x_length=voxel_size, y_length=voxel_size, z_length=voxel_size)
+    boxes_pv = (
+        pv.PolyData(np.ascontiguousarray(centers_np))
+        .glyph(geom=cube_pv, scale=False, orient=False)
+        .triangulate()
+    )
+    assert boxes_pv.n_cells == 12 * centers_np.shape[0] == boxes_wp.faces.shape[0]
+    corners_pv = np.asarray(boxes_pv.points)
+    assert cKDTree(corners_wp).query(corners_pv)[0].max() < 1e-5
     assert cKDTree(corners_tm).query(corners_wp)[0].max() < 1e-5
     assert boxes_wp.volume == pytest.approx(boxes_tm.volume, rel=1e-5)
 

@@ -376,15 +376,27 @@ def test_remove_small_components(bench_case: BenchCase) -> None:
     reason="D2 the same idea, greedier: for each non-manifold edge MeshLab iteratively deletes the "
     "smallest-area incident face until that edge is 2-manifold, where triwarp drops every face on "
     "an over-incident edge and re-tests. Both leave an edge-manifold mesh but they delete "
-    "different faces and different numbers of them, so only the post-condition is shared and "
-    "tests/test_repair.py asserts that directly rather than through MeshLab.",
+    "different faces and different numbers of them, so only the post-condition is shared -- and "
+    "tests/test_repair.py now asserts that post-condition through igl and open3d rather than "
+    "through triwarp's own detector, which is the half that was missing.",
 )
 @pytest.mark.benchmark(group="remove_non_manifold_faces")
 @pytest.mark.benchmeshes("sphere_med")
 @pytest.mark.benchlibs("triwarp", "pymeshlab")
 @pytest.mark.parametrize("extra", _NON_MANIFOLD_COUNTS, ids=["clean", "nm1024"])
 def test_remove_non_manifold_faces(bench_case: BenchCase, extra: int) -> None:
-    """Iterated edge-sort and manifold test: a clean mesh exits in one round, a broken one loops."""
+    """
+    Iterated edge-sort and manifold test: a clean mesh exits in one round, a broken one loops.
+
+    **open3d's ``remove_non_manifold_edges`` is deliberately not a second row.** It uses the same
+    greedier rule MeshLab does -- measured on an ``icosphere(2)`` carrying one extra face on an
+    existing edge, it deletes **one** face (321 -> 320) where triwarp drops all three on that edge
+    (321 -> 318). Both land edge-manifold, so only the post-condition is shared, and a second
+    incomparable timing row would say nothing the exemption above does not. What open3d *does*
+    supply is that post-condition: it and igl both flip False -> True with triwarp on every input in
+    ``tests/test_repair.py``, which is where this group's real coverage now sits -- before that, the
+    contract was asserted with triwarp's own ``is_edge_manifold``.
+    """
     if bench_case.kind == "pymeshlab":
         # MeshLab deletes the smallest-area incident face per non-manifold edge until the edge is
         # 2-manifold; triwarp drops every face on an over-incident edge and re-tests. Same goal,

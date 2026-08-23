@@ -427,7 +427,7 @@ def test_fill_orthographic(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="to_boxes")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pyvista")
 def test_to_boxes(bench_case: BenchCase) -> None:
     """
     Mesh the voxel set as cubes: shared nanogrid corners against ``12 n`` unshared triangles.
@@ -436,8 +436,28 @@ def test_to_boxes(bench_case: BenchCase) -> None:
     vertices; triwarp's corners come deduplicated out of ``warp.fem``'s vertex grid, which is a
     smaller output *and* skips a welding pass. Both rows emit every face (``cull_internal=False``)
     so the comparison is like for like.
+
+    pyvista reaches the same answer through ``glyph(geom=pv.Cube(), scale=False, orient=False)``,
+    which is VTK's template-instancing filter and so belongs with trimesh on the unwelded side --
+    measured **exactly 12 triangles per centre** after ``.triangulate()`` (2 244 quads from 374
+    centres), the same ``12 n`` ``multibox`` emits. ``scale=False`` and ``orient=False`` are both
+    load-bearing: left at their defaults the filter reads a scalar and a vector array off the cloud
+    and would size and rotate each cube. The ``.triangulate()`` is inside the row because without it
+    the output is quads and the counts are not comparable with either other side.
     """
     voxel_size = _voxel_size(bench_case, _MORPHOLOGY_DIVISOR)
+    if bench_case.kind == "pyvista":
+        skip_larger_than(bench_case, "bunny", "VTK instances a template cube per voxel")
+        mesh_tm = tm.Trimesh(bench_case.vertices_np, bench_case.faces_np, process=False)
+        centers_np = tm.voxel.creation.voxelize_subdivide(mesh_tm, pitch=voxel_size).points
+        cloud_pv = pv.PolyData(np.ascontiguousarray(centers_np))
+        cube_pv = pv.Cube(x_length=voxel_size, y_length=voxel_size, z_length=voxel_size)
+        boxes_pv = bench_case.run(
+            lambda: cloud_pv.glyph(geom=cube_pv, scale=False, orient=False).triangulate(),
+            rounds=_HEAVY_ROUNDS,
+        )
+        assert boxes_pv.n_cells == 12 * centers_np.shape[0]
+        return
     if bench_case.kind == "trimesh":
         skip_larger_than(bench_case, "bunny", "multibox tiles a template cube per voxel in Python")
         mesh_tm = tm.Trimesh(bench_case.vertices_np, bench_case.faces_np, process=False)
