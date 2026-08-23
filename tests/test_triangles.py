@@ -48,7 +48,7 @@ def test_face_normals_and_areas_against_the_partial_references(
 
     ``face_normals_and_areas`` returns both quantities from one cross product, and the benchmark
     reads these three rows as a floor rather than a fair race because each computes less. That makes
-    them no *less* valid as oracles, only partial. All three are class B -- exact transforms, full
+    them no *less* valid as oracles, only partial. All three are Class B -- exact transforms, full
     ``1e-5`` tolerance:
 
     - ``igl.doublearea`` is literally twice the area, so the transform is a factor of two;
@@ -299,7 +299,7 @@ def test_face_quality_against_the_verdict_measures(
     half_torus: tuple[tm.Trimesh, wp.Mesh], metric: str, measure: str, reciprocal: bool
 ):
     """
-    Decode VTK's Verdict measure names onto triwarp's, three class A and one class B.
+    Decode VTK's Verdict measure names onto triwarp's, three Class A and one Class B.
 
     The mapping is the trap, not the arithmetic, and the two inversions in it will mislead anyone
     reading pyvista's docs instead of this table:
@@ -308,7 +308,7 @@ def test_face_quality_against_the_verdict_measures(
     - triwarp's own ``radius_ratio`` is its *reciprocal* (asserted below so the inversion is pinned
       rather than described);
     - ``shape`` is ``4 sqrt(3) A / (a^2 + b^2 + c^2)``, triwarp's **mean_ratio**;
-    - ``aspect_frobenius`` is one over that -- the class B row, one named reciprocal -- and
+    - ``aspect_frobenius`` is one over that -- the Class B row, one named reciprocal -- and
       ``condition`` duplicates it exactly, so it gets no row of its own.
 
     ``area_max_side`` has no Verdict counterpart at all, and Verdict's ``aspect_ratio``
@@ -436,10 +436,10 @@ def test_per_face_quantities_match_meshlib(half_torus: tuple[tm.Trimesh, wp.Mesh
     reason ``benchmarks/`` reads those rows as an upper bound (see section 6).
 
     The fourth family is the corner angles, and MeshLib reaches them two ways: ``mm.angle(a, b)``
-    on the two corner vectors (class B -- the transform is building those vectors, and MeshLib's
+    on the two corner vectors (Class B -- the transform is building those vectors, and MeshLib's
     ``atan2(|cross|, dot)`` form is a different formulation from an ``acos`` of the normalized dot,
     which is what makes it worth comparing) and ``sumAngles`` per vertex, which must equal the
-    table's per-vertex sum (class A, and the quantity ``vertex_defects`` subtracts from 2pi).
+    table's per-vertex sum (Class A, and the quantity ``vertex_defects`` subtracts from 2pi).
     Measured on ``half_torus``: **2.38e-07** on the corners and **1.07e-06** on the vertex sums.
 
     Testing the four together is deliberate: they come out of the same corner load, so a
@@ -656,7 +656,7 @@ def test_closest_point(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
 )
 def test_soup_quantities_match_meshlib(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     """
-    Class A on the projection and class B on the interpolation, for the module's two soup ops.
+    Class A on the projection and Class B on the interpolation, for the module's two soup ops.
 
     ``closestPointInTriangle(p, a, b, c)`` is the same query triangle by triangle and needs no
     transform -- measured **1.19e-07**, the float32 floor. It returns a ``(point, TriPointf)`` pair
@@ -742,7 +742,7 @@ def test_face_centroids(request: pytest.FixtureRequest, mesh_name: str):
 
     ``igl.barycenter`` and VTK's ``cell_centers`` both return the corner mean in face order — the
     latter is a *parametric* centre in general, but on a triangle that is the barycentre, which is
-    why the row is class A rather than a documented approximation.
+    why the row is Class A rather than a documented approximation.
 
     The assert that matters beyond the comparison is the last one: the barycentre must lie *in* its
     own triangle, which the barycentric coordinates ``(1/3, 1/3, 1/3)`` state exactly. A function
@@ -767,7 +767,7 @@ def test_face_centroids(request: pytest.FixtureRequest, mesh_name: str):
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube", "half_torus"])
 def test_face_signed_volumes(request: pytest.FixtureRequest, mesh_name: str):
     """
-    Class A against the NumPy oracle, element-wise, plus class B on the sum.
+    Class A against the NumPy oracle, element-wise, plus Class B on the sum.
 
     ``dot(v0, cross(v1, v2)) / 6`` per face, which is a one-liner in NumPy and therefore an exact
     oracle rather than an approximate one. The class-B half is that the sum over a closed mesh is

@@ -704,7 +704,7 @@ def test_query_nearest_matches_open3d(
 
     Open3D's batched tensor search (not the legacy ``KDTreeFlann`` per-query loop) returns
     ``(n_queries, k)`` indices sorted by distance in ``KDTree``'s layout, plus **squared**
-    distances -- the square root is the named transform that makes the distance half class B on
+    distances -- the square root is the named transform that makes the distance half Class B on
     its own; the index half needs none. The cloud is random in a box, so no two points tie in
     ``float32`` distance from a query and the index comparison is exact.
 

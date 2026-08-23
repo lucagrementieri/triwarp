@@ -198,18 +198,27 @@ def test_discrete_gaussian_curvature(hemisphere: tuple[tm.Trimesh, wp.Mesh]):
     assert np.allclose(gauss_curvature_wp.numpy(), gauss_curvature_tm, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize(("mesh_name", "radius"), [("icosahedron", 2.0), ("icosphere", 0.5)])
 @pytest.mark.parity("discrete_mean_curvature", "trimesh")
-def test_discrete_mean_curvature(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
+def test_discrete_mean_curvature(
+    request: pytest.FixtureRequest, mesh_name: str, radius: float
+) -> None:
     """
     Class A: the ball mean-curvature measure against trimesh's, over every vertex.
 
-    The radius of 2.0 exceeds the icosahedron, so every query integrates the whole mesh --
-    which is the case that exercises the ball clipping rather than avoiding it.
+    **Two fixtures, because either alone tests half of it.** On the ``icosahedron`` the radius of
+    2.0 exceeds the mesh, so every query integrates the whole surface -- the case that exercises
+    the ball clipping rather than avoiding it. But the icosahedron is *regular*, so that answer is
+    one number repeated: measured on trimesh's side, **1 unique value across all 12 vertices, spread
+    exactly 0.0**. A comparison of two constant arrays cannot see a permuted result, an off-by-one
+    in the gather or a query/vertex index swap -- only a global scale error. The ``icosphere`` at
+    0.5 is the per-vertex half: 10 distinct values over its 642 vertices at a spread of 0.0497, and
+    the assert below checks that the reference really did vary before comparing to it.
+
     ``benchmarks/test_curvature.py`` records why pymeshlab cannot be the oracle here (a
     different operator, 0.982 correlation with a 7 % offset).
     """
-    mesh_tm, mesh_wp = icosahedron
-    radius = 2.0
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     points_tm = mesh_tm.vertices
     mean_curvature_tm = tm.curvature.discrete_mean_curvature_measure(mesh_tm, points_tm, radius)
 
@@ -221,6 +230,8 @@ def test_discrete_mean_curvature(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> Non
     mean_curvature_wp = tw.curvature.discrete_mean_curvature(
         points_wp, vertices_wp, faces_wp, radius
     )
+    # Non-vacuous on the curved fixture: a constant reference would pass any per-vertex bug.
+    assert mesh_name == "icosahedron" or np.ptp(mean_curvature_tm) > 1e-3
     assert np.allclose(mean_curvature_wp.numpy(), mean_curvature_tm, rtol=1e-5, atol=1e-5)
 
 

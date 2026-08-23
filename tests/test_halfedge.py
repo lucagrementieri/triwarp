@@ -97,7 +97,7 @@ def test_vertex_one_ring_sizes_match_incident_face_counts(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
     """
-    Class A after a named transform (class B): ring sizes are the incident-face-corner counts.
+    Class A after a named transform (Class B): ring sizes are the incident-face-corner counts.
 
     One outgoing halfedge per incident corner, so ``np.bincount`` over the flat face buffer is the
     reference -- exact, no tolerance. The second assert is what makes it a *partition*: every

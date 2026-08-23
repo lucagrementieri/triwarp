@@ -91,7 +91,7 @@ def test_edges_sorted(device: str) -> None:
     Class A: the ``sorted=True`` form against trimesh's table with each row sorted.
 
     The sort on the reference side *is* the definition of the keyword, not an accommodation,
-    which is why this stays class A rather than B.
+    which is why this stays Class A rather than B.
     """
     rng = np.random.default_rng(1)
     faces_np = rng.integers(0, 50, size=(20, 3), dtype=np.int32)
@@ -203,7 +203,7 @@ def test_edges_unique_matches_potpourri3d(request: pytest.FixtureRequest, mesh_n
 
     ``benchmarks/test_edges.py`` calls this row "a timing comparison, not a parity one" because
     ``pp3d.edges`` returns geometry-central's internal halfedge ordering. That is a statement about
-    *order*, and sorting dissolves it -- the sets themselves must match exactly, so this is class B
+    *order*, and sorting dissolves it -- the sets themselves must match exactly, so this is Class B
     with a lexsort, at full tolerance rather than a weakened one.
 
     Both sides are canonicalised twice over: ``np.sort(..., axis=1)`` because the pair is undirected
@@ -238,7 +238,7 @@ def test_edges_unique_and_inverse_match_igl(request: pytest.FixtureRequest, mesh
     igl returns ``(E, uE, EMAP, uEC, uEE)``; ``uE`` is the unique undirected list and ``EMAP`` sends
     each of the ``3 * n_faces`` directed edges to its row in ``uE``. Both libraries are free to
     order
-    ``uE`` however they like, so this is class B twice over rather than a weakened comparison:
+    ``uE`` however they like, so this is Class B twice over rather than a weakened comparison:
 
     - the edge *sets* are compared after sorting each pair and then lexsorting the rows;
     - the inverse maps index into two differently ordered tables *and* are indexed by two different
@@ -525,7 +525,7 @@ def test_edge_length_averages_match_their_references(
     either way. The final block asserts that divergence, which is what stops the two being quietly
     swapped for one another.
 
-    The per-face length *table* is class B: igl's ``(n_faces, 3)`` uses its opposite-edge corner
+    The per-face length *table* is Class B: igl's ``(n_faces, 3)`` uses its opposite-edge corner
     convention against triwarp's flat face-order buffer, so rows are sorted before comparing.
 
     MeshLib's ``averageEdgeLength`` is a fourth reference for the unique-edge average specifically,

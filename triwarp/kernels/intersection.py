@@ -150,9 +150,9 @@ def mesh_with_plane_segments(
     v0 = vertices[i0]
     v1 = vertices[i1]
     v2 = vertices[i2]
-    s0 = kernel_array.tolerance_sign(vertex_dots[i0])
-    s1 = kernel_array.tolerance_sign(vertex_dots[i1])
-    s2 = kernel_array.tolerance_sign(vertex_dots[i2])
+    s0 = kernel_array.sign_with_tolerance(vertex_dots[i0], TOLERANCE_MERGE_CONSTANT)
+    s1 = kernel_array.sign_with_tolerance(vertex_dots[i1], TOLERANCE_MERGE_CONSTANT)
+    s2 = kernel_array.sign_with_tolerance(vertex_dots[i2], TOLERANCE_MERGE_CONSTANT)
     valid, p0, p1 = mesh_with_plane_segment_for_face(
         plane_normal, plane_origin, v0, v1, v2, s0, s1, s2
     )
@@ -505,9 +505,9 @@ def classify_faces_for_slice(
     i0 = faces[f * 3]
     i1 = faces[f * 3 + 1]
     i2 = faces[f * 3 + 2]
-    s0 = -kernel_array.tolerance_sign(vertex_dots[i0])
-    s1 = -kernel_array.tolerance_sign(vertex_dots[i1])
-    s2 = -kernel_array.tolerance_sign(vertex_dots[i2])
+    s0 = -kernel_array.sign_with_tolerance(vertex_dots[i0], TOLERANCE_MERGE_CONSTANT)
+    s1 = -kernel_array.sign_with_tolerance(vertex_dots[i1], TOLERANCE_MERGE_CONSTANT)
+    s2 = -kernel_array.sign_with_tolerance(vertex_dots[i2], TOLERANCE_MERGE_CONSTANT)
     out_signs[f, 0] = s0
     out_signs[f, 1] = s1
     out_signs[f, 2] = s2
@@ -738,9 +738,9 @@ def classify_faces_for_split(
     # ``SLICE_SIGN_INSIDE`` (-1) is the ``>= isovalue`` side, so a zero value counts as positive.
     f = wp.tid()
     i0, i1, i2 = kernel_triangles.corner_triple(faces, f)
-    s0 = -kernel_array.tolerance_sign(vertex_dots[i0])
-    s1 = -kernel_array.tolerance_sign(vertex_dots[i1])
-    s2 = -kernel_array.tolerance_sign(vertex_dots[i2])
+    s0 = -kernel_array.sign_with_tolerance(vertex_dots[i0], TOLERANCE_MERGE_CONSTANT)
+    s1 = -kernel_array.sign_with_tolerance(vertex_dots[i1], TOLERANCE_MERGE_CONSTANT)
+    s2 = -kernel_array.sign_with_tolerance(vertex_dots[i2], TOLERANCE_MERGE_CONSTANT)
     out_signs[f, 0] = s0
     out_signs[f, 1] = s1
     out_signs[f, 2] = s2

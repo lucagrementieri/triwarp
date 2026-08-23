@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.kernels.array import binary_search_index, cross2, update_argmax, wrap_index
+from triwarp.kernels.array import binary_search_index, cross2, lowbias32, update_argmax, wrap_index
 from triwarp.kernels.points import plane_basis
 from triwarp.kernels.predicates import (
     closest_point_on_segment,
@@ -539,13 +539,10 @@ def compute_ears(
 
 @wp.func
 def ear_priority(i: wp.int32) -> wp.uint32:
-    # ``lowbias32`` finalizer: a bijection on uint32, so distinct ring indices never tie and the
-    # order it induces is an effectively random permutation of them. Being a pure function of the
-    # index it is also perfectly deterministic and needs no state.
-    x = wp.uint32(i)
-    x = (x ^ (x >> wp.uint32(16))) * wp.uint32(0x7FEB352D)
-    x = (x ^ (x >> wp.uint32(15))) * wp.uint32(0x846CA68B)
-    return x ^ (x >> wp.uint32(16))
+    # An effectively random but perfectly deterministic order on the ring indices -- see
+    # ``array.lowbias32`` for why a hash and not the index itself, and for the bijectivity
+    # ``ear_outranks`` leans on.
+    return lowbias32(wp.uint32(i))
 
 
 @wp.func

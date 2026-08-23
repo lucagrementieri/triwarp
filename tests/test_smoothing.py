@@ -125,7 +125,7 @@ def _meshlab_umbrella(mesh_tm: tm.Trimesh, device: str) -> wps.BsrMatrix[wp.floa
 
     Each neighbour is weighted by the number of faces its edge shares (2 for an interior edge, 1 on
     a boundary) and the vertex itself by 1, then the row is normalized. Feeding this to triwarp's
-    ``laplacian_operator=`` parameter is what makes the comparison class B rather than an exemption.
+    ``laplacian_operator=`` parameter is what makes the comparison Class B rather than an exemption.
     """
     shared: dict[tuple[int, int], int] = {}
     for face_np in mesh_tm.faces:
@@ -559,7 +559,7 @@ def test_smooth_region_fixed_rim_matches_meshlib(device: str):
 
     The rim is pinned on both sides and the free set is identical, so the two solve the same
     Dirichlet problem and agree to ``1e-5`` element-wise even though meshlib factorizes where this
-    iterates -- a solve to a fixpoint has one answer, which is what makes this class A rather than a
+    iterates -- a solve to a fixpoint has one answer, which is what makes this Class A rather than a
     displacement bound.
 
     The fixed half is asserted exactly (``array_equal``, not ``allclose``): a solver that moved a

@@ -803,8 +803,12 @@ def _screened_poisson_adaptive(
     balance matches the dense backend's index-space calibration. The (un-oriented) iso-surface
     ``(vertices, faces)`` is returned; the caller orients it outward.
     """
-    # Deferred: importing ``warp.fem`` costs ~0.15 s of ``import triwarp``, and the kernel module
-    # below imports it at module scope, so both stay behind the one adaptive-Poisson path.
+    # Deferred: importing ``warp.fem`` costs ~0.3 s of ``import triwarp`` (measured on Warp 1.16,
+    # 1.49 s against 1.18 s over four interleaved reps), and the kernel module below imports it at
+    # module scope, so both stay behind the one adaptive-Poisson path. The deferral is only real
+    # because ``kernels/curvature.py`` and ``kernels/smoothing.py`` take their two QR helpers from
+    # ``warp._src.fem.linalg``; while they used the public path this saved nothing at all, since
+    # ``import triwarp`` loaded the whole fem package anyway.
     import warp.fem as fem
 
     from triwarp.kernels.algorithms import poisson_fem as kernel_poisson_fem

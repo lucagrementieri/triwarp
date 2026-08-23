@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT, TILE_1D
-from triwarp.kernels.array import pack_farthest_key, pack_nearest_key
+from triwarp.kernels.array import pack_farthest_key, pack_nearest_key, unpack_ranked_index
 from triwarp.kernels.intersection import point_plane_dot
 from triwarp.kernels.reduce import outer_sum_chunk, tile_chunk
 
@@ -302,11 +302,6 @@ def pack_class_z_bits(class_id: wp.int32, point: wp.vec3) -> wp.int64:
     return wp.int64((class_bits << wp.uint64(32)) | z_bits)
 
 
-@wp.func
-def unpack_farthest_index(key: wp.int64) -> wp.int32:
-    return wp.int32(2147483647) - wp.int32(wp.uint32(wp.uint64(key) & wp.uint64(4294967295)))
-
-
 @wp.kernel
 def nearest_pair_keys(
     nearest_distances: wp.array2d[wp.float32], out_keys: wp.array[wp.int64]
@@ -357,7 +352,7 @@ def commit_farthest_point(
     # Decode the winning key into the next sample, advance the step and re-arm the accumulator, so
     # the loop needs no separate reset launch, no host readback and no per-iteration argument.
     step = out_cursor[0] + 1
-    out_selected[step] = unpack_farthest_index(best[0])
+    out_selected[step] = unpack_ranked_index(best[0])
     out_cursor[0] = step
     best[0] = wp.int64(-1)
 

@@ -448,12 +448,11 @@ def filter_spikes(
         defects = tw.vertices.vertex_defects(
             n_vertices, faces, tw.triangles.face_angles(positions, faces)
         )
-        wp.map(
-            kernel_smoothing.is_spike_defect,
-            defects,
-            wp.float32(2.0 * math.pi - min_angle_sum),
-            out=spikes,
-        )
+        # The spike test is ``angle_sum < min_angle_sum``, applied to the angle *defect*
+        # ``2 * pi - angle_sum`` instead: the condition becomes ``defect > 2 * pi - min_angle_sum``,
+        # and the defect is the quantity ``vertices.vertex_defects`` already returns -- re-deriving
+        # the sum would mean scattering the same corner angles a second time.
+        wp.map(kernel_array.greater, defects, wp.float32(2.0 * math.pi - min_angle_sum), out=spikes)
         # One readback per pass, and it is the stopping test: whether any vertex is still a spike is
         # a device-side fact that a Python loop cannot branch on otherwise.
         n_spikes = int(tw.reduce.sum(tw.array.astype(spikes, wp.int32)))

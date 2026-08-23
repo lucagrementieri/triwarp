@@ -6,6 +6,7 @@ from triwarp.constants import TOLERANCE_ZERO_CONSTANT
 from triwarp.kernels.adjacency import edge_endpoints, edge_pair_topology, write_face_edge_keys
 from triwarp.kernels.array import (
     binary_search_sorted_contains,
+    lowbias32,
     pack_edge_key,
     to_vec2d,
     to_vec3,
@@ -527,7 +528,7 @@ def density_split_wanted(
     scale_b: wp.float32,
     scale_c: wp.float32,
     alpha: wp.float32,
-) -> bool:
+) -> wp.bool:
     # Liepa's density criterion for splitting a patch triangle at its centroid. Each vertex carries
     # a *scale attribute* -- the average length of the edges incident to it in the surrounding mesh
     # -- and the centroid inherits the mean of its three. The triangle is split when, for **every**
@@ -573,7 +574,7 @@ def mark_density_splits(
     wanted = density_split_wanted(
         vertices[i], vertices[j], vertices[k], scale[i], scale[j], scale[k], alpha
     )
-    out_split[f] = wp.int32(1) if wanted else wp.int32(0)
+    out_split[f] = wp.where(wanted, wp.int32(1), wp.int32(0))
 
 
 @wp.kernel
@@ -2279,13 +2280,10 @@ def scramble_index(index: wp.int32) -> wp.int32:
     # cost yields 23 (the cost field is smoothly graded there, so it is monotone too). Hashing the
     # index breaks the correlation and restores the expected ~candidates/valence winners.
     #
-    # Murmur-style 32-bit finalizer; the top bit is cleared so the key stays a non-negative int32
-    # and ``INT32_MAX`` remains usable as the unclaimed sentinel.
-    x = wp.uint32(index)
-    x = (x ^ (x >> wp.uint32(16))) * wp.uint32(0x7FEB352D)
-    x = (x ^ (x >> wp.uint32(15))) * wp.uint32(0x846CA68B)
-    x = x ^ (x >> wp.uint32(16))
-    return wp.int32(x & wp.uint32(0x7FFFFFFF))
+    # ``array.lowbias32`` with the top bit cleared, so the key stays a non-negative int32 and
+    # ``INT32_MAX`` remains usable as the unclaimed sentinel. The measurement behind the hash is
+    # recorded there, on the shared function, rather than here.
+    return wp.int32(lowbias32(wp.uint32(index)) & wp.uint32(0x7FFFFFFF))
 
 
 @wp.kernel(enable_backward=False)

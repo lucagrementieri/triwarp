@@ -126,7 +126,7 @@ def test_trace_from_vertex_matches_potpourri3d(
     request: pytest.FixtureRequest, mesh_name: str, device: str
 ) -> None:
     """
-    Class A on the arc length, class C on the endpoint -- and the split is the point.
+    Class A on the arc length, Class C on the endpoint -- and the split is the point.
 
     The traced *length* is the contract and matches geometry-central to ``1e-4``. The *endpoint*
     cannot: the two libraries resolve a walk crossing exactly through a vertex differently, and the

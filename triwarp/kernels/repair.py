@@ -1,7 +1,7 @@
 import warp as wp
 
 from triwarp.kernels.array import pack_ranked_key, update_argmin_pair
-from triwarp.kernels.halfedge import halfedge_destination
+from triwarp.kernels.halfedge import halfedge_destination, halfedge_next
 from triwarp.kernels.predicates import triangle_aspect_ratio, triangle_normal
 from triwarp.kernels.triangles import corner_triple, triangle_cross
 
@@ -103,25 +103,14 @@ def mark_largest_group_mask(
     # Flag every member of the group ``reduce_largest_group`` chose. Recomputing the key and testing
     # it against the reduced maximum is what keeps this readback-free: the winning group index is
     # never brought to the host, and the ``-1`` seed marks nothing when there are no groups at all.
+    #
+    # Not convertible to a ``wp.map`` over a gather, unlike the *threshold* criteria beside it in
+    # ``repair.remove_small_components``: those are one table lookup compared against a scalar, so
+    # ``wp.map(greater_equal, statistic[labels], threshold)`` is the whole kernel, whereas this
+    # needs two gathers and a call to rebuild the key before it can compare.
     f = wp.int32(wp.tid())
     group = groups[f]
     out_mask[f] = pack_ranked_key(counts[group], group) == best[0]
-
-
-@wp.kernel
-def mark_group_statistic_mask(
-    groups: wp.array[wp.int32],
-    statistic: wp.array[wp.Scalar],
-    threshold: wp.Scalar,
-    out_mask: wp.array[wp.bool],
-) -> None:
-    # Flag every member of a group whose statistic reaches ``threshold``, inclusive -- the bound
-    # every reference that thresholds a component uses (measured: a component of exactly
-    # ``mincomponentsize`` faces, or of exactly ``mincomponentdiag`` diagonal, survives). Generic
-    # over the statistic's dtype so the face-count, area and diameter criteria share one kernel
-    # rather than differing only in a comparison.
-    f = wp.int32(wp.tid())
-    out_mask[f] = statistic[groups[f]] >= threshold
 
 
 @wp.kernel(enable_backward=False)
@@ -238,8 +227,8 @@ def corner_merge_links(
     backward = backward_corner[e]
     # The forward half-edge runs (low, high) from its own corner; the backward one runs (high, low),
     # so its *next* slot holds the low endpoint.
-    forward_next = (forward // 3) * 3 + (forward + 1) % 3
-    backward_next = (backward // 3) * 3 + (backward + 1) % 3
+    forward_next = halfedge_next(forward)
+    backward_next = halfedge_next(backward)
     out_links[e * 2 + 0, 0] = forward  # low endpoint, forward face
     out_links[e * 2 + 0, 1] = backward_next  # low endpoint, backward face
     out_links[e * 2 + 1, 0] = forward_next  # high endpoint, forward face
@@ -407,20 +396,3 @@ def flatten_degree3_positions(
     for slot in range(begin, end):
         total += positions[halfedge_destination(faces, ring_halfedges[slot])]
     out_positions[vertex] = total / wp.float32(3.0)
-
-
-# Concrete overloads, registered at import -- rationale in ``triwarp/kernels/reduce.py``, rule in
-# CLAUDE.md section 4. ``mark_group_statistic_mask`` is this module's only generic kernel and its
-# wrapper's dispatch reaches exactly two dtypes: ``wp.int32`` for the face-count criterion and
-# ``wp.float32`` for the area and bounding-box-diagonal ones. There is no float64 path -- the
-# statistics are all derived from a ``wp.vec3`` (float32) vertex buffer.
-def _register_overloads() -> None:
-    """Instantiate every concrete overload of this module's generic kernels."""
-    for dtype in (wp.int32, wp.float32):
-        wp.overload(
-            mark_group_statistic_mask,
-            [wp.array[wp.int32], wp.array[dtype], dtype, wp.array[wp.bool]],
-        )
-
-
-_register_overloads()

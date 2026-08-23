@@ -31,7 +31,7 @@ def _uv_to_pixel(uv: wp.vec2, resolution: wp.int32) -> wp.vec2:
 
 
 @wp.func
-def _covered(bary: wp.vec3) -> bool:
+def _covered(bary: wp.vec3) -> wp.bool:
     """Return whether a pixel center lies inside the triangle (edge-inclusive)."""
     return bary[0] >= -COVERAGE_EPS and bary[1] >= -COVERAGE_EPS and bary[2] >= -COVERAGE_EPS
 

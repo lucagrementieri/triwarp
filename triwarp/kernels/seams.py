@@ -57,12 +57,6 @@ def scatter_corner_values(
 
 
 @wp.func
-def crease_edge_mask(adjacency_angle: wp.float32, threshold: wp.float32) -> wp.bool:
-    # Strictly greater, so a threshold of 0 selects every non-coplanar interior edge.
-    return adjacency_angle > threshold
-
-
-@wp.func
 def halfedge_opposite_corner(h: wp.int32) -> wp.int32:
     # The corner of ``h``'s face that ``h`` does *not* touch -- igl's ``(i + 2) % 3``.
     return halfedge_next(halfedge_next(h))

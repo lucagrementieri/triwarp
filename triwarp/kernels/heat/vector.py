@@ -54,7 +54,8 @@ def scale_to_magnitude(direction: wp.vec2d, magnitude: wp.float64, floor: wp.flo
     # from round-off and must not be raised in an attempt to: the smallest genuinely diffused value
     # on ``half_torus`` is 8.0e-10 of the maximum, *below* the 8.7e-09 of round-off left at a point
     # where the transported copies cancel exactly. The two populations overlap, so no magnitude cut
-    # tells them apart -- that is what ``is_resolved`` below reports instead of acting on.
+    # tells them apart -- which is why ``transport_tangent_vectors`` *reports* resolution as a
+    # second mask (one ``array.greater`` at a higher floor) instead of acting on it here.
     #
     # That round-off is the float32 *transport angles*, not the solve and not the frames (which the
     # connection Laplacian never reads). Three measurements: it does not move when the
@@ -66,15 +67,6 @@ def scale_to_magnitude(direction: wp.vec2d, magnitude: wp.float64, floor: wp.flo
     if length <= floor:
         return wp.vec2d(wp.float64(0.0), wp.float64(0.0))
     return (magnitude / length) * direction
-
-
-@wp.func
-def is_resolved(length: wp.float64, floor: wp.float64) -> wp.bool:
-    # Companion to ``scale_to_magnitude``: same field, same relative comparison, higher floor.
-    # Where that one asks "did this vanish?" and must stay below every genuine value, this one asks
-    # "can this be told from round-off?" and must stay *above* it -- so a vertex can be reported
-    # unresolved while still carrying a full-length vector, which is exactly the cut-locus case.
-    return length > floor
 
 
 @wp.func

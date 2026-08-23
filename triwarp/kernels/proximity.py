@@ -163,21 +163,6 @@ def closest_point_on_edges(
         out_edge[tid] = best_edge
 
 
-@wp.kernel
-def edge_bounds(
-    vertices: wp.array[wp.vec3],
-    edges: wp.array2d[wp.int32],
-    out_lower: wp.array[wp.vec3],
-    out_upper: wp.array[wp.vec3],
-) -> None:
-    # Per-edge AABB, the input a segment BVH is built from.
-    e = wp.int32(wp.tid())
-    a = vertices[edges[e, 0]]
-    b = vertices[edges[e, 1]]
-    out_lower[e] = wp.min(a, b)
-    out_upper[e] = wp.max(a, b)
-
-
 @wp.func
 def solid_angle(a: wp.vec3, b: wp.vec3, c: wp.vec3, p: wp.vec3) -> wp.float32:
     """Signed solid angle subtended by triangle (a, b, c) at point p (``igl::solid_angle``)."""
@@ -198,14 +183,14 @@ def solid_angle(a: wp.vec3, b: wp.vec3, c: wp.vec3, p: wp.vec3) -> wp.float32:
 
 @wp.func
 def solid_angle_at_face(
-    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: int, p: wp.vec3
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], f: wp.int32, p: wp.vec3
 ) -> wp.float32:
     v0, v1, v2 = kernel_triangles.face_vertices(vertices, faces, wp.int32(f))
     return solid_angle(v0, v1, v2, p)
 
 
 @wp.func
-def point_strictly_inside_aabb(p: wp.vec3, mesh_min: wp.vec3, mesh_max: wp.vec3) -> bool:
+def point_strictly_inside_aabb(p: wp.vec3, mesh_min: wp.vec3, mesh_max: wp.vec3) -> wp.bool:
     return (
         p[0] > mesh_min[0]
         and p[1] > mesh_min[1]

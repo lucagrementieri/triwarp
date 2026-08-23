@@ -323,13 +323,12 @@ def transport_tangent_vectors(
     transported = wp.empty(n_vertices, dtype=wp.vec2, device=device)
     wp.map(kernel_array.to_vec2, scaled, out=transported)
 
+    # Same field and the same relative comparison as ``scale_to_magnitude``' floor above, at a
+    # *higher* floor: that one asks "did this vanish?" and must stay below every genuine value,
+    # this one asks "can this be told from round-off?" and must stay above it. So a vertex can be
+    # reported unresolved while still carrying a full-length vector, which is the cut-locus case.
     resolved = wp.empty(n_vertices, dtype=wp.bool, device=device)
-    wp.map(
-        kernel_heat_vector.is_resolved,
-        lengths,
-        wp.float64(_RESOLVED_FRACTION * maximum),
-        out=resolved,
-    )
+    wp.map(kernel_array.greater, lengths, wp.float64(_RESOLVED_FRACTION * maximum), out=resolved)
     return transported, resolved
 
 

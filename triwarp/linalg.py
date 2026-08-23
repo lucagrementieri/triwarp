@@ -1571,7 +1571,7 @@ def _multigrid_prune(matrix: wps.BsrMatrix[wp.float64]) -> wps.BsrMatrix[wp.floa
         return matrix
     rows = wp.empty(nnz, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_mg.expand_row_indices, dim=n_rows, inputs=[matrix.offsets, rows], device=device
+        kernel_array.segment_owner_labels, dim=n_rows, inputs=[matrix.offsets, rows], device=device
     )
     return wps.bsr_from_triplets(
         n_rows,

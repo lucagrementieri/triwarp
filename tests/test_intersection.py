@@ -1276,7 +1276,7 @@ def test_mesh_with_mesh_icosahedron_cave_cube(
 
     MeshLib's ``findIntersectionContours`` covers the same group and does strictly more (it links
     the crossing into ordered contours); VTK's filter returns the soup triwarp returns, which is why
-    this is class B where that pairing is class C.
+    this is Class B where that pairing is Class C.
     """
     ico_tm, ico_wp = icosahedron
     cave_tm, _ = cave_cube

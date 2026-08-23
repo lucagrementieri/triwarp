@@ -28,7 +28,7 @@ def sample_surface(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     cdf: wp.array[wp.float32],
-    seed: int,
+    seed: wp.int32,
     out_points: wp.array[wp.vec3],
     out_face_indices: wp.array[wp.int32],
 ) -> None:
@@ -51,7 +51,7 @@ def sample_volume_tetrahedra(
     faces: wp.array[wp.int32],
     center: wp.vec3,
     cdf: wp.array[wp.float32],
-    seed: int,
+    seed: wp.int32,
     out_points: wp.array[wp.vec3],
 ) -> None:
     tid = wp.int32(wp.tid())

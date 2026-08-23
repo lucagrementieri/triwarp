@@ -422,6 +422,13 @@ The following Python features are **not supported** inside `@wp.kernel` and `@wp
   sibling `multigrid` three files over wrote `t % stride`; there is no such reason.
 - `wp.asin()` / `wp.acos()` auto-clamp inputs to [-1, 1]; explicit `wp.clamp` before these calls is redundant but harmless.
 - Variable scope inside conditional blocks may differ from CPython: variables defined only inside an `if` branch are accessible afterward in Warp, but are uninitialized if the branch was not taken — always initialize variables before branching.
+- **A tuple cannot be subscripted by a runtime index; a vector can.** The `tuple[T, T, T]` a
+  `@wp.func` returns unpacks into names and nothing more, so `corner[k]` for a loop variable `k`
+  does not compile — which is why a handful of kernels reach for the flat slice
+  `faces[f * 3 : (f + 1) * 3]` that §3's index-form rule otherwise retired. The spelling that keeps
+  both is `wp.vec3i(*corner_triple(faces, f))`, which accepts a runtime `[]` (verified on Warp
+  1.16) and takes no sub-array view. So the rule is **not** "no slices" but *no slice where an index
+  form exists* — `holes.directed_edge_opposites` reintroduced one and it was the legitimate case.
 
 ---
 
@@ -1723,6 +1730,21 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
   `ball_pivoting`, which were neither converted nor annotated and were therefore re-derived a pass
   later. A finding that names five sites is closed when all five are converted **or** annotated —
   a partially applied one reads as an open question and costs the next pass the whole re-derivation.
+- **Before proposing an optimization, read what *calls* the thing — the decline may already be
+  written there.** A scan reads bodies; a measured decision is prose, and it lives at the call site
+  rather than in the function. The fifth kernel pass proposed replacing `holes._closest_loop_pair`'s
+  three launches and `(n_a, n_b)` matrix with a one-kernel atomic reduction, having read the three
+  kernels and the private wrapper — and its caller's preamble comment, **three lines above the
+  call**, already read *"Measured, and deliberately left alone: this preamble … is 5.0 % of the call
+  at a 100-vertex rim on CUDA and falls to 0.7 % at 1 000 and 0.4 % at 4 000."* Grep the caller for a
+  number first. Where the decline is genuinely absent, measure it and write it at *both* ends: the
+  sibling item that pass did measure (folding `holes.global_argmin` into `row_argmin`, **1.51 % /
+  0.58 % / 0.41 %** of `stitch_loops` at rims of 100 / 1 000 / 4 000, launch-dominated so the
+  single-lane walk is not the cost) is now recorded on the kernel *and* at the wrapper.
+- **A share that falls as the input grows is a decline, not a small win.** Both of the above shrink
+  with rim size, which means the saving is largest exactly where the call is already cheap — the
+  same shape as §13's `objective_flip_candidates` bundle (1.75 % of a two-round pass). Report the
+  share at more than one size before deciding; a single operating point cannot show the trend.
 - **Budget the host–device syncs.** Every `.numpy()` / `int(<device value>)` readback in a wrapper
   carries a comment naming why it is unavoidable. When the caller can supply the bound the readback
   infers, expose it as a keyword (`face_adjacency(n_vertices=...)`,
@@ -1739,20 +1761,26 @@ Running basedpyright in a dev-only env yields spurious `reportMissingImports` on
 ## 14. Evolving the Public API
 
 **`tests/test_api_conventions.py` is the mechanical half of this section**, and it fails the default
-`pytest` run. Seventeen checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
+`pytest` run. Eighteen checks. Eight scan the public surface of `triwarp/` (excluding `kernels/`): a
 summary line naming a reference library (§10); a `*_mask` producer that does not return
 `wp.array[wp.bool]`; a module summary advertising Warp; a module without a `tests/` **and** a
 `benchmarks/` file named for it; a private name reached across a module boundary; one public name
 exported by two modules; a top-level `kernels/<name>.py` without its `triwarp/<name>.py` or the
 reverse (§4); and a private helper defined above its first caller (§11). The ninth scans `kernels/`
 **as well**: a comment or docstring blaming a Warp version older than the installed `warp-lang`.
-Four enforce an earlier section's convention on kernel code: §3's `out_` prefix and
+Five enforce an earlier section's convention on kernel code: §3's `out_` prefix and
 end-of-signature position for a written argument (its two exemption classes carried as
 `_KERNEL_OUTPUT_ALLOWLIST`); §2's subscript-style array annotation — this one scans the whole
 package, because only in an *annotation* position is `wp.array(dtype=T)` the stale spelling rather
-than a legal allocation; §3's cast spelling, **check 16**, no bare `int(...)` / `float(...)`; and
-§5's integer division, **check 17**, no `/` between two operands that are integers *by
-declaration*. The last five are newer and each exists because the same defect was found twice:
+than a legal allocation; §3's cast spelling, **check 16**, no bare `int(...)` / `float(...)`; §5's
+integer division, **check 17**, no `/` between two operands that are integers *by declaration*; and
+§2's type standard, **check 18**, no bare `bool` / `int` / `float` annotation in a `@wp.kernel` /
+`@wp.func` signature. Those last three are one family, and the family is the point: all three
+spellings are *legal* and generate identical code, so the defect is invisible to the compiler and to
+the suite, and nothing but a scan holds the line. Check 18 reads kernel-scope signatures **only** —
+a kernel *factory* is ordinary Python and its `row_size: int` / `name: str` parameters are correct,
+which is why `str` is not in its table. The last five are newer and each exists because the same
+defect was found twice:
 
 - **A `wp.launch` / `wp.launch_tiled` with no `device=`.** Check 15, and it is a memory-safety guard
   rather than a style one — see §8 for the measured failure. It is also the *load-bearing* half of
@@ -1881,6 +1909,18 @@ survive the next upgrade unexamined, which is exactly the failure the check exis
   the dispatch stays readable*. Where Warp cannot express the generic — there is no `wp.any` /
   `wp.all` over vector components and no generic vector annotation — keep named per-type funcs
   behind a small dtype-keyed dispatch rather than contorting the kernel.
+- **The axis is not always the dtype: `Any` is generic over the *rank* and the *dimension* too, and
+  a helper pinned to either breeds copies exactly as a precision-pinned one does.** Two measured
+  instances, both merged in the fifth kernel pass. A 5×5 and a 6×6 Householder normal-equation solve
+  lived in `curvature` and `smoothing`, and what pinned them was one line — a `for k in range(N)`
+  singularity test, because **a matrix has no readable `.shape` in kernel scope**
+  (`r.shape[0]` is a `WarpCodegenAttributeError` at parse time on Warp 1.16). The rank-free spelling
+  is a reduction over the diagonal: `wp.min(wp.abs(wp.get_diag(r))) < tol` asks the identical
+  question with no loop, and `linalg.solve_normal_equations` now serves both. And a Cramer's-rule
+  barycentric solve lived once per *dimension* (`wp.vec2`, `wp.vec3`) although `wp.length_sq` and
+  `wp.dot` say nothing about the ambient dimension — one `Any` body serves both. **When two bodies
+  differ only in a size, look for the one statement that names it and ask whether Warp has a
+  reduction for it.**
 - **No speculative generality.** Add an axis, parameter, or mode only when an in-repo call site
   needs it. The absence of a caller is a reason not to build it, not a gap to fill.
 - **No near-duplicate wrappers.** Two public functions that are the same algorithm with different

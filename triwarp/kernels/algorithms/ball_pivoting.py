@@ -187,7 +187,7 @@ def compute_ball_center(
 @wp.func
 def is_compatible(
     a: wp.vec3, b: wp.vec3, c: wp.vec3, na: wp.vec3, nb: wp.vec3, nc: wp.vec3
-) -> bool:
+) -> wp.bool:
     # The triangle normal must agree (within tolerance) with all three oriented point normals.
     normal = triangle_normal(a, b, c)
     if wp.dot(normal, na) < -1e-16:
@@ -206,7 +206,7 @@ def ball_is_empty(
     a: wp.int32,
     b: wp.int32,
     c: wp.int32,
-) -> bool:
+) -> wp.bool:
     # True when no point other than the three defining ones lies strictly inside the ball.
     #
     # Compared squared, matching ``candidate_is_viable``'s clustering test. The two spellings are
@@ -382,14 +382,14 @@ def seed_triangles(
 @wp.func
 def point_is_available(
     p: wp.int32, point_used: wp.array[wp.bool], boundary_degree: wp.array[wp.int32]
-) -> bool:
+) -> wp.bool:
     # Orphan, or still on the advancing front. A used point with no incident boundary edge is
     # fully interior and can never be pivoted onto again — which is what makes retirement sound.
     return (not point_used[p]) or boundary_degree[p] > 0
 
 
 @wp.func
-def edge_is_interior(u: wp.int32, v: wp.int32, edges: BpaEdgeTable) -> bool:
+def edge_is_interior(u: wp.int32, v: wp.int32, edges: BpaEdgeTable) -> wp.bool:
     # Manifold guard: an edge already shared by two triangles may not gain a third. One hash probe,
     # where the previous design needed a binary search into a freshly sorted key array.
     slot = hash_find(pack_edge_key(u, v, edges.key_base), edges.key, edges.mask)
@@ -408,7 +408,7 @@ def candidate_prefilter(
     min_cluster_sq: wp.float32,
     point_used: wp.array[wp.bool],
     boundary_degree: wp.array[wp.int32],
-) -> bool:
+) -> wp.bool:
     # The cheap half of the candidate test: identity, availability and vcglib clustering. Compared
     # squared, since this runs once per point the grid hands back.
     if c == src or c == tgt or c == opp:
@@ -436,7 +436,7 @@ def candidate_accepted(
     radius: wp.float32,
     crease_cos: wp.float32,
     edges: BpaEdgeTable,
-) -> bool:
+) -> wp.bool:
     # The expensive half: crease, manifoldness, normal compatibility and the empty-ball test, in
     # increasing order of cost. Shared verbatim between the full search and the O(1) re-validation
     # of a cached candidate, so the two can never disagree about what a valid candidate is.

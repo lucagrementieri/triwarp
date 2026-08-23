@@ -630,7 +630,7 @@ def delete_region_keep_boundary(
         )
 
     keep_mask = wp.empty(n_faces, dtype=wp.bool, device=device)
-    wp.map(kernel_selection.logical_not, face_mask, out=keep_mask)
+    wp.map(kernel_array.mask_not, face_mask, out=keep_mask)
     kept_vertices, kept_faces, vertex_index = submesh_from_face_mask(
         vertices, faces, keep_mask, return_index=True
     )

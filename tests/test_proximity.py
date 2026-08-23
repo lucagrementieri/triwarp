@@ -96,7 +96,7 @@ def test_query_mesh_aabb_with_offsets(device: str) -> None:
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
 def test_closest_point_on_mesh_random(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
-    Class A on the distance, class C on the point: ties make the closest *point* ambiguous.
+    Class A on the distance, Class C on the point: ties make the closest *point* ambiguous.
 
     200 random queries against ``trimesh.proximity.closest_point``. The distance is the well-
     defined quantity and is compared directly; a query equidistant from two faces has two valid
@@ -126,7 +126,7 @@ def test_closest_point_on_mesh_matches_meshlib(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     """
-    Class A on the distance, class C on the point, and the face index is a *tie-break gauge*.
+    Class A on the distance, Class C on the point, and the face index is a *tie-break gauge*.
 
     ``findProjection`` returns a ``MeshProjectionResult`` carrying the squared distance, the
     projected point and the ``FaceId`` it landed on -- so it is the only reference in this module

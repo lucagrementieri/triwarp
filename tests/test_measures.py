@@ -156,7 +156,7 @@ def test_surface_centroid_matches_pymeshlab_shell_barycenter(
     ``get_geometric_measures`` answers six questions in one call -- which is why
     ``benchmarks/test_triangles.py`` reads its row as an *upper* bound on the centroid alone -- but
     "upper bound" is a statement about cost, not about the value. Indexing the dict is the whole
-    transform (class B).
+    transform (Class B).
 
     The distinction that matters here is that the same call also returns ``barycenter``, the plain
     *vertex* mean, and the two differ on any mesh with uneven triangle areas. Asserting against
@@ -179,7 +179,7 @@ def test_surface_centroid_matches_pymeshlab_shell_barycenter(
 @pytest.mark.parity("moments", "igl", "trimesh")
 def test_moments(request: pytest.FixtureRequest, mesh_name: str):
     """
-    Class B on igl (its first moment is un-normalised), class A on trimesh.
+    Class B on igl (its first moment is un-normalised), Class A on trimesh.
 
     ``igl.moments`` returns ``(m0, m1, m2)`` where ``m1`` is the centre of mass **times the mass**,
     so the named transform is ``m1 / m0``. ``m2`` needs no transform: it is already referred to the

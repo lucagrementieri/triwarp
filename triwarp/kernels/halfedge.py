@@ -1,3 +1,21 @@
+"""
+Kernels for the halfedge structure (``triwarp.halfedge``).
+
+Every function here is index arithmetic under the ``h = 3 * f + k`` convention: halfedge ``h``
+belongs to face ``h // 3``, occupies corner ``h % 3`` of it, and runs
+``faces[h] -> faces[3 * f + (k + 1) % 3]``. There is no stored ``next`` or ``prev`` pointer and no
+face table to consult, which is why these are ``@wp.func``s over an ``int32`` rather than lookups.
+
+**The decomposition itself is deliberately not wrapped.** ``h // 3`` for the face appears at ~20
+sites across the tree and stays spelled that way: it is shorter than a call, the convention is
+stated here and restated at the sites that need it (``adjacency.py`` puts it in one clause -- *"the
+face of edge ``e`` is just ``e // 3``"*), and a ``halfedge_face(h)`` helper would add a name without
+adding information. What *is* worth reaching for is anything with a branch in it --
+``halfedge_next`` and ``halfedge_prev`` below -- because those get re-derived by hand instead:
+``kernels/repair.py`` carried ``(forward // 3) * 3 + (forward + 1) % 3`` twice, in a file that
+already imported from here.
+"""
+
 import warp as wp
 
 from triwarp.constants import INT32_MAX_CONSTANT

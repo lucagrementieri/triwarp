@@ -334,7 +334,7 @@ def test_procrustes_matches_open3d(device: str) -> None:
     Closed-form Kabsch against Open3D's, with the correspondence handed to both.
 
     Open3D's ``TransformationEstimationPointToPoint.compute_transformation`` takes an explicit
-    correspondence list, which is exactly triwarp's ``procrustes`` contract, so this is class A on
+    correspondence list, which is exactly triwarp's ``procrustes`` contract, so this is Class A on
     the 4x4 matrix -- no ICP loop, no nearest-neighbour search, just the SVD. Measured worst entry
     deviation **1.4e-7**, well inside the 1e-5 asserted here.
 

@@ -1,6 +1,6 @@
 import warp as wp
 
-from triwarp.kernels.array import wrap_index
+from triwarp.kernels.array import loop_next_slot
 
 
 @wp.kernel
@@ -125,10 +125,8 @@ def loop_perimeters(
     # ``preserve_largest_hole`` costs one readback instead of two per loop.
     t = wp.int32(wp.tid())
     ell = loop_id[t]
-    o = loop_starts[ell]
-    b = loop_sizes[ell]
     a = vertices[flat_loops[t]]
-    c = vertices[flat_loops[o + wrap_index(t - o + 1, b)]]
+    c = vertices[flat_loops[loop_next_slot(loop_id, loop_starts, loop_sizes, t)]]
     wp.atomic_add(out_perimeter, ell, wp.length(c - a))
 
 
@@ -147,8 +145,6 @@ def loop_directed_areas(
     # centroid pass is needed -- and accumulated per segment in one launch, like the perimeter.
     t = wp.int32(wp.tid())
     ell = loop_id[t]
-    o = loop_starts[ell]
-    b = loop_sizes[ell]
     a = vertices[flat_loops[t]]
-    c = vertices[flat_loops[o + wrap_index(t - o + 1, b)]]
+    c = vertices[flat_loops[loop_next_slot(loop_id, loop_starts, loop_sizes, t)]]
     wp.atomic_add(out_directed_area, ell, wp.float32(0.5) * wp.cross(a, c))

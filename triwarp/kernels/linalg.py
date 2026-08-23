@@ -21,7 +21,54 @@ assembles, lives in ``triwarp.kernels.algorithms.conjugate_gradient``.
     Routing them through here would force an extra full matrix build.
 """
 
+from typing import Any
+
 import warp as wp
+
+# Warp's own Householder QR. From ``warp._src.fem.linalg`` rather than the public
+# ``warp.fem.linalg``: both bind the same two ``@wp.func``s, which inline here and trigger no fem
+# codegen, but the public path executes ``warp/fem/__init__.py`` and eagerly loads the whole fem
+# package -- measured on **Warp 1.16** at 0.24-0.29 s against 0.008-0.010 s, and 1.49 s against
+# 1.18 s for ``import triwarp`` end to end. ``kernels/reduce.py`` reaches into ``warp._src`` on the
+# same terms.
+from warp._src.fem.linalg import householder_qr_decomposition, solve_triangular
+
+
+@wp.func
+def solve_normal_equations(matrix: Any, rhs: Any):
+    """
+    Solve a small dense symmetric system ``A x = b`` by Householder QR, at any rank.
+
+    Returns ``(solution, ok)``; ``ok`` is False when the system is singular to ``1e-14``, in which
+    case the returned vector is ``rhs`` unchanged. Reporting rather than raising, because the caller
+    is a kernel: a per-vertex least-squares fit that fails on a degenerate 1-ring has to fall back,
+    not abort the launch.
+
+    ``|R[k, k]|`` is the norm of column k after the preceding reflections -- the QR analogue of the
+    partial-pivot magnitude a Gaussian elimination would test, to within a ``sqrt(n)`` factor -- so
+    a single threshold carries across ranks.
+
+    **The rank is nowhere in this function, and that is the point.** It was written twice, as a 5x5
+    for ``curvature``'s quadric fit and a 6x6 for ``smoothing``'s area-equalizing solve, because the
+    singularity test was a ``for k in range(5)`` / ``range(6)`` loop and a generic matrix has no
+    readable rank in kernel scope -- ``r.shape[0]`` is a ``WarpCodegenAttributeError`` at parse time
+    on Warp 1.16. ``wp.min(wp.abs(wp.get_diag(r)))`` asks the identical question ("is some
+    diagonal below tolerance") with no loop and no rank, which is what let the two collapse into
+    one. Verified against ``numpy.linalg.solve`` at both ranks: max abs error 4.163e-17 at 5 and
+    5.551e-17 at 6, with the singular case reporting ``ok=False`` at both.
+
+    The two predicates were also compared directly, 810 finite matrices per rank -- 200 well
+    conditioned, 200 near-singular spanning fourteen orders of magnitude of conditioning, and one
+    exactly rank-deficient per column -- and they agree on **every** one. They part on exactly two
+    inputs, and in the safe direction: a matrix carrying a ``nan`` or an ``inf`` entry passed the
+    old loop (``wp.abs(nan) < tol`` is False, so no iteration rejected it) and now reports
+    ``ok=False``. So a degenerate 1-ring that used to yield a ``nan`` fit silently now takes the
+    caller's fallback, which is what both callers already do for a singular system.
+    """
+    q, r = householder_qr_decomposition(matrix)
+    if wp.min(wp.abs(wp.get_diag(r))) < wp.float64(1e-14):
+        return rhs, False
+    return solve_triangular(r, wp.transpose(q) * rhs), True
 
 
 @wp.func

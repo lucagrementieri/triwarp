@@ -1,5 +1,7 @@
 import warp as wp
 
+from triwarp.kernels.predicates import segment_aabb, side_lengths
+
 
 @wp.func
 def _write_edge(
@@ -37,15 +39,33 @@ def edge_lengths(
 
 
 @wp.kernel
+def edge_aabb_bounds(
+    vertices: wp.array[wp.vec3],
+    edges: wp.array2d[wp.int32],
+    out_lower: wp.array[wp.vec3],
+    out_upper: wp.array[wp.vec3],
+) -> None:
+    # Per-edge AABB, the input a segment BVH is built from -- the edge counterpart of
+    # ``triangles.face_aabb_bounds``, and the one spelling of it: this lived twice, as
+    # ``curvature.edge_aabb_from_endpoints`` (for the mean-curvature ball measure over the
+    # face-adjacency edges) and ``proximity.edge_bounds`` (for closest-point-on-edges), which is
+    # what a per-edge geometric quantity parked in two algorithm modules looks like.
+    e = wp.int32(wp.tid())
+    lower, upper = segment_aabb(vertices[edges[e, 0]], vertices[edges[e, 1]])
+    out_lower[e] = lower
+    out_upper[e] = upper
+
+
+@wp.kernel
 def face_edge_lengths(
     vertices: wp.array[wp.vec3], faces: wp.array[wp.int32], out_lengths: wp.array2d[wp.float32]
 ) -> None:
     # Column ``e`` is the edge *opposite* corner ``e``, the igl intrinsic convention that
     # ``laplacian.cotmatrix_entries_intrinsic`` reads.
     f = wp.int32(wp.tid())
-    v0 = vertices[faces[f * 3 + 0]]
-    v1 = vertices[faces[f * 3 + 1]]
-    v2 = vertices[faces[f * 3 + 2]]
-    out_lengths[f, 0] = wp.length(v2 - v1)
-    out_lengths[f, 1] = wp.length(v0 - v2)
-    out_lengths[f, 2] = wp.length(v1 - v0)
+    l0, l1, l2 = side_lengths(
+        vertices[faces[f * 3 + 0]], vertices[faces[f * 3 + 1]], vertices[faces[f * 3 + 2]]
+    )
+    out_lengths[f, 0] = l0
+    out_lengths[f, 1] = l1
+    out_lengths[f, 2] = l2

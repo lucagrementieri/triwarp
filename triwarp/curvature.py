@@ -22,6 +22,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp.kernels import curvature as kernel_curvature
+from triwarp.kernels import edges as kernel_edges
 from triwarp.kernels import scatter as kernel_scatter
 from triwarp.vertices import vertex_defects
 from triwarp.vertices import vertex_normals as _vertex_normals
@@ -247,7 +248,7 @@ def discrete_mean_curvature(
     edge_lower = wp.empty(m, dtype=wp.vec3, device=device)
     edge_upper = wp.empty(m, dtype=wp.vec3, device=device)
     wp.launch(
-        kernel_curvature.edge_aabb_from_endpoints,
+        kernel_edges.edge_aabb_bounds,
         dim=m,
         inputs=[vertices, face_adjacency_edges, edge_lower, edge_upper],
         device=device,

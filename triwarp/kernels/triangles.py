@@ -6,6 +6,8 @@ from triwarp.constants import PI, TOLERANCE_MERGE_CONSTANT, TOLERANCE_ZERO_CONST
 from triwarp.kernels.array import binary_search_sorted_contains, pack_edge_key, to_vec3d
 from triwarp.kernels.halfedge import halfedge_next, halfedge_prev
 from triwarp.kernels.predicates import (
+    barycentric_gram,
+    side_lengths,
     triangle_aabb,
     triangle_aspect_ratio,
     triangle_double_area,
@@ -198,9 +200,7 @@ def triangle_radius_ratio(a: Any, b: Any, c: Any) -> wp.Float:
     # VCG ``QualityRadii`` ("inradius/circumradius"): the ratio of the two radii, rescaled so an
     # equilateral triangle reads 1 (the bare geometric ratio is 1/2 there). Symmetric in the three
     # side lengths; zero for a degenerate triangle.
-    bc = wp.length(c - b)
-    ca = wp.length(a - c)
-    ab = wp.length(b - a)
+    bc, ca, ab = side_lengths(a, b, c)
     product = ab * ca * bc
     if product <= type(product)(0.0):
         return type(product)(0.0)
@@ -295,22 +295,16 @@ def barycentric_to_points(
 
 @wp.func
 def point_barycentric_cramer(v0: wp.vec3, v1: wp.vec3, v2: wp.vec3, point: wp.vec3) -> wp.vec3:
-    # Barycentric coordinates of ``point`` projected into the plane of triangle (v0, v1, v2),
-    # by Cramer's rule on the 2x2 Gram system of the two edge vectors. A degenerate triangle makes
-    # the determinant zero and the result infinite, which is the caller's cue rather than this
-    # function's business (the kernel form has always behaved that way).
-    e0 = v1 - v0
-    e1 = v2 - v0
-    w = point - v0
-    dot00 = wp.length_sq(e0)
-    dot01 = wp.dot(e0, e1)
-    dot02 = wp.dot(e0, w)
-    dot11 = wp.length_sq(e1)
-    dot12 = wp.dot(e1, w)
-    inverse_denominator = 1.0 / (dot00 * dot11 - dot01 * dot01)
-    v = (dot11 * dot02 - dot01 * dot12) * inverse_denominator
-    w2 = (dot00 * dot12 - dot01 * dot02) * inverse_denominator
-    return wp.vec3(1.0 - v - w2, v, w2)
+    # Barycentric coordinates of ``point`` projected into the plane of triangle (v0, v1, v2). A
+    # degenerate triangle makes the determinant zero and the result infinite, which is the caller's
+    # cue rather than this function's business (the kernel form has always behaved that way) -- so
+    # the division is here and not in the shared ``barycentric_gram``, whose 2-D caller wants the
+    # opposite policy.
+    n1, n2, denom = barycentric_gram(v0, v1, v2, point)
+    inverse_denominator = 1.0 / denom
+    v = n1 * inverse_denominator
+    w = n2 * inverse_denominator
+    return wp.vec3(1.0 - v - w, v, w)
 
 
 @wp.kernel
@@ -525,7 +519,7 @@ def is_crease_edge(
     crease_keys_sorted: wp.array[wp.uint64],
     base: wp.uint64,
     halfedge: wp.int32,
-) -> bool:
+) -> wp.bool:
     # Whether the undirected edge a halfedge lies on is in the crease set. An empty set answers
     # ``False`` for every edge without a special case: ``binary_search_sorted_contains`` short-
     # circuits before reading, so the no-crease path costs one compare per rotation step.

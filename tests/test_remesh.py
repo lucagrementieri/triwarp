@@ -1636,7 +1636,7 @@ def test_intrinsic_delaunay_metric_matches_igl(
     where libigl drains a queue, so the *sequence* differs and so does the face ordering. What must
     agree is where they land, because the intrinsic Delaunay triangulation of a surface is unique
     away from cocircular degeneracies -- so the multiset of edge lengths is the invariant, and this
-    is class B with a sort rather than a weakened tolerance.
+    is Class B with a sort rather than a weakened tolerance.
 
     That makes it a real check rather than a formality: on ``half_torus`` triwarp performs **298**
     flips and still reaches libigl's metric to 1e-4, which a wrong flip rule or a mis-unfolded
@@ -1849,7 +1849,7 @@ def _loop_odd_correspondence(
 @pytest.mark.parity("subdivide_loop", "igl")
 def test_subdivide_loop_matches_igl(mesh_name: str, request: pytest.FixtureRequest) -> None:
     """
-    Class A on the moved originals, class B on the new vertices: the same Loop stencils as igl.
+    Class A on the moved originals, Class B on the new vertices: the same Loop stencils as igl.
 
     Every weight in Loop subdivision is a convention another library may pick differently, and this
     pins all four of them against ``igl.loop`` at ``1e-5``: the interior ``beta`` (**Warren's**
@@ -1859,7 +1859,7 @@ def test_subdivide_loop_matches_igl(mesh_name: str, request: pytest.FixtureReque
     would not see it.
 
     The originals correspond by index on both sides -- igl returns them first too -- so that half is
-    class A and directly comparable. The new vertices are ordered by each library's own edge
+    Class A and directly comparable. The new vertices are ordered by each library's own edge
     enumeration, and ``_loop_odd_correspondence`` decodes the exact pairing from the face tables
     rather than matching coordinates.
 

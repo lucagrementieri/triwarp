@@ -37,6 +37,7 @@ import warp as wp
 import triwarp as tw
 import triwarp.typing as twt
 from triwarp._device import require_nonempty_mesh
+from triwarp.kernels import edges as kernel_edges
 from triwarp.kernels import proximity as kernel_proximity
 from triwarp.kernels import triangles as kernel_triangles
 from triwarp.triangles import face_normals_and_areas
@@ -250,7 +251,7 @@ def closest_point_on_edges(
         lower = wp.empty(n_edges, dtype=wp.vec3, device=device)
         upper = wp.empty(n_edges, dtype=wp.vec3, device=device)
         wp.launch(
-            kernel_proximity.edge_bounds,
+            kernel_edges.edge_aabb_bounds,
             dim=n_edges,
             inputs=[vertices, edges, lower, upper],
             device=device,

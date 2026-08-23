@@ -540,8 +540,35 @@ def _points_to_surface(points_np: np.ndarray, mesh: tm.Trimesh) -> float:
 
 
 def _open3d_poisson(points_np: np.ndarray, normals_np: np.ndarray, depth: int) -> tm.Trimesh:
+    """
+    Open3D's screened Poisson, pinned to **one thread** -- which is what makes it affordable.
+
+    ``n_threads`` defaults to ``-1``, meaning one thread per core, and on this 642-point cloud
+    Kazhdan's solver is far below its parallel break-even: the barriers dominate and the wall clock
+    grows monotonically with the thread count from the first doubling. Measured on this box at
+    ``depth=5``, one setting per process, and the answer does not move -- **7 976 faces at every
+    setting**:
+
+    ===========  =========
+    n_threads    wall
+    ===========  =========
+    1            **0.575 s**
+    2            2.350 s
+    4            8.621 s
+    8            34.469 s
+    -1 (default) **78.395 s**
+    ===========  =========
+
+    At one thread the *CPU* time is 0.257 s, so 0.575 s is essentially the floor and no thread count
+    can beat it by much -- pinning costs nothing even on an idle box. Unpinned, this test measured
+    36.99 s inside the suite and 44.92 s in a re-run twenty minutes later; the spread is the reason
+    for the pin, not the mean. The pymeshlab twin has the same defect and a much worse constant --
+    see ``test_poisson_matches_pymeshlab_metric``.
+    """
     pcd = points_to_open3d(points_np, normals_np)
-    mesh_o3d, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth)
+    mesh_o3d, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=depth, n_threads=1
+    )
     return open3d_to_trimesh(mesh_o3d)
 
 
@@ -712,10 +739,22 @@ def test_poisson_matches_pymeshlab_metric(device: str):
         )
     )
     # depth=5, not 6, for the reason given on ``test_poisson_matches_open3d_metric``: MeshLab
-    # returns the same 7 976 faces at both depths on this cloud, in 0.24 s instead of 0.48 s.
-    # Do not go below 5 without re-measuring -- the axis is *not* monotonic in either time or
-    # resolution, and depth=4 drops to 2 024 faces.
-    meshset_pml.generate_surface_reconstruction_screened_poisson(depth=5)
+    # returns the same 7 976 faces at both depths on this cloud. Do not go below 5 without
+    # re-measuring -- the axis is *not* monotonic in either time or resolution, and depth=4 drops
+    # to 2 024 faces.
+    #
+    # ``threads=1`` is load-bearing, and it is the single largest cost in the whole test suite.
+    # ``print_filter_parameter_list`` reports ``threads : int = 48`` on this box -- the default is
+    # ``hardware_concurrency`` -- and on a 642-point cloud the solver is far below its parallel
+    # break-even, so the wall clock grows monotonically with the thread count while the answer does
+    # not move (7 976 faces at every setting): 2.250 s at 1, 2.680 s at 2, 7.444 s at 4, 122.279 s
+    # at 8, and over 115 s at the 48 default. Unpinned this test measured **261 s** inside the suite
+    # and **540 s** in a re-run twenty minutes later, against 0.019 s for the triwarp solve it is
+    # comparing -- so its cost was a function of how busy the machine was, not of anything either
+    # implementation does. One thread costs ~3.4 s of CPU, which bounds the worst case; a global
+    # ``OMP_NUM_THREADS`` cap does *not* help here, because MeshLab's filter sets its own thread
+    # count from this parameter and overrides the environment (measured: unchanged at >115 s).
+    meshset_pml.generate_surface_reconstruction_screened_poisson(depth=5, threads=1)
     mesh_current = meshset_pml.current_mesh()
     mesh_pml = tm.Trimesh(
         vertices=mesh_current.vertex_matrix(), faces=mesh_current.face_matrix(), process=False
@@ -1330,7 +1369,7 @@ def test_ball_pivoting_matches_pymeshlab(device: str):
 
     Two ball-pivoting fronts advance in different orders and produce different triangles, so there
     is no face correspondence to recover. What is comparable is sharp: BPA adds no vertices, so the
-    **vertex sets are identical** (Hausdorff **3.8e-08**, class A), and at the same radius the two
+    **vertex sets are identical** (Hausdorff **3.8e-08**, Class A), and at the same radius the two
     close the same surface -- **1 280 faces against 1 277**, 0.23% apart.
 
     **The reference's ``clustering`` parameter is load-bearing and its zero is not "off".** At

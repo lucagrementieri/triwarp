@@ -32,7 +32,7 @@ PROCRUSTES_ACC_SIZE = 26
 
 @wp.func
 def procrustes_shifts(
-    a: wp.array[wp.vec3], b: wp.array[wp.vec3], use_translation: bool
+    a: wp.array[wp.vec3], b: wp.array[wp.vec3], use_translation: wp.bool
 ) -> tuple[wp.vec3, wp.vec3]:
     # Read the shift origins straight off the device (a broadcast load, no host round trip).
     # ``use_translation=False`` must shift by nothing at all, so the arithmetic stays bit-for-bit
@@ -73,7 +73,7 @@ def accumulate_procrustes_moments(
     a: wp.array[wp.vec3],
     b: wp.array[wp.vec3],
     weights: wp.array[wp.float32],
-    use_translation: bool,
+    use_translation: wp.bool,
     out_acc: wp.array[wp.float32],
 ) -> None:
     # Every moment the fit needs, in one pass over ``a`` and ``b``. The two-pass form this replaces
@@ -152,9 +152,9 @@ def build_procrustes_matrix(
     a: wp.array[wp.vec3],
     b: wp.array[wp.vec3],
     acc: wp.array[wp.float32],
-    use_reflection: bool,
-    use_translation: bool,
-    use_scale: bool,
+    use_reflection: wp.bool,
+    use_translation: wp.bool,
+    use_scale: wp.bool,
     out_matrix: wp.array[wp.mat44],
 ) -> None:
     ws = acc[ACC_W_SUM]
@@ -318,8 +318,8 @@ def point_to_plane_tile(
     max_distance: wp.float32,
     robust_kind: wp.int32,
     robust_scale: wp.float32,
-    offset: int,
-    remaining: int,
+    offset: wp.int32,
+    remaining: wp.int32,
 ) -> tuple[wp.spatial_matrix, wp.spatial_vector, wp.float32]:
     count = wp.min(remaining, TILE_1D)
     jtj = wp.spatial_matrix(wp.float32(0.0))

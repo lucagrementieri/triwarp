@@ -33,6 +33,7 @@ import warp as wp
 
 import triwarp as tw
 import triwarp.typing as twt
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import grouping as kernel_grouping
 from triwarp.kernels import seams as kernel_seams
 
@@ -103,7 +104,8 @@ def crease_edges(
     if int(adjacency.shape[0]) > 0:
         angles = tw.adjacency.face_adjacency_angles(vertices, faces, face_adjacency=adjacency)
         mask = wp.empty(int(angles.shape[0]), dtype=wp.bool, device=device)
-        wp.map(kernel_seams.crease_edge_mask, angles, wp.float32(math.radians(angle)), out=mask)
+        # Strictly greater, so ``angle=0`` selects every non-coplanar interior edge.
+        wp.map(kernel_array.greater, angles, wp.float32(math.radians(angle)), out=mask)
         selected = tw.array.gather(adjacency_edges, tw.array.flatnonzero(mask))
 
     if not include_boundary:

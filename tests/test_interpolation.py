@@ -40,7 +40,7 @@ def test_average_onto_faces(half_torus: tuple[tm.Trimesh, wp.Mesh]):
 @pytest.mark.parity("average_onto_vertices", "pymeshlab", "igl", "pyvista")
 def test_average_onto_vertices(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     """
-    Class A against libigl, class B against MeshLab's face-to-vertex scalar transfer.
+    Class A against libigl, Class B against MeshLab's face-to-vertex scalar transfer.
 
     ``compute_scalar_transfer_face_to_vertex`` reads the *face* scalar attribute and writes the
     *vertex* one rather than taking and returning arrays, so the transform is seeding
@@ -48,7 +48,7 @@ def test_average_onto_vertices(half_torus: tuple[tm.Trimesh, wp.Mesh]):
     ``areaweight=False`` is load-bearing and is what the benchmark passes: its default weights each
     incident face by area, where this function takes the plain corner mean.
 
-    VTK's ``cell_data_to_point_data`` is class A as well (measured 8.7e-08) and needs no weighting
+    VTK's ``cell_data_to_point_data`` is Class A as well (measured 8.7e-08) and needs no weighting
     flag: it is the unweighted incident-cell mean.
     """
     mesh_tm, mesh_wp = half_torus

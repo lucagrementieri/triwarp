@@ -192,7 +192,7 @@ def test_primitives_match_open3d(device: str) -> None:
 
     Worth asserting rather than assuming: these are table-driven generators, so a wrong cap winding
     or a dropped seam ring changes the enclosed volume while leaving the face count intact, and a
-    count check alone would miss it. Class A on the counts, class B on volume and area (both are
+    count check alone would miss it. Class A on the counts, Class B on volume and area (both are
     functions of the mesh, not of its vertex ordering, which the two libraries do not share).
 
     ``uv_sphere`` is deliberately not here -- its tessellation parameter does not map
@@ -236,7 +236,7 @@ def test_primitives_match_open3d(device: str) -> None:
 @pytest.mark.parity("torus", "meshlib")
 def test_primitives_match_meshlib(device: str) -> None:
     """
-    Class A on the counts and class B on the invariants -- and the four agree **exactly**.
+    Class A on the counts and Class B on the invariants -- and the four agree **exactly**.
 
     Stronger than the plan for this pairing predicted, which was a rigid-motion comparison after
     scaling: measured on all four, the vertex and face counts, the enclosed volume, the surface
@@ -571,7 +571,7 @@ def test_box_invalid(device: str) -> None:
 @pytest.mark.parity("platonic_solids", "trimesh", "igl")
 def test_icosahedron(device: str) -> None:
     """
-    Class A against trimesh; class B against igl, whose icosahedron sits in a **rotated frame**.
+    Class A against trimesh; Class B against igl, whose icosahedron sits in a **rotated frame**.
 
     ``igl.icosahedron`` is libigl's only Platonic generator, and it is the same solid in a different
     orientation: triwarp and trimesh use the ``(0, ±1, ±φ)`` form (every coordinate ±0.851 or 0)
@@ -1328,7 +1328,7 @@ def test_axis_transform(device: str) -> None:
 @pytest.mark.parity("super_toroid", "pyvista")
 def test_parametric_surface_matches_pyvista(device: str, surface: str) -> None:
     """
-    Class A on the topology, class B on the geometry, against ``pv.Parametric*(clean=True)``.
+    Class A on the topology, Class B on the geometry, against ``pv.Parametric*(clean=True)``.
 
     The counts and the Euler characteristic are integers and compare directly. The vertex *order*
     differs — VTK welds its raw lattice by distance and drops whichever duplicate it meets second —

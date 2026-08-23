@@ -203,15 +203,6 @@ def scale_rows(
         values[k] = values[k] * scale
 
 
-@wp.kernel
-def expand_row_indices(offsets: wp.array[wp.int32], out_rows: wp.array[wp.int32]) -> None:
-    # CSR row offsets back to one row index per entry, so a matrix can be rebuilt through
-    # ``bsr_from_triplets`` -- which is how the pattern gets pruned; see ``_multigrid_prune``.
-    i = wp.int32(wp.tid())
-    for k in range(offsets[i], offsets[i + 1]):
-        out_rows[k] = i
-
-
 @wp.func
 def csr_row_dot(
     row: wp.int32,

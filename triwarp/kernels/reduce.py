@@ -579,7 +579,7 @@ weighted_sum_vec3_1d_tiled = _weighted_sum_1d_tiled("weighted_sum_vec3_1d_tiled"
 
 @wp.func
 def outer_sum_chunk(
-    points: wp.array[wp.vec3], center: wp.vec3, offset: int, remaining: int
+    points: wp.array[wp.vec3], center: wp.vec3, offset: wp.int32, remaining: wp.int32
 ) -> wp.mat33:
     # ``_chunk``, not ``_tile``: unlike the sum reductions above this walks the chunk with a plain
     # loop and uses no tile primitive, so every lane of the block recomputes the same matrix and

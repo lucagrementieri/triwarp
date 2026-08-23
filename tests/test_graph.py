@@ -49,22 +49,31 @@ def test_connected_component_labels_random(device: str) -> None:
 
     triwarp names a component after a representative node and scipy numbers them in traversal
     order, so only the partition is shared -- comparing labels directly would fail on a correct
-    answer. 200 random edges over 64 nodes gives several components rather than one, which
-    [`test_connected_component_labels_path_graph`] deliberately does not.
+    answer. But that transform is only *exercised* if the graph genuinely fragments: with one
+    component the two numbering conventions coincide and ``same_partition`` compares one constant
+    labelling with another, which any implementation returning a single label would pass.
+
+    **24 edges, not 200.** Measured on this seed, 200 random edges over 64 nodes gives **1**
+    component holding all 64 nodes -- the count is well past the giant-component threshold -- where
+    24 gives **40** components, **12** of them non-trivial, the largest holding 6 nodes. The assert
+    below therefore checks the fragmentation before comparing to it, which is the guard the vacuous
+    version lacked.
     """
     rng = np.random.default_rng(7)
     node_count = 64
-    n_edges = 200
+    n_edges = 24
     edges_np = rng.integers(0, node_count, size=(n_edges, 2), dtype=np.int32)
 
     edges_wp = wp.array(edges_np, dtype=wp.int32, device=device)
     labels_wp = tw.graph.connected_component_labels_from_edges(edges_wp, node_count=node_count)
     labels_np = _scipy_component_labels(edges_np, node_count)
 
+    # Non-vacuous: with one component the label-packing transform under test is the identity.
+    assert np.unique(labels_np).shape[0] > 1
     assert same_partition(labels_wp.numpy(), labels_np)
 
 
-@pytest.mark.parametrize(("node_count", "n_edges"), [(64, 200), (2048, 2047)])
+@pytest.mark.parametrize(("node_count", "n_edges"), [(64, 24), (2048, 2047)])
 @pytest.mark.parity("connected_component_labels", "igl")
 @pytest.mark.parity("connected_component_labels_depth", "igl")
 def test_connected_component_labels_matches_igl(device: str, node_count: int, n_edges: int) -> None:
@@ -79,10 +88,13 @@ def test_connected_component_labels_matches_igl(device: str, node_count: int, n_
     [`same_partition`][tests.comparisons.same_partition] is the transform exactly as it is for the
     scipy comparison above.
 
-    Two shapes, and the second is the point: 200 random edges over 64 nodes gives a handful of
-    shallow components, while the 2 048-node path is diameter-equal-to-node-count and is what the
-    ``*_depth`` group exists to gate -- an implementation that stopped propagating early would pass
-    the first and fail the second.
+    Two shapes, and each carries a different half of the claim. The 64-node random graph is what
+    exercises the *label packing*, so its edge count is chosen to fragment it -- 24 edges give 40
+    components where the 200 this used to pass gave **1**, and with one component the two numbering
+    conventions coincide and the transform under test is the identity (the same defect the scipy
+    comparison above records). The 2 048-node **path** is deliberately a single component: its
+    diameter equals its node count, which is what the ``*_depth`` group exists to gate, and an
+    implementation that stopped propagating early would pass the first shape and fail this one.
     """
     if n_edges == node_count - 1:  # the path graph
         edges_np = np.stack(
@@ -105,6 +117,8 @@ def test_connected_component_labels_matches_igl(device: str, node_count: int, n_
 
     assert int(n_components_igl) == np.unique(labels_wp.numpy()).shape[0]
     assert int(np.asarray(sizes_igl).sum()) == node_count  # every node landed in a component
+    # Non-vacuous on the random shape: the path is one component by design, see the docstring.
+    assert int(n_components_igl) > 1 or n_edges == node_count - 1
     assert same_partition(labels_wp.numpy(), np.asarray(labels_igl).ravel())
 
 

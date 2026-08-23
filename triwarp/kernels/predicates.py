@@ -94,6 +94,21 @@ def squared_edge_lengths(a: Any, b: Any, c: Any) -> tuple[wp.Float, wp.Float, wp
 
 
 @wp.func
+def side_lengths(a: Any, b: Any, c: Any) -> tuple[wp.Float, wp.Float, wp.Float]:
+    # Side lengths of triangle ABC, same opposite-corner convention as ``squared_edge_lengths``.
+    #
+    # Three ``wp.length`` calls rather than three square roots of that one: ``length`` is a single
+    # ``sqrt`` of the same sum, so the composed spelling would add nothing but a name. The two
+    # exist as a pair because the callers genuinely split -- an intrinsic law-of-cosines form wants
+    # the squares, a radius ratio or an aspect ratio wants the lengths -- and the reason for
+    # naming this one at all is that four modules had written it out (``triangle_aspect_ratio``
+    # here, ``triangles.triangle_radius_ratio``, ``holes.min_triangle_angle_sin``, and
+    # ``edges.face_edge_lengths``' three stores), which is one square root away from the
+    # duplication that put ``squared_edge_lengths`` in this file.
+    return wp.length(b - c), wp.length(c - a), wp.length(a - b)
+
+
+@wp.func
 def law_of_cosines_angle(
     adjacent_a: wp.Float, adjacent_b: wp.Float, opposite: wp.Float
 ) -> wp.Float:
@@ -142,6 +157,13 @@ def triangle_aabb(a: Any, b: Any, c: Any):
 
 
 @wp.func
+def segment_aabb(a: Any, b: Any):
+    # Lower and upper corners of segment AB's axis-aligned bounding box -- the input a *segment*
+    # BVH is built from, as ``triangle_aabb`` is for a face BVH. Element-wise for the same reason.
+    return wp.min(a, b), wp.max(a, b)
+
+
+@wp.func
 def vector_angle(a: Any, b: Any) -> wp.Float:
     # Unsigned angle in [0, pi] between two vectors, as ``atan2(|a x b|, a . b)`` rather than
     # ``acos(a . b)``.
@@ -175,9 +197,7 @@ def dihedral_angle(left_normal: Any, right_normal: Any, edge_vector: Any) -> wp.
 def circumcircle_diameter_sq(a: Any, b: Any, c: Any) -> wp.Float:
     # Squared diameter of triangle ABC's circumcircle.
     # A zero-length side collapses to the opposite side; zero area means no circumcircle at all.
-    ab = wp.length_sq(b - a)
-    ca = wp.length_sq(a - c)
-    bc = wp.length_sq(c - b)
+    bc, ca, ab = squared_edge_lengths(a, b, c)
     zero = type(ab)(0.0)
     if ab <= zero:
         return ca
@@ -213,9 +233,7 @@ def delone_metrics(a: Any, b: Any, c: Any, d: Any):
 def mincircle_diameter_sq(a: Any, b: Any, c: Any) -> wp.Float:
     # Squared diameter of the smallest circle enclosing triangle ABC: for an obtuse triangle that
     # is the circle on the longest side, otherwise it is the circumcircle.
-    ab = wp.length_sq(b - a)
-    ca = wp.length_sq(a - c)
-    bc = wp.length_sq(c - b)
+    bc, ca, ab = squared_edge_lengths(a, b, c)
     if ca >= bc + ab:
         return ca
     if bc >= ab + ca:
@@ -232,9 +250,7 @@ def mincircle_diameter_sq(a: Any, b: Any, c: Any) -> wp.Float:
 def triangle_aspect_ratio(a: Any, b: Any, c: Any) -> wp.Float:
     # Circum-radius over twice the in-radius. Grows without bound for slivers, so a degenerate
     # triangle returns +inf.
-    bc = wp.length(c - b)
-    ca = wp.length(a - c)
-    ab = wp.length(b - a)
+    bc, ca, ab = side_lengths(a, b, c)
     half_perimeter = (bc + ca + ab) / type(bc)(2.0)
     denominator = (
         type(bc)(8.0) * (half_perimeter - bc) * (half_perimeter - ca) * (half_perimeter - ab)
@@ -324,6 +340,36 @@ def angle_defect(angle_sum: wp.Float) -> wp.Float:
 
 
 @wp.func
+def barycentric_gram(a: Any, b: Any, c: Any, p: Any):
+    """
+    Cramer's rule on the Gram system of triangle ABC's two edge vectors, undivided.
+
+    Returns ``(numerator_1, numerator_2, determinant)``: the barycentric coordinates of ``p`` are
+    ``(det - n1 - n2, n1, n2) / det``, and when ``p`` is out of plane they are those of its
+    orthogonal projection into the triangle's plane. **Dimension-generic** -- ``wp.length_sq`` and
+    ``wp.dot`` say nothing about the ambient dimension, so this serves ``wp.vec2`` and ``wp.vec3``
+    from one body, which is why it exists: it was written twice, once per dimension, and verified
+    equal on the unit triangle at both.
+
+    Undivided, and therefore guard-free, because **the two callers want different degenerate
+    policies and both are right**. A 2-D containment test wants a definite answer for a degenerate
+    triangle so that ``min(b) >= -eps`` rejects it without a separate area check; a 3-D projection
+    wants the division by zero, since an infinite coordinate is the caller's cue and the kernel form
+    has always behaved that way. Neither can be the shared default, so the shared function returns
+    the numbers and each caller decides -- the ``corner_cosines_from_l2`` convention.
+    """
+    e0 = b - a
+    e1 = c - a
+    w = p - a
+    d00 = wp.length_sq(e0)
+    d01 = wp.dot(e0, e1)
+    d11 = wp.length_sq(e1)
+    d20 = wp.dot(w, e0)
+    d21 = wp.dot(w, e1)
+    return d11 * d20 - d01 * d21, d00 * d21 - d01 * d20, d00 * d11 - d01 * d01
+
+
+@wp.func
 def barycentric_2d(q0: wp.vec2, q1: wp.vec2, q2: wp.vec2, p: wp.vec2) -> wp.vec3:
     """
     Barycentric coordinates ``(b0, b1, b2)`` of ``p`` in the 2D triangle ``(q0, q1, q2)``.
@@ -331,20 +377,12 @@ def barycentric_2d(q0: wp.vec2, q1: wp.vec2, q2: wp.vec2, p: wp.vec2) -> wp.vec3
     Returns a vector with a negative component for degenerate triangles, so a caller testing
     ``min(b) >= -eps`` for containment rejects them without a separate area check.
     """
-    v0 = q1 - q0
-    v1 = q2 - q0
-    v2 = p - q0
-    d00 = wp.length_sq(v0)
-    d01 = wp.dot(v0, v1)
-    d11 = wp.length_sq(v1)
-    d20 = wp.dot(v2, v0)
-    d21 = wp.dot(v2, v1)
-    denom = d00 * d11 - d01 * d01
+    n1, n2, denom = barycentric_gram(q0, q1, q2, p)
     if wp.abs(denom) < wp.float32(1e-20):
         return wp.vec3(-1.0, -1.0, -1.0)
     inverse_denominator = 1.0 / denom
-    b1 = (d11 * d20 - d01 * d21) * inverse_denominator
-    b2 = (d00 * d21 - d01 * d20) * inverse_denominator
+    b1 = n1 * inverse_denominator
+    b2 = n2 * inverse_denominator
     b0 = 1.0 - b1 - b2
     return wp.vec3(b0, b1, b2)
 

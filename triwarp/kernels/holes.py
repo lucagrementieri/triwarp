@@ -4,14 +4,16 @@ import warp as wp
 
 from triwarp.constants import FLOAT32_INF_CONSTANT, INT32_MAX_CONSTANT
 from triwarp.kernels import array as kernel_array
-from triwarp.kernels.array import pack_nearest_key, update_argmin
+from triwarp.kernels.array import loop_next_slot, pack_nearest_key, update_argmin
 from triwarp.kernels.array import wrap_index as _wrap
 from triwarp.kernels.predicates import (
     circumcircle_diameter,
     dihedral_angle,
+    side_lengths,
     triangle_aspect_ratio,
     triangle_double_area,
 )
+from triwarp.kernels.triangles import corner_triple
 
 # Big-but-finite penalty for a triangulation the metric rejects: lets the DP keep a bad
 # triangulation rather than break entirely, while staying below ``float`` precision limits
@@ -37,28 +39,23 @@ COMBINE_MAX = wp.constant(wp.int32(1))
 MAX_MIN_ANGLE_SIN = wp.constant(wp.float32(0.86602540378443864676))
 
 
-@wp.func
-def loop_size(
-    loop_starts: wp.array[wp.int32], total: wp.int32, n_loops: wp.int32, i: wp.int32
-) -> wp.int32:
-    # ``loop_starts`` is the exclusive scan of the loop sizes; the last loop ends at ``total``.
-    end = total
-    if i + 1 < n_loops:
-        end = loop_starts[i + 1]
-    return end - loop_starts[i]
+# One convention for a loop's extent, and this is it: ``loop_starts[ell]`` and
+# ``loop_sizes[ell]``, both uploaded once by ``holes._PackedLoops``. The kernels below used to
+# split -- three of them re-derived the size from ``loop_starts``, a ``total`` and an ``n_loops``
+# through a ``loop_size`` helper, while the rest read the size array directly -- which meant one
+# file answered the same question two ways and a new kernel could pick a third.
 
 
 @wp.kernel
 def fan_faces(
     flat_loops: wp.array[wp.int32],
     loop_starts: wp.array[wp.int32],
-    total: wp.int32,
-    n_loops: wp.int32,
+    loop_sizes: wp.array[wp.int32],
     out_faces: wp.array[wp.int32],
 ) -> None:
     ell = wp.int32(wp.tid())
     o = loop_starts[ell]
-    s = loop_size(loop_starts, total, n_loops, ell)
+    s = loop_sizes[ell]
     # This loop contributes s - 2 fan triangles; earlier loops occupy o - 2 * ell of them.
     base = o - 2 * ell
     for k in range(1, s - 1):
@@ -72,14 +69,13 @@ def fan_faces(
 def cone_faces(
     flat_loops: wp.array[wp.int32],
     loop_starts: wp.array[wp.int32],
-    total: wp.int32,
-    n_loops: wp.int32,
+    loop_sizes: wp.array[wp.int32],
     n_vertices: wp.int32,
     out_faces: wp.array[wp.int32],
 ) -> None:
     ell = wp.int32(wp.tid())
     o = loop_starts[ell]
-    s = loop_size(loop_starts, total, n_loops, ell)
+    s = loop_sizes[ell]
     apex = n_vertices + ell
     # This loop contributes s cone triangles; the cone base equals o (scan of the loop sizes).
     for j in range(s):
@@ -95,13 +91,12 @@ def loop_centroids(
     vertices: wp.array[wp.vec3],
     flat_loops: wp.array[wp.int32],
     loop_starts: wp.array[wp.int32],
-    total: wp.int32,
-    n_loops: wp.int32,
+    loop_sizes: wp.array[wp.int32],
     out_centroids: wp.array[wp.vec3],
 ) -> None:
     ell = wp.int32(wp.tid())
     o = loop_starts[ell]
-    s = loop_size(loop_starts, total, n_loops, ell)
+    s = loop_sizes[ell]
     acc = wp.vec3(0.0, 0.0, 0.0)
     for j in range(s):
         acc = acc + vertices[flat_loops[o + j]]
@@ -111,9 +106,7 @@ def loop_centroids(
 @wp.func
 def min_triangle_angle_sin(a: wp.vec3, b: wp.vec3, c: wp.vec3) -> wp.float32:
     # sin of the smallest angle = shortest edge / circumcircle diameter.
-    ab = wp.length(b - a)
-    ca = wp.length(a - c)
-    bc = wp.length(c - b)
+    bc, ca, ab = side_lengths(a, b, c)
     if ab <= 0.0 or ca <= 0.0 or bc <= 0.0:
         return 0.0
     f = triangle_double_area(a, b, c)
@@ -230,10 +223,8 @@ def loop_rim_metrics(
     # ``tw.polyline.polyline_normal``, each of which costs a host synchronization per loop.
     t = wp.int32(wp.tid())
     ell = loop_id[t]
-    o = loop_starts[ell]
-    b = loop_sizes[ell]
     a = vertices[flat_loops[t]]
-    c = vertices[flat_loops[o + _wrap(t - o + 1, b)]]
+    c = vertices[flat_loops[loop_next_slot(loop_id, loop_starts, loop_sizes, t)]]
     wp.atomic_max(out_max_edge_sq, ell, wp.length_sq(c - a))
     wp.atomic_add(out_normal, ell, wp.cross(a, c))
 
@@ -537,10 +528,8 @@ def rim_opposite_from_table(
     # a single hit means exactly one adjacent existing face, whose third vertex blends the fill
     # dihedral metrics into the surface (host dict semantics of the former _rim_opposite).
     t = wp.int32(wp.tid())
-    ell = loop_id[t]
-    o = loop_starts[ell]
     u = flat_loops[t]
-    v = flat_loops[o + _wrap(t - o + 1, loop_sizes[ell])]
+    v = flat_loops[loop_next_slot(loop_id, loop_starts, loop_sizes, t)]
     lo_v = wp.min(u, v)
     hi_v = wp.max(u, v)
     key = wp.uint64(wp.uint32(lo_v)) + wp.uint64(wp.uint32(hi_v)) * max_index
@@ -657,6 +646,17 @@ def global_argmin(
     out_shift: wp.array[wp.int32],
 ) -> None:
     # Single-thread reduction: out_shift = (shift_a, shift_b).
+    #
+    # One lane walking ``n_a`` elements looks like the antipattern it usually is, and folding it
+    # into ``row_argmin`` -- which would reduce each row's winner into a packed
+    # ``pack_nearest_key`` atomic and drop this launch entirely -- was measured and **declined**.
+    # On an RTX 5090, two facing fan disks, min of 7, this kernel costs 0.023 / 0.042 / 0.108 ms
+    # at rims of 100 / 1 000 / 4 000 against 1.54 / 7.24 / 26.6 ms for the whole ``stitch_loops``
+    # call: **1.51 % / 0.58 % / 0.41 %**. It is launch-dominated rather than loop-dominated (a
+    # bare launch is ~32 us, CLAUDE.md section 13), so the serial walk is not what is being paid
+    # for, and the share *falls* with rim size -- the saving would be largest exactly where the
+    # call is already cheap. The whole alignment path -- this plus ``row_argmin`` plus
+    # ``boundary_perimeters`` -- is 4.5 % at 100 and 2.3 % at 4 000.
     best_row = wp.int32(0)
     best_val = val_min[0]
     for i in range(1, n_a):
@@ -998,10 +998,7 @@ def bridge_loop_to_ring(
     # rim runs with the surface on its left, so the quad ``(a, b, b', a')`` is wound the other way
     # round to keep the extension's outward side the same as the mesh's.
     t = wp.int32(wp.tid())
-    ell = loop_id[t]
-    begin = loop_starts[ell]
-    size = loop_sizes[ell]
-    next_slot = begin + _wrap(t - begin + 1, size)
+    next_slot = loop_next_slot(loop_id, loop_starts, loop_sizes, t)
     a = loop_vertices[t]
     b = loop_vertices[next_slot]
     projected_a = ring_base + t
@@ -1024,10 +1021,17 @@ def directed_edge_opposites(
     # ``u -> v``. A boundary edge occurs in exactly one face, so at most one thread writes each
     # slot and the scatter needs no atomic; ``out_opposites`` arrives filled with -1, which is what
     # survives when the edge is not a directed edge of the mesh at all.
+    #
+    # The corners go into a ``wp.vec3i`` rather than staying the tuple ``corner_triple`` returns,
+    # because ``k`` is a *runtime* index and a tuple cannot be subscripted by one in kernel scope.
+    # A vector can (verified on Warp 1.16), which is what keeps this off the flat-slice spelling
+    # ``faces[f * 3 : (f + 1) * 3]`` that the rest of the tree no longer uses: the rule is not "no
+    # slices", it is "no slice where an index form exists", and here one does.
     f, q = wp.tid()
     u = edges[q, 0]
     v = edges[q, 1]
-    corner = faces[f * 3 : (f + 1) * 3]
+    c0, c1, c2 = corner_triple(faces, f)
+    corner = wp.vec3i(c0, c1, c2)
     for k in range(3):
         if corner[k] == u and corner[_wrap(k + 1, 3)] == v:
             out_opposites[q] = corner[_wrap(k + 2, 3)]

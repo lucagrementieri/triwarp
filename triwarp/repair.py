@@ -60,7 +60,6 @@ from triwarp.kernels import array as kernel_array
 from triwarp.kernels import bounds as kernel_bounds
 from triwarp.kernels import repair as kernel_repair
 from triwarp.kernels import scatter as kernel_scatter
-from triwarp.kernels import selection as kernel_selection
 
 # Lattice resolution for ``fix_self_intersections(method="voxel")``, in samples across the mesh's
 # bounding-box diagonal. 128 is the same order as ``offset.offset_mesh``'s automatic floor and costs
@@ -697,18 +696,24 @@ def remove_small_components(
             inputs=[areas, labels, statistic],
             device=device,
         )
-        _mark_components_above(labels, statistic, wp.float32(min_area), keep)
+        # Gather-then-compare at Python scope rather than a kernel: ``statistic[labels]`` is a
+        # per-component table read through the per-face label, and ``wp.map`` over that
+        # ``indexedarray`` is exactly the form section 4 of CLAUDE.md prescribes (and that
+        # ``make_volume`` below already uses). ``labels`` is a dense array, so the strided-index
+        # hazard -- which applies to a *column* of a rank-2 buffer -- does not arise. The bound
+        # is inclusive at every criterion: measured, a component of exactly ``min_faces`` faces
+        # or exactly ``min_diameter`` across survives, matching both references.
+        wp.map(kernel_array.greater_equal, statistic[labels], wp.float32(min_area), out=keep)
     elif min_diameter is not None:
-        _mark_components_above(
-            labels, _component_diagonals(vertices, faces, labels), wp.float32(min_diameter), keep
-        )
+        diagonals = _component_diagonals(vertices, faces, labels)
+        wp.map(kernel_array.greater_equal, diagonals[labels], wp.float32(min_diameter), out=keep)
     else:
         counts = wp.zeros(n_faces, dtype=wp.int32, device=device)
         wp.launch(
             kernel_scatter.count_occurrences, dim=n_faces, inputs=[labels, counts], device=device
         )
         if min_faces is not None:
-            _mark_components_above(labels, counts, wp.int32(min_faces), keep)
+            wp.map(kernel_array.greater_equal, counts[labels], wp.int32(min_faces), out=keep)
         else:
             # ``-1`` is below every packed key, so the reduction needs no separate seeding pass and
             # the winning label never reaches the host -- the mask kernel recomputes its key.
@@ -727,21 +732,6 @@ def remove_small_components(
             )
 
     return tw.selection.submesh_from_face_mask(vertices, faces, keep)
-
-
-def _mark_components_above(
-    labels: wp.array[wp.int32],
-    statistic: twt.ScalarArray,
-    threshold: object,
-    out_keep: wp.array[wp.bool],
-) -> None:
-    """Flag every face whose component statistic reaches ``threshold`` (inclusive)."""
-    wp.launch(
-        kernel_repair.mark_group_statistic_mask,
-        dim=int(labels.shape[0]),
-        inputs=[labels, statistic, threshold, out_keep],
-        device=labels.device,
-    )
 
 
 def _component_diagonals(
@@ -1237,7 +1227,7 @@ def eliminate_degree3_vertices(
             device=device,
         )
         keep = wp.empty(n_faces, dtype=wp.bool, device=device)
-        wp.map(kernel_selection.logical_not, dropped, out=keep)
+        wp.map(kernel_array.mask_not, dropped, out=keep)
         kept = tw.array.gather(faces.reshape((n_faces, 3)), tw.array.flatnonzero(keep))
         faces = tw.array.concatenate([kept.reshape(-1), new_faces.reshape(3 * n_selected)])
         removed += n_selected
@@ -1689,9 +1679,17 @@ def fix_self_intersections(
     current_vertices, current_faces = wp.clone(vertices), wp.clone(faces)
     for _ in range(max_iter):
         bad_mask = tw.validation.face_self_intersecting_mask(current_vertices, current_faces)
-        if not bool(bad_mask.numpy().any()):  # one readback per pass, and it decides the loop
+        # Two readbacks per pass, and each decides the loop. Deliberately *not* ``tw.reduce.any`` /
+        # ``tw.reduce.all``: a device reduction costs ~0.1-0.3 ms flat on CUDA, and copying a
+        # ``bool`` array only overtakes it at ~1M elements (CLAUDE.md section 13). These are
+        # ``n_faces`` long -- 320 on ``icosphere``, 16 k on ``bunny_decimated``, 69 k on ``bunny``,
+        # 871 k on ``dragon`` -- so every fixture in the suite, ``dragon`` included, sits under the
+        # crossover and the copy is the cheaper call. Revisit above ~1M faces, not before.
+        if not bool(bad_mask.numpy().any()):
             break
-        region = _dilate_face_mask(current_faces, bad_mask, max_expand)
+        region = _dilate_face_mask(
+            current_faces, bad_mask, max_expand, int(current_vertices.shape[0])
+        )
         if bool(region.numpy().all()):
             break  # the region swallowed the mesh: refilling it would delete everything
         current_vertices, current_faces = tw.holes.refill_region(
@@ -1703,7 +1701,7 @@ def fix_self_intersections(
 
 
 def _dilate_face_mask(
-    faces: wp.array[wp.int32], face_mask: wp.array[wp.bool], hops: int
+    faces: wp.array[wp.int32], face_mask: wp.array[wp.bool], hops: int, n_vertices: int
 ) -> wp.array[wp.bool]:
     """
     Grow a face selection by ``hops`` rings, through the vertices it touches.
@@ -1722,6 +1720,11 @@ def _dilate_face_mask(
     hops
         Rings to add. Zero returns the selection's own faces, which is *not* the input mask: it is
         every face sharing a vertex with it, since a cut has to leave a rim rather than a slit.
+    n_vertices
+        Length of the vertex buffer ``faces`` indexes, supplied by the caller. Not inferred from
+        ``faces.max()``: that is a whole-buffer readback -- 833 KB per call on ``bunny``, and
+        ``fix_self_intersections`` calls this once per pass -- to recover a number the caller is
+        already holding, which is what ``face_adjacency(n_vertices=...)`` exists to avoid.
 
     Returns
     -------
@@ -1730,7 +1733,6 @@ def _dilate_face_mask(
     """
     device = faces.device
     n_faces = int(faces.shape[0]) // 3
-    n_vertices = int(faces.numpy().max()) + 1 if n_faces > 0 else 0
 
     selected_corners = tw.array.gather(
         faces.reshape((-1, 3)), tw.array.flatnonzero(face_mask)

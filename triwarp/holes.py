@@ -185,7 +185,7 @@ def fill_fan(
     wp.launch(
         kernel_holes.fan_faces,
         dim=n_loops,
-        inputs=[flat_loops, loop_starts, wp.int32(total), wp.int32(n_loops), fill_faces],
+        inputs=[flat_loops, loop_starts, packed.sizes, fill_faces],
         device=device,
     )
     return tw.array.concatenate([faces, fill_faces])
@@ -248,7 +248,7 @@ def fill_cone(
     wp.launch(
         kernel_holes.loop_centroids,
         dim=n_loops,
-        inputs=[vertices, flat_loops, loop_starts, wp.int32(total), wp.int32(n_loops), centroids],
+        inputs=[vertices, flat_loops, loop_starts, packed.sizes, centroids],
         device=device,
     )
 
@@ -256,14 +256,7 @@ def fill_cone(
     wp.launch(
         kernel_holes.cone_faces,
         dim=n_loops,
-        inputs=[
-            flat_loops,
-            loop_starts,
-            wp.int32(total),
-            wp.int32(n_loops),
-            wp.int32(n_vertices),
-            fill_faces,
-        ],
+        inputs=[flat_loops, loop_starts, packed.sizes, wp.int32(n_vertices), fill_faces],
         device=device,
     )
     return (tw.array.concatenate([vertices, centroids]), tw.array.concatenate([faces, fill_faces]))
@@ -2722,6 +2715,16 @@ def _closest_loop_pair(a_pos: wp.array[wp.vec3], b_pos: wp.array[wp.vec3]) -> tu
     ``row_argmin`` / ``global_argmin`` reduction the greedy zippering uses); only the two winning
     indices come back to the host. Ties resolve to the smallest ``i`` then smallest ``j``, matching
     ``numpy.argmin`` on the flattened matrix.
+
+    ``kernels/holes.reduce_closest_cross_label_pair`` answers the same question in **one** kernel
+    with no matrix at all, by reducing a ``pack_nearest_key`` atomic over labelled members, and
+    routing this through it was measured and **declined**. Its caller's own preamble comment carries
+    the number: the whole preamble -- two readbacks, this search, the host roll and two uploads --
+    is 5.0 % of ``stitch_loops_min_weight`` at a 100-vertex rim and 0.7 % at 1 000, of which this is
+    a fraction. The two are also not one function wearing two hats: that kernel takes members and
+    labels over a shared vertex buffer, this takes two separate position arrays, and the three
+    launches here reuse ``row_argmin`` / ``global_argmin``, which the caller needs anyway for its
+    *perimeter* objective. See ``global_argmin`` for the same decline measured from the other side.
     """
     device = a_pos.device
     n_a = int(a_pos.shape[0])
@@ -2837,6 +2840,11 @@ def _hole_loops(
     Returns ``None`` when there is no fillable boundary loop. Costs **one** host readback (the loop
     offsets, which the ragged indexing needs anyway), plus a second one only under
     ``preserve_largest_hole``.
+
+    That second readback stays on the host on purpose, and not because the argmax could not run on
+    the device: what the host needs is the resulting *mask*, to build the ragged gather index that
+    compacts the surviving loops. Reducing on the device would still have to bring the winner back,
+    so it would add a launch and remove nothing.
 
     When ``preserve_largest_hole`` is ``True`` the single largest loop — the one with the greatest
     perimeter arc length; the first one on a tie — is excluded, leaving it open. This is the

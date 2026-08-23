@@ -1,15 +1,15 @@
 import warp as wp
-from warp.fem.linalg import householder_qr_decomposition, solve_triangular
 
 from triwarp.kernels.array import to_vec3d
-from triwarp.kernels.linalg import free_row
+from triwarp.kernels.linalg import free_row, solve_normal_equations
 from triwarp.kernels.points import plane_basis
 from triwarp.kernels.predicates import closest_point_on_segment
 from triwarp.kernels.triangles import corner_triple
 
 # Fixed-size float64 types for the 6-coefficient quadric fit in ``relax_approx``. The rest of the
-# kernel runs in float32; the least-squares solve is float64 for conditioning, as in
-# ``kernels/curvature.py``'s 5x5 sibling.
+# kernel runs in float32; the least-squares solve is float64 for conditioning, and it runs through
+# ``linalg.solve_normal_equations``, which is rank-generic -- ``kernels/curvature.py``'s 5x5 quadric
+# fit is the same call at a different width.
 # DBL_EPSILON, the relative accuracy of a float64. The area-equalizing solve compares its system's
 # determinant against this times the trace's power, which is the scale-free way to ask whether the
 # 1-ring is degenerate enough that the solution cannot be trusted.
@@ -17,22 +17,6 @@ DOUBLE_EPSILON = wp.constant(wp.float64(2.220446049250313e-16))
 
 vec6d = wp.types.vector(length=6, dtype=wp.float64)
 mat66d = wp.types.matrix(shape=(6, 6), dtype=wp.float64)
-
-
-@wp.func
-def solve_normal_equations_6(matrix: mat66d, rhs: vec6d) -> tuple[vec6d, wp.bool]:
-    """
-    Solve the 6x6 normal equations by Householder QR, reporting failure rather than raising.
-
-    ``|R[k, k]|`` is the norm of column k after the preceding reflections, so testing it is the QR
-    analogue of a partial-pivot magnitude test and the ``1e-14`` threshold carries the same meaning
-    it has in the 5x5 quadric solve.
-    """
-    q, r = householder_qr_decomposition(matrix)
-    for k in range(6):
-        if wp.abs(r[k, k]) < wp.float64(1e-14):
-            return rhs, False
-    return solve_triangular(r, wp.transpose(q) * rhs), True
 
 
 # ---------------------------------------------------------------------------
@@ -467,19 +451,6 @@ def step_along_normal(position: wp.vec3, normal: wp.vec3, distance: wp.float32) 
 
 
 @wp.func
-def is_spike_defect(defect: wp.float32, min_defect: wp.float32) -> wp.bool:
-    """
-    Test a spike through its angle *defect*, which is the quantity that already exists.
-
-    The condition is ``angle_sum < min_angle_sum``, and the defect is ``2 * pi - angle_sum``, so it
-    becomes ``defect > 2 * pi - min_angle_sum``. Phrased on the defect rather than the sum because
-    ``vertices.vertex_defects`` computes it, and re-deriving the sum would mean scattering the same
-    corner angles a second time.
-    """
-    return defect > min_defect
-
-
-@wp.func
 def select_position(smoothed: wp.vec3, original: wp.vec3, replace: wp.bool) -> wp.vec3:
     """Take the smoothed position only where the mask says to, leaving the rest untouched."""
     if replace:
@@ -735,7 +706,7 @@ def relax_approx_step(
             row = vec6d(u * u, u * v, v * v, u, v, wp.float64(1.0))
             normal_matrix += wp.outer(row, row)
             normal_rhs += row * wp.float64(wp.dot(local, axis_w))
-        coefficients, ok = solve_normal_equations_6(normal_matrix, normal_rhs)
+        coefficients, ok = solve_normal_equations(normal_matrix, normal_rhs)
         if ok:
             u = wp.float64(wp.dot(offset, axis_u))
             v = wp.float64(wp.dot(offset, axis_v))

@@ -737,17 +737,6 @@ def shorten_loop_write(
 
 
 @wp.kernel
-def loop_position_labels(
-    loop_offsets: wp.array[wp.int32], out_position_loop: wp.array[wp.int32]
-) -> None:
-    # One thread per loop, writing its own label across its span -- the loops are few and short, so
-    # this beats a binary search per position and needs no readback of the offsets.
-    loop = wp.int32(wp.tid())
-    for t in range(loop_offsets[loop], loop_offsets[loop + 1]):
-        out_position_loop[t] = loop
-
-
-@wp.kernel
 def distinct_from_predecessor(
     loop_vertices: wp.array[wp.int32],
     position_loop: wp.array[wp.int32],

@@ -1158,8 +1158,8 @@ def _split_with_vertex_field(
 
     # One new vertex per crossed *edge*: both faces sharing it address the same index, which is
     # what makes the cut watertight rather than a seam of coincident pairs. Sign agreement with the
-    # classifier is a correctness requirement, so the mask is built at ``TOLERANCE_MERGE``, the
-    # dead zone ``tolerance_sign`` uses.
+    # classifier is a correctness requirement, so the mask is built at ``TOLERANCE_MERGE`` -- the
+    # dead zone ``classify_faces_for_split`` passes ``sign_with_tolerance`` a few lines above.
     unique_edges, halfedge_edges = tw.edges.edges_unique(faces)
     crossed = wp.empty(int(unique_edges.shape[0]), dtype=wp.bool, device=device)
     wp.launch(

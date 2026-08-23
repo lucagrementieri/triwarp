@@ -658,6 +658,25 @@ def test_fillable_loop_mask_on_the_fixtures(request: pytest.FixtureRequest, mesh
 def test_fill_min_weight_matches_meshlib(
     request: pytest.FixtureRequest, mesh_name: str, metric: str
 ) -> None:
+    """
+    Class C: the triangle count and the *achieved optimum*, there being no canonical triangulation.
+
+    The interval DP has one minimum-weight cost and, in general, several triangulations that reach
+    it -- a rim with cocircular vertices ties, and the two libraries break ties differently -- so
+    the face buffers need not agree even when both solutions are optimal. What must agree is the
+    triangle count and the total metric each answer achieves, scored here by the *same* function
+    for both.
+
+    That scorer is the part a class-C claim has to justify, and it is anchored separately:
+    [`test_fill_metric_scorer_matches_meshlib`] pins ``_total_fill_metric`` against MeshLib's own
+    ``calcCombinedFillMetric``, so a scorer that agreed with neither library's definition could not
+    make this test pass. Excludes the bug class "the DP reaches a worse optimum" -- a greedy fan, a
+    fill that misses the true minimum, an off-by-one in the interval recursion -- for each of the
+    metrics in ``FILL_METRICS``, which is why the metric is an axis rather than a single choice.
+
+    The tolerance is ``rtol=2e-3`` rather than the usual ``1e-5`` because both sides accumulate
+    their metric in ``float32`` across the whole patch.
+    """
     _, mesh_wp = request.getfixturevalue(mesh_name)
     n_orig = int(mesh_wp.indices.shape[0])
 
@@ -776,8 +795,8 @@ def test_fill_min_weight_matches_open3d_and_pymeshlab(
     ``meshing_close_holes``, whose default ``maxholesize=30`` would close nothing on these rims, so
     the cap is lifted exactly as the benchmark lifts it.
 
-    Three asserts. The counts are class A: same vertex count, same face count, and every added
-    triangle drawn only from the boundary loops. The **volume** is class B under the named
+    Three asserts. The counts are Class A: same vertex count, same face count, and every added
+    triangle drawn only from the boundary loops. The **volume** is Class B under the named
     [`_sealed_volume`][tests.test_holes._sealed_volume] transform -- these rims are planar,
     so the enclosed volume is triangulation-invariant and all three must agree exactly. And the
     **cost** is the optimality claim: triwarp runs the exact minimum-weight DP, so its

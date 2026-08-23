@@ -547,11 +547,13 @@ def test_face_adjacency_angles_matches_meshlib(
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
 def test_face_adjacency_angles_precomputed(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
-    Triwarp against triwarp: passing precomputed face normals must not change the angles.
+    Triwarp against triwarp on the precomputed path, then Class B against trimesh's own table.
 
-    Not a reference comparison -- the oracle for the angles themselves is
-    [`test_face_adjacency_angles`], which compares them to trimesh. This pins only that the
-    precomputed path takes the same route as the deriving one.
+    The first assert is the triwarp-against-triwarp one and carries no oracle: it pins only that
+    supplying ``face_normals`` takes the same route as deriving them. The trailing loop is the
+    reference half, and it is Class B for the reason [`test_face_adjacency_angles`] gives -- the two
+    libraries order the adjacency rows differently, so the comparison goes through a
+    ``(face_a, face_b)`` dict rather than positionally.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     adjacency_wp = tw.adjacency.face_adjacency(mesh_wp.indices)
@@ -717,11 +719,11 @@ def test_face_adjacency_projections_precomputed(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     """
-    Triwarp against triwarp: the precomputed-normals path must give the same projections.
+    Triwarp against triwarp on the precomputed path, then Class B against trimesh.
 
-    The oracle for the values is [`test_face_adjacency_projections`] above, against trimesh;
-    this pins only that supplying ``face_adjacency_unshared`` and ``face_normals`` takes the
-    same route as deriving them.
+    The first assert carries no oracle: it pins only that supplying ``face_adjacency_unshared`` and
+    ``face_normals`` takes the same route as deriving them. The reference half repeats
+    [`test_face_adjacency_projections`]'s comparison, Class B through the same row-order transform.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     adjacency_wp, adjacency_edges_wp = tw.adjacency.face_adjacency(
@@ -812,9 +814,11 @@ def test_face_adjacency_convex(request: pytest.FixtureRequest, mesh_name: str) -
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "half_torus"])
 def test_face_adjacency_convex_precomputed(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
-    Triwarp against triwarp: the precomputed path must give the same convexity flags.
+    Triwarp against triwarp on the precomputed path, then Class B against trimesh.
 
-    Oracle is [`test_face_adjacency_convex`]; this pins the precomputed-argument route only.
+    The first assert carries no oracle -- it pins the precomputed-argument route only. The reference
+    half repeats [`test_face_adjacency_convex`]'s comparison, Class B through the same row-order
+    transform.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     adjacency_wp, adjacency_edges_wp = tw.adjacency.face_adjacency(

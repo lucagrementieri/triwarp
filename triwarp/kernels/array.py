@@ -2,8 +2,6 @@ from typing import Any
 
 import warp as wp
 
-from triwarp.constants import TOLERANCE_MERGE_CONSTANT
-
 
 @wp.func
 def sort3(a: wp.Scalar, b: wp.Scalar, c: wp.Scalar) -> tuple[wp.Scalar, wp.Scalar, wp.Scalar]:
@@ -17,19 +15,23 @@ def sort3(a: wp.Scalar, b: wp.Scalar, c: wp.Scalar) -> tuple[wp.Scalar, wp.Scala
 
 
 @wp.func
-def tolerance_sign(value: wp.float32) -> wp.int32:
-    if value < -TOLERANCE_MERGE_CONSTANT:
-        return wp.int32(-1)
-    if value > TOLERANCE_MERGE_CONSTANT:
-        return wp.int32(1)
-    return wp.int32(0)
-
-
-@wp.func
-def sign_with_tolerance(value: wp.float32, tolerance: wp.float32) -> wp.int32:
-    # ``tolerance_sign`` with the dead zone exposed as an argument, for callers whose tolerance is
-    # scale-dependent rather than fixed at ``TOLERANCE_MERGE`` (a plane split's snap band scales
-    # with the model). Pass ``TOLERANCE_MERGE`` to recover ``tolerance_sign`` exactly.
+def sign_with_tolerance(value: wp.Float, tolerance: wp.Float) -> wp.int32:
+    # Sign of ``value`` with a dead zone of half-width ``tolerance`` around zero, which reads 0.
+    #
+    # **The dead zone is an argument and not a constant on purpose, and every pipeline that uses
+    # this twice must use the same one both times.** A plane cut asks the question in two places --
+    # which side is each *vertex* on, and does the plane cross each *edge*'s interior -- and the two
+    # answers have to agree or the classifier flags a face the edge pass does not split. This lived
+    # for a while as two functions, a fixed-``TOLERANCE_MERGE`` ``tolerance_sign`` for the
+    # classifiers and this one for the edge mask, which put the coupling beyond the reach of a
+    # reader of either: ``intersection.split_faces_along_field`` had to hardcode ``TOLERANCE_MERGE``
+    # at its edge mask to match a classifier whose dead zone was invisible from the call site.
+    #
+    # The classifiers pass ``TOLERANCE_MERGE_CONSTANT`` because their public entry points
+    # (``slice_mesh_with_plane``, ``clip_mesh_with_field``, ``split_faces_along_field``) expose no
+    # tolerance and, per CLAUDE.md section 14, should not grow one until a caller needs it;
+    # ``split_mesh_with_plane`` documents a ``tolerance=`` and passes it through. Both spellings are
+    # now visible at the call site, which is the whole point.
     if value < -tolerance:
         return wp.int32(-1)
     if value > tolerance:
@@ -41,6 +43,26 @@ def sign_with_tolerance(value: wp.float32, tolerance: wp.float32) -> wp.int32:
 def wrap_index(i: wp.int32, n: wp.int32) -> wp.int32:
     # Positive modulo: ``%`` follows C++11 semantics (sign of the dividend).
     return ((i % n) + n) % n
+
+
+@wp.func
+def loop_next_slot(
+    loop_id: wp.array[wp.int32],
+    loop_starts: wp.array[wp.int32],
+    loop_sizes: wp.array[wp.int32],
+    slot: wp.int32,
+) -> wp.int32:
+    # Given a flat slot in a packed array of *closed* loops, the slot of the next element around
+    # **its own** loop -- so the last element of a loop wraps to that loop's first and not into the
+    # next loop's.
+    #
+    # Named because five kernels across ``boundary`` and ``holes`` had written this arithmetic out,
+    # in three spellings that a duplicate scan keying on statement text cannot connect: with the
+    # size in a local, with the size inlined into the ``wrap_index`` call, and with ``begin`` /
+    # ``size`` / ``next_slot`` in place of ``o`` / ``b``. Every one of them is one edge of a rim,
+    # and getting the wrap wrong silently joins two different holes.
+    begin = loop_starts[loop_id[slot]]
+    return begin + wrap_index(slot - begin + 1, loop_sizes[loop_id[slot]])
 
 
 @wp.func
@@ -161,6 +183,26 @@ def init_repeat_index(repeats: wp.Int, out_indices: wp.array[wp.Int]) -> None:
 
 
 @wp.kernel
+def segment_owner_labels(offsets: wp.array[wp.int32], out_owner: wp.array[wp.int32]) -> None:
+    # For every element of a packed ragged array, which segment it belongs to -- the ragged
+    # counterpart of ``init_repeat_index``, whose segments are all one width. ``offsets`` is the
+    # exclusive scan of the segment sizes with the total appended, so this is launched over the
+    # *segment* count and each thread writes its own label across its own span.
+    #
+    # One thread per segment rather than one per element (a binary search into ``offsets``) is the
+    # right shape for the two callers here for opposite reasons, and both are worth knowing before
+    # reaching for it. ``linalg`` expands CSR row offsets back to one row index per entry so a
+    # pruned pattern can be rebuilt through ``bsr_from_triplets``: the rows are many and short, and
+    # the alternative costs a search per non-zero. ``geodesic_walk`` labels each packed loop
+    # position with its loop: the loops are few and short, so this beats a search *and* needs no
+    # readback of the offsets. Where the segments are few but enormous, the per-element form would
+    # win instead -- nothing in the tree is in that regime.
+    segment = wp.int32(wp.tid())
+    for slot in range(offsets[segment], offsets[segment + 1]):
+        out_owner[slot] = segment
+
+
+@wp.kernel
 def random_priorities(seed: wp.int32, out_priority: wp.array[wp.uint32]) -> None:
     # A total order on the elements, drawn once for the whole run rather than per round. Every
     # multi-round selection that breaks ties by priority -- blue-noise dart throwing, the
@@ -232,6 +274,11 @@ def isin_lookup_sorted(
 
 @wp.func
 def mask_not(a: wp.bool) -> wp.bool:
+    # Mask complement -- for a caller holding the region to *delete* and needing the one to keep,
+    # among others. Warp exposes no ``logical_not`` builtin (``wp.invert`` is the bitwise
+    # complement, which is wrong for a ``wp.bool``), so this one-liner is what ``wp.map`` needs,
+    # and it is the tree's only spelling of it: a second copy under a second name lived in
+    # ``kernels/selection.py`` for a week, carrying this same paragraph.
     return not a
 
 
@@ -261,6 +308,14 @@ def nonzero_flag(value: wp.Scalar) -> wp.int32:
     return wp.where(value != type(value)(0), wp.int32(1), wp.int32(0))
 
 
+# The comparison family below is the tree's spelling for a thresholding ``wp.map``, and it is worth
+# saying so here because it kept being re-spelled: ``seams.crease_edge_mask``,
+# ``smoothing.is_spike_defect`` and ``heat/vector.is_resolved`` were each a private ``a > b`` under
+# a domain name while ``greater`` already had six adopters. What those three carried that was worth
+# keeping was never the comparison -- it was *which quantity* and *which threshold* their caller
+# chose, and that argument now sits in the wrapper that chooses it, where a user of the public
+# function reads it. Reach for a named predicate when it computes something (``is_positive_finite``,
+# ``is_close_scalar``); reach for these when it is a comparison.
 @wp.func
 def greater(a: wp.Scalar, b: wp.Scalar) -> wp.bool:
     return a > b
@@ -362,7 +417,7 @@ def binary_search_index_left(values: wp.array[wp.Scalar], value: wp.Scalar) -> w
 
 
 @wp.func
-def binary_search_sorted_contains(values: wp.array[wp.Scalar], value: wp.Scalar) -> bool:
+def binary_search_sorted_contains(values: wp.array[wp.Scalar], value: wp.Scalar) -> wp.bool:
     # ``wp.lower_bound``'s clamp to ``n - 1`` is harmless here: a value past the end lands on the
     # last element, which then compares unequal. ``and`` short-circuits in kernel scope, so the
     # element read is skipped on an empty array.
@@ -426,6 +481,34 @@ _register_overloads()
 
 
 @wp.func
+def lowbias32(x: wp.uint32) -> wp.uint32:
+    # The ``lowbias32`` finalizer: a **bijection** on uint32 whose output is decorrelated from its
+    # input. Two properties, and the tree needs both -- each of its callers needed one of them and
+    # wrote the mixer out for itself.
+    #
+    # *Bijective*, so distinct inputs never collide: a priority drawn as ``lowbias32(index)`` is a
+    # strict total order on the indices with no tie to break, which is what
+    # ``polyline.ear_outranks`` relies on (its index tiebreak is dead code kept only in case the
+    # mixer is ever swapped).
+    #
+    # *Decorrelating*, and this is load-bearing for any parallel independent-set pass. ``edges_
+    # unique`` orders edges lexicographically by endpoint index, which on a structured mesh is
+    # spatially *monotone*, and a monotone key field has essentially one local minimum -- so a
+    # min-key lock commits a single winner per pass however many candidates there are. Measured on
+    # ``saddle_graded``: locking by raw edge index yields **1** winner out of 51 546 candidates, and
+    # locking by quadric cost yields 23 (that field is smoothly graded there, so it is monotone
+    # too). Hashing the index restores the expected ~candidates/valence.
+    #
+    # For a random order that a caller can *vary*, use ``random_priorities`` instead: it takes a
+    # seed. This one is a pure function of the index, so it needs no state and is reproducible
+    # across runs and across launches -- which is why the collapse pass can recompute a lock key in
+    # a later kernel instead of storing it.
+    x = (x ^ (x >> wp.uint32(16))) * wp.uint32(0x7FEB352D)
+    x = (x ^ (x >> wp.uint32(15))) * wp.uint32(0x846CA68B)
+    return x ^ (x >> wp.uint32(16))
+
+
+@wp.func
 def pack_edge_key(u: wp.int32, v: wp.int32, base: wp.uint64) -> wp.uint64:
     """Key of undirected edge (u, v); matches ``pack_indices`` for a sorted 2-index row."""
     lo = wp.uint64(wp.uint32(wp.min(u, v)))
@@ -439,7 +522,8 @@ def pack_farthest_key(distance_sq: wp.float32, index: wp.int32) -> wp.int64:
     # bits of a non-negative float increase monotonically with the value, so the high half orders
     # by distance; the low half stores ``index`` complemented within int32 so that a *smaller*
     # index compares *larger*. Both halves are non-negative, so the whole key is, which is what
-    # makes ``-1`` a sentinel below every real candidate.
+    # makes ``-1`` a sentinel below every real candidate. ``unpack_ranked_index`` inverts the
+    # low half.
     distance_bits = wp.uint64(wp.uint32(wp.cast(distance_sq, wp.int32)))
     rank = wp.uint64(wp.uint32(wp.int32(2147483647) - index))
     return wp.int64((distance_bits << wp.uint64(32)) | rank)
@@ -455,11 +539,27 @@ def pack_ranked_key(value: wp.int32, index: wp.int32) -> wp.int64:
     #
     # Comparing this key is also how a caller applies the result without a readback: recomputing
     # ``pack_ranked_key(value, index)`` in a second kernel and testing it against the reduced
-    # maximum identifies the winner on the device.
+    # maximum identifies the winner on the device. Where the host does need the index,
+    # ``unpack_ranked_index`` inverts the low half.
     return wp.int64(
         (wp.uint64(wp.uint32(value)) << wp.uint64(32))
         | wp.uint64(wp.uint32(wp.int32(2147483647) - index))
     )
+
+
+@wp.func
+def unpack_ranked_index(key: wp.int64) -> wp.int32:
+    # The index out of a ``pack_farthest_key`` / ``pack_ranked_key`` key -- the inverse of the
+    # complement both use in their low half, so one decoder serves both.
+    #
+    # It lives here, beside its packers, because a pack/unpack pair in two modules is a pair that
+    # cannot be read: this was in ``kernels/points.py`` while both packers were here, three hundred
+    # lines from either. Note the alternative a caller may prefer:
+    # ``repair.mark_largest_group_mask`` never unpacks at all, it *recomputes* the key and tests it
+    # against the reduced maximum, keeping the winner on the device instead of pulling it back to
+    # pick a row. Unpack when the host needs the index (a greedy loop's next seed); recompute when
+    # only the device does.
+    return wp.int32(2147483647) - wp.int32(wp.uint32(wp.uint64(key) & wp.uint64(4294967295)))
 
 
 @wp.func

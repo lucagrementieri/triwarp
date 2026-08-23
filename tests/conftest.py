@@ -1,15 +1,42 @@
 from __future__ import annotations
 
-from types import CodeType
+import os
 
-import numpy as np
-import pytest
-import trimesh as tm
-import warp as wp
-from meshlib import mrmeshpy as mm
+# Cap the reference libraries' thread pools **before** NumPy is imported, because OpenBLAS reads
+# these at library load and never again. The default is one thread per core, and on this box's 48
+# that is not a mild pessimisation -- it is a cliff. Measured on an otherwise idle machine, median
+# of five, against the same call at 8 threads:
+#
+#   call                      default (48)   8 threads   1 thread
+#   np.linalg.solve, n=256      385.26 ms      0.64 ms     0.63 ms
+#   np.linalg.solve, n=513      878.02 ms      1.81 ms     2.92 ms
+#   np.linalg.eigvalsh, 1284^2  2897.9 ms     59.70 ms   151.30 ms
+#
+# So 8 is 485-600x faster than the default on the dense solves this suite's linear-algebra
+# references are built from, and 49x on the eigendecomposition behind
+# ``test_connection_laplacian_is_symmetric_psd_and_a_rotation_per_block``. It is not a contention
+# artifact: the numbers above were taken with the machine idle. Eight rather than one because the
+# eigendecomposition genuinely parallelises (59.7 ms against 151.3 ms) while the solves do not care.
+#
+# This cap does **not** reach a library that sets its own count. MeshLab's screened-Poisson filter
+# takes a ``threads`` parameter defaulting to ``hardware_concurrency`` and overrides the
+# environment (measured: unchanged at >115 s under ``OMP_NUM_THREADS=2``), which is why
+# ``tests/test_reconstruction.py`` pins that one at its call site instead. ``meshlib`` is
+# deliberately left alone by name -- it is the suite's one legitimately multi-threaded reference --
+# but it uses its own pool rather than OpenMP, so these variables do not touch it either.
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_var, "8")
 
-import triwarp as tw
-from tests.conversions import meshlib_to_trimesh, trimesh_to_warp, warp_to_trimesh
+from types import CodeType  # noqa: E402
+
+import numpy as np  # noqa: E402
+import pytest  # noqa: E402
+import trimesh as tm  # noqa: E402
+import warp as wp  # noqa: E402
+from meshlib import mrmeshpy as mm  # noqa: E402
+
+import triwarp as tw  # noqa: E402
+from tests.conversions import meshlib_to_trimesh, trimesh_to_warp, warp_to_trimesh  # noqa: E402
 
 # Reject a launch whose array arguments do not live on the launch device. Warp's default is
 # RELAXED, which passes the pointers straight through: a launch that forgets ``device=`` lands on

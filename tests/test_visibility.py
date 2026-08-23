@@ -120,8 +120,8 @@ def test_ambient_occlusion_matches_meshlib_sky_view_factor(device: str) -> None:
 
     MeshLib solves the terrain form of this integral -- how much of the sky each sample point can
     see -- and it is the same quantity ``ambient_occlusion`` reports as the blocked share, so the
-    named part of the comparison is the complement ``svf = 1 - occlusion``. What keeps it class C
-    rather than class B is that the two integrate over *different direction sets*: triwarp rotates
+    named part of the comparison is the complement ``svf = 1 - occlusion``. What keeps it Class C
+    rather than Class B is that the two integrate over *different direction sets*: triwarp rotates
     its own Fibonacci lattice into each point's frame and MeshLib takes the patch list it is given,
     so the residual is quadrature error and not a correspondence.
 
@@ -821,7 +821,7 @@ def test_max_tangent_sphere_matches_meshlib(device: str) -> None:
     Class C (a median relative difference): the same shrinking-sphere algorithm, from just inside.
 
     Both implementations are Inui et al.'s shrinking sphere, so this is the closest thing to a
-    second implementation triwarp's iteration has -- and the reason it is class C rather than A is a
+    second implementation triwarp's iteration has -- and the reason it is Class C rather than A is a
     query-point difference neither side can remove. MeshLib excludes the faces incident to the
     vertex it measures at (``MeshPoint::notIncidentFaces``); triwarp takes no such predicate, so at
     a point exactly *on* the surface its sphere collapses -- 0.0018 on a unit sphere, the degeneracy

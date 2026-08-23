@@ -1,13 +1,7 @@
 import warp as wp
 
-# The 5x5 quadric solve below uses Warp's own Householder QR instead of a hand-rolled elimination.
-# Unlike ``warp.fem``'s solvers (which ``triwarp.reconstruction`` imports lazily to dodge a
-# tens-of-seconds first-call codegen penalty), these are plain ``@wp.func``s that inline into this
-# module — no fem codegen is triggered. The import itself is eager and costs ~0.15 s of
-# ``import triwarp`` (measured), almost all of it ``warp/fem/__init__.py`` rather than ``linalg``.
-from warp.fem.linalg import householder_qr_decomposition, solve_triangular
-
 from triwarp.kernels import array as kernel_array
+from triwarp.kernels.linalg import solve_normal_equations
 from triwarp.kernels.predicates import project_out_normal
 
 # Custom fixed-size float64 types for the 5x5 quadric-fit normal equations: the rest of the
@@ -37,24 +31,6 @@ def _build_reference_frame(
     t2 = wp.cross(normal, t1)
     t2 = wp.normalize(t2)
     return t1, t2
-
-
-@wp.func
-def _solve_normal_equations(ata: mat55d, atb: vec5d) -> tuple[vec5d, wp.bool]:
-    """
-    Solve the 5x5 system ``AtA x = Atb`` by Householder QR.
-
-    Returns (solution, ok); ok is False if singular to tolerance 1e-14.
-    """
-    q, r = householder_qr_decomposition(ata)
-    # ``|R[k, k]|`` is the norm of column k after the preceding reflections — the QR analogue of
-    # the partial-pivot magnitude the former Gaussian elimination tested, to within a sqrt(5)
-    # factor, so the 1e-14 singularity threshold carries over unchanged.
-    for k in range(5):
-        if wp.abs(r[k, k]) < wp.float64(1e-14):
-            return atb, False
-    # ``Q R x = AtA x = Atb`` with ``Q`` orthonormal, so back-substitute against ``Q^T Atb``.
-    return solve_triangular(r, wp.transpose(q) * atb), True
 
 
 @wp.func
@@ -226,7 +202,7 @@ def fit_principal_curvature(
         ata += wp.outer(r, r)
         atb += r * w
 
-    solution, ok = _solve_normal_equations(ata, atb)
+    solution, ok = solve_normal_equations(ata, atb)
     if not ok:
         out_pd1[i] = zero3
         out_pd2[i] = zero3
@@ -313,20 +289,6 @@ def line_ball_intersection_segment(
     d2 = wp.clamp(d2, wp.float32(0.0), wp.float32(1.0))
 
     return (d2 - d1) * wp.length(segment)
-
-
-@wp.kernel
-def edge_aabb_from_endpoints(
-    vertices: wp.array[wp.vec3],
-    face_adjacency_edges: wp.array2d[wp.int32],
-    out_lower: wp.array[wp.vec3],
-    out_upper: wp.array[wp.vec3],
-) -> None:
-    tid = wp.int32(wp.tid())
-    v0 = vertices[face_adjacency_edges[tid, 0]]
-    v1 = vertices[face_adjacency_edges[tid, 1]]
-    out_lower[tid] = wp.min(v0, v1)  # wp.min / wp.max on vectors are element-wise
-    out_upper[tid] = wp.max(v0, v1)
 
 
 @wp.kernel

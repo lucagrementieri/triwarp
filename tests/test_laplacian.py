@@ -402,10 +402,10 @@ def test_cotmatrix_and_mass_match_potpourri3d(
     because it is cheap: these are the operators every solver in the library is built on, so a
     regression here surfaces as a wrong answer several modules away.
 
-    ``vertex_areas`` is class A: it is one third of the incident face areas, which is exactly the
+    ``vertex_areas`` is Class A: it is one third of the incident face areas, which is exactly the
     barycentric lumped mass diagonal ``mass_matrix_entries`` returns.
 
-    ``cotan_laplacian`` is class B, and the transform is a **sign flip**. geometry-central builds
+    ``cotan_laplacian`` is Class B, and the transform is a **sign flip**. geometry-central builds
     the positive-semidefinite Laplacian while libigl -- and triwarp with it -- builds the negative
     one: measured on ``icosahedron``, ``pp3d.cotan_laplacian`` is ``-igl.cotmatrix`` to 1e-9 entry
     for entry, with a ``+2.887`` diagonal against igl's ``-2.887``. Neither is wrong, but handing

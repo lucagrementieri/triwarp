@@ -1,7 +1,7 @@
 """
 Static scan of the public API's shape: names, summaries, file layout and module boundaries.
 
-Sixteen conventions the package holds to, each one a defect class that was actually found rather
+Eighteen conventions the package holds to, each one a defect class that was actually found rather
 than an aesthetic preference. They are checked by an ``ast`` scan of ``triwarp/`` (excluding
 ``kernels/``, ``__init__.py`` and private ``_*.py`` modules) plus a listing of ``tests/`` and
 ``benchmarks/``, and [`tests/test_api_conventions.py`](test_api_conventions.py) fails the default
@@ -82,6 +82,20 @@ test run on any violation:
     runs against section 14's "prefer dtype-generic ``@wp.func``s". The tree carried 329
     ``int(wp.tid())`` alongside 640 ``wp.int32(...)``, and 46 sites in 41 kernels used *both* on
     the same local. Like checks 9, 13 and 14 this one scans ``kernels/``.
+17. **An integer division inside a kernel is spelled ``//``, never ``/``** (``.claude/CLAUDE.md``
+    section 5). On integers the two are the *same* operation in Warp -- both truncate toward zero,
+    where CPython's ``//`` floors -- so this is legibility: ``/`` on two ``int32``s reads as real
+    division and truncates only because the operands happen to be integers. A check rather than an
+    edit because the defect recurred after the rule was written, and because the scan found four
+    sites a textual pass had missed. It types an operand only *by declaration*, which is what makes
+    it safe to run on float-heavy code.
+18. **A kernel-scope argument or return is annotated in Warp's types** -- ``wp.bool`` /
+    ``wp.int32`` / ``wp.float32``, not the bare Python names (``.claude/CLAUDE.md`` section 2).
+    The third member of the 16/17 family, and the same story: Warp resolves both spellings to the
+    same types, so only a scan keeps them from coexisting. The tree carried 11 ``-> bool`` against
+    46 ``-> wp.bool`` plus 12 bare parameters, the newest written the day after the pass that
+    converted the last batch of casts. It reads ``@wp.kernel`` / ``@wp.func`` signatures only,
+    because a kernel *factory* is ordinary Python whose ``int`` parameters are correct.
 
 Why a static scan rather than importing ``triwarp``
 ---------------------------------------------------
@@ -1395,5 +1409,68 @@ def integer_division_problems() -> list[str]:
                     f"{path.relative_to(_REPO_ROOT)}:{node.lineno} {function.name} divides "
                     f"integers with '/' in '{ast.unparse(node)}' -- write // instead, which is the "
                     "same operation on integers and says so"
+                )
+    return problems
+
+
+# --- check 18 -----------------------------------------------------------------------------------
+
+# Bare Python annotations with a Warp equivalent. ``str`` is deliberately absent: no kernel-scope
+# argument can be one, so a ``str`` annotation is proof the function is a Python-scope factory and
+# not kernel code at all.
+_BARE_ANNOTATIONS = {"bool": "wp.bool", "int": "wp.int32", "float": "wp.float32"}
+
+
+def _annotation_nodes(function: ast.FunctionDef) -> list[tuple[str, ast.expr]]:
+    """Every annotation in a signature, paired with the argument name (``->`` for the return)."""
+    arguments = function.args
+    every = [
+        *arguments.posonlyargs,
+        *arguments.args,
+        *([arguments.vararg] if arguments.vararg else []),
+        *arguments.kwonlyargs,
+        *([arguments.kwarg] if arguments.kwarg else []),
+    ]
+    found = [(argument.arg, argument.annotation) for argument in every if argument.annotation]
+    if function.returns is not None:
+        found.append(("->", function.returns))
+    return found
+
+
+def bare_annotation_problems() -> list[str]:
+    """
+    Check 18: a bare ``bool`` / ``int`` / ``float`` annotation in a kernel-scope signature.
+
+    ``.claude/CLAUDE.md`` section 2: kernel arguments and returns are spelled in Warp's types. Warp
+    resolves the bare names to the same ones, so like checks 16 and 17 this is legibility rather
+    than correctness -- and like them, that is exactly why nothing but a scan holds it. The tree
+    carried 11 ``-> bool`` against 46 ``-> wp.bool``, five of them predating the fourth kernel pass
+    and the newest written the day after it, which is section 14's bar for a check: the same defect
+    found twice, in code written after the rule.
+
+    The distinction that makes it sound is that it reads *only* ``@wp.kernel`` / ``@wp.func``
+    signatures. A kernel **factory** is ordinary Python and its parameters are correctly plain --
+    ``reduce.blocks_1d(n: int) -> int`` and ``neighbors._bvh_nearest_row_kernel(row_size: int,
+    name: str)`` compute a launch geometry and a kernel name at import time, and annotating them
+    ``wp.int32`` would be a lie about where they run. Those are not kernel-scope functions, so they
+    are never scanned; ``str`` is left out of the mapping for the same reason, as a further tell.
+    """
+    problems: list[str] = []
+    for path in sorted(_PACKAGE_DIR.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue  # test_package_scan_is_discoverable reports the parse failure
+        for function in _kernel_scope_functions(tree):
+            for name, annotation in _annotation_nodes(function):
+                if not isinstance(annotation, ast.Name):
+                    continue
+                replacement = _BARE_ANNOTATIONS.get(annotation.id)
+                if replacement is None:
+                    continue
+                where = "return" if name == "->" else f"argument '{name}'"
+                problems.append(
+                    f"{path.relative_to(_REPO_ROOT)}:{annotation.lineno} {function.name} annotates "
+                    f"its {where} '{annotation.id}' -- write {replacement} instead"
                 )
     return problems

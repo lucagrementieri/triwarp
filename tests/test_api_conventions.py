@@ -25,12 +25,14 @@ import warp as wp
 import triwarp as tw
 from tests.api_conventions import (
     DocstringExample,
+    _annotation_nodes,
     _int_module_constants,
     _int_typed_names,
     _is_int_expression,
     _kernel_scope_functions,
     allocation_device_problems,
     array_annotation_style_problems,
+    bare_annotation_problems,
     builtin_cast_problems,
     coverage_location_problems,
     docstring_examples,
@@ -334,6 +336,66 @@ def test_integer_division_scan_ignores_float_operands() -> None:
         and _is_int_expression(node.right, scalars, arrays)
     ]
     assert flagged == ["counts[i] / b"]
+
+
+def test_kernel_signatures_use_the_warp_types() -> None:
+    """
+    A kernel-scope argument or return is annotated ``wp.bool`` / ``wp.int32`` / ``wp.float32``.
+
+    ``.claude/CLAUDE.md`` section 2. Warp resolves the bare names to the same types, so -- as with
+    checks 16 and 17 -- nothing but a scan keeps the two spellings from coexisting: the tree carried
+    11 ``-> bool`` against 46 ``-> wp.bool``, plus 12 bare ``int`` / ``bool`` parameters, and the
+    newest of them was written the day after the kernel pass that converted the last batch of casts.
+
+    Only ``@wp.kernel`` / ``@wp.func`` signatures are read, which is what keeps it honest: a kernel
+    *factory* is ordinary Python and its parameters are correctly plain (``reduce.blocks_1d``,
+    ``neighbors._bvh_nearest_row_kernel``), and annotating those ``wp.int32`` would misdescribe
+    where they run.
+    """
+    _fail("bare bool/int/float annotation(s) in kernel scope:", bare_annotation_problems())
+
+
+def test_bare_annotation_scan_ignores_kernel_factories() -> None:
+    """
+    Check 18 reads kernel-scope signatures only -- a factory's plain ``int`` is not a violation.
+
+    The negative case is pinned here rather than left to the tree happening not to contain one,
+    because a factory that returns a kernel sits in the same file as the kernels it builds and is
+    the obvious false positive. ``wp.Scalar`` / ``Any`` / ``wp.array[...]`` and a bare ``str`` stay
+    silent too; ``str`` is left out of the mapping deliberately, since no kernel argument can be
+    one, which makes it a further tell that the enclosing function is Python.
+    """
+    source = textwrap.dedent(
+        """
+        import warp as wp
+
+        def blocks_1d(n: int) -> int:
+            return (n + 255) // 256
+
+        def row_kernel_factory(row_size: int, name: str):
+            @wp.kernel(name=name)
+            def row_kernel(values: wp.array[wp.float32], scale: float) -> None:
+                values[wp.tid()] = values[wp.tid()] * scale
+
+            return row_kernel
+
+        @wp.func
+        def is_short(length: wp.float32, limit: wp.float32) -> bool:
+            return length < limit
+
+        @wp.func
+        def generic(value: wp.Scalar, other: Any, table: wp.array[wp.int32]) -> wp.bool:
+            return value > table[0]
+        """
+    )
+    tree = ast.parse(source)
+    flagged = [
+        f"{function.name}:{name}"
+        for function in _kernel_scope_functions(tree)
+        for name, annotation in _annotation_nodes(function)
+        if isinstance(annotation, ast.Name) and annotation.id in {"bool", "int", "float"}
+    ]
+    assert flagged == ["is_short:->", "row_kernel:scale"]  # ast.walk is breadth-first
 
 
 def test_generic_kernels_register_their_overloads() -> None:

@@ -38,7 +38,7 @@ def test_aabb_matches_trimesh_open3d_and_igl(
     request: pytest.FixtureRequest, mesh_name: str
 ) -> None:
     """
-    The axis-aligned bounding box against all four references: class A on three, class B on igl.
+    The axis-aligned bounding box against all four references: Class A on three, Class B on igl.
 
     Trivial to compute and trivial to get subtly wrong -- a reduction that seeds its accumulator at
     zero rather than at +/-inf returns a box clamped to the origin, which is correct for any mesh
@@ -53,7 +53,7 @@ def test_aabb_matches_trimesh_open3d_and_igl(
     to reduce those 8 corners back to a min/max pair. That is a genuinely different output shape for
     the same answer, and reducing it is exact.
 
-    MeshLib's ``computeBoundingBox`` is class A and returns a ``Box3f`` -- ``.min`` / ``.max``, the
+    MeshLib's ``computeBoundingBox`` is Class A and returns a ``Box3f`` -- ``.min`` / ``.max``, the
     two corners directly. Its ``region`` argument is passed ``None`` for the whole mesh; note that
     it takes the *topology* as well as the points, so on a mesh with unreferenced vertices it would
     box only the referenced ones, where triwarp's takes the point buffer alone. Every fixture here

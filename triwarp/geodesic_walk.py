@@ -35,6 +35,7 @@ import warp as wp
 
 import triwarp as tw
 from triwarp.halfedge import halfedge_twins, vertex_one_rings
+from triwarp.kernels import array as kernel_array
 from triwarp.kernels import geodesic_walk as kernel_geodesic_walk
 
 _DEFAULT_MAX_STEPS = 4096
@@ -523,7 +524,7 @@ def shorten_loop(
             break
         position_loop = wp.empty(n_positions, dtype=wp.int32, device=device)
         wp.launch(
-            kernel_geodesic_walk.loop_position_labels,
+            kernel_array.segment_owner_labels,
             dim=n_loops,
             inputs=[loop_offsets, position_loop],
             device=device,
@@ -612,7 +613,7 @@ def _compact_repeats(
         return packed, loop_offsets
     position_loop = wp.empty(n_positions, dtype=wp.int32, device=device)
     wp.launch(
-        kernel_geodesic_walk.loop_position_labels,
+        kernel_array.segment_owner_labels,
         dim=n_loops,
         inputs=[loop_offsets, position_loop],
         device=device,
