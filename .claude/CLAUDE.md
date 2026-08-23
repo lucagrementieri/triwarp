@@ -1043,7 +1043,7 @@ reconstruction, decimation, remeshing, point-cloud, boolean, proximity or signed
 point, and the C++ names for several of those (`cutAndStitch`, `iterativeEdgeSwaps`,
 `loopSubdivision`, `isInnerPoint`, `openToDisk`, `marchIntersections.cpp`) are in the headers and
 **unbound** — the libigl lesson, one notch worse, since here only nine algorithms of a ~120-method
-class are reachable. Ten hazards, all measured:
+class are reachable. Thirteen hazards, all measured:
 
 - **`load_array` is not a load; it is already a repair, and it renumbers.** It runs the kernel's
   connectivity fix and Euler update before returning. Measured on `icosphere(1)` (42 v / 80 f): a
@@ -1082,10 +1082,14 @@ class are reachable. Ten hazards, all measured:
   does not on any fixture probed. Pass both explicitly at those values so a wheel that starts
   honouring either one fails a test rather than drifting, and do **not** build a triwarp flag around
   `justproper` until a fixture is found where its two settings differ.
-- **`nbe` is inclusive, and both docstrings say otherwise.** `fill_small_boundaries(nbe, …)` fills
-  loops of **at most** `nbe` boundary edges where the C++ comment and the Python docstring say "less
-  than". Measured on a 24-edge rim: `nbe` 23 → **0** patched, 24 → **1**, 25 → 1. `nbe = 0` means
-  all.
+- **`nbe` is inclusive, both its docstrings say otherwise, and pymeshlab's counterpart is
+  exclusive.** `fill_small_boundaries(nbe, …)` fills loops of **at most** `nbe` boundary edges where
+  the C++ comment and the Python docstring both say "less than". Measured on a 24-edge rim: `nbe`
+  23 → **0** patched, 24 → **1**, 25 → 1; `nbe = 0` means all. This is also the one place two
+  references disagree about the *same* parameter — on a 16-edge rim pymeshfix fills at `nbe = 16`
+  and pymeshlab only at `maxholesize = 17` — so `holes.fill_small(max_edges=...)` follows pymeshfix
+  (the precedence rule below) and a pymeshlab comparison passes `max_edges + 1` as its named
+  class-B transform.
 - **The "MeshFix could not fix everything" line on stderr is printed when it *succeeded*.** The
   wrapper does `if (result) cerr << …` where `result` is *true only if the mesh was completely
   cleaned*. Measured: `clean_from_arrays` printed it for both `bunny_decimated` and `bunny` and both
@@ -1107,6 +1111,33 @@ class are reachable. Ten hazards, all measured:
   deprecated. Use n_boundaries instead."`, and `n_points` / `n_faces` became properties in the same
   change. Code written against an example older than 0.17 fails with
   `TypeError: 'int' object is not callable`.
+- **`strong_degeneracy_removal` measures degeneracy in `double`, so it is *stricter* than triwarp's
+  `float32` test rather than merely different.** Measured on a flat 12-column strip: exactly
+  collinear vertices are removed by both (24 v / 22 f → 0 / 0), and the same strip offset by `1e-9`
+  is removed by triwarp and **kept unchanged** by pymeshfix, because `1e-9` is not zero in `double`.
+  Where the degeneracy is exact the two agree completely -- a sphere with zero-area faces appended
+  comes back at 162 v / 320 f, watertight, χ = 2, volume 4.0470 from both -- so compare on an
+  *exactly* degenerate fixture and pin the near-degenerate class as the divergence.
+- **`strong_intersection_removal` is a different algorithm from
+  `repair.fix_self_intersections(method="local")`, not a different tuning**, and no transform
+  rescues the pair: on the 16x16 self-intersecting torus triwarp cuts and refills each sheet and
+  ends with **two** closed components (χ = 4, volume −10.42, 528 v) where pymeshfix removes far more
+  and ends with **one** (χ = 2, volume −6.53, 80 v), two-sided surface distance 0.50; on
+  `bohemian_dome` the same shapes at 2.23. All they share is the post-condition, so that pair is
+  neither benchmarked nor a parity claim. The comparable level is the whole pipeline:
+  `repair.make_solid` against `clean_from_arrays` agrees to **3.11e-08** on interpenetrating shells
+  and returns **8 188 v / 16 372 f from both sides** on `bunny_decimated`.
+- **Reproducing `clean_from_arrays` needs the loader's repair as an explicit first stage.** It is
+  invisible in the C++ pipeline because `load_array` does it, and its absence is invisible in the
+  output too until you check the right predicate: without `remove_unreferenced_vertices` +
+  `make_winding_consistent` + `split_non_manifold_vertices` first, `bunny_decimated` comes back with
+  χ = 2 and one component and is **not watertight**, because nothing downstream looks at edge
+  manifoldness. Two more orderings that were measured rather than reasoned: the component filter has
+  to run *inside* the intersection loop as well as before it (cutting a band out can disconnect the
+  surface -- the torus above goes from one component to two), and **nothing geometric may run after
+  the final fill** (filling a 3-vertex rim makes one sliver, a degeneracy pass deletes it and
+  reopens the rim, and the two trade the same 122 faces for ever: χ = 2 before, χ = −56 after, and
+  stable there).
 - **`trimesh.slice_plane`'s output is a poor input**, the same hazard the MeshLib block records and
   worse here: a hemisphere sliced from `icosphere(2)` without `merge_vertices()` loads as
   121 → **137 v** and reports **17** boundary loops where the surface has one; after

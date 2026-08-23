@@ -1,6 +1,10 @@
 """
 Removing what should not be in a mesh: redundant elements, bad triangles and inconsistent winding.
 
+[`make_solid`][triwarp.repair.make_solid] is the composite most callers want -- a broken digitised
+surface in, a single watertight solid out -- and everything below is a stage of it that is also
+useful on its own.
+
 Five defects are visible in the index buffer alone, and each has a remover:
 [`remove_unreferenced_vertices`][triwarp.repair.remove_unreferenced_vertices],
 [`remove_duplicated_vertices`][triwarp.repair.remove_duplicated_vertices],
@@ -26,7 +30,12 @@ The verb predicts the return shape, and that is a rule rather than a coincidence
 - **``remove_*`` / ``collapse_*``** change the element count, so they return ``(vertices, faces)``
   or more -- there is a new position buffer because vertices went away or moved.
 - **``make_*``** preserve positions and counts and rewrite only the index buffer, so they return
-  ``faces`` alone.
+  ``faces`` alone -- *unless* the name is a whole-mesh **outcome** rather than a property of the
+  index buffer, which is [`make_solid`][triwarp.repair.make_solid] alone. It is the composite of
+  most of this module and returns ``(vertices, faces)`` like the removers it runs; the three
+  property-fixers beside it ([`make_winding_consistent`][triwarp.repair.make_winding_consistent],
+  [`make_volume`][triwarp.repair.make_volume],
+  [`make_normals_outward`][triwarp.repair.make_normals_outward]) return ``faces``.
 - **``*_mask``** are detectors: they return a ``wp.array[wp.bool]`` and mutate nothing. The one this
   module used to hold now lives in [`triwarp.validation`][triwarp.validation].
 
@@ -57,6 +66,172 @@ from triwarp.kernels import selection as kernel_selection
 # bounding-box diagonal. 128 is the same order as ``offset.offset_mesh``'s automatic floor and costs
 # a 128 ** 3 field (8 MB); a caller who needs the surface resolved finer passes ``voxel_size``.
 _VOXEL_REBUILD_RESOLUTION = 128
+
+
+def make_solid(
+    vertices: wp.array[wp.vec3],
+    faces: wp.array[wp.int32],
+    *,
+    keep_largest: bool = True,
+    join_components: bool = False,
+    max_iter: int = 10,
+    inner_iter: int = 3,
+) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
+    """
+    Turn a broken digitised surface into a single watertight solid.
+
+    The composite this module's pieces exist to make possible, and the operation a caller reaching
+    for "repair" usually means: debris removed, holes closed, degeneracies collapsed and
+    self-intersections cut out and refilled, alternating until nothing is left to fix. Every stage
+    is a public function here or in [`triwarp.holes`][triwarp.holes]; what this adds is the order
+    and the loop, which is where the difficulty actually is -- closing a hole can create a
+    self-intersection, and cutting one out reopens a hole.
+
+    The stages, in order:
+
+    0. The connectivity repair the reference implementation performs inside its *loader*, and which
+       therefore does not look like a stage at all until it is missing:
+       [`remove_unreferenced_vertices`][triwarp.repair.remove_unreferenced_vertices],
+       [`make_winding_consistent`][triwarp.repair.make_winding_consistent] and
+       [`split_non_manifold_vertices`][triwarp.repair.split_non_manifold_vertices]. Without it a
+       mesh whose defect is a non-manifold *edge* comes back with the right Euler characteristic and
+       one component and is still not watertight, because no later stage looks at edge manifoldness.
+    1. ``keep_largest`` -> [`remove_small_components`][triwarp.repair.remove_small_components],
+       so the scan debris goes before anything expensive runs on it.
+    2. ``join_components`` ->
+       [`holes.join_closest_components`][triwarp.holes.join_closest_components], for an input whose
+       pieces are meant to be one surface rather than a largest piece plus rubbish. Mutually useful
+       with ``keep_largest`` rather than exclusive: keep the big piece *and* weld what is left.
+    3. [`holes.fill_min_weight`][triwarp.holes.fill_min_weight] if any boundary remains.
+    4. Up to ``max_iter`` rounds of
+       [`remove_degenerate_faces`][triwarp.repair.remove_degenerate_faces] and
+       [`collapse_small_triangles`][triwarp.repair.collapse_small_triangles], then
+       [`fix_self_intersections`][triwarp.repair.fix_self_intersections] at
+       ``max_iter=inner_iter``. The loop exits as soon as a round changes nothing.
+    5. A final fill if stage 4 reopened a boundary -- which it routinely does, since cutting an
+       intersecting region out is what opens one. Nothing geometric runs after it, and that is not
+       an omission: filling a 3-vertex rim produces one sliver, a degeneracy pass deletes the sliver
+       and reopens the rim, and the two trade the same faces indefinitely. Measured on
+       ``bunny_decimated``, one extra degeneracy pass after the fill takes it from closed (chi = 2)
+       to 58 rims (chi = -56) and holds it there.
+
+    Under ``keep_largest`` the component filter runs **inside** stage 4 as well as at the top, and
+    that is not belt and braces: cutting an intersecting band out can disconnect the surface, so the
+    extra piece does not exist yet when stage 1 looks. Measured on a torus whose inner wall crosses
+    itself, the intersection repair alone leaves two closed shells where the input was one.
+
+    !!! warning "It returns the best it managed, not a guarantee"
+        There is no success flag, deliberately. Convergence is not guaranteed for any input -- a
+        patch can intersect something, and its repair can open another hole -- so on a stubborn mesh
+        this returns a *partly* repaired surface rather than looping harder or raising. Ask
+        [`validation.is_watertight`][triwarp.validation.is_watertight] if the answer matters.
+
+        ``join_components`` is where that bites in practice, and the failure mode is worth knowing
+        because it is not a bug in any stage: welding several shells leaves **one** rim spanning all
+        of them, and if that rim is badly non-planar the minimum-weight patch across it
+        self-intersects, so stage 4 cuts the patch out and undoes the join. Measured on three
+        hemispherical bowls 3.0 apart, it converges to one solid (291 v / 578 f, chi = 2) when their
+        rims are coplanar and returns the **three separate shells** when each bowl is tilted 45
+        degrees. Rims that are far from coplanar want
+        [`holes.stitch_loops`][triwarp.holes.stitch_loops] or a per-pair
+        [`holes.bridge_edges`][triwarp.holes.bridge_edges] followed by a targeted fill, not this.
+
+        The reference implementation prints a diagnostic here and its own caller reports that
+        diagnostic **inverted**, which is worth knowing only as a reason not to trust a boolean of
+        this shape from anywhere: read the mesh.
+
+    Parameters
+    ----------
+    vertices
+        ``(n_vertices,)`` mesh vertex positions.
+    faces
+        Length-``3 * n_faces`` ``wp.int32`` flat triangle index buffer.
+    keep_largest
+        Drop every connected component but the one with the most faces, first.
+    join_components
+        Bridge the remaining open components together instead of leaving them separate.
+    max_iter
+        Cap on the alternating degeneracy / self-intersection rounds.
+    inner_iter
+        Cap on the cut-and-refill passes inside each self-intersection repair.
+
+    Returns
+    -------
+    new_vertices : wp.array[wp.vec3]
+        Positions of the repaired mesh, on ``vertices.device``.
+    new_faces : wp.array[wp.int32]
+        Flat face buffer of the repaired mesh.
+
+    Raises
+    ------
+    ValueError
+        If ``max_iter`` or ``inner_iter`` is negative.
+
+    See Also
+    --------
+    [`validation.is_watertight`][triwarp.validation.is_watertight]
+        The question this does not answer for you.
+    [`remove_small_components`][triwarp.repair.remove_small_components]
+    [`fix_self_intersections`][triwarp.repair.fix_self_intersections]
+    [`holes.fill_min_weight`][triwarp.holes.fill_min_weight]
+    [`make_normals_outward`][triwarp.repair.make_normals_outward]
+        What to run afterwards if the winding has to face outward as well as be consistent.
+    """
+    if max_iter < 0 or inner_iter < 0:
+        raise ValueError(
+            f"max_iter and inner_iter must be non-negative, got {max_iter}, {inner_iter}"
+        )
+
+    if int(faces.shape[0]) == 0:
+        return vertices, faces
+
+    # Stage 0. The reference does this inside its *loader*, which is why it is easy to leave out and
+    # why leaving it out is visible: measured on ``bunny_decimated``, whose 87 duplicated faces make
+    # it non-edge-manifold, the pipeline without this stage returns chi = 2 and one component and is
+    # still **not watertight**, because nothing downstream addresses a non-manifold edge.
+    vertices, faces, _remap = remove_unreferenced_vertices(vertices, faces)
+    faces = make_winding_consistent(faces)
+    vertices, faces, _source = split_non_manifold_vertices(vertices, faces)
+
+    if keep_largest:
+        vertices, faces = remove_small_components(vertices, faces, keep_largest=True)
+    if join_components:
+        faces = tw.holes.join_closest_components(vertices, faces)
+
+    faces = _fill_any_boundary(vertices, faces)
+    for _ in range(max_iter):
+        n_faces_before = int(faces.shape[0])
+        vertices, faces = remove_degenerate_faces(vertices, faces)
+        vertices, faces = collapse_small_triangles(vertices, faces)
+        vertices, faces = fix_self_intersections(vertices, faces, max_iter=inner_iter)
+        # Cutting an intersecting band out can *disconnect* the surface, so the component filter has
+        # to run again here and not only at the top: measured on a torus whose inner wall crosses
+        # itself, the local repair leaves two closed shells (chi = 4) where the input was one, and a
+        # single pass at the start cannot see a component that did not exist yet.
+        if keep_largest:
+            vertices, faces = remove_small_components(vertices, faces, keep_largest=True)
+        if int(faces.shape[0]) == n_faces_before:
+            break
+
+    # Stage 4 opens a rim whenever it cuts an intersecting region out, so the last fill is not a
+    # belt-and-braces repeat of stage 3 -- it is what makes the common case come back closed. And
+    # nothing geometric may run *after* it: filling a 3-vertex rim produces one sliver, degeneracy
+    # removal deletes that sliver and reopens the rim, and the two then trade the same 122 faces for
+    # ever. Measured on ``bunny_decimated``: closed at chi = 2 after the fill, chi = -56 with 58
+    # rims after one more degeneracy pass, and stable there -- so the fill goes last.
+    faces = _fill_any_boundary(vertices, faces)
+    if keep_largest:
+        vertices, faces = remove_small_components(vertices, faces, keep_largest=True)
+    return vertices, faces
+
+
+def _fill_any_boundary(
+    vertices: wp.array[wp.vec3], faces: wp.array[wp.int32]
+) -> wp.array[wp.int32]:
+    """Close every boundary loop, or hand the buffer back untouched when there is none."""
+    if int(tw.boundary.boundary_edges(vertices, faces).shape[0]) == 0:
+        return faces
+    return tw.holes.fill_min_weight(vertices, faces)
 
 
 def remove_unreferenced_vertices(

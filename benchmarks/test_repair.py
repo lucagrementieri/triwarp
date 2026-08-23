@@ -243,6 +243,64 @@ def _faces_with_non_manifold_wp(bench_case: BenchCase, extra: int) -> wp.array[w
     return _nonmanifold_cache[key]
 
 
+@pytest.mark.benchmark(group="make_solid")
+@pytest.mark.benchmeshes("bunny_decimated", "bunny")
+@pytest.mark.benchlibs("triwarp", "pymeshfix")
+def test_make_solid(bench_case: BenchCase) -> None:
+    """
+    The whole pipeline: broken scan in, single watertight solid out.
+
+    The one group in this file whose input is a real scan rather than an injected defect, because
+    the whole point of the composite is that the *distribution* of defects drives it -- 86 boundary
+    loops and 1 084 self-intersecting faces on ``bunny_decimated``, 5 loops and none on ``bunny``,
+    so the two meshes exercise different stages of the same call and the pair is the measurement.
+    Capped at ``bunny``: ``dragon`` is seconds of pymeshfix load plus seconds of query per round,
+    and the composite runs the self-intersection loop over all of it.
+
+    ``clean_from_arrays`` is pymeshfix's headline and this is the one group where its row is timed
+    rather than declared, because the operation clears the load by a wide margin: measured
+    **73 %** of the round on ``bunny_decimated`` (250.0 ms total against 67.9 ms of load) and
+    **68 %** on ``bunny`` (1 387.1 against 439.6). The load still cannot leave the timed callable --
+    a ``PyTMesh`` takes exactly one ``load_array`` -- so read the row as pipeline-plus-load and
+    subtract accordingly.
+
+    First measurement, medians on an RTX 5090:
+
+    | mesh | triwarp-cuda | pymeshfix |
+    |---|---|---|
+    | ``bunny_decimated`` | **22.9 ms** | 212.9 (9.3x) |
+    | ``bunny`` | **30.4 ms** | 1 279.0 (42.0x) |
+
+    The gap widens with the mesh because the composite's per-stage cost is a fixed chain of wrapper
+    calls plus device passes, where the reference is sequential C++ throughout. Read it knowing what
+    dominates triwarp's side, which is **not** kernel time: a dozen wrapper chains inside a
+    convergence loop, each a handful of launches. Anything spent optimizing this belongs in the
+    refill chain and the self-intersection loop, exactly as the ``fix_self_intersections`` group's
+    own note says; a faster kernel would not move it.
+
+    Both rows assert a watertight one-component answer rather than a count, since the two libraries
+    sacrifice different amounts of surface around a defect. On these two meshes they agree
+    closely -- ``bunny_decimated`` comes back at **8 188 v / 16 372 f from both**, watertight with
+    chi = 2 -- and ``tests/test_repair.py`` measures where they agree exactly (3.11e-08 on
+    interpenetrating shells) and where they do not (a self-intersecting torus, 0.400).
+    """
+    if bench_case.kind == "pymeshfix":
+        from pymeshfix import _meshfix
+
+        vertices_np = np.ascontiguousarray(bench_case.vertices_np, dtype=np.float64)
+        faces_np = np.ascontiguousarray(bench_case.faces_np, dtype=np.int32)
+        vertices_pmf, faces_pmf = bench_case.run(
+            lambda: _meshfix.clean_from_arrays(vertices_np, faces_np), rounds=3
+        )
+        assert tm.Trimesh(vertices_pmf, faces_pmf, process=False).is_watertight
+        return
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    solid_vertices, solid_faces = bench_case.run(
+        lambda: tw.repair.make_solid(vertices, faces), rounds=3
+    )
+    assert tw.validation.is_watertight(solid_vertices, solid_faces)
+
+
 @pytest.mark.benchmark(group="remove_small_components")
 @pytest.mark.benchaxis("components")
 @pytest.mark.benchlibs("triwarp", "pymeshlab", "open3d")

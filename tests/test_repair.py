@@ -11,6 +11,7 @@ import trimesh.repair as tm_repair
 import warp as wp
 from meshlib import mrmeshnumpy as mn
 from meshlib import mrmeshpy as mm
+from pymeshfix import _meshfix
 
 import triwarp as tw
 from tests.comparisons import (
@@ -35,6 +36,222 @@ from tests.conversions import (
     trimesh_to_pyvista,
     warp_to_trimesh,
 )
+
+# --------------------------------------------------------------------------------------
+# make_solid
+# --------------------------------------------------------------------------------------
+
+
+def _overlapping_spheres_tm() -> tm.Trimesh:
+    """Two ``icosphere(2)``s translated 1.2 apart: 72 of 640 faces self-intersect."""
+    first_tm = tm.creation.icosphere(subdivisions=2)
+    second_tm = tm.creation.icosphere(subdivisions=2)
+    second_tm.apply_translation([1.2, 0.0, 0.0])
+    return tm.util.concatenate([first_tm, second_tm])
+
+
+def _spaced_bowls_tm(count: int, gap: float = 3.0) -> tm.Trimesh:
+    """
+    Build ``count`` open hemispherical bowls in a row, each ``gap`` apart along ``x``.
+
+    Built here rather than from the ``hemisphere`` fixture, and the reason is a measured limit of
+    the pipeline rather than convenience: that fixture is rotated 45 degrees about ``(1, 1, 0)``, so
+    three spaced copies have three rims in three different planes, the loop they merge into is badly
+    non-planar, and the minimum-weight patch across it self-intersects. ``make_solid`` then cuts the
+    patch out and undoes the join -- measured, three separate shells back out (chi = 6), and 17 of
+    them at ``gap = 4.0`` on the CPU. With the bowls unrotated the answer is byte-identical at
+    ``gap`` 2.5 / 3.0 / 3.5 / 5.0 on both devices: 291 v / 578 f, chi = 2, one component.
+    """
+    sphere_tm = tm.creation.icosphere(subdivisions=2, radius=1.0)
+    bowl_tm = sphere_tm.slice_plane(
+        plane_origin=np.zeros(3), plane_normal=np.array([0.0, 0.0, 1.0]), cap=False
+    )
+    bowl_tm.merge_vertices()
+    shells_tm = []
+    for index in range(count):
+        shell_tm = bowl_tm.copy()
+        shell_tm.apply_translation([gap * index, 0.0, 0.0])
+        shells_tm.append(shell_tm)
+    return tm.util.concatenate(shells_tm)
+
+
+def _assert_is_a_solid(vertices_wp: wp.array, faces_wp: wp.array) -> tm.Trimesh:
+    """Assert the four post-conditions ``make_solid`` exists to establish, together."""
+    solid_tm = warp_to_trimesh(vertices_wp, faces_wp)
+    assert solid_tm.is_watertight
+    assert solid_tm.euler_number == 2
+    assert len(solid_tm.split(only_watertight=False)) == 1
+    assert int(tw.validation.face_self_intersecting_mask(vertices_wp, faces_wp).numpy().sum()) == 0
+    return solid_tm
+
+
+@pytest.mark.parity("make_solid", "pymeshfix")
+def test_make_solid_matches_pymeshfix_on_interpenetrating_shells(device: str) -> None:
+    """
+    Class C, and the strongest pipeline pair available: the two answers are the same surface.
+
+    ``clean_from_arrays`` is pymeshfix's headline and the reason anyone installs it -- broken
+    digitised surface in, single watertight solid out -- and this is triwarp's composite of the same
+    stages. On two ``icosphere(2)``s translated 1.2 apart (324 v / 640 f, 72 of them
+    self-intersecting) the two agree on **everything measurable**: 162 v / 320 f, watertight,
+    Euler characteristic 2, one component, no self-intersecting face, enclosed volume 4.0470, and a
+    two-sided surface distance of **3.11e-08**.
+
+    That is a class-C statement rather than a class-B one because nothing pairs the buffers: both
+    sides delete, refill and renumber, so only the surface and the derived scalars are comparable.
+
+    Mutation probe and margin: the *unrepaired* input sits **1.192** from pymeshfix's answer, so the
+    1e-6 bound asserted here is seven orders of magnitude clear of "did not repair it", and the
+    volume equality is what rules out the two having kept different shells.
+    """
+    mesh_tm = _overlapping_spheres_tm()
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
+
+    solid_wp, solid_faces_wp = tw.repair.make_solid(vertices_wp, faces_wp)
+    solid_tm = _assert_is_a_solid(solid_wp, solid_faces_wp)
+
+    vertices_pmf, faces_pmf = _meshfix.clean_from_arrays(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),
+        np.ascontiguousarray(mesh_tm.faces, dtype=np.int32),
+    )
+    solid_pmf = tm.Trimesh(vertices_pmf, faces_pmf, process=False)
+
+    # Non-vacuity: the reference really repaired the input rather than passing it through.
+    assert faces_pmf.shape[0] < mesh_tm.faces.shape[0]
+    assert solid_pmf.is_watertight
+    assert solid_pmf.euler_number == 2
+    assert int(solid_faces_wp.shape[0]) // 3 == faces_pmf.shape[0]
+    assert int(solid_wp.shape[0]) == vertices_pmf.shape[0]
+    assert np.isclose(solid_tm.volume, solid_pmf.volume, rtol=1e-5, atol=1e-5)
+    assert (
+        hausdorff_surface_two_sided(
+            np.asarray(solid_tm.vertices), solid_tm.faces, vertices_pmf, faces_pmf
+        )
+        < 1e-6
+    )
+
+
+@pytest.mark.parametrize("mesh_name", ["torus_self_intersecting", "bohemian_dome"])
+def test_make_solid_singular_curve_divergence(
+    request: pytest.FixtureRequest, mesh_name: str
+) -> None:
+    """
+    Not a parity assert: the input class where the two pipelines part, pinned with numbers.
+
+    A surface that crosses itself along a *curve* rather than in a band has no canonical repair --
+    every implementation has to decide how much surface to sacrifice around the singularity, and the
+    two decide differently. Measured, both ending in a watertight one-component solid with no
+    self-intersecting face:
+
+    | input | triwarp | pymeshfix | surface distance |
+    |---|---|---|---|
+    | ``torus_self_intersecting`` | 419 v, volume -9.60 | 80 v, volume -6.53 | **0.400** |
+    | ``bohemian_dome`` | 855 v, volume 1.42 | 747 v, volume -1.54 | **2.615** |
+
+    pymeshfix removes far more of the torus (80 vertices of 256) where triwarp cuts closer to the
+    intersection; on the dome both are far from the *input* too (2.61 and 2.22), which is what says
+    the gap is the question rather than either answer. So this test asserts the post-conditions on
+    both sides and records the divergence instead of bounding it -- a surface bound here would
+    either be loose enough to mean nothing or would pin one library's sacrifice as correct.
+
+    [`test_make_solid_matches_pymeshfix_on_interpenetrating_shells`] is where the pair *is*
+    comparable, and it carries the parity claim.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    n_faces = mesh_tm.faces.shape[0]
+    assert (
+        int(
+            tw.validation.face_self_intersecting_mask(mesh_wp.points, mesh_wp.indices).numpy().sum()
+        )
+        > 0
+    )
+
+    solid_wp, solid_faces_wp = tw.repair.make_solid(mesh_wp.points, mesh_wp.indices)
+    _assert_is_a_solid(solid_wp, solid_faces_wp)
+
+    vertices_pmf, faces_pmf = _meshfix.clean_from_arrays(
+        np.ascontiguousarray(mesh_tm.vertices, dtype=np.float64),
+        np.ascontiguousarray(mesh_tm.faces, dtype=np.int32),
+    )
+    solid_pmf = tm.Trimesh(vertices_pmf, faces_pmf, process=False)
+
+    assert solid_pmf.is_watertight
+    assert solid_pmf.euler_number == 2
+    # Both sacrificed surface rather than growing it, which is the one thing they do share here.
+    assert int(solid_faces_wp.shape[0]) // 3 < 2 * n_faces
+    assert faces_pmf.shape[0] < n_faces
+
+
+def test_make_solid_closes_and_connects_open_shells(device: str) -> None:
+    """
+    Not a library comparison: what ``keep_largest`` and ``join_components`` each mean.
+
+    Three open bowls 3.0 apart are the input that separates them, and both answers are solids --
+    which is the point: the flag chooses *which* solid. ``keep_largest`` (the default, and
+    ``clean_from_arrays``' own) keeps one shell and caps it, at 97 v / 190 f and volume 2.0235 --
+    the same volume pymeshfix reports on this input. Turning it off and welding instead gives one
+    connected solid of 291 v / 578 f and volume 6.0706 from all three, a combination no reference
+    here can produce: MeshFix has ``joincomp`` but not ``joincomp`` without its component filter.
+
+    The face count separates them independently of the volume, which is what makes the pair an
+    assertion about the flags rather than about the geometry: 190 against 578.
+
+    Both numbers are byte-identical across ``gap`` 2.5 / 3.0 / 3.5 / 5.0 and both devices. The input
+    is built rather than taken from the ``hemisphere`` fixture for a reason worth reading in
+    [`_spaced_bowls_tm`] -- with rotated bowls the welded path does *not* converge, which is a real
+    limit of the composite and is documented on ``make_solid`` itself.
+    """
+    mesh_tm = _spaced_bowls_tm(3)
+    vertices_wp, faces_wp = numpy_to_warp(mesh_tm.vertices, mesh_tm.faces, device)
+
+    largest_wp, largest_faces_wp = tw.repair.make_solid(vertices_wp, faces_wp)
+    largest_tm = _assert_is_a_solid(largest_wp, largest_faces_wp)
+
+    welded_wp, welded_faces_wp = tw.repair.make_solid(
+        vertices_wp, faces_wp, keep_largest=False, join_components=True
+    )
+    welded_tm = _assert_is_a_solid(welded_wp, welded_faces_wp)
+
+    assert int(largest_faces_wp.shape[0]) // 3 < mesh_tm.faces.shape[0] // 2
+    assert welded_tm.volume > 2.5 * largest_tm.volume
+    assert int(welded_faces_wp.shape[0]) > int(largest_faces_wp.shape[0])
+
+
+def test_make_solid_leaves_a_solid_alone(icosphere_coarse: tuple[tm.Trimesh, wp.Mesh]) -> None:
+    """
+    Not a library comparison: a mesh that is already a solid comes back as one, unchanged in size.
+
+    The idempotence case, and the one that would catch a pipeline that "repairs" a clean input --
+    a filler that patched a hole that was not there, or a component filter that dropped the mesh.
+    The counts are asserted exactly rather than bounded, since nothing here has anything to do.
+    """
+    mesh_tm, mesh_wp = icosphere_coarse
+
+    solid_wp, solid_faces_wp = tw.repair.make_solid(mesh_wp.points, mesh_wp.indices)
+    solid_tm = _assert_is_a_solid(solid_wp, solid_faces_wp)
+
+    assert int(solid_faces_wp.shape[0]) // 3 == mesh_tm.faces.shape[0]
+    assert int(solid_wp.shape[0]) == mesh_tm.vertices.shape[0]
+    assert np.isclose(solid_tm.volume, mesh_tm.volume, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("kwargs", [{"max_iter": -1}, {"inner_iter": -1}])
+def test_make_solid_rejects_negative_iteration_caps(
+    icosphere_coarse: tuple[tm.Trimesh, wp.Mesh], kwargs: dict[str, int]
+) -> None:
+    """The documented ``ValueError``, for each of the two caps."""
+    _mesh_tm, mesh_wp = icosphere_coarse
+    with pytest.raises(ValueError, match="must be non-negative"):
+        tw.repair.make_solid(mesh_wp.points, mesh_wp.indices, **kwargs)
+
+
+def test_make_solid_empty_mesh(device: str) -> None:
+    """An empty mesh comes back unchanged rather than raising."""
+    vertices_wp = wp.zeros(0, dtype=wp.vec3, device=device)
+    faces_wp = wp.zeros(0, dtype=wp.int32, device=device)
+    solid_wp, solid_faces_wp = tw.repair.make_solid(vertices_wp, faces_wp)
+    assert int(solid_wp.shape[0]) == 0
+    assert int(solid_faces_wp.shape[0]) == 0
 
 
 def _resolve_duplicated_faces_ref(faces_np: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1721,6 +1938,97 @@ def test_split_non_manifold_vertices_matches_pymeshfix(device: str) -> None:
     assert int(split_faces_wp.shape[0]) // 3 == faces_pmf.shape[0]
     assert tw.validation.is_vertex_manifold(split_faces_wp)
     assert tw.validation.is_vertex_manifold(numpy_to_warp(vertices_pmf, faces_pmf, device)[1])
+
+
+@pytest.mark.parity(
+    "remove_degenerate_faces",
+    "pymeshfix",
+    benchmarked=False,
+    reason="strong_degeneracy_removal is 7-13 % of a pymeshfix round -- 5.4 ms against 77.4 ms of "
+    "load on bunny_decimated, 66.8 against 432.2 on bunny -- and a PyTMesh takes exactly one "
+    "load_array, so the build cannot leave the timed callable and the row would be the load. "
+    "meshlib carries the timed row for this group.",
+)
+@pytest.mark.parametrize("n_degenerate", [1, 3])
+def test_remove_degenerate_faces_matches_pymeshfix(device: str, n_degenerate: int) -> None:
+    """
+    Class B: on **exactly** degenerate input the two recover the identical clean mesh.
+
+    ``strong_degeneracy_removal`` deletes zero-area faces, refills what that opens and iterates, so
+    the comparison is on the recovered mesh rather than on which faces went: appending ``k``
+    zero-area triangles to an ``icosphere(2)`` (each a duplicated vertex, so the area is exactly
+    zero in ``float64`` and in ``float32``), both sides come back at **162 v / 320 f, watertight,
+    Euler characteristic 2, volume 4.0470** -- the clean sphere, for ``k`` = 1 and 3. The transform
+    is that pymeshfix's loader cuts before the removal runs (163 v in, 165 v loaded), so only the
+    recovered counts are comparable, not the intermediate.
+
+    The near-degenerate class is where they part, and it is a *precision* difference rather than a
+    tolerance one: TMesh's coordinates are ``double``, so a flat 12-column strip offset by ``1e-9``
+    is **not** degenerate to it and comes back unchanged at 24 v / 22 f, where triwarp's ``float32``
+    altitude test removes the whole strip. On the *exactly* collinear version of the same strip both
+    reduce it to 0 v / 0 f. So this comparison runs on exact degeneracy on purpose -- a
+    near-degenerate fixture would be pinning float32 against float64 and calling it a disagreement.
+    """
+    mesh_tm = tm.creation.icosphere(subdivisions=2)
+    n_vertices = mesh_tm.vertices.shape[0]
+    vertices_np = np.vstack([mesh_tm.vertices, mesh_tm.vertices[:n_degenerate]])
+    zero_area_np = np.array(
+        [[i, (i + 1) % n_vertices, n_vertices + i] for i in range(n_degenerate)]
+    )
+    faces_np = np.vstack([mesh_tm.faces, zero_area_np])
+
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    kept_wp, kept_faces_wp = tw.repair.remove_degenerate_faces(vertices_wp, faces_wp)
+    kept_tm = warp_to_trimesh(kept_wp, kept_faces_wp)
+
+    tin_pmf = numpy_to_pymeshfix(vertices_np, faces_np)
+    assert tin_pmf.n_faces == faces_np.shape[0]  # the loader kept the faces, cutting vertices only
+    assert tin_pmf.strong_degeneracy_removal(3)
+    vertices_pmf, faces_pmf = pymeshfix_to_numpy(tin_pmf)
+    kept_pmf = tm.Trimesh(vertices_pmf, faces_pmf, process=False)
+
+    # Non-vacuity: the reference removed the degeneracies rather than passing the mesh through.
+    assert faces_pmf.shape[0] == mesh_tm.faces.shape[0] < faces_np.shape[0]
+    assert vertices_pmf.shape[0] == n_vertices
+    assert int(kept_faces_wp.shape[0]) // 3 == faces_pmf.shape[0]
+    assert int(kept_wp.shape[0]) == vertices_pmf.shape[0]
+    assert kept_tm.is_watertight
+    assert kept_pmf.is_watertight
+    assert kept_tm.euler_number == 2
+    assert kept_pmf.euler_number == 2
+    assert np.isclose(kept_tm.volume, kept_pmf.volume, rtol=1e-5, atol=1e-5)
+
+
+def test_remove_degenerate_faces_near_degenerate_divergence(device: str) -> None:
+    """
+    Not a parity assert: the precision boundary, pinned so the class-B pair above stays honest.
+
+    A flat strip 12 columns long, offset by ``1e-9`` in ``y``. TMesh stores coordinates in
+    ``double``, where ``1e-9`` is emphatically not zero, so ``strong_degeneracy_removal`` returns
+    ``True`` having changed **nothing** (24 v / 22 f in and out); triwarp's altitude test runs on
+    the ``float32`` vertex buffer and removes the entire strip. Set the offset to exactly zero and
+    both reduce it to 0 v / 0 f.
+
+    Neither is wrong -- it is the same predicate at two precisions -- and recording it is what stops
+    a future author reading the exact-degeneracy comparison as a general one.
+    """
+    columns = 12
+    x_np = np.repeat(np.arange(columns, dtype=np.float64), 2)
+    quads_np = np.array(
+        [[2 * i, 2 * i + 2, 2 * i + 1] for i in range(columns - 1)]
+        + [[2 * i + 1, 2 * i + 2, 2 * i + 3] for i in range(columns - 1)]
+    )
+    for offset, pmf_faces, triwarp_faces in ((1e-9, 22, 0), (0.0, 0, 0)):
+        vertices_np = np.stack(
+            [x_np, np.tile([0.0, offset], columns), np.zeros(2 * columns)], axis=1
+        )
+        tin_pmf = numpy_to_pymeshfix(vertices_np, quads_np)
+        tin_pmf.strong_degeneracy_removal(3)
+        assert tin_pmf.n_faces == pmf_faces, offset
+
+        vertices_wp, faces_wp = numpy_to_warp(vertices_np, quads_np, device)
+        _kept_wp, kept_faces_wp = tw.repair.remove_degenerate_faces(vertices_wp, faces_wp)
+        assert int(kept_faces_wp.shape[0]) // 3 == triwarp_faces, offset
 
 
 def test_remove_degenerate_faces_matches_trimesh(device: str) -> None:
