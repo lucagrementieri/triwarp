@@ -1101,6 +1101,70 @@ def test_revolve_absolute_tolerance_is_scale_dependent(device: str) -> None:
 # --- extrusion and polygons -------------------------------------------------------------
 
 
+@pytest.mark.parity("extrude_polygon", "pyvista", "open3d")
+@pytest.mark.parametrize("ring_size", [8, 32])
+def test_extrude_polygon_matches_pyvista_and_open3d(device: str, ring_size: int) -> None:
+    """
+    Class A on the counts and the solid: a convex ring extrudes to the same mesh in all three.
+
+    A convex ring is used deliberately rather than the L-shape the trimesh comparison below runs on.
+    The cap admits only one triangulation up to a rotation of the fan there, so the *counts* are
+    comparable exactly -- ``2 * (n - 2)`` cap triangles plus ``2 * n`` wall triangles, measured
+    **64** vertices and **124** faces from all three on a 32-gon, watertight with chi = 2.
+
+    The split between the two references is who triangulates the cap, and it decides how each one is
+    handed the input:
+
+    * **pyvista** ``extrude((0, 0, h), capping=True)`` takes a ``PolyData`` whose single polygon
+      *cell* is the cap, so VTK triangulates on the way out and ``.triangulate()`` is required --
+      without it the result carries polygons, not triangles, and the cell count is not comparable.
+    * **open3d** ``extrude_linear`` walls an **already triangulated** mesh; it does not triangulate
+      a ring, so the cap fan is built here. Its faces must be ``Int32``/``Int64`` -- a ``UInt32``
+      tensor raises ``Tensor has dtype UInt32, but is expected to have dtype among {Int32, Int64}``,
+      although ``RaycastingScene.add_triangles`` accepts one. Two conventions inside one API.
+
+    Both also want 3-D points where triwarp's signature takes ``wp.vec2``, which is the only other
+    transform.
+
+    **Bug class excluded:** a wall band that skips or doubles a quad, which the face count catches,
+    and an unclosed solid, which the watertightness and chi asserts catch on every side.
+    """
+    angle_np = 2.0 * np.pi * np.arange(ring_size) / ring_size
+    ring_np = np.column_stack([np.cos(angle_np), np.sin(angle_np)])
+    ring3_np = np.column_stack([ring_np, np.zeros(ring_size)])
+    n_expected = 2 * (ring_size - 2) + 2 * ring_size
+
+    vertices_wp, faces_wp = tw.creation.extrude_polygon(points_to_warp_uv(ring_np, device), 1.0)
+    mesh_wp = warp_to_trimesh(vertices_wp, faces_wp)
+    assert int(vertices_wp.shape[0]) == 2 * ring_size
+    assert int(faces_wp.shape[0]) // 3 == n_expected
+    assert mesh_wp.is_watertight
+    assert mesh_wp.euler_number == 2
+
+    polygon_pv = pv.PolyData(ring3_np, faces=np.hstack([[ring_size], np.arange(ring_size)]))
+    extruded_pv = polygon_pv.extrude((0.0, 0.0, 1.0), capping=True).triangulate()
+    mesh_pv = tm.Trimesh(
+        np.asarray(extruded_pv.points), np.asarray(extruded_pv.regular_faces), process=False
+    )
+
+    fan_np = np.array([[0, i, i + 1] for i in range(1, ring_size - 1)], dtype=np.int32)
+    disc_o3d = o3d.t.geometry.TriangleMesh(
+        o3d.core.Tensor(np.ascontiguousarray(ring3_np, dtype=np.float64)),
+        o3d.core.Tensor(np.ascontiguousarray(fan_np)),
+    )
+    extruded_o3d = disc_o3d.extrude_linear([0.0, 0.0, 1.0])
+    mesh_o3d = tm.Trimesh(
+        extruded_o3d.vertex.positions.numpy(), extruded_o3d.triangle.indices.numpy(), process=False
+    )
+
+    for reference_tm in (mesh_pv, mesh_o3d):
+        assert reference_tm.vertices.shape[0] == 2 * ring_size
+        assert reference_tm.faces.shape[0] == n_expected
+        assert reference_tm.is_watertight
+        assert reference_tm.euler_number == 2
+        assert np.isclose(abs(reference_tm.volume), abs(mesh_wp.volume), rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.parametrize("ring_name", ["square", "L"])
 @pytest.mark.parametrize("height", [0.5, -0.5])
 @pytest.mark.parity("extrude_polygon", "trimesh")

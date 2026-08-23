@@ -28,8 +28,14 @@ being measured on both sides, not factored out.
   Its ``resolution`` is the *latitude* count and it derives longitude as ``2 * resolution``, so it
   is given ``sections // 2`` to land on the same face count.
 - ``create_icosahedron`` exists but is never subdivided, so ``icosphere`` has **no** open3d
-  counterpart, and neither do ``revolve``, ``annulus``, ``capsule``, ``extrude_polygon``,
-  ``sweep_polygon``, ``truncated_prisms``, ``axis`` or ``random_soup``.
+  counterpart, and neither do ``revolve``, ``annulus``, ``capsule``, ``sweep_polygon``,
+  ``truncated_prisms``, ``axis`` or ``random_soup``.
+- ``extrude_polygon`` **does** have one, in the tensor API: ``o3d.t.geometry.TriangleMesh``'s
+  ``extrude_linear``. An earlier version of this list said otherwise. It walls an *already
+  triangulated* mesh rather than triangulating a ring, so its row is the walls alone and the cap fan
+  is built outside the timed callable -- and its faces must be ``Int32``/``Int64``, where
+  ``RaycastingScene.add_triangles`` takes ``UInt32``. pyvista's ``extrude(capping=True)`` is the
+  third implementation and does triangulate the cap, like trimesh and triwarp.
 
 open3d builds these on the CPU in C++ with per-vertex loops, so at low resolution it wins on launch
 latency and at high resolution the comparison is the intended one: loop-per-vertex versus one kernel
@@ -642,11 +648,54 @@ def test_revolve(bench_lib: BenchLibrary, sections: int) -> None:
 
 
 @pytest.mark.benchmark(group="extrude_polygon")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pyvista", "open3d")
 @pytest.mark.parametrize("ring_size", [64, 1024])
 def test_extrude_polygon(bench_lib: BenchLibrary, ring_size: int) -> None:
-    # Dominated by the ear-clipping triangulation of the ring, which is the interesting part: a
-    # convex ring takes triwarp's single-fan fast path. No open3d counterpart.
+    """
+    Cap, extrude and wall a closed ring: dominated by the cap triangulation.
+
+    A convex ring takes triwarp's single-fan fast path, which is what makes the ear clipper the
+    interesting part of the other rows rather than of this one.
+
+    Three references, and the split between them is **who triangulates the cap**:
+
+    * **trimesh** ``creation.extrude_polygon`` takes a shapely polygon and triangulates it itself,
+      so its row includes the cap -- the same work triwarp's does.
+    * **pyvista** ``extrude((0, 0, h), capping=True)`` takes a ``PolyData`` whose single polygon
+      *cell* is the cap, so VTK triangulates on the way out; ``.triangulate()`` is inside the row
+      because without it the result is polygons rather than triangles and the counts are not
+      comparable.
+    * **open3d** ``extrude_linear`` takes an **already triangulated** disc, so its row is the walls
+      alone and is the lower bound of the three. Its faces must be ``Int32``/``Int64`` -- a
+      ``UInt32`` tensor raises, although ``RaycastingScene.add_triangles`` accepts one, which is the
+      same two-conventions-in-one-API note ``benchmarks/test_ray.py`` records.
+
+    All three land on the same mesh: measured on a 32-gon, **64** vertices and **124** faces from
+    every one, watertight with chi = 2 (``tests/test_creation.py``).
+    """
+    if bench_lib.kind == "pyvista":
+        # ``_ring_np`` is the 2-D ring triwarp's ``wp.vec2`` signature takes; both references
+        # want 3-D points.
+        ring_np = np.column_stack([_ring_np(ring_size), np.zeros(ring_size)])
+        polygon_pv = pv.PolyData(ring_np, faces=np.hstack([[ring_size], np.arange(ring_size)]))
+        extruded_pv = bench_lib.run(
+            lambda: polygon_pv.extrude((0.0, 0.0, 1.0), capping=True).triangulate()
+        )
+        assert extruded_pv.n_cells == 2 * (ring_size - 2) + 2 * ring_size
+        return
+    if bench_lib.kind == "open3d":
+        import open3d as o3d
+
+        ring_np = np.column_stack([_ring_np(ring_size), np.zeros(ring_size)])
+        # Already-triangulated cap: extrude_linear walls a mesh, it does not triangulate a ring.
+        fan_np = np.array([[0, i, i + 1] for i in range(1, ring_size - 1)], dtype=np.int32)
+        disc_o3d = o3d.t.geometry.TriangleMesh(
+            o3d.core.Tensor(np.ascontiguousarray(ring_np, dtype=np.float64)),
+            o3d.core.Tensor(np.ascontiguousarray(fan_np)),
+        )
+        extruded_o3d = bench_lib.run(lambda: disc_o3d.extrude_linear([0.0, 0.0, 1.0]))
+        assert int(extruded_o3d.triangle.indices.shape[0]) == 2 * (ring_size - 2) + 2 * ring_size
+        return
     if bench_lib.kind == "triwarp":
         ring_wp = _ring_wp(ring_size, str(bench_lib.device))
         _, faces_wp = bench_lib.run(lambda: tw.creation.extrude_polygon(ring_wp, 1.0))
