@@ -13,7 +13,7 @@ def point_plane_distance(
     # Signed perpendicular distance: the shared unnormalized plane dot divided by the normal
     # length, so a non-unit ``plane_normal`` behaves like trimesh's reference. This is the only
     # caller that needs the division, so the dot stays the primitive.
-    return point_plane_dot(point, plane_origin, plane_normal) / wp.length(plane_normal)
+    return point_plane_dot(point, plane_normal, plane_origin) / wp.length(plane_normal)
 
 
 @wp.func
@@ -22,7 +22,7 @@ def is_in_half_space(point: wp.vec3, plane_normal: wp.vec3, plane_origin: wp.vec
     # the dot matters, which is why this reads the unnormalized primitive rather than
     # ``point_plane_distance``: a non-unit normal cannot change the answer and the division cannot
     # change the sign, but it can turn a large dot into an infinity.
-    return point_plane_dot(point, plane_origin, plane_normal) > 0.0
+    return point_plane_dot(point, plane_normal, plane_origin) > 0.0
 
 
 @wp.func

@@ -579,7 +579,7 @@ def test_segments_with_plane(bench_case: BenchCase) -> None:
         normal = wp.vec3(*_PLANE_NORMAL.tolist())
         plane_origin = wp.vec3(*origin.tolist())
         _points, valid = bench_case.run(
-            lambda: tw.intersection.segments_with_plane(start, end, plane_origin, normal)
+            lambda: tw.intersection.segments_with_plane(start, end, normal, plane_origin)
         )
         assert valid.shape[0] == start_np.shape[0]
     else:

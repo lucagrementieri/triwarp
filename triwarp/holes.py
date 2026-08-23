@@ -1078,8 +1078,8 @@ def refill_region(
 def extend_hole(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
-    plane_origin: wp.vec3,
     plane_normal: wp.vec3,
+    plane_origin: wp.vec3,
     loops: Sequence[wp.array[wp.int32]] | None = None,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
@@ -1102,11 +1102,11 @@ def extend_hole(
         ``(n_vertices,)`` mesh vertex positions.
     faces
         Length-``3 * n_faces`` ``wp.int32`` triangle index buffer.
-    plane_origin
-        A point on the target plane.
     plane_normal
         The plane's normal. Need not be unit length in principle, but **is assumed to be** -- the
         projection scales with it otherwise. Normalize it.
+    plane_origin
+        A point on the target plane.
     loops
         Rims to extend. ``None`` extends every one, via
         [`boundary_loops`][triwarp.boundary.boundary_loops]; pass a subset to extend only those.
@@ -1144,7 +1144,7 @@ def extend_hole(
     if packed is None:
         return wp.clone(vertices), wp.clone(faces)
     origins = wp.full(packed.n_loops, plane_origin, dtype=wp.vec3, device=faces.device)
-    return _extend_packed_rims(vertices, faces, packed, origins, plane_normal)
+    return _extend_packed_rims(vertices, faces, packed, plane_normal, origins)
 
 
 def build_bottom(
@@ -1226,7 +1226,7 @@ def build_bottom(
         wp.float32(hole_extension),
         out=origins,
     )
-    return _extend_packed_rims(vertices, faces, packed, origins, direction)
+    return _extend_packed_rims(vertices, faces, packed, direction, origins)
 
 
 class _PackedRims(NamedTuple):
@@ -1268,8 +1268,8 @@ def _extend_packed_rims(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     rims: _PackedRims,
-    plane_origins: wp.array[wp.vec3],
     plane_normal: wp.vec3,
+    plane_origins: wp.array[wp.vec3],
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """Project every packed rim vertex onto its loop's plane and bridge the two rings."""
     device = faces.device
@@ -1284,8 +1284,8 @@ def _extend_packed_rims(
             vertices,
             rims.indices,
             rims.loop_id,
-            plane_origins,
             plane_normal,
+            plane_origins,
             extended_vertices[n_vertices:],
         ],
         device=device,

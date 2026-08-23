@@ -401,7 +401,7 @@ def test_fit_plane(bench_case: BenchCase) -> None:
         return
     if bench_case.kind == "triwarp":
         points = bench_case.vertices_wp
-        centroid, normal = bench_case.run(lambda: tw.points.fit_plane(points))
+        normal, centroid = bench_case.run(lambda: tw.points.fit_plane(points))
         assert len(centroid) == 3
         assert len(normal) == 3
     else:

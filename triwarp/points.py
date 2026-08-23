@@ -301,9 +301,13 @@ def fit_plane(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     Returns
     -------
     tuple[wp.vec3, wp.vec3]
-        ``(centroid, normal)`` where ``centroid`` is a point on the plane
-        and ``normal`` is its unit normal. The normal is sign-ambiguous: its
-        orientation is governed by the SVD convention.
+        ``(normal, centroid)`` where ``normal`` is the plane's unit normal and ``centroid`` is a
+        point on it. The normal is sign-ambiguous: its orientation is governed by the SVD
+        convention. Orientation first, position last, matching
+        [`principal_axes`][triwarp.points.principal_axes] and
+        [`bounds.oriented_bounding_box`][triwarp.bounds.oriented_bounding_box] -- and so the pair
+        splats directly into the ``(plane_normal, plane_origin)`` argument order every plane entry
+        point takes. [`trimesh.points.plane_fit`][] returns the two the other way round.
 
     See Also
     --------
@@ -315,6 +319,7 @@ def fit_plane(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
     device = points.device
     n = int(points.shape[0])
     if n == 0:
+        # Both zero, so the order is readability rather than behaviour: normal, then centroid.
         return wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0)
 
     # Pass 1: centroid (plane origin) on-device.
@@ -334,7 +339,7 @@ def fit_plane(points: wp.array[wp.vec3]) -> tuple[wp.vec3, wp.vec3]:
         inputs=[center, cov, out_centroid, out_normal],
         device=device,
     )
-    return (out_centroid.list()[0], out_normal.list()[0])
+    return (out_normal.list()[0], out_centroid.list()[0])
 
 
 def plane_basis(normal: wp.vec3) -> tuple[wp.vec3, wp.vec3]:

@@ -1899,7 +1899,7 @@ def test_extend_hole_matches_meshlib(request: pytest.FixtureRequest, mesh_name: 
 
     height = float(np.asarray(mesh_tm.vertices)[:, 2].max()) + 1.0
     extended_vertices_wp, extended_faces_wp = tw.holes.extend_hole(
-        vertices_wp, faces_wp, wp.vec3(0.0, 0.0, height), wp.vec3(0.0, 0.0, 1.0)
+        vertices_wp, faces_wp, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, height)
     )
     assert int(extended_vertices_wp.shape[0]) == n_vertices + rim_total
     assert int(extended_faces_wp.shape[0]) // 3 == n_faces + 2 * rim_total
@@ -1935,7 +1935,7 @@ def test_extend_hole_then_fill_is_watertight(hemisphere: tuple[tm.Trimesh, wp.Me
     vertices_wp, faces_wp = mesh_wp.points, mesh_wp.indices
     height = float(np.asarray(mesh_tm.vertices)[:, 2].max()) + 0.5
     extended_vertices_wp, extended_faces_wp = tw.holes.extend_hole(
-        vertices_wp, faces_wp, wp.vec3(0.0, 0.0, height), wp.vec3(0.0, 0.0, 1.0)
+        vertices_wp, faces_wp, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, height)
     )
     capped_faces_wp = tw.holes.fill_min_weight(extended_vertices_wp, extended_faces_wp)
     capped_tm = warp_to_trimesh(extended_vertices_wp, capped_faces_wp)
@@ -1947,7 +1947,7 @@ def test_extend_hole_then_fill_is_watertight(hemisphere: tuple[tm.Trimesh, wp.Me
     assert abs(capped_tm.volume) > 0.0
 
     same_vertices_wp, same_faces_wp = tw.holes.extend_hole(
-        vertices_wp, faces_wp, wp.vec3(0.0, 0.0, height), wp.vec3(0.0, 0.0, 1.0), []
+        vertices_wp, faces_wp, wp.vec3(0.0, 0.0, 1.0), wp.vec3(0.0, 0.0, height), []
     )
     assert np.array_equal(same_faces_wp.numpy(), faces_wp.numpy())
     assert np.array_equal(same_vertices_wp.numpy(), vertices_wp.numpy())
@@ -1955,8 +1955,8 @@ def test_extend_hole_then_fill_is_watertight(hemisphere: tuple[tm.Trimesh, wp.Me
         tw.holes.extend_hole(
             vertices_wp,
             faces_wp,
-            wp.vec3(0.0, 0.0, height),
             wp.vec3(0.0, 0.0, 1.0),
+            wp.vec3(0.0, 0.0, height),
             [wp.zeros(3, dtype=wp.float32, device=faces_wp.device)],
         )
 

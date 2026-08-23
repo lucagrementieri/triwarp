@@ -126,8 +126,8 @@ def test_segments_with_plane_axis_aligned(device: str) -> None:
     intersections_wp, valid_wp = tw.intersection.segments_with_plane(
         start_points_wp,
         end_points_wp,
-        wp.vec3(*plane_origin.tolist()),
         wp.vec3(*plane_normal.tolist()),
+        wp.vec3(*plane_origin.tolist()),
         line_segments=True,
     )
 
@@ -158,8 +158,8 @@ def test_segments_with_plane_parallel(device: str) -> None:
     _, valid_wp = tw.intersection.segments_with_plane(
         start_points_wp,
         end_points_wp,
-        wp.vec3(*plane_origin.tolist()),
         wp.vec3(*plane_normal.tolist()),
+        wp.vec3(*plane_origin.tolist()),
         line_segments=True,
     )
     assert np.array_equal(valid_wp.numpy(), valid_tm)

@@ -558,7 +558,7 @@ def test_extend_hole(bench_case: BenchCase) -> None:
     origin = wp.vec3(0.0, 0.0, height)
     normal = wp.vec3(0.0, 0.0, 1.0)
     extended_vertices, extended_faces = bench_case.run(
-        lambda: tw.holes.extend_hole(vertices, faces, origin, normal, loops), rounds=3
+        lambda: tw.holes.extend_hole(vertices, faces, normal, origin, loops), rounds=3
     )
     assert int(extended_faces.shape[0]) > int(faces.shape[0])
     assert int(extended_vertices.shape[0]) > bench_case.n_vertices

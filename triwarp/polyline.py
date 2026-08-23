@@ -650,6 +650,11 @@ def polyline_radius(
     normal
         Plane normal (need not be unit). Defaults to
         [`polyline_normal`][triwarp.polyline.polyline_normal].
+
+        These two are the circle's frame, not a cutting plane, so they deliberately keep their own
+        names and their own order rather than the ``(plane_normal, plane_origin)`` convention every
+        plane argument in the package follows -- both are keyword-defaulted here, and calling them
+        a plane would misdescribe the geometry.
     closed
         When ``True``, treat the polyline as a loop: the closing edge back to the first point is
         added if absent (see [`close_polyline`][triwarp.polyline.close_polyline]), so the closing

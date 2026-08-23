@@ -949,8 +949,8 @@ def project_loop_to_plane(
     vertices: wp.array[wp.vec3],
     loop_vertices: wp.array[wp.int32],
     loop_id: wp.array[wp.int32],
-    plane_origins: wp.array[wp.vec3],
     plane_normal: wp.vec3,
+    plane_origins: wp.array[wp.vec3],
     out_positions: wp.array[wp.vec3],
 ) -> None:
     # Each rim vertex's orthogonal projection onto its loop's plane. The *ring* of these is what the

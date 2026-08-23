@@ -267,7 +267,7 @@ def test_fit_plane_matches_meshlib(device: str) -> None:
         [2.0, -1.0, 0.5]
     )
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
-    centroid_wp, normal_wp = tw.fit_plane(points_wp)
+    normal_wp, centroid_wp = tw.fit_plane(points_wp)
 
     plane_ml = _point_accumulator_ml(points_np).getBestPlanef()
     normal_ml = np.array([plane_ml.n.x, plane_ml.n.y, plane_ml.n.z], dtype=np.float64)
@@ -434,7 +434,7 @@ def test_fit_plane(device: str) -> None:
     normal_pml /= np.linalg.norm(normal_pml)
 
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
-    centroid_wp, normal_wp = tw.fit_plane(points_wp)
+    normal_wp, centroid_wp = tw.fit_plane(points_wp)
 
     assert np.allclose(np.array(centroid_wp), centroid_tm, rtol=1e-4, atol=1e-4)
     # normal is sign-ambiguous: compare up to sign.
@@ -464,7 +464,7 @@ def test_fit_plane_normal_matches_pyvista(device: str) -> None:
     _plane_pv, centre_pv, normal_pv = pv.fit_plane_to_points(points_np, return_meta=True)
 
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
-    centroid_wp, normal_wp = tw.fit_plane(points_wp)
+    normal_wp, centroid_wp = tw.fit_plane(points_wp)
 
     assert np.isclose(
         abs(float(np.dot(np.array(normal_wp), np.asarray(normal_pv)))), 1.0, atol=1e-4
@@ -551,7 +551,7 @@ def test_fit_plane_large(device: str) -> None:
     centroid_tm, normal_tm = tm.plane_fit(points_np)
 
     points_wp = wp.array(points_np.astype(np.float32), dtype=wp.vec3, device=device)
-    centroid_wp, normal_wp = tw.fit_plane(points_wp)
+    normal_wp, centroid_wp = tw.fit_plane(points_wp)
 
     assert np.allclose(np.array(centroid_wp), centroid_tm, rtol=1e-4, atol=1e-4)
     assert np.isclose(np.abs(np.dot(np.array(normal_wp), normal_tm)), 1.0, atol=1e-4)

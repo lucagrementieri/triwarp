@@ -12,6 +12,12 @@ not repeating their first point, and a parallel list of closed flags.
 [`mesh_with_mesh`][triwarp.intersection.mesh_with_mesh] is the genuine intersection in the set
 sense, and [`slice_mesh_with_plane`][triwarp.intersection.slice_mesh_with_plane] keeps the cut
 geometry rather than the curve.
+
+Every entry point here that takes a plane takes it as ``(plane_normal, plane_origin)``, in that
+order, and so does every plane argument elsewhere in the package. Both are ``wp.vec3``, so a
+transposed call type-checks and sections the wrong plane -- pass them by keyword where the call site
+is not obvious. [`points.fit_plane`][triwarp.points.fit_plane] returns the pair in this order, so
+its result splats straight into any of them.
 """
 
 from __future__ import annotations
@@ -32,8 +38,8 @@ from triwarp.kernels import triangles as kernel_triangles
 def segments_with_plane(
     start_points: wp.array[wp.vec3],
     end_points: wp.array[wp.vec3],
-    plane_origin: wp.vec3,
     plane_normal: wp.vec3,
+    plane_origin: wp.vec3,
     *,
     line_segments: bool = True,
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.bool]]:
@@ -46,10 +52,10 @@ def segments_with_plane(
 
     Parameters
     ----------
-    plane_origin
-        Point on the plane.
     plane_normal
         Plane normal vector.
+    plane_origin
+        Point on the plane.
     start_points
         ``(n,)`` first endpoint of each segment.
     end_points
@@ -81,8 +87,8 @@ def segments_with_plane(
 
     wp.map(
         kernel_intersections.plane_with_line,
-        plane_origin,
         plane_normal,
+        plane_origin,
         start_points,
         end_points,
         wp.bool(line_segments),
@@ -135,14 +141,14 @@ def mesh_with_plane(
             return empty_segments, wp.empty(0, dtype=wp.int32, device=device)
         return empty_segments
 
-    vertex_dots = _plane_dots(vertices, plane_origin, plane_normal)
+    vertex_dots = _plane_dots(vertices, plane_normal, plane_origin)
 
     valid = wp.empty(n_faces, dtype=wp.bool, device=device)
     segments = wp.empty((n_faces, 2), dtype=wp.vec3, device=device)
     wp.launch(
         kernel_intersections.mesh_with_plane_segments,
         dim=n_faces,
-        inputs=[vertices, faces, vertex_dots, plane_origin, plane_normal, valid, segments],
+        inputs=[vertices, faces, vertex_dots, plane_normal, plane_origin, valid, segments],
         device=device,
     )
 
@@ -757,7 +763,7 @@ def slice_mesh_with_plane(
     return _clip_with_vertex_field(
         vertices,
         faces,
-        _plane_dots(vertices, plane_origin, plane_normal),
+        _plane_dots(vertices, plane_normal, plane_origin),
         plane_normal=plane_normal,
     )
 
@@ -863,7 +869,7 @@ def split_mesh_with_plane(
     if n_vertices == 0 or n_faces == 0:
         return wp.clone(vertices), wp.clone(faces), wp.empty(n_faces, dtype=wp.bool, device=device)
 
-    vertex_dots = _plane_dots(vertices, plane_origin, plane_normal)
+    vertex_dots = _plane_dots(vertices, plane_normal, plane_origin)
 
     unique_edges, inverse = tw.edges.edges_unique(faces, n_vertices=n_vertices)
     n_edges = int(unique_edges.shape[0])
@@ -901,7 +907,7 @@ def split_mesh_with_plane(
             # The appended crossing points sit on the plane by construction, so their dots are zero
             # to rounding; recomputing over the grown buffer is one map and avoids tracking which
             # tail entries to zero.
-            _plane_dots(new_vertices, plane_origin, plane_normal),
+            _plane_dots(new_vertices, plane_normal, plane_origin),
             plane_normal,
             wp.float32(tolerance),
             above,
@@ -1114,11 +1120,11 @@ def _shifted_field(
 
 
 def _plane_dots(
-    vertices: wp.array[wp.vec3], plane_origin: wp.vec3, plane_normal: wp.vec3
+    vertices: wp.array[wp.vec3], plane_normal: wp.vec3, plane_origin: wp.vec3
 ) -> wp.array[wp.float32]:
     """Signed plane distance of every vertex, the field all three plane entry points classify on."""
     dots = wp.empty(int(vertices.shape[0]), dtype=wp.float32, device=vertices.device)
-    wp.map(kernel_intersections.point_plane_dot, vertices, plane_origin, plane_normal, out=dots)
+    wp.map(kernel_intersections.point_plane_dot, vertices, plane_normal, plane_origin, out=dots)
     return dots
 
 

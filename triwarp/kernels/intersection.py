@@ -31,7 +31,7 @@ def triangle_case_code(s0: wp.int32, s1: wp.int32, s2: wp.int32) -> wp.int32:
 
 @wp.func
 def plane_with_line(
-    plane_origin: wp.vec3, plane_normal: wp.vec3, p0: wp.vec3, p1: wp.vec3, line_segments: wp.bool
+    plane_normal: wp.vec3, plane_origin: wp.vec3, p0: wp.vec3, p1: wp.vec3, line_segments: wp.bool
 ) -> tuple[wp.vec3, wp.bool]:
     line_dir = wp.normalize(p1 - p0)
     n = wp.normalize(plane_normal)
@@ -69,8 +69,8 @@ def vertex_at(local_index: wp.int32, v0: wp.vec3, v1: wp.vec3, v2: wp.vec3) -> w
 
 @wp.func
 def mesh_with_plane_segment_for_face(
-    plane_origin: wp.vec3,
     plane_normal: wp.vec3,
+    plane_origin: wp.vec3,
     v0: wp.vec3,
     v1: wp.vec3,
     v2: wp.vec3,
@@ -87,8 +87,8 @@ def mesh_with_plane_segment_for_face(
         unique_v = vertex_at(unique_i, v0, v1, v2)
         va = vertex_at(other_a, v0, v1, v2)
         vb = vertex_at(other_b, v0, v1, v2)
-        p_a, valid_a = plane_with_line(plane_origin, plane_normal, unique_v, va, False)
-        p_b, valid_b = plane_with_line(plane_origin, plane_normal, unique_v, vb, False)
+        p_a, valid_a = plane_with_line(plane_normal, plane_origin, unique_v, va, False)
+        p_b, valid_b = plane_with_line(plane_normal, plane_origin, unique_v, vb, False)
         if valid_a and valid_b:
             return True, p_a, p_b
         return False, wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0)
@@ -106,7 +106,7 @@ def mesh_with_plane_segment_for_face(
         on_plane_v = vertex_at(on_plane_i, v0, v1, v2)
         va = vertex_at(other_a, v0, v1, v2)
         vb = vertex_at(other_b, v0, v1, v2)
-        hit, valid = plane_with_line(plane_origin, plane_normal, va, vb, False)
+        hit, valid = plane_with_line(plane_normal, plane_origin, va, vb, False)
         if valid:
             return True, on_plane_v, hit
         return False, wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0)
@@ -129,7 +129,7 @@ def mesh_with_plane_segment_for_face(
 
 
 @wp.func
-def point_plane_dot(point: wp.vec3, plane_origin: wp.vec3, plane_normal: wp.vec3) -> wp.float32:
+def point_plane_dot(point: wp.vec3, plane_normal: wp.vec3, plane_origin: wp.vec3) -> wp.float32:
     return wp.dot(point - plane_origin, plane_normal)
 
 
@@ -138,8 +138,8 @@ def mesh_with_plane_segments(
     vertices: wp.array[wp.vec3],
     faces: wp.array[wp.int32],
     vertex_dots: wp.array[wp.float32],
-    plane_origin: wp.vec3,
     plane_normal: wp.vec3,
+    plane_origin: wp.vec3,
     out_valid: wp.array[wp.bool],
     out_segments: wp.array2d[wp.vec3],
 ) -> None:
@@ -154,7 +154,7 @@ def mesh_with_plane_segments(
     s1 = kernel_array.tolerance_sign(vertex_dots[i1])
     s2 = kernel_array.tolerance_sign(vertex_dots[i2])
     valid, p0, p1 = mesh_with_plane_segment_for_face(
-        plane_origin, plane_normal, v0, v1, v2, s0, s1, s2
+        plane_normal, plane_origin, v0, v1, v2, s0, s1, s2
     )
     out_valid[f] = valid
     out_segments[f, 0] = p0
