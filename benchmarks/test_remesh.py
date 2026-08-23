@@ -114,7 +114,7 @@ import warp as wp
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
-from conftest import BenchCase, mesh_ml_from_numpy, skip_larger_than
+from conftest import BenchCase, face_bitset_ml, mesh_ml_from_numpy, skip_larger_than
 
 # MeshLib expresses several gates as *absolute* lengths whose defaults assume a unit-scale mesh
 # (``SubdivideSettings.maxDeviationAfterFlip`` is 1.0). Passing this instead disables the gate
@@ -362,20 +362,21 @@ def test_split_edges(bench_case: BenchCase, split_fraction: float) -> None:
 _REGION_SPLIT_BUDGETS = [None, 0.25]
 
 
-def _region_half(bench_case: BenchCase) -> wp.array[wp.bool]:
-    """Face mask covering the half of the mesh below the median face-centroid ``x``."""
+def _region_half_np(bench_case: BenchCase) -> np.ndarray:
+    """Dense face mask covering the half of the mesh below the median face-centroid ``x``."""
     vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
     centroid_x = vertices_np[faces_np, 0].mean(axis=1)
-    return wp.array(
-        np.ascontiguousarray(centroid_x < np.median(centroid_x)),
-        dtype=wp.bool,
-        device=bench_case.device,
-    )
+    return np.ascontiguousarray(centroid_x < np.median(centroid_x))
+
+
+def _region_half(bench_case: BenchCase) -> wp.array[wp.bool]:
+    """Face mask covering the half of the mesh below the median face-centroid ``x``."""
+    return wp.array(_region_half_np(bench_case), dtype=wp.bool, device=bench_case.device)
 
 
 @pytest.mark.benchmark(group="subdivide_region_to_size")
 @pytest.mark.benchaxis("scale")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "meshlib")
 @pytest.mark.parametrize("split_budget", _REGION_SPLIT_BUDGETS)
 def test_subdivide_region_to_size(bench_case: BenchCase, split_budget: float | None) -> None:
     """
@@ -388,15 +389,44 @@ def test_subdivide_region_to_size(bench_case: BenchCase, split_budget: float | N
     than once per pass: truncating a pass spends the whole remaining budget, so the next pass exits
     at ``remaining <= 0``.
 
-    There is no reference row. trimesh's and MeshLab's refiners take an edge-length target over the
-    whole mesh with no region restriction and no split cap, so they would measure a different
-    operation; the region form exists because ``holes.fill_smooth`` needs it.
+    meshlib is the only reference with the region restriction, and it has the *whole* parameter set:
+    ``SubdivideSettings`` carries ``region``, ``maxEdgeLen``, ``maxEdgeSplits``,
+    ``maxAngleChangeAfterFlip`` and ``maxDeviationAfterFlip``, which is this function's signature
+    argument for argument -- so both rows are given the same target, the same split budget and the
+    same unbounded flip gate. trimesh's and MeshLab's refiners take an edge-length target over the
+    *whole* mesh with no region restriction and no split cap, which is why the sibling
+    ``subdivide_to_size`` group carries them and this one does not.
+
+    It is doing slightly more than triwarp for the same reason its sibling row is: ``subdivideMesh``
+    flips as it splits, so it lands on a nearby rather than identical mesh -- measured 3 256 faces
+    against triwarp's 3 200 on an ``icosphere(3)`` upper half, and 0.014 % less area because a flip
+    moves the surface where a split does not (``tests/test_remesh.py``). Two traps in the settings
+    object: ``maxEdgeSplits`` defaults to 1 000, which stops it long before the cap on any registry
+    mesh, and ``maintainRegion`` is a ``FaceBitSet`` rather than the bool its name reads as.
     """
-    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
-    region = _region_half(bench_case)
     max_edge = 0.35 * bench_case.mean_edge
     max_splits = None if split_budget is None else int(split_budget * bench_case.n_faces)
 
+    if bench_case.kind == "meshlib":
+        vertices_np, faces_np = bench_case.vertices_np, bench_case.faces_np
+        region_np = _region_half_np(bench_case)
+        budget_ml = 10_000_000 if max_splits is None else max_splits
+
+        def subdivide_region_ml() -> int:
+            mesh_ml = mesh_ml_from_numpy(vertices_np, faces_np)
+            settings_ml = mm.SubdivideSettings()
+            settings_ml.maxEdgeLen = max_edge
+            settings_ml.maxEdgeSplits = budget_ml
+            settings_ml.maxDeviationAfterFlip = _UNBOUNDED
+            settings_ml.region = face_bitset_ml(region_np)
+            mm.subdivideMesh(mesh_ml, settings_ml)
+            return mesh_ml.topology.numValidFaces()
+
+        assert bench_case.run(subdivide_region_ml, rounds=_ROUNDS) >= bench_case.n_faces
+        return
+
+    vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
+    region = _region_half(bench_case)
     _new_vertices, new_faces, new_region = bench_case.run(
         lambda: tw.remesh.subdivide_region_to_size(
             vertices, faces, region, max_edge, max_splits=max_splits

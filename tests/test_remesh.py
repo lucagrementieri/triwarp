@@ -21,8 +21,10 @@ from tests.conversions import (
     bsr_to_csr,
     bsr_to_dense,
     faces_igl,
+    meshlib_bitset_to_numpy,
     meshlib_to_trimesh,
     numpy_to_meshlib,
+    numpy_to_meshlib_bitset,
     numpy_to_warp,
     open3d_to_trimesh,
     points_to_warp,
@@ -580,6 +582,107 @@ def test_subdivide_to_size_matches_meshlib(device: str) -> None:
         )
         < 0.25 * max_edge
     )
+
+
+@pytest.mark.parity("subdivide_region_to_size", "meshlib")
+def test_subdivide_region_to_size_matches_meshlib(device: str) -> None:
+    """
+    Class C (no correspondence): the same cap, applied to the same half of the same mesh.
+
+    meshlib is the only reference with a region restriction, and it has the whole parameter set:
+    ``SubdivideSettings.region`` is triwarp's ``region``, and ``maxEdgeLen`` / ``maxEdgeSplits`` /
+    ``maxDeviationAfterFlip`` are ``max_edge`` / ``max_splits`` / ``max_deviation``. So this is the
+    comparison in ``test_subdivide_to_size_matches_meshlib`` with one field set, and it diverges for
+    the same reason: MeshLib *flips* as it splits where triwarp only splits.
+
+    Measured on ``icosphere(3)``'s upper half at 0.6 of the mean edge:
+
+    | | faces | region | area inside | area outside |
+    |---|---|---|---|---|
+    | input | 1 280 | 624 | 6.087263879 | 6.419228855 |
+    | triwarp | 3 200 | 2 496 | **6.087263824** | 6.419228780 |
+    | meshlib | 3 256 | 2 552 | 6.084993649 | 6.419228780 |
+
+    Two things in that table are the test. **The complement's area is identical on both sides to
+    nine digits**, so neither refiner moves the surface it was told to leave alone -- and it is
+    *not* left untouched combinatorially: both grow it from 656 faces to **704**, by exactly the
+    same amount, because a split on the region's rim must propagate across to stay crack-free. A
+    test asserting the complement's faces are unchanged would fail on both libraries and for a good
+    reason, which is why the invariant here is the area and the face count rather than the face
+    buffer.
+
+    **Inside** the region the two part company in the direction the flip predicts: triwarp preserves
+    the area to 9e-09 relative (a split cannot move a surface) and MeshLib loses 2.3e-03 (a flip
+    can). That is the discriminating fact, so it is asserted rather than absorbed into a tolerance.
+
+    ``maxDeviationAfterFlip`` is raised from its default of 1.0, an absolute length, for the reason
+    the sibling records. ``maintainRegion`` is left alone and is **not** the bool its name suggests:
+    it is a second ``FaceBitSet``. And ``settings.region`` is an **in-place** output as well as an
+    input -- MeshLib grows it to track the refined region (624 -> 2 552 bits, resized to the new
+    face count), which is what makes the inside/outside split readable on its answer at all.
+
+    **Bug class excluded:** a refiner that stops early inside the region, asserted as the cap on
+    both outputs' region faces. **Mutation probe, measured:** the region's longest input edge is
+    1.8x the cap, so a pass that did nothing fails that assert by most of a factor of two.
+    """
+    sphere_tm = tm.creation.icosphere(subdivisions=3)
+    vertices_np = np.asarray(sphere_tm.vertices)
+    faces_np = np.asarray(sphere_tm.faces)
+    region_np = np.ascontiguousarray(vertices_np[faces_np].mean(axis=1)[:, 2] > 0.0)
+
+    vertices_wp, faces_wp = numpy_to_warp(vertices_np, faces_np, device)
+    region_wp = wp.array(region_np, dtype=wp.bool, device=device)
+    max_edge = 0.6 * float(tw.edges.mean_edge_length(vertices_wp, faces_wp))
+
+    out_vertices_wp, out_faces_wp, out_region_wp = tw.remesh.subdivide_region_to_size(
+        vertices_wp, faces_wp, region_wp, max_edge
+    )
+    out_tm = warp_to_trimesh(out_vertices_wp, out_faces_wp)
+
+    mesh_ml = numpy_to_meshlib(vertices_np, faces_np)
+    region_ml = mm.FaceBitSet(numpy_to_meshlib_bitset(region_np))
+    settings_ml = mm.SubdivideSettings()
+    settings_ml.maxEdgeLen = max_edge
+    settings_ml.maxEdgeSplits = 10_000_000
+    settings_ml.maxDeviationAfterFlip = 1e30  # an absolute length; its default of 1.0 is unitful
+    settings_ml.region = region_ml
+    n_splits_ml = mm.subdivideMesh(mesh_ml, settings_ml)
+    refined_tm = meshlib_to_trimesh(mesh_ml)
+    refined_region_ml = meshlib_bitset_to_numpy(region_ml, refined_tm.faces.shape[0])
+
+    assert n_splits_ml > 0  # non-vacuity: the reference really refined
+    # Mutation probe: the region's own longest edge is well above the cap to begin with.
+    assert _edge_lengths(vertices_np, faces_np[region_np]).max() > 1.5 * max_edge
+
+    out_region_np = out_region_wp.numpy()
+    area_outside = float(
+        tm.Trimesh(vertices_np, faces_np, process=False).area_faces[~region_np].sum()
+    )
+    for result_tm, refined_region_np in ((out_tm, out_region_np), (refined_tm, refined_region_ml)):
+        assert result_tm.faces.shape[0] > faces_np.shape[0]
+        assert (
+            _edge_lengths(result_tm.vertices, result_tm.faces[refined_region_np]).max() <= max_edge
+        )
+        # Neither refiner moves the complement, although both subdivide into it to stay crack-free.
+        assert np.isclose(
+            float(result_tm.area_faces[~refined_region_np].sum()), area_outside, rtol=1e-5, atol=0.0
+        )
+        assert int((~refined_region_np).sum()) > int((~region_np).sum())
+    assert abs(out_tm.faces.shape[0] - refined_tm.faces.shape[0]) < 0.1 * out_tm.faces.shape[0]
+    assert int((~out_region_np).sum()) == int((~refined_region_ml).sum())
+
+    # Inside the region the two part company, in the direction the flip predicts.
+    area_inside = float(
+        tm.Trimesh(vertices_np, faces_np, process=False).area_faces[region_np].sum()
+    )
+    assert np.isclose(
+        float(out_tm.area_faces[out_region_np].sum()), area_inside, rtol=1e-6, atol=0.0
+    )
+    assert not np.isclose(
+        float(refined_tm.area_faces[refined_region_ml].sum()), area_inside, rtol=1e-6, atol=0.0
+    )
+    # Every input vertex survives in place: this refiner only ever inserts.
+    assert np.allclose(out_tm.vertices[: vertices_np.shape[0]], vertices_np, rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("voxel_size", [0.1, 0.3])

@@ -66,22 +66,44 @@ Two groups carry a second sweep, on the parameter that drives them rather than o
 
 References
 ----------
-**No CPU baseline is registered for this module**, and the reason is per-function rather than
-blanket:
+**meshlib and pyvista are the module's baselines**, and between them they cover every group here
+except the two per-vertex maps. MeshLib's ``Polyline3`` is a complete polyline library --
+``totalLength``, ``averageEdgeLength``, ``loopDirArea``, ``splitEdge``,
+``findProjectionOnPolyline``, ``subdividePolyline``, ``decimatePolyline``, ``pack`` -- and VTK
+reaches the same operations through a single-cell ``PolyData``. An earlier version of this section
+said no CPU baseline was registered at all, which was already false of three groups when it was
+written.
 
-* **trimesh** models polylines as ``trimesh.path.Path3D`` entities, not arrays, and its only
-  simplification is ``trimesh.path.simplify.merge_colinear`` — a colinear-run merge, a different
-  algorithm from Ramer-Douglas-Peucker with a different output, so it is not a parity baseline for
-  ``polyline_simplify``. It has no arc-length resampling for 3D polylines
-  (``resample_spline`` fits a spline first, which changes the geometry).
-* **libigl**'s ``igl.upsample`` is *mesh* subdivision, not polyline resampling; the C++
-  ``ramer_douglas_peucker`` that ``polyline_simplify`` is ported from is **not exposed** in the
-  Python bindings (only ``upsample`` / ``upsample_matrix`` match the name search).
-* **open3d** has no polyline type at all — ``LineSet`` stores unordered segments with no ordering,
-  length, resampling or simplification operations.
+Two hazards decide every row here, both measured:
 
-So these are before/after self-comparisons, which is what the batches touching this module
-(``wp.length_sq``, ``wp.lerp``, ``wp.sign``) need.
+* **The single line cell.** ``pv.lines_from_points`` gives one two-point cell *per segment*, and
+  every polyline filter then restarts at each of them -- ``compute_arc_length`` reports 0.0638 for
+  a 200-point helix whose length is 12.7049, and ``decimate_polyline`` is a **no-op at every
+  reduction**. ``_polyline_pv`` builds one cell for that reason; a row built the other way would
+  time the right filter on the wrong input and read as a suspiciously fast reference.
+* **``pack()`` is mandatory after a decimation, and skipping it is silent.** Measured on a 128-point
+  helix at ``maxError=0.1``: ``vertsDeleted`` is **104**, ``points.size()`` is still **128**, and
+  ``topology.numValidVerts()`` is **24**. ``totalLength()`` is already correct before packing, so a
+  *length* comparison passes unpacked while a *point-count* one silently reads the input's count and
+  reads as a no-op. This is CLAUDE.md section 6's ``getNumpyFaces``-without-``pack()`` rule, in a
+  class that rule does not name.
+
+The three groups that stay triwarp-only, and why it is per-function rather than blanket:
+
+* **``polyline_radius``** -- no reference computes it. ``Polyline3.findCenterFromPoints`` is a
+  centroid and ``findMaxProjectionOnPolyline`` projects points *onto* a polyline, which is
+  ``polyline_point_distance``'s question and already carries its rows.
+* **``polyline_angles``** -- three-point turning angles. MeshLib has ``edgeVector`` only, so a
+  reference row would time a Python loop over the segments.
+* **``polyline_triangulate``**'s sibling ``triangulate_polygon`` carries trimesh; the ear clipper
+  itself carries meshlib and pyvista.
+
+trimesh, libigl and open3d remain unregistered here, and each for its own reason: trimesh models
+polylines as ``Path3D`` entities rather than arrays and its only simplification is
+``merge_colinear`` (a colinear-run merge, a different algorithm with a different output); libigl's
+``igl.upsample`` is *mesh* subdivision and its C++ ``ramer_douglas_peucker`` is not bound; and
+open3d's ``LineSet`` stores unordered segments with no ordering, length, resampling or
+simplification operation at all.
 """
 
 from __future__ import annotations
@@ -96,6 +118,11 @@ from meshlib import mrmeshpy as mm
 
 import triwarp as tw
 from conftest import BenchCase, BenchLibrary, skip_larger_than
+
+# MeshLib expresses several gates as *absolute* lengths whose defaults assume a unit-scale input
+# (``DecimatePolylineSettings.maxError`` is 1e-3). Passing this instead disables the gate outright,
+# so a row stops for the reason it is given rather than for the fixture's units.
+_UNBOUNDED = 1e30
 
 # Resampling step, as a fraction of the mean segment length: < 1 upsamples, > 1 downsamples.
 _UPSAMPLE_FRACTION = 0.5
@@ -130,8 +157,14 @@ def _polyline_wp(bench_case: BenchCase) -> wp.array[wp.vec3]:
 
 
 def _segment_scale(bench_case: BenchCase) -> tuple[float, float]:
-    """``(mean_segment_length, bbox_diagonal)`` of the polyline, computed on the host once."""
-    polyline = _polyline_wp(bench_case).numpy()
+    """
+    ``(mean_segment_length, bbox_diagonal)`` of the polyline, computed on the host once.
+
+    Through ``_polyline_np`` rather than ``_polyline_wp``, for the reason that helper exists: a
+    ``cpu_bound`` reference case has no Warp device, and every resampling row now reads this scale
+    on both sides of its branch to give both libraries the same target.
+    """
+    polyline = _polyline_np(bench_case)
     steps = np.linalg.norm(np.diff(polyline, axis=0), axis=1)
     diagonal = float(np.linalg.norm(polyline.max(axis=0) - polyline.min(axis=0)))
     return float(steps.mean()), diagonal
@@ -288,7 +321,14 @@ def test_polyline_length(bench_case: BenchCase) -> None:
 @pytest.mark.benchaxis("polyline")
 @pytest.mark.benchlibs("triwarp")
 def test_polyline_radius(bench_case: BenchCase) -> None:
-    """Per-segment plane projection and closest-point search, then a reduction."""
+    """
+    Per-segment plane projection and closest-point search, then a reduction.
+
+    triwarp-only, and it is an absence rather than a cost objection: no registered library computes
+    a polyline's radius about a centre and normal. ``Polyline3.findCenterFromPoints`` is a centroid
+    and ``findMaxProjectionOnPolyline`` projects points *onto* a polyline, which is
+    ``polyline_point_distance``'s question and already carries its rows. See the module docstring.
+    """
     polyline = _polyline_wp(bench_case)
     radius = bench_case.run(lambda: tw.polyline.polyline_radius(polyline, reduction="min"))
     assert radius >= 0.0
@@ -298,42 +338,172 @@ def test_polyline_radius(bench_case: BenchCase) -> None:
 @pytest.mark.benchaxis("polyline")
 @pytest.mark.benchlibs("triwarp")
 def test_polyline_angles(bench_case: BenchCase) -> None:
-    """Per-vertex turning angle: the ``wp.acos`` path, one angle per point."""
+    """
+    Per-vertex turning angle: the ``wp.acos`` path, one angle per point.
+
+    triwarp-only. MeshLib has ``edgeVector`` and nothing above it, so a reference row would time a
+    Python loop over the segments rather than MeshLib -- the per-element rule. See the module
+    docstring.
+    """
     polyline = _polyline_wp(bench_case)
     angles = bench_case.run(lambda: tw.polyline.polyline_angles(polyline))
     assert angles.shape[0] == int(polyline.shape[0])
 
 
+def _polyline_cpu(bench_case: BenchCase) -> wp.array[wp.vec3]:
+    """
+    Build the benchmark's polyline as a ``wp.vec3`` array on the **cpu** device, cached per mesh.
+
+    The reference rows for ``polyline_downsample`` and ``polyline_simplify`` are driven by the
+    *count* triwarp reaches rather than by their own error parameter (each row says why), so they
+    have to call triwarp once to learn it. That call is outside the timed callable and is not the
+    measurement, so it runs on the cpu -- a ``cpu_bound`` case has no Warp device of its own.
+    """
+    key = (bench_case.mesh_name, "cpu-polyline")
+    if key not in _polyline_cache:
+        _polyline_cache[key] = wp.array(
+            np.ascontiguousarray(_polyline_np(bench_case)), dtype=wp.vec3, device="cpu"
+        )
+    return _polyline_cache[key]
+
+
 @pytest.mark.benchmark(group="polyline_upsample")
 @pytest.mark.benchaxis("polyline")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "meshlib")
 def test_upsample_polyline(bench_case: BenchCase) -> None:
-    """Arc-length upsampling at half the mean segment length: scan, readback, then a lerp pass."""
-    polyline = _polyline_wp(bench_case)
+    """
+    Arc-length upsampling at half the mean segment length: scan, readback, then a lerp pass.
+
+    meshlib's ``subdividePolyline`` takes the same ``maxEdgeLen`` and makes the same guarantee, but
+    it **bisects** where triwarp splits each segment into equal pieces, so at a target that is not
+    a power-of-two fraction of the input spacing it overshoots -- measured on a 128-point helix at
+    half the spacing, 509 points against triwarp's 254, because one halving leaves 0.0502 against a
+    cap of 0.05 and forces a second. Both satisfy the cap; read the row as a cost at a *shared
+    post-condition* rather than at a shared output size (``tests/test_polyline.py``).
+
+    It mutates, so the ``Polyline3`` is rebuilt inside the timed callable, and ``maxEdgeSplits`` is
+    raised from its default of **1 000** -- the same trap ``SubdivideSettings`` has, and on these
+    axes it would stop the reference in the first few percent of the work.
+    """
     step = _UPSAMPLE_FRACTION * _segment_scale(bench_case)[0]
+    n_points = _polyline_np(bench_case).shape[0]
+
+    if bench_case.kind == "meshlib":
+        contour_ml = _contour_ml(bench_case)
+
+        def upsample_ml() -> int:
+            polyline_ml = mm.Polyline3(contour_ml)
+            settings_ml = mm.PolylineSubdivideSettings()
+            settings_ml.maxEdgeLen = step
+            settings_ml.maxEdgeSplits = 10_000_000
+            mm.subdividePolyline(polyline_ml, settings_ml)
+            return polyline_ml.topology.numValidVerts()
+
+        assert bench_case.run(upsample_ml) >= n_points
+        return
+
+    polyline = _polyline_wp(bench_case)
     dense = bench_case.run(lambda: tw.polyline.polyline_upsample(polyline, step))
     assert dense.shape[0] >= int(polyline.shape[0])
 
 
 @pytest.mark.benchmark(group="polyline_downsample")
 @pytest.mark.benchaxis("polyline")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "meshlib")
 def test_downsample_polyline(bench_case: BenchCase) -> None:
-    """Arc-length downsampling at four times the mean segment length."""
-    polyline = _polyline_wp(bench_case)
+    """
+    Arc-length downsampling at four times the mean segment length.
+
+    meshlib's ``decimatePolyline`` reaches a *count* rather than a step, so its row is given the
+    count triwarp's step produces (``maxDeletedVertices``) and its ``maxError`` is opened up so the
+    count is what binds -- otherwise the two rows would stop for different reasons and the ratio
+    would mean nothing. That makes this the module's clearest structural contrast: an arc-length
+    resample is one scan and one gather where a decimator is a priority queue of collapses.
+
+    ``optimizeVertexPos`` is turned **off**. It defaults on and moves each surviving vertex to a
+    fitted position, which is work triwarp does not do and which would additionally leave the output
+    off the input point set.
+    """
     step = _DOWNSAMPLE_FRACTION * _segment_scale(bench_case)[0]
+
+    if bench_case.kind == "meshlib":
+        contour_ml = _contour_ml(bench_case)
+        cpu_polyline = _polyline_cpu(bench_case)
+        n_points = int(cpu_polyline.shape[0])
+        n_kept = int(tw.polyline.polyline_downsample(cpu_polyline, step).shape[0])
+
+        def downsample_ml() -> int:
+            polyline_ml = mm.Polyline3(contour_ml)
+            settings_ml = mm.DecimatePolylineSettings_Vector3f()
+            settings_ml.maxDeletedVertices = max(n_points - n_kept, 0)
+            settings_ml.maxError = _UNBOUNDED
+            settings_ml.optimizeVertexPos = False
+            return int(mm.decimatePolyline(polyline_ml, settings_ml).vertsDeleted)
+
+        assert bench_case.run(downsample_ml) >= 0
+        return
+
+    polyline = _polyline_wp(bench_case)
     sparse = bench_case.run(lambda: tw.polyline.polyline_downsample(polyline, step))
     assert sparse.shape[0] >= 2
 
 
 @pytest.mark.benchmark(group="polyline_simplify")
 @pytest.mark.benchaxis("polyline")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "meshlib", "pyvista")
 @pytest.mark.parametrize("tolerance_fraction", _SIMPLIFY_FRACTIONS)
 def test_simplify_polyline(bench_case: BenchCase, tolerance_fraction: float) -> None:
-    """Ramer-Douglas-Peucker on a *single* GPU thread — the module's deliberate serial outlier."""
-    polyline = _polyline_wp(bench_case)
+    """
+    Ramer-Douglas-Peucker on a *single* GPU thread — the module's deliberate serial outlier.
+
+    This is the one group in the package where triwarp is *expected* to lose, so it is also the one
+    where a reference is worth the most -- until now there was nothing to lose to. Neither reference
+    is Ramer-Douglas-Peucker, and **neither is driven by triwarp's tolerance**, which is the thing
+    to know before reading the ratio: both are given the *reduction* triwarp's tolerance produces,
+    so the rows price three ways of removing the same number of points.
+
+    Driving them by their own error parameter was tried and rejected on a measurement.
+    ``decimatePolyline``'s ``maxError`` is a collapse cost, **not** a deviation bound: on a 40-point
+    random walk at a tolerance of 0.8134 its output sits **1.9187** from the input, 2.4x the number
+    it was given, where triwarp's and pyvista's sit at 0.3730. So a tolerance-matched pair would be
+    two different amounts of work under one parameter name.
+
+    * **meshlib** ``decimatePolyline`` at ``maxDeletedVertices`` = triwarp's deletion count, with
+      ``maxError`` opened up so the count is what binds. ``optimizeVertexPos`` is turned off for the
+      reason the ``downsample`` row records; it mutates, so the ``Polyline3`` is rebuilt per round.
+    * **pyvista** ``decimate_polyline`` takes a reduction *fraction*, handed the same count. It
+      needs the **single-cell** ``PolyData`` ``_polyline_pv`` builds: on a ``lines_from_points``
+      polyline (one two-point cell per segment) it is a no-op at every reduction, which is the
+      silent-wrong-input hazard that builder exists for.
+    """
     tol = tolerance_fraction * _segment_scale(bench_case)[1]
+
+    if bench_case.kind == "meshlib":
+        contour_ml = _contour_ml(bench_case)
+        cpu_polyline = _polyline_cpu(bench_case)
+        n_points = int(cpu_polyline.shape[0])
+        n_kept = int(tw.polyline.polyline_simplify(cpu_polyline, tol)[0].shape[0])
+
+        def simplify_ml() -> int:
+            polyline_ml = mm.Polyline3(contour_ml)
+            settings_ml = mm.DecimatePolylineSettings_Vector3f()
+            settings_ml.maxDeletedVertices = max(n_points - n_kept, 0)
+            settings_ml.maxError = _UNBOUNDED
+            settings_ml.optimizeVertexPos = False
+            return int(mm.decimatePolyline(polyline_ml, settings_ml).vertsDeleted)
+
+        assert bench_case.run(simplify_ml) >= 0
+        return
+    if bench_case.kind == "pyvista":
+        line_pv = _polyline_pv(bench_case)
+        cpu_polyline = _polyline_cpu(bench_case)
+        n_points = int(cpu_polyline.shape[0])
+        n_kept = int(tw.polyline.polyline_simplify(cpu_polyline, tol)[0].shape[0])
+        reduction = min(max(1.0 - n_kept / n_points, 0.0), 0.999)
+        assert bench_case.run(lambda: line_pv.decimate_polyline(reduction)).n_points >= 2
+        return
+
+    polyline = _polyline_wp(bench_case)
     simplified, kept = bench_case.run(lambda: tw.polyline.polyline_simplify(polyline, tol))
     assert simplified.shape[0] == kept.shape[0]
 

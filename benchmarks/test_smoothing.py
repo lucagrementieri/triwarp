@@ -817,9 +817,17 @@ def test_inflate(bench_case: BenchCase) -> None:
     triwarp-only, and not by omission. MeshLib's ``inflate`` is the only reference that has one and
     it cannot be timed here: with every vertex selected -- the operation this performs -- it
     collapses the mesh to a point at every pressure probed, because its implicit solve takes the
-    *unselected* vertices as its boundary condition. Given a region it works but solves a different
-    problem, dropping the volume below the input before pressure raises it again. Measured numbers
-    are in ``tests/test_smoothing.py``.
+    *unselected* vertices as its boundary condition. Measured numbers are in
+    ``tests/test_smoothing.py``.
+
+    Restricting it to a *region* does not rescue the row, and the reason is sharper than "it solves
+    a different problem": **its displacement is insensitive to the parameter that should drive it.**
+    Measured on ``icosphere(3)`` (volume 4.15274) with a 61-vertex cap selected, ``InflateSettings``
+    otherwise at its defaults -- pressure ``+0.1`` x mean edge gives max displacement 0.221164 and
+    volume 4.01012, ``-0.1`` gives 0.231235 and 4.00390, ``+0.01`` gives 0.225696 and 4.00732,
+    ``+1.0`` gives 0.175928 and 4.03818. A 100x pressure range and a sign flip move the surface less
+    than the runs differ from each other, and the volume *falls* in every case where positive
+    pressure must raise it. What the row would be timing is the ``preSmooth`` pass.
 
     First measurement, medians on an RTX 5090 at the default 3 passes: **4.59 ms**
     (``bunny_decimated``), **5.16** (``bunny``), **5.51** (``dragon``), **5.72**

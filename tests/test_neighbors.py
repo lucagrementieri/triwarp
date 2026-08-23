@@ -25,9 +25,12 @@ from scipy.spatial import KDTree
 import triwarp as tw
 from tests.conversions import (
     meshlib_indices_to_numpy,
+    meshlib_scalars_to_numpy,
+    numpy_to_meshlib_bitset,
     points_to_meshlib,
     points_to_open3d,
     points_to_warp,
+    trimesh_to_meshlib,
 )
 from triwarp.kernels import neighbors as kernel_neighbors
 
@@ -1356,6 +1359,74 @@ def test_geodesic_ball_neighborhoods(mesh_name: str, request: pytest.FixtureRequ
         end = int(offsets[i + 1]) if i + 1 < n else total
         neighbors_wp = {int(x) for x in neighbor_indices[start:end]}
         assert neighbors_wp == set(per_vertex_oracle[i]), f"vertex {i} neighborhood differs"
+
+
+@pytest.mark.parity(
+    "query_geodesic_ball",
+    "meshlib",
+    benchmarked=False,
+    reason="computeSurfaceDistances answers one source per call, so a row would time a Python loop "
+    "over the vertex buffer rather than MeshLib -- the per-element rule. It is nonetheless the "
+    "only reference that answers this question at all, and it agrees exactly, which is what "
+    "this test "
+    "records; its own timed row is in the heat_geodesic group as a fast-marching front.",
+)
+def test_geodesic_ball_matches_meshlib(device: str) -> None:
+    """
+    Class A on the ball's membership set: the same vertices, on every source sampled.
+
+    MeshLib is the only reference that answers this at all -- ``computeSurfaceDistances`` runs a
+    fast-marching front from a ``VertBitSet`` of sources and truncates it at ``maxDist``, so
+    thresholding its field at the radius *is* the geodesic ball. Measured on ``icosphere(3)`` at
+    three mean edges, over seven sampled sources: **31, 33, 33, 34, 33, 33, 34** on both sides,
+    exactly.
+
+    Two things make that agreement meaningful rather than lucky. The front is **not** Dijkstra over
+    the edge graph -- it crosses triangle interiors -- so the two implementations reach the same set
+    by different routes and a shared off-by-one in the traversal is excluded. And the radius is
+    chosen so ``min_count`` cannot bind: that argument *expands* a ball to reach its floor, so at a
+    radius where a ball holds six or fewer vertices triwarp would legitimately return more than the
+    distance field does. Every ball here holds 31 or more.
+
+    It answers one source per call, which is why this samples rather than sweeping every vertex --
+    and why there is no benchmark row.
+    """
+    sphere_tm = tm.creation.icosphere(subdivisions=3)
+    vertices_np = np.asarray(sphere_tm.vertices)
+    n_vertices = vertices_np.shape[0]
+
+    vertices_wp = points_to_warp(vertices_np, device)
+    faces_wp = wp.array(
+        np.ascontiguousarray(sphere_tm.faces).ravel().astype(np.int32),
+        dtype=wp.int32,
+        device=device,
+    )
+    radius = 3.0 * float(tw.edges.mean_edge_length(vertices_wp, faces_wp))
+    neighbor_indices_wp, offsets_wp, _reference_wp = tw.neighbors.geodesic_ball(
+        vertices_wp, faces_wp, radius
+    )
+    neighbor_indices_np = neighbor_indices_wp.numpy()
+    offsets_np = offsets_wp.numpy()
+
+    mesh_ml = trimesh_to_meshlib(sphere_tm)
+    for source in range(0, n_vertices, 97):
+        start = int(offsets_np[source])
+        end = (
+            int(offsets_np[source + 1]) if source + 1 < n_vertices else neighbor_indices_np.shape[0]
+        )
+        ball_wp = set(neighbor_indices_np[start:end].tolist())
+
+        seeds_np = np.arange(n_vertices) == source
+        seeds_ml = mm.VertBitSet(numpy_to_meshlib_bitset(seeds_np))
+        distance_ml = meshlib_scalars_to_numpy(
+            mm.computeSurfaceDistances(mesh_ml, seeds_ml, radius)
+        )
+        ball_ml = set(np.flatnonzero(distance_ml <= radius).tolist())
+
+        assert len(ball_ml) > 6, (
+            "min_count cannot be allowed to bind, or the two disagree by design"
+        )
+        assert ball_wp == ball_ml, f"source {source}"
 
 
 def test_geodesic_ball_neighborhoods_overflow_warns() -> None:

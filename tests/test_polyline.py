@@ -46,6 +46,37 @@ def _contour_ml(pts_np: np.ndarray) -> mm.std_vector_Vector3_float:
     return contour_ml
 
 
+def _ordered_ml(polyline_ml: mm.Polyline3) -> np.ndarray:
+    """
+    Read a ``Polyline3`` back in **path** order, through ``contours()``.
+
+    Not through ``points``, and this is a silent wrong answer rather than an inconvenience:
+    ``points`` is the *storage* buffer, so after a subdivision or a decimation its consecutive
+    entries are no longer consecutive along the curve. Measured on a 128-point helix subdivided to
+    407 points, the largest gap between adjacent ``points`` entries is **2.548** against a curve
+    whose longest segment is 0.050 -- a spacing assertion built on it reads 50x too large and looks
+    like the reference failing.
+
+    ``contours()`` walks the topology and needs no ``pack()``; a ``points`` read would need one as
+    well (``vertsDeleted`` 104 with ``points.size()`` still 128 and ``numValidVerts`` 24).
+    """
+    return np.asarray([[point.x, point.y, point.z] for point in polyline_ml.contours()[0]])
+
+
+def _max_deviation_np(points_np: np.ndarray, polyline_np: np.ndarray) -> float:
+    """Largest distance from any of ``points_np`` to the polyline through ``polyline_np``."""
+    starts, ends = polyline_np[:-1], polyline_np[1:]
+    spans = ends - starts
+    fractions = np.clip(
+        ((points_np[:, None, :] - starts) * spans).sum(-1)
+        / np.maximum((spans * spans).sum(-1), 1e-30),
+        0.0,
+        1.0,
+    )
+    closest = starts + fractions[..., None] * spans
+    return float(np.linalg.norm(points_np[:, None, :] - closest, axis=-1).min(axis=1).max())
+
+
 def _closed_from(pts_np: np.ndarray) -> np.ndarray:
     return np.concatenate([pts_np, pts_np[:1]], axis=0)
 
@@ -512,6 +543,61 @@ def test_upsample_point_count(device: str) -> None:
     assert upsampled.shape[0] == expected_count
 
 
+@pytest.mark.parity("polyline_upsample", "meshlib")
+def test_upsample_polyline_matches_meshlib(device: str) -> None:
+    """
+    Class C (no correspondence): the same curve resampled two ways, both of them *on* the curve.
+
+    ``subdividePolyline`` takes the same ``maxEdgeLen``, and it is the only reference that resamples
+    a 3-D polyline at all. What the two do not share is the rule: triwarp splits each segment into
+    ``max(floor(length / step), 1)`` **equal** pieces, so it lands near the step and can overshoot
+    it by up to 2x; MeshLib **bisects** until every edge is under the cap, so it lands under the
+    step and can undershoot by up to 2x. Measured on a 128-point helix (spacing 0.100273) at a step
+    of 0.040109 -- triwarp 254 points at spacing 0.050136, MeshLib 509 at 0.025068. Both are inside
+    the factor of two, from opposite sides, which is what the count bound below asserts.
+
+    The claim that does hold exactly is the one that matters: **every point either library emits
+    lies on the input polyline**, so neither is smoothing. Measured 1.3e-07 and 2.2e-07, i.e. the
+    float32 buffer's own noise.
+
+    ``maxEdgeSplits`` is raised from its default of **1 000**, which would otherwise stop the
+    reference in the first few percent of the work and make it look fast.
+
+    **Bug class excluded:** a resampler that interpolates off the curve (a spline fit, a smoothing
+    pass) or that leaves the spacing where it found it. **Mutation probe, measured:** feeding
+    ``polyline_smooth_upsample``'s output to the deviation assert -- triwarp's own curvature-aware
+    variant, which is *meant* to leave the chord -- gives 1.1e-03, four orders past the 1e-05 bound.
+    """
+    steps_np = np.linspace(0.0, 4.0 * np.pi, 128)
+    pts_np = np.stack([np.cos(steps_np), np.sin(steps_np), steps_np / 6.0], axis=1)
+    spacing = float(np.linalg.norm(np.diff(pts_np, axis=0), axis=1).mean())
+    step = 0.4 * spacing
+
+    dense_wp = tw.polyline.polyline_upsample(points_to_warp(pts_np, device), step)
+    dense_np = dense_wp.numpy().astype(np.float64)
+
+    polyline_ml = _polyline_ml(pts_np)
+    settings_ml = mm.PolylineSubdivideSettings()
+    settings_ml.maxEdgeLen = step
+    settings_ml.maxEdgeSplits = 10_000_000
+    n_added_ml = mm.subdividePolyline(polyline_ml, settings_ml)
+    dense_ml = _ordered_ml(polyline_ml)
+
+    assert n_added_ml > 0  # non-vacuity: the reference really subdivided
+    for resampled_np in (dense_np, dense_ml):
+        assert resampled_np.shape[0] > pts_np.shape[0]
+        # Every emitted point is on the input polyline: neither library smooths.
+        assert _max_deviation_np(resampled_np, pts_np) < 1e-5
+        # Both land within a factor of two of the step, from opposite sides.
+        emitted = np.linalg.norm(np.diff(resampled_np, axis=0), axis=1)
+        assert emitted.max() < 2.0 * step
+        assert emitted.mean() > 0.5 * step
+
+    # Mutation probe for the deviation bound: the curvature-aware variant leaves the chord.
+    smooth_np = tw.polyline.polyline_smooth_upsample(points_to_warp(pts_np, device), step).numpy()
+    assert _max_deviation_np(smooth_np.astype(np.float64), pts_np) > 1e-4
+
+
 # --- smooth upsample (curvature-aware, NumPy reference + circle oracle) ---
 
 
@@ -610,6 +696,70 @@ def test_downsample_polyline_matches_reference(device: str, step: float) -> None
     pts_np = _random_open_polyline(60)
     downsampled_wp = tw.polyline.polyline_downsample(points_to_warp(pts_np, device), step)
     assert np.allclose(downsampled_wp.numpy(), _downsample_np(pts_np, step), rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parity("polyline_downsample", "meshlib")
+def test_downsample_polyline_matches_meshlib(device: str) -> None:
+    """
+    Class C (a derived scalar): the same number of points removed, both answers on the curve.
+
+    ``decimatePolyline`` reaches a *count* where ``polyline_downsample`` reaches a *step*, so the
+    named transform is to hand it triwarp's own deletion count as ``maxDeletedVertices`` and open
+    ``maxError`` up so the count is what binds. Without that they would stop for different reasons
+    and the comparison would be two unrelated reductions.
+
+    **Two of its defaults have to be turned off, and neither is a tuning choice.**
+    ``optimizeVertexPos`` defaults *on* and moves each surviving vertex to a fitted position, which
+    would put the output off the input point set. ``touchBdVertices`` defaults *on* and collapses
+    the endpoints away: measured on this fixture it returns (0.99511, 0.09879, 0.01649) where the
+    input starts at (1, 0, 0), so a first-point assertion fails by a whole segment for a reason that
+    is a parameter rather than a disagreement. With both off the endpoints come back exactly.
+
+    With those set, both keep a subset of the input points at a matched count -- 56 of 128 at twice
+    the mean spacing, 30 of 128 at four times -- and both stay on the original curve. The point
+    *sets* differ, because a collapse queue and an arc-length walk choose differently, which is why
+    this is a scalar comparison rather than an equality.
+
+    One convention is left as a measured divergence rather than asserted: triwarp keeps the
+    **first** point by contract and the last only when the walk lands on it (at four times the
+    spacing its last kept point is one short of the end), where MeshLib at ``touchBdVertices=False``
+    keeps both.
+
+    **Bug class excluded:** a downsampler that moves the points it keeps, or that loses the start of
+    the curve. Both are asserted on both answers.
+    """
+    steps_np = np.linspace(0.0, 4.0 * np.pi, 128)
+    pts_np = np.stack([np.cos(steps_np), np.sin(steps_np), steps_np / 6.0], axis=1)
+    spacing = float(np.linalg.norm(np.diff(pts_np, axis=0), axis=1).mean())
+
+    for factor, n_bound in ((2.0, 60), (4.0, 34)):
+        sparse_wp = tw.polyline.polyline_downsample(
+            points_to_warp(pts_np, device), factor * spacing
+        )
+        sparse_np = sparse_wp.numpy().astype(np.float64)
+        n_expected = sparse_np.shape[0]
+        # Non-vacuity: the reduction is real, and close enough to its target to be the right one.
+        assert n_expected < n_bound
+        assert n_expected > n_bound // 2
+
+        polyline_ml = _polyline_ml(pts_np)
+        settings_ml = mm.DecimatePolylineSettings_Vector3f()
+        settings_ml.maxDeletedVertices = pts_np.shape[0] - n_expected
+        settings_ml.maxError = 1e30  # let the count bind, not the collapse cost
+        settings_ml.optimizeVertexPos = False  # defaults on, and would move the kept points
+        settings_ml.touchBdVertices = False  # defaults on, and would collapse the endpoints
+        result_ml = mm.decimatePolyline(polyline_ml, settings_ml)
+        sparse_ml = _ordered_ml(polyline_ml)
+
+        assert int(result_ml.vertsDeleted) == pts_np.shape[0] - n_expected
+        assert sparse_ml.shape[0] == n_expected
+        for reduced_np in (sparse_np, sparse_ml):
+            # A kept point is an input point: neither library moved what it kept.
+            assert _max_deviation_np(reduced_np, pts_np) < 1e-5
+            # The start of the curve survives, so this shortened rather than trimmed.
+            assert np.allclose(reduced_np[0], pts_np[0], rtol=1e-5, atol=1e-5)
+        # MeshLib additionally keeps the far endpoint; triwarp's greedy walk need not land on it.
+        assert np.allclose(sparse_ml[-1], pts_np[-1], rtol=1e-5, atol=1e-5)
 
 
 # --- resample (NumPy interp reference + trimesh oracle) ---
@@ -1065,6 +1215,84 @@ def test_simplify_closed_matches_reference(device: str, tol: float) -> None:
     assert np.allclose(
         simplified_wp.numpy(), simplified_np.astype(np.float32), rtol=1e-4, atol=1e-4
     )
+
+
+@pytest.mark.parity("polyline_simplify", "meshlib", "pyvista")
+@pytest.mark.parametrize("tolerance", [0.8, 2.4])
+def test_simplify_matches_the_two_decimators(device: str, tolerance: float) -> None:
+    """
+    Class C (a derived scalar): three decimators removing the same number of points.
+
+    Neither reference is Ramer-Douglas-Peucker and **neither takes triwarp's tolerance**, which is
+    the finding this test exists to pin rather than a limitation to apologise for.
+    ``decimatePolyline``'s ``maxError`` is a *collapse cost*, not a deviation bound: driven by it at
+    0.8134 on this fixture, its output sits **1.9187** from the input, 2.4x the number it was
+    handed. So a tolerance-matched comparison would compare two different quantities under one
+    parameter name. Both references are therefore driven by the **count** triwarp's tolerance
+    produces, and what is compared is where each one puts the points it keeps.
+
+    Measured at the two settings below, all three keeping the same count:
+
+    | tolerance | kept | triwarp | meshlib | pyvista |
+    |---|---|---|---|---|
+    | 0.8 | 39 of 40 | 0.373016 | **0.151980** | 0.373016 |
+    | 2.4 | 10 of 40 | 1.760643 | 2.402235 | 1.918705 |
+
+    Two things in that table. **pyvista is exact at the light setting** -- ``decimate_polyline``
+    retains triwarp's own point set, a two-sided Hausdorff of **0.0** -- and diverges at the heavy
+    one (1.9187), both legal since neither claims a unique answer at a 4x reduction. And **MeshLib
+    is the most accurate of the three at the light setting and the only one over budget at the heavy
+    one** (2.402235 against 2.4), which is the same fact as the paragraph above: its reduction is
+    driven by a quadric cost, so the deviation is an outcome rather than a promise. That is why the
+    tolerance bound below is asserted on triwarp and pyvista and not on MeshLib.
+
+    pyvista's ``PolyData`` must hold **one** line cell. ``pv.lines_from_points`` gives one two-point
+    cell per segment and ``decimate_polyline`` is then a **no-op at every reduction**, so a
+    comparison built that way asserts nothing and looks like agreement --
+    [`polyline_to_pyvista`][tests.conversions.polyline_to_pyvista] is the builder for that reason,
+    and its cell count is asserted here rather than assumed.
+
+    ``optimizeVertexPos`` and ``touchBdVertices`` are turned off on the MeshLib side for the reasons
+    ``test_downsample_polyline_matches_meshlib`` records; without the first, the "keeps a subset of
+    the input points" assert below would fail on every setting.
+
+    **Bug class excluded:** a simplifier that moves the points it keeps (all three), and one that
+    exceeds its own tolerance (the two that promise one). **Mutation probe, measured:** MeshLib's
+    ``maxError``-driven answer deviates 1.9187 against a 0.8134 bound, 2.4x, so the bound is not
+    something any reduction of roughly the right size passes.
+    """
+    pts_np = _random_open_polyline(50, n=40)
+    simplified_wp, _indices_wp = tw.polyline.polyline_simplify(
+        points_to_warp(pts_np, device), tolerance
+    )
+    simplified_np = simplified_wp.numpy().astype(np.float64)
+    n_kept = simplified_np.shape[0]
+    assert 2 < n_kept < pts_np.shape[0]  # non-vacuity: it simplified, and did not collapse
+
+    polyline_ml = _polyline_ml(pts_np)
+    settings_ml = mm.DecimatePolylineSettings_Vector3f()
+    settings_ml.maxDeletedVertices = pts_np.shape[0] - n_kept
+    settings_ml.maxError = 1e30  # a collapse cost, not a deviation bound -- see the docstring
+    settings_ml.optimizeVertexPos = False
+    settings_ml.touchBdVertices = False
+    result_ml = mm.decimatePolyline(polyline_ml, settings_ml)
+    simplified_ml = _ordered_ml(polyline_ml)
+
+    line_pv = polyline_to_pyvista(pts_np)
+    assert line_pv.n_cells == 1  # a per-segment cell set would make decimate_polyline a no-op
+    decimated_pv = line_pv.decimate_polyline(1.0 - n_kept / pts_np.shape[0])
+    simplified_pv = np.asarray(decimated_pv.points, dtype=np.float64)
+
+    assert int(result_ml.vertsDeleted) == pts_np.shape[0] - n_kept
+    assert simplified_ml.shape[0] == n_kept
+    assert simplified_pv.shape[0] == n_kept
+
+    # All three keep a subset of the input points rather than moving them.
+    for reduced_np in (simplified_np, simplified_ml, simplified_pv):
+        assert _max_deviation_np(reduced_np, pts_np) < 1e-5
+    # Only the two that bound the deviation are held to the tolerance.
+    assert _max_deviation_np(pts_np, simplified_np) <= tolerance
+    assert _max_deviation_np(pts_np, simplified_pv) <= tolerance
 
 
 def test_closed_keyword_equals_closing_the_polyline_explicitly(device: str) -> None:

@@ -696,8 +696,14 @@ def test_query_geodesic_ball(bench_case: BenchCase) -> None:
     hash-grid query at the same radius would also return vertices across a fold of the surface
     -- the opposite wall of a torus tube -- which is what corrupts the quadric fit in
     ``curvature.principal_curvature``, its only caller. So this row prices the surface-aware
-    alternative to the ball groups above rather than a variant of them, and no reference
-    library exposes it to time against.
+    alternative to the ball groups above rather than a variant of them.
+
+    There is no reference row, and it is a cost objection rather than an absence: meshlib's
+    ``computeSurfaceDistances`` truncated at ``maxDist`` *is* this ball and agrees with it exactly
+    (measured, ``tests/test_neighbors.py``), but it answers **one source per call**, so a row would
+    time a Python loop over the vertex buffer rather than MeshLib -- the per-element rule. Its own
+    timed row is in the ``heat_geodesic`` group, where the same function is priced as a
+    fast-marching front over the whole mesh.
     """
     skip_larger_than(bench_case, "happy_buddha")
     vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
