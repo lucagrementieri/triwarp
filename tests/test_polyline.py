@@ -211,26 +211,26 @@ def _radius_np(
 def test_open_polyline_drops_duplicate_endpoint(device: str) -> None:
     pts_np = _random_open_polyline(0)
     closed_np = _closed_from(pts_np)
-    opened_wp = tw.polyline.open_polyline(_polyline_wp(closed_np, device))
+    opened_wp = tw.polyline.polyline_open(_polyline_wp(closed_np, device))
     assert np.allclose(opened_wp.numpy(), pts_np.astype(np.float32), rtol=1e-5, atol=1e-5)
 
 
 def test_open_polyline_leaves_open_unchanged(device: str) -> None:
     pts_np = _random_open_polyline(1)
-    opened_wp = tw.polyline.open_polyline(_polyline_wp(pts_np, device))
+    opened_wp = tw.polyline.polyline_open(_polyline_wp(pts_np, device))
     assert np.allclose(opened_wp.numpy(), pts_np.astype(np.float32), rtol=1e-5, atol=1e-5)
 
 
 def test_close_polyline_appends_first_point(device: str) -> None:
     pts_np = _random_open_polyline(2)
-    closed_wp = tw.polyline.close_polyline(_polyline_wp(pts_np, device))
+    closed_wp = tw.polyline.polyline_close(_polyline_wp(pts_np, device))
     expected = _closed_from(pts_np).astype(np.float32)
     assert np.allclose(closed_wp.numpy(), expected, rtol=1e-5, atol=1e-5)
 
 
 def test_close_polyline_leaves_closed_unchanged(device: str) -> None:
     closed_np = _closed_from(_random_open_polyline(3))
-    closed_wp = tw.polyline.close_polyline(_polyline_wp(closed_np, device))
+    closed_wp = tw.polyline.polyline_close(_polyline_wp(closed_np, device))
     assert np.allclose(closed_wp.numpy(), closed_np.astype(np.float32), rtol=1e-5, atol=1e-5)
 
 
@@ -341,7 +341,7 @@ def test_polyline_centroid_closed_matches_reference(device: str) -> None:
     ``closed=True`` weights the seam segment like any other, which moves the centroid.
 
     Both halves matter. The first assert is the value, against the same NumPy reference fed the
-    explicitly-closed points -- so ``closed=True`` and ``close_polyline`` agree. The second is that
+    explicitly-closed points -- so ``closed=True`` and ``polyline_close`` agree. The second is that
     the two answers *differ*: this is a length-weighted mean, so adding a segment reweights every
     other one, and a collapse that quietly ignored the keyword would pass the first assert alone.
     """
@@ -398,11 +398,11 @@ def test_distance_to_polyline_matches_reference(device: str) -> None:
     pts_np = _random_open_polyline(40)
     points_np = rng.standard_normal((25, 3))
     points_wp = _polyline_wp(points_np, device)
-    distances_wp = tw.polyline.distance_to_polyline(points_wp, _polyline_wp(pts_np, device))
+    distances_wp = tw.polyline.polyline_point_distance(points_wp, _polyline_wp(pts_np, device))
     assert np.allclose(distances_wp.numpy(), _distance_np(points_np, pts_np), rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.parity("distance_to_polyline", "meshlib")
+@pytest.mark.parity("polyline_point_distance", "meshlib")
 def test_distance_to_polyline_matches_meshlib(device: str) -> None:
     """
     Class A after one named transform: ``findProjectionOnPolyline`` reports a **squared** distance.
@@ -418,7 +418,7 @@ def test_distance_to_polyline_matches_meshlib(device: str) -> None:
     pts_np = _random_open_polyline(40, n=40)
     points_np = rng.standard_normal((50, 3)) * 3.0 + pts_np.mean(axis=0)
 
-    distances_wp = tw.polyline.distance_to_polyline(
+    distances_wp = tw.polyline.polyline_point_distance(
         _polyline_wp(points_np, device), _polyline_wp(pts_np, device)
     )
 
@@ -437,7 +437,7 @@ def test_distance_to_polyline_matches_meshlib(device: str) -> None:
     assert np.allclose(distances_wp.numpy(), distances_ml, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parity("distance_to_polyline", "pyvista")
+@pytest.mark.parity("polyline_point_distance", "pyvista")
 def test_distance_to_polyline_matches_pyvista(device: str) -> None:
     """
     Class A: ``find_closest_cell`` on a one-cell polyline is the point-to-*segment* distance.
@@ -457,7 +457,7 @@ def test_distance_to_polyline_matches_pyvista(device: str) -> None:
     pts_np = _random_open_polyline(40, n=40)
     points_np = rng.standard_normal((50, 3)) * 3.0 + pts_np.mean(axis=0)
 
-    distances_wp = tw.polyline.distance_to_polyline(
+    distances_wp = tw.polyline.polyline_point_distance(
         _polyline_wp(points_np, device), _polyline_wp(pts_np, device)
     )
 
@@ -474,7 +474,7 @@ def test_distance_to_single_point_polyline(device: str) -> None:
     rng = np.random.default_rng(41)
     points_np = rng.standard_normal((10, 3))
     target_np = rng.standard_normal((1, 3))
-    distances_wp = tw.polyline.distance_to_polyline(
+    distances_wp = tw.polyline.polyline_point_distance(
         _polyline_wp(points_np, device), _polyline_wp(target_np, device)
     )
     expected = np.linalg.norm(points_np - target_np[0], axis=-1)
@@ -487,7 +487,7 @@ def test_distance_to_empty_polyline_is_infinite(device: str) -> None:
     points_wp = _polyline_wp(rng.standard_normal((5, 3)), device)
     empty_wp = wp.empty(0, dtype=wp.vec3, device=device)
 
-    distances_wp = tw.polyline.distance_to_polyline(points_wp, empty_wp)
+    distances_wp = tw.polyline.polyline_point_distance(points_wp, empty_wp)
 
     assert np.array_equal(distances_wp.numpy(), np.full(5, np.inf, dtype=np.float32))
 
@@ -498,7 +498,7 @@ def test_distance_to_empty_polyline_is_infinite(device: str) -> None:
 @pytest.mark.parametrize("step", [0.3, 0.75])
 def test_upsample_polyline_matches_reference(device: str, step: float) -> None:
     pts_np = _random_open_polyline(50)
-    upsampled_wp = tw.polyline.upsample_polyline(_polyline_wp(pts_np, device), step)
+    upsampled_wp = tw.polyline.polyline_upsample(_polyline_wp(pts_np, device), step)
     assert np.allclose(upsampled_wp.numpy(), _upsample_np(pts_np, step), rtol=1e-4, atol=1e-4)
 
 
@@ -507,7 +507,7 @@ def test_upsample_point_count(device: str) -> None:
     step = 0.4
     seg_len = np.linalg.norm(np.diff(pts_np, axis=0), axis=-1)
     expected_count = int(np.clip(seg_len // step, 1, None).astype(np.int64).sum())
-    upsampled = tw.polyline.upsample_polyline(_polyline_wp(pts_np, device), step).numpy()
+    upsampled = tw.polyline.polyline_upsample(_polyline_wp(pts_np, device), step).numpy()
     assert upsampled.shape[0] == expected_count
 
 
@@ -517,7 +517,7 @@ def test_upsample_point_count(device: str) -> None:
 @pytest.mark.parametrize("step", [0.3, 0.75])
 def test_smooth_upsample_matches_reference(device: str, step: float) -> None:
     pts_np = _random_open_polyline(50)
-    smoothed_wp = tw.polyline.smooth_upsample_polyline(_polyline_wp(pts_np, device), step)
+    smoothed_wp = tw.polyline.polyline_smooth_upsample(_polyline_wp(pts_np, device), step)
     assert np.allclose(
         smoothed_wp.numpy(), _smooth_upsample_np(pts_np, step, closed=False), rtol=1e-4, atol=1e-4
     )
@@ -526,7 +526,7 @@ def test_smooth_upsample_matches_reference(device: str, step: float) -> None:
 @pytest.mark.parametrize("step", [0.3, 0.75])
 def test_smooth_upsample_closed_matches_reference(device: str, step: float) -> None:
     pts_np = _closed_from(_random_open_polyline(52))
-    smoothed_wp = tw.polyline.smooth_upsample_polyline(
+    smoothed_wp = tw.polyline.polyline_smooth_upsample(
         _polyline_wp(pts_np, device), step, closed=True
     )
     assert np.allclose(
@@ -537,8 +537,8 @@ def test_smooth_upsample_closed_matches_reference(device: str, step: float) -> N
 def test_smooth_upsample_same_point_count_as_linear(device: str) -> None:
     pts_np = _random_open_polyline(53)
     step = 0.4
-    linear = tw.polyline.upsample_polyline(_polyline_wp(pts_np, device), step).numpy()
-    smoothed = tw.polyline.smooth_upsample_polyline(_polyline_wp(pts_np, device), step).numpy()
+    linear = tw.polyline.polyline_upsample(_polyline_wp(pts_np, device), step).numpy()
+    smoothed = tw.polyline.polyline_smooth_upsample(_polyline_wp(pts_np, device), step).numpy()
     assert smoothed.shape == linear.shape
 
 
@@ -547,15 +547,15 @@ def test_smooth_upsample_straight_line_reduces_to_linear(device: str) -> None:
     # the result must coincide with plain linear upsampling.
     pts_np = np.stack([np.linspace(0.0, 3.0, 7), np.zeros(7), np.zeros(7)], axis=1)
     step = 0.25
-    linear = tw.polyline.upsample_polyline(_polyline_wp(pts_np, device), step).numpy()
-    smoothed = tw.polyline.smooth_upsample_polyline(_polyline_wp(pts_np, device), step).numpy()
+    linear = tw.polyline.polyline_upsample(_polyline_wp(pts_np, device), step).numpy()
+    smoothed = tw.polyline.polyline_smooth_upsample(_polyline_wp(pts_np, device), step).numpy()
     assert np.allclose(smoothed, linear, rtol=1e-5, atol=1e-5)
 
 
 def test_smooth_upsample_preserves_original_vertices(device: str) -> None:
     # Each segment's first sample (t == 0) is its start vertex, so all but the final vertex survive.
     pts_np = _random_open_polyline(54, n=6)
-    smoothed = tw.polyline.smooth_upsample_polyline(_polyline_wp(pts_np, device), 0.5).numpy()
+    smoothed = tw.polyline.polyline_smooth_upsample(_polyline_wp(pts_np, device), 0.5).numpy()
     for vertex in pts_np[:-1]:
         assert np.any(np.all(np.isclose(smoothed, vertex, rtol=1e-4, atol=1e-4), axis=1))
 
@@ -565,12 +565,12 @@ def test_smooth_upsample_closed_recovers_circle(device: str) -> None:
     # arcs, so every inserted point lies on the circle (a linear upsample would cut inside it).
     radius = 2.0
     polygon_np = _planar_circle(8, radius)
-    smoothed = tw.polyline.smooth_upsample_polyline(
+    smoothed = tw.polyline.polyline_smooth_upsample(
         _polyline_wp(polygon_np, device), 0.35, closed=True
     ).numpy()
     assert np.allclose(np.linalg.norm(smoothed, axis=-1), radius, rtol=1e-3, atol=1e-3)
     # The added points genuinely bulge outward relative to the straight-chord upsample.
-    linear = tw.polyline.upsample_polyline(
+    linear = tw.polyline.polyline_upsample(
         _polyline_wp(polygon_np, device), 0.35, closed=True
     ).numpy()
     assert np.linalg.norm(linear, axis=-1).min() < radius - 1e-2
@@ -578,7 +578,7 @@ def test_smooth_upsample_closed_recovers_circle(device: str) -> None:
 
 def test_smooth_upsample_short_polyline_unchanged(device: str) -> None:
     single = _polyline_wp(np.array([[1.0, 2.0, 3.0]]), device)
-    assert tw.polyline.smooth_upsample_polyline(single, 0.5).shape[0] == 1
+    assert tw.polyline.polyline_smooth_upsample(single, 0.5).shape[0] == 1
 
 
 # --- cumulative_arc_length (NumPy reference) ---
@@ -607,7 +607,7 @@ def test_cumulative_arc_length_last_entry_is_total_length(device: str) -> None:
 @pytest.mark.parametrize("step", [0.5, 1.5])
 def test_downsample_polyline_matches_reference(device: str, step: float) -> None:
     pts_np = _random_open_polyline(60)
-    downsampled_wp = tw.polyline.downsample_polyline(_polyline_wp(pts_np, device), step)
+    downsampled_wp = tw.polyline.polyline_downsample(_polyline_wp(pts_np, device), step)
     assert np.allclose(downsampled_wp.numpy(), _downsample_np(pts_np, step), rtol=1e-4, atol=1e-4)
 
 
@@ -617,7 +617,7 @@ def test_downsample_polyline_matches_reference(device: str, step: float) -> None
 @pytest.mark.parametrize("num_points", [5, 50])
 def test_resample_polyline_matches_numpy_interp(device: str, num_points: int) -> None:
     pts_np = _random_open_polyline(70)
-    resampled_wp = tw.polyline.resample_polyline(_polyline_wp(pts_np, device), num_points)
+    resampled_wp = tw.polyline.polyline_resample(_polyline_wp(pts_np, device), num_points)
     assert np.allclose(resampled_wp.numpy(), _resample_np(pts_np, num_points), rtol=1e-4, atol=1e-4)
 
 
@@ -633,14 +633,14 @@ def test_resample_polyline_matches_trimesh(device: str) -> None:
     pts_np = _random_open_polyline(71)
     num_points = 40
     resampled_tm = tm_traversal.resample_path(pts_np, count=num_points)
-    resampled_wp = tw.polyline.resample_polyline(_polyline_wp(pts_np, device), num_points)
+    resampled_wp = tw.polyline.polyline_resample(_polyline_wp(pts_np, device), num_points)
     assert np.allclose(resampled_wp.numpy(), resampled_tm, rtol=1e-3, atol=1e-3)
 
 
 def test_resample_polyline_closed_shape_and_endpoints(device: str) -> None:
     pts_np = _random_open_polyline(72)
     num_points = 16
-    resampled_wp = tw.polyline.resample_polyline(
+    resampled_wp = tw.polyline.polyline_resample(
         _polyline_wp(pts_np, device), num_points, closed=True
     )
     resampled = resampled_wp.numpy()
@@ -651,7 +651,7 @@ def test_resample_polyline_closed_shape_and_endpoints(device: str) -> None:
 
 def test_resample_single_point_repeats(device: str) -> None:
     point_np = np.array([[1.0, 2.0, 3.0]])
-    resampled_wp = tw.polyline.resample_polyline(_polyline_wp(point_np, device), 5)
+    resampled_wp = tw.polyline.polyline_resample(_polyline_wp(point_np, device), 5)
     assert np.allclose(resampled_wp.numpy(), np.repeat(point_np, 5, axis=0), rtol=1e-5, atol=1e-5)
 
 
@@ -767,7 +767,7 @@ def test_angles_short_polyline_is_zeros(device: str) -> None:
 def test_distance_empty_polyline(device: str) -> None:
     points = _polyline_wp(np.random.default_rng(99).standard_normal((4, 3)), device)
     empty = wp.empty(0, dtype=wp.vec3, device=device)
-    assert tw.polyline.distance_to_polyline(points, empty).shape[0] == 4
+    assert tw.polyline.polyline_point_distance(points, empty).shape[0] == 4
 
 
 # --- triangulate (ear clipping) ---
@@ -824,13 +824,13 @@ def _assert_valid_triangulation(pts: np.ndarray, faces: np.ndarray) -> None:
     assert np.allclose(tri_areas.sum(), _polygon_area(pts), rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parity("triangulate_polyline", "meshlib")
+@pytest.mark.parity("polyline_triangulate", "meshlib")
 def test_triangulate_polyline_matches_meshlib(device: str) -> None:
     """
     Class C (count and area): two ear-clippings of the same polygon, with different diagonals.
 
     ``triangulateContours`` takes **2-D** closed contours -- ``std_vector_Vector2_float`` with the
-    first point repeated -- where ``triangulate_polyline`` takes an open 3-D loop, so the transform
+    first point repeated -- where ``polyline_triangulate`` takes an open 3-D loop, so the transform
     is dropping z and closing the ring. Omitting the repeat is the silent failure mode: an open
     square comes back as **one** triangle over three vertices rather than two over four.
 
@@ -861,7 +861,7 @@ def test_triangulate_polyline_matches_meshlib(device: str) -> None:
         ),
     ):
         points_np = np.column_stack([polygon_np, np.zeros(polygon_np.shape[0])])
-        faces_wp = tw.polyline.triangulate_polyline(_polyline_wp(points_np, device)).numpy()
+        faces_wp = tw.polyline.polyline_triangulate(_polyline_wp(points_np, device)).numpy()
 
         contour_ml = mm.std_vector_Vector2_float()
         for point_np in np.vstack([polygon_np, polygon_np[:1]]):  # closed: the repeat is required
@@ -880,7 +880,7 @@ def test_triangulate_polyline_matches_meshlib(device: str) -> None:
         assert np.isclose(area_wp, _polygon_area(points_np), rtol=1e-5), name
 
 
-@pytest.mark.parity("triangulate_polyline", "pyvista")
+@pytest.mark.parity("polyline_triangulate", "pyvista")
 def test_triangulate_polyline_matches_pyvista(device: str) -> None:
     """
     Class C (count and area): VTK's ``triangulate_contours`` ear-clips the same polygon.
@@ -902,7 +902,7 @@ def test_triangulate_polyline_matches_pyvista(device: str) -> None:
         ("star", _star(5)[:, :2]),
     ):
         points_np = np.column_stack([polygon_np, np.zeros(polygon_np.shape[0])])
-        faces_wp = tw.polyline.triangulate_polyline(_polyline_wp(points_np, device)).numpy()
+        faces_wp = tw.polyline.polyline_triangulate(_polyline_wp(points_np, device)).numpy()
 
         filled_pv = polyline_to_pyvista(points_np, closed=True).triangulate_contours()
         assert filled_pv.is_all_triangles, name
@@ -917,7 +917,7 @@ def test_triangulate_polyline_matches_pyvista(device: str) -> None:
 
 def test_triangulate_convex_is_fan(device: str) -> None:
     pts_np = _convex_ngon(8)
-    faces_wp = tw.polyline.triangulate_polyline(_polyline_wp(pts_np, device))
+    faces_wp = tw.polyline.polyline_triangulate(_polyline_wp(pts_np, device))
     n = pts_np.shape[0]
     expected = np.stack([np.zeros(n - 2), np.arange(1, n - 1), np.arange(2, n)], axis=1)
     assert np.array_equal(faces_wp.numpy(), expected.astype(np.int32))
@@ -926,46 +926,46 @@ def test_triangulate_convex_is_fan(device: str) -> None:
 
 def test_triangulate_l_shape(device: str) -> None:
     pts_np = _l_shape()
-    faces_wp = tw.polyline.triangulate_polyline(_polyline_wp(pts_np, device))
+    faces_wp = tw.polyline.polyline_triangulate(_polyline_wp(pts_np, device))
     _assert_valid_triangulation(pts_np, faces_wp.numpy())
 
 
 def test_triangulate_star(device: str) -> None:
     pts_np = _star(6)
-    faces_wp = tw.polyline.triangulate_polyline(_polyline_wp(pts_np, device))
+    faces_wp = tw.polyline.polyline_triangulate(_polyline_wp(pts_np, device))
     _assert_valid_triangulation(pts_np, faces_wp.numpy())
 
 
 def test_triangulate_tilted_plane(device: str) -> None:
     pts_np = _rotate_into_3d(_star(6), seed=7)
-    faces_wp = tw.polyline.triangulate_polyline(_polyline_wp(pts_np, device))
+    faces_wp = tw.polyline.polyline_triangulate(_polyline_wp(pts_np, device))
     _assert_valid_triangulation(pts_np, faces_wp.numpy())
 
 
 def test_triangulate_clockwise_orientation(device: str) -> None:
     pts_np = _l_shape()[::-1].copy()  # reverse to clockwise
-    faces_wp = tw.polyline.triangulate_polyline(_polyline_wp(pts_np, device))
+    faces_wp = tw.polyline.polyline_triangulate(_polyline_wp(pts_np, device))
     _assert_valid_triangulation(pts_np, faces_wp.numpy())
 
 
 def test_triangulate_closed_input_matches_open(device: str) -> None:
     pts_np = _star(5)
     closed_np = _closed_from(pts_np)
-    faces_open = tw.polyline.triangulate_polyline(_polyline_wp(pts_np, device)).numpy()
-    faces_closed = tw.polyline.triangulate_polyline(_polyline_wp(closed_np, device)).numpy()
+    faces_open = tw.polyline.polyline_triangulate(_polyline_wp(pts_np, device)).numpy()
+    faces_closed = tw.polyline.polyline_triangulate(_polyline_wp(closed_np, device)).numpy()
     assert np.array_equal(faces_open, faces_closed)
 
 
 def test_triangulate_single_triangle(device: str) -> None:
     pts_np = _convex_ngon(3)
-    faces_wp = tw.polyline.triangulate_polyline(_polyline_wp(pts_np, device))
+    faces_wp = tw.polyline.polyline_triangulate(_polyline_wp(pts_np, device))
     assert faces_wp.shape == (1, 3)
     assert set(faces_wp.numpy().ravel().tolist()) == {0, 1, 2}
 
 
 def test_triangulate_too_few_points(device: str) -> None:
     pts_np = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
-    faces_wp = tw.polyline.triangulate_polyline(_polyline_wp(pts_np, device))
+    faces_wp = tw.polyline.polyline_triangulate(_polyline_wp(pts_np, device))
     assert faces_wp.shape == (0, 3)
 
 
@@ -1010,7 +1010,7 @@ def _simplify_np(pts_np: np.ndarray, tol: float) -> tuple[np.ndarray, np.ndarray
 @pytest.mark.parametrize("seed", [0, 7, 42])
 def test_simplify_matches_reference(device: str, tol: float, seed: int) -> None:
     pts_np = _random_open_polyline(seed, n=40)
-    simplified_wp, indices_wp = tw.polyline.simplify_polyline(_polyline_wp(pts_np, device), tol)
+    simplified_wp, indices_wp = tw.polyline.polyline_simplify(_polyline_wp(pts_np, device), tol)
     simplified_np, indices_np = _simplify_np(pts_np, tol)
     assert np.array_equal(indices_wp.numpy(), indices_np.astype(np.int32))
     assert np.allclose(
@@ -1020,7 +1020,7 @@ def test_simplify_matches_reference(device: str, tol: float, seed: int) -> None:
 
 def test_simplify_collinear_collapses_to_endpoints(device: str) -> None:
     pts_np = np.stack([np.linspace(0.0, 1.0, 11), np.zeros(11), np.zeros(11)], axis=1)
-    simplified_wp, indices_wp = tw.polyline.simplify_polyline(_polyline_wp(pts_np, device), 1e-3)
+    simplified_wp, indices_wp = tw.polyline.polyline_simplify(_polyline_wp(pts_np, device), 1e-3)
     assert np.array_equal(indices_wp.numpy(), np.array([0, 10], dtype=np.int32))
     assert np.allclose(simplified_wp.numpy(), pts_np[[0, 10]].astype(np.float32))
 
@@ -1028,27 +1028,27 @@ def test_simplify_collinear_collapses_to_endpoints(device: str) -> None:
 def test_simplify_preserves_a_sharp_corner(device: str) -> None:
     # A tent: the apex deviates far from the base chord and must be kept.
     pts_np = np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float64)
-    _, indices_wp = tw.polyline.simplify_polyline(_polyline_wp(pts_np, device), 0.1)
+    _, indices_wp = tw.polyline.polyline_simplify(_polyline_wp(pts_np, device), 0.1)
     assert np.array_equal(indices_wp.numpy(), np.array([0, 1, 2], dtype=np.int32))
 
 
 def test_simplify_empty(device: str) -> None:
     empty_wp = wp.array(np.zeros((0, 3), dtype=np.float32), dtype=wp.vec3, device=device)
-    simplified_wp, indices_wp = tw.polyline.simplify_polyline(empty_wp, 0.5)
+    simplified_wp, indices_wp = tw.polyline.polyline_simplify(empty_wp, 0.5)
     assert simplified_wp.shape == (0,)
     assert indices_wp.shape == (0,)
 
 
 def test_simplify_single_point(device: str) -> None:
     pts_np = np.array([[0.3, -0.4, 1.2]])
-    simplified_wp, indices_wp = tw.polyline.simplify_polyline(_polyline_wp(pts_np, device), 0.5)
+    simplified_wp, indices_wp = tw.polyline.polyline_simplify(_polyline_wp(pts_np, device), 0.5)
     assert np.array_equal(indices_wp.numpy(), np.array([0], dtype=np.int32))
     assert np.allclose(simplified_wp.numpy(), pts_np.astype(np.float32))
 
 
 def test_simplify_two_points_kept(device: str) -> None:
     pts_np = np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]])
-    _, indices_wp = tw.polyline.simplify_polyline(_polyline_wp(pts_np, device), 0.5)
+    _, indices_wp = tw.polyline.polyline_simplify(_polyline_wp(pts_np, device), 0.5)
     assert np.array_equal(indices_wp.numpy(), np.array([0, 1], dtype=np.int32))
 
 
@@ -1056,7 +1056,7 @@ def test_simplify_two_points_kept(device: str) -> None:
 def test_simplify_closed_matches_reference(device: str, tol: float) -> None:
     pts_np = _random_open_polyline(3, n=30)
     closed_np = _closed_from(pts_np)
-    simplified_wp, indices_wp = tw.polyline.simplify_polyline(
+    simplified_wp, indices_wp = tw.polyline.polyline_simplify(
         _polyline_wp(pts_np, device), tol, closed=True
     )
     simplified_np, indices_np = _simplify_np(closed_np, tol)
@@ -1068,7 +1068,7 @@ def test_simplify_closed_matches_reference(device: str, tol: float) -> None:
 
 def test_closed_keyword_equals_closing_the_polyline_explicitly(device: str) -> None:
     """
-    ``closed=True`` is exactly the open computation on ``close_polyline(polyline)``.
+    ``closed=True`` is exactly the open computation on ``polyline_close(polyline)``.
 
     The convention, asserted once for every function that carries the keyword rather than seven
     times in seven near-identical tests. Three of the ten additionally drop the duplicated seam
@@ -1077,7 +1077,7 @@ def test_closed_keyword_equals_closing_the_polyline_explicitly(device: str) -> N
     """
     pts_np = _random_open_polyline(33, n=20)
     polyline_wp = _polyline_wp(pts_np, device)
-    closed_wp = tw.polyline.close_polyline(polyline_wp)
+    closed_wp = tw.polyline.polyline_close(polyline_wp)
     queries_wp = _polyline_wp(_random_open_polyline(34, n=15), device)
     n_original = int(polyline_wp.shape[0])
 
@@ -1095,36 +1095,36 @@ def test_closed_keyword_equals_closing_the_polyline_explicitly(device: str) -> N
         tw.polyline.polyline_radius(closed_wp, "mean"),
     )
     assert np.array_equal(
-        tw.polyline.distance_to_polyline(queries_wp, polyline_wp, closed=True).numpy(),
-        tw.polyline.distance_to_polyline(queries_wp, closed_wp).numpy(),
+        tw.polyline.polyline_point_distance(queries_wp, polyline_wp, closed=True).numpy(),
+        tw.polyline.polyline_point_distance(queries_wp, closed_wp).numpy(),
     )
     assert np.array_equal(
-        tw.polyline.upsample_polyline(polyline_wp, 0.3, closed=True).numpy(),
-        tw.polyline.upsample_polyline(closed_wp, 0.3).numpy(),
+        tw.polyline.polyline_upsample(polyline_wp, 0.3, closed=True).numpy(),
+        tw.polyline.polyline_upsample(closed_wp, 0.3).numpy(),
     )
     assert np.array_equal(
-        tw.polyline.downsample_polyline(polyline_wp, 0.3, closed=True).numpy(),
-        tw.polyline.downsample_polyline(closed_wp, 0.3).numpy(),
+        tw.polyline.polyline_downsample(polyline_wp, 0.3, closed=True).numpy(),
+        tw.polyline.polyline_downsample(closed_wp, 0.3).numpy(),
     )
-    simplified_closed, indices_closed = tw.polyline.simplify_polyline(
+    simplified_closed, indices_closed = tw.polyline.polyline_simplify(
         polyline_wp, 0.05, closed=True
     )
-    simplified_explicit, indices_explicit = tw.polyline.simplify_polyline(closed_wp, 0.05)
+    simplified_explicit, indices_explicit = tw.polyline.polyline_simplify(closed_wp, 0.05)
     assert np.array_equal(simplified_closed.numpy(), simplified_explicit.numpy())
     assert np.array_equal(indices_closed.numpy(), indices_explicit.numpy())
 
     # ...and the three that drop the duplicated seam point, so their result is a cyclic ring.
     assert np.array_equal(
-        tw.polyline.resample_polyline(polyline_wp, 17, closed=True).numpy(),
-        tw.polyline.resample_polyline(closed_wp, 18).numpy()[0:17],
+        tw.polyline.polyline_resample(polyline_wp, 17, closed=True).numpy(),
+        tw.polyline.polyline_resample(closed_wp, 18).numpy()[0:17],
     )
     assert np.array_equal(
         tw.polyline.polyline_angles(polyline_wp, closed=True).numpy(),
         tw.polyline.polyline_angles(closed_wp).numpy()[0:n_original],
     )
     assert np.array_equal(
-        tw.polyline.smooth_upsample_polyline(polyline_wp, 0.3, closed=True).numpy(),
-        tw.polyline.smooth_upsample_polyline(closed_wp, 0.3, closed=True).numpy(),
+        tw.polyline.polyline_smooth_upsample(polyline_wp, 0.3, closed=True).numpy(),
+        tw.polyline.polyline_smooth_upsample(closed_wp, 0.3, closed=True).numpy(),
     )
 
 

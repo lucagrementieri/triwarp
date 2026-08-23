@@ -306,8 +306,8 @@ def polyline_to_pyvista(polyline_np: np.ndarray, *, closed: bool = False) -> pv.
     ``compute_arc_length`` reports **0.0638** for a 200-point helix whose length is 12.7049, and
     ``decimate_polyline`` is a no-op at every reduction. ``find_closest_cell`` on this form is the
     point-to-*segment* distance (measured 2.49e-07 against
-    [`distance_to_polyline`][triwarp.polyline.distance_to_polyline]), where on the per-segment form
-    it is the same answer at 199x the cell count.
+    [`polyline_point_distance`][triwarp.polyline.polyline_point_distance]), where on the
+    per-segment form it is the same answer at 199x the cell count.
 
     ``closed=True`` repeats the first index at the end, which is what ``triangulate_contours``
     needs to read the line as a polygon boundary; the point buffer itself is not duplicated.

@@ -11,10 +11,10 @@ because within a class the kernels differ only in the per-segment expression:
   a plane and finds each segment's closest point before reducing.
 * **Per-vertex maps** (``polyline_angles``, ``cumulative_arc_length``) — one value per vertex,
   purely local. ``polyline_angles`` is the ``wp.acos`` path.
-* **Resampling** (``upsample_polyline``, ``resample_polyline``, ``downsample_polyline``) — an
+* **Resampling** (``polyline_upsample``, ``polyline_resample``, ``polyline_downsample``) — an
   output whose length is data-dependent, so these pay a scan plus a host readback of the output
   size before the write pass. The interpolation itself is the ``wp.lerp`` inner loop.
-* **Simplification** (``simplify_polyline``) — Ramer-Douglas-Peucker, which Warp cannot express in
+* **Simplification** (``polyline_simplify``) — Ramer-Douglas-Peucker, which Warp cannot express in
   parallel (it is a recursive split, and Warp forbids recursion), so it runs as a *single-thread*
   stack-based kernel. This is the deliberate outlier of the module and the only case here whose
   cost is O(n) serial work on one GPU thread; expect it to be slower than everything else by
@@ -23,12 +23,12 @@ because within a class the kernels differ only in the per-segment expression:
   this group measured as neutral (25.59 -> 25.53 ms on ``rim_long``) and so is a structural
   cleanup rather than a win — the recursion dominates by two orders of magnitude.
 
-``distance_to_polyline`` is timed separately from the rest because it is the only function whose
+``polyline_point_distance`` is timed separately from the rest because it is the only function whose
 cost is the product of two sizes (query points x segments) rather than a function of the polyline
 alone.
 
 ``triangulate_polygon`` is the remaining exception, and the module's worked example of a cost
-that is not where it looks. It delegates to ``polyline.triangulate_polyline``, a **parallel**
+that is not where it looks. It delegates to ``polyline.polyline_triangulate``, a **parallel**
 multi-round ear clipper — every launch in the round loop is ``dim=n``, and a round clips a whole
 *independent set* of ears at once. What is serial is the **round count**: a round costs four
 ``dim=n`` launches whatever it clips, so the only thing that matters is how many ears survive per
@@ -38,7 +38,7 @@ before — 2.07x and 1.53x.
 
 Read the residual against its attribution rather than against the round loop, because the round loop
 is no longer the cost: at 64 points the clip itself is 0.22 ms of the 2.2, and **1.05 ms is the
-prologue** — ``open_polyline``'s ``is_closed`` (0.24), ``polyline_normal`` (0.35) and
+prologue** — ``polyline_open``'s ``is_closed`` (0.24), ``polyline_normal`` (0.35) and
 ``polyline_centroid`` (0.25), three reductions that each end in a host readback because their result
 is a Python-scope ``wp.vec3``, plus the reflex-count readback. That share is *flat in n*, so it is
 the whole gap to trimesh's 0.12 ms at 64 points and none of it at 1 024.
@@ -61,8 +61,8 @@ The longest loop of each mesh is gathered into a dense ``wp.vec3`` buffer once p
 and reused across rounds, so the timed region contains only the polyline function itself.
 
 Two groups carry a second sweep, on the parameter that drives them rather than on length:
-``simplify_polyline`` on its tolerance (which sets the recursion depth of a serial algorithm) and
-``distance_to_polyline`` on the query count (the other half of its two-size product).
+``polyline_simplify`` on its tolerance (which sets the recursion depth of a serial algorithm) and
+``polyline_point_distance`` on the query count (the other half of its two-size product).
 
 References
 ----------
@@ -72,10 +72,10 @@ blanket:
 * **trimesh** models polylines as ``trimesh.path.Path3D`` entities, not arrays, and its only
   simplification is ``trimesh.path.simplify.merge_colinear`` — a colinear-run merge, a different
   algorithm from Ramer-Douglas-Peucker with a different output, so it is not a parity baseline for
-  ``simplify_polyline``. It has no arc-length resampling for 3D polylines
+  ``polyline_simplify``. It has no arc-length resampling for 3D polylines
   (``resample_spline`` fits a spline first, which changes the geometry).
 * **libigl**'s ``igl.upsample`` is *mesh* subdivision, not polyline resampling; the C++
-  ``ramer_douglas_peucker`` that ``simplify_polyline`` is ported from is **not exposed** in the
+  ``ramer_douglas_peucker`` that ``polyline_simplify`` is ported from is **not exposed** in the
   Python bindings (only ``upsample`` / ``upsample_matrix`` match the name search).
 * **open3d** has no polyline type at all — ``LineSet`` stores unordered segments with no ordering,
   length, resampling or simplification operations.
@@ -91,10 +91,10 @@ import pytest
 import pyvista as pv
 import trimesh as tm
 import warp as wp
-from conftest import BenchCase, BenchLibrary, skip_larger_than
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchCase, BenchLibrary, skip_larger_than
 
 # Resampling step, as a fraction of the mean segment length: < 1 upsamples, > 1 downsamples.
 _UPSAMPLE_FRACTION = 0.5
@@ -105,7 +105,7 @@ _DOWNSAMPLE_FRACTION = 4.0
 # the whole cost; the pair is two orders of magnitude apart so the slope is unambiguous.
 _SIMPLIFY_FRACTIONS = [1e-3, 1e-1]
 
-# Query-point counts for distance_to_polyline: the second size in its points x segments product,
+# Query-point counts for polyline_point_distance: the second size in its points x segments product,
 # swept independently of the polyline length the axis provides.
 _N_QUERIES = [1 << 12, 1 << 16]
 
@@ -303,29 +303,29 @@ def test_polyline_angles(bench_case: BenchCase) -> None:
     assert angles.shape[0] == int(polyline.shape[0])
 
 
-@pytest.mark.benchmark(group="upsample_polyline")
+@pytest.mark.benchmark(group="polyline_upsample")
 @pytest.mark.benchaxis("polyline")
 @pytest.mark.benchlibs("triwarp")
 def test_upsample_polyline(bench_case: BenchCase) -> None:
     """Arc-length upsampling at half the mean segment length: scan, readback, then a lerp pass."""
     polyline = _polyline_wp(bench_case)
     step = _UPSAMPLE_FRACTION * _segment_scale(bench_case)[0]
-    dense = bench_case.run(lambda: tw.polyline.upsample_polyline(polyline, step))
+    dense = bench_case.run(lambda: tw.polyline.polyline_upsample(polyline, step))
     assert dense.shape[0] >= int(polyline.shape[0])
 
 
-@pytest.mark.benchmark(group="downsample_polyline")
+@pytest.mark.benchmark(group="polyline_downsample")
 @pytest.mark.benchaxis("polyline")
 @pytest.mark.benchlibs("triwarp")
 def test_downsample_polyline(bench_case: BenchCase) -> None:
     """Arc-length downsampling at four times the mean segment length."""
     polyline = _polyline_wp(bench_case)
     step = _DOWNSAMPLE_FRACTION * _segment_scale(bench_case)[0]
-    sparse = bench_case.run(lambda: tw.polyline.downsample_polyline(polyline, step))
+    sparse = bench_case.run(lambda: tw.polyline.polyline_downsample(polyline, step))
     assert sparse.shape[0] >= 2
 
 
-@pytest.mark.benchmark(group="simplify_polyline")
+@pytest.mark.benchmark(group="polyline_simplify")
 @pytest.mark.benchaxis("polyline")
 @pytest.mark.benchlibs("triwarp")
 @pytest.mark.parametrize("tolerance_fraction", _SIMPLIFY_FRACTIONS)
@@ -333,11 +333,11 @@ def test_simplify_polyline(bench_case: BenchCase, tolerance_fraction: float) -> 
     """Ramer-Douglas-Peucker on a *single* GPU thread — the module's deliberate serial outlier."""
     polyline = _polyline_wp(bench_case)
     tol = tolerance_fraction * _segment_scale(bench_case)[1]
-    simplified, kept = bench_case.run(lambda: tw.polyline.simplify_polyline(polyline, tol))
+    simplified, kept = bench_case.run(lambda: tw.polyline.polyline_simplify(polyline, tol))
     assert simplified.shape[0] == kept.shape[0]
 
 
-@pytest.mark.benchmark(group="distance_to_polyline")
+@pytest.mark.benchmark(group="polyline_point_distance")
 @pytest.mark.benchaxis("polyline")
 @pytest.mark.benchlibs("triwarp", "meshlib", "pyvista")
 @pytest.mark.parametrize("n_queries", _N_QUERIES)
@@ -389,7 +389,7 @@ def test_distance_to_polyline(bench_case: BenchCase, n_queries: int) -> None:
         return
     polyline = _polyline_wp(bench_case)
     points = _query_points_wp(bench_case, n_queries)
-    distance = bench_case.run(lambda: tw.polyline.distance_to_polyline(points, polyline))
+    distance = bench_case.run(lambda: tw.polyline.polyline_point_distance(points, polyline))
     assert distance.shape[0] == n_queries
 
 
@@ -412,7 +412,7 @@ def _polygon_np(n_vertices: int) -> np.ndarray:
     return _polygon_np_cache[n_vertices]
 
 
-@pytest.mark.benchmark(group="triangulate_polyline")
+@pytest.mark.benchmark(group="polyline_triangulate")
 @pytest.mark.benchmeshes("sphere_small")
 @pytest.mark.benchlibs("triwarp", "meshlib", "pyvista")
 @pytest.mark.parametrize("n_vertices", _POLYGON_SIZES)
@@ -460,7 +460,7 @@ def test_triangulate_polyline(bench_case: BenchCase, n_vertices: int) -> None:
         dtype=wp.vec3,
         device=bench_case.device,
     )
-    faces = bench_case.run(lambda: tw.polyline.triangulate_polyline(points_wp))
+    faces = bench_case.run(lambda: tw.polyline.polyline_triangulate(points_wp))
     assert int(faces.shape[0]) == n_vertices - 2
 
 

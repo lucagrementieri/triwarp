@@ -1,19 +1,34 @@
 """
 Open and closed 3D polyline operations.
 
+**The ``polyline_`` prefix.** Where a name carries the module's own token, the token comes
+**first** -- ``polyline_length``, ``polyline_open``, ``polyline_resample``,
+``polyline_triangulate`` -- so the whole family sorts and completes together. The measures used to
+take the prefix while the operations took it as a suffix, which put one convention in two places
+for no reason.
+
+A function that does *not* need the token does not gain one:
+[`is_closed`][triwarp.polyline.is_closed] and
+[`cumulative_arc_length`][triwarp.polyline.cumulative_arc_length] have an unambiguous subject
+already, and [`triangulate_polygon`][triwarp.polyline.triangulate_polygon] takes a 2D polygon
+rather than a polyline, so the token there would be wrong rather than redundant.
+[`polyline_point_distance`][triwarp.polyline.polyline_point_distance] keeps both nouns because the
+prefix alone would lose "from what"; it is spelled to match
+[`points.point_plane_distance`][triwarp.points.point_plane_distance].
+
 **The ``closed=`` convention.** Ten of these functions -- length, centroid, radius, angles,
 point-to-curve distance, and the five resampling operations -- take a keyword-only
 ``closed: bool = False``. Passing ``closed=True`` appends the closing edge back to the first point
-if it is absent ([`close_polyline`][triwarp.polyline.close_polyline]) and then does the open
+if it is absent ([`polyline_close`][triwarp.polyline.polyline_close]) and then does the open
 computation on that, so the seam is treated like any other segment. Three of the ten additionally
 drop the duplicated seam point on the way out, so their result is a clean cyclic ring with one entry
 per *original* point rather than one extra:
-[`resample_polyline`][triwarp.polyline.resample_polyline],
+[`polyline_resample`][triwarp.polyline.polyline_resample],
 [`polyline_angles`][triwarp.polyline.polyline_angles] and
-[`smooth_upsample_polyline`][triwarp.polyline.smooth_upsample_polyline].
+[`polyline_smooth_upsample`][triwarp.polyline.polyline_smooth_upsample].
 
 The keyword is not always needed. [`polyline_angles`][triwarp.polyline.polyline_angles] and
-[`smooth_upsample_polyline`][triwarp.polyline.smooth_upsample_polyline] already detect an
+[`polyline_smooth_upsample`][triwarp.polyline.polyline_smooth_upsample] already detect an
 *explicitly* closed input -- one whose last point equals its first -- with
 [`is_closed`][triwarp.polyline.is_closed]; ``closed=True`` is for the common case of a loop stored
 without that duplicate, which is the form
@@ -53,14 +68,14 @@ def is_closed(polyline: wp.array[wp.vec3]) -> bool:
 
     See Also
     --------
-    [`open_polyline`][triwarp.polyline.open_polyline]
-    [`close_polyline`][triwarp.polyline.close_polyline]
+    [`polyline_open`][triwarp.polyline.polyline_open]
+    [`polyline_close`][triwarp.polyline.polyline_close]
     """
     n = int(polyline.shape[0])
     return n >= 2 and tw.array.allclose(polyline[0:1], polyline[n - 1 : n])
 
 
-def open_polyline(polyline: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
+def polyline_open(polyline: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
     """
     Open a polyline by dropping the last point when it duplicates the first.
 
@@ -77,7 +92,7 @@ def open_polyline(polyline: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
 
     See Also
     --------
-    [`close_polyline`][triwarp.polyline.close_polyline]
+    [`polyline_close`][triwarp.polyline.polyline_close]
     """
     n = int(polyline.shape[0])
     if not is_closed(polyline):
@@ -85,7 +100,7 @@ def open_polyline(polyline: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
     return polyline[0 : n - 1]
 
 
-def close_polyline(polyline: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
+def polyline_close(polyline: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
     """
     Close a polyline by appending the first point when it is not already the last.
 
@@ -102,7 +117,7 @@ def close_polyline(polyline: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
 
     See Also
     --------
-    [`open_polyline`][triwarp.polyline.open_polyline]
+    [`polyline_open`][triwarp.polyline.polyline_open]
     """
     n = int(polyline.shape[0])
     if n < 2 or is_closed(polyline):
@@ -120,7 +135,7 @@ def polyline_length(polyline: wp.array[wp.vec3], *, closed: bool = False) -> flo
         ``(n,)`` polyline vertices as ``wp.vec3``.
     closed
         When ``True``, treat the polyline as a loop: the closing edge back to the first point is
-        added if absent (see [`close_polyline`][triwarp.polyline.close_polyline]), so the closing
+        added if absent (see [`polyline_close`][triwarp.polyline.polyline_close]), so the closing
         edge counts toward the total.
 
     Returns
@@ -134,7 +149,7 @@ def polyline_length(polyline: wp.array[wp.vec3], *, closed: bool = False) -> flo
         The same lengths, unreduced.
     """
     if closed:
-        polyline = close_polyline(polyline)
+        polyline = polyline_close(polyline)
     device = polyline.device
     n_segments = int(polyline.shape[0]) - 1
     if n_segments < 1:
@@ -157,7 +172,7 @@ def polyline_centroid(polyline: wp.array[wp.vec3], *, closed: bool = False) -> w
         ``(n,)`` polyline vertices as ``wp.vec3``.
     closed
         When ``True``, treat the polyline as a loop: the closing edge back to the first point is
-        added if absent (see [`close_polyline`][triwarp.polyline.close_polyline]), so the closing
+        added if absent (see [`polyline_close`][triwarp.polyline.polyline_close]), so the closing
         segment contributes its midpoint and length like any other.
 
     Returns
@@ -177,7 +192,7 @@ def polyline_centroid(polyline: wp.array[wp.vec3], *, closed: bool = False) -> w
         Both default their plane to this centroid.
     """
     if closed:
-        polyline = close_polyline(polyline)
+        polyline = polyline_close(polyline)
     device = polyline.device
     n_segments = int(polyline.shape[0]) - 1
     if n_segments < 1:
@@ -219,7 +234,7 @@ def polyline_normal(polyline: wp.array[wp.vec3]) -> wp.vec3:
     ValueError
         If the polyline has fewer than three points.
     """
-    polyline = close_polyline(polyline)
+    polyline = polyline_close(polyline)
     device = polyline.device
     n = int(polyline.shape[0])
     # The closed polyline's last vertex duplicates its first, so it has n - 1 distinct vertices;
@@ -239,7 +254,7 @@ def polyline_normal(polyline: wp.array[wp.vec3]) -> wp.vec3:
     return out_normal.list()[0]
 
 
-def distance_to_polyline(
+def polyline_point_distance(
     points: wp.array[wp.vec3], polyline: wp.array[wp.vec3], *, closed: bool = False
 ) -> wp.array[wp.float32]:
     """
@@ -253,7 +268,7 @@ def distance_to_polyline(
         ``(m,)`` polyline vertices as ``wp.vec3``.
     closed
         When ``True``, treat the polyline as a loop: the closing edge back to the first point is
-        added if absent (see [`close_polyline`][triwarp.polyline.close_polyline]), so the closing
+        added if absent (see [`polyline_close`][triwarp.polyline.polyline_close]), so the closing
         edge is a candidate segment like any other.
 
     Returns
@@ -265,7 +280,7 @@ def distance_to_polyline(
         [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh] uses.
     """
     if closed:
-        polyline = close_polyline(polyline)
+        polyline = polyline_close(polyline)
     device = points.device
     n_points = int(points.shape[0])
     m = int(polyline.shape[0])
@@ -291,7 +306,7 @@ def distance_to_polyline(
     return out_distances
 
 
-def upsample_polyline(
+def polyline_upsample(
     polyline: wp.array[wp.vec3], step_size: float, *, closed: bool = False
 ) -> wp.array[wp.vec3]:
     """
@@ -308,7 +323,7 @@ def upsample_polyline(
         Target spacing between consecutive output points.
     closed
         When ``True``, treat the polyline as a loop: the closing edge back to the first point is
-        added if absent (see [`close_polyline`][triwarp.polyline.close_polyline]), and the
+        added if absent (see [`polyline_close`][triwarp.polyline.polyline_close]), and the
         duplicated closing point is not emitted, so the result is a cyclic ring.
 
     Returns
@@ -318,23 +333,23 @@ def upsample_polyline(
 
     See Also
     --------
-    [`smooth_upsample_polyline`][triwarp.polyline.smooth_upsample_polyline]
+    [`polyline_smooth_upsample`][triwarp.polyline.polyline_smooth_upsample]
         The same subdivision with the new points placed on a fitted arc instead of the chord.
-    [`downsample_polyline`][triwarp.polyline.downsample_polyline]
-    [`resample_polyline`][triwarp.polyline.resample_polyline]
+    [`polyline_downsample`][triwarp.polyline.polyline_downsample]
+    [`polyline_resample`][triwarp.polyline.polyline_resample]
     """
     if closed:
-        polyline = close_polyline(polyline)
+        polyline = polyline_close(polyline)
     return _upsample(polyline, step_size, kernel_polyline.upsample_gather, [])
 
 
-def smooth_upsample_polyline(
+def polyline_smooth_upsample(
     polyline: wp.array[wp.vec3], step_size: float, *, closed: bool = False
 ) -> wp.array[wp.vec3]:
     """
     Upsample a polyline to an approximately uniform step size, following local curvature.
 
-    Like [`upsample_polyline`][triwarp.polyline.upsample_polyline], each segment is split into
+    Like [`polyline_upsample`][triwarp.polyline.polyline_upsample], each segment is split into
     ``max(floor(length / step_size), 1)`` pieces and the final endpoint is not emitted. Unlike it,
     the inserted points are placed on a circular arc fitted to the segment's endpoint tangents
     (estimated from the two bracketing neighbour vertices) rather than on the straight chord, so a
@@ -353,7 +368,7 @@ def smooth_upsample_polyline(
         Target spacing between consecutive output points.
     closed
         When ``True``, treat the polyline as a loop: the closing edge back to the first point is
-        added if absent (see [`close_polyline`][triwarp.polyline.close_polyline]). Every segment
+        added if absent (see [`polyline_close`][triwarp.polyline.polyline_close]). Every segment
         including the seam is then treated as interior, so neighbour tangents wrap cyclically and
         the whole loop is smoothed rather than only its middle.
 
@@ -365,13 +380,13 @@ def smooth_upsample_polyline(
 
     See Also
     --------
-    [`upsample_polyline`][triwarp.polyline.upsample_polyline]
+    [`polyline_upsample`][triwarp.polyline.polyline_upsample]
         The straight-chord version, which is what this reduces to on the end segments.
     """
     if closed:
         # Every segment including the seam becomes interior, so neighbour tangents wrap cyclically
         # and the duplicated closing point is dropped -- a clean cyclic ring.
-        polyline = close_polyline(polyline)
+        polyline = polyline_close(polyline)
     gather = kernel_polyline.smooth_upsample_gather
     return _upsample(polyline, step_size, gather, [wp.int32(closed)])
 
@@ -385,8 +400,8 @@ def _upsample(
     """
     Split every segment into ``max(floor(length / step_size), 1)`` pieces and gather the samples.
 
-    The shared body of [`upsample_polyline`][triwarp.polyline.upsample_polyline] and
-    [`smooth_upsample_polyline`][triwarp.polyline.smooth_upsample_polyline], which differ only in
+    The shared body of [`polyline_upsample`][triwarp.polyline.polyline_upsample] and
+    [`polyline_smooth_upsample`][triwarp.polyline.polyline_smooth_upsample], which differ only in
     the gather kernel that places each sample -- on the chord or on a fitted arc -- and in the
     extra arguments that kernel takes. Both have already applied their own ``closed`` handling.
     """
@@ -419,8 +434,8 @@ def cumulative_arc_length(polyline: wp.array[wp.vec3]) -> wp.array[wp.float32]:
     Cumulative arc length from the first vertex to each vertex of an open polyline.
 
     The underlying arc-length parametrization behind
-    [`downsample_polyline`][triwarp.polyline.downsample_polyline] and
-    [`resample_polyline`][triwarp.polyline.resample_polyline]; exposed directly for callers
+    [`polyline_downsample`][triwarp.polyline.polyline_downsample] and
+    [`polyline_resample`][triwarp.polyline.polyline_resample]; exposed directly for callers
     doing custom resampling along the polyline.
 
     Parameters
@@ -437,8 +452,8 @@ def cumulative_arc_length(polyline: wp.array[wp.vec3]) -> wp.array[wp.float32]:
     See Also
     --------
     [`polyline_length`][triwarp.polyline.polyline_length]
-    [`downsample_polyline`][triwarp.polyline.downsample_polyline]
-    [`resample_polyline`][triwarp.polyline.resample_polyline]
+    [`polyline_downsample`][triwarp.polyline.polyline_downsample]
+    [`polyline_resample`][triwarp.polyline.polyline_resample]
     """
     device = polyline.device
     n_segments = int(polyline.shape[0]) - 1
@@ -459,7 +474,7 @@ def cumulative_arc_length(polyline: wp.array[wp.vec3]) -> wp.array[wp.float32]:
     return cumulative
 
 
-def downsample_polyline(
+def polyline_downsample(
     polyline: wp.array[wp.vec3], step_size: float, *, closed: bool = False
 ) -> wp.array[wp.vec3]:
     """
@@ -476,7 +491,7 @@ def downsample_polyline(
         Minimum arc-length distance between kept points.
     closed
         When ``True``, treat the polyline as a loop: the closing edge back to the first point is
-        added if absent (see [`close_polyline`][triwarp.polyline.close_polyline]), so the closing
+        added if absent (see [`polyline_close`][triwarp.polyline.polyline_close]), so the closing
         edge counts toward the spacing.
 
     Returns
@@ -486,12 +501,12 @@ def downsample_polyline(
 
     See Also
     --------
-    [`simplify_polyline`][triwarp.polyline.simplify_polyline]
+    [`polyline_simplify`][triwarp.polyline.polyline_simplify]
         Drops points by *shape* error rather than by spacing.
-    [`upsample_polyline`][triwarp.polyline.upsample_polyline]
+    [`polyline_upsample`][triwarp.polyline.polyline_upsample]
     """
     if closed:
-        polyline = close_polyline(polyline)
+        polyline = polyline_close(polyline)
     device = polyline.device
     n = int(polyline.shape[0])
     if n < 2:
@@ -508,7 +523,7 @@ def downsample_polyline(
     return tw.array.gather(polyline, tw.array.flatnonzero(keep_mask))
 
 
-def simplify_polyline(
+def polyline_simplify(
     polyline: wp.array[wp.vec3], tol: float, *, closed: bool = False
 ) -> tuple[wp.array[wp.vec3], wp.array[wp.int32]]:
     """
@@ -527,7 +542,7 @@ def simplify_polyline(
         Maximum Euclidean distance allowed between a dropped vertex and the retained chord.
     closed
         When ``True``, treat the polyline as a loop: the closing edge back to the first point is
-        added if absent (see [`close_polyline`][triwarp.polyline.close_polyline]). ``indices``
+        added if absent (see [`polyline_close`][triwarp.polyline.polyline_close]). ``indices``
         then refer to the *closed* polyline, so the shared start/end vertex is preserved at both
         ends.
 
@@ -541,12 +556,12 @@ def simplify_polyline(
 
     See Also
     --------
-    [`downsample_polyline`][triwarp.polyline.downsample_polyline]
+    [`polyline_downsample`][triwarp.polyline.polyline_downsample]
         Drops points by *spacing* rather than by shape error.
-    [`downsample_polyline`][triwarp.polyline.downsample_polyline]
+    [`polyline_downsample`][triwarp.polyline.polyline_downsample]
     """
     if closed:
-        polyline = close_polyline(polyline)
+        polyline = polyline_close(polyline)
     device = polyline.device
     n = int(polyline.shape[0])
     # Everything is kept until the recursion drops it, and filling that in parallel here keeps the
@@ -564,7 +579,7 @@ def simplify_polyline(
     return tw.array.gather(polyline, indices), indices
 
 
-def resample_polyline(
+def polyline_resample(
     polyline: wp.array[wp.vec3], num_points: int, *, closed: bool = False
 ) -> wp.array[wp.vec3]:
     """
@@ -581,7 +596,7 @@ def resample_polyline(
         Number of output points.
     closed
         When ``True``, treat the polyline as a loop: the closing edge back to the first point is
-        added if absent (see [`close_polyline`][triwarp.polyline.close_polyline]). The result has
+        added if absent (see [`polyline_close`][triwarp.polyline.polyline_close]). The result has
         ``num_points`` *distinct* points: the duplicated seam is dropped.
 
     Returns
@@ -592,13 +607,13 @@ def resample_polyline(
 
     See Also
     --------
-    [`upsample_polyline`][triwarp.polyline.upsample_polyline]
+    [`polyline_upsample`][triwarp.polyline.polyline_upsample]
         Targets a step size instead of a point count.
     """
     if closed:
         # ``num_points + 1`` samples of the closed polyline, minus the duplicated seam point, so the
         # result has ``num_points`` *distinct* points and is a clean cyclic ring.
-        return resample_polyline(close_polyline(polyline), num_points + 1)[0:num_points]
+        return polyline_resample(polyline_close(polyline), num_points + 1)[0:num_points]
     device = polyline.device
     n = int(polyline.shape[0])
     if n == 0:
@@ -657,7 +672,7 @@ def polyline_radius(
         a plane would misdescribe the geometry.
     closed
         When ``True``, treat the polyline as a loop: the closing edge back to the first point is
-        added if absent (see [`close_polyline`][triwarp.polyline.close_polyline]), so the closing
+        added if absent (see [`polyline_close`][triwarp.polyline.polyline_close]), so the closing
         segment contributes a radial distance like any other, and the default ``center`` /
         ``normal`` are the closed polyline's.
 
@@ -680,7 +695,7 @@ def polyline_radius(
     [`median`][triwarp.reduce.median]
     """
     if closed:
-        polyline = close_polyline(polyline)
+        polyline = polyline_close(polyline)
     if reduction not in ("min", "max", "mean", "median"):
         raise ValueError(f"unsupported reduction {reduction!r}")
     device = polyline.device
@@ -724,7 +739,7 @@ def polyline_angles(polyline: wp.array[wp.vec3], *, closed: bool = False) -> wp.
         ``(n,)`` polyline vertices as ``wp.vec3``.
     closed
         When ``True``, treat the polyline as a loop: the closing edge back to the first point is
-        added if absent (see [`close_polyline`][triwarp.polyline.close_polyline]). The result
+        added if absent (see [`polyline_close`][triwarp.polyline.polyline_close]). The result
         still has one angle per *original* point, and the turning angles wrap around.
 
     Returns
@@ -741,7 +756,7 @@ def polyline_angles(polyline: wp.array[wp.vec3], *, closed: bool = False) -> wp.
         # One angle per *original* point: closing appends a duplicate of the first, whose angle is
         # the first's, so the tail is dropped rather than returned twice.
         n_original = int(polyline.shape[0])
-        return polyline_angles(close_polyline(polyline))[0:n_original]
+        return polyline_angles(polyline_close(polyline))[0:n_original]
     device = polyline.device
     n = int(polyline.shape[0])
     if n < 2:
@@ -758,7 +773,7 @@ def polyline_angles(polyline: wp.array[wp.vec3], *, closed: bool = False) -> wp.
     return tw.array.concatenate([zero, raw[0 : n_segments - 1], zero])
 
 
-def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
+def polyline_triangulate(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     """
     Triangulate the simple planar polygon bounded by a closed 3D polyline (ear clipping).
 
@@ -787,7 +802,7 @@ def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     ----------
     polyline
         ``(n,)`` polyline vertices as ``wp.vec3``. A duplicated closing point is dropped via
-        [`open_polyline`][triwarp.polyline.open_polyline].
+        [`polyline_open`][triwarp.polyline.polyline_open].
 
     Returns
     -------
@@ -814,13 +829,13 @@ def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
 
     **The prologue is now fused.** It used to be the dominant fixed cost: three reductions
     ([`polyline_normal`][triwarp.polyline.polyline_normal], its internal
-    [`close_polyline`][triwarp.polyline.close_polyline] closure test, and
+    [`polyline_close`][triwarp.polyline.polyline_close] closure test, and
     [`polyline_centroid`][triwarp.polyline.polyline_centroid]) that each ended in a host readback
     because each returned a Python-scope value the next one consumed. They are one accumulation
     pass, one single-thread finalize and one projection, with the plane frame living in device
     memory and never crossing to the host. Measured interleaved on an RTX 5090 (min of 40):
     **1.06 -> 0.38 ms, 2.80x**, and — being fixed cost — the same 2.81x at 1 024 points. Only two
-    readbacks are left in the whole function, both structural: ``open_polyline``'s
+    readbacks are left in the whole function, both structural: ``polyline_open``'s
     [`is_closed`][triwarp.polyline.is_closed], which decides ``n`` and therefore every launch
     dimension, and the reflex count that selects the convex fan fast path.
 
@@ -833,9 +848,9 @@ def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
     See Also
     --------
     [`polyline_normal`][triwarp.polyline.polyline_normal]
-    [`close_polyline`][triwarp.polyline.close_polyline]
+    [`polyline_close`][triwarp.polyline.polyline_close]
     """
-    polyline = open_polyline(polyline)
+    polyline = polyline_open(polyline)
     device = polyline.device
     n = int(polyline.shape[0])
     if n < 3:
@@ -843,7 +858,7 @@ def triangulate_polyline(polyline: wp.array[wp.vec3]) -> twt.Array2dInt32:
 
     # The plane frame is built and consumed entirely on device: one accumulation pass, one
     # single-thread finalize, one projection. The three host-scope reductions this replaces
-    # (``polyline_normal``, its internal ``close_polyline`` closure test, and
+    # (``polyline_normal``, its internal ``polyline_close`` closure test, and
     # ``polyline_centroid``) each ended in a readback because the next one consumed its result,
     # and that prologue was flat in ``n`` -- the whole of this function's fixed cost at small
     # loops. ``frame`` is ``[center, u, v]``.
@@ -958,7 +973,7 @@ def triangulate_polygon(polygon: wp.array[wp.vec2]) -> tuple[wp.array[wp.vec2], 
     -----
     Differs from [`trimesh.creation.triangulate_polygon`][] in three ways, all of which follow from
     replacing the CPU polygon libraries (``mapbox_earcut`` / ``manifold3d`` / ``triangle``) with
-    triwarp's own GPU ear clipper, [`triangulate_polyline`][triwarp.polyline.triangulate_polyline]:
+    triwarp's own GPU ear clipper, [`polyline_triangulate`][triwarp.polyline.polyline_triangulate]:
 
     - The input is a ``wp.vec2`` ring, not a ``shapely.geometry.Polygon``, and **interior rings
       (holes) are not supported**.
@@ -972,7 +987,7 @@ def triangulate_polygon(polygon: wp.array[wp.vec2]) -> tuple[wp.array[wp.vec2], 
 
     See Also
     --------
-    [`triangulate_polyline`][triwarp.polyline.triangulate_polyline]
+    [`polyline_triangulate`][triwarp.polyline.polyline_triangulate]
     [`extrude_polygon`][triwarp.creation.extrude_polygon]
     [`trimesh.creation.triangulate_polygon`][]
     """
@@ -984,7 +999,7 @@ def triangulate_polygon(polygon: wp.array[wp.vec2]) -> tuple[wp.array[wp.vec2], 
 
     lifted = wp.empty(n, dtype=wp.vec3, device=device)
     wp.map(kernel_creation.lift_vec2, polygon, wp.float32(0.0), out=lifted)
-    opened = open_polyline(lifted)
-    faces = triangulate_polyline(opened).reshape((-1,))
-    # open_polyline only ever drops a repeated final point, so the matching 2D ring is a prefix.
+    opened = polyline_open(lifted)
+    faces = polyline_triangulate(opened).reshape((-1,))
+    # polyline_open only ever drops a repeated final point, so the matching 2D ring is a prefix.
     return polygon[: int(opened.shape[0])].contiguous(), faces

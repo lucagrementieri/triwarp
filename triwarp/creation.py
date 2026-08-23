@@ -1280,7 +1280,7 @@ def revolve(
         wp.map(kernel_creation.lift_vec2, linestring, wp.float32(0.0), out=profile_3d)
         # Ear clipping introduces no new vertices, so its indices address profile points directly --
         # the guarantee trimesh gets from ``triangulate_polygon(force_vertices=True)``.
-        cap_faces = tw.polyline.triangulate_polyline(profile_3d).reshape((-1,))
+        cap_faces = tw.polyline.polyline_triangulate(profile_3d).reshape((-1,))
         n_cap = int(cap_faces.shape[0]) // 3
 
     faces = wp.empty((n_slices * n_keep + 2 * n_cap) * 3, dtype=wp.int32, device=device)

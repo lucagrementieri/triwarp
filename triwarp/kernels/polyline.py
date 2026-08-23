@@ -239,7 +239,7 @@ def greedy_downsample_mask(
     # It is not *inherently* sequential — the same set can be produced by a parallel scan plus a
     # segmented pick (bucket each point by ``floor(cumulative / step)``, take the first point of
     # each bucket, then fix up buckets a kept point spilled past). That is a real rewrite and it has
-    # not been shown to be worth one: this kernel is on the live path of ``downsample_polyline``,
+    # not been shown to be worth one: this kernel is on the live path of ``polyline_downsample``,
     # open and closed, which measures 0.35 ms on a 528-point loop and 3.9 ms on a
     # 65 536-point rim (RTX 5090) — the walk is ~60 ns a point and nothing else in those calls is
     # faster. Revisit if a benchmark ever puts it on top.
@@ -415,7 +415,7 @@ def accumulate_loop_frame(
     out_length: wp.array[wp.float32],
 ) -> None:
     # dim == n, over an *open* loop of n distinct vertices. One pass replaces the three separate
-    # reductions ``triangulate_polyline``'s prologue used to run, each of which ended in a host
+    # reductions ``polyline_triangulate``'s prologue used to run, each of which ended in a host
     # readback because the next one consumed its Python-scope result.
     #
     # Newell's normal is cyclic -- thread i takes the edge (i, (i + 1) % n), so the wrap-around

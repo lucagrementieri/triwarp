@@ -222,7 +222,7 @@ def closest_point_on_edges(
     --------
     [`closest_point_on_mesh`][triwarp.proximity.closest_point_on_mesh]
         The surface form. On a closed mesh its answer is never farther than this one's.
-    [`triwarp.polyline.distance_to_polyline`][triwarp.polyline.distance_to_polyline]
+    [`triwarp.polyline.polyline_point_distance`][triwarp.polyline.polyline_point_distance]
         The same computation for an *ordered* chain, where the segments are consecutive vertices and
         no index structure is built.
     """

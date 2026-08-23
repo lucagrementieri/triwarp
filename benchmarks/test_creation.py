@@ -128,7 +128,7 @@ losing 6x at level 3 (245 µs against 472, and 345 µs against 67.1 ms at level 
 
 ``extrude_polygon`` only ever exercises the *convex* fast path (a single fan), which is why the ear
 clipper is benchmarked directly on a non-convex star ring — the same reasoning that puts
-``polyline.simplify_polyline`` in its own group in [`test_polyline.py`](test_polyline.py). It is
+``polyline.polyline_simplify`` in its own group in [`test_polyline.py`](test_polyline.py). It is
 also why this row does **not** move with anything done to the ear loop (measured flat, 0.81-1.05x
 across an A/B of the device-driven round loop): a convex ring reaches the fan and returns, so
 ``extrude_polygon`` is a floor row wearing a triangulator's name, and its loss to trimesh at 64
@@ -155,10 +155,10 @@ import pytest
 import pyvista as pv
 import trimesh as tm
 import warp as wp
-from conftest import BenchLibrary
 from meshlib import mrmeshpy as mm
 
 import triwarp as tw
+from conftest import BenchLibrary
 
 if TYPE_CHECKING:
     import open3d as o3d

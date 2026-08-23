@@ -139,7 +139,7 @@ A benchmark with neither marker gets the scan sweep.
 Where a group's driver is a *parameter* rather than a mesh, it is a second
 `pytest.mark.parametrize` layer with named ids and lands as extra rows in the same table:
 `screened_poisson(depth)`, `rasterize_*(resolution)`, `blue_noise(radius)`,
-`expand_vertex_mask(hops)`, `winding_number(|queries|)`, `simplify_polyline(tol)`,
+`expand_vertex_mask(hops)`, `winding_number(|queries|)`, `polyline_simplify(tol)`,
 `icp(initial misalignment)`, `solve_spd_columns(check_every)`, `neighbors(k / leaf_size /
 grid_bins)`, and the defect counts in `test_repair`.
 
@@ -794,7 +794,7 @@ the `test` dependency group. `PolyData`'s callable surface is **142 distinct fil
 three mixins; 28 of them map onto something triwarp already has, and those 28 carry **47 group rows**
 across 26 modules (one filter often answers several groups — `cell_quality` alone covers
 `face_quality` and `face_angles`, and `find_closest_cell` answers both `closest_point_on_mesh` and
-`distance_to_polyline`). Every one is single-threaded CPU VTK, so `pyvista` is `cpu_bound` and the
+`polyline_point_distance`). Every one is single-threaded CPU VTK, so `pyvista` is `cpu_bound` and the
 heavy filters carry explicit caps.
 
 The seven newest rows were added for a different reason from the forty that preceded them, and it is
@@ -833,7 +833,7 @@ Two mechanics that differ from the other references:
 | `test_remesh` / `test_smoothing` | `quadric_decimate`, `filter_laplacian_integration` (exempt), `filter_taubin` (exempt) | `decimate`, `smooth`, `smooth_taubin` |
 | `test_repair` / `test_voxels` | `remove_duplicated_vertices`, `voxelize_mesh` | `clean`, `voxelize_binary_mask` |
 | `test_reconstruction` | `delaunay_triangulation` (new group) | `delaunay_2d` |
-| `test_polyline` | `polyline_length`, `distance_to_polyline`, `triangulate_polyline` | `compute_arc_length`, `find_closest_cell`, `triangulate_contours` — all three on a **single-cell** polyline |
+| `test_polyline` | `polyline_length`, `polyline_point_distance`, `polyline_triangulate` | `compute_arc_length`, `find_closest_cell`, `triangulate_contours` — all three on a **single-cell** polyline |
 | `test_proximity` | `closest_point_on_mesh`, `containing_faces_2d` | `find_closest_cell`, `find_containing_cell` (`vtkStaticCellLocator`, batched) |
 | `test_selection` | `region_boundary_edges` | `extract_cells` + `extract_feature_edges(boundary_edges=True)` — a superset, minus the mesh rim |
 | `test_intersection` | `mesh_with_mesh` | `intersection` (`vtkIntersectionPolyDataFilter`) |
@@ -858,7 +858,7 @@ bound it (36 = 36 segments, bit-identical total length).
 `intersection` is 134 / 577 ms on the same two (the group's own `bunny` cap covers it); and the
 polyline locator collapses on a long single cell — 24.8 ms at 4 096 queries against a 268-segment
 loop, **4 963.9 ms** against `rim_long`'s 65 536-segment one and 104 s at 65 536 queries, so
-`rim_long` is skipped for `pyvista` in `distance_to_polyline` by name.
+`rim_long` is skipped for `pyvista` in `polyline_point_distance` by name.
 
 **Costs measured on an 81 920-face mesh**, which is where the caps come from: `slice` 7.9 ms,
 `curvature('gaussian')` 8.4 ms, `cell_quality` 9.4 ms, `clean` 10.1 ms, `compute_normals` 20.3 ms,
