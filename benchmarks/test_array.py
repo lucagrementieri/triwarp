@@ -13,17 +13,29 @@ only the scatter's output size moves.
 module (``grouping.group``, ``adjacency.face_adjacency``, every submesh extraction), so they are
 timed on mesh-derived buffers at whatever size the suite is running.
 
-There is no reference *library* in this file. These are array primitives, not mesh operations:
-trimesh, igl, open3d and pymeshlab all operate a level above and expose nothing comparable, and
-timing NumPy would generally compare a host implementation against a device one.
-``benchmarks/test_reduce.py`` and ``benchmarks/test_grouping.py`` are triwarp-only for the same
-reason.
+References
+----------
+**NumPy is the reference, on the same grounds ``benchmarks/test_reduce.py`` argues at length.** An
+earlier version of this paragraph said the opposite -- that "timing NumPy would generally compare a
+host implementation against a device one" -- and cited ``test_reduce.py`` as agreeing, which it does
+not: that module carries a numpy row on all ten of its groups and treats the host/device asymmetry
+as *the question* rather than as a reason not to ask it. A device primitive that hands back a Python
+value pays a launch and a readback NumPy never pays, so NumPy should win at small sizes and each row
+answers where the crossover sits.
 
-The one exception is ``index_domain_size``, whose "trimesh" row is a NumPy stand-in
-(``int(faces.max()) + 1``) rather than a library call, because trimesh has no *uncached* equivalent
--- its vertex count comes from the array it was built with. That row exists precisely because the
-host/device comparison is the question there: the crossover between a 4-byte device reduction and a
-host max is what the group establishes, and it lands inside the registry's size range.
+``test_reduce`` also measured the answer, and it transfers: **the split is by return type, not by
+size.** The groups here that hand back a device array (``concatenate_arrays``, ``gather``,
+``sort_and_argsort``) have no host synchronisation to pay and should track bandwidth;
+``flatnonzero`` and ``split_array`` end in a 4-byte tail readback and an ``offsets`` transfer
+respectively, so they carry the flat host cost that sets the crossover. ``pack_1d_arrays`` is the
+pair to read ``concatenate_arrays`` against: the offsets are host metadata on both sides.
+
+trimesh, igl, open3d and pymeshlab stay unregistered here and it is not a judgement -- they operate
+a level above and expose nothing comparable. ``index_domain_size``'s "trimesh" row is likewise a
+NumPy stand-in (``int(faces.max()) + 1``) rather than a library call, because trimesh has no
+*uncached* equivalent: its vertex count comes from the array it was built with. That row predates
+this section and is the group that first established the crossover is inside the registry's size
+range.
 """
 
 from __future__ import annotations
@@ -65,6 +77,29 @@ def _segments(bench_case: BenchCase, n_segments: int) -> list:
     return _segments_cache[key]
 
 
+def _segments_np(bench_case: BenchCase, n_segments: int) -> list[np.ndarray]:
+    """Split the flat face buffer as ``_segments`` does, on the host: a numpy row has no device."""
+    faces_np = bench_case.faces_np.reshape(-1).astype(np.int32)
+    return [np.ascontiguousarray(piece) for piece in np.array_split(faces_np, n_segments)]
+
+
+def _keys_np(bench_case: BenchCase) -> np.ndarray:
+    """Build the same shuffled key buffer as ``_keys``, on the host."""
+    return np.random.default_rng(0).permutation(bench_case.faces_np.size).astype(np.int32)
+
+
+def _mask_np(bench_case: BenchCase, selectivity: float) -> np.ndarray:
+    """Build the same mask as ``_mask``, on the host."""
+    return np.random.default_rng(1).random(bench_case.faces_np.size) < selectivity
+
+
+def _gather_inputs_np(bench_case: BenchCase) -> tuple[np.ndarray, np.ndarray]:
+    """Build the same ``(vertices, indices)`` pair as ``_gather_inputs``, on the host."""
+    n = bench_case.n_vertices
+    indices_np = np.random.default_rng(2).integers(0, n, size=max(1, n // 2)).astype(np.int32)
+    return np.ascontiguousarray(bench_case.vertices_np, dtype=np.float32), indices_np
+
+
 def _keys(bench_case: BenchCase) -> wp.array[wp.int32]:
     """Build a shuffled int32 key buffer, one key per face index."""
     key = (bench_case.mesh_name, str(bench_case.device))
@@ -99,17 +134,22 @@ def _gather_inputs(bench_case: BenchCase) -> tuple:
 
 
 @pytest.mark.benchmark(group="concatenate_arrays")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "numpy")
 @pytest.mark.parametrize("n_segments", _SEGMENT_COUNTS, ids=["few", "many"])
 def test_concatenate(bench_case: BenchCase, n_segments: int) -> None:
     """One buffer from many, at two segment counts with the total element count held fixed."""
+    if bench_case.kind == "numpy":
+        segments_np = _segments_np(bench_case, n_segments)
+        flat_np = bench_case.run(lambda: np.concatenate(segments_np))
+        assert flat_np.size == bench_case.faces_np.size
+        return
     segments = _segments(bench_case, n_segments)
     flat = bench_case.run(lambda: tw.array.concatenate(segments))
     assert int(flat.shape[0]) == bench_case.faces_np.size
 
 
 @pytest.mark.benchmark(group="pack_1d_arrays")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "numpy")
 @pytest.mark.parametrize("n_segments", _SEGMENT_COUNTS, ids=["few", "many"])
 def test_pack_1d_arrays(bench_case: BenchCase, n_segments: int) -> None:
     """
@@ -117,7 +157,24 @@ def test_pack_1d_arrays(bench_case: BenchCase, n_segments: int) -> None:
 
     Read the two groups together: the offsets are the only difference, so a gap between them at
     ``many`` is the host-side accumulate and the ``wp.array(list)`` transfer, not the copies.
+
+    NumPy's counterpart is ``concatenate`` plus a ``cumsum`` of the lengths, which is the honest
+    comparison: the offsets are host metadata on both sides, so this pair isolates the *transfer* of
+    them from their computation.
     """
+    if bench_case.kind == "numpy":
+        segments_np = _segments_np(bench_case, n_segments)
+
+        def pack_np() -> tuple[np.ndarray, np.ndarray]:
+            return (
+                np.concatenate(segments_np),
+                np.cumsum([0] + [piece.size for piece in segments_np[:-1]]),
+            )
+
+        flat_np, offsets_np = bench_case.run(pack_np)
+        assert flat_np.size == bench_case.faces_np.size
+        assert offsets_np.size == n_segments
+        return
     segments = _segments(bench_case, n_segments)
     flat, offsets = bench_case.run(lambda: tw.array.pack_1d_arrays(segments))
     assert int(flat.shape[0]) == bench_case.faces_np.size
@@ -125,7 +182,7 @@ def test_pack_1d_arrays(bench_case: BenchCase, n_segments: int) -> None:
 
 
 @pytest.mark.benchmark(group="split_array")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "numpy")
 @pytest.mark.parametrize("n_segments", _SEGMENT_COUNTS, ids=["few", "many"])
 @pytest.mark.parametrize("copy", [False, True], ids=["views", "copies"])
 def test_split(bench_case: BenchCase, n_segments: int, copy: bool) -> None:
@@ -135,16 +192,49 @@ def test_split(bench_case: BenchCase, n_segments: int, copy: bool) -> None:
     The ``views`` rows price the readback plus Python slicing alone; the gap to ``copies`` at
     ``many`` is the per-segment ``wp.clone`` launches, the same per-segment floor the packing
     direction pays.
+
+    NumPy's ``split`` has the same two modes and the same names for them -- its result is views, and
+    a copy is one ``np.copy`` per piece -- so the ``views`` / ``copies`` pair reads across both
+    libraries and the ratio between the pairs is the readback triwarp cannot avoid.
     """
+    if bench_case.kind == "numpy":
+        segments_np = _segments_np(bench_case, n_segments)
+        flat_np = np.concatenate(segments_np)
+        offsets_np = np.cumsum([0] + [piece.size for piece in segments_np[:-1]])
+
+        def split_np() -> list[np.ndarray]:
+            parts = np.split(flat_np, offsets_np[1:])
+            return [np.copy(part) for part in parts] if copy else parts
+
+        assert len(bench_case.run(split_np)) == n_segments
+        return
     flat, offsets = tw.array.pack_1d_arrays(_segments(bench_case, n_segments))
     parts = bench_case.run(lambda: tw.array.split(flat, offsets, copy=copy))
     assert len(parts) == n_segments
 
 
 @pytest.mark.benchmark(group="sort_and_argsort")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "numpy")
 def test_sort_and_argsort(bench_case: BenchCase) -> None:
-    """Radix sort plus its permutation: the primitive under ``group`` and every dedup here."""
+    """
+    Radix sort plus its permutation: the primitive under ``group`` and every dedup here.
+
+    NumPy needs **two** calls for what one radix pass returns -- ``argsort`` for the permutation and
+    a gather to apply it -- which is the shape of the comparison rather than a handicap: a
+    least-significant-digit radix sort carries its payload through the same passes, so the pair
+    prices "sorted keys and their order" against "the order, then use it".
+    """
+    if bench_case.kind == "numpy":
+        keys_np = _keys_np(bench_case)
+
+        def sort_and_argsort_np() -> tuple[np.ndarray, np.ndarray]:
+            order_np = np.argsort(keys_np, kind="stable")
+            return keys_np[order_np], order_np
+
+        sorted_np, order_np = bench_case.run(sort_and_argsort_np)
+        assert sorted_np.size == keys_np.size
+        assert order_np.size == keys_np.size
+        return
     keys = _keys(bench_case)
     sorted_keys, order = bench_case.run(lambda: tw.array.sort_and_argsort(keys))
     assert int(sorted_keys.shape[0]) == int(keys.shape[0])
@@ -152,7 +242,7 @@ def test_sort_and_argsort(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="flatnonzero")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "numpy")
 @pytest.mark.parametrize("selectivity", _SELECTIVITIES, ids=["half", "sparse"])
 def test_flatnonzero(bench_case: BenchCase, selectivity: float) -> None:
     """
@@ -160,17 +250,32 @@ def test_flatnonzero(bench_case: BenchCase, selectivity: float) -> None:
 
     The flag pass and the scan are the same work either way, and only the scatter's output shrinks,
     so these two ids should sit close together. They also pin the cost of the single 4-byte tail
-    readback that sizes the output -- the one host synchronisation this primitive cannot avoid.
+    readback that sizes the output -- the one host synchronisation this primitive cannot avoid,
+    and the whole of what ``np.flatnonzero`` does not pay.
     """
+    if bench_case.kind == "numpy":
+        mask_np = _mask_np(bench_case, selectivity)
+        assert bench_case.run(lambda: np.flatnonzero(mask_np)).size > 0
+        return
     mask = _mask(bench_case, selectivity)
     indices = bench_case.run(lambda: tw.array.flatnonzero(mask))
     assert int(indices.shape[0]) > 0
 
 
 @pytest.mark.benchmark(group="gather")
-@pytest.mark.benchlibs("triwarp")
+@pytest.mark.benchlibs("triwarp", "numpy")
 def test_gather(bench_case: BenchCase) -> None:
-    """Dense materialization of a fancy-index view: one ``wp.copy`` out of an ``indexedarray``."""
+    """
+    Dense materialization of a fancy-index view: one ``wp.copy`` out of an ``indexedarray``.
+
+    ``src[indices]`` is NumPy's whole answer and it is already dense, so this is the group where the
+    two libraries are closest in shape and the ratio is nearly pure memory bandwidth -- the one row
+    here to read as a hardware comparison rather than as an API one.
+    """
+    if bench_case.kind == "numpy":
+        src_np, indices_np = _gather_inputs_np(bench_case)
+        assert bench_case.run(lambda: src_np[indices_np]).shape[0] == indices_np.size
+        return
     src, indices = _gather_inputs(bench_case)
     out = bench_case.run(lambda: tw.array.gather(src, indices))
     assert int(out.shape[0]) == int(indices.shape[0])

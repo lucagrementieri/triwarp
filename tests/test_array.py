@@ -93,6 +93,53 @@ def test_split_roundtrips_pack_1d_arrays(device: str) -> None:
         assert np.array_equal(segment_wp.numpy(), part_np)
 
 
+@pytest.mark.parity("concatenate_arrays", "numpy")
+@pytest.mark.parity("pack_1d_arrays", "numpy")
+@pytest.mark.parity("split_array", "numpy")
+@pytest.mark.parametrize("copy", [False, True])
+def test_the_packing_family_matches_numpy(device: str, copy: bool) -> None:
+    """
+    Class A on all three: ``np.concatenate``, a ``cumsum`` of the lengths, and ``np.split``.
+
+    The three primitives are one round trip, so they are asserted as one -- and against the NumPy
+    calls the benchmark rows are timed against rather than against a literal, which is what makes
+    this a comparison instead of a restatement. The offsets are host metadata on both sides, so
+    ``pack_1d_arrays``' second return has an exact NumPy counterpart and not merely a compatible
+    shape.
+
+    Both ``copy`` modes are run because ``np.split`` has the same two and names them the same way:
+    its result is views, and a copy is one ``np.copy`` per piece. The values are identical either
+    way, which is the point -- what differs is storage, and that is asserted in
+    ``test_split_views_share_storage_and_copies_do_not`` instead.
+
+    A **zero-length segment** is in the middle of the input on purpose. It is the case an offsets
+    scheme gets wrong (two consecutive offsets that are equal), and the one where ``np.split`` and
+    triwarp could plausibly disagree about which piece is empty.
+    """
+    rng = np.random.default_rng(3)
+    parts_np = [
+        np.ascontiguousarray(rng.integers(0, 100, size=size).astype(np.int32))
+        for size in (4, 1, 0, 7)
+    ]
+    parts_wp = [wp.array(part, dtype=wp.int32, device=device) for part in parts_np]
+
+    flat_np = np.concatenate(parts_np)
+    offsets_np = np.cumsum([0] + [part.size for part in parts_np[:-1]])
+    assert np.array_equal(tw.array.concatenate(parts_wp).numpy(), flat_np)
+
+    packed_wp, packed_offsets_wp = tw.array.pack_1d_arrays(parts_wp)
+    assert np.array_equal(packed_wp.numpy(), flat_np)
+    assert np.array_equal(packed_offsets_wp.numpy(), offsets_np.astype(np.int32))
+
+    split_np = np.split(flat_np, offsets_np[1:])
+    if copy:
+        split_np = [np.copy(part) for part in split_np]
+    segments_wp = tw.array.split(packed_wp, packed_offsets_wp, copy=copy)
+    assert len(segments_wp) == len(split_np)
+    for segment_wp, part_np in zip(segments_wp, split_np, strict=True):
+        assert np.array_equal(segment_wp.numpy(), part_np)
+
+
 def test_split_views_share_storage_and_copies_do_not(device: str) -> None:
     """Default segments alias the packed buffer; ``copy=True`` detaches them."""
     flat_wp = wp.array(np.arange(6, dtype=np.int32), dtype=wp.int32, device=device)
@@ -161,8 +208,9 @@ def test_allclose_rejects_mismatched_dtypes(device: str) -> None:
         tw.array.allclose(a_wp, b_wp)
 
 
+@pytest.mark.parity("sort_and_argsort", "numpy")
 def test_sort_and_argsort_distinct_keys(device: str) -> None:
-    """With distinct keys the permutation is unique, so it must equal ``numpy.argsort``."""
+    """Class A: with distinct keys the permutation is unique, so it must equal ``numpy.argsort``."""
     rng = np.random.default_rng(31)
     keys_np = rng.permutation(64).astype(np.int32)
     keys_wp = wp.array(keys_np, dtype=wp.int32, device=device)
@@ -453,7 +501,9 @@ def test_isin_rejects_mismatched_and_non_integer_dtypes(device: str) -> None:
         tw.array.isin(floats_wp, floats_wp)
 
 
+@pytest.mark.parity("flatnonzero", "numpy")
 def test_flatnonzero(device: str) -> None:
+    """Class A: the same indices ``np.flatnonzero`` returns, for the same mask."""
     rng = np.random.default_rng(11)
     mask_np = rng.choice([False, True], size=64, replace=True)
     mask_wp = wp.array(mask_np, dtype=wp.bool, device=device)
@@ -597,7 +647,9 @@ def test_indices_to_mask_empty(device: str) -> None:
     assert np.array_equal(mask_wp.numpy(), np.zeros(5, dtype=bool))
 
 
+@pytest.mark.parity("gather", "numpy")
 def test_gather_1d(device: str) -> None:
+    """Class A: the same values ``src[indices]`` returns, which is NumPy's whole answer here."""
     rng = np.random.default_rng(5)
     values_np = rng.integers(0, 1000, size=32, dtype=np.int32)
     indices_np = rng.integers(0, 32, size=10, dtype=np.int32)
