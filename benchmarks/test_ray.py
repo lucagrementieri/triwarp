@@ -34,13 +34,33 @@ row, and the same thing triwarp's rows do by holding a ``wp.Mesh``. The ray clou
 *input*: filling a ``std_vector_Vector3_float`` is a Python loop over 10 000 ``Vector3f``
 constructions, comparable to the query itself, so it is cached per mesh.
 
+**open3d**'s ``RaycastingScene`` is Embree, which makes these the closest thing in the suite to a
+fair fight on ray casting -- and it has **one method per group**, not one method for all three. An
+earlier version of this section said the opposite ("``cast_rays`` returns a dense record ... so it
+is the ``intersects_location`` row three times over"), which read only one of five methods:
+
+- ``test_occlusions`` is a genuine **any-hit** traversal and answers nothing else, which is what
+  ``intersects_any`` is for and what MeshLib's row is only an upper bound on
+  (``closestIntersect`` stays on there);
+- ``cast_rays`` returns ``t_hit`` and ``primitive_ids`` densely -- ``intersects_first``'s answer,
+  with ``INVALID_ID`` where triwarp writes ``-1``;
+- ``cast_rays`` again for ``intersects_location``, where the hit points are ``origin + t_hit *
+  dir`` and triwarp compacts, so open3d's row is the lower bound of the same work exactly as
+  MeshLib's is.
+
+``count_intersections`` is a **fourth** question -- the crossing count, which is the axis this file
+is built on -- and there is no row for it because triwarp exposes no crossing-count entry point.
+``list_intersections`` is a fifth (every hit along every ray).
+
+The scene is built and pre-warmed outside the timed callable, like the MeshLib tree and triwarp's
+``wp.Mesh``, and the rays are uploaded as one ``float32`` ``(n, 6)`` tensor once per mesh -- also an
+input. Note ``add_triangles`` accepts ``uint32`` faces where the vtkutils-backed filters elsewhere
+in open3d demand ``Int32``/``Int64``; two conventions inside one API.
+
 **trimesh** has all three functions (``ray.intersects_first`` / ``intersects_any`` /
 ``intersects_id``) and is deliberately absent: its pure-Python engine takes minutes on these
 meshes, and ``tests/test_ray.py`` already holds it as the correctness oracle, which is the useful
-half. **open3d**'s ``RaycastingScene`` is Embree and would be a fair fight, but it answers a
-different question shape -- ``cast_rays`` returns a dense record of distances, primitive ids and
-barycentrics in one call, so it is the ``intersects_location`` row three times over rather than one
-row per group.
+half.
 """
 
 from __future__ import annotations
@@ -133,6 +153,50 @@ def _mesh_wp(bench_case: BenchCase) -> wp.Mesh:
     return _mesh_cache[key]
 
 
+_scene_o3d_cache: dict[str, object] = {}
+_ray_o3d_cache: dict[str, object] = {}
+
+
+def _rays_o3d(bench_case: BenchCase) -> object:
+    """Pack the same ray cloud into one ``(n_rays, 6)`` float32 tensor: open3d's layout."""
+    import open3d as o3d
+
+    if bench_case.mesh_name not in _ray_o3d_cache:
+        origins_np, directions_np = _rays_np(bench_case)
+        _ray_o3d_cache[bench_case.mesh_name] = o3d.core.Tensor(
+            np.ascontiguousarray(np.hstack([origins_np, directions_np]), dtype=np.float32),
+            dtype=o3d.core.Dtype.Float32,
+        )
+    return _ray_o3d_cache[bench_case.mesh_name]
+
+
+def _scene_o3d(bench_case: BenchCase) -> object:
+    """
+    Build the Embree scene once per mesh and pre-warm it, so a row prices the traversal.
+
+    Cached for the same reason the MeshLib ``Mesh`` is: the acceleration structure is the input, and
+    every row in this file holds one already built. ``add_triangles`` takes ``uint32`` faces here
+    although open3d's vtkutils-backed filters reject that dtype -- two conventions in one API.
+    """
+    import open3d as o3d
+
+    if bench_case.mesh_name not in _scene_o3d_cache:
+        scene_o3d = o3d.t.geometry.RaycastingScene()
+        scene_o3d.add_triangles(
+            o3d.core.Tensor(
+                np.ascontiguousarray(bench_case.vertices_np, dtype=np.float32),
+                dtype=o3d.core.Dtype.Float32,
+            ),
+            o3d.core.Tensor(
+                np.ascontiguousarray(bench_case.faces_np, dtype=np.uint32),
+                dtype=o3d.core.Dtype.UInt32,
+            ),
+        )
+        scene_o3d.test_occlusions(_rays_o3d(bench_case))  # pre-warm
+        _scene_o3d_cache[bench_case.mesh_name] = scene_o3d
+    return _scene_o3d_cache[bench_case.mesh_name]
+
+
 def _mesh_part_ml(bench_case: BenchCase) -> mm.MeshPart:
     """
     Build a ``MeshPart``, keeping its mesh alive in a module-level cache.
@@ -181,7 +245,7 @@ def _multi_ray_query_ml(
 
 @pytest.mark.benchmark(group="intersects_first")
 @pytest.mark.benchaxis("depth")
-@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.benchlibs("triwarp", "meshlib", "open3d")
 def test_intersects_first(bench_case: BenchCase) -> None:
     """
     Nearest-hit face per ray: the traversal that cannot stop early.
@@ -190,7 +254,15 @@ def test_intersects_first(bench_case: BenchCase) -> None:
     triwarp returns -- with an invalid ``FaceId`` where triwarp writes ``-1``
     (``tests/test_ray.py``). ``closestIntersect`` defaults to ``True``, which is triwarp's rule, so
     it is left alone here and the ``intersects_any`` row below is what shows the other setting.
+
+    open3d's ``cast_rays`` is Embree's nearest-hit query and returns ``primitive_ids`` densely,
+    matching triwarp's shape with ``INVALID_ID`` for a miss.
     """
+    if bench_case.kind == "open3d":
+        scene_o3d, rays_o3d = _scene_o3d(bench_case), _rays_o3d(bench_case)
+        hits_o3d = bench_case.run(lambda: scene_o3d.cast_rays(rays_o3d))
+        assert hits_o3d["primitive_ids"].shape[0] == _N_RAYS
+        return
     if bench_case.kind == "meshlib":
         first_ml = _multi_ray_query_ml(bench_case, faces=True)
         assert len(bench_case.run(first_ml).isectFaces) == _N_RAYS
@@ -202,7 +274,7 @@ def test_intersects_first(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="intersects_any")
 @pytest.mark.benchaxis("depth")
-@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.benchlibs("triwarp", "meshlib", "open3d")
 def test_intersects_any(bench_case: BenchCase) -> None:
     """
     Any-hit per ray: the one group here that is allowed to stop at the first triangle it finds.
@@ -213,7 +285,16 @@ def test_intersects_any(bench_case: BenchCase) -> None:
     rays that hit anything. Note that requesting fewer outputs does *not* make MeshLib's traversal
     any-hit -- ``closestIntersect`` governs that, and this row leaves it at its default, so the row
     is an upper bound on the question rather than the matching algorithm.
+
+    **open3d's ``test_occlusions`` is the one reference here that is genuinely any-hit**, so this is
+    the group where the three rows answer three different amounts of work: triwarp and open3d may
+    stop at the first triangle, MeshLib may not.
     """
+    if bench_case.kind == "open3d":
+        scene_o3d, rays_o3d = _scene_o3d(bench_case), _rays_o3d(bench_case)
+        hit_o3d = bench_case.run(lambda: scene_o3d.test_occlusions(rays_o3d))
+        assert hit_o3d.shape[0] == _N_RAYS
+        return
     if bench_case.kind == "meshlib":
         any_ml = _multi_ray_query_ml(bench_case, hits=True)
         assert 0 < bench_case.run(any_ml).intersectingRays.count() <= _N_RAYS
@@ -225,7 +306,7 @@ def test_intersects_any(bench_case: BenchCase) -> None:
 
 @pytest.mark.benchmark(group="intersects_location")
 @pytest.mark.benchaxis("depth")
-@pytest.mark.benchlibs("triwarp", "meshlib")
+@pytest.mark.benchlibs("triwarp", "meshlib", "open3d")
 def test_intersects_location(bench_case: BenchCase) -> None:
     """
     The hit positions, compacted: ``intersects_first``'s traversal plus a scan and a gather.
@@ -233,8 +314,15 @@ def test_intersects_location(bench_case: BenchCase) -> None:
     triwarp returns only the rays that hit, as three sparse arrays, so its row carries a prefix sum
     and a compaction the other two groups do not -- which is the cost this group isolates. meshlib
     returns its hits *densely* and asks for ``isectPts`` plus the hit bitset, leaving the selection
-    to the caller, so its row is the lower bound of the same work.
+    to the caller, so its row is the lower bound of the same work. open3d is denser still: its
+    ``cast_rays`` returns ``t_hit`` and the hit *position* is ``origin + t_hit * direction``, a host
+    multiply-add the row leaves out, so it is the same lower bound one step further down.
     """
+    if bench_case.kind == "open3d":
+        scene_o3d, rays_o3d = _scene_o3d(bench_case), _rays_o3d(bench_case)
+        hits_o3d = bench_case.run(lambda: scene_o3d.cast_rays(rays_o3d))
+        assert hits_o3d["t_hit"].shape[0] == _N_RAYS
+        return
     if bench_case.kind == "meshlib":
         location_ml = _multi_ray_query_ml(bench_case, points=True, hits=True)
         result_ml = bench_case.run(location_ml)

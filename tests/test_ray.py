@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import open3d as o3d
 import pytest
 import trimesh as tm
 import warp as wp
@@ -282,6 +283,80 @@ def test_intersects_match_meshlib(request: pytest.FixtureRequest, mesh_name: str
     assert np.array_equal(rays_wp.numpy()[order_wp], np.flatnonzero(hit_ml))
     assert np.array_equal(triangles_wp.numpy()[order_wp], faces_ml[hit_ml])
     assert np.allclose(locations_wp.numpy()[order_wp], points_ml[hit_ml], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parity("intersects_first", "open3d")
+@pytest.mark.parity("intersects_any", "open3d")
+@pytest.mark.parity("intersects_location", "open3d")
+@pytest.mark.parametrize("mesh_name", ["icosahedron", "hemisphere"])
+def test_intersects_match_open3d(request: pytest.FixtureRequest, mesh_name: str) -> None:
+    """
+    Class A on the first two, Class B on the third: Embree answers each group with its own method.
+
+    One method per group, not one method for all three -- which is the correction this test carries.
+    ``test_occlusions`` is a genuine **any-hit** traversal and returns nothing else, so it is
+    ``intersects_any``'s exact counterpart and the only reference in the suite that is allowed to
+    stop early (MeshLib's ``closestIntersect`` stays on). ``cast_rays`` returns ``primitive_ids``
+    and ``t_hit`` densely, which is ``intersects_first`` directly and ``intersects_location`` after
+    one transform.
+
+    Two conventions, both named. A miss is ``RaycastingScene.INVALID_ID`` where triwarp writes
+    ``-1``, and ``t_hit`` is ``inf`` there. And the hit *position* is not returned at all: it is
+    ``origin + t_hit * direction``, which is the class-B half -- the same
+    ``float32`` recomputation triwarp's kernel does, so the two agree to the ray parameter's own
+    precision rather than exactly.
+
+    triwarp's ``intersects_location`` compacts in BVH order rather than ray order, so its rows are
+    sorted by ray first, exactly as the meshlib and trimesh comparisons above do.
+
+    Non-vacuous: the assert requires both branches present in the hit mask, so a scene that hit
+    everything or nothing would fail rather than agree.
+    """
+    mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
+    origins_np, directions_np = _upward_rays(mesh_tm, 256, seed=0)
+    origins_wp = points_to_warp(origins_np, mesh_wp.device)
+    directions_wp = points_to_warp(directions_np, mesh_wp.device)
+
+    scene_o3d = o3d.t.geometry.RaycastingScene()
+    scene_o3d.add_triangles(
+        o3d.core.Tensor(
+            np.ascontiguousarray(mesh_tm.vertices, dtype=np.float32), dtype=o3d.core.Dtype.Float32
+        ),
+        o3d.core.Tensor(
+            np.ascontiguousarray(mesh_tm.faces, dtype=np.uint32), dtype=o3d.core.Dtype.UInt32
+        ),
+    )
+    rays_o3d = o3d.core.Tensor(
+        np.ascontiguousarray(np.hstack([origins_np, directions_np]), dtype=np.float32),
+        dtype=o3d.core.Dtype.Float32,
+    )
+    hit_o3d = scene_o3d.test_occlusions(rays_o3d).numpy()
+    cast_o3d = scene_o3d.cast_rays(rays_o3d)
+    faces_o3d = cast_o3d["primitive_ids"].numpy().astype(np.int64)
+    distance_o3d = cast_o3d["t_hit"].numpy().astype(np.float64)
+    faces_o3d = np.where(faces_o3d == o3d.t.geometry.RaycastingScene.INVALID_ID, -1, faces_o3d)
+
+    assert 0 < hit_o3d.sum() < origins_np.shape[0]  # both branches present
+    # The any-hit answer and the nearest-hit answer are the same mask, which pins the two methods.
+    assert np.array_equal(hit_o3d, faces_o3d >= 0)
+
+    assert np.array_equal(
+        tw.ray.intersects_first(mesh_wp, origins_wp, directions_wp).numpy(),
+        faces_o3d.astype(np.int32),
+    )
+    assert np.array_equal(
+        tw.ray.intersects_any(mesh_wp, origins_wp, directions_wp).numpy(), hit_o3d
+    )
+
+    locations_wp, rays_wp, triangles_wp = tw.ray.intersects_location(
+        mesh_wp, origins_wp, directions_wp
+    )
+    order_wp = np.argsort(rays_wp.numpy(), kind="stable")
+    assert np.array_equal(rays_wp.numpy()[order_wp], np.flatnonzero(hit_o3d))
+    assert np.array_equal(triangles_wp.numpy()[order_wp], faces_o3d[hit_o3d].astype(np.int32))
+    # The hit position is a transform of t_hit, not an output: origin + t * direction.
+    points_o3d = origins_np[hit_o3d] + distance_o3d[hit_o3d, None] * directions_np[hit_o3d]
+    assert np.allclose(locations_wp.numpy()[order_wp], points_o3d, rtol=1e-5, atol=1e-5)
 
 
 def test_intersects_empty_rays(icosahedron: tuple[tm.Trimesh, wp.Mesh]):

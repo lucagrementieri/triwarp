@@ -698,7 +698,7 @@ def test_make_winding_consistent(bench_case: BenchCase) -> None:
 
 
 @pytest.mark.benchmark(group="make_volume")
-@pytest.mark.benchlibs("triwarp", "trimesh")
+@pytest.mark.benchlibs("triwarp", "trimesh", "pyvista")
 def test_make_volume(bench_case: BenchCase) -> None:
     """
     Orient the whole surface outward: one watertightness predicate, one reduction, one flip pass.
@@ -708,10 +708,41 @@ def test_make_volume(bench_case: BenchCase) -> None:
     mesh in place and caches the volume on it, so the ``tm.Trimesh`` is rebuilt inside the timed
     callable as the other trimesh rows here do.
 
-    The scan meshes are open, so both sides take the "not watertight, return unchanged" path and
+    pyvista's ``compute_normals(consistent_normals=True, auto_orient_normals=True)`` is the one
+    other library that performs *this* operation, and the distinction is worth stating precisely
+    because two libraries have an obviously-named filter that does something else. Measured on an
+    ``icosphere(2)``, signed volume, target +4.047045:
+
+    | input | pyvista | open3d ``orient_triangles`` | pymeshlab ``re_orient_faces_coherently`` |
+    |---|---|---|---|
+    | 20 of 320 faces reversed (inconsistent) | **+4.047045** | +4.047045 | -4.047045 |
+    | every face reversed (consistent, inward) | **+4.047045** | **-4.047045** | -4.047045 |
+
+    The second row is the whole difference. ``orient_triangles`` and
+    ``meshing_re_orient_faces_coherently`` make the winding *coherent*; on a locally inconsistent
+    mesh that recovers the majority orientation and looks like this operation, and on a
+    consistently **inward** mesh -- the state ``make_volume`` exists for -- open3d leaves it inward
+    and pymeshlab always does. So both belong to ``make_winding_consistent`` and only pyvista is a
+    row here. A comparison probed on the inconsistent input alone reads all three as agreeing, which
+    is exactly what an earlier version of this decision concluded.
+
+    pyvista is not identical either, on an input class the scan meshes do not contain: on a
+    **multi-shell** mesh it turns each shell outward *from itself*, so a cavity's contribution adds
+    where triwarp's subtracts -- measured 1.0010 against 0.9990 on ``tests/conftest.py``'s
+    ``cave_cube``. Every registry mesh here is a single open shell, so the row is unaffected; the
+    divergence is pinned in ``tests/test_repair.py``.
+
+    The scan meshes are open, so every side takes the "not watertight, return unchanged" path and
     what this row prices is the *test*, which is the point: the watertightness check dominates a
     call that would otherwise be one reduction and one relabel.
     """
+    if bench_case.kind == "pyvista":
+        mesh_pv = bench_case.mesh_pv
+        oriented_pv = bench_case.run(
+            lambda: mesh_pv.compute_normals(consistent_normals=True, auto_orient_normals=True)
+        )
+        assert oriented_pv.n_faces == bench_case.n_faces
+        return
     if bench_case.kind == "triwarp":
         vertices, faces = bench_case.vertices_wp, bench_case.faces_wp
         oriented = bench_case.run(lambda: tw.repair.make_volume(vertices, faces))

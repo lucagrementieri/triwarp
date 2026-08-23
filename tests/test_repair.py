@@ -1112,15 +1112,41 @@ def test_make_winding_consistent_idempotent(icosahedron: tuple[tm.Trimesh, wp.Me
     assert np.array_equal(_faces_2d(repaired_wp), _faces_2d(mesh_wp.indices))
 
 
-@pytest.mark.parity("make_volume", "trimesh")
+@pytest.mark.parity("make_volume", "trimesh", "pyvista")
 @pytest.mark.parametrize("mesh_name", ["icosahedron", "cave_cube"])
 def test_make_volume_repairs_inversion(request: pytest.FixtureRequest, mesh_name: str) -> None:
     """
-    Not a library comparison: an inward-wound closed mesh must come back enclosing positive volume.
+    Class A on the enclosed volume, and a pinned three-way split over what "orient" means.
 
     Reversing *every* face leaves the winding consistent, so this is the state
-    ``make_winding_consistent`` cannot fix and ``make_volume`` exists for. Asserted false
-    before and true after.
+    ``make_winding_consistent`` cannot fix and ``make_volume`` exists for. Asserted false before and
+    true after -- and then against the two libraries that make the same decision:
+    ``trimesh.repair.fix_inversion`` (compared face normal for face normal) and pyvista's
+    ``compute_normals(consistent_normals=True, auto_orient_normals=True)``.
+
+    **Two other libraries have an obviously-named filter that does something else, and this fixture
+    is the one that tells them apart.** Measured on an ``icosphere(2)``, signed volume, target
+    +4.047045:
+
+    | input | pyvista | open3d ``orient_triangles`` | pymeshlab ``re_orient_faces_coherently`` |
+    |---|---|---|---|
+    | 20 of 320 faces reversed (inconsistent) | +4.047045 | +4.047045 | -4.047045 |
+    | every face reversed (consistent, inward) | **+4.047045** | **-4.047045** | -4.047045 |
+
+    On a *locally inconsistent* mesh, making the winding coherent recovers the majority orientation
+    and therefore looks like this operation -- which is why a probe on that input alone reads all
+    three as agreeing. On a consistently **inward** mesh, open3d leaves it inward and pymeshlab
+    always does, so both are ``make_winding_consistent``'s counterparts. This test runs on the
+    inward fixture and asserts their answers stay negative, so the distinction is pinned rather than
+    described.
+
+    **And pyvista parts company on a multi-shell mesh, which is why its equality runs on
+    ``icosahedron`` only.** ``cave_cube`` is a unit cube with an inner void, so its enclosed solid
+    is ``outer - cavity``; triwarp returns **0.9990** and pyvista **1.0010**, i.e. pyvista orients
+    each shell outward *from itself* -- including the cavity's, which then adds instead of
+    subtracting -- where triwarp orients for a positive total. Both are defensible readings of
+    "outward" and only one is this function's contract, so the divergence is asserted as a sum
+    rather than papered over with a tolerance.
     """
     mesh_tm, mesh_wp = request.getfixturevalue(mesh_name)
     faces_inward = mesh_tm.faces[:, ::-1].copy()  # reverse every face -> inward normals
@@ -1131,11 +1157,48 @@ def test_make_volume_repairs_inversion(request: pytest.FixtureRequest, mesh_name
     assert tw.validation.is_volume(vertices_wp, repaired_wp) is True
 
     # Reference: trimesh.repair.fix_inversion also produces an outward-oriented volume.
+    inward_tm = tm.Trimesh(vertices=mesh_tm.vertices, faces=faces_inward, process=False)
     reference_tm = tm.Trimesh(vertices=mesh_tm.vertices, faces=faces_inward, process=False)
     tm_repair.fix_inversion(reference_tm)
     ours_tm = tm.Trimesh(vertices=mesh_tm.vertices, faces=_faces_2d(repaired_wp), process=False)
+    assert inward_tm.volume < 0.0  # non-vacuity: the input really is inside out
     assert ours_tm.volume > 0.0
     assert np.allclose(ours_tm.face_normals, reference_tm.face_normals, atol=1e-5)
+
+    mesh_o3d = trimesh_to_open3d(inward_tm)
+    mesh_o3d.orient_triangles()
+    volume_o3d = float(
+        tm.Trimesh(
+            np.asarray(mesh_o3d.vertices), np.asarray(mesh_o3d.triangles), process=False
+        ).volume
+    )
+    oriented_pv = trimesh_to_pyvista(inward_tm).compute_normals(
+        consistent_normals=True, auto_orient_normals=True
+    )
+    volume_pv = float(
+        tm.Trimesh(
+            np.asarray(oriented_pv.points), np.asarray(oriented_pv.regular_faces), process=False
+        ).volume
+    )
+    if mesh_name == "cave_cube":
+        # Two shells: pyvista turns the cavity outward too, so its volume gains what ours loses.
+        assert volume_pv > ours_tm.volume
+        assert np.isclose(volume_pv + ours_tm.volume, 2.0, rtol=1e-3, atol=1e-3)
+    else:
+        assert np.isclose(volume_pv, ours_tm.volume, rtol=1e-5, atol=1e-5)
+
+    # The two coherent-but-not-outward filters, pinned on the input that separates them.
+    meshset_pml = trimesh_to_pymeshlab(inward_tm)
+    meshset_pml.meshing_re_orient_faces_coherently()
+    volume_pml = float(
+        tm.Trimesh(
+            meshset_pml.current_mesh().vertex_matrix(),
+            meshset_pml.current_mesh().face_matrix(),
+            process=False,
+        ).volume
+    )
+    assert np.isclose(volume_o3d, -ours_tm.volume, rtol=1e-5, atol=1e-5)
+    assert np.isclose(volume_pml, -ours_tm.volume, rtol=1e-5, atol=1e-5)
 
 
 def test_make_volume_leaves_valid_mesh(icosahedron: tuple[tm.Trimesh, wp.Mesh]) -> None:
